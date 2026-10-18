@@ -47,7 +47,7 @@ cd /Users/everflow/Projects/dalton-langalpha
 .venv/bin/python -m pytest tests/unit/llms tests/unit/mcp_servers tests/unit/middleware/skills -q
 (cd integrations/openclaw/dalton-langalpha-broker && node --test test/*.test.mjs)   # 10 项
 (cd web && pnpm typecheck && pnpm test)
-for f in workflows/*/workflow.js; do node --check "$f"; done
+for f in workflows/*/workflow.js; do node --check "$f"; done   # ⚠️ 已证实不适用：workflow.js 由 QuickJS 引擎包裹执行，顶层 return 合法，node --check 必报 Illegal return statement；改用引擎编译检查（见 review/SUMMARY-20261018.md §0）
 grep -rn "max_failures" src/dalton plugins/dalton workflows scripts/dalton docs/dalton/dev-guide/automation-templates   # 已知有问题（P0F.3）
 git diff --name-only 8e0dce94 HEAD --diff-filter=M | grep -v '^docs/'   # 被改动的上游文件，逐一确认有 DALTON-HOOK 标注
 ```
