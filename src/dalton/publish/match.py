@@ -309,6 +309,24 @@ def _inspect_text_source(
         return False, "", None, []
 
     src_figures = extract_figures(body)
+    if fig.raw and not any(ch.isdigit() for ch in fig.raw) and fig.raw in body:
+        src_figures.append(
+            ExtractedFigure(
+                id="SF-CN",
+                raw=fig.raw,
+                value=fig.value,
+                decimals=fig.decimals,
+                unit=fig.unit,
+                scale=fig.scale,
+                currency=fig.currency,
+                metric=fig.metric,
+                period=fig.period,
+                label_hint=fig.label_hint,
+                footnote_id=None,
+                footnote_target=None,
+                location={"line": 1, "table": False, "row": None, "col": None, "sentence": body[:200]},
+            )
+        )
     fig_p = normalize_period(fig.period)
     all_body_periods = {
         normalize_period(pm.group(1)) for pm in _PERIOD_TOKEN_RE.finditer(body)
@@ -752,14 +770,24 @@ def match_figures(
             )
             continue
 
-        # Special rule: Target price / IRR / 3-scenario returns can ONLY match model cells
+        # Special rule: House target price / IRR / 3-scenario returns with explicit footnote must point to model cells
         if _RequiresModelCellOnly(fig):
-            if fig.footnote_target and fig.footnote_target.startswith("model:"):
-                out = _try_match_target(fig, fig.footnote_target)
-                if out and out.matched:
-                    outcomes.append(out)
-                    continue
-            # Try auto-searching model cells for target price
+            if fig.footnote_target:
+                if fig.footnote_target.startswith("model:"):
+                    out = _try_match_target(fig, fig.footnote_target)
+                    if out and out.matched:
+                        outcomes.append(out)
+                        continue
+                outcomes.append(
+                    MatchOutcome(
+                        figure=fig,
+                        matched=False,
+                        reason="unverified",
+                        hint="目标价、IRR、三情景收益必须指向模型单元格（model:<path>#<Sheet>!<Cell>）",
+                    )
+                )
+                continue
+            # Unfootnoted target price: try auto-searching model cells first, then fall through to evidence/prov for sell-side/consensus target prices
             matched_model_out: MatchOutcome | None = None
             for m_spec, c_info in cells_map.items():
                 if metrics_match(fig.metric, str(c_info.get("metric") or ""), metric_aliases):
@@ -769,16 +797,7 @@ def match_figures(
                         break
             if matched_model_out:
                 outcomes.append(matched_model_out)
-            else:
-                outcomes.append(
-                    MatchOutcome(
-                        figure=fig,
-                        matched=False,
-                        reason="unverified",
-                        hint="目标价、IRR、三情景收益必须指向模型单元格（model:<path>#<Sheet>!<Cell>）",
-                    )
-                )
-            continue
+                continue
 
         # Step C: Explicit footnote matching (Orders 0, 1, 2, 3)
         # Deterministic contradiction (`source_conflict`, `unit_mismatch`, `period_mismatch`) is ONLY
@@ -812,11 +831,19 @@ def match_figures(
         # sources attached so Step D (`audit.judge` + code anchoring) decides.
         auto_candidates: list[MatchCandidate] = []
         matched_auto: MatchOutcome | None = None
-        has_meaningful_metric = bool(re.search(r"[A-Za-z\u4e00-\u9fff]{2,}", fig.metric or ""))
+        has_meaningful_metric = (
+            bool(re.search(r"[A-Za-z]{2,}|[\u4e00-\u9fff]", fig.metric or ""))
+            or fig.unit != "other"
+            or fig.scale > 1.0
+        )
+        sent_prefix = str(fig.location.get("sentence") or "").lstrip("- ").strip()[:28]
 
-        if has_meaningful_metric:
+        if has_meaningful_metric or len(sent_prefix) >= 12:
             # 4a. Search thesis.evidence
-            for eid in evidence_by_id:
+            for eid, ev_obj in evidence_by_id.items():
+                if not has_meaningful_metric:
+                    if sent_prefix not in str(ev_obj.get("fact") or ""):
+                        continue
                 cand = _try_match_target(fig, f"evidence:{eid}")
                 if cand is not None:
                     if cand.matched:
@@ -1003,6 +1030,11 @@ def retrieve_candidate_sources(
             score += 3
         if fig_p and fig_p.lower() in fact_str.lower():
             score += 2
+        if fig.raw and fig.raw in fact_str:
+            score += 4
+        sent_pfx = str(fig.location.get("sentence") or "").lstrip("- ").strip()[:24]
+        if len(sent_pfx) >= 8 and sent_pfx in fact_str:
+            score += 8
         combined_text = fact_str
         if fig_lines:
             combined_text = f"{fact_str} | Figures: {'; '.join(fig_lines)}".strip(" |")

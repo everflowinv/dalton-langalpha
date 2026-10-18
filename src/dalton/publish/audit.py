@@ -611,7 +611,7 @@ async def aaudit_draft(
             fig = out.figure
             if fig.exempt or out.matched:
                 continue
-            if _RequiresModelCellOnly(fig) or out.reason in CONTRADICTED_REASONS:
+            if (fig.footnote_target and _RequiresModelCellOnly(fig)) or out.reason in CONTRADICTED_REASONS:
                 continue
             cand_sources = retrieve_candidate_sources(
                 fig,

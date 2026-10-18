@@ -117,7 +117,9 @@ def _extract_json_dict(raw_data: Any, raw_text: str | None) -> dict[str, Any]:
     if isinstance(raw_data, BaseException):
         raise raw_data
 
-    text = (raw_text if raw_text is not None else str(raw_data or "")).strip()
+    from src.dalton.llm.complete import _unwrap_content_blocks
+
+    text = _unwrap_content_blocks(raw_text if raw_text is not None else raw_data).strip()
     if not text:
         raise ValueError("Empty response from model")
 
@@ -191,6 +193,32 @@ async def assist_json(
             thread_id=thread_id,
             raise_on_error=False,
         )
+        if not comp.ok and model is None and comp.error_kind == "pre_send":
+            # Primary subscription assist model (e.g. gemini-3.8-flash-low-oauth) is not logged in;
+            # fall back to broker/cash assist_fallback_model (P0N.8 / L27).
+            for fb_cand in ("ocb-deepseek-deepseek-flash", "deepseek-flash"):
+                if fb_cand == resolved_model:
+                    continue
+                comp_fb = await dalton_complete(
+                    llm_service=llm_service,
+                    user_id=user_id,
+                    system_prompt=system_prompt,
+                    user_prompt=payload_json,
+                    scope_ref=f"{eff_scope}:fb:{fb_cand}",
+                    purpose=f"assist.{task}",
+                    request_model=fb_cand,
+                    response_schema=schema,
+                    slot="background",
+                    timeout_s=timeout_s,
+                    workspace_id=workspace_id,
+                    thread_id=thread_id,
+                    raise_on_error=False,
+                )
+                if comp_fb.ok or comp_fb.error_kind != "pre_send":
+                    comp = comp_fb
+                    resolved_model = fb_cand
+                    break
+
         elapsed_ms = int((time.monotonic() - t0) * 1000)
         used_model = comp.model or resolved_model
 

@@ -194,10 +194,14 @@ async def probe_sec(
     descriptions: list[str] = recent.get("primaryDocDescription") or []
 
     last_seen = state.get("last_sec_accession")
+    raw_seen_list = state.get("seen_accessions")
+    has_seen_set = isinstance(raw_seen_list, list)
+    seen_set: set[str] = {str(x) for x in raw_seen_list if x} if has_seen_set else set()
+
     signals: list[ProbeSignal] = []
     newest_accession: Optional[str] = None
 
-    for idx, acc in enumerate(accessions[:15]):
+    for idx, acc in enumerate(accessions[:100]):
         form = forms[idx] if idx < len(forms) else ""
         f_date = filing_dates[idx] if idx < len(filing_dates) else ""
         doc_name = primary_docs[idx] if idx < len(primary_docs) else ""
@@ -207,13 +211,20 @@ async def probe_sec(
 
         if newest_accession is None:
             newest_accession = acc
-        if last_seen and acc == last_seen:
-            break
+
+        if has_seen_set:
+            if acc in seen_set:
+                continue
+        else:
+            if last_seen and acc == last_seen:
+                break
+            # If last_seen was None (first bootstrap), record watermark without flooding old filings
+            if last_seen is None:
+                break
+
         if form not in WATCHED_FORMS:
             continue
-        # If last_seen was None (first bootstrap), record watermark without flooding old filings
-        if last_seen is None:
-            break
+
         prio = "P0" if form in P0_FORMS else "P1"
         item_suffix = f" items={','.join(parsed_items)}" if parsed_items else ""
         signals.append(
@@ -235,5 +246,8 @@ async def probe_sec(
 
     if newest_accession:
         state["last_sec_accession"] = newest_accession
+    if accessions:
+        merged_seen = list(dict.fromkeys([*accessions[:100], *(raw_seen_list if has_seen_set else [])]))
+        state["seen_accessions"] = merged_seen[:120]
 
     return signals, state

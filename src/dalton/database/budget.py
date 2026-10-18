@@ -188,9 +188,9 @@ async def lookup_run_context(conn: Any, run_ref: str) -> tuple[str | None, str |
             FROM conversation_responses cr
             LEFT JOIN conversation_threads ct
                 ON ct.conversation_thread_id = cr.conversation_thread_id
-            WHERE cr.conversation_response_id = %s
+            WHERE cr.conversation_response_id::text = %s
             """,
-            (run_ref,),
+            (str(run_ref),),
         )
         row = await cur.fetchone()
         if not row:

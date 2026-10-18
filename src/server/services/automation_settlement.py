@@ -353,7 +353,7 @@ async def settle(
         from_statuses=policy.from_statuses,
         to=policy.status,
         strike=policy.strike,
-        schedule=_schedule_action(policy, automation, outcome=outcome, excerpt=excerpt),
+        schedule=_schedule_action(policy, automation, outcome=outcome, excerpt=excerpt),  # DALTON-HOOK(precheck-outcome)
         quiet_for=quiet_for,
         in_transaction=leave_finish,
         conversation_thread_id=thread_id,

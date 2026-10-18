@@ -90,6 +90,14 @@ def extract_verdict_signal_refs(verdict: dict[str, Any]) -> list[str]:
     if not isinstance(verdict, dict):
         return []
     refs: list[str] = []
+    trig = verdict.get("trigger")
+    if isinstance(trig, dict):
+        t_ref = trig.get("ref")
+        if isinstance(t_ref, str) and t_ref.strip():
+            clean_ref = t_ref.strip()
+            refs.append(clean_ref)
+            if trig.get("kind") == "filing" and not clean_ref.startswith("filing:"):
+                refs.append(f"filing:{clean_ref}")
     for key in ("trigger_signal", "signal_id", "signal_key"):
         val = verdict.get(key)
         if isinstance(val, str) and val.strip():
@@ -123,7 +131,13 @@ async def resolve_verdict_signals(
 ) -> int:
     """Resolve matching signals in ``dalton_signals`` after a verdict is recorded (G4.2)."""
     refs = extract_verdict_signal_refs(verdict)
-    if not refs and not execution_id:
+    trig = verdict.get("trigger") if isinstance(verdict, dict) else None
+    eff_exec_id = execution_id or (
+        str(trig.get("automation_execution_id")).strip()
+        if isinstance(trig, dict) and trig.get("automation_execution_id")
+        else None
+    )
+    if not refs and not eff_exec_id:
         return 0
     try:
         from src.dalton.database import watch as watch_db
@@ -133,7 +147,7 @@ async def resolve_verdict_signals(
             workspace_id=workspace_id,
             ticker=ticker or (str(verdict.get("ticker")).upper() if verdict.get("ticker") else None),
             resolved_by=str(verdict_id) if verdict_id else None,
-            execution_id=execution_id,
+            execution_id=eff_exec_id,
         )
     except Exception as e:
         logger.warning("[DALTON_KNOWLEDGE_TOOLS] Could not resolve signals for verdict %s: %s", verdict_id, e)

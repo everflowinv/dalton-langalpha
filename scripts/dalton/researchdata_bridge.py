@@ -154,9 +154,9 @@ class BridgeConfig:
         self.max_inflight: int = max(
             1, int(os.environ.get("DALTON_BRIDGE_MAX_INFLIGHT", "2"))
         )
-        # Default 300s matches P0-D.1 §229 and agent_config.dalton.yaml call_timeout_s=300
+        # Default 625s matches agent_config.dalton.yaml call_timeout_s=625 (625 - 25 = 600s long-read ceiling)
         self.caller_budget_s: int = max(
-            35, int(os.environ.get("DALTON_BRIDGE_CALLER_BUDGET_S", "300"))
+            35, int(os.environ.get("DALTON_BRIDGE_CALLER_BUDGET_S", "625"))
         )
         self.usage_file: Path = Path(
             os.environ.get(
