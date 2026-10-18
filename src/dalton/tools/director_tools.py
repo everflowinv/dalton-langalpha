@@ -231,9 +231,18 @@ def build_director_tools(
             from src.dalton.knowledge.service import apply_update
 
             configurable = (config or {}).get("configurable") or {}
-            user_id = str(configurable.get("user_id") or "local_dev_user")
+            user_id = str(configurable.get("user_id") or "local-dev-user")
             latest = await latest_version(workspace_id, "agenda")
             base_ver = int(latest["version_no"]) if latest else None
+            urg_norm = {
+                "overdue": "now",
+                "today": "now",
+                "now": "now",
+                "this_week": "this_week",
+                "this_quarter": "this_quarter",
+                "later": "someday",
+                "someday": "someday",
+            }.get(str(urgency or "this_week").strip().lower(), "this_week")
             res = await apply_update(
                 user_id=user_id,
                 workspace_id=workspace_id,
@@ -245,8 +254,9 @@ def build_director_tools(
                         "value": {
                             "question": question,
                             "value": value if value in ("high", "medium", "low") else "high",
-                            "urgency": urgency,
+                            "urgency": urg_norm,
                             "origin": "pm",
+                            "owner": "pm",
                             "status": "open",
                             "why": why or "PM 经研究总监追加",
                         },
@@ -297,7 +307,7 @@ def build_director_tools(
         from src.dalton.autonomy.schedule import schedule_dalton_automation_helper
 
         configurable = (config or {}).get("configurable") or {}
-        user_id = str(configurable.get("user_id") or "local_dev_user")
+        user_id = str(configurable.get("user_id") or "local-dev-user")
         ws_id = workspace_id or configurable.get("workspace_id")
         tz = timezone_name or get_dalton_settings().autonomy.timezone
 

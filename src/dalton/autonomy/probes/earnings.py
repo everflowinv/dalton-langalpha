@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from datetime import date, datetime, timezone
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
 from src.dalton.autonomy.probes import ProbeSignal
+from src.dalton.settings import get_dalton_settings
 
 
 async def probe_earnings(
@@ -17,7 +19,11 @@ async def probe_earnings(
     today: Optional[date] = None,
 ) -> tuple[list[ProbeSignal], dict[str, Any]]:
     """Check if `next_earnings_date` is within T-3..T+1 or if a new earnings release arrived."""
-    now_date = today or datetime.now(timezone.utc).date()
+    try:
+        tz = ZoneInfo(get_dalton_settings().autonomy.timezone)
+    except Exception:
+        tz = timezone.utc
+    now_date = today or datetime.now(tz).date()
     state = dict(watch_state or {})
     signals: list[ProbeSignal] = []
 
@@ -25,13 +31,13 @@ async def probe_earnings(
     period = state.get("next_earnings_period") or "next"
 
     if not next_earn_raw and isinstance(agenda_doc, dict):
-        for cat in (agenda_doc.get("catalysts") or []) + ((agenda_doc.get("watch") or {}).get("events") or []):
+        for cat in ((agenda_doc.get("watch") or {}).get("events") or []) + (agenda_doc.get("catalysts") or []):
             if not isinstance(cat, dict):
                 continue
             ctype = str(cat.get("type") or "").lower()
-            ctitle = str(cat.get("title") or cat.get("event") or "").lower()
+            ctitle = str(cat.get("plan") or cat.get("title") or cat.get("event") or "").lower()
             if ctype == "earnings" or "财报" in ctitle or "earnings" in ctitle:
-                cand_date = cat.get("expected_date") or cat.get("date")
+                cand_date = cat.get("date") or cat.get("expected_date")
                 if cand_date:
                     next_earn_raw = cand_date
                     if cat.get("period"):
@@ -74,19 +80,5 @@ async def probe_earnings(
                 )
         except ValueError:
             pass
-
-    latest_release_id = state.get("latest_earnings_release_id")
-    last_seen_release_id = state.get("last_seen_earnings_release_id")
-    if latest_release_id and latest_release_id != last_seen_release_id:
-        signals.append(
-            ProbeSignal(
-                probe="earnings",
-                signal_key=f"release:{latest_release_id}",
-                priority="P0",
-                summary=f"{ticker} 检测到新财报/业绩电话会材料（id={latest_release_id}）",
-                payload={"release_id": latest_release_id},
-            )
-        )
-        state["last_seen_earnings_release_id"] = latest_release_id
 
     return signals, state

@@ -6,6 +6,7 @@ import logging
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import yaml
 from psycopg.rows import dict_row
@@ -34,6 +35,7 @@ URGENCY_WEIGHT = {
     "tm3": 2.5,
     "this_week": 2.0,
     "this_quarter": 1.0,
+    "someday": 0.5,
     "later": 0.5,
 }
 
@@ -67,6 +69,22 @@ def _compute_staleness(last_research_iso: str | None, today: date) -> float:
         return 1.2
 
 
+def _is_backoff_active(backoff_until: Any, now_dt: datetime, today: date) -> bool:
+    if not backoff_until:
+        return False
+    raw = str(backoff_until).strip()
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=now_dt.tzinfo or timezone.utc)
+        return dt > now_dt
+    except ValueError:
+        try:
+            return date.fromisoformat(raw[:10]) > today
+        except ValueError:
+            return False
+
+
 async def build_coverage_board(
     user_id: str | None = None,
     tier: str = "all",
@@ -75,19 +93,35 @@ async def build_coverage_board(
     """Assemble the cross-company coverage board and candidate ranking (PK.19)."""
     settings = get_dalton_settings()
     tz_name = settings.autonomy.timezone
-    now_dt = datetime.now(timezone.utc)
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = timezone.utc
+    now_dt = datetime.now(tz)
     today = now_dt.date()
     cov_map = _load_coverage_yaml()
 
     budget_raw: dict[str, Any] = {}
     try:
-        budget_raw = await get_budget_today()
+        budget_raw = await get_budget_today(user_id=user_id)
     except Exception as e:
-        logger.debug("[DALTON_BOARD] get_budget_today failed: %s", e)
+        logger.warning("[DALTON_BOARD] get_budget_today failed: %s", e)
 
-    cap_usd = float(budget_raw.get("daily_cap_usd") or 0.0)
-    spent_usd = float(budget_raw.get("spent_today_usd") or 0.0)
-    reserved_usd = float(budget_raw.get("reserved_usd") or 0.0)
+    cap_usd = float(
+        budget_raw["cap_usd"]
+        if "cap_usd" in budget_raw and budget_raw["cap_usd"] is not None
+        else (budget_raw.get("daily_cap_usd") or 0.0)
+    )
+    spent_usd = float(
+        budget_raw["spent_usd"]
+        if "spent_usd" in budget_raw and budget_raw["spent_usd"] is not None
+        else (budget_raw.get("spent_today_usd") or 0.0)
+    )
+    reserved_usd = float(
+        budget_raw["open_reserved_usd"]
+        if "open_reserved_usd" in budget_raw and budget_raw["open_reserved_usd"] is not None
+        else (budget_raw.get("reserved_usd") or 0.0)
+    )
     remaining_usd = max(0.0, round(cap_usd - spent_usd - reserved_usd, 2)) if cap_usd > 0 else 50.0
     reserve_for_events_usd = round(min(remaining_usd * 0.2, 6.0), 2)
     allocatable_usd = max(0.0, round(remaining_usd - reserve_for_events_usd, 2))
@@ -96,6 +130,7 @@ async def build_coverage_board(
         **budget_raw,
         "cap_usd": cap_usd,
         "spent_usd": spent_usd,
+        "open_reserved_usd": reserved_usd,
         "remaining_usd": remaining_usd,
         "reserve_for_events_usd": reserve_for_events_usd,
         "allocatable_usd": allocatable_usd,
@@ -256,6 +291,7 @@ async def build_coverage_board(
                 val = str(q.get("value") or q.get("priority") or "medium").lower()
                 urg = str(q.get("urgency") or "this_week").lower()
                 backoff_until = q.get("next_attempt_after") or q.get("backoff_until")
+                in_backoff = _is_backoff_active(backoff_until, now_dt, today)
                 waiting_pm = bool(q.get("waiting_pm")) or q.get("status") == "waiting_pm"
                 open_questions_list.append(
                     {
@@ -267,7 +303,7 @@ async def build_coverage_board(
                         "waiting_pm": waiting_pm,
                     }
                 )
-                if not waiting_pm and not backoff_until:
+                if not waiting_pm and not in_backoff:
                     v_w = VALUE_WEIGHT.get(val, 2.0)
                     u_w = URGENCY_WEIGHT.get(urg, 1.5)
                     score = round(v_w * u_w * staleness, 2)
@@ -284,8 +320,36 @@ async def build_coverage_board(
                         }
                     )
 
-            catalysts = (agenda_content.get("catalysts") or []) + (
-                (agenda_content.get("watch") or {}).get("events") or []
+            for v in (agenda_content.get("next_validations") or []) + (
+                agenda_content.get("validation_queue") or []
+            ):
+                if not isinstance(v, dict) or v.get("status") not in (None, "open", "pending"):
+                    continue
+                vid = str(v.get("id") or "V1")
+                v_what = str(v.get("what") or v.get("metric") or v.get("title") or vid)
+                due_raw = v.get("due") or v.get("target_date") or v.get("due_date")
+                if not due_raw:
+                    continue
+                try:
+                    due_date = date.fromisoformat(str(due_raw)[:10])
+                    if due_date <= today:
+                        score = round(3.0 * 3.0 * staleness, 2)
+                        raw_candidates.append(
+                            {
+                                "workspace_id": ws_id,
+                                "ticker": ticker,
+                                "task": f"验证节点到期 {vid}：{v_what}",
+                                "kind": "validation_check",
+                                "score": score,
+                                "est_usd": DEFAULT_EST_COST_BY_KIND["validation_check"],
+                                "why": f"验证节点到期（{due_date.isoformat()}）· 距上次研究权重={staleness:.2f}",
+                            }
+                        )
+                except ValueError:
+                    continue
+
+            catalysts = ((agenda_content.get("watch") or {}).get("events") or []) + (
+                agenda_content.get("catalysts") or []
             )
             next_events: list[dict[str, Any]] = []
             for cat in catalysts:
@@ -294,8 +358,8 @@ async def build_coverage_board(
                     next_events.append(
                         {
                             "type": cat.get("type") or cat.get("kind") or "catalyst",
-                            "title": cat.get("title") or cat.get("event") or "催化剂",
-                            "date": cat.get("expected_date") or cat.get("date"),
+                            "title": cat.get("plan") or cat.get("title") or cat.get("event") or "催化剂",
+                            "date": cat.get("date") or cat.get("expected_date"),
                             "date_status": "待确认" if date_status == "estimated" else date_status,
                         }
                     )
@@ -410,7 +474,7 @@ async def build_coverage_board(
     running_est = 0.0
     for item in raw_candidates:
         est = float(item.get("est_usd") or 1.5)
-        if running_est + est <= max(allocatable_usd, est if allocatable_usd > 0 else 0.0):
+        if cap_usd <= 0 or (running_est + est <= allocatable_usd + 1e-6):
             running_est = round(running_est + est, 2)
             selected_candidates.append(
                 {

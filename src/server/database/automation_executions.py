@@ -129,6 +129,14 @@ _SCHEDULE_SQL = {
         WHERE automation_id = %s AND status = 'active'
           AND next_run_at IS NULL AND last_run_at = %s
     """,
+    # DALTON-HOOK(precheck-outcome): A9 defer one-time automation by 1 day on budget exhaustion
+    "defer_once_1d": """
+        UPDATE automations
+        SET status = 'active',
+            next_run_at = COALESCE(next_run_at, COALESCE(last_run_at, NOW()) + INTERVAL '1 day')
+        WHERE automation_id = %s AND status IN ('active', 'executing')
+          AND (last_run_at = %s OR last_run_at IS NULL)
+    """,
     "close_price": """
         UPDATE automations SET status = 'completed', next_run_at = NULL
         WHERE automation_id = %s AND status = 'executing'
@@ -141,7 +149,7 @@ _SCHEDULE_SQL = {
     """,
 }
 
-ScheduleAction = Literal["close_once", "close_price", "rearm_price"]
+ScheduleAction = Literal["close_once", "defer_once_1d", "close_price", "rearm_price"]
 
 
 async def settle_execution(

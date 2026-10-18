@@ -136,7 +136,7 @@ async def resolve_verdict_signals(
             execution_id=execution_id,
         )
     except Exception as e:
-        logger.debug("Could not resolve signals for verdict %s: %s", verdict_id, e)
+        logger.warning("[DALTON_KNOWLEDGE_TOOLS] Could not resolve signals for verdict %s: %s", verdict_id, e)
         return 0
 
 

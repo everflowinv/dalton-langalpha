@@ -18,6 +18,7 @@ from src.dalton.knowledge.ops import (
     apply_ops,
     diff_documents,
     repair_knowledge_ops,
+    suggest_close_fields,
 )
 from src.dalton.knowledge.paths import (
     AGENT_MD,
@@ -95,12 +96,97 @@ def _resolve_container_at_path(doc: dict[str, Any], path: str) -> Any:
     return curr
 
 
+async def _repair_ops_paths_with_assist(
+    doc_key: str,
+    base_doc: dict[str, Any] | None,
+    ops: list[dict[str, Any]],
+    *,
+    user_id: str | None = None,
+    workspace_id: str | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Use difflib suggestions + assist_json('knowledge.repair_field') to confirm unknown top-level op paths."""
+    if not isinstance(base_doc, dict) or not ops:
+        return ops, []
+
+    valid_keys = [k for k in base_doc.keys() if k != "official"]
+    unknown_tops: list[str] = []
+    for raw_op in ops:
+        if not isinstance(raw_op, dict) or raw_op.get("op") == "create":
+            continue
+        path = str(raw_op.get("path") or "")
+        segs = [s for s in path.split("/") if s]
+        if segs and segs[0] not in base_doc:
+            top = segs[0]
+            if top not in unknown_tops:
+                unknown_tops.append(top)
+
+    if not unknown_tops:
+        return ops, []
+
+    unknown_suggestions = suggest_close_fields(unknown_tops, valid_keys)
+
+    res = await assist_json(
+        task="knowledge.repair_field",
+        instructions=(
+            "将知识库更新操作中未识别的顶层路径字段名映射为文档中的合法字段名。"
+            "参考 difflib_suggestions 中的候选建议，确认后返回 {\"mappings\": {\"原字段名\": \"合法字段名\"}}。"
+        ),
+        payload={
+            "doc_key": doc_key,
+            "unknown_fields": unknown_tops,
+            "difflib_suggestions": unknown_suggestions,
+            "schema_properties": valid_keys,
+        },
+        schema=_REPAIR_FIELD_SCHEMA,
+        user_id=user_id,
+        workspace_id=workspace_id,
+    )
+    if not (res.ok and isinstance(res.data, dict) and isinstance(res.data.get("mappings"), dict)):
+        return ops, []
+
+    mappings = {
+        str(k).lstrip("/"): str(v).lstrip("/")
+        for k, v in res.data["mappings"].items()
+        if k and v and str(v).lstrip("/") in valid_keys
+    }
+    if not mappings:
+        return ops, []
+
+    repaired: list[dict[str, Any]] = []
+    warnings: list[dict[str, Any]] = []
+    for raw_op in ops:
+        if not isinstance(raw_op, dict):
+            repaired.append(raw_op)
+            continue
+        op_copy = copy.deepcopy(raw_op)
+        path = str(op_copy.get("path") or "")
+        segs = [s for s in path.split("/") if s]
+        if segs and segs[0] in mappings:
+            old_top = segs[0]
+            new_top = mappings[old_top]
+            suffix = ("/" + "/".join(segs[1:])) if len(segs) > 1 else ""
+            new_path = f"/{new_top}{suffix}"
+            op_copy["path"] = new_path
+            warnings.append(
+                {
+                    "code": "path_repaired",
+                    "path": path,
+                    "original_field": f"/{old_top}",
+                    "repaired_to": f"/{new_top}",
+                    "message": f"repaired path {path!r} -> {new_path!r} via knowledge.repair_field",
+                }
+            )
+        repaired.append(op_copy)
+    return repaired, warnings
+
+
 async def _repair_doc_schema_with_assist(
     doc_key: str,
     doc: dict[str, Any],
     errors: list[dict[str, Any]],
     *,
     user_id: str | None = None,
+    workspace_id: str | None = None,
 ) -> list[dict[str, Any]]:
     """Use assist_json(task='knowledge.repair_field', ...) to map unknown/synonym fields to valid schema fields."""
     warnings: list[dict[str, Any]] = []
@@ -109,20 +195,33 @@ async def _repair_doc_schema_with_assist(
 
     schemas, _ = _load_schemas_and_registry()
     schema_obj = schemas.get(doc_key, {})
+    schema_props = [k for k in (schema_obj.get("properties") or {}).keys() if k != "official"]
+
+    bad_doc_fields: list[str] = []
+    for err in errors:
+        err_path = str(err.get("path") or "/")
+        target_obj = _resolve_container_at_path(doc, err_path)
+        if isinstance(target_obj, dict):
+            for k in target_obj.keys():
+                if k not in schema_props and str(k) not in bad_doc_fields:
+                    bad_doc_fields.append(str(k))
+    difflib_suggestions = suggest_close_fields(bad_doc_fields, schema_props)
 
     res = await assist_json(
         task="knowledge.repair_field",
         instructions=(
             "将 JSON 文档中因拼写或同义词偏差未通过 schema 校验的字段名映射为对应 schema 中的合法字段名。"
-            "返回 {\"mappings\": {\"原字段名\": \"合法字段名\"}}。"
+            "参考 difflib_suggestions 中的候选建议，确认后返回 {\"mappings\": {\"原字段名\": \"合法字段名\"}}。"
         ),
         payload={
             "doc_key": doc_key,
             "errors": errors,
-            "schema_properties": list((schema_obj.get("properties") or {}).keys()),
+            "difflib_suggestions": difflib_suggestions,
+            "schema_properties": schema_props,
         },
         schema=_REPAIR_FIELD_SCHEMA,
         user_id=user_id,
+        workspace_id=workspace_id,
     )
     mappings: dict[str, str] = {}
     if res.ok and isinstance(res.data, dict) and isinstance(res.data.get("mappings"), dict):
@@ -144,6 +243,8 @@ async def _repair_doc_schema_with_assist(
                     {
                         "code": "field_repaired",
                         "path": f"{err_path.rstrip('/')}/{bad_k}",
+                        "original_field": bad_k,
+                        "repaired_to": good_k,
                         "message": f"repaired field {bad_k!r} -> {good_k!r} via knowledge.repair_field",
                     }
                 )
@@ -373,6 +474,18 @@ async def apply_update(
     )
 
     repaired_ops, repair_warnings = repair_knowledge_ops(doc_key, base_doc, ops)
+    repaired_ops, assist_path_warnings = await _repair_ops_paths_with_assist(
+        doc_key,
+        base_doc,
+        repaired_ops,
+        user_id=user_id,
+        workspace_id=workspace_id,
+    )
+    if assist_path_warnings:
+        repair_warnings.extend(assist_path_warnings)
+        repaired_ops, post_alias_warnings = repair_knowledge_ops(doc_key, base_doc, repaired_ops)
+        repair_warnings.extend(post_alias_warnings)
+
     ev_ids = [
         str(r.get("evidence_id") or r.get("id"))
         for r in (evidence_refs or [])
@@ -431,6 +544,7 @@ async def apply_update(
             new_doc,
             val.errors,
             user_id=user_id,
+            workspace_id=workspace_id,
         )
         if assist_warnings:
             repair_warnings.extend(assist_warnings)
@@ -451,6 +565,8 @@ async def apply_update(
             )
 
     if repair_warnings:
+        if repaired_ops != ops:
+            repair_warnings[0] = {**repair_warnings[0], "original_ops": ops}
         val.warnings = [*repair_warnings, *val.warnings]
 
     if not val.ok:

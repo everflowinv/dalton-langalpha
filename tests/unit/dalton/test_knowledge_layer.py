@@ -506,6 +506,7 @@ def test_migrated_4_companies_pass_all_schemas_and_debate_coverage() -> None:
 
 @pytest.mark.asyncio
 async def test_service_apply_update_and_append_verdict(monkeypatch: pytest.MonkeyPatch) -> None:
+    from unittest.mock import create_autospec
     from src.dalton.database import knowledge as db_knowledge
     from src.dalton.database import verdicts as db_verdicts
     from src.dalton.knowledge import service
@@ -529,29 +530,50 @@ async def test_service_apply_update_and_append_verdict(monkeypatch: pytest.Monke
                 out[k] = filtered[-1]
         return out
 
-    async def fake_insert_version(**kwargs: Any) -> dict[str, Any]:
-        doc_key = kwargs["doc_key"]
+    mock_insert_version = create_autospec(db_knowledge.insert_version)
+
+    async def _insert_version_impl(
+        *,
+        user_id: str,
+        workspace_id: str,
+        doc_key: str,
+        base_version_no: int | None,
+        content: dict[str, Any],
+        content_sha256: str,
+        ops: list[dict[str, Any]] | None,
+        reason: str,
+        evidence_refs: list[dict[str, Any]] | None = None,
+        source: str = "tool",
+        warnings: list[dict[str, Any]] | None = None,
+        schema_valid: bool = True,
+        edited_path: str | None = None,
+        thread_id: str | None = None,
+        run_id: str | None = None,
+        tool_call_id: str | None = None,
+    ) -> dict[str, Any]:
         rows = store.setdefault(doc_key, [])
         v_no = len(rows) + 1
         row = {
             "knowledge_version_id": f"kv-{doc_key}-{v_no}",
-            "workspace_id": kwargs["workspace_id"],
+            "workspace_id": workspace_id,
             "doc_key": doc_key,
             "version_no": v_no,
-            "base_version_no": kwargs.get("base_version_no"),
-            "content": copy.deepcopy(kwargs["content"]),
-            "content_sha256": kwargs["content_sha256"],
-            "ops": kwargs.get("ops"),
-            "reason": kwargs["reason"],
-            "source": kwargs.get("source", "tool"),
-            "warnings": kwargs.get("warnings", []),
-            "schema_valid": kwargs.get("schema_valid", True),
-            "edited_path": kwargs.get("edited_path"),
+            "base_version_no": base_version_no,
+            "content": copy.deepcopy(content),
+            "content_sha256": content_sha256,
+            "ops": ops,
+            "reason": reason,
+            "source": source,
+            "warnings": warnings or [],
+            "schema_valid": schema_valid,
+            "edited_path": edited_path,
             "files_written_at": None,
             "created_at": datetime(2026, 10, 18, 12, 0, 0, tzinfo=timezone.utc),
         }
         rows.append(row)
         return row
+
+    mock_insert_version.side_effect = _insert_version_impl
 
     async def fake_mark_files_written(kv_id: str) -> None:
         for rows in store.values():
@@ -559,13 +581,24 @@ async def test_service_apply_update_and_append_verdict(monkeypatch: pytest.Monke
                 if r["knowledge_version_id"] == kv_id:
                     r["files_written_at"] = datetime.now(timezone.utc)
 
-    async def fake_insert_verdict(**kwargs: Any) -> dict[str, Any]:
-        v = copy.deepcopy(kwargs["verdict"])
+    mock_insert_verdict = create_autospec(db_verdicts.insert_verdict)
+
+    async def _insert_verdict_impl(
+        *,
+        user_id: str,
+        workspace_id: str,
+        verdict: dict[str, Any],
+        thread_id: str | None = None,
+        run_id: str | None = None,
+        automation_execution_id: str | None = None,
+        origin_type: str | None = None,
+    ) -> dict[str, Any]:
+        v = copy.deepcopy(verdict)
         vid = f"VD-20261018-{len(verdict_store) + 1:02d}"
         v["id"] = vid
         row = {
             "verdict_id": vid,
-            "workspace_id": kwargs["workspace_id"],
+            "workspace_id": workspace_id,
             "verdict_at": datetime(2026, 10, 18, 12, 0, 0, tzinfo=timezone.utc),
             "word": v["verdict"],
             "payload": v,
@@ -573,15 +606,17 @@ async def test_service_apply_update_and_append_verdict(monkeypatch: pytest.Monke
         verdict_store.append(row)
         return row
 
+    mock_insert_verdict.side_effect = _insert_verdict_impl
+
     async def fake_list_verdicts(workspace_id: str, limit: int = 60) -> list[dict[str, Any]]:
         return list(reversed(verdict_store))[:limit]
 
     monkeypatch.setattr(db_knowledge, "latest_version", fake_latest_version)
     monkeypatch.setattr(db_knowledge, "latest_valid_version", fake_latest_valid_version)
     monkeypatch.setattr(db_knowledge, "list_all_latest_for_workspace", fake_list_all_latest)
-    monkeypatch.setattr(db_knowledge, "insert_version", fake_insert_version)
+    monkeypatch.setattr(db_knowledge, "insert_version", mock_insert_version)
     monkeypatch.setattr(db_knowledge, "mark_files_written", fake_mark_files_written)
-    monkeypatch.setattr(db_verdicts, "insert_verdict", fake_insert_verdict)
+    monkeypatch.setattr(db_verdicts, "insert_verdict", mock_insert_verdict)
     monkeypatch.setattr(db_verdicts, "list_verdicts", fake_list_verdicts)
 
     class MemoryBackend:
@@ -742,9 +777,11 @@ def test_question_backoff_stalled_duration_and_new_evidence_reset() -> None:
 async def test_field_and_path_repair_with_warnings_and_assist_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from unittest.mock import create_autospec
     from src.dalton.database import knowledge as db_knowledge
     from src.dalton.knowledge import service
-    from src.dalton.llm.assist import AssistResult
+    from src.dalton.knowledge.ops import repair_knowledge_ops
+    from src.dalton.llm.assist import AssistResult, assist_json
 
     store: dict[str, list[dict[str, Any]]] = {}
 
@@ -756,31 +793,52 @@ async def test_field_and_path_repair_with_warnings_and_assist_fallback(
         rows = store.get(doc_key, [])
         return rows[-1] if rows else None
 
-    async def fake_insert_version(**kwargs: Any) -> dict[str, Any]:
-        doc_key = kwargs["doc_key"]
+    mock_insert = create_autospec(db_knowledge.insert_version)
+
+    async def _insert_impl(
+        *,
+        user_id: str,
+        workspace_id: str,
+        doc_key: str,
+        base_version_no: int | None,
+        content: dict[str, Any],
+        content_sha256: str,
+        ops: list[dict[str, Any]] | None,
+        reason: str,
+        evidence_refs: list[dict[str, Any]] | None = None,
+        source: str = "tool",
+        warnings: list[dict[str, Any]] | None = None,
+        schema_valid: bool = True,
+        edited_path: str | None = None,
+        thread_id: str | None = None,
+        run_id: str | None = None,
+        tool_call_id: str | None = None,
+    ) -> dict[str, Any]:
         rows = store.setdefault(doc_key, [])
         v_no = len(rows) + 1
         row = {
             "knowledge_version_id": f"kv-{doc_key}-{v_no}",
-            "workspace_id": kwargs["workspace_id"],
+            "workspace_id": workspace_id,
             "doc_key": doc_key,
             "version_no": v_no,
-            "base_version_no": kwargs.get("base_version_no"),
-            "content": copy.deepcopy(kwargs["content"]),
-            "content_sha256": kwargs["content_sha256"],
-            "ops": kwargs.get("ops"),
-            "reason": kwargs["reason"],
-            "source": kwargs.get("source", "tool"),
-            "warnings": kwargs.get("warnings", []),
+            "base_version_no": base_version_no,
+            "content": copy.deepcopy(content),
+            "content_sha256": content_sha256,
+            "ops": ops,
+            "reason": reason,
+            "source": source,
+            "warnings": warnings or [],
             "schema_valid": True,
             "created_at": datetime(2026, 10, 18, 12, 0, 0, tzinfo=timezone.utc),
         }
         rows.append(row)
         return row
 
+    mock_insert.side_effect = _insert_impl
+
     monkeypatch.setattr(db_knowledge, "latest_version", fake_latest_version)
     monkeypatch.setattr(db_knowledge, "latest_valid_version", fake_latest_valid_version)
-    monkeypatch.setattr(db_knowledge, "insert_version", fake_insert_version)
+    monkeypatch.setattr(db_knowledge, "insert_version", mock_insert)
 
     # Create initial agenda
     await service.apply_update(
@@ -802,7 +860,16 @@ async def test_field_and_path_repair_with_warnings_and_assist_fallback(
         base_version=None,
     )
 
-    # Append using misnamed path `/questions` and misnamed field `statement` instead of `question`
+    # P0H §3.3: Verify repair_knowledge_ops does NOT auto-mutate fuzzy paths (like /open_questons) without LLM confirmation
+    unconfirmed_ops, unconfirmed_warns = repair_knowledge_ops(
+        "agenda",
+        store["agenda"][-1]["content"],
+        [{"op": "append", "path": "/open_questons", "value": {"question": "Test"}}],
+    )
+    assert unconfirmed_ops[0]["path"] == "/open_questons"
+    assert unconfirmed_warns == []
+
+    # Append using frozen alias path `/questions` and frozen alias field `statement` instead of `question`
     res_repaired = await service.apply_update(
         user_id="u1",
         workspace_id="ws1",
@@ -828,19 +895,39 @@ async def test_field_and_path_repair_with_warnings_and_assist_fallback(
     )
     assert res_repaired["ok"] is True, res_repaired
     assert any(w["code"] == "field_repaired" for w in res_repaired["warnings"])
+    # R2-N3N4 #12: original_ops preserved in warnings
+    assert "original_ops" in res_repaired["warnings"][0]
     saved_q = store["agenda"][-1]["content"]["open_questions"][0]
     assert saved_q["question"] == "Will AWS capacity double by 2027?"
 
-    # Test assist_json(task="knowledge.repair_field") repairing an unknown synonym field
-    async def fake_assist_repair(*args: Any, **kwargs: Any) -> AssistResult:
-        assert kwargs.get("task") == "knowledge.repair_field"
+    # Test assist_json(task="knowledge.repair_field") confirming difflib suggestion on fuzzy path `/open_questons`
+    mock_assist_repair = create_autospec(assist_json)
+
+    async def _assist_repair_impl(
+        task: str,
+        instructions: str,
+        payload: dict[str, Any],
+        schema: dict[str, Any],
+        *,
+        user_id: str | None = None,
+        workspace_id: str | None = None,
+        thread_id: str | None = None,
+        role: str = "assist",
+        scope_ref: str | None = None,
+        timeout_s: float = 60.0,
+    ) -> AssistResult:
+        assert task == "knowledge.repair_field"
+        assert "difflib_suggestions" in payload
+        assert payload["difflib_suggestions"].get("open_questons") == ["open_questions"]
         return AssistResult(
             ok=True,
-            data={"mappings": {"inquiry_prompt": "question"}},
+            data={"mappings": {"open_questons": "open_questions"}},
             error=None,
         )
 
-    monkeypatch.setattr(service, "assist_json", fake_assist_repair)
+    mock_assist_repair.side_effect = _assist_repair_impl
+    monkeypatch.setattr(service, "assist_json", mock_assist_repair)
+
     res_assist = await service.apply_update(
         user_id="u1",
         workspace_id="ws1",
@@ -848,9 +935,9 @@ async def test_field_and_path_repair_with_warnings_and_assist_fallback(
         ops=[
             {
                 "op": "append",
-                "path": "/open_questions",
+                "path": "/open_questons",
                 "value": {
-                    "inquiry_prompt": "How fast does Trainium ramp?",
+                    "question": "How fast does Trainium ramp?",
                     "why": "Margin impact",
                     "value": "medium",
                     "urgency": "this_week",
@@ -861,11 +948,13 @@ async def test_field_and_path_repair_with_warnings_and_assist_fallback(
                 },
             }
         ],
-        reason="Add question with custom field repaired by assist_json",
+        reason="Add question with fuzzy path confirmed by assist_json",
         base_version=2,
     )
     assert res_assist["ok"] is True, res_assist
     assert any("knowledge.repair_field" in w["message"] for w in res_assist["warnings"])
+    assert len(store["agenda"][-1]["content"]["open_questions"]) == 2
+
 
 
 def test_g34_migrated_docs_have_no_fabricated_numbers_and_remediation() -> None:

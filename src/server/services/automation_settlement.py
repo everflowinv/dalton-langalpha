@@ -283,7 +283,11 @@ def _one_shot_price(automation: Dict[str, Any]) -> bool:
 
 
 def _schedule_action(
-    policy: _Policy, automation: Dict[str, Any]
+    policy: _Policy,
+    automation: Dict[str, Any],
+    *,
+    outcome: Optional[Outcome] = None,
+    excerpt: Optional[str] = None,
 ) -> Optional[exec_db.ScheduleAction]:
     """What the firing leaves on the schedule: a one-time automation is
     done, and a price alert is either done or watching again."""
@@ -293,6 +297,9 @@ def _schedule_action(
             return "close_price"
         return "rearm_price"
     if trigger == "once" and policy.schedule == "close":
+        # DALTON-HOOK(precheck-outcome): A9 defer once automation by 1 day on budget_exhausted
+        if outcome == Outcome.PRECHECK_SKIPPED and "budget_exhausted" in str(excerpt or ""):
+            return "defer_once_1d"
         return "close_once"
     return None
 
@@ -346,7 +353,7 @@ async def settle(
         from_statuses=policy.from_statuses,
         to=policy.status,
         strike=policy.strike,
-        schedule=_schedule_action(policy, automation),
+        schedule=_schedule_action(policy, automation, outcome=outcome, excerpt=excerpt),
         quiet_for=quiet_for,
         in_transaction=leave_finish,
         conversation_thread_id=thread_id,

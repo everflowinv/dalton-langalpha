@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
 from src.dalton.settings import get_dalton_settings
 
@@ -34,12 +35,12 @@ def build_company_watch_specs(
     tier: str = "Core",
     timezone_name: Optional[str] = None,
 ) -> list[dict[str, Any]]:
-    """Return the standard automation definitions for a covered company (PK.15)."""
+    """Return the standard automation definitions for a covered company (PK.15 / A13)."""
     t_upper = ticker.upper()
     t_lower = ticker.lower()
     is_cnhk = t_upper.endswith((".HK", ".SS", ".SZ", ".SH"))
     tz = timezone_name or ("Asia/Shanghai" if is_cnhk else "America/New_York")
-    watch_cron = "0 7,19 * * 1-5" if tier.lower() == "core" else "30 7 * * 1-5"
+    watch_cron = "*/30 6-20 * * 1-5" if tier.lower() == "core" else "30 7 * * 1-5"
 
     return [
         {
@@ -63,14 +64,14 @@ def build_company_watch_specs(
         },
         {
             "name": f"dalton-{t_lower}-delta",
-            "description": f"{t_upper} 周度 Thesis Delta 复盘",
+            "description": f"{t_upper} 盘后 Thesis Delta 复盘",
             "trigger_type": "cron",
-            "cron_expression": "0 21 * * 0",
+            "cron_expression": "30 21 * * 1-5",
             "timezone": tz,
             "workspace_id": workspace_id,
             "thread_strategy": "new",
             "instruction": (
-                f"请按 `.agents/skills/dalton-thesis-delta/SKILL.md` 对 {t_upper} 过去一周的证据、预期变化与催化剂进展做周度复盘，"
+                f"请按 `.agents/skills/dalton-thesis-delta/SKILL.md` 对 {t_upper} 最新证据、预期变化与催化剂进展做复盘，"
                 "必要时更新 `thesis` / `debate` / `agenda` 并追加一条 `knowledge_append_verdict`。"
             ),
             "metadata": {
@@ -82,7 +83,7 @@ def build_company_watch_specs(
         },
         {
             "name": f"dalton-{t_lower}-move-up",
-            "description": f"{t_upper} 单日涨幅 ≥ 5% 异动归因",
+            "description": f"{t_upper} 单日涨幅 ≥ 4% 异动归因",
             "trigger_type": "price",
             "timezone": tz,
             "workspace_id": workspace_id,
@@ -93,7 +94,7 @@ def build_company_watch_specs(
                 "conditions": [
                     {
                         "type": "pct_change_above",
-                        "value": 5.0,
+                        "value": 4.0,
                         "reference": "previous_close",
                     }
                 ],
@@ -103,7 +104,7 @@ def build_company_watch_specs(
                 },
             },
             "instruction": (
-                f"{t_upper} 日内涨幅达到或超过 +5%。请按 `.agents/skills/dalton-stock-move/SKILL.md` 排查基本面、新闻、卖方预期与同行联动原因，"
+                f"{t_upper} 日内涨幅达到或超过 +4%。请按 `.agents/skills/dalton-stock-move/SKILL.md` 排查基本面、新闻、卖方预期与同行联动原因，"
                 "并追加 `knowledge_append_verdict`。"
             ),
             "metadata": {
@@ -115,7 +116,7 @@ def build_company_watch_specs(
         },
         {
             "name": f"dalton-{t_lower}-move-down",
-            "description": f"{t_upper} 单日跌幅 ≥ 5% 异动归因",
+            "description": f"{t_upper} 单日跌幅 ≥ 4% 异动归因",
             "trigger_type": "price",
             "timezone": tz,
             "workspace_id": workspace_id,
@@ -126,7 +127,7 @@ def build_company_watch_specs(
                 "conditions": [
                     {
                         "type": "pct_change_below",
-                        "value": 5.0,
+                        "value": 4.0,
                         "reference": "previous_close",
                     }
                 ],
@@ -136,7 +137,7 @@ def build_company_watch_specs(
                 },
             },
             "instruction": (
-                f"{t_upper} 日内跌幅达到或超过 -5%。请按 `.agents/skills/dalton-stock-move/SKILL.md` 排查基本面、新闻、卖方预期与同行联动原因，"
+                f"{t_upper} 日内跌幅达到或超过 -4%。请按 `.agents/skills/dalton-stock-move/SKILL.md` 排查基本面、新闻、卖方预期与同行联动原因，"
                 "并追加 `knowledge_append_verdict`。"
             ),
             "metadata": {
@@ -154,7 +155,7 @@ def build_earnings_window_specs(
     ticker: str,
     workspace_id: str,
     period: str,
-    report_at: datetime,
+    report_at: datetime | str,
     timezone_name: Optional[str] = None,
 ) -> list[dict[str, Any]]:
     """Build T-3d preview, T+0 flash, and T+1d deep-update one-shot automations for an earnings release."""
@@ -162,8 +163,13 @@ def build_earnings_window_specs(
     t_upper = ticker.upper()
     t_lower = ticker.lower()
     p_slug = re.sub(r"[^a-z0-9]+", "", period.lower()) or "next"
+    if isinstance(report_at, str):
+        report_at = datetime.fromisoformat(report_at.replace("Z", "+00:00"))
     if report_at.tzinfo is None:
-        report_at = report_at.replace(tzinfo=timezone.utc)
+        try:
+            report_at = report_at.replace(tzinfo=ZoneInfo(tz))
+        except Exception:
+            report_at = report_at.replace(tzinfo=timezone.utc)
 
     tm3_at = report_at - timedelta(days=3)
     t0_at = report_at + timedelta(minutes=30)
@@ -234,7 +240,7 @@ def build_global_director_specs(
     *,
     timezone_name: Optional[str] = None,
 ) -> list[dict[str, Any]]:
-    """Build Home-level automations: earnings calendar scan, daily director, weekly director (PK.15/PK.19)."""
+    """Build Home-level automations: earnings calendar scan, daily director, weekly director (PK.15/PK.19/A13)."""
     tz = timezone_name or get_dalton_settings().autonomy.timezone
     return [
         {
@@ -258,7 +264,7 @@ def build_global_director_specs(
             "name": "dalton-director-daily",
             "description": "Dalton 研究总监每日晨会调度与覆盖总览生成",
             "trigger_type": "cron",
-            "cron_expression": "0 8 * * 1-5",
+            "cron_expression": "30 7 * * 1-5",
             "timezone": tz,
             "workspace_id": None,
             "thread_strategy": "pinned",
@@ -277,7 +283,7 @@ def build_global_director_specs(
             "name": "dalton-director-weekly",
             "description": "Dalton 研究总监每周全域复盘与自主运行周报",
             "trigger_type": "cron",
-            "cron_expression": "0 20 * * 0",
+            "cron_expression": "0 10 * * 6",
             "timezone": tz,
             "workspace_id": None,
             "thread_strategy": "pinned",
@@ -294,7 +300,7 @@ def build_global_director_specs(
 
 
 async def schedule_dalton_automation_helper(
-    user_id: str = "local_dev_user",
+    user_id: str = "local-dev-user",
     name: Optional[str] = None,
     spec: Optional[dict[str, Any]] = None,
     *,
@@ -390,6 +396,11 @@ async def schedule_dalton_automation_helper(
         next_dt = next_run_raw
     elif isinstance(next_run_raw, str) and next_run_raw.strip():
         next_dt = datetime.fromisoformat(next_run_raw.strip().replace("Z", "+00:00"))
+    if next_dt is not None and next_dt.tzinfo is None:
+        try:
+            next_dt = next_dt.replace(tzinfo=ZoneInfo(tz))
+        except Exception:
+            next_dt = next_dt.replace(tzinfo=timezone.utc)
 
     description = merged_spec.get("description")
     cron_expression = merged_spec.get("cron_expression") or merged_spec.get("cron")

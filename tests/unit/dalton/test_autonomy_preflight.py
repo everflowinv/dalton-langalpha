@@ -1,11 +1,16 @@
-"""Unit tests for Dalton autonomous agenda, 4 probes, LLM triage, signal lifecycle, and CIK initialization (PK.14–PK.20, G4.1–G4.5)."""
+"""Unit tests for Dalton autonomous agenda, 4 probes, LLM triage, signal lifecycle, and CIK initialization (PK.14–PK.20, G4.1–G4.5, H3 A1–A14)."""
 
 from __future__ import annotations
 
+import asyncio
+import copy
 import importlib.util
+import json
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, create_autospec
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -16,7 +21,9 @@ from src.dalton.autonomy.backoff import (
     next_backoff_minutes,
     record_probe_backoff,
 )
+from src.dalton.autonomy.board import build_coverage_board
 from src.dalton.autonomy.preflight import (
+    _check_budget_available,
     format_wake_directive,
     is_dalton_automation,
     is_direct_wake_signal,
@@ -24,6 +31,7 @@ from src.dalton.autonomy.preflight import (
 )
 from src.dalton.autonomy.probes import COMPANY_PROBES
 from src.dalton.autonomy.probes.agenda import probe_agenda
+from src.dalton.autonomy.probes.director import probe_director
 from src.dalton.autonomy.probes.earnings import probe_earnings
 from src.dalton.autonomy.probes.internal import probe_internal
 from src.dalton.autonomy.probes.sec import probe_sec, resolve_company_cik
@@ -33,11 +41,16 @@ from src.dalton.autonomy.schedule import (
     schedule_dalton_automation_helper,
     validate_automation_name,
 )
+from src.dalton.budget import service as budget_service
 from src.dalton.database import watch as watch_db
+from src.dalton.knowledge.ops import apply_ops, repair_knowledge_ops
+from src.dalton.knowledge.validate import validate_update
+from src.dalton.llm.assist import AssistResult, assist_json
 from src.dalton.tools.knowledge_tools import (
     extract_verdict_signal_refs,
     resolve_verdict_signals,
 )
+from src.server.services.automation_settlement import _POLICIES, Outcome, _schedule_action
 
 
 def test_four_company_probes_and_deleted_price_consensus():
@@ -91,42 +104,125 @@ async def test_automation_naming_templates_and_schedule_helper(monkeypatch):
         "dalton-meta-move-up",
         "dalton-meta-move-down",
     ]
+    # A13: verify cron/threshold alignment with docs/dalton/dev-guide/automation-templates/
+    assert specs[0]["cron_expression"] == "*/30 6-20 * * 1-5"
+    assert specs[1]["cron_expression"] == "30 21 * * 1-5"
+    assert specs[2]["trigger_config"]["conditions"][0]["value"] == 4.0
+    assert specs[3]["trigger_config"]["conditions"][0]["value"] == 4.0
 
     earn_specs = build_earnings_window_specs(
         ticker="META",
         workspace_id="ws-meta",
         period="2026Q3",
-        report_at=datetime(2026, 10, 29, 20, 0, tzinfo=timezone.utc),
+        report_at="2026-10-29T20:00:00",  # A8: naive ISO string gets timezone attached
     )
     assert [s["name"] for s in earn_specs] == [
         "dalton-meta-earn-2026q3-tm3",
         "dalton-meta-earn-2026q3-t0",
         "dalton-meta-earn-2026q3-tp1",
     ]
+    assert earn_specs[0]["next_run_at"].tzinfo == ZoneInfo("Asia/Shanghai")
 
-    # Test idempotent schedule_dalton_automation_helper (G4.5)
+    # Test idempotent schedule_dalton_automation_helper (G4.5, A8) with create_autospec (L33)
     from src.server.database import automation as auto_db
 
     store: list[dict[str, Any]] = []
 
-    async def fake_list(user_id: str, workspace_id: str | None = None, limit: int = 200):
-        return [r for r in store if r.get("workspace_id") == workspace_id], len(store)
+    mock_list = create_autospec(auto_db.list_automations)
+    mock_create = create_autospec(auto_db.create_automation)
+    mock_update = create_autospec(auto_db.update_automation)
 
-    async def fake_create(**kwargs):
-        row = {"automation_id": f"auto-{len(store) + 1}", **kwargs}
+    async def _list_impl(
+        user_id: str,
+        status: str | None = None,
+        thread_id: str | None = None,
+        workspace_id: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ):
+        return [r for r in store if not workspace_id or r.get("workspace_id") == workspace_id], len(store)
+
+    async def _create_impl(
+        user_id: str,
+        name: str,
+        trigger_type: str,
+        instruction: str,
+        *,
+        file_name: str | None = None,
+        description: str | None = None,
+        cron_expression: str | None = None,
+        timezone: str = "UTC",
+        trigger_config: dict[str, Any] | None = None,
+        next_run_at: datetime | None = None,
+        workspace_id: str | None = None,
+        llm_model: str | None = None,
+        additional_context: list[dict[str, Any]] | None = None,
+        thread_strategy: str = "new",
+        conversation_thread_id: str | None = None,
+        max_failures: int = 3,
+        delivery_config: dict[str, Any] | None = None,
+        metadata: dict[str, Any] | None = None,
+        conn=None,
+    ):
+        row = {
+            "automation_id": f"auto-{len(store) + 1}",
+            "user_id": user_id,
+            "name": name,
+            "trigger_type": trigger_type,
+            "instruction": instruction,
+            "cron_expression": cron_expression,
+            "timezone": timezone,
+            "trigger_config": trigger_config or {},
+            "next_run_at": next_run_at,
+            "workspace_id": workspace_id,
+            "description": description,
+            "metadata": metadata or {},
+        }
         store.append(row)
         return row
 
-    async def fake_update(automation_id: str, user_id: str, **patch):
+    async def _update_impl(
+        automation_id: str,
+        user_id: str,
+        *,
+        conn=None,
+        instruction: str | None = None,
+        description: str | None = None,
+        cron_expression: str | None = None,
+        timezone: str | None = None,
+        trigger_config: dict[str, Any] | None = None,
+        next_run_at: datetime | None = None,
+        metadata: dict[str, Any] | None = None,
+        status: str | None = None,
+    ):
         for r in store:
             if r["automation_id"] == automation_id:
-                r.update(patch)
+                if instruction is not None:
+                    r["instruction"] = instruction
+                if description is not None:
+                    r["description"] = description
+                if cron_expression is not None:
+                    r["cron_expression"] = cron_expression
+                if timezone is not None:
+                    r["timezone"] = timezone
+                if trigger_config is not None:
+                    r["trigger_config"] = trigger_config
+                if next_run_at is not None:
+                    r["next_run_at"] = next_run_at
+                if metadata is not None:
+                    r["metadata"] = metadata
+                if status is not None:
+                    r["status"] = status
                 return r
         return None
 
-    monkeypatch.setattr(auto_db, "list_automations", fake_list)
-    monkeypatch.setattr(auto_db, "create_automation", fake_create)
-    monkeypatch.setattr(auto_db, "update_automation", fake_update)
+    mock_list.side_effect = _list_impl
+    mock_create.side_effect = _create_impl
+    mock_update.side_effect = _update_impl
+
+    monkeypatch.setattr(auto_db, "list_automations", mock_list)
+    monkeypatch.setattr(auto_db, "create_automation", mock_create)
+    monkeypatch.setattr(auto_db, "update_automation", mock_update)
 
     res_create = await schedule_dalton_automation_helper(
         "user-1",
@@ -137,6 +233,22 @@ async def test_automation_naming_templates_and_schedule_helper(monkeypatch):
     assert res_create["ok"] is True
     assert res_create["action"] == "created"
 
+    # A8: naive next_run_at gets ZoneInfo("Asia/Shanghai") attached
+    res_once = await schedule_dalton_automation_helper(
+        "user-1",
+        "dalton-meta-earn-2026q3-t0",
+        {
+            "name": "dalton-meta-earn-2026q3-t0",
+            "trigger_type": "once",
+            "next_run_at": "2026-10-29T20:00:00",
+            "timezone": "Asia/Shanghai",
+            "instruction": "T0 flash",
+        },
+        workspace_id="ws-meta",
+    )
+    assert res_once["ok"] is True
+    assert store[-1]["next_run_at"].tzinfo == ZoneInfo("Asia/Shanghai")
+
     res_update = await schedule_dalton_automation_helper(
         user_id="user-1",
         workspace_id="ws-meta",
@@ -145,22 +257,32 @@ async def test_automation_naming_templates_and_schedule_helper(monkeypatch):
     )
     assert res_update["ok"] is True
     assert res_update["action"] == "updated"
-    assert len(store) == 1
+    assert len(store) == 2
 
 
 @pytest.mark.asyncio
 async def test_probes_detect_real_signals_and_resolve_cik():
     today = date(2026, 10, 18)
+    now_utc = datetime(2026, 10, 18, 12, 0, tzinfo=timezone.utc)
     agenda_doc = {
-        "catalysts": [
+        "next_validations": [
             {
-                "id": "C1",
-                "title": "Q3 2026 财报披露",
-                "expected_date": "2026-10-20",
-                "status": "upcoming",
-                "importance": "P0",
+                "id": "V1",
+                "check": "核对 3Q26 广告加载率环比变化",
+                "due": "2026-10-18",
             }
         ],
+        "watch": {
+            "events": [
+                {
+                    "id": "W1",
+                    "type": "earnings",
+                    "date": "2026-10-20",
+                    "date_confidence": "confirmed",
+                    "plan": "Q3 2026 财报披露",
+                }
+            ]
+        },
         "open_questions": [
             {
                 "id": "Q1",
@@ -168,8 +290,17 @@ async def test_probes_detect_real_signals_and_resolve_cik():
                 "status": "open",
                 "priority": "P0",
                 "due_date": "2026-10-18",
-            }
+            },
+            {
+                "id": "Q2",
+                "question": "处于退避期的问题不应唤醒 (A11)",
+                "status": "open",
+                "priority": "P0",
+                "due_date": "2026-10-18",
+                "next_attempt_after": "2026-10-25T00:00:00Z",
+            },
         ],
+        "wake_conditions": ["10-Q 披露后更新收入拆分"],
     }
     sigs, _ = await probe_agenda(
         workspace_id=None,
@@ -177,9 +308,31 @@ async def test_probes_detect_real_signals_and_resolve_cik():
         watch_state={},
         agenda_doc=agenda_doc,
         today=today,
+        now=now_utc,
     )
-    assert len(sigs) == 2
-    assert {s.signal_key for s in sigs} == {"catalyst:C1:2026-10-20", "question:Q1:2026-10-18"}
+    assert {s.signal_key for s in sigs} == {
+        "validation:V1:2026-10-18",
+        "catalyst:W1:2026-10-20",
+        "question:Q1:2026-10-18",
+    }
+
+    # A4: Also test against real migrated GOOGL agenda.json on disk if present
+    googl_agenda_path = Path("var/dalton/migration/Home/dalton/companies/GOOGL/data/agenda.json")
+    if googl_agenda_path.exists():
+        real_googl_agenda = json.loads(googl_agenda_path.read_text(encoding="utf-8"))
+        real_googl_agenda = copy.deepcopy(real_googl_agenda)
+        real_googl_agenda.setdefault("next_validations", []).append(
+            {"id": "V99", "check": "验证 Search AI Overview 货币化率", "due": "2026-10-18"}
+        )
+        googl_sigs, _ = await probe_agenda(
+            workspace_id=None,
+            ticker="GOOGL",
+            watch_state={},
+            agenda_doc=real_googl_agenda,
+            today=today,
+            now=now_utc,
+        )
+        assert any(s.signal_key == "validation:V99:2026-10-18" for s in googl_sigs)
 
     # SEC probe: resolves CIK automatically and records watermark on first run; second run detects new 10-Q & 8-K items
     cik = await resolve_company_cik("NVDA", watch_state={}, allow_network=False)
@@ -221,7 +374,7 @@ async def test_probes_detect_real_signals_and_resolve_cik():
     assert sec_sigs_2[0].payload["items"] == ["2.02", "9.01"]
     assert st2["last_sec_accession"] == "0001326801-26-000025"
 
-    # Internal probe: detects new docs and populates snippet & watermark
+    # Internal probe: detects new docs and populates snippet & watermark (A6)
     int_sigs, ist = await probe_internal(
         ticker="META",
         watch_state={},
@@ -239,11 +392,25 @@ async def test_probes_detect_real_signals_and_resolve_cik():
     assert int_sigs[0].signal_key == "doc:guidepoint:gp-101"
     assert int_sigs[0].payload["snippet"] == "Expert noted +15% CPM lift in Q3."
     assert ist["last_internal_doc_id"] == "gp-101"
+    assert "last_internal_check_at" in ist
 
-    # Earnings probe T-3
+    # Earnings probe T-3 reading watch.events
     earn_sigs, _ = await probe_earnings(
         ticker="META",
-        watch_state={"next_earnings_date": "2026-10-21", "next_earnings_period": "2026Q3"},
+        watch_state={},
+        agenda_doc={
+            "watch": {
+                "events": [
+                    {
+                        "id": "W1",
+                        "type": "earnings",
+                        "date": "2026-10-21",
+                        "date_confidence": "confirmed",
+                        "plan": "2026Q3 财报",
+                    }
+                ]
+            }
+        },
         today=today,
     )
     assert len(earn_sigs) == 1
@@ -252,7 +419,7 @@ async def test_probes_detect_real_signals_and_resolve_cik():
 
 @pytest.mark.asyncio
 async def test_preflight_direct_wake_vs_llm_triage_and_fallback(monkeypatch):
-    """Test G4.3: 10-Q/10-K/20-F/8-K(2.02)/agenda/earnings wake directly; Form 4/internal go to assist_json(preflight.triage)."""
+    """Test G4.3 + A2 + L33: 10-Q/10-K/20-F/8-K(2.02)/agenda/earnings wake directly; Form 4/internal go to assist_json(preflight.triage) verified via create_autospec."""
     assert is_direct_wake_signal({"probe": "sec", "payload": {"form": "10-Q"}}) is True
     assert is_direct_wake_signal({"probe": "sec", "payload": {"form": "10-K"}}) is True
     assert is_direct_wake_signal({"probe": "sec", "payload": {"form": "20-F"}}) is True
@@ -265,26 +432,24 @@ async def test_preflight_direct_wake_vs_llm_triage_and_fallback(monkeypatch):
         "automation_id": "11111111-1111-1111-1111-111111111111",
         "name": "dalton-meta-watch",
         "trigger_type": "cron",
+        "user_id": "local-dev-user",
         "workspace_id": "22222222-2222-2222-2222-222222222222",
     }
     assert is_dalton_automation(auto) is True
 
-    # Case 1: Routine Form 4 -> assist_json returns wake=False -> preflight skips
-    triage_calls: list[dict[str, Any]] = []
-
-    async def mock_triage_skip(**kwargs):
-        triage_calls.append(kwargs)
-        return {
-            "ok": True,
-            "data": {
-                "wake": False,
-                "priority": "P2",
-                "reason": "routine_form4_tax_withholding",
-                "relevant_pillar_or_question_id": None,
-            },
-        }
-
-    monkeypatch.setattr("src.dalton.autonomy.preflight.assist_json", mock_triage_skip)
+    # Case 1: Routine Form 4 -> assist_json (autospec!) returns wake=False -> preflight skips
+    mock_assist_skip = create_autospec(assist_json)
+    mock_assist_skip.return_value = AssistResult(
+        ok=True,
+        data={
+            "wake": False,
+            "priority": "P2",
+            "reason": "routine_form4_tax_withholding",
+            "relevant_pillar_or_question_id": None,
+        },
+        model="gemini-3.8-flash-low-oauth",
+    )
+    monkeypatch.setattr("src.dalton.autonomy.preflight.assist_json", mock_assist_skip)
 
     ws_form4 = {
         "cik": "0001326801",
@@ -307,17 +472,27 @@ async def test_preflight_direct_wake_vs_llm_triage_and_fallback(monkeypatch):
         agenda_doc_override={},
         persist=False,
     )
-    assert len(triage_calls) == 1
-    assert triage_calls[0]["task"] == "preflight.triage"
+    assert mock_assist_skip.await_count == 1
+    call_kwargs = mock_assist_skip.call_args.kwargs
+    assert call_kwargs["task"] == "preflight.triage"
+    assert isinstance(call_kwargs["instructions"], str) and call_kwargs["instructions"]
+    assert isinstance(call_kwargs["payload"], dict) and call_kwargs["payload"]["ticker"] == "META"
+    assert isinstance(call_kwargs["schema"], dict)
+    assert call_kwargs["user_id"] == "local-dev-user"
+    assert call_kwargs["workspace_id"] == "22222222-2222-2222-2222-222222222222"
     assert res_form4.should_wake is False
     assert res_form4.decision == "skip"
     assert res_form4.reason == "routine_form4_tax_withholding"
 
-    # Case 2: Internal doc where assist_json raises -> conservative fallback MUST wake!
-    async def mock_triage_error(**kwargs):
-        raise RuntimeError("LLM provider timeout")
-
-    monkeypatch.setattr("src.dalton.autonomy.preflight.assist_json", mock_triage_error)
+    # Case 2: Internal doc where assist_json returns ok=False -> conservative fallback MUST wake!
+    mock_assist_fail = create_autospec(assist_json)
+    mock_assist_fail.return_value = AssistResult(
+        ok=False,
+        data=None,
+        error="timeout",
+        status="failed",
+    )
+    monkeypatch.setattr("src.dalton.autonomy.preflight.assist_json", mock_assist_fail)
 
     ws_internal = {
         "pending_internal_docs": [
@@ -342,6 +517,202 @@ async def test_preflight_direct_wake_vs_llm_triage_and_fallback(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_a1_budget_keys_a3_timeout_a5_agenda_note_a7_director_a9_once_defer_a10_concurrent_claim(monkeypatch):
+    """Test A1 (budget keys), A3 (45s timeout), A5 (agenda_note schema), A7 (director idle skip), A9 (once defer), and A10 (concurrent claim)."""
+    # A1: Lock _check_budget_available and build_coverage_board against real get_budget_today return shape
+    real_budget_summary = {
+        "date": "2026-10-18",
+        "cap_usd": 45.0,
+        "spent_usd": 40.0,
+        "open_reserved_usd": 5.0,
+        "remaining_usd": 0.0,
+        "exhausted": True,
+    }
+    mock_get_budget = create_autospec(budget_service.get_budget_today)
+    mock_get_budget.return_value = real_budget_summary
+    monkeypatch.setattr(budget_service, "get_budget_today", mock_get_budget)
+    monkeypatch.setattr("src.dalton.autonomy.board.get_budget_today", mock_get_budget)
+
+    budget_ok, budget_reason = await _check_budget_available(user_id="local-dev-user")
+    assert budget_ok is False
+    assert budget_reason == "budget_exhausted"
+    mock_get_budget.assert_awaited_with(user_id="local-dev-user")
+
+    board = await build_coverage_board(user_id="local-dev-user")
+    assert board["budget"]["cap_usd"] == 45.0
+    assert board["budget"]["spent_usd"] == 40.0
+    assert board["budget"]["open_reserved_usd"] == 5.0
+    assert board["budget"]["allocatable_usd"] == 0.0
+
+    # A9: When budget is exhausted on a 'once' automation, preflight postpones next_run_at by +1d and settlement uses defer_once_1d
+    mock_log_budget = create_autospec(watch_db.insert_preflight_log)
+    mock_log_budget.return_value = {}
+    monkeypatch.setattr(watch_db, "insert_preflight_log", mock_log_budget)
+
+    orig_next_run = datetime(2026, 10, 18, 20, 0, tzinfo=timezone.utc)
+    once_auto = {
+        "automation_id": "11111111-1111-1111-1111-111111111111",
+        "name": "dalton-meta-earn-2026q3-t0",
+        "trigger_type": "once",
+        "user_id": "local-dev-user",
+        "workspace_id": "22222222-2222-2222-2222-222222222222",
+        "next_run_at": orig_next_run,
+    }
+    res_budget_once = await preflight_check(
+        once_auto,
+        "exec-once-budget",
+        persist=True,
+    )
+    assert res_budget_once.should_wake is False
+    assert res_budget_once.reason == "budget_exhausted"
+    assert once_auto["status"] == "active"
+    assert once_auto["next_run_at"] == orig_next_run + timedelta(days=1)
+    assert _schedule_action(_POLICIES[Outcome.PRECHECK_SKIPPED], once_auto, outcome=Outcome.PRECHECK_SKIPPED, excerpt="budget_exhausted ($0.00 remaining)") == "defer_once_1d"
+
+    # Restore ample budget for remaining tests
+    mock_get_budget.return_value = {
+        "date": "2026-10-18",
+        "cap_usd": 45.0,
+        "spent_usd": 5.0,
+        "open_reserved_usd": 0.0,
+        "remaining_usd": 40.0,
+        "exhausted": False,
+    }
+
+    # A3: 45s timeout (tested with timeout_s=0.05) wakes conservatively with reason="preflight_timeout"
+    async def slow_probe_sec(workspace_id=None, ticker="", watch_state=None, company_doc=None, submissions_override=None, allow_network=True, now=None):
+        await asyncio.sleep(0.3)
+        return [], watch_state or {}
+
+    monkeypatch.setattr("src.dalton.autonomy.preflight.probe_sec", slow_probe_sec)
+    res_timeout = await preflight_check(
+        {
+            "automation_id": "11111111-1111-1111-1111-111111111111",
+            "name": "dalton-meta-watch",
+            "trigger_type": "cron",
+            "workspace_id": "22222222-2222-2222-2222-222222222222",
+        },
+        "exec-timeout",
+        persist=False,
+        timeout_s=0.05,
+    )
+    assert res_timeout.should_wake is True
+    assert res_timeout.reason == "preflight_timeout"
+    monkeypatch.setattr("src.dalton.autonomy.preflight.probe_sec", probe_sec)
+
+    # A5: dalton_agenda_note op passes apply_ops + validate_update("agenda", ...) against real agenda.schema.json
+    base_agenda = {
+        "schema_version": 1,
+        "as_of": "2026-10-18T00:00:00Z",
+        "open_questions": [],
+        "next_validations": [],
+        "watch": {"events": [], "indicators": []},
+        "wake_conditions": [],
+    }
+    note_ops = [
+        {
+            "op": "append_item",
+            "path": "/open_questions",
+            "value": {
+                "question": "核实 Q4 指引隐含的 CapEx 增速",
+                "value": "high",
+                "urgency": "now",
+                "origin": "pm",
+                "owner": "pm",
+                "status": "open",
+                "why": "PM 经研究总监追加",
+            },
+        }
+    ]
+    repaired_ops, _ = repair_knowledge_ops("agenda", base_agenda, note_ops)
+    updated_agenda, _ = apply_ops("agenda", base_agenda, repaired_ops, reason="director note")
+    val_agenda = validate_update("agenda", base_agenda, updated_agenda, source="tool", reason="director note")
+    assert val_agenda.ok is True, val_agenda.errors
+    assert updated_agenda["open_questions"][0]["owner"] == "pm"
+    assert updated_agenda["open_questions"][0]["urgency"] == "now"
+
+    # A7: probe_director skips on idle day and wakes when actionable work exists
+    idle_sigs, _ = await probe_director(
+        kind="director_daily",
+        watch_state={
+            "actionable_counts": {
+                "due_validations": 0,
+                "actionable_questions": 0,
+                "stale_signals_24h": 0,
+                "publish_near_or_past_ttl": 0,
+                "unconfirmed_earnings_14d": 0,
+            }
+        },
+        persist=False,
+    )
+    assert idle_sigs == []
+
+    busy_sigs, _ = await probe_director(
+        kind="director_daily",
+        watch_state={
+            "actionable_counts": {
+                "due_validations": 2,
+                "actionable_questions": 0,
+                "stale_signals_24h": 1,
+                "publish_near_or_past_ttl": 0,
+                "unconfirmed_earnings_14d": 0,
+            }
+        },
+        persist=False,
+    )
+    assert len(busy_sigs) == 1
+    assert busy_sigs[0].probe == "director"
+
+    # A10: concurrent claim returning empty list causes preflight_check to skip with already_claimed_by_concurrent_run
+    mock_upsert = create_autospec(watch_db.upsert_signal)
+    mock_upsert.return_value = (
+        {"signal_id": "sig-1", "signal_key": "question:Q9:2026-10-18", "status": "pending"},
+        True,
+    )
+    mock_claim = create_autospec(watch_db.claim_signals_woken)
+    mock_claim.return_value = []
+    mock_get_ws = create_autospec(watch_db.get_watch_state)
+    mock_get_ws.return_value = {}
+    mock_upsert_ws = create_autospec(watch_db.upsert_watch_state)
+    mock_upsert_ws.return_value = {}
+    mock_expire = create_autospec(watch_db.expire_old_signals)
+    mock_expire.return_value = []
+
+    mock_probe_sec = create_autospec(probe_sec)
+    mock_probe_sec.return_value = ([], {})
+    mock_probe_internal = create_autospec(probe_internal)
+    mock_probe_internal.return_value = ([], {})
+
+    monkeypatch.setattr(watch_db, "upsert_signal", mock_upsert)
+    monkeypatch.setattr(watch_db, "claim_signals_woken", mock_claim)
+    monkeypatch.setattr(watch_db, "get_watch_state", mock_get_ws)
+    monkeypatch.setattr(watch_db, "upsert_watch_state", mock_upsert_ws)
+    monkeypatch.setattr(watch_db, "expire_old_signals", mock_expire)
+    monkeypatch.setattr("src.dalton.autonomy.preflight.probe_sec", mock_probe_sec)
+    monkeypatch.setattr("src.dalton.autonomy.preflight.probe_internal", mock_probe_internal)
+
+    today_iso = datetime.now(timezone.utc).date().isoformat()
+    res_concurrent = await preflight_check(
+        {
+            "automation_id": "11111111-1111-1111-1111-111111111111",
+            "name": "dalton-meta-watch",
+            "trigger_type": "cron",
+            "workspace_id": "22222222-2222-2222-2222-222222222222",
+        },
+        "33333333-3333-3333-3333-333333333333",
+        watch_state_override={},
+        agenda_doc_override={
+            "open_questions": [
+                {"id": "Q9", "question": "Concurrent test", "status": "open", "priority": "P0", "due_date": today_iso}
+            ]
+        },
+        persist=True,
+    )
+    assert res_concurrent.should_wake is False
+    assert res_concurrent.reason == "already_claimed_by_concurrent_run"
+
+
+@pytest.mark.asyncio
 async def test_preflight_check_skips_when_no_signals_and_wakes_once():
     auto = {
         "automation_id": "11111111-1111-1111-1111-111111111111",
@@ -356,7 +727,7 @@ async def test_preflight_check_skips_when_no_signals_and_wakes_once():
         auto,
         "exec-1",
         watch_state_override=watch_state,
-        agenda_doc_override={"catalysts": [], "open_questions": []},
+        agenda_doc_override={"next_validations": [], "open_questions": []},
         persist=False,
     )
     assert res_skip.should_wake is False
@@ -419,13 +790,11 @@ async def test_signal_lifecycle_resolve_and_expire(monkeypatch):
         "question:Q9:2026-10-18",
     ]
 
-    called_args: list[Any] = []
-
-    async def fake_resolve(signal_ids=None, **kwargs):
-        called_args.append((signal_ids, kwargs))
-        return len(signal_ids or [])
-
-    monkeypatch.setattr(watch_db, "resolve_signals", fake_resolve)
+    mock_resolve = create_autospec(watch_db.resolve_signals)
+    mock_resolve.side_effect = (
+        lambda signal_ids=None, *, signal_refs=None, workspace_id=None, ticker=None, resolved_by=None, execution_id=None: len(signal_ids or [])
+    )
+    monkeypatch.setattr(watch_db, "resolve_signals", mock_resolve)
 
     count = await resolve_verdict_signals(
         workspace_id="22222222-2222-2222-2222-222222222222",
@@ -433,8 +802,8 @@ async def test_signal_lifecycle_resolve_and_expire(monkeypatch):
         verdict_id="VD-20261018-01",
     )
     assert count == 1
-    assert called_args[0][0] == ["filing:0001045810-26-000012"]
-    assert called_args[0][1]["resolved_by"] == "VD-20261018-01"
+    assert mock_resolve.call_args.args[0] == ["filing:0001045810-26-000012"]
+    assert mock_resolve.call_args.kwargs["resolved_by"] == "VD-20261018-01"
 
     # Test expire_old_signals with mock cursor
     mock_cur = AsyncMock()
@@ -465,3 +834,4 @@ def test_format_wake_directive():
     assert "knowledge_append_verdict" in xml
     assert "trigger_signals: [filing:0001]" in xml
     assert "</dalton_wake>" in xml
+
