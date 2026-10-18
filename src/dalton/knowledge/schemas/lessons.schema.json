@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema", "$id": "https://dalton.local/schemas/lessons",
+  "type": "object", "additionalProperties": false,
+  "properties": {
+    "schema_version": {"const": 1},
+    "lessons": {"type": "array", "items": {"type": "object", "additionalProperties": false,
+      "properties": {
+        "id": {"type": "string", "pattern": "^L-\\d{3}$"},
+        "statement": {"type": "string"},
+        "applies_when": {"type": "string", "description": "适用条件，必须具体到可判断"},
+        "does_not_apply_when": {"type": "string"},
+        "counterexamples": {"type": "array", "items": {"type": "object", "additionalProperties": false,
+          "properties": {"text": {"type": "string"}, "ref": {"$ref": "common#/$defs/evidenceRef"}, "at": {"$ref": "common#/$defs/isoTime"}},
+          "required": ["text","at"]}},
+        "origin": {"type": "object", "additionalProperties": false,
+          "properties": {"event": {"type": "string"}, "at": {"$ref": "common#/$defs/isoDate"}, "verdict_id": {"type": "string"},
+                         "ref": {"$ref": "common#/$defs/evidenceRef"}},
+          "required": ["event","at"]},
+        "scope": {"enum": ["company","sector","fund"], "description": "sector/fund 级教训由研究总监提升到用户层记忆（PK.6）"},
+        "confidence": {"enum": ["high","medium","low"]},
+        "status": {"enum": ["active","retracted"]},
+        "retracted": {"type": "object", "additionalProperties": false,
+          "properties": {"at": {"$ref": "common#/$defs/isoTime"}, "reason": {"type": "string"}}, "required": ["at","reason"]},
+        "created_at": {"$ref": "common#/$defs/isoTime"}
+      },
+      "required": ["id","statement","applies_when","origin","scope","confidence","status","created_at"]}}
+  },
+  "required": ["schema_version","lessons"]
+}

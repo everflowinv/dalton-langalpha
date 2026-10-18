@@ -1,0 +1,29 @@
+{{ header_comment }}
+
+# {{ ticker }} 核心分歧（Top Debates）
+
+- **更新时间**：{{ doc.as_of }}
+
+{% if doc.debates %}
+| ID | 排序 | 变量 | 核心问题 | 我方倾向（置信度） | 市场倾向 | 状态 |
+|---|---|---|---|---|---|---|
+{% for d in doc.debates %}| **{{ d.id }}** | {{ d.rank or loop.index }} | {{ d.variable }} | {{ d.question }} | `{{ d.my_view.side }}` (`{{ d.my_view.confidence }}`) | `{{ d.market_lean.side if d.market_lean else "unknown" }}` | `{{ d.status }}` |
+{% endfor %}
+
+{% for d in doc.debates %}
+## {{ d.id }}：{{ d.variable }} — {{ d.question }}
+
+- **状态**：`{{ d.status }}` ｜ **开启时间**：{{ d.opened_at[:10] }}{% if d.why_it_matters %} ｜ **重要性**：{{ d.why_it_matters }}{% endif %}
+- **多方（Bull）**：{{ d.bull.case }}{% if d.bull.who %}（代表：{{ d.bull.who }}）{% endif %}
+- **空方（Bear）**：{{ d.bear.case }}{% if d.bear.who %}（代表：{{ d.bear.who }}）{% endif %}
+- **我方判断（My View）**：`{{ d.my_view.side }}` / 置信度 `{{ d.my_view.confidence }}` — {{ d.my_view.text }}
+- **最强反驳（Strongest Rebuttal，针对 `{{ d.strongest_rebuttal.against }}`）**：{{ d.strongest_rebuttal.text }}
+- **改判条件（Flip Condition）**：{{ d.flip_condition.text }}
+{% if d.history %}
+- **演变历史**：
+{% for h in d.history %}  - `{{ h.at[:10] }}`：{{ h.change }}（原因：{{ h.reason }}）
+{% endfor %}{% endif %}
+{% endfor %}
+{% else %}
+暂无分歧记录。
+{% endif %}

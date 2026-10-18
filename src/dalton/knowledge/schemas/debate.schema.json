@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema", "$id": "https://dalton.local/schemas/debate",
+  "type": "object", "additionalProperties": false,
+  "properties": {
+    "schema_version": {"const": 1}, "as_of": {"$ref": "common#/$defs/isoTime"},
+    "debates": {"type": "array", "items": {"$ref": "#/$defs/debate"}}
+  },
+  "required": ["schema_version","as_of","debates"],
+  "$defs": {
+    "side": {"type": "object", "additionalProperties": false,
+      "properties": {"case": {"type": "string"}, "who": {"type": "string", "description": "持这一方的典型机构/卖方，按来源链去重"},
+                     "evidence_ids": {"type": "array", "items": {"type": "string"}},
+                     "evidence_refs": {"type": "array", "items": {"$ref": "common#/$defs/evidenceRef"}}},
+      "required": ["case"]},
+    "debate": {"type": "object", "additionalProperties": false,
+      "properties": {
+        "id": {"type": "string", "pattern": "^D\\d+$"},
+        "variable": {"type": "string", "description": "分歧变量，如 FY26 Capex 指引上限"},
+        "question": {"type": "string"},
+        "why_it_matters": {"type": "string", "description": "对 EPS / 倍数 / 股价的量级"},
+        "rank": {"type": "integer", "minimum": 1},
+        "bull": {"$ref": "#/$defs/side"}, "bear": {"$ref": "#/$defs/side"},
+        "strongest_rebuttal": {"type": "object", "additionalProperties": false,
+          "properties": {"against": {"enum": ["bull","bear","my_view"]}, "text": {"type": "string"}},
+          "required": ["against","text"], "description": "对我方判断最强的反驳"},
+        "my_view": {"type": "object", "additionalProperties": false,
+          "properties": {"side": {"enum": ["bull","bear","neutral","undecided"]}, "confidence": {"enum": ["high","medium","low"]}, "text": {"type": "string"}},
+          "required": ["side","confidence","text"]},
+        "market_lean": {"type": "object", "additionalProperties": false,
+          "properties": {"side": {"enum": ["bull","bear","split","unknown"]}, "evidence": {"type": "string"}}},
+        "flip_condition": {"type": "object", "additionalProperties": false,
+          "properties": {"text": {"type": "string"}, "driver_ids": {"type": "array", "items": {"type": "string"}},
+                         "threshold": {"$ref": "common#/$defs/threshold"}},
+          "required": ["text"]},
+        "linked_pillars": {"type": "array", "items": {"type": "string"}},
+        "status": {"enum": ["open","resolved","dormant"]},
+        "opened_at": {"$ref": "common#/$defs/isoTime"},
+        "last_reviewed_at": {"$ref": "common#/$defs/isoTime"},
+        "history": {"type": "array", "description": "只追加",
+          "items": {"type": "object", "additionalProperties": false,
+            "properties": {"at": {"$ref": "common#/$defs/isoTime"}, "change": {"type": "string"}, "reason": {"type": "string"},
+                           "evidence_ids": {"type": "array", "items": {"type": "string"}}, "verdict_id": {"type": "string"}},
+            "required": ["at","change","reason"]}}
+      },
+      "required": ["id","variable","question","bull","bear","strongest_rebuttal","my_view","flip_condition","status","opened_at","history"]}
+  }
+}

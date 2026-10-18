@@ -1,0 +1,61 @@
+{{ header_comment }}
+
+# {{ ticker }} 自主研究议程（Research Agenda）
+
+- **更新时间**：{{ doc.as_of }}
+{% if doc.last_session %}- **最近一次运行**：{{ doc.last_session.at }}（{{ doc.last_session.summary }}{% if doc.last_session.verdict_id %}，结论：`{{ doc.last_session.verdict_id }}`{% endif %}）{% endif %}
+{% if doc.last_verdict %}- **最新事件结论**：`{{ doc.last_verdict.verdict_id }}` · `{{ doc.last_verdict.word }}` ({{ verdict_zh.get(doc.last_verdict.word, doc.last_verdict.word) }}) · {{ doc.last_verdict.at }}{% endif %}
+{% if doc.next_wake %}- **下次计划唤醒**：{{ doc.next_wake.at }}（原因：{{ doc.next_wake.reason }}）{% endif %}
+
+## 待解研究问题（Open Questions）
+
+{% if doc.open_questions %}
+| ID | 价值 | 紧迫度 | 状态 | 责任方 | 问题 | 原因与意义 | 尝试次数 | 下次可尝试时间 |
+|---|---|---|---|---|---|---|---|---|
+{% for q in doc.open_questions %}| **{{ q.id }}** | `{{ q.value }}` | `{{ q.urgency }}` | `{{ q.status }}` | `{{ q.owner }}` | {{ q.question }} | {{ q.why }} | {{ q.attempts | length }} | {{ q.next_attempt_after or "随时" }} |
+{% endfor %}
+{% else %}
+暂无待解问题。
+{% endif %}
+
+## 近期验证点（Next Validations）
+
+{% if doc.next_validations %}
+| ID | 预计日期 | 状态 | 验证事项 | 预期结果 | 数据来源 |
+|---|---|---|---|---|---|
+{% for v in doc.next_validations %}| **{{ v.id }}** | {{ v.due }} | `{{ v.status }}` | {{ v.what }} | {{ v.expected }} | {{ v.source or "—" }} |
+{% endfor %}
+{% else %}
+暂无待验证事项。
+{% endif %}
+
+## 监控与催化剂日历（Watch & Catalysts）
+
+{% if doc.watch and doc.watch.events %}
+| ID | 事件类型 | 日期 | 日期状态 | 来源 | 应对计划 |
+|---|---|---|---|---|---|
+{% for ev in doc.watch.events %}| **{{ ev.id }}** | `{{ ev.type }}` | {{ ev.date or "待定" }} | {{ "已确认" if ev.date_status == "confirmed" else ("待确认" if ev.date_status == "estimated" else "未知") }} (`{{ ev.date_status }}`) | {{ ev.source or "—" }} | {{ ev.plan or "—" }} |
+{% endfor %}
+{% else %}
+暂无监控事件。
+{% endif %}
+
+## 唤醒条件（Wake Conditions）
+
+{% if doc.wake_conditions %}
+| ID | 类型 | 启用 | 触发后动作 |
+|---|---|---|---|
+{% for c in doc.wake_conditions %}| **{{ c.id }}** | `{{ c.kind }}` | {{ "是" if c.enabled else "否" }} | {{ c.action }} |
+{% endfor %}
+{% else %}
+暂无唤醒条件。
+{% endif %}
+
+{% if doc.pm_handoffs %}
+## 等待 PM 事项（PM Handoffs）
+
+| ID | 类型 | 状态 | 事项 | 提交时间 |
+|---|---|---|---|---|
+{% for h in doc.pm_handoffs %}| **{{ h.id }}** | `{{ h.kind }}` | `{{ h.status }}` | {{ h.what }} | {{ h.since }} |
+{% endfor %}
+{% endif %}

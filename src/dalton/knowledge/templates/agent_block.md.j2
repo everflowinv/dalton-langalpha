@@ -1,0 +1,13 @@
+<!-- dalton:summary:start (由 knowledge_update 维护；手改会在下次更新时被重写) -->
+# {{ header_title }}
+**一句话**：{{ one_liner_line }}
+**正式版本**：{{ official_line }}
+**Thesis 状态**：{{ thesis_status_line }}
+**Top debates**：{{ debates_line }}
+**下一项验证**：{{ next_validation_line }}
+**上次结论**：{{ last_verdict_line }}
+{% if waiting_pm_line %}**等待 PM**：{{ waiting_pm_line }}
+{% endif %}**文件**：thesis.md · debate.md · drivers.md · management.md · lessons.md · agenda.md · verdicts.md · model/（{{ model_current }}）· published/INDEX.md
+**规则**：改知识层用 knowledge_update / knowledge_append_verdict；直接修改会被记录并提示合入；published/ 按约定不改写。
+{% if alert_lines %}**提示**：{{ alert_lines }}
+{% endif %}<!-- dalton:summary:end -->

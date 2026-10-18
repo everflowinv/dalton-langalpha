@@ -926,6 +926,10 @@ async def astream_ptc_workflow(
                 await ws_manager.backup_changed_projects(
                     workspace_id, session=session
                 )
+                # DALTON-HOOK(knowledge-reconcile): detect direct edits after mirror backup
+                if workspace_id and user_id:
+                    from src.dalton.knowledge.reconcile import detect_direct_edits
+                    asyncio.create_task(detect_direct_edits(str(workspace_id), str(user_id)))
             except Exception as e:
                 logger.warning(
                     f"[PTC_COMPLETE] file backup failed for {thread_id}: {e}"

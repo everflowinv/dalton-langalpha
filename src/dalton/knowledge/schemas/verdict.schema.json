@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema", "$id": "https://dalton.local/schemas/verdict",
+  "type": "object", "additionalProperties": false,
+  "properties": {
+    "id": {"type": "string", "pattern": "^VD-\\d{8}-\\d{2,3}$"},
+    "at": {"$ref": "common#/$defs/isoTime"},
+    "trigger": {"type": "object", "additionalProperties": false,
+      "properties": {"kind": {"enum": ["filing","earnings","price_move","consensus_change","indicator","due_validation","pm_question","internal_material","agenda","director","manual"]},
+                     "ref": {"type": "string", "description": "预检信号 id、accession、V-/Q- id 等"},
+                     "automation_execution_id": {"type": "string"}},
+      "required": ["kind"]},
+    "event": {"type": "string", "description": "一句话事件"},
+    "verdict": {"$ref": "common#/$defs/verdictWord"},
+    "affected": {"type": "object", "additionalProperties": false,
+      "properties": {"pillars": {"type": "array", "items": {"type": "string"}}, "debates": {"type": "array", "items": {"type": "string"}}, "drivers": {"type": "array", "items": {"type": "string"}}}},
+    "rationale": {"type": "string"},
+    "evidence_ids": {"type": "array", "items": {"type": "string"}},
+    "house_view_changed": {"type": "boolean"},
+    "next_validation": {"type": "object", "additionalProperties": false,
+      "properties": {"what": {"type": "string"}, "due": {"$ref": "common#/$defs/isoDate"}, "validation_id": {"type": "string"}},
+      "required": ["what","due"]},
+    "progress": {"enum": ["none","some","resolved"], "description": "对议程问题的进展，用于退避（PK.18）"},
+    "question_ids": {"type": "array", "items": {"type": "string"}}
+  },
+  "required": ["at","trigger","event","verdict","rationale","next_validation","progress"]
+}

@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema", "$id": "https://dalton.local/schemas/company",
+  "type": "object", "additionalProperties": false,
+  "properties": {
+    "schema_version": {"const": 1},
+    "ticker": {"type": "string", "pattern": "^[A-Z0-9.]{1,12}$"},
+    "exchange": {"enum": ["NASDAQ","NYSE","HKEX","SSE","SZSE","OTHER"]},
+    "name": {"type": "string"}, "name_zh": {"type": "string"},
+    "coverage_tier": {"enum": ["core","watch"]},
+    "coverage_stage": {"enum": ["onboarding","initial","full","maintenance","paused"]},
+    "sector": {"type": "string"}, "currency": {"type": "string"},
+    "fiscal_year_end": {"type": "string", "pattern": "^\\d{2}-\\d{2}$"},
+    "identifiers": {"type": "object", "additionalProperties": false,
+      "properties": {"cik": {"type": "string"}, "hk_code": {"type": "string"}, "cn_code": {"type": "string"}}},
+    "peers": {"type": "array", "items": {"type": "string"}},
+    "benchmarks": {"type": "array", "items": {"type": "string"}, "description": "板块 ETF / 指数，股价异动时用来分 beta 和 alpha"},
+    "one_liner": {"type": "string", "maxLength": 200},
+    "covered_since": {"$ref": "common#/$defs/isoDate"},
+    "autonomy": {"type": "object", "additionalProperties": false,
+      "properties": {"enabled": {"type": "boolean"}, "max_usd_per_day": {"type": "number", "minimum": 0}}}
+  },
+  "required": ["schema_version","ticker","exchange","name","coverage_tier","coverage_stage","one_liner"]
+}

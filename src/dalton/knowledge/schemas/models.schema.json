@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema", "$id": "https://dalton.local/schemas/models",
+  "type": "object", "additionalProperties": false,
+  "properties": {
+    "schema_version": {"const": 1},
+    "current": {"type": "string", "description": "当前版本 id，如 v12"},
+    "versions": {"type": "array", "description": "只追加", "items": {"type": "object", "additionalProperties": false,
+      "properties": {"id": {"type": "string", "pattern": "^v\\d+$"}, "path": {"type": "string", "pattern": "^model/.+\\.xlsx$"},
+                     "sha256": {"type": "string", "description": "服务端读文件计算"}, "created_at": {"$ref": "common#/$defs/isoTime"},
+                     "reason": {"type": "string"}, "recalculated": {"type": "boolean", "description": "是否已跑 xlsx skill 的 recalc.py"},
+                     "key_outputs": {"type": "array", "items": {"type": "object", "additionalProperties": false,
+                       "properties": {"name": {"type": "string"}, "cell": {"type": "string"}, "value": {"type": "number"}, "unit": {"$ref": "common#/$defs/unit"}, "period": {"$ref": "common#/$defs/period"}},
+                       "required": ["name","cell"]}}},
+      "required": ["id","path","created_at","reason"]}}
+  },
+  "required": ["schema_version","versions"]
+}
