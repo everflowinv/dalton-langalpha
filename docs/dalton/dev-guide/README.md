@@ -12,7 +12,7 @@
 | `P0D-P1-data-and-onboarding.md` | researchdata 桥接、SEC 数据、来源记录；基金方法论 skill、覆盖名单、公司工作区初始化、旧认知迁移 | 数据工程师、内容工程师 |
 | `PK-knowledge-governance-autonomy.md` | 公司知识层、发布治理、自主研究议程、界面小改 | 后端工程师 |
 | `PS-analyst-skills-and-workflows.md` | 分析师的 skill、workflow、自动任务，以及验收样例 | 内容工程师 |
-| `P0N-native-models.md` | 模型改为以 LangAlpha 原生接入为默认路径；broker v2 保留为并行可选路径 | 平台工程师 |
+| `P0N-native-models.md` | 模型改为以 LangAlpha 原生接入为默认路径；broker v2 保留为并行可选路径。**包含一个严重问题的修复：主模型用订阅登录时日预算被整个跳过（P0N.6）** | 平台工程师 |
 | `P0F-acceptance-fixes.md` | 第一轮代码验收发现的 6 个问题和修正步骤 | 全体，**先做** |
 | `PROGRESS.md` | 开发进度。状态分三档，每档都要附证据（见 P0F.5） | 全体，持续更新 |
 | `REVIEW-CHECKLIST.md` | 第一轮代码的审查清单：7 个模块，每个模块要查什么、怎么查、交付什么 | 审查人 |
