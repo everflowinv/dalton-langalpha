@@ -136,6 +136,12 @@ export function DaltonBudgetCard() {
             订阅名义用量（不计入现金额度）：$
             {(today?.subscription_notional_usd ?? 0).toFixed(2)}
           </span>
+          <span>
+            {t(
+              'dalton.budget.byokCashNote',
+              '注：设置页填写的现金类 BYOK Key 同样计入本地日美元现金额度（L24）',
+            )}
+          </span>
           {today?.budget_gate_enabled === false && (
             <span style={{ color: 'var(--color-warning)' }}>
               ⚠ 预算闸门未开启（DALTON_BUDGET_GATE!=1）

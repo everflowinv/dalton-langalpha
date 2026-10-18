@@ -22,7 +22,10 @@ from src.dalton.budget.service import (
     reconcile_and_summarize_day,
     resolve_user_budget_config,
 )
-from src.dalton.database.budget import resolve_effective_task_cap
+from src.dalton.database.budget import (
+    fetch_scoped_task_spend,
+    resolve_effective_task_cap,
+)
 from src.dalton.database.llm_journal import (
     claim_journal_invocation,
     complete_journal_done,
@@ -353,9 +356,17 @@ async def _check_cash_budget_admission(
                     workspace_id,
                     cfg.get("default_task_cap_usd"),
                 )
-                if task_cap is not None and task_cap <= Decimal("0"):
-                    msg = format_task_cap_exhausted_message(task_cap, Decimal("0"))
-                    return False, "task_cap_exhausted", msg
+                if task_cap is not None:
+                    task_spent = await fetch_scoped_task_spend(
+                        conn,
+                        user_id,
+                        thread_id=thread_id,
+                        workspace_id=workspace_id,
+                        summary_rows=summary.get("_raw_rows"),
+                    )
+                    if task_cap <= Decimal("0") or task_spent >= task_cap:
+                        msg = format_task_cap_exhausted_message(task_cap, task_spent)
+                        return False, "task_cap_exhausted", msg
 
     return True, None, None
 
@@ -593,6 +604,12 @@ async def dalton_complete(
         )
 
     # 4. Invoke underlying LLMService.complete
+    # R2-N1 #6: Separate pre-call/in-call errors from post-call errors so an exception
+    # after the upstream LLM already returned is ALWAYS recorded as `indeterminate`
+    # (never `failed`), preventing double billing on retry.
+    llm_call_completed = False
+    cash_dec: Decimal | None = None
+    notional_dec: Decimal | None = None
     try:
         if llm_service is None:
             from ptc_agent.config import load_from_files
@@ -622,6 +639,7 @@ async def dalton_complete(
             ),
             timeout=timeout_s,
         )
+        llm_call_completed = True
 
         if isinstance(raw_result, tuple) and len(raw_result) == 2:
             out_obj, token_usage = raw_result
@@ -661,13 +679,19 @@ async def dalton_complete(
             attempt=attempt,
         )
     except Exception as exc:
-        target_state, error_kind = _classify_exception(exc)
+        if llm_call_completed:
+            target_state = "indeterminate"
+            error_kind = "post_call_error"
+        else:
+            target_state, error_kind = _classify_exception(exc)
         safe_msg = sanitize_error_text(exc, max_len=240)
         await complete_journal_failed(
             inv_id,
             error_kind=error_kind,
             error_text=safe_msg,
             state=target_state,
+            cash_usd=cash_dec,
+            notional_usd=notional_dec,
         )
         if provider:
             await record_provider_event(
@@ -700,3 +724,4 @@ async def dalton_complete(
 
 
 journaled_complete = dalton_complete
+

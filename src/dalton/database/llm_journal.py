@@ -129,6 +129,8 @@ async def inspect_journal_state(
 
             state = str(row.get("state") or "")
             if state == "done":
+                if row.get("response") is None:
+                    return "proceed", row
                 return "done", row
 
             if state == "pending":
@@ -244,7 +246,7 @@ async def claim_journal_invocation(
                 return "conflict", existing
 
             state = str(existing.get("state") or "")
-            if state == "done":
+            if state == "done" and existing.get("response") is not None:
                 return "done", existing
 
             if state == "pending":
@@ -272,7 +274,7 @@ async def claim_journal_invocation(
             if state == "indeterminate" and not resend_indeterminate:
                 return "indeterminate", existing
 
-            # Either state == 'failed', or (state in ('pending', 'indeterminate') and resend_indeterminate=True)
+            # Either state == 'failed', response was pruned on 'done', or resend_indeterminate=True
             await cur.execute(
                 """
                 UPDATE dalton_llm_journal
@@ -411,7 +413,10 @@ async def fetch_journal_rows_in_window(
     user_id: str | None = None,
     conn: Any = None,
 ) -> list[dict[str, Any]]:
-    """Fetch journal rows created within `[day_start_utc, day_end_utc)` for budget and provider summaries."""
+    """Fetch journal rows created within `[day_start_utc, day_end_utc)` for budget and provider summaries.
+
+    P0H §5 B2: Errors are logged at ERROR level and re-raised so budget reconciliation fails closed.
+    """
     async def _do_fetch(c: Any) -> list[dict[str, Any]]:
         async with c.cursor(row_factory=dict_row) as cur:
             await cur.execute(
@@ -436,5 +441,41 @@ async def fetch_journal_rows_in_window(
         async with get_db_connection() as db_conn:
             return await _do_fetch(db_conn)
     except Exception as exc:
-        logger.debug("[DaltonLLMJournal] fetch_journal_rows_in_window failed: %s", exc)
-        return []
+        logger.error("[DaltonLLMJournal] fetch_journal_rows_in_window failed: %s", exc)
+        raise
+
+
+async def prune_expired_journal_responses(
+    conn_or_cur: Any = None,
+    *,
+    retention_days: int = 30,
+) -> int:
+    """Clear `response` JSONB on `state='done'` journal rows older than `retention_days` (P0H §5 B1).
+
+    Preserves all metadata and accounting columns (`invocation_id`, `model_key`, `provider`,
+    `billing_type`, `request_hash`, `state`, `usage`, `cash_usd`, `notional_usd`, `created_at`).
+    """
+    days = max(1, int(retention_days))
+    query = """
+        UPDATE dalton_llm_journal
+        SET response = NULL
+        WHERE state = 'done'
+          AND response IS NOT NULL
+          AND created_at < NOW() - make_interval(days => %s)
+    """
+
+    async def _run_on_cur(cur: Any) -> int:
+        await cur.execute(query, (days,))
+        return int(cur.rowcount or 0)
+
+    if conn_or_cur is not None:
+        if hasattr(conn_or_cur, "cursor"):
+            async with conn_or_cur.cursor() as cur:
+                return await _run_on_cur(cur)
+        return await _run_on_cur(conn_or_cur)
+
+    async with get_db_connection() as db_conn:
+        async with db_conn.transaction():
+            async with db_conn.cursor() as cur:
+                return await _run_on_cur(cur)
+

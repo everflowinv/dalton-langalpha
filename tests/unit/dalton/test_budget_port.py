@@ -625,3 +625,246 @@ def test_openclaw_catalog_tiered_pricing_and_discrepancy():
     assert len(in_tiers) == 2
     assert in_tiers[0]["max_tokens"] == 272000
     assert in_tiers[1]["rate"] == 5.0
+
+
+@pytest.mark.asyncio
+async def test_b1_prune_expired_journal_responses_preserves_metadata_and_clears_response():
+    """P0H §5 B1: `prune_expired_journal_responses` sets `response = NULL` on >30d `done` rows
+    while keeping metadata/cost columns, and `inspect_journal_state` treats pruned `done` rows as `proceed`."""
+    from src.dalton.database.llm_journal import (
+        inspect_journal_state,
+        prune_expired_journal_responses,
+    )
+
+    executed_queries: list[tuple[str, tuple]] = []
+
+    class _FakeCursor:
+        rowcount = 3
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def execute(self, sql: str, params: tuple = ()):
+            executed_queries.append((sql, params))
+
+        async def fetchone(self):
+            return {
+                "invocation_id": "lj1:old",
+                "request_hash": "hash-1",
+                "state": "done",
+                "response": None,
+                "cash_usd": Decimal("0.05"),
+                "notional_usd": Decimal("0"),
+            }
+
+    class _FakeConn:
+        def cursor(self, **kwargs):
+            return _FakeCursor()
+
+    pruned_count = await prune_expired_journal_responses(_FakeConn(), retention_days=30)
+    assert pruned_count == 3
+    sql_text, sql_params = executed_queries[0]
+    assert "SET response = NULL" in sql_text
+    assert "DELETE" not in sql_text.upper()
+    assert sql_params == (30,)
+
+    action, row = await inspect_journal_state(
+        "lj1:old",
+        request_hash="hash-1",
+        conn=_FakeConn(),
+    )
+    assert action == "proceed"
+    assert row is not None
+    assert row["cash_usd"] == Decimal("0.05")
+
+
+@pytest.mark.asyncio
+async def test_b2_fetch_journal_cash_today_fails_closed_and_denies_admission():
+    """P0H §5 B2: When `fetch_journal_cash_today` fails in `reconcile_and_summarize_day`,
+    it must raise (not return $0) and `enforce_local_admission` must reject admission (503)."""
+    from datetime import datetime, timezone
+    from unittest.mock import create_autospec
+    import src.dalton.budget.service as budget_svc
+    from src.dalton.database.budget import fetch_journal_cash_today
+
+    class _BrokenCur:
+        async def execute(self, *args, **kwargs):
+            raise RuntimeError("relation dalton_llm_journal unavailable")
+
+    now = datetime.now(timezone.utc)
+    with pytest.raises(RuntimeError, match="dalton_llm_journal unavailable"):
+        await fetch_journal_cash_today(_BrokenCur(), now, now, user_id="u1")
+
+    mock_conn = _make_mock_conn()
+    with (
+        patch("src.dalton.budget.gate.get_db_connection", return_value=mock_conn),
+        patch.object(
+            budget_svc,
+            "fetch_journal_cash_today",
+            new=create_autospec(
+                budget_svc.fetch_journal_cash_today,
+                side_effect=RuntimeError("journal query failed"),
+            ),
+        ),
+        patch.object(
+            budget_svc,
+            "resolve_user_budget_config",
+            new=create_autospec(
+                budget_svc.resolve_user_budget_config,
+                return_value={
+                    "user_id": "u1",
+                    "daily_cap_usd": Decimal("20.00"),
+                    "default_task_cap_usd": None,
+                    "timezone": "Asia/Shanghai",
+                    "configured": True,
+                },
+            ),
+        ),
+        patch.object(
+            budget_svc,
+            "acquire_budget_advisory_lock",
+            new=create_autospec(budget_svc.acquire_budget_advisory_lock, return_value=None),
+        ),
+        patch.object(
+            budget_svc,
+            "reconcile_reservations_sql",
+            new=create_autospec(budget_svc.reconcile_reservations_sql, return_value=None),
+        ),
+        patch.object(
+            budget_svc,
+            "fetch_day_reservations",
+            new=create_autospec(budget_svc.fetch_day_reservations, return_value=[]),
+        ),
+        patch.object(
+            budget_svc,
+            "fetch_unreserved_usage_today",
+            new=create_autospec(
+                budget_svc.fetch_unreserved_usage_today, return_value=Decimal("0")
+            ),
+        ),
+    ):
+        with pytest.raises(HTTPException) as exc_info:
+            await enforce_local_admission("u1", byok=False)
+        assert exc_info.value.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_b3_scoped_task_cap_and_post_call_indeterminate():
+    """P0H §5 B3 & R2-N1 #6:
+    1. `_check_cash_budget_admission` rejects when cumulative workspace cash spend >= `task_cap`.
+    2. Post-call serialization errors in `dalton_complete` mark the journal row `indeterminate` (never `failed`)."""
+    from unittest.mock import create_autospec
+    import src.dalton.llm.complete as complete_mod
+
+    mock_conn = _make_mock_conn()
+    fake_summary = {
+        "configured": True,
+        "retry_after_seconds": 1800,
+        "_raw_rows": [
+            {
+                "run_ref": "r1",
+                "thread_id": "t-1",
+                "workspace_id": "ws-1",
+                "charge_usd": Decimal("5.20"),
+            }
+        ],
+        "_decimals": {
+            "cap_usd": Decimal("30.00"),
+            "spent_usd": Decimal("5.20"),
+            "settled_usd": Decimal("5.20"),
+            "unreserved_usage_usd": Decimal("0.00"),
+            "open_reserved_usd": Decimal("0.00"),
+            "expired_conservative_usd": Decimal("0.00"),
+        },
+    }
+
+    with (
+        patch("src.dalton.llm.complete.get_db_connection", return_value=mock_conn),
+        patch.object(
+            complete_mod,
+            "reconcile_and_summarize_day",
+            new=create_autospec(
+                complete_mod.reconcile_and_summarize_day, return_value=fake_summary
+            ),
+        ),
+        patch.object(
+            complete_mod,
+            "resolve_user_budget_config",
+            new=create_autospec(
+                complete_mod.resolve_user_budget_config,
+                return_value={"default_task_cap_usd": Decimal("5.00")},
+            ),
+        ),
+        patch.object(
+            complete_mod,
+            "resolve_effective_task_cap",
+            new=create_autospec(
+                complete_mod.resolve_effective_task_cap,
+                return_value=Decimal("5.00"),
+            ),
+        ),
+    ):
+        admitted, kind, msg = await complete_mod._check_cash_budget_admission(
+            "u1", workspace_id="ws-1"
+        )
+        assert admitted is False
+        assert kind == "task_cap_exhausted"
+        assert "$5.00" in (msg or "")
+
+    # Post-call serialization exception -> state="indeterminate" (not "failed")
+    mock_llm = MagicMock()
+    mock_llm.complete = AsyncMock(
+        return_value=({"ok": True}, {"input_tokens": 100, "output_tokens": 50})
+    )
+    mock_fail = create_autospec(complete_mod.complete_journal_failed, return_value=None)
+    with (
+        patch.object(
+            complete_mod,
+            "inspect_journal_state",
+            new=create_autospec(
+                complete_mod.inspect_journal_state, return_value=("proceed", None)
+            ),
+        ),
+        patch.object(
+            complete_mod,
+            "_check_cash_budget_admission",
+            new=create_autospec(
+                complete_mod._check_cash_budget_admission,
+                return_value=(True, None, None),
+            ),
+        ),
+        patch.object(
+            complete_mod,
+            "claim_journal_invocation",
+            new=create_autospec(
+                complete_mod.claim_journal_invocation,
+                return_value=("claimed", {"attempt": 1}),
+            ),
+        ),
+        patch.object(
+            complete_mod,
+            "_serialize_response_payload",
+            side_effect=ValueError("unserializable custom object"),
+        ),
+        patch.object(complete_mod, "complete_journal_failed", new=mock_fail),
+        patch.object(
+            complete_mod,
+            "record_provider_event",
+            new=create_autospec(complete_mod.record_provider_event, return_value=None),
+        ),
+    ):
+        res = await dalton_complete(
+            mock_llm,
+            user_id="u1",
+            user_prompt="ping",
+            model="grok-4.7",
+        )
+        assert res.ok is False
+        assert res.status == "indeterminate"
+        assert res.error_kind == "post_call_error"
+        mock_fail.assert_awaited_once()
+        assert mock_fail.await_args.kwargs["state"] == "indeterminate"
+

@@ -421,7 +421,10 @@ async def fetch_journal_cash_today(
     day_end_utc: datetime,
     user_id: str | None = None,
 ) -> Decimal:
-    """Sum `cash_usd` from `dalton_llm_journal` for today where `state IN ('done', 'indeterminate')` (P0N.6 §5, P0N.7)."""
+    """Sum `cash_usd` from `dalton_llm_journal` for today where `state IN ('done', 'indeterminate')` (P0N.6 §5, P0N.7, P0H §5 B2).
+
+    Fails closed by logging ERROR and re-raising on DB query failure.
+    """
     query = """
         SELECT COALESCE(SUM(cash_usd), 0) AS journal_cash_usd
         FROM dalton_llm_journal
@@ -447,8 +450,78 @@ async def fetch_journal_cash_today(
             val = "0"
         return Decimal(str(val))
     except Exception as exc:
-        logger.debug("[DaltonBudget] fetch_journal_cash_today skipped/failed: %s", exc)
-        return Decimal("0")
+        logger.error("[DaltonBudget] fetch_journal_cash_today failed: %s", exc)
+        raise
+
+
+async def fetch_scoped_task_spend(
+    conn: Any,
+    user_id: str,
+    *,
+    thread_id: str | None = None,
+    workspace_id: str | None = None,
+    summary_rows: list[dict[str, Any]] | None = None,
+) -> Decimal:
+    """Sum cumulative cash spend for a thread or workspace scope (P0H §5 B3).
+
+    Combines reservation charges from `summary_rows` (or `dalton_budget_reservations`)
+    and one-shot cash spend in `dalton_llm_journal` matching the scope.
+    """
+    total = Decimal("0")
+    if summary_rows is not None:
+        for r in summary_rows:
+            if not isinstance(r, dict):
+                continue
+            r_tid = str(r.get("thread_id") or "")
+            r_wid = str(r.get("workspace_id") or "")
+            if (thread_id and r_tid == str(thread_id)) or (
+                not thread_id and workspace_id and r_wid == str(workspace_id)
+            ):
+                total += Decimal(str(r.get("charge_usd") or "0"))
+    elif hasattr(conn, "cursor"):
+        async with conn.cursor(row_factory=dict_row) as cur:
+            if thread_id:
+                await cur.execute(
+                    """
+                    SELECT COALESCE(SUM(GREATEST(reserved_usd, observed_usd, COALESCE(settled_usd, 0))), 0) AS scoped_usd
+                    FROM dalton_budget_reservations
+                    WHERE user_id = %s AND thread_id = %s
+                    """,
+                    (user_id, thread_id),
+                )
+            elif workspace_id:
+                await cur.execute(
+                    """
+                    SELECT COALESCE(SUM(GREATEST(reserved_usd, observed_usd, COALESCE(settled_usd, 0))), 0) AS scoped_usd
+                    FROM dalton_budget_reservations
+                    WHERE user_id = %s AND workspace_id = %s
+                    """,
+                    (user_id, workspace_id),
+                )
+            else:
+                return total
+            row = await cur.fetchone()
+            if isinstance(row, dict):
+                total += Decimal(str(row.get("scoped_usd") or "0"))
+
+    scope_token = str(thread_id or workspace_id or "").strip()
+    if scope_token and hasattr(conn, "cursor"):
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT COALESCE(SUM(cash_usd), 0) AS journal_scoped_usd
+                FROM dalton_llm_journal
+                WHERE state IN ('done', 'indeterminate')
+                  AND (%s::text IS NULL OR user_id = %s OR user_id IS NULL)
+                  AND scope_ref LIKE %s
+                """,
+                (user_id, user_id, f"%{scope_token}%"),
+            )
+            j_row = await cur.fetchone()
+            if isinstance(j_row, dict):
+                total += Decimal(str(j_row.get("journal_scoped_usd") or "0"))
+
+    return total
 
 
 async def fetch_today_token_usages(
@@ -471,3 +544,4 @@ async def fetch_today_token_usages(
             (user_id, day_start_utc, day_end_utc),
         )
         return [dict(r) for r in await cur.fetchall()]
+
