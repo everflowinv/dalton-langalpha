@@ -1,0 +1,12 @@
+{{ header_comment }}
+
+# {{ ticker }} 经验教训与来源纪律（Lessons）
+
+{% if doc.lessons %}
+| ID | 状态 | 范围 | 置信度 | 经验陈述（Statement） | 适用条件（Applies When） | 来源事件 |
+|---|---|---|---|---|---|---|
+{% for l in doc.lessons %}| **{{ l.id }}** | `{{ l.status }}` | `{{ l.scope }}` | `{{ l.confidence }}` | {{ l.statement }}{% if l.status == "retracted" and l.retracted %} *(已撤回：{{ l.retracted.reason }})*{% endif %} | {{ l.applies_when }} | {{ l.origin.event }} ({{ l.origin.at }}) |
+{% endfor %}
+{% else %}
+暂无经验教训记录。
+{% endif %}

@@ -1,0 +1,63 @@
+{{ header_comment }}
+
+# {{ ticker }} 核心论点（Thesis）
+
+- **更新时间**：{{ doc.as_of }}
+- **一句话判断**：{{ doc.one_liner }}
+- **总体状态（Aggregate Status）**：`{{ doc.aggregate_status }}`{% if doc.aggregate_override %}（破例说明：{{ doc.aggregate_override }}）{% endif %}
+{% if doc.official %}
+- **正式版本（Official）**：v{{ doc.official.version_no }} · {{ doc.official.approved_at }} 由 {{ doc.official.approved_by }} 批准（Publication `{{ doc.official.publication_id }}`）
+{% else %}
+- **正式版本（Official）**：尚未发布正式版本（当前为研究草稿 / 迁移观点，待复核）
+{% endif %}
+
+## House View
+
+| 维度 | 内容 |
+|---|---|
+| 方向 / 置信度 | `{{ doc.house_view.stance }}` / `{{ doc.house_view.conviction }}`{% if doc.house_view.position_suggestion %}（仓位建议：`{{ doc.house_view.position_suggestion }}`）{% endif %} |
+| 核心摘要 | {{ doc.house_view.summary }} |
+{% if doc.house_view.variant_perception %}| 预期差（Variant Perception） | {{ doc.house_view.variant_perception }} |
+{% endif %}{% if doc.house_view.target %}| 目标价 | {{ doc.house_view.target.currency }} {{ doc.house_view.target.value }}（方法：{{ doc.house_view.target.method }}，模型单元格：`{{ doc.house_view.target.model_ref.path }}#{{ doc.house_view.target.model_ref.cell }}`） |
+{% endif %}| 更新时间 | {{ doc.house_view.updated_at }} |
+
+{% if doc.market_view %}
+## 市场基准与一致预期（Market View）
+
+{{ doc.market_view.summary or "—" }}
+{% if doc.market_view.figures %}
+
+| 指标 | 期间 | 数值 | 单位 | 标签 |
+|---|---|---|---|---|
+{% for f in doc.market_view.figures %}| {{ f.metric }} | {{ f.period }} | {{ f.value }} | {{ f.unit }} | `{{ f.label }}` |
+{% endfor %}{% endif %}
+{% endif %}
+
+## 核心支柱（Pillars）
+
+| ID | 优先级 | 状态 | 来源状态 | 核心主张（Claim） | 基线（Baseline） | 预期路径 | 下一步验证 |
+|---|---|---|---|---|---|---|---|
+{% for p in doc.pillars %}| **{{ p.id }}** | `{{ p.priority }}` | `{{ p.status }}` | {{ "迁移观点，待复核" if p.provenance == "inherited" else p.provenance }} | {{ p.claim }} | {{ p.baseline.text }} ({{ p.baseline.as_of }}) | {{ p.expected_path }} | {{ p.next_proof_point.what if p.next_proof_point else "—" }} |
+{% endfor %}
+
+{% for p in doc.pillars %}
+### {{ p.id }}：{{ p.claim }}
+- **优先级**：`{{ p.priority }}` ｜ **当前状态**：`{{ p.status }}`{% if p.status_reason %}（{{ p.status_reason }}）{% endif %} ｜ **出处**：`{{ p.provenance }}`
+- **基线**：{{ p.baseline.text }}（截至 {{ p.baseline.as_of }}）
+- **预期路径**：{{ p.expected_path }}
+- **阈值（Thresholds）**：
+  - **确认（Confirm）**：{% if p.thresholds.confirm %}{% for t in p.thresholds.confirm %}`{{ t.id }}` {{ t.metric }} {{ t.operator }} {{ t.value if t.value is defined else (t.event_text or "") }} {{ t.unit or "" }} ({{ t.period or "" }}){% if not loop.last %}；{% endif %}{% endfor %}{% else %}无{% endif %}
+  - **预警（Warn）**：{% if p.thresholds.warn %}{% for t in p.thresholds.warn %}`{{ t.id }}` {{ t.metric }} {{ t.operator }} {{ t.value if t.value is defined else (t.event_text or "") }} {{ t.unit or "" }} ({{ t.period or "" }}){% if not loop.last %}；{% endif %}{% endfor %}{% else %}无{% endif %}
+  - **证伪（Break）**：{% if p.thresholds.break %}{% for t in p.thresholds.break %}`{{ t.id }}` {{ t.metric }} {{ t.operator }} {{ t.value if t.value is defined else (t.event_text or "") }} {{ t.unit or "" }} ({{ t.period or "" }}){% if not loop.last %}；{% endif %}{% endfor %}{% else %}⚠ 未设置证伪阈值{% endif %}
+{% endfor %}
+
+## 证据台账（Evidence Ledger，只追加）
+
+{% if doc.evidence %}
+| ID | 时间 | 期间 | 来源（层级） | 事实与数据 | 关联支柱 | 信号 | 质量 |
+|---|---|---|---|---|---|---|---|
+{% for e in doc.evidence %}| **{{ e.id }}**{% if e.supersedes %} *(更正 {{ e.supersedes }})*{% endif %} | {{ e.at[:10] }} | {{ e.period or "—" }} | {{ e.source.identity }} (`{{ e.source.type }}` T{{ e.source.tier }}) | {{ e.fact }}{% if e.interpretation %} — *{{ e.interpretation }}*{% endif %} | {{ e.pillar_ids | join(", ") }} | `{{ e.signal }}` | `{{ e.quality }}` |
+{% endfor %}
+{% else %}
+暂无证据记录。
+{% endif %}

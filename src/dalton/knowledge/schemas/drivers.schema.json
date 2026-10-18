@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema", "$id": "https://dalton.local/schemas/drivers",
+  "type": "object", "additionalProperties": false,
+  "properties": {
+    "schema_version": {"const": 1}, "as_of": {"$ref": "common#/$defs/isoTime"},
+    "historical_valuation_driver": {"type": "object", "additionalProperties": false,
+      "description": "历史上股价由 EPS 驱动还是倍数驱动",
+      "properties": {"summary": {"type": "string"}, "window": {"type": "string"},
+                     "eps_share_pct": {"type": "number"}, "multiple_share_pct": {"type": "number"},
+                     "model_ref": {"$ref": "common#/$defs/evidenceRef"}}},
+    "drivers": {"type": "array", "items": {"$ref": "#/$defs/driver"}}
+  },
+  "required": ["schema_version","as_of","drivers"],
+  "$defs": {
+    "reading": {"type": "object", "additionalProperties": false,
+      "properties": {"value": {"type": "number"}, "unit": {"$ref": "common#/$defs/unit"}, "period": {"$ref": "common#/$defs/period"},
+                     "as_of": {"$ref": "common#/$defs/isoTime"}, "ref": {"$ref": "common#/$defs/evidenceRef"},
+                     "label": {"$ref": "common#/$defs/label"}},
+      "required": ["value","unit","period","as_of","ref","label"]},
+    "indicator": {"type": "object", "additionalProperties": false,
+      "properties": {
+        "id": {"type": "string", "pattern": "^K\\d+\\.\\d+$"},
+        "name": {"type": "string"}, "source": {"type": "string"},
+        "frequency": {"enum": ["daily","weekly","monthly","quarterly","event"]},
+        "lead_months": {"type": "number", "minimum": 0},
+        "good_direction": {"enum": ["up","down","band"]},
+        "latest": {"$ref": "#/$defs/reading"},
+        "readings": {"type": "array", "items": {"$ref": "#/$defs/reading"}, "description": "只追加，最多保留 200 条，更早的由服务端滚到 history/"},
+        "probe": {"type": "object", "additionalProperties": false, "description": "预检能否零成本取这个读数（PK.16）",
+          "properties": {"kind": {"enum": ["none","price","fmp_metric","internal_query"]}, "params": {"type": "object"}}}
+      },
+      "required": ["id","name","source","frequency","good_direction"]},
+    "driver": {"type": "object", "additionalProperties": false,
+      "properties": {
+        "id": {"type": "string", "pattern": "^K\\d+$"},
+        "name": {"type": "string"},
+        "kind": {"enum": ["volume","price","mix","margin","capex","multiple","macro","capital_return","other"]},
+        "horizon": {"enum": ["short","long","both"]},
+        "description": {"type": "string"},
+        "linked_pillars": {"type": "array", "items": {"type": "string"}},
+        "linked_debates": {"type": "array", "items": {"type": "string"}},
+        "leading_indicators": {"type": "array", "items": {"$ref": "#/$defs/indicator"}},
+        "sensitivity": {"type": "object", "additionalProperties": false,
+          "properties": {"target_metric": {"type": "string", "description": "如 FY2026 EPS"},
+                         "per_change": {"type": "string", "description": "如 每 +1pp 广告增速"},
+                         "impact_value": {"type": "number"}, "impact_unit": {"$ref": "common#/$defs/unit"},
+                         "model_ref": {"$ref": "common#/$defs/evidenceRef"}},
+          "required": ["target_metric","per_change","impact_value","impact_unit","model_ref"]},
+        "latest_assessment": {"type": "string"},
+        "updated_at": {"$ref": "common#/$defs/isoTime"}
+      },
+      "required": ["id","name","kind","description","leading_indicators","updated_at"]}
+  }
+}

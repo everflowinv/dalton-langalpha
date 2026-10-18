@@ -1,0 +1,12 @@
+<!-- 由 dalton_verdicts 表渲染（最近 {{ verdicts | length }} 条 · {{ rendered_at }}）；请用 knowledge_append_verdict 追加 -->
+
+# {{ ticker }} 事件五词结论日志（Event Verdicts）
+
+{% if verdicts %}
+| 结论 ID | 时间 | 结论（五词） | 触发类型 | 事件概述 | 核心依据 | 下一步验证 |
+|---|---|---|---|---|---|---|
+{% for v in verdicts %}| **{{ v.id }}** | {{ v.at[:16] }} | **{{ verdict_zh.get(v.verdict, v.verdict) }}** (`{{ v.verdict }}`) | `{{ v.trigger.kind }}`{% if v.trigger.ref %} ({{ v.trigger.ref }}){% endif %} | {{ v.event }} | {{ v.rationale }} | {{ v.next_validation.what }} ({{ v.next_validation.due }}) |
+{% endfor %}
+{% else %}
+暂无事件结论记录。
+{% endif %}

@@ -1,0 +1,52 @@
+{{ header_comment }}
+
+# {{ ticker }} 管理层与指引风格（Management & Guidance）
+
+- **更新时间**：{{ doc.as_of }}
+
+## 指引风格（Guidance Style）
+
+- **整体倾向（Bias）**：`{{ doc.guidance_style.bias }}`
+- **风格总结**：{{ doc.guidance_style.summary }}
+- **历史统计**：样本数 `{{ doc.guidance_style.sample_n if doc.guidance_style.sample_n is defined else 0 }}`{% if doc.guidance_style.beat_rate is defined %} ｜ Beat 率 `{{ (doc.guidance_style.beat_rate * 100) | round(1) }}%`{% endif %}{% if doc.guidance_style.median_surprise_pct is defined %} ｜ 中位 Surprise `{{ doc.guidance_style.median_surprise_pct }}%`{% endif %}
+{% if doc.guidance_style.patterns %}
+- **常见规律**：
+{% for pat in doc.guidance_style.patterns %}  - {{ pat }}
+{% endfor %}{% endif %}
+
+{% if doc.team %}
+## 核心管理团队
+
+| 姓名 | 职务 | 任期起点 | 备注 |
+|---|---|---|---|
+{% for m in doc.team %}| {{ m.name }} | {{ m.role }} | {{ m.since or "—" }} | {{ m.notes or "—" }} |
+{% endfor %}
+{% endif %}
+
+{% if doc.capital_allocation %}
+## 资本配置（Capital Allocation）
+
+- **总结**：{{ doc.capital_allocation.summary or "—" }}
+{% if doc.capital_allocation.buyback %}- **回购**：{{ doc.capital_allocation.buyback }}{% endif %}
+{% if doc.capital_allocation.dividend %}- **分红**：{{ doc.capital_allocation.dividend }}{% endif %}
+{% if doc.capital_allocation.capex %}- **Capex**：{{ doc.capital_allocation.capex }}{% endif %}
+{% if doc.capital_allocation.m_and_a %}- **并购**：{{ doc.capital_allocation.m_and_a }}{% endif %}
+{% endif %}
+
+## 指引对实际历史（Guidance vs Actual）
+
+{% if doc.guidance_history %}
+| ID | 指标 | 期间 | 发布日 | 指引区间 / 点值 | 实际值 | 结果 | 偏离中值 (%) |
+|---|---|---|---|---|---|---|---|
+{% for g in doc.guidance_history %}| **{{ g.id }}** | {{ g.metric }} | {{ g.period }} | {{ g.issued_at }} | {% if g.guide.point is defined %}{{ g.guide.point }}{% elif g.guide.low is defined %}{{ g.guide.low }}–{{ g.guide.high }}{% else %}{{ g.guide.text or "—" }}{% endif %} {{ g.guide.unit }} | {% if g.actual %}{{ g.actual.value }} {{ g.actual.unit }} ({{ g.actual.reported_at }}){% else %}待披露{% endif %} | `{{ g.outcome }}` | {{ g.delta_vs_mid_pct if g.delta_vs_mid_pct is defined else "—" }} |
+{% endfor %}
+{% else %}
+暂无历史指引记录。
+{% endif %}
+
+{% if doc.credibility_notes %}
+## 言行与可信度记录（Credibility Notes）
+
+{% for c in doc.credibility_notes %}- `{{ c.at[:10] }}`：{{ c.note }}
+{% endfor %}
+{% endif %}

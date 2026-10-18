@@ -1,0 +1,33 @@
+{{ header_comment }}
+
+# {{ ticker }} 关键驱动与领先指标（Drivers & Leading Indicators）
+
+- **更新时间**：{{ doc.as_of }}
+
+{% if doc.historical_valuation_driver %}
+## 历史估值驱动归因
+- **摘要**：{{ doc.historical_valuation_driver.summary or "—" }}
+{% if doc.historical_valuation_driver.window %}- **窗口**：{{ doc.historical_valuation_driver.window }}（EPS 贡献 {{ doc.historical_valuation_driver.eps_share_pct }}% / 倍数贡献 {{ doc.historical_valuation_driver.multiple_share_pct }}%）{% endif %}
+{% endif %}
+
+## 核心业务驱动（Drivers）
+
+{% if doc.drivers %}
+| ID | 名称 | 类型 | 周期 | 描述 | 最新评估 |
+|---|---|---|---|---|---|
+{% for k in doc.drivers %}| **{{ k.id }}** | {{ k.name }} | `{{ k.kind }}` | `{{ k.horizon or "both" }}` | {{ k.description }} | {{ k.latest_assessment or "—" }} |
+{% endfor %}
+
+{% for k in doc.drivers %}
+### {{ k.id }}：{{ k.name }} (`{{ k.kind }}`)
+- **描述**：{{ k.description }}
+{% if k.sensitivity %}- **敏感度**：`{{ k.sensitivity.target_metric }}` — {{ k.sensitivity.per_change }} 影响 {{ k.sensitivity.impact_value }} {{ k.sensitivity.impact_unit }}（模型：`{{ k.sensitivity.model_ref.path or "" }}#{{ k.sensitivity.model_ref.cell or "" }}`）
+{% endif %}{% if k.leading_indicators %}
+| 指标 ID | 指标名称 | 来源 | 频率 | 方向 | 最新读数 |
+|---|---|---|---|---|---|
+{% for ind in k.leading_indicators %}| `{{ ind.id }}` | {{ ind.name }} | {{ ind.source }} | `{{ ind.frequency }}` | `{{ ind.good_direction }}` | {% if ind.latest %}{{ ind.latest.value }} {{ ind.latest.unit }} ({{ ind.latest.period }}){% else %}—{% endif %} |
+{% endfor %}{% endif %}
+{% endfor %}
+{% else %}
+暂无驱动记录。
+{% endif %}

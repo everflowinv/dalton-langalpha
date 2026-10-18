@@ -1,0 +1,12 @@
+<!-- 由 dalton_publications 表渲染（{{ rendered_at }}）；published/ 下文件按约定不可改写 -->
+
+# {{ ticker }} 正式发布研究清单（Published Research Index）
+
+{% if publications %}
+| 发布日期 | 类型 | 标题 | 文件 | 确立 Thesis 版本 | 独立审稿 | 审批人 | Publication ID |
+|---|---|---|---|---|---|---|---|
+{% for p in publications %}| {{ p.published_date }} | `{{ p.kind }}` | {{ p.title }} | {% for f in p.files %}`{{ f.path }}`{% if not loop.last %}, {% endif %}{% endfor %} | {{ ("v" ~ p.thesis_version_no) if p.thesis_version_no else "—" }} | `{{ p.reviewer.model }}` ({{ p.reviewer.verdict }}) | {{ p.approver_user_id }} | `{{ p.publication_id }}` |
+{% endfor %}
+{% else %}
+暂无正式发布记录。
+{% endif %}

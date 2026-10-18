@@ -9,6 +9,7 @@ import { DirectToolTileMark } from './mcp/DirectToolMark';
 import { OrderApprovalCard } from './mcp/OrderApprovalCard';
 import { useDirectToolVendorLabel } from './mcp/useDirectToolVendor';
 import { SettledStep } from './SettledStep';
+import { PublishApprovalCard } from './dalton/PublishApprovalCard'; // DALTON-HOOK(publish-card)
 import { humanizeKey } from '../utils/structuredResult';
 
 interface ToolApprovalCardProps {
@@ -54,6 +55,11 @@ function ToolApprovalCard({ data, onApprove, onReject, resultPending, resultLost
         resultLost={resultLost}
       />
     );
+  }
+
+  // DALTON-HOOK(publish-card): render dedicated publish receipt card for publish_report
+  if (data.tool === 'publish_report') {
+    return <PublishApprovalCard data={data} onApprove={onApprove} onReject={onReject} />;
   }
 
   const { status, server, tool, args } = data;
