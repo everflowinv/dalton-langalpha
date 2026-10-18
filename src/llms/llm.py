@@ -48,6 +48,10 @@ class ModelConfig:
         with open(manifest_path, 'r') as f:
             self.manifest = json.load(f)
 
+        # DALTON-HOOK(llm-overlay): merge the generated OpenClaw catalog without editing upstream manifests
+        from src.dalton.llm.overlay import apply_model_overlay
+        self.overlay_stamp = apply_model_overlay(self.llm_config, self.manifest)
+
         # Flatten grouped provider_config into a flat dict for downstream access.
         # Raw self.manifest stays pristine for grouped UI views.
         self._flat_providers = self._flatten_providers(
@@ -372,7 +376,9 @@ class LLM:
     @classmethod
     def get_model_config(cls) -> ModelConfig:
         """Get or create the model configuration singleton."""
-        if cls._model_config is None:
+        # DALTON-HOOK(llm-overlay): rebuild when the overlay file changed (re-sync button)
+        from src.dalton.llm.overlay import overlay_changed
+        if cls._model_config is None or overlay_changed(getattr(cls._model_config, "overlay_stamp", None)):
             cls._model_config = ModelConfig()
         return cls._model_config
 
@@ -741,6 +747,12 @@ class LLM:
         if cache_key:
             existing_mk = params.get("model_kwargs") or {}
             params["model_kwargs"] = {**existing_mk, "prompt_cache_key": cache_key}
+
+        # DALTON-HOOK(llm-broker-client): stable invocation ids for the Dalton broker's idempotency journal
+        if self.provider_info.get("dalton_broker"):
+            from src.dalton.llm.broker_http import broker_http_clients
+            params.setdefault("http_async_client", broker_http_clients().async_client)
+            params.setdefault("http_client", broker_http_clients().sync_client)
 
         return params
 

@@ -1,0 +1,370 @@
+"""Raw psycopg3 SQL queries for Dalton local daily USD budget and reservations (P0.8)."""
+
+from __future__ import annotations
+
+from datetime import date, datetime
+from decimal import Decimal
+from typing import Any
+
+from psycopg.rows import dict_row
+
+from src.server.database.pool import get_db_connection
+
+
+async def acquire_budget_advisory_lock(conn: Any, user_id: str, budget_day: date) -> None:
+    """Acquire transaction-scoped advisory lock for `(user_id, budget_day)`."""
+    lock_key = f"dalton_budget:{user_id}:{budget_day.isoformat()}"
+    async with conn.cursor() as cur:
+        await cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (lock_key,))
+
+
+async def fetch_budget_config(conn: Any, user_id: str) -> dict[str, Any] | None:
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            """
+            SELECT user_id, daily_cap_usd, default_task_cap_usd, timezone, updated_at
+            FROM dalton_budget_config
+            WHERE user_id = %s
+            """,
+            (user_id,),
+        )
+        return await cur.fetchone()
+
+
+async def upsert_budget_config(
+    user_id: str,
+    daily_cap_usd: Decimal,
+    default_task_cap_usd: Decimal | None,
+    timezone_str: str,
+) -> dict[str, Any]:
+    async with get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                INSERT INTO dalton_budget_config (user_id, daily_cap_usd, default_task_cap_usd, timezone, updated_at)
+                VALUES (%s, %s, %s, %s, NOW())
+                ON CONFLICT (user_id) DO UPDATE
+                SET daily_cap_usd = EXCLUDED.daily_cap_usd,
+                    default_task_cap_usd = EXCLUDED.default_task_cap_usd,
+                    timezone = EXCLUDED.timezone,
+                    updated_at = NOW()
+                RETURNING user_id, daily_cap_usd, default_task_cap_usd, timezone, updated_at
+                """,
+                (user_id, daily_cap_usd, default_task_cap_usd, timezone_str),
+            )
+            row = await cur.fetchone()
+            assert row is not None
+            return dict(row)
+
+
+async def list_task_caps(conn: Any, user_id: str) -> list[dict[str, Any]]:
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            """
+            SELECT
+                tc.user_id,
+                tc.scope_kind,
+                tc.scope_id,
+                tc.cap_usd,
+                tc.updated_at,
+                COALESCE(w.name, t.title, tc.scope_id::text) AS scope_name
+            FROM dalton_budget_task_caps tc
+            LEFT JOIN workspaces w
+                ON tc.scope_kind = 'workspace' AND w.workspace_id = tc.scope_id
+            LEFT JOIN conversation_threads t
+                ON tc.scope_kind = 'thread' AND t.conversation_thread_id = tc.scope_id
+            WHERE tc.user_id = %s
+            ORDER BY tc.scope_kind, tc.updated_at DESC
+            """,
+            (user_id,),
+        )
+        return [dict(r) for r in await cur.fetchall()]
+
+
+async def upsert_task_cap(
+    user_id: str,
+    scope_kind: str,
+    scope_id: str,
+    cap_usd: Decimal,
+) -> dict[str, Any]:
+    async with get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                INSERT INTO dalton_budget_task_caps (user_id, scope_kind, scope_id, cap_usd, updated_at)
+                VALUES (%s, %s, %s, %s, NOW())
+                ON CONFLICT (user_id, scope_kind, scope_id) DO UPDATE
+                SET cap_usd = EXCLUDED.cap_usd,
+                    updated_at = NOW()
+                RETURNING user_id, scope_kind, scope_id, cap_usd, updated_at
+                """,
+                (user_id, scope_kind, scope_id, cap_usd),
+            )
+            row = await cur.fetchone()
+            assert row is not None
+            return dict(row)
+
+
+async def delete_task_cap(user_id: str, scope_kind: str, scope_id: str) -> bool:
+    async with get_db_connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                DELETE FROM dalton_budget_task_caps
+                WHERE user_id = %s AND scope_kind = %s AND scope_id = %s
+                """,
+                (user_id, scope_kind, scope_id),
+            )
+            return (cur.rowcount or 0) > 0
+
+
+async def lookup_run_context(conn: Any, run_ref: str) -> tuple[str | None, str | None]:
+    """Resolve `(thread_id, workspace_id)` from `conversation_responses` / `conversation_threads`."""
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            """
+            SELECT
+                cr.conversation_thread_id::text AS thread_id,
+                ct.workspace_id::text AS workspace_id
+            FROM conversation_responses cr
+            LEFT JOIN conversation_threads ct
+                ON ct.conversation_thread_id = cr.conversation_thread_id
+            WHERE cr.conversation_response_id = %s
+            """,
+            (run_ref,),
+        )
+        row = await cur.fetchone()
+        if not row:
+            return None, None
+        return row.get("thread_id"), row.get("workspace_id")
+
+
+async def resolve_effective_task_cap(
+    conn: Any,
+    user_id: str,
+    thread_id: str | None,
+    workspace_id: str | None,
+    default_task_cap_usd: Decimal | None,
+) -> Decimal | None:
+    """Priority: thread cap > workspace cap > default_task_cap_usd."""
+    async with conn.cursor(row_factory=dict_row) as cur:
+        if thread_id:
+            await cur.execute(
+                """
+                SELECT cap_usd FROM dalton_budget_task_caps
+                WHERE user_id = %s AND scope_kind = 'thread' AND scope_id = %s
+                """,
+                (user_id, thread_id),
+            )
+            r = await cur.fetchone()
+            if r and r.get("cap_usd") is not None:
+                return Decimal(str(r["cap_usd"]))
+
+        if workspace_id:
+            await cur.execute(
+                """
+                SELECT cap_usd FROM dalton_budget_task_caps
+                WHERE user_id = %s AND scope_kind = 'workspace' AND scope_id = %s
+                """,
+                (user_id, workspace_id),
+            )
+            r = await cur.fetchone()
+            if r and r.get("cap_usd") is not None:
+                return Decimal(str(r["cap_usd"]))
+
+    return default_task_cap_usd
+
+
+async def reconcile_reservations_sql(
+    conn: Any,
+    user_id: str,
+    rate: Decimal,
+) -> None:
+    """Lazy reconciliation of open, released, and expired reservations (P0.8 §4).
+
+    1. `state IN ('open','released')` where `conversation_responses.usage_settled_at IS NOT NULL`,
+       at least one `conversation_usages` row exists, and no `subagent_runs` with
+       `parent_run_id = run_ref AND status = 'in_progress'` -> `state='settled'`,
+       `settled_usd = usage_for_run`, `settle_source='usage'`.
+    2. `state = 'open'` and `expires_at < NOW()` -> `state='expired'`,
+       `settled_usd = GREATEST(reserved_usd, observed_usd, usage_for_run)`,
+       `settle_source='conservative'`.
+    3. `state = 'expired'` -> `settled_usd` can only increase to
+       `GREATEST(settled_usd, usage_for_run)`.
+    """
+    async with conn.cursor() as cur:
+        # 1. Settle completed runs with settled usage
+        await cur.execute(
+            """
+            WITH run_usage AS (
+                SELECT
+                    r.reservation_id,
+                    r.run_ref,
+                    COALESCE(SUM(cu.total_credits), 0) / %s AS usage_usd,
+                    COUNT(cu.conversation_usage_id) AS usage_rows
+                FROM dalton_budget_reservations r
+                LEFT JOIN conversation_usages cu
+                    ON cu.conversation_response_id = r.run_ref
+                WHERE r.user_id = %s
+                  AND r.state IN ('open', 'released')
+                GROUP BY r.reservation_id, r.run_ref
+            )
+            UPDATE dalton_budget_reservations r
+            SET state = 'settled',
+                settled_at = NOW(),
+                settled_usd = ru.usage_usd,
+                settle_source = 'usage'
+            FROM run_usage ru,
+                 conversation_responses cr
+            WHERE r.reservation_id = ru.reservation_id
+              AND cr.conversation_response_id = r.run_ref
+              AND cr.usage_settled_at IS NOT NULL
+              AND ru.usage_rows > 0
+              AND r.state IN ('open', 'released')
+              AND NOT EXISTS (
+                  SELECT 1 FROM subagent_runs sr
+                  WHERE sr.parent_run_id = r.run_ref
+                    AND sr.status = 'in_progress'
+              )
+            """,
+            (rate, user_id),
+        )
+
+        # 2. Expire stale open leases conservatively (never release)
+        await cur.execute(
+            """
+            WITH stale_usage AS (
+                SELECT
+                    r.reservation_id,
+                    COALESCE(SUM(cu.total_credits), 0) / %s AS usage_usd
+                FROM dalton_budget_reservations r
+                LEFT JOIN conversation_usages cu
+                    ON cu.conversation_response_id = r.run_ref
+                WHERE r.user_id = %s
+                  AND r.state = 'open'
+                  AND r.expires_at < NOW()
+                GROUP BY r.reservation_id
+            )
+            UPDATE dalton_budget_reservations r
+            SET state = 'expired',
+                settled_at = NOW(),
+                settled_usd = GREATEST(r.reserved_usd, r.observed_usd, su.usage_usd),
+                settle_source = 'conservative'
+            FROM stale_usage su
+            WHERE r.reservation_id = su.reservation_id
+              AND r.state = 'open'
+              AND r.expires_at < NOW()
+            """,
+            (rate, user_id),
+        )
+
+        # 3. Ratchet expired reservations upward if recovery sweep later persisted higher usage
+        await cur.execute(
+            """
+            WITH exp_usage AS (
+                SELECT
+                    r.reservation_id,
+                    COALESCE(SUM(cu.total_credits), 0) / %s AS usage_usd
+                FROM dalton_budget_reservations r
+                JOIN conversation_usages cu
+                    ON cu.conversation_response_id = r.run_ref
+                WHERE r.user_id = %s
+                  AND r.state = 'expired'
+                GROUP BY r.reservation_id
+            )
+            UPDATE dalton_budget_reservations r
+            SET settled_usd = GREATEST(COALESCE(r.settled_usd, 0), eu.usage_usd)
+            FROM exp_usage eu
+            WHERE r.reservation_id = eu.reservation_id
+              AND r.state = 'expired'
+              AND eu.usage_usd > COALESCE(r.settled_usd, 0)
+            """,
+            (rate, user_id),
+        )
+
+
+async def fetch_day_reservations(
+    conn: Any,
+    user_id: str,
+    budget_day: date,
+    rate: Decimal,
+) -> list[dict[str, Any]]:
+    """Return reservations for `(user_id, budget_day)` along with `usage_usd` and `charge_usd`."""
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            """
+            SELECT
+                r.*,
+                COALESCE(u.usage_usd, 0) AS usage_usd,
+                CASE
+                    WHEN r.state = 'settled' THEN COALESCE(r.settled_usd, COALESCE(u.usage_usd, 0))
+                    WHEN r.state = 'expired' THEN COALESCE(
+                        r.settled_usd,
+                        GREATEST(r.reserved_usd, r.observed_usd, COALESCE(u.usage_usd, 0))
+                    )
+                    ELSE GREATEST(r.reserved_usd, r.observed_usd, COALESCE(u.usage_usd, 0))
+                END AS charge_usd
+            FROM dalton_budget_reservations r
+            LEFT JOIN (
+                SELECT
+                    conversation_response_id,
+                    COALESCE(SUM(total_credits), 0) / %s AS usage_usd
+                FROM conversation_usages
+                WHERE user_id = %s
+                GROUP BY conversation_response_id
+            ) u ON u.conversation_response_id = r.run_ref
+            WHERE r.user_id = %s AND r.budget_day = %s
+            ORDER BY r.created_at DESC
+            """,
+            (rate, user_id, user_id, budget_day),
+        )
+        return [dict(row) for row in await cur.fetchall()]
+
+
+async def fetch_unreserved_usage_today(
+    conn: Any,
+    user_id: str,
+    day_start_utc: datetime,
+    day_end_utc: datetime,
+    rate: Decimal,
+) -> Decimal:
+    """Sum `total_credits / rate` for today's `conversation_usages` not tied to any reservation."""
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            """
+            SELECT COALESCE(SUM(cu.total_credits), 0) / %s AS unreserved_usd
+            FROM conversation_usages cu
+            WHERE cu.user_id = %s
+              AND cu.created_at >= %s
+              AND cu.created_at < %s
+              AND NOT EXISTS (
+                  SELECT 1 FROM dalton_budget_reservations r
+                  WHERE r.run_ref = cu.conversation_response_id
+              )
+            """,
+            (rate, user_id, day_start_utc, day_end_utc),
+        )
+        row = await cur.fetchone()
+        return Decimal(str((row or {}).get("unreserved_usd") or "0"))
+
+
+async def fetch_today_token_usages(
+    conn: Any,
+    user_id: str,
+    day_start_utc: datetime,
+    day_end_utc: datetime,
+) -> list[dict[str, Any]]:
+    """Fetch `token_usage` JSON payloads for today's usage rows to compute subscription notional USD."""
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            """
+            SELECT token_usage, is_byok
+            FROM conversation_usages
+            WHERE user_id = %s
+              AND created_at >= %s
+              AND created_at < %s
+              AND token_usage IS NOT NULL
+            """,
+            (user_id, day_start_utc, day_end_utc),
+        )
+        return [dict(r) for r in await cur.fetchall()]

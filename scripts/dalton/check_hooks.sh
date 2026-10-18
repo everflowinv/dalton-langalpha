@@ -117,11 +117,15 @@ if [[ "$STRICT" -eq 1 ]]; then
   done
 fi
 
-# Verify protected upstream config files are untouched vs upstream/main (if upstream/main ref exists)
-if git rev-parse --verify upstream/main >/dev/null 2>&1; then
+# Verify protected upstream config files are untouched vs base ref (9a03d3ac or upstream/main)
+BASE_REF="${DALTON_BASE_REF:-upstream/main}"
+if git rev-parse --verify 9a03d3ac >/dev/null 2>&1; then
+  BASE_REF="${DALTON_BASE_REF:-9a03d3ac}"
+fi
+if git rev-parse --verify "$BASE_REF" >/dev/null 2>&1; then
   UNTOUCHED_FILES=("src/llms/manifest/models.json" "src/llms/manifest/providers.json" "agent_config.yaml" "config.yaml")
   for uf in "${UNTOUCHED_FILES[@]}"; do
-    if ! git diff --quiet upstream/main -- "$uf"; then
+    if ! git diff --quiet "$BASE_REF" -- "$uf"; then
       echo "ERROR: Upstream file $uf was modified (must use overlay instead)" >&2
       ERRORS=$((ERRORS + 1))
     fi

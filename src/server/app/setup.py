@@ -1322,6 +1322,9 @@ app.include_router(
 )  # /api/v1/share-links/{code} - One of the owner's links, any workspace
 app.include_router(skills_router)  # /api/v1/skills - Available agent skills
 app.include_router(subagents_router)  # /api/v1/subagents - The user's subagents (Plugins pane)
+# DALTON-HOOK(router): register /api/v1/dalton/* endpoints
+from src.dalton.app import dalton_router
+app.include_router(dalton_router)
 app.include_router(
     workspace_skills_router
 )  # /api/v1/workspaces/{id}/skills - Workspace-scoped skills

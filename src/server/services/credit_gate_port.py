@@ -412,6 +412,10 @@ def build_run_credit_gate(
     No gate without a principal: a heartbeat onto a ``user_id IS NULL`` row
     would spend against an aggregate that can never see it.
     """
+    # DALTON-HOOK(budget-gate): local daily-USD gate in OSS mode
+    from src.dalton.budget.gate import local_gate_enabled, build_local_run_gate
+    if local_gate_enabled():
+        return build_local_run_gate(user_id, run_id, token_callback, tool_tracker, model_name, is_byok)
     if not user_id or not usage_limits.platform_gating_active():
         return None
     return CreditGateState(
@@ -466,6 +470,10 @@ async def verify_credit_gate_wiring() -> None:
 
     Silent when gating is inactive: OSS builds have no service to ask.
     """
+    # DALTON-HOOK(budget-gate): startup verification for local daily-USD budget gate
+    from src.dalton.budget.gate import local_gate_enabled, verify_local_wiring
+    if local_gate_enabled():
+        return await verify_local_wiring()
     if not usage_limits.platform_gating_active():
         return
     body = await _port.capability()
