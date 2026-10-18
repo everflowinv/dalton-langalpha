@@ -1,0 +1,31 @@
+{
+  "name": "@dalton/openclaw-langalpha-broker",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "OpenClaw gateway plugin exposing a loopback OpenAI-compatible broker (/dalton-broker/v1/*) for Dalton LangAlpha.",
+  "engines": {
+    "node": ">=24"
+  },
+  "peerDependencies": {
+    "openclaw": ">=2026.10.4"
+  },
+  "files": [
+    "index.mjs",
+    "src",
+    "openclaw.plugin.json",
+    "README.md"
+  ],
+  "openclaw": {
+    "extensions": [
+      "./index.mjs"
+    ],
+    "compat": {
+      "pluginApi": ">=2026.10.4",
+      "minGatewayVersion": "2026.10.4"
+    }
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  }
+}

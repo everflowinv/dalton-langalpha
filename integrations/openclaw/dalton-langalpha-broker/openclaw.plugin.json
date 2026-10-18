@@ -1,0 +1,52 @@
+{
+  "id": "dalton-langalpha-broker",
+  "name": "Dalton LangAlpha Model Broker v2",
+  "version": "0.2.0",
+  "description": "Loopback OpenAI-compatible chat/completions + models broker backed by OpenClaw runtime auth, streaming, tool calls, and cost metadata.",
+  "activation": {
+    "onStartup": true
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "enabled": { "type": "boolean", "default": true },
+      "defaultAgentId": { "type": "string", "default": "main" },
+      "routePrefix": { "type": "string", "default": "/dalton-broker/v1" },
+      "authTokenPath": { "type": "string" },
+      "journalDir": { "type": "string" },
+      "allowedProviders": {
+        "type": "array",
+        "items": { "type": "string" }
+      },
+      "allowedModels": {
+        "type": "array",
+        "items": { "type": "string" }
+      },
+      "maxBodyBytes": {
+        "type": "integer",
+        "minimum": 4096,
+        "maximum": 33554432,
+        "default": 4194304
+      },
+      "maxConcurrent": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 64,
+        "default": 8
+      },
+      "defaultTimeoutMs": {
+        "type": "integer",
+        "minimum": 1000,
+        "maximum": 900000,
+        "default": 180000
+      },
+      "maxTimeoutMs": {
+        "type": "integer",
+        "minimum": 5000,
+        "maximum": 1800000,
+        "default": 600000
+      }
+    }
+  }
+}
