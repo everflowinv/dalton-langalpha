@@ -698,6 +698,8 @@ except ImportError:
             if untrusted:
                 entry["headers"] = dict(server.headers or {})
                 entry["discovery_uses_secrets"] = discovery_should_use_secrets(server)
+            if server.call_timeout_s:  # DALTON-HOOK(mcp-call-timeout)
+                entry["call_timeout_s"] = float(server.call_timeout_s)
             return entry
 
         # Stdio transport. `uv run python mcp_servers/<file>.py` paths are

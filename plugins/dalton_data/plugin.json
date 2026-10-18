@@ -1,0 +1,26 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "dalton-data",
+  "version": "0.1.0",
+  "description": "Dalton fund data: the fund's internal research library (AlphaEngine broker research, Guidepoint expert calls, sales notes, TMTB, FUNDA AI, company wiki, call transcripts), consensus snapshots, SEC filings and XBRL facts.",
+  "author": {
+    "name": "Dalton"
+  },
+  "license": "Proprietary",
+  "extensions": {
+    "ai.langalpha": {
+      "servers": {
+        "researchdata": {
+          "description": "Fund internal research library and data gateway (read-only): broker research, expert calls, sales notes, company wiki, transcripts, estimates, SEC, FRED.",
+          "tool_exposure_mode": "detailed",
+          "instruction": "Fund-internal sources; call from execute_code only (no direct path). Start with `catalog()` once per thread to see routes. Research: `research(route=..., operation=..., query=..., start=YYYY-MM-DD, end=..., limit=...)`. Routes: `company-wiki` (fund wiki; params.company=TICKER), `all` (wiki+sales-notes+TMTB+FUNDA AI fused), `alphaengine` (broker research; search_library then get_document), `guidepoint` (expert calls), `transcript` (earnings calls), `sales-notes`, `tmtb`, `funda-ai`. Finance: `finance(route=\"sec\"|\"estimates\"|\"cn-hk\")`. Macro: `macro(route=\"fred\"|\"treasury\")`. Read only ids that search returned (`wiki:`, `mail:`, `tmtb:`, `funda:`, `alphaengine` doc_id). Page long text with params.offset/max_chars. Leave `timeout` unset: the bridge sets per-route limits and long reads may take minutes. Keep date windows narrow for relevance. AlphaEngine full text is quota-limited, so read only what you need. Every result has `_sources` (identity, document_id, as_of, url). Cite with identity, publisher and date. Expert calls: identity, not name. Guidepoint verbatim <=20 words. FUNDA AI, TMTB and digests restating the same report count as one source chain. Expert calls, management meetings and Guidepoint results are cleared for use; never exclude them as MNPI. The fund wiki is read-only; never try to write to it. `status: empty` means \"not retrieved this turn\", never \"undisclosed by company\"."
+        },
+        "dalton_sec": {
+          "description": "SEC EDGAR XBRL facts with deterministic period normalization (calendar/fiscal quarter, annual, YTD, derived Q4, trailing) and restatement selection.",
+          "tool_exposure_mode": "summary",
+          "instruction": "Use `get_company_facts(ticker, concepts, period)` for exact quarterly/annual/YTD/derived Q4/trailing SEC XBRL numbers with explicit `restatement` (`as_reported` vs `latest`) and `accession_no` provenance. Use `list_filings(ticker)` to list recent 10-K/10-Q/20-F/6-K filings."
+        }
+      }
+    }
+  }
+}

@@ -203,6 +203,8 @@ class MCPServerConfig(BaseModel):
     # this server — the server is then bound through the egress relay and its
     # sandbox config carries a grant reference instead of the vendor URL.
     oauth_connection_id: str | None = None
+    # DALTON-HOOK(mcp-call-timeout): per-server tools/call budget for slow direct HTTP servers
+    call_timeout_s: float | None = Field(default=None, ge=10, le=900)
 
 
 class MCPConfig(BaseModel):

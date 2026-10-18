@@ -166,6 +166,7 @@ class _ServerCfg:
     #: workspace's own vault. The root vault is the account's, where a secret
     #: of the same name can hold another value, so such an entry gets none.
     workspace_vault: bool
+    call_timeout_s: float = _HTTP_CALL_BUDGET  # DALTON-HOOK(mcp-call-timeout)
 
 
 def _normalize(name: str, entry: dict) -> _ServerCfg:
@@ -188,6 +189,7 @@ def _normalize(name: str, entry: dict) -> _ServerCfg:
         relay_bound=bool(entry.get("relay_bound")),
         credential_files=tuple(entry.get("credential_files") or ()),
         workspace_vault=bool(entry.get("vault_file")) or "@" in name,
+        call_timeout_s=float(entry.get("call_timeout_s") or _HTTP_CALL_BUDGET),  # DALTON-HOOK(mcp-call-timeout)
     )
 
 
@@ -1564,11 +1566,11 @@ def _http_exchange(server_name: str, tool_name: str, arguments: dict[str, Any]) 
     # into a local timeout. The two recovery paths (relay credential
     # re-mint and legacy session expiry) each fire at most once, so the
     # loop is bounded to three sends.
-    with httpx.Client(timeout=_HTTP_CALL_BUDGET) as client:
+    with httpx.Client(timeout=cfg.call_timeout_s) as client:  # DALTON-HOOK(mcp-call-timeout)
         relay_auth_retried = False
         session_reinited = False
         while True:
-            deadline = time.monotonic() + _HTTP_CALL_BUDGET
+            deadline = time.monotonic() + cfg.call_timeout_s  # DALTON-HOOK(mcp-call-timeout)
             with client.stream("POST", url, json=request, headers=headers) as response:
                 relay_code = response.headers.get("x-relay-error")
                 if relay_code:
