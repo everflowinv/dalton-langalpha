@@ -12,7 +12,7 @@ import { useConfiguredProviders, type ConfiguredProvider } from '@/hooks/useConf
 import { useUser } from '@/hooks/useUser';
 import { usePreferences } from '@/hooks/usePreferences';
 import { useUpdatePreferences } from '@/hooks/useUpdatePreferences';
-import { deleteUserApiKey, disconnectCodexOAuth, disconnectClaudeOAuth, getCurrentUser } from '@/pages/Dashboard/utils/api';
+import { deleteUserApiKey, disconnectAntigravityOAuth, disconnectCodexOAuth, disconnectClaudeOAuth, getCurrentUser } from '@/pages/Dashboard/utils/api';
 import type { AccessType } from '@/components/model/types';
 import { isPlatformMode } from '@/config/hostMode';
 import { useAllModels } from '@/hooks/useAllModels';
@@ -192,6 +192,9 @@ export default function MethodStep() {
         } else if (provider.provider === 'claude-oauth') {
           await disconnectClaudeOAuth();
           queryClient.invalidateQueries({ queryKey: queryKeys.oauth.claude() });
+        } else if (provider.provider === 'antigravity-oauth') {
+          await disconnectAntigravityOAuth();
+          queryClient.invalidateQueries({ queryKey: queryKeys.oauth.antigravity() });
         }
       } else {
         // Remove API key

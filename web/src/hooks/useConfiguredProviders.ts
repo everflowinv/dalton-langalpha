@@ -2,7 +2,7 @@ import { useMemo } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { queryKeys } from '@/lib/queryKeys';
 import { useApiKeys } from './useApiKeys';
-import { getCodexOAuthStatus, getClaudeOAuthStatus } from '@/pages/Dashboard/utils/api';
+import { getCodexOAuthStatus, getClaudeOAuthStatus, getAntigravityOAuthStatus } from '@/pages/Dashboard/utils/api';
 
 export interface ConfiguredProvider {
   provider: string;
@@ -34,6 +34,13 @@ export function useConfiguredProviders() {
   const { data: claudeStatus, isLoading: claudeLoading } = useQuery({
     queryKey: queryKeys.oauth.claude(),
     queryFn: getClaudeOAuthStatus,
+    staleTime: 60_000,
+    retry: false,
+  });
+
+  const { data: antigravityStatus, isLoading: antigravityLoading } = useQuery({
+    queryKey: queryKeys.oauth.antigravity(),
+    queryFn: getAntigravityOAuthStatus,
     staleTime: 60_000,
     retry: false,
   });
@@ -81,9 +88,17 @@ export function useConfiguredProviders() {
         plan_type: claudeStatus.plan_type ?? null,
       });
     }
+    if (antigravityStatus?.connected) {
+      result.push({
+        provider: 'antigravity-oauth',
+        display_name: 'Antigravity (Google Account)',
+        access_type: 'oauth',
+        plan_type: antigravityStatus.plan_type ?? null,
+      });
+    }
 
     return result;
-  }, [apiKeys, codexStatus, claudeStatus]);
+  }, [apiKeys, codexStatus, claudeStatus, antigravityStatus]);
 
   /** Set of configured provider keys for fast lookup */
   const configuredSet = useMemo(
@@ -95,6 +110,6 @@ export function useConfiguredProviders() {
     providers,
     configuredSet,
     hasAny: providers.length > 0,
-    isLoading: keysLoading || codexLoading || claudeLoading,
+    isLoading: keysLoading || codexLoading || claudeLoading || antigravityLoading,
   };
 }

@@ -1,5 +1,6 @@
 """
-OAuth Router — Connect external OAuth providers (ChatGPT Codex, Claude).
+OAuth Router — Connect external OAuth providers (ChatGPT Codex, Claude, Google
+Antigravity).
 
 Codex — Device Code Flow (RFC 8628):
 - POST   /api/v1/oauth/codex/device/initiate — Start device code flow
@@ -12,6 +13,12 @@ Claude — PKCE Authorization Code Flow:
 - POST   /api/v1/oauth/claude/callback        — Exchange code#state for tokens
 - GET    /api/v1/oauth/claude/status           — Check connection status
 - DELETE /api/v1/oauth/claude                  — Disconnect (delete tokens)
+
+Antigravity — Google OAuth loopback (RFC 8252) + PKCE:
+- POST   /api/v1/oauth/antigravity/initiate    — Start loopback listener + authorize URL
+- POST   /api/v1/oauth/antigravity/poll        — Poll for loopback completion
+- GET    /api/v1/oauth/antigravity/status      — Check connection status
+- DELETE /api/v1/oauth/antigravity             — Disconnect (delete tokens)
 """
 
 import json
@@ -35,6 +42,11 @@ from src.server.services.claude_oauth import (
     exchange_code as claude_exchange_code,
     generate_authorize_url as claude_generate_authorize_url,
     parse_callback_input as claude_parse_callback_input,
+)
+from src.server.services.antigravity_oauth import (
+    ANTIGRAVITY_PROVIDER,
+    check_login_complete as antigravity_check_login_complete,
+    start_login as antigravity_start_login,
 )
 from src.server.database.oauth_tokens import (
     delete_oauth_tokens,
@@ -324,4 +336,78 @@ async def claude_disconnect(user_id: CurrentUserId):
     except Exception:
         pass
     logger.info(f"[oauth] Claude disconnected for user_id={user_id}")
+    return {"success": True}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Google Antigravity OAuth — browser + loopback redirect (RFC 8252) + PKCE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@router.post("/antigravity/initiate")
+async def antigravity_initiate(user_id: CurrentUserId):
+    """Start the loopback login: PKCE + local callback listener + authorize URL.
+
+    The frontend should open authorize_url in a new tab. Google redirects to
+    http://localhost:<port>/callback served by this process, which completes
+    the exchange; the frontend polls /antigravity/poll until it succeeds.
+    """
+    try:
+        login = await antigravity_start_login(user_id)
+    except Exception as e:
+        logger.error(f"[oauth] Antigravity login start failed for user_id={user_id}: {e}")
+        raise HTTPException(status_code=502, detail="Failed to start Google login")
+
+    logger.info(f"[oauth] Antigravity login initiated for user_id={user_id} (port {login['port']})")
+    return {
+        "authorize_url": login["authorize_url"],
+        "port": login["port"],
+    }
+
+
+# ─── Poll ─────────────────────────────────────────────────────────────────────
+
+@router.post("/antigravity/poll")
+async def antigravity_poll(user_id: CurrentUserId):
+    """Poll for loopback-callback completion.
+
+    Returns:
+        {pending: true} until the browser round-trip finishes
+        {success: true, email} once tokens are stored
+    """
+    try:
+        if await antigravity_check_login_complete(user_id):
+            status = await get_oauth_status(user_id, ANTIGRAVITY_PROVIDER)
+            logger.info(f"[oauth] Antigravity connected for user_id={user_id}")
+            return {
+                "success": True,
+                "email": status.get("email"),
+                "plan_type": status.get("plan_type"),
+            }
+        return {"pending": True}
+    except Exception as e:
+        logger.error(f"[oauth] Antigravity poll error for user_id={user_id}: {e}")
+        raise HTTPException(status_code=502, detail="Failed to poll login status")
+
+
+# ─── Status ──────────────────────────────────────────────────────────────────
+
+@router.get("/antigravity/status")
+async def antigravity_status(user_id: CurrentUserId):
+    """Return connection status (no token decryption — fast check)."""
+    status = await get_oauth_status(user_id, ANTIGRAVITY_PROVIDER)
+    return status
+
+
+# ─── Disconnect ──────────────────────────────────────────────────────────────
+
+@router.delete("/antigravity")
+async def antigravity_disconnect(user_id: CurrentUserId):
+    """Delete stored Antigravity OAuth tokens."""
+    await delete_oauth_tokens(user_id, ANTIGRAVITY_PROVIDER)
+    try:
+        await invalidate_oauth_active_cache(user_id)
+    except Exception:
+        pass
+    logger.info(f"[oauth] Antigravity disconnected for user_id={user_id}")
     return {"success": True}

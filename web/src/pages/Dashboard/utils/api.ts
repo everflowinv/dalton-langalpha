@@ -469,6 +469,51 @@ export async function disconnectClaudeOAuth(): Promise<Record<string, unknown>> 
   return data;
 }
 
+// --- Antigravity OAuth (Google account, loopback redirect + PKCE) ---
+
+/**
+ * Start Antigravity login — spins up the loopback callback listener.
+ * POST /api/v1/oauth/antigravity/initiate
+ * @returns {Promise<Object>} { authorize_url, port }
+ */
+export async function initiateAntigravityOAuth(): Promise<Record<string, unknown>> {
+  const { data } = await api.post('/api/v1/oauth/antigravity/initiate');
+  return data;
+}
+
+/**
+ * Poll for Antigravity loopback-callback completion.
+ * POST /api/v1/oauth/antigravity/poll
+ * @returns {Promise<Object>} { pending: true } or { success: true, email, plan_type }
+ */
+export async function pollAntigravityOAuth(): Promise<Record<string, unknown>> {
+  const { data } = await api.post('/api/v1/oauth/antigravity/poll');
+  return data;
+}
+
+/**
+ * Check Antigravity OAuth connection status.
+ * GET /api/v1/oauth/antigravity/status
+ * Returns { connected, account_id, email, plan_type }
+ */
+export async function getAntigravityOAuthStatus(): Promise<{ connected: boolean; account_id: string | null; email: string | null; plan_type: string | null }> {
+  try {
+    const { data } = await api.get('/api/v1/oauth/antigravity/status');
+    return data;
+  } catch {
+    return { connected: false, account_id: null, email: null, plan_type: null };
+  }
+}
+
+/**
+ * Disconnect Antigravity OAuth — delete stored tokens.
+ * DELETE /api/v1/oauth/antigravity
+ */
+export async function disconnectAntigravityOAuth(): Promise<Record<string, unknown>> {
+  const { data } = await api.delete('/api/v1/oauth/antigravity');
+  return data;
+}
+
 // --- News feed ---
 
 /**

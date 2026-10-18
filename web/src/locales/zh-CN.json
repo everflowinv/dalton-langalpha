@@ -345,6 +345,7 @@
     "codexPollFailed": "轮询失败，请重试。",
     "codexFlowFailed": "启动 Codex 设备码流程失败",
     "claudeDesc": "使用您的 Anthropic 订阅来使用 Claude 模型",
+    "antigravityDesc": "Google Antigravity 订阅（Gemini、Claude 和 GPT-OSS 模型）。",
     "claudeConnectTitle": "连接 Claude 账户",
     "claudeHowItWorks": "工作原理",
     "claudeStep1Title": "在 claude.ai 上授权",
@@ -2465,6 +2466,7 @@
     "waitingNote": "所在对话中正在进行的轮次结束后运行。",
     "skippedThreadBusy": "所在对话一直有轮次在运行，本次已跳过。",
     "skippedInterrupted": "等待期间服务重启，本次已跳过。",
+    "skippedPrecheck": "预检跳过（无新增信号，零 token 消耗）。",
     "failedServerError": "服务端在本次运行中出了问题。这不是你的自动化导致的，无需做任何修改。",
     "failedInterrupted": "服务在本次运行结束前将其中止。这不是你的自动化导致的，无需做任何修改。",
     "skipRun": "跳过",
@@ -3141,6 +3143,19 @@
     "customBaseUrlPlaceholder": "https://your-endpoint.com/v1",
     "oauthCodexDesc": "使用设备码授权您的 ChatGPT 账户。",
     "oauthClaudeDesc": "通过 OAuth 连接您的 Claude 订阅。",
+    "oauthAntigravityDesc": "连接你的 Google Antigravity 订阅（Google One AI / Antigravity 套餐），使用其中的 Gemini、Claude 和 GPT-OSS 模型。",
+    "antigravityStep1Title": "打开 Google 登录页",
+    "antigravityStep1Desc": "点击下方按钮，会在新标签页打开 accounts.google.com。",
+    "antigravityStep2Title": "登录并授权",
+    "antigravityStep2Desc": "确认对 LangAlpha 的授权请求，页面会自动重定向回本机 —— 无需复制任何内容。",
+    "antigravityStep3Title": "完成",
+    "antigravityStep3Desc": "本页面会自动检测到连接成功并继续。",
+    "oauthAgreeGoogle": "我了解我的 Google 账号令牌会被加密存储，请求将消耗我的订阅额度。",
+    "openGoogle": "打开 Google 登录",
+    "openGoogleAgain": "重新打开 Google 登录页",
+    "waitingGoogleCallback": "等待 Google 重定向……",
+    "errorAntigravityOAuth": "无法启动 Google 登录，请重试。",
+    "usageCountsAntigravity": "请求计入你的 Antigravity 订阅额度，与在 Antigravity CLI 或 IDE 中使用相同。",
     "howItWorks": "操作步骤",
     "codexStep1Title": "打开 OpenAI 验证页面",
     "codexStep1Desc": "将打开新标签页跳转到 OpenAI 的设备授权页面。",
@@ -5285,6 +5300,22 @@
       "handoff": "已交给分析师",
       "taskHandoff": "任务已交给分析师",
       "footer": "两种工作方式"
+    }
+  },
+  "dalton": {
+    "publish": {
+      "cardTitle": "正式研究报告发布审批（PM 终审）",
+      "titleLabel": "报告标题",
+      "kindLabel": "报告类型",
+      "draftLabel": "草稿路径",
+      "auditLabel": "数字核验",
+      "reviewerLabel": "独立审稿",
+      "thesisLabel": "更新正式 Thesis",
+      "approveBtn": "批准正式发布",
+      "rejectBtn": "退回修改",
+      "reasonPlaceholder": "批注或退回原因（可选）",
+      "approvedLabel": "已批准正式发布：{{title}}",
+      "rejectedLabel": "已拒绝正式发布：{{title}}"
     }
   }
 }

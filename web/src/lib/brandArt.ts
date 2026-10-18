@@ -45,6 +45,7 @@ const LLM_PROVIDER_ART: Record<string, string> = {
   'codex-oauth': iconOpenai,
   anthropic: iconAnthropic,
   'claude-oauth': iconAnthropic,
+  'antigravity-oauth': iconGemini,
   gemini: iconGemini,
   openrouter: iconOpenrouter,
   'z-ai': iconZai,

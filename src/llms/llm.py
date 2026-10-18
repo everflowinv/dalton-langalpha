@@ -586,6 +586,8 @@ class LLM:
             client = self._get_qwq_llm()
         elif self.sdk == "anthropic":
             client = self._get_anthropic_llm()
+        elif self.sdk == "antigravity":
+            client = self._get_antigravity_llm()
         elif self.sdk == "gemini":
             client = self._get_gemini_llm()
         else:
@@ -909,6 +911,29 @@ class LLM:
         if is_oauth:
             return ChatAnthropicOAuth(**params)
         return ChatAnthropic(**params)
+
+    def _get_antigravity_llm(self):
+        """Get Google Antigravity subscription LLM (v1internal native client).
+
+        The OAuth access token arrives via ``api_key`` (resolve_oauth_llm_client
+        passes the bearer token there) and the class itself owns the envelope
+        protocol — endpoint path, user-agent gating, request shape.
+        """
+        from src.llms.extension import ChatAntigravity
+
+        params = {
+            "model": self.model,
+            "api_key": self._resolve_api_key(),
+        }
+        params.update(self._resolve_base_url("base_url"))
+
+        if self.default_headers:
+            params["default_headers"] = dict(self.default_headers)
+
+        # models.json parameters (thinking_level, temperature, max_output_tokens...)
+        params.update(self.parameters)
+
+        return ChatAntigravity(**params)
 
     def _get_gemini_llm(self):
         """Get Gemini LLM."""

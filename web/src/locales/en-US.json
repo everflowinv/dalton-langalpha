@@ -347,6 +347,7 @@
     "codexPollFailed": "Polling failed. Please try again.",
     "codexFlowFailed": "Failed to start Codex device code flow",
     "claudeDesc": "Use Claude models with your Anthropic subscription",
+    "antigravityDesc": "Google Antigravity subscription (Gemini, Claude and GPT-OSS models).",
     "claudeConnectTitle": "Connect Claude Account",
     "claudeHowItWorks": "How it works",
     "claudeStep1Title": "Authorize on claude.ai",
@@ -2477,6 +2478,7 @@
     "waitingNote": "It runs when the turn now running in its thread ends.",
     "skippedThreadBusy": "Skipped because its thread stayed busy.",
     "skippedInterrupted": "Skipped because the server restarted while it waited.",
+    "skippedPrecheck": "Skipped by zero-token preflight (no new signals).",
     "failedServerError": "The server ran into a problem with this run. Your automation didn't cause it, and nothing needs changing.",
     "failedInterrupted": "The server stopped this run before it finished. Your automation didn't cause it, and nothing needs changing.",
     "skipRun": "Skip",
@@ -3175,6 +3177,19 @@
     "customBaseUrlPlaceholder": "https://your-endpoint.com/v1",
     "oauthCodexDesc": "Authorize with your ChatGPT account using a device code.",
     "oauthClaudeDesc": "Connect your Claude subscription via OAuth.",
+    "oauthAntigravityDesc": "Connect your Google Antigravity subscription (Google One AI / Antigravity plan) to use its Gemini, Claude and GPT-OSS models.",
+    "antigravityStep1Title": "Open the Google sign-in page",
+    "antigravityStep1Desc": "Click the button below. A new tab opens to accounts.google.com.",
+    "antigravityStep2Title": "Sign in and grant access",
+    "antigravityStep2Desc": "Approve the permission request for LangAlpha. The page then redirects back to this machine automatically — nothing to copy.",
+    "antigravityStep3Title": "Done",
+    "antigravityStep3Desc": "This screen detects the connection by itself and moves on.",
+    "oauthAgreeGoogle": "I understand my Google account tokens are stored encrypted and my subscription quota is used for requests.",
+    "openGoogle": "Open Google sign-in",
+    "openGoogleAgain": "Reopen the Google sign-in page",
+    "waitingGoogleCallback": "Waiting for the Google redirect…",
+    "errorAntigravityOAuth": "Could not start Google login. Please try again.",
+    "usageCountsAntigravity": "Requests count against your Antigravity subscription quota, exactly as they would in the Antigravity CLI or IDE.",
     "howItWorks": "How it works",
     "codexStep1Title": "Open OpenAI verification page",
     "codexStep1Desc": "A new tab will open to OpenAI's device authorization page.",
@@ -5390,6 +5405,22 @@
       "handoff": "handed to an analyst",
       "taskHandoff": "task handed to an analyst",
       "footer": "two ways to work"
+    }
+  },
+  "dalton": {
+    "publish": {
+      "cardTitle": "Official Research Publication Approval (PM Final Review)",
+      "titleLabel": "Report Title",
+      "kindLabel": "Report Type",
+      "draftLabel": "Draft Path",
+      "auditLabel": "Figure Audit",
+      "reviewerLabel": "Independent Review",
+      "thesisLabel": "Updates Official Thesis",
+      "approveBtn": "Approve & Publish",
+      "rejectBtn": "Request Revisions",
+      "reasonPlaceholder": "Note or revision reason (optional)",
+      "approvedLabel": "Approved official publication: {{title}}",
+      "rejectedLabel": "Rejected official publication: {{title}}"
     }
   }
 }

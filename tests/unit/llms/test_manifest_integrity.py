@@ -28,6 +28,22 @@ _UNPRICED_KEYS = frozenset({
     "gpt-oss-20b-deepinfra",
     "gpt-oss-safeguard-20b-deepinfra",
     "gpt-5.3-codex-spark-oauth",
+    # Antigravity subscription models — quota-metered by the plan, not per token
+    "gemini-4-argon-low-oauth",
+    "gemini-4-argon-medium-oauth",
+    "gemini-4-argon-high-oauth",
+    "gemini-3.8-flash-low-oauth",
+    "gemini-3.8-flash-medium-oauth",
+    "gemini-3.8-flash-high-oauth",
+    "gemini-2.5-pro-oauth",
+    "gemini-3-flash-oauth",
+    "claude-opus-5-5-low-oauth",
+    "claude-opus-5-5-medium-oauth",
+    "claude-opus-5-5-high-oauth",
+    "claude-sonnet-5-5-low-oauth",
+    "claude-sonnet-5-5-medium-oauth",
+    "claude-sonnet-5-5-high-oauth",
+    "gpt-oss-120b-medium-oauth",
 })
 
 

@@ -100,6 +100,7 @@ export function ProcessStep({ number, title, description }: { number: number; ti
 export function DisclaimerBox({ provider }: { provider: string }) {
   const { t } = useTranslation();
   const isClaude = provider === 'claude-oauth';
+  const isAntigravity = provider === 'antigravity-oauth';
   return (
     <div
       className="rounded-lg p-3"
@@ -120,7 +121,9 @@ export function DisclaimerBox({ provider }: { provider: string }) {
           <p className="text-[0.6875rem] leading-relaxed mt-1.5" style={{ color: 'var(--color-text-tertiary)' }}>
             {isClaude
               ? t('setup.usageCountsClaude')
-              : t('setup.usageCountsOpenai')}
+              : isAntigravity
+                ? t('setup.usageCountsAntigravity')
+                : t('setup.usageCountsOpenai')}
           </p>
         </div>
       </div>

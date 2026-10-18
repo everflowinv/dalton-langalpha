@@ -11,6 +11,8 @@ import {
   pollCodexDevice,
   initiateClaudeOAuth,
   submitClaudeCallback,
+  initiateAntigravityOAuth,
+  pollAntigravityOAuth,
 } from '@/pages/Dashboard/utils/api';
 import { useTranslation } from 'react-i18next';
 import { ProcessStep, DisclaimerBox, CopyButton, type LocationState } from './shared';
@@ -40,8 +42,13 @@ export function OAuthConnect({ state }: { state: LocationState }) {
   const [claudeCallbackInput, setClaudeCallbackInput] = useState('');
   const [claudeSubmitting, setClaudeSubmitting] = useState(false);
 
+  // Antigravity OAuth state (loopback: nothing to paste, just poll)
+  const [antigravityAuthorizeUrl, setAntigravityAuthorizeUrl] = useState<string | null>(null);
+  const [antigravityPolling, setAntigravityPolling] = useState(false);
+
   const isCodex = provider === 'codex-oauth';
   const isClaude = provider === 'claude-oauth';
+  const isAntigravity = provider === 'antigravity-oauth';
 
   // Abort polling on unmount
   const cancelledRef = useRef(false);
@@ -142,6 +149,51 @@ export function OAuthConnect({ state }: { state: LocationState }) {
     }
   }, [claudeCallbackInput, queryClient, navigate, method, provider, displayName, brandKey, t]);
 
+  // ---------------------------------------------------------------------------
+  // Antigravity OAuth handler (browser + loopback redirect)
+  // ---------------------------------------------------------------------------
+
+  const handleAntigravityStart = useCallback(async () => {
+    setOauthPhase('connecting');
+    setOauthError(null);
+    try {
+      const result = await initiateAntigravityOAuth();
+      const authorizeUrl = result.authorize_url as string;
+      setAntigravityAuthorizeUrl(authorizeUrl);
+      setOauthPhase('active');
+      // Google redirects to a localhost callback the backend serves; the
+      // backend completes the exchange, we just poll for completion.
+      window.open(authorizeUrl, '_blank', 'noopener');
+
+      cancelledRef.current = false;
+      setAntigravityPolling(true);
+      const maxAttempts = 200; // 3s apart → 10 minutes, matching the listener
+      for (let i = 0; i < maxAttempts; i++) {
+        await new Promise((r) => setTimeout(r, 3000));
+        if (cancelledRef.current) return;
+        try {
+          const pollResult = await pollAntigravityOAuth();
+          if ('success' in pollResult && pollResult.success) {
+            await queryClient.invalidateQueries({ queryKey: queryKeys.user.me() });
+            await queryClient.invalidateQueries({ queryKey: queryKeys.oauth.antigravity() });
+            await queryClient.invalidateQueries({ queryKey: queryKeys.platform.models() });
+            navigate('/setup/models', {
+              state: { method, provider, displayName, brandKey },
+            });
+            return;
+          }
+        } catch {
+          // Continue polling
+        }
+      }
+      setOauthError(t('setup.errorAuthTimeout'));
+      setAntigravityPolling(false);
+    } catch {
+      setOauthError(t('setup.errorAntigravityOAuth'));
+      setOauthPhase('disclaimer');
+    }
+  }, [queryClient, navigate, method, provider, displayName, brandKey, t]);
+
   const handleBack = useCallback(() => {
     navigate('/setup/provider', { state: { method } });
   }, [navigate, method]);
@@ -161,7 +213,9 @@ export function OAuthConnect({ state }: { state: LocationState }) {
           >
             {isCodex
               ? t('setup.oauthCodexDesc')
-              : t('setup.oauthClaudeDesc')}
+              : isAntigravity
+                ? t('setup.oauthAntigravityDesc')
+                : t('setup.oauthClaudeDesc')}
           </p>
         </div>
 
@@ -201,6 +255,24 @@ export function OAuthConnect({ state }: { state: LocationState }) {
                       description={t('setup.codexStep3Desc')}
                     />
                   </>
+                ) : isAntigravity ? (
+                  <>
+                    <ProcessStep
+                      number={1}
+                      title={t('setup.antigravityStep1Title')}
+                      description={t('setup.antigravityStep1Desc')}
+                    />
+                    <ProcessStep
+                      number={2}
+                      title={t('setup.antigravityStep2Title')}
+                      description={t('setup.antigravityStep2Desc')}
+                    />
+                    <ProcessStep
+                      number={3}
+                      title={t('setup.antigravityStep3Title')}
+                      description={t('setup.antigravityStep3Desc')}
+                    />
+                  </>
                 ) : (
                   <>
                     <ProcessStep
@@ -235,7 +307,13 @@ export function OAuthConnect({ state }: { state: LocationState }) {
                 className="mt-0.5 h-4 w-4 rounded border accent-(--color-accent-primary)"
               />
               <span className="text-xs" style={{ color: 'var(--color-text-secondary)' }}>
-                {t(isClaude ? 'setup.oauthAgreeAnthropic' : 'setup.oauthAgreeOpenai')}
+                {t(
+                  isClaude
+                    ? 'setup.oauthAgreeAnthropic'
+                    : isAntigravity
+                      ? 'setup.oauthAgreeGoogle'
+                      : 'setup.oauthAgreeOpenai'
+                )}
               </span>
             </label>
 
@@ -243,11 +321,21 @@ export function OAuthConnect({ state }: { state: LocationState }) {
             <Button
               variant="default"
               disabled={!agreed}
-              onClick={isCodex ? handleCodexStart : handleClaudeStart}
+              onClick={
+                isCodex
+                  ? handleCodexStart
+                  : isAntigravity
+                    ? handleAntigravityStart
+                    : handleClaudeStart
+              }
               className="w-full h-11"
             >
               <ExternalLink className="h-4 w-4 mr-1.5" />
-              {isCodex ? t('setup.openVerification') : t('setup.openClaude')}
+              {isCodex
+                ? t('setup.openVerification')
+                : isAntigravity
+                  ? t('setup.openGoogle')
+                  : t('setup.openClaude')}
             </Button>
           </>
         )}
@@ -377,6 +465,44 @@ export function OAuthConnect({ state }: { state: LocationState }) {
             >
               {t('setup.openClaudeAgain')}
               <ExternalLink className="h-3 w-3" />
+            </a>
+          </div>
+        )}
+
+        {/* Phase 3: Active — Antigravity loopback waiting */}
+        {oauthPhase === 'active' && isAntigravity && (
+          <div
+            className="flex flex-col items-center gap-4 rounded-lg p-6"
+            style={{
+              background: 'var(--color-bg-surface)',
+              border: '1px solid var(--color-border-default)',
+            }}
+          >
+            <p className="text-sm font-medium" style={{ color: 'var(--color-text-primary)' }}>
+              {t('setup.waitingGoogleCallback')}
+            </p>
+
+            {antigravityPolling && (
+              <p
+                className="text-xs flex items-center gap-1.5"
+                style={{ color: 'var(--color-text-tertiary)' }}
+              >
+                <span aria-hidden="true" className="shrink-0">
+                  <Loader size={12} className="text-current" />
+                </span>
+                {t('setup.waitingApproval')}
+              </p>
+            )}
+
+            <a
+              href={antigravityAuthorizeUrl ?? '#'}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex items-center gap-1.5 text-sm font-medium"
+              style={{ color: 'var(--color-accent-primary)' }}
+            >
+              {t('setup.openGoogleAgain')}
+              <ExternalLink className="h-3.5 w-3.5" />
             </a>
           </div>
         )}

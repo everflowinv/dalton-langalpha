@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { Link2, Unlink, ExternalLink, Shield, ClipboardCopy } from 'lucide-react';
 import { Input } from '@/components/ui/input';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog';
-import { initiateCodexDevice, pollCodexDevice, getCodexOAuthStatus, disconnectCodexOAuth, initiateClaudeOAuth, submitClaudeCallback, getClaudeOAuthStatus, disconnectClaudeOAuth } from '@/pages/Dashboard/utils/api';
+import { initiateCodexDevice, pollCodexDevice, getCodexOAuthStatus, disconnectCodexOAuth, initiateClaudeOAuth, submitClaudeCallback, getClaudeOAuthStatus, disconnectClaudeOAuth, initiateAntigravityOAuth, pollAntigravityOAuth, getAntigravityOAuthStatus, disconnectAntigravityOAuth } from '@/pages/Dashboard/utils/api';
 import { useQueryClient } from '@tanstack/react-query';
 import { queryKeys } from '@/lib/queryKeys';
 import { useTranslation } from 'react-i18next';
@@ -48,19 +48,30 @@ export function ConnectedAccounts() {
   const [claudeError, setClaudeError] = useState<string | null>(null);
   const [isSubmittingClaudeCallback, setIsSubmittingClaudeCallback] = useState(false);
 
+  // Connected Accounts (Antigravity OAuth — browser + loopback redirect)
+  const [antigravityOAuthStatus, setAntigravityOAuthStatus] = useState<OAuthStatus>({ connected: false });
+  const [showAntigravityDisclaimer, setShowAntigravityDisclaimer] = useState(false);
+  const [isConnectingAntigravity, setIsConnectingAntigravity] = useState(false);
+  const [isDisconnectingAntigravity, setIsDisconnectingAntigravity] = useState(false);
+  const [isPollingAntigravity, setIsPollingAntigravity] = useState(false);
+  const [antigravityError, setAntigravityError] = useState<string | null>(null);
+  const antigravityPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
   const [accountsError, setAccountsError] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
-        const [codexStatus, claudeStatus] = await Promise.all([
+        const [codexStatus, claudeStatus, antigravityStatus] = await Promise.all([
           getCodexOAuthStatus(),
           getClaudeOAuthStatus(),
-        ]) as [OAuthStatus, OAuthStatus];
+          getAntigravityOAuthStatus(),
+        ]) as [OAuthStatus, OAuthStatus, OAuthStatus];
         if (cancelled) return;
         setCodexOAuthStatus(codexStatus || { connected: false });
         setClaudeOAuthStatus(claudeStatus || { connected: false });
+        setAntigravityOAuthStatus(antigravityStatus || { connected: false });
       } catch {
         // Status stays disconnected; the connect flows still work.
       }
@@ -74,6 +85,10 @@ export function ConnectedAccounts() {
       if (codexPollRef.current) {
         clearInterval(codexPollRef.current);
         codexPollRef.current = null;
+      }
+      if (antigravityPollRef.current) {
+        clearInterval(antigravityPollRef.current);
+        antigravityPollRef.current = null;
       }
     };
   }, []);
@@ -224,6 +239,79 @@ export function ConnectedAccounts() {
       setAccountsError('Failed to disconnect Claude');
     } finally {
       setIsDisconnectingClaude(false);
+    }
+  };
+
+  // --- Antigravity OAuth handlers (browser + loopback redirect) ---
+
+  const handleAntigravityConnectClick = () => {
+    setShowAntigravityDisclaimer(true);
+  };
+
+  const handleAntigravityPollCancel = () => {
+    if (antigravityPollRef.current) {
+      clearInterval(antigravityPollRef.current);
+      antigravityPollRef.current = null;
+    }
+    setIsPollingAntigravity(false);
+    setAntigravityError(null);
+  };
+
+  const handleAntigravityConnect = async () => {
+    setShowAntigravityDisclaimer(false);
+    setIsConnectingAntigravity(true);
+    setAccountsError(null);
+    setAntigravityError(null);
+    try {
+      const result = await initiateAntigravityOAuth() as Record<string, unknown>;
+      window.open(result.authorize_url as string, '_blank', 'noopener');
+      // Google redirects to a localhost callback the backend serves; poll
+      // until the backend reports the tokens stored.
+      setIsPollingAntigravity(true);
+      const startTime = Date.now();
+      const maxDuration = 10 * 60 * 1000; // matches the listener's lifetime
+      antigravityPollRef.current = setInterval(async () => {
+        if (Date.now() - startTime > maxDuration) {
+          handleAntigravityPollCancel();
+          setAntigravityError(t('setup.errorAuthTimeout', 'Timed out waiting for approval.'));
+          return;
+        }
+        try {
+          const poll = await pollAntigravityOAuth() as Record<string, unknown>;
+          if (poll.success) {
+            handleAntigravityPollCancel();
+            setAntigravityOAuthStatus({
+              connected: true,
+              email: (poll.email as string) || null,
+              plan_type: (poll.plan_type as string) || null,
+            });
+            queryClient.invalidateQueries({ queryKey: queryKeys.oauth.antigravity() });
+            queryClient.invalidateQueries({ queryKey: queryKeys.platform.models() });
+          }
+        } catch {
+          handleAntigravityPollCancel();
+          setAntigravityError(t('setup.errorAntigravityOAuth', 'Could not start Google login. Please try again.'));
+        }
+      }, 3000);
+    } catch {
+      setAccountsError(t('setup.errorAntigravityOAuth', 'Could not start Google login. Please try again.'));
+    } finally {
+      setIsConnectingAntigravity(false);
+    }
+  };
+
+  const handleAntigravityDisconnect = async () => {
+    setIsDisconnectingAntigravity(true);
+    setAccountsError(null);
+    try {
+      await disconnectAntigravityOAuth();
+      setAntigravityOAuthStatus({ connected: false, account_id: null, email: null, plan_type: null });
+      queryClient.invalidateQueries({ queryKey: queryKeys.oauth.antigravity() });
+      queryClient.invalidateQueries({ queryKey: queryKeys.platform.models() });
+    } catch {
+      setAccountsError('Failed to disconnect Antigravity');
+    } finally {
+      setIsDisconnectingAntigravity(false);
     }
   };
 
@@ -474,6 +562,94 @@ export function ConnectedAccounts() {
           )}
         </div>
 
+        {/* Antigravity OAuth card */}
+        <div
+          className="rounded-lg px-4 py-3 mt-2"
+          style={{
+            backgroundColor: 'var(--color-bg-card)',
+            border: `1px solid ${antigravityOAuthStatus.connected ? 'var(--color-success-soft)' : 'var(--color-border-muted)'}`,
+          }}
+        >
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-3">
+              <div
+                className="h-8 w-8 rounded-md flex items-center justify-center"
+                style={{ backgroundColor: antigravityOAuthStatus.connected ? 'var(--color-success-soft)' : 'var(--color-accent-soft)' }}
+              >
+                <Link2 className="h-4 w-4" style={{ color: antigravityOAuthStatus.connected ? 'var(--color-success)' : 'var(--color-accent-primary)' }} />
+              </div>
+              <div>
+                <div className="flex items-center gap-2">
+                  <span className="text-sm font-medium" style={{ color: 'var(--color-text-primary)' }}>Google Antigravity</span>
+                  {antigravityOAuthStatus.connected && antigravityOAuthStatus.plan_type && (
+                    <span
+                      className="inline-flex items-center px-1.5 py-0.5 rounded text-[0.625rem] font-medium"
+                      style={{ backgroundColor: 'var(--color-success-soft)', color: 'var(--color-success)' }}
+                    >
+                      {antigravityOAuthStatus.plan_type}
+                    </span>
+                  )}
+                </div>
+                {antigravityOAuthStatus.connected ? (
+                  <p className="text-xs mt-0.5" style={{ color: 'var(--color-text-tertiary)' }}>{antigravityOAuthStatus.email || t('settings.connected', 'Connected')}</p>
+                ) : (
+                  <p className="text-xs mt-0.5" style={{ color: 'var(--color-text-tertiary)' }}>
+                    {t('settings.antigravityDesc', 'Use Gemini, Claude and GPT-OSS models with your Google Antigravity subscription')}
+                  </p>
+                )}
+              </div>
+            </div>
+            <div className="shrink-0">
+              {antigravityOAuthStatus.connected ? (
+                <button
+                  type="button"
+                  onClick={handleAntigravityDisconnect}
+                  disabled={isDisconnectingAntigravity}
+                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium transition-colors"
+                  style={{ color: 'var(--color-loss)', backgroundColor: 'transparent', border: '1px solid var(--color-loss)' }}
+                >
+                  <Unlink className="h-3 w-3" />
+                  {isDisconnectingAntigravity ? t('common.loading', 'Loading...') : t('settings.disconnect', 'Disconnect')}
+                </button>
+              ) : !isPollingAntigravity ? (
+                <button
+                  type="button"
+                  onClick={handleAntigravityConnectClick}
+                  disabled={isConnectingAntigravity}
+                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium transition-opacity hover:opacity-90"
+                  style={{
+                    backgroundColor: isConnectingAntigravity ? 'var(--color-bg-elevated)' : 'var(--color-btn-primary-bg)',
+                    color: isConnectingAntigravity ? 'var(--color-text-tertiary)' : 'var(--color-btn-primary-text)',
+                  }}
+                >
+                  <Link2 className="h-3 w-3" />
+                  {isConnectingAntigravity ? t('common.loading', 'Loading...') : t('settings.connect', 'Connect')}
+                </button>
+              ) : null}
+            </div>
+          </div>
+
+          {/* Waiting row — shown while polling the loopback completion */}
+          {isPollingAntigravity && !antigravityOAuthStatus.connected && (
+            <div className="mt-3 pt-3 flex items-center gap-3" style={{ borderTop: '1px solid var(--color-border-muted)' }}>
+              <span className="text-xs animate-pulse" style={{ color: 'var(--color-text-tertiary)' }}>
+                {t('setup.waitingGoogleCallback', 'Waiting for the Google redirect…')}
+              </span>
+              <button
+                type="button"
+                onClick={handleAntigravityPollCancel}
+                className="px-3 py-1.5 rounded-md text-xs font-medium"
+                style={{ color: 'var(--color-text-tertiary)', backgroundColor: 'transparent' }}
+              >
+                {t('common.cancel', 'Cancel')}
+              </button>
+            </div>
+          )}
+          {antigravityError && (
+            <p className="text-xs mt-1.5" style={{ color: 'var(--color-loss)' }}>{antigravityError}</p>
+          )}
+        </div>
+
         {accountsError && (
           <div className="p-3 rounded-md mt-2" style={{ backgroundColor: 'var(--color-loss-soft)', border: '1px solid var(--color-border-loss)' }}>
             <p className="text-sm" style={{ color: 'var(--color-loss)' }}>{accountsError}</p>
@@ -644,6 +820,87 @@ export function ConnectedAccounts() {
             >
               <ExternalLink className="h-3.5 w-3.5" />
               {t('settings.claudeProceed', 'Open claude.ai')}
+            </button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+      {/* Antigravity OAuth Disclaimer Dialog */}
+      <Dialog open={showAntigravityDisclaimer} onOpenChange={setShowAntigravityDisclaimer}>
+        <DialogContent
+          className="sm:max-w-md border"
+          style={{ backgroundColor: 'var(--color-bg-elevated)', borderColor: 'var(--color-border-elevated)' }}
+        >
+          <DialogHeader>
+            <DialogTitle className="title-font flex items-center gap-2" style={{ color: 'var(--color-text-primary)' }}>
+              <Link2 className="h-5 w-5" style={{ color: 'var(--color-accent-primary)' }} />
+              {t('settings.antigravityConnectTitle', 'Connect Google Antigravity')}
+            </DialogTitle>
+          </DialogHeader>
+
+          <div className="space-y-4">
+            <div className="space-y-3">
+              <p className="text-xs font-medium uppercase tracking-wide" style={{ color: 'var(--color-text-tertiary)' }}>{t('settings.claudeHowItWorks', 'How it works')}</p>
+
+              <div className="flex gap-3 items-start">
+                <div className="shrink-0 h-6 w-6 rounded-full flex items-center justify-center text-xs font-bold" style={{ backgroundColor: 'var(--color-accent-soft)', color: 'var(--color-accent-primary)' }}>1</div>
+                <div>
+                  <p className="text-sm font-medium" style={{ color: 'var(--color-text-primary)' }}>{t('setup.antigravityStep1Title', 'Open the Google sign-in page')}</p>
+                  <p className="text-xs mt-0.5" style={{ color: 'var(--color-text-tertiary)' }}>{t('setup.antigravityStep1Desc', 'Click the button below. A new tab opens to accounts.google.com.')}</p>
+                </div>
+              </div>
+
+              <div className="flex gap-3 items-start">
+                <div className="shrink-0 h-6 w-6 rounded-full flex items-center justify-center text-xs font-bold" style={{ backgroundColor: 'var(--color-accent-soft)', color: 'var(--color-accent-primary)' }}>2</div>
+                <div>
+                  <p className="text-sm font-medium" style={{ color: 'var(--color-text-primary)' }}>{t('setup.antigravityStep2Title', 'Sign in and grant access')}</p>
+                  <p className="text-xs mt-0.5" style={{ color: 'var(--color-text-tertiary)' }}>{t('setup.antigravityStep2Desc', 'Approve the permission request for LangAlpha. The page then redirects back to this machine automatically — nothing to copy.')}</p>
+                </div>
+              </div>
+
+              <div className="flex gap-3 items-start">
+                <div className="shrink-0 h-6 w-6 rounded-full flex items-center justify-center text-xs font-bold" style={{ backgroundColor: 'var(--color-accent-soft)', color: 'var(--color-accent-primary)' }}>3</div>
+                <div>
+                  <p className="text-sm font-medium" style={{ color: 'var(--color-text-primary)' }}>{t('setup.antigravityStep3Title', 'Done')}</p>
+                  <p className="text-xs mt-0.5" style={{ color: 'var(--color-text-tertiary)' }}>{t('setup.antigravityStep3Desc', 'This screen detects the connection by itself and moves on.')}</p>
+                </div>
+              </div>
+            </div>
+
+            <div className="rounded-lg p-3" style={{ backgroundColor: 'var(--color-bg-subtle)', border: '1px solid var(--color-border-muted)' }}>
+              <div className="flex gap-2 items-start">
+                <Shield className="h-4 w-4 shrink-0 mt-0.5" style={{ color: 'var(--color-text-tertiary)' }} />
+                <div>
+                  <p className="text-xs font-medium mb-1" style={{ color: 'var(--color-text-secondary)' }}>{t('settings.claudeSecurityTitle', 'Security & Privacy')}</p>
+                  <p className="text-[0.6875rem] leading-relaxed" style={{ color: 'var(--color-text-tertiary)' }}>
+                    {t('settings.claudeSecurityDesc', 'Your tokens are encrypted at rest. We use them only to make API calls on your behalf.')}
+                  </p>
+                  <p className="text-[0.6875rem] leading-relaxed mt-1.5" style={{ color: 'var(--color-text-tertiary)' }}>
+                    {t('setup.usageCountsAntigravity', 'Requests count against your Antigravity subscription quota, exactly as they would in the Antigravity CLI or IDE.')}
+                  </p>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <DialogFooter className="gap-2 pt-2">
+            <button
+              type="button"
+              onClick={() => setShowAntigravityDisclaimer(false)}
+              className="px-3 py-1.5 rounded text-sm border"
+              style={{ color: 'var(--color-text-primary)', borderColor: 'var(--color-border-default)' }}
+              onMouseEnter={(e) => e.currentTarget.style.backgroundColor = 'var(--color-border-muted)'}
+              onMouseLeave={(e) => e.currentTarget.style.backgroundColor = 'transparent'}
+            >
+              {t('common.cancel', 'Cancel')}
+            </button>
+            <button
+              type="button"
+              onClick={handleAntigravityConnect}
+              className="px-4 py-1.5 rounded text-sm font-medium transition-opacity hover:opacity-90 flex items-center gap-1.5"
+              style={{ backgroundColor: 'var(--color-btn-primary-bg)', color: 'var(--color-btn-primary-text)' }}
+            >
+              <ExternalLink className="h-3.5 w-3.5" />
+              {t('setup.openGoogle', 'Open Google sign-in')}
             </button>
           </DialogFooter>
         </DialogContent>

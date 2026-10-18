@@ -835,6 +835,19 @@
       "byok_eligible": true,
       "display_name": "Gemini"
     },
+    "antigravity": {
+      "sdk": "antigravity",
+      "base_url": "https://daily-cloudcode-pa.googleapis.com",
+      "env_key": null,
+      "access_type": "oauth",
+      "display_name": "Google Antigravity",
+      "variants": {
+        "antigravity-oauth": {
+          "display_name": "Antigravity (Google Account)",
+          "comment": "Native v1internal protocol; login via Google OAuth loopback PKCE. Includes Claude Opus/Sonnet 5.5 and GPT-OSS models under the same subscription."
+        }
+      }
+    },
     "dashscope": {
       "operator_channel": "developer",
       "env_key": "DASHSCOPE_API_KEY",
