@@ -1,0 +1,11 @@
+services:
+  backend:
+    entrypoint: ["/usr/bin/tini", "-s", "--", "/app/scripts/dalton/docker_entrypoint_dalton.sh"]
+    command: ["uv", "run", "python", "server.py", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    mem_limit: 2g
+    memswap_limit: 2g
+    volumes:
+      - ./agent_config.dalton.yaml:/app/agent_config.dalton.yaml:ro
+      - ./workflows:/app/workflows:ro
+      - ./config/dalton:/app/config/dalton:ro
+      - ./var/dalton:/app/var/dalton

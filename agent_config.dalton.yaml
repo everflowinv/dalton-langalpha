@@ -1,0 +1,36 @@
+# =============================================================================
+# DALTON AGENT CONFIGURATION OVERLAY (APP_ENV=dalton)
+# =============================================================================
+# Applied over agent_config.yaml when APP_ENV=dalton.
+
+llm:
+  name: "claude-opus-5-5-oauth"
+  background: "ocb-deepseek-deepseek-flash"
+  compaction: ""
+  fetch: ""
+  fallback: []
+
+sandbox:
+  provider: "docker"
+  docker:
+    memory_limit: "3g"
+    cpu_count: 2.0
+  daytona:
+    # Used by WorkspaceManager to derive idle auto-stop threshold (2400 - 600 = 1800s = 30 min)
+    auto_stop_interval: 2400
+
+mcp:
+  servers:
+    - name: "price_data"
+      enabled: true
+    - name: "researchdata"
+      call_timeout_s: 300
+
+subagents:
+  definitions:
+    research:
+      model: "ocb-xai-grok-4.7"
+    data-prep:
+      model: "ocb-xai-grok-4.7"
+    general-purpose:
+      model: "ocb-xai-grok-4.7"

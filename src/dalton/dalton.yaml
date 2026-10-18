@@ -1,0 +1,41 @@
+# Dalton on LangAlpha behavioral defaults (P0.1, P0.8, PK §0.5)
+enabled: true
+pm_user_ids:
+  - "local-dev-user"
+timezone: "Asia/Shanghai"
+
+budget:
+  # Default daily cap USD when user has not saved a DB row yet.
+  # null = fail-closed ("未设置日预算") until configured in Settings -> Dalton Budget.
+  default_daily_cap_usd: null
+  default_task_cap_usd: null
+  reserve_chunk_usd: 1.00
+  admission_floor_usd: 0.25
+  lease_ttl_seconds: 300
+  timezone: "Asia/Shanghai"
+
+knowledge:
+  max_doc_bytes: 1048576
+
+publish:
+  reviewer_models:
+    - "ocb-openai-gpt-6.1-sol"
+    - "ocb-google-gemini-4-argon"
+    - "ocb-claude-cli-gateway-claude-opus-5-5"
+    - "claude-opus-5-5-oauth"
+  extract_model: null
+  approval_ttl_hours: 168
+  max_file_bytes: 20971520
+  consensus_providers:
+    - "estimates:"
+    - "yf_analysis"
+
+autonomy:
+  enabled: true
+  min_wake_usd: 0.50
+  event_reserve_ratio: 0.2
+  preflight_timeout_s: 20
+  backoff:
+    base_hours: 24
+    max_days: 30
+  vendor_quota_alert_ratio: 0.8
