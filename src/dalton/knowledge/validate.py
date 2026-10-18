@@ -187,8 +187,10 @@ def _check_hard_invariants(
                     "message": "thesis.official can only be written by publish_report",
                 }
             )
-        old_hv_off = ((old_doc or {}).get("house_view") or {}).get("official_version")
-        new_hv_off = (new_doc.get("house_view") or {}).get("official_version")
+        old_hv_raw = (old_doc or {}).get("house_view")
+        new_hv_raw = new_doc.get("house_view")
+        old_hv_off = old_hv_raw.get("official_version") if isinstance(old_hv_raw, dict) else None
+        new_hv_off = new_hv_raw.get("official_version") if isinstance(new_hv_raw, dict) else None
         if new_hv_off != old_hv_off:
             errors.append(
                 {

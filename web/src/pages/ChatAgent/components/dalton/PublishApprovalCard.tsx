@@ -30,6 +30,7 @@ interface FigureSummary {
   unverified?: number;
   uncertain?: number;
   exempt?: number;
+  labeling_incomplete?: boolean;
   uncertain_items?: UncertainItem[];
 }
 
@@ -64,6 +65,9 @@ export function PublishApprovalCard({
       ? (args.figure_summary as FigureSummary)
       : null
   );
+  const labelingIncomplete = Boolean(
+    args?.labeling_incomplete ?? figSum?.labeling_incomplete ?? false
+  );
   const uncertainItems: UncertainItem[] = Array.isArray(args?.uncertain_items)
     ? (args.uncertain_items as UncertainItem[])
     : Array.isArray(figSum?.uncertain_items)
@@ -95,6 +99,19 @@ export function PublishApprovalCard({
       className="rounded-lg px-4 py-3 text-xs space-y-1.5"
       style={{ border: '1px solid var(--color-border-muted)', color: 'var(--color-text-secondary)' }}
     >
+      {labelingIncomplete && (
+        <div
+          className="rounded px-3 py-1.5 text-[11px] font-medium"
+          style={{
+            backgroundColor: 'rgba(245, 158, 11, 0.12)',
+            border: '1px solid rgba(245, 158, 11, 0.35)',
+            color: 'var(--color-text-primary)',
+          }}
+          data-testid="publish-labeling-incomplete-warning"
+        >
+          {t('dalton.publish.labelingIncompleteWarning', '标注未完成，口语数字和指标可能未核验')}
+        </div>
+      )}
       <div className="flex items-center justify-between gap-2">
         <span style={{ color: 'var(--color-text-tertiary)' }}>{t('dalton.publish.titleLabel', '报告标题')}</span>
         <span className="font-medium" style={{ color: 'var(--color-text-primary)' }}>

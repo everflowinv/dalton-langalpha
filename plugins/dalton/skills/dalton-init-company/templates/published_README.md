@@ -11,5 +11,5 @@
 
 ## 纪律与约定
 
-1. **唯一写入通道**：本目录下的报告（`<YYYY-MM-DD>-<slug>.md` / `.pdf` / `.xlsx`）与索引 `published/INDEX.md` **只经 `publish_report` 工具写入**。
+1. **唯一写入通道**：本目录下的报告（`<YYYY-MM-DD>-<slug>.md` / `.xlsx`）与索引 `published/INDEX.md` **只经 `publish_report` 工具写入**。
 2. **只读不改写**：已发布文件代表基金在发布时点的正式档案，其内容哈希记录在数据库中。任何后续观点更新应通过撰写新草稿或更新知识层完成，严禁直接修改或删除 `published/` 下的历史文件。

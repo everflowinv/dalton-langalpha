@@ -1,4 +1,4 @@
-"""Immutable publication file writer for ``published/<YYYY-MM-DD>-<slug>.{md,pdf,xlsx}`` (PK.11)."""
+"""Immutable publication file writer for ``published/<YYYY-MM-DD>-<slug>.{md,xlsx}`` (PK.11)."""
 
 from __future__ import annotations
 

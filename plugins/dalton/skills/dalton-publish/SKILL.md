@@ -34,7 +34,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 ## 2. 草稿自检：`check_draft(draft_path)`
 
 写完 `drafts/<slug>.md` 后，先调用 `check_draft(draft_path="drafts/<slug>.md")`：
-- 生成侧车清单 `drafts/<slug>.audit.md`（按行号列出所有未匹配或冲突数字及原因：`unverified`、`source_conflict`、`period_mismatch`、`unit_mismatch`、`consensus_confusion`）；
+- 生成侧车清单 `drafts/<slug>.audit.md`（按行号列出所有未匹配或冲突数字及原因：`unverified`、`source_conflict`、`period_mismatch`、`unit_mismatch`）；
 - 生成带标注副本 `drafts/<slug>.annotated.md`（未核实数字标为 `**27.10 美元**⟨未核实⟩`）；
 - 根据 `.audit.md` 补齐脚注或修正数字，直到 `unverified` 降为 0。
 
@@ -46,4 +46,4 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 3. **PM 审批**：
    - 在交互线程中弹出审批卡（`ToolApprovalCard`）；
    - 在自动任务（unattended）运行中不弹 interrupt，状态停在 `awaiting_pm` 并写入 `agenda.pm_handoffs`，待 PM 在交互线程中指示批准时传入 `request_id` 完成发布。
-4. **不可变归档**：批准后写入 `published/<YYYY-MM-DD>-<slug>.md`（及 `.pdf` / `.xlsx`）、写入 `dalton_publications` 与 `dalton_publication_files`，并在 `updates_thesis=True` 时更新 `thesis.official` 与 `published/INDEX.md`。`published/` 下的文件一旦生成绝不改写。
+4. **不可变归档**：批准后写入 `published/<YYYY-MM-DD>-<slug>.md`（及 `.xlsx`）、写入 `dalton_publications` 与 `dalton_publication_files`，并在 `updates_thesis=True` 时更新 `thesis.official` 与 `published/INDEX.md`。`published/` 下的文件一旦生成绝不改写。

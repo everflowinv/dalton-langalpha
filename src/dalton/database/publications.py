@@ -483,7 +483,12 @@ async def resolve_thread_author_model(thread_id: str | None) -> str | None:
                     llm_model = trow.get("llm_model")
                     if isinstance(llm_model, str) and llm_model.strip():
                         return llm_model.strip()
-    except Exception:
+    except Exception as exc:
+        logger.warning(
+            "Failed to resolve thread author model for thread %s (%s)",
+            thread_id,
+            type(exc).__name__,
+        )
         return None
     return None
 

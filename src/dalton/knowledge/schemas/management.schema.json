@@ -19,7 +19,8 @@
         "properties": {
           "id": {"type": "string", "pattern": "^G-\\d{3,4}$"},
           "metric": {"type": "string"}, "period": {"$ref": "common#/$defs/period"},
-          "issued_at": {"$ref": "common#/$defs/isoDate"},
+          "issued_at": {"oneOf": [{"type": "null"}, {"$ref": "common#/$defs/isoDate"}]},
+          "note": {"type": ["string", "null"]},
           "guide": {"type": "object", "additionalProperties": false,
             "properties": {"low": {"type": "number"}, "high": {"type": "number"}, "point": {"type": "number"},
                            "unit": {"$ref": "common#/$defs/unit"}, "text": {"type": "string"}},

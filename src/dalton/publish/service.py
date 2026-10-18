@@ -528,12 +528,15 @@ async def run_publish(
         exempt_cnt = int(audit_info.get("exempt", 0))
         uncertain_items = list(audit_info.get("uncertain_items") or [])
 
+        labeling_incomplete = bool(audit_info.get("labeling_incomplete", False))
+
         figure_summary = {
             "verified": verified_cnt,
             "contradicted": contradicted_cnt,
             "unverified": unverified_cnt,
             "uncertain": uncertain_cnt,
             "exempt": exempt_cnt,
+            "labeling_incomplete": labeling_incomplete,
             "uncertain_items": uncertain_items,
         }
         reviewer_payload = {
@@ -577,6 +580,7 @@ async def run_publish(
                         "draft_path": draft_path,
                         "published_path": published_path,
                         "figure_summary": figure_summary,
+                        "labeling_incomplete": labeling_incomplete,
                         "uncertain_items": uncertain_items,
                         "reviewer": reviewer_payload,
                         "updates_thesis": bool(updates_thesis),
