@@ -305,6 +305,7 @@ const SKIP_REASON_NOTE: Record<SkipReason, string | null> = {
   user: null,
   thread_busy: 'automation.skippedThreadBusy',
   interrupted: 'automation.skippedInterrupted',
+  precheck: 'automation.skippedPrecheck', // DALTON-HOOK(precheck-label)
 };
 
 /** The line a failed run carries when the failure was not the automation's.

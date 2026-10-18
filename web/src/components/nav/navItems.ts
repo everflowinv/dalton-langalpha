@@ -16,14 +16,14 @@ export interface NavItem {
    * Never a route guard: the route stays reachable by URL, and the page it
    * leads to is the one that explains an empty answer.
    */
-  requires?: 'orders';
+  requires?: 'orders' | 'market' | 'dashboard'; // DALTON-HOOK(dalton-nav)
 }
 
 // Single source of truth for primary navigation (rail + mobile tab bar).
 export const NAV_ITEMS: NavItem[] = [
-  { key: '/dashboard', icon: LayoutDashboard, labelKey: 'sidebar.dashboard', match: 'exact-or-sub' },
+  { key: '/dashboard', icon: LayoutDashboard, labelKey: 'sidebar.dashboard', match: 'exact-or-sub', requires: 'dashboard' }, // DALTON-HOOK(dalton-nav)
   { key: '/chat', icon: MessagesSquare, labelKey: 'sidebar.chatAgent', match: 'prefix' },
-  { key: '/market', icon: ChartCandlestick, labelKey: 'sidebar.marketView', match: 'exact-or-sub' },
+  { key: '/market', icon: ChartCandlestick, labelKey: 'sidebar.marketView', match: 'exact-or-sub', requires: 'market' }, // DALTON-HOOK(dalton-nav)
   { key: '/automations', icon: Timer, labelKey: 'sidebar.automations', match: 'exact-or-sub' },
   { key: '/orders', icon: Receipt, labelKey: 'sidebar.orders', match: 'exact-or-sub', requires: 'orders' },
   { key: '/plugins', icon: Blocks, labelKey: 'sidebar.plugins', match: 'exact-or-sub' },

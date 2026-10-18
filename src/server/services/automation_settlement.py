@@ -89,6 +89,7 @@ class Outcome(StrEnum):
     # clears its "started" notice on.
     STOPPED = "stopped"
     SKIPPED = "skipped"
+    PRECHECK_SKIPPED = "precheck_skipped"  # DALTON-HOOK(precheck-outcome)
 
 
 @dataclass(frozen=True)
@@ -188,6 +189,13 @@ _POLICIES: Dict[Outcome, _Policy] = {
         status="skipped",
         from_statuses=("waiting",),
         metric="skipped",
+        schedule="close",
+    ),
+    # DALTON-HOOK(precheck-outcome): zero-token preflight skip from pending
+    Outcome.PRECHECK_SKIPPED: _Policy(
+        status="skipped",
+        from_statuses=("pending",),
+        metric="precheck_skipped",
         schedule="close",
     ),
 }

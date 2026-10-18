@@ -942,6 +942,8 @@ class PTCAgent:
         # On the wire that is: tools (bp1), static system (bp2), baseline block
         # (bp3), messages ending in the turn's rows (bp4), the four Anthropic
         # allows.
+        from src.dalton.middleware.reconcile import DaltonReconcileMiddleware
+
         deepagent_middleware = [
             m
             for m in [
@@ -983,6 +985,8 @@ class PTCAgent:
                 EmptyToolCallRetryMiddleware(),
                 PatchToolCallsMiddleware(),
                 context.turn,
+                # DALTON-HOOK(knowledge-reconcile-mw): reconcile direct edits and pending knowledge files before baseline reads agent.md (PK.5).
+                DaltonReconcileMiddleware(workspace_id=workspace_id_for_memory, backend=filesystem_backend, user_id=user_id),
                 context.baseline,
                 notes_rows,
                 context.tail,
@@ -998,6 +1002,10 @@ class PTCAgent:
             from src.tools.secretary.chief_of_staff import CHIEF_OF_STAFF_TOOLS
 
             tools = [*tools, *CHIEF_OF_STAFF_TOOLS]
+        # DALTON-HOOK(dalton-tools): bind role-scoped Dalton knowledge/publish/director tools onto the main agent (PK.4, PK.11, PK.19).
+        from src.dalton.tools import build_dalton_tools
+
+        tools = [*tools, *build_dalton_tools(role, filesystem_backend)]
         if direct_tools:
             tools = [*tools, *direct_tools]
 
