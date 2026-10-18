@@ -20,6 +20,8 @@ from src.dalton.publish.numbers import (
 )
 from src.dalton.settings import get_dalton_config
 
+# FROZEN (P0H §1.3 #4 / L30): Do NOT add new entries to DEFAULT_METRIC_ALIASES, _GROWTH_WORDS,
+# or _MARGIN_WORDS. These tables are used only for candidate retrieval and explicit footnote matching.
 DEFAULT_METRIC_ALIASES: dict[str, list[str]] = {
     "revenue": ["revenue", "revenues", "total revenue", "营收", "总营收", "收入", "营业收入", "总收入"],
     "ad_revenue": ["ad revenue", "advertising revenue", "广告收入", "广告营收"],
@@ -549,26 +551,6 @@ def match_figures(
                     continue
 
                 if ok_val:
-                    # Check consensus confusion: source figure is labeled consensus,
-                    # or figure claims to be consensus without a consensus prov:
-                    if fig.label_hint == "consensus":
-                        return MatchOutcome(
-                            figure=fig,
-                            matched=False,
-                            reason="consensus_confusion",
-                            hint="一致预期数字必须使用 prov:<record> 脚注并指向一致预期数据接口",
-                        )
-                    if ef_label == "consensus" and fig.label_hint in (
-                        "estimate",
-                        "reported",
-                        "guidance",
-                    ):
-                        return MatchOutcome(
-                            figure=fig,
-                            matched=False,
-                            reason="consensus_confusion",
-                            hint=f"来源 {eid} 中该数字标签为 consensus（一致预期），正文中被当作 {fig.label_hint} 使用",
-                        )
                     return MatchOutcome(
                         figure=fig,
                         matched=True,
@@ -613,13 +595,6 @@ def match_figures(
                     metric_aliases=metric_aliases,
                 )
                 if f_hit:
-                    if fig.label_hint == "consensus":
-                        return MatchOutcome(
-                            figure=fig,
-                            matched=False,
-                            reason="consensus_confusion",
-                            hint="一致预期数字必须使用 prov:<record> 脚注并指向一致预期数据接口",
-                        )
                     return MatchOutcome(
                         figure=fig,
                         matched=True,
@@ -738,26 +713,6 @@ def match_figures(
                     reason="unverified",
                     hint=f"Provenance record {pid} not found",
                 )
-            if fig.label_hint == "consensus" and not _is_consensus_provenance(prec):
-                return MatchOutcome(
-                    figure=fig,
-                    matched=False,
-                    reason="consensus_confusion",
-                    hint=(
-                        f"一致预期数字引用了非一致预期来源 {pid} "
-                        f"(provider={prec.get('provider')!r})；必须来自 estimates:/yf_analysis/street_estimate"
-                    ),
-                )
-            if (
-                _is_consensus_provenance(prec)
-                and fig.label_hint in ("estimate", "reported", "guidance")
-            ):
-                return MatchOutcome(
-                    figure=fig,
-                    matched=False,
-                    reason="consensus_confusion",
-                    hint=f"来源 {pid} 是一致预期接口，但正文将数字表述为 {fig.label_hint}",
-                )
             body_text = str(
                 prec.get("body")
                 or prec.get("body_inline")
@@ -825,68 +780,9 @@ def match_figures(
                 )
             continue
 
-        # Special rule: Consensus figure without consensus provenance
-        if fig.label_hint == "consensus":
-            if fig.footnote_target and (
-                fig.footnote_target.startswith("prov:")
-                or fig.footnote_target.startswith("f:")
-            ):
-                out = _try_match_target(fig, fig.footnote_target)
-                if out:
-                    outcomes.append(out)
-                    continue
-            # Auto-search consensus provenance records
-            found_cons: MatchOutcome | None = None
-            for pid, prec in prov_map.items():
-                if _is_consensus_provenance(prec):
-                    hit, excerpt = _match_in_provenance_record(fig, prec, metric_aliases)
-                    if hit:
-                        found_cons = MatchOutcome(
-                            figure=fig,
-                            matched=True,
-                            kind="prov",
-                            ref=pid,
-                            excerpt=excerpt,
-                            source_sha256=str(prec.get("result_sha256") or ""),
-                        )
-                        break
-            if not found_cons:
-                mv_figs = ((thesis_doc or {}).get("market_view") or {}).get("figures") or []
-                for mvf in mv_figs:
-                    if not isinstance(mvf, dict) or mvf.get("value") is None:
-                        continue
-                    if not metrics_match(fig.metric, str(mvf.get("metric") or ""), metric_aliases):
-                        continue
-                    mv_p = normalize_period(mvf.get("period"))
-                    fig_p = normalize_period(fig.period)
-                    if fig_p and mv_p and fig_p != mv_p:
-                        continue
-                    ok_v, _, _ = values_within_tolerance(
-                        fig, float(mvf["value"]), str(mvf.get("unit") or fig.unit)
-                    )
-                    if ok_v:
-                        found_cons = MatchOutcome(
-                            figure=fig,
-                            matched=True,
-                            kind="prov",
-                            ref="thesis:market_view",
-                            excerpt=f"market_view: {mvf.get('metric')} {mvf.get('period')} = {mvf.get('value')} {mvf.get('unit')}",
-                        )
-                        break
-            if found_cons:
-                outcomes.append(found_cons)
-            else:
-                outcomes.append(
-                    MatchOutcome(
-                        figure=fig,
-                        matched=False,
-                        reason="consensus_confusion",
-                        hint="加脚注 prov:<record>，来源必须是一致预期数据接口（estimates: / yf_analysis / street_estimate）",
-                    )
-                )
-            continue
-
-        # Explicit footnote matching (Orders 0, 1, 2, 3)
+        # Step C: Explicit footnote matching (Orders 0, 1, 2, 3)
+        # Deterministic contradiction (`source_conflict`, `unit_mismatch`, `period_mismatch`) is ONLY
+        # emitted here when an explicit footnote points to a source whose value genuinely differs (L28).
         if fig.footnote_target:
             out = _try_match_target(fig, fig.footnote_target)
             if out is not None:
@@ -910,118 +806,114 @@ def match_figures(
             outcomes.append(facts_outcome)
             continue
 
-        # Order 4: Auto-search across thesis.evidence, model_cells, and provenance_records
+        # Order 4: Unfootnoted auto-search across thesis.evidence, thesis.market_view, model_cells, and provenance.
+        # Per P0H §1.2 Step C & L28: unfootnoted figures that do not match here NEVER produce `contradicted`
+        # (`source_conflict`, `unit_mismatch`, `period_mismatch`); they are marked `unverified` with candidate
+        # sources attached so Step D (`audit.judge` + code anchoring) decides.
         auto_candidates: list[MatchCandidate] = []
-        best_failure_reason: str | None = None
         matched_auto: MatchOutcome | None = None
+        has_meaningful_metric = bool(re.search(r"[A-Za-z\u4e00-\u9fff]{2,}", fig.metric or ""))
 
-        # 4a. Search thesis.evidence
-        for eid in evidence_by_id:
-            cand = _try_match_target(fig, f"evidence:{eid}")
-            if cand is not None:
-                if cand.matched:
-                    matched_auto = cand
-                    break
-                if cand.reason == "consensus_confusion":
-                    best_failure_reason = "consensus_confusion"
-                elif cand.reason == "unit_mismatch" and best_failure_reason != "consensus_confusion":
-                    best_failure_reason = "unit_mismatch"
-                elif cand.reason == "period_mismatch" and best_failure_reason not in (
-                    "consensus_confusion",
-                    "unit_mismatch",
-                ):
-                    best_failure_reason = "period_mismatch"
-                elif cand.reason == "source_conflict" and not best_failure_reason:
-                    best_failure_reason = "source_conflict"
-                auto_candidates.extend(cand.candidates)
-
-        if matched_auto:
-            outcomes.append(matched_auto)
-            continue
-
-        # 4b. Search model cells
-        for m_spec, c_info in cells_map.items():
-            if metrics_match(fig.metric, str(c_info.get("metric") or ""), metric_aliases):
-                cand = _try_match_target(fig, f"model:{m_spec}")
+        if has_meaningful_metric:
+            # 4a. Search thesis.evidence
+            for eid in evidence_by_id:
+                cand = _try_match_target(fig, f"evidence:{eid}")
                 if cand is not None:
                     if cand.matched:
                         matched_auto = cand
                         break
-                    if not best_failure_reason and cand.reason:
-                        best_failure_reason = cand.reason
                     auto_candidates.extend(cand.candidates)
 
+            # 4b. Search thesis.market_view.figures
+            if not matched_auto:
+                mv_figs = ((thesis_doc or {}).get("market_view") or {}).get("figures") or []
+                for mvf in mv_figs:
+                    if not isinstance(mvf, dict) or mvf.get("value") is None:
+                        continue
+                    if not metrics_match(fig.metric, str(mvf.get("metric") or ""), metric_aliases):
+                        continue
+                    mv_p = normalize_period(mvf.get("period"))
+                    fig_p = normalize_period(fig.period)
+                    if fig_p and mv_p and fig_p != mv_p:
+                        continue
+                    ok_v, _, _ = values_within_tolerance(
+                        fig, float(mvf["value"]), str(mvf.get("unit") or fig.unit)
+                    )
+                    if ok_v:
+                        matched_auto = MatchOutcome(
+                            figure=fig,
+                            matched=True,
+                            kind="prov",
+                            ref="thesis:market_view",
+                            excerpt=f"market_view: {mvf.get('metric')} {mvf.get('period')} = {mvf.get('value')} {mvf.get('unit')}",
+                        )
+                        break
+
+            # 4c. Search model cells
+            if not matched_auto:
+                for m_spec, c_info in cells_map.items():
+                    if metrics_match(fig.metric, str(c_info.get("metric") or ""), metric_aliases):
+                        cand = _try_match_target(fig, f"model:{m_spec}")
+                        if cand is not None:
+                            if cand.matched:
+                                matched_auto = cand
+                                break
+                            auto_candidates.extend(cand.candidates)
+
+            # 4d. Search provenance records
+            if not matched_auto:
+                for pid, prec in prov_map.items():
+                    body_text = str(
+                        prec.get("body")
+                        or prec.get("body_inline")
+                        or prec.get("result_snippet")
+                        or ""
+                    )
+                    hit, excerpt, _, prov_cands = _inspect_text_source(
+                        fig,
+                        body_text,
+                        source_id=pid,
+                        kind="prov",
+                        metric_aliases=metric_aliases,
+                    )
+                    if hit:
+                        matched_auto = MatchOutcome(
+                            figure=fig,
+                            matched=True,
+                            kind="prov",
+                            ref=pid,
+                            excerpt=excerpt,
+                            source_sha256=str(prec.get("result_sha256") or ""),
+                        )
+                        break
+                    if prov_cands:
+                        auto_candidates.extend(prov_cands)
+
         if matched_auto:
             outcomes.append(matched_auto)
             continue
 
-        # 4c. Search provenance records
-        for pid, prec in prov_map.items():
-            body_text = str(
-                prec.get("body")
-                or prec.get("body_inline")
-                or prec.get("result_snippet")
-                or ""
-            )
-            hit, excerpt, prov_reason, prov_cands = _inspect_text_source(
-                fig,
-                body_text,
-                source_id=pid,
-                kind="prov",
-                metric_aliases=metric_aliases,
-            )
-            if _is_consensus_provenance(prec) and fig.label_hint in (
-                "estimate",
-                "reported",
-                "guidance",
-            ):
-                if hit:
-                    best_failure_reason = "consensus_confusion"
-                    continue
-            if hit:
-                matched_auto = MatchOutcome(
-                    figure=fig,
-                    matched=True,
-                    kind="prov",
-                    ref=pid,
-                    excerpt=excerpt,
-                    source_sha256=str(prec.get("result_sha256") or ""),
-                )
-                break
-            if prov_cands:
-                if prov_reason == "unit_mismatch" and best_failure_reason != "consensus_confusion":
-                    best_failure_reason = "unit_mismatch"
-                elif prov_reason == "period_mismatch" and best_failure_reason not in (
-                    "consensus_confusion",
-                    "unit_mismatch",
-                ):
-                    best_failure_reason = "period_mismatch"
-                elif prov_reason == "source_conflict" and not best_failure_reason:
-                    best_failure_reason = "source_conflict"
-                auto_candidates.extend(prov_cands)
-
-        if matched_auto:
-            outcomes.append(matched_auto)
-            continue
-
-        # Record diagnostic failure
         outcomes.append(
             MatchOutcome(
                 figure=fig,
                 matched=False,
-                reason=best_failure_reason or "unverified",
+                reason="unverified",
                 hint="请补充 evidence:/model:/prov: 脚注或核对数值、单位与期间",
                 candidates=auto_candidates[:5],
             )
         )
 
     # Order 5: Second pass for derived figures (rates, margins, multiples) recomputable
-    # from two already-matched figures on the same line or within ±3 lines
+    # from two already-matched figures on the same line or within ±5 lines
     matched_by_line: list[ExtractedFigure] = [
         o.figure for o in outcomes if o.matched and o.kind != "exempt"
     ]
     for idx, out in enumerate(outcomes):
-        if out.matched or out.figure.label_hint != "derived":
+        if (
+            out.matched
+            or out.reason in ("source_conflict", "unit_mismatch", "period_mismatch")
+            or out.figure.unit not in ("pct", "x")
+        ):
             continue
         fig = out.figure
         nearby = [
@@ -1040,10 +932,9 @@ def match_figures(
                 if b == 0:
                     continue
                 if fig.unit == "pct":
-                    # Check ratio a/b * 100 or growth (a - b)/b * 100
+                    tol_pct = max(0.05, 0.5 * (10.0 ** (-fig.decimals)), abs(fig.value) * 0.01)
                     for derived_pct in ((a / b) * 100.0, ((a - b) / b) * 100.0):
-                        ok_d, _, _ = values_within_tolerance(fig, derived_pct, "pct")
-                        if ok_d:
+                        if abs(fig.value - derived_pct) <= tol_pct * 1.0001:
                             recomputed_pair = (nearby[i].id, nearby[j].id)
                             break
                 elif fig.unit == "x":
@@ -1080,8 +971,9 @@ def retrieve_candidate_sources(
     metric_aliases: dict[str, list[str]] | None = None,
     limit: int = 5,
 ) -> list[dict[str, Any]]:
-    """Retrieve up to ``limit`` (default 5) candidate source snippets for ``fig`` (G3.1 step 3)."""
+    """Retrieve up to ``limit`` (default 5) candidate source snippets for ``fig`` (G3.1 / P0H Step D)."""
     scored: list[tuple[int, dict[str, Any]]] = []
+    fallback_pool: list[dict[str, Any]] = []
     fig_p = normalize_period(fig.period)
     fn_target = (fig.footnote_target or "").strip()
 
@@ -1111,21 +1003,46 @@ def retrieve_candidate_sources(
             score += 3
         if fig_p and fig_p.lower() in fact_str.lower():
             score += 2
+        combined_text = fact_str
+        if fig_lines:
+            combined_text = f"{fact_str} | Figures: {'; '.join(fig_lines)}".strip(" |")
+        entry = {
+            "source_id": eid,
+            "ref": f"evidence:{eid}",
+            "kind": "evidence",
+            "text": combined_text,
+        }
         if score > 0:
-            combined_text = fact_str
-            if fig_lines:
-                combined_text = f"{fact_str} | Figures: {'; '.join(fig_lines)}".strip(" |")
-            scored.append(
-                (
-                    score,
-                    {
-                        "source_id": eid,
-                        "ref": f"evidence:{eid}",
-                        "kind": "evidence",
-                        "text": combined_text,
-                    },
-                )
-            )
+            scored.append((score, entry))
+        elif combined_text:
+            fallback_pool.append(entry)
+
+    # 1b. thesis.json market_view.figures[]
+    mv_figs = ((thesis_doc or {}).get("market_view") or {}).get("figures") or []
+    if mv_figs:
+        mv_lines: list[str] = []
+        mv_score = 0
+        for mvf in mv_figs:
+            if not isinstance(mvf, dict) or mvf.get("value") is None:
+                continue
+            m_name = str(mvf.get("metric") or "")
+            m_per = normalize_period(mvf.get("period"))
+            if fig.metric and m_name and metrics_match(fig.metric, m_name, metric_aliases):
+                mv_score += 5
+            if fig_p and m_per and fig_p == m_per:
+                mv_score += 3
+            mv_lines.append(f"{m_name} ({mvf.get('period') or ''}): {mvf.get('value')} {mvf.get('unit') or ''}")
+        if mv_lines:
+            mv_entry = {
+                "source_id": "thesis:market_view",
+                "ref": "thesis:market_view",
+                "kind": "prov",
+                "text": "Market consensus figures: " + "; ".join(mv_lines),
+            }
+            if mv_score > 0:
+                scored.append((mv_score, mv_entry))
+            else:
+                fallback_pool.append(mv_entry)
 
     # 2. models.json + model_cells
     merged_cells = dict(model_cells or {})
@@ -1187,18 +1104,16 @@ def retrieve_candidate_sources(
             score += 4
         if fig_p and fig_p.lower() in body.lower():
             score += 2
+        p_entry = {
+            "source_id": pid,
+            "ref": f"prov:{pid}",
+            "kind": "prov",
+            "text": body[:1000],
+        }
         if score > 0:
-            scored.append(
-                (
-                    score,
-                    {
-                        "source_id": pid,
-                        "ref": f"prov:{pid}",
-                        "kind": "prov",
-                        "text": body[:1000],
-                    },
-                )
-            )
+            scored.append((score, p_entry))
+        else:
+            fallback_pool.append(p_entry)
 
     # 4. facts_ledger
     for fid, frow in (facts_ledger or {}).items():
@@ -1227,5 +1142,7 @@ def retrieve_candidate_sources(
             )
 
     scored.sort(key=lambda item: item[0], reverse=True)
-    return [item[1] for item in scored[:limit]]
+    if scored:
+        return [item[1] for item in scored[:limit]]
+    return fallback_pool[:limit]
 

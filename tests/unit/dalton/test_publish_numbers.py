@@ -175,18 +175,15 @@ def test_match_figures_all_orders_and_discrepancies() -> None:
     # - unit_mismatch: 2Q26 广告收入 $59.4mn (million instead of billion)
     # - period_mismatch: 3Q26 广告收入 $59.4bn pointing to 2Q26 evidence
     # - source_conflict: 2Q26 营业收入 $68.9bn pointing to E-20261015-01 (which has 60.8)
-    # - consensus_confusion: 一致预期 FY2027 EPS $34.05 pointing to non-consensus news prov-news-002
     # - target price without model cell: 目标价 $900 pointing to evidence:E-20261015-01
     bad_draft = """# META 错误测试草稿
 
 2Q26 广告收入为 $59.4mn[^e1]。
 3Q26 广告收入为 $59.4bn[^e1]。
 2Q26 营业收入为 $68.9bn[^e1]。
-一致预期 FY2027 EPS 为 $34.05[^p_news]。
 我们给予 FY26 目标价 $900[^e1]。
 
 [^e1]: evidence:E-20261015-01
-[^p_news]: prov:prov-news-002
 """
     audit_bad = audit_draft(
         bad_draft,
@@ -199,14 +196,12 @@ def test_match_figures_all_orders_and_discrepancies() -> None:
     assert reasons_by_raw["$59.4mn"] == "unit_mismatch"
     assert reasons_by_raw["$59.4bn"] == "period_mismatch"
     assert reasons_by_raw["$68.9bn"] == "source_conflict"
-    assert reasons_by_raw["$34.05"] == "consensus_confusion"
     assert reasons_by_raw["$900"] == "unverified"
 
     audit_md = render_audit_md(audit_bad, draft_path="drafts/meta.md")
     assert "unit_mismatch" in audit_md
     assert "period_mismatch" in audit_md
     assert "source_conflict" in audit_md
-    assert "consensus_confusion" in audit_md
 
     annotated = render_annotated_draft(bad_draft, audit_bad)
     assert "**$59.4mn**⟨未核实⟩" in annotated
@@ -338,15 +333,24 @@ async def test_published_files_immutability_and_collision_suffix() -> None:
     assert b_sha1 == b_sha2
 
 
-def test_g31_counterexamples_units_footnotes_tables_and_sec_accession() -> None:
-    # 1. SEC accession (0001326801-26-000042) & doc code (10-K-2026-03) must NOT be extracted (R4-5)
-    # 2. Inline footnote [^E0001] without footer definition resolves to evidence:E0001
-    # 3. Cross-scale unit normalization: 512 亿美元 == $51.2B (51.2 USD_bn)
-    # 4. Table header unit inheritance: 广告收入（亿美元） -> unit CNY_100mn, metric "广告收入" (R4-4)
-    # 5. Chinese prose quantifiers: 三成 -> 30%, 翻倍 -> 100%
-    draft = """# META 2Q26 财报复盘（Filing 10-K-2026-03, Accession 0001326801-26-000042）
+@pytest.mark.asyncio
+async def test_g31_counterexamples_units_footnotes_tables_and_sec_accession(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import create_autospec
+    from src.dalton.llm.assist import AssistResult, assist_json
+    from src.dalton.publish import numbers as numbers_mod
+    from src.dalton.publish.audit import aaudit_draft
 
-2Q26 广告收入 512 亿美元，同比 +21%[^E0001]；核心 AI 广告转化率提升约三成[^E0001]。
+    # 1. SEC accession (0001326801-26-000042), doc code (10-K-2026-03), slash date (10/12),
+    #    clock time (05:22), Discord ID (1485122334455667788), batch code (20261018-0412) masked (N2-M6)
+    # 2. Heading `# 2Q26 复盘` keeps period `2Q26` (N2-H3)
+    # 3. Cross-scale unit normalization: 512 亿美元 == $51.2B (51.2 USD_bn)
+    # 4. Table header unit inheritance: 广告收入（亿美元） -> unit USD_bn, metric "广告收入"
+    # 5. Colloquial Chinese numbers ("三成", "两成", "百分之三十", "腰斩", "过半") extracted via Step B (L28)
+    draft = """# 2Q26 复盘（Filing 10-K-2026-03, Accession 0001326801-26-000042, 10/12 05:22, msg 1485122334455667788, batch 20261018-0412）
+
+广告收入 512 亿美元，同比 +21%[^E0001]；核心 AI 广告转化率提升约三成[^E0001]，退订率下降两成[^E0001]，渗透率达百分之三十[^E0001]，硬件亏损腰斩[^E0001]，视频时长占比过半[^E0001]。
 
 | 期间 | 广告收入（亿美元） | 同比增速 |
 | :--- | :---: | :---: |
@@ -354,13 +358,11 @@ def test_g31_counterexamples_units_footnotes_tables_and_sec_accession() -> None:
 """
     figs = extract_figures(draft)
     raws = [f.raw for f in figs]
-    # Accession and doc codes excluded
-    assert not any("0001326801" in r or "000042" in r or "2026-03" in r for r in raws)
-    # Chinese quantifier extracted
-    assert "三成" in raws
-    san_cheng = next(f for f in figs if f.raw == "三成")
-    assert san_cheng.value == 30.0
-    assert san_cheng.unit == "pct"
+    # Accession, doc codes, slash dates, clock times, Discord IDs, batch codes excluded
+    assert raws == ["512 亿美元", "+21%", "512", "+21%"]
+    # Heading `# 2Q26 复盘` propagates period 2Q26 to subsequent prose line
+    prose_512 = next(f for f in figs if f.raw == "512 亿美元")
+    assert prose_512.period == "2Q26"
 
     # Table cell 512 inherits unit USD_bn (scale 1e8) from column header 广告收入（亿美元）
     table_512 = [f for f in figs if f.raw == "512" and f.location.get("line", 0) > 5]
@@ -369,22 +371,65 @@ def test_g31_counterexamples_units_footnotes_tables_and_sec_accession() -> None:
     assert table_512[0].scale == 1e8
     assert table_512[0].metric == "广告收入"
 
+    mock_assist = create_autospec(assist_json)
+
+    async def _side_effect(
+        task: str,
+        instructions: str,
+        payload: dict[str, Any],
+        schema: dict[str, Any],
+        *,
+        user_id: str = "local-dev-user",
+        role: str = "assist",
+        scope_ref: str | None = None,
+        timeout_s: float = 60.0,
+        model: str | None = None,
+        llm_service: Any = None,
+        workspace_id: str | None = None,
+        thread_id: str | None = None,
+    ) -> AssistResult:
+        if task == "audit.label_figures":
+            return AssistResult(
+                ok=True,
+                data={
+                    "labels": [],
+                    "extra_figures": [
+                        {"raw": "三成", "value": 30.0, "unit": "pct", "metric": "AI 广告转化率提升", "period": "2Q26", "kind": "reported", "line": 3},
+                        {"raw": "两成", "value": 20.0, "unit": "pct", "metric": "退订率下降", "period": "2Q26", "kind": "reported", "line": 3},
+                        {"raw": "百分之三十", "value": 30.0, "unit": "pct", "metric": "渗透率", "period": "2Q26", "kind": "reported", "line": 3},
+                        {"raw": "腰斩", "value": 50.0, "unit": "pct", "metric": "硬件亏损降幅", "period": "2Q26", "kind": "reported", "line": 3},
+                        {"raw": "过半", "value": 50.0, "unit": "pct", "metric": "视频时长占比", "period": "2Q26", "kind": "reported", "line": 3},
+                        {"raw": "并不存在于草稿中的幻觉词", "value": 99.0, "unit": "pct", "metric": "幻觉", "period": "2Q26", "kind": "reported", "line": 3},
+                    ],
+                },
+            )
+        return AssistResult(ok=False, data=None, error="unexpected_task")
+
+    mock_assist.side_effect = _side_effect
+    monkeypatch.setattr(numbers_mod, "assist_json", mock_assist)
+
     thesis_doc = {
         "evidence": [
             {
                 "id": "E0001",
-                "fact": "2Q26 ad revenue reached $51.2B (+21% YoY), AI conversion up 30%.",
+                "fact": "2Q26 ad revenue reached $51.2B (+21% YoY), AI conversion up 30%, churn down 20%, penetration 30%, RL loss down 50%, video share >50%.",
                 "figures": [
                     {"metric": "广告收入", "value": 51.2, "unit": "USD_bn", "period": "2Q26", "label": "reported"},
                     {"metric": "广告收入同比增速", "value": 21.0, "unit": "pct", "period": "2Q26", "label": "reported"},
                     {"metric": "AI 广告转化率提升", "value": 30.0, "unit": "pct", "period": "2Q26", "label": "reported"},
+                    {"metric": "退订率下降", "value": 20.0, "unit": "pct", "period": "2Q26", "label": "reported"},
+                    {"metric": "渗透率", "value": 30.0, "unit": "pct", "period": "2Q26", "label": "reported"},
+                    {"metric": "硬件亏损降幅", "value": 50.0, "unit": "pct", "period": "2Q26", "label": "reported"},
+                    {"metric": "视频时长占比", "value": 50.0, "unit": "pct", "period": "2Q26", "label": "reported"},
                 ],
             }
         ]
     }
-    res = audit_draft(draft, thesis_doc=thesis_doc)
+    res = await aaudit_draft(draft, thesis_doc=thesis_doc)
     assert res.passed, f"Unexpected failures: {res.unmatched}"
-    assert len(res.verified) == 5
+    assert res.labeling_incomplete is False
+    # 4 code-extracted figures + 5 anchored colloquial Chinese figures = 9 verified (hallucinated extra_figure dropped)
+    assert len(res.verified) == 9
 
 
 def test_g31_provenance_rejects_wrong_metric_or_period_r4_3() -> None:
@@ -408,8 +453,10 @@ def test_g31_provenance_rejects_wrong_metric_or_period_r4_3() -> None:
 async def test_g31_llm_judge_reverification_and_uncertain_bucket_does_not_block(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from src.dalton.llm.assist import AssistResult
+    from unittest.mock import create_autospec
+    from src.dalton.llm.assist import AssistResult, assist_json
     from src.dalton.publish import audit as audit_mod
+    from src.dalton.publish import numbers as numbers_mod
     from src.dalton.publish.audit import aaudit_draft, verify_llm_judge_verdict
 
     fig = ExtractedFigure(
@@ -437,49 +484,152 @@ async def test_g31_llm_judge_reverification_and_uncertain_bucket_does_not_block(
     bucket_1, _ = verify_llm_judge_verdict(
         fig,
         {
-            "verdict": "verified",
+            "verdict": "supported",
             "source_id": "evidence:E0001",
             "quote": "This quote does not exist in source",
-            "source_value": 51.2,
-            "source_unit": "USD_bn",
         },
         cand,
     )
-    assert bucket_1 != "verified"
+    assert bucket_1 == "unverified"
 
-    # 2. Quote exists, but source_value (40.0 USD_bn) is outside tolerance of 512 亿美元 (51.2B) -> rejected
+    # 2. Quote exists verbatim in source ("Family of Apps ad revenue"), but contains NO number -> downgraded to uncertain (L29 / P0H §1.4 #1)
     bucket_2, _ = verify_llm_judge_verdict(
         fig,
         {
-            "verdict": "verified",
+            "verdict": "supported",
             "source_id": "evidence:E0001",
-            "quote": "ad revenue was $51.2B",
-            "source_value": 40.0,
-            "source_unit": "USD_bn",
+            "quote": "Family of Apps ad revenue",
         },
         cand,
     )
-    assert bucket_2 != "verified"
+    assert bucket_2 == "uncertain"
 
-    # 3. Verbatim quote + unit-converted source_value within tolerance -> accepted!
+    # 3. Verbatim quote containing "$51.2B" -> code extracts $51.2B and confirms it matches 512 亿美元!
     bucket_3, _ = verify_llm_judge_verdict(
         fig,
         {
-            "verdict": "verified",
+            "verdict": "supported",
             "source_id": "evidence:E0001",
             "quote": "ad revenue was $51.2B",
-            "source_value": 51.2,
-            "source_unit": "USD_bn",
         },
         cand,
     )
     assert bucket_3 == "verified"
 
-    # 4. When assist_json fails (ok=False), figure goes to `uncertain` and does NOT block `passed`
-    async def fake_assist_fail(*args: Any, **kwargs: Any) -> AssistResult:
-        return AssistResult(ok=False, data=None, error="llm_timeout")
+    # 4. Contradicted verdict where quote is missing or unanchored -> downgraded to "unverified" (L29!)
+    bucket_4a, _ = verify_llm_judge_verdict(
+        fig,
+        {
+            "verdict": "contradicted",
+            "source_id": "evidence:E0001",
+            "quote": "nonexistent quote",
+        },
+        cand,
+    )
+    assert bucket_4a == "unverified"
 
-    monkeypatch.setattr(audit_mod, "assist_json", fake_assist_fail)
+    # 5a. Supported verdict where quote is verbatim in source ("ad revenue was $51.2B"),
+    #     but quote number ($51.2B) differs from draft figure (600 亿美元 = $60.0B) -> MUST NOT be "verified" (P0H §1.7 #1)!
+    fig_wrong = ExtractedFigure(
+        id="F-002",
+        raw="600 亿美元",
+        value=600.0,
+        decimals=0,
+        unit="USD_bn",
+        scale=1e8,
+        currency="USD",
+        metric="广告收入",
+        period="2Q26",
+        label_hint="reported",
+        location={"line": 3, "sentence": "2Q26 广告收入 600 亿美元。"},
+    )
+    bucket_3b, _ = verify_llm_judge_verdict(
+        fig_wrong,
+        {
+            "verdict": "supported",
+            "source_id": "evidence:E0001",
+            "quote": "ad revenue was $51.2B",
+        },
+        cand,
+    )
+    assert bucket_3b != "verified"
+    assert bucket_3b == "uncertain"
+
+    # 5b. Contradicted verdict where quote is anchored AND has a differing number -> accepted as "contradicted"
+    bucket_4b, detail_4b = verify_llm_judge_verdict(
+        fig_wrong,
+        {
+            "verdict": "contradicted",
+            "source_id": "evidence:E0001",
+            "quote": "ad revenue was $51.2B",
+        },
+        cand,
+    )
+    assert bucket_4b == "contradicted"
+    assert detail_4b["reason"] == "source_conflict"
+
+    # 5c. Single line with both consensus (with consensus footnote) and our own estimate/reported (with evidence footnote)
+    #     must verify BOTH figures without whole-line consensus_confusion false positive (P0H §1.7 #1)!
+    mixed_line_draft = (
+        "2Q26 广告收入市场一致预期为 $50.0B[^p_cons]，而我们测算/实际录得 2Q26 广告收入为 $51.2B[^E0001]。\n\n"
+        "[^p_cons]: prov:prov-yf-001\n"
+    )
+    mixed_res = audit_draft(
+        mixed_line_draft,
+        thesis_doc={
+            "evidence": [
+                {
+                    "id": "E0001",
+                    "fact": "2Q26 ad revenue $51.2B",
+                    "figures": [{"metric": "广告收入", "value": 51.2, "unit": "USD_bn", "period": "2Q26", "label": "reported"}],
+                }
+            ]
+        },
+        provenance_records={
+            "prov-yf-001": {
+                "provider": "estimates:yfinance",
+                "identifier": "yf",
+                "source_type": "street_estimate",
+                "result_sha256": "abc",
+                "body": "2Q26 ad revenue consensus 50.0 bn.",
+            }
+        },
+    )
+    assert mixed_res.passed, f"Unexpected failures on mixed consensus+evidence line: {mixed_res.unmatched}"
+    assert len(mixed_res.verified) == 2
+
+    # 6. Exempt verdict without [估计]/[假设] marker in draft sentence -> downgraded to "unverified" (L29!)
+    bucket_5a, _ = verify_llm_judge_verdict(
+        fig,
+        {"verdict": "exempt", "reason": "analyst assumption"},
+        cand,
+    )
+    assert bucket_5a == "unverified"
+
+    fig_exempt = ExtractedFigure(
+        id="F-003",
+        raw="512 亿美元",
+        value=512.0,
+        decimals=0,
+        unit="USD_bn",
+        scale=1e8,
+        currency="USD",
+        metric="广告收入",
+        period="2Q26",
+        label_hint="assumption",
+        location={"line": 3, "sentence": "[假设] 2Q26 广告收入 512 亿美元。"},
+    )
+    bucket_5b, _ = verify_llm_judge_verdict(
+        fig_exempt,
+        {"verdict": "exempt", "reason": "explicit assumption marker"},
+        cand,
+    )
+    assert bucket_5b == "exempt"
+
+    # 7. When assist_json fails (ok=False), figure goes to `uncertain`, `labeling_incomplete=True`, and does NOT block `passed`
+    mock_assist_fail = create_autospec(assist_json, return_value=AssistResult(ok=False, data=None, error="llm_timeout"))
+    monkeypatch.setattr(audit_mod, "assist_json", mock_assist_fail)
+    monkeypatch.setattr(numbers_mod, "assist_json", mock_assist_fail)
     draft = "2Q26 某细分指标达到 88.8%。\n"
     res = await aaudit_draft(
         draft,
@@ -487,6 +637,7 @@ async def test_g31_llm_judge_reverification_and_uncertain_bucket_does_not_block(
             "evidence": [{"id": "E0001", "fact": "2Q26 某细分指标在北美市场表现良好。"}]
         },
     )
+    assert res.labeling_incomplete is True
     assert len(res.uncertain) == 1
     assert len(res.contradicted) == 0
     assert len(res.unverified) == 0

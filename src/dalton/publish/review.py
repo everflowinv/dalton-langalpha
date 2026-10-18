@@ -270,50 +270,32 @@ async def run_review(
     user_prompt = render_review_input(bundle)
 
     try:
-        if llm_service is None:
-            from src.dalton.llm.complete import dalton_complete
+        from src.dalton.llm.complete import dalton_complete
 
-            comp = await dalton_complete(
-                user_id=user_id or "local-dev-user",
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                purpose="publish.review",
-                request_model=model,
-                response_schema=ReviewVerdict,
-                slot="primary",
-                reasoning_effort="high",
-                timeout_s=300.0,
-                workspace_id=workspace_id,
-                thread_id=thread_id,
-                raise_on_error=False,
+        comp = await dalton_complete(
+            llm_service,
+            user_id=user_id or "local-dev-user",
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            purpose="publish.review",
+            request_model=model,
+            response_schema=ReviewVerdict,
+            slot="primary",
+            reasoning_effort="high",
+            timeout_s=300.0,
+            workspace_id=workspace_id,
+            thread_id=thread_id,
+            raise_on_error=False,
+        )
+        if not comp.ok:
+            return ReviewResult(
+                status="unavailable",
+                model=model,
+                family=family_of(model),
+                reason=f"独立审稿调用失败：{comp.error or comp.status}",
             )
-            if not comp.ok:
-                return ReviewResult(
-                    status="unavailable",
-                    model=model,
-                    family=family_of(model),
-                    reason=f"独立审稿调用失败：{comp.error or comp.status}",
-                )
-            verdict_obj = comp.data
-            usage = comp.usage
-        else:
-            out = await asyncio.wait_for(
-                llm_service.complete(
-                    user_id=user_id,
-                    system_prompt=system_prompt,
-                    user_prompt=user_prompt,
-                    response_schema=ReviewVerdict,
-                    request_model=model,
-                    slot="primary",
-                    reasoning_effort="high",
-                    return_token_usage=True,
-                ),
-                timeout=300.0,
-            )
-            if isinstance(out, tuple) and len(out) == 2:
-                verdict_obj, usage = out
-            else:
-                verdict_obj, usage = out, {}
+        verdict_obj = comp.data
+        usage = comp.usage
 
         if isinstance(verdict_obj, dict):
             verdict_obj = ReviewVerdict.model_validate(verdict_obj)

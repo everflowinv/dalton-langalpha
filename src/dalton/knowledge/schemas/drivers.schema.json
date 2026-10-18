@@ -6,7 +6,8 @@
     "historical_valuation_driver": {"type": "object", "additionalProperties": false,
       "description": "历史上股价由 EPS 驱动还是倍数驱动",
       "properties": {"summary": {"type": "string"}, "window": {"type": "string"},
-                     "eps_share_pct": {"type": "number"}, "multiple_share_pct": {"type": "number"},
+                     "eps_share_pct": {"type": ["number", "null"]}, "multiple_share_pct": {"type": ["number", "null"]},
+                     "note": {"type": ["string", "null"]},
                      "model_ref": {"$ref": "common#/$defs/evidenceRef"}}},
     "drivers": {"type": "array", "items": {"$ref": "#/$defs/driver"}}
   },

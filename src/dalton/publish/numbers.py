@@ -8,6 +8,11 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+try:
+    from src.dalton.llm.assist import assist_json
+except ImportError:  # pragma: no cover
+    assist_json = None  # type: ignore[assignment]
+
 # Period tokens: FY2026, FY26, 3Q26, Q3 2026, 2026Q3, 1H26, 2H26, 2026H1, LTM-2026-09, 2026E, NTM
 _PERIOD_TOKEN_RE = re.compile(
     r"\b("
@@ -32,6 +37,10 @@ _HYPHEN_DOC_CODE_RE = re.compile(
 _ISO_DATE_RE = re.compile(r"\b20\d{2}[-/.](?:0?[1-9]|1[0-2])(?:[-/.](?:0?[1-9]|[12]\d|3[01]))?\b")
 _CN_DATE_RE = re.compile(r"20\d{2}\s*年(?:\s*\d{1,2}\s*月(?:\s*\d{1,2}\s*日)?)?")
 _SHORT_DATE_RE = re.compile(r"(?<!\d)(?:0?[1-9]|1[0-2])-(?:0?[1-9]|[12]\d|3[01])(?!\d)")
+_SLASH_DATE_RE = re.compile(r"(?<!\d)(?:0?[1-9]|1[0-2])/(?:0?[1-9]|[12]\d|3[01])(?:/\d{2,4})?(?!\d)")
+_CLOCK_TIME_RE = re.compile(r"\b(?:[01]?\d|2[0-3]):[0-5]\d(?::[0-5]\d)?\b")
+_LONG_ID_INT_RE = re.compile(r"\b\d{12,}\b")
+_BATCH_CODE_RE = re.compile(r"\b\d{8}-\d{4}\b")
 _YEAR_RANGE_RE = re.compile(r"\b20\d{2}\s*[-–~至]\s*20\d{2}\b")
 _STANDALONE_YEAR_RE = re.compile(r"^(?:19|20)\d{2}$")
 _FILING_FORM_RE = re.compile(r"\b(?:10-K|10-Q|8-K|6-K|20-F|DEF\s*14A|S-1|13F)\b", re.IGNORECASE)
@@ -44,7 +53,10 @@ _FOOTNOTE_DEF_RE = re.compile(r"^\s*\[\^([^\]]+)\]:\s*(.+?)\s*$")
 _FOOTNOTE_REF_RE = re.compile(r"\[\^([^\]]+)\]")
 _MARKDOWN_LINK_RE = re.compile(r"\[[^\]]*\]\([^)]+\)")
 _INLINE_CODE_RE = re.compile(r"`[^`]+`")
-_HEADING_PREFIX_RE = re.compile(r"^\s*#{1,6}\s+(?:\d+(?:\.\d+)*\.?\s*)?")
+_HEADING_PREFIX_RE = re.compile(
+    r"^\s*#{1,6}\s+(?:(?![1-4]Q\d|[12]H\d|20\d{2}\s*[QH][1-4])\d+(?:\.\d+)*(?:[.)]\s*|\s+))?",
+    re.IGNORECASE,
+)
 _LIST_PREFIX_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)]|（\d+）|\(\d+\))\s+")
 
 # Structural prose counts like "3 个支柱", "第 2 季度", "第 1 节", "2 条分歧"
@@ -58,26 +70,6 @@ _EXEMPT_MARKER_RE = re.compile(
     r"(?:〔示意〕|\[示意\]|（示意）|〔假设〕|\[假设\]|（假设）|〔估计〕|\[估计\]|（估计）|（举例）)"
 )
 
-# Chinese prose fraction / multiple expressions ("三成", "三成半", "五分之一", "翻倍", "翻一番", "减半")
-_CN_DIGIT_MAP: dict[str, float] = {
-    "一": 1.0,
-    "二": 2.0,
-    "两": 2.0,
-    "三": 3.0,
-    "四": 4.0,
-    "五": 5.0,
-    "六": 6.0,
-    "七": 7.0,
-    "八": 8.0,
-    "九": 9.0,
-    "十": 10.0,
-}
-_CN_PROSE_FIG_RE = re.compile(
-    r"(?P<cheng>(?<![一二三四五六七八九十])[一二三四五六七八九]成(?:半)?(?!不变))|"
-    r"(?P<zhe>(?<![一二三四五六七八九十])[一二三四五六七八九]折)|"
-    r"(?P<frac>[一二三四五六七八九十]+\s*分之\s*[一二三四五六七八九十]+)|"
-    r"(?P<mult>翻两番|翻一番|翻倍|减半)"
-)
 
 # Core financial number regex:
 # Captures optional sign/parens, optional currency prefix, number with commas/decimals,
@@ -131,27 +123,35 @@ CURRENCY_MAP: dict[str, str] = {
 
 
 class FigureLabelItem(BaseModel):
-    """LLM-annotated metric, period, and optional unit for one extracted figure ID."""
+    """LLM-annotated metric, period, unit, and kind for one extracted figure ID."""
 
     id: str = Field(description="Extracted figure ID, e.g. F-001")
     metric: str = Field(default="", description="Financial metric name")
     period: str = Field(default="", description="Normalized period, e.g. 3Q26 or FY2026")
     unit: str = Field(default="", description="Optional canonical unit, e.g. USD_bn, USD_mn, pct, x, count_mn")
+    kind: str = Field(
+        default="",
+        description="Semantic figure kind: reported, estimate, consensus, guidance, or derived",
+    )
 
 
 class ExtraFigureItem(BaseModel):
-    """Additional prose figure identified by LLM (e.g. Chinese expressions like '三成', '翻倍')."""
+    """Additional prose figure identified by LLM (e.g. Chinese expressions like '三成', '翻倍', '腰斩')."""
 
-    raw: str = Field(description="Exact substring in the draft sentence, e.g. '三成' or '翻倍'")
+    raw: str = Field(description="Exact substring in the draft sentence, e.g. '三成', '翻倍', '腰斩', '过半'")
     line: int = Field(default=1, description="1-based line number in the draft")
-    value: float = Field(description="Numeric value (e.g. 30.0 for 三成, 2.0 for 翻倍)")
+    value: float = Field(description="Numeric value (e.g. 30.0 for 三成, 2.0 for 翻倍, -50.0 or 50.0 for 腰斩)")
     unit: str = Field(default="pct", description="Canonical unit, e.g. pct or x")
     metric: str = Field(default="", description="Financial metric name")
     period: str = Field(default="", description="Normalized period if any")
+    kind: str = Field(
+        default="reported",
+        description="Semantic figure kind: reported, estimate, consensus, guidance, or derived",
+    )
 
 
 class FigureLabels(BaseModel):
-    """Structured response for LLM-assisted prose figure labeling (PK.9 / G3.1)."""
+    """Structured response for LLM-assisted figure labeling (PK.9 / P0H Step B)."""
 
     items: list[FigureLabelItem] = Field(default_factory=list)
     extra_figures: list[ExtraFigureItem] = Field(default_factory=list)
@@ -310,58 +310,6 @@ def _determine_unit_and_scale(
     return None, "other", 1.0
 
 
-def _infer_label_hint(text: str) -> str:
-    low = text.lower()
-    if any(
-        w in low
-        for w in (
-            "一致预期",
-            "consensus",
-            "street",
-            "卖方一致",
-            "彭博一致",
-            "市场预期",
-        )
-    ):
-        return "consensus"
-    if any(w in low for w in ("指引", "guidance", "管理层预计", "公司预计")):
-        return "guidance"
-    if any(w in low for w in ("假设", "assumption", "假定")):
-        return "assumption"
-    if any(
-        w in low
-        for w in (
-            "我们预计",
-            "我们的预测",
-            "我方预测",
-            "house view",
-            "house case",
-            "预测",
-            "目标价",
-        )
-    ):
-        return "estimate"
-    if any(
-        w in low
-        for w in (
-            "同比",
-            "环比",
-            "yoy",
-            "qoq",
-            "增速",
-            "增长",
-            "利润率",
-            "margin",
-            "p/e",
-            "ev/ebitda",
-            "倍数",
-            "cagr",
-        )
-    ):
-        return "derived"
-    return "reported"
-
-
 _GENERIC_MODIFIER_WORDS = frozenset(
     {
         "同比",
@@ -504,44 +452,6 @@ def _resolve_footnote_target(
     return None
 
 
-def _parse_cn_prose_figure(raw_match: str) -> tuple[float, str] | None:
-    """Convert Chinese prose quantifiers ('三成', '五分之一', '翻倍') into (value, canonical_unit)."""
-    s = re.sub(r"\s+", "", raw_match.strip())
-    if s in ("翻倍", "翻一番"):
-        return 2.0, "x"
-    if s == "翻两番":
-        return 4.0, "x"
-    if s in ("减半", "一半", "半数"):
-        return 50.0, "pct"
-    m_cheng = re.match(r"^([一二三四五六七八九十\d]+(?:\.\d+)?)成(半)?$", s)
-    if m_cheng:
-        num_part = m_cheng.group(1)
-        base = (
-            float(_CN_DIGIT_MAP[num_part])
-            if num_part in _CN_DIGIT_MAP
-            else float(num_part)
-        )
-        val = base * 10.0 + (5.0 if m_cheng.group(2) else 0.0)
-        return val, "pct"
-    m_zhe = re.match(r"^([一二三四五六七八九十\d]+)折$", s)
-    if m_zhe:
-        num_part = m_zhe.group(1)
-        base = (
-            float(_CN_DIGIT_MAP[num_part])
-            if num_part in _CN_DIGIT_MAP
-            else float(num_part)
-        )
-        return base * 10.0, "pct"
-    m_frac = re.match(r"^([一二三四五六七八九十\d]+)分之([一二三四五六七八九十\d]+)$", s)
-    if m_frac:
-        den_s, num_s = m_frac.group(1), m_frac.group(2)
-        den = _CN_DIGIT_MAP.get(den_s) or (float(den_s) if den_s.isdigit() else 0.0)
-        num = _CN_DIGIT_MAP.get(num_s) or (float(num_s) if num_s.isdigit() else 0.0)
-        if den > 0:
-            return round((num / den) * 100.0, 4), "pct"
-    return None
-
-
 def _split_md_table_row(line: str) -> list[str]:
     s = line.strip()
     if s.startswith("|"):
@@ -576,6 +486,10 @@ def _mask_excluded_spans(line: str) -> str:
     _blank(_CN_DATE_RE)
     _blank(_YEAR_RANGE_RE)
     _blank(_SHORT_DATE_RE)
+    _blank(_SLASH_DATE_RE)
+    _blank(_CLOCK_TIME_RE)
+    _blank(_LONG_ID_INT_RE)
+    _blank(_BATCH_CODE_RE)
     _blank(_FILING_FORM_RE)
     _blank(_TICKER_CODE_RE)
     _blank(_ENTITY_ID_RE)
@@ -803,9 +717,7 @@ def extract_figures(markdown_text: str) -> list[ExtractedFigure]:
                             context_text=f"{eff_row_header} {col_header}",
                             header_context=header_ctx,
                         )
-                        label_hint = _infer_label_hint(
-                            f"{eff_row_header} {col_header} {cell_text}"
-                        )
+                        label_hint = "reported"
                         is_exempt = bool(
                             _EXEMPT_MARKER_RE.search(cell_text)
                             or _EXEMPT_MARKER_RE.search(eff_row_header)
@@ -928,7 +840,7 @@ def extract_figures(markdown_text: str) -> list[ExtractedFigure]:
                 context_text=scan_line[max(0, nm.start() - 25) : nm.end() + 15],
                 header_context=last_caption_line if "单位" in last_caption_line else "",
             )
-            label_hint = _infer_label_hint(scan_line)
+            label_hint = "reported"
 
             fig_counter += 1
             figures.append(
@@ -957,79 +869,33 @@ def extract_figures(markdown_text: str) -> list[ExtractedFigure]:
                 )
             )
 
-        # Also extract Chinese prose quantifiers ("约三成", "五分之一", "翻倍") on non-exempt lines
-        if not is_exempt:
-            for cm in _CN_PROSE_FIG_RE.finditer(masked_line):
-                raw_cn = cm.group(0).strip()
-                # Skip "翻倍至 <num>" when the explicit target figure is already given right after
-                after_slice = masked_line[cm.end() : cm.end() + 12]
-                if raw_cn in ("翻倍", "翻一番", "翻两番") and re.match(
-                    r"^\s*(?:至|到|达|为)\s*[\$¥€£]?\d", after_slice
-                ):
-                    continue
-                parsed_cn = _parse_cn_prose_figure(raw_cn)
-                if parsed_cn is None:
-                    continue
-                cn_val, cn_unit = parsed_cn
-                period = current_section_period
-                if line_periods:
-                    preceding = [p for pos, p in line_periods if pos <= cm.start()]
-                    period = preceding[-1] if preceding else line_periods[0][1]
-                fn_id = None
-                after_fns = [fid for pos, fid in line_footnotes if pos >= cm.end() - 1]
-                if after_fns:
-                    fn_id = after_fns[0]
-                elif line_footnotes:
-                    fn_id = line_footnotes[-1][1]
-                fn_target = _resolve_footnote_target(fn_id, footnotes)
-                metric = _extract_metric_from_context(scan_line, cm.start(), cm.end())
-                fig_counter += 1
-                figures.append(
-                    ExtractedFigure(
-                        id=f"F-{fig_counter:03d}",
-                        raw=raw_cn,
-                        value=cn_val,
-                        decimals=0,
-                        unit=cn_unit,
-                        scale=1.0,
-                        currency=None,
-                        metric=metric,
-                        period=period,
-                        label_hint=_infer_label_hint(scan_line),
-                        footnote_id=fn_id,
-                        footnote_target=fn_target,
-                        location={
-                            "line": line_no,
-                            "table": False,
-                            "row": None,
-                            "col": None,
-                            "sentence": stripped,
-                        },
-                        exempt=False,
-                        exempt_reason=None,
-                    )
-                )
-
         i += 1
 
     return figures
 
 
-async def maybe_label_prose_figures_with_llm(
+_VALID_LABEL_KINDS = frozenset({"reported", "estimate", "consensus", "guidance", "derived"})
+
+
+async def label_figures_with_status(
     markdown_text: str,
     figures: list[ExtractedFigure],
     *,
     user_id: str = "local-dev-user",
     llm_service: Any = None,
-) -> list[ExtractedFigure]:
-    """Optional LLM slow-path (`audit.label_figures`) to refine labels/units and discover prose figures."""
-    try:
-        from src.dalton.llm.assist import assist_json
-    except ImportError:
-        return figures
+) -> tuple[list[ExtractedFigure], bool]:
+    """Step B LLM figure labeling (`audit.label_figures`) required on every publish audit (P0H §1.2, L28, L31).
+
+    Returns ``(updated_figures, labeling_ok)``. Never falls back to deterministic semantic rules on failure.
+    """
+    if assist_json is None:
+        return figures, False
+
+    footnotes = parse_footnotes(markdown_text)
+    lines = markdown_text.splitlines()
 
     payload = {
-        "markdown_excerpt": markdown_text[:6000],
+        "markdown_excerpt": markdown_text[:8000],
         "extracted_figures": [
             {
                 "id": f.id,
@@ -1039,18 +905,26 @@ async def maybe_label_prose_figures_with_llm(
                 "scale": f.scale,
                 "metric": f.metric,
                 "period": f.period,
+                "kind": f.label_hint,
                 "exempt": f.exempt,
                 "line": f.location.get("line"),
                 "sentence": f.location.get("sentence"),
             }
-            for f in figures
+            for f in figures[:120]
         ],
     }
     res = await assist_json(
         task="audit.label_figures",
         instructions=(
-            "You label extracted financial report figures with accurate metric, period, and unit, "
-            "and identify any unextracted Chinese/prose quantitative claims."
+            "You are Step B of the Dalton publication audit pipeline. "
+            "1) For each item in extracted_figures, label its financial `metric`, normalized `period` "
+            "(e.g. 2Q26, 3Q26, FY2026), canonical `unit` (if missing or inherited from context), "
+            "and semantic `kind` ('reported', 'estimate', 'consensus', 'guidance', or 'derived'). "
+            "2) Also scan markdown_excerpt for any colloquial Chinese numbers not already in extracted_figures "
+            "(such as '三成', '两成', '百分之三十', '五分之一', '翻倍', '腰斩', '过半', '减半') and return them "
+            "in `extra_figures` with exact `raw` substring from the draft, `line` number, numeric `value` "
+            "(e.g. 30.0 for 三成, 20.0 for 两成, 2.0 for 翻倍, 50.0 for 过半/腰斩), `unit` ('pct' or 'x'), "
+            "`metric`, `period`, and `kind`."
         ),
         payload=payload,
         schema=FigureLabels.model_json_schema(),
@@ -1058,12 +932,12 @@ async def maybe_label_prose_figures_with_llm(
         llm_service=llm_service,
     )
     if not res.ok or not res.data:
-        return figures
+        return figures, False
 
     try:
         parsed = FigureLabels.model_validate(res.data)
     except Exception:
-        return figures
+        return figures, False
 
     by_id = {f.id: f for f in figures}
     for item in parsed.items:
@@ -1076,40 +950,107 @@ async def maybe_label_prose_figures_with_llm(
             target.period = normalize_period(item.period) or item.period
         if item.unit:
             target.unit = item.unit
+        if item.kind and item.kind.lower() in _VALID_LABEL_KINDS:
+            target.label_hint = item.kind.lower()
 
     fig_counter = len(figures)
     existing_raws_by_line = {
         (f.location.get("line"), f.raw) for f in figures
     }
     for extra in parsed.extra_figures:
-        if (extra.line, extra.raw) in existing_raws_by_line:
+        raw_sub = (extra.raw or "").strip()
+        if not raw_sub:
             continue
+        # Code-anchor extra.raw in the draft lines
+        matched_line_no = extra.line if 1 <= extra.line <= len(lines) else 1
+        matched_line_text = ""
+        if 1 <= matched_line_no <= len(lines) and raw_sub in lines[matched_line_no - 1]:
+            matched_line_text = lines[matched_line_no - 1]
+        else:
+            for idx, l_text in enumerate(lines, start=1):
+                if raw_sub in l_text:
+                    matched_line_no = idx
+                    matched_line_text = l_text
+                    break
+        if not matched_line_text:
+            continue
+        if (matched_line_no, raw_sub) in existing_raws_by_line:
+            continue
+        existing_raws_by_line.add((matched_line_no, raw_sub))
+
+        # Associate footnote and exemption from the anchored draft line
+        raw_pos = matched_line_text.find(raw_sub)
+        line_fns = [
+            (fm.start(), fm.group(1))
+            for fm in _FOOTNOTE_REF_RE.finditer(matched_line_text)
+        ]
+        fn_id: str | None = None
+        after_fns = [fid for pos, fid in line_fns if pos >= raw_pos + len(raw_sub) - 1]
+        if after_fns:
+            fn_id = after_fns[0]
+        elif line_fns:
+            fn_id = line_fns[-1][1]
+        fn_target = _resolve_footnote_target(fn_id, footnotes)
+        is_exempt = matched_line_text.strip().startswith(">") or bool(
+            _EXEMPT_MARKER_RE.search(matched_line_text)
+        )
+        kind_val = (
+            extra.kind.lower()
+            if extra.kind and extra.kind.lower() in _VALID_LABEL_KINDS
+            else "reported"
+        )
+        period_val = normalize_period(extra.period) if extra.period else ""
+        if not period_val:
+            pm = _PERIOD_TOKEN_RE.search(matched_line_text)
+            if pm:
+                period_val = normalize_period(pm.group(1))
+        metric_val = extra.metric or _extract_metric_from_context(
+            matched_line_text, raw_pos, raw_pos + len(raw_sub)
+        )
+
         fig_counter += 1
         figures.append(
             ExtractedFigure(
                 id=f"F-{fig_counter:03d}",
-                raw=extra.raw,
+                raw=raw_sub,
                 value=extra.value,
                 decimals=0,
                 unit=extra.unit or "pct",
                 scale=1.0,
                 currency=None,
-                metric=extra.metric,
-                period=normalize_period(extra.period) if extra.period else "",
-                label_hint="reported",
-                footnote_id=None,
-                footnote_target=None,
+                metric=metric_val,
+                period=period_val,
+                label_hint=kind_val,
+                footnote_id=fn_id,
+                footnote_target=fn_target,
                 location={
-                    "line": extra.line,
+                    "line": matched_line_no,
                     "table": False,
                     "row": None,
                     "col": None,
-                    "sentence": extra.raw,
+                    "sentence": matched_line_text.strip(),
                 },
-                exempt=False,
-                exempt_reason=None,
+                exempt=is_exempt,
+                exempt_reason="illustrative" if is_exempt else None,
             )
         )
-    return figures
+    return figures, True
+
+
+async def maybe_label_prose_figures_with_llm(
+    markdown_text: str,
+    figures: list[ExtractedFigure],
+    *,
+    user_id: str = "local-dev-user",
+    llm_service: Any = None,
+) -> list[ExtractedFigure]:
+    """Wrapper around `label_figures_with_status` returning the updated figure list."""
+    updated, _ = await label_figures_with_status(
+        markdown_text,
+        figures,
+        user_id=user_id,
+        llm_service=llm_service,
+    )
+    return updated
 
 

@@ -17,7 +17,7 @@
     "one_liner": {"type": "string", "maxLength": 200},
     "covered_since": {"$ref": "common#/$defs/isoDate"},
     "autonomy": {"type": "object", "additionalProperties": false,
-      "properties": {"enabled": {"type": "boolean"}, "max_usd_per_day": {"type": "number", "minimum": 0}}}
+      "properties": {"enabled": {"type": "boolean"}, "max_usd_per_day": {"type": ["number", "null"], "minimum": 0}, "note": {"type": ["string", "null"]}}}
   },
   "required": ["schema_version","ticker","exchange","name","coverage_tier","coverage_stage","one_liner"]
 }
