@@ -12,6 +12,10 @@
 | `P0D-P1-data-and-onboarding.md` | researchdata 桥接、SEC 数据、来源记录；基金方法论 skill、覆盖名单、公司工作区初始化、旧认知迁移 | 数据工程师、内容工程师 |
 | `PK-knowledge-governance-autonomy.md` | 公司知识层、发布治理、自主研究议程、界面小改 | 后端工程师 |
 | `PS-analyst-skills-and-workflows.md` | 分析师的 skill、workflow、自动任务，以及验收样例 | 内容工程师 |
+| `P0N-native-models.md` | 模型改为以 LangAlpha 原生接入为默认路径；broker v2 保留为并行可选路径 | 平台工程师 |
+| `P0F-acceptance-fixes.md` | 第一轮代码验收发现的 6 个问题和修正步骤 | 全体，**先做** |
+| `PROGRESS.md` | 开发进度。状态分三档，每档都要附证据（见 P0F.5） | 全体，持续更新 |
+| `REVIEW-CHECKLIST.md` | 第一轮代码的审查清单：7 个模块，每个模块要查什么、怎么查、交付什么 | 审查人 |
 
 **冲突时的优先级：** 本文第 6 节"决定记录" > 各分册 > blueprint。分册里写着【待验证】的地方，要先做验证，再按结果实现。验证结果写进 PR 描述。
 
@@ -102,6 +106,8 @@ workflows/<name>/          initial-coverage、full-coverage、bullbear-doc、ear
 - 上游：remote `upstream` 指向 `ginlix-ai/LangAlpha`，推送地址已禁用。每两周由 lead 合并一次上游 main，合并后跑一遍 P0.10 里标为【回归】的验收项。
 - 每个步骤一个功能分支，命名为 `feat/<步骤编号>-<短名>`，例如 `feat/P0.3-broker`、`feat/PS.4-bullbear`。完成后提 PR 合入 `dalton/main`。
 - 提交信息用英文，一行讲清改了什么。
+- **每次合入 `dalton/main` 后立即推送到远端**，不在本机保留未推送的已合并提交。
+- `check_hooks.sh` 的基线一律取 `git merge-base dalton/main upstream/main`，不能用自己的提交做基线。
 
 **代码位置**
 - Dalton 自己的代码只放在：`plugins/dalton/`、`plugins/dalton_data/`、`src/dalton/`、`workflows/`、`scripts/dalton/`、`config/dalton/`，以及 Dalton 独立的 Alembic 迁移链。
@@ -145,13 +151,15 @@ workflows/<name>/          initial-coverage、full-coverage、bullbear-doc、ear
 | O10 | 45 秒超时太短，要放宽 |
 | O11 | 同意两项自主权限：研究总监可以自动把任务交给分析师；分析师可以自己创建和修改 `dalton-*` 自动任务 |
 | O12 | 代码交给其他工程师写，lead 负责验收 |
+| O13 | 模型默认改为 LangAlpha 原生接入（Claude 订阅、ChatGPT 订阅、Antigravity、Muse、xAI，以及上游的 API key 供应商）。broker v2 **暂不退役**，作为并行可选的路径保留 |
+| O14 | owner 知晓并接受：原生的订阅接入是冒充官方命令行调用后台接口，违反条款、被限制的风险高于 OpenClaw 经 CLI 网关的用法 |
 
 ### 6.2 lead 做出的技术决定
 
 | 编号 | 决定 |
 |---|---|
-| L1 | 主模型可切换。默认用原生 Claude 订阅登录的 Opus 5.5；备选是经 broker 的 grok-4.7，或者 API key 按量付费。Claude 订阅登录存在订阅条款上的风险，owner 知情 |
-| L2 | CLI 网关类模型（claude-cli-gateway、antigravity-cli-gateway、muse-cli-gateway）只用于纯文字的环节：上下文压缩、后台摘要、审稿。broker 收到带工具的请求时直接拒绝 |
+| L1 | 主模型可切换。默认用原生 Claude 订阅登录的 Opus 5.5；备选是 ChatGPT 订阅、原生 xAI 的 grok-4.7、Antigravity 上的模型，或者 API key 按量付费；broker v2 上的模型也可选。具体默认值见 P0N |
+| L2 | 经 broker v2 的 CLI 网关类模型（claude-cli-gateway、antigravity-cli-gateway、muse-cli-gateway）只用于纯文字的环节，broker 收到带工具的请求时直接拒绝。原生接入的 Antigravity 和 Muse 支持工具调用，但要先通过 P0N 的冒烟测试矩阵，才能分配给需要工具的角色 |
 | L3 | 自动回退默认关闭。打开时也只在供应商故障、且尚未输出任何内容时才回退，并且要告知调用方实际用了哪个模型 |
 | L4 | 新项目的日预算和旧 Dalton 分开；时区 Asia/Shanghai |
 | L5 | researchdata 桥接的凭据，第一期用"token 放在地址里、只读"；更彻底的做法以后再评估 |
@@ -165,6 +173,8 @@ workflows/<name>/          initial-coverage、full-coverage、bullbear-doc、ear
 | L13 | 有正式发布成果的工作区不允许删除，只能归档；Dalton 模式下隐藏行情看板 |
 | L14 | gridcraft 不作为建模主路径。建模用 LangAlpha 的 xlsx 流程；gridcraft 的 `check` 留作 P3 之后可选的第二引擎复算 |
 | L15 | 模型分层：主分析师用强模型，取数子智能体和后台用便宜模型，审稿用另一家族的模型。上线前在 P2 做一次分层配置与全强模型配置的对照，PM 盲评没有明显差别才采用 |
+| L17 | `dalton-*` 自动任务不因连续失败而停用：在上游 `_count_strike` 加挂钩豁免，失败交给按时间的退避处理。凭据失效（`provider_auth`）仍然立即停用（P0F.3） |
+| L18 | 进度状态分三档：代码完成、真实运行验证、lead 验收通过；每档都要附证据（P0F.5） |
 | L16 | 所有审稿人（包括草稿阶段的审稿子智能体）都通过 `role_policy.family_of()` 选择与主模型不同家族的模型，不固定写死某一个模型 |
 
 ## 7. 待 owner 回答的问题
