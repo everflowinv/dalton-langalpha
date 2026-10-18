@@ -36,6 +36,7 @@ export const queryKeys = {
     codex:  () => [...queryKeys.oauth.all, 'codex'],
     claude: () => [...queryKeys.oauth.all, 'claude'],
     antigravity: () => [...queryKeys.oauth.all, 'antigravity'],
+    muse:   () => [...queryKeys.oauth.all, 'muse'],
   },
   workspaces: {
     all:    ['workspaces'],

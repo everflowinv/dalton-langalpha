@@ -2,7 +2,7 @@ import { useMemo } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { queryKeys } from '@/lib/queryKeys';
 import { useApiKeys } from './useApiKeys';
-import { getCodexOAuthStatus, getClaudeOAuthStatus, getAntigravityOAuthStatus } from '@/pages/Dashboard/utils/api';
+import { getCodexOAuthStatus, getClaudeOAuthStatus, getAntigravityOAuthStatus, getMuseOAuthStatus } from '@/pages/Dashboard/utils/api';
 
 export interface ConfiguredProvider {
   provider: string;
@@ -41,6 +41,13 @@ export function useConfiguredProviders() {
   const { data: antigravityStatus, isLoading: antigravityLoading } = useQuery({
     queryKey: queryKeys.oauth.antigravity(),
     queryFn: getAntigravityOAuthStatus,
+    staleTime: 60_000,
+    retry: false,
+  });
+
+  const { data: museStatus, isLoading: museLoading } = useQuery({
+    queryKey: queryKeys.oauth.muse(),
+    queryFn: getMuseOAuthStatus,
     staleTime: 60_000,
     retry: false,
   });
@@ -96,9 +103,17 @@ export function useConfiguredProviders() {
         plan_type: antigravityStatus.plan_type ?? null,
       });
     }
+    if (museStatus?.connected) {
+      result.push({
+        provider: 'muse-oauth',
+        display_name: 'Muse Code (Meta Account)',
+        access_type: 'oauth',
+        plan_type: museStatus.plan_type ?? null,
+      });
+    }
 
     return result;
-  }, [apiKeys, codexStatus, claudeStatus, antigravityStatus]);
+  }, [apiKeys, codexStatus, claudeStatus, antigravityStatus, museStatus]);
 
   /** Set of configured provider keys for fast lookup */
   const configuredSet = useMemo(
@@ -110,6 +125,6 @@ export function useConfiguredProviders() {
     providers,
     configuredSet,
     hasAny: providers.length > 0,
-    isLoading: keysLoading || codexLoading || claudeLoading || antigravityLoading,
+    isLoading: keysLoading || codexLoading || claudeLoading || antigravityLoading || museLoading,
   };
 }

@@ -44,6 +44,12 @@ _UNPRICED_KEYS = frozenset({
     "claude-sonnet-5-5-medium-oauth",
     "claude-sonnet-5-5-high-oauth",
     "gpt-oss-120b-medium-oauth",
+    # Muse subscription models — quota-metered by the plan, not per token
+    "muse-wonder-full-1.0-oauth",
+    "muse-wonder-1.0-oauth",
+    "muse-wonder-full-1.0-contributor-oauth",
+    "muse-spark-1.3-oauth",
+    "muse-spark-1.3-contributor-oauth",
 })
 
 

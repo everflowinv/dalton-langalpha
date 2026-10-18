@@ -514,6 +514,49 @@ export async function disconnectAntigravityOAuth(): Promise<Record<string, unkno
   return data;
 }
 
+// --- Muse Code OAuth (Meta account, Device Code Flow) ---
+
+/**
+ * Start Muse device code flow — returns { user_code, verification_url, interval }.
+ * POST /api/v1/oauth/muse/device/initiate
+ */
+export async function initiateMuseDevice(): Promise<Record<string, unknown>> {
+  const { data } = await api.post('/api/v1/oauth/muse/device/initiate');
+  return data;
+}
+
+/**
+ * Poll for Muse device authorization approval.
+ * POST /api/v1/oauth/muse/device/poll
+ * @returns {Promise<Object>} { pending: true } or { success: true }
+ */
+export async function pollMuseDevice(): Promise<Record<string, unknown>> {
+  const { data } = await api.post('/api/v1/oauth/muse/device/poll');
+  return data;
+}
+
+/**
+ * Check Muse OAuth connection status.
+ * GET /api/v1/oauth/muse/status
+ */
+export async function getMuseOAuthStatus(): Promise<{ connected: boolean; account_id: string | null; email: string | null; plan_type: string | null }> {
+  try {
+    const { data } = await api.get('/api/v1/oauth/muse/status');
+    return data;
+  } catch {
+    return { connected: false, account_id: null, email: null, plan_type: null };
+  }
+}
+
+/**
+ * Disconnect Muse OAuth — delete stored tokens.
+ * DELETE /api/v1/oauth/muse
+ */
+export async function disconnectMuseOAuth(): Promise<Record<string, unknown>> {
+  const { data } = await api.delete('/api/v1/oauth/muse');
+  return data;
+}
+
 // --- News feed ---
 
 /**

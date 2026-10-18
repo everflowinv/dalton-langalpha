@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { Link2, Unlink, ExternalLink, Shield, ClipboardCopy } from 'lucide-react';
 import { Input } from '@/components/ui/input';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog';
-import { initiateCodexDevice, pollCodexDevice, getCodexOAuthStatus, disconnectCodexOAuth, initiateClaudeOAuth, submitClaudeCallback, getClaudeOAuthStatus, disconnectClaudeOAuth, initiateAntigravityOAuth, pollAntigravityOAuth, getAntigravityOAuthStatus, disconnectAntigravityOAuth } from '@/pages/Dashboard/utils/api';
+import { initiateCodexDevice, pollCodexDevice, getCodexOAuthStatus, disconnectCodexOAuth, initiateClaudeOAuth, submitClaudeCallback, getClaudeOAuthStatus, disconnectClaudeOAuth, initiateAntigravityOAuth, pollAntigravityOAuth, getAntigravityOAuthStatus, disconnectAntigravityOAuth, initiateMuseDevice, pollMuseDevice, getMuseOAuthStatus, disconnectMuseOAuth } from '@/pages/Dashboard/utils/api';
 import { useQueryClient } from '@tanstack/react-query';
 import { queryKeys } from '@/lib/queryKeys';
 import { useTranslation } from 'react-i18next';
@@ -57,21 +57,33 @@ export function ConnectedAccounts() {
   const [antigravityError, setAntigravityError] = useState<string | null>(null);
   const antigravityPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
+  // Connected Accounts (Muse OAuth — Device Code Flow, mirrors Codex)
+  const [museOAuthStatus, setMuseOAuthStatus] = useState<OAuthStatus>({ connected: false });
+  const [showMuseDisclaimer, setShowMuseDisclaimer] = useState(false);
+  const [isConnectingMuse, setIsConnectingMuse] = useState(false);
+  const [isDisconnectingMuse, setIsDisconnectingMuse] = useState(false);
+  const [museDeviceCode, setMuseDeviceCode] = useState<CodexDeviceCode | null>(null);
+  const [museDeviceError, setMuseDeviceError] = useState<string | null>(null);
+  const [isPollingMuse, setIsPollingMuse] = useState(false);
+  const musePollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
   const [accountsError, setAccountsError] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
-        const [codexStatus, claudeStatus, antigravityStatus] = await Promise.all([
+        const [codexStatus, claudeStatus, antigravityStatus, museStatus] = await Promise.all([
           getCodexOAuthStatus(),
           getClaudeOAuthStatus(),
           getAntigravityOAuthStatus(),
-        ]) as [OAuthStatus, OAuthStatus, OAuthStatus];
+          getMuseOAuthStatus(),
+        ]) as [OAuthStatus, OAuthStatus, OAuthStatus, OAuthStatus];
         if (cancelled) return;
         setCodexOAuthStatus(codexStatus || { connected: false });
         setClaudeOAuthStatus(claudeStatus || { connected: false });
         setAntigravityOAuthStatus(antigravityStatus || { connected: false });
+        setMuseOAuthStatus(museStatus || { connected: false });
       } catch {
         // Status stays disconnected; the connect flows still work.
       }
@@ -89,6 +101,10 @@ export function ConnectedAccounts() {
       if (antigravityPollRef.current) {
         clearInterval(antigravityPollRef.current);
         antigravityPollRef.current = null;
+      }
+      if (musePollRef.current) {
+        clearInterval(musePollRef.current);
+        musePollRef.current = null;
       }
     };
   }, []);
@@ -239,6 +255,77 @@ export function ConnectedAccounts() {
       setAccountsError('Failed to disconnect Claude');
     } finally {
       setIsDisconnectingClaude(false);
+    }
+  };
+
+  // --- Muse OAuth handlers (device code flow, mirrors Codex) ---
+
+  const handleMuseConnectClick = () => {
+    setShowMuseDisclaimer(true);
+  };
+
+  const handleMuseDeviceCancel = () => {
+    if (musePollRef.current) {
+      clearInterval(musePollRef.current);
+      musePollRef.current = null;
+    }
+    setIsPollingMuse(false);
+    setMuseDeviceCode(null);
+    setMuseDeviceError(null);
+  };
+
+  const handleMuseConnect = async () => {
+    setShowMuseDisclaimer(false);
+    setIsConnectingMuse(true);
+    setAccountsError(null);
+    setMuseDeviceError(null);
+    try {
+      const device = await initiateMuseDevice() as unknown as CodexDeviceCode;
+      setMuseDeviceCode(device);
+      window.open(device.verification_url, '_blank', 'noopener');
+      setIsPollingMuse(true);
+      const interval = (device.interval || 5) * 1000;
+      const startTime = Date.now();
+      const maxDuration = 10 * 60 * 1000;
+      musePollRef.current = setInterval(async () => {
+        if (Date.now() - startTime > maxDuration) {
+          handleMuseDeviceCancel();
+          setMuseDeviceError(t('settings.codexTimeout'));
+          return;
+        }
+        try {
+          const result = await pollMuseDevice() as Record<string, unknown>;
+          if (result.success) {
+            handleMuseDeviceCancel();
+            setMuseOAuthStatus({ connected: true, email: null, plan_type: 'muse' });
+            queryClient.invalidateQueries({ queryKey: queryKeys.oauth.muse() });
+            queryClient.invalidateQueries({ queryKey: queryKeys.platform.models() });
+          }
+        } catch (e: unknown) {
+          const apiError = e as { response?: { data?: { detail?: string } } };
+          handleMuseDeviceCancel();
+          setMuseDeviceError(apiError.response?.data?.detail || t('settings.codexPollFailed'));
+        }
+      }, interval);
+    } catch {
+      setAccountsError(t('setup.errorMuseOAuth', 'Could not start Muse sign-in. Please try again.'));
+    } finally {
+      setIsConnectingMuse(false);
+    }
+  };
+
+  const handleMuseDisconnect = async () => {
+    setIsDisconnectingMuse(true);
+    setAccountsError(null);
+    try {
+      await disconnectMuseOAuth();
+      setMuseOAuthStatus({ connected: false, account_id: null, email: null, plan_type: null });
+      queryClient.invalidateQueries({ queryKey: queryKeys.oauth.muse() });
+      queryClient.invalidateQueries({ queryKey: queryKeys.platform.models() });
+    } catch {
+      setAccountsError('Failed to disconnect Muse');
+    } finally {
+      setIsDisconnectingMuse(false);
     }
   };
 
@@ -650,6 +737,132 @@ export function ConnectedAccounts() {
           )}
         </div>
 
+        {/* Muse OAuth card */}
+        <div
+          className="rounded-lg px-4 py-3 mt-2"
+          style={{
+            backgroundColor: 'var(--color-bg-card)',
+            border: `1px solid ${museOAuthStatus.connected ? 'var(--color-success-soft)' : 'var(--color-border-muted)'}`,
+          }}
+        >
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-3">
+              <div
+                className="h-8 w-8 rounded-md flex items-center justify-center"
+                style={{ backgroundColor: museOAuthStatus.connected ? 'var(--color-success-soft)' : 'var(--color-accent-soft)' }}
+              >
+                <Link2 className="h-4 w-4" style={{ color: museOAuthStatus.connected ? 'var(--color-success)' : 'var(--color-accent-primary)' }} />
+              </div>
+              <div>
+                <div className="flex items-center gap-2">
+                  <span className="text-sm font-medium" style={{ color: 'var(--color-text-primary)' }}>Muse Code (Meta)</span>
+                  {museOAuthStatus.connected && museOAuthStatus.plan_type && (
+                    <span
+                      className="inline-flex items-center px-1.5 py-0.5 rounded text-[0.625rem] font-medium"
+                      style={{ backgroundColor: 'var(--color-success-soft)', color: 'var(--color-success)' }}
+                    >
+                      {museOAuthStatus.plan_type}
+                    </span>
+                  )}
+                </div>
+                {museOAuthStatus.connected ? (
+                  <p className="text-xs mt-0.5" style={{ color: 'var(--color-text-tertiary)' }}>{museOAuthStatus.email || t('settings.connected', 'Connected')}</p>
+                ) : (
+                  <p className="text-xs mt-0.5" style={{ color: 'var(--color-text-tertiary)' }}>
+                    {t('setup.oauthMuseDesc', 'Use Muse Code models with your Meta account')}
+                  </p>
+                )}
+              </div>
+            </div>
+            <div className="shrink-0">
+              {museOAuthStatus.connected ? (
+                <button
+                  type="button"
+                  onClick={handleMuseDisconnect}
+                  disabled={isDisconnectingMuse}
+                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium transition-colors"
+                  style={{ color: 'var(--color-loss)', backgroundColor: 'transparent', border: '1px solid var(--color-loss)' }}
+                >
+                  <Unlink className="h-3 w-3" />
+                  {isDisconnectingMuse ? t('common.loading', 'Loading...') : t('settings.disconnect', 'Disconnect')}
+                </button>
+              ) : !museDeviceCode ? (
+                <button
+                  type="button"
+                  onClick={handleMuseConnectClick}
+                  disabled={isConnectingMuse}
+                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium transition-opacity hover:opacity-90"
+                  style={{
+                    backgroundColor: isConnectingMuse ? 'var(--color-bg-elevated)' : 'var(--color-btn-primary-bg)',
+                    color: isConnectingMuse ? 'var(--color-text-tertiary)' : 'var(--color-btn-primary-text)',
+                  }}
+                >
+                  <Link2 className="h-3 w-3" />
+                  {isConnectingMuse ? t('common.loading', 'Loading...') : t('settings.connect', 'Connect')}
+                </button>
+              ) : null}
+            </div>
+          </div>
+
+          {/* Device code dialog — shown while waiting for user approval */}
+          {museDeviceCode && !museOAuthStatus.connected && (
+            <div className="mt-3 pt-3" style={{ borderTop: '1px solid var(--color-border-muted)' }}>
+              <p className="text-xs mb-2" style={{ color: 'var(--color-text-secondary)' }}>
+                {t('setup.enterCodeOnMeta', 'Confirm this code on auth.meta.com')}:
+              </p>
+              <div className="flex items-center gap-2 mb-2">
+                <code
+                  className="text-lg font-mono font-bold tracking-widest px-3 py-1.5 rounded-md select-all"
+                  style={{
+                    backgroundColor: 'var(--color-bg-elevated)',
+                    border: '1px solid var(--color-border-muted)',
+                    color: 'var(--color-text-primary)',
+                    letterSpacing: '0.15em',
+                  }}
+                >
+                  {museDeviceCode.user_code}
+                </code>
+                <button
+                  type="button"
+                  onClick={() => navigator.clipboard.writeText(museDeviceCode.user_code)}
+                  className="p-1.5 rounded-md transition-colors hover:opacity-80"
+                  style={{ backgroundColor: 'var(--color-bg-elevated)', border: '1px solid var(--color-border-muted)' }}
+                  title={t('common.copy', 'Copy')}
+                >
+                  <ClipboardCopy className="h-3.5 w-3.5" style={{ color: 'var(--color-text-tertiary)' }} />
+                </button>
+                {isPollingMuse && (
+                  <span className="text-xs animate-pulse" style={{ color: 'var(--color-text-tertiary)' }}>
+                    {t('settings.codexWaitingApproval')}
+                  </span>
+                )}
+              </div>
+              <div className="flex items-center gap-3">
+                <a
+                  href={museDeviceCode.verification_url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-xs underline"
+                  style={{ color: 'var(--color-accent-primary)' }}
+                >
+                  {t('settings.claudeOpenAgain', 'Open authorize page again')}
+                </a>
+                <button
+                  type="button"
+                  onClick={handleMuseDeviceCancel}
+                  className="px-3 py-1.5 rounded-md text-xs font-medium"
+                  style={{ color: 'var(--color-text-tertiary)', backgroundColor: 'transparent' }}
+                >
+                  {t('common.cancel', 'Cancel')}
+                </button>
+              </div>
+              {museDeviceError && (
+                <p className="text-xs mt-1.5" style={{ color: 'var(--color-loss)' }}>{museDeviceError}</p>
+              )}
+            </div>
+          )}
+        </div>
+
         {accountsError && (
           <div className="p-3 rounded-md mt-2" style={{ backgroundColor: 'var(--color-loss-soft)', border: '1px solid var(--color-border-loss)' }}>
             <p className="text-sm" style={{ color: 'var(--color-loss)' }}>{accountsError}</p>
@@ -824,6 +1037,88 @@ export function ConnectedAccounts() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+      {/* Muse OAuth Disclaimer Dialog */}
+      <Dialog open={showMuseDisclaimer} onOpenChange={setShowMuseDisclaimer}>
+        <DialogContent
+          className="sm:max-w-md border"
+          style={{ backgroundColor: 'var(--color-bg-elevated)', borderColor: 'var(--color-border-elevated)' }}
+        >
+          <DialogHeader>
+            <DialogTitle className="title-font flex items-center gap-2" style={{ color: 'var(--color-text-primary)' }}>
+              <Link2 className="h-5 w-5" style={{ color: 'var(--color-accent-primary)' }} />
+              {t('setup.oauthMuseDesc', 'Connect Muse Code (Meta Account)')}
+            </DialogTitle>
+          </DialogHeader>
+
+          <div className="space-y-4">
+            <div className="space-y-3">
+              <p className="text-xs font-medium uppercase tracking-wide" style={{ color: 'var(--color-text-tertiary)' }}>{t('settings.claudeHowItWorks', 'How it works')}</p>
+
+              <div className="flex gap-3 items-start">
+                <div className="shrink-0 h-6 w-6 rounded-full flex items-center justify-center text-xs font-bold" style={{ backgroundColor: 'var(--color-accent-soft)', color: 'var(--color-accent-primary)' }}>1</div>
+                <div>
+                  <p className="text-sm font-medium" style={{ color: 'var(--color-text-primary)' }}>{t('setup.museStep1Title', 'Open the verification page')}</p>
+                  <p className="text-xs mt-0.5" style={{ color: 'var(--color-text-tertiary)' }}>{t('setup.museStep1Desc', 'A new tab opens to auth.meta.com.')}</p>
+                </div>
+              </div>
+
+              <div className="flex gap-3 items-start">
+                <div className="shrink-0 h-6 w-6 rounded-full flex items-center justify-center text-xs font-bold" style={{ backgroundColor: 'var(--color-accent-soft)', color: 'var(--color-accent-primary)' }}>2</div>
+                <div>
+                  <p className="text-sm font-medium" style={{ color: 'var(--color-text-primary)' }}>{t('setup.museStep2Title', 'Confirm the code')}</p>
+                  <p className="text-xs mt-0.5" style={{ color: 'var(--color-text-tertiary)' }}>{t('setup.museStep2Desc', "Sign in with your Meta account and check the code shown here matches the one on the page.")}</p>
+                </div>
+              </div>
+
+              <div className="flex gap-3 items-start">
+                <div className="shrink-0 h-6 w-6 rounded-full flex items-center justify-center text-xs font-bold" style={{ backgroundColor: 'var(--color-accent-soft)', color: 'var(--color-accent-primary)' }}>3</div>
+                <div>
+                  <p className="text-sm font-medium" style={{ color: 'var(--color-text-primary)' }}>{t('setup.museStep3Title', 'Done')}</p>
+                  <p className="text-xs mt-0.5" style={{ color: 'var(--color-text-tertiary)' }}>{t('setup.museStep3Desc', 'This screen detects approval by itself and moves on.')}</p>
+                </div>
+              </div>
+            </div>
+
+            <div className="rounded-lg p-3" style={{ backgroundColor: 'var(--color-bg-subtle)', border: '1px solid var(--color-border-muted)' }}>
+              <div className="flex gap-2 items-start">
+                <Shield className="h-4 w-4 shrink-0 mt-0.5" style={{ color: 'var(--color-text-tertiary)' }} />
+                <div>
+                  <p className="text-xs font-medium mb-1" style={{ color: 'var(--color-text-secondary)' }}>{t('settings.claudeSecurityTitle', 'Security & Privacy')}</p>
+                  <p className="text-[0.6875rem] leading-relaxed" style={{ color: 'var(--color-text-tertiary)' }}>
+                    {t('settings.claudeSecurityDesc', 'Your tokens are encrypted at rest. We use them only to make API calls on your behalf.')}
+                  </p>
+                  <p className="text-[0.6875rem] leading-relaxed mt-1.5" style={{ color: 'var(--color-text-tertiary)' }}>
+                    {t('setup.usageCountsMuse', 'Requests count against your Muse subscription quota, exactly as they would in the Muse Code CLI.')}
+                  </p>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <DialogFooter className="gap-2 pt-2">
+            <button
+              type="button"
+              onClick={() => setShowMuseDisclaimer(false)}
+              className="px-3 py-1.5 rounded text-sm border"
+              style={{ color: 'var(--color-text-primary)', borderColor: 'var(--color-border-default)' }}
+              onMouseEnter={(e) => e.currentTarget.style.backgroundColor = 'var(--color-border-muted)'}
+              onMouseLeave={(e) => e.currentTarget.style.backgroundColor = 'transparent'}
+            >
+              {t('common.cancel', 'Cancel')}
+            </button>
+            <button
+              type="button"
+              onClick={handleMuseConnect}
+              className="px-4 py-1.5 rounded text-sm font-medium transition-opacity hover:opacity-90 flex items-center gap-1.5"
+              style={{ backgroundColor: 'var(--color-btn-primary-bg)', color: 'var(--color-btn-primary-text)' }}
+            >
+              <ExternalLink className="h-3.5 w-3.5" />
+              {t('setup.openVerification', 'Open verification page')}
+            </button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       {/* Antigravity OAuth Disclaimer Dialog */}
       <Dialog open={showAntigravityDisclaimer} onOpenChange={setShowAntigravityDisclaimer}>
         <DialogContent

@@ -848,6 +848,20 @@
         }
       }
     },
+    "meta": {
+      "sdk": "muse",
+      "base_url": "https://api.meta.ai/v1",
+      "env_key": null,
+      "access_type": "oauth",
+      "use_response_api": true,
+      "display_name": "Meta Muse",
+      "variants": {
+        "muse-oauth": {
+          "display_name": "Muse Code (Meta Account)",
+          "comment": "Native OpenAI Responses API at api.meta.ai/v1 with Muse client headers; login via Meta device code flow. Contributor variants trade data-for-training for cheaper quota."
+        }
+      }
+    },
     "dashscope": {
       "operator_channel": "developer",
       "env_key": "DASHSCOPE_API_KEY",

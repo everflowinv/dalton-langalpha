@@ -576,6 +576,8 @@ class LLM:
             client = self._get_openai_llm(cache_key=effective_cache_key)
         elif self.sdk == "codex":
             client = self._get_codex_llm(cache_key=effective_cache_key)
+        elif self.sdk == "muse":
+            client = self._get_muse_llm(cache_key=effective_cache_key)
         elif self.sdk == "dashscope":
             client = self._get_dashscope_llm(cache_key=effective_cache_key)
         elif self.sdk == "deepseek":
@@ -804,6 +806,58 @@ class LLM:
         if cache_key:
             existing_mk = params.get("model_kwargs") or {}
             params["model_kwargs"] = {**existing_mk, "prompt_cache_key": cache_key}
+
+        return ChatCodexOpenAI(**params)
+
+    def _get_muse_llm(self, cache_key: str | None = None):
+        """Get Muse Code (Meta subscription) LLM.
+
+        api.meta.ai/v1 speaks the OpenAI Responses API, so this rides the same
+        ChatCodexOpenAI machinery (system→instructions promotion, store=false
+        handling, Responses stream guards) with the Muse client headers the
+        gateway expects. Contributor models (cheaper tier; content may be used
+        for training per the catalog) are flagged via x-tbh-contributor-mode.
+        """
+        from src.llms.extension import ChatCodexOpenAI
+
+        params = {
+            "model": self.model,
+            "api_key": self._resolve_api_key(),
+            "streaming": True,
+            "stream_usage": True,
+            "max_retries": 5,
+            "timeout": 600.0,
+            "stream_chunk_timeout": STREAM_CHUNK_TIMEOUT_S,
+        }
+        params.update(self._resolve_base_url("base_url"))
+
+        if self.use_response_api:
+            params["output_version"] = "responses/v1"
+
+        params.update(self.parameters)
+
+        params["default_headers"] = _merged_default_headers(
+            params,
+            {
+                "User-Agent": "muse-build/1.4.10 (non-interactive; macos-aarch64; build 98c762468d5746a17e31a05cc923592d4e6124d3)",
+                "x-client-id": "tbh:exec",
+                "x-tbh-agent-role": "main",
+                "x-tbh-contributor-mode": "1" if "-contributor" in self.model else "0",
+            },
+            self.default_headers,
+        )
+
+        # Session affinity: the gateway tracks conversations by these headers;
+        # derive a stable UUID per cache key (conversation) like the codex path.
+        if cache_key:
+            session_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"muse-session:{cache_key}"))
+            present = {k.lower() for k in params["default_headers"]}
+            for header in ("x-tbh-session-id", "x-meta-ai-gateway-session-id"):
+                if header not in present:
+                    params["default_headers"][header] = session_id
+
+        if self.extra_body:
+            params["extra_body"] = self.extra_body
 
         return ChatCodexOpenAI(**params)
 

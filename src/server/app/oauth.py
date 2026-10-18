@@ -1,6 +1,6 @@
 """
 OAuth Router — Connect external OAuth providers (ChatGPT Codex, Claude, Google
-Antigravity).
+Antigravity, Meta Muse).
 
 Codex — Device Code Flow (RFC 8628):
 - POST   /api/v1/oauth/codex/device/initiate — Start device code flow
@@ -19,6 +19,12 @@ Antigravity — Google OAuth loopback (RFC 8252) + PKCE:
 - POST   /api/v1/oauth/antigravity/poll        — Poll for loopback completion
 - GET    /api/v1/oauth/antigravity/status      — Check connection status
 - DELETE /api/v1/oauth/antigravity             — Disconnect (delete tokens)
+
+Muse — Device Code Flow (same shape as Codex):
+- POST   /api/v1/oauth/muse/device/initiate    — Start device code flow
+- POST   /api/v1/oauth/muse/device/poll        — Poll for user approval
+- GET    /api/v1/oauth/muse/status             — Check connection status
+- DELETE /api/v1/oauth/muse                    — Disconnect (delete tokens)
 """
 
 import json
@@ -47,6 +53,11 @@ from src.server.services.antigravity_oauth import (
     ANTIGRAVITY_PROVIDER,
     check_login_complete as antigravity_check_login_complete,
     start_login as antigravity_start_login,
+)
+from src.server.services.muse_oauth import (
+    MUSE_PROVIDER,
+    poll_device_authorization as muse_poll_device_authorization,
+    request_device_code as muse_request_device_code,
 )
 from src.server.database.oauth_tokens import (
     delete_oauth_tokens,
@@ -336,6 +347,129 @@ async def claude_disconnect(user_id: CurrentUserId):
     except Exception:
         pass
     logger.info(f"[oauth] Claude disconnected for user_id={user_id}")
+    return {"success": True}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Muse Code OAuth — Device Code Flow (same shape as Codex)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@router.post("/muse/device/initiate")
+async def muse_device_initiate(user_id: CurrentUserId):
+    """Start device code flow. Returns user_code + verification URL."""
+    from src.utils.cache.redis_cache import get_cache_client
+
+    cache = get_cache_client()
+    if not cache.enabled or not cache.client:
+        raise HTTPException(status_code=503, detail="Cache unavailable for OAuth")
+
+    try:
+        device = await muse_request_device_code()
+    except Exception as e:
+        logger.error(f"[oauth] Muse device code request failed: {e}")
+        raise HTTPException(status_code=502, detail="Failed to request device code from Meta")
+
+    # Store device_code in Redis with the code's own lifetime as TTL
+    await cache.client.set(
+        f"oauth:muse:device:{user_id}",
+        json.dumps({"device_code": device["device_code"]}),
+        ex=max(60, device.get("expires_in", 600)),
+    )
+
+    logger.info(f"[oauth] Muse device code initiated for user_id={user_id}")
+    return {
+        "user_code": device["user_code"],
+        "verification_url": device["verification_url"],
+        "interval": device["interval"],
+    }
+
+
+# ─── Device Code: Poll ────────────────────────────────────────────────────────
+
+@router.post("/muse/device/poll")
+async def muse_device_poll(user_id: CurrentUserId):
+    """Poll for device authorization.
+
+    Returns:
+        {pending: true} if user hasn't approved yet
+        {success: true} on approval (tokens stored)
+    """
+    from src.utils.cache.redis_cache import get_cache_client
+
+    cache = get_cache_client()
+    if not cache.enabled or not cache.client:
+        raise HTTPException(status_code=503, detail="Cache unavailable")
+
+    raw = await cache.client.get(f"oauth:muse:device:{user_id}")
+    if not raw:
+        raise HTTPException(status_code=400, detail="No pending Muse authorization. Please initiate again.")
+
+    device = json.loads(raw)
+
+    try:
+        result = await muse_poll_device_authorization(device["device_code"])
+    except ValueError as e:
+        # Terminal device-flow error (denied / expired / failed)
+        await cache.client.delete(f"oauth:muse:device:{user_id}")
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"[oauth] Muse device poll error for user_id={user_id}: {e}")
+        raise HTTPException(status_code=502, detail="Failed to poll Meta")
+
+    if result is None:
+        return {"pending": True}
+
+    # User approved — store tokens
+    try:
+        expires_at = datetime.now(timezone.utc) + timedelta(seconds=result.get("expires_in", 3600))
+
+        await upsert_oauth_tokens(
+            user_id=user_id,
+            provider=MUSE_PROVIDER,
+            access_token=result["access_token"],
+            refresh_token=result.get("refresh_token", ""),
+            account_id="",
+            email=None,
+            plan_type="muse",
+            expires_at=expires_at,
+        )
+
+        try:
+            await invalidate_oauth_active_cache(user_id)
+        except Exception:
+            pass
+
+        await cache.client.delete(f"oauth:muse:device:{user_id}")
+
+        logger.info(f"[oauth] Muse connected for user_id={user_id}")
+        return {"success": True}
+
+    except Exception as e:
+        logger.error(f"[oauth] Muse token storage failed for user_id={user_id}: {e}")
+        raise HTTPException(status_code=400, detail=f"Token storage failed: {e}")
+
+
+# ─── Status ──────────────────────────────────────────────────────────────────
+
+@router.get("/muse/status")
+async def muse_status(user_id: CurrentUserId):
+    """Return connection status (no token decryption — fast check)."""
+    status = await get_oauth_status(user_id, MUSE_PROVIDER)
+    return status
+
+
+# ─── Disconnect ──────────────────────────────────────────────────────────────
+
+@router.delete("/muse")
+async def muse_disconnect(user_id: CurrentUserId):
+    """Delete stored Muse OAuth tokens."""
+    await delete_oauth_tokens(user_id, MUSE_PROVIDER)
+    try:
+        await invalidate_oauth_active_cache(user_id)
+    except Exception:
+        pass
+    logger.info(f"[oauth] Muse disconnected for user_id={user_id}")
     return {"success": True}
 
 

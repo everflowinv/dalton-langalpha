@@ -432,6 +432,8 @@ async def resolve_oauth_llm_client(
         from src.server.services.claude_oauth import get_valid_token
     elif provider == "antigravity-oauth":
         from src.server.services.antigravity_oauth import get_valid_token
+    elif provider == "muse-oauth":
+        from src.server.services.muse_oauth import get_valid_token
     else:
         from src.server.services.codex_oauth import get_valid_token
 
@@ -478,9 +480,9 @@ async def resolve_oauth_llm_client(
     headers = {}
     if provider == "claude-oauth":
         logger.debug(f"[CHAT] Resolved Claude OAuth client for model={model_name}")
-    elif provider == "antigravity-oauth":
-        # Bearer token rides api_key; the client class owns the UA gating.
-        logger.debug(f"[CHAT] Resolved Antigravity OAuth client for model={model_name}")
+    elif provider in ("antigravity-oauth", "muse-oauth"):
+        # Bearer token rides api_key; the client class owns the client headers.
+        logger.debug(f"[CHAT] Resolved {provider} OAuth client for model={model_name}")
     else:
         # Codex: set ChatGPT-Account-Id header
         account_id = token_data.get("account_id", "")

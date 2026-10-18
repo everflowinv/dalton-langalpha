@@ -13,6 +13,8 @@ import {
   submitClaudeCallback,
   initiateAntigravityOAuth,
   pollAntigravityOAuth,
+  initiateMuseDevice,
+  pollMuseDevice,
 } from '@/pages/Dashboard/utils/api';
 import { useTranslation } from 'react-i18next';
 import { ProcessStep, DisclaimerBox, CopyButton, type LocationState } from './shared';
@@ -47,6 +49,8 @@ export function OAuthConnect({ state }: { state: LocationState }) {
   const [antigravityPolling, setAntigravityPolling] = useState(false);
 
   const isCodex = provider === 'codex-oauth';
+  const isMuse = provider === 'muse-oauth';
+  // Muse shares the Codex device-code UI (same flow shape, different backend).
   const isClaude = provider === 'claude-oauth';
   const isAntigravity = provider === 'antigravity-oauth';
 
@@ -150,6 +154,54 @@ export function OAuthConnect({ state }: { state: LocationState }) {
   }, [claudeCallbackInput, queryClient, navigate, method, provider, displayName, brandKey, t]);
 
   // ---------------------------------------------------------------------------
+  // Muse OAuth handler (device code flow, mirrors Codex)
+  // ---------------------------------------------------------------------------
+
+  const handleMuseStart = useCallback(async () => {
+    setOauthPhase('connecting');
+    setOauthError(null);
+    try {
+      const result = await initiateMuseDevice();
+      const userCode = result.user_code as string;
+      const verifyUrl = result.verification_url as string;
+      const interval = (result.interval as number) || 5;
+
+      setCodexUserCode(userCode);
+      setCodexVerifyUrl(verifyUrl);
+      setOauthPhase('active');
+
+      window.open(verifyUrl, '_blank', 'noopener');
+
+      cancelledRef.current = false;
+      setCodexPolling(true);
+      const maxAttempts = 120;
+      for (let i = 0; i < maxAttempts; i++) {
+        await new Promise((r) => setTimeout(r, interval * 1000));
+        if (cancelledRef.current) return;
+        try {
+          const pollResult = await pollMuseDevice();
+          if ('success' in pollResult && pollResult.success) {
+            await queryClient.invalidateQueries({ queryKey: queryKeys.user.me() });
+            await queryClient.invalidateQueries({ queryKey: queryKeys.oauth.muse() });
+            await queryClient.invalidateQueries({ queryKey: queryKeys.platform.models() });
+            navigate('/setup/models', {
+              state: { method, provider, displayName, brandKey },
+            });
+            return;
+          }
+        } catch {
+          // Terminal error surfaced by the API; stop politely after next pass
+        }
+      }
+      setOauthError(t('setup.errorAuthTimeout'));
+      setCodexPolling(false);
+    } catch {
+      setOauthError(t('setup.errorMuseOAuth'));
+      setOauthPhase('disclaimer');
+    }
+  }, [queryClient, navigate, method, provider, displayName, brandKey, t]);
+
+  // ---------------------------------------------------------------------------
   // Antigravity OAuth handler (browser + loopback redirect)
   // ---------------------------------------------------------------------------
 
@@ -215,7 +267,9 @@ export function OAuthConnect({ state }: { state: LocationState }) {
               ? t('setup.oauthCodexDesc')
               : isAntigravity
                 ? t('setup.oauthAntigravityDesc')
-                : t('setup.oauthClaudeDesc')}
+                : isMuse
+                  ? t('setup.oauthMuseDesc')
+                  : t('setup.oauthClaudeDesc')}
           </p>
         </div>
 
@@ -237,22 +291,22 @@ export function OAuthConnect({ state }: { state: LocationState }) {
                 {t('setup.howItWorks')}
               </p>
               <div className="space-y-3">
-                {isCodex ? (
+                {isCodex || isMuse ? (
                   <>
                     <ProcessStep
                       number={1}
-                      title={t('setup.codexStep1Title')}
-                      description={t('setup.codexStep1Desc')}
+                      title={isMuse ? t('setup.museStep1Title') : t('setup.codexStep1Title')}
+                      description={isMuse ? t('setup.museStep1Desc') : t('setup.codexStep1Desc')}
                     />
                     <ProcessStep
                       number={2}
-                      title={t('setup.codexStep2Title')}
-                      description={t('setup.codexStep2Desc')}
+                      title={isMuse ? t('setup.museStep2Title') : t('setup.codexStep2Title')}
+                      description={isMuse ? t('setup.museStep2Desc') : t('setup.codexStep2Desc')}
                     />
                     <ProcessStep
                       number={3}
-                      title={t('setup.codexStep3Title')}
-                      description={t('setup.codexStep3Desc')}
+                      title={isMuse ? t('setup.museStep3Title') : t('setup.codexStep3Title')}
+                      description={isMuse ? t('setup.museStep3Desc') : t('setup.codexStep3Desc')}
                     />
                   </>
                 ) : isAntigravity ? (
@@ -312,7 +366,9 @@ export function OAuthConnect({ state }: { state: LocationState }) {
                     ? 'setup.oauthAgreeAnthropic'
                     : isAntigravity
                       ? 'setup.oauthAgreeGoogle'
-                      : 'setup.oauthAgreeOpenai'
+                      : isMuse
+                        ? 'setup.oauthAgreeMeta'
+                        : 'setup.oauthAgreeOpenai'
                 )}
               </span>
             </label>
@@ -326,12 +382,14 @@ export function OAuthConnect({ state }: { state: LocationState }) {
                   ? handleCodexStart
                   : isAntigravity
                     ? handleAntigravityStart
-                    : handleClaudeStart
+                    : isMuse
+                      ? handleMuseStart
+                      : handleClaudeStart
               }
               className="w-full h-11"
             >
               <ExternalLink className="h-4 w-4 mr-1.5" />
-              {isCodex
+              {isCodex || isMuse
                 ? t('setup.openVerification')
                 : isAntigravity
                   ? t('setup.openGoogle')
@@ -353,7 +411,7 @@ export function OAuthConnect({ state }: { state: LocationState }) {
         )}
 
         {/* Phase 3: Active — Codex device code display */}
-        {oauthPhase === 'active' && isCodex && codexUserCode && (
+        {oauthPhase === 'active' && (isCodex || isMuse) && codexUserCode && (
           <div
             className="flex flex-col items-center gap-4 rounded-lg p-6"
             style={{
@@ -364,7 +422,7 @@ export function OAuthConnect({ state }: { state: LocationState }) {
             <div className="flex items-center gap-2">
               <AlertTriangle className="h-4 w-4" style={{ color: 'var(--color-warning, #f59e0b)' }} />
               <p className="text-sm font-medium" style={{ color: 'var(--color-text-primary)' }}>
-                {t('setup.enterCodeOnOpenai')}
+                {t(isMuse ? 'setup.enterCodeOnMeta' : 'setup.enterCodeOnOpenai')}
               </p>
             </div>
 
