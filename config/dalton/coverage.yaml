@@ -1,0 +1,3048 @@
+schema_version: 1
+as_of: '2026-10-09'
+generated_at: '2026-10-18T13:05:28+00:00'
+sources:
+- path: ~/.openclaw/workspace/skills/coverage-update-richard/scripts/screen_movers.py
+  sha256: d90ec6e5c217f196c6461c1cde317ca13512ac851963cb1c1bbae0afc925595f
+- path: ~/.openclaw/workspace/skills/coverage-update-richard/scripts/coverage_update_richard_cli.py
+  sha256: 9221de4d52b2be228d394e4421332fea3c9d31d453dda424a40a5097896da116
+- path: ~/.openclaw/workspace/scripts/richard_earnings_tracker_cli.py
+  sha256: 881f6f08eb385e61e6ba3cc3a54fb87eeb877747bc2bf93a0b99870b22fe587e
+- path: ~/.openclaw/workspace/state/earnings_scan/watchlist.json
+  sha256: e2dc785a28ddbac55e3af54a26b4313f9397e88f4fff24d09effe040e382220e
+tiers:
+  core:
+    meaning: 每周五源复盘、每日跟踪、财报前瞻和点评全链
+    count: 27
+  watch:
+    meaning: 只看异动；财报只做快讯
+    count: 78
+companies:
+- ticker: GOOGL
+  name: Alphabet (Google)
+  tier: core
+  market: US
+  peer_group: megacap
+  sheet_section: Live Position
+  peers:
+  - AMZN
+  - AAPL
+  - MSFT
+  - META
+  - TSLA
+  etfs: []
+  aliases:
+    search_names:
+    - Alphabet
+    - Google
+    - 谷歌
+    - GOOGL
+    - Alphabet (Google)
+    adr: null
+    earnings_tracker: GOOGL
+  earnings:
+    group: A
+    ir_url: https://abc.xyz/investor/news/news-details/2026/Alphabet-Announces-Date-of-Third-Quarter-2026-Financial-Results-Conference-Call-2026-8tpGZsLS6v/default.aspx
+  workspace:
+    name: GOOGL
+    status: active
+  coverage_stage: legacy_imported
+  note: null
+- ticker: AMZN
+  name: Amazon
+  tier: core
+  market: US
+  peer_group: megacap
+  sheet_section: Live Position
+  peers:
+  - GOOGL
+  - AAPL
+  - MSFT
+  - META
+  - TSLA
+  etfs: []
+  aliases:
+    search_names:
+    - Amazon
+    - 亚马逊
+    - AMZN
+    adr: null
+    earnings_tracker: AMZN
+  earnings:
+    group: A
+    ir_url: https://www.aboutamazon.com/news/company-news/amazon-earnings-q3-2026-report
+  workspace:
+    name: AMZN
+    status: active
+  coverage_stage: legacy_imported
+  note: null
+- ticker: DASH
+  name: DoorDash
+  tier: core
+  market: US
+  peer_group: delivery
+  sheet_section: Live Position
+  peers:
+  - GRAB
+  - UBER
+  - CART
+  - LYFT
+  etfs: []
+  aliases:
+    search_names:
+    - DoorDash
+    - DASH
+    adr: null
+    earnings_tracker: DASH
+  earnings:
+    group: A
+    ir_url: https://www.tipranks.com/stocks/dash/earnings
+  workspace:
+    name: DASH
+    status: planned
+  coverage_stage: none
+  note: null
+- ticker: AFRM
+  name: Affirm
+  tier: core
+  market: US
+  peer_group: bnpl
+  sheet_section: Live Position
+  peers:
+  - KLAR
+  - SEZL
+  - ZIP.AX
+  etfs:
+  - PYPL
+  - XYZ
+  - UPST
+  aliases:
+    search_names:
+    - Affirm Holdings
+    - Affirm
+    - AFRM
+    adr: null
+    earnings_tracker: AFRM
+  earnings:
+    group: A
+    ir_url: https://investors.affirm.com/news-releases/news-release-details/affirm-announce-first-quarter-fiscal-year-2027-results-november
+  workspace:
+    name: AFRM
+    status: planned
+  coverage_stage: none
+  note: FY ends Jun
+- ticker: ECHO
+  name: EchoStar
+  tier: watch
+  market: US
+  peer_group: space
+  sheet_section: Live Position
+  peers:
+  - SPCX
+  - RKLB
+  - ASTS
+  - PL
+  - MP
+  - RBC
+  etfs:
+  - NASA
+  - UFO
+  aliases:
+    search_names:
+    - EchoStar
+    - ECHO
+    adr: null
+    earnings_tracker: ECHO
+  earnings:
+    group: B
+    ir_url: null
+  workspace:
+    name: ECHO
+    status: planned
+  coverage_stage: none
+  note: ex-SATS
+- ticker: DHI
+  name: D.R. Horton
+  tier: watch
+  market: US
+  peer_group: homebuilder
+  sheet_section: Live Position
+  peers:
+  - PHM
+  - LEN
+  - NVR
+  - TOL
+  etfs:
+  - XHB
+  - ITB
+  aliases:
+    search_names:
+    - D.R. Horton
+    - DHI
+    adr: null
+    earnings_tracker: DHI
+  earnings:
+    group: B
+    ir_url: https://investor.drhorton.com/news-and-events/press-releases/2026/09-10-2026-210511837
+  workspace:
+    name: DHI
+    status: planned
+  coverage_stage: none
+  note: FY ends Sep
+- ticker: VIPS
+  name: 唯品会
+  tier: watch
+  market: US
+  peer_group: cn_ecom_vertical
+  sheet_section: Live Position
+  peers:
+  - 0625.HK
+  - 7618.HK
+  - 1797.HK
+  - RERE
+  etfs:
+  - BABA
+  - PDD
+  - JD
+  aliases:
+    search_names:
+    - 唯品会
+    - Vipshop
+    - VIPS
+    adr: null
+    earnings_tracker: VIPS
+  earnings:
+    group: D
+    ir_url: https://ir.vip.com/news-releases/news-release-details/vipshop-announce-second-quarter-2026-financial-results-august-25
+  workspace:
+    name: VIPS
+    status: planned
+  coverage_stage: none
+  note: null
+- ticker: ATAT
+  name: 亚朵
+  tier: core
+  market: US
+  peer_group: cn_travel_local
+  sheet_section: Live Position
+  peers:
+  - TCOM
+  - DIDIY
+  - 0780.HK
+  - HTHT
+  etfs:
+  - KWEB
+  aliases:
+    search_names:
+    - 亚朵
+    - Atour
+    - ATAT
+    adr: null
+    earnings_tracker: ATAT
+  earnings:
+    group: A
+    ir_url: https://www.marketbeat.com/stocks/NASDAQ/ATAT/earnings/
+  workspace:
+    name: ATAT
+    status: planned
+  coverage_stage: none
+  note: null
+- ticker: BZ
+  name: Boss直聘
+  tier: core
+  market: US
+  peer_group: cn_internet_small
+  sheet_section: Live Position
+  peers:
+  - BEKE
+  - ATHM
+  - API
+  etfs:
+  - KWEB
+  aliases:
+    search_names:
+    - BOSS直聘
+    - Kanzhun
+    - BZ
+    - Boss直聘
+    adr: null
+    earnings_tracker: BZ
+  earnings:
+    group: A
+    ir_url: https://www.sec.gov/Archives/edgar/data/1842827/000110465926095483/tm2623124d1_ex99-1.htm
+  workspace:
+    name: BZ
+    status: planned
+  coverage_stage: none
+  note: null
+- ticker: AAPL
+  name: Apple
+  tier: watch
+  market: US
+  peer_group: megacap
+  sheet_section: US Mega Tech
+  peers:
+  - GOOGL
+  - AMZN
+  - MSFT
+  - META
+  - TSLA
+  etfs: []
+  aliases:
+    search_names:
+    - Apple
+    - AAPL
+    adr: null
+    earnings_tracker: AAPL
+  earnings:
+    group: B
+    ir_url: https://www.apple.com/investor/earnings-call/
+  workspace:
+    name: AAPL
+    status: planned
+  coverage_stage: none
+  note: FY ends Sep
+- ticker: MSFT
+  name: Microsoft
+  tier: core
+  market: US
+  peer_group: megacap
+  sheet_section: US Mega Tech
+  peers:
+  - GOOGL
+  - AMZN
+  - AAPL
+  - META
+  - TSLA
+  etfs: []
+  aliases:
+    search_names:
+    - Microsoft
+    - 微软
+    - MSFT
+    adr: null
+    earnings_tracker: MSFT
+  earnings:
+    group: A
+    ir_url: https://news.microsoft.com/source/2026/10/07/microsoft-announces-quarterly-earnings-release-date-69/
+  workspace:
+    name: MSFT
+    status: active
+  coverage_stage: legacy_imported
+  note: FY ends Jun
+- ticker: SPCX
+  name: SpaceX
+  tier: core
+  market: US
+  peer_group: space
+  sheet_section: US Mega Tech
+  peers:
+  - ECHO
+  - RKLB
+  - ASTS
+  - PL
+  - MP
+  - RBC
+  etfs:
+  - NASA
+  - UFO
+  aliases:
+    search_names:
+    - SpaceX
+    - SPCX
+    adr: null
+    earnings_tracker: SPCX
+  earnings:
+    group: A
+    ir_url: https://www.zacks.com/stock/research/SPCX/earnings-calendar
+  workspace:
+    name: SPCX
+    status: planned
+  coverage_stage: none
+  note: 非上市或特殊标的，数据可得性有限；没有 filing 和行情时按'本轮未取得'处理
+- ticker: META
+  name: Meta Platforms
+  tier: core
+  market: US
+  peer_group: megacap
+  sheet_section: US Mega Tech
+  peers:
+  - GOOGL
+  - AMZN
+  - AAPL
+  - MSFT
+  - TSLA
+  etfs: []
+  aliases:
+    search_names:
+    - Meta Platforms
+    - Meta
+    - META
+    adr: null
+    earnings_tracker: META
+  earnings:
+    group: A
+    ir_url: https://investor.atmeta.com/investor-news/press-release-details/2026/Meta-to-Announce-Third-Quarter-2026-Results/default.aspx
+  workspace:
+    name: META
+    status: active
+  coverage_stage: legacy_imported
+  note: null
+- ticker: TSLA
+  name: Tesla
+  tier: watch
+  market: US
+  peer_group: megacap
+  sheet_section: US Mega Tech
+  peers:
+  - GOOGL
+  - AMZN
+  - AAPL
+  - MSFT
+  - META
+  etfs: []
+  aliases:
+    search_names:
+    - Tesla
+    - TSLA
+    adr: null
+    earnings_tracker: TSLA
+  earnings:
+    group: B
+    ir_url: https://ir.tesla.com/press-release/tesla-third-quarter-2026-production-deliveries-and-deployments
+  workspace:
+    name: TSLA
+    status: planned
+  coverage_stage: none
+  note: null
+- ticker: 2513.HK
+  name: 智谱
+  tier: core
+  market: HK
+  peer_group: cn_ai
+  sheet_section: AI Native
+  peers:
+  - 0100.HK
+  - 2723.HK
+  - 0020.HK
+  - 3317.HK
+  - 3696.HK
+  - 0268.HK
+  - 2556.HK
+  - 6682.HK
+  - 2706.HK
+  - 1384.HK
+  etfs: []
+  aliases:
+    search_names:
+    - 智谱
+    - Zhipu
+    - Z.ai
+    - 2513.HK
+    - Zhipu 智谱 (Z.ai)
+    adr: null
+    earnings_tracker: 2513.HK
+  earnings:
+    group: A
+    ir_url: null
+  workspace:
+    name: 2513.HK
+    status: none
+  coverage_stage: none
+  note: HK; reporting frequency unconfirmed, usually semiannual
+- ticker: 0100.HK
+  name: Minimax
+  tier: watch
+  market: HK
+  peer_group: cn_ai
+  sheet_section: AI Native
+  peers:
+  - 2513.HK
+  - 2723.HK
+  - 0020.HK
+  - 3317.HK
+  - 3696.HK
+  - 0268.HK
+  - 2556.HK
+  - 6682.HK
+  - 2706.HK
+  - 1384.HK
+  etfs: []
+  aliases:
+    search_names:
+    - Minimax
+    - MiniMax
+    - 0100.HK
+    adr: null
+    earnings_tracker: 0100.HK
+  earnings:
+    group: D
+    ir_url: null
+  workspace:
+    name: 0100.HK
+    status: none
+  coverage_stage: none
+  note: HK; reporting frequency unconfirmed, usually semiannual
+- ticker: NFLX
+  name: Netflix
+  tier: watch
+  market: US
+  peer_group: streaming_media
+  sheet_section: US Internet
+  peers:
+  - SPOT
+  - DIS
+  - FOXA
+  - FWONK
+  - ROKU
+  - WMG
+  etfs: []
+  aliases:
+    search_names:
+    - Netflix
+    - NFLX
+    adr: null
+    earnings_tracker: NFLX
+  earnings:
+    group: B
+    ir_url: https://ir.netflix.net/investor-news-and-events/financial-releases/press-release-details/2026/Netflix-to-Announce-Third-Quarter-2026-Financial-Results/default.aspx
+  workspace:
+    name: NFLX
+    status: planned
+  coverage_stage: none
+  note: null
+- ticker: SPOT
+  name: Spotify
+  tier: watch
+  market: US
+  peer_group: streaming_media
+  sheet_section: US Internet
+  peers:
+  - NFLX
+  - DIS
+  - FOXA
+  - FWONK
+  - ROKU
+  - WMG
+  etfs: []
+  aliases:
+    search_names:
+    - Spotify
+    - SPOT
+    adr: null
+    earnings_tracker: SPOT
+  earnings:
+    group: B
+    ir_url: https://www.nasdaq.com/press-release/spotify-technology-sa-announce-results-third-quarter-2026-2026-09-24
+  workspace:
+    name: SPOT
+    status: planned
+  coverage_stage: none
+  note: null
+- ticker: MELI
+  name: MercadoLibre
+  tier: watch
+  market: US
+  peer_group: ecom
+  sheet_section: US Internet
+  peers:
+  - SE
+  - CPNG
+  - EBAY
+  - W
+  - CHWY
+  - ETSY
+  - SHOP
+  etfs: []
+  aliases:
+    search_names:
+    - MercadoLibre
+    - MELI
+    adr: null
+    earnings_tracker: MELI
+  earnings:
+    group: B
+    ir_url: https://www.tipranks.com/stocks/meli/earnings
+  workspace:
+    name: MELI
+    status: planned
+  coverage_stage: none
+  note: null
+- ticker: SE
+  name: Sea
+  tier: watch
+  market: US
+  peer_group: ecom
+  sheet_section: US Internet
+  peers:
+  - MELI
+  - CPNG
+  - EBAY
+  - W
+  - CHWY
+  - ETSY
+  - SHOP
+  etfs: []
+  aliases:
+    search_names:
+    - Sea
+    - SE
+    adr: null
+    earnings_tracker: SE
+  earnings:
+    group: B
+    ir_url: https://www.zacks.com/stock/research/SE/earnings-calendar
+  workspace:
+    name: SE
+    status: planned
+  coverage_stage: none
+  note: null
+- ticker: CPNG
+  name: Coupang
+  tier: watch
+  market: US
+  peer_group: ecom
+  sheet_section: US Internet
+  peers:
+  - MELI
+  - SE
+  - EBAY
+  - W
+  - CHWY
+  - ETSY
+  - SHOP
+  etfs: []
+  aliases:
+    search_names:
+    - Coupang
+    - CPNG
+    adr: null
+    earnings_tracker: CPNG
+  earnings:
+    group: B
+    ir_url: https://www.marketbeat.com/earnings/reports/2026-11-3-coupang-inc-stock/
+  workspace:
+    name: CPNG
+    status: planned
+  coverage_stage: none
+  note: null
+- ticker: UBER
+  name: Uber
+  tier: core
+  market: US
+  peer_group: delivery
+  sheet_section: US Internet
+  peers:
+  - DASH
+  - GRAB
+  - CART
+  - LYFT
+  etfs: []
+  aliases:
+    search_names:
+    - Uber
+    - UBER
+    adr: null
+    earnings_tracker: UBER
+  earnings:
+    group: A
+    ir_url: https://investor.uber.com/news-events/news/press-release-details/2026/Uber-Announces-Date-of-Third-Quarter-2026-Results-Conference-Call/default.aspx
+  workspace:
+    name: UBER
+    status: planned
+  coverage_stage: none
+  note: null
+- ticker: BKNG
+  name: Booking
+  tier: watch
+  market: US
+  peer_group: online_travel
+  sheet_section: US Internet
+  peers:
+  - ABNB
+  - EXPE
+  etfs:
+  - TCOM
+  - TRIP
+  aliases:
+    search_names:
+    - Booking
+    - BKNG
+    adr: null
+    earnings_tracker: BKNG
+  earnings:
+    group: B
+    ir_url: https://www.prnewswire.com/news-releases/booking-holdings-to-webcast-third-quarter-2026-financial-results-on-november-3-302895776.html
+  workspace:
+    name: BKNG
+    status: planned
+  coverage_stage: none
+  note: null
+- ticker: ABNB
+  name: Airbnb
+  tier: watch
+  market: US
+  peer_group: online_travel
+  sheet_section: US Internet
+  peers:
+  - BKNG
+  - EXPE
+  etfs:
+  - TCOM
+  - TRIP
+  aliases:
+    search_names:
+    - Airbnb
+    - ABNB
+    adr: null
+    earnings_tracker: ABNB
+  earnings:
+    group: B
+    ir_url: https://www.zacks.com/stock/research/ABNB/earnings-calendar
+  workspace:
+    name: ABNB
+    status: planned
+  coverage_stage: none
+  note: null
+- ticker: EXPE
+  name: Expedia
+  tier: watch
+  market: US
+  peer_group: online_travel
+  sheet_section: US Internet
+  peers:
+  - BKNG
+  - ABNB
+  etfs:
+  - TCOM
+  - TRIP
+  aliases:
+    search_names:
+    - Expedia
+    - EXPE
+    adr: null
+    earnings_tracker: EXPE
+  earnings:
+    group: B
+    ir_url: https://www.marketbeat.com/stocks/NASDAQ/EXPE/earnings/
+  workspace:
+    name: EXPE
+    status: planned
+  coverage_stage: none
+  note: null
+- ticker: RBLX
+  name: Roblox
+  tier: watch
+  market: US
+  peer_group: games_adtech
+  sheet_section: US Internet
+  peers:
+  - TTWO
+  - APP
+  - U
+  - 1860.HK
+  etfs: []
+  aliases:
+    search_names:
+    - Roblox
+    - RBLX
+    adr: null
+    earnings_tracker: RBLX
+  earnings:
+    group: B
+    ir_url: https://ir.roblox.com/news/news-details/2026/Roblox-to-Report-Third-Quarter-2026-Financial-Results-on-October-29-2026/default.aspx
+  workspace:
+    name: RBLX
+    status: planned
+  coverage_stage: none
+  note: null
+- ticker: DUOL
+  name: Duolingo
+  tier: watch
+  market: US
+  peer_group: social_apps
+  sheet_section: US Internet
+  peers:
+  - RDDT
+  - PINS
+  - SNAP
+  - MTCH
+  etfs: []
+  aliases:
+    search_names:
+    - Duolingo
+    - DUOL
+    adr: null
+    earnings_tracker: DUOL
+  earnings:
+    group: B
+    ir_url: https://investors.duolingo.com/
+  workspace:
+    name: DUOL
+    status: planned
+  coverage_stage: none
+  note: null
+- ticker: APP
+  name: AppLovin
+  tier: watch
+  market: US
+  peer_group: games_adtech
+  sheet_section: US Internet
+  peers:
+  - TTWO
+  - RBLX
+  - U
+  - 1860.HK
+  etfs: []
+  aliases:
+    search_names:
+    - AppLovin
+    - APP
+    adr: null
+    earnings_tracker: APP
+  earnings:
+    group: B
+    ir_url: https://investingnews.com/applovin-to-announce-third-quarter-2026-results/
+  workspace:
+    name: APP
+    status: planned
+  coverage_stage: none
+  note: null
+- ticker: U
+  name: Unity Software
+  tier: watch
+  market: US
+  peer_group: games_adtech
+  sheet_section: US Internet
+  peers:
+  - TTWO
+  - RBLX
+  - APP
+  - 1860.HK
+  etfs: []
+  aliases:
+    search_names:
+    - Unity
+    - Unity Software
+    - U
+    adr: null
+    earnings_tracker: U
+  earnings:
+    group: B
+    ir_url: https://investors.unity.com/news/news-details/2026/Unity-Announces-Date-of-Third-Quarter-2026-Financial-Results-Webcast/default.aspx
+  workspace:
+    name: U
+    status: planned
+  coverage_stage: none
+  note: null
+- ticker: RDDT
+  name: Reddit
+  tier: watch
+  market: US
+  peer_group: social_apps
+  sheet_section: US Internet
+  peers:
+  - DUOL
+  - PINS
+  - SNAP
+  - MTCH
+  etfs: []
+  aliases:
+    search_names:
+    - Reddit
+    - RDDT
+    adr: null
+    earnings_tracker: RDDT
+  earnings:
+    group: B
+    ir_url: https://investor.redditinc.com/news-events/news-releases/news-details/2026/Reddit-to-Announce-Third-Quarter-Results-on-Thursday-October-29-2026/default.aspx
+  workspace:
+    name: RDDT
+    status: planned
+  coverage_stage: none
+  note: null
+- ticker: MTCH
+  name: Match Group
+  tier: watch
+  market: US
+  peer_group: social_apps
+  sheet_section: US Internet
+  peers:
+  - DUOL
+  - RDDT
+  - PINS
+  - SNAP
+  etfs: []
+  aliases:
+    search_names:
+    - Match
+    - Match Group
+    - MTCH
+    adr: null
+    earnings_tracker: MTCH
+  earnings:
+    group: B
+    ir_url: https://ir.mtch.com/investor-relations/news-events/news-events/news-details/2026/Match-Group-to-Announce-Third-Quarter-2026-Results/default.aspx
+  workspace:
+    name: MTCH
+    status: planned
+  coverage_stage: none
+  note: null
+- ticker: JPM
+  name: JPMorgan
+  tier: watch
+  market: US
+  peer_group: banks
+  sheet_section: US Financial
+  peers:
+  - BAC
+  - WFC
+  - C
+  - MS
+  - GS
+  - BNY
+  - STT
+  etfs: []
+  aliases:
+    search_names:
+    - JPMorgan
+    - JPM
+    adr: null
+    earnings_tracker: JPM
+  earnings:
+    group: C
+    ir_url: https://www.jpmorganchase.com/ir/news/2026/jpmc-to-host-third-quarter-2026-earnings-call
+  workspace:
+    name: JPM
+    status: planned
+  coverage_stage: none
+  note: null
+- ticker: BAC
+  name: Bank of America
+  tier: watch
+  market: US
+  peer_group: banks
+  sheet_section: US Financial
+  peers:
+  - JPM
+  - WFC
+  - C
+  - MS
+  - GS
+  - BNY
+  - STT
+  etfs: []
+  aliases:
+    search_names:
+    - BofA
+    - Bank of America
+    - BAC
+    adr: null
+    earnings_tracker: BAC
+  earnings:
+    group: C
+    ir_url: https://newsroom.bankofamerica.com/content/newsroom/press-releases/2026/09/bank-of-america-to-report-third-quarter-2026-financial-results-a.html
+  workspace:
+    name: BAC
+    status: planned
+  coverage_stage: none
+  note: null
+- ticker: V
+  name: Visa
+  tier: core
+  market: US
+  peer_group: networks
+  sheet_section: US Financial
+  peers:
+  - MA
+  - AXP
+  etfs: []
+  aliases:
+    search_names:
+    - Visa
+    - V
+    adr: null
+    earnings_tracker: V
+  earnings:
+    group: A
+    ir_url: https://investor.visa.com/news/news-details/2026/Visa-to-Announce-Fiscal-Fourth-Quarter-and-Full-Year-2026-Financial-Results-on-October-27-2026/default.aspx
+  workspace:
+    name: V
+    status: planned
+  coverage_stage: none
+  note: FY ends Sep
+- ticker: MA
+  name: Mastercard
+  tier: core
+  market: US
+  peer_group: networks
+  sheet_section: US Financial
+  peers:
+  - V
+  - AXP
+  etfs: []
+  aliases:
+    search_names:
+    - Mastercard
+    - 万事达
+    - MA
+    adr: null
+    earnings_tracker: MA
+  earnings:
+    group: A
+    ir_url: https://investor.mastercard.com/investor-news/investor-news-details/2026/Mastercard-Incorporated-to-Host-Conference-Call-on-Third-Quarter-2026-Financial-Results/default.aspx
+  workspace:
+    name: MA
+    status: planned
+  coverage_stage: none
+  note: null
+- ticker: SHOP
+  name: Shopify
+  tier: watch
+  market: US
+  peer_group: ecom
+  sheet_section: US Financial
+  peers:
+  - MELI
+  - SE
+  - CPNG
+  - EBAY
+  - W
+  - CHWY
+  - ETSY
+  etfs: []
+  aliases:
+    search_names:
+    - Shopify
+    - SHOP
+    adr: null
+    earnings_tracker: SHOP
+  earnings:
+    group: B
+    ir_url: https://www.shopify.com/news/shopify-q3-2026-financial-advisory
+  workspace:
+    name: SHOP
+    status: planned
+  coverage_stage: none
+  note: null
+- ticker: PYPL
+  name: PayPal
+  tier: watch
+  market: US
+  peer_group: payments
+  sheet_section: US Financial
+  peers:
+  - XYZ
+  - ADYEY
+  - CPAY
+  - FISV
+  - GPN
+  - FIS
+  - TOST
+  - WISE.L
+  etfs: []
+  aliases:
+    search_names:
+    - PayPal
+    - PYPL
+    adr: null
+    earnings_tracker: PYPL
+  earnings:
+    group: C
+    ir_url: https://investor.pypl.com/news-and-events/events/event-details/2026/PayPals-Third-Quarter-2026-Earnings-Call/default.aspx
+  workspace:
+    name: PYPL
+    status: planned
+  coverage_stage: none
+  note: null
+- ticker: XYZ
+  name: Block
+  tier: watch
+  market: US
+  peer_group: payments
+  sheet_section: US Financial
+  peers:
+  - PYPL
+  - ADYEY
+  - CPAY
+  - FISV
+  - GPN
+  - FIS
+  - TOST
+  - WISE.L
+  etfs: []
+  aliases:
+    search_names:
+    - Block
+    - XYZ
+    adr: null
+    earnings_tracker: XYZ
+  earnings:
+    group: C
+    ir_url: https://www.morningstar.com/news/business-wire/20261001716706/block-to-announce-third-quarter-2026-results
+  workspace:
+    name: XYZ
+    status: planned
+  coverage_stage: none
+  note: ex-SQ
+- ticker: CHYM
+  name: Chime
+  tier: watch
+  market: US
+  peer_group: fintech_lenders
+  sheet_section: US Financial
+  peers:
+  - SOFI
+  - ENVA
+  - UPST
+  - PGY
+  - RKT
+  - FIGR
+  - NU
+  etfs: []
+  aliases:
+    search_names:
+    - Chime
+    - CHYM
+    adr: null
+    earnings_tracker: CHYM
+  earnings:
+    group: C
+    ir_url: https://beta.earningswhispers.com/stocks/CHYM
+  workspace:
+    name: CHYM
+    status: planned
+  coverage_stage: none
+  note: null
+- ticker: SOFI
+  name: SoFi
+  tier: watch
+  market: US
+  peer_group: fintech_lenders
+  sheet_section: US Financial
+  peers:
+  - CHYM
+  - ENVA
+  - UPST
+  - PGY
+  - RKT
+  - FIGR
+  - NU
+  etfs: []
+  aliases:
+    search_names:
+    - SoFi
+    - SOFI
+    adr: null
+    earnings_tracker: SOFI
+  earnings:
+    group: C
+    ir_url: https://investors.sofi.com/news/news-details/2026/SoFi-Schedules-Conference-Call-to-Discuss-Q3-2026-Results/default.aspx
+  workspace:
+    name: SOFI
+    status: planned
+  coverage_stage: none
+  note: null
+- ticker: KLAR
+  name: Klarna
+  tier: watch
+  market: US
+  peer_group: bnpl
+  sheet_section: US Financial
+  peers:
+  - AFRM
+  - SEZL
+  - ZIP.AX
+  etfs:
+  - PYPL
+  - XYZ
+  - UPST
+  aliases:
+    search_names:
+    - Klarna
+    - KLAR
+    adr: null
+    earnings_tracker: KLAR
+  earnings:
+    group: C
+    ir_url: https://investors.klarna.com/News--Events/events-and-presentations/default.aspx
+  workspace:
+    name: KLAR
+    status: planned
+  coverage_stage: none
+  note: null
+- ticker: SEZL
+  name: Sezzle
+  tier: watch
+  market: US
+  peer_group: bnpl
+  sheet_section: US Financial
+  peers:
+  - AFRM
+  - KLAR
+  - ZIP.AX
+  etfs:
+  - PYPL
+  - XYZ
+  - UPST
+  aliases:
+    search_names:
+    - Sezzle
+    - SEZL
+    adr: null
+    earnings_tracker: SEZL
+  earnings:
+    group: C
+    ir_url: https://www.nasdaq.com/press-release/sezzle-announce-third-quarter-2026-results-and-participate-upcoming-investor
+  workspace:
+    name: SEZL
+    status: planned
+  coverage_stage: none
+  note: null
+- ticker: UPST
+  name: Upstart
+  tier: watch
+  market: US
+  peer_group: fintech_lenders
+  sheet_section: US Financial
+  peers:
+  - CHYM
+  - SOFI
+  - ENVA
+  - PGY
+  - RKT
+  - FIGR
+  - NU
+  etfs: []
+  aliases:
+    search_names:
+    - Upstart
+    - UPST
+    adr: null
+    earnings_tracker: UPST
+  earnings:
+    group: C
+    ir_url: https://ir.upstart.com/news-releases/news-release-details/upstart-announce-third-quarter-2026-results-november-3-2026
+  workspace:
+    name: UPST
+    status: planned
+  coverage_stage: none
+  note: null
+- ticker: HOOD
+  name: Robinhood
+  tier: core
+  market: US
+  peer_group: brokers
+  sheet_section: US Financial
+  peers:
+  - SCHW
+  - RJF
+  - LPLA
+  - IBKR
+  - VIRT
+  - SNEX
+  etfs: []
+  aliases:
+    search_names:
+    - Robinhood
+    - HOOD
+    adr: null
+    earnings_tracker: HOOD
+  earnings:
+    group: A
+    ir_url: https://investors.robinhood.com/news-releases/news-release-details/robinhood-markets-inc-announce-third-quarter-2026-results
+  workspace:
+    name: HOOD
+    status: planned
+  coverage_stage: none
+  note: null
+- ticker: RKT
+  name: Rocket Companies
+  tier: watch
+  market: US
+  peer_group: fintech_lenders
+  sheet_section: US Financial
+  peers:
+  - CHYM
+  - SOFI
+  - ENVA
+  - UPST
+  - PGY
+  - FIGR
+  - NU
+  etfs: []
+  aliases:
+    search_names:
+    - Rocket
+    - Rocket Companies
+    - RKT
+    adr: null
+    earnings_tracker: RKT
+  earnings:
+    group: C
+    ir_url: null
+  workspace:
+    name: RKT
+    status: planned
+  coverage_stage: none
+  note: null
+- ticker: FIGR
+  name: Figure
+  tier: watch
+  market: US
+  peer_group: fintech_lenders
+  sheet_section: US Financial
+  peers:
+  - CHYM
+  - SOFI
+  - ENVA
+  - UPST
+  - PGY
+  - RKT
+  - NU
+  etfs: []
+  aliases:
+    search_names:
+    - Figure
+    - FIGR
+    adr: null
+    earnings_tracker: FIGR
+  earnings:
+    group: C
+    ir_url: https://www.investing.com/equities/figure-technology-solutions-ltd-earnings
+  workspace:
+    name: FIGR
+    status: planned
+  coverage_stage: none
+  note: null
+- ticker: IBKR
+  name: Interactive Brokers
+  tier: core
+  market: US
+  peer_group: brokers
+  sheet_section: US Financial
+  peers:
+  - HOOD
+  - SCHW
+  - RJF
+  - LPLA
+  - VIRT
+  - SNEX
+  etfs: []
+  aliases:
+    search_names:
+    - Interactive Brokers
+    - 盈透
+    - IBKR
+    adr: null
+    earnings_tracker: IBKR
+  earnings:
+    group: A
+    ir_url: https://www.interactivebrokers.com/en/general/about/mediaRelations/7-24-26.php
+  workspace:
+    name: IBKR
+    status: planned
+  coverage_stage: none
+  note: null
+- ticker: BX
+  name: Blackstone
+  tier: watch
+  market: US
+  peer_group: alts
+  sheet_section: US Financial
+  peers:
+  - KKR
+  - APO
+  - ARES
+  - OWL
+  - BLK
+  - TROW
+  etfs: []
+  aliases:
+    search_names:
+    - Blackstone
+    - BX
+    adr: null
+    earnings_tracker: BX
+  earnings:
+    group: C
+    ir_url: https://www.zacks.com/stock/news/3009356/blackstones-q3-earnings-on-the-deck-whats-in-store-for-bx
+  workspace:
+    name: BX
+    status: planned
+  coverage_stage: none
+  note: null
+- ticker: KKR
+  name: KKR
+  tier: watch
+  market: US
+  peer_group: alts
+  sheet_section: US Financial
+  peers:
+  - BX
+  - APO
+  - ARES
+  - OWL
+  - BLK
+  - TROW
+  etfs: []
+  aliases:
+    search_names:
+    - KKR
+    adr: null
+    earnings_tracker: KKR
+  earnings:
+    group: C
+    ir_url: https://www.nasdaq.com/press-release/kkr-co-inc-announce-third-quarter-2026-results-2026-09-29
+  workspace:
+    name: KKR
+    status: planned
+  coverage_stage: none
+  note: null
+- ticker: APO
+  name: Apollo
+  tier: watch
+  market: US
+  peer_group: alts
+  sheet_section: US Financial
+  peers:
+  - BX
+  - KKR
+  - ARES
+  - OWL
+  - BLK
+  - TROW
+  etfs: []
+  aliases:
+    search_names:
+    - Apollo
+    - APO
+    adr: null
+    earnings_tracker: APO
+  earnings:
+    group: C
+    ir_url: https://www.apollo.com/insights-news/pressreleases/2026/09/apollo-to-announce-third-quarter-2026-financial-results-on-november-3-2026-3370753
+  workspace:
+    name: APO
+    status: planned
+  coverage_stage: none
+  note: null
+- ticker: SPGI
+  name: S&P Global
+  tier: core
+  market: US
+  peer_group: ratings_info
+  sheet_section: US Financial
+  peers:
+  - MCO
+  - MSCI
+  - TRI
+  - WKL.AS
+  - REL.L
+  - VRSK
+  etfs: []
+  aliases:
+    search_names:
+    - S&P Global
+    - 标普全球
+    - SPGI
+    adr: null
+    earnings_tracker: SPGI
+  earnings:
+    group: A
+    ir_url: https://investor.spglobal.com/news-releases/news-details/2026/SP-Global-Schedules-Third-Quarter-2026-Earnings-Announcement-and-Conference-Call-for-Tuesday-October-27-2026/default.aspx
+  workspace:
+    name: SPGI
+    status: planned
+  coverage_stage: none
+  note: null
+- ticker: MCO
+  name: Moody's
+  tier: core
+  market: US
+  peer_group: ratings_info
+  sheet_section: US Financial
+  peers:
+  - SPGI
+  - MSCI
+  - TRI
+  - WKL.AS
+  - REL.L
+  - VRSK
+  etfs: []
+  aliases:
+    search_names:
+    - Moody's
+    - 穆迪
+    - MCO
+    adr: null
+    earnings_tracker: MCO
+  earnings:
+    group: A
+    ir_url: https://ir.moodys.com/press-releases/news-details/2026/Date-Set-For-Moodys-Earnings-Release-And-Investor-Teleconference-fc9db3848/default.aspx
+  workspace:
+    name: MCO
+    status: planned
+  coverage_stage: none
+  note: null
+- ticker: BRK-B
+  name: Berkshire Hathaway
+  tier: watch
+  market: US
+  peer_group: insurers
+  sheet_section: US Financial
+  peers:
+  - CB
+  - PGR
+  - TRV
+  - WRB
+  - KNSL
+  - LMND
+  - ROOT
+  etfs: []
+  aliases:
+    search_names:
+    - Berkshire
+    - Berkshire Hathaway
+    - BRK-B
+    - BRK.B
+    adr: null
+    earnings_tracker: BRK.B
+  earnings:
+    group: C
+    ir_url: null
+  workspace:
+    name: BRK-B
+    status: planned
+  coverage_stage: none
+  note: null
+- ticker: PGR
+  name: Progressive
+  tier: watch
+  market: US
+  peer_group: insurers
+  sheet_section: US Financial
+  peers:
+  - BRK-B
+  - CB
+  - TRV
+  - WRB
+  - KNSL
+  - LMND
+  - ROOT
+  etfs: []
+  aliases:
+    search_names:
+    - Progressive
+    - PGR
+    adr: null
+    earnings_tracker: PGR
+  earnings:
+    group: C
+    ir_url: null
+  workspace:
+    name: PGR
+    status: planned
+  coverage_stage: none
+  note: null
+- ticker: MRSH
+  name: Marsh McLennan
+  tier: watch
+  market: US
+  peer_group: ins_brokers
+  sheet_section: US Financial
+  peers:
+  - AON
+  - AJG
+  - WTW
+  - BRO
+  - RYAN
+  etfs: []
+  aliases:
+    search_names:
+    - Marsh
+    - Marsh McLennan
+    - MRSH
+    adr: null
+    earnings_tracker: MRSH
+  earnings:
+    group: C
+    ir_url: null
+  workspace:
+    name: MRSH
+    status: planned
+  coverage_stage: none
+  note: ex-MMC
+- ticker: AON
+  name: Aon
+  tier: watch
+  market: US
+  peer_group: ins_brokers
+  sheet_section: US Financial
+  peers:
+  - MRSH
+  - AJG
+  - WTW
+  - BRO
+  - RYAN
+  etfs: []
+  aliases:
+    search_names:
+    - Aon
+    - AON
+    adr: null
+    earnings_tracker: AON
+  earnings:
+    group: C
+    ir_url: https://aon.mediaroom.com/2026-10-09-Aon-Announces-Third-Quarter-2026-Earnings-Release-and-Conference-Call-Date
+  workspace:
+    name: AON
+    status: planned
+  coverage_stage: none
+  note: null
+- ticker: AJG
+  name: Arthur J. Gallagher
+  tier: watch
+  market: US
+  peer_group: ins_brokers
+  sheet_section: US Financial
+  peers:
+  - MRSH
+  - AON
+  - WTW
+  - BRO
+  - RYAN
+  etfs: []
+  aliases:
+    search_names:
+    - Gallagher
+    - Arthur J. Gallagher
+    - AJG
+    adr: null
+    earnings_tracker: AJG
+  earnings:
+    group: C
+    ir_url: https://investor.ajg.com/news/news-details/2026/Arthur-J--Gallagher--Co--Announces-Third-Quarter-2026-Earnings-Release-And-Conference-Call-Date/default.aspx
+  workspace:
+    name: AJG
+    status: planned
+  coverage_stage: none
+  note: null
+- ticker: CME
+  name: CME Group
+  tier: watch
+  market: US
+  peer_group: exchanges
+  sheet_section: US Financial
+  peers:
+  - ICE
+  - CBOE
+  - NDAQ
+  etfs: []
+  aliases:
+    search_names:
+    - CME
+    - CME Group
+    adr: null
+    earnings_tracker: CME
+  earnings:
+    group: C
+    ir_url: https://www.cmegroup.com/media-room/press-releases/2026/9/04/cme_group_inc_announcesthird-quarter2026earningsreleaseconferenc.html
+  workspace:
+    name: CME
+    status: planned
+  coverage_stage: none
+  note: null
+- ticker: ICE
+  name: Intercontinental Exchange
+  tier: watch
+  market: US
+  peer_group: exchanges
+  sheet_section: US Financial
+  peers:
+  - CME
+  - CBOE
+  - NDAQ
+  etfs: []
+  aliases:
+    search_names:
+    - ICE
+    - Intercontinental Exchange
+    adr: null
+    earnings_tracker: ICE
+  earnings:
+    group: C
+    ir_url: null
+  workspace:
+    name: ICE
+    status: planned
+  coverage_stage: none
+  note: null
+- ticker: CBOE
+  name: Cboe Global Markets
+  tier: watch
+  market: US
+  peer_group: exchanges
+  sheet_section: US Financial
+  peers:
+  - CME
+  - ICE
+  - NDAQ
+  etfs: []
+  aliases:
+    search_names:
+    - Cboe
+    - Cboe Global Markets
+    - CBOE
+    adr: null
+    earnings_tracker: CBOE
+  earnings:
+    group: C
+    ir_url: https://ir.cboe.com/news/news-details/2026/Cboe-Global-Markets-Announces-Date-of-Third-Quarter-2026-Earnings-Release-and-Conference-Call/default.aspx
+  workspace:
+    name: CBOE
+    status: planned
+  coverage_stage: none
+  note: null
+- ticker: NDAQ
+  name: Nasdaq Inc
+  tier: core
+  market: US
+  peer_group: exchanges
+  sheet_section: US Financial
+  peers:
+  - CME
+  - ICE
+  - CBOE
+  etfs: []
+  aliases:
+    search_names:
+    - Nasdaq Inc
+    - 纳斯达克
+    - NDAQ
+    - Nasdaq
+    adr: null
+    earnings_tracker: NDAQ
+  earnings:
+    group: A
+    ir_url: https://www.nasdaq.com/
+  workspace:
+    name: NDAQ
+    status: planned
+  coverage_stage: none
+  note: null
+- ticker: PLTR
+  name: Palantir
+  tier: watch
+  market: US
+  peer_group: infra_software
+  sheet_section: US Software
+  peers:
+  - PANW
+  - CRWD
+  - FTNT
+  - NET
+  - OKTA
+  - ZS
+  - SNOW
+  - DDOG
+  - TWLO
+  - MDB
+  - RBRK
+  - FROG
+  - VRSN
+  - GDDY
+  etfs:
+  - IGV
+  aliases:
+    search_names:
+    - Palantir
+    - PLTR
+    adr: null
+    earnings_tracker: PLTR
+  earnings:
+    group: B
+    ir_url: https://www.stocktitan.net/news/PLTR/palantir-announces-date-of-third-quarter-2026-earnings-release-and-e4l6pbmfvv3z.html
+  workspace:
+    name: PLTR
+    status: planned
+  coverage_stage: none
+  note: null
+- ticker: CRM
+  name: Salesforce
+  tier: watch
+  market: US
+  peer_group: app_software
+  sheet_section: US Software
+  peers:
+  - NOW
+  - SAP
+  - ADBE
+  - INTU
+  - TEAM
+  - ADSK
+  - VEEV
+  - WDAY
+  - ROP
+  - ZM
+  etfs:
+  - IGV
+  aliases:
+    search_names:
+    - Salesforce
+    - CRM
+    adr: null
+    earnings_tracker: CRM
+  earnings:
+    group: B
+    ir_url: null
+  workspace:
+    name: CRM
+    status: planned
+  coverage_stage: none
+  note: FY ends Jan
+- ticker: NET
+  name: Cloudflare
+  tier: watch
+  market: US
+  peer_group: infra_software
+  sheet_section: US Software
+  peers:
+  - PLTR
+  - PANW
+  - CRWD
+  - FTNT
+  - OKTA
+  - ZS
+  - SNOW
+  - DDOG
+  - TWLO
+  - MDB
+  - RBRK
+  - FROG
+  - VRSN
+  - GDDY
+  etfs:
+  - IGV
+  aliases:
+    search_names:
+    - Cloudflare
+    - NET
+    adr: null
+    earnings_tracker: NET
+  earnings:
+    group: B
+    ir_url: https://cloudflare.net/news/news-details/2026/Cloudflare-Announces-Date-of-Third-Quarter-2026-Financial-Results/default.aspx
+  workspace:
+    name: NET
+    status: planned
+  coverage_stage: none
+  note: null
+- ticker: HURN
+  name: Huron Consulting
+  tier: watch
+  market: US
+  peer_group: it_services
+  sheet_section: US Software
+  peers:
+  - IBM
+  - ACN
+  - CTSH
+  - CAP.PA
+  etfs: []
+  aliases:
+    search_names:
+    - Huron
+    - Huron Consulting
+    - HURN
+    adr: null
+    earnings_tracker: HURN
+  earnings:
+    group: B
+    ir_url: null
+  workspace:
+    name: HURN
+    status: planned
+  coverage_stage: none
+  note: null
+- ticker: PM
+  name: Philip Morris
+  tier: watch
+  market: US
+  peer_group: staples
+  sheet_section: Global Consumer
+  peers:
+  - EL
+  - KO
+  - PEP
+  - MNST
+  - STZ
+  - MDLZ
+  - HSY
+  - KHC
+  - PG
+  - CL
+  - MO
+  etfs: []
+  aliases:
+    search_names:
+    - Philip Morris
+    - PM
+    adr: null
+    earnings_tracker: PM
+  earnings:
+    group: B
+    ir_url: null
+  workspace:
+    name: PM
+    status: planned
+  coverage_stage: none
+  note: null
+- ticker: WMT
+  name: Walmart
+  tier: watch
+  market: US
+  peer_group: mass_retail
+  sheet_section: Global Consumer
+  peers:
+  - COST
+  - TGT
+  - KR
+  - DG
+  - TJX
+  - ROST
+  etfs: []
+  aliases:
+    search_names:
+    - Walmart
+    - WMT
+    adr: null
+    earnings_tracker: WMT
+  earnings:
+    group: B
+    ir_url: https://corporate.walmart.com/news/events/fy2027-q3-earnings-release
+  workspace:
+    name: WMT
+    status: planned
+  coverage_stage: none
+  note: FY ends Jan
+- ticker: MAR
+  name: Marriott
+  tier: watch
+  market: US
+  peer_group: lodging_cruise
+  sheet_section: Global Consumer
+  peers:
+  - HLT
+  - RCL
+  - VIK
+  - CCL
+  etfs: []
+  aliases:
+    search_names:
+    - Marriott
+    - MAR
+    adr: null
+    earnings_tracker: MAR
+  earnings:
+    group: B
+    ir_url: https://marriott.gcs-web.com/news-releases/news-release-details/marriott-international-announces-release-date-third-quarter-2026
+  workspace:
+    name: MAR
+    status: planned
+  coverage_stage: none
+  note: null
+- ticker: HLT
+  name: Hilton
+  tier: watch
+  market: US
+  peer_group: lodging_cruise
+  sheet_section: Global Consumer
+  peers:
+  - MAR
+  - RCL
+  - VIK
+  - CCL
+  etfs: []
+  aliases:
+    search_names:
+    - Hilton
+    - HLT
+    adr: null
+    earnings_tracker: HLT
+  earnings:
+    group: B
+    ir_url: https://ir.hilton.com/news-events/investor-news/detail/415/hilton-announces-third-quarter-2026-earnings-release-date
+  workspace:
+    name: HLT
+    status: planned
+  coverage_stage: none
+  note: null
+- ticker: RKLB
+  name: Rocket Lab
+  tier: watch
+  market: US
+  peer_group: space
+  sheet_section: US Space
+  peers:
+  - ECHO
+  - SPCX
+  - ASTS
+  - PL
+  - MP
+  - RBC
+  etfs:
+  - NASA
+  - UFO
+  aliases:
+    search_names:
+    - Rocket Lab
+    - RKLB
+    adr: null
+    earnings_tracker: RKLB
+  earnings:
+    group: B
+    ir_url: https://investors.rocketlabcorp.com
+  workspace:
+    name: RKLB
+    status: planned
+  coverage_stage: none
+  note: null
+- ticker: PL
+  name: Planet Labs
+  tier: watch
+  market: US
+  peer_group: space
+  sheet_section: US Space
+  peers:
+  - ECHO
+  - SPCX
+  - RKLB
+  - ASTS
+  - MP
+  - RBC
+  etfs:
+  - NASA
+  - UFO
+  aliases:
+    search_names:
+    - Planet Labs
+    - PL
+    adr: null
+    earnings_tracker: PL
+  earnings:
+    group: B
+    ir_url: null
+  workspace:
+    name: PL
+    status: planned
+  coverage_stage: none
+  note: FY ends Jan
+- ticker: PWR
+  name: Quanta Services
+  tier: watch
+  market: US
+  peer_group: ai_construction
+  sheet_section: AI Construction
+  peers:
+  - FIX
+  - EME
+  - MTZ
+  - STRL
+  etfs:
+  - PAVE
+  - VRT
+  aliases:
+    search_names:
+    - Quanta
+    - Quanta Services
+    - PWR
+    adr: null
+    earnings_tracker: PWR
+  earnings:
+    group: B
+    ir_url: https://www.zacks.com/stock/research/PWR/earnings-calendar
+  workspace:
+    name: PWR
+    status: planned
+  coverage_stage: none
+  note: null
+- ticker: FIX
+  name: Comfort Systems
+  tier: watch
+  market: US
+  peer_group: ai_construction
+  sheet_section: AI Construction
+  peers:
+  - PWR
+  - EME
+  - MTZ
+  - STRL
+  etfs:
+  - PAVE
+  - VRT
+  aliases:
+    search_names:
+    - Comfort Systems
+    - FIX
+    adr: null
+    earnings_tracker: FIX
+  earnings:
+    group: B
+    ir_url: https://www.zacks.com/stock/research/FIX/earnings-calendar
+  workspace:
+    name: FIX
+    status: planned
+  coverage_stage: none
+  note: null
+- ticker: STRL
+  name: Sterling Infra
+  tier: watch
+  market: US
+  peer_group: ai_construction
+  sheet_section: AI Construction
+  peers:
+  - PWR
+  - FIX
+  - EME
+  - MTZ
+  etfs:
+  - PAVE
+  - VRT
+  aliases:
+    search_names:
+    - Sterling
+    - Sterling Infra
+    - STRL
+    adr: null
+    earnings_tracker: STRL
+  earnings:
+    group: B
+    ir_url: https://www.strlco.com/news/sterling-schedules-2026-third-quarter-release-and-conference-call/
+  workspace:
+    name: STRL
+    status: planned
+  coverage_stage: none
+  note: null
+- ticker: PHM
+  name: PulteGroup
+  tier: watch
+  market: US
+  peer_group: homebuilder
+  sheet_section: Homebuilder
+  peers:
+  - DHI
+  - LEN
+  - NVR
+  - TOL
+  etfs:
+  - XHB
+  - ITB
+  aliases:
+    search_names:
+    - Pulte
+    - PulteGroup
+    - PHM
+    adr: null
+    earnings_tracker: PHM
+  earnings:
+    group: B
+    ir_url: https://www.pultegroupinc.com/investor-relations/news/news-details/2026/PulteGroups-Third-Quarter-2026-Earnings-Release-and-Webcast-Conference-Call-Scheduled-for-October-22-2026/default.aspx
+  workspace:
+    name: PHM
+    status: planned
+  coverage_stage: none
+  note: null
+- ticker: TOL
+  name: Toll Brothers
+  tier: watch
+  market: US
+  peer_group: homebuilder
+  sheet_section: Homebuilder
+  peers:
+  - DHI
+  - PHM
+  - LEN
+  - NVR
+  etfs:
+  - XHB
+  - ITB
+  aliases:
+    search_names:
+    - Toll Brothers
+    - TOL
+    adr: null
+    earnings_tracker: TOL
+  earnings:
+    group: B
+    ir_url: null
+  workspace:
+    name: TOL
+    status: planned
+  coverage_stage: none
+  note: FY ends Oct
+- ticker: 0700.HK
+  name: 腾讯
+  tier: core
+  market: HK
+  peer_group: cn_mega
+  sheet_section: China Internet
+  peers:
+  - BABA
+  - PDD
+  - NTES
+  - 3690.HK
+  - JD
+  - BIDU
+  etfs:
+  - KWEB
+  aliases:
+    search_names:
+    - 腾讯
+    - Tencent
+    - 0700.HK
+    - Tencent 腾讯
+    adr: null
+    earnings_tracker: 0700.HK
+  earnings:
+    group: A
+    ir_url: null
+  workspace:
+    name: 0700.HK
+    status: none
+  coverage_stage: none
+  note: HK; quarterly
+- ticker: BABA
+  name: 阿里巴巴
+  tier: core
+  market: US
+  peer_group: cn_mega
+  sheet_section: China Internet
+  peers:
+  - 0700.HK
+  - PDD
+  - NTES
+  - 3690.HK
+  - JD
+  - BIDU
+  etfs:
+  - KWEB
+  aliases:
+    search_names:
+    - 阿里巴巴
+    - Alibaba
+    - BABA
+    adr: null
+    earnings_tracker: BABA
+  earnings:
+    group: A
+    ir_url: https://www.zacks.com/stock/research/BABA/earnings-calendar
+  workspace:
+    name: BABA
+    status: planned
+  coverage_stage: none
+  note: FY ends Mar
+- ticker: PDD
+  name: 拼多多
+  tier: core
+  market: US
+  peer_group: cn_mega
+  sheet_section: China Internet
+  peers:
+  - 0700.HK
+  - BABA
+  - NTES
+  - 3690.HK
+  - JD
+  - BIDU
+  etfs:
+  - KWEB
+  aliases:
+    search_names:
+    - 拼多多
+    - PDD Holdings
+    - PDD
+    adr: null
+    earnings_tracker: PDD
+  earnings:
+    group: A
+    ir_url: https://www.tipranks.com/stocks/pdd/earnings
+  workspace:
+    name: PDD
+    status: planned
+  coverage_stage: none
+  note: null
+- ticker: NTES
+  name: 网易
+  tier: core
+  market: US
+  peer_group: cn_mega
+  sheet_section: China Internet
+  peers:
+  - 0700.HK
+  - BABA
+  - PDD
+  - 3690.HK
+  - JD
+  - BIDU
+  etfs:
+  - KWEB
+  aliases:
+    search_names:
+    - 网易
+    - NetEase
+    - NTES
+    - NetEase 网易
+    adr: null
+    earnings_tracker: NTES
+  earnings:
+    group: A
+    ir_url: null
+  workspace:
+    name: NTES
+    status: planned
+  coverage_stage: none
+  note: null
+- ticker: 3690.HK
+  name: 美团
+  tier: core
+  market: HK
+  peer_group: cn_mega
+  sheet_section: China Internet
+  peers:
+  - 0700.HK
+  - BABA
+  - PDD
+  - NTES
+  - JD
+  - BIDU
+  etfs:
+  - KWEB
+  aliases:
+    search_names:
+    - 美团
+    - Meituan
+    - 3690.HK
+    - MPNGY
+    adr: MPNGY
+    earnings_tracker: MPNGY
+  earnings:
+    group: A
+    ir_url: https://www.tipranks.com/stocks/hk:3690/earnings
+  workspace:
+    name: 3690.HK
+    status: none
+  coverage_stage: none
+  note: 3690.HK; semiannual + quarterly
+- ticker: JD
+  name: 京东
+  tier: watch
+  market: US
+  peer_group: cn_mega
+  sheet_section: China Internet
+  peers:
+  - 0700.HK
+  - BABA
+  - PDD
+  - NTES
+  - 3690.HK
+  - BIDU
+  etfs:
+  - KWEB
+  aliases:
+    search_names:
+    - 京东
+    - JD.com
+    - JD
+    adr: null
+    earnings_tracker: JD
+  earnings:
+    group: D
+    ir_url: https://www.zacks.com/stock/research/JD/earnings-calendar
+  workspace:
+    name: JD
+    status: planned
+  coverage_stage: none
+  note: null
+- ticker: BIDU
+  name: 百度
+  tier: watch
+  market: US
+  peer_group: cn_mega
+  sheet_section: China Internet
+  peers:
+  - 0700.HK
+  - BABA
+  - PDD
+  - NTES
+  - 3690.HK
+  - JD
+  etfs:
+  - KWEB
+  aliases:
+    search_names:
+    - 百度
+    - Baidu 百度
+    - BIDU
+    adr: null
+    earnings_tracker: BIDU
+  earnings:
+    group: D
+    ir_url: null
+  workspace:
+    name: BIDU
+    status: planned
+  coverage_stage: none
+  note: null
+- ticker: TCOM
+  name: 携程
+  tier: core
+  market: US
+  peer_group: cn_travel_local
+  sheet_section: China Internet
+  peers:
+  - ATAT
+  - DIDIY
+  - 0780.HK
+  - HTHT
+  etfs:
+  - KWEB
+  aliases:
+    search_names:
+    - 携程
+    - Trip.com
+    - TCOM
+    adr: null
+    earnings_tracker: TCOM
+  earnings:
+    group: A
+    ir_url: https://ir.ctrip.com
+  workspace:
+    name: TCOM
+    status: planned
+  coverage_stage: none
+  note: null
+- ticker: BEKE
+  name: 贝壳
+  tier: core
+  market: US
+  peer_group: cn_internet_small
+  sheet_section: China Internet
+  peers:
+  - BZ
+  - ATHM
+  - API
+  etfs:
+  - KWEB
+  aliases:
+    search_names:
+    - 贝壳
+    - KE Holdings
+    - BEKE
+    adr: null
+    earnings_tracker: BEKE
+  earnings:
+    group: A
+    ir_url: https://www.investing.com/equities/ke-holdings-inc-earnings
+  workspace:
+    name: BEKE
+    status: planned
+  coverage_stage: none
+  note: null
+- ticker: 0625.HK
+  name: 希音
+  tier: watch
+  market: HK
+  peer_group: cn_ecom_vertical
+  sheet_section: China Internet
+  peers:
+  - VIPS
+  - 7618.HK
+  - 1797.HK
+  - RERE
+  etfs:
+  - BABA
+  - PDD
+  - JD
+  aliases:
+    search_names:
+    - 希音
+    - Shein 希音
+    - 0625.HK
+    adr: null
+    earnings_tracker: 0625.HK
+  earnings:
+    group: D
+    ir_url: null
+  workspace:
+    name: 0625.HK
+    status: none
+  coverage_stage: none
+  note: HK; reporting frequency unconfirmed, usually semiannual
+- ticker: 1024.HK
+  name: 快手
+  tier: watch
+  market: HK
+  peer_group: cn_content
+  sheet_section: China Internet
+  peers:
+  - TME
+  - BILI
+  - JOYY
+  - 0772.HK
+  - 9899.HK
+  - 1357.HK
+  - 1060.HK
+  - 9911.HK
+  etfs:
+  - KWEB
+  aliases:
+    search_names:
+    - 快手
+    - Kuaishou 快手
+    - 1024.HK
+    adr: null
+    earnings_tracker: 1024.HK
+  earnings:
+    group: D
+    ir_url: null
+  workspace:
+    name: 1024.HK
+    status: none
+  coverage_stage: none
+  note: HK; quarterly
+- ticker: DIDIY
+  name: 滴滴
+  tier: watch
+  market: US
+  peer_group: cn_travel_local
+  sheet_section: China Internet
+  peers:
+  - ATAT
+  - TCOM
+  - 0780.HK
+  - HTHT
+  etfs:
+  - KWEB
+  aliases:
+    search_names:
+    - 滴滴
+    - DiDi Global 滴滴
+    - DIDIY
+    adr: null
+    earnings_tracker: DIDIY
+  earnings:
+    group: D
+    ir_url: null
+  workspace:
+    name: DIDIY
+    status: planned
+  coverage_stage: none
+  note: OTC
+- ticker: FUTU
+  name: 富途
+  tier: core
+  market: US
+  peer_group: cn_brokers_exch
+  sheet_section: China Internet
+  peers:
+  - TIGR
+  - 0388.HK
+  etfs:
+  - HOOD
+  - IBKR
+  aliases:
+    search_names:
+    - 富途
+    - Futu
+    - FUTU
+    adr: null
+    earnings_tracker: FUTU
+  earnings:
+    group: A
+    ir_url: https://www.zacks.com/stock/research/FUTU/earnings-calendar
+  workspace:
+    name: FUTU
+    status: planned
+  coverage_stage: none
+  note: null
+- ticker: ZTO
+  name: 中通
+  tier: watch
+  market: US
+  peer_group: cn_logistics
+  sheet_section: China Internet
+  peers:
+  - 1519.HK
+  - 2618.HK
+  - YMM
+  etfs:
+  - KWEB
+  aliases:
+    search_names:
+    - 中通
+    - ZTO Express
+    - ZTO
+    adr: null
+    earnings_tracker: ZTO
+  earnings:
+    group: D
+    ir_url: https://www.zacks.com/stock/research/ZTO/earnings-calendar
+  workspace:
+    name: ZTO
+    status: planned
+  coverage_stage: none
+  note: null
+- ticker: 6618.HK
+  name: 京东健康
+  tier: watch
+  market: HK
+  peer_group: cn_health
+  sheet_section: China Internet
+  peers:
+  - 0241.HK
+  - 1833.HK
+  etfs:
+  - KWEB
+  aliases:
+    search_names:
+    - 京东健康
+    - JD Health 京东健康
+    - 6618.HK
+    adr: null
+    earnings_tracker: 6618.HK
+  earnings:
+    group: D
+    ir_url: null
+  workspace:
+    name: 6618.HK
+    status: none
+  coverage_stage: none
+  note: HK; semiannual (interim Aug, annual Mar)
+- ticker: TME
+  name: 腾讯音乐
+  tier: watch
+  market: US
+  peer_group: cn_content
+  sheet_section: China Internet
+  peers:
+  - 1024.HK
+  - BILI
+  - JOYY
+  - 0772.HK
+  - 9899.HK
+  - 1357.HK
+  - 1060.HK
+  - 9911.HK
+  etfs:
+  - KWEB
+  aliases:
+    search_names:
+    - 腾讯音乐
+    - Tencent Music 腾讯音乐
+    - TME
+    adr: null
+    earnings_tracker: TME
+  earnings:
+    group: D
+    ir_url: https://ir.tencentmusic.com/2026-10-13-Tencent-Music-Entertainment-Group-to-Report-Third-Quarter-2026-Financial-Results-on-November-17,-2026
+  workspace:
+    name: TME
+    status: planned
+  coverage_stage: none
+  note: null
+- ticker: 1519.HK
+  name: 极兔速递
+  tier: watch
+  market: HK
+  peer_group: cn_logistics
+  sheet_section: China Internet
+  peers:
+  - ZTO
+  - 2618.HK
+  - YMM
+  etfs:
+  - KWEB
+  aliases:
+    search_names:
+    - 极兔速递
+    - J&T Global Express 极兔速递
+    - 1519.HK
+    adr: null
+    earnings_tracker: 1519.HK
+  earnings:
+    group: D
+    ir_url: null
+  workspace:
+    name: 1519.HK
+    status: none
+  coverage_stage: none
+  note: HK; semiannual (interim Aug, annual Mar); quarterly operating data is not results
+- ticker: YMM
+  name: 满帮
+  tier: watch
+  market: US
+  peer_group: cn_logistics
+  sheet_section: China Internet
+  peers:
+  - ZTO
+  - 1519.HK
+  - 2618.HK
+  etfs:
+  - KWEB
+  aliases:
+    search_names:
+    - 满帮
+    - Full Truck Alliance 满帮
+    - YMM
+    adr: null
+    earnings_tracker: YMM
+  earnings:
+    group: D
+    ir_url: null
+  workspace:
+    name: YMM
+    status: planned
+  coverage_stage: none
+  note: null
+- ticker: BILI
+  name: 哔哩哔哩
+  tier: watch
+  market: US
+  peer_group: cn_content
+  sheet_section: China Internet
+  peers:
+  - 1024.HK
+  - TME
+  - JOYY
+  - 0772.HK
+  - 9899.HK
+  - 1357.HK
+  - 1060.HK
+  - 9911.HK
+  etfs:
+  - KWEB
+  aliases:
+    search_names:
+    - 哔哩哔哩
+    - Bilibili 哔哩哔哩
+    - BILI
+    adr: null
+    earnings_tracker: BILI
+  earnings:
+    group: D
+    ir_url: null
+  workspace:
+    name: BILI
+    status: planned
+  coverage_stage: none
+  note: null
+- ticker: JOYY
+  name: 欢聚
+  tier: watch
+  market: US
+  peer_group: cn_content
+  sheet_section: China Internet
+  peers:
+  - 1024.HK
+  - TME
+  - BILI
+  - 0772.HK
+  - 9899.HK
+  - 1357.HK
+  - 1060.HK
+  - 9911.HK
+  etfs:
+  - KWEB
+  aliases:
+    search_names:
+    - 欢聚
+    - JOYY 欢聚
+    - JOYY
+    adr: null
+    earnings_tracker: JOYY
+  earnings:
+    group: D
+    ir_url: null
+  workspace:
+    name: JOYY
+    status: planned
+  coverage_stage: none
+  note: null
+- ticker: 1860.HK
+  name: 汇量科技
+  tier: watch
+  market: HK
+  peer_group: games_adtech
+  sheet_section: China Internet
+  peers:
+  - TTWO
+  - RBLX
+  - APP
+  - U
+  etfs: []
+  aliases:
+    search_names:
+    - 汇量科技
+    - Mobvista 汇量科技
+    - 1860.HK
+    adr: null
+    earnings_tracker: 1860.HK
+  earnings:
+    group: D
+    ir_url: null
+  workspace:
+    name: 1860.HK
+    status: none
+  coverage_stage: none
+  note: HK; reporting frequency unconfirmed, usually semiannual
+- ticker: 2400.HK
+  name: 心动
+  tier: watch
+  market: HK
+  peer_group: cn_games
+  sheet_section: China Internet
+  peers:
+  - 002602.SZ
+  - 002558.SZ
+  - 002555.SZ
+  - 002517.SZ
+  etfs:
+  - NTES
+  - 0700.HK
+  aliases:
+    search_names:
+    - 心动
+    - XD Inc 心动
+    - 2400.HK
+    adr: null
+    earnings_tracker: 2400.HK
+  earnings:
+    group: D
+    ir_url: null
+  workspace:
+    name: 2400.HK
+    status: none
+  coverage_stage: none
+  note: HK; semiannual (interim Aug, annual Mar)
+- ticker: 3696.HK
+  name: 英矽智能
+  tier: watch
+  market: HK
+  peer_group: cn_ai
+  sheet_section: China Software
+  peers:
+  - 2513.HK
+  - 0100.HK
+  - 2723.HK
+  - 0020.HK
+  - 3317.HK
+  - 0268.HK
+  - 2556.HK
+  - 6682.HK
+  - 2706.HK
+  - 1384.HK
+  etfs: []
+  aliases:
+    search_names:
+    - 英矽智能
+    - Insilico Medicine 英矽智能
+    - 3696.HK
+    adr: null
+    earnings_tracker: 3696.HK
+  earnings:
+    group: D
+    ir_url: null
+  workspace:
+    name: 3696.HK
+    status: none
+  coverage_stage: none
+  note: HK; reporting frequency unconfirmed, usually semiannual
+- ticker: 2556.HK
+  name: 迈富时
+  tier: watch
+  market: HK
+  peer_group: cn_ai
+  sheet_section: China Software
+  peers:
+  - 2513.HK
+  - 0100.HK
+  - 2723.HK
+  - 0020.HK
+  - 3317.HK
+  - 3696.HK
+  - 0268.HK
+  - 6682.HK
+  - 2706.HK
+  - 1384.HK
+  etfs: []
+  aliases:
+    search_names:
+    - 迈富时
+    - Marketingforce 迈富时
+    - 2556.HK
+    adr: null
+    earnings_tracker: 2556.HK
+  earnings:
+    group: D
+    ir_url: null
+  workspace:
+    name: 2556.HK
+    status: none
+  coverage_stage: none
+  note: HK; reporting frequency unconfirmed, usually semiannual
+- ticker: 9992.HK
+  name: 泡泡玛特
+  tier: watch
+  market: HK
+  peer_group: cn_consumer
+  sheet_section: China Consumer
+  peers:
+  - 2020.HK
+  - 1929.HK
+  - 6181.HK
+  - 6969.HK
+  - 3998.HK
+  - 2313.HK
+  - 0325.HK
+  - RLX
+  - 3388.HK
+  etfs: []
+  aliases:
+    search_names:
+    - 泡泡玛特
+    - Pop Mart 泡泡玛特
+    - 9992.HK
+    adr: null
+    earnings_tracker: 9992.HK
+  earnings:
+    group: D
+    ir_url: null
+  workspace:
+    name: 9992.HK
+    status: none
+  coverage_stage: none
+  note: HK; semiannual (interim Aug, annual Mar); quarterly business update is not results
+- ticker: HTHT
+  name: 华住
+  tier: core
+  market: US
+  peer_group: cn_travel_local
+  sheet_section: China Consumer
+  peers:
+  - ATAT
+  - TCOM
+  - DIDIY
+  - 0780.HK
+  etfs:
+  - KWEB
+  aliases:
+    search_names:
+    - 华住
+    - H World
+    - HTHT
+    - H World Group
+    adr: null
+    earnings_tracker: HTHT
+  earnings:
+    group: A
+    ir_url: https://www.zacks.com/stock/research/HTHT/earnings-calendar
+  workspace:
+    name: HTHT
+    status: planned
+  coverage_stage: none
+  note: null
+- ticker: 6181.HK
+  name: 老铺黄金
+  tier: watch
+  market: HK
+  peer_group: cn_consumer
+  sheet_section: China Consumer
+  peers:
+  - 2020.HK
+  - 9992.HK
+  - 1929.HK
+  - 6969.HK
+  - 3998.HK
+  - 2313.HK
+  - 0325.HK
+  - RLX
+  - 3388.HK
+  etfs: []
+  aliases:
+    search_names:
+    - 老铺黄金
+    - Laopu Gold 老铺黄金
+    - 6181.HK
+    adr: null
+    earnings_tracker: 6181.HK
+  earnings:
+    group: D
+    ir_url: null
+  workspace:
+    name: 6181.HK
+    status: none
+  coverage_stage: none
+  note: HK; semiannual (interim Aug, annual Mar)
+- ticker: 0388.HK
+  name: 港交所
+  tier: watch
+  market: HK
+  peer_group: cn_brokers_exch
+  sheet_section: China Others
+  peers:
+  - FUTU
+  - TIGR
+  etfs:
+  - HOOD
+  - IBKR
+  aliases:
+    search_names:
+    - 港交所
+    - HKEX 港交所
+    - 0388.HK
+    adr: null
+    earnings_tracker: 0388.HK
+  earnings:
+    group: D
+    ir_url: https://www.hkexgroup.com/Investor-Relations?sc_lang=en
+  workspace:
+    name: 0388.HK
+    status: none
+  coverage_stage: none
+  note: HK; quarterly
+- ticker: 601100.SS
+  name: 恒立液压
+  tier: watch
+  market: CN
+  peer_group: humanoid
+  sheet_section: Humanoid
+  peers:
+  - 688836.SS
+  - 9880.HK
+  - 002050.SZ
+  - 601689.SS
+  - 688017.SS
+  - 0425.HK
+  - 3952.HK
+  - 6324.T
+  - 6268.T
+  - OUST
+  - VPG
+  etfs: []
+  aliases:
+    search_names:
+    - 恒立液压
+    - Hengli Hydraulic
+    - 601100.SS
+    - 601100.SH
+    adr: null
+    earnings_tracker: 601100.SH
+  earnings:
+    group: D
+    ir_url: https://data.eastmoney.com/stockdata/601100.html
+  workspace:
+    name: 601100.SS
+    status: none
+  coverage_stage: none
+  note: A-share; exchange disclosure calendar

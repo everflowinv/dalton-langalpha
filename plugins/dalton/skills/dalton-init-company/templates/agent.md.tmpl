@@ -1,0 +1,44 @@
+# {name}（{ticker}）· Dalton 覆盖工作区
+
+## 覆盖信息
+- Tier：{tier}；同组：{peers}；市场：{market}；覆盖阶段：{coverage_stage}
+- 名单来源：../Home/dalton/coverage.yaml（as_of {as_of}）
+
+## 当前判断（一句话）
+暂无（{date} 初始化）。正式 thesis 以 data/thesis.json 的 `official`（经 publish_report、PM 批准）为准。
+
+<!-- dalton:summary:start (由 knowledge_update 维护，勿手改) -->
+（知识层尚未建立）
+<!-- dalton:summary:end -->
+
+## 工作约定
+- 先读 .agents/skills/dalton-conventions/SKILL.md
+- 回答 PM 的问题：先读 .agents/skills/dalton-pm-qa/SKILL.md
+- 改知识层用 knowledge_update / knowledge_append_verdict（PK.4）；直接改文件会被记录为 direct_edit 并提示合入
+- 基金 wiki 只读；发现写进本工作区的知识层
+- 可以直接新建和修改本公司的 dalton-* 自动任务文件，不必先问（PK.15）
+- 每次工作结束：更新议程，并给出下一次唤醒的时间和理由（PK.14）
+
+## 文件索引
+| 文件 | 内容 |
+|---|---|
+| thesis.md / data/thesis.json | thesis 支柱、证据台账、证伪阈值、house view（字段见 PK.2） |
+| debate.md / data/debate.json | 核心多空分歧（D1..Dn）、多方/空方/我方判断、最强反驳、改判条件與历史演进 |
+| drivers.md / data/drivers.json | 核心驱动因子、领先指标、最新读数、敏感度与历史估值驱动拆解 |
+| management.md / data/management.json | 管理层背景、资本配置纪律、指引风格与历史指引兑现记录 |
+| lessons.md / data/lessons.json | 研究复盘教训（事实、时机、传导、估值、执行五类归因，含已撤回记录） |
+| agenda.md / data/agenda.json | 待验证问题清单、催化剂日历、跟踪阈值与下一次自主唤醒计划 |
+| verdicts.md / data/verdicts.jsonl | 事件五词结论只追加日志（NO_CHANGE / THESIS_STRENGTHENED / THESIS_WEAKENED / THESIS_BROKEN / NEW_THESIS） |
+| data/consensus/ | 卖方一致预期历史快照（`<YYYY-MM-DD_HHMM>.json`，附 `_meta`） |
+| model/ | 财务模型（`<TICKER>-model-v<NN>.xlsx`，每版新建文件，不覆盖旧版）与 `data/models.json` |
+| research/ | 事件笔记、专题研究、取证材料（自由 Markdown 文件） |
+| drafts/ | 待发布报告草稿（草稿随时可改，核验只在发布时卡一次） |
+| published/ | 经 `publish_report` 与 PM 批准后的正式发布物及 `published/INDEX.md`（只读不改写） |
+| history/ | 知识层各版本的日期副本（供人查阅，真值在数据库） |
+| sources/ | 旧系统认知迁移与外部原件只读副本 |
+
+## Thread Index
+
+## Key Findings
+
+## File Index

@@ -1,0 +1,20 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "dalton",
+  "version": "1.0.0",
+  "description": "Dalton fund methodology, company workspace onboarding, and equity research workflow skills.",
+  "author": {
+    "name": "Dalton",
+    "url": "https://langalpha.ai"
+  },
+  "homepage": "https://langalpha.ai",
+  "repository": "https://github.com/ginlix/langalpha",
+  "license": "Apache-2.0",
+  "keywords": [
+    "dalton",
+    "research",
+    "methodology",
+    "equity-research",
+    "onboarding"
+  ]
+}
