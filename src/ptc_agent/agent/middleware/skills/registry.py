@@ -561,3 +561,10 @@ def list_skills() -> list[dict[str, Any]]:
         for skill in SKILL_REGISTRY.values()
         if _is_enabled(skill) and not skill.hidden
     ]
+
+
+# DALTON-HOOK(skills-registry)
+from .dalton_registry import DALTON_SKILL_DEFINITIONS  # noqa: E402
+
+SKILL_REGISTRY.update(DALTON_SKILL_DEFINITIONS)
+

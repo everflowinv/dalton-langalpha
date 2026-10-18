@@ -1,0 +1,12 @@
+{
+  "name": "<TICKER> <PERIOD> 财报快讯（T0）",
+  "description": "官方财报发布后 N 小时触发财报快讯与事件五词初判",
+  "status": "active",
+  "trigger_type": "once",
+  "next_run_at": "2026-10-28T18:35:00-04:00",
+  "timezone": "America/New_York",
+  "instruction": "/dalton-earnings-flash <TICKER> <PERIOD> 发布时间 <EARNINGS_DATE> <RELEASE_TIME_ET> ET。先读 .agents/skills/dalton-earnings-flash/SKILL.md。前瞻稿与 predictions.json 在 drafts/、research/ 下最新的 preview-<PERIOD>；收尾按 .agents/skills/dalton-agenda/SKILL.md 三步。",
+  "workspace_id": "<WORKSPACE_ID>",
+  "thread": "new",
+  "delivery": ["<PM_DELIVERY_CHANNEL>"]
+}

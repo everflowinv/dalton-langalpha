@@ -1,0 +1,147 @@
+export const meta = {
+  name: 'topic-research',
+  description: 'Dalton 专题研究：规划 → 一手 → 分簇取证∥内部记忆∥专家 → 交叉验证与盲区 → 写作 → 数字核验 → 独立审稿 → 修订',
+}
+
+const { topic, slug, horizon, workspace_dir: W, as_of: D } = args
+const related = args.related_tickers || []
+const dateTag = D || 'latest'
+const topicSlug = slug || 'topic'
+const R = `${W}/research/${dateTag}-topic-${topicSlug}`
+const S = '.agents/skills/dalton-topic-research'
+const base = `先读 .agents/skills/dalton-conventions/SKILL.md 与 ${S}/SKILL.md、${S}/references/principles.md；专题：「${topic}」，时间范围：${
+  horizon || '优先近 30 天（6 个月以上标日期，12 个月以上仅作背景）'
+}，相关公司：${related.join(', ') || '见规划'}。基金 wiki 只读，任何阶段不回写 wiki。`
+
+// Keep schema nesting depth <= 4 (well within schema_max_depth=5)
+const PLAN_SCHEMA = {
+  type: 'object',
+  properties: {
+    file: { type: 'string' },
+    clusters: { type: 'array', items: { type: 'object' } },
+    questions: { type: 'array', items: { type: 'string' } },
+    summary: { type: 'string' },
+  },
+  required: ['file', 'clusters', 'questions'],
+}
+
+const OUT = {
+  type: 'object',
+  properties: {
+    files: { type: 'array', items: { type: 'string' } },
+    summary: { type: 'string' },
+    sha256: { type: 'string' },
+    gaps: { type: 'array', items: { type: 'string' } },
+  },
+  required: ['files', 'summary'],
+}
+
+phase('规划')
+const plan = await agent(
+  `${base} 阶段 0 规划：参考 ${S}/references/clusters-investment.md 设计 3–6 个检索簇（每簇含 id, name, queries（5–8 条中英文检索词）、预期信息类型、关键来源、盲区），锁定报告框架与 5–8 个核心问题（${
+    (args.core_questions || []).join('；') || '按主题拆解'
+  }）、预期矛盾与数字核验清单，写 ${R}/plan.md。返回 file、clusters（最多 6 个对象，每项含 id, name, queries）、questions、summary。`,
+  { agentType: 'general-purpose', label: '规划', phase: '规划', schema: PLAN_SCHEMA }
+)
+if (plan === null) {
+  return { ok: false, reason: '专题规划阶段失败' }
+}
+
+phase('一手材料')
+const primary = await agent(
+  `${base} 阶段 0.5 一手材料：规划见 ${R}/plan.md。涉及上市公司（${
+    related.join(', ') || '按规划'
+  }）时读最近定期报告与 8-K 附件、1–2 次电话会、近 6 个月卖方报告；行业/宏观题读 AlphaEngine 行业检索与内部库，写 ${R}/primary.md。`,
+  { agentType: 'dalton-evidence', label: '一手材料', phase: '一手材料', schema: OUT }
+)
+
+phase('分簇取证')
+const clusters = (plan.clusters || []).slice(0, 6)
+const evTasks = [
+  ...clusters.map((c, idx) => () => {
+    const cid = c.id || `c${idx + 1}`
+    const cname = c.name || `簇 ${idx + 1}`
+    const qs = Array.isArray(c.queries) ? c.queries.join(' / ') : ''
+    return agent(
+      `${base} 阶段 2 分簇取证（${cid}：${cname}）：检索词 [${qs}]。跑完全部检索词，精读 3–5 篇全文；输出 Facts / Direct Quotes / Timeline / Contradictions / 全文摘录 / Sources 到 ${R}/cluster-${cid}.md。`,
+      { agentType: 'dalton-evidence', label: `取证 ${cname}`, phase: '分簇取证', schema: OUT }
+    )
+  }),
+  () =>
+    agent(
+      `${base} 阶段 2 内部记忆检索：检索 researchdata 的 sales-notes、tmtb、funda-ai、company-wiki（只读），英文与中文结合，写 ${R}/internal-memory.md。`,
+      { agentType: 'dalton-evidence', label: '内部记忆', phase: '分簇取证', schema: OUT }
+    ),
+  () =>
+    agent(
+      `${base} 阶段 2 专家纪要检索：用英文检索 Guidepoint 1–2 轮，标专家身份不写姓名，原话引用 ≤20 个英文词并带出处，写 ${R}/guidepoint.md。`,
+      { agentType: 'dalton-evidence', label: '专家纪要', phase: '分簇取证', schema: OUT }
+    ),
+]
+const evResults = await parallel(evTasks)
+
+phase('交叉验证与盲区')
+const cross = await agent(
+  `${base} 阶段 3 交叉验证 + 阶段 3.5 盲区检查：读 ${R}/ 下全部取证文件（primary.md、cluster-*.md、internal-memory.md、guidepoint.md），跨簇互证升级置信度（【高】≥3 独立源、【中】2 源、【低】单源）；矛盾保留各方原话（【冲突】），不折中合并；检查盲区并写 ${R}/cross-check.md。若仍有必须补查的盲区，放入返回 JSON 的 gaps 数组（最多 2 项）。`,
+  { agentType: 'general-purpose', label: '交叉验证与盲区', phase: '交叉验证与盲区', schema: OUT }
+)
+
+if (cross && Array.isArray(cross.gaps) && cross.gaps.length > 0) {
+  const suppGaps = cross.gaps.slice(0, 2)
+  await parallel(
+    suppGaps.map((g, idx) => () =>
+      agent(
+        `${base} 阶段 3.5 盲区补查 #${idx + 1}：针对盲区「${g}」补充检索一手材料、内部库或 AlphaEngine，写 ${R}/supplement-${
+          idx + 1
+        }.md。`,
+        { agentType: 'dalton-evidence', label: `盲区补查 ${idx + 1}`, phase: '交叉验证与盲区', schema: OUT }
+      )
+    )
+  )
+}
+
+phase('写作与数字核验')
+const draftPath = `${W}/drafts/${dateTag}-topic-${topicSlug}.md`
+const draft = await agent(
+  `${base} 阶段 4 写作：按 ${S}/templates/topic.md 综合 ${R}/ 下全部材料写专题报告到 ${draftPath}（含逐条置信度标签、“对覆盖公司的含义”表、情景推演、信息缺口与局限、数字核验表占位、Sources），跑 python ${S}/scripts/validate_topic.py ${draftPath} 到通过，返回成稿路径与 sha256。`,
+  { agentType: 'general-purpose', label: '专题写作', phase: '写作与数字核验', schema: OUT }
+)
+
+const audit =
+  draft === null
+    ? null
+    : await agent(
+        `${base} 阶段 5 数字核验：对 ${draftPath} 里每个关键数字核对 SEC filing（dalton_sec）与行情/一致预期接口（价格、市值、PE、净现金、营收、净利、分红回购、capex），输出 PASS/FAIL 核验表到 ${R}/number-audit.md。`,
+        { agentType: 'dalton-evidence', label: '数字核验', phase: '写作与数字核验', schema: OUT }
+      )
+
+phase('独立审稿与修订')
+const review =
+  draft === null
+    ? null
+    : await agent(
+        `审阅 ${draftPath} 及 ${R}/number-audit.md、${R}/cross-check.md（只读不改文件）。检查：无据断言、逻辑漏洞、盲点、来源偏差、矛盾是否保留原话、低置信度占比是否异常（<15% 提示注水）、对覆盖公司的驱动变量传导是否具体。给出结论：可发布 / 需修订 / 不得发布。`,
+        { agentType: 'dalton-reviewer', label: '独立审稿', phase: '独立审稿与修订' }
+      )
+
+const fix =
+  draft === null
+    ? null
+    : await agent(
+        `${base} 阶段 7 修订与知识层草案：先核对 ${draftPath} 的 sha256 是否与审稿前（${
+          draft.sha256 || '写作记录值'
+        }）一致；把 ${R}/number-audit.md 的核验表并入报告（FAIL 项修成正值并标【更正】），按审稿意见修复全部 P0，跑 python ${S}/scripts/validate_topic.py ${draftPath} 到通过。同时按 PK.2 的 JSON Schema 将对相关覆盖公司（${
+          related.join(', ') || '报告涉及的覆盖公司'
+        }）的知识层修改建议（drivers、debate、lessons、agenda）写到 ${R}/knowledge-revision.json（不回写基金 wiki，不直接改 data/）。\n审稿意见：\n${
+          review || '审稿缺席'
+        }`,
+        { agentType: 'general-purpose', label: '修订与知识层草案', phase: '独立审稿与修订', schema: OUT }
+      )
+
+return {
+  ok: draft !== null,
+  draft: draftPath,
+  number_audit: audit && `${R}/number-audit.md`,
+  review_done: review !== null,
+  knowledge_revision: fix && `${R}/knowledge-revision.json`,
+}

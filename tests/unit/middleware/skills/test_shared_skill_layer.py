@@ -82,3 +82,61 @@ async def test_sandbox_sync_keeps_the_layer(tmp_path):
         [str(tmp_path)], disabled=frozenset({LAYER, *_dependents()})
     )
     assert names == set()
+
+
+# ---------------------------------------------------------------------------
+# dalton-conventions shared methodology layer
+# ---------------------------------------------------------------------------
+
+DALTON_LAYER = "dalton-conventions"
+DALTON_MANDATE_LINE = (
+    "Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the first deliverable."
+)
+
+
+def _dalton_dependents() -> list[str]:
+    return sorted(name for name, s in SKILL_REGISTRY.items() if DALTON_LAYER in s.requires)
+
+
+def _shipped_dalton_dependents() -> list[str]:
+    from ptc_agent.config.plugins import bundled_skill_dirs
+
+    found = set()
+    for root in bundled_skill_dirs():
+        for skill_dir in root.iterdir():
+            if not skill_dir.is_dir() or skill_dir.name in (DALTON_LAYER, ""):
+                continue
+            if skill_dir.name not in SKILL_REGISTRY:
+                continue
+            for path in skill_dir.rglob("*.md"):
+                if f".agents/skills/{DALTON_LAYER}/" in path.read_text(encoding="utf-8"):
+                    found.add(skill_dir.name)
+                    break
+    return sorted(found)
+
+
+@pytest.mark.parametrize("name", _shipped_dalton_dependents())
+def test_skill_that_reads_dalton_layer_declares_it(name, shipped_skill_md):
+    assert DALTON_LAYER in SKILL_REGISTRY[name].requires
+    assert LAYER in SKILL_REGISTRY[name].requires
+    # Verify the mandate line appears within the first 12 lines of the SKILL.md body
+    raw = shipped_skill_md(name).read_text(encoding="utf-8")
+    parts = raw.split("---", 2)
+    body = parts[2].lstrip("\n") if len(parts) >= 3 else raw
+    first_12_lines = "\n".join(body.splitlines()[:12])
+    assert DALTON_MANDATE_LINE in first_12_lines
+
+
+def test_dalton_layer_survives_its_own_disable():
+    assert resolve_disabled_skills({DALTON_LAYER}) == frozenset()
+
+    registry = build_effective_skill_registry(disabled_skills={DALTON_LAYER})
+    assert DALTON_LAYER in registry
+    assert "dalton-init-company" in registry
+
+
+def test_dalton_layer_goes_when_every_dependent_is_off():
+    disabled = {DALTON_LAYER, *_dalton_dependents()}
+    assert resolve_disabled_skills(disabled) == frozenset(disabled)
+    assert DALTON_LAYER not in build_effective_skill_registry(disabled_skills=disabled)
+

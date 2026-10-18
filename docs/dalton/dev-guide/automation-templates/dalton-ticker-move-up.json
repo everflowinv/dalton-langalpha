@@ -1,0 +1,26 @@
+{
+  "name": "<TICKER> 异动（涨）",
+  "description": "Core 公司单日涨幅超过阈值自动触发异动归因（板块 beta 且无个股事件时不推送）",
+  "status": "active",
+  "trigger_type": "price",
+  "trigger_config": {
+    "symbol": "<TICKER>",
+    "market": "stock",
+    "conditions": [
+      {
+        "type": "pct_change_above",
+        "value": 4.0,
+        "reference": "previous_close"
+      }
+    ],
+    "retrigger": {
+      "mode": "recurring",
+      "cooldown_seconds": null
+    }
+  },
+  "timezone": "America/New_York",
+  "instruction": "/dalton-stock-move <TICKER> 今天 —— 价格触发：较昨收涨超 4%。先读 .agents/skills/dalton-stock-move/SKILL.md，先量化同组与板块，再找原因；若判定为板块 beta 且无个股事件，只用 knowledge_append_verdict 写一条 NO_CHANGE，不推送。",
+  "workspace_id": "<WORKSPACE_ID>",
+  "thread": "new",
+  "delivery": ["<PM_DELIVERY_CHANNEL>"]
+}

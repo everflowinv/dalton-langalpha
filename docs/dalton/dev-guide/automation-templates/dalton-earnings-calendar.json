@@ -1,0 +1,11 @@
+{
+  "name": "财报日历每周维护",
+  "description": "每周六 09:00（Asia/Shanghai）刷新覆盖名单官方财报日期，维护三态台账并生成 tm3/t0/tp1 自动任务",
+  "status": "active",
+  "trigger_type": "cron",
+  "cron_expression": "0 9 * * 6",
+  "timezone": "Asia/Shanghai",
+  "instruction": "/dalton-earnings-calendar 全名单 —— 先读 .agents/skills/dalton-earnings-calendar/SKILL.md，按 skill 流程滚动、扫描（只认官方来源，候选日期标待确认 date_status: estimated）、经 PUT /api/v1/dalton/automations/{name} 建/改 tm3/t0/tp1 自动任务、用 dalton_agenda_note 同步各公司 watch.events、对账，最后按固定顺序总结。",
+  "workspace_id": "home",
+  "thread": "new"
+}

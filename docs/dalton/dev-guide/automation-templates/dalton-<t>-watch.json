@@ -1,0 +1,11 @@
+{
+  "name": "<TICKER> 事件监控",
+  "description": "Dalton 公司工作区事件轮询监控（filing、earnings、price、indicator、pm_question、internal 零成本预检）",
+  "status": "active",
+  "trigger_type": "cron",
+  "cron_expression": "*/30 6-20 * * 1-5",
+  "timezone": "America/New_York",
+  "instruction": "Dalton 事件唤醒：按 <dalton_wake> 里的原因处理（如 kind=filing 则先读 .agents/skills/dalton-filing-review/SKILL.md），按 .agents/skills/dalton-agenda/SKILL.md 收尾三步结束。",
+  "workspace_id": "<WORKSPACE_ID>",
+  "thread": "new"
+}
