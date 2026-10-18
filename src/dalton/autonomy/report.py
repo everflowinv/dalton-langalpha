@@ -122,7 +122,7 @@ async def generate_weekly_autonomy_report(
 
     budget: dict[str, Any] = {}
     try:
-        budget = await get_budget_today(user_id or "local_dev_user")
+        budget = await get_budget_today(user_id=user_id or "local-dev-user")
     except Exception as e:
         logger.warning("[DALTON_WEEK_REPORT] get_budget_today failed: %s", e)
 

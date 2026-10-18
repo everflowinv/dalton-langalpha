@@ -12,9 +12,22 @@ from psycopg.types.json import Jsonb
 from src.server.database.pool import get_db_connection
 
 
-async def get_watch_state(workspace_id: str) -> dict[str, Any]:
-    """Return the watch state JSON for a workspace, or an empty dict."""
-    ws_uuid = uuid.UUID(str(workspace_id))
+HOME_WORKSPACE_SENTINEL = uuid.UUID("00000000-0000-0000-0000-000000000000")
+
+
+def _resolve_ws_uuid(workspace_id: Optional[str]) -> uuid.UUID:
+    """Resolve workspace_id to UUID, using HOME_WORKSPACE_SENTINEL when empty/None/home (A10)."""
+    if not workspace_id or str(workspace_id).strip().lower() == "home":
+        return HOME_WORKSPACE_SENTINEL
+    try:
+        return uuid.UUID(str(workspace_id))
+    except (ValueError, TypeError):
+        return uuid.uuid5(uuid.NAMESPACE_DNS, str(workspace_id))
+
+
+async def get_watch_state(workspace_id: Optional[str]) -> dict[str, Any]:
+    """Return the watch state JSON for a workspace (or Home sentinel), or an empty dict."""
+    ws_uuid = _resolve_ws_uuid(workspace_id)
     async with get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
@@ -32,12 +45,12 @@ async def get_watch_state(workspace_id: str) -> dict[str, Any]:
 
 
 async def upsert_watch_state(
-    workspace_id: str,
+    workspace_id: Optional[str],
     ticker: str,
     state: dict[str, Any],
 ) -> dict[str, Any]:
-    """Create or update watch state for a workspace."""
-    ws_uuid = uuid.UUID(str(workspace_id))
+    """Create or update watch state for a workspace (or Home sentinel)."""
+    ws_uuid = _resolve_ws_uuid(workspace_id)
     async with get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
@@ -50,7 +63,7 @@ async def upsert_watch_state(
                     updated_at = NOW()
                 RETURNING workspace_id, ticker, state, updated_at
                 """,
-                (ws_uuid, ticker.upper(), Jsonb(state)),
+                (ws_uuid, (ticker or "HOME").upper(), Jsonb(state)),
             )
             row = await cur.fetchone()
             return dict(row) if row else {}
@@ -90,49 +103,17 @@ async def upsert_signal(
     summary: str,
     payload: Optional[dict[str, Any]] = None,
 ) -> tuple[dict[str, Any], bool]:
-    """Idempotently record a signal; returns (row, should_wake).
+    """Idempotently record a signal via atomic ``INSERT ... ON CONFLICT``; returns (row, should_wake).
 
-    If (workspace_id, probe, signal_key) already exists and woken_execution_id, resolved_at,
-    or expired_at is set, should_wake is False so we never double-wake on the same signal.
+    Empty/None ``workspace_id`` uses ``HOME_WORKSPACE_SENTINEL`` so Home-level signals are also
+    deduplicated by Postgres ``UNIQUE (workspace_id, probe, signal_key)`` (P0H §3.2 A10).
     """
-    ws_uuid = _try_uuid(workspace_id)
+    ws_uuid = _resolve_ws_uuid(workspace_id)
+    sig_id = uuid.uuid4()
+    init_payload = dict(payload or {})
+    init_payload.setdefault("status", "pending")
     async with get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
-            if ws_uuid is not None:
-                await cur.execute(
-                    """
-                    SELECT signal_id, workspace_id, ticker, probe, signal_key, priority,
-                           summary, payload, detected_at, woken_execution_id, woken_at,
-                           resolved_at, expired_at
-                    FROM dalton_signals
-                    WHERE workspace_id = %s AND probe = %s AND signal_key = %s
-                    """,
-                    (ws_uuid, probe, signal_key),
-                )
-            else:
-                await cur.execute(
-                    """
-                    SELECT signal_id, workspace_id, ticker, probe, signal_key, priority,
-                           summary, payload, detected_at, woken_execution_id, woken_at,
-                           resolved_at, expired_at
-                    FROM dalton_signals
-                    WHERE workspace_id IS NULL AND probe = %s AND signal_key = %s
-                    """,
-                    (probe, signal_key),
-                )
-            existing = await cur.fetchone()
-            if existing:
-                row_dict = _with_signal_status(dict(existing))
-                should_wake = (
-                    row_dict.get("woken_execution_id") is None
-                    and row_dict.get("resolved_at") is None
-                    and row_dict.get("expired_at") is None
-                )
-                return row_dict, should_wake
-
-            sig_id = uuid.uuid4()
-            init_payload = dict(payload or {})
-            init_payload.setdefault("status", "pending")
             await cur.execute(
                 """
                 INSERT INTO dalton_signals (

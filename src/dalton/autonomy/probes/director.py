@@ -3,9 +3,174 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timezone
+import logging
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
 from src.dalton.autonomy.probes import ProbeSignal
+from src.dalton.settings import get_dalton_settings
+
+logger = logging.getLogger(__name__)
+
+
+def _parse_backoff_future(backoff_val: Any, now_dt: datetime, now_date: date) -> bool:
+    if not backoff_val:
+        return False
+    raw = str(backoff_val).strip()
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=now_dt.tzinfo or timezone.utc)
+        return dt > now_dt
+    except ValueError:
+        try:
+            return date.fromisoformat(raw[:10]) > now_date
+        except ValueError:
+            return False
+
+
+def _count_agenda_actionable(
+    agenda_docs: list[dict[str, Any]],
+    *,
+    now_dt: datetime,
+    now_date: date,
+) -> dict[str, int]:
+    due_validations = 0
+    actionable_questions = 0
+    unconfirmed_earnings_14d = 0
+
+    for doc in agenda_docs:
+        if not isinstance(doc, dict):
+            continue
+        for v in (doc.get("next_validations") or []) + (doc.get("validation_queue") or []):
+            if not isinstance(v, dict):
+                continue
+            if v.get("status") not in (None, "open", "pending"):
+                continue
+            raw_due = v.get("due") or v.get("target_date") or v.get("due_date")
+            if not raw_due:
+                continue
+            try:
+                if date.fromisoformat(str(raw_due)[:10]) <= now_date:
+                    due_validations += 1
+            except ValueError:
+                continue
+
+        for q in doc.get("open_questions") or []:
+            if not isinstance(q, dict):
+                continue
+            if q.get("status") not in (None, "open", "investigating"):
+                continue
+            if bool(q.get("waiting_pm")) or q.get("status") == "waiting_pm":
+                continue
+            backoff_raw = q.get("next_attempt_after") or q.get("backoff_until")
+            if _parse_backoff_future(backoff_raw, now_dt, now_date):
+                continue
+            val = str(q.get("value") or q.get("priority") or "medium").lower()
+            origin = str(q.get("origin") or "").lower()
+            if val in ("high", "p0") or origin == "pm":
+                actionable_questions += 1
+
+        events = ((doc.get("watch") or {}).get("events") or []) + (doc.get("catalysts") or [])
+        for ev in events:
+            if not isinstance(ev, dict):
+                continue
+            etype = str(ev.get("type") or ev.get("kind") or "").lower()
+            eplan = str(ev.get("plan") or ev.get("title") or ev.get("event") or "").lower()
+            is_earnings = etype == "earnings" or "财报" in eplan or "earnings" in eplan
+            date_status = str(ev.get("date_status") or "").lower()
+            if not is_earnings or date_status != "estimated":
+                continue
+            raw_d = ev.get("date") or ev.get("expected_date")
+            if not raw_d:
+                continue
+            try:
+                days = (date.fromisoformat(str(raw_d)[:10]) - now_date).days
+                if 0 <= days <= 14:
+                    unconfirmed_earnings_14d += 1
+            except ValueError:
+                continue
+
+    return {
+        "due_validations": due_validations,
+        "actionable_questions": actionable_questions,
+        "unconfirmed_earnings_14d": unconfirmed_earnings_14d,
+    }
+
+
+async def _check_db_actionable_work(
+    *,
+    now_dt: datetime,
+    now_date: date,
+    ttl_hours: int,
+) -> dict[str, int]:
+    """Query Postgres for the 5 daily director actionable work conditions (A7, N2-M3)."""
+    counts = {
+        "due_validations": 0,
+        "actionable_questions": 0,
+        "stale_signals_24h": 0,
+        "publish_near_or_past_ttl": 0,
+        "unconfirmed_earnings_14d": 0,
+    }
+    try:
+        from psycopg.rows import dict_row
+        from src.dalton.database.publications import expire_stale_publications
+        from src.server.database.pool import get_db_connection
+
+        try:
+            expired_rows = await expire_stale_publications(ttl_hours=ttl_hours)
+            if expired_rows:
+                counts["publish_near_or_past_ttl"] += len(expired_rows)
+        except Exception as e:
+            logger.warning("[DALTON_DIRECTOR_PROBE] expire_stale_publications failed: %s", e)
+
+        async with get_db_connection() as conn:
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    """
+                    SELECT DISTINCT ON (workspace_id) content
+                    FROM dalton_knowledge_versions
+                    WHERE doc_key = 'agenda' AND schema_valid = TRUE
+                    ORDER BY workspace_id, version_no DESC
+                    """
+                )
+                agenda_rows = await cur.fetchall()
+                agenda_docs = [
+                    r["content"] for r in (agenda_rows or []) if isinstance(r.get("content"), dict)
+                ]
+                ag_counts = _count_agenda_actionable(agenda_docs, now_dt=now_dt, now_date=now_date)
+                counts["due_validations"] = ag_counts["due_validations"]
+                counts["actionable_questions"] = ag_counts["actionable_questions"]
+                counts["unconfirmed_earnings_14d"] = ag_counts["unconfirmed_earnings_14d"]
+
+                await cur.execute(
+                    """
+                    SELECT COUNT(*) AS cnt
+                    FROM dalton_signals
+                    WHERE resolved_at IS NULL
+                      AND expired_at IS NULL
+                      AND detected_at <= NOW() - INTERVAL '24 hours'
+                    """
+                )
+                sig_row = await cur.fetchone()
+                counts["stale_signals_24h"] = int((sig_row or {}).get("cnt") or 0)
+
+                warn_hours = max(1, ttl_hours - 24)
+                await cur.execute(
+                    """
+                    SELECT COUNT(*) AS cnt
+                    FROM dalton_publish_requests
+                    WHERE status = 'awaiting_pm'
+                      AND created_at <= NOW() - make_interval(hours => %s)
+                    """,
+                    (warn_hours,),
+                )
+                pub_row = await cur.fetchone()
+                counts["publish_near_or_past_ttl"] += int((pub_row or {}).get("cnt") or 0)
+    except Exception as e:
+        logger.warning("[DALTON_DIRECTOR_PROBE] DB actionable work check failed: %s", e)
+
+    return counts
 
 
 async def probe_director(
@@ -13,10 +178,19 @@ async def probe_director(
     kind: str,
     watch_state: dict[str, Any],
     today: Optional[date] = None,
+    persist: bool = True,
+    agenda_docs_override: Optional[list[dict[str, Any]]] = None,
 ) -> tuple[list[ProbeSignal], dict[str, Any]]:
-    """Emit a daily or weekly director wake signal."""
-    now_date = today or datetime.now(timezone.utc).date()
+    """Emit a daily or weekly director wake signal when actionable work exists (PK.16 / PK.19 / A7)."""
+    settings = get_dalton_settings()
+    try:
+        tz = ZoneInfo(settings.autonomy.timezone)
+    except Exception:
+        tz = timezone.utc
+    now_dt = datetime.now(tz)
+    now_date = today or now_dt.date()
     state = dict(watch_state or {})
+
     if kind == "director_weekly":
         iso_year, iso_week, _ = now_date.isocalendar()
         week_key = f"{iso_year}-W{iso_week:02d}"
@@ -30,12 +204,63 @@ async def probe_director(
             )
         ], state
 
+    # Daily director: check the 5 actionable conditions before waking (A7)
+    ttl_hours = int(getattr(settings.publish, "approval_ttl_hours", 72) or 72)
+    counts: dict[str, int]
+    if isinstance(state.get("actionable_counts"), dict):
+        raw_c = state["actionable_counts"]
+        counts = {
+            "due_validations": int(raw_c.get("due_validations") or 0),
+            "actionable_questions": int(raw_c.get("actionable_questions") or 0),
+            "stale_signals_24h": int(raw_c.get("stale_signals_24h") or 0),
+            "publish_near_or_past_ttl": int(raw_c.get("publish_near_or_past_ttl") or 0),
+            "unconfirmed_earnings_14d": int(raw_c.get("unconfirmed_earnings_14d") or 0),
+        }
+    elif agenda_docs_override is not None or isinstance(state.get("agenda_docs"), list):
+        docs = agenda_docs_override if agenda_docs_override is not None else state.get("agenda_docs") or []
+        ag_c = _count_agenda_actionable(docs, now_dt=now_dt, now_date=now_date)
+        counts = {
+            "due_validations": ag_c["due_validations"],
+            "actionable_questions": ag_c["actionable_questions"],
+            "stale_signals_24h": int(state.get("stale_signals_24h") or 0),
+            "publish_near_or_past_ttl": int(state.get("publish_near_or_past_ttl") or 0),
+            "unconfirmed_earnings_14d": ag_c["unconfirmed_earnings_14d"],
+        }
+    elif "has_actionable_work" in state:
+        has_work = bool(state["has_actionable_work"])
+        counts = {
+            "due_validations": 1 if has_work else 0,
+            "actionable_questions": 0,
+            "stale_signals_24h": 0,
+            "publish_near_or_past_ttl": 0,
+            "unconfirmed_earnings_14d": 0,
+        }
+    elif persist:
+        counts = await _check_db_actionable_work(now_dt=now_dt, now_date=now_date, ttl_hours=ttl_hours)
+    else:
+        counts = {
+            "due_validations": 0,
+            "actionable_questions": 0,
+            "stale_signals_24h": 0,
+            "publish_near_or_past_ttl": 0,
+            "unconfirmed_earnings_14d": 0,
+        }
+
+    state["last_director_check_counts"] = counts
+    total_actionable = sum(counts.values())
+    if total_actionable <= 0:
+        return [], state
+
     return [
         ProbeSignal(
             probe="director",
             signal_key=f"daily:{now_date.isoformat()}",
             priority="P1",
-            summary=f"研究总监每日晨会调度与覆盖总览刷新（{now_date.isoformat()}）",
-            payload={"kind": "director_daily", "date": now_date.isoformat()},
+            summary=f"研究总监每日晨会调度与覆盖总览刷新（{now_date.isoformat()}，待办 {total_actionable} 项）",
+            payload={
+                "kind": "director_daily",
+                "date": now_date.isoformat(),
+                "actionable_counts": counts,
+            },
         )
     ], state

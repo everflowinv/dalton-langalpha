@@ -38,6 +38,7 @@ _APPEND_ONLY_ARRAY_NAMES = frozenset(
 
 _AS_OF_DOCS = frozenset({"thesis", "debate", "drivers", "management", "agenda"})
 
+# FROZEN (L30 / P0H §3.3): Do not add new aliases after P0H; use assist_json('knowledge.repair_field') for unknown field names.
 _DOC_PATH_ALIASES: dict[str, dict[str, str]] = {
     "agenda": {
         "questions": "open_questions",
@@ -73,6 +74,7 @@ _DOC_PATH_ALIASES: dict[str, dict[str, str]] = {
     },
 }
 
+# FROZEN (L30 / P0H §3.3): Do not add new aliases after P0H.
 _COLLECTION_FIELD_ALIASES: dict[str, dict[str, str]] = {
     "pillars": {
         "statement": "claim",
@@ -126,8 +128,10 @@ _COLLECTION_FIELD_ALIASES: dict[str, dict[str, str]] = {
     },
     "events": {
         "event_date": "date",
+        "expected_date": "date",
         "due": "date",
         "due_date": "date",
+        "title": "plan",
         "action": "plan",
         "description": "plan",
         "what": "plan",
@@ -359,6 +363,7 @@ def _ensure_nested_ids_and_defaults(
                         "open_questions", doc["open_questions"][:idx], now=now
                     )
                 q.setdefault("created_at", now_str)
+                q.setdefault("owner", "pm" if q.get("origin") == "pm" else "analyst")
                 q.setdefault("attempts", [])
                 _maintain_question_backoff(
                     q,
@@ -569,6 +574,25 @@ def _split_path(path: str) -> list[str]:
     return [seg for seg in path.split("/")[1:] if seg != ""]
 
 
+def suggest_close_fields(
+    bad_fields: list[str],
+    valid_fields: list[str],
+    *,
+    n: int = 3,
+    cutoff: float = 0.6,
+) -> dict[str, list[str]]:
+    """Suggest candidate valid field names for mistyped fields using difflib (suggestion-only, P0H §3.3)."""
+    allowed = [f for f in valid_fields if f and f != "official"]
+    suggestions: dict[str, list[str]] = {}
+    for bad in bad_fields:
+        if not bad or bad == "official":
+            continue
+        matches = difflib.get_close_matches(bad, allowed, n=n, cutoff=cutoff)
+        if matches:
+            suggestions[bad] = matches
+    return suggestions
+
+
 def _repair_item_dict(
     collection_name: str,
     item: dict[str, Any],
@@ -585,6 +609,8 @@ def _repair_item_dict(
                 {
                     "code": "field_repaired",
                     "path": f"{path_prefix}/{bad_key}",
+                    "original_field": bad_key,
+                    "repaired_to": target_key,
                     "message": f"repaired field {bad_key!r} -> {target_key!r}",
                 }
             )
@@ -620,6 +646,8 @@ def _repair_doc_collections(
                 {
                     "code": "field_repaired",
                     "path": f"/{bad_key}",
+                    "original_field": bad_key,
+                    "repaired_to": target_rel,
                     "message": f"repaired path '/{bad_key}' -> '/{target_rel}'",
                 }
             )
@@ -647,7 +675,11 @@ def repair_knowledge_ops(
     base_doc: dict[str, Any] | None,
     ops: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Repair common path/field aliases in ``ops`` and return ``(repaired_ops, warnings)``."""
+    """Repair frozen path/field aliases in ``ops`` and return ``(repaired_ops, warnings)`` (P0H §3.3).
+
+    Note: ``difflib`` fuzzy matching is NEVER applied automatically here; unknown typos are handed to
+    ``assist_json(task='knowledge.repair_field')`` with ``suggest_close_fields`` candidate hints.
+    """
     repaired_ops = copy.deepcopy(ops)
     warnings: list[dict[str, Any]] = []
     doc_aliases = _DOC_PATH_ALIASES.get(doc_key, {})
@@ -667,14 +699,10 @@ def repair_knowledge_ops(
         if not segs:
             continue
 
-        # 1. Check top-level segment alias (never repair /official)
+        # 1. Check frozen top-level segment alias (never repair /official; no automatic difflib mutation)
         top = segs[0]
         if top != "official":
             mapped_top = doc_aliases.get(top)
-            if mapped_top is None and isinstance(base_doc, dict) and top not in base_doc:
-                close = difflib.get_close_matches(top, list(base_doc.keys()), n=1, cutoff=0.78)
-                if close and close[0] != "official":
-                    mapped_top = close[0]
             if mapped_top:
                 new_top_segs = [s for s in mapped_top.split("/") if s]
                 segs = [*new_top_segs, *segs[1:]]
@@ -683,6 +711,8 @@ def repair_knowledge_ops(
                     {
                         "code": "field_repaired",
                         "path": raw_path,
+                        "original_field": top,
+                        "repaired_to": mapped_top,
                         "message": f"repaired path {raw_path!r} -> {new_path!r}",
                     }
                 )
@@ -702,6 +732,8 @@ def repair_knowledge_ops(
                     {
                         "code": "field_repaired",
                         "path": raw_path,
+                        "original_field": leaf_seg,
+                        "repaired_to": mapped_leaf,
                         "message": f"repaired field {leaf_seg!r} -> {mapped_leaf!r} at {new_path!r}",
                     }
                 )

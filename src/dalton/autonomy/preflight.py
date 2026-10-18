@@ -8,10 +8,12 @@ execution settles immediately as `Outcome.PRECHECK_SKIPPED` (`status='skipped'`,
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
 from src.dalton.autonomy.backoff import (
     clear_probe_backoff,
@@ -26,6 +28,7 @@ from src.dalton.autonomy.probes.earnings import probe_earnings
 from src.dalton.autonomy.probes.internal import probe_internal
 from src.dalton.autonomy.probes.sec import probe_sec
 from src.dalton.database import watch as watch_db
+from src.dalton.llm.assist import assist_json
 from src.dalton.settings import get_dalton_settings
 
 logger = logging.getLogger(__name__)
@@ -56,13 +59,6 @@ TRIAGE_OUTPUT_SCHEMA: dict[str, Any] = {
     },
     "required": ["wake", "priority", "reason"],
 }
-
-
-async def assist_json(*args: Any, **kwargs: Any) -> Any:
-    """Delegate to ``src.dalton.llm.assist.assist_json`` for preflight LLM triage (G1.3 / G4.3)."""
-    from src.dalton.llm.assist import assist_json as _assist_json
-
-    return await _assist_json(*args, **kwargs)
 
 
 def is_direct_wake_signal(sig: dict[str, Any] | ProbeSignal) -> bool:
@@ -110,11 +106,13 @@ async def _triage_signals_with_llm(
     *,
     ticker: Optional[str],
     workspace_id: Optional[str],
+    user_id: Optional[str] = None,
     signals: list[dict[str, Any]],
     agenda_doc: Optional[dict[str, Any]] = None,
     watch_state: Optional[dict[str, Any]] = None,
+    persist: bool = True,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str]:
-    """Run single batch ``assist_json(task='preflight.triage')`` on non-direct signals (G4.3).
+    """Run single batch ``assist_json(task='preflight.triage')`` on non-direct signals (G4.3 / A2).
 
     Returns ``(kept_signals, skipped_signals, triage_reason)``.
     Conservative fallback: if ``assist_json`` fails, errors, or returns invalid data, all signals wake.
@@ -126,7 +124,7 @@ async def _triage_signals_with_llm(
     pillars_brief: list[str] = []
     open_questions_brief: list[str] = []
 
-    if workspace_id and not thesis_summary:
+    if persist and workspace_id and not thesis_summary:
         try:
             from src.dalton.database.knowledge import latest_valid_version
 
@@ -137,8 +135,8 @@ async def _triage_signals_with_llm(
                 for p in t_content.get("pillars") or []:
                     if isinstance(p, dict):
                         pillars_brief.append(f"{p.get('id', 'P')}: {p.get('name') or p.get('claim') or ''}")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("[DALTON_PREFLIGHT] latest_valid_version(thesis) failed: %s", e)
 
     if isinstance(agenda_doc, dict):
         for q in agenda_doc.get("open_questions") or []:
@@ -178,11 +176,11 @@ async def _triage_signals_with_llm(
     try:
         res = await assist_json(
             task="preflight.triage",
-            system_prompt=system_prompt,
-            user_input=user_payload,
-            output_schema=TRIAGE_OUTPUT_SCHEMA,
+            instructions=system_prompt,
+            payload=user_payload,
+            schema=TRIAGE_OUTPUT_SCHEMA,
+            user_id=str(user_id or "local-dev-user"),
             workspace_id=workspace_id,
-            ticker=ticker,
         )
     except Exception as e:
         logger.warning("[DALTON_PREFLIGHT] assist_json(preflight.triage) raised %s; conservative wake fallback", e)
@@ -345,23 +343,81 @@ def is_dalton_automation(automation: dict[str, Any]) -> bool:
     return name.startswith("dalton-") or (isinstance(meta, dict) and bool(meta.get("dalton_managed")))
 
 
-async def _check_budget_available() -> tuple[bool, Optional[str]]:
-    """Return (False, 'budget_exhausted') if the shared daily USD budget is exhausted."""
+async def _check_budget_available(user_id: Optional[str] = None) -> tuple[bool, Optional[str]]:
+    """Return (False, 'budget_exhausted') if the shared daily USD budget is exhausted (A1, A14)."""
     try:
         from src.dalton.budget.service import get_budget_today
 
-        snap = await get_budget_today()
-        cap = float(snap.get("daily_cap_usd") or 0.0)
-        spent = float(snap.get("spent_today_usd") or 0.0)
-        reserved = float(snap.get("reserved_usd") or 0.0)
+        snap = await get_budget_today(user_id=user_id)
+        cap = float(
+            snap["cap_usd"]
+            if "cap_usd" in snap and snap["cap_usd"] is not None
+            else (snap.get("daily_cap_usd") or 0.0)
+        )
+        spent = float(
+            snap["spent_usd"]
+            if "spent_usd" in snap and snap["spent_usd"] is not None
+            else (snap.get("spent_today_usd") or 0.0)
+        )
+        reserved = float(
+            snap["open_reserved_usd"]
+            if "open_reserved_usd" in snap and snap["open_reserved_usd"] is not None
+            else (snap.get("reserved_usd") or 0.0)
+        )
         if cap > 0 and (spent + reserved) >= cap:
             return False, "budget_exhausted"
     except Exception as e:
-        logger.debug("[DALTON_PREFLIGHT] budget check skipped: %s", e)
+        logger.warning("[DALTON_PREFLIGHT] budget check failed: %s", e)
     return True, None
 
 
-async def preflight_check(
+async def _defer_once_automation_on_budget_exhausted(
+    automation: dict[str, Any],
+    *,
+    persist: bool,
+) -> None:
+    """Postpone a one-time (`once`) automation by +1 day when skipped due to budget exhaustion (A9)."""
+    if str(automation.get("trigger_type") or "") != "once":
+        return
+    base_dt: datetime
+    raw_next = automation.get("next_run_at") or automation.get("last_run_at")
+    if isinstance(raw_next, datetime):
+        base_dt = raw_next if raw_next.tzinfo is not None else raw_next.replace(tzinfo=timezone.utc)
+    elif isinstance(raw_next, str) and raw_next.strip():
+        try:
+            parsed = datetime.fromisoformat(raw_next.strip().replace("Z", "+00:00"))
+            base_dt = parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+        except ValueError:
+            base_dt = datetime.now(timezone.utc)
+    else:
+        base_dt = datetime.now(timezone.utc)
+
+    deferred_dt = base_dt + timedelta(days=1)
+    automation["next_run_at"] = deferred_dt
+    automation["status"] = "active"
+
+    automation_id = str(automation.get("automation_id") or "") or None
+    if persist and automation_id:
+        try:
+            from src.server.database.pool import get_db_connection
+
+            async with get_db_connection() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        """
+                        UPDATE automations
+                        SET status = 'active',
+                            next_run_at = COALESCE(next_run_at, last_run_at, NOW()) + INTERVAL '1 day'
+                        WHERE automation_id = %s
+                          AND status IN ('active', 'executing')
+                        """,
+                        (automation_id,),
+                    )
+        except Exception as e:
+            logger.warning("[DALTON_PREFLIGHT] defer once automation failed for %s: %s", automation_id, e)
+
+
+async def _preflight_check_inner(
     automation: dict[str, Any],
     execution_id: str,
     *,
@@ -369,8 +425,9 @@ async def preflight_check(
     agenda_doc_override: Optional[dict[str, Any]] = None,
     persist: bool = True,
 ) -> PreflightResult:
-    """Run zero-token preflight + optional LLM triage for a Dalton automation firing (PK.16 / G4)."""
-    if not get_dalton_settings().autonomy.enabled:
+    """Inner implementation of `preflight_check` wrapped by `asyncio.wait_for` (A3)."""
+    settings = get_dalton_settings()
+    if not settings.autonomy.enabled:
         return PreflightResult(should_wake=True, decision="passthrough", reason="autonomy_disabled")
 
     if not is_dalton_automation(automation):
@@ -378,9 +435,15 @@ async def preflight_check(
 
     automation_id = str(automation.get("automation_id") or "") or None
     workspace_id = str(automation["workspace_id"]) if automation.get("workspace_id") else None
+    user_id = str(automation.get("user_id") or "local-dev-user")
     name = str(automation.get("name") or "dalton-task")
     ticker = _extract_ticker(automation)
     kind = _determine_kind(automation)
+
+    try:
+        tz = ZoneInfo(settings.autonomy.timezone)
+    except Exception:
+        tz = timezone.utc
 
     # Price triggers are already event-driven by upstream price monitor
     if automation.get("trigger_type") == "price" or kind == "price_move":
@@ -399,13 +462,14 @@ async def preflight_check(
             wake_context=wake_ctx,
         )
 
-    # Check shared daily USD cap before running probes or waking sandbox
+    # Check shared daily USD cap before running probes or waking sandbox (A1)
     budget_ok, budget_reason = (True, None)
     if persist:
-        budget_ok, budget_reason = await _check_budget_available()
+        budget_ok, budget_reason = await _check_budget_available(user_id=user_id)
     elif isinstance(watch_state_override, dict) and watch_state_override.get("budget_exhausted"):
         budget_ok, budget_reason = (False, "budget_exhausted")
     if not budget_ok:
+        await _defer_once_automation_on_budget_exhausted(automation, persist=persist)
         if persist:
             try:
                 await watch_db.insert_preflight_log(
@@ -426,12 +490,12 @@ async def preflight_check(
             wake_context=None,
         )
 
-    # Expire unresolved signals older than 7 days (G4.2)
+    # Expire unresolved signals older than 7 days (G4.2 / A14)
     if persist:
         try:
             await watch_db.expire_old_signals(max_age_days=7, workspace_id=workspace_id)
         except Exception as e:
-            logger.debug("[DALTON_PREFLIGHT] expire_old_signals skipped: %s", e)
+            logger.warning("[DALTON_PREFLIGHT] expire_old_signals failed: %s", e)
 
     # Load watch state
     state: dict[str, Any] = {}
@@ -449,13 +513,18 @@ async def preflight_check(
         sigs, state = await probe_calendar(watch_state=state)
         emitted.extend(sigs)
     elif kind in ("director_daily", "director_weekly"):
-        sigs, state = await probe_director(kind=kind, watch_state=state)
+        sigs, state = await probe_director(
+            kind=kind,
+            watch_state=state,
+            persist=persist,
+            agenda_docs_override=[agenda_doc_override] if isinstance(agenda_doc_override, dict) else None,
+        )
         emitted.extend(sigs)
     elif kind in ("weekly_delta", "earnings_window", "custom_dalton"):
         emitted.append(
             ProbeSignal(
                 probe="schedule",
-                signal_key=f"{kind}:{datetime.now(timezone.utc).date().isoformat()}",
+                signal_key=f"{kind}:{datetime.now(tz).date().isoformat()}",
                 priority="P1",
                 summary=f"{ticker or name} 计划任务唤醒（{kind}）",
                 payload={"kind": kind},
@@ -499,6 +568,7 @@ async def preflight_check(
                     ticker=t_sym,
                     watch_state=st,
                     workspace_id=eff_ws_id,
+                    allow_network=persist,
                 ),
             ),
         ]
@@ -532,7 +602,7 @@ async def preflight_check(
         except Exception as e:
             logger.warning("[DALTON_PREFLIGHT] upsert_watch_state failed: %s", e)
 
-    # Deduplicate against dalton_signals (idempotent by workspace_id, probe, signal_key)
+    # Deduplicate against dalton_signals (idempotent by workspace_id, probe, signal_key; A10)
     candidate_signals: list[dict[str, Any]] = []
 
     if persist:
@@ -611,10 +681,12 @@ async def preflight_check(
     if triage_candidates:
         triage_kept, triage_skipped, triage_reason = await _triage_signals_with_llm(
             ticker=ticker,
-            workspace_id=workspace_id if persist else None,
+            workspace_id=workspace_id,
+            user_id=user_id,
             signals=triage_candidates,
             agenda_doc=agenda_doc_override,
             watch_state=state,
+            persist=persist,
         )
         if persist and triage_skipped:
             skipped_ids = [str(s["signal_id"]) for s in triage_skipped if s.get("signal_id")]
@@ -627,7 +699,7 @@ async def preflight_check(
                         resolved_by="preflight.triage:skip",
                     )
                 except Exception as e:
-                    logger.debug("[DALTON_PREFLIGHT] resolve triage-skipped signals failed: %s", e)
+                    logger.warning("[DALTON_PREFLIGHT] resolve triage-skipped signals failed: %s", e)
 
     woke_signals = direct_signals + triage_kept
 
@@ -653,12 +725,38 @@ async def preflight_check(
             wake_context=None,
         )
 
+    # Atomically claim unwoken signals (A10): filter out any signal already claimed by a concurrent execution
     signal_ids_to_mark = [str(s["signal_id"]) for s in woke_signals if s.get("signal_id")]
     if persist and signal_ids_to_mark:
         try:
-            await watch_db.mark_signals_woken(signal_ids_to_mark, execution_id)
+            claimed_ids = set(await watch_db.claim_signals_woken(signal_ids_to_mark, execution_id))
+            woke_signals = [
+                s
+                for s in woke_signals
+                if not s.get("signal_id") or str(s["signal_id"]) in claimed_ids
+            ]
+            if not woke_signals:
+                if persist:
+                    try:
+                        await watch_db.insert_preflight_log(
+                            automation_id=automation_id,
+                            automation_execution_id=execution_id,
+                            workspace_id=workspace_id,
+                            decision="skip",
+                            reason="already_claimed_by_concurrent_run",
+                            signals=[],
+                        )
+                    except Exception as e:
+                        logger.warning("[DALTON_PREFLIGHT] log insert failed: %s", e)
+                return PreflightResult(
+                    should_wake=False,
+                    decision="skip",
+                    reason="already_claimed_by_concurrent_run",
+                    signals=[],
+                    wake_context=None,
+                )
         except Exception as e:
-            logger.warning("[DALTON_PREFLIGHT] mark_signals_woken failed: %s", e)
+            logger.warning("[DALTON_PREFLIGHT] claim_signals_woken failed: %s", e)
 
     if persist:
         try:
@@ -685,6 +783,59 @@ async def preflight_check(
         signals=woke_signals,
         wake_context=wake_ctx,
     )
+
+
+async def preflight_check(
+    automation: dict[str, Any],
+    execution_id: str,
+    *,
+    watch_state_override: Optional[dict[str, Any]] = None,
+    agenda_doc_override: Optional[dict[str, Any]] = None,
+    persist: bool = True,
+    timeout_s: Optional[float] = None,
+) -> PreflightResult:
+    """Run zero-token preflight + optional LLM triage bounded by `preflight_timeout_s` (45s default, A3)."""
+    eff_timeout = float(
+        timeout_s
+        if timeout_s is not None
+        else (get_dalton_settings().autonomy.preflight_timeout_s or 45)
+    )
+    try:
+        return await asyncio.wait_for(
+            _preflight_check_inner(
+                automation,
+                execution_id,
+                watch_state_override=watch_state_override,
+                agenda_doc_override=agenda_doc_override,
+                persist=persist,
+            ),
+            timeout=eff_timeout,
+        )
+    except asyncio.TimeoutError:
+        name = str(automation.get("name") or "dalton-task")
+        ticker = _extract_ticker(automation)
+        logger.warning(
+            "[DALTON_PREFLIGHT] preflight_check timed out after %.1fs for %s; waking conservatively",
+            eff_timeout,
+            name,
+        )
+        timeout_sig = {
+            "probe": "preflight",
+            "signal_key": f"timeout:{execution_id[:8]}",
+            "priority": "P1",
+            "summary": f"预检超时（>{eff_timeout:g}s），保守唤醒分析师",
+        }
+        return PreflightResult(
+            should_wake=True,
+            decision="wake",
+            reason="preflight_timeout",
+            signals=[timeout_sig],
+            wake_context=format_wake_directive(
+                automation_name=name,
+                ticker=ticker,
+                signals=[timeout_sig],
+            ),
+        )
 
 
 async def decide(
