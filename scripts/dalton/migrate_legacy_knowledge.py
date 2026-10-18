@@ -877,15 +877,24 @@ def build_knowledge_documents(bundle: dict[str, Any]) -> tuple[dict[str, dict[st
                 json.dumps(dc_deb, ensure_ascii=False),
             )
 
-    # Also migrate `## 已知观点池` bullets into `thesis.evidence` so every sell-side/expert view in the pool is preserved!
-    vp_sec = next((v for k, v in sections.items() if "已知观点池" in k), None)
-    if vp_sec:
-        for lno, ltxt in vp_sec["lines"]:
+    # Also migrate remaining section bullets (including `## 已知观点池`, `## 一致预期与市场锚点`,
+    # `## 关键指标与阈值`, `## 指引节奏`, `## 专家来源可靠性`, etc.) into `thesis.evidence`
+    # so every factual bullet in legacy `thesis.md` is preserved in `thesis.json`.
+    existing_ev_facts = {e.get("fact", "").strip() for e in evidence_list}
+    for sec_title, sec_data in sections.items():
+        for lno, ltxt in sec_data.get("lines", []):
             s = ltxt.strip()
             if s.startswith("- "):
                 body = s[2:].strip()
+                if not body or body in existing_ev_facts:
+                    continue
+                existing_ev_facts.add(body)
                 ev_id = next_ev_id()
-                org_label = body.split("：", 1)[0].strip() if "：" in body else f"OpenClaw View Pool L{lno}"
+                org_label = (
+                    body.split("：", 1)[0].strip()
+                    if "：" in body
+                    else f"OpenClaw {sec_title} L{lno}"
+                )
                 evidence_list.append(
                     {
                         "id": ev_id,

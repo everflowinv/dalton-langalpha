@@ -372,10 +372,13 @@ def _ensure_nested_ids_and_defaults(
                     evidence_ids=evidence_ids,
                 )
         for idx, v in enumerate(doc["next_validations"]):
-            if isinstance(v, dict) and not v.get("id"):
-                v["id"] = next_item_id(
-                    "next_validations", doc["next_validations"][:idx], now=now
-                )
+            if isinstance(v, dict):
+                if not v.get("id"):
+                    v["id"] = next_item_id(
+                        "next_validations", doc["next_validations"][:idx], now=now
+                    )
+                v.setdefault("status", "pending")
+                v.setdefault("expected", str(v.get("what") or ""))
         watch = doc.get("watch")
         if isinstance(watch, dict) and isinstance(watch.get("events"), list):
             for idx, ev in enumerate(watch["events"]):

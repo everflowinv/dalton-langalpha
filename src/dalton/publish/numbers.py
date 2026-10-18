@@ -894,8 +894,11 @@ async def label_figures_with_status(
     footnotes = parse_footnotes(markdown_text)
     lines = markdown_text.splitlines()
 
+    unlabeled_figs = [f for f in figures if not f.metric or not f.period]
+    prioritized_figs = (unlabeled_figs if unlabeled_figs else figures)[:10]
+
     payload = {
-        "markdown_excerpt": markdown_text[:8000],
+        "markdown_excerpt": markdown_text[:3000],
         "extracted_figures": [
             {
                 "id": f.id,
@@ -910,7 +913,7 @@ async def label_figures_with_status(
                 "line": f.location.get("line"),
                 "sentence": f.location.get("sentence"),
             }
-            for f in figures[:120]
+            for f in prioritized_figs
         ],
     }
     res = await assist_json(
@@ -930,6 +933,7 @@ async def label_figures_with_status(
         schema=FigureLabels.model_json_schema(),
         user_id=user_id,
         llm_service=llm_service,
+        timeout_s=90.0,
     )
     if not res.ok or not res.data:
         return figures, False
@@ -944,11 +948,11 @@ async def label_figures_with_status(
         target = by_id.get(item.id)
         if target is None:
             continue
-        if item.metric:
+        if item.metric and not re.search(r"[A-Za-z]{2,}|[\u4e00-\u9fff]{2,}", target.metric or ""):
             target.metric = item.metric
-        if item.period:
+        if item.period and not target.period:
             target.period = normalize_period(item.period) or item.period
-        if item.unit:
+        if item.unit and target.unit == "other":
             target.unit = item.unit
         if item.kind and item.kind.lower() in _VALID_LABEL_KINDS:
             target.label_hint = item.kind.lower()

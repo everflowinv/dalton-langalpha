@@ -253,6 +253,8 @@ def _classify_exception(exc: BaseException) -> tuple[str, str]:
             "no model configured",
             "not logged in",
             "no valid oauth token",
+            "oauth_required",
+            "requires a connected",
             "unsupported sdk",
         )
     ):
@@ -279,6 +281,32 @@ def _classify_exception(exc: BaseException) -> tuple[str, str]:
     return "indeterminate", "stream_cut"
 
 
+def _unwrap_content_blocks(val: Any) -> str:
+    """Convert a string or LangChain list of content blocks (`[{'type': 'text', 'text': '...'}]`) into plain text."""
+    if isinstance(val, list):
+        parts: list[str] = []
+        for item in val:
+            if isinstance(item, dict) and item.get("type") == "text":
+                parts.append(str(item.get("text") or ""))
+            elif isinstance(item, str):
+                parts.append(item)
+        if parts:
+            return "".join(parts)
+    if isinstance(val, str):
+        stripped = val.strip()
+        if stripped.startswith("[{") and stripped.endswith("}]") and "'text'" in stripped:
+            try:
+                import ast
+
+                parsed_blocks = ast.literal_eval(stripped)
+                if isinstance(parsed_blocks, list):
+                    return _unwrap_content_blocks(parsed_blocks)
+            except Exception:
+                pass
+        return val
+    return str(val if val is not None else "")
+
+
 def _serialize_response_payload(raw_out: Any) -> tuple[dict[str, Any], Any, str | None]:
     """Convert `LLMService.complete` output into `(json_dict_for_db, parsed_data, text)`."""
     if isinstance(raw_out, BaseModel):
@@ -286,7 +314,7 @@ def _serialize_response_payload(raw_out: Any) -> tuple[dict[str, Any], Any, str 
         return {"kind": "structured", "data": dumped}, raw_out, json.dumps(dumped, ensure_ascii=False)
     if isinstance(raw_out, dict):
         return {"kind": "json", "data": raw_out}, raw_out, json.dumps(raw_out, ensure_ascii=False)
-    text_val = str(raw_out if raw_out is not None else "")
+    text_val = _unwrap_content_blocks(raw_out)
     return {"kind": "text", "text": text_val}, None, text_val
 
 
@@ -296,7 +324,7 @@ def _deserialize_cached_response(
 ) -> tuple[Any, str | None]:
     """Restore `(data, text)` from `dalton_llm_journal.response`."""
     if not isinstance(stored, dict):
-        text_val = str(stored or "")
+        text_val = _unwrap_content_blocks(stored)
         return None, text_val
 
     if isinstance(response_schema, type) and issubclass(response_schema, BaseModel):
@@ -313,7 +341,7 @@ def _deserialize_cached_response(
         return data_val, json.dumps(data_val, ensure_ascii=False) if isinstance(data_val, dict) else str(data_val)
 
     if "text" in stored:
-        text_val = str(stored.get("text") or "")
+        text_val = _unwrap_content_blocks(stored.get("text"))
         return None, text_val
 
     return stored, json.dumps(stored, ensure_ascii=False)
@@ -419,6 +447,10 @@ async def dalton_complete(
         f"{purpose}:"
         + hashlib.sha256(f"{system_prompt or ''}\n{user_prompt}".encode("utf-8")).hexdigest()[:24]
     )
+    if workspace_id and str(workspace_id) not in eff_scope:
+        eff_scope = f"{eff_scope}@ws:{workspace_id}"
+    if thread_id and str(thread_id) not in eff_scope:
+        eff_scope = f"{eff_scope}@th:{thread_id}"
     computed_inv_id, request_hash = compute_invocation_id_and_hash(
         scope_ref=eff_scope,
         purpose=purpose,

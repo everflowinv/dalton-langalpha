@@ -180,6 +180,41 @@ async def _repair_ops_paths_with_assist(
     return repaired, warnings
 
 
+def _schema_props_for_path(schema_obj: dict[str, Any], err_path: str) -> list[str]:
+    """Return allowed property names for the schema container at ``err_path`` (resolving local ``#/$defs/``)."""
+    defs = schema_obj.get("$defs") or {}
+
+    def _deref(node: Any) -> dict[str, Any]:
+        if not isinstance(node, dict):
+            return {}
+        ref = node.get("$ref")
+        if isinstance(ref, str) and ref.startswith("#/$defs/"):
+            def_name = ref.split("#/$defs/", 1)[1]
+            target = defs.get(def_name)
+            if isinstance(target, dict):
+                return target
+        return node
+
+    curr: dict[str, Any] = _deref(schema_obj)
+    for seg in [s for s in str(err_path or "/").split("/") if s]:
+        curr = _deref(curr)
+        if seg.isdigit():
+            items_node = curr.get("items")
+            curr = _deref(items_node)
+        else:
+            props = curr.get("properties") or {}
+            if seg in props:
+                curr = _deref(props[seg])
+            elif isinstance(curr.get("items"), dict):
+                item_schema = _deref(curr["items"])
+                item_props = item_schema.get("properties") or {}
+                curr = _deref(item_props.get(seg, {}))
+            else:
+                return []
+    curr = _deref(curr)
+    return [k for k in (curr.get("properties") or {}).keys() if k != "official"]
+
+
 async def _repair_doc_schema_with_assist(
     doc_key: str,
     doc: dict[str, Any],
@@ -195,17 +230,29 @@ async def _repair_doc_schema_with_assist(
 
     schemas, _ = _load_schemas_and_registry()
     schema_obj = schemas.get(doc_key, {})
-    schema_props = [k for k in (schema_obj.get("properties") or {}).keys() if k != "official"]
 
     bad_doc_fields: list[str] = []
+    candidate_valid_props: list[str] = []
+    path_valid_map: dict[str, list[str]] = {}
     for err in errors:
         err_path = str(err.get("path") or "/")
+        valid_here = _schema_props_for_path(schema_obj, err_path)
+        if not valid_here:
+            valid_here = [k for k in (schema_obj.get("properties") or {}).keys() if k != "official"]
+        path_valid_map[err_path] = valid_here
+        for vp in valid_here:
+            if vp not in candidate_valid_props:
+                candidate_valid_props.append(vp)
         target_obj = _resolve_container_at_path(doc, err_path)
         if isinstance(target_obj, dict):
             for k in target_obj.keys():
-                if k not in schema_props and str(k) not in bad_doc_fields:
+                if k not in valid_here and str(k) not in bad_doc_fields:
                     bad_doc_fields.append(str(k))
-    difflib_suggestions = suggest_close_fields(bad_doc_fields, schema_props)
+
+    if not bad_doc_fields:
+        return warnings
+
+    difflib_suggestions = suggest_close_fields(bad_doc_fields, candidate_valid_props)
 
     res = await assist_json(
         task="knowledge.repair_field",
@@ -217,7 +264,7 @@ async def _repair_doc_schema_with_assist(
             "doc_key": doc_key,
             "errors": errors,
             "difflib_suggestions": difflib_suggestions,
-            "schema_properties": schema_props,
+            "schema_properties": candidate_valid_props,
         },
         schema=_REPAIR_FIELD_SCHEMA,
         user_id=user_id,
@@ -233,11 +280,12 @@ async def _repair_doc_schema_with_assist(
 
     for err in errors:
         err_path = str(err.get("path") or "/")
+        valid_here = path_valid_map.get(err_path) or candidate_valid_props
         target_obj = _resolve_container_at_path(doc, err_path)
         if not isinstance(target_obj, dict):
             continue
         for bad_k, good_k in list(mappings.items()):
-            if bad_k in target_obj and good_k not in target_obj:
+            if bad_k in target_obj and bad_k not in valid_here and good_k in valid_here and good_k not in target_obj:
                 target_obj[good_k] = target_obj.pop(bad_k)
                 warnings.append(
                     {

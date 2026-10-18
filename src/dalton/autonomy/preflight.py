@@ -729,7 +729,12 @@ async def _preflight_check_inner(
     signal_ids_to_mark = [str(s["signal_id"]) for s in woke_signals if s.get("signal_id")]
     if persist and signal_ids_to_mark:
         try:
-            claimed_ids = set(await watch_db.claim_signals_woken(signal_ids_to_mark, execution_id))
+            claimed_raw = await watch_db.claim_signals_woken(signal_ids_to_mark, execution_id)
+            claimed_ids = {
+                str(r.get("signal_id") if isinstance(r, dict) else r)
+                for r in (claimed_raw or [])
+                if (r.get("signal_id") if isinstance(r, dict) else r)
+            }
             woke_signals = [
                 s
                 for s in woke_signals
