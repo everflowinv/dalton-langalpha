@@ -1,0 +1,11 @@
+{
+  "name": "Dalton 研究总监 · 每日排程",
+  "description": "每日 07:30（Asia/Shanghai）读全覆盖看板，按价值与紧迫度在今日额度内排程派单并刷新 coverage.html",
+  "status": "active",
+  "trigger_type": "cron",
+  "cron_expression": "30 7 * * 1-5",
+  "timezone": "Asia/Shanghai",
+  "instruction": "运行 dalton-research-director：先读 .agents/skills/dalton-research-director/SKILL.md，调用 dalton_coverage_board 读看板，按价值与紧迫度在今日额度内排程并派单（delegate_to_analyst），调用 dalton_record_plan 记录计划，运行 render_coverage.py 刷新覆盖总览 dalton/coverage.html，并清理 14 天前已完成的 once 自动任务。",
+  "workspace_id": "home",
+  "thread": "new"
+}

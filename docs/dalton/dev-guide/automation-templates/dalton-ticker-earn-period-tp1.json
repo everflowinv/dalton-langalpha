@@ -1,0 +1,12 @@
+{
+  "name": "<TICKER> <PERIOD> 财报深度链（T+1）",
+  "description": "财报发布后 T+1 交易日 20:00 触发八节点评、模型更新、thesis 校准与前瞻对账",
+  "status": "active",
+  "trigger_type": "once",
+  "next_run_at": "2026-10-29T20:00:00-04:00",
+  "timezone": "America/New_York",
+  "instruction": "/dalton-earnings-deep <TICKER> <PERIOD> 发布日 <EARNINGS_DATE>。先读 .agents/skills/dalton-earnings-deep/SKILL.md 与 .agents/skills/run-workflow/SKILL.md，跑 earnings-deep-update workflow（模型：data/models.json 登记的当前版本；前瞻预测：research/ 下 preview-<PERIOD>/predictions.json），结束后按 knowledge-revision.json 写知识层，并按 .agents/skills/dalton-agenda/SKILL.md 收尾三步结束。",
+  "workspace_id": "<WORKSPACE_ID>",
+  "thread": "new",
+  "delivery": ["<PM_DELIVERY_CHANNEL>"]
+}

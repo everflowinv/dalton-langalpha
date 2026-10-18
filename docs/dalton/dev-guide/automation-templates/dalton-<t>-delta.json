@@ -1,0 +1,12 @@
+{
+  "name": "<TICKER> 每晚 thesis 增量（dalton-<t>-delta.json）",
+  "description": "每晚收一致预期与内部库增量包（后端 consensus/sec/internal/price 探针零成本预检），无重要变化不推送",
+  "status": "active",
+  "trigger_type": "cron",
+  "cron_expression": "30 21 * * 1-5",
+  "timezone": "America/New_York",
+  "instruction": "/dalton-thesis-delta <TICKER> —— 已由预检唤醒：先读 .agents/skills/dalton-thesis-delta/SKILL.md 与 <dalton_wake> 的信号，再跑 collect.py；按 materiality.md 判断，重要才推送；收尾按 .agents/skills/dalton-agenda/SKILL.md 三步。",
+  "workspace_id": "<WORKSPACE_ID>",
+  "thread": "new",
+  "delivery": ["<PM_DELIVERY_CHANNEL>"]
+}

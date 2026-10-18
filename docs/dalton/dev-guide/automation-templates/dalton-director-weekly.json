@@ -1,0 +1,12 @@
+{
+  "name": "周会稿（dalton-director-weekly.json）",
+  "description": "每周六 10:00（Asia/Shanghai）运行 weekly-coverage-review workflow 产出覆盖周报与股价归因",
+  "status": "active",
+  "trigger_type": "cron",
+  "cron_expression": "0 10 * * 6",
+  "timezone": "Asia/Shanghai",
+  "instruction": "/weekly-review 本周 —— 先读 .agents/skills/dalton-weekly-review/SKILL.md 与 .agents/skills/run-workflow/SKILL.md；窗口终点取最近一个完整交易日；跑 weekly-coverage-review workflow；完成后按 dalton-research-director 的周会规则：提案交给各公司分析师确认（delegate_to_analyst，已开 auto_approve_handoffs），统计各公司本周五词分布，把“本周判断”和“Conviction call”推送 PM。周会稿留在 Home/dalton/drafts/，不走 publish_report（Home 没有发布工具）。",
+  "workspace_id": "home",
+  "thread": "new",
+  "delivery": ["<PM_DELIVERY_CHANNEL>"]
+}

@@ -1,0 +1,11 @@
+{
+  "name": "<TICKER> <PERIOD> 财报前瞻（T-3）",
+  "description": "官方财报发布前 3 个交易日 08:00 触发财报前瞻与结构化预测 predictions.json",
+  "status": "active",
+  "trigger_type": "once",
+  "next_run_at": "2026-10-23T08:00:00-04:00",
+  "timezone": "America/New_York",
+  "instruction": "/dalton-earnings-preview <TICKER> <PERIOD> 发布日 <EARNINGS_DATE> <TIMING>（来源：<IR_URL>）。先读 .agents/skills/dalton-earnings-preview/SKILL.md；收尾按 .agents/skills/dalton-agenda/SKILL.md 三步。",
+  "workspace_id": "<WORKSPACE_ID>",
+  "thread": "new"
+}
