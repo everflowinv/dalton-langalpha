@@ -145,6 +145,8 @@ def main(argv: list[str] | None = None) -> int:
         "warnings": warnings,
     }
     print(json.dumps(result, indent=2, ensure_ascii=False))
+    if any(w.get("code") == "role_forbidden_model" for w in warnings):
+        return 1
     return 0
 
 

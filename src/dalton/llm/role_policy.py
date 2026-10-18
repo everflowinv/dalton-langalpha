@@ -196,14 +196,22 @@ async def explain_model_availability(
     except Exception:
         pass
 
-    # Query user BYOK keys if available
+    # Query user BYOK keys if available (get_user_api_keys returns {"byok_enabled", "keys": {prov: key}, "base_urls"})
     byok_providers: set[str] = set()
     try:
         from src.server.database.api_keys import get_user_api_keys
 
         rows = await get_user_api_keys(user_id)
         if isinstance(rows, dict):
-            byok_providers = {k for k, v in rows.items() if v}
+            keys_map = rows.get("keys")
+            if isinstance(keys_map, dict):
+                byok_providers = {str(p) for p, v in keys_map.items() if v}
+            else:
+                byok_providers = {
+                    str(k)
+                    for k, v in rows.items()
+                    if k not in ("byok_enabled", "keys", "base_urls") and v
+                }
         elif isinstance(rows, list):
             for r in rows:
                 if isinstance(r, dict) and r.get("provider"):
@@ -314,6 +322,23 @@ def select_independent_reviewer(
     return None
 
 
+class RolePolicyError(RuntimeError):
+    """Raised when a forbidden model (e.g. contributor OAuth variant, L21) is assigned to any role."""
+
+
+def _load_default_agent_config() -> dict[str, Any]:
+    cfg_path = REPO_ROOT / "agent_config.dalton.yaml"
+    if not cfg_path.exists():
+        return {}
+    try:
+        import yaml
+
+        loaded = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+        return loaded if isinstance(loaded, dict) else {}
+    except Exception:
+        return {}
+
+
 def check_roles(
     config: dict[str, Any] | None = None,
     *,
@@ -322,10 +347,15 @@ def check_roles(
 ) -> list[dict[str, str]]:
     """Validate role model assignments against family independence, forbidden models, and text-only rules.
 
+    Validates all roles (`lead`, `assist`, `background`, `compaction`, `fetch`, `fallback`,
+    `subagent:*`, and `reviewer`). `assist` does not require tool calling (`require_tool_calling=False`),
+    while `lead` and `subagent:*` require tool calling. Contributor OAuth variants (`L21`) are
+    strictly forbidden in EVERY role.
+
     Returns a list of warning dicts `{"code", "role", "model", "message", "link"}`.
     """
     warnings: list[dict[str, str]] = []
-    cfg = config or {}
+    cfg = config if config is not None else _load_default_agent_config()
     llm_cfg = cfg.get("llm") if isinstance(cfg.get("llm"), dict) else cfg
     lead_model = str(
         llm_cfg.get("name")
@@ -365,6 +395,59 @@ def check_roles(
                 "link": "/settings?tab=model",
             }
         )
+
+    # Validate auxiliary LLM slots: assist, background, compaction, fetch (P0H §4 P3)
+    # Note: assist (and compaction/background) are non-tool structured/background slots,
+    # so they do not require tool-calling, but they MUST NOT use forbidden contributor models.
+    aux_slots: list[tuple[str, str]] = [
+        ("assist", str(llm_cfg.get("assist") or "").strip()),
+        ("background", str(llm_cfg.get("background") or "").strip()),
+        (
+            "compaction",
+            str(llm_cfg.get("compaction") or llm_cfg.get("summarization") or "").strip(),
+        ),
+        ("fetch", str(llm_cfg.get("fetch") or "").strip()),
+    ]
+    for role_name, role_model in aux_slots:
+        if not role_model:
+            continue
+        if is_forbidden_for_roles(role_model):
+            warnings.append(
+                {
+                    "code": "role_forbidden_model",
+                    "role": role_name,
+                    "model": role_model,
+                    "message": f"角色 {role_name} 配置了禁用变体 {role_model}（contributor 变体可能用于训练，L21 严禁用于任何基金研究角色）。",
+                    "link": "/settings?tab=model",
+                }
+            )
+        if available_models is not None and role_model not in available_models:
+            warnings.append(
+                {
+                    "code": "role_model_unavailable",
+                    "role": role_name,
+                    "model": role_model,
+                    "message": f"角色 {role_name} 模型 {role_model} 当前不可用（凭据未配置或供应商已关闭）。",
+                    "link": "/settings?tab=model",
+                }
+            )
+
+    fallback_list = llm_cfg.get("fallback")
+    if isinstance(fallback_list, list):
+        for fb_item in fallback_list:
+            fb_model = str(fb_item or "").strip()
+            if not fb_model:
+                continue
+            if is_forbidden_for_roles(fb_model):
+                warnings.append(
+                    {
+                        "code": "role_forbidden_model",
+                        "role": "fallback",
+                        "model": fb_model,
+                        "message": f"后备模型列表包含禁用变体 {fb_model}（L21 严禁用于任何基金研究角色）。",
+                        "link": "/settings?tab=model",
+                    }
+                )
 
     subagents_cfg = (
         (cfg.get("subagents") or {}).get("definitions")
@@ -411,6 +494,19 @@ def check_roles(
                     }
                 )
 
+    if reviewer_models:
+        for rev_cand in reviewer_models:
+            if is_forbidden_for_roles(rev_cand):
+                warnings.append(
+                    {
+                        "code": "role_forbidden_model",
+                        "role": "reviewer",
+                        "model": rev_cand,
+                        "message": f"审稿候选模型 {rev_cand} 为 contributor 禁用变体（L21 严禁用于任何基金研究角色）。",
+                        "link": "/settings?tab=model",
+                    }
+                )
+
     chosen_reviewer = select_independent_reviewer(
         lead_model,
         reviewer_models,
@@ -429,3 +525,14 @@ def check_roles(
         )
 
     return warnings
+
+
+def enforce_role_policy_on_startup(config: dict[str, Any] | None = None) -> list[dict[str, str]]:
+    """Validate role assignments at backend startup; raise `RolePolicyError` if any role uses a forbidden model (P0H §4 P3)."""
+    warnings = check_roles(config)
+    forbidden = [w for w in warnings if w.get("code") == "role_forbidden_model"]
+    if forbidden:
+        details = "; ".join(f"{w.get('role')}={w.get('model')}: {w.get('message')}" for w in forbidden)
+        raise RolePolicyError(f"Role policy violation on startup (L21): {details}")
+    return warnings
+

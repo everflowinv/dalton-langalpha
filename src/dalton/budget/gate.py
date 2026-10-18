@@ -136,7 +136,15 @@ async def enforce_local_admission(user_id: str, byok: bool = False) -> None:
 
 
 async def verify_local_wiring() -> None:
-    """Startup assertion for Dalton local budget gate (P0.8 §8). Never raises."""
+    """Startup assertion for Dalton local budget gate and role policy (P0.8 §8, P0H §4 P3).
+
+    Raises `RolePolicyError` if any role (including `assist`, `background`, `compaction`,
+    `fetch`, `lead`, `subagent:*`) is configured with a forbidden contributor model (L21).
+    """
+    from src.dalton.llm.role_policy import enforce_role_policy_on_startup
+
+    enforce_role_policy_on_startup()
+
     try:
         if not is_dalton_budget_gate_enabled():
             logger.warning(

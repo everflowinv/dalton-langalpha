@@ -49,14 +49,19 @@ LONG_READ_OPERATIONS: frozenset[str] = frozenset(
         "get-document",
         "get_transcript",
         "get-transcript",
+        "transcript",
         "read_filing",
         "read-filing",
+        "search-text",
+        "search_text",
+        "attachments",
+        "financials",
         "download_document",
         "download-document",
     }
 )
 
-# Route-level (default_s, max_s) timeout budgets aligned with R3-2 (240s default, 600s full-text reads)
+# Route-level (default_s, max_s) timeout budgets aligned with P0-D.1 §274 & R3-2 (240s default, 600s full-text reads)
 ROUTE_TIMEOUTS: dict[str, tuple[int, int]] = {
     "catalog": (15, 30),
     "company-wiki": (DEFAULT_ROUTE_TIMEOUT_S, DEFAULT_ROUTE_TIMEOUT_S),
@@ -68,13 +73,17 @@ ROUTE_TIMEOUTS: dict[str, tuple[int, int]] = {
     "alphaengine": (DEFAULT_ROUTE_TIMEOUT_S, DEFAULT_ROUTE_TIMEOUT_S),
     "alphaengine:get_document": (LONG_READ_TIMEOUT_S, LONG_READ_TIMEOUT_S),
     "alphaengine:download_document": (LONG_READ_TIMEOUT_S, LONG_READ_TIMEOUT_S),
-    "guidepoint": (DEFAULT_ROUTE_TIMEOUT_S, DEFAULT_ROUTE_TIMEOUT_S),
-    "transcript": (DEFAULT_ROUTE_TIMEOUT_S, DEFAULT_ROUTE_TIMEOUT_S),
+    "guidepoint": (LONG_READ_TIMEOUT_S, LONG_READ_TIMEOUT_S),
+    "transcript": (LONG_READ_TIMEOUT_S, LONG_READ_TIMEOUT_S),
+    "transcript:transcript": (LONG_READ_TIMEOUT_S, LONG_READ_TIMEOUT_S),
     "transcript:get_transcript": (LONG_READ_TIMEOUT_S, LONG_READ_TIMEOUT_S),
     "transcript:read": (LONG_READ_TIMEOUT_S, LONG_READ_TIMEOUT_S),
     "sec": (DEFAULT_ROUTE_TIMEOUT_S, DEFAULT_ROUTE_TIMEOUT_S),
     "sec:read-item": (LONG_READ_TIMEOUT_S, LONG_READ_TIMEOUT_S),
     "sec:read_filing": (LONG_READ_TIMEOUT_S, LONG_READ_TIMEOUT_S),
+    "sec:search-text": (LONG_READ_TIMEOUT_S, LONG_READ_TIMEOUT_S),
+    "sec:attachments": (LONG_READ_TIMEOUT_S, LONG_READ_TIMEOUT_S),
+    "sec:financials": (LONG_READ_TIMEOUT_S, LONG_READ_TIMEOUT_S),
     "estimates": (DEFAULT_ROUTE_TIMEOUT_S, DEFAULT_ROUTE_TIMEOUT_S),
     "fred": (DEFAULT_ROUTE_TIMEOUT_S, DEFAULT_ROUTE_TIMEOUT_S),
     "treasury": (DEFAULT_ROUTE_TIMEOUT_S, DEFAULT_ROUTE_TIMEOUT_S),
@@ -145,8 +154,9 @@ class BridgeConfig:
         self.max_inflight: int = max(
             1, int(os.environ.get("DALTON_BRIDGE_MAX_INFLIGHT", "2"))
         )
+        # Default 300s matches P0-D.1 §229 and agent_config.dalton.yaml call_timeout_s=300
         self.caller_budget_s: int = max(
-            35, int(os.environ.get("DALTON_BRIDGE_CALLER_BUDGET_S", "625"))
+            35, int(os.environ.get("DALTON_BRIDGE_CALLER_BUDGET_S", "300"))
         )
         self.usage_file: Path = Path(
             os.environ.get(

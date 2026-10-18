@@ -36,18 +36,19 @@ MUSE_TOKEN_URL = "https://auth.meta.com/oidc/device/token/"
 MUSE_DEVICE_GRANT = "urn:ietf:params:oauth:grant-type:device_code"
 
 
-def _record_provider_event_safe(user_id: str | None, kind: str, detail: dict) -> None:
+async def _record_provider_event_safe(user_id: str | None, kind: str, detail: dict) -> None:
     try:
         from src.dalton.database.provider_events import record_provider_event
 
-        record_provider_event(
+        await record_provider_event(
             provider=MUSE_PROVIDER,
             kind=kind,
             user_id=user_id,
             detail=detail,
+            best_effort=True,
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("[muse_oauth] record_provider_event skipped: %s", type(exc).__name__)
 
 
 async def request_device_code() -> dict:
@@ -183,10 +184,10 @@ async def get_valid_token(user_id: str) -> dict | None:
 
         try:
             await invalidate_oauth_active_cache(user_id)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[muse_oauth] invalidate_oauth_active_cache skipped: %s", type(exc).__name__)
 
-        _record_provider_event_safe(
+        await _record_provider_event_safe(
             user_id,
             "refresh_ok",
             {"expires_in": int(new.get("expires_in", 3600))},
@@ -194,7 +195,7 @@ async def get_valid_token(user_id: str) -> dict | None:
         logger.debug(f"[muse_oauth] Refreshed tokens for user_id={user_id}")
         return {"access_token": new["access_token"], "plan_type": tokens.get("plan_type")}
     except Exception as e:
-        _record_provider_event_safe(
+        await _record_provider_event_safe(
             user_id,
             "refresh_fail",
             {"error_type": type(e).__name__, "message": str(e)[:160]},

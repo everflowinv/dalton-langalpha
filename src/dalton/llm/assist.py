@@ -53,6 +53,17 @@ def _read_yaml_dict(path: Any) -> dict[str, Any]:
     return {}
 
 
+def _validate_assist_candidate(role: str, candidate: str) -> str:
+    from src.dalton.llm.role_policy import RolePolicyError, is_forbidden_for_roles
+
+    cand = candidate.strip()
+    if is_forbidden_for_roles(cand):
+        raise RolePolicyError(
+            f"角色 {role} 配置了禁用变体 {cand}（contributor 变体可能用于训练，L21 严禁用于任何基金研究角色）。"
+        )
+    return cand
+
+
 def resolve_assist_model(role: str = "assist", explicit_model: str | None = None) -> str:
     """Resolve model key for `role` (default `'assist'`).
 
@@ -61,9 +72,11 @@ def resolve_assist_model(role: str = "assist", explicit_model: str | None = None
     2. `agent_config.dalton.yaml` `llm.<role>` (e.g. `llm.assist`)
     3. `src/dalton/dalton.yaml` `llm.<role>` or `publish.extract_model`
     4. `'gemini-3.8-flash-low-oauth'` if present in merged model catalog, else `'deepseek-flash'`
+
+    Raises `RolePolicyError` if the resolved model is marked `forbidden_for_roles` (L21).
     """
     if explicit_model and explicit_model.strip():
-        return explicit_model.strip()
+        return _validate_assist_candidate(role, explicit_model)
 
     agent_cfg_path = REPO_ROOT / "agent_config.dalton.yaml"
     agent_cfg = _read_yaml_dict(agent_cfg_path)
@@ -71,19 +84,19 @@ def resolve_assist_model(role: str = "assist", explicit_model: str | None = None
     if isinstance(llm_block, dict):
         role_val = llm_block.get(role)
         if isinstance(role_val, str) and role_val.strip():
-            return role_val.strip()
+            return _validate_assist_candidate(role, role_val)
 
     dalton_cfg = _read_yaml_dict(DALTON_YAML_PATH)
     dalton_llm = dalton_cfg.get("llm")
     if isinstance(dalton_llm, dict):
         role_val = dalton_llm.get(role)
         if isinstance(role_val, str) and role_val.strip():
-            return role_val.strip()
+            return _validate_assist_candidate(role, role_val)
     publish_block = dalton_cfg.get("publish")
     if isinstance(publish_block, dict) and role in ("assist", "extract"):
         ext_val = publish_block.get("extract_model")
         if isinstance(ext_val, str) and ext_val.strip():
-            return ext_val.strip()
+            return _validate_assist_candidate(role, ext_val)
 
     try:
         from src.llms.llm import LLM
@@ -143,9 +156,10 @@ async def assist_json(
     Never raises: returns `AssistResult(ok=False, data=None, error=...)` on any error.
     """
     t0 = time.monotonic()
-    resolved_model = resolve_assist_model(role=role, explicit_model=model)
+    resolved_model = str(model or "")
 
     try:
+        resolved_model = resolve_assist_model(role=role, explicit_model=model)
         payload_json = json.dumps(
             payload if isinstance(payload, dict) else {"value": payload},
             sort_keys=True,
