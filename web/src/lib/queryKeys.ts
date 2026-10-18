@@ -256,6 +256,16 @@ export const queryKeys = {
     all:    ['quote'],
     detail: (symbol: string) => [...queryKeys.quote.all, symbol],
   },
+  // DALTON-HOOK(query-keys): Dalton OpenClaw sync, budget, and coverage board query keys
+  dalton: {
+    all:            ['dalton'],
+    openclawStatus: () => [...queryKeys.dalton.all, 'openclaw', 'status'],
+    openclawHealth: () => [...queryKeys.dalton.all, 'openclaw', 'health'],
+    budget:         () => [...queryKeys.dalton.all, 'budget'],
+    budgetToday:    () => [...queryKeys.dalton.all, 'budget', 'today'],
+    coverageBoard:  (tier = 'all', staleOnly = false) => [...queryKeys.dalton.all, 'coverage', 'board', tier, staleOnly],
+    autonomyReport: (week?: string) => [...queryKeys.dalton.all, 'autonomy', 'report', week ?? 'current'],
+  },
 };
 
 /**

@@ -292,6 +292,10 @@ async def enforce_credit_limit(user_id: str, *, byok: bool = False) -> None:
     it is an unbounded spend by a user the service may well have been about to
     refuse, landing on them later as debt they never agreed to.
     """
+    # DALTON-HOOK(budget-admission): local daily-USD admission check in OSS mode
+    from src.dalton.budget.gate import local_gate_enabled, enforce_local_admission
+    if local_gate_enabled():
+        return await enforce_local_admission(user_id, byok=byok)
     if not platform_gating_active():
         return
 

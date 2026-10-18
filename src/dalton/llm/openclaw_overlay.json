@@ -1,0 +1,1601 @@
+{
+  "meta": {
+    "generated_at": "2026-10-18T13:57:04Z",
+    "source": "broker+openclaw_config",
+    "broker_version": "2.0.0",
+    "openclaw_version": "unknown",
+    "counts": {
+      "catalog": 27,
+      "visible": 24,
+      "hidden": 3,
+      "text_only": 13
+    },
+    "hidden": [
+      {
+        "key": "ocb-antigravity-cli-gateway-gemini-3.8-flash",
+        "openclaw_ref": "antigravity-cli-gateway/gemini-3.8-flash",
+        "reason": "hidden_by_override"
+      },
+      {
+        "key": "ocb-antigravity-cli-gateway-gemini-4-argon",
+        "openclaw_ref": "antigravity-cli-gateway/gemini-4-argon",
+        "reason": "hidden_by_override"
+      },
+      {
+        "key": "ocb-muse-cli-gateway-muse-wonder-full-1.0",
+        "openclaw_ref": "muse-cli-gateway/muse-wonder-full-1.0",
+        "reason": "hidden_by_override"
+      }
+    ],
+    "price_discrepancies": [
+      {
+        "ref": "google/gemini-3.8-flash",
+        "field": "input",
+        "values": {
+          "broker.cost": 0.75,
+          "openclaw.rateCard": 1.5
+        },
+        "chosen": 1.5
+      },
+      {
+        "ref": "google/gemini-3.8-flash",
+        "field": "output",
+        "values": {
+          "broker.cost": 3.75,
+          "openclaw.rateCard": 7.5
+        },
+        "chosen": 7.5
+      },
+      {
+        "ref": "google/gemini-3.8-flash",
+        "field": "cached_input",
+        "values": {
+          "broker.cost": 0.075,
+          "openclaw.rateCard": 1.5
+        },
+        "chosen": 1.5
+      },
+      {
+        "ref": "google/gemini-3.1-pro-preview",
+        "field": "input",
+        "values": {
+          "broker.cost": 2.0,
+          "openclaw.rateCard": 4.0
+        },
+        "chosen": 4.0
+      },
+      {
+        "ref": "google/gemini-3.1-pro-preview",
+        "field": "output",
+        "values": {
+          "broker.cost": 12.0,
+          "openclaw.rateCard": 18.0
+        },
+        "chosen": 18.0
+      },
+      {
+        "ref": "google/gemini-3.1-pro-preview",
+        "field": "cached_input",
+        "values": {
+          "broker.cost": 0.2,
+          "openclaw.rateCard": 4.0
+        },
+        "chosen": 4.0
+      },
+      {
+        "ref": "xai/grok-4.7",
+        "field": "input",
+        "values": {
+          "broker.cost": 2.0,
+          "openclaw.rateCard": 3.0
+        },
+        "chosen": 3.0
+      },
+      {
+        "ref": "xai/grok-4.7",
+        "field": "output",
+        "values": {
+          "broker.cost": 6.0,
+          "openclaw.rateCard": 15.0
+        },
+        "chosen": 15.0
+      },
+      {
+        "ref": "xai/grok-4.7",
+        "field": "cached_input",
+        "values": {
+          "broker.cost": 0.5,
+          "openclaw.rateCard": 0.75
+        },
+        "chosen": 0.75
+      }
+    ],
+    "warnings": [
+      "Cash model google/gemini-3.8-flash (ocb-google-gemini-3.8-flash) has cache_5m=1.5 > 0; verify cache_write_tokens metering.",
+      "Cash model google/gemini-3.1-pro-preview (ocb-google-gemini-3.1-pro-preview) has cache_5m=4.0 > 0; verify cache_write_tokens metering.",
+      "Cash model openai/gpt-6-astra (ocb-openai-gpt-6-astra) has cache_5m=12.5 > 0; verify cache_write_tokens metering.",
+      "Cash model openai/gpt-5.6-terra (ocb-openai-gpt-5.6-terra) has cache_5m=2.5 > 0; verify cache_write_tokens metering.",
+      "Cash model openai/gpt-6.1-sol (ocb-openai-gpt-6.1-sol) has cache_5m=2.5 > 0; verify cache_write_tokens metering.",
+      "Cash model openai/gpt-6-luna (ocb-openai-gpt-6-luna) has cache_5m=0.125 > 0; verify cache_write_tokens metering."
+    ]
+  },
+  "models": {
+    "ocb-antigravity-cli-gateway-gemini-3.8-flash": {
+      "model_id": "antigravity-cli-gateway/gemini-3.8-flash",
+      "provider": "openclaw-broker",
+      "display_name": "Gemini 3.8 Flash via Antigravity CLI · OpenClaw（仅文本）",
+      "visible": false,
+      "speed": 3,
+      "intelligence": 4,
+      "context": 1048576,
+      "input_modalities": [
+        "text"
+      ],
+      "prompt_guidance": "lean",
+      "parameters": {
+        "max_tokens": 65536
+      },
+      "reasoning": {
+        "efforts": [
+          "low",
+          "medium",
+          "high"
+        ],
+        "default": "high",
+        "write": "parameters.reasoning_effort"
+      },
+      "profile": {
+        "tool_calling": false
+      }
+    },
+    "ocb-antigravity-cli-gateway-claude-opus-5-5": {
+      "model_id": "antigravity-cli-gateway/claude-opus-5-5",
+      "provider": "openclaw-broker",
+      "display_name": "Claude Opus 5.5 via Antigravity CLI · OpenClaw（仅文本）",
+      "visible": true,
+      "speed": 3,
+      "intelligence": 4,
+      "context": 1000000,
+      "input_modalities": [
+        "text"
+      ],
+      "prompt_guidance": "lean",
+      "parameters": {
+        "max_tokens": 65536
+      },
+      "reasoning": {
+        "efforts": [
+          "low",
+          "medium",
+          "high"
+        ],
+        "default": "high",
+        "write": "parameters.reasoning_effort"
+      },
+      "profile": {
+        "tool_calling": false
+      }
+    },
+    "ocb-antigravity-cli-gateway-claude-sonnet-5-5": {
+      "model_id": "antigravity-cli-gateway/claude-sonnet-5-5",
+      "provider": "openclaw-broker",
+      "display_name": "Claude Sonnet 5.5 via Antigravity CLI · OpenClaw（仅文本）",
+      "visible": true,
+      "speed": 3,
+      "intelligence": 4,
+      "context": 1000000,
+      "input_modalities": [
+        "text"
+      ],
+      "prompt_guidance": "lean",
+      "parameters": {
+        "max_tokens": 65536
+      },
+      "reasoning": {
+        "efforts": [
+          "low",
+          "medium",
+          "high"
+        ],
+        "default": "high",
+        "write": "parameters.reasoning_effort"
+      },
+      "profile": {
+        "tool_calling": false
+      }
+    },
+    "ocb-antigravity-cli-gateway-gpt-oss-120b": {
+      "model_id": "antigravity-cli-gateway/gpt-oss-120b",
+      "provider": "openclaw-broker",
+      "display_name": "GPT-OSS 120B via Antigravity CLI · OpenClaw（仅文本）",
+      "visible": true,
+      "speed": 3,
+      "intelligence": 4,
+      "context": 131072,
+      "input_modalities": [
+        "text"
+      ],
+      "prompt_guidance": "lean",
+      "parameters": {
+        "max_tokens": 32768
+      },
+      "reasoning": {
+        "efforts": [
+          "low",
+          "medium",
+          "high"
+        ],
+        "default": "high",
+        "write": "parameters.reasoning_effort"
+      },
+      "profile": {
+        "tool_calling": false
+      }
+    },
+    "ocb-antigravity-cli-gateway-gemini-4-argon": {
+      "model_id": "antigravity-cli-gateway/gemini-4-argon",
+      "provider": "openclaw-broker",
+      "display_name": "Gemini 4 Argon via Antigravity CLI (190KB prompt cap) · OpenClaw（仅文本）",
+      "visible": false,
+      "speed": 3,
+      "intelligence": 4,
+      "context": 1048576,
+      "input_modalities": [
+        "text"
+      ],
+      "prompt_guidance": "lean",
+      "parameters": {
+        "max_tokens": 65536
+      },
+      "reasoning": {
+        "efforts": [
+          "low",
+          "medium",
+          "high"
+        ],
+        "default": "high",
+        "write": "parameters.reasoning_effort"
+      },
+      "profile": {
+        "tool_calling": false
+      }
+    },
+    "ocb-claude-cli-gateway-claude-opus-5-5": {
+      "model_id": "claude-cli-gateway/claude-opus-5-5",
+      "provider": "openclaw-broker",
+      "display_name": "Claude Opus 5.5 via official Claude CLI · OpenClaw（仅文本）",
+      "visible": true,
+      "speed": 3,
+      "intelligence": 4,
+      "context": 1000000,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "prompt_guidance": "lean",
+      "parameters": {
+        "max_tokens": 128000
+      },
+      "reasoning": {
+        "efforts": [
+          "low",
+          "medium",
+          "high"
+        ],
+        "default": "high",
+        "write": "parameters.reasoning_effort"
+      },
+      "profile": {
+        "tool_calling": false
+      }
+    },
+    "ocb-claude-cli-gateway-claude-sonnet-5-5": {
+      "model_id": "claude-cli-gateway/claude-sonnet-5-5",
+      "provider": "openclaw-broker",
+      "display_name": "claude-sonnet-5-5 via official Claude CLI · OpenClaw（仅文本）",
+      "visible": true,
+      "speed": 3,
+      "intelligence": 4,
+      "context": 1000000,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "prompt_guidance": "lean",
+      "parameters": {
+        "max_tokens": 128000
+      },
+      "reasoning": {
+        "efforts": [
+          "low",
+          "medium",
+          "high"
+        ],
+        "default": "high",
+        "write": "parameters.reasoning_effort"
+      },
+      "profile": {
+        "tool_calling": false
+      }
+    },
+    "ocb-claude-cli-gateway-claude-fable-5-1": {
+      "model_id": "claude-cli-gateway/claude-fable-5-1",
+      "provider": "openclaw-broker",
+      "display_name": "claude-fable-5-1 via official Claude CLI · OpenClaw（仅文本）",
+      "visible": true,
+      "speed": 3,
+      "intelligence": 4,
+      "context": 1000000,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "prompt_guidance": "lean",
+      "parameters": {
+        "max_tokens": 64000
+      },
+      "reasoning": {
+        "efforts": [
+          "low",
+          "medium",
+          "high"
+        ],
+        "default": "high",
+        "write": "parameters.reasoning_effort"
+      },
+      "profile": {
+        "tool_calling": false
+      }
+    },
+    "ocb-claude-cli-gateway-claude-haiku-5-5": {
+      "model_id": "claude-cli-gateway/claude-haiku-5-5",
+      "provider": "openclaw-broker",
+      "display_name": "claude-haiku-5-5 via official Claude CLI · OpenClaw（仅文本）",
+      "visible": true,
+      "speed": 3,
+      "intelligence": 4,
+      "context": 1000000,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "prompt_guidance": "lean",
+      "parameters": {
+        "max_tokens": 128000
+      },
+      "reasoning": {
+        "efforts": [
+          "low",
+          "medium",
+          "high"
+        ],
+        "default": "high",
+        "write": "parameters.reasoning_effort"
+      },
+      "profile": {
+        "tool_calling": false
+      }
+    },
+    "ocb-deepseek-deepseek-flash": {
+      "model_id": "deepseek/deepseek-flash",
+      "provider": "openclaw-broker",
+      "display_name": "DeepSeek V4.1 Flash (Official) · OpenClaw",
+      "visible": true,
+      "speed": 5,
+      "intelligence": 3,
+      "context": 1048576,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "prompt_guidance": "lean",
+      "parameters": {
+        "max_tokens": 393216
+      },
+      "reasoning": {
+        "efforts": [
+          "low",
+          "medium",
+          "high"
+        ],
+        "default": "high",
+        "write": "parameters.reasoning_effort"
+      }
+    },
+    "ocb-google-gemini-3.8-flash": {
+      "model_id": "google/gemini-3.8-flash",
+      "provider": "openclaw-broker",
+      "display_name": "gemini-3.8-flash · OpenClaw",
+      "visible": true,
+      "speed": 3,
+      "intelligence": 4,
+      "context": 1048576,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "prompt_guidance": "lean",
+      "parameters": {
+        "max_tokens": 65536
+      },
+      "reasoning": {
+        "efforts": [
+          "low",
+          "medium",
+          "high"
+        ],
+        "default": "high",
+        "write": "parameters.reasoning_effort"
+      }
+    },
+    "ocb-google-gemini-3.1-pro-preview": {
+      "model_id": "google/gemini-3.1-pro-preview",
+      "provider": "openclaw-broker",
+      "display_name": "gemini-3.1-pro-preview · OpenClaw",
+      "visible": true,
+      "speed": 3,
+      "intelligence": 4,
+      "context": 1048576,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "prompt_guidance": "lean",
+      "parameters": {
+        "max_tokens": 65536
+      },
+      "reasoning": {
+        "efforts": [
+          "low",
+          "medium",
+          "high"
+        ],
+        "default": "high",
+        "write": "parameters.reasoning_effort"
+      }
+    },
+    "ocb-google-gemini-3.5-flash-lite": {
+      "model_id": "google/gemini-3.5-flash-lite",
+      "provider": "openclaw-broker",
+      "display_name": "gemini-3.5-flash-lite · OpenClaw",
+      "visible": true,
+      "speed": 3,
+      "intelligence": 4,
+      "context": 1048576,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "prompt_guidance": "lean",
+      "parameters": {
+        "max_tokens": 65536
+      },
+      "reasoning": {
+        "efforts": [
+          "low",
+          "medium",
+          "high"
+        ],
+        "default": "high",
+        "write": "parameters.reasoning_effort"
+      }
+    },
+    "ocb-google-gemini-4-argon": {
+      "model_id": "google/gemini-4-argon",
+      "provider": "openclaw-broker",
+      "display_name": "Gemini 4 Argon (Google API) · OpenClaw",
+      "visible": true,
+      "speed": 3,
+      "intelligence": 4,
+      "context": 1048576,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "prompt_guidance": "lean",
+      "parameters": {
+        "max_tokens": 65536
+      },
+      "reasoning": {
+        "efforts": [
+          "low",
+          "medium",
+          "high"
+        ],
+        "default": "high",
+        "write": "parameters.reasoning_effort"
+      }
+    },
+    "ocb-openai-gpt-6-astra": {
+      "model_id": "openai/gpt-6-astra",
+      "provider": "openclaw-broker",
+      "display_name": "GPT-6 Astra · OpenClaw",
+      "visible": true,
+      "speed": 3,
+      "intelligence": 4,
+      "context": 872000,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "prompt_guidance": "lean",
+      "parameters": {
+        "max_tokens": 128000
+      },
+      "reasoning": {
+        "efforts": [
+          "low",
+          "medium",
+          "high"
+        ],
+        "default": "high",
+        "write": "parameters.reasoning_effort"
+      }
+    },
+    "ocb-openai-gpt-5.6-terra": {
+      "model_id": "openai/gpt-5.6-terra",
+      "provider": "openclaw-broker",
+      "display_name": "GPT-5.6 Terra · OpenClaw",
+      "visible": true,
+      "speed": 3,
+      "intelligence": 4,
+      "context": 872000,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "prompt_guidance": "lean",
+      "parameters": {
+        "max_tokens": 128000
+      },
+      "reasoning": {
+        "efforts": [
+          "low",
+          "medium",
+          "high"
+        ],
+        "default": "high",
+        "write": "parameters.reasoning_effort"
+      }
+    },
+    "ocb-openai-gpt-6.1-sol": {
+      "model_id": "openai/gpt-6.1-sol",
+      "provider": "openclaw-broker",
+      "display_name": "GPT-6.1 Sol · OpenClaw",
+      "visible": true,
+      "speed": 3,
+      "intelligence": 5,
+      "context": 872000,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "prompt_guidance": "lean",
+      "parameters": {
+        "max_tokens": 128000
+      },
+      "reasoning": {
+        "efforts": [
+          "low",
+          "medium",
+          "high"
+        ],
+        "default": "high",
+        "write": "parameters.reasoning_effort"
+      }
+    },
+    "ocb-openai-gpt-6-luna": {
+      "model_id": "openai/gpt-6-luna",
+      "provider": "openclaw-broker",
+      "display_name": "GPT-6 Luna · OpenClaw",
+      "visible": true,
+      "speed": 3,
+      "intelligence": 4,
+      "context": 872000,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "prompt_guidance": "lean",
+      "parameters": {
+        "max_tokens": 128000
+      },
+      "reasoning": {
+        "efforts": [
+          "low",
+          "medium",
+          "high"
+        ],
+        "default": "high",
+        "write": "parameters.reasoning_effort"
+      }
+    },
+    "ocb-xai-grok-4.7": {
+      "model_id": "xai/grok-4.7",
+      "provider": "openclaw-broker",
+      "display_name": "Grok 4.7 · OpenClaw",
+      "visible": true,
+      "speed": 3,
+      "intelligence": 4,
+      "context": 500000,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "prompt_guidance": "lean",
+      "parameters": {
+        "max_tokens": 128000
+      },
+      "reasoning": {
+        "efforts": [
+          "low",
+          "medium",
+          "high"
+        ],
+        "default": "high",
+        "write": "parameters.reasoning_effort"
+      }
+    },
+    "ocb-xai-grok-build-0.1": {
+      "model_id": "xai/grok-build-0.1",
+      "provider": "openclaw-broker",
+      "display_name": "Grok Build 0.1 · OpenClaw",
+      "visible": true,
+      "speed": 3,
+      "intelligence": 4,
+      "context": 256000,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "prompt_guidance": "lean",
+      "parameters": {
+        "max_tokens": 64000
+      },
+      "reasoning": {
+        "efforts": [
+          "low",
+          "medium",
+          "high"
+        ],
+        "default": "high",
+        "write": "parameters.reasoning_effort"
+      }
+    },
+    "ocb-xai-grok-4.3": {
+      "model_id": "xai/grok-4.3",
+      "provider": "openclaw-broker",
+      "display_name": "Grok 4.3 · OpenClaw",
+      "visible": true,
+      "speed": 3,
+      "intelligence": 4,
+      "context": 1000000,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "prompt_guidance": "lean",
+      "parameters": {
+        "max_tokens": 64000
+      },
+      "reasoning": {
+        "efforts": [
+          "low",
+          "medium",
+          "high"
+        ],
+        "default": "high",
+        "write": "parameters.reasoning_effort"
+      }
+    },
+    "ocb-zai-glm-5.3": {
+      "model_id": "zai/glm-5.3",
+      "provider": "openclaw-broker",
+      "display_name": "GLM-5.3 · OpenClaw",
+      "visible": true,
+      "speed": 3,
+      "intelligence": 4,
+      "context": 1000000,
+      "input_modalities": [
+        "text"
+      ],
+      "prompt_guidance": "lean",
+      "parameters": {
+        "max_tokens": 131072
+      },
+      "reasoning": {
+        "efforts": [
+          "low",
+          "medium",
+          "high"
+        ],
+        "default": "high",
+        "write": "parameters.reasoning_effort"
+      }
+    },
+    "ocb-zai-glm-5.3-flash": {
+      "model_id": "zai/glm-5.3-flash",
+      "provider": "openclaw-broker",
+      "display_name": "GLM-5.3-Flash · OpenClaw",
+      "visible": true,
+      "speed": 3,
+      "intelligence": 4,
+      "context": 1000000,
+      "input_modalities": [
+        "text"
+      ],
+      "prompt_guidance": "lean",
+      "parameters": {
+        "max_tokens": 131072
+      },
+      "reasoning": {
+        "efforts": [
+          "low",
+          "medium",
+          "high"
+        ],
+        "default": "high",
+        "write": "parameters.reasoning_effort"
+      }
+    },
+    "ocb-muse-cli-gateway-muse-spark-1.3": {
+      "model_id": "muse-cli-gateway/muse-spark-1.3",
+      "provider": "openclaw-broker",
+      "display_name": "Muse Spark 1.3 (Muse Code subscription) · OpenClaw（仅文本）",
+      "visible": true,
+      "speed": 3,
+      "intelligence": 4,
+      "context": 384000,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "prompt_guidance": "lean",
+      "parameters": {
+        "max_tokens": 128000
+      },
+      "reasoning": {
+        "efforts": [
+          "low",
+          "medium",
+          "high"
+        ],
+        "default": "high",
+        "write": "parameters.reasoning_effort"
+      },
+      "profile": {
+        "tool_calling": false
+      }
+    },
+    "ocb-muse-cli-gateway-muse-spark-1.3-contributor": {
+      "model_id": "muse-cli-gateway/muse-spark-1.3-contributor",
+      "provider": "openclaw-broker",
+      "display_name": "Muse Spark 1.3 Contributor (training eligible) · OpenClaw（仅文本）",
+      "visible": true,
+      "speed": 3,
+      "intelligence": 4,
+      "context": 384000,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "prompt_guidance": "lean",
+      "parameters": {
+        "max_tokens": 128000
+      },
+      "reasoning": {
+        "efforts": [
+          "low",
+          "medium",
+          "high"
+        ],
+        "default": "high",
+        "write": "parameters.reasoning_effort"
+      },
+      "profile": {
+        "tool_calling": false
+      }
+    },
+    "ocb-muse-cli-gateway-muse-wonder-1.0": {
+      "model_id": "muse-cli-gateway/muse-wonder-1.0",
+      "provider": "openclaw-broker",
+      "display_name": "Muse Wonder 1.0 (Muse Code subscription) · OpenClaw（仅文本）",
+      "visible": true,
+      "speed": 3,
+      "intelligence": 4,
+      "context": 384000,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "prompt_guidance": "lean",
+      "parameters": {
+        "max_tokens": 128000
+      },
+      "reasoning": {
+        "efforts": [
+          "low",
+          "medium",
+          "high"
+        ],
+        "default": "high",
+        "write": "parameters.reasoning_effort"
+      },
+      "profile": {
+        "tool_calling": false
+      }
+    },
+    "ocb-muse-cli-gateway-muse-wonder-full-1.0": {
+      "model_id": "muse-cli-gateway/muse-wonder-full-1.0",
+      "provider": "openclaw-broker",
+      "display_name": "Muse Wonder Full 1.0 (subscription; token price unpublished) · OpenClaw（仅文本）",
+      "visible": false,
+      "speed": 3,
+      "intelligence": 4,
+      "context": 384000,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "prompt_guidance": "lean",
+      "parameters": {
+        "max_tokens": 128000
+      },
+      "reasoning": {
+        "efforts": [
+          "low",
+          "medium",
+          "high"
+        ],
+        "default": "high",
+        "write": "parameters.reasoning_effort"
+      },
+      "profile": {
+        "tool_calling": false
+      }
+    }
+  },
+  "providers": {
+    "provider_config": {
+      "openclaw-broker": {
+        "sdk": "openai",
+        "base_url": "http://{HOST_IP}:18789/dalton-broker/v1",
+        "env_key": "DALTON_BROKER_TOKEN",
+        "access_type": "local",
+        "use_response_api": false,
+        "dynamic_models": false,
+        "byok_eligible": false,
+        "prompt_cache_key": false,
+        "operator_channel": "system",
+        "display_name": "OpenClaw (broker)",
+        "dalton_broker": true
+      }
+    },
+    "models": {
+      "openclaw-broker": [
+        {
+          "id": "antigravity-cli-gateway/gemini-3.8-flash",
+          "name": "Gemini 3.8 Flash via Antigravity CLI",
+          "is_reasoning": true,
+          "description": "Gemini 3.8 Flash via Antigravity CLI via Dalton broker v2",
+          "context_window": 1048576,
+          "max_output": 65536,
+          "pricing": {
+            "pricing_type": "subscription",
+            "unit": "per_1m_tokens"
+          },
+          "notional_pricing": {
+            "input": 0.75,
+            "output": 3.75,
+            "cached_input": 0.075,
+            "unit": "per_1m_tokens"
+          },
+          "dalton": {
+            "openclaw_ref": "antigravity-cli-gateway/gemini-3.8-flash",
+            "upstream_provider": "antigravity-cli-gateway",
+            "family": "google-gemini",
+            "billing": "subscription",
+            "tool_calling": false,
+            "price_sources": [
+              "broker.cost"
+            ]
+          }
+        },
+        {
+          "id": "antigravity-cli-gateway/claude-opus-5-5",
+          "name": "Claude Opus 5.5 via Antigravity CLI",
+          "is_reasoning": true,
+          "description": "Claude Opus 5.5 via Antigravity CLI via Dalton broker v2",
+          "context_window": 1000000,
+          "max_output": 65536,
+          "pricing": {
+            "pricing_type": "subscription",
+            "unit": "per_1m_tokens"
+          },
+          "notional_pricing": {
+            "input": 4.0,
+            "output": 20.0,
+            "cached_input": 0.2,
+            "unit": "per_1m_tokens",
+            "cache_5m": 8.0
+          },
+          "dalton": {
+            "openclaw_ref": "antigravity-cli-gateway/claude-opus-5-5",
+            "upstream_provider": "antigravity-cli-gateway",
+            "family": "anthropic-claude",
+            "billing": "subscription",
+            "tool_calling": false,
+            "price_sources": [
+              "broker.cost"
+            ]
+          }
+        },
+        {
+          "id": "antigravity-cli-gateway/claude-sonnet-5-5",
+          "name": "Claude Sonnet 5.5 via Antigravity CLI",
+          "is_reasoning": true,
+          "description": "Claude Sonnet 5.5 via Antigravity CLI via Dalton broker v2",
+          "context_window": 1000000,
+          "max_output": 65536,
+          "pricing": {
+            "pricing_type": "subscription",
+            "unit": "per_1m_tokens"
+          },
+          "notional_pricing": {
+            "input": 2.0,
+            "output": 10.0,
+            "cached_input": 0.1,
+            "unit": "per_1m_tokens",
+            "cache_5m": 4.0
+          },
+          "dalton": {
+            "openclaw_ref": "antigravity-cli-gateway/claude-sonnet-5-5",
+            "upstream_provider": "antigravity-cli-gateway",
+            "family": "anthropic-claude",
+            "billing": "subscription",
+            "tool_calling": false,
+            "price_sources": [
+              "broker.cost"
+            ]
+          }
+        },
+        {
+          "id": "antigravity-cli-gateway/gpt-oss-120b",
+          "name": "GPT-OSS 120B via Antigravity CLI",
+          "is_reasoning": true,
+          "description": "GPT-OSS 120B via Antigravity CLI via Dalton broker v2",
+          "context_window": 131072,
+          "max_output": 32768,
+          "pricing": {
+            "pricing_type": "subscription",
+            "unit": "per_1m_tokens"
+          },
+          "notional_pricing": {
+            "input": 0.35,
+            "cached_input": 0.35,
+            "output": 0.75,
+            "unit": "per_1m_tokens"
+          },
+          "dalton": {
+            "openclaw_ref": "antigravity-cli-gateway/gpt-oss-120b",
+            "upstream_provider": "antigravity-cli-gateway",
+            "family": "openai-gpt-oss",
+            "billing": "subscription",
+            "tool_calling": false,
+            "price_sources": [
+              "upstream.providers"
+            ]
+          }
+        },
+        {
+          "id": "antigravity-cli-gateway/gemini-4-argon",
+          "name": "Gemini 4 Argon via Antigravity CLI (190KB prompt cap)",
+          "is_reasoning": true,
+          "description": "Gemini 4 Argon via Antigravity CLI (190KB prompt cap) via Dalton broker v2",
+          "context_window": 1048576,
+          "max_output": 65536,
+          "pricing": {
+            "pricing_type": "subscription",
+            "unit": "per_1m_tokens"
+          },
+          "notional_pricing": {
+            "input": 2.0,
+            "output": 10.0,
+            "cached_input": 0.1,
+            "unit": "per_1m_tokens"
+          },
+          "dalton": {
+            "openclaw_ref": "antigravity-cli-gateway/gemini-4-argon",
+            "upstream_provider": "antigravity-cli-gateway",
+            "family": "google-gemini",
+            "billing": "subscription",
+            "tool_calling": false,
+            "price_sources": [
+              "broker.cost"
+            ]
+          }
+        },
+        {
+          "id": "claude-cli-gateway/claude-opus-5-5",
+          "name": "Claude Opus 5.5 via official Claude CLI",
+          "is_reasoning": true,
+          "description": "Claude Opus 5.5 via official Claude CLI via Dalton broker v2",
+          "context_window": 1000000,
+          "max_output": 128000,
+          "pricing": {
+            "pricing_type": "subscription",
+            "unit": "per_1m_tokens"
+          },
+          "notional_pricing": {
+            "input": 4.0,
+            "output": 20.0,
+            "cached_input": 0.2,
+            "unit": "per_1m_tokens",
+            "cache_5m": 8.0
+          },
+          "dalton": {
+            "openclaw_ref": "claude-cli-gateway/claude-opus-5-5",
+            "upstream_provider": "claude-cli-gateway",
+            "family": "anthropic-claude",
+            "billing": "subscription",
+            "tool_calling": false,
+            "price_sources": [
+              "broker.cost"
+            ]
+          }
+        },
+        {
+          "id": "claude-cli-gateway/claude-sonnet-5-5",
+          "name": "claude-sonnet-5-5 via official Claude CLI",
+          "is_reasoning": true,
+          "description": "claude-sonnet-5-5 via official Claude CLI via Dalton broker v2",
+          "context_window": 1000000,
+          "max_output": 128000,
+          "pricing": {
+            "pricing_type": "subscription",
+            "unit": "per_1m_tokens"
+          },
+          "notional_pricing": {
+            "input": 2.0,
+            "output": 10.0,
+            "cached_input": 0.1,
+            "unit": "per_1m_tokens",
+            "cache_5m": 4.0
+          },
+          "dalton": {
+            "openclaw_ref": "claude-cli-gateway/claude-sonnet-5-5",
+            "upstream_provider": "claude-cli-gateway",
+            "family": "anthropic-claude",
+            "billing": "subscription",
+            "tool_calling": false,
+            "price_sources": [
+              "broker.cost"
+            ]
+          }
+        },
+        {
+          "id": "claude-cli-gateway/claude-fable-5-1",
+          "name": "claude-fable-5-1 via official Claude CLI",
+          "is_reasoning": true,
+          "description": "claude-fable-5-1 via official Claude CLI via Dalton broker v2",
+          "context_window": 1000000,
+          "max_output": 64000,
+          "pricing": {
+            "pricing_type": "subscription",
+            "unit": "per_1m_tokens"
+          },
+          "notional_pricing": {
+            "input": 10.0,
+            "output": 50.0,
+            "cached_input": 0.25,
+            "unit": "per_1m_tokens",
+            "cache_5m": 20.0
+          },
+          "dalton": {
+            "openclaw_ref": "claude-cli-gateway/claude-fable-5-1",
+            "upstream_provider": "claude-cli-gateway",
+            "family": "anthropic-claude",
+            "billing": "subscription",
+            "tool_calling": false,
+            "price_sources": [
+              "broker.cost"
+            ]
+          }
+        },
+        {
+          "id": "claude-cli-gateway/claude-haiku-5-5",
+          "name": "claude-haiku-5-5 via official Claude CLI",
+          "is_reasoning": true,
+          "description": "claude-haiku-5-5 via official Claude CLI via Dalton broker v2",
+          "context_window": 1000000,
+          "max_output": 128000,
+          "pricing": {
+            "pricing_type": "subscription",
+            "unit": "per_1m_tokens"
+          },
+          "notional_pricing": {
+            "input": 0.1,
+            "output": 0.5,
+            "cached_input": 0.01,
+            "unit": "per_1m_tokens",
+            "cache_5m": 0.2
+          },
+          "dalton": {
+            "openclaw_ref": "claude-cli-gateway/claude-haiku-5-5",
+            "upstream_provider": "claude-cli-gateway",
+            "family": "anthropic-claude",
+            "billing": "subscription",
+            "tool_calling": false,
+            "price_sources": [
+              "broker.cost"
+            ]
+          }
+        },
+        {
+          "id": "deepseek/deepseek-flash",
+          "name": "DeepSeek V4.1 Flash (Official)",
+          "is_reasoning": true,
+          "description": "DeepSeek V4.1 Flash (Official) via Dalton broker v2",
+          "context_window": 1048576,
+          "max_output": 393216,
+          "pricing": {
+            "input": 0.15,
+            "output": 0.6,
+            "cached_input": 0.003,
+            "unit": "per_1m_tokens"
+          },
+          "notional_pricing": null,
+          "dalton": {
+            "openclaw_ref": "deepseek/deepseek-flash",
+            "upstream_provider": "deepseek",
+            "family": "deepseek",
+            "billing": "cash",
+            "tool_calling": true,
+            "price_sources": [
+              "broker.cost"
+            ]
+          }
+        },
+        {
+          "id": "google/gemini-3.8-flash",
+          "name": "gemini-3.8-flash",
+          "is_reasoning": true,
+          "description": "gemini-3.8-flash via Dalton broker v2",
+          "context_window": 1048576,
+          "max_output": 65536,
+          "pricing": {
+            "input": 1.5,
+            "output": 7.5,
+            "cached_input": 1.5,
+            "unit": "per_1m_tokens",
+            "cache_5m": 1.5
+          },
+          "notional_pricing": null,
+          "dalton": {
+            "openclaw_ref": "google/gemini-3.8-flash",
+            "upstream_provider": "google",
+            "family": "google-gemini",
+            "billing": "cash",
+            "tool_calling": true,
+            "price_sources": [
+              "broker.cost",
+              "openclaw.rateCard"
+            ]
+          }
+        },
+        {
+          "id": "google/gemini-3.1-pro-preview",
+          "name": "gemini-3.1-pro-preview",
+          "is_reasoning": true,
+          "description": "gemini-3.1-pro-preview via Dalton broker v2",
+          "context_window": 1048576,
+          "max_output": 65536,
+          "pricing": {
+            "input": 4.0,
+            "output": 18.0,
+            "cached_input": 4.0,
+            "unit": "per_1m_tokens",
+            "cache_5m": 4.0
+          },
+          "notional_pricing": null,
+          "dalton": {
+            "openclaw_ref": "google/gemini-3.1-pro-preview",
+            "upstream_provider": "google",
+            "family": "google-gemini",
+            "billing": "cash",
+            "tool_calling": true,
+            "price_sources": [
+              "broker.cost",
+              "openclaw.rateCard"
+            ]
+          }
+        },
+        {
+          "id": "google/gemini-3.5-flash-lite",
+          "name": "gemini-3.5-flash-lite",
+          "is_reasoning": true,
+          "description": "gemini-3.5-flash-lite via Dalton broker v2",
+          "context_window": 1048576,
+          "max_output": 65536,
+          "pricing": {
+            "input": 0.3,
+            "output": 2.5,
+            "cached_input": 0.03,
+            "unit": "per_1m_tokens"
+          },
+          "notional_pricing": null,
+          "dalton": {
+            "openclaw_ref": "google/gemini-3.5-flash-lite",
+            "upstream_provider": "google",
+            "family": "google-gemini",
+            "billing": "cash",
+            "tool_calling": true,
+            "price_sources": [
+              "broker.cost"
+            ]
+          }
+        },
+        {
+          "id": "google/gemini-4-argon",
+          "name": "Gemini 4 Argon (Google API)",
+          "is_reasoning": true,
+          "description": "Gemini 4 Argon (Google API) via Dalton broker v2",
+          "context_window": 1048576,
+          "max_output": 65536,
+          "pricing": {
+            "input": 2.0,
+            "output": 10.0,
+            "cached_input": 0.1,
+            "unit": "per_1m_tokens"
+          },
+          "notional_pricing": null,
+          "dalton": {
+            "openclaw_ref": "google/gemini-4-argon",
+            "upstream_provider": "google",
+            "family": "google-gemini",
+            "billing": "cash",
+            "tool_calling": true,
+            "price_sources": [
+              "broker.cost"
+            ]
+          }
+        },
+        {
+          "id": "openai/gpt-6-astra",
+          "name": "GPT-6 Astra",
+          "is_reasoning": true,
+          "description": "GPT-6 Astra via Dalton broker v2",
+          "context_window": 872000,
+          "max_output": 128000,
+          "pricing": {
+            "input": 10.0,
+            "output": 50.0,
+            "cached_input": 1.0,
+            "unit": "per_1m_tokens",
+            "cache_5m": 12.5
+          },
+          "notional_pricing": null,
+          "dalton": {
+            "openclaw_ref": "openai/gpt-6-astra",
+            "upstream_provider": "openai",
+            "family": "openai-gpt",
+            "billing": "cash",
+            "tool_calling": true,
+            "price_sources": [
+              "broker.cost"
+            ]
+          }
+        },
+        {
+          "id": "openai/gpt-5.6-terra",
+          "name": "GPT-5.6 Terra",
+          "is_reasoning": true,
+          "description": "GPT-5.6 Terra via Dalton broker v2",
+          "context_window": 872000,
+          "max_output": 128000,
+          "pricing": {
+            "input": 2.0,
+            "output": 12.0,
+            "cached_input": 0.2,
+            "unit": "per_1m_tokens",
+            "cache_5m": 2.5
+          },
+          "notional_pricing": null,
+          "dalton": {
+            "openclaw_ref": "openai/gpt-5.6-terra",
+            "upstream_provider": "openai",
+            "family": "openai-gpt",
+            "billing": "cash",
+            "tool_calling": true,
+            "price_sources": [
+              "broker.cost"
+            ]
+          }
+        },
+        {
+          "id": "openai/gpt-6.1-sol",
+          "name": "GPT-6.1 Sol",
+          "is_reasoning": true,
+          "description": "GPT-6.1 Sol via Dalton broker v2",
+          "context_window": 872000,
+          "max_output": 128000,
+          "pricing": {
+            "input": 2.0,
+            "output": 10.0,
+            "cached_input": 0.1,
+            "unit": "per_1m_tokens",
+            "cache_5m": 2.5
+          },
+          "notional_pricing": null,
+          "dalton": {
+            "openclaw_ref": "openai/gpt-6.1-sol",
+            "upstream_provider": "openai",
+            "family": "openai-gpt",
+            "billing": "cash",
+            "tool_calling": true,
+            "price_sources": [
+              "broker.cost"
+            ]
+          }
+        },
+        {
+          "id": "openai/gpt-6-luna",
+          "name": "GPT-6 Luna",
+          "is_reasoning": true,
+          "description": "GPT-6 Luna via Dalton broker v2",
+          "context_window": 872000,
+          "max_output": 128000,
+          "pricing": {
+            "input": 0.1,
+            "output": 0.5,
+            "cached_input": 0.01,
+            "unit": "per_1m_tokens",
+            "cache_5m": 0.125
+          },
+          "notional_pricing": null,
+          "dalton": {
+            "openclaw_ref": "openai/gpt-6-luna",
+            "upstream_provider": "openai",
+            "family": "openai-gpt",
+            "billing": "cash",
+            "tool_calling": true,
+            "price_sources": [
+              "broker.cost"
+            ]
+          }
+        },
+        {
+          "id": "xai/grok-4.7",
+          "name": "Grok 4.7",
+          "is_reasoning": true,
+          "description": "Grok 4.7 via Dalton broker v2",
+          "context_window": 500000,
+          "max_output": 128000,
+          "pricing": {
+            "input": 3.0,
+            "output": 15.0,
+            "cached_input": 0.75,
+            "unit": "per_1m_tokens"
+          },
+          "notional_pricing": null,
+          "dalton": {
+            "openclaw_ref": "xai/grok-4.7",
+            "upstream_provider": "xai",
+            "family": "xai-grok",
+            "billing": "cash",
+            "tool_calling": true,
+            "price_sources": [
+              "broker.cost",
+              "openclaw.rateCard"
+            ]
+          }
+        },
+        {
+          "id": "xai/grok-build-0.1",
+          "name": "Grok Build 0.1",
+          "is_reasoning": true,
+          "description": "Grok Build 0.1 via Dalton broker v2",
+          "context_window": 256000,
+          "max_output": 64000,
+          "pricing": {
+            "input": 1.0,
+            "output": 2.0,
+            "cached_input": 0.2,
+            "unit": "per_1m_tokens"
+          },
+          "notional_pricing": null,
+          "dalton": {
+            "openclaw_ref": "xai/grok-build-0.1",
+            "upstream_provider": "xai",
+            "family": "xai-grok",
+            "billing": "cash",
+            "tool_calling": true,
+            "price_sources": [
+              "broker.cost"
+            ]
+          }
+        },
+        {
+          "id": "xai/grok-4.3",
+          "name": "Grok 4.3",
+          "is_reasoning": true,
+          "description": "Grok 4.3 via Dalton broker v2",
+          "context_window": 1000000,
+          "max_output": 64000,
+          "pricing": {
+            "input": 1.25,
+            "output": 2.5,
+            "cached_input": 0.2,
+            "unit": "per_1m_tokens"
+          },
+          "notional_pricing": null,
+          "dalton": {
+            "openclaw_ref": "xai/grok-4.3",
+            "upstream_provider": "xai",
+            "family": "xai-grok",
+            "billing": "cash",
+            "tool_calling": true,
+            "price_sources": [
+              "broker.cost"
+            ]
+          }
+        },
+        {
+          "id": "zai/glm-5.3",
+          "name": "GLM-5.3",
+          "is_reasoning": true,
+          "description": "GLM-5.3 via Dalton broker v2",
+          "context_window": 1000000,
+          "max_output": 131072,
+          "pricing": {
+            "input": 1.4,
+            "output": 4.4,
+            "cached_input": 0.26,
+            "unit": "per_1m_tokens"
+          },
+          "notional_pricing": null,
+          "dalton": {
+            "openclaw_ref": "zai/glm-5.3",
+            "upstream_provider": "zai",
+            "family": "zai-glm",
+            "billing": "cash",
+            "tool_calling": true,
+            "price_sources": [
+              "broker.cost"
+            ]
+          }
+        },
+        {
+          "id": "zai/glm-5.3-flash",
+          "name": "GLM-5.3-Flash",
+          "is_reasoning": true,
+          "description": "GLM-5.3-Flash via Dalton broker v2",
+          "context_window": 1000000,
+          "max_output": 131072,
+          "pricing": {
+            "input": 0.15,
+            "output": 0.5,
+            "cached_input": 0.03,
+            "unit": "per_1m_tokens"
+          },
+          "notional_pricing": null,
+          "dalton": {
+            "openclaw_ref": "zai/glm-5.3-flash",
+            "upstream_provider": "zai",
+            "family": "zai-glm",
+            "billing": "cash",
+            "tool_calling": true,
+            "price_sources": [
+              "broker.cost"
+            ]
+          }
+        },
+        {
+          "id": "muse-cli-gateway/muse-spark-1.3",
+          "name": "Muse Spark 1.3 (Muse Code subscription)",
+          "is_reasoning": true,
+          "description": "Muse Spark 1.3 (Muse Code subscription) via Dalton broker v2",
+          "context_window": 384000,
+          "max_output": 128000,
+          "pricing": {
+            "pricing_type": "subscription",
+            "unit": "per_1m_tokens"
+          },
+          "notional_pricing": {
+            "input": 1.25,
+            "output": 4.25,
+            "cached_input": 0.15,
+            "unit": "per_1m_tokens"
+          },
+          "dalton": {
+            "openclaw_ref": "muse-cli-gateway/muse-spark-1.3",
+            "upstream_provider": "muse-cli-gateway",
+            "family": "meta-muse",
+            "billing": "subscription",
+            "tool_calling": false,
+            "price_sources": [
+              "broker.cost"
+            ]
+          }
+        },
+        {
+          "id": "muse-cli-gateway/muse-spark-1.3-contributor",
+          "name": "Muse Spark 1.3 Contributor (training eligible)",
+          "is_reasoning": true,
+          "description": "Muse Spark 1.3 Contributor (training eligible) via Dalton broker v2",
+          "context_window": 384000,
+          "max_output": 128000,
+          "pricing": {
+            "pricing_type": "subscription",
+            "unit": "per_1m_tokens"
+          },
+          "notional_pricing": {
+            "input": 0.1,
+            "output": 0.2,
+            "cached_input": 0.002,
+            "unit": "per_1m_tokens"
+          },
+          "dalton": {
+            "openclaw_ref": "muse-cli-gateway/muse-spark-1.3-contributor",
+            "upstream_provider": "muse-cli-gateway",
+            "family": "meta-muse",
+            "billing": "subscription",
+            "tool_calling": false,
+            "price_sources": [
+              "broker.cost"
+            ]
+          }
+        },
+        {
+          "id": "muse-cli-gateway/muse-wonder-1.0",
+          "name": "Muse Wonder 1.0 (Muse Code subscription)",
+          "is_reasoning": true,
+          "description": "Muse Wonder 1.0 (Muse Code subscription) via Dalton broker v2",
+          "context_window": 384000,
+          "max_output": 128000,
+          "pricing": {
+            "pricing_type": "subscription",
+            "unit": "per_1m_tokens"
+          },
+          "notional_pricing": {
+            "input": 4.0,
+            "output": 20.0,
+            "cached_input": 0.2,
+            "unit": "per_1m_tokens"
+          },
+          "dalton": {
+            "openclaw_ref": "muse-cli-gateway/muse-wonder-1.0",
+            "upstream_provider": "muse-cli-gateway",
+            "family": "meta-muse",
+            "billing": "subscription",
+            "tool_calling": false,
+            "price_sources": [
+              "broker.cost"
+            ]
+          }
+        },
+        {
+          "id": "muse-cli-gateway/muse-wonder-full-1.0",
+          "name": "Muse Wonder Full 1.0 (subscription; token price unpublished)",
+          "is_reasoning": true,
+          "description": "Muse Wonder Full 1.0 (subscription; token price unpublished) via Dalton broker v2",
+          "context_window": 384000,
+          "max_output": 128000,
+          "pricing": {
+            "pricing_type": "subscription",
+            "unit": "per_1m_tokens"
+          },
+          "notional_pricing": null,
+          "dalton": {
+            "openclaw_ref": "muse-cli-gateway/muse-wonder-full-1.0",
+            "upstream_provider": "muse-cli-gateway",
+            "family": "meta-muse",
+            "billing": "subscription",
+            "tool_calling": false,
+            "price_sources": []
+          }
+        }
+      ]
+    }
+  }
+}

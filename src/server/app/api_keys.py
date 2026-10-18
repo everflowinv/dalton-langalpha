@@ -822,6 +822,11 @@ async def list_models():
         resolve_min_tier,
     )
 
+    # DALTON-HOOK(catalog-cache): clear provider catalog cache when OpenClaw overlay changes
+    from src.dalton.llm.overlay import overlay_changed
+    if LLM._model_config is None or overlay_changed(getattr(LLM._model_config, "overlay_stamp", None)):
+        _build_provider_catalog.cache_clear()
+
     models = get_configured_llm_models()
     config = LLM.get_model_config()
     from ptc_agent.config.agent import COMPACTION_PROFILES

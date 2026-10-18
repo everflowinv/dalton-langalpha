@@ -35,12 +35,17 @@ class DaltonBudgetDefaults(BaseModel):
 class DaltonKnowledgeConfig(BaseModel):
     """Company knowledge layer settings (PK.1-PK.7)."""
 
+    enabled: bool = True
     max_doc_bytes: int = Field(default=1_048_576, gt=0)
+    pm_user_ids: list[str] = Field(
+        default_factory=lambda: ["local-dev-user", "local_dev_user", "default"]
+    )
 
 
 class DaltonPublishConfig(BaseModel):
     """Publication governance settings (PK.8-PK.13)."""
 
+    enabled: bool = True
     reviewer_models: list[str] = Field(
         default_factory=lambda: [
             "ocb-openai-gpt-6.1-sol",
@@ -68,18 +73,38 @@ class DaltonAutonomyConfig(BaseModel):
     """Autonomous research agenda and preflight settings (PK.14-PK.20)."""
 
     enabled: bool = True
+    timezone: str = "Asia/Shanghai"
     min_wake_usd: float = Field(default=0.50, ge=0)
+    reserve_for_events_usd: float = Field(default=5.00, ge=0)
     event_reserve_ratio: float = Field(default=0.2, ge=0, le=1.0)
     preflight_timeout_s: float = Field(default=20.0, gt=0)
     backoff: DaltonBackoffConfig = Field(default_factory=DaltonBackoffConfig)
     vendor_quota_alert_ratio: float = Field(default=0.8, gt=0, le=1.0)
+    est_cost_by_kind: dict[str, float] = Field(
+        default_factory=lambda: {
+            "initial_coverage": 4.50,
+            "full_coverage": 12.00,
+            "earnings_preview": 2.50,
+            "earnings_flash": 1.20,
+            "earnings_deep": 6.00,
+            "filing_review": 1.50,
+            "thesis_delta": 1.00,
+            "stock_move": 1.20,
+            "bullbear": 2.50,
+            "topic_research": 5.00,
+            "weekly_review": 4.00,
+            "question_followup": 1.50,
+        }
+    )
 
 
 class DaltonConfig(BaseModel):
     """Root Dalton behavioral configuration loaded from ``src/dalton/dalton.yaml``."""
 
     enabled: bool = True
-    pm_user_ids: list[str] = Field(default_factory=lambda: ["local-dev-user"])
+    pm_user_ids: list[str] = Field(
+        default_factory=lambda: ["local-dev-user", "local_dev_user", "default"]
+    )
     timezone: str = "Asia/Shanghai"
     budget: DaltonBudgetDefaults = Field(default_factory=DaltonBudgetDefaults)
     knowledge: DaltonKnowledgeConfig = Field(default_factory=DaltonKnowledgeConfig)
@@ -96,6 +121,9 @@ def get_dalton_config() -> DaltonConfig:
     return DaltonConfig.model_validate(raw)
 
 
+get_dalton_settings = get_dalton_config
+
+
 def is_dalton_enabled() -> bool:
     """Whether Dalton features are enabled in this deployment."""
     env_flag = os.getenv("DALTON_ENABLED")
@@ -109,17 +137,21 @@ def is_budget_gate_enabled() -> bool:
     return HOST_MODE == "oss" and os.getenv("DALTON_BUDGET_GATE", "").strip() == "1"
 
 
+is_dalton_budget_gate_enabled = is_budget_gate_enabled
+
+
 def get_dalton_broker_token() -> str:
     """Return ``DALTON_BROKER_TOKEN`` from environment (empty string if unset)."""
     return os.getenv("DALTON_BROKER_TOKEN", "").strip()
 
 
-def get_dalton_broker_url() -> str:
+def get_dalton_broker_url(host: str | None = None) -> str:
     """Return the resolved OpenClaw broker v2 base URL."""
+    resolved_host = host or HOST_IP
     explicit = os.getenv("DALTON_BROKER_URL", "").strip()
     if explicit:
-        return explicit.replace("{HOST_IP}", HOST_IP).rstrip("/")
-    return f"http://{HOST_IP}:18789/dalton-broker/v1"
+        return explicit.replace("{HOST_IP}", resolved_host).rstrip("/")
+    return f"http://{resolved_host}:18789/dalton-broker/v1"
 
 
 def get_dalton_researchdata_url() -> str:

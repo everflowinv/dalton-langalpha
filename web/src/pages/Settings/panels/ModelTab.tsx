@@ -18,6 +18,8 @@ import { useQuickAccessModels } from '@/hooks/useQuickAccessModels';
 import { modelLabel, modelMatches } from '@/lib/modelLabel';
 import { Trans, useTranslation } from 'react-i18next';
 import { ConnectedAccounts } from './ConnectedAccounts';
+// DALTON-HOOK(settings-section): import DaltonSection
+import { DaltonSection } from './dalton/DaltonSection';
 import { BACKGROUND_AUTO, backgroundDefaultChoice, modelPrefs, readDefaultModelScope, splitPreferenceWrite } from '@/lib/modelPreferences';
 import { useModelSlotCopy } from '@/components/model/useModelSlotCopy';
 import type { ModelSlot, DefaultModelScope, PreferencePatch, PreferencesLike } from '@/lib/modelPreferences';
@@ -538,6 +540,9 @@ export function ModelTab() {
             <Settings2 className="h-5 w-5 shrink-0" style={{ color: 'var(--color-accent-primary)' }} />
           </div>
         </div>
+
+        {/* DALTON-HOOK(settings-section): OpenClaw model sync & Dalton daily USD budget */}
+        <DaltonSection />
 
         {saveStatus !== 'idle' && (
           <div className="flex items-center justify-end pt-2">

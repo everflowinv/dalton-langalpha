@@ -1,0 +1,23 @@
+# Dalton OpenClaw catalog overrides (P0.4 §5)
+claude-cli-gateway/claude-opus-5-5:
+  visible: true
+antigravity-cli-gateway/gemini-3.8-flash:
+  visible: false
+antigravity-cli-gateway/gemini-4-argon:
+  visible: false
+muse-cli-gateway/muse-wonder-full-1.0:
+  visible: false
+xai/grok-4.7:
+  speed: 3
+  intelligence: 4
+  pricing:
+    input: 3.0
+    output: 15.0
+    cached_input: 0.75
+openai/gpt-6.1-sol:
+  speed: 3
+  intelligence: 5
+deepseek/deepseek-flash:
+  speed: 5
+  intelligence: 3
+

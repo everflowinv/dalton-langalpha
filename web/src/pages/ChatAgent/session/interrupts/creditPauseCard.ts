@@ -5,6 +5,7 @@
 
 import type { CreditPauseState } from '@/types/chat';
 import type { ActionRequest } from '@/types/sse';
+import { isPlatformMode } from '@/config/hostMode';
 import { buildRateLimitError } from '@/utils/rateLimitError';
 
 export function buildCreditPauseState(
@@ -19,9 +20,13 @@ export function buildCreditPauseState(
   // A pause is a quota denial the user resolves on the same two pages a 429
   // sends them to, so the links come from that builder rather than a second
   // copy — including its exclusion for denials no account page can fix.
-  const { links } = buildRateLimitError(
+  let { links } = buildRateLimitError(
     { type: request.type, message },
     (import.meta.env.VITE_PLATFORM_URL as string | undefined) || '/account',
   );
+  // DALTON-HOOK(pause-links): point OSS credit pause card to Dalton budget settings
+  if (!isPlatformMode && (Boolean(import.meta.env.VITE_DALTON_MODE) || message?.includes('Dalton') || message?.includes('今日预算') || message?.includes('任务预算'))) {
+    links = [{ label: '调整日预算', labelKey: 'dalton.budget.adjust', url: '/settings?tab=model#dalton-budget' }];
+  }
   return { status: 'pending', message, links, interruptId };
 }
