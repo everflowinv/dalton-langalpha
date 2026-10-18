@@ -12,7 +12,9 @@ Always exits 0 (report-only, non-blocking).
 from __future__ import annotations
 
 import argparse
+import ast
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -23,6 +25,8 @@ SKILLS_ROOT = REPO_ROOT / "plugins" / "dalton" / "skills"
 GHOST_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("ghost_tool:x_search", re.compile(r"\bx_search\b")),
     ("ghost_tool:firecrawl__firecrawl_scrape", re.compile(r"firecrawl__firecrawl_scrape")),
+    ("ghost_tool:double_underscore_mcp", re.compile(r"\b(?:researchdata|guidepoint|alphaengine|firecrawl)__[a-z0-9_]+\b")),
+    ("ghost_tool:research_prefix", re.compile(r"\bresearch_(?:alphaengine|guidepoint|sec|wiki|estimates)\b")),
     ("ghost_tool:dalton_sec.extract_facts", re.compile(r"\bextract_facts\b")),
     ("ghost_tool:dalton_sec.verify_numbers", re.compile(r"\bverify_numbers\b")),
     ("ghost_tool:dalton_sec.get_filing_metadata", re.compile(r"\bget_filing_metadata\b")),
@@ -32,6 +36,29 @@ GHOST_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("ghost_skill:dalton-initiate-full", re.compile(r"\bdalton-initiate-full\b")),
     ("ghost_skill:dalton-earnings-review", re.compile(r"\bdalton-earnings-review\b")),
 ]
+
+MCP_CALL_RE = re.compile(
+    r"`?\b(researchdata|dalton_sec|x_api|price_data|yfinance)\.([a-zA-Z0-9_]+)\s*\("
+)
+DALTON_SKILL_REF_RE = re.compile(r"\b(dalton-[a-z0-9-]+)\b")
+
+NON_SKILL_DALTON_IDENTIFIERS = {
+    "dalton-evidence",
+    "dalton-reviewer",
+    "dalton-broker",
+    "dalton-langalpha",
+    "dalton-langalpha-broker",
+    "dalton-director-daily",
+    "dalton-director-weekly",
+    "dalton-earnings-calendar",
+    "dalton-sec",
+    "dalton-t-watch",
+    "dalton-t-delta",
+    "dalton-t-move-up",
+    "dalton-t-move-down",
+    "dalton-meta-watch",
+    "dalton-meta-delta",
+}
 
 REL_REF_RE = re.compile(
     r"(?<![A-Za-z0-9_./-])((?:references|templates|scripts)/[A-Za-z0-9_./-]+\.(?:md|py|json|yaml|sh))"
@@ -49,6 +76,65 @@ SECOND_HEADER_EXEMPT = {
     "dalton-earnings-calendar",
     "dalton-publish",
 }
+
+
+def build_registered_allowlists() -> tuple[dict[str, set[str]], set[str], set[str]]:
+    """Build `(mcp_server_tools, dalton_tools, registered_skills)` from live repo + data_sources.json."""
+    mcp_tools: dict[str, set[str]] = {
+        "researchdata": {"catalog", "finance", "macro", "news", "research", "community"},
+        "dalton_sec": set(),
+        "x_api": {"search_posts", "get_user_posts", "get_post_thread"},
+        "price_data": {"get_stock_data", "get_Asset_Data", "get_company_overview", "get_market_movers"},
+        "yfinance": {"Ticker", "download"},
+    }
+
+    # 1. Load categories from ~/.openclaw/workspace/config/data_sources.json if available
+    ds_path = Path(os.path.expanduser("~/.openclaw/workspace/config/data_sources.json"))
+    if ds_path.is_file():
+        try:
+            ds_data = json.loads(ds_path.read_text(encoding="utf-8"))
+            cats = (ds_data.get("categories") or {}).keys()
+            if cats:
+                mcp_tools["researchdata"] = set(cats) | {"catalog"}
+        except Exception:
+            pass
+
+    # 2. Parse @mcp.tool() functions from plugins/dalton_data/dalton_sec_mcp_server.py
+    sec_mcp_py = REPO_ROOT / "plugins" / "dalton_data" / "dalton_sec_mcp_server.py"
+    if sec_mcp_py.is_file():
+        try:
+            tree = ast.parse(sec_mcp_py.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    for dec in node.decorator_list:
+                        if "tool" in ast.unparse(dec):
+                            mcp_tools["dalton_sec"].add(node.name)
+        except Exception:
+            mcp_tools["dalton_sec"] = {"get_company_facts", "list_filings"}
+
+    # 3. Parse @tool functions from src/dalton/tools/*.py
+    dalton_tools: set[str] = set()
+    tools_dir = REPO_ROOT / "src" / "dalton" / "tools"
+    if tools_dir.is_dir():
+        for py_path in tools_dir.glob("*.py"):
+            try:
+                tree = ast.parse(py_path.read_text(encoding="utf-8"))
+                for node in ast.walk(tree):
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        for dec in node.decorator_list:
+                            if "tool" in ast.unparse(dec):
+                                dalton_tools.add(node.name)
+            except Exception:
+                pass
+
+    # 4. Registered skill directories under plugins/dalton/skills/
+    registered_skills: set[str] = set()
+    if SKILLS_ROOT.is_dir():
+        for p in SKILLS_ROOT.iterdir():
+            if p.is_dir() and (p / "SKILL.md").is_file():
+                registered_skills.add(p.name)
+
+    return mcp_tools, dalton_tools, registered_skills
 
 
 def strip_frontmatter(text: str) -> str:
@@ -72,6 +158,8 @@ def scan_skills(skills_root: Path = SKILLS_ROOT) -> dict:
             "broken_refs": [],
             "header_notes": [],
         }
+
+    mcp_allowlist, dalton_tools, registered_skills = build_registered_allowlists()
 
     for skill_dir in sorted(p for p in skills_root.iterdir() if p.is_dir()):
         skill_name = skill_dir.name
@@ -123,6 +211,21 @@ def scan_skills(skills_root: Path = SKILLS_ROOT) -> dict:
                     )
 
             if path.suffix == ".md":
+                for match in MCP_CALL_RE.finditer(text):
+                    srv, fn = match.group(1), match.group(2)
+                    allowed_fns = mcp_allowlist.get(srv)
+                    if allowed_fns is not None and fn not in allowed_fns:
+                        line_no = text.count("\n", 0, match.start()) + 1
+                        ghost_hits.append(
+                            {
+                                "skill": skill_name,
+                                "file": rel_file,
+                                "line": line_no,
+                                "rule": f"unregistered_mcp_tool:{srv}.{fn}",
+                                "match": match.group(0),
+                            }
+                        )
+
                 for match in REL_REF_RE.finditer(text):
                     ref_rel = match.group(1)
                     if "<" in ref_rel or ">" in ref_rel:

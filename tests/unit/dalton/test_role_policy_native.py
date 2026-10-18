@@ -99,6 +99,67 @@ def test_contributor_models_forbidden_for_all_roles():
     assert "role_forbidden_model" in codes
 
 
+@pytest.mark.parametrize("slot", ["assist", "background", "compaction", "fetch"])
+def test_contributor_models_forbidden_in_auxiliary_slots_and_fail_startup(slot: str):
+    """P0H §4 P3 (L21): assist, background, compaction, and fetch slots reject contributor models and fail startup."""
+    from src.dalton.llm.role_policy import RolePolicyError, enforce_role_policy_on_startup
+
+    bad_cfg = {
+        "llm": {
+            "name": "claude-opus-5-5-oauth",
+            slot: "muse-spark-1.3-contributor-oauth",
+        }
+    }
+    warnings = check_roles(bad_cfg)
+    forbidden = [w for w in warnings if w["code"] == "role_forbidden_model" and w["role"] == slot]
+    assert len(forbidden) == 1
+    assert forbidden[0]["model"] == "muse-spark-1.3-contributor-oauth"
+
+    with pytest.raises(RolePolicyError, match="muse-spark-1.3-contributor-oauth"):
+        enforce_role_policy_on_startup(bad_cfg)
+
+
+@pytest.mark.asyncio
+async def test_resolve_assist_model_and_startup_wiring_reject_contributor_model(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """P0H §4 P3: resolve_assist_model and verify_local_wiring raise RolePolicyError if assist is set to a contributor variant."""
+    import src.dalton.budget.gate as gate_mod
+    import src.dalton.llm.assist as assist_mod
+    import src.dalton.llm.role_policy as rp_mod
+    from src.dalton.llm.role_policy import RolePolicyError
+
+    with pytest.raises(RolePolicyError, match="muse-spark-1.3-contributor-oauth"):
+        assist_mod.resolve_assist_model(
+            role="assist", explicit_model="muse-spark-1.3-contributor-oauth"
+        )
+
+    # assist_json catches RolePolicyError and returns ok=False without ever calling dalton_complete
+    res = await assist_mod.assist_json(
+        task="test.forbidden",
+        instructions="Return JSON",
+        payload={"x": 1},
+        schema={"type": "object"},
+        model="muse-spark-1.3-contributor-oauth",
+    )
+    assert res.ok is False
+    assert "muse-spark-1.3-contributor-oauth" in (res.error or "")
+
+    # Backend startup (verify_local_wiring) fails when agent_config.dalton.yaml has assist = contributor variant
+    monkeypatch.setattr(
+        rp_mod,
+        "_load_default_agent_config",
+        lambda: {
+            "llm": {
+                "name": "claude-opus-5-5-oauth",
+                "assist": "muse-spark-1.3-contributor-oauth",
+            }
+        },
+    )
+    with pytest.raises(RolePolicyError, match="assist=muse-spark-1.3-contributor-oauth"):
+        await gate_mod.verify_local_wiring()
+
+
 def test_default_role_config_has_zero_warnings():
     """P0N.5: default agent_config.dalton.yaml produces 0 warnings from check_roles()."""
     default_cfg = {
@@ -116,3 +177,4 @@ def test_default_role_config_has_zero_warnings():
         },
     }
     assert check_roles(default_cfg) == []
+

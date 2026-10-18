@@ -322,7 +322,6 @@ async def schedule_dalton_automation_helper(
     if resolved_action == "list":
         rows, _ = await auto_db.list_automations(
             user_id=user_id,
-            workspace_id=ws_id,
             limit=100,
         )
         dalton_rows = [
@@ -336,6 +335,7 @@ async def schedule_dalton_automation_helper(
             }
             for r in rows
             if str(r.get("name") or "").startswith("dalton-")
+            and (not ws_id or str(r.get("workspace_id") or "") == str(ws_id))
         ]
         return {"ok": True, "count": len(dalton_rows), "automations": dalton_rows}
 
@@ -349,8 +349,16 @@ async def schedule_dalton_automation_helper(
     if not valid:
         return {"ok": False, "error": err_msg}
 
-    rows, _ = await auto_db.list_automations(user_id=user_id, workspace_id=ws_id, limit=200)
-    existing = next((r for r in rows if r.get("name") == resolved_name), None)
+    rows, _ = await auto_db.list_automations(user_id=user_id, limit=200)
+    existing = next(
+        (
+            r
+            for r in rows
+            if r.get("name") == resolved_name
+            and (not ws_id or not r.get("workspace_id") or str(r.get("workspace_id")) == str(ws_id))
+        ),
+        None,
+    )
 
     if resolved_action in ("pause", "resume"):
         if not existing:

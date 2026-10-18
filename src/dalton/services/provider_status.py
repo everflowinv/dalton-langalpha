@@ -6,6 +6,7 @@ import asyncio
 import logging
 import os
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -71,6 +72,14 @@ def _load_role_model_assignments() -> list[dict[str, str]]:
     assist = str(llm_cfg.get("assist") or "gemini-3.8-flash-low-oauth")
     if assist:
         roles.append({"role": "assist", "model": assist})
+
+    compaction = str(llm_cfg.get("compaction") or llm_cfg.get("summarization") or "").strip()
+    if compaction:
+        roles.append({"role": "compaction", "model": compaction})
+
+    fetch_m = str(llm_cfg.get("fetch") or "").strip()
+    if fetch_m:
+        roles.append({"role": "fetch", "model": fetch_m})
 
     subagents = ((cfg.get("subagents") or {}).get("definitions")) or {}
     if isinstance(subagents, dict):
@@ -154,8 +163,11 @@ async def _fetch_usage_stats_24h(
                         ts = jr.get("completed_at") or jr.get("created_at")
                         at_iso = ts.isoformat() if hasattr(ts, "isoformat") else str(ts or "")
                         _bump(prov, at_iso, str(jr.get("model_key") or ""), "journal")
-                except Exception:
-                    pass
+                except Exception as jexc:
+                    logger.debug(
+                        "[provider_status] journal stats query skipped: %s",
+                        type(jexc).__name__,
+                    )
     except Exception as e:
         logger.debug("[provider_status] usage stats query skipped: %s", type(e).__name__)
 
@@ -187,14 +199,22 @@ async def get_providers_status(user_id: str = "local-dev-user") -> dict[str, Any
         if prov and prov != "openclaw-broker":
             roles_by_provider.setdefault(prov, []).append(item)
 
-    # Check user BYOK keys
+    # Check user BYOK keys (get_user_api_keys returns {"byok_enabled", "keys": {prov: key}, "base_urls"})
     byok_providers: set[str] = set()
     try:
         from src.server.database.api_keys import get_user_api_keys
 
         rows = await get_user_api_keys(user_id)
         if isinstance(rows, dict):
-            byok_providers = {k for k, v in rows.items() if v}
+            keys_map = rows.get("keys")
+            if isinstance(keys_map, dict):
+                byok_providers = {str(p) for p, v in keys_map.items() if v}
+            else:
+                byok_providers = {
+                    str(k)
+                    for k, v in rows.items()
+                    if k not in ("byok_enabled", "keys", "base_urls") and v
+                }
         elif isinstance(rows, list):
             for r in rows:
                 if isinstance(r, dict) and r.get("provider"):
@@ -367,6 +387,41 @@ def _pick_probe_model(
     return models[0] if models else preferred
 
 
+class _ProbeLLMService:
+    """Adapter allowing `dalton_complete` to execute a PONG probe via a resolved model client."""
+
+    def __init__(self, client: Any) -> None:
+        self._client = client
+
+    async def complete(
+        self,
+        *,
+        user_id: str | None = None,
+        user_prompt: str = "",
+        system_prompt: str | None = None,
+        response_schema: Any = None,
+        slot: str = "background",
+        request_model: str | None = None,
+        is_byok: bool = True,
+        reasoning_effort: str | None = None,
+        disable_tracing: bool = True,
+        return_token_usage: bool = False,
+    ) -> Any:
+        from langchain_core.messages import HumanMessage, SystemMessage
+
+        messages = [
+            SystemMessage(content=system_prompt or "Reply with exactly: PONG"),
+            HumanMessage(content=user_prompt or "ping"),
+        ]
+        resp = await self._client.ainvoke(messages)
+        text = str(getattr(resp, "content", "") or "").strip()
+        raw_usage = getattr(resp, "usage_metadata", None) or {}
+        usage_dict = dict(raw_usage) if isinstance(raw_usage, dict) else {}
+        if return_token_usage:
+            return text, usage_dict
+        return text
+
+
 async def probe_provider(
     provider: str,
     *,
@@ -375,8 +430,7 @@ async def probe_provider(
     model_key: str | None = None,
     timeout_s: float = 30.0,
 ) -> dict[str, Any]:
-    """Run a user-initiated live PONG probe against `provider` (P0N.8 §4)."""
-    from langchain_core.messages import HumanMessage, SystemMessage
+    """Run a user-initiated live PONG probe against `provider` via `dalton_complete` (P0N.8 §4, P0H §4 P1/P2)."""
     from src.llms.llm import ModelConfig
 
     mc = ModelConfig()
@@ -399,18 +453,35 @@ async def probe_provider(
     t0 = time.perf_counter()
     try:
         ensure_provider_enabled(provider)
-        from src.server.services.llm.clients import resolve_llm_client
+        from src.dalton.llm.complete import dalton_complete
+        from src.server.services.llm.clients import resolve_model_client
 
-        client = await resolve_llm_client(selected_model, user_id=user_id)
-        messages = [
-            SystemMessage(content="Reply with exactly: PONG"),
-            HumanMessage(content="ping"),
-        ]
-        resp = await asyncio.wait_for(client.ainvoke(messages), timeout=timeout_s)
+        resolved = await resolve_model_client(
+            user_id,
+            selected_model,
+            is_byok=True,
+            allow_platform_fallback=True,
+        )
+        if resolved.client is None:
+            raise RuntimeError(f"供应商 {provider} ({selected_model}) 凭据未配置或未连接。")
+
+        probe_scope = f"probe:{provider}:{uuid.uuid4().hex[:12]}"
+        comp = await dalton_complete(
+            llm_service=_ProbeLLMService(resolved.client),
+            user_id=user_id,
+            system_prompt="Reply with exactly: PONG",
+            user_prompt="ping",
+            scope_ref=probe_scope,
+            purpose="provider_probe",
+            request_model=selected_model,
+            slot="background",
+            timeout_s=timeout_s,
+            raise_on_error=True,
+        )
         latency_ms = int((time.perf_counter() - t0) * 1000)
-        text = str(getattr(resp, "content", "") or "").strip()
-        usage = getattr(resp, "usage_metadata", None) or {}
-        ok = "PONG" in text.upper() or bool(text)
+        text = str(comp.text or "").strip()
+        usage = dict(comp.usage) if isinstance(comp.usage, dict) else {}
+        ok = "PONG" in text.upper()
         await record_provider_event(
             provider=provider,
             kind="probe_ok" if ok else "probe_fail",
@@ -419,6 +490,8 @@ async def probe_provider(
             detail={
                 "latency_ms": latency_ms,
                 "reply_preview": sanitize_error_text(text[:40]),
+                "cash_usd": comp.cash_usd,
+                "notional_usd": comp.notional_usd,
             },
         )
         return {
@@ -427,7 +500,9 @@ async def probe_provider(
             "model": selected_model,
             "latency_ms": latency_ms,
             "reply": sanitize_error_text(text[:40]),
-            "usage": dict(usage) if isinstance(usage, dict) else {},
+            "usage": usage,
+            "cash_usd": comp.cash_usd,
+            "notional_usd": comp.notional_usd,
             "error_kind": None if ok else "unexpected_reply",
             "message": f"PONG ({latency_ms} ms)" if ok else f"收到非预期回复: {sanitize_error_text(text[:40])}",
         }

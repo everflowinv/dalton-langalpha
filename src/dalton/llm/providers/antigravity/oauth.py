@@ -53,20 +53,22 @@ ANTIGRAVITY_SCOPES = " ".join(
 )
 
 _CALLBACK_TIMEOUT_S = 600  # listener lives 10 minutes, matching Redis TTL
+_LAST_INITIATED_AT: dict[str, datetime] = {}
 
 
-def _record_provider_event_safe(user_id: str | None, kind: str, detail: dict) -> None:
+async def _record_provider_event_safe(user_id: str | None, kind: str, detail: dict) -> None:
     try:
         from src.dalton.database.provider_events import record_provider_event
 
-        record_provider_event(
+        await record_provider_event(
             provider=ANTIGRAVITY_PROVIDER,
             kind=kind,
             user_id=user_id,
             detail=detail,
+            best_effort=True,
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("[antigravity_oauth] record_provider_event skipped: %s", type(exc).__name__)
 
 
 def _generate_pkce_pair() -> tuple[str, str]:
@@ -197,7 +199,9 @@ async def start_login(user_id: str) -> dict:
     """Begin a login: PKCE pair + one-shot loopback callback listener."""
     verifier, challenge = _generate_pkce_pair()
     state = secrets.token_urlsafe(24)
-    initiated_at = datetime.now(timezone.utc).isoformat()
+    now_dt = datetime.now(timezone.utc)
+    _LAST_INITIATED_AT[user_id] = now_dt
+    initiated_at = now_dt.isoformat()
 
     server_future = asyncio.get_running_loop().create_future()
 
@@ -412,9 +416,17 @@ async def check_login_complete(user_id: str) -> bool:
     cache = get_cache_client()
     if cache.enabled and cache.client:
         return bool(await cache.client.get(f"oauth:antigravity:done:{user_id}"))
-    # Redis unavailable: fall back to a DB lookup.
+    # Redis unavailable: fall back to a DB lookup, comparing updated_at against initiated_at (R2-N5N6 #7).
     tokens = await get_oauth_tokens(user_id, ANTIGRAVITY_PROVIDER)
-    return bool(tokens and tokens.get("access_token"))
+    if not tokens or not tokens.get("access_token"):
+        return False
+    initiated_at = _LAST_INITIATED_AT.get(user_id)
+    updated_at = tokens.get("updated_at")
+    if initiated_at is not None and isinstance(updated_at, datetime):
+        upd = updated_at if updated_at.tzinfo else updated_at.replace(tzinfo=timezone.utc)
+        if upd < initiated_at:
+            return False
+    return True
 
 
 async def get_valid_token(user_id: str) -> dict | None:
@@ -458,10 +470,10 @@ async def get_valid_token(user_id: str) -> dict | None:
 
         try:
             await invalidate_oauth_active_cache(user_id)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[antigravity_oauth] invalidate_oauth_active_cache skipped: %s", type(exc).__name__)
 
-        _record_provider_event_safe(
+        await _record_provider_event_safe(
             user_id,
             "refresh_ok",
             {"expires_in": int(new.get("expires_in", 3600))},
@@ -469,7 +481,7 @@ async def get_valid_token(user_id: str) -> dict | None:
         logger.debug(f"[antigravity_oauth] Refreshed tokens for user_id={user_id}")
         return {"access_token": new["access_token"], "plan_type": tokens.get("plan_type")}
     except Exception as e:
-        _record_provider_event_safe(
+        await _record_provider_event_safe(
             user_id,
             "refresh_fail",
             {"error_type": type(e).__name__, "message": str(e)[:160]},
@@ -479,3 +491,4 @@ async def get_valid_token(user_id: str) -> dict | None:
     finally:
         if acquired:
             await cache.release_lock(lock_key, lock_token)
+
