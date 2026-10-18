@@ -44,6 +44,7 @@ from ptc_agent.agent.provenance import (
 from ptc_agent.agent.provenance.types import (
     RESULT_BODY_MAX_BYTES,
 )
+from src.dalton.provenance.declared_sources import expand_declared_sources  # DALTON-HOOK(provenance-declared)
 from ptc_agent.core.paths import (
     AGENT_HISTORY_DIRS,
     LEGACY_ROOT_TOOLS_DIR,
@@ -751,13 +752,15 @@ class ProvenanceMiddleware(AgentMiddleware):
         content = getattr(result, "content", result)
         sha256, size, snippet, body = fingerprint_result_with_body(content)
         args = request.tool_call.get("args")
+        tool_call_id = request.tool_call.get("id")
+        ts = _now_iso()
         yield ProvenanceSource(
             record_id=_new_id(),
             source_type="mcp_tool",
             identifier=f"{server}:{tool}",
-            timestamp=_now_iso(),
+            timestamp=ts,
             provider=f"mcp:{server}",
-            tool_call_id=request.tool_call.get("id"),
+            tool_call_id=tool_call_id,
             args_fingerprint=hash_args(args),
             args=redact_args(args),
             result_sha256=sha256,
@@ -765,6 +768,7 @@ class ProvenanceMiddleware(AgentMiddleware):
             result_snippet=snippet,
             result_body=body,
         )
+        yield from expand_declared_sources(server, tool, body, tool_call_id, timestamp=ts)  # DALTON-HOOK(provenance-declared)
 
     def _extract_execute_code(
         self, request: Any, result: Any
@@ -802,6 +806,9 @@ class ProvenanceMiddleware(AgentMiddleware):
                 if isinstance(raw_ts, str) and raw_ts
                 else _now_iso()
             )
+            clamped_body = _clamp_body_bytes(
+                entry.get("result_body"), RESULT_BODY_MAX_BYTES
+            )
             yield ProvenanceSource(
                 record_id=_new_id(),
                 source_type="mcp_tool",
@@ -822,7 +829,6 @@ class ProvenanceMiddleware(AgentMiddleware):
                 # root fix: NOT the aggregate ExecuteCode stdout). Re-clamped
                 # host-side as the trace is agent-authored. May be absent once
                 # the sandbox's per-execution body budget is exhausted.
-                result_body=_clamp_body_bytes(
-                    entry.get("result_body"), RESULT_BODY_MAX_BYTES
-                ),
+                result_body=clamped_body,
             )
+            yield from expand_declared_sources(server, tool, clamped_body, tool_call_id, timestamp=timestamp)  # DALTON-HOOK(provenance-declared)

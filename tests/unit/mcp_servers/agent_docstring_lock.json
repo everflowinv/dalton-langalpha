@@ -161,6 +161,64 @@
     ],
     "required": []
   },
+  "mcp:dalton_sec:get_company_facts": {
+    "doc_lines": [
+      "Fetch period-normalized SEC XBRL facts with restatement and derived-Q4 support.",
+      "",
+      "Supports calendar (2025Q2), fiscal (FY2026Q1), annual (FY2025), YTD (H1 2025,",
+      "9M 2025), latest_quarter, latest_annual, and trailing:8q/3y periods. Derives Q4",
+      "flow facts as FY minus 9M when a standalone Q4 fact is absent.",
+      "",
+      "Args:",
+      "    ticker: Stock ticker symbol or CIK (e.g. META, MSFT, AMZN).",
+      "    concepts: XBRL concept name(s) or alias(es), comma-separated or list.",
+      "    period: Target period (default 'latest_quarter').",
+      "    restatement: 'as_reported' (earliest filing) or 'latest' (most recent).",
+      "    as_of: Optional YYYY-MM-DD point-in-time filing date cutoff.",
+      "    fiscal_year_end_month: Optional fiscal year-end month override (1-12).",
+      "",
+      "Returns:",
+      "    dict: Normalized facts per concept with period, value, unit, and _declared_sources."
+    ],
+    "params": [
+      "as_of",
+      "concepts",
+      "fiscal_year_end_month",
+      "period",
+      "restatement",
+      "ticker"
+    ],
+    "required": [
+      "concepts",
+      "ticker"
+    ]
+  },
+  "mcp:dalton_sec:list_filings": {
+    "doc_lines": [
+      "List recent SEC EDGAR filings for a company with accession and report dates.",
+      "",
+      "Filters filings by form type and optional point-in-time filing date cutoff,",
+      "returning direct SEC EDGAR archive URLs and _declared_sources metadata.",
+      "",
+      "Args:",
+      "    ticker: Stock ticker symbol or CIK (e.g. META, MSFT, AMZN).",
+      "    forms: Comma-separated SEC form types (default '10-K,10-Q,20-F,6-K').",
+      "    limit: Maximum number of filings to return (1-50, default 10).",
+      "    as_of: Optional YYYY-MM-DD point-in-time filing date cutoff.",
+      "",
+      "Returns:",
+      "    dict: Filing list with form, filing_date, report_date, accession_no, and url."
+    ],
+    "params": [
+      "as_of",
+      "forms",
+      "limit",
+      "ticker"
+    ],
+    "required": [
+      "ticker"
+    ]
+  },
   "mcp:fundamentals:get_dividends_and_splits": {
     "doc_lines": [
       "Fetch historical dividend payments and stock splits — analyze dividend",

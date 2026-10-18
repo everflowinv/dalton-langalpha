@@ -29,6 +29,7 @@ import { AnimatedTabs } from '@/components/ui/animated-tabs';
 import { workspaceRelativePath } from '@/pages/ChatAgent/utils/agentPaths';
 import { isTaskAgentId } from '@/pages/ChatAgent/utils/agentId';
 import { Favicon } from './Favicon';
+import { ResearchDocSource } from './dalton/ResearchDocSource'; // DALTON-HOOK(provenance-type)
 import './SourcesPanel.css';
 import { deckHeight, deckPeekLayers, deckSlot, useDeckCollapse, type DeckGeometry } from '@/components/ui/cardDeck';
 
@@ -43,6 +44,7 @@ const GROUP_ORDER: ProvenanceSourceType[] = [
   'web_search',
   'web_fetch',
   'sec_filing',
+  'research_doc', // DALTON-HOOK(provenance-type)
   'market_data',
   'mcp_tool',
   'file_read',
@@ -561,6 +563,10 @@ function SourceRow({
   // List decks dedup by URL; entity decks dedup by content hash (see distinctByContent).
   const distinct = distinctByContent(records, isWebSearch || isWebFetch);
   const title = recordTitle(t, record);
+
+  if (record.source_type === 'research_doc') { // DALTON-HOOK(provenance-type)
+    return <ResearchDocSource record={record} records={records} onOpenRecord={onOpenRecord} />;
+  }
 
   if (distinct.length <= 1) {
     const kind = kindLabel(t, record.detail);

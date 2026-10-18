@@ -131,7 +131,8 @@ export type ProvenanceSourceType =
   | 'memory_read'
   | 'sec_filing'
   | 'market_data'
-  | 'mcp_tool';
+  | 'mcp_tool'
+  | 'research_doc'; // DALTON-HOOK(provenance-type)
 
 export interface ProvenanceEvent extends BaseSSEEvent {
   event: 'provenance';

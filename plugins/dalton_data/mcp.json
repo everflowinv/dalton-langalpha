@@ -1,0 +1,21 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+  "mcpServers": {
+    "researchdata": {
+      "type": "streamable-http",
+      "url": "${DALTON_RESEARCHDATA_URL}"
+    },
+    "dalton_sec": {
+      "type": "stdio",
+      "command": "uv",
+      "args": [
+        "run",
+        "python",
+        "plugins/dalton_data/dalton_sec_mcp_server.py"
+      ],
+      "env": {
+        "SEC_USER_AGENT": "${SEC_USER_AGENT}"
+      }
+    }
+  }
+}

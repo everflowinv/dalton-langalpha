@@ -278,6 +278,7 @@ def merge_ledger(ledger):
         "untrusted",
         "relay_bound",
         "credential_files",
+        "call_timeout_s",  # DALTON-HOOK(mcp-call-timeout)
     )
     old_executable = {
         name: {key: entry.get(key) for key in executable_keys if key in entry}

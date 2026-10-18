@@ -35,6 +35,7 @@ _SERVERS = {
     "yf_market": "plugins.yfinance.yf_market_mcp_server",
     "yf_analysis": "plugins.yfinance.yf_analysis_mcp_server",
     "yf_fundamentals": "plugins.yfinance.yf_fundamentals_mcp_server",
+    "dalton_sec": "plugins.dalton_data.dalton_sec_mcp_server",
 }
 
 # Target is ~800 chars (AGENT_CONTRACT.md); the hard cap leaves slight headroom.
