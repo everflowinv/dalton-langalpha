@@ -9,7 +9,15 @@ import re
 from pathlib import Path
 from typing import Any
 
-from src.dalton.publish.numbers import ExtractedFigure, normalize_period
+from src.dalton.publish.numbers import (
+    ExtractedFigure,
+    _determine_unit_and_scale,
+    _extract_metric_from_context,
+    _NUMBER_RE,
+    _PERIOD_TOKEN_RE,
+    extract_figures,
+    normalize_period,
+)
 from src.dalton.settings import get_dalton_config
 
 DEFAULT_METRIC_ALIASES: dict[str, list[str]] = {
@@ -28,27 +36,64 @@ DEFAULT_METRIC_ALIASES: dict[str, list[str]] = {
     "pe": ["p/e", "pe", "市盈率", "估值倍数"],
     "target_price": ["target price", "tp", "目标价"],
     "irr": ["irr", "内部收益率", "预期回报率"],
+    "rd_expense": ["r&d", "research and development", "研发费用", "研发开支", "研发支出", "研发投入"],
+    "sm_expense": ["s&m", "sales and marketing", "销售及营销费用", "销售费用", "营销费用"],
+    "ga_expense": ["g&a", "general and administrative", "一般及行政费用", "管理费用"],
+    "market_share": ["market share", "市场份额", "市占率", "份额"],
 }
 
 UNIT_BASE: dict[str, tuple[float, str]] = {
     "USD": (1.0, "USD"),
     "USD_mn": (1e6, "USD"),
+    "USD_100mn": (1e8, "USD"),
     "USD_bn": (1e9, "USD"),
     "HKD": (1.0, "HKD"),
     "HKD_mn": (1e6, "HKD"),
+    "HKD_100mn": (1e8, "HKD"),
     "HKD_bn": (1e9, "HKD"),
     "CNY": (1.0, "CNY"),
     "CNY_mn": (1e6, "CNY"),
     "CNY_100mn": (1e8, "CNY"),
     "CNY_bn": (1e9, "CNY"),
     "pct": (1.0, "pct"),
+    "%": (1.0, "pct"),
+    "pp": (1.0, "pct"),
     "bp": (0.01, "pct"),
+    "bps": (0.01, "pct"),
     "x": (1.0, "x"),
     "count": (1.0, "count"),
     "count_mn": (1e6, "count"),
     "per_share": (1.0, "USD"),
+    "raw": (1.0, "other"),
     "other": (1.0, "other"),
 }
+
+_GROWTH_WORDS = (
+    "同比",
+    "环比",
+    "增速",
+    "增长",
+    "下滑",
+    "下降",
+    "变动",
+    "增幅",
+    "降幅",
+    "yoy",
+    "qoq",
+    "cagr",
+    "growth",
+)
+_MARGIN_WORDS = (
+    "利润率",
+    "毛利率",
+    "净利率",
+    "费率",
+    "税率",
+    "转化率",
+    "留存率",
+    "渗透率",
+    "margin",
+)
 
 
 @dataclasses.dataclass
@@ -117,6 +162,21 @@ def metrics_match(
         return True
     s1 = " ".join(m1.lower().split())
     s2 = " ".join(m2.lower().split())
+    if s1 == s2:
+        return True
+
+    # Prevent matching a level metric ("广告收入") against its growth rate ("广告收入同比增速")
+    # or an income level ("营业利润") against a margin ("营业利润率").
+    has_growth_1 = any(w in s1 for w in _GROWTH_WORDS)
+    has_growth_2 = any(w in s2 for w in _GROWTH_WORDS)
+    if has_growth_1 != has_growth_2:
+        return False
+
+    has_margin_1 = any(w in s1 for w in _MARGIN_WORDS)
+    has_margin_2 = any(w in s2 for w in _MARGIN_WORDS)
+    if has_margin_1 != has_margin_2:
+        return False
+
     if s1 in s2 or s2 in s1:
         return True
     g1 = canonical_metric_group(s1, aliases)
@@ -126,7 +186,16 @@ def metrics_match(
     # Token overlap check for Chinese/English compound metrics
     tokens1 = set(re.findall(r"[a-z0-9]+|[\u4e00-\u9fff]{2,}", s1))
     tokens2 = set(re.findall(r"[a-z0-9]+|[\u4e00-\u9fff]{2,}", s2))
-    common = tokens1 & tokens2 - {"同比", "环比", "增速", "增长", "一季度", "二季度", "三季度", "四季度"}
+    common = tokens1 & tokens2 - {
+        "同比",
+        "环比",
+        "增速",
+        "增长",
+        "一季度",
+        "二季度",
+        "三季度",
+        "四季度",
+    }
     return len(common) > 0
 
 
@@ -151,25 +220,48 @@ def values_within_tolerance(
     fig_base, fig_dim = _to_base(fig.value, fig.unit, fig.scale)
     src_base, src_dim = _to_base(src_value, src_unit, src_scale)
 
-    # Half-ULP tolerance in the figure's displayed precision
+    # Half-ULP tolerance in the figure's displayed precision, or 1% relative for derived percentages
     ulp_half = 0.5 * (10.0 ** (-fig.decimals))
-    if fig.unit == "pct" or src_unit == "pct":
-        tol_display = max(0.05, ulp_half)
+    if fig.unit in ("pct", "%") or src_unit in ("pct", "%"):
+        if fig.label_hint == "derived" and fig.value != 0:
+            tol_display = max(0.05, ulp_half, abs(fig.value) * 0.01)
+        else:
+            tol_display = max(0.05, ulp_half)
     else:
         tol_display = ulp_half
 
-    fig_effective_scale = fig.scale if fig.scale > 1.0 else UNIT_BASE.get(fig.unit, (1.0, ""))[0]
+    fig_effective_scale = (
+        fig.scale if fig.scale > 1.0 else UNIT_BASE.get(fig.unit, (1.0, ""))[0]
+    )
     tol_base = tol_display * fig_effective_scale
 
-    # Direct base-value match (same dimension or one is generic 'other')
-    if fig_dim == src_dim or "other" in (fig_dim, src_dim):
+    # Allow currency-dimension to match currency-agnostic scaled counts ('63.4 bn' vs '$63.4bn')
+    dims_compatible = (
+        fig_dim == src_dim
+        or "other" in (fig_dim, src_dim)
+        or (fig_dim in ("USD", "CNY", "HKD") and src_dim == "count")
+        or (src_dim in ("USD", "CNY", "HKD") and fig_dim == "count")
+    )
+
+    if dims_compatible:
         diff_base = abs(fig_base - src_base)
         if diff_base <= tol_base * 1.0001:
             return True, False, 0.0
 
-    # Direct unscaled number match when source unit is identical to figure unit
+    # Percentage vs decimal ratio (e.g. 21% vs 0.21)
+    if fig_dim == "pct" and src_dim == "other" and 0 < abs(src_value) <= 1.0:
+        if abs(fig.value - src_value * 100.0) <= tol_display * 1.0001:
+            return True, False, 0.0
+
+    # Chinese prose '翻倍' (2.0x) vs '+100%' (100 pct)
+    if fig.raw in ("翻倍", "翻一番") and src_dim == "pct" and abs(src_value - 100.0) <= 0.5:
+        return True, False, 0.0
+
+    # Direct unscaled number match when source unit is identical to figure unit (and same scale)
     if abs(fig.value - src_value) <= tol_display * 1.0001:
-        if fig.unit == src_unit or "other" in (fig.unit, src_unit):
+        if (fig.unit == src_unit and fig.scale == (src_scale if src_scale > 1.0 else fig.scale)) or (
+            src_unit == "other" and fig.scale == 1.0 and src_scale == 1.0
+        ):
             return True, False, 0.0
         # Same raw number (or 10x/1000x factor) but different unit/scale -> unit_mismatch!
         return False, True, abs(fig_base - src_base)
@@ -199,70 +291,124 @@ def _is_consensus_provenance(prov_rec: dict[str, Any]) -> bool:
     return False
 
 
-def _number_representations(fig: ExtractedFigure) -> list[str]:
-    """Generate string representations of ``fig`` to search inside provenance bodies."""
-    reps: set[str] = set()
-    val = abs(fig.value)
-    if fig.decimals == 0:
-        ival = int(round(val))
-        reps.add(str(ival))
-        reps.add(f"{ival:,}")
-    else:
-        s = f"{val:.{fig.decimals}f}"
-        reps.add(s)
-        parts = s.split(".")
-        reps.add(f"{int(parts[0]):,}.{parts[1]}")
+def _inspect_text_source(
+    fig: ExtractedFigure,
+    body: str,
+    *,
+    source_id: str = "",
+    kind: str = "prov",
+    metric_aliases: dict[str, list[str]] | None = None,
+) -> tuple[bool, str, str | None, list[MatchCandidate]]:
+    """Unit-normalized numeric comparison in a text body with period and metric compatibility (G3.1 R4-3).
 
-    # If scaled in 亿 (1e8), also check bn (1e9) and mn (1e6) equivalents!
-    base_val = abs(fig.scaled_value)
-    if base_val >= 1e6:
-        in_bn = base_val / 1e9
-        in_mn = base_val / 1e6
-        in_yi = base_val / 1e8
-        for candidate in (in_bn, in_mn, in_yi):
-            if candidate >= 0.01:
-                if abs(candidate - round(candidate)) < 1e-6:
-                    iv = int(round(candidate))
-                    reps.add(str(iv))
-                    reps.add(f"{iv:,}")
-                else:
-                    reps.add(f"{candidate:.1f}".rstrip("0").rstrip("."))
-                    reps.add(f"{candidate:.2f}".rstrip("0").rstrip("."))
-    return sorted(reps, key=len, reverse=True)
+    Returns ``(matched, excerpt, failure_reason, candidates)``.
+    """
+    if not body or not body.strip():
+        return False, "", None, []
+
+    src_figures = extract_figures(body)
+    fig_p = normalize_period(fig.period)
+    all_body_periods = {
+        normalize_period(pm.group(1)) for pm in _PERIOD_TOKEN_RE.finditer(body)
+    } - {""}
+
+    cands: list[MatchCandidate] = []
+    best_reason: str | None = None
+
+    for sf in src_figures:
+        if sf.exempt:
+            continue
+        # Check metric compatibility when the source figure has an identifiable metric
+        if sf.metric and fig.metric:
+            if not metrics_match(fig.metric, sf.metric, metric_aliases):
+                continue
+
+        sf_p = normalize_period(sf.period)
+        ok_val, unit_mis, _ = values_within_tolerance(
+            fig, sf.value, sf.unit, sf.scale
+        )
+
+        # Period compatibility check
+        if fig_p:
+            if sf_p and sf_p != fig_p:
+                if ok_val:
+                    best_reason = best_reason or "period_mismatch"
+                    cands.append(
+                        MatchCandidate(
+                            kind=kind,
+                            id=source_id,
+                            value=sf.value,
+                            unit=sf.unit,
+                            period=sf_p,
+                            why=f"期间不匹配：正文为 {fig_p}，来源 {source_id} 为 {sf_p}",
+                        )
+                    )
+                continue
+            if not sf_p and all_body_periods and fig_p not in all_body_periods:
+                if ok_val:
+                    other_p = sorted(all_body_periods)[0]
+                    best_reason = best_reason or "period_mismatch"
+                    cands.append(
+                        MatchCandidate(
+                            kind=kind,
+                            id=source_id,
+                            value=sf.value,
+                            unit=sf.unit,
+                            period=other_p,
+                            why=f"期间不匹配：正文为 {fig_p}，来源 {source_id} 期间为 {other_p}",
+                        )
+                    )
+                continue
+
+        if ok_val:
+            excerpt = str(sf.location.get("sentence") or body[:160]).strip()
+            return True, excerpt[:200], None, []
+
+        if unit_mis:
+            best_reason = "unit_mismatch"
+            cands.append(
+                MatchCandidate(
+                    kind=kind,
+                    id=source_id,
+                    value=sf.value,
+                    unit=sf.unit,
+                    period=sf_p or fig_p,
+                    why=f"单位/量级不匹配：正文为 {fig.raw} ({fig.unit})，来源 {source_id} 为 {sf.raw} ({sf.unit})",
+                )
+            )
+        else:
+            best_reason = best_reason or "source_conflict"
+            cands.append(
+                MatchCandidate(
+                    kind=kind,
+                    id=source_id,
+                    value=sf.value,
+                    unit=sf.unit,
+                    period=sf_p or fig_p,
+                    why=f"数值冲突：正文为 {fig.raw}，来源 {source_id} 为 {sf.raw}",
+                )
+            )
+
+    return False, "", best_reason, cands
 
 
 def _match_in_provenance_record(
     fig: ExtractedFigure,
     prov: dict[str, Any],
+    metric_aliases: dict[str, list[str]] | None = None,
 ) -> tuple[bool, str]:
-    """Search ``prov`` body for ``fig`` value within ±300 chars of metric and period (PK.9 rule 3)."""
-    body = str(prov.get("body") or prov.get("body_inline") or prov.get("result_snippet") or "")
-    if not body:
-        return False, ""
-
-    reps = _number_representations(fig)
-    period_norm = normalize_period(fig.period)
-    for rep in reps:
-        if not rep:
-            continue
-        pat = re.compile(rf"(?<!\d){re.escape(rep)}(?!\d)")
-        for m in pat.finditer(body):
-            win_start = max(0, m.start() - 300)
-            win_end = min(len(body), m.end() + 300)
-            window = body[win_start:win_end]
-            # Check period if fig has a period
-            if period_norm:
-                p_short = period_norm.replace("FY20", "FY")
-                if (
-                    period_norm.lower() not in window.lower()
-                    and p_short.lower() not in window.lower()
-                ):
-                    continue
-            excerpt = " ".join(
-                body[max(0, m.start() - 60) : min(len(body), m.end() + 60)].split()
-            )
-            return True, excerpt
-    return False, ""
+    """Search ``prov`` body for ``fig`` using unit-normalized numeric comparison + period/metric check (G3.1)."""
+    body = str(
+        prov.get("body") or prov.get("body_inline") or prov.get("result_snippet") or ""
+    )
+    hit, excerpt, _, _ = _inspect_text_source(
+        fig,
+        body,
+        source_id=str(prov.get("id") or ""),
+        kind="prov",
+        metric_aliases=metric_aliases,
+    )
+    return hit, excerpt
 
 
 def read_xlsx_cell(
@@ -356,17 +502,20 @@ def match_figures(
             eid = target_ref.split(":", 1)[1].strip()
             ev = evidence_by_id.get(eid)
             if not ev:
+                # Fallback: try hyphen-normalized ID (e.g. E0001 <-> E-0001)
+                norm_eid = eid.replace("-", "").upper()
+                for k_id, v_ev in evidence_by_id.items():
+                    if k_id.replace("-", "").upper() == norm_eid:
+                        ev = v_ev
+                        eid = k_id
+                        break
+            if not ev:
                 return MatchOutcome(
                     figure=fig,
                     matched=False,
                     reason="unverified",
                     hint=f"Evidence {eid} not found in thesis.json",
                 )
-            src_info = ev.get("source") or {}
-            is_ev_consensus = (
-                src_info.get("type") == "broker_report"
-                and "consensus" in str(src_info.get("identity") or "").lower()
-            )
             cands: list[MatchCandidate] = []
             best_reason: str | None = None
             for ef in ev.get("figures") or []:
@@ -452,6 +601,35 @@ def match_figures(
                             why=f"数值冲突：正文为 {fig.raw}，来源 {eid} 为 {ef_val} {ef_unit}",
                         )
                     )
+
+            # Also inspect evidence fact text if structured figures[] did not match
+            fact_text = str(ev.get("fact") or "")
+            if not cands and fact_text:
+                f_hit, f_excerpt, f_reason, f_cands = _inspect_text_source(
+                    fig,
+                    fact_text,
+                    source_id=eid,
+                    kind="evidence",
+                    metric_aliases=metric_aliases,
+                )
+                if f_hit:
+                    if fig.label_hint == "consensus":
+                        return MatchOutcome(
+                            figure=fig,
+                            matched=False,
+                            reason="consensus_confusion",
+                            hint="一致预期数字必须使用 prov:<record> 脚注并指向一致预期数据接口",
+                        )
+                    return MatchOutcome(
+                        figure=fig,
+                        matched=True,
+                        kind="evidence",
+                        ref=eid,
+                        excerpt=f_excerpt or fact_text,
+                    )
+                if f_cands:
+                    cands.extend(f_cands)
+                    best_reason = best_reason or f_reason
 
             if cands:
                 return MatchOutcome(
@@ -580,7 +758,19 @@ def match_figures(
                     reason="consensus_confusion",
                     hint=f"来源 {pid} 是一致预期接口，但正文将数字表述为 {fig.label_hint}",
                 )
-            hit, excerpt = _match_in_provenance_record(fig, prec)
+            body_text = str(
+                prec.get("body")
+                or prec.get("body_inline")
+                or prec.get("result_snippet")
+                or ""
+            )
+            hit, excerpt, prov_reason, prov_cands = _inspect_text_source(
+                fig,
+                body_text,
+                source_id=pid,
+                kind="prov",
+                metric_aliases=metric_aliases,
+            )
             if hit:
                 return MatchOutcome(
                     figure=fig,
@@ -593,8 +783,9 @@ def match_figures(
             return MatchOutcome(
                 figure=fig,
                 matched=False,
-                reason="source_conflict",
-                hint=f"Provenance {pid} body does not contain {fig.raw} for {fig.period}",
+                reason=prov_reason or "source_conflict",
+                hint=f"Provenance {pid} body does not match {fig.raw} ({fig.unit}) for {fig.period}",
+                candidates=prov_cands,
             )
 
         return None
@@ -648,7 +839,7 @@ def match_figures(
             found_cons: MatchOutcome | None = None
             for pid, prec in prov_map.items():
                 if _is_consensus_provenance(prec):
-                    hit, excerpt = _match_in_provenance_record(fig, prec)
+                    hit, excerpt = _match_in_provenance_record(fig, prec, metric_aliases)
                     if hit:
                         found_cons = MatchOutcome(
                             figure=fig,
@@ -657,6 +848,29 @@ def match_figures(
                             ref=pid,
                             excerpt=excerpt,
                             source_sha256=str(prec.get("result_sha256") or ""),
+                        )
+                        break
+            if not found_cons:
+                mv_figs = ((thesis_doc or {}).get("market_view") or {}).get("figures") or []
+                for mvf in mv_figs:
+                    if not isinstance(mvf, dict) or mvf.get("value") is None:
+                        continue
+                    if not metrics_match(fig.metric, str(mvf.get("metric") or ""), metric_aliases):
+                        continue
+                    mv_p = normalize_period(mvf.get("period"))
+                    fig_p = normalize_period(fig.period)
+                    if fig_p and mv_p and fig_p != mv_p:
+                        continue
+                    ok_v, _, _ = values_within_tolerance(
+                        fig, float(mvf["value"]), str(mvf.get("unit") or fig.unit)
+                    )
+                    if ok_v:
+                        found_cons = MatchOutcome(
+                            figure=fig,
+                            matched=True,
+                            kind="prov",
+                            ref="thesis:market_view",
+                            excerpt=f"market_view: {mvf.get('metric')} {mvf.get('period')} = {mvf.get('value')} {mvf.get('unit')}",
                         )
                         break
             if found_cons:
@@ -743,16 +957,27 @@ def match_figures(
 
         # 4c. Search provenance records
         for pid, prec in prov_map.items():
+            body_text = str(
+                prec.get("body")
+                or prec.get("body_inline")
+                or prec.get("result_snippet")
+                or ""
+            )
+            hit, excerpt, prov_reason, prov_cands = _inspect_text_source(
+                fig,
+                body_text,
+                source_id=pid,
+                kind="prov",
+                metric_aliases=metric_aliases,
+            )
             if _is_consensus_provenance(prec) and fig.label_hint in (
                 "estimate",
                 "reported",
                 "guidance",
             ):
-                hit, _ = _match_in_provenance_record(fig, prec)
                 if hit:
                     best_failure_reason = "consensus_confusion"
                     continue
-            hit, excerpt = _match_in_provenance_record(fig, prec)
             if hit:
                 matched_auto = MatchOutcome(
                     figure=fig,
@@ -763,6 +988,17 @@ def match_figures(
                     source_sha256=str(prec.get("result_sha256") or ""),
                 )
                 break
+            if prov_cands:
+                if prov_reason == "unit_mismatch" and best_failure_reason != "consensus_confusion":
+                    best_failure_reason = "unit_mismatch"
+                elif prov_reason == "period_mismatch" and best_failure_reason not in (
+                    "consensus_confusion",
+                    "unit_mismatch",
+                ):
+                    best_failure_reason = "period_mismatch"
+                elif prov_reason == "source_conflict" and not best_failure_reason:
+                    best_failure_reason = "source_conflict"
+                auto_candidates.extend(prov_cands)
 
         if matched_auto:
             outcomes.append(matched_auto)
@@ -831,3 +1067,165 @@ def match_figures(
             )
 
     return outcomes
+
+
+def retrieve_candidate_sources(
+    fig: ExtractedFigure,
+    *,
+    thesis_doc: dict[str, Any] | None = None,
+    models_doc: dict[str, Any] | None = None,
+    model_cells: dict[str, dict[str, Any]] | None = None,
+    provenance_records: dict[str, dict[str, Any]] | None = None,
+    facts_ledger: dict[str, dict[str, Any]] | None = None,
+    metric_aliases: dict[str, list[str]] | None = None,
+    limit: int = 5,
+) -> list[dict[str, Any]]:
+    """Retrieve up to ``limit`` (default 5) candidate source snippets for ``fig`` (G3.1 step 3)."""
+    scored: list[tuple[int, dict[str, Any]]] = []
+    fig_p = normalize_period(fig.period)
+    fn_target = (fig.footnote_target or "").strip()
+
+    # 1. thesis.json evidence[]
+    for ev in (thesis_doc or {}).get("evidence") or []:
+        if not isinstance(ev, dict) or "id" not in ev:
+            continue
+        eid = str(ev["id"])
+        score = 0
+        if fn_target == f"evidence:{eid}" or fn_target.replace("-", "").upper() == f"EVIDENCE:{eid.replace('-', '').upper()}":
+            score += 20
+        fact_str = str(ev.get("fact") or "")
+        fig_lines: list[str] = []
+        for ef in ev.get("figures") or []:
+            if not isinstance(ef, dict):
+                continue
+            ef_m = str(ef.get("metric") or "")
+            ef_p = normalize_period(ef.get("period"))
+            if fig.metric and ef_m and metrics_match(fig.metric, ef_m, metric_aliases):
+                score += 5
+            if fig_p and ef_p and fig_p == ef_p:
+                score += 3
+            fig_lines.append(
+                f"{ef_m} ({ef.get('period') or ''}): {ef.get('value')} {ef.get('unit') or ''}"
+            )
+        if fig.metric and fact_str and metrics_match(fig.metric, fact_str, metric_aliases):
+            score += 3
+        if fig_p and fig_p.lower() in fact_str.lower():
+            score += 2
+        if score > 0:
+            combined_text = fact_str
+            if fig_lines:
+                combined_text = f"{fact_str} | Figures: {'; '.join(fig_lines)}".strip(" |")
+            scored.append(
+                (
+                    score,
+                    {
+                        "source_id": eid,
+                        "ref": f"evidence:{eid}",
+                        "kind": "evidence",
+                        "text": combined_text,
+                    },
+                )
+            )
+
+    # 2. models.json + model_cells
+    merged_cells = dict(model_cells or {})
+    for ver in (models_doc or {}).get("versions") or []:
+        if not isinstance(ver, dict):
+            continue
+        vpath = ver.get("path") or ""
+        for ko in ver.get("key_outputs") or []:
+            if isinstance(ko, dict) and ko.get("cell") and ko.get("value") is not None:
+                key = f"{vpath}#{ko['cell']}"
+                merged_cells.setdefault(
+                    key,
+                    {
+                        "value": float(ko["value"]),
+                        "unit": ko.get("unit") or "other",
+                        "period": normalize_period(ko.get("period")),
+                        "metric": ko.get("name") or "",
+                    },
+                )
+    for m_spec, c_info in merged_cells.items():
+        score = 0
+        if fn_target == f"model:{m_spec}":
+            score += 20
+        cm = str(c_info.get("metric") or "")
+        cp = normalize_period(c_info.get("period"))
+        if fig.metric and cm and metrics_match(fig.metric, cm, metric_aliases):
+            score += 5
+        if fig_p and cp and fig_p == cp:
+            score += 3
+        if score > 0:
+            scored.append(
+                (
+                    score,
+                    {
+                        "source_id": m_spec,
+                        "ref": f"model:{m_spec}",
+                        "kind": "model",
+                        "text": f"{m_spec} ({cm} {cp}): {c_info.get('value')} {c_info.get('unit') or ''}".strip(),
+                    },
+                )
+            )
+
+    # 3. provenance_records
+    for pid, prec in (provenance_records or {}).items():
+        if not isinstance(prec, dict):
+            continue
+        score = 0
+        if fn_target == f"prov:{pid}":
+            score += 20
+        body = str(
+            prec.get("body")
+            or prec.get("body_inline")
+            or prec.get("result_snippet")
+            or ""
+        )
+        if not body:
+            continue
+        if fig.metric and metrics_match(fig.metric, body, metric_aliases):
+            score += 4
+        if fig_p and fig_p.lower() in body.lower():
+            score += 2
+        if score > 0:
+            scored.append(
+                (
+                    score,
+                    {
+                        "source_id": pid,
+                        "ref": f"prov:{pid}",
+                        "kind": "prov",
+                        "text": body[:1000],
+                    },
+                )
+            )
+
+    # 4. facts_ledger
+    for fid, frow in (facts_ledger or {}).items():
+        if not isinstance(frow, dict):
+            continue
+        score = 0
+        if fn_target == f"f:{fid}":
+            score += 20
+        fm = str(frow.get("metric") or "")
+        fp = normalize_period(frow.get("period"))
+        if fig.metric and fm and metrics_match(fig.metric, fm, metric_aliases):
+            score += 5
+        if fig_p and fp and fig_p == fp:
+            score += 3
+        if score > 0:
+            scored.append(
+                (
+                    score,
+                    {
+                        "source_id": fid,
+                        "ref": f"f:{fid}",
+                        "kind": "facts",
+                        "text": f"{fm} ({fp}): {frow.get('value')} {frow.get('unit') or ''} (ref={frow.get('ref') or ''})",
+                    },
+                )
+            )
+
+    scored.sort(key=lambda item: item[0], reverse=True)
+    return [item[1] for item in scored[:limit]]
+

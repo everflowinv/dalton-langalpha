@@ -12,7 +12,7 @@ import { useConfiguredProviders, type ConfiguredProvider } from '@/hooks/useConf
 import { useUser } from '@/hooks/useUser';
 import { usePreferences } from '@/hooks/usePreferences';
 import { useUpdatePreferences } from '@/hooks/useUpdatePreferences';
-import { deleteUserApiKey, disconnectAntigravityOAuth, disconnectMuseOAuth, disconnectCodexOAuth, disconnectClaudeOAuth, getCurrentUser } from '@/pages/Dashboard/utils/api';
+import { deleteUserApiKey, disconnectCodexOAuth, disconnectClaudeOAuth, getCurrentUser } from '@/pages/Dashboard/utils/api';
 import type { AccessType } from '@/components/model/types';
 import { isPlatformMode } from '@/config/hostMode';
 import { useAllModels } from '@/hooks/useAllModels';
@@ -192,12 +192,11 @@ export default function MethodStep() {
         } else if (provider.provider === 'claude-oauth') {
           await disconnectClaudeOAuth();
           queryClient.invalidateQueries({ queryKey: queryKeys.oauth.claude() });
-        } else if (provider.provider === 'antigravity-oauth') {
-          await disconnectAntigravityOAuth();
-          queryClient.invalidateQueries({ queryKey: queryKeys.oauth.antigravity() });
-        } else if (provider.provider === 'muse-oauth') {
-          await disconnectMuseOAuth();
-          queryClient.invalidateQueries({ queryKey: queryKeys.oauth.muse() });
+        } else {
+          // DALTON-HOOK(native-oauth-ui): P0N.3 disconnect Antigravity / Meta Muse
+          const { disconnectDaltonOAuth } = await import('@/pages/Settings/utils/daltonOAuthApi');
+          await disconnectDaltonOAuth(provider.provider);
+          queryClient.invalidateQueries({ queryKey: queryKeys.oauth.all });
         }
       } else {
         // Remove API key

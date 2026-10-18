@@ -83,7 +83,7 @@ function healthPillMeta(health: OpenClawHealthResponse | undefined, t: (k: strin
   }
 }
 
-export function OpenClawCard() {
+export function OpenClawCard({ embedded = false }: { embedded?: boolean } = {}) {
   const { t } = useTranslation();
   const statusQuery = useOpenClawStatus(true);
   const healthQuery = useOpenClawHealth(true);
@@ -133,11 +133,15 @@ export function OpenClawCard() {
 
   return (
     <div
-      className="flex flex-col gap-3 p-4 rounded-lg"
-      style={{
-        backgroundColor: 'var(--color-bg-card)',
-        border: '1px solid var(--color-border-default)',
-      }}
+      className={embedded ? 'flex flex-col gap-3' : 'flex flex-col gap-3 p-4 rounded-lg'}
+      style={
+        embedded
+          ? undefined
+          : {
+              backgroundColor: 'var(--color-bg-card)',
+              border: '1px solid var(--color-border-default)',
+            }
+      }
       data-testid="dalton-openclaw-card"
     >
       {/* Header row */}

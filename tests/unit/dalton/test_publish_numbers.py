@@ -336,3 +336,239 @@ async def test_published_files_immutability_and_collision_suffix() -> None:
     b_sha1 = compute_bundle_sha256(b"draft", [("model", "model/a.xlsx", b"123")])
     b_sha2 = compute_bundle_sha256(b"draft", [("model", "model/a.xlsx", b"123")])
     assert b_sha1 == b_sha2
+
+
+def test_g31_counterexamples_units_footnotes_tables_and_sec_accession() -> None:
+    # 1. SEC accession (0001326801-26-000042) & doc code (10-K-2026-03) must NOT be extracted (R4-5)
+    # 2. Inline footnote [^E0001] without footer definition resolves to evidence:E0001
+    # 3. Cross-scale unit normalization: 512 亿美元 == $51.2B (51.2 USD_bn)
+    # 4. Table header unit inheritance: 广告收入（亿美元） -> unit CNY_100mn, metric "广告收入" (R4-4)
+    # 5. Chinese prose quantifiers: 三成 -> 30%, 翻倍 -> 100%
+    draft = """# META 2Q26 财报复盘（Filing 10-K-2026-03, Accession 0001326801-26-000042）
+
+2Q26 广告收入 512 亿美元，同比 +21%[^E0001]；核心 AI 广告转化率提升约三成[^E0001]。
+
+| 期间 | 广告收入（亿美元） | 同比增速 |
+| :--- | :---: | :---: |
+| 2Q26 | 512[^E0001] | +21%[^E0001] |
+"""
+    figs = extract_figures(draft)
+    raws = [f.raw for f in figs]
+    # Accession and doc codes excluded
+    assert not any("0001326801" in r or "000042" in r or "2026-03" in r for r in raws)
+    # Chinese quantifier extracted
+    assert "三成" in raws
+    san_cheng = next(f for f in figs if f.raw == "三成")
+    assert san_cheng.value == 30.0
+    assert san_cheng.unit == "pct"
+
+    # Table cell 512 inherits unit USD_bn (scale 1e8) from column header 广告收入（亿美元）
+    table_512 = [f for f in figs if f.raw == "512" and f.location.get("line", 0) > 5]
+    assert len(table_512) == 1
+    assert table_512[0].unit == "USD_bn"
+    assert table_512[0].scale == 1e8
+    assert table_512[0].metric == "广告收入"
+
+    thesis_doc = {
+        "evidence": [
+            {
+                "id": "E0001",
+                "fact": "2Q26 ad revenue reached $51.2B (+21% YoY), AI conversion up 30%.",
+                "figures": [
+                    {"metric": "广告收入", "value": 51.2, "unit": "USD_bn", "period": "2Q26", "label": "reported"},
+                    {"metric": "广告收入同比增速", "value": 21.0, "unit": "pct", "period": "2Q26", "label": "reported"},
+                    {"metric": "AI 广告转化率提升", "value": 30.0, "unit": "pct", "period": "2Q26", "label": "reported"},
+                ],
+            }
+        ]
+    }
+    res = audit_draft(draft, thesis_doc=thesis_doc)
+    assert res.passed, f"Unexpected failures: {res.unmatched}"
+    assert len(res.verified) == 5
+
+
+def test_g31_provenance_rejects_wrong_metric_or_period_r4_3() -> None:
+    provenance_records = {
+        "prov-sec-001": {
+            "provider": "sec_edgar",
+            "identifier": "meta_10q",
+            "source_type": "filing",
+            "result_sha256": "deadbeef",
+            "body": "In 1Q25, Reality Labs hardware revenue grew 21.0% YoY to $0.4B.",
+        }
+    }
+    # Draft claims 2Q26 广告收入同比 +21.0% citing prov-sec-001 (which is 1Q25 Reality Labs!)
+    draft = "2Q26 广告收入同比 +21.0%[^p1]。\n\n[^p1]: prov:prov-sec-001\n"
+    res = audit_draft(draft, provenance_records=provenance_records)
+    assert not res.passed
+    assert len(res.unverified) + len(res.contradicted) == 1
+
+
+@pytest.mark.asyncio
+async def test_g31_llm_judge_reverification_and_uncertain_bucket_does_not_block(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.dalton.llm.assist import AssistResult
+    from src.dalton.publish import audit as audit_mod
+    from src.dalton.publish.audit import aaudit_draft, verify_llm_judge_verdict
+
+    fig = ExtractedFigure(
+        id="F-001",
+        raw="512 亿美元",
+        value=512.0,
+        decimals=0,
+        unit="USD_bn",
+        scale=1e8,
+        currency="USD",
+        metric="广告收入",
+        period="2Q26",
+        label_hint="reported",
+        location={"line": 3, "sentence": "2Q26 广告收入 512 亿美元。"},
+    )
+    cand = [
+        {
+            "source_id": "evidence:E0001",
+            "text": "Meta 2Q26 Family of Apps ad revenue was $51.2B (+21% YoY).",
+            "figures": [{"metric": "Ad Revenue", "value": 51.2, "unit": "USD_bn", "period": "2Q26"}],
+        }
+    ]
+
+    # 1. Hallucinated quote not in candidate text -> rejected by verify_llm_judge_verdict
+    bucket_1, _ = verify_llm_judge_verdict(
+        fig,
+        {
+            "verdict": "verified",
+            "source_id": "evidence:E0001",
+            "quote": "This quote does not exist in source",
+            "source_value": 51.2,
+            "source_unit": "USD_bn",
+        },
+        cand,
+    )
+    assert bucket_1 != "verified"
+
+    # 2. Quote exists, but source_value (40.0 USD_bn) is outside tolerance of 512 亿美元 (51.2B) -> rejected
+    bucket_2, _ = verify_llm_judge_verdict(
+        fig,
+        {
+            "verdict": "verified",
+            "source_id": "evidence:E0001",
+            "quote": "ad revenue was $51.2B",
+            "source_value": 40.0,
+            "source_unit": "USD_bn",
+        },
+        cand,
+    )
+    assert bucket_2 != "verified"
+
+    # 3. Verbatim quote + unit-converted source_value within tolerance -> accepted!
+    bucket_3, _ = verify_llm_judge_verdict(
+        fig,
+        {
+            "verdict": "verified",
+            "source_id": "evidence:E0001",
+            "quote": "ad revenue was $51.2B",
+            "source_value": 51.2,
+            "source_unit": "USD_bn",
+        },
+        cand,
+    )
+    assert bucket_3 == "verified"
+
+    # 4. When assist_json fails (ok=False), figure goes to `uncertain` and does NOT block `passed`
+    async def fake_assist_fail(*args: Any, **kwargs: Any) -> AssistResult:
+        return AssistResult(ok=False, data=None, error="llm_timeout")
+
+    monkeypatch.setattr(audit_mod, "assist_json", fake_assist_fail)
+    draft = "2Q26 某细分指标达到 88.8%。\n"
+    res = await aaudit_draft(
+        draft,
+        thesis_doc={
+            "evidence": [{"id": "E0001", "fact": "2Q26 某细分指标在北美市场表现良好。"}]
+        },
+    )
+    assert len(res.uncertain) == 1
+    assert len(res.contradicted) == 0
+    assert len(res.unverified) == 0
+    assert res.passed is True
+
+
+def test_g31_realistic_report_false_positive_rate_at_most_2() -> None:
+    thesis_doc = {
+        "evidence": [
+            {
+                "id": "E-20261015-01",
+                "fact": "2Q26 总收入 608 亿美元（$60.8B），广告收入 594 亿美元（$59.4B，同比 +27%），营业利润 243 亿美元（$24.3B），capex 135 亿美元。",
+                "figures": [
+                    {"metric": "总收入", "value": 60.8, "unit": "USD_bn", "period": "2Q26", "label": "reported"},
+                    {"metric": "广告收入", "value": 59.4, "unit": "USD_bn", "period": "2Q26", "label": "reported"},
+                    {"metric": "广告收入同比增速", "value": 27.0, "unit": "pct", "period": "2Q26", "label": "reported"},
+                    {"metric": "营业利润", "value": 24.3, "unit": "USD_bn", "period": "2Q26", "label": "reported"},
+                    {"metric": "Capex", "value": 13.5, "unit": "USD_bn", "period": "2Q26", "label": "reported"},
+                ],
+            }
+        ],
+        "market_view": {
+            "figures": [
+                {"metric": "营业收入", "value": 63.4, "unit": "USD_bn", "period": "3Q26", "label": "consensus"},
+                {"metric": "EPS", "value": 34.05, "unit": "per_share", "period": "FY2027", "label": "consensus"},
+            ]
+        },
+    }
+    models_doc = {
+        "current": "v1",
+        "versions": [
+            {
+                "id": "v1",
+                "path": "model/meta_v1.xlsx",
+                "key_outputs": [
+                    {"name": "目标价", "cell": "Summary!C10", "value": 850.0, "unit": "USD", "period": "FY2026"},
+                ],
+            }
+        ],
+    }
+    report_md = """# META 2026Q3 财报前瞻深度报告（Accession 0001326801-26-000042, Form 10-Q-2026-02）
+
+我们在 2Q26 看到公司总收入达 608 亿美元[^E-20261015-01]，其中广告收入 594 亿美元，同比 +27%[^E-20261015-01]。
+2Q26 营业利润为 $24.3B[^E-20261015-01]，对应营业利润率 40.0%，单季 Capex 为 135 亿美元[^E-20261015-01]。
+市场一致预期 3Q26E 营业收入为 $63.4B，一致预期 FY2027 EPS 为 $34.05。
+我们维持 FY26 目标价 $850[^m1]。
+
+> "We expect AI infrastructure investment to remain significant in 2027, exceeding $100B." —— 管理层原话引用
+
+| 指标 | 2Q26 |
+| :--- | :---: |
+| 总收入（亿美元） | 608[^E-20261015-01] |
+| 广告收入（亿美元） | 594[^E-20261015-01] |
+| 营业利润（亿美元） | 243[^E-20261015-01] |
+
+[^m1]: model:model/meta_v1.xlsx#Summary!C10
+"""
+    res = audit_draft(report_md, thesis_doc=thesis_doc, models_doc=models_doc)
+    false_positives = len(res.contradicted) + len(res.unverified)
+    assert false_positives <= 2, f"Too many false positives ({false_positives}): {res.unmatched}"
+    assert false_positives == 0
+
+
+@pytest.mark.asyncio
+async def test_g32_reviewer_refuses_none_or_unknown_author_model() -> None:
+    from src.dalton.publish.review import run_review
+
+    assert pick_reviewer_model(None) is None
+    assert pick_reviewer_model("") is None
+    assert pick_reviewer_model("unknown-custom-model-v1") is None
+
+    bundle = ReviewBundle(
+        title="META 3Q26",
+        kind="earnings",
+        draft_markdown="# Draft",
+        audit_summary={},
+    )
+    res_none = await run_review(bundle=bundle, author_model=None, user_id="u1")
+    assert res_none.status == "unavailable"
+    res_unknown = await run_review(
+        bundle=bundle, author_model="unknown-custom-model-v1", user_id="u1"
+    )
+    assert res_unknown.status == "unavailable"
+
+

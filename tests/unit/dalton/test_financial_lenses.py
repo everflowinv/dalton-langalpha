@@ -160,7 +160,7 @@ class TestSkillAndAgentConventions:
 
 
 class TestAnchors:
-    """Verify anchors.py fixes HK+CNY reporting FX bug and price_usd conversion bug."""
+    """Verify anchors.py fixes HK+CNY reporting FX bug, price_usd conversion, and strict FX/currency rules."""
 
     def test_hk_stock_with_cny_reporting_currency_fx_fix(self) -> None:
         res = anchors_mod.build_anchors(
@@ -186,6 +186,7 @@ class TestAnchors:
         assert res["listing_fx"]["rate"] == pytest.approx(0.1282)
         assert res["market_cap"]["price_local"] == pytest.approx(400.0)
         assert res["market_cap"]["price_usd"] == pytest.approx(51.28)
+        assert res["market_cap"]["market_cap_usd_mn"] == pytest.approx(400.0 * 9280.0 * 0.1282, rel=1e-4)
         assert res["market_cap"]["market_cap_usd"] == pytest.approx(400.0 * 9280.0 * 0.1282, rel=1e-4)
 
     def test_us_stock_identity_fx(self) -> None:
@@ -202,7 +203,39 @@ class TestAnchors:
         assert res["fx"]["rate"] == 1.0
         assert res["market_cap"]["price_usd"] == 220.0
         assert res["market_cap"]["shares_mn"] == pytest.approx(15000.0)
-        assert res["market_cap"]["market_cap_usd"] == pytest.approx(3_300_000.0)
+        assert res["market_cap"]["market_cap_usd_mn"] == pytest.approx(3_300_000.0)
+
+    def test_adr_and_non_us_require_explicit_currency_and_fx_offline(self) -> None:
+        with pytest.raises(ValueError, match="reporting-currency"):
+            anchors_mod.build_anchors("BABA", "2025-09-30", allow_network=False)
+
+        with pytest.raises(ValueError, match="reporting-currency"):
+            anchors_mod.build_anchors("0700.HK", "2025-09-30", allow_network=False)
+
+        with pytest.raises(ValueError, match="requires explicit --fx-rate"):
+            anchors_mod.build_anchors(
+                "BABA",
+                "2025-09-30",
+                reporting_currency="CNY",
+                allow_network=False,
+            )
+
+        res_baba = anchors_mod.build_anchors(
+            "BABA",
+            "2025-09-30",
+            price_local=100.0,
+            shares=19_200_000_000,
+            adr_ratio=8.0,
+            listing_currency="USD",
+            reporting_currency="CNY",
+            fx_rate=0.1400,
+            as_of="2026-10-18",
+        )
+        assert res_baba["financial_currency"] == "CNY"
+        assert res_baba["fx"]["pair"] == "CNYUSD=X"
+        assert res_baba["fx"]["rate"] == pytest.approx(0.1400)
+        assert res_baba["market_cap"]["shares_mn"] == pytest.approx(2400.0)
+        assert res_baba["market_cap"]["market_cap_usd_mn"] == pytest.approx(240_000.0)
 
 
 class TestReturnScore:
@@ -292,13 +325,13 @@ class TestNetCashAndImpliedAssets:
                 {"item": "operating_accruals", "amount": 30.0, "include": False, "reason": "Normal payroll"},
             ],
             non_free_cash_items=[
-                {"item": "pledged_deposits", "amount": 50.0, "include": True, "reason": "Bill margin"},
+                {"item": "trapped_cash", "amount": 30.0, "include": True, "reason": "FX controls"},
             ],
             current_assets=1200.0,
             current_liabilities=600.0,
             other_payables=150.0,
             other_receivables=60.0,
-            market_cap_usd=1000.0,
+            market_cap_usd_mn=1000.0,
             hidden_assets_gross_usd=300.0,
             hidden_assets_after_haircut_usd=210.0,
             fx_rate_to_usd=1.0,
@@ -308,12 +341,64 @@ class TestNetCashAndImpliedAssets:
         assert res["lease_liabilities_usd"] == pytest.approx(45.0)
         assert res["basic_net_cash_usd"] == pytest.approx(600.0)
         assert res["basic_net_cash_to_mcap_pct"] == pytest.approx(60.0)
-        assert res["strict_net_cash_usd"] == pytest.approx(490.0)
-        assert res["strict_net_cash_to_mcap_pct"] == pytest.approx(49.0)
+        # Restricted cash (50.0) + trapped_cash (30.0) + customer_advances (60.0) = 140.0 deducted
+        assert res["non_free_cash_deductions_usd"] == pytest.approx(80.0)
+        assert res["strict_net_cash_usd"] == pytest.approx(460.0)
+        assert res["strict_net_cash_to_mcap_pct"] == pytest.approx(46.0)
         assert res["implied_operating_assets"]["basic_usd"] == pytest.approx(190.0)
-        assert res["implied_operating_assets"]["strict_usd"] == pytest.approx(300.0)
+        assert res["implied_operating_assets"]["strict_usd"] == pytest.approx(330.0)
         assert res["working_capital"]["working_capital_usd"] == pytest.approx(600.0)
         assert any("Other payables / Current liabilities" in w for w in res["warnings"])
+        # Verify value_local is preserved on deduction items
+        assert res["quasi_debt_items"][0]["value_local"] == pytest.approx(60.0)
+        assert res["non_free_cash_items"][0]["value_local"] == pytest.approx(50.0)
+
+    def test_netcash_cli_input_json_and_restricted_cash_override(self, tmp_path: Path) -> None:
+        input_file = tmp_path / "netcash_input.json"
+        input_file.write_text(
+            json.dumps(
+                {
+                    "cash": 1000.0,
+                    "restricted_cash": 200.0,
+                    "lt_debt": 300.0,
+                    "quasi_debt_items": [
+                        {"item": "deferred_revenue", "value_local": 100.0, "include": True, "reason": "Prepaid"}
+                    ],
+                    "non_free_cash_items": [
+                        {"item": "escrow", "value_local": 50.0, "include": True, "reason": "Customer escrow"}
+                    ],
+                    "market_cap_usd_mn": 2000.0,
+                    "fx_rate": 0.5,
+                }
+            ),
+            encoding="utf-8",
+        )
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPTS_DIR / "netcash.py"),
+                "--input",
+                str(input_file),
+                "--json",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        out = json.loads(proc.stdout)
+        # gross_cash_usd = (1000 + 200) * 0.5 = 600; debt = 300 * 0.5 = 150 -> basic = 450
+        assert out["basic_net_cash_usd"] == pytest.approx(450.0)
+        # strict deducts deferred_revenue (50 USD) + restricted_cash (100 USD) + escrow (25 USD) = 175 USD -> strict = 275
+        assert out["strict_net_cash_usd"] == pytest.approx(275.0)
+        assert out["quasi_debt_items"][0]["value_local"] == pytest.approx(100.0)
+        assert out["quasi_debt_items"][0]["value_usd"] == pytest.approx(50.0)
+
+        with pytest.raises(ValueError, match="restricted_cash_free_reason"):
+            netcash_mod.compute_netcash(
+                cash_and_equivalents=500.0,
+                restricted_cash=100.0,
+                include_restricted_cash_in_free=True,
+            )
 
 
 class TestEarningsQuality:
@@ -323,7 +408,8 @@ class TestEarningsQuality:
         res = earnings_quality_mod.compute_earnings_quality(
             net_income=200.0,
             cfo=240.0,
-            avg_total_assets=2000.0,
+            beginning_assets=1800.0,
+            ending_assets=2200.0,
             cfi=-80.0,
             inventory=100.0,
             accounts_receivable=150.0,
@@ -333,6 +419,7 @@ class TestEarningsQuality:
             days_in_period=365.0,
             prior_ccc_days=30.0,
         )
+        assert res["average_total_assets"] == pytest.approx(2000.0)
         assert res["sloan"]["operating_sloan_ratio"] == pytest.approx(-0.02)
         assert res["sloan"]["flag_gt_10pct"] is False
         assert res["cfo_to_ni"]["cfo_to_ni_ratio"] == pytest.approx(1.20)
@@ -340,6 +427,37 @@ class TestEarningsQuality:
         assert res["ccc"]["ccc_days"] == pytest.approx(28.39, abs=0.05)
         assert res["overall_quality"] == "strong"
         assert res["warnings"] == []
+
+    def test_ccc_returns_null_when_components_missing_and_cli_ni_flags(self) -> None:
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPTS_DIR / "earnings_quality.py"),
+                "--ni",
+                "100",
+                "--cfo",
+                "120",
+                "--assets-begin",
+                "900",
+                "--assets-end",
+                "1100",
+                "--revenue",
+                "500",
+                "--ar",
+                "100",
+                "--json",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        out = json.loads(proc.stdout)
+        assert out["average_total_assets"] == pytest.approx(1000.0)
+        assert out["ccc"]["dso_days"] == pytest.approx(73.0)
+        assert out["ccc"]["dio_days"] is None
+        assert out["ccc"]["dpo_days"] is None
+        assert out["ccc"]["ccc_days"] is None
+        assert out["ccc"]["applicable"] is False
 
     def test_accrual_and_ccc_warnings(self) -> None:
         res = earnings_quality_mod.compute_earnings_quality(

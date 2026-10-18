@@ -22,6 +22,7 @@ if str(REPO_ROOT) not in sys.path:
 from src.dalton.autonomy.schedule import (  # noqa: E402
     build_company_watch_specs,
     build_global_director_specs,
+    schedule_dalton_automation_helper,
 )
 
 
@@ -45,45 +46,34 @@ async def _resolve_workspace_id(ticker: str, user_id: str) -> str | None:
             return str(row["workspace_id"]) if row else None
 
 
+async def _seed_workspace_cik(workspace_id: str, ticker: str) -> None:
+    """Seed resolved SEC CIK into ``dalton_watch_state`` on bootstrap (G4.4)."""
+    try:
+        from src.dalton.autonomy.probes.sec import resolve_company_cik
+        from src.dalton.database import watch as watch_db
+
+        state = await watch_db.get_watch_state(workspace_id)
+        if not state.get("cik"):
+            cik = await resolve_company_cik(
+                ticker,
+                watch_state=state,
+                workspace_id=workspace_id,
+                allow_network=False,
+            )
+            if cik:
+                state["cik"] = cik
+                await watch_db.upsert_watch_state(workspace_id, ticker, state)
+    except Exception:
+        pass
+
+
 async def _upsert_automation_spec(user_id: str, spec: dict[str, Any]) -> dict[str, Any]:
-    from src.server.database import automation as auto_db
-
-    ws_id = spec.get("workspace_id")
-    rows, _ = await auto_db.list_automations(user_id=user_id, workspace_id=ws_id, limit=200)
-    existing = next((r for r in rows if r.get("name") == spec["name"]), None)
-    if existing:
-        updated = await auto_db.update_automation(
-            str(existing["automation_id"]),
-            user_id,
-            description=spec.get("description"),
-            cron_expression=spec.get("cron_expression"),
-            timezone=spec.get("timezone"),
-            trigger_config=spec.get("trigger_config"),
-            instruction=spec["instruction"],
-            metadata=spec.get("metadata"),
-        )
-        return {"action": "updated", "name": spec["name"], "automation_id": str((updated or existing)["automation_id"])}
-
-    created = await auto_db.create_automation(
-        user_id=user_id,
-        name=spec["name"],
-        description=spec.get("description"),
-        trigger_type=spec["trigger_type"],
-        cron_expression=spec.get("cron_expression"),
-        timezone=spec.get("timezone", "Asia/Shanghai"),
-        trigger_config=spec.get("trigger_config"),
-        next_run_at=spec.get("next_run_at"),
-        instruction=spec["instruction"],
-        workspace_id=ws_id,
-        llm_model=None,
-        additional_context=None,
-        thread_strategy=spec.get("thread_strategy", "new"),
-        conversation_thread_id=None,
-        max_failures=spec.get("max_failures", 10),
-        delivery_config=None,
-        metadata=spec.get("metadata"),
+    return await schedule_dalton_automation_helper(
+        user_id,
+        spec["name"],
+        spec,
+        workspace_id=spec.get("workspace_id"),
     )
-    return {"action": "created", "name": spec["name"], "automation_id": str(created["automation_id"])}
 
 
 async def main_async(args: argparse.Namespace) -> int:
@@ -96,6 +86,8 @@ async def main_async(args: argparse.Namespace) -> int:
             ws_id = await _resolve_workspace_id(ticker, args.user_id)
         if not ws_id:
             ws_id = f"dry-run-{ticker.lower()}"
+        elif not args.dry_run and not ws_id.startswith("dry-run-"):
+            await _seed_workspace_cik(ws_id, ticker)
         specs.extend(
             build_company_watch_specs(
                 ticker=ticker,

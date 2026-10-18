@@ -942,7 +942,7 @@ class PTCAgent:
         # On the wire that is: tools (bp1), static system (bp2), baseline block
         # (bp3), messages ending in the turn's rows (bp4), the four Anthropic
         # allows.
-        from src.dalton.middleware.reconcile import DaltonReconcileMiddleware
+        from src.dalton.middleware.reconcile import DaltonReconcileMiddleware  # DALTON-HOOK(knowledge-reconcile)
 
         deepagent_middleware = [
             m

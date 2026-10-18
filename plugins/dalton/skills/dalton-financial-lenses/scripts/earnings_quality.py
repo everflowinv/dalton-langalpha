@@ -14,6 +14,8 @@ Computes three core earnings quality metrics required by Stage 0 and Financial L
    - DSO = (Average Accounts Receivable / Revenue) * period_days
    - DPO = (Average Accounts Payable / COGS) * period_days
    - CCC = DIO + DSO - DPO
+   - If any of DIO, DSO, or DPO cannot be computed (missing input), CCC is returned as None (null)
+     rather than fabricating 0.0 for missing components.
 """
 
 from __future__ import annotations
@@ -80,7 +82,6 @@ def compute_cfo_to_ni(cfo: float, net_income: float) -> dict[str, Any]:
         }
 
     if ni_f < 0:
-        # Negative net income: ratio sign is misleading unless interpreted explicitly
         return {
             "cfo": round(cfo_f, 2),
             "net_income": round(ni_f, 2),
@@ -123,52 +124,78 @@ def compute_ccc(
     days_in_period: float = 365.0,
     prior_ccc_days: float | None = None,
 ) -> dict[str, Any]:
-    """Compute Cash Conversion Cycle (CCC = DIO + DSO - DPO) in days."""
-    if dio is None:
-        if inventory is not None and cogs is not None and cogs > 0:
-            dio = (float(inventory) / float(cogs)) * float(days_in_period)
-        else:
-            dio = 0.0
+    """Compute Cash Conversion Cycle (CCC = DIO + DSO - DPO) in days.
 
-    if dso is None:
-        if accounts_receivable is not None and revenue is not None and revenue > 0:
-            dso = (float(accounts_receivable) / float(revenue)) * float(days_in_period)
-        else:
-            dso = 0.0
+    Returns None for any missing component and None for ccc_days if any of DIO, DSO, or DPO is None.
+    """
+    resolved_dio: float | None = None
+    if dio is not None:
+        resolved_dio = round(float(dio), 2)
+    elif inventory is not None and cogs is not None and float(cogs) > 0:
+        resolved_dio = round((float(inventory) / float(cogs)) * float(days_in_period), 2)
 
-    if dpo is None:
-        if accounts_payable is not None and cogs is not None and cogs > 0:
-            dpo = (float(accounts_payable) / float(cogs)) * float(days_in_period)
-        else:
-            dpo = 0.0
+    resolved_dso: float | None = None
+    if dso is not None:
+        resolved_dso = round(float(dso), 2)
+    elif accounts_receivable is not None and revenue is not None and float(revenue) > 0:
+        resolved_dso = round((float(accounts_receivable) / float(revenue)) * float(days_in_period), 2)
 
-    dio_val = round(float(dio), 2)
-    dso_val = round(float(dso), 2)
-    dpo_val = round(float(dpo), 2)
-    ccc_days = round(dio_val + dso_val - dpo_val, 2)
+    resolved_dpo: float | None = None
+    if dpo is not None:
+        resolved_dpo = round(float(dpo), 2)
+    elif accounts_payable is not None and cogs is not None and float(cogs) > 0:
+        resolved_dpo = round((float(accounts_payable) / float(cogs)) * float(days_in_period), 2)
+
+    ccc_days: float | None = None
+    if resolved_dio is not None and resolved_dso is not None and resolved_dpo is not None:
+        ccc_days = round(resolved_dio + resolved_dso - resolved_dpo, 2)
 
     yoy_change_days: float | None = None
     flag_working_capital_deterioration = False
-    if prior_ccc_days is not None:
+    if ccc_days is not None and prior_ccc_days is not None:
         yoy_change_days = round(ccc_days - float(prior_ccc_days), 2)
         flag_working_capital_deterioration = yoy_change_days > 15.0
 
     return {
-        "dio_days": dio_val,
-        "dso_days": dso_val,
-        "dpo_days": dpo_val,
+        "dio_days": resolved_dio,
+        "dso_days": resolved_dso,
+        "dpo_days": resolved_dpo,
         "ccc_days": ccc_days,
+        "applicable": ccc_days is not None,
         "prior_ccc_days": round(float(prior_ccc_days), 2) if prior_ccc_days is not None else None,
         "yoy_change_days": yoy_change_days,
         "flag_working_capital_deterioration": flag_working_capital_deterioration,
     }
 
 
+def _resolve_avg_assets(
+    avg_total_assets: float | None = None,
+    beginning_assets: float | None = None,
+    ending_assets: float | None = None,
+    assets_begin: float | None = None,
+    assets_end: float | None = None,
+) -> float:
+    if avg_total_assets is not None:
+        return float(avg_total_assets)
+    b = beginning_assets if beginning_assets is not None else assets_begin
+    e = ending_assets if ending_assets is not None else assets_end
+    if b is not None and e is not None:
+        return (float(b) + float(e)) / 2.0
+    raise ValueError(
+        "Must provide avg_total_assets (--avg-assets) OR both beginning and ending assets "
+        "(--assets-begin / --beginning-assets and --assets-end / --ending-assets)"
+    )
+
+
 def compute_earnings_quality(
     *,
     net_income: float,
     cfo: float,
-    avg_total_assets: float,
+    avg_total_assets: float | None = None,
+    beginning_assets: float | None = None,
+    ending_assets: float | None = None,
+    assets_begin: float | None = None,
+    assets_end: float | None = None,
     cfi: float | None = None,
     dio: float | None = None,
     dso: float | None = None,
@@ -182,7 +209,14 @@ def compute_earnings_quality(
     prior_ccc_days: float | None = None,
 ) -> dict[str, Any]:
     """Compute unified Stage 0 Earnings Quality metrics (Sloan, CFO/NI, CCC)."""
-    sloan = compute_sloan_ratio(net_income, cfo, avg_total_assets, cfi=cfi)
+    resolved_avg_assets = _resolve_avg_assets(
+        avg_total_assets=avg_total_assets,
+        beginning_assets=beginning_assets,
+        ending_assets=ending_assets,
+        assets_begin=assets_begin,
+        assets_end=assets_end,
+    )
+    sloan = compute_sloan_ratio(net_income, cfo, resolved_avg_assets, cfi=cfi)
     cfo_ni = compute_cfo_to_ni(cfo, net_income)
     ccc = compute_ccc(
         dio=dio,
@@ -221,6 +255,7 @@ def compute_earnings_quality(
         overall_quality = "strong"
 
     return {
+        "average_total_assets": round(resolved_avg_assets, 2),
         "sloan": sloan,
         "cfo_to_ni": cfo_ni,
         "ccc": ccc,
@@ -233,16 +268,46 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Compute Stage 0 Earnings Quality metrics: Sloan ratio, CFO/NI, and CCC."
     )
-    parser.add_argument("--net-income", type=float, required=True, help="Net income")
+    parser.add_argument(
+        "--net-income",
+        "--ni",
+        dest="net_income",
+        type=float,
+        required=True,
+        help="Net income",
+    )
     parser.add_argument("--cfo", type=float, required=True, help="Operating cash flow (CFO)")
-    parser.add_argument("--avg-assets", type=float, required=True, help="Average total assets")
+    parser.add_argument(
+        "--avg-assets",
+        "--average-assets",
+        dest="avg_assets",
+        type=float,
+        default=None,
+        help="Average total assets (if precomputed)",
+    )
+    parser.add_argument(
+        "--assets-begin",
+        "--beginning-assets",
+        dest="assets_begin",
+        type=float,
+        default=None,
+        help="Beginning total assets",
+    )
+    parser.add_argument(
+        "--assets-end",
+        "--ending-assets",
+        dest="assets_end",
+        type=float,
+        default=None,
+        help="Ending total assets",
+    )
     parser.add_argument("--cfi", type=float, default=None, help="Investing cash flow (CFI, optional)")
     parser.add_argument("--dio", type=float, default=None, help="Days Inventory Outstanding (if precomputed)")
     parser.add_argument("--dso", type=float, default=None, help="Days Sales Outstanding (if precomputed)")
     parser.add_argument("--dpo", type=float, default=None, help="Days Payable Outstanding (if precomputed)")
     parser.add_argument("--inventory", type=float, default=None, help="Average inventory")
-    parser.add_argument("--ar", type=float, default=None, help="Average accounts receivable")
-    parser.add_argument("--ap", type=float, default=None, help="Average accounts payable")
+    parser.add_argument("--ar", "--accounts-receivable", dest="ar", type=float, default=None, help="Average accounts receivable")
+    parser.add_argument("--ap", "--accounts-payable", dest="ap", type=float, default=None, help="Average accounts payable")
     parser.add_argument("--revenue", type=float, default=None, help="Revenue")
     parser.add_argument("--cogs", type=float, default=None, help="Cost of goods sold (COGS)")
     parser.add_argument("--days", type=float, default=365.0, help="Days in period (default 365)")
@@ -250,22 +315,29 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json", action="store_true", help="Emit JSON output")
     args = parser.parse_args(argv)
 
-    result = compute_earnings_quality(
-        net_income=args.net_income,
-        cfo=args.cfo,
-        avg_total_assets=args.avg_assets,
-        cfi=args.cfi,
-        dio=args.dio,
-        dso=args.dso,
-        dpo=args.dpo,
-        inventory=args.inventory,
-        accounts_receivable=args.ar,
-        accounts_payable=args.ap,
-        revenue=args.revenue,
-        cogs=args.cogs,
-        days_in_period=args.days,
-        prior_ccc_days=args.prior_ccc,
-    )
+    try:
+        result = compute_earnings_quality(
+            net_income=args.net_income,
+            cfo=args.cfo,
+            avg_total_assets=args.avg_assets,
+            assets_begin=args.assets_begin,
+            assets_end=args.assets_end,
+            cfi=args.cfi,
+            dio=args.dio,
+            dso=args.dso,
+            dpo=args.dpo,
+            inventory=args.inventory,
+            accounts_receivable=args.ar,
+            accounts_payable=args.ap,
+            revenue=args.revenue,
+            cogs=args.cogs,
+            days_in_period=args.days,
+            prior_ccc_days=args.prior_ccc,
+        )
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
 

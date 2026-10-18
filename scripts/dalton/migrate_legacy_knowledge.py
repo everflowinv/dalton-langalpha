@@ -32,6 +32,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+import src.dalton.knowledge.ops  # noqa: F401
 from src.dalton.knowledge.paths import DOC_KEYS, RENDERED, data_path, rendered_path
 from src.dalton.knowledge.render import (
     render_agent_block,
@@ -974,14 +975,16 @@ def build_knowledge_documents(bundle: dict[str, Any]) -> tuple[dict[str, dict[st
         "debates": debates_list,
     }
 
+    uncomputed_note = "迁移时未计算，待首次研究补充"
     drivers_doc = {
         "schema_version": 1,
         "as_of": now_iso,
         "historical_valuation_driver": {
             "summary": next((b for _, b in er_bullets if "隐含" in b or "修正" in b), "股价主要由远期 EPS 修正与 AI capex 叙事共同驱动。"),
             "window": "2025-2026",
-            "eps_share_pct": 65.0,
-            "multiple_share_pct": 35.0,
+            "eps_share_pct": None,
+            "multiple_share_pct": None,
+            "note": uncomputed_note,
             "model_ref": legacy_md_ref,
         },
         "drivers": drivers_list,
@@ -1009,7 +1012,8 @@ def build_knowledge_documents(bundle: dict[str, Any]) -> tuple[dict[str, dict[st
                     "id": gid,
                     "metric": f"{ticker} Quarterly / Full-Year Guidance",
                     "period": meta["current_period"],
-                    "issued_at": "2026-07-29",
+                    "issued_at": None,
+                    "note": uncomputed_note,
                     "guide": {
                         "unit": "USD_bn",
                         "text": btxt,
@@ -1179,13 +1183,16 @@ def build_knowledge_documents(bundle: dict[str, Any]) -> tuple[dict[str, dict[st
                         else ("product" if any(k in body for k in ("发布", "发售", "Universe", "Ignite", "re:Invent", "Connect")) else "other")
                     )
                 )
-                ev_date = meta["earnings_date"] if ("10/28" in body or "10/29" in body) else "2026-11-15"
+                has_explicit_earnings_date = "10/28" in body or "10/29" in body
+                ev_date = meta["earnings_date"] if has_explicit_earnings_date else None
+                ev_date_status = "estimated" if has_explicit_earnings_date else "unknown"
                 watch_events.append(
                     {
                         "id": wid,
                         "type": ev_type,
                         "date": ev_date,
-                        "date_status": "estimated",
+                        "date_status": ev_date_status,
+                        "note": None if has_explicit_earnings_date else uncomputed_note,
                         "source": f"OpenClaw {source_path}#L{lno}",
                         "plan": body[:160],
                     }
@@ -1195,6 +1202,7 @@ def build_knowledge_documents(bundle: dict[str, Any]) -> tuple[dict[str, dict[st
                         "id": vid,
                         "what": body[:140],
                         "due": ev_date,
+                        "note": None if has_explicit_earnings_date else uncomputed_note,
                         "source": "季报 / 行业会议 / 公告",
                         "expected": debates_list[0]["flip_condition"]["text"] if debates_list else body[:100],
                         "linked": {"pillars": ["P1"], "debates": ["D1"], "drivers": ["K1"]},
@@ -1278,7 +1286,7 @@ def build_knowledge_documents(bundle: dict[str, Any]) -> tuple[dict[str, dict[st
         "benchmarks": meta["benchmarks"],
         "one_liner": one_liner,
         "covered_since": "2026-10-15",
-        "autonomy": {"enabled": True, "max_usd_per_day": 15.0},
+        "autonomy": {"enabled": True, "max_usd_per_day": None, "note": uncomputed_note},
     }
     rec_prov("company", ticker, "openclaw_thesis_md", f"{source_path}#L1-L18", 1, 18, one_liner)
 
@@ -1527,6 +1535,85 @@ def run_migration_pipeline(
         )
     (out_dir / "migration_report.md").write_text("\n".join(md_lines) + "\n", encoding="utf-8")
     return report
+
+
+def remediate_doc_payload(doc_key: str, doc: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    """Null out fabricated migration defaults on a knowledge document copy."""
+    import copy as _copy
+
+    updated = _copy.deepcopy(doc)
+    changed = False
+    uncomputed_note = "迁移时未计算，待首次研究补充"
+
+    if doc_key == "drivers":
+        hvd = updated.get("historical_valuation_driver")
+        if isinstance(hvd, dict):
+            if hvd.get("eps_share_pct") == 65 or hvd.get("multiple_share_pct") == 35:
+                hvd["eps_share_pct"] = None
+                hvd["multiple_share_pct"] = None
+                hvd["note"] = uncomputed_note
+                changed = True
+    elif doc_key == "management":
+        for item in updated.get("guidance_history") or []:
+            if isinstance(item, dict) and str(item.get("issued_at") or "").endswith("-07-29"):
+                item["issued_at"] = None
+                item["note"] = uncomputed_note
+                changed = True
+    elif doc_key == "company":
+        aut = updated.get("autonomy")
+        if isinstance(aut, dict) and aut.get("max_usd_per_day") == 15:
+            aut["max_usd_per_day"] = None
+            aut["note"] = uncomputed_note
+            changed = True
+    elif doc_key == "agenda":
+        watch = updated.get("watch")
+        if isinstance(watch, dict):
+            for ev in watch.get("events") or []:
+                if isinstance(ev, dict) and str(ev.get("date") or "").endswith("-11-15"):
+                    ev["date"] = None
+                    ev["date_status"] = "unknown"
+                    ev["note"] = uncomputed_note
+                    changed = True
+        for val in updated.get("next_validations") or []:
+            if isinstance(val, dict) and str(val.get("due") or "").endswith("-11-15"):
+                val["due"] = None
+                val["note"] = uncomputed_note
+                changed = True
+
+    return updated, changed
+
+
+async def remediate_migrated_workspaces(
+    *,
+    user_id: str,
+    workspace_ids: list[str],
+    backend_by_workspace: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Append a new knowledge version ('移除迁移脚本编造的数值') for any workspace with fabricated defaults."""
+    from src.dalton.database import knowledge as db_knowledge
+    from src.dalton.knowledge import service as knowledge_service
+
+    results: list[dict[str, Any]] = []
+    for ws_id in workspace_ids:
+        for doc_key in ("drivers", "management", "company", "agenda"):
+            latest = await db_knowledge.latest_version(ws_id, doc_key)
+            if not latest or not isinstance(latest.get("content"), dict):
+                continue
+            cleaned, changed = remediate_doc_payload(doc_key, latest["content"])
+            if not changed:
+                continue
+            res = await knowledge_service.apply_update(
+                user_id=user_id,
+                workspace_id=ws_id,
+                doc_key=doc_key,
+                ops=[{"op": "create", "value": cleaned}],
+                reason="移除迁移脚本编造的数值",
+                base_version=latest["version_no"],
+                source="tool",
+                backend=(backend_by_workspace or {}).get(ws_id),
+            )
+            results.append({"workspace_id": ws_id, "doc_key": doc_key, **res})
+    return results
 
 
 def main() -> int:

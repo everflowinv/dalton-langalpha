@@ -428,12 +428,13 @@ async def resolve_oauth_llm_client(
         return None
 
     # Dispatch to the correct OAuth service by provider
-    if provider == "claude-oauth":
+    # DALTON-HOOK(oauth-dispatch): token getters for Dalton-owned OAuth providers
+    from src.dalton.llm.providers import dalton_oauth_token_getter, is_dalton_oauth_provider
+    get_valid_token = dalton_oauth_token_getter(provider)
+    if get_valid_token is not None:
+        pass
+    elif provider == "claude-oauth":
         from src.server.services.claude_oauth import get_valid_token
-    elif provider == "antigravity-oauth":
-        from src.server.services.antigravity_oauth import get_valid_token
-    elif provider == "muse-oauth":
-        from src.server.services.muse_oauth import get_valid_token
     else:
         from src.server.services.codex_oauth import get_valid_token
 
@@ -480,8 +481,7 @@ async def resolve_oauth_llm_client(
     headers = {}
     if provider == "claude-oauth":
         logger.debug(f"[CHAT] Resolved Claude OAuth client for model={model_name}")
-    elif provider in ("antigravity-oauth", "muse-oauth"):
-        # Bearer token rides api_key; the client class owns the client headers.
+    elif is_dalton_oauth_provider(provider):  # DALTON-HOOK(oauth-dispatch): bearer rides api_key
         logger.debug(f"[CHAT] Resolved {provider} OAuth client for model={model_name}")
     else:
         # Codex: set ChatGPT-Account-Id header

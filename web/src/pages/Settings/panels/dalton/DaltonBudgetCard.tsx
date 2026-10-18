@@ -136,7 +136,25 @@ export function DaltonBudgetCard() {
             订阅名义用量（不计入现金额度）：$
             {(today?.subscription_notional_usd ?? 0).toFixed(2)}
           </span>
+          {today?.budget_gate_enabled === false && (
+            <span style={{ color: 'var(--color-warning)' }}>
+              ⚠ 预算闸门未开启（DALTON_BUDGET_GATE!=1）
+            </span>
+          )}
         </div>
+        {today?.by_provider && Object.keys(today.by_provider).length > 0 && (
+          <div
+            className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] font-mono pt-0.5"
+            style={{ color: 'var(--color-text-tertiary)' }}
+          >
+            {Object.entries(today.by_provider).map(([prov, st]) => (
+              <span key={prov}>
+                {prov}: 现金 ${(st.cash_usd ?? 0).toFixed(2)} / 名义 $
+                {(st.notional_usd ?? 0).toFixed(2)} ({st.calls ?? 0} 次)
+              </span>
+            ))}
+          </div>
+        )}
       </div>
 
       {/* Budget settings form */}

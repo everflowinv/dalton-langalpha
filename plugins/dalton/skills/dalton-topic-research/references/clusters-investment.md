@@ -13,7 +13,7 @@
 
 ### C2：竞争格局 + 行业趋势（Competitive Landscape & Industry Trends）
 - **核心问题**：存量份额与增量份额（Incremental Share）归属、技术路线演进、客户切换成本、上下游议价权（供应商集中度与客户集中度）、新进入者壁垒与价格战风险。
-- **优先信源**：竞争对手 10-K/法说会纪要、第三方行业统计（IDC/Gartner/Mercury/SemiAnalysis 等）、`research_internal`（`tmtb`、`funda-ai`）、`guidepoint` 产业链上下游访谈。
+- **优先信源**：竞争对手 10-K/法说会纪要、第三方行业统计（IDC/Gartner/Mercury/SemiAnalysis 等）、`researchdata.research(route="tmtb")`、`researchdata.research(route="funda-ai")`、`researchdata.research(route="guidepoint")` 产业链上下游访谈。
 - **必核指标**：CR3/CR5 市场份额变化（带具体季度）、ASP 趋势、大客户二供/自研进展、交期（Lead Time）与库存水位。
 
 ### C3：催化剂 + 风险（Catalysts & Risks）
@@ -28,7 +28,7 @@
 
 ### C5：牛熊观点 + 卖方研究（Bull/Bear Views & Sell-Side Research）
 - **核心问题**：当前买方与卖方的主流叙事是什么？多头最依赖的 2–3 个核心假设是什么？空头最犀利的证伪点是什么？市场分歧集中在哪个具体的经营驱动变量（Driver）上？
-- **优先信源**：`research_alphaengine`（近 6 个月大行深度报告与评级变更）、`research_internal`（`sales-notes` 买方路演反馈）、`community` 专业投资者深度讨论。
+- **优先信源**：`researchdata.research(route="alphaengine")`（近 6 个月大行深度报告与评级变更）、`researchdata.research(route="sales-notes")`（买方路演反馈）、`researchdata.community` 专业投资者深度讨论。
 - **必核指标**：卖方目标价区间与隐含倍数、多空双方对核心 Driver（如次年出货量/毛利率）的具体数字分歧。
 
 ---

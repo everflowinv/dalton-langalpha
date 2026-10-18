@@ -24,10 +24,12 @@ description: "Dalton 三把财务镜头与盈利质量计算：在同一报告�
 所有镜头和后续数字必须共用同一组市值、汇率和报告期锚点，严禁各算各的市值或混用不同日期汇率：
 ```bash
 python3 .agents/skills/dalton-financial-lenses/scripts/anchors.py \
-  --ticker {TICKER} --period-end {YYYY-MM-DD} [--market-cap-usd-mn {MC_MN}] --json
+  --ticker {TICKER} --period-end {YYYY-MM-DD} \
+  [--financial-currency {USD|CNY|HKD|...}] [--fx-rate {RATE} | --allow-network] \
+  [--market-cap-usd-mn {MC_MN}] [--adr-ratio {RATIO}] --json
 ```
-- 股本优先使用最新 10-Q/10-K 封面股数（`dalton_sec.get_company_facts` 的 `dei:EntityCommonStockSharesOutstanding` 或稀释股数），可传 `--shares` 与 `--price-local` 覆盖；yfinance 仅作行情与交叉核对。
-- 非美元列报公司（如美股中概 ADR 或 P6 港股人民币报表）统一按 `financial_currency` 对应的 `CNYUSD=X` 等汇率换算为美元；美元列报公司汇率为 `1.0`。
+- 股本优先使用最新 10-Q/10-K/20-F 封面股数（`dalton_sec.get_company_facts` 的 `dei:EntityCommonStockSharesOutstanding` 或稀释股数），可传 `--shares`、`--shares-unit {auto|raw|thousands|millions}`、`--adr-ratio` 与 `--price-local` 覆盖；yfinance 仅作行情与实时汇率获取（`--allow-network`）。
+- 非美元列报公司（如美股中概 ADR 或港股人民币报表）**必须显式传入 `--financial-currency CNY`**（或开启 `--allow-network` 获取实时汇率 `CNYUSD=X`）；离线且未传 `--fx-rate` 时脚本直接报错退出，严禁使用写死的旧汇率。
 
 ### 第 3 步：获取一手 Filing 财务与附注数据
 1. 用 `dalton_sec.get_company_facts(ticker=..., concepts=..., periods=...)` 获取最新 10-Q/10-K 资产负债表、利润表、现金流量表科目（严格遵守 R1–R10 规则，带单位、期间与 accession）。
@@ -38,6 +40,11 @@ python3 .agents/skills/dalton-financial-lenses/scripts/anchors.py \
    - 整理现金端、债务端、类债务与不自由现金扣减项，调用确定性脚本计算基础净现金（Definition A）、严格净现金（Definition B）、营运资本、其他应收/应付 >20% 预警、“大存大贷”标记、现金质量评级与隐含经营资产（Implied Operating Assets）：
    ```bash
    python3 .agents/skills/dalton-financial-lenses/scripts/netcash.py --input netcash_input.json --json
+   # 或直接传命令行参数：
+   python3 .agents/skills/dalton-financial-lenses/scripts/netcash.py \
+     --cash {CASH} --restricted-cash {RC} --time-deposits {TD} --st-investments {STI} \
+     --st-debt {STD} --cur-lt-debt {CLTD} --lt-debt {LTD} --convertible-debt {CD} \
+     --lease-liabilities {LEASE} --market-cap-usd-mn {MC_MN} --fx-rate {FX} --json
    ```
 2. **隐含资产**（详见 [`references/hidden-assets.md`](references/hidden-assets.md)）：
    - 识别 A 联营/合营权益、B 上市参股股权、C 投资性房地产、D 其他可变现非核心资产。
@@ -54,13 +61,15 @@ python3 .agents/skills/dalton-financial-lenses/scripts/anchors.py \
      --true-return-share {SHARE_0_TO_1} \
      --annual {FY3},{FY2},{FY1} \
      --fwd-total {FWD_TOTAL_PCT} --credibility {100|90|75|60|50} \
+     [--credibility-reason "{REASON}"] \
      [--adjust "+1:理由" --adjust "-0.5:理由"]
    ```
 4. **盈利质量（Stage 0 / 按需）**：
-   - 使用 `scripts/earnings_quality.py` 计算 Sloan Ratio（总应计口径 `(NI - CFO - CFI) / Avg Total Assets` 与经营应计口径 `(NI - CFO) / Avg Total Assets`）、`CFO / NI` 比率、现金转换周期 `CCC = DIO + DSO - DPO`：
+   - 使用 `scripts/earnings_quality.py` 计算 Sloan Ratio（总应计口径 `(NI - CFO - CFI) / Avg Total Assets` 与经营应计口径 `(NI - CFO) / Avg Total Assets`）、`CFO / NI` 比率、现金转换周期 `CCC = DIO + DSO - DPO`（缺任一分项时 `ccc_days` 返回 `null`）：
    ```bash
    python3 .agents/skills/dalton-financial-lenses/scripts/earnings_quality.py \
-     --ni {NI} --cfo {CFO} --cfi {CFI} --assets-begin {A0} --assets-end {A1} \
+     --ni {NI} --cfo {CFO} [--cfi {CFI}] \
+     [--avg-assets {AVG_A} | --assets-begin {A0} --assets-end {A1}] \
      [--revenue {REV} --cogs {COGS} --inventory {INV} --ar {AR} --ap {AP}] --json
    ```
 

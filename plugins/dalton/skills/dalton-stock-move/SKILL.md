@@ -95,7 +95,7 @@ python3 .agents/skills/dalton-stock-move/scripts/move_quant.py analyze \
 
 ### 第 6 步：社交媒体（X）
 
-在窗口内检索 X（使用 `x_search` 或 `alternative_data` 插件）：
+在窗口内检索 X（使用 `x_api.search_posts` 或 `alternative_data` 插件）：
 - 只保留有实质内容的帖子（具体业务数据拆解、行业上下游交叉验证、知名机构/基本面投资人分析）。
 - 过滤纯情绪宣泄与 meme。
 - 附上帖子链接与互动量，明确区分**有信息量的专业观点（informed opinion）**与**散户情绪**。（雪球在 P6 支持。）

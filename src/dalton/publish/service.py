@@ -18,6 +18,7 @@ from src.dalton.knowledge.render import render_published_index_md
 from src.dalton.knowledge.service import apply_update
 from src.dalton.publish.audit import (
     AuditResult,
+    aaudit_draft,
     audit_draft,
     render_annotated_draft,
     render_audit_md,
@@ -98,6 +99,9 @@ async def run_check_draft(
     thesis_doc: dict[str, Any] | None = None,
     models_doc: dict[str, Any] | None = None,
     provenance_records: dict[str, dict[str, Any]] | None = None,
+    use_llm_judge: bool = False,
+    user_id: str = "local-dev-user",
+    llm_service: Any = None,
 ) -> dict[str, Any]:
     """Execute ``check_draft``: audit figures, write ``.audit.md`` and ``.annotated.md``, never block (PK.9)."""
     if backend is None:
@@ -123,13 +127,26 @@ async def run_check_draft(
     if provenance_records is None:
         provenance_records = await _load_workspace_provenance(workspace_id)
 
-    audit = audit_draft(
-        draft_text,
-        thesis_doc=thesis_doc,
-        models_doc=models_doc,
-        provenance_records=provenance_records,
-        facts_markdown=facts_text,
-    )
+    if use_llm_judge:
+        audit = await aaudit_draft(
+            draft_text,
+            thesis_doc=thesis_doc,
+            models_doc=models_doc,
+            provenance_records=provenance_records,
+            facts_markdown=facts_text,
+            use_llm_judge=True,
+            user_id=user_id,
+            llm_service=llm_service,
+            workspace_id=workspace_id,
+        )
+    else:
+        audit = audit_draft(
+            draft_text,
+            thesis_doc=thesis_doc,
+            models_doc=models_doc,
+            provenance_records=provenance_records,
+            facts_markdown=facts_text,
+        )
 
     audit_path, annotated_path = _derive_sidecar_paths(draft_path)
     audit_md = render_audit_md(audit, draft_path=draft_path)
@@ -213,6 +230,10 @@ async def run_publish(
     """Execute the full PK.11 re-entrant publication governance state machine."""
     if backend is None:
         return {"ok": False, "message": "ERROR: filesystem backend is unavailable."}
+
+    # Resolve author_model from active thread usage / thread record when not explicitly provided (G3.2)
+    if not author_model:
+        author_model = await db_publications.resolve_thread_author_model(thread_id)
 
     draft_text = await backend.aread_text(draft_path)
     if draft_text is None:
@@ -338,12 +359,17 @@ async def run_publish(
     # Step 2: Figure Audit (when status == 'auditing')
     if status == "auditing":
         prov_records = await _load_workspace_provenance(workspace_id)
-        audit = audit_draft(
+        audit = await aaudit_draft(
             draft_text,
             thesis_doc=thesis_doc,
             models_doc=models_doc,
             provenance_records=prov_records,
             facts_markdown=facts_text,
+            use_llm_judge=True,
+            user_id=user_id,
+            llm_service=llm_service,
+            workspace_id=workspace_id,
+            thread_id=thread_id,
         )
         audit_path, annotated_path = _derive_sidecar_paths(draft_path)
         await backend.awrite_text(audit_path, render_audit_md(audit, draft_path=draft_path))
@@ -361,7 +387,7 @@ async def run_publish(
                 "status": "audit_failed",
                 "audit": audit.to_dict(),
                 "message": (
-                    f"Audit failed ({len(audit.unmatched)} unverified figure(s)): "
+                    f"Audit failed ({len(audit.unmatched)} unverified/contradicted figure(s)): "
                     f"see {audit_path}. Fix footnotes/figures and call publish_report again."
                 ),
             }
@@ -395,6 +421,8 @@ async def run_publish(
                 management_md=mgmt_md,
             ),
             llm_service=llm_service,
+            workspace_id=workspace_id,
+            thread_id=thread_id,
         )
         rev_dict = rev_res.to_dict()
         if rev_res.status == "unavailable":
@@ -481,10 +509,57 @@ async def run_publish(
                 "message": f"已通过数字核验与独立审稿，等待 PM 审批，request_id={req_id}",
             }
 
-        # 4b. Interactive thread -> emit ToolApprovalCard interrupt
+        # 4b. Interactive thread -> emit ToolApprovalCard interrupt (aligned schema G3.2)
         audit_info = row.get("audit") or {}
         review_info = row.get("review") or {}
         date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        published_path = f"published/{date_str}-{slug}.md"
+
+        verified_cnt = int(audit_info.get("verified", audit_info.get("matched", 0)))
+        contradicted_cnt = int(
+            audit_info.get("contradicted", len(audit_info.get("contradicted_items") or []))
+        )
+        unverified_cnt = int(
+            audit_info.get("unverified", len(audit_info.get("unverified_items") or []))
+        )
+        uncertain_cnt = int(
+            audit_info.get("uncertain", len(audit_info.get("uncertain_items") or []))
+        )
+        exempt_cnt = int(audit_info.get("exempt", 0))
+        uncertain_items = list(audit_info.get("uncertain_items") or [])
+
+        figure_summary = {
+            "verified": verified_cnt,
+            "contradicted": contradicted_cnt,
+            "unverified": unverified_cnt,
+            "uncertain": uncertain_cnt,
+            "exempt": exempt_cnt,
+            "uncertain_items": uncertain_items,
+        }
+        reviewer_payload = {
+            "model": review_info.get("model", "reviewer"),
+            "family": review_info.get("family", ""),
+            "verdict": review_info.get("verdict", "pass"),
+            "summary": review_info.get("summary", ""),
+            "points": review_info.get("points")
+            or review_info.get("reasons")
+            or review_info.get("must_fix")
+            or [],
+        }
+        audit_summary_str = (
+            f"{audit_info.get('figures', 0)} 个数字："
+            f"{verified_cnt} 已核实，{contradicted_cnt} 冲突，"
+            f"{unverified_cnt} 未核实，{uncertain_cnt} 未能判断，{exempt_cnt} 豁免"
+        )
+        reviewer_summary_str = (
+            f"通过 · {reviewer_payload['model']} （{reviewer_payload['family']}）"
+        )
+        thesis_ver_str = (
+            f"v{thesis_version_no}"
+            if updates_thesis and thesis_version_no
+            else "不更新"
+        )
+
         payload = {
             "kind": "publish_approval",
             "action_requests": [
@@ -495,24 +570,27 @@ async def run_publish(
                     "attempt_id": req_id,
                     "description": f"正式发布《{title}》",
                     "args": {
+                        "request_id": req_id,
+                        "ticker": ticker,
+                        "title": title,
+                        "kind": kind,
+                        "draft_path": draft_path,
+                        "published_path": published_path,
+                        "figure_summary": figure_summary,
+                        "uncertain_items": uncertain_items,
+                        "reviewer": reviewer_payload,
+                        "updates_thesis": bool(updates_thesis),
+                        "thesis_version": thesis_ver_str,
+                        "audit_summary": audit_summary_str,
+                        "reviewer_summary": reviewer_summary_str,
+                        # Preserve Chinese keys for backward compatibility
                         "公司": ticker,
                         "类型": kind,
                         "草稿": draft_path,
-                        "数字核验": (
-                            f"{audit_info.get('figures', 0)} 个数字："
-                            f"{audit_info.get('matched', 0)} 已匹配，"
-                            f"{audit_info.get('exempt', 0)} 豁免，0 未核实"
-                        ),
-                        "独立审稿": (
-                            f"通过 · {review_info.get('model', 'reviewer')} "
-                            f"（{review_info.get('family', '')}）"
-                        ),
-                        "发布为": f"published/{date_str}-{slug}.md",
-                        "thesis 正式版本": (
-                            f"v{thesis_version_no}"
-                            if updates_thesis and thesis_version_no
-                            else "不更新"
-                        ),
+                        "数字核验": audit_summary_str,
+                        "独立审稿": reviewer_summary_str,
+                        "发布为": published_path,
+                        "thesis 正式版本": thesis_ver_str,
                     },
                 }
             ],
@@ -643,6 +721,10 @@ async def run_publish(
             audit_summary={
                 "figures": audit_info.get("figures", 0),
                 "matched": audit_info.get("matched", 0),
+                "verified": audit_info.get("verified", audit_info.get("matched", 0)),
+                "contradicted": audit_info.get("contradicted", 0),
+                "unverified": audit_info.get("unverified", 0),
+                "uncertain": audit_info.get("uncertain", 0),
                 "exempt": audit_info.get("exempt", 0),
             },
             reviewer={
@@ -660,6 +742,7 @@ async def run_publish(
 
         # Step 9: Update thesis.official when updates_thesis=True (source='publish')
         official_ver_note = ""
+        thesis_update_error: str | None = None
         if updates_thesis and thesis_row is not None and isinstance(thesis_doc, dict):
             frozen_pillars = copy.deepcopy(thesis_doc.get("pillars") or [])
             ops_for_official: list[dict[str, Any]] = [
@@ -700,6 +783,26 @@ async def run_publish(
             )
             if off_res.get("ok"):
                 official_ver_note = f" · thesis official v{off_res['version_no']}"
+            else:
+                thesis_update_error = str(
+                    off_res.get("message")
+                    or off_res.get("errors")
+                    or "thesis.official update failed"
+                )
+                file_notes.append(f"thesis.official 更新失败：{thesis_update_error}")
+                try:
+                    await db_publications.transition(
+                        req_id,
+                        ("published",),
+                        "published",
+                        error=f"thesis.official update failed: {thesis_update_error}",
+                    )
+                except Exception as err_trans:
+                    logger.warning(
+                        "Failed to record thesis.official error on publish_request %s: %s",
+                        req_id,
+                        err_trans,
+                    )
 
         # Render published/INDEX.md
         all_pubs = await db_publications.list_publications(workspace_id)
@@ -708,7 +811,7 @@ async def run_publish(
 
         paths_str = ", ".join(f["path"] for f in files_meta)
         notes_str = f" ({'; '.join(file_notes)})" if file_notes else ""
-        return {
+        res_out: dict[str, Any] = {
             "ok": True,
             "status": "published",
             "publication_id": pub_id,
@@ -718,9 +821,13 @@ async def run_publish(
                 f"{official_ver_note} · publication {pub_id[:8]}{notes_str}"
             ),
         }
+        if thesis_update_error:
+            res_out["thesis_update_error"] = thesis_update_error
+        return res_out
 
     return {
         "ok": False,
         "status": status,
         "message": f"Unexpected publish request status: {status}",
     }
+

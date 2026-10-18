@@ -75,7 +75,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 ### Step 5：优先级 3 —— 核心 Debate 与 Narrative 共性 + 一轮 X
 
 1. **先合并内部观点，再补一轮公开 X**：
-   - 先将内部四入口中的同义观点去重归并，再按 [`references/retrieval.md`](references/retrieval.md) 调用 `x_search` 做一轮公开主题检索（时间窗 90 天且截至 `as-of`；严禁把内部邮件或私有 bogey 数字放进公开查询）。
+   - 先将内部四入口中的同义观点去重归并，再按 [`references/retrieval.md`](references/retrieval.md) 调用 `x_api.search_posts` 做一轮公开主题检索（时间窗 90 天且截至 `as-of`；严禁把内部邮件或私有 bogey 数字放进公开查询）。
 2. **按因果机制聚类（禁止按表面关键词合并）**：
    - 沿着“**共同前提 → 因果机制 → 关键变量 → 对盈利/估值的含义**”聚类。例如两位作者都谈订单，一个讲需求加速、一个讲供给受限，必须分成两条机制，不能因为都出现“订单”而合并。
 3. **独立性与来源链去重**：
@@ -114,7 +114,7 @@ python3 .agents/skills/dalton-earnings-preview/scripts/predictions.py validate \
   2. EPS（或公司最核心的利润指标，如 Adjusted Operating Income / EBITDA）；
   3. 下季或全年指引（Guidance）；
   4. 2–4 个关键业务运营 KPI；
-  5. 第ス三节中的每个核心 debate 至少对应一条可验证预测。
+  5. 第三节中的每个核心 debate 至少对应一条可验证预测。
 
 ### Step 8：成稿、自检与收尾三步
 

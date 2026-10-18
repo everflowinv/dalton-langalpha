@@ -38,28 +38,28 @@ $$S_i = W_{\text{tier}} + 40 \cdot \mathbb{I}(\text{Earnings in } T{-}3 \text{ o
 其中层级基础分 $W_{\text{tier}}$：`Core = 30`，`Watch = 15`，`Radar = 5`。
 - 按 $S_i$ 从高到低排序；同分时按 `Core > Watch > Radar`，再按 `days_since_last_verdict` 降序排列。
 
-### Step 3：预算与并发配额（Budget & Quota Gate）
-每次自主巡检严格遵守以下硬配额，防止无效空转与费用失控：
+### Step 3：预算与并发约束（Budget & Concurrency）
+每次自主巡检按以下原则排程，防止无效空转与费用失控：
 1. **每日常规巡检（Daily Run）**：
-   - 最多委派 **3 家**公司分析师任务（`max_delegations_per_day = 3`）。
+   - 受当天的现金额度约束；拿不到并发槽位的任务列入当天的计划，稍后再派。
    - 仅对 $S_i \ge 45$ 的公司发起委派；若全池最高分 $< 45$，当日记录 `NO_ACTION_NEEDED` 并安静退出（不推送噪音消息）。
-   - 深度重型工作流（`full-coverage`、`initial-coverage`）每日最多触发 **1 个**，且仅在明确立项或 `THESIS_BROKEN` 重构时触发。
-2. **财报季高峰豁免**：若当日有多家 `Core` 公司同日发榜（`T+0` / `T+1`），财报快评/深评不受 3 家上限限制，但非财报日常巡检自动顺延。
+   - 深度重型工作流（`full-coverage`、`initial-coverage`）仅在明确立项或 `THESIS_BROKEN` 重构、且当日现金额度充足时触发。
+2. **财报季排程优先级**：若当日有多家 `Core` 公司同日发榜（`T+0` / `T+1`），优先保障财报快评/深评的现金额度与并发槽位，非财报日常巡检排在其后。
 
 ### Step 4：记录调度计划（`dalton_record_plan`）
 在发起任何委派前，先调用 `dalton_record_plan` 将本日评分排序、入选公司、任务类型、跳过原因写入 Home 的 `plan-log.jsonl`，保证自治决策可审计。
 
 ### Step 5：委派分析师执行（`delegate_to_analyst`）
-对入选的每家公司，调用 `delegate_to_analyst(ticker=..., task_type=..., prompt=..., auto_approve_handoffs=True)`：
-- 在 `prompt` 中明确指定：
+对入选的每家公司，调用 `delegate_to_analyst(question=..., workspace_id=..., report_back=True)`：
+- 在 `question` 中明确指定：
   1. 触发原因（如“Q2 10-Q 刚披露”或“agenda P0 问题 `q_xxx` 已到期”）；
   2. 应使用的技能（如 `dalton-filing-review`、`dalton-thesis-delta`、`dalton-earnings-preview`）；
   3. 要求分析师完成后执行 `dalton-agenda` 收尾三步。
-- 若发现跨公司线索只需在某公司 `agenda.md` 挂号而无需立即深挖，调用 `dalton_agenda_note(ticker=..., ...)` 即可，不消耗 `delegate_to_analyst` 配额。
+- 若发现跨公司线索只需在某公司 `agenda.md` 挂号而无需立即深挖，调用 `dalton_agenda_note(ticker=..., ...)` 即可。
 - 若需为某公司创建/更新跨期自动化触发器，调用 `dalton_schedule_automation`。
 
 ### Step 6：刷新 Home 覆盖看板（`render_coverage.py`）
-所有委派返回后，运行 `render_coverage.py`（或等效看板刷新逻辑）更新 Home 根目录的 `coverage.md`，确保看板反映最新 `verdict`、目标价/IRR 与下次财报日。
+所有委派返回后，运行 `render_coverage.py`（或等效看板刷新逻辑）更新 Home 的 `dalton/coverage.html`（及 `coverage.md`），确保看板反映最新 `verdict`、目标价/IRR 与下次财报日。
 
 ---
 

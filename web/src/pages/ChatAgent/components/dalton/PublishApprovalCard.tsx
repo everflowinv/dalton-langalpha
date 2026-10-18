@@ -12,6 +12,35 @@ interface PublishApprovalCardProps {
   onReject?: (message?: string) => void;
 }
 
+interface UncertainItem {
+  id?: string;
+  raw?: string;
+  line?: number;
+  metric?: string;
+  period?: string;
+  reason?: string;
+  hint?: string;
+  sentence?: string;
+  candidates?: Array<{ kind?: string; id?: string; value?: number; unit?: string; why?: string }>;
+}
+
+interface FigureSummary {
+  verified?: number;
+  contradicted?: number;
+  unverified?: number;
+  uncertain?: number;
+  exempt?: number;
+  uncertain_items?: UncertainItem[];
+}
+
+interface ReviewerPayload {
+  model?: string;
+  family?: string;
+  verdict?: string;
+  summary?: string;
+  points?: string[];
+}
+
 export function PublishApprovalCard({
   data,
   onApprove,
@@ -23,13 +52,43 @@ export function PublishApprovalCard({
   const isApproved = status === 'approved';
   const isRejected = status === 'rejected';
 
+  const requestId = String(args?.request_id ?? '');
   const title = String(args?.title ?? args?.slug ?? '研究报告发布审批');
-  const ticker = String(args?.ticker ?? args?.company ?? '');
-  const kind = String(args?.kind ?? args?.report_type ?? '');
-  const draftPath = String(args?.draft_path ?? '');
-  const auditSummary = String(args?.audit_summary ?? args?.audit ?? '');
-  const reviewerSummary = String(args?.reviewer_summary ?? args?.reviewer ?? '');
-  const thesisVersion = args?.thesis_version ?? args?.updates_thesis;
+  const ticker = String(args?.ticker ?? args?.company ?? args?.['公司'] ?? '');
+  const kind = String(args?.kind ?? args?.report_type ?? args?.['类型'] ?? '');
+  const draftPath = String(args?.draft_path ?? args?.['草稿'] ?? '');
+  const publishedPath = String(args?.published_path ?? args?.['发布为'] ?? '');
+
+  const figSum = (
+    typeof args?.figure_summary === 'object' && args?.figure_summary !== null
+      ? (args.figure_summary as FigureSummary)
+      : null
+  );
+  const uncertainItems: UncertainItem[] = Array.isArray(args?.uncertain_items)
+    ? (args.uncertain_items as UncertainItem[])
+    : Array.isArray(figSum?.uncertain_items)
+      ? (figSum?.uncertain_items as UncertainItem[])
+      : [];
+
+  const auditSummary = figSum
+    ? `${figSum.verified ?? 0} 已核实 · ${figSum.contradicted ?? 0} 冲突 · ${figSum.unverified ?? 0} 未核实 · ${figSum.uncertain ?? 0} 未能判断 · ${figSum.exempt ?? 0} 豁免`
+    : String(args?.audit_summary ?? args?.audit ?? args?.['数字核验'] ?? '');
+
+  const revObj = (
+    typeof args?.reviewer === 'object' && args?.reviewer !== null
+      ? (args.reviewer as ReviewerPayload)
+      : null
+  );
+  const reviewerSummary = revObj
+    ? `${revObj.verdict === 'pass' ? '通过' : revObj.verdict ?? '通过'} · ${revObj.model ?? 'reviewer'}${revObj.family ? ` (${revObj.family})` : ''}`
+    : String(args?.reviewer_summary ?? args?.reviewer ?? args?.['独立审稿'] ?? '');
+  const reviewerPoints: string[] = Array.isArray(revObj?.points) ? revObj.points : [];
+
+  const updatesThesis = args?.updates_thesis;
+  const thesisVersion =
+    args?.thesis_version ??
+    args?.['thesis 正式版本'] ??
+    (typeof updatesThesis === 'boolean' ? (updatesThesis ? '是' : '不更新') : undefined);
 
   const detailBlock = (
     <div
@@ -42,6 +101,12 @@ export function PublishApprovalCard({
           {ticker ? `[${ticker}] ` : ''}{title}
         </span>
       </div>
+      {requestId && (
+        <div className="flex items-center justify-between gap-2">
+          <span style={{ color: 'var(--color-text-tertiary)' }}>{t('dalton.publish.requestIdLabel', '请求 ID')}</span>
+          <code>{requestId.slice(0, 12)}</code>
+        </div>
+      )}
       {kind && (
         <div className="flex items-center justify-between gap-2">
           <span style={{ color: 'var(--color-text-tertiary)' }}>{t('dalton.publish.kindLabel', '报告类型')}</span>
@@ -52,6 +117,12 @@ export function PublishApprovalCard({
         <div className="flex items-center justify-between gap-2">
           <span style={{ color: 'var(--color-text-tertiary)' }}>{t('dalton.publish.draftLabel', '草稿路径')}</span>
           <code>{draftPath}</code>
+        </div>
+      )}
+      {publishedPath && (
+        <div className="flex items-center justify-between gap-2">
+          <span style={{ color: 'var(--color-text-tertiary)' }}>{t('dalton.publish.publishedPathLabel', '发布路径')}</span>
+          <code>{publishedPath}</code>
         </div>
       )}
       {auditSummary && (
@@ -66,10 +137,51 @@ export function PublishApprovalCard({
           <span>{reviewerSummary}</span>
         </div>
       )}
+      {revObj?.summary && (
+        <div className="pt-1 text-[11px]" style={{ color: 'var(--color-text-tertiary)' }}>
+          {revObj.summary}
+        </div>
+      )}
+      {reviewerPoints.length > 0 && (
+        <ul className="list-disc pl-4 space-y-0.5 text-[11px]" style={{ color: 'var(--color-text-tertiary)' }}>
+          {reviewerPoints.slice(0, 4).map((pt, idx) => (
+            <li key={idx}>{pt}</li>
+          ))}
+        </ul>
+      )}
       {thesisVersion !== undefined && (
         <div className="flex items-center justify-between gap-2">
           <span style={{ color: 'var(--color-text-tertiary)' }}>{t('dalton.publish.thesisLabel', '更新正式 Thesis')}</span>
           <span>{String(thesisVersion)}</span>
+        </div>
+      )}
+      {uncertainItems.length > 0 && (
+        <div
+          className="mt-2 rounded px-3 py-2 space-y-1"
+          style={{ backgroundColor: 'var(--color-bg-subtle)', border: '1px solid var(--color-border-muted)' }}
+          data-testid="publish-uncertain-items"
+        >
+          <div className="font-medium text-[11px]" style={{ color: 'var(--color-text-primary)' }}>
+            {t('dalton.publish.uncertainHeader', '未能判断 — 交由 PM 决定')}（{uncertainItems.length}）
+          </div>
+          {uncertainItems.map((item, idx) => (
+            <div key={item.id ?? idx} className="text-[11px] space-y-0.5">
+              <div>
+                <code>L{item.line ?? '?'}</code> · <strong>{item.raw}</strong>
+                {item.metric ? ` (${item.metric}${item.period ? ` · ${item.period}` : ''})` : ''}
+              </div>
+              {item.sentence && (
+                <div className="truncate" style={{ color: 'var(--color-text-tertiary)' }}>
+                  原文：{item.sentence}
+                </div>
+              )}
+              {item.hint && (
+                <div style={{ color: 'var(--color-text-tertiary)' }}>
+                  原因：{item.hint}
+                </div>
+              )}
+            </div>
+          ))}
         </div>
       )}
     </div>

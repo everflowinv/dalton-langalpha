@@ -211,10 +211,35 @@ export async function handleChatCompletions(
   const defaultTimeoutMs = Number(pluginConfig.defaultTimeoutMs) || 180_000;
   const maxTimeoutMs = Number(pluginConfig.maxTimeoutMs) || 600_000;
   let timeoutTimer = null;
+  let clientDisconnected = false;
+  let invocationId = "";
+  let reqHash = "";
+  let modelRef = "";
+  let startedAt = new Date().toISOString();
+  let emittedOutput = false;
+  let invocationRecorded = false;
+  let invocationFinalized = false;
+
+  const saveInvocation = async (record) => {
+    if (!invocationId) return;
+    if (typeof journal?.setInvocation === "function") {
+      await journal.setInvocation(invocationId, record);
+    } else {
+      idempotencyCache.set(invocationId, record);
+    }
+  };
+
+  const getInvocation = async (id) => {
+    if (!id) return null;
+    if (typeof journal?.getInvocation === "function") {
+      return await journal.getInvocation(id);
+    }
+    return idempotencyCache.get(id) || null;
+  };
 
   const onClientClose = () => {
     if (!res.writableEnded) {
-      abortController.abort(new Error("client_disconnected"));
+      clientDisconnected = true;
     }
   };
   req.on("aborted", onClientClose);
@@ -224,7 +249,7 @@ export async function handleChatCompletions(
     const maxBytes = Number(pluginConfig.maxBodyBytes) || 4 * 1024 * 1024;
     const { body } = await readJsonBody(req, { maxBytes });
 
-    const modelRef = String(body.model || "").trim();
+    modelRef = String(body.model || "").trim();
     if (!modelRef || !modelRef.includes("/")) {
       return sendOpenAiError(res, 400, {
         code: "invalid_model",
@@ -258,19 +283,28 @@ export async function handleChatCompletions(
       });
     }
 
-    const invocationId = String(req.headers?.["x-dalton-invocation-id"] || "").trim();
+    invocationId = String(req.headers?.["x-dalton-invocation-id"] || "").trim();
     const replayOnly = String(req.headers?.["x-dalton-replay-only"] || "").trim() === "1";
-    const reqHash = invocationId
+    reqHash = invocationId
       ? sha256Hex({
           model: modelRef,
           messages: body.messages,
           tools: body.tools || null,
           tool_choice: body.tool_choice || null,
+          temperature: body.temperature ?? null,
+          max_tokens: body.max_tokens ?? body.max_completion_tokens ?? null,
+          reasoning_effort:
+            body.reasoning_effort ??
+            body.dalton?.reasoning_effort ??
+            body.dalton?.thinking_level ??
+            null,
+          response_format: body.response_format ?? null,
+          stop: body.stop ?? null,
         })
       : "";
 
     if (invocationId) {
-      const existing = idempotencyCache.get(invocationId);
+      const existing = await getInvocation(invocationId);
       if (replayOnly && !existing) {
         return sendOpenAiError(res, 404, {
           code: "invocation_not_found",
@@ -286,14 +320,27 @@ export async function handleChatCompletions(
           });
         }
         if (existing.status === "completed" && existing.responsePayload) {
+          const savedReasoning =
+            existing.responsePayload?.openclaw?.reasoning ||
+            existing.responsePayload?.dalton_meta?.reasoning_effort ||
+            "off";
           const replayedPayload = {
             ...existing.responsePayload,
             dalton_replayed: true,
             openclaw: {
+              reasoning: savedReasoning,
               ...(existing.responsePayload.openclaw || {}),
               replayed: true,
             },
           };
+          await journal?.append?.({
+            request_id: requestId,
+            invocation_id: invocationId,
+            endpoint: "chat/completions",
+            stream: Boolean(body.stream),
+            model_ref: modelRef,
+            status: "replayed",
+          });
           if (!Boolean(body.stream)) {
             res.setHeader("X-Dalton-Replayed", "1");
             return sendJson(res, 200, replayedPayload);
@@ -316,9 +363,24 @@ export async function handleChatCompletions(
             ],
             usage: existing.responsePayload.usage,
             dalton_replayed: true,
+            openclaw: replayedPayload.openclaw,
           });
           endSse(res);
           return;
+        }
+        if (existing.status === "pending" || existing.status === "indeterminate") {
+          return sendOpenAiError(res, 409, {
+            code: "idempotency_indeterminate",
+            type: "conflict_error",
+            message:
+              "Invocation is still in progress or ended in an indeterminate state after restart; refusing automatic resend to prevent double billing.",
+          });
+        }
+        if (existing.status === "failed_no_output" && replayOnly) {
+          return sendOpenAiError(res, 404, {
+            code: "invocation_not_found",
+            message: `Invocation ${invocationId} failed with no output; nothing to replay.`,
+          });
         }
       }
     }
@@ -341,6 +403,17 @@ export async function handleChatCompletions(
     });
 
     if (!isPreparedResultOk(prepared)) {
+      if (invocationId) {
+        await saveInvocation({
+          invocationId,
+          reqHash,
+          status: "failed_no_output",
+          model: modelRef,
+          startedAt,
+          failedAt: new Date().toISOString(),
+        });
+        invocationFinalized = true;
+      }
       const errText = String(prepared?.error || `Failed to prepare model ${modelRef}`);
       const classified = classifyProviderError(errText);
       return sendOpenAiError(res, classified.status, {
@@ -371,6 +444,7 @@ export async function handleChatCompletions(
       daltonExt.thinking_level ??
       undefined;
     const reasoning = resolveReasoningLevel(model, reasoningEffortRaw);
+    const effectiveReasoning = reasoning || "off";
 
     const maxTokensRaw = body.max_completion_tokens ?? body.max_tokens;
     const maxTokens =
@@ -402,17 +476,53 @@ export async function handleChatCompletions(
       ...toolChoiceOpts,
     };
 
+    if (invocationId) {
+      startedAt = new Date().toISOString();
+      await saveInvocation({
+        invocationId,
+        reqHash,
+        status: "pending",
+        model: modelRef,
+        startedAt,
+      });
+      invocationRecorded = true;
+    }
+
     const executionModel = resolveStreamExecutionModel(model);
     const eventStream = streamSimpleFn(executionModel, context, streamOpts);
 
     if (!wantStream) {
-      for await (const _ of eventStream) {
-        // Drain stream events; final message comes from eventStream.result()
+      for await (const ev of eventStream) {
+        if (
+          ev &&
+          (ev.type === "text_delta" ||
+            ev.type === "thinking_delta" ||
+            ev.type === "toolcall_start" ||
+            ev.type === "toolcall_delta" ||
+            ev.type === "toolcall_end")
+        ) {
+          emittedOutput = true;
+        }
       }
       const finalMsg = await eventStream.result();
       const latencyMs = Math.round(performance.now() - startMonotonic);
 
       if (finalMsg?.stopReason === "error" || finalMsg?.stopReason === "aborted") {
+        const hasPartialOutput =
+          emittedOutput ||
+          Number(finalMsg?.usage?.output || 0) > 0 ||
+          (Array.isArray(finalMsg?.content) && finalMsg.content.length > 0);
+        if (invocationId) {
+          await saveInvocation({
+            invocationId,
+            reqHash,
+            status: hasPartialOutput ? "indeterminate" : "failed_no_output",
+            model: modelRef,
+            startedAt,
+            failedAt: new Date().toISOString(),
+          });
+          invocationFinalized = true;
+        }
         const errMsg = String(finalMsg.errorMessage || `Upstream generation ${finalMsg.stopReason}`);
         const classified = classifyProviderError(errMsg);
         await journal.append({
@@ -427,11 +537,14 @@ export async function handleChatCompletions(
           error_message: errMsg.slice(0, 500),
           latency_ms: latencyMs,
         });
-        return sendOpenAiError(res, classified.status, {
-          code: classified.code,
-          type: classified.type,
-          message: errMsg,
-        });
+        if (!clientDisconnected && !res.writableEnded) {
+          return sendOpenAiError(res, classified.status, {
+            code: classified.code,
+            type: classified.type,
+            message: errMsg,
+          });
+        }
+        return;
       }
 
       try {
@@ -451,6 +564,7 @@ export async function handleChatCompletions(
         model_id: model.id,
         auth_mode: auth?.mode || "configured",
         profile_id: auth?.profileId || null,
+        reasoning_effort: effectiveReasoning,
         latency_ms: latencyMs,
         cost_usd: finalMsg?.usage?.cost || {
           input: 0,
@@ -462,13 +576,31 @@ export async function handleChatCompletions(
         stop_reason_raw: finalMsg?.stopReason || "stop",
       };
 
-      const responsePayload = buildNonStreamingChatCompletionResponse({
-        id: requestId,
-        created,
-        modelRef,
-        assistantMsg: finalMsg,
-        daltonMeta,
-      });
+      const responsePayload = {
+        ...buildNonStreamingChatCompletionResponse({
+          id: requestId,
+          created,
+          modelRef,
+          assistantMsg: finalMsg,
+          daltonMeta,
+        }),
+        openclaw: {
+          reasoning: effectiveReasoning,
+        },
+      };
+
+      if (invocationId) {
+        await saveInvocation({
+          invocationId,
+          reqHash,
+          status: "completed",
+          model: modelRef,
+          startedAt,
+          completedAt: new Date().toISOString(),
+          responsePayload,
+        });
+        invocationFinalized = true;
+      }
 
       await journal.append({
         request_id: requestId,
@@ -488,20 +620,16 @@ export async function handleChatCompletions(
         caller_meta: daltonExt,
       });
 
-      if (invocationId) {
-        idempotencyCache.set(invocationId, {
-          reqHash,
-          status: "completed",
-          responsePayload,
-          ts: Date.now(),
-        });
+      if (!clientDisconnected && !res.writableEnded) {
+        return sendJson(res, 200, responsePayload);
       }
-
-      return sendJson(res, 200, responsePayload);
+      return;
     }
 
     // Streaming SSE branch (stream: true)
-    beginSse(res, { "X-Dalton-Request-Id": requestId });
+    if (!clientDisconnected && !res.writableEnded) {
+      beginSse(res, { "X-Dalton-Request-Id": requestId });
+    }
     const translator = createSseDeltaTranslator({
       id: requestId,
       created,
@@ -511,9 +639,21 @@ export async function handleChatCompletions(
 
     for await (const ev of eventStream) {
       if (abortController.signal.aborted) break;
+      if (
+        ev &&
+        (ev.type === "text_delta" ||
+          ev.type === "thinking_delta" ||
+          ev.type === "toolcall_start" ||
+          ev.type === "toolcall_delta" ||
+          ev.type === "toolcall_end")
+      ) {
+        emittedOutput = true;
+      }
       const chunks = translator.onEvent(ev);
-      for (const chunk of chunks) {
-        writeSseData(res, chunk);
+      if (!clientDisconnected && !res.writableEnded) {
+        for (const chunk of chunks) {
+          writeSseData(res, chunk);
+        }
       }
     }
 
@@ -521,21 +661,38 @@ export async function handleChatCompletions(
     const latencyMs = Math.round(performance.now() - startMonotonic);
 
     if (finalMsg?.stopReason === "error" || finalMsg?.stopReason === "aborted") {
+      const hasPartialOutput =
+        emittedOutput ||
+        Number(finalMsg?.usage?.output || 0) > 0 ||
+        (Array.isArray(finalMsg?.content) && finalMsg.content.length > 0);
+      if (invocationId) {
+        await saveInvocation({
+          invocationId,
+          reqHash,
+          status: hasPartialOutput ? "indeterminate" : "failed_no_output",
+          model: modelRef,
+          startedAt,
+          failedAt: new Date().toISOString(),
+        });
+        invocationFinalized = true;
+      }
       const errMsg = String(finalMsg.errorMessage || `Stream ${finalMsg.stopReason}`);
       const classified = classifyProviderError(errMsg);
-      writeSseData(res, {
-        id: requestId,
-        object: "chat.completion.chunk",
-        created,
-        model: modelRef,
-        choices: [{ index: 0, delta: {}, finish_reason: "error" }],
-        error: {
-          code: classified.code,
-          type: classified.type,
-          message: errMsg,
-        },
-      });
-      endSse(res);
+      if (!clientDisconnected && !res.writableEnded) {
+        writeSseData(res, {
+          id: requestId,
+          object: "chat.completion.chunk",
+          created,
+          model: modelRef,
+          choices: [{ index: 0, delta: {}, finish_reason: "error" }],
+          error: {
+            code: classified.code,
+            type: classified.type,
+            message: errMsg,
+          },
+        });
+        endSse(res);
+      }
       await journal.append({
         request_id: requestId,
         endpoint: "chat/completions",
@@ -568,6 +725,7 @@ export async function handleChatCompletions(
       model_id: model.id,
       auth_mode: auth?.mode || "configured",
       profile_id: auth?.profileId || null,
+      reasoning_effort: effectiveReasoning,
       latency_ms: latencyMs,
       cost_usd: finalMsg?.usage?.cost || {
         input: 0,
@@ -580,26 +738,37 @@ export async function handleChatCompletions(
     };
 
     if (invocationId) {
-      const cachedResponsePayload = buildNonStreamingChatCompletionResponse({
-        id: requestId,
-        created,
-        modelRef,
-        assistantMsg: finalMsg,
-        daltonMeta,
-      });
-      idempotencyCache.set(invocationId, {
+      const cachedResponsePayload = {
+        ...buildNonStreamingChatCompletionResponse({
+          id: requestId,
+          created,
+          modelRef,
+          assistantMsg: finalMsg,
+          daltonMeta,
+        }),
+        openclaw: {
+          reasoning: effectiveReasoning,
+        },
+      };
+      await saveInvocation({
+        invocationId,
         reqHash,
         status: "completed",
+        model: modelRef,
+        startedAt,
+        completedAt: new Date().toISOString(),
         responsePayload: cachedResponsePayload,
-        ts: Date.now(),
       });
+      invocationFinalized = true;
     }
 
     const doneChunks = translator.onDone(finalMsg, daltonMeta);
-    for (const chunk of doneChunks) {
-      writeSseData(res, chunk);
+    if (!clientDisconnected && !res.writableEnded) {
+      for (const chunk of doneChunks) {
+        writeSseData(res, chunk);
+      }
+      endSse(res);
     }
-    endSse(res);
 
     await journal.append({
       request_id: requestId,
@@ -617,17 +786,34 @@ export async function handleChatCompletions(
       caller_meta: daltonExt,
     });
   } catch (err) {
+    if (invocationId && invocationRecorded && !invocationFinalized) {
+      try {
+        await saveInvocation({
+          invocationId,
+          reqHash,
+          status: emittedOutput ? "indeterminate" : "failed_no_output",
+          model: modelRef,
+          startedAt,
+          failedAt: new Date().toISOString(),
+        });
+        invocationFinalized = true;
+      } catch {
+        // Ignore secondary persistence error in catch
+      }
+    }
     const statusCode = Number(err?.statusCode) || 500;
     const code = String(err?.code || "internal_broker_error");
     const message = String(err?.message || "Unexpected broker error");
     logger?.warn?.(`[dalton-broker] chat/completions error (${code}): ${message}`);
-    if (!res.headersSent) {
-      sendOpenAiError(res, statusCode, { code, message });
-    } else if (!res.writableEnded) {
-      writeSseData(res, {
-        error: { code, message, type: "api_error" },
-      });
-      endSse(res);
+    if (!clientDisconnected) {
+      if (!res.headersSent) {
+        sendOpenAiError(res, statusCode, { code, message });
+      } else if (!res.writableEnded) {
+        writeSseData(res, {
+          error: { code, message, type: "api_error" },
+        });
+        endSse(res);
+      }
     }
   } finally {
     if (timeoutTimer) clearTimeout(timeoutTimer);

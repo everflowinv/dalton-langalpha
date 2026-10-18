@@ -1,4 +1,4 @@
-"""Dalton budget gate hooks: runtime gate builder, admission check, and startup wiring verification (P0.8 §2, §7, §8)."""
+"""Dalton budget gate hooks: runtime gate builder, admission check, and startup wiring verification (P0.8 §2, §7, §8, P0N.6, G1)."""
 
 from __future__ import annotations
 
@@ -15,16 +15,30 @@ from src.dalton.budget.port import (
     format_daily_budget_exhausted_message,
 )
 from src.dalton.budget.service import reconcile_and_summarize_day
-from src.dalton.settings import get_dalton_settings, is_dalton_budget_gate_enabled
+from src.dalton.settings import (
+    get_dalton_settings,
+    is_dalton_budget_gate_enabled,
+    is_dalton_enabled,
+)
 from src.ptc_agent.agent.middleware.credit_gate import CreditGateState, CreditLease
 from src.server.database.pool import get_db_connection
 
 logger = logging.getLogger(__name__)
 
+_WARNED_GATE_DISABLED = False
+
 
 def local_gate_enabled() -> bool:
-    """Return True when running in OSS mode with `DALTON_BUDGET_GATE=1`."""
-    return HOST_MODE == "oss" and is_dalton_budget_gate_enabled()
+    """Return True when running in OSS mode with `DALTON_BUDGET_GATE=1` (R2-6)."""
+    global _WARNED_GATE_DISABLED
+    enabled = HOST_MODE == "oss" and is_dalton_budget_gate_enabled()
+    if not enabled and not _WARNED_GATE_DISABLED and HOST_MODE == "oss" and is_dalton_enabled():
+        _WARNED_GATE_DISABLED = True
+        logger.warning(
+            "[DaltonBudget] 本地预算闸门未启用 (DALTON_BUDGET_GATE != 1); "
+            "daily USD cap enforcement is currently inactive."
+        )
+    return enabled
 
 
 def build_local_run_gate(
@@ -55,13 +69,14 @@ def build_local_run_gate(
 
 
 async def enforce_local_admission(user_id: str, byok: bool = False) -> None:
-    """Fail-closed admission check before starting or resuming a run (P0.8 §7).
+    """Fail-closed admission check before starting or resuming a run (P0.8 §7, P0N.6 §3, G1.1).
 
-    Passes through when `byok=True` (user-supplied key or OAuth).
+    Even when the main model uses OAuth/BYOK (`byok=True`), subagents and background tasks
+    in the same turn consume cash budget (L24). Therefore, `byok` never skips admission.
     Raises 429 (`dalton_daily_budget`) when `available < admission_floor_usd`,
     or 503 (`service_unavailable`) on DB error.
     """
-    if byok or not user_id:
+    if not user_id:
         return
 
     settings = get_dalton_settings().budget
@@ -123,6 +138,13 @@ async def enforce_local_admission(user_id: str, byok: bool = False) -> None:
 async def verify_local_wiring() -> None:
     """Startup assertion for Dalton local budget gate (P0.8 §8). Never raises."""
     try:
+        if not is_dalton_budget_gate_enabled():
+            logger.warning(
+                "[DaltonBudget] 本地预算闸门未启用 (DALTON_BUDGET_GATE != 1); "
+                "daily USD cap enforcement is currently inactive."
+            )
+            return
+
         if USD_TO_CREDITS_RATE != 1000:
             logger.warning(
                 "[DaltonBudget] USD_TO_CREDITS_RATE is %s (expected 1000)",

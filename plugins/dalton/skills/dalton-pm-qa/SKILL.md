@@ -6,6 +6,7 @@ description: "处理基金经理（PM）日常互动问答：先读知识层（t
 # PM 日常互动问答（PM Q&A）
 
 Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the first deliverable.
+公司认知按 `.agents/skills/dalton-knowledge/SKILL.md` 的读序读（`agent.md` 托管块 → `thesis.md` → `debate.md` → 按需 `drivers.md`、`management.md`、`verdicts.md`、`agenda.md`）；收尾按 `.agents/skills/dalton-agenda/SKILL.md` 的三步。
 
 ## 1. 第一步：先读知识层（Knowledge Layer First）
 
@@ -38,7 +39,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 - **场景**：PM 问及知识层尚未覆盖的新竞争对手、新技改路线、未建模的新业务分部、或跨行业专题。
 - **动作**：
   1. 先基于现有知识层给出**初步判断、已知事实边界与核心未知项**（绝不不懂装懂）；
-  2. 明确向 PM 提议启动 `/topic-research`（或 `/bullbear`、`/dalton-earnings-review`），说明拟拆解的核心问题；
+  2. 明确向 PM 提议启动 `/topic-research`（或 `/bullbear`、`/dalton-earnings-deep`），说明拟拆解的核心问题；
   3. 若 PM 同意立即深挖则启动对应工作流；若暂不深挖，通过 `agenda_ops` 将该问题记入 `agenda.md` 的 `open_questions`（标记 `origin="pm"`）。
 
 ---

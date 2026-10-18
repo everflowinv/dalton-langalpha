@@ -79,7 +79,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 
 ### Step 11：确认或补建 T+1 深度链自动任务
 - 检查本工作区 `.agents/user/automations/dalton-<t>-earn-<period>-tp1.json`（T+1 交易日 20:00 当地市场时区）是否已由 PS.7 建立、`status == "active"` 且时间正确。
-- 若该文件不存在或时间有误（針對 Core 公司或 PM 要求深度跟踪的公司），立即按 PS.7 模板在本工作区直接写文件补建（分析师对本工作区 `dalton-*` 自动任务有常设授权，无需询问 PM）。
+- 若该文件不存在或时间有误（针对 Core 公司或 PM 要求深度跟踪的公司），立即按 PS.7 模板在本工作区直接写文件补建（分析师对本工作区 `dalton-*` 自动任务有常设授权，无需询问 PM）。
 
 ### Step 12：交付前 14 项数据质量门自检（Data-Quality Gate）
 

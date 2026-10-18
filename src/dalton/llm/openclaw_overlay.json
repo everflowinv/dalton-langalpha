@@ -866,7 +866,6 @@
         "dynamic_models": false,
         "byok_eligible": false,
         "prompt_cache_key": false,
-        "operator_channel": "system",
         "display_name": "OpenClaw (broker)",
         "dalton_broker": true
       }
@@ -979,7 +978,7 @@
           "dalton": {
             "openclaw_ref": "antigravity-cli-gateway/gpt-oss-120b",
             "upstream_provider": "antigravity-cli-gateway",
-            "family": "openai-gpt-oss",
+            "family": "openai-gpt",
             "billing": "subscription",
             "tool_calling": false,
             "price_sources": [

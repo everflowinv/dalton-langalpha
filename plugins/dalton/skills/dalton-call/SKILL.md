@@ -6,6 +6,7 @@ description: "生成高确信度投资建议（Conviction Call）：先做 6 条
 # 高确信度投资建议（Conviction Call）
 
 Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the first deliverable.
+公司认知按 `.agents/skills/dalton-knowledge/SKILL.md` 的读序读（`agent.md` 托管块 → `thesis.md` → `debate.md` → 按需 `drivers.md`、`management.md`、`verdicts.md`、`agenda.md`）；收尾按 `.agents/skills/dalton-agenda/SKILL.md` 的三步。
 
 ## 0. 核心纪律：宁缺毋滥，不达门禁绝不硬凑
 

@@ -13,7 +13,7 @@
 
 ## 2. 一手 Filing 硬编码与单元格级来源台账
 
-- **历史实际数（Actuals）只取一手监管 Filing**：美股取 SEC 10-K / 10-Q / 20-F（经 `dalton_sec.extract_facts` 或 `researchdata.finance(route="sec")`），港股/A 股取法定年报/季报/业绩公告。严禁直接把卖方模型里的历史数抄入底表。
+- **历史实际数（Actuals）只取一手监管 Filing**：美股取 SEC 10-K / 10-Q / 20-F（经 `dalton_sec.get_company_facts`、`dalton_sec.list_filings` 或 `researchdata.finance(route="sec")`），港股/A 股取法定年报/季报/业绩公告。严禁直接把卖方模型里的历史数抄入底表。
 - **单元格级来源台账（Provenance Ledger）**：每个历史硬编码区域必须配套记录或可追溯至以下 6 项元数据：
   1. **法定文件与 Accession**（如 `10-K (0001326801-26-000012)`）
   2. **报告期间与财年结束日**（如 `FY2025 (ended 2025-12-31)`）

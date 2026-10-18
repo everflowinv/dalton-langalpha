@@ -3,9 +3,9 @@
 
 Ported from findata-return (`findata_return_cli.py`) per PS.2 specification:
 - R1 (TTM): ttm_div + ttm_buyback * true_return_share
-- R2 (3Y avg): sum(annual_3y) / 3.0
+- R2 (3Y avg): sum(annual_3y) / 3.0 (or None if company has < 3 years of listing history)
 - R3 (12M fwd): fwd_total * (credibility / 100.0)
-- R = max(R1, R2, R3); driver in {"R1", "R2", "R3"}
+- R = max(available of R1, R2, R3); driver in {"R1", "R2", "R3"}
 - base_score = min(R, 20.0)
 - sustainability adjustments summed and clamped to [-1.0, +2.0]
 - final_score = round(clamp(base_score + adj, 0.0, 20.0), 1)
@@ -19,6 +19,14 @@ import sys
 from typing import Any, Sequence
 
 VALID_CREDIBILITY = (100, 90, 75, 60, 50)
+
+CREDIBILITY_TIER_ZH: dict[int, str] = {
+    100: "管理层明确金额或比例，且已有董事会决议并正在执行",
+    90: "管理层明确比例或金额，且当前已有执行",
+    75: "明确方向性目标但无精确数字，过往兑现记录良好",
+    60: "方向性表态，历史执行一般",
+    50: "无明确政策，按近年趋势外推",
+}
 
 
 def parse_adjust(items: Sequence[str] | None) -> list[tuple[float, str]]:
@@ -46,21 +54,29 @@ def compute_return_score(
     ttm_div: float,
     ttm_buyback: float,
     true_return_share: float,
-    annual: Sequence[float],
+    annual: Sequence[float] | None,
     fwd_total: float,
     credibility: int,
     adjustments: Sequence[tuple[float, str] | dict[str, Any]] | None = None,
+    credibility_reason: str | None = None,
+    annual_na_reason: str | None = None,
 ) -> dict[str, Any]:
     """Compute deterministic 0-20 shareholder return score per PS.2."""
     if not (0.0 <= true_return_share <= 1.0):
         raise ValueError("true_return_share must be in [0, 1]")
-    if len(annual) != 3:
-        raise ValueError("annual must have 3 values (most recent 3 fiscal years)")
     if int(credibility) not in VALID_CREDIBILITY:
         raise ValueError(f"credibility must be one of {VALID_CREDIBILITY}")
 
     cred_int = int(credibility)
-    annual_list = [float(x) for x in annual]
+    cred_desc = (credibility_reason or "").strip() or CREDIBILITY_TIER_ZH[cred_int]
+
+    annual_list: list[float] | None = None
+    r2: float | None = None
+    if annual is not None and len(annual) > 0:
+        if len(annual) != 3:
+            raise ValueError("annual must have 3 values (most recent 3 fiscal years) or be None/N/A")
+        annual_list = [float(x) for x in annual]
+        r2 = sum(annual_list) / 3.0
 
     norm_adjustments: list[tuple[float, str]] = []
     for item in adjustments or []:
@@ -71,11 +87,15 @@ def compute_return_score(
             norm_adjustments.append((float(d), str(r).strip()))
 
     r1 = float(ttm_div) + float(ttm_buyback) * float(true_return_share)
-    r2 = sum(annual_list) / 3.0
     r3 = float(fwd_total) * (cred_int / 100.0)
 
-    r = max(r1, r2, r3)
-    driver = "R1" if r == r1 else ("R2" if r == r2 else "R3")
+    candidates: list[tuple[str, float]] = [("R1", r1)]
+    if r2 is not None:
+        candidates.append(("R2", r2))
+    candidates.append(("R3", r3))
+
+    r = max(val for _, val in candidates)
+    driver = next(name for name, val in candidates if val == r)
     base = min(r, 20.0)
 
     adj_raw = sum(d for d, _ in norm_adjustments)
@@ -88,10 +108,15 @@ def compute_return_score(
         if norm_adjustments
         else "无调整"
     )
+    r2_str = (
+        f"R2(三年均值)={r2:.2f}%"
+        if r2 is not None
+        else f"R2(三年均值)=N/A（{annual_na_reason or '上市不足三年'}）"
+    )
     rationale = (
-        f"R1(TTM 净回报率)={r1:.2f}%，R2(三年均值)={r2:.2f}%，"
-        f"R3(前瞻折算，可信度 {cred_int}%)={r3:.2f}%；"
-        f"取三者最高 {driver}={r:.2f}% 对应基础分 {base:.2f}；"
+        f"R1(TTM 净回报率)={r1:.2f}%，{r2_str}，"
+        f"R3(前瞻折算，可信度 {cred_int}%：{cred_desc})={r3:.2f}%；"
+        f"取最高 {driver}={r:.2f}% 对应基础分 {base:.2f}；"
         f"可持续性调整 {_fmt_signed(adj)}（{adj_text}）；"
         f"最终得分 {final_rounded:.1f}/20。"
     )
@@ -102,11 +127,13 @@ def compute_return_score(
             "ttm_buyback_pct": float(ttm_buyback),
             "true_return_share": float(true_return_share),
             "annual_3y_pct": annual_list,
+            "annual_total_return_pct": annual_list,
             "fwd_total_pct": float(fwd_total),
             "credibility_pct": cred_int,
+            "credibility_reason": cred_desc,
         },
         "R1": round(r1, 2),
-        "R2": round(r2, 2),
+        "R2": round(r2, 2) if r2 is not None else None,
         "R3": round(r3, 2),
         "R": round(r, 2),
         "driver": driver,
@@ -139,7 +166,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--annual",
         type=str,
         required=True,
-        help="Comma-separated 3 fiscal year total return yields (pct), e.g. '11.24,11.88,15.05'",
+        help="Comma-separated 3 fiscal year total return yields (pct), e.g. '11.24,11.88,15.05', or 'N/A[:reason]'",
     )
     parser.add_argument("--fwd-total", type=float, required=True, help="12M forward expected yield (pct)")
     parser.add_argument(
@@ -148,6 +175,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         choices=VALID_CREDIBILITY,
         required=True,
         help="Policy credibility weight (pct)",
+    )
+    parser.add_argument(
+        "--credibility-reason",
+        type=str,
+        default=None,
+        help="Optional explanation for credibility tier selection",
     )
     parser.add_argument(
         "--adjust",
@@ -174,7 +207,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(normalized_argv)
 
     try:
-        annual_vals = [float(x.strip()) for x in args.annual.split(",") if x.strip()]
+        annual_raw = args.annual.strip()
+        annual_vals: list[float] | None
+        annual_na_reason: str | None = None
+        if annual_raw.upper().startswith(("N/A", "NA", "NULL", "NONE")):
+            annual_vals = None
+            if ":" in annual_raw:
+                annual_na_reason = annual_raw.split(":", 1)[1].strip()
+        else:
+            annual_vals = [float(x.strip()) for x in annual_raw.split(",") if x.strip()]
         adjustments = parse_adjust(args.adjust)
         result = compute_return_score(
             ttm_div=args.ttm_div,
@@ -184,6 +225,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             fwd_total=args.fwd_total,
             credibility=args.credibility,
             adjustments=adjustments,
+            credibility_reason=args.credibility_reason,
+            annual_na_reason=annual_na_reason,
         )
     except ValueError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

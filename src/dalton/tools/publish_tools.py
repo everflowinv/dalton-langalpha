@@ -7,6 +7,7 @@ from typing import Annotated, Any, Literal
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool, tool
 
+from src.dalton.database.publications import resolve_thread_author_model
 from src.dalton.publish.service import run_check_draft, run_publish
 from src.dalton.tools.knowledge_tools import (
     _extract_run_identity,
@@ -67,7 +68,7 @@ def create_publish_tools(filesystem_backend: Any = None) -> list[BaseTool]:
         config: RunnableConfig,
         tool_call_id: Annotated[str, InjectedToolCallId] = "",
     ) -> str:
-        """Publish a finished draft as the fund's official research: audits every figure, gets an independent review, then asks the PM to approve.
+        """Publish a finished draft as the fund's official research (.md and optional .xlsx model): audits every figure, gets an independent review, then asks the PM to approve.
 
         Call only when the draft is final; while drafting use check_draft. Unmatched figures or a "revise" review come back as a list to fix — fix and call again.
         Returns: the published paths, or what blocks publishing and what to do next.
@@ -77,8 +78,20 @@ def create_publish_tools(filesystem_backend: Any = None) -> list[BaseTool]:
             return "ERROR: user_id, workspace_id, and thread_id are required in RunnableConfig."
 
         cfg = (config or {}).get("configurable") or {}
-        author_model = cfg.get("model") or cfg.get("llm_model")
+        author_model = (
+            cfg.get("served_model")
+            or cfg.get("model")
+            or cfg.get("llm_model")
+        )
+        if not author_model:
+            author_model = await resolve_thread_author_model(thread_id)
         origin_type, _ = await _resolve_thread_origin(thread_id)
+
+        cleaned_attachments = [
+            a
+            for a in (attachments or [])
+            if isinstance(a, dict) and str(a.get("role") or "") != "pdf_source"
+        ]
 
         res = await run_publish(
             user_id=user_id,
@@ -89,7 +102,7 @@ def create_publish_tools(filesystem_backend: Any = None) -> list[BaseTool]:
             title=title,
             kind=kind,
             slug=slug,
-            attachments=attachments,
+            attachments=cleaned_attachments,
             updates_thesis=updates_thesis,
             request_id=request_id,
             backend=filesystem_backend,

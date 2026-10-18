@@ -158,6 +158,15 @@ export interface DaltonBudgetToday {
   spent_usd: number;
   remaining_usd: number;
   subscription_notional_usd: number;
+  budget_gate_enabled?: boolean;
+  by_provider?: Record<
+    string,
+    {
+      cash_usd: number;
+      notional_usd: number;
+      calls: number;
+    }
+  >;
   runs: Array<{
     run_ref: string;
     thread_id?: string | null;
@@ -168,6 +177,78 @@ export interface DaltonBudgetToday {
     charge_usd: number;
     created_at: string;
   }>;
+}
+
+export interface DaltonProviderStatusItem {
+  provider: string;
+  display_name: string;
+  access_type: string;
+  billing: 'subscription' | 'cash';
+  enabled: boolean;
+  configured: boolean;
+  credential: {
+    source?: string;
+    email?: string | null;
+    plan_type?: string | null;
+    expires_at?: string | null;
+    seconds_left?: number | null;
+    last_refresh?: { at?: string; ok?: boolean } | null;
+    env_key?: string;
+    has_env?: boolean;
+    has_byok?: boolean;
+  };
+  last_success?: {
+    at?: string;
+    model?: string;
+    source?: string;
+  } | null;
+  recent_errors: Array<{
+    at?: string;
+    kind?: string;
+    model?: string | null;
+    message?: string;
+  }>;
+  errors_24h: number;
+  calls_24h: number;
+  used_by_roles: Array<{ role: string; model: string }>;
+  warnings: Array<{ code: string; message: string }>;
+  tos_risk: 'high' | 'none';
+  default_probe_model?: string | null;
+}
+
+export interface DaltonProvidersStatusResponse {
+  generated_at: string;
+  providers: DaltonProviderStatusItem[];
+  role_warnings?: OpenClawRoleWarning[];
+  broker: {
+    enabled: boolean;
+    health?: OpenClawHealthResponse | null;
+  };
+}
+
+export interface DaltonProviderProbeResponse {
+  ok: boolean;
+  provider: string;
+  model?: string | null;
+  latency_ms: number;
+  reply?: string;
+  usage?: Record<string, unknown>;
+  error_kind?: string | null;
+  message: string;
+}
+
+export interface DaltonAvailableModelsResponse {
+  user_id: string;
+  available_keys: string[];
+  models: Record<
+    string,
+    {
+      available: boolean;
+      provider: string;
+      family: string;
+      reasons: string[];
+    }
+  >;
 }
 
 export async function fetchOpenClawStatus(): Promise<OpenClawStatusResponse> {
@@ -185,6 +266,29 @@ export async function syncOpenClawModels(params: {
   force?: boolean;
 }): Promise<OpenClawSyncResponse> {
   const { data } = await api.post<OpenClawSyncResponse>('/api/v1/dalton/openclaw/models/sync', params);
+  return data;
+}
+
+export async function fetchDaltonProvidersStatus(): Promise<DaltonProvidersStatusResponse> {
+  const { data } = await api.get<DaltonProvidersStatusResponse>('/api/v1/dalton/providers/status');
+  return data;
+}
+
+export async function probeDaltonProvider(
+  provider: string,
+  model?: string | null,
+): Promise<DaltonProviderProbeResponse> {
+  const { data } = await api.post<DaltonProviderProbeResponse>(
+    `/api/v1/dalton/providers/${encodeURIComponent(provider)}/probe`,
+    model ? { model } : {},
+  );
+  return data;
+}
+
+export async function fetchDaltonAvailableModels(): Promise<DaltonAvailableModelsResponse> {
+  const { data } = await api.get<DaltonAvailableModelsResponse>(
+    '/api/v1/dalton/providers/available-models',
+  );
   return data;
 }
 

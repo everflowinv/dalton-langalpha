@@ -6,6 +6,7 @@ description: Rapid 9-section company background sheet (business, segments, 3Y an
 # dalton-company-background — 公司背景速览（PS.3）
 
 Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the first deliverable.
+公司认知按 `.agents/skills/dalton-knowledge/SKILL.md` 的读序读（`agent.md` 托管块 → `thesis.md` → `debate.md` → 按需 `drivers.md`、`management.md`、`verdicts.md`、`agenda.md`）；收尾按 `.agents/skills/dalton-agenda/SKILL.md` 的三步。
 
 ## 1. 触发与定位
 
@@ -13,14 +14,14 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 
 - **定位**：一页看清公司“是什么、靠什么赚钱、财务体量、市场给什么价、核心看点与风险”。
 - **硬边界**：前 6 节（定位、分部、年度、季度、资产负债表、市场数据）**只写事实，不写观点判断**；第 7 节（商业模式与竞争）写结构化特征；观点与待验证问题集中放在第 8 节（核心看点）与第 9 节（核心风险）。
-- **与 `dalton-initial-coverage` 的关系**：本技能是单次快速背景扫描（不启动多分支 `run_workflow`），产出写入公司空间 `drafts/<YYYY-MM-DD>-background.md`。若后续升级为初次覆盖，本技能产出可直接作为 Stage 0 输入。
+- **与 `dalton-initial-coverage` 的关系**：本技能是单次快速背景扫描（不启动多分支 `RunWorkflow`），产出写入公司空间 `drafts/<YYYY-MM-DD>-background.md`。若后续升级为初次覆盖，本技能产出可直接作为 Stage 0 输入。
 
 ---
 
 ## 2. 数据源优先级与核验纪律
 
 1. **上市公司（美股 / 港股 / A 股 / 日欧股）**：
-   - 美股优先调用 `dalton_sec`（`get_filing_metadata`、`get_company_facts`、`read_filing_section`）读取最新 10-K / 20-F 与最近 4 个季度 10-Q / 6-K / 8-K。
+   - 美股优先调用 `dalton_sec`（`list_filings`、`get_company_facts`）与 `researchdata.finance(route="sec")` 读取最新 10-K / 20-F 与最近 4 个季度 10-Q / 6-K / 8-K。
    - 行情、市值、EV、估值倍数、一致预期优先调用 `researchdata`（`finance`）或 `market_data`。
    - 港股 / 非美市场优先从公司 IR 公告、年报 / 中报及 `researchdata` 获取。
 2. **未上市 / 拟上市公司**：
@@ -64,6 +65,6 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 
 ## 5. 知识层与交付动作
 
-1. 若当前工作空间尚未初始化 `company.md`，可用本次核实的事实字段调用 `knowledge_update(target="company", ...)` 补齐公司基础档案（不捏造 thesis）。
+1. 若当前工作空间尚未初始化 `company.md`，可用本次核实的事实字段调用 `knowledge_update(doc="company", ...)` 补齐公司基础档案（不捏造 thesis）。
 2. 将完整稿件写入 `drafts/<YYYY-MM-DD>-background.md`。
 3. 如用户要求正式发布，调用 `check_draft` 通过后调用 `publish_report`。

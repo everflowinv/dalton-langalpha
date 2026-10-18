@@ -5,7 +5,8 @@
 
 llm:
   name: "claude-opus-5-5-oauth"
-  background: "ocb-deepseek-deepseek-flash"
+  background: "deepseek-flash"
+  assist: "gemini-3.8-flash-low-oauth"
   compaction: ""
   fetch: ""
   fallback: []
@@ -29,8 +30,8 @@ mcp:
 subagents:
   definitions:
     research:
-      model: "ocb-xai-grok-4.7"
+      model: "grok-4.7"
     data-prep:
-      model: "ocb-xai-grok-4.7"
+      model: "grok-4.7"
     general-purpose:
-      model: "ocb-xai-grok-4.7"
+      model: "grok-4.7"

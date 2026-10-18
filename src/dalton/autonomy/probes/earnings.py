@@ -12,6 +12,8 @@ async def probe_earnings(
     *,
     ticker: str,
     watch_state: dict[str, Any],
+    workspace_id: Optional[str] = None,
+    agenda_doc: Optional[dict[str, Any]] = None,
     today: Optional[date] = None,
 ) -> tuple[list[ProbeSignal], dict[str, Any]]:
     """Check if `next_earnings_date` is within T-3..T+1 or if a new earnings release arrived."""
@@ -21,11 +23,26 @@ async def probe_earnings(
 
     next_earn_raw = state.get("next_earnings_date")
     period = state.get("next_earnings_period") or "next"
+
+    if not next_earn_raw and isinstance(agenda_doc, dict):
+        for cat in (agenda_doc.get("catalysts") or []) + ((agenda_doc.get("watch") or {}).get("events") or []):
+            if not isinstance(cat, dict):
+                continue
+            ctype = str(cat.get("type") or "").lower()
+            ctitle = str(cat.get("title") or cat.get("event") or "").lower()
+            if ctype == "earnings" or "财报" in ctitle or "earnings" in ctitle:
+                cand_date = cat.get("expected_date") or cat.get("date")
+                if cand_date:
+                    next_earn_raw = cand_date
+                    if cat.get("period"):
+                        period = str(cat["period"])
+                    break
+
     if next_earn_raw:
         try:
             earn_date = date.fromisoformat(str(next_earn_raw)[:10])
             days_until = (earn_date - now_date).days
-            if days_until == 3:
+            if 1 <= days_until <= 3:
                 signals.append(
                     ProbeSignal(
                         probe="earnings",

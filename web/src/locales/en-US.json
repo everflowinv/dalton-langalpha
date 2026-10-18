@@ -349,6 +349,8 @@
     "claudeDesc": "Use Claude models with your Anthropic subscription",
     "antigravityDesc": "Google Antigravity subscription (Gemini, Claude and GPT-OSS models).",
     "antigravityConnectTitle": "Connect Google Antigravity",
+    "museDesc": "ByteDance Muse subscription (Gemini and Claude models).",
+    "museConnectTitle": "Connect ByteDance Muse",
     "claudeConnectTitle": "Connect Claude Account",
     "claudeHowItWorks": "How it works",
     "claudeStep1Title": "Authorize on claude.ai",
@@ -5459,10 +5461,13 @@
     },
     "publish": {
       "cardTitle": "Official Research Publication Approval (PM Final Review)",
+      "requestIdLabel": "Request ID",
       "titleLabel": "Report Title",
       "kindLabel": "Report Type",
       "draftLabel": "Draft Path",
+      "publishedPathLabel": "Published Path",
       "auditLabel": "Figure Audit",
+      "uncertainHeader": "Uncertain Figures — Handed to PM for Decision",
       "reviewerLabel": "Independent Review",
       "thesisLabel": "Updates Official Thesis",
       "approveBtn": "Approve & Publish",
@@ -5470,6 +5475,19 @@
       "reasonPlaceholder": "Note or revision reason (optional)",
       "approvedLabel": "Approved official publication: {{title}}",
       "rejectedLabel": "Rejected official publication: {{title}}"
+    },
+    "providers": {
+      "title": "Model Provider Status",
+      "subtitle": "Credentials, live probes, and 24h status for Lead, Background, Assist, Evidence, and Reviewer roles",
+      "refresh": "Refresh",
+      "probeBtn": "Test Connection",
+      "probing": "Testing...",
+      "connectLink": "Connect",
+      "brokerParallelTitle": "OpenClaw broker (parallel path)",
+      "brokerSectionTitle": "OpenClaw broker (parallel path)",
+      "subscriptionBadge": "Subscription",
+      "cashBadge": "Cash",
+      "tosRiskBadge": "ToS Risk"
     }
   }
 }

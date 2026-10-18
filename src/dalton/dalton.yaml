@@ -1,8 +1,15 @@
-# Dalton on LangAlpha behavioral defaults (P0.1, P0.8, PK §0.5)
+# Dalton on LangAlpha behavioral defaults (P0.1, P0.8, PK §0.5, P0N.1, P0N.5, P0G)
 enabled: true
 pm_user_ids:
   - "local-dev-user"
 timezone: "Asia/Shanghai"
+
+models:
+  broker:
+    enabled: true            # OpenClaw broker v2 parallel path; false hides ocb-* from catalog
+  disabled_providers: []     # Provider kill switch (P0N.8, L17). Example: ["muse-oauth"]
+  assist_model: "gemini-3.8-flash-low-oauth"
+  assist_fallback_model: "deepseek-flash"
 
 budget:
   # Default daily cap USD when user has not saved a DB row yet.
@@ -19,9 +26,9 @@ knowledge:
 
 publish:
   reviewer_models:
-    - "ocb-openai-gpt-6.1-sol"
-    - "ocb-google-gemini-4-argon"
-    - "ocb-claude-cli-gateway-claude-opus-5-5"
+    - "gpt-6.1-sol-oauth"
+    - "gemini-4-argon-high-oauth"
+    - "grok-4.7"
     - "claude-opus-5-5-oauth"
   extract_model: null
   approval_ttl_hours: 168
@@ -34,7 +41,7 @@ autonomy:
   enabled: true
   min_wake_usd: 0.50
   event_reserve_ratio: 0.2
-  preflight_timeout_s: 20
+  preflight_timeout_s: 45
   backoff:
     base_hours: 24
     max_days: 30

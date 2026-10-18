@@ -1,20 +1,9 @@
 """
 Muse Code OAuth service — device code flow, token exchange, refresh with
-Redis lock.
-
-Connects Meta Muse Code models via users' existing Muse subscriptions,
-speaking the same endpoints the official `muse` CLI launcher uses
-(endpoints and client id discovered from the launcher's own device-login
-implementation and verified against live traffic):
-
-- Device authorization: POST https://auth.meta.com/oidc/device/authorization/
-  (trailing slash required) with the public client id.
-- Token: POST https://auth.meta.com/oidc/device/token/ — device_code grant
-  for login, refresh_token grant for renewal.
-- Inference is NOT via OAuth endpoints: the model calls go straight to
-  https://api.meta.ai/v1/responses (standard OpenAI Responses API) with the
-  bearer access token plus Muse client headers — see src/llms/llm.py.
+Redis lock (P0N.2, P0N.8).
 """
+
+from __future__ import annotations
 
 import logging
 import secrets
@@ -47,15 +36,22 @@ MUSE_TOKEN_URL = "https://auth.meta.com/oidc/device/token/"
 MUSE_DEVICE_GRANT = "urn:ietf:params:oauth:grant-type:device_code"
 
 
-# --- Device code flow ---
+def _record_provider_event_safe(user_id: str | None, kind: str, detail: dict) -> None:
+    try:
+        from src.dalton.database.provider_events import record_provider_event
+
+        record_provider_event(
+            provider=MUSE_PROVIDER,
+            kind=kind,
+            user_id=user_id,
+            detail=detail,
+        )
+    except Exception:
+        pass
 
 
 async def request_device_code() -> dict:
-    """Request a device code from Meta.
-
-    Returns:
-        {device_code, user_code, verification_url, interval, expires_in}
-    """
+    """Request a device code from Meta."""
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.post(
             MUSE_DEVICE_AUTH_URL,
@@ -67,12 +63,9 @@ async def request_device_code() -> dict:
             },
         )
         if resp.status_code >= 400:
-            logger.error(
-                f"[muse_oauth] Device code request failed: status={resp.status_code} body={resp.text[:200]}"
-            )
+            logger.error(f"[muse_oauth] Device code request failed: status={resp.status_code}")
         resp.raise_for_status()
         data = resp.json()
-        # verification_uri_complete pre-fills the code; prefer it when present.
         verification_url = (
             data.get("verification_uri_complete") or data.get("verification_uri") or ""
         )
@@ -86,14 +79,7 @@ async def request_device_code() -> dict:
 
 
 async def poll_device_authorization(device_code: str) -> dict | None:
-    """Single poll attempt for device authorization.
-
-    Returns:
-        {access_token, refresh_token, expires_in} on approval,
-        None while the user hasn't approved yet.
-    Raises:
-        ValueError on access_denied / expired_token.
-    """
+    """Single poll attempt for device authorization."""
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.post(
             MUSE_TOKEN_URL,
@@ -126,19 +112,11 @@ async def poll_device_authorization(device_code: str) -> dict | None:
             raise ValueError("The sign-in request was denied.")
         if error == "expired_token":
             raise ValueError("The sign-in request expired before it was approved.")
-        # Unknown terminal error — surface it rather than polling forever.
-        raise ValueError(f"Muse sign-in failed (HTTP {resp.status_code}: {error or resp.text[:120]})")
+        raise ValueError(f"Muse sign-in failed (HTTP {resp.status_code}: {error or 'unknown'})")
 
 
 async def refresh_tokens(refresh_token: str) -> dict:
-    """Use the refresh token to get a new access token.
-
-    Meta does not appear to rotate refresh tokens; the response may omit
-    refresh_token, in which case the caller keeps the existing one.
-
-    Returns:
-        {access_token, refresh_token, expires_in}
-    """
+    """Use the refresh token to get a new access token."""
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.post(
             MUSE_TOKEN_URL,
@@ -162,16 +140,8 @@ async def refresh_tokens(refresh_token: str) -> dict:
         }
 
 
-# --- Orchestrator with refresh-lock (mirrors codex/claude/antigravity) ---
-
-
 async def get_valid_token(user_id: str) -> dict | None:
-    """
-    Get a valid access token, refreshing if needed.
-
-    Uses Redis SETNX lock to prevent concurrent refresh.
-    Returns None if user hasn't connected.
-    """
+    """Get a valid access token, refreshing if needed."""
     tokens = await get_oauth_tokens(user_id, MUSE_PROVIDER)
     if not tokens:
         return None
@@ -181,8 +151,6 @@ async def get_valid_token(user_id: str) -> dict | None:
     if token_expiry(tokens) > now + REFRESH_BUFFER:
         return {"access_token": tokens["access_token"], "plan_type": tokens.get("plan_type")}
 
-    # No refresh token stored (older connect or Meta omitted it): the access
-    # token is all we have; surface it until it hard-fails upstream.
     if not tokens.get("refresh_token"):
         return {"access_token": tokens["access_token"], "plan_type": tokens.get("plan_type")}
 
@@ -190,8 +158,6 @@ async def get_valid_token(user_id: str) -> dict | None:
 
     cache = get_cache_client()
     lock_key = f"oauth:refresh:{user_id}:{MUSE_PROVIDER}"
-    # Released only by its owner, so a refresh that outlives the lock cannot
-    # free the next holder's. None (Redis unavailable) refreshes uncoordinated.
     lock_token = secrets.token_hex(16)
     acquired = await cache.acquire_lock(lock_key, lock_token, REFRESH_LOCK_TTL_MS)
     if acquired is False:
@@ -220,10 +186,20 @@ async def get_valid_token(user_id: str) -> dict | None:
         except Exception:
             pass
 
+        _record_provider_event_safe(
+            user_id,
+            "refresh_ok",
+            {"expires_in": int(new.get("expires_in", 3600))},
+        )
         logger.debug(f"[muse_oauth] Refreshed tokens for user_id={user_id}")
         return {"access_token": new["access_token"], "plan_type": tokens.get("plan_type")}
     except Exception as e:
-        logger.error(f"[muse_oauth] Token refresh failed for user_id={user_id}: {e}")
+        _record_provider_event_safe(
+            user_id,
+            "refresh_fail",
+            {"error_type": type(e).__name__, "message": str(e)[:160]},
+        )
+        logger.error(f"[muse_oauth] Token refresh failed for user_id={user_id}: {type(e).__name__}")
         return None
     finally:
         if acquired:

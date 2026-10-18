@@ -1,4 +1,4 @@
-"""Dalton HTTP API router (`/api/v1/dalton/*`) for P0.7, P0.8, and PK.13.
+"""Dalton HTTP API router (`/api/v1/dalton/*`) for P0.7, P0.8, PK.13, P0N.8, and G2.
 
 Follows `src/server/AGENTS.md` layering: router orchestrates service calls only;
 all SQL lives in `src/dalton/database/`.
@@ -10,7 +10,7 @@ import logging
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from src.dalton.budget.service import (
     get_budget_settings,
@@ -24,6 +24,11 @@ from src.dalton.services.openclaw_admin import (
     probe_health,
     run_sync,
 )
+from src.dalton.services.provider_status import (
+    get_available_models_report,
+    get_providers_status,
+    probe_provider,
+)
 from src.dalton.settings import get_dalton_settings
 from src.server.utils.api import CurrentUserId, handle_api_exceptions
 
@@ -35,6 +40,10 @@ router = APIRouter(prefix="/api/v1/dalton", tags=["Dalton"])
 class OpenClawSyncRequest(BaseModel):
     dry_run: bool = False
     force: bool = False
+
+
+class ProviderProbeRequest(BaseModel):
+    model_key: str | None = None
 
 
 class BudgetSettingsUpdateRequest(BaseModel):
@@ -50,12 +59,47 @@ class TaskCapUpdateRequest(BaseModel):
 class KnowledgeImportRequest(BaseModel):
     content: dict[str, Any]
     reason: str = "Legacy knowledge import"
-    evidence_refs: list[str] = Field(default_factory=list)
+    evidence_refs: list[Any] = Field(default_factory=list)
 
 
 class DaltonAutomationWriteRequest(BaseModel):
-    workspace_id: str
-    entry: dict[str, Any]
+    model_config = ConfigDict(extra="allow")
+
+    workspace_id: str | None = None
+    entry: dict[str, Any] | None = None
+    spec: dict[str, Any] | None = None
+
+
+def _require_dalton_enabled() -> None:
+    if not get_dalton_settings().enabled:
+        raise HTTPException(status_code=404, detail="Dalton mode disabled")
+
+
+def _require_pm_user(user_id: str) -> None:
+    _require_dalton_enabled()
+    settings = get_dalton_settings()
+    if user_id not in settings.knowledge.pm_user_ids:
+        raise HTTPException(
+            status_code=403, detail="Only PM users may perform this action"
+        )
+
+
+async def _verify_workspace_access(workspace_id: str, user_id: str) -> None:
+    """Verify that ``workspace_id`` belongs to ``user_id`` (G2 #2, R4-8, R5-1)."""
+    _require_dalton_enabled()
+    try:
+        from src.server.database.workspace import get_workspace
+
+        ws = await get_workspace(workspace_id)
+    except Exception:
+        ws = None
+    if ws is not None:
+        owner = str(ws.get("user_id") or "")
+        if owner and owner != str(user_id):
+            raise HTTPException(
+                status_code=403,
+                detail="Workspace does not belong to current user",
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -69,6 +113,7 @@ async def sync_openclaw_models_endpoint(
     body: OpenClawSyncRequest,
     user_id: CurrentUserId,
 ) -> dict[str, Any]:
+    _require_pm_user(user_id)
     return await run_sync(user_id=user_id, dry_run=body.dry_run, force=body.force)
 
 
@@ -77,6 +122,7 @@ async def sync_openclaw_models_endpoint(
 async def get_openclaw_models_status_endpoint(
     user_id: CurrentUserId,
 ) -> dict[str, Any]:
+    _require_dalton_enabled()
     return await get_openclaw_status()
 
 
@@ -85,7 +131,46 @@ async def get_openclaw_models_status_endpoint(
 async def get_openclaw_health_endpoint(
     user_id: CurrentUserId,
 ) -> dict[str, Any]:
+    _require_dalton_enabled()
     return await probe_health()
+
+
+# ---------------------------------------------------------------------------
+# P0N.8: Native Model Provider Status, Probe & Available Models
+# ---------------------------------------------------------------------------
+
+
+@router.get("/providers/status")
+@handle_api_exceptions("get dalton providers status", logger)
+async def get_providers_status_endpoint(
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    _require_dalton_enabled()
+    return await get_providers_status(user_id=user_id)
+
+
+@router.post("/providers/{provider}/probe")
+@handle_api_exceptions("probe dalton provider", logger)
+async def probe_provider_endpoint(
+    provider: str,
+    user_id: CurrentUserId,
+    body: ProviderProbeRequest | None = None,
+) -> dict[str, Any]:
+    _require_dalton_enabled()
+    return await probe_provider(
+        user_id=user_id,
+        provider=provider,
+        model_key=body.model_key if body else None,
+    )
+
+
+@router.get("/providers/available-models")
+@handle_api_exceptions("get dalton available models", logger)
+async def get_available_models_endpoint(
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    _require_dalton_enabled()
+    return await get_available_models_report(user_id=user_id)
 
 
 # ---------------------------------------------------------------------------
@@ -96,6 +181,7 @@ async def get_openclaw_health_endpoint(
 @router.get("/budget")
 @handle_api_exceptions("get dalton budget settings", logger)
 async def get_budget_endpoint(user_id: CurrentUserId) -> dict[str, Any]:
+    _require_dalton_enabled()
     return await get_budget_settings(user_id)
 
 
@@ -105,6 +191,7 @@ async def update_budget_endpoint(
     body: BudgetSettingsUpdateRequest,
     user_id: CurrentUserId,
 ) -> dict[str, Any]:
+    _require_dalton_enabled()
     try:
         return await save_budget_settings(
             user_id,
@@ -124,6 +211,7 @@ async def upsert_task_cap_endpoint(
     body: TaskCapUpdateRequest,
     user_id: CurrentUserId,
 ) -> dict[str, Any]:
+    _require_dalton_enabled()
     try:
         return await put_scoped_task_cap(user_id, scope_kind, scope_id, body.cap_usd)
     except ValueError as exc:
@@ -137,6 +225,7 @@ async def delete_task_cap_endpoint(
     scope_id: str,
     user_id: CurrentUserId,
 ) -> dict[str, Any]:
+    _require_dalton_enabled()
     deleted = await remove_scoped_task_cap(user_id, scope_kind, scope_id)
     return {"deleted": deleted}
 
@@ -144,6 +233,7 @@ async def delete_task_cap_endpoint(
 @router.get("/budget/today")
 @handle_api_exceptions("get dalton budget today", logger)
 async def get_budget_today_endpoint(user_id: CurrentUserId) -> dict[str, Any]:
+    _require_dalton_enabled()
     return await get_budget_today(user_id)
 
 
@@ -161,15 +251,20 @@ async def list_knowledge_versions_endpoint(
     limit: int = Query(default=50, ge=1, le=200),
     before: int | None = Query(default=None),
 ) -> dict[str, Any]:
-    from src.dalton.knowledge import service as knowledge_service
+    await _verify_workspace_access(workspace_id, user_id)
+    from src.dalton.database import knowledge as db_knowledge
 
-    items = await knowledge_service.list_doc_versions(
-        user_id=user_id,
+    rows = await db_knowledge.list_versions(
         workspace_id=workspace_id,
         doc_key=doc,
         limit=limit,
         before=before,
     )
+    items = [
+        r
+        for r in rows
+        if not r.get("user_id") or str(r.get("user_id")) == str(user_id)
+    ]
     return {"items": items}
 
 
@@ -181,15 +276,15 @@ async def get_knowledge_version_endpoint(
     n: int,
     user_id: CurrentUserId,
 ) -> dict[str, Any]:
-    from src.dalton.knowledge import service as knowledge_service
+    await _verify_workspace_access(workspace_id, user_id)
+    from src.dalton.database import knowledge as db_knowledge
 
-    row = await knowledge_service.get_doc_version(
-        user_id=user_id,
+    row = await db_knowledge.get_version(
         workspace_id=workspace_id,
         doc_key=doc,
         version_no=n,
     )
-    if row is None:
+    if row is None or (row.get("user_id") and str(row.get("user_id")) != str(user_id)):
         raise HTTPException(status_code=404, detail="Knowledge version not found")
     return row
 
@@ -203,15 +298,22 @@ async def diff_knowledge_versions_endpoint(
     from_version: int = Query(..., alias="from"),
     to_version: int = Query(..., alias="to"),
 ) -> dict[str, Any]:
+    await _verify_workspace_access(workspace_id, user_id)
     from src.dalton.knowledge import service as knowledge_service
 
-    return await knowledge_service.diff_doc_versions(
-        user_id=user_id,
+    diffs = await knowledge_service.diff_versions(
         workspace_id=workspace_id,
         doc_key=doc,
         from_version=from_version,
         to_version=to_version,
     )
+    return {
+        "workspace_id": workspace_id,
+        "doc": doc,
+        "from_version": from_version,
+        "to_version": to_version,
+        "diffs": diffs,
+    }
 
 
 @router.post("/knowledge/{workspace_id}/{doc}/import")
@@ -222,21 +324,21 @@ async def import_knowledge_document_endpoint(
     body: KnowledgeImportRequest,
     user_id: CurrentUserId,
 ) -> dict[str, Any]:
-    settings = get_dalton_settings()
-    if not settings.enabled:
-        raise HTTPException(status_code=404, detail="Dalton mode disabled")
-    if user_id not in settings.knowledge.pm_user_ids:
-        raise HTTPException(status_code=403, detail="Only PM users may import knowledge")
-
+    _require_pm_user(user_id)
+    await _verify_workspace_access(workspace_id, user_id)
     from src.dalton.knowledge import service as knowledge_service
 
-    return await knowledge_service.import_document(
+    provenance = [
+        r if isinstance(r, dict) else {"kind": "note", "ref": str(r)}
+        for r in (body.evidence_refs or [])
+    ]
+    return await knowledge_service.import_knowledge_doc(
         user_id=user_id,
         workspace_id=workspace_id,
         doc_key=doc,
         content=body.content,
         reason=body.reason,
-        evidence_refs=body.evidence_refs,
+        provenance=provenance,
     )
 
 
@@ -249,17 +351,18 @@ async def list_verdicts_endpoint(
     until: str | None = Query(default=None),
     limit: int = Query(default=50, ge=1, le=200),
 ) -> dict[str, Any]:
+    _require_dalton_enabled()
+    if workspace_id:
+        await _verify_workspace_access(workspace_id, user_id)
     from src.dalton.database import verdicts as verdicts_db
 
-    if workspace_id:
-        items = await verdicts_db.list_verdicts(
-            workspace_id=workspace_id, limit=limit, since=since
-        )
-        items = [r for r in items if str(r.get("user_id")) == user_id]
-    else:
-        items = await verdicts_db.list_user_verdicts(
-            user_id=user_id, since=since, until=until, limit=limit
-        )
+    items = await verdicts_db.list_user_verdicts(
+        user_id=user_id,
+        workspace_id=workspace_id,
+        since=since,
+        until=until,
+        limit=limit,
+    )
     return {"items": items}
 
 
@@ -269,6 +372,9 @@ async def list_publications_endpoint(
     user_id: CurrentUserId,
     workspace_id: str | None = Query(default=None),
 ) -> dict[str, Any]:
+    _require_dalton_enabled()
+    if workspace_id:
+        await _verify_workspace_access(workspace_id, user_id)
     from src.dalton.database import publications as pub_db
 
     items = await pub_db.list_publications(
@@ -283,10 +389,11 @@ async def get_publication_endpoint(
     publication_id: str,
     user_id: CurrentUserId,
 ) -> dict[str, Any]:
+    _require_dalton_enabled()
     from src.dalton.database import publications as pub_db
 
     row = await pub_db.get_publication(publication_id)
-    if row is None or str(row.get("user_id")) != user_id:
+    if row is None or str(row.get("user_id")) != str(user_id):
         raise HTTPException(status_code=404, detail="Publication not found")
     return row
 
@@ -297,6 +404,7 @@ async def list_publish_requests_endpoint(
     user_id: CurrentUserId,
     status: str = Query(default="awaiting_pm"),
 ) -> dict[str, Any]:
+    _require_dalton_enabled()
     from src.dalton.database import publications as pub_db
 
     items = await pub_db.list_pending(user_id=user_id, status=status)
@@ -310,13 +418,17 @@ async def put_dalton_automation_endpoint(
     body: DaltonAutomationWriteRequest,
     user_id: CurrentUserId,
 ) -> dict[str, Any]:
+    _require_dalton_enabled()
+    if body.workspace_id:
+        await _verify_workspace_access(body.workspace_id, user_id)
     from src.dalton.tools.director_tools import schedule_dalton_automation_helper
 
+    spec = body.entry or body.spec or body.model_dump(exclude={"workspace_id", "entry", "spec"}, exclude_none=True)
     return await schedule_dalton_automation_helper(
         user_id=user_id,
-        workspace_id=body.workspace_id,
         name=name,
-        entry=body.entry,
+        spec=spec,
+        workspace_id=body.workspace_id,
     )
 
 
@@ -327,6 +439,7 @@ async def get_coverage_board_endpoint(
     tier: str = Query(default="all"),
     stale_only: bool = Query(default=False),
 ) -> dict[str, Any]:
+    _require_dalton_enabled()
     from src.dalton.autonomy.board import build_coverage_board
 
     return await build_coverage_board(
@@ -342,6 +455,7 @@ async def get_autonomy_report_endpoint(
     user_id: CurrentUserId,
     week: str | None = Query(default=None),
 ) -> dict[str, Any]:
-    from src.dalton.autonomy.report import build_weekly_autonomy_report
+    _require_dalton_enabled()
+    from src.dalton.autonomy.report import generate_weekly_autonomy_report
 
-    return await build_weekly_autonomy_report(user_id=user_id, week=week)
+    return await generate_weekly_autonomy_report(user_id=user_id, week=week)

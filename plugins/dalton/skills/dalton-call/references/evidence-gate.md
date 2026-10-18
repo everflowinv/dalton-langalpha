@@ -6,7 +6,7 @@
 
 ## Gate 1：基础覆盖与模型时效性（Coverage & Model Recency）
 - **通过标准**：
-  - 已完成完整首次深度覆盖（PS.6 `dalton-initiate-full`），**或者**已完成快速覆盖 + 最近一次季报校准（PS.9 `dalton-earnings-review`）；
+  - 已完成完整首次深度覆盖（PS.6 `dalton-full-coverage`），**或者**已完成快速覆盖 + 最近一次季报校准（PS.9 `dalton-earnings-deep`）；
   - 且上述基准报告与财务模型更新距今 **不超过 120 天**。
 - **不通过（FAIL）情形**：仅做过快速筛选（Quick Scan）、尚无三表/驱动模型、或最近一次财报发布后尚未完成模型校准。
 

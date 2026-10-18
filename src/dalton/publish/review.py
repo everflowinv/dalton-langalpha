@@ -73,6 +73,11 @@ class ReviewResult:
         effective_verdict = (
             "revise" if self.verdict.must_fix else self.verdict.verdict
         )
+        points = list(self.verdict.must_fix) + [
+            f"[建议] {x}" for x in self.verdict.nice_to_have
+        ]
+        if not points and self.verdict.summary:
+            points = [self.verdict.summary]
         return {
             "status": "done",
             "model": self.model,
@@ -83,6 +88,7 @@ class ReviewResult:
             "must_fix": list(self.verdict.must_fix),
             "nice_to_have": list(self.verdict.nice_to_have),
             "reasons": list(self.verdict.must_fix) or [self.verdict.summary],
+            "points": points,
             "usage": self.usage or {},
             "reviewed_at": (
                 datetime.now(timezone.utc)
@@ -95,18 +101,18 @@ class ReviewResult:
 
 def family_of(model_key: str | None) -> str:
     """Determine the model family of ``model_key`` (delegating to P0.6 ``role_policy.family_of`` if present)."""
-    if not model_key:
+    if not model_key or not str(model_key).strip():
         return "unknown"
     try:
-        from src.dalton.llm.role_policy import family_of as _role_family_of  # type: ignore[import-not-found]
+        from src.dalton.llm.role_policy import family_of as _role_family_of
 
         fam = _role_family_of(model_key)
-        if fam:
+        if fam and str(fam) != "unknown":
             return str(fam)
     except Exception:
         pass
 
-    key = model_key.strip().lower()
+    key = str(model_key).strip().lower()
     if any(t in key for t in ("claude", "anthropic", "opus", "sonnet", "haiku")):
         return "anthropic-claude"
     if any(t in key for t in ("gpt", "openai", "codex", "o1", "o3", "o4")):
@@ -132,16 +138,36 @@ def pick_reviewer_model(
     candidates: list[str] | None = None,
     available_models: set[str] | None = None,
 ) -> str | None:
-    """Pick the first candidate reviewer model whose family differs from ``author_model`` (PK.10)."""
+    """Pick the first candidate reviewer model whose family differs from ``author_model`` (PK.10 / G3.2).
+
+    Refuses selection (returns ``None``) if ``author_model`` is ``None`` or ``family_of(author_model) == 'unknown'``.
+    """
     author_family = family_of(author_model)
+    if not author_model or author_family == "unknown":
+        return None
+
     candidate_list = (
-        candidates
+        list(candidates)
         if candidates is not None
-        else get_dalton_config().publish.reviewer_models
+        else list(get_dalton_config().publish.reviewer_models)
     )
+    if available_models is not None:
+        candidate_list = [c for c in candidate_list if c in available_models]
+
+    try:
+        from src.dalton.llm.role_policy import select_independent_reviewer
+
+        chosen = select_independent_reviewer(
+            str(author_model),
+            candidate_list,
+            require_tool_calling=False,
+        )
+        if chosen and family_of(chosen) not in ("unknown", author_family):
+            return chosen
+    except Exception:
+        pass
+
     for cand in candidate_list:
-        if available_models is not None and cand not in available_models:
-            continue
         cand_family = family_of(cand)
         if cand_family != "unknown" and cand_family != author_family:
             return cand
@@ -212,50 +238,82 @@ async def run_review(
     llm_service: Any = None,
     candidates: list[str] | None = None,
     available_models: set[str] | None = None,
+    workspace_id: str | None = None,
+    thread_id: str | None = None,
 ) -> ReviewResult:
-    """Run authoritative server-side independent review via ``LLMService.complete`` (PK.10)."""
+    """Run authoritative server-side independent review via ``dalton_complete`` / ``LLMService.complete`` (PK.10 / G3.2)."""
+    author_family = family_of(author_model)
+    if not author_model or author_family == "unknown":
+        return ReviewResult(
+            status="unavailable",
+            reason=(
+                f"无法发布：作者模型（{author_model or 'None'}）家族未知（unknown），"
+                "无法保证跨家族独立审稿"
+            ),
+        )
+
     model = pick_reviewer_model(
         author_model,
         candidates=candidates,
         available_models=available_models,
     )
-    if not model:
+    if not model or family_of(model) == author_family:
         return ReviewResult(
             status="unavailable",
             reason=(
-                f"无法发布：缺少与作者模型（{author_model or 'unknown'} / "
-                f"{family_of(author_model)}）不同家族的可用审稿模型"
+                f"无法发布：缺少与作者模型（{author_model} / "
+                f"{author_family}）不同家族的可用审稿模型"
             ),
         )
 
     system_prompt = load_agent_body("dalton-reviewer")
     user_prompt = render_review_input(bundle)
 
-    if llm_service is None:
-        from ptc_agent.config import load_from_files
-        from src.server.services.llm.service import LLMService
-
-        agent_cfg = await load_from_files()
-        llm_service = LLMService(agent_config=agent_cfg, logger=logger)
-
     try:
-        out = await asyncio.wait_for(
-            llm_service.complete(
-                user_id=user_id,
+        if llm_service is None:
+            from src.dalton.llm.complete import dalton_complete
+
+            comp = await dalton_complete(
+                user_id=user_id or "local-dev-user",
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
-                response_schema=ReviewVerdict,
+                purpose="publish.review",
                 request_model=model,
+                response_schema=ReviewVerdict,
                 slot="primary",
                 reasoning_effort="high",
-                return_token_usage=True,
-            ),
-            timeout=300.0,
-        )
-        if isinstance(out, tuple) and len(out) == 2:
-            verdict_obj, usage = out
+                timeout_s=300.0,
+                workspace_id=workspace_id,
+                thread_id=thread_id,
+                raise_on_error=False,
+            )
+            if not comp.ok:
+                return ReviewResult(
+                    status="unavailable",
+                    model=model,
+                    family=family_of(model),
+                    reason=f"独立审稿调用失败：{comp.error or comp.status}",
+                )
+            verdict_obj = comp.data
+            usage = comp.usage
         else:
-            verdict_obj, usage = out, {}
+            out = await asyncio.wait_for(
+                llm_service.complete(
+                    user_id=user_id,
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    response_schema=ReviewVerdict,
+                    request_model=model,
+                    slot="primary",
+                    reasoning_effort="high",
+                    return_token_usage=True,
+                ),
+                timeout=300.0,
+            )
+            if isinstance(out, tuple) and len(out) == 2:
+                verdict_obj, usage = out
+            else:
+                verdict_obj, usage = out, {}
 
         if isinstance(verdict_obj, dict):
             verdict_obj = ReviewVerdict.model_validate(verdict_obj)
@@ -280,3 +338,4 @@ async def run_review(
             family=family_of(model),
             reason=f"独立审稿调用失败：{e}",
         )
+

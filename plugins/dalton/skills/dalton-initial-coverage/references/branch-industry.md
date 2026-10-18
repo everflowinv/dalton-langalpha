@@ -1,6 +1,6 @@
 # 初次覆盖 B 支线规则：行业与竞争（`branch-industry.md`）
 
-本文件定义 `initial-coverage` workflow 阶段 1B「行业支线」（输出 `research/<D>-ic/industry.md`）的 8 条取证与写作规则。执行前先读 `.agents/skills/dalton-conventions/SKILL.md` 及 `references/evidence-and-sources.md`。
+本文件定义 `initial-coverage` workflow 阶段 1B「行业支线」（输出 `research/<D>-ic/industry.md`）的 8 条取证与写作规则。执行前先读 `.agents/skills/dalton-conventions/SKILL.md` 及 `.agents/skills/dalton-conventions/references/evidence-and-sources.md`。
 
 ---
 

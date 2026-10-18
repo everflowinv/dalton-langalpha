@@ -391,3 +391,99 @@ async def list_pending(
             )
             rows = await cur.fetchall()
             return [_serialize_row(r) for r in rows if r is not None]  # type: ignore[misc]
+
+
+async def expire_stale_publications(
+    cur: Any = None, ttl_hours: int = 72
+) -> int:
+    """Transition ``awaiting_pm`` publish requests older than ``ttl_hours`` to ``expired`` (G3.2 R4-10)."""
+    sql = """
+        UPDATE dalton_publish_requests
+        SET status = 'expired',
+            error = COALESCE(error, %s),
+            updated_at = NOW()
+        WHERE status = 'awaiting_pm'
+          AND updated_at < NOW() - (%s * INTERVAL '1 hour')
+        RETURNING publish_request_id
+    """
+    err_msg = f"审批超时（超过 {ttl_hours} 小时未处理，自动过期）"
+    if cur is not None:
+        await cur.execute(sql, (err_msg, int(ttl_hours)))
+        rows = await cur.fetchall()
+        return len(rows)
+
+    async with get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as db_cur:
+            await db_cur.execute(sql, (err_msg, int(ttl_hours)))
+            rows = await db_cur.fetchall()
+            return len(rows)
+
+
+async def has_published_reports(workspace_id: str | UUID) -> bool:
+    """Return True if ``workspace_id`` has any immutable rows in ``dalton_publications`` (G3.3)."""
+    async with get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                "SELECT EXISTS(SELECT 1 FROM dalton_publications WHERE workspace_id = %s) AS has_pub",
+                (str(workspace_id),),
+            )
+            row = await cur.fetchone()
+            return bool(row and row.get("has_pub"))
+
+
+async def resolve_thread_author_model(thread_id: str | None) -> str | None:
+    """Resolve the author LLM model from the thread's latest ``conversation_usages`` or ``conversation_threads`` (G3.2)."""
+    if not thread_id or thread_id == "unknown-thread":
+        return None
+    try:
+        async with get_db_connection() as conn:
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    """
+                    SELECT token_usage
+                    FROM conversation_usages
+                    WHERE conversation_thread_id = %s
+                    ORDER BY created_at DESC
+                    LIMIT 5
+                    """,
+                    (str(thread_id),),
+                )
+                usage_rows = await cur.fetchall()
+                for urow in usage_rows:
+                    tu = urow.get("token_usage") if isinstance(urow, dict) else None
+                    if isinstance(tu, dict):
+                        for direct_k in ("served_model", "model", "model_name"):
+                            val = tu.get(direct_k)
+                            if isinstance(val, str) and val.strip():
+                                return val.strip()
+                        per_call = tu.get("per_call_costs")
+                        if isinstance(per_call, list):
+                            for entry in reversed(per_call):
+                                if isinstance(entry, dict):
+                                    for k in ("served_model", "model_name", "model"):
+                                        v = entry.get(k)
+                                        if isinstance(v, str) and v.strip():
+                                            return v.strip()
+                        by_model = tu.get("by_model")
+                        if isinstance(by_model, dict) and by_model:
+                            last_key = list(by_model.keys())[-1]
+                            if isinstance(last_key, str) and last_key.strip():
+                                return last_key.strip()
+
+                await cur.execute(
+                    """
+                    SELECT llm_model
+                    FROM conversation_threads
+                    WHERE conversation_thread_id = %s
+                    """,
+                    (str(thread_id),),
+                )
+                trow = await cur.fetchone()
+                if isinstance(trow, dict):
+                    llm_model = trow.get("llm_model")
+                    if isinstance(llm_model, str) and llm_model.strip():
+                        return llm_model.strip()
+    except Exception:
+        return None
+    return None
+

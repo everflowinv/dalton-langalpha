@@ -561,16 +561,23 @@ def run_broker_checks(
                     "max_tokens": 256,
                 },
             )
-            oc_l = (body_l.get("openclaw") or {}).get("reasoning")
-            oc_h = (body_h.get("openclaw") or {}).get("reasoning")
-            ok = code_l == 200 and code_h == 200 and oc_l != oc_h
+            meta_l = (body_l.get("dalton_meta") or {}).get("reasoning_effort")
+            meta_h = (body_h.get("dalton_meta") or {}).get("reasoning_effort")
+            oc_l = meta_l or (body_l.get("openclaw") or {}).get("reasoning")
+            oc_h = meta_h or (body_h.get("openclaw") or {}).get("reasoning")
+            ok = code_l == 200 and code_h == 200 and bool(oc_l) and bool(oc_h) and oc_l != oc_h
             results.append(
                 _record(
                     "B8",
                     "broker",
                     primary_tool_model,
                     "pass" if ok else "warn",
-                    {"low_reasoning": oc_l, "high_reasoning": oc_h},
+                    {
+                        "low_reasoning": oc_l,
+                        "high_reasoning": oc_h,
+                        "dalton_meta_low": meta_l,
+                        "dalton_meta_high": meta_h,
+                    },
                     "Reasoning effort passes through to OpenClaw SDK.",
                     blocking=False,
                     elapsed_ms=ms_l + ms_h,

@@ -36,7 +36,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 ```json
 {
   "workflow": "weekly-coverage-review",
-  "args": {
+  "params": {
     "home_dir": "dalton",
     "end": "YYYY-MM-DD",
     "coverage_path": "dalton/coverage.yaml"
@@ -65,7 +65,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 Workflow 完成后，研究总监在 Home 执行收尾动作：
 1. **交办知识层修改提案**：
    - 遍历 `dalton/research/weekly-<end>/proposals/*.json`；
-   - 对每家有提案的公司，调用 `delegate_to_analyst` 派单给该公司工作区分析师（无人值守运行已开启 `auto_approve_handoffs`，不会卡在确认卡上），指令分析师审阅提案并调用 `knowledge_update` / `knowledge_append_verdict` 落库。
+   - 对每家有提案的公司，调用 `delegate_to_analyst(question=..., workspace_id=..., report_back=True)` 派单给该公司工作区分析师（无人值守运行已开启 `auto_approve_handoffs`，不会卡在确认卡上），指令分析师审阅提案并调用 `knowledge_update` / `knowledge_append_verdict` 落库。
 2. **追加重点议程备注**：
    - 对本周出现重大异动、证据缺口或需要下周重点跟踪的问题，调用研究总监工具 `dalton_agenda_note` 追加到对应公司的 `agenda` 中。
 3. **统计与推送 PM**：

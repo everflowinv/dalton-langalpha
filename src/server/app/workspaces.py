@@ -855,6 +855,15 @@ async def delete_workspace(workspace_id: str, x_user_id: CurrentUserId):
             raise HTTPException(status_code=400, detail="Cannot delete Home")
         require_workspace_owner(workspace, user_id=x_user_id)
 
+        # DALTON-HOOK(workspace-delete-guard): forbid deleting workspaces with immutable published reports
+        from src.dalton.database.publications import has_published_reports
+
+        if await has_published_reports(workspace_id):
+            raise HTTPException(
+                status_code=409,
+                detail="该工作区含已发布研报，禁止删除；请归档。",
+            )
+
         manager = WorkspaceManager.get_instance()
         await manager.delete_workspace(workspace_id)
 

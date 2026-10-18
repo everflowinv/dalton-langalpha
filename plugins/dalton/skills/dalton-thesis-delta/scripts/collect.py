@@ -661,7 +661,7 @@ def cmd_collect(args: argparse.Namespace) -> int:
         "internal": internal_data,
         "alphaengine": ae_data,
         "sec": sec_data,
-        "x": {"status": [], "new": {}, "note": "X 由分析师在需要时用 web_search / x_search 补充"},
+        "x": {"status": [], "new": {}, "note": "X 由分析师在需要时用 web_search / x_api.search_posts 补充"},
     }
 
     pkt_json_path = run_dir / "packet.json"

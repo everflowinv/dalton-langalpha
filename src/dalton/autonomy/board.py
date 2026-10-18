@@ -67,7 +67,11 @@ def _compute_staleness(last_research_iso: str | None, today: date) -> float:
         return 1.2
 
 
-async def build_coverage_board() -> dict[str, Any]:
+async def build_coverage_board(
+    user_id: str | None = None,
+    tier: str = "all",
+    stale_only: bool = False,
+) -> dict[str, Any]:
     """Assemble the cross-company coverage board and candidate ranking (PK.19)."""
     settings = get_dalton_settings()
     tz_name = settings.autonomy.timezone
@@ -180,6 +184,7 @@ async def build_coverage_board() -> dict[str, Any]:
                     SELECT signal_id, workspace_id, ticker, probe, signal_key, priority, summary, detected_at
                     FROM dalton_signals
                     WHERE resolved_at IS NULL
+                      AND expired_at IS NULL
                     ORDER BY detected_at DESC
                     """
                 )

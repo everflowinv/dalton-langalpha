@@ -1,52 +1,64 @@
 #!/usr/bin/env bash
 # Check all DALTON-HOOK(<id>) annotations across upstream files against the registered allowlist
-# (P0 Appendix A + PK Section 5).
+# (P0 Appendix A, PK Section 5, P0N.0, P0F.2, G7.1).
 #
 # Usage:
-#   scripts/dalton/check_hooks.sh           # verify no unregistered hooks exist & no upstream files are modified without hooks
-#   scripts/dalton/check_hooks.sh --strict  # also require all registered P0/P0D hooks to be present
+#   scripts/dalton/check_hooks.sh           # verify no unregistered hooks exist & protected manifests are untouched
+#   scripts/dalton/check_hooks.sh --strict  # also require all P0/P0D hooks, additive lock check, and zero UNHOOKED_EDIT
+#   scripts/dalton/check_hooks.sh --audit   # audit all upstream file modifications vs upstream merge-base
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 
 STRICT=0
-if [[ "${1:-}" == "--strict" ]]; then
-  STRICT=1
-fi
+AUDIT=0
+for arg in "$@"; do
+  if [[ "$arg" == "--strict" ]]; then
+    STRICT=1
+  elif [[ "$arg" == "--audit" ]]; then
+    AUDIT=1
+  fi
+done
 
-# Registered hook IDs from P0 Appendix A and PK Section 5
+# Registered hook IDs from P0 Appendix A, PK Section 5, P0N, P0F, and P0G
 ALLOWED_HOOKS=(
-  # P0 platform hooks
+  # P0 & P0N platform hooks
   "llm-overlay"
   "llm-broker-client"
+  "llm-sdk-dispatch"
+  "oauth-dispatch"
+  "provider-kill-switch"
+  "native-oauth-ui"
   "catalog-cache"
   "router"
   "budget-gate"
   "budget-admission"
   "settings-section"
   "query-keys"
-  "i18n"
   "pause-links"
-  # P0D data & P1 skills hooks
+  # P0-D data & P1 skills hooks
   "mcp-call-timeout"
   "skills-registry"
   "provenance-declared"
   "provenance-type"
-  "provenance-locator"
-  # PK knowledge, publish, autonomy & UI hooks
-  "dalton-tools"
-  "knowledge-reconcile-mw"
+  # PK knowledge, publish & autonomy hooks
   "knowledge-reconcile"
+  "knowledge-reconcile-mw"
+  "dalton-tools"
   "preflight"
   "precheck-outcome"
   "precheck-skip-reason"
   "precheck-hidden"
+  "precheck-label"
+  "no-strike"
+  "workspace-delete-guard"
   "dalton-nav"
   "publish-card"
-  "precheck-label"
+  "i18n"
 )
 
+# P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)
 P0_REQUIRED_HOOKS=(
   "llm-overlay"
   "llm-broker-client"
@@ -73,7 +85,114 @@ is_allowed() {
   return 1
 }
 
-# Find all DALTON-HOOK(<id>) markers outside docs/dalton and scripts/dalton/check_hooks.sh
+# Compute upstream merge-base (P0F.2: always compare against upstream/main merge-base or 8e0dce94)
+MERGE_BASE="$(git merge-base HEAD upstream/main 2>/dev/null || echo 8e0dce94)"
+if [[ "$STRICT" -eq 1 ]]; then
+  BASE_REF="$MERGE_BASE"
+else
+  BASE_REF="${DALTON_BASE_REF:-$MERGE_BASE}"
+fi
+
+if [[ "$AUDIT" -eq 1 ]]; then
+  uv run python - "$BASE_REF" <<'PY'
+import pathlib, re, subprocess, sys
+
+base_ref = sys.argv[1]
+repo = pathlib.Path.cwd()
+paths_file = repo / "scripts" / "dalton" / "dalton_paths.txt"
+dalton_prefixes = [
+    line.strip()
+    for line in paths_file.read_text(encoding="utf-8").splitlines()
+    if line.strip() and not line.strip().startswith("#")
+]
+
+# Exempt pure lock/locale/test-contract files that do not use inline DALTON-HOOK comments
+AUDIT_EXEMPT_FILES = {
+    "tests/unit/mcp_servers/agent_docstring_lock.json",
+    "tests/unit/mcp_servers/test_agent_contract.py",
+    "tests/unit/mcp_servers/test_entrypoint_imports.py",
+    "tests/unit/middleware/skills/test_shared_skill_layer.py",
+    "web/src/components/nav/__tests__/useNavItems.test.tsx",
+    "web/src/locales/en-US.json",
+    "web/src/locales/zh-CN.json",
+}
+
+def is_dalton_owned(rel: str) -> bool:
+    for p in dalton_prefixes:
+        if rel == p or rel.startswith(p):
+            return True
+    return False
+
+out = subprocess.check_output(
+    ["git", "diff", "--name-status", base_ref], text=True
+).splitlines()
+
+new_in_upstream = []
+unhooked_edits = []
+hooked_edits = []
+
+for row in out:
+    if not row.strip():
+        continue
+    parts = row.split("\t")
+    status = parts[0]
+    rel = parts[-1]
+    if is_dalton_owned(rel) or rel in AUDIT_EXEMPT_FILES:
+        continue
+    if status.startswith("A"):
+        new_in_upstream.append(rel)
+        continue
+    if status.startswith("M"):
+        file_path = repo / rel
+        if not file_path.exists():
+            continue
+        lines = file_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        diff_text = subprocess.check_output(
+            ["git", "diff", "-U0", base_ref, "--", rel], text=True
+        )
+        hunk_starts = []
+        for dline in diff_text.splitlines():
+            m = re.match(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@", dline)
+            if m:
+                start = int(m.group(1))
+                count = int(m.group(2) or "1")
+                if count > 0:
+                    hunk_starts.append((start, start + count - 1))
+        file_unhooked = []
+        for s, e in hunk_starts:
+            win_s = max(1, s - 25)
+            win_e = min(len(lines), e + 25)
+            window = "\n".join(lines[win_s - 1 : win_e])
+            if "DALTON-HOOK" not in window:
+                file_unhooked.append(f"L{s}-L{e}")
+        if file_unhooked:
+            unhooked_edits.append((rel, file_unhooked))
+        else:
+            hooked_edits.append(rel)
+
+print(f"=== DALTON HOOK AUDIT (base={base_ref[:10]}) ===")
+print(f"NEW_IN_UPSTREAM_DIR ({len(new_in_upstream)}):")
+for f in new_in_upstream:
+    print(f"  NEW_IN_UPSTREAM_DIR: {f}")
+print(f"UNHOOKED_EDIT ({len(unhooked_edits)}):")
+for f, ranges in unhooked_edits:
+    print(f"  UNHOOKED_EDIT: {f} ({', '.join(ranges)})")
+print(f"HOOKED_EDIT ({len(hooked_edits)}):")
+for f in hooked_edits:
+    print(f"  HOOKED_EDIT: {f}")
+if new_in_upstream or unhooked_edits:
+    sys.exit(2)
+PY
+  AUDIT_RC=$?
+  if [[ "$STRICT" -eq 0 ]]; then
+    exit 0
+  elif [[ "$AUDIT_RC" -ne 0 ]]; then
+    echo "ERROR (--strict --audit): Found NEW_IN_UPSTREAM_DIR or UNHOOKED_EDIT" >&2
+    exit 1
+  fi
+fi
+
+# Find all DALTON-HOOK(<id>) or DALTON-HOOK: markers outside docs/dalton and scripts/dalton/check_hooks.sh
 MATCHES="$(git grep -n "DALTON-HOOK(" -- ':!docs/dalton/**' ':!scripts/dalton/check_hooks.sh' || true)"
 
 echo "=== Registered DALTON-HOOK occurrences ==="
@@ -117,19 +236,39 @@ if [[ "$STRICT" -eq 1 ]]; then
   done
 fi
 
-# Verify protected upstream config files are untouched vs base ref (9a03d3ac or upstream/main)
-BASE_REF="${DALTON_BASE_REF:-upstream/main}"
-if git rev-parse --verify 9a03d3ac >/dev/null 2>&1; then
-  BASE_REF="${DALTON_BASE_REF:-9a03d3ac}"
-fi
+# Verify protected upstream config files are untouched vs base ref
 if git rev-parse --verify "$BASE_REF" >/dev/null 2>&1; then
   UNTOUCHED_FILES=("src/llms/manifest/models.json" "src/llms/manifest/providers.json" "agent_config.yaml" "config.yaml")
   for uf in "${UNTOUCHED_FILES[@]}"; do
     if ! git diff --quiet "$BASE_REF" -- "$uf"; then
-      echo "ERROR: Upstream file $uf was modified (must use overlay instead)" >&2
+      echo "ERROR: Upstream file $uf was modified relative to $BASE_REF (must use overlay instead)" >&2
       ERRORS=$((ERRORS + 1))
     fi
   done
+
+  # P0F.2 #3: Verify agent_docstring_lock.json is additive-only vs BASE_REF and only adds dalton_* keys
+  if ! uv run python - "$BASE_REF" <<'PY'
+import json, subprocess, sys
+base_ref = sys.argv[1]
+base_json = json.loads(subprocess.check_output(["git", "show", f"{base_ref}:tests/unit/mcp_servers/agent_docstring_lock.json"], text=True))
+cur_json = json.loads(open("tests/unit/mcp_servers/agent_docstring_lock.json", encoding="utf-8").read())
+errors = []
+for k, v in base_json.items():
+    if k not in cur_json:
+        errors.append(f"Removed upstream key {k} from agent_docstring_lock.json")
+    elif cur_json[k] != v:
+        errors.append(f"Modified upstream key {k} in agent_docstring_lock.json")
+for k in cur_json:
+    if k not in base_json and not (k.startswith("dalton_") or k.startswith("mcp:dalton_")):
+        errors.append(f"Added non-dalton key {k} to agent_docstring_lock.json")
+if errors:
+    for e in errors:
+        print("ERROR:", e, file=sys.stderr)
+    sys.exit(1)
+PY
+  then
+    ERRORS=$((ERRORS + 1))
+  fi
 fi
 
 if [[ "$ERRORS" -gt 0 ]]; then

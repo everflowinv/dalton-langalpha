@@ -347,6 +347,8 @@
     "claudeDesc": "使用您的 Anthropic 订阅来使用 Claude 模型",
     "antigravityDesc": "Google Antigravity 订阅（Gemini、Claude 和 GPT-OSS 模型）。",
     "antigravityConnectTitle": "连接 Google Antigravity",
+    "museDesc": "ByteDance Muse 订阅（Gemini 和 Claude 模型）。",
+    "museConnectTitle": "连接 ByteDance Muse",
     "claudeConnectTitle": "连接 Claude 账户",
     "claudeHowItWorks": "工作原理",
     "claudeStep1Title": "在 claude.ai 上授权",
@@ -5354,10 +5356,13 @@
     },
     "publish": {
       "cardTitle": "正式研究报告发布审批（PM 终审）",
+      "requestIdLabel": "申请单号",
       "titleLabel": "报告标题",
       "kindLabel": "报告类型",
       "draftLabel": "草稿路径",
+      "publishedPathLabel": "归档路径",
       "auditLabel": "数字核验",
+      "uncertainHeader": "未能判断（交由 PM 决定）",
       "reviewerLabel": "独立审稿",
       "thesisLabel": "更新正式 Thesis",
       "approveBtn": "批准正式发布",
@@ -5365,6 +5370,19 @@
       "reasonPlaceholder": "批注或退回原因（可选）",
       "approvedLabel": "已批准正式发布：{{title}}",
       "rejectedLabel": "已拒绝正式发布：{{title}}"
+    },
+    "providers": {
+      "title": "模型供应商状态",
+      "subtitle": "主模型、后台、助手、取证与独立审稿的凭据、探测与近 24 小时运行状态",
+      "refresh": "刷新",
+      "probeBtn": "测试连接",
+      "probing": "探测中...",
+      "connectLink": "去连接",
+      "brokerParallelTitle": "OpenClaw broker（并行路径）",
+      "brokerSectionTitle": "OpenClaw broker（并行路径）",
+      "subscriptionBadge": "订阅",
+      "cashBadge": "现金",
+      "tosRiskBadge": "条款风险"
     }
   }
 }

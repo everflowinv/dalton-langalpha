@@ -56,6 +56,30 @@ async def upsert_watch_state(
             return dict(row) if row else {}
 
 
+def _with_signal_status(row: dict[str, Any]) -> dict[str, Any]:
+    """Attach canonical lifecycle ``status`` ('pending' | 'woken' | 'resolved' | 'expired') to a signal row."""
+    out = dict(row)
+    payload = out.get("payload") if isinstance(out.get("payload"), dict) else {}
+    if out.get("resolved_at") is not None or payload.get("status") == "resolved":
+        out["status"] = "resolved"
+    elif out.get("expired_at") is not None or payload.get("status") == "expired":
+        out["status"] = "expired"
+    elif out.get("woken_execution_id") is not None or out.get("woken_at") is not None:
+        out["status"] = "woken"
+    else:
+        out["status"] = "pending"
+    return out
+
+
+def _try_uuid(val: Any) -> Optional[uuid.UUID]:
+    if not val:
+        return None
+    try:
+        return uuid.UUID(str(val))
+    except (ValueError, TypeError):
+        return None
+
+
 async def upsert_signal(
     *,
     workspace_id: Optional[str],
@@ -68,17 +92,18 @@ async def upsert_signal(
 ) -> tuple[dict[str, Any], bool]:
     """Idempotently record a signal; returns (row, should_wake).
 
-    If (workspace_id, probe, signal_key) already exists and woken_execution_id is set,
-    should_wake is False so we never double-wake on the same signal.
+    If (workspace_id, probe, signal_key) already exists and woken_execution_id, resolved_at,
+    or expired_at is set, should_wake is False so we never double-wake on the same signal.
     """
-    ws_uuid = uuid.UUID(str(workspace_id)) if workspace_id else None
+    ws_uuid = _try_uuid(workspace_id)
     async with get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
             if ws_uuid is not None:
                 await cur.execute(
                     """
                     SELECT signal_id, workspace_id, ticker, probe, signal_key, priority,
-                           summary, payload, detected_at, woken_execution_id, woken_at, resolved_at
+                           summary, payload, detected_at, woken_execution_id, woken_at,
+                           resolved_at, expired_at
                     FROM dalton_signals
                     WHERE workspace_id = %s AND probe = %s AND signal_key = %s
                     """,
@@ -88,7 +113,8 @@ async def upsert_signal(
                 await cur.execute(
                     """
                     SELECT signal_id, workspace_id, ticker, probe, signal_key, priority,
-                           summary, payload, detected_at, woken_execution_id, woken_at, resolved_at
+                           summary, payload, detected_at, woken_execution_id, woken_at,
+                           resolved_at, expired_at
                     FROM dalton_signals
                     WHERE workspace_id IS NULL AND probe = %s AND signal_key = %s
                     """,
@@ -96,14 +122,17 @@ async def upsert_signal(
                 )
             existing = await cur.fetchone()
             if existing:
-                row_dict = dict(existing)
+                row_dict = _with_signal_status(dict(existing))
                 should_wake = (
                     row_dict.get("woken_execution_id") is None
                     and row_dict.get("resolved_at") is None
+                    and row_dict.get("expired_at") is None
                 )
                 return row_dict, should_wake
 
             sig_id = uuid.uuid4()
+            init_payload = dict(payload or {})
+            init_payload.setdefault("status", "pending")
             await cur.execute(
                 """
                 INSERT INTO dalton_signals (
@@ -114,7 +143,8 @@ async def upsert_signal(
                 ON CONFLICT (workspace_id, probe, signal_key) DO UPDATE
                 SET summary = EXCLUDED.summary
                 RETURNING signal_id, workspace_id, ticker, probe, signal_key, priority,
-                          summary, payload, detected_at, woken_execution_id, woken_at, resolved_at
+                          summary, payload, detected_at, woken_execution_id, woken_at,
+                          resolved_at, expired_at
                 """,
                 (
                     sig_id,
@@ -124,14 +154,15 @@ async def upsert_signal(
                     signal_key,
                     priority,
                     summary,
-                    Jsonb(payload or {}),
+                    Jsonb(init_payload),
                 ),
             )
             created = await cur.fetchone()
-            row_dict = dict(created) if created else {}
+            row_dict = _with_signal_status(dict(created)) if created else {}
             should_wake = (
                 row_dict.get("woken_execution_id") is None
                 and row_dict.get("resolved_at") is None
+                and row_dict.get("expired_at") is None
             )
             return row_dict, should_wake
 
@@ -140,12 +171,14 @@ async def list_pending_signals(
     workspace_id: Optional[str] = None,
     ticker: Optional[str] = None,
 ) -> list[dict[str, Any]]:
-    """List unresolved signals (woken or unwoken) for a workspace/ticker."""
-    clauses = ["resolved_at IS NULL"]
+    """List unresolved, non-expired signals (woken or unwoken) for a workspace/ticker."""
+    clauses = ["resolved_at IS NULL", "expired_at IS NULL"]
     params: list[Any] = []
     if workspace_id:
-        clauses.append("workspace_id = %s")
-        params.append(uuid.UUID(str(workspace_id)))
+        ws_uuid = _try_uuid(workspace_id)
+        if ws_uuid:
+            clauses.append("workspace_id = %s")
+            params.append(ws_uuid)
     if ticker:
         clauses.append("ticker = %s")
         params.append(ticker.upper())
@@ -155,7 +188,8 @@ async def list_pending_signals(
             await cur.execute(
                 f"""
                 SELECT signal_id, workspace_id, ticker, probe, signal_key, priority,
-                       summary, payload, detected_at, woken_execution_id, woken_at, resolved_at
+                       summary, payload, detected_at, woken_execution_id, woken_at,
+                       resolved_at, expired_at
                 FROM dalton_signals
                 WHERE {where_sql}
                 ORDER BY detected_at DESC
@@ -163,50 +197,198 @@ async def list_pending_signals(
                 tuple(params),
             )
             rows = await cur.fetchall()
-            return [dict(r) for r in rows]
+            return [_with_signal_status(dict(r)) for r in rows]
+
+
+async def claim_signals_woken(
+    signal_ids: list[str],
+    execution_id: str,
+) -> list[dict[str, Any]]:
+    """Atomically claim unwoken signals for ``execution_id`` using ``UPDATE ... WHERE woken_execution_id IS NULL RETURNING *`` (R5-12)."""
+    if not signal_ids:
+        return []
+    exec_uuid = _try_uuid(execution_id) or uuid.uuid5(uuid.NAMESPACE_DNS, str(execution_id))
+    sig_uuids = [u for s in signal_ids if (u := _try_uuid(s)) is not None]
+    if not sig_uuids:
+        return []
+    async with get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                UPDATE dalton_signals
+                SET woken_execution_id = %s,
+                    woken_at = NOW(),
+                    payload = COALESCE(payload, '{}'::jsonb) || '{"status": "woken"}'::jsonb
+                WHERE signal_id = ANY(%s)
+                  AND woken_execution_id IS NULL
+                  AND resolved_at IS NULL
+                  AND expired_at IS NULL
+                RETURNING signal_id, workspace_id, ticker, probe, signal_key, priority,
+                          summary, payload, detected_at, woken_execution_id, woken_at,
+                          resolved_at, expired_at
+                """,
+                (exec_uuid, sig_uuids),
+            )
+            rows = await cur.fetchall()
+            return [_with_signal_status(dict(r)) for r in (rows or [])]
 
 
 async def mark_signals_woken(
     signal_ids: list[str],
     execution_id: str,
 ) -> int:
-    """Stamp woken_execution_id and woken_at on the given signals."""
-    if not signal_ids:
-        return 0
-    exec_uuid = uuid.UUID(str(execution_id))
-    sig_uuids = [uuid.UUID(str(s)) for s in signal_ids]
-    async with get_db_connection() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute(
-                """
-                UPDATE dalton_signals
-                SET woken_execution_id = %s,
-                    woken_at = NOW()
-                WHERE signal_id = ANY(%s)
-                  AND woken_execution_id IS NULL
-                """,
-                (exec_uuid, sig_uuids),
-            )
-            return cur.rowcount or 0
+    """Stamp woken_execution_id and woken_at on the given signals (atomic claim)."""
+    claimed = await claim_signals_woken(signal_ids, execution_id)
+    return len(claimed)
 
 
-async def resolve_signals(signal_ids: list[str]) -> int:
-    """Mark signals as resolved."""
-    if not signal_ids:
+async def resolve_signals(
+    signal_ids: Optional[list[str]] = None,
+    *,
+    signal_refs: Optional[list[str]] = None,
+    workspace_id: Optional[str] = None,
+    ticker: Optional[str] = None,
+    resolved_by: Optional[str] = None,
+    execution_id: Optional[str] = None,
+) -> int:
+    """Mark signals as resolved by UUID, signal_key / ref suffix, or woken_execution_id (G4.2)."""
+    refs = list(signal_ids or []) + list(signal_refs or [])
+    refs = [str(r).strip() for r in refs if r and str(r).strip()]
+    exec_uuid = _try_uuid(execution_id)
+    if not refs and exec_uuid is None:
         return 0
-    sig_uuids = [uuid.UUID(str(s)) for s in signal_ids]
+
+    sig_uuids: list[uuid.UUID] = []
+    key_refs: list[str] = []
+    for ref in refs:
+        u = _try_uuid(ref)
+        if u is not None:
+            sig_uuids.append(u)
+        else:
+            key_refs.append(ref)
+
+    ws_uuid = _try_uuid(workspace_id)
+    patch_obj: dict[str, Any] = {"status": "resolved"}
+    if resolved_by:
+        patch_obj["resolved_by"] = str(resolved_by)
+
+    total_updated = 0
     async with get_db_connection() as conn:
         async with conn.cursor() as cur:
-            await cur.execute(
-                """
+            if sig_uuids:
+                await cur.execute(
+                    """
+                    UPDATE dalton_signals
+                    SET resolved_at = NOW(),
+                        payload = COALESCE(payload, '{}'::jsonb) || %s::jsonb
+                    WHERE signal_id = ANY(%s)
+                      AND resolved_at IS NULL
+                    """,
+                    (Jsonb(patch_obj), sig_uuids),
+                )
+                total_updated += cur.rowcount or 0
+
+            for kref in key_refs:
+                scope_clauses = ["resolved_at IS NULL"]
+                params: list[Any] = [Jsonb(patch_obj)]
+                if ws_uuid is not None:
+                    scope_clauses.append("workspace_id = %s")
+                    params.append(ws_uuid)
+                if ticker:
+                    scope_clauses.append("ticker = %s")
+                    params.append(ticker.upper())
+                scope_clauses.append(
+                    "(signal_key = %s OR signal_key LIKE %s OR signal_key LIKE %s "
+                    "OR payload->>'id' = %s OR payload->>'accession_number' = %s OR payload->>'doc_id' = %s)"
+                )
+                params.extend([kref, f"%:{kref}", f"%:{kref}:%", kref, kref, kref])
+                where_sql = " AND ".join(scope_clauses)
+                await cur.execute(
+                    f"""
+                    UPDATE dalton_signals
+                    SET resolved_at = NOW(),
+                        payload = COALESCE(payload, '{{}}'::jsonb) || %s::jsonb
+                    WHERE {where_sql}
+                    """,
+                    tuple(params),
+                )
+                total_updated += cur.rowcount or 0
+
+            if exec_uuid is not None:
+                await cur.execute(
+                    """
+                    UPDATE dalton_signals
+                    SET resolved_at = NOW(),
+                        payload = COALESCE(payload, '{}'::jsonb) || %s::jsonb
+                    WHERE woken_execution_id = %s
+                      AND resolved_at IS NULL
+                    """,
+                    (Jsonb(patch_obj), exec_uuid),
+                )
+                total_updated += cur.rowcount or 0
+
+    return total_updated
+
+
+async def expire_old_signals(
+    cur: Any = None,
+    *,
+    max_age_days: int = 7,
+    workspace_id: Optional[str] = None,
+) -> list[dict[str, Any]]:
+    """Mark unresolved signals older than ``max_age_days`` (default 7d) as expired (G4.2)."""
+    import inspect
+
+    days = max(1, int(max_age_days))
+    ws_uuid = _try_uuid(workspace_id)
+
+    async def _run_with_cursor(c: Any) -> list[dict[str, Any]]:
+        if ws_uuid is not None:
+            sql = """
                 UPDATE dalton_signals
-                SET resolved_at = NOW()
-                WHERE signal_id = ANY(%s)
-                  AND resolved_at IS NULL
-                """,
-                (sig_uuids,),
-            )
-            return cur.rowcount or 0
+                SET expired_at = NOW(),
+                    payload = COALESCE(payload, '{}'::jsonb) || '{"status": "expired"}'::jsonb
+                WHERE resolved_at IS NULL
+                  AND expired_at IS NULL
+                  AND workspace_id = %s
+                  AND detected_at < NOW() - (%s * INTERVAL '1 day')
+                RETURNING signal_id, workspace_id, ticker, probe, signal_key, priority,
+                          summary, payload, detected_at, woken_execution_id, woken_at,
+                          resolved_at, expired_at
+            """
+            params: tuple[Any, ...] = (ws_uuid, days)
+        else:
+            sql = """
+                UPDATE dalton_signals
+                SET expired_at = NOW(),
+                    payload = COALESCE(payload, '{}'::jsonb) || '{"status": "expired"}'::jsonb
+                WHERE resolved_at IS NULL
+                  AND expired_at IS NULL
+                  AND detected_at < NOW() - (%s * INTERVAL '1 day')
+                RETURNING signal_id, workspace_id, ticker, probe, signal_key, priority,
+                          summary, payload, detected_at, woken_execution_id, woken_at,
+                          resolved_at, expired_at
+            """
+            params = (days,)
+
+        exec_res = c.execute(sql, params)
+        if inspect.isawaitable(exec_res):
+            await exec_res
+        fetch_res = c.fetchall()
+        rows = await fetch_res if inspect.isawaitable(fetch_res) else fetch_res
+        out: list[dict[str, Any]] = []
+        for r in rows or []:
+            d = dict(r) if isinstance(r, dict) else {"signal_id": str(r[0])}
+            d["status"] = "expired"
+            out.append(d)
+        return out
+
+    if cur is not None:
+        return await _run_with_cursor(cur)
+
+    async with get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as db_cur:
+            return await _run_with_cursor(db_cur)
 
 
 async def insert_preflight_log(

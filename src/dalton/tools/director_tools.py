@@ -11,7 +11,10 @@ from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool, tool
 
 from src.dalton.autonomy.board import build_coverage_board
-from src.dalton.autonomy.schedule import validate_automation_name
+from src.dalton.autonomy.schedule import (
+    schedule_dalton_automation_helper,
+    validate_automation_name,
+)
 from src.dalton.database import plans as plans_db
 from src.dalton.settings import get_dalton_settings
 
@@ -224,12 +227,12 @@ def build_director_tools(
             ticker: Optional ticker symbol (e.g. "AMZN").
         """
         try:
-            from src.dalton.database.knowledge import get_latest_version
+            from src.dalton.database.knowledge import latest_version
             from src.dalton.knowledge.service import apply_update
 
             configurable = (config or {}).get("configurable") or {}
             user_id = str(configurable.get("user_id") or "local_dev_user")
-            latest = await get_latest_version(workspace_id, "agenda", valid_only=False)
+            latest = await latest_version(workspace_id, "agenda")
             base_ver = int(latest["version_no"]) if latest else None
             res = await apply_update(
                 user_id=user_id,
@@ -238,7 +241,7 @@ def build_director_tools(
                 ops=[
                     {
                         "op": "append_item",
-                        "path": "/questions",
+                        "path": "/open_questions",
                         "value": {
                             "question": question,
                             "value": value if value in ("high", "medium", "low") else "high",
@@ -291,125 +294,35 @@ def build_director_tools(
             workspace_id: Workspace UUID (defaults to current workspace in config).
             ticker: Optional company ticker for naming validation.
         """
-        from src.server.database import automation as auto_db
+        from src.dalton.autonomy.schedule import schedule_dalton_automation_helper
 
         configurable = (config or {}).get("configurable") or {}
-        user_id = configurable.get("user_id") or "local_dev_user"
+        user_id = str(configurable.get("user_id") or "local_dev_user")
         ws_id = workspace_id or configurable.get("workspace_id")
         tz = timezone_name or get_dalton_settings().autonomy.timezone
 
-        if action == "list":
-            rows, total = await auto_db.list_automations(
-                user_id=user_id,
-                workspace_id=ws_id,
-                limit=100,
-            )
-            dalton_rows = [
-                {
-                    "automation_id": str(r.get("automation_id")),
-                    "name": r.get("name"),
-                    "trigger_type": r.get("trigger_type"),
-                    "cron_expression": r.get("cron_expression"),
-                    "next_run_at": str(r.get("next_run_at") or ""),
-                    "status": r.get("status"),
-                }
-                for r in rows
-                if str(r.get("name") or "").startswith("dalton-")
-            ]
-            return json.dumps(
-                {"ok": True, "count": len(dalton_rows), "automations": dalton_rows},
-                ensure_ascii=False,
-            )
-
-        if not name:
-            return json.dumps({"ok": False, "error": "缺少自动任务名称 `name`。"}, ensure_ascii=False)
-
-        valid, err_msg = validate_automation_name(name, ticker=ticker if role != "chief_of_staff" else None)
-        if not valid:
-            return json.dumps({"ok": False, "error": err_msg}, ensure_ascii=False)
-
-        rows, _ = await auto_db.list_automations(user_id=user_id, workspace_id=ws_id, limit=200)
-        existing = next((r for r in rows if r.get("name") == name), None)
-
-        if action in ("pause", "resume"):
-            if not existing:
-                return json.dumps({"ok": False, "error": f"未找到任务 `{name}`"}, ensure_ascii=False)
-            new_status = "paused" if action == "pause" else "active"
-            updated = await auto_db.update_automation(
-                str(existing["automation_id"]),
-                user_id,
-                status=new_status,
-            )
-            return json.dumps(
-                {
-                    "ok": True,
-                    "automation_id": str((updated or existing).get("automation_id")),
-                    "name": name,
-                    "status": new_status,
-                },
-                ensure_ascii=False,
-            )
-
-        if action == "upsert":
-            if not instruction and not existing:
-                return json.dumps({"ok": False, "error": "新建任务必须提供 `instruction`。"}, ensure_ascii=False)
-            next_dt = None
-            if next_run_at:
-                next_dt = datetime.fromisoformat(next_run_at.replace("Z", "+00:00"))
-            if existing:
-                patch: dict[str, Any] = {}
-                if instruction is not None:
-                    patch["instruction"] = instruction
-                if description is not None:
-                    patch["description"] = description
-                if cron_expression is not None:
-                    patch["cron_expression"] = cron_expression
-                if next_dt is not None:
-                    patch["next_run_at"] = next_dt
-                updated = await auto_db.update_automation(
-                    str(existing["automation_id"]),
-                    user_id,
-                    **patch,
-                )
-                return json.dumps(
-                    {
-                        "ok": True,
-                        "action": "updated",
-                        "automation_id": str((updated or existing).get("automation_id")),
-                        "name": name,
-                    },
-                    ensure_ascii=False,
-                )
-            created = await auto_db.create_automation(
-                user_id=user_id,
-                name=name,
-                description=description,
-                trigger_type=trigger_type,
-                cron_expression=cron_expression,
-                timezone=tz,
-                trigger_config=None,
-                next_run_at=next_dt,
-                instruction=instruction or "",
-                workspace_id=ws_id,
-                llm_model=None,
-                additional_context=None,
-                thread_strategy="new",
-                conversation_thread_id=None,
-                max_failures=10,
-                delivery_config=None,
-                metadata={"dalton_managed": True, "ticker": ticker.upper() if ticker else None},
-            )
-            return json.dumps(
-                {
-                    "ok": True,
-                    "action": "created",
-                    "automation_id": str(created.get("automation_id")),
-                    "name": name,
-                },
-                ensure_ascii=False,
-            )
-
-        return json.dumps({"ok": False, "error": f"不支持的 action: {action}"}, ensure_ascii=False)
+        spec = {
+            "action": action,
+            "name": name,
+            "trigger_type": trigger_type,
+            "cron_expression": cron_expression,
+            "next_run_at": next_run_at,
+            "instruction": instruction,
+            "description": description,
+            "timezone": tz,
+            "workspace_id": ws_id,
+            "ticker": ticker,
+        }
+        result = await schedule_dalton_automation_helper(
+            user_id,
+            name,
+            spec,
+            workspace_id=ws_id,
+            ticker=ticker,
+            role=role,
+            action=action,
+        )
+        return json.dumps(result, ensure_ascii=False, default=str)
 
     if role == "chief_of_staff":
         return [

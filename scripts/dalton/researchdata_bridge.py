@@ -37,24 +37,57 @@ logger = logging.getLogger("researchdata_bridge")
 
 MAX_REQUEST_BYTES = 256 * 1024  # 256 KiB
 
-# Route-level (default_s, max_s) timeout budgets
+DEFAULT_ROUTE_TIMEOUT_S = 240
+LONG_READ_TIMEOUT_S = 600
+
+LONG_READ_OPERATIONS: frozenset[str] = frozenset(
+    {
+        "read",
+        "read-item",
+        "read_item",
+        "get_document",
+        "get-document",
+        "get_transcript",
+        "get-transcript",
+        "read_filing",
+        "read-filing",
+        "download_document",
+        "download-document",
+    }
+)
+
+# Route-level (default_s, max_s) timeout budgets aligned with R3-2 (240s default, 600s full-text reads)
 ROUTE_TIMEOUTS: dict[str, tuple[int, int]] = {
     "catalog": (15, 30),
-    "company-wiki": (60, 120),
-    "sales-notes": (60, 120),
-    "tmtb": (60, 120),
-    "funda-ai": (60, 120),
-    "all": (90, 180),
-    "alphaengine": (60, 120),
-    "alphaengine:get_document": (240, 600),
-    "guidepoint": (90, 180),
-    "transcript": (90, 180),
-    "sec": (90, 180),
-    "estimates": (60, 120),
-    "fred": (60, 120),
-    "treasury": (60, 120),
-    "cn-hk": (60, 120),
+    "company-wiki": (DEFAULT_ROUTE_TIMEOUT_S, DEFAULT_ROUTE_TIMEOUT_S),
+    "company-wiki:read": (LONG_READ_TIMEOUT_S, LONG_READ_TIMEOUT_S),
+    "sales-notes": (DEFAULT_ROUTE_TIMEOUT_S, DEFAULT_ROUTE_TIMEOUT_S),
+    "tmtb": (DEFAULT_ROUTE_TIMEOUT_S, DEFAULT_ROUTE_TIMEOUT_S),
+    "funda-ai": (DEFAULT_ROUTE_TIMEOUT_S, DEFAULT_ROUTE_TIMEOUT_S),
+    "all": (DEFAULT_ROUTE_TIMEOUT_S, DEFAULT_ROUTE_TIMEOUT_S),
+    "alphaengine": (DEFAULT_ROUTE_TIMEOUT_S, DEFAULT_ROUTE_TIMEOUT_S),
+    "alphaengine:get_document": (LONG_READ_TIMEOUT_S, LONG_READ_TIMEOUT_S),
+    "alphaengine:download_document": (LONG_READ_TIMEOUT_S, LONG_READ_TIMEOUT_S),
+    "guidepoint": (DEFAULT_ROUTE_TIMEOUT_S, DEFAULT_ROUTE_TIMEOUT_S),
+    "transcript": (DEFAULT_ROUTE_TIMEOUT_S, DEFAULT_ROUTE_TIMEOUT_S),
+    "transcript:get_transcript": (LONG_READ_TIMEOUT_S, LONG_READ_TIMEOUT_S),
+    "transcript:read": (LONG_READ_TIMEOUT_S, LONG_READ_TIMEOUT_S),
+    "sec": (DEFAULT_ROUTE_TIMEOUT_S, DEFAULT_ROUTE_TIMEOUT_S),
+    "sec:read-item": (LONG_READ_TIMEOUT_S, LONG_READ_TIMEOUT_S),
+    "sec:read_filing": (LONG_READ_TIMEOUT_S, LONG_READ_TIMEOUT_S),
+    "estimates": (DEFAULT_ROUTE_TIMEOUT_S, DEFAULT_ROUTE_TIMEOUT_S),
+    "fred": (DEFAULT_ROUTE_TIMEOUT_S, DEFAULT_ROUTE_TIMEOUT_S),
+    "treasury": (DEFAULT_ROUTE_TIMEOUT_S, DEFAULT_ROUTE_TIMEOUT_S),
+    "cn-hk": (DEFAULT_ROUTE_TIMEOUT_S, DEFAULT_ROUTE_TIMEOUT_S),
 }
+
+
+class SubprocessExitError(RuntimeError):
+    """Raised when researchdata_mcp exits without valid JSON-RPC output (never carries stderr)."""
+
+    def __init__(self, exit_code: int | None) -> None:
+        self.exit_code = exit_code
+        super().__init__(f"researchdata_mcp exited without JSON response (exit_code={exit_code})")
 
 
 def _load_env_file(path: Path) -> None:
@@ -113,7 +146,7 @@ class BridgeConfig:
             1, int(os.environ.get("DALTON_BRIDGE_MAX_INFLIGHT", "2"))
         )
         self.caller_budget_s: int = max(
-            35, int(os.environ.get("DALTON_BRIDGE_CALLER_BUDGET_S", "300"))
+            35, int(os.environ.get("DALTON_BRIDGE_CALLER_BUDGET_S", "625"))
         )
         self.usage_file: Path = Path(
             os.environ.get(
@@ -149,7 +182,7 @@ class ResearchDataBridge:
                 and r.get("kind") in ("agent_tool", "skill")
             }
         except Exception as exc:
-            logger.warning("Failed to load data_sources.json: %s", exc)
+            logger.warning("Failed to load data_sources.json: %s", type(exc).__name__)
             return {
                 "web-news",
                 "web-page",
@@ -169,9 +202,16 @@ class ResearchDataBridge:
             default_s, max_s = ROUTE_TIMEOUTS["catalog"]
         else:
             route = str(arguments.get("route") or "").strip()
-            op = str(arguments.get("operation") or "").strip()
-            key = f"{route}:{op}" if f"{route}:{op}" in ROUTE_TIMEOUTS else route
-            default_s, max_s = ROUTE_TIMEOUTS.get(key, (60, 120))
+            op = str(arguments.get("operation") or arguments.get("action") or "").strip()
+            key = f"{route}:{op}"
+            if key in ROUTE_TIMEOUTS:
+                default_s, max_s = ROUTE_TIMEOUTS[key]
+            elif op in LONG_READ_OPERATIONS:
+                default_s, max_s = (LONG_READ_TIMEOUT_S, LONG_READ_TIMEOUT_S)
+            else:
+                default_s, max_s = ROUTE_TIMEOUTS.get(
+                    route, (DEFAULT_ROUTE_TIMEOUT_S, DEFAULT_ROUTE_TIMEOUT_S)
+                )
 
         req_timeout = arguments.get("timeout")
         if isinstance(req_timeout, int) and req_timeout > 0:
@@ -197,7 +237,7 @@ class ResearchDataBridge:
                 "\n".join(json.dumps(r, ensure_ascii=False) for r in requests)
                 + "\n"
             ).encode("utf-8")
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(
+            stdout_bytes, _stderr_bytes = await asyncio.wait_for(
                 proc.communicate(input=payload_bytes),
                 timeout=timeout_s,
             )
@@ -227,9 +267,13 @@ class ResearchDataBridge:
                     responses.append(parsed)
             except Exception:
                 continue
-        if not responses and stderr_bytes:
-            err_tail = stderr_bytes.decode("utf-8", errors="replace").strip()[-400:]
-            raise RuntimeError(f"researchdata_mcp exited without JSON response: {err_tail}")
+        if not responses:
+            # R3-1: NEVER decode or log stderr content; log/report only exception class and exit code
+            logger.warning(
+                "researchdata_mcp subprocess returned no JSON response (exit_code=%s)",
+                proc.returncode,
+            )
+            raise SubprocessExitError(proc.returncode)
         return responses
 
     async def ensure_initialized(self) -> dict[str, Any]:
@@ -333,7 +377,7 @@ class ResearchDataBridge:
                 tmp_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
                 tmp_path.replace(self.cfg.usage_file)
             except Exception as exc:
-                logger.warning("Failed to record alphaengine usage: %s", exc)
+                logger.warning("Failed to record alphaengine usage: %s", type(exc).__name__)
 
     async def handle_tools_call(
         self, req_id: Any, params: dict[str, Any]
@@ -563,7 +607,11 @@ async def _handle_client(
                 try:
                     await bridge.ensure_initialized()
                 except Exception as exc:
-                    logger.warning("Healthz init probe failed: %s", exc)
+                    logger.warning(
+                        "Healthz init probe failed: %s (exit_code=%s)",
+                        type(exc).__name__,
+                        getattr(exc, "exit_code", None),
+                    )
             health_payload = {
                 "ok": True,
                 "status": "ok",
@@ -722,7 +770,11 @@ async def main() -> None:
     try:
         await bridge.ensure_initialized()
     except Exception as exc:
-        logger.warning("Startup initialize probe warning: %s", exc)
+        logger.warning(
+            "Startup initialize probe warning: %s (exit_code=%s)",
+            type(exc).__name__,
+            getattr(exc, "exit_code", None),
+        )
 
     server = await asyncio.start_server(
         lambda r, w: _handle_client(bridge, r, w),

@@ -30,16 +30,24 @@ async def _count_strike(cur, automation_id: str, *, fuse: bool = False) -> int:
     automation is disabled: a pause, a finish or an earlier disable, and its
     reason, stand.
     """
+    # DALTON-HOOK(no-strike): P0F.3 dalton-* automations never auto-disable on consecutive failures
     disables = (
-        "(%(fuse)s OR failure_count + 1 >= max_failures)"
+        "(%(fuse)s OR (failure_count + 1 >= max_failures AND name NOT LIKE 'dalton-%%'))"
         " AND status IN ('active', 'executing')"
+    )
+    dalton_backoff = (
+        "GREATEST(COALESCE(next_run_at, NOW()), NOW() + make_interval("
+        "secs => LEAST(604800, 3600 * (1 << LEAST(failure_count, 8)))))"
     )
     await cur.execute(f"""
         UPDATE automations
         SET failure_count = failure_count + 1,
             status = CASE WHEN {disables} THEN 'disabled' ELSE status END,
             next_run_at = CASE WHEN {disables} AND trigger_type <> 'once'
-                               THEN NULL ELSE next_run_at END,
+                               THEN NULL
+                               WHEN name LIKE 'dalton-%%' AND trigger_type <> 'price'
+                               THEN {dalton_backoff}
+                               ELSE next_run_at END,
             disable_reason = CASE WHEN {disables} THEN %(reason)s
                                   ELSE disable_reason END
         FROM (SELECT status AS was FROM automations

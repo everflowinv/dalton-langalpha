@@ -45,6 +45,7 @@ const LLM_PROVIDER_ART: Record<string, string> = {
   'codex-oauth': iconOpenai,
   anthropic: iconAnthropic,
   'claude-oauth': iconAnthropic,
+  // DALTON-HOOK(native-oauth-ui): P0N.3 Antigravity brand icon
   'antigravity-oauth': iconGemini,
   gemini: iconGemini,
   openrouter: iconOpenrouter,

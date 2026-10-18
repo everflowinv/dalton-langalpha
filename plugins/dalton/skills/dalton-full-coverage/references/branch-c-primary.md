@@ -19,7 +19,7 @@
 ### C2. 最近 4 次业绩电话会精读（Prepared Remarks & Q&A）
 - **电话会信源回退链（严格遵守）**：
   1. 首选调用 `researchdata.research(route="transcript", ticker=T, limit=4)` 获取 `kind="company_call"` 的公司业绩会原文（忽略 `broker_callback` 券商回访）；
-  2. 若无匹配，检索公司 IR 官网的 webcast transcript（`web_fetch` → 403/JS 空壳时用 `firecrawl__firecrawl_scrape`）；
+  2. 若无匹配，检索公司 IR 官网的 webcast transcript（`web_fetch`）；
   3. 仍无则查 8-K / 6-K 的 `Ex-99` 附件；
   4. 三条路径均未取得时，如实写 `电话会未覆盖（已尝试路径：…）`，**严禁用业绩新闻稿（Earnings Release）冒充电话会问答**。
 - **必须提取的四项内容**：

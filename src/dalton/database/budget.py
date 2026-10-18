@@ -1,7 +1,8 @@
-"""Raw psycopg3 SQL queries for Dalton local daily USD budget and reservations (P0.8)."""
+"""Raw psycopg3 SQL queries for Dalton local daily USD budget and reservations (P0.8, P0N.6, G1)."""
 
 from __future__ import annotations
 
+import logging
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
@@ -9,6 +10,8 @@ from typing import Any
 from psycopg.rows import dict_row
 
 from src.server.database.pool import get_db_connection
+
+logger = logging.getLogger(__name__)
 
 
 async def acquire_budget_advisory_lock(conn: Any, user_id: str, budget_day: date) -> None:
@@ -81,6 +84,41 @@ async def list_task_caps(conn: Any, user_id: str) -> list[dict[str, Any]]:
         return [dict(r) for r in await cur.fetchall()]
 
 
+async def verify_task_cap_scope_owner(
+    user_id: str,
+    scope_kind: str,
+    scope_id: str,
+    *,
+    conn: Any = None,
+) -> bool:
+    """Verify that `scope_id` (workspace or thread) belongs to `user_id` (R2-8 / G2)."""
+    async def _check(c: Any) -> bool:
+        async with c.cursor() as cur:
+            if scope_kind == "workspace":
+                await cur.execute(
+                    "SELECT 1 FROM workspaces WHERE workspace_id = %s AND user_id = %s",
+                    (scope_id, user_id),
+                )
+            elif scope_kind == "thread":
+                await cur.execute(
+                    """
+                    SELECT 1
+                    FROM conversation_threads t
+                    JOIN workspaces w ON w.workspace_id = t.workspace_id
+                    WHERE t.conversation_thread_id = %s AND w.user_id = %s
+                    """,
+                    (scope_id, user_id),
+                )
+            else:
+                return False
+            return (await cur.fetchone()) is not None
+
+    if conn is not None:
+        return await _check(conn)
+    async with get_db_connection() as db_conn:
+        return await _check(db_conn)
+
+
 async def upsert_task_cap(
     user_id: str,
     scope_kind: str,
@@ -116,6 +154,27 @@ async def delete_task_cap(user_id: str, scope_kind: str, scope_id: str) -> bool:
                 (user_id, scope_kind, scope_id),
             )
             return (cur.rowcount or 0) > 0
+
+
+async def release_reservation(
+    conn: Any,
+    run_ref: str,
+    generation: int | None = None,
+) -> int:
+    """Mark an open reservation as released, gated on optional generation (G1.4 / R2-7)."""
+    async with conn.cursor() as cur:
+        await cur.execute(
+            """
+            UPDATE dalton_budget_reservations
+            SET state = 'released',
+                released_at = NOW()
+            WHERE run_ref = %s
+              AND state = 'open'
+              AND (%s::int IS NULL OR generation = %s::int)
+            """,
+            (run_ref, generation, generation),
+        )
+        return cur.rowcount or 0
 
 
 async def lookup_run_context(conn: Any, run_ref: str) -> tuple[str | None, str | None]:
@@ -180,17 +239,10 @@ async def reconcile_reservations_sql(
     user_id: str,
     rate: Decimal,
 ) -> None:
-    """Lazy reconciliation of open, released, and expired reservations (P0.8 §4).
+    """Lazy reconciliation of open, released, and expired reservations (P0.8 §4, P0N.6 §2).
 
-    1. `state IN ('open','released')` where `conversation_responses.usage_settled_at IS NOT NULL`,
-       at least one `conversation_usages` row exists, and no `subagent_runs` with
-       `parent_run_id = run_ref AND status = 'in_progress'` -> `state='settled'`,
-       `settled_usd = usage_for_run`, `settle_source='usage'`.
-    2. `state = 'open'` and `expires_at < NOW()` -> `state='expired'`,
-       `settled_usd = GREATEST(reserved_usd, observed_usd, usage_for_run)`,
-       `settle_source='conservative'`.
-    3. `state = 'expired'` -> `settled_usd` can only increase to
-       `GREATEST(settled_usd, usage_for_run)`.
+    Uses `dalton_cash_usd(cu.token_usage::jsonb, cu.total_credits, cu.infrastructure_credits, rate)`
+    so per-call cash costs (`platform` and `byok`) are summed in USD while `oauth` calls are 0.
     """
     async with conn.cursor() as cur:
         # 1. Settle completed runs with settled usage
@@ -200,7 +252,10 @@ async def reconcile_reservations_sql(
                 SELECT
                     r.reservation_id,
                     r.run_ref,
-                    COALESCE(SUM(cu.total_credits), 0) / %s AS usage_usd,
+                    COALESCE(
+                        SUM(dalton_cash_usd(cu.token_usage::jsonb, cu.total_credits, cu.infrastructure_credits, %s)),
+                        0
+                    ) AS usage_usd,
                     COUNT(cu.conversation_usage_id) AS usage_rows
                 FROM dalton_budget_reservations r
                 LEFT JOIN conversation_usages cu
@@ -236,7 +291,10 @@ async def reconcile_reservations_sql(
             WITH stale_usage AS (
                 SELECT
                     r.reservation_id,
-                    COALESCE(SUM(cu.total_credits), 0) / %s AS usage_usd
+                    COALESCE(
+                        SUM(dalton_cash_usd(cu.token_usage::jsonb, cu.total_credits, cu.infrastructure_credits, %s)),
+                        0
+                    ) AS usage_usd
                 FROM dalton_budget_reservations r
                 LEFT JOIN conversation_usages cu
                     ON cu.conversation_response_id = r.run_ref
@@ -264,7 +322,10 @@ async def reconcile_reservations_sql(
             WITH exp_usage AS (
                 SELECT
                     r.reservation_id,
-                    COALESCE(SUM(cu.total_credits), 0) / %s AS usage_usd
+                    COALESCE(
+                        SUM(dalton_cash_usd(cu.token_usage::jsonb, cu.total_credits, cu.infrastructure_credits, %s)),
+                        0
+                    ) AS usage_usd
                 FROM dalton_budget_reservations r
                 JOIN conversation_usages cu
                     ON cu.conversation_response_id = r.run_ref
@@ -308,7 +369,10 @@ async def fetch_day_reservations(
             LEFT JOIN (
                 SELECT
                     conversation_response_id,
-                    COALESCE(SUM(total_credits), 0) / %s AS usage_usd
+                    COALESCE(
+                        SUM(dalton_cash_usd(token_usage::jsonb, total_credits, infrastructure_credits, %s)),
+                        0
+                    ) AS usage_usd
                 FROM conversation_usages
                 WHERE user_id = %s
                 GROUP BY conversation_response_id
@@ -328,11 +392,14 @@ async def fetch_unreserved_usage_today(
     day_end_utc: datetime,
     rate: Decimal,
 ) -> Decimal:
-    """Sum `total_credits / rate` for today's `conversation_usages` not tied to any reservation."""
+    """Sum `dalton_cash_usd(...)` for today's `conversation_usages` not tied to any reservation."""
     async with conn.cursor(row_factory=dict_row) as cur:
         await cur.execute(
             """
-            SELECT COALESCE(SUM(cu.total_credits), 0) / %s AS unreserved_usd
+            SELECT COALESCE(
+                SUM(dalton_cash_usd(cu.token_usage::jsonb, cu.total_credits, cu.infrastructure_credits, %s)),
+                0
+            ) AS unreserved_usd
             FROM conversation_usages cu
             WHERE cu.user_id = %s
               AND cu.created_at >= %s
@@ -346,6 +413,42 @@ async def fetch_unreserved_usage_today(
         )
         row = await cur.fetchone()
         return Decimal(str((row or {}).get("unreserved_usd") or "0"))
+
+
+async def fetch_journal_cash_today(
+    conn_or_cur: Any,
+    day_start_utc: datetime,
+    day_end_utc: datetime,
+    user_id: str | None = None,
+) -> Decimal:
+    """Sum `cash_usd` from `dalton_llm_journal` for today where `state IN ('done', 'indeterminate')` (P0N.6 §5, P0N.7)."""
+    query = """
+        SELECT COALESCE(SUM(cash_usd), 0) AS journal_cash_usd
+        FROM dalton_llm_journal
+        WHERE created_at >= %s
+          AND created_at < %s
+          AND state IN ('done', 'indeterminate')
+          AND (%s::text IS NULL OR user_id = %s OR user_id IS NULL)
+    """
+    params = (day_start_utc, day_end_utc, user_id, user_id)
+    try:
+        if hasattr(conn_or_cur, "cursor"):
+            async with conn_or_cur.cursor(row_factory=dict_row) as cur:
+                await cur.execute(query, params)
+                row = await cur.fetchone()
+        else:
+            await conn_or_cur.execute(query, params)
+            row = await conn_or_cur.fetchone()
+        if isinstance(row, dict):
+            val = row.get("journal_cash_usd") or row.get("cash_usd") or "0"
+        elif isinstance(row, (tuple, list)) and row:
+            val = row[0] or "0"
+        else:
+            val = "0"
+        return Decimal(str(val))
+    except Exception as exc:
+        logger.debug("[DaltonBudget] fetch_journal_cash_today skipped/failed: %s", exc)
+        return Decimal("0")
 
 
 async def fetch_today_token_usages(

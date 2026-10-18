@@ -1,0 +1,1125 @@
+{
+  "schema": "dalton-native-overlay/1",
+  "models": {
+    "gemini-4-argon-low-oauth": {
+      "prompt_guidance": "lean",
+      "model_id": "gemini-4-argon-low",
+      "provider": "antigravity-oauth",
+      "visible": true,
+      "speed": 3,
+      "intelligence": 5,
+      "context": 1048576,
+      "input_modalities": [
+        "text",
+        "image",
+        "pdf",
+        "video"
+      ],
+      "parameters": {
+        "include_thoughts": true,
+        "max_output_tokens": 65536
+      },
+      "reasoning": {
+        "efforts": [
+          "low"
+        ],
+        "default": "low",
+        "write": "parameters.thinking_level"
+      }
+    },
+    "gemini-4-argon-medium-oauth": {
+      "prompt_guidance": "lean",
+      "model_id": "gemini-4-argon-medium",
+      "provider": "antigravity-oauth",
+      "visible": true,
+      "speed": 3,
+      "intelligence": 5,
+      "context": 1048576,
+      "input_modalities": [
+        "text",
+        "image",
+        "pdf",
+        "video"
+      ],
+      "parameters": {
+        "include_thoughts": true,
+        "max_output_tokens": 65536
+      },
+      "reasoning": {
+        "efforts": [
+          "medium"
+        ],
+        "default": "medium",
+        "write": "parameters.thinking_level"
+      }
+    },
+    "gemini-4-argon-high-oauth": {
+      "prompt_guidance": "lean",
+      "model_id": "gemini-4-argon-high",
+      "provider": "antigravity-oauth",
+      "visible": true,
+      "speed": 2,
+      "intelligence": 5,
+      "context": 1048576,
+      "input_modalities": [
+        "text",
+        "image",
+        "pdf",
+        "video"
+      ],
+      "parameters": {
+        "include_thoughts": true,
+        "max_output_tokens": 65536
+      },
+      "reasoning": {
+        "efforts": [
+          "high"
+        ],
+        "default": "high",
+        "write": "parameters.thinking_level"
+      }
+    },
+    "gemini-3.8-flash-low-oauth": {
+      "prompt_guidance": "lean",
+      "model_id": "gemini-3.8-flash-low",
+      "provider": "antigravity-oauth",
+      "visible": true,
+      "speed": 5,
+      "intelligence": 3,
+      "context": 1048576,
+      "input_modalities": [
+        "text",
+        "image",
+        "pdf",
+        "video"
+      ],
+      "parameters": {
+        "include_thoughts": true,
+        "max_output_tokens": 65536
+      },
+      "reasoning": {
+        "efforts": [
+          "low"
+        ],
+        "default": "low",
+        "write": "parameters.thinking_level"
+      }
+    },
+    "gemini-3.8-flash-medium-oauth": {
+      "prompt_guidance": "lean",
+      "model_id": "gemini-3.8-flash-medium",
+      "provider": "antigravity-oauth",
+      "visible": true,
+      "speed": 5,
+      "intelligence": 3,
+      "context": 1048576,
+      "input_modalities": [
+        "text",
+        "image",
+        "pdf",
+        "video"
+      ],
+      "parameters": {
+        "include_thoughts": true,
+        "max_output_tokens": 65536
+      },
+      "reasoning": {
+        "efforts": [
+          "medium"
+        ],
+        "default": "medium",
+        "write": "parameters.thinking_level"
+      }
+    },
+    "gemini-3.8-flash-high-oauth": {
+      "prompt_guidance": "lean",
+      "model_id": "gemini-3.8-flash-high",
+      "provider": "antigravity-oauth",
+      "visible": true,
+      "speed": 4,
+      "intelligence": 4,
+      "context": 1048576,
+      "input_modalities": [
+        "text",
+        "image",
+        "pdf",
+        "video"
+      ],
+      "parameters": {
+        "include_thoughts": true,
+        "max_output_tokens": 65536
+      },
+      "reasoning": {
+        "efforts": [
+          "high"
+        ],
+        "default": "high",
+        "write": "parameters.thinking_level"
+      }
+    },
+    "gemini-2.5-pro-oauth": {
+      "prompt_guidance": "lean",
+      "model_id": "gemini-2.5-pro",
+      "provider": "antigravity-oauth",
+      "visible": true,
+      "speed": 2,
+      "intelligence": 4,
+      "context": 1048576,
+      "input_modalities": [
+        "text",
+        "image",
+        "pdf",
+        "video"
+      ],
+      "parameters": {
+        "include_thoughts": true,
+        "max_output_tokens": 65536
+      },
+      "reasoning": {
+        "efforts": [
+          "medium"
+        ],
+        "default": "medium",
+        "write": "parameters.thinking_level"
+      }
+    },
+    "gemini-3-flash-oauth": {
+      "prompt_guidance": "lean",
+      "model_id": "gemini-3-flash",
+      "provider": "antigravity-oauth",
+      "visible": true,
+      "speed": 4,
+      "intelligence": 4,
+      "context": 1048576,
+      "input_modalities": [
+        "text",
+        "image",
+        "pdf",
+        "video"
+      ],
+      "parameters": {
+        "include_thoughts": true,
+        "max_output_tokens": 65536
+      },
+      "reasoning": {
+        "efforts": [
+          "medium"
+        ],
+        "default": "medium",
+        "write": "parameters.thinking_level"
+      }
+    },
+    "claude-opus-5-5-low-oauth": {
+      "model_id": "claude-opus-5-5-low",
+      "provider": "antigravity-oauth",
+      "visible": true,
+      "speed": 3,
+      "intelligence": 5,
+      "context": 1000000,
+      "input_modalities": [
+        "text",
+        "image",
+        "pdf"
+      ],
+      "parameters": {
+        "include_thoughts": true,
+        "max_output_tokens": 128000
+      },
+      "reasoning": {
+        "efforts": [
+          "low"
+        ],
+        "default": "low",
+        "write": "parameters.thinking_level"
+      }
+    },
+    "claude-opus-5-5-medium-oauth": {
+      "model_id": "claude-opus-5-5-medium",
+      "provider": "antigravity-oauth",
+      "visible": true,
+      "speed": 3,
+      "intelligence": 5,
+      "context": 1000000,
+      "input_modalities": [
+        "text",
+        "image",
+        "pdf"
+      ],
+      "parameters": {
+        "include_thoughts": true,
+        "max_output_tokens": 128000
+      },
+      "reasoning": {
+        "efforts": [
+          "medium"
+        ],
+        "default": "medium",
+        "write": "parameters.thinking_level"
+      }
+    },
+    "claude-opus-5-5-high-oauth": {
+      "model_id": "claude-opus-5-5-high",
+      "provider": "antigravity-oauth",
+      "visible": true,
+      "speed": 2,
+      "intelligence": 5,
+      "context": 1000000,
+      "input_modalities": [
+        "text",
+        "image",
+        "pdf"
+      ],
+      "parameters": {
+        "include_thoughts": true,
+        "max_output_tokens": 128000
+      },
+      "reasoning": {
+        "efforts": [
+          "high"
+        ],
+        "default": "high",
+        "write": "parameters.thinking_level"
+      }
+    },
+    "claude-sonnet-5-5-low-oauth": {
+      "model_id": "claude-sonnet-5-5-low",
+      "provider": "antigravity-oauth",
+      "visible": true,
+      "speed": 4,
+      "intelligence": 4,
+      "context": 1000000,
+      "input_modalities": [
+        "text",
+        "image",
+        "pdf"
+      ],
+      "parameters": {
+        "include_thoughts": true,
+        "max_output_tokens": 128000
+      },
+      "reasoning": {
+        "efforts": [
+          "low"
+        ],
+        "default": "low",
+        "write": "parameters.thinking_level"
+      }
+    },
+    "claude-sonnet-5-5-medium-oauth": {
+      "model_id": "claude-sonnet-5-5-medium",
+      "provider": "antigravity-oauth",
+      "visible": true,
+      "speed": 4,
+      "intelligence": 4,
+      "context": 1000000,
+      "input_modalities": [
+        "text",
+        "image",
+        "pdf"
+      ],
+      "parameters": {
+        "include_thoughts": true,
+        "max_output_tokens": 128000
+      },
+      "reasoning": {
+        "efforts": [
+          "medium"
+        ],
+        "default": "medium",
+        "write": "parameters.thinking_level"
+      }
+    },
+    "claude-sonnet-5-5-high-oauth": {
+      "model_id": "claude-sonnet-5-5-high",
+      "provider": "antigravity-oauth",
+      "visible": true,
+      "speed": 3,
+      "intelligence": 4,
+      "context": 1000000,
+      "input_modalities": [
+        "text",
+        "image",
+        "pdf"
+      ],
+      "parameters": {
+        "include_thoughts": true,
+        "max_output_tokens": 128000
+      },
+      "reasoning": {
+        "efforts": [
+          "high"
+        ],
+        "default": "high",
+        "write": "parameters.thinking_level"
+      }
+    },
+    "gpt-oss-120b-medium-oauth": {
+      "model_id": "gpt-oss-120b-medium",
+      "provider": "antigravity-oauth",
+      "visible": true,
+      "speed": 4,
+      "intelligence": 3,
+      "context": 131072,
+      "input_modalities": [
+        "text"
+      ],
+      "parameters": {
+        "include_thoughts": true,
+        "max_output_tokens": 32768
+      },
+      "reasoning": {
+        "efforts": [
+          "medium"
+        ],
+        "default": "medium",
+        "write": "parameters.thinking_level"
+      }
+    },
+    "muse-wonder-full-1.0-oauth": {
+      "model_id": "muse-wonder-full-1.0",
+      "provider": "muse-oauth",
+      "visible": true,
+      "speed": 2,
+      "intelligence": 5,
+      "context": 1007997,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "prompt_guidance": "lean",
+      "parameters": {
+        "reasoning": {
+          "summary": "auto"
+        },
+        "include": [
+          "reasoning.encrypted_content"
+        ],
+        "store": false
+      },
+      "reasoning": {
+        "efforts": [
+          "low",
+          "medium",
+          "high"
+        ],
+        "default": "high",
+        "write": "parameters.reasoning.effort"
+      }
+    },
+    "muse-wonder-1.0-oauth": {
+      "model_id": "muse-wonder-1.0",
+      "provider": "muse-oauth",
+      "visible": true,
+      "speed": 2,
+      "intelligence": 5,
+      "context": 1007997,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "prompt_guidance": "lean",
+      "parameters": {
+        "reasoning": {
+          "summary": "auto"
+        },
+        "include": [
+          "reasoning.encrypted_content"
+        ],
+        "store": false
+      },
+      "reasoning": {
+        "efforts": [
+          "low",
+          "medium",
+          "high"
+        ],
+        "default": "high",
+        "write": "parameters.reasoning.effort"
+      }
+    },
+    "muse-wonder-full-1.0-contributor-oauth": {
+      "model_id": "muse-wonder-full-1.0-contributor",
+      "provider": "muse-oauth",
+      "visible": false,
+      "speed": 3,
+      "intelligence": 5,
+      "context": 1007997,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "parameters": {
+        "reasoning": {
+          "summary": "auto"
+        },
+        "include": [
+          "reasoning.encrypted_content"
+        ],
+        "store": false
+      },
+      "reasoning": {
+        "efforts": [
+          "low",
+          "medium",
+          "high"
+        ],
+        "default": "high",
+        "write": "parameters.reasoning.effort"
+      }
+    },
+    "muse-spark-1.3-oauth": {
+      "model_id": "muse-spark-1.3",
+      "provider": "muse-oauth",
+      "visible": true,
+      "speed": 5,
+      "intelligence": 3,
+      "context": 1007997,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "prompt_guidance": "lean",
+      "parameters": {
+        "reasoning": {
+          "summary": "auto"
+        },
+        "include": [
+          "reasoning.encrypted_content"
+        ],
+        "store": false
+      },
+      "reasoning": {
+        "efforts": [
+          "low",
+          "medium",
+          "high"
+        ],
+        "default": "high",
+        "write": "parameters.reasoning.effort"
+      }
+    },
+    "muse-spark-1.3-contributor-oauth": {
+      "model_id": "muse-spark-1.3-contributor",
+      "provider": "muse-oauth",
+      "visible": false,
+      "speed": 5,
+      "intelligence": 3,
+      "context": 1007997,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "parameters": {
+        "reasoning": {
+          "summary": "auto"
+        },
+        "include": [
+          "reasoning.encrypted_content"
+        ],
+        "store": false
+      },
+      "reasoning": {
+        "efforts": [
+          "low",
+          "medium",
+          "high"
+        ],
+        "default": "high",
+        "write": "parameters.reasoning.effort"
+      }
+    },
+    "grok-4.7": {
+      "model_id": "grok-4.7",
+      "provider": "xai",
+      "visible": true,
+      "speed": 3,
+      "intelligence": 5,
+      "context": 500000,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "parameters": {
+        "include": [
+          "reasoning.encrypted_content"
+        ],
+        "store": false
+      }
+    },
+    "grok-build-0.1": {
+      "model_id": "grok-build-0.1",
+      "provider": "xai",
+      "visible": true,
+      "speed": 5,
+      "intelligence": 4,
+      "context": 256000,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "parameters": {
+        "include": [
+          "reasoning.encrypted_content"
+        ],
+        "store": false
+      }
+    },
+    "grok-4.3": {
+      "model_id": "grok-4.3",
+      "provider": "xai",
+      "visible": true,
+      "speed": 3,
+      "intelligence": 4,
+      "context": 1000000,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "parameters": {
+        "include": [
+          "reasoning.encrypted_content"
+        ],
+        "store": false
+      }
+    }
+  },
+  "providers": {
+    "provider_config": {
+      "antigravity": {
+        "sdk": "antigravity",
+        "base_url": "https://daily-cloudcode-pa.googleapis.com",
+        "env_key": null,
+        "access_type": "oauth",
+        "display_name": "Google Antigravity",
+        "variants": {
+          "antigravity-oauth": {
+            "display_name": "Antigravity (Google Account)",
+            "comment": "Native v1internal protocol; login via Google OAuth loopback PKCE. Includes Claude Opus/Sonnet 5.5 and GPT-OSS models under the same subscription."
+          }
+        }
+      },
+      "meta": {
+        "sdk": "muse",
+        "base_url": "https://api.meta.ai/v1",
+        "env_key": null,
+        "access_type": "oauth",
+        "use_response_api": true,
+        "display_name": "Meta Muse",
+        "variants": {
+          "muse-oauth": {
+            "display_name": "Muse Code (Meta Account)",
+            "comment": "Native OpenAI Responses API at api.meta.ai/v1 with Muse client headers; login via Meta device code flow. Contributor variants trade data-for-training for cheaper quota."
+          }
+        }
+      },
+      "xai": {
+        "sdk": "openai",
+        "base_url": "https://api.x.ai/v1",
+        "env_key": "XAI_API_KEY",
+        "access_type": "api_key",
+        "byok_eligible": true,
+        "use_response_api": true,
+        "prompt_cache_key": true,
+        "display_name": "xAI Grok",
+        "operator_channel": "developer"
+      }
+    },
+    "provider_variants": {},
+    "models": {
+      "xai": [
+        {
+          "id": "grok-4.7",
+          "name": "Grok 4.7",
+          "is_reasoning": true,
+          "description": "xAI's flagship Grok 4.7 reasoning model with tiered short/long-context pricing",
+          "pricing": {
+            "input_tiers": [
+              {
+                "max_tokens": 200000,
+                "rate": 2.0,
+                "cached_input": 0.5
+              },
+              {
+                "max_tokens": null,
+                "rate": 4.0,
+                "cached_input": 1.0
+              }
+            ],
+            "output_tiers": [
+              {
+                "max_tokens": 200000,
+                "rate": 6.0
+              },
+              {
+                "max_tokens": null,
+                "rate": 12.0
+              }
+            ],
+            "input_pricing_mode": "input_dependent",
+            "output_pricing_mode": "input_dependent",
+            "unit": "per_1m_tokens"
+          },
+          "context_window": 500000,
+          "max_output": 128000
+        },
+        {
+          "id": "grok-build-0.1",
+          "name": "Grok Build 0.1",
+          "is_reasoning": true,
+          "description": "xAI's coding-focused Grok Build model with tiered short/long-context pricing",
+          "pricing": {
+            "input_tiers": [
+              {
+                "max_tokens": 200000,
+                "rate": 1.0,
+                "cached_input": 0.2
+              },
+              {
+                "max_tokens": null,
+                "rate": 2.0,
+                "cached_input": 0.4
+              }
+            ],
+            "output_tiers": [
+              {
+                "max_tokens": 200000,
+                "rate": 2.0
+              },
+              {
+                "max_tokens": null,
+                "rate": 4.0
+              }
+            ],
+            "input_pricing_mode": "input_dependent",
+            "output_pricing_mode": "input_dependent",
+            "unit": "per_1m_tokens"
+          },
+          "context_window": 256000,
+          "max_output": 64000
+        },
+        {
+          "id": "grok-4.3",
+          "name": "Grok 4.3",
+          "is_reasoning": true,
+          "description": "xAI's long-context Grok 4.3 reasoning model with tiered short/long-context pricing",
+          "pricing": {
+            "input_tiers": [
+              {
+                "max_tokens": 200000,
+                "rate": 1.25,
+                "cached_input": 0.2
+              },
+              {
+                "max_tokens": null,
+                "rate": 2.5,
+                "cached_input": 0.4
+              }
+            ],
+            "output_tiers": [
+              {
+                "max_tokens": 200000,
+                "rate": 2.5
+              },
+              {
+                "max_tokens": null,
+                "rate": 5.0
+              }
+            ],
+            "input_pricing_mode": "input_dependent",
+            "output_pricing_mode": "input_dependent",
+            "unit": "per_1m_tokens"
+          },
+          "context_window": 1000000,
+          "max_output": 64000
+        }
+      ]
+    }
+  },
+  "dalton_meta": {
+    "gemini-4-argon-low-oauth": {
+      "family": "google-gemini",
+      "billing": "subscription",
+      "notional_ref": "gemini-4-argon",
+      "tool_calling": true
+    },
+    "gemini-4-argon-medium-oauth": {
+      "family": "google-gemini",
+      "billing": "subscription",
+      "notional_ref": "gemini-4-argon",
+      "tool_calling": true
+    },
+    "gemini-4-argon-high-oauth": {
+      "family": "google-gemini",
+      "billing": "subscription",
+      "notional_ref": "gemini-4-argon",
+      "tool_calling": true
+    },
+    "gemini-3.8-flash-low-oauth": {
+      "family": "google-gemini",
+      "billing": "subscription",
+      "notional_ref": "gemini-3.8-flash",
+      "tool_calling": true
+    },
+    "gemini-3.8-flash-medium-oauth": {
+      "family": "google-gemini",
+      "billing": "subscription",
+      "notional_ref": "gemini-3.8-flash",
+      "tool_calling": true
+    },
+    "gemini-3.8-flash-high-oauth": {
+      "family": "google-gemini",
+      "billing": "subscription",
+      "notional_ref": "gemini-3.8-flash",
+      "tool_calling": true
+    },
+    "gemini-2.5-pro-oauth": {
+      "family": "google-gemini",
+      "billing": "subscription",
+      "notional_ref": "gemini-3.1-pro-preview",
+      "tool_calling": true
+    },
+    "gemini-3-flash-oauth": {
+      "family": "google-gemini",
+      "billing": "subscription",
+      "notional_ref": "gemini-3.8-flash",
+      "tool_calling": true
+    },
+    "claude-opus-5-5-low-oauth": {
+      "family": "anthropic-claude",
+      "billing": "subscription",
+      "notional_ref": "claude-opus-5-5",
+      "tool_calling": true
+    },
+    "claude-opus-5-5-medium-oauth": {
+      "family": "anthropic-claude",
+      "billing": "subscription",
+      "notional_ref": "claude-opus-5-5",
+      "tool_calling": true
+    },
+    "claude-opus-5-5-high-oauth": {
+      "family": "anthropic-claude",
+      "billing": "subscription",
+      "notional_ref": "claude-opus-5-5",
+      "tool_calling": true
+    },
+    "claude-sonnet-5-5-low-oauth": {
+      "family": "anthropic-claude",
+      "billing": "subscription",
+      "notional_ref": "claude-sonnet-5-5",
+      "tool_calling": true
+    },
+    "claude-sonnet-5-5-medium-oauth": {
+      "family": "anthropic-claude",
+      "billing": "subscription",
+      "notional_ref": "claude-sonnet-5-5",
+      "tool_calling": true
+    },
+    "claude-sonnet-5-5-high-oauth": {
+      "family": "anthropic-claude",
+      "billing": "subscription",
+      "notional_ref": "claude-sonnet-5-5",
+      "tool_calling": true
+    },
+    "gpt-oss-120b-medium-oauth": {
+      "family": "openai-gpt",
+      "billing": "subscription",
+      "notional_ref": "gpt-oss-120b-groq",
+      "tool_calling": true
+    },
+    "muse-wonder-full-1.0-oauth": {
+      "family": "meta-muse",
+      "billing": "subscription",
+      "notional_ref": "grok-4.7",
+      "notional_pricing": {
+        "input": 2.0,
+        "output": 6.0,
+        "cache_read": 0.5,
+        "estimated": true
+      },
+      "tool_calling": true
+    },
+    "muse-wonder-1.0-oauth": {
+      "family": "meta-muse",
+      "billing": "subscription",
+      "notional_ref": "grok-4.7",
+      "notional_pricing": {
+        "input": 2.0,
+        "output": 6.0,
+        "cache_read": 0.5,
+        "estimated": true
+      },
+      "tool_calling": true
+    },
+    "muse-wonder-full-1.0-contributor-oauth": {
+      "family": "meta-muse",
+      "billing": "subscription",
+      "notional_ref": "grok-4.7",
+      "notional_pricing": {
+        "input": 2.0,
+        "output": 6.0,
+        "cache_read": 0.5,
+        "estimated": true
+      },
+      "tool_calling": true,
+      "forbidden_for_roles": true
+    },
+    "muse-spark-1.3-oauth": {
+      "family": "meta-muse",
+      "billing": "subscription",
+      "notional_ref": "grok-4.7",
+      "notional_pricing": {
+        "input": 2.0,
+        "output": 6.0,
+        "cache_read": 0.5,
+        "estimated": true
+      },
+      "tool_calling": true
+    },
+    "muse-spark-1.3-contributor-oauth": {
+      "family": "meta-muse",
+      "billing": "subscription",
+      "notional_ref": "grok-4.7",
+      "notional_pricing": {
+        "input": 2.0,
+        "output": 6.0,
+        "cache_read": 0.5,
+        "estimated": true
+      },
+      "tool_calling": true,
+      "forbidden_for_roles": true
+    },
+    "grok-4.7": {
+      "family": "xai-grok",
+      "billing": "cash",
+      "tool_calling": true
+    },
+    "grok-build-0.1": {
+      "family": "xai-grok",
+      "billing": "cash",
+      "tool_calling": true
+    },
+    "grok-4.3": {
+      "family": "xai-grok",
+      "billing": "cash",
+      "tool_calling": true
+    },
+    "gpt-5.6-terra": {
+      "family": "openai-gpt",
+      "billing": "cash",
+      "tool_calling": true
+    },
+    "gpt-6-astra": {
+      "family": "openai-gpt",
+      "billing": "cash",
+      "tool_calling": true
+    },
+    "gpt-6.1-sol": {
+      "family": "openai-gpt",
+      "billing": "cash",
+      "tool_calling": true
+    },
+    "gpt-6-luna": {
+      "family": "openai-gpt",
+      "billing": "cash",
+      "tool_calling": true
+    },
+    "claude-fable-5-1": {
+      "family": "anthropic-claude",
+      "billing": "cash",
+      "tool_calling": true
+    },
+    "claude-opus-5-5": {
+      "family": "anthropic-claude",
+      "billing": "cash",
+      "tool_calling": true
+    },
+    "claude-sonnet-5-5": {
+      "family": "anthropic-claude",
+      "billing": "cash",
+      "tool_calling": true
+    },
+    "claude-haiku-5-5": {
+      "family": "anthropic-claude",
+      "billing": "cash",
+      "tool_calling": true
+    },
+    "gemini-4-argon": {
+      "family": "google-gemini",
+      "billing": "cash",
+      "tool_calling": true
+    },
+    "gemini-3.8-flash": {
+      "family": "google-gemini",
+      "billing": "cash",
+      "tool_calling": true
+    },
+    "gemini-3.1-flash-lite": {
+      "family": "google-gemini",
+      "billing": "cash",
+      "tool_calling": true
+    },
+    "gpt-oss-120b": {
+      "family": "openai-gpt",
+      "billing": "cash",
+      "tool_calling": true
+    },
+    "gpt-oss-20b": {
+      "family": "openai-gpt",
+      "billing": "cash",
+      "tool_calling": true
+    },
+    "gpt-oss-20b-safe-groq": {
+      "family": "openai-gpt",
+      "billing": "cash",
+      "tool_calling": true
+    },
+    "gpt-oss-20b-deepinfra": {
+      "family": "openai-gpt",
+      "billing": "cash",
+      "tool_calling": true
+    },
+    "gpt-oss-safeguard-20b-deepinfra": {
+      "family": "openai-gpt",
+      "billing": "cash",
+      "tool_calling": true
+    },
+    "gpt-oss-120b-groq": {
+      "family": "openai-gpt",
+      "billing": "cash",
+      "tool_calling": true
+    },
+    "deepseek-flash": {
+      "family": "deepseek",
+      "billing": "cash",
+      "tool_calling": true
+    },
+    "glm-5.2": {
+      "family": "zai-glm",
+      "billing": "cash",
+      "tool_calling": true
+    },
+    "glm-5.3": {
+      "family": "zai-glm",
+      "billing": "cash",
+      "tool_calling": true
+    },
+    "glm-5.3-flash": {
+      "family": "zai-glm",
+      "billing": "cash",
+      "tool_calling": true
+    },
+    "glm-5.2-cn": {
+      "family": "zai-glm",
+      "billing": "cash",
+      "tool_calling": true
+    },
+    "glm-5.3-cn": {
+      "family": "zai-glm",
+      "billing": "cash",
+      "tool_calling": true
+    },
+    "glm-5.3-flash-cn": {
+      "family": "zai-glm",
+      "billing": "cash",
+      "tool_calling": true
+    },
+    "minimax-m3": {
+      "family": "minimax",
+      "billing": "cash",
+      "tool_calling": true
+    },
+    "qwen3.8-max": {
+      "family": "alibaba-qwen",
+      "billing": "cash",
+      "tool_calling": true
+    },
+    "qwen3.8-flash": {
+      "family": "alibaba-qwen",
+      "billing": "cash",
+      "tool_calling": true
+    },
+    "qwen3.7-plus": {
+      "family": "alibaba-qwen",
+      "billing": "cash",
+      "tool_calling": true
+    },
+    "qwen3.8-max-intl": {
+      "family": "alibaba-qwen",
+      "billing": "cash",
+      "tool_calling": true
+    },
+    "qwen3.8-flash-intl": {
+      "family": "alibaba-qwen",
+      "billing": "cash",
+      "tool_calling": true
+    },
+    "qwen3.7-plus-intl": {
+      "family": "alibaba-qwen",
+      "billing": "cash",
+      "tool_calling": true
+    },
+    "kimi-k3": {
+      "family": "moonshot-kimi",
+      "billing": "cash",
+      "tool_calling": true
+    },
+    "kimi-k3-coding": {
+      "family": "moonshot-kimi",
+      "billing": "cash",
+      "tool_calling": true
+    },
+    "gpt-5.3-codex-spark-oauth": {
+      "family": "openai-gpt",
+      "billing": "subscription",
+      "tool_calling": true
+    },
+    "gpt-5.6-terra-oauth": {
+      "family": "openai-gpt",
+      "billing": "subscription",
+      "tool_calling": true,
+      "notional_ref": "gpt-5.6-terra"
+    },
+    "gpt-6-astra-oauth": {
+      "family": "openai-gpt",
+      "billing": "subscription",
+      "tool_calling": true,
+      "notional_ref": "gpt-6-astra"
+    },
+    "gpt-6.1-sol-oauth": {
+      "family": "openai-gpt",
+      "billing": "subscription",
+      "tool_calling": true,
+      "notional_ref": "gpt-6.1-sol"
+    },
+    "gpt-6-luna-oauth": {
+      "family": "openai-gpt",
+      "billing": "subscription",
+      "tool_calling": true,
+      "notional_ref": "gpt-6-luna"
+    },
+    "claude-fable-5-1-oauth": {
+      "family": "anthropic-claude",
+      "billing": "subscription",
+      "tool_calling": true,
+      "notional_ref": "claude-fable-5-1"
+    },
+    "claude-opus-5-5-oauth": {
+      "family": "anthropic-claude",
+      "billing": "subscription",
+      "tool_calling": true,
+      "notional_ref": "claude-opus-5-5"
+    },
+    "claude-sonnet-5-5-oauth": {
+      "family": "anthropic-claude",
+      "billing": "subscription",
+      "tool_calling": true,
+      "notional_ref": "claude-sonnet-5-5"
+    },
+    "claude-haiku-5-5-oauth": {
+      "family": "anthropic-claude",
+      "billing": "subscription",
+      "tool_calling": true,
+      "notional_ref": "claude-haiku-5-5"
+    }
+  }
+}

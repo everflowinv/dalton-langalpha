@@ -105,9 +105,8 @@ async def write_published_bundle(
     published_markdown: str,
     attachments: list[dict[str, Any]] | None = None,
     backend: Any,
-    pdf_renderer: Any = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
-    """Write ``published/<YYYY-MM-DD>-<slug>.{md,pdf,xlsx}`` and return ``(files_meta, file_blobs, notes)``."""
+    """Write ``published/<YYYY-MM-DD>-<slug>.{md,xlsx}`` and return ``(files_meta, file_blobs, notes)``."""
     date_str = (
         published_date[:10]
         if isinstance(published_date, str)
@@ -143,7 +142,7 @@ async def write_published_bundle(
         }
     )
 
-    # 2. Optional attachments (model .xlsx, pdf_source .html, appendix)
+    # 2. Optional attachments (model .xlsx, appendix)
     for att in attachments or []:
         if not isinstance(att, dict):
             continue
@@ -189,39 +188,5 @@ async def write_published_bundle(
                     }
                 )
 
-        elif role == "pdf_source":
-            if pdf_renderer is not None and backend is not None:
-                try:
-                    html_text = await backend.aread_text(src_path)
-                    if html_text:
-                        pdf_bytes = await pdf_renderer(html_text)
-                        if pdf_bytes and len(pdf_bytes) <= max_bytes:
-                            p_sha = hashlib.sha256(pdf_bytes).hexdigest()
-                            base_p_path = f"{PUBLISHED_DIR}/{date_str}-{slug}.pdf"
-                            final_p_path = await _pick_non_colliding_path(
-                                base_p_path, p_sha, backend
-                            )
-                            if hasattr(backend, "aupload_files"):
-                                await backend.aupload_files([(final_p_path, pdf_bytes)])
-                            files_meta.append(
-                                {
-                                    "path": final_p_path,
-                                    "sha256": p_sha,
-                                    "bytes": len(pdf_bytes),
-                                    "mime": "application/pdf",
-                                }
-                            )
-                            file_blobs.append(
-                                {
-                                    "path": final_p_path,
-                                    "sha256": p_sha,
-                                    "mime": "application/pdf",
-                                    "content": pdf_bytes,
-                                }
-                            )
-                except Exception as e:
-                    notes.append(f"PDF 渲染跳过（{e}）")
-            else:
-                notes.append("未启用 PDF 渲染依赖，本次仅发布 Markdown/模型文件")
-
     return files_meta, file_blobs, notes
+

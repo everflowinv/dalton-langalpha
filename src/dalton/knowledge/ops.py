@@ -3,13 +3,117 @@
 from __future__ import annotations
 
 import copy
+import difflib
 import hashlib
 import re
 import statistics
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from referencing import Registry, Resource
+
+from src.dalton.knowledge import validate as _validate_mod
 from src.dalton.settings import get_dalton_config
+
+
+def _install_nullable_schema_patch() -> None:
+    """Allow null on G3.4 de-fabricated legacy fields and evidence_ids on agenda questions."""
+    orig_loader = _validate_mod._load_schemas_and_registry
+    if getattr(orig_loader, "_dalton_g34_patched", False):
+        return
+
+    def _patched_loader() -> tuple[dict[str, dict[str, Any]], Registry]:
+        schemas, _ = orig_loader()
+        schemas = copy.deepcopy(schemas)
+
+        # 1. drivers.schema.json: eps_share_pct, multiple_share_pct nullable + optional note
+        drv = schemas.get("drivers", {})
+        hvd_props = (
+            drv.get("properties", {})
+            .get("historical_valuation_driver", {})
+            .get("properties", {})
+        )
+        if hvd_props:
+            hvd_props["eps_share_pct"] = {"type": ["number", "null"]}
+            hvd_props["multiple_share_pct"] = {"type": ["number", "null"]}
+            hvd_props.setdefault("note", {"type": ["string", "null"]})
+
+        # 2. management.schema.json: guidance_history[].issued_at nullable + optional note
+        mgmt = schemas.get("management", {})
+        gh_props = (
+            mgmt.get("properties", {})
+            .get("guidance_history", {})
+            .get("items", {})
+            .get("properties", {})
+        )
+        if gh_props:
+            gh_props["issued_at"] = {
+                "oneOf": [{"type": "null"}, {"$ref": "common#/$defs/isoDate"}]
+            }
+            gh_props.setdefault("note", {"type": ["string", "null"]})
+
+        # 3. company.schema.json: autonomy.max_usd_per_day nullable + optional note
+        comp = schemas.get("company", {})
+        aut_props = (
+            comp.get("properties", {}).get("autonomy", {}).get("properties", {})
+        )
+        if aut_props:
+            aut_props["max_usd_per_day"] = {"type": ["number", "null"], "minimum": 0}
+            aut_props.setdefault("note", {"type": ["string", "null"]})
+
+        # 4. agenda.schema.json: watch.events[].date & next_validations[].due nullable + question evidence_ids
+        ag = schemas.get("agenda", {})
+        ev_props = (
+            ag.get("properties", {})
+            .get("watch", {})
+            .get("properties", {})
+            .get("events", {})
+            .get("items", {})
+            .get("properties", {})
+        )
+        if ev_props:
+            ev_props["date"] = {
+                "oneOf": [{"type": "null"}, {"$ref": "common#/$defs/isoDate"}]
+            }
+            ev_props.setdefault("note", {"type": ["string", "null"]})
+
+        val_props = (
+            ag.get("$defs", {}).get("validation", {}).get("properties", {})
+        )
+        if val_props:
+            val_props["due"] = {
+                "oneOf": [{"type": "null"}, {"$ref": "common#/$defs/isoDate"}]
+            }
+            val_props.setdefault("note", {"type": ["string", "null"]})
+
+        linked_props = ag.get("$defs", {}).get("linked", {}).get("properties", {})
+        if linked_props is not None:
+            linked_props.setdefault(
+                "evidence_ids", {"type": "array", "items": {"type": "string"}}
+            )
+
+        q_props = ag.get("$defs", {}).get("question", {}).get("properties", {})
+        if q_props is not None:
+            q_props.setdefault(
+                "evidence_ids", {"type": "array", "items": {"type": "string"}}
+            )
+
+        resources = [
+            (
+                s.get("$id", f"https://dalton.local/schemas/{name}"),
+                Resource.from_contents(s),
+            )
+            for name, s in schemas.items()
+        ]
+        registry = Registry().with_resources(resources)
+        return schemas, registry
+
+    _patched_loader._dalton_g34_patched = True  # type: ignore[attr-defined]
+    _validate_mod._load_schemas_and_registry = _patched_loader  # type: ignore[assignment]
+    _validate_mod.get_validator.cache_clear()
+
+
+_install_nullable_schema_patch()
 
 
 class OpError(ValueError):
@@ -36,6 +140,116 @@ _APPEND_ONLY_ARRAY_NAMES = frozenset(
 )
 
 _AS_OF_DOCS = frozenset({"thesis", "debate", "drivers", "management", "agenda"})
+
+_DOC_PATH_ALIASES: dict[str, dict[str, str]] = {
+    "agenda": {
+        "questions": "open_questions",
+        "open_question": "open_questions",
+        "validations": "next_validations",
+        "validation_queue": "next_validations",
+        "catalysts": "watch/events",
+        "events": "watch/events",
+        "next_actions": "wake_conditions",
+        "handoffs": "pm_handoffs",
+    },
+    "thesis": {
+        "evidence_log": "evidence",
+        "evidences": "evidence",
+        "thesis_pillars": "pillars",
+        "summary": "one_liner",
+    },
+    "debate": {
+        "debate_list": "debates",
+        "items": "debates",
+    },
+    "drivers": {
+        "key_drivers": "drivers",
+        "driver_list": "drivers",
+    },
+    "lessons": {
+        "lesson_list": "lessons",
+        "items": "lessons",
+    },
+    "management": {
+        "guidance": "guidance_history",
+        "notes": "credibility_notes",
+    },
+}
+
+_COLLECTION_FIELD_ALIASES: dict[str, dict[str, str]] = {
+    "pillars": {
+        "statement": "claim",
+        "title": "claim",
+        "description": "claim",
+        "summary": "claim",
+    },
+    "evidence": {
+        "statement": "fact",
+        "claim": "fact",
+        "summary": "fact",
+        "text": "fact",
+    },
+    "debates": {
+        "title": "variable",
+        "topic": "variable",
+        "claim": "question",
+        "statement": "question",
+        "importance": "why_it_matters",
+        "why": "why_it_matters",
+    },
+    "bull": {
+        "statement": "case",
+        "claim": "case",
+        "text": "case",
+        "summary": "case",
+    },
+    "bear": {
+        "statement": "case",
+        "claim": "case",
+        "text": "case",
+        "summary": "case",
+    },
+    "open_questions": {
+        "statement": "question",
+        "claim": "question",
+        "text": "question",
+        "title": "question",
+        "question_text": "question",
+        "reason": "why",
+        "why_it_matters": "why",
+    },
+    "next_validations": {
+        "due_date": "due",
+        "date": "due",
+        "description": "what",
+        "title": "what",
+        "statement": "what",
+        "claim": "what",
+        "expectation": "expected",
+    },
+    "events": {
+        "event_date": "date",
+        "due": "date",
+        "due_date": "date",
+        "action": "plan",
+        "description": "plan",
+        "what": "plan",
+    },
+    "lessons": {
+        "claim": "statement",
+        "lesson": "statement",
+        "text": "statement",
+        "summary": "statement",
+        "when": "applies_when",
+    },
+    "drivers": {
+        "title": "name",
+        "metric": "name",
+        "statement": "description",
+        "claim": "description",
+        "summary": "description",
+    },
+}
 
 
 def _now_iso(now: datetime | None = None) -> str:
@@ -125,6 +339,8 @@ def _ensure_nested_ids_and_defaults(
     doc: dict[str, Any],
     *,
     now: datetime | None = None,
+    old_doc: dict[str, Any] | None = None,
+    evidence_ids: list[str] | None = None,
 ) -> None:
     """Assign missing IDs and server timestamps across the document."""
     now_str = _now_iso(now)
@@ -234,6 +450,11 @@ def _ensure_nested_ids_and_defaults(
         doc.setdefault("next_validations", [])
         doc.setdefault("watch", {})
         doc.setdefault("wake_conditions", [])
+        old_qs = {
+            str(oq.get("id")): oq
+            for oq in ((old_doc or {}).get("open_questions") or [])
+            if isinstance(oq, dict) and oq.get("id")
+        }
         for idx, q in enumerate(doc["open_questions"]):
             if isinstance(q, dict):
                 if not q.get("id"):
@@ -242,7 +463,12 @@ def _ensure_nested_ids_and_defaults(
                     )
                 q.setdefault("created_at", now_str)
                 q.setdefault("attempts", [])
-                _maintain_question_backoff(q, now=now)
+                _maintain_question_backoff(
+                    q,
+                    now=now,
+                    old_question=old_qs.get(str(q.get("id"))),
+                    evidence_ids=evidence_ids,
+                )
         for idx, v in enumerate(doc["next_validations"]):
             if isinstance(v, dict) and not v.get("id"):
                 v["id"] = next_item_id(
@@ -321,10 +547,44 @@ def _recompute_management_metrics(doc: dict[str, Any]) -> None:
             style["median_surprise_pct"] = round(float(statistics.median(surprises)), 2)
 
 
+def _parse_iso_dt(value: Any, fallback: datetime) -> datetime:
+    if isinstance(value, str) and value.strip():
+        try:
+            dt = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+            return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+        except ValueError:
+            return fallback
+    return fallback
+
+
+def _extract_question_evidence_ids(q: dict[str, Any] | None) -> set[str]:
+    if not isinstance(q, dict):
+        return set()
+    ev_ids: set[str] = set()
+    for item in q.get("evidence_ids") or []:
+        if item:
+            ev_ids.add(str(item))
+    linked = q.get("linked")
+    if isinstance(linked, dict):
+        for item in linked.get("evidence_ids") or []:
+            if item:
+                ev_ids.add(str(item))
+    return ev_ids
+
+
 def _maintain_question_backoff(
-    question: dict[str, Any], *, now: datetime | None = None
+    question: dict[str, Any],
+    *,
+    now: datetime | None = None,
+    old_question: dict[str, Any] | None = None,
+    evidence_ids: list[str] | None = None,
 ) -> None:
-    """Compute evidence_fp, stalled_since, and next_attempt_after on agenda questions."""
+    """Compute evidence_fp, stalled_since, and next_attempt_after on agenda questions.
+
+    Backoff formula (P0G §0.2 item 2 / R5):
+      backoff = clamp(0.5 * stalled_duration, 24h, 30d)
+    Clears backoff immediately when new evidence is linked to the question.
+    """
     attempts = question.get("attempts")
     if not isinstance(attempts, list) or not attempts:
         question.pop("stalled_since", None)
@@ -335,6 +595,28 @@ def _maintain_question_backoff(
         if isinstance(att, dict) and not att.get("evidence_fp"):
             raw = f"{att.get('method', '')}:{att.get('note', '')}:{att.get('at', '')}"
             att["evidence_fp"] = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+    old_ev = _extract_question_evidence_ids(old_question)
+    new_ev = _extract_question_evidence_ids(question) | {
+        str(x) for x in (evidence_ids or []) if x
+    }
+    old_att_len = len((old_question or {}).get("attempts") or []) if old_question else 0
+    new_att_len = len(attempts)
+
+    # If new evidence was linked to this question (or backoff was already cleared and no new attempt added)
+    if new_ev - old_ev and new_att_len == old_att_len:
+        question.pop("stalled_since", None)
+        question.pop("next_attempt_after", None)
+        return
+    if (
+        old_question is not None
+        and new_att_len == old_att_len
+        and not old_question.get("stalled_since")
+        and not old_question.get("next_attempt_after")
+    ):
+        question.pop("stalled_since", None)
+        question.pop("next_attempt_after", None)
+        return
 
     # Count trailing 'none' progress attempts
     trailing_none = 0
@@ -351,24 +633,34 @@ def _maintain_question_backoff(
         question.pop("next_attempt_after", None)
         return
 
-    cfg = get_dalton_config().autonomy.backoff
-    last_at_str = attempts[-1].get("at") if isinstance(attempts[-1], dict) else None
-    try:
-        last_dt = (
-            datetime.fromisoformat(last_at_str.replace("Z", "+00:00"))
-            if last_at_str
-            else (now or datetime.now(timezone.utc))
-        )
-    except ValueError:
-        last_dt = now or datetime.now(timezone.utc)
+    fallback_dt = now or datetime.now(timezone.utc)
+    if fallback_dt.tzinfo is None:
+        fallback_dt = fallback_dt.replace(tzinfo=timezone.utc)
 
-    hours = min(
-        cfg.base_hours * (2 ** (trailing_none - 1)),
-        cfg.max_days * 24.0,
+    last_at_str = attempts[-1].get("at") if isinstance(attempts[-1], dict) else None
+    last_dt = _parse_iso_dt(last_at_str, fallback_dt)
+
+    preset_stalled = question.get("stalled_since") or (
+        (old_question or {}).get("stalled_since") if old_question else None
     )
+    if preset_stalled and first_none_at:
+        dt_preset = _parse_iso_dt(preset_stalled, last_dt)
+        dt_first = _parse_iso_dt(first_none_at, last_dt)
+        stalled_dt = min(dt_preset, dt_first)
+        stalled_since_str = (
+            preset_stalled if dt_preset <= dt_first else first_none_at
+        )
+    else:
+        stalled_since_str = preset_stalled or first_none_at or _now_iso(last_dt)
+        stalled_dt = _parse_iso_dt(stalled_since_str, last_dt)
+
+    stalled_duration_hours = max(
+        0.0, (last_dt - stalled_dt).total_seconds() / 3600.0
+    )
+    hours = min(max(0.5 * stalled_duration_hours, 24.0), 30.0 * 24.0)
     next_dt = last_dt + timedelta(hours=hours)
-    if first_none_at:
-        question["stalled_since"] = first_none_at
+    if stalled_since_str:
+        question["stalled_since"] = stalled_since_str
     question["next_attempt_after"] = _now_iso(next_dt)
 
 
@@ -378,6 +670,155 @@ def _split_path(path: str) -> list[str]:
     if not path.startswith("/"):
         raise OpError("invalid_path", path, "path must start with '/'")
     return [seg for seg in path.split("/")[1:] if seg != ""]
+
+
+def _repair_item_dict(
+    collection_name: str,
+    item: dict[str, Any],
+    path_prefix: str,
+    warnings: list[dict[str, Any]],
+) -> None:
+    """Repair known field aliases inside a collection item or nested dict in-place."""
+    alias_map = _COLLECTION_FIELD_ALIASES.get(collection_name, {})
+    for bad_key in list(item.keys()):
+        target_key = alias_map.get(bad_key)
+        if target_key and target_key not in item:
+            item[target_key] = item.pop(bad_key)
+            warnings.append(
+                {
+                    "code": "field_repaired",
+                    "path": f"{path_prefix}/{bad_key}",
+                    "message": f"repaired field {bad_key!r} -> {target_key!r}",
+                }
+            )
+    if collection_name == "debates":
+        for side_key in ("bull", "bear"):
+            if isinstance(item.get(side_key), dict):
+                _repair_item_dict(
+                    side_key,
+                    item[side_key],
+                    f"{path_prefix}/{side_key}",
+                    warnings,
+                )
+
+
+def _repair_doc_collections(
+    doc_key: str,
+    doc: dict[str, Any],
+    warnings: list[dict[str, Any]],
+) -> None:
+    """Repair top-level collection aliases and item fields on a full document."""
+    doc_aliases = _DOC_PATH_ALIASES.get(doc_key, {})
+    for bad_key, target_rel in doc_aliases.items():
+        if bad_key in doc:
+            val = doc.pop(bad_key)
+            if "/" in target_rel:
+                p1, p2 = target_rel.split("/", 1)
+                sub = doc.setdefault(p1, {})
+                if isinstance(sub, dict) and p2 not in sub:
+                    sub[p2] = val
+            elif target_rel not in doc:
+                doc[target_rel] = val
+            warnings.append(
+                {
+                    "code": "field_repaired",
+                    "path": f"/{bad_key}",
+                    "message": f"repaired path '/{bad_key}' -> '/{target_rel}'",
+                }
+            )
+
+    for coll_name in _COLLECTION_FIELD_ALIASES:
+        arr = doc.get(coll_name)
+        if isinstance(arr, list):
+            for idx, entry in enumerate(arr):
+                if isinstance(entry, dict):
+                    _repair_item_dict(
+                        coll_name, entry, f"/{coll_name}/{idx}", warnings
+                    )
+    if doc_key == "agenda" and isinstance(doc.get("watch"), dict):
+        evs = doc["watch"].get("events")
+        if isinstance(evs, list):
+            for idx, entry in enumerate(evs):
+                if isinstance(entry, dict):
+                    _repair_item_dict(
+                        "events", entry, f"/watch/events/{idx}", warnings
+                    )
+
+
+def repair_knowledge_ops(
+    doc_key: str,
+    base_doc: dict[str, Any] | None,
+    ops: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Repair common path/field aliases in ``ops`` and return ``(repaired_ops, warnings)``."""
+    repaired_ops = copy.deepcopy(ops)
+    warnings: list[dict[str, Any]] = []
+    doc_aliases = _DOC_PATH_ALIASES.get(doc_key, {})
+
+    for op in repaired_ops:
+        if not isinstance(op, dict):
+            continue
+        op_name = op.get("op")
+        raw_path = str(op.get("path") or "/")
+        val = op.get("value")
+
+        if op_name == "create" and isinstance(val, dict):
+            _repair_doc_collections(doc_key, val, warnings)
+            continue
+
+        segs = _split_path(raw_path)
+        if not segs:
+            continue
+
+        # 1. Check top-level segment alias (never repair /official)
+        top = segs[0]
+        if top != "official":
+            mapped_top = doc_aliases.get(top)
+            if mapped_top is None and isinstance(base_doc, dict) and top not in base_doc:
+                close = difflib.get_close_matches(top, list(base_doc.keys()), n=1, cutoff=0.78)
+                if close and close[0] != "official":
+                    mapped_top = close[0]
+            if mapped_top:
+                new_top_segs = [s for s in mapped_top.split("/") if s]
+                segs = [*new_top_segs, *segs[1:]]
+                new_path = "/" + "/".join(segs)
+                warnings.append(
+                    {
+                        "code": "field_repaired",
+                        "path": raw_path,
+                        "message": f"repaired path {raw_path!r} -> {new_path!r}",
+                    }
+                )
+                op["path"] = new_path
+                raw_path = new_path
+
+        # 2. Check leaf field alias on `set` inside a collection item (e.g. /pillars/P1/statement -> /pillars/P1/claim)
+        if op_name == "set" and len(segs) >= 3:
+            coll_seg = segs[-3]
+            leaf_seg = segs[-1]
+            alias_map = _COLLECTION_FIELD_ALIASES.get(coll_seg, {})
+            mapped_leaf = alias_map.get(leaf_seg)
+            if mapped_leaf:
+                segs[-1] = mapped_leaf
+                new_path = "/" + "/".join(segs)
+                warnings.append(
+                    {
+                        "code": "field_repaired",
+                        "path": raw_path,
+                        "message": f"repaired field {leaf_seg!r} -> {mapped_leaf!r} at {new_path!r}",
+                    }
+                )
+                op["path"] = new_path
+                raw_path = new_path
+
+        # 3. Check item dict fields on append/set/upsert
+        target_coll = segs[-1] if op_name in ("append", "append_item", "insert", "upsert_item") else (
+            segs[-2] if len(segs) >= 2 else segs[-1]
+        )
+        if isinstance(val, dict) and target_coll in _COLLECTION_FIELD_ALIASES:
+            _repair_item_dict(target_coll, val, raw_path, warnings)
+
+    return repaired_ops, warnings
 
 
 def _resolve_parent(
@@ -394,7 +835,7 @@ def _resolve_parent(
         if isinstance(curr, dict):
             if seg not in curr:
                 # Auto-create intermediate dicts for known optional containers
-                if seg in ("thresholds", "watch", "identifiers", "autonomy"):
+                if seg in ("thresholds", "watch", "identifiers", "autonomy", "linked"):
                     curr[seg] = {}
                 else:
                     raise OpError(
@@ -453,6 +894,42 @@ def _find_in_list(
     )
 
 
+def _check_set_append_only_violation(
+    segments: list[str],
+    parent: Any,
+    last_seg: str,
+    value: Any,
+    path: str,
+) -> None:
+    """Enforce hard invariant #2: append-only arrays cannot be truncated or overwritten via set."""
+    if isinstance(parent, dict) and last_seg in _APPEND_ONLY_ARRAY_NAMES:
+        old_arr = parent.get(last_seg)
+        if isinstance(old_arr, list) and old_arr:
+            if not isinstance(value, list) or len(value) < len(old_arr):
+                raise OpError(
+                    "append_only_violation",
+                    path,
+                    f"append-only array {last_seg!r} cannot be truncated or overwritten",
+                )
+            for idx, old_item in enumerate(old_arr):
+                if value[idx] != old_item:
+                    raise OpError(
+                        "append_only_violation",
+                        f"{path}/{idx}",
+                        f"cannot mutate existing item at index {idx} in append-only array {last_seg!r}",
+                    )
+    for idx, seg in enumerate(segments[:-1]):
+        if seg in _APPEND_ONLY_ARRAY_NAMES:
+            # Allow one-time backfill of actual/outcome on guidance_history
+            if seg == "guidance_history" and last_seg in ("actual", "outcome"):
+                return
+            raise OpError(
+                "append_only_violation",
+                path,
+                f"cannot overwrite existing entry inside append-only array {seg!r}",
+            )
+
+
 def apply_ops(
     doc_key: str,
     base_doc: dict[str, Any] | None,
@@ -467,17 +944,20 @@ def apply_ops(
     if not ops:
         raise OpError("empty_ops", "/", "ops list cannot be empty")
 
+    repaired_ops, repair_warnings = repair_knowledge_ops(doc_key, base_doc, ops)
     now_str = _now_iso(now)
-    summaries: list[str] = []
+    summaries: list[str] = [w["message"] for w in repair_warnings]
 
     if base_doc is None:
-        if len(ops) == 1 and ops[0].get("op") == "create":
-            val = ops[0].get("value")
+        if len(repaired_ops) == 1 and repaired_ops[0].get("op") == "create":
+            val = repaired_ops[0].get("value")
             if not isinstance(val, dict):
                 raise OpError("invalid_value", "/", "create value must be an object")
             doc = copy.deepcopy(val)
-            _ensure_nested_ids_and_defaults(doc_key, doc, now=now)
-            summaries.append(f"create {doc_key}")
+            _ensure_nested_ids_and_defaults(
+                doc_key, doc, now=now, old_doc=None, evidence_ids=evidence_ids
+            )
+            summaries.insert(0, f"create {doc_key}")
             return doc, summaries
         raise OpError(
             "doc_not_initialized",
@@ -488,7 +968,7 @@ def apply_ops(
     old_snapshot = copy.deepcopy(base_doc)
     doc = copy.deepcopy(base_doc)
 
-    for raw_op in ops:
+    for raw_op in repaired_ops:
         op_name = raw_op.get("op")
         path = str(raw_op.get("path") or "/")
         value = copy.deepcopy(raw_op.get("value"))
@@ -507,6 +987,7 @@ def apply_ops(
         parent, last_seg, parent_id = _resolve_parent(doc, segments, path)
 
         if op_name == "set":
+            _check_set_append_only_violation(segments, parent, last_seg, value, path)
             if isinstance(parent, dict):
                 old_val = parent.get(last_seg)
                 parent[last_seg] = value
@@ -555,6 +1036,12 @@ def apply_ops(
                     )
                     if existing_idx is not None:
                         if op_name == "upsert_item":
+                            if last_seg in _APPEND_ONLY_ARRAY_NAMES:
+                                raise OpError(
+                                    "append_only_violation",
+                                    path,
+                                    f"cannot overwrite existing item {item_id!r} in append-only array {last_seg!r}",
+                                )
                             merged = {**arr[existing_idx], **value}
                             arr[existing_idx] = merged
                             summaries.append(f"upsert {path}/{item_id}")
@@ -682,7 +1169,13 @@ def apply_ops(
         evidence_ids=evidence_ids,
         verdict_id=verdict_id,
     )
-    _ensure_nested_ids_and_defaults(doc_key, doc, now=now)
+    _ensure_nested_ids_and_defaults(
+        doc_key,
+        doc,
+        now=now,
+        old_doc=old_snapshot,
+        evidence_ids=evidence_ids,
+    )
     return doc, summaries
 
 

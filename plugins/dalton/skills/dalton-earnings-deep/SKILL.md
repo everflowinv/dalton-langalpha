@@ -14,14 +14,14 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 
 1. **必读 `run-workflow`**：执行任何操作前，先读 `.agents/skills/run-workflow/SKILL.md` 以解锁 `RunWorkflow` 工具。
 2. **双模式路由**：
-   - **默认模式（深度链 `earnings-deep-update` workflow）**：当由 PS.7 创建的 `tp1` 自动任务触发（T+1 交易日 20:00，此时卖方财报后报告已基本到齐）或用户要求完整财报后更新时，调用 `RunWorkflow(workflow="earnings-deep-update", args={...})`。
+   - **默认模式（深度链 `earnings-deep-update` workflow）**：当由 PS.7 创建的 `tp1` 自动任务触发（T+1 交易日 20:00，此时卖方财报后报告已基本到齐）或用户要求完整财报后更新时，调用 `RunWorkflow(workflow="earnings-deep-update", params={...})`。
    - **回退 / 独立八节点评模式（Standalone Fallback）**：若平台 `workflow.enabled` 关闭，或用户明确要求“只写八节深度点评报告、不跑完整 workflow”，主智能体在当前会话内按本 skill 下述四个阶段顺序直接执行。
 
 ---
 
 ## Step 1：组装参数并启动 `earnings-deep-update` Workflow
 
-在公司工作区收集以下参数后调用 `RunWorkflow(workflow="earnings-deep-update", args=...)`：
+在公司工作区收集以下参数后调用 `RunWorkflow(workflow="earnings-deep-update", params=...)`：
 
 | 参数名 | 含义与取值规则 |
 |---|---|

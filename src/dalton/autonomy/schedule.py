@@ -35,9 +35,10 @@ def build_company_watch_specs(
     timezone_name: Optional[str] = None,
 ) -> list[dict[str, Any]]:
     """Return the standard automation definitions for a covered company (PK.15)."""
-    tz = timezone_name or get_dalton_settings().autonomy.timezone
     t_upper = ticker.upper()
     t_lower = ticker.lower()
+    is_cnhk = t_upper.endswith((".HK", ".SS", ".SZ", ".SH"))
+    tz = timezone_name or ("Asia/Shanghai" if is_cnhk else "America/New_York")
     watch_cron = "0 7,19 * * 1-5" if tier.lower() == "core" else "30 7 * * 1-5"
 
     return [
@@ -49,7 +50,6 @@ def build_company_watch_specs(
             "timezone": tz,
             "workspace_id": workspace_id,
             "thread_strategy": "new",
-            "max_failures": 10,
             "instruction": (
                 f"请阅读本轮 `<dalton_wake>` 中的触发信号，使用 `.agents/skills/dalton-agenda/SKILL.md` 与相关分析技能处理 {t_upper} 的最新事项，"
                 "更新公司知识层并在收盘前写入 `knowledge_append_verdict`。"
@@ -69,7 +69,6 @@ def build_company_watch_specs(
             "timezone": tz,
             "workspace_id": workspace_id,
             "thread_strategy": "new",
-            "max_failures": 10,
             "instruction": (
                 f"请按 `.agents/skills/dalton-thesis-delta/SKILL.md` 对 {t_upper} 过去一周的证据、预期变化与催化剂进展做周度复盘，"
                 "必要时更新 `thesis` / `debate` / `agenda` 并追加一条 `knowledge_append_verdict`。"
@@ -88,7 +87,6 @@ def build_company_watch_specs(
             "timezone": tz,
             "workspace_id": workspace_id,
             "thread_strategy": "new",
-            "max_failures": 10,
             "trigger_config": {
                 "symbol": t_upper,
                 "market": "stock",
@@ -122,7 +120,6 @@ def build_company_watch_specs(
             "timezone": tz,
             "workspace_id": workspace_id,
             "thread_strategy": "new",
-            "max_failures": 10,
             "trigger_config": {
                 "symbol": t_upper,
                 "market": "stock",
@@ -181,7 +178,6 @@ def build_earnings_window_specs(
             "timezone": tz,
             "workspace_id": workspace_id,
             "thread_strategy": "new",
-            "max_failures": 5,
             "instruction": (
                 f"{t_upper} 将于 {report_at.date().isoformat()} 披露 {period} 财报。"
                 "请按 `.agents/skills/dalton-earnings-preview/SKILL.md` 生成财报前瞻草稿并更新 `agenda` 关注清单。"
@@ -201,7 +197,6 @@ def build_earnings_window_specs(
             "timezone": tz,
             "workspace_id": workspace_id,
             "thread_strategy": "new",
-            "max_failures": 5,
             "instruction": (
                 f"{t_upper} {period} 财报已进入披露窗口。请按 `.agents/skills/dalton-earnings-flash/SKILL.md` 完成第一反应快评，"
                 "对比一致预期与核心 KPI，并追加 `knowledge_append_verdict`。"
@@ -221,7 +216,6 @@ def build_earnings_window_specs(
             "timezone": tz,
             "workspace_id": workspace_id,
             "thread_strategy": "new",
-            "max_failures": 5,
             "instruction": (
                 f"请按 `.agents/skills/dalton-earnings-deep/SKILL.md` 结合 {t_upper} {period} 10-Q/10-K 与电话会纪要，"
                 "完成模型更新、深度复盘草稿与知识层更新。"
@@ -247,11 +241,10 @@ def build_global_director_specs(
             "name": "dalton-earnings-calendar",
             "description": "Dalton 覆盖池财报日历周度刷新并排期 T-3 / T+0 / T+1",
             "trigger_type": "cron",
-            "cron_expression": "0 8 * * 1",
+            "cron_expression": "0 9 * * 6",
             "timezone": tz,
             "workspace_id": None,
             "thread_strategy": "new",
-            "max_failures": 10,
             "instruction": (
                 "请按 `.agents/skills/dalton-earnings-calendar/SKILL.md` 扫描覆盖池未来 21 天的财报披露日，"
                 "更新 `dalton/earnings_calendar.md` 并为即将披露的 Core 公司排期 T-3 / T+0 / T+1 任务。"
@@ -269,11 +262,10 @@ def build_global_director_specs(
             "timezone": tz,
             "workspace_id": None,
             "thread_strategy": "pinned",
-            "max_failures": 10,
             "instruction": (
                 "请按 `.agents/skills/dalton-research-director/SKILL.md` 执行每日晨会：\n"
                 "1. 调用 `dalton_coverage_board` 获取全覆盖公司状态与今日剩余额度；\n"
-                "2. 对需要深挖或复盘的工作区通过 ` delegate_to_workspace ` 派单；\n"
+                "2. 对需要深挖或复盘的工作区通过 `delegate_to_analyst(question=..., workspace_id=..., report_back=True)` 派单；\n"
                 "3. 调用 `dalton_record_plan` 记录今日计划并刷新 `dalton/coverage.html`。"
             ),
             "metadata": {
@@ -289,7 +281,6 @@ def build_global_director_specs(
             "timezone": tz,
             "workspace_id": None,
             "thread_strategy": "pinned",
-            "max_failures": 10,
             "instruction": (
                 "请按 `.agents/skills/dalton-weekly-review/SKILL.md` 与 `.agents/skills/dalton-research-director/SKILL.md` "
                 "汇总本周全部覆盖公司的结论分布、待决辩题、催化剂兑现情况与预算使用，生成周度复盘报告。"
@@ -300,3 +291,156 @@ def build_global_director_specs(
             },
         },
     ]
+
+
+async def schedule_dalton_automation_helper(
+    user_id: str = "local_dev_user",
+    name: Optional[str] = None,
+    spec: Optional[dict[str, Any]] = None,
+    *,
+    workspace_id: Optional[str] = None,
+    entry: Optional[dict[str, Any]] = None,
+    ticker: Optional[str] = None,
+    role: str = "chief_of_staff",
+    action: Optional[str] = None,
+) -> dict[str, Any]:
+    """Idempotently create, update, pause, resume, or list Dalton (`dalton-*`) automations (G4.5).
+
+    Supports both:
+    - ``schedule_dalton_automation_helper(user_id, name, spec)``
+    - ``schedule_dalton_automation_helper(user_id=..., workspace_id=..., name=..., entry=...)``
+    """
+    from src.server.database import automation as auto_db
+
+    merged_spec: dict[str, Any] = dict(spec or entry or {})
+    resolved_action = str(action or merged_spec.get("action") or "upsert").strip().lower()
+    resolved_name = str(name or merged_spec.get("name") or "").strip()
+    ws_id = workspace_id if workspace_id is not None else merged_spec.get("workspace_id")
+    tz = str(merged_spec.get("timezone") or merged_spec.get("timezone_name") or get_dalton_settings().autonomy.timezone)
+    resolved_ticker = ticker or (merged_spec.get("metadata") or {}).get("ticker") or merged_spec.get("ticker")
+
+    if resolved_action == "list":
+        rows, _ = await auto_db.list_automations(
+            user_id=user_id,
+            workspace_id=ws_id,
+            limit=100,
+        )
+        dalton_rows = [
+            {
+                "automation_id": str(r.get("automation_id")),
+                "name": r.get("name"),
+                "trigger_type": r.get("trigger_type"),
+                "cron_expression": r.get("cron_expression"),
+                "next_run_at": str(r.get("next_run_at") or ""),
+                "status": r.get("status"),
+            }
+            for r in rows
+            if str(r.get("name") or "").startswith("dalton-")
+        ]
+        return {"ok": True, "count": len(dalton_rows), "automations": dalton_rows}
+
+    if not resolved_name:
+        return {"ok": False, "error": "缺少自动任务名称 `name`。"}
+
+    valid, err_msg = validate_automation_name(
+        resolved_name,
+        ticker=str(resolved_ticker) if (resolved_ticker and role != "chief_of_staff") else None,
+    )
+    if not valid:
+        return {"ok": False, "error": err_msg}
+
+    rows, _ = await auto_db.list_automations(user_id=user_id, workspace_id=ws_id, limit=200)
+    existing = next((r for r in rows if r.get("name") == resolved_name), None)
+
+    if resolved_action in ("pause", "resume"):
+        if not existing:
+            return {"ok": False, "error": f"未找到任务 `{resolved_name}`"}
+        new_status = "paused" if resolved_action == "pause" else "active"
+        updated = await auto_db.update_automation(
+            str(existing["automation_id"]),
+            user_id,
+            status=new_status,
+        )
+        return {
+            "ok": True,
+            "action": resolved_action,
+            "automation_id": str((updated or existing).get("automation_id")),
+            "name": resolved_name,
+            "status": new_status,
+        }
+
+    if resolved_action != "upsert":
+        return {"ok": False, "error": f"不支持的 action: {resolved_action}"}
+
+    instruction = merged_spec.get("instruction") or merged_spec.get("prompt")
+    if not instruction and not existing:
+        return {"ok": False, "error": "新建任务必须提供 `instruction`。"}
+
+    next_run_raw = merged_spec.get("next_run_at") or merged_spec.get("run_at")
+    next_dt: Optional[datetime] = None
+    if isinstance(next_run_raw, datetime):
+        next_dt = next_run_raw
+    elif isinstance(next_run_raw, str) and next_run_raw.strip():
+        next_dt = datetime.fromisoformat(next_run_raw.strip().replace("Z", "+00:00"))
+
+    description = merged_spec.get("description")
+    cron_expression = merged_spec.get("cron_expression") or merged_spec.get("cron")
+    trigger_type = str(merged_spec.get("trigger_type") or ("cron" if cron_expression else "once"))
+    trigger_config = merged_spec.get("trigger_config")
+    meta = dict(merged_spec.get("metadata") or {})
+    meta.setdefault("dalton_managed", True)
+    if resolved_ticker and not meta.get("ticker"):
+        meta["ticker"] = str(resolved_ticker).upper()
+
+    if existing:
+        patch: dict[str, Any] = {}
+        if instruction is not None:
+            patch["instruction"] = instruction
+        if description is not None:
+            patch["description"] = description
+        if cron_expression is not None:
+            patch["cron_expression"] = cron_expression
+        if tz:
+            patch["timezone"] = tz
+        if trigger_config is not None:
+            patch["trigger_config"] = trigger_config
+        if next_dt is not None:
+            patch["next_run_at"] = next_dt
+        if meta:
+            patch["metadata"] = meta
+        updated = await auto_db.update_automation(
+            str(existing["automation_id"]),
+            user_id,
+            **patch,
+        )
+        return {
+            "ok": True,
+            "action": "updated",
+            "automation_id": str((updated or existing).get("automation_id")),
+            "name": resolved_name,
+        }
+
+    created = await auto_db.create_automation(
+        user_id=user_id,
+        name=resolved_name,
+        description=description,
+        trigger_type=trigger_type,
+        cron_expression=cron_expression,
+        timezone=tz,
+        trigger_config=trigger_config,
+        next_run_at=next_dt,
+        instruction=instruction or "",
+        workspace_id=ws_id,
+        llm_model=merged_spec.get("llm_model"),
+        additional_context=merged_spec.get("additional_context"),
+        thread_strategy=str(merged_spec.get("thread_strategy") or "new"),
+        conversation_thread_id=merged_spec.get("conversation_thread_id"),
+        delivery_config=merged_spec.get("delivery_config"),
+        metadata=meta,
+    )
+    return {
+        "ok": True,
+        "action": "created",
+        "automation_id": str(created.get("automation_id")),
+        "name": resolved_name,
+    }

@@ -1,7 +1,8 @@
-"""Unit tests for Dalton budget port, admission gate, and OpenClaw catalog overlay (P0.4–P0.8)."""
+"""Unit tests for Dalton budget port, admission gate, LLM journal, and assist_json (P0.4–P0.8, P0N.6–7, G0, G1)."""
 
 from __future__ import annotations
 
+import asyncio
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -15,8 +16,25 @@ from src.dalton.budget.port import (
     format_task_cap_exhausted_message,
 )
 from src.dalton.budget.service import _local_day_bounds
+from src.dalton.llm.assist import AssistResult, assist_json
+from src.dalton.llm.complete import (
+    BudgetExhaustedError,
+    JournalIndeterminate,
+    dalton_complete,
+)
 from src.dalton.llm.openclaw_catalog import build_overlay
 from src.dalton.llm.role_policy import check_roles, family_of
+
+
+def _make_mock_conn() -> MagicMock:
+    mock_conn = MagicMock()
+    mock_conn.__aenter__ = AsyncMock(return_value=mock_conn)
+    mock_conn.__aexit__ = AsyncMock(return_value=None)
+    mock_tx = MagicMock()
+    mock_tx.__aenter__ = AsyncMock(return_value=None)
+    mock_tx.__aexit__ = AsyncMock(return_value=None)
+    mock_conn.transaction.return_value = mock_tx
+    return mock_conn
 
 
 def test_local_day_bounds_shanghai():
@@ -39,18 +57,84 @@ def test_budget_exhausted_messages_chinese():
     assert "今日预算 $30.00 已用完" in daily
     assert "$28.50" in daily
     assert "$1.50" in daily
+    assert "现金模型" in daily
 
     task = format_task_cap_exhausted_message(Decimal("5.00"), Decimal("5.00"))
     assert "本任务预算 $5.00 已用完" in task
 
 
 @pytest.mark.asyncio
-async def test_local_budget_port_byok_grants_immediately():
+async def test_acquire_byok_enforces_daily_cash_cap():
+    """G1.1: `acquire(..., byok=True)` must NOT return an unbounded +1,000,000 ceiling;
+    it must enforce the daily USD cash cap and deny when exhausted."""
     port = LocalBudgetPort()
-    verdict = await port.acquire("user-1", "run-1", spent_credits=500.0, byok=True)
-    assert verdict is not None
-    assert verdict.granted is True
-    assert verdict.ceiling_credits > 500.0
+    mock_conn = _make_mock_conn()
+
+    mock_cur = MagicMock()
+    mock_cur.__aenter__ = AsyncMock(return_value=mock_cur)
+    mock_cur.__aexit__ = AsyncMock(return_value=None)
+    mock_cur.execute = AsyncMock(return_value=None)
+    mock_cur.fetchone = AsyncMock(
+        return_value={
+            "run_ref": "run-1",
+            "reserved_usd": Decimal("1.00"),
+            "observed_usd": Decimal("0.50"),
+            "usage_usd": Decimal("0.50"),
+            "task_cap_usd": None,
+            "generation": 2,
+        }
+    )
+    mock_conn.cursor.return_value = mock_cur
+
+    exhausted_summary = {
+        "configured": True,
+        "retry_after_seconds": 1800,
+        "_raw_rows": [
+            {
+                "run_ref": "run-1",
+                "reserved_usd": Decimal("1.00"),
+                "observed_usd": Decimal("0.50"),
+                "usage_usd": Decimal("0.50"),
+                "charge_usd": Decimal("1.00"),
+                "task_cap_usd": None,
+                "generation": 2,
+            }
+        ],
+        "_decimals": {
+            "cap_usd": Decimal("1.00"),
+            "spent_usd": Decimal("1.50"),
+            "settled_usd": Decimal("0.50"),
+            "unreserved_usage_usd": Decimal("0.00"),
+            "open_reserved_usd": Decimal("1.00"),
+            "expired_conservative_usd": Decimal("0.00"),
+        },
+    }
+
+    with (
+        patch("src.dalton.budget.port.get_db_connection", return_value=mock_conn),
+        patch(
+            "src.dalton.budget.port.reconcile_and_summarize_day",
+            new=AsyncMock(return_value=exhausted_summary),
+        ),
+        patch(
+            "src.dalton.budget.port.resolve_user_budget_config",
+            new=AsyncMock(
+                return_value={
+                    "user_id": "user-1",
+                    "daily_cap_usd": Decimal("1.00"),
+                    "default_task_cap_usd": None,
+                    "timezone": "Asia/Shanghai",
+                    "configured": True,
+                }
+            ),
+        ),
+    ):
+        verdict = await port.acquire("user-1", "run-1", spent_credits=500.0, byok=True)
+        assert verdict is not None
+        assert verdict.granted is False
+        assert verdict.ceiling_credits < 10_000.0  # Never 500 + 1_000_000
+        assert verdict.quota is not None
+        assert verdict.quota["type"] == "dalton_daily_budget"
 
     cap = await port.capability()
     assert cap is not None
@@ -59,7 +143,9 @@ async def test_local_budget_port_byok_grants_immediately():
 
 
 @pytest.mark.asyncio
-async def test_enforce_local_admission_denies_when_below_floor():
+async def test_enforce_local_admission_denies_when_below_floor_including_byok():
+    """G1.1: `enforce_local_admission` must reject when daily cash budget is exhausted
+    both for `byok=False` and `byok=True` (L24)."""
     fake_summary = {
         "configured": True,
         "retry_after_seconds": 1800,
@@ -72,13 +158,7 @@ async def test_enforce_local_admission_denies_when_below_floor():
             "expired_conservative_usd": Decimal("0.00"),
         },
     }
-    mock_conn = MagicMock()
-    mock_conn.__aenter__ = AsyncMock(return_value=mock_conn)
-    mock_conn.__aexit__ = AsyncMock(return_value=None)
-    mock_tx = MagicMock()
-    mock_tx.__aenter__ = AsyncMock(return_value=None)
-    mock_tx.__aexit__ = AsyncMock(return_value=None)
-    mock_conn.transaction.return_value = mock_tx
+    mock_conn = _make_mock_conn()
 
     with (
         patch("src.dalton.budget.gate.get_db_connection", return_value=mock_conn),
@@ -87,10 +167,357 @@ async def test_enforce_local_admission_denies_when_below_floor():
             new=AsyncMock(return_value=fake_summary),
         ),
     ):
-        with pytest.raises(HTTPException) as exc_info:
-            await enforce_local_admission("local_dev_user", byok=False)
-        assert exc_info.value.status_code == 429
-        assert exc_info.value.detail["type"] == "dalton_daily_budget"
+        for is_byok in (False, True):
+            with pytest.raises(HTTPException) as exc_info:
+                await enforce_local_admission("local_dev_user", byok=is_byok)
+            assert exc_info.value.status_code == 429
+            assert exc_info.value.detail["type"] == "dalton_daily_budget"
+
+
+@pytest.mark.asyncio
+async def test_release_passes_generation_to_db():
+    """G1.4 / R2-7: `release(..., generation=3)` passes `generation` through to `release_reservation`."""
+    port = LocalBudgetPort()
+    mock_conn = _make_mock_conn()
+    mock_release_res = AsyncMock(return_value=1)
+
+    with (
+        patch("src.dalton.budget.port.get_db_connection", return_value=mock_conn),
+        patch("src.dalton.budget.port.release_reservation", new=mock_release_res),
+        patch(
+            "src.dalton.budget.port.reconcile_and_summarize_day",
+            new=AsyncMock(return_value={}),
+        ),
+    ):
+        await port.release("user-1", "run-abc", generation=3)
+        mock_release_res.assert_awaited_once_with(mock_conn, "run-abc", generation=3)
+
+
+@pytest.mark.asyncio
+async def test_dalton_complete_cache_hit_and_budget_rejection():
+    """G1.3 / P0N.7:
+    1. Cached `done` entry replays without calling LLM or charging cash_usd.
+    2. Cash model call when daily budget is exhausted returns `status='budget_exhausted'` without calling LLM.
+    3. `indeterminate` entry does not auto-resend when `resend_indeterminate=False`."""
+    mock_llm = MagicMock()
+    mock_llm.complete = AsyncMock(return_value=({"verdict": "approve"}, {"input_tokens": 100, "output_tokens": 50}))
+
+    # 1. Cache hit (`done`)
+    with patch(
+        "src.dalton.llm.complete.inspect_journal_state",
+        new=AsyncMock(
+            return_value=(
+                "done",
+                {
+                    "invocation_id": "lj1:test",
+                    "model_key": "grok-4.7",
+                    "provider": "xai",
+                    "billing_type": "platform",
+                    "response": {"kind": "json", "data": {"verdict": "approve"}},
+                    "usage": {"input_tokens": 100, "output_tokens": 50},
+                    "cash_usd": Decimal("0.012"),
+                    "notional_usd": Decimal("0"),
+                    "attempt": 1,
+                },
+            )
+        ),
+    ):
+        res = await dalton_complete(
+            mock_llm,
+            user_id="local-dev-user",
+            user_prompt="check this",
+            scope_ref="review:1",
+            purpose="publish_review",
+            model="grok-4.7",
+        )
+        assert res.ok is True
+        assert res.replayed is True
+        assert res.cached is True
+        assert res.cash_usd == 0.0
+        assert res.data == {"verdict": "approve"}
+        mock_llm.complete.assert_not_awaited()
+
+    # 2. Budget rejection when cash cap is exceeded
+    with (
+        patch(
+            "src.dalton.llm.complete.inspect_journal_state",
+            new=AsyncMock(return_value=("proceed", None)),
+        ),
+        patch(
+            "src.dalton.llm.complete._check_cash_budget_admission",
+            new=AsyncMock(return_value=(False, "budget_exhausted", "今日预算 $10.00 已用完")),
+        ),
+    ):
+        res_rejected = await dalton_complete(
+            mock_llm,
+            user_id="local-dev-user",
+            user_prompt="check this",
+            scope_ref="review:2",
+            purpose="publish_review",
+            model="grok-4.7",
+        )
+        assert res_rejected.ok is False
+        assert res_rejected.status == "budget_exhausted"
+        assert "已用完" in (res_rejected.error or "")
+        mock_llm.complete.assert_not_awaited()
+
+        with pytest.raises(BudgetExhaustedError):
+            await dalton_complete(
+                mock_llm,
+                user_id="local-dev-user",
+                user_prompt="check this",
+                scope_ref="review:2",
+                purpose="publish_review",
+                model="grok-4.7",
+                raise_on_error=True,
+            )
+
+    # 3. Indeterminate handling (no auto-resend)
+    with patch(
+        "src.dalton.llm.complete.inspect_journal_state",
+        new=AsyncMock(
+            return_value=(
+                "indeterminate",
+                {
+                    "invocation_id": "lj1:indet",
+                    "attempt": 1,
+                    "error_kind": "timeout",
+                },
+            )
+        ),
+    ):
+        res_indet = await dalton_complete(
+            mock_llm,
+            user_id="local-dev-user",
+            user_prompt="check this",
+            scope_ref="review:3",
+            purpose="publish_review",
+            model="grok-4.7",
+            resend_indeterminate=False,
+        )
+        assert res_indet.ok is False
+        assert res_indet.status == "indeterminate"
+        mock_llm.complete.assert_not_awaited()
+
+        with pytest.raises(JournalIndeterminate):
+            await dalton_complete(
+                mock_llm,
+                user_id="local-dev-user",
+                user_prompt="check this",
+                scope_ref="review:3",
+                purpose="publish_review",
+                model="grok-4.7",
+                resend_indeterminate=False,
+                raise_on_error=True,
+            )
+
+
+@pytest.mark.asyncio
+async def test_assist_json_validation_and_conservative_fallback():
+    """G0 §0.3: `assist_json` validates JSON against schema and returns `ok=False` on any error without raising."""
+    schema = {
+        "type": "object",
+        "properties": {
+            "verdict": {"type": "string", "enum": ["supported", "contradicted", "unrelated"]},
+            "reason": {"type": "string"},
+        },
+        "required": ["verdict", "reason"],
+    }
+
+    # 1. Valid JSON matching schema
+    with patch(
+        "src.dalton.llm.assist.dalton_complete",
+        new=AsyncMock(
+            return_value=MagicMock(
+                ok=True,
+                status="done",
+                data=None,
+                text='```json\n{"verdict": "supported", "reason": "Matches 10-Q table"}\n```',
+                model="gemini-3.8-flash-low-oauth",
+                cash_usd=0.0,
+                cached=True,
+                error=None,
+            )
+        ),
+    ):
+        ok_res = await assist_json(
+            "audit.judge",
+            "Check if figure is supported",
+            {"figure": "512M"},
+            schema,
+        )
+        assert isinstance(ok_res, AssistResult)
+        assert ok_res.ok is True
+        assert ok_res.cached is True
+        assert ok_res.data == {"verdict": "supported", "reason": "Matches 10-Q table"}
+
+    # 2. Schema validation failure -> conservative ok=False (never raises)
+    with patch(
+        "src.dalton.llm.assist.dalton_complete",
+        new=AsyncMock(
+            return_value=MagicMock(
+                ok=True,
+                status="done",
+                data={"verdict": "invalid_enum_val"},
+                text='{"verdict": "invalid_enum_val"}',
+                model="gemini-3.8-flash-low-oauth",
+                cash_usd=0.0,
+                cached=False,
+                error=None,
+            )
+        ),
+    ):
+        bad_schema_res = await assist_json(
+            "audit.judge",
+            "Check if figure is supported",
+            {"figure": "512M"},
+            schema,
+        )
+        assert bad_schema_res.ok is False
+        assert bad_schema_res.data is None
+        assert bad_schema_res.error is not None
+
+    # 3. Timeout / exception -> conservative ok=False (never raises)
+    with patch(
+        "src.dalton.llm.assist.dalton_complete",
+        new=AsyncMock(side_effect=asyncio.TimeoutError("timed out after 60s")),
+    ):
+        timeout_res = await assist_json(
+            "audit.judge",
+            "Check if figure is supported",
+            {"figure": "512M"},
+            schema,
+        )
+        assert timeout_res.ok is False
+        assert timeout_res.data is None
+        assert "TimeoutError" in (timeout_res.error or "")
+
+
+@pytest.mark.asyncio
+async def test_acquire_byok_grants_bounded_chunk_when_budget_available():
+    """G1.1: When daily budget has room, `acquire(..., byok=True)` reserves one chunk ($1.00)
+    rather than granting +1,000,000 credits."""
+    port = LocalBudgetPort()
+    mock_conn = _make_mock_conn()
+
+    mock_cur = MagicMock()
+    mock_cur.__aenter__ = AsyncMock(return_value=mock_cur)
+    mock_cur.__aexit__ = AsyncMock(return_value=None)
+    mock_cur.execute = AsyncMock(return_value=None)
+    mock_cur.fetchone = AsyncMock(
+        side_effect=[
+            {
+                "run_ref": "run-1",
+                "reserved_usd": Decimal("0.50"),
+                "observed_usd": Decimal("0.50"),
+                "usage_usd": Decimal("0.50"),
+                "task_cap_usd": None,
+                "generation": 1,
+            },
+            {"generation": 2},
+        ]
+    )
+    mock_conn.cursor.return_value = mock_cur
+
+    avail_summary = {
+        "configured": True,
+        "retry_after_seconds": 1800,
+        "_raw_rows": [
+            {
+                "run_ref": "run-1",
+                "reserved_usd": Decimal("0.50"),
+                "observed_usd": Decimal("0.50"),
+                "usage_usd": Decimal("0.50"),
+                "charge_usd": Decimal("0.50"),
+                "task_cap_usd": None,
+                "generation": 1,
+            }
+        ],
+        "_decimals": {
+            "cap_usd": Decimal("10.00"),
+            "spent_usd": Decimal("0.50"),
+            "settled_usd": Decimal("0.00"),
+            "unreserved_usage_usd": Decimal("0.00"),
+            "open_reserved_usd": Decimal("0.50"),
+            "expired_conservative_usd": Decimal("0.00"),
+        },
+    }
+
+    with (
+        patch("src.dalton.budget.port.get_db_connection", return_value=mock_conn),
+        patch(
+            "src.dalton.budget.port.reconcile_and_summarize_day",
+            new=AsyncMock(return_value=avail_summary),
+        ),
+        patch(
+            "src.dalton.budget.port.resolve_user_budget_config",
+            new=AsyncMock(
+                return_value={
+                    "user_id": "user-1",
+                    "daily_cap_usd": Decimal("10.00"),
+                    "default_task_cap_usd": None,
+                    "timezone": "Asia/Shanghai",
+                    "configured": True,
+                }
+            ),
+        ),
+    ):
+        verdict = await port.acquire("user-1", "run-1", spent_credits=500.0, byok=True)
+        assert verdict is not None
+        assert verdict.granted is True
+        # floor=$0.50 + chunk=$1.00 -> $1.50 = 1500 credits (never 1_000_500)
+        assert verdict.ceiling_credits == pytest.approx(1500.0)
+        assert verdict.generation == 2
+
+
+def test_d007_migration_and_provider_breakdown():
+    from src.dalton.budget.service import _notional_price_index, compute_provider_breakdown
+    from src.dalton.migrations.versions import d007_llm_call_journal
+
+    assert d007_llm_call_journal.revision == "d007"
+    assert d007_llm_call_journal.down_revision == "d006"
+
+    idx = _notional_price_index()
+    assert "claude-opus-5-5-oauth" in idx
+
+    breakdown = compute_provider_breakdown(
+        token_usage_rows=[
+            {
+                "token_usage": {
+                    "per_call_costs": [
+                        {
+                            "model_name": "grok-4.7",
+                            "billing_type": "byok",
+                            "cost": 0.25,
+                            "input_tokens": 1000,
+                            "output_tokens": 500,
+                        },
+                        {
+                            "model_name": "claude-opus-5-5-oauth",
+                            "billing_type": "oauth",
+                            "cost": 0.10,
+                            "input_tokens": 1000,
+                            "output_tokens": 500,
+                        },
+                    ]
+                }
+            }
+        ],
+        journal_rows=[
+            {
+                "state": "done",
+                "model_key": "deepseek-flash",
+                "provider": "deepseek",
+                "billing_type": "platform",
+                "cash_usd": Decimal("0.02"),
+                "notional_usd": Decimal("0"),
+            }
+        ],
+    )
+    assert breakdown["xai"]["cash_usd"] == pytest.approx(0.25)
+    assert breakdown["claude-oauth"]["cash_usd"] == pytest.approx(0.0)
+    assert breakdown["claude-oauth"]["notional_usd"] == pytest.approx(0.10)
+    assert breakdown["deepseek"]["cash_usd"] == pytest.approx(0.02)
 
 
 def test_build_local_run_gate():
@@ -198,4 +625,3 @@ def test_openclaw_catalog_tiered_pricing_and_discrepancy():
     assert len(in_tiers) == 2
     assert in_tiers[0]["max_tokens"] == 272000
     assert in_tiers[1]["rate"] == 5.0
-

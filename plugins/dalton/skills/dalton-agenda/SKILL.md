@@ -36,7 +36,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 
 ### 第二步：更新研究议程（`agenda_ops`）
 
-读取当前工作空间的 `agenda.md`（或调用 `knowledge_read(target="agenda")`），调用 `agenda_ops` 维护待验证问题队列（`open_questions`）、高频跟踪指标（`watch`）与历史归档（`closed_questions`）：
+读取当前工作空间的 `agenda.md`（或机器真值 `data/agenda.json`），在调用 `knowledge_append_verdict` 的 `agenda_ops`（或 `knowledge_update(doc="agenda", ...)`）中维护待验证问题队列（`open_questions`）、高频跟踪指标（`watch`）与历史归档（`closed_questions`）：
 
 1. **`close_question`**：若本次研究已拿到一手证据回答了某条存量问题，传入 `id` 与 `resolution`（结论摘要 + 证据引用 + 解决日期），将其移入 `closed_questions`。
 2. **`add_question` / `update_question`**：将本次研究新发现的争议点或下一步验证点写入 `open_questions`：
@@ -54,22 +54,21 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 若第二步新增或更新的 `P0` / `P1` 问题具有**明确的未来日历验证时点**（例如：某监管终裁日、竞争对手财报日、管理层承诺的指引更新日、行业数据发布日）：
 
 1. **常设授权（Standing Owner Authorization）**：在公司工作空间内，分析师代理拥有直接写入一次性验证自动化的常设授权，直接调用 `Write` 工具写入 `.agents/user/automations/dalton-<t>-v<YYYYMMDD>-<slug>.json`（其中 `<t>` 为小写 ticker，`<YYYYMMDD>` 为触发日期，`<slug>` 为简短英文标识）。若在 Home 空间由研究总监跨公司调度，则调用 `dalton_schedule_automation`。
-2. **Automation JSON 规范**（严禁写入未知字段如 `max_failures`）：
+2. **Automation JSON 规范**（不要写 `max_failures`；`dalton-*` 自动任务不会因连续失败而停用，系统会按时间自动退避）：
    ```json
    {
-     "name": "dalton-nvda-v20260828-blackwell-ramp",
+     "name": "NVDA FY27Q2 Blackwell 毛利率验证",
      "description": "Verify NVDA Q2 FY27 Blackwell gross margin recovery against 75% bogey",
-     "schedule_type": "once",
-     "next_run_at": "2026-08-28T13:00:00Z",
+     "status": "active",
+     "trigger_type": "once",
+     "next_run_at": "2026-08-28T08:00:00-04:00",
      "timezone": "America/New_York",
-     "agent_mode": " analyst ",
-     "workspace_name": "NVDA",
-     "instruction": "Run verification for agenda question q_blackwell_gm: check Q2 10-Q/release for gross margin and update thesis/agenda via dalton-agenda.",
-     "delivery": { "methods": ["feishu"] },
-     "enabled": true
+     "instruction": "执行议程问题 q_blackwell_gm 验证：核查 Q2 10-Q / 业绩公告中的 Blackwell 毛利率是否达到 75% 门槛，并按 .agents/skills/dalton-agenda/SKILL.md 收尾三步更新 thesis 与 agenda。",
+     "workspace_id": "<WORKSPACE_ID>",
+     "thread": "new"
    }
    ```
-   *(注：`agent_mode` 填 `"ptc"` 或与模板一致的合法模式，参照 `docs/dalton/dev-guide/automation-templates/`)*。
+   *(注：字段须与 `docs/dalton/dev-guide/automation-templates/` 模板保持一致，只使用平台支持的合法字段)*。
 
 ---
 

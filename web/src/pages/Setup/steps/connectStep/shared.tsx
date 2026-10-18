@@ -100,6 +100,7 @@ export function ProcessStep({ number, title, description }: { number: number; ti
 export function DisclaimerBox({ provider }: { provider: string }) {
   const { t } = useTranslation();
   const isClaude = provider === 'claude-oauth';
+  // DALTON-HOOK(native-oauth-ui): P0N.3 Antigravity disclaimer copy
   const isAntigravity = provider === 'antigravity-oauth';
   return (
     <div

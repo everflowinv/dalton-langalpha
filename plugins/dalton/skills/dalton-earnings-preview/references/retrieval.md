@@ -9,7 +9,7 @@
 ### 1. 证据笔记必留字段
 
 边查边把已采用的原文短摘和上下文写入 `research/<D>-preview-<季度>/evidence-notes.md`。每条证据记录必须保留以下 12 项字段：
-1. **来源路由（`route`）**：`alphaengine` / `sales-notes` / `tmtb` / `funda-ai` / `estimates` / `sec` / `x_search`
+1. **来源路由（`route`）**：`alphaengine` / `sales-notes` / `tmtb` / `funda-ai` / `estimates` / `sec`（及公开社媒 `x_api.search_posts`）
 2. **原始 ID / URL**：如 `doc_id`、`mail:<ID>`、`tmtb:<ID>`、`funda:<ID>`、SEC accession 或原帖 URL
 3. **文件标题**
 4. **作者与真实身份**：区分买方原话、机构 sales 转述买方、机构 sales 个人观点、卖方分析师、独立研究作者（FUNDA AI / TMTB）、公司管理层
@@ -147,7 +147,7 @@ researchdata.finance(route="estimates", ticker="<TICKER>")
 ## 五、一轮公开 X 检索：找 Narrative 共性，不做情绪投票
 
 1. **调用方式与时间窗**：
-   - 使用公开 X 检索工具（如 `x_search` 或 `alternative_data.x_api`），设置 `from_date`（近 90 天起点）与 `to_date`（严格等于 `as-of` 冻结日期），按需开启图片理解。
+   - 使用公开 X 检索工具（`x_api.search_posts`），设置 `from_date`（近 90 天起点）与 `to_date`（严格等于 `as-of` 冻结日期），按需开启图片理解。
    - **历史回测防泄漏**：必须逐条复核帖子实际发布时间戳，严格剔除 `as-of` 之后发布的帖子。
 2. **保密与合规边界**：
    - 公开 X 查询词只允许包含公开公司名、ticker、行业术语与公开业务问题；**严禁将内部 sales 邮件原文、私有 buyside bogey 数字或未公开研报段落放入公共搜索框**。

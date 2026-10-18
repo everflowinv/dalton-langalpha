@@ -11,6 +11,18 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 BACKOFF_SCHEDULE_MINUTES: tuple[int, ...] = (2, 10, 30, 120)
+MIN_FAILURE_BACKOFF_SECONDS: int = 3600
+MAX_FAILURE_BACKOFF_SECONDS: int = 604800  # 7 days
+
+
+def compute_failure_backoff_seconds(failure_count: int) -> int:
+    """Compute time-based exponential backoff in seconds for automation execution failures (1h -> 7d cap).
+
+    Never disables the automation; only delays ``next_run_at``.
+    """
+    exp = max(0, int(failure_count) - 1)
+    wait_sec = MIN_FAILURE_BACKOFF_SECONDS * (2 ** min(exp, 10))
+    return max(MIN_FAILURE_BACKOFF_SECONDS, min(MAX_FAILURE_BACKOFF_SECONDS, wait_sec))
 
 
 def next_backoff_minutes(attempt: int) -> int:

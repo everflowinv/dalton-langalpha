@@ -1,22 +1,10 @@
 """
-Antigravity OAuth service — loopback authorization-code + PKCE flow, token
-exchange, refresh with Redis lock.
-
-Connects Google Antigravity subscription models via users' existing Antigravity
-/ Google One AI plans, speaking the same endpoints the official `agy` CLI
-uses (protocol details reverse-engineered from the CLI 1.4.2 binary and
-verified against live traffic):
-
-- Client ID/secret: the `agy` installed-app client (Google "installed" clients
-  embed a non-secret client secret; it is not treated as confidential).
-- This client is NOT registered for the device-code flow (`invalid_client`),
-  so login uses the browser authorization-code flow with an RFC 8252 loopback
-  redirect: Google redirects to http://localhost:<port>/callback served by
-  this process. This requires the browser and the LangAlpha server to share
-  a machine (the normal self-hosted deployment).
-- Model calls: POST {server}/v1internal:streamGenerateContent — see
-  src/llms/extension/antigravity.py.
+Antigravity OAuth service — loopback authorization-code + PKCE flow (plus
+manual callback paste fallback for Docker deployments), token exchange, and
+refresh with Redis lock.
 """
+
+from __future__ import annotations
 
 import asyncio
 import base64
@@ -25,7 +13,7 @@ import json
 import logging
 import secrets
 from datetime import datetime, timedelta, timezone
-from urllib.parse import parse_qs, urlencode
+from urllib.parse import parse_qs, urlencode, urlparse
 
 import httpx
 
@@ -52,8 +40,6 @@ ANTIGRAVITY_CLIENT_SECRET = "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"
 ANTIGRAVITY_AUTHORIZE_URL = "https://accounts.google.com/o/oauth2/auth"
 ANTIGRAVITY_TOKEN_URL = "https://oauth2.googleapis.com/token"
 
-# Scope set observed on a live `agy`-issued refresh token. `aicode` is the
-# Code Assist/Antigravity scope the model endpoint authorizes on.
 ANTIGRAVITY_SCOPES = " ".join(
     [
         "https://www.googleapis.com/auth/aicode",
@@ -69,7 +55,18 @@ ANTIGRAVITY_SCOPES = " ".join(
 _CALLBACK_TIMEOUT_S = 600  # listener lives 10 minutes, matching Redis TTL
 
 
-# --- PKCE + authorize URL ---
+def _record_provider_event_safe(user_id: str | None, kind: str, detail: dict) -> None:
+    try:
+        from src.dalton.database.provider_events import record_provider_event
+
+        record_provider_event(
+            provider=ANTIGRAVITY_PROVIDER,
+            kind=kind,
+            user_id=user_id,
+            detail=detail,
+        )
+    except Exception:
+        pass
 
 
 def _generate_pkce_pair() -> tuple[str, str]:
@@ -95,9 +92,6 @@ def build_authorize_url(redirect_uri: str, state: str, challenge: str) -> str:
     return f"{ANTIGRAVITY_AUTHORIZE_URL}?{urlencode(params)}"
 
 
-# --- JWT claims (Google id_token) ---
-
-
 def parse_id_token_claims(id_token: str) -> dict:
     """Decode a Google id_token payload without verification (we trust the
     token endpoint, same trust model as the codex provider)."""
@@ -120,15 +114,8 @@ def parse_id_token_claims(id_token: str) -> dict:
     }
 
 
-# --- Token exchange / refresh ---
-
-
 async def exchange_code(code: str, code_verifier: str, redirect_uri: str) -> dict:
-    """Exchange the loopback authorization code for tokens.
-
-    Returns:
-        {access_token, refresh_token, id_token, expires_in}
-    """
+    """Exchange the loopback authorization code for tokens."""
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.post(
             ANTIGRAVITY_TOKEN_URL,
@@ -144,7 +131,7 @@ async def exchange_code(code: str, code_verifier: str, redirect_uri: str) -> dic
         )
         if resp.status_code >= 400:
             logger.error(
-                f"[antigravity_oauth] Token exchange failed: status={resp.status_code} body={resp.text[:300]}"
+                f"[antigravity_oauth] Token exchange failed: status={resp.status_code}"
             )
         resp.raise_for_status()
         data = resp.json()
@@ -157,14 +144,7 @@ async def exchange_code(code: str, code_verifier: str, redirect_uri: str) -> dic
 
 
 async def refresh_tokens(refresh_token: str) -> dict:
-    """Use the refresh token to get a new access token.
-
-    Google does not rotate refresh tokens; the response may omit
-    refresh_token, in which case the caller keeps the existing one.
-
-    Returns:
-        {access_token, refresh_token, id_token, expires_in}
-    """
+    """Use the refresh token to get a new access token."""
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.post(
             ANTIGRAVITY_TOKEN_URL,
@@ -186,21 +166,38 @@ async def refresh_tokens(refresh_token: str) -> dict:
         }
 
 
-# --- Loopback login flow ---
+async def _finalize_token_save(user_id: str, tokens: dict) -> dict:
+    claims = parse_id_token_claims(tokens.get("id_token", ""))
+    await upsert_oauth_tokens(
+        user_id=user_id,
+        provider=ANTIGRAVITY_PROVIDER,
+        access_token=tokens["access_token"],
+        refresh_token=tokens["refresh_token"],
+        account_id=claims.get("sub") or "",
+        email=claims.get("email"),
+        plan_type="antigravity",
+        expires_at=datetime.now(timezone.utc)
+        + timedelta(seconds=tokens.get("expires_in", 3600)),
+    )
+    try:
+        await invalidate_oauth_active_cache(user_id)
+    except Exception:
+        pass
+
+    from src.utils.cache.redis_cache import get_cache_client
+
+    cache = get_cache_client()
+    if cache.enabled and cache.client:
+        await cache.client.set(f"oauth:antigravity:done:{user_id}", "1", ex=600)
+        await cache.client.delete(f"oauth:antigravity:{user_id}")
+    return claims
 
 
 async def start_login(user_id: str) -> dict:
-    """Begin a login: PKCE pair + one-shot loopback callback listener.
-
-    The listener serves Google's redirect on 127.0.0.1:<ephemeral port>,
-    completes the token exchange itself, and shuts down. The frontend polls
-    ``check_login_complete`` until it flips.
-
-    Returns:
-        {authorize_url, port}
-    """
+    """Begin a login: PKCE pair + one-shot loopback callback listener."""
     verifier, challenge = _generate_pkce_pair()
     state = secrets.token_urlsafe(24)
+    initiated_at = datetime.now(timezone.utc).isoformat()
 
     server_future = asyncio.get_running_loop().create_future()
 
@@ -234,15 +231,100 @@ async def start_login(user_id: str) -> dict:
 
     cache = get_cache_client()
     if cache.enabled and cache.client:
+        # R6-9: clear any stale completion flag before starting a new flow
+        await cache.client.delete(f"oauth:antigravity:done:{user_id}")
         await cache.client.set(
             f"oauth:antigravity:{user_id}",
-            json.dumps({"verifier": verifier, "state": state, "port": port}),
+            json.dumps(
+                {
+                    "verifier": verifier,
+                    "state": state,
+                    "port": port,
+                    "redirect_uri": redirect_uri,
+                    "initiated_at": initiated_at,
+                }
+            ),
             ex=_CALLBACK_TIMEOUT_S,
         )
 
     return {
         "authorize_url": build_authorize_url(redirect_uri, state, challenge),
         "port": port,
+    }
+
+
+def parse_callback_input(raw_input: str) -> tuple[str, str, str | None]:
+    """Parse pasted callback URL or query string into (code, state, redirect_uri).
+
+    Supports:
+    - Full callback URL: http://localhost:54321/callback?code=...&state=...
+    - Query string: code=...&state=...
+    - Code#state: code#state
+    """
+    text = (raw_input or "").strip()
+    if not text:
+        raise ValueError("Callback input is empty.")
+
+    redirect_uri: str | None = None
+    if text.startswith("http://") or text.startswith("https://"):
+        parsed = urlparse(text)
+        qs = parse_qs(parsed.query)
+        if parsed.scheme and parsed.netloc:
+            redirect_uri = f"{parsed.scheme}://{parsed.netloc}{parsed.path or '/callback'}"
+    elif "?" in text or "&" in text or "code=" in text:
+        qpart = text.split("?", 1)[1] if "?" in text else text
+        qs = parse_qs(qpart)
+    elif "#" in text:
+        code_part, state_part = text.split("#", 1)
+        return code_part.strip(), state_part.strip(), None
+    else:
+        raise ValueError("Expected full callback URL (http://localhost:<port>/callback?code=...&state=...).")
+
+    if "error" in qs:
+        err_desc = qs.get("error_description", qs.get("error", ["unknown"]))[0]
+        raise ValueError(f"Authorization failed: {err_desc}")
+    code = (qs.get("code") or [""])[0].strip()
+    state = (qs.get("state") or [""])[0].strip()
+    if not code:
+        raise ValueError("Callback URL does not contain an authorization 'code' parameter.")
+    if not state:
+        raise ValueError("Callback URL does not contain a 'state' parameter.")
+    return code, state, redirect_uri
+
+
+async def submit_callback_url(user_id: str, callback_input: str) -> dict:
+    """Complete Antigravity OAuth from a manually pasted callback URL (R6-5 Docker fallback)."""
+    from src.utils.cache.redis_cache import get_cache_client
+
+    cache = get_cache_client()
+    if not cache.enabled or not cache.client:
+        raise RuntimeError("Cache unavailable for OAuth callback verification.")
+
+    raw = await cache.client.get(f"oauth:antigravity:{user_id}")
+    if not raw:
+        raise ValueError("No pending Antigravity authorization. Please initiate login again.")
+    if isinstance(raw, bytes):
+        raw = raw.decode()
+    pending = json.loads(raw)
+
+    code, returned_state, parsed_redirect = parse_callback_input(callback_input)
+    expected_state = pending.get("state") or ""
+    # R6-7: require non-empty matching state
+    if not returned_state or returned_state != expected_state:
+        raise ValueError("State mismatch — possible CSRF or stale login tab. Please initiate again.")
+
+    redirect_uri = (
+        pending.get("redirect_uri")
+        or parsed_redirect
+        or f"http://localhost:{pending.get('port')}/callback"
+    )
+    tokens = await exchange_code(code, pending["verifier"], redirect_uri)
+    claims = await _finalize_token_save(user_id, tokens)
+    logger.info(f"[antigravity_oauth] Connected via callback paste for user_id={user_id}")
+    return {
+        "success": True,
+        "email": claims.get("email"),
+        "plan_type": "antigravity",
     }
 
 
@@ -255,7 +337,6 @@ async def _handle_google_callback(
     server_future: "asyncio.Future[asyncio.AbstractServer]",
 ) -> None:
     """Parse one loopback HTTP request from Google, finish the login, respond."""
-
     reasons = {200: "OK", 400: "Bad Request", 404: "Not Found", 500: "Internal Server Error"}
 
     def respond(status: int, title: str, detail: str) -> None:
@@ -296,35 +377,14 @@ async def _handle_google_callback(
 
         code = qs["code"][0]
         returned_state = qs.get("state", [""])[0]
-        if returned_state and returned_state != state:
+        # R6-7: require non-empty state matching expected state
+        if not returned_state or returned_state != state:
             respond(400, "State mismatch", "Please restart the connection from LangAlpha.")
             return
 
         port = writer.get_extra_info("sockname")[1]
         tokens = await exchange_code(code, verifier, f"http://localhost:{port}/callback")
-        claims = parse_id_token_claims(tokens.get("id_token", ""))
-
-        await upsert_oauth_tokens(
-            user_id=user_id,
-            provider=ANTIGRAVITY_PROVIDER,
-            access_token=tokens["access_token"],
-            refresh_token=tokens["refresh_token"],
-            account_id=claims.get("sub") or "",
-            email=claims.get("email"),
-            plan_type="antigravity",
-            expires_at=datetime.now(timezone.utc)
-            + timedelta(seconds=tokens.get("expires_in", 3600)),
-        )
-        try:
-            await invalidate_oauth_active_cache(user_id)
-        except Exception:
-            pass
-
-        from src.utils.cache.redis_cache import get_cache_client
-
-        cache = get_cache_client()
-        if cache.enabled and cache.client:
-            await cache.client.set(f"oauth:antigravity:done:{user_id}", "1", ex=600)
+        claims = await _finalize_token_save(user_id, tokens)
 
         respond(
             200,
@@ -333,13 +393,12 @@ async def _handle_google_callback(
         )
         logger.info(f"[antigravity_oauth] Connected for user_id={user_id}")
 
-        # Login complete — retire the listener.
         if server_future.done():
             server = server_future.result()
             server.close()
             await server.wait_closed()
     except Exception as e:
-        logger.error(f"[antigravity_oauth] Callback handling failed: {e}")
+        logger.error(f"[antigravity_oauth] Callback handling failed: {type(e).__name__}")
         try:
             respond(500, "Connection failed", "Please try again from LangAlpha.")
         except Exception:
@@ -347,27 +406,19 @@ async def _handle_google_callback(
 
 
 async def check_login_complete(user_id: str) -> bool:
-    """Whether the loopback callback finished a successful login."""
+    """Whether the loopback callback or manual paste finished a successful login."""
     from src.utils.cache.redis_cache import get_cache_client
 
     cache = get_cache_client()
     if cache.enabled and cache.client:
         return bool(await cache.client.get(f"oauth:antigravity:done:{user_id}"))
-    # Redis unavailable: fall back to a DB lookup (decrypts, slower but rare).
+    # Redis unavailable: fall back to a DB lookup.
     tokens = await get_oauth_tokens(user_id, ANTIGRAVITY_PROVIDER)
     return bool(tokens and tokens.get("access_token"))
 
 
-# --- Orchestrator with refresh-lock (mirrors codex/claude) ---
-
-
 async def get_valid_token(user_id: str) -> dict | None:
-    """
-    Get a valid access token, refreshing if needed.
-
-    Uses Redis SETNX lock to prevent concurrent refresh.
-    Returns None if user hasn't connected.
-    """
+    """Get a valid access token, refreshing if needed."""
     tokens = await get_oauth_tokens(user_id, ANTIGRAVITY_PROVIDER)
     if not tokens:
         return None
@@ -381,8 +432,6 @@ async def get_valid_token(user_id: str) -> dict | None:
 
     cache = get_cache_client()
     lock_key = f"oauth:refresh:{user_id}:{ANTIGRAVITY_PROVIDER}"
-    # Released only by its owner, so a refresh that outlives the lock cannot
-    # free the next holder's. None (Redis unavailable) refreshes uncoordinated.
     lock_token = secrets.token_hex(16)
     acquired = await cache.acquire_lock(lock_key, lock_token, REFRESH_LOCK_TTL_MS)
     if acquired is False:
@@ -412,10 +461,20 @@ async def get_valid_token(user_id: str) -> dict | None:
         except Exception:
             pass
 
+        _record_provider_event_safe(
+            user_id,
+            "refresh_ok",
+            {"expires_in": int(new.get("expires_in", 3600))},
+        )
         logger.debug(f"[antigravity_oauth] Refreshed tokens for user_id={user_id}")
         return {"access_token": new["access_token"], "plan_type": tokens.get("plan_type")}
     except Exception as e:
-        logger.error(f"[antigravity_oauth] Token refresh failed for user_id={user_id}: {e}")
+        _record_provider_event_safe(
+            user_id,
+            "refresh_fail",
+            {"error_type": type(e).__name__, "message": str(e)[:160]},
+        )
+        logger.error(f"[antigravity_oauth] Token refresh failed for user_id={user_id}: {type(e).__name__}")
         return None
     finally:
         if acquired:

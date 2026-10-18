@@ -571,6 +571,10 @@ class LLM:
         derives session-affinity headers from it — while regular OpenAI applies
         it only when the provider opts in via providers.json.
         """
+        # DALTON-HOOK(provider-kill-switch): refuse providers disabled in Dalton config (L17)
+        from src.dalton.llm.providers import ensure_provider_enabled
+        ensure_provider_enabled(self.provider)
+
         effective_cache_key: str | None = None
         if cache_key and (
             self.sdk == "codex"
@@ -582,8 +586,6 @@ class LLM:
             client = self._get_openai_llm(cache_key=effective_cache_key)
         elif self.sdk == "codex":
             client = self._get_codex_llm(cache_key=effective_cache_key)
-        elif self.sdk == "muse":
-            client = self._get_muse_llm(cache_key=effective_cache_key)
         elif self.sdk == "dashscope":
             client = self._get_dashscope_llm(cache_key=effective_cache_key)
         elif self.sdk == "deepseek":
@@ -594,12 +596,14 @@ class LLM:
             client = self._get_qwq_llm()
         elif self.sdk == "anthropic":
             client = self._get_anthropic_llm()
-        elif self.sdk == "antigravity":
-            client = self._get_antigravity_llm()
         elif self.sdk == "gemini":
             client = self._get_gemini_llm()
         else:
-            raise ValueError(f"Unsupported SDK: {self.sdk} for provider {self.provider}")
+            # DALTON-HOOK(llm-sdk-dispatch): Dalton-owned native SDKs (antigravity, muse)
+            from src.dalton.llm.providers import build_dalton_client
+            client = build_dalton_client(self, cache_key=cache_key)
+            if client is None:
+                raise ValueError(f"Unsupported SDK: {self.sdk} for provider {self.provider}")
 
         # The entry's declarations win over the SDK's table, which most models
         # are missing from, so the two can't drift; capability flags the entry
@@ -821,58 +825,6 @@ class LLM:
 
         return ChatCodexOpenAI(**params)
 
-    def _get_muse_llm(self, cache_key: str | None = None):
-        """Get Muse Code (Meta subscription) LLM.
-
-        api.meta.ai/v1 speaks the OpenAI Responses API, so this rides the same
-        ChatCodexOpenAI machinery (system→instructions promotion, store=false
-        handling, Responses stream guards) with the Muse client headers the
-        gateway expects. Contributor models (cheaper tier; content may be used
-        for training per the catalog) are flagged via x-tbh-contributor-mode.
-        """
-        from src.llms.extension import ChatCodexOpenAI
-
-        params = {
-            "model": self.model,
-            "api_key": self._resolve_api_key(),
-            "streaming": True,
-            "stream_usage": True,
-            "max_retries": 5,
-            "timeout": 600.0,
-            "stream_chunk_timeout": STREAM_CHUNK_TIMEOUT_S,
-        }
-        params.update(self._resolve_base_url("base_url"))
-
-        if self.use_response_api:
-            params["output_version"] = "responses/v1"
-
-        params.update(self.parameters)
-
-        params["default_headers"] = _merged_default_headers(
-            params,
-            {
-                "User-Agent": "muse-build/1.4.10 (non-interactive; macos-aarch64; build 98c762468d5746a17e31a05cc923592d4e6124d3)",
-                "x-client-id": "tbh:exec",
-                "x-tbh-agent-role": "main",
-                "x-tbh-contributor-mode": "1" if "-contributor" in self.model else "0",
-            },
-            self.default_headers,
-        )
-
-        # Session affinity: the gateway tracks conversations by these headers;
-        # derive a stable UUID per cache key (conversation) like the codex path.
-        if cache_key:
-            session_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"muse-session:{cache_key}"))
-            present = {k.lower() for k in params["default_headers"]}
-            for header in ("x-tbh-session-id", "x-meta-ai-gateway-session-id"):
-                if header not in present:
-                    params["default_headers"][header] = session_id
-
-        if self.extra_body:
-            params["extra_body"] = self.extra_body
-
-        return ChatCodexOpenAI(**params)
-
     def _get_deepseek_llm(self):
         """Get DeepSeek or DeepSeek-compatible LLM."""
         params = {
@@ -977,29 +929,6 @@ class LLM:
         if is_oauth:
             return ChatAnthropicOAuth(**params)
         return ChatAnthropic(**params)
-
-    def _get_antigravity_llm(self):
-        """Get Google Antigravity subscription LLM (v1internal native client).
-
-        The OAuth access token arrives via ``api_key`` (resolve_oauth_llm_client
-        passes the bearer token there) and the class itself owns the envelope
-        protocol — endpoint path, user-agent gating, request shape.
-        """
-        from src.llms.extension import ChatAntigravity
-
-        params = {
-            "model": self.model,
-            "api_key": self._resolve_api_key(),
-        }
-        params.update(self._resolve_base_url("base_url"))
-
-        if self.default_headers:
-            params["default_headers"] = dict(self.default_headers)
-
-        # models.json parameters (thinking_level, temperature, max_output_tokens...)
-        params.update(self.parameters)
-
-        return ChatAntigravity(**params)
 
     def _get_gemini_llm(self):
         """Get Gemini LLM."""

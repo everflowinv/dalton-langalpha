@@ -12,7 +12,13 @@ from typing import Any
 from src.dalton.database import knowledge as db_knowledge
 from src.dalton.database import verdicts as db_verdicts
 from src.dalton.database.knowledge import VersionConflict
-from src.dalton.knowledge.ops import OpError, apply_ops, diff_documents
+from src.dalton.knowledge.ops import (
+    OpError,
+    _ensure_nested_ids_and_defaults,
+    apply_ops,
+    diff_documents,
+    repair_knowledge_ops,
+)
 from src.dalton.knowledge.paths import (
     AGENT_MD,
     DOC_KEYS,
@@ -28,11 +34,27 @@ from src.dalton.knowledge.render import (
     render_verdicts_md,
     update_agent_md_block,
 )
-from src.dalton.knowledge.validate import validate_update, validate_verdict
+from src.dalton.knowledge.validate import (
+    _load_schemas_and_registry,
+    validate_update,
+    validate_verdict,
+)
+from src.dalton.llm.assist import assist_json
 
 logger = logging.getLogger(__name__)
 
 MAX_AGENT_MD_WARN_CHARS = int(32768 * 0.85)
+
+_REPAIR_FIELD_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "mappings": {
+            "type": "object",
+            "additionalProperties": {"type": "string"},
+        }
+    },
+    "required": ["mappings"],
+}
 
 
 def canonical_json(doc: dict[str, Any]) -> tuple[str, str]:
@@ -59,6 +81,73 @@ def _normalize_legacy_aliases(doc_key: str, doc: dict[str, Any]) -> None:
                     if sheet and cell and "!" not in str(cell):
                         mref["cell"] = f"{sheet}!{cell}"
                 mref.setdefault("kind", "model_cell")
+
+
+def _resolve_container_at_path(doc: dict[str, Any], path: str) -> Any:
+    curr: Any = doc
+    for seg in [s for s in path.split("/") if s]:
+        if isinstance(curr, dict) and seg in curr:
+            curr = curr[seg]
+        elif isinstance(curr, list) and seg.isdigit() and 0 <= int(seg) < len(curr):
+            curr = curr[int(seg)]
+        else:
+            return None
+    return curr
+
+
+async def _repair_doc_schema_with_assist(
+    doc_key: str,
+    doc: dict[str, Any],
+    errors: list[dict[str, Any]],
+    *,
+    user_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """Use assist_json(task='knowledge.repair_field', ...) to map unknown/synonym fields to valid schema fields."""
+    warnings: list[dict[str, Any]] = []
+    if not errors:
+        return warnings
+
+    schemas, _ = _load_schemas_and_registry()
+    schema_obj = schemas.get(doc_key, {})
+
+    res = await assist_json(
+        task="knowledge.repair_field",
+        instructions=(
+            "将 JSON 文档中因拼写或同义词偏差未通过 schema 校验的字段名映射为对应 schema 中的合法字段名。"
+            "返回 {\"mappings\": {\"原字段名\": \"合法字段名\"}}。"
+        ),
+        payload={
+            "doc_key": doc_key,
+            "errors": errors,
+            "schema_properties": list((schema_obj.get("properties") or {}).keys()),
+        },
+        schema=_REPAIR_FIELD_SCHEMA,
+        user_id=user_id,
+    )
+    mappings: dict[str, str] = {}
+    if res.ok and isinstance(res.data, dict) and isinstance(res.data.get("mappings"), dict):
+        mappings = {
+            str(k): str(v)
+            for k, v in res.data["mappings"].items()
+            if k and v and str(v) != "official"
+        }
+
+    for err in errors:
+        err_path = str(err.get("path") or "/")
+        target_obj = _resolve_container_at_path(doc, err_path)
+        if not isinstance(target_obj, dict):
+            continue
+        for bad_k, good_k in list(mappings.items()):
+            if bad_k in target_obj and good_k not in target_obj:
+                target_obj[good_k] = target_obj.pop(bad_k)
+                warnings.append(
+                    {
+                        "code": "field_repaired",
+                        "path": f"{err_path.rstrip('/')}/{bad_k}",
+                        "message": f"repaired field {bad_k!r} -> {good_k!r} via knowledge.repair_field",
+                    }
+                )
+    return warnings
 
 
 async def _populate_model_sha256(doc: dict[str, Any], backend: Any) -> None:
@@ -245,11 +334,25 @@ async def apply_update(
     # Step 2: Check base_version for tool / import paths
     latest_no = latest["version_no"] if latest else None
     if source == "tool" and base_version != latest_no:
+        base_v_row = None
+        if base_version is not None and hasattr(db_knowledge, "get_version"):
+            try:
+                base_v_row = await db_knowledge.get_version(
+                    workspace_id, doc_key, base_version
+                )
+            except Exception:
+                base_v_row = None
+        base_v_content = (
+            base_v_row.get("content") if isinstance(base_v_row, dict) else None
+        )
+        latest_content = latest.get("content") if latest else None
         return {
             "ok": False,
             "error": "version_conflict",
             "latest_version": latest_no,
             "latest_reason": latest.get("reason") if latest else None,
+            "latest_doc": latest_content,
+            "diff": diff_documents(base_v_content, latest_content),
             "message": (
                 f"version_conflict on {doc_key}: passed base_version={base_version}, "
                 f"but latest version in DB is v{latest_no}. Re-read data/{doc_key}.json and retry."
@@ -269,14 +372,22 @@ async def apply_update(
         else None
     )
 
+    repaired_ops, repair_warnings = repair_knowledge_ops(doc_key, base_doc, ops)
+    ev_ids = [
+        str(r.get("evidence_id") or r.get("id"))
+        for r in (evidence_refs or [])
+        if isinstance(r, dict) and (r.get("evidence_id") or r.get("id"))
+    ]
+
     # Step 3: Apply ops -> server fields -> validate schema & 3 hard invariants
     try:
         new_doc, op_summaries = apply_ops(
             doc_key,
             base_doc,
-            ops,
+            repaired_ops,
             reason=reason,
             now=now,
+            evidence_ids=ev_ids or None,
         )
     except OpError as e:
         return {
@@ -310,6 +421,38 @@ async def apply_update(
         models_doc=models_doc,
         reason=reason,
     )
+    has_hard_invariant_error = any(
+        err.get("code") in ("append_only_violation", "official_is_publish_only", "target_needs_model_cell")
+        for err in val.errors
+    )
+    if not val.ok and not has_hard_invariant_error:
+        assist_warnings = await _repair_doc_schema_with_assist(
+            doc_key,
+            new_doc,
+            val.errors,
+            user_id=user_id,
+        )
+        if assist_warnings:
+            repair_warnings.extend(assist_warnings)
+            _ensure_nested_ids_and_defaults(
+                doc_key,
+                new_doc,
+                now=now,
+                old_doc=valid_base_doc,
+                evidence_ids=ev_ids or None,
+            )
+            val = validate_update(
+                doc_key,
+                valid_base_doc,
+                new_doc,
+                source=source,
+                models_doc=models_doc,
+                reason=reason,
+            )
+
+    if repair_warnings:
+        val.warnings = [*repair_warnings, *val.warnings]
+
     if not val.ok:
         return {
             "ok": False,
@@ -329,7 +472,7 @@ async def apply_update(
             base_version_no=base_version,
             content=new_doc,
             content_sha256=content_sha,
-            ops=ops,
+            ops=repaired_ops,
             reason=reason,
             evidence_refs=evidence_refs or [],
             source=source,
@@ -342,10 +485,13 @@ async def apply_update(
         )
     except VersionConflict as vc:
         curr_no = vc.latest["version_no"] if vc.latest else None
+        curr_doc = vc.latest.get("content") if vc.latest else None
         return {
             "ok": False,
             "error": "version_conflict",
             "latest_version": curr_no,
+            "latest_doc": curr_doc,
+            "diff": diff_documents(base_doc, curr_doc),
             "message": (
                 f"version_conflict on {doc_key}: passed base_version={base_version}, "
                 f"but latest version in DB is v{curr_no}. Re-read data/{doc_key}.json and retry."

@@ -71,11 +71,12 @@ _THOUGHT_SIGNATURES_KEY = "antigravity_thought_signatures"
 
 
 class AntigravityApiError(RuntimeError):
-    """Upstream Antigravity call failed. ``status`` carries the HTTP code."""
+    """Upstream Antigravity call failed. ``status`` and ``status_code`` carry the HTTP code."""
 
     def __init__(self, message: str, status: int | None = None, body: str | None = None):
         super().__init__(message)
         self.status = status
+        self.status_code = status
         self.body = body
 
 
@@ -147,6 +148,9 @@ def _messages_to_gemini(messages: Sequence[BaseMessage]) -> tuple[dict | None, l
     """
     system_parts: list[dict] = []
     contents: list[dict] = []
+    # R6-3: map tool_call_id -> tool name from preceding AIMessages so
+    # ToolMessages without an explicit .name still send the declared function name.
+    tool_call_names: dict[str, str] = {}
 
     for message in messages:
         if isinstance(message, SystemMessage):
@@ -175,13 +179,19 @@ def _messages_to_gemini(messages: Sequence[BaseMessage]) -> tuple[dict | None, l
                 }
             if not isinstance(result, dict):
                 result = {"result": result}
+            resolved_name = (
+                message.name
+                or tool_call_names.get(message.tool_call_id or "")
+                or message.tool_call_id
+                or "tool"
+            )
             contents.append(
                 {
                     "role": "user",  # tool results ride the user turn in Gemini
                     "parts": [
                         {
                             "functionResponse": {
-                                "name": message.name or message.tool_call_id or "tool",
+                                "name": resolved_name,
                                 "response": result,
                             }
                         }
@@ -193,6 +203,9 @@ def _messages_to_gemini(messages: Sequence[BaseMessage]) -> tuple[dict | None, l
         role = "model" if isinstance(message, AIMessage) else "user"
         parts: list[dict] = []
         for block in _content_blocks(message):
+            if isinstance(block, dict) and block.get("type") == "tool_use":
+                if block.get("id") and block.get("name"):
+                    tool_call_names[str(block["id"])] = str(block["name"])
             part = _part_from_block(block)
             if part:
                 parts.append(part)
@@ -202,12 +215,16 @@ def _messages_to_gemini(messages: Sequence[BaseMessage]) -> tuple[dict | None, l
             # signatures in order onto the calls, leftovers as standalone.
             signatures = list((message.additional_kwargs or {}).get(_THOUGHT_SIGNATURES_KEY, []))
             for call in message.tool_calls or []:
-                part: dict = {
-                    "functionCall": {"name": call["name"], "args": call.get("args", {})}
+                call_id = call.get("id")
+                call_name = call.get("name", "")
+                if call_id and call_name:
+                    tool_call_names[str(call_id)] = str(call_name)
+                part_fc: dict = {
+                    "functionCall": {"name": call_name, "args": call.get("args", {})}
                 }
                 if signatures:
-                    part["thoughtSignature"] = signatures.pop(0)
-                parts.append(part)
+                    part_fc["thoughtSignature"] = signatures.pop(0)
+                parts.append(part_fc)
             for signature in signatures:
                 parts.append({"thoughtSignature": signature})
         if parts:
@@ -256,7 +273,7 @@ class ChatAntigravity(BaseChatModel):
     tools: list[dict] = []  # bound Gemini functionDeclarations
 
     # Thought signatures observed in the current response, replayed on the
-    # next turn of this conversation (per-request, hence private instance).
+    # next turn of this conversation (cleared at the start of every call).
     _signatures: list[str] = PrivateAttr(default_factory=list)
 
     @property
@@ -347,6 +364,7 @@ class ChatAntigravity(BaseChatModel):
     @staticmethod
     def _error_from_status(status: int, body: str) -> AntigravityApiError:
         detail = ""
+        effective_status = status or 500
         try:
             parsed = json.loads(body)
             err = parsed.get("error", {})
@@ -356,15 +374,19 @@ class ChatAntigravity(BaseChatModel):
                 if d.get("@type", "").endswith("ErrorInfo"):
                     reason = d.get("reason", "")
             if reason == "SUBSCRIPTION_REQUIRED":
+                sub_status = status or 403
                 return AntigravityApiError(
-                    "Antigravity subscription required or no longer valid. "
+                    f"Antigravity API error {sub_status}: Antigravity subscription required or no longer valid. "
                     "Reconnect the Google account in Settings.",
-                    status, body,
+                    sub_status,
+                    body,
                 )
         except json.JSONDecodeError:
             pass
         return AntigravityApiError(
-            f"Antigravity API error {status}: {detail or body[:200]}", status, body
+            f"Antigravity API error {effective_status}: {detail or body[:200]}",
+            effective_status,
+            body,
         )
 
     # -- streaming core ----------------------------------------------------
@@ -425,8 +447,11 @@ class ChatAntigravity(BaseChatModel):
         if not candidates:
             error = response.get("error") or envelope.get("error")
             if error:
+                err_code = error.get("code") if isinstance(error, dict) else None
+                status = int(err_code) if isinstance(err_code, int) and 100 <= err_code < 600 else 500
                 raise AntigravityApiError(
-                    f"Antigravity stream error: {json.dumps(error)[:300]}"
+                    f"Antigravity stream error {status}: {json.dumps(error)[:300]}",
+                    status=status,
                 )
             return []
         candidate = candidates[0]
@@ -456,15 +481,20 @@ class ChatAntigravity(BaseChatModel):
                 )
 
         chunks: list[AIMessageChunk] = []
-        extra_kwargs: dict[str, Any] = {}
         if signatures:
             self._signatures.extend(signatures)
         if reasoning_parts:
-            extra_kwargs["reasoning_content"] = "".join(reasoning_parts)
-            chunks.append(AIMessageChunk(content="", additional_kwargs=dict(extra_kwargs)))
+            chunks.append(
+                AIMessageChunk(
+                    content="",
+                    additional_kwargs={"reasoning_content": "".join(reasoning_parts)},
+                )
+            )
+        # R6-4: do NOT copy reasoning_content onto the text chunk when a single
+        # SSE frame contains both thought and text parts.
         if text_parts:
             content = "".join(text_parts)
-            chunk_kwargs = dict(extra_kwargs) if extra_kwargs else {}
+            chunk_kwargs: dict[str, Any] = {}
             if tool_chunks:
                 chunk_kwargs["tool_call_chunks"] = tool_chunks
             chunks.append(AIMessageChunk(content=content, additional_kwargs=chunk_kwargs))
@@ -486,10 +516,13 @@ class ChatAntigravity(BaseChatModel):
             if trace_id:
                 meta["trace_id"] = trace_id
             usage = ChatAntigravity._usage_metadata(response)
+            finish_kwargs: dict[str, Any] = {}
+            if self._signatures:
+                finish_kwargs[_THOUGHT_SIGNATURES_KEY] = list(self._signatures)
             chunks.append(
                 AIMessageChunk(
                     content="",
-                    additional_kwargs={},
+                    additional_kwargs=finish_kwargs,
                     response_metadata=meta,
                     **({"usage_metadata": usage} if usage else {}),
                 )
@@ -502,9 +535,11 @@ class ChatAntigravity(BaseChatModel):
         if not usage:
             return None
         input_tokens = usage.get("promptTokenCount", 0)
-        output_tokens = usage.get("candidatesTokenCount", 0)
+        candidates_tokens = usage.get("candidatesTokenCount", 0)
         thoughts = usage.get("thoughtsTokenCount") or 0
-        details = {"output_token_details": OutputTokenDetails(reasoning_tokens=thoughts)} if thoughts else {}
+        # R6-13: include thoughts in output_tokens so input_tokens + output_tokens == total_tokens
+        output_tokens = candidates_tokens + thoughts
+        details = {"output_token_details": OutputTokenDetails(reasoning=thoughts)} if thoughts else {}
         return UsageMetadata(
             input_tokens=input_tokens,
             output_tokens=output_tokens,
@@ -568,6 +603,8 @@ class ChatAntigravity(BaseChatModel):
         run_manager: CallbackManagerForLLMRun | None = None,
         **kwargs: Any,
     ) -> Iterator[ChatGenerationChunk]:
+        # R6-1: clear per-response signatures so they never accumulate across turns
+        self._signatures = []
         payload = self._build_payload(messages, stop=stop, thinking_level_override=kwargs.get("thinking_level"))
         for envelope in self._stream_raw(payload):
             for chunk in self._chunks_from_frame(envelope):
@@ -582,6 +619,8 @@ class ChatAntigravity(BaseChatModel):
         run_manager: AsyncCallbackManagerForLLMRun | None = None,
         **kwargs: Any,
     ) -> AsyncIterator[ChatGenerationChunk]:
+        # R6-1: clear per-response signatures so they never accumulate across turns
+        self._signatures = []
         payload = self._build_payload(messages, stop=stop, thinking_level_override=kwargs.get("thinking_level"))
         async for envelope in self._astream_raw(payload):
             for chunk in self._chunks_from_frame(envelope):

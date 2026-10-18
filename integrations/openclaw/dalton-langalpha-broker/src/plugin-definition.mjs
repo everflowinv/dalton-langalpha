@@ -84,7 +84,12 @@ export function createPluginDefinition(deps = {}) {
           const journalDir = pluginConfig.journalDir
             ? path.resolve(pluginConfig.journalDir)
             : path.join(stateDir, "journal");
-          const journal = await createBrokerJournal({ journalDir });
+          const journal = await createBrokerJournal({
+            journalDir,
+            stateDir,
+            ttlMs: Number(pluginConfig.journalTtlMs) || undefined,
+            maxCacheEntries: Number(pluginConfig.journalMaxRecords) || undefined,
+          });
 
           brokerState.startedAt = new Date().toISOString();
           brokerState.stateDir = stateDir;
@@ -150,16 +155,34 @@ export function createPluginDefinition(deps = {}) {
               agentId: pluginConfig.defaultAgentId || "main",
               includeAuthCheck: false,
             });
+            const openclawVersion = String(
+              api.runtime?.version || currentCfg?.meta?.lastTouchedVersion || "unknown",
+            );
+            const journalStats =
+              typeof brokerState.journal?.getStats === "function"
+                ? brokerState.journal.getStats()
+                : { pending: 0, indeterminate: 0, completed: 0, failed_no_output: 0, total: 0, write_failures: 0 };
             sendJson(res, 200, {
               ok: true,
               status: "ok",
               plugin_id: PLUGIN_ID,
               version: PLUGIN_VERSION,
+              broker_version: PLUGIN_VERSION,
+              openclaw_version: openclawVersion,
+              brokerVersion: PLUGIN_VERSION,
+              openclawVersion,
               route_prefix: routePrefix,
               started_at: brokerState.startedAt,
               active_requests: limiter.activeCount,
+              inflight: limiter.activeCount,
+              queued: 0,
               max_concurrent: limiter.limit,
+              limits: {
+                maxConcurrent: limiter.limit,
+              },
               configured_models_count: models.length,
+              journal_entries: journalStats.total,
+              journal: journalStats,
               token_configured: Boolean(brokerState.tokenState.token),
             });
             return true;

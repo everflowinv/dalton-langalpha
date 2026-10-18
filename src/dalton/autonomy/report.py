@@ -23,7 +23,12 @@ FIVE_VERDICTS = (
 )
 
 
-async def generate_weekly_autonomy_report(days: int = 7) -> dict[str, Any]:
+async def generate_weekly_autonomy_report(
+    days: int = 7,
+    *,
+    user_id: str | None = None,
+    week: str | None = None,
+) -> dict[str, Any]:
     """Compile a 7-day autonomy report across preflight logs, signals, verdicts, and publications."""
     now = datetime.now(timezone.utc)
     since = now - timedelta(days=days)
@@ -35,6 +40,7 @@ async def generate_weekly_autonomy_report(days: int = 7) -> dict[str, Any]:
     signals_detected = 0
     signals_woken = 0
     signals_resolved = 0
+    signals_expired = 0
     verdict_counts: Counter[str] = Counter()
     verdicts_by_ticker: dict[str, Counter[str]] = {}
     publications_count = 0
@@ -62,7 +68,7 @@ async def generate_weekly_autonomy_report(days: int = 7) -> dict[str, Any]:
 
                 await cur.execute(
                     """
-                    SELECT woken_execution_id, resolved_at
+                    SELECT woken_execution_id, resolved_at, expired_at
                     FROM dalton_signals
                     WHERE detected_at >= %s
                     """,
@@ -74,6 +80,8 @@ async def generate_weekly_autonomy_report(days: int = 7) -> dict[str, Any]:
                         signals_woken += 1
                     if row.get("resolved_at") is not None:
                         signals_resolved += 1
+                    elif row.get("expired_at") is not None:
+                        signals_expired += 1
 
                 await cur.execute(
                     """
@@ -114,9 +122,9 @@ async def generate_weekly_autonomy_report(days: int = 7) -> dict[str, Any]:
 
     budget: dict[str, Any] = {}
     try:
-        budget = await get_budget_today()
-    except Exception:
-        pass
+        budget = await get_budget_today(user_id or "local_dev_user")
+    except Exception as e:
+        logger.warning("[DALTON_WEEK_REPORT] get_budget_today failed: %s", e)
 
     skip_rate_pct = (
         round((preflight_skipped / preflight_total) * 100.0, 1)
@@ -135,7 +143,7 @@ async def generate_weekly_autonomy_report(days: int = 7) -> dict[str, Any]:
         "",
         f"- 生成时间：`{now.isoformat()}`",
         f"- 预检总次数：**{preflight_total}**（零 token 跳过 **{preflight_skipped}** 次，唤醒 **{preflight_woken}** 次，跳过率 **{skip_rate_pct}%**）",
-        f"- 信号统计：检测 **{signals_detected}** 条 · 已唤醒 **{signals_woken}** 条 · 已闭环 **{signals_resolved}** 条",
+        f"- 信号统计：检测 **{signals_detected}** 条 · 已唤醒 **{signals_woken}** 条 · 已闭环 **{signals_resolved}** 条 · 超期归档 **{signals_expired}** 条",
         f"- 正式发布：**{publications_count}** 篇 · 待 PM 审批：**{pending_approvals_count}** 篇",
         "",
         "## 五词结论分布（Verdict Distribution）",
@@ -156,6 +164,7 @@ async def generate_weekly_autonomy_report(days: int = 7) -> dict[str, Any]:
 
     return {
         "window_days": days,
+        "week": week,
         "generated_at": now.isoformat(),
         "preflight": {
             "total": preflight_total,
@@ -168,6 +177,7 @@ async def generate_weekly_autonomy_report(days: int = 7) -> dict[str, Any]:
             "detected": signals_detected,
             "woken": signals_woken,
             "resolved": signals_resolved,
+            "expired": signals_expired,
         },
         "verdicts": {k: verdict_counts.get(k, 0) for k in FIVE_VERDICTS},
         "lazy_verdict_tickers": lazy_tickers,
@@ -176,3 +186,6 @@ async def generate_weekly_autonomy_report(days: int = 7) -> dict[str, Any]:
         "budget": budget,
         "markdown": "\n".join(md_lines) + "\n",
     }
+
+
+build_weekly_autonomy_report = generate_weekly_autonomy_report

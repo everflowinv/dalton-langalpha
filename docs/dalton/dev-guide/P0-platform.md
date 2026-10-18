@@ -1812,6 +1812,12 @@ async def get_run_charge_usd(run_ref: str) -> Decimal | None
 | query-keys | `web/src/lib/queryKeys.ts` | `dalton` 键组 | 约 8 |
 | i18n | `web/src/locales/en-US.json`、`zh-CN.json` | `dalton.*` | 若干键 |
 | pause-links | `web/src/pages/ChatAgent/session/interrupts/creditPauseCard.ts` | `buildCreditPauseState` | 约 3 |
+| provider-kill-switch | `src/llms/llm.py` | `LLM.get_llm` 开头检查 `ensure_provider_enabled` | 3 |
+| llm-sdk-dispatch | `src/llms/llm.py` | `LLM.get_llm` SDK 分派调用 `dispatch_native_sdk` | 约 6 |
+| oauth-dispatch | `src/server/services/llm/clients.py` | `_resolve_oauth_token` 调用 `resolve_native_oauth_token` | 约 6 |
+| native-oauth-ui | `web/src/hooks/useConfiguredProviders.ts`、`web/src/pages/Settings/panels/ConnectedAccounts.tsx`、`web/src/pages/Setup/steps/connectStep/OAuthConnect.tsx`、`web/src/pages/Setup/steps/MethodStep.tsx`、`web/src/pages/Setup/steps/connectStep/shared.tsx`、`web/src/lib/brandArt.ts` | Antigravity / Muse OAuth UI 委托至 Dalton 子模块 | 各 1–4 |
+| workspace-delete-guard | `src/server/app/workspaces.py` | `delete_workspace` 检查正式发布报告（G3.3 / L13） | 约 5 |
+| no-strike | `src/server/database/automation_executions.py` | `_count_strike` 豁免 `dalton-*` 自动停用并按时间退避（G4.4 / P0F.3） | 约 8 |
 
 **数据篇（P0D）引入的钩子**（也在 P0 阶段落地，`check_hooks.sh` 一并核对）：
 

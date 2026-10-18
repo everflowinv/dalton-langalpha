@@ -35,6 +35,7 @@ export const queryKeys = {
     all:    ['oauth'],
     codex:  () => [...queryKeys.oauth.all, 'codex'],
     claude: () => [...queryKeys.oauth.all, 'claude'],
+    // DALTON-HOOK(query-keys): P0N.3 Antigravity & Meta Muse OAuth query keys
     antigravity: () => [...queryKeys.oauth.all, 'antigravity'],
     muse:   () => [...queryKeys.oauth.all, 'muse'],
   },
@@ -258,13 +259,15 @@ export const queryKeys = {
   },
   // DALTON-HOOK(query-keys): Dalton OpenClaw sync, budget, and coverage board query keys
   dalton: {
-    all:            ['dalton'],
-    openclawStatus: () => [...queryKeys.dalton.all, 'openclaw', 'status'],
-    openclawHealth: () => [...queryKeys.dalton.all, 'openclaw', 'health'],
-    budget:         () => [...queryKeys.dalton.all, 'budget'],
-    budgetToday:    () => [...queryKeys.dalton.all, 'budget', 'today'],
-    coverageBoard:  (tier = 'all', staleOnly = false) => [...queryKeys.dalton.all, 'coverage', 'board', tier, staleOnly],
-    autonomyReport: (week?: string) => [...queryKeys.dalton.all, 'autonomy', 'report', week ?? 'current'],
+    all:             ['dalton'],
+    openclawStatus:  () => [...queryKeys.dalton.all, 'openclaw', 'status'],
+    openclawHealth:  () => [...queryKeys.dalton.all, 'openclaw', 'health'],
+    providersStatus: () => [...queryKeys.dalton.all, 'providers', 'status'],
+    modelsAvailable: () => [...queryKeys.dalton.all, 'models', 'available'],
+    budget:          () => [...queryKeys.dalton.all, 'budget'],
+    budgetToday:     () => [...queryKeys.dalton.all, 'budget', 'today'],
+    coverageBoard:   (tier = 'all', staleOnly = false) => [...queryKeys.dalton.all, 'coverage', 'board', tier, staleOnly],
+    autonomyReport:  (week?: string) => [...queryKeys.dalton.all, 'autonomy', 'report', week ?? 'current'],
   },
 };
 

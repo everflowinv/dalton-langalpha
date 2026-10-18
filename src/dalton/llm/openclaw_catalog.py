@@ -26,12 +26,15 @@ UPSTREAM_PROVIDERS_PATH = REPO_ROOT / "src" / "llms" / "manifest" / "providers.j
 FAMILY_PREFIX_TABLE: tuple[tuple[str, str], ...] = (
     ("claude-", "anthropic-claude"),
     ("gemini-", "google-gemini"),
-    ("gpt-oss-", "openai-gpt-oss"),
+    ("gpt-oss-", "openai-gpt"),
     ("gpt-", "openai-gpt"),
     ("grok-", "xai-grok"),
     ("deepseek-", "deepseek"),
     ("glm-", "zai-glm"),
     ("muse-", "meta-muse"),
+    ("kimi-", "moonshot-kimi"),
+    ("qwen", "alibaba-qwen"),
+    ("minimax-", "minimax"),
 )
 
 _FORBIDDEN_CREDENTIAL_KEYS = frozenset(
@@ -593,7 +596,6 @@ def build_overlay(
                     "dynamic_models": False,
                     "byok_eligible": False,
                     "prompt_cache_key": False,
-                    "operator_channel": "system",
                     "display_name": "OpenClaw (broker)",
                     "dalton_broker": True,
                 }

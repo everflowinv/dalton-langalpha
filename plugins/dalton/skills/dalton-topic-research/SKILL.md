@@ -6,6 +6,7 @@ description: "启动专题研究（topic-research workflow）：围绕产业、�
 # 专题研究（Topic Research）
 
 Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the first deliverable.
+公司认知按 `.agents/skills/dalton-knowledge/SKILL.md` 的读序读（`agent.md` 托管块 → `thesis.md` → `debate.md` → 按需 `drivers.md`、`management.md`、`verdicts.md`、`agenda.md`）；收尾按 `.agents/skills/dalton-agenda/SKILL.md` 的三步。
 
 ## 0. 启动工作流（第一步必读）
 
@@ -22,7 +23,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
    ```python
    RunWorkflow(
        workflow="topic-research",
-       args={
+       params={
            "topic": "<专题名称>",
            "slug": "<kebab-case-slug>",
            "horizon": "<时间范围，如 2026Q1-2026Q3 或 近30天>",
@@ -37,9 +38,9 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 
 ## 1. Phase 0 — 研究规划（Research Planning）
 
-1. **先读现有知识层與基金 Wiki（只读）**：
+1. **先读现有知识层与基金 Wiki（只读）**：
    - 若在公司工作区，先读 `thesis.md`、`debate.md`、`drivers.md`、`management.md`、`lessons.md`；若涉及其他覆盖公司，跨目录读取 `../<TICKER>/thesis.md` 与 `drivers.md`。
-   - 用 `Read` / `Grep` 检索共享只读基金百科 `wiki/` 中已有的行业/技术/供应链条目（**严禁写回 `wiki/`**）。
+   - 用 `researchdata.research(route="company-wiki")`（或只读文件检索）查阅共享只读基金百科 `wiki/` 中已有的行业/技术/供应链条目（**严禁写回 `wiki/`**）。
 2. **拆解 3–6 个信息集群（Clusters）**：
    - 参考 [references/clusters-investment.md](references/clusters-investment.md)。
    - 为每个集群生成 **5–8 条中英文检索词**（含精确机构名、产品代号、供应链术语、时间限定词）。
@@ -50,8 +51,8 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 ## 2. Phase 0.5 — 一手锚点采集（Primary Source Anchoring）
 
 在派发并行搜索前，先锁定一手基准数据作为锚点：
-- **公司 / 竞争专题**：拉取相关公司最新 10-K / 10-Q / 20-F（`researchdata` `research_sec_filings`）、近 1–2 个季度电话会纪要（`research_earnings_transcripts`）、近 6 个月 AlphaEngine 卖方深度报告（`research_alphaengine`）。
-- **行业 / 技术 / 政策专题**：拉取监管原文、行业协会统计、头部公司披露口径及内部共享资料库（`research_internal`：`sales-notes`、`tmtb`、`funda-ai`）。
+- **公司 / 竞争专题**：拉取相关公司最新 10-K / 10-Q / 20-F（`dalton_sec.list_filings` / `dalton_sec.get_company_facts` 或 `researchdata.finance(route="sec")`）、近 1–2 个季度电话会纪要（`researchdata.research(route="transcript")`）、近 6 个月 AlphaEngine 卖方深度报告（`researchdata.research(route="alphaengine", operation="search_library")`）。
+- **行业 / 技术 / 政策专题**：拉取监管原文、行业协会统计、头部公司披露口径及内部共享资料库（`researchdata.research(route="sales-notes")`、`researchdata.research(route="tmtb")`、`researchdata.research(route="funda-ai")`）。
 
 ---
 
@@ -59,10 +60,10 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 
 按集群并行派发 3–6 个 `dalton-evidence` 子代理，每个集群遵守以下硬约束：
 
-1. **精读全文**：每个集群在广度搜索（5–8 轮中英查询）后，必须挑选 **3–5 篇最高质量长文 / 原始文件调用全文读取**（`alphaengine__download_document`、`web_fetch` 或 SEC 原文），严禁仅凭搜索摘要写结论。
+1. **精读全文**：每个集群在广度搜索（5–8 轮中英查询）后，必须挑选 **3–5 篇最高质量长文 / 原始文件调用全文读取**（`researchdata.research(route="alphaengine", operation="get_document")`、`web_fetch` 或 SEC 原文 `researchdata.finance(route="sec")`），严禁仅凭搜索摘要写结论。
 2. **内部记忆库与专家网络必查**：
-   - 检索 `research_internal`（`sales-notes`、`tmtb`、`funda-ai`）。
-   - 检索 `guidepoint__search_events` 相关专家访谈。**合规红线：Guidepoint 内容以提炼观点为主，直接引用原文每篇不得超过 20 个英文词，严禁将完整访谈全文贴入报告。**
+   - 检索 `researchdata.research(route="sales-notes")`、`researchdata.research(route="tmtb")`、`researchdata.research(route="funda-ai")`。
+   - 检索 `researchdata.research(route="guidepoint")` 相关专家访谈。**合规红线：Guidepoint 内容以提炼观点为主，直接引用原文每篇不得超过 20 个英文词，严禁将完整访谈全文贴入报告。**
 3. **结构化证据包返回**：每条证据必须带完整 `[S#]` 来源（标题、机构/作者、发布日期、URL/doc_id）、数据所属期（如 `2026Q2`）及原文关键数字。
 
 ---

@@ -649,3 +649,267 @@ async def test_service_apply_update_and_append_verdict(monkeypatch: pytest.Monke
     assert "verdicts.md" in backend.files
     assert "VD-20261018-01" in backend.files["verdicts.md"]
 
+
+def test_question_backoff_stalled_duration_and_new_evidence_reset() -> None:
+    now = datetime(2026, 10, 18, 12, 0, 0, tzinfo=timezone.utc)
+    # 1. Stalled for 10 days (2026-10-01 to 2026-10-11 = 240h) -> 0.5 * 240h = 120h (5 days) -> 2026-10-16
+    agenda_doc, _ = apply_ops(
+        "agenda",
+        None,
+        [
+            {
+                "op": "create",
+                "value": {
+                    "open_questions": [
+                        {
+                            "id": "Q-001",
+                            "question": "What is Anthropic's exact gross margin?",
+                            "why": "Impacts AWS AI margin debate",
+                            "value": "high",
+                            "urgency": "this_quarter",
+                            "origin": "analyst",
+                            "owner": "analyst",
+                            "status": "open",
+                            "attempts": [
+                                {
+                                    "at": "2026-10-01T12:00:00Z",
+                                    "method": "search_1",
+                                    "progress": "none",
+                                    "note": "No disclosure",
+                                },
+                                {
+                                    "at": "2026-10-11T12:00:00Z",
+                                    "method": "search_2",
+                                    "progress": "none",
+                                    "note": "Still no disclosure",
+                                },
+                            ],
+                        }
+                    ],
+                    "next_validations": [],
+                    "watch": {},
+                    "wake_conditions": [],
+                },
+            }
+        ],
+        now=now,
+    )
+    q = agenda_doc["open_questions"][0]
+    assert q["stalled_since"] == "2026-10-01T12:00:00Z"
+    assert q["next_attempt_after"] == "2026-10-16T12:00:00Z"
+
+    # 2. Stalled for 80 days (2026-10-01 to 2026-12-20 = 1920h) -> 0.5 * 1920h = 960h -> clamped to 30d (720h = 2027-01-19)
+    agenda_80d, _ = apply_ops(
+        "agenda",
+        agenda_doc,
+        [
+            {
+                "op": "append",
+                "path": "/open_questions/Q-001/attempts",
+                "value": {
+                    "at": "2026-12-20T12:00:00Z",
+                    "method": "search_3",
+                    "progress": "none",
+                    "note": "Still stalled",
+                },
+            }
+        ],
+        now=now,
+    )
+    q80 = agenda_80d["open_questions"][0]
+    assert q80["stalled_since"] == "2026-10-01T12:00:00Z"
+    assert q80["next_attempt_after"] == "2027-01-19T12:00:00Z"
+
+    # 3. Linking new evidence to the question immediately clears stalled_since and next_attempt_after!
+    agenda_cleared, _ = apply_ops(
+        "agenda",
+        agenda_80d,
+        [
+            {
+                "op": "set",
+                "path": "/open_questions/Q-001/linked/evidence_ids",
+                "value": ["E-20261221-01"],
+            }
+        ],
+        now=now,
+    )
+    q_cleared = agenda_cleared["open_questions"][0]
+    assert "stalled_since" not in q_cleared
+    assert "next_attempt_after" not in q_cleared
+
+
+@pytest.mark.asyncio
+async def test_field_and_path_repair_with_warnings_and_assist_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.dalton.database import knowledge as db_knowledge
+    from src.dalton.knowledge import service
+    from src.dalton.llm.assist import AssistResult
+
+    store: dict[str, list[dict[str, Any]]] = {}
+
+    async def fake_latest_version(workspace_id: str, doc_key: str) -> dict[str, Any] | None:
+        rows = store.get(doc_key, [])
+        return rows[-1] if rows else None
+
+    async def fake_latest_valid_version(workspace_id: str, doc_key: str) -> dict[str, Any] | None:
+        rows = store.get(doc_key, [])
+        return rows[-1] if rows else None
+
+    async def fake_insert_version(**kwargs: Any) -> dict[str, Any]:
+        doc_key = kwargs["doc_key"]
+        rows = store.setdefault(doc_key, [])
+        v_no = len(rows) + 1
+        row = {
+            "knowledge_version_id": f"kv-{doc_key}-{v_no}",
+            "workspace_id": kwargs["workspace_id"],
+            "doc_key": doc_key,
+            "version_no": v_no,
+            "base_version_no": kwargs.get("base_version_no"),
+            "content": copy.deepcopy(kwargs["content"]),
+            "content_sha256": kwargs["content_sha256"],
+            "ops": kwargs.get("ops"),
+            "reason": kwargs["reason"],
+            "source": kwargs.get("source", "tool"),
+            "warnings": kwargs.get("warnings", []),
+            "schema_valid": True,
+            "created_at": datetime(2026, 10, 18, 12, 0, 0, tzinfo=timezone.utc),
+        }
+        rows.append(row)
+        return row
+
+    monkeypatch.setattr(db_knowledge, "latest_version", fake_latest_version)
+    monkeypatch.setattr(db_knowledge, "latest_valid_version", fake_latest_valid_version)
+    monkeypatch.setattr(db_knowledge, "insert_version", fake_insert_version)
+
+    # Create initial agenda
+    await service.apply_update(
+        user_id="u1",
+        workspace_id="ws1",
+        doc_key="agenda",
+        ops=[
+            {
+                "op": "create",
+                "value": {
+                    "open_questions": [],
+                    "next_validations": [],
+                    "watch": {},
+                    "wake_conditions": [],
+                },
+            }
+        ],
+        reason="Initialize agenda",
+        base_version=None,
+    )
+
+    # Append using misnamed path `/questions` and misnamed field `statement` instead of `question`
+    res_repaired = await service.apply_update(
+        user_id="u1",
+        workspace_id="ws1",
+        doc_key="agenda",
+        ops=[
+            {
+                "op": "append",
+                "path": "/questions",
+                "value": {
+                    "statement": "Will AWS capacity double by 2027?",
+                    "why": "Key driver of AWS acceleration",
+                    "value": "high",
+                    "urgency": "this_quarter",
+                    "origin": "analyst",
+                    "owner": "analyst",
+                    "status": "open",
+                    "attempts": [],
+                },
+            }
+        ],
+        reason="Add question with alias path and field",
+        base_version=1,
+    )
+    assert res_repaired["ok"] is True, res_repaired
+    assert any(w["code"] == "field_repaired" for w in res_repaired["warnings"])
+    saved_q = store["agenda"][-1]["content"]["open_questions"][0]
+    assert saved_q["question"] == "Will AWS capacity double by 2027?"
+
+    # Test assist_json(task="knowledge.repair_field") repairing an unknown synonym field
+    async def fake_assist_repair(*args: Any, **kwargs: Any) -> AssistResult:
+        assert kwargs.get("task") == "knowledge.repair_field"
+        return AssistResult(
+            ok=True,
+            data={"mappings": {"inquiry_prompt": "question"}},
+            error=None,
+        )
+
+    monkeypatch.setattr(service, "assist_json", fake_assist_repair)
+    res_assist = await service.apply_update(
+        user_id="u1",
+        workspace_id="ws1",
+        doc_key="agenda",
+        ops=[
+            {
+                "op": "append",
+                "path": "/open_questions",
+                "value": {
+                    "inquiry_prompt": "How fast does Trainium ramp?",
+                    "why": "Margin impact",
+                    "value": "medium",
+                    "urgency": "this_week",
+                    "origin": "analyst",
+                    "owner": "analyst",
+                    "status": "open",
+                    "attempts": [],
+                },
+            }
+        ],
+        reason="Add question with custom field repaired by assist_json",
+        base_version=2,
+    )
+    assert res_assist["ok"] is True, res_assist
+    assert any("knowledge.repair_field" in w["message"] for w in res_assist["warnings"])
+
+
+def test_g34_migrated_docs_have_no_fabricated_numbers_and_remediation() -> None:
+    from scripts.dalton.migrate_legacy_knowledge import remediate_doc_payload
+
+    migration_root = Path(__file__).resolve().parents[3] / "var" / "dalton" / "migration"
+    for ticker in ("META", "AMZN", "GOOGL", "MSFT"):
+        c_dir = migration_root / "Home" / "dalton" / "companies" / ticker / "data"
+        drivers = json.loads((c_dir / "drivers.json").read_text(encoding="utf-8"))
+        hvd = drivers["historical_valuation_driver"]
+        assert hvd["eps_share_pct"] is None
+        assert hvd["multiple_share_pct"] is None
+        assert hvd.get("note") == "迁移时未计算，待首次研究补充"
+
+        mgmt = json.loads((c_dir / "management.json").read_text(encoding="utf-8"))
+        for g in mgmt["guidance_history"]:
+            assert g["issued_at"] is None
+            assert g.get("note") == "迁移时未计算，待首次研究补充"
+
+        comp = json.loads((c_dir / "company.json").read_text(encoding="utf-8"))
+        assert comp["autonomy"]["max_usd_per_day"] is None
+        assert comp["autonomy"].get("note") == "迁移时未计算，待首次研究补充"
+
+        agenda = json.loads((c_dir / "agenda.json").read_text(encoding="utf-8"))
+        for ev in agenda["watch"]["events"]:
+            assert ev["date"] != "2026-11-15"
+        for val in agenda["next_validations"]:
+            assert val["due"] != "2026-11-15"
+
+    # Also verify remediate_doc_payload cleans up legacy fabricated payloads
+    legacy_drivers = {
+        "schema_version": 1,
+        "as_of": "2026-10-18T12:00:00Z",
+        "historical_valuation_driver": {
+            "summary": "Test",
+            "window": "2025-2026",
+            "eps_share_pct": 65.0,
+            "multiple_share_pct": 35.0,
+        },
+        "drivers": [],
+    }
+    cleaned_drv, changed = remediate_doc_payload("drivers", legacy_drivers)
+    assert changed is True
+    assert cleaned_drv["historical_valuation_driver"]["eps_share_pct"] is None
+    assert cleaned_drv["historical_valuation_driver"]["multiple_share_pct"] is None
+
+

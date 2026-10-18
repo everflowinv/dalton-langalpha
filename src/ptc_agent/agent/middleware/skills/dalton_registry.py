@@ -80,6 +80,7 @@ DALTON_SKILL_DEFINITIONS: dict[str, SkillDefinition] = {
             "触发词：财务镜头、净现金、net cash、隐含资产、hidden assets、股东回报、R1/R2/R3、盈利质量。"
         ),
         skill_md_path="skills/dalton-financial-lenses/SKILL.md",
+        command="dalton-financial-lenses",
         requires=("dalton-conventions", "research-conventions"),
     ),
     "dalton-company-background": SkillDefinition(

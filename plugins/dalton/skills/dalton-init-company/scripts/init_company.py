@@ -37,6 +37,40 @@ as you work. The system prompt has full guidelines on what to maintain.
 """
 
 TEMPLATES_DIR = Path(__file__).resolve().parent.parent / "templates"
+REPO_ROOT = Path(__file__).resolve().parents[5]
+DEFAULT_REPO_COVERAGE_YAML = REPO_ROOT / "config" / "dalton" / "coverage.yaml"
+
+BUILTIN_TICKER_CIKS: dict[str, str] = {
+    "META": "0001326801",
+    "MSFT": "0000789019",
+    "AMZN": "0001018724",
+    "GOOGL": "0001652044",
+    "GOOG": "0001652044",
+    "AAPL": "0000320193",
+    "NVDA": "0001045810",
+    "TSLA": "0001318605",
+    "AVGO": "0001730168",
+    "ORCL": "0001341439",
+    "CRM": "0001108524",
+    "NFLX": "0001065280",
+    "AMD": "0000002488",
+    "INTC": "0000050863",
+    "TSM": "0001046179",
+    "BABA": "0001577552",
+    "PDD": "0001737806",
+    "JD": "0001549802",
+    "BIDU": "0001329099",
+    "DASH": "0001794589",
+    "UBER": "0001543151",
+    "SNOW": "0001640147",
+    "PLTR": "0001321655",
+    "SHOP": "0001594805",
+    "SPOT": "0001639920",
+    "APP": "0001751008",
+    "CRWD": "0001535527",
+    "PANW": "0001327567",
+    "NOW": "0001373715",
+}
 
 TEMPLATE_FILE_MAP = {
     "agent.md": "agent.md.tmpl",
@@ -51,6 +85,20 @@ TEMPLATE_FILE_MAP = {
 
 def sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def resolve_ticker_cik(ticker: str, entry: dict[str, Any] | None = None) -> str | None:
+    """Resolve 10-digit SEC CIK from coverage entry or built-in map."""
+    norm = ticker.strip().upper()
+    if entry:
+        raw = entry.get("cik") or (entry.get("identifiers") or {}).get("cik")
+        if raw:
+            s = str(raw).strip()
+            if s.upper().startswith("CIK"):
+                s = s[3:].strip()
+            return s.lstrip("0").zfill(10) if s else None
+    builtin = BUILTIN_TICKER_CIKS.get(norm)
+    return builtin.zfill(10) if builtin else None
 
 
 def render(
@@ -71,11 +119,15 @@ def render(
     market = str(entry.get("market") or ("HK" if norm_ticker.endswith(".HK") else ("CN" if norm_ticker.endswith((".SS", ".SZ")) else "US")))
     coverage_stage = str(entry.get("coverage_stage") or "none")
     as_of = str(entry.get("as_of") or "2026-10-09")
+    cik = resolve_ticker_cik(norm_ticker, entry)
 
     peers_val = entry.get("peers")
+    peers_list: list[str] = []
     if isinstance(peers_val, list):
-        peers_str = "、".join(str(p) for p in peers_val) if peers_val else "无"
+        peers_list = [str(p).strip() for p in peers_val if str(p).strip()]
+        peers_str = "、".join(peers_list) if peers_list else "无"
     elif isinstance(peers_val, str) and peers_val.strip():
+        peers_list = [p.strip() for p in peers_val.split(",") if p.strip()]
         peers_str = peers_val.strip()
     else:
         peers_str = "无"
@@ -100,6 +152,23 @@ def render(
         else:
             content = raw
         out[relpath] = content
+
+    exchange = str(entry.get("exchange") or ("HKEX" if market == "HK" else ("SSE" if norm_ticker.endswith(".SS") else ("SZSE" if norm_ticker.endswith(".SZ") else "NASDAQ"))))
+    stage_schema = coverage_stage if coverage_stage in ("onboarding", "initial", "full", "maintenance", "paused") else "onboarding"
+    company_doc: dict[str, Any] = {
+        "schema_version": 1,
+        "ticker": norm_ticker,
+        "exchange": exchange,
+        "name": name,
+        "coverage_tier": "core" if tier_raw == "core" else "watch",
+        "coverage_stage": stage_schema,
+        "cik": cik,
+        "identifiers": {"cik": cik} if cik else {},
+        "peers": peers_list,
+        "one_liner": f"{name} ({norm_ticker}) — {tier_display} coverage",
+        "covered_since": rendered_date,
+    }
+    out["data/company.json"] = json.dumps(company_doc, ensure_ascii=False, indent=2) + "\n"
     return out
 
 
@@ -234,9 +303,13 @@ def apply(
 
 def load_coverage_entry(coverage_path: Path | None, ticker: str) -> dict[str, Any] | None:
     """Load a single ticker's entry from `coverage.yaml` (using PyYAML if available, or stdlib fallback)."""
-    if coverage_path is None or not coverage_path.is_file():
-        return None
-    text = coverage_path.read_text(encoding="utf-8")
+    eff_path = coverage_path
+    if (eff_path is None or not eff_path.is_file()) and DEFAULT_REPO_COVERAGE_YAML.is_file():
+        eff_path = DEFAULT_REPO_COVERAGE_YAML
+    if eff_path is None or not eff_path.is_file():
+        cik = resolve_ticker_cik(ticker)
+        return {"ticker": ticker.upper(), "cik": cik} if cik else None
+    text = eff_path.read_text(encoding="utf-8")
     try:
         import yaml  # type: ignore
 
@@ -246,10 +319,14 @@ def load_coverage_entry(coverage_path: Path | None, ticker: str) -> dict[str, An
             if str(comp.get("ticker", "")).upper() == ticker.upper():
                 entry = dict(comp)
                 entry.setdefault("as_of", as_of)
+                cik = resolve_ticker_cik(ticker, entry)
+                if cik:
+                    entry.setdefault("cik", cik)
                 return entry
     except ImportError:
         pass
-    return None
+    cik = resolve_ticker_cik(ticker)
+    return {"ticker": ticker.upper(), "cik": cik} if cik else None
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -265,6 +342,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--name", help="Override company display name")
     parser.add_argument("--tier", help="Override tier (core|watch)")
     parser.add_argument("--market", help="Override market (US|HK|CN)")
+    parser.add_argument("--cik", help="Override 10-digit SEC CIK")
     parser.add_argument("--peers", help="Comma-separated peer tickers override")
     parser.add_argument("--coverage-stage", help="Override coverage_stage")
     parser.add_argument("--apply", action="store_true", help="Write files to disk (default is dry-run)")
@@ -277,6 +355,8 @@ def main(argv: list[str] | None = None) -> int:
         entry["tier"] = args.tier
     if args.market:
         entry["market"] = args.market
+    if args.cik:
+        entry["cik"] = str(args.cik).strip().lstrip("0").zfill(10)
     if args.peers is not None:
         entry["peers"] = [p.strip() for p in args.peers.split(",") if p.strip()]
     if args.coverage_stage:
@@ -303,3 +383,4 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

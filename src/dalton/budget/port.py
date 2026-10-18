@@ -1,4 +1,4 @@
-"""LocalBudgetPort compatible with `PlatformCreditGatePort` and `FakePort` (P0.8 §5)."""
+"""LocalBudgetPort compatible with `PlatformCreditGatePort` and `FakePort` (P0.8 §5, P0N.6, G1)."""
 
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ from src.dalton.budget.service import (
 )
 from src.dalton.database.budget import (
     lookup_run_context,
+    release_reservation,
     resolve_effective_task_cap,
 )
 from src.dalton.settings import get_dalton_settings
@@ -40,6 +41,7 @@ def format_daily_budget_exhausted_message(
     return (
         f"今日预算 ${cap_usd:.2f} 已用完（已结算 ${settled_usd:.2f}，"
         f"未结算预留 ${open_reserved_usd:.2f}）。"
+        "订阅模型不占现金额度，但本轮的子智能体和后台任务使用现金模型。"
         "可在 设置 → 模型 → Dalton 预算 调高额度，或等北京时间 00:00 重置。"
     )
 
@@ -62,18 +64,15 @@ class LocalBudgetPort:
         rate_multiplier: float = 1.0,
         byok: bool = False,
     ) -> Optional[LeaseVerdict]:
+        """Acquire or renew a cash budget lease for `run_ref` (G1.1 / P0N.6).
+
+        Even when the main turn uses an OAuth subscription (`byok=True`), subagents
+        (e.g. `grok-4.7`) and background models (`deepseek-flash`) share the same lease
+        and spend cash credits. Therefore, `byok` never bypasses the daily USD cap.
+        """
         settings = get_dalton_settings().budget
         lease_ttl = int(settings.lease_ttl_seconds or 300)
         rate = Decimal(str(USD_TO_CREDITS_RATE))
-
-        # BYOK or OAuth runs do not consume cash budget
-        if byok:
-            return LeaseVerdict(
-                granted=True,
-                ceiling_credits=float(spent_credits) + 1_000_000.0,
-                ttl_seconds=float(lease_ttl),
-                generation=1,
-            )
 
         try:
             async with get_db_connection() as conn:
@@ -120,7 +119,10 @@ class LocalBudgetPort:
                                 SET observed_usd = GREATEST(dalton_budget_reservations.observed_usd, EXCLUDED.observed_usd),
                                     renewed_at = NOW()
                                 RETURNING *,
-                                    (SELECT COALESCE(SUM(total_credits), 0) / %s
+                                    (SELECT COALESCE(
+                                         SUM(dalton_cash_usd(token_usage::jsonb, total_credits, infrastructure_credits, %s)),
+                                         0
+                                     )
                                      FROM conversation_usages
                                      WHERE conversation_response_id = %s) AS usage_usd
                                 """,
@@ -167,7 +169,6 @@ class LocalBudgetPort:
                     observed_usd = Decimal(str(existing.get("observed_usd") or "0"))
                     usage_for_run = Decimal(str(existing.get("usage_usd") or "0"))
                     reserved_usd = Decimal(str(existing.get("reserved_usd") or "0"))
-                    this_charge = Decimal(str(existing.get("charge_usd") or "0"))
                     task_cap_usd = (
                         Decimal(str(existing["task_cap_usd"]))
                         if existing.get("task_cap_usd") is not None
@@ -278,16 +279,7 @@ class LocalBudgetPort:
         try:
             async with get_db_connection() as conn:
                 async with conn.transaction():
-                    async with conn.cursor() as cur:
-                        await cur.execute(
-                            """
-                            UPDATE dalton_budget_reservations
-                            SET state = 'released',
-                                released_at = NOW()
-                            WHERE run_ref = %s AND state = 'open'
-                            """,
-                            (run_ref,),
-                        )
+                    await release_reservation(conn, run_ref, generation=generation)
                     # Trigger a lazy reconcile right away if usage was already settled
                     await reconcile_and_summarize_day(conn, user_id)
         except Exception as exc:

@@ -2,7 +2,9 @@ import { useMemo } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { queryKeys } from '@/lib/queryKeys';
 import { useApiKeys } from './useApiKeys';
-import { getCodexOAuthStatus, getClaudeOAuthStatus, getAntigravityOAuthStatus, getMuseOAuthStatus } from '@/pages/Dashboard/utils/api';
+import { getCodexOAuthStatus, getClaudeOAuthStatus } from '@/pages/Dashboard/utils/api';
+// DALTON-HOOK(native-oauth-ui): P0N.3 Dalton OAuth providers hook
+import { useDaltonOAuthProviders } from '@/pages/Settings/hooks/useDaltonOAuthProviders';
 
 export interface ConfiguredProvider {
   provider: string;
@@ -38,19 +40,8 @@ export function useConfiguredProviders() {
     retry: false,
   });
 
-  const { data: antigravityStatus, isLoading: antigravityLoading } = useQuery({
-    queryKey: queryKeys.oauth.antigravity(),
-    queryFn: getAntigravityOAuthStatus,
-    staleTime: 60_000,
-    retry: false,
-  });
-
-  const { data: museStatus, isLoading: museLoading } = useQuery({
-    queryKey: queryKeys.oauth.muse(),
-    queryFn: getMuseOAuthStatus,
-    staleTime: 60_000,
-    retry: false,
-  });
+  // DALTON-HOOK(native-oauth-ui): P0N.3 include Antigravity + Meta Muse
+  const { extraProviders, isLoading: daltonLoading } = useDaltonOAuthProviders();
 
   const providers = useMemo<ConfiguredProvider[]>(() => {
     const result: ConfiguredProvider[] = [];
@@ -95,25 +86,12 @@ export function useConfiguredProviders() {
         plan_type: claudeStatus.plan_type ?? null,
       });
     }
-    if (antigravityStatus?.connected) {
-      result.push({
-        provider: 'antigravity-oauth',
-        display_name: 'Antigravity (Google Account)',
-        access_type: 'oauth',
-        plan_type: antigravityStatus.plan_type ?? null,
-      });
-    }
-    if (museStatus?.connected) {
-      result.push({
-        provider: 'muse-oauth',
-        display_name: 'Muse Code (Meta Account)',
-        access_type: 'oauth',
-        plan_type: museStatus.plan_type ?? null,
-      });
-    }
+
+    // DALTON-HOOK(native-oauth-ui): P0N.3 append Dalton OAuth providers
+    result.push(...extraProviders);
 
     return result;
-  }, [apiKeys, codexStatus, claudeStatus, antigravityStatus, museStatus]);
+  }, [apiKeys, codexStatus, claudeStatus, extraProviders]);
 
   /** Set of configured provider keys for fast lookup */
   const configuredSet = useMemo(
@@ -125,6 +103,6 @@ export function useConfiguredProviders() {
     providers,
     configuredSet,
     hasAny: providers.length > 0,
-    isLoading: keysLoading || codexLoading || claudeLoading || antigravityLoading || museLoading,
+    isLoading: keysLoading || codexLoading || claudeLoading || daltonLoading,
   };
 }

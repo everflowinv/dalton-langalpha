@@ -21,16 +21,232 @@ from src.dalton.autonomy.backoff import (
 from src.dalton.autonomy.probes import ProbeSignal
 from src.dalton.autonomy.probes.agenda import probe_agenda
 from src.dalton.autonomy.probes.calendar import probe_calendar
-from src.dalton.autonomy.probes.consensus import probe_consensus
 from src.dalton.autonomy.probes.director import probe_director
 from src.dalton.autonomy.probes.earnings import probe_earnings
 from src.dalton.autonomy.probes.internal import probe_internal
-from src.dalton.autonomy.probes.price import probe_price
 from src.dalton.autonomy.probes.sec import probe_sec
 from src.dalton.database import watch as watch_db
 from src.dalton.settings import get_dalton_settings
 
 logger = logging.getLogger(__name__)
+
+DIRECT_WAKE_SEC_FORMS = frozenset({"10-K", "10-Q", "20-F"})
+
+TRIAGE_OUTPUT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "wake": {"type": "boolean"},
+        "priority": {"type": "string", "enum": ["P0", "P1", "P2"]},
+        "reason": {"type": "string"},
+        "relevant_pillar_or_question_id": {"type": ["string", "null"]},
+        "decisions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "signal_key": {"type": "string"},
+                    "wake": {"type": "boolean"},
+                    "priority": {"type": "string", "enum": ["P0", "P1", "P2"]},
+                    "reason": {"type": "string"},
+                    "relevant_pillar_or_question_id": {"type": ["string", "null"]},
+                },
+                "required": ["signal_key", "wake"],
+            },
+        },
+    },
+    "required": ["wake", "priority", "reason"],
+}
+
+
+async def assist_json(*args: Any, **kwargs: Any) -> Any:
+    """Delegate to ``src.dalton.llm.assist.assist_json`` for preflight LLM triage (G1.3 / G4.3)."""
+    from src.dalton.llm.assist import assist_json as _assist_json
+
+    return await _assist_json(*args, **kwargs)
+
+
+def is_direct_wake_signal(sig: dict[str, Any] | ProbeSignal) -> bool:
+    """Return True if a signal should wake directly without LLM triage (G4.3).
+
+    Direct wake rules:
+    - SEC 10-K, 10-Q, 20-F -> direct wake
+    - SEC 8-K containing Item 2.02 -> direct wake
+    - Agenda due items (catalyst / validation / open_question / pm_question / next_action) -> direct wake
+    - Earnings window (T-3 / T0 / T+1 / release) -> direct wake
+    - Director / calendar / schedule / price triggers -> direct wake
+    All other SEC forms (8-K without 2.02, Form 4, 13D/G, 6-K, DEF 14A) and internal docs go to LLM triage.
+    """
+    if isinstance(sig, ProbeSignal):
+        probe = sig.probe
+        payload = sig.payload or {}
+        summary = sig.summary or ""
+    else:
+        probe = str(sig.get("probe") or "")
+        payload = sig.get("payload") if isinstance(sig.get("payload"), dict) else {}
+        summary = str(sig.get("summary") or "")
+
+    if probe in ("agenda", "earnings", "calendar", "director", "schedule", "price"):
+        return True
+
+    if probe == "sec":
+        form = str(payload.get("form") or "").strip().upper()
+        if form in DIRECT_WAKE_SEC_FORMS:
+            return True
+        if form == "8-K":
+            items = payload.get("items") or []
+            if isinstance(items, str):
+                items = [x.strip() for x in items.split(",") if x.strip()]
+            if any("2.02" in str(it) for it in items) or "2.02" in summary:
+                return True
+        return False
+
+    if probe == "internal":
+        return False
+
+    return True
+
+
+async def _triage_signals_with_llm(
+    *,
+    ticker: Optional[str],
+    workspace_id: Optional[str],
+    signals: list[dict[str, Any]],
+    agenda_doc: Optional[dict[str, Any]] = None,
+    watch_state: Optional[dict[str, Any]] = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str]:
+    """Run single batch ``assist_json(task='preflight.triage')`` on non-direct signals (G4.3).
+
+    Returns ``(kept_signals, skipped_signals, triage_reason)``.
+    Conservative fallback: if ``assist_json`` fails, errors, or returns invalid data, all signals wake.
+    """
+    if not signals:
+        return [], [], "no_triage_signals"
+
+    thesis_summary = str((watch_state or {}).get("thesis_summary") or "")
+    pillars_brief: list[str] = []
+    open_questions_brief: list[str] = []
+
+    if workspace_id and not thesis_summary:
+        try:
+            from src.dalton.database.knowledge import latest_valid_version
+
+            t_row = await latest_valid_version(str(workspace_id), "thesis")
+            t_content = (t_row or {}).get("content") if isinstance(t_row, dict) else None
+            if isinstance(t_content, dict):
+                thesis_summary = str(t_content.get("one_liner") or t_content.get("summary") or "")
+                for p in t_content.get("pillars") or []:
+                    if isinstance(p, dict):
+                        pillars_brief.append(f"{p.get('id', 'P')}: {p.get('name') or p.get('claim') or ''}")
+        except Exception:
+            pass
+
+    if isinstance(agenda_doc, dict):
+        for q in agenda_doc.get("open_questions") or []:
+            if isinstance(q, dict) and q.get("status") in (None, "open", "investigating"):
+                open_questions_brief.append(f"{q.get('id', 'Q')}: {q.get('question') or q.get('title') or ''}")
+
+    candidates_payload = []
+    for s in signals:
+        pl = s.get("payload") if isinstance(s.get("payload"), dict) else {}
+        candidates_payload.append(
+            {
+                "signal_key": s.get("signal_key"),
+                "probe": s.get("probe"),
+                "priority": s.get("priority"),
+                "summary": s.get("summary"),
+                "form": pl.get("form") or pl.get("doc_type"),
+                "items": pl.get("items") or [],
+                "title": pl.get("title") or pl.get("description") or pl.get("primary_document") or "",
+                "snippet": pl.get("snippet") or "",
+            }
+        )
+
+    system_prompt = (
+        "你是 Dalton 投研系统的零噪音预检分诊器（preflight.triage）。"
+        "请判断给定的 SEC 披露（非 2.02 的 8-K、Form 4、13D/G、6-K、DEF 14A）或内部研究文献是否具有实质投研价值、"
+        "值得唤醒分析师沙箱开展深度取证。例行无实质内容的小额高管减持或纯行政公告应返回 wake=false；"
+        "涉及业绩指引、重大合同、并购、核心高管变动、大股东增减持或与核心论点/待查问题相关的信号应返回 wake=true。"
+    )
+    user_payload = {
+        "ticker": ticker or "UNKNOWN",
+        "thesis_summary": thesis_summary,
+        "pillars": pillars_brief[:8],
+        "open_questions": open_questions_brief[:10],
+        "signals": candidates_payload,
+    }
+
+    try:
+        res = await assist_json(
+            task="preflight.triage",
+            system_prompt=system_prompt,
+            user_input=user_payload,
+            output_schema=TRIAGE_OUTPUT_SCHEMA,
+            workspace_id=workspace_id,
+            ticker=ticker,
+        )
+    except Exception as e:
+        logger.warning("[DALTON_PREFLIGHT] assist_json(preflight.triage) raised %s; conservative wake fallback", e)
+        return list(signals), [], "triage_fallback_wake"
+
+    # Extract structured dict from either AssistResult(.ok, .data) or plain dict mock
+    data: Optional[dict[str, Any]] = None
+    if isinstance(res, dict):
+        if res.get("ok") is False:
+            logger.warning("[DALTON_PREFLIGHT] assist_json returned ok=False; conservative wake fallback")
+            return list(signals), [], "triage_fallback_wake"
+        data = res.get("data") if isinstance(res.get("data"), dict) else res
+    else:
+        ok_attr = getattr(res, "ok", True)
+        if not ok_attr:
+            logger.warning("[DALTON_PREFLIGHT] AssistResult.ok=False; conservative wake fallback")
+            return list(signals), [], "triage_fallback_wake"
+        raw_data = getattr(res, "data", None)
+        if isinstance(raw_data, dict):
+            data = raw_data
+
+    if not isinstance(data, dict) or "wake" not in data:
+        logger.warning("[DALTON_PREFLIGHT] Invalid triage response %r; conservative wake fallback", data)
+        return list(signals), [], "triage_fallback_wake"
+
+    batch_wake = bool(data.get("wake", True))
+    batch_prio = str(data.get("priority") or "P1").upper()
+    if batch_prio not in ("P0", "P1", "P2"):
+        batch_prio = "P1"
+    batch_reason = str(data.get("reason") or ("triage_wake" if batch_wake else "triage_skip"))
+    batch_rel = data.get("relevant_pillar_or_question_id")
+
+    per_key: dict[str, dict[str, Any]] = {}
+    if isinstance(data.get("decisions"), list):
+        for dec in data["decisions"]:
+            if isinstance(dec, dict) and dec.get("signal_key"):
+                per_key[str(dec["signal_key"])] = dec
+
+    kept: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    for sig in signals:
+        s_copy = dict(sig)
+        s_key = str(s_copy.get("signal_key") or "")
+        dec = per_key.get(s_key)
+        sig_wake = bool(dec.get("wake")) if dec is not None and "wake" in dec else batch_wake
+        sig_prio = str((dec or {}).get("priority") or batch_prio).upper()
+        if sig_prio in ("P0", "P1", "P2"):
+            s_copy["priority"] = sig_prio
+        sig_reason = str((dec or {}).get("reason") or batch_reason)
+        sig_rel = (dec or {}).get("relevant_pillar_or_question_id", batch_rel)
+        pl = dict(s_copy.get("payload") or {})
+        pl["triage"] = {
+            "wake": sig_wake,
+            "priority": s_copy.get("priority", "P1"),
+            "reason": sig_reason,
+            "relevant_pillar_or_question_id": sig_rel,
+        }
+        s_copy["payload"] = pl
+        if sig_wake:
+            kept.append(s_copy)
+        else:
+            skipped.append(s_copy)
+
+    return kept, skipped, batch_reason
 
 
 @dataclass
@@ -68,16 +284,22 @@ def format_wake_directive(
     """Format the `<dalton_wake>` XML directive injected into `additional_context`."""
     ts = (checked_at or datetime.now(timezone.utc)).isoformat()
     ticker_attr = f' ticker="{ticker}"' if ticker else ""
+    signal_keys = [str(s.get("signal_key") or "") for s in signals if s.get("signal_key")]
+    keys_hint = ", ".join(signal_keys)
     lines = [
         f'<dalton_wake automation="{automation_name}"{ticker_attr} checked_at="{ts}" signal_count="{len(signals)}">',
-        "以下是由零 token 预检探针检测到的真实变更信号，请优先围绕这些信号开展取证与分析，并在结束前调用 `knowledge_append_verdict` 记录五词结论：",
+        "以下是由预检探针检测到的真实变更信号，请优先围绕这些信号开展取证与分析，并在结束前调用 `knowledge_append_verdict` 记录五词结论（在 verdict.trigger_signal 或 verdict.trigger_signals 中传入对应 signal_key 以闭环信号状态）：",
     ]
     for idx, sig in enumerate(signals, start=1):
         probe = sig.get("probe") or "probe"
         prio = sig.get("priority") or "P1"
         key = sig.get("signal_key") or ""
+        sig_id = sig.get("signal_id") or ""
         summary = sig.get("summary") or ""
-        lines.append(f"  {idx}. [{prio}][{probe}] {summary} (key={key})")
+        id_attr = f", signal_id={sig_id}" if sig_id else ""
+        lines.append(f"  {idx}. [{prio}][{probe}] {summary} (key={key}{id_attr})")
+    if keys_hint:
+        lines.append(f"  trigger_signals: [{keys_hint}]")
     lines.append("</dalton_wake>")
     return "\n".join(lines)
 
@@ -147,7 +369,7 @@ async def preflight_check(
     agenda_doc_override: Optional[dict[str, Any]] = None,
     persist: bool = True,
 ) -> PreflightResult:
-    """Run zero-token preflight for a Dalton automation firing (PK.16)."""
+    """Run zero-token preflight + optional LLM triage for a Dalton automation firing (PK.16 / G4)."""
     if not get_dalton_settings().autonomy.enabled:
         return PreflightResult(should_wake=True, decision="passthrough", reason="autonomy_disabled")
 
@@ -178,7 +400,11 @@ async def preflight_check(
         )
 
     # Check shared daily USD cap before running probes or waking sandbox
-    budget_ok, budget_reason = await _check_budget_available()
+    budget_ok, budget_reason = (True, None)
+    if persist:
+        budget_ok, budget_reason = await _check_budget_available()
+    elif isinstance(watch_state_override, dict) and watch_state_override.get("budget_exhausted"):
+        budget_ok, budget_reason = (False, "budget_exhausted")
     if not budget_ok:
         if persist:
             try:
@@ -199,6 +425,13 @@ async def preflight_check(
             signals=[],
             wake_context=None,
         )
+
+    # Expire unresolved signals older than 7 days (G4.2)
+    if persist:
+        try:
+            await watch_db.expire_old_signals(max_age_days=7, workspace_id=workspace_id)
+        except Exception as e:
+            logger.debug("[DALTON_PREFLIGHT] expire_old_signals skipped: %s", e)
 
     # Load watch state
     state: dict[str, Any] = {}
@@ -229,23 +462,45 @@ async def preflight_check(
             )
         )
     else:
-        # Standard company_watch: run all 6 company probes with time-based backoff protection
+        # Standard company_watch: run the 4 company probes (agenda, sec, earnings, internal) with time-based backoff
         t_sym = ticker or "UNKNOWN"
+        eff_ws_id = workspace_id if persist else None
         probe_runners = [
             (
                 "agenda",
                 lambda st: probe_agenda(
-                    workspace_id=workspace_id,
+                    workspace_id=eff_ws_id,
                     ticker=t_sym,
                     watch_state=st,
                     agenda_doc=agenda_doc_override,
                 ),
             ),
-            ("sec", lambda st: probe_sec(ticker=t_sym, watch_state=st)),
-            ("earnings", lambda st: probe_earnings(ticker=t_sym, watch_state=st)),
-            ("price", lambda st: probe_price(ticker=t_sym, watch_state=st)),
-            ("consensus", lambda st: probe_consensus(ticker=t_sym, watch_state=st)),
-            ("internal", lambda st: probe_internal(ticker=t_sym, watch_state=st)),
+            (
+                "sec",
+                lambda st: probe_sec(
+                    ticker=t_sym,
+                    watch_state=st,
+                    workspace_id=eff_ws_id,
+                    allow_network=persist,
+                ),
+            ),
+            (
+                "earnings",
+                lambda st: probe_earnings(
+                    ticker=t_sym,
+                    watch_state=st,
+                    workspace_id=eff_ws_id,
+                    agenda_doc=agenda_doc_override,
+                ),
+            ),
+            (
+                "internal",
+                lambda st: probe_internal(
+                    ticker=t_sym,
+                    watch_state=st,
+                    workspace_id=eff_ws_id,
+                ),
+            ),
         ]
         for probe_name, runner in probe_runners:
             in_bo, nb_iso = is_in_backoff(state, probe_name)
@@ -270,7 +525,7 @@ async def preflight_check(
                 )
                 state = record_probe_backoff(state, probe_name, str(err))
 
-    # Persist updated watch state
+    # Persist updated watch state (including any auto-resolved CIK or watermarks)
     if persist and workspace_id and ticker:
         try:
             await watch_db.upsert_watch_state(workspace_id, ticker, state)
@@ -278,8 +533,7 @@ async def preflight_check(
             logger.warning("[DALTON_PREFLIGHT] upsert_watch_state failed: %s", e)
 
     # Deduplicate against dalton_signals (idempotent by workspace_id, probe, signal_key)
-    woke_signals: list[dict[str, Any]] = []
-    signal_ids_to_mark: list[str] = []
+    candidate_signals: list[dict[str, Any]] = []
 
     if persist:
         for sig in emitted:
@@ -294,7 +548,7 @@ async def preflight_check(
                     payload=sig.payload,
                 )
                 if is_unwoken:
-                    woke_signals.append(
+                    candidate_signals.append(
                         {
                             "signal_id": str(row.get("signal_id") or ""),
                             "probe": sig.probe,
@@ -304,11 +558,9 @@ async def preflight_check(
                             "payload": sig.payload,
                         }
                     )
-                    if row.get("signal_id"):
-                        signal_ids_to_mark.append(str(row["signal_id"]))
             except Exception as e:
                 logger.warning("[DALTON_PREFLIGHT] upsert_signal failed: %s", e)
-                woke_signals.append(sig.to_dict())
+                candidate_signals.append(sig.to_dict())
     else:
         seen_keys: set[tuple[str, str]] = set(
             tuple(x) for x in (state.get("_woken_signal_keys") or []) if isinstance(x, (list, tuple)) and len(x) == 2
@@ -316,14 +568,14 @@ async def preflight_check(
         for sig in emitted:
             pair = (sig.probe, sig.signal_key)
             if pair not in seen_keys:
-                woke_signals.append(sig.to_dict())
+                candidate_signals.append(sig.to_dict())
                 seen_keys.add(pair)
         state["_woken_signal_keys"] = [list(x) for x in sorted(seen_keys)]
         if watch_state_override is not None:
             watch_state_override.clear()
             watch_state_override.update(state)
 
-    if not woke_signals:
+    if not candidate_signals:
         if persist:
             try:
                 await watch_db.insert_preflight_log(
@@ -344,6 +596,64 @@ async def preflight_check(
             wake_context=None,
         )
 
+    # Split into direct-wake signals and LLM-triage signals (G4.3)
+    direct_signals: list[dict[str, Any]] = []
+    triage_candidates: list[dict[str, Any]] = []
+    for cand in candidate_signals:
+        if is_direct_wake_signal(cand):
+            direct_signals.append(cand)
+        else:
+            triage_candidates.append(cand)
+
+    triage_kept: list[dict[str, Any]] = []
+    triage_skipped: list[dict[str, Any]] = []
+    triage_reason = "no_triage"
+    if triage_candidates:
+        triage_kept, triage_skipped, triage_reason = await _triage_signals_with_llm(
+            ticker=ticker,
+            workspace_id=workspace_id if persist else None,
+            signals=triage_candidates,
+            agenda_doc=agenda_doc_override,
+            watch_state=state,
+        )
+        if persist and triage_skipped:
+            skipped_ids = [str(s["signal_id"]) for s in triage_skipped if s.get("signal_id")]
+            if skipped_ids:
+                try:
+                    await watch_db.resolve_signals(
+                        skipped_ids,
+                        workspace_id=workspace_id,
+                        ticker=ticker,
+                        resolved_by="preflight.triage:skip",
+                    )
+                except Exception as e:
+                    logger.debug("[DALTON_PREFLIGHT] resolve triage-skipped signals failed: %s", e)
+
+    woke_signals = direct_signals + triage_kept
+
+    if not woke_signals:
+        skip_reason = triage_reason if triage_candidates else "no_new_signals"
+        if persist:
+            try:
+                await watch_db.insert_preflight_log(
+                    automation_id=automation_id,
+                    automation_execution_id=execution_id,
+                    workspace_id=workspace_id,
+                    decision="skip",
+                    reason=skip_reason,
+                    signals=triage_skipped,
+                )
+            except Exception as e:
+                logger.warning("[DALTON_PREFLIGHT] log insert failed: %s", e)
+        return PreflightResult(
+            should_wake=False,
+            decision="skip",
+            reason=skip_reason,
+            signals=[],
+            wake_context=None,
+        )
+
+    signal_ids_to_mark = [str(s["signal_id"]) for s in woke_signals if s.get("signal_id")]
     if persist and signal_ids_to_mark:
         try:
             await watch_db.mark_signals_woken(signal_ids_to_mark, execution_id)
