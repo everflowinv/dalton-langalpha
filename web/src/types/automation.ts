@@ -30,7 +30,7 @@ export type ExecutionStatus = 'pending' | 'waiting' | 'running' | 'completed' | 
 
 /** Why a run was skipped: the reader chose to, its thread stayed busy (or an
  *  earlier firing was already waiting), or the server stopped mid-wait. */
-export type SkipReason = 'user' | 'thread_busy' | 'interrupted';
+export type SkipReason = 'user' | 'thread_busy' | 'interrupted' | 'precheck'; // DALTON-HOOK(precheck-label)
 
 /** A failed run's cause, where the server knows it: a usage limit refused
  *  the firing or paused its run (`error_message` is then the quota service's

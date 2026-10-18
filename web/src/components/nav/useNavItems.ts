@@ -13,11 +13,14 @@ import { NAV_ITEMS, type NavItem } from './navItems';
  */
 export function useNavItems(): NavItem[] {
   const ordersVisible = useOrdersVisible();
+  const daltonMode = Boolean(import.meta.env.VITE_DALTON_MODE); // DALTON-HOOK(dalton-nav)
   return useMemo(
     () =>
-      NAV_ITEMS.filter((item) =>
-        item.requires === 'orders' ? ordersVisible === true : true,
-      ),
-    [ordersVisible],
+      NAV_ITEMS.filter((item) => {
+        if (item.requires === 'orders') return ordersVisible === true;
+        if (item.requires === 'market' || item.requires === 'dashboard') return !daltonMode; // DALTON-HOOK(dalton-nav)
+        return true;
+      }),
+    [ordersVisible, daltonMode],
   );
 }

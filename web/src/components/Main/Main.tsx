@@ -96,7 +96,7 @@ function Main() {
           <Route path="/connectors" element={<LegacyConnectorsRedirect />} />
           <Route path="/settings" element={<Settings />} />
           <Route path="/news/:id" element={<NewsDetailPage />} />
-          <Route path="*" element={<Navigate to="/dashboard" replace />} />
+          <Route path="*" element={<Navigate to={import.meta.env.VITE_DALTON_MODE ? '/chat' : '/dashboard'} replace />} /> {/* DALTON-HOOK(dalton-nav) */}
         </Routes>
       </StaleBuildBoundary>
     </Suspense>

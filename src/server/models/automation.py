@@ -588,7 +588,7 @@ ExecutionStatus = Literal[
 # Why a ``skipped`` firing did not run to its end: someone skipped it or
 # stopped its run, its thread stayed busy (or an earlier firing was already
 # waiting), or the server stopped while it waited.
-SkipReason = Literal["user", "thread_busy", "interrupted"]
+SkipReason = Literal["user", "thread_busy", "interrupted", "precheck"]  # DALTON-HOOK(precheck-skip-reason)
 # Why a ``failed`` firing failed, when it was not the automation's own doing:
 # a usage limit refused it or paused its run, the provider rejected the
 # user's own key, the service failed it (``server_error``), or the server cut

@@ -65,11 +65,22 @@ beforeEach(() => {
 });
 
 describe('the primary nav', () => {
-  it('draws every ungated item whatever the gate answers', () => {
-    const ungated = NAV_ITEMS.filter((item) => !item.requires).map((item) => item.key);
-    expect(keys()).toEqual(ungated);
+  it('draws every non-orders item by default when VITE_DALTON_MODE is unset', () => {
+    const defaultItems = NAV_ITEMS.filter((item) => item.requires !== 'orders').map((item) => item.key);
+    expect(keys()).toEqual(defaultItems);
     servers = [httpCatalogServer({ url: MOOMOO.url, oauth_status: 'connected' })];
-    expect(keys()).toEqual(expect.arrayContaining(ungated));
+    expect(keys()).toEqual(expect.arrayContaining(defaultItems));
+  });
+
+  it('hides /market and /dashboard when VITE_DALTON_MODE is enabled', () => {
+    vi.stubEnv('VITE_DALTON_MODE', '1');
+    try {
+      expect(keys()).not.toContain('/market');
+      expect(keys()).not.toContain('/dashboard');
+      expect(keys()).toEqual(['/chat', '/automations', '/plugins']);
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 
   it('shows Orders once a shipped brokerage is connected', () => {

@@ -86,6 +86,7 @@ class _Firing:
     # The starts made, and the entries the last one was made for.
     delivery_starts: int = 0
     delivery_entries: Optional[list[str]] = None
+    wake_context: Optional[str] = None  # DALTON-HOOK(preflight)
 
     @property
     def held(self) -> bool:
@@ -720,6 +721,11 @@ class AutomationExecutor:
                     },
                 ]
                 extra_configurable = automation_delivery.turn_configurable(firing.delivery)
+            if firing.wake_context:  # DALTON-HOOK(preflight)
+                additional_context = [
+                    *(additional_context or []),
+                    {"type": "directive", "content": firing.wake_context},
+                ]
             if firing.delivery is not None:
                 run_metadata.update(automation_delivery.run_metadata(firing.delivery))
             request = ChatRequest(
@@ -809,6 +815,20 @@ class AutomationExecutor:
             f"[AUTOMATION_EXEC] Starting execution: "
             f"automation_id={automation_id} execution_id={execution_id}"
         )
+        # DALTON-HOOK(preflight): zero-LLM wake/skip decision for dalton-* automations
+        from src.dalton.autonomy import preflight as dalton_preflight
+
+        decision = await dalton_preflight.decide(automation, execution_id)
+        if decision is not None and decision.skip:
+            await settle(
+                automation,
+                execution_id,
+                Outcome.PRECHECK_SKIPPED,
+                workspace_id=str(automation.get("workspace_id") or "") or None,
+                skip_reason="precheck",
+                excerpt=decision.summary[:300],
+            )
+            return
         if not await exec_db.transition_execution(
             execution_id,
             from_statuses=("pending",),
@@ -834,7 +854,10 @@ class AutomationExecutor:
             name=f"automation_heartbeat_{execution_id[:8]}",
         )
 
-        firing = _Firing(automation=automation)
+        firing = _Firing(
+            automation=automation,
+            wake_context=decision.context if decision else None,  # DALTON-HOOK(preflight)
+        )
         wait_deadline = time.monotonic() + _WAIT_CAP_SECONDS
         try:
             # ─── Wait out a running turn ──────────────────────────

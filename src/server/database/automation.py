@@ -58,7 +58,7 @@ def not_a_server_skip(alias: str) -> str:
     the server skipped because the thread stayed busy or it stopped."""
     return (
         f"({alias}.status <> 'skipped' OR {alias}.skip_reason IS NULL"
-        f" OR {alias}.skip_reason NOT IN ('thread_busy', 'interrupted'))"
+        f" OR {alias}.skip_reason NOT IN ('thread_busy', 'interrupted', 'precheck'))"  # DALTON-HOOK(precheck-hidden)
     )
 
 
