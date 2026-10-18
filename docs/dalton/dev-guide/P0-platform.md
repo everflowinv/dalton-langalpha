@@ -1596,6 +1596,7 @@ grant      = MIN(chunk_usd, available, task_left)
 - 上游设计是"慢一个裁决"：中间件只在被拒绝**之后**才会停下。最坏的超额约等于 `chunk_usd` 加上单次模型调用成本乘以同时在跑的成员数（主运行加子智能体）。
 - 用 `chunk_usd=1.00`、`admission_floor_usd=0.25` 时，正常情况下超额在 $1 量级。
 - 如果 owner 要求严格的"单次调用前预留"，要另写一个 Dalton 中间件，在每次调用前按"输入 token 估算 + max_tokens"预扣。这要改智能体中间件栈。**已决定 P0 不做**。
+- 服务端单次调用（`dalton_complete` / `assist_json`）在发送现金模型请求前执行准入检查：未传 `thread_id` / `workspace_id` 时仅检查日美元上限（含 `admission_floor_usd`）；传入 `thread_id` 或 `workspace_id` 时还会汇总该会话/工作区累计现金花费并与生效的 `task_cap` 比较（`task_spent >= task_cap` 时返回 `task_cap_exhausted`，P0H §5 B3）。
 
 ### 6. 拒绝文案（中文，进入 `CreditPauseCard`）
 
