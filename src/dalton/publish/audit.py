@@ -752,10 +752,7 @@ async def aaudit_draft(
     # Step B: Mandatory full-coverage LLM figure labeling & colloquial Chinese number extraction (P0I §1.4, L28, L35)
     if use_llm_judge:
         extracted, labeling_ok = await label_figures_with_status(
-            draft_markdown,
-            extracted,
-            user_id=user_id,
-            stats_out=labeling_stats,
+            draft_markdown, extracted, user_id=user_id, workspace_id=workspace_id, thread_id=thread_id, stats_out=labeling_stats
         )
         labeling_incomplete = not labeling_ok
 

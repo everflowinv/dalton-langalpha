@@ -1124,12 +1124,11 @@ async def label_figures_with_status(
     figures: list[ExtractedFigure],
     *,
     user_id: str = LOCAL_DEV_USER_ID,
+    workspace_id: str | None = None,
+    thread_id: str | None = None,
     stats_out: dict[str, Any] | None = None,
 ) -> tuple[list[ExtractedFigure], bool]:
-    """Step B LLM figure labeling (`audit.label_figures`) across all figures and sections (P0I §1.4, L28, L35, L43).
-
-    Returns ``(updated_figures, labeling_ok)``. Populates ``stats_out`` when provided.
-    """
+    """Step B LLM figure labeling (`audit.label_figures`) across all figures and sections (P0I §1.4, L28, L35, L43)."""
     total_initial = len(figures)
     if assist_json is None:
         for f in figures:
@@ -1256,6 +1255,8 @@ async def label_figures_with_status(
                 payload=payload,
                 schema=label_schema,
                 user_id=user_id,
+                workspace_id=workspace_id,
+                thread_id=thread_id,
                 timeout_s=90.0,
             )
 
