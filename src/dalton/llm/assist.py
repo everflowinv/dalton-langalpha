@@ -160,7 +160,7 @@ async def assist_json(
     """
     t0 = time.monotonic()
     resolved_model = str(model or "")
-    eff_user = str(user_id or LOCAL_DEV_USER_ID).strip()
+    user_id = str(user_id or LOCAL_DEV_USER_ID).strip()
 
     try:
         resolved_model = resolve_assist_model(role=role, explicit_model=model)
@@ -174,9 +174,9 @@ async def assist_json(
         if scope_ref:
             eff_scope = scope_ref
         elif workspace_id:
-            eff_scope = f"assist:{eff_user}:ws:{workspace_id}:{task}:{payload_sha}"
+            eff_scope = f"assist:{user_id}:ws:{workspace_id}:{task}:{payload_sha}"
         else:
-            eff_scope = f"assist:{eff_user}:{task}:{payload_sha}"
+            eff_scope = f"assist:{user_id}:{task}:{payload_sha}"
 
         schema_json = json.dumps(schema, ensure_ascii=False, indent=2)
         system_prompt = (
@@ -187,7 +187,7 @@ async def assist_json(
 
         comp = await dalton_complete(
             llm_service=llm_service,
-            user_id=eff_user,
+            user_id=user_id,
             system_prompt=system_prompt,
             user_prompt=payload_json,
             scope_ref=eff_scope,
@@ -208,7 +208,7 @@ async def assist_json(
                     continue
                 comp_fb = await dalton_complete(
                     llm_service=llm_service,
-                    user_id=eff_user,
+                    user_id=user_id,
                     system_prompt=system_prompt,
                     user_prompt=payload_json,
                     scope_ref=f"{eff_scope}:fb:{fb_cand}",
