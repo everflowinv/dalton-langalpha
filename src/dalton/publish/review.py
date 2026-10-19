@@ -235,13 +235,12 @@ async def run_review(
     user_id: str | None,
     author_model: str | None,
     bundle: ReviewBundle,
-    llm_service: Any = None,
     candidates: list[str] | None = None,
     available_models: set[str] | None = None,
     workspace_id: str | None = None,
     thread_id: str | None = None,
 ) -> ReviewResult:
-    """Run authoritative server-side independent review via ``dalton_complete`` / ``LLMService.complete`` (PK.10 / G3.2)."""
+    """Run authoritative server-side independent review via ``dalton_complete`` (PK.10 / G3.2)."""
     author_family = family_of(author_model)
     if not author_model or author_family == "unknown":
         return ReviewResult(
@@ -273,7 +272,7 @@ async def run_review(
         from src.dalton.llm.complete import dalton_complete
 
         comp = await dalton_complete(
-            llm_service,
+            None,
             user_id=user_id or "local-dev-user",
             system_prompt=system_prompt,
             user_prompt=user_prompt,

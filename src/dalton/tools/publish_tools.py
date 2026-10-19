@@ -44,7 +44,7 @@ def create_publish_tools(filesystem_backend: Any = None) -> list[BaseTool]:
         Writes drafts/<slug>.audit.md and drafts/<slug>.annotated.md so you can fix unverified figures before calling publish_report.
         Returns: one-line summary of total, matched, exempt, and unverified figures plus the audit file path.
         """
-        _, workspace_id, _, _ = _extract_run_identity(config)
+        user_id, workspace_id, thread_id, _ = _extract_run_identity(config)
         if not workspace_id:
             return "ERROR: workspace_id is required in RunnableConfig."
         res = await run_check_draft(
@@ -52,6 +52,9 @@ def create_publish_tools(filesystem_backend: Any = None) -> list[BaseTool]:
             draft_path=draft_path,
             facts_path=facts_path,
             backend=filesystem_backend,
+            use_llm_judge=True,
+            user_id=user_id or "local-dev-user",
+            thread_id=thread_id,
         )
         return str(res["message"])
 

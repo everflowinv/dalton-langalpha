@@ -1,0 +1,251 @@
+{
+  "evidence": [
+    {
+      "id": "EV-SEC-001",
+      "at": "2026-07-23T20:05:00Z",
+      "period": "2Q26",
+      "source": {
+        "type": "filing",
+        "identity": "Alphabet Inc. Form 10-Q for the Quarterly Period Ended June 30, 2026",
+        "tier": 1,
+        "ref": {
+          "kind": "filing",
+          "form": "10-Q",
+          "accession": "0001652044-26-000071",
+          "period": "2Q26",
+          "section": "Note 15 - Information about Segments (goog-20260630.htm)"
+        }
+      },
+      "fact": "2Q26（截至 2026-06-30 的三个月）Google Cloud 云收入 247.68 亿美元（约 247.7 亿美元），上年同期 136.24 亿美元，同比增长约 82%；Google Cloud 分部经营利润 88.14 亿美元，云经营利润率约 35.6%。",
+      "figures": [
+        {"metric": "Google Cloud 云收入", "value": 24.77, "unit": "USD_bn", "period": "2Q26", "label": "reported"},
+        {"metric": "云收入同比增速", "value": 82.0, "unit": "pct", "period": "2Q26", "label": "reported"},
+        {"metric": "云经营利润率", "value": 35.6, "unit": "pct", "period": "2Q26", "label": "reported"}
+      ],
+      "pillar_ids": ["P1"],
+      "signal": "confirming",
+      "quality": "high"
+    },
+    {
+      "id": "EV-SEC-002",
+      "at": "2026-07-23T20:05:00Z",
+      "period": "2Q26",
+      "source": {
+        "type": "filing",
+        "identity": "Alphabet Inc. Form 10-Q for the Quarterly Period Ended June 30, 2026",
+        "tier": 1,
+        "ref": {
+          "kind": "filing",
+          "form": "10-Q",
+          "accession": "0001652044-26-000071",
+          "period": "2Q26",
+          "section": "Item 2 MD&A - Disaggregated Revenues (goog-20260630.htm)"
+        }
+      },
+      "fact": "2Q26 Google Search & other 收入 632.71 亿美元，上年同期 541.90 亿美元，同比增长 16.8%；1Q26 收入 603.99 亿美元，上年同期 507.02 亿美元，同比增长 19.1%。",
+      "figures": [
+        {"metric": "Search & other 同比增速", "value": 16.8, "unit": "pct", "period": "2Q26", "label": "reported"},
+        {"metric": "Search & other 同比增速", "value": 19.1, "unit": "pct", "period": "1Q26", "label": "reported"}
+      ],
+      "pillar_ids": ["P1"],
+      "signal": "confirming",
+      "quality": "high"
+    },
+    {
+      "id": "EV-SEC-003",
+      "at": "2026-07-23T20:05:00Z",
+      "period": "2Q26",
+      "source": {
+        "type": "filing",
+        "identity": "Alphabet Inc. Form 10-Q for the Quarterly Period Ended June 30, 2026",
+        "tier": 1,
+        "ref": {
+          "kind": "filing",
+          "form": "10-Q",
+          "accession": "0001652044-26-000071",
+          "period": "2Q26",
+          "section": "Item 2 MD&A - Monetization Metrics (goog-20260630.htm)"
+        }
+      },
+      "fact": "2Q26 Google Search & other 付费点击同比 +13%，单次点击成本（CPC）同比 +3%。",
+      "figures": [
+        {"metric": "付费点击同比增速", "value": 13.0, "unit": "pct", "period": "2Q26", "label": "reported"},
+        {"metric": "CPC 同比增速", "value": 3.0, "unit": "pct", "period": "2Q26", "label": "reported"}
+      ],
+      "pillar_ids": ["P1"],
+      "signal": "confirming",
+      "quality": "high"
+    },
+    {
+      "id": "EV-SEC-004",
+      "at": "2026-07-23T20:05:00Z",
+      "period": "1H26",
+      "source": {
+        "type": "filing",
+        "identity": "Alphabet Inc. Form 10-Q for the Quarterly Period Ended June 30, 2026",
+        "tier": 1,
+        "ref": {
+          "kind": "filing",
+          "form": "10-Q",
+          "accession": "0001652044-26-000071",
+          "period": "2Q26",
+          "section": "Note 6 - Other Income (Expense), Net (goog-20260630.htm)"
+        }
+      },
+      "fact": "2026 上半年其他收入（Other income (expense), net）1,356.99 亿美元（约 1,357 亿美元），其中 2Q26 为 979.83 亿美元（约 980 亿美元）。",
+      "figures": [
+        {"metric": "其他收入", "value": 135.7, "unit": "USD_bn", "period": "1H26", "label": "reported"},
+        {"metric": "其他收入", "value": 98.0, "unit": "USD_bn", "period": "2Q26", "label": "reported"}
+      ],
+      "pillar_ids": ["P1"],
+      "signal": "neutral",
+      "quality": "high"
+    },
+    {
+      "id": "EV-SEC-005",
+      "at": "2026-07-23T20:05:00Z",
+      "period": "2Q26",
+      "source": {
+        "type": "filing",
+        "identity": "Alphabet Inc. Form 10-Q for the Quarterly Period Ended June 30, 2026",
+        "tier": 1,
+        "ref": {
+          "kind": "filing",
+          "form": "10-Q",
+          "accession": "0001652044-26-000071",
+          "period": "2Q26",
+          "section": "Note 11 - Stockholders' Equity (goog-20260630.htm)"
+        }
+      },
+      "fact": "2Q26（2026 年 6 月）公司增发 Class A/Class C 普通股与 6.25% 强制可转换优先股，合计净募资 496 亿美元；其中优先股部分净募 190 亿美元。另于 6 月 1 日签订最高 400 亿美元的 ATM（at-the-market）股票发行协议。",
+      "figures": [
+        {"metric": "增发普通股和强制可转换优先股净募资", "value": 49.6, "unit": "USD_bn", "period": "2Q26", "label": "reported"},
+        {"metric": "ATM 股票发行协议额度", "value": 40.0, "unit": "USD_bn", "period": "2Q26", "label": "reported"}
+      ],
+      "pillar_ids": ["P1"],
+      "signal": "neutral",
+      "quality": "high"
+    },
+    {
+      "id": "EV-SEC-006",
+      "at": "2026-07-23T20:05:00Z",
+      "period": "2Q26",
+      "source": {
+        "type": "filing",
+        "identity": "Alphabet Inc. Form 10-Q for the Quarterly Period Ended June 30, 2026",
+        "tier": 1,
+        "ref": {
+          "kind": "filing",
+          "form": "10-Q",
+          "accession": "0001652044-26-000071",
+          "period": "2Q26",
+          "section": "Note 7 - Debt (goog-20260630.htm)"
+        }
+      },
+      "fact": "2Q26 公司发行高级无担保票据（senior unsecured notes），发债净额 203 亿美元。",
+      "figures": [
+        {"metric": "发债净额", "value": 20.3, "unit": "USD_bn", "period": "2Q26", "label": "reported"}
+      ],
+      "pillar_ids": ["P1"],
+      "signal": "neutral",
+      "quality": "high"
+    },
+    {
+      "id": "EV-SEC-007",
+      "at": "2026-07-23T20:05:00Z",
+      "period": "2Q26",
+      "source": {
+        "type": "filing",
+        "identity": "Alphabet Inc. Form 10-Q for the Quarterly Period Ended June 30, 2026",
+        "tier": 1,
+        "ref": {
+          "kind": "filing",
+          "form": "10-Q",
+          "accession": "0001652044-26-000071",
+          "period": "2Q26",
+          "section": "Note 5 - Leases (goog-20260630.htm)"
+        }
+      },
+      "fact": "截至 2Q26 末（2026-06-30），公司已签约但尚未起租的数据中心等租约未来付款合计 852 亿美元。",
+      "figures": [
+        {"metric": "已签约未起租数据中心租约", "value": 85.2, "unit": "USD_bn", "period": "2Q26", "label": "reported"}
+      ],
+      "pillar_ids": ["P1"],
+      "signal": "neutral",
+      "quality": "high"
+    },
+    {
+      "id": "EV-SEC-008",
+      "at": "2026-07-23T20:05:00Z",
+      "period": "2Q26",
+      "source": {
+        "type": "filing",
+        "identity": "Alphabet Inc. Form 10-Q for the Quarterly Period Ended June 30, 2026",
+        "tier": 1,
+        "ref": {
+          "kind": "filing",
+          "form": "10-Q",
+          "accession": "0001652044-26-000071",
+          "period": "2Q26",
+          "section": "Consolidated Balance Sheets (goog-20260630.htm)"
+        }
+      },
+      "fact": "截至 2Q26 末（2026-06-30），现金、现金等价物与短期投资合计 2,424.74 亿美元（约 2,425 亿美元）。",
+      "figures": [
+        {"metric": "现金和短期投资", "value": 242.5, "unit": "USD_bn", "period": "2Q26", "label": "reported"}
+      ],
+      "pillar_ids": ["P1"],
+      "signal": "neutral",
+      "quality": "high"
+    },
+    {
+      "id": "EV-SEC-009",
+      "at": "2026-07-23T20:05:00Z",
+      "period": "2Q26",
+      "source": {
+        "type": "filing",
+        "identity": "Alphabet Inc. Form 10-Q for the Quarterly Period Ended June 30, 2026",
+        "tier": 1,
+        "ref": {
+          "kind": "filing",
+          "form": "10-Q",
+          "accession": "0001652044-26-000071",
+          "period": "2Q26",
+          "section": "Note 2 - Revenue / Remaining Performance Obligations (goog-20260630.htm)"
+        }
+      },
+      "fact": "截至 2Q26 末（2026-06-30），剩余履约义务（收入积压订单 revenue backlog）5,195 亿美元，其中 Google Cloud 云积压订单公布为 5,139 亿美元（约 5,140 亿美元）。",
+      "figures": [
+        {"metric": "云积压订单", "value": 514.0, "unit": "USD_bn", "period": "2Q26", "label": "reported"}
+      ],
+      "pillar_ids": ["P1"],
+      "signal": "confirming",
+      "quality": "high"
+    },
+    {
+      "id": "EV-SEC-010",
+      "at": "2026-07-23T20:05:00Z",
+      "period": "2Q26",
+      "source": {
+        "type": "filing",
+        "identity": "Alphabet Inc. Form 10-Q for the Quarterly Period Ended June 30, 2026",
+        "tier": 1,
+        "ref": {
+          "kind": "filing",
+          "form": "10-Q",
+          "accession": "0001652044-26-000071",
+          "period": "2Q26",
+          "section": "Consolidated Statements of Income (goog-20260630.htm)"
+        }
+      },
+      "fact": "2Q26 总收入 1,197.96 亿美元（上年同期 964.28 亿美元）；2Q26 净利润 1,121.93 亿美元，其中权益证券净收益约 990 亿美元。",
+      "figures": [
+        {"metric": "总收入", "value": 119.8, "unit": "USD_bn", "period": "2Q26", "label": "reported"},
+        {"metric": "净利润", "value": 112.19, "unit": "USD_bn", "period": "2Q26", "label": "reported"}
+      ],
+      "pillar_ids": ["P1"],
+      "signal": "neutral",
+      "quality": "high"
+    }
+  ]
+}

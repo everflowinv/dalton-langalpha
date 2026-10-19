@@ -6,26 +6,27 @@ import dataclasses
 import re
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 try:
     from src.dalton.llm.assist import assist_json
 except ImportError:  # pragma: no cover
     assist_json = None  # type: ignore[assignment]
 
-# Period tokens: FY2026, FY26, 3Q26, Q3 2026, 2026Q3, 1H26, 2H26, 2026H1, LTM-2026-09, 2026E, NTM
+# Period tokens: FY2026, FY26, 3Q26, 26Q4, Q4 26, Q4'26, Q3 2026, 2026Q3, 1H26, 2H26, 2026H1, LTM-2026-09, 2026E, NTM
 _PERIOD_TOKEN_RE = re.compile(
-    r"\b("
-    r"FY\d{2,4}E?|"
-    r"[1-4]Q\d{2,4}E?|"
-    r"Q[1-4]\s*['’]?\d{2,4}E?|"
-    r"20\d{2}\s*Q[1-4]E?|"
-    r"[12]H\d{2,4}E?|"
-    r"20\d{2}\s*H[12]E?|"
+    r"(?<![A-Za-z0-9])("
+    r"FY(?:(?:19|20)\d{2}|[12]\d)E?|"
+    r"[1-4]Q(?:(?:19|20)\d{2}|[12]\d)E?|"
+    r"(?:20\d{2}|2\d)\s*Q[1-4]E?|"
+    r"Q[1-4](?:\s*['’]\s*(?:(?:19|20)\d{2}|[12]\d)|\s+(?:20\d{2}|2\d)(?!\s*[-\d.%％bp倍万亿美港元QqKk]))E?|"
+    r"[12]H(?:(?:19|20)\d{2}|[12]\d)E?|"
+    r"(?:20\d{2}|2\d)\s*H[12]E?|"
+    r"202\d\s*(?:上半年|下半年|全年|财年)|"
     r"LTM(?:-\d{4}-\d{2})?|"
     r"NTM|"
     r"20\d{2}E"
-    r")\b",
+    r")(?![A-Za-z0-9])",
     re.IGNORECASE,
 )
 
@@ -35,7 +36,10 @@ _HYPHEN_DOC_CODE_RE = re.compile(
     r"\b(?=[A-Za-z0-9-]*[A-Za-z])[A-Za-z0-9]+(?:-[A-Za-z0-9]+){2,}\b|\b[A-Za-z]{2,}-\d{2,}-\d+\b"
 )
 _ISO_DATE_RE = re.compile(r"\b20\d{2}[-/.](?:0?[1-9]|1[0-2])(?:[-/.](?:0?[1-9]|[12]\d|3[01]))?\b")
-_CN_DATE_RE = re.compile(r"20\d{2}\s*年(?:\s*\d{1,2}\s*月(?:\s*\d{1,2}\s*日)?)?")
+_CN_DATE_RE = re.compile(
+    r"(?:20\d{2}\s*年(?:\s*(?:1[0-2]|0?[1-9])\s*月(?:\s*(?:[0-3]?\d)\s*[日号])?)?|"
+    r"(?<!\d)(?:1[0-2]|0?[1-9])\s*月(?:\s*(?:[0-3]?\d)\s*[日号])?)"
+)
 _SHORT_DATE_RE = re.compile(r"(?<!\d)(?:0?[1-9]|1[0-2])-(?:0?[1-9]|[12]\d|3[01])(?!\d)")
 _SLASH_DATE_RE = re.compile(r"(?<!\d)(?:0?[1-9]|1[0-2])/(?:0?[1-9]|[12]\d|3[01])(?:/\d{2,4})?(?!\d)")
 _CLOCK_TIME_RE = re.compile(r"\b(?:[01]?\d|2[0-3]):[0-5]\d(?::[0-5]\d)?\b")
@@ -128,10 +132,10 @@ class FigureLabelItem(BaseModel):
     id: str = Field(description="Extracted figure ID, e.g. F-001")
     metric: str = Field(default="", description="Financial metric name")
     period: str = Field(default="", description="Normalized period, e.g. 3Q26 or FY2026")
-    unit: str = Field(default="", description="Optional canonical unit, e.g. USD_bn, USD_mn, pct, x, count_mn")
+    unit: str = Field(default="", description="Optional canonical unit, e.g. USD_bn, USD_mn, pct, x, per_share, count_mn")
     kind: str = Field(
         default="",
-        description="Semantic figure kind: reported, estimate, consensus, guidance, or derived",
+        description="Semantic figure kind: reported, estimate, consensus, guidance, derived, or incidental",
     )
 
 
@@ -151,10 +155,19 @@ class ExtraFigureItem(BaseModel):
 
 
 class FigureLabels(BaseModel):
-    """Structured response for LLM-assisted figure labeling (PK.9 / P0H Step B)."""
+    """Structured response for LLM-assisted figure labeling (PK.9 / P0H Step B / P0I §1.4)."""
 
     items: list[FigureLabelItem] = Field(default_factory=list)
     extra_figures: list[ExtraFigureItem] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_labels_alias(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "items" not in data and "labels" in data:
+            copied = dict(data)
+            copied["items"] = copied.pop("labels")
+            return copied
+        return data
 
 
 @dataclasses.dataclass
@@ -183,7 +196,7 @@ class ExtractedFigure:
 
 
 def normalize_period(raw_period: str | None) -> str:
-    """Canonicalize period strings (e.g. ``FY26`` -> ``FY2026``, ``Q3 2026`` -> ``3Q26``, ``3Q2026`` -> ``3Q26``)."""
+    """Canonicalize period strings (e.g. ``FY26`` -> ``FY2026``, ``Q3 2026`` -> ``3Q26``, ``26Q4`` -> ``4Q26``)."""
     if not raw_period:
         return ""
     s = raw_period.strip().upper().rstrip("E")
@@ -196,18 +209,26 @@ def normalize_period(raw_period: str | None) -> str:
     m_q_first = re.match(r"^([1-4])Q(?:20)?(\d{2})$", s)
     if m_q_first:
         return f"{m_q_first.group(1)}Q{m_q_first.group(2)}"
-    m_q_second = re.match(r"^Q([1-4])\s*['’]?(?:20)?(\d{2})$", s)
+    m_q_second = re.match(r"^Q([1-4])\s*['’]?\s*(?:20)?(\d{2})$", s)
     if m_q_second:
         return f"{m_q_second.group(1)}Q{m_q_second.group(2)}"
-    m_year_q = re.match(r"^20(\d{2})\s*Q([1-4])$", s)
+    m_year_q = re.match(r"^(?:20)?(\d{2})\s*Q([1-4])$", s)
     if m_year_q:
         return f"{m_year_q.group(2)}Q{m_year_q.group(1)}"
     m_h = re.match(r"^([12])H(?:20)?(\d{2})$", s)
     if m_h:
         return f"{m_h.group(1)}H{m_h.group(2)}"
-    m_year_h = re.match(r"^20(\d{2})\s*H([12])$", s)
+    m_year_h = re.match(r"^(?:20)?(\d{2})\s*H([12])$", s)
     if m_year_h:
         return f"{m_year_h.group(2)}H{m_year_h.group(1)}"
+    m_cn = re.match(r"^20(\d{2})\s*(上半年|下半年|全年|财年)$", s)
+    if m_cn:
+        yy, kind_cn = m_cn.group(1), m_cn.group(2)
+        if kind_cn == "上半年":
+            return f"1H{yy}"
+        if kind_cn == "下半年":
+            return f"2H{yy}"
+        return f"FY20{yy}"
     m_year = re.match(r"^(20\d{2})$", s)
     if m_year:
         return f"FY{m_year.group(1)}"
@@ -291,6 +312,13 @@ def _determine_unit_and_scale(
     scale = SCALE_MULTIPLIERS.get(scale_raw, 1.0)
     if scale == 1.0 and header_context:
         scale = _infer_scale_from_header(header_context)
+
+    if scale == 1.0 and combined_ctx and re.search(
+        r"(?:[美港]元/股|人民币/股|元/股|每股|\beps\b|per\s+share|/share\b|/sh\b)",
+        combined_ctx,
+        re.IGNORECASE,
+    ):
+        return currency or "USD", "per_share", 1.0
 
     if currency:
         if scale == 1e9:
@@ -439,13 +467,13 @@ def _clean_metric_header(header_text: str) -> str:
 def _resolve_footnote_target(
     fn_id: str | None, footnotes: dict[str, str]
 ) -> str | None:
-    """Resolve footnote ID to its target prefix, supporting inline [^E0001] evidence refs."""
+    """Resolve footnote ID to its target prefix, supporting inline [^E0001] and [^E-...] evidence refs."""
     if not fn_id:
         return None
     if fn_id in footnotes:
         return footnotes[fn_id]
     s = fn_id.strip()
-    if re.match(r"^E-?\d+$", s, re.IGNORECASE):
+    if re.match(r"^E-?\d+$", s, re.IGNORECASE) or s.upper().startswith("E-"):
         return f"evidence:{s}"
     if s.startswith(("evidence:", "run:", "filing:", "attachment:")):
         return s
@@ -509,6 +537,7 @@ def extract_figures(markdown_text: str) -> list[ExtractedFigure]:
     in_html_comment = False
     in_disclaimer = False
     current_section_period = ""
+    current_section_title = ""
     last_caption_line = ""
 
     # Track Markdown table state
@@ -551,6 +580,8 @@ def extract_figures(markdown_text: str) -> list[ExtractedFigure]:
         # Section heading check (detect disclaimer section or section-level period)
         if stripped.startswith("#"):
             heading_text = _HEADING_PREFIX_RE.sub("", stripped)
+            if stripped.startswith("## ") or not current_section_title:
+                current_section_title = heading_text.strip()
             if any(
                 k in heading_text.lower()
                 for k in ("免责声明", "disclaimer", "风险提示与免责")
@@ -744,6 +775,7 @@ def extract_figures(markdown_text: str) -> list[ExtractedFigure]:
                                     "row": eff_row_header,
                                     "col": col_header,
                                     "sentence": stripped,
+                                    "section": current_section_title,
                                 },
                                 exempt=is_exempt,
                                 exempt_reason="illustrative" if is_exempt else None,
@@ -769,9 +801,13 @@ def extract_figures(markdown_text: str) -> list[ExtractedFigure]:
                 + masked_line[sm.end() :]
             )
 
+        # Mask filing forms (e.g. "10-Q" in "Q2 10-Q") and inline refs before scanning for period tokens
+        period_scan_line = scan_line
+        for pat in (_INLINE_CODE_RE, _MARKDOWN_LINK_RE, _FOOTNOTE_REF_RE, _FILING_FORM_RE):
+            period_scan_line = pat.sub(lambda m: " " * len(m.group(0)), period_scan_line)
         line_periods = [
             (pm.start(), normalize_period(pm.group(1)))
-            for pm in _PERIOD_TOKEN_RE.finditer(scan_line)
+            for pm in _PERIOD_TOKEN_RE.finditer(period_scan_line)
         ]
         line_footnotes = [
             (fm.start(), fm.group(1))
@@ -813,14 +849,22 @@ def extract_figures(markdown_text: str) -> list[ExtractedFigure]:
             if is_neg:
                 val = -val
 
-            # Nearest period in same line (prefer preceding, else nearest following, else section)
+            # Nearest period in same line: prefer preceding period on the line;
+            # only look forward within the same clause (no 。；; between number and period)
             period = current_section_period
             if line_periods:
                 preceding = [p for pos, p in line_periods if pos <= nm.start()]
                 if preceding:
                     period = preceding[-1]
                 else:
-                    period = line_periods[0][1]
+                    following_same_clause = [
+                        p
+                        for pos, p in line_periods
+                        if pos > nm.start()
+                        and not re.search(r"[。；;]", scan_line[nm.end() : pos])
+                    ]
+                    if following_same_clause:
+                        period = following_same_clause[0]
 
             # Nearest footnote at or after this number on the same line
             fn_id: str | None = None
@@ -833,11 +877,20 @@ def extract_figures(markdown_text: str) -> list[ExtractedFigure]:
             fn_target = _resolve_footnote_target(fn_id, footnotes)
 
             metric = _extract_metric_from_context(scan_line, nm.start(), nm.end())
+            ctx_left = scan_line[max(0, nm.start() - 25) : nm.start()]
+            for sep in ("。", "；", ";"):
+                if sep in ctx_left:
+                    ctx_left = ctx_left.rsplit(sep, 1)[-1]
+            ctx_right = scan_line[nm.end() : nm.end() + 15]
+            for sep in ("。", "；", ";"):
+                if sep in ctx_right:
+                    ctx_right = ctx_right.split(sep, 1)[0]
+            clause_ctx = f"{ctx_left}{scan_line[nm.start() : nm.end()]}{ctx_right}"
             currency, unit, scale = _determine_unit_and_scale(
                 nm.group("currency"),
                 nm.group("scale"),
                 nm.group("unit"),
-                context_text=scan_line[max(0, nm.start() - 25) : nm.end() + 15],
+                context_text=clause_ctx,
                 header_context=last_caption_line if "单位" in last_caption_line else "",
             )
             label_hint = "reported"
@@ -863,6 +916,7 @@ def extract_figures(markdown_text: str) -> list[ExtractedFigure]:
                         "row": None,
                         "col": None,
                         "sentence": stripped,
+                        "section": current_section_title,
                     },
                     exempt=is_exempt,
                     exempt_reason=exempt_reason,
@@ -874,7 +928,155 @@ def extract_figures(markdown_text: str) -> list[ExtractedFigure]:
     return figures
 
 
-_VALID_LABEL_KINDS = frozenset({"reported", "estimate", "consensus", "guidance", "derived"})
+_VALID_LABEL_KINDS = frozenset(
+    {"reported", "estimate", "consensus", "guidance", "derived", "incidental"}
+)
+
+_FINANCIAL_RAW_TOKENS = (
+    "%",
+    "％",
+    "$",
+    "¥",
+    "美元",
+    "港元",
+    "人民币",
+    "元",
+    "亿",
+    "万",
+    "百万",
+    "bn",
+    "mn",
+    "billion",
+    "million",
+    "bp",
+    "bps",
+    "pp",
+    "倍",
+)
+
+
+def _can_be_incidental(fig: ExtractedFigure, item_unit: str = "") -> bool:
+    """Return True if ``fig`` is eligible to be excluded as ``incidental`` (P0I §1.4 / L35).
+
+    Numbers with currency, percentage, basis points, or valuation multiples (or inside tables)
+    cannot be marked ``incidental``.
+    """
+    if fig.location.get("table"):
+        return False
+    if fig.currency is not None or fig.scale > 1.0:
+        return False
+    orig_unit = (fig.unit or "").strip().lower()
+    if orig_unit not in ("", "other", "count"):
+        return False
+    new_unit = (item_unit or "").strip().lower()
+    if new_unit not in ("", "other", "count"):
+        return False
+    raw_low = (fig.raw or "").strip().lower()
+    if any(tok in raw_low for tok in _FINANCIAL_RAW_TOKENS):
+        return False
+    if re.search(r"\d\s*x$", raw_low):
+        return False
+    return True
+
+
+def _split_markdown_sections_and_chunks(
+    markdown_text: str,
+    max_chunk_chars: int = 6000,
+) -> tuple[list[str], list[tuple[str, int, int, str]]]:
+    """Split markdown by H2 (`## `) sections and paragraph chunks (<=6000 chars with 1-paragraph overlap).
+
+    Returns ``(outline, chunks)`` where each chunk is ``(section_title, start_line, end_line, chunk_text)``.
+    """
+    lines = markdown_text.splitlines()
+    if not lines:
+        return [], []
+
+    outline: list[str] = []
+    sections: list[tuple[str, int, int]] = []
+    curr_title = ""
+    curr_start = 1
+    in_code = False
+
+    for idx, raw_line in enumerate(lines, start=1):
+        stripped = raw_line.strip()
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            in_code = not in_code
+            continue
+        if in_code:
+            continue
+        if stripped.startswith("#"):
+            if stripped.startswith("# ") or stripped.startswith("## "):
+                outline.append(stripped)
+            if stripped.startswith("## "):
+                if idx > curr_start:
+                    sections.append((curr_title, curr_start, idx - 1))
+                curr_title = _HEADING_PREFIX_RE.sub("", stripped).strip() or stripped
+                curr_start = idx
+            elif not curr_title:
+                curr_title = _HEADING_PREFIX_RE.sub("", stripped).strip() or stripped
+
+    if curr_start <= len(lines):
+        sections.append((curr_title, curr_start, len(lines)))
+
+    chunks: list[tuple[str, int, int, str]] = []
+    for sec_title, s_line, e_line in sections:
+        if any(
+            k in sec_title.lower()
+            for k in ("免责声明", "disclaimer", "风险提示与免责")
+        ):
+            continue
+        sec_text = "\n".join(lines[s_line - 1 : e_line])
+        if len(sec_text) <= max_chunk_chars:
+            chunks.append((sec_title, s_line, e_line, sec_text))
+            continue
+
+        # Split long section by paragraphs (blank lines), overlapping 1 paragraph between chunks
+        paragraphs: list[tuple[int, int, str]] = []
+        p_start = s_line
+        buf: list[str] = []
+        for l_no in range(s_line, e_line + 1):
+            l_txt = lines[l_no - 1]
+            if not l_txt.strip() and buf:
+                paragraphs.append((p_start, l_no - 1, "\n".join(buf)))
+                buf = []
+                p_start = l_no + 1
+            else:
+                if not buf:
+                    p_start = l_no
+                buf.append(l_txt)
+        if buf:
+            paragraphs.append((p_start, e_line, "\n".join(buf)))
+
+        if not paragraphs:
+            chunks.append((sec_title, s_line, e_line, sec_text))
+            continue
+
+        c_start = paragraphs[0][0]
+        c_end = paragraphs[0][1]
+        c_paras: list[str] = []
+        prev_overlap_para = ""
+        for p_s, p_e, p_txt in paragraphs:
+            candidate_len = sum(len(x) + 2 for x in c_paras) + len(p_txt)
+            if c_paras and candidate_len > max_chunk_chars:
+                prefix = f"{prev_overlap_para}\n\n" if prev_overlap_para else ""
+                chunks.append((sec_title, c_start, c_end, prefix + "\n\n".join(c_paras)))
+                prev_overlap_para = c_paras[-1]
+                c_start = p_s
+                c_end = p_e
+                c_paras = [p_txt]
+            else:
+                if not c_paras:
+                    c_start = p_s
+                c_end = p_e
+                c_paras.append(p_txt)
+        if c_paras:
+            prefix = f"{prev_overlap_para}\n\n" if prev_overlap_para else ""
+            chunks.append((sec_title, c_start, c_end, prefix + "\n\n".join(c_paras)))
+
+    return outline, chunks
+
+
+_COLLOQUIAL_HINT_RE = re.compile(r"(?:[一二两三四五六七八九十]成|百分之|分之|翻倍|翻一番|腰斩|过半|减半)")
 
 
 async def label_figures_with_status(
@@ -882,139 +1084,247 @@ async def label_figures_with_status(
     figures: list[ExtractedFigure],
     *,
     user_id: str = "local-dev-user",
-    llm_service: Any = None,
+    stats_out: dict[str, Any] | None = None,
 ) -> tuple[list[ExtractedFigure], bool]:
-    """Step B LLM figure labeling (`audit.label_figures`) required on every publish audit (P0H §1.2, L28, L31).
+    """Step B LLM figure labeling (`audit.label_figures`) across all figures and sections (P0I §1.4, L28, L35).
 
-    Returns ``(updated_figures, labeling_ok)``. Never falls back to deterministic semantic rules on failure.
+    Returns ``(updated_figures, labeling_ok)``. Populates ``stats_out`` when provided.
     """
+    total_initial = len(figures)
     if assist_json is None:
+        if stats_out is not None:
+            stats_out.update(
+                {
+                    "total": total_initial,
+                    "labeled": 0,
+                    "batches": 1 if total_initial else 0,
+                    "failed_batches": 1 if total_initial else 0,
+                    "failed_batch_details": (
+                        [{"batch_index": 1, "start_fig": 1, "end_fig": total_initial, "section": ""}]
+                        if total_initial
+                        else []
+                    ),
+                    "incidental_excluded": 0,
+                    "llm_period_overrides": 0,
+                }
+            )
         return figures, False
 
     footnotes = parse_footnotes(markdown_text)
     lines = markdown_text.splitlines()
+    outline, chunks = _split_markdown_sections_and_chunks(markdown_text, max_chunk_chars=6000)
 
-    unlabeled_figs = [f for f in figures if not f.metric or not f.period]
-    prioritized_figs = (unlabeled_figs if unlabeled_figs else figures)[:10]
+    # Map each figure to its chunk; batch up to 40 figures per call
+    batches: list[tuple[str, int, str, list[ExtractedFigure], int, int]] = []
+    assigned_ids: set[str] = set()
+    fig_ordinal_map = {f.id: idx for idx, f in enumerate(figures, start=1)}
 
-    payload = {
-        "markdown_excerpt": markdown_text[:3000],
-        "extracted_figures": [
-            {
-                "id": f.id,
-                "raw": f.raw,
-                "value": f.value,
-                "unit": f.unit,
-                "scale": f.scale,
-                "metric": f.metric,
-                "period": f.period,
-                "kind": f.label_hint,
-                "exempt": f.exempt,
-                "line": f.location.get("line"),
-                "sentence": f.location.get("sentence"),
-            }
-            for f in prioritized_figs
-        ],
-    }
-    res = await assist_json(
-        task="audit.label_figures",
-        instructions=(
-            "You are Step B of the Dalton publication audit pipeline. "
-            "1) For each item in extracted_figures, label its financial `metric`, normalized `period` "
-            "(e.g. 2Q26, 3Q26, FY2026), canonical `unit` (if missing or inherited from context), "
-            "and semantic `kind` ('reported', 'estimate', 'consensus', 'guidance', or 'derived'). "
-            "2) Also scan markdown_excerpt for any colloquial Chinese numbers not already in extracted_figures "
-            "(such as '三成', '两成', '百分之三十', '五分之一', '翻倍', '腰斩', '过半', '减半') and return them "
-            "in `extra_figures` with exact `raw` substring from the draft, `line` number, numeric `value` "
-            "(e.g. 30.0 for 三成, 20.0 for 两成, 2.0 for 翻倍, 50.0 for 过半/腰斩), `unit` ('pct' or 'x'), "
-            "`metric`, `period`, and `kind`."
-        ),
-        payload=payload,
-        schema=FigureLabels.model_json_schema(),
-        user_id=user_id,
-        llm_service=llm_service,
-        timeout_s=90.0,
-    )
-    if not res.ok or not res.data:
-        return figures, False
+    for sec_title, c_start, c_end, chunk_text in chunks:
+        chunk_figs = [
+            f
+            for f in figures
+            if f.id not in assigned_ids
+            and c_start <= int(f.location.get("line") or 1) <= c_end
+        ]
+        for f in chunk_figs:
+            assigned_ids.add(f.id)
 
-    try:
-        parsed = FigureLabels.model_validate(res.data)
-    except Exception:
-        return figures, False
+        if chunk_figs:
+            for offset in range(0, len(chunk_figs), 40):
+                sub = chunk_figs[offset : offset + 40]
+                s_idx = fig_ordinal_map[sub[0].id]
+                e_idx = fig_ordinal_map[sub[-1].id]
+                batches.append((sec_title, c_start, chunk_text, sub, s_idx, e_idx))
+        elif _COLLOQUIAL_HINT_RE.search(chunk_text) or (not figures and chunk_text.strip()):
+            batches.append((sec_title, c_start, chunk_text, [], 0, 0))
+
+    leftover = [f for f in figures if f.id not in assigned_ids]
+    if leftover:
+        for offset in range(0, len(leftover), 40):
+            sub = leftover[offset : offset + 40]
+            s_idx = fig_ordinal_map[sub[0].id]
+            e_idx = fig_ordinal_map[sub[-1].id]
+            batches.append(("", 1, markdown_text[:6000], sub, s_idx, e_idx))
+
+    if not batches and markdown_text.strip():
+        batches.append(("", 1, markdown_text[:6000], [], 0, 0))
 
     by_id = {f.id: f for f in figures}
-    for item in parsed.items:
-        target = by_id.get(item.id)
-        if target is None:
-            continue
-        if item.metric and not re.search(r"[A-Za-z]{2,}|[\u4e00-\u9fff]{2,}", target.metric or ""):
-            target.metric = item.metric
-        if item.period and not target.period:
-            target.period = normalize_period(item.period) or item.period
-        if item.unit and target.unit == "other":
-            target.unit = item.unit
-        if item.kind and item.kind.lower() in _VALID_LABEL_KINDS:
-            target.label_hint = item.kind.lower()
-
     fig_counter = len(figures)
-    existing_raws_by_line = {
-        (f.location.get("line"), f.raw) for f in figures
-    }
-    for extra in parsed.extra_figures:
-        raw_sub = (extra.raw or "").strip()
-        if not raw_sub:
-            continue
-        # Code-anchor extra.raw in the draft lines
-        matched_line_no = extra.line if 1 <= extra.line <= len(lines) else 1
-        matched_line_text = ""
-        if 1 <= matched_line_no <= len(lines) and raw_sub in lines[matched_line_no - 1]:
-            matched_line_text = lines[matched_line_no - 1]
-        else:
-            for idx, l_text in enumerate(lines, start=1):
-                if raw_sub in l_text:
-                    matched_line_no = idx
-                    matched_line_text = l_text
-                    break
-        if not matched_line_text:
-            continue
-        if (matched_line_no, raw_sub) in existing_raws_by_line:
-            continue
-        existing_raws_by_line.add((matched_line_no, raw_sub))
+    existing_raws_by_line = {(f.location.get("line"), f.raw) for f in figures}
 
-        # Associate footnote and exemption from the anchored draft line
-        raw_pos = matched_line_text.find(raw_sub)
-        line_fns = [
-            (fm.start(), fm.group(1))
-            for fm in _FOOTNOTE_REF_RE.finditer(matched_line_text)
-        ]
-        fn_id: str | None = None
-        after_fns = [fid for pos, fid in line_fns if pos >= raw_pos + len(raw_sub) - 1]
-        if after_fns:
-            fn_id = after_fns[0]
-        elif line_fns:
-            fn_id = line_fns[-1][1]
-        fn_target = _resolve_footnote_target(fn_id, footnotes)
-        is_exempt = matched_line_text.strip().startswith(">") or bool(
-            _EXEMPT_MARKER_RE.search(matched_line_text)
-        )
-        kind_val = (
-            extra.kind.lower()
-            if extra.kind and extra.kind.lower() in _VALID_LABEL_KINDS
-            else "reported"
-        )
-        period_val = normalize_period(extra.period) if extra.period else ""
-        if not period_val:
-            pm = _PERIOD_TOKEN_RE.search(matched_line_text)
-            if pm:
-                period_val = normalize_period(pm.group(1))
-        metric_val = extra.metric or _extract_metric_from_context(
-            matched_line_text, raw_pos, raw_pos + len(raw_sub)
-        )
+    labeled_count = 0
+    failed_batches = 0
+    failed_batch_details: list[dict[str, Any]] = []
+    llm_period_overrides = 0
 
-        fig_counter += 1
-        figures.append(
-            ExtractedFigure(
+    for batch_idx, (sec_title, c_start, chunk_text, batch_figs, s_idx, e_idx) in enumerate(batches, start=1):
+        local_to_fig: dict[str, ExtractedFigure] = {}
+        payload_figs: list[dict[str, Any]] = []
+        for local_i, f in enumerate(batch_figs, start=1):
+            local_id = f"B-{local_i:03d}"
+            local_to_fig[local_id] = f
+            local_to_fig[f.id] = f
+            rel_line = max(1, int(f.location.get("line") or c_start) - c_start + 1)
+            payload_figs.append(
+                {
+                    "id": local_id,
+                    "raw": f.raw,
+                    "value": f.value,
+                    "unit": f.unit,
+                    "scale": f.scale,
+                    "metric": f.metric,
+                    "period": f.period,
+                    "kind": f.label_hint,
+                    "exempt": f.exempt,
+                    "line": rel_line,
+                    "sentence": f.location.get("sentence"),
+                }
+            )
+
+        payload = {
+            "outline": outline,
+            "section_title": sec_title,
+            "markdown_excerpt": chunk_text,
+            "extracted_figures": payload_figs,
+        }
+        res = await assist_json(
+            task="audit.label_figures",
+            instructions=(
+                "You are Step B of the Dalton publication audit pipeline. "
+                "1) For each item in extracted_figures, label its financial `metric`, normalized `period` "
+                "(e.g. 2Q26, 3Q26, FY2026, or 'none' if it is an intraday/spot figure with no fiscal period), "
+                "canonical `unit` (e.g. USD_bn, USD_mn, USD, pct, bp, x, per_share, count_mn, count), "
+                "and semantic `kind` ('reported', 'estimate', 'consensus', 'guidance', 'derived', or 'incidental'). "
+                "Use `incidental` ONLY for non-financial numbers in prose (such as social media likes/views/retweets, "
+                "HTTP status codes like 409/500, document/slide/file IDs, model version numbers like Sonnet 5.5, "
+                "rankings like Fortune 500 / Top 20, or calendar durations like 24 hours / 12 months / 365 days). "
+                "NEVER mark any number with currency, percentage (%), basis points (bp), or multiple (x/倍) as `incidental`. "
+                "2) Also scan markdown_excerpt for any colloquial Chinese numbers not already in extracted_figures "
+                "(such as '三成', '两成', '百分之三十', '五分之一', '翻倍', '腰斩', '过半', '减半') and return them "
+                "in `extra_figures` with exact `raw` substring from the draft, `line` number, numeric `value` "
+                "(e.g. 30.0 for 三成, 20.0 for 两成, 2.0 for 翻倍, 50.0 for 过半/腰斩), `unit` ('pct' or 'x'), "
+                "`metric`, `period`, and `kind`."
+            ),
+            payload=payload,
+            schema=FigureLabels.model_json_schema(),
+            user_id=user_id,
+            timeout_s=90.0,
+        )
+        if not res.ok or not res.data:
+            failed_batches += 1
+            failed_batch_details.append(
+                {
+                    "batch_index": batch_idx,
+                    "start_fig": s_idx,
+                    "end_fig": e_idx,
+                    "section": sec_title,
+                }
+            )
+            continue
+
+        try:
+            parsed = FigureLabels.model_validate(res.data)
+        except Exception:
+            failed_batches += 1
+            failed_batch_details.append(
+                {
+                    "batch_index": batch_idx,
+                    "start_fig": s_idx,
+                    "end_fig": e_idx,
+                    "section": sec_title,
+                }
+            )
+            continue
+
+        labeled_count += len(batch_figs)
+        for item in parsed.items:
+            target = local_to_fig.get(item.id) or (by_id.get(item.id) if not batch_figs else None)
+            if target is None:
+                continue
+
+            # LLM annotations take priority over code heuristics (P0I §1.4 / L35)
+            raw_kind = item.kind.strip().lower() if item.kind else ""
+            if raw_kind in _VALID_LABEL_KINDS:
+                if raw_kind == "incidental" and not _can_be_incidental(target, item.unit):
+                    raw_kind = "reported"
+                target.label_hint = raw_kind
+
+            if item.metric and item.metric.strip():
+                target.metric = item.metric.strip()
+
+            if item.period and item.period.strip():
+                p_raw = item.period.strip()
+                if p_raw.lower() in ("none", "n/a", "null", "spot", "intraday", "无", "-"):
+                    if target.period:
+                        llm_period_overrides += 1
+                    target.period = ""
+                else:
+                    norm_p = normalize_period(p_raw) or p_raw
+                    if norm_p != target.period:
+                        llm_period_overrides += 1
+                    target.period = norm_p
+
+            if item.unit and item.unit.strip():
+                u_clean = item.unit.strip()
+                if target.label_hint != "incidental" or u_clean in ("other", "count"):
+                    target.unit = u_clean
+
+        for extra in parsed.extra_figures:
+            raw_sub = (extra.raw or "").strip()
+            if not raw_sub:
+                continue
+            # Code-anchor extra.raw in the draft lines
+            matched_line_no = extra.line if 1 <= extra.line <= len(lines) else 1
+            matched_line_text = ""
+            if 1 <= matched_line_no <= len(lines) and raw_sub in lines[matched_line_no - 1]:
+                matched_line_text = lines[matched_line_no - 1]
+            else:
+                for idx, l_text in enumerate(lines, start=1):
+                    if raw_sub in l_text:
+                        matched_line_no = idx
+                        matched_line_text = l_text
+                        break
+            if not matched_line_text:
+                continue
+            if (matched_line_no, raw_sub) in existing_raws_by_line:
+                continue
+            existing_raws_by_line.add((matched_line_no, raw_sub))
+
+            # Associate footnote and exemption from the anchored draft line
+            raw_pos = matched_line_text.find(raw_sub)
+            line_fns = [
+                (fm.start(), fm.group(1))
+                for fm in _FOOTNOTE_REF_RE.finditer(matched_line_text)
+            ]
+            fn_id: str | None = None
+            after_fns = [fid for pos, fid in line_fns if pos >= raw_pos + len(raw_sub) - 1]
+            if after_fns:
+                fn_id = after_fns[0]
+            elif line_fns:
+                fn_id = line_fns[-1][1]
+            fn_target = _resolve_footnote_target(fn_id, footnotes)
+            is_exempt = matched_line_text.strip().startswith(">") or bool(
+                _EXEMPT_MARKER_RE.search(matched_line_text)
+            )
+            kind_val = (
+                extra.kind.lower()
+                if extra.kind and extra.kind.lower() in _VALID_LABEL_KINDS
+                else "reported"
+            )
+            if kind_val == "incidental":
+                kind_val = "reported"
+            period_val = normalize_period(extra.period) if extra.period else ""
+            if not period_val:
+                pm = _PERIOD_TOKEN_RE.search(matched_line_text)
+                if pm:
+                    period_val = normalize_period(pm.group(1))
+            metric_val = extra.metric or _extract_metric_from_context(
+                matched_line_text, raw_pos, raw_pos + len(raw_sub)
+            )
+
+            fig_counter += 1
+            new_fig = ExtractedFigure(
                 id=f"F-{fig_counter:03d}",
                 raw=raw_sub,
                 value=extra.value,
@@ -1033,28 +1343,32 @@ async def label_figures_with_status(
                     "row": None,
                     "col": None,
                     "sentence": matched_line_text.strip(),
+                    "section": sec_title,
                 },
                 exempt=is_exempt,
                 exempt_reason="illustrative" if is_exempt else None,
             )
-        )
-    return figures, True
+            figures.append(new_fig)
+            by_id[new_fig.id] = new_fig
+            labeled_count += 1
 
-
-async def maybe_label_prose_figures_with_llm(
-    markdown_text: str,
-    figures: list[ExtractedFigure],
-    *,
-    user_id: str = "local-dev-user",
-    llm_service: Any = None,
-) -> list[ExtractedFigure]:
-    """Wrapper around `label_figures_with_status` returning the updated figure list."""
-    updated, _ = await label_figures_with_status(
-        markdown_text,
-        figures,
-        user_id=user_id,
-        llm_service=llm_service,
+    incidental_excluded = sum(
+        1 for f in figures if not f.exempt and f.label_hint == "incidental"
     )
-    return updated
+    if stats_out is not None:
+        stats_out.update(
+            {
+                "total": len(figures),
+                "labeled": labeled_count,
+                "batches": len(batches),
+                "failed_batches": failed_batches,
+                "failed_batch_details": failed_batch_details,
+                "incidental_excluded": incidental_excluded,
+                "llm_period_overrides": llm_period_overrides,
+            }
+        )
+
+    return figures, failed_batches == 0
+
 
 

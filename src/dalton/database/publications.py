@@ -490,5 +490,9 @@ async def resolve_thread_author_model(thread_id: str | None) -> str | None:
             type(exc).__name__,
         )
         return None
+    logger.warning(
+        "No author model found for thread %s in conversation_usages or conversation_threads",
+        thread_id,
+    )
     return None
 

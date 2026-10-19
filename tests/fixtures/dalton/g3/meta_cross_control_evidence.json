@@ -1,0 +1,1898 @@
+{
+  "evidence": [
+    {
+      "id": "E-20261015-001",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "internal_note",
+        "identity": "OpenClaw META thesis.md D1 L19",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "分歧：2027 年总费用（剔除法律计提）增速落在 25% 以内，还是 30% 以上？",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "neutral",
+      "quality": "high"
+    },
+    {
+      "id": "E-20261015-002",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "OpenClaw META thesis.md D1 L20",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "Bull：收入加速能覆盖；机房自建，H100 比去年更值钱（Zuckerberg）。对外出租这条退路已经搁置：FUNDA AI 10/13 引 WSJ 10/9 报道，Muse 推理和下一代模型训练需求上升，Meta 搁置把算力租给 Anthropic 的计划（7 月 NYT 报道规模两年约 100 亿美元）。",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "confirming",
+      "quality": "high"
+    },
+    {
+      "id": "E-20261015-003",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "OpenClaw META thesis.md D1 L21",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "Bear：Q2 自由现金流只有 7.8 亿美元；JPM 模型 2027 调整后 EBITDA 1,828 亿 < capex 2,427 亿；Zuckerberg 10/12 对 FT 说 Meta \"already working on the next step up\"，指下一代模型（TMTB 10/12 EOD Wrap 转述；NDTV 转述 FT 另一句 progress would \"probably feel like it'll go quite a bit faster from here\"），同次采访拒绝的\"放慢\"指 9 月 Anthropic CEO 提议的放慢 AI 能力进展（安全议题）；capex 层面的原话来自 Cheeky Pint：1GW 集群运营约 150 亿美元/年、建设 500 亿至 600 亿，模型出来前已承诺 1,000 亿至 2,000 亿；Cheeky Pint（10/12 上线，YouTube 字幕核对）里的 tone：去年底内部有人主张 \"be a little more conservative\"，回答是 \"no, we're doing this... burn the boats\"；兜底理由是 \"if AI works overall, plenty of other people want all our compute\"，要失败得 \"AI overall has to fail\"；资金来源说的是核心业务加 \"good credit and can kind of underwrite these large investments\"，再加订阅、交易抽成、API 和企业平台，没给 ROI 时间表；TMTB Slack 把\"no slowdown\"读成大幅上调 capex 的信号，META 当日从 +4.7% 回落到 +3.4%；卖方 2027 capex 普遍上调到 2,250 亿至 2,500 亿，折旧大增；高盛 Eric Sheridan 10/14 数字广告前瞻（AlphaEngine 320000610462572）称其 2027 年 opex 预测高于市场一致，理由是 Meta 找到产品市场契合点后投入通常往上走（报告未给具体数字）；富国 10/5 Q3 前瞻（AlphaEngine 320000610452310，摘要）同样提示 2027 年 opex 高于市场预期，2027 EPS 下调到 31.18 美元，比当前一致 34.05 低约 8%；Oppenheimer（Perform，据 TMTB 10/15 Morning Wrap 转述）提出「FY27 AI 成本重置」，下调 2027 经营利润约 3%、EPS 约 4%，同时上调 2028 收入/EBIT/EPS 约 4%/8%/10%，按 22 至 25 倍 2028 EPS 得出 780 至 890 美元。",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "weakening",
+      "quality": "high"
+    },
+    {
+      "id": "E-20261015-004",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "OpenClaw META thesis.md D1 L22",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "Bear 补充（10/15 并入）：FUNDA AI 10/13 渠道调研称下一代模型是 Wonder（约 3T 参数）的数倍，GB300 最紧缺、Meta 已大额预订 Vera Rubin，预计 2027 capex 指引再上调；Zuckerberg 10 月播客称 1GW 集群建设 500 亿至 600 亿美元、每年运营约 150 亿。约 9/21 自称 MSL 人员的专家说研发已基本不用 H100，外部对租 H100 兴趣低；前 Scale AI 专家（会期约 9/9–9/20）说算力约 60% 用于研究、30% 用于其他推理、Muse 约 10%，并说 Meta 正把部分计算、存储需求从 AWS 和 Azure 迁回自建。",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "weakening",
+      "quality": "high"
+    },
+    {
+      "id": "E-20261015-005",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "internal_note",
+        "identity": "OpenClaw META thesis.md D1 L23",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "当前倾向：偏 Bear，中高（10/15 由中上调）。增速超过 25% 的可能性更大，算力自用、对外出租搁置让 capex 上修更确定。",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "neutral",
+      "quality": "high"
+    },
+    {
+      "id": "E-20261015-006",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "internal_note",
+        "identity": "OpenClaw META thesis.md D1 L24",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "改判：电话会把 2027 年费用增速说在 25% 以内。",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "neutral",
+      "quality": "high"
+    },
+    {
+      "id": "E-20261015-007",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "internal_note",
+        "identity": "OpenClaw META thesis.md D2 L27",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "分歧：Muse DAU 能否重新加速、2027 年内能否出现可量化的直接收入？",
+      "pillar_ids": [
+        "P2"
+      ],
+      "signal": "neutral",
+      "quality": "high"
+    },
+    {
+      "id": "E-20261015-008",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "OpenClaw META thesis.md D2 L28",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "Bull：美国下载 22 天破 500 万（Evercore，ChatGPT 用了 56 天）；D7 留存超过 30%、D14 22%（Sensor Tower）；10/12 Muse Wonder Full 在 Artificial Analysis 智能指数 56 分，与 Sonnet 5.5 并列第二，仅次于 Opus 5.5 的 58 分；新收入线：订阅（Wonder 付费）、交易抽成、企业平台（CJ Desai 负责）、模型 API；用自家模型替代外购 Anthropic（Reuters）；AlphaEngine 10/15 点评把 Meta 和微软削减支出列为 Anthropic Q3 ARR 放缓的原因之一（市场乐观派说法），BofA Justin Post 10/14 也把降低外购 token 成本列为 Muse Wonder 的收益。卖方开始给 Muse 收入定量：Truist 10/13 维持买入/1,000，预计 Muse 2027 财年开始贡献收入，2030 财年基准情形增量约 285 亿美元（TradingView/Benzinga 摘要与 X @pequityresearch 一致；X 帖另给区间 114 亿至 542 亿，约为 2026 财年收入的 11%，区间为单一来源）；UBS 10/14 目标价 715→884、买入，理由是 Business Agents 和 Muse 在 WhatsApp、Messenger 的变现，加上搜索广告份额提升。",
+      "pillar_ids": [
+        "P2"
+      ],
+      "signal": "confirming",
+      "quality": "high"
+    },
+    {
+      "id": "E-20261015-009",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "OpenClaw META thesis.md D2 L29",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "Bear：Similarweb DAU 9 月下旬日增约 14.5 万，10 月以来降到约 4.5 万，10/5 峰值 218 万；广发 10/13 专题用另一口径统计 10/6 DAU 273 万，周均净增从 9/15–22 的 19.8 万降到 9/30–10/6 的 7.4 万，下载峰值 21.5 万（9/24），10/6 较峰值回落 21%，放缓方向与 Similarweb 一致；每 100 万 DAU 约需 5 万张 GPU（FUNDA AI）；Jefferies 实测约三分之一网站能顺畅使用，Amazon、Airbnb 拒绝接入；大摩认为直接变现要到 2027 年底至 2028 年。",
+      "pillar_ids": [
+        "P2"
+      ],
+      "signal": "weakening",
+      "quality": "high"
+    },
+    {
+      "id": "E-20261015-010",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "expert",
+        "identity": "OpenClaw META thesis.md D2 L30",
+        "tier": 5,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "专家补充（10/15 并入）：约 9/21 自称 MSL 人员的专家称 Muse 上线约两周 DAU 刚到 100 万、付费用户刚过 1,000、iOS 约占 70%；免费档每周 1 亿 token，用满时每个免费用户每月约几十美元 GPU 成本加 10 至 20 美元虚拟机成本；结账走 Stripe，他估计 Meta 目前没有抽成，要抽成得先做支付；Meta AI 一大半请求已改用比 Muse Spark 小约 4 倍的蒸馏模型，用户满意度只差几个点。前 Scale AI 专家（9/9–9/20）称每用户每天推理成本平均 3 至 5 美元、收入勉强覆盖成本，抽成约为交易利润的 20%（约合交易额 5% 至 10%），付费率不会超过 ChatGPT 的 5% 至 6%，Meta 内部没有网上那么兴奋。Zuckerberg 9/23 Connect 称先大额免费，之后从交易中收小额费用（Jefferies 9/24 转述）。Wang 9/9 称用户 token 消耗是内部测试组的 10 倍（FUNDA 转述）。",
+      "pillar_ids": [
+        "P2"
+      ],
+      "signal": "neutral",
+      "quality": "medium"
+    },
+    {
+      "id": "E-20261015-011",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "expert",
+        "identity": "OpenClaw META thesis.md D2 L31",
+        "tier": 5,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "成本补充（10/15 11:50 轮）：TMTB 10/14 Podcast Intel 转述 Daytona CEO Ivan Burazin 测算、Box CEO Levie 引用：Muse 服务 1 亿用户约需 6.5 万颗 CPU 加大量 DRAM，个人智能体成本落在 CPU 和内存上，和 GPU 成本叠加。",
+      "pillar_ids": [
+        "P2"
+      ],
+      "signal": "neutral",
+      "quality": "medium"
+    },
+    {
+      "id": "E-20261015-012",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "expert",
+        "identity": "OpenClaw META thesis.md D2 L32",
+        "tier": 5,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "成本补充（10/15 22:00 轮）：Oppenheimer（TMTB 10/15 转述）估计 Muse 下载约 1,080 万，服务 1 亿用户一年约 300 亿美元（折合每 100 万用户约 3 亿，落在下面粗算区间的低端）；取消外购 Anthropic API 省下的钱即使按高端算，也只抵 Street 2027 费用约 7%。Muse Spark Open 10/15 开源（Artificial Analysis：816B 总参数、42B 激活，智能指数 39，美国开源模型第一，比 Muse Wonder 低 13 分；Together、Fireworks、Baseten 定价每百万 token 输入 1.25、输出 4.25 美元），利好开发者生态，对 Muse 变现影响间接。",
+      "pillar_ids": [
+        "P2"
+      ],
+      "signal": "neutral",
+      "quality": "medium"
+    },
+    {
+      "id": "E-20261015-013",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "expert",
+        "identity": "OpenClaw META thesis.md D2 L33",
+        "tier": 5,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "成本粗算（10/15）：每 100 万 DAU 一年约 2.5 亿至 18 亿美元（低端按 MSL 专家、高端按前 Scale 专家，FUNDA 每百万 DAU 5 万张 GPU 落在中间），中值约 10 亿。DAU 到 1,000 万（大摩 Nowak 年底估计）时一年约 100 亿，按每 100 亿费用 EPS 少 3.3 美元，约占 2027 一致 EPS 的 10%。这部分成本主要以折旧和电费进入费用，体现在 capex 上修里。",
+      "pillar_ids": [
+        "P2"
+      ],
+      "signal": "neutral",
+      "quality": "medium"
+    },
+    {
+      "id": "E-20261015-014",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "internal_note",
+        "identity": "OpenClaw META thesis.md D2 L34",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "当前倾向：中性偏 Bear，中。产品力已验证（Wonder 回到前沿），变现路径是交易抽成加订阅，近 12 个月直接收入接近零，成本随 DAU 线性增加。",
+      "pillar_ids": [
+        "P2"
+      ],
+      "signal": "neutral",
+      "quality": "high"
+    },
+    {
+      "id": "E-20261015-015",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "internal_note",
+        "identity": "OpenClaw META thesis.md D2 L35",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "改判：DAU 重新加速到日增 10 万以上，或公司披露付费用户/交易额。",
+      "pillar_ids": [
+        "P2"
+      ],
+      "signal": "neutral",
+      "quality": "high"
+    },
+    {
+      "id": "E-20261015-016",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "internal_note",
+        "identity": "OpenClaw META thesis.md D3 L38",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "分歧：2H26 广告增速维持 27% 以上，到 1Q27 是否回落？",
+      "pillar_ids": [
+        "P3"
+      ],
+      "signal": "neutral",
+      "quality": "high"
+    },
+    {
+      "id": "E-20261015-017",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "OpenClaw META thesis.md D3 L39",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "Bull：Q2 Family of Apps 广告收入 594 亿美元，同比 +27%；Piper 跟踪 Meta CPM 9 月同比 +47%（8 月 +33%）；DB 渠道调研增速提高约 200bp，中小广告主上量更快；伦敦广告追踪专家约 300 家广告主样本，预测 Q3、Q4 支出增长 29%、30%（wiki 专家访谈）；IGG 买量总监（wiki 10/15 专家访谈）称游戏买量预算里 Meta 占比从 Q2 约 35% 升到 Q3 40% 以上，主要从 Google 转来，原因是 Meta 改成实时竞价、模型直接读素材、起量更快；Wedbush 10/13 广告顾问电话会把 Meta、Google 排在头部，Meta 靠 Andromeda 提升 ROAS。",
+      "pillar_ids": [
+        "P3"
+      ],
+      "signal": "confirming",
+      "quality": "high"
+    },
+    {
+      "id": "E-20261015-018",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "OpenClaw META thesis.md D3 L40",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "Bear 补充：同一 IGG 专家预计 10 月中下旬至 11 月电商旺季 CPM 抬到 200 以上（币种未明确），游戏广告主 11 月会在 Meta、Google、AppLovin 上部分缩量，Q4 游戏类投放盘子有一定衰减。",
+      "pillar_ids": [
+        "P3"
+      ],
+      "signal": "weakening",
+      "quality": "high"
+    },
+    {
+      "id": "E-20261015-019",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "OpenClaw META thesis.md D3 L41",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "Bear：同一专家样本 1Q27 增长 27%，低于 Q4 的 30%，基数抬高；TikTok 时长 +17%、DAU +10.5%，快于 Instagram 全球 DAU +6.5%（Citizens，9 月）。",
+      "pillar_ids": [
+        "P3"
+      ],
+      "signal": "weakening",
+      "quality": "high"
+    },
+    {
+      "id": "E-20261015-020",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "internal_note",
+        "identity": "OpenClaw META thesis.md D3 L42",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "当前倾向：偏 Bull，中高。收入侧上修方向明确。",
+      "pillar_ids": [
+        "P3"
+      ],
+      "signal": "neutral",
+      "quality": "high"
+    },
+    {
+      "id": "E-20261015-021",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "internal_note",
+        "identity": "OpenClaw META thesis.md D3 L43",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "改判：Q4 收入指引中值低于 737 亿一致预期。",
+      "pillar_ids": [
+        "P3"
+      ],
+      "signal": "neutral",
+      "quality": "high"
+    },
+    {
+      "id": "E-20261015-022",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "internal_note",
+        "identity": "OpenClaw META thesis.md D4 L46",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "分歧：Meta 会不会用股权/可转债融资，融资成本是否继续抬升？",
+      "pillar_ids": [
+        "P4"
+      ],
+      "signal": "neutral",
+      "quality": "high"
+    },
+    {
+      "id": "E-20261015-023",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "filing",
+        "identity": "OpenClaw META thesis.md D4 L47",
+        "tier": 1,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "证据：Jefferies 销售 10/13 纪要：仓位仍偏多但略有松动，买方担心 2027 年融资（多头认为发债优先于股权）；TMTB 10/14 转述卖方信用电话会，一笔 Meta 背书的数据中心债预期 6.5%，最后定价 7.5%；卖方销售纪要称多数买方认为 Meta 可能做股权融资，800 美元附近是窗口；财报日比原计划提前一周，TMTB 听到的猜测是配合融资（未证实）。BofA AI capex 与信用市场电话会（wiki 10/15 卖方交流）：Meta 虽是 AA 评级，已被信用投资者视为超大规模厂商里贝塔最高的债券；约一个月前欧洲路演时投资者要求 40 至 50 个基点的新券让利；数据中心交易融资成本从预期 6.5% 定到 7.5%（与 TMTB 10/14 一致）；Meta 今年早些时候把净债务中性政策改成净债务为正，并指引每年进债市两次；信用投资者信任度排序 Google、Microsoft、Amazon、Meta、Oracle，Meta 排第四。卖方研报首次写出股权融资判断：Oppenheimer 10/15 认为 Meta 可能在 Anthropic IPO（计划 11 月）之前做股权融资（TMTB 10/15 转述）。买方仓位：Altimeter 的 Brad Gerstner 10/15 在 BG2 播客称约两个月前把组合 10% 移到 Meta（另 10% 到 Tesla），对冲基金敞口降到三年低位（TMTB 10/15 Podcast Intel 与 X @RealNickMugalli、@amitisinvesting 一致）。",
+      "pillar_ids": [
+        "P4"
+      ],
+      "signal": "neutral",
+      "quality": "high"
+    },
+    {
+      "id": "E-20261015-024",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "internal_note",
+        "identity": "OpenClaw META thesis.md D4 L48",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "当前倾向：偏 Bear，低至中（10/15 22:00 由低上调）。融资本身未发生；BofA 信用电话会确认融资成本和新券让利已经抬升，Oppenheimer 把股权融资写进研报，判断从销售转述升级到卖方研究。",
+      "pillar_ids": [
+        "P4"
+      ],
+      "signal": "neutral",
+      "quality": "high"
+    },
+    {
+      "id": "E-20261015-025",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "internal_note",
+        "identity": "OpenClaw META thesis.md D4 L49",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "改判：财报后 30 天内无股权类融资，且债券利差收窄。",
+      "pillar_ids": [
+        "P4"
+      ],
+      "signal": "neutral",
+      "quality": "high"
+    },
+    {
+      "id": "E-20261015-026",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "filing",
+        "identity": "OpenClaw META thesis.md D5 L52",
+        "tier": 1,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "证据：与 50 多个州总检察长青少年案和解约 170 亿至 180 亿美元，分 10 年支付；JPM 按 Q3 计提 100 亿美元建模；Florida 另案要求禁止 14 岁以下使用、青少年每天限 2 小时、关闭未成年人广告；10/15 联邦上诉法院允许 Florida 执行 14 岁以下禁开带自动播放、无限滚动功能社交账号的法律（Reuters，TMTB 10/15 Morning Wrap 转述；涉及 META、SNAP），Florida 一线从诉讼要求变成可执行的州法；参议院民主党人质疑约 66 亿美元数据中心研发税收抵免，据报道 10/31 为回复期限；税率指引 15% 至 17%。",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "neutral",
+      "quality": "high"
+    },
+    {
+      "id": "E-20261015-027",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "internal_note",
+        "identity": "OpenClaw META thesis.md D5 L53",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "当前倾向：GAAP 一次性冲击市场大多剔除；持续性影响看 Florida 案和税率。10/15 上诉法院放行后，Florida 禁令的用户和收入影响进入可测算阶段，规模待公司或卖方给数。",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "neutral",
+      "quality": "high"
+    },
+    {
+      "id": "E-20261015-028",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "filing",
+        "identity": "OpenClaw META thesis.md D6 L56",
+        "tier": 1,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "证据：OpenAI Dots、Instinct；苹果 Siri 接入 Gemini；海通国际 10/13 重申短期看空（Muse DAU 放缓、竞争者进场、AI 投入加码）；国海 10/15 推荐顺序谷歌在 Meta 前，认为 Muse 增长预期已部分反映。",
+      "pillar_ids": [
+        "P2"
+      ],
+      "signal": "neutral",
+      "quality": "high"
+    },
+    {
+      "id": "E-20261015-029",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "OpenClaw 核心判断 L10",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "10/21 Q3 财报，收入预测大概率继续上调；决定 2027 年 EPS 方向的是费用和 capex，这一侧下调可能更大。之后的真正分歧是 2028 年 EPS 守不守得住。",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "neutral",
+      "quality": "medium"
+    },
+    {
+      "id": "E-20261015-030",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "财报风险偏下行，置信度中等。依据",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "财报风险偏下行，置信度中等。依据：对冲基金仓位偏多、融资传闻、过去四次财报后次日三跌一涨（-11.3%、+10.4%、-8.6%、-8.0%，顺序由近到远以首轮研究记录为准）。",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "neutral",
+      "quality": "medium"
+    },
+    {
+      "id": "E-20261015-031",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "转多条件",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "转多条件：Q3 电话会把 2027 年费用增速说在 25% 以内（剔除法律计提），同时 Q4 收入指引中值不低于 750 亿美元；或给出 Muse 付费用户、交易额等可量化数字。",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "neutral",
+      "quality": "medium"
+    },
+    {
+      "id": "E-20261015-032",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "更确定看空条件",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "更确定看空条件：2027 年 capex 指向 2,800 亿美元以上、宣布股权融资、或 Muse DAU 一直停在 200 万出头。",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "neutral",
+      "quality": "medium"
+    },
+    {
+      "id": "E-20261015-033",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "10/15 并入专家材料后",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "10/15 并入专家材料后：2027 年 EPS 下修的置信度由中调到中高。新增依据是算力：Meta 搁置对外出租（WSJ 10/9，FUNDA 转述），下一代模型是 Wonder 的数倍规模，Muse 每多 100 万 DAU 一年多约 2.5 亿至 18 亿美元算力和虚拟机成本，而 Muse 近 12 个月的直接收入接近零（付费用户约 9/21 刚过 1,000）。",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "neutral",
+      "quality": "medium"
+    },
+    {
+      "id": "E-20261015-034",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "公司指引（2Q26 8-K 附件 99.1，accession 0001628280-26-050596，2026-07-29）",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "公司指引（2Q26 8-K 附件 99.1，accession 0001628280-26-050596，2026-07-29）：Q3 收入 610 亿至 640 亿美元；2026 全年总费用 1,650 亿至 1,690 亿（含 Q2 的 24 亿法律费用）；2026 capex 1,300 亿至 1,450 亿（原 1,250 亿至 1,450 亿）；税率指引见 8-K 原文。",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "neutral",
+      "quality": "medium"
+    },
+    {
+      "id": "E-20261015-035",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "一致预期基线（Yahoo，10/15 09:42 跟踪轮读取；平均目标价 813.65、中位 830、区间 580–1,050；10/14 收盘 737.54，单日 -3.27%，QQQ -1.97%；10/15 09:42 快照 730.",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "一致预期基线（Yahoo，10/15 09:42 跟踪轮读取；平均目标价 813.65、中位 830、区间 580–1,050；10/14 收盘 737.54，单日 -3.27%，QQQ -1.97%；10/15 09:42 快照 730.47，-0.96%，QQQ -1.19%；10/15 11:50 再读，各项一致预期与目标价零变动，盘中 733.93，-0.49%，QQQ -0.63%；10/15 22:00 再读仍零变动，收盘 736.72，-0.11%，QQQ -0.13%，5 日 +2.2% 对 QQQ -2.62%）：Q3 收入 634 亿、EPS 5.94（06:53 为 6.01，-1.24%；7 天前 6.25、90 天前 7.06，计入和解计提的分析师在增加，区间 2.88–7.64）；Q4 收入 737 亿、EPS 8.28；2026 EPS 30.81；2027 EPS 34.05（06:53 为 34.09）、收入 3,068 亿；2027 EPS 近 7 天上调 1 家、下调 1 家，近 30 天上调 8 家、下调 3 家。",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "neutral",
+      "quality": "medium"
+    },
+    {
+      "id": "E-20261015-036",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "买方预期",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "买方预期：Q3 收入约 640 亿；Q4 指引买方预期 720 亿至 750 亿，多数押上沿（卖方销售纪要转述）。Altimeter 约 8 月中把组合 10% 移到 Meta（Gerstner 10/15 BG2 播客，见 D4）。",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "neutral",
+      "quality": "medium"
+    },
+    {
+      "id": "E-20261015-037",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "卖方锚点",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "卖方锚点：JPM Doug Anmuth 10/15《Pre-3Q Earnings Estimate Revisions》（AlphaEngine 320000610472493）：Q3/Q4 收入各上调 0.6%；Q3 计提 100 亿和解费用（Q3 EPS 6.62→3.34）；2027 总费用 2,101 亿（剔除法律计提 +25%）；2026/2027/2028 EPS 27.99/31.08/35.45；2027/2028 capex 2,427/2,835 亿。JPM 9/10 上调评级至 OW、目标价 820 美元（23 倍 2028E GAAP EPS 35.44）；JPM 10/12 Muse Wonder 报告（AlphaEngine 320000610454983）标题写「Reiterate Overweight & $920 PT」，目标价已是 920 美元，上调时点待查。",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "neutral",
+      "quality": "medium"
+    },
+    {
+      "id": "E-20261015-038",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "其他评级锚点（AlphaEngine 摘要）",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "其他评级锚点（AlphaEngine 摘要）：Citi 10/12 买入、目标价 800 美元，预计 2027 年 Meta 算力同比翻倍；HSBC 10/13 买入、830 美元；BofA Justin Post 10/14 重申买入（MarketBeat 记目标价 810）；高盛 10/14 数字广告前瞻维持买入、目标价 860 美元（定价基准 10/12 收盘 742.96），同时上调未来 6 至 18 个月收入预测。10/15 11:50 轮核实：UBS 10/14 买入、目标价 715→884（Stocktwits/TradingView 转 TheFly 与 MarketBeat 两个来源）；Guggenheim 10/14 买入、目标价 700→850（TradingView/Benzinga 表与 MarketBeat；据 X @AIStockSavvy 同时上调 2027 预测和 capex，此条单一来源）；Truist 10/13 买入/1,000；KeyBanc 10/13 超配/900；Rosenblatt 10/13 买入/886（后三家据 TradingView/Benzinga 表）。",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "neutral",
+      "quality": "medium"
+    },
+    {
+      "id": "E-20261015-039",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "隐含费用",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "隐含费用：按 25.6 亿股、16% 税率，2027 年一致 EPS 34.09 在一致收入下只容纳约 2,000 亿总费用；费用每多 100 亿美元 EPS 少约 3.3 美元（约 10%），收入每多 1 个百分点（约 31 亿）EPS 多约 1 美元。",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "neutral",
+      "quality": "medium"
+    },
+    {
+      "id": "E-20261015-040",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "三层修正框架",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "三层修正框架：收入层向上；费用/capex 层向下且权重更大；GAAP 一次性项目（和解计提）拉低账面 EPS 但市场大多剔除，看到\"EPS 不及预期\"标题先拆口径。",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "neutral",
+      "quality": "medium"
+    },
+    {
+      "id": "E-20261015-041",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "关键阈值",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "关键阈值：剔除法律计提的 2027 费用增速 25% 左右市场已消化；30% 以上一致 EPS 还要再降 3 到 5 美元。Meta 惯例 Q3 给下一年方向（2023 年给过初步区间），1 月 Q4 财报给正式数字；今年 7 月没给 2027 方向，见「指引节奏」。",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "neutral",
+      "quality": "medium"
+    },
+    {
+      "id": "E-20261015-042",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "2027 一致 EPS（Yahoo +1y）",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "2027 一致 EPS（Yahoo +1y）：34.05（10/15 09:42；06:53 为 34.09）。单次运行变动 ≥1% 或 7 天变动 ≥2% 算重要。",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "neutral",
+      "quality": "medium"
+    },
+    {
+      "id": "E-20261015-043",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "2027 隐含总费用空间",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "2027 隐含总费用空间：约 2,031 亿（10/15 09:42 packet 测算）。",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "neutral",
+      "quality": "medium"
+    },
+    {
+      "id": "E-20261015-044",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "Q4 收入一致预期",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "Q4 收入一致预期：737 亿（10/15）。",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "neutral",
+      "quality": "medium"
+    },
+    {
+      "id": "E-20261015-045",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "Muse DAU（Similarweb）",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "Muse DAU（Similarweb）：峰值 218 万（10/5），10 月日增约 4.5 万。跌破 200 万或日增回到 10 万以上算重要。参考口径：Citi 10/12 美国 DAU 200 万、累计下载 860 万；广发 10/6 DAU 273 万、周均净增 7.4 万。",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "neutral",
+      "quality": "medium"
+    },
+    {
+      "id": "E-20261015-046",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "Muse 付费用户",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "Muse 付费用户：约 9/21 刚过 1,000（MSL 专家）。公司首次披露付费或交易额时算重要。",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "neutral",
+      "quality": "medium"
+    },
+    {
+      "id": "E-20261015-047",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "卖方平均目标价（Yahoo，12 个月）",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "卖方平均目标价（Yahoo，12 个月）：813.65（10/15）。",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "neutral",
+      "quality": "medium"
+    },
+    {
+      "id": "E-20261015-048",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "Meta CPM 同比（Piper 月度）",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "Meta CPM 同比（Piper 月度）：9 月 +47%。",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "neutral",
+      "quality": "medium"
+    },
+    {
+      "id": "E-20261015-049",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "数据中心融资利率",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "数据中心融资利率：Meta 背书项目 7.5%（10/14 TMTB 转述，10/15 BofA 信用电话会同口径）。新券让利：欧洲路演约 40 至 50 个基点（BofA，约 9 月中）。下一笔 Meta 债券让利超过 50 个基点或融资利率超过 7.5% 算重要。",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "neutral",
+      "quality": "medium"
+    },
+    {
+      "id": "E-20261015-050",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "10/21 盘后",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "10/21 盘后：Q3 财报和电话会。看点按重要性：2027 费用与 capex 方向、Q4 收入指引、2026 capex 下限是否上调、Muse DAU/付费/国际化数据、和解计提实际金额、融资计划。",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "neutral",
+      "quality": "medium"
+    },
+    {
+      "id": "E-20261015-051",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "财报前后",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "财报前后：股权、可转债或大额债券融资。",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "neutral",
+      "quality": "medium"
+    },
+    {
+      "id": "E-20261015-052",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "10/15 起",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "10/15 起：Florida 14 岁以下社交账号禁令获上诉法院允许执行（Reuters，TMTB 转述），关注 Meta 合规措施和后续诉讼。",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "neutral",
+      "quality": "medium"
+    },
+    {
+      "id": "E-20261015-053",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "10/31",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "10/31：参议员要求回复研发抵免问题的期限（据报道）。",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "neutral",
+      "quality": "medium"
+    },
+    {
+      "id": "E-20261015-054",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "11 月",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "11 月：Muse 海外上线（大摩 9 月底听到\"未来几周\"）、WhatsApp/Instagram 集成；Anthropic 计划 11 月 IPO（WSJ、NYT 报道）。",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "neutral",
+      "quality": "medium"
+    },
+    {
+      "id": "E-20261015-055",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "12 月",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "12 月：Muse Charm 硬件发货；假日季代理式购物第一次流量考验，影响和 Amazon 谈判筹码。",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "neutral",
+      "quality": "medium"
+    },
+    {
+      "id": "E-20261015-056",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "1 月下旬",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "1 月下旬：Q4 财报，正式 2027 费用与 capex 指引；Q1 2027 收入指引遇到更高基数。",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "neutral",
+      "quality": "medium"
+    },
+    {
+      "id": "E-20261015-057",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "26Q4 至 1H27",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "26Q4 至 1H27：Vera Rubin 到货节奏决定下一代模型（Wonder 的数倍规模）何时开始预训练（FUNDA 10/13 渠道调研）。",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "neutral",
+      "quality": "medium"
+    },
+    {
+      "id": "E-20261015-058",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "未定时",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "未定时：Muse 收交易费或自建支付（Zuckerberg 9/23 表态「之后收小额费用」；MSL 专家称目前走 Stripe、大概率未抽成）。",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "neutral",
+      "quality": "medium"
+    },
+    {
+      "id": "E-20261015-059",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "往年",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "往年：Q3 新闻稿 CFO Outlook 都讲下一年。2023-10 直接给 2024 初步区间（总费用 940 亿至 990 亿、capex 300 亿至 350 亿）；2024-10 \"continue to expect significant capital expenditures growth in 2025\"，并称明年 \"significant acceleration in infrastructure expense growth\"；2025-10 \"capital expenditures dollar growth will be notably larger in 2026 than 2025\"、\"total expenses will grow at a significantly faster percentage rate in 2026 than 2025\"，次日 -11.3%；2026-01 给 2026 capex 1,150 亿至 1,350 亿、费用 1,620 亿至 1,690 亿，次日 +10.4%。Q2 通常先给方向（2025-07 \"another year of similarly significant capital expenditures dollar growth in 2026\"，并称 2026 费用增速高于 2025）。来源：8-K 附件 99.1（0001326801-23-000100、0001326801-24-000077、0001628280-25-036719、0001628280-25-047114、0001628280-26-003832）。",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "neutral",
+      "quality": "medium"
+    },
+    {
+      "id": "E-20261015-060",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "今年反常",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "今年反常：2026-07 电话会 Susan Li 原话 \"we aren't providing a specific outlook for 2027 CapEx at this time\"，只说计划按 \"maximizing 2026 and 2027 capacity\" 来做。10/21 是 2027 第一次表态。",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "neutral",
+      "quality": "medium"
+    },
+    {
+      "id": "E-20261015-061",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "本次预期",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "本次预期：2026 capex 1,300 亿至 1,450 亿收窄到上半区；费用区间上调以纳入和解计提（Q2 的 24 亿法律费用就是这样处理）。\"2026 经营利润高于 2025\" 的承诺在计提超过约 40 亿时守不住（2025 经营利润 832.8 亿；按一致收入 2,542 亿、费用中值 1,670 亿，2026 约 872 亿），预计撤掉或改为剔除法律费用。2027 capex 大概率只给方向：2026 美元增量约 650 亿，卖方 2,250 亿至 2,500 亿已隐含 900 亿至 1,100 亿增量，\"美元增量更大\"在一致预期内。2027 费用措辞是股价开关：2026 增速约 42%，\"2027 增速低于 2026\" 信息量低，要看美元口径和驱动排序，判断沿用 D1 的 25%/30% 两档。给出 2027 数字区间的概率约 25%。",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "neutral",
+      "quality": "medium"
+    },
+    {
+      "id": "E-20261015-062",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "伦敦广告追踪专家（wiki META 2026-10-08-专家访谈.md，约 300 家广告主样本）",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "伦敦广告追踪专家（wiki META 2026-10-08-专家访谈.md，约 300 家广告主样本）：样本 Q2 CPM +11.6%，和公司公布的每条广告价格 +12% 接近；Q1 样本 5.3% 对公司 12% 差得多。广告增速数字作样本口径使用。",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "neutral",
+      "quality": "medium"
+    },
+    {
+      "id": "E-20261015-063",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "自称 MSL 人员的专家（wiki META 2026-10-08-专家访谈-2.md，推测会期 9/21）",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "自称 MSL 人员的专家（wiki META 2026-10-08-专家访谈-2.md，推测会期 9/21）：已验证三条：Watermelon「已训练好、做到 Astra 和 Fable 程度再发、快的话秋天」，10/12 以 Muse Wonder 发布、AA 指数 56 高于 Astra 53（FUNDA 10/13 确认 Wonder 即 Watermelon）；对外租 H100 兴趣低，10/9 WSJ 报道出租计划搁置；DAU 约 100 万，和 FUNDA 引用的上线一个月 180 万、Similarweb 10/5 峰值 218 万的轨迹相符。说他三人里最可信。",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "neutral",
+      "quality": "medium"
+    },
+    {
+      "id": "E-20261015-064",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "前 Scale AI、以 Meta 内部口吻说话的专家（wiki META 2026-10-08-专家访谈-3.md，推测会期 9/9–9/20）",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "前 Scale AI、以 Meta 内部口吻说话的专家（wiki META 2026-10-08-专家访谈-3.md，推测会期 9/9–9/20）：被推翻两条：Watermelon「12 个月内发布、部分领域相当于 GPT-5.5」，实际 10/12 发布且排名在 Astra 之上；可出租 10% 至 15% 算力、明年初开始，实际计划已搁置。推理成本每天 3 至 5 美元与「收入勉强覆盖成本」自相矛盾。他的数字只作区间上限参考。",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "neutral",
+      "quality": "medium"
+    },
+    {
+      "id": "E-20261015-065",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "两位 Meta 内部口吻专家的分歧",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "两位 Meta 内部口吻专家的分歧：抽成（MSL 专家估计目前没有；前 Scale 专家说交易利润约 20%）、出租算力。一致的地方：Meta 模型整体落后 OpenAI 和 Anthropic，内部对 Muse 没有网上那么兴奋。",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "neutral",
+      "quality": "medium"
+    },
+    {
+      "id": "E-20261015-066",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "JPM",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "JPM：9/10 升 OW/820；10/15 财报前上调收入、计入 100 亿计提、2027 费用 2,101 亿。",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "neutral",
+      "quality": "medium"
+    },
+    {
+      "id": "E-20261015-067",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "Piper",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "Piper：Meta CPM 跟踪。DB：渠道调研 +200bp。Evercore：Muse 下载。Sensor Tower：留存。Similarweb：DAU。Jefferies：Muse 网站兼容性实测。Morgan Stanley：变现要到 2027 年底至 2028 年、海外上线\"未来几周\"。Citizens：Instagram/TikTok 用户数据。FUNDA AI：GPU/DAU 成本测算。",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "neutral",
+      "quality": "medium"
+    },
+    {
+      "id": "E-20261015-068",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "OpenClaw 已知观点池（重复出现不算更新） L110",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "海通国际 10/13 短期看空；国海 10/15 谷歌优先于 Meta。",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "neutral",
+      "quality": "medium"
+    },
+    {
+      "id": "E-20261015-069",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "OpenClaw 已知观点池（重复出现不算更新） L111",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "TMTB 10/14 信用电话会 7.5%；10/13 财报提前一周与融资猜测。",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "neutral",
+      "quality": "medium"
+    },
+    {
+      "id": "E-20261015-070",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "OpenClaw 已知观点池（重复出现不算更新） L112",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "BofA 季报前瞻、买方快速调查、Jefferies 财报季观点（首轮研究读过）。",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "neutral",
+      "quality": "medium"
+    },
+    {
+      "id": "E-20261015-071",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "10/15 跟踪轮新增",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "10/15 跟踪轮新增：JPM 10/12 重申 OW、目标价 920；Citi 10/12 买入/800、2027 算力翻倍；HSBC 10/13 买入/830；BofA Justin Post 10/14 重申买入，看点在企业业务和降低外购 token 成本；Jefferies 销售 10/13 仓位偏多略松动、2027 融资担忧；广发 10/13 Muse 周均净增 19.8 万→7.4 万；Wedbush 10/13 广告顾问 Meta/Google 居首；IGG 买量总监（wiki 10/15）游戏预算 Meta 占比 35%→40%+；AlphaEngine 10/15 Anthropic 点评称 Meta/微软削减支出拖累其 Q3；中信、中信建投、财通、中金、华创、中泰、国金、国泰海通 10/9–10/14 的 Muse Wonder 与 Muse 速评（定价：API 每百万 token 输入 4 美元、输出 20 美元；Muse 订阅 20/100 美元/月）。",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "neutral",
+      "quality": "medium"
+    },
+    {
+      "id": "E-20261015-072",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "10/15 06:53 跟踪轮新增",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "10/15 06:53 跟踪轮新增：高盛 10/14 数字广告前瞻（Sheridan 团队）买入/860，2027 opex 预测高于市场一致、上调 6 至 18 个月收入预测；MarketBeat 10/14 报道高盛把目标价从 860 降到 762 并把当天 -3.3% 归因于此，高盛同日原报告仍写 860，且 762 与前一日收盘价 762.50 几乎相同，判断为 MarketBeat 数据错误，10/14 下跌原因待查。",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "neutral",
+      "quality": "medium"
+    },
+    {
+      "id": "E-20261015-073",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "10/15 06:50 跟踪轮新增（均为 X 单一来源，作线索）",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "10/15 06:50 跟踪轮新增（均为 X 单一来源，作线索）：10/14 X 帖称 Muse 在美国 App Store 被 Dave's Hot Chicken 促销挤到第 2；10/15 X 帖称 Cathie Wood（ARK）10/14 买入 CRWV、META、CBRS 合计 2,600 万美元，当日整体净卖出 1,500 万。",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "neutral",
+      "quality": "medium"
+    },
+    {
+      "id": "E-20261015-074",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "10/15 09:35 并入",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "10/15 09:35 并入：FUNDA AI 10/13《Muse Wonder Returns Meta to the Frontier as Compute Tightens》：Wonder 即 Watermelon，约 3T 参数；Muse 下载 660 万、DAU 180 万（上线一个月，转述公开报道）；WSJ 10/9 出租计划搁置；预计 2027 capex 指引再上调；Muse 每用户专属虚拟机约 2 vCPU、8GB 内存、100GB 存储（公开用户测试）。Jefferies 9/24：Connect 前 20 天涨 30%、RSI 77 为科技股最超买，Zuckerberg 称之后从交易收小额费用。MSL 专家与前 Scale 专家的说法见 D1、D2 和「专家来源可靠性」。",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "neutral",
+      "quality": "medium"
+    },
+    {
+      "id": "E-20261015-075",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "10/15 09:42 跟踪轮新增",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "10/15 09:42 跟踪轮新增：富国 10/5 Q3 前瞻（AlphaEngine 320000610452310，摘要；MarketBeat 10/12 文中同样记为 10/6 由 796 升到 1,000，两个来源一致）超配、目标价 796→1,000，Q3 收入 641 亿、EPS 3.72（计入计提口径），2027 EPS 下调到 31.18，提示 2027 opex 高于市场预期，看好 Muse 产品周期；Cantor 10/12 目标价 860→840、维持超配（据 MarketBeat，单一来源，降幅约 2%）；Jefferies 销售 10/15 晨报转述 Brent Thill：Q3/Q4 收入一致预期保守，预计 Q3 小幅超预期、Q4 指引有上行空间（无新数字，和观点池 Jefferies 财报季观点同向）；天风 10/15 Muse 点评（AlphaEngine 20000609124732，摘要）补充付费档 token 额度：免费每周 1 亿、Power 5 亿、Maximum 30 亿；10/14 下跌原因，据 X 帖（<https://x.com/i/status/2110600312369361356>）是 CPI 高于预期引发加息担忧、科技和半导体普跌（NVDA -3.44%、AMD -5.78%），属板块性下跌，单一来源。",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "neutral",
+      "quality": "medium"
+    },
+    {
+      "id": "E-20261015-076",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "10/15 11:50 跟踪轮新增",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "10/15 11:50 跟踪轮新增：UBS 10/14 买入/884（原 715）、Guggenheim 10/14 买入/850（原 700）、Truist 10/13 买入/1,000 及 Muse 2030 财年增量收入约 285 亿、KeyBanc 10/13 超配/900、Rosenblatt 10/13 买入/886（详见修正模型）；BofA 信用电话会（wiki 10/15）Meta 债券贝塔最高、新券让利 40 至 50 个基点、每年两次发债、净债务为正政策；TMTB 10/14 Podcast Intel：Burazin 测算 Muse 服务 1 亿用户约 6.5 万颗 CPU，Nathan Lambert 认为 OpenAI、Anthropic、Google 在算力、数据、人才三项领先，称 Meta 做了「complete reset」；GS APAC 销售 10/13：Watermelon 让超大规模厂商留在 AI 排行榜前列；出海游戏投放负责人（wiki 10/15 专家访谈，单一来源）：游戏获客成本 Meta 约 6 美元，低于 Apple Search Ads 6.4，高于 Google 5.8，AppLovin CPM 同比 +5% 他推测和电商广告进场竞价有关；Jefferies 销售 10/15：财报周前单股预期讨论很少；前 Shopee 员工（wiki 10/08 Jefferies 专家会）称 Shopee 已与 Meta 签约，巴西用户可在 Facebook 内直接买 Shopee 商品（未核实）。",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "neutral",
+      "quality": "medium"
+    },
+    {
+      "id": "E-20261015-077",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "10/15 22:00 跟踪轮新增",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "10/15 22:00 跟踪轮新增：Oppenheimer 10/15（Perform，TMTB 转述）2027 经营利润/EPS 下调约 3%/4%、2028 EPS 上调约 10%，服务 1 亿 Muse 用户一年约 300 亿美元，可能在 Anthropic IPO 前股权融资，780 至 890 美元；Altimeter Gerstner 10/15 BG2：约两个月前组合 10% 移到 Meta，已清仓 CoreWeave，几周内可能开始买 AI 股（TMTB Podcast Intel 与 X 一致）；Reuters 10/15 Florida 14 岁以下禁令获准执行（TMTB 转述）；Artificial Analysis 10/15 Muse Spark Open 开源、智能指数 39（X @ArtificialAnlys 原帖）；TMTB 10/15 买方对 Anthropic Q3 的估算：蒸馏限制和 Meta/微软削减支出约拖累 40 亿至 70 亿美元 ARR（和观点池 AlphaEngine 10/15 点评同向）；TrendForce 预计全球九大云厂商 capex 2026 年 9,570 亿美元、2027 年超 1.5 万亿（X @pequityresearch 转述，行业口径）。",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "neutral",
+      "quality": "medium"
+    },
+    {
+      "id": "E-20261015-078",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "X 专业观点（10/14 至 10/15）",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "X 专业观点（10/14 至 10/15）：X @munster_gene（Deepwater 管理合伙人）10/14，赞 136：个人智能体会交易，比 ChatGPT 对 Google 威胁更大，Muse 上线后 GOOG 反而涨 7%，支持 D2 Bull（变现走交易）和 D6；X @evergreencap3（科技投资人）10/14，赞 42：自建前沿模型可省去付给第三方 70% 至 80% 的毛利，支持 D2 Bull；X @alc2022（Antonio Linares）10/14，赞 129：过剩算力可高毛利变现，观点无数字，只作参考。",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "neutral",
+      "quality": "medium"
+    },
+    {
+      "id": "E-20261015-079",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "OpenClaw 待核实线索 L127",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "Guggenheim 10/14 同时上调 2027 预测和 capex（X @AIStockSavvy <https://x.com/AIStockSavvy/status/2110324260698755190>，10/14；目标价已核，预测和 capex 的幅度未见原文）。已核 1 轮（10/15 22:00 xreach 读原帖只写「raising 2027 estimates and capex」，MarketBeat 与 AlphaEngine 无幅度）。",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "neutral",
+      "quality": "medium"
+    },
+    {
+      "id": "E-20261015-080",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "OpenClaw 待核实线索 L128",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "Truist Muse 2030 财年收入情景区间 114 亿至 542 亿美元（X @pequityresearch <https://x.com/pequityresearch/status/2110535376226209968>，10/15）。已核 1 轮（AlphaEngine 10/12 至 10/16 检索无 Truist 原报告）。",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "neutral",
+      "quality": "medium"
+    },
+    {
+      "id": "E-20261015-081",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "OpenClaw 待核实线索 L129",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "Citi 10/15 目标价 800→895、维持买入（X @StockMKTNewz <https://x.com/StockMKTNewz/status/2110760146007966192>，搬运号；Gemini 新闻摘要同样写 895；MarketBeat 10/15 22:00 无此条，AlphaEngine 10/13 至 10/16 无 Citi Meta 新报告）。10/15 06:58 轮曾因与 Citi 10/12 原报告 800 冲突删除，本次写明「today raised」，可能是 10/15 新动作。已核 0 轮。",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "neutral",
+      "quality": "medium"
+    },
+    {
+      "id": "E-20261015-082",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "OpenClaw 待核实线索 L130",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "Meta 与 TikTok 互相屏蔽对方广告（X @eric_seufert <https://x.com/eric_seufert/status/2110785373932790158>，10/15，帖内只有一句加链接，链接内容未读）。已核 0 轮。",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "neutral",
+      "quality": "medium"
+    },
+    {
+      "id": "E-20261015-083",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "OpenClaw 排除来源 L134",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "无。2026-10-15 Lumos 确认 wiki 专家材料已过合规，原先排除的 10/08 访谈-2、-3 已并入，见「专家来源可靠性」。",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "neutral",
+      "quality": "medium"
+    },
+    {
+      "id": "E-20261015-084",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "OpenClaw 变更记录 L138",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "2026-10-15 06:30 初始建立。",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "neutral",
+      "quality": "medium"
+    },
+    {
+      "id": "E-20261015-085",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "OpenClaw 变更记录 L139",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "2026-10-15 06:39 | material=no | 一致预期与催化剂未动；新增 IGG 买量预算向 Meta 转移、广发 Muse 净增放缓两条同向证据，修正 JPM 目标价为 920，Gemini 目标价线索因网页抓取不可用暂不采信。",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "neutral",
+      "quality": "medium"
+    },
+    {
+      "id": "E-20261015-086",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "OpenClaw 变更记录 L140",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "2026-10-15 06:50 | material=no | 距上轮 11 分钟，一致预期与目标价零变动，内部库、AlphaEngine、SEC 均无新文档；X 只有 Muse 榜单第 2 和 ARK 小额买入两条单一来源线索，已记入观点池。",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "neutral",
+      "quality": "medium"
+    },
+    {
+      "id": "E-20261015-087",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "2026-10-15 06:58 | material=no | 一致预期零变动、无新文档；核待查线索",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "2026-10-15 06:58 | material=no | 一致预期零变动、无新文档；核待查线索：高盛 10/14 原报告仍是买入/860 并称 2027 opex 高于市场，MarketBeat「降到 762」判为数据错误后删除；Citi 895 与 Citi 10/12 原报告 800 冲突后删除；UBS 884、Guggenheim 850 仍只有 MarketBeat 一个来源，已核 1 轮。",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "neutral",
+      "quality": "medium"
+    },
+    {
+      "id": "E-20261015-088",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "2026-10-15 09:35 | material=no（手动）| Lumos 确认专家材料已过合规",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "2026-10-15 09:35 | material=no（手动）| Lumos 确认专家材料已过合规：并入 10/08 MSL 专家与前 Scale AI 专家访谈、FUNDA AI 10/13（Wonder 即 Watermelon、出租计划搁置、2027 capex 预计再上调）；D1 置信度升到中高，D2 补成本粗算，新增「专家来源可靠性」。",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "neutral",
+      "quality": "medium"
+    },
+    {
+      "id": "E-20261015-089",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "OpenClaw 变更记录 L143",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "2026-10-15 09:47 | material=no | 2027 一致 EPS 34.09→34.05、Q3 EPS 6.01→5.94（计提口径增加），均低于阈值；补录富国 10/5 前瞻（目标价 1,000、2027 EPS 31.18、opex 高于预期，强化 D1 偏 Bear），Cantor 840 与 Jefferies 收入上行观点均为已知方向；UBS/Guggenheim 线索已核 2 轮；10/14 下跌据 X 帖为 CPI 引发的板块性下跌。",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "neutral",
+      "quality": "medium"
+    },
+    {
+      "id": "E-20261015-090",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "OpenClaw 变更记录 L144",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "2026-10-15 11:58 | material=yes | UBS（715→884）、Guggenheim（700→850）目标价经两个来源核实后移出待核线索，Truist 给出 Muse 2030 财年增量收入约 285 亿美元，强化 D2 Bull；BofA 信用电话会补 Meta 债券贝塔最高、新券让利 40 至 50 个基点，强化 D4 Bear；一致预期零变动，核心判断不变。",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "neutral",
+      "quality": "medium"
+    },
+    {
+      "id": "E-20261015-091",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "2026-10-15 14:10 | material=no（手动）| 新增「指引节奏」",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "2026-10-15 14:10 | material=no（手动）| 新增「指引节奏」：往年同季度下一年 capex/opex 说法（8-K 与电话会原文核对）和本次预期措辞。",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "neutral",
+      "quality": "medium"
+    },
+    {
+      "id": "E-20261015-092",
+      "at": "2026-10-18T12:00:00Z",
+      "period": "3Q26",
+      "source": {
+        "type": "broker_report",
+        "identity": "OpenClaw 变更记录 L146",
+        "tier": 3,
+        "ref": {
+          "kind": "file",
+          "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+        }
+      },
+      "fact": "2026-10-15 22:10 | material=yes | Oppenheimer 下调 2027 经营利润/EPS 约 3%/4%、给出 1 亿用户年服务成本约 300 亿美元并提示 Anthropic IPO 前股权融资，D4 置信度由低升到低至中；Florida 14 岁以下禁令获上诉法院放行（D5）；Altimeter 组合 10% 在 Meta；Muse Spark Open 开源；一致预期零变动，核心判断不变；web_fetch 返回 500，改用 fetch-url。",
+      "pillar_ids": [
+        "P1"
+      ],
+      "signal": "neutral",
+      "quality": "medium"
+    }
+  ],
+  "market_view": {
+    "summary": "一致预期基线（Yahoo，10/15 09:42 跟踪轮读取；平均目标价 813.65、中位 830、区间 580–1,050；10/14 收盘 737.54，单日 -3.27%，QQQ -1.97%；10/15 09:42 快照 730.47，-0.96%，QQQ -1.19%；10/15 11:50 再读，各项一致预期与目标价零变动，盘中 733.93，-0.49%，QQQ -0.63%；10/15 22:00 再读仍零变动，收盘 736.72，-0.11%，QQQ -0.13%，5 日 +2.2% 对 QQQ -2.62%）：Q3 收入 634 亿、EPS 5.94（06:53 为 6.01，-1.24%；7 天前 6.25、90 天前 7.06，计入和解计提的分析师在增加，区间 2.88–7.64）；Q4 收入 737 亿、EPS 8.28；2026 EPS 30.81；2027 EPS 34.05（06:53 为 34.09）、收入 3,068 亿；2027 EPS 近 7 天上调 1 家、下调 1 家，近 30 天上调 8 家、下调 3 家。",
+    "as_of": "2026-10-18T12:00:00Z",
+    "figures": [
+      {
+        "metric": "Consensus EPS",
+        "value": 5.94,
+        "unit": "per_share",
+        "period": "3Q26",
+        "label": "consensus"
+      },
+      {
+        "metric": "Consensus Revenue",
+        "value": 63.35,
+        "unit": "USD_bn",
+        "period": "3Q26",
+        "label": "consensus"
+      },
+      {
+        "metric": "Consensus EPS",
+        "value": 30.81,
+        "unit": "per_share",
+        "period": "FY2026",
+        "label": "consensus"
+      },
+      {
+        "metric": "Consensus Revenue",
+        "value": 254.16,
+        "unit": "USD_bn",
+        "period": "FY2026",
+        "label": "consensus"
+      },
+      {
+        "metric": "Consensus EPS",
+        "value": 34.05,
+        "unit": "per_share",
+        "period": "FY2027",
+        "label": "consensus"
+      },
+      {
+        "metric": "Consensus Revenue",
+        "value": 306.84,
+        "unit": "USD_bn",
+        "period": "FY2027",
+        "label": "consensus"
+      }
+    ],
+    "evidence_refs": [
+      {
+        "kind": "file",
+        "path": "sources/legacy/openclaw_thesis_2026-10-15.md"
+      }
+    ]
+  }
+}
