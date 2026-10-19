@@ -111,6 +111,17 @@ def resolve_assist_model(role: str = "assist", explicit_model: str | None = None
     return "deepseek-flash"
 
 
+def resolve_assist_fallback_model(role: str = "assist_fallback") -> str | None:
+    """Resolve fallback model for `assist_json` from `llm.assist_fallback` or `models.assist_fallback_model` (P0J.J2)."""
+    for cfg in (_read_yaml_dict(REPO_ROOT / "agent_config.dalton.yaml"), _read_yaml_dict(DALTON_YAML_PATH)):
+        for block_key, field_key in (("llm", "assist_fallback"), ("models", "assist_fallback_model")):
+            block = cfg.get(block_key)
+            val = block.get(field_key) if isinstance(block, dict) else None
+            if isinstance(val, str) and val.strip():
+                return _validate_assist_candidate(role, val)
+    return None
+
+
 def _extract_json_dict(raw_data: Any, raw_text: str | None) -> dict[str, Any]:
     """Parse a JSON object from `raw_data` or `raw_text`, stripping markdown code fences if present."""
     if isinstance(raw_data, dict):
@@ -195,31 +206,39 @@ async def assist_json(
             thread_id=thread_id,
             raise_on_error=False,
         )
-        if not comp.ok and model is None and comp.error_kind == "pre_send":
-            # Primary subscription assist model (e.g. gemini-3.8-flash-low-oauth) is not logged in;
-            # fall back to broker/cash assist_fallback_model (P0N.8 / L27).
-            for fb_cand in ("ocb-deepseek-deepseek-flash", "deepseek-flash"):
-                if fb_cand == resolved_model:
-                    continue
-                comp_fb = await dalton_complete(
-                    llm_service=llm_service,
-                    user_id=user_id,
-                    system_prompt=system_prompt,
-                    user_prompt=payload_json,
-                    scope_ref=f"{eff_scope}:fb:{fb_cand}",
-                    purpose=f"assist.{task}",
-                    request_model=fb_cand,
-                    response_schema=schema,
-                    slot="background",
-                    timeout_s=timeout_s,
-                    workspace_id=workspace_id,
-                    thread_id=thread_id,
-                    raise_on_error=False,
+        if not comp.ok and model is None and comp.status != "timeout":
+            fb_model = resolve_assist_fallback_model()
+            if fb_model and fb_model != resolved_model:
+                logger.info(
+                    "[DaltonAssist] task=%s primary_model=%s failed (%s); switching to assist_fallback=%s",
+                    task,
+                    resolved_model,
+                    comp.error or comp.status,
+                    fb_model,
                 )
-                if comp_fb.ok or comp_fb.error_kind != "pre_send":
-                    comp = comp_fb
-                    resolved_model = fb_cand
-                    break
+                fb_cands = (fb_model, "ocb-deepseek-deepseek-flash") if fb_model == "deepseek-flash" else (fb_model,)
+                for fb_cand in fb_cands:
+                    if fb_cand == resolved_model:
+                        continue
+                    comp_fb = await dalton_complete(
+                        llm_service=llm_service,
+                        user_id=user_id,
+                        system_prompt=system_prompt,
+                        user_prompt=payload_json,
+                        scope_ref=f"{eff_scope}:fb:{fb_cand}",
+                        purpose=f"assist.{task}",
+                        request_model=fb_cand,
+                        response_schema=schema,
+                        slot="background",
+                        timeout_s=timeout_s,
+                        workspace_id=workspace_id,
+                        thread_id=thread_id,
+                        raise_on_error=False,
+                    )
+                    if comp_fb.ok or comp_fb.error_kind != "pre_send":
+                        comp = comp_fb
+                        resolved_model = fb_cand
+                        break
 
         elapsed_ms = int((time.monotonic() - t0) * 1000)
         used_model = comp.model or resolved_model

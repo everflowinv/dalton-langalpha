@@ -422,8 +422,16 @@ def check_roles(
     # Validate auxiliary LLM slots: assist, background, compaction, fetch (P0H §4 P3)
     # Note: assist (and compaction/background) are non-tool structured/background slots,
     # so they do not require tool-calling, but they MUST NOT use forbidden contributor models.
+    models_cfg = cfg.get("models") if isinstance(cfg.get("models"), dict) else {}
+    assist_fb = str(
+        llm_cfg.get("assist_fallback")
+        or models_cfg.get("assist_fallback_model")
+        or ""
+    ).strip()
+
     aux_slots: list[tuple[str, str]] = [
         ("assist", str(llm_cfg.get("assist") or "").strip()),
+        ("assist_fallback", assist_fb),
         ("background", str(llm_cfg.get("background") or "").strip()),
         (
             "compaction",
@@ -546,16 +554,30 @@ def check_roles(
                 "link": "/settings?tab=model",
             }
         )
+    elif assist_fb and family_of(assist_fb) == family_of(chosen_reviewer):
+        warnings.append(
+            {
+                "code": "assist_fallback_same_family",
+                "role": "assist_fallback",
+                "model": assist_fb,
+                "message": f"assist 备选模型 {assist_fb} 与审稿人 {chosen_reviewer} 同属家族 {family_of(assist_fb)}（违反 L20 跨家族独立原则）。",
+                "link": "/settings?tab=model",
+            }
+        )
 
     return warnings
 
 
 def enforce_role_policy_on_startup(config: dict[str, Any] | None = None) -> list[dict[str, str]]:
-    """Validate role assignments at backend startup; raise `RolePolicyError` if any role uses a forbidden model (P0H §4 P3)."""
+    """Validate role assignments at backend startup; raise `RolePolicyError` if any role uses a forbidden model (P0H §4 P3, P0J.J2)."""
     warnings = check_roles(config)
-    forbidden = [w for w in warnings if w.get("code") == "role_forbidden_model"]
+    forbidden = [
+        w
+        for w in warnings
+        if w.get("code") in ("role_forbidden_model", "assist_fallback_same_family")
+    ]
     if forbidden:
         details = "; ".join(f"{w.get('role')}={w.get('model')}: {w.get('message')}" for w in forbidden)
-        raise RolePolicyError(f"Role policy violation on startup (L21): {details}")
+        raise RolePolicyError(f"Role policy violation on startup (L20/L21): {details}")
     return warnings
 

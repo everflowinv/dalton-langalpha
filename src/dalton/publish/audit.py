@@ -21,11 +21,12 @@ from src.dalton.publish.match import (
     values_within_tolerance,
 )
 from src.dalton.publish.numbers import (
+    EXEMPT_MARKERS,
     ExtractedFigure,
-    _EXEMPT_MARKER_RE,
     _FILING_FORM_RE,
     _PERIOD_TOKEN_RE,
     extract_figures,
+    has_exempt_marker,
     label_figures_with_status,
     normalize_period,
     parse_facts_ledger,
@@ -37,6 +38,7 @@ except ImportError:  # pragma: no cover
     assist_json = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
+_EXEMPT_MARKERS_PROMPT = ", ".join(f"`{m}`" for m in EXEMPT_MARKERS)
 
 REASON_ZH: dict[str, str] = {
     "unverified": "未核实（无来源）",
@@ -268,9 +270,7 @@ def verify_llm_judge_verdict(
     if verdict == "exempt":
         draft_sentence = str(fig.location.get("sentence") or "")
         exempt_marker = str(verdict_data.get("exempt_marker") or quote or "").strip()
-        has_sentence_marker = draft_sentence.strip().startswith(">") or bool(
-            _EXEMPT_MARKER_RE.search(draft_sentence)
-        )
+        has_sentence_marker = draft_sentence.strip().startswith(">") or has_exempt_marker(draft_sentence)
         if exempt_marker and has_sentence_marker:
             if (
                 exempt_marker not in draft_sentence
@@ -280,7 +280,7 @@ def verify_llm_judge_verdict(
         if not has_sentence_marker:
             return "unverified", {
                 "reason": "unverified",
-                "hint": "草稿原句未找到显式 [估计]/[假设] 标记，拒绝 LLM 豁免",
+                "hint": "草稿原句未找到显式豁免标记，拒绝 LLM 豁免",
             }
         return "exempt", {"exempt_reason": explanation or "llm_exempt"}
 
@@ -368,6 +368,8 @@ def verify_llm_judge_verdict(
             normalize_period(pm.group(1))
             for pm in _PERIOD_TOKEN_RE.finditer(quote_period_scan)
         } - {""}
+        if any(k in quote_period_scan.upper() for k in ("过去 12 个月", "过去12个月", "近 12 个月", "近12个月", "TTM", "LTM")):
+            quote_periods.add("LTM")
         if quote_periods and fig_p not in quote_periods:
             return "uncertain", {
                 "reason": "uncertain",
@@ -449,8 +451,7 @@ async def judge_figure_with_llm(
             "matched source's `text` that contains the relevant number, `quote_number_raw` MUST be "
             "the exact number substring inside `quote`, and `quote_metric_raw` MUST be the exact "
             "metric phrase substring inside `quote` that identifies what the number measures. "
-            "Only return `exempt` if the draft `sentence` itself explicitly contains `[估计]`, `[假设]`, "
-            "`〔估计〕`, `〔假设〕`, or `〔示意〕`."
+            f"Only return `exempt` if the draft `sentence` itself explicitly contains one of: {_EXEMPT_MARKERS_PROMPT}."
         ),
         payload=payload,
         schema=JUDGE_SCHEMA,
@@ -537,8 +538,7 @@ async def judge_figures_batch_with_llm(
         "- `quote_number_raw` MUST be the exact number substring inside `quote`; "
         "- `quote_metric_raw` MUST be a short verbatim metric name substring (2-5 words) copied character-for-character "
         "from inside `quote` that names the metric. "
-        "3) Only return `exempt` if the draft `sentence` itself explicitly contains `[估计]`, `[假设]`, "
-        "`〔估计〕`, `〔假设〕`, or `〔示意〕`."
+        f"3) Only return `exempt` if the draft `sentence` itself explicitly contains one of: {_EXEMPT_MARKERS_PROMPT}."
     )
     res = await assist_json(
         task="audit.judge",
@@ -550,18 +550,6 @@ async def judge_figures_batch_with_llm(
         thread_id=thread_id,
         timeout_s=90.0,
     )
-    if (not res.ok or not isinstance(res.data, dict)) and res.error not in ("llm_timeout", "unexpected"):
-        res = await assist_json(
-            task="audit.judge",
-            instructions=judge_instructions,
-            payload=payload,
-            schema=BATCH_JUDGE_SCHEMA,
-            user_id=user_id,
-            workspace_id=workspace_id,
-            thread_id=thread_id,
-            model="deepseek-flash",
-            timeout_s=90.0,
-        )
     if not res.ok or not isinstance(res.data, dict):
         err_msg = res.error or "assist_failed"
         return {
@@ -644,12 +632,15 @@ def _build_audit_result(
             exempt_count += 1
             continue
         if fig.label_hint == "incidental" or out.reason == "incidental":
+            inc_cat = fig.incidental_category or fig.metric
             incidental_list.append(
                 {
                     "id": fig.id,
                     "raw": fig.raw,
                     "line": fig.location.get("line", 0),
                     "metric": fig.metric,
+                    "incidental_category": inc_cat,
+                    "category": inc_cat,
                     "period": fig.period,
                     "unit": fig.unit,
                     "sentence": fig.location.get("sentence", ""),
@@ -867,10 +858,7 @@ async def aaudit_draft(
 
         total_pending_figs = len(pending_cands_by_idx)
         if section_batches:
-            if total_timeout_s >= 120.0:
-                eff_timeout_s = min(900.0, max(float(total_timeout_s), total_pending_figs * 2.0))
-            else:
-                eff_timeout_s = min(900.0, float(total_timeout_s))
+            eff_timeout_s = min(900.0, max(120.0, float(total_timeout_s), total_pending_figs * 2.0))
 
             task_to_indices: dict[asyncio.Task[None], list[int]] = {}
             tasks: list[asyncio.Task[None]] = []

@@ -118,12 +118,14 @@ describe('PublishApprovalCard', () => {
               id: 'F-003',
               raw: '600',
               line: 5,
+              incidental_category: '社交互动计数',
               sentence: 'X 帖子获得 600 赞。',
             },
             {
               id: 'F-004',
               raw: '500',
               line: 7,
+              incidental_category: 'HTTP 状态码',
               sentence: '接口曾短暂返回 HTTP 500。',
             },
           ],
@@ -175,11 +177,13 @@ describe('PublishApprovalCard', () => {
       '脚注 30 · LLM 判断 10 · 推算 5'
     );
 
-    // 3. Incidental collapsible list (collapsed initially, expands on click)
+    // 3. Incidental collapsible list (collapsed initially, expands on click, shows category + sentence)
     expect(screen.getByTestId('publish-incidental-section')).toBeInTheDocument();
     expect(screen.queryByTestId('publish-incidental-list')).toBeNull();
     fireEvent.click(screen.getByTestId('publish-incidental-toggle'));
+    expect(screen.getByTestId('publish-incidental-list')).toHaveTextContent('[社交互动计数]');
     expect(screen.getByTestId('publish-incidental-list')).toHaveTextContent('X 帖子获得 600 赞');
+    expect(screen.getByTestId('publish-incidental-list')).toHaveTextContent('[HTTP 状态码]');
     expect(screen.getByTestId('publish-incidental-list')).toHaveTextContent('HTTP 500');
 
     // 4. Side-by-side LLM judge draft sentence vs quote
@@ -252,6 +256,15 @@ describe('PublishApprovalCard', () => {
           uncertain: 0,
           exempt: 0,
           labeling_incomplete: true,
+          labeling: {
+            total: 40,
+            labeled: 20,
+            batches: 2,
+            failed_batches: 1,
+            failed_batch_details: [
+              { batch_index: 2, start_fig: 21, end_fig: 40, section: '估值与模型' },
+            ],
+          },
         },
       },
     };
@@ -260,6 +273,9 @@ describe('PublishApprovalCard', () => {
 
     expect(screen.getByTestId('publish-labeling-incomplete-warning')).toHaveTextContent(
       'Figure labeling incomplete; colloquial figures and metric labels may not be fully verified'
+    );
+    expect(screen.getByTestId('publish-failed-batch-details')).toHaveTextContent(
+      'Batch 2 (figures 21–40) labeling failed'
     );
     expect(
       screen.getByText('Official Research Publication Approval (PM Final Review)')

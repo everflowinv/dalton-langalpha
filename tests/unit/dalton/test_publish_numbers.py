@@ -837,7 +837,8 @@ async def test_p0i_ten_r3_false_verified_counterexamples(
     full_res = await aaudit_draft(draft, thesis_doc=thesis_doc, use_llm_judge=True)
     assert full_res.matched == 0
     incidental_raws = {i["raw"] for i in full_res.incidental}
-    assert {"600", "500", "5.5"}.issubset(incidental_raws)
+    assert {"600", "500"}.issubset(incidental_raws)
+    assert "5.5" not in incidental_raws
 
 
 def test_p0i_two_anchoring_blind_spots_and_s1() -> None:
@@ -1079,14 +1080,6 @@ def test_p0i_contradicted_reasons_and_zero_unit_or_period_mismatch_assignments()
         assert "maybe_label_prose_figures_with_llm" not in src_text, f"Found maybe_label_prose_figures_with_llm in {src_name}"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "P0J J2a relabelled duration facts (20-year PPA, 6.4-year backlog) as "
-        "verification targets; numbers.py's duration->incidental regex still "
-        "excludes them. P0J J2 deletes that regex and must remove this marker."
-    ),
-)
 @pytest.mark.asyncio
 async def test_p0i_g3_gold_standard_and_cross_control_zero_false_verified(
     monkeypatch: pytest.MonkeyPatch,
@@ -1222,4 +1215,181 @@ async def test_p0i_g3_gold_standard_and_cross_control_zero_false_verified(
             g = gold_by_report_line_raw.get((rep_name, int(inc["line"]), inc["raw"]))
             if g is not None:
                 assert g["is_verification_target"] is False, f"Financial figure marked incidental in {rep_name}: {inc}"
+
+
+@pytest.mark.asyncio
+async def test_p0j_j2_failed_batch_never_excludes_figures_and_colloquial_always_scanned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P0J.J2 (§2.2, §2.3, §2.5):
+    1. Every non-empty section (including colloquial-only sections with 0 Arabic digits) is sent to Step B.
+    2. When a labeling batch fails, all figures in that batch fall back to normal verification targets and are never excluded as incidental.
+    """
+    numbers_src = Path(numbers_mod.__file__).read_text(encoding="utf-8")
+    assert "_COLLOQUIAL_HINT_RE" not in numbers_src
+    assert "_EXEMPT_MARKER_RE" not in numbers_src
+
+    colloquial_draft = (G3_FIXTURES_DIR / "colloquial_only_draft.md").read_text(encoding="utf-8")
+    colloquial_gold = json.loads((G3_FIXTURES_DIR / "colloquial_only_gold.json").read_text(encoding="utf-8"))
+    expected_raws = {it["raw"] for it in colloquial_gold["items"]}
+
+    mock_assist = create_autospec(assist_json)
+
+    async def _colloquial_side_effect(
+        task: str,
+        instructions: str,
+        payload: dict[str, Any],
+        schema: dict[str, Any],
+        **kwargs: Any,
+    ) -> AssistResult:
+        if task == "audit.label_figures":
+            return AssistResult(
+                ok=True,
+                data={
+                    "items": [],
+                    "extra_figures": [
+                        {
+                            "raw": it["raw"],
+                            "value": 50.0,
+                            "unit": "pct",
+                            "metric": "渠道比例",
+                            "period": "FY2026",
+                            "kind": "reported",
+                            "line": it["line"],
+                            "sentence": "管理层在电话会中提到上述口语化比例。",
+                        }
+                        for it in colloquial_gold["items"]
+                    ],
+                },
+            )
+        return AssistResult(ok=True, data={"items": []})
+
+    mock_assist.side_effect = _colloquial_side_effect
+    monkeypatch.setattr(numbers_mod, "assist_json", mock_assist)
+    monkeypatch.setattr(audit_mod, "assist_json", mock_assist)
+
+    col_res = await aaudit_draft(colloquial_draft, thesis_doc={"evidence": []}, use_llm_judge=True)
+    extracted_raws = {u["raw"] for u in col_res.unverified}
+    assert expected_raws.issubset(extracted_raws)
+
+    # Now test failed batch fallback: pre-existing incidental hint MUST be reset to 'reported' on batch failure
+    draft_with_figs = "## 合同期限与装机\n\n项目签署了 20 年 PPA 协议，加权剩余合同期限 6.4 年，装机容量 702MW。\n"
+    figs = extract_figures(draft_with_figs)
+    assert len(figs) == 3
+    # Even if a figure somehow had label_hint='incidental' prior to batch failure, failed batch resets it
+    figs[0].label_hint = "incidental"
+    figs[0].incidental_category = "期间和时间窗口表达"
+
+    mock_fail = create_autospec(
+        assist_json,
+        return_value=AssistResult(ok=False, data=None, error="llm_unavailable", status="error"),
+    )
+    monkeypatch.setattr(numbers_mod, "assist_json", mock_fail)
+    monkeypatch.setattr(audit_mod, "assist_json", mock_fail)
+
+    stats: dict[str, Any] = {}
+    labeled_figs, ok = await numbers_mod.label_figures_with_status(
+        draft_with_figs,
+        figs,
+        stats_out=stats,
+    )
+    assert ok is False
+    assert stats["failed_batches"] == 1
+    assert len(stats["failed_batch_details"]) == 1
+    for lf in labeled_figs:
+        assert lf.label_hint == "reported"
+        assert lf.incidental_category == ""
+
+    audit_fail_res = await aaudit_draft(draft_with_figs, thesis_doc={"evidence": []}, use_llm_judge=True)
+    assert audit_fail_res.labeling_incomplete is True
+    assert len(audit_fail_res.incidental) == 0
+    assert audit_fail_res.figures == 3
+
+
+def test_p0j_j2_exempt_markers_single_source_and_ltm_period_normalization() -> None:
+    """P0J.J2 (§2.4 #1 & #2):
+    - EXEMPT_MARKERS is the single source of truth across numbers.py, audit.py judge prompt, and dalton-publish/SKILL.md.
+    - normalize_period maps '过去 12 个月', '近 12 个月', 'TTM', 'LTM' to 'LTM'.
+    """
+    from src.dalton.publish.numbers import EXEMPT_MARKERS, has_exempt_marker, normalize_period
+    from src.dalton.settings import REPO_ROOT
+
+    assert len(EXEMPT_MARKERS) == 12
+    skill_md = (REPO_ROOT / "plugins" / "dalton" / "skills" / "dalton-publish" / "SKILL.md").read_text(
+        encoding="utf-8"
+    )
+    for marker in EXEMPT_MARKERS:
+        assert marker in skill_md, f"Marker {marker} missing from dalton-publish/SKILL.md"
+        assert marker in audit_mod._EXEMPT_MARKERS_PROMPT
+        assert has_exempt_marker(f"假设推演 {marker} 收入增长 15%")
+
+    for ltm_expr in ("过去 12 个月", "过去12个月", "近 12 个月", "近12个月", "TTM", "LTM", "过去 12 个月营业利润率"):
+        assert normalize_period(ltm_expr) == "LTM", f"Expected LTM for {ltm_expr!r}"
+
+
+@pytest.mark.asyncio
+async def test_p0j_j2_assist_fallback_unified_and_role_policy_family_check(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """P0J.J2 (§1 & §2.2):
+    - assist_json handles fallback in one place using configured assist_fallback model, logs info, and records actual model.
+    - role_policy rejects assist_fallback when it shares the reviewer's family or uses a contributor variant.
+    """
+    from unittest.mock import create_autospec
+    from src.dalton.llm import assist as assist_mod
+    from src.dalton.llm.complete import DaltonCompleteResult, dalton_complete
+    from src.dalton.llm.role_policy import RolePolicyError, check_roles, enforce_role_policy_on_startup
+
+    mock_complete = create_autospec(dalton_complete)
+    calls: list[str] = []
+
+    async def _complete_side_effect(**kwargs: Any) -> DaltonCompleteResult:
+        req_model = str(kwargs.get("request_model") or "")
+        calls.append(req_model)
+        if req_model == "gemini-3.8-flash-low-oauth":
+            return DaltonCompleteResult(
+                ok=False,
+                status="error",
+                error="primary_oauth_expired",
+                error_kind="pre_send",
+                model=req_model,
+            )
+        return DaltonCompleteResult(
+            ok=True,
+            status="done",
+            data={"items": []},
+            text='{"items": []}',
+            model=req_model,
+            cash_usd=0.001,
+        )
+
+    mock_complete.side_effect = _complete_side_effect
+    monkeypatch.setattr(assist_mod, "dalton_complete", mock_complete)
+
+    with caplog.at_level("INFO"):
+        res = await assist_mod.assist_json(
+            "audit.label_figures",
+            "Label figures",
+            {"figures": []},
+            {"type": "object", "properties": {"items": {"type": "array"}}, "required": ["items"]},
+        )
+    assert res.ok is True
+    assert res.model == "deepseek-flash"
+    assert calls == ["gemini-3.8-flash-low-oauth", "deepseek-flash"]
+    assert any("switching to assist_fallback=deepseek-flash" in r.message for r in caplog.records)
+
+    # Role policy: assist_fallback in same family as chosen reviewer (gpt-6.1-sol-oauth -> openai) must fail
+    bad_cfg = {
+        "llm": {
+            "name": "claude-opus-5-5-oauth",
+            "assist": "gemini-3.8-flash-low-oauth",
+            "assist_fallback": "gpt-6.1-sol-oauth",
+        }
+    }
+    warnings = check_roles(bad_cfg, reviewer_models=["gpt-6.1-sol-oauth"])
+    assert any(w["code"] == "assist_fallback_same_family" for w in warnings)
+    with pytest.raises(RolePolicyError, match="assist_fallback"):
+        enforce_role_policy_on_startup(bad_cfg)
+
 

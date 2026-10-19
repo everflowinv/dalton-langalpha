@@ -28,6 +28,8 @@ interface AuditFigureItem {
   raw?: string;
   line?: number;
   metric?: string;
+  incidental_category?: string;
+  category?: string;
   period?: string;
   reason?: string;
   hint?: string;
@@ -39,11 +41,22 @@ interface AuditFigureItem {
   candidates?: CandidateSourceItem[];
 }
 
+interface FailedBatchDetail {
+  batch?: number;
+  batch_index?: number;
+  start_figure?: number;
+  start_fig?: number;
+  end_figure?: number;
+  end_fig?: number;
+  section?: string;
+}
+
 interface LabelingInfo {
   total?: number;
   labeled?: number;
   batches?: number;
   failed_batches?: number;
+  failed_batch_details?: FailedBatchDetail[];
   incidental_excluded?: number;
 }
 
@@ -103,6 +116,9 @@ export function PublishApprovalCard({
   );
   const labeling = figSum?.labeling;
   const failedBatches = Number(labeling?.failed_batches ?? 0);
+  const failedBatchDetails: FailedBatchDetail[] = Array.isArray(labeling?.failed_batch_details)
+    ? labeling.failed_batch_details
+    : [];
   const labelingIncomplete = Boolean(
     args?.labeling_incomplete ?? figSum?.labeling_incomplete ?? failedBatches > 0
   );
@@ -191,7 +207,7 @@ export function PublishApprovalCard({
     >
       {labelingIncomplete && (
         <div
-          className="rounded px-3 py-1.5 text-[11px] font-medium"
+          className="rounded px-3 py-1.5 text-[11px] font-medium space-y-1"
           style={{
             backgroundColor: 'rgba(245, 158, 11, 0.12)',
             border: '1px solid rgba(245, 158, 11, 0.35)',
@@ -199,8 +215,29 @@ export function PublishApprovalCard({
           }}
           data-testid="publish-labeling-incomplete-warning"
         >
-          {t('dalton.publish.labelingIncompleteWarning', '标注未完成，口语数字和指标可能未核验')}
-          {failedBatches > 0 ? `（失败批次：${failedBatches}）` : ''}
+          <div>
+            {t('dalton.publish.labelingIncompleteWarning', '标注未完成，口语数字和指标可能未核验')}
+            {failedBatches > 0 ? `（失败批次：${failedBatches}）` : ''}
+          </div>
+          {failedBatchDetails.length > 0 && (
+            <div className="text-[10.5px] font-normal space-y-0.5" data-testid="publish-failed-batch-details">
+              {failedBatchDetails.map((d, dIdx) => {
+                const batchNo = d.batch ?? d.batch_index ?? dIdx + 1;
+                const startFig = d.start_figure ?? d.start_fig ?? '?';
+                const endFig = d.end_figure ?? d.end_fig ?? '?';
+                return (
+                  <div key={`${batchNo}-${dIdx}`}>
+                    {t('dalton.publish.failedBatchDetailItem', {
+                      batch: batchNo,
+                      start: startFig,
+                      end: endFig,
+                      defaultValue: `第 ${batchNo} 批（第 ${startFig}–${endFig} 个数字）标注失败`,
+                    })}
+                  </div>
+                );
+              })}
+            </div>
+          )}
         </div>
       )}
       <div className="flex items-center justify-between gap-2">
@@ -325,12 +362,16 @@ export function PublishApprovalCard({
           </button>
           {incidentalExpanded && incidentalItems.length > 0 && (
             <div className="pt-1 space-y-0.5 text-[11px]" data-testid="publish-incidental-list">
-              {incidentalItems.map((item, idx) => (
-                <div key={item.id ?? idx} style={{ color: 'var(--color-text-tertiary)' }}>
-                  <code>L{item.line ?? '?'}</code> · <strong>{item.raw}</strong>
-                  {item.sentence ? ` — ${item.sentence}` : ''}
-                </div>
-              ))}
+              {incidentalItems.map((item, idx) => {
+                const cat = item.incidental_category || item.category || item.metric || '';
+                return (
+                  <div key={item.id ?? idx} style={{ color: 'var(--color-text-tertiary)' }}>
+                    <code>L{item.line ?? '?'}</code> · <strong>{item.raw}</strong>
+                    {cat ? ` [${cat}]` : ''}
+                    {item.sentence ? ` — ${item.sentence}` : ''}
+                  </div>
+                );
+              })}
             </div>
           )}
         </div>

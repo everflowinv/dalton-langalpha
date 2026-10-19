@@ -5358,6 +5358,7 @@
     "publish": {
       "cardTitle": "正式研究报告发布审批（PM 终审）",
       "labelingIncompleteWarning": "标注未完成，口语数字和指标可能未核验",
+      "failedBatchDetailItem": "第 {{batch}} 批（第 {{start}}–{{end}} 个数字）标注失败",
       "labelingCoverageLabel": "标注覆盖",
       "labelingCoverageValue": "已标注 {{labeled}} / {{total}} 个数字",
       "verifiedBreakdownLabel": "已核实拆分",
