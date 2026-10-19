@@ -10,6 +10,7 @@ import pytest
 from fastapi import HTTPException
 
 from src.dalton.budget.gate import build_local_run_gate, enforce_local_admission
+from src.dalton.llm.complete import _check_cash_budget_admission
 from src.dalton.budget.port import (
     LocalBudgetPort,
     format_daily_budget_exhausted_message,
@@ -173,6 +174,67 @@ async def test_enforce_local_admission_denies_when_below_floor_including_byok():
                 await enforce_local_admission("local_dev_user", byok=is_byok)
             assert exc_info.value.status_code == 429
             assert exc_info.value.detail["type"] == "dalton_daily_budget"
+
+
+def _floor_summary(cap: str, spent: str) -> dict:
+    return {
+        "configured": True,
+        "retry_after_seconds": 1800,
+        "_decimals": {
+            "cap_usd": Decimal(cap),
+            "spent_usd": Decimal(spent),
+            "settled_usd": Decimal(spent),
+            "unreserved_usage_usd": Decimal("0.00"),
+            "open_reserved_usd": Decimal("0.00"),
+            "expired_conservative_usd": Decimal("0.00"),
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_admission_floor_semantics_per_turn_and_per_call():
+    """R4 B3 regression: the two admission levels keep their original floor semantics.
+
+    Per-turn (`enforce_local_admission`): plain `available < floor_usd` — a cap below
+    the default floor ($0.25) can never start a turn; configure a realistic floor/cap.
+    Per-call (`_check_cash_budget_admission`): `min(floor, cap)` — an in-flight turn
+    may spend down to the cap. Neither may collapse the floor to ~$0 (PR #7 backdoor).
+    """
+    mock_conn = _make_mock_conn()
+
+    async def run_gate(cap: str, spent: str) -> None:
+        with (
+            patch("src.dalton.budget.gate.get_db_connection", return_value=mock_conn),
+            patch(
+                "src.dalton.budget.gate.reconcile_and_summarize_day",
+                new=AsyncMock(return_value=_floor_summary(cap, spent)),
+            ),
+        ):
+            await enforce_local_admission("local_dev_user")
+
+    async def call_allowed(cap: str, spent: str) -> bool:
+        with (
+            patch("src.dalton.llm.complete.get_db_connection", return_value=mock_conn),
+            patch(
+                "src.dalton.llm.complete.reconcile_and_summarize_day",
+                new=AsyncMock(return_value=_floor_summary(cap, spent)),
+            ),
+        ):
+            allowed, _, _ = await _check_cash_budget_admission("local_dev_user")
+            return allowed
+
+    # Per-turn: tiny cap below the floor cannot start; healthy cap passes until drained.
+    with pytest.raises(HTTPException) as exc_info:
+        await run_gate("0.02", "0.00")
+    assert exc_info.value.status_code == 429
+    await run_gate("0.30", "0.05")
+    with pytest.raises(HTTPException):
+        await run_gate("0.30", "0.10")
+
+    # Per-call: floor clamps to the cap, never to ~$0.
+    assert await call_allowed("0.02", "0.00") is True
+    assert await call_allowed("0.02", "0.015") is False
+    assert await call_allowed("0.30", "0.05") is True
 
 
 @pytest.mark.asyncio

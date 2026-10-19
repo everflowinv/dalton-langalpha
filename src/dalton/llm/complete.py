@@ -367,11 +367,7 @@ async def _check_cash_budget_admission(
             available = cap_usd - spent_usd
             configured = bool(summary.get("configured", True))
 
-            effective_floor = (
-                floor_usd
-                if (cap_usd <= Decimal("0") or cap_usd > floor_usd)
-                else Decimal("0.000001")
-            )
+            effective_floor = min(floor_usd, cap_usd) if cap_usd > Decimal("0") else floor_usd
             if not configured or available <= Decimal("0") or available < effective_floor:
                 settled_total = decs["settled_usd"] + decs["unreserved_usage_usd"]
                 open_total = decs["open_reserved_usd"] + decs["expired_conservative_usd"]
