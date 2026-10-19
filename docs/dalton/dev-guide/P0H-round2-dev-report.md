@@ -118,3 +118,20 @@
 - **Python 单元测试（`uv run pytest tests/unit/dalton/ tests/unit/llms/ tests/unit/middleware/skills/ tests/unit/mcp_servers/ -q`）**：**`1,685 passed, 0 failed`**。
 - **Broker v2 Node 单元测试**：**`13 pass, 0 fail`**。
 - **Web 前端类型检查与单测**：`pnpm --dir web typecheck` **0 errors**；`vitest` **676/676 个测试文件（7,224/7,224 项测试）全部通过**。
+
+---
+
+## 勘误（2026-10-19 第三轮审查复核）
+
+根据第三轮代码审查（`docs/dalton/dev-guide/review/SUMMARY-R3-20261018.md`、`R3-1-publish-audit.md`、`R3-2-evidence-and-others.md`）与 `P0I-round3-fixes.md` 第 8.2 节要求，保留上方原文不做改动，逐条勘误如下：
+
+1. **"净减 88 行"不实**：原文第 2.3 节声称 `src/dalton/publish/` 净减 88 行；实际执行 `git diff --shortstat 1ca7c225 aa7b1223 -- src/dalton/publish/` 的结果为 `6 files changed, 711 insertions(+), 243 deletions(-)`，净增 `+468` 行而非净减 88 行。
+2. **9 个不存在的正则名与不存在的 `_METRIC_SYNONYM_GROUPS`**：原文第 2.3 节列出的 `_CODE_FENCE_RE`、`_URL_RE`、`_HYPHEN_CODE_RE`、`_EN_DATE_RE`、`_TIME_RE`、`_LIST_MARKER_RE`、`_HEADING_NUM_RE`、`_BARE_YEAR_RE`、`_VERSION_RE`（以及连带列出的 `_TIER_CODE_RE`、`_EXEMPT_TAG_RE`、`_CALC_EXPR_RE`、`_APPROX_PREFIX_RE`、`_NUMBER_TOKEN_RE`、`_CN_COLLOQUIAL_MULTI_RE`、`_CN_NUMBER_SEQ_RE`、`_chinese_numeral_to_float`、`is_consensus_labeled_line`）与 `_METRIC_SYNONYM_GROUPS` 在仓库代码中均不存在。`src/dalton/publish/numbers.py` 实际定义的是 `_PERIOD_TOKEN_RE`、`_CN_DATE_RE`、`_ISO_DATE_RE`、`_SHORT_DATE_RE`、`_SLASH_DATE_RE`、`_CLOCK_TIME_RE`、`_HYPHEN_DOC_CODE_RE`、`_INLINE_CODE_RE`、`_MARKDOWN_LINK_RE`、`_HEADING_PREFIX_RE`、`_LIST_PREFIX_RE`、`_STANDALONE_YEAR_RE`、`_EXEMPT_MARKER_RE`、`_NUMBER_RE` 等正则。
+3. **不存在的 `JournalCashQueryError`**：原文第 4 节声称抛出 `JournalCashQueryError`（以及第 3 节提及的 `total_cash_usd`、`reserved_cash_usd`、第 4 节提及的 `resolve_llm_client`），在代码中均不存在；`src/dalton/database/llm_journal.py` 实际定义并抛出的是 `BudgetCheckError`。
+4. **HTTP 402 实为 HTTP 429**：原文第 5 节 `G1` 声称日额度耗尽后返回 `HTTP 402`，实际代码 `src/dalton/budget/gate.py` 返回的是 `HTTP 429`（`detail.type = "dalton_daily_budget"`），且当时 `$1.05` 是预先写入数据库的种子数据，只在准入函数层验证而非通过 `POST /api/v1/threads/messages` 发起对话。
+5. **"跨家族审稿通过"不实**：原文第 5 节 `G3` 声称跨家族审稿通过，但原始证据 `var/dalton/reports/g3_publish_pipeline_20261018.json` 中独立审稿的实际返回结论为 `verdict = "revise"`，而非 `pass`。
+6. **"40 个一批分批标注"不实**：原文第 2.1 节声称 B 环节按 40 个数字一批分批标注，但当时 `src/dalton/publish/numbers.py` 的 `label_figures_with_status` 实际只截取 `figures[:10]` 与 `draft_markdown[:3000]` 单次调用，前 10 个以外的数字全部落回启发式兜底（已在 P0I `I1` 中修复为按章节分批、每批 `<= 40` 个数字的全量标注）。
+7. **"由每日预检自动触发"与 G4 触发通路不实**：原文第 4 节声称 `prune_expired_journal_responses(retention_days=30)` 由每日预检自动触发，但当时该函数在仓库中没有任何生产调用点（已在 P0I `I3` 中接入应用启动生命周期 `src/server/app/setup.py`）；同时 `G4` 当时的验证脚本是直接调用 Python 内部函数 `evaluate_preflight` 与直接写表，而非通过 `POST /api/v1/automations/{id}/trigger` 触发（已在 P0I `I7` 的 `scripts/dalton/realrun/g4_autonomy.py` 中重做）。
+8. **"已从结构删除 `source_value`"不实**：原文第 2.1/2.2 节声称从 `_LLM_JUDGE_SCHEMA` 中删除了 `source_value` 和 `source_unit` 并移除了 `consensus_confusion`，但基线提交 `1ca7c225` 中原本就不存在这些标识符与字段。
+9. **G7 的 242 秒模拟未声明**：原文第 5 节 `G7` 将未入库脚本中人为注入的 242 秒延迟写成了真实长文档读取，且未在证据中声明非真实成分（已在 P0I `I7` 中通过入库的 `DALTON_BRIDGE_TEST_DELAY_S` 环境变量钩子并显式声明 `synthetic: ["bridge_delay_hook"]` + 真实长文档读取重做）。
+10. **A8、A12 的描述与代码不符**：原文第 1 节声称 `A8` 在 `src/dalton/llm/complete.py` 中对真实模型调用返回后的落盘异常统一落为 `indeterminate`，但当时 `record_settled_usage` 周围并未包裹 `try/except`（已在 P0I `I3` 中补齐）；声称 `A12` 将 OAuth 登录启动冷却持久化，但当时只写入了进程内存字典 `_LAST_INITIATED_AT` 而未写入 `dalton_provider_events` 表（已在 P0I `I3` 中改为查询并写入 `dalton_provider_events`）。

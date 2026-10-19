@@ -569,10 +569,12 @@ def main(argv: list[str] | None = None) -> int:
 
     target_files: list[str | Path] = list(args.files)
     if not target_files:
+        p0i_rel = "docs/dalton/dev-guide/P0I-round3-dev-report.md"
+        p0h_rel = "docs/dalton/dev-guide/P0H-round2-dev-report.md"
+        report_rel = p0i_rel if (REPO_ROOT / p0i_rel).exists() else p0h_rel
         default_candidates = [
             "docs/dalton/dev-guide/PROGRESS.md",
-            "docs/dalton/dev-guide/P0H-round2-dev-report.md",
-            "docs/dalton/dev-guide/P0I-round3-dev-report.md",
+            report_rel,
         ]
         target_files = [c for c in default_candidates if (REPO_ROOT / c).exists()]
 

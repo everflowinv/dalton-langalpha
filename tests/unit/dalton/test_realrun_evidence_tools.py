@@ -172,9 +172,15 @@ def test_check_report_claims_catches_p0h_and_progress_violations(
     tmp_path: Path,
 ) -> None:
     p0h_report = REPO_ROOT / "docs/dalton/dev-guide/P0H-round2-dev-report.md"
-    progress_md = REPO_ROOT / "docs/dalton/dev-guide/PROGRESS.md"
+    bad_var_md = tmp_path / "bad-progress.md"
+    bad_var_md.write_text(
+        "# Bad Progress\n\n"
+        "- Old missing path 1: `var/dalton/catalog_openclaw.json`\n"
+        "- Old missing path 2: `var/dalton/catalog_native.json`\n",
+        encoding="utf-8",
+    )
 
-    result = scan_reports([p0h_report, progress_md], repo_root=REPO_ROOT)
+    result = scan_reports([p0h_report, bad_var_md], repo_root=REPO_ROOT)
     assert result["summary"]["all_clean"] is False
 
     p0h_entry = result["reports"][0]
@@ -184,17 +190,12 @@ def test_check_report_claims_catches_p0h_and_progress_violations(
     assert "JournalCashQueryError" in missing_ids
     assert "_CODE_FENCE_RE" in missing_ids
 
-    progress_entry = result["reports"][1]
-    missing_vars = {item["path"] for item in progress_entry["missing_var_paths"]}
+    bad_var_entry = result["reports"][1]
+    missing_vars = {item["path"] for item in bad_var_entry["missing_var_paths"]}
     assert "var/dalton/catalog_openclaw.json" in missing_vars
     assert "var/dalton/catalog_native.json" in missing_vars
 
-    clean_md = tmp_path / "clean-report.md"
-    clean_md.write_text(
-        "# Clean Report\n\n"
-        "- Path: `src/dalton/publish/audit.py`\n"
-        "- Function: `aaudit_draft`\n",
-        encoding="utf-8",
-    )
-    clean_res = scan_reports([clean_md], repo_root=REPO_ROOT)
+    progress_md = REPO_ROOT / "docs/dalton/dev-guide/PROGRESS.md"
+    p0i_report = REPO_ROOT / "docs/dalton/dev-guide/P0I-round3-dev-report.md"
+    clean_res = scan_reports([progress_md, p0i_report], repo_root=REPO_ROOT)
     assert clean_res["summary"]["all_clean"] is True
