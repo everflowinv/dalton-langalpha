@@ -835,3 +835,193 @@ def test_format_wake_directive():
     assert "trigger_signals: [filing:0001]" in xml
     assert "</dalton_wake>" in xml
 
+
+@pytest.mark.asyncio
+async def test_p0i_i5_autonomy_low_risk_fixes(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Verify P0I §5 #1-#7 low-risk autonomy fixes."""
+    import importlib.util
+    from pathlib import Path
+    from src.dalton.autonomy import preflight as preflight_mod
+    from src.dalton.autonomy.probes import internal as internal_mod
+    from src.dalton.autonomy.probes import sec as sec_mod
+    from src.dalton.budget import service as budget_svc
+    from src.dalton.tools import director_tools as dt_mod
+
+    # 1. director_tools passes user_id from config["configurable"]["user_id"] to build_coverage_board
+    mock_board = create_autospec(
+        dt_mod.build_coverage_board,
+        return_value={
+            "date": "2026-10-19",
+            "budget": {
+                "cap_usd": 20.0,
+                "spent_usd": 2.0,
+                "remaining_usd": 18.0,
+                "reserve_for_events_usd": 3.0,
+                "allocatable_usd": 15.0,
+            },
+            "companies": [],
+            "candidates": [],
+        },
+    )
+    monkeypatch.setattr(dt_mod, "build_coverage_board", mock_board)
+    tools = {t.name: t for t in dt_mod.build_director_tools(role="chief_of_staff")}
+    await tools["dalton_coverage_board"].ainvoke(
+        {}, config={"configurable": {"user_id": "pm-user-42"}}
+    )
+    mock_board.assert_awaited_once_with(user_id="pm-user-42")
+
+    # 2. internal.py logs warning once per hour when bridge is unconfigured
+    monkeypatch.delenv("DALTON_BRIDGE_MCP_URL", raising=False)
+    monkeypatch.delenv("DALTON_BRIDGE_TOKEN", raising=False)
+    monkeypatch.setattr(internal_mod, "_LAST_UNCONFIGURED_WARN_AT", 0.0)
+    with caplog.at_level("WARNING"):
+        res1 = await internal_mod._query_bridge_internal_docs(
+            ticker="META", workspace_id="ws-1", allow_network=True
+        )
+        res2 = await internal_mod._query_bridge_internal_docs(
+            ticker="META", workspace_id="ws-1", allow_network=True
+        )
+    assert res1 == [] and res2 == []
+    unconf_warns = [
+        r for r in caplog.records if "neither DALTON_BRIDGE_MCP_URL nor DALTON_BRIDGE_TOKEN" in r.message
+    ]
+    assert len(unconf_warns) == 1
+
+    # 3. internal.py runs 3 routes in parallel and enforces 10s step timeout
+    monkeypatch.setenv("DALTON_BRIDGE_MCP_URL", "http://127.0.0.1:8960/mcp/test")
+    monkeypatch.setattr(internal_mod, "INTERNAL_PROBE_STEP_TIMEOUT_S", 0.05)
+
+    def _slow_bridge(**kwargs: Any) -> list[dict[str, Any]]:
+        import time as _t
+
+        _t.sleep(0.2)
+        return []
+
+    monkeypatch.setattr(internal_mod, "_fetch_bridge_route_sync", _slow_bridge)
+    with caplog.at_level("WARNING"):
+        timed_out_docs = await internal_mod._query_bridge_internal_docs(
+            ticker="META", workspace_id="ws-1", allow_network=True
+        )
+    assert timed_out_docs == []
+    assert any("bridge parallel query timed out" in r.message for r in caplog.records)
+
+    # 7. _check_budget_available fails open on DB error and logs at ERROR level
+    monkeypatch.setattr(
+        budget_svc,
+        "get_budget_today",
+        create_autospec(
+            budget_svc.get_budget_today,
+            side_effect=RuntimeError("db down during preflight budget check"),
+        ),
+    )
+    with caplog.at_level("ERROR"):
+        ok_b, reason_b = await preflight_mod._check_budget_available(user_id="u-1")
+    assert ok_b is True and reason_b is None
+    assert any(
+        r.levelname == "ERROR" and "failing open at preflight" in r.message
+        for r in caplog.records
+    )
+
+    # 4. preflight.py returns skip with reason="claim_failed" when claim_signals_woken raises
+    monkeypatch.setattr(
+        preflight_mod,
+        "_check_budget_available",
+        create_autospec(preflight_mod._check_budget_available, return_value=(True, None)),
+    )
+    monkeypatch.setattr(
+        watch_db,
+        "get_watch_state",
+        create_autospec(watch_db.get_watch_state, return_value={}),
+    )
+    monkeypatch.setattr(
+        watch_db,
+        "upsert_watch_state",
+        create_autospec(watch_db.upsert_watch_state, return_value={}),
+    )
+    monkeypatch.setattr(
+        watch_db,
+        "upsert_signal",
+        create_autospec(
+            watch_db.upsert_signal,
+            return_value=({"signal_id": "sig-claim-err"}, True),
+        ),
+    )
+    monkeypatch.setattr(
+        watch_db,
+        "claim_signals_woken",
+        create_autospec(
+            watch_db.claim_signals_woken,
+            side_effect=RuntimeError("db connection reset during claim"),
+        ),
+    )
+    monkeypatch.setattr(
+        watch_db,
+        "insert_preflight_log",
+        create_autospec(watch_db.insert_preflight_log, return_value=1),
+    )
+
+    pf_res = await preflight_check(
+        {
+            "automation_id": "11111111-1111-1111-1111-111111111111",
+            "name": "dalton-meta-watch",
+            "workspace_id": "22222222-2222-2222-2222-222222222222",
+            "user_id": "u-1",
+            "metadata": {"dalton_managed": True, "ticker": "META", "allow_network": False},
+        },
+        "33333333-3333-3333-3333-333333333333",
+        agenda_doc_override={
+            "next_validations": [
+                {"id": "V-1", "what": "Check Q3", "due": "2020-01-01", "status": "open"}
+            ]
+        },
+        persist=True,
+    )
+    assert pf_res.should_wake is False
+    assert pf_res.decision == "skip"
+    assert pf_res.reason == "claim_failed"
+
+    # 5. sec.py logs warning and marks sec_probe_degraded=True when CIK resolution fails
+    monkeypatch.setattr(
+        sec_mod,
+        "resolve_company_cik",
+        create_autospec(sec_mod.resolve_company_cik, return_value=None),
+    )
+    with caplog.at_level("WARNING"):
+        sec_sigs, sec_state = await sec_mod.probe_sec(
+            ticker="UNKNOWN_TICKER_XYZ",
+            watch_state={},
+            allow_network=False,
+        )
+    assert sec_sigs == []
+    assert sec_state.get("sec_probe_degraded") is True
+    assert any("marking sec_probe_degraded=True" in r.message for r in caplog.records)
+
+    # 6. schedule.py uses trading days & fixed hours (08:00 / 20:00), and make_price_triggers.py uses cooldown_seconds=86400
+    wed_specs = build_earnings_window_specs(
+        ticker="META",
+        workspace_id="ws-meta",
+        period="FY26Q3",
+        report_at="2026-10-28T16:05:00-04:00",  # Wednesday
+        timezone_name="America/New_York",
+    )
+    # 3 trading days before Wednesday Oct 28 -> Friday Oct 23 at 08:00 ET
+    assert wed_specs[0]["next_run_at"].isoformat() == "2026-10-23T08:00:00-04:00"
+    # 1 trading day after Wednesday Oct 28 -> Thursday Oct 29 at 20:00 ET
+    assert wed_specs[2]["next_run_at"].isoformat() == "2026-10-29T20:00:00-04:00"
+
+    script_path = (
+        Path(__file__).resolve().parents[3]
+        / "plugins/dalton/skills/dalton-stock-move/scripts/make_price_triggers.py"
+    )
+    spec = importlib.util.spec_from_file_location("make_price_triggers", script_path)
+    assert spec and spec.loader
+    mpt_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mpt_mod)
+    pair = mpt_mod.build_trigger_pair("META")
+    for obj in pair.values():
+        assert obj["trigger_config"]["retrigger"]["cooldown_seconds"] == 86400
+
+

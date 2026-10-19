@@ -92,13 +92,17 @@ def build_director_tools(
     """Build tools for the Chief of Staff / Research Director and Dalton automation scheduling."""
 
     @tool("dalton_coverage_board")
-    async def dalton_coverage_board() -> str:
+    async def dalton_coverage_board(
+        config: RunnableConfig = None,
+    ) -> str:
         """Read the cross-company Dalton coverage board, budget snapshot, and ranked task candidates.
 
         Returns:
             JSON string with `date`, `tz`, `budget`, `companies`, `candidates`, and `est_cost_by_kind`.
         """
-        board = await build_coverage_board()
+        configurable = (config or {}).get("configurable") or {}
+        user_id = str(configurable.get("user_id") or "local-dev-user")
+        board = await build_coverage_board(user_id=user_id)
         return json.dumps(board, ensure_ascii=False, default=str)
 
     @tool("dalton_record_plan")
@@ -107,7 +111,7 @@ def build_director_tools(
         skipped: Optional[list[dict[str, Any]]] = None,
         pm_attention: Optional[list[dict[str, Any]]] = None,
         plan_date: Optional[str] = None,
-        config: Optional[RunnableConfig] = None,
+        config: RunnableConfig = None,
     ) -> str:
         """Record the Research Director's daily dispatch plan into Postgres and write `dalton/plans/<date>.md`.
 
@@ -120,7 +124,9 @@ def build_director_tools(
             pm_attention: List of items awaiting PM review (`{ticker, what}`).
             plan_date: Optional ISO date string (`YYYY-MM-DD`); defaults to today.
         """
-        board = await build_coverage_board()
+        configurable = (config or {}).get("configurable") or {}
+        user_id = str(configurable.get("user_id") or "local-dev-user")
+        board = await build_coverage_board(user_id=user_id)
         budget = board.get("budget") or {}
         cap_usd = float(budget.get("cap_usd") or 0.0)
         allocatable = float(budget.get("allocatable_usd") or 0.0)
@@ -212,7 +218,7 @@ def build_director_tools(
         urgency: str = "this_week",
         why: str = "",
         ticker: Optional[str] = None,
-        config: Optional[RunnableConfig] = None,
+        config: RunnableConfig = None,
     ) -> str:
         """Append a PM/Director priority question directly to a company's `agenda` document (`origin='pm'`).
 
@@ -288,7 +294,7 @@ def build_director_tools(
         timezone_name: Optional[str] = None,
         workspace_id: Optional[str] = None,
         ticker: Optional[str] = None,
-        config: Optional[RunnableConfig] = None,
+        config: RunnableConfig = None,
     ) -> str:
         """Create, update, pause, resume, or list Dalton (`dalton-*`) automations (PK.15).
 

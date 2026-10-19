@@ -225,6 +225,20 @@ async def build_coverage_board(
                 )
                 sig_rows = await cur.fetchall()
 
+                watch_state_by_ws: dict[str, dict[str, Any]] = {}
+                try:
+                    await cur.execute(
+                        """
+                        SELECT workspace_id, state
+                        FROM dalton_watch_state
+                        """
+                    )
+                    for wr in await cur.fetchall() or []:
+                        if isinstance(wr, dict) and wr.get("workspace_id") and isinstance(wr.get("state"), dict):
+                            watch_state_by_ws[str(wr["workspace_id"])] = dict(wr["state"])
+                except Exception:
+                    watch_state_by_ws = {}
+
         kv_by_ws: dict[str, dict[str, dict[str, Any]]] = {}
         for r in kv_rows:
             ws_id = str(r["workspace_id"])
@@ -464,6 +478,9 @@ async def build_coverage_board(
                     ),
                     "last_research_at": last_research_at,
                     "pending_signals": len(ws_sigs),
+                    "sec_probe_degraded": bool(
+                        (watch_state_by_ws.get(ws_id) or {}).get("sec_probe_degraded")
+                    ),
                 }
             )
     except Exception as e:

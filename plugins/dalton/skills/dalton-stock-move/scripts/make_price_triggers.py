@@ -62,7 +62,7 @@ def build_trigger_pair(
             ],
             "retrigger": {
                 "mode": "recurring",
-                "cooldown_seconds": None,
+                "cooldown_seconds": 86400,
             },
         },
         "timezone": timezone,
@@ -92,7 +92,7 @@ def build_trigger_pair(
             ],
             "retrigger": {
                 "mode": "recurring",
-                "cooldown_seconds": None,
+                "cooldown_seconds": 86400,
             },
         },
         "timezone": timezone,

@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import json
 import logging
 import os
+import time
 from typing import Any, Optional
 import urllib.request
 
@@ -15,6 +16,8 @@ from src.dalton.autonomy.probes import ProbeSignal
 logger = logging.getLogger(__name__)
 
 INTERNAL_BRIDGE_ROUTES: tuple[str, ...] = ("sales-notes", "alphaengine", "guidepoint")
+INTERNAL_PROBE_STEP_TIMEOUT_S: float = 10.0
+_LAST_UNCONFIGURED_WARN_AT: float = 0.0
 
 
 def _fetch_bridge_route_sync(
@@ -95,6 +98,7 @@ async def _query_bridge_internal_docs(
     allow_network: bool = True,
 ) -> list[dict[str, Any]]:
     """Query internal research documents via researchdata bridge (sales-notes / alphaengine / guidepoint, A6)."""
+    global _LAST_UNCONFIGURED_WARN_AT
     if not allow_network:
         return []
     sym = (ticker or "").strip().upper()
@@ -108,19 +112,25 @@ async def _query_bridge_internal_docs(
         if token:
             bridge_url = f"http://127.0.0.1:{port}/mcp/{token}"
         else:
+            now_mono = time.monotonic()
+            if _LAST_UNCONFIGURED_WARN_AT == 0.0 or (now_mono - _LAST_UNCONFIGURED_WARN_AT) >= 3600.0:
+                _LAST_UNCONFIGURED_WARN_AT = now_mono
+                logger.warning(
+                    "[DALTON_INTERNAL_PROBE] neither DALTON_BRIDGE_MCP_URL nor DALTON_BRIDGE_TOKEN "
+                    "is configured; internal probe returning empty results (ticker=%s).",
+                    sym,
+                )
             return []
 
-    docs: list[dict[str, Any]] = []
-    for route in INTERNAL_BRIDGE_ROUTES:
+    async def _fetch_one_route(route: str) -> list[dict[str, Any]]:
         try:
-            route_docs = await asyncio.to_thread(
+            return await asyncio.to_thread(
                 _fetch_bridge_route_sync,
                 bridge_url=bridge_url,
                 route=route,
                 ticker=sym,
                 since_ts=since_ts,
             )
-            docs.extend(route_docs)
         except Exception as e:
             logger.warning(
                 "[DALTON_INTERNAL_PROBE] bridge query failed for ticker=%s route=%s: %s",
@@ -128,6 +138,29 @@ async def _query_bridge_internal_docs(
                 route,
                 e,
             )
+            return []
+
+    tasks = [asyncio.create_task(_fetch_one_route(route)) for route in INTERNAL_BRIDGE_ROUTES]
+    try:
+        route_results = await asyncio.wait_for(
+            asyncio.gather(*tasks, return_exceptions=True),
+            timeout=INTERNAL_PROBE_STEP_TIMEOUT_S,
+        )
+    except asyncio.TimeoutError:
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        logger.warning(
+            "[DALTON_INTERNAL_PROBE] bridge parallel query timed out after %.1fs for ticker=%s",
+            INTERNAL_PROBE_STEP_TIMEOUT_S,
+            sym,
+        )
+        return []
+
+    docs: list[dict[str, Any]] = []
+    for res in route_results:
+        if isinstance(res, list):
+            docs.extend(res)
     return docs
 
 
