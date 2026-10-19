@@ -1,29 +1,23 @@
 import React from 'react';
 import { render, screen, fireEvent } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
+import i18n from '@/i18n';
 import { PublishApprovalCard } from '../PublishApprovalCard';
 import type { ToolApprovalState } from '@/types/chat';
 
-vi.mock('react-i18next', () => ({
-  useTranslation: () => ({
-    t: (_key: string, fallback?: string | { defaultValue?: string }) => {
-      if (typeof fallback === 'string') return fallback;
-      if (fallback && typeof fallback === 'object' && fallback.defaultValue) {
-        return fallback.defaultValue;
-      }
-      return _key;
-    },
-  }),
-}));
-
 describe('PublishApprovalCard', () => {
-  it('renders 4-category figure_summary counts, uncertain_items list, reviewer summary, and labeling_incomplete banner from English keys', () => {
+  it('renders 4-category figure_summary counts, uncertain_items list, reviewer summary, and labeling_incomplete banner from English keys', async () => {
+    await i18n.changeLanguage('zh-CN');
     const onApprove = vi.fn();
     const onReject = vi.fn();
 
     const state: ToolApprovalState = {
       status: 'pending',
-      toolName: 'publish_report',
+      toolName: 'mcp__dalton-publish__publish_report',
+      server: 'dalton-publish',
+      tool: 'publish_report',
+      actionIndex: 0,
+      actionCount: 1,
       args: {
         request_id: 'req-abc1234567890',
         ticker: 'META',
@@ -82,10 +76,15 @@ describe('PublishApprovalCard', () => {
     expect(onApprove).toHaveBeenCalledTimes(1);
   });
 
-  it('supports legacy Chinese fallback keys when figure_summary object is omitted', () => {
+  it('supports legacy Chinese fallback keys when figure_summary object is omitted', async () => {
+    await i18n.changeLanguage('zh-CN');
     const state: ToolApprovalState = {
       status: 'pending',
-      toolName: 'publish_report',
+      toolName: 'mcp__dalton-publish__publish_report',
+      server: 'dalton-publish',
+      tool: 'publish_report',
+      actionIndex: 0,
+      actionCount: 1,
       args: {
         title: 'AMZN 初次覆盖',
         公司: 'AMZN',
@@ -107,6 +106,42 @@ describe('PublishApprovalCard', () => {
     ).toBeInTheDocument();
     expect(
       screen.getByText('通过 · claude-opus-4-7 (anthropic-claude)')
+    ).toBeInTheDocument();
+  });
+
+  it('renders English banner and labels when real i18n is loaded with en-US', async () => {
+    await i18n.changeLanguage('en-US');
+    const state: ToolApprovalState = {
+      status: 'pending',
+      toolName: 'mcp__dalton-publish__publish_report',
+      server: 'dalton-publish',
+      tool: 'publish_report',
+      actionIndex: 0,
+      actionCount: 1,
+      args: {
+        request_id: 'req-en123456',
+        ticker: 'GOOGL',
+        title: 'GOOGL 2Q26 Review',
+        kind: 'earnings',
+        labeling_incomplete: true,
+        figure_summary: {
+          verified: 10,
+          contradicted: 0,
+          unverified: 0,
+          uncertain: 0,
+          exempt: 0,
+          labeling_incomplete: true,
+        },
+      },
+    };
+
+    render(<PublishApprovalCard data={state} />);
+
+    expect(screen.getByTestId('publish-labeling-incomplete-warning')).toHaveTextContent(
+      'Figure labeling incomplete; colloquial figures and metric labels may not be fully verified'
+    );
+    expect(
+      screen.getByText('Official Research Publication Approval (PM Final Review)')
     ).toBeInTheDocument();
   });
 });

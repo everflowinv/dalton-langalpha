@@ -5324,7 +5324,8 @@
       "dailyCapLabel": "每日总上限 (USD)",
       "defaultTaskCapLabel": "单任务默认上限 (可选)",
       "timezoneLabel": "日切时区",
-      "workspaceCapsTitle": "工作区单任务上限覆盖"
+      "workspaceCapsTitle": "工作区单任务上限覆盖",
+      "byokCashNote": "注：设置页填写的现金类 BYOK Key 同样计入本地日美元现金额度（L24）"
     },
     "openclaw": {
       "title": "OpenClaw 模型同步（Dalton Broker）",
@@ -5356,6 +5357,7 @@
     },
     "publish": {
       "cardTitle": "正式研究报告发布审批（PM 终审）",
+      "labelingIncompleteWarning": "标注未完成，口语数字和指标可能未核验",
       "requestIdLabel": "申请单号",
       "titleLabel": "报告标题",
       "kindLabel": "报告类型",
