@@ -163,6 +163,11 @@ async def verify_local_wiring() -> None:
                 await cur.execute("SELECT version_num FROM alembic_version_dalton LIMIT 1")
                 v_row = await cur.fetchone()
                 version_num = (v_row or {}).get("version_num")
+                if not version_num:
+                    raise RuntimeError(
+                        "[DaltonBudget] alembic_version_dalton has no version_num; "
+                        "run Dalton database migrations before starting with DALTON_BUDGET_GATE=1."
+                    )
 
                 await cur.execute("SELECT COUNT(*) AS cnt FROM dalton_budget_config")
                 c_row = await cur.fetchone()
@@ -188,3 +193,4 @@ async def verify_local_wiring() -> None:
             )
     except Exception as exc:
         logger.error("[DaltonBudget] Startup wiring verification failed: %s", exc)
+        raise
