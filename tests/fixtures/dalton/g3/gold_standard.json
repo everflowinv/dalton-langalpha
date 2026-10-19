@@ -1,14 +1,34 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "description": "G3 Gold Standard figure annotation dataset across 3 sections of GOOGL and 3 sections of AMZN (P0I §1.8)",
+  "conventions": {
+    "is_verification_target": "是否应进入核验。false 只允许 P0J L43 的九类非核验对象，写在 incidental_category 里；事实陈述不论单位一律为 true",
+    "value_as_written": "raw 里的数字本身，不做单位换算（如 \"496 亿\" 记 496）",
+    "unit_as_written": "raw 里数字后面的原文单位（如 \"亿\"、\"亿美元\"、\"%\"），不做规范化",
+    "has_source": "独立证据集（*_sec_evidence.json）里有支撑该数字的原文；expected_source_id 指向该条证据"
+  },
+  "review": {
+    "reviewed_by": "lead",
+    "reviewed_at": "2026-10-19",
+    "method": [
+      "159 条全部做确定性复核：raw 逐字出现在草稿对应行；有来源的条目，证据原文含该数字（含 亿↔bn 的 ×10 换算）；无来源的条目，列出证据里同值的 23 处巧合并逐条人工确认属于不同事实",
+      "有来源的 36 条与无来源抽样 30 条，第四轮审查（R4-publish R4 节）已逐条人工复核",
+      "非核验对象 9 条按 P0J L43 重判：4 条事实陈述改为 true（F-155、F-156、F-051、F-069），F-051 实际有来源 EV-AMZN-001；5 条保留并写明类别"
+    ],
+    "changes_from_v1": [
+      "is_financial_figure 改名 is_verification_target",
+      "删除口径不一致的 value/unit，改为 value_as_written/unit_as_written",
+      "新增 incidental_category、reviewed_by、reviewed_at"
+    ]
+  },
   "summary": {
     "total_figures": 159,
     "googl_figures": 72,
     "amzn_figures": 87,
-    "financial_figures": 150,
-    "incidental_non_financial_figures": 9,
-    "sourced_figures": 36,
-    "unsourced_financial_figures": 114
+    "verification_targets": 154,
+    "incidental_non_targets": 5,
+    "sourced_figures": 37,
+    "unsourced_targets": 117
   },
   "items": [
     {
@@ -18,13 +38,15 @@
       "line": 11,
       "raw": "10 亿美元",
       "occurrence": 1,
-      "value": 10.0,
-      "unit": "USD_bn",
-      "is_financial_figure": true,
+      "value_as_written": 10.0,
+      "unit_as_written": "亿美元",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "3Q26",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "GOOGL",
@@ -33,13 +55,15 @@
       "line": 11,
       "raw": "110%",
       "occurrence": 1,
-      "value": 110.0,
-      "unit": "pct",
-      "is_financial_figure": true,
+      "value_as_written": 110.0,
+      "unit_as_written": "%",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "3Q26",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "GOOGL",
@@ -48,13 +72,15 @@
       "line": 11,
       "raw": "115%",
       "occurrence": 1,
-      "value": 115.0,
-      "unit": "pct",
-      "is_financial_figure": true,
+      "value_as_written": 115.0,
+      "unit_as_written": "%",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "3Q26",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "GOOGL",
@@ -63,13 +89,15 @@
       "line": 11,
       "raw": "50 亿",
       "occurrence": 1,
-      "value": 50.0,
-      "unit": "count",
-      "is_financial_figure": true,
+      "value_as_written": 50.0,
+      "unit_as_written": "亿",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "3Q26",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "GOOGL",
@@ -78,13 +106,15 @@
       "line": 11,
       "raw": "70 亿",
       "occurrence": 1,
-      "value": 70.0,
-      "unit": "count",
-      "is_financial_figure": true,
+      "value_as_written": 70.0,
+      "unit_as_written": "亿",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "3Q26",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "GOOGL",
@@ -93,13 +123,15 @@
       "line": 11,
       "raw": "87%",
       "occurrence": 1,
-      "value": 87.0,
-      "unit": "pct",
-      "is_financial_figure": true,
+      "value_as_written": 87.0,
+      "unit_as_written": "%",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "3Q26",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "GOOGL",
@@ -108,13 +140,15 @@
       "line": 11,
       "raw": "89%",
       "occurrence": 1,
-      "value": 89.0,
-      "unit": "pct",
-      "is_financial_figure": true,
+      "value_as_written": 89.0,
+      "unit_as_written": "%",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "3Q26",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "GOOGL",
@@ -123,13 +157,15 @@
       "line": 11,
       "raw": "88.6%",
       "occurrence": 1,
-      "value": 88.6,
-      "unit": "pct",
-      "is_financial_figure": true,
+      "value_as_written": 88.6,
+      "unit_as_written": "%",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "3Q26",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "GOOGL",
@@ -138,13 +174,15 @@
       "line": 11,
       "raw": "30 亿",
       "occurrence": 1,
-      "value": 30.0,
-      "unit": "USD_bn",
-      "is_financial_figure": true,
+      "value_as_written": 30.0,
+      "unit_as_written": "亿",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "3Q26",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "GOOGL",
@@ -153,13 +191,15 @@
       "line": 11,
       "raw": "40",
       "occurrence": 1,
-      "value": 40.0,
-      "unit": "USD",
-      "is_financial_figure": true,
+      "value_as_written": 40.0,
+      "unit_as_written": "",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "3Q26",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "GOOGL",
@@ -168,13 +208,15 @@
       "line": 12,
       "raw": "2,550 亿美元",
       "occurrence": 1,
-      "value": 2550.0,
-      "unit": "USD_bn",
-      "is_financial_figure": true,
+      "value_as_written": 2550.0,
+      "unit_as_written": "亿美元",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "FY2027",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "GOOGL",
@@ -183,13 +225,15 @@
       "line": 12,
       "raw": "400 亿",
       "occurrence": 1,
-      "value": 400.0,
-      "unit": "USD_bn",
-      "is_financial_figure": true,
+      "value_as_written": 400.0,
+      "unit_as_written": "亿",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "FY2027",
-      "note": "锚定盲区反例：专家称 2027 capex 年中达标最多再加 400 亿预算余量，绝不能被 EV-SEC-005（2Q26 400 亿美元 ATM 股票发行协议）核实"
+      "note": "锚定盲区反例：专家称 2027 capex 年中达标最多再加 400 亿预算余量，绝不能被 EV-SEC-005（2Q26 400 亿美元 ATM 股票发行协议）核实",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "GOOGL",
@@ -198,13 +242,15 @@
       "line": 12,
       "raw": "3,050 亿",
       "occurrence": 1,
-      "value": 3050.0,
-      "unit": "USD_bn",
-      "is_financial_figure": true,
+      "value_as_written": 3050.0,
+      "unit_as_written": "亿",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "FY2027",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "GOOGL",
@@ -213,13 +259,15 @@
       "line": 12,
       "raw": "3,500 亿",
       "occurrence": 1,
-      "value": 3500.0,
-      "unit": "count",
-      "is_financial_figure": true,
+      "value_as_written": 3500.0,
+      "unit_as_written": "亿",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "FY2027",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "GOOGL",
@@ -228,13 +276,15 @@
       "line": 13,
       "raw": "2%",
       "occurrence": 1,
-      "value": 2.0,
-      "unit": "pct",
-      "is_financial_figure": true,
+      "value_as_written": 2.0,
+      "unit_as_written": "%",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "FY2027",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "GOOGL",
@@ -243,13 +293,15 @@
       "line": 13,
       "raw": "5%",
       "occurrence": 1,
-      "value": 5.0,
-      "unit": "pct",
-      "is_financial_figure": true,
+      "value_as_written": 5.0,
+      "unit_as_written": "%",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "FY2027",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "GOOGL",
@@ -258,13 +310,15 @@
       "line": 13,
       "raw": "-7.1%",
       "occurrence": 1,
-      "value": -7.1,
-      "unit": "pct",
-      "is_financial_figure": true,
+      "value_as_written": -7.1,
+      "unit_as_written": "%",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "GOOGL",
@@ -273,13 +327,15 @@
       "line": 14,
       "raw": "349.22",
       "occurrence": 1,
-      "value": 349.22,
-      "unit": "other",
-      "is_financial_figure": true,
+      "value_as_written": 349.22,
+      "unit_as_written": "",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "GOOGL",
@@ -288,13 +344,15 @@
       "line": 14,
       "raw": "+0.45%",
       "occurrence": 1,
-      "value": 0.45,
-      "unit": "pct",
-      "is_financial_figure": true,
+      "value_as_written": 0.45,
+      "unit_as_written": "%",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "GOOGL",
@@ -303,13 +361,15 @@
       "line": 14,
       "raw": "-0.13%",
       "occurrence": 1,
-      "value": -0.13,
-      "unit": "pct",
-      "is_financial_figure": true,
+      "value_as_written": -0.13,
+      "unit_as_written": "%",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "GOOGL",
@@ -318,13 +378,15 @@
       "line": 14,
       "raw": "+0.27%",
       "occurrence": 1,
-      "value": 0.27,
-      "unit": "pct",
-      "is_financial_figure": true,
+      "value_as_written": 0.27,
+      "unit_as_written": "%",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "GOOGL",
@@ -333,13 +395,15 @@
       "line": 14,
       "raw": "-2.62%",
       "occurrence": 1,
-      "value": -2.62,
-      "unit": "pct",
-      "is_financial_figure": true,
+      "value_as_written": -2.62,
+      "unit_as_written": "%",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "GOOGL",
@@ -348,13 +412,15 @@
       "line": 14,
       "raw": "-7.53%",
       "occurrence": 1,
-      "value": -7.53,
-      "unit": "pct",
-      "is_financial_figure": true,
+      "value_as_written": -7.53,
+      "unit_as_written": "%",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "GOOGL",
@@ -363,13 +429,15 @@
       "line": 14,
       "raw": "2.6",
       "occurrence": 1,
-      "value": 2.6,
-      "unit": "other",
-      "is_financial_figure": true,
+      "value_as_written": 2.6,
+      "unit_as_written": "",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "GOOGL",
@@ -378,13 +446,15 @@
       "line": 15,
       "raw": "15%",
       "occurrence": 1,
-      "value": 15.0,
-      "unit": "pct",
-      "is_financial_figure": true,
+      "value_as_written": 15.0,
+      "unit_as_written": "%",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "FY2027",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "GOOGL",
@@ -393,13 +463,15 @@
       "line": 15,
       "raw": "80%",
       "occurrence": 1,
-      "value": 80.0,
-      "unit": "pct",
-      "is_financial_figure": true,
+      "value_as_written": 80.0,
+      "unit_as_written": "%",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "3Q26",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "GOOGL",
@@ -408,13 +480,15 @@
       "line": 15,
       "raw": "14%",
       "occurrence": 1,
-      "value": 14.0,
-      "unit": "pct",
-      "is_financial_figure": true,
+      "value_as_written": 14.0,
+      "unit_as_written": "%",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "3Q26",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "GOOGL",
@@ -423,13 +497,15 @@
       "line": 15,
       "raw": "3,000 亿",
       "occurrence": 1,
-      "value": 3000.0,
-      "unit": "count",
-      "is_financial_figure": true,
+      "value_as_written": 3000.0,
+      "unit_as_written": "亿",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "FY2027",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "GOOGL",
@@ -438,13 +514,15 @@
       "line": 16,
       "raw": "13%",
       "occurrence": 1,
-      "value": 13.0,
-      "unit": "pct",
-      "is_financial_figure": true,
+      "value_as_written": 13.0,
+      "unit_as_written": "%",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "3Q26",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "GOOGL",
@@ -453,13 +531,15 @@
       "line": 16,
       "raw": "12%",
       "occurrence": 1,
-      "value": 12.0,
-      "unit": "pct",
-      "is_financial_figure": true,
+      "value_as_written": 12.0,
+      "unit_as_written": "%",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "4Q26",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "GOOGL",
@@ -468,13 +548,15 @@
       "line": 16,
       "raw": "3,500 亿",
       "occurrence": 1,
-      "value": 3500.0,
-      "unit": "count",
-      "is_financial_figure": true,
+      "value_as_written": 3500.0,
+      "unit_as_written": "亿",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "FY2027",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "GOOGL",
@@ -483,13 +565,15 @@
       "line": 16,
       "raw": "10%",
       "occurrence": 1,
-      "value": 10.0,
-      "unit": "pct",
-      "is_financial_figure": true,
+      "value_as_written": 10.0,
+      "unit_as_written": "%",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "FY2027",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "GOOGL",
@@ -498,13 +582,15 @@
       "line": 38,
       "raw": "2,550 亿",
       "occurrence": 1,
-      "value": 2550.0,
-      "unit": "count",
-      "is_financial_figure": true,
+      "value_as_written": 2550.0,
+      "unit_as_written": "亿",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "FY2027",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "GOOGL",
@@ -513,13 +599,15 @@
       "line": 38,
       "raw": "2,950 亿",
       "occurrence": 1,
-      "value": 2950.0,
-      "unit": "count",
-      "is_financial_figure": true,
+      "value_as_written": 2950.0,
+      "unit_as_written": "亿",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "FY2027",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "GOOGL",
@@ -528,13 +616,15 @@
       "line": 38,
       "raw": "3,500 亿",
       "occurrence": 1,
-      "value": 3500.0,
-      "unit": "count",
-      "is_financial_figure": true,
+      "value_as_written": 3500.0,
+      "unit_as_written": "亿",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "FY2027",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "GOOGL",
@@ -543,13 +633,15 @@
       "line": 39,
       "raw": "496 亿",
       "occurrence": 1,
-      "value": 496.0,
-      "unit": "count",
-      "is_financial_figure": true,
+      "value_as_written": 496.0,
+      "unit_as_written": "亿",
+      "is_verification_target": true,
       "has_source": true,
       "expected_source_id": "EV-SEC-005",
       "expected_period": "2Q26",
-      "note": "2Q26 10-Q Note 11: 6月增发普通股与强制可转优先股净募资 496 亿美元"
+      "note": "2Q26 10-Q Note 11: 6月增发普通股与强制可转优先股净募资 496 亿美元",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "GOOGL",
@@ -558,13 +650,15 @@
       "line": 39,
       "raw": "400 亿",
       "occurrence": 1,
-      "value": 400.0,
-      "unit": "count",
-      "is_financial_figure": true,
+      "value_as_written": 400.0,
+      "unit_as_written": "亿",
+      "is_verification_target": true,
       "has_source": true,
       "expected_source_id": "EV-SEC-005",
       "expected_period": "2Q26",
-      "note": "2Q26 10-Q Note 11: 6月1日签订最高 400 亿美元 ATM 股票发行协议"
+      "note": "2Q26 10-Q Note 11: 6月1日签订最高 400 亿美元 ATM 股票发行协议",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "GOOGL",
@@ -573,13 +667,15 @@
       "line": 39,
       "raw": "203 亿",
       "occurrence": 1,
-      "value": 203.0,
-      "unit": "USD_bn",
-      "is_financial_figure": true,
+      "value_as_written": 203.0,
+      "unit_as_written": "亿",
+      "is_verification_target": true,
       "has_source": true,
       "expected_source_id": "EV-SEC-006",
       "expected_period": "2Q26",
-      "note": "2Q26 10-Q Note 7: Q2 发行高级无担保票据净募资 203 亿美元"
+      "note": "2Q26 10-Q Note 7: Q2 发行高级无担保票据净募资 203 亿美元",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "GOOGL",
@@ -588,13 +684,15 @@
       "line": 39,
       "raw": "852 亿美元",
       "occurrence": 1,
-      "value": 852.0,
-      "unit": "USD_bn",
-      "is_financial_figure": true,
+      "value_as_written": 852.0,
+      "unit_as_written": "亿美元",
+      "is_verification_target": true,
       "has_source": true,
       "expected_source_id": "EV-SEC-007",
       "expected_period": "2Q26",
-      "note": "2Q26 10-Q Note 5: 截至 6/30 已签约未起租数据中心租约 852 亿美元"
+      "note": "2Q26 10-Q Note 5: 截至 6/30 已签约未起租数据中心租约 852 亿美元",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "GOOGL",
@@ -603,13 +701,15 @@
       "line": 39,
       "raw": "2,425 亿",
       "occurrence": 1,
-      "value": 2425.0,
-      "unit": "count",
-      "is_financial_figure": true,
+      "value_as_written": 2425.0,
+      "unit_as_written": "亿",
+      "is_verification_target": true,
       "has_source": true,
       "expected_source_id": "EV-SEC-008",
       "expected_period": "2Q26",
-      "note": "2Q26 10-Q 资产负债表: 截至 6/30 现金及短期投资 2,424.74 亿美元（约 2,425 亿）"
+      "note": "2Q26 10-Q 资产负债表: 截至 6/30 现金及短期投资 2,424.74 亿美元（约 2,425 亿）",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "GOOGL",
@@ -618,13 +718,15 @@
       "line": 40,
       "raw": "3,050 亿",
       "occurrence": 1,
-      "value": 3050.0,
-      "unit": "count",
-      "is_financial_figure": true,
+      "value_as_written": 3050.0,
+      "unit_as_written": "亿",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "FY2027",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "GOOGL",
@@ -633,13 +735,15 @@
       "line": 40,
       "raw": "3,500 亿",
       "occurrence": 1,
-      "value": 3500.0,
-      "unit": "count",
-      "is_financial_figure": true,
+      "value_as_written": 3500.0,
+      "unit_as_written": "亿",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "FY2027",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "GOOGL",
@@ -648,13 +752,15 @@
       "line": 40,
       "raw": "45 亿",
       "occurrence": 1,
-      "value": 45.0,
-      "unit": "count",
-      "is_financial_figure": true,
+      "value_as_written": 45.0,
+      "unit_as_written": "亿",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "FY2026",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "GOOGL",
@@ -663,13 +769,15 @@
       "line": 40,
       "raw": "-631 亿",
       "occurrence": 1,
-      "value": -631.0,
-      "unit": "count",
-      "is_financial_figure": true,
+      "value_as_written": -631.0,
+      "unit_as_written": "亿",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "FY2027",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "GOOGL",
@@ -678,13 +786,15 @@
       "line": 40,
       "raw": "800 亿",
       "occurrence": 1,
-      "value": 800.0,
-      "unit": "count",
-      "is_financial_figure": true,
+      "value_as_written": 800.0,
+      "unit_as_written": "亿",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "FY2027",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "GOOGL",
@@ -693,13 +803,15 @@
       "line": 41,
       "raw": "7.5%",
       "occurrence": 1,
-      "value": 7.5,
-      "unit": "pct",
-      "is_financial_figure": true,
+      "value_as_written": 7.5,
+      "unit_as_written": "%",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "GOOGL",
@@ -708,13 +820,15 @@
       "line": 41,
       "raw": "6.5%",
       "occurrence": 1,
-      "value": 6.5,
-      "unit": "pct",
-      "is_financial_figure": true,
+      "value_as_written": 6.5,
+      "unit_as_written": "%",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "GOOGL",
@@ -723,13 +837,15 @@
       "line": 41,
       "raw": "800 亿",
       "occurrence": 1,
-      "value": 800.0,
-      "unit": "count",
-      "is_financial_figure": true,
+      "value_as_written": 800.0,
+      "unit_as_written": "亿",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "FY2027",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "GOOGL",
@@ -738,13 +854,15 @@
       "line": 42,
       "raw": "40 亿美元",
       "occurrence": 1,
-      "value": 40.0,
-      "unit": "USD_bn",
-      "is_financial_figure": true,
+      "value_as_written": 40.0,
+      "unit_as_written": "亿美元",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "GOOGL",
@@ -753,13 +871,15 @@
       "line": 42,
       "raw": "702",
       "occurrence": 1,
-      "value": 702.0,
-      "unit": "USD",
-      "is_financial_figure": false,
+      "value_as_written": 702.0,
+      "unit_as_written": "",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "",
-      "note": "非核验对象：702MW 燃料电池装机容量（物理功率单位，非财务指标）"
+      "note": "事实陈述：AEP 702MW 燃料电池装机容量（TMTB 10/14 转述，不在独立 SEC 证据集中）",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "GOOGL",
@@ -768,13 +888,15 @@
       "line": 42,
       "raw": "20",
       "occurrence": 1,
-      "value": 20.0,
-      "unit": "USD",
-      "is_financial_figure": false,
+      "value_as_written": 20.0,
+      "unit_as_written": "",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "",
-      "note": "非核验对象：20 年 PPA 合同期限（年限，非财务指标）"
+      "note": "事实陈述：20 年 PPA 合同期限（TMTB 10/14 转述，不在独立 SEC 证据集中）",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "GOOGL",
@@ -783,13 +905,15 @@
       "line": 43,
       "raw": "2,550 亿",
       "occurrence": 1,
-      "value": 2550.0,
-      "unit": "count",
-      "is_financial_figure": true,
+      "value_as_written": 2550.0,
+      "unit_as_written": "亿",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "FY2027",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "GOOGL",
@@ -798,13 +922,15 @@
       "line": 43,
       "raw": "400 亿",
       "occurrence": 1,
-      "value": 400.0,
-      "unit": "count",
-      "is_financial_figure": true,
+      "value_as_written": 400.0,
+      "unit_as_written": "亿",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "FY2027",
-      "note": "锚定盲区反例：专家称 2027 capex 年中达标最多再加 400 亿预算余量，绝不能被 EV-SEC-005（2Q26 400 亿美元 ATM 股票发行协议）核实"
+      "note": "锚定盲区反例：专家称 2027 capex 年中达标最多再加 400 亿预算余量，绝不能被 EV-SEC-005（2Q26 400 亿美元 ATM 股票发行协议）核实",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "GOOGL",
@@ -813,13 +939,15 @@
       "line": 43,
       "raw": "852 亿",
       "occurrence": 1,
-      "value": 852.0,
-      "unit": "count",
-      "is_financial_figure": true,
+      "value_as_written": 852.0,
+      "unit_as_written": "亿",
+      "is_verification_target": true,
       "has_source": true,
       "expected_source_id": "EV-SEC-007",
       "expected_period": "2Q26",
-      "note": "2Q26 10-Q Note 5: 852 亿美元未起租数据中心租约"
+      "note": "2Q26 10-Q Note 5: 852 亿美元未起租数据中心租约",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "GOOGL",
@@ -828,13 +956,15 @@
       "line": 48,
       "raw": "247.7 亿",
       "occurrence": 1,
-      "value": 247.7,
-      "unit": "count",
-      "is_financial_figure": true,
+      "value_as_written": 247.7,
+      "unit_as_written": "亿",
+      "is_verification_target": true,
       "has_source": true,
       "expected_source_id": "EV-SEC-001",
       "expected_period": "2Q26",
-      "note": "2Q26 10-Q Note 15: Q2 Google Cloud 云收入 247.68 亿美元（约 247.7 亿）"
+      "note": "2Q26 10-Q Note 15: Q2 Google Cloud 云收入 247.68 亿美元（约 247.7 亿）",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "GOOGL",
@@ -843,13 +973,15 @@
       "line": 48,
       "raw": "+82%",
       "occurrence": 1,
-      "value": 82.0,
-      "unit": "pct",
-      "is_financial_figure": true,
+      "value_as_written": 82.0,
+      "unit_as_written": "%",
+      "is_verification_target": true,
       "has_source": true,
       "expected_source_id": "EV-SEC-001",
       "expected_period": "2Q26",
-      "note": "2Q26 10-Q Note 15: Q2 Google Cloud 云收入同比 +82%"
+      "note": "2Q26 10-Q Note 15: Q2 Google Cloud 云收入同比 +82%",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "GOOGL",
@@ -858,13 +990,15 @@
       "line": 48,
       "raw": "35.6%",
       "occurrence": 1,
-      "value": 35.6,
-      "unit": "pct",
-      "is_financial_figure": true,
+      "value_as_written": 35.6,
+      "unit_as_written": "%",
+      "is_verification_target": true,
       "has_source": true,
       "expected_source_id": "EV-SEC-001",
       "expected_period": "2Q26",
-      "note": "2Q26 10-Q Note 15: Q2 Google Cloud 经营利润率 35.6%"
+      "note": "2Q26 10-Q Note 15: Q2 Google Cloud 经营利润率 35.6%",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "GOOGL",
@@ -873,13 +1007,15 @@
       "line": 48,
       "raw": "81%",
       "occurrence": 1,
-      "value": 81.0,
-      "unit": "pct",
-      "is_financial_figure": true,
+      "value_as_written": 81.0,
+      "unit_as_written": "%",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "3Q26",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "GOOGL",
@@ -888,13 +1024,15 @@
       "line": 48,
       "raw": "5,500 亿",
       "occurrence": 1,
-      "value": 5500.0,
-      "unit": "count",
-      "is_financial_figure": true,
+      "value_as_written": 5500.0,
+      "unit_as_written": "亿",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "3Q26",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "GOOGL",
@@ -903,13 +1041,15 @@
       "line": 48,
       "raw": "5,140 亿",
       "occurrence": 1,
-      "value": 5140.0,
-      "unit": "count",
-      "is_financial_figure": true,
+      "value_as_written": 5140.0,
+      "unit_as_written": "亿",
+      "is_verification_target": true,
       "has_source": true,
       "expected_source_id": "EV-SEC-009",
       "expected_period": "2Q26",
-      "note": "2Q26 10-Q Note 2: Q2 末 Google Cloud 积压订单 5,139 亿美元（约 5,140 亿）"
+      "note": "2Q26 10-Q Note 2: Q2 末 Google Cloud 积压订单 5,139 亿美元（约 5,140 亿）",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "GOOGL",
@@ -918,13 +1058,15 @@
       "line": 48,
       "raw": "50 亿",
       "occurrence": 1,
-      "value": 50.0,
-      "unit": "count",
-      "is_financial_figure": true,
+      "value_as_written": 50.0,
+      "unit_as_written": "亿",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "FY2026",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "GOOGL",
@@ -933,13 +1075,15 @@
       "line": 48,
       "raw": "150 亿",
       "occurrence": 1,
-      "value": 150.0,
-      "unit": "count",
-      "is_financial_figure": true,
+      "value_as_written": 150.0,
+      "unit_as_written": "亿",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "2Q26",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "GOOGL",
@@ -948,13 +1092,15 @@
       "line": 48,
       "raw": "170 亿",
       "occurrence": 1,
-      "value": 170.0,
-      "unit": "count",
-      "is_financial_figure": true,
+      "value_as_written": 170.0,
+      "unit_as_written": "亿",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "2Q26",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "GOOGL",
@@ -963,13 +1109,15 @@
       "line": 48,
       "raw": "300 亿",
       "occurrence": 1,
-      "value": 300.0,
-      "unit": "count",
-      "is_financial_figure": true,
+      "value_as_written": 300.0,
+      "unit_as_written": "亿",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "FY2026",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "GOOGL",
@@ -978,13 +1126,15 @@
       "line": 48,
       "raw": "3,000 万",
       "occurrence": 1,
-      "value": 3000.0,
-      "unit": "count",
-      "is_financial_figure": true,
+      "value_as_written": 3000.0,
+      "unit_as_written": "万",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "3Q26",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "GOOGL",
@@ -993,13 +1143,15 @@
       "line": 49,
       "raw": "+43%",
       "occurrence": 1,
-      "value": 43.0,
-      "unit": "pct",
-      "is_financial_figure": true,
+      "value_as_written": 43.0,
+      "unit_as_written": "%",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "FY2026",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "GOOGL",
@@ -1008,13 +1160,15 @@
       "line": 49,
       "raw": "+26%",
       "occurrence": 1,
-      "value": 26.0,
-      "unit": "pct",
-      "is_financial_figure": true,
+      "value_as_written": 26.0,
+      "unit_as_written": "%",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "FY2026",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "GOOGL",
@@ -1023,13 +1177,15 @@
       "line": 49,
       "raw": "+4%",
       "occurrence": 1,
-      "value": 4.0,
-      "unit": "pct",
-      "is_financial_figure": true,
+      "value_as_written": 4.0,
+      "unit_as_written": "%",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "FY2026",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "GOOGL",
@@ -1038,13 +1194,15 @@
       "line": 49,
       "raw": "5%",
       "occurrence": 1,
-      "value": 5.0,
-      "unit": "pct",
-      "is_financial_figure": true,
+      "value_as_written": 5.0,
+      "unit_as_written": "%",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "FY2026",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "GOOGL",
@@ -1053,13 +1211,15 @@
       "line": 49,
       "raw": "20%",
       "occurrence": 1,
-      "value": 20.0,
-      "unit": "pct",
-      "is_financial_figure": true,
+      "value_as_written": 20.0,
+      "unit_as_written": "%",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "FY2026",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "GOOGL",
@@ -1068,13 +1228,15 @@
       "line": 49,
       "raw": "300 万",
       "occurrence": 1,
-      "value": 300.0,
-      "unit": "count",
-      "is_financial_figure": true,
+      "value_as_written": 300.0,
+      "unit_as_written": "万",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "1H27",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "GOOGL",
@@ -1083,13 +1245,15 @@
       "line": 49,
       "raw": "400 万",
       "occurrence": 1,
-      "value": 400.0,
-      "unit": "count",
-      "is_financial_figure": true,
+      "value_as_written": 400.0,
+      "unit_as_written": "万",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "2H27",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -1098,13 +1262,15 @@
       "line": 21,
       "raw": "37%",
       "occurrence": 1,
-      "value": 37.0,
-      "unit": "pct",
-      "is_financial_figure": true,
+      "value_as_written": 37.0,
+      "unit_as_written": "%",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "3Q26",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -1113,13 +1279,15 @@
       "line": 21,
       "raw": "40%",
       "occurrence": 1,
-      "value": 40.0,
-      "unit": "pct",
-      "is_financial_figure": true,
+      "value_as_written": 40.0,
+      "unit_as_written": "%",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "3Q26",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -1128,13 +1296,15 @@
       "line": 22,
       "raw": "422.3 亿美元",
       "occurrence": 1,
-      "value": 422.3,
-      "unit": "USD_bn",
-      "is_financial_figure": true,
+      "value_as_written": 422.3,
+      "unit_as_written": "亿美元",
+      "is_verification_target": true,
       "has_source": true,
       "expected_source_id": "EV-AMZN-001",
       "expected_period": "2Q26",
-      "note": "2Q26 10-Q Note 10: Q2 AWS 收入 422.3 亿美元"
+      "note": "2Q26 10-Q Note 10: Q2 AWS 收入 422.3 亿美元",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -1143,13 +1313,15 @@
       "line": 22,
       "raw": "+36.7%",
       "occurrence": 1,
-      "value": 36.7,
-      "unit": "pct",
-      "is_financial_figure": true,
+      "value_as_written": 36.7,
+      "unit_as_written": "%",
+      "is_verification_target": true,
       "has_source": true,
       "expected_source_id": "EV-AMZN-001",
       "expected_period": "2Q26",
-      "note": "2Q26 10-Q Note 10: Q2 AWS 收入同比 +36.7%"
+      "note": "2Q26 10-Q Note 10: Q2 AWS 收入同比 +36.7%",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -1158,13 +1330,15 @@
       "line": 22,
       "raw": "46 亿美元",
       "occurrence": 1,
-      "value": 46.0,
-      "unit": "USD_bn",
-      "is_financial_figure": true,
+      "value_as_written": 46.0,
+      "unit_as_written": "亿美元",
+      "is_verification_target": true,
       "has_source": true,
       "expected_source_id": "EV-AMZN-001",
       "expected_period": "2Q26",
-      "note": "2Q26 10-Q Note 10: Q2 AWS 收入环比增量 46 亿美元"
+      "note": "2Q26 10-Q Note 10: Q2 AWS 收入环比增量 46 亿美元",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -1173,13 +1347,15 @@
       "line": 22,
       "raw": "1,690 亿美元",
       "occurrence": 1,
-      "value": 1690.0,
-      "unit": "USD_bn",
-      "is_financial_figure": true,
+      "value_as_written": 1690.0,
+      "unit_as_written": "亿美元",
+      "is_verification_target": true,
       "has_source": true,
       "expected_source_id": "EV-AMZN-001",
       "expected_period": "2Q26",
-      "note": "2Q26 10-Q Note 10: Q2 AWS 年化运行率 1,690 亿美元"
+      "note": "2Q26 10-Q Note 10: Q2 AWS 年化运行率 1,690 亿美元",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -1188,13 +1364,15 @@
       "line": 22,
       "raw": "4,960 亿美元",
       "occurrence": 1,
-      "value": 4960.0,
-      "unit": "USD_bn",
-      "is_financial_figure": true,
+      "value_as_written": 4960.0,
+      "unit_as_written": "亿美元",
+      "is_verification_target": true,
       "has_source": true,
       "expected_source_id": "EV-AMZN-001",
       "expected_period": "2Q26",
-      "note": "2Q26 10-Q Note 10: Q2 末 AWS backlog 4,960 亿美元"
+      "note": "2Q26 10-Q Note 10: Q2 末 AWS backlog 4,960 亿美元",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -1203,13 +1381,15 @@
       "line": 22,
       "raw": "6.4",
       "occurrence": 1,
-      "value": 6.4,
-      "unit": "USD",
-      "is_financial_figure": false,
-      "has_source": false,
-      "expected_source_id": null,
+      "value_as_written": 6.4,
+      "unit_as_written": "",
+      "is_verification_target": true,
+      "has_source": true,
+      "expected_source_id": "EV-AMZN-001",
       "expected_period": "2Q26",
-      "note": "非核验对象：加权剩余合同期限 6.4 年（合同年限，非货币/百分比财务数字）"
+      "note": "事实陈述：backlog 加权剩余合同期限 6.4 年（2Q26 10-Q 披露，见 EV-AMZN-001）",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -1218,13 +1398,15 @@
       "line": 22,
       "raw": "250 亿美元",
       "occurrence": 1,
-      "value": 250.0,
-      "unit": "USD_bn",
-      "is_financial_figure": true,
+      "value_as_written": 250.0,
+      "unit_as_written": "亿美元",
+      "is_verification_target": true,
       "has_source": true,
       "expected_source_id": "EV-AMZN-002",
       "expected_period": "2Q26",
-      "note": "2Q26 8-K/电话会: 定制芯片与 AI 业务年化收入各超过 250 亿美元"
+      "note": "2Q26 8-K/电话会: 定制芯片与 AI 业务年化收入各超过 250 亿美元",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -1233,13 +1415,15 @@
       "line": 22,
       "raw": "330.1 亿",
       "occurrence": 1,
-      "value": 330.1,
-      "unit": "count",
-      "is_financial_figure": true,
+      "value_as_written": 330.1,
+      "unit_as_written": "亿",
+      "is_verification_target": true,
       "has_source": true,
       "expected_source_id": "EV-AMZN-001",
       "expected_period": "3Q25",
-      "note": "2Q26 10-Q Note 10: 3Q25 AWS 收入基数 330.1 亿美元"
+      "note": "2Q26 10-Q Note 10: 3Q25 AWS 收入基数 330.1 亿美元",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -1248,13 +1432,15 @@
       "line": 22,
       "raw": "355.7 亿",
       "occurrence": 1,
-      "value": 355.7,
-      "unit": "count",
-      "is_financial_figure": true,
+      "value_as_written": 355.7,
+      "unit_as_written": "亿",
+      "is_verification_target": true,
       "has_source": true,
       "expected_source_id": "EV-AMZN-001",
       "expected_period": "4Q25",
-      "note": "2Q26 10-Q Note 10: 4Q25 AWS 收入基数 355.7 亿美元"
+      "note": "2Q26 10-Q Note 10: 4Q25 AWS 收入基数 355.7 亿美元",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -1263,13 +1449,15 @@
       "line": 23,
       "raw": "+41.2%",
       "occurrence": 1,
-      "value": 41.2,
-      "unit": "pct",
-      "is_financial_figure": true,
+      "value_as_written": 41.2,
+      "unit_as_written": "%",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "3Q26",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -1278,13 +1466,15 @@
       "line": 23,
       "raw": "101 亿美元",
       "occurrence": 1,
-      "value": 101.0,
-      "unit": "USD_bn",
-      "is_financial_figure": true,
+      "value_as_written": 101.0,
+      "unit_as_written": "亿美元",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "3Q26",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -1293,13 +1483,15 @@
       "line": 23,
       "raw": "+540%",
       "occurrence": 1,
-      "value": 540.0,
-      "unit": "pct",
-      "is_financial_figure": true,
+      "value_as_written": 540.0,
+      "unit_as_written": "%",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "3Q26",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -1308,13 +1500,15 @@
       "line": 23,
       "raw": "365 亿",
       "occurrence": 1,
-      "value": 365.0,
-      "unit": "USD_bn",
-      "is_financial_figure": true,
+      "value_as_written": 365.0,
+      "unit_as_written": "亿",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "3Q26",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -1323,13 +1517,15 @@
       "line": 23,
       "raw": "+16%",
       "occurrence": 1,
-      "value": 16.0,
-      "unit": "pct",
-      "is_financial_figure": true,
+      "value_as_written": 16.0,
+      "unit_as_written": "%",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "3Q26",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -1338,13 +1534,15 @@
       "line": 23,
       "raw": "350",
       "occurrence": 1,
-      "value": 350.0,
-      "unit": "other",
-      "is_financial_figure": true,
+      "value_as_written": 350.0,
+      "unit_as_written": "",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "FY2026",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -1353,13 +1551,15 @@
       "line": 23,
       "raw": "15%",
       "occurrence": 1,
-      "value": 15.0,
-      "unit": "pct",
-      "is_financial_figure": true,
+      "value_as_written": 15.0,
+      "unit_as_written": "%",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "FY2026",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -1368,13 +1568,16 @@
       "line": 23,
       "raw": "200",
       "occurrence": 1,
-      "value": 200.0,
-      "unit": "other",
-      "is_financial_figure": false,
+      "value_as_written": 200.0,
+      "unit_as_written": "",
+      "is_verification_target": false,
+      "incidental_category": "型号",
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "",
-      "note": "非核验对象：GPU 型号 B200 中的型号数字"
+      "note": "非核验对象：GPU 型号 B200 中的型号数字",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -1383,13 +1586,16 @@
       "line": 23,
       "raw": "300",
       "occurrence": 1,
-      "value": 300.0,
-      "unit": "other",
-      "is_financial_figure": false,
+      "value_as_written": 300.0,
+      "unit_as_written": "",
+      "is_verification_target": false,
+      "incidental_category": "型号",
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "",
-      "note": "非核验对象：GPU 型号 B300 中的型号数字"
+      "note": "非核验对象：GPU 型号 B300 中的型号数字",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -1398,13 +1604,15 @@
       "line": 23,
       "raw": "40%",
       "occurrence": 1,
-      "value": 40.0,
-      "unit": "pct",
-      "is_financial_figure": true,
+      "value_as_written": 40.0,
+      "unit_as_written": "%",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "FY2026",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -1413,13 +1621,15 @@
       "line": 23,
       "raw": "75%",
       "occurrence": 1,
-      "value": 75.0,
-      "unit": "pct",
-      "is_financial_figure": true,
+      "value_as_written": 75.0,
+      "unit_as_written": "%",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "FY2026",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -1428,13 +1638,15 @@
       "line": 23,
       "raw": "338",
       "occurrence": 1,
-      "value": 338.0,
-      "unit": "other",
-      "is_financial_figure": true,
+      "value_as_written": 338.0,
+      "unit_as_written": "",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "FY2026",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -1443,13 +1655,15 @@
       "line": 23,
       "raw": "355",
       "occurrence": 1,
-      "value": 355.0,
-      "unit": "other",
-      "is_financial_figure": true,
+      "value_as_written": 355.0,
+      "unit_as_written": "",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "FY2026",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -1458,13 +1672,15 @@
       "line": 23,
       "raw": "375",
       "occurrence": 1,
-      "value": 375.0,
-      "unit": "other",
-      "is_financial_figure": true,
+      "value_as_written": 375.0,
+      "unit_as_written": "",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "FY2026",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -1473,13 +1689,15 @@
       "line": 23,
       "raw": "18",
       "occurrence": 1,
-      "value": 18.0,
-      "unit": "other",
-      "is_financial_figure": false,
+      "value_as_written": 18.0,
+      "unit_as_written": "",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "",
-      "note": "非核验对象：新签 18 笔合作（交易笔数，无货币/百分比单位）"
+      "note": "事实陈述：Truist 9/11 称 Q2 后 AWS 新签 18 笔合作（卖方说法，不在独立 SEC 证据集中）",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -1488,13 +1706,16 @@
       "line": 23,
       "raw": "16",
       "occurrence": 1,
-      "value": 16.0,
-      "unit": "other",
-      "is_financial_figure": false,
+      "value_as_written": 16.0,
+      "unit_as_written": "",
+      "is_verification_target": false,
+      "incidental_category": "名称里的数字",
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "",
-      "note": "非核验对象：a16z 播客名称中的数字"
+      "note": "非核验对象：a16z 播客名称中的数字",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -1503,13 +1724,15 @@
       "line": 23,
       "raw": "2,200 亿",
       "occurrence": 1,
-      "value": 2200.0,
-      "unit": "count",
-      "is_financial_figure": true,
+      "value_as_written": 2200.0,
+      "unit_as_written": "亿",
+      "is_verification_target": true,
       "has_source": true,
       "expected_source_id": "EV-AMZN-002",
       "expected_period": "FY2026",
-      "note": "2Q26 8-K/电话会: 2026 全年现金 capex 指引约 2,200 亿美元"
+      "note": "2Q26 8-K/电话会: 2026 全年现金 capex 指引约 2,200 亿美元",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -1518,13 +1741,15 @@
       "line": 23,
       "raw": "60%",
       "occurrence": 1,
-      "value": 60.0,
-      "unit": "pct",
-      "is_financial_figure": true,
+      "value_as_written": 60.0,
+      "unit_as_written": "%",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "FY2026",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -1533,13 +1758,15 @@
       "line": 23,
       "raw": "44%",
       "occurrence": 1,
-      "value": 44.0,
-      "unit": "pct",
-      "is_financial_figure": true,
+      "value_as_written": 44.0,
+      "unit_as_written": "%",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "3Q26",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -1548,13 +1775,15 @@
       "line": 24,
       "raw": "0.5",
       "occurrence": 1,
-      "value": 0.5,
-      "unit": "other",
-      "is_financial_figure": true,
+      "value_as_written": 0.5,
+      "unit_as_written": "",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "3Q26",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -1563,13 +1792,15 @@
       "line": 24,
       "raw": "30%",
       "occurrence": 1,
-      "value": 30.0,
-      "unit": "pct",
-      "is_financial_figure": true,
+      "value_as_written": 30.0,
+      "unit_as_written": "%",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "3Q26",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -1578,13 +1809,15 @@
       "line": 25,
       "raw": "41%",
       "occurrence": 1,
-      "value": 41.0,
-      "unit": "pct",
-      "is_financial_figure": true,
+      "value_as_written": 41.0,
+      "unit_as_written": "%",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "3Q26",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -1593,13 +1826,15 @@
       "line": 25,
       "raw": "44%",
       "occurrence": 1,
-      "value": 44.0,
-      "unit": "pct",
-      "is_financial_figure": true,
+      "value_as_written": 44.0,
+      "unit_as_written": "%",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "3Q26",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -1608,13 +1843,15 @@
       "line": 25,
       "raw": "44%",
       "occurrence": 2,
-      "value": 44.0,
-      "unit": "pct",
-      "is_financial_figure": true,
+      "value_as_written": 44.0,
+      "unit_as_written": "%",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "3Q26",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -1623,13 +1860,15 @@
       "line": 25,
       "raw": "41.2%",
       "occurrence": 1,
-      "value": 41.2,
-      "unit": "pct",
-      "is_financial_figure": true,
+      "value_as_written": 41.2,
+      "unit_as_written": "%",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "3Q26",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -1638,13 +1877,15 @@
       "line": 25,
       "raw": "42%",
       "occurrence": 1,
-      "value": 42.0,
-      "unit": "pct",
-      "is_financial_figure": true,
+      "value_as_written": 42.0,
+      "unit_as_written": "%",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "3Q26",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -1653,13 +1894,15 @@
       "line": 25,
       "raw": "40%",
       "occurrence": 1,
-      "value": 40.0,
-      "unit": "pct",
-      "is_financial_figure": true,
+      "value_as_written": 40.0,
+      "unit_as_written": "%",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "3Q26",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -1668,13 +1911,15 @@
       "line": 25,
       "raw": "41%",
       "occurrence": 2,
-      "value": 41.0,
-      "unit": "pct",
-      "is_financial_figure": true,
+      "value_as_written": 41.0,
+      "unit_as_written": "%",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "3Q26",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -1683,13 +1928,15 @@
       "line": 26,
       "raw": "42%",
       "occurrence": 1,
-      "value": 42.0,
-      "unit": "pct",
-      "is_financial_figure": true,
+      "value_as_written": 42.0,
+      "unit_as_written": "%",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "3Q26",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -1698,13 +1945,15 @@
       "line": 29,
       "raw": "2,780 亿",
       "occurrence": 1,
-      "value": 2780.0,
-      "unit": "count",
-      "is_financial_figure": true,
+      "value_as_written": 2780.0,
+      "unit_as_written": "亿",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "FY2027",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -1713,13 +1962,15 @@
       "line": 29,
       "raw": "3,400 亿",
       "occurrence": 1,
-      "value": 3400.0,
-      "unit": "count",
-      "is_financial_figure": true,
+      "value_as_written": 3400.0,
+      "unit_as_written": "亿",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "FY2027",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -1728,13 +1979,15 @@
       "line": 30,
       "raw": "2,200 亿",
       "occurrence": 1,
-      "value": 2200.0,
-      "unit": "count",
-      "is_financial_figure": true,
+      "value_as_written": 2200.0,
+      "unit_as_written": "亿",
+      "is_verification_target": true,
       "has_source": true,
       "expected_source_id": "EV-AMZN-002",
       "expected_period": "FY2026",
-      "note": "2Q26 8-K/电话会: 2026 年现金 capex 指引约 2,200 亿美元"
+      "note": "2Q26 8-K/电话会: 2026 年现金 capex 指引约 2,200 亿美元",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -1743,13 +1996,15 @@
       "line": 30,
       "raw": "531 亿",
       "occurrence": 1,
-      "value": 531.0,
-      "unit": "count",
-      "is_financial_figure": true,
+      "value_as_written": 531.0,
+      "unit_as_written": "亿",
+      "is_verification_target": true,
       "has_source": true,
       "expected_source_id": "EV-AMZN-003",
       "expected_period": "2Q26",
-      "note": "2Q26 10-Q 现金流量表: Q2 现金 capex 531 亿美元"
+      "note": "2Q26 10-Q 现金流量表: Q2 现金 capex 531 亿美元",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -1758,13 +2013,16 @@
       "line": 30,
       "raw": "12",
       "occurrence": 1,
-      "value": 12.0,
-      "unit": "other",
-      "is_financial_figure": false,
+      "value_as_written": 12.0,
+      "unit_as_written": "",
+      "is_verification_target": false,
+      "incidental_category": "期间与时间窗口表达",
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "",
-      "note": "非核验对象：过去 12 个月（时间窗口长度，非财务指标）"
+      "note": "非核验对象：过去 12 个月（时间窗口长度，非财务指标）",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -1773,13 +2031,15 @@
       "line": 30,
       "raw": "-76 亿",
       "occurrence": 1,
-      "value": -76.0,
-      "unit": "count",
-      "is_financial_figure": true,
+      "value_as_written": -76.0,
+      "unit_as_written": "亿",
+      "is_verification_target": true,
       "has_source": true,
       "expected_source_id": "EV-AMZN-003",
       "expected_period": "LTM",
-      "note": "2Q26 10-Q 补充现金流: 过去 12 个月自由现金流 -76 亿美元"
+      "note": "2Q26 10-Q 补充现金流: 过去 12 个月自由现金流 -76 亿美元",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -1788,13 +2048,15 @@
       "line": 30,
       "raw": "200 亿",
       "occurrence": 1,
-      "value": 200.0,
-      "unit": "count",
-      "is_financial_figure": true,
+      "value_as_written": 200.0,
+      "unit_as_written": "亿",
+      "is_verification_target": true,
       "has_source": true,
       "expected_source_id": "EV-AMZN-003",
       "expected_period": "2Q26",
-      "note": "2Q26 10-Q 现金流量表: Q2 折旧摊销 200 亿美元"
+      "note": "2Q26 10-Q 现金流量表: Q2 折旧摊销 200 亿美元",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -1803,13 +2065,15 @@
       "line": 30,
       "raw": "+31%",
       "occurrence": 1,
-      "value": 31.0,
-      "unit": "pct",
-      "is_financial_figure": true,
+      "value_as_written": 31.0,
+      "unit_as_written": "%",
+      "is_verification_target": true,
       "has_source": true,
       "expected_source_id": "EV-AMZN-003",
       "expected_period": "2Q26",
-      "note": "2Q26 10-Q 现金流量表: Q2 折旧摊销同比 +31%"
+      "note": "2Q26 10-Q 现金流量表: Q2 折旧摊销同比 +31%",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -1818,13 +2082,16 @@
       "line": 30,
       "raw": "12",
       "occurrence": 2,
-      "value": 12.0,
-      "unit": "other",
-      "is_financial_figure": false,
+      "value_as_written": 12.0,
+      "unit_as_written": "",
+      "is_verification_target": false,
+      "incidental_category": "期间与时间窗口表达",
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "",
-      "note": "非核验对象：过去 12 个月（时间窗口长度，非财务指标）"
+      "note": "非核验对象：过去 12 个月（时间窗口长度，非财务指标）",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -1833,13 +2100,15 @@
       "line": 30,
       "raw": "752 亿",
       "occurrence": 1,
-      "value": 752.0,
-      "unit": "count",
-      "is_financial_figure": true,
+      "value_as_written": 752.0,
+      "unit_as_written": "亿",
+      "is_verification_target": true,
       "has_source": true,
       "expected_source_id": "EV-AMZN-003",
       "expected_period": "LTM",
-      "note": "2Q26 10-Q 补充现金流: 过去 12 个月折旧摊销 752 亿美元"
+      "note": "2Q26 10-Q 补充现金流: 过去 12 个月折旧摊销 752 亿美元",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -1848,13 +2117,15 @@
       "line": 30,
       "raw": "670 亿",
       "occurrence": 1,
-      "value": 670.0,
-      "unit": "count",
-      "is_financial_figure": true,
+      "value_as_written": 670.0,
+      "unit_as_written": "亿",
+      "is_verification_target": true,
       "has_source": true,
       "expected_source_id": "EV-AMZN-004",
       "expected_period": "1H26",
-      "note": "2Q26 10-Q Note 6: 2026 上半年长期债发行 670 亿美元"
+      "note": "2Q26 10-Q Note 6: 2026 上半年长期债发行 670 亿美元",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -1863,13 +2134,15 @@
       "line": 30,
       "raw": "42.5 亿",
       "occurrence": 1,
-      "value": 42.5,
-      "unit": "count",
-      "is_financial_figure": true,
+      "value_as_written": 42.5,
+      "unit_as_written": "亿",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "3Q26",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -1878,13 +2151,15 @@
       "line": 30,
       "raw": "5.200%",
       "occurrence": 1,
-      "value": 5.2,
-      "unit": "pct",
-      "is_financial_figure": true,
+      "value_as_written": 5.2,
+      "unit_as_written": "%",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "3Q26",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -1893,13 +2168,15 @@
       "line": 30,
       "raw": "6.650%",
       "occurrence": 1,
-      "value": 6.65,
-      "unit": "pct",
-      "is_financial_figure": true,
+      "value_as_written": 6.65,
+      "unit_as_written": "%",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "3Q26",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -1908,13 +2185,15 @@
       "line": 30,
       "raw": "13.1 亿",
       "occurrence": 1,
-      "value": 13.1,
-      "unit": "count",
-      "is_financial_figure": true,
+      "value_as_written": 13.1,
+      "unit_as_written": "亿",
+      "is_verification_target": true,
       "has_source": true,
       "expected_source_id": "EV-AMZN-004",
       "expected_period": "2Q26",
-      "note": "2Q26 10-Q 利润表: Q2 利息支出 13.1 亿美元"
+      "note": "2Q26 10-Q 利润表: Q2 利息支出 13.1 亿美元",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -1923,13 +2202,15 @@
       "line": 30,
       "raw": "5.2 亿",
       "occurrence": 1,
-      "value": 5.2,
-      "unit": "count",
-      "is_financial_figure": true,
+      "value_as_written": 5.2,
+      "unit_as_written": "亿",
+      "is_verification_target": true,
       "has_source": true,
       "expected_source_id": "EV-AMZN-004",
       "expected_period": "2Q25",
-      "note": "2Q26 10-Q 利润表: 上年同期（2Q25）利息支出 5.2 亿美元"
+      "note": "2Q26 10-Q 利润表: 上年同期（2Q25）利息支出 5.2 亿美元",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -1938,13 +2219,15 @@
       "line": 32,
       "raw": "3,370 亿",
       "occurrence": 1,
-      "value": 3370.0,
-      "unit": "count",
-      "is_financial_figure": true,
+      "value_as_written": 3370.0,
+      "unit_as_written": "亿",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "FY2027",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -1953,13 +2236,15 @@
       "line": 32,
       "raw": "3,050 亿",
       "occurrence": 1,
-      "value": 3050.0,
-      "unit": "count",
-      "is_financial_figure": true,
+      "value_as_written": 3050.0,
+      "unit_as_written": "亿",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "FY2027",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -1968,13 +2253,15 @@
       "line": 32,
       "raw": "1,870 亿",
       "occurrence": 1,
-      "value": 1870.0,
-      "unit": "count",
-      "is_financial_figure": true,
+      "value_as_written": 1870.0,
+      "unit_as_written": "亿",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "FY2026",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -1983,13 +2270,15 @@
       "line": 32,
       "raw": "859 亿",
       "occurrence": 1,
-      "value": 859.0,
-      "unit": "count",
-      "is_financial_figure": true,
+      "value_as_written": 859.0,
+      "unit_as_written": "亿",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "FY2026",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -1998,13 +2287,15 @@
       "line": 32,
       "raw": "1,178 亿",
       "occurrence": 1,
-      "value": 1178.0,
-      "unit": "count",
-      "is_financial_figure": true,
+      "value_as_written": 1178.0,
+      "unit_as_written": "亿",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "FY2027",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -2013,13 +2304,15 @@
       "line": 32,
       "raw": "-302 亿",
       "occurrence": 1,
-      "value": -302.0,
-      "unit": "count",
-      "is_financial_figure": true,
+      "value_as_written": -302.0,
+      "unit_as_written": "亿",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "FY2026",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -2028,13 +2321,15 @@
       "line": 32,
       "raw": "-747 亿",
       "occurrence": 1,
-      "value": -747.0,
-      "unit": "count",
-      "is_financial_figure": true,
+      "value_as_written": -747.0,
+      "unit_as_written": "亿",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "FY2027",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -2043,13 +2338,15 @@
       "line": 32,
       "raw": "-226 亿",
       "occurrence": 1,
-      "value": -226.0,
-      "unit": "count",
-      "is_financial_figure": true,
+      "value_as_written": -226.0,
+      "unit_as_written": "亿",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "FY2027",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -2058,13 +2355,15 @@
       "line": 32,
       "raw": "80 亿美元",
       "occurrence": 1,
-      "value": 80.0,
-      "unit": "USD_bn",
-      "is_financial_figure": true,
+      "value_as_written": 80.0,
+      "unit_as_written": "亿美元",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "FY2027",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -2073,13 +2372,15 @@
       "line": 32,
       "raw": "176 亿",
       "occurrence": 1,
-      "value": 176.0,
-      "unit": "count",
-      "is_financial_figure": true,
+      "value_as_written": 176.0,
+      "unit_as_written": "亿",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "FY2027",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -2088,13 +2389,15 @@
       "line": 32,
       "raw": "70 亿",
       "occurrence": 1,
-      "value": 70.0,
-      "unit": "count",
-      "is_financial_figure": true,
+      "value_as_written": 70.0,
+      "unit_as_written": "亿",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "FY2027",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -2103,13 +2406,15 @@
       "line": 63,
       "raw": "534.2 亿",
       "occurrence": 1,
-      "value": 534.2,
-      "unit": "count",
-      "is_financial_figure": true,
+      "value_as_written": 534.2,
+      "unit_as_written": "亿",
+      "is_verification_target": true,
       "has_source": true,
       "expected_source_id": "EV-AMZN-005",
       "expected_period": "2Q26",
-      "note": "2Q26 10-Q Note 5: Q2 其他收入 534.2 亿美元"
+      "note": "2Q26 10-Q Note 5: Q2 其他收入 534.2 亿美元",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -2118,13 +2423,15 @@
       "line": 63,
       "raw": "505 亿",
       "occurrence": 1,
-      "value": 505.0,
-      "unit": "count",
-      "is_financial_figure": true,
+      "value_as_written": 505.0,
+      "unit_as_written": "亿",
+      "is_verification_target": true,
       "has_source": true,
       "expected_source_id": "EV-AMZN-005",
       "expected_period": "2Q26",
-      "note": "2Q26 10-Q Note 5: Q2 私有股权向上调整 505 亿美元"
+      "note": "2Q26 10-Q Note 5: Q2 私有股权向上调整 505 亿美元",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -2133,13 +2440,15 @@
       "line": 63,
       "raw": "628 亿",
       "occurrence": 1,
-      "value": 628.0,
-      "unit": "count",
-      "is_financial_figure": true,
+      "value_as_written": 628.0,
+      "unit_as_written": "亿",
+      "is_verification_target": true,
       "has_source": true,
       "expected_source_id": "EV-AMZN-005",
       "expected_period": "1H26",
-      "note": "2Q26 10-Q Note 5: 2026 上半年私有股权向上调整 628 亿美元"
+      "note": "2Q26 10-Q Note 5: 2026 上半年私有股权向上调整 628 亿美元",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -2148,13 +2457,15 @@
       "line": 63,
       "raw": "45 亿",
       "occurrence": 1,
-      "value": 45.0,
-      "unit": "count",
-      "is_financial_figure": true,
+      "value_as_written": 45.0,
+      "unit_as_written": "亿",
+      "is_verification_target": true,
       "has_source": true,
       "expected_source_id": "EV-AMZN-005",
       "expected_period": "1H26",
-      "note": "2Q26 10-Q Note 5: 2026 上半年可转债转换重分类收益 45 亿美元"
+      "note": "2Q26 10-Q Note 5: 2026 上半年可转债转换重分类收益 45 亿美元",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -2163,13 +2474,15 @@
       "line": 63,
       "raw": "156.5 亿",
       "occurrence": 1,
-      "value": 156.5,
-      "unit": "count",
-      "is_financial_figure": true,
+      "value_as_written": 156.5,
+      "unit_as_written": "亿",
+      "is_verification_target": true,
       "has_source": true,
       "expected_source_id": "EV-AMZN-005",
       "expected_period": "1Q26",
-      "note": "2Q26 10-Q Note 5: 1Q26 其他收入 156.5 亿美元"
+      "note": "2Q26 10-Q Note 5: 1Q26 其他收入 156.5 亿美元",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -2178,13 +2491,15 @@
       "line": 63,
       "raw": "170 亿美元",
       "occurrence": 1,
-      "value": 170.0,
-      "unit": "USD_bn",
-      "is_financial_figure": true,
+      "value_as_written": 170.0,
+      "unit_as_written": "亿美元",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "3Q26",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -2193,13 +2508,15 @@
       "line": 63,
       "raw": "+45%",
       "occurrence": 1,
-      "value": 45.0,
-      "unit": "pct",
-      "is_financial_figure": true,
+      "value_as_written": 45.0,
+      "unit_as_written": "%",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "3Q26",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -2208,13 +2525,15 @@
       "line": 63,
       "raw": "+140%",
       "occurrence": 1,
-      "value": 140.0,
-      "unit": "pct",
-      "is_financial_figure": true,
+      "value_as_written": 140.0,
+      "unit_as_written": "%",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "1Q26",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -2223,13 +2542,15 @@
       "line": 63,
       "raw": "80%",
       "occurrence": 1,
-      "value": 80.0,
-      "unit": "pct",
-      "is_financial_figure": true,
+      "value_as_written": 80.0,
+      "unit_as_written": "%",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "3Q26",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -2238,13 +2559,15 @@
       "line": 63,
       "raw": "2 万亿美元",
       "occurrence": 1,
-      "value": 2.0,
-      "unit": "USD",
-      "is_financial_figure": true,
+      "value_as_written": 2.0,
+      "unit_as_written": "万亿美元",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "FY2026",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -2253,13 +2576,15 @@
       "line": 63,
       "raw": "15%",
       "occurrence": 1,
-      "value": 15.0,
-      "unit": "pct",
-      "is_financial_figure": true,
+      "value_as_written": 15.0,
+      "unit_as_written": "%",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "FY2026",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -2268,13 +2593,15 @@
       "line": 63,
       "raw": "21%",
       "occurrence": 1,
-      "value": 21.0,
-      "unit": "pct",
-      "is_financial_figure": true,
+      "value_as_written": 21.0,
+      "unit_as_written": "%",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "FY2026",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -2283,13 +2610,15 @@
       "line": 63,
       "raw": "2 万亿",
       "occurrence": 1,
-      "value": 2.0,
-      "unit": "count",
-      "is_financial_figure": true,
+      "value_as_written": 2.0,
+      "unit_as_written": "万亿",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "FY2026",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -2298,13 +2627,15 @@
       "line": 63,
       "raw": "3,000 亿",
       "occurrence": 1,
-      "value": 3000.0,
-      "unit": "USD_bn",
-      "is_financial_figure": true,
+      "value_as_written": 3000.0,
+      "unit_as_written": "亿",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "FY2026",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -2313,13 +2644,15 @@
       "line": 63,
       "raw": "4,200 亿美元",
       "occurrence": 1,
-      "value": 4200.0,
-      "unit": "USD_bn",
-      "is_financial_figure": true,
+      "value_as_written": 4200.0,
+      "unit_as_written": "亿美元",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "FY2026",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -2328,13 +2661,15 @@
       "line": 64,
       "raw": "925 亿美元",
       "occurrence": 1,
-      "value": 925.0,
-      "unit": "USD_bn",
-      "is_financial_figure": true,
+      "value_as_written": 925.0,
+      "unit_as_written": "亿美元",
+      "is_verification_target": true,
       "has_source": true,
       "expected_source_id": "EV-AMZN-006",
       "expected_period": "2Q26",
-      "note": "2Q26 10-Q Note 3: 6/30 Anthropic 优先股账面价值 925 亿美元"
+      "note": "2Q26 10-Q Note 3: 6/30 Anthropic 优先股账面价值 925 亿美元",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -2343,13 +2678,15 @@
       "line": 64,
       "raw": "979 亿",
       "occurrence": 1,
-      "value": 979.0,
-      "unit": "USD_bn",
-      "is_financial_figure": true,
+      "value_as_written": 979.0,
+      "unit_as_written": "亿",
+      "is_verification_target": true,
       "has_source": true,
       "expected_source_id": "EV-AMZN-006",
       "expected_period": "2Q26",
-      "note": "2Q26 10-Q Note 3: 6/30 Anthropic 可转债公允价值 979 亿美元"
+      "note": "2Q26 10-Q Note 3: 6/30 Anthropic 可转债公允价值 979 亿美元",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -2358,13 +2695,15 @@
       "line": 64,
       "raw": "920 亿",
       "occurrence": 1,
-      "value": 920.0,
-      "unit": "count",
-      "is_financial_figure": true,
+      "value_as_written": 920.0,
+      "unit_as_written": "亿",
+      "is_verification_target": true,
       "has_source": true,
       "expected_source_id": "EV-AMZN-006",
       "expected_period": "2Q26",
-      "note": "2Q26 10-Q Note 3: 可转债相关未实现收益 920 亿美元记入 OCI"
+      "note": "2Q26 10-Q Note 3: 可转债相关未实现收益 920 亿美元记入 OCI",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -2373,13 +2712,15 @@
       "line": 64,
       "raw": "15%",
       "occurrence": 1,
-      "value": 15.0,
-      "unit": "pct",
-      "is_financial_figure": true,
+      "value_as_written": 15.0,
+      "unit_as_written": "%",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "2Q26",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     },
     {
       "report": "AMZN",
@@ -2388,13 +2729,15 @@
       "line": 64,
       "raw": "21%",
       "occurrence": 1,
-      "value": 21.0,
-      "unit": "pct",
-      "is_financial_figure": true,
+      "value_as_written": 21.0,
+      "unit_as_written": "%",
+      "is_verification_target": true,
       "has_source": false,
       "expected_source_id": null,
       "expected_period": "2Q26",
-      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中"
+      "note": "卖方/买方/专家/第三方渠道或行情数字，不在独立 SEC 一手证据集中",
+      "reviewed_by": "lead",
+      "reviewed_at": "2026-10-19"
     }
   ]
 }

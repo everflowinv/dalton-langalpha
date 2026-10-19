@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "description": "P0J J2a 反例：草稿里有阿拉伯数字时，只含口语数字的节也必须被扫描",
+  "draft": "tests/fixtures/dalton/g3/colloquial_only_draft.md",
+  "reviewed_by": "lead",
+  "reviewed_at": "2026-10-19",
+  "acceptance": "真实 LLM 下 4 个口语数字全部被抽出，判为 unverified（无来源），不得被排除为非核验对象",
+  "items": [
+    {
+      "section": "## 渠道观察",
+      "line": 9,
+      "raw": "近一半",
+      "is_verification_target": true,
+      "has_source": false,
+      "expected_status": "unverified",
+      "note": "只含口语数字、没有阿拉伯数字的节：必须送 B 环节扫描并抽出（P0J L35/L43，R4-publish R1）"
+    },
+    {
+      "section": "## 渠道观察",
+      "line": 10,
+      "raw": "大半",
+      "is_verification_target": true,
+      "has_source": false,
+      "expected_status": "unverified",
+      "note": "只含口语数字、没有阿拉伯数字的节：必须送 B 环节扫描并抽出（P0J L35/L43，R4-publish R1）"
+    },
+    {
+      "section": "## 渠道观察",
+      "line": 11,
+      "raw": "砍掉一半",
+      "is_verification_target": true,
+      "has_source": false,
+      "expected_status": "unverified",
+      "note": "只含口语数字、没有阿拉伯数字的节：必须送 B 环节扫描并抽出（P0J L35/L43，R4-publish R1）"
+    },
+    {
+      "section": "## 渠道观察",
+      "line": 12,
+      "raw": "倍增",
+      "is_verification_target": true,
+      "has_source": false,
+      "expected_status": "unverified",
+      "note": "只含口语数字、没有阿拉伯数字的节：必须送 B 环节扫描并抽出（P0J L35/L43，R4-publish R1）"
+    }
+  ]
+}
