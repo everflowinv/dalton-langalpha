@@ -150,6 +150,26 @@ def build_company_watch_specs(
     ]
 
 
+def _offset_trading_days(
+    dt: datetime,
+    trading_days: int,
+    *,
+    hour: int,
+    minute: int = 0,
+) -> datetime:
+    """Shift ``dt`` by ``trading_days`` (Mon–Fri only, skipping Sat/Sun) and set local time to ``hour:minute:00`` (P0I §5 #6)."""
+    step = 1 if trading_days >= 0 else -1
+    remaining = abs(int(trading_days))
+    cur = dt
+    while remaining > 0:
+        cur = cur + timedelta(days=step)
+        if cur.weekday() < 5:
+            remaining -= 1
+    while cur.weekday() >= 5:
+        cur = cur + timedelta(days=step)
+    return cur.replace(hour=hour, minute=minute, second=0, microsecond=0)
+
+
 def build_earnings_window_specs(
     *,
     ticker: str,
@@ -170,10 +190,15 @@ def build_earnings_window_specs(
             report_at = report_at.replace(tzinfo=ZoneInfo(tz))
         except Exception:
             report_at = report_at.replace(tzinfo=timezone.utc)
+    else:
+        try:
+            report_at = report_at.astimezone(ZoneInfo(tz))
+        except Exception:
+            pass
 
-    tm3_at = report_at - timedelta(days=3)
+    tm3_at = _offset_trading_days(report_at, -3, hour=8, minute=0)
     t0_at = report_at + timedelta(minutes=30)
-    tp1_at = report_at + timedelta(days=1)
+    tp1_at = _offset_trading_days(report_at, 1, hour=20, minute=0)
 
     return [
         {

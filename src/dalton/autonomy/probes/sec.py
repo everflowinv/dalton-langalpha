@@ -134,7 +134,7 @@ async def resolve_company_cik(
                 if sym in _SEC_TICKERS_CACHE:
                     return _SEC_TICKERS_CACHE[sym]
         except Exception as e:
-            logger.debug("[DALTON_SEC_PROBE] SEC company_tickers.json lookup failed for %s: %s", sym, e)
+            logger.warning("[DALTON_SEC_PROBE] SEC company_tickers.json lookup failed for %s: %s", sym, e)
 
     return None
 
@@ -170,8 +170,18 @@ async def probe_sec(
         workspace_id=workspace_id if allow_network else None,
         allow_network=(data is None and allow_network),
     )
-    if cik and not state.get("cik"):
-        state["cik"] = cik
+    if cik:
+        if not state.get("cik"):
+            state["cik"] = cik
+        state["sec_probe_degraded"] = False
+    elif data is None:
+        state["sec_probe_degraded"] = True
+        logger.warning(
+            "[DALTON_SEC_PROBE] CIK resolution failed across all fallbacks for ticker=%s; "
+            "marking sec_probe_degraded=True",
+            ticker,
+        )
+        return [], state
 
     if data is None and cik and allow_network:
         cik10 = str(cik).lstrip("0").zfill(10)

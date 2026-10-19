@@ -367,7 +367,9 @@ async def _check_budget_available(user_id: Optional[str] = None) -> tuple[bool, 
         if cap > 0 and (spent + reserved) >= cap:
             return False, "budget_exhausted"
     except Exception as e:
-        logger.warning("[DALTON_PREFLIGHT] budget check failed: %s", e)
+        # P0I §5 #7: Preflight fails open here (only avoids skipping wake on transient DB error);
+        # actual cash admission in dalton_complete / enforce_local_admission is strictly fail-closed.
+        logger.error("[DALTON_PREFLIGHT] budget check failed (failing open at preflight): %s", e)
     return True, None
 
 
@@ -762,6 +764,25 @@ async def _preflight_check_inner(
                 )
         except Exception as e:
             logger.warning("[DALTON_PREFLIGHT] claim_signals_woken failed: %s", e)
+            if persist:
+                try:
+                    await watch_db.insert_preflight_log(
+                        automation_id=automation_id,
+                        automation_execution_id=execution_id,
+                        workspace_id=workspace_id,
+                        decision="skip",
+                        reason="claim_failed",
+                        signals=[],
+                    )
+                except Exception as log_err:
+                    logger.warning("[DALTON_PREFLIGHT] log insert failed: %s", log_err)
+            return PreflightResult(
+                should_wake=False,
+                decision="skip",
+                reason="claim_failed",
+                signals=[],
+                wake_context=None,
+            )
 
     if persist:
         try:
