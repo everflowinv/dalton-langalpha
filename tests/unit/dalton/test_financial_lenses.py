@@ -539,3 +539,174 @@ class TestWorkflowsAndHelperScripts:
             check=True,
         )
         assert proc.stdout.strip() == "2026-04-23"
+
+
+def test_p0i_i6_unified_anchors_and_conflict_rejection(tmp_path: Path) -> None:
+    """Verify P0I §6: --anchors unifies market_cap/fx/period across all 3 lenses and rejects simultaneous manual overrides."""
+    anchors_file = tmp_path / "baba_anchors.json"
+    anchors_payload = anchors_mod.build_anchors(
+        "BABA",
+        "2025-12-31",
+        market_cap_usd_mn=271437.86,
+        listing_currency="USD",
+        reporting_currency="CNY",
+        fx_rate=0.149772,
+        as_of="2026-10-18",
+    )
+    anchors_file.write_text(json.dumps(anchors_payload), encoding="utf-8")
+
+    # 1. netcash.py with --anchors
+    nc_proc = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPTS_DIR / "netcash.py"),
+            "--anchors",
+            str(anchors_file),
+            "--cash",
+            "195321",
+            "--restricted-cash",
+            "41200",
+            "--time-deposits",
+            "182450",
+            "--st-investments",
+            "185900",
+            "--st-debt",
+            "18500",
+            "--cur-lt-debt",
+            "14200",
+            "--lt-debt",
+            "148900",
+            "--convertible-debt",
+            "35600",
+            "--lease-liabilities",
+            "22400",
+            "--json",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    nc_out = json.loads(nc_proc.stdout)
+    assert nc_out["anchors_source"] == "anchors"
+    assert nc_out["ticker"] == "BABA"
+    assert nc_out["period_end"] == "2025-12-31"
+    assert nc_out["market_cap_usd_mn"] == pytest.approx(271437.86)
+    assert nc_out["fx_rate_to_usd"] == pytest.approx(0.149772)
+    assert nc_out["strict_net_cash_to_mcap_pct"] == pytest.approx(19.12, abs=0.02)
+
+    # 2. return_score.py with --anchors
+    rs_proc = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPTS_DIR / "return_score.py"),
+            "--anchors",
+            str(anchors_file),
+            "--ttm-div",
+            "1.05",
+            "--ttm-buyback",
+            "6.45",
+            "--true-return-share",
+            "0.85",
+            "--annual",
+            "3.8,6.2,7.5",
+            "--fwd-total",
+            "6.8",
+            "--credibility",
+            "90",
+            "--json",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    rs_out = json.loads(rs_proc.stdout)
+    assert rs_out["anchors_source"] == "anchors"
+    assert rs_out["ticker"] == "BABA"
+    assert rs_out["period_end"] == "2025-12-31"
+    assert rs_out["market_cap_usd_mn"] == pytest.approx(271437.86)
+    assert rs_out["fx_rate_to_usd"] == pytest.approx(0.149772)
+
+    # 3. earnings_quality.py with --anchors
+    eq_proc = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPTS_DIR / "earnings_quality.py"),
+            "--anchors",
+            str(anchors_file),
+            "--ni",
+            "129470",
+            "--cfo",
+            "163509",
+            "--avg-assets",
+            "1794669.5",
+            "--json",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    eq_out = json.loads(eq_proc.stdout)
+    assert eq_out["anchors_source"] == "anchors"
+    assert eq_out["ticker"] == "BABA"
+    assert eq_out["period_end"] == "2025-12-31"
+    assert eq_out["market_cap_usd_mn"] == pytest.approx(271437.86)
+    assert eq_out["fx_rate_to_usd"] == pytest.approx(0.149772)
+
+    # 4. Reject simultaneous --anchors and manual --market-cap-usd-mn / --fx-rate on all 3 scripts
+    for script_name, base_args in [
+        ("netcash.py", ["--cash", "100"]),
+        (
+            "return_score.py",
+            [
+                "--ttm-div",
+                "1.0",
+                "--ttm-buyback",
+                "2.0",
+                "--true-return-share",
+                "0.8",
+                "--annual",
+                "2,3,4",
+                "--fwd-total",
+                "3.0",
+                "--credibility",
+                "90",
+            ],
+        ),
+        ("earnings_quality.py", ["--ni", "100", "--cfo", "120", "--avg-assets", "1000"]),
+    ]:
+        for manual_flag in (["--market-cap-usd-mn", "245000"], ["--fx-rate", "0.14"]):
+            err_proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPTS_DIR / script_name),
+                    "--anchors",
+                    str(anchors_file),
+                    *base_args,
+                    *manual_flag,
+                    "--json",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            assert err_proc.returncode == 2
+            assert "Cannot specify both --anchors and manual" in err_proc.stderr
+
+    # 5. Manual mode without --anchors marks anchors_source == "manual"
+    manual_nc = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPTS_DIR / "netcash.py"),
+            "--cash",
+            "100",
+            "--market-cap-usd-mn",
+            "1000",
+            "--fx-rate",
+            "0.5",
+            "--json",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert json.loads(manual_nc.stdout)["anchors_source"] == "manual"
+
