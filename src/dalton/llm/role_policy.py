@@ -332,7 +332,12 @@ class RolePolicyError(DaltonStartupConfigError):
 
 
 def _load_default_agent_config() -> dict[str, Any]:
-    cfg_path = REPO_ROOT / "agent_config.dalton.yaml"
+    env_cfg = os.environ.get("PTC_CONFIG_FILE", "").strip()
+    if env_cfg:
+        cand = Path(env_cfg)
+        cfg_path = cand if cand.is_absolute() else (REPO_ROOT / cand)
+    else:
+        cfg_path = REPO_ROOT / "agent_config.dalton.yaml"
     if not cfg_path.exists():
         return {}
     try:

@@ -173,6 +173,8 @@ async def assist_json(
         payload_sha = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()[:24]
         if scope_ref:
             eff_scope = scope_ref
+        elif workspace_id:
+            eff_scope = f"assist:{eff_user}:ws:{workspace_id}:{task}:{payload_sha}"
         else:
             eff_scope = f"assist:{eff_user}:{task}:{payload_sha}"
 
@@ -206,7 +208,7 @@ async def assist_json(
                     continue
                 comp_fb = await dalton_complete(
                     llm_service=llm_service,
-                    user_id=user_id,
+                    user_id=eff_user,
                     system_prompt=system_prompt,
                     user_prompt=payload_json,
                     scope_ref=f"{eff_scope}:fb:{fb_cand}",
