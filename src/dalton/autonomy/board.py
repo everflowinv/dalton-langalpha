@@ -144,15 +144,27 @@ async def build_coverage_board(
     try:
         async with get_db_connection() as conn:
             async with conn.cursor(row_factory=dict_row) as cur:
-                await cur.execute(
-                    """
-                    SELECT workspace_id, name, description, status, updated_at
-                    FROM workspaces
-                    WHERE status <> 'deleted'
-                    ORDER BY name ASC
-                    """
-                )
+                if user_id and user_id != "local-dev-user":
+                    await cur.execute(
+                        """
+                        SELECT workspace_id, name, description, status, updated_at
+                        FROM workspaces
+                        WHERE status <> 'deleted' AND user_id = %s
+                        ORDER BY name ASC
+                        """,
+                        (user_id,),
+                    )
+                else:
+                    await cur.execute(
+                        """
+                        SELECT workspace_id, name, description, status, updated_at
+                        FROM workspaces
+                        WHERE status <> 'deleted'
+                        ORDER BY name ASC
+                        """
+                    )
                 ws_rows = await cur.fetchall()
+                user_ws_ids = {str(r["workspace_id"]) for r in ws_rows}
 
                 await cur.execute(
                     """
@@ -199,6 +211,8 @@ async def build_coverage_board(
                     """
                 )
                 req_rows = await cur.fetchall()
+                if user_id and user_id != "local-dev-user":
+                    req_rows = [r for r in req_rows if str(r.get("workspace_id") or "") in user_ws_ids]
                 pending_approvals = [
                     {
                         "request_id": str(r["publish_request_id"]),
@@ -224,6 +238,8 @@ async def build_coverage_board(
                     """
                 )
                 sig_rows = await cur.fetchall()
+                if user_id and user_id != "local-dev-user":
+                    sig_rows = [s for s in sig_rows if str(s.get("workspace_id") or "") in user_ws_ids]
 
                 watch_state_by_ws: dict[str, dict[str, Any]] = {}
                 try:

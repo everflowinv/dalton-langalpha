@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import re
 from typing import Any
@@ -138,6 +139,16 @@ class FigureLabelItem(BaseModel):
         description="Semantic figure kind: reported, estimate, consensus, guidance, derived, or incidental",
     )
 
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_null_strings(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            return {
+                k: ("" if v is None and k in ("metric", "period", "unit", "kind") else v)
+                for k, v in data.items()
+            }
+        return data
+
 
 class ExtraFigureItem(BaseModel):
     """Additional prose figure identified by LLM (e.g. Chinese expressions like '三成', '翻倍', '腰斩')."""
@@ -153,6 +164,16 @@ class ExtraFigureItem(BaseModel):
         description="Semantic figure kind: reported, estimate, consensus, guidance, or derived",
     )
 
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_null_strings(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            return {
+                k: ("" if v is None and k in ("unit", "metric", "period", "kind") else (1 if v is None and k == "line" else v))
+                for k, v in data.items()
+            }
+        return data
+
 
 class FigureLabels(BaseModel):
     """Structured response for LLM-assisted figure labeling (PK.9 / P0H Step B / P0I §1.4)."""
@@ -163,9 +184,12 @@ class FigureLabels(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def _accept_labels_alias(cls, data: Any) -> Any:
-        if isinstance(data, dict) and "items" not in data and "labels" in data:
+        if isinstance(data, dict):
             copied = dict(data)
-            copied["items"] = copied.pop("labels")
+            if "items" not in copied and "labels" in copied:
+                copied["items"] = copied.pop("labels")
+            if copied.get("extra_figures") is None:
+                copied["extra_figures"] = []
             return copied
         return data
 
@@ -878,11 +902,11 @@ def extract_figures(markdown_text: str) -> list[ExtractedFigure]:
 
             metric = _extract_metric_from_context(scan_line, nm.start(), nm.end())
             ctx_left = scan_line[max(0, nm.start() - 25) : nm.start()]
-            for sep in ("。", "；", ";"):
+            for sep in ("。", "；", ";", "，", ",", "（", "）", "(", ")"):
                 if sep in ctx_left:
                     ctx_left = ctx_left.rsplit(sep, 1)[-1]
             ctx_right = scan_line[nm.end() : nm.end() + 15]
-            for sep in ("。", "；", ";"):
+            for sep in ("。", "；", ";", "，", ",", "（", "）", "(", ")"):
                 if sep in ctx_right:
                     ctx_right = ctx_right.split(sep, 1)[0]
             clause_ctx = f"{ctx_left}{scan_line[nm.start() : nm.end()]}{ctx_right}"
@@ -894,6 +918,13 @@ def extract_figures(markdown_text: str) -> list[ExtractedFigure]:
                 header_context=last_caption_line if "单位" in last_caption_line else "",
             )
             label_hint = "reported"
+            if (
+                currency is None
+                and scale == 1.0
+                and unit in ("", "other", "count")
+                and re.match(r"^\s*(?:年|个月|周|天|小时)(?!化|初|底|中|内|度|率)", scan_line[nm.end() :])
+            ):
+                label_hint = "incidental"
 
             fig_counter += 1
             figures.append(
@@ -955,11 +986,15 @@ _FINANCIAL_RAW_TOKENS = (
 )
 
 
-def _can_be_incidental(fig: ExtractedFigure, item_unit: str = "") -> bool:
+def _can_be_incidental(
+    fig: ExtractedFigure,
+    item_unit: str = "",
+    item_metric: str = "",
+) -> bool:
     """Return True if ``fig`` is eligible to be excluded as ``incidental`` (P0I §1.4 / L35).
 
-    Numbers with currency, percentage, basis points, or valuation multiples (or inside tables)
-    cannot be marked ``incidental``.
+    Numbers with currency, percentage, basis points, valuation multiples, target prices, or
+    non-version/non-duration decimal values (or inside tables) cannot be marked ``incidental``.
     """
     if fig.location.get("table"):
         return False
@@ -976,6 +1011,16 @@ def _can_be_incidental(fig: ExtractedFigure, item_unit: str = "") -> bool:
         return False
     if re.search(r"\d\s*x$", raw_low):
         return False
+    combined_metric = f"{fig.metric or ''} {item_metric or ''}".lower()
+    if any(k in combined_metric for k in ("目标价", "target price", "收盘", "eps", "偏度", "skew")):
+        return False
+    if fig.decimals > 0 and fig.label_hint != "incidental":
+        sent_low = str(fig.location.get("sentence") or "").lower()
+        if not any(
+            k in f"{combined_metric} {sent_low}"
+            for k in ("model", "version", "gemini", "opus", "sonnet", "gpt", "claude", "版本", "型号")
+        ):
+            return False
     return True
 
 
@@ -1158,6 +1203,28 @@ async def label_figures_with_status(
     failed_batch_details: list[dict[str, Any]] = []
     llm_period_overrides = 0
 
+    sem = asyncio.Semaphore(4)
+    label_instructions = (
+        "You are Step B of the Dalton publication audit pipeline. "
+        "1) For each item in extracted_figures, label its financial `metric`, normalized `period` "
+        "(e.g. 2Q26, 3Q26, FY2026, or 'none' if it is an intraday/spot figure with no fiscal period), "
+        "canonical `unit` (e.g. USD_bn, USD_mn, USD, pct, bp, x, per_share, count_mn, count), "
+        "and semantic `kind` ('reported', 'estimate', 'consensus', 'guidance', 'derived', or 'incidental'). "
+        "Use `incidental` ONLY for non-financial numbers in prose (such as social media likes/views/retweets, "
+        "HTTP status codes like 409/500, document/slide/file IDs, model version numbers like Sonnet 5.5, "
+        "rankings like Fortune 500 / Top 20, or calendar durations like 24 hours / 12 months / 365 days). "
+        "NEVER mark any number with currency, percentage (%), basis points (bp), or multiple (x/倍) as `incidental`. "
+        "2) Also scan markdown_excerpt for any colloquial Chinese numbers not already in extracted_figures "
+        "(such as '三成', '两成', '百分之三十', '五分之一', '翻倍', '腰斩', '过半', '减半') and return them "
+        "in `extra_figures` with exact `raw` substring from the draft, `line` number, numeric `value` "
+        "(e.g. 30.0 for 三成, 20.0 for 两成, 2.0 for 翻倍, 50.0 for 过半/腰斩), `unit` ('pct' or 'x'), "
+        "`metric`, `period`, and `kind`."
+    )
+    label_schema = FigureLabels.model_json_schema()
+
+    prepared_batches: list[
+        tuple[int, str, int, str, list[ExtractedFigure], int, int, dict[str, ExtractedFigure], dict[str, Any]]
+    ] = []
     for batch_idx, (sec_title, c_start, chunk_text, batch_figs, s_idx, e_idx) in enumerate(batches, start=1):
         local_to_fig: dict[str, ExtractedFigure] = {}
         payload_figs: list[dict[str, Any]] = []
@@ -1181,36 +1248,45 @@ async def label_figures_with_status(
                     "sentence": f.location.get("sentence"),
                 }
             )
-
         payload = {
             "outline": outline,
             "section_title": sec_title,
             "markdown_excerpt": chunk_text,
             "extracted_figures": payload_figs,
         }
-        res = await assist_json(
-            task="audit.label_figures",
-            instructions=(
-                "You are Step B of the Dalton publication audit pipeline. "
-                "1) For each item in extracted_figures, label its financial `metric`, normalized `period` "
-                "(e.g. 2Q26, 3Q26, FY2026, or 'none' if it is an intraday/spot figure with no fiscal period), "
-                "canonical `unit` (e.g. USD_bn, USD_mn, USD, pct, bp, x, per_share, count_mn, count), "
-                "and semantic `kind` ('reported', 'estimate', 'consensus', 'guidance', 'derived', or 'incidental'). "
-                "Use `incidental` ONLY for non-financial numbers in prose (such as social media likes/views/retweets, "
-                "HTTP status codes like 409/500, document/slide/file IDs, model version numbers like Sonnet 5.5, "
-                "rankings like Fortune 500 / Top 20, or calendar durations like 24 hours / 12 months / 365 days). "
-                "NEVER mark any number with currency, percentage (%), basis points (bp), or multiple (x/倍) as `incidental`. "
-                "2) Also scan markdown_excerpt for any colloquial Chinese numbers not already in extracted_figures "
-                "(such as '三成', '两成', '百分之三十', '五分之一', '翻倍', '腰斩', '过半', '减半') and return them "
-                "in `extra_figures` with exact `raw` substring from the draft, `line` number, numeric `value` "
-                "(e.g. 30.0 for 三成, 20.0 for 两成, 2.0 for 翻倍, 50.0 for 过半/腰斩), `unit` ('pct' or 'x'), "
-                "`metric`, `period`, and `kind`."
-            ),
-            payload=payload,
-            schema=FigureLabels.model_json_schema(),
-            user_id=user_id,
-            timeout_s=90.0,
+        prepared_batches.append(
+            (batch_idx, sec_title, c_start, chunk_text, batch_figs, s_idx, e_idx, local_to_fig, payload)
         )
+
+    async def _call_label_batch(payload: dict[str, Any], batch_idx: int) -> Any:
+        async with sem:
+            res = await assist_json(
+                task="audit.label_figures",
+                instructions=label_instructions,
+                payload=payload,
+                schema=label_schema,
+                user_id=user_id,
+                timeout_s=90.0,
+            )
+            if (not res.ok or not res.data) and res.error not in ("llm_timeout", "unexpected"):
+                res = await assist_json(
+                    task="audit.label_figures",
+                    instructions=label_instructions,
+                    payload=payload,
+                    schema=label_schema,
+                    user_id=user_id,
+                    model="deepseek-flash",
+                    timeout_s=90.0,
+                )
+            return res
+
+    batch_results = await asyncio.gather(
+        *[_call_label_batch(pb[8], pb[0]) for pb in prepared_batches]
+    )
+
+    for (batch_idx, sec_title, c_start, chunk_text, batch_figs, s_idx, e_idx, local_to_fig, _payload), res in zip(
+        prepared_batches, batch_results, strict=False
+    ):
         if not res.ok or not res.data:
             failed_batches += 1
             failed_batch_details.append(
@@ -1243,10 +1319,13 @@ async def label_figures_with_status(
             if target is None:
                 continue
 
-            # LLM annotations take priority over code heuristics (P0I §1.4 / L35)
+            # LLM annotations take priority over code heuristics (P0I §1.4 / L35),
+            # except bare calendar/contract durations ("X 年 / X 个月 / X 天 / X 小时") remain incidental
             raw_kind = item.kind.strip().lower() if item.kind else ""
-            if raw_kind in _VALID_LABEL_KINDS:
-                if raw_kind == "incidental" and not _can_be_incidental(target, item.unit):
+            if target.label_hint == "incidental" and _can_be_incidental(target):
+                pass
+            elif raw_kind in _VALID_LABEL_KINDS:
+                if raw_kind == "incidental" and not _can_be_incidental(target, item.unit, item.metric):
                     raw_kind = "reported"
                 target.label_hint = raw_kind
 

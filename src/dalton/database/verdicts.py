@@ -56,10 +56,10 @@ async def next_verdict_id(
             """
             SELECT verdict_id
             FROM dalton_verdicts
-            WHERE workspace_id = %s AND verdict_id LIKE %s
+            WHERE verdict_id LIKE %s
             ORDER BY verdict_id DESC
             """,
-            (workspace_id, f"{prefix}%"),
+            (f"{prefix}%",),
         )
         rows = await c.fetchall()
         max_n = 0
@@ -102,7 +102,7 @@ async def insert_verdict(
         verdict_at = datetime.now(timezone.utc)
 
     day_stamp = _day_str(verdict_at)
-    lock_key = f"dalton:verdict:{workspace_id}:{day_stamp}"
+    lock_key = f"dalton:verdict:{day_stamp}"
 
     trigger = verdict.get("trigger") or {}
     trigger_kind = str(trigger.get("kind") or "manual")

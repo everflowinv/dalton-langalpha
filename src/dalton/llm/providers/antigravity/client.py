@@ -115,12 +115,13 @@ def _content_blocks(message: BaseMessage) -> list[Any]:
 def _part_from_block(block: Any) -> dict | None:
     """One content block → one Gemini part."""
     if isinstance(block, str):
-        return {"text": block}
+        return {"text": block} if block else None
     if not isinstance(block, dict):
         return None
     btype = block.get("type")
     if btype in ("text", "input_text", "output_text"):
-        return {"text": block.get("text", "")}
+        text_val = block.get("text", "")
+        return {"text": text_val} if text_val else None
     if btype == "image_url":
         url = (block.get("image_url") or {}).get("url", "")
         if not isinstance(url, str) or not url.startswith("data:"):
@@ -131,7 +132,10 @@ def _part_from_block(block: Any) -> dict | None:
         return {"inlineData": {"mimeType": mime, "data": data}}
     if btype in ("tool_use", "tool_result"):  # anthropic-style blocks from history
         if btype == "tool_use":
-            return {"functionCall": {"name": block.get("name", ""), "args": block.get("input", {})}}
+            fc: dict[str, Any] = {"name": block.get("name", ""), "args": block.get("input", {})}
+            if block.get("id"):
+                fc["id"] = block["id"]
+            return {"functionCall": fc}
         return None  # handled via ToolMessage path
     if btype == "thinking":
         return None  # reasoning is not replayed (fresh thinking per turn)
@@ -185,15 +189,18 @@ def _messages_to_gemini(messages: Sequence[BaseMessage]) -> tuple[dict | None, l
                 or message.tool_call_id
                 or "tool"
             )
+            fn_resp: dict[str, Any] = {
+                "name": resolved_name,
+                "response": result,
+            }
+            if message.tool_call_id:
+                fn_resp["id"] = message.tool_call_id
             contents.append(
                 {
                     "role": "user",  # tool results ride the user turn in Gemini
                     "parts": [
                         {
-                            "functionResponse": {
-                                "name": resolved_name,
-                                "response": result,
-                            }
+                            "functionResponse": fn_resp
                         }
                     ],
                 }
@@ -219,8 +226,11 @@ def _messages_to_gemini(messages: Sequence[BaseMessage]) -> tuple[dict | None, l
                 call_name = call.get("name", "")
                 if call_id and call_name:
                     tool_call_names[str(call_id)] = str(call_name)
+                fc_payload: dict[str, Any] = {"name": call_name, "args": call.get("args", {})}
+                if call_id:
+                    fc_payload["id"] = call_id
                 part_fc: dict = {
-                    "functionCall": {"name": call_name, "args": call.get("args", {})}
+                    "functionCall": fc_payload
                 }
                 if signatures:
                     part_fc["thoughtSignature"] = signatures.pop(0)
@@ -234,6 +244,153 @@ def _messages_to_gemini(messages: Sequence[BaseMessage]) -> tuple[dict | None, l
     return system_instruction, contents
 
 
+_GEMINI_ALLOWED_SCHEMA_KEYS = {
+    "type",
+    "description",
+    "properties",
+    "required",
+    "items",
+    "enum",
+    "format",
+    "anyOf",
+    "nullable",
+    "title",
+}
+
+
+def _sanitize_gemini_schema(
+    schema: Any,
+    *,
+    is_property: bool = False,
+    defs: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Recursively sanitize a JSON Schema node into the subset Gemini accepts."""
+    if not isinstance(schema, dict):
+        return {"type": "string"} if is_property else {"type": "object"}
+
+    if defs is None:
+        raw_defs = {}
+        if isinstance(schema.get("$defs"), dict):
+            raw_defs.update(schema["$defs"])
+        if isinstance(schema.get("definitions"), dict):
+            raw_defs.update(schema["definitions"])
+        defs = raw_defs
+
+    node = dict(schema)
+    ref_str = node.get("$ref")
+    if isinstance(ref_str, str) and defs:
+        ref_key = ref_str.rsplit("/", 1)[-1]
+        ref_target = defs.get(ref_key)
+        if isinstance(ref_target, dict):
+            merged_ref = dict(ref_target)
+            for k_override, v_override in node.items():
+                if k_override != "$ref":
+                    merged_ref[k_override] = v_override
+            node = merged_ref
+
+    if "allOf" in node and isinstance(node["allOf"], list) and node["allOf"]:
+        first = node["allOf"][0]
+        if isinstance(first, dict):
+            merged = dict(first)
+            if "description" in node and "description" not in merged:
+                merged["description"] = node["description"]
+            node = merged
+            if "$ref" in node and isinstance(node["$ref"], str) and defs:
+                ref_key = node["$ref"].rsplit("/", 1)[-1]
+                ref_target = defs.get(ref_key)
+                if isinstance(ref_target, dict):
+                    merged_ref = dict(ref_target)
+                    for k_override, v_override in node.items():
+                        if k_override != "$ref":
+                            merged_ref[k_override] = v_override
+                    node = merged_ref
+
+    out: dict[str, Any] = {}
+    nullable = bool(node.get("nullable", False))
+
+    if "const" in node:
+        const_val = node["const"]
+        if const_val is None:
+            nullable = True
+        else:
+            out["enum"] = [str(const_val)]
+            out["type"] = "string"
+
+    raw_any_of = node.get("anyOf") or node.get("oneOf")
+    if isinstance(raw_any_of, list) and raw_any_of:
+        non_null_branches: list[dict[str, Any]] = []
+        for branch in raw_any_of:
+            if isinstance(branch, dict) and branch.get("type") == "null":
+                nullable = True
+                continue
+            cleaned_branch = _sanitize_gemini_schema(branch, is_property=True, defs=defs)
+            if cleaned_branch:
+                non_null_branches.append(cleaned_branch)
+        if non_null_branches:
+            single = dict(non_null_branches[0])
+            if "description" in node and "description" not in single:
+                single["description"] = node["description"]
+            out.update(single)
+
+    for k, v in node.items():
+        if k in ("anyOf", "oneOf", "allOf", "const"):
+            continue
+        if k not in _GEMINI_ALLOWED_SCHEMA_KEYS:
+            continue
+        if k == "type":
+            if "anyOf" in out:
+                continue
+            if isinstance(v, list):
+                non_null_types = [t for t in v if t != "null"]
+                if "null" in v:
+                    nullable = True
+                out["type"] = str(non_null_types[0]) if non_null_types else "string"
+            elif isinstance(v, str):
+                if v == "null":
+                    nullable = True
+                    out["type"] = "string"
+                else:
+                    out["type"] = v
+        elif k == "properties" and isinstance(v, dict):
+            props = {
+                str(prop_name): _sanitize_gemini_schema(prop_val, is_property=True, defs=defs)
+                for prop_name, prop_val in v.items()
+            }
+            out["properties"] = props
+        elif k == "items":
+            if isinstance(v, dict):
+                out["items"] = _sanitize_gemini_schema(v, is_property=True, defs=defs)
+            elif isinstance(v, list) and v:
+                out["items"] = _sanitize_gemini_schema(v[0], is_property=True, defs=defs)
+        elif k == "enum" and isinstance(v, list):
+            non_null_enums = [str(item) for item in v if item is not None]
+            if any(item is None for item in v):
+                nullable = True
+            if non_null_enums:
+                out["enum"] = non_null_enums
+                out.setdefault("type", "string")
+        elif k == "required" and isinstance(v, list):
+            out["required"] = [str(r) for r in v if isinstance(r, str)]
+        else:
+            out[k] = v
+
+    if "required" in out and "properties" in out:
+        valid_props = set(out["properties"].keys())
+        out["required"] = [r for r in out["required"] if r in valid_props]
+        if not out["required"]:
+            out.pop("required", None)
+    elif "required" in out and "properties" not in out:
+        out.pop("required", None)
+
+    if nullable:
+        out["nullable"] = True
+
+    if "type" not in out and "anyOf" not in out:
+        out["type"] = "object" if "properties" in out or not is_property else "string"
+
+    return out
+
+
 def _openai_tool_to_declaration(tool: dict) -> dict | None:
     """OpenAI-format tool → Gemini functionDeclaration."""
     function = tool.get("function", tool)
@@ -245,14 +402,15 @@ def _openai_tool_to_declaration(tool: dict) -> dict | None:
         declaration["description"] = function["description"]
     parameters = function.get("parameters")
     if isinstance(parameters, dict):
-        # Gemini rejects the OpenAI-only $schema/$defs siblings; keep the
-        # JSON-Schema subset it accepts.
-        parameters = {
-            k: v
-            for k, v in parameters.items()
-            if k in ("type", "description", "properties", "required", "items", "enum", "format", "anyOf", "title")
-        }
-        declaration["parameters"] = parameters
+        try:
+            from langchain_core.utils.json_schema import dereference_refs
+
+            deref = dereference_refs(parameters)
+            if isinstance(deref, dict):
+                parameters = deref
+        except Exception:
+            pass
+        declaration["parameters"] = _sanitize_gemini_schema(parameters, is_property=False)
     return declaration
 
 
@@ -475,8 +633,9 @@ class ChatAntigravity(BaseChatModel):
                     {
                         "name": call.get("name", ""),
                         "args": json.dumps(call.get("args", {})),
-                        "id": f"antigravity_call_{index}",
+                        "id": call.get("id") or f"antigravity_call_{uuid.uuid4().hex[:8]}",
                         "index": len(tool_chunks),
+                        "type": "tool_call_chunk",
                     }
                 )
 
@@ -497,10 +656,20 @@ class ChatAntigravity(BaseChatModel):
             chunk_kwargs: dict[str, Any] = {}
             if tool_chunks:
                 chunk_kwargs["tool_call_chunks"] = tool_chunks
-            chunks.append(AIMessageChunk(content=content, additional_kwargs=chunk_kwargs))
+            chunks.append(
+                AIMessageChunk(
+                    content=content,
+                    tool_call_chunks=tool_chunks if tool_chunks else [],
+                    additional_kwargs=chunk_kwargs,
+                )
+            )
         elif tool_chunks:
             chunks.append(
-                AIMessageChunk(content="", additional_kwargs={"tool_call_chunks": tool_chunks})
+                AIMessageChunk(
+                    content="",
+                    tool_call_chunks=tool_chunks,
+                    additional_kwargs={"tool_call_chunks": tool_chunks},
+                )
             )
 
         finish = candidate.get("finishReason")

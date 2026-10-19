@@ -218,6 +218,26 @@ def normalize_journal_rows(
             float(Decimal(str(m_bucket["notional_usd"])) + notional_dec), 6
         )
 
+        replay_cnt = int(usage.get("replay_count") or 0) if not is_replayed else 0
+        for _ in range(replay_cnt):
+            replay_ts = str(usage.get("last_replayed_at") or format_iso_utc(created_at))
+            replay_item = {
+                **row_item,
+                "replayed": True,
+                "cached": True,
+                "cash_usd": 0.0,
+                "notional_usd": 0.0,
+                "created_at": replay_ts,
+            }
+            rows.append(replay_item)
+            replayed_calls += 1
+            if state == "done":
+                done_calls += 1
+            p_bucket["calls"] += 1
+            p_bucket["replayed_calls"] += 1
+            m_bucket["calls"] += 1
+            m_bucket["replayed_calls"] += 1
+
     conv_items: list[dict[str, Any]] = []
     conv_cash = Decimal("0")
     if conversation_rows:
@@ -273,7 +293,7 @@ def _summarize_conversation_token_usage(token_usage: Any) -> dict[str, Any]:
                 continue
             calls_out.append(
                 {
-                    "model": entry.get("model") or entry.get("llm_model"),
+                    "model": entry.get("model") or entry.get("model_name") or entry.get("llm_model"),
                     "agent": entry.get("agent") or entry.get("role"),
                     "billing_type": entry.get("billing_type"),
                     "input_tokens": int(entry.get("input_tokens") or 0),
@@ -282,6 +302,7 @@ def _summarize_conversation_token_usage(token_usage: Any) -> dict[str, Any]:
                 }
             )
     return {
+        "by_model": token_usage.get("by_model") or {},
         "per_call_costs": calls_out,
         "call_count": len(calls_out),
     }
@@ -297,8 +318,12 @@ def dump_journal(
     include_conversation_usages: bool = True,
 ) -> dict[str, Any]:
     """Query `dalton_llm_journal` (and optionally `conversation_usages`) for `(user_id, [since, until])`."""
+    from datetime import timedelta
+
     since_dt = parse_iso_utc(since) if isinstance(since, str) else since.astimezone(timezone.utc)
     until_dt = parse_iso_utc(until) if isinstance(until, str) else until.astimezone(timezone.utc)
+    if until_dt.microsecond == 0:
+        until_dt = until_dt + timedelta(seconds=2)
     conn_str = build_dsn_from_env(dsn)
 
     with psycopg.connect(conn_str, row_factory=dict_row) as conn:

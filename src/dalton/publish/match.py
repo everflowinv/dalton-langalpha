@@ -516,14 +516,21 @@ def apply_derived_figure_matching(outcomes: list[MatchOutcome]) -> list[MatchOut
         ):
             continue
         fig = out.figure
-        max_line_dist = 3 if fig.label_hint == "derived" else 1
         fig_p = normalize_period(fig.period)
+        if not fig_p:
+            continue
         nearby = [
             m
             for m in matched_by_line
             if m.id != fig.id
             and m.unit not in ("pct", "bp", "bps", "x")
-            and abs(m.location.get("line", 0) - fig.location.get("line", 0)) <= max_line_dist
+            and (
+                m.location.get("line", 0) == fig.location.get("line", 0)
+                or (
+                    abs(m.location.get("line", 0) - fig.location.get("line", 0)) <= 1
+                    and not str(fig.location.get("sentence") or "").lstrip().startswith(("-", "*", "+"))
+                )
+            )
         ]
         recomputed_pair: tuple[str, str] | None = None
         for i in range(len(nearby)):
@@ -536,17 +543,20 @@ def apply_derived_figure_matching(outcomes: list[MatchOutcome]) -> list[MatchOut
                     continue
                 pa = normalize_period(nearby[i].period)
                 pb = normalize_period(nearby[j].period)
-                same_period_as_fig = (
-                    (not fig_p or not pa or pa == fig_p)
-                    and (not fig_p or not pb or pb == fig_p)
-                    and (not pa or not pb or pa == pb)
-                )
+                same_period_as_fig = bool(pa and pb and pa == fig_p and pb == fig_p)
                 if fig.unit == "pct":
                     tol_pct = max(0.05, 0.5 * (10.0 ** (-fig.decimals)))
                     candidates_pct: list[float] = []
                     if same_period_as_fig:
                         candidates_pct.append((a / b) * 100.0)
-                    if fig.label_hint == "derived":
+                    if (
+                        fig.label_hint == "derived"
+                        and pa
+                        and pb
+                        and pa != pb
+                        and canonical_metric_group(nearby[i].metric)
+                        == canonical_metric_group(nearby[j].metric)
+                    ):
                         candidates_pct.append(((a - b) / b) * 100.0)
                     for derived_pct in candidates_pct:
                         if abs(fig.value - derived_pct) <= tol_pct * 1.0001:
@@ -1197,6 +1207,7 @@ def retrieve_candidate_sources(
             "source_id": eid,
             "ref": f"evidence:{eid}",
             "kind": "evidence",
+            "source_identity": str((ev.get("source") or {}).get("identity") or ""),
             "text": combined_text,
         }
         all_entries.append(((fn_hit, val_hit, per_hit, met_hit, raw_hit), -seq, entry))

@@ -385,7 +385,8 @@ def _check_soft_warnings(
             if not isinstance(p, dict):
                 continue
             pid = p.get("id", "?")
-            th = p.get("thresholds") or {}
+            th_raw = p.get("thresholds")
+            th = th_raw if isinstance(th_raw, dict) else {}
             if not (th.get("break") or []):
                 warnings.append(
                     {

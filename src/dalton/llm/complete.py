@@ -31,6 +31,7 @@ from src.dalton.database.llm_journal import (
     complete_journal_done,
     complete_journal_failed,
     inspect_journal_state,
+    record_journal_replay,
 )
 from src.dalton.database.provider_events import record_provider_event, sanitize_error_text
 from src.dalton.llm.overlay import load_dalton_meta, load_overlay_data
@@ -366,7 +367,11 @@ async def _check_cash_budget_admission(
             available = cap_usd - spent_usd
             configured = bool(summary.get("configured", True))
 
-            effective_floor = min(floor_usd, cap_usd) if cap_usd > Decimal("0") else floor_usd
+            effective_floor = (
+                floor_usd
+                if (cap_usd <= Decimal("0") or cap_usd > floor_usd)
+                else Decimal("0.000001")
+            )
             if not configured or available <= Decimal("0") or available < effective_floor:
                 settled_total = decs["settled_usd"] + decs["unreserved_usage_usd"]
                 open_total = decs["open_reserved_usd"] + decs["expired_conservative_usd"]
@@ -443,14 +448,17 @@ async def dalton_complete(
         effective_model = "deepseek-flash" if slot == "background" else "claude-opus-5-5-oauth"
 
     billing_type, provider = resolve_model_billing_and_provider(effective_model)
-    eff_scope = scope_ref or (
-        f"{purpose}:"
-        + hashlib.sha256(f"{system_prompt or ''}\n{user_prompt}".encode("utf-8")).hexdigest()[:24]
-    )
-    if workspace_id and str(workspace_id) not in eff_scope:
-        eff_scope = f"{eff_scope}@ws:{workspace_id}"
-    if thread_id and str(thread_id) not in eff_scope:
-        eff_scope = f"{eff_scope}@th:{thread_id}"
+    if scope_ref:
+        eff_scope = scope_ref
+    else:
+        eff_scope = (
+            f"{purpose}:"
+            + hashlib.sha256(f"{system_prompt or ''}\n{user_prompt}".encode("utf-8")).hexdigest()[:24]
+        )
+        if workspace_id and str(workspace_id) not in eff_scope:
+            eff_scope = f"{eff_scope}@ws:{workspace_id}"
+        if thread_id and str(thread_id) not in eff_scope:
+            eff_scope = f"{eff_scope}@th:{thread_id}"
     computed_inv_id, request_hash = compute_invocation_id_and_hash(
         scope_ref=eff_scope,
         purpose=purpose,
@@ -489,6 +497,10 @@ async def dalton_complete(
         )
 
     if action == "done" and existing_row is not None:
+        try:
+            await record_journal_replay(inv_id)
+        except Exception:
+            pass
         restored_data, restored_text = _deserialize_cached_response(
             existing_row.get("response"), response_schema
         )
@@ -599,6 +611,10 @@ async def dalton_complete(
     attempt = int(claimed_row.get("attempt") or 1)
 
     if claim_action == "done":
+        try:
+            await record_journal_replay(inv_id)
+        except Exception:
+            pass
         restored_data, restored_text = _deserialize_cached_response(
             claimed_row.get("response"), response_schema
         )

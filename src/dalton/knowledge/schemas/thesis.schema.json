@@ -73,7 +73,7 @@
       "required": ["id","claim","priority","baseline","expected_path","thresholds","status","provenance","created_at"]},
     "evidence": {"type": "object", "additionalProperties": false,
       "properties": {
-        "id": {"type": "string", "pattern": "^E-\\d{8}-\\d{2,3}$"},
+        "id": {"type": "string", "pattern": "^(E-\\d{8}-\\d{2,3}|EV-[A-Z0-9-]+-\\d{3})$"},
         "at": {"$ref": "common#/$defs/isoTime"},
         "period": {"$ref": "common#/$defs/period"},
         "source": {"type": "object", "additionalProperties": false,

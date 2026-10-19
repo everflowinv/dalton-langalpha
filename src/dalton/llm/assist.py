@@ -169,7 +169,12 @@ async def assist_json(
             default=str,
         )
         payload_sha = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()[:24]
-        eff_scope = scope_ref or f"assist:{task}:{payload_sha}"
+        if scope_ref:
+            eff_scope = scope_ref
+        elif user_id and user_id != "local-dev-user":
+            eff_scope = f"assist:{user_id}:{task}:{payload_sha}"
+        else:
+            eff_scope = f"assist:{task}:{payload_sha}"
 
         schema_json = json.dumps(schema, ensure_ascii=False, indent=2)
         system_prompt = (

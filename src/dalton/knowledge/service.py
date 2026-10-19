@@ -721,6 +721,12 @@ async def append_verdict(
 ) -> dict[str, Any]:
     """Validate and record an event verdict, update agenda, and render ``verdicts.md`` (PK.4)."""
     v_copy = copy.deepcopy(verdict)
+    for extra_sig_key in ("trigger_signal", "trigger_signals", "signal_id", "signal_ids", "signal_key", "signals"):
+        sig_val = v_copy.pop(extra_sig_key, None)
+        if extra_sig_key == "trigger_signal" and isinstance(sig_val, str) and sig_val.strip():
+            trig_obj = v_copy.get("trigger")
+            if isinstance(trig_obj, dict) and not trig_obj.get("ref"):
+                trig_obj["ref"] = sig_val.strip()
     now_iso = (
         datetime.now(timezone.utc)
         .replace(microsecond=0)
