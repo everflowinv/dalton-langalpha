@@ -11,6 +11,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+from src.config.env import LOCAL_DEV_USER_ID
 from src.dalton.settings import REPO_ROOT, get_dalton_config
 
 logger = logging.getLogger(__name__)
@@ -262,10 +263,7 @@ async def run_review(
                 for k, v in avail_map.items()
                 if isinstance(v, dict) and v.get("available")
             }
-            if any(
-                c in avail_set and family_of(c) not in ("unknown", author_family)
-                for c in get_dalton_config().publish.reviewer_models
-            ):
+            if avail_set:
                 eff_available = avail_set
         except Exception:
             pass
@@ -292,7 +290,7 @@ async def run_review(
 
         comp = await dalton_complete(
             None,
-            user_id=user_id or "local-dev-user",
+            user_id=user_id or LOCAL_DEV_USER_ID,
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             purpose="publish.review",

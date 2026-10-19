@@ -7,7 +7,7 @@
     "period": {"type": "string", "pattern": "^(FY\\d{4}|[1-4]Q\\d{2}|1H\\d{2}|2H\\d{2}|LTM(-\\d{4}-\\d{2})?|\\d{4}-\\d{2}(-\\d{2})?|NTM|spot)$",
                "description": "FY2026 / 3Q26 / 1H26 / LTM / LTM-2026-09 / 2026-09 / 2026-09-30 / NTM / spot"},
     "unit": {"type": "string", "enum": ["USD","USD_mn","USD_bn","HKD","HKD_mn","HKD_bn","CNY","CNY_mn","CNY_bn","CNY_100mn","pct","bp","x","count","count_mn","per_share","other"]},
-    "label": {"type": "string", "enum": ["reported","company_guidance","guidance","consensus","estimate","assumption","research_judgement"],
+    "label": {"type": "string", "enum": ["reported","company_guidance","consensus","estimate","assumption","research_judgement"],
               "description": "蓝图 §3.1 第 2 条：估计、假设、公司指引、一致预期分层标注"},
     "sourceTier": {"type": "integer", "minimum": 1, "maximum": 6,
                    "description": "1 filing > 2 公司公告 > 3 署名研报 > 4 官方/协会数据 > 5 专家(标身份) > 6 新闻(只作线索)"},

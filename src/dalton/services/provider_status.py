@@ -13,6 +13,7 @@ from typing import Any
 
 import yaml
 
+from src.config.env import LOCAL_DEV_USER_ID
 from src.dalton.database.provider_events import (
     count_provider_errors_24h,
     get_last_refresh_event,
@@ -174,7 +175,7 @@ async def _fetch_usage_stats_24h(
     return stats
 
 
-async def get_providers_status(user_id: str = "local-dev-user") -> dict[str, Any]:
+async def get_providers_status(user_id: str = LOCAL_DEV_USER_ID) -> dict[str, Any]:
     """Build the `GET /api/v1/dalton/providers/status` payload (P0N.8 §3)."""
     from src.llms.llm import ModelConfig
 
@@ -429,7 +430,7 @@ class _ProbeLLMService:
 async def probe_provider(
     provider: str,
     *,
-    user_id: str = "local-dev-user",
+    user_id: str = LOCAL_DEV_USER_ID,
     model: str | None = None,
     model_key: str | None = None,
     timeout_s: float = 30.0,
@@ -546,7 +547,7 @@ async def probe_provider(
         }
 
 
-async def get_available_models_report(user_id: str = "local-dev-user") -> dict[str, Any]:
+async def get_available_models_report(user_id: str = LOCAL_DEV_USER_ID) -> dict[str, Any]:
     """Return `GET /api/v1/dalton/providers/available-models` payload (P0N.8 §5)."""
     report = await explain_model_availability(user_id)
     available = sorted(k for k, v in report.items() if v.get("available"))

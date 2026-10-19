@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 from typing import Any
 
+from src.config.env import LOCAL_DEV_USER_ID
 from src.dalton.llm.openclaw_catalog import FAMILY_PREFIX_TABLE, infer_family_from_model_id
 from src.dalton.llm.overlay import load_dalton_meta, load_overlay_data
 from src.dalton.settings import get_disabled_providers, is_broker_models_enabled
@@ -168,7 +169,7 @@ def is_forbidden_for_roles(model_key: str | None) -> bool:
 
 
 async def explain_model_availability(
-    user_id: str = "local-dev-user",
+    user_id: str = LOCAL_DEV_USER_ID,
     *,
     require_tool_calling: bool = False,
 ) -> dict[str, dict[str, Any]]:
@@ -265,7 +266,7 @@ async def explain_model_availability(
 
 
 async def available_model_keys(
-    user_id: str = "local-dev-user",
+    user_id: str = LOCAL_DEV_USER_ID,
     *,
     require_tool_calling: bool = False,
 ) -> set[str]:
@@ -322,7 +323,11 @@ def select_independent_reviewer(
     return None
 
 
-class RolePolicyError(RuntimeError):
+class DaltonStartupConfigError(RuntimeError):
+    """Fatal Dalton startup configuration or schema migration error (P0J.J3)."""
+
+
+class RolePolicyError(DaltonStartupConfigError):
     """Raised when a forbidden model (e.g. contributor OAuth variant, L21) is assigned to any role."""
 
 

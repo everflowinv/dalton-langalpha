@@ -136,12 +136,17 @@ async def enforce_local_admission(user_id: str, byok: bool = False) -> None:
 
 
 async def verify_local_wiring() -> None:
-    """Startup assertion for Dalton local budget gate and role policy (P0.8 §8, P0H §4 P3).
+    """Startup assertion for Dalton local budget gate and role policy (P0.8 §8, P0H §4 P3, P0J.J3).
 
-    Raises `RolePolicyError` if any role (including `assist`, `background`, `compaction`,
-    `fetch`, `lead`, `subagent:*`) is configured with a forbidden contributor model (L21).
+    Raises `DaltonStartupConfigError` (`RolePolicyError` or missing Dalton migration)
+    when startup must fail fast; other transient errors (e.g. DB temporarily unreachable)
+    propagate as non-`DaltonStartupConfigError` so `setup.py` logs a warning.
     """
-    from src.dalton.llm.role_policy import enforce_role_policy_on_startup
+    import psycopg
+    from src.dalton.llm.role_policy import (
+        DaltonStartupConfigError as _DaltonStartupConfigError,
+        enforce_role_policy_on_startup,
+    )
 
     enforce_role_policy_on_startup()
 
@@ -164,7 +169,7 @@ async def verify_local_wiring() -> None:
                 v_row = await cur.fetchone()
                 version_num = (v_row or {}).get("version_num")
                 if not version_num:
-                    raise RuntimeError(
+                    raise _DaltonStartupConfigError(
                         "[DaltonBudget] alembic_version_dalton has no version_num; "
                         "run Dalton database migrations before starting with DALTON_BUDGET_GATE=1."
                     )
@@ -191,6 +196,24 @@ async def verify_local_wiring() -> None:
                 cfg_count,
                 default_cap,
             )
-    except Exception as exc:
+    except _DaltonStartupConfigError as exc:
         logger.error("[DaltonBudget] Startup wiring verification failed: %s", exc)
         raise
+    except Exception as exc:
+        logger.error("[DaltonBudget] Startup wiring verification failed: %s", exc)
+        msg_lower = str(exc).lower()
+        if isinstance(exc, psycopg.errors.UndefinedTable) or (
+            "does not exist" in msg_lower
+            and (
+                "alembic_version_dalton" in msg_lower
+                or "dalton_budget_" in msg_lower
+            )
+        ):
+            raise _DaltonStartupConfigError(
+                f"[DaltonBudget] Missing Dalton database migration: {exc}"
+            ) from exc
+        raise
+
+
+from src.dalton.llm.role_policy import DaltonStartupConfigError  # noqa: E402
+

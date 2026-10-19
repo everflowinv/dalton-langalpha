@@ -9,6 +9,7 @@ from typing import Any
 
 from psycopg.rows import dict_row
 
+from src.config.env import LOCAL_DEV_USER_ID
 from src.dalton.budget.service import get_budget_today
 from src.server.database.pool import get_db_connection
 
@@ -122,7 +123,7 @@ async def generate_weekly_autonomy_report(
 
     budget: dict[str, Any] = {}
     try:
-        budget = await get_budget_today(user_id=user_id or "local-dev-user")
+        budget = await get_budget_today(user_id=user_id or LOCAL_DEV_USER_ID)
     except Exception as e:
         logger.warning("[DALTON_WEEK_REPORT] get_budget_today failed: %s", e)
 

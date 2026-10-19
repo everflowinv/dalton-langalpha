@@ -12,6 +12,7 @@ from typing import Any, Literal, Type
 
 from pydantic import BaseModel
 
+from src.config.env import LOCAL_DEV_USER_ID
 from src.dalton.budget.port import (
     format_daily_budget_exhausted_message,
     format_task_cap_exhausted_message,
@@ -418,7 +419,7 @@ def _finish(result: DaltonCompleteResult, *, raise_on_error: bool) -> DaltonComp
 async def dalton_complete(
     llm_service: Any = None,
     *,
-    user_id: str | None = "local-dev-user",
+    user_id: str | None = LOCAL_DEV_USER_ID,
     user_prompt: str = "",
     system_prompt: str | None = None,
     scope_ref: str | None = None,
@@ -466,7 +467,7 @@ async def dalton_complete(
         slot=slot,
     )
     inv_id = invocation_id or computed_inv_id
-    eff_user_id = user_id or "local-dev-user"
+    eff_user_id = user_id or LOCAL_DEV_USER_ID
 
     # 1. Inspect journal first so cached replays (`done`) and indeterminate/in-flight states
     #    return immediately without charging or re-sending.
@@ -495,8 +496,8 @@ async def dalton_complete(
     if action == "done" and existing_row is not None:
         try:
             await record_journal_replay(inv_id)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[DaltonComplete] record_journal_replay failed for %s: %s", inv_id, exc)
         restored_data, restored_text = _deserialize_cached_response(
             existing_row.get("response"), response_schema
         )
@@ -609,8 +610,8 @@ async def dalton_complete(
     if claim_action == "done":
         try:
             await record_journal_replay(inv_id)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[DaltonComplete] record_journal_replay failed for %s: %s", inv_id, exc)
         restored_data, restored_text = _deserialize_cached_response(
             claimed_row.get("response"), response_schema
         )
