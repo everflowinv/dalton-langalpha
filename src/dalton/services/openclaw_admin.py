@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import subprocess
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,7 +14,7 @@ from urllib.parse import urlparse
 import httpx
 from fastapi import HTTPException
 
-from src.config.env import HOST_IP
+from src.config.env import HOST_IP, _IN_DOCKER
 from src.dalton.database.openclaw_sync import (
     create_sync_run,
     fetch_recent_sync_runs,
@@ -33,10 +34,75 @@ from src.dalton.llm.openclaw_catalog import (
 )
 from src.dalton.llm.overlay import current_overlay_stamp, load_overlay_data
 from src.dalton.llm.role_policy import check_roles
-from src.dalton.settings import get_dalton_broker_token, get_dalton_broker_url
+from src.dalton.settings import (
+    get_dalton_broker_token,
+    get_dalton_broker_url,
+    get_dalton_settings,
+    get_pm_user_ids_source,
+)
 from src.server.database.pool import get_db_connection
 
 logger = logging.getLogger(__name__)
+
+_DOCKER_SCOPED_PATHS = (
+    "src",
+    "plugins",
+    "scripts",
+    "workflows",
+    "config",
+    "mcp_servers",
+    "migrations",
+    "server.py",
+    "agent_config.yaml",
+    "agent_config.dalton.yaml",
+    "config.yaml",
+    "alembic.ini",
+)
+
+
+def _compute_startup_git_info() -> tuple[str, bool]:
+    """Compute (git_sha_8char, git_dirty) once at backend startup (P0J §1.3, L41)."""
+    git_sha = "unknown"
+    git_dirty = True
+    try:
+        git_sha = subprocess.check_output(
+            ["git", "--no-optional-locks", "-C", str(REPO_ROOT), "rev-parse", "--short=8", "HEAD"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=5.0,
+        ).strip()
+        status_cmd = ["git", "--no-optional-locks", "-C", str(REPO_ROOT), "status", "--porcelain"]
+        if _IN_DOCKER:
+            status_cmd.extend(["--", *_DOCKER_SCOPED_PATHS])
+        raw_status = subprocess.check_output(
+            status_cmd,
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=5.0,
+        )
+        dirty_lines: list[str] = []
+        for line in raw_status.splitlines():
+            if not line.strip():
+                continue
+            path_part = line[3:].strip().strip('"')
+            if " -> " in path_part:
+                path_part = path_part.split(" -> ", 1)[-1].strip().strip('"')
+            if path_part == "var" or path_part.startswith("var/"):
+                continue
+            dirty_lines.append(line)
+        git_dirty = len(dirty_lines) > 0
+    except Exception as exc:
+        logger.debug("Failed to compute startup git info: %s", exc)
+    return git_sha, git_dirty
+
+
+_STARTUP_GIT_SHA, _STARTUP_GIT_DIRTY = _compute_startup_git_info()
+_DEPLOYMENT_MODE = "docker" if _IN_DOCKER else "host"
+
+
+def get_startup_git_info() -> tuple[str, bool]:
+    """Return cached (git_sha, git_dirty) recorded when the backend process started."""
+    return _STARTUP_GIT_SHA, _STARTUP_GIT_DIRTY
 
 
 def _sanitize_error_text(exc: Exception) -> str:
@@ -71,13 +137,23 @@ def _read_latest_smoke_summary() -> dict[str, Any] | None:
         return None
 
 
-async def probe_health() -> dict[str, Any]:
-    """Real-time probe of OpenClaw Broker v2 `/health` (P0.7 §3.3). Never caches in-process."""
+async def probe_health(user_id: str | None = None) -> dict[str, Any]:
+    """Real-time probe of OpenClaw Broker v2 `/health` (P0.7 §3.3, P0J §1.3). Never caches in-process."""
     base_url = get_dalton_broker_url(HOST_IP)
     token = get_dalton_broker_token()
     checked_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     smoke = _read_latest_smoke_summary()
     host_port = _host_port_only(base_url)
+    git_sha, git_dirty = get_startup_git_info()
+    pm_ids = get_dalton_settings().pm_user_ids
+    meta = {
+        "git_sha": git_sha,
+        "git_dirty": git_dirty,
+        "user_id": user_id,
+        "is_pm": bool(user_id and user_id in pm_ids),
+        "deployment": _DEPLOYMENT_MODE,
+        "pm_user_ids_source": get_pm_user_ids_source(),
+    }
 
     if not token:
         return {
@@ -88,6 +164,7 @@ async def probe_health() -> dict[str, Any]:
             "base_url": host_port,
             "broker": None,
             "smoke": smoke,
+            **meta,
         }
 
     t0 = time.monotonic()
@@ -126,6 +203,7 @@ async def probe_health() -> dict[str, Any]:
                     "queued": queued,
                 },
                 "smoke": smoke,
+                **meta,
             }
 
         status_map = {
@@ -142,6 +220,7 @@ async def probe_health() -> dict[str, Any]:
             "base_url": host_port,
             "broker": None,
             "smoke": smoke,
+            **meta,
         }
     except Exception:
         latency_ms = int((time.monotonic() - t0) * 1000)
@@ -153,6 +232,7 @@ async def probe_health() -> dict[str, Any]:
             "base_url": host_port,
             "broker": None,
             "smoke": smoke,
+            **meta,
         }
 
 
@@ -257,7 +337,7 @@ async def run_sync(
                 )
 
             try:
-                async with httpx.AsyncClient(timeout=10.0) as client:
+                async with httpx.AsyncClient(timeout=25.0) as client:
                     resp = await client.get(
                         f"{base_url.rstrip('/')}/models?detail=1",
                         headers={"Authorization": f"Bearer {token}"},

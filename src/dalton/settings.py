@@ -15,7 +15,7 @@ from typing import Any
 import yaml
 from pydantic import BaseModel, Field
 
-from src.config.env import HOST_IP
+from src.config.env import HOST_IP, LOCAL_DEV_USER_ID
 from src.config.settings import HOST_MODE
 
 logger = logging.getLogger(__name__)
@@ -55,9 +55,6 @@ class DaltonKnowledgeConfig(BaseModel):
 
     enabled: bool = True
     max_doc_bytes: int = Field(default=1_048_576, gt=0)
-    pm_user_ids: list[str] = Field(
-        default_factory=lambda: ["local-dev-user", "local_dev_user", "default"]
-    )
 
 
 class DaltonPublishConfig(BaseModel):
@@ -121,7 +118,7 @@ class DaltonConfig(BaseModel):
 
     enabled: bool = True
     pm_user_ids: list[str] = Field(
-        default_factory=lambda: ["local-dev-user", "local_dev_user", "default"]
+        default_factory=lambda: [LOCAL_DEV_USER_ID]
     )
     timezone: str = "Asia/Shanghai"
     models: DaltonModelsConfig = Field(default_factory=DaltonModelsConfig)
@@ -131,13 +128,39 @@ class DaltonConfig(BaseModel):
     autonomy: DaltonAutonomyConfig = Field(default_factory=DaltonAutonomyConfig)
 
 
+def _parse_env_pm_user_ids() -> list[str] | None:
+    """Parse ``DALTON_PM_USER_IDS`` (comma-separated) when set and non-empty (L39)."""
+    raw = os.getenv("DALTON_PM_USER_IDS")
+    if raw is None:
+        return None
+    parsed = [u.strip() for u in raw.split(",") if u.strip()]
+    return parsed if parsed else None
+
+
+def get_pm_user_ids_source() -> str:
+    """Return whether ``pm_user_ids`` comes from ``env`` (``DALTON_PM_USER_IDS``) or ``dalton.yaml``."""
+    return "env" if _parse_env_pm_user_ids() is not None else "dalton.yaml"
+
+
 @lru_cache(maxsize=1)
-def get_dalton_config() -> DaltonConfig:
+def _load_base_dalton_config() -> DaltonConfig:
     """Load and cache ``src/dalton/dalton.yaml``."""
     if not DALTON_YAML_PATH.exists():
         return DaltonConfig()
     raw: dict[str, Any] = yaml.safe_load(DALTON_YAML_PATH.read_text(encoding="utf-8")) or {}
     return DaltonConfig.model_validate(raw)
+
+
+def get_dalton_config() -> DaltonConfig:
+    """Return DaltonConfig with ``DALTON_PM_USER_IDS`` override applied when set (L39)."""
+    base = _load_base_dalton_config()
+    env_pm = _parse_env_pm_user_ids()
+    if env_pm is not None:
+        return base.model_copy(update={"pm_user_ids": env_pm})
+    return base
+
+
+get_dalton_config.cache_clear = _load_base_dalton_config.cache_clear  # type: ignore[attr-defined]
 
 
 get_dalton_settings = get_dalton_config

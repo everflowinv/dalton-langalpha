@@ -22,6 +22,8 @@ from pathlib import Path
 from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 SEARCH_DIRS = (
     "src",
@@ -211,11 +213,23 @@ def build_repo_index(repo_root: Path = REPO_ROOT) -> tuple[set[str], dict[str, l
             rel = p.relative_to(repo_root).as_posix()
             rel_files.add(rel)
             basename_map.setdefault(p.name, []).append(rel)
-            if rel in SELF_EXCLUDED_REL_PATHS:
-                continue
             if p.suffix in SOURCE_EXTENSIONS:
                 try:
                     raw_txt = p.read_text(encoding="utf-8", errors="ignore")
+                    if rel in SELF_EXCLUDED_REL_PATHS:
+                        raw_txt = "\n".join(
+                            ln
+                            for ln in raw_txt.splitlines()
+                            if not any(
+                                neg in ln
+                                for neg in (
+                                    "_METRIC_SYNONYM_GROUPS",
+                                    "_LLM_JUDGE_SCHEMA",
+                                    "JournalCashQueryError",
+                                    "_CODE_FENCE_RE",
+                                )
+                            )
+                        )
                     corpus_chunks.append(_strip_code_comments(raw_txt, p.suffix))
                 except Exception:
                     pass
@@ -368,6 +382,20 @@ def identifier_exists_in_corpus(ident: str, corpus: str, basename_map: dict[str,
     return pattern.search(corpus) is not None
 
 
+def _compute_file_sha256(path: Path) -> str:
+    import hashlib
+
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+_SHA256_HEX_RE = re.compile(r"\b([0-9a-f]{64})\b")
+_VAR_JSON_PATH_RE = re.compile(r"(var/[^\s`|)]+?\.json)")
+
+
 def scan_markdown_file(
     md_path: Path,
     *,
@@ -378,14 +406,34 @@ def scan_markdown_file(
     include_errata: bool = False,
 ) -> dict[str, Any]:
     """Scan a single Markdown file and return structured claim verification results."""
-    lines = md_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    from scripts.dalton.realrun.render_report_tables import verify_generated_evidence_block
+
+    raw_text = md_path.read_text(encoding="utf-8", errors="replace")
+    lines = raw_text.splitlines()
     missing_identifiers: list[dict[str, Any]] = []
     missing_repo_paths: list[dict[str, Any]] = []
     missing_var_paths: list[dict[str, Any]] = []
+    sha256_mismatches: list[dict[str, Any]] = []
+    generated_block_mismatches = verify_generated_evidence_block(raw_text, repo_root=repo_root)
     verified_count = 0
+
+    # First pass: collect any 64-hex hashes mentioned in Errata / 勘误 sections so historical
+    # reports with an appended errata section can acknowledge superseded hashes without modifying original prose.
+    errata_acknowledged_hashes: set[str] = set()
+    if not include_errata:
+        in_err = False
+        for line in lines:
+            st = line.strip()
+            mh = _HEADING_RE.match(st)
+            if mh:
+                in_err = bool(_ERRATA_HEADING_RE.search(mh.group(1)))
+            if in_err:
+                for hm in _SHA256_HEX_RE.finditer(line):
+                    errata_acknowledged_hashes.add(hm.group(1))
 
     in_errata_section = False
     in_code_fence = False
+    pending_summary_var_json: str | None = None
 
     for line_no, line in enumerate(lines, start=1):
         stripped = line.strip()
@@ -399,9 +447,52 @@ def scan_markdown_file(
         if m_head:
             heading_text = m_head.group(1)
             in_errata_section = bool(_ERRATA_HEADING_RE.search(heading_text))
+            pending_summary_var_json = None
 
         if in_errata_section and not include_errata:
             continue
+
+        # Check var/*.json and sha256 pairings on the same line or adjacent summary metadata rows
+        var_json_matches = _VAR_JSON_PATH_RE.findall(line)
+        sha_matches = _SHA256_HEX_RE.findall(line)
+        if var_json_matches and sha_matches:
+            v_rel = var_json_matches[0]
+            claimed_sha = sha_matches[0]
+            v_abs = repo_root / v_rel
+            if v_abs.is_file():
+                actual_sha = _compute_file_sha256(v_abs)
+                if actual_sha == claimed_sha or claimed_sha in errata_acknowledged_hashes:
+                    verified_count += 1
+                else:
+                    sha256_mismatches.append(
+                        {
+                            "line": line_no,
+                            "path": v_rel,
+                            "claimed_sha256": claimed_sha,
+                            "actual_sha256": actual_sha,
+                        }
+                    )
+            pending_summary_var_json = None
+        elif var_json_matches and "原始证据路径" in line:
+            pending_summary_var_json = var_json_matches[0]
+        elif sha_matches and pending_summary_var_json and "sha256" in line.lower():
+            v_rel = pending_summary_var_json
+            claimed_sha = sha_matches[0]
+            v_abs = repo_root / v_rel
+            if v_abs.is_file():
+                actual_sha = _compute_file_sha256(v_abs)
+                if actual_sha == claimed_sha or claimed_sha in errata_acknowledged_hashes:
+                    verified_count += 1
+                else:
+                    sha256_mismatches.append(
+                        {
+                            "line": line_no,
+                            "path": v_rel,
+                            "claimed_sha256": claimed_sha,
+                            "actual_sha256": actual_sha,
+                        }
+                    )
+            pending_summary_var_json = None
 
         for m in _BACKTICK_RE.finditer(line):
             raw_token = m.group(1).strip()
@@ -458,6 +549,8 @@ def scan_markdown_file(
         "missing_identifiers": missing_identifiers,
         "missing_repo_paths": missing_repo_paths,
         "missing_var_paths": missing_var_paths,
+        "sha256_mismatches": sha256_mismatches,
+        "generated_block_mismatches": generated_block_mismatches,
     }
 
 
@@ -472,6 +565,8 @@ def scan_reports(
     total_missing_identifiers = 0
     total_missing_repo_paths = 0
     total_missing_var_paths = 0
+    total_sha256_mismatches = 0
+    total_generated_mismatches = 0
 
     for p in paths:
         fp = Path(p)
@@ -486,6 +581,8 @@ def scan_reports(
                     "missing_identifiers": [],
                     "missing_repo_paths": [],
                     "missing_var_paths": [],
+                    "sha256_mismatches": [],
+                    "generated_block_mismatches": [],
                 }
             )
             continue
@@ -500,6 +597,8 @@ def scan_reports(
         total_missing_identifiers += len(res["missing_identifiers"])
         total_missing_repo_paths += len(res["missing_repo_paths"])
         total_missing_var_paths += len(res["missing_var_paths"])
+        total_sha256_mismatches += len(res["sha256_mismatches"])
+        total_generated_mismatches += len(res["generated_block_mismatches"])
         reports.append(res)
 
     return {
@@ -508,10 +607,14 @@ def scan_reports(
             "missing_identifiers_count": total_missing_identifiers,
             "missing_repo_paths_count": total_missing_repo_paths,
             "missing_var_paths_count": total_missing_var_paths,
+            "sha256_mismatches_count": total_sha256_mismatches,
+            "generated_block_mismatches_count": total_generated_mismatches,
             "all_clean": (
                 total_missing_identifiers == 0
                 and total_missing_repo_paths == 0
                 and total_missing_var_paths == 0
+                and total_sha256_mismatches == 0
+                and total_generated_mismatches == 0
             ),
         },
         "reports": reports,
@@ -525,7 +628,9 @@ def format_text_report(result: dict[str, Any]) -> str:
             f"\nFile: {rep['file']} (verified={rep.get('verified_claims', 0)}, "
             f"missing_identifiers={len(rep.get('missing_identifiers', []))}, "
             f"missing_repo_paths={len(rep.get('missing_repo_paths', []))}, "
-            f"missing_var_paths={len(rep.get('missing_var_paths', []))})"
+            f"missing_var_paths={len(rep.get('missing_var_paths', []))}, "
+            f"sha256_mismatches={len(rep.get('sha256_mismatches', []))}, "
+            f"generated_block_mismatches={len(rep.get('generated_block_mismatches', []))})"
         )
         for item in rep.get("missing_identifiers", []):
             lines.append(f"  [MISSING_IDENTIFIER] L{item['line']}: `{item['identifier']}`")
@@ -533,6 +638,15 @@ def format_text_report(result: dict[str, Any]) -> str:
             lines.append(f"  [MISSING_REPO_PATH]  L{item['line']}: `{item['path']}`")
         for item in rep.get("missing_var_paths", []):
             lines.append(f"  [MISSING_VAR_PATH]   L{item['line']}: `{item['path']}`")
+        for item in rep.get("sha256_mismatches", []):
+            lines.append(
+                f"  [SHA256_MISMATCH]    L{item['line']}: `{item['path']}` "
+                f"claimed={item['claimed_sha256'][:12]}... actual={item['actual_sha256'][:12]}..."
+            )
+        for item in rep.get("generated_block_mismatches", []):
+            lines.append(
+                f"  [GENERATED_MISMATCH] L{item['line']}: {item['reason']}"
+            )
 
     s = result["summary"]
     lines.append(
@@ -540,6 +654,8 @@ def format_text_report(result: dict[str, Any]) -> str:
         f"missing_identifiers={s['missing_identifiers_count']} "
         f"missing_repo_paths={s['missing_repo_paths_count']} "
         f"missing_var_paths={s['missing_var_paths_count']} "
+        f"sha256_mismatches={s.get('sha256_mismatches_count', 0)} "
+        f"generated_block_mismatches={s.get('generated_block_mismatches_count', 0)} "
         f"all_clean={s['all_clean']}"
     )
     return "\n".join(lines)
@@ -547,12 +663,12 @@ def format_text_report(result: dict[str, Any]) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Check backticked identifiers and var/ evidence paths in dev reports and PROGRESS.md."
+        description="Check backticked identifiers, var/ evidence paths, sha256 hashes, and generated tables in dev reports and PROGRESS.md."
     )
     parser.add_argument(
         "files",
         nargs="*",
-        help="Markdown files to scan (defaults to PROGRESS.md and P0H-round2-dev-report.md / P0I-round3-dev-report.md)",
+        help="Markdown files to scan (defaults to PROGRESS.md, trial-run summaries, and P0J-round4-dev-report.md)",
     )
     parser.add_argument("--json", action="store_true", help="Output JSON instead of text")
     parser.add_argument(
@@ -563,19 +679,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--strict",
         action="store_true",
-        help="Exit with code 1 if any missing identifier or path is found (default: report-only, exit 0)",
+        help="Exit with code 1 if any missing identifier, path, or sha256/generated mismatch is found",
     )
     args = parser.parse_args(argv)
 
     target_files: list[str | Path] = list(args.files)
     if not target_files:
-        p0i_rel = "docs/dalton/dev-guide/P0I-round3-dev-report.md"
-        p0h_rel = "docs/dalton/dev-guide/P0H-round2-dev-report.md"
-        report_rel = p0i_rel if (REPO_ROOT / p0i_rel).exists() else p0h_rel
-        default_candidates = [
-            "docs/dalton/dev-guide/PROGRESS.md",
-            report_rel,
-        ]
+        default_candidates: list[str] = ["docs/dalton/dev-guide/PROGRESS.md"]
+        p0j_rel = "docs/dalton/dev-guide/P0J-round4-dev-report.md"
+        if (REPO_ROOT / p0j_rel).exists():
+            default_candidates.append(p0j_rel)
+        for g_md in sorted((REPO_ROOT / "docs/dalton/dev-guide/trial-runs").glob("realrun-*/G*.md")):
+            default_candidates.append(g_md.relative_to(REPO_ROOT).as_posix())
         target_files = [c for c in default_candidates if (REPO_ROOT / c).exists()]
 
     result = scan_reports(

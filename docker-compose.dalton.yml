@@ -4,7 +4,10 @@ services:
     command: ["uv", "run", "python", "server.py", "--host", "0.0.0.0", "--port", "8000", "--reload"]
     mem_limit: 2g
     memswap_limit: 2g
+    environment:
+      REDIS_URL: "redis://:${REDIS_PASSWORD:-redis}@redis:6379/0"
     volumes:
+      - ./.git:/app/.git:ro
       - ./agent_config.dalton.yaml:/app/agent_config.dalton.yaml:ro
       - ./workflows:/app/workflows:ro
       - ./config/dalton:/app/config/dalton:ro

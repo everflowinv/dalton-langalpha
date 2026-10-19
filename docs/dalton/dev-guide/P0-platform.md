@@ -174,6 +174,8 @@ TAVILY_API_KEY=<owner 提供>          # agent_config.yaml 的 search_api 默认
 DALTON_RESEARCHDATA_URL=<见数据篇 P0-D.1；值不入库>
 DALTON_BROKER_TOKEN=<broker v2 首次启动时生成在它的状态目录里，owner 复制过来；只能调模型，不是网关 operator 令牌>
 DALTON_BUDGET_GATE=1                 # 本地预算开关，见 P0.8
+REDIS_PASSWORD=redis                 # 与 Redis 容器 --requirepass 一致
+REDIS_URL=redis://:redis@localhost:6379/0  # 宿主机模式（uv run python server.py）必填带密码 URL，防止 [RB_WAKE] Authentication required 导致 /threads/messages 503；Docker 容器内由 docker-compose.dalton.yml 覆盖为 @redis:6379/0
 # 下面这个只给"网关 agent 对照组"（P0.5 --target gateway）用，主路径不需要：
 # OPENCLAW_GATEWAY_TOKEN=<owner 从 openclaw.json 的 gateway.auth.token 复制；我们的脚本绝不读这个字段>
 ```
