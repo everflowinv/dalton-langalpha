@@ -125,6 +125,7 @@ class BridgeConfig:
                 os.path.expanduser("~/.config/dalton/researchdata-bridge.env"),
             )
         )
+        self.env_path: Path = env_path
         _load_env_file(env_path)
 
         self.host: str = os.environ.get("DALTON_BRIDGE_HOST", "127.0.0.1")
@@ -164,6 +165,32 @@ class BridgeConfig:
                 os.path.expanduser("~/.cache/dalton/bridge-usage.json"),
             )
         )
+        self.test_mode: bool = os.environ.get("DALTON_BRIDGE_TEST_MODE", "0").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        self.test_delay_s: float = (
+            max(0.0, float(os.environ.get("DALTON_BRIDGE_TEST_DELAY_S", "0") or 0.0))
+            if self.test_mode
+            else 0.0
+        )
+
+    def resolve_test_delay_s(self) -> float:
+        """Return active test delay in seconds (0.0 unless DALTON_BRIDGE_TEST_MODE=1)."""
+        if self.test_mode and self.test_delay_s > 0.0:
+            return self.test_delay_s
+        env_mode = os.environ.get("DALTON_BRIDGE_TEST_MODE", "0").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        if env_mode:
+            try:
+                return max(0.0, float(os.environ.get("DALTON_BRIDGE_TEST_DELAY_S", "0") or 0.0))
+            except ValueError:
+                return 0.0
+        return 0.0
 
 
 class ResearchDataBridge:
@@ -429,8 +456,17 @@ class ResearchDataBridge:
             call_args["timeout"] = eff_timeout
 
         t0 = time.monotonic()
+        test_delay_s = self.cfg.resolve_test_delay_s()
         async with self.sem:
             try:
+                if test_delay_s > 0.0:
+                    await asyncio.wait_for(
+                        asyncio.sleep(test_delay_s),
+                        timeout=float(eff_timeout),
+                    )
+                remaining_budget_s = max(
+                    5.0, float(eff_timeout) - (time.monotonic() - t0) + 5.0
+                )
                 rpc_req = {
                     "jsonrpc": "2.0",
                     "id": req_id if req_id is not None else 1,
@@ -438,7 +474,7 @@ class ResearchDataBridge:
                     "params": {"name": tool_name, "arguments": call_args},
                 }
                 resps = await self._run_stdio_rpc(
-                    [rpc_req], timeout_s=float(eff_timeout) + 5.0
+                    [rpc_req], timeout_s=remaining_budget_s
                 )
             except asyncio.TimeoutError:
                 elapsed_ms = int((time.monotonic() - t0) * 1000)

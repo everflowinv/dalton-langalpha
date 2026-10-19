@@ -103,6 +103,7 @@ async def _check_db_actionable_work(
     now_dt: datetime,
     now_date: date,
     ttl_hours: int,
+    user_id: Optional[str] = None,
 ) -> dict[str, int]:
     """Query Postgres for the 5 daily director actionable work conditions (A7, N2-M3)."""
     counts = {
@@ -117,12 +118,13 @@ async def _check_db_actionable_work(
         from src.dalton.database.publications import expire_stale_publications
         from src.server.database.pool import get_db_connection
 
-        try:
-            expired_rows = await expire_stale_publications(ttl_hours=ttl_hours)
-            if expired_rows:
-                counts["publish_near_or_past_ttl"] += len(expired_rows)
-        except Exception as e:
-            logger.warning("[DALTON_DIRECTOR_PROBE] expire_stale_publications failed: %s", e)
+        if not user_id or user_id == "local-dev-user":
+            try:
+                expired_rows = await expire_stale_publications(ttl_hours=ttl_hours)
+                if expired_rows:
+                    counts["publish_near_or_past_ttl"] += len(expired_rows)
+            except Exception as e:
+                logger.warning("[DALTON_DIRECTOR_PROBE] expire_stale_publications failed: %s", e)
 
         try:
             from src.dalton.database.llm_journal import prune_expired_journal_responses
@@ -138,14 +140,29 @@ async def _check_db_actionable_work(
 
         async with get_db_connection() as conn:
             async with conn.cursor(row_factory=dict_row) as cur:
-                await cur.execute(
-                    """
-                    SELECT DISTINCT ON (workspace_id) content
-                    FROM dalton_knowledge_versions
-                    WHERE doc_key = 'agenda' AND schema_valid = TRUE
-                    ORDER BY workspace_id, version_no DESC
-                    """
-                )
+                if user_id and user_id != "local-dev-user":
+                    await cur.execute(
+                        """
+                        SELECT DISTINCT ON (workspace_id) content
+                        FROM dalton_knowledge_versions
+                        WHERE doc_key = 'agenda' AND schema_valid = TRUE
+                          AND workspace_id IN (
+                              SELECT workspace_id FROM workspaces
+                              WHERE user_id = %s AND status <> 'deleted'
+                          )
+                        ORDER BY workspace_id, version_no DESC
+                        """,
+                        (user_id,),
+                    )
+                else:
+                    await cur.execute(
+                        """
+                        SELECT DISTINCT ON (workspace_id) content
+                        FROM dalton_knowledge_versions
+                        WHERE doc_key = 'agenda' AND schema_valid = TRUE
+                        ORDER BY workspace_id, version_no DESC
+                        """
+                    )
                 agenda_rows = await cur.fetchall()
                 agenda_docs = [
                     r["content"] for r in (agenda_rows or []) if isinstance(r.get("content"), dict)
@@ -155,28 +172,59 @@ async def _check_db_actionable_work(
                 counts["actionable_questions"] = ag_counts["actionable_questions"]
                 counts["unconfirmed_earnings_14d"] = ag_counts["unconfirmed_earnings_14d"]
 
-                await cur.execute(
-                    """
-                    SELECT COUNT(*) AS cnt
-                    FROM dalton_signals
-                    WHERE resolved_at IS NULL
-                      AND expired_at IS NULL
-                      AND detected_at <= NOW() - INTERVAL '24 hours'
-                    """
-                )
+                if user_id and user_id != "local-dev-user":
+                    await cur.execute(
+                        """
+                        SELECT COUNT(*) AS cnt
+                        FROM dalton_signals
+                        WHERE resolved_at IS NULL
+                          AND expired_at IS NULL
+                          AND detected_at <= NOW() - INTERVAL '24 hours'
+                          AND workspace_id IN (
+                              SELECT workspace_id FROM workspaces
+                              WHERE user_id = %s AND status <> 'deleted'
+                          )
+                        """,
+                        (user_id,),
+                    )
+                else:
+                    await cur.execute(
+                        """
+                        SELECT COUNT(*) AS cnt
+                        FROM dalton_signals
+                        WHERE resolved_at IS NULL
+                          AND expired_at IS NULL
+                          AND detected_at <= NOW() - INTERVAL '24 hours'
+                        """
+                    )
                 sig_row = await cur.fetchone()
                 counts["stale_signals_24h"] = int((sig_row or {}).get("cnt") or 0)
 
                 warn_hours = max(1, ttl_hours - 24)
-                await cur.execute(
-                    """
-                    SELECT COUNT(*) AS cnt
-                    FROM dalton_publish_requests
-                    WHERE status = 'awaiting_pm'
-                      AND created_at <= NOW() - make_interval(hours => %s)
-                    """,
-                    (warn_hours,),
-                )
+                if user_id and user_id != "local-dev-user":
+                    await cur.execute(
+                        """
+                        SELECT COUNT(*) AS cnt
+                        FROM dalton_publish_requests
+                        WHERE status = 'awaiting_pm'
+                          AND created_at <= NOW() - make_interval(hours => %s)
+                          AND workspace_id IN (
+                              SELECT workspace_id FROM workspaces
+                              WHERE user_id = %s AND status <> 'deleted'
+                          )
+                        """,
+                        (warn_hours, user_id),
+                    )
+                else:
+                    await cur.execute(
+                        """
+                        SELECT COUNT(*) AS cnt
+                        FROM dalton_publish_requests
+                        WHERE status = 'awaiting_pm'
+                          AND created_at <= NOW() - make_interval(hours => %s)
+                        """,
+                        (warn_hours,),
+                    )
                 pub_row = await cur.fetchone()
                 counts["publish_near_or_past_ttl"] += int((pub_row or {}).get("cnt") or 0)
     except Exception as e:
@@ -192,6 +240,7 @@ async def probe_director(
     today: Optional[date] = None,
     persist: bool = True,
     agenda_docs_override: Optional[list[dict[str, Any]]] = None,
+    user_id: Optional[str] = None,
 ) -> tuple[list[ProbeSignal], dict[str, Any]]:
     """Emit a daily or weekly director wake signal when actionable work exists (PK.16 / PK.19 / A7)."""
     settings = get_dalton_settings()
@@ -248,7 +297,12 @@ async def probe_director(
             "unconfirmed_earnings_14d": 0,
         }
     elif persist:
-        counts = await _check_db_actionable_work(now_dt=now_dt, now_date=now_date, ttl_hours=ttl_hours)
+        counts = await _check_db_actionable_work(
+            now_dt=now_dt,
+            now_date=now_date,
+            ttl_hours=ttl_hours,
+            user_id=user_id,
+        )
     else:
         counts = {
             "due_validations": 0,

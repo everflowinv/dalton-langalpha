@@ -520,6 +520,7 @@ async def _preflight_check_inner(
             watch_state=state,
             persist=persist,
             agenda_docs_override=[agenda_doc_override] if isinstance(agenda_doc_override, dict) else None,
+            user_id=user_id,
         )
         emitted.extend(sigs)
     elif kind in ("weekly_delta", "earnings_window", "custom_dalton"):

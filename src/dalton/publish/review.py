@@ -251,10 +251,29 @@ async def run_review(
             ),
         )
 
+    eff_available = available_models
+    if eff_available is None and candidates is None and user_id:
+        try:
+            from src.dalton.services.provider_status import explain_model_availability
+
+            avail_map = await explain_model_availability(str(user_id))
+            avail_set = {
+                k
+                for k, v in avail_map.items()
+                if isinstance(v, dict) and v.get("available")
+            }
+            if any(
+                c in avail_set and family_of(c) not in ("unknown", author_family)
+                for c in get_dalton_config().publish.reviewer_models
+            ):
+                eff_available = avail_set
+        except Exception:
+            pass
+
     model = pick_reviewer_model(
         author_model,
         candidates=candidates,
-        available_models=available_models,
+        available_models=eff_available,
     )
     if not model or family_of(model) == author_family:
         return ReviewResult(
@@ -294,7 +313,12 @@ async def run_review(
                 reason=f"独立审稿调用失败：{comp.error or comp.status}",
             )
         verdict_obj = comp.data
-        usage = comp.usage
+        usage = dict(comp.usage) if isinstance(comp.usage, dict) else {}
+        usage["replayed"] = bool(comp.replayed)
+        usage["cached"] = bool(comp.cached)
+        usage["cash_usd"] = float(comp.cash_usd)
+        usage["notional_usd"] = float(comp.notional_usd)
+        usage["invocation_id"] = comp.invocation_id
 
         if isinstance(verdict_obj, dict):
             verdict_obj = ReviewVerdict.model_validate(verdict_obj)
@@ -309,7 +333,7 @@ async def run_review(
             model=model,
             family=family_of(model),
             verdict=verdict_obj,
-            usage=usage if isinstance(usage, dict) else {},
+            usage=usage,
         )
     except Exception as e:
         logger.warning("Independent review call failed on model %s: %s", model, e)

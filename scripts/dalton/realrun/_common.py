@@ -205,8 +205,9 @@ def render_summary_markdown(
     else:
         for item in synthetic:
             if isinstance(item, dict):
+                desc = item.get("description") or item.get("reason") or ""
                 lines.append(
-                    f"- **`{item.get('kind')}`**（入口：`{item.get('entry_point')}`）：{item.get('description', '')}"
+                    f"- **`{item.get('kind')}`**（入口：`{item.get('entry_point')}`）：{desc}"
                 )
             else:
                 lines.append(f"- `{item}`")
@@ -261,6 +262,44 @@ def render_summary_markdown(
             lines.append(f"| ... | 其余 {len(rows) - 50} 条记录见原始 JSON | | | | | | | |")
     else:
         lines.append("_本窗口内无 `dalton_llm_journal` 记录。_")
+
+    conv_usages = journal.get("conversation_usages") or []
+    if conv_usages:
+        lines.extend(
+            [
+                "",
+                "### 对话与子智能体调用明细 (`conversation_usages`)",
+                "",
+                "| `conversation_response_id` | `#` | `model` | `billing_type` | `input_tokens` | `output_tokens` | `cost_usd` | `created_at` |",
+                "|---|---:|---|---|---:|---:|---:|---|",
+            ]
+        )
+        for cu in conv_usages:
+            resp_id = str(cu.get("conversation_response_id") or "")
+            short_resp = resp_id[:18] + "…" if len(resp_id) > 19 else resp_id
+            tu_sum = cu.get("token_usage_summary") or {}
+            per_calls = tu_sum.get("per_call_costs") or []
+            by_model = tu_sum.get("by_model") or {}
+            if per_calls:
+                for idx_c, pc in enumerate(per_calls, 1):
+                    lines.append(
+                        f"| `{short_resp}` | `{idx_c}` | `{pc.get('model')}` | `{pc.get('billing_type')}` | "
+                        f"`{pc.get('input_tokens', 0)}` | `{pc.get('output_tokens', 0)}` | "
+                        f"`${float(pc.get('cost', 0.0)):.6f}` | `{cu.get('created_at')}` |"
+                    )
+            elif by_model:
+                for idx_c, (m_name, m_stats) in enumerate(by_model.items(), 1):
+                    b_type = "byok" if cu.get("is_byok") else "oauth"
+                    lines.append(
+                        f"| `{short_resp}` | `{idx_c}` | `{m_name}` | `{b_type}` | "
+                        f"`{m_stats.get('input_tokens', 0)}` | `{m_stats.get('output_tokens', 0)}` | "
+                        f"`${float(m_stats.get('total_cost', cu.get('cash_usd', 0.0))):.6f}` | `{cu.get('created_at')}` |"
+                    )
+            else:
+                lines.append(
+                    f"| `{short_resp}` | `1` | `-` | `-` | `0` | `0` | "
+                    f"`${float(cu.get('cash_usd', 0.0)):.6f}` | `{cu.get('created_at')}` |"
+                )
 
     if notes:
         lines.extend(["", "## 5. 补充说明", ""])
@@ -325,12 +364,22 @@ class RealRunHttpClient:
         timeout_s: float = 120.0,
         extra_headers: dict[str, str] | None = None,
     ) -> None:
+        import os
+
         self.base_url = base_url.rstrip("/")
         self.user_id = user_id
+        svc_token = os.getenv("INTERNAL_SERVICE_TOKEN", "dalton-realrun-service-token")
         headers = {"X-User-Id": user_id}
+        if svc_token:
+            headers["X-Service-Token"] = svc_token
         if extra_headers:
             headers.update(extra_headers)
-        self._client = httpx.Client(base_url=self.base_url, headers=headers, timeout=timeout_s)
+        self._client = httpx.Client(
+            base_url=self.base_url,
+            headers=headers,
+            timeout=timeout_s,
+            trust_env=False,
+        )
 
     def close(self) -> None:
         self._client.close()
@@ -340,6 +389,19 @@ class RealRunHttpClient:
 
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
         self.close()
+
+    def ensure_user(self) -> tuple[int, Any]:
+        """Provision `self.user_id` via `POST /api/v1/users` (idempotent on 409)."""
+        return self.request(
+            "POST",
+            "/api/v1/users",
+            json_body={
+                "email": f"{self.user_id}@dalton.local",
+                "name": f"RealRun {self.user_id}",
+                "timezone": "America/New_York",
+                "locale": "zh-CN",
+            },
+        )
 
     def request(
         self,
@@ -364,3 +426,86 @@ class RealRunHttpClient:
             except Exception:
                 return resp.status_code, resp.text
         return resp.status_code, resp.text
+
+    def get(
+        self,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> tuple[int, Any]:
+        return self.request("GET", path, params=params, headers=headers)
+
+    def post(
+        self,
+        path: str,
+        *,
+        json_body: Any = None,
+        params: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> tuple[int, Any]:
+        return self.request("POST", path, json_body=json_body, params=params, headers=headers)
+
+    def put(
+        self,
+        path: str,
+        *,
+        json_body: Any = None,
+        params: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> tuple[int, Any]:
+        return self.request("PUT", path, json_body=json_body, params=params, headers=headers)
+
+    def delete(
+        self,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> tuple[int, Any]:
+        return self.request("DELETE", path, params=params, headers=headers)
+
+    def stream_sse(
+        self,
+        method: str,
+        path: str,
+        *,
+        json_body: Any = None,
+        headers: dict[str, str] | None = None,
+        max_events: int = 500,
+    ) -> tuple[int, list[dict[str, Any]], Any]:
+        """Send an HTTP request expecting SSE (`text/event-stream`) or JSON error."""
+        events: list[dict[str, Any]] = []
+        with self._client.stream(
+            method.upper(),
+            path,
+            json=json_body,
+            headers=headers,
+        ) as resp:
+            status = resp.status_code
+            ctype = resp.headers.get("content-type", "")
+            if status >= 400 or "text/event-stream" not in ctype:
+                body_bytes = resp.read()
+                text = body_bytes.decode("utf-8", errors="replace")
+                try:
+                    return status, events, json.loads(text)
+                except Exception:
+                    return status, events, text
+
+            curr_event = "message"
+            for line in resp.iter_lines():
+                if not line:
+                    continue
+                if line.startswith("event:"):
+                    curr_event = line.split(":", 1)[1].strip()
+                elif line.startswith("data:"):
+                    raw_data = line.split(":", 1)[1].strip()
+                    try:
+                        parsed_data = json.loads(raw_data)
+                    except Exception:
+                        parsed_data = raw_data
+                    events.append({"event": curr_event, "data": parsed_data})
+                    if len(events) >= max_events:
+                        break
+            return status, events, None
+
