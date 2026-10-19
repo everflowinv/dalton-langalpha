@@ -26,7 +26,7 @@ description: "Dalton 三把财务镜头与盈利质量计算：在同一报告�
 python3 .agents/skills/dalton-financial-lenses/scripts/anchors.py \
   --ticker {TICKER} --period-end {YYYY-MM-DD} \
   [--financial-currency {USD|CNY|HKD|...}] [--fx-rate {RATE} | --allow-network] \
-  [--market-cap-usd-mn {MC_MN}] [--adr-ratio {RATIO}] --json
+  [--market-cap-usd-mn {MC_MN}] [--adr-ratio {RATIO}] --json > anchors.json
 ```
 - 股本优先使用最新 10-Q/10-K/20-F 封面股数（`dalton_sec.get_company_facts` 的 `dei:EntityCommonStockSharesOutstanding` 或稀释股数），可传 `--shares`、`--shares-unit {auto|raw|thousands|millions}`、`--adr-ratio` 与 `--price-local` 覆盖；yfinance 仅作行情与实时汇率获取（`--allow-network`）。
 - 非美元列报公司（如美股中概 ADR 或港股人民币报表）**必须显式传入 `--financial-currency CNY`**（或开启 `--allow-network` 获取实时汇率 `CNYUSD=X`）；离线且未传 `--fx-rate` 时脚本直接报错退出，严禁使用写死的旧汇率。
@@ -36,15 +36,19 @@ python3 .agents/skills/dalton-financial-lenses/scripts/anchors.py \
 2. 用 `researchdata.finance(route="sec", ...)` 的 `read-item` / `search-text`（或自带 `get_sec_filing`）读取资产负债表附注（现金及短期投资构成、受限资金、有息债务明细、合同负债/递延收入、联营合营与股权投资、回购授权与执行 `share repurchase program`）。
 
 ### 第 4 步：按口径与确定性脚本计算三把镜头（及盈利质量）
+> **硬规则**：以下三个脚本必须统一传入 `--anchors anchors.json` 读取第 2 步锁定的市值、汇率与期间；同时传入 `--anchors` 与手填 `--market-cap-usd-mn` / `--fx-rate` 会直接报错退出（仅手填时输出会标记 `anchors_source: "manual"`）。
+
 1. **净现金双口径**（详见 [`references/netcash.md`](references/netcash.md)）：
    - 整理现金端、债务端、类债务与不自由现金扣减项，调用确定性脚本计算基础净现金（Definition A）、严格净现金（Definition B）、营运资本、其他应收/应付 >20% 预警、“大存大贷”标记、现金质量评级与隐含经营资产（Implied Operating Assets）：
    ```bash
-   python3 .agents/skills/dalton-financial-lenses/scripts/netcash.py --input netcash_input.json --json
-   # 或直接传命令行参数：
    python3 .agents/skills/dalton-financial-lenses/scripts/netcash.py \
+     --anchors anchors.json --input netcash_input.json --json
+   # 或直接传命令行参数（由 --anchors 提供统一市值与汇率）：
+   python3 .agents/skills/dalton-financial-lenses/scripts/netcash.py \
+     --anchors anchors.json \
      --cash {CASH} --restricted-cash {RC} --time-deposits {TD} --st-investments {STI} \
      --st-debt {STD} --cur-lt-debt {CLTD} --lt-debt {LTD} --convertible-debt {CD} \
-     --lease-liabilities {LEASE} --market-cap-usd-mn {MC_MN} --fx-rate {FX} --json
+     --lease-liabilities {LEASE} --json
    ```
 2. **隐含资产**（详见 [`references/hidden-assets.md`](references/hidden-assets.md)）：
    - 识别 A 联营/合营权益、B 上市参股股权、C 投资性房地产、D 其他可变现非核心资产。
@@ -57,6 +61,7 @@ python3 .agents/skills/dalton-financial-lenses/scripts/anchors.py \
    - **必须调用 `return_score.py` 确定性计算评分，严禁手算或中途四舍五入**：
    ```bash
    python3 .agents/skills/dalton-financial-lenses/scripts/return_score.py --json \
+     --anchors anchors.json \
      --ttm-div {TTM_DIV_PCT} --ttm-buyback {TTM_BUYBACK_PCT} \
      --true-return-share {SHARE_0_TO_1} \
      --annual {FY3},{FY2},{FY1} \
@@ -68,6 +73,7 @@ python3 .agents/skills/dalton-financial-lenses/scripts/anchors.py \
    - 使用 `scripts/earnings_quality.py` 计算 Sloan Ratio（总应计口径 `(NI - CFO - CFI) / Avg Total Assets` 与经营应计口径 `(NI - CFO) / Avg Total Assets`）、`CFO / NI` 比率、现金转换周期 `CCC = DIO + DSO - DPO`（缺任一分项时 `ccc_days` 返回 `null`）：
    ```bash
    python3 .agents/skills/dalton-financial-lenses/scripts/earnings_quality.py \
+     --anchors anchors.json \
      --ni {NI} --cfo {CFO} [--cfi {CFI}] \
      [--avg-assets {AVG_A} | --assets-begin {A0} --assets-end {A1}] \
      [--revenue {REV} --cogs {COGS} --inventory {INV} --ar {AR} --ap {AP}] --json

@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from pathlib import Path
 from typing import Any, Sequence
 
 VALID_CREDIBILITY = (100, 90, 75, 60, 50)
@@ -27,6 +28,46 @@ CREDIBILITY_TIER_ZH: dict[int, str] = {
     60: "方向性表态，历史执行一般",
     50: "无明确政策，按近年趋势外推",
 }
+
+
+def _load_anchors_payload(raw_anchors: str) -> dict[str, Any]:
+    s = raw_anchors.strip()
+    if s == "-":
+        data = json.load(sys.stdin)
+    elif s.startswith("{"):
+        data = json.loads(s)
+    else:
+        data = json.loads(Path(s).read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("--anchors JSON must be an object")
+    return data
+
+
+def _extract_anchor_fields(anchors_obj: dict[str, Any]) -> dict[str, Any]:
+    fx_val: float | None = None
+    if isinstance(anchors_obj.get("fx"), dict) and anchors_obj["fx"].get("rate") is not None:
+        fx_val = float(anchors_obj["fx"]["rate"])
+    elif anchors_obj.get("fx_rate_to_usd") is not None:
+        fx_val = float(anchors_obj["fx_rate_to_usd"])
+    elif anchors_obj.get("fx_rate") is not None:
+        fx_val = float(anchors_obj["fx_rate"])
+
+    mcap_mn_val: float | None = None
+    if isinstance(anchors_obj.get("market_cap"), dict):
+        mc_dict = anchors_obj["market_cap"]
+        raw_mc = mc_dict.get("market_cap_usd_mn", mc_dict.get("market_cap_usd"))
+        if raw_mc is not None:
+            mcap_mn_val = float(raw_mc)
+    elif anchors_obj.get("market_cap_usd_mn") is not None:
+        mcap_mn_val = float(anchors_obj["market_cap_usd_mn"])
+
+    return {
+        "ticker": anchors_obj.get("ticker"),
+        "period_end": anchors_obj.get("period_end"),
+        "as_of": anchors_obj.get("as_of"),
+        "fx_rate_to_usd": fx_val,
+        "market_cap_usd_mn": round(mcap_mn_val, 2) if mcap_mn_val is not None else None,
+    }
 
 
 def parse_adjust(items: Sequence[str] | None) -> list[tuple[float, str]]:
@@ -147,12 +188,36 @@ def compute_return_score(
         "final_score": final_rounded,
         "max_score": 20,
         "rationale_zh": rationale,
+        "anchors_source": "manual",
     }
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Deterministic 0-20 shareholder return score calculator (PS.2)"
+    )
+    parser.add_argument(
+        "--anchors",
+        default=None,
+        help="Path to anchors.py JSON output file, '-' for stdin, or inline JSON object string",
+    )
+    parser.add_argument(
+        "--market-cap-usd-mn",
+        type=float,
+        default=None,
+        help="Manual market cap in USD millions (mutually exclusive with --anchors)",
+    )
+    parser.add_argument(
+        "--market-cap-usd",
+        type=float,
+        default=None,
+        help="Manual market cap in USD (mutually exclusive with --anchors)",
+    )
+    parser.add_argument(
+        "--fx-rate",
+        type=float,
+        default=None,
+        help="Manual reporting currency -> USD FX rate (mutually exclusive with --anchors)",
     )
     parser.add_argument("--ttm-div", type=float, required=True, help="TTM dividend yield (pct)")
     parser.add_argument("--ttm-buyback", type=float, required=True, help="TTM gross buyback yield (pct)")
@@ -207,6 +272,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(normalized_argv)
 
     try:
+        has_manual = (
+            args.market_cap_usd_mn is not None
+            or args.market_cap_usd is not None
+            or args.fx_rate is not None
+        )
+        if args.anchors and has_manual:
+            raise ValueError(
+                "Cannot specify both --anchors and manual --market-cap-usd-mn/--market-cap-usd/--fx-rate"
+            )
+        anchors_obj = _load_anchors_payload(args.anchors) if args.anchors else None
+        anchor_meta = _extract_anchor_fields(anchors_obj) if anchors_obj is not None else {}
+
         annual_raw = args.annual.strip()
         annual_vals: list[float] | None
         annual_na_reason: str | None = None
@@ -228,7 +305,27 @@ def main(argv: Sequence[str] | None = None) -> int:
             credibility_reason=args.credibility_reason,
             annual_na_reason=annual_na_reason,
         )
-    except ValueError as exc:
+        if anchors_obj is not None:
+            result["anchors_source"] = "anchors"
+            result["ticker"] = anchor_meta.get("ticker")
+            result["period_end"] = anchor_meta.get("period_end")
+            result["market_cap_usd_mn"] = anchor_meta.get("market_cap_usd_mn")
+            result["fx_rate_to_usd"] = anchor_meta.get("fx_rate_to_usd")
+            result["anchors"] = {
+                "ticker": anchor_meta.get("ticker"),
+                "period_end": anchor_meta.get("period_end"),
+                "as_of": anchor_meta.get("as_of"),
+                "market_cap_usd_mn": anchor_meta.get("market_cap_usd_mn"),
+                "fx_rate_to_usd": anchor_meta.get("fx_rate_to_usd"),
+            }
+        else:
+            result["anchors_source"] = "manual"
+            if args.market_cap_usd_mn is not None or args.market_cap_usd is not None:
+                raw_mc = args.market_cap_usd_mn if args.market_cap_usd_mn is not None else args.market_cap_usd
+                result["market_cap_usd_mn"] = round(float(raw_mc), 2) if raw_mc is not None else None
+            if args.fx_rate is not None:
+                result["fx_rate_to_usd"] = float(args.fx_rate)
+    except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
 

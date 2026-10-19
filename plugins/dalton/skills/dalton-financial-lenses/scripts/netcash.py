@@ -351,6 +351,8 @@ def compute_netcash(
         "large_deposit_loan_flag": large_deposit_loan_flag,
         "cash_quality": cash_quality,
         "warnings": warnings,
+        "fx_rate_to_usd": fx_rate_to_usd,
+        "anchors_source": "manual",
     }
 
 
@@ -387,6 +389,33 @@ def _load_input_payload(raw_input: str) -> dict[str, Any]:
     return data
 
 
+def _extract_anchor_fields(anchors_obj: dict[str, Any]) -> dict[str, Any]:
+    fx_val: float | None = None
+    if isinstance(anchors_obj.get("fx"), dict) and anchors_obj["fx"].get("rate") is not None:
+        fx_val = float(anchors_obj["fx"]["rate"])
+    elif anchors_obj.get("fx_rate_to_usd") is not None:
+        fx_val = float(anchors_obj["fx_rate_to_usd"])
+    elif anchors_obj.get("fx_rate") is not None:
+        fx_val = float(anchors_obj["fx_rate"])
+
+    mcap_mn_val: float | None = None
+    if isinstance(anchors_obj.get("market_cap"), dict):
+        mc_dict = anchors_obj["market_cap"]
+        raw_mc = mc_dict.get("market_cap_usd_mn", mc_dict.get("market_cap_usd"))
+        if raw_mc is not None:
+            mcap_mn_val = float(raw_mc)
+    elif anchors_obj.get("market_cap_usd_mn") is not None:
+        mcap_mn_val = float(anchors_obj["market_cap_usd_mn"])
+
+    return {
+        "ticker": anchors_obj.get("ticker"),
+        "period_end": anchors_obj.get("period_end"),
+        "as_of": anchors_obj.get("as_of"),
+        "fx_rate_to_usd": fx_val,
+        "market_cap_usd_mn": mcap_mn_val,
+    }
+
+
 def _coerce_items_list(val: Any) -> list[dict[str, Any]] | None:
     if val is None:
         return None
@@ -412,6 +441,11 @@ def main(argv: list[str] | None = None) -> int:
         "-i",
         default=None,
         help="Path to JSON input file, '-' for stdin, or inline JSON object string",
+    )
+    parser.add_argument(
+        "--anchors",
+        default=None,
+        help="Path to anchors.py JSON output file, '-' for stdin, or inline JSON object string",
     )
     parser.add_argument("--cash", type=float, default=None, help="Cash and cash equivalents")
     parser.add_argument("--restricted-cash", type=float, default=None, help="Restricted / pledged cash")
@@ -452,23 +486,41 @@ def main(argv: list[str] | None = None) -> int:
         "--market-cap-usd-mn",
         type=float,
         default=None,
-        help="Market cap in USD millions",
+        help="Market cap in USD millions (manual override; mutually exclusive with --anchors)",
     )
     parser.add_argument(
         "--market-cap-usd",
         type=float,
         default=None,
-        help="Market cap in USD (same unit scale or millions)",
+        help="Market cap in USD (same unit scale or millions; mutually exclusive with --anchors)",
     )
     parser.add_argument("--hidden-assets-gross-usd", type=float, default=None, help="Pre-haircut hidden assets in USD")
     parser.add_argument("--hidden-assets-after-usd", type=float, default=None, help="Post-haircut hidden assets in USD")
-    parser.add_argument("--fx-rate", type=float, default=None, help="Reporting currency -> USD FX rate")
+    parser.add_argument("--fx-rate", type=float, default=None, help="Reporting currency -> USD FX rate (manual override; mutually exclusive with --anchors)")
     parser.add_argument("--json", action="store_true", help="Emit JSON output")
     args = parser.parse_args(argv)
 
     try:
         payload: dict[str, Any] = _load_input_payload(args.input) if args.input else {}
-        anchors = payload.get("anchors") if isinstance(payload.get("anchors"), dict) else {}
+        anchors_obj: dict[str, Any] | None = None
+        if args.anchors:
+            anchors_obj = _load_input_payload(args.anchors)
+        elif isinstance(payload.get("anchors"), dict):
+            anchors_obj = payload["anchors"]
+
+        has_manual_cli_or_payload = (
+            args.market_cap_usd_mn is not None
+            or args.market_cap_usd is not None
+            or args.fx_rate is not None
+            or payload.get("market_cap_usd_mn") is not None
+            or payload.get("market_cap_usd") is not None
+            or payload.get("fx_rate") is not None
+            or payload.get("fx_rate_to_usd") is not None
+        )
+        if anchors_obj is not None and has_manual_cli_or_payload:
+            raise ValueError(
+                "Cannot specify both --anchors and manual --market-cap-usd-mn/--market-cap-usd/--fx-rate"
+            )
 
         def _pick_float(cli_val: float | None, *keys: str, default: float | None = None) -> float | None:
             if cli_val is not None:
@@ -478,15 +530,11 @@ def main(argv: list[str] | None = None) -> int:
                     return float(payload[k])
             return default
 
-        fx_default = 1.0
-        if isinstance(anchors.get("fx"), dict) and anchors["fx"].get("rate") is not None:
-            fx_default = float(anchors["fx"]["rate"])
+        anchor_meta = _extract_anchor_fields(anchors_obj) if anchors_obj is not None else {}
+        fx_default = anchor_meta.get("fx_rate_to_usd") or 1.0
         fx_rate_val = _pick_float(args.fx_rate, "fx_rate_to_usd", "fx_rate", default=fx_default) or 1.0
 
-        mcap_mn_default = None
-        if isinstance(anchors.get("market_cap"), dict):
-            mc_dict = anchors["market_cap"]
-            mcap_mn_default = mc_dict.get("market_cap_usd_mn", mc_dict.get("market_cap_usd"))
+        mcap_mn_default = anchor_meta.get("market_cap_usd_mn")
         mcap_usd_mn_val = _pick_float(
             args.market_cap_usd_mn,
             "market_cap_usd_mn",
@@ -557,6 +605,21 @@ def main(argv: list[str] | None = None) -> int:
             ) or 0.0,
             fx_rate_to_usd=fx_rate_val,
         )
+        if anchors_obj is not None:
+            result["anchors_source"] = "anchors"
+            result["ticker"] = anchor_meta.get("ticker")
+            result["period_end"] = anchor_meta.get("period_end")
+            result["fx_rate_to_usd"] = fx_rate_val
+            result["anchors"] = {
+                "ticker": anchor_meta.get("ticker"),
+                "period_end": anchor_meta.get("period_end"),
+                "as_of": anchor_meta.get("as_of"),
+                "market_cap_usd_mn": result["market_cap_usd_mn"],
+                "fx_rate_to_usd": fx_rate_val,
+            }
+        else:
+            result["anchors_source"] = "manual"
+            result["fx_rate_to_usd"] = fx_rate_val
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
