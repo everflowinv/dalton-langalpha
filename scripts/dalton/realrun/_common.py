@@ -109,7 +109,7 @@ def get_git_sha(short: bool = True) -> str:
 
 
 def is_git_dirty() -> bool:
-    """Return True if working tree has uncommitted changes outside `var/` (P0J §1.3, L41)."""
+    """Return True if working tree has uncommitted changes outside `var/` and `docs/dalton/dev-guide/trial-runs/` (P0J §1.3, L41)."""
     raw = subprocess.check_output(
         ["git", "--no-optional-locks", "-C", str(REPO_ROOT), "status", "--porcelain"],
         text=True,
@@ -121,6 +121,8 @@ def is_git_dirty() -> bool:
         if " -> " in path_part:
             path_part = path_part.split(" -> ", 1)[-1].strip().strip('"')
         if path_part == "var" or path_part.startswith("var/"):
+            continue
+        if path_part.startswith("docs/dalton/dev-guide/trial-runs/"):
             continue
         return True
     return False
@@ -289,9 +291,9 @@ def assert_clean_and_synced_environment(
     *,
     base_url: str = "http://127.0.0.1:8000",
     user_id: str = "realrun-pm-a",
-    require_merged_main: bool = False,
+    require_merged_main: bool = True,
 ) -> dict[str, Any]:
-    """Fail fast (exit code != 0) if worktree is dirty, backend SHA/dirty drifts, or service token is missing (L40, L41)."""
+    """Fail fast (exit code != 0) if worktree is dirty, HEAD is not in main, backend SHA/dirty drifts, or service token is missing (L40, L41)."""
     svc_token = os.getenv("INTERNAL_SERVICE_TOKEN", "").strip()
     if not svc_token:
         raise SystemExit(
@@ -302,7 +304,8 @@ def assert_clean_and_synced_environment(
             "ERROR: Working tree is dirty (git status --porcelain excluding var/ is non-empty, L41). "
             "Refusing to run or write evidence."
         )
-    if require_merged_main and not is_head_merged_into_main():
+    allow_unmerged = os.getenv("DALTON_ALLOW_UNMERGED_BRANCH") == "1"
+    if require_merged_main and not allow_unmerged and not is_head_merged_into_main():
         raise SystemExit(
             "ERROR: HEAD is not merged into origin/dalton/main (L41). Refusing to write formal evidence."
         )

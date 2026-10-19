@@ -31,10 +31,9 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.dalton.realrun._common import (
+from scripts.dalton.realrun._common import (  # noqa: E402
     RealRunHttpClient,
     build_evidence_envelope,
-    new_test_user_id,
     now_utc_iso,
     write_evidence_and_summary,
 )
@@ -283,7 +282,7 @@ def main() -> int:
         raise ValueError(f"--delay-s must be > 240 seconds (got {args.delay_s})")
 
     started_at = now_utc_iso()
-    test_user_id = new_test_user_id("g7")
+    test_user_id = "realrun-pm-a"
     token = _read_bridge_token()
 
     with RealRunHttpClient(base_url=args.backend, user_id=test_user_id, timeout_s=60.0) as client:
@@ -295,14 +294,14 @@ def main() -> int:
     ended_at = now_utc_iso()
     synthetic = [
         {
-            "kind": "bridge_delay_hook",
+            "kind": "committed_test_hook",
             "entry_point": (
-                f"DALTON_BRIDGE_TEST_MODE=1 DALTON_BRIDGE_TEST_DELAY_S={args.delay_s} "
-                "on scripts/dalton/researchdata_bridge.py"
+                f"scripts/dalton/researchdata_bridge.py "
+                f"(DALTON_BRIDGE_TEST_MODE=1 DALTON_BRIDGE_TEST_DELAY_S={args.delay_s})"
             ),
             "reason": (
                 "Verify >240s long-read call completes within the 240s-600s long-read timeout window "
-                "without modifying committed code (P0I §7 G7 #1)."
+                "without modifying committed code (P0I §7 G7 #1, P0J §5.7)."
             ),
         }
     ]
@@ -317,6 +316,8 @@ def main() -> int:
         ended_at=ended_at,
         backend=args.backend,
         test_user_id=test_user_id,
+        family="G7",
+        sub_item="G7.all",
         synthetic=synthetic,
         extra_fields={
             "call_1_long_read_over_240s": long_read_delay_result,
@@ -368,7 +369,7 @@ def main() -> int:
             ),
         ],
         notes=[
-            "调用 ① 使用已入库的 `DALTON_BRIDGE_TEST_MODE=1` + `DALTON_BRIDGE_TEST_DELAY_S=245` 环境变量开关启动未改动的 `scripts/dalton/researchdata_bridge.py`，在默认超时 `240s` 之上、长读超时 `eff_timeout=600s` 之下真实跑满 `> 245s` 并成功返回，且在 `synthetic` 字段显式声明 `bridge_delay_hook`。",
+            "调用 ① 使用已入库的 `DALTON_BRIDGE_TEST_MODE=1` + `DALTON_BRIDGE_TEST_DELAY_S=245` 环境变量开关启动未改动的 `scripts/dalton/researchdata_bridge.py`，在默认超时 `240s` 之上、长读超时 `eff_timeout=600s` 之下真实跑满 `> 245s` 并成功返回，且在 `synthetic` 字段显式声明 `committed_test_hook`。",
             "调用 ② 针对常驻桥接服务 `http://127.0.0.1:8960`（无延迟注入）真实执行 `company-wiki:read` 与 `sec:financials` 读取，返回 JSON 首两个键固定为 `_declared_sources` 与 `_sources` 且非空。",
         ],
     )

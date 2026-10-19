@@ -44,7 +44,6 @@ newly generated `test_user_id` (`realrun-g4-...`):
 from __future__ import annotations
 
 import argparse
-import asyncio
 import json
 import os
 import subprocess
@@ -66,12 +65,10 @@ if str(REPO_ROOT) not in sys.path:
 from scripts.dalton.realrun._common import (  # noqa: E402
     RealRunHttpClient,
     build_evidence_envelope,
-    new_test_user_id,
     now_utc_iso,
     write_evidence_and_summary,
 )
 from scripts.dalton.realrun.journal_dump import build_dsn_from_env  # noqa: E402
-from src.dalton.autonomy.probes.internal import probe_internal  # noqa: E402
 
 
 def _resolve_deepseek_key() -> str:
@@ -266,14 +263,13 @@ def _unsee_filing_in_watch_state(workspace_id: str, ticker: str, accession_to_re
             state["seen_accessions"] = seen
             cur.execute(
                 """
-                INSERT INTO dalton_watch_state (workspace_id, ticker, state, updated_at)
-                VALUES (%s, %s, %s, NOW())
-                ON CONFLICT (workspace_id) DO UPDATE
-                SET ticker = EXCLUDED.ticker,
-                    state = EXCLUDED.state,
+                UPDATE dalton_watch_state
+                SET ticker = %s,
+                    state = %s,
                     updated_at = NOW()
+                WHERE workspace_id = %s
                 """,
-                (workspace_id, ticker, Jsonb(state)),
+                (ticker, Jsonb(state), workspace_id),
             )
             conn.commit()
     return {
@@ -326,44 +322,97 @@ def _query_preflight_and_signals(execution_id: str, workspace_id: str | None = N
     )
 
 
-async def _check_live_internal_literature_today() -> dict[str, Any]:
-    today_sigs_meta, state_meta = await probe_internal(
-        ticker="META",
-        watch_state={},
-        allow_network=True,
-    )
-    today_sigs_googl, state_googl = await probe_internal(
-        ticker="GOOGL",
-        watch_state={},
-        allow_network=True,
-    )
+def _check_live_internal_literature_today(bridge_url: str = "http://127.0.0.1:8960/mcp") -> dict[str, Any]:
+    """Check today's internal literature via the live HTTP researchdata MCP bridge without importing src.dalton."""
+    today_prefix = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    counts_by_ticker: dict[str, int] = {"META": 0, "GOOGL": 0}
+    degraded_by_ticker: dict[str, bool] = {"META": False, "GOOGL": False}
+
+    with httpx.Client(timeout=10.0) as http_client:
+        for ticker in ("META", "GOOGL"):
+            for route in ("sales-notes", "alphaengine", "guidepoint"):
+                payload = {
+                    "jsonrpc": "2.0",
+                    "id": f"g4-internal-{route}-{ticker}",
+                    "method": "tools/call",
+                    "params": {
+                        "name": "research",
+                        "arguments": {
+                            "route": route,
+                            "action": "search",
+                            "ticker": ticker,
+                            "query": ticker,
+                            "limit": 10,
+                        },
+                    },
+                }
+                try:
+                    resp = http_client.post(bridge_url, json=payload)
+                    resp.raise_for_status()
+                    raw = resp.json()
+                    content_list = ((raw.get("result") or {}).get("content")) or []
+                    for block in content_list:
+                        if not isinstance(block, dict) or block.get("type") != "text":
+                            continue
+                        parsed = json.loads(block.get("text") or "{}")
+                        if isinstance(parsed, dict):
+                            candidates = (
+                                parsed.get("items")
+                                or parsed.get("results")
+                                or parsed.get("documents")
+                                or parsed.get("data")
+                                or []
+                            )
+                            if isinstance(candidates, list):
+                                for c in candidates:
+                                    if isinstance(c, dict):
+                                        pub_at = str(
+                                            c.get("published_at") or c.get("date") or c.get("created_at") or ""
+                                        )
+                                        if pub_at.startswith(today_prefix):
+                                            counts_by_ticker[ticker] += 1
+                except Exception:
+                    degraded_by_ticker[ticker] = True
+
+    meta_new = counts_by_ticker["META"]
+    googl_new = counts_by_ticker["GOOGL"]
+    skipped_today = meta_new == 0 and googl_new == 0
     return {
         "checked_at": now_utc_iso(),
-        "meta_new_docs_count": len(today_sigs_meta),
-        "googl_new_docs_count": len(today_sigs_googl),
-        "meta_probe_degraded": bool(state_meta.get("internal_probe_degraded")),
-        "googl_probe_degraded": bool(state_googl.get("internal_probe_degraded")),
-        "status": "🟦" if (len(today_sigs_meta) == 0 and len(today_sigs_googl) == 0) else "🟨",
+        "bridge_url": bridge_url,
+        "meta_new_docs_count": meta_new,
+        "googl_new_docs_count": googl_new,
+        "meta_probe_degraded": degraded_by_ticker["META"],
+        "googl_probe_degraded": degraded_by_ticker["GOOGL"],
+        "subscenario_skipped": skipped_today,
         "note": (
-            "当天内部资料库无新入库文档（meta_new_docs=0, googl_new_docs=0）；按 P0I §7 G4 规范如实标为 🟦，不合成假内部资料。"
-            if (len(today_sigs_meta) == 0 and len(today_sigs_googl) == 0)
+            "运行当天内部资料库无新入库文档（meta_new_docs=0, googl_new_docs=0）；按 P0J §5 G4 规范跳过该子场景，等待有真实新资料入库的交易日补跑，不合成假内部资料。"
+            if skipped_today
             else "已使用当天真实新入库内部资料完成验证。"
         ),
     }
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="G4 Real-Run Evidence Generator (P0I §7 G4)")
+    parser = argparse.ArgumentParser(description="G4 Real-Run Evidence Generator (P0J §5 G4)")
     parser.add_argument("--backend", default="http://127.0.0.1:8000")
     parser.add_argument("--date", default="20261019")
+    parser.add_argument("--pm-user", default="realrun-pm-a")
+    parser.add_argument("--other-user", default="realrun-user-b")
     args = parser.parse_args()
 
     started_at = now_utc_iso()
-    test_user_id = new_test_user_id("g4")
+    pm_user = args.pm_user
+    other_user = args.other_user
+    test_user_id = f"{pm_user},{other_user}"
     synthetic: list[dict[str, Any]] = []
 
-    with RealRunHttpClient(base_url=args.backend, user_id=test_user_id, timeout_s=180.0) as client:
+    with (
+        RealRunHttpClient(base_url=args.backend, user_id=pm_user, timeout_s=180.0) as client,
+        RealRunHttpClient(base_url=args.backend, user_id=other_user, timeout_s=60.0) as user_b_client,
+    ):
         client.ensure_user()
+        user_b_client.ensure_user()
 
         # Configure initial daily budget ($15.00) and BYOK DeepSeek key
         st_b, body_b = client.request(
@@ -376,7 +425,14 @@ def main() -> int:
             {
                 "kind": "settings_api_budget",
                 "entry_point": "PUT /api/v1/dalton/budget",
-                "description": "初始化测试用户日预算上限 $15.00，并在场景 6 下调至 $0.01 以触发共享预算熔断。",
+                "description": f"初始化测试用户 {pm_user} 日预算上限 $15.00，在场景 6 下调至 $0.01 触发共享预算熔断，验证完成后恢复为 $15.00。",
+            }
+        )
+        synthetic.append(
+            {
+                "kind": "knowledge_api_import_fixture",
+                "entry_point": "POST /api/v1/dalton/knowledge/{ws}/{doc}/import",
+                "description": "导入初始 company、thesis 与空 agenda 基线文档。",
             }
         )
 
@@ -627,11 +683,11 @@ def main() -> int:
         s2_exec_id = str(s2_trig.get("execution_id") or s2_trig.get("automation_execution_id"))
         s2_exec = _wait_for_execution(client, meta_watch_id, s2_exec_id, timeout_s=120.0)
         s2_db = _query_preflight_and_signals(s2_exec_id, meta_ws_id)
-        internal_lit_check = asyncio.run(_check_live_internal_literature_today())
+        internal_lit_check = _check_live_internal_literature_today()
         print(
             f"[G4] Scenario 2 done: exec_status={s2_exec.get('status')} "
             f"preflight={((s2_db.get('preflight_log') or {}).get('reason'))} "
-            f"internal_lit={internal_lit_check['status']}",
+            f"internal_lit_skipped={internal_lit_check['subscenario_skipped']}",
             flush=True,
         )
 
@@ -741,8 +797,8 @@ def main() -> int:
             flush=True,
         )
 
-        # Scenario 4: Check Coverage Board & Signal Resolution
-        print("[G4] Scenario 4: Checking GET /api/v1/dalton/coverage/board ...", flush=True)
+        # Scenario 4: Check Coverage Board & Signal Resolution + Two-User Isolation
+        print("[G4] Scenario 4: Checking GET /api/v1/dalton/coverage/board & 2-user isolation ...", flush=True)
         st_board, board_body = client.request("GET", "/api/v1/dalton/coverage/board")
         assert st_board == 200 and isinstance(board_body, dict), f"Coverage board failed: {st_board}"
         board_companies = board_body.get("companies") or []
@@ -750,6 +806,40 @@ def main() -> int:
             str(c.get("ticker")): int(c.get("open_signals_count") or 0)
             for c in board_companies
             if isinstance(c, dict)
+        }
+        st_b_board, b_board_body = user_b_client.get("/api/v1/dalton/coverage/board")
+        assert st_b_board == 200 and isinstance(b_board_body, dict)
+        b_ws_ids = {
+            str(c.get("workspace_id"))
+            for c in (b_board_body.get("companies") or [])
+            if isinstance(c, dict) and c.get("workspace_id")
+        }
+        assert meta_ws_id not in b_ws_ids and googl_ws_id not in b_ws_ids, (
+            f"Two-user isolation failed on coverage/board: {other_user} saw {pm_user} workspaces"
+        )
+        st_b_verdicts, b_verdicts_body = user_b_client.get("/api/v1/dalton/verdicts")
+        assert st_b_verdicts == 200 and isinstance(b_verdicts_body, dict)
+        b_verdict_ws = {
+            str(v.get("workspace_id"))
+            for v in (b_verdicts_body.get("items") or [])
+            if isinstance(v, dict)
+        }
+        assert meta_ws_id not in b_verdict_ws and googl_ws_id not in b_verdict_ws
+        st_b_pr, b_pr_body = user_b_client.get("/api/v1/dalton/publish-requests")
+        assert st_b_pr == 200 and isinstance(b_pr_body, dict)
+        b_pr_ws = {
+            str(p.get("workspace_id"))
+            for p in (b_pr_body.get("items") or [])
+            if isinstance(p, dict)
+        }
+        assert meta_ws_id not in b_pr_ws and googl_ws_id not in b_pr_ws
+
+        two_user_isolation = {
+            "pm_user": pm_user,
+            "other_user": other_user,
+            "other_user_visible_pm_workspaces_on_board": len(b_ws_ids & {meta_ws_id, googl_ws_id}),
+            "other_user_visible_pm_verdicts": len(b_verdict_ws & {meta_ws_id, googl_ws_id}),
+            "other_user_visible_pm_publish_requests": len(b_pr_ws & {meta_ws_id, googl_ws_id}),
         }
         print(f"[G4] Scenario 4 done: open_signals_by_ticker={open_signals_by_ticker}", flush=True)
 
@@ -823,6 +913,13 @@ def main() -> int:
         assert st_tm3_after == 200 and isinstance(tm3_after_body, dict), (
             f"GET tm3 automation failed: {st_tm3_after} {tm3_after_body}"
         )
+
+        # Restore daily_cap_usd to $15.00 after Scenario 6 verification
+        client.request(
+            "PUT",
+            "/api/v1/dalton/budget",
+            json_body={"daily_cap_usd": 15.0, "default_task_cap_usd": 5.0},
+        )
         print(
             f"[G4] Scenario 6 done: watch_status={s6_w_exec.get('status')} "
             f"tm3_exec_status={s6_tm3_exec.get('status')} "
@@ -834,6 +931,8 @@ def main() -> int:
     ended_at = now_utc_iso()
 
     scenario_results = {
+        "test_user_ids": [pm_user, other_user],
+        "two_user_isolation": two_user_isolation,
         "scenario_1_sec_8k_direct_wake": {
             "unsee_info": unsee_8k_info,
             "filing": real_8k_202,
@@ -961,39 +1060,40 @@ def main() -> int:
             f"场景 ① SEC 8-K (Item 2.02) 直接唤醒：`dalton-meta-watch` (`exec={s1_exec_id[:8]}…`) 预检决策 "
             f"`{((s1_db.get('preflight_log') or {}).get('decision'))}` / `{((s1_db.get('preflight_log') or {}).get('reason'))}`，"
             f"执行状态 `{s1_exec.get('status')}`，真实 8-K `{acc_8k}` 注入 `<dalton_wake>`，写入结论 "
-            f"`{s1_verdicts[0].get('verdict_id')}` (`{s1_verdicts[0].get('word')}`) — 状态 🟨"
+            f"`{s1_verdicts[0].get('verdict_id')}` (`{s1_verdicts[0].get('word')}`)"
         ),
         (
-            f"场景 ② SEC Form 4 分诊跳过 + 内部文献：`dalton-meta-watch` (`exec={s2_exec_id[:8]}…`) 预检决策 "
+            f"场景 ② SEC Form 4 分诊跳过：`dalton-meta-watch` (`exec={s2_exec_id[:8]}…`) 预检决策 "
             f"`{((s2_db.get('preflight_log') or {}).get('decision'))}` / `{((s2_db.get('preflight_log') or {}).get('reason'))}`，"
             f"执行状态 `{s2_exec.get('status')}` (`{s2_exec.get('skip_reason')}`)，真实 Form 4 `{acc_form4}` 经 "
             f"`assist.preflight.triage` (`replayed=false` 调用 `{len(triage_fresh_calls)}` 次) 跳过；"
-            f"内部文献子项：`{internal_lit_check['status']}`（当天无新入库内部文献，按规范不合成）— 状态 🟨（内部文献子项 🟦）"
+            f"内部文献子场景：`subscenario_skipped={internal_lit_check['subscenario_skipped']}`（{internal_lit_check['note']}）"
         ),
         (
             f"场景 ③a `dalton_agenda_note` 实际写入：`POST /api/v1/threads/messages` (`thread={str(agenda_note_turn.get('thread_id'))[:8]}…`) "
             f"驱动 `GOOGL` `agenda` 生成 `v{latest_ag_ver.get('version_no')}` (`source={latest_ag_ver.get('source')}`)，"
-            f"新增 `Q-001` (`origin=pm`) — 状态 🟨"
+            f"新增 `Q-001` (`origin=pm`)"
         ),
         (
             f"场景 ③b 到期验证项 `V-201` 唤醒与结案：`dalton-googl-watch` (`exec={s3_exec_id[:8]}…`) 预检决策 "
             f"`{((s3_db.get('preflight_log') or {}).get('decision'))}` / `{((s3_db.get('preflight_log') or {}).get('reason'))}`，"
             f"执行状态 `{s3_exec.get('status')}`，写入结论 `{s3_verdicts[0].get('verdict_id')}` (`{s3_verdicts[0].get('word')}`)，"
-            f"`V-201` 状态更新为 `done` — 状态 🟨"
+            f"`V-201` 状态更新为 `done`"
         ),
         (
-            f"场景 ④ 信号消解与覆盖总览未决信号清零：`GET /api/v1/dalton/coverage/board` 返回 "
-            f"`open_signals_by_ticker={json.dumps(open_signals_by_ticker)}`，唤醒信号均已写入 `resolved_at` — 状态 🟨"
+            f"场景 ④ 信号消解、覆盖总览未决信号清零与两用户隔离：`GET /api/v1/dalton/coverage/board` 返回 "
+            f"`open_signals_by_ticker={json.dumps(open_signals_by_ticker)}`，唤醒信号均已写入 `resolved_at`；"
+            f"`{other_user}` 可见 `{pm_user}` 覆盖总览公司 `0` 家、结论 `0` 条、审批请求 `0` 条"
         ),
         (
             f"场景 ⑤ 每日研究总监零信号跳过：`dalton-director-daily` (`exec={s5_exec_id[:8]}…`) 预检决策 "
             f"`{((s5_db.get('preflight_log') or {}).get('decision'))}` / `{((s5_db.get('preflight_log') or {}).get('reason'))}`，"
-            f"执行状态 `{s5_exec.get('status')}` (`{s5_exec.get('skip_reason')}`)，零待办事项时直接跳过，大模型花费 `$0.00` — 状态 🟨"
+            f"执行状态 `{s5_exec.get('status')}` (`{s5_exec.get('skip_reason')}`)，零待办事项时直接跳过，大模型花费 `$0.00`"
         ),
         (
             f"场景 ⑥ 共享日预算熔断与一次性任务顺延：`dalton-googl-watch` 与 `dalton-googl-earn-2q26-tm3` 均以 "
             f"`skip` / `budget_exhausted` 跳过（已花费 `${spent_before_s6:.4f}` >= 下调后上限 `$0.01`）；"
-            f"一次性任务保持 `status={tm3_after_body.get('status')}`，`next_run_at` 从 `{initial_tm3_run_at}` 顺延至 `{tm3_after_body.get('next_run_at')}` — 状态 🟨"
+            f"一次性任务保持 `status={tm3_after_body.get('status')}`，`next_run_at` 从 `{initial_tm3_run_at}` 顺延至 `{tm3_after_body.get('next_run_at')}`"
         ),
     ]
 
@@ -1002,17 +1102,18 @@ def main() -> int:
 
     _, _, sha = write_evidence_and_summary(
         family_code="G4",
-        title="自主议程、零 Token 预检、分诊、信号消解与预算熔断（P0I §7 G4）",
+        title="自主议程、零 Token 预检、分诊、信号消解、双用户隔离与预算熔断（P0J §5 G4）",
         raw_json_path=raw_out,
         summary_md_path=md_out,
         envelope=envelope,
         key_findings=[
+            ("测试用户 (`pm_user` / `other_user`)", f"`{pm_user}` / `{other_user}`"),
             ("Scenario 1 (SEC 8-K Item 2.02 direct wake)", f"status={s1_exec.get('status')}, reason={(s1_db.get('preflight_log') or {}).get('reason')}, verdict={s1_verdicts[0].get('verdict_id')} ({s1_verdicts[0].get('word')})"),
             ("Scenario 2 (SEC Form 4 triage skip)", f"status={s2_exec.get('status')}, reason={(s2_db.get('preflight_log') or {}).get('reason')}, triage_fresh_calls={len(triage_fresh_calls)}"),
-            ("Scenario 2 (Internal literature sub-item)", f"{internal_lit_check['status']} (meta_new_docs={internal_lit_check['meta_new_docs_count']}, googl_new_docs={internal_lit_check['googl_new_docs_count']})"),
+            ("Scenario 2 (Internal literature subscenario)", f"subscenario_skipped={internal_lit_check['subscenario_skipped']} (meta_new_docs={internal_lit_check['meta_new_docs_count']}, googl_new_docs={internal_lit_check['googl_new_docs_count']})"),
             ("Scenario 3a (dalton_agenda_note)", f"agenda v{latest_ag_ver.get('version_no')} (source={latest_ag_ver.get('source')}, questions={len(ag_open_questions)})"),
             ("Scenario 3b (Due validation V-201 wake)", f"status={s3_exec.get('status')}, reason={(s3_db.get('preflight_log') or {}).get('reason')}, verdict={s3_verdicts[0].get('verdict_id')} ({s3_verdicts[0].get('word')})"),
-            ("Scenario 4 (Coverage board open signals)", json.dumps(open_signals_by_ticker)),
+            ("Scenario 4 (Coverage board open signals & 2-user isolation)", json.dumps({"open_signals_by_ticker": open_signals_by_ticker, "two_user_isolation": two_user_isolation})),
             ("Scenario 5 (Director daily zero-signal skip)", f"status={s5_exec.get('status')}, reason={(s5_db.get('preflight_log') or {}).get('reason')}"),
             ("Scenario 6 (Budget exhausted & once-task defer)", f"watch_reason={(s6_w_db.get('preflight_log') or {}).get('reason')}, tm3_status={tm3_after_body.get('status')}, next_run_at={tm3_after_body.get('next_run_at')}"),
         ],

@@ -60,13 +60,8 @@ LATEST_ENV_CACHE_PATH = REPO_ROOT / "var" / "dalton-realrun" / "check_env.latest
 _FROM_SRC_RE = re.compile(r"\b(?:from|import)\s+src\b")
 _INSERT_INTO_RE = re.compile(r"\bINSERT\s+INTO\s+([a-zA-Z0-9_]+)", re.IGNORECASE)
 
-# Pre-J3 baseline hashes for g2/g4/g5 before J3 branch removes their legacy P0I lines.
-# Any edit to these files or any violation in any other g*.py file immediately fails static scan.
-_PRE_J3_LEGACY_SCRIPT_SHAS: dict[str, str] = {
-    "scripts/dalton/realrun/g2_providers.py": "493d46bff4db3d98ec7b0464301457d7957611dd86deab5c906650d2babd0877",
-    "scripts/dalton/realrun/g4_autonomy.py": "89c7b6deb19e31deaaf9b294f4e2b2db92c8a4e6360bd3853ee9e4aadcbc387e",
-    "scripts/dalton/realrun/g5_broker_and_antigravity.py": "d49f0ffb91a60315931e265067170568e32ebda36b4fa0a686b8d1363cf38d44",
-}
+# All g1..g7 scripts must have 0 `from src` imports and 0 `INSERT INTO` statements.
+_PRE_J3_LEGACY_SCRIPT_SHAS: dict[str, str] = {}
 
 
 def _read_bridge_token() -> str:

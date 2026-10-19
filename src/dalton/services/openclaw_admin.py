@@ -7,7 +7,6 @@ import logging
 import subprocess
 import time
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 

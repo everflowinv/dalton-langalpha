@@ -26,8 +26,6 @@ from scripts.dalton.realrun.journal_dump import (
 from scripts.dalton.realrun.render_report_tables import (
     GENERATED_END_MARKER,
     GENERATED_START_MARKER,
-    compare_legacy_report,
-    render_evidence_table_block,
     update_markdown_generated_block,
     verify_generated_evidence_block,
 )
