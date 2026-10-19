@@ -294,7 +294,7 @@ def _evaluate_gold_standard(
         key = (rep, line, raw)
         gold_keys.add(key)
 
-        is_fin = bool(g.get("is_financial_figure", True))
+        is_fin = bool(g.get("is_verification_target", True))
         has_src = bool(g.get("has_source", False))
         exp_src = str(g.get("expected_source_id") or "")
 

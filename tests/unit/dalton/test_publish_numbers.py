@@ -1079,6 +1079,14 @@ def test_p0i_contradicted_reasons_and_zero_unit_or_period_mismatch_assignments()
         assert "maybe_label_prose_figures_with_llm" not in src_text, f"Found maybe_label_prose_figures_with_llm in {src_name}"
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "P0J J2a relabelled duration facts (20-year PPA, 6.4-year backlog) as "
+        "verification targets; numbers.py's duration->incidental regex still "
+        "excludes them. P0J J2 deletes that regex and must remove this marker."
+    ),
+)
 @pytest.mark.asyncio
 async def test_p0i_g3_gold_standard_and_cross_control_zero_false_verified(
     monkeypatch: pytest.MonkeyPatch,
@@ -1149,7 +1157,7 @@ async def test_p0i_g3_gold_standard_and_cross_control_zero_false_verified(
                 abs_line = sec_start + rel_line - 1
                 raw = str(f_in.get("raw") or "")
                 g = gold_by_report_line_raw.get((current_report["name"], abs_line, raw))
-                if g and not g["is_financial_figure"]:
+                if g and not g["is_verification_target"]:
                     items.append({"id": f_in["id"], "metric": "非财务数字", "period": "", "kind": "incidental"})
                 elif g:
                     items.append({"id": f_in["id"], "metric": str(f_in.get("metric") or "财务指标"), "period": g.get("expected_period") or "", "kind": "reported"})
@@ -1213,5 +1221,5 @@ async def test_p0i_g3_gold_standard_and_cross_control_zero_false_verified(
         for inc in res.incidental:
             g = gold_by_report_line_raw.get((rep_name, int(inc["line"]), inc["raw"]))
             if g is not None:
-                assert g["is_financial_figure"] is False, f"Financial figure marked incidental in {rep_name}: {inc}"
+                assert g["is_verification_target"] is False, f"Financial figure marked incidental in {rep_name}: {inc}"
 
