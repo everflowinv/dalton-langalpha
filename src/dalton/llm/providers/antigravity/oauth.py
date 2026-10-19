@@ -53,7 +53,6 @@ ANTIGRAVITY_SCOPES = " ".join(
 )
 
 _CALLBACK_TIMEOUT_S = 600  # listener lives 10 minutes, matching Redis TTL
-_LAST_INITIATED_AT: dict[str, datetime] = {}
 
 
 async def _record_provider_event_safe(user_id: str | None, kind: str, detail: dict) -> None:
@@ -69,6 +68,42 @@ async def _record_provider_event_safe(user_id: str | None, kind: str, detail: di
         )
     except Exception as exc:
         logger.debug("[antigravity_oauth] record_provider_event skipped: %s", type(exc).__name__)
+
+
+async def _get_latest_oauth_login_start(user_id: str) -> datetime | None:
+    """Read the most recent `oauth_login_start` timestamp for `user_id` from `dalton_provider_events` (P0I §3 P3)."""
+    try:
+        from src.dalton.database.provider_events import list_recent_provider_events
+
+        rows = await list_recent_provider_events(
+            ANTIGRAVITY_PROVIDER,
+            user_id=user_id,
+            kinds=("oauth_login_start",),
+            limit=5,
+        )
+        for row in rows:
+            if row.get("user_id") not in (user_id, None):
+                continue
+            detail = row.get("detail")
+            if isinstance(detail, dict) and detail.get("initiated_at"):
+                raw_ts = str(detail["initiated_at"]).strip()
+                if raw_ts.endswith("Z"):
+                    raw_ts = raw_ts[:-1] + "+00:00"
+                dt = datetime.fromisoformat(raw_ts)
+                return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+            created_at = row.get("created_at")
+            if isinstance(created_at, datetime):
+                return (
+                    created_at
+                    if created_at.tzinfo
+                    else created_at.replace(tzinfo=timezone.utc)
+                )
+    except Exception as exc:
+        logger.debug(
+            "[antigravity_oauth] _get_latest_oauth_login_start skipped: %s",
+            type(exc).__name__,
+        )
+    return None
 
 
 def _generate_pkce_pair() -> tuple[str, str]:
@@ -200,8 +235,12 @@ async def start_login(user_id: str) -> dict:
     verifier, challenge = _generate_pkce_pair()
     state = secrets.token_urlsafe(24)
     now_dt = datetime.now(timezone.utc)
-    _LAST_INITIATED_AT[user_id] = now_dt
     initiated_at = now_dt.isoformat()
+    await _record_provider_event_safe(
+        user_id,
+        "oauth_login_start",
+        {"initiated_at": initiated_at},
+    )
 
     server_future = asyncio.get_running_loop().create_future()
 
@@ -420,7 +459,7 @@ async def check_login_complete(user_id: str) -> bool:
     tokens = await get_oauth_tokens(user_id, ANTIGRAVITY_PROVIDER)
     if not tokens or not tokens.get("access_token"):
         return False
-    initiated_at = _LAST_INITIATED_AT.get(user_id)
+    initiated_at = await _get_latest_oauth_login_start(user_id)
     updated_at = tokens.get("updated_at")
     if initiated_at is not None and isinstance(updated_at, datetime):
         upd = updated_at if updated_at.tzinfo else updated_at.replace(tzinfo=timezone.utc)

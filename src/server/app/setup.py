@@ -660,6 +660,12 @@ async def lifespan(app: FastAPI):
 
         await verify_credit_gate_wiring()
     except Exception as e:
+        # DALTON-HOOK(budget-gate): fail-fast on RolePolicyError or missing Dalton migration when DALTON_BUDGET_GATE=1
+        from src.dalton.llm.role_policy import RolePolicyError
+        from src.dalton.settings import is_dalton_budget_gate_enabled
+
+        if isinstance(e, RolePolicyError) or is_dalton_budget_gate_enabled():
+            raise
         logger.warning(f"Credit gate wiring check failed: {e}")
 
     from src.server.auth.jwt_bearer import warm_jwks

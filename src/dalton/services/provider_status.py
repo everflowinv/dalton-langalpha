@@ -219,8 +219,12 @@ async def get_providers_status(user_id: str = "local-dev-user") -> dict[str, Any
             for r in rows:
                 if isinstance(r, dict) and r.get("provider"):
                     byok_providers.add(str(r["provider"]))
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug(
+            "[DaltonProviderStatus] get_user_api_keys failed for user_id=%s: %s",
+            user_id,
+            type(exc).__name__,
+        )
 
     # Candidate providers: core native providers + any provider referenced by roles or configured
     candidate_providers: list[str] = [

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from decimal import Decimal
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, create_autospec, patch
 
 import pytest
 from fastapi import HTTPException
@@ -24,6 +24,7 @@ from src.dalton.llm.complete import (
 )
 from src.dalton.llm.openclaw_catalog import build_overlay
 from src.dalton.llm.role_policy import check_roles, family_of
+from src.server.services.llm.service import LLMService
 
 
 def _make_mock_conn() -> MagicMock:
@@ -199,8 +200,11 @@ async def test_dalton_complete_cache_hit_and_budget_rejection():
     1. Cached `done` entry replays without calling LLM or charging cash_usd.
     2. Cash model call when daily budget is exhausted returns `status='budget_exhausted'` without calling LLM.
     3. `indeterminate` entry does not auto-resend when `resend_indeterminate=False`."""
-    mock_llm = MagicMock()
-    mock_llm.complete = AsyncMock(return_value=({"verdict": "approve"}, {"input_tokens": 100, "output_tokens": 50}))
+    mock_llm = create_autospec(LLMService, instance=True)
+    mock_llm.complete.return_value = (
+        {"verdict": "approve"},
+        {"input_tokens": 100, "output_tokens": 50},
+    )
 
     # 1. Cache hit (`done`)
     with patch(
@@ -815,9 +819,10 @@ async def test_b3_scoped_task_cap_and_post_call_indeterminate():
         assert "$5.00" in (msg or "")
 
     # Post-call serialization exception -> state="indeterminate" (not "failed")
-    mock_llm = MagicMock()
-    mock_llm.complete = AsyncMock(
-        return_value=({"ok": True}, {"input_tokens": 100, "output_tokens": 50})
+    mock_llm = create_autospec(LLMService, instance=True)
+    mock_llm.complete.return_value = (
+        {"ok": True},
+        {"input_tokens": 100, "output_tokens": 50},
     )
     mock_fail = create_autospec(complete_mod.complete_journal_failed, return_value=None)
     with (
@@ -867,4 +872,208 @@ async def test_b3_scoped_task_cap_and_post_call_indeterminate():
         assert res.error_kind == "post_call_error"
         mock_fail.assert_awaited_once()
         assert mock_fail.await_args.kwargs["state"] == "indeterminate"
+
+
+@pytest.mark.asyncio
+async def test_p0i_i3_startup_fail_fast_and_journal_pruning_and_oauth_events(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """P0I §3 P1, P2, P3, P4, P6 verification."""
+    from datetime import datetime, timedelta, timezone
+
+    from src.dalton.autonomy.probes import director as director_mod
+    from src.dalton.budget import gate as gate_mod
+    from src.dalton.database import llm_journal as journal_mod
+    from src.dalton.database import provider_events as pe_mod
+    from src.dalton.llm import complete as complete_mod
+    from src.dalton.llm.providers.antigravity import oauth as ag_oauth
+    from src.dalton.llm.role_policy import RolePolicyError
+    from src.dalton.services import provider_status as ps_mod
+    from src.server.services import credit_gate_port as cgp_mod
+
+    # P1a: RolePolicyError propagates out of verify_local_wiring / verify_credit_gate_wiring
+    with (
+        patch.object(
+            gate_mod,
+            "local_gate_enabled",
+            return_value=True,
+        ),
+        patch(
+            "src.dalton.llm.role_policy.enforce_role_policy_on_startup",
+            side_effect=RolePolicyError("assist role configured with contributor-oauth"),
+        ),
+    ):
+        with pytest.raises(RolePolicyError, match="contributor-oauth"):
+            await cgp_mod.verify_credit_gate_wiring()
+
+    # P1b: Missing Dalton migration when DALTON_BUDGET_GATE=1 raises instead of swallowing
+    mock_conn = _make_mock_conn()
+    mock_cur = MagicMock()
+    mock_cur.__aenter__ = AsyncMock(return_value=mock_cur)
+    mock_cur.__aexit__ = AsyncMock(return_value=None)
+    mock_cur.execute = AsyncMock(side_effect=RuntimeError("relation alembic_version_dalton does not exist"))
+    mock_conn.cursor = MagicMock(return_value=mock_cur)
+
+    with (
+        patch("src.dalton.llm.role_policy.enforce_role_policy_on_startup", return_value=[]),
+        patch.object(gate_mod, "is_dalton_budget_gate_enabled", return_value=True),
+        patch.object(gate_mod, "get_db_connection", return_value=mock_conn),
+    ):
+        with pytest.raises(RuntimeError, match="alembic_version_dalton"):
+            await gate_mod.verify_local_wiring()
+
+    # P2: Daily director preflight calls prune_expired_journal_responses(retention_days=30)
+    mock_prune = create_autospec(
+        journal_mod.prune_expired_journal_responses, return_value=4
+    )
+    mock_dir_conn = _make_mock_conn()
+    mock_dir_cur = MagicMock()
+    mock_dir_cur.__aenter__ = AsyncMock(return_value=mock_dir_cur)
+    mock_dir_cur.__aexit__ = AsyncMock(return_value=None)
+    mock_dir_cur.execute = AsyncMock()
+    mock_dir_cur.fetchall = AsyncMock(return_value=[])
+    mock_dir_cur.fetchone = AsyncMock(return_value={"cnt": 0})
+    mock_dir_conn.cursor = MagicMock(return_value=mock_dir_cur)
+
+    with (
+        patch(
+            "src.dalton.database.publications.expire_stale_publications",
+            new=AsyncMock(return_value=[]),
+        ),
+        patch.object(
+            journal_mod,
+            "prune_expired_journal_responses",
+            new=mock_prune,
+        ),
+        patch(
+            "src.server.database.pool.get_db_connection",
+            return_value=mock_dir_conn,
+        ),
+    ):
+        await director_mod.probe_director(
+            kind="director_daily",
+            watch_state={},
+            persist=True,
+        )
+        mock_prune.assert_awaited_once_with(retention_days=30)
+
+    # P3: Antigravity OAuth does not have _LAST_INITIATED_AT dict and reads oauth_login_start from DB
+    assert not hasattr(ag_oauth, "_LAST_INITIATED_AT")
+    t0 = datetime(2026, 10, 19, 5, 0, 0, tzinfo=timezone.utc)
+    fake_cache = MagicMock()
+    fake_cache.enabled = False
+    fake_cache.client = None
+    with (
+        patch("src.utils.cache.redis_cache.get_cache_client", return_value=fake_cache),
+        patch.object(
+            ag_oauth,
+            "get_oauth_tokens",
+            new=create_autospec(
+                ag_oauth.get_oauth_tokens,
+                return_value={
+                    "access_token": "tok-old",
+                    "updated_at": t0 - timedelta(minutes=5),
+                },
+            ),
+        ),
+        patch.object(
+            pe_mod,
+            "list_recent_provider_events",
+            new=create_autospec(
+                pe_mod.list_recent_provider_events,
+                return_value=[
+                    {
+                        "user_id": "u-oauth",
+                        "kind": "oauth_login_start",
+                        "detail": {"initiated_at": t0.isoformat()},
+                        "created_at": t0,
+                    }
+                ],
+            ),
+        ),
+    ):
+        # Token updated_at is older than oauth_login_start -> False
+        assert await ag_oauth.check_login_complete("u-oauth") is False
+
+    # P4: provider_status logs debug when get_user_api_keys raises
+    with (
+        caplog.at_level("DEBUG"),
+        patch(
+            "src.server.database.api_keys.get_user_api_keys",
+            side_effect=RuntimeError("db down"),
+        ),
+        patch.object(
+            ps_mod,
+            "_fetch_usage_stats_24h",
+            new=create_autospec(ps_mod._fetch_usage_stats_24h, return_value={}),
+        ),
+        patch.object(
+            ps_mod,
+            "list_recent_provider_events",
+            new=create_autospec(ps_mod.list_recent_provider_events, return_value=[]),
+        ),
+        patch.object(
+            ps_mod,
+            "count_provider_errors_24h",
+            new=create_autospec(ps_mod.count_provider_errors_24h, return_value={}),
+        ),
+    ):
+        await ps_mod.get_providers_status(user_id="u-test")
+        assert any("get_user_api_keys failed" in rec.message for rec in caplog.records)
+
+    # P6: complete_journal_failed raising DB error logs both exceptions and still returns/raises via _finish
+    mock_llm_fail = create_autospec(LLMService, instance=True)
+    mock_llm_fail.complete.side_effect = TimeoutError("upstream llm timed out")
+    mock_journal_fail_boom = create_autospec(
+        complete_mod.complete_journal_failed,
+        side_effect=RuntimeError("db connection lost during journal fail write"),
+    )
+    with (
+        caplog.at_level("ERROR"),
+        patch.object(
+            complete_mod,
+            "inspect_journal_state",
+            new=create_autospec(
+                complete_mod.inspect_journal_state, return_value=("proceed", None)
+            ),
+        ),
+        patch.object(
+            complete_mod,
+            "_check_cash_budget_admission",
+            new=create_autospec(
+                complete_mod._check_cash_budget_admission,
+                return_value=(True, None, None),
+            ),
+        ),
+        patch.object(
+            complete_mod,
+            "claim_journal_invocation",
+            new=create_autospec(
+                complete_mod.claim_journal_invocation,
+                return_value=("claimed", {"attempt": 1}),
+            ),
+        ),
+        patch.object(
+            complete_mod, "complete_journal_failed", new=mock_journal_fail_boom
+        ),
+        patch.object(
+            complete_mod,
+            "record_provider_event",
+            new=create_autospec(complete_mod.record_provider_event, return_value=None),
+        ),
+    ):
+        with pytest.raises(JournalIndeterminate, match="upstream llm timed out"):
+            await dalton_complete(
+                mock_llm_fail,
+                user_id="u1",
+                user_prompt="ping",
+                model="grok-4.7",
+                raise_on_error=True,
+            )
+        assert any(
+            "complete_journal_failed failed" in rec.message
+            and "upstream llm timed out" in rec.message
+            for rec in caplog.records
+        )
+
 

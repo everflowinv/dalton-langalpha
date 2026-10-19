@@ -124,6 +124,18 @@ async def _check_db_actionable_work(
         except Exception as e:
             logger.warning("[DALTON_DIRECTOR_PROBE] expire_stale_publications failed: %s", e)
 
+        try:
+            from src.dalton.database.llm_journal import prune_expired_journal_responses
+
+            pruned_count = await prune_expired_journal_responses(retention_days=30)
+            if pruned_count:
+                logger.info(
+                    "[DALTON_DIRECTOR_PROBE] pruned %d expired journal response payloads",
+                    pruned_count,
+                )
+        except Exception as e:
+            logger.warning("[DALTON_DIRECTOR_PROBE] prune_expired_journal_responses failed: %s", e)
+
         async with get_db_connection() as conn:
             async with conn.cursor(row_factory=dict_row) as cur:
                 await cur.execute(

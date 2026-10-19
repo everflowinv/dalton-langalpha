@@ -717,14 +717,24 @@ async def dalton_complete(
         else:
             target_state, error_kind = _classify_exception(exc)
         safe_msg = sanitize_error_text(exc, max_len=240)
-        await complete_journal_failed(
-            inv_id,
-            error_kind=error_kind,
-            error_text=safe_msg,
-            state=target_state,
-            cash_usd=cash_dec,
-            notional_usd=notional_dec,
-        )
+        try:
+            await complete_journal_failed(
+                inv_id,
+                error_kind=error_kind,
+                error_text=safe_msg,
+                state=target_state,
+                cash_usd=cash_dec,
+                notional_usd=notional_dec,
+            )
+        except Exception as journal_exc:
+            logger.error(
+                "[DaltonComplete] complete_journal_failed failed for %s (original %s: %s): %s",
+                inv_id,
+                error_kind,
+                safe_msg,
+                journal_exc,
+                exc_info=True,
+            )
         if provider:
             await record_provider_event(
                 provider,
