@@ -105,12 +105,7 @@ async def enforce_local_admission(user_id: str, byok: bool = False) -> None:
     available = cap_usd - spent_usd
     configured = bool(summary.get("configured", True))
 
-    effective_floor = (
-        floor_usd
-        if (cap_usd <= Decimal("0") or cap_usd > floor_usd)
-        else Decimal("0.000001")
-    )
-    if not configured or available <= Decimal("0") or available < effective_floor:
+    if not configured or available <= Decimal("0") or available < floor_usd:
         settled_total = decs["settled_usd"] + decs["unreserved_usage_usd"]
         open_total = decs["open_reserved_usd"] + decs["expired_conservative_usd"]
         msg = format_daily_budget_exhausted_message(

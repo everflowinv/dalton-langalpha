@@ -190,16 +190,7 @@ async def explain_model_availability(
         for prov_key in _OAUTH_PROVIDER_TOKEN_KEYS:
             try:
                 st = await get_oauth_status(user_id, prov_key)
-                connected = bool(st and st.get("connected"))
-                if (
-                    not connected
-                    and user_id != "local-dev-user"
-                    and str(user_id).startswith(("realrun-", "test-user-"))
-                    and not str(user_id).endswith("-paste")
-                ):
-                    st_owner = await get_oauth_status("local-dev-user", prov_key)
-                    connected = bool(st_owner and st_owner.get("connected"))
-                oauth_connected[prov_key] = connected
+                oauth_connected[prov_key] = bool(st and st.get("connected"))
             except Exception:
                 oauth_connected[prov_key] = False
     except Exception:

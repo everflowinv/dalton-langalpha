@@ -4,7 +4,8 @@
 Verifies against the live HTTP backend (`http://127.0.0.1:8000`) for a fresh test user:
 1. Scenario ② (Settings BYOK cash key spend counted):
    - Configures `PUT /api/v1/users/me/api-keys` with the user's `deepseek` cash API key and `PUT /api/v1/dalton/budget`
-     with `daily_cap_usd = --cap-usd` (default `$0.02`).
+     with `daily_cap_usd = --cap-usd` (default `$0.30`; must stay above `budget.admission_floor_usd` — default $0.25 —
+     so the run starts through the normal admission check, and below P0I's $0.50 total-spend cap).
    - Triggers `POST /api/v1/dalton/providers/deepseek/probe` and verifies `GET /api/v1/dalton/budget/today` reflects
      `spent_usd > 0`, `journal_cash_usd > 0`, and `by_provider.deepseek.cash_usd > 0`.
 2. Scenario ③ (Second review call hits cache):
@@ -316,7 +317,7 @@ def _capture_rejection_banner_screenshot(
 def main() -> int:
     parser = argparse.ArgumentParser(description="G1 Real-Run Evidence Generator (P0I §7 G1)")
     parser.add_argument("--backend", default="http://127.0.0.1:8000")
-    parser.add_argument("--cap-usd", type=float, default=0.02)
+    parser.add_argument("--cap-usd", type=float, default=0.30)
     parser.add_argument("--date", default="20261019")
     args = parser.parse_args()
 
