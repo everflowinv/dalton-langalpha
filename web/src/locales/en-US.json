@@ -5429,7 +5429,8 @@
       "dailyCapLabel": "Daily USD Cap",
       "defaultTaskCapLabel": "Default Task Cap (optional)",
       "timezoneLabel": "Reset Timezone",
-      "workspaceCapsTitle": "Per-Workspace Task Cap Overrides"
+      "workspaceCapsTitle": "Per-Workspace Task Cap Overrides",
+      "byokCashNote": "Note: Cash-billed BYOK keys configured in Settings also count toward the local daily USD cash cap (L24)"
     },
     "openclaw": {
       "title": "OpenClaw Models (via Dalton Broker)",
@@ -5461,6 +5462,7 @@
     },
     "publish": {
       "cardTitle": "Official Research Publication Approval (PM Final Review)",
+      "labelingIncompleteWarning": "Figure labeling incomplete; colloquial figures and metric labels may not be fully verified",
       "requestIdLabel": "Request ID",
       "titleLabel": "Report Title",
       "kindLabel": "Report Type",
