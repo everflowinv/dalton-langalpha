@@ -76,6 +76,127 @@ describe('PublishApprovalCard', () => {
     expect(onApprove).toHaveBeenCalledTimes(1);
   });
 
+  it('renders P0I additions: labeling coverage, verified breakdown, collapsible incidental list, side-by-side LLM judge draft vs quote, and unverified candidates', async () => {
+    await i18n.changeLanguage('zh-CN');
+
+    const state: ToolApprovalState = {
+      status: 'pending',
+      toolName: 'mcp__dalton-publish__publish_report',
+      server: 'dalton-publish',
+      tool: 'publish_report',
+      actionIndex: 0,
+      actionCount: 1,
+      args: {
+        request_id: 'req-p0i9876543210',
+        ticker: 'GOOGL',
+        title: 'Alphabet 2Q26 深度复盘',
+        kind: 'earnings_review',
+        draft_path: 'drafts/googl-2q26.md',
+        published_path: 'published/2026-10-19-googl-2q26.md',
+        figure_summary: {
+          verified: 45,
+          contradicted: 0,
+          unverified: 1,
+          uncertain: 0,
+          exempt: 2,
+          incidental: 2,
+          labeling_incomplete: false,
+          labeling: {
+            total: 50,
+            labeled: 50,
+            batches: 2,
+            failed_batches: 0,
+            incidental_excluded: 2,
+          },
+          verified_by_counts: {
+            footnote: 30,
+            llm_judge: 10,
+            derived: 5,
+          },
+          incidental_items: [
+            {
+              id: 'F-003',
+              raw: '600',
+              line: 5,
+              sentence: 'X 帖子获得 600 赞。',
+            },
+            {
+              id: 'F-004',
+              raw: '500',
+              line: 7,
+              sentence: '接口曾短暂返回 HTTP 500。',
+            },
+          ],
+          llm_verified_items: [
+            {
+              id: 'F-012',
+              raw: '968.3 亿美元',
+              line: 14,
+              metric: '合并总收入',
+              period: '2Q26',
+              sentence: '2Q26 Alphabet 合并总收入达 968.3 亿美元。',
+              matched_source: 'evidence:E-GOOGL-001',
+              quote_metric_raw: 'Consolidated revenues',
+              quote: 'Consolidated revenues in Q2 2026 were $96,830 million ($96.83 billion).',
+            },
+          ],
+          unverified_items: [
+            {
+              id: 'F-049',
+              raw: '390 亿美元',
+              line: 88,
+              metric: '云计算收入',
+              period: '2Q26',
+              sentence: '2Q26 云计算收入约 390 亿美元。',
+              hint: '未核实（unverified）',
+              candidates: [
+                {
+                  source_id: 'E-GOOGL-002',
+                  value: 142.7,
+                  unit: 'USD_100mn',
+                  text: 'Google Cloud revenues were $14.27 billion in Q2 2026.',
+                },
+              ],
+            },
+          ],
+        },
+      },
+    };
+
+    render(<PublishApprovalCard data={state} />);
+
+    // 1. Labeling coverage
+    expect(screen.getByTestId('publish-labeling-coverage')).toHaveTextContent(
+      '已标注 50 / 50 个数字'
+    );
+
+    // 2. Verified breakdown (footnote / LLM judge / derived)
+    expect(screen.getByTestId('publish-verified-breakdown')).toHaveTextContent(
+      '脚注 30 · LLM 判断 10 · 推算 5'
+    );
+
+    // 3. Incidental collapsible list (collapsed initially, expands on click)
+    expect(screen.getByTestId('publish-incidental-section')).toBeInTheDocument();
+    expect(screen.queryByTestId('publish-incidental-list')).toBeNull();
+    fireEvent.click(screen.getByTestId('publish-incidental-toggle'));
+    expect(screen.getByTestId('publish-incidental-list')).toHaveTextContent('X 帖子获得 600 赞');
+    expect(screen.getByTestId('publish-incidental-list')).toHaveTextContent('HTTP 500');
+
+    // 4. Side-by-side LLM judge draft sentence vs quote
+    const llmRow = screen.getByTestId('publish-llm-verified-row');
+    expect(llmRow).toHaveTextContent('2Q26 Alphabet 合并总收入达 968.3 亿美元。');
+    expect(llmRow).toHaveTextContent('Consolidated revenues in Q2 2026 were $96,830 million');
+    expect(llmRow).toHaveTextContent('Consolidated revenues');
+
+    // 5. Unverified items with candidates
+    const unvSection = screen.getByTestId('publish-unverified-items');
+    expect(unvSection).toHaveTextContent('390 亿美元');
+    expect(screen.getByTestId('publish-item-candidates')).toHaveTextContent('E-GOOGL-002');
+    expect(screen.getByTestId('publish-item-candidates')).toHaveTextContent(
+      'Google Cloud revenues were $14.27 billion in Q2 2026.'
+    );
+  });
+
   it('supports legacy Chinese fallback keys when figure_summary object is omitted', async () => {
     await i18n.changeLanguage('zh-CN');
     const state: ToolApprovalState = {

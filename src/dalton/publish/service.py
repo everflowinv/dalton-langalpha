@@ -19,7 +19,6 @@ from src.dalton.knowledge.service import apply_update
 from src.dalton.publish.audit import (
     AuditResult,
     aaudit_draft,
-    audit_draft,
     render_annotated_draft,
     render_audit_md,
 )
@@ -99,11 +98,11 @@ async def run_check_draft(
     thesis_doc: dict[str, Any] | None = None,
     models_doc: dict[str, Any] | None = None,
     provenance_records: dict[str, dict[str, Any]] | None = None,
-    use_llm_judge: bool = False,
+    use_llm_judge: bool = True,
     user_id: str = "local-dev-user",
-    llm_service: Any = None,
+    thread_id: str | None = None,
 ) -> dict[str, Any]:
-    """Execute ``check_draft``: audit figures, write ``.audit.md`` and ``.annotated.md``, never block (PK.9)."""
+    """Execute ``check_draft``: audit figures via ``aaudit_draft``, write ``.audit.md`` and ``.annotated.md``, never block (PK.9 / P0I §1.7)."""
     if backend is None:
         return {"ok": False, "message": "ERROR: filesystem backend is unavailable."}
 
@@ -127,26 +126,17 @@ async def run_check_draft(
     if provenance_records is None:
         provenance_records = await _load_workspace_provenance(workspace_id)
 
-    if use_llm_judge:
-        audit = await aaudit_draft(
-            draft_text,
-            thesis_doc=thesis_doc,
-            models_doc=models_doc,
-            provenance_records=provenance_records,
-            facts_markdown=facts_text,
-            use_llm_judge=True,
-            user_id=user_id,
-            llm_service=llm_service,
-            workspace_id=workspace_id,
-        )
-    else:
-        audit = audit_draft(
-            draft_text,
-            thesis_doc=thesis_doc,
-            models_doc=models_doc,
-            provenance_records=provenance_records,
-            facts_markdown=facts_text,
-        )
+    audit = await aaudit_draft(
+        draft_text,
+        thesis_doc=thesis_doc,
+        models_doc=models_doc,
+        provenance_records=provenance_records,
+        facts_markdown=facts_text,
+        use_llm_judge=use_llm_judge,
+        user_id=user_id,
+        workspace_id=workspace_id,
+        thread_id=thread_id,
+    )
 
     audit_path, annotated_path = _derive_sidecar_paths(draft_path)
     audit_md = render_audit_md(audit, draft_path=draft_path)
@@ -224,7 +214,6 @@ async def run_publish(
     backend: Any,
     author_model: str | None = None,
     origin_type: str | None = None,
-    llm_service: Any = None,
     interrupt_fn: Any = None,
 ) -> dict[str, Any]:
     """Execute the full PK.11 re-entrant publication governance state machine."""
@@ -367,7 +356,6 @@ async def run_publish(
             facts_markdown=facts_text,
             use_llm_judge=True,
             user_id=user_id,
-            llm_service=llm_service,
             workspace_id=workspace_id,
             thread_id=thread_id,
         )
@@ -420,7 +408,6 @@ async def run_publish(
                 debate_md=debate_md,
                 management_md=mgmt_md,
             ),
-            llm_service=llm_service,
             workspace_id=workspace_id,
             thread_id=thread_id,
         )
@@ -526,7 +513,18 @@ async def run_publish(
             audit_info.get("uncertain", len(audit_info.get("uncertain_items") or []))
         )
         exempt_cnt = int(audit_info.get("exempt", 0))
+        incidental_cnt = int(
+            audit_info.get("incidental", len(audit_info.get("incidental_items") or []))
+        )
         uncertain_items = list(audit_info.get("uncertain_items") or [])
+        unverified_items = list(audit_info.get("unverified_items") or [])
+        llm_verified_items = list(audit_info.get("llm_verified_items") or [])
+        incidental_items = list(audit_info.get("incidental_items") or [])
+        labeling = dict(audit_info.get("labeling") or {})
+        verified_by_counts = dict(
+            audit_info.get("verified_by_counts")
+            or {"footnote": 0, "llm_judge": 0, "derived": 0}
+        )
 
         labeling_incomplete = bool(audit_info.get("labeling_incomplete", False))
 
@@ -536,8 +534,14 @@ async def run_publish(
             "unverified": unverified_cnt,
             "uncertain": uncertain_cnt,
             "exempt": exempt_cnt,
+            "incidental": incidental_cnt,
             "labeling_incomplete": labeling_incomplete,
+            "labeling": labeling,
+            "verified_by_counts": verified_by_counts,
             "uncertain_items": uncertain_items,
+            "unverified_items": unverified_items,
+            "llm_verified_items": llm_verified_items,
+            "incidental_items": incidental_items,
         }
         reviewer_payload = {
             "model": review_info.get("model", "reviewer"),
@@ -582,6 +586,9 @@ async def run_publish(
                         "figure_summary": figure_summary,
                         "labeling_incomplete": labeling_incomplete,
                         "uncertain_items": uncertain_items,
+                        "unverified_items": unverified_items,
+                        "llm_verified_items": llm_verified_items,
+                        "incidental_items": incidental_items,
                         "reviewer": reviewer_payload,
                         "updates_thesis": bool(updates_thesis),
                         "thesis_version": thesis_ver_str,

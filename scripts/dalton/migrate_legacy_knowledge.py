@@ -738,8 +738,8 @@ def build_knowledge_documents(bundle: dict[str, Any]) -> tuple[dict[str, dict[st
                     "at": now_iso,
                     "period": meta["current_period"],
                     "source": {
-                        "type": src_type,
-                        "identity": f"OpenClaw {ticker} thesis.md {d_id} L{b_line}",
+                        "type": "legacy_thesis",
+                        "identity": f"[{src_type}] OpenClaw {ticker} thesis.md {d_id} L{b_line}",
                         "tier": src_tier,
                         "ref": legacy_md_ref,
                     },
@@ -901,8 +901,8 @@ def build_knowledge_documents(bundle: dict[str, Any]) -> tuple[dict[str, dict[st
                         "at": now_iso,
                         "period": meta["current_period"],
                         "source": {
-                            "type": "broker_report",
-                            "identity": org_label[:120],
+                            "type": "legacy_thesis",
+                            "identity": f"[broker_report] {org_label}"[:120],
                             "tier": 3,
                             "ref": legacy_md_ref,
                         },
@@ -1588,6 +1588,22 @@ def remediate_doc_payload(doc_key: str, doc: dict[str, Any]) -> tuple[dict[str, 
                 val["due"] = None
                 val["note"] = uncomputed_note
                 changed = True
+    elif doc_key == "thesis":
+        for ev in updated.get("evidence") or []:
+            if not isinstance(ev, dict):
+                continue
+            src = ev.get("source")
+            if not isinstance(src, dict):
+                continue
+            ref = src.get("ref")
+            ref_path = str(ref.get("path") or "") if isinstance(ref, dict) else ""
+            old_type = str(src.get("type") or "")
+            if ref_path.startswith("sources/legacy/") and old_type != "legacy_thesis":
+                ident = str(src.get("identity") or "")
+                if old_type and not ident.startswith(f"[{old_type}]"):
+                    src["identity"] = f"[{old_type}] {ident}".strip()[:120]
+                src["type"] = "legacy_thesis"
+                changed = True
 
     return updated, changed
 
@@ -1598,25 +1614,30 @@ async def remediate_migrated_workspaces(
     workspace_ids: list[str],
     backend_by_workspace: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """Append a new knowledge version ('移除迁移脚本编造的数值') for any workspace with fabricated defaults."""
+    """Append a new knowledge version for any workspace with fabricated defaults or legacy_thesis evidence."""
     from src.dalton.database import knowledge as db_knowledge
     from src.dalton.knowledge import service as knowledge_service
 
     results: list[dict[str, Any]] = []
     for ws_id in workspace_ids:
-        for doc_key in ("drivers", "management", "company", "agenda"):
+        for doc_key in ("thesis", "drivers", "management", "company", "agenda"):
             latest = await db_knowledge.latest_version(ws_id, doc_key)
             if not latest or not isinstance(latest.get("content"), dict):
                 continue
             cleaned, changed = remediate_doc_payload(doc_key, latest["content"])
             if not changed:
                 continue
+            reason = (
+                "迁移的旧认知不作为核实依据"
+                if doc_key == "thesis"
+                else "移除迁移脚本编造的数值"
+            )
             res = await knowledge_service.apply_update(
                 user_id=user_id,
                 workspace_id=ws_id,
                 doc_key=doc_key,
                 ops=[{"op": "create", "value": cleaned}],
-                reason="移除迁移脚本编造的数值",
+                reason=reason,
                 base_version=latest["version_no"],
                 source="tool",
                 backend=(backend_by_workspace or {}).get(ws_id),

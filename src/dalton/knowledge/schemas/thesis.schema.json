@@ -77,7 +77,7 @@
         "at": {"$ref": "common#/$defs/isoTime"},
         "period": {"$ref": "common#/$defs/period"},
         "source": {"type": "object", "additionalProperties": false,
-          "properties": {"type": {"enum": ["filing","company_release","broker_report","official_data","expert","news","model","internal_note"]},
+          "properties": {"type": {"enum": ["filing","company_release","broker_report","official_data","expert","news","model","internal_note","legacy_thesis"]},
                          "identity": {"type": "string", "description": "研报署名机构/作者、专家身份、文件名"},
                          "tier": {"$ref": "common#/$defs/sourceTier"},
                          "ref": {"$ref": "common#/$defs/evidenceRef"},

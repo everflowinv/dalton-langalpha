@@ -1,0 +1,167 @@
+{
+  "evidence": [
+    {
+      "id": "EV-AMZN-001",
+      "at": "2026-07-31T20:10:00Z",
+      "period": "2Q26",
+      "source": {
+        "type": "filing",
+        "identity": "Amazon.com, Inc. Form 10-Q for the Quarterly Period Ended June 30, 2026",
+        "tier": 1,
+        "ref": {
+          "kind": "filing",
+          "form": "10-Q",
+          "accession": "0001018724-26-000026",
+          "period": "2Q26",
+          "section": "Note 10 - Segment Information & Remaining Performance Obligations (amzn-20260630.htm)"
+        }
+      },
+      "fact": "2Q26（截至 2026-06-30 的三个月）AWS 分部收入 422.3 亿美元，同比增长 +36.7%，较上季环比增量 46 亿美元，按当季折算年化运行率约 1,690 亿美元；截至 2Q26 末 AWS 剩余履约义务（backlog）为 4,960 亿美元，加权平均剩余合同期限 6.4 年。3Q25 AWS 收入基数为 330.1 亿美元，4Q25 AWS 收入为 355.7 亿美元。",
+      "figures": [
+        {"metric": "AWS 收入", "value": 42.23, "unit": "USD_bn", "period": "2Q26", "label": "reported"},
+        {"metric": "AWS 收入同比增速", "value": 36.7, "unit": "pct", "period": "2Q26", "label": "reported"},
+        {"metric": "AWS 环比增量", "value": 4.6, "unit": "USD_bn", "period": "2Q26", "label": "reported"},
+        {"metric": "AWS 年化收入", "value": 169.0, "unit": "USD_bn", "period": "2Q26", "label": "reported"},
+        {"metric": "AWS backlog", "value": 496.0, "unit": "USD_bn", "period": "2Q26", "label": "reported"},
+        {"metric": "AWS 收入基数", "value": 33.01, "unit": "USD_bn", "period": "3Q25", "label": "reported"},
+        {"metric": "AWS 收入基数", "value": 35.57, "unit": "USD_bn", "period": "4Q25", "label": "reported"}
+      ],
+      "pillar_ids": ["P1"],
+      "signal": "confirming",
+      "quality": "high"
+    },
+    {
+      "id": "EV-AMZN-002",
+      "at": "2026-07-30T21:30:00Z",
+      "period": "2Q26",
+      "source": {
+        "type": "company_release",
+        "identity": "Amazon.com, Inc. Q2 2026 Earnings Release & Conference Call (8-K Exhibit 99.1)",
+        "tier": 1,
+        "ref": {
+          "kind": "filing",
+          "form": "8-K",
+          "accession": "0001018724-26-000024",
+          "period": "2Q26",
+          "section": "Exhibit 99.1 & Prepared Remarks (2026-07-30)"
+        }
+      },
+      "fact": "2Q26 财报电话会（2026-07-30）CEO Andy Jassy 披露 AWS 定制芯片业务、AI 业务年化收入运行率各超过 250 亿美元；同时将 2026 全年现金资本开支（cash capex）指引上调至约 2,200 亿美元。",
+      "figures": [
+        {"metric": "芯片业务、AI 业务年化收入", "value": 25.0, "unit": "USD_bn", "period": "2Q26", "label": "reported"},
+        {"metric": "现金 capex 指引", "value": 220.0, "unit": "USD_bn", "period": "FY2026", "label": "guidance"}
+      ],
+      "pillar_ids": ["P1"],
+      "signal": "confirming",
+      "quality": "high"
+    },
+    {
+      "id": "EV-AMZN-003",
+      "at": "2026-07-31T20:10:00Z",
+      "period": "2Q26",
+      "source": {
+        "type": "filing",
+        "identity": "Amazon.com, Inc. Form 10-Q for the Quarterly Period Ended June 30, 2026",
+        "tier": 1,
+        "ref": {
+          "kind": "filing",
+          "form": "10-Q",
+          "accession": "0001018724-26-000026",
+          "period": "2Q26",
+          "section": "Consolidated Statements of Cash Flows & Supplemental Cash Flow Info (amzn-20260630.htm)"
+        }
+      },
+      "fact": "2Q26 现金资本开支（现金 capex）为 531 亿美元，过去 12 个月（LTM）自由现金流为 -76 亿美元；2Q26 折旧摊销费用为 200 亿美元（同比 +31%），过去 12 个月（LTM）折旧摊销合计 752 亿美元。",
+      "figures": [
+        {"metric": "现金 capex", "value": 53.1, "unit": "USD_bn", "period": "2Q26", "label": "reported"},
+        {"metric": "过去 12 个月自由现金流", "value": -7.6, "unit": "USD_bn", "period": "LTM", "label": "reported"},
+        {"metric": "折旧摊销", "value": 20.0, "unit": "USD_bn", "period": "2Q26", "label": "reported"},
+        {"metric": "折旧摊销同比增速", "value": 31.0, "unit": "pct", "period": "2Q26", "label": "reported"},
+        {"metric": "过去 12 个月折旧摊销", "value": 75.2, "unit": "USD_bn", "period": "LTM", "label": "reported"}
+      ],
+      "pillar_ids": ["P1"],
+      "signal": "neutral",
+      "quality": "high"
+    },
+    {
+      "id": "EV-AMZN-004",
+      "at": "2026-07-31T20:10:00Z",
+      "period": "2Q26",
+      "source": {
+        "type": "filing",
+        "identity": "Amazon.com, Inc. Form 10-Q for the Quarterly Period Ended June 30, 2026",
+        "tier": 1,
+        "ref": {
+          "kind": "filing",
+          "form": "10-Q",
+          "accession": "0001018724-26-000026",
+          "period": "2Q26",
+          "section": "Consolidated Statements of Operations & Note 6 - Debt (amzn-20260630.htm)"
+        }
+      },
+      "fact": "2026 上半年公司长期债发行融资 670 亿美元；2Q26 利息支出为 13.1 亿美元，上年同期（2Q25）利息支出为 5.2 亿美元。",
+      "figures": [
+        {"metric": "上半年长期债发行", "value": 67.0, "unit": "USD_bn", "period": "1H26", "label": "reported"},
+        {"metric": "利息支出", "value": 1.31, "unit": "USD_bn", "period": "2Q26", "label": "reported"},
+        {"metric": "上年同期利息支出", "value": 0.52, "unit": "USD_bn", "period": "2Q25", "label": "reported"}
+      ],
+      "pillar_ids": ["P1"],
+      "signal": "neutral",
+      "quality": "high"
+    },
+    {
+      "id": "EV-AMZN-005",
+      "at": "2026-07-31T20:10:00Z",
+      "period": "2Q26",
+      "source": {
+        "type": "filing",
+        "identity": "Amazon.com, Inc. Form 10-Q for the Quarterly Period Ended June 30, 2026",
+        "tier": 1,
+        "ref": {
+          "kind": "filing",
+          "form": "10-Q",
+          "accession": "0001018724-26-000026",
+          "period": "2Q26",
+          "section": "Note 5 - Other Income (Expense), Net (amzn-20260630.htm)"
+        }
+      },
+      "fact": "2Q26 其他收入为 534.2 亿美元，其中私有股权向上调整 505 亿美元（主要来自 Anthropic 无投票权优先股）；2026 上半年私有股权向上调整 628 亿美元，另有可转债转换重分类收益 45 亿美元；1Q26 其他收入为 156.5 亿美元。",
+      "figures": [
+        {"metric": "其他收入", "value": 53.42, "unit": "USD_bn", "period": "2Q26", "label": "reported"},
+        {"metric": "私有股权向上调整", "value": 50.5, "unit": "USD_bn", "period": "2Q26", "label": "reported"},
+        {"metric": "上半年私有股权向上调整", "value": 62.8, "unit": "USD_bn", "period": "1H26", "label": "reported"},
+        {"metric": "可转债转换重分类收益", "value": 4.5, "unit": "USD_bn", "period": "1H26", "label": "reported"},
+        {"metric": "其他收入", "value": 15.65, "unit": "USD_bn", "period": "1Q26", "label": "reported"}
+      ],
+      "pillar_ids": ["P1"],
+      "signal": "neutral",
+      "quality": "high"
+    },
+    {
+      "id": "EV-AMZN-006",
+      "at": "2026-07-31T20:10:00Z",
+      "period": "2Q26",
+      "source": {
+        "type": "filing",
+        "identity": "Amazon.com, Inc. Form 10-Q for the Quarterly Period Ended June 30, 2026",
+        "tier": 1,
+        "ref": {
+          "kind": "filing",
+          "form": "10-Q",
+          "accession": "0001018724-26-000026",
+          "period": "2Q26",
+          "section": "Note 3 - Marketable Securities and Non-Marketable Investments (amzn-20260630.htm)"
+        }
+      },
+      "fact": "截至 2Q26 末（2026-06-30），Anthropic 无投票权优先股账面价值 925 亿美元、可转债公允价值 979 亿美元，合计 1,904 亿美元；可转债相关未实现收益 920 亿美元记入累计其他综合收益（OCI）。",
+      "figures": [
+        {"metric": "Anthropic 无投票权优先股账面", "value": 92.5, "unit": "USD_bn", "period": "2Q26", "label": "reported"},
+        {"metric": "可转债公允价值", "value": 97.9, "unit": "USD_bn", "period": "2Q26", "label": "reported"},
+        {"metric": "可转债相关未实现收益", "value": 92.0, "unit": "USD_bn", "period": "2Q26", "label": "reported"}
+      ],
+      "pillar_ids": ["P1"],
+      "signal": "neutral",
+      "quality": "high"
+    }
+  ]
+}

@@ -1,25 +1,39 @@
-"""Unit tests for Publication Governance, Figure Audit, Cross-Family Review, and Immutable Files (PK.8–PK.12)."""
+"""Unit tests for Publication Governance, Figure Audit, Cross-Family Review, and Immutable Files (PK.8–PK.12, P0H, P0I)."""
 
 from __future__ import annotations
 
 import hashlib
+import json
+import re
+from pathlib import Path
 from typing import Any
+from unittest.mock import create_autospec
 
 import pytest
 
+from src.dalton.llm.assist import AssistResult, assist_json
+from src.dalton.publish import audit as audit_mod
+from src.dalton.publish import numbers as numbers_mod
 from src.dalton.publish.audit import (
-    audit_draft,
+    CONTRADICTED_REASONS,
+    aaudit_draft,
     render_annotated_draft,
     render_audit_md,
+    verify_llm_judge_verdict,
 )
 from src.dalton.publish.files import (
     _pick_non_colliding_path,
     compute_bundle_sha256,
     prepend_publication_banner,
 )
-from src.dalton.publish.match import match_figures, values_within_tolerance
+from src.dalton.publish.match import (
+    match_figures,
+    retrieve_candidate_sources,
+    values_within_tolerance,
+)
 from src.dalton.publish.numbers import (
     ExtractedFigure,
+    _can_be_incidental,
     extract_figures,
     normalize_period,
     parse_facts_ledger,
@@ -35,6 +49,9 @@ from src.dalton.publish.review import (
     render_review_input,
 )
 
+REPO_ROOT = Path(__file__).resolve().parents[3]
+G3_FIXTURES_DIR = REPO_ROOT / "tests" / "fixtures" / "dalton" / "g3"
+
 
 def test_normalize_period() -> None:
     assert normalize_period("FY26") == "FY2026"
@@ -42,6 +59,12 @@ def test_normalize_period() -> None:
     assert normalize_period("Q3 2026") == "3Q26"
     assert normalize_period("3Q26E") == "3Q26"
     assert normalize_period("1H2026") == "1H26"
+    assert normalize_period("26Q4") == "4Q26"
+    assert normalize_period("26H1") == "1H26"
+    assert normalize_period("2026 上半年") == "1H26"
+    assert normalize_period("2026 下半年") == "2H26"
+    assert normalize_period("2026 全年") == "FY2026"
+    assert normalize_period("2026 财年") == "FY2026"
 
 
 def test_extract_figures_exclusions_and_exemptions() -> None:
@@ -97,7 +120,8 @@ def test_extract_figures_exclusions_and_exemptions() -> None:
     assert len(non_exempt) == 8
 
 
-def test_match_figures_all_orders_and_discrepancies() -> None:
+@pytest.mark.asyncio
+async def test_match_figures_all_orders_and_discrepancies() -> None:
     thesis_doc = {
         "evidence": [
             {
@@ -160,22 +184,20 @@ def test_match_figures_all_orders_and_discrepancies() -> None:
 [^m1]: model:model/meta_v1.xlsx#Summary!C10
 [^m2]: model:model/meta_v1.xlsx#Summary!D12
 """
-    audit_ok = audit_draft(
+    audit_ok = await aaudit_draft(
         clean_draft,
         thesis_doc=thesis_doc,
         models_doc=models_doc,
         provenance_records=provenance_records,
+        use_llm_judge=False,
     )
     assert audit_ok.passed, f"Unmatched: {audit_ok.unmatched}"
     assert audit_ok.matched == 8
     # Verify Order 5 derived figure (40.0% = 24.3 / 60.8) was matched as `derived`
     assert any(m["kind"] == "derived" and m["raw"] == "40.0%" for m in audit_ok.matches)
 
-    # 2. Draft with specific discrepancies:
-    # - unit_mismatch: 2Q26 广告收入 $59.4mn (million instead of billion)
-    # - period_mismatch: 3Q26 广告收入 $59.4bn pointing to 2Q26 evidence
-    # - source_conflict: 2Q26 营业收入 $68.9bn pointing to E-20261015-01 (which has 60.8)
-    # - target price without model cell: 目标价 $900 pointing to evidence:E-20261015-01
+    # 2. Draft with specific discrepancies (L36: only source_conflict is contradicted;
+    #    unit mismatch and period mismatch emit reason="unverified" with descriptive Chinese hints):
     bad_draft = """# META 错误测试草稿
 
 2Q26 广告收入为 $59.4mn[^e1]。
@@ -185,30 +207,37 @@ def test_match_figures_all_orders_and_discrepancies() -> None:
 
 [^e1]: evidence:E-20261015-01
 """
-    audit_bad = audit_draft(
+    audit_bad = await aaudit_draft(
         bad_draft,
         thesis_doc=thesis_doc,
         models_doc=models_doc,
         provenance_records=provenance_records,
+        use_llm_judge=False,
     )
     assert not audit_bad.passed
     reasons_by_raw = {u["raw"]: u["reason"] for u in audit_bad.unmatched}
-    assert reasons_by_raw["$59.4mn"] == "unit_mismatch"
-    assert reasons_by_raw["$59.4bn"] == "period_mismatch"
+    hints_by_raw = {u["raw"]: u.get("hint", "") for u in audit_bad.unmatched}
+    assert reasons_by_raw["$59.4mn"] == "unverified"
+    assert "量纲" in hints_by_raw["$59.4mn"]
+    assert reasons_by_raw["$59.4bn"] == "unverified"
+    assert "期间" in hints_by_raw["$59.4bn"]
     assert reasons_by_raw["$68.9bn"] == "source_conflict"
     assert reasons_by_raw["$900"] == "unverified"
+    assert len(audit_bad.contradicted) == 1
+    assert audit_bad.contradicted[0]["raw"] == "$68.9bn"
 
     audit_md = render_audit_md(audit_bad, draft_path="drafts/meta.md")
-    assert "unit_mismatch" in audit_md
-    assert "period_mismatch" in audit_md
     assert "source_conflict" in audit_md
+    assert "脚注指向的证据量纲与正文不一致" in audit_md
+    assert "脚注指向的证据期间与正文不一致" in audit_md
 
     annotated = render_annotated_draft(bad_draft, audit_bad)
     assert "**$59.4mn**⟨未核实⟩" in annotated
     assert "**$68.9bn**⟨未核实⟩" in annotated
 
 
-def test_facts_ledger_order_0_matching() -> None:
+@pytest.mark.asyncio
+async def test_facts_ledger_order_0_matching() -> None:
     facts_md = """<!-- FACTS-LEDGER -->
 | id | metric | period | value | unit | ref |
 |---|---|---|---|---|---|
@@ -231,7 +260,12 @@ def test_facts_ledger_order_0_matching() -> None:
         ]
     }
     draft = "2Q26 广告收入达到 $59.4bn[^f1]。\n\n[^f1]: f:F1\n"
-    audit = audit_draft(draft, thesis_doc=thesis_doc, facts_markdown=facts_md)
+    audit = await aaudit_draft(
+        draft,
+        thesis_doc=thesis_doc,
+        facts_markdown=facts_md,
+        use_llm_judge=False,
+    )
     assert audit.passed
     assert audit.matched == 1
 
@@ -242,11 +276,8 @@ def test_cross_family_reviewer_selection_and_verdict() -> None:
     assert family_of("gemini-3.1-pro") == "google-gemini"
 
     candidates = ["claude-opus-4-7", "gpt-5.4", "gemini-3.1-pro"]
-    # Author is Claude -> picks GPT-5.4
     assert pick_reviewer_model("claude-sonnet-4-6", candidates=candidates) == "gpt-5.4"
-    # Author is GPT -> picks Claude
     assert pick_reviewer_model("gpt-5.4", candidates=candidates) == "claude-opus-4-7"
-    # Only same-family model available -> returns None (refuses to publish without cross-family reviewer)
     assert (
         pick_reviewer_model(
             "claude-opus-4-7",
@@ -256,7 +287,6 @@ def test_cross_family_reviewer_selection_and_verdict() -> None:
         is None
     )
 
-    # ReviewVerdict with non-empty must_fix forces verdict='revise' in ReviewResult.to_dict()
     verdict = ReviewVerdict(
         verdict="pass",
         summary="Missing bear rebuttal on D1",
@@ -298,16 +328,13 @@ async def test_published_files_immutability_and_collision_suffix() -> None:
     content_v1 = b"# Report v1"
     sha_v1 = hashlib.sha256(content_v1).hexdigest()
 
-    # First write takes base_path
     p1 = await _pick_non_colliding_path(base_path, sha_v1, backend)
     assert p1 == base_path
     backend.files[p1] = content_v1
 
-    # Idempotent retry with identical SHA-256 reuses base_path
     p1_retry = await _pick_non_colliding_path(base_path, sha_v1, backend)
     assert p1_retry == base_path
 
-    # Different content never overwrites; gets `-2` suffix
     content_v2 = b"# Report v2 (updated)"
     sha_v2 = hashlib.sha256(content_v2).hexdigest()
     p2 = await _pick_non_colliding_path(base_path, sha_v2, backend)
@@ -337,17 +364,6 @@ async def test_published_files_immutability_and_collision_suffix() -> None:
 async def test_g31_counterexamples_units_footnotes_tables_and_sec_accession(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from unittest.mock import create_autospec
-    from src.dalton.llm.assist import AssistResult, assist_json
-    from src.dalton.publish import numbers as numbers_mod
-    from src.dalton.publish.audit import aaudit_draft
-
-    # 1. SEC accession (0001326801-26-000042), doc code (10-K-2026-03), slash date (10/12),
-    #    clock time (05:22), Discord ID (1485122334455667788), batch code (20261018-0412) masked (N2-M6)
-    # 2. Heading `# 2Q26 复盘` keeps period `2Q26` (N2-H3)
-    # 3. Cross-scale unit normalization: 512 亿美元 == $51.2B (51.2 USD_bn)
-    # 4. Table header unit inheritance: 广告收入（亿美元） -> unit USD_bn, metric "广告收入"
-    # 5. Colloquial Chinese numbers ("三成", "两成", "百分之三十", "腰斩", "过半") extracted via Step B (L28)
     draft = """# 2Q26 复盘（Filing 10-K-2026-03, Accession 0001326801-26-000042, 10/12 05:22, msg 1485122334455667788, batch 20261018-0412）
 
 广告收入 512 亿美元，同比 +21%[^E0001]；核心 AI 广告转化率提升约三成[^E0001]，退订率下降两成[^E0001]，渗透率达百分之三十[^E0001]，硬件亏损腰斩[^E0001]，视频时长占比过半[^E0001]。
@@ -358,13 +374,10 @@ async def test_g31_counterexamples_units_footnotes_tables_and_sec_accession(
 """
     figs = extract_figures(draft)
     raws = [f.raw for f in figs]
-    # Accession, doc codes, slash dates, clock times, Discord IDs, batch codes excluded
     assert raws == ["512 亿美元", "+21%", "512", "+21%"]
-    # Heading `# 2Q26 复盘` propagates period 2Q26 to subsequent prose line
     prose_512 = next(f for f in figs if f.raw == "512 亿美元")
     assert prose_512.period == "2Q26"
 
-    # Table cell 512 inherits unit USD_bn (scale 1e8) from column header 广告收入（亿美元）
     table_512 = [f for f in figs if f.raw == "512" and f.location.get("line", 0) > 5]
     assert len(table_512) == 1
     assert table_512[0].unit == "USD_bn"
@@ -392,7 +405,12 @@ async def test_g31_counterexamples_units_footnotes_tables_and_sec_accession(
             return AssistResult(
                 ok=True,
                 data={
-                    "labels": [],
+                    "items": [
+                        {"id": "B-001", "metric": "广告收入", "period": "2Q26", "kind": "reported"},
+                        {"id": "B-002", "metric": "广告收入同比增速", "period": "2Q26", "kind": "reported"},
+                        {"id": "B-003", "metric": "广告收入", "period": "2Q26", "kind": "reported"},
+                        {"id": "B-004", "metric": "广告收入同比增速", "period": "2Q26", "kind": "reported"},
+                    ],
                     "extra_figures": [
                         {"raw": "三成", "value": 30.0, "unit": "pct", "metric": "AI 广告转化率提升", "period": "2Q26", "kind": "reported", "line": 3},
                         {"raw": "两成", "value": 20.0, "unit": "pct", "metric": "退订率下降", "period": "2Q26", "kind": "reported", "line": 3},
@@ -428,11 +446,11 @@ async def test_g31_counterexamples_units_footnotes_tables_and_sec_accession(
     res = await aaudit_draft(draft, thesis_doc=thesis_doc)
     assert res.passed, f"Unexpected failures: {res.unmatched}"
     assert res.labeling_incomplete is False
-    # 4 code-extracted figures + 5 anchored colloquial Chinese figures = 9 verified (hallucinated extra_figure dropped)
     assert len(res.verified) == 9
 
 
-def test_g31_provenance_rejects_wrong_metric_or_period_r4_3() -> None:
+@pytest.mark.asyncio
+async def test_g31_provenance_rejects_wrong_metric_or_period_r4_3() -> None:
     provenance_records = {
         "prov-sec-001": {
             "provider": "sec_edgar",
@@ -442,23 +460,17 @@ def test_g31_provenance_rejects_wrong_metric_or_period_r4_3() -> None:
             "body": "In 1Q25, Reality Labs hardware revenue grew 21.0% YoY to $0.4B.",
         }
     }
-    # Draft claims 2Q26 广告收入同比 +21.0% citing prov-sec-001 (which is 1Q25 Reality Labs!)
     draft = "2Q26 广告收入同比 +21.0%[^p1]。\n\n[^p1]: prov:prov-sec-001\n"
-    res = audit_draft(draft, provenance_records=provenance_records)
+    res = await aaudit_draft(draft, provenance_records=provenance_records, use_llm_judge=False)
     assert not res.passed
-    assert len(res.unverified) + len(res.contradicted) == 1
+    assert len(res.unverified) == 1
+    assert len(res.contradicted) == 0
 
 
 @pytest.mark.asyncio
 async def test_g31_llm_judge_reverification_and_uncertain_bucket_does_not_block(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from unittest.mock import create_autospec
-    from src.dalton.llm.assist import AssistResult, assist_json
-    from src.dalton.publish import audit as audit_mod
-    from src.dalton.publish import numbers as numbers_mod
-    from src.dalton.publish.audit import aaudit_draft, verify_llm_judge_verdict
-
     fig = ExtractedFigure(
         id="F-001",
         raw="512 亿美元",
@@ -480,43 +492,46 @@ async def test_g31_llm_judge_reverification_and_uncertain_bucket_does_not_block(
         }
     ]
 
-    # 1. Hallucinated quote not in candidate text -> rejected by verify_llm_judge_verdict
+    # 1. S1: Hallucinated quote on `supported` -> downgraded to "uncertain" (P0I §1.5 / §1.8 S1)
     bucket_1, _ = verify_llm_judge_verdict(
         fig,
         {
             "verdict": "supported",
             "source_id": "evidence:E0001",
+            "quote_metric_raw": "ad revenue",
             "quote": "This quote does not exist in source",
         },
         cand,
     )
-    assert bucket_1 == "unverified"
+    assert bucket_1 == "uncertain"
 
-    # 2. Quote exists verbatim in source ("Family of Apps ad revenue"), but contains NO number -> downgraded to uncertain (L29 / P0H §1.4 #1)
+    # 2. Quote exists verbatim in source ("Family of Apps ad revenue"), but contains NO number -> downgraded to uncertain
     bucket_2, _ = verify_llm_judge_verdict(
         fig,
         {
             "verdict": "supported",
             "source_id": "evidence:E0001",
+            "quote_metric_raw": "ad revenue",
             "quote": "Family of Apps ad revenue",
         },
         cand,
     )
     assert bucket_2 == "uncertain"
 
-    # 3. Verbatim quote containing "$51.2B" -> code extracts $51.2B and confirms it matches 512 亿美元!
+    # 3. Verbatim quote containing "$51.2B" and verbatim quote_metric_raw "ad revenue" -> verified!
     bucket_3, _ = verify_llm_judge_verdict(
         fig,
         {
             "verdict": "supported",
             "source_id": "evidence:E0001",
+            "quote_metric_raw": "ad revenue",
             "quote": "ad revenue was $51.2B",
         },
         cand,
     )
     assert bucket_3 == "verified"
 
-    # 4. Contradicted verdict where quote is missing or unanchored -> downgraded to "unverified" (L29!)
+    # 4. Contradicted verdict where quote is missing or unanchored -> downgraded to "unverified"
     bucket_4a, _ = verify_llm_judge_verdict(
         fig,
         {
@@ -529,7 +544,7 @@ async def test_g31_llm_judge_reverification_and_uncertain_bucket_does_not_block(
     assert bucket_4a == "unverified"
 
     # 5a. Supported verdict where quote is verbatim in source ("ad revenue was $51.2B"),
-    #     but quote number ($51.2B) differs from draft figure (600 亿美元 = $60.0B) -> MUST NOT be "verified" (P0H §1.7 #1)!
+    #     but quote number ($51.2B) differs from draft figure (600 亿美元 = $60.0B) -> MUST be "uncertain"
     fig_wrong = ExtractedFigure(
         id="F-002",
         raw="600 亿美元",
@@ -548,11 +563,11 @@ async def test_g31_llm_judge_reverification_and_uncertain_bucket_does_not_block(
         {
             "verdict": "supported",
             "source_id": "evidence:E0001",
+            "quote_metric_raw": "ad revenue",
             "quote": "ad revenue was $51.2B",
         },
         cand,
     )
-    assert bucket_3b != "verified"
     assert bucket_3b == "uncertain"
 
     # 5b. Contradicted verdict where quote is anchored AND has a differing number -> accepted as "contradicted"
@@ -561,6 +576,7 @@ async def test_g31_llm_judge_reverification_and_uncertain_bucket_does_not_block(
         {
             "verdict": "contradicted",
             "source_id": "evidence:E0001",
+            "quote_metric_raw": "ad revenue",
             "quote": "ad revenue was $51.2B",
         },
         cand,
@@ -569,12 +585,11 @@ async def test_g31_llm_judge_reverification_and_uncertain_bucket_does_not_block(
     assert detail_4b["reason"] == "source_conflict"
 
     # 5c. Single line with both consensus (with consensus footnote) and our own estimate/reported (with evidence footnote)
-    #     must verify BOTH figures without whole-line consensus_confusion false positive (P0H §1.7 #1)!
     mixed_line_draft = (
         "2Q26 广告收入市场一致预期为 $50.0B[^p_cons]，而我们测算/实际录得 2Q26 广告收入为 $51.2B[^E0001]。\n\n"
         "[^p_cons]: prov:prov-yf-001\n"
     )
-    mixed_res = audit_draft(
+    mixed_res = await aaudit_draft(
         mixed_line_draft,
         thesis_doc={
             "evidence": [
@@ -594,11 +609,12 @@ async def test_g31_llm_judge_reverification_and_uncertain_bucket_does_not_block(
                 "body": "2Q26 ad revenue consensus 50.0 bn.",
             }
         },
+        use_llm_judge=False,
     )
     assert mixed_res.passed, f"Unexpected failures on mixed consensus+evidence line: {mixed_res.unmatched}"
     assert len(mixed_res.verified) == 2
 
-    # 6. Exempt verdict without [估计]/[假设] marker in draft sentence -> downgraded to "unverified" (L29!)
+    # 6. Exempt verdict without [估计]/[假设] marker in draft sentence -> downgraded to "unverified"
     bucket_5a, _ = verify_llm_judge_verdict(
         fig,
         {"verdict": "exempt", "reason": "analyst assumption"},
@@ -644,7 +660,8 @@ async def test_g31_llm_judge_reverification_and_uncertain_bucket_does_not_block(
     assert res.passed is True
 
 
-def test_g31_realistic_report_false_positive_rate_at_most_2() -> None:
+@pytest.mark.asyncio
+async def test_g31_realistic_report_false_positive_rate_at_most_2() -> None:
     thesis_doc = {
         "evidence": [
             {
@@ -659,12 +676,6 @@ def test_g31_realistic_report_false_positive_rate_at_most_2() -> None:
                 ],
             }
         ],
-        "market_view": {
-            "figures": [
-                {"metric": "营业收入", "value": 63.4, "unit": "USD_bn", "period": "3Q26", "label": "consensus"},
-                {"metric": "EPS", "value": 34.05, "unit": "per_share", "period": "FY2027", "label": "consensus"},
-            ]
-        },
     }
     models_doc = {
         "current": "v1",
@@ -678,11 +689,20 @@ def test_g31_realistic_report_false_positive_rate_at_most_2() -> None:
             }
         ],
     }
+    provenance_records = {
+        "prov-yf-001": {
+            "provider": "estimates:yfinance",
+            "identifier": "yf_analysis",
+            "source_type": "street_estimate",
+            "result_sha256": "def67890",
+            "body": "META consensus estimates: 3Q26 revenue 63.4 bn, FY2027 EPS 34.05.",
+        }
+    }
     report_md = """# META 2026Q3 财报前瞻深度报告（Accession 0001326801-26-000042, Form 10-Q-2026-02）
 
 我们在 2Q26 看到公司总收入达 608 亿美元[^E-20261015-01]，其中广告收入 594 亿美元，同比 +27%[^E-20261015-01]。
 2Q26 营业利润为 $24.3B[^E-20261015-01]，对应营业利润率 40.0%，单季 Capex 为 135 亿美元[^E-20261015-01]。
-市场一致预期 3Q26E 营业收入为 $63.4B，一致预期 FY2027 EPS 为 $34.05。
+市场一致预期 3Q26E 营业收入为 $63.4B[^p1]，一致预期 FY2027 EPS 为 $34.05[^p1]。
 我们维持 FY26 目标价 $850[^m1]。
 
 > "We expect AI infrastructure investment to remain significant in 2027, exceeding $100B." —— 管理层原话引用
@@ -694,11 +714,17 @@ def test_g31_realistic_report_false_positive_rate_at_most_2() -> None:
 | 营业利润（亿美元） | 243[^E-20261015-01] |
 
 [^m1]: model:model/meta_v1.xlsx#Summary!C10
+[^p1]: prov:prov-yf-001
 """
-    res = audit_draft(report_md, thesis_doc=thesis_doc, models_doc=models_doc)
+    res = await aaudit_draft(
+        report_md,
+        thesis_doc=thesis_doc,
+        models_doc=models_doc,
+        provenance_records=provenance_records,
+        use_llm_judge=False,
+    )
     false_positives = len(res.contradicted) + len(res.unverified)
-    assert false_positives <= 2, f"Too many false positives ({false_positives}): {res.unmatched}"
-    assert false_positives == 0
+    assert false_positives == 0, f"Unexpected false positives ({false_positives}): {res.unmatched}"
 
 
 @pytest.mark.asyncio
@@ -722,4 +748,470 @@ async def test_g32_reviewer_refuses_none_or_unknown_author_model() -> None:
     )
     assert res_unknown.status == "unavailable"
 
+
+@pytest.mark.asyncio
+async def test_p0i_ten_r3_false_verified_counterexamples(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify all 10 Round-3 false-verified counterexamples (P0I §1.8 #4)."""
+    draft = """# 1. GOOGL 3Q25 季报复盘（参考 `GOOGL_3Q25_10-Q.pdf` 与 10-Q 披露）
+
+1. 社区帖子获得 600 赞，接口偶发返回 HTTP 500，评测使用 Claude Sonnet 5.5，附件编号 Doc-42。
+2. 截至 10 月底（自 7 月以来），管理层展望 26Q4 与 26H1（2026 上半年）云业务表现。
+3. 3Q25 合并总收入为 882.68 亿美元；此外 4Q25 资本开支预计继续爬坡。
+"""
+    figs = extract_figures(draft)
+    raws = [f.raw for f in figs]
+
+    # Counterexamples #3, #4, #5:
+    # - Filename `GOOGL_3Q25_10-Q.pdf`, `Doc-42`, and `10-Q` are masked, never extracted or polluting period to `4Q10`
+    # - Chinese months `10 月底` and `7 月` are masked by _CN_DATE_RE, never extracted as 10 or 7
+    # - `26Q4` and `26H1` are recognized as period tokens (`4Q26`, `1H26`), never extracted as bare numbers 26 or 4
+    assert "10" not in raws
+    assert "42" not in raws
+    assert "7" not in raws
+    assert "26" not in raws
+    assert "4" not in raws
+    assert all(f.period != "4Q10" for f in figs)
+
+    # Counterexample #7 (3 period mis-assignments):
+    # - `882.68 亿美元` in clause 1 of line 5 has period `3Q25`, NOT polluted by `4Q25` in the second clause after `；`
+    fig_rev = next(f for f in figs if f.raw == "882.68 亿美元")
+    assert fig_rev.period == "3Q25"
+
+    # Counterexamples #1 (600 赞), #2 (HTTP 500), #6 (Sonnet 5.5):
+    # Even when thesis_doc contains matching numeric values (600, 500, 42, 5.5), unfootnoted figures
+    # cannot be auto-verified by Order 4 (L34), and Step B labels them `incidental`!
+    thesis_doc = {
+        "evidence": [
+            {
+                "id": "E-TRAP",
+                "fact": "Trap numbers 600, 500, 42, 5.5 in 3Q25.",
+                "source": {"type": "filing", "identity": "10-Q", "tier": 1, "ref": {"kind": "sec_filing", "accession": "0001652044-25-000088"}},
+                "figures": [
+                    {"metric": "陷阱600", "value": 600.0, "unit": "other", "period": "3Q25", "label": "reported"},
+                    {"metric": "陷阱500", "value": 500.0, "unit": "other", "period": "3Q25", "label": "reported"},
+                    {"metric": "陷阱42", "value": 42.0, "unit": "other", "period": "3Q25", "label": "reported"},
+                    {"metric": "陷阱5.5", "value": 5.5, "unit": "other", "period": "3Q25", "label": "reported"},
+                ],
+            }
+        ]
+    }
+    det_res = await aaudit_draft(draft, thesis_doc=thesis_doc, use_llm_judge=False)
+    assert det_res.matched == 0, f"Order 4 must never auto-verify unfootnoted figures: {det_res.matches}"
+
+    mock_assist = create_autospec(assist_json)
+
+    async def _side_effect(
+        task: str,
+        instructions: str,
+        payload: dict[str, Any],
+        schema: dict[str, Any],
+        **kwargs: Any,
+    ) -> AssistResult:
+        if task == "audit.label_figures":
+            items = []
+            for item in payload.get("extracted_figures") or payload.get("figures") or []:
+                raw = str(item.get("raw") or "")
+                if raw in ("600", "500", "42", "5.5"):
+                    items.append({"id": item["id"], "metric": "非财务数字", "period": "", "kind": "incidental"})
+                else:
+                    items.append({"id": item["id"], "metric": "合并总收入", "period": "3Q25", "kind": "reported"})
+            return AssistResult(ok=True, data={"items": items, "extra_figures": []})
+        if task == "audit.judge":
+            return AssistResult(
+                ok=True,
+                data={
+                    "items": [
+                        {"id": f["id"], "verdict": "unverified", "reason": "no matching source"}
+                        for f in payload.get("figures", [])
+                    ]
+                },
+            )
+        return AssistResult(ok=False, data=None, error="unexpected_task")
+
+    mock_assist.side_effect = _side_effect
+    monkeypatch.setattr(numbers_mod, "assist_json", mock_assist)
+    monkeypatch.setattr(audit_mod, "assist_json", mock_assist)
+
+    full_res = await aaudit_draft(draft, thesis_doc=thesis_doc, use_llm_judge=True)
+    assert full_res.matched == 0
+    incidental_raws = {i["raw"] for i in full_res.incidental}
+    assert {"600", "500", "5.5"}.issubset(incidental_raws)
+
+
+def test_p0i_two_anchoring_blind_spots_and_s1() -> None:
+    """Verify the two anchoring blind spots and S1 fabricated quote handling (P0I §1.5 & §1.8 #4)."""
+    # Blind spot 1: "400 亿 ATM 对资本开支余量"
+    fig_capex = ExtractedFigure(
+        id="F-CAPEX",
+        raw="400 亿美元",
+        value=400.0,
+        decimals=0,
+        unit="USD_bn",
+        scale=1e8,
+        currency="USD",
+        metric="资本开支",
+        period="FY2026",
+        label_hint="reported",
+        location={"line": 10, "sentence": "FY2026 资本开支预计为 400 亿美元。"},
+    )
+    cand_atm = [
+        {
+            "source_id": "evidence:E-ATM",
+            "text": "As of Q3 2025, $40.0 billion remained available under the ATM share repurchase program.",
+            "figures": [],
+        }
+    ]
+    # If LLM claims supported but quote_metric_raw is missing or not verbatim in quote -> uncertain
+    b_missing_metric, d_missing = verify_llm_judge_verdict(
+        fig_capex,
+        {
+            "verdict": "supported",
+            "source_id": "evidence:E-ATM",
+            "quote_metric_raw": "Capital expenditures",
+            "quote": "As of Q3 2025, $40.0 billion remained available under the ATM share repurchase program.",
+        },
+        cand_atm,
+    )
+    assert b_missing_metric == "uncertain"
+    assert "quote_metric_raw" in d_missing["hint"]
+
+    # Even if quote_metric_raw is in quote, quote has explicit period Q3 2025 (3Q25) != FY2026 -> uncertain!
+    b_period_mismatch, d_period = verify_llm_judge_verdict(
+        fig_capex,
+        {
+            "verdict": "supported",
+            "source_id": "evidence:E-ATM",
+            "quote_metric_raw": "ATM share repurchase program",
+            "quote": "As of Q3 2025, $40.0 billion remained available under the ATM share repurchase program.",
+        },
+        cand_atm,
+    )
+    assert b_period_mismatch == "uncertain"
+    assert "引文期间" in d_period["hint"]
+
+    # Blind spot 2: "19.11 美元/股对 19.1%"
+    figs_eps = extract_figures("FY2025 稀释后 EPS 为 19.11 美元/股。")
+    assert len(figs_eps) == 1
+    fig_eps = figs_eps[0]
+    assert fig_eps.unit == "per_share"
+
+    # Dimension check: per_share (19.11) vs pct (19.1%) MUST be False!
+    assert values_within_tolerance(fig_eps, 19.1, "pct")[0] is False
+    assert values_within_tolerance(fig_eps, 19.11, "per_share")[0] is True
+
+    # Dimension check: pct (19.1%) vs decimal ratio (0.191, unit="other") is True, but vs USD_bn (19.1) is False
+    fig_pct = extract_figures("营业利润率为 19.1%。")[0]
+    assert fig_pct.unit == "pct"
+    assert values_within_tolerance(fig_pct, 0.191, "other")[0] is True
+    assert values_within_tolerance(fig_pct, 19.1, "USD_bn")[0] is False
+    assert values_within_tolerance(fig_pct, 19.1, "per_share")[0] is False
+
+    cand_margin = [
+        {
+            "source_id": "evidence:E-MARGIN",
+            "text": "In FY2025, consolidated operating margin was 19.1%.",
+            "figures": [],
+        }
+    ]
+    b_dim, d_dim = verify_llm_judge_verdict(
+        fig_eps,
+        {
+            "verdict": "supported",
+            "source_id": "evidence:E-MARGIN",
+            "quote_metric_raw": "operating margin",
+            "quote": "In FY2025, consolidated operating margin was 19.1%.",
+        },
+        cand_margin,
+    )
+    assert b_dim == "uncertain"
+    assert "量纲不符" in d_dim["hint"]
+
+
+@pytest.mark.asyncio
+async def test_p0i_legacy_thesis_excluded_from_verification_and_step_d() -> None:
+    """Verify L35: migrated legacy_thesis evidence cannot verify figures in Step C or Step D."""
+    thesis_doc = {
+        "evidence": [
+            {
+                "id": "E-LEGACY-001",
+                "fact": "2Q26 广告收入为 594 亿美元。",
+                "source": {
+                    "type": "legacy_thesis",
+                    "identity": "Migrated from thesis.md",
+                    "tier": 3,
+                    "ref": {"kind": "url", "path": "sources/legacy/meta_thesis.md"},
+                },
+                "figures": [
+                    {"metric": "广告收入", "value": 59.4, "unit": "USD_bn", "period": "2Q26", "label": "reported"}
+                ],
+            }
+        ]
+    }
+    draft = "2Q26 广告收入为 594 亿美元[^E-LEGACY-001]。\n\n[^E-LEGACY-001]: evidence:E-LEGACY-001\n"
+    res = await aaudit_draft(draft, thesis_doc=thesis_doc, use_llm_judge=False)
+    assert res.matched == 0
+    assert len(res.unverified) == 1
+    assert "旧认知中的说法，尚未用原始来源核实" in res.unverified[0]["hint"]
+    assert res.unverified[0]["candidates"][0]["why"] == "旧认知中的说法，尚未用原始来源核实"
+
+    # Step D candidate retrieval also excludes legacy_thesis
+    fig = extract_figures(draft)[0]
+    cands = retrieve_candidate_sources(fig, thesis_doc=thesis_doc)
+    assert cands == []
+
+
+def test_p0i_incidental_guard_rejects_currency_and_pct() -> None:
+    """Verify _can_be_incidental guard: currency, pct, bps, and per_share figures can never be incidental."""
+    figs = extract_figures(
+        "帖子获 600 赞；收入 $500M；毛利率 45.2%；利差 50bps；EPS 为 19.11 美元/股。"
+    )
+    by_raw = {f.raw: f for f in figs}
+    assert _can_be_incidental(by_raw["600"]) is True
+    assert _can_be_incidental(by_raw["$500M"]) is False
+    assert _can_be_incidental(by_raw["45.2%"]) is False
+    assert _can_be_incidental(by_raw["50bps"]) is False
+    fig_eps = next(f for f in figs if f.unit == "per_share")
+    assert _can_be_incidental(fig_eps) is False
+
+
+@pytest.mark.asyncio
+async def test_p0i_section_batch_cache_isolation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify modifying Section 1 leaves Section 2's Step B and Step D LLM payloads byte-for-byte identical."""
+    draft_v1 = """## 第一节：收入概览
+2Q26 搜索收入达到 540 亿美元。
+
+## 第二节：云业务与利润率
+2Q26 云业务收入达到 142.7 亿美元。
+"""
+    draft_v2 = """## 第一节：收入概览
+2Q26 搜索收入达到 545 亿美元，YouTube 广告收入达到 98 亿美元。
+此外订阅收入达到 110 亿美元。
+
+## 第二节：云业务与利润率
+2Q26 云业务收入达到 142.7 亿美元。
+"""
+    thesis_doc = {
+        "evidence": [
+            {
+                "id": "E-CLOUD",
+                "fact": "Q2 2026 Google Cloud revenue was $14.27B.",
+                "source": {"type": "filing", "identity": "10-Q", "tier": 1, "ref": {"kind": "sec_filing", "accession": "0001652044-26-000010"}},
+                "figures": [
+                    {"metric": "云业务收入", "value": 14.27, "unit": "USD_bn", "period": "2Q26", "label": "reported"}
+                ],
+            }
+        ]
+    }
+
+    captured_label_sec2: list[str] = []
+    captured_judge_sec2: list[str] = []
+
+    mock_assist = create_autospec(assist_json)
+
+    async def _side_effect(
+        task: str,
+        instructions: str,
+        payload: dict[str, Any],
+        schema: dict[str, Any],
+        **kwargs: Any,
+    ) -> AssistResult:
+        if task == "audit.label_figures":
+            if "第二节" in str(payload.get("section_title") or ""):
+                captured_label_sec2.append(json.dumps(payload, sort_keys=True, ensure_ascii=False))
+            return AssistResult(
+                ok=True,
+                data={
+                    "items": [
+                        {"id": f["id"], "metric": "云业务收入", "period": "2Q26", "kind": "reported"}
+                        for f in payload.get("extracted_figures") or payload.get("figures") or []
+                    ],
+                    "extra_figures": [],
+                },
+            )
+        if task == "audit.judge":
+            if "第二节" in str(payload.get("section_title") or ""):
+                captured_judge_sec2.append(json.dumps(payload, sort_keys=True, ensure_ascii=False))
+            return AssistResult(
+                ok=True,
+                data={
+                    "items": [
+                        {
+                            "id": f["id"],
+                            "verdict": "supported",
+                            "source_id": "evidence:E-CLOUD",
+                            "quote_metric_raw": "Google Cloud revenue",
+                            "quote": "Q2 2026 Google Cloud revenue was $14.27B.",
+                        }
+                        for f in payload.get("figures", [])
+                    ]
+                },
+            )
+        return AssistResult(ok=False, data=None, error="unexpected")
+
+    mock_assist.side_effect = _side_effect
+    monkeypatch.setattr(numbers_mod, "assist_json", mock_assist)
+    monkeypatch.setattr(audit_mod, "assist_json", mock_assist)
+
+    await aaudit_draft(draft_v1, thesis_doc=thesis_doc, use_llm_judge=True)
+    await aaudit_draft(draft_v2, thesis_doc=thesis_doc, use_llm_judge=True)
+
+    assert len(captured_label_sec2) == 2
+    assert captured_label_sec2[0] == captured_label_sec2[1]
+    assert len(captured_judge_sec2) == 2
+    assert captured_judge_sec2[0] == captured_judge_sec2[1]
+
+
+def test_p0i_contradicted_reasons_and_zero_unit_or_period_mismatch_assignments() -> None:
+    """Verify L36: CONTRADICTED_REASONS == {'source_conflict'} and zero unit_mismatch / period_mismatch reason assignments."""
+    assert CONTRADICTED_REASONS == frozenset({"source_conflict"})
+
+    match_src = (REPO_ROOT / "src" / "dalton" / "publish" / "match.py").read_text(encoding="utf-8")
+    audit_src = (REPO_ROOT / "src" / "dalton" / "publish" / "audit.py").read_text(encoding="utf-8")
+    for src_name, src_text in [("match.py", match_src), ("audit.py", audit_src)]:
+        assert not re.search(r'reason\s*[:=]\s*["\']unit_mismatch["\']', src_text), f"Found unit_mismatch in {src_name}"
+        assert not re.search(r'reason\s*[:=]\s*["\']period_mismatch["\']', src_text), f"Found period_mismatch in {src_name}"
+        assert "SF-CN" not in src_text, f"Found SF-CN in {src_name}"
+        assert "_match_in_provenance_record" not in src_text, f"Found _match_in_provenance_record in {src_name}"
+        assert "maybe_label_prose_figures_with_llm" not in src_text, f"Found maybe_label_prose_figures_with_llm in {src_name}"
+
+
+@pytest.mark.asyncio
+async def test_p0i_g3_gold_standard_and_cross_control_zero_false_verified(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Run the committed G3 gold-standard dataset (159 figures across GOOGL + AMZN) and GOOGL-vs-META cross-control."""
+    gold_doc = json.loads((G3_FIXTURES_DIR / "gold_standard.json").read_text(encoding="utf-8"))
+    googl_draft = (G3_FIXTURES_DIR / "googl_draft.md").read_text(encoding="utf-8")
+    amzn_draft = (G3_FIXTURES_DIR / "amzn_draft.md").read_text(encoding="utf-8")
+    googl_ev = json.loads((G3_FIXTURES_DIR / "googl_sec_evidence.json").read_text(encoding="utf-8"))
+    amzn_ev = json.loads((G3_FIXTURES_DIR / "amzn_sec_evidence.json").read_text(encoding="utf-8"))
+    meta_ev = json.loads((G3_FIXTURES_DIR / "meta_cross_control_evidence.json").read_text(encoding="utf-8"))
+
+    gold_items = gold_doc["items"]
+    assert len(gold_items) >= 150
+
+    # Verify all evidence items in GOOGL and AMZN fixtures have real SEC filing refs and zero legacy_thesis
+    for ev_bundle in (googl_ev, amzn_ev):
+        for ev in ev_bundle["evidence"]:
+            src = ev["source"]
+            assert src["type"] != "legacy_thesis"
+            assert src["ref"].get("accession") or src["ref"].get("url")
+
+    # 1. Cross-control: GOOGL draft audited against META evidence MUST produce 0 verified figures!
+    cross_det = await aaudit_draft(googl_draft, thesis_doc=meta_ev, use_llm_judge=False)
+    assert cross_det.matched == 0, f"Cross-control (GOOGL draft vs META evidence) false verified: {cross_det.matches}"
+
+    # 2. Audit GOOGL and AMZN drafts using gold-standard-informed Step B & Step D autospec double
+    #    to verify deterministic + anchored pipeline achieves 0 false-verified and 0 financial incidental misclassifications.
+    gold_by_report_line_raw: dict[tuple[str, int, str], dict[str, Any]] = {
+        (it["report"], int(it["line"]), it["raw"]): it for it in gold_items
+    }
+    gold_by_report_sent_raw: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for rep_name, draft_txt in [("GOOGL", googl_draft), ("AMZN", amzn_draft)]:
+        d_lines = draft_txt.splitlines()
+        for it in gold_items:
+            if it["report"] == rep_name:
+                lno = int(it["line"])
+                sent = d_lines[lno - 1].strip() if 1 <= lno <= len(d_lines) else ""
+                gold_by_report_sent_raw[(rep_name, sent, it["raw"])] = it
+
+    ev_by_id: dict[str, dict[str, Any]] = {}
+    for ev in googl_ev["evidence"] + amzn_ev["evidence"]:
+        ev_by_id[ev["id"]] = ev
+
+    current_report = {"name": "GOOGL"}
+    mock_assist = create_autospec(assist_json)
+
+    async def _gold_assist_side_effect(
+        task: str,
+        instructions: str,
+        payload: dict[str, Any],
+        schema: dict[str, Any],
+        **kwargs: Any,
+    ) -> AssistResult:
+        sec_title = str(payload.get("section_title") or "")
+        draft_text = googl_draft if current_report["name"] == "GOOGL" else amzn_draft
+        draft_lines = draft_text.splitlines()
+        sec_start = 1
+        for idx_l, l_str in enumerate(draft_lines, start=1):
+            if sec_title and sec_title in l_str:
+                sec_start = idx_l
+                break
+
+        if task == "audit.label_figures":
+            items = []
+            for f_in in payload.get("extracted_figures") or payload.get("figures") or []:
+                rel_line = int(f_in.get("line") or 1)
+                abs_line = sec_start + rel_line - 1
+                raw = str(f_in.get("raw") or "")
+                g = gold_by_report_line_raw.get((current_report["name"], abs_line, raw))
+                if g and not g["is_financial_figure"]:
+                    items.append({"id": f_in["id"], "metric": "非财务数字", "period": "", "kind": "incidental"})
+                elif g:
+                    items.append({"id": f_in["id"], "metric": str(f_in.get("metric") or "财务指标"), "period": g.get("expected_period") or "", "kind": "reported"})
+                else:
+                    items.append({"id": f_in["id"], "metric": str(f_in.get("metric") or "指标"), "period": str(f_in.get("period") or ""), "kind": "reported"})
+            return AssistResult(ok=True, data={"items": items, "extra_figures": []})
+
+        if task == "audit.judge":
+            out_items = []
+            for f_in in payload.get("figures", []):
+                raw = str(f_in.get("raw") or "")
+                sent = str(f_in.get("sentence") or "").strip()
+                g = gold_by_report_sent_raw.get((current_report["name"], sent, raw))
+                src_id = g.get("expected_source_id") if g else None
+                if g and g["has_source"] and src_id in ev_by_id:
+                    ev_obj = ev_by_id[src_id]
+                    fact_str = ev_obj["fact"]
+                    m_words = [w for w in re.split(r"[,:;.]", fact_str) if w.strip()]
+                    metric_phrase = m_words[0].strip()[:30] if m_words else fact_str[:20]
+                    out_items.append(
+                        {
+                            "id": f_in["id"],
+                            "verdict": "supported",
+                            "source_id": f"evidence:{src_id}",
+                            "quote_metric_raw": metric_phrase,
+                            "quote": fact_str,
+                        }
+                    )
+                else:
+                    out_items.append(
+                        {
+                            "id": f_in["id"],
+                            "verdict": "unverified",
+                            "reason": "no matching source in evidence",
+                        }
+                    )
+            return AssistResult(ok=True, data={"items": out_items})
+
+        return AssistResult(ok=False, data=None, error="unexpected")
+
+    mock_assist.side_effect = _gold_assist_side_effect
+    monkeypatch.setattr(numbers_mod, "assist_json", mock_assist)
+    monkeypatch.setattr(audit_mod, "assist_json", mock_assist)
+
+    current_report["name"] = "GOOGL"
+    googl_res = await aaudit_draft(googl_draft, thesis_doc=googl_ev, use_llm_judge=True)
+
+    current_report["name"] = "AMZN"
+    amzn_res = await aaudit_draft(amzn_draft, thesis_doc=amzn_ev, use_llm_judge=True)
+
+    for rep_name, res in [("GOOGL", googl_res), ("AMZN", amzn_res)]:
+        assert res.labeling_incomplete is False
+        assert res.labeling["total"] == res.labeling["labeled"]
+        assert res.labeling["failed_batches"] == 0
+        # 0 false-verified: every verified figure must have has_source=True in gold standard
+        for m in res.verified:
+            g = gold_by_report_line_raw.get((rep_name, int(m["line"]), m["raw"]))
+            if g is not None:
+                assert g["has_source"] is True, f"False-verified figure in {rep_name}: {m} (gold={g})"
+        # 0 financial figures misclassified as incidental
+        for inc in res.incidental:
+            g = gold_by_report_line_raw.get((rep_name, int(inc["line"]), inc["raw"]))
+            if g is not None:
+                assert g["is_financial_figure"] is False, f"Financial figure marked incidental in {rep_name}: {inc}"
 

@@ -7,6 +7,7 @@ config/dalton/
 docs/dalton/
 integrations/openclaw/
 tests/unit/dalton/
+tests/fixtures/dalton/
 tests/unit/mcp_servers/fixtures/dalton_sec/
 tests/unit/mcp_servers/test_dalton_sec_periods.py
 agent_config.dalton.yaml
