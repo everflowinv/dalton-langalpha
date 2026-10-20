@@ -429,11 +429,12 @@ def test_workspace_ownership_and_pm_guards(
     """Verify non-owner gets 403 on workspace knowledge routes and non-PM gets 403 on sync/import."""
     import src.server.database.workspace as ws_db
 
+    real_get_workspace = ws_db.get_workspace
     monkeypatch.setattr(
         ws_db,
         "get_workspace",
         create_autospec(
-            ws_db.get_workspace,
+            real_get_workspace,
             return_value={
                 "workspace_id": "00000000-0000-0000-0000-000000000001",
                 "user_id": "owner-user",
@@ -458,4 +459,49 @@ def test_workspace_ownership_and_pm_guards(
         json={"dry_run": True, "force": False},
     )
     assert r_sync.status_code == 403
+
+    # P0J §8.1 #14: fail-closed when workspace is not found -> 404 (never silently allow)
+    monkeypatch.setattr(
+        ws_db,
+        "get_workspace",
+        create_autospec(real_get_workspace, return_value=None),
+    )
+    r_missing = intruder_client.get(
+        "/api/v1/dalton/knowledge/00000000-0000-0000-0000-000000000001/thesis/versions"
+    )
+    assert r_missing.status_code == 404
+
+    # P0J §8.1 #14: fail-closed when database raises an error -> 503 (never silently allow)
+    monkeypatch.setattr(
+        ws_db,
+        "get_workspace",
+        create_autospec(
+            real_get_workspace,
+            side_effect=RuntimeError("postgres connection refused"),
+        ),
+    )
+    r_db_err = intruder_client.get(
+        "/api/v1/dalton/knowledge/00000000-0000-0000-0000-000000000001/thesis/versions"
+    )
+    assert r_db_err.status_code == 503
+
+    # P0J §8.1 #14: fail-closed when workspace row has empty user_id -> 403
+    monkeypatch.setattr(
+        ws_db,
+        "get_workspace",
+        create_autospec(
+            real_get_workspace,
+            return_value={
+                "workspace_id": "00000000-0000-0000-0000-000000000001",
+                "user_id": "",
+                "name": "META",
+                "status": "running",
+            },
+        ),
+    )
+    r_no_owner = intruder_client.get(
+        "/api/v1/dalton/knowledge/00000000-0000-0000-0000-000000000001/thesis/versions"
+    )
+    assert r_no_owner.status_code == 403
+
 
