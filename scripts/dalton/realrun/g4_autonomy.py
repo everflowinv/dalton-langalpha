@@ -49,7 +49,7 @@ import os
 import subprocess
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -71,7 +71,7 @@ from scripts.dalton.realrun._common import (  # noqa: E402
     preflight_realrun_script,
     write_evidence_and_summary,
 )
-from scripts.dalton.realrun.check_env import _read_bridge_token  # noqa: E402
+from scripts.dalton.realrun.check_env import _read_bridge_token, _restore_budget_state  # noqa: E402
 from scripts.dalton.realrun.journal_dump import build_dsn_from_env  # noqa: E402
 
 
@@ -533,545 +533,654 @@ def main() -> int:
     test_user_id = f"{pm_user},{other_user}"
     synthetic: list[dict[str, Any]] = []
 
-    with (
-        RealRunHttpClient(base_url=args.backend, user_id=pm_user, timeout_s=180.0) as client,
-        RealRunHttpClient(base_url=args.backend, user_id=other_user, timeout_s=60.0) as user_b_client,
-    ):
-        client.ensure_user()
-        user_b_client.ensure_user()
+    prior_budget_pm: dict[str, Any] = {}
+    was_configured_pm = False
+    budget_modified_pm = False
+    created_ws_ids: list[str] = []
+    created_auto_ids: list[str] = []
+    saved_preexisting_agendas: list[tuple[str, dict[str, Any], str]] = []
 
-        # Configure initial daily budget ($15.00) and BYOK DeepSeek key
-        st_b, body_b = client.request(
-            "PUT",
-            "/api/v1/dalton/budget",
-            json_body={"daily_cap_usd": 15.0, "default_task_cap_usd": 5.0},
-        )
-        assert st_b == 200, f"PUT /api/v1/dalton/budget failed: {st_b} {body_b}"
-        synthetic.append(
-            {
-                "kind": "settings_api_budget",
-                "entry_point": "PUT /api/v1/dalton/budget",
-                "description": f"初始化测试用户 {pm_user} 日预算上限 $15.00，在场景 6 下调至 $0.01 触发共享预算熔断，验证完成后恢复为 $15.00。",
-            }
-        )
+    try:
+        with (
+            RealRunHttpClient(base_url=args.backend, user_id=pm_user, timeout_s=180.0) as client,
+            RealRunHttpClient(base_url=args.backend, user_id=other_user, timeout_s=60.0) as user_b_client,
+        ):
+            client.ensure_user()
+            user_b_client.ensure_user()
 
-        ds_key = _resolve_deepseek_key()
-        st_byok, body_byok = client.request(
-            "PUT",
-            "/api/v1/users/me/api-keys",
-            json_body={"byok_enabled": True, "api_keys": {"deepseek": ds_key}},
-        )
-        assert st_byok == 200, f"PUT /api/v1/users/me/api-keys failed: {st_byok} {body_byok}"
-
-        # Configure `general-purpose` subagent to use cash model `deepseek-flash` so real cash spend can accumulate >= $0.01
-        st_sa_get, sa_list = client.request("GET", "/api/v1/subagents")
-        assert st_sa_get == 200 and isinstance(sa_list, dict), f"GET /api/v1/subagents failed: {st_sa_get} {sa_list}"
-        gp_item = next(
-            (s for s in (sa_list.get("subagents") or []) if isinstance(s, dict) and s.get("name") == "general-purpose"),
-            {},
-        )
-        sa_version = str(gp_item.get("version") or "")
-        st_sa_put, sa_put_resp = client.request(
-            "PUT",
-            "/api/v1/subagents/general-purpose",
-            json_body={"version": sa_version, "fields": {"model": "deepseek-flash"}},
-        )
-        assert st_sa_put == 200, f"PUT /api/v1/subagents/general-purpose failed: {st_sa_put} {sa_put_resp}"
-
-        # Create & start META and GOOGL workspaces
-        print(f"[G4] Creating META and GOOGL workspaces for user={test_user_id} ...", flush=True)
-        meta_ws_id = _create_started_workspace(client, "META", "META G4 Real-Run Workspace")
-        googl_ws_id = _create_started_workspace(client, "GOOGL", "GOOGL G4 Real-Run Workspace")
-
-        # Import initial company, thesis, and empty agenda for META; import company and thesis for GOOGL
-        # (GOOGL agenda v1 with V-201 is imported in Scenario 3 before dalton_agenda_note writes v2)
-        for ws_id, ticker, name, cik, include_empty_agenda in [
-            (meta_ws_id, "META", "Meta Platforms, Inc.", "0001326801", True),
-            (googl_ws_id, "GOOGL", "Alphabet Inc.", "0001652044", False),
-        ]:
-            docs_to_import: list[tuple[str, dict[str, Any]]] = [
-                ("company", _build_company_doc(ticker, name, cik)),
-                ("thesis", _build_thesis_doc(ticker)),
-            ]
-            if include_empty_agenda:
-                docs_to_import.append(("agenda", _build_agenda_doc()))
-            for doc_key, doc_payload in docs_to_import:
-                st_imp, imp_body = client.request(
-                    "POST",
-                    f"/api/v1/dalton/knowledge/{ws_id}/{doc_key}/import",
-                    json_body={"content": doc_payload, "reason": f"G4 initial {doc_key} bootstrap"},
-                )
-                assert st_imp == 200 and imp_body.get("ok"), (
-                    f"Import {doc_key} failed for {ticker}: {st_imp} {imp_body}"
-                )
-
-        # Fetch live SEC submissions for META to identify real 8-K (Item 2.02) and Form 4 accessions
-        meta_sec_data = _fetch_sec_submissions("0001326801")
-        real_8k_202 = _find_filing_accession(meta_sec_data, target_form="8-K", require_item_202=True)
-        real_form4 = _find_filing_accession(meta_sec_data, target_form="4", require_item_202=False)
-        acc_8k = real_8k_202["accession_number"]
-        acc_form4 = real_form4["accession_number"]
-
-        # Schedule dalton-meta-watch, dalton-googl-watch, dalton-director-daily, and dalton-googl-earn-2q26-tm3
-        meta_watch_instruction = (
-            f"请阅读本轮 `<dalton_wake>` 中的触发信号 `filing:{acc_8k}`，立即调用一次 "
-            "`knowledge_append_verdict` 工具。请将以下 JSON 对象直接作为 `verdict` 参数的值传入（注意：`verdict` 参数本身就是该字典，不要在字典外层再套一层 `verdict` 键）：\n"
-            "```json\n"
-            "{\n"
-            f'  "trigger": {{"kind": "filing", "ref": "filing:{acc_8k}"}},\n'
-            f'  "event": "META 披露 8-K (Item 2.02, accession={acc_8k}) 季度业绩公告",\n'
-            '  "verdict": "NO_CHANGE",\n'
-            '  "rationale": "核查 SEC 8-K Item 2.02 披露内容，广告收入与 CapEx 指引符合预期，维持现有核心判断。",\n'
-            '  "next_validation": {"what": "跟踪下季广告展现量与单价同比增速", "due": "2026-12-31"},\n'
-            '  "progress": "some"\n'
-            "}\n"
-            "```\n"
-            "调用成功后立即用一句话回复完成，不要调用任何其他工具。"
-        )
-        st_mw, mw_body = client.request(
-            "PUT",
-            "/api/v1/dalton/automations/dalton-meta-watch",
-            json_body={
-                "workspace_id": meta_ws_id,
-                "spec": {
-                    "description": "META 日常信号巡检",
-                    "trigger_type": "cron",
-                    "cron_expression": "*/30 6-20 * * 1-5",
-                    "timezone": "America/New_York",
-                    "workspace_id": meta_ws_id,
-                    "llm_model": "claude-sonnet-5-5-low-oauth",
-                    "thread_strategy": "new",
-                    "instruction": meta_watch_instruction,
-                    "metadata": {
-                        "dalton_managed": True,
-                        "dalton_kind": "company_watch",
-                        "ticker": "META",
-                        "tier": "Core",
-                    },
-                },
-            },
-        )
-        assert st_mw == 200 and mw_body.get("ok"), f"Schedule dalton-meta-watch failed: {st_mw} {mw_body}"
-        meta_watch_id = str(mw_body["automation_id"])
-
-        googl_watch_instruction = (
-            "请阅读本轮 `<dalton_wake>` 中的到期验证信号 `validation:V-201` 与议程问题 `pm_question:Q-001`，立即调用一次 "
-            "`knowledge_append_verdict` 工具：\n"
-            "1. `verdict` 参数的值（直接传入以下字典，不要在外层再包一层 `verdict` 键）：\n"
-            "```json\n"
-            "{\n"
-            '  "trigger": {"kind": "due_validation", "ref": "V-201"},\n'
-            '  "event": "GOOGL 2Q26 Google Cloud 营业利润率达 11.3%，兑现 V-201 到期验证项并解答 Q-001",\n'
-            '  "verdict": "THESIS_STRENGTHENED",\n'
-            '  "rationale": "2Q26 Google Cloud 营业利润率 11.3% 突破 11.0% 阈值，经营杠杆持续释放。",\n'
-            '  "next_validation": {"what": "跟踪 3Q26 Google Cloud 营业利润率维持 11% 以上", "due": "2026-12-31", "validation_id": "V-201"},\n'
-            '  "progress": "resolved",\n'
-            '  "question_ids": ["Q-001"]\n'
-            "}\n"
-            "```\n"
-            "2. 同时传入 `agenda_ops` 参数以将 `Q-001` 标记为 `resolved`：\n"
-            "```json\n"
-            "[\n"
-            '  {"op": "set", "path": "/open_questions/Q-001/status", "value": "resolved"},\n'
-            '  {"op": "set", "path": "/open_questions/Q-001/resolution", "value": "2Q26 Google Cloud 营业利润率 11.3% 已核实兑现"}\n'
-            "]\n"
-            "```\n"
-            "调用成功后立即用一句话回复完成，不要调用任何其他工具。"
-        )
-        st_gw, gw_body = client.request(
-            "PUT",
-            "/api/v1/dalton/automations/dalton-googl-watch",
-            json_body={
-                "workspace_id": googl_ws_id,
-                "spec": {
-                    "description": "GOOGL 日常信号巡检",
-                    "trigger_type": "cron",
-                    "cron_expression": "*/30 6-20 * * 1-5",
-                    "timezone": "America/New_York",
-                    "workspace_id": googl_ws_id,
-                    "llm_model": "claude-sonnet-5-5-low-oauth",
-                    "thread_strategy": "new",
-                    "instruction": googl_watch_instruction,
-                    "metadata": {
-                        "dalton_managed": True,
-                        "dalton_kind": "company_watch",
-                        "ticker": "GOOGL",
-                        "tier": "Core",
-                    },
-                },
-            },
-        )
-        assert st_gw == 200 and gw_body.get("ok"), f"Schedule dalton-googl-watch failed: {st_gw} {gw_body}"
-        googl_watch_id = str(gw_body["automation_id"])
-
-        st_dd, dd_body = client.request(
-            "PUT",
-            "/api/v1/dalton/automations/dalton-director-daily",
-            json_body={
-                "spec": {
-                    "description": "Dalton 研究总监每日晨会调度",
-                    "trigger_type": "cron",
-                    "cron_expression": "30 7 * * 1-5",
-                    "timezone": "America/New_York",
-                    "workspace_id": None,
-                    "llm_model": "claude-sonnet-5-5-low-oauth",
-                    "thread_strategy": "new",
-                    "instruction": "请调用 dalton_coverage_board 查看覆盖池状态并简短回复。",
-                    "metadata": {
-                        "dalton_managed": True,
-                        "dalton_kind": "director_daily",
-                    },
-                },
-            },
-        )
-        assert st_dd == 200 and dd_body.get("ok"), f"Schedule dalton-director-daily failed: {st_dd} {dd_body}"
-        director_daily_id = str(dd_body["automation_id"])
-
-        initial_tm3_run_at = "2026-10-20T12:00:00Z"
-        st_tm3, tm3_body = client.request(
-            "PUT",
-            "/api/v1/dalton/automations/dalton-googl-earn-2q26-tm3",
-            json_body={
-                "workspace_id": googl_ws_id,
-                "spec": {
-                    "description": "GOOGL 2Q26 财报前瞻（T-3）",
-                    "trigger_type": "once",
-                    "next_run_at": initial_tm3_run_at,
-                    "timezone": "America/New_York",
-                    "workspace_id": googl_ws_id,
-                    "llm_model": "claude-sonnet-5-5-low-oauth",
-                    "thread_strategy": "new",
-                    "instruction": "请生成 GOOGL 2Q26 财报前瞻草稿。",
-                    "metadata": {
-                        "dalton_managed": True,
-                        "dalton_kind": "earnings_tm3",
-                        "ticker": "GOOGL",
-                        "period": "2Q26",
-                    },
-                },
-            },
-        )
-        assert st_tm3 == 200 and tm3_body.get("ok"), f"Schedule dalton-googl-earn-2q26-tm3 failed: {st_tm3} {tm3_body}"
-        tm3_id = str(tm3_body["automation_id"])
-
-        # Step 0: Bootstrap SEC watermarks for META and GOOGL via initial trigger
-        print("[G4] Step 0: Bootstrapping SEC watermarks for META and GOOGL ...", flush=True)
-        for auto_id in (meta_watch_id, googl_watch_id):
-            st_t, t_body = client.request("POST", f"/api/v1/automations/{auto_id}/trigger")
-            assert st_t == 200, f"Bootstrap trigger failed: {st_t} {t_body}"
-            exec_id_0 = str(t_body.get("execution_id") or t_body.get("automation_execution_id"))
-            _wait_for_execution(client, auto_id, exec_id_0, timeout_s=60.0)
-
-        # Scenario 1: Unsee real SEC 8-K (Item 2.02) and trigger dalton-meta-watch -> Direct Wake & Verdict
-        print(f"[G4] Scenario 1: Unseeing real META 8-K (Item 2.02) {acc_8k} and triggering dalton-meta-watch ...", flush=True)
-        unsee_8k_info = _unsee_filing_in_watch_state(meta_ws_id, "META", acc_8k)
-        synthetic.append(
-            {
-                "kind": "watch_state_unsee_filing",
-                "entry_point": "dalton_watch_state.state.seen_accessions",
-                "description": f"从 META seen_accessions 中移除真实存在的 SEC 8-K (Item 2.02) 申报号 {acc_8k}，触发直接唤醒。",
-            }
-        )
-        st_s1, s1_trig = client.request("POST", f"/api/v1/automations/{meta_watch_id}/trigger")
-        assert st_s1 == 200, f"Scenario 1 trigger failed: {st_s1} {s1_trig}"
-        s1_exec_id = str(s1_trig.get("execution_id") or s1_trig.get("automation_execution_id"))
-        s1_exec = _wait_for_execution(client, meta_watch_id, s1_exec_id, timeout_s=180.0)
-        s1_db = _query_preflight_and_signals(s1_exec_id, meta_ws_id)
-        _, s1_verdicts_resp = client.request(
-            "GET", "/api/v1/dalton/verdicts", params={"workspace_id": meta_ws_id}
-        )
-        s1_verdicts = (s1_verdicts_resp or {}).get("items") or []
-        print(
-            f"[G4] Scenario 1 done: exec_status={s1_exec.get('status')} "
-            f"preflight={((s1_db.get('preflight_log') or {}).get('reason'))} verdicts={len(s1_verdicts)}",
-            flush=True,
-        )
-
-        # Scenario 2: Unsee real SEC Form 4 and trigger dalton-meta-watch -> LLM Triage (assist.preflight.triage)
-        print(f"[G4] Scenario 2: Unseeing real META Form 4 {acc_form4} and triggering dalton-meta-watch ...", flush=True)
-        unsee_form4_info = _unsee_filing_in_watch_state(meta_ws_id, "META", acc_form4)
-        synthetic.append(
-            {
-                "kind": "watch_state_unsee_filing",
-                "entry_point": "dalton_watch_state.state.seen_accessions",
-                "description": f"从 META seen_accessions 中移除真实存在的 SEC Form 4 申报号 {acc_form4}，触发 preflight.triage 分诊。",
-            }
-        )
-        st_s2, s2_trig = client.request("POST", f"/api/v1/automations/{meta_watch_id}/trigger")
-        assert st_s2 == 200, f"Scenario 2 trigger failed: {st_s2} {s2_trig}"
-        s2_exec_id = str(s2_trig.get("execution_id") or s2_trig.get("automation_execution_id"))
-        s2_exec = _wait_for_execution(client, meta_watch_id, s2_exec_id, timeout_s=120.0)
-        s2_db = _query_preflight_and_signals(s2_exec_id, meta_ws_id)
-        internal_lit_check = _check_live_internal_literature_today(
-            client,
-            meta_watch_id=meta_watch_id,
-            meta_ws_id=meta_ws_id,
-            googl_watch_id=googl_watch_id,
-            googl_ws_id=googl_ws_id,
-        )
-        print(
-            f"[G4] Scenario 2 done: exec_status={s2_exec.get('status')} "
-            f"preflight={((s2_db.get('preflight_log') or {}).get('reason'))} "
-            f"internal_lit_has_new_docs={internal_lit_check['has_new_docs_today']}",
-            flush=True,
-        )
-
-        # Scenario 3: First import GOOGL agenda v1 with due validation V-201, then invoke dalton_agenda_note via HTTP chat turn to create v2 (source='tool')
-        print("[G4] Scenario 3a: Importing GOOGL agenda v1 (with V-201) and invoking dalton_agenda_note via POST /api/v1/threads/messages ...", flush=True)
-        now_iso = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-        due_agenda_payload = _build_agenda_doc(
-            open_questions=[],
-            next_validations=[
-                {
-                    "id": "V-201",
-                    "what": "验证 2Q26 Google Cloud 营业利润率突破 11.0%",
-                    "due": "2026-10-19",
-                    "note": "G4 到期验证项触发测试",
-                    "source": "GOOGL 2Q26 10-Q",
-                    "expected": "Google Cloud 营业利润率 >= 11.0%",
-                    "linked": {"pillars": ["P1"]},
-                    "status": "pending",
-                }
-            ],
-        )
-        due_agenda_payload["as_of"] = now_iso
-        st_imp_ag, imp_ag_body = client.request(
-            "POST",
-            f"/api/v1/dalton/knowledge/{googl_ws_id}/agenda/import",
-            json_body={
-                "content": due_agenda_payload,
-                "reason": "G4 inject due validation V-201 (due=2026-10-19)",
-            },
-        )
-        assert st_imp_ag == 200 and imp_ag_body.get("ok"), (
-            f"GOOGL agenda import failed: {st_imp_ag} {imp_ag_body}"
-        )
-        synthetic.append(
-            {
-                "kind": "knowledge_api_agenda",
-                "entry_point": f"POST /api/v1/dalton/knowledge/{googl_ws_id}/agenda/import",
-                "description": "向 GOOGL 导入包含到期验证项 V-201 (due=2026-10-19, status=pending) 的初始 agenda v1。",
-            }
-        )
-
-        st_home, home_body = client.request("POST", "/api/v1/workspaces/home", json_body={})
-        assert st_home in (200, 201) and isinstance(home_body, dict) and home_body.get("workspace_id"), (
-            f"POST /api/v1/workspaces/home failed: {st_home} {home_body}"
-        )
-        home_ws_id = str(home_body["workspace_id"])
-        client.request("POST", f"/api/v1/workspaces/{home_ws_id}/start", json_body={})
-
-        agenda_note_prompt = (
-            f"请立即调用一次 `dalton_agenda_note` 工具，向 GOOGL 工作区（`workspace_id=\"{googl_ws_id}\"`）写入一条议程问题：\n"
-            f"- `workspace_id`: `{googl_ws_id}`\n"
-            "- `ticker`: `GOOGL`\n"
-            "- `question`: `核查 2Q26 Google Cloud 营业利润率是否突破 11% 并持续改善`\n"
-            "- `value`: `high`\n"
-            "- `urgency`: `this_week`\n"
-            "- `why`: `G4 真实运行验证 dalton_agenda_note 工具写入`\n"
-            "调用成功后简短回复一行确认，不要调用其他工具。"
-        )
-        st_an, an_events, an_err = client.stream_sse(
-            "POST",
-            "/api/v1/threads/messages",
-            json_body={
-                "workspace_id": home_ws_id,
-                "llm_model": "claude-sonnet-5-5-low-oauth",
-                "messages": [{"role": "user", "content": agenda_note_prompt}],
-            },
-            max_events=1000,
-        )
-        assert st_an == 200 and an_err is None, f"dalton_agenda_note turn failed: {st_an} {an_err}"
-        an_thread_id = None
-        an_run_id = None
-        for ev in an_events:
-            if ev.get("event") in ("metadata", "run_end") and isinstance(ev.get("data"), dict):
-                an_thread_id = ev["data"].get("thread_id") or an_thread_id
-                an_run_id = ev["data"].get("run_id") or an_run_id
-        agenda_note_turn = {"status_code": st_an, "thread_id": an_thread_id, "response_id": an_run_id}
-        st_ag_v, ag_versions_body = client.request(
-            "GET", f"/api/v1/dalton/knowledge/{googl_ws_id}/agenda/versions"
-        )
-        ag_versions = (ag_versions_body or {}).get("items") or []
-        latest_ag_ver = ag_versions[0] if ag_versions else {}
-        st_ag_doc, ag_doc_body = client.request(
-            "GET",
-            f"/api/v1/dalton/knowledge/{googl_ws_id}/agenda/versions/{latest_ag_ver.get('version_no', 2)}",
-        )
-        ag_open_questions = ((ag_doc_body or {}).get("content") or {}).get("open_questions") or []
-        print(
-            f"[G4] Scenario 3a done: agenda version_no={latest_ag_ver.get('version_no')} "
-            f"source={latest_ag_ver.get('source')} open_questions={len(ag_open_questions)}",
-            flush=True,
-        )
-
-        # Scenario 3b: Trigger dalton-googl-watch -> wakes on V-201 & Q-001, records verdict & resolves both
-        print("[G4] Scenario 3b: Triggering dalton-googl-watch to wake on V-201 & Q-001 ...", flush=True)
-        st_s3, s3_trig = client.request("POST", f"/api/v1/automations/{googl_watch_id}/trigger")
-        assert st_s3 == 200, f"Scenario 3 trigger failed: {st_s3} {s3_trig}"
-        s3_exec_id = str(s3_trig.get("execution_id") or s3_trig.get("automation_execution_id"))
-        s3_exec = _wait_for_execution(client, googl_watch_id, s3_exec_id, timeout_s=180.0)
-        s3_db = _query_preflight_and_signals(s3_exec_id, googl_ws_id)
-        _, s3_verdicts_resp = client.request(
-            "GET", "/api/v1/dalton/verdicts", params={"workspace_id": googl_ws_id}
-        )
-        s3_verdicts = (s3_verdicts_resp or {}).get("items") or []
-        print(
-            f"[G4] Scenario 3b done: exec_status={s3_exec.get('status')} "
-            f"preflight={((s3_db.get('preflight_log') or {}).get('reason'))} verdicts={len(s3_verdicts)}",
-            flush=True,
-        )
-
-        # Scenario 4: Check Coverage Board & Signal Resolution + Two-User Isolation
-        print("[G4] Scenario 4: Checking GET /api/v1/dalton/coverage/board & 2-user isolation ...", flush=True)
-        st_board, board_body = client.request("GET", "/api/v1/dalton/coverage/board")
-        assert st_board == 200 and isinstance(board_body, dict), f"Coverage board failed: {st_board}"
-        board_companies = board_body.get("companies") or []
-        open_signals_by_ticker = {
-            str(c.get("ticker")): int(c.get("open_signals_count") or 0)
-            for c in board_companies
-            if isinstance(c, dict)
-        }
-        st_b_board, b_board_body = user_b_client.get("/api/v1/dalton/coverage/board")
-        assert st_b_board == 200 and isinstance(b_board_body, dict)
-        b_ws_ids = {
-            str(c.get("workspace_id"))
-            for c in (b_board_body.get("companies") or [])
-            if isinstance(c, dict) and c.get("workspace_id")
-        }
-        assert meta_ws_id not in b_ws_ids and googl_ws_id not in b_ws_ids, (
-            f"Two-user isolation failed on coverage/board: {other_user} saw {pm_user} workspaces"
-        )
-        st_b_verdicts, b_verdicts_body = user_b_client.get("/api/v1/dalton/verdicts")
-        assert st_b_verdicts == 200 and isinstance(b_verdicts_body, dict)
-        b_verdict_ws = {
-            str(v.get("workspace_id"))
-            for v in (b_verdicts_body.get("items") or [])
-            if isinstance(v, dict)
-        }
-        assert meta_ws_id not in b_verdict_ws and googl_ws_id not in b_verdict_ws
-        st_b_pr, b_pr_body = user_b_client.get("/api/v1/dalton/publish-requests")
-        assert st_b_pr == 200 and isinstance(b_pr_body, dict)
-        b_pr_ws = {
-            str(p.get("workspace_id"))
-            for p in (b_pr_body.get("items") or [])
-            if isinstance(p, dict)
-        }
-        assert meta_ws_id not in b_pr_ws and googl_ws_id not in b_pr_ws
-
-        two_user_isolation = {
-            "pm_user": pm_user,
-            "other_user": other_user,
-            "other_user_visible_pm_workspaces_on_board": len(b_ws_ids & {meta_ws_id, googl_ws_id}),
-            "other_user_visible_pm_verdicts": len(b_verdict_ws & {meta_ws_id, googl_ws_id}),
-            "other_user_visible_pm_publish_requests": len(b_pr_ws & {meta_ws_id, googl_ws_id}),
-        }
-        print(f"[G4] Scenario 4 done: open_signals_by_ticker={open_signals_by_ticker}", flush=True)
-
-        # Scenario 5: Trigger dalton-director-daily when no actionable items remain -> Zero-Token Skip
-        print("[G4] Scenario 5: Triggering dalton-director-daily when 0 actionable items remain ...", flush=True)
-        _, budget_before_s5 = client.request("GET", "/api/v1/dalton/budget/today")
-        spent_before_s5 = float((budget_before_s5 or {}).get("spent_usd") or 0.0)
-        st_s5, s5_trig = client.request("POST", f"/api/v1/automations/{director_daily_id}/trigger")
-        assert st_s5 == 200, f"Scenario 5 trigger failed: {st_s5} {s5_trig}"
-        s5_exec_id = str(s5_trig.get("execution_id") or s5_trig.get("automation_execution_id"))
-        s5_exec = _wait_for_execution(client, director_daily_id, s5_exec_id, timeout_s=60.0)
-        s5_db = _query_preflight_and_signals(s5_exec_id, None)
-        _, budget_after_s5 = client.request("GET", "/api/v1/dalton/budget/today")
-        spent_after_s5 = float((budget_after_s5 or {}).get("spent_usd") or 0.0)
-        s5_cash_spend_usd = max(0.0, round(spent_after_s5 - spent_before_s5, 6))
-        assert s5_cash_spend_usd == 0.0, f"Expected Scenario 5 zero-token skip to spend $0.00, got ${s5_cash_spend_usd:.6f}"
-        print(
-            f"[G4] Scenario 5 done: exec_status={s5_exec.get('status')} "
-            f"preflight={((s5_db.get('preflight_log') or {}).get('reason'))} cash_spend=${s5_cash_spend_usd:.2f}",
-            flush=True,
-        )
-
-        # Scenario 6: Accumulate >= $0.01 real cash spend if needed, lower daily_cap_usd to $0.01, and trigger watch + one-shot tm3
-        print("[G4] Scenario 6: Accumulating >= $0.01 cash spend and lowering daily_cap_usd to $0.01 ...", flush=True)
-        spend_deadline = time.monotonic() + 300.0
-        turn_idx = 0
-        while time.monotonic() < spend_deadline:
-            _, cur_today = client.request("GET", "/api/v1/dalton/budget/today")
-            cur_spent = float((cur_today or {}).get("spent_usd") or 0.0)
-            if cur_spent >= 0.01:
-                break
-            turn_idx += 1
-            sub_prompt = (
-                f"请在本轮响应中调用 1 次 `Task` 工具（使用 `subagent_type='general-purpose'`，命名为 `G4-{turn_idx}-A`）。\n"
-                "在 `Task` 的 `prompt` 中，要求该子智能体严格按顺序分 2 轮调用 `Bash` 工具（每轮等待上一轮返回后再发起下一轮，每次输出 150 行随机数据以保留在上下文内）：\n"
-                "第 1 轮在子智能体中执行：`python3 -c \"import uuid; print('\\n'.join(f'R1_{i:03d}_{uuid.uuid4().hex}_{uuid.uuid4().hex}' for i in range(150)))\"`；\n"
-                "第 2 轮在子智能体中执行：`python3 -c \"import uuid; print('\\n'.join(f'R2_{i:03d}_{uuid.uuid4().hex}_{uuid.uuid4().hex}' for i in range(150)))\"`；\n"
-                "第 2 轮返回后，子智能体撰写 300 字详细财务敏感性结论并返回。"
+            st_prior_b, body_prior_b = client.get("/api/v1/dalton/budget")
+            if st_prior_b == 200 and isinstance(body_prior_b, dict):
+                prior_budget_pm = body_prior_b
+                was_configured_pm = bool(body_prior_b.get("configured"))
+            st_prior_bt, body_prior_bt = client.get("/api/v1/dalton/budget/today")
+            baseline_spent_pm = (
+                float(body_prior_bt.get("spent_usd") or 0.0)
+                if st_prior_bt == 200 and isinstance(body_prior_bt, dict)
+                else 0.0
             )
-            st_sub, _, sub_err = client.stream_sse(
+            initial_cap_usd = round(max(15.0, baseline_spent_pm + 15.0), 2)
+
+            # Configure initial daily budget and BYOK DeepSeek key
+            st_b, body_b = client.request(
+                "PUT",
+                "/api/v1/dalton/budget",
+                json_body={"daily_cap_usd": initial_cap_usd, "default_task_cap_usd": 5.0},
+            )
+            assert st_b == 200, f"PUT /api/v1/dalton/budget failed: {st_b} {body_b}"
+            budget_modified_pm = True
+            synthetic.append(
+                {
+                    "kind": "settings_api_budget",
+                    "entry_point": "PUT /api/v1/dalton/budget",
+                    "description": f"初始化测试用户 {pm_user} 日预算上限 ${initial_cap_usd:.2f}，在场景 6 下调至 $0.01 触发共享预算熔断，验证完成后恢复原预算状态。",
+                }
+            )
+
+            ds_key = _resolve_deepseek_key()
+            st_byok, body_byok = client.request(
+                "PUT",
+                "/api/v1/users/me/api-keys",
+                json_body={"byok_enabled": True, "api_keys": {"deepseek": ds_key}},
+            )
+            assert st_byok == 200, f"PUT /api/v1/users/me/api-keys failed: {st_byok} {body_byok}"
+
+            # Configure `general-purpose` subagent to use cash model `deepseek-flash` so real cash spend can accumulate >= $0.01
+            st_sa_get, sa_list = client.request("GET", "/api/v1/subagents")
+            assert st_sa_get == 200 and isinstance(sa_list, dict), f"GET /api/v1/subagents failed: {st_sa_get} {sa_list}"
+            gp_item = next(
+                (s for s in (sa_list.get("subagents") or []) if isinstance(s, dict) and s.get("name") == "general-purpose"),
+                {},
+            )
+            sa_version = str(gp_item.get("version") or "")
+            st_sa_put, sa_put_resp = client.request(
+                "PUT",
+                "/api/v1/subagents/general-purpose",
+                json_body={"version": sa_version, "fields": {"model": "deepseek-flash"}},
+            )
+            assert st_sa_put == 200, f"PUT /api/v1/subagents/general-purpose failed: {st_sa_put} {sa_put_resp}"
+
+            # Snapshot and temporarily clear any pre-existing migrated workspace agendas owned by pm_user
+            # so Scenario 5 (director_daily zero-token skip) does not wake on pre-existing migrated open questions.
+            # Exact prior agenda contents are restored in finally.
+            st_pre_board, pre_board_body = client.get("/api/v1/dalton/coverage/board")
+            if st_pre_board == 200 and isinstance(pre_board_body, dict):
+                seen_pre_ws: set[str] = set()
+                for comp in pre_board_body.get("companies") or []:
+                    if not isinstance(comp, dict):
+                        continue
+                    pre_ws_id = str(comp.get("workspace_id") or "").strip()
+                    if not pre_ws_id or pre_ws_id in seen_pre_ws:
+                        continue
+                    seen_pre_ws.add(pre_ws_id)
+                    st_pv, pv_body = client.get(f"/api/v1/dalton/knowledge/{pre_ws_id}/agenda/versions")
+                    pv_items = (pv_body or {}).get("items") or [] if st_pv == 200 and isinstance(pv_body, dict) else []
+                    if not pv_items:
+                        continue
+                    latest_pv = max(pv_items, key=lambda it: int(it.get("version_no") or 0))
+                    latest_pv_no = int(latest_pv.get("version_no") or 0)
+                    latest_pv_reason = str(latest_pv.get("reason") or "Restore pre-G4 agenda")
+                    st_pdoc, pdoc_body = client.get(
+                        f"/api/v1/dalton/knowledge/{pre_ws_id}/agenda/versions/{latest_pv_no}"
+                    )
+                    if st_pdoc == 200 and isinstance(pdoc_body, dict) and isinstance(pdoc_body.get("content"), dict):
+                        saved_preexisting_agendas.append(
+                            (pre_ws_id, dict(pdoc_body["content"]), latest_pv_reason)
+                        )
+                        st_clr, clr_body = client.request(
+                            "POST",
+                            f"/api/v1/dalton/knowledge/{pre_ws_id}/agenda/import",
+                            json_body={
+                                "content": _build_agenda_doc(),
+                                "reason": "G4 temporary clean agenda for Scenario 5 zero-token director probe",
+                            },
+                        )
+                        assert st_clr == 200 and clr_body.get("ok"), (
+                            f"Temporary clean agenda import failed for {pre_ws_id}: {st_clr} {clr_body}"
+                        )
+                        synthetic.append(
+                            {
+                                "kind": "knowledge_api_agenda",
+                                "entry_point": f"POST /api/v1/dalton/knowledge/{pre_ws_id}/agenda/import",
+                                "description": f"临时清空 {pm_user} 既有工作区 {pre_ws_id} 的待办议程以供场景 5 零信号检查（finally 中恢复原议程版本）。",
+                            }
+                        )
+
+            # Create & start META and GOOGL workspaces
+            print(f"[G4] Creating META and GOOGL workspaces for user={test_user_id} ...", flush=True)
+            meta_ws_id = _create_started_workspace(client, "META", "META G4 Real-Run Workspace")
+            created_ws_ids.append(meta_ws_id)
+            googl_ws_id = _create_started_workspace(client, "GOOGL", "GOOGL G4 Real-Run Workspace")
+            created_ws_ids.append(googl_ws_id)
+
+            # Import initial company, thesis, and empty agenda for META; import company and thesis for GOOGL
+            # (GOOGL agenda v1 with V-201 is imported in Scenario 3 before dalton_agenda_note writes v2)
+            for ws_id, ticker, name, cik, include_empty_agenda in [
+                (meta_ws_id, "META", "Meta Platforms, Inc.", "0001326801", True),
+                (googl_ws_id, "GOOGL", "Alphabet Inc.", "0001652044", False),
+            ]:
+                docs_to_import: list[tuple[str, dict[str, Any]]] = [
+                    ("company", _build_company_doc(ticker, name, cik)),
+                    ("thesis", _build_thesis_doc(ticker)),
+                ]
+                if include_empty_agenda:
+                    docs_to_import.append(("agenda", _build_agenda_doc()))
+                for doc_key, doc_payload in docs_to_import:
+                    st_imp, imp_body = client.request(
+                        "POST",
+                        f"/api/v1/dalton/knowledge/{ws_id}/{doc_key}/import",
+                        json_body={"content": doc_payload, "reason": f"G4 initial {doc_key} bootstrap"},
+                    )
+                    assert st_imp == 200 and imp_body.get("ok"), (
+                        f"Import {doc_key} failed for {ticker}: {st_imp} {imp_body}"
+                    )
+
+            # Fetch live SEC submissions for META to identify real 8-K (Item 2.02) and Form 4 accessions
+            meta_sec_data = _fetch_sec_submissions("0001326801")
+            real_8k_202 = _find_filing_accession(meta_sec_data, target_form="8-K", require_item_202=True)
+            real_form4 = _find_filing_accession(meta_sec_data, target_form="4", require_item_202=False)
+            acc_8k = real_8k_202["accession_number"]
+            acc_form4 = real_form4["accession_number"]
+
+            # Schedule dalton-meta-watch, dalton-googl-watch, dalton-director-daily, and dalton-googl-earn-2q26-tm3
+            meta_watch_instruction = (
+                f"请阅读本轮 `<dalton_wake>` 中的触发信号 `filing:{acc_8k}`，立即调用一次 "
+                "`knowledge_append_verdict` 工具。请将以下 JSON 对象直接作为 `verdict` 参数的值传入（注意：`verdict` 参数本身就是该字典，不要在字典外层再套一层 `verdict` 键）：\n"
+                "```json\n"
+                "{\n"
+                f'  "trigger": {{"kind": "filing", "ref": "filing:{acc_8k}"}},\n'
+                f'  "event": "META 披露 8-K (Item 2.02, accession={acc_8k}) 季度业绩公告",\n'
+                '  "verdict": "NO_CHANGE",\n'
+                '  "rationale": "核查 SEC 8-K Item 2.02 披露内容，广告收入与 CapEx 指引符合预期，维持现有核心判断。",\n'
+                '  "next_validation": {"what": "跟踪下季广告展现量与单价同比增速", "due": "2026-12-31"},\n'
+                '  "progress": "some"\n'
+                "}\n"
+                "```\n"
+                "调用成功后立即用一句话回复完成，不要调用任何其他工具。"
+            )
+            st_mw, mw_body = client.request(
+                "PUT",
+                "/api/v1/dalton/automations/dalton-meta-watch",
+                json_body={
+                    "workspace_id": meta_ws_id,
+                    "spec": {
+                        "description": "META 日常信号巡检",
+                        "trigger_type": "cron",
+                        "cron_expression": "*/30 6-20 * * 1-5",
+                        "timezone": "America/New_York",
+                        "workspace_id": meta_ws_id,
+                        "llm_model": "claude-sonnet-5-5-low-oauth",
+                        "thread_strategy": "new",
+                        "instruction": meta_watch_instruction,
+                        "metadata": {
+                            "dalton_managed": True,
+                            "dalton_kind": "company_watch",
+                            "ticker": "META",
+                            "tier": "Core",
+                        },
+                    },
+                },
+            )
+            assert st_mw == 200 and mw_body.get("ok"), f"Schedule dalton-meta-watch failed: {st_mw} {mw_body}"
+            meta_watch_id = str(mw_body["automation_id"])
+            created_auto_ids.append(meta_watch_id)
+
+            googl_watch_instruction = (
+                "请阅读本轮 `<dalton_wake>` 中的到期验证信号 `validation:V-201` 与议程问题 `pm_question:Q-001`，立即调用一次 "
+                "`knowledge_append_verdict` 工具：\n"
+                "1. `verdict` 参数的值（直接传入以下字典，不要在外层再包一层 `verdict` 键）：\n"
+                "```json\n"
+                "{\n"
+                '  "trigger": {"kind": "due_validation", "ref": "V-201"},\n'
+                '  "event": "GOOGL 2Q26 Google Cloud 营业利润率达 11.3%，兑现 V-201 到期验证项并解答 Q-001",\n'
+                '  "verdict": "THESIS_STRENGTHENED",\n'
+                '  "rationale": "2Q26 Google Cloud 营业利润率 11.3% 突破 11.0% 阈值，经营杠杆持续释放。",\n'
+                '  "next_validation": {"what": "跟踪 3Q26 Google Cloud 营业利润率维持 11% 以上", "due": "2026-12-31", "validation_id": "V-201"},\n'
+                '  "progress": "resolved",\n'
+                '  "question_ids": ["Q-001"]\n'
+                "}\n"
+                "```\n"
+                "2. 同时传入 `agenda_ops` 参数以将 `Q-001` 标记为 `resolved`：\n"
+                "```json\n"
+                "[\n"
+                '  {"op": "set", "path": "/open_questions/Q-001/status", "value": "resolved"},\n'
+                '  {"op": "set", "path": "/open_questions/Q-001/resolution", "value": "2Q26 Google Cloud 营业利润率 11.3% 已核实兑现"}\n'
+                "]\n"
+                "```\n"
+                "调用成功后立即用一句话回复完成，不要调用任何其他工具。"
+            )
+            st_gw, gw_body = client.request(
+                "PUT",
+                "/api/v1/dalton/automations/dalton-googl-watch",
+                json_body={
+                    "workspace_id": googl_ws_id,
+                    "spec": {
+                        "description": "GOOGL 日常信号巡检",
+                        "trigger_type": "cron",
+                        "cron_expression": "*/30 6-20 * * 1-5",
+                        "timezone": "America/New_York",
+                        "workspace_id": googl_ws_id,
+                        "llm_model": "claude-sonnet-5-5-low-oauth",
+                        "thread_strategy": "new",
+                        "instruction": googl_watch_instruction,
+                        "metadata": {
+                            "dalton_managed": True,
+                            "dalton_kind": "company_watch",
+                            "ticker": "GOOGL",
+                            "tier": "Core",
+                        },
+                    },
+                },
+            )
+            assert st_gw == 200 and gw_body.get("ok"), f"Schedule dalton-googl-watch failed: {st_gw} {gw_body}"
+            googl_watch_id = str(gw_body["automation_id"])
+            created_auto_ids.append(googl_watch_id)
+
+            st_dd, dd_body = client.request(
+                "PUT",
+                "/api/v1/dalton/automations/dalton-director-daily",
+                json_body={
+                    "spec": {
+                        "description": "Dalton 研究总监每日晨会调度",
+                        "trigger_type": "cron",
+                        "cron_expression": "30 7 * * 1-5",
+                        "timezone": "America/New_York",
+                        "workspace_id": None,
+                        "llm_model": "claude-sonnet-5-5-low-oauth",
+                        "thread_strategy": "new",
+                        "instruction": "请调用 dalton_coverage_board 查看覆盖池状态并简短回复。",
+                        "metadata": {
+                            "dalton_managed": True,
+                            "dalton_kind": "director_daily",
+                        },
+                    },
+                },
+            )
+            assert st_dd == 200 and dd_body.get("ok"), f"Schedule dalton-director-daily failed: {st_dd} {dd_body}"
+            director_daily_id = str(dd_body["automation_id"])
+            created_auto_ids.append(director_daily_id)
+
+            initial_tm3_dt = (datetime.now(timezone.utc) + timedelta(days=1)).replace(
+                hour=12, minute=0, second=0, microsecond=0
+            )
+            initial_tm3_run_at = initial_tm3_dt.isoformat().replace("+00:00", "Z")
+            expected_tm3_postponed_date = (initial_tm3_dt + timedelta(days=1)).strftime("%Y-%m-%d")
+            st_tm3, tm3_body = client.request(
+                "PUT",
+                "/api/v1/dalton/automations/dalton-googl-earn-2q26-tm3",
+                json_body={
+                    "workspace_id": googl_ws_id,
+                    "spec": {
+                        "description": "GOOGL 2Q26 财报前瞻（T-3）",
+                        "trigger_type": "once",
+                        "next_run_at": initial_tm3_run_at,
+                        "timezone": "America/New_York",
+                        "workspace_id": googl_ws_id,
+                        "llm_model": "claude-sonnet-5-5-low-oauth",
+                        "thread_strategy": "new",
+                        "instruction": "请生成 GOOGL 2Q26 财报前瞻草稿。",
+                        "metadata": {
+                            "dalton_managed": True,
+                            "dalton_kind": "earnings_tm3",
+                            "ticker": "GOOGL",
+                            "period": "2Q26",
+                        },
+                    },
+                },
+            )
+            assert st_tm3 == 200 and tm3_body.get("ok"), f"Schedule dalton-googl-earn-2q26-tm3 failed: {st_tm3} {tm3_body}"
+            tm3_id = str(tm3_body["automation_id"])
+            created_auto_ids.append(tm3_id)
+
+            # Step 0: Bootstrap SEC watermarks for META and GOOGL via initial trigger
+            print("[G4] Step 0: Bootstrapping SEC watermarks for META and GOOGL ...", flush=True)
+            for auto_id in (meta_watch_id, googl_watch_id):
+                st_t, t_body = client.request("POST", f"/api/v1/automations/{auto_id}/trigger")
+                assert st_t == 200, f"Bootstrap trigger failed: {st_t} {t_body}"
+                exec_id_0 = str(t_body.get("execution_id") or t_body.get("automation_execution_id"))
+                _wait_for_execution(client, auto_id, exec_id_0, timeout_s=60.0)
+
+            # Scenario 1: Unsee real SEC 8-K (Item 2.02) and trigger dalton-meta-watch -> Direct Wake & Verdict
+            print(f"[G4] Scenario 1: Unseeing real META 8-K (Item 2.02) {acc_8k} and triggering dalton-meta-watch ...", flush=True)
+            unsee_8k_info = _unsee_filing_in_watch_state(meta_ws_id, "META", acc_8k)
+            synthetic.append(
+                {
+                    "kind": "watch_state_unsee_filing",
+                    "entry_point": "dalton_watch_state.state.seen_accessions",
+                    "description": f"从 META seen_accessions 中移除真实存在的 SEC 8-K (Item 2.02) 申报号 {acc_8k}，触发直接唤醒。",
+                }
+            )
+            st_s1, s1_trig = client.request("POST", f"/api/v1/automations/{meta_watch_id}/trigger")
+            assert st_s1 == 200, f"Scenario 1 trigger failed: {st_s1} {s1_trig}"
+            s1_exec_id = str(s1_trig.get("execution_id") or s1_trig.get("automation_execution_id"))
+            s1_exec = _wait_for_execution(client, meta_watch_id, s1_exec_id, timeout_s=180.0)
+            s1_db = _query_preflight_and_signals(s1_exec_id, meta_ws_id)
+            _, s1_verdicts_resp = client.request(
+                "GET", "/api/v1/dalton/verdicts", params={"workspace_id": meta_ws_id}
+            )
+            s1_verdicts = (s1_verdicts_resp or {}).get("items") or []
+            print(
+                f"[G4] Scenario 1 done: exec_status={s1_exec.get('status')} "
+                f"preflight={((s1_db.get('preflight_log') or {}).get('reason'))} verdicts={len(s1_verdicts)}",
+                flush=True,
+            )
+
+            # Scenario 2: Unsee real SEC Form 4 and trigger dalton-meta-watch -> LLM Triage (assist.preflight.triage)
+            print(f"[G4] Scenario 2: Unseeing real META Form 4 {acc_form4} and triggering dalton-meta-watch ...", flush=True)
+            unsee_form4_info = _unsee_filing_in_watch_state(meta_ws_id, "META", acc_form4)
+            synthetic.append(
+                {
+                    "kind": "watch_state_unsee_filing",
+                    "entry_point": "dalton_watch_state.state.seen_accessions",
+                    "description": f"从 META seen_accessions 中移除真实存在的 SEC Form 4 申报号 {acc_form4}，触发 preflight.triage 分诊。",
+                }
+            )
+            st_s2, s2_trig = client.request("POST", f"/api/v1/automations/{meta_watch_id}/trigger")
+            assert st_s2 == 200, f"Scenario 2 trigger failed: {st_s2} {s2_trig}"
+            s2_exec_id = str(s2_trig.get("execution_id") or s2_trig.get("automation_execution_id"))
+            s2_exec = _wait_for_execution(client, meta_watch_id, s2_exec_id, timeout_s=120.0)
+            s2_db = _query_preflight_and_signals(s2_exec_id, meta_ws_id)
+            internal_lit_check = _check_live_internal_literature_today(
+                client,
+                meta_watch_id=meta_watch_id,
+                meta_ws_id=meta_ws_id,
+                googl_watch_id=googl_watch_id,
+                googl_ws_id=googl_ws_id,
+            )
+            print(
+                f"[G4] Scenario 2 done: exec_status={s2_exec.get('status')} "
+                f"preflight={((s2_db.get('preflight_log') or {}).get('reason'))} "
+                f"internal_lit_has_new_docs={internal_lit_check['has_new_docs_today']}",
+                flush=True,
+            )
+
+            # Scenario 3: First import GOOGL agenda v1 with due validation V-201, then invoke dalton_agenda_note via HTTP chat turn to create v2 (source='tool')
+            print("[G4] Scenario 3a: Importing GOOGL agenda v1 (with V-201) and invoking dalton_agenda_note via POST /api/v1/threads/messages ...", flush=True)
+            now_iso = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            due_agenda_payload = _build_agenda_doc(
+                open_questions=[],
+                next_validations=[
+                    {
+                        "id": "V-201",
+                        "what": "验证 2Q26 Google Cloud 营业利润率突破 11.0%",
+                        "due": "2026-10-19",
+                        "note": "G4 到期验证项触发测试",
+                        "source": "GOOGL 2Q26 10-Q",
+                        "expected": "Google Cloud 营业利润率 >= 11.0%",
+                        "linked": {"pillars": ["P1"]},
+                        "status": "pending",
+                    }
+                ],
+            )
+            due_agenda_payload["as_of"] = now_iso
+            st_imp_ag, imp_ag_body = client.request(
+                "POST",
+                f"/api/v1/dalton/knowledge/{googl_ws_id}/agenda/import",
+                json_body={
+                    "content": due_agenda_payload,
+                    "reason": "G4 inject due validation V-201 (due=2026-10-19)",
+                },
+            )
+            assert st_imp_ag == 200 and imp_ag_body.get("ok"), (
+                f"GOOGL agenda import failed: {st_imp_ag} {imp_ag_body}"
+            )
+            synthetic.append(
+                {
+                    "kind": "knowledge_api_agenda",
+                    "entry_point": f"POST /api/v1/dalton/knowledge/{googl_ws_id}/agenda/import",
+                    "description": "向 GOOGL 导入包含到期验证项 V-201 (due=2026-10-19, status=pending) 的初始 agenda v1。",
+                }
+            )
+
+            st_home, home_body = client.request("POST", "/api/v1/workspaces/home", json_body={})
+            assert st_home in (200, 201) and isinstance(home_body, dict) and home_body.get("workspace_id"), (
+                f"POST /api/v1/workspaces/home failed: {st_home} {home_body}"
+            )
+            home_ws_id = str(home_body["workspace_id"])
+            client.request("POST", f"/api/v1/workspaces/{home_ws_id}/start", json_body={})
+
+            agenda_note_prompt = (
+                f"请立即调用一次 `dalton_agenda_note` 工具，向 GOOGL 工作区（`workspace_id=\"{googl_ws_id}\"`）写入一条议程问题：\n"
+                f"- `workspace_id`: `{googl_ws_id}`\n"
+                "- `ticker`: `GOOGL`\n"
+                "- `question`: `核查 2Q26 Google Cloud 营业利润率是否突破 11% 并持续改善`\n"
+                "- `value`: `high`\n"
+                "- `urgency`: `this_week`\n"
+                "- `why`: `G4 真实运行验证 dalton_agenda_note 工具写入`\n"
+                "调用成功后简短回复一行确认，不要调用其他工具。"
+            )
+            st_an, an_events, an_err = client.stream_sse(
                 "POST",
                 "/api/v1/threads/messages",
                 json_body={
-                    "workspace_id": googl_ws_id,
+                    "workspace_id": home_ws_id,
                     "llm_model": "claude-sonnet-5-5-low-oauth",
-                    "messages": [{"role": "user", "content": sub_prompt}],
+                    "messages": [{"role": "user", "content": agenda_note_prompt}],
                 },
-                max_events=2500,
+                max_events=1000,
             )
-            assert st_sub == 200 and sub_err is None, f"Cash spend turn {turn_idx} failed: {st_sub} {sub_err}"
-            settle_deadline = time.monotonic() + 60.0
-            settled = False
-            while time.monotonic() < settle_deadline:
-                _, poll_today = client.request("GET", "/api/v1/dalton/budget/today")
-                if float((poll_today or {}).get("open_reserved_usd") or 0.0) == 0.0:
-                    settled = True
+            assert st_an == 200 and an_err is None, f"dalton_agenda_note turn failed: {st_an} {an_err}"
+            an_thread_id = None
+            an_run_id = None
+            for ev in an_events:
+                if ev.get("event") in ("metadata", "run_end") and isinstance(ev.get("data"), dict):
+                    an_thread_id = ev["data"].get("thread_id") or an_thread_id
+                    an_run_id = ev["data"].get("run_id") or an_run_id
+            agenda_note_turn = {"status_code": st_an, "thread_id": an_thread_id, "response_id": an_run_id}
+            st_ag_v, ag_versions_body = client.request(
+                "GET", f"/api/v1/dalton/knowledge/{googl_ws_id}/agenda/versions"
+            )
+            ag_versions = (ag_versions_body or {}).get("items") or []
+            latest_ag_ver = ag_versions[0] if ag_versions else {}
+            st_ag_doc, ag_doc_body = client.request(
+                "GET",
+                f"/api/v1/dalton/knowledge/{googl_ws_id}/agenda/versions/{latest_ag_ver.get('version_no', 2)}",
+            )
+            ag_open_questions = ((ag_doc_body or {}).get("content") or {}).get("open_questions") or []
+            print(
+                f"[G4] Scenario 3a done: agenda version_no={latest_ag_ver.get('version_no')} "
+                f"source={latest_ag_ver.get('source')} open_questions={len(ag_open_questions)}",
+                flush=True,
+            )
+
+            # Scenario 3b: Trigger dalton-googl-watch -> wakes on V-201 & Q-001, records verdict & resolves both
+            print("[G4] Scenario 3b: Triggering dalton-googl-watch to wake on V-201 & Q-001 ...", flush=True)
+            st_s3, s3_trig = client.request("POST", f"/api/v1/automations/{googl_watch_id}/trigger")
+            assert st_s3 == 200, f"Scenario 3 trigger failed: {st_s3} {s3_trig}"
+            s3_exec_id = str(s3_trig.get("execution_id") or s3_trig.get("automation_execution_id"))
+            s3_exec = _wait_for_execution(client, googl_watch_id, s3_exec_id, timeout_s=180.0)
+            s3_db = _query_preflight_and_signals(s3_exec_id, googl_ws_id)
+            _, s3_verdicts_resp = client.request(
+                "GET", "/api/v1/dalton/verdicts", params={"workspace_id": googl_ws_id}
+            )
+            s3_verdicts = (s3_verdicts_resp or {}).get("items") or []
+            print(
+                f"[G4] Scenario 3b done: exec_status={s3_exec.get('status')} "
+                f"preflight={((s3_db.get('preflight_log') or {}).get('reason'))} verdicts={len(s3_verdicts)}",
+                flush=True,
+            )
+
+            # Scenario 4: Check Coverage Board & Signal Resolution + Two-User Isolation
+            print("[G4] Scenario 4: Checking GET /api/v1/dalton/coverage/board & 2-user isolation ...", flush=True)
+            st_board, board_body = client.request("GET", "/api/v1/dalton/coverage/board")
+            assert st_board == 200 and isinstance(board_body, dict), f"Coverage board failed: {st_board}"
+            board_companies = board_body.get("companies") or []
+            open_signals_by_ticker = {
+                str(c.get("ticker")): int(c.get("open_signals_count") or 0)
+                for c in board_companies
+                if isinstance(c, dict)
+            }
+            st_b_board, b_board_body = user_b_client.get("/api/v1/dalton/coverage/board")
+            assert st_b_board == 200 and isinstance(b_board_body, dict)
+            b_ws_ids = {
+                str(c.get("workspace_id"))
+                for c in (b_board_body.get("companies") or [])
+                if isinstance(c, dict) and c.get("workspace_id")
+            }
+            assert meta_ws_id not in b_ws_ids and googl_ws_id not in b_ws_ids, (
+                f"Two-user isolation failed on coverage/board: {other_user} saw {pm_user} workspaces"
+            )
+            st_b_verdicts, b_verdicts_body = user_b_client.get("/api/v1/dalton/verdicts")
+            assert st_b_verdicts == 200 and isinstance(b_verdicts_body, dict)
+            b_verdict_ws = {
+                str(v.get("workspace_id"))
+                for v in (b_verdicts_body.get("items") or [])
+                if isinstance(v, dict)
+            }
+            assert meta_ws_id not in b_verdict_ws and googl_ws_id not in b_verdict_ws
+            st_b_pr, b_pr_body = user_b_client.get("/api/v1/dalton/publish-requests")
+            assert st_b_pr == 200 and isinstance(b_pr_body, dict)
+            b_pr_ws = {
+                str(p.get("workspace_id"))
+                for p in (b_pr_body.get("items") or [])
+                if isinstance(p, dict)
+            }
+            assert meta_ws_id not in b_pr_ws and googl_ws_id not in b_pr_ws
+
+            two_user_isolation = {
+                "pm_user": pm_user,
+                "other_user": other_user,
+                "other_user_visible_pm_workspaces_on_board": len(b_ws_ids & {meta_ws_id, googl_ws_id}),
+                "other_user_visible_pm_verdicts": len(b_verdict_ws & {meta_ws_id, googl_ws_id}),
+                "other_user_visible_pm_publish_requests": len(b_pr_ws & {meta_ws_id, googl_ws_id}),
+            }
+            print(f"[G4] Scenario 4 done: open_signals_by_ticker={open_signals_by_ticker}", flush=True)
+
+            # Scenario 5: Trigger dalton-director-daily when no actionable items remain -> Zero-Token Skip
+            print("[G4] Scenario 5: Triggering dalton-director-daily when 0 actionable items remain ...", flush=True)
+            _, budget_before_s5 = client.request("GET", "/api/v1/dalton/budget/today")
+            spent_before_s5 = float((budget_before_s5 or {}).get("spent_usd") or 0.0)
+            st_s5, s5_trig = client.request("POST", f"/api/v1/automations/{director_daily_id}/trigger")
+            assert st_s5 == 200, f"Scenario 5 trigger failed: {st_s5} {s5_trig}"
+            s5_exec_id = str(s5_trig.get("execution_id") or s5_trig.get("automation_execution_id"))
+            s5_exec = _wait_for_execution(client, director_daily_id, s5_exec_id, timeout_s=60.0)
+            s5_db = _query_preflight_and_signals(s5_exec_id, None)
+            _, budget_after_s5 = client.request("GET", "/api/v1/dalton/budget/today")
+            spent_after_s5 = float((budget_after_s5 or {}).get("spent_usd") or 0.0)
+            s5_cash_spend_usd = max(0.0, round(spent_after_s5 - spent_before_s5, 6))
+            assert s5_cash_spend_usd == 0.0, f"Expected Scenario 5 zero-token skip to spend $0.00, got ${s5_cash_spend_usd:.6f}"
+            print(
+                f"[G4] Scenario 5 done: exec_status={s5_exec.get('status')} "
+                f"preflight={((s5_db.get('preflight_log') or {}).get('reason'))} cash_spend=${s5_cash_spend_usd:.2f}",
+                flush=True,
+            )
+
+            # Scenario 6: Accumulate >= $0.01 real cash spend if needed, lower daily_cap_usd to $0.01, and trigger watch + one-shot tm3
+            print("[G4] Scenario 6: Accumulating >= $0.01 cash spend and lowering daily_cap_usd to $0.01 ...", flush=True)
+            spend_deadline = time.monotonic() + 300.0
+            turn_idx = 0
+            while time.monotonic() < spend_deadline:
+                _, cur_today = client.request("GET", "/api/v1/dalton/budget/today")
+                cur_spent = float((cur_today or {}).get("spent_usd") or 0.0)
+                if cur_spent >= 0.01:
                     break
-                time.sleep(2.0)
-            if not settled:
-                raise TimeoutError(
-                    f"Timed out after 60s waiting for open_reserved_usd == 0.0 after turn {turn_idx}"
+                turn_idx += 1
+                sub_prompt = (
+                    f"请在本轮响应中调用 1 次 `Task` 工具（使用 `subagent_type='general-purpose'`，命名为 `G4-{turn_idx}-A`）。\n"
+                    "在 `Task` 的 `prompt` 中，要求该子智能体严格按顺序分 2 轮调用 `Bash` 工具（每轮等待上一轮返回后再发起下一轮，每次输出 150 行随机数据以保留在上下文内）：\n"
+                    "第 1 轮在子智能体中执行：`python3 -c \"import uuid; print('\\n'.join(f'R1_{i:03d}_{uuid.uuid4().hex}_{uuid.uuid4().hex}' for i in range(150)))\"`；\n"
+                    "第 2 轮在子智能体中执行：`python3 -c \"import uuid; print('\\n'.join(f'R2_{i:03d}_{uuid.uuid4().hex}_{uuid.uuid4().hex}' for i in range(150)))\"`；\n"
+                    "第 2 轮返回后，子智能体撰写 300 字详细财务敏感性结论并返回。"
                 )
+                st_sub, _, sub_err = client.stream_sse(
+                    "POST",
+                    "/api/v1/threads/messages",
+                    json_body={
+                        "workspace_id": googl_ws_id,
+                        "llm_model": "claude-sonnet-5-5-low-oauth",
+                        "messages": [{"role": "user", "content": sub_prompt}],
+                    },
+                    max_events=2500,
+                )
+                assert st_sub == 200 and sub_err is None, f"Cash spend turn {turn_idx} failed: {st_sub} {sub_err}"
+                settle_deadline = time.monotonic() + 60.0
+                settled = False
+                while time.monotonic() < settle_deadline:
+                    _, poll_today = client.request("GET", "/api/v1/dalton/budget/today")
+                    if float((poll_today or {}).get("open_reserved_usd") or 0.0) == 0.0:
+                        settled = True
+                        break
+                    time.sleep(2.0)
+                if not settled:
+                    raise TimeoutError(
+                        f"Timed out after 60s waiting for open_reserved_usd == 0.0 after turn {turn_idx}"
+                    )
 
-        _, budget_before_s6 = client.request("GET", "/api/v1/dalton/budget/today")
-        spent_before_s6 = float((budget_before_s6 or {}).get("spent_usd") or 0.0)
-        if spent_before_s6 < 0.01:
-            raise TimeoutError(
-                f"Failed to accumulate >= $0.01 cash spend before Scenario 6: spent_usd={spent_before_s6}"
+            _, budget_before_s6 = client.request("GET", "/api/v1/dalton/budget/today")
+            spent_before_s6 = float((budget_before_s6 or {}).get("spent_usd") or 0.0)
+            if spent_before_s6 < 0.01:
+                raise TimeoutError(
+                    f"Failed to accumulate >= $0.01 cash spend before Scenario 6: spent_usd={spent_before_s6}"
+                )
+            print(f"[G4] Scenario 6 cash spend before lowering cap: ${spent_before_s6:.6f}", flush=True)
+            st_cap_low, cap_low_body = client.request(
+                "PUT",
+                "/api/v1/dalton/budget",
+                json_body={"daily_cap_usd": 0.01, "default_task_cap_usd": 0.01},
             )
-        print(f"[G4] Scenario 6 cash spend before lowering cap: ${spent_before_s6:.6f}", flush=True)
-        st_cap_low, cap_low_body = client.request(
-            "PUT",
-            "/api/v1/dalton/budget",
-            json_body={"daily_cap_usd": 0.01, "default_task_cap_usd": 0.01},
-        )
-        assert st_cap_low == 200, f"Failed to lower daily_cap_usd: {st_cap_low} {cap_low_body}"
+            assert st_cap_low == 200, f"Failed to lower daily_cap_usd: {st_cap_low} {cap_low_body}"
 
-        st_s6_w, s6_w_trig = client.request("POST", f"/api/v1/automations/{googl_watch_id}/trigger")
-        assert st_s6_w == 200, f"Scenario 6 watch trigger failed: {st_s6_w} {s6_w_trig}"
-        s6_w_exec_id = str(s6_w_trig.get("execution_id") or s6_w_trig.get("automation_execution_id"))
-        s6_w_exec = _wait_for_execution(client, googl_watch_id, s6_w_exec_id, timeout_s=60.0)
-        s6_w_db = _query_preflight_and_signals(s6_w_exec_id, googl_ws_id)
+            st_s6_w, s6_w_trig = client.request("POST", f"/api/v1/automations/{googl_watch_id}/trigger")
+            assert st_s6_w == 200, f"Scenario 6 watch trigger failed: {st_s6_w} {s6_w_trig}"
+            s6_w_exec_id = str(s6_w_trig.get("execution_id") or s6_w_trig.get("automation_execution_id"))
+            s6_w_exec = _wait_for_execution(client, googl_watch_id, s6_w_exec_id, timeout_s=60.0)
+            s6_w_db = _query_preflight_and_signals(s6_w_exec_id, googl_ws_id)
 
-        st_s6_tm3, s6_tm3_trig = client.request("POST", f"/api/v1/automations/{tm3_id}/trigger")
-        assert st_s6_tm3 == 200, f"Scenario 6 tm3 trigger failed: {st_s6_tm3} {s6_tm3_trig}"
-        s6_tm3_exec_id = str(s6_tm3_trig.get("execution_id") or s6_tm3_trig.get("automation_execution_id"))
-        s6_tm3_exec = _wait_for_execution(client, tm3_id, s6_tm3_exec_id, timeout_s=60.0)
-        s6_tm3_db = _query_preflight_and_signals(s6_tm3_exec_id, googl_ws_id)
+            st_s6_tm3, s6_tm3_trig = client.request("POST", f"/api/v1/automations/{tm3_id}/trigger")
+            assert st_s6_tm3 == 200, f"Scenario 6 tm3 trigger failed: {st_s6_tm3} {s6_tm3_trig}"
+            s6_tm3_exec_id = str(s6_tm3_trig.get("execution_id") or s6_tm3_trig.get("automation_execution_id"))
+            s6_tm3_exec = _wait_for_execution(client, tm3_id, s6_tm3_exec_id, timeout_s=60.0)
+            s6_tm3_db = _query_preflight_and_signals(s6_tm3_exec_id, googl_ws_id)
 
-        st_tm3_after, tm3_after_body = client.request("GET", f"/api/v1/automations/{tm3_id}")
-        assert st_tm3_after == 200 and isinstance(tm3_after_body, dict), (
-            f"GET tm3 automation failed: {st_tm3_after} {tm3_after_body}"
-        )
+            st_tm3_after, tm3_after_body = client.request("GET", f"/api/v1/automations/{tm3_id}")
+            assert st_tm3_after == 200 and isinstance(tm3_after_body, dict), (
+                f"GET tm3 automation failed: {st_tm3_after} {tm3_after_body}"
+            )
 
-        # Restore daily_cap_usd to $15.00 after Scenario 6 verification
-        client.request(
-            "PUT",
-            "/api/v1/dalton/budget",
-            json_body={"daily_cap_usd": 15.0, "default_task_cap_usd": 5.0},
-        )
-        print(
-            f"[G4] Scenario 6 done: watch_status={s6_w_exec.get('status')} "
-            f"tm3_exec_status={s6_tm3_exec.get('status')} "
-            f"tm3_automation_status={tm3_after_body.get('status')} "
-            f"tm3_next_run_at={tm3_after_body.get('next_run_at')}",
-            flush=True,
-        )
+            # Restore daily_cap_usd after Scenario 6 verification (finally block also restores exact prior state)
+            client.request(
+                "PUT",
+                "/api/v1/dalton/budget",
+                json_body={"daily_cap_usd": initial_cap_usd, "default_task_cap_usd": 5.0},
+            )
+            print(
+                f"[G4] Scenario 6 done: watch_status={s6_w_exec.get('status')} "
+                f"tm3_exec_status={s6_tm3_exec.get('status')} "
+                f"tm3_automation_status={tm3_after_body.get('status')} "
+                f"tm3_next_run_at={tm3_after_body.get('next_run_at')}",
+                flush=True,
+            )
+    finally:
+        cleanup_errors: list[str] = []
+        try:
+            with RealRunHttpClient(base_url=args.backend, user_id=pm_user, timeout_s=30.0, record=False) as cleanup_pm:
+                for auto_id_del in created_auto_ids:
+                    cleanup_pm.delete(f"/api/v1/automations/{auto_id_del}")
+                for ws_id_del in created_ws_ids:
+                    cleanup_pm.delete(f"/api/v1/workspaces/{ws_id_del}")
+                for pre_ws_id, prior_ag_content, prior_ag_reason in saved_preexisting_agendas:
+                    st_rest_ag, rest_ag_body = cleanup_pm.request(
+                        "POST",
+                        f"/api/v1/dalton/knowledge/{pre_ws_id}/agenda/import",
+                        json_body={
+                            "content": prior_ag_content,
+                            "reason": prior_ag_reason or "Restore pre-G4 agenda",
+                        },
+                    )
+                    if st_rest_ag != 200 or not (rest_ag_body or {}).get("ok"):
+                        cleanup_errors.append(f"restore_agenda:{pre_ws_id}:HTTP {st_rest_ag} {rest_ag_body}")
+                if budget_modified_pm:
+                    err_pm = _restore_budget_state(
+                        cleanup_pm,
+                        user_id=pm_user,
+                        was_configured=was_configured_pm,
+                        prior_budget=prior_budget_pm,
+                    )
+                    if err_pm is not None:
+                        cleanup_errors.append(f"restore_budget_pm:{err_pm}")
+        except Exception as exc:
+            cleanup_errors.append(f"cleanup_exception:{type(exc).__name__}:{exc}")
+        if cleanup_errors:
+            raise RuntimeError(f"G4 cleanup/restoration failed: {cleanup_errors}")
 
     ended_at = now_utc_iso()
 
@@ -1202,8 +1311,8 @@ def main() -> int:
         f"Scenario 6 tm3 did not skip with budget_exhausted: {s6_tm3_db}"
     )
     assert tm3_after_body.get("status") == "active", f"One-shot tm3 did not stay active: {tm3_after_body}"
-    assert "2026-10-21" in str(tm3_after_body.get("next_run_at") or ""), (
-        f"One-shot tm3 next_run_at was not postponed by +1 day: {tm3_after_body}"
+    assert expected_tm3_postponed_date in str(tm3_after_body.get("next_run_at") or ""), (
+        f"One-shot tm3 next_run_at was not postponed by +1 day (expected {expected_tm3_postponed_date}): {tm3_after_body}"
     )
 
     s2_note = (

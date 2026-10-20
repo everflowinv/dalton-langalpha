@@ -1067,3 +1067,155 @@ def test_check_env_oauth_provenance_budget_restore_and_g6_markdown(monkeypatch: 
     assert "## 2." not in md_text
     assert "与原脚本一致" not in md_text
     assert "偶发漏扣" not in md_text
+
+
+def test_j5a_realrun_script_fixes_g5_callback_ordering_and_g2_schema(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import jsonschema
+    from scripts.dalton.realrun import (
+        g1_budget,
+        g2_providers,
+        g3_publish,
+        g4_autonomy,
+        g5_broker_and_antigravity,
+    )
+
+    # 1. Static scan on all realrun g*.py scripts must pass with 0 violations
+    scan_res = scan_realrun_scripts()
+    assert scan_res["status"] == "PASS", f"Static scan failed: {scan_res}"
+    assert scan_res["violations"] == []
+
+    # 2. All budget-modifying realrun scripts import _restore_budget_state
+    for mod in (g1_budget, g2_providers, g3_publish, g4_autonomy, g5_broker_and_antigravity):
+        assert callable(getattr(mod, "_restore_budget_state", None))
+
+    # 3. G5 pre-callback gate rejects dirty working tree or mismatched backend SHA before touching callback URL
+    monkeypatch.setattr(g5_broker_and_antigravity, "is_git_dirty", lambda: True)
+    with pytest.raises(SystemExit, match="Working tree is dirty"):
+        g5_broker_and_antigravity._assert_pre_callback_git_and_backend_gate(
+            base_url="http://127.0.0.1:8000", user_id="realrun-pm-a", record=True
+        )
+
+    monkeypatch.setattr(g5_broker_and_antigravity, "is_git_dirty", lambda: False)
+    monkeypatch.setattr(g5_broker_and_antigravity, "is_head_merged_into_main", lambda: True)
+    monkeypatch.setattr(g5_broker_and_antigravity, "is_main_ancestor_of_head", lambda: True)
+    monkeypatch.setattr(g5_broker_and_antigravity, "get_git_sha", lambda: "deadbeef")
+    monkeypatch.setattr(
+        g5_broker_and_antigravity,
+        "_probe_backend_health_sync",
+        lambda url, uid: {"git_sha": "cafebabe", "git_dirty": False, "deployment": "docker"},
+    )
+    with pytest.raises(SystemExit, match="Backend git_sha"):
+        g5_broker_and_antigravity._assert_pre_callback_git_and_backend_gate(
+            base_url="http://127.0.0.1:8000", user_id="realrun-pm-a", record=True
+        )
+
+    # 4. G5 --mode g5.2 exchanges callback URL BEFORE preflight_realrun_script runs
+    call_order: list[str] = []
+    monkeypatch.setattr(
+        g5_broker_and_antigravity,
+        "_assert_pre_callback_git_and_backend_gate",
+        lambda **kw: (call_order.append("pre_gate") or {"deployment": "docker"}),
+    )
+    monkeypatch.setattr(
+        g5_broker_and_antigravity,
+        "_exchange_g5_2_docker_callback",
+        lambda *a, **kw: (call_order.append("exchange_callback") or {"deployment": "docker"}),
+    )
+    monkeypatch.setattr(
+        g5_broker_and_antigravity,
+        "preflight_realrun_script",
+        lambda *a, **kw: (call_order.append("preflight") or {}),
+    )
+    monkeypatch.setattr(
+        g5_broker_and_antigravity,
+        "_run_g5_2_antigravity",
+        lambda *a, **kw: (
+            call_order.append("run_g5_2")
+            or (
+                {
+                    "deployment": "docker",
+                    "oauth_status_and_isolation": {
+                        "user_a": {"status_body": {"connected": True}},
+                        "user_b_isolation": {"status_body": {"connected": False}},
+                    },
+                    "gemini_4_round_tool_calling": {
+                        "tool_calls_count": 4,
+                        "tool_call_results_count": 4,
+                        "gemini_model_invocations_count": 5,
+                    },
+                    "docker_callback_paste_flow": {
+                        "callback_missing_state": {"http_status": 400},
+                        "callback_wrong_state": {"http_status": 400},
+                        "callback_real_paste_exchange": {"http_status": 200},
+                    },
+                },
+                [{"passed": True}],
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        g5_broker_and_antigravity,
+        "build_evidence_envelope",
+        lambda **kw: {"deployment": "docker", "assertions": [{"passed": True}]},
+    )
+    monkeypatch.setattr(
+        g5_broker_and_antigravity,
+        "write_evidence_and_summary",
+        lambda **kw: (Path("/tmp/g5.json"), Path("/tmp/G5.md"), "abc123"),
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "g5_broker_and_antigravity.py",
+            "--mode",
+            "g5.2",
+            "--callback-url",
+            "http://localhost:51121/oauth-callback?code=c1&state=s1",
+        ],
+    )
+    rc = g5_broker_and_antigravity.main()
+    assert rc == 0
+    assert call_order == ["pre_gate", "exchange_callback", "preflight", "run_g5_2"]
+
+    # 5. G2 thesis payloads conform to src/dalton/knowledge/schemas/thesis.schema.json
+    from src.dalton.knowledge.validate import validate_schema
+
+    repo_root = Path(__file__).resolve().parents[3]
+    g2_src = (repo_root / "scripts" / "dalton" / "realrun" / "g2_providers.py").read_text(encoding="utf-8")
+    assert "/api/v1/dalton/budget/task-caps/workspace/{sample_ws_id}" in g2_src
+    assert 'json_body={"dry_run": True}' in g2_src
+    assert "claude-sonnet-5-5-low-oauth" in g2_src
+    sample_thesis = {
+        "schema_version": 1,
+        "as_of": "2026-10-20T00:00:00Z",
+        "one_liner": "Alphabet Inc. G2 路由与权限测试初始观点 v1",
+        "aggregate_status": "intact",
+        "house_view": {
+            "stance": "long",
+            "conviction": "high",
+            "horizon_months": 18,
+            "summary": "G2 路由与权限测试初始观点 v1",
+            "variant_perception": "Search and Cloud operating margin durability exceeds consensus.",
+            "updated_at": "2026-10-20T00:00:00Z",
+        },
+        "house_view_history": [],
+        "pillars": [
+            {
+                "id": "P1",
+                "claim": "GOOGL core revenue growth and operating margin trajectory.",
+                "priority": "core",
+                "baseline": {"text": "2Q26 SEC 10-Q baseline.", "as_of": "2026-06-30"},
+                "expected_path": "Maintain double-digit revenue growth and margin expansion.",
+                "thresholds": {"confirm": [], "warn": [], "break": []},
+                "status": "intact",
+                "provenance": "approved",
+                "created_at": "2026-10-20T00:00:00Z",
+            }
+        ],
+        "evidence": [],
+        "official": None,
+    }
+    assert validate_schema("thesis", sample_thesis) == []
+
