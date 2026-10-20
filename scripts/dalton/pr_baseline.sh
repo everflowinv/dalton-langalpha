@@ -90,10 +90,15 @@ run_and_record() {
   local cmd_head
   local exit_code=0
   local tmp_out
+  local tmp_clean
+  local clean_bytes
+  local clean_lines
+  local clean_sha
 
   cmd_start_utc="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
   cmd_head="$(git rev-parse HEAD)"
   tmp_out="$(mktemp)"
+  tmp_clean="$(mktemp)"
 
   echo "[pr_baseline] Running: $title" >&2
   set +e
@@ -106,6 +111,11 @@ run_and_record() {
     OVERALL_FAILURES=$((OVERALL_FAILURES + 1))
   fi
 
+  perl -pe 's/\e\[[0-9;]*[a-zA-Z]//g' "$tmp_out" > "$tmp_clean"
+  clean_bytes="$(wc -c < "$tmp_clean" | tr -d ' ')"
+  clean_lines="$(wc -l < "$tmp_clean" | tr -d ' ')"
+  clean_sha="$(shasum -a 256 "$tmp_clean" | awk '{print $1}')"
+
   {
     echo ""
     echo "### ${title}"
@@ -115,13 +125,22 @@ run_and_record() {
     echo "- **Started (UTC)**: \`${cmd_start_utc}\`"
     echo "- **Ended (UTC)**: \`${cmd_end_utc}\`"
     echo "- **Exit code**: \`${exit_code}\`"
+    echo "- **Raw output stats**: \`lines=${clean_lines}\`, \`bytes=${clean_bytes}\`, \`sha256=${clean_sha}\`"
     echo ""
     echo "\`\`\`text"
-    perl -pe 's/\e\[[0-9;]*[a-zA-Z]//g' "$tmp_out"
+    if [[ "$clean_bytes" -le 25000 ]]; then
+      cat "$tmp_clean"
+    else
+      head -n 40 "$tmp_clean"
+      echo ""
+      echo "... [middle lines omitted by pr_baseline.sh so total report fits GitHub's 65536-char comment limit: raw_lines=${clean_lines}, raw_bytes=${clean_bytes}, raw_sha256=${clean_sha}] ..."
+      echo ""
+      tail -n 60 "$tmp_clean"
+    fi
     echo "\`\`\`"
   } >> "$OUTPUT_FILE"
 
-  rm -f "$tmp_out"
+  rm -f "$tmp_out" "$tmp_clean"
 }
 
 # Four mandatory baseline commands
