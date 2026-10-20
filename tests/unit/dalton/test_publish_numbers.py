@@ -107,7 +107,8 @@ def test_extract_figures_exclusions_and_exemptions() -> None:
     assert any("15B" in f.raw for f in exempt)
     assert any("500" in f.raw for f in exempt)
 
-    # Excluded items (2026-10-15, 10-Q, 8-K, 3 个支柱, P1, D2, K1.1, disclaimer 100) must NOT be in non_exempt
+    # Structural / format tokens (2026-10-15, 10-Q, 8-K, P1, D2, K1.1) must NOT be in non_exempt;
+    # numbers inside ## 免责声明 (100) are extracted and sent to Step B (P0J.J2b §8.1 #16).
     raw_tokens = [f.raw for f in non_exempt]
     assert "$59.4bn" in raw_tokens
     assert "27%" in raw_tokens
@@ -117,7 +118,8 @@ def test_extract_figures_exclusions_and_exemptions() -> None:
     assert "63.4" in raw_tokens
     assert "24.3" in raw_tokens
     assert "25.0" in raw_tokens
-    assert len(non_exempt) == 8
+    assert "100" in raw_tokens
+    assert len(non_exempt) == 9
 
 
 @pytest.mark.asyncio
@@ -1706,5 +1708,88 @@ async def test_p0j_j2_assist_fallback_unified_and_role_policy_family_check(
     monkeypatch.setenv("PTC_CONFIG_FILE", str(bad_yaml))
     with pytest.raises(DaltonStartupConfigError):
         enforce_role_policy_on_startup()
+
+
+@pytest.mark.asyncio
+async def test_p0j_j2b_risk_and_disclaimer_section_sent_to_step_b_and_labeled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P0J.J2b (§8.1 #16): Section titled '风险提示与免责' containing numbers must not be skipped."""
+    from src.dalton.llm.assist import AssistResult
+    from src.dalton.publish.numbers import (
+        _split_markdown_sections_and_chunks,
+        extract_figures,
+        label_figures_with_status,
+    )
+
+    md = (
+        "# META 研究报告\n\n"
+        "## 1. 核心财务表现\n"
+        "2Q26 广告营收达到 $59.4bn。\n\n"
+        "## 风险提示与免责\n"
+        "若欧盟监管罚款达到 $8.5bn，FY26 营业利润率将下降 12%。\n"
+    )
+
+    outline, chunks = _split_markdown_sections_and_chunks(md)
+    section_titles = [sec_title for sec_title, _, _, _ in chunks]
+    assert "风险提示与免责" in section_titles
+
+    figs = extract_figures(md)
+    risk_figs = [f for f in figs if f.location.get("section") == "风险提示与免责"]
+    assert [f.raw for f in risk_figs] == ["$8.5bn", "12%"]
+
+    seen_sections: list[str] = []
+
+    async def fake_assist_json(
+        task: str,
+        instructions: str,
+        payload: dict[str, Any],
+        schema: dict[str, Any],
+        **kwargs: Any,
+    ) -> AssistResult:
+        sec = str(payload.get("section_title") or "")
+        seen_sections.append(sec)
+        items = []
+        for pf in payload.get("extracted_figures") or []:
+            raw = str(pf.get("raw") or "")
+            metric_name = (
+                "欧盟监管罚款"
+                if "8.5" in raw
+                else ("营业利润率变动" if "12%" in raw else "广告营收")
+            )
+            items.append(
+                {
+                    "id": pf["id"],
+                    "kind": "estimate" if sec == "风险提示与免责" else "reported",
+                    "incidental_category": "",
+                    "metric": metric_name,
+                    "period": "FY26" if sec == "风险提示与免责" else "2Q26",
+                    "unit": str(pf.get("unit") or ""),
+                }
+            )
+        return AssistResult(
+            ok=True,
+            status="ok",
+            data={"items": items, "extra_figures": []},
+            model="gemini-3.8-flash-low-oauth",
+        )
+
+    monkeypatch.setattr("src.dalton.publish.numbers.assist_json", fake_assist_json)
+    stats: dict[str, Any] = {}
+    labeled, ok = await label_figures_with_status(
+        md,
+        figs,
+        stats_out=stats,
+    )
+    assert ok is True
+    assert "风险提示与免责" in seen_sections
+    assert stats["total"] == 3
+    assert stats["labeled"] == 3
+    labeled_risk = [f for f in labeled if f.location.get("section") == "风险提示与免责"]
+    assert len(labeled_risk) == 2
+    assert all(f.label_hint == "estimate" for f in labeled_risk)
+    assert {f.metric for f in labeled_risk} == {"欧盟监管罚款", "营业利润率变动"}
+
+
 
 
