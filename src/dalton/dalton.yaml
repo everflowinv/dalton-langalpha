@@ -9,7 +9,9 @@ models:
     enabled: true            # OpenClaw broker v2 parallel path; false hides ocb-* from catalog
   disabled_providers: []     # Provider kill switch (P0N.8, L17). Example: ["muse-oauth"]
   assist_model: "gemini-3.8-flash-low-oauth"
-  assist_fallback_model: "deepseek-flash"
+  assist_fallback_model:
+    - "deepseek-flash"
+    - "ocb-deepseek-deepseek-flash"
 
 budget:
   # Default daily cap USD when user has not saved a DB row yet.

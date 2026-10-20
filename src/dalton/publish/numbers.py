@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import re
-from typing import Any
+from typing import Any, Literal, get_args
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -15,6 +15,21 @@ try:
     from src.dalton.llm.assist import assist_json
 except ImportError:  # pragma: no cover
     assist_json = None  # type: ignore[assignment]
+
+IncidentalCategory = Literal[
+    "",
+    "点赞数、转发数等社交互动计数",
+    "浏览量",
+    "HTTP 状态码",
+    "文件、文档、邮件和 URL 里的编号",
+    "软件和模型的版本号、硬件型号",
+    "列表序号、页码",
+    "用户名里的数字",
+    "机构、产品、节目名称里的数字",
+    "期间、日期和时间窗口表达里的数字",
+]
+INCIDENTAL_CATEGORIES: tuple[str, ...] = tuple(c for c in get_args(IncidentalCategory) if c)
+_DECIMAL_UNCERTAIN_CATEGORIES = frozenset({"软件和模型的版本号、硬件型号", "机构、产品、节目名称里的数字"})
 
 # Period tokens: FY2026, FY26, 3Q26, 26Q4, Q4 26, Q4'26, Q3 2026, 2026Q3, 1H26, 2H26, 2026H1, LTM-2026-09, 2026E, NTM
 _PERIOD_TOKEN_RE = re.compile(
@@ -32,6 +47,7 @@ _PERIOD_TOKEN_RE = re.compile(
     r")(?![A-Za-z0-9])",
     re.IGNORECASE,
 )
+_LTM_EXPR_RE = re.compile(r"(?:\b(?:LTM|TTM)\b|(?:过去|近)\s*12\s*个月)", re.IGNORECASE)
 
 # Standalone date / period / filing form / identifier patterns to exclude
 _SEC_ACCESSION_RE = re.compile(r"\b\d{10}-\d{2}-\d{6}\b")
@@ -140,13 +156,16 @@ class FigureLabelItem(BaseModel):
 
     id: str = Field(description="Extracted figure ID, e.g. F-001")
     metric: str = Field(default="", description="Financial metric name")
-    period: str = Field(default="", description="Normalized period, e.g. 3Q26 or FY2026")
-    unit: str = Field(default="", description="Optional canonical unit, e.g. USD_bn, USD_mn, pct, x, per_share, count_mn")
+    period: str = Field(default="", description="Normalized period, e.g. 4Q23 or FY2023")
+    unit: str = Field(
+        default="",
+        description="Optional canonical unit, e.g. USD_bn, USD_mn, pct, x, per_share, count_mn",
+    )
     kind: str = Field(
         default="",
         description="Semantic figure kind: reported, estimate, consensus, guidance, derived, or incidental",
     )
-    incidental_category: str = Field(
+    incidental_category: IncidentalCategory = Field(
         default="",
         description="One of the 9 non-verification categories when kind is incidental",
     )
@@ -155,23 +174,22 @@ class FigureLabelItem(BaseModel):
     @classmethod
     def _coerce_null_strings(cls, data: Any) -> Any:
         if isinstance(data, dict):
-            return {
-                k: (
-                    ""
-                    if v is None and k in ("metric", "period", "unit", "kind", "incidental_category")
-                    else v
-                )
+            out = {
+                k: ("" if v is None and k in ("metric", "period", "unit", "kind", "incidental_category") else v)
                 for k, v in data.items()
             }
+            cat = str(out.get("incidental_category") or "").strip()
+            out["incidental_category"] = cat if cat in INCIDENTAL_CATEGORIES else ""
+            return out
         return data
 
 
 class ExtraFigureItem(BaseModel):
-    """Additional prose figure identified by LLM (e.g. Chinese expressions like '三成', '翻倍', '腰斩')."""
+    """Additional prose figure identified by LLM (e.g. Chinese expressions like '两成', '翻番', '腰斩')."""
 
-    raw: str = Field(description="Exact substring in the draft sentence, e.g. '三成', '翻倍', '腰斩', '过半'")
+    raw: str = Field(description="Exact substring in the draft sentence, e.g. '两成', '翻番', '腰斩', '过半'")
     line: int = Field(default=1, description="1-based line number in the draft")
-    value: float = Field(description="Numeric value (e.g. 30.0 for 三成, 2.0 for 翻倍, -50.0 or 50.0 for 腰斩)")
+    value: float = Field(description="Numeric value (e.g. 20.0 for 两成, 2.0 for 翻番, -50.0 or 50.0 for 腰斩)")
     unit: str = Field(default="pct", description="Canonical unit, e.g. pct or x")
     metric: str = Field(default="", description="Financial metric name")
     period: str = Field(default="", description="Normalized period if any")
@@ -236,13 +254,21 @@ class ExtractedFigure:
         return self.value * self.scale
 
 
+def match_ltm_periods(text: str, *, fullmatch: bool = False) -> list[int]:
+    """Match LTM / TTM / '过去 12 个月' / '近 12 个月' period tokens (with word boundaries on LTM/TTM)."""
+    if not text:
+        return []
+    if fullmatch:
+        return [0] if _LTM_EXPR_RE.fullmatch(text.strip()) else []
+    return [m.start() for m in _LTM_EXPR_RE.finditer(text)]
+
+
 def normalize_period(raw_period: str | None) -> str:
-    """Canonicalize period strings (e.g. ``FY26`` -> ``FY2026``, ``Q3 2026`` -> ``3Q26``, ``26Q4`` -> ``4Q26``, ``过去 12 个月`` -> ``LTM``)."""
+    """Canonicalize period strings (e.g. ``FY26`` -> ``FY2026``, ``Q3 2026`` -> ``3Q26``, ``过去 12 个月`` -> ``LTM``)."""
     if not raw_period:
         return ""
     s = raw_period.strip().upper().rstrip("E")
-    s_compact = "".join(s.split())
-    if s_compact in ("LTM", "TTM") or "过去12个月" in s_compact or "近12个月" in s_compact:
+    if match_ltm_periods(s, fullmatch=True):
         return "LTM"
     m_fy_short = re.match(r"^FY(\d{2})$", s)
     if m_fy_short:
@@ -497,7 +523,8 @@ def parse_facts_ledger(facts_markdown: str) -> dict[str, dict[str, Any]]:
 
 
 _UNIT_PAREN_STRIP_RE = re.compile(
-    r"[（\(]\s*(?:单位\s*[：:]\s*)?(?:亿美元|亿元|万元|百万美元|百万|十亿|千亿|元|美元|港元|人民币|%\s*|pct|bps|bp|\$[BMKbmk]?|USD|CNY|RMB|HKD|in\s+\$?[BMKbmk]|in\s+(?:billions?|millions?))\s*[）\)]",
+    r"[（\(]\s*(?:单位\s*[：:]\s*)?(?:亿美元|亿元|万元|百万美元|百万|十亿|千亿|元|美元|港元|人民币|"
+    r"%\s*|pct|bps|bp|\$[BMKbmk]?|USD|CNY|RMB|HKD|in\s+\$?[BMKbmk]|in\s+(?:billions?|millions?))\s*[）\)]",
     re.IGNORECASE,
 )
 
@@ -854,10 +881,7 @@ def extract_figures(markdown_text: str) -> list[ExtractedFigure]:
                 (pm.start(), normalize_period(pm.group(1)))
                 for pm in _PERIOD_TOKEN_RE.finditer(period_scan_line)
             ]
-            + [
-                (lm.start(), "LTM")
-                for lm in re.finditer(r"(?:过去|近)\s*12\s*个月", period_scan_line)
-            ]
+            + [(pos, "LTM") for pos in match_ltm_periods(period_scan_line)]
         )
         line_footnotes = [
             (fm.start(), fm.group(1))
@@ -1010,14 +1034,18 @@ def _can_be_incidental(fig: ExtractedFigure, item_unit: str = "") -> bool:
     Numbers with currency, percentage, basis points, valuation multiples, per-share units,
     decimals, or inside tables cannot be marked ``incidental``.
     """
-    if fig.location.get("table") or fig.decimals > 0 or fig.currency is not None or fig.scale > 1.0:
+    if fig.location.get("table") or fig.decimals > 0:
+        return False
+    if fig.currency is not None or fig.scale > 1.0:
         return False
     if (fig.unit or "").strip().lower() not in ("", "other", "count"):
         return False
     if (item_unit or "").strip().lower() not in ("", "other", "count"):
         return False
     raw_low = (fig.raw or "").strip().lower()
-    if any(tok in raw_low for tok in _FINANCIAL_RAW_TOKENS) or re.search(r"\d\s*x$", raw_low):
+    if any(tok in raw_low for tok in _FINANCIAL_RAW_TOKENS):
+        return False
+    if re.search(r"\d\s*x$", raw_low):
         return False
     return True
 
@@ -1119,6 +1147,30 @@ def _split_markdown_sections_and_chunks(
     return outline, chunks
 
 
+STEP_B_LABEL_INSTRUCTIONS = (
+    "You are Step B of the Dalton publication audit pipeline. "
+    "1) For each item in extracted_figures, label its financial `metric`, normalized `period` "
+    "(e.g. 4Q23, FY2023, LTM, or 'none' if it is an intraday/spot figure with no fiscal period), "
+    "canonical `unit` (e.g. USD_bn, USD_mn, USD, pct, bp, x, per_share, count_mn, count), "
+    "and semantic `kind` ('reported', 'estimate', 'consensus', 'guidance', 'derived', or 'incidental'). "
+    "Use `incidental` ONLY when a number belongs strictly to one of these 9 non-verification categories (L43), "
+    "and set `incidental_category` to the exact category name: "
+    "(1) 点赞数、转发数等社交互动计数; (2) 浏览量; (3) HTTP 状态码; (4) 文件、文档、邮件和 URL 里的编号; "
+    "(5) 软件和模型的版本号、硬件型号; (6) 列表序号、页码; (7) 用户名里的数字; "
+    "(8) 机构、产品、节目名称里的数字; (9) 期间、日期和时间窗口表达里的数字. "
+    "COUNTEREXAMPLES (MUST NOT be marked `incidental`): Any factual statement in the research report, "
+    "regardless of unit, MUST be verified (`reported`/`estimate`/`consensus`/`guidance`/`derived`), "
+    "including: 装机容量、合同期限、样本量、覆盖半径、调查家数、量子比特数. "
+    "NEVER mark any number with currency, percentage (%), basis points (bp), decimal, or multiple (x/倍) "
+    "as `incidental`. "
+    "2) Also scan markdown_excerpt for any colloquial Chinese numbers not already in extracted_figures "
+    "(such as '两成', '四成', '五分之一', '四分之三', '过半', '减半', '翻番', '腰斩') "
+    "and return them in `extra_figures` with exact `raw` substring from the draft, `line` number, "
+    "numeric `value` (e.g. 20.0 for 两成, 50.0 for 过半/减半/腰斩, 2.0 for 翻番), `unit` ('pct' or 'x'), "
+    "`metric`, `period`, and `kind`."
+)
+
+
 async def label_figures_with_status(
     markdown_text: str,
     figures: list[ExtractedFigure],
@@ -1191,7 +1243,6 @@ async def label_figures_with_status(
     if not batches and markdown_text.strip():
         batches.append(("", 1, markdown_text[:6000], [], 0, 0))
 
-    by_id = {f.id: f for f in figures}
     fig_counter = len(figures)
     existing_raws_by_line = {(f.location.get("line"), f.raw) for f in figures}
 
@@ -1201,30 +1252,6 @@ async def label_figures_with_status(
     llm_period_overrides = 0
 
     sem = asyncio.Semaphore(4)
-    label_instructions = (
-        "You are Step B of the Dalton publication audit pipeline. "
-        "1) For each item in extracted_figures, label its financial `metric`, normalized `period` "
-        "(e.g. 2Q26, 3Q26, FY2026, LTM, or 'none' if it is an intraday/spot figure with no fiscal period), "
-        "canonical `unit` (e.g. USD_bn, USD_mn, USD, pct, bp, x, per_share, count_mn, count), "
-        "and semantic `kind` ('reported', 'estimate', 'consensus', 'guidance', 'derived', or 'incidental'). "
-        "Use `incidental` ONLY when a number belongs strictly to one of these 9 non-verification categories (L43), "
-        "and set `incidental_category` to the matching category name: "
-        "(1) 点赞数、转发数等社交互动计数; (2) 浏览量; (3) HTTP 状态码; (4) 文件、文档、邮件和 URL 里的编号; "
-        "(5) 软件和模型的版本号、硬件型号（如 Sonnet 5.5、B200）; (6) 列表序号、页码; "
-        "(7) 用户名里的数字（如 @kashyap286）; (8) 机构、产品、节目名称里的数字（如 a16z、Law360、财富 100 强）; "
-        "(9) 期间、日期和时间窗口表达里的数字（仅限纯时间窗口标签，如“过去 12 个月”、“近 30 天”、1Q27 里的 27）. "
-        "COUNTEREXAMPLES (MUST NOT be marked `incidental`): Any factual statement in the research report, regardless of unit, "
-        "MUST be verified (`reported`/`estimate`/`consensus`/`guidance`/`derived`), including: "
-        "装机容量（如 702MW）、合同期限（如 20 年 PPA、合同期 10 年、加权剩余合同期限 6.4 年、积压 24 个月内转收入）、"
-        "样本量、覆盖半径、调查家数、量子比特数、合作笔数（如 18 笔合作）、共识机构家数（如 45 家）、代理商/团队人数（如 150 人）、"
-        "内部库资料篇数（如 115 篇）、新增帖子/信号条数（如 10 条帖子）. "
-        "NEVER mark any number with currency, percentage (%), basis points (bp), decimal, or multiple (x/倍) as `incidental`. "
-        "2) Also scan markdown_excerpt for any colloquial Chinese numbers not already in extracted_figures "
-        "(such as '三成', '两成', '百分之三十', '五分之一', '近一半', '大半', '砍掉一半', '过半', '减半', '翻倍', '倍增', '腰斩') "
-        "and return them in `extra_figures` with exact `raw` substring from the draft, `line` number, numeric `value` "
-        "(e.g. 30.0 for 三成, 50.0 for 近一半/大半/过半/砍掉一半/腰斩, 2.0 for 翻倍/倍增), `unit` ('pct' or 'x'), "
-        "`metric`, `period`, and `kind`."
-    )
     label_schema = FigureLabels.model_json_schema()
 
     prepared_batches: list[
@@ -1235,23 +1262,39 @@ async def label_figures_with_status(
         payload_figs: list[dict[str, Any]] = []
         for local_i, f in enumerate(batch_figs, start=1):
             local_id = f"B-{local_i:03d}"
-            local_to_fig[local_id] = local_to_fig[f.id] = f
+            local_to_fig[local_id] = f
+            local_to_fig[f.id] = f
             rel_line = max(1, int(f.location.get("line") or c_start) - c_start + 1)
             payload_figs.append(
                 {
-                    "id": local_id, "raw": f.raw, "value": f.value, "unit": f.unit, "scale": f.scale,
-                    "metric": f.metric, "period": f.period, "kind": f.label_hint, "exempt": f.exempt,
-                    "line": rel_line, "sentence": f.location.get("sentence"),
+                    "id": local_id,
+                    "raw": f.raw,
+                    "value": f.value,
+                    "unit": f.unit,
+                    "scale": f.scale,
+                    "metric": f.metric,
+                    "period": f.period,
+                    "kind": f.label_hint,
+                    "exempt": f.exempt,
+                    "line": rel_line,
+                    "sentence": f.location.get("sentence"),
                 }
             )
-        payload = {"outline": outline, "section_title": sec_title, "markdown_excerpt": chunk_text, "extracted_figures": payload_figs}
-        prepared_batches.append((batch_idx, sec_title, c_start, chunk_text, batch_figs, s_idx, e_idx, local_to_fig, payload))
+        payload = {
+            "outline": outline,
+            "section_title": sec_title,
+            "markdown_excerpt": chunk_text,
+            "extracted_figures": payload_figs,
+        }
+        prepared_batches.append(
+            (batch_idx, sec_title, c_start, chunk_text, batch_figs, s_idx, e_idx, local_to_fig, payload)
+        )
 
     async def _call_label_batch(payload: dict[str, Any]) -> Any:
         async with sem:
             return await assist_json(
                 task="audit.label_figures",
-                instructions=label_instructions,
+                instructions=STEP_B_LABEL_INSTRUCTIONS,
                 payload=payload,
                 schema=label_schema,
                 user_id=user_id,
@@ -1272,7 +1315,12 @@ async def label_figures_with_status(
         if not res.ok or not res.data:
             failed_batches += 1
             failed_batch_details.append(
-                {"batch_index": batch_idx, "start_fig": s_idx, "end_fig": e_idx, "section": sec_title}
+                {
+                    "batch_index": batch_idx,
+                    "start_fig": s_idx,
+                    "end_fig": e_idx,
+                    "section": sec_title,
+                }
             )
             continue
 
@@ -1281,27 +1329,32 @@ async def label_figures_with_status(
         except Exception:
             failed_batches += 1
             failed_batch_details.append(
-                {"batch_index": batch_idx, "start_fig": s_idx, "end_fig": e_idx, "section": sec_title}
+                {
+                    "batch_index": batch_idx,
+                    "start_fig": s_idx,
+                    "end_fig": e_idx,
+                    "section": sec_title,
+                }
             )
             continue
 
         labeled_count += len(batch_figs)
         for item in parsed.items:
-            target = local_to_fig.get(item.id) or (by_id.get(item.id) if not batch_figs else None)
+            target = local_to_fig.get(item.id)
             if target is None:
                 continue
 
             raw_kind = item.kind.strip().lower() if item.kind else "reported"
             if raw_kind not in _VALID_LABEL_KINDS:
                 raw_kind = "reported"
-            if raw_kind == "incidental" and not _can_be_incidental(target, item.unit):
-                raw_kind = "reported"
-            target.label_hint = raw_kind
-            target.incidental_category = (
-                (item.incidental_category or item.metric or "").strip()
-                if raw_kind == "incidental"
-                else ""
-            )
+            inc_cat = (item.incidental_category or "").strip()
+            if raw_kind == "incidental" and _can_be_incidental(target, item.unit):
+                target.label_hint = "incidental"
+                target.incidental_category = inc_cat or "未给类别"
+            else:
+                target.label_hint = "reported" if raw_kind == "incidental" else raw_kind
+                if raw_kind == "incidental" and target.decimals > 0 and inc_cat in _DECIMAL_UNCERTAIN_CATEGORIES:
+                    target.incidental_category = inc_cat
 
             if item.metric and item.metric.strip():
                 target.metric = item.metric.strip()
@@ -1396,7 +1449,6 @@ async def label_figures_with_status(
                 exempt_reason="illustrative" if is_exempt else None,
             )
             figures.append(new_fig)
-            by_id[new_fig.id] = new_fig
             labeled_count += 1
 
     incidental_excluded = sum(

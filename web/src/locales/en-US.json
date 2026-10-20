@@ -5464,6 +5464,7 @@
       "cardTitle": "Official Research Publication Approval (PM Final Review)",
       "labelingIncompleteWarning": "Figure labeling incomplete; colloquial figures and metric labels may not be fully verified",
       "failedBatchDetailItem": "Batch {{batch}} (figures {{start}}–{{end}}) labeling failed",
+      "failedBatchColloquialItem": "Batch {{batch}} (colloquial figure scan) labeling failed",
       "labelingCoverageLabel": "Labeling Coverage",
       "labelingCoverageValue": "Labeled {{labeled}} / {{total}} figures",
       "verifiedBreakdownLabel": "Verified Breakdown",

@@ -225,14 +225,20 @@ export function PublishApprovalCard({
                 const batchNo = d.batch ?? d.batch_index ?? dIdx + 1;
                 const startFig = d.start_figure ?? d.start_fig ?? '?';
                 const endFig = d.end_figure ?? d.end_fig ?? '?';
+                const isColloquialScan = Number(startFig) === 0 && Number(endFig) === 0;
                 return (
                   <div key={`${batchNo}-${dIdx}`}>
-                    {t('dalton.publish.failedBatchDetailItem', {
-                      batch: batchNo,
-                      start: startFig,
-                      end: endFig,
-                      defaultValue: `第 ${batchNo} 批（第 ${startFig}–${endFig} 个数字）标注失败`,
-                    })}
+                    {isColloquialScan
+                      ? t('dalton.publish.failedBatchColloquialItem', {
+                          batch: batchNo,
+                          defaultValue: `第 ${batchNo} 批（口语数字扫描）标注失败`,
+                        })
+                      : t('dalton.publish.failedBatchDetailItem', {
+                          batch: batchNo,
+                          start: startFig,
+                          end: endFig,
+                          defaultValue: `第 ${batchNo} 批（第 ${startFig}–${endFig} 个数字）标注失败`,
+                        })}
                   </div>
                 );
               })}
@@ -363,7 +369,7 @@ export function PublishApprovalCard({
           {incidentalExpanded && incidentalItems.length > 0 && (
             <div className="pt-1 space-y-0.5 text-[11px]" data-testid="publish-incidental-list">
               {incidentalItems.map((item, idx) => {
-                const cat = item.incidental_category || item.category || item.metric || '';
+                const cat = item.incidental_category || item.category || '未给类别';
                 return (
                   <div key={item.id ?? idx} style={{ color: 'var(--color-text-tertiary)' }}>
                     <code>L{item.line ?? '?'}</code> · <strong>{item.raw}</strong>

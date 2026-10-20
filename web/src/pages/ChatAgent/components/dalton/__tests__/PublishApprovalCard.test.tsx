@@ -263,8 +263,20 @@ describe('PublishApprovalCard', () => {
             failed_batches: 1,
             failed_batch_details: [
               { batch_index: 2, start_fig: 21, end_fig: 40, section: '估值与模型' },
+              { batch_index: 3, start_fig: 0, end_fig: 0, section: '渠道观察' },
             ],
           },
+          incidental: 1,
+          incidental_items: [
+            {
+              id: 'F-099',
+              raw: '404',
+              line: 12,
+              metric: '增速',
+              incidental_category: '',
+              sentence: '页面返回 404。',
+            },
+          ],
         },
       },
     };
@@ -277,6 +289,12 @@ describe('PublishApprovalCard', () => {
     expect(screen.getByTestId('publish-failed-batch-details')).toHaveTextContent(
       'Batch 2 (figures 21–40) labeling failed'
     );
+    expect(screen.getByTestId('publish-failed-batch-details')).toHaveTextContent(
+      'Batch 3 (colloquial figure scan) labeling failed'
+    );
+    fireEvent.click(screen.getByTestId('publish-incidental-toggle'));
+    expect(screen.getByTestId('publish-incidental-list')).toHaveTextContent('[未给类别]');
+    expect(screen.getByTestId('publish-incidental-list')).not.toHaveTextContent('[增速]');
     expect(
       screen.getByText('Official Research Publication Approval (PM Final Review)')
     ).toBeInTheDocument();

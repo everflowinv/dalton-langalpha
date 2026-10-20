@@ -340,26 +340,70 @@ def _load_default_agent_config() -> dict[str, Any]:
         load_yaml_config,
     )
 
+    explicit_env_path = os.getenv("PTC_CONFIG_FILE", "").strip()
+    if explicit_env_path and not Path(explicit_env_path).is_file():
+        raise DaltonStartupConfigError(
+            f"PTC_CONFIG_FILE={explicit_env_path!r} does not exist or is not a file."
+        )
+
     cfg_path = find_config_file(
         AGENT_CONFIG_FILE,
         search_paths=[REPO_ROOT],
         env_var="PTC_CONFIG_FILE",
     )
     if cfg_path is None:
-        return {}
+        raise DaltonStartupConfigError(
+            f"Agent configuration file '{AGENT_CONFIG_FILE}' not found."
+        )
     try:
         loaded = load_yaml_config(str(cfg_path), use_cache=False)
         if not isinstance(loaded, dict):
-            return {}
+            raise DaltonStartupConfigError(
+                f"Agent configuration '{cfg_path}' must parse to a mapping, got {type(loaded).__name__}."
+            )
+        # Upstream load_yaml_config only overlays agent_config.<APP_ENV>.yaml when APP_ENV is set.
+        # In Dalton local dev or CLI invocations where APP_ENV may be unset while Dalton is enabled,
+        # we still overlay agent_config.dalton.yaml so startup role-policy enforcement always checks
+        # the effective Dalton role assignments rather than the upstream base defaults.
         if not os.getenv("APP_ENV", "").strip() and cfg_path.name == AGENT_CONFIG_FILE:
             dalton_overlay = cfg_path.with_name(f"{cfg_path.stem}.dalton{cfg_path.suffix}")
             if dalton_overlay.is_file():
                 overlay_cfg = _read_yaml(dalton_overlay)
-                if isinstance(overlay_cfg, dict):
-                    loaded = _deep_merge(loaded, overlay_cfg)
+                if not isinstance(overlay_cfg, dict):
+                    raise DaltonStartupConfigError(
+                        f"Dalton overlay configuration '{dalton_overlay}' must parse to a mapping, "
+                        f"got {type(overlay_cfg).__name__}."
+                    )
+                loaded = _deep_merge(loaded, overlay_cfg)
         return loaded
-    except Exception:
-        return {}
+    except DaltonStartupConfigError:
+        raise
+    except Exception as exc:
+        raise DaltonStartupConfigError(
+            f"Failed to load or parse agent configuration '{cfg_path}': {exc}"
+        ) from exc
+
+
+def _resolve_assist_fallback_models_for_policy(cfg: dict[str, Any]) -> list[str]:
+    from src.dalton.settings import get_assist_fallback_models
+
+    llm_cfg = cfg.get("llm") if isinstance(cfg.get("llm"), dict) else {}
+    models_cfg = cfg.get("models") if isinstance(cfg.get("models"), dict) else {}
+    raw_override = (
+        models_cfg.get("assist_fallback_model")
+        if "assist_fallback_model" in models_cfg
+        else llm_cfg.get("assist_fallback")
+    )
+    if isinstance(raw_override, str) and raw_override.strip():
+        return [m.strip() for m in raw_override.split(",") if m.strip()]
+    if isinstance(raw_override, list):
+        return [str(m).strip() for m in raw_override if str(m).strip()]
+    try:
+        return get_assist_fallback_models()
+    except Exception as exc:
+        raise DaltonStartupConfigError(
+            f"Failed to load assist_fallback_model from Dalton settings: {exc}"
+        ) from exc
 
 
 def check_roles(
@@ -419,19 +463,14 @@ def check_roles(
             }
         )
 
-    # Validate auxiliary LLM slots: assist, background, compaction, fetch (P0H §4 P3)
+    # Validate auxiliary LLM slots: assist, assist_fallback, background, compaction, fetch (P0H §4 P3, P0J.J2)
     # Note: assist (and compaction/background) are non-tool structured/background slots,
     # so they do not require tool-calling, but they MUST NOT use forbidden contributor models.
-    models_cfg = cfg.get("models") if isinstance(cfg.get("models"), dict) else {}
-    assist_fb = str(
-        llm_cfg.get("assist_fallback")
-        or models_cfg.get("assist_fallback_model")
-        or ""
-    ).strip()
+    assist_fb_models = _resolve_assist_fallback_models_for_policy(cfg)
 
     aux_slots: list[tuple[str, str]] = [
         ("assist", str(llm_cfg.get("assist") or "").strip()),
-        ("assist_fallback", assist_fb),
+        *[("assist_fallback", fb_m) for fb_m in assist_fb_models],
         ("background", str(llm_cfg.get("background") or "").strip()),
         (
             "compaction",
@@ -525,22 +564,28 @@ def check_roles(
                     }
                 )
 
-    if reviewer_models:
-        for rev_cand in reviewer_models:
-            if is_forbidden_for_roles(rev_cand):
-                warnings.append(
-                    {
-                        "code": "role_forbidden_model",
-                        "role": "reviewer",
-                        "model": rev_cand,
-                        "message": f"审稿候选模型 {rev_cand} 为 contributor 禁用变体（L21 严禁用于任何基金研究角色）。",
-                        "link": "/settings?tab=model",
-                    }
-                )
+    from src.dalton.settings import get_dalton_settings
+
+    eff_reviewer_models = (
+        list(reviewer_models)
+        if reviewer_models is not None
+        else list(get_dalton_settings().publish.reviewer_models)
+    )
+    for rev_cand in eff_reviewer_models:
+        if is_forbidden_for_roles(rev_cand):
+            warnings.append(
+                {
+                    "code": "role_forbidden_model",
+                    "role": "reviewer",
+                    "model": rev_cand,
+                    "message": f"审稿候选模型 {rev_cand} 为 contributor 禁用变体（L21 严禁用于任何基金研究角色）。",
+                    "link": "/settings?tab=model",
+                }
+            )
 
     chosen_reviewer = select_independent_reviewer(
         lead_model,
-        reviewer_models,
+        eff_reviewer_models,
         require_tool_calling=False,
         available_models=available_models,
     )
@@ -554,22 +599,29 @@ def check_roles(
                 "link": "/settings?tab=model",
             }
         )
-    elif assist_fb and family_of(assist_fb) == family_of(chosen_reviewer):
-        warnings.append(
-            {
-                "code": "assist_fallback_same_family",
-                "role": "assist_fallback",
-                "model": assist_fb,
-                "message": f"assist 备选模型 {assist_fb} 与审稿人 {chosen_reviewer} 同属家族 {family_of(assist_fb)}（违反 L20 跨家族独立原则）。",
-                "link": "/settings?tab=model",
-            }
-        )
+
+    for fb_m in assist_fb_models:
+        fb_fam = family_of(fb_m)
+        if fb_fam == "unknown":
+            continue
+        for rev_cand in eff_reviewer_models:
+            if family_of(rev_cand) == fb_fam:
+                warnings.append(
+                    {
+                        "code": "assist_fallback_same_family",
+                        "role": "assist_fallback",
+                        "model": fb_m,
+                        "message": f"assist 备选模型 {fb_m} 与审稿候选模型 {rev_cand} 同属家族 {fb_fam}（违反 L20 跨家族独立原则）。",
+                        "link": "/settings?tab=model",
+                    }
+                )
+                break
 
     return warnings
 
 
 def enforce_role_policy_on_startup(config: dict[str, Any] | None = None) -> list[dict[str, str]]:
-    """Validate role assignments at backend startup; raise `RolePolicyError` if any role uses a forbidden model (P0H §4 P3, P0J.J2)."""
+    """Validate role assignments at backend startup; raise `RolePolicyError` on L20/L21 violation (P0H §4 P3, P0J.J2)."""
     warnings = check_roles(config)
     forbidden = [
         w

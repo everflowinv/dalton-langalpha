@@ -24,7 +24,7 @@ import yaml
 from src.config.env import LOCAL_DEV_USER_ID
 from src.dalton.database.provider_events import sanitize_error_text
 from src.dalton.llm.complete import dalton_complete
-from src.dalton.settings import DALTON_YAML_PATH, REPO_ROOT
+from src.dalton.settings import DALTON_YAML_PATH, REPO_ROOT, get_assist_fallback_models
 
 logger = logging.getLogger(__name__)
 
@@ -111,15 +111,27 @@ def resolve_assist_model(role: str = "assist", explicit_model: str | None = None
     return "deepseek-flash"
 
 
+def resolve_assist_fallback_models(role: str = "assist_fallback") -> list[str]:
+    """Resolve fallback model list for `assist_json` from `settings.get_assist_fallback_models()` (P0J.J2)."""
+    return [
+        _validate_assist_candidate(role, m)
+        for m in get_assist_fallback_models()
+        if m and m.strip()
+    ]
+
+
 def resolve_assist_fallback_model(role: str = "assist_fallback") -> str | None:
-    """Resolve fallback model for `assist_json` from `llm.assist_fallback` or `models.assist_fallback_model` (P0J.J2)."""
-    for cfg in (_read_yaml_dict(REPO_ROOT / "agent_config.dalton.yaml"), _read_yaml_dict(DALTON_YAML_PATH)):
-        for block_key, field_key in (("llm", "assist_fallback"), ("models", "assist_fallback_model")):
-            block = cfg.get(block_key)
-            val = block.get(field_key) if isinstance(block, dict) else None
-            if isinstance(val, str) and val.strip():
-                return _validate_assist_candidate(role, val)
-    return None
+    """Return the first configured assist fallback model, if any."""
+    models = resolve_assist_fallback_models(role=role)
+    return models[0] if models else None
+
+
+def _is_safe_to_fallback(comp: Any) -> bool:
+    """Return True only when `dalton_complete` failed safely without charge (`pre_send` or `4xx`)."""
+    if comp.ok or getattr(comp, "status", None) != "failed":
+        return False
+    ek = str(getattr(comp, "error_kind", None) or "").strip().lower()
+    return ek == "pre_send" or (ek.startswith("http_4") and ek != "http_429")
 
 
 def _extract_json_dict(raw_data: Any, raw_text: str | None) -> dict[str, Any]:
@@ -206,39 +218,37 @@ async def assist_json(
             thread_id=thread_id,
             raise_on_error=False,
         )
-        if not comp.ok and model is None and comp.status != "timeout":
-            fb_model = resolve_assist_fallback_model()
-            if fb_model and fb_model != resolved_model:
+        if model is None and _is_safe_to_fallback(comp):
+            primary_model = resolved_model
+            for fb_cand in resolve_assist_fallback_models():
+                if fb_cand == primary_model:
+                    continue
                 logger.info(
                     "[DaltonAssist] task=%s primary_model=%s failed (%s); switching to assist_fallback=%s",
                     task,
                     resolved_model,
                     comp.error or comp.status,
-                    fb_model,
+                    fb_cand,
                 )
-                fb_cands = (fb_model, "ocb-deepseek-deepseek-flash") if fb_model == "deepseek-flash" else (fb_model,)
-                for fb_cand in fb_cands:
-                    if fb_cand == resolved_model:
-                        continue
-                    comp_fb = await dalton_complete(
-                        llm_service=llm_service,
-                        user_id=user_id,
-                        system_prompt=system_prompt,
-                        user_prompt=payload_json,
-                        scope_ref=f"{eff_scope}:fb:{fb_cand}",
-                        purpose=f"assist.{task}",
-                        request_model=fb_cand,
-                        response_schema=schema,
-                        slot="background",
-                        timeout_s=timeout_s,
-                        workspace_id=workspace_id,
-                        thread_id=thread_id,
-                        raise_on_error=False,
-                    )
-                    if comp_fb.ok or comp_fb.error_kind != "pre_send":
-                        comp = comp_fb
-                        resolved_model = fb_cand
-                        break
+                comp_fb = await dalton_complete(
+                    llm_service=llm_service,
+                    user_id=user_id,
+                    system_prompt=system_prompt,
+                    user_prompt=payload_json,
+                    scope_ref=f"{eff_scope}:fb:{fb_cand}",
+                    purpose=f"assist.{task}",
+                    request_model=fb_cand,
+                    response_schema=schema,
+                    slot="background",
+                    timeout_s=timeout_s,
+                    workspace_id=workspace_id,
+                    thread_id=thread_id,
+                    raise_on_error=False,
+                )
+                comp = comp_fb
+                resolved_model = fb_cand
+                if comp_fb.ok or not _is_safe_to_fallback(comp_fb):
+                    break
 
         elapsed_ms = int((time.monotonic() - t0) * 1000)
         used_model = comp.model or resolved_model
