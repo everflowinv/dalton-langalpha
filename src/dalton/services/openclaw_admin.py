@@ -56,6 +56,7 @@ DOCKER_MANIFEST_WATCHED_PATHS: tuple[str, ...] = (
     "agent_config.dalton.yaml",
     "alembic.ini",
     "config/dalton",
+    "libs/ptc-cli",
     "libs/market-protocol",
     "src",
     "scripts",
@@ -64,7 +65,7 @@ DOCKER_MANIFEST_WATCHED_PATHS: tuple[str, ...] = (
     "plugins",
     "workflows",
 )
-_IGNORED_DIR_NAMES = frozenset({"__pycache__", ".pytest_cache"})
+_IGNORED_DIR_NAMES = frozenset({"__pycache__", ".pytest_cache", ".ruff_cache"})
 _IGNORED_FILE_NAMES = frozenset({".DS_Store"})
 _IGNORED_FILE_SUFFIXES = (".pyc", ".pyo")
 
@@ -150,11 +151,11 @@ def _verify_docker_build_manifest(
         except Exception:
             return False
 
-    # 2. Verify no new untracked/post-build files exist under watched paths or manifest top-level dirs
+    # 2. Verify no new untracked/post-build files exist under watched paths or manifest parent dirs
     watched_roots: set[str] = set(DOCKER_MANIFEST_WATCHED_PATHS)
     for rel_path in manifest:
         if "/" in rel_path:
-            watched_roots.add(rel_path.split("/", 1)[0])
+            watched_roots.add(rel_path.rsplit("/", 1)[0])
         else:
             watched_roots.add(rel_path)
 

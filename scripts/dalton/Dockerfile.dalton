@@ -64,8 +64,8 @@ RUN if [ -z "$BUILD_GIT_SHA" ] || [ "$BUILD_GIT_SHA" = "unknown" ]; then \
     && printf '%s\n' "$BUILD_GIT_SHA" | cut -c1-8 > /app/.build_git_sha \
     && printf '%s\n' "$BUILD_GIT_DIRTY" > /app/.build_git_dirty \
     && find server.py config.yaml agent_config.yaml agent_config.dalton.yaml alembic.ini \
-            config/dalton libs/market-protocol src scripts migrations mcp_servers plugins workflows \
-            -type f ! -path '*/__pycache__/*' ! -path '*/.pytest_cache/*' ! -name '*.pyc' ! -name '*.pyo' ! -name '.DS_Store' -print0 \
+            config/dalton libs/ptc-cli libs/market-protocol src scripts migrations mcp_servers plugins workflows \
+            -type f ! -path '*/__pycache__/*' ! -path '*/.pytest_cache/*' ! -path '*/.ruff_cache/*' ! -name '*.pyc' ! -name '*.pyo' ! -name '.DS_Store' -print0 \
        | sort -z \
        | xargs -0 sha256sum > /app/.build_files.sha256
 
