@@ -897,3 +897,173 @@ def test_pr_baseline_script_exists_and_executable() -> None:
     assert os.access(build_script, os.X_OK)
 
 
+def test_check_env_oauth_provenance_budget_restore_and_g6_markdown(monkeypatch: pytest.MonkeyPatch) -> None:
+    from datetime import datetime, timezone
+
+    from scripts.dalton.realrun import check_env, g6_lenses
+
+    # 1. check_oauth_token_provenance: PASS when prior login_start exists and no unverified realrun-* rows
+    class _FakeCursor:
+        def __init__(self, row: dict[str, Any] | None, unverified: list[dict[str, Any]]) -> None:
+            self._row = row
+            self._unverified = unverified
+            self._step = 0
+            self.executed_sql: list[tuple[str, Any]] = []
+
+        def __enter__(self) -> "_FakeCursor":
+            return self
+
+        def __exit__(self, *args: Any) -> None:
+            pass
+
+        def execute(self, sql: str, params: Any = None) -> None:
+            self.executed_sql.append((sql, params))
+            self._step += 1
+
+        def fetchone(self) -> dict[str, Any] | None:
+            return self._row
+
+        def fetchall(self) -> list[dict[str, Any]]:
+            return self._unverified
+
+    class _FakeConn:
+        def __init__(self, cursor: _FakeCursor) -> None:
+            self._cursor = cursor
+            self.committed = False
+
+        def __enter__(self) -> "_FakeConn":
+            return self
+
+        def __exit__(self, *args: Any) -> None:
+            pass
+
+        def cursor(self) -> _FakeCursor:
+            return self._cursor
+
+        def commit(self) -> None:
+            self.committed = True
+
+    t_login = datetime(2026, 10, 20, 12, 0, 0, tzinfo=timezone.utc)
+    t_token = datetime(2026, 10, 20, 12, 0, 15, tzinfo=timezone.utc)
+
+    monkeypatch.setattr(
+        check_env.psycopg,
+        "connect",
+        lambda *a, **kw: _FakeConn(
+            _FakeCursor(
+                {
+                    "user_id": "realrun-pm-a",
+                    "provider": "antigravity-oauth",
+                    "created_at": t_token,
+                    "updated_at": t_token,
+                    "earliest_prior_login_start": t_login,
+                },
+                [],
+            )
+        ),
+    )
+    res_pass = check_env.check_oauth_token_provenance("realrun-pm-a", "antigravity-oauth", dsn="postgresql://x")
+    assert res_pass["status"] == "PASS"
+    assert res_pass["has_prior_oauth_login_start"] is True
+
+    # FAIL when token exists but earliest_prior_login_start is None (copied token)
+    monkeypatch.setattr(
+        check_env.psycopg,
+        "connect",
+        lambda *a, **kw: _FakeConn(
+            _FakeCursor(
+                {
+                    "user_id": "realrun-pm-a",
+                    "provider": "antigravity-oauth",
+                    "created_at": t_token,
+                    "updated_at": t_token,
+                    "earliest_prior_login_start": None,
+                },
+                [{"user_id": "realrun-pm-a", "provider": "antigravity-oauth", "created_at": t_token}],
+            )
+        ),
+    )
+    res_fail = check_env.check_oauth_token_provenance("realrun-pm-a", "antigravity-oauth", dsn="postgresql://x")
+    assert res_fail["status"] == "FAIL"
+    assert res_fail["reason"] == "missing_prior_oauth_login_start_event"
+
+    # check_conversation_transport fails immediately when oauth_provenance is FAIL
+    conv_fail = check_env.check_conversation_transport(
+        "http://127.0.0.1:8000",
+        model="gemini-3.8-flash-low-oauth",
+        oauth_provenance=res_fail,
+    )
+    assert conv_fail["status"] == "FAIL"
+    assert "oauth_token_provenance_failed" in str(conv_fail.get("reason"))
+
+    # 2. _restore_budget_state: unconfigured state deletes DB row and verifies configured == False
+    class _FakeHttpClient:
+        def __init__(self, get_resp: tuple[int, dict[str, Any]], put_status: int = 200) -> None:
+            self._get_resp = get_resp
+            self._put_status = put_status
+            self.puts: list[dict[str, Any]] = []
+
+        def get(self, path: str) -> tuple[int, dict[str, Any]]:
+            return self._get_resp
+
+        def put(self, path: str, json_body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+            self.puts.append(json_body)
+            return self._put_status, {}
+
+    fake_cur = _FakeCursor(None, [])
+    fake_conn = _FakeConn(fake_cur)
+    monkeypatch.setattr(check_env.psycopg, "connect", lambda *a, **kw: fake_conn)
+    err_unconf = check_env._restore_budget_state(
+        _FakeHttpClient((200, {"configured": False})),  # type: ignore[arg-type]
+        user_id="realrun-pm-a",
+        was_configured=False,
+        prior_budget=None,
+        dsn="postgresql://x",
+    )
+    assert err_unconf is None
+    assert fake_conn.committed is True
+    assert any("DELETE FROM dalton_budget_config" in sql for sql, _ in fake_cur.executed_sql)
+
+    # Restore failure when configured remains True after delete
+    err_unconf_fail = check_env._restore_budget_state(
+        _FakeHttpClient((200, {"configured": True})),  # type: ignore[arg-type]
+        user_id="realrun-pm-a",
+        was_configured=False,
+        prior_budget=None,
+        dsn="postgresql://x",
+    )
+    assert err_unconf_fail is not None
+
+    # Restore failure when PUT fails for previously configured budget
+    err_conf_fail = check_env._restore_budget_state(
+        _FakeHttpClient((200, {"configured": True}), put_status=500),  # type: ignore[arg-type]
+        user_id="realrun-pm-a",
+        was_configured=True,
+        prior_budget={"daily_cap_usd": 12.0, "default_task_cap_usd": 3.0, "timezone": "Asia/Shanghai"},
+        dsn="postgresql://x",
+    )
+    assert err_conf_fail == "budget_restore_put_http_500"
+
+    # 3. G6 render_comparison_markdown has no Section 2 static table or hand-written legacy comparison claims
+    sample_ticker = {
+        "market_cap_usd_mn": 1000.0,
+        "strict_net_cash_usd": 200.0,
+        "strict_net_cash_to_mcap_pct": 20.0,
+        "fx_rate_to_usd": 0.14,
+        "listing_fx_rate": 0.128,
+        "basic_net_cash_usd": 250.0,
+        "basic_net_cash_to_mcap_pct": 25.0,
+        "restricted_cash_usd_equiv": 50.0,
+        "return_final_score": 15.0,
+        "overall_quality": "HIGH",
+        "operating_sloan_pct": -1.2,
+        "cfo_to_ni_pct": 120.0,
+    }
+    md_text = g6_lenses.render_comparison_markdown(
+        {"BABA": sample_ticker, "0700.HK": sample_ticker, "META": sample_ticker},
+        run_date="20261020",
+    )
+    assert "示意数据" in md_text
+    assert "## 2." not in md_text
+    assert "与原脚本一致" not in md_text
+    assert "偶发漏扣" not in md_text

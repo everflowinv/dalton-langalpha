@@ -91,11 +91,11 @@ def render_comparison_markdown(results_by_ticker: dict[str, Any], run_date: str 
     meta_impl_pct = round(100.0 - meta["strict_net_cash_to_mcap_pct"], 2)
 
     lines = [
-        "# G6.2 财务镜头脚本命令链路与基金原脚本对比记录 (统一锚点与受限现金单次扣除)",
+        "# G6.2 财务镜头脚本命令链路实跑记录 (统一锚点与受限现金单次扣除)",
         "",
-        "- **生成方式**：由 `python -m scripts.dalton.realrun._common --render-docs` 从 `var/dalton/trial-runs/` 下的 G6 实跑证据 JSON 直接渲染生成（无手写硬编码表）",
+        "- **生成方式**：由 `python -m scripts.dalton.realrun._common --render-docs` 从 `var/dalton/trial-runs/` 下的 G6 实跑证据 JSON 直接渲染生成",
         "- **对应指南**：`P0J-round4-fixes.md` §5.7 (`G6`)、§8.1 第 17 条、`P0I-round3-fixes.md` §6 (`I6`)",
-        "- **输入说明（示意数据，`illustrative: true`）**：科目数值取自 `tests/fixtures/dalton/g6/lenses_inputs.json`，属于示意输入，用于验证镜头命令链路、跨镜头锚点一致性与受限现金单次扣除逻辑，**不是公司真实财报数据**；市值与汇率由 `anchors.py --allow-network` 实时从 `yfinance` 拉取。本文档仅比较**同一组示意输入下，Dalton 镜头与基金原脚本的输出与口径行为是否一致**",
+        "- **输入说明（示意数据，`illustrative: true`）**：科目数值取自 `tests/fixtures/dalton/g6/lenses_inputs.json`，属于示意输入，用于验证镜头命令链路、跨镜头锚点一致性与受限现金单次扣除逻辑，**不是公司真实财报数据**；市值与汇率由 `anchors.py --allow-network` 实时从 `yfinance` 拉取。本文档仅记录**同一组示意输入与实时锚点下，Dalton 四个财务镜头脚本（`anchors.py`、`netcash.py`、`return_score.py`、`earnings_quality.py`）的实际命令输出与口径校验结果**",
         "- **真实运行产物路径（`--record` 模式写入 `var/dalton/lenses/`）**：",
         f"  - `var/dalton/lenses/baba_anchors_{date_tag}.json`",
         f"  - `var/dalton/lenses/baba_netcash_{date_tag}.json`",
@@ -142,18 +142,6 @@ def render_comparison_markdown(results_by_ticker: dict[str, Any], run_date: str 
             f"`${meta_impl:,.2f}M` ({meta_impl_pct}%) | `{meta['return_final_score']} / 20` | "
             f"`{meta['overall_quality']}` (`{meta['operating_sloan_pct']}%`, `CFO/NI={meta['cfo_to_ni_pct']}%`) |"
         ),
-        "",
-        "---",
-        "",
-        "## 2. 与基金原脚本（OpenClaw `company-deepdive-mx-0911`）结果对比",
-        "",
-        "| 维度 | 基金原脚本 (`~/.openclaw/agents/main/agent/workshop-skills/company-deepdive-mx-0911/`) | 本仓 `dalton-financial-lenses/scripts/` (`P0I.I6` 统一锚点后) | 对比结论 |",
-        "|---|---|---|---|",
-        "| **跨镜头市值与汇率锚点一致性 (`--anchors`)** | 各脚本分别手填市值和汇率，易出现 `anchors` 与 `netcash` 混用不同市值/整数汇率 | `netcash.py`、`return_score.py`、`earnings_quality.py` 统一通过 `--anchors <json>` 读取 `market_cap_usd_mn`、`fx.rate`、`period_end`；同时传 `--anchors` 与手填 `--market-cap-usd-mn`/`--fx-rate` 直接报错退出（仅手填时标 `anchors_source: \"manual\"`） | 从参数结构上杜绝手填市值/汇率与 `anchors.py` 输出不一致的问题 |",
-        "| **ADR / 港股财报汇率换算** | 未强制要求显式传入 `--reporting-currency`，离线时回退到写死的静态汇率表 | 非美股与 ADR 强制校验 `--reporting-currency CNY`，汇率由 `--allow-network` 实时 `yfinance` 获取或 `--fx-rate` 显式锁定（删除静态兜底表） | `BABA` 与 `0700.HK` 人民币报表均按 `anchors` 锁定的实时 `CNYUSD=X` 统一换算 |",
-        "| **受限现金扣除逻辑 (`netcash.py`)** | 传入自定义 `trapped_cash_items` 时偶发漏扣 `restricted_cash` | 口径 A (`basic_net_cash_usd`) 计入广义现金减去有息负债；口径 B (`strict_net_cash_usd`) 从口径 A 扣除一次 `restricted_cash`（及类债务/受困现金），满足 `(basic_net_cash_usd - restricted_cash_usd_equiv) == strict_net_cash_usd` | 口径 A 与口径 B 差额等于受限现金与额外扣减项之和 |",
-        "| **市值字段与单位 (`market_cap_usd_mn`)** | 混用 `market_cap_usd`（百万美元 vs 美元原值） | 统一使用 `market_cap_usd_mn`（百万美元），同时保留 `value_usd` 原值并与 `references/output-schema.md` 100% 对齐 | 消除 100 万倍单位歧义 |",
-        "| **盈利质量期初/期末资产与 CCC (`earnings_quality.py`)** | 需手工预计算平均总资产；缺少分项时将缺失分项按 `0` 求和算出伪造的 `ccc_days` | 支持直接传 `--beginning-assets` 与 `--ending-assets` 自动求均值；`dso`/`dio`/`dpo` 任一分项缺失时 `ccc_days` 返回 `null` | Sloan 应计比率与 CFO/NI 计算结果与原脚本一致，缺失分项时诚实返回 `null` |",
         "",
     ]
     return "\n".join(lines)

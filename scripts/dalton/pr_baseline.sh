@@ -74,8 +74,9 @@ if [[ -n "$PR_NUMBER" ]]; then
   fi
 fi
 
-# 3. Persist untruncated raw logs under var/dalton/pr_baseline/<HEAD_SHORT>/ (Review Item 7)
-RAW_LOG_DIR="var/dalton/pr_baseline/${HEAD_SHORT}"
+# 3. Persist untruncated raw logs under var/dalton/pr_baseline/<HEAD_FULL>/<UTC_TIMESTAMP>/ so reruns never overwrite prior logs
+RUN_TS_DIR="$(date -u +"%Y%m%dT%H%M%SZ")"
+RAW_LOG_DIR="var/dalton/pr_baseline/${HEAD_FULL}/${RUN_TS_DIR}"
 mkdir -p "$RAW_LOG_DIR"
 
 if [[ -z "$OUTPUT_FILE" ]]; then
@@ -85,7 +86,7 @@ else
 fi
 
 BODY_SECTIONS_FILE="$(mktemp "/tmp/pr_baseline_sections_${HEAD_SHORT}_XXXXXX.md")"
-trap 'rm -f "$BODY_SECTIONS_FILE" "$REPO_ROOT/.pr_baseline_dirty_probe.tmp"' EXIT
+trap 'rm -f "$BODY_SECTIONS_FILE"; git checkout -- README.md 2>/dev/null || true' EXIT
 
 OVERALL_FAILURES=0
 FAILED_TITLES=()
@@ -147,21 +148,34 @@ run_and_record() {
     if [[ "$clean_bytes" -le 25000 ]]; then
       cat "$raw_log_file"
     else
-      head -n 40 "$raw_log_file"
-      echo ""
-      echo "... [middle lines omitted for GitHub 65536-char comment limit; full untruncated log saved at ${raw_log_file} (lines=${clean_lines}, bytes=${clean_bytes}, sha256=${clean_sha})] ..."
+      local err_matches
       if [[ "$clean_lines" -gt 100 ]]; then
+        head -n 40 "$raw_log_file"
+        echo ""
+        echo "... [middle lines omitted for GitHub 65536-char comment limit; full untruncated log saved at ${raw_log_file} (lines=${clean_lines}, bytes=${clean_bytes}, sha256=${clean_sha})] ..."
         local mid_end=$((clean_lines - 60))
-        local err_matches
-        err_matches="$(sed -n "41,${mid_end}p" "$raw_log_file" | grep -nE 'FAIL|Error|ERROR|failed|FAILED|Traceback|AssertionError' | head -n 80 || true)"
+        err_matches="$(sed -n "41,${mid_end}p" "$raw_log_file" | grep -nE 'FAIL|Error|ERROR|failed|FAILED|Traceback|AssertionError' || true)"
         if [[ -n "$err_matches" ]]; then
           echo "--- [Extracted FAIL/Error lines from omitted middle section] ---"
           echo "$err_matches"
           echo "----------------------------------------------------------------"
         fi
+        echo ""
+        tail -n 60 "$raw_log_file"
+      else
+        head -c 10000 "$raw_log_file"
+        echo ""
+        echo "... [middle bytes omitted for GitHub 65536-char comment limit; full untruncated log saved at ${raw_log_file} (lines=${clean_lines}, bytes=${clean_bytes}, sha256=${clean_sha})] ..."
+        err_matches="$(grep -nE 'FAIL|Error|ERROR|failed|FAILED|Traceback|AssertionError' "$raw_log_file" || true)"
+        if [[ -n "$err_matches" ]]; then
+          echo "--- [Extracted FAIL/Error lines from log] ---"
+          echo "$err_matches"
+          echo "---------------------------------------------"
+        fi
+        echo ""
+        tail -c 10000 "$raw_log_file"
+        echo ""
       fi
-      echo ""
-      tail -n 60 "$raw_log_file"
     fi
     echo "\`\`\`"
   } >> "$BODY_SECTIONS_FILE"
@@ -187,8 +201,8 @@ run_and_record \
 # J1 acceptance & debug runs (when not --baseline-only)
 if [[ "$BASELINE_ONLY" -eq 0 ]]; then
   run_and_record \
-    "J1 Debug 1/9: src/ Net Line Delta (git diff origin/dalton/main...HEAD --stat -- src/)" \
-    "git diff origin/dalton/main...HEAD --stat -- src/"
+    "J1 Debug 1/9: src/ Net Line Delta (git diff origin/dalton/main...HEAD --stat --shortstat -- src/)" \
+    "git diff origin/dalton/main...HEAD --stat -- src/ && git diff --shortstat origin/dalton/main...HEAD -- src/"
 
   run_and_record \
     "J1 Debug 2/9: Live /api/v1/dalton/openclaw/health Probe (realrun-pm-a & realrun-user-b)" \
@@ -199,12 +213,12 @@ if [[ "$BASELINE_ONLY" -eq 0 ]]; then
     "uv run python scripts/dalton/realrun/check_env.py"
 
   run_and_record \
-    "J1 Debug 4/9: Dirty Working Tree Rejection on g1_budget.py --record (Expected Non-Zero Exit)" \
-    "touch .pr_baseline_dirty_probe.tmp && set +e; uv run python scripts/dalton/realrun/g1_budget.py --record; rc=\$?; rm -f .pr_baseline_dirty_probe.tmp; echo \"rejected_exit_code=\$rc\"; test \"\$rc\" -ne 0"
+    "J1 Debug 4/9: Dirty Working Tree Rejection on g1_budget.py --record (Expected Non-Zero Exit + Dirty Reason)" \
+    "printf '\n<!-- pr_baseline dirty probe -->\n' >> README.md && git status --porcelain README.md && set +e; out=\$(uv run python scripts/dalton/realrun/g1_budget.py --record 2>&1); rc=\$?; git checkout -- README.md; printf '%s\n' \"\$out\"; echo \"rejected_exit_code=\$rc\"; test \"\$rc\" -ne 0 && grep -q 'Working tree is dirty' <<<\"\$out\""
 
   run_and_record \
-    "J1 Debug 5/9: Empty INTERNAL_SERVICE_TOKEN Rejection on check_env.py (Expected Non-Zero Exit)" \
-    "set +e; INTERNAL_SERVICE_TOKEN=\"\" uv run python scripts/dalton/realrun/check_env.py; rc=\$?; echo \"rejected_exit_code=\$rc\"; test \"\$rc\" -ne 0"
+    "J1 Debug 5/9: Empty INTERNAL_SERVICE_TOKEN Rejection on check_env.py (Expected Non-Zero Exit + Token Reason)" \
+    "set +e; out=\$(INTERNAL_SERVICE_TOKEN=\"\" uv run python scripts/dalton/realrun/check_env.py 2>&1); rc=\$?; printf '%s\n' \"\$out\"; echo \"rejected_exit_code=\$rc\"; test \"\$rc\" -ne 0 && grep -q 'INTERNAL_SERVICE_TOKEN is not set' <<<\"\$out\""
 
   run_and_record \
     "J1 Debug 6/9: Legacy Report Comparison Reproducing 5 Mismatched Rows & 5 G3 Mismatches (render_report_tables.py)" \

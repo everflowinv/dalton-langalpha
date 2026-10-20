@@ -21,6 +21,8 @@ Checks in order:
    - Reports whether the backend is running in `docker` or `host` mode.
 7. `static_script_scan`:
    - Scans `scripts/dalton/realrun/g*.py` for forbidden `from src` imports, direct `INSERT INTO` SQL statements, `_for_check_env_probe`, and `*_fn=` preflight override arguments.
+8. `oauth_token_provenance`:
+   - Verifies that test user (`realrun-pm-a`) OAuth token in `user_oauth_tokens` has a prior `oauth_login_start` event in `dalton_provider_events` (`e.created_at <= t.created_at`), and that no `realrun-%` row in `user_oauth_tokens` lacks a prior `oauth_login_start` event (L39, P0J §1.5).
 """
 
 from __future__ import annotations
@@ -35,7 +37,9 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import psycopg
 from dotenv import load_dotenv
+from psycopg.rows import dict_row
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
@@ -51,7 +55,11 @@ from scripts.dalton.realrun._common import (  # noqa: E402
     is_git_dirty,
     now_utc_iso,
 )
-from scripts.dalton.realrun.journal_dump import dump_journal  # noqa: E402
+from scripts.dalton.realrun.journal_dump import (  # noqa: E402
+    build_dsn_from_env,
+    dump_journal,
+    format_iso_utc,
+)
 
 BRIDGE_ENV_FILE = Path.home() / ".config" / "dalton" / "researchdata-bridge.env"
 
@@ -233,15 +241,169 @@ def check_identity_and_version(base_url: str) -> tuple[dict[str, Any], dict[str,
     return identity_result, version_result, deployment_result
 
 
+def check_oauth_token_provenance(
+    user_id: str = "realrun-pm-a",
+    provider: str = "antigravity-oauth",
+    dsn: str | None = None,
+) -> dict[str, Any]:
+    """Verify test user OAuth token has a prior `oauth_login_start` event in `dalton_provider_events` (L39, P0J §1.5).
+
+    Also checks that no `realrun-%` row in `user_oauth_tokens` lacks a prior `oauth_login_start` event.
+    """
+    try:
+        conn_str = build_dsn_from_env(dsn)
+        with psycopg.connect(conn_str, row_factory=dict_row) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT t.user_id,
+                           t.provider,
+                           t.created_at,
+                           t.updated_at,
+                           (
+                               SELECT MIN(e.created_at)
+                               FROM dalton_provider_events e
+                               WHERE e.user_id = t.user_id
+                                 AND e.provider = t.provider
+                                 AND e.kind = 'oauth_login_start'
+                                 AND e.created_at <= t.created_at
+                           ) AS earliest_prior_login_start
+                    FROM user_oauth_tokens t
+                    WHERE t.user_id = %s AND t.provider = %s
+                    """,
+                    (user_id, provider),
+                )
+                row = cur.fetchone()
+
+                cur.execute(
+                    """
+                    SELECT t.user_id,
+                           t.provider,
+                           t.created_at
+                    FROM user_oauth_tokens t
+                    WHERE t.user_id LIKE 'realrun-%%'
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM dalton_provider_events e
+                          WHERE e.user_id = t.user_id
+                            AND e.provider = t.provider
+                            AND e.kind = 'oauth_login_start'
+                            AND e.created_at <= t.created_at
+                      )
+                    ORDER BY t.created_at, t.user_id, t.provider
+                    """
+                )
+                unverified_rows = list(cur.fetchall())
+    except Exception as exc:
+        return {
+            "status": "FAIL",
+            "user_id": user_id,
+            "provider": provider,
+            "reason": "db_query_failed",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+    token_exists = row is not None
+    prior_login_start = row.get("earliest_prior_login_start") if row else None
+    has_prior_login_start = prior_login_start is not None
+    ok = token_exists and has_prior_login_start and len(unverified_rows) == 0
+
+    reason: str | None = None
+    if not token_exists:
+        reason = "missing_oauth_token_row"
+    elif not has_prior_login_start:
+        reason = "missing_prior_oauth_login_start_event"
+    elif len(unverified_rows) > 0:
+        reason = "unverified_realrun_oauth_token_rows_present"
+
+    return {
+        "status": "PASS" if ok else "FAIL",
+        "user_id": user_id,
+        "provider": provider,
+        "token_exists": token_exists,
+        "token_created_at": format_iso_utc(row["created_at"]) if row else None,
+        "earliest_prior_login_start": format_iso_utc(prior_login_start) if prior_login_start is not None else None,
+        "has_prior_oauth_login_start": has_prior_login_start,
+        "unverified_test_token_rows": [
+            {
+                "user_id": str(r["user_id"]),
+                "provider": str(r["provider"]),
+                "created_at": format_iso_utc(r["created_at"]),
+            }
+            for r in unverified_rows
+        ],
+        "reason": reason,
+    }
+
+
+def _restore_budget_state(
+    cleanup_client: RealRunHttpClient,
+    *,
+    user_id: str,
+    was_configured: bool,
+    prior_budget: dict[str, Any] | None,
+    dsn: str | None = None,
+) -> str | None:
+    """Restore `user_id`'s budget state after `check_conversation_transport`; return error string on failure."""
+    try:
+        if was_configured:
+            if not isinstance(prior_budget, dict) or prior_budget.get("daily_cap_usd") is None:
+                return "budget_restore_missing_prior_daily_cap_usd"
+            st_put, _ = cleanup_client.put(
+                "/api/v1/dalton/budget",
+                json_body={
+                    "daily_cap_usd": float(prior_budget["daily_cap_usd"]),
+                    "default_task_cap_usd": prior_budget.get("default_task_cap_usd"),
+                    "timezone": str(prior_budget.get("timezone") or "Asia/Shanghai"),
+                },
+            )
+            if st_put != 200:
+                return f"budget_restore_put_http_{st_put}"
+            return None
+
+        conn_str = build_dsn_from_env(dsn)
+        with psycopg.connect(conn_str) as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM dalton_budget_config WHERE user_id = %s", (user_id,))
+            conn.commit()
+        st_get, body_get = cleanup_client.get("/api/v1/dalton/budget")
+        if st_get != 200 or not isinstance(body_get, dict) or bool(body_get.get("configured")) is not False:
+            return f"budget_restore_unconfigured_verify_failed:{st_get}"
+        return None
+    except Exception as exc:
+        return f"budget_restore_exception:{type(exc).__name__}:{exc}"
+
+
 def check_conversation_transport(
-    base_url: str, model: str = "gemini-3.8-flash-low-oauth"
+    base_url: str,
+    model: str = "gemini-3.8-flash-low-oauth",
+    *,
+    oauth_provenance: dict[str, Any] | None = None,
+    dsn: str | None = None,
 ) -> dict[str, Any]:
     """Run check #3: minimal `POST /api/v1/threads/messages` turn covering Redis wake listener and `conversation_usages`."""
+    if model.endswith("-oauth"):
+        prov = oauth_provenance or check_oauth_token_provenance(
+            user_id="realrun-pm-a", provider="antigravity-oauth", dsn=dsn
+        )
+        if prov.get("status") != "PASS":
+            return {
+                "status": "FAIL",
+                "model": model,
+                "reason": f"oauth_token_provenance_failed:{prov.get('reason') or 'missing_prior_oauth_login_start'}",
+                "oauth_token_provenance_status": prov.get("status"),
+                "error": (
+                    f"Refusing to run subscription transport probe for realrun-pm-a/{model}: "
+                    f"OAuth token provenance check failed ({prov.get('reason')})"
+                ),
+            }
+
     t0 = now_utc_iso()
     ws_id: str | None = None
     prior_budget: dict[str, Any] | None = None
     was_configured = False
     budget_modified = False
+    restore_error: str | None = None
     try:
         with RealRunHttpClient._for_check_env_probe(
             base_url=base_url, user_id="realrun-pm-a", timeout_s=120.0
@@ -264,10 +426,16 @@ def check_conversation_transport(
             # Only set a temporary budget if realrun-pm-a has none configured or remaining_usd <= 0
             if not was_configured or remaining_usd <= 0.0:
                 probe_cap = max(5.0, spent_usd + 1.0)
-                client.put(
+                st_put_tmp, _ = client.put(
                     "/api/v1/dalton/budget",
                     json_body={"daily_cap_usd": probe_cap, "default_task_cap_usd": 5.0},
                 )
+                if st_put_tmp != 200:
+                    return {
+                        "status": "FAIL",
+                        "reason": f"temporary_budget_put_failed:{st_put_tmp}",
+                        "http_status": st_put_tmp,
+                    }
                 budget_modified = True
 
             st_ws, body_ws = client.post(
@@ -293,29 +461,23 @@ def check_conversation_transport(
                 max_events=300,
             )
     finally:
-        if ws_id or (budget_modified and was_configured and isinstance(prior_budget, dict)):
+        if ws_id or budget_modified:
             try:
                 with RealRunHttpClient._for_check_env_probe(
                     base_url=base_url, user_id="realrun-pm-a", timeout_s=30.0
                 ) as cleanup_client:
                     if ws_id:
                         cleanup_client.delete(f"/api/v1/workspaces/{ws_id}")
-                    if (
-                        budget_modified
-                        and was_configured
-                        and isinstance(prior_budget, dict)
-                        and prior_budget.get("daily_cap_usd") is not None
-                    ):
-                        cleanup_client.put(
-                            "/api/v1/dalton/budget",
-                            json_body={
-                                "daily_cap_usd": float(prior_budget["daily_cap_usd"]),
-                                "default_task_cap_usd": prior_budget.get("default_task_cap_usd"),
-                                "timezone": str(prior_budget.get("timezone") or "Asia/Shanghai"),
-                            },
+                    if budget_modified:
+                        restore_error = _restore_budget_state(
+                            cleanup_client,
+                            user_id="realrun-pm-a",
+                            was_configured=was_configured,
+                            prior_budget=prior_budget,
+                            dsn=dsn,
                         )
-            except Exception:
-                pass
+            except Exception as exc:
+                restore_error = f"cleanup_exception:{type(exc).__name__}:{exc}"
 
     # Allow 0.5s for async usage persistence to commit
     time.sleep(0.5)
@@ -333,6 +495,7 @@ def check_conversation_transport(
         and probe_cash_usd == 0.0
         and len(unexpected_users) == 0
         and not j.get("totals", {}).get("conversation_usages_unavailable", False)
+        and restore_error is None
     )
     return {
         "status": "PASS" if ok else "FAIL",
@@ -342,7 +505,9 @@ def check_conversation_transport(
         "conversation_usages_count": len(pm_rows),
         "cash_usd": probe_cash_usd,
         "user_id_verified": len(pm_rows) >= 1 and all(r.get("user_id") == "realrun-pm-a" for r in pm_rows),
-        "error": err_body if st_msg != 200 else None,
+        "budget_restored": restore_error is None,
+        "restore_error": restore_error,
+        "error": err_body if st_msg != 200 else restore_error,
     }
 
 
@@ -443,13 +608,17 @@ def run_all_checks(
 
     broker_res = check_broker(broker_url)
     identity_res, version_res, deployment_res = check_identity_and_version(backend_url)
-    transport_res = check_conversation_transport(backend_url, model=transport_model)
+    oauth_prov_res = check_oauth_token_provenance(user_id="realrun-pm-a", provider="antigravity-oauth")
+    transport_res = check_conversation_transport(
+        backend_url, model=transport_model, oauth_provenance=oauth_prov_res
+    )
     bridge_res = check_bridge(bridge_url)
     static_res = scan_realrun_scripts()
 
     checks = {
         "identity": identity_res,
         "version": version_res,
+        "oauth_token_provenance": oauth_prov_res,
         "conversation_transport": transport_res,
         "bridge": bridge_res,
         "broker": broker_res,

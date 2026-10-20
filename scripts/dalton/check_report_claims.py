@@ -194,7 +194,10 @@ SELF_EXCLUDED_REL_PATHS = frozenset(
     }
 )
 _TEST_DEF_RE = re.compile(r"^\s*def\s+(test_[A-Za-z0-9_]+)\s*\(", re.MULTILINE)
-_TOP_DEF_OR_CLASS_RE = re.compile(r"^(?:def|class)\s+([A-Za-z_][A-Za-z0-9_]*)\b", re.MULTILINE)
+_TOP_DEF_OR_CLASS_RE = re.compile(
+    r"^(?:(?:def|class)\s+([A-Za-z_][A-Za-z0-9_]*)\b|([A-Za-z_][A-Za-z0-9_]*)\s*(?::[^=\n]+)?=)",
+    re.MULTILINE,
+)
 
 
 def build_repo_index(repo_root: Path = REPO_ROOT) -> tuple[set[str], dict[str, list[str]], str]:
@@ -222,7 +225,7 @@ def build_repo_index(repo_root: Path = REPO_ROOT) -> tuple[set[str], dict[str, l
                         if rel.startswith("tests/"):
                             defs = _TEST_DEF_RE.findall(raw_txt)
                         else:
-                            defs = _TOP_DEF_OR_CLASS_RE.findall(raw_txt)
+                            defs = [m[0] or m[1] for m in _TOP_DEF_OR_CLASS_RE.findall(raw_txt) if m[0] or m[1]]
                         if defs:
                             corpus_chunks.append("\n".join(defs))
                     else:
