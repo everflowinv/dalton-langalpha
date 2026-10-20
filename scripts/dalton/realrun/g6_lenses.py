@@ -30,6 +30,7 @@ if str(REPO_ROOT) not in sys.path:
 from scripts.dalton.realrun._common import (  # noqa: E402
     build_evidence_envelope,
     default_shanghai_date,
+    load_repo_dotenv,
     now_utc_iso,
     preflight_realrun_script,
     write_evidence_and_summary,
@@ -148,6 +149,7 @@ def render_comparison_markdown(results_by_ticker: dict[str, Any], run_date: str 
 
 
 def main() -> int:
+    load_repo_dotenv()
     parser = argparse.ArgumentParser(description="G6 Financial Lenses Real-Run Evidence Generator")
     parser.add_argument("--backend", default="http://127.0.0.1:8000")
     parser.add_argument("--date", default=default_shanghai_date())

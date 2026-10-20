@@ -35,6 +35,7 @@ from scripts.dalton.realrun._common import (  # noqa: E402
     RealRunHttpClient,
     build_evidence_envelope,
     default_shanghai_date,
+    load_repo_dotenv,
     now_utc_iso,
     preflight_realrun_script,
     write_evidence_and_summary,
@@ -283,6 +284,7 @@ def _run_real_content_long_reads(live_bridge_url: str, token: str) -> dict[str, 
 
 
 def main() -> int:
+    load_repo_dotenv()
     parser = argparse.ArgumentParser(description="Run G7 ResearchData Bridge real-run verification.")
     parser.add_argument("--backend", default="http://127.0.0.1:8000", help="Backend base URL")
     parser.add_argument("--bridge", default="http://127.0.0.1:8960", help="Live bridge base URL")

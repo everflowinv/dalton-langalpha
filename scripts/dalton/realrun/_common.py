@@ -43,7 +43,128 @@ import httpx
 from scripts.dalton.realrun.journal_dump import dump_journal, format_iso_utc
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-load_dotenv(REPO_ROOT / ".env", override=False)
+
+
+def load_repo_dotenv() -> None:
+    """Explicitly load `REPO_ROOT / '.env'` when invoked from a script `main()` entry point."""
+    load_dotenv(REPO_ROOT / ".env", override=False)
+
+KNOWN_MIGRATED_WORKSPACES: dict[str, str] = {
+    "META": "0d9c7b91-2db8-587e-903c-5a98ac8deee1",
+    "AMZN": "83d1d873-beb4-5fd1-9655-ffb39af506d2",
+    "GOOGL": "f0725330-1d25-52c2-9052-8f95537e2eb4",
+    "MSFT": "1ee3520c-1fa9-5f19-9c0a-1625d3e27ee4",
+}
+
+REALRUN_WORKSPACE_MARKER_KEY = "realrun_ephemeral"
+REALRUN_WORKSPACE_SCRIPT_KEY = "realrun_script"
+HOME_WORKSPACE_NAMESPACE = uuid.UUID("f1a50000-0000-5000-e000-f1a500000000")
+VALID_REALRUN_SCRIPTS = frozenset(
+    {
+        "check_env.py",
+        "g1_budget.py",
+        "g2_providers.py",
+        "g3_publish.py",
+        "g4_autonomy.py",
+        "g5_broker_and_antigravity.py",
+        "g6_lenses.py",
+        "g7_bridge.py",
+    }
+)
+
+
+def resolve_local_dev_user_id() -> str:
+    """Resolve `LOCAL_DEV_USER_ID` following `src/config/env.py` (`os.getenv('AUTH_USER_ID', 'local-dev-user')`)."""
+    return (os.getenv("AUTH_USER_ID") or "").strip() or "local-dev-user"
+
+
+def build_realrun_workspace_config(
+    script_name: str, extra: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """Build standard `workspaces.config` metadata marking a workspace as newly created by a realrun evidence script."""
+    cfg: dict[str, Any] = {
+        REALRUN_WORKSPACE_MARKER_KEY: True,
+        REALRUN_WORKSPACE_SCRIPT_KEY: str(script_name).strip(),
+    }
+    if isinstance(extra, dict):
+        cfg.update(extra)
+    return cfg
+
+
+def is_valid_realrun_workspace_row(
+    row: dict[str, Any],
+    migrated_ids: set[str] | None = None,
+) -> tuple[bool, str]:
+    """Verify a workspace row owned by `realrun-*` was newly created by an evidence script (P0J §8.1 #20)."""
+    ws_id = str(row.get("workspace_id") or "").strip().lower()
+    user_id = str(row.get("user_id") or "").strip()
+    name = str(row.get("name") or "").strip()
+    cfg = row.get("config") if isinstance(row.get("config"), dict) else {}
+
+    known_migrated = {
+        m.lower() for m in (migrated_ids if migrated_ids is not None else KNOWN_MIGRATED_WORKSPACES.values())
+    }
+    if ws_id in known_migrated:
+        return False, "migrated_workspace_assigned_to_realrun_user"
+
+    if (
+        cfg.get(REALRUN_WORKSPACE_MARKER_KEY) is True
+        and str(cfg.get(REALRUN_WORKSPACE_SCRIPT_KEY) or "").strip() in VALID_REALRUN_SCRIPTS
+    ):
+        return True, "config_realrun_ephemeral"
+
+    # A user's Home row is created idempotently by POST /api/v1/workspaces/home with deterministic
+    # UUIDv5(HOME_WORKSPACE_NAMESPACE, user_id) and cannot be deleted via DELETE /api/v1/workspaces/{id}.
+    if user_id.startswith("realrun-") and name == "Home":
+        expected_home_id = str(uuid.uuid5(HOME_WORKSPACE_NAMESPACE, user_id)).lower()
+        if ws_id == expected_home_id:
+            return True, "deterministic_user_home"
+
+    return False, "unmarked_realrun_workspace"
+
+
+def assert_no_conflicting_dalton_automation(
+    client: Any,
+    *,
+    name: str,
+    workspace_id: str | None = None,
+) -> None:
+    """Verify via `GET /api/v1/automations` (paginated) that no existing automation matches
+    the server's upsert condition (`r.name == name and (not ws_id or not r.workspace_id or str(r.workspace_id) == str(ws_id))`)
+    before issuing `PUT /api/v1/dalton/automations/{name}` (D7).
+    """
+    resolved_name = str(name or "").strip()
+    ws_str = str(workspace_id or "").strip()
+    limit = 100
+    offset = 0
+    while True:
+        st, body = client.request(
+            "GET",
+            "/api/v1/automations",
+            params={"limit": limit, "offset": offset},
+        )
+        if st != 200 or not isinstance(body, dict):
+            raise RuntimeError(
+                f"GET /api/v1/automations failed before PUT /api/v1/dalton/automations/{resolved_name}: "
+                f"status={st} body={body}"
+            )
+        items = body.get("automations") or body.get("items") or []
+        for r in items:
+            if not isinstance(r, dict):
+                continue
+            if str(r.get("name") or "").strip() != resolved_name:
+                continue
+            r_ws = str(r.get("workspace_id") or "").strip()
+            if not ws_str or not r_ws or r_ws == ws_str:
+                raise RuntimeError(
+                    f"Refusing to PUT /api/v1/dalton/automations/{resolved_name}: "
+                    f"conflicting automation already exists (automation_id={r.get('automation_id')!r}, "
+                    f"workspace_id={r.get('workspace_id')!r})"
+                )
+        total = int(body.get("total") or 0)
+        offset += len(items)
+        if not items or (total > 0 and offset >= total):
+            break
 
 ALLOWED_SYNTHETIC_KINDS = frozenset(
     {
@@ -1310,6 +1431,7 @@ class RealRunHttpClient:
 
 
 def main(argv: list[str] | None = None) -> int:
+    load_repo_dotenv()
     parser = argparse.ArgumentParser(
         description="Render trial-run Markdown summaries from var/dalton/trial-runs/realrun-<date>/ into docs/dalton/dev-guide/trial-runs/realrun-<date>/ (P0J §1.6, L42)."
     )

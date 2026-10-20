@@ -27,7 +27,6 @@ from dotenv import load_dotenv
 from psycopg.rows import dict_row
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-load_dotenv(REPO_ROOT / ".env")
 
 
 def build_dsn_from_env(dsn: str | None = None) -> str:
@@ -452,6 +451,7 @@ def dump_journal(
 
 
 def main(argv: list[str] | None = None) -> int:
+    load_dotenv(REPO_ROOT / ".env", override=False)
     parser = argparse.ArgumentParser(
         description="Dump dalton_llm_journal records for user(s) and time window (without request/response bodies)."
     )

@@ -212,32 +212,54 @@ def test_common_synthetic_validation_and_artifact_writing(
     with pytest.raises(ValueError, match="email address pattern"):
         assert_no_credentials_in_obj({"user_email": "analyst@example.com"})
 
-    injected_health = lambda _url, uid: {  # noqa: E731
-        "git_sha": "1234abcd",
-        "git_dirty": False,
-        "deployment": "docker",
-        "user_id": uid,
-    }
-    injected_env = lambda _url: {  # noqa: E731
+    from unittest.mock import create_autospec
+    from scripts.dalton.realrun import _common as _common_mod
+
+    def _health_side_effect(_url: str, uid: str) -> dict[str, object]:
+        return {
+            "git_sha": "1234abcd",
+            "git_dirty": False,
+            "deployment": "docker",
+            "user_id": uid,
+        }
+
+    injected_health = create_autospec(_common_mod._probe_backend_health_sync, side_effect=_health_side_effect)
+    injected_env = create_autospec(_common_mod._default_live_env_check)
+    injected_env.return_value = {
         "all_passed": True,
         "deployment": "docker",
         "checks": {"identity": {"status": "PASS"}},
     }
-    failing_env = lambda _url: {  # noqa: E731
+    failing_env = create_autospec(_common_mod._default_live_env_check)
+    failing_env.return_value = {
         "all_passed": False,
         "deployment": "docker",
         "checks": {"conversation_transport": {"status": "FAIL"}},
     }
+    sha_fn = create_autospec(_common_mod.get_git_sha)
+    sha_fn.return_value = "1234abcd"
+    dirty_true = create_autospec(_common_mod.is_git_dirty)
+    dirty_true.return_value = True
+    dirty_false = create_autospec(_common_mod.is_git_dirty)
+    dirty_false.return_value = False
+    merged_true = create_autospec(_common_mod.is_head_merged_into_main)
+    merged_true.return_value = True
+    merged_false = create_autospec(_common_mod.is_head_merged_into_main)
+    merged_false.return_value = False
+    anc_true = create_autospec(_common_mod.is_main_ancestor_of_head)
+    anc_true.return_value = True
+    anc_false = create_autospec(_common_mod.is_main_ancestor_of_head)
+    anc_false.return_value = False
 
     # Debug mode (record=False) allows dirty/unmerged branches and prints DEBUG RUN — NOT EVIDENCE (§8.1 #13)
     debug_health = assert_clean_and_synced_environment(
         base_url="http://127.0.0.1:8000",
         user_id="realrun-g1-20261019-abcd1234",
         record=False,
-        _git_sha_fn=lambda: "1234abcd",
-        _git_dirty_fn=lambda: True,
-        _merged_main_fn=lambda: False,
-        _main_ancestor_fn=lambda: False,
+        _git_sha_fn=sha_fn,
+        _git_dirty_fn=dirty_true,
+        _merged_main_fn=merged_false,
+        _main_ancestor_fn=anc_false,
         _health_fn=injected_health,
     )
     assert debug_health["deployment"] == "docker"
@@ -250,10 +272,10 @@ def test_common_synthetic_validation_and_artifact_writing(
             base_url="http://127.0.0.1:8000",
             user_id="realrun-g1-20261019-abcd1234",
             record=True,
-            _git_sha_fn=lambda: "1234abcd",
-            _git_dirty_fn=lambda: True,
-            _merged_main_fn=lambda: True,
-            _main_ancestor_fn=lambda: True,
+            _git_sha_fn=sha_fn,
+            _git_dirty_fn=dirty_true,
+            _merged_main_fn=merged_true,
+            _main_ancestor_fn=anc_true,
             _health_fn=injected_health,
             _env_check_fn=injected_env,
         )
@@ -263,10 +285,10 @@ def test_common_synthetic_validation_and_artifact_writing(
             base_url="http://127.0.0.1:8000",
             user_id="realrun-g1-20261019-abcd1234",
             record=True,
-            _git_sha_fn=lambda: "1234abcd",
-            _git_dirty_fn=lambda: False,
-            _merged_main_fn=lambda: False,
-            _main_ancestor_fn=lambda: True,
+            _git_sha_fn=sha_fn,
+            _git_dirty_fn=dirty_false,
+            _merged_main_fn=merged_false,
+            _main_ancestor_fn=anc_true,
             _health_fn=injected_health,
             _env_check_fn=injected_env,
         )
@@ -276,10 +298,10 @@ def test_common_synthetic_validation_and_artifact_writing(
             base_url="http://127.0.0.1:8000",
             user_id="realrun-g1-20261019-abcd1234",
             record=True,
-            _git_sha_fn=lambda: "1234abcd",
-            _git_dirty_fn=lambda: False,
-            _merged_main_fn=lambda: True,
-            _main_ancestor_fn=lambda: True,
+            _git_sha_fn=sha_fn,
+            _git_dirty_fn=dirty_false,
+            _merged_main_fn=merged_true,
+            _main_ancestor_fn=anc_true,
             _health_fn=injected_health,
             _env_check_fn=failing_env,
         )
@@ -327,10 +349,10 @@ def test_common_synthetic_validation_and_artifact_writing(
         synthetic=valid_synthetic,
         journal=fake_journal,
         record=False,
-        _git_sha_fn=lambda: "1234abcd",
-        _git_dirty_fn=lambda: False,
-        _merged_main_fn=lambda: True,
-        _main_ancestor_fn=lambda: True,
+        _git_sha_fn=sha_fn,
+        _git_dirty_fn=dirty_false,
+        _merged_main_fn=merged_true,
+        _main_ancestor_fn=anc_true,
         _health_fn=injected_health,
     )
     assert debug_envelope["environment"] == {"skipped_in_debug_mode": True, "record": False}
@@ -345,10 +367,10 @@ def test_common_synthetic_validation_and_artifact_writing(
         synthetic=valid_synthetic,
         journal=fake_journal,
         extra_fields={"scenarios": {"cap_enforced": True}},
-        _git_sha_fn=lambda: "1234abcd",
-        _git_dirty_fn=lambda: False,
-        _merged_main_fn=lambda: True,
-        _main_ancestor_fn=lambda: True,
+        _git_sha_fn=sha_fn,
+        _git_dirty_fn=dirty_false,
+        _merged_main_fn=merged_true,
+        _main_ancestor_fn=anc_true,
         _health_fn=injected_health,
         _env_check_fn=injected_env,
     )
@@ -378,10 +400,10 @@ def test_common_synthetic_validation_and_artifact_writing(
         test_user_id="realrun-g1-20261019-abcd1234",
         synthetic=[],
         journal=bad_journal,
-        _git_sha_fn=lambda: "1234abcd",
-        _git_dirty_fn=lambda: False,
-        _merged_main_fn=lambda: True,
-        _main_ancestor_fn=lambda: True,
+        _git_sha_fn=sha_fn,
+        _git_dirty_fn=dirty_false,
+        _merged_main_fn=merged_true,
+        _main_ancestor_fn=anc_true,
         _health_fn=injected_health,
         _env_check_fn=injected_env,
     )
@@ -429,8 +451,8 @@ def test_common_synthetic_validation_and_artifact_writing(
         key_findings=[("日额度阻断", "402 budget_exceeded")],
         notes=["全部通过真实后端接口执行"],
         record=False,
-        _git_dirty_fn=lambda: False,
-        _merged_main_fn=lambda: True,
+        _git_dirty_fn=dirty_false,
+        _merged_main_fn=merged_true,
         repo_root=tmp_path,
     )
     assert not dry_raw.exists()
@@ -447,8 +469,8 @@ def test_common_synthetic_validation_and_artifact_writing(
         key_findings=[("日额度阻断", "402 budget_exceeded")],
         notes=["全部通过真实后端接口执行"],
         record=True,
-        _git_dirty_fn=lambda: False,
-        _merged_main_fn=lambda: True,
+        _git_dirty_fn=dirty_false,
+        _merged_main_fn=merged_true,
         repo_root=tmp_path,
     )
     assert written_raw.is_file()
@@ -744,54 +766,101 @@ def test_all_realrun_scripts_import_cleanly() -> None:
 
 
 def test_g3_discover_migrated_workspaces_matches_by_name_with_pagination() -> None:
-    from scripts.dalton.realrun import g3_publish
+    from unittest.mock import create_autospec
+    from scripts.dalton.realrun import _common, g3_publish
 
-    class _FakeClient:
-        def __init__(self) -> None:
-            self.calls: list[dict[str, Any]] = []
+    calls: list[dict[str, object]] = []
 
-        def get(
-            self,
-            path: str,
-            *,
-            params: dict[str, Any] | None = None,
-            expected_status: int | tuple[int, ...] | None = 200,
-        ) -> tuple[int, dict[str, Any]]:
-            self.calls.append({"path": path, "params": dict(params or {})})
-            offset = int((params or {}).get("offset", 0))
-            if offset == 0:
-                return (
-                    200,
-                    {
-                        "workspaces": [
-                            {"workspace_id": "ws-meta", "name": "META", "status": "ready"},
-                            {"workspace_id": "ws-amzn", "name": "AMZN", "status": "ready"},
-                            {"workspace_id": "ws-del", "name": "GOOGL", "status": "deleted"},
-                        ],
-                        "total": 5,
-                    },
-                )
+    def _paginated_get(
+        path: str,
+        *,
+        params: dict[str, object] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> tuple[int, dict[str, object]]:
+        calls.append({"path": path, "params": dict(params or {})})
+        offset = int((params or {}).get("offset", 0))
+        if offset == 0:
             return (
                 200,
                 {
                     "workspaces": [
-                        {"workspace_id": "ws-googl", "name": "GOOGL", "status": "ready"},
-                        {"workspace_id": "ws-msft", "name": "MSFT", "status": "ready"},
+                        {
+                            "workspace_id": _common.KNOWN_MIGRATED_WORKSPACES["META"],
+                            "name": "META",
+                            "status": "ready",
+                        },
+                        {
+                            "workspace_id": _common.KNOWN_MIGRATED_WORKSPACES["AMZN"],
+                            "name": "AMZN",
+                            "status": "ready",
+                        },
+                        {"workspace_id": "ws-del", "name": "GOOGL", "status": "deleted"},
                     ],
                     "total": 5,
                 },
             )
+        return (
+            200,
+            {
+                "workspaces": [
+                    {
+                        "workspace_id": _common.KNOWN_MIGRATED_WORKSPACES["GOOGL"],
+                        "name": "GOOGL",
+                        "status": "ready",
+                    },
+                    {
+                        "workspace_id": _common.KNOWN_MIGRATED_WORKSPACES["MSFT"],
+                        "name": "MSFT",
+                        "status": "ready",
+                    },
+                ],
+                "total": 5,
+            },
+        )
 
-    fake_client = _FakeClient()
-    mapping = g3_publish._discover_migrated_company_workspaces(fake_client)  # type: ignore[arg-type]
-    assert mapping == {
-        "META": "ws-meta",
-        "AMZN": "ws-amzn",
-        "GOOGL": "ws-googl",
-        "MSFT": "ws-msft",
-    }
-    assert len(fake_client.calls) == 2
-    assert fake_client.calls[0]["params"] == {"limit": 100, "offset": 0}
+    fake_client = create_autospec(RealRunHttpClient, instance=True)
+    fake_client.get.side_effect = _paginated_get
+    mapping = g3_publish._discover_migrated_company_workspaces(fake_client)
+    assert mapping == dict(_common.KNOWN_MIGRATED_WORKSPACES)
+    assert len(calls) == 2
+    assert calls[0]["params"] == {"limit": 100, "offset": 0}
+
+    # Duplicate non-deleted workspaces matching same ticker must raise RuntimeError (Requirement 5)
+    dup_client = create_autospec(RealRunHttpClient, instance=True)
+    dup_client.get.return_value = (
+        200,
+        {
+            "workspaces": [
+                {
+                    "workspace_id": _common.KNOWN_MIGRATED_WORKSPACES["META"],
+                    "name": "META",
+                    "status": "ready",
+                },
+                {
+                    "workspace_id": "22222222-3333-4444-5555-666666666666",
+                    "name": "META",
+                    "status": "ready",
+                },
+            ],
+            "total": 2,
+        },
+    )
+    with pytest.raises(RuntimeError, match="Multiple non-deleted workspaces"):
+        g3_publish._discover_migrated_company_workspaces(dup_client)
+
+    # Workspace matching by name whose ID is not in KNOWN_MIGRATED_WORKSPACES must raise RuntimeError (Requirement 5)
+    wrong_id_client = create_autospec(RealRunHttpClient, instance=True)
+    wrong_id_client.get.return_value = (
+        200,
+        {
+            "workspaces": [
+                {"workspace_id": "wrong-meta-id", "name": "META", "status": "ready"},
+            ],
+            "total": 1,
+        },
+    )
+    with pytest.raises(RuntimeError, match="does not match KNOWN_MIGRATED_WORKSPACES"):
+        g3_publish._discover_migrated_company_workspaces(wrong_id_client)
 
 
 def test_g6_lenses_inputs_is_explicitly_illustrative_and_has_no_sec_tags() -> None:
@@ -844,22 +913,13 @@ def test_g1_playwright_route_scopes_auth_headers_to_local_origins_only() -> None
         is False
     )
 
-    class _FakeRequest:
-        def __init__(self, url: str, headers: dict[str, str]) -> None:
-            self.url = url
-            self.headers = headers
+    from unittest.mock import create_autospec
+    from playwright.sync_api import Request, Route
 
-    class _FakeRoute:
-        def __init__(self) -> None:
-            self.continued_headers: dict[str, str] | None = None
-            self.continued_count = 0
-
-        def continue_(self, headers: dict[str, str] | None = None) -> None:
-            self.continued_headers = headers
-            self.continued_count += 1
-
-    local_req = _FakeRequest("http://localhost:5173/api/v1/dalton/budget/today", {"Accept": "application/json"})
-    local_route = _FakeRoute()
+    local_req = create_autospec(Request, instance=True)
+    local_req.url = "http://localhost:5173/api/v1/dalton/budget/today"
+    local_req.headers = {"Accept": "application/json"}
+    local_route = create_autospec(Route, instance=True)
     g1_budget._handle_scoped_auth_route(
         local_route,
         local_req,
@@ -868,11 +928,15 @@ def test_g1_playwright_route_scopes_auth_headers_to_local_origins_only() -> None
         user_id="u1",
         svc_token="tok-secret",
     )
-    assert local_route.continued_headers is not None
-    assert local_route.continued_headers["X-Service-Token"] == "tok-secret"
+    local_route.continue_.assert_called_once()
+    continued_headers = local_route.continue_.call_args.kwargs.get("headers")
+    assert isinstance(continued_headers, dict)
+    assert continued_headers["X-Service-Token"] == "tok-secret"
 
-    ext_req = _FakeRequest("https://fonts.googleapis.com/css2?family=Inter", {"Accept": "text/css"})
-    ext_route = _FakeRoute()
+    ext_req = create_autospec(Request, instance=True)
+    ext_req.url = "https://fonts.googleapis.com/css2?family=Inter"
+    ext_req.headers = {"Accept": "text/css"}
+    ext_route = create_autospec(Route, instance=True)
     g1_budget._handle_scoped_auth_route(
         ext_route,
         ext_req,
@@ -881,8 +945,7 @@ def test_g1_playwright_route_scopes_auth_headers_to_local_origins_only() -> None
         user_id="u1",
         svc_token="tok-secret",
     )
-    assert ext_route.continued_count == 1
-    assert ext_route.continued_headers is None
+    ext_route.continue_.assert_called_once_with()
 
 
 def test_pr_baseline_script_exists_and_executable() -> None:
@@ -899,93 +962,82 @@ def test_pr_baseline_script_exists_and_executable() -> None:
 
 def test_check_env_oauth_provenance_budget_restore_and_g6_markdown(monkeypatch: pytest.MonkeyPatch) -> None:
     from datetime import datetime, timezone
+    from unittest.mock import create_autospec
+    import psycopg
 
     from scripts.dalton.realrun import check_env, g6_lenses
 
-    # 1. check_oauth_token_provenance: PASS when prior login_start exists and no unverified realrun-* rows
-    class _FakeCursor:
-        def __init__(self, row: dict[str, Any] | None, unverified: list[dict[str, Any]]) -> None:
-            self._row = row
-            self._unverified = unverified
-            self._step = 0
-            self.executed_sql: list[tuple[str, Any]] = []
+    def _build_autospec_db_conn(
+        row: dict[str, object] | None,
+        rows: list[dict[str, object]],
+    ) -> tuple[psycopg.Connection[object], psycopg.Cursor[object], list[tuple[str, object]]]:
+        executed_sql: list[tuple[str, object]] = []
+        cur = create_autospec(psycopg.Cursor, instance=True)
+        cur.__enter__.return_value = cur
 
-        def __enter__(self) -> "_FakeCursor":
-            return self
+        def _rec_execute(query: str, params: object = None, **kwargs: object) -> object:
+            executed_sql.append((str(query), params))
+            return cur
 
-        def __exit__(self, *args: Any) -> None:
-            pass
-
-        def execute(self, sql: str, params: Any = None) -> None:
-            self.executed_sql.append((sql, params))
-            self._step += 1
-
-        def fetchone(self) -> dict[str, Any] | None:
-            return self._row
-
-        def fetchall(self) -> list[dict[str, Any]]:
-            return self._unverified
-
-    class _FakeConn:
-        def __init__(self, cursor: _FakeCursor) -> None:
-            self._cursor = cursor
-            self.committed = False
-
-        def __enter__(self) -> "_FakeConn":
-            return self
-
-        def __exit__(self, *args: Any) -> None:
-            pass
-
-        def cursor(self) -> _FakeCursor:
-            return self._cursor
-
-        def commit(self) -> None:
-            self.committed = True
+        cur.execute.side_effect = _rec_execute
+        cur.fetchone.return_value = row
+        cur.fetchall.return_value = rows
+        conn = create_autospec(psycopg.Connection, instance=True)
+        conn.__enter__.return_value = conn
+        conn.cursor.return_value = cur
+        return conn, cur, executed_sql
 
     t_login = datetime(2026, 10, 20, 12, 0, 0, tzinfo=timezone.utc)
     t_token = datetime(2026, 10, 20, 12, 0, 15, tzinfo=timezone.utc)
 
-    monkeypatch.setattr(
-        check_env.psycopg,
-        "connect",
-        lambda *a, **kw: _FakeConn(
-            _FakeCursor(
-                {
-                    "user_id": "realrun-pm-a",
-                    "provider": "antigravity-oauth",
-                    "created_at": t_token,
-                    "updated_at": t_token,
-                    "earliest_prior_login_start": t_login,
-                },
-                [],
-            )
-        ),
+    mock_connect = create_autospec(psycopg.connect)
+    monkeypatch.setattr(check_env.psycopg, "connect", mock_connect)
+
+    # 1. check_oauth_token_provenance: PASS when prior login_start exists and no unverified realrun-* rows
+    conn_pass, _, _ = _build_autospec_db_conn(
+        {
+            "user_id": "realrun-pm-a",
+            "provider": "antigravity-oauth",
+            "created_at": t_token,
+            "updated_at": t_token,
+            "earliest_prior_login_start": t_login,
+        },
+        [],
     )
+    mock_connect.return_value = conn_pass
     res_pass = check_env.check_oauth_token_provenance("realrun-pm-a", "antigravity-oauth", dsn="postgresql://x")
     assert res_pass["status"] == "PASS"
     assert res_pass["has_prior_oauth_login_start"] is True
 
     # FAIL when token exists but earliest_prior_login_start is None (copied token)
-    monkeypatch.setattr(
-        check_env.psycopg,
-        "connect",
-        lambda *a, **kw: _FakeConn(
-            _FakeCursor(
-                {
-                    "user_id": "realrun-pm-a",
-                    "provider": "antigravity-oauth",
-                    "created_at": t_token,
-                    "updated_at": t_token,
-                    "earliest_prior_login_start": None,
-                },
-                [{"user_id": "realrun-pm-a", "provider": "antigravity-oauth", "created_at": t_token}],
-            )
-        ),
+    conn_fail, _, _ = _build_autospec_db_conn(
+        {
+            "user_id": "realrun-pm-a",
+            "provider": "antigravity-oauth",
+            "created_at": t_token,
+            "updated_at": t_token,
+            "earliest_prior_login_start": None,
+        },
+        [{"user_id": "realrun-pm-a", "provider": "antigravity-oauth", "created_at": t_token}],
     )
+    mock_connect.return_value = conn_fail
     res_fail = check_env.check_oauth_token_provenance("realrun-pm-a", "antigravity-oauth", dsn="postgresql://x")
     assert res_fail["status"] == "FAIL"
     assert res_fail["reason"] == "missing_prior_oauth_login_start_event"
+
+    # Exception sanitization (Requirement 9): FAIL error summary must not leak DSNs, passwords, or keys
+    mock_connect.side_effect = RuntimeError(
+        "conn failed for postgresql://admin:mySecretPass123@db.local:5432/dalton with sk-1234567890abcdefghijklmnop"
+    )
+    res_err = check_env.check_oauth_token_provenance(
+        "realrun-pm-a",
+        "antigravity-oauth",
+        dsn="postgresql://admin:mySecretPass123@db.local:5432/dalton",
+    )
+    assert res_err["status"] == "FAIL"
+    assert "mySecretPass123" not in json.dumps(res_err)
+    assert "sk-1234567890abcdefghijklmnop" not in json.dumps(res_err)
+    mock_connect.side_effect = None
 
     # check_conversation_transport fails immediately when oauth_provenance is FAIL
     conv_fail = check_env.check_conversation_transport(
@@ -997,36 +1049,27 @@ def test_check_env_oauth_provenance_budget_restore_and_g6_markdown(monkeypatch: 
     assert "oauth_token_provenance_failed" in str(conv_fail.get("reason"))
 
     # 2. _restore_budget_state: unconfigured state deletes DB row and verifies configured == False
-    class _FakeHttpClient:
-        def __init__(self, get_resp: tuple[int, dict[str, Any]], put_status: int = 200) -> None:
-            self._get_resp = get_resp
-            self._put_status = put_status
-            self.puts: list[dict[str, Any]] = []
+    conn_unconf, _, executed_sql = _build_autospec_db_conn(None, [])
+    mock_connect.return_value = conn_unconf
 
-        def get(self, path: str) -> tuple[int, dict[str, Any]]:
-            return self._get_resp
-
-        def put(self, path: str, json_body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
-            self.puts.append(json_body)
-            return self._put_status, {}
-
-    fake_cur = _FakeCursor(None, [])
-    fake_conn = _FakeConn(fake_cur)
-    monkeypatch.setattr(check_env.psycopg, "connect", lambda *a, **kw: fake_conn)
+    http_unconf = create_autospec(RealRunHttpClient, instance=True)
+    http_unconf.get.return_value = (200, {"configured": False})
     err_unconf = check_env._restore_budget_state(
-        _FakeHttpClient((200, {"configured": False})),  # type: ignore[arg-type]
+        http_unconf,
         user_id="realrun-pm-a",
         was_configured=False,
         prior_budget=None,
         dsn="postgresql://x",
     )
     assert err_unconf is None
-    assert fake_conn.committed is True
-    assert any("DELETE FROM dalton_budget_config" in sql for sql, _ in fake_cur.executed_sql)
+    conn_unconf.commit.assert_called_once()
+    assert any("DELETE FROM dalton_budget_config" in sql for sql, _ in executed_sql)
 
     # Restore failure when configured remains True after delete
+    http_unconf_fail = create_autospec(RealRunHttpClient, instance=True)
+    http_unconf_fail.get.return_value = (200, {"configured": True})
     err_unconf_fail = check_env._restore_budget_state(
-        _FakeHttpClient((200, {"configured": True})),  # type: ignore[arg-type]
+        http_unconf_fail,
         user_id="realrun-pm-a",
         was_configured=False,
         prior_budget=None,
@@ -1035,8 +1078,11 @@ def test_check_env_oauth_provenance_budget_restore_and_g6_markdown(monkeypatch: 
     assert err_unconf_fail is not None
 
     # Restore failure when PUT fails for previously configured budget
+    http_conf_fail = create_autospec(RealRunHttpClient, instance=True)
+    http_conf_fail.get.return_value = (200, {"configured": True})
+    http_conf_fail.put.return_value = (500, {})
     err_conf_fail = check_env._restore_budget_state(
-        _FakeHttpClient((200, {"configured": True}), put_status=500),  # type: ignore[arg-type]
+        http_conf_fail,
         user_id="realrun-pm-a",
         was_configured=True,
         prior_budget={"daily_cap_usd": 12.0, "default_task_cap_usd": 3.0, "timezone": "Asia/Shanghai"},
@@ -1067,3 +1113,1239 @@ def test_check_env_oauth_provenance_budget_restore_and_g6_markdown(monkeypatch: 
     assert "## 2." not in md_text
     assert "与原脚本一致" not in md_text
     assert "偶发漏扣" not in md_text
+
+
+def test_j5a_realrun_script_fixes_g5_callback_ordering_and_g2_schema(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import create_autospec
+    from scripts.dalton.realrun import (
+        g1_budget,
+        g2_providers,
+        g3_publish,
+        g4_autonomy,
+        g5_broker_and_antigravity,
+    )
+
+    monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", "test-service-token-value")
+
+    # 1. Static scan on all realrun g*.py scripts must pass with 0 violations
+    scan_res = scan_realrun_scripts()
+    assert scan_res["status"] == "PASS", f"Static scan failed: {scan_res}"
+    assert scan_res["violations"] == []
+
+    # 2. All budget-modifying realrun scripts import _restore_budget_state
+    for mod in (g1_budget, g2_providers, g3_publish, g4_autonomy, g5_broker_and_antigravity):
+        assert callable(getattr(mod, "_restore_budget_state", None))
+
+    # 3. G5 pre-callback gate rejects dirty working tree, mismatched backend SHA, or pre-callback check_env failure before touching callback URL
+    mock_dirty = create_autospec(g5_broker_and_antigravity.is_git_dirty, return_value=True)
+    mock_merged_true = create_autospec(g5_broker_and_antigravity.is_head_merged_into_main, return_value=True)
+    mock_anc_true = create_autospec(g5_broker_and_antigravity.is_main_ancestor_of_head, return_value=True)
+    mock_sha = create_autospec(g5_broker_and_antigravity.get_git_sha, return_value="deadbeef")
+    mock_health = create_autospec(
+        g5_broker_and_antigravity._probe_backend_health_sync,
+        return_value={"git_sha": "cafebabe", "git_dirty": False, "deployment": "docker"},
+    )
+    monkeypatch.setattr(g5_broker_and_antigravity, "is_git_dirty", mock_dirty)
+    with pytest.raises(SystemExit, match="Working tree is dirty"):
+        g5_broker_and_antigravity._assert_pre_callback_git_and_backend_gate(
+            base_url="http://127.0.0.1:8000", user_id="realrun-pm-a", record=True
+        )
+
+    mock_dirty.return_value = False
+    monkeypatch.setattr(g5_broker_and_antigravity, "is_head_merged_into_main", mock_merged_true)
+    monkeypatch.setattr(g5_broker_and_antigravity, "is_main_ancestor_of_head", mock_anc_true)
+    monkeypatch.setattr(g5_broker_and_antigravity, "get_git_sha", mock_sha)
+    monkeypatch.setattr(
+        g5_broker_and_antigravity,
+        "_probe_backend_health_sync",
+        mock_health,
+    )
+    with pytest.raises(SystemExit, match="Backend git_sha"):
+        g5_broker_and_antigravity._assert_pre_callback_git_and_backend_gate(
+            base_url="http://127.0.0.1:8000", user_id="realrun-pm-a", record=True
+        )
+
+    # Pre-callback check_env (skip_oauth_and_transport=True) runs before consuming callback URL (Requirement 7)
+    mock_health.return_value = {"git_sha": "deadbeef", "git_dirty": False, "deployment": "docker"}
+    mock_pre_checks_fail = create_autospec(
+        g5_broker_and_antigravity.run_all_checks,
+        return_value={
+            "all_passed": False,
+            "checks": {
+                "migrated_workspace_ownership": {"status": "FAIL"},
+                "oauth_token_provenance": {"status": "SKIPPED"},
+                "conversation_transport": {"status": "SKIPPED"},
+            },
+        },
+    )
+    monkeypatch.setattr(g5_broker_and_antigravity, "run_all_checks", mock_pre_checks_fail)
+    with pytest.raises(SystemExit, match="Pre-callback check_env failed before consuming single-use OAuth callback URL"):
+        g5_broker_and_antigravity._assert_pre_callback_git_and_backend_gate(
+            base_url="http://127.0.0.1:8000", user_id="realrun-pm-a", record=False
+        )
+    mock_pre_checks_fail.assert_called_once_with(
+        backend_url="http://127.0.0.1:8000",
+        skip_oauth_and_transport=True,
+    )
+
+    # 4. G5 --mode g5.2 exchanges callback URL BEFORE preflight_realrun_script runs
+    call_order: list[str] = []
+
+    def _rec_pre_gate(*, base_url: str, user_id: str, record: bool | None = None) -> dict[str, object]:
+        call_order.append("pre_gate")
+        return {"deployment": "docker"}
+
+    def _rec_exchange(
+        base_url: str,
+        user_a: str,
+        callback_url: str | None,
+        *,
+        record: bool = False,
+    ) -> dict[str, object]:
+        call_order.append("exchange_callback")
+        return {"deployment": "docker"}
+
+    def _rec_preflight(
+        family_code: str,
+        *,
+        record: bool | None = None,
+        backend: str = "http://127.0.0.1:8000",
+        user_id: str = "realrun-pm-a",
+    ) -> dict[str, object]:
+        call_order.append("preflight")
+        return {}
+
+    def _rec_run_g5_2(
+        base_url: str,
+        user_a: str,
+        user_b: str,
+        callback_url: str | None = None,
+        *,
+        record: bool = False,
+        pre_exchanged_callback_flow: dict[str, object] | None = None,
+    ) -> tuple[dict[str, object], list[dict[str, object]]]:
+        call_order.append("run_g5_2")
+        return (
+            {
+                "deployment": "docker",
+                "oauth_status_and_isolation": {
+                    "user_a": {"status_body": {"connected": True}},
+                    "user_b_isolation": {"status_body": {"connected": False}},
+                },
+                "gemini_4_round_tool_calling": {
+                    "tool_calls_count": 4,
+                    "tool_call_results_count": 4,
+                    "gemini_model_invocations_count": 5,
+                },
+                "docker_callback_paste_flow": {
+                    "callback_missing_state": {"http_status": 400},
+                    "callback_wrong_state": {"http_status": 400},
+                    "callback_real_paste_exchange": {"http_status": 200},
+                },
+            },
+            [{"passed": True}],
+        )
+
+    def _rec_post_checks(*, backend_url: str = "http://127.0.0.1:8000", dsn: str | None = None, skip_oauth_and_transport: bool = False) -> dict[str, object]:
+        call_order.append(f"post_callback_check_env:skip={skip_oauth_and_transport}")
+        return {"all_passed": True, "checks": {}}
+
+    mock_dotenv = create_autospec(g5_broker_and_antigravity.load_repo_dotenv, return_value=False)
+    mock_pre_gate = create_autospec(
+        g5_broker_and_antigravity._assert_pre_callback_git_and_backend_gate,
+        side_effect=_rec_pre_gate,
+    )
+    mock_exchange = create_autospec(
+        g5_broker_and_antigravity._exchange_g5_2_docker_callback,
+        side_effect=_rec_exchange,
+    )
+    from scripts.dalton.realrun import check_env as _check_env_mod
+
+    mock_post_checks = create_autospec(
+        _check_env_mod.run_all_checks,
+        side_effect=_rec_post_checks,
+    )
+    mock_preflight = create_autospec(
+        g5_broker_and_antigravity.preflight_realrun_script,
+        side_effect=_rec_preflight,
+    )
+    mock_run_g5_2 = create_autospec(
+        g5_broker_and_antigravity._run_g5_2_antigravity,
+        side_effect=_rec_run_g5_2,
+    )
+    mock_build_env = create_autospec(
+        g5_broker_and_antigravity.build_evidence_envelope,
+        return_value={"deployment": "docker", "assertions": [{"passed": True}]},
+    )
+    mock_write_ev = create_autospec(
+        g5_broker_and_antigravity.write_evidence_and_summary,
+        return_value=(Path("/tmp/g5.json"), Path("/tmp/G5.md"), "abc123"),
+    )
+    monkeypatch.setattr(g5_broker_and_antigravity, "load_repo_dotenv", mock_dotenv)
+    monkeypatch.setattr(
+        g5_broker_and_antigravity,
+        "_assert_pre_callback_git_and_backend_gate",
+        mock_pre_gate,
+    )
+    monkeypatch.setattr(
+        g5_broker_and_antigravity,
+        "_exchange_g5_2_docker_callback",
+        mock_exchange,
+    )
+    monkeypatch.setattr(
+        g5_broker_and_antigravity,
+        "run_all_checks",
+        mock_post_checks,
+    )
+    monkeypatch.setattr(
+        g5_broker_and_antigravity,
+        "preflight_realrun_script",
+        mock_preflight,
+    )
+    monkeypatch.setattr(
+        g5_broker_and_antigravity,
+        "_run_g5_2_antigravity",
+        mock_run_g5_2,
+    )
+    monkeypatch.setattr(
+        g5_broker_and_antigravity,
+        "build_evidence_envelope",
+        mock_build_env,
+    )
+    monkeypatch.setattr(
+        g5_broker_and_antigravity,
+        "write_evidence_and_summary",
+        mock_write_ev,
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "g5_broker_and_antigravity.py",
+            "--mode",
+            "g5.2",
+            "--callback-url",
+            "http://localhost:51121/oauth-callback?code=c1&state=s1",
+        ],
+    )
+    rc = g5_broker_and_antigravity.main()
+    assert rc == 0
+    assert call_order == [
+        "pre_gate",
+        "exchange_callback",
+        "post_callback_check_env:skip=False",
+        "preflight",
+        "run_g5_2",
+    ]
+
+    # Post-callback check_env failure aborts even without --record
+    mock_post_checks.side_effect = None
+    mock_post_checks.return_value = {
+        "all_passed": False,
+        "checks": {"oauth_token_provenance": {"status": "FAIL", "reason": "missing_prior_oauth_login_start_event"}},
+    }
+    with pytest.raises(SystemExit, match="Post-callback check_env failed after exchanging OAuth callback URL"):
+        g5_broker_and_antigravity.main()
+
+    # 5. G2 thesis payloads conform to src/dalton/knowledge/schemas/thesis.schema.json
+    from src.dalton.knowledge.validate import validate_schema
+
+    repo_root = Path(__file__).resolve().parents[3]
+    g2_src = (repo_root / "scripts" / "dalton" / "realrun" / "g2_providers.py").read_text(encoding="utf-8")
+    assert "/api/v1/dalton/budget/task-caps/workspace/{sample_ws_id}" in g2_src
+    assert 'json_body={"dry_run": True}' in g2_src
+    assert "claude-sonnet-5-5-low-oauth" in g2_src
+    sample_thesis = {
+        "schema_version": 1,
+        "as_of": "2026-10-20T00:00:00Z",
+        "one_liner": "Alphabet Inc. G2 路由与权限测试初始观点 v1",
+        "aggregate_status": "intact",
+        "house_view": {
+            "stance": "long",
+            "conviction": "high",
+            "horizon_months": 18,
+            "summary": "G2 路由与权限测试初始观点 v1",
+            "variant_perception": "Search and Cloud operating margin durability exceeds consensus.",
+            "updated_at": "2026-10-20T00:00:00Z",
+        },
+        "house_view_history": [],
+        "pillars": [
+            {
+                "id": "P1",
+                "claim": "GOOGL core revenue growth and operating margin trajectory.",
+                "priority": "core",
+                "baseline": {"text": "2Q26 SEC 10-Q baseline.", "as_of": "2026-06-30"},
+                "expected_path": "Maintain double-digit revenue growth and margin expansion.",
+                "thresholds": {"confirm": [], "warn": [], "break": []},
+                "status": "intact",
+                "provenance": "approved",
+                "created_at": "2026-10-20T00:00:00Z",
+            }
+        ],
+        "evidence": [],
+        "official": None,
+    }
+    assert validate_schema("thesis", sample_thesis) == []
+
+
+def test_r2_g3_owner_read_g4_idle_user_check_env_and_g5_initiate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from unittest.mock import create_autospec
+    import uuid
+    import psycopg
+
+    from scripts.dalton.realrun import (
+        _common,
+        check_env,
+        g3_publish,
+        g4_autonomy,
+        g5_broker_and_antigravity,
+    )
+
+    monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", "test-service-token-value")
+    monkeypatch.delenv("AUTH_USER_ID", raising=False)
+
+    # 1. G3 migrated check must read as local-dev-user (P0J §8.1 #20) and reject non-owner or non-string user_id (Requirement 5)
+    wrong_client = create_autospec(RealRunHttpClient, instance=True)
+    wrong_client.user_id = "realrun-pm-a"
+    with pytest.raises(RuntimeError, match="must read as 'local-dev-user'"):
+        g3_publish._verify_legacy_migrated_theses_via_http(wrong_client)
+
+    non_str_client = create_autospec(RealRunHttpClient, instance=True)
+    non_str_client.user_id = None  # type: ignore[assignment]
+    with pytest.raises(RuntimeError, match="to be a non-empty string"):
+        g3_publish._verify_legacy_migrated_theses_via_http(non_str_client)
+
+    owner_client = create_autospec(RealRunHttpClient, instance=True)
+    owner_client.user_id = "local-dev-user"
+
+    def _owner_get(
+        path: str,
+        *,
+        params: dict[str, object] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> tuple[int, dict[str, object]]:
+        if path == "/api/v1/workspaces":
+            offset = int((params or {}).get("offset", 0))
+            if offset == 0:
+                return (
+                    200,
+                    {
+                        "workspaces": [
+                            {
+                                "workspace_id": _common.KNOWN_MIGRATED_WORKSPACES["META"],
+                                "name": "META",
+                                "status": "ready",
+                            },
+                            {
+                                "workspace_id": _common.KNOWN_MIGRATED_WORKSPACES["AMZN"],
+                                "name": "AMZN",
+                                "status": "ready",
+                            },
+                        ],
+                        "total": 4,
+                    },
+                )
+            return (
+                200,
+                {
+                    "workspaces": [
+                        {
+                            "workspace_id": _common.KNOWN_MIGRATED_WORKSPACES["GOOGL"],
+                            "name": "GOOGL",
+                            "status": "ready",
+                        },
+                        {
+                            "workspace_id": _common.KNOWN_MIGRATED_WORKSPACES["MSFT"],
+                            "name": "MSFT",
+                            "status": "ready",
+                        },
+                    ],
+                    "total": 4,
+                },
+            )
+        if path.endswith("/thesis/versions"):
+            return (
+                200,
+                {
+                    "items": [
+                        {"version_no": 1, "source": "migration", "reason": "Initial migration", "content_sha256": "s1"},
+                        {
+                            "version_no": 2,
+                            "source": "import",
+                            "reason": "迁移的旧认知不作为核实依据",
+                            "content_sha256": "s2",
+                        },
+                    ]
+                },
+            )
+        if path.endswith("/thesis/versions/2"):
+            return (
+                200,
+                {
+                    "version_no": 2,
+                    "content": {"evidence": [{"id": "EV-1", "source": {"type": "legacy_thesis"}}]},
+                },
+            )
+        raise AssertionError(f"Unexpected GET path: {path}")
+
+    owner_client.get.side_effect = _owner_get
+    histories = g3_publish._verify_legacy_migrated_theses_via_http(owner_client)
+    assert set(histories.keys()) == {"META", "AMZN", "GOOGL", "MSFT"}
+    for ticker, item in histories.items():
+        assert item["read_as_user_id"] == "local-dev-user"
+        assert item["workspace_id"] == _common.KNOWN_MIGRATED_WORKSPACES[ticker]
+        assert item["latest_version_no"] == 2
+        assert "迁移的旧认知不作为核实依据" in item["latest_version_reason"]
+
+    # 2. G4 Scenario 5 uses dedicated realrun-idle-c, verifies only Home + new ws exist, puts workspace_id at top level, and requires action == "created"
+    repo_root = Path(__file__).resolve().parents[3]
+    g4_src = (repo_root / "scripts" / "dalton" / "realrun" / "g4_autonomy.py").read_text(encoding="utf-8")
+    assert "saved_preexisting_agendas" not in g4_src
+    assert "Temporary clean agenda import" not in g4_src
+    assert 'default="realrun-idle-c"' in g4_src
+
+    idle_home_id = str(uuid.uuid5(_common.HOME_WORKSPACE_NAMESPACE, "realrun-idle-c"))
+    idle_client = create_autospec(RealRunHttpClient, instance=True)
+    idle_requests: list[tuple[str, str, object]] = []
+
+    def _idle_request(
+        method: str,
+        path: str,
+        *,
+        json_body: object = None,
+        params: dict[str, object] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> tuple[int, dict[str, object]]:
+        idle_requests.append((method, path, json_body))
+        if method == "POST" and path == "/api/v1/workspaces":
+            return 201, {"workspace_id": "ws-idle-c"}
+        if method == "POST" and path == "/api/v1/workspaces/ws-idle-c/start":
+            return 200, {"status": "running"}
+        if method == "GET" and path == "/api/v1/workspaces":
+            return (
+                200,
+                {
+                    "workspaces": [
+                        {"workspace_id": idle_home_id, "name": "Home", "status": "stopped"},
+                        {"workspace_id": "ws-idle-c", "name": "G4-IDLE", "status": "ready"},
+                    ],
+                    "total": 2,
+                },
+            )
+        if method == "GET" and path == "/api/v1/automations":
+            return 200, {"automations": [], "total": 0}
+        if method == "PUT" and path == "/api/v1/dalton/automations/dalton-director-daily":
+            return 200, {"ok": True, "action": "created", "automation_id": "auto-dd-idle-c"}
+        if method == "GET" and path == "/api/v1/dalton/budget/today":
+            return 200, {"spent_usd": 0.0}
+        if method == "POST" and path == "/api/v1/automations/auto-dd-idle-c/trigger":
+            return 200, {"execution_id": "exec-dd-idle-c"}
+        if method == "GET" and path == "/api/v1/automations/auto-dd-idle-c/executions":
+            return (
+                200,
+                {
+                    "executions": [
+                        {
+                            "automation_execution_id": "exec-dd-idle-c",
+                            "status": "skipped",
+                            "skip_reason": "precheck",
+                        }
+                    ]
+                },
+            )
+        raise AssertionError(f"Unexpected request in Scenario 5: {method} {path}")
+
+    idle_client.request.side_effect = _idle_request
+    mock_query_pf = create_autospec(g4_autonomy._query_preflight_and_signals)
+    mock_query_pf.return_value = {
+        "preflight_log": {"decision": "skip", "reason": "no_new_signals"},
+        "signals": [],
+    }
+    monkeypatch.setattr(g4_autonomy, "_query_preflight_and_signals", mock_query_pf)
+
+    created_ws_c: list[str] = []
+    created_auto_c: list[str] = []
+    s5_out = g4_autonomy._run_scenario_5_director_daily_zero_token_skip(
+        idle_client,
+        idle_user_id="realrun-idle-c",
+        created_ws_ids=created_ws_c,
+        created_auto_ids=created_auto_c,
+    )
+    assert s5_out["user_id"] == "realrun-idle-c"
+    assert s5_out["idle_workspace_id"] == "ws-idle-c"
+    assert s5_out["execution_status"] == "skipped"
+    assert s5_out["preflight_reason"] == "no_new_signals"
+    assert s5_out["cash_spend_usd"] == 0.0
+    assert created_ws_c == ["ws-idle-c"]
+    assert created_auto_c == ["auto-dd-idle-c"]
+    ws_create_body = next(b for m, p, b in idle_requests if m == "POST" and p == "/api/v1/workspaces")
+    assert isinstance(ws_create_body, dict)
+    assert ws_create_body.get("config") == {
+        "realrun_ephemeral": True,
+        "realrun_script": "g4_autonomy.py",
+    }
+    dd_put_body = next(
+        b for m, p, b in idle_requests if m == "PUT" and p == "/api/v1/dalton/automations/dalton-director-daily"
+    )
+    assert isinstance(dd_put_body, dict)
+    assert dd_put_body.get("workspace_id") == "ws-idle-c"
+    assert not any("/agenda/import" in p for _, p, _ in idle_requests)
+
+    # Scenario 5 fails if realrun-idle-c owns any unexpected active workspace or if automation was updated instead of created
+    def _idle_request_updated(
+        method: str,
+        path: str,
+        *,
+        json_body: object = None,
+        params: dict[str, object] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> tuple[int, dict[str, object]]:
+        if method == "POST" and path == "/api/v1/workspaces":
+            return 201, {"workspace_id": "ws-idle-c-2"}
+        if method == "POST" and path == "/api/v1/workspaces/ws-idle-c-2/start":
+            return 200, {"status": "running"}
+        if method == "GET" and path == "/api/v1/workspaces":
+            return (
+                200,
+                {
+                    "workspaces": [
+                        {"workspace_id": idle_home_id, "name": "Home", "status": "stopped"},
+                        {"workspace_id": "ws-idle-c-2", "name": "G4-IDLE", "status": "ready"},
+                    ],
+                    "total": 2,
+                },
+            )
+        if method == "GET" and path == "/api/v1/automations":
+            return (
+                200,
+                {
+                    "automations": [
+                        {
+                            "automation_id": "auto-existing",
+                            "name": "dalton-director-daily",
+                            "workspace_id": "ws-idle-c-2",
+                        }
+                    ],
+                    "total": 1,
+                },
+            )
+        if method == "PUT" and path == "/api/v1/dalton/automations/dalton-director-daily":
+            raise AssertionError("PUT must not be sent when a conflicting automation already exists (D7)")
+        raise AssertionError(f"Unexpected request: {method} {path}")
+
+    idle_client_upd = create_autospec(RealRunHttpClient, instance=True)
+    idle_client_upd.request.side_effect = _idle_request_updated
+    created_auto_upd: list[str] = []
+    with pytest.raises(RuntimeError, match="Refusing to PUT /api/v1/dalton/automations/dalton-director-daily"):
+        g4_autonomy._run_scenario_5_director_daily_zero_token_skip(
+            idle_client_upd,
+            idle_user_id="realrun-idle-c",
+            created_ws_ids=[],
+            created_auto_ids=created_auto_upd,
+        )
+    assert created_auto_upd == []
+
+    # 3. D1 & check_env: KNOWN_MIGRATED_WORKSPACES exact 4 UUIDs, migrated ownership & realrun-* provenance
+    assert not hasattr(check_env, "load_migrated_workspace_ids")
+    assert _common.KNOWN_MIGRATED_WORKSPACES == {
+        "META": "0d9c7b91-2db8-587e-903c-5a98ac8deee1",
+        "AMZN": "83d1d873-beb4-5fd1-9655-ffb39af506d2",
+        "GOOGL": "f0725330-1d25-52c2-9052-8f95537e2eb4",
+        "MSFT": "1ee3520c-1fa9-5f19-9c0a-1625d3e27ee4",
+    }
+
+    def _make_autospec_conn(rows: list[dict[str, object]]) -> psycopg.Connection[object]:
+        cur = create_autospec(psycopg.Cursor, instance=True)
+        cur.__enter__.return_value = cur
+        cur.fetchall.return_value = rows
+        conn = create_autospec(psycopg.Connection, instance=True)
+        conn.__enter__.return_value = conn
+        conn.cursor.return_value = cur
+        return conn
+
+    mock_db_connect = create_autospec(psycopg.connect)
+    monkeypatch.setattr(check_env.psycopg, "connect", mock_db_connect)
+
+    # 3a. Migrated workspaces all owned by local-dev-user -> PASS
+    pass_mig_rows = [
+        {"workspace_id": wid, "name": ticker, "user_id": "local-dev-user", "status": "ready"}
+        for ticker, wid in _common.KNOWN_MIGRATED_WORKSPACES.items()
+    ]
+    conn_mig_pass = _make_autospec_conn(pass_mig_rows)
+    mock_db_connect.return_value = conn_mig_pass
+    res_mig_pass = check_env.check_migrated_workspace_ownership(dsn="postgresql://x")
+    assert res_mig_pass["status"] == "PASS"
+    assert res_mig_pass["expected_owner"] == "local-dev-user"
+
+    # Migrated workspace reassigned to realrun-pm-a -> FAIL
+    fail_mig_rows = [
+        {
+            "workspace_id": wid,
+            "name": ticker,
+            "user_id": "realrun-pm-a" if ticker == "META" else "local-dev-user",
+            "status": "ready",
+        }
+        for ticker, wid in _common.KNOWN_MIGRATED_WORKSPACES.items()
+    ]
+    conn_mig_fail = _make_autospec_conn(fail_mig_rows)
+    mock_db_connect.return_value = conn_mig_fail
+    res_mig_fail = check_env.check_migrated_workspace_ownership(dsn="postgresql://x")
+    assert res_mig_fail["status"] == "FAIL"
+    assert res_mig_fail["wrong_owner_workspaces"][0]["ticker"] == "META"
+
+    # 3b. realrun-* workspace provenance: valid marker + valid UUIDv5 Home -> PASS; unmarked -> FAIL
+    valid_home_id = str(uuid.uuid5(_common.HOME_WORKSPACE_NAMESPACE, "realrun-pm-a"))
+    prov_pass_rows = [
+        {
+            "workspace_id": valid_home_id,
+            "user_id": "realrun-pm-a",
+            "name": "Home",
+            "status": "stopped",
+            "config": {},
+        },
+        {
+            "workspace_id": "11111111-2222-3333-4444-555555555555",
+            "user_id": "realrun-idle-c",
+            "name": "G4-IDLE",
+            "status": "ready",
+            "config": {"realrun_ephemeral": True, "realrun_script": "g4_autonomy.py"},
+        },
+    ]
+    conn_prov_pass = _make_autospec_conn(prov_pass_rows)
+    mock_db_connect.return_value = conn_prov_pass
+    res_prov_pass = check_env.check_realrun_workspace_provenance(dsn="postgresql://x")
+    assert res_prov_pass["status"] == "PASS"
+
+    prov_fail_rows = [
+        {
+            "workspace_id": "9f649354-7bf0-4a84-b178-9d2576b4c805",
+            "user_id": "realrun-pm-a",
+            "name": "META",
+            "status": "ready",
+            "config": {},
+        }
+    ]
+    conn_prov_fail = _make_autospec_conn(prov_fail_rows)
+    mock_db_connect.return_value = conn_prov_fail
+    res_prov_fail = check_env.check_realrun_workspace_provenance(dsn="postgresql://x")
+    assert res_prov_fail["status"] == "FAIL"
+    assert len(res_prov_fail["invalid_workspaces"]) == 1
+
+    # 3c. BYOK and subagent snapshot/restore helpers (Requirement 3)
+    restore_client = create_autospec(RealRunHttpClient, instance=True)
+    restore_client.get.return_value = (
+        200,
+        {"byok_enabled": False, "providers": [{"provider": "deepseek", "masked_key": "(server)"}]},
+    )
+    restore_client.put.return_value = (
+        200,
+        {"byok_enabled": False, "providers": [{"provider": "deepseek", "masked_key": "(server)"}]},
+    )
+    restore_client.delete.return_value = (200, {})
+    snap_keys = check_env._snapshot_api_keys_state(restore_client)
+    assert snap_keys["byok_enabled"] is False
+    assert snap_keys["had_user_deepseek_key"] is False
+    assert check_env._restore_api_keys_state(restore_client, prior_state=snap_keys) is None
+    restore_client.delete.assert_called_once_with("/api/v1/users/me/api-keys/deepseek")
+
+    restore_sub_client = create_autospec(RealRunHttpClient, instance=True)
+    restore_sub_client.get.return_value = (
+        200,
+        {
+            "subagents": [
+                {
+                    "name": "general-purpose",
+                    "version": "v1",
+                    "edited": False,
+                    "user_fields": [],
+                    "model": None,
+                }
+            ]
+        },
+    )
+    restore_sub_client.put.return_value = (
+        200,
+        {"name": "general-purpose", "version": "v2", "user_fields": [], "model": None},
+    )
+    snap_sub = check_env._snapshot_subagent_state(restore_sub_client, "general-purpose")
+    assert snap_sub["edited"] is False
+    assert check_env._restore_subagent_state(restore_sub_client, prior_state=snap_sub) is None
+    restore_sub_client.put.assert_called_once_with(
+        "/api/v1/subagents/general-purpose",
+        json_body={"version": "v1", "fields": {"model": None}},
+    )
+
+    # 4. G5 --mode g5.2-initiate: rejects --record (non-zero exit) and raises RuntimeError if any file is written under var/dalton/trial-runs/
+    mock_dotenv_init = create_autospec(g5_broker_and_antigravity.load_repo_dotenv, return_value=False)
+    monkeypatch.setattr(g5_broker_and_antigravity, "load_repo_dotenv", mock_dotenv_init)
+
+    with pytest.raises(SystemExit, match="cannot be combined with --record"):
+        g5_broker_and_antigravity.main(["--mode", "g5.2-initiate", "--record"])
+
+    mock_health = create_autospec(g5_broker_and_antigravity._probe_backend_health_sync)
+    mock_health.return_value = {"status": "ok", "deployment": "docker"}
+    mock_init = create_autospec(g5_broker_and_antigravity._initiate_g5_2_for_user)
+    mock_init.return_value = {
+        "user_id": "realrun-pm-a",
+        "initiate_http_status": 200,
+        "port": 51121,
+        "state_prefix": "abc1234567",
+        "authorize_url": "https://accounts.google.com/o/oauth2/v2/auth?state=abc1234567",
+    }
+    monkeypatch.setattr(g5_broker_and_antigravity, "_probe_backend_health_sync", mock_health)
+    monkeypatch.setattr(g5_broker_and_antigravity, "_initiate_g5_2_for_user", mock_init)
+    monkeypatch.setattr(g5_broker_and_antigravity, "REPO_ROOT", tmp_path)
+
+    rc_init = g5_broker_and_antigravity.main(["--mode", "g5.2-initiate", "--date", "20261020"])
+    assert rc_init == 0
+    assert not (tmp_path / "var" / "dalton" / "trial-runs").exists()
+
+    # Recursive check across entire var/dalton/trial-runs/ tree raises RuntimeError (not assert)
+    def _dirty_init(base_url: str, user_id: str, *, record: bool = False) -> dict[str, object]:
+        out_dir = tmp_path / "var" / "dalton" / "trial-runs" / "realrun-19990101"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "other_artifact.txt").write_text("{}", encoding="utf-8")
+        return {"user_id": user_id}
+
+    mock_init.side_effect = _dirty_init
+    with pytest.raises(RuntimeError, match="must not write or modify any evidence files"):
+        g5_broker_and_antigravity.main(["--mode", "g5.2-initiate", "--date", "20261020"])
+
+
+def test_r2_round2_cleanup_autospec_d5_d6_d7(monkeypatch: pytest.MonkeyPatch) -> None:
+    from unittest.mock import create_autospec
+
+    from scripts.dalton.realrun import (
+        _common,
+        check_env,
+        g1_budget,
+        g4_autonomy,
+    )
+
+    monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", "test-service-token-value")
+
+    # 1. Execute g1_budget._cleanup_g1_state directly with create_autospec on RealRunHttpClient and restore functions (Items 1 & 4)
+    deleted_paths_g1: list[tuple[str, str]] = []
+
+    def _make_g1_autospec_client(
+        base_url: str = "http://127.0.0.1:8000",
+        *,
+        user_id: str,
+        timeout_s: float = 120.0,
+        extra_headers: dict[str, str] | None = None,
+        record: bool | None = None,
+    ) -> _common.RealRunHttpClient:
+        inst = create_autospec(_common.RealRunHttpClient, instance=True)
+        inst.__enter__.return_value = inst
+        inst.__exit__.return_value = None
+
+        def _del(path: str) -> tuple[int, dict[str, object]]:
+            deleted_paths_g1.append((user_id, path))
+            return 200, {}
+
+        inst.delete.side_effect = _del
+        return inst
+
+    mock_g1_client_cls = create_autospec(_common.RealRunHttpClient, side_effect=_make_g1_autospec_client)
+    mock_restore_sub_g1 = create_autospec(check_env._restore_subagent_state, return_value=None)
+    mock_restore_keys_g1 = create_autospec(check_env._restore_api_keys_state, return_value=None)
+    mock_restore_budget_g1 = create_autospec(check_env._restore_budget_state, return_value=None)
+    monkeypatch.setattr(g1_budget, "RealRunHttpClient", mock_g1_client_cls)
+    monkeypatch.setattr(g1_budget, "_restore_subagent_state", mock_restore_sub_g1)
+    monkeypatch.setattr(g1_budget, "_restore_api_keys_state", mock_restore_keys_g1)
+    monkeypatch.setattr(g1_budget, "_restore_budget_state", mock_restore_budget_g1)
+
+    prior_sub_a = {"name": "general-purpose", "version": "v1", "edited": False, "user_fields": [], "model": None}
+    prior_keys_a = {"byok_enabled": False, "had_user_deepseek_key": False}
+    prior_budget_a = {"configured": True, "daily_cap_usd": 10.0}
+    prior_keys_b = {"byok_enabled": False, "had_user_deepseek_key": False}
+    prior_budget_b = {"configured": False}
+
+    res_g1_ok = g1_budget._cleanup_g1_state(
+        backend_url="http://127.0.0.1:8000",
+        user_a="realrun-pm-a",
+        workspace_id="ws-a-1",
+        subagent_modified_a=True,
+        prior_subagent_a=prior_sub_a,
+        key_modified_a=True,
+        prior_keys_a=prior_keys_a,
+        budget_modified_a=True,
+        was_configured_a=True,
+        prior_budget_a=prior_budget_a,
+        user_b="realrun-user-b",
+        ws_b_id="ws-b-1",
+        key_modified_b=True,
+        prior_keys_b=prior_keys_b,
+        budget_modified_b=True,
+        was_configured_b=False,
+        prior_budget_b=prior_budget_b,
+    )
+    assert all(v is None for v in res_g1_ok.values())
+    assert deleted_paths_g1 == [
+        ("realrun-pm-a", "/api/v1/workspaces/ws-a-1"),
+        ("realrun-user-b", "/api/v1/workspaces/ws-b-1"),
+    ]
+    assert mock_restore_sub_g1.call_count == 1
+    assert mock_restore_sub_g1.call_args.kwargs == {"prior_state": prior_sub_a}
+    assert mock_restore_keys_g1.call_count == 2
+    assert mock_restore_keys_g1.call_args_list[0].kwargs == {"prior_state": prior_keys_a}
+    assert mock_restore_keys_g1.call_args_list[1].kwargs == {"prior_state": prior_keys_b}
+    assert mock_restore_budget_g1.call_count == 2
+
+    # Verify fault isolation in _cleanup_g1_state: if user_a subagent restore raises RuntimeError,
+    # user_a key/budget and user_b workspace/key/budget still execute before RuntimeError is raised
+    deleted_paths_g1.clear()
+    mock_restore_sub_g1.reset_mock()
+    mock_restore_keys_g1.reset_mock()
+    mock_restore_budget_g1.reset_mock()
+    mock_restore_sub_g1.side_effect = RuntimeError("boom_subagent")
+    with pytest.raises(RuntimeError, match="subagent_a_restore_exception:RuntimeError"):
+        g1_budget._cleanup_g1_state(
+            backend_url="http://127.0.0.1:8000",
+            user_a="realrun-pm-a",
+            workspace_id="ws-a-2",
+            subagent_modified_a=True,
+            prior_subagent_a=prior_sub_a,
+            key_modified_a=True,
+            prior_keys_a=prior_keys_a,
+            budget_modified_a=True,
+            was_configured_a=True,
+            prior_budget_a=prior_budget_a,
+            user_b="realrun-user-b",
+            ws_b_id="ws-b-2",
+            key_modified_b=True,
+            prior_keys_b=prior_keys_b,
+            budget_modified_b=True,
+            was_configured_b=False,
+            prior_budget_b=prior_budget_b,
+        )
+    assert deleted_paths_g1 == [
+        ("realrun-pm-a", "/api/v1/workspaces/ws-a-2"),
+        ("realrun-user-b", "/api/v1/workspaces/ws-b-2"),
+    ]
+    assert mock_restore_keys_g1.call_count == 2
+    assert mock_restore_budget_g1.call_count == 2
+
+    # 2. Execute g4_autonomy._cleanup_g4_state directly with create_autospec on RealRunHttpClient and restore functions (Items 1 & 4)
+    deleted_paths_g4: list[tuple[str, str]] = []
+
+    def _make_g4_autospec_client(
+        base_url: str = "http://127.0.0.1:8000",
+        *,
+        user_id: str,
+        timeout_s: float = 120.0,
+        extra_headers: dict[str, str] | None = None,
+        record: bool | None = None,
+    ) -> _common.RealRunHttpClient:
+        inst = create_autospec(_common.RealRunHttpClient, instance=True)
+        inst.__enter__.return_value = inst
+        inst.__exit__.return_value = None
+
+        def _del(path: str) -> tuple[int, dict[str, object]]:
+            deleted_paths_g4.append((user_id, path))
+            return 200, {}
+
+        inst.delete.side_effect = _del
+        return inst
+
+    mock_g4_client_cls = create_autospec(_common.RealRunHttpClient, side_effect=_make_g4_autospec_client)
+    mock_restore_sub_g4 = create_autospec(check_env._restore_subagent_state, return_value=None)
+    mock_restore_keys_g4 = create_autospec(check_env._restore_api_keys_state, return_value=None)
+    mock_restore_budget_g4 = create_autospec(check_env._restore_budget_state, return_value=None)
+    monkeypatch.setattr(g4_autonomy, "RealRunHttpClient", mock_g4_client_cls)
+    monkeypatch.setattr(g4_autonomy, "_restore_subagent_state", mock_restore_sub_g4)
+    monkeypatch.setattr(g4_autonomy, "_restore_api_keys_state", mock_restore_keys_g4)
+    monkeypatch.setattr(g4_autonomy, "_restore_budget_state", mock_restore_budget_g4)
+
+    errs_g4 = g4_autonomy._cleanup_g4_state(
+        backend_url="http://127.0.0.1:8000",
+        idle_user="realrun-idle-c",
+        created_idle_auto_ids=["auto-idle-1"],
+        created_idle_ws_ids=["ws-idle-1"],
+        pm_user="realrun-pm-a",
+        created_auto_ids=["auto-pm-1"],
+        created_ws_ids=["ws-pm-1"],
+        subagent_modified_pm=True,
+        prior_subagent_pm=prior_sub_a,
+        key_modified_pm=True,
+        prior_keys_pm=prior_keys_a,
+        budget_modified_pm=True,
+        was_configured_pm=True,
+        prior_budget_pm=prior_budget_a,
+    )
+    assert errs_g4 == []
+    # realrun-idle-c resources are deleted first
+    assert deleted_paths_g4 == [
+        ("realrun-idle-c", "/api/v1/automations/auto-idle-1"),
+        ("realrun-idle-c", "/api/v1/workspaces/ws-idle-1"),
+        ("realrun-pm-a", "/api/v1/automations/auto-pm-1"),
+        ("realrun-pm-a", "/api/v1/workspaces/ws-pm-1"),
+    ]
+    assert mock_restore_sub_g4.call_args.kwargs == {"prior_state": prior_sub_a}
+    assert mock_restore_keys_g4.call_args.kwargs == {"prior_state": prior_keys_a}
+
+    # Verify fault isolation in _cleanup_g4_state: an exception in subagent restore does not skip key/budget or idle cleanup
+    deleted_paths_g4.clear()
+    mock_restore_sub_g4.side_effect = RuntimeError("subagent_fail")
+    with pytest.raises(RuntimeError, match="restore_subagent_pm_exception:RuntimeError"):
+        g4_autonomy._cleanup_g4_state(
+            backend_url="http://127.0.0.1:8000",
+            idle_user="realrun-idle-c",
+            created_idle_auto_ids=["auto-idle-2"],
+            created_idle_ws_ids=["ws-idle-2"],
+            pm_user="realrun-pm-a",
+            created_auto_ids=["auto-pm-2"],
+            created_ws_ids=["ws-pm-2"],
+            subagent_modified_pm=True,
+            prior_subagent_pm=prior_sub_a,
+            key_modified_pm=True,
+            prior_keys_pm=prior_keys_a,
+            budget_modified_pm=True,
+            was_configured_pm=True,
+            prior_budget_pm=prior_budget_a,
+        )
+    assert ("realrun-idle-c", "/api/v1/automations/auto-idle-2") in deleted_paths_g4
+    assert ("realrun-idle-c", "/api/v1/workspaces/ws-idle-2") in deleted_paths_g4
+    assert mock_restore_keys_g4.call_count == 2
+    assert mock_restore_budget_g4.call_count == 2
+
+    # 3. D6: Setup and cleanup behavior for both had_user_deepseek_key=True and had_user_deepseek_key=False
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-deepseek-key")
+
+    # 3a. had_user_deepseek_key=True -> neither G1 nor G4 setup calls PUT, and _restore_api_keys_state is a no-op
+    existing_key_client = create_autospec(RealRunHttpClient, instance=True)
+    assert (
+        g1_budget._ensure_deepseek_byok_for_g1(
+            existing_key_client,
+            {"byok_enabled": True, "had_user_deepseek_key": True},
+        )
+        is False
+    )
+    assert (
+        g4_autonomy._ensure_deepseek_byok_for_g4(
+            existing_key_client,
+            {"byok_enabled": True, "had_user_deepseek_key": True},
+        )
+        is False
+    )
+    assert (
+        check_env._restore_api_keys_state(
+            existing_key_client,
+            prior_state={"byok_enabled": True, "had_user_deepseek_key": True},
+        )
+        is None
+    )
+    existing_key_client.delete.assert_not_called()
+    existing_key_client.put.assert_not_called()
+    existing_key_client.request.assert_not_called()
+
+    # Verify G1 evidence fields truthfully reflect preserved pre-existing keys (no PUT, no delete)
+    ev_preserved = g1_budget._build_g1_byok_evidence_fields(
+        key_modified_a=False,
+        key_modified_b=False,
+        cleanup_result={
+            "restore_err_a": None,
+            "restore_key_err_a": None,
+            "restore_err_b": None,
+            "delete_key_err_b": None,
+        },
+    )
+    assert ev_preserved["scenario_1_api_keys_restored"] == "not_applicable"
+    assert ev_preserved["scenario_2_settings_endpoint"] == "GET /api/v1/users/me/api-keys (preexisting key preserved)"
+    assert ev_preserved["scenario_2_temporary_key_written"] is False
+    assert ev_preserved["scenario_2_temporary_key_deleted"] is False
+    assert ev_preserved["scenario_2_key_write_skipped_reason"] == "preexisting_user_deepseek_key_preserved"
+    assert ev_preserved["user_b_temporary_key_written"] is False
+    assert ev_preserved["user_b_key_deleted"] is False
+    assert ev_preserved["user_b_key_write_skipped_reason"] == "preexisting_user_deepseek_key_preserved"
+    assert "保留未删除" in ev_preserved["user_b_cleanup_note"]
+    assert "已删除用户 B" not in ev_preserved["user_b_cleanup_note"]
+
+    # 3b. had_user_deepseek_key=False -> G1 and G4 setup write temporary key via PUT, and evidence fields record write + delete
+    no_key_client_g1 = create_autospec(RealRunHttpClient, instance=True)
+    no_key_client_g1.put.return_value = (200, {"ok": True})
+    assert (
+        g1_budget._ensure_deepseek_byok_for_g1(
+            no_key_client_g1,
+            {"byok_enabled": False, "had_user_deepseek_key": False},
+        )
+        is True
+    )
+    no_key_client_g1.put.assert_called_once_with(
+        "/api/v1/users/me/api-keys",
+        json_body={"byok_enabled": True, "api_keys": {"deepseek": "sk-test-deepseek-key"}},
+    )
+
+    no_key_client_g4 = create_autospec(RealRunHttpClient, instance=True)
+    no_key_client_g4.request.return_value = (200, {"ok": True})
+    assert (
+        g4_autonomy._ensure_deepseek_byok_for_g4(
+            no_key_client_g4,
+            {"byok_enabled": False, "had_user_deepseek_key": False},
+        )
+        is True
+    )
+    no_key_client_g4.request.assert_called_once_with(
+        "PUT",
+        "/api/v1/users/me/api-keys",
+        json_body={"byok_enabled": True, "api_keys": {"deepseek": "sk-test-deepseek-key"}},
+    )
+
+    ev_written = g1_budget._build_g1_byok_evidence_fields(
+        key_modified_a=True,
+        key_modified_b=True,
+        cleanup_result={
+            "restore_err_a": None,
+            "restore_key_err_a": None,
+            "restore_err_b": None,
+            "delete_key_err_b": None,
+        },
+    )
+    assert ev_written["scenario_1_api_keys_restored"] is True
+    assert ev_written["scenario_2_settings_endpoint"] == "PUT /api/v1/users/me/api-keys"
+    assert ev_written["scenario_2_temporary_key_written"] is True
+    assert ev_written["scenario_2_temporary_key_deleted"] is True
+    assert ev_written["scenario_2_key_write_skipped_reason"] is None
+    assert ev_written["user_b_temporary_key_written"] is True
+    assert ev_written["user_b_key_deleted"] is True
+    assert ev_written["user_b_key_write_skipped_reason"] is None
+    assert "已删除用户 B 本轮写入的临时 key" in ev_written["user_b_cleanup_note"]
+
+    ev_del_failed = g1_budget._build_g1_byok_evidence_fields(
+        key_modified_a=True,
+        key_modified_b=True,
+        cleanup_result={
+            "restore_err_a": None,
+            "restore_key_err_a": "api_keys_restore_http_failed:del=500,put=500",
+            "restore_err_b": None,
+            "delete_key_err_b": "api_keys_restore_http_failed:del=500,put=500",
+        },
+    )
+    assert ev_del_failed["scenario_1_api_keys_restored"] is False
+    assert ev_del_failed["user_b_key_deleted"] is False
+    assert "删除用户 B 本轮写入的临时 key 失败" in ev_del_failed["user_b_cleanup_note"]
+
+    # 4. D7: assert_no_conflicting_dalton_automation detects conflicts before PUT
+    auto_check_client = create_autospec(RealRunHttpClient, instance=True)
+    auto_check_client.request.return_value = (
+        200,
+        {
+            "automations": [
+                {
+                    "automation_id": "auto-other-ws",
+                    "name": "dalton-meta-watch",
+                    "workspace_id": "ws-other",
+                }
+            ],
+            "total": 1,
+        },
+    )
+    # Different non-null workspace_id -> allowed
+    _common.assert_no_conflicting_dalton_automation(
+        auto_check_client,
+        name="dalton-meta-watch",
+        workspace_id="ws-new",
+    )
+    # Same workspace_id -> raises RuntimeError before PUT
+    with pytest.raises(RuntimeError, match="Refusing to PUT /api/v1/dalton/automations/dalton-meta-watch"):
+        _common.assert_no_conflicting_dalton_automation(
+            auto_check_client,
+            name="dalton-meta-watch",
+            workspace_id="ws-other",
+        )
+    # Existing automation has workspace_id=None -> matches any workspace_id on server, so raises RuntimeError
+    auto_check_client.request.return_value = (
+        200,
+        {
+            "automations": [
+                {
+                    "automation_id": "auto-global",
+                    "name": "dalton-director-daily",
+                    "workspace_id": None,
+                }
+            ],
+            "total": 1,
+        },
+    )
+    with pytest.raises(RuntimeError, match="Refusing to PUT /api/v1/dalton/automations/dalton-director-daily"):
+        _common.assert_no_conflicting_dalton_automation(
+            auto_check_client,
+            name="dalton-director-daily",
+            workspace_id="ws-idle-c",
+        )
+
+    # 5. D5: Call g1_budget._assert_g1_added_cash_spend directly with 1 passing dataset and 2 failing datasets
+    added_a, added_b, total_added = g1_budget._assert_g1_added_cash_spend(
+        baseline_spent_a=1.00,
+        final_spent_a=1.30,
+        baseline_spent_b=0.20,
+        final_spent_b=0.23,
+    )
+    assert (added_a, added_b, total_added) == (0.30, 0.03, 0.33)
+
+    # Failing dataset 1: user_b added spend > $0.05
+    with pytest.raises(AssertionError, match=r"user_b newly added cash spend <= 0\.05 USD"):
+        g1_budget._assert_g1_added_cash_spend(
+            baseline_spent_a=1.00,
+            final_spent_a=1.20,
+            baseline_spent_b=0.20,
+            final_spent_b=0.26,
+        )
+
+    # Failing dataset 2: total added spend > $0.50 (while user_b added spend <= $0.05)
+    with pytest.raises(AssertionError, match=r"user_a \+ user_b newly added cash spend <= 0\.50 USD"):
+        g1_budget._assert_g1_added_cash_spend(
+            baseline_spent_a=1.00,
+            final_spent_a=1.48,
+            baseline_spent_b=0.20,
+            final_spent_b=0.24,
+        )
+
+    # 6. Item 3 & Round 4 Items 1-2 & 5: check_env.check_conversation_transport does not discard restore_error
+    # when workspace creation returns 500, raises an exception, or stream_sse raises an exception
+    probe_client = create_autospec(_common.RealRunHttpClient, instance=True)
+    probe_client.__enter__.return_value = probe_client
+    probe_client.__exit__.return_value = None
+    probe_client.get.side_effect = [
+        (200, {"configured": True, "daily_cap_usd": 10.0, "default_task_cap_usd": 5.0}),
+        (200, {"remaining_usd": 0.0, "spent_usd": 10.0}),
+    ]
+    probe_client.put.return_value = (200, {"ok": True})
+    probe_client.post.return_value = (500, {"detail": "ws_create_boom"})
+
+    cleanup_probe_client = create_autospec(_common.RealRunHttpClient, instance=True)
+    cleanup_probe_client.__enter__.return_value = cleanup_probe_client
+    cleanup_probe_client.__exit__.return_value = None
+    probe_clients_iter = iter([probe_client, cleanup_probe_client])
+
+    def _next_probe_client_ws_fail(
+        base_url: str = "http://127.0.0.1:8000",
+        *,
+        user_id: str,
+        timeout_s: float = 30.0,
+        extra_headers: dict[str, str] | None = None,
+    ) -> _common.RealRunHttpClient:
+        return next(probe_clients_iter)
+
+    mock_for_check_env_probe = create_autospec(
+        _common.RealRunHttpClient._for_check_env_probe,
+        side_effect=_next_probe_client_ws_fail,
+    )
+    monkeypatch.setattr(
+        check_env.RealRunHttpClient,
+        "_for_check_env_probe",
+        mock_for_check_env_probe,
+    )
+    mock_probe_restore = create_autospec(
+        check_env._restore_budget_state,
+        return_value="budget_restore_put_http_503",
+    )
+    monkeypatch.setattr(check_env, "_restore_budget_state", mock_probe_restore)
+
+    ws_fail_res = check_env.check_conversation_transport(
+        base_url="http://127.0.0.1:8000",
+        oauth_provenance={"status": "PASS"},
+    )
+    assert ws_fail_res["status"] == "FAIL"
+    assert ws_fail_res["http_status"] == 500
+    assert ws_fail_res["budget_restored"] is False
+    assert ws_fail_res["budget_restore_error"] == "budget_restore_put_http_503"
+    assert ws_fail_res["workspace_cleaned"] is True
+    assert ws_fail_res["workspace_cleanup_error"] is None
+    assert ws_fail_res["restore_error"] == "budget_restore_put_http_503"
+    assert "workspace_create_failed:500" in ws_fail_res["reason"]
+    assert "restore_error=budget_restore_put_http_503" in ws_fail_res["reason"]
+
+    # Verify client.post raising an exception AND budget restoration failing preserves both in returned dict
+    probe_client_post_exc = create_autospec(_common.RealRunHttpClient, instance=True)
+    probe_client_post_exc.__enter__.return_value = probe_client_post_exc
+    probe_client_post_exc.__exit__.return_value = None
+    probe_client_post_exc.get.side_effect = [
+        (200, {"configured": True, "daily_cap_usd": 10.0, "default_task_cap_usd": 5.0}),
+        (200, {"remaining_usd": 0.0, "spent_usd": 10.0}),
+    ]
+    probe_client_post_exc.put.return_value = (200, {"ok": True})
+    probe_client_post_exc.post.side_effect = RuntimeError("sensitive_post_network_boom")
+
+    cleanup_probe_post_exc = create_autospec(_common.RealRunHttpClient, instance=True)
+    cleanup_probe_post_exc.__enter__.return_value = cleanup_probe_post_exc
+    cleanup_probe_post_exc.__exit__.return_value = None
+    probe_post_exc_iter = iter([probe_client_post_exc, cleanup_probe_post_exc])
+
+    def _next_probe_client_post_exc(
+        base_url: str = "http://127.0.0.1:8000",
+        *,
+        user_id: str,
+        timeout_s: float = 30.0,
+        extra_headers: dict[str, str] | None = None,
+    ) -> _common.RealRunHttpClient:
+        return next(probe_post_exc_iter)
+
+    mock_for_check_env_probe.side_effect = _next_probe_client_post_exc
+
+    post_exc_res = check_env.check_conversation_transport(
+        base_url="http://127.0.0.1:8000",
+        oauth_provenance={"status": "PASS"},
+    )
+    assert post_exc_res["status"] == "FAIL"
+    assert post_exc_res["budget_restored"] is False
+    assert post_exc_res["budget_restore_error"] == "budget_restore_put_http_503"
+    assert post_exc_res["restore_error"] == "budget_restore_put_http_503"
+    assert "probe_request_exception:RuntimeError" in post_exc_res["reason"]
+    assert "restore_error=budget_restore_put_http_503" in post_exc_res["reason"]
+    assert post_exc_res["error"] == "RuntimeError: conversation_transport request failed"
+    assert "sensitive_post_network_boom" not in str(post_exc_res)
+
+    # Also verify stream_sse raising an exception + workspace delete failing while budget restore succeeds
+    # records budget_restored=True and workspace_cleaned=False separately
+    probe_client_sse = create_autospec(_common.RealRunHttpClient, instance=True)
+    probe_client_sse.__enter__.return_value = probe_client_sse
+    probe_client_sse.__exit__.return_value = None
+    probe_client_sse.get.side_effect = [
+        (200, {"configured": True, "daily_cap_usd": 10.0, "default_task_cap_usd": 5.0}),
+        (200, {"remaining_usd": 0.0, "spent_usd": 10.0}),
+    ]
+    probe_client_sse.put.return_value = (200, {"ok": True})
+    probe_client_sse.post.return_value = (201, {"workspace_id": "ws-probe-sse"})
+    probe_client_sse.stream_sse.side_effect = RuntimeError("sse_stream_broken")
+
+    cleanup_probe_sse = create_autospec(_common.RealRunHttpClient, instance=True)
+    cleanup_probe_sse.__enter__.return_value = cleanup_probe_sse
+    cleanup_probe_sse.__exit__.return_value = None
+    cleanup_probe_sse.delete.return_value = (500, {})
+    probe_sse_iter = iter([probe_client_sse, cleanup_probe_sse])
+
+    def _next_probe_client_sse(
+        base_url: str = "http://127.0.0.1:8000",
+        *,
+        user_id: str,
+        timeout_s: float = 30.0,
+        extra_headers: dict[str, str] | None = None,
+    ) -> _common.RealRunHttpClient:
+        return next(probe_sse_iter)
+
+    mock_for_check_env_probe.side_effect = _next_probe_client_sse
+    mock_probe_restore.return_value = None
+
+    sse_fail_res = check_env.check_conversation_transport(
+        base_url="http://127.0.0.1:8000",
+        oauth_provenance={"status": "PASS"},
+    )
+    assert sse_fail_res["status"] == "FAIL"
+    assert sse_fail_res["budget_restored"] is True
+    assert sse_fail_res["budget_restore_error"] is None
+    assert sse_fail_res["workspace_cleaned"] is False
+    assert sse_fail_res["workspace_cleanup_error"] == "workspace_delete_http_500"
+    assert sse_fail_res["restore_error"] == "workspace_delete_http_500"
+    assert "stream_sse_exception:RuntimeError" in sse_fail_res["reason"]
+    assert "restore_error=workspace_delete_http_500" in sse_fail_res["reason"]
+    assert sse_fail_res["error"] == "RuntimeError: conversation_transport stream_sse failed"
+    assert "sse_stream_broken" not in str(sse_fail_res)
+    cleanup_probe_sse.delete.assert_called_once_with("/api/v1/workspaces/ws-probe-sse")
+
+
+
+
