@@ -85,21 +85,35 @@ def _require_pm_user(user_id: str) -> None:
 
 
 async def _verify_workspace_access(workspace_id: str, user_id: str) -> None:
-    """Verify that ``workspace_id`` belongs to ``user_id`` (G2 #2, R4-8, R5-1)."""
+    """Verify that ``workspace_id`` belongs to ``user_id`` fail-closed (G2 #2, R4-8, R5-1, P0J §8.1 #14)."""
     _require_dalton_enabled()
     try:
         from src.server.database.workspace import get_workspace
 
         ws = await get_workspace(workspace_id)
-    except Exception:
-        ws = None
-    if ws is not None:
-        owner = str(ws.get("user_id") or "")
-        if owner and owner != str(user_id):
-            raise HTTPException(
-                status_code=403,
-                detail="Workspace does not belong to current user",
-            )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error(
+            "Database error verifying workspace access for workspace_id=%s: %s",
+            workspace_id,
+            exc,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Database unavailable while verifying workspace access",
+        ) from exc
+    if ws is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Workspace '{workspace_id}' not found",
+        )
+    owner = str(ws.get("user_id") or "").strip()
+    if not owner or owner != str(user_id):
+        raise HTTPException(
+            status_code=403,
+            detail="Workspace does not belong to current user",
+        )
 
 
 # ---------------------------------------------------------------------------
