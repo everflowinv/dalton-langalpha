@@ -47,7 +47,10 @@ _PERIOD_TOKEN_RE = re.compile(
     r")(?![A-Za-z0-9])",
     re.IGNORECASE,
 )
-_LTM_EXPR_RE = re.compile(r"(?:\b(?:LTM|TTM)\b|(?:过去|近)\s*12\s*个月)", re.IGNORECASE)
+_LTM_EXPR_RE = re.compile(
+    r"(?:(?<![A-Za-z0-9])(?:LTM|TTM)(?![A-Za-z0-9])|(?:过去|近)\s*12\s*个月)",
+    re.IGNORECASE,
+)
 
 # Standalone date / period / filing form / identifier patterns to exclude
 _SEC_ACCESSION_RE = re.compile(r"\b\d{10}-\d{2}-\d{6}\b")
@@ -1028,26 +1031,27 @@ _FINANCIAL_RAW_TOKENS = (
 )
 
 
-def _can_be_incidental(fig: ExtractedFigure, item_unit: str = "") -> bool:
-    """Return True if ``fig`` is eligible to be excluded as ``incidental`` (P0I §1.4 / L35 / L43).
-
-    Numbers with currency, percentage, basis points, valuation multiples, per-share units,
-    decimals, or inside tables cannot be marked ``incidental``.
-    """
-    if fig.location.get("table") or fig.decimals > 0:
-        return False
+def _incidental_guard_reject_reasons(fig: ExtractedFigure, item_unit: str = "") -> list[str]:
+    """Return guard rejection reasons preventing ``fig`` from being ``incidental`` (P0I §1.4 / L35 / L43)."""
+    reasons: list[str] = []
+    if fig.location.get("table"):
+        reasons.append("table")
+    if fig.decimals > 0:
+        reasons.append("decimals")
     if fig.currency is not None or fig.scale > 1.0:
-        return False
+        reasons.append("currency_or_scale")
     if (fig.unit or "").strip().lower() not in ("", "other", "count"):
-        return False
+        reasons.append("unit")
     if (item_unit or "").strip().lower() not in ("", "other", "count"):
-        return False
+        reasons.append("item_unit")
     raw_low = (fig.raw or "").strip().lower()
-    if any(tok in raw_low for tok in _FINANCIAL_RAW_TOKENS):
-        return False
-    if re.search(r"\d\s*x$", raw_low):
-        return False
-    return True
+    if any(tok in raw_low for tok in _FINANCIAL_RAW_TOKENS) or re.search(r"\d\s*x$", raw_low):
+        reasons.append("financial_token")
+    return reasons
+
+
+def _can_be_incidental(fig: ExtractedFigure, item_unit: str = "") -> bool:
+    return not _incidental_guard_reject_reasons(fig, item_unit)
 
 
 def _split_markdown_sections_and_chunks(
@@ -1348,12 +1352,17 @@ async def label_figures_with_status(
             if raw_kind not in _VALID_LABEL_KINDS:
                 raw_kind = "reported"
             inc_cat = (item.incidental_category or "").strip()
-            if raw_kind == "incidental" and _can_be_incidental(target, item.unit):
+            reject_reasons = _incidental_guard_reject_reasons(target, item.unit)
+            if raw_kind == "incidental" and not reject_reasons:
                 target.label_hint = "incidental"
                 target.incidental_category = inc_cat or "未给类别"
             else:
                 target.label_hint = "reported" if raw_kind == "incidental" else raw_kind
-                if raw_kind == "incidental" and target.decimals > 0 and inc_cat in _DECIMAL_UNCERTAIN_CATEGORIES:
+                if (
+                    raw_kind == "incidental"
+                    and reject_reasons == ["decimals"]
+                    and inc_cat in _DECIMAL_UNCERTAIN_CATEGORIES
+                ):
                     target.incidental_category = inc_cat
 
             if item.metric and item.metric.strip():

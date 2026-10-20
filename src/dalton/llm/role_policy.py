@@ -384,20 +384,9 @@ def _load_default_agent_config() -> dict[str, Any]:
         ) from exc
 
 
-def _resolve_assist_fallback_models_for_policy(cfg: dict[str, Any]) -> list[str]:
+def _resolve_assist_fallback_models_for_policy() -> list[str]:
     from src.dalton.settings import get_assist_fallback_models
 
-    llm_cfg = cfg.get("llm") if isinstance(cfg.get("llm"), dict) else {}
-    models_cfg = cfg.get("models") if isinstance(cfg.get("models"), dict) else {}
-    raw_override = (
-        models_cfg.get("assist_fallback_model")
-        if "assist_fallback_model" in models_cfg
-        else llm_cfg.get("assist_fallback")
-    )
-    if isinstance(raw_override, str) and raw_override.strip():
-        return [m.strip() for m in raw_override.split(",") if m.strip()]
-    if isinstance(raw_override, list):
-        return [str(m).strip() for m in raw_override if str(m).strip()]
     try:
         return get_assist_fallback_models()
     except Exception as exc:
@@ -466,7 +455,7 @@ def check_roles(
     # Validate auxiliary LLM slots: assist, assist_fallback, background, compaction, fetch (P0H §4 P3, P0J.J2)
     # Note: assist (and compaction/background) are non-tool structured/background slots,
     # so they do not require tool-calling, but they MUST NOT use forbidden contributor models.
-    assist_fb_models = _resolve_assist_fallback_models_for_policy(cfg)
+    assist_fb_models = _resolve_assist_fallback_models_for_policy()
 
     aux_slots: list[tuple[str, str]] = [
         ("assist", str(llm_cfg.get("assist") or "").strip()),
@@ -611,7 +600,10 @@ def check_roles(
                         "code": "assist_fallback_same_family",
                         "role": "assist_fallback",
                         "model": fb_m,
-                        "message": f"assist 备选模型 {fb_m} 与审稿候选模型 {rev_cand} 同属家族 {fb_fam}（违反 L20 跨家族独立原则）。",
+                        "message": (
+                            f"assist 备选模型 {fb_m} 与审稿候选模型 {rev_cand} "
+                            f"同属家族 {fb_fam}（违反 L20 跨家族独立原则）。"
+                        ),
                         "link": "/settings?tab=model",
                     }
                 )
@@ -621,7 +613,7 @@ def check_roles(
 
 
 def enforce_role_policy_on_startup(config: dict[str, Any] | None = None) -> list[dict[str, str]]:
-    """Validate role assignments at backend startup; raise `RolePolicyError` on L20/L21 violation (P0H §4 P3, P0J.J2)."""
+    """Validate role assignments at startup; raise `RolePolicyError` on L20/L21 violation (P0H §4 P3, P0J.J2)."""
     warnings = check_roles(config)
     forbidden = [
         w

@@ -42,11 +42,8 @@ interface AuditFigureItem {
 }
 
 interface FailedBatchDetail {
-  batch?: number;
   batch_index?: number;
-  start_figure?: number;
   start_fig?: number;
-  end_figure?: number;
   end_fig?: number;
   section?: string;
 }
@@ -222,9 +219,9 @@ export function PublishApprovalCard({
           {failedBatchDetails.length > 0 && (
             <div className="text-[10.5px] font-normal space-y-0.5" data-testid="publish-failed-batch-details">
               {failedBatchDetails.map((d, dIdx) => {
-                const batchNo = d.batch ?? d.batch_index ?? dIdx + 1;
-                const startFig = d.start_figure ?? d.start_fig ?? '?';
-                const endFig = d.end_figure ?? d.end_fig ?? '?';
+                const batchNo = d.batch_index ?? dIdx + 1;
+                const startFig = d.start_fig ?? '?';
+                const endFig = d.end_fig ?? '?';
                 const isColloquialScan = Number(startFig) === 0 && Number(endFig) === 0;
                 return (
                   <div key={`${batchNo}-${dIdx}`}>
@@ -369,7 +366,10 @@ export function PublishApprovalCard({
           {incidentalExpanded && incidentalItems.length > 0 && (
             <div className="pt-1 space-y-0.5 text-[11px]" data-testid="publish-incidental-list">
               {incidentalItems.map((item, idx) => {
-                const cat = item.incidental_category || item.category || '未给类别';
+                const cat =
+                  item.incidental_category ||
+                  item.category ||
+                  t('dalton.publish.incidentalCategoryMissing', '未给类别');
                 return (
                   <div key={item.id ?? idx} style={{ color: 'var(--color-text-tertiary)' }}>
                     <code>L{item.line ?? '?'}</code> · <strong>{item.raw}</strong>

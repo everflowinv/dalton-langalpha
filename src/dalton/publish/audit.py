@@ -26,6 +26,7 @@ from src.dalton.publish.numbers import (
     _DECIMAL_UNCERTAIN_CATEGORIES,
     _FILING_FORM_RE,
     _PERIOD_TOKEN_RE,
+    _incidental_guard_reject_reasons,
     extract_figures,
     has_exempt_marker,
     label_figures_with_status,
@@ -413,24 +414,6 @@ def verify_llm_judge_verdict(
     }
 
 
-async def judge_figure_with_llm(
-    fig: ExtractedFigure,
-    candidate_sources: list[dict[str, Any]],
-    *,
-    user_id: str = LOCAL_DEV_USER_ID,
-    workspace_id: str | None = None,
-    thread_id: str | None = None,
-) -> tuple[str, dict[str, Any]]:
-    """Run grounded LLM source-consistency judgment (`audit.judge`) for a single figure (P0H §1.4 / P0I §1.5)."""
-    verdicts = await judge_figures_batch_with_llm(
-        [(0, fig, candidate_sources)],
-        user_id=user_id,
-        workspace_id=workspace_id,
-        thread_id=thread_id,
-    )
-    return verdicts[0]
-
-
 async def judge_figures_batch_with_llm(
     batch_items: list[tuple[int, ExtractedFigure, list[dict[str, Any]]]],
     *,
@@ -634,13 +617,17 @@ def _build_audit_result(
                 }
             )
         elif out.reason == "uncertain" or (
-            fig.decimals > 0
-            and fig.incidental_category in _DECIMAL_UNCERTAIN_CATEGORIES
+            fig.incidental_category in _DECIMAL_UNCERTAIN_CATEGORIES
+            and _incidental_guard_reject_reasons(fig) == ["decimals"]
             and out.reason not in CONTRADICTED_REASONS
         ):
             hint_msg = (
                 "LLM 判断为版本号或名称；带小数的数字不能自动排除，请 PM 确认"
-                if fig.decimals > 0 and fig.incidental_category in _DECIMAL_UNCERTAIN_CATEGORIES
+                if (
+                    out.reason != "uncertain"
+                    and fig.incidental_category in _DECIMAL_UNCERTAIN_CATEGORIES
+                    and _incidental_guard_reject_reasons(fig) == ["decimals"]
+                )
                 else (out.hint or "未能判断 — 交由 PM 决定")
             )
             unc_list.append(
@@ -756,8 +743,6 @@ async def aaudit_draft(
         for idx, out in enumerate(outcomes):
             fig = out.figure
             if fig.exempt or out.matched or fig.label_hint == "incidental":
-                continue
-            if fig.decimals > 0 and fig.incidental_category in _DECIMAL_UNCERTAIN_CATEGORIES:
                 continue
             if (fig.footnote_target and _RequiresModelCellOnly(fig)) or out.reason in CONTRADICTED_REASONS:
                 continue

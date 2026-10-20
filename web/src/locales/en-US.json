@@ -5470,6 +5470,7 @@
       "verifiedBreakdownLabel": "Verified Breakdown",
       "verifiedBreakdownValue": "Footnote {{footnote}} · LLM Judge {{llm_judge}} · Derived {{derived}}",
       "incidentalHeader": "Incidental / Non-Audited ({{count}})",
+      "incidentalCategoryMissing": "Uncategorized",
       "llmVerifiedHeader": "LLM Judge Verified — Draft vs. Source Quote",
       "draftSentenceLabel": "Draft Sentence",
       "sourceQuoteLabel": "Source Quote",

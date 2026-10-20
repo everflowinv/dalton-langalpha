@@ -36,9 +36,7 @@ class DaltonModelsConfig(BaseModel):
     broker: DaltonBrokerModelsConfig = Field(default_factory=DaltonBrokerModelsConfig)
     disabled_providers: list[str] = Field(default_factory=list)
     assist_model: str = "gemini-3.8-flash-low-oauth"
-    assist_fallback_model: str | list[str] = Field(
-        default_factory=lambda: ["deepseek-flash", "ocb-deepseek-deepseek-flash"]
-    )
+    assist_fallback_model: str | list[str] = Field(default_factory=list)
 
 
 class DaltonBudgetDefaults(BaseModel):

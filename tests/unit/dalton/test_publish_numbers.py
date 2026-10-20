@@ -1406,15 +1406,171 @@ def test_p0j_j2_exempt_markers_single_source_and_ltm_period_normalization() -> N
     assert normalize_period("过去 12 个月营业利润率") != "LTM"
     assert normalize_period("ULTIMATE") != "LTM"
 
-    ltm_figs = extract_figures("过去 12 个月营业利润率达到 35.2%。")
+    ltm_figs = extract_figures("过去 12 个月营业利润率达到 35.2%，TTM收入达 120 亿美元。")
     fig_margin = next(f for f in ltm_figs if f.raw == "35.2%")
     assert fig_margin.period == "LTM"
+    fig_ttm_rev = next(f for f in ltm_figs if "120" in f.raw)
+    assert fig_ttm_rev.period == "LTM"
 
     assert len(INCIDENTAL_CATEGORIES) == 9
     item_unknown = FigureLabelItem.model_validate(
         {"id": "F-001", "kind": "incidental", "incidental_category": "随便写的类别"}
     )
     assert item_unknown.incidental_category == ""
+
+
+@pytest.mark.asyncio
+async def test_p0j_j2_decimal_version_number_two_counterexamples(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P0J §8.1 #8 counterexamples:
+    1) '45.5 亿美元' mislabeled as Category 5 ('软件和模型的版本号、硬件型号') with no source -> unverified (blocks publish).
+    2) 'Sonnet 5.5' labeled as Category 5 with source present in evidence -> verified ('已核实') via Step D judge.
+    """
+    from src.dalton.publish import audit as audit_mod
+    from src.dalton.publish import numbers as numbers_mod
+
+    # Counterexample 1: "45.5 亿美元" mislabeled as Category 5 -> must remain unverified (never uncertain)
+    draft_fin = "## 财务摘要\n本季度公司实现收入 45.5 亿美元。\n"
+    thesis_empty = {
+        "schema_version": 2,
+        "evidence": [
+            {
+                "id": "EV-FIN-001",
+                "fact": "本季度公司实现收入稳步提升，版本号持续迭代。",
+                "source": {"type": "filing", "identity": "10-Q", "tier": 1},
+                "figures": [],
+            }
+        ],
+    }
+    mock_assist_fin = create_autospec(assist_json)
+    judge_called_fin = False
+
+    async def _fin_effect(
+        task: str,
+        instructions: str,
+        payload: dict[str, Any],
+        schema: dict[str, Any],
+        **kwargs: Any,
+    ) -> AssistResult:
+        nonlocal judge_called_fin
+        if task == "audit.label_figures":
+            figs = payload.get("extracted_figures") or payload.get("figures") or []
+            return AssistResult(
+                ok=True,
+                data={
+                    "items": [
+                        {
+                            "id": f["id"],
+                            "metric": "版本号",
+                            "period": "",
+                            "kind": "incidental",
+                            "incidental_category": "软件和模型的版本号、硬件型号",
+                        }
+                        for f in figs
+                    ],
+                    "extra_figures": [],
+                },
+            )
+        if task == "audit.judge":
+            judge_called_fin = True
+            return AssistResult(
+                ok=True,
+                data={
+                    "items": [
+                        {
+                            "id": f["id"],
+                            "verdict": "unverified",
+                            "quote_metric_raw": "",
+                            "explanation": "no source for 45.5 bn revenue",
+                        }
+                        for f in payload.get("figures", [])
+                    ]
+                },
+            )
+        return AssistResult(ok=False, data=None, error="unexpected_task")
+
+    mock_assist_fin.side_effect = _fin_effect
+    monkeypatch.setattr(numbers_mod, "assist_json", mock_assist_fin)
+    monkeypatch.setattr(audit_mod, "assist_json", mock_assist_fin)
+
+    res_fin = await aaudit_draft(draft_fin, thesis_doc=thesis_empty, use_llm_judge=True)
+    assert judge_called_fin is True
+    assert len(res_fin.incidental) == 0
+    assert len(res_fin.uncertain) == 0
+    assert len(res_fin.unverified) == 1
+    assert "45.5" in res_fin.unverified[0]["raw"]
+    assert len(res_fin.unmatched) == 1
+
+    # Counterexample 2: "Sonnet 5.5" labeled as Category 5 with source in evidence -> verified ("已核实")
+    draft_ver = "## 产品进展\n本季度新发布的模型版本为 Sonnet 5.5。\n"
+    thesis_with_source = {
+        "schema_version": 2,
+        "evidence": [
+            {
+                "id": "EV-MOD-001",
+                "fact": "本季度新发布的模型版本为 Sonnet 5.5。",
+                "source": {"type": "filing", "identity": "10-Q", "tier": 1},
+                "figures": [],
+            }
+        ],
+    }
+    mock_assist_ver = create_autospec(assist_json)
+
+    async def _ver_effect(
+        task: str,
+        instructions: str,
+        payload: dict[str, Any],
+        schema: dict[str, Any],
+        **kwargs: Any,
+    ) -> AssistResult:
+        if task == "audit.label_figures":
+            figs = payload.get("extracted_figures") or payload.get("figures") or []
+            return AssistResult(
+                ok=True,
+                data={
+                    "items": [
+                        {
+                            "id": f["id"],
+                            "metric": "模型版本",
+                            "period": "",
+                            "kind": "incidental",
+                            "incidental_category": "软件和模型的版本号、硬件型号",
+                        }
+                        for f in figs
+                    ],
+                    "extra_figures": [],
+                },
+            )
+        if task == "audit.judge":
+            return AssistResult(
+                ok=True,
+                data={
+                    "items": [
+                        {
+                            "id": f["id"],
+                            "verdict": "supported",
+                            "matched_source_id": "evidence:EV-MOD-001",
+                            "quote": "本季度新发布的模型版本为 Sonnet 5.5。",
+                            "quote_number_raw": "5.5",
+                            "quote_metric_raw": "模型版本",
+                            "explanation": "evidence EV-MOD-001 states Sonnet 5.5",
+                        }
+                        for f in payload.get("figures", [])
+                    ]
+                },
+            )
+        return AssistResult(ok=False, data=None, error="unexpected_task")
+
+    mock_assist_ver.side_effect = _ver_effect
+    monkeypatch.setattr(numbers_mod, "assist_json", mock_assist_ver)
+    monkeypatch.setattr(audit_mod, "assist_json", mock_assist_ver)
+
+    res_ver = await aaudit_draft(draft_ver, thesis_doc=thesis_with_source, use_llm_judge=True)
+    assert res_ver.matched == 1
+    assert res_ver.matches[0]["raw"] == "5.5"
+    assert len(res_ver.uncertain) == 0
+    assert len(res_ver.unverified) == 0
 
 
 @pytest.mark.asyncio
@@ -1477,7 +1633,7 @@ async def test_p0j_j2_assist_fallback_unified_and_role_policy_family_check(
         ("indeterminate", "timeout"),
         ("in_flight", "in_flight"),
         ("conflict", "conflict"),
-        ("failed", "budget_exhausted"),
+        ("budget_exhausted", "budget_exhausted"),
         ("failed", "http_429"),
     ]:
         calls.clear()
@@ -1525,31 +1681,26 @@ async def test_p0j_j2_assist_fallback_unified_and_role_policy_family_check(
     assert res_all_fail.model == "ocb-deepseek-deepseek-flash"
     assert "ocb-deepseek-deepseek-flash" in (res_all_fail.error or "")
 
-    # Role policy: assist_fallback compared against ALL reviewer_models (even when 2nd candidate matches family)
-    cfg_second_cand_conflict = {
+    # Role policy: assist_fallback (from DALTON_ASSIST_FALLBACK_MODEL / dalton.yaml) compared against ALL reviewer_models
+    base_role_cfg = {
         "llm": {
             "name": "claude-opus-5-5-oauth",
             "assist": "gemini-3.8-flash-low-oauth",
-            "assist_fallback": "deepseek-flash",
         }
     }
+    monkeypatch.setenv("DALTON_ASSIST_FALLBACK_MODEL", "deepseek-flash")
     warnings = check_roles(
-        cfg_second_cand_conflict,
+        base_role_cfg,
         reviewer_models=["gpt-6.1-sol-oauth", "deepseek-reasoner"],
     )
     assert any(w["code"] == "assist_fallback_same_family" for w in warnings)
 
-    bad_cfg = {
-        "llm": {
-            "name": "claude-opus-5-5-oauth",
-            "assist": "gemini-3.8-flash-low-oauth",
-            "assist_fallback": "gpt-6.1-sol-oauth",
-        }
-    }
+    monkeypatch.setenv("DALTON_ASSIST_FALLBACK_MODEL", "gpt-6.1-sol-oauth")
     with pytest.raises(RolePolicyError, match="assist_fallback"):
-        enforce_role_policy_on_startup(bad_cfg)
+        enforce_role_policy_on_startup(base_role_cfg)
 
     # Corrupt YAML in PTC_CONFIG_FILE must raise DaltonStartupConfigError (never silently return {})
+    monkeypatch.delenv("DALTON_ASSIST_FALLBACK_MODEL", raising=False)
     bad_yaml = tmp_path / "bad_agent_config.yaml"
     bad_yaml.write_text(":::invalid_yaml\n  - [unclosed", encoding="utf-8")
     monkeypatch.setenv("PTC_CONFIG_FILE", str(bad_yaml))

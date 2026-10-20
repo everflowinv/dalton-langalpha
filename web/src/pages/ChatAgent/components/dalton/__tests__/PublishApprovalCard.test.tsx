@@ -293,7 +293,7 @@ describe('PublishApprovalCard', () => {
       'Batch 3 (colloquial figure scan) labeling failed'
     );
     fireEvent.click(screen.getByTestId('publish-incidental-toggle'));
-    expect(screen.getByTestId('publish-incidental-list')).toHaveTextContent('[未给类别]');
+    expect(screen.getByTestId('publish-incidental-list')).toHaveTextContent('[Uncategorized]');
     expect(screen.getByTestId('publish-incidental-list')).not.toHaveTextContent('[增速]');
     expect(
       screen.getByText('Official Research Publication Approval (PM Final Review)')
