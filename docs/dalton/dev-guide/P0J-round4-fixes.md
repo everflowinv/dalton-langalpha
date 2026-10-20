@@ -488,6 +488,8 @@ PR #7 的描述有两处和 diff 不符："回退到 CLI 网关"、"修了 open_
 | 10 | `role_policy` 读取哪份配置（PR #16、#17 审查） | 复用上游的 `load_yaml_config`（底座加 `APP_ENV` 覆盖层，并尊重 `PTC_CONFIG_FILE`），读取后端实际加载的配置。放在 J3 里做，J1 的 G2 依赖它 |
 | 11 | PR #16 把活库导出的内部研究资料（`legacy_migrated_theses.json`）推到了 GitHub 分支上 | 关闭 PR #16，从新分支重新提交，新分支的任何提交里都不能出现这个文件。GitHub 保留旧 PR 的提交，接受这个残留（私有仓库，内容是 owner 自己的研究），不联系 GitHub 清理 |
 | 12 | 合并顺序 | **J3 → J2 → J1。** J2、J1 在前一个合并之后变基，再复审 |
+| 13 | 版本门禁管到什么程度（PR #20 审查） | **门禁只管 `--record`。** 不加 `--record` 是"调试运行"：可以在没合并、不干净的分支上跑，不写任何文件，输出开头打印 `DEBUG RUN — NOT EVIDENCE`。加了 `--record` 才检查"工作区干净、已合并（只认 `origin/dalton/main`）、后端版本一致"，不满足就拒绝运行，先过门禁再写文件。PR 里的"真实运行验证"必须是已提交代码的调试运行输出。§1.3 第 3 条按此理解 |
+| 14 | 工作区归属检查查不到时放行（PR #20 审查时发现，`dalton/main` 上原来就有） | `src/dalton/app/router.py` 的 `_verify_workspace_access` 在查不到工作区或数据库出错时放行，违反原则 1（权限必须写死、失败即拒绝）。**单独开一个小修复 `fix/P0J.J3b-workspace-access-fail-closed`：** 查不到返回 404，数据库出错返回 503，不再放行；补测试。可以和 J2、J1 并行，合并顺序不限 |
 
 ---
 
