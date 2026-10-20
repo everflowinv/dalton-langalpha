@@ -78,7 +78,7 @@ def _require_dalton_enabled() -> None:
 def _require_pm_user(user_id: str) -> None:
     _require_dalton_enabled()
     settings = get_dalton_settings()
-    if user_id not in settings.knowledge.pm_user_ids:
+    if user_id not in settings.pm_user_ids:
         raise HTTPException(
             status_code=403, detail="Only PM users may perform this action"
         )
@@ -146,7 +146,7 @@ async def get_openclaw_health_endpoint(
     user_id: CurrentUserId,
 ) -> dict[str, Any]:
     _require_dalton_enabled()
-    return await probe_health()
+    return await probe_health(user_id=user_id)
 
 
 # ---------------------------------------------------------------------------

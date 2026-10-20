@@ -1,5 +1,6 @@
 #!/bin/bash
 # Dalton Docker entrypoint: wait for database, run upstream + Dalton migrations, then exec CMD.
+# Git is pre-installed and build SHA/dirty are baked at image build time in scripts/dalton/Dockerfile.dalton.
 set -e
 
 DB_HOST="${DB_HOST:-localhost}"

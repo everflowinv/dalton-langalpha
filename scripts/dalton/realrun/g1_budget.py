@@ -42,14 +42,17 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.dalton.realrun._common import (
+from scripts.dalton.realrun._common import (  # noqa: E402
     RealRunHttpClient,
     build_evidence_envelope,
+    default_shanghai_date,
     new_test_user_id,
     now_utc_iso,
+    preflight_realrun_script,
+    require_internal_service_token,
     write_evidence_and_summary,
 )
-from scripts.dalton.realrun.journal_dump import build_dsn_from_env
+from scripts.dalton.realrun.journal_dump import build_dsn_from_env  # noqa: E402
 
 
 def _resolve_deepseek_key() -> str:
@@ -152,192 +155,162 @@ def _fetch_publish_requests_for_thread(thread_id: str) -> list[dict[str, Any]]:
             return out
 
 
+def _is_allowed_auth_header_origin(
+    request_url: str,
+    *,
+    frontend_url: str,
+    backend_url: str = "http://127.0.0.1:8000",
+) -> bool:
+    """Return True only when `request_url` targets the configured frontend or backend origin
+    (including localhost <-> 127.0.0.1 equivalence on the same port). External requests
+    (such as `https://fonts.googleapis.com`) must never receive `X-Service-Token` (Hard Rule 9).
+    """
+    from urllib.parse import urlsplit
+
+    req = urlsplit(request_url)
+    if req.scheme not in ("http", "https") or not req.hostname:
+        return False
+
+    allowed_origins: set[tuple[str, str, int | None]] = set()
+    for base in (frontend_url, backend_url):
+        parsed = urlsplit(base)
+        if not parsed.scheme or not parsed.hostname:
+            continue
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        allowed_origins.add((parsed.scheme, parsed.hostname.lower(), port))
+        if parsed.hostname.lower() in ("localhost", "127.0.0.1"):
+            allowed_origins.add((parsed.scheme, "localhost", port))
+            allowed_origins.add((parsed.scheme, "127.0.0.1", port))
+
+    req_port = req.port or (443 if req.scheme == "https" else 80)
+    return (req.scheme, req.hostname.lower(), req_port) in allowed_origins
+
+
+def _handle_scoped_auth_route(
+    route: Any,
+    request: Any,
+    *,
+    frontend_url: str,
+    backend_url: str = "http://127.0.0.1:8000",
+    user_id: str,
+    svc_token: str,
+) -> None:
+    """Playwright route handler that injects `X-User-Id` and `X-Service-Token` only on
+    requests targeting `frontend_url` or `backend_url`, forwarding all other requests untouched.
+    """
+    if _is_allowed_auth_header_origin(
+        request.url, frontend_url=frontend_url, backend_url=backend_url
+    ):
+        headers = dict(request.headers)
+        headers["X-User-Id"] = user_id
+        headers["X-Service-Token"] = svc_token
+        route.continue_(headers=headers)
+    else:
+        route.continue_()
+
+
 def _capture_rejection_banner_screenshot(
     *,
     output_path: Path,
-    rejected_status: int,
-    rejected_body: dict[str, Any],
-    budget_today: dict[str, Any],
-) -> dict[str, Any]:
-    """Render the frontend rejection alert banner + DaltonBudgetCard state via headless Chrome and save PNG."""
+    frontend_url: str,
+    backend_url: str = "http://127.0.0.1:8000",
+    user_id: str,
+    workspace_id: str,
+    thread_id: str,
+) -> tuple[dict[str, Any], bytes]:
+    """Open the live frontend application (`frontend_url`) in headless Chromium as `user_id`,
+    trigger the budget-exhausted chat submission on the live page so the real UI renders the
+    rejection alert banner, and return `(metadata, png_bytes)` without writing to disk before the gate.
+    """
     from playwright.sync_api import sync_playwright
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    detail = rejected_body.get("detail") if isinstance(rejected_body, dict) else {}
-    if not isinstance(detail, dict):
-        detail = {"message": str(rejected_body)}
+    svc_token = require_internal_service_token()
+    target_url = f"{frontend_url.rstrip('/')}/chat/t/{thread_id}"
 
-    msg = str(detail.get("message") or "")
-    used_credits = detail.get("used_credits")
-    credit_limit = detail.get("credit_limit")
-    remaining_credits = detail.get("remaining_credits")
-    retry_after = detail.get("retry_after")
-    cap_usd = float(budget_today.get("cap_usd") or 0.0)
-    spent_usd = float(budget_today.get("spent_usd") or 0.0)
-    settled_usd = float(budget_today.get("settled_usd") or 0.0)
-    journal_cash_usd = float(budget_today.get("journal_cash_usd") or 0.0)
-    notional_usd = float(budget_today.get("subscription_notional_usd") or 0.0)
-
-    html = f"""<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8" />
-<title>Dalton Daily Budget Exhausted — HTTP {rejected_status}</title>
-<style>
-  :root {{
-    --color-bg-page: #0b0f17;
-    --color-bg-card: #111827;
-    --color-border-default: #1f2937;
-    --color-text-primary: #f9fafb;
-    --color-text-secondary: #d1d5db;
-    --color-text-tertiary: #9ca3af;
-    --color-loss: #ef4444;
-  }}
-  body {{
-    margin: 0;
-    padding: 32px;
-    background: var(--color-bg-page);
-    color: var(--color-text-primary);
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-  }}
-  .container {{
-    max-width: 840px;
-    margin: 0 auto;
-    display: flex;
-    flex-direction: column;
-    gap: 20px;
-  }}
-  .card {{
-    background: var(--color-bg-card);
-    border: 1px solid var(--color-border-default);
-    border-radius: 10px;
-    padding: 20px;
-  }}
-  .banner {{
-    background: rgba(239, 68, 68, 0.12);
-    border: 1px solid rgba(239, 68, 68, 0.45);
-    border-radius: 10px;
-    padding: 18px 20px;
-    display: flex;
-    flex-direction: column;
-    gap: 10px;
-  }}
-  .banner-title {{
-    color: #fca5a5;
-    font-weight: 600;
-    font-size: 15px;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-  }}
-  .banner-msg {{
-    color: #fee2e2;
-    font-size: 14px;
-    line-height: 1.55;
-  }}
-  .meta {{
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-    font-size: 12px;
-    color: var(--color-text-tertiary);
-    display: flex;
-    flex-wrap: wrap;
-    gap: 16px;
-  }}
-  .bar-bg {{
-    width: 100%;
-    height: 10px;
-    background: #1f2937;
-    border-radius: 999px;
-    overflow: hidden;
-    margin: 10px 0;
-  }}
-  .bar-fill {{
-    width: 100%;
-    height: 100%;
-    background: var(--color-loss);
-  }}
-</style>
-</head>
-<body>
-  <div class="container">
-    <div class="card" data-testid="dalton-budget-card">
-      <div style="display:flex;justify-content:space-between;align-items:center;">
-        <span style="font-weight:600;font-size:15px;">Dalton 本地日美元预算</span>
-        <span class="meta">{budget_today.get("day")} ({budget_today.get("timezone")})</span>
-      </div>
-      <div style="display:flex;justify-content:space-between;font-size:13px;margin-top:12px;">
-        <span>今日已用 <strong>${spent_usd:.6f}</strong> / 日额度 <strong>${cap_usd:.4f}</strong></span>
-        <span class="meta">剩余 $0.0000</span>
-      </div>
-      <div class="bar-bg"><div class="bar-fill"></div></div>
-      <div class="meta">
-        <span>已结算(子智能体/对话)：${settled_usd:.6f}</span>
-        <span>日志直调现金(探测等)：${journal_cash_usd:.6f}</span>
-        <span>订阅名义用量（不计入现金额度）：${notional_usd:.6f}</span>
-      </div>
-      <div style="font-size:12px;color:#9ca3af;margin-top:8px;">
-        注：设置页填写的现金类 BYOK Key 同样计入本地日美元现金额度（L24）
-      </div>
-    </div>
-
-    <div class="banner" role="alert" data-testid="chat-rate-limit-banner">
-      <div class="banner-title">
-        <span>对话请求被拒绝 — HTTP {rejected_status} ({detail.get("type")})</span>
-        <span class="meta">Retry-After: {retry_after}s</span>
-      </div>
-      <div class="banner-msg">{msg}</div>
-      <div class="meta">
-        <span>type: {detail.get("type")}</span>
-        <span>used_credits: {used_credits}</span>
-        <span>credit_limit: {credit_limit}</span>
-        <span>remaining_credits: {remaining_credits}</span>
-      </div>
-    </div>
-  </div>
-</body>
-</html>
-"""
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, channel="chrome")
+        browser = p.chromium.launch(headless=True)
         try:
-            page = browser.new_page(viewport={"width": 960, "height": 420})
-            page.set_content(html, wait_until="load")
-            page.screenshot(path=str(output_path), full_page=True)
+            context = browser.new_context(
+                viewport={"width": 1280, "height": 800},
+            )
+            page = context.new_page()
+            page.route(
+                "**/*",
+                lambda route, request: _handle_scoped_auth_route(
+                    route,
+                    request,
+                    frontend_url=frontend_url,
+                    backend_url=backend_url,
+                    user_id=user_id,
+                    svc_token=svc_token,
+                ),
+            )
+            resp = page.goto(target_url, wait_until="networkidle", timeout=30000)
+            assert resp is not None and resp.status < 400, (
+                f"Failed to load frontend chat route {target_url}: status={getattr(resp, 'status', None)}"
+            )
+
+            textarea = page.locator("textarea").first
+            textarea.wait_for(state="visible", timeout=15000)
+            textarea.fill("继续下一轮分析（日现金额度耗尽验证）")
+            textarea.press("Enter")
+
+            banner = page.get_by_text("今日预算").first
+            banner.wait_for(state="visible", timeout=15000)
+            assert banner.is_visible(), (
+                "Expected budget-exhausted banner ('今日预算') to be visible before taking screenshot"
+            )
+
+            raw_bytes = page.screenshot(full_page=True)
         finally:
             browser.close()
 
-    raw_bytes = output_path.read_bytes()
-    return {
-        "screenshot_path": str(output_path.relative_to(REPO_ROOT)),
-        "bytes": len(raw_bytes),
-        "sha256": hashlib.sha256(raw_bytes).hexdigest(),
-    }
+    return (
+        {
+            "screenshot_path": str(output_path.relative_to(REPO_ROOT)),
+            "frontend_url": target_url,
+            "bytes": len(raw_bytes),
+            "sha256": hashlib.sha256(raw_bytes).hexdigest(),
+        },
+        raw_bytes,
+    )
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="G1 Real-Run Evidence Generator (P0I §7 G1)")
     parser.add_argument("--backend", default="http://127.0.0.1:8000")
+    parser.add_argument("--frontend", default="http://localhost:5173")
     parser.add_argument("--cap-usd", type=float, default=0.30)
-    parser.add_argument("--date", default="20261019")
+    parser.add_argument("--date", default=default_shanghai_date())
+    parser.add_argument("--record", action="store_true", help="Write evidence JSON and summary under var/dalton/")
     args = parser.parse_args()
 
+    preflight_realrun_script("G1", record=args.record, backend=args.backend)
+
     started_at = now_utc_iso()
-    test_user_id = new_test_user_id("g1")
+    base_user_id = new_test_user_id("g1")
+    user_a = f"{base_user_id}-a"
+    user_b = f"{base_user_id}-b"
+    test_user_id = f"{user_a},{user_b}"
     cap_usd = float(args.cap_usd)
+    user_b_cap_usd = 5.00
     ds_key = _resolve_deepseek_key()
 
     synthetic: list[dict[str, Any]] = [
         {
             "kind": "settings_api_budget",
             "entry_point": "PUT /api/v1/dalton/budget",
-            "description": f"通过设置接口将该测试用户的日现金额度设为 ${cap_usd:.4f}，用于验证真实花费触顶后下一轮对话被 HTTP 429 拒绝。",
+            "description": (
+                f"通过设置接口为预算测试用户 A ({user_a}) 设低日额度 ${cap_usd:.4f}、为用户 B ({user_b}) 设正常日额度 ${user_b_cap_usd:.2f}，"
+                "用于验证 A 真实花费触顶被 HTTP 429 拒绝的同时 B 正常调用不受影响。"
+            ),
         }
     ]
 
-    with RealRunHttpClient(base_url=args.backend, user_id=test_user_id, timeout_s=300.0) as client:
+    with RealRunHttpClient(base_url=args.backend, user_id=user_a, timeout_s=300.0) as client:
         client.ensure_user()
 
-        # 1. Set low daily budget cap via Settings API
+        # 1. Set low daily budget cap via Settings API for user A
         st_b, budget_cfg = client.put(
             "/api/v1/dalton/budget",
             json_body={"daily_cap_usd": cap_usd, "default_task_cap_usd": 0.50},
@@ -427,7 +400,6 @@ def main() -> int:
 
         pub_requests = _fetch_publish_requests_for_thread(thread_id)
         if len(pub_requests) < 2:
-            # If the model only called publish_report once in that turn, send a follow-up turn to call it the second time
             st_rev2, rev2_events, rev2_err = client.stream_sse(
                 "POST",
                 f"/api/v1/threads/{thread_id}/messages",
@@ -462,7 +434,10 @@ def main() -> int:
         #    until daily settled cash spend reaches `cap_usd`, then next turn via `POST /api/v1/threads/{thread_id}/messages`
         #    is rejected with HTTP 429 (`dalton_daily_budget`).
         subagent_turns: list[dict[str, Any]] = []
-        for turn_idx in range(1, 6):
+        spend_deadline = time.monotonic() + 600.0
+        turn_idx = 0
+        reached_cap = False
+        while time.monotonic() < spend_deadline:
             _, cur_today = client.get("/api/v1/dalton/budget/today")
             cur_settled = (
                 float(cur_today.get("settled_usd") or 0.0)
@@ -470,8 +445,10 @@ def main() -> int:
                 + float(cur_today.get("unreserved_usage_usd") or 0.0)
             )
             if cur_settled >= cap_usd and float(cur_today.get("open_reserved_usd") or 0.0) == 0.0:
+                reached_cap = True
                 break
 
+            turn_idx += 1
             prev_settled_only = float(cur_today.get("settled_usd") or 0.0)
             subagent_prompt = (
                 f"请在本轮响应中同时并行调用 3 次 `Task` 工具（3 个并行子任务均使用 `subagent_type='general-purpose'`，分别命名为 `批次{turn_idx}-A`、`批次{turn_idx}-B`、`批次{turn_idx}-C`）。\n"
@@ -495,12 +472,10 @@ def main() -> int:
             )
             sub_summary = _extract_sse_summary(sub_events)
 
-            # Poll until all parallel background subagent tasks persist their conversation_usages rows
-            # (settled_usd > prev_settled_only and stabilized) AND any TASK_REPORT_BACK notification turn settles
-            # (open_reserved_usd == 0.0).
             after_turn_today = cur_today
-            deadline = time.time() + 120.0
-            while time.time() < deadline:
+            settle_deadline = time.monotonic() + 120.0
+            settled_confirmed = False
+            while time.monotonic() < settle_deadline:
                 time.sleep(2.0)
                 _, after_turn_today = client.get("/api/v1/dalton/budget/today")
                 new_settled_only = float(after_turn_today.get("settled_usd") or 0.0)
@@ -512,7 +487,13 @@ def main() -> int:
                     confirm_open = float(confirm_today.get("open_reserved_usd") or 0.0)
                     after_turn_today = confirm_today
                     if confirm_open == 0.0 and abs(confirm_settled - new_settled_only) < 1e-9:
+                        settled_confirmed = True
                         break
+
+            if not settled_confirmed:
+                raise TimeoutError(
+                    f"Timed out after 120s waiting for budget settlement after subagent turn {turn_idx}: {after_turn_today}"
+                )
 
             subagent_turns.append(
                 {
@@ -530,7 +511,13 @@ def main() -> int:
                 + float(after_turn_today.get("unreserved_usage_usd") or 0.0)
             )
             if settled_total >= cap_usd and float(after_turn_today.get("open_reserved_usd") or 0.0) == 0.0:
+                reached_cap = True
                 break
+
+        if not reached_cap:
+            raise TimeoutError(
+                f"Timed out after 600s waiting for settled cash spend to reach cap_usd={cap_usd} (turns={turn_idx})"
+            )
 
         _, budget_at_cap = client.get("/api/v1/dalton/budget/today")
         assert float(budget_at_cap.get("spent_usd") or 0.0) >= cap_usd, (
@@ -567,18 +554,66 @@ def main() -> int:
             / f"realrun-{args.date}"
             / "g1_budget_exhausted_banner.png"
         )
-        screenshot_info = _capture_rejection_banner_screenshot(
+        screenshot_info, screenshot_bytes = _capture_rejection_banner_screenshot(
             output_path=screenshot_path,
-            rejected_status=rejected_status,
-            rejected_body=rejected_body or {},
-            budget_today=budget_at_cap,
+            frontend_url=args.frontend,
+            backend_url=args.backend,
+            user_id=user_a,
+            workspace_id=workspace_id,
+            thread_id=thread_id,
+        )
+
+    # 7. Two-user budget isolation: while user_a is rejected with HTTP 429, user_b (normal daily cap)
+    #    executes a normal conversation turn and probe and succeeds with HTTP 200 (P0J §5 G1).
+    with RealRunHttpClient(base_url=args.backend, user_id=user_b, timeout_s=180.0) as client_b:
+        client_b.ensure_user()
+        st_b_cfg, b_cfg = client_b.put(
+            "/api/v1/dalton/budget",
+            json_body={"daily_cap_usd": user_b_cap_usd, "default_task_cap_usd": 1.00},
+        )
+        assert st_b_cfg == 200, f"user_b PUT /api/v1/dalton/budget failed: {st_b_cfg} {b_cfg}"
+        st_b_k, _ = client_b.put(
+            "/api/v1/users/me/api-keys",
+            json_body={"byok_enabled": True, "api_keys": {"deepseek": ds_key}},
+        )
+        assert st_b_k == 200
+        st_b_ws, b_ws = client_b.post(
+            "/api/v1/workspaces",
+            json_body={"name": "GOOGL-B", "description": "G1 user_b isolation workspace"},
+        )
+        assert st_b_ws in (200, 201) and b_ws.get("workspace_id")
+        ws_b_id = str(b_ws["workspace_id"])
+        st_b_turn, b_events, b_err = client_b.stream_sse(
+            "POST",
+            "/api/v1/threads/messages",
+            json_body={
+                "workspace_id": ws_b_id,
+                "llm_model": "claude-sonnet-5-5-low-oauth",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "不要调用任何工具，仅用一句话确认你收到了本条消息。",
+                    }
+                ],
+            },
+            max_events=500,
+        )
+        assert st_b_turn == 200 and b_err is None, (
+            f"Expected user_b conversation turn to succeed with 200 while user_a is at 429, got {st_b_turn}: {b_err}"
+        )
+        b_turn_summary = _extract_sse_summary(b_events)
+        _, b_today = client_b.get("/api/v1/dalton/budget/today")
+        assert float(b_today.get("remaining_usd") or 0.0) > 4.5, (
+            f"Expected user_b remaining_usd > 4.5, got {b_today}"
         )
 
     ended_at = now_utc_iso()
     script_cmd = f"scripts/dalton/realrun/g1_budget.py --cap-usd {cap_usd}"
 
     payload = {
+        "test_user_ids": [user_a, user_b],
         "scenario_1_low_cap_subagent_and_429_rejection": {
+            "user_id": user_a,
             "thread_id": thread_id,
             "workspace_id": workspace_id,
             "lead_model": "claude-sonnet-5-5-low-oauth",
@@ -598,6 +633,7 @@ def main() -> int:
             "frontend_rejection_screenshot": screenshot_info,
         },
         "scenario_2_settings_byok_cash_key_counted": {
+            "user_id": user_a,
             "settings_endpoint": "PUT /api/v1/users/me/api-keys",
             "byok_provider": "deepseek",
             "spent_usd_before_probe": today_before_probe.get("spent_usd"),
@@ -607,6 +643,7 @@ def main() -> int:
             "by_provider_after_probe": today_after_probe.get("by_provider"),
         },
         "scenario_3_review_second_call_cache_hit": {
+            "user_id": user_a,
             "draft_path": "drafts/g1_review_cache.md",
             "publish_requests": [
                 {
@@ -620,6 +657,18 @@ def main() -> int:
                 }
                 for pr in pub_requests[:2]
             ],
+        },
+        "scenario_4_two_user_budget_isolation": {
+            "user_a": user_a,
+            "user_a_http_status": rejected_status,
+            "user_b": user_b,
+            "user_b_cap_usd": user_b_cap_usd,
+            "user_b_http_status": st_b_turn,
+            "user_b_thread_id": b_turn_summary.get("thread_id"),
+            "user_b_reply_preview": b_turn_summary.get("assistant_reply_preview"),
+            "user_b_budget_today": {
+                k: v for k, v in b_today.items() if k not in ("_raw_rows", "_decimals")
+            },
         },
     }
 
@@ -655,25 +704,32 @@ def main() -> int:
     assert deepseek_conv_rows, (
         f"Expected at least one conversation_usages row for deepseek-flash with tokens > 0, got {conv_usages}"
     )
+    combined_cash_usd = float(
+        ((envelope.get("journal") or {}).get("totals") or {}).get("combined_cash_usd") or 0.0
+    )
+    assert combined_cash_usd <= 0.50, (
+        f"Expected G1 total combined_cash_usd <= 0.50 USD, got ${combined_cash_usd:.6f}"
+    )
 
     json_path = REPO_ROOT / "var" / "dalton" / "trial-runs" / f"realrun-{args.date}" / "g1_budget.json"
     md_path = (
         REPO_ROOT
-        / "docs"
+        / "var"
         / "dalton"
-        / "dev-guide"
         / "trial-runs"
         / f"realrun-{args.date}"
         / "G1.md"
     )
 
     key_metrics = {
-        "日额度上限 (`cap_usd`)": f"${cap_usd:.4f}",
+        "测试用户 A / B": f"`{user_a}`（低日额度 ${cap_usd:.2f}） / `{user_b}`（正常日额度 ${user_b_cap_usd:.2f}）",
         "主模型 (`lead_model`)": "claude-sonnet-5-5-low-oauth（Claude 订阅，现金成本 $0）",
         "现金子智能体 (`subagent:general-purpose`)": f"deepseek-flash（会话用量记录数：{len(deepseek_conv_rows)}，总花费计入 settled_usd=${float(budget_at_cap.get('settled_usd') or 0.0):.6f}）",
         "设置页 BYOK 现金 Key (`PUT /api/v1/users/me/api-keys`)": f"deepseek 探测花费 ${float(probe_resp.get('cash_usd') or 0.0):.6f} 计入 GET /api/v1/dalton/budget/today",
-        "触顶时日累计现金花费 (`spent_usd`)": f"${float(budget_at_cap.get('spent_usd') or 0.0):.6f}（剩余额度 ${float(budget_at_cap.get('remaining_usd') or 0.0):.6f}）",
-        "下一轮对话拒绝 (`POST /api/v1/threads/{id}/messages`)": f"HTTP {rejected_status}，detail.type = '{detail.get('type')}'",
+        "用户 A 触顶时日累计现金花费 (`spent_usd`)": f"${float(budget_at_cap.get('spent_usd') or 0.0):.6f}（剩余额度 ${float(budget_at_cap.get('remaining_usd') or 0.0):.6f}）",
+        "本轮总现金花费 (`combined_cash_usd <= $0.50`)": f"${combined_cash_usd:.6f}",
+        "用户 A 下一轮对话拒绝 (`POST /api/v1/threads/{id}/messages`)": f"HTTP {rejected_status}，detail.type = '{detail.get('type')}'",
+        "用户 B 并行对话请求 (`POST /api/v1/threads/messages`)": f"HTTP {st_b_turn}（正常通过，剩余额度 ${float(b_today.get('remaining_usd') or 0.0):.4f}）",
         "前端拒绝提示截图": screenshot_info["screenshot_path"],
         "前端拒绝提示截图 `sha256`": screenshot_info["sha256"],
         "审稿第二次命中缓存 (`publish.review`)": (
@@ -683,21 +739,26 @@ def main() -> int:
     }
 
     notes = [
-        f"被拒那一轮（`POST /api/v1/threads/{thread_id}/messages`）完整返回体：`{json.dumps(rejected_body, ensure_ascii=False)}`",
+        f"用户 A 被拒那一轮（`POST /api/v1/threads/{thread_id}/messages`）完整返回体：`{json.dumps(rejected_body, ensure_ascii=False)}`",
+        f"用户 B 在用户 A 被 429 拒绝的同时正常发起对话（`thread_id={b_turn_summary.get('thread_id')}`），返回 `HTTP {st_b_turn}`，证明日预算闸门按 `user_id` 严格隔离。",
         f"前端拒绝提示横幅截图保存在 `{screenshot_info['screenshot_path']}`（`{screenshot_info['bytes']}` bytes，`sha256={screenshot_info['sha256']}`）。",
     ]
 
-    _, _, sha = write_evidence_and_summary(
+    written_raw, written_md, sha = write_evidence_and_summary(
         family_code="G1",
-        title="预算闸门、现金子智能体花费、BYOK 现金计入与审稿缓存真实运行证据（P0I §7 G1）",
+        title="预算闸门、现金子智能体花费、BYOK 现金计入与双用户隔离真实运行证据（P0J §5 G1）",
         raw_json_path=json_path,
         summary_md_path=md_path,
         envelope=envelope,
         key_findings=list(key_metrics.items()),
         notes=notes,
+        record=args.record,
     )
-    print(f"G1 evidence written: {json_path} (sha256={sha})")
-    print(f"G1 summary written:  {md_path}")
+    if args.record:
+        screenshot_path.parent.mkdir(parents=True, exist_ok=True)
+        screenshot_path.write_bytes(screenshot_bytes)
+    print(f"G1 evidence (record={args.record}): {written_raw} (sha256={sha})")
+    print(f"G1 summary  (record={args.record}): {written_md}")
     return 0
 
 

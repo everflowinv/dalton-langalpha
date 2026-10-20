@@ -1,7 +1,5 @@
 # Dalton on LangAlpha behavioral defaults (P0.1, P0.8, PK §0.5, P0N.1, P0N.5, P0G)
 enabled: true
-pm_user_ids:
-  - "local-dev-user"
 timezone: "Asia/Shanghai"
 
 models:

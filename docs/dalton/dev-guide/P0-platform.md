@@ -174,6 +174,8 @@ TAVILY_API_KEY=<owner 提供>          # agent_config.yaml 的 search_api 默认
 DALTON_RESEARCHDATA_URL=<见数据篇 P0-D.1；值不入库>
 DALTON_BROKER_TOKEN=<broker v2 首次启动时生成在它的状态目录里，owner 复制过来；只能调模型，不是网关 operator 令牌>
 DALTON_BUDGET_GATE=1                 # 本地预算开关，见 P0.8
+REDIS_PASSWORD=redis                 # 与 Redis 容器 --requirepass 一致
+REDIS_URL=redis://:redis@localhost:6379/0  # 宿主机模式（uv run python server.py）必填带密码 URL，防止 [RB_WAKE] Authentication required 导致 /threads/messages 503；Docker 容器内由 docker-compose.dalton.yml 覆盖为 @redis:6379/0
 # 下面这个只给"网关 agent 对照组"（P0.5 --target gateway）用，主路径不需要：
 # OPENCLAW_GATEWAY_TOKEN=<owner 从 openclaw.json 的 gateway.auth.token 复制；我们的脚本绝不读这个字段>
 ```
@@ -315,6 +317,15 @@ du -sh "$COLIMA_HOME"                                               # VM 磁盘�
 ### 风险与注意
 
 - 后端容器里只有 `DALTON_BROKER_TOKEN`（只能调模型）。各家供应商的 apiKey 和 OAuth 凭证都留在宿主机的 OpenClaw 进程里，不进容器，也不进沙箱。
+- **宿主机与容器共跑时的 Redis 唤醒监听池与对话传输层 503 根因（`REDIS_URL` 说明，P0J §1.4）：**
+  - **审查人实例缺失的变量：** 审查人当时那台实例的 `.env`（备份于 `.env.bak-20261019`）已配置 `REDIS_PASSWORD=redis`，**缺失的变量是 `REDIS_URL`**。
+  - **为什么需要密码及连接串解析路径：** `docker-compose.yml:35` 启动 `redis` 容器时使用 `redis-server --requirepass ${REDIS_PASSWORD:-redis}` 开启了密码鉴权。后端在宿主机进程启动时，`RedisCacheClient.__init__`（`src/utils/cache/redis_cache.py:125-129`）通过 `get_nested_config('redis.url') or os.getenv("REDIS_URL", "redis://localhost:6379/0")` 读取 `config.yaml` 中的 `redis.url: "${REDIS_URL:-redis://localhost:6379/0}"`；因 `.env` 缺失 `REDIS_URL`，`self.url` 解析为不带密码的 `redis://localhost:6379/0`。
+  - **启动握手失败与 `self.enabled = False`：** 后端启动执行 `src/server/app/setup.py:259-268` 的 `await init_cache()` 时，`RedisCacheClient.connect()`（`src/utils/cache/redis_cache.py:154-196`）在第 `183` 行执行 `await self.client.ping()`，被要求密码的 Redis 拒绝并抛出 `AuthenticationError: Authentication required.`。`redis_cache.py:193-196` 捕获异常后打印 `Failed to connect to Redis: Authentication required.`，**将 `self.enabled` 置为 `False` 并重新抛出异常（`raise`）**；`src/server/app/setup.py:266-268` 捕获该异常后打印 `Server will continue without caching`，使后端在 `cache.enabled == False` 状态下继续运行。
+  - **为什么唤醒监听循环持续报错且 `POST /api/v1/threads/messages` 返回 HTTP 503：**
+    1. 唤醒监听循环 `WakeListener._run()`（`src/server/services/report_back/handoff/wake_listener.py:314-332`）调用 `await get_shared_pubsub_client()`（`src/server/services/workspace_status_pubsub.py:100-109`）；该函数在第 `107-108` 行检查 `if not cache.enabled or not cache.client: return None`，因 `cache.enabled` 已被置为 `False` 而返回 `None`，导致 `wake_listener.py:315-321` 抛出 `ConnectionError("pub/sub pool unavailable")` 并在第 `332` 行反复输出 `[RB_WAKE] Wake listener error, resubscribing: pub/sub pool unavailable`。
+    2. 对话接口 `POST /api/v1/threads/messages` 在 `_handle_send_message()`（`src/server/app/threads/messaging.py:552`）调用预检 `_assert_stream_transport_ready()`（`src/server/app/threads/messaging.py:61-104`）；第 `89-91` 行检查 `if cache.enabled and cache.client and await cache.client.ping(): return` 因 `cache.enabled` 为 `False` 不满足，直接在第 `94-104` 行抛出 `HTTPException(status_code=503, detail={"code": "transport_unavailable", "message": "The event-stream transport is temporarily unreachable; retry shortly."})`（同时若走到底层事件流写入 `RedisCacheClient.pipelined_event_buffer`，`src/utils/cache/redis_cache.py:583-586` 也会因 `if not self.enabled or not self.client:` 抛出 `EventBufferUnavailableError`，经 `src/utils/cache/stream_append.py:222-225` 转为 `StreamAppendError`）。
+  - **固定配置方式：** `.env` 中补齐宿主机使用的 `REDIS_URL=redis://:redis@localhost:6379/0`，并在 `docker-compose.dalton.yml:13-14` 中为 `backend` 容器显式覆盖 `REDIS_URL: "redis://:${REDIS_PASSWORD:-redis}@redis:6379/0"`（容器内访问 `redis` 服务名，宿主机访问 `localhost`），同时配置 `INTERNAL_SERVICE_TOKEN` 与 `DALTON_PM_USER_IDS=local-dev-user,realrun-pm-a`。
+  - **实测验证结果：** 见 PR #25 中 `scripts/dalton/pr_baseline.sh` 发布的评论（https://github.com/everflowinv/dalton-langalpha/pull/25）。
 - 如果 colima 下 `host.docker.internal` 访问不到只绑 loopback 的网关（broker v2 也挂在这个端口上，所以结论一样）：
   - 先按 P0-D.0 的排查顺序处理（`host.lima.internal` / `192.168.5.2`、daemon 的 `host-gateway-ip`）；
   - 备选一：后端改在宿主机跑（`make setup-db` 起 PG/Redis，`make dev` 起后端，`make dev-web` 起前端）。这时 `{HOST_IP}` 自动解析为 `localhost`（`src/config/env.py:127`）。沙箱仍在 colima 里，仍要能访问宿主机桥；

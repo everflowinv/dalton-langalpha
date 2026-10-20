@@ -1,9 +1,17 @@
 services:
   backend:
+    build:
+      context: .
+      dockerfile: scripts/dalton/Dockerfile.dalton
+      args:
+        BUILD_GIT_SHA: ${BUILD_GIT_SHA:-}
+        BUILD_GIT_DIRTY: ${BUILD_GIT_DIRTY:-}
     entrypoint: ["/usr/bin/tini", "-s", "--", "/app/scripts/dalton/docker_entrypoint_dalton.sh"]
     command: ["uv", "run", "python", "server.py", "--host", "0.0.0.0", "--port", "8000", "--reload"]
     mem_limit: 2g
     memswap_limit: 2g
+    environment:
+      REDIS_URL: "redis://:${REDIS_PASSWORD:-redis}@redis:6379/0"
     volumes:
       - ./agent_config.dalton.yaml:/app/agent_config.dalton.yaml:ro
       - ./workflows:/app/workflows:ro

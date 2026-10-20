@@ -1,0 +1,106 @@
+{
+  "schema_version": 1,
+  "illustrative": true,
+  "description": "示意输入，用于验证镜头命令链路和锚点一致性，不是公司财报数据",
+  "companies": [
+    {
+      "slug": "baba",
+      "ticker": "BABA",
+      "period_end": "2026-06-30",
+      "financial_currency": "CNY",
+      "listing_currency": "USD",
+      "adr_ratio": 8,
+      "netcash": {
+        "cash": "195400",
+        "restricted_cash": "41200",
+        "time_deposits": "178600",
+        "st_investments": "182300",
+        "st_debt": "18500",
+        "cur_lt_debt": "14200",
+        "lt_debt": "136000",
+        "lease_liabilities": "19800"
+      },
+      "return_score": {
+        "ttm_div": "1.02",
+        "ttm_buyback": "5.51",
+        "true_return_share": "0.82",
+        "annual": "4.10,5.80,6.53",
+        "fwd_total": "6.20",
+        "credibility": "90",
+        "credibility_reason": "示意参数（用于验证 return_score.py 命令链路，非真实财报或预测数据）"
+      },
+      "earnings_quality": {
+        "ni": "142800",
+        "cfo": "180340",
+        "cfi": "-62400",
+        "beginning_assets": "1765000",
+        "ending_assets": "2180000"
+      }
+    },
+    {
+      "slug": "0700hk",
+      "ticker": "0700.HK",
+      "period_end": "2026-06-30",
+      "financial_currency": "CNY",
+      "listing_currency": "HKD",
+      "adr_ratio": 1,
+      "netcash": {
+        "cash": "162800",
+        "restricted_cash": "3400",
+        "time_deposits": "198500",
+        "st_investments": "47200",
+        "st_debt": "42100",
+        "cur_lt_debt": "26800",
+        "lt_debt": "270100",
+        "lease_liabilities": "21400"
+      },
+      "return_score": {
+        "ttm_div": "0.88",
+        "ttm_buyback": "2.86",
+        "true_return_share": "0.85",
+        "annual": "2.40,3.50,3.74",
+        "fwd_total": "3.60",
+        "credibility": "90",
+        "credibility_reason": "示意参数（用于验证 return_score.py 命令链路，非真实财报或预测数据）"
+      },
+      "earnings_quality": {
+        "ni": "196400",
+        "cfo": "261600",
+        "cfi": "-94200",
+        "beginning_assets": "1580000",
+        "ending_assets": "1760000"
+      }
+    },
+    {
+      "slug": "meta",
+      "ticker": "META",
+      "period_end": "2026-06-30",
+      "financial_currency": "USD",
+      "listing_currency": "USD",
+      "adr_ratio": 1,
+      "netcash": {
+        "cash": "45300",
+        "restricted_cash": "120",
+        "st_investments": "32689",
+        "lt_debt": "28880",
+        "lease_liabilities": "19450"
+      },
+      "return_score": {
+        "ttm_div": "0.31",
+        "ttm_buyback": "1.84",
+        "true_return_share": "0.68",
+        "annual": "1.95,2.40,2.15",
+        "fwd_total": "2.10",
+        "credibility": "90",
+        "credibility_reason": "示意参数（用于验证 return_score.py 命令链路，非真实财报或预测数据）"
+      },
+      "earnings_quality": {
+        "ni": "64200",
+        "cfo": "94020",
+        "cfi": "-48500",
+        "beginning_assets": "245000",
+        "ending_assets": "275400"
+      }
+    }
+  ]
+}
