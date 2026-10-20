@@ -63,8 +63,7 @@ BRANCH_NAME="$(git rev-parse --abbrev-ref HEAD)"
 SUITE_START_UTC="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 
 if [[ -z "$OUTPUT_FILE" ]]; then
-  mkdir -p "$REPO_ROOT/var/dalton"
-  OUTPUT_FILE="$REPO_ROOT/var/dalton/pr_baseline_${HEAD_SHORT}.md"
+  OUTPUT_FILE="/tmp/pr_baseline_${HEAD_SHORT}.md"
 else
   mkdir -p "$(dirname "$OUTPUT_FILE")"
 fi
@@ -145,28 +144,30 @@ run_and_record \
 # J1 debug runs (when not --baseline-only)
 if [[ "$BASELINE_ONLY" -eq 0 ]]; then
   run_and_record \
-    "J1 Debug 1/6: Live /api/v1/dalton/openclaw/health Probe (realrun-pm-a & realrun-user-b)" \
+    "J1 Debug 1/5: Live /api/v1/dalton/openclaw/health Probe (realrun-pm-a & realrun-user-b)" \
     "uv run python -c 'import json, os, httpx; from dotenv import load_dotenv; load_dotenv(\".env\"); tok = os.environ[\"INTERNAL_SERVICE_TOKEN\"]; c = httpx.Client(base_url=\"http://127.0.0.1:8000\", timeout=15.0, trust_env=False); print(\"=== realrun-pm-a ===\"); print(json.dumps(c.get(\"/api/v1/dalton/openclaw/health\", headers={\"X-User-Id\": \"realrun-pm-a\", \"X-Service-Token\": tok}).json(), indent=2, ensure_ascii=False)); print(\"=== realrun-user-b ===\"); print(json.dumps(c.get(\"/api/v1/dalton/openclaw/health\", headers={\"X-User-Id\": \"realrun-user-b\", \"X-Service-Token\": tok}).json(), indent=2, ensure_ascii=False))'"
 
   run_and_record \
-    "J1 Debug 2/6: Pre-flight Environment Check (check_env.py)" \
+    "J1 Debug 2/5: Pre-flight Environment Check (check_env.py)" \
     "uv run python scripts/dalton/realrun/check_env.py"
 
   run_and_record \
-    "J1 Debug 3/6: G2 Startup Fail-Fast Check (g2_providers.py --only-startup-check)" \
+    "J1 Debug 3/5: G2 Startup Fail-Fast Check (g2_providers.py --only-startup-check)" \
     "uv run python scripts/dalton/realrun/g2_providers.py --only-startup-check"
 
   run_and_record \
-    "J1 Debug 4/6: G3 Live Migrated Thesis Version Check (g3_publish.py --only-migrated-check)" \
+    "J1 Debug 4/5: G3 Live Migrated Thesis Version Check (g3_publish.py --only-migrated-check)" \
     "uv run python scripts/dalton/realrun/g3_publish.py --only-migrated-check"
 
   run_and_record \
-    "J1 Debug 5/6: G6 Financial Lenses Debug Run (g6_lenses.py)" \
+    "J1 Debug 5/5: G6 Financial Lenses Debug Run (g6_lenses.py)" \
     "uv run python scripts/dalton/realrun/g6_lenses.py"
+fi
 
+if [[ -n "$PR_NUMBER" ]]; then
   run_and_record \
-    "J1 Debug 6/6: Report Claims Strict Check (P0-platform.md)" \
-    "uv run python scripts/dalton/check_report_claims.py --strict docs/dalton/dev-guide/P0-platform.md"
+    "PR Description Claim Check (check_report_claims.py --strict on PR #${PR_NUMBER})" \
+    "tmp_pr_md=\$(mktemp /tmp/pr_${PR_NUMBER}_body_XXXXXX.md) && trap 'rm -f \"\$tmp_pr_md\"' EXIT && gh pr view ${PR_NUMBER} --json body --jq .body > \"\$tmp_pr_md\" && uv run python scripts/dalton/check_report_claims.py --strict \"\$tmp_pr_md\""
 fi
 
 SUITE_END_UTC="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"

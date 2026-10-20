@@ -330,7 +330,7 @@ du -sh "$COLIMA_HOME"                                               # VM 磁盘�
       ```json
       {
         "status": "FAIL",
-        "model": "ocb-openai-gpt-6-luna",
+        "model": "antigravity/gemini-3-flash-preview",
         "http_status": 503,
         "sse_events_count": 0,
         "conversation_usages_count": 0,
@@ -347,9 +347,9 @@ du -sh "$COLIMA_HOME"                                               # VM 磁盘�
       ```json
       {
         "status": "PASS",
-        "model": "ocb-openai-gpt-6-luna",
+        "model": "antigravity/gemini-3-flash-preview",
         "http_status": 200,
-        "sse_events_count": 12,
+        "sse_events_count": 9,
         "conversation_usages_count": 1,
         "user_id_verified": true,
         "error": null
