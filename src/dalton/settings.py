@@ -36,7 +36,7 @@ class DaltonModelsConfig(BaseModel):
     broker: DaltonBrokerModelsConfig = Field(default_factory=DaltonBrokerModelsConfig)
     disabled_providers: list[str] = Field(default_factory=list)
     assist_model: str = "gemini-3.8-flash-low-oauth"
-    assist_fallback_model: str = "deepseek-flash"
+    assist_fallback_model: str | list[str] = Field(default_factory=list)
 
 
 class DaltonBudgetDefaults(BaseModel):
@@ -173,6 +173,19 @@ def get_disabled_providers() -> set[str]:
     if env_raw is not None:
         return {p.strip() for p in env_raw.split(",") if p.strip()}
     return {p.strip() for p in get_dalton_config().models.disabled_providers if p.strip()}
+
+
+def get_assist_fallback_models() -> list[str]:
+    """Return configured assist fallback model(s) from env or `dalton.yaml` `models.assist_fallback_model` (P0J.J2)."""
+    env_raw = os.getenv("DALTON_ASSIST_FALLBACK_MODEL")
+    if env_raw is not None:
+        return [m.strip() for m in env_raw.split(",") if m.strip()]
+    raw = get_dalton_config().models.assist_fallback_model
+    if isinstance(raw, str):
+        return [m.strip() for m in raw.split(",") if m.strip()]
+    if isinstance(raw, list):
+        return [str(m).strip() for m in raw if str(m).strip()]
+    return []
 
 
 def log_dalton_startup_warnings() -> None:

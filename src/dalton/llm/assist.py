@@ -24,7 +24,7 @@ import yaml
 from src.config.env import LOCAL_DEV_USER_ID
 from src.dalton.database.provider_events import sanitize_error_text
 from src.dalton.llm.complete import dalton_complete
-from src.dalton.settings import DALTON_YAML_PATH, REPO_ROOT
+from src.dalton.settings import DALTON_YAML_PATH, REPO_ROOT, get_assist_fallback_models
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +111,29 @@ def resolve_assist_model(role: str = "assist", explicit_model: str | None = None
     return "deepseek-flash"
 
 
+def resolve_assist_fallback_models(role: str = "assist_fallback") -> list[str]:
+    """Resolve fallback model list for `assist_json` from `settings.get_assist_fallback_models()` (P0J.J2)."""
+    return [
+        _validate_assist_candidate(role, m)
+        for m in get_assist_fallback_models()
+        if m and m.strip()
+    ]
+
+
+def resolve_assist_fallback_model(role: str = "assist_fallback") -> str | None:
+    """Return the first configured assist fallback model, if any."""
+    models = resolve_assist_fallback_models(role=role)
+    return models[0] if models else None
+
+
+def _is_safe_to_fallback(comp: Any) -> bool:
+    """Return True only when `dalton_complete` failed safely without charge (`pre_send` or `4xx`)."""
+    if comp.ok or getattr(comp, "status", None) != "failed":
+        return False
+    ek = str(getattr(comp, "error_kind", None) or "").strip().lower()
+    return ek == "pre_send" or (ek.startswith("http_4") and ek != "http_429")
+
+
 def _extract_json_dict(raw_data: Any, raw_text: str | None) -> dict[str, Any]:
     """Parse a JSON object from `raw_data` or `raw_text`, stripping markdown code fences if present."""
     if isinstance(raw_data, dict):
@@ -195,12 +218,18 @@ async def assist_json(
             thread_id=thread_id,
             raise_on_error=False,
         )
-        if not comp.ok and model is None and comp.error_kind == "pre_send":
-            # Primary subscription assist model (e.g. gemini-3.8-flash-low-oauth) is not logged in;
-            # fall back to broker/cash assist_fallback_model (P0N.8 / L27).
-            for fb_cand in ("ocb-deepseek-deepseek-flash", "deepseek-flash"):
-                if fb_cand == resolved_model:
+        if model is None and _is_safe_to_fallback(comp):
+            primary_model = resolved_model
+            for fb_cand in resolve_assist_fallback_models():
+                if fb_cand == primary_model:
                     continue
+                logger.info(
+                    "[DaltonAssist] task=%s primary_model=%s failed (%s); switching to assist_fallback=%s",
+                    task,
+                    resolved_model,
+                    comp.error or comp.status,
+                    fb_cand,
+                )
                 comp_fb = await dalton_complete(
                     llm_service=llm_service,
                     user_id=user_id,
@@ -216,9 +245,9 @@ async def assist_json(
                     thread_id=thread_id,
                     raise_on_error=False,
                 )
-                if comp_fb.ok or comp_fb.error_kind != "pre_send":
-                    comp = comp_fb
-                    resolved_model = fb_cand
+                comp = comp_fb
+                resolved_model = fb_cand
+                if comp_fb.ok or not _is_safe_to_fallback(comp_fb):
                     break
 
         elapsed_ms = int((time.monotonic() - t0) * 1000)

@@ -813,8 +813,36 @@ async def test_p0i_ten_r3_false_verified_counterexamples(
             items = []
             for item in payload.get("extracted_figures") or payload.get("figures") or []:
                 raw = str(item.get("raw") or "")
-                if raw in ("600", "500", "42", "5.5"):
-                    items.append({"id": item["id"], "metric": "非财务数字", "period": "", "kind": "incidental"})
+                if raw == "600":
+                    items.append(
+                        {
+                            "id": item["id"],
+                            "metric": "非财务数字",
+                            "period": "",
+                            "kind": "incidental",
+                            "incidental_category": "点赞数、转发数等社交互动计数",
+                        }
+                    )
+                elif raw == "500":
+                    items.append(
+                        {
+                            "id": item["id"],
+                            "metric": "非财务数字",
+                            "period": "",
+                            "kind": "incidental",
+                            "incidental_category": "HTTP 状态码",
+                        }
+                    )
+                elif raw == "5.5":
+                    items.append(
+                        {
+                            "id": item["id"],
+                            "metric": "模型版本",
+                            "period": "",
+                            "kind": "incidental",
+                            "incidental_category": "软件和模型的版本号、硬件型号",
+                        }
+                    )
                 else:
                     items.append({"id": item["id"], "metric": "合并总收入", "period": "3Q25", "kind": "reported"})
             return AssistResult(ok=True, data={"items": items, "extra_figures": []})
@@ -837,7 +865,12 @@ async def test_p0i_ten_r3_false_verified_counterexamples(
     full_res = await aaudit_draft(draft, thesis_doc=thesis_doc, use_llm_judge=True)
     assert full_res.matched == 0
     incidental_raws = {i["raw"] for i in full_res.incidental}
-    assert {"600", "500", "5.5"}.issubset(incidental_raws)
+    assert {"600", "500"}.issubset(incidental_raws)
+    assert "5.5" not in incidental_raws
+    uncertain_by_raw = {u["raw"]: u for u in full_res.uncertain}
+    assert "5.5" in uncertain_by_raw
+    assert uncertain_by_raw["5.5"]["hint"] == "LLM 判断为版本号或名称；带小数的数字不能自动排除，请 PM 确认"
+    assert "5.5" not in {u["raw"] for u in full_res.unverified}
 
 
 def test_p0i_two_anchoring_blind_spots_and_s1() -> None:
@@ -1079,14 +1112,6 @@ def test_p0i_contradicted_reasons_and_zero_unit_or_period_mismatch_assignments()
         assert "maybe_label_prose_figures_with_llm" not in src_text, f"Found maybe_label_prose_figures_with_llm in {src_name}"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "P0J J2a relabelled duration facts (20-year PPA, 6.4-year backlog) as "
-        "verification targets; numbers.py's duration->incidental regex still "
-        "excludes them. P0J J2 deletes that regex and must remove this marker."
-    ),
-)
 @pytest.mark.asyncio
 async def test_p0i_g3_gold_standard_and_cross_control_zero_false_verified(
     monkeypatch: pytest.MonkeyPatch,
@@ -1222,4 +1247,464 @@ async def test_p0i_g3_gold_standard_and_cross_control_zero_false_verified(
             g = gold_by_report_line_raw.get((rep_name, int(inc["line"]), inc["raw"]))
             if g is not None:
                 assert g["is_verification_target"] is False, f"Financial figure marked incidental in {rep_name}: {inc}"
+
+
+@pytest.mark.asyncio
+async def test_p0j_j2_failed_batch_never_excludes_figures_and_colloquial_always_scanned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P0J.J2 (§2.2, §2.3, §2.5; replaces _COLLOQUIAL_HINT_RE and _EXEMPT_MARKER_RE):
+    1. Every non-empty section (including colloquial-only sections with 0 Arabic digits) is sent to Step B.
+    2. STEP_B_LABEL_INSTRUCTIONS and FigureLabels schema do not leak G3 fixture examples.
+    3. When a labeling batch fails, all figures in that batch fall back to normal verification targets and
+       cannot be marked incidental by another batch (no cross-batch by_id pollution).
+    """
+    colloquial_draft = (G3_FIXTURES_DIR / "colloquial_only_draft.md").read_text(encoding="utf-8")
+    colloquial_gold = json.loads((G3_FIXTURES_DIR / "colloquial_only_gold.json").read_text(encoding="utf-8"))
+    expected_raws = {it["raw"] for it in colloquial_gold["items"]}
+
+    # Verify Step B prompt & schema do not hardcode G3 fixture raw examples
+    schema_dump = json.dumps(numbers_mod.FigureLabels.model_json_schema(), ensure_ascii=False)
+    for forbidden_tok in ("702MW", "6.4 年", "20 年 PPA", "18 笔", "三成", "百分之三十", "翻倍", *expected_raws):
+        assert forbidden_tok not in numbers_mod.STEP_B_LABEL_INSTRUCTIONS
+        assert forbidden_tok not in schema_dump
+
+    seen_sections: list[str] = []
+    mock_assist = create_autospec(assist_json)
+
+    async def _colloquial_side_effect(
+        task: str,
+        instructions: str,
+        payload: dict[str, Any],
+        schema: dict[str, Any],
+        **kwargs: Any,
+    ) -> AssistResult:
+        if task == "audit.label_figures":
+            sec_title = str(payload.get("section_title") or "")
+            seen_sections.append(sec_title)
+            extra = (
+                [
+                    {
+                        "raw": it["raw"],
+                        "value": 50.0,
+                        "unit": "pct",
+                        "metric": "渠道比例",
+                        "period": "FY2026",
+                        "kind": "reported",
+                        "line": it["line"],
+                        "sentence": "管理层在电话会中提到上述口语化比例。",
+                    }
+                    for it in colloquial_gold["items"]
+                ]
+                if "渠道观察" in sec_title
+                else []
+            )
+            return AssistResult(ok=True, data={"items": [], "extra_figures": extra})
+        return AssistResult(ok=True, data={"items": []})
+
+    mock_assist.side_effect = _colloquial_side_effect
+    monkeypatch.setattr(numbers_mod, "assist_json", mock_assist)
+    monkeypatch.setattr(audit_mod, "assist_json", mock_assist)
+
+    col_res = await aaudit_draft(colloquial_draft, thesis_doc={"evidence": []}, use_llm_judge=True)
+    assert any("渠道观察" in s for s in seen_sections)
+    extracted_raws = {u["raw"] for u in col_res.unverified}
+    assert expected_raws.issubset(extracted_raws)
+
+    # Test failed batch fallback AND cross-batch isolation (empty-figure batch B cannot overwrite failed batch A's F-001)
+    draft_with_figs = (
+        "## 合同期限与装机\n\n"
+        "项目签署了 20 年 PPA 协议，加权剩余合同期限 6.4 年，装机容量 702MW。\n\n"
+        "## 渠道观察\n\n"
+        "本节没有阿拉伯数字。\n"
+    )
+    figs = extract_figures(draft_with_figs)
+    assert len(figs) == 3
+    figs[0].label_hint = "incidental"
+    figs[0].incidental_category = "期间、日期和时间窗口表达里的数字"
+
+    mock_mixed = create_autospec(assist_json)
+
+    async def _mixed_side_effect(
+        task: str,
+        instructions: str,
+        payload: dict[str, Any],
+        schema: dict[str, Any],
+        **kwargs: Any,
+    ) -> AssistResult:
+        if task == "audit.label_figures":
+            sec = str(payload.get("section_title") or "")
+            if "合同期限与装机" in sec:
+                return AssistResult(ok=False, data=None, error="llm_unavailable", status="failed")
+            # Empty-figure batch attempts to pollute F-001 from failed batch 1
+            return AssistResult(
+                ok=True,
+                data={
+                    "items": [
+                        {
+                            "id": "F-001",
+                            "metric": "非财务",
+                            "period": "",
+                            "kind": "incidental",
+                            "incidental_category": "期间、日期和时间窗口表达里的数字",
+                        }
+                    ],
+                    "extra_figures": [],
+                },
+            )
+        return AssistResult(ok=False, data=None, error="llm_unavailable", status="failed")
+
+    mock_mixed.side_effect = _mixed_side_effect
+    monkeypatch.setattr(numbers_mod, "assist_json", mock_mixed)
+    monkeypatch.setattr(audit_mod, "assist_json", mock_mixed)
+
+    stats: dict[str, Any] = {}
+    labeled_figs, ok = await numbers_mod.label_figures_with_status(
+        draft_with_figs,
+        figs,
+        stats_out=stats,
+    )
+    assert ok is False
+    assert stats["failed_batches"] == 1
+    assert len(stats["failed_batch_details"]) == 1
+    for lf in labeled_figs:
+        assert lf.label_hint == "reported"
+        assert lf.incidental_category == ""
+
+    audit_fail_res = await aaudit_draft(draft_with_figs, thesis_doc={"evidence": []}, use_llm_judge=True)
+    assert audit_fail_res.labeling_incomplete is True
+    assert len(audit_fail_res.incidental) == 0
+    assert audit_fail_res.figures == 3
+
+
+def test_p0j_j2_exempt_markers_single_source_and_ltm_period_normalization() -> None:
+    """P0J.J2 (§2.4 #1 & #2):
+    - EXEMPT_MARKERS is the single source of truth across numbers.py, audit.py judge prompt, and dalton-publish/SKILL.md.
+    - normalize_period maps standalone '过去 12 个月', '近 12 个月', 'TTM', 'LTM' to 'LTM' without matching metric phrases.
+    - FigureLabels schema constrains incidental_category to the 9 categories (plus empty string).
+    """
+    from src.dalton.publish.numbers import (
+        EXEMPT_MARKERS,
+        INCIDENTAL_CATEGORIES,
+        FigureLabelItem,
+        has_exempt_marker,
+        normalize_period,
+    )
+    from src.dalton.settings import REPO_ROOT
+
+    assert len(EXEMPT_MARKERS) == 12
+    skill_md = (REPO_ROOT / "plugins" / "dalton" / "skills" / "dalton-publish" / "SKILL.md").read_text(
+        encoding="utf-8"
+    )
+    for marker in EXEMPT_MARKERS:
+        assert marker in skill_md, f"Marker {marker} missing from dalton-publish/SKILL.md"
+        assert marker in audit_mod._EXEMPT_MARKERS_PROMPT
+        assert has_exempt_marker(f"假设推演 {marker} 收入增长 15%")
+
+    for ltm_expr in ("过去 12 个月", "过去12个月", "近 12 个月", "近12个月", "TTM", "LTM"):
+        assert normalize_period(ltm_expr) == "LTM", f"Expected LTM for {ltm_expr!r}"
+    assert normalize_period("过去 12 个月营业利润率") != "LTM"
+    assert normalize_period("ULTIMATE") != "LTM"
+
+    ltm_figs = extract_figures("过去 12 个月营业利润率达到 35.2%，TTM收入达 120 亿美元。")
+    fig_margin = next(f for f in ltm_figs if f.raw == "35.2%")
+    assert fig_margin.period == "LTM"
+    fig_ttm_rev = next(f for f in ltm_figs if "120" in f.raw)
+    assert fig_ttm_rev.period == "LTM"
+
+    assert len(INCIDENTAL_CATEGORIES) == 9
+    item_unknown = FigureLabelItem.model_validate(
+        {"id": "F-001", "kind": "incidental", "incidental_category": "随便写的类别"}
+    )
+    assert item_unknown.incidental_category == ""
+
+
+@pytest.mark.asyncio
+async def test_p0j_j2_decimal_version_number_two_counterexamples(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P0J §8.1 #8 counterexamples:
+    1) '45.5 亿美元' mislabeled as Category 5 ('软件和模型的版本号、硬件型号') with no source -> unverified (blocks publish).
+    2) 'Sonnet 5.5' labeled as Category 5 with source present in evidence -> verified ('已核实') via Step D judge.
+    """
+    from src.dalton.publish import audit as audit_mod
+    from src.dalton.publish import numbers as numbers_mod
+
+    # Counterexample 1: "45.5 亿美元" mislabeled as Category 5 -> must remain unverified (never uncertain)
+    draft_fin = "## 财务摘要\n本季度公司实现收入 45.5 亿美元。\n"
+    thesis_empty = {
+        "schema_version": 2,
+        "evidence": [
+            {
+                "id": "EV-FIN-001",
+                "fact": "本季度公司实现收入稳步提升，版本号持续迭代。",
+                "source": {"type": "filing", "identity": "10-Q", "tier": 1},
+                "figures": [],
+            }
+        ],
+    }
+    mock_assist_fin = create_autospec(assist_json)
+    judge_called_fin = False
+
+    async def _fin_effect(
+        task: str,
+        instructions: str,
+        payload: dict[str, Any],
+        schema: dict[str, Any],
+        **kwargs: Any,
+    ) -> AssistResult:
+        nonlocal judge_called_fin
+        if task == "audit.label_figures":
+            figs = payload.get("extracted_figures") or payload.get("figures") or []
+            return AssistResult(
+                ok=True,
+                data={
+                    "items": [
+                        {
+                            "id": f["id"],
+                            "metric": "版本号",
+                            "period": "",
+                            "kind": "incidental",
+                            "incidental_category": "软件和模型的版本号、硬件型号",
+                        }
+                        for f in figs
+                    ],
+                    "extra_figures": [],
+                },
+            )
+        if task == "audit.judge":
+            judge_called_fin = True
+            return AssistResult(
+                ok=True,
+                data={
+                    "items": [
+                        {
+                            "id": f["id"],
+                            "verdict": "unverified",
+                            "quote_metric_raw": "",
+                            "explanation": "no source for 45.5 bn revenue",
+                        }
+                        for f in payload.get("figures", [])
+                    ]
+                },
+            )
+        return AssistResult(ok=False, data=None, error="unexpected_task")
+
+    mock_assist_fin.side_effect = _fin_effect
+    monkeypatch.setattr(numbers_mod, "assist_json", mock_assist_fin)
+    monkeypatch.setattr(audit_mod, "assist_json", mock_assist_fin)
+
+    res_fin = await aaudit_draft(draft_fin, thesis_doc=thesis_empty, use_llm_judge=True)
+    assert judge_called_fin is True
+    assert len(res_fin.incidental) == 0
+    assert len(res_fin.uncertain) == 0
+    assert len(res_fin.unverified) == 1
+    assert "45.5" in res_fin.unverified[0]["raw"]
+    assert len(res_fin.unmatched) == 1
+
+    # Counterexample 2: "Sonnet 5.5" labeled as Category 5 with source in evidence -> verified ("已核实")
+    draft_ver = "## 产品进展\n本季度新发布的模型版本为 Sonnet 5.5。\n"
+    thesis_with_source = {
+        "schema_version": 2,
+        "evidence": [
+            {
+                "id": "EV-MOD-001",
+                "fact": "本季度新发布的模型版本为 Sonnet 5.5。",
+                "source": {"type": "filing", "identity": "10-Q", "tier": 1},
+                "figures": [],
+            }
+        ],
+    }
+    mock_assist_ver = create_autospec(assist_json)
+
+    async def _ver_effect(
+        task: str,
+        instructions: str,
+        payload: dict[str, Any],
+        schema: dict[str, Any],
+        **kwargs: Any,
+    ) -> AssistResult:
+        if task == "audit.label_figures":
+            figs = payload.get("extracted_figures") or payload.get("figures") or []
+            return AssistResult(
+                ok=True,
+                data={
+                    "items": [
+                        {
+                            "id": f["id"],
+                            "metric": "模型版本",
+                            "period": "",
+                            "kind": "incidental",
+                            "incidental_category": "软件和模型的版本号、硬件型号",
+                        }
+                        for f in figs
+                    ],
+                    "extra_figures": [],
+                },
+            )
+        if task == "audit.judge":
+            return AssistResult(
+                ok=True,
+                data={
+                    "items": [
+                        {
+                            "id": f["id"],
+                            "verdict": "supported",
+                            "matched_source_id": "evidence:EV-MOD-001",
+                            "quote": "本季度新发布的模型版本为 Sonnet 5.5。",
+                            "quote_number_raw": "5.5",
+                            "quote_metric_raw": "模型版本",
+                            "explanation": "evidence EV-MOD-001 states Sonnet 5.5",
+                        }
+                        for f in payload.get("figures", [])
+                    ]
+                },
+            )
+        return AssistResult(ok=False, data=None, error="unexpected_task")
+
+    mock_assist_ver.side_effect = _ver_effect
+    monkeypatch.setattr(numbers_mod, "assist_json", mock_assist_ver)
+    monkeypatch.setattr(audit_mod, "assist_json", mock_assist_ver)
+
+    res_ver = await aaudit_draft(draft_ver, thesis_doc=thesis_with_source, use_llm_judge=True)
+    assert res_ver.matched == 1
+    assert res_ver.matches[0]["raw"] == "5.5"
+    assert len(res_ver.uncertain) == 0
+    assert len(res_ver.unverified) == 0
+
+
+@pytest.mark.asyncio
+async def test_p0j_j2_assist_fallback_unified_and_role_policy_family_check(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    tmp_path: Path,
+) -> None:
+    """P0J.J2 (§1 & §2.2):
+    - assist_json only falls back on status=='failed' with error_kind in ('pre_send', 'http_4xx' excluding 429).
+    - Never falls back on indeterminate/timeout, in_flight, conflict, or budget_exhausted.
+    - Records the last attempted fallback model when all fallbacks fail.
+    - role_policy checks assist_fallback against ALL reviewer_models and raises DaltonStartupConfigError on invalid YAML.
+    """
+    from src.dalton.llm import assist as assist_mod
+    from src.dalton.llm.complete import DaltonCompleteResult, dalton_complete
+    from src.dalton.llm.role_policy import (
+        DaltonStartupConfigError,
+        RolePolicyError,
+        check_roles,
+        enforce_role_policy_on_startup,
+    )
+
+    mock_complete = create_autospec(dalton_complete)
+    calls: list[str] = []
+
+    async def _complete_side_effect(**kwargs: Any) -> DaltonCompleteResult:
+        req_model = str(kwargs.get("request_model") or "")
+        calls.append(req_model)
+        if req_model == "gemini-3.8-flash-low-oauth":
+            return DaltonCompleteResult(
+                ok=False,
+                status="failed",
+                error="primary_oauth_expired",
+                error_kind="pre_send",
+                model=req_model,
+            )
+        return DaltonCompleteResult(
+            ok=True,
+            status="done",
+            data={"items": []},
+            text='{"items": []}',
+            model=req_model,
+            cash_usd=0.001,
+        )
+
+    mock_complete.side_effect = _complete_side_effect
+    monkeypatch.setattr(assist_mod, "dalton_complete", mock_complete)
+
+    schema = {"type": "object", "properties": {"items": {"type": "array"}}, "required": ["items"]}
+    with caplog.at_level("INFO"):
+        res = await assist_mod.assist_json("audit.label_figures", "Label figures", {"figures": []}, schema)
+    assert res.ok is True
+    assert res.model == "deepseek-flash"
+    assert calls == ["gemini-3.8-flash-low-oauth", "deepseek-flash"]
+    assert any("switching to assist_fallback=deepseek-flash" in r.message for r in caplog.records)
+
+    # Non-fallbackable statuses/error_kinds MUST NOT trigger fallback
+    for non_fb_status, non_fb_kind in [
+        ("indeterminate", "timeout"),
+        ("in_flight", "in_flight"),
+        ("conflict", "conflict"),
+        ("budget_exhausted", "budget_exhausted"),
+        ("failed", "http_429"),
+    ]:
+        calls.clear()
+
+        async def _no_fb_effect(
+            _st: str = non_fb_status,
+            _ek: str = non_fb_kind,
+            **kwargs: Any,
+        ) -> DaltonCompleteResult:
+            req_m = str(kwargs.get("request_model") or "")
+            calls.append(req_m)
+            return DaltonCompleteResult(
+                ok=False,
+                status=_st,
+                error=f"err_{_ek}",
+                error_kind=_ek,
+                model=req_m,
+            )
+
+        mock_complete.side_effect = _no_fb_effect
+        res_no_fb = await assist_mod.assist_json("audit.label_figures", "Label figures", {"figures": []}, schema)
+        assert res_no_fb.ok is False
+        assert calls == ["gemini-3.8-flash-low-oauth"], (
+            f"Unexpected fallback for {non_fb_status}/{non_fb_kind}: {calls}"
+        )
+
+    # When primary and all fallbacks fail at pre_send, res.model records the last attempted fallback model
+    calls.clear()
+
+    async def _all_fail_effect(**kwargs: Any) -> DaltonCompleteResult:
+        req_m = str(kwargs.get("request_model") or "")
+        calls.append(req_m)
+        return DaltonCompleteResult(
+            ok=False,
+            status="failed",
+            error=f"pre_send_fail_{req_m}",
+            error_kind="pre_send",
+            model=req_m,
+        )
+
+    mock_complete.side_effect = _all_fail_effect
+    res_all_fail = await assist_mod.assist_json("audit.label_figures", "Label figures", {"figures": []}, schema)
+    assert res_all_fail.ok is False
+    assert calls == ["gemini-3.8-flash-low-oauth", "deepseek-flash", "ocb-deepseek-deepseek-flash"]
+    assert res_all_fail.model == "ocb-deepseek-deepseek-flash"
+    assert "ocb-deepseek-deepseek-flash" in (res_all_fail.error or "")
+
+    # Role policy: assist_fallback (from DALTON_ASSIST_FALLBACK_MODEL / dalton.yaml) compared against ALL reviewer_models
+    base_role_cfg = {
+        "llm": {
+            "name": "claude-opus-5-5-oauth",
+            "assist": "gemini-3.8-flash-low-oauth",
+        }
+    }
+    monkeypatch.setenv("DALTON_ASSIST_FALLBACK_MODEL", "deepseek-flash")
+    warnings = check_roles(
+        base_role_cfg,
+        reviewer_models=["gpt-6.1-sol-oauth", "deepseek-reasoner"],
+    )
+    assert any(w["code"] == "assist_fallback_same_family" for w in warnings)
+
+    monkeypatch.setenv("DALTON_ASSIST_FALLBACK_MODEL", "gpt-6.1-sol-oauth")
+    with pytest.raises(RolePolicyError, match="assist_fallback"):
+        enforce_role_policy_on_startup(base_role_cfg)
+
+    # Corrupt YAML in PTC_CONFIG_FILE must raise DaltonStartupConfigError (never silently return {})
+    monkeypatch.delenv("DALTON_ASSIST_FALLBACK_MODEL", raising=False)
+    bad_yaml = tmp_path / "bad_agent_config.yaml"
+    bad_yaml.write_text(":::invalid_yaml\n  - [unclosed", encoding="utf-8")
+    monkeypatch.setenv("PTC_CONFIG_FILE", str(bad_yaml))
+    with pytest.raises(DaltonStartupConfigError):
+        enforce_role_policy_on_startup()
+
 
