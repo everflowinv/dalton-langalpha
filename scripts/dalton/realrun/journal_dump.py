@@ -116,6 +116,9 @@ def normalize_journal_rows(
     *,
     since_dt: datetime | None = None,
     conversation_rows: list[dict[str, Any]] | None = None,
+    conversation_usages_unavailable: bool = False,
+    window_user_ids: list[str] | None = None,
+    unexpected_user_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     """Normalize raw `dalton_llm_journal` rows (and optional conversation usage rows) into `{rows, totals}`."""
     rows: list[dict[str, Any]] = []
@@ -258,23 +261,30 @@ def normalize_journal_rows(
                 }
             )
 
+    totals_dict: dict[str, Any] = {
+        "total_calls": len(rows),
+        "fresh_calls": fresh_calls,
+        "replayed_calls": replayed_calls,
+        "done_calls": done_calls,
+        "failed_calls": failed_calls,
+        "indeterminate_calls": indeterminate_calls,
+        "cash_usd": float(round(total_cash, 6)),
+        "notional_usd": float(round(total_notional, 6)),
+        "conversation_turns": len(conv_items),
+        "conversation_cash_usd": float(round(conv_cash, 6)),
+        "combined_cash_usd": float(round(total_cash + conv_cash, 6)),
+        "conversation_usages_unavailable": bool(conversation_usages_unavailable),
+        "by_purpose": by_purpose,
+        "by_model": by_model,
+    }
+    if window_user_ids is not None:
+        totals_dict["window_user_ids"] = list(window_user_ids)
+    if unexpected_user_ids is not None:
+        totals_dict["unexpected_user_ids"] = list(unexpected_user_ids)
+
     result: dict[str, Any] = {
         "rows": rows,
-        "totals": {
-            "total_calls": len(rows),
-            "fresh_calls": fresh_calls,
-            "replayed_calls": replayed_calls,
-            "done_calls": done_calls,
-            "failed_calls": failed_calls,
-            "indeterminate_calls": indeterminate_calls,
-            "cash_usd": float(round(total_cash, 6)),
-            "notional_usd": float(round(total_notional, 6)),
-            "conversation_turns": len(conv_items),
-            "conversation_cash_usd": float(round(conv_cash, 6)),
-            "combined_cash_usd": float(round(total_cash + conv_cash, 6)),
-            "by_purpose": by_purpose,
-            "by_model": by_model,
-        },
+        "totals": totals_dict,
     }
     if conv_items:
         result["conversation_usages"] = conv_items
@@ -308,9 +318,16 @@ def _summarize_conversation_token_usage(token_usage: Any) -> dict[str, Any]:
     }
 
 
+def _normalize_user_id_list(user_id: str | list[str] | tuple[str, ...] | set[str]) -> list[str]:
+    if isinstance(user_id, str):
+        parts = [u.strip() for u in user_id.split(",") if u.strip()]
+        return parts if parts else [user_id]
+    return [str(u).strip() for u in user_id if str(u).strip()]
+
+
 def dump_journal(
     *,
-    user_id: str,
+    user_id: str | list[str] | tuple[str, ...] | set[str],
     since: str | datetime,
     until: str | datetime,
     dsn: str | None = None,
@@ -320,11 +337,15 @@ def dump_journal(
     """Query `dalton_llm_journal` (and optionally `conversation_usages`) for `(user_id, [since, until])`."""
     from datetime import timedelta
 
+    user_ids = _normalize_user_id_list(user_id)
     since_dt = parse_iso_utc(since) if isinstance(since, str) else since.astimezone(timezone.utc)
     until_dt = parse_iso_utc(until) if isinstance(until, str) else until.astimezone(timezone.utc)
     if until_dt.microsecond == 0:
         until_dt = until_dt + timedelta(seconds=2)
     conn_str = build_dsn_from_env(dsn)
+
+    conv_unavailable = False
+    window_uids: set[str] = set()
 
     with psycopg.connect(conn_str, row_factory=dict_row) as conn:
         with conn.cursor() as cur:
@@ -339,10 +360,10 @@ def dump_journal(
                     FROM dalton_llm_journal
                     WHERE created_at >= %s
                       AND created_at <= %s
-                      AND (user_id = %s OR user_id IS NULL)
+                      AND (user_id = ANY(%s) OR user_id IS NULL)
                     ORDER BY created_at ASC, invocation_id ASC
                     """,
-                    (since_dt, until_dt, user_id),
+                    (since_dt, until_dt, user_ids),
                 )
             else:
                 cur.execute(
@@ -355,12 +376,25 @@ def dump_journal(
                     FROM dalton_llm_journal
                     WHERE created_at >= %s
                       AND created_at <= %s
-                      AND user_id = %s
+                      AND user_id = ANY(%s)
                     ORDER BY created_at ASC, invocation_id ASC
                     """,
-                    (since_dt, until_dt, user_id),
+                    (since_dt, until_dt, user_ids),
                 )
             journal_rows = [dict(r) for r in cur.fetchall()]
+
+            cur.execute(
+                """
+                SELECT DISTINCT COALESCE(NULLIF(BTRIM(user_id), ''), '<NULL>') AS uid
+                FROM dalton_llm_journal
+                WHERE created_at >= %s
+                  AND created_at <= %s
+                """,
+                (since_dt, until_dt),
+            )
+            for row in cur.fetchall():
+                if row.get("uid"):
+                    window_uids.add(str(row["uid"]))
 
             conv_rows: list[dict[str, Any]] = []
             if include_conversation_usages:
@@ -376,29 +410,56 @@ def dump_journal(
                             dalton_cash_usd(token_usage::jsonb, total_credits, infrastructure_credits, 1000) AS cash_usd,
                             created_at
                         FROM conversation_usages
-                        WHERE user_id = %s
+                        WHERE user_id = ANY(%s)
                           AND created_at >= %s
                           AND created_at <= %s
                         ORDER BY created_at ASC
                         """,
-                        (user_id, since_dt, until_dt),
+                        (user_ids, since_dt, until_dt),
                     )
                     conv_rows = [dict(r) for r in cur.fetchall()]
-                except Exception:
+                    cur.execute(
+                        """
+                        SELECT DISTINCT COALESCE(NULLIF(BTRIM(user_id), ''), '<NULL>') AS uid
+                        FROM conversation_usages
+                        WHERE created_at >= %s
+                          AND created_at <= %s
+                        """,
+                        (since_dt, until_dt),
+                    )
+                    for row in cur.fetchall():
+                        if row.get("uid"):
+                            window_uids.add(str(row["uid"]))
+                except Exception as exc:
+                    conn.rollback()
+                    conv_unavailable = True
+                    sys.stderr.write(
+                        f"WARNING: Failed to query conversation_usages for {user_ids}: {exc}\n"
+                    )
                     conv_rows = []
+
+    allowed_set = {u for u in user_ids if u and u != "<NULL>"}
+    unexpected = sorted(uid for uid in window_uids if uid not in allowed_set)
 
     return normalize_journal_rows(
         journal_rows,
         since_dt=since_dt,
         conversation_rows=conv_rows,
+        conversation_usages_unavailable=conv_unavailable,
+        window_user_ids=sorted(window_uids),
+        unexpected_user_ids=unexpected,
     )
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Dump dalton_llm_journal records for a user and time window (without request/response bodies)."
+        description="Dump dalton_llm_journal records for user(s) and time window (without request/response bodies)."
     )
-    parser.add_argument("--user", required=True, help="Test user_id to filter on")
+    parser.add_argument(
+        "--user",
+        required=True,
+        help="Test user_id(s) to filter on (comma-separated for multi-user)",
+    )
     parser.add_argument("--since", required=True, help="Window start ISO-8601 timestamp (UTC)")
     parser.add_argument("--until", required=True, help="Window end ISO-8601 timestamp (UTC)")
     parser.add_argument("--dsn", default=None, help="Optional Postgres DSN override")

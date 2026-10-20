@@ -1,6 +1,14 @@
 #!/bin/bash
-# Dalton Docker entrypoint: wait for database, run upstream + Dalton migrations, then exec CMD.
+# Dalton Docker entrypoint: ensure git is available for L41 version stamping, wait for database,
+# run upstream + Dalton migrations, then exec CMD.
 set -e
+
+if ! command -v git >/dev/null 2>&1; then
+  echo "Installing git in container for startup version check..."
+  apt-get update -qq && apt-get install -y -qq --no-install-recommends git >/dev/null
+  rm -rf /var/lib/apt/lists/*
+fi
+git config --global --add safe.directory '*' || true
 
 DB_HOST="${DB_HOST:-localhost}"
 DB_PORT="${DB_PORT:-5432}"
