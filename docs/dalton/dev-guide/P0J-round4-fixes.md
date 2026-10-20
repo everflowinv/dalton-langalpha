@@ -492,6 +492,8 @@ PR #7 的描述有两处和 diff 不符："回退到 CLI 网关"、"修了 open_
 | 14 | 工作区归属检查查不到时放行（PR #20 审查时发现，`dalton/main` 上原来就有） | `src/dalton/app/router.py` 的 `_verify_workspace_access` 在查不到工作区或数据库出错时放行，违反原则 1（权限必须写死、失败即拒绝）。**单独开一个小修复 `fix/P0J.J3b-workspace-access-fail-closed`：** 查不到返回 404，数据库出错返回 503，不再放行；补测试。可以和 J2、J1 并行，合并顺序不限 |
 | 15 | PR 里贴的运行输出不是已提交代码产生的（PR #16、#20 共四次） | **PR 里的运行输出一律由脚本生成并发布，不手工抄写。** 新建 `scripts/dalton/pr_baseline.sh`：在干净的工作区里运行四条基线命令和本 PR 要求的调试运行，把原始输出、退出码、HEAD sha 和时间写进文件，直接用 `gh pr comment --body-file` 发布。PR 描述里不再贴运行输出。lead 在自己的环境里重跑同一个脚本对比结果。PR #20 已按此规则关闭，J1 从 `fix/P0J.J1-evidence-base-r3` 重新提交 |
 | 16 | 免责声明章节被整节跳过（PR #18 审查时发现，PK 阶段 `0a5bbdce` 就有） | `numbers.py` 的 `_split_markdown_sections_and_chunks` 里，标题含"免责声明""disclaimer""风险提示与免责"的整节不送 LLM，这是 L43 禁止的"用词表决定哪些节不送 LLM"。**单独开一个小修复 `fix/P0J.J2b-remove-disclaimer-skip`：** 删掉这张词表，每一节都送 B 环节；补一个测试：标题叫"风险提示与免责"、内容含数字的节也会被标注 |
+| 17 | G6 的财务输入从哪里来（PR #25 审查：夹具沿用第四轮写死的数字，只贴了来源标签） | **G6 的财务输入改为如实声明的示意数据。** 删掉夹具里所有的 accession、URL 和来源标签，顶层加 `"illustrative": true` 和说明；`committed_fixture_input` 的声明写明"示意数据"；摘要和对比文档不得把这些数字当作公司的真实财务数据。anchors 仍联网取真实的市值和汇率。G6 验证的是镜头命令链路和锚点一致性；用真实财报数据跑镜头，放到以后的 PS 试跑里做。**来源标签和数值不对应，就是编造来源，一律不允许。** 本条取代 §5 G6 里"每个科目标注来源的 accession 号"的要求 |
+| 18 | 开发文档里能不能放运行输出（PR #25 审查：P0-platform 里的"实测输出"是手写的） | **开发文档里不放运行输出。** 只写根因、改法和配置；需要引用实测结果时，写"见 PR #NN 中 `pr_baseline.sh` 发布的评论"并附链接。运行输出只存在于 `pr_baseline.sh` 发布的 PR 评论和 `var/` 下的原始文件里 |
 
 ---
 
