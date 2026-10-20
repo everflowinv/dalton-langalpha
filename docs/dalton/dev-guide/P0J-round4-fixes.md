@@ -490,6 +490,8 @@ PR #7 的描述有两处和 diff 不符："回退到 CLI 网关"、"修了 open_
 | 12 | 合并顺序 | **J3 → J2 → J1。** J2、J1 在前一个合并之后变基，再复审 |
 | 13 | 版本门禁管到什么程度（PR #20 审查） | **门禁只管 `--record`。** 不加 `--record` 是"调试运行"：可以在没合并、不干净的分支上跑，不写任何文件，输出开头打印 `DEBUG RUN — NOT EVIDENCE`。加了 `--record` 才检查"工作区干净、已合并（只认 `origin/dalton/main`）、后端版本一致"，不满足就拒绝运行，先过门禁再写文件。PR 里的"真实运行验证"必须是已提交代码的调试运行输出。§1.3 第 3 条按此理解 |
 | 14 | 工作区归属检查查不到时放行（PR #20 审查时发现，`dalton/main` 上原来就有） | `src/dalton/app/router.py` 的 `_verify_workspace_access` 在查不到工作区或数据库出错时放行，违反原则 1（权限必须写死、失败即拒绝）。**单独开一个小修复 `fix/P0J.J3b-workspace-access-fail-closed`：** 查不到返回 404，数据库出错返回 503，不再放行；补测试。可以和 J2、J1 并行，合并顺序不限 |
+| 15 | PR 里贴的运行输出不是已提交代码产生的（PR #16、#20 共四次） | **PR 里的运行输出一律由脚本生成并发布，不手工抄写。** 新建 `scripts/dalton/pr_baseline.sh`：在干净的工作区里运行四条基线命令和本 PR 要求的调试运行，把原始输出、退出码、HEAD sha 和时间写进文件，直接用 `gh pr comment --body-file` 发布。PR 描述里不再贴运行输出。lead 在自己的环境里重跑同一个脚本对比结果。PR #20 已按此规则关闭，J1 从 `fix/P0J.J1-evidence-base-r3` 重新提交 |
+| 16 | 免责声明章节被整节跳过（PR #18 审查时发现，PK 阶段 `0a5bbdce` 就有） | `numbers.py` 的 `_split_markdown_sections_and_chunks` 里，标题含"免责声明""disclaimer""风险提示与免责"的整节不送 LLM，这是 L43 禁止的"用词表决定哪些节不送 LLM"。**单独开一个小修复 `fix/P0J.J2b-remove-disclaimer-skip`：** 删掉这张词表，每一节都送 B 环节；补一个测试：标题叫"风险提示与免责"、内容含数字的节也会被标注 |
 
 ---
 
