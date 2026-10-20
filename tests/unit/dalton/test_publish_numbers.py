@@ -1774,7 +1774,8 @@ async def test_p0j_j2b_risk_and_disclaimer_section_sent_to_step_b_and_labeled(
             model="gemini-3.8-flash-low-oauth",
         )
 
-    monkeypatch.setattr("src.dalton.publish.numbers.assist_json", fake_assist_json)
+    mock_assist = create_autospec(assist_json, side_effect=fake_assist_json)
+    monkeypatch.setattr("src.dalton.publish.numbers.assist_json", mock_assist)
     stats: dict[str, Any] = {}
     labeled, ok = await label_figures_with_status(
         md,
