@@ -10,6 +10,7 @@ from typing import Any, Optional
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool, tool
 
+from src.config.env import LOCAL_DEV_USER_ID
 from src.dalton.autonomy.board import build_coverage_board
 from src.dalton.autonomy.schedule import (
     schedule_dalton_automation_helper,
@@ -101,7 +102,7 @@ def build_director_tools(
             JSON string with `date`, `tz`, `budget`, `companies`, `candidates`, and `est_cost_by_kind`.
         """
         configurable = (config or {}).get("configurable") or {}
-        user_id = str(configurable.get("user_id") or "local-dev-user")
+        user_id = str(configurable.get("user_id") or LOCAL_DEV_USER_ID)
         board = await build_coverage_board(user_id=user_id)
         return json.dumps(board, ensure_ascii=False, default=str)
 
@@ -125,7 +126,7 @@ def build_director_tools(
             plan_date: Optional ISO date string (`YYYY-MM-DD`); defaults to today.
         """
         configurable = (config or {}).get("configurable") or {}
-        user_id = str(configurable.get("user_id") or "local-dev-user")
+        user_id = str(configurable.get("user_id") or LOCAL_DEV_USER_ID)
         board = await build_coverage_board(user_id=user_id)
         budget = board.get("budget") or {}
         cap_usd = float(budget.get("cap_usd") or 0.0)
@@ -237,7 +238,7 @@ def build_director_tools(
             from src.dalton.knowledge.service import apply_update
 
             configurable = (config or {}).get("configurable") or {}
-            user_id = str(configurable.get("user_id") or "local-dev-user")
+            user_id = str(configurable.get("user_id") or LOCAL_DEV_USER_ID)
             latest = await latest_version(workspace_id, "agenda")
             base_ver = int(latest["version_no"]) if latest else None
             urg_norm = {
@@ -313,7 +314,7 @@ def build_director_tools(
         from src.dalton.autonomy.schedule import schedule_dalton_automation_helper
 
         configurable = (config or {}).get("configurable") or {}
-        user_id = str(configurable.get("user_id") or "local-dev-user")
+        user_id = str(configurable.get("user_id") or LOCAL_DEV_USER_ID)
         ws_id = workspace_id or configurable.get("workspace_id")
         tz = timezone_name or get_dalton_settings().autonomy.timezone
 

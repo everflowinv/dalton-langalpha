@@ -9,6 +9,7 @@ import logging
 import re
 from typing import Any
 
+from src.config.env import LOCAL_DEV_USER_ID
 from src.dalton.publish.match import (
     UNIT_BASE,
     MatchCandidate,
@@ -412,7 +413,7 @@ async def judge_figure_with_llm(
     fig: ExtractedFigure,
     candidate_sources: list[dict[str, Any]],
     *,
-    user_id: str = "local-dev-user",
+    user_id: str = LOCAL_DEV_USER_ID,
     workspace_id: str | None = None,
     thread_id: str | None = None,
 ) -> tuple[str, dict[str, Any]]:
@@ -469,7 +470,7 @@ async def judge_figures_batch_with_llm(
     batch_items: list[tuple[int, ExtractedFigure, list[dict[str, Any]]]],
     *,
     section_title: str = "",
-    user_id: str = "local-dev-user",
+    user_id: str = LOCAL_DEV_USER_ID,
     workspace_id: str | None = None,
     thread_id: str | None = None,
 ) -> dict[int, tuple[str, dict[str, Any]]]:
@@ -746,7 +747,7 @@ async def aaudit_draft(
     facts_markdown: str | None = None,
     metric_aliases: dict[str, list[str]] | None = None,
     use_llm_judge: bool = True,
-    user_id: str = "local-dev-user",
+    user_id: str = LOCAL_DEV_USER_ID,
     workspace_id: str | None = None,
     thread_id: str | None = None,
     total_timeout_s: float = 120.0,

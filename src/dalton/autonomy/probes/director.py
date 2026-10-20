@@ -98,6 +98,38 @@ def _count_agenda_actionable(
     }
 
 
+async def _run_daily_system_maintenance(
+    *,
+    ttl_hours: int,
+    user_id: Optional[str] = None,
+) -> int:
+    """Run system-context daily maintenance (`expire_stale_publications` and 30-day journal pruning) when `user_id is None` (P0J §3.1, L39)."""
+    if user_id is not None:
+        return 0
+    expired_count = 0
+    try:
+        from src.dalton.database.publications import expire_stale_publications
+
+        expired_rows = await expire_stale_publications(ttl_hours=ttl_hours)
+        if expired_rows:
+            expired_count = len(expired_rows)
+    except Exception as e:
+        logger.warning("[DALTON_DIRECTOR_PROBE] expire_stale_publications failed: %s", e)
+
+    try:
+        from src.dalton.database.llm_journal import prune_expired_journal_responses
+
+        pruned_count = await prune_expired_journal_responses(retention_days=30)
+        if pruned_count:
+            logger.info(
+                "[DALTON_DIRECTOR_PROBE] pruned %d expired journal response payloads",
+                pruned_count,
+            )
+    except Exception as e:
+        logger.warning("[DALTON_DIRECTOR_PROBE] prune_expired_journal_responses failed: %s", e)
+    return expired_count
+
+
 async def _check_db_actionable_work(
     *,
     now_dt: datetime,
@@ -105,7 +137,7 @@ async def _check_db_actionable_work(
     ttl_hours: int,
     user_id: Optional[str] = None,
 ) -> dict[str, int]:
-    """Query Postgres for the 5 daily director actionable work conditions (A7, N2-M3)."""
+    """Query Postgres for the 5 daily director actionable work conditions (A7, N2-M3, L39)."""
     counts = {
         "due_validations": 0,
         "actionable_questions": 0,
@@ -115,32 +147,17 @@ async def _check_db_actionable_work(
     }
     try:
         from psycopg.rows import dict_row
-        from src.dalton.database.publications import expire_stale_publications
         from src.server.database.pool import get_db_connection
 
-        if not user_id or user_id == "local-dev-user":
-            try:
-                expired_rows = await expire_stale_publications(ttl_hours=ttl_hours)
-                if expired_rows:
-                    counts["publish_near_or_past_ttl"] += len(expired_rows)
-            except Exception as e:
-                logger.warning("[DALTON_DIRECTOR_PROBE] expire_stale_publications failed: %s", e)
-
-        try:
-            from src.dalton.database.llm_journal import prune_expired_journal_responses
-
-            pruned_count = await prune_expired_journal_responses(retention_days=30)
-            if pruned_count:
-                logger.info(
-                    "[DALTON_DIRECTOR_PROBE] pruned %d expired journal response payloads",
-                    pruned_count,
-                )
-        except Exception as e:
-            logger.warning("[DALTON_DIRECTOR_PROBE] prune_expired_journal_responses failed: %s", e)
+        if user_id is None:
+            counts["publish_near_or_past_ttl"] += await _run_daily_system_maintenance(
+                ttl_hours=ttl_hours,
+                user_id=None,
+            )
 
         async with get_db_connection() as conn:
             async with conn.cursor(row_factory=dict_row) as cur:
-                if user_id and user_id != "local-dev-user":
+                if user_id is not None:
                     await cur.execute(
                         """
                         SELECT DISTINCT ON (workspace_id) content
@@ -172,7 +189,7 @@ async def _check_db_actionable_work(
                 counts["actionable_questions"] = ag_counts["actionable_questions"]
                 counts["unconfirmed_earnings_14d"] = ag_counts["unconfirmed_earnings_14d"]
 
-                if user_id and user_id != "local-dev-user":
+                if user_id is not None:
                     await cur.execute(
                         """
                         SELECT COUNT(*) AS cnt
@@ -201,7 +218,7 @@ async def _check_db_actionable_work(
                 counts["stale_signals_24h"] = int((sig_row or {}).get("cnt") or 0)
 
                 warn_hours = max(1, ttl_hours - 24)
-                if user_id and user_id != "local-dev-user":
+                if user_id is not None:
                     await cur.execute(
                         """
                         SELECT COUNT(*) AS cnt
@@ -303,6 +320,8 @@ async def probe_director(
             ttl_hours=ttl_hours,
             user_id=user_id,
         )
+        if user_id is not None:
+            await _run_daily_system_maintenance(ttl_hours=ttl_hours, user_id=None)
     else:
         counts = {
             "due_validations": 0,

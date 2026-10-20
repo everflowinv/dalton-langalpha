@@ -170,27 +170,25 @@ class BridgeConfig:
             "true",
             "yes",
         )
-        self.test_delay_s: float = (
-            max(0.0, float(os.environ.get("DALTON_BRIDGE_TEST_DELAY_S", "0") or 0.0))
-            if self.test_mode
-            else 0.0
-        )
+        self.test_delay_s: float = 0.0
+        if self.test_mode:
+            try:
+                self.test_delay_s = max(
+                    0.0, float(os.environ.get("DALTON_BRIDGE_TEST_DELAY_S", "0") or 0.0)
+                )
+            except ValueError:
+                self.test_delay_s = 0.0
 
     def resolve_test_delay_s(self) -> float:
-        """Return active test delay in seconds (0.0 unless DALTON_BRIDGE_TEST_MODE=1)."""
-        if self.test_mode and self.test_delay_s > 0.0:
+        """Return active test delay in seconds (0.0 unless self.test_mode is True)."""
+        if not self.test_mode:
+            return 0.0
+        if self.test_delay_s > 0.0:
             return self.test_delay_s
-        env_mode = os.environ.get("DALTON_BRIDGE_TEST_MODE", "0").strip().lower() in (
-            "1",
-            "true",
-            "yes",
-        )
-        if env_mode:
-            try:
-                return max(0.0, float(os.environ.get("DALTON_BRIDGE_TEST_DELAY_S", "0") or 0.0))
-            except ValueError:
-                return 0.0
-        return 0.0
+        try:
+            return max(0.0, float(os.environ.get("DALTON_BRIDGE_TEST_DELAY_S", "0") or 0.0))
+        except ValueError:
+            return 0.0
 
 
 class ResearchDataBridge:

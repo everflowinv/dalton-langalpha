@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
+from src.config.env import LOCAL_DEV_USER_ID
 from src.dalton.autonomy.backoff import (
     clear_probe_backoff,
     is_in_backoff,
@@ -179,7 +180,7 @@ async def _triage_signals_with_llm(
             instructions=system_prompt,
             payload=user_payload,
             schema=TRIAGE_OUTPUT_SCHEMA,
-            user_id=str(user_id or "local-dev-user"),
+            user_id=str(user_id or LOCAL_DEV_USER_ID),
             workspace_id=workspace_id,
         )
     except Exception as e:
@@ -437,7 +438,7 @@ async def _preflight_check_inner(
 
     automation_id = str(automation.get("automation_id") or "") or None
     workspace_id = str(automation["workspace_id"]) if automation.get("workspace_id") else None
-    user_id = str(automation.get("user_id") or "local-dev-user")
+    user_id = str(automation.get("user_id") or LOCAL_DEV_USER_ID)
     name = str(automation.get("name") or "dalton-task")
     ticker = _extract_ticker(automation)
     kind = _determine_kind(automation)

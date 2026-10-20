@@ -7,6 +7,7 @@ from typing import Annotated, Any, Literal
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool, tool
 
+from src.config.env import LOCAL_DEV_USER_ID
 from src.dalton.database.publications import resolve_thread_author_model
 from src.dalton.publish.service import run_check_draft, run_publish
 from src.dalton.tools.knowledge_tools import (
@@ -53,7 +54,7 @@ def create_publish_tools(filesystem_backend: Any = None) -> list[BaseTool]:
             facts_path=facts_path,
             backend=filesystem_backend,
             use_llm_judge=True,
-            user_id=user_id or "local-dev-user",
+            user_id=user_id or LOCAL_DEV_USER_ID,
             thread_id=thread_id,
         )
         return str(res["message"])

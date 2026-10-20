@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 from typing import Any
 
+from src.config.env import LOCAL_DEV_USER_ID
 from src.dalton.llm.openclaw_catalog import FAMILY_PREFIX_TABLE, infer_family_from_model_id
 from src.dalton.llm.overlay import load_dalton_meta, load_overlay_data
 from src.dalton.settings import get_disabled_providers, is_broker_models_enabled
@@ -168,7 +169,7 @@ def is_forbidden_for_roles(model_key: str | None) -> bool:
 
 
 async def explain_model_availability(
-    user_id: str = "local-dev-user",
+    user_id: str = LOCAL_DEV_USER_ID,
     *,
     require_tool_calling: bool = False,
 ) -> dict[str, dict[str, Any]]:
@@ -265,7 +266,7 @@ async def explain_model_availability(
 
 
 async def available_model_keys(
-    user_id: str = "local-dev-user",
+    user_id: str = LOCAL_DEV_USER_ID,
     *,
     require_tool_calling: bool = False,
 ) -> set[str]:
@@ -322,19 +323,41 @@ def select_independent_reviewer(
     return None
 
 
-class RolePolicyError(RuntimeError):
+class DaltonStartupConfigError(RuntimeError):
+    """Fatal Dalton startup configuration or schema migration error (P0J.J3)."""
+
+
+class RolePolicyError(DaltonStartupConfigError):
     """Raised when a forbidden model (e.g. contributor OAuth variant, L21) is assigned to any role."""
 
 
 def _load_default_agent_config() -> dict[str, Any]:
-    cfg_path = REPO_ROOT / "agent_config.dalton.yaml"
-    if not cfg_path.exists():
+    from ptc_agent.config.file_utils import (
+        AGENT_CONFIG_FILE,
+        _deep_merge,
+        _read_yaml,
+        find_config_file,
+        load_yaml_config,
+    )
+
+    cfg_path = find_config_file(
+        AGENT_CONFIG_FILE,
+        search_paths=[REPO_ROOT],
+        env_var="PTC_CONFIG_FILE",
+    )
+    if cfg_path is None:
         return {}
     try:
-        import yaml
-
-        loaded = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
-        return loaded if isinstance(loaded, dict) else {}
+        loaded = load_yaml_config(str(cfg_path), use_cache=False)
+        if not isinstance(loaded, dict):
+            return {}
+        if not os.getenv("APP_ENV", "").strip() and cfg_path.name == AGENT_CONFIG_FILE:
+            dalton_overlay = cfg_path.with_name(f"{cfg_path.stem}.dalton{cfg_path.suffix}")
+            if dalton_overlay.is_file():
+                overlay_cfg = _read_yaml(dalton_overlay)
+                if isinstance(overlay_cfg, dict):
+                    loaded = _deep_merge(loaded, overlay_cfg)
+        return loaded
     except Exception:
         return {}
 

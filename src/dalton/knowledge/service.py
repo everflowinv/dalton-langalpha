@@ -721,12 +721,15 @@ async def append_verdict(
 ) -> dict[str, Any]:
     """Validate and record an event verdict, update agenda, and render ``verdicts.md`` (PK.4)."""
     v_copy = copy.deepcopy(verdict)
+    dropped_fields: list[str] = []
     for extra_sig_key in ("trigger_signal", "trigger_signals", "signal_id", "signal_ids", "signal_key", "signals"):
-        sig_val = v_copy.pop(extra_sig_key, None)
-        if extra_sig_key == "trigger_signal" and isinstance(sig_val, str) and sig_val.strip():
-            trig_obj = v_copy.get("trigger")
-            if isinstance(trig_obj, dict) and not trig_obj.get("ref"):
-                trig_obj["ref"] = sig_val.strip()
+        if extra_sig_key in v_copy:
+            sig_val = v_copy.pop(extra_sig_key, None)
+            dropped_fields.append(extra_sig_key)
+            if extra_sig_key == "trigger_signal" and isinstance(sig_val, str) and sig_val.strip():
+                trig_obj = v_copy.get("trigger")
+                if isinstance(trig_obj, dict) and not trig_obj.get("ref"):
+                    trig_obj["ref"] = sig_val.strip()
     now_iso = (
         datetime.now(timezone.utc)
         .replace(microsecond=0)
@@ -742,6 +745,15 @@ async def append_verdict(
     thesis_row = await db_knowledge.latest_valid_version(workspace_id, "thesis")
     thesis_doc = thesis_row["content"] if thesis_row else None
     val = validate_verdict(v_copy, thesis_doc=thesis_doc)
+    if dropped_fields:
+        val.warnings.append(
+            {
+                "code": "dropped_extra_fields",
+                "path": "/",
+                "dropped_fields": dropped_fields,
+                "message": f"dropped non-schema verdict fields: {', '.join(dropped_fields)}",
+            }
+        )
     if not val.ok:
         return {
             "ok": False,

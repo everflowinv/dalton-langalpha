@@ -21,6 +21,7 @@ from typing import Any
 import jsonschema
 import yaml
 
+from src.config.env import LOCAL_DEV_USER_ID
 from src.dalton.database.provider_events import sanitize_error_text
 from src.dalton.llm.complete import dalton_complete
 from src.dalton.settings import DALTON_YAML_PATH, REPO_ROOT
@@ -144,7 +145,7 @@ async def assist_json(
     payload: dict[str, Any],
     schema: dict[str, Any],
     *,
-    user_id: str = "local-dev-user",
+    user_id: str = LOCAL_DEV_USER_ID,
     role: str = "assist",
     scope_ref: str | None = None,
     timeout_s: float = 60.0,
@@ -159,6 +160,7 @@ async def assist_json(
     """
     t0 = time.monotonic()
     resolved_model = str(model or "")
+    user_id = str(user_id or LOCAL_DEV_USER_ID).strip()
 
     try:
         resolved_model = resolve_assist_model(role=role, explicit_model=model)
@@ -169,12 +171,7 @@ async def assist_json(
             default=str,
         )
         payload_sha = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()[:24]
-        if scope_ref:
-            eff_scope = scope_ref
-        elif user_id and user_id != "local-dev-user":
-            eff_scope = f"assist:{user_id}:{task}:{payload_sha}"
-        else:
-            eff_scope = f"assist:{task}:{payload_sha}"
+        eff_scope = scope_ref or f"assist:{user_id}:{task}:{payload_sha}"
 
         schema_json = json.dumps(schema, ensure_ascii=False, indent=2)
         system_prompt = (

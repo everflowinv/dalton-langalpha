@@ -49,7 +49,7 @@
       "fact": "2Q26 财报电话会（2026-07-30）CEO Andy Jassy 披露 AWS 定制芯片业务、AI 业务年化收入运行率各超过 250 亿美元；同时将 2026 全年现金资本开支（cash capex）指引上调至约 2,200 亿美元。",
       "figures": [
         {"metric": "芯片业务、AI 业务年化收入", "value": 25.0, "unit": "USD_bn", "period": "2Q26", "label": "reported"},
-        {"metric": "现金 capex 指引", "value": 220.0, "unit": "USD_bn", "period": "FY2026", "label": "guidance"}
+        {"metric": "现金 capex 指引", "value": 220.0, "unit": "USD_bn", "period": "FY2026", "label": "company_guidance"}
       ],
       "pillar_ids": ["P1"],
       "signal": "confirming",

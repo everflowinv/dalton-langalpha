@@ -11,6 +11,7 @@ from typing import Any
 
 from langgraph.types import interrupt
 
+from src.config.env import LOCAL_DEV_USER_ID
 from src.dalton.database import knowledge as db_knowledge
 from src.dalton.database import publications as db_publications
 from src.dalton.knowledge.paths import PUBLISHED_INDEX, RENDERED
@@ -99,7 +100,7 @@ async def run_check_draft(
     models_doc: dict[str, Any] | None = None,
     provenance_records: dict[str, dict[str, Any]] | None = None,
     use_llm_judge: bool = True,
-    user_id: str = "local-dev-user",
+    user_id: str = LOCAL_DEV_USER_ID,
     thread_id: str | None = None,
 ) -> dict[str, Any]:
     """Execute ``check_draft``: audit figures via ``aaudit_draft``, write ``.audit.md`` and ``.annotated.md``, never block (PK.9 / P0I §1.7)."""

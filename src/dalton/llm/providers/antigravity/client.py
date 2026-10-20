@@ -408,8 +408,8 @@ def _openai_tool_to_declaration(tool: dict) -> dict | None:
             deref = dereference_refs(parameters)
             if isinstance(deref, dict):
                 parameters = deref
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[antigravity] dereference_refs failed for tool %s: %s", name, exc)
         declaration["parameters"] = _sanitize_gemini_schema(parameters, is_property=False)
     return declaration
 

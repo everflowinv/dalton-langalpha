@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
+from src.config.env import LOCAL_DEV_USER_ID
 from src.dalton.settings import get_dalton_settings
 
 DALTON_NAME_RE = re.compile(r"^dalton-[a-z0-9][a-z0-9._-]{1,62}$")
@@ -325,7 +326,7 @@ def build_global_director_specs(
 
 
 async def schedule_dalton_automation_helper(
-    user_id: str = "local-dev-user",
+    user_id: str = LOCAL_DEV_USER_ID,
     name: Optional[str] = None,
     spec: Optional[dict[str, Any]] = None,
     *,

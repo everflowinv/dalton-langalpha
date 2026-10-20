@@ -144,7 +144,7 @@ async def build_coverage_board(
     try:
         async with get_db_connection() as conn:
             async with conn.cursor(row_factory=dict_row) as cur:
-                if user_id and user_id != "local-dev-user":
+                if user_id is not None:
                     await cur.execute(
                         """
                         SELECT workspace_id, name, description, status, updated_at
@@ -211,7 +211,7 @@ async def build_coverage_board(
                     """
                 )
                 req_rows = await cur.fetchall()
-                if user_id and user_id != "local-dev-user":
+                if user_id is not None:
                     req_rows = [r for r in req_rows if str(r.get("workspace_id") or "") in user_ws_ids]
                 pending_approvals = [
                     {
@@ -238,7 +238,7 @@ async def build_coverage_board(
                     """
                 )
                 sig_rows = await cur.fetchall()
-                if user_id and user_id != "local-dev-user":
+                if user_id is not None:
                     sig_rows = [s for s in sig_rows if str(s.get("workspace_id") or "") in user_ws_ids]
 
                 watch_state_by_ws: dict[str, dict[str, Any]] = {}
