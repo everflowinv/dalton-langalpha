@@ -42,14 +42,14 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.dalton.realrun._common import (
+from scripts.dalton.realrun._common import (  # noqa: E402
     RealRunHttpClient,
     build_evidence_envelope,
     new_test_user_id,
     now_utc_iso,
     write_evidence_and_summary,
 )
-from scripts.dalton.realrun.journal_dump import build_dsn_from_env
+from scripts.dalton.realrun.journal_dump import build_dsn_from_env  # noqa: E402
 
 
 def _resolve_deepseek_key() -> str:
@@ -302,11 +302,13 @@ def _capture_rejection_banner_screenshot(
         try:
             page = browser.new_page(viewport={"width": 960, "height": 420})
             page.set_content(html, wait_until="load")
-            page.screenshot(path=str(output_path), full_page=True)
+            raw_bytes = page.screenshot(full_page=True)
         finally:
             browser.close()
 
-    raw_bytes = output_path.read_bytes()
+    if "--record" in sys.argv:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(raw_bytes)
     return {
         "screenshot_path": str(output_path.relative_to(REPO_ROOT)),
         "bytes": len(raw_bytes),
@@ -319,25 +321,33 @@ def main() -> int:
     parser.add_argument("--backend", default="http://127.0.0.1:8000")
     parser.add_argument("--cap-usd", type=float, default=0.30)
     parser.add_argument("--date", default="20261019")
+    parser.add_argument("--record", action="store_true", help="Write evidence JSON and summary under var/dalton/")
     args = parser.parse_args()
 
     started_at = now_utc_iso()
-    test_user_id = new_test_user_id("g1")
+    base_user_id = new_test_user_id("g1")
+    user_a = f"{base_user_id}-a"
+    user_b = f"{base_user_id}-b"
+    test_user_id = f"{user_a},{user_b}"
     cap_usd = float(args.cap_usd)
+    user_b_cap_usd = 5.00
     ds_key = _resolve_deepseek_key()
 
     synthetic: list[dict[str, Any]] = [
         {
             "kind": "settings_api_budget",
             "entry_point": "PUT /api/v1/dalton/budget",
-            "description": f"通过设置接口将该测试用户的日现金额度设为 ${cap_usd:.4f}，用于验证真实花费触顶后下一轮对话被 HTTP 429 拒绝。",
+            "description": (
+                f"通过设置接口为预算测试用户 A ({user_a}) 设低日额度 ${cap_usd:.4f}、为用户 B ({user_b}) 设正常日额度 ${user_b_cap_usd:.2f}，"
+                "用于验证 A 真实花费触顶被 HTTP 429 拒绝的同时 B 正常调用不受影响。"
+            ),
         }
     ]
 
-    with RealRunHttpClient(base_url=args.backend, user_id=test_user_id, timeout_s=300.0) as client:
+    with RealRunHttpClient(base_url=args.backend, user_id=user_a, timeout_s=300.0) as client:
         client.ensure_user()
 
-        # 1. Set low daily budget cap via Settings API
+        # 1. Set low daily budget cap via Settings API for user A
         st_b, budget_cfg = client.put(
             "/api/v1/dalton/budget",
             json_body={"daily_cap_usd": cap_usd, "default_task_cap_usd": 0.50},
@@ -427,7 +437,6 @@ def main() -> int:
 
         pub_requests = _fetch_publish_requests_for_thread(thread_id)
         if len(pub_requests) < 2:
-            # If the model only called publish_report once in that turn, send a follow-up turn to call it the second time
             st_rev2, rev2_events, rev2_err = client.stream_sse(
                 "POST",
                 f"/api/v1/threads/{thread_id}/messages",
@@ -495,9 +504,6 @@ def main() -> int:
             )
             sub_summary = _extract_sse_summary(sub_events)
 
-            # Poll until all parallel background subagent tasks persist their conversation_usages rows
-            # (settled_usd > prev_settled_only and stabilized) AND any TASK_REPORT_BACK notification turn settles
-            # (open_reserved_usd == 0.0).
             after_turn_today = cur_today
             deadline = time.time() + 120.0
             while time.time() < deadline:
@@ -574,11 +580,57 @@ def main() -> int:
             budget_today=budget_at_cap,
         )
 
+    # 7. Two-user budget isolation: while user_a is rejected with HTTP 429, user_b (normal daily cap)
+    #    executes a normal conversation turn and probe and succeeds with HTTP 200 (P0J §5 G1).
+    with RealRunHttpClient(base_url=args.backend, user_id=user_b, timeout_s=180.0) as client_b:
+        client_b.ensure_user()
+        st_b_cfg, b_cfg = client_b.put(
+            "/api/v1/dalton/budget",
+            json_body={"daily_cap_usd": user_b_cap_usd, "default_task_cap_usd": 1.00},
+        )
+        assert st_b_cfg == 200, f"user_b PUT /api/v1/dalton/budget failed: {st_b_cfg} {b_cfg}"
+        st_b_k, _ = client_b.put(
+            "/api/v1/users/me/api-keys",
+            json_body={"byok_enabled": True, "api_keys": {"deepseek": ds_key}},
+        )
+        assert st_b_k == 200
+        st_b_ws, b_ws = client_b.post(
+            "/api/v1/workspaces",
+            json_body={"name": "GOOGL-B", "description": "G1 user_b isolation workspace"},
+        )
+        assert st_b_ws in (200, 201) and b_ws.get("workspace_id")
+        ws_b_id = str(b_ws["workspace_id"])
+        st_b_turn, b_events, b_err = client_b.stream_sse(
+            "POST",
+            "/api/v1/threads/messages",
+            json_body={
+                "workspace_id": ws_b_id,
+                "llm_model": "claude-sonnet-5-5-low-oauth",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "不要调用任何工具，仅用一句话确认你收到了本条消息。",
+                    }
+                ],
+            },
+            max_events=500,
+        )
+        assert st_b_turn == 200 and b_err is None, (
+            f"Expected user_b conversation turn to succeed with 200 while user_a is at 429, got {st_b_turn}: {b_err}"
+        )
+        b_turn_summary = _extract_sse_summary(b_events)
+        _, b_today = client_b.get("/api/v1/dalton/budget/today")
+        assert float(b_today.get("remaining_usd") or 0.0) > 4.5, (
+            f"Expected user_b remaining_usd > 4.5, got {b_today}"
+        )
+
     ended_at = now_utc_iso()
     script_cmd = f"scripts/dalton/realrun/g1_budget.py --cap-usd {cap_usd}"
 
     payload = {
+        "test_user_ids": [user_a, user_b],
         "scenario_1_low_cap_subagent_and_429_rejection": {
+            "user_id": user_a,
             "thread_id": thread_id,
             "workspace_id": workspace_id,
             "lead_model": "claude-sonnet-5-5-low-oauth",
@@ -598,6 +650,7 @@ def main() -> int:
             "frontend_rejection_screenshot": screenshot_info,
         },
         "scenario_2_settings_byok_cash_key_counted": {
+            "user_id": user_a,
             "settings_endpoint": "PUT /api/v1/users/me/api-keys",
             "byok_provider": "deepseek",
             "spent_usd_before_probe": today_before_probe.get("spent_usd"),
@@ -607,6 +660,7 @@ def main() -> int:
             "by_provider_after_probe": today_after_probe.get("by_provider"),
         },
         "scenario_3_review_second_call_cache_hit": {
+            "user_id": user_a,
             "draft_path": "drafts/g1_review_cache.md",
             "publish_requests": [
                 {
@@ -620,6 +674,18 @@ def main() -> int:
                 }
                 for pr in pub_requests[:2]
             ],
+        },
+        "scenario_4_two_user_budget_isolation": {
+            "user_a": user_a,
+            "user_a_http_status": rejected_status,
+            "user_b": user_b,
+            "user_b_cap_usd": user_b_cap_usd,
+            "user_b_http_status": st_b_turn,
+            "user_b_thread_id": b_turn_summary.get("thread_id"),
+            "user_b_reply_preview": b_turn_summary.get("assistant_reply_preview"),
+            "user_b_budget_today": {
+                k: v for k, v in b_today.items() if k not in ("_raw_rows", "_decimals")
+            },
         },
     }
 
@@ -655,25 +721,32 @@ def main() -> int:
     assert deepseek_conv_rows, (
         f"Expected at least one conversation_usages row for deepseek-flash with tokens > 0, got {conv_usages}"
     )
+    combined_cash_usd = float(
+        ((envelope.get("journal") or {}).get("totals") or {}).get("combined_cash_usd") or 0.0
+    )
+    assert combined_cash_usd <= 0.50, (
+        f"Expected G1 total combined_cash_usd <= 0.50 USD, got ${combined_cash_usd:.6f}"
+    )
 
     json_path = REPO_ROOT / "var" / "dalton" / "trial-runs" / f"realrun-{args.date}" / "g1_budget.json"
     md_path = (
         REPO_ROOT
-        / "docs"
+        / "var"
         / "dalton"
-        / "dev-guide"
         / "trial-runs"
         / f"realrun-{args.date}"
         / "G1.md"
     )
 
     key_metrics = {
-        "日额度上限 (`cap_usd`)": f"${cap_usd:.4f}",
+        "测试用户 A / B": f"`{user_a}`（低日额度 ${cap_usd:.2f}） / `{user_b}`（正常日额度 ${user_b_cap_usd:.2f}）",
         "主模型 (`lead_model`)": "claude-sonnet-5-5-low-oauth（Claude 订阅，现金成本 $0）",
         "现金子智能体 (`subagent:general-purpose`)": f"deepseek-flash（会话用量记录数：{len(deepseek_conv_rows)}，总花费计入 settled_usd=${float(budget_at_cap.get('settled_usd') or 0.0):.6f}）",
         "设置页 BYOK 现金 Key (`PUT /api/v1/users/me/api-keys`)": f"deepseek 探测花费 ${float(probe_resp.get('cash_usd') or 0.0):.6f} 计入 GET /api/v1/dalton/budget/today",
-        "触顶时日累计现金花费 (`spent_usd`)": f"${float(budget_at_cap.get('spent_usd') or 0.0):.6f}（剩余额度 ${float(budget_at_cap.get('remaining_usd') or 0.0):.6f}）",
-        "下一轮对话拒绝 (`POST /api/v1/threads/{id}/messages`)": f"HTTP {rejected_status}，detail.type = '{detail.get('type')}'",
+        "用户 A 触顶时日累计现金花费 (`spent_usd`)": f"${float(budget_at_cap.get('spent_usd') or 0.0):.6f}（剩余额度 ${float(budget_at_cap.get('remaining_usd') or 0.0):.6f}）",
+        "本轮总现金花费 (`combined_cash_usd <= $0.50`)": f"${combined_cash_usd:.6f}",
+        "用户 A 下一轮对话拒绝 (`POST /api/v1/threads/{id}/messages`)": f"HTTP {rejected_status}，detail.type = '{detail.get('type')}'",
+        "用户 B 并行对话请求 (`POST /api/v1/threads/messages`)": f"HTTP {st_b_turn}（正常通过，剩余额度 ${float(b_today.get('remaining_usd') or 0.0):.4f}）",
         "前端拒绝提示截图": screenshot_info["screenshot_path"],
         "前端拒绝提示截图 `sha256`": screenshot_info["sha256"],
         "审稿第二次命中缓存 (`publish.review`)": (
@@ -683,21 +756,23 @@ def main() -> int:
     }
 
     notes = [
-        f"被拒那一轮（`POST /api/v1/threads/{thread_id}/messages`）完整返回体：`{json.dumps(rejected_body, ensure_ascii=False)}`",
+        f"用户 A 被拒那一轮（`POST /api/v1/threads/{thread_id}/messages`）完整返回体：`{json.dumps(rejected_body, ensure_ascii=False)}`",
+        f"用户 B 在用户 A 被 429 拒绝的同时正常发起对话（`thread_id={b_turn_summary.get('thread_id')}`），返回 `HTTP {st_b_turn}`，证明日预算闸门按 `user_id` 严格隔离。",
         f"前端拒绝提示横幅截图保存在 `{screenshot_info['screenshot_path']}`（`{screenshot_info['bytes']}` bytes，`sha256={screenshot_info['sha256']}`）。",
     ]
 
-    _, _, sha = write_evidence_and_summary(
+    written_raw, written_md, sha = write_evidence_and_summary(
         family_code="G1",
-        title="预算闸门、现金子智能体花费、BYOK 现金计入与审稿缓存真实运行证据（P0I §7 G1）",
+        title="预算闸门、现金子智能体花费、BYOK 现金计入与双用户隔离真实运行证据（P0J §5 G1）",
         raw_json_path=json_path,
         summary_md_path=md_path,
         envelope=envelope,
         key_findings=list(key_metrics.items()),
         notes=notes,
+        record=args.record,
     )
-    print(f"G1 evidence written: {json_path} (sha256={sha})")
-    print(f"G1 summary written:  {md_path}")
+    print(f"G1 evidence (record={args.record}): {written_raw} (sha256={sha})")
+    print(f"G1 summary  (record={args.record}): {written_md}")
     return 0
 
 

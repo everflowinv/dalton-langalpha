@@ -174,6 +174,8 @@ TAVILY_API_KEY=<owner 提供>          # agent_config.yaml 的 search_api 默认
 DALTON_RESEARCHDATA_URL=<见数据篇 P0-D.1；值不入库>
 DALTON_BROKER_TOKEN=<broker v2 首次启动时生成在它的状态目录里，owner 复制过来；只能调模型，不是网关 operator 令牌>
 DALTON_BUDGET_GATE=1                 # 本地预算开关，见 P0.8
+REDIS_PASSWORD=redis                 # 与 Redis 容器 --requirepass 一致
+REDIS_URL=redis://:redis@localhost:6379/0  # 宿主机模式（uv run python server.py）必填带密码 URL，防止 [RB_WAKE] Authentication required 导致 /threads/messages 503；Docker 容器内由 docker-compose.dalton.yml 覆盖为 @redis:6379/0
 # 下面这个只给"网关 agent 对照组"（P0.5 --target gateway）用，主路径不需要：
 # OPENCLAW_GATEWAY_TOKEN=<owner 从 openclaw.json 的 gateway.auth.token 复制；我们的脚本绝不读这个字段>
 ```
@@ -315,6 +317,12 @@ du -sh "$COLIMA_HOME"                                               # VM 磁盘�
 ### 风险与注意
 
 - 后端容器里只有 `DALTON_BROKER_TOKEN`（只能调模型）。各家供应商的 apiKey 和 OAuth 凭证都留在宿主机的 OpenClaw 进程里，不进容器，也不进沙箱。
+- **宿主机与容器共跑时的 Redis 唤醒监听池鉴权（`REDIS_URL` 根因说明，P0J §1.4）：**
+  - **为什么需要密码：** `docker-compose.yml:35` 启动 `redis` 容器时使用 `redis-server --requirepass ${REDIS_PASSWORD:-redis}` 开启了密码鉴权。
+  - **哪个配置项读取了哪条连接串：** `src/utils/cache/redis_cache.py:125-129`（`RedisCacheClient.__init__`）通过 `get_nested_config('redis.url') or os.getenv("REDIS_URL", "redis://localhost:6379/0")` 读取 `config.yaml` 中的 `redis.url: "${REDIS_URL:-redis://localhost:6379/0}"`；随后状态/唤醒订阅池 `src/server/services/workspace_status_pubsub.py:80`（`_get_pubsub_client`，由 `src/server/services/report_back/handoff/wake_listener.py:314` 调用）与流式读取池 `src/utils/cache/stream_pool.py:114`（`get_stream_reader_client`）均直接读取 `cache.url` 调用 `ConnectionPool.from_url(cache.url, ...)`。
+  - **为什么容器与宿主机配置不一致：** 容器内运行时，`docker-compose.yml:65` 在 `REDIS_URL` 未显式设置时注入默认带密码的 `redis://:${REDIS_PASSWORD:-redis}@redis:6379/0`；而宿主机直接启动后端（`make dev` / `uv run python server.py`）时不会经过 `docker-compose.yml:65`，若 `.env` 未设置带密码的 `REDIS_URL=redis://:redis@localhost:6379/0`（或写了不带密码的 `redis://localhost:6379/0`），`cache.url` 就会落回无密码的 `redis://localhost:6379/0`。反过来，若 `.env` 设了 `REDIS_URL=redis://:redis@localhost:6379/0`，`docker-compose.yml:65` 的 `${REDIS_URL:-...}` 会把 `localhost:6379` 透传进容器导致容器内连不上 `redis` 服务名。
+  - **为什么表现为唤醒监听池持续报错且对话传输返回 503：** `RedisCacheClient.connect()`（`src/utils/cache/redis_cache.py:160-198`）在启动 `ping()` 遇到 `AuthenticationError: Authentication required.` 时会捕获异常并把 `self.client` 置为 `None`，但**保留了 `self.enabled = True` 和未带密码的 `self.url`**。因此普通缓存读写看到 `self.client is None` 直接静默跳过，而 `workspace_status_pubsub.py:59` 和 `stream_pool.py:102` 只检查 `getattr(cache, "enabled", False)`（仍为 `True`），继续用无密码的 `cache.url` 创建连接池；`ConnectionPool.from_url` 仅解析 URL 不做握手，直到 `wake_listener.py:323` 执行 `psubscribe` 或对话流执行事件缓冲操作才触发 `Authentication required.`，导致唤醒监听循环不断报错且 `POST /api/v1/threads/messages` 抛出 `EventBufferUnavailableError` 返回 HTTP 503。
+  - **固定配置方式：** `.env` 中设置宿主机可用的 `REDIS_URL=redis://:redis@localhost:6379/0`，同时在 `docker-compose.dalton.yml:8` 中为 `backend` 容器显式覆盖 `REDIS_URL: "redis://:${REDIS_PASSWORD:-redis}@redis:6379/0"`，并设置 `INTERNAL_SERVICE_TOKEN` 与 `DALTON_PM_USER_IDS=local-dev-user,realrun-pm-a`，使宿主机与容器两种部署形态下缓存池、流式池与唤醒监听池全部带密码正常握手。
 - 如果 colima 下 `host.docker.internal` 访问不到只绑 loopback 的网关（broker v2 也挂在这个端口上，所以结论一样）：
   - 先按 P0-D.0 的排查顺序处理（`host.lima.internal` / `192.168.5.2`、daemon 的 `host-gateway-ip`）；
   - 备选一：后端改在宿主机跑（`make setup-db` 起 PG/Redis，`make dev` 起后端，`make dev-web` 起前端）。这时 `{HOST_IP}` 自动解析为 `localhost`（`src/config/env.py:127`）。沙箱仍在 colima 里，仍要能访问宿主机桥；
@@ -1808,7 +1816,6 @@ async def get_run_charge_usd(run_ref: str) -> Decimal | None
 | catalog-cache | `src/server/app/api_keys.py` | `list_models()` 开头 | 约 4 |
 | router | `src/server/app/setup.py` | 约第 1324 行 | 2 |
 | budget-gate | `src/server/services/credit_gate_port.py` | `build_run_credit_gate`、`verify_credit_gate_wiring` | 约 6 |
-| budget-gate | `src/server/app/setup.py` | `lifespan` 启动时 `verify_credit_gate_wiring` 仅在 `DaltonStartupConfigError` 时阻断启动 | 约 5 |
 | budget-admission | `src/server/dependencies/usage_limits.py` | `enforce_credit_limit` | 3 |
 | settings-section | `web/src/pages/Settings/panels/ModelTab.tsx` | Providers & accounts 小节之后 | 2 |
 | query-keys | `web/src/lib/queryKeys.ts` | `dalton` 键组 | 约 8 |
