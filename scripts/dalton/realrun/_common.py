@@ -424,12 +424,12 @@ def assert_clean_and_synced_environment(
     base_url: str = "http://127.0.0.1:8000",
     user_id: str = "realrun-pm-a",
     record: bool | None = None,
-    git_sha_fn: Callable[[], str] = get_git_sha,
-    git_dirty_fn: Callable[[], bool] = is_git_dirty,
-    merged_main_fn: Callable[[], bool] = is_head_merged_into_main,
-    main_ancestor_fn: Callable[[], bool] = is_main_ancestor_of_head,
-    health_fn: Callable[[str, str], dict[str, Any]] = _probe_backend_health_sync,
-    env_check_fn: Callable[[str], dict[str, Any]] | None = None,
+    _git_sha_fn: Callable[[], str] = get_git_sha,
+    _git_dirty_fn: Callable[[], bool] = is_git_dirty,
+    _merged_main_fn: Callable[[], bool] = is_head_merged_into_main,
+    _main_ancestor_fn: Callable[[], bool] = is_main_ancestor_of_head,
+    _health_fn: Callable[[str, str], dict[str, Any]] = _probe_backend_health_sync,
+    _env_check_fn: Callable[[str], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Validate environment before running a real-run script (P0J §1.3, §1.4, §8.1 #13, L40, L41).
 
@@ -452,27 +452,27 @@ def assert_clean_and_synced_environment(
     if not record:
         ensure_debug_banner_printed()
         try:
-            return health_fn(base_url, user_id)
+            return _health_fn(base_url, user_id)
         except Exception as exc:
             raise SystemExit(f"ERROR: {exc}") from exc
 
-    if git_dirty_fn():
+    if _git_dirty_fn():
         raise SystemExit(
             "ERROR: Working tree is dirty (git status --porcelain is non-empty, L41). "
             "Refusing to run or write evidence."
         )
-    if not merged_main_fn():
+    if not _merged_main_fn():
         raise SystemExit(
             "ERROR: HEAD is not merged into origin/dalton/main (L41). Refusing to run or write formal evidence."
         )
-    if not main_ancestor_fn():
+    if not _main_ancestor_fn():
         raise SystemExit(
             "ERROR: HEAD does not share ancestry with origin/dalton/main (L41). Refusing to run on orphaned commit."
         )
 
-    local_sha = git_sha_fn()
+    local_sha = _git_sha_fn()
     try:
-        health = health_fn(base_url, user_id)
+        health = _health_fn(base_url, user_id)
     except Exception as exc:
         raise SystemExit(f"ERROR: {exc}") from exc
 
@@ -491,7 +491,7 @@ def assert_clean_and_synced_environment(
             "ERROR: Backend reported git_dirty=True at startup (L41). Restart backend from a clean working tree."
         )
 
-    resolved_env_check = env_check_fn or _default_live_env_check
+    resolved_env_check = _env_check_fn or _default_live_env_check
     try:
         env_payload = _get_or_run_env_check(base_url, resolved_env_check)
     except Exception as exc:
@@ -566,12 +566,12 @@ def build_evidence_envelope(
     request_trace: list[dict[str, Any]] | None = None,
     assertions: list[dict[str, Any]] | None = None,
     record: bool | None = None,
-    git_sha_fn: Callable[[], str] = get_git_sha,
-    git_dirty_fn: Callable[[], bool] = is_git_dirty,
-    merged_main_fn: Callable[[], bool] = is_head_merged_into_main,
-    main_ancestor_fn: Callable[[], bool] = is_main_ancestor_of_head,
-    health_fn: Callable[[str, str], dict[str, Any]] = _probe_backend_health_sync,
-    env_check_fn: Callable[[str], dict[str, Any]] | None = None,
+    _git_sha_fn: Callable[[], str] = get_git_sha,
+    _git_dirty_fn: Callable[[], bool] = is_git_dirty,
+    _merged_main_fn: Callable[[], bool] = is_head_merged_into_main,
+    _main_ancestor_fn: Callable[[], bool] = is_main_ancestor_of_head,
+    _health_fn: Callable[[str, str], dict[str, Any]] = _probe_backend_health_sync,
+    _env_check_fn: Callable[[str], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Construct a P0J §1.3 v2 compliant evidence JSON dictionary with live identity, version & check_env self-checks."""
     if record is None:
@@ -592,12 +592,12 @@ def build_evidence_envelope(
         base_url=probe_url,
         user_id=allowed_users[0] if allowed_users else test_user_id,
         record=record,
-        git_sha_fn=git_sha_fn,
-        git_dirty_fn=git_dirty_fn,
-        merged_main_fn=merged_main_fn,
-        main_ancestor_fn=main_ancestor_fn,
-        health_fn=health_fn,
-        env_check_fn=env_check_fn,
+        _git_sha_fn=_git_sha_fn,
+        _git_dirty_fn=_git_dirty_fn,
+        _merged_main_fn=_merged_main_fn,
+        _main_ancestor_fn=_main_ancestor_fn,
+        _health_fn=_health_fn,
+        _env_check_fn=_env_check_fn,
     )
 
     if journal is None:
@@ -609,8 +609,8 @@ def build_evidence_envelope(
             include_null_user=include_null_user_journal,
         )
 
-    git_sha = git_sha_fn()
-    git_dirty = git_dirty_fn()
+    git_sha = _git_sha_fn()
+    git_dirty = _git_dirty_fn()
     script_path, script_sha256 = _resolve_script_path_and_sha256(script)
     resolved_family = family or (extra_fields or {}).get("family") or _infer_family_from_script(script_path)
     resolved_sub_item = sub_item or (extra_fields or {}).get("sub_item") or f"{resolved_family}.all"
@@ -627,8 +627,8 @@ def build_evidence_envelope(
         or ("env" if os.getenv("DALTON_PM_USER_IDS", "").strip() else "default")
     )
 
-    if record or env_check_fn is not None:
-        resolved_env_check = env_check_fn or _default_live_env_check
+    if record or _env_check_fn is not None:
+        resolved_env_check = _env_check_fn or _default_live_env_check
         env_payload = _get_or_run_env_check(probe_url, resolved_env_check)
     else:
         env_payload = {"skipped_in_debug_mode": True, "record": False}
@@ -643,17 +643,17 @@ def build_evidence_envelope(
     invalid_reasons: list[str] = []
     if git_dirty:
         invalid_reasons.append("worktree_git_dirty")
-    if not merged_main_fn():
+    if not _merged_main_fn():
         invalid_reasons.append("head_not_merged_into_origin_dalton_main")
     if backend_git_dirty:
         invalid_reasons.append("backend_git_dirty")
     if backend_git_sha != git_sha:
         invalid_reasons.append(f"backend_git_sha_mismatch:{backend_git_sha}!={git_sha}")
-    if (record or env_check_fn is not None) and (
+    if (record or _env_check_fn is not None) and (
         not isinstance(env_payload, dict) or not env_payload.get("all_passed", False)
     ):
         invalid_reasons.append("check_env_not_all_passed")
-    elif not record and env_check_fn is None:
+    elif not record and _env_check_fn is None:
         invalid_reasons.append("debug_run_not_record")
     if "local-dev-user" in allowed_users:
         invalid_reasons.append("test_user_id_is_local_dev_user")
@@ -941,8 +941,8 @@ def write_evidence_and_summary(
     key_findings: list[tuple[str, Any]],
     notes: list[str] | None = None,
     record: bool | None = None,
-    git_dirty_fn: Callable[[], bool] = is_git_dirty,
-    merged_main_fn: Callable[[], bool] = is_head_merged_into_main,
+    _git_dirty_fn: Callable[[], bool] = is_git_dirty,
+    _merged_main_fn: Callable[[], bool] = is_head_merged_into_main,
     repo_root: Path = REPO_ROOT,
 ) -> tuple[Path, Path, str]:
     """Validate and optionally write raw JSON + runtime Markdown summary under `var/dalton/` when `--record` is enabled."""
@@ -989,11 +989,11 @@ def write_evidence_and_summary(
         ensure_debug_banner_printed()
         return raw_path, md_path, sha256_hex
 
-    if envelope.get("git_dirty") or git_dirty_fn():
+    if envelope.get("git_dirty") or _git_dirty_fn():
         raise SystemExit(
             "ERROR: Refusing to write evidence on dirty working tree (L41)."
         )
-    if not merged_main_fn():
+    if not _merged_main_fn():
         raise SystemExit(
             "ERROR: Refusing to write evidence when HEAD is not merged into origin/dalton/main (L41)."
         )

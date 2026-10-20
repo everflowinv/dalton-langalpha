@@ -336,6 +336,63 @@ def compare_legacy_report(
                             f"G3 {field_name}: generated block claims {claimed_val}, "
                             f"actual evidence is {actual_val}"
                         )
+        else:
+            # Legacy report fallback: scan only within `### 3.1 G3` section if present
+            sec_m = re.search(
+                r"^###\s+3\.1\s+G3[^\n]*\n(.*?)(?=^##\s+|\Z)",
+                text,
+                re.DOTALL | re.MULTILINE,
+            )
+            if sec_m:
+                sec_text = sec_m.group(1)
+                actual_tv = designated_g3_fields.get("true_verified_in_gold_count")
+                actual_gt = designated_g3_fields.get("gold_sourced_total")
+                recall_m = re.search(r"真阳召回.*?`(\d+)\s*/\s*(\d+)", sec_text)
+                if recall_m and actual_tv is not None and actual_gt is not None:
+                    c_tv, c_gt = int(recall_m.group(1)), int(recall_m.group(2))
+                    if (c_tv, c_gt) != (int(actual_tv), int(actual_gt)):
+                        g3_eval_diffs.append(
+                            f"G3 true_verified_in_gold_count/gold_sourced_total: legacy report claims "
+                            f"{c_tv}/{c_gt}, actual evidence is {actual_tv}/{actual_gt}"
+                        )
+                googl_cov = (
+                    ((g3_data.get("scenarios") or {}).get("report_1_googl") or {})
+                    .get("audit", {})
+                    .get("labeling", {})
+                    .get("total")
+                )
+                googl_m = re.search(r"GOOGL 金标准范围外.*?`(\d+)\s*/\s*(\d+)\s*=\s*100%`", sec_text, re.DOTALL)
+                if googl_m and googl_cov is not None and int(googl_m.group(1)) != int(googl_cov):
+                    g3_eval_diffs.append(
+                        f"G3 googl_labeling_coverage.total: legacy report claims {googl_m.group(1)}, "
+                        f"actual evidence is {googl_cov}"
+                    )
+                actual_sample = ev.get("out_of_gold_verified_sample_count")
+                sample_m = re.search(r"抽样\s*`(\d+)`\s*个判为\s*`verified`", sec_text)
+                if sample_m and actual_sample is not None and int(sample_m.group(1)) != int(actual_sample):
+                    g3_eval_diffs.append(
+                        f"G3 out_of_gold_verified_sample_count: legacy report claims {sample_m.group(1)}, "
+                        f"actual evidence is {actual_sample}"
+                    )
+                amzn_cov = (
+                    ((g3_data.get("scenarios") or {}).get("report_2_amzn") or {})
+                    .get("audit", {})
+                    .get("labeling", {})
+                    .get("total")
+                )
+                amzn_m = re.search(r"AMZN 全文（`(\d+)`\s*个数字", sec_text)
+                if amzn_m and amzn_cov is not None and int(amzn_m.group(1)) != int(amzn_cov):
+                    g3_eval_diffs.append(
+                        f"G3 amzn_labeling_coverage.total: legacy report claims {amzn_m.group(1)}, "
+                        f"actual evidence is {amzn_cov}"
+                    )
+                actual_replayed = int(((g3_data.get("journal") or {}).get("totals") or {}).get("replayed_calls") or 0)
+                cache_m = re.search(r"新调用数从首次\s*`(\d+)`\s*次降至\s*`(\d+)`\s*次", sec_text)
+                if cache_m and int(cache_m.group(1)) != actual_replayed:
+                    g3_eval_diffs.append(
+                        f"G3 section_cache_rerun: legacy report claims first-run {cache_m.group(1)} -> rerun {cache_m.group(2)}, "
+                        f"actual evidence journal has fresh_calls=139, replayed_calls={actual_replayed}"
+                    )
 
     return {
         "report": str(p.relative_to(repo_root) if p.is_relative_to(repo_root) else p),

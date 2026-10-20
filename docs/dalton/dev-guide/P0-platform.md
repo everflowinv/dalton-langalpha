@@ -324,37 +324,8 @@ du -sh "$COLIMA_HOME"                                               # VM 磁盘�
   - **为什么唤醒监听循环持续报错且 `POST /api/v1/threads/messages` 返回 HTTP 503：**
     1. 唤醒监听循环 `WakeListener._run()`（`src/server/services/report_back/handoff/wake_listener.py:314-332`）调用 `await get_shared_pubsub_client()`（`src/server/services/workspace_status_pubsub.py:100-109`）；该函数在第 `107-108` 行检查 `if not cache.enabled or not cache.client: return None`，因 `cache.enabled` 已被置为 `False` 而返回 `None`，导致 `wake_listener.py:315-321` 抛出 `ConnectionError("pub/sub pool unavailable")` 并在第 `332` 行反复输出 `[RB_WAKE] Wake listener error, resubscribing: pub/sub pool unavailable`。
     2. 对话接口 `POST /api/v1/threads/messages` 在 `_handle_send_message()`（`src/server/app/threads/messaging.py:552`）调用预检 `_assert_stream_transport_ready()`（`src/server/app/threads/messaging.py:61-104`）；第 `89-91` 行检查 `if cache.enabled and cache.client and await cache.client.ping(): return` 因 `cache.enabled` 为 `False` 不满足，直接在第 `94-104` 行抛出 `HTTPException(status_code=503, detail={"code": "transport_unavailable", "message": "The event-stream transport is temporarily unreachable; retry shortly."})`（同时若走到底层事件流写入 `RedisCacheClient.pipelined_event_buffer`，`src/utils/cache/redis_cache.py:583-586` 也会因 `if not self.enabled or not self.client:` 抛出 `EventBufferUnavailableError`，经 `src/utils/cache/stream_append.py:222-225` 转为 `StreamAppendError`）。
-  - **固定配置方式：** `.env` 中补齐宿主机使用的 `REDIS_URL=redis://:redis@localhost:6379/0`，并在 `docker-compose.dalton.yml:8` 中为 `backend` 容器显式覆盖 `REDIS_URL: "redis://:${REDIS_PASSWORD:-redis}@redis:6379/0"`（容器内访问 `redis` 服务名，宿主机访问 `localhost`），同时配置 `INTERNAL_SERVICE_TOKEN` 与 `DALTON_PM_USER_IDS=local-dev-user,realrun-pm-a`。
-  - **修复前后 `check_env.py` 对话传输层（`checks.conversation_transport`）实测输出结构（完整实测运行输出见 `scripts/dalton/pr_baseline.sh` 自动生成发布的 PR 评论）：**
-    - 修复前（缺失 `REDIS_URL`，`cache.enabled` 在启动 `ping()` 鉴权失败后被置为 `False`，`check_conversation_transport` 返回 `checks.conversation_transport`）：
-      ```json
-      {
-        "status": "FAIL",
-        "model": "antigravity/gemini-3-flash-preview",
-        "http_status": 503,
-        "sse_events_count": 0,
-        "conversation_usages_count": 0,
-        "user_id_verified": false,
-        "error": {
-          "detail": {
-            "code": "transport_unavailable",
-            "message": "The event-stream transport is temporarily unreachable; retry shortly."
-          }
-        }
-      }
-      ```
-    - 修复后（`.env` 补齐 `REDIS_URL=redis://:redis@localhost:6379/0` 且容器内由 `docker-compose.dalton.yml` 覆盖为 `redis://:${REDIS_PASSWORD:-redis}@redis:6379/0`，`check_conversation_transport` 返回 `checks.conversation_transport`，实跑原始输出由 `scripts/dalton/pr_baseline.sh` 直接生成）：
-      ```json
-      {
-        "status": "PASS",
-        "model": "antigravity/gemini-3-flash-preview",
-        "http_status": 200,
-        "sse_events_count": 9,
-        "conversation_usages_count": 1,
-        "user_id_verified": true,
-        "error": null
-      }
-      ```
+  - **固定配置方式：** `.env` 中补齐宿主机使用的 `REDIS_URL=redis://:redis@localhost:6379/0`，并在 `docker-compose.dalton.yml:13-14` 中为 `backend` 容器显式覆盖 `REDIS_URL: "redis://:${REDIS_PASSWORD:-redis}@redis:6379/0"`（容器内访问 `redis` 服务名，宿主机访问 `localhost`），同时配置 `INTERNAL_SERVICE_TOKEN` 与 `DALTON_PM_USER_IDS=local-dev-user,realrun-pm-a`。
+  - **实测验证结果：** 见 PR #25 中 `scripts/dalton/pr_baseline.sh` 发布的评论（https://github.com/everflowinv/dalton-langalpha/pull/25）。
 - 如果 colima 下 `host.docker.internal` 访问不到只绑 loopback 的网关（broker v2 也挂在这个端口上，所以结论一样）：
   - 先按 P0-D.0 的排查顺序处理（`host.lima.internal` / `192.168.5.2`、daemon 的 `host-gateway-ip`）；
   - 备选一：后端改在宿主机跑（`make setup-db` 起 PG/Redis，`make dev` 起后端，`make dev-web` 起前端）。这时 `{HOST_IP}` 自动解析为 `localhost`（`src/config/env.py:127`）。沙箱仍在 colima 里，仍要能访问宿主机桥；

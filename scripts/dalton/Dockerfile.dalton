@@ -44,12 +44,13 @@ COPY migrations/ migrations/
 COPY mcp_servers/ mcp_servers/
 COPY plugins/ plugins/
 COPY workflows/ workflows/
+COPY config/dalton/ config/dalton/
 
 COPY scripts/docker_entrypoint.sh /docker_entrypoint.sh
 RUN chmod +x /docker_entrypoint.sh
 
 # Mandatory build-time git SHA and dirty status (fail build if missing/invalid) +
-# deterministic SHA-256 manifest of bind-mounted code paths so startup detects any drift.
+# deterministic SHA-256 manifest of bind-mounted code/config paths so startup detects any drift or new files.
 ARG BUILD_GIT_SHA=""
 ARG BUILD_GIT_DIRTY=""
 RUN if [ -z "$BUILD_GIT_SHA" ] || [ "$BUILD_GIT_SHA" = "unknown" ]; then \
@@ -62,7 +63,9 @@ RUN if [ -z "$BUILD_GIT_SHA" ] || [ "$BUILD_GIT_SHA" = "unknown" ]; then \
     fi \
     && printf '%s\n' "$BUILD_GIT_SHA" | cut -c1-8 > /app/.build_git_sha \
     && printf '%s\n' "$BUILD_GIT_DIRTY" > /app/.build_git_dirty \
-    && find server.py libs/market-protocol src scripts migrations -type f -print0 \
+    && find server.py config.yaml agent_config.yaml agent_config.dalton.yaml alembic.ini \
+            config/dalton libs/market-protocol src scripts migrations mcp_servers plugins workflows \
+            -type f ! -path '*/__pycache__/*' ! -path '*/.pytest_cache/*' ! -name '*.pyc' ! -name '*.pyo' ! -name '.DS_Store' -print0 \
        | sort -z \
        | xargs -0 sha256sum > /app/.build_files.sha256
 

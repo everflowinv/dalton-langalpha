@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # scripts/dalton/pr_baseline.sh
 #
-# Run the 4 mandatory baseline commands (plus PR debug runs) on a clean working tree,
-# capture raw outputs, exit codes, git rev-parse HEAD, and start/end UTC timestamps into
-# a single markdown file, and publish directly via `gh pr comment <PR> --body-file <file>`
-# without manual copy/editing (P0J-round4-fixes.md §8.1 #15).
+# Run the 4 mandatory baseline commands (plus J1 acceptance/debug runs) on a clean working tree,
+# persist untruncated raw outputs under var/dalton/pr_baseline/<head_sha>/, capture exit codes,
+# git rev-parse HEAD, and start/end UTC timestamps into a single markdown file, and publish
+# directly via `gh pr comment <PR> --body-file <file>` without manual copy/editing
+# (P0J-round4-fixes.md §8.1 #15, PR #25 Review Items 5, 6, 7, 11).
 #
 # Usage:
 #   ./scripts/dalton/pr_baseline.sh [--pr <PR_NUMBER>] [--baseline-only] [--output <PATH>] [--no-comment]
@@ -61,26 +62,34 @@ HEAD_FULL="$(git rev-parse HEAD)"
 HEAD_SHORT="$(git rev-parse --short=8 HEAD)"
 BRANCH_NAME="$(git rev-parse --abbrev-ref HEAD)"
 SUITE_START_UTC="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+REMOTE_HEAD_OID="n/a"
+
+# 2. When --pr is provided, verify remote PR headRefOid matches local HEAD before running/publishing (Review Item 6)
+if [[ -n "$PR_NUMBER" ]]; then
+  REMOTE_HEAD_OID="$(gh pr view "$PR_NUMBER" --json headRefOid --jq .headRefOid)"
+  if [[ "$REMOTE_HEAD_OID" != "$HEAD_FULL" ]]; then
+    echo "ERROR: PR #${PR_NUMBER} remote headRefOid (${REMOTE_HEAD_OID}) != local HEAD (${HEAD_FULL})." >&2
+    echo "Push your local commits first (git push) before running pr_baseline.sh." >&2
+    exit 1
+  fi
+fi
+
+# 3. Persist untruncated raw logs under var/dalton/pr_baseline/<HEAD_SHORT>/ (Review Item 7)
+RAW_LOG_DIR="var/dalton/pr_baseline/${HEAD_SHORT}"
+mkdir -p "$RAW_LOG_DIR"
 
 if [[ -z "$OUTPUT_FILE" ]]; then
-  OUTPUT_FILE="/tmp/pr_baseline_${HEAD_SHORT}.md"
+  OUTPUT_FILE="${RAW_LOG_DIR}/pr_baseline_report.md"
 else
   mkdir -p "$(dirname "$OUTPUT_FILE")"
 fi
 
+BODY_SECTIONS_FILE="$(mktemp "/tmp/pr_baseline_sections_${HEAD_SHORT}_XXXXXX.md")"
+trap 'rm -f "$BODY_SECTIONS_FILE" "$REPO_ROOT/.pr_baseline_dirty_probe.tmp"' EXIT
+
 OVERALL_FAILURES=0
-
-cat > "$OUTPUT_FILE" <<EOF
-## Automated Baseline & Debug Run Report (\`scripts/dalton/pr_baseline.sh\`)
-
-- **Branch**: \`${BRANCH_NAME}\`
-- **HEAD (\`git rev-parse HEAD\`)**: \`${HEAD_FULL}\` (\`${HEAD_SHORT}\`)
-- **Working tree (\`git status --porcelain\`)**: clean (empty)
-- **Started at (UTC)**: \`${SUITE_START_UTC}\`
-- **Mode**: $(if [[ "$BASELINE_ONLY" -eq 1 ]]; then echo "\`--baseline-only\` (4 baseline commands)"; else echo "\`default / --j1-debug\` (4 baseline commands + J1 debug runs)"; fi)
-
----
-EOF
+FAILED_TITLES=()
+STEP_INDEX=0
 
 run_and_record() {
   local title="$1"
@@ -90,17 +99,21 @@ run_and_record() {
   local cmd_head
   local exit_code=0
   local tmp_out
-  local tmp_clean
+  local raw_log_file
   local clean_bytes
   local clean_lines
   local clean_sha
+  local slug
+
+  STEP_INDEX=$((STEP_INDEX + 1))
+  slug="$(printf "%02d_%s" "$STEP_INDEX" "$(echo "$title" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/_/g; s/^_+|_+$//g' | cut -c1-48)")"
+  raw_log_file="${RAW_LOG_DIR}/${slug}.log"
 
   cmd_start_utc="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
   cmd_head="$(git rev-parse HEAD)"
   tmp_out="$(mktemp)"
-  tmp_clean="$(mktemp)"
 
-  echo "[pr_baseline] Running: $title" >&2
+  echo "[pr_baseline] Running ($STEP_INDEX): $title" >&2
   set +e
   NO_COLOR=1 FORCE_COLOR=0 bash -c "$cmd_str" >"$tmp_out" 2>&1
   exit_code=$?
@@ -109,12 +122,15 @@ run_and_record() {
 
   if [[ "$exit_code" -ne 0 ]]; then
     OVERALL_FAILURES=$((OVERALL_FAILURES + 1))
+    FAILED_TITLES+=("${title} (exit=${exit_code})")
   fi
 
-  perl -pe 's/\e\[[0-9;]*[a-zA-Z]//g' "$tmp_out" > "$tmp_clean"
-  clean_bytes="$(wc -c < "$tmp_clean" | tr -d ' ')"
-  clean_lines="$(wc -l < "$tmp_clean" | tr -d ' ')"
-  clean_sha="$(shasum -a 256 "$tmp_clean" | awk '{print $1}')"
+  perl -pe 's/\e\[[0-9;]*[a-zA-Z]//g' "$tmp_out" > "$raw_log_file"
+  rm -f "$tmp_out"
+
+  clean_bytes="$(wc -c < "$raw_log_file" | tr -d ' ')"
+  clean_lines="$(wc -l < "$raw_log_file" | tr -d ' ')"
+  clean_sha="$(shasum -a 256 "$raw_log_file" | awk '{print $1}')"
 
   {
     echo ""
@@ -125,22 +141,30 @@ run_and_record() {
     echo "- **Started (UTC)**: \`${cmd_start_utc}\`"
     echo "- **Ended (UTC)**: \`${cmd_end_utc}\`"
     echo "- **Exit code**: \`${exit_code}\`"
-    echo "- **Raw output stats**: \`lines=${clean_lines}\`, \`bytes=${clean_bytes}\`, \`sha256=${clean_sha}\`"
+    echo "- **Persisted raw log**: \`${raw_log_file}\` (\`lines=${clean_lines}\`, \`bytes=${clean_bytes}\`, \`sha256=${clean_sha}\`)"
     echo ""
     echo "\`\`\`text"
     if [[ "$clean_bytes" -le 25000 ]]; then
-      cat "$tmp_clean"
+      cat "$raw_log_file"
     else
-      head -n 40 "$tmp_clean"
+      head -n 40 "$raw_log_file"
       echo ""
-      echo "... [middle lines omitted by pr_baseline.sh so total report fits GitHub's 65536-char comment limit: raw_lines=${clean_lines}, raw_bytes=${clean_bytes}, raw_sha256=${clean_sha}] ..."
+      echo "... [middle lines omitted for GitHub 65536-char comment limit; full untruncated log saved at ${raw_log_file} (lines=${clean_lines}, bytes=${clean_bytes}, sha256=${clean_sha})] ..."
+      if [[ "$clean_lines" -gt 100 ]]; then
+        local mid_end=$((clean_lines - 60))
+        local err_matches
+        err_matches="$(sed -n "41,${mid_end}p" "$raw_log_file" | grep -nE 'FAIL|Error|ERROR|failed|FAILED|Traceback|AssertionError' | head -n 80 || true)"
+        if [[ -n "$err_matches" ]]; then
+          echo "--- [Extracted FAIL/Error lines from omitted middle section] ---"
+          echo "$err_matches"
+          echo "----------------------------------------------------------------"
+        fi
+      fi
       echo ""
-      tail -n 60 "$tmp_clean"
+      tail -n 60 "$raw_log_file"
     fi
     echo "\`\`\`"
-  } >> "$OUTPUT_FILE"
-
-  rm -f "$tmp_out" "$tmp_clean"
+  } >> "$BODY_SECTIONS_FILE"
 }
 
 # Four mandatory baseline commands
@@ -160,26 +184,42 @@ run_and_record \
   "Baseline 4/4: Web Typecheck & Vitest" \
   "pnpm --dir web typecheck && pnpm --dir web test -- --run"
 
-# J1 debug runs (when not --baseline-only)
+# J1 acceptance & debug runs (when not --baseline-only)
 if [[ "$BASELINE_ONLY" -eq 0 ]]; then
   run_and_record \
-    "J1 Debug 1/5: Live /api/v1/dalton/openclaw/health Probe (realrun-pm-a & realrun-user-b)" \
+    "J1 Debug 1/9: src/ Net Line Delta (git diff origin/dalton/main...HEAD --stat -- src/)" \
+    "git diff origin/dalton/main...HEAD --stat -- src/"
+
+  run_and_record \
+    "J1 Debug 2/9: Live /api/v1/dalton/openclaw/health Probe (realrun-pm-a & realrun-user-b)" \
     "uv run python -c 'import json, os, httpx; from dotenv import load_dotenv; load_dotenv(\".env\"); tok = os.environ[\"INTERNAL_SERVICE_TOKEN\"]; c = httpx.Client(base_url=\"http://127.0.0.1:8000\", timeout=15.0, trust_env=False); print(\"=== realrun-pm-a ===\"); print(json.dumps(c.get(\"/api/v1/dalton/openclaw/health\", headers={\"X-User-Id\": \"realrun-pm-a\", \"X-Service-Token\": tok}).json(), indent=2, ensure_ascii=False)); print(\"=== realrun-user-b ===\"); print(json.dumps(c.get(\"/api/v1/dalton/openclaw/health\", headers={\"X-User-Id\": \"realrun-user-b\", \"X-Service-Token\": tok}).json(), indent=2, ensure_ascii=False))'"
 
   run_and_record \
-    "J1 Debug 2/5: Pre-flight Environment Check (check_env.py)" \
+    "J1 Debug 3/9: Pre-flight Environment Check (check_env.py)" \
     "uv run python scripts/dalton/realrun/check_env.py"
 
   run_and_record \
-    "J1 Debug 3/5: G2 Startup Fail-Fast Check (g2_providers.py --only-startup-check)" \
+    "J1 Debug 4/9: Dirty Working Tree Rejection on g1_budget.py --record (Expected Non-Zero Exit)" \
+    "touch .pr_baseline_dirty_probe.tmp && set +e; uv run python scripts/dalton/realrun/g1_budget.py --record; rc=\$?; rm -f .pr_baseline_dirty_probe.tmp; echo \"rejected_exit_code=\$rc\"; test \"\$rc\" -ne 0"
+
+  run_and_record \
+    "J1 Debug 5/9: Empty INTERNAL_SERVICE_TOKEN Rejection on check_env.py (Expected Non-Zero Exit)" \
+    "set +e; INTERNAL_SERVICE_TOKEN=\"\" uv run python scripts/dalton/realrun/check_env.py; rc=\$?; echo \"rejected_exit_code=\$rc\"; test \"\$rc\" -ne 0"
+
+  run_and_record \
+    "J1 Debug 6/9: Legacy Report Comparison Reproducing 5 Mismatched Rows & 5 G3 Mismatches (render_report_tables.py)" \
+    "uv run python -c 'import json, subprocess, sys; out = subprocess.check_output([sys.executable, \"scripts/dalton/realrun/render_report_tables.py\", \"--compare-legacy-report\", \"docs/dalton/dev-guide/P0I-round3-dev-report.md\", \"--evidence-dir\", \"var/dalton/trial-runs/realrun-20261019\"], text=True); print(out, end=\"\"); data = json.loads(out); assert data[\"mismatched_table_rows_count\"] == 5 and len(data[\"g3_evaluation_mismatches\"]) == 5'"
+
+  run_and_record \
+    "J1 Debug 7/9: G2 Startup Fail-Fast Check (g2_providers.py --only-startup-check)" \
     "uv run python scripts/dalton/realrun/g2_providers.py --only-startup-check"
 
   run_and_record \
-    "J1 Debug 4/5: G3 Live Migrated Thesis Version Check (g3_publish.py --only-migrated-check)" \
+    "J1 Debug 8/9: G3 Live Migrated Thesis Version Check (g3_publish.py --only-migrated-check)" \
     "uv run python scripts/dalton/realrun/g3_publish.py --only-migrated-check"
 
   run_and_record \
-    "J1 Debug 5/5: G6 Financial Lenses Debug Run (g6_lenses.py)" \
+    "J1 Debug 9/9: G6 Financial Lenses Debug Run (g6_lenses.py)" \
     "uv run python scripts/dalton/realrun/g6_lenses.py"
 fi
 
@@ -195,25 +235,48 @@ if [[ -n "$DIRTY_AFTER" ]]; then
   echo "ERROR: Working tree became dirty after running pr_baseline.sh!" >&2
   echo "$DIRTY_AFTER" >&2
   OVERALL_FAILURES=$((OVERALL_FAILURES + 1))
+  FAILED_TITLES+=("Post-run git status --porcelain clean check")
+fi
+
+OVERALL_STATUS_LINE="PASS (0 failed)"
+if [[ "$OVERALL_FAILURES" -ne 0 ]]; then
+  OVERALL_STATUS_LINE="FAIL (${OVERALL_FAILURES} failed: ${FAILED_TITLES[*]})"
 fi
 
 {
+  echo "## Automated Baseline & Debug Run Report (\`scripts/dalton/pr_baseline.sh\`)"
+  echo ""
+  echo "- **Overall Status**: **${OVERALL_STATUS_LINE}**"
+  echo "- **Branch**: \`${BRANCH_NAME}\`"
+  echo "- **HEAD (\`git rev-parse HEAD\`)**: \`${HEAD_FULL}\` (\`${HEAD_SHORT}\`)"
+  if [[ -n "$PR_NUMBER" ]]; then
+    echo "- **Remote PR #${PR_NUMBER} \`headRefOid\` verified**: \`${REMOTE_HEAD_OID}\` (matches local \`HEAD\`)"
+  fi
+  echo "- **Working tree before/after (\`git status --porcelain\`)**: $(if [[ -z "$DIRTY_AFTER" ]]; then echo "clean (empty)"; else echo "DIRTY"; fi)"
+  echo "- **Persisted raw log directory**: \`${RAW_LOG_DIR}/\`"
+  echo "- **Started at (UTC)**: \`${SUITE_START_UTC}\`"
+  echo "- **Finished at (UTC)**: \`${SUITE_END_UTC}\`"
+  echo "- **Mode**: $(if [[ "$BASELINE_ONLY" -eq 1 ]]; then echo "\`--baseline-only\` (4 baseline commands)"; else echo "\`default / --j1-debug\` (4 baseline commands + 9 J1 acceptance/debug runs)"; fi)"
+  echo ""
+  echo "---"
+  cat "$BODY_SECTIONS_FILE"
   echo ""
   echo "---"
   echo ""
   echo "- **Finished at (UTC)**: \`${SUITE_END_UTC}\`"
   echo "- **Working tree after run (\`git status --porcelain\`)**: $(if [[ -z "$DIRTY_AFTER" ]]; then echo "clean (empty)"; else echo "DIRTY"; fi)"
   echo "- **Failed commands count**: \`${OVERALL_FAILURES}\`"
-} >> "$OUTPUT_FILE"
+} > "$OUTPUT_FILE"
 
 echo "[pr_baseline] Output written to: $OUTPUT_FILE (failures=$OVERALL_FAILURES)" >&2
 
-if [[ "$OVERALL_FAILURES" -ne 0 ]]; then
-  echo "ERROR: $OVERALL_FAILURES command(s) failed during pr_baseline.sh; refusing to publish failing report." >&2
-  exit 1
-fi
-
+# Always publish report (even when OVERALL_FAILURES > 0) before exiting non-zero (Review Item 5)
 if [[ -n "$PR_NUMBER" && "$NO_COMMENT" -eq 0 ]]; then
   echo "[pr_baseline] Publishing comment to PR #${PR_NUMBER} via gh pr comment --body-file ..." >&2
   gh pr comment "$PR_NUMBER" --body-file "$OUTPUT_FILE"
+fi
+
+if [[ "$OVERALL_FAILURES" -ne 0 ]]; then
+  echo "ERROR: $OVERALL_FAILURES command(s) failed during pr_baseline.sh." >&2
+  exit 1
 fi

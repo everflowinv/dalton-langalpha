@@ -11,8 +11,8 @@ Checks in order:
    - Local working tree is clean (`git_dirty == False`).
    - Backend `git_sha` equals local `HEAD` (`git_sha`), and `backend_git_dirty == False`.
 3. `conversation_transport`:
-   - Sends a minimal `POST /api/v1/threads/messages` turn as `realrun-pm-a` using a subscription model (`ocb-openai-gpt-6-luna`),
-     verifying HTTP 200 (covering the Redis wake listener pool) and a `conversation_usages` row recorded under `user_id == "realrun-pm-a"`.
+   - Sends a minimal `POST /api/v1/threads/messages` turn as `realrun-pm-a` using a subscription model (`gemini-3.8-flash-low-oauth`),
+     verifying HTTP 200 (covering the Redis wake listener pool) and a `conversation_usages` row recorded under `user_id == "realrun-pm-a"` with `cash_usd == 0.0`.
 4. `bridge`:
    - `http://127.0.0.1:8960/healthz` returns 200 and one real MCP `tools/call` read succeeds.
 5. `broker`:
@@ -20,7 +20,7 @@ Checks in order:
 6. `deployment`:
    - Reports whether the backend is running in `docker` or `host` mode.
 7. `static_script_scan`:
-   - Scans `scripts/dalton/realrun/g*.py` for forbidden `from src` imports and direct `INSERT INTO` SQL statements.
+   - Scans `scripts/dalton/realrun/g*.py` for forbidden `from src` imports, direct `INSERT INTO` SQL statements, `_for_check_env_probe`, and `*_fn=` preflight override arguments.
 """
 
 from __future__ import annotations
@@ -58,6 +58,7 @@ BRIDGE_ENV_FILE = Path.home() / ".config" / "dalton" / "researchdata-bridge.env"
 _FROM_SRC_RE = re.compile(r"\b(?:from|import)\s+src\b")
 _INSERT_INTO_RE = re.compile(r"\bINSERT\s+INTO\s+([a-zA-Z0-9_]+)", re.IGNORECASE)
 _FOR_CHECK_ENV_PROBE_RE = re.compile(r"\b_for_check_env_probe\b")
+_FN_OVERRIDE_RE = re.compile(r"\b[a-zA-Z0-9_]*_fn\s*=")
 
 
 def _read_bridge_token() -> str:
@@ -72,7 +73,7 @@ def _read_bridge_token() -> str:
 def scan_realrun_scripts(
     script_paths: list[Path] | None = None,
 ) -> dict[str, Any]:
-    """Scan `scripts/dalton/realrun/g*.py` for `from src`, `INSERT INTO`, and `_for_check_env_probe` (P0J §1.5)."""
+    """Scan `scripts/dalton/realrun/g*.py` for `from src`, `INSERT INTO`, `_for_check_env_probe`, and `*_fn=` (P0J §1.5)."""
     if script_paths is None:
         script_paths = sorted((REPO_ROOT / "scripts" / "dalton" / "realrun").glob("g*.py"))
 
@@ -116,6 +117,15 @@ def scan_realrun_scripts(
                         "file": rel_path,
                         "line": lineno,
                         "kind": "forbidden_check_env_probe_call",
+                        "snippet": stripped[:120],
+                    }
+                )
+            if _FN_OVERRIDE_RE.search(line):
+                violations.append(
+                    {
+                        "file": rel_path,
+                        "line": lineno,
+                        "kind": "forbidden_preflight_fn_override",
                         "snippet": stripped[:120],
                     }
                 )
@@ -224,20 +234,42 @@ def check_identity_and_version(base_url: str) -> tuple[dict[str, Any], dict[str,
 
 
 def check_conversation_transport(
-    base_url: str, model: str = "ocb-openai-gpt-6-luna"
+    base_url: str, model: str = "gemini-3.8-flash-low-oauth"
 ) -> dict[str, Any]:
     """Run check #3: minimal `POST /api/v1/threads/messages` turn covering Redis wake listener and `conversation_usages`."""
     t0 = now_utc_iso()
     ws_id: str | None = None
+    prior_budget: dict[str, Any] | None = None
+    was_configured = False
+    budget_modified = False
     try:
         with RealRunHttpClient._for_check_env_probe(
             base_url=base_url, user_id="realrun-pm-a", timeout_s=120.0
         ) as client:
-            # Ensure realrun-pm-a has a daily budget configured so LocalBudgetPort admits the turn (G1.1)
-            client.put(
-                "/api/v1/dalton/budget",
-                json_body={"daily_cap_usd": 5.0, "default_task_cap_usd": 5.0},
+            st_b, body_b = client.get("/api/v1/dalton/budget")
+            st_bt, body_bt = client.get("/api/v1/dalton/budget/today")
+            if st_b == 200 and isinstance(body_b, dict):
+                prior_budget = body_b
+                was_configured = bool(body_b.get("configured"))
+            remaining_usd = (
+                float(body_bt.get("remaining_usd") or 0.0)
+                if st_bt == 200 and isinstance(body_bt, dict)
+                else 0.0
             )
+            spent_usd = (
+                float(body_bt.get("spent_usd") or 0.0)
+                if st_bt == 200 and isinstance(body_bt, dict)
+                else 0.0
+            )
+            # Only set a temporary budget if realrun-pm-a has none configured or remaining_usd <= 0
+            if not was_configured or remaining_usd <= 0.0:
+                probe_cap = max(5.0, spent_usd + 1.0)
+                client.put(
+                    "/api/v1/dalton/budget",
+                    json_body={"daily_cap_usd": probe_cap, "default_task_cap_usd": 5.0},
+                )
+                budget_modified = True
+
             st_ws, body_ws = client.post(
                 "/api/v1/workspaces",
                 json_body={"name": "check-env-transport", "description": "P0J §1.4 check_env transport probe"},
@@ -261,12 +293,27 @@ def check_conversation_transport(
                 max_events=300,
             )
     finally:
-        if ws_id:
+        if ws_id or (budget_modified and was_configured and isinstance(prior_budget, dict)):
             try:
                 with RealRunHttpClient._for_check_env_probe(
                     base_url=base_url, user_id="realrun-pm-a", timeout_s=30.0
                 ) as cleanup_client:
-                    cleanup_client.delete(f"/api/v1/workspaces/{ws_id}")
+                    if ws_id:
+                        cleanup_client.delete(f"/api/v1/workspaces/{ws_id}")
+                    if (
+                        budget_modified
+                        and was_configured
+                        and isinstance(prior_budget, dict)
+                        and prior_budget.get("daily_cap_usd") is not None
+                    ):
+                        cleanup_client.put(
+                            "/api/v1/dalton/budget",
+                            json_body={
+                                "daily_cap_usd": float(prior_budget["daily_cap_usd"]),
+                                "default_task_cap_usd": prior_budget.get("default_task_cap_usd"),
+                                "timezone": str(prior_budget.get("timezone") or "Asia/Shanghai"),
+                            },
+                        )
             except Exception:
                 pass
 
@@ -277,11 +324,13 @@ def check_conversation_transport(
     conv_rows = j.get("conversation_usages") or []
     pm_rows = [r for r in conv_rows if r.get("user_id") == "realrun-pm-a"]
     unexpected_users = j.get("totals", {}).get("unexpected_user_ids") or []
+    probe_cash_usd = round(sum(float(r.get("cash_usd") or 0.0) for r in pm_rows), 6)
 
     ok = (
         st_msg == 200
         and len(events) > 0
         and len(pm_rows) >= 1
+        and probe_cash_usd == 0.0
         and len(unexpected_users) == 0
         and not j.get("totals", {}).get("conversation_usages_unavailable", False)
     )
@@ -291,6 +340,7 @@ def check_conversation_transport(
         "http_status": st_msg,
         "sse_events_count": len(events),
         "conversation_usages_count": len(pm_rows),
+        "cash_usd": probe_cash_usd,
         "user_id_verified": len(pm_rows) >= 1 and all(r.get("user_id") == "realrun-pm-a" for r in pm_rows),
         "error": err_body if st_msg != 200 else None,
     }
@@ -381,7 +431,7 @@ def run_all_checks(
     backend_url: str = "http://127.0.0.1:8000",
     bridge_url: str = "http://127.0.0.1:8960",
     broker_url: str | None = None,
-    transport_model: str = "ocb-openai-gpt-6-luna",
+    transport_model: str = "gemini-3.8-flash-low-oauth",
     strict_static_scan: bool = False,
 ) -> dict[str, Any]:
     svc_token = os.getenv("INTERNAL_SERVICE_TOKEN", "").strip()
@@ -433,8 +483,8 @@ def main() -> int:
     parser.add_argument("--broker", default=None, help="OpenClaw broker base URL")
     parser.add_argument(
         "--model",
-        default="ocb-openai-gpt-6-luna",
-        help="Subscription model for transport probe",
+        default="gemini-3.8-flash-low-oauth",
+        help="Subscription model for transport probe (cash_usd == 0)",
     )
     parser.add_argument("--strict-static-scan", action="store_true", help="Fail on pre-J3 legacy script items")
     args = parser.parse_args()

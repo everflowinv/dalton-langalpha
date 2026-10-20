@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""G6 Real-Run Verification Script — Financial Lenses Unified `--anchors` (P0I §6, §7 G6, P0J §5.7, L37).
+"""G6 Real-Run Verification Script — Financial Lenses Unified `--anchors` (P0I §6, §7 G6, P0J §5.7, §8.1 #17, L37).
 
 Runs `anchors.py --allow-network`, `netcash.py --anchors`, `return_score.py --anchors`, and
-`earnings_quality.py --anchors` for `BABA`, `0700.HK`, and `META` using the committed filing
-inputs in `tests/fixtures/dalton/g6/lenses_inputs.json`, asserting:
+`earnings_quality.py --anchors` for `BABA`, `0700.HK`, and `META` using the committed illustrative
+inputs in `tests/fixtures/dalton/g6/lenses_inputs.json` (`"illustrative": true`) plus live
+`yfinance` market cap and FX anchors, asserting:
 1. Identical `market_cap_usd_mn`, `fx_rate_to_usd`, and `period_end` across all lenses for each ticker.
 2. `anchors_source == "anchors"` on all lens outputs.
 3. `(basic_net_cash_usd - restricted_cash_usd_equiv) == strict_net_cash_usd` (within < 0.01 rounding)
@@ -39,26 +40,6 @@ LENSES_SCRIPTS_DIR = (
 )
 LENSES_OUT_DIR = REPO_ROOT / "var" / "dalton" / "lenses"
 LENSES_FIXTURE_PATH = REPO_ROOT / "tests" / "fixtures" / "dalton" / "g6" / "lenses_inputs.json"
-
-# Analyst forward estimate (fwd_total) and judgment parameters (credibility / credibility_reason)
-# for return_score.py — kept separate from historical filing line items in lenses_inputs.json
-ANALYST_CREDIBILITY_BY_TICKER: dict[str, dict[str, str]] = {
-    "BABA": {
-        "fwd_total": "6.20",
-        "credibility": "90",
-        "credibility_reason": "持续执行大规模注销式回购并派发年度股息（分析师前瞻与主观判断参数，非历史财报原始科目）",
-    },
-    "0700.HK": {
-        "fwd_total": "3.60",
-        "credibility": "90",
-        "credibility_reason": "千亿港元回购计划按季稳定兑现并注销股份（分析师前瞻与主观判断参数，非历史财报原始科目）",
-    },
-    "META": {
-        "fwd_total": "2.10",
-        "credibility": "90",
-        "credibility_reason": "强劲自由现金流支撑季度分红与持续回购（分析师前瞻与主观判断参数，非历史财报原始科目）",
-    },
-}
 
 
 def _field_str(container: dict[str, Any], key: str, default: str = "0") -> str:
@@ -110,11 +91,11 @@ def render_comparison_markdown(results_by_ticker: dict[str, Any], run_date: str 
     meta_impl_pct = round(100.0 - meta["strict_net_cash_to_mcap_pct"], 2)
 
     lines = [
-        "# G6.2 财务镜头脚本真实运行与基金原脚本对比记录 (统一锚点与受限现金单次扣除)",
+        "# G6.2 财务镜头脚本命令链路与基金原脚本对比记录 (统一锚点与受限现金单次扣除)",
         "",
         "- **生成方式**：由 `python -m scripts.dalton.realrun._common --render-docs` 从 `var/dalton/trial-runs/` 下的 G6 实跑证据 JSON 直接渲染生成（无手写硬编码表）",
-        "- **对应指南**：`P0J-round4-fixes.md` §5.7 (`G6`)、`P0I-round3-fixes.md` §6 (`I6`)",
-        "- **输入科目出处**：`tests/fixtures/dalton/g6/lenses_inputs.json`（每项历史财报科目均单独标注真实 SEC `accession` 或港交所披露易公告编号与 PDF 链接，其中 TTM 与期初/多年度科目分别标明对应的年报与中期报告组合；`return_score.py` 的前瞻预期 `fwd_total` 及主观判断参数 `credibility`/`credibility_reason` 由 `scripts/dalton/realrun/g6_lenses.py` 的 `ANALYST_CREDIBILITY_BY_TICKER` 传入），市值与汇率由 `anchors.py --allow-network` 实时从 `yfinance` 拉取",
+        "- **对应指南**：`P0J-round4-fixes.md` §5.7 (`G6`)、§8.1 第 17 条、`P0I-round3-fixes.md` §6 (`I6`)",
+        "- **输入说明（示意数据，`illustrative: true`）**：科目数值取自 `tests/fixtures/dalton/g6/lenses_inputs.json`，属于示意输入，用于验证镜头命令链路、跨镜头锚点一致性与受限现金单次扣除逻辑，**不是公司真实财报数据**；市值与汇率由 `anchors.py --allow-network` 实时从 `yfinance` 拉取。本文档仅比较**同一组示意输入下，Dalton 镜头与基金原脚本的输出与口径行为是否一致**",
         "- **真实运行产物路径（`--record` 模式写入 `var/dalton/lenses/`）**：",
         f"  - `var/dalton/lenses/baba_anchors_{date_tag}.json`",
         f"  - `var/dalton/lenses/baba_netcash_{date_tag}.json`",
@@ -131,11 +112,11 @@ def render_comparison_markdown(results_by_ticker: dict[str, Any], run_date: str 
         "",
         "---",
         "",
-        "## 1. 按 `SKILL.md` 统一 `--anchors` 命令真实运行汇总（`BABA`、`0700.HK`、`META`）",
+        "## 1. 同一组示意输入 + 实时 `anchors.py` 锚点下的镜头输出汇总（`BABA`、`0700.HK`、`META`）",
         "",
-        "三组标的先由 `anchors.py --allow-network` 实时拉取市值与汇率生成锚点 JSON，再将 `--anchors <anchors.json>` 统一传给 `netcash.py`、`return_score.py`、`earnings_quality.py`（所有镜头输出均带 `\"anchors_source\": \"anchors\"` 且 `market_cap_usd_mn`、`fx_rate_to_usd`、`period_end` 完全一致；口径 A `basic_net_cash_usd` 包含受限现金，口径 B `strict_net_cash_usd` 从口径 A 扣除一次受限现金 `restricted_cash_usd_equiv`，满足 `(basic_net_cash_usd - restricted_cash_usd_equiv) == strict_net_cash_usd`）：",
+        "三组标的先由 `anchors.py --allow-network` 实时拉取市值与汇率生成锚点 JSON，再将 `--anchors <anchors.json>` 与 `tests/fixtures/dalton/g6/lenses_inputs.json` 的示意输入统一传给 `netcash.py`、`return_score.py`、`earnings_quality.py`（所有镜头输出均带 `\"anchors_source\": \"anchors\"` 且 `market_cap_usd_mn`、`fx_rate_to_usd`、`period_end` 完全一致；口径 A `basic_net_cash_usd` 包含受限现金，口径 B `strict_net_cash_usd` 从口径 A 扣除一次受限现金 `restricted_cash_usd_equiv`，满足 `(basic_net_cash_usd - restricted_cash_usd_equiv) == strict_net_cash_usd`；注：表中现金、负债、利润与现金流等输入均为示意数据，非公司真实财务数据）：",
         "",
-        "| 标的 | 交易币种 | 财报币种 (`--reporting-currency`) | 锁定汇率 (`fx_rate_to_usd`) | 锁定市值 (`market_cap_usd_mn`) | 口径 A 基础净现金 (`basic_net_cash_usd`) | 受限现金折算 (`restricted_cash_usd_equiv`) | 口径 B 严格净现金 (`strict_net_cash_usd`) | 隐含经营资产 (Strict) | 股东回报评分 (`final_score`) | 盈利质量 (`overall_quality` / Operating Sloan) |",
+        "| 标的 | 交易币种 | 报表币种 (`--reporting-currency`) | 锁定汇率 (`fx_rate_to_usd`) | 锁定市值 (`market_cap_usd_mn`) | 口径 A 基础净现金 (`basic_net_cash_usd`, 示意输入) | 受限现金折算 (`restricted_cash_usd_equiv`, 示意输入) | 口径 B 严格净现金 (`strict_net_cash_usd`, 示意输入) | 隐含经营资产 (Strict, 示意输入) | 股东回报评分 (`final_score`, 示意输入) | 盈利质量 (`overall_quality` / Operating Sloan, 示意输入) |",
         "|---|---|---|---|---|---|---|---|---|---|---|",
         (
             f"| **BABA** | `USD` (ADR 1:8) | `CNY` | `CNYUSD=X = {baba['fx_rate_to_usd']}` | "
@@ -195,6 +176,9 @@ def main() -> int:
     user_a = "realrun-pm-a"
 
     fixture_data = json.loads(LENSES_FIXTURE_PATH.read_text(encoding="utf-8"))
+    assert fixture_data.get("illustrative") is True, (
+        "tests/fixtures/dalton/g6/lenses_inputs.json must declare \"illustrative\": true (P0J §8.1 #17)"
+    )
     companies_list = fixture_data["companies"]
 
     results_by_ticker: dict[str, Any] = {}
@@ -253,7 +237,6 @@ def main() -> int:
             pending_lens_files.append((LENSES_OUT_DIR / f"{slug}_netcash_{args.date}.json", nc_out))
 
             rs_in = item["return_score"]
-            cred_cfg = ANALYST_CREDIBILITY_BY_TICKER[ticker]
             return_args = [
                 "--anchors",
                 str(anchors_file),
@@ -266,11 +249,11 @@ def main() -> int:
                 "--annual",
                 _field_str(rs_in, "annual"),
                 "--fwd-total",
-                str(cred_cfg["fwd_total"]),
+                _field_str(rs_in, "fwd_total"),
                 "--credibility",
-                str(cred_cfg["credibility"]),
+                _field_str(rs_in, "credibility"),
                 "--credibility-reason",
-                str(cred_cfg["credibility_reason"]),
+                _field_str(rs_in, "credibility_reason"),
             ]
             rs_out = _run_script("return_score.py", return_args)
             pending_lens_files.append((LENSES_OUT_DIR / f"{slug}_return_score_{args.date}.json", rs_out))
@@ -344,8 +327,7 @@ def main() -> int:
 
             results_by_ticker[ticker] = {
                 "period_end": expected_period,
-                "filing": item.get("filing"),
-                "analyst_credibility": cred_cfg,
+                "illustrative_input": True,
                 "market_cap_usd_mn": expected_mcap,
                 "market_cap_source": anchors_out["market_cap"]["source"],
                 "fx_rate_to_usd": expected_fx,
@@ -388,21 +370,20 @@ def main() -> int:
                 "kind": "committed_fixture_input",
                 "entry_point": "tests/fixtures/dalton/g6/lenses_inputs.json",
                 "description": (
-                    "使用入库的 BABA / 0700.HK / META 历史财报科目夹具（每项科目均单独标明真实来源：期末资产负债表取当期季报/中期公告，"
-                    "期初资产取上年同期比较期报表，TTM 现金流与分红回购取年报加减中期报表组合，多年度序列取历年年报；"
-                    "0700.HK 使用港交所披露易公告编号与 PDF 链接；return_score 的前瞻预期 fwd_total 及主观判断参数 "
-                    "credibility / credibility_reason 已移出夹具，由 g6_lenses.py 的 ANALYST_CREDIBILITY_BY_TICKER 提供），"
-                    "配合 anchors.py --allow-network 实时拉取市值与汇率。"
+                    "示意数据（illustrative=true）：用于验证镜头命令链路和锚点一致性，不是公司财报数据；"
+                    "anchors 仍按 SKILL.md 联网（yfinance）取真实的市值和汇率。"
                 ),
             }
         ],
         assertions=assertions,
         extra_fields={
             "fixture_path": "tests/fixtures/dalton/g6/lenses_inputs.json",
-            "analyst_credibility_by_ticker": ANALYST_CREDIBILITY_BY_TICKER,
+            "illustrative": True,
+            "fixture_description": str(fixture_data.get("description") or ""),
             "tickers": results_by_ticker,
             "conflict_rejection_check": conflict_check,
         },
+        record=args.record,
     )
 
     baba = results_by_ticker["BABA"]
@@ -410,22 +391,22 @@ def main() -> int:
     meta = results_by_ticker["META"]
     raw_path, md_path, sha256_hex = write_evidence_and_summary(
         family_code="G6",
-        title="三把财务镜头与盈利质量统一 `--anchors` 真实运行验证 (`BABA`, `0700.HK`, `META`)",
+        title="三把财务镜头与盈利质量统一 `--anchors` 命令链路验证 (`BABA`, `0700.HK`, `META`, 示意输入)",
         raw_json_path=f"var/dalton/trial-runs/realrun-{args.date}/g6_lenses.json",
         summary_md_path=f"var/dalton/trial-runs/realrun-{args.date}/G6.md",
         envelope=envelope,
         key_findings=[
             (
-                "`BABA` 统一锚点与输出（`basic - restricted == strict`）",
-                f"mcap=${baba['market_cap_usd_mn']}M, fx={baba['fx_rate_to_usd']}, basic=${baba['basic_net_cash_usd']}M, restricted=${baba['restricted_cash_usd_equiv']}M, strict=${baba['strict_net_cash_usd']}M ({baba['strict_net_cash_to_mcap_pct']}%), return_score={baba['return_final_score']}, quality={baba['overall_quality']}",
+                "`BABA` 示意输入 + 实时锚点下镜头输出（`basic - restricted == strict`）",
+                f"illustrative=True, mcap=${baba['market_cap_usd_mn']}M, fx={baba['fx_rate_to_usd']}, basic=${baba['basic_net_cash_usd']}M, restricted=${baba['restricted_cash_usd_equiv']}M, strict=${baba['strict_net_cash_usd']}M ({baba['strict_net_cash_to_mcap_pct']}%), return_score={baba['return_final_score']}, quality={baba['overall_quality']}",
             ),
             (
-                "`0700.HK` 统一锚点与输出（`basic - restricted == strict`）",
-                f"mcap=${hk['market_cap_usd_mn']}M, fx={hk['fx_rate_to_usd']}, basic=${hk['basic_net_cash_usd']}M, restricted=${hk['restricted_cash_usd_equiv']}M, strict=${hk['strict_net_cash_usd']}M ({hk['strict_net_cash_to_mcap_pct']}%), return_score={hk['return_final_score']}, quality={hk['overall_quality']}",
+                "`0700.HK` 示意输入 + 实时锚点下镜头输出（`basic - restricted == strict`）",
+                f"illustrative=True, mcap=${hk['market_cap_usd_mn']}M, fx={hk['fx_rate_to_usd']}, basic=${hk['basic_net_cash_usd']}M, restricted=${hk['restricted_cash_usd_equiv']}M, strict=${hk['strict_net_cash_usd']}M ({hk['strict_net_cash_to_mcap_pct']}%), return_score={hk['return_final_score']}, quality={hk['overall_quality']}",
             ),
             (
-                "`META` 统一锚点与输出（`basic - restricted == strict`）",
-                f"mcap=${meta['market_cap_usd_mn']}M, fx={meta['fx_rate_to_usd']}, basic=${meta['basic_net_cash_usd']}M, restricted=${meta['restricted_cash_usd_equiv']}M, strict=${meta['strict_net_cash_usd']}M ({meta['strict_net_cash_to_mcap_pct']}%), return_score={meta['return_final_score']}, quality={meta['overall_quality']}",
+                "`META` 示意输入 + 实时锚点下镜头输出（`basic - restricted == strict`）",
+                f"illustrative=True, mcap=${meta['market_cap_usd_mn']}M, fx={meta['fx_rate_to_usd']}, basic=${meta['basic_net_cash_usd']}M, restricted=${meta['restricted_cash_usd_equiv']}M, strict=${meta['strict_net_cash_usd']}M ({meta['strict_net_cash_to_mcap_pct']}%), return_score={meta['return_final_score']}, quality={meta['overall_quality']}",
             ),
             (
                 "`--anchors` 与手填 `--market-cap-usd-mn` 同时传入拒绝检查",
@@ -434,7 +415,7 @@ def main() -> int:
         ],
         notes=[
             "财务镜头为纯确定性 Python 脚本，不发生 LLM 调用（`dalton_llm_journal` 调用数为 0）。",
-            "市值与汇率由 `anchors.py --allow-network` 从 `yfinance` 实时拉取；历史资产负债表与现金流表科目读取自 `tests/fixtures/dalton/g6/lenses_inputs.json`（每项科目单独标注真实 SEC `accession` 或港交所披露易公告编号与 PDF 链接，其中 TTM 与多年度科目分别标明年报与中期报告组合；`return_score` 的前瞻预期 `fwd_total` 及主观判断参数 `credibility`/`credibility_reason` 定义于 `g6_lenses.py:ANALYST_CREDIBILITY_BY_TICKER`）。",
+            "科目数值读取自 `tests/fixtures/dalton/g6/lenses_inputs.json`（`\"illustrative\": true`），属于示意输入，用于验证镜头命令链路和锚点一致性，**不是公司真实财报数据**；市值与汇率由 `anchors.py --allow-network` 从 `yfinance` 实时拉取。",
             "已验证受限现金单次扣除：口径 A (`basic_net_cash_usd`) 含受限现金，口径 B (`strict_net_cash_usd`) 从口径 A 扣除一次 `restricted_cash_usd_equiv`，满足 `abs((basic_net_cash_usd - restricted_cash_usd_equiv) - strict_net_cash_usd) < 0.01`。",
         ],
         record=args.record,

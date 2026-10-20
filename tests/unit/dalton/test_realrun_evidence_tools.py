@@ -234,11 +234,11 @@ def test_common_synthetic_validation_and_artifact_writing(
         base_url="http://127.0.0.1:8000",
         user_id="realrun-g1-20261019-abcd1234",
         record=False,
-        git_sha_fn=lambda: "1234abcd",
-        git_dirty_fn=lambda: True,
-        merged_main_fn=lambda: False,
-        main_ancestor_fn=lambda: False,
-        health_fn=injected_health,
+        _git_sha_fn=lambda: "1234abcd",
+        _git_dirty_fn=lambda: True,
+        _merged_main_fn=lambda: False,
+        _main_ancestor_fn=lambda: False,
+        _health_fn=injected_health,
     )
     assert debug_health["deployment"] == "docker"
     captured = capsys.readouterr()
@@ -250,12 +250,12 @@ def test_common_synthetic_validation_and_artifact_writing(
             base_url="http://127.0.0.1:8000",
             user_id="realrun-g1-20261019-abcd1234",
             record=True,
-            git_sha_fn=lambda: "1234abcd",
-            git_dirty_fn=lambda: True,
-            merged_main_fn=lambda: True,
-            main_ancestor_fn=lambda: True,
-            health_fn=injected_health,
-            env_check_fn=injected_env,
+            _git_sha_fn=lambda: "1234abcd",
+            _git_dirty_fn=lambda: True,
+            _merged_main_fn=lambda: True,
+            _main_ancestor_fn=lambda: True,
+            _health_fn=injected_health,
+            _env_check_fn=injected_env,
         )
 
     with pytest.raises(SystemExit, match="not merged into origin/dalton/main"):
@@ -263,12 +263,12 @@ def test_common_synthetic_validation_and_artifact_writing(
             base_url="http://127.0.0.1:8000",
             user_id="realrun-g1-20261019-abcd1234",
             record=True,
-            git_sha_fn=lambda: "1234abcd",
-            git_dirty_fn=lambda: False,
-            merged_main_fn=lambda: False,
-            main_ancestor_fn=lambda: True,
-            health_fn=injected_health,
-            env_check_fn=injected_env,
+            _git_sha_fn=lambda: "1234abcd",
+            _git_dirty_fn=lambda: False,
+            _merged_main_fn=lambda: False,
+            _main_ancestor_fn=lambda: True,
+            _health_fn=injected_health,
+            _env_check_fn=injected_env,
         )
 
     with pytest.raises(SystemExit, match="Pre-run check_env failed before family execution"):
@@ -276,12 +276,12 @@ def test_common_synthetic_validation_and_artifact_writing(
             base_url="http://127.0.0.1:8000",
             user_id="realrun-g1-20261019-abcd1234",
             record=True,
-            git_sha_fn=lambda: "1234abcd",
-            git_dirty_fn=lambda: False,
-            merged_main_fn=lambda: True,
-            main_ancestor_fn=lambda: True,
-            health_fn=injected_health,
-            env_check_fn=failing_env,
+            _git_sha_fn=lambda: "1234abcd",
+            _git_dirty_fn=lambda: False,
+            _merged_main_fn=lambda: True,
+            _main_ancestor_fn=lambda: True,
+            _health_fn=injected_health,
+            _env_check_fn=failing_env,
         )
 
     fake_journal = {
@@ -317,7 +317,7 @@ def test_common_synthetic_validation_and_artifact_writing(
         },
     }
 
-    # Debug run (record=False and env_check_fn=None) must skip check_env completely
+    # Debug run (record=False and _env_check_fn=None) must skip check_env completely
     debug_envelope = build_evidence_envelope(
         script="scripts/dalton/realrun/g1_budget.py",
         started_at="2026-10-19T05:00:00Z",
@@ -327,11 +327,11 @@ def test_common_synthetic_validation_and_artifact_writing(
         synthetic=valid_synthetic,
         journal=fake_journal,
         record=False,
-        git_sha_fn=lambda: "1234abcd",
-        git_dirty_fn=lambda: False,
-        merged_main_fn=lambda: True,
-        main_ancestor_fn=lambda: True,
-        health_fn=injected_health,
+        _git_sha_fn=lambda: "1234abcd",
+        _git_dirty_fn=lambda: False,
+        _merged_main_fn=lambda: True,
+        _main_ancestor_fn=lambda: True,
+        _health_fn=injected_health,
     )
     assert debug_envelope["environment"] == {"skipped_in_debug_mode": True, "record": False}
     assert "debug_run_not_record" in debug_envelope["invalid_reasons"]
@@ -345,12 +345,12 @@ def test_common_synthetic_validation_and_artifact_writing(
         synthetic=valid_synthetic,
         journal=fake_journal,
         extra_fields={"scenarios": {"cap_enforced": True}},
-        git_sha_fn=lambda: "1234abcd",
-        git_dirty_fn=lambda: False,
-        merged_main_fn=lambda: True,
-        main_ancestor_fn=lambda: True,
-        health_fn=injected_health,
-        env_check_fn=injected_env,
+        _git_sha_fn=lambda: "1234abcd",
+        _git_dirty_fn=lambda: False,
+        _merged_main_fn=lambda: True,
+        _main_ancestor_fn=lambda: True,
+        _health_fn=injected_health,
+        _env_check_fn=injected_env,
     )
     assert envelope["evidence_version"] == 2
     assert envelope["identity_mode"] == "service_token"
@@ -378,12 +378,12 @@ def test_common_synthetic_validation_and_artifact_writing(
         test_user_id="realrun-g1-20261019-abcd1234",
         synthetic=[],
         journal=bad_journal,
-        git_sha_fn=lambda: "1234abcd",
-        git_dirty_fn=lambda: False,
-        merged_main_fn=lambda: True,
-        main_ancestor_fn=lambda: True,
-        health_fn=injected_health,
-        env_check_fn=injected_env,
+        _git_sha_fn=lambda: "1234abcd",
+        _git_dirty_fn=lambda: False,
+        _merged_main_fn=lambda: True,
+        _main_ancestor_fn=lambda: True,
+        _health_fn=injected_health,
+        _env_check_fn=injected_env,
     )
     assert bad_env["valid"] is False
     assert "conversation_usages_unavailable" in bad_env["invalid_reasons"]
@@ -429,8 +429,8 @@ def test_common_synthetic_validation_and_artifact_writing(
         key_findings=[("日额度阻断", "402 budget_exceeded")],
         notes=["全部通过真实后端接口执行"],
         record=False,
-        git_dirty_fn=lambda: False,
-        merged_main_fn=lambda: True,
+        _git_dirty_fn=lambda: False,
+        _merged_main_fn=lambda: True,
         repo_root=tmp_path,
     )
     assert not dry_raw.exists()
@@ -447,8 +447,8 @@ def test_common_synthetic_validation_and_artifact_writing(
         key_findings=[("日额度阻断", "402 budget_exceeded")],
         notes=["全部通过真实后端接口执行"],
         record=True,
-        git_dirty_fn=lambda: False,
-        merged_main_fn=lambda: True,
+        _git_dirty_fn=lambda: False,
+        _merged_main_fn=lambda: True,
         repo_root=tmp_path,
     )
     assert written_raw.is_file()
@@ -480,15 +480,21 @@ def test_for_check_env_probe_caller_guard_and_docker_build_sha_drift(
             base_url="http://127.0.0.1:8000", user_id="realrun-env-probe-123"
         )
 
-    # Docker build-time SHA and dirty flag (Must-Fix #7):
-    build_sha_file = tmp_path / ".build_git_sha"
-    build_dirty_file = tmp_path / ".build_git_dirty"
-    manifest_file = tmp_path / ".build_files.sha256"
+    # Docker build-time SHA and dirty flag (Must-Fix #7, Review Item 9):
+    docker_app = tmp_path / "docker_app"
+    (docker_app / "src").mkdir(parents=True)
+    sample_py = docker_app / "src" / "main.py"
+    sample_py.write_text("print('ok')\n", encoding="utf-8")
+    sample_sha = compute_file_sha256(sample_py)
+
+    build_sha_file = docker_app / ".build_git_sha"
+    build_dirty_file = docker_app / ".build_git_dirty"
+    manifest_file = docker_app / ".build_files.sha256"
 
     # Missing .build_git_sha -> ("unknown", True)
     sha_missing, dirty_missing = openclaw_admin._compute_startup_git_info(
         in_docker=True,
-        app_root=tmp_path,
+        app_root=docker_app,
         build_sha_file=build_sha_file,
         build_dirty_file=build_dirty_file,
         build_files_sha256_file=manifest_file,
@@ -496,30 +502,54 @@ def test_for_check_env_probe_caller_guard_and_docker_build_sha_drift(
     assert sha_missing == "unknown"
     assert dirty_missing is True
 
-    # Baked SHA + dirty=true -> ("94a8d368", True)
+    # Baked SHA + dirty=false BUT missing .build_files.sha256 -> must still be dirty=True (Review Item 9)
     build_sha_file.write_text("94a8d368\n", encoding="utf-8")
-    build_dirty_file.write_text("true\n", encoding="utf-8")
-    sha_dirty, is_dirty = openclaw_admin._compute_startup_git_info(
+    build_dirty_file.write_text("false\n", encoding="utf-8")
+    sha_no_manifest, dirty_no_manifest = openclaw_admin._compute_startup_git_info(
         in_docker=True,
-        app_root=tmp_path,
+        app_root=docker_app,
         build_sha_file=build_sha_file,
         build_dirty_file=build_dirty_file,
         build_files_sha256_file=manifest_file,
     )
-    assert sha_dirty == "94a8d368"
-    assert is_dirty is True
+    assert sha_no_manifest == "94a8d368"
+    assert dirty_no_manifest is True
 
-    # Baked SHA + dirty=false -> ("94a8d368", False)
-    build_dirty_file.write_text("false\n", encoding="utf-8")
+    # Write matching .build_files.sha256 -> ("94a8d368", False)
+    manifest_file.write_text(f"{sample_sha}  src/main.py\n", encoding="utf-8")
     sha_clean, is_clean = openclaw_admin._compute_startup_git_info(
         in_docker=True,
-        app_root=tmp_path,
+        app_root=docker_app,
         build_sha_file=build_sha_file,
         build_dirty_file=build_dirty_file,
         build_files_sha256_file=manifest_file,
     )
     assert sha_clean == "94a8d368"
     assert is_clean is False
+
+    # Adding an untracked file under src/ or config/dalton/ after build -> marks dirty=True (Review Item 9)
+    added_file = docker_app / "src" / "untracked_extra.py"
+    added_file.write_text("x = 1\n", encoding="utf-8")
+    _, dirty_after_add = openclaw_admin._compute_startup_git_info(
+        in_docker=True,
+        app_root=docker_app,
+        build_sha_file=build_sha_file,
+        build_dirty_file=build_dirty_file,
+        build_files_sha256_file=manifest_file,
+    )
+    assert dirty_after_add is True
+    added_file.unlink()
+
+    # Modifying tracked file in src/ after build -> marks dirty=True
+    sample_py.write_text("print('modified')\n", encoding="utf-8")
+    _, dirty_after_mod = openclaw_admin._compute_startup_git_info(
+        in_docker=True,
+        app_root=docker_app,
+        build_sha_file=build_sha_file,
+        build_dirty_file=build_dirty_file,
+        build_files_sha256_file=manifest_file,
+    )
+    assert dirty_after_mod is True
 
 
 def test_check_report_claims_and_generated_evidence_table_on_sample_files(
@@ -687,7 +717,8 @@ def test_static_script_scan_detects_from_src_and_insert_into(tmp_path: Path) -> 
     bad_script.write_text(
         "from src.dalton.llm import router\n"
         "cur.execute('INSERT INTO dalton_watch_signals VALUES (1)')\n"
-        "RealRunHttpClient._for_check_env_probe(base_url='http://127.0.0.1:8000', user_id='u')\n",
+        "RealRunHttpClient._for_check_env_probe(base_url='http://127.0.0.1:8000', user_id='u')\n"
+        "assert_clean_and_synced_environment(_git_dirty_fn=lambda: False)\n",
         encoding="utf-8",
     )
     res = scan_realrun_scripts([bad_script])
@@ -696,6 +727,7 @@ def test_static_script_scan_detects_from_src_and_insert_into(tmp_path: Path) -> 
     assert "from_src_import" in kinds
     assert "insert_into:dalton_watch_signals" in kinds
     assert "forbidden_check_env_probe_call" in kinds
+    assert "forbidden_preflight_fn_override" in kinds
 
 
 def test_all_realrun_scripts_import_cleanly() -> None:
@@ -762,34 +794,95 @@ def test_g3_discover_migrated_workspaces_matches_by_name_with_pagination() -> No
     assert fake_client.calls[0]["params"] == {"limit": 100, "offset": 0}
 
 
-def test_g6_lenses_inputs_has_multiperiod_provenance_and_no_fwd_total() -> None:
+def test_g6_lenses_inputs_is_explicitly_illustrative_and_has_no_sec_tags() -> None:
     from scripts.dalton.realrun import g6_lenses
 
     repo_root = Path(__file__).resolve().parents[3]
     fixture_path = repo_root / "tests" / "fixtures" / "dalton" / "g6" / "lenses_inputs.json"
-    payload = json.loads(fixture_path.read_text(encoding="utf-8"))
+    raw_text = fixture_path.read_text(encoding="utf-8")
+    payload = json.loads(raw_text)
+    assert payload.get("illustrative") is True
+    assert payload.get("description") == "示意输入，用于验证镜头命令链路和锚点一致性，不是公司财报数据"
+    assert '"accession"' not in raw_text
+    assert '"url"' not in raw_text
+    assert '"filing"' not in raw_text
     companies = payload["companies"]
     assert len(companies) == 3
+    assert callable(g6_lenses.render_comparison_markdown)
     for comp in companies:
         ticker = comp["ticker"]
-        assert ticker in g6_lenses.ANALYST_CREDIBILITY_BY_TICKER
+        assert ticker in {"BABA", "0700.HK", "META"}
         ret = comp["return_score"]
-        assert "fwd_total" not in ret
-        for section in (comp["netcash"], ret, comp["earnings_quality"]):
-            for metric_key, item in section.items():
-                assert isinstance(item.get("accession"), str) and item["accession"].strip(), (
-                    f"{ticker}.{metric_key} missing accession"
-                )
-        # Multi-period / prior-year items must not point solely to the single current-quarter accession
-        single_current_acc = comp["filing"]["accession"]
-        for mp_section, mp_key in (
-            (ret, "annual"),
-            (ret, "ttm_div"),
-            (comp["earnings_quality"], "beginning_assets"),
-            (comp["earnings_quality"], "ni"),
-        ):
-            assert mp_section[mp_key]["accession"] != single_current_acc
+        assert "示意参数" in ret["credibility_reason"]
 
+
+def test_g1_playwright_route_scopes_auth_headers_to_local_origins_only() -> None:
+    from scripts.dalton.realrun import g1_budget
+
+    assert (
+        g1_budget._is_allowed_auth_header_origin(
+            "http://localhost:5173/api/v1/dalton/budget/today",
+            frontend_url="http://localhost:5173",
+            backend_url="http://127.0.0.1:8000",
+        )
+        is True
+    )
+    assert (
+        g1_budget._is_allowed_auth_header_origin(
+            "http://127.0.0.1:8000/api/v1/dalton/budget",
+            frontend_url="http://localhost:5173",
+            backend_url="http://127.0.0.1:8000",
+        )
+        is True
+    )
+    assert (
+        g1_budget._is_allowed_auth_header_origin(
+            "https://fonts.googleapis.com/css2?family=Inter",
+            frontend_url="http://localhost:5173",
+            backend_url="http://127.0.0.1:8000",
+        )
+        is False
+    )
+
+    class _FakeRequest:
+        def __init__(self, url: str, headers: dict[str, str]) -> None:
+            self.url = url
+            self.headers = headers
+
+    class _FakeRoute:
+        def __init__(self) -> None:
+            self.continued_headers: dict[str, str] | None = None
+            self.continued_count = 0
+
+        def continue_(self, headers: dict[str, str] | None = None) -> None:
+            self.continued_headers = headers
+            self.continued_count += 1
+
+    local_req = _FakeRequest("http://localhost:5173/api/v1/dalton/budget/today", {"Accept": "application/json"})
+    local_route = _FakeRoute()
+    g1_budget._handle_scoped_auth_route(
+        local_route,
+        local_req,
+        frontend_url="http://localhost:5173",
+        backend_url="http://127.0.0.1:8000",
+        user_id="u1",
+        svc_token="tok-secret",
+    )
+    assert local_route.continued_headers is not None
+    assert local_route.continued_headers["X-Service-Token"] == "tok-secret"
+
+    ext_req = _FakeRequest("https://fonts.googleapis.com/css2?family=Inter", {"Accept": "text/css"})
+    ext_route = _FakeRoute()
+    g1_budget._handle_scoped_auth_route(
+        ext_route,
+        ext_req,
+        frontend_url="http://localhost:5173",
+        backend_url="http://127.0.0.1:8000",
+        user_id="u1",
+        svc_token="tok-secret",
+    )
+    assert ext_route.continued_count == 1
+    assert ext_route.continued_headers is None
 
 
 def test_pr_baseline_script_exists_and_executable() -> None:
@@ -799,4 +892,8 @@ def test_pr_baseline_script_exists_and_executable() -> None:
     script = repo_root / "scripts" / "dalton" / "pr_baseline.sh"
     assert script.is_file()
     assert os.access(script, os.X_OK)
+    build_script = repo_root / "scripts" / "dalton" / "docker_build_backend.sh"
+    assert build_script.is_file()
+    assert os.access(build_script, os.X_OK)
+
 

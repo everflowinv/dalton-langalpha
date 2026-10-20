@@ -155,10 +155,65 @@ def _fetch_publish_requests_for_thread(thread_id: str) -> list[dict[str, Any]]:
             return out
 
 
+def _is_allowed_auth_header_origin(
+    request_url: str,
+    *,
+    frontend_url: str,
+    backend_url: str = "http://127.0.0.1:8000",
+) -> bool:
+    """Return True only when `request_url` targets the configured frontend or backend origin
+    (including localhost <-> 127.0.0.1 equivalence on the same port). External requests
+    (such as `https://fonts.googleapis.com`) must never receive `X-Service-Token` (Hard Rule 9).
+    """
+    from urllib.parse import urlsplit
+
+    req = urlsplit(request_url)
+    if req.scheme not in ("http", "https") or not req.hostname:
+        return False
+
+    allowed_origins: set[tuple[str, str, int | None]] = set()
+    for base in (frontend_url, backend_url):
+        parsed = urlsplit(base)
+        if not parsed.scheme or not parsed.hostname:
+            continue
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        allowed_origins.add((parsed.scheme, parsed.hostname.lower(), port))
+        if parsed.hostname.lower() in ("localhost", "127.0.0.1"):
+            allowed_origins.add((parsed.scheme, "localhost", port))
+            allowed_origins.add((parsed.scheme, "127.0.0.1", port))
+
+    req_port = req.port or (443 if req.scheme == "https" else 80)
+    return (req.scheme, req.hostname.lower(), req_port) in allowed_origins
+
+
+def _handle_scoped_auth_route(
+    route: Any,
+    request: Any,
+    *,
+    frontend_url: str,
+    backend_url: str = "http://127.0.0.1:8000",
+    user_id: str,
+    svc_token: str,
+) -> None:
+    """Playwright route handler that injects `X-User-Id` and `X-Service-Token` only on
+    requests targeting `frontend_url` or `backend_url`, forwarding all other requests untouched.
+    """
+    if _is_allowed_auth_header_origin(
+        request.url, frontend_url=frontend_url, backend_url=backend_url
+    ):
+        headers = dict(request.headers)
+        headers["X-User-Id"] = user_id
+        headers["X-Service-Token"] = svc_token
+        route.continue_(headers=headers)
+    else:
+        route.continue_()
+
+
 def _capture_rejection_banner_screenshot(
     *,
     output_path: Path,
     frontend_url: str,
+    backend_url: str = "http://127.0.0.1:8000",
     user_id: str,
     workspace_id: str,
     thread_id: str,
@@ -177,12 +232,19 @@ def _capture_rejection_banner_screenshot(
         try:
             context = browser.new_context(
                 viewport={"width": 1280, "height": 800},
-                extra_http_headers={
-                    "X-User-Id": user_id,
-                    "X-Service-Token": svc_token,
-                },
             )
             page = context.new_page()
+            page.route(
+                "**/*",
+                lambda route, request: _handle_scoped_auth_route(
+                    route,
+                    request,
+                    frontend_url=frontend_url,
+                    backend_url=backend_url,
+                    user_id=user_id,
+                    svc_token=svc_token,
+                ),
+            )
             resp = page.goto(target_url, wait_until="networkidle", timeout=30000)
             assert resp is not None and resp.status < 400, (
                 f"Failed to load frontend chat route {target_url}: status={getattr(resp, 'status', None)}"
@@ -495,6 +557,7 @@ def main() -> int:
         screenshot_info, screenshot_bytes = _capture_rejection_banner_screenshot(
             output_path=screenshot_path,
             frontend_url=args.frontend,
+            backend_url=args.backend,
             user_id=user_a,
             workspace_id=workspace_id,
             thread_id=thread_id,

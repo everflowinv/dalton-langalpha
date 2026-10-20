@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -48,6 +49,24 @@ logger = logging.getLogger(__name__)
 BUILD_GIT_SHA_FILE = Path("/app/.build_git_sha")
 BUILD_GIT_DIRTY_FILE = Path("/app/.build_git_dirty")
 BUILD_FILES_SHA256_FILE = Path("/app/.build_files.sha256")
+DOCKER_MANIFEST_WATCHED_PATHS: tuple[str, ...] = (
+    "server.py",
+    "config.yaml",
+    "agent_config.yaml",
+    "agent_config.dalton.yaml",
+    "alembic.ini",
+    "config/dalton",
+    "libs/market-protocol",
+    "src",
+    "scripts",
+    "migrations",
+    "mcp_servers",
+    "plugins",
+    "workflows",
+)
+_IGNORED_DIR_NAMES = frozenset({"__pycache__", ".pytest_cache"})
+_IGNORED_FILE_NAMES = frozenset({".DS_Store"})
+_IGNORED_FILE_SUFFIXES = (".pyc", ".pyo")
 
 
 def _read_image_build_git_sha(build_sha_file: Path = BUILD_GIT_SHA_FILE) -> str:
@@ -72,6 +91,98 @@ def _read_image_build_git_dirty(build_dirty_file: Path = BUILD_GIT_DIRTY_FILE) -
     return True
 
 
+def _is_ignored_runtime_file(rel_posix: str) -> bool:
+    parts = rel_posix.split("/")
+    if any(p in _IGNORED_DIR_NAMES for p in parts[:-1]):
+        return True
+    fname = parts[-1]
+    if fname in _IGNORED_FILE_NAMES or fname.endswith(_IGNORED_FILE_SUFFIXES):
+        return True
+    return False
+
+
+def _verify_docker_build_manifest(
+    app_root: Path,
+    build_files_sha256_file: Path = BUILD_FILES_SHA256_FILE,
+) -> bool:
+    """Return True iff `build_files_sha256_file` exists, all listed files match SHA-256, and no new files exist."""
+    if not build_files_sha256_file.is_file():
+        return False
+    try:
+        raw_lines = build_files_sha256_file.read_text(encoding="utf-8").splitlines()
+    except Exception:
+        return False
+
+    manifest: dict[str, str] = {}
+    for line in raw_lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        parts = stripped.split(None, 1)
+        if len(parts) != 2:
+            return False
+        digest, rel_raw = parts[0].strip().lower(), parts[1].strip()
+        if rel_raw.startswith("*"):
+            rel_raw = rel_raw[1:]
+        while rel_raw.startswith("./"):
+            rel_raw = rel_raw[2:]
+        if len(digest) != 64 or not rel_raw:
+            return False
+        if _is_ignored_runtime_file(rel_raw):
+            continue
+        manifest[rel_raw] = digest
+
+    if not manifest:
+        return False
+
+    # 1. Verify every file in manifest still exists and matches its build-time SHA-256
+    for rel_path, expected_sha in manifest.items():
+        target = app_root / rel_path
+        if not target.is_file():
+            return False
+        try:
+            h = hashlib.sha256()
+            with target.open("rb") as f:
+                for chunk in iter(lambda: f.read(65536), b""):
+                    h.update(chunk)
+            if h.hexdigest().lower() != expected_sha:
+                return False
+        except Exception:
+            return False
+
+    # 2. Verify no new untracked/post-build files exist under watched paths or manifest top-level dirs
+    watched_roots: set[str] = set(DOCKER_MANIFEST_WATCHED_PATHS)
+    for rel_path in manifest:
+        if "/" in rel_path:
+            watched_roots.add(rel_path.split("/", 1)[0])
+        else:
+            watched_roots.add(rel_path)
+
+    for root_rel in watched_roots:
+        root_path = app_root / root_rel
+        if not root_path.exists():
+            continue
+        if root_path.is_file():
+            rel_posix = root_path.relative_to(app_root).as_posix()
+            if not _is_ignored_runtime_file(rel_posix) and rel_posix not in manifest:
+                return False
+        elif root_path.is_dir():
+            for dirpath, dirnames, filenames in os.walk(root_path):
+                dirnames[:] = [d for d in dirnames if d not in _IGNORED_DIR_NAMES]
+                for fname in filenames:
+                    if fname in _IGNORED_FILE_NAMES or fname.endswith(_IGNORED_FILE_SUFFIXES):
+                        continue
+                    fpath = Path(dirpath) / fname
+                    try:
+                        rel_posix = fpath.relative_to(app_root).as_posix()
+                    except ValueError:
+                        return False
+                    if not _is_ignored_runtime_file(rel_posix) and rel_posix not in manifest:
+                        return False
+
+    return True
+
+
 def _compute_startup_git_info(
     *,
     in_docker: bool = _IN_DOCKER,
@@ -85,26 +196,16 @@ def _compute_startup_git_info(
     In Docker (`in_docker=True`), reads the build-time `/app/.build_git_sha` and
     `/app/.build_git_dirty` baked into the image by `scripts/dalton/Dockerfile.dalton`,
     and verifies the baked SHA-256 manifest (`/app/.build_files.sha256`) against the
-    bind-mounted code under `/app` so any post-build file modification marks `git_dirty=True`.
+    bind-mounted code/config under `/app` so missing manifests, modified files, or newly
+    added files all mark `git_dirty=True`.
     """
     if in_docker:
         image_build_sha = _read_image_build_git_sha(build_sha_file)
         if not image_build_sha or image_build_sha == "unknown":
             return "unknown", True
         git_dirty = _read_image_build_git_dirty(build_dirty_file)
-        if not git_dirty and build_files_sha256_file.is_file():
-            try:
-                chk = subprocess.run(
-                    ["sha256sum", "--status", "-c", str(build_files_sha256_file)],
-                    cwd=str(app_root),
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=10.0,
-                    check=False,
-                )
-                if chk.returncode != 0:
-                    git_dirty = True
-            except Exception:
+        if not git_dirty:
+            if not _verify_docker_build_manifest(app_root, build_files_sha256_file):
                 git_dirty = True
         return image_build_sha, git_dirty
 

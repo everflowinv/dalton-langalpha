@@ -4,8 +4,8 @@ services:
       context: .
       dockerfile: scripts/dalton/Dockerfile.dalton
       args:
-        BUILD_GIT_SHA: ${BUILD_GIT_SHA:?BUILD_GIT_SHA is required}
-        BUILD_GIT_DIRTY: ${BUILD_GIT_DIRTY:?BUILD_GIT_DIRTY is required}
+        BUILD_GIT_SHA: ${BUILD_GIT_SHA:-}
+        BUILD_GIT_DIRTY: ${BUILD_GIT_DIRTY:-}
     entrypoint: ["/usr/bin/tini", "-s", "--", "/app/scripts/dalton/docker_entrypoint_dalton.sh"]
     command: ["uv", "run", "python", "server.py", "--host", "0.0.0.0", "--port", "8000", "--reload"]
     mem_limit: 2g

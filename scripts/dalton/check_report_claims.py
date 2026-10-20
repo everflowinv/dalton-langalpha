@@ -187,6 +187,16 @@ def _strip_code_comments(text: str, suffix: str) -> str:
     return text
 
 
+SELF_EXCLUDED_REL_PATHS = frozenset(
+    {
+        "scripts/dalton/check_report_claims.py",
+        "tests/unit/dalton/test_realrun_evidence_tools.py",
+    }
+)
+_TEST_DEF_RE = re.compile(r"^\s*def\s+(test_[A-Za-z0-9_]+)\s*\(", re.MULTILINE)
+_TOP_DEF_OR_CLASS_RE = re.compile(r"^(?:def|class)\s+([A-Za-z_][A-Za-z0-9_]*)\b", re.MULTILINE)
+
+
 def build_repo_index(repo_root: Path = REPO_ROOT) -> tuple[set[str], dict[str, list[str]], str]:
     """Index all files and source text in the repository for fast lookup."""
     rel_files: set[str] = set()
@@ -208,7 +218,15 @@ def build_repo_index(repo_root: Path = REPO_ROOT) -> tuple[set[str], dict[str, l
             if p.suffix in SOURCE_EXTENSIONS:
                 try:
                     raw_txt = p.read_text(encoding="utf-8", errors="ignore")
-                    corpus_chunks.append(_strip_code_comments(raw_txt, p.suffix))
+                    if rel in SELF_EXCLUDED_REL_PATHS:
+                        if rel.startswith("tests/"):
+                            defs = _TEST_DEF_RE.findall(raw_txt)
+                        else:
+                            defs = _TOP_DEF_OR_CLASS_RE.findall(raw_txt)
+                        if defs:
+                            corpus_chunks.append("\n".join(defs))
+                    else:
+                        corpus_chunks.append(_strip_code_comments(raw_txt, p.suffix))
                 except Exception:
                     pass
 
