@@ -5,13 +5,15 @@ Verifies against the live HTTP backend (`http://127.0.0.1:8000`) under `realrun-
 (never `local-dev-user`):
 1. Enumerates all `/api/v1/dalton` routes from `GET /openapi.json` and invokes every `(method, path)` pair,
    asserting 0 missed routes.
-2. Probes all 4 configured providers (`POST /api/v1/dalton/providers/{provider}/probe`) and 1 unconfigured provider,
+2. Probes configured providers (`POST /api/v1/dalton/providers/{provider}/probe`, including cash provider `deepseek`
+   and `antigravity-oauth` subscription models) and 1 unconfigured provider (`zhipu`),
    verifying real `dalton_llm_journal` entries (`purpose='provider_probe'`) and safe `error_kind` with zero credential text.
 3. Calls PM-exclusive route (`POST /api/v1/dalton/knowledge/{ws}/thesis/import`) as `realrun-pm-a` (in `pm_user_ids` -> 200)
    and `realrun-user-b` (not in `pm_user_ids` -> 403).
 4. Verifies startup fail-fast (`RolePolicyError` / `DaltonStartupConfigError`) by launching a real backend child process
    (`uvicorn src.server.app:app`) with a temporary config file (`PTC_CONFIG_FILE`) setting
    `llm.assist: muse-cli-gateway/muse-spark-1.3-contributor`, asserting non-zero exit code and startup error log.
+5. Restores `realrun-pm-a`'s original budget configuration via `_restore_budget_state` and deletes temporary workspaces in `finally`.
 """
 
 from __future__ import annotations
@@ -22,7 +24,6 @@ import os
 import subprocess
 import sys
 import tempfile
-import time
 from pathlib import Path
 from typing import Any
 
@@ -34,24 +35,16 @@ if str(REPO_ROOT) not in sys.path:
 
 from scripts.dalton.realrun._common import (  # noqa: E402
     RealRunHttpClient,
+    assert_no_conflicting_dalton_automation,
     build_evidence_envelope,
+    build_realrun_workspace_config,
     default_shanghai_date,
+    load_repo_dotenv,
     now_utc_iso,
     preflight_realrun_script,
     write_evidence_and_summary,
 )
-
-
-def _resolve_deepseek_key() -> str:
-    env_val = os.environ.get("DEEPSEEK_API_KEY", "").strip()
-    if env_val:
-        return env_val
-    keychain_script = Path(
-        os.path.expanduser("~/.openclaw/workspace/scripts/deepseek_keychain_secret.sh")
-    )
-    if keychain_script.is_file():
-        return subprocess.check_output([str(keychain_script)], text=True).strip()
-    raise RuntimeError("Could not resolve DeepSeek API key from env or keychain script")
+from scripts.dalton.realrun.check_env import _restore_budget_state  # noqa: E402
 
 
 def _verify_startup_fail_fast() -> dict[str, Any]:
@@ -135,6 +128,7 @@ def _verify_startup_fail_fast() -> dict[str, Any]:
 
 
 def main() -> int:
+    load_repo_dotenv()
     parser = argparse.ArgumentParser(description="G2 Real-Run Evidence Generator (P0J §5 G2)")
     parser.add_argument("--backend", default="http://127.0.0.1:8000")
     parser.add_argument("--date", default=default_shanghai_date())
@@ -163,251 +157,373 @@ def main() -> int:
     other_user = args.other_user
     test_user_id = f"{pm_user},{other_user}"
 
-    synthetic: list[dict[str, Any]] = [
-        {
-            "kind": "settings_api_budget",
-            "entry_point": "PUT /api/v1/dalton/budget",
-            "description": f"为测试用户 {pm_user} 设置日预算上限 $5.00，用于验证现金探测计入当日预算。",
-        },
-    ]
+    synthetic: list[dict[str, Any]] = []
 
     sample_thesis_v1 = {
         "schema_version": 1,
-        "company": {"ticker": "GOOGL", "name": "Alphabet Inc."},
-        "updated_at": started_at,
-        "summary": "G2 路由与权限测试初始观点 v1",
-        "pillars": [],
-        "debates": [],
+        "as_of": started_at,
+        "one_liner": "Alphabet Inc. G2 路由与权限测试初始观点 v1",
+        "aggregate_status": "intact",
+        "house_view": {
+            "stance": "long",
+            "conviction": "high",
+            "horizon_months": 18,
+            "summary": "G2 路由与权限测试初始观点 v1",
+            "variant_perception": "Search and Cloud operating margin durability exceeds consensus.",
+            "updated_at": started_at,
+        },
+        "house_view_history": [],
+        "pillars": [
+            {
+                "id": "P1",
+                "claim": "GOOGL core revenue growth and operating margin trajectory.",
+                "priority": "core",
+                "baseline": {"text": "2Q26 SEC 10-Q baseline.", "as_of": "2026-06-30"},
+                "expected_path": "Maintain double-digit revenue growth and margin expansion.",
+                "thresholds": {"confirm": [], "warn": [], "break": []},
+                "status": "intact",
+                "provenance": "approved",
+                "created_at": started_at,
+            }
+        ],
         "evidence": [],
+        "official": None,
     }
     sample_thesis_v2 = {
         **sample_thesis_v1,
-        "summary": "G2 路由与权限测试更新观点 v2",
+        "one_liner": "Alphabet Inc. G2 路由与权限测试更新观点 v2",
+        "house_view": {
+            **sample_thesis_v1["house_view"],
+            "summary": "G2 路由与权限测试更新观点 v2",
+        },
     }
 
-    with (
-        RealRunHttpClient(base_url=args.backend, user_id=pm_user, timeout_s=60.0) as pm_client,
-        RealRunHttpClient(base_url=args.backend, user_id=other_user, timeout_s=60.0) as user_b_client,
-    ):
-        pm_client.ensure_user()
-        user_b_client.ensure_user()
+    sample_ws_id: str | None = None
+    user_b_ws_id: str | None = None
+    created_auto_id: str | None = None
+    prior_budget_pm: dict[str, Any] | None = None
+    was_configured_pm = False
+    budget_modified_pm = False
 
-        # 1. Create a workspace owned by pm_user for parameterized knowledge/verdict routes
-        st_ws, ws_resp = pm_client.post(
-            "/api/v1/workspaces",
-            json_body={"name": f"G2-GOOGL-{args.date}", "description": "G2 route coverage workspace"},
-        )
-        assert st_ws in (200, 201) and ws_resp.get("workspace_id"), f"Workspace create failed: {st_ws} {ws_resp}"
-        sample_ws_id = str(ws_resp["workspace_id"])
+    try:
+        with (
+            RealRunHttpClient(base_url=args.backend, user_id=pm_user, timeout_s=60.0) as pm_client,
+            RealRunHttpClient(base_url=args.backend, user_id=other_user, timeout_s=60.0) as user_b_client,
+        ):
+            pm_client.ensure_user()
+            user_b_client.ensure_user()
 
-        # Also create a workspace owned by user_b to test PM-only /import returning 403 on user_b's own workspace
-        st_ws_b, ws_b_resp = user_b_client.post(
-            "/api/v1/workspaces",
-            json_body={"name": f"G2-USERB-{args.date}", "description": "G2 user_b RBAC workspace"},
-        )
-        assert st_ws_b in (200, 201) and ws_b_resp.get("workspace_id")
-        user_b_ws_id = str(ws_b_resp["workspace_id"])
-
-        # 2. Configure budget and BYOK cash key for pm_user
-        st_budget_put, resp_budget_put = pm_client.put(
-            "/api/v1/dalton/budget",
-            json_body={"daily_cap_usd": 5.0, "default_task_cap_usd": 1.0},
-        )
-        assert st_budget_put == 200, f"PUT /api/v1/dalton/budget failed: {st_budget_put} {resp_budget_put}"
-
-        ds_key = _resolve_deepseek_key()
-        st_byok, _ = pm_client.put(
-            "/api/v1/users/me/api-keys",
-            json_body={"byok_enabled": True, "api_keys": {"deepseek": ds_key}},
-        )
-        assert st_byok == 200, f"PUT /api/v1/users/me/api-keys failed: {st_byok}"
-
-        # 3. Enumerate all /api/v1/dalton routes from /openapi.json
-        st_spec, openapi_spec = pm_client.get("/openapi.json")
-        assert st_spec == 200 and isinstance(openapi_spec, dict), "Failed to fetch /openapi.json"
-
-        enumerated_routes: list[tuple[str, str]] = []
-        for path, methods_obj in sorted((openapi_spec.get("paths") or {}).items()):
-            if not path.startswith("/api/v1/dalton"):
-                continue
-            for m in sorted(methods_obj.keys()):
-                if m.upper() in ("GET", "POST", "PUT", "DELETE", "PATCH"):
-                    enumerated_routes.append((m.upper(), path))
-
-        called_routes: list[dict[str, Any]] = []
-        called_set: set[tuple[str, str]] = set()
-
-        def _invoke_and_record(
-            method: str,
-            template_path: str,
-            actual_path: str,
-            *,
-            json_body: Any = None,
-            params: dict[str, Any] | None = None,
-            as_user_b: bool = False,
-        ) -> tuple[int, Any]:
-            target = user_b_client if as_user_b else pm_client
-            status, body = target.request(
-                method, actual_path, json_body=json_body, params=params
+            st_prior_b, body_prior_b = pm_client.get("/api/v1/dalton/budget")
+            if st_prior_b == 200 and isinstance(body_prior_b, dict):
+                prior_budget_pm = body_prior_b
+                was_configured_pm = bool(body_prior_b.get("configured"))
+            st_prior_bt, body_prior_bt = pm_client.get("/api/v1/dalton/budget/today")
+            baseline_spent_pm = (
+                float(body_prior_bt.get("spent_usd") or 0.0)
+                if st_prior_bt == 200 and isinstance(body_prior_bt, dict)
+                else 0.0
             )
-            called_set.add((method.upper(), template_path))
-            called_routes.append(
+            g2_cap_usd = round(max(5.0, baseline_spent_pm + 5.0), 6)
+            synthetic.append(
                 {
-                    "user_id": other_user if as_user_b else pm_user,
-                    "method": method.upper(),
-                    "template_path": template_path,
-                    "actual_path": actual_path,
-                    "status_code": status,
+                    "kind": "settings_api_budget",
+                    "entry_point": "PUT /api/v1/dalton/budget",
+                    "description": (
+                        f"为测试用户 {pm_user} 设置相对日预算上限 ${g2_cap_usd:.4f} "
+                        f"（max($5.00, 当日已有现金花费 ${baseline_spent_pm:.4f} + $5.00)），"
+                        "用于验证现金探测计入当日预算，并在结束时恢复原预算配置。"
+                    ),
                 }
             )
-            return status, body
 
-        # Invoke all 22 /api/v1/dalton routes as pm_user (never local-dev-user)
-        _invoke_and_record("GET", "/api/v1/dalton/budget", "/api/v1/dalton/budget")
-        _invoke_and_record(
-            "PUT",
-            "/api/v1/dalton/budget",
-            "/api/v1/dalton/budget",
-            json_body={"daily_cap_usd": 5.0, "default_task_cap_usd": 1.0},
-        )
-        _invoke_and_record(
-            "PUT",
-            "/api/v1/dalton/budget/task-caps/{scope_kind}/{scope_id}",
-            "/api/v1/dalton/budget/task-caps/thread/g2-sample-thread",
-            json_body={"cap_usd": 0.50},
-        )
-        _invoke_and_record(
-            "DELETE",
-            "/api/v1/dalton/budget/task-caps/{scope_kind}/{scope_id}",
-            "/api/v1/dalton/budget/task-caps/thread/g2-sample-thread",
-        )
-        _invoke_and_record("GET", "/api/v1/dalton/budget/today", "/api/v1/dalton/budget/today")
-        _invoke_and_record("GET", "/api/v1/dalton/coverage/board", "/api/v1/dalton/coverage/board")
-        _invoke_and_record("GET", "/api/v1/dalton/autonomy/report", "/api/v1/dalton/autonomy/report")
-        st_auto_pm, _ = _invoke_and_record(
-            "PUT",
-            "/api/v1/dalton/automations/{name}",
-            "/api/v1/dalton/automations/dalton-research-director-daily",
-            json_body={
-                "workspace_id": sample_ws_id,
-                "entry": {
-                    "type": "director_daily",
-                    "prompt": "G2 director daily schedule check",
-                    "cron": "0 8 * * 1-5",
-                    "timezone": "America/New_York",
-                    "enabled": False,
+            # 1. Create a workspace owned by pm_user for parameterized knowledge/verdict/task-cap routes
+            st_ws, ws_resp = pm_client.post(
+                "/api/v1/workspaces",
+                json_body={
+                    "name": f"G2-GOOGL-{args.date}",
+                    "description": "G2 route coverage workspace",
+                    "config": build_realrun_workspace_config("g2_providers.py"),
                 },
-            },
-        )
-        # Import v1 and v2 on sample_ws_id as PM user -> 200
-        st_imp_v1, body_imp_v1 = _invoke_and_record(
-            "POST",
-            "/api/v1/dalton/knowledge/{workspace_id}/{doc}/import",
-            f"/api/v1/dalton/knowledge/{sample_ws_id}/thesis/import",
-            json_body={"content": sample_thesis_v1, "reason": "G2 PM import v1"},
-        )
-        assert st_imp_v1 == 200, f"Expected PM import v1 to return 200, got {st_imp_v1}: {body_imp_v1}"
-        st_imp_v2, body_imp_v2 = _invoke_and_record(
-            "POST",
-            "/api/v1/dalton/knowledge/{workspace_id}/{doc}/import",
-            f"/api/v1/dalton/knowledge/{sample_ws_id}/thesis/import",
-            json_body={"content": sample_thesis_v2, "reason": "G2 PM import v2"},
-        )
-        assert st_imp_v2 == 200, f"Expected PM import v2 to return 200, got {st_imp_v2}: {body_imp_v2}"
+            )
+            assert st_ws in (200, 201) and ws_resp.get("workspace_id"), f"Workspace create failed: {st_ws} {ws_resp}"
+            sample_ws_id = str(ws_resp["workspace_id"])
 
-        # Non-PM user (`realrun-user-b`) calling PM-exclusive `/import` -> 403
-        st_imp_user_b, body_imp_user_b = _invoke_and_record(
-            "POST",
-            "/api/v1/dalton/knowledge/{workspace_id}/{doc}/import",
-            f"/api/v1/dalton/knowledge/{user_b_ws_id}/thesis/import",
-            json_body={"content": sample_thesis_v1, "reason": "G2 non-PM import attempt"},
-            as_user_b=True,
-        )
-        assert st_imp_user_b == 403, (
-            f"Expected non-PM user {other_user} to get 403 on /import, got {st_imp_user_b}: {body_imp_user_b}"
-        )
+            # Also create a workspace owned by user_b to test PM-only /import returning 403 on user_b's own workspace
+            st_ws_b, ws_b_resp = user_b_client.post(
+                "/api/v1/workspaces",
+                json_body={
+                    "name": f"G2-USERB-{args.date}",
+                    "description": "G2 user_b RBAC workspace",
+                    "config": build_realrun_workspace_config("g2_providers.py"),
+                },
+            )
+            assert st_ws_b in (200, 201) and ws_b_resp.get("workspace_id")
+            user_b_ws_id = str(ws_b_resp["workspace_id"])
 
-        _invoke_and_record(
-            "GET",
-            "/api/v1/dalton/knowledge/{workspace_id}/{doc}/versions",
-            f"/api/v1/dalton/knowledge/{sample_ws_id}/thesis/versions",
-        )
-        _invoke_and_record(
-            "GET",
-            "/api/v1/dalton/knowledge/{workspace_id}/{doc}/versions/{n}",
-            f"/api/v1/dalton/knowledge/{sample_ws_id}/thesis/versions/1",
-        )
-        _invoke_and_record(
-            "GET",
-            "/api/v1/dalton/knowledge/{workspace_id}/{doc}/diff",
-            f"/api/v1/dalton/knowledge/{sample_ws_id}/thesis/diff",
-            params={"from": 1, "to": 2},
-        )
-        _, oc_health = _invoke_and_record("GET", "/api/v1/dalton/openclaw/health", "/api/v1/dalton/openclaw/health")
-        _invoke_and_record("GET", "/api/v1/dalton/openclaw/models/status", "/api/v1/dalton/openclaw/models/status")
-        _invoke_and_record("POST", "/api/v1/dalton/openclaw/models/sync", "/api/v1/dalton/openclaw/models/sync")
-        _invoke_and_record("GET", "/api/v1/dalton/providers/available-models", "/api/v1/dalton/providers/available-models")
-        _, prov_status_body = _invoke_and_record(
-            "GET", "/api/v1/dalton/providers/status", "/api/v1/dalton/providers/status"
-        )
-        _invoke_and_record("GET", "/api/v1/dalton/publications", "/api/v1/dalton/publications")
-        _invoke_and_record(
-            "GET",
-            "/api/v1/dalton/publications/{publication_id}",
-            "/api/v1/dalton/publications/00000000-0000-0000-0000-000000000000",
-        )
-        _invoke_and_record("GET", "/api/v1/dalton/publish-requests", "/api/v1/dalton/publish-requests")
-        _invoke_and_record(
-            "GET",
-            "/api/v1/dalton/verdicts",
-            "/api/v1/dalton/verdicts",
-            params={"workspace_id": sample_ws_id},
-        )
+            # 2. Configure budget for pm_user (DeepSeek probe uses platform fallback key in LLMService/resolve_model_client)
+            st_budget_put, resp_budget_put = pm_client.put(
+                "/api/v1/dalton/budget",
+                json_body={"daily_cap_usd": g2_cap_usd, "default_task_cap_usd": 1.0},
+            )
+            assert st_budget_put == 200, f"PUT /api/v1/dalton/budget failed: {st_budget_put} {resp_budget_put}"
+            budget_modified_pm = True
 
-        # 4. Probe 4 configured providers + 1 unconfigured provider under pm_user
-        configured_probes: list[tuple[str, dict[str, Any]]] = [
-            ("deepseek", {"model_key": "deepseek-flash"}),
-            ("anthropic-oauth", {"model_key": "claude-sonnet-5-5-low-oauth"}),
-            ("openai-oauth", {"model_key": "gpt-5.4-low-oauth"}),
-            ("openclaw-broker", {"model_key": "ocb-deepseek-deepseek-flash"}),
-        ]
-        probe_results: list[dict[str, Any]] = []
-        for prov_key, req_body in configured_probes:
-            st_p, body_p = _invoke_and_record(
+            # 3. Enumerate all /api/v1/dalton routes from /openapi.json
+            st_spec, openapi_spec = pm_client.get("/openapi.json")
+            assert st_spec == 200 and isinstance(openapi_spec, dict), "Failed to fetch /openapi.json"
+
+            enumerated_routes: list[tuple[str, str]] = []
+            for path, methods_obj in sorted((openapi_spec.get("paths") or {}).items()):
+                if not path.startswith("/api/v1/dalton"):
+                    continue
+                for m in sorted(methods_obj.keys()):
+                    if m.upper() in ("GET", "POST", "PUT", "DELETE", "PATCH"):
+                        enumerated_routes.append((m.upper(), path))
+
+            called_routes: list[dict[str, Any]] = []
+            called_set: set[tuple[str, str]] = set()
+
+            def _invoke_and_record(
+                method: str,
+                template_path: str,
+                actual_path: str,
+                *,
+                json_body: Any = None,
+                params: dict[str, Any] | None = None,
+                as_user_b: bool = False,
+            ) -> tuple[int, Any]:
+                target = user_b_client if as_user_b else pm_client
+                status, body = target.request(
+                    method, actual_path, json_body=json_body, params=params
+                )
+                called_set.add((method.upper(), template_path))
+                called_routes.append(
+                    {
+                        "user_id": other_user if as_user_b else pm_user,
+                        "method": method.upper(),
+                        "template_path": template_path,
+                        "actual_path": actual_path,
+                        "status_code": status,
+                    }
+                )
+                return status, body
+
+            # Invoke all 22 /api/v1/dalton routes as pm_user (never local-dev-user)
+            _invoke_and_record("GET", "/api/v1/dalton/budget", "/api/v1/dalton/budget")
+            _invoke_and_record(
+                "PUT",
+                "/api/v1/dalton/budget",
+                "/api/v1/dalton/budget",
+                json_body={"daily_cap_usd": g2_cap_usd, "default_task_cap_usd": 1.0},
+            )
+            st_tc_put, body_tc_put = _invoke_and_record(
+                "PUT",
+                "/api/v1/dalton/budget/task-caps/{scope_kind}/{scope_id}",
+                f"/api/v1/dalton/budget/task-caps/workspace/{sample_ws_id}",
+                json_body={"cap_usd": 0.50},
+            )
+            assert st_tc_put == 200, f"Expected task-cap PUT to return 200, got {st_tc_put}: {body_tc_put}"
+            st_tc_del, body_tc_del = _invoke_and_record(
+                "DELETE",
+                "/api/v1/dalton/budget/task-caps/{scope_kind}/{scope_id}",
+                f"/api/v1/dalton/budget/task-caps/workspace/{sample_ws_id}",
+            )
+            assert st_tc_del == 200, f"Expected task-cap DELETE to return 200, got {st_tc_del}: {body_tc_del}"
+            _invoke_and_record("GET", "/api/v1/dalton/budget/today", "/api/v1/dalton/budget/today")
+            _invoke_and_record("GET", "/api/v1/dalton/coverage/board", "/api/v1/dalton/coverage/board")
+            _invoke_and_record("GET", "/api/v1/dalton/autonomy/report", "/api/v1/dalton/autonomy/report")
+            assert_no_conflicting_dalton_automation(
+                pm_client,
+                name="dalton-research-director-daily",
+                workspace_id=sample_ws_id,
+            )
+            st_auto_pm, body_auto_pm = _invoke_and_record(
+                "PUT",
+                "/api/v1/dalton/automations/{name}",
+                "/api/v1/dalton/automations/dalton-research-director-daily",
+                json_body={
+                    "workspace_id": sample_ws_id,
+                    "entry": {
+                        "type": "director_daily",
+                        "prompt": "G2 director daily schedule check",
+                        "cron": "0 8 * * 1-5",
+                        "timezone": "America/New_York",
+                        "enabled": False,
+                    },
+                },
+            )
+            if (
+                st_auto_pm != 200
+                or not isinstance(body_auto_pm, dict)
+                or not body_auto_pm.get("ok")
+                or body_auto_pm.get("action") != "created"
+                or not body_auto_pm.get("automation_id")
+            ):
+                raise RuntimeError(
+                    "Expected PUT /api/v1/dalton/automations/dalton-research-director-daily to create a new automation "
+                    f"(action='created'), got status={st_auto_pm} body={body_auto_pm}"
+                )
+            created_auto_id = str(body_auto_pm["automation_id"])
+            # Import v1 and v2 on sample_ws_id as PM user -> 200
+            st_imp_v1, body_imp_v1 = _invoke_and_record(
+                "POST",
+                "/api/v1/dalton/knowledge/{workspace_id}/{doc}/import",
+                f"/api/v1/dalton/knowledge/{sample_ws_id}/thesis/import",
+                json_body={"content": sample_thesis_v1, "reason": "G2 PM import v1"},
+            )
+            assert st_imp_v1 == 200, f"Expected PM import v1 to return 200, got {st_imp_v1}: {body_imp_v1}"
+            st_imp_v2, body_imp_v2 = _invoke_and_record(
+                "POST",
+                "/api/v1/dalton/knowledge/{workspace_id}/{doc}/import",
+                f"/api/v1/dalton/knowledge/{sample_ws_id}/thesis/import",
+                json_body={"content": sample_thesis_v2, "reason": "G2 PM import v2"},
+            )
+            assert st_imp_v2 == 200, f"Expected PM import v2 to return 200, got {st_imp_v2}: {body_imp_v2}"
+
+            # Non-PM user (`realrun-user-b`) calling PM-exclusive `/import` -> 403
+            st_imp_user_b, body_imp_user_b = _invoke_and_record(
+                "POST",
+                "/api/v1/dalton/knowledge/{workspace_id}/{doc}/import",
+                f"/api/v1/dalton/knowledge/{user_b_ws_id}/thesis/import",
+                json_body={"content": sample_thesis_v1, "reason": "G2 non-PM import attempt"},
+                as_user_b=True,
+            )
+            assert st_imp_user_b == 403, (
+                f"Expected non-PM user {other_user} to get 403 on /import, got {st_imp_user_b}: {body_imp_user_b}"
+            )
+
+            _invoke_and_record(
+                "GET",
+                "/api/v1/dalton/knowledge/{workspace_id}/{doc}/versions",
+                f"/api/v1/dalton/knowledge/{sample_ws_id}/thesis/versions",
+            )
+            _invoke_and_record(
+                "GET",
+                "/api/v1/dalton/knowledge/{workspace_id}/{doc}/versions/{n}",
+                f"/api/v1/dalton/knowledge/{sample_ws_id}/thesis/versions/1",
+            )
+            _invoke_and_record(
+                "GET",
+                "/api/v1/dalton/knowledge/{workspace_id}/{doc}/diff",
+                f"/api/v1/dalton/knowledge/{sample_ws_id}/thesis/diff",
+                params={"from": 1, "to": 2},
+            )
+            _, oc_health = _invoke_and_record("GET", "/api/v1/dalton/openclaw/health", "/api/v1/dalton/openclaw/health")
+            _invoke_and_record("GET", "/api/v1/dalton/openclaw/models/status", "/api/v1/dalton/openclaw/models/status")
+            st_sync, body_sync = _invoke_and_record(
+                "POST",
+                "/api/v1/dalton/openclaw/models/sync",
+                "/api/v1/dalton/openclaw/models/sync",
+                json_body={"dry_run": True},
+            )
+            assert st_sync == 200, f"Expected openclaw/models/sync dry_run to return 200, got {st_sync}: {body_sync}"
+            _invoke_and_record("GET", "/api/v1/dalton/providers/available-models", "/api/v1/dalton/providers/available-models")
+            _, prov_status_body = _invoke_and_record(
+                "GET", "/api/v1/dalton/providers/status", "/api/v1/dalton/providers/status"
+            )
+            _invoke_and_record("GET", "/api/v1/dalton/publications", "/api/v1/dalton/publications")
+            _invoke_and_record(
+                "GET",
+                "/api/v1/dalton/publications/{publication_id}",
+                "/api/v1/dalton/publications/00000000-0000-0000-0000-000000000000",
+            )
+            _invoke_and_record("GET", "/api/v1/dalton/publish-requests", "/api/v1/dalton/publish-requests")
+            _invoke_and_record(
+                "GET",
+                "/api/v1/dalton/verdicts",
+                "/api/v1/dalton/verdicts",
+                params={"workspace_id": sample_ws_id},
+            )
+
+            # 4. Probe configured providers (cash DeepSeek via platform fallback + Antigravity OAuth subscription models) + 1 unconfigured provider under pm_user
+            configured_probes: list[tuple[str, dict[str, Any]]] = [
+                ("deepseek", {"model_key": "deepseek-flash"}),
+                ("antigravity-oauth", {"model_key": "gemini-3.8-flash-low-oauth"}),
+                ("antigravity-oauth", {"model_key": "claude-sonnet-5-5-low-oauth"}),
+            ]
+            probe_results: list[dict[str, Any]] = []
+            for prov_key, req_body in configured_probes:
+                st_p, body_p = _invoke_and_record(
+                    "POST",
+                    "/api/v1/dalton/providers/{provider}/probe",
+                    f"/api/v1/dalton/providers/{prov_key}/probe",
+                    json_body=req_body,
+                )
+                assert st_p == 200 and isinstance(body_p, dict) and body_p.get("ok") is True, (
+                    f"Configured provider probe failed for {prov_key}: {st_p} {body_p}"
+                )
+                probe_results.append(body_p)
+
+            ds_probe = next(p for p in probe_results if p.get("provider") == "deepseek")
+            assert float(ds_probe.get("cash_usd") or 0.0) > 0.0, (
+                f"DeepSeek cash probe did not record positive cash_usd: {ds_probe}"
+            )
+
+            # Unconfigured provider probe -> returns ok=False with error_kind and zero credential leak
+            st_unconf, body_unconf = _invoke_and_record(
                 "POST",
                 "/api/v1/dalton/providers/{provider}/probe",
-                f"/api/v1/dalton/providers/{prov_key}/probe",
-                json_body=req_body,
+                "/api/v1/dalton/providers/zhipu/probe",
+                json_body={},
             )
-            assert st_p == 200 and isinstance(body_p, dict) and body_p.get("ok") is True, (
-                f"Configured provider probe failed for {prov_key}: {st_p} {body_p}"
+            assert st_unconf == 200 and isinstance(body_unconf, dict) and body_unconf.get("ok") is False, (
+                f"Expected unconfigured provider probe to return ok=False, got {st_unconf}: {body_unconf}"
             )
-            probe_results.append(body_p)
+            assert body_unconf.get("error_kind"), f"Missing error_kind on unconfigured probe: {body_unconf}"
 
-        ds_probe = next(p for p in probe_results if p.get("provider") == "deepseek")
-        assert float(ds_probe.get("cash_usd") or 0.0) > 0.0, (
-            f"DeepSeek cash probe did not record positive cash_usd: {ds_probe}"
-        )
+            st_bt_after, budget_today_after = pm_client.get("/api/v1/dalton/budget/today")
+            assert st_bt_after == 200
 
-        # Unconfigured provider probe -> returns ok=False with error_kind and zero credential leak
-        st_unconf, body_unconf = _invoke_and_record(
-            "POST",
-            "/api/v1/dalton/providers/{provider}/probe",
-            "/api/v1/dalton/providers/zhipu/probe",
-            json_body={},
-        )
-        assert st_unconf == 200 and isinstance(body_unconf, dict) and body_unconf.get("ok") is False, (
-            f"Expected unconfigured provider probe to return ok=False, got {st_unconf}: {body_unconf}"
-        )
-        assert body_unconf.get("error_kind"), f"Missing error_kind on unconfigured probe: {body_unconf}"
+            uncalled_routes = [
+                f"{m} {p}" for (m, p) in enumerated_routes if (m, p) not in called_set
+            ]
+            assert not uncalled_routes, f"Uncalled Dalton routes: {uncalled_routes}"
+    finally:
+        cleanup_errors: list[str] = []
+        try:
+            with RealRunHttpClient(base_url=args.backend, user_id=pm_user, timeout_s=30.0, record=False) as cleanup_pm:
+                if created_auto_id:
+                    try:
+                        st_del_auto, _ = cleanup_pm.delete(f"/api/v1/automations/{created_auto_id}")
+                        if st_del_auto not in (200, 204, 404):
+                            cleanup_errors.append(f"delete_auto_pm:http_{st_del_auto}")
+                    except Exception as exc:
+                        cleanup_errors.append(f"delete_auto_pm_exception:{type(exc).__name__}")
+                if sample_ws_id:
+                    try:
+                        st_del_ws_pm, _ = cleanup_pm.delete(f"/api/v1/workspaces/{sample_ws_id}")
+                        if st_del_ws_pm not in (200, 204, 404):
+                            cleanup_errors.append(f"delete_ws_pm:http_{st_del_ws_pm}")
+                    except Exception as exc:
+                        cleanup_errors.append(f"delete_ws_pm_exception:{type(exc).__name__}")
+                if budget_modified_pm:
+                    try:
+                        err_pm = _restore_budget_state(
+                            cleanup_pm,
+                            user_id=pm_user,
+                            was_configured=was_configured_pm,
+                            prior_budget=prior_budget_pm,
+                        )
+                        if err_pm is not None:
+                            cleanup_errors.append(f"restore_budget_pm:{err_pm}")
+                    except Exception as exc:
+                        cleanup_errors.append(f"restore_budget_pm_exception:{type(exc).__name__}")
+        except Exception as exc:
+            cleanup_errors.append(f"cleanup_pm_exception:{type(exc).__name__}")
 
-        st_bt_after, budget_today_after = pm_client.get("/api/v1/dalton/budget/today")
-        assert st_bt_after == 200
+        if user_b_ws_id:
+            try:
+                with RealRunHttpClient(base_url=args.backend, user_id=other_user, timeout_s=30.0, record=False) as cleanup_b:
+                    st_del_ws_b, _ = cleanup_b.delete(f"/api/v1/workspaces/{user_b_ws_id}")
+                    if st_del_ws_b not in (200, 204, 404):
+                        cleanup_errors.append(f"delete_ws_b:http_{st_del_ws_b}")
+            except Exception as exc:
+                cleanup_errors.append(f"delete_ws_b_exception:{type(exc).__name__}")
 
-        uncalled_routes = [
-            f"{m} {p}" for (m, p) in enumerated_routes if (m, p) not in called_set
-        ]
-        assert not uncalled_routes, f"Uncalled Dalton routes: {uncalled_routes}"
+        if cleanup_errors:
+            raise RuntimeError(
+                f"G2 cleanup/restoration failed: {cleanup_errors}"
+            )
 
     startup_fail_check = _verify_startup_fail_fast()
     assert startup_fail_check["failed_fast"] is True, (
@@ -452,7 +568,7 @@ def main() -> int:
     journal_totals = envelope["journal"]["totals"]
     raw_path, md_path, sha256_hex = write_evidence_and_summary(
         family_code="G2",
-        title="Dalton 路由全覆盖、四供应商真实探测、PM 权限隔离与真实子进程启动拒绝校验（P0J §5 G2）",
+        title="Dalton 路由全覆盖、供应商真实探测、PM 权限隔离与真实子进程启动拒绝校验（P0J §5 G2）",
         raw_json_path=f"var/dalton/trial-runs/realrun-{args.date}/g2_providers.json",
         summary_md_path=f"var/dalton/trial-runs/realrun-{args.date}/G2.md",
         envelope=envelope,
@@ -461,8 +577,8 @@ def main() -> int:
             ("OpenAPI 枚举 `/api/v1/dalton` 路由数", len(enumerated_routes)),
             ("实际调用覆盖路由数 (`uncalled_routes=0`)", len(called_set)),
             (
-                "4 个已配置供应商探测 (`POST /api/v1/dalton/providers/{provider}/probe`)",
-                ", ".join(f"{p.get('provider')}:ok={p.get('ok')}" for p in probe_results),
+                "已配置供应商探测 (`POST /api/v1/dalton/providers/{provider}/probe`)",
+                ", ".join(f"{p.get('provider')}({p.get('model_key')}):ok={p.get('ok')}" for p in probe_results),
             ),
             (
                 "未配置供应商探测 (`zhipu`)",

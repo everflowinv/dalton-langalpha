@@ -38,22 +38,23 @@ from typing import Any
 
 import httpx
 import psycopg
-from dotenv import load_dotenv
 from psycopg.rows import dict_row
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-# Preserve explicit empty INTERNAL_SERVICE_TOKEN="" in os.environ so callers can test missing token failure
-load_dotenv(REPO_ROOT / ".env", override=False)
-
 from scripts.dalton.realrun._common import (  # noqa: E402
+    KNOWN_MIGRATED_WORKSPACES,
     RealRunHttpClient,
     assert_no_credentials_in_obj,
+    build_realrun_workspace_config,
     get_git_sha,
     is_git_dirty,
+    is_valid_realrun_workspace_row,
+    load_repo_dotenv,
     now_utc_iso,
+    resolve_local_dev_user_id,
 )
 from scripts.dalton.realrun.journal_dump import (  # noqa: E402
     build_dsn_from_env,
@@ -300,7 +301,7 @@ def check_oauth_token_provenance(
             "user_id": user_id,
             "provider": provider,
             "reason": "db_query_failed",
-            "error": f"{type(exc).__name__}: {exc}",
+            "error": _safe_exc_summary(exc, "oauth_token_provenance database query failed"),
         }
 
     token_exists = row is not None
@@ -333,6 +334,147 @@ def check_oauth_token_provenance(
             for r in unverified_rows
         ],
         "reason": reason,
+    }
+
+
+def _safe_exc_summary(exc: BaseException, context: str) -> str:
+    """Return a credential-free exception summary containing only the exception type and a static description."""
+    return f"{type(exc).__name__}: {context}"
+
+
+def check_migrated_workspace_ownership(
+    *,
+    dsn: str | None = None,
+) -> dict[str, Any]:
+    """Verify the 4 migrated workspaces (`META`, `AMZN`, `GOOGL`, `MSFT`) belong to `LOCAL_DEV_USER_ID` (P0J §8.1 #20)."""
+    expected_owner = resolve_local_dev_user_id()
+    migrated_map = dict(KNOWN_MIGRATED_WORKSPACES)
+    expected_ids = list(migrated_map.values())
+    try:
+        conn_str = build_dsn_from_env(dsn)
+        with psycopg.connect(conn_str, row_factory=dict_row) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT workspace_id::text AS workspace_id,
+                           user_id,
+                           name,
+                           status
+                    FROM workspaces
+                    WHERE workspace_id = ANY(%s::uuid[])
+                      AND status <> 'deleted'
+                    """,
+                    (expected_ids,),
+                )
+                rows = list(cur.fetchall())
+    except Exception as exc:
+        return {
+            "status": "FAIL",
+            "expected_owner": expected_owner,
+            "expected_workspaces": migrated_map,
+            "reason": "db_query_failed",
+            "error": _safe_exc_summary(exc, "migrated_workspace_ownership database query failed"),
+        }
+
+    by_id = {str(r.get("workspace_id") or "").strip().lower(): dict(r) for r in rows}
+    missing_tickers: list[str] = []
+    wrong_owner_workspaces: list[dict[str, Any]] = []
+    verified_workspaces: dict[str, dict[str, Any]] = {}
+
+    for ticker, ws_id in migrated_map.items():
+        row = by_id.get(ws_id.lower())
+        if row is None:
+            missing_tickers.append(ticker)
+            continue
+        actual_owner = str(row.get("user_id") or "").strip()
+        verified_workspaces[ticker] = {
+            "workspace_id": ws_id,
+            "user_id": actual_owner,
+            "name": row.get("name"),
+            "status": row.get("status"),
+        }
+        if actual_owner != expected_owner:
+            wrong_owner_workspaces.append(
+                {
+                    "ticker": ticker,
+                    "workspace_id": ws_id,
+                    "expected_owner": expected_owner,
+                    "actual_owner": actual_owner,
+                }
+            )
+
+    ok = len(missing_tickers) == 0 and len(wrong_owner_workspaces) == 0
+    reason: str | None = None
+    if missing_tickers:
+        reason = f"missing_migrated_workspaces:{','.join(missing_tickers)}"
+    elif wrong_owner_workspaces:
+        reason = "migrated_workspace_wrong_owner"
+
+    return {
+        "status": "PASS" if ok else "FAIL",
+        "expected_owner": expected_owner,
+        "expected_workspaces": migrated_map,
+        "verified_workspaces": verified_workspaces,
+        "missing_tickers": missing_tickers,
+        "wrong_owner_workspaces": wrong_owner_workspaces,
+        "reason": reason,
+    }
+
+
+def check_realrun_workspace_provenance(
+    *,
+    dsn: str | None = None,
+) -> dict[str, Any]:
+    """Verify every workspace owned by `realrun-*` carries the evidence-script marker in `config` (P0J §8.1 #20)."""
+    migrated_ids = {ws_id.lower() for ws_id in KNOWN_MIGRATED_WORKSPACES.values()}
+    try:
+        conn_str = build_dsn_from_env(dsn)
+        with psycopg.connect(conn_str, row_factory=dict_row) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT workspace_id::text AS workspace_id,
+                           user_id,
+                           name,
+                           status,
+                           config
+                    FROM workspaces
+                    WHERE user_id LIKE 'realrun-%%'
+                      AND status <> 'deleted'
+                    ORDER BY user_id, name, workspace_id
+                    """
+                )
+                rows = list(cur.fetchall())
+    except Exception as exc:
+        return {
+            "status": "FAIL",
+            "reason": "db_query_failed",
+            "error": _safe_exc_summary(exc, "realrun_workspace_provenance database query failed"),
+        }
+
+    valid_workspaces: list[dict[str, Any]] = []
+    invalid_workspaces: list[dict[str, Any]] = []
+    for row in rows:
+        is_valid, marker_reason = is_valid_realrun_workspace_row(dict(row), migrated_ids=migrated_ids)
+        entry = {
+            "workspace_id": str(row.get("workspace_id") or ""),
+            "user_id": str(row.get("user_id") or ""),
+            "name": str(row.get("name") or ""),
+            "status": str(row.get("status") or ""),
+            "marker_check": marker_reason,
+        }
+        if is_valid:
+            valid_workspaces.append(entry)
+        else:
+            invalid_workspaces.append(entry)
+
+    ok = len(invalid_workspaces) == 0
+    return {
+        "status": "PASS" if ok else "FAIL",
+        "realrun_workspaces_checked": len(rows),
+        "valid_workspaces": valid_workspaces,
+        "invalid_workspaces": invalid_workspaces,
+        "reason": None if ok else str(invalid_workspaces[0]["marker_check"]),
     }
 
 
@@ -371,7 +513,128 @@ def _restore_budget_state(
             return f"budget_restore_unconfigured_verify_failed:{st_get}"
         return None
     except Exception as exc:
-        return f"budget_restore_exception:{type(exc).__name__}:{exc}"
+        return f"budget_restore_exception:{type(exc).__name__}"
+
+
+def _snapshot_api_keys_state(client: RealRunHttpClient) -> dict[str, Any]:
+    """Snapshot `GET /api/v1/users/me/api-keys` state (without logging or storing raw keys)."""
+    st, body = client.get("/api/v1/users/me/api-keys")
+    if st != 200 or not isinstance(body, dict):
+        raise RuntimeError(f"GET /api/v1/users/me/api-keys failed with HTTP {st}")
+    providers = body.get("providers") or []
+    ds_entry = next(
+        (p for p in providers if isinstance(p, dict) and p.get("provider") == "deepseek"),
+        {},
+    )
+    masked_key = ds_entry.get("masked_key")
+    had_user_deepseek_key = bool(isinstance(masked_key, str) and masked_key and masked_key != "(server)")
+    return {
+        "byok_enabled": bool(body.get("byok_enabled")),
+        "had_user_deepseek_key": had_user_deepseek_key,
+    }
+
+
+def _restore_api_keys_state(
+    cleanup_client: RealRunHttpClient,
+    *,
+    prior_state: dict[str, Any] | None,
+) -> str | None:
+    """Restore user's BYOK `api-keys` state to `prior_state`; return error string on failure.
+
+    When `prior_state["had_user_deepseek_key"]` is True, callers must not overwrite the
+    user's pre-existing DeepSeek key at setup time (since `GET /api/v1/users/me/api-keys`
+    only returns a masked key), so restoration is a no-op.
+    """
+    if not isinstance(prior_state, dict):
+        return "api_keys_restore_missing_prior_state"
+    try:
+        prior_byok_enabled = bool(prior_state.get("byok_enabled"))
+        had_user_ds_key = bool(prior_state.get("had_user_deepseek_key"))
+        if had_user_ds_key:
+            return None
+        st_del, _ = cleanup_client.delete("/api/v1/users/me/api-keys/deepseek")
+        st_put, body_put = cleanup_client.put(
+            "/api/v1/users/me/api-keys",
+            json_body={"byok_enabled": prior_byok_enabled, "api_keys": {"deepseek": None}},
+        )
+        if st_del != 200 or st_put != 200 or not isinstance(body_put, dict):
+            return f"api_keys_restore_http_failed:del={st_del},put={st_put}"
+        if bool(body_put.get("byok_enabled")) != prior_byok_enabled:
+            return "api_keys_restore_byok_enabled_mismatch"
+        ds_after = next(
+            (
+                p
+                for p in (body_put.get("providers") or [])
+                if isinstance(p, dict) and p.get("provider") == "deepseek"
+            ),
+            {},
+        )
+        if ds_after.get("masked_key") not in (None, "(server)"):
+            return "api_keys_restore_deepseek_key_still_present"
+        return None
+    except Exception as exc:
+        return f"api_keys_restore_exception:{type(exc).__name__}"
+
+
+def _snapshot_subagent_state(
+    client: RealRunHttpClient,
+    name: str = "general-purpose",
+) -> dict[str, Any]:
+    """Snapshot a subagent's configuration from `GET /api/v1/subagents`."""
+    st, body = client.get("/api/v1/subagents")
+    if st != 200 or not isinstance(body, dict):
+        raise RuntimeError(f"GET /api/v1/subagents failed with HTTP {st}")
+    item = next(
+        (s for s in (body.get("subagents") or []) if isinstance(s, dict) and s.get("name") == name),
+        None,
+    )
+    if not isinstance(item, dict) or not item.get("version"):
+        raise RuntimeError(f"Subagent {name!r} not found in GET /api/v1/subagents")
+    return {
+        "name": name,
+        "version": str(item["version"]),
+        "edited": bool(item.get("edited")),
+        "user_fields": list(item.get("user_fields") or []),
+        "model": item.get("model"),
+    }
+
+
+def _restore_subagent_state(
+    cleanup_client: RealRunHttpClient,
+    *,
+    prior_state: dict[str, Any] | None,
+) -> str | None:
+    """Restore a subagent's `model` field to `prior_state`; return error string on failure."""
+    if not isinstance(prior_state, dict):
+        return "subagent_restore_missing_prior_state"
+    name = str(prior_state.get("name") or "general-purpose")
+    try:
+        st_get, body_get = cleanup_client.get("/api/v1/subagents")
+        if st_get != 200 or not isinstance(body_get, dict):
+            return f"subagent_restore_get_http_{st_get}"
+        cur_item = next(
+            (s for s in (body_get.get("subagents") or []) if isinstance(s, dict) and s.get("name") == name),
+            None,
+        )
+        if not isinstance(cur_item, dict) or not cur_item.get("version"):
+            return f"subagent_restore_missing_{name}"
+        cur_version = str(cur_item["version"])
+        prior_user_fields = list(prior_state.get("user_fields") or [])
+        prior_model = prior_state.get("model")
+        target_model_patch = (prior_model or "inherit") if "model" in prior_user_fields else None
+        st_put, body_put = cleanup_client.put(
+            f"/api/v1/subagents/{name}",
+            json_body={"version": cur_version, "fields": {"model": target_model_patch}},
+        )
+        if st_put != 200 or not isinstance(body_put, dict):
+            return f"subagent_restore_put_http_{st_put}"
+        if body_put.get("model") != prior_model:
+            return "subagent_restore_model_mismatch"
+        if ("model" in (body_put.get("user_fields") or [])) != ("model" in prior_user_fields):
+            return "subagent_restore_user_fields_mismatch"
+        return None
+    except Exception as exc:
+        return f"subagent_restore_exception:{type(exc).__name__}"
 
 
 def check_conversation_transport(
@@ -403,7 +666,13 @@ def check_conversation_transport(
     prior_budget: dict[str, Any] | None = None
     was_configured = False
     budget_modified = False
+    budget_restore_error: str | None = None
+    workspace_cleanup_error: str | None = None
     restore_error: str | None = None
+    early_fail: dict[str, Any] | None = None
+    st_msg = 0
+    events: list[dict[str, Any]] = []
+    err_body: Any = None
     try:
         with RealRunHttpClient._for_check_env_probe(
             base_url=base_url, user_id="realrun-pm-a", timeout_s=120.0
@@ -431,53 +700,107 @@ def check_conversation_transport(
                     json_body={"daily_cap_usd": probe_cap, "default_task_cap_usd": 5.0},
                 )
                 if st_put_tmp != 200:
-                    return {
+                    early_fail = {
                         "status": "FAIL",
                         "reason": f"temporary_budget_put_failed:{st_put_tmp}",
                         "http_status": st_put_tmp,
                     }
-                budget_modified = True
+                else:
+                    budget_modified = True
 
-            st_ws, body_ws = client.post(
-                "/api/v1/workspaces",
-                json_body={"name": "check-env-transport", "description": "P0J §1.4 check_env transport probe"},
-            )
-            if st_ws not in (200, 201) or not isinstance(body_ws, dict):
-                return {
-                    "status": "FAIL",
-                    "reason": f"workspace_create_failed:{st_ws}",
-                    "http_status": st_ws,
-                }
-            ws_id = str(body_ws.get("workspace_id") or "")
-            st_msg, events, err_body = client.stream_sse(
-                "POST",
-                "/api/v1/threads/messages",
-                json_body={
-                    "workspace_id": ws_id,
-                    "messages": [{"role": "user", "content": "Reply with ONLY the single word: PONG"}],
-                    "llm_model": model,
-                    "agent_mode": "flash",
-                },
-                max_events=300,
-            )
+            if early_fail is None:
+                st_ws, body_ws = client.post(
+                    "/api/v1/workspaces",
+                    json_body={
+                        "name": "check-env-transport",
+                        "description": "P0J §1.4 check_env transport probe",
+                        "config": build_realrun_workspace_config("check_env.py"),
+                    },
+                )
+                if st_ws not in (200, 201) or not isinstance(body_ws, dict):
+                    early_fail = {
+                        "status": "FAIL",
+                        "reason": f"workspace_create_failed:{st_ws}",
+                        "http_status": st_ws,
+                    }
+                else:
+                    ws_id = str(body_ws.get("workspace_id") or "")
+                    try:
+                        st_msg, events, err_body = client.stream_sse(
+                            "POST",
+                            "/api/v1/threads/messages",
+                            json_body={
+                                "workspace_id": ws_id,
+                                "messages": [{"role": "user", "content": "Reply with ONLY the single word: PONG"}],
+                                "llm_model": model,
+                                "agent_mode": "flash",
+                            },
+                            max_events=300,
+                        )
+                    except Exception as exc:
+                        early_fail = {
+                            "status": "FAIL",
+                            "reason": f"stream_sse_exception:{type(exc).__name__}",
+                            "error": _safe_exc_summary(exc, "conversation_transport stream_sse failed"),
+                        }
+    except Exception as exc:
+        early_fail = {
+            "status": "FAIL",
+            "reason": f"probe_request_exception:{type(exc).__name__}",
+            "error": _safe_exc_summary(exc, "conversation_transport request failed"),
+        }
     finally:
         if ws_id or budget_modified:
+            cleanup_errors: list[str] = []
             try:
                 with RealRunHttpClient._for_check_env_probe(
                     base_url=base_url, user_id="realrun-pm-a", timeout_s=30.0
                 ) as cleanup_client:
                     if ws_id:
-                        cleanup_client.delete(f"/api/v1/workspaces/{ws_id}")
+                        try:
+                            st_del_ws, _ = cleanup_client.delete(f"/api/v1/workspaces/{ws_id}")
+                            if st_del_ws not in (200, 204, 404):
+                                workspace_cleanup_error = f"workspace_delete_http_{st_del_ws}"
+                                cleanup_errors.append(workspace_cleanup_error)
+                        except Exception as exc:
+                            workspace_cleanup_error = f"workspace_delete_exception:{type(exc).__name__}"
+                            cleanup_errors.append(workspace_cleanup_error)
                     if budget_modified:
-                        restore_error = _restore_budget_state(
-                            cleanup_client,
-                            user_id="realrun-pm-a",
-                            was_configured=was_configured,
-                            prior_budget=prior_budget,
-                            dsn=dsn,
-                        )
+                        try:
+                            err_b = _restore_budget_state(
+                                cleanup_client,
+                                user_id="realrun-pm-a",
+                                was_configured=was_configured,
+                                prior_budget=prior_budget,
+                                dsn=dsn,
+                            )
+                            if err_b:
+                                budget_restore_error = err_b
+                                cleanup_errors.append(err_b)
+                        except Exception as exc:
+                            budget_restore_error = f"budget_restore_exception:{type(exc).__name__}"
+                            cleanup_errors.append(budget_restore_error)
             except Exception as exc:
-                restore_error = f"cleanup_exception:{type(exc).__name__}:{exc}"
+                cleanup_exc_msg = f"cleanup_exception:{type(exc).__name__}"
+                if ws_id and workspace_cleanup_error is None:
+                    workspace_cleanup_error = cleanup_exc_msg
+                if budget_modified and budget_restore_error is None:
+                    budget_restore_error = cleanup_exc_msg
+                cleanup_errors.append(cleanup_exc_msg)
+            if cleanup_errors:
+                restore_error = "; ".join(cleanup_errors)
+
+    if early_fail is not None:
+        early_fail["budget_restored"] = budget_restore_error is None
+        early_fail["budget_restore_error"] = budget_restore_error
+        early_fail["workspace_cleaned"] = workspace_cleanup_error is None
+        early_fail["workspace_cleanup_error"] = workspace_cleanup_error
+        early_fail["restore_error"] = restore_error
+        if restore_error:
+            base_reason = str(early_fail.get("reason") or "probe_failed")
+            early_fail["reason"] = f"{base_reason}; restore_error={restore_error}"
+            early_fail["error"] = early_fail.get("error") or restore_error
+        return early_fail
 
     # Allow 0.5s for async usage persistence to commit
     time.sleep(0.5)
@@ -505,7 +828,10 @@ def check_conversation_transport(
         "conversation_usages_count": len(pm_rows),
         "cash_usd": probe_cash_usd,
         "user_id_verified": len(pm_rows) >= 1 and all(r.get("user_id") == "realrun-pm-a" for r in pm_rows),
-        "budget_restored": restore_error is None,
+        "budget_restored": budget_restore_error is None,
+        "budget_restore_error": budget_restore_error,
+        "workspace_cleaned": workspace_cleanup_error is None,
+        "workspace_cleanup_error": workspace_cleanup_error,
         "restore_error": restore_error,
         "error": err_body if st_msg != 200 else restore_error,
     }
@@ -545,7 +871,7 @@ def check_bridge(bridge_url: str = "http://127.0.0.1:8960") -> dict[str, Any]:
         return {
             "status": "FAIL",
             "bridge_url": bridge_url,
-            "error": f"{type(exc).__name__}: {exc}",
+            "error": _safe_exc_summary(exc, "bridge healthz or MCP read failed"),
         }
 
 
@@ -587,7 +913,7 @@ def check_broker(broker_url: str | None = None) -> dict[str, Any]:
         return {
             "status": "FAIL",
             "broker_url": url,
-            "error": f"{type(exc).__name__}: {exc}",
+            "error": _safe_exc_summary(exc, "broker health or models request failed"),
         }
 
 
@@ -598,6 +924,7 @@ def run_all_checks(
     broker_url: str | None = None,
     transport_model: str = "gemini-3.8-flash-low-oauth",
     strict_static_scan: bool = False,
+    skip_oauth_and_transport: bool = False,
 ) -> dict[str, Any]:
     svc_token = os.getenv("INTERNAL_SERVICE_TOKEN", "").strip()
     if not svc_token:
@@ -608,23 +935,29 @@ def run_all_checks(
 
     broker_res = check_broker(broker_url)
     identity_res, version_res, deployment_res = check_identity_and_version(backend_url)
-    oauth_prov_res = check_oauth_token_provenance(user_id="realrun-pm-a", provider="antigravity-oauth")
-    transport_res = check_conversation_transport(
-        backend_url, model=transport_model, oauth_provenance=oauth_prov_res
-    )
+    migrated_ws_res = check_migrated_workspace_ownership()
+    realrun_ws_res = check_realrun_workspace_provenance()
     bridge_res = check_bridge(bridge_url)
     static_res = scan_realrun_scripts()
 
-    checks = {
+    checks: dict[str, dict[str, Any]] = {
         "identity": identity_res,
         "version": version_res,
-        "oauth_token_provenance": oauth_prov_res,
-        "conversation_transport": transport_res,
+        "migrated_workspace_ownership": migrated_ws_res,
+        "realrun_workspace_provenance": realrun_ws_res,
         "bridge": bridge_res,
         "broker": broker_res,
         "deployment": deployment_res,
         "static_script_scan": static_res,
     }
+    if not skip_oauth_and_transport:
+        oauth_prov_res = check_oauth_token_provenance(user_id="realrun-pm-a", provider="antigravity-oauth")
+        transport_res = check_conversation_transport(
+            backend_url, model=transport_model, oauth_provenance=oauth_prov_res
+        )
+        checks["oauth_token_provenance"] = oauth_prov_res
+        checks["conversation_transport"] = transport_res
+
     failed = [name for name, item in checks.items() if item.get("status") != "PASS"]
     summary = {
         "checked_at": now_utc_iso(),
@@ -646,6 +979,7 @@ def run_all_checks(
 
 
 def main() -> int:
+    load_repo_dotenv()
     parser = argparse.ArgumentParser(description="Verify Dalton real-run environment (P0J §1.4).")
     parser.add_argument("--backend", default="http://127.0.0.1:8000", help="Backend base URL")
     parser.add_argument("--bridge", default="http://127.0.0.1:8960", help="ResearchData bridge base URL")
@@ -667,7 +1001,12 @@ def main() -> int:
             strict_static_scan=args.strict_static_scan,
         )
     except Exception as exc:
-        print(json.dumps({"all_passed": False, "error": str(exc)}, ensure_ascii=False, indent=2), file=sys.stderr)
+        err_msg = (
+            str(exc)
+            if isinstance(exc, RuntimeError) and "INTERNAL_SERVICE_TOKEN" in str(exc)
+            else _safe_exc_summary(exc, "check_env execution failed")
+        )
+        print(json.dumps({"all_passed": False, "error": err_msg}, ensure_ascii=False, indent=2), file=sys.stderr)
         return 1
 
     print(json.dumps(summary, ensure_ascii=False, indent=2))

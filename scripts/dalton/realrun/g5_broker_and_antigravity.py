@@ -44,12 +44,21 @@ if str(REPO_ROOT) not in sys.path:
 
 from scripts.dalton.realrun._common import (  # noqa: E402
     RealRunHttpClient,
+    _probe_backend_health_sync,
     build_evidence_envelope,
     default_shanghai_date,
+    ensure_debug_banner_printed,
+    get_git_sha,
+    is_git_dirty,
+    is_head_merged_into_main,
+    is_main_ancestor_of_head,
+    load_repo_dotenv,
     now_utc_iso,
     preflight_realrun_script,
+    require_internal_service_token,
     write_evidence_and_summary,
 )
+from scripts.dalton.realrun.check_env import _restore_budget_state, run_all_checks  # noqa: E402
 
 DEFAULT_BACKEND_URL = "http://127.0.0.1:8000"
 BROKER_BASE_URL = "http://127.0.0.1:18789/dalton-broker/v1"
@@ -346,15 +355,95 @@ def _initiate_g5_2_for_user(base_url: str, user_id: str, *, record: bool = False
         return payload
 
 
-def _run_g5_2_antigravity(
+def _assert_pre_callback_git_and_backend_gate(
+    *,
+    base_url: str,
+    user_id: str,
+    record: bool,
+) -> dict[str, Any]:
+    """Validate git cleanliness, merge ancestry, Docker backend version parity, and all check_env checks
+    except `oauth_token_provenance` and `conversation_transport` before touching a single-use OAuth callback URL.
+    """
+    require_internal_service_token()
+    if not record:
+        ensure_debug_banner_printed()
+        try:
+            health = _probe_backend_health_sync(base_url, user_id)
+        except Exception as exc:
+            raise SystemExit(f"ERROR: {type(exc).__name__}") from exc
+        deployment_mode = str(health.get("deployment") or "")
+        if deployment_mode != "docker":
+            raise SystemExit(
+                f"ERROR: G5.2 requires Docker deployment (`deployment == 'docker'`), got {deployment_mode!r}"
+            )
+    else:
+        if is_git_dirty():
+            raise SystemExit(
+                "ERROR: Working tree is dirty (git status --porcelain is non-empty, L41). "
+                "Refusing to consume OAuth callback URL or write evidence."
+            )
+        if not is_head_merged_into_main():
+            raise SystemExit(
+                "ERROR: HEAD is not merged into origin/dalton/main (L41). "
+                "Refusing to consume OAuth callback URL or write formal evidence."
+            )
+        if not is_main_ancestor_of_head():
+            raise SystemExit(
+                "ERROR: HEAD does not share ancestry with origin/dalton/main (L41). "
+                "Refusing to run on orphaned commit."
+            )
+
+        local_sha = get_git_sha()
+        try:
+            health = _probe_backend_health_sync(base_url, user_id)
+        except Exception as exc:
+            raise SystemExit(f"ERROR: {type(exc).__name__}") from exc
+
+        b_sha = str(health.get("git_sha") or "").strip()
+        b_dirty = bool(health.get("git_dirty", True))
+        deployment_mode = str(health.get("deployment") or "")
+        if not b_sha or b_sha == "unknown":
+            raise SystemExit(
+                f"ERROR: Backend reported missing/unknown git_sha ({b_sha!r}) (L41). Refusing to run."
+            )
+        if b_sha != local_sha:
+            raise SystemExit(
+                f"ERROR: Backend git_sha ({b_sha}) != local HEAD ({local_sha}) (L41). Restart backend at HEAD first."
+            )
+        if b_dirty:
+            raise SystemExit(
+                "ERROR: Backend reported git_dirty=True at startup (L41). Restart backend from a clean working tree."
+            )
+        if deployment_mode != "docker":
+            raise SystemExit(
+                f"ERROR: G5.2 requires Docker deployment (`deployment == 'docker'`), got {deployment_mode!r}"
+            )
+
+    pre_cb_report = run_all_checks(
+        backend_url=base_url,
+        skip_oauth_and_transport=True,
+    )
+    if not pre_cb_report.get("all_passed"):
+        failed = [
+            f"{k}: {v.get('detail') or v.get('error') or v.get('reason') or 'FAIL'}"
+            for k, v in (pre_cb_report.get("checks") or {}).items()
+            if isinstance(v, dict) and v.get("status") == "FAIL"
+        ]
+        raise SystemExit(
+            "ERROR: Pre-callback check_env failed before consuming single-use OAuth callback URL: "
+            + "; ".join(failed)
+        )
+    return health
+
+
+def _exchange_g5_2_docker_callback(
     base_url: str,
     user_a: str,
-    user_b: str,
-    callback_url: str | None = None,
+    callback_url: str | None,
     *,
     record: bool = False,
-) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    """Run G5.2 Antigravity Docker manual callback paste + 4-round Gemini tool calling + 2-user isolation."""
+) -> dict[str, Any]:
+    """Execute Docker manual callback paste verification (steps 1-5) and exchange `callback_url` for `user_a`'s OAuth token."""
     resolved_callback = (callback_url or "").strip()
     if not resolved_callback:
         raise RuntimeError(
@@ -363,15 +452,19 @@ def _run_g5_2_antigravity(
             "the redirected callback URL via `--callback-url <url>`."
         )
 
-    with RealRunHttpClient(
-        base_url=base_url, user_id=user_a, timeout_s=240.0, record=record
-    ) as client_a, RealRunHttpClient(
-        base_url=base_url, user_id=user_b, timeout_s=60.0, record=record
-    ) as client_b:
-        client_a.ensure_user()
-        client_b.ensure_user()
+    parsed_cb = urlparse(resolved_callback)
+    cb_qs = parse_qs(parsed_cb.query)
+    cb_state = (cb_qs.get("state") or [""])[0]
+    cb_port = parsed_cb.port or 0
+    assert cb_port > 0 and bool(cb_state), (
+        f"Callback URL must include localhost port and state query parameter: {resolved_callback!r}"
+    )
 
-        # Check deployment mode via /api/v1/dalton/openclaw/health and assert Docker deployment
+    with RealRunHttpClient(
+        base_url=base_url, user_id=user_a, timeout_s=120.0, record=record
+    ) as client_a:
+        client_a.ensure_user()
+
         st_health, body_health = client_a.get("/api/v1/dalton/openclaw/health")
         assert st_health == 200 and isinstance(body_health, dict), (
             f"openclaw/health failed: {st_health} {body_health}"
@@ -379,21 +472,6 @@ def _run_g5_2_antigravity(
         deployment_mode = str(body_health.get("deployment") or "")
         assert deployment_mode == "docker", (
             f"G5.2 requires Docker deployment (`deployment == 'docker'`), got {deployment_mode!r}"
-        )
-
-        st_b, body_b = client_a.put(
-            "/api/v1/dalton/budget",
-            json_body={"daily_cap_usd": 5.0, "default_task_cap_usd": 2.0},
-        )
-        assert st_b == 200, f"Failed to set daily budget for {user_a}: {st_b} {body_b}"
-
-        # Parse callback URL to inspect port & state
-        parsed_cb = urlparse(resolved_callback)
-        cb_qs = parse_qs(parsed_cb.query)
-        cb_state = (cb_qs.get("state") or [""])[0]
-        cb_port = parsed_cb.port or 0
-        assert cb_port > 0 and bool(cb_state), (
-            f"Callback URL must include localhost port and state query parameter: {resolved_callback!r}"
         )
 
         # 1. Verify loopback localhost:<port> is unreachable from host when backend is in Docker
@@ -432,7 +510,7 @@ def _run_g5_2_antigravity(
         assert real_cb_status == 200 and isinstance(sanitized_cb_body, dict) and sanitized_cb_body.get("success") is True, (
             f"Real callback URL exchange failed: {real_cb_status} {sanitized_cb_body}"
         )
-        docker_callback_flow: dict[str, Any] = {
+        return {
             "user_id": user_a,
             "deployment": deployment_mode,
             "port": cb_port,
@@ -457,126 +535,205 @@ def _run_g5_2_antigravity(
             },
         }
 
-        # Also run missing-state / wrong-state 400 checks on user_b (without touching user_a's connected token)
-        init_b_status, init_b_body = client_b.post("/api/v1/oauth/antigravity/initiate")
-        assert init_b_status == 200 and isinstance(init_b_body, dict), (
-            f"user_b initiate failed: {init_b_status} {init_b_body}"
-        )
-        port_b = int(init_b_body["port"])
-        missing_b_status, _ = client_b.post(
-            "/api/v1/oauth/antigravity/callback",
-            json_body={"callback_input": f"http://localhost:{port_b}/callback?code=4/0AeanS0_test"},
-        )
-        wrong_b_status, _ = client_b.post(
-            "/api/v1/oauth/antigravity/callback",
-            json_body={
-                "callback_input": f"http://localhost:{port_b}/callback?code=4/0AeanS0_test&state=wrong_state_val"
-            },
-        )
 
-        # Verify user_a OAuth status via HTTP
-        st_status_a, raw_status_a = client_a.get("/api/v1/oauth/antigravity/status")
-        oauth_status_a = _sanitize_oauth_dict(raw_status_a)
-        assert st_status_a == 200 and isinstance(oauth_status_a, dict) and oauth_status_a.get("connected") is True, (
-            f"Expected connected Antigravity status for {user_a}, got {st_status_a}: {oauth_status_a}."
+def _run_g5_2_antigravity(
+    base_url: str,
+    user_a: str,
+    user_b: str,
+    callback_url: str | None = None,
+    *,
+    record: bool = False,
+    pre_exchanged_callback_flow: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Run G5.2 Antigravity Docker manual callback paste + 4-round Gemini tool calling + 2-user isolation."""
+    docker_callback_flow = (
+        pre_exchanged_callback_flow
+        if pre_exchanged_callback_flow is not None
+        else _exchange_g5_2_docker_callback(
+            base_url, user_a, callback_url, record=record
         )
+    )
+    deployment_mode = str(docker_callback_flow.get("deployment") or "")
+    host_loopback_unreachable = bool(docker_callback_flow.get("host_loopback_unreachable_in_docker"))
+    missing_state_status = int(
+        (docker_callback_flow.get("callback_missing_state") or {}).get("http_status") or 0
+    )
+    wrong_state_status = int(
+        (docker_callback_flow.get("callback_wrong_state") or {}).get("http_status") or 0
+    )
+    real_cb_exchange = docker_callback_flow.get("callback_real_paste_exchange") or {}
+    real_cb_status = int(real_cb_exchange.get("http_status") or 0)
+    sanitized_cb_body = real_cb_exchange.get("body")
 
-        # Verify two-user isolation: user_b cannot read user_a's OAuth credentials
-        st_status_b, raw_status_b = client_b.get("/api/v1/oauth/antigravity/status")
-        oauth_status_b = _sanitize_oauth_dict(raw_status_b)
-        assert st_status_b == 200 and isinstance(oauth_status_b, dict) and oauth_status_b.get("connected") is False, (
-            f"Expected connected=False for isolated {user_b}, got {st_status_b}: {oauth_status_b}"
-        )
+    prior_budget_a: dict[str, Any] | None = None
+    was_configured_a = False
+    budget_modified_a = False
 
-        # Probe antigravity-oauth as user_a (connected) and user_b (unconnected)
-        ag_probe_a_status, ag_probe_a_body = client_a.post(
-            "/api/v1/dalton/providers/antigravity-oauth/probe"
-        )
-        ag_probe_b_status, ag_probe_b_body = client_b.post(
-            "/api/v1/dalton/providers/antigravity-oauth/probe"
-        )
-        broker_probe_status, broker_probe_body = client_a.post(
-            "/api/v1/dalton/providers/openai-codex/probe"
-        )
+    try:
+        with RealRunHttpClient(
+            base_url=base_url, user_id=user_a, timeout_s=240.0, record=record
+        ) as client_a, RealRunHttpClient(
+            base_url=base_url, user_id=user_b, timeout_s=60.0, record=record
+        ) as client_b:
+            client_a.ensure_user()
+            client_b.ensure_user()
 
-        # Ensure user_a's Home workspace via HTTP
-        ws_status, ws_body = client_a.post("/api/v1/workspaces/home")
-        assert ws_status in (200, 201) and isinstance(ws_body, dict) and ws_body.get("workspace_id"), (
-            f"Failed to get home workspace: {ws_status} {ws_body}"
-        )
-        home_workspace_id = ws_body["workspace_id"]
+            st_prior_b, body_prior_b = client_a.get("/api/v1/dalton/budget")
+            if st_prior_b == 200 and isinstance(body_prior_b, dict):
+                prior_budget_a = body_prior_b
+                was_configured_a = bool(body_prior_b.get("configured"))
+            st_prior_bt, body_prior_bt = client_a.get("/api/v1/dalton/budget/today")
+            baseline_spent_a = (
+                float(body_prior_bt.get("spent_usd") or 0.0)
+                if st_prior_bt == 200 and isinstance(body_prior_bt, dict)
+                else 0.0
+            )
+            g5_cap_usd = round(max(5.0, baseline_spent_a + 5.0), 6)
 
-        # 4-round sequential tool calling with gemini-3.8-flash-low-oauth
-        sse_status, events, sse_err = client_a.stream_sse(
-            "POST",
-            "/api/v1/threads/messages",
-            json_body={
-                "workspace_id": home_workspace_id,
-                "llm_model": "gemini-3.8-flash-low-oauth",
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": (
-                            "请严格分 4 轮顺序调用 Bash 工具（禁止一次调用多个工具，必须等上一轮工具返回结果后再发起下一轮调用）："
-                            "第 1 轮执行 `echo ROUND_1 && uname -s`；"
-                            "第 2 轮执行 `echo ROUND_2 && pwd`；"
-                            "第 3 轮执行 `echo ROUND_3 && ls -1 | head -n 5`；"
-                            "第 4 轮执行 `echo ROUND_4 && python3 --version`；"
-                            "完成 4 轮工具调用后用一句话汇总四轮输出。"
-                        ),
-                    }
-                ],
-            },
-            max_events=2000,
-        )
+            st_b, body_b = client_a.put(
+                "/api/v1/dalton/budget",
+                json_body={"daily_cap_usd": g5_cap_usd, "default_task_cap_usd": 2.0},
+            )
+            assert st_b == 200, f"Failed to set daily budget for {user_a}: {st_b} {body_b}"
+            budget_modified_a = True
 
-        tool_call_events: list[dict[str, Any]] = []
-        tool_result_events: list[dict[str, Any]] = []
-        context_window_events: list[dict[str, Any]] = []
-        message_chunks: list[str] = []
-        run_end_event: dict[str, Any] | None = None
-        thread_id = None
-        run_id = None
+            # Also run missing-state / wrong-state 400 checks on user_b (without touching user_a's connected token)
+            init_b_status, init_b_body = client_b.post("/api/v1/oauth/antigravity/initiate")
+            assert init_b_status == 200 and isinstance(init_b_body, dict), (
+                f"user_b initiate failed: {init_b_status} {init_b_body}"
+            )
+            port_b = int(init_b_body["port"])
+            missing_b_status, _ = client_b.post(
+                "/api/v1/oauth/antigravity/callback",
+                json_body={"callback_input": f"http://localhost:{port_b}/callback?code=4/0AeanS0_test"},
+            )
+            wrong_b_status, _ = client_b.post(
+                "/api/v1/oauth/antigravity/callback",
+                json_body={
+                    "callback_input": f"http://localhost:{port_b}/callback?code=4/0AeanS0_test&state=wrong_state_val"
+                },
+            )
 
-        for ev in events:
-            et = ev.get("event")
-            data = ev.get("data")
-            if et == "metadata" and isinstance(data, dict):
-                thread_id = data.get("thread_id")
-                run_id = data.get("run_id")
-            elif et == "tool_calls" and isinstance(data, dict):
-                tool_call_events.append(
-                    {
-                        "id": data.get("id"),
-                        "agent": data.get("agent"),
-                        "tool_calls": data.get("tool_calls"),
-                    }
-                )
-            elif et == "tool_call_result" and isinstance(data, dict):
-                tool_result_events.append(
-                    {
-                        "id": data.get("id"),
-                        "tool_call_id": data.get("tool_call_id"),
-                        "content_preview": str(data.get("content", ""))[:120],
-                    }
-                )
-            elif et == "context_window" and isinstance(data, dict):
-                context_window_events.append(
-                    {
-                        "agent": data.get("agent"),
-                        "input_tokens": data.get("input_tokens"),
-                        "output_tokens": data.get("output_tokens"),
-                    }
-                )
-            elif et == "message_chunk" and isinstance(data, dict):
-                if data.get("content_type") == "text" and data.get("content"):
-                    message_chunks.append(str(data.get("content")))
-            elif et == "run_end" and isinstance(data, dict):
-                run_end_event = data
+            # Verify user_a OAuth status via HTTP
+            st_status_a, raw_status_a = client_a.get("/api/v1/oauth/antigravity/status")
+            oauth_status_a = _sanitize_oauth_dict(raw_status_a)
+            assert st_status_a == 200 and isinstance(oauth_status_a, dict) and oauth_status_a.get("connected") is True, (
+                f"Expected connected Antigravity status for {user_a}, got {st_status_a}: {oauth_status_a}."
+            )
 
-        assert sse_status == 200 and sse_err is None, f"SSE failed: {sse_status} {sse_err}"
-        assert len(tool_call_events) >= 4, f"Expected >= 4 tool_calls rounds, got {len(tool_call_events)}"
-        assert len(tool_result_events) >= 4, f"Expected >= 4 tool_call_result rounds, got {len(tool_result_events)}"
+            # Verify two-user isolation: user_b cannot read user_a's OAuth credentials
+            st_status_b, raw_status_b = client_b.get("/api/v1/oauth/antigravity/status")
+            oauth_status_b = _sanitize_oauth_dict(raw_status_b)
+            assert st_status_b == 200 and isinstance(oauth_status_b, dict) and oauth_status_b.get("connected") is False, (
+                f"Expected connected=False for isolated {user_b}, got {st_status_b}: {oauth_status_b}"
+            )
+
+            # Probe antigravity-oauth as user_a (connected) and user_b (unconnected)
+            ag_probe_a_status, ag_probe_a_body = client_a.post(
+                "/api/v1/dalton/providers/antigravity-oauth/probe"
+            )
+            ag_probe_b_status, ag_probe_b_body = client_b.post(
+                "/api/v1/dalton/providers/antigravity-oauth/probe"
+            )
+            broker_probe_status, broker_probe_body = client_a.post(
+                "/api/v1/dalton/providers/openai-codex/probe"
+            )
+
+            # Ensure user_a's Home workspace via HTTP (without modifying existing Home config, P0J §8.1 #20)
+            ws_status, ws_body = client_a.post("/api/v1/workspaces/home")
+            assert ws_status in (200, 201) and isinstance(ws_body, dict) and ws_body.get("workspace_id"), (
+                f"Failed to get home workspace: {ws_status} {ws_body}"
+            )
+            home_workspace_id = ws_body["workspace_id"]
+
+            # 4-round sequential tool calling with gemini-3.8-flash-low-oauth
+            sse_status, events, sse_err = client_a.stream_sse(
+                "POST",
+                "/api/v1/threads/messages",
+                json_body={
+                    "workspace_id": home_workspace_id,
+                    "llm_model": "gemini-3.8-flash-low-oauth",
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": (
+                                "请严格分 4 轮顺序调用 Bash 工具（禁止一次调用多个工具，必须等上一轮工具返回结果后再发起下一轮调用）："
+                                "第 1 轮执行 `echo ROUND_1 && uname -s`；"
+                                "第 2 轮执行 `echo ROUND_2 && pwd`；"
+                                "第 3 轮执行 `echo ROUND_3 && ls -1 | head -n 5`；"
+                                "第 4 轮执行 `echo ROUND_4 && python3 --version`；"
+                                "完成 4 轮工具调用后用一句话汇总四轮输出。"
+                            ),
+                        }
+                    ],
+                },
+                max_events=2000,
+            )
+
+            tool_call_events: list[dict[str, Any]] = []
+            tool_result_events: list[dict[str, Any]] = []
+            context_window_events: list[dict[str, Any]] = []
+            message_chunks: list[str] = []
+            run_end_event: dict[str, Any] | None = None
+            thread_id = None
+            run_id = None
+
+            for ev in events:
+                et = ev.get("event")
+                data = ev.get("data")
+                if et == "metadata" and isinstance(data, dict):
+                    thread_id = data.get("thread_id")
+                    run_id = data.get("run_id")
+                elif et == "tool_calls" and isinstance(data, dict):
+                    tool_call_events.append(
+                        {
+                            "id": data.get("id"),
+                            "agent": data.get("agent"),
+                            "tool_calls": data.get("tool_calls"),
+                        }
+                    )
+                elif et == "tool_call_result" and isinstance(data, dict):
+                    tool_result_events.append(
+                        {
+                            "id": data.get("id"),
+                            "tool_call_id": data.get("tool_call_id"),
+                            "content_preview": str(data.get("content", ""))[:120],
+                        }
+                    )
+                elif et == "context_window" and isinstance(data, dict):
+                    context_window_events.append(
+                        {
+                            "agent": data.get("agent"),
+                            "input_tokens": data.get("input_tokens"),
+                            "output_tokens": data.get("output_tokens"),
+                        }
+                    )
+                elif et == "message_chunk" and isinstance(data, dict):
+                    if data.get("content_type") == "text" and data.get("content"):
+                        message_chunks.append(str(data.get("content")))
+                elif et == "run_end" and isinstance(data, dict):
+                    run_end_event = data
+
+            assert sse_status == 200 and sse_err is None, f"SSE failed: {sse_status} {sse_err}"
+            assert len(tool_call_events) >= 4, f"Expected >= 4 tool_calls rounds, got {len(tool_call_events)}"
+            assert len(tool_result_events) >= 4, f"Expected >= 4 tool_call_result rounds, got {len(tool_result_events)}"
+    finally:
+        if budget_modified_a:
+            restore_err: str | None = None
+            try:
+                with RealRunHttpClient(
+                    base_url=base_url, user_id=user_a, timeout_s=30.0, record=False
+                ) as cleanup_client_a:
+                    restore_err = _restore_budget_state(
+                        cleanup_client_a,
+                        user_id=user_a,
+                        was_configured=was_configured_a,
+                        prior_budget=prior_budget_a,
+                    )
+            except Exception as exc:
+                restore_err = f"cleanup_exception:{type(exc).__name__}"
+            if restore_err is not None:
+                raise RuntimeError(f"G5.2 budget restoration failed for {user_a}: {restore_err}")
 
     ag_probe_b_state = (ag_probe_b_body or {}).get("status") if isinstance(ag_probe_b_body, dict) else None
     assertions = [
@@ -679,7 +836,22 @@ def _run_g5_2_antigravity(
     return payload, assertions
 
 
-def main() -> int:
+def _snapshot_g5_evidence_files(date_str: str | None = None) -> dict[str, tuple[int, int]]:
+    """Return a recursive snapshot `{relative_path: (size, mtime_ns)}` of all files under `var/dalton/trial-runs/`."""
+    _ = date_str
+    trial_runs_dir = REPO_ROOT / "var" / "dalton" / "trial-runs"
+    if not trial_runs_dir.is_dir():
+        return {}
+    snap: dict[str, tuple[int, int]] = {}
+    for p in sorted(trial_runs_dir.rglob("*")):
+        if p.is_file():
+            st = p.stat()
+            snap[str(p.relative_to(REPO_ROOT))] = (st.st_size, st.st_mtime_ns)
+    return snap
+
+
+def main(argv: list[str] | None = None) -> int:
+    load_repo_dotenv()
     parser = argparse.ArgumentParser(description="G5 Broker & Antigravity OAuth Real-Run Verification")
     parser.add_argument("--backend", default=DEFAULT_BACKEND_URL, help="Backend base URL")
     parser.add_argument("--date", default=default_shanghai_date(), help="Evidence date folder YYYYMMDD")
@@ -699,17 +871,60 @@ def main() -> int:
         action="store_true",
         help="Persist raw JSON and Markdown summary under var/dalton/trial-runs/realrun-<date>/",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     user_a = "realrun-pm-a"
     user_b = "realrun-user-b"
 
-    preflight_realrun_script("G5", record=args.record, backend=args.backend, user_id=user_a)
-
     if args.mode == "g5.2-initiate":
-        init_info = _initiate_g5_2_for_user(args.backend, user_a, record=args.record)
+        if args.record:
+            raise SystemExit(
+                "ERROR: --mode g5.2-initiate is the interactive OAuth login start step and cannot be combined with --record"
+            )
+        before_evidence_files = _snapshot_g5_evidence_files(args.date)
+        require_internal_service_token()
+        ensure_debug_banner_printed()
+        _probe_backend_health_sync(args.backend, user_a)
+        init_info = _initiate_g5_2_for_user(args.backend, user_a, record=False)
+        after_evidence_files = _snapshot_g5_evidence_files(args.date)
+        if after_evidence_files != before_evidence_files:
+            raise RuntimeError(
+                "--mode g5.2-initiate skips check_env and must not write or modify any evidence files: "
+                f"before={before_evidence_files}, after={after_evidence_files}"
+            )
         print(json.dumps(init_info, ensure_ascii=False, indent=2))
         return 0
+
+    pre_exchanged_cb: dict[str, Any] | None = None
+    if args.mode in ("all", "g5.2"):
+        # Verify git cleanliness, merge ancestry, and Docker backend version parity BEFORE touching the single-use callback URL
+        _assert_pre_callback_git_and_backend_gate(
+            base_url=args.backend,
+            user_id=user_a,
+            record=args.record,
+        )
+        # Exchange the pasted callback URL so `realrun-pm-a`'s OAuth token is persisted before check_env runs
+        pre_exchanged_cb = _exchange_g5_2_docker_callback(
+            args.backend,
+            user_a,
+            args.callback_url,
+            record=args.record,
+        )
+        post_cb_report = run_all_checks(backend_url=args.backend)
+        if not post_cb_report.get("all_passed"):
+            failed = [
+                f"{k}: {v.get('detail') or v.get('error') or v.get('reason') or 'FAIL'}"
+                for k, v in (post_cb_report.get("checks") or {}).items()
+                if isinstance(v, dict) and v.get("status") == "FAIL"
+            ]
+            raise SystemExit(
+                "ERROR: Post-callback check_env failed after exchanging OAuth callback URL: "
+                + "; ".join(failed)
+            )
+        preflight_realrun_script("G5", record=args.record, backend=args.backend, user_id=user_a)
+        time.sleep(1.0)
+    else:
+        preflight_realrun_script("G5", record=args.record, backend=args.backend, user_id=user_a)
 
     g5_1_payload: dict[str, Any] | None = None
     g5_1_assertions: list[dict[str, Any]] = []
@@ -777,7 +992,12 @@ def main() -> int:
     if args.mode in ("all", "g5.2"):
         t0_2 = now_utc_iso()
         g5_2_payload, g5_2_assertions = _run_g5_2_antigravity(
-            args.backend, user_a, user_b, callback_url=args.callback_url, record=args.record
+            args.backend,
+            user_a,
+            user_b,
+            callback_url=args.callback_url,
+            record=args.record,
+            pre_exchanged_callback_flow=pre_exchanged_cb,
         )
         t1_2 = now_utc_iso()
         env_g5_2 = build_evidence_envelope(
@@ -792,7 +1012,10 @@ def main() -> int:
                 {
                     "kind": "settings_api_budget",
                     "entry_point": "PUT /api/v1/dalton/budget",
-                    "description": f"为测试用户 {user_a} 设置日预算上限 $5.00，使 POST /api/v1/threads/messages 通过本地预算准入。",
+                    "description": (
+                        f"为测试用户 {user_a} 设置相对日预算上限 max($5.00, 当日已有现金花费 + $5.00)，"
+                        "使 POST /api/v1/threads/messages 通过本地预算准入，并在结束时恢复原预算配置。"
+                    ),
                 }
             ],
             assertions=g5_2_assertions,
