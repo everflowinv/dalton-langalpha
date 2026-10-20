@@ -609,7 +609,6 @@ def extract_figures(markdown_text: str) -> list[ExtractedFigure]:
 
     in_code_block = False
     in_html_comment = False
-    in_disclaimer = False
     current_section_period = ""
     current_section_title = ""
     last_caption_line = ""
@@ -651,20 +650,11 @@ def extract_figures(markdown_text: str) -> list[ExtractedFigure]:
             i += 1
             continue
 
-        # Section heading check (detect disclaimer section or section-level period)
+        # Section heading check (detect section-level period)
         if stripped.startswith("#"):
             heading_text = _HEADING_PREFIX_RE.sub("", stripped)
             if stripped.startswith("## ") or not current_section_title:
                 current_section_title = heading_text.strip()
-            if any(
-                k in heading_text.lower()
-                for k in ("免责声明", "disclaimer", "风险提示与免责")
-            ):
-                in_disclaimer = True
-                i += 1
-                continue
-            else:
-                in_disclaimer = False
             pm = _PERIOD_TOKEN_RE.search(heading_text)
             if pm:
                 current_section_period = normalize_period(pm.group(1))
@@ -681,11 +671,10 @@ def extract_figures(markdown_text: str) -> list[ExtractedFigure]:
                 lambda m: " " * len(m.group(0)), raw_line
             )
 
-        if in_disclaimer or not stripped:
-            if not stripped:
-                table_headers = None
-                table_shared_footnote = None
-                table_caption = ""
+        if not stripped:
+            table_headers = None
+            table_shared_footnote = None
+            table_caption = ""
             i += 1
             continue
 
@@ -1095,11 +1084,6 @@ def _split_markdown_sections_and_chunks(
 
     chunks: list[tuple[str, int, int, str]] = []
     for sec_title, s_line, e_line in sections:
-        if any(
-            k in sec_title.lower()
-            for k in ("免责声明", "disclaimer", "风险提示与免责")
-        ):
-            continue
         sec_text = "\n".join(lines[s_line - 1 : e_line])
         if len(sec_text) <= max_chunk_chars:
             chunks.append((sec_title, s_line, e_line, sec_text))
