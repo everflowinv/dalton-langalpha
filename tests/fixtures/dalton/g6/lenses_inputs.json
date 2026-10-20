@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "description": "G6 Financial Lenses filing balance sheet, cash flow, and shareholder return inputs (unit: millions in financial_currency)",
+  "description": "G6 Financial Lenses filing balance sheet, cash flow, and shareholder return inputs (unit: millions in financial_currency; analyst credibility parameters are supplied separately by g6_lenses.py)",
   "companies": [
     {
       "slug": "baba",
@@ -17,30 +17,82 @@
         "unit": "CNY_mn"
       },
       "netcash": {
-        "cash": "195400",
-        "restricted_cash": "41200",
-        "time_deposits": "178600",
-        "st_investments": "182300",
-        "st_debt": "18500",
-        "cur_lt_debt": "14200",
-        "lt_debt": "136000",
-        "lease_liabilities": "19800"
+        "cash": {
+          "value": "195400",
+          "accession": "0001104659-26-071842"
+        },
+        "restricted_cash": {
+          "value": "41200",
+          "accession": "0001104659-26-071842"
+        },
+        "time_deposits": {
+          "value": "178600",
+          "accession": "0001104659-26-071842"
+        },
+        "st_investments": {
+          "value": "182300",
+          "accession": "0001104659-26-071842"
+        },
+        "st_debt": {
+          "value": "18500",
+          "accession": "0001104659-26-071842"
+        },
+        "cur_lt_debt": {
+          "value": "14200",
+          "accession": "0001104659-26-071842"
+        },
+        "lt_debt": {
+          "value": "136000",
+          "accession": "0001104659-26-071842"
+        },
+        "lease_liabilities": {
+          "value": "19800",
+          "accession": "0001104659-26-071842"
+        }
       },
       "return_score": {
-        "ttm_div": "1.02",
-        "ttm_buyback": "5.51",
-        "true_return_share": "0.82",
-        "annual": "4.10,5.80,6.53",
-        "fwd_total": "6.20",
-        "credibility": "90",
-        "credibility_reason": "持续执行大规模注销式回购并派发年度股息"
+        "ttm_div": {
+          "value": "1.02",
+          "accession": "0001104659-26-071842"
+        },
+        "ttm_buyback": {
+          "value": "5.51",
+          "accession": "0001104659-26-071842"
+        },
+        "true_return_share": {
+          "value": "0.82",
+          "accession": "0001104659-26-071842"
+        },
+        "annual": {
+          "value": "4.10,5.80,6.53",
+          "accession": "0001104659-26-071842"
+        },
+        "fwd_total": {
+          "value": "6.20",
+          "accession": "0001104659-26-071842"
+        }
       },
       "earnings_quality": {
-        "ni": "142800",
-        "cfo": "180340",
-        "cfi": "-62400",
-        "beginning_assets": "1765000",
-        "ending_assets": "2180000"
+        "ni": {
+          "value": "142800",
+          "accession": "0001104659-26-071842"
+        },
+        "cfo": {
+          "value": "180340",
+          "accession": "0001104659-26-071842"
+        },
+        "cfi": {
+          "value": "-62400",
+          "accession": "0001104659-26-071842"
+        },
+        "beginning_assets": {
+          "value": "1765000",
+          "accession": "0001104659-26-071842"
+        },
+        "ending_assets": {
+          "value": "2180000",
+          "accession": "0001104659-26-071842"
+        }
       }
     },
     {
@@ -51,37 +103,89 @@
       "listing_currency": "HKD",
       "adr_ratio": 1,
       "filing": {
-        "form": "HKEX Interim Report / 2Q2026 Results Announcement",
-        "accession": "HKEX-2026-08-14-00700-2Q26",
-        "filing_date": "2026-08-14",
+        "form": "HKEX 2Q2026 Interim Results Announcement",
+        "accession": "https://www.tencent.com/wp-content/uploads/2026/08/E700_IRA.pdf",
+        "filing_date": "2026-08-12",
         "period_of_report": "2026-06-30",
         "unit": "CNY_mn"
       },
       "netcash": {
-        "cash": "162800",
-        "restricted_cash": "3400",
-        "time_deposits": "198500",
-        "st_investments": "47200",
-        "st_debt": "42100",
-        "cur_lt_debt": "26800",
-        "lt_debt": "270100",
-        "lease_liabilities": "21400"
+        "cash": {
+          "value": "162800",
+          "accession": "https://www.tencent.com/wp-content/uploads/2026/08/E700_IRA.pdf"
+        },
+        "restricted_cash": {
+          "value": "3400",
+          "accession": "https://www.tencent.com/wp-content/uploads/2026/08/E700_IRA.pdf"
+        },
+        "time_deposits": {
+          "value": "198500",
+          "accession": "https://www.tencent.com/wp-content/uploads/2026/08/E700_IRA.pdf"
+        },
+        "st_investments": {
+          "value": "47200",
+          "accession": "https://www.tencent.com/wp-content/uploads/2026/08/E700_IRA.pdf"
+        },
+        "st_debt": {
+          "value": "42100",
+          "accession": "https://www.tencent.com/wp-content/uploads/2026/08/E700_IRA.pdf"
+        },
+        "cur_lt_debt": {
+          "value": "26800",
+          "accession": "https://www.tencent.com/wp-content/uploads/2026/08/E700_IRA.pdf"
+        },
+        "lt_debt": {
+          "value": "270100",
+          "accession": "https://www.tencent.com/wp-content/uploads/2026/08/E700_IRA.pdf"
+        },
+        "lease_liabilities": {
+          "value": "21400",
+          "accession": "https://www.tencent.com/wp-content/uploads/2026/08/E700_IRA.pdf"
+        }
       },
       "return_score": {
-        "ttm_div": "0.88",
-        "ttm_buyback": "2.86",
-        "true_return_share": "0.85",
-        "annual": "2.40,3.50,3.74",
-        "fwd_total": "3.60",
-        "credibility": "90",
-        "credibility_reason": "千亿港元回购计划按季稳定兑现并注销股份"
+        "ttm_div": {
+          "value": "0.88",
+          "accession": "https://www.tencent.com/wp-content/uploads/2026/08/E700_IRA.pdf"
+        },
+        "ttm_buyback": {
+          "value": "2.86",
+          "accession": "https://www.tencent.com/wp-content/uploads/2026/08/E700_IRA.pdf"
+        },
+        "true_return_share": {
+          "value": "0.85",
+          "accession": "https://www.tencent.com/wp-content/uploads/2026/08/E700_IRA.pdf"
+        },
+        "annual": {
+          "value": "2.40,3.50,3.74",
+          "accession": "https://www.tencent.com/wp-content/uploads/2026/08/E700_IRA.pdf"
+        },
+        "fwd_total": {
+          "value": "3.60",
+          "accession": "https://www.tencent.com/wp-content/uploads/2026/08/E700_IRA.pdf"
+        }
       },
       "earnings_quality": {
-        "ni": "196400",
-        "cfo": "261600",
-        "cfi": "-94200",
-        "beginning_assets": "1580000",
-        "ending_assets": "1760000"
+        "ni": {
+          "value": "196400",
+          "accession": "https://www.tencent.com/wp-content/uploads/2026/08/E700_IRA.pdf"
+        },
+        "cfo": {
+          "value": "261600",
+          "accession": "https://www.tencent.com/wp-content/uploads/2026/08/E700_IRA.pdf"
+        },
+        "cfi": {
+          "value": "-94200",
+          "accession": "https://www.tencent.com/wp-content/uploads/2026/08/E700_IRA.pdf"
+        },
+        "beginning_assets": {
+          "value": "1580000",
+          "accession": "https://www.tencent.com/wp-content/uploads/2026/08/E700_IRA.pdf"
+        },
+        "ending_assets": {
+          "value": "1760000",
+          "accession": "https://www.tencent.com/wp-content/uploads/2026/08/E700_IRA.pdf"
+        }
       }
     },
     {
@@ -99,27 +203,70 @@
         "unit": "USD_mn"
       },
       "netcash": {
-        "cash": "45300",
-        "restricted_cash": "120",
-        "st_investments": "32689",
-        "lt_debt": "28880",
-        "lease_liabilities": "19450"
+        "cash": {
+          "value": "45300",
+          "accession": "0001326801-26-000058"
+        },
+        "restricted_cash": {
+          "value": "120",
+          "accession": "0001326801-26-000058"
+        },
+        "st_investments": {
+          "value": "32689",
+          "accession": "0001326801-26-000058"
+        },
+        "lt_debt": {
+          "value": "28880",
+          "accession": "0001326801-26-000058"
+        },
+        "lease_liabilities": {
+          "value": "19450",
+          "accession": "0001326801-26-000058"
+        }
       },
       "return_score": {
-        "ttm_div": "0.31",
-        "ttm_buyback": "1.84",
-        "true_return_share": "0.68",
-        "annual": "1.95,2.40,2.15",
-        "fwd_total": "2.10",
-        "credibility": "90",
-        "credibility_reason": "强劲自由现金流支撑季度分红与持续回购"
+        "ttm_div": {
+          "value": "0.31",
+          "accession": "0001326801-26-000058"
+        },
+        "ttm_buyback": {
+          "value": "1.84",
+          "accession": "0001326801-26-000058"
+        },
+        "true_return_share": {
+          "value": "0.68",
+          "accession": "0001326801-26-000058"
+        },
+        "annual": {
+          "value": "1.95,2.40,2.15",
+          "accession": "0001326801-26-000058"
+        },
+        "fwd_total": {
+          "value": "2.10",
+          "accession": "0001326801-26-000058"
+        }
       },
       "earnings_quality": {
-        "ni": "64200",
-        "cfo": "94020",
-        "cfi": "-48500",
-        "beginning_assets": "245000",
-        "ending_assets": "275400"
+        "ni": {
+          "value": "64200",
+          "accession": "0001326801-26-000058"
+        },
+        "cfo": {
+          "value": "94020",
+          "accession": "0001326801-26-000058"
+        },
+        "cfi": {
+          "value": "-48500",
+          "accession": "0001326801-26-000058"
+        },
+        "beginning_assets": {
+          "value": "245000",
+          "accession": "0001326801-26-000058"
+        },
+        "ending_assets": {
+          "value": "275400",
+          "accession": "0001326801-26-000058"
+        }
       }
     }
   ]

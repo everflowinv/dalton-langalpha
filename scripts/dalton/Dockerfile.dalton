@@ -1,0 +1,65 @@
+# Dalton backend image extending deploy/Dockerfile.dev with build-time git installation
+# and image build SHA + file manifest recording (P0J Round-4 Must-Fix #7).
+# Shares the exact top layers of deploy/Dockerfile.dev for 100% Docker layer cache reuse.
+FROM python:3.13-slim
+
+ENV PYTHONUNBUFFERED=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    postgresql-client \
+    tini \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
+WORKDIR /app
+
+COPY pyproject.toml uv.lock README.md ./
+COPY libs/ptc-cli/ libs/ptc-cli/
+COPY libs/market-protocol/ libs/market-protocol/
+
+ARG INSTALL_OBSERVABILITY=false
+RUN if [ "$INSTALL_OBSERVABILITY" = "true" ]; then \
+        uv sync --frozen --no-dev --extra observability; \
+    else \
+        uv sync --frozen --no-dev; \
+    fi
+
+RUN uv run patchright install --with-deps chromium \
+    && uv run scrapling install
+
+# Install git at image build time (never at container startup via apt-get)
+RUN apt-get update && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/* \
+    && git config --system --add safe.directory '*'
+
+COPY src/ src/
+COPY server.py .
+COPY scripts/ scripts/
+COPY config*.yaml ./
+COPY agent_config*.yaml ./
+COPY alembic.ini .
+COPY migrations/ migrations/
+COPY mcp_servers/ mcp_servers/
+COPY plugins/ plugins/
+COPY workflows/ workflows/
+
+COPY scripts/docker_entrypoint.sh /docker_entrypoint.sh
+RUN chmod +x /docker_entrypoint.sh
+
+# Record image build git SHA (when passed via --build-arg BUILD_GIT_SHA) and
+# bake a deterministic SHA-256 manifest of all image-bundled files at build time
+# so startup can detect any drift between the built image and /host_repo.
+ARG BUILD_GIT_SHA=""
+RUN if [ -n "$BUILD_GIT_SHA" ]; then \
+        printf '%s\n' "$BUILD_GIT_SHA" | cut -c1-8 > /app/.build_git_sha; \
+    fi \
+    && find pyproject.toml uv.lock server.py libs src scripts migrations -type f -print0 \
+       | sort -z \
+       | xargs -0 sha256sum > /app/.build_files.sha256
+
+EXPOSE 8000
+
+ENTRYPOINT ["tini", "--", "/docker_entrypoint.sh"]
+CMD ["uv", "run", "uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000"]

@@ -57,6 +57,7 @@ BRIDGE_ENV_FILE = Path.home() / ".config" / "dalton" / "researchdata-bridge.env"
 
 _FROM_SRC_RE = re.compile(r"\b(?:from|import)\s+src\b")
 _INSERT_INTO_RE = re.compile(r"\bINSERT\s+INTO\s+([a-zA-Z0-9_]+)", re.IGNORECASE)
+_FOR_CHECK_ENV_PROBE_RE = re.compile(r"\b_for_check_env_probe\b")
 
 
 def _read_bridge_token() -> str:
@@ -71,7 +72,7 @@ def _read_bridge_token() -> str:
 def scan_realrun_scripts(
     script_paths: list[Path] | None = None,
 ) -> dict[str, Any]:
-    """Scan `scripts/dalton/realrun/g*.py` for `from src` and `INSERT INTO` (P0J §1.5)."""
+    """Scan `scripts/dalton/realrun/g*.py` for `from src`, `INSERT INTO`, and `_for_check_env_probe` (P0J §1.5)."""
     if script_paths is None:
         script_paths = sorted((REPO_ROOT / "scripts" / "dalton" / "realrun").glob("g*.py"))
 
@@ -109,6 +110,15 @@ def scan_realrun_scripts(
                         "snippet": stripped[:120],
                     }
                 )
+            if _FOR_CHECK_ENV_PROBE_RE.search(line):
+                violations.append(
+                    {
+                        "file": rel_path,
+                        "line": lineno,
+                        "kind": "forbidden_check_env_probe_call",
+                        "snippet": stripped[:120],
+                    }
+                )
 
     return {
         "status": "PASS" if len(violations) == 0 else "FAIL",
@@ -126,10 +136,10 @@ def check_identity_and_version(base_url: str) -> tuple[dict[str, Any], dict[str,
     local_sha = get_git_sha(short=True)
     local_dirty = is_git_dirty()
 
-    with RealRunHttpClient(
-        base_url=base_url, user_id="realrun-pm-a", timeout_s=30.0, skip_env_preflight=True
-    ) as pm_client, RealRunHttpClient(
-        base_url=base_url, user_id="realrun-user-b", timeout_s=30.0, skip_env_preflight=True
+    with RealRunHttpClient._for_check_env_probe(
+        base_url=base_url, user_id="realrun-pm-a", timeout_s=30.0
+    ) as pm_client, RealRunHttpClient._for_check_env_probe(
+        base_url=base_url, user_id="realrun-user-b", timeout_s=30.0
     ) as user_b_client:
         pm_client.ensure_user()
         user_b_client.ensure_user()
@@ -220,8 +230,8 @@ def check_conversation_transport(
     t0 = now_utc_iso()
     ws_id: str | None = None
     try:
-        with RealRunHttpClient(
-            base_url=base_url, user_id="realrun-pm-a", timeout_s=120.0, skip_env_preflight=True
+        with RealRunHttpClient._for_check_env_probe(
+            base_url=base_url, user_id="realrun-pm-a", timeout_s=120.0
         ) as client:
             # Ensure realrun-pm-a has a daily budget configured so LocalBudgetPort admits the turn (G1.1)
             client.put(
@@ -253,8 +263,8 @@ def check_conversation_transport(
     finally:
         if ws_id:
             try:
-                with RealRunHttpClient(
-                    base_url=base_url, user_id="realrun-pm-a", timeout_s=30.0, skip_env_preflight=True
+                with RealRunHttpClient._for_check_env_probe(
+                    base_url=base_url, user_id="realrun-pm-a", timeout_s=30.0
                 ) as cleanup_client:
                     cleanup_client.delete(f"/api/v1/workspaces/{ws_id}")
             except Exception:

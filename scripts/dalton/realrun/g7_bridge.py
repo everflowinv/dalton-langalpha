@@ -34,7 +34,9 @@ if str(REPO_ROOT) not in sys.path:
 from scripts.dalton.realrun._common import (  # noqa: E402
     RealRunHttpClient,
     build_evidence_envelope,
+    default_shanghai_date,
     now_utc_iso,
+    preflight_realrun_script,
     write_evidence_and_summary,
 )
 
@@ -94,8 +96,8 @@ def _call_bridge_mcp(
 
 
 def _run_long_read_with_delay_hook(
-    token: str, delay_s: int = 245, *, record: bool = False
-) -> dict[str, Any]:
+    token: str, delay_s: int = 245
+) -> tuple[dict[str, Any], str]:
     """Spawn committed `scripts/dalton/researchdata_bridge.py` with DALTON_BRIDGE_TEST_DELAY_S=245."""
     import tempfile
 
@@ -110,11 +112,7 @@ def _run_long_read_with_delay_hook(
     env["DALTON_BRIDGE_TEST_DELAY_S"] = str(delay_s)
 
     with tempfile.TemporaryDirectory() as tmp_dir:
-        if record:
-            log_path = REPO_ROOT / "var" / "dalton" / "smoke" / "g7_bridge_delay_run.log"
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-        else:
-            log_path = Path(tmp_dir) / "g7_bridge_delay_run.log"
+        log_path = Path(tmp_dir) / "g7_bridge_delay_run.log"
 
         with log_path.open("w", encoding="utf-8") as log_file:
             proc = subprocess.Popen(
@@ -128,8 +126,9 @@ def _run_long_read_with_delay_hook(
             try:
                 # Wait for /healthz
                 health_body = None
+                health_deadline = time.monotonic() + 15.0
                 with httpx.Client(timeout=5.0, trust_env=False) as hc:
-                    for _ in range(30):
+                    while time.monotonic() < health_deadline:
                         try:
                             r = hc.get(f"{base_url}/healthz")
                             if r.status_code == 200:
@@ -139,7 +138,7 @@ def _run_long_read_with_delay_hook(
                             pass
                         time.sleep(0.3)
                 if not health_body:
-                    raise RuntimeError("Delayed bridge instance failed to pass /healthz")
+                    raise TimeoutError("Timed out after 15s waiting for delayed bridge instance /healthz")
 
                 # Execute >240s long read on `sec:financials` (eff_timeout=600s > 240s default)
                 http_status, elapsed_s, rpc_body, inner_payload = _call_bridge_mcp(
@@ -182,25 +181,28 @@ def _run_long_read_with_delay_hook(
     )
     assert not stderr_leaked, "Detected stderr or token leakage in bridge log"
 
-    return {
-        "bridge_url": base_url,
-        "healthz": health_body,
-        "tool": "finance",
-        "arguments": {"route": "sec", "operation": "financials", "ticker": "GOOGL"},
-        "configured_delay_s": delay_s,
-        "effective_route_timeout_s": 600,
-        "default_route_timeout_s": 240,
-        "http_status": http_status,
-        "elapsed_s": elapsed_s,
-        "timed_out": timed_out,
-        "top_keys_prefix": top_keys[:6],
-        "declared_sources_count": len(declared_sources),
-        "sources_count": len(sources),
-        "declared_sources": declared_sources,
-        "sources": sources,
-        "bridge_log_lines": [ln for ln in log_text.splitlines() if ln.strip()],
-        "zero_stderr_leakage": not stderr_leaked,
-    }
+    return (
+        {
+            "bridge_url": base_url,
+            "healthz": health_body,
+            "tool": "finance",
+            "arguments": {"route": "sec", "operation": "financials", "ticker": "GOOGL"},
+            "configured_delay_s": delay_s,
+            "effective_route_timeout_s": 600,
+            "default_route_timeout_s": 240,
+            "http_status": http_status,
+            "elapsed_s": elapsed_s,
+            "timed_out": timed_out,
+            "top_keys_prefix": top_keys[:6],
+            "declared_sources_count": len(declared_sources),
+            "sources_count": len(sources),
+            "declared_sources": declared_sources,
+            "sources": sources,
+            "bridge_log_lines": [ln for ln in log_text.splitlines() if ln.strip()],
+            "zero_stderr_leakage": not stderr_leaked,
+        },
+        log_text,
+    )
 
 
 def _run_real_content_long_reads(live_bridge_url: str, token: str) -> dict[str, Any]:
@@ -285,7 +287,7 @@ def main() -> int:
     parser.add_argument("--backend", default="http://127.0.0.1:8000", help="Backend base URL")
     parser.add_argument("--bridge", default="http://127.0.0.1:8960", help="Live bridge base URL")
     parser.add_argument("--delay-s", type=int, default=245, help="Long-read delay seconds (>240)")
-    parser.add_argument("--date", default="20261019", help="Evidence date folder YYYYMMDD")
+    parser.add_argument("--date", default=default_shanghai_date(), help="Evidence date folder YYYYMMDD")
     parser.add_argument(
         "--record",
         action="store_true",
@@ -296,15 +298,19 @@ def main() -> int:
     if args.delay_s <= 240:
         raise ValueError(f"--delay-s must be > 240 seconds (got {args.delay_s})")
 
-    started_at = now_utc_iso()
     test_user_id = "realrun-pm-a"
+    preflight_realrun_script("G7", record=args.record, backend=args.backend, user_id=test_user_id)
+
+    started_at = now_utc_iso()
     token = _read_bridge_token()
 
-    with RealRunHttpClient(base_url=args.backend, user_id=test_user_id, timeout_s=60.0) as client:
+    with RealRunHttpClient(
+        base_url=args.backend, user_id=test_user_id, timeout_s=60.0, record=args.record
+    ) as client:
         client.ensure_user()
 
-    long_read_delay_result = _run_long_read_with_delay_hook(
-        token=token, delay_s=args.delay_s, record=args.record
+    long_read_delay_result, delay_log_text = _run_long_read_with_delay_hook(
+        token=token, delay_s=args.delay_s
     )
     real_content_result = _run_real_content_long_reads(live_bridge_url=args.bridge, token=token)
 
@@ -312,10 +318,7 @@ def main() -> int:
     synthetic = [
         {
             "kind": "committed_test_hook",
-            "entry_point": (
-                f"scripts/dalton/researchdata_bridge.py:168-190 "
-                f"(DALTON_BRIDGE_TEST_MODE=1 DALTON_BRIDGE_TEST_DELAY_S={args.delay_s})"
-            ),
+            "entry_point": "scripts/dalton/researchdata_bridge.py:168-190",
             "reason": (
                 f"Use committed hook scripts/dalton/researchdata_bridge.py:168-190 "
                 f"(DALTON_BRIDGE_TEST_MODE=1 DALTON_BRIDGE_TEST_DELAY_S={args.delay_s}) to verify "
@@ -393,6 +396,10 @@ def main() -> int:
         ],
         record=args.record,
     )
+    if args.record:
+        var_log_path = REPO_ROOT / "var" / "dalton" / "smoke" / "g7_bridge_delay_run.log"
+        var_log_path.parent.mkdir(parents=True, exist_ok=True)
+        var_log_path.write_text(delay_log_text, encoding="utf-8")
     print(
         json.dumps(
             {

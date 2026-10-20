@@ -664,6 +664,7 @@ async def lifespan(app: FastAPI):
         from src.dalton.budget.gate import DaltonStartupConfigError
 
         if isinstance(e, DaltonStartupConfigError):
+            await conv_pool.close()
             raise
         logger.warning(f"Credit gate wiring check failed: {e}")
 

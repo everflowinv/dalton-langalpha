@@ -45,15 +45,27 @@ def compute_sha256(path: Path) -> str:
     return h.hexdigest()
 
 
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+
+def _default_shanghai_date() -> str:
+    return datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y%m%d")
+
+
 def resolve_default_evidence_dir(repo_root: Path = REPO_ROOT) -> Path:
-    candidates = [
-        repo_root / "var" / "dalton" / "realrun",
-        repo_root / "var" / "dalton" / "trial-runs" / "realrun-20261019",
-    ]
-    for cand in candidates:
-        if cand.is_dir() and any(cand.glob("*.json")):
-            return cand
-    return candidates[-1]
+    realrun_root = repo_root / "var" / "dalton" / "realrun"
+    if realrun_root.is_dir() and any(realrun_root.glob("*.json")):
+        return realrun_root
+    trial_runs_dir = repo_root / "var" / "dalton" / "trial-runs"
+    if trial_runs_dir.is_dir():
+        dated_dirs = sorted(
+            (d for d in trial_runs_dir.glob("realrun-*") if d.is_dir() and any(d.glob("*.json"))),
+            reverse=True,
+        )
+        if dated_dirs:
+            return dated_dirs[0]
+    return trial_runs_dir / f"realrun-{_default_shanghai_date()}"
 
 
 def _find_evidence_file(evidence_dir: Path, filename: str) -> Path | None:
@@ -221,7 +233,7 @@ def compare_legacy_report(
     p = Path(report_path)
     if not p.is_absolute():
         p = repo_root / p
-    ev_dir = Path(evidence_dir) if evidence_dir is not None else (repo_root / "var" / "dalton" / "trial-runs" / "realrun-20261019")
+    ev_dir = Path(evidence_dir) if evidence_dir is not None else resolve_default_evidence_dir(repo_root)
     if not ev_dir.is_absolute():
         ev_dir = repo_root / ev_dir
 
@@ -296,12 +308,20 @@ def compare_legacy_report(
         true_verified = ev.get("true_verified_in_gold_count", ev.get("true_verified_count"))
         false_unverified = ev.get("false_unverified_in_gold_count", ev.get("false_unverified_count"))
         sourced_uncertain = ev.get("sourced_uncertain_in_gold_count", ev.get("sourced_uncertain_count"))
-        if "61 / 61 = 100.0%" in text and sourced_total != 61:
-            g3_eval_diffs.append(
-                f"G3 recall: report claims 61/61 (100.0%), actual evidence is "
-                f"{true_verified}/{sourced_total} "
-                f"(false_unverified={false_unverified}, sourced_uncertain={sourced_uncertain})"
-            )
+        if sourced_total is not None and true_verified is not None:
+            actual_num = int(true_verified)
+            actual_den = int(sourced_total)
+            actual_pct = round((actual_num / actual_den) * 100.0, 2) if actual_den > 0 else 0.0
+            for ratio_m in re.finditer(r"`?(\d+)\s*/\s*(\d+)\s*=\s*([0-9.]+)%`?", text):
+                claimed_num = int(ratio_m.group(1))
+                claimed_den = int(ratio_m.group(2))
+                claimed_pct = float(ratio_m.group(3))
+                if (claimed_num, claimed_den) != (actual_num, actual_den) or abs(claimed_pct - actual_pct) > 0.1:
+                    g3_eval_diffs.append(
+                        f"G3 recall: report claims {claimed_num}/{claimed_den} ({claimed_pct}%), "
+                        f"actual evidence is {actual_num}/{actual_den} ({actual_pct}%) "
+                        f"(false_unverified={false_unverified}, sourced_uncertain={sourced_uncertain})"
+                    )
 
     return {
         "report": str(p.relative_to(repo_root) if p.is_relative_to(repo_root) else p),

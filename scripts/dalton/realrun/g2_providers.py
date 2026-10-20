@@ -35,7 +35,9 @@ if str(REPO_ROOT) not in sys.path:
 from scripts.dalton.realrun._common import (  # noqa: E402
     RealRunHttpClient,
     build_evidence_envelope,
+    default_shanghai_date,
     now_utc_iso,
+    preflight_realrun_script,
     write_evidence_and_summary,
 )
 
@@ -54,11 +56,15 @@ def _resolve_deepseek_key() -> str:
 
 def _verify_startup_fail_fast() -> dict[str, Any]:
     """Start a real backend child process (`uvicorn src.server.app:app`) with a temporary config file
-    where `llm.assist` is set to `muse-cli-gateway/muse-spark-1.3-contributor`, asserting non-zero exit and RolePolicyError (P0J §5 G2).
+    where `llm.assist` is set to `muse-cli-gateway/muse-spark-1.3-contributor`, wait for the process
+    to exit on its own (60s deadline), and assert `exit_code > 0` (not killed by signal) and RolePolicyError (P0J §5 G2).
     """
-    base_cfg_path = REPO_ROOT / "agent_config.dalton.yaml"
-    cfg_data = yaml.safe_load(base_cfg_path.read_text(encoding="utf-8")) or {}
-    cfg_data.setdefault("llm", {})["assist"] = "muse-cli-gateway/muse-spark-1.3-contributor"
+    upstream_cfg_path = REPO_ROOT / "agent_config.yaml"
+    dalton_cfg_path = REPO_ROOT / "agent_config.dalton.yaml"
+    upstream_cfg = yaml.safe_load(upstream_cfg_path.read_text(encoding="utf-8")) or {}
+    dalton_cfg = yaml.safe_load(dalton_cfg_path.read_text(encoding="utf-8")) or {}
+    upstream_cfg.setdefault("llm", {})["assist"] = "muse-cli-gateway/muse-spark-1.3-contributor"
+    dalton_cfg.setdefault("llm", {})["assist"] = "muse-cli-gateway/muse-spark-1.3-contributor"
 
     cmd = [
         sys.executable,
@@ -70,11 +76,15 @@ def _verify_startup_fail_fast() -> dict[str, Any]:
         "--port",
         "18099",
     ]
-    collected_lines: list[str] = []
     with tempfile.TemporaryDirectory(prefix="g2_role_policy_") as tmp_dir:
-        bad_cfg_path = Path(tmp_dir) / "g2_bad_role_policy_agent_config.yaml"
+        tmp_dir_path = Path(tmp_dir)
+        bad_cfg_path = tmp_dir_path / "agent_config.yaml"
+        bad_dalton_cfg_path = tmp_dir_path / "agent_config.dalton.yaml"
         bad_cfg_path.write_text(
-            yaml.safe_dump(cfg_data, allow_unicode=True, sort_keys=False), encoding="utf-8"
+            yaml.safe_dump(upstream_cfg, allow_unicode=True, sort_keys=False), encoding="utf-8"
+        )
+        bad_dalton_cfg_path.write_text(
+            yaml.safe_dump(dalton_cfg, allow_unicode=True, sort_keys=False), encoding="utf-8"
         )
 
         env = dict(os.environ)
@@ -91,43 +101,32 @@ def _verify_startup_fail_fast() -> dict[str, Any]:
             stderr=subprocess.STDOUT,
             text=True,
         )
-        deadline = time.monotonic() + 35.0
-        assert proc.stdout is not None
-        while time.monotonic() < deadline:
-            line = proc.stdout.readline()
-            if not line:
-                if proc.poll() is not None:
-                    break
-                time.sleep(0.05)
-                continue
-            collected_lines.append(line.rstrip("\r\n"))
-            if "Application startup failed. Exiting." in line:
-                break
-
         try:
-            proc.wait(timeout=2.0)
-        except subprocess.TimeoutExpired:
-            proc.terminate()
-            try:
-                proc.wait(timeout=2.0)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait(timeout=2.0)
+            stdout_text, _ = proc.communicate(timeout=60.0)
+        except subprocess.TimeoutExpired as exc:
+            proc.kill()
+            partial_out, _ = proc.communicate()
+            raise AssertionError(
+                "uvicorn startup fail-fast check timed out after 60s without exiting on its own: "
+                f"{(partial_out or '')[-800:]}"
+            ) from exc
 
-    combined_out = "\n".join(collected_lines).strip()
+    combined_out = (stdout_text or "").strip()
+    collected_lines = [ln.rstrip("\r\n") for ln in combined_out.splitlines()]
     tail_lines = "\n".join(collected_lines[-15:])
     has_role_err = (
         "RolePolicyError" in combined_out
         and "muse-spark-1.3-contributor" in combined_out
     )
-    failed_fast = (proc.returncode is not None and proc.returncode != 0) and has_role_err
+    exited_positive = proc.returncode is not None and proc.returncode > 0
+    failed_fast = exited_positive and has_role_err
     assert failed_fast, (
-        f"Expected uvicorn startup with assist=muse-spark-1.3-contributor to exit non-zero with RolePolicyError, "
-        f"got exit_code={proc.returncode}, tail={tail_lines}"
+        "Expected uvicorn startup with assist=muse-spark-1.3-contributor to exit on its own "
+        f"with exit_code > 0 and RolePolicyError, got exit_code={proc.returncode}, tail={tail_lines}"
     )
     return {
         "command": " ".join(cmd[1:]),
-        "temp_config_path": "tempfile:g2_bad_role_policy_agent_config.yaml",
+        "temp_config_path": "tempfile:agent_config.yaml",
         "override_config": {"llm.assist": "muse-cli-gateway/muse-spark-1.3-contributor"},
         "exit_code": proc.returncode,
         "failed_fast": failed_fast,
@@ -138,11 +137,26 @@ def _verify_startup_fail_fast() -> dict[str, Any]:
 def main() -> int:
     parser = argparse.ArgumentParser(description="G2 Real-Run Evidence Generator (P0J §5 G2)")
     parser.add_argument("--backend", default="http://127.0.0.1:8000")
-    parser.add_argument("--date", default="20261019")
+    parser.add_argument("--date", default=default_shanghai_date())
     parser.add_argument("--pm-user", default="realrun-pm-a")
     parser.add_argument("--other-user", default="realrun-user-b")
     parser.add_argument("--record", action="store_true", help="Write evidence JSON and summary under var/dalton/")
+    parser.add_argument(
+        "--only-startup-check",
+        action="store_true",
+        help="Debug helper: run only the uvicorn startup fail-fast check (disallowed with --record)",
+    )
     args = parser.parse_args()
+
+    if args.only_startup_check and args.record:
+        raise SystemExit("ERROR: --only-startup-check cannot be combined with --record")
+
+    preflight_realrun_script("G2", record=args.record, backend=args.backend)
+
+    if args.only_startup_check:
+        startup_fail_check = _verify_startup_fail_fast()
+        print(json.dumps({"startup_fail_fast_check": startup_fail_check}, ensure_ascii=False, indent=2))
+        return 0
 
     started_at = now_utc_iso()
     pm_user = args.pm_user
@@ -473,7 +487,7 @@ def main() -> int:
         ],
         notes=[
             f"所有 {len(enumerated_routes)} 条 `/api/v1/dalton/*` 路由均从运行中后端的 `GET /openapi.json` 动态枚举并在 `{pm_user}` / `{other_user}` 下逐一调用，断言 `uncalled_routes == []`，全程不触碰 `local-dev-user`。",
-            "启动即拒验证通过 `subprocess.run([sys.executable, '-m', 'uvicorn', 'src.server.app.app:app', ...])` 配合临时配置文件 `PTC_CONFIG_FILE` 在真实子进程中执行，断言 `exit_code != 0` 且输出包含 `RolePolicyError`。",
+            "启动即拒验证通过 `subprocess.Popen([sys.executable, '-m', 'uvicorn', 'src.server.app:app', ...])` 配合临时配置文件 `PTC_CONFIG_FILE` 在真实子进程中执行，等待进程自行退出并断言 `exit_code > 0`（非信号终止）且输出包含 `RolePolicyError`。",
         ],
         record=args.record,
     )
