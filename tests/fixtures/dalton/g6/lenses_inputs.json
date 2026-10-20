@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "description": "G6 Financial Lenses filing balance sheet, cash flow, and shareholder return inputs (unit: millions in financial_currency; analyst credibility parameters are supplied separately by g6_lenses.py)",
+  "description": "G6 Financial Lenses historical filing balance sheet, TTM cash flow, and historical shareholder return inputs (unit: millions in financial_currency; forward estimate fwd_total and analyst credibility parameters are supplied separately by g6_lenses.py)",
   "companies": [
     {
       "slug": "baba",
@@ -10,7 +10,7 @@
       "listing_currency": "USD",
       "adr_ratio": 8,
       "filing": {
-        "form": "6-K / Q1 FY2027 Earnings Release",
+        "form": "6-K (Q1 FY2027) + 20-F (FY2024–FY2026) + 6-K (Q1 FY2026)",
         "accession": "0001104659-26-071842",
         "filing_date": "2026-08-15",
         "period_of_report": "2026-06-30",
@@ -53,41 +53,37 @@
       "return_score": {
         "ttm_div": {
           "value": "1.02",
-          "accession": "0001104659-26-071842"
+          "accession": "0000950170-26-075432 (FY2026 Form 20-F) + 0001104659-26-071842 (Q1 FY2027 Form 6-K) - 0001104659-25-079118 (Q1 FY2026 Form 6-K)"
         },
         "ttm_buyback": {
           "value": "5.51",
-          "accession": "0001104659-26-071842"
+          "accession": "0000950170-26-075432 (FY2026 Form 20-F) + 0001104659-26-071842 (Q1 FY2027 Form 6-K) - 0001104659-25-079118 (Q1 FY2026 Form 6-K)"
         },
         "true_return_share": {
           "value": "0.82",
-          "accession": "0001104659-26-071842"
+          "accession": "0000950170-26-075432 (FY2026 Form 20-F) + 0001104659-26-071842 (Q1 FY2027 Form 6-K) - 0001104659-25-079118 (Q1 FY2026 Form 6-K)"
         },
         "annual": {
           "value": "4.10,5.80,6.53",
-          "accession": "0001104659-26-071842"
-        },
-        "fwd_total": {
-          "value": "6.20",
-          "accession": "0001104659-26-071842"
+          "accession": "0000950170-24-063110 (FY2024 Form 20-F), 0000950170-25-071204 (FY2025 Form 20-F), 0000950170-26-075432 (FY2026 Form 20-F)"
         }
       },
       "earnings_quality": {
         "ni": {
           "value": "142800",
-          "accession": "0001104659-26-071842"
+          "accession": "0000950170-26-075432 (FY2026 Form 20-F) + 0001104659-26-071842 (Q1 FY2027 Form 6-K) - 0001104659-25-079118 (Q1 FY2026 Form 6-K)"
         },
         "cfo": {
           "value": "180340",
-          "accession": "0001104659-26-071842"
+          "accession": "0000950170-26-075432 (FY2026 Form 20-F) + 0001104659-26-071842 (Q1 FY2027 Form 6-K) - 0001104659-25-079118 (Q1 FY2026 Form 6-K)"
         },
         "cfi": {
           "value": "-62400",
-          "accession": "0001104659-26-071842"
+          "accession": "0000950170-26-075432 (FY2026 Form 20-F) + 0001104659-26-071842 (Q1 FY2027 Form 6-K) - 0001104659-25-079118 (Q1 FY2026 Form 6-K)"
         },
         "beginning_assets": {
           "value": "1765000",
-          "accession": "0001104659-26-071842"
+          "accession": "0001104659-25-079118 (Q1 FY2026 Form 6-K as of 2025-06-30)"
         },
         "ending_assets": {
           "value": "2180000",
@@ -103,8 +99,8 @@
       "listing_currency": "HKD",
       "adr_ratio": 1,
       "filing": {
-        "form": "HKEX 2Q2026 Interim Results Announcement",
-        "accession": "https://www.tencent.com/wp-content/uploads/2026/08/E700_IRA.pdf",
+        "form": "HKEX 2026 Interim Results Announcement + 2023–2025 Annual Reports + 2025 Interim Results",
+        "accession": "HKEX-EPS-20260812-00431 (https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0812/2026081200431.pdf)",
         "filing_date": "2026-08-12",
         "period_of_report": "2026-06-30",
         "unit": "CNY_mn"
@@ -112,79 +108,75 @@
       "netcash": {
         "cash": {
           "value": "162800",
-          "accession": "https://www.tencent.com/wp-content/uploads/2026/08/E700_IRA.pdf"
+          "accession": "HKEX-EPS-20260812-00431 (https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0812/2026081200431.pdf)"
         },
         "restricted_cash": {
           "value": "3400",
-          "accession": "https://www.tencent.com/wp-content/uploads/2026/08/E700_IRA.pdf"
+          "accession": "HKEX-EPS-20260812-00431 (https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0812/2026081200431.pdf)"
         },
         "time_deposits": {
           "value": "198500",
-          "accession": "https://www.tencent.com/wp-content/uploads/2026/08/E700_IRA.pdf"
+          "accession": "HKEX-EPS-20260812-00431 (https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0812/2026081200431.pdf)"
         },
         "st_investments": {
           "value": "47200",
-          "accession": "https://www.tencent.com/wp-content/uploads/2026/08/E700_IRA.pdf"
+          "accession": "HKEX-EPS-20260812-00431 (https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0812/2026081200431.pdf)"
         },
         "st_debt": {
           "value": "42100",
-          "accession": "https://www.tencent.com/wp-content/uploads/2026/08/E700_IRA.pdf"
+          "accession": "HKEX-EPS-20260812-00431 (https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0812/2026081200431.pdf)"
         },
         "cur_lt_debt": {
           "value": "26800",
-          "accession": "https://www.tencent.com/wp-content/uploads/2026/08/E700_IRA.pdf"
+          "accession": "HKEX-EPS-20260812-00431 (https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0812/2026081200431.pdf)"
         },
         "lt_debt": {
           "value": "270100",
-          "accession": "https://www.tencent.com/wp-content/uploads/2026/08/E700_IRA.pdf"
+          "accession": "HKEX-EPS-20260812-00431 (https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0812/2026081200431.pdf)"
         },
         "lease_liabilities": {
           "value": "21400",
-          "accession": "https://www.tencent.com/wp-content/uploads/2026/08/E700_IRA.pdf"
+          "accession": "HKEX-EPS-20260812-00431 (https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0812/2026081200431.pdf)"
         }
       },
       "return_score": {
         "ttm_div": {
           "value": "0.88",
-          "accession": "https://www.tencent.com/wp-content/uploads/2026/08/E700_IRA.pdf"
+          "accession": "HKEX-EPS-20260408-00615 (2025 Annual Report, https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0408/2026040800615.pdf) + HKEX-EPS-20260812-00431 (2026 Interim Results) - HKEX-EPS-20250813-00419 (2025 Interim Results)"
         },
         "ttm_buyback": {
           "value": "2.86",
-          "accession": "https://www.tencent.com/wp-content/uploads/2026/08/E700_IRA.pdf"
+          "accession": "HKEX-EPS-20260408-00615 (2025 Annual Report, https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0408/2026040800615.pdf) + HKEX-EPS-20260812-00431 (2026 Interim Results) - HKEX-EPS-20250813-00419 (2025 Interim Results)"
         },
         "true_return_share": {
           "value": "0.85",
-          "accession": "https://www.tencent.com/wp-content/uploads/2026/08/E700_IRA.pdf"
+          "accession": "HKEX-EPS-20260408-00615 (2025 Annual Report, https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0408/2026040800615.pdf) + HKEX-EPS-20260812-00431 (2026 Interim Results) - HKEX-EPS-20250813-00419 (2025 Interim Results)"
         },
         "annual": {
           "value": "2.40,3.50,3.74",
-          "accession": "https://www.tencent.com/wp-content/uploads/2026/08/E700_IRA.pdf"
-        },
-        "fwd_total": {
-          "value": "3.60",
-          "accession": "https://www.tencent.com/wp-content/uploads/2026/08/E700_IRA.pdf"
+          "accession": "HKEX-EPS-20240409-00711 (2023 Annual Report, https://www1.hkexnews.hk/listedco/listconews/sehk/2024/0409/2024040900711.pdf), HKEX-EPS-20250408-00589 (2024 Annual Report, https://www1.hkexnews.hk/listedco/listconews/sehk/2025/0408/2025040800589.pdf), HKEX-EPS-20260408-00615 (2025 Annual Report, https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0408/2026040800615.pdf)"
         }
       },
       "earnings_quality": {
         "ni": {
           "value": "196400",
-          "accession": "https://www.tencent.com/wp-content/uploads/2026/08/E700_IRA.pdf"
+          "accession": "HKEX-EPS-20260408-00615 (2025 Annual Report) + HKEX-EPS-20260812-00431 (2026 Interim Results) - HKEX-EPS-20250813-00419 (2025 Interim Results)"
         },
         "cfo": {
           "value": "261600",
-          "accession": "https://www.tencent.com/wp-content/uploads/2026/08/E700_IRA.pdf"
+          "accession": "HKEX-EPS-20260408-00615 (2025 Annual Report) + HKEX-EPS-20260812-00431 (2026 Interim Results) - HKEX-EPS-20250813-00419 (2025 Interim Results)"
         },
         "cfi": {
           "value": "-94200",
-          "accession": "https://www.tencent.com/wp-content/uploads/2026/08/E700_IRA.pdf"
+          "accession": "HKEX-EPS-20260408-00615 (2025 Annual Report) + HKEX-EPS-20260812-00431 (2026 Interim Results) - HKEX-EPS-20250813-00419 (2025 Interim Results)"
         },
         "beginning_assets": {
           "value": "1580000",
-          "accession": "https://www.tencent.com/wp-content/uploads/2026/08/E700_IRA.pdf"
+          "accession": "HKEX-EPS-20250813-00419 (2025 Interim Results as at 2025-06-30, https://www1.hkexnews.hk/listedco/listconews/sehk/2025/0813/2025081300419.pdf)"
         },
         "ending_assets": {
           "value": "1760000",
-          "accession": "https://www.tencent.com/wp-content/uploads/2026/08/E700_IRA.pdf"
+          "accession": "HKEX-EPS-20260812-00431 (https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0812/2026081200431.pdf)"
         }
       }
     },
@@ -196,7 +188,7 @@
       "listing_currency": "USD",
       "adr_ratio": 1,
       "filing": {
-        "form": "10-Q (Q2 2026)",
+        "form": "10-Q (Q2 2026) + 10-K (FY2023–FY2025) + 10-Q (Q2 2025)",
         "accession": "0001326801-26-000058",
         "filing_date": "2026-07-31",
         "period_of_report": "2026-06-30",
@@ -227,41 +219,37 @@
       "return_score": {
         "ttm_div": {
           "value": "0.31",
-          "accession": "0001326801-26-000058"
+          "accession": "0001326801-26-000011 (FY2025 Form 10-K) + 0001326801-26-000058 (Q2 2026 Form 10-Q, 6M ended 2026-06-30 minus 6M ended 2025-06-30)"
         },
         "ttm_buyback": {
           "value": "1.84",
-          "accession": "0001326801-26-000058"
+          "accession": "0001326801-26-000011 (FY2025 Form 10-K) + 0001326801-26-000058 (Q2 2026 Form 10-Q, 6M ended 2026-06-30 minus 6M ended 2025-06-30)"
         },
         "true_return_share": {
           "value": "0.68",
-          "accession": "0001326801-26-000058"
+          "accession": "0001326801-26-000011 (FY2025 Form 10-K) + 0001326801-26-000058 (Q2 2026 Form 10-Q, 6M ended 2026-06-30 minus 6M ended 2025-06-30)"
         },
         "annual": {
           "value": "1.95,2.40,2.15",
-          "accession": "0001326801-26-000058"
-        },
-        "fwd_total": {
-          "value": "2.10",
-          "accession": "0001326801-26-000058"
+          "accession": "0001326801-24-000012 (FY2023 Form 10-K), 0001326801-25-000014 (FY2024 Form 10-K), 0001326801-26-000011 (FY2025 Form 10-K)"
         }
       },
       "earnings_quality": {
         "ni": {
           "value": "64200",
-          "accession": "0001326801-26-000058"
+          "accession": "0001326801-26-000011 (FY2025 Form 10-K) + 0001326801-26-000058 (Q2 2026 Form 10-Q, 6M ended 2026-06-30 minus 6M ended 2025-06-30)"
         },
         "cfo": {
           "value": "94020",
-          "accession": "0001326801-26-000058"
+          "accession": "0001326801-26-000011 (FY2025 Form 10-K) + 0001326801-26-000058 (Q2 2026 Form 10-Q, 6M ended 2026-06-30 minus 6M ended 2025-06-30)"
         },
         "cfi": {
           "value": "-48500",
-          "accession": "0001326801-26-000058"
+          "accession": "0001326801-26-000011 (FY2025 Form 10-K) + 0001326801-26-000058 (Q2 2026 Form 10-Q, 6M ended 2026-06-30 minus 6M ended 2025-06-30)"
         },
         "beginning_assets": {
           "value": "245000",
-          "accession": "0001326801-26-000058"
+          "accession": "0001326801-25-000052 (Q2 2025 Form 10-Q as of 2025-06-30)"
         },
         "ending_assets": {
           "value": "275400",

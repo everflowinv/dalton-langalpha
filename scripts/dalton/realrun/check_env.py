@@ -11,7 +11,7 @@ Checks in order:
    - Local working tree is clean (`git_dirty == False`).
    - Backend `git_sha` equals local `HEAD` (`git_sha`), and `backend_git_dirty == False`.
 3. `conversation_transport`:
-   - Sends a minimal `POST /api/v1/threads/messages` turn as `realrun-pm-a` using a subscription model (`ocb-openai-gpt-6.1-sol`),
+   - Sends a minimal `POST /api/v1/threads/messages` turn as `realrun-pm-a` using a subscription model (`ocb-openai-gpt-6-luna`),
      verifying HTTP 200 (covering the Redis wake listener pool) and a `conversation_usages` row recorded under `user_id == "realrun-pm-a"`.
 4. `bridge`:
    - `http://127.0.0.1:8960/healthz` returns 200 and one real MCP `tools/call` read succeeds.
@@ -161,7 +161,7 @@ def check_identity_and_version(base_url: str) -> tuple[dict[str, Any], dict[str,
     pm_source = (
         body_pm_h.get("pm_user_ids_source")
         if isinstance(body_pm_h, dict)
-        else ("env" if os.getenv("DALTON_PM_USER_IDS", "").strip() else "dalton.yaml")
+        else ("env" if os.getenv("DALTON_PM_USER_IDS", "").strip() else "default")
     )
 
     identity_ok = (

@@ -504,6 +504,20 @@ def assert_clean_and_synced_environment(
     return health
 
 
+def require_internal_service_token() -> str:
+    """Return `INTERNAL_SERVICE_TOKEN` from environment/.env or raise RuntimeError (L40)."""
+    svc_token = os.getenv("INTERNAL_SERVICE_TOKEN", "").strip()
+    if not svc_token:
+        raise RuntimeError(
+            "INTERNAL_SERVICE_TOKEN is required in environment/.env (L40); "
+            "refusing to fall back to unauthenticated requests."
+        )
+    return svc_token
+
+
+get_internal_service_token = require_internal_service_token
+
+
 def preflight_realrun_script(
     family: str | None = None,
     *,
@@ -526,11 +540,9 @@ def new_test_user_id(
     family: str,
     *,
     record: bool | None = None,
-    preflight_fn: Callable[..., Any] | None = assert_clean_and_synced_environment,
 ) -> str:
     """Create a fresh, unique test user ID so runs never hit stale cached journal rows."""
-    if preflight_fn is not None:
-        preflight_fn(record=record)
+    assert_clean_and_synced_environment(record=record)
     slug = re.sub(r"[^a-z0-9]+", "-", family.lower()).strip("-")
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
     short_uid = uuid.uuid4().hex[:8]
@@ -559,7 +571,7 @@ def build_evidence_envelope(
     merged_main_fn: Callable[[], bool] = is_head_merged_into_main,
     main_ancestor_fn: Callable[[], bool] = is_main_ancestor_of_head,
     health_fn: Callable[[str, str], dict[str, Any]] = _probe_backend_health_sync,
-    env_check_fn: Callable[[str], dict[str, Any]] = _default_live_env_check,
+    env_check_fn: Callable[[str], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Construct a P0J §1.3 v2 compliant evidence JSON dictionary with live identity, version & check_env self-checks."""
     if record is None:
@@ -615,7 +627,12 @@ def build_evidence_envelope(
         or ("env" if os.getenv("DALTON_PM_USER_IDS", "").strip() else "default")
     )
 
-    env_payload = _get_or_run_env_check(probe_url, env_check_fn)
+    if record or env_check_fn is not None:
+        resolved_env_check = env_check_fn or _default_live_env_check
+        env_payload = _get_or_run_env_check(probe_url, resolved_env_check)
+    else:
+        env_payload = {"skipped_in_debug_mode": True, "record": False}
+
     if record and (not isinstance(env_payload, dict) or not env_payload.get("all_passed", False)):
         failed_list = env_payload.get("failed_checks") if isinstance(env_payload, dict) else "unknown"
         raise RuntimeError(
@@ -632,8 +649,12 @@ def build_evidence_envelope(
         invalid_reasons.append("backend_git_dirty")
     if backend_git_sha != git_sha:
         invalid_reasons.append(f"backend_git_sha_mismatch:{backend_git_sha}!={git_sha}")
-    if not isinstance(env_payload, dict) or not env_payload.get("all_passed", False):
+    if (record or env_check_fn is not None) and (
+        not isinstance(env_payload, dict) or not env_payload.get("all_passed", False)
+    ):
         invalid_reasons.append("check_env_not_all_passed")
+    elif not record and env_check_fn is None:
+        invalid_reasons.append("debug_run_not_record")
     if "local-dev-user" in allowed_users:
         invalid_reasons.append("test_user_id_is_local_dev_user")
 
@@ -948,6 +969,7 @@ def write_evidence_and_summary(
     if not raw_md_path.is_absolute():
         raw_md_path = repo_root / raw_md_path
     md_path = _redirect_docs_summary_to_var(raw_md_path, repo_root=repo_root)
+    _assert_path_under_var(md_path, repo_root=repo_root)
 
     serialized_json = json.dumps(envelope, ensure_ascii=False, indent=2) + "\n"
     sha256_hex = hashlib.sha256(serialized_json.encode("utf-8")).hexdigest()
@@ -1052,7 +1074,7 @@ def render_summaries_from_var_to_docs(
                 / "dalton"
                 / "dev-guide"
                 / "trial-runs"
-                / "G6-financial-lenses-comparison-20261018.md"
+                / f"G6-financial-lenses-comparison-{date_str}.md"
             )
             comp_out.parent.mkdir(parents=True, exist_ok=True)
             comp_out.write_text(comp_md, encoding="utf-8")
@@ -1063,31 +1085,20 @@ def render_summaries_from_var_to_docs(
 class RealRunHttpClient:
     """Thin HTTP client for operating against the live backend (`http://127.0.0.1:8000`) with service-token identity (L40, L41)."""
 
-    def __init__(
+    def _init_http_client(
         self,
-        base_url: str = "http://127.0.0.1:8000",
+        base_url: str,
         *,
         user_id: str,
-        timeout_s: float = 120.0,
-        extra_headers: dict[str, str] | None = None,
-        record: bool | None = None,
-        preflight_fn: Callable[..., Any] | None = assert_clean_and_synced_environment,
+        timeout_s: float,
+        extra_headers: dict[str, str] | None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.user_id = str(user_id).strip()
         if not self.user_id:
             raise ValueError("user_id must be non-empty for RealRunHttpClient")
 
-        svc_token = os.getenv("INTERNAL_SERVICE_TOKEN", "").strip()
-        if not svc_token:
-            raise RuntimeError(
-                "INTERNAL_SERVICE_TOKEN is required in environment/.env for RealRunHttpClient (L40); "
-                "refusing to fall back to unauthenticated requests."
-            )
-
-        if preflight_fn is not None:
-            preflight_fn(base_url=self.base_url, user_id=self.user_id, record=record)
-
+        svc_token = require_internal_service_token()
         headers = {
             "X-User-Id": self.user_id,
             "X-Service-Token": svc_token,
@@ -1099,6 +1110,27 @@ class RealRunHttpClient:
             headers=headers,
             timeout=timeout_s,
             trust_env=False,
+        )
+
+    def __init__(
+        self,
+        base_url: str = "http://127.0.0.1:8000",
+        *,
+        user_id: str,
+        timeout_s: float = 120.0,
+        extra_headers: dict[str, str] | None = None,
+        record: bool | None = None,
+    ) -> None:
+        self._init_http_client(
+            base_url,
+            user_id=user_id,
+            timeout_s=timeout_s,
+            extra_headers=extra_headers,
+        )
+        assert_clean_and_synced_environment(
+            base_url=self.base_url,
+            user_id=self.user_id,
+            record=record,
         )
 
     @classmethod
@@ -1123,13 +1155,14 @@ class RealRunHttpClient:
                 f"_for_check_env_probe is reserved exclusively for {expected_check_env}, "
                 f"cannot be called from {caller_file}"
             )
-        return cls(
-            base_url=base_url,
+        inst = cls.__new__(cls)
+        inst._init_http_client(
+            base_url,
             user_id=user_id,
             timeout_s=timeout_s,
             extra_headers=extra_headers,
-            preflight_fn=None,
         )
+        return inst
 
     def close(self) -> None:
         self._client.close()

@@ -1,13 +1,7 @@
 #!/bin/bash
 # Dalton Docker entrypoint: wait for database, run upstream + Dalton migrations, then exec CMD.
-# Git is pre-installed in scripts/dalton/Dockerfile.dalton (no runtime apt-get).
+# Git is pre-installed and build SHA/dirty are baked at image build time in scripts/dalton/Dockerfile.dalton.
 set -e
-
-if [ ! -s /app/.build_git_sha ] && [ -f /app/.build_files.sha256 ] && [ -d /host_repo/.git ]; then
-  if (cd /host_repo && sha256sum --status -c /app/.build_files.sha256 2>/dev/null); then
-    git -c safe.directory='*' --no-optional-locks -C /host_repo rev-parse --short=8 HEAD > /app/.build_git_sha 2>/dev/null || true
-  fi
-fi
 
 DB_HOST="${DB_HOST:-localhost}"
 DB_PORT="${DB_PORT:-5432}"

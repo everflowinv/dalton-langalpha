@@ -513,25 +513,33 @@ MIGRATED_COMPANY_TICKERS: tuple[str, ...] = ("META", "AMZN", "GOOGL", "MSFT")
 def _discover_migrated_company_workspaces(
     client: RealRunHttpClient,
 ) -> dict[str, str]:
-    """Query `GET /api/v1/workspaces` as `realrun-pm-a` and resolve the 4 migrated company
-    workspaces (`META`, `AMZN`, `GOOGL`, `MSFT`) by `config.ticker` and `config.dalton_company == True`.
+    """Query `GET /api/v1/workspaces` (with pagination) as `realrun-pm-a` and resolve the 4 migrated
+    company workspaces (`META`, `AMZN`, `GOOGL`, `MSFT`) by workspace `name == ticker`
+    (consistent with `init_company_workspace.py` and `bootstrap_watch.py`).
     """
-    st_ws, ws_body = client.get("/api/v1/workspaces", params={"limit": 100})
-    assert st_ws == 200 and isinstance(ws_body, dict), (
-        f"GET /api/v1/workspaces failed while discovering migrated company workspaces: {st_ws} {ws_body}"
-    )
-    workspaces = ws_body.get("workspaces") or []
     discovered: dict[str, str] = {}
-    for ws in workspaces:
-        if not isinstance(ws, dict):
-            continue
-        cfg = ws.get("config") or {}
-        if not isinstance(cfg, dict) or cfg.get("dalton_company") is not True:
-            continue
-        ticker = str(cfg.get("ticker") or "").strip().upper()
-        ws_id = str(ws.get("workspace_id") or "").strip()
-        if ticker in MIGRATED_COMPANY_TICKERS and ws_id and ticker not in discovered:
-            discovered[ticker] = ws_id
+    limit = 100
+    offset = 0
+    while True:
+        st_ws, ws_body = client.get("/api/v1/workspaces", params={"limit": limit, "offset": offset})
+        assert st_ws == 200 and isinstance(ws_body, dict), (
+            f"GET /api/v1/workspaces failed while discovering migrated company workspaces: {st_ws} {ws_body}"
+        )
+        page_items = ws_body.get("workspaces") or ws_body.get("items") or []
+        for ws in page_items:
+            if not isinstance(ws, dict):
+                continue
+            if str(ws.get("status") or "").lower() == "deleted":
+                continue
+            name_upper = str(ws.get("name") or "").strip().upper()
+            ws_id = str(ws.get("workspace_id") or ws.get("id") or "").strip()
+            if name_upper in MIGRATED_COMPANY_TICKERS and ws_id and name_upper not in discovered:
+                discovered[name_upper] = ws_id
+
+        total = int(ws_body.get("total") or 0)
+        offset += len(page_items)
+        if not page_items or (total > 0 and offset >= total):
+            break
 
     assert set(discovered.keys()) == set(MIGRATED_COMPANY_TICKERS), (
         f"Expected GET /api/v1/workspaces to return all 4 migrated company workspaces "
@@ -583,7 +591,7 @@ def _verify_legacy_migrated_theses_via_http(
         )
         company_histories[ticker] = {
             "workspace_id": ws_id,
-            "discovered_via": "GET /api/v1/workspaces (config.ticker + config.dalton_company=true)",
+            "discovered_via": "GET /api/v1/workspaces (paginated, workspace.name == ticker)",
             "versions_endpoint": f"GET /api/v1/dalton/knowledge/{ws_id}/thesis/versions",
             "versions_count": len(items),
             "versions": [

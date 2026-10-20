@@ -40,19 +40,23 @@ LENSES_SCRIPTS_DIR = (
 LENSES_OUT_DIR = REPO_ROOT / "var" / "dalton" / "lenses"
 LENSES_FIXTURE_PATH = REPO_ROOT / "tests" / "fixtures" / "dalton" / "g6" / "lenses_inputs.json"
 
-# Analyst judgment parameters for return_score.py (kept separate from filing line items in lenses_inputs.json)
+# Analyst forward estimate (fwd_total) and judgment parameters (credibility / credibility_reason)
+# for return_score.py — kept separate from historical filing line items in lenses_inputs.json
 ANALYST_CREDIBILITY_BY_TICKER: dict[str, dict[str, str]] = {
     "BABA": {
+        "fwd_total": "6.20",
         "credibility": "90",
-        "credibility_reason": "持续执行大规模注销式回购并派发年度股息（分析师主观判断参数，非财报原始科目）",
+        "credibility_reason": "持续执行大规模注销式回购并派发年度股息（分析师前瞻与主观判断参数，非历史财报原始科目）",
     },
     "0700.HK": {
+        "fwd_total": "3.60",
         "credibility": "90",
-        "credibility_reason": "千亿港元回购计划按季稳定兑现并注销股份（分析师主观判断参数，非财报原始科目）",
+        "credibility_reason": "千亿港元回购计划按季稳定兑现并注销股份（分析师前瞻与主观判断参数，非历史财报原始科目）",
     },
     "META": {
+        "fwd_total": "2.10",
         "credibility": "90",
-        "credibility_reason": "强劲自由现金流支撑季度分红与持续回购（分析师主观判断参数，非财报原始科目）",
+        "credibility_reason": "强劲自由现金流支撑季度分红与持续回购（分析师前瞻与主观判断参数，非历史财报原始科目）",
     },
 }
 
@@ -92,7 +96,7 @@ def _verify_conflict_rejection(anchors_path: Path) -> dict[str, Any]:
 
 
 def render_comparison_markdown(results_by_ticker: dict[str, Any], run_date: str | None = None) -> str:
-    """Render `G6-financial-lenses-comparison-20261018.md` directly from the G6 evidence JSON in `var/`."""
+    """Render `G6-financial-lenses-comparison-<date>.md` directly from the G6 evidence JSON in `var/`."""
     date_tag = run_date or default_shanghai_date()
     baba = results_by_ticker["BABA"]
     hk = results_by_ticker["0700.HK"]
@@ -110,7 +114,7 @@ def render_comparison_markdown(results_by_ticker: dict[str, Any], run_date: str 
         "",
         "- **生成方式**：由 `python -m scripts.dalton.realrun._common --render-docs` 从 `var/dalton/trial-runs/` 下的 G6 实跑证据 JSON 直接渲染生成（无手写硬编码表）",
         "- **对应指南**：`P0J-round4-fixes.md` §5.7 (`G6`)、`P0I-round3-fixes.md` §6 (`I6`)",
-        "- **输入科目出处**：`tests/fixtures/dalton/g6/lenses_inputs.json`（每项财报科目均单独标注真实财报 `accession` 或港交所业绩公告 PDF 链接；`return_score.py` 的 `credibility` 与 `credibility_reason` 为分析师判断参数，由 `scripts/dalton/realrun/g6_lenses.py` 的 `ANALYST_CREDIBILITY_BY_TICKER` 传入），市值与汇率由 `anchors.py --allow-network` 实时从 `yfinance` 拉取",
+        "- **输入科目出处**：`tests/fixtures/dalton/g6/lenses_inputs.json`（每项历史财报科目均单独标注真实 SEC `accession` 或港交所披露易公告编号与 PDF 链接，其中 TTM 与期初/多年度科目分别标明对应的年报与中期报告组合；`return_score.py` 的前瞻预期 `fwd_total` 及主观判断参数 `credibility`/`credibility_reason` 由 `scripts/dalton/realrun/g6_lenses.py` 的 `ANALYST_CREDIBILITY_BY_TICKER` 传入），市值与汇率由 `anchors.py --allow-network` 实时从 `yfinance` 拉取",
         "- **真实运行产物路径（`--record` 模式写入 `var/dalton/lenses/`）**：",
         f"  - `var/dalton/lenses/baba_anchors_{date_tag}.json`",
         f"  - `var/dalton/lenses/baba_netcash_{date_tag}.json`",
@@ -169,18 +173,6 @@ def render_comparison_markdown(results_by_ticker: dict[str, Any], run_date: str 
         "| **受限现金扣除逻辑 (`netcash.py`)** | 传入自定义 `trapped_cash_items` 时偶发漏扣 `restricted_cash` | 口径 A (`basic_net_cash_usd`) 计入广义现金减去有息负债；口径 B (`strict_net_cash_usd`) 从口径 A 扣除一次 `restricted_cash`（及类债务/受困现金），满足 `(basic_net_cash_usd - restricted_cash_usd_equiv) == strict_net_cash_usd` | 口径 A 与口径 B 差额等于受限现金与额外扣减项之和 |",
         "| **市值字段与单位 (`market_cap_usd_mn`)** | 混用 `market_cap_usd`（百万美元 vs 美元原值） | 统一使用 `market_cap_usd_mn`（百万美元），同时保留 `value_usd` 原值并与 `references/output-schema.md` 100% 对齐 | 消除 100 万倍单位歧义 |",
         "| **盈利质量期初/期末资产与 CCC (`earnings_quality.py`)** | 需手工预计算平均总资产；缺少分项时将缺失分项按 `0` 求和算出伪造的 `ccc_days` | 支持直接传 `--beginning-assets` 与 `--ending-assets` 自动求均值；`dso`/`dio`/`dpo` 任一分项缺失时 `ccc_days` 返回 `null` | Sloan 应计比率与 CFO/NI 计算结果与原脚本一致，缺失分项时诚实返回 `null` |",
-        "",
-        "---",
-        "",
-        "## 3. 历史旧表存档（已作废：受限现金被扣了两次）",
-        "",
-        "> **说明（P0J §5 G6）：** 下表为早期旧版试跑记录存档，当时对口径 A 与口径 B 的列说明存在混淆，**已作废：受限现金被扣了两次**，仅保留备查。",
-        "",
-        "| 标的 | 旧表口径 A 净现金 | 旧表口径 B 严格净现金 | 状态 |",
-        "|---|---|---|---|",
-        "| **BABA** | `$51,891.66M` | `$45,721.05M` | 已作废：受限现金被扣了两次 |",
-        "| **0700.HK** | `$9,899.93M` | `$9,390.71M` | 已作废：受限现金被扣了两次 |",
-        "| **META** | `$48,989.00M` | `$48,869.00M` | 已作废：受限现金被扣了两次 |",
         "",
     ]
     return "\n".join(lines)
@@ -274,7 +266,7 @@ def main() -> int:
                 "--annual",
                 _field_str(rs_in, "annual"),
                 "--fwd-total",
-                _field_str(rs_in, "fwd_total"),
+                str(cred_cfg["fwd_total"]),
                 "--credibility",
                 str(cred_cfg["credibility"]),
                 "--credibility-reason",
@@ -396,9 +388,11 @@ def main() -> int:
                 "kind": "committed_fixture_input",
                 "entry_point": "tests/fixtures/dalton/g6/lenses_inputs.json",
                 "description": (
-                    "使用入库的 BABA / 0700.HK / META 财报科目夹具（每项财报科目均带真实 SEC accession 或腾讯 2Q2026 业绩公告 PDF 链接；"
-                    "return_score 的 credibility 与 credibility_reason 为分析师主观判断参数，已移出夹具并由 g6_lenses.py 的 "
-                    "ANALYST_CREDIBILITY_BY_TICKER 提供），配合 anchors.py --allow-network 实时拉取市值与汇率。"
+                    "使用入库的 BABA / 0700.HK / META 历史财报科目夹具（每项科目均单独标明真实来源：期末资产负债表取当期季报/中期公告，"
+                    "期初资产取上年同期比较期报表，TTM 现金流与分红回购取年报加减中期报表组合，多年度序列取历年年报；"
+                    "0700.HK 使用港交所披露易公告编号与 PDF 链接；return_score 的前瞻预期 fwd_total 及主观判断参数 "
+                    "credibility / credibility_reason 已移出夹具，由 g6_lenses.py 的 ANALYST_CREDIBILITY_BY_TICKER 提供），"
+                    "配合 anchors.py --allow-network 实时拉取市值与汇率。"
                 ),
             }
         ],
@@ -440,7 +434,7 @@ def main() -> int:
         ],
         notes=[
             "财务镜头为纯确定性 Python 脚本，不发生 LLM 调用（`dalton_llm_journal` 调用数为 0）。",
-            "市值与汇率由 `anchors.py --allow-network` 从 `yfinance` 实时拉取；资产负债表与现金流表科目读取自 `tests/fixtures/dalton/g6/lenses_inputs.json`（每项科目单独标注真实 SEC `accession` 或腾讯 2Q2026 业绩公告 PDF 链接，`return_score` 的 `credibility`/`credibility_reason` 分析师主观判断参数定义于 `g6_lenses.py:ANALYST_CREDIBILITY_BY_TICKER`）。",
+            "市值与汇率由 `anchors.py --allow-network` 从 `yfinance` 实时拉取；历史资产负债表与现金流表科目读取自 `tests/fixtures/dalton/g6/lenses_inputs.json`（每项科目单独标注真实 SEC `accession` 或港交所披露易公告编号与 PDF 链接，其中 TTM 与多年度科目分别标明年报与中期报告组合；`return_score` 的前瞻预期 `fwd_total` 及主观判断参数 `credibility`/`credibility_reason` 定义于 `g6_lenses.py:ANALYST_CREDIBILITY_BY_TICKER`）。",
             "已验证受限现金单次扣除：口径 A (`basic_net_cash_usd`) 含受限现金，口径 B (`strict_net_cash_usd`) 从口径 A 扣除一次 `restricted_cash_usd_equiv`，满足 `abs((basic_net_cash_usd - restricted_cash_usd_equiv) - strict_net_cash_usd) < 0.01`。",
         ],
         record=args.record,

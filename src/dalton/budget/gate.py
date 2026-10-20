@@ -145,6 +145,9 @@ async def verify_local_wiring() -> None:
     when startup must fail fast; other transient errors (e.g. DB temporarily unreachable)
     propagate as non-`DaltonStartupConfigError` so `setup.py` logs a warning.
     """
+    from src.dalton.services.openclaw_admin import init_startup_git_info
+
+    init_startup_git_info()
     role_policy.enforce_role_policy_on_startup()
 
     try:

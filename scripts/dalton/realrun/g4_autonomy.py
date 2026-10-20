@@ -989,11 +989,14 @@ def main() -> int:
 
         # Scenario 6: Accumulate >= $0.01 real cash spend if needed, lower daily_cap_usd to $0.01, and trigger watch + one-shot tm3
         print("[G4] Scenario 6: Accumulating >= $0.01 cash spend and lowering daily_cap_usd to $0.01 ...", flush=True)
-        for turn_idx in range(1, 4):
+        spend_deadline = time.monotonic() + 300.0
+        turn_idx = 0
+        while time.monotonic() < spend_deadline:
             _, cur_today = client.request("GET", "/api/v1/dalton/budget/today")
             cur_spent = float((cur_today or {}).get("spent_usd") or 0.0)
             if cur_spent >= 0.01:
                 break
+            turn_idx += 1
             sub_prompt = (
                 f"请在本轮响应中调用 1 次 `Task` 工具（使用 `subagent_type='general-purpose'`，命名为 `G4-{turn_idx}-A`）。\n"
                 "在 `Task` 的 `prompt` 中，要求该子智能体严格按顺序分 2 轮调用 `Bash` 工具（每轮等待上一轮返回后再发起下一轮，每次输出 150 行随机数据以保留在上下文内）：\n"

@@ -1,5 +1,5 @@
 # Dalton backend image extending deploy/Dockerfile.dev with build-time git installation
-# and image build SHA + file manifest recording (P0J Round-4 Must-Fix #7).
+# and mandatory build-time git SHA + dirty flag + file manifest recording (P0J Round-4 Must-Fix #7).
 # Shares the exact top layers of deploy/Dockerfile.dev for 100% Docker layer cache reuse.
 FROM python:3.13-slim
 
@@ -48,14 +48,21 @@ COPY workflows/ workflows/
 COPY scripts/docker_entrypoint.sh /docker_entrypoint.sh
 RUN chmod +x /docker_entrypoint.sh
 
-# Record image build git SHA (when passed via --build-arg BUILD_GIT_SHA) and
-# bake a deterministic SHA-256 manifest of all image-bundled files at build time
-# so startup can detect any drift between the built image and /host_repo.
+# Mandatory build-time git SHA and dirty status (fail build if missing/invalid) +
+# deterministic SHA-256 manifest of bind-mounted code paths so startup detects any drift.
 ARG BUILD_GIT_SHA=""
-RUN if [ -n "$BUILD_GIT_SHA" ]; then \
-        printf '%s\n' "$BUILD_GIT_SHA" | cut -c1-8 > /app/.build_git_sha; \
+ARG BUILD_GIT_DIRTY=""
+RUN if [ -z "$BUILD_GIT_SHA" ] || [ "$BUILD_GIT_SHA" = "unknown" ]; then \
+        echo "ERROR: BUILD_GIT_SHA build arg is required and must not be empty or unknown" >&2; \
+        exit 1; \
     fi \
-    && find pyproject.toml uv.lock server.py libs src scripts migrations -type f -print0 \
+    && if [ "$BUILD_GIT_DIRTY" != "true" ] && [ "$BUILD_GIT_DIRTY" != "false" ]; then \
+        echo "ERROR: BUILD_GIT_DIRTY build arg is required and must be 'true' or 'false'" >&2; \
+        exit 1; \
+    fi \
+    && printf '%s\n' "$BUILD_GIT_SHA" | cut -c1-8 > /app/.build_git_sha \
+    && printf '%s\n' "$BUILD_GIT_DIRTY" > /app/.build_git_dirty \
+    && find server.py libs/market-protocol src scripts migrations -type f -print0 \
        | sort -z \
        | xargs -0 sha256sum > /app/.build_files.sha256
 

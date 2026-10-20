@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from decimal import Decimal
+import importlib
+import inspect
 import json
 from pathlib import Path
 
@@ -235,6 +237,7 @@ def test_common_synthetic_validation_and_artifact_writing(
         git_sha_fn=lambda: "1234abcd",
         git_dirty_fn=lambda: True,
         merged_main_fn=lambda: False,
+        main_ancestor_fn=lambda: False,
         health_fn=injected_health,
     )
     assert debug_health["deployment"] == "docker"
@@ -250,6 +253,7 @@ def test_common_synthetic_validation_and_artifact_writing(
             git_sha_fn=lambda: "1234abcd",
             git_dirty_fn=lambda: True,
             merged_main_fn=lambda: True,
+            main_ancestor_fn=lambda: True,
             health_fn=injected_health,
             env_check_fn=injected_env,
         )
@@ -262,6 +266,7 @@ def test_common_synthetic_validation_and_artifact_writing(
             git_sha_fn=lambda: "1234abcd",
             git_dirty_fn=lambda: False,
             merged_main_fn=lambda: False,
+            main_ancestor_fn=lambda: True,
             health_fn=injected_health,
             env_check_fn=injected_env,
         )
@@ -274,6 +279,7 @@ def test_common_synthetic_validation_and_artifact_writing(
             git_sha_fn=lambda: "1234abcd",
             git_dirty_fn=lambda: False,
             merged_main_fn=lambda: True,
+            main_ancestor_fn=lambda: True,
             health_fn=injected_health,
             env_check_fn=failing_env,
         )
@@ -310,6 +316,25 @@ def test_common_synthetic_validation_and_artifact_writing(
             "unexpected_user_ids": [],
         },
     }
+
+    # Debug run (record=False and env_check_fn=None) must skip check_env completely
+    debug_envelope = build_evidence_envelope(
+        script="scripts/dalton/realrun/g1_budget.py",
+        started_at="2026-10-19T05:00:00Z",
+        ended_at="2026-10-19T05:02:00Z",
+        backend="http://127.0.0.1:8000",
+        test_user_id="realrun-g1-20261019-abcd1234",
+        synthetic=valid_synthetic,
+        journal=fake_journal,
+        record=False,
+        git_sha_fn=lambda: "1234abcd",
+        git_dirty_fn=lambda: False,
+        merged_main_fn=lambda: True,
+        main_ancestor_fn=lambda: True,
+        health_fn=injected_health,
+    )
+    assert debug_envelope["environment"] == {"skipped_in_debug_mode": True, "record": False}
+    assert "debug_run_not_record" in debug_envelope["invalid_reasons"]
 
     envelope = build_evidence_envelope(
         script="scripts/dalton/realrun/g1_budget.py",
@@ -369,13 +394,25 @@ def test_common_synthetic_validation_and_artifact_writing(
     raw_path = tmp_path / "var" / "dalton" / "trial-runs" / "realrun-20261019" / "g1_budget.json"
     md_path = tmp_path / "var" / "dalton" / "trial-runs" / "realrun-20261019" / "G1.md"
 
-    # Reject raw_json_path outside var/ (Must-Fix #12)
+    # Reject raw_json_path or summary_md_path outside var/ (Must-Fix #12)
     with pytest.raises(ValueError, match="Evidence raw_json_path must reside under"):
         write_evidence_and_summary(
             family_code="G1",
             title="预算三连真实运行验证",
             raw_json_path=tmp_path / "docs" / "dalton" / "g1_budget.json",
             summary_md_path=md_path,
+            envelope=envelope,
+            key_findings=[("日额度阻断", "402 budget_exceeded")],
+            record=False,
+            repo_root=tmp_path,
+        )
+
+    with pytest.raises(ValueError, match="Evidence raw_json_path must reside under"):
+        write_evidence_and_summary(
+            family_code="G1",
+            title="预算三连真实运行验证",
+            raw_json_path=raw_path,
+            summary_md_path=tmp_path / "outside_var" / "G1.md",
             envelope=envelope,
             key_findings=[("日额度阻断", "402 budget_exceeded")],
             record=False,
@@ -435,35 +472,54 @@ def test_for_check_env_probe_caller_guard_and_docker_build_sha_drift(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", "test-service-token-value")
+    # RealRunHttpClient.__init__ must not expose any preflight_fn bypass parameter
+    assert "preflight_fn" not in inspect.signature(RealRunHttpClient.__init__).parameters
+
     with pytest.raises(RuntimeError, match="reserved exclusively for"):
         RealRunHttpClient._for_check_env_probe(
             base_url="http://127.0.0.1:8000", user_id="realrun-env-probe-123"
         )
 
-    # Docker build SHA drift detection (Must-Fix #7):
-    # If running inside Docker and /app/.build_git_sha differs from git HEAD SHA, git_dirty must be True
+    # Docker build-time SHA and dirty flag (Must-Fix #7):
     build_sha_file = tmp_path / ".build_git_sha"
-    build_sha_file.write_text("deadbeef\n", encoding="utf-8")
+    build_dirty_file = tmp_path / ".build_git_dirty"
+    manifest_file = tmp_path / ".build_files.sha256"
 
-    def _fake_check_output(cmd: list[str], **_kwargs: object) -> str:
-        if "rev-parse" in cmd:
-            return "94a8d368\n"
-        return ""
-
-    monkeypatch.setattr(openclaw_admin.subprocess, "check_output", _fake_check_output)
-    sha_mismatch, dirty_mismatch = openclaw_admin._compute_startup_git_info(
-        in_docker=True, build_sha_file=build_sha_file
+    # Missing .build_git_sha -> ("unknown", True)
+    sha_missing, dirty_missing = openclaw_admin._compute_startup_git_info(
+        in_docker=True,
+        app_root=tmp_path,
+        build_sha_file=build_sha_file,
+        build_dirty_file=build_dirty_file,
+        build_files_sha256_file=manifest_file,
     )
-    assert sha_mismatch == "94a8d368"
-    assert dirty_mismatch is True
+    assert sha_missing == "unknown"
+    assert dirty_missing is True
 
-    # Matching build SHA and clean git status -> git_dirty is False
+    # Baked SHA + dirty=true -> ("94a8d368", True)
     build_sha_file.write_text("94a8d368\n", encoding="utf-8")
-    sha_match, dirty_match = openclaw_admin._compute_startup_git_info(
-        in_docker=True, build_sha_file=build_sha_file
+    build_dirty_file.write_text("true\n", encoding="utf-8")
+    sha_dirty, is_dirty = openclaw_admin._compute_startup_git_info(
+        in_docker=True,
+        app_root=tmp_path,
+        build_sha_file=build_sha_file,
+        build_dirty_file=build_dirty_file,
+        build_files_sha256_file=manifest_file,
     )
-    assert sha_match == "94a8d368"
-    assert dirty_match is False
+    assert sha_dirty == "94a8d368"
+    assert is_dirty is True
+
+    # Baked SHA + dirty=false -> ("94a8d368", False)
+    build_dirty_file.write_text("false\n", encoding="utf-8")
+    sha_clean, is_clean = openclaw_admin._compute_startup_git_info(
+        in_docker=True,
+        app_root=tmp_path,
+        build_sha_file=build_sha_file,
+        build_dirty_file=build_dirty_file,
+        build_files_sha256_file=manifest_file,
+    )
+    assert sha_clean == "94a8d368"
+    assert is_clean is False
 
 
 def test_check_report_claims_and_generated_evidence_table_on_sample_files(
@@ -481,6 +537,10 @@ def test_check_report_claims_and_generated_evidence_table_on_sample_files(
     (sample_repo / "scripts" / "dalton" / "realrun").mkdir(parents=True)
     (sample_repo / "scripts" / "dalton" / "realrun" / "g1_budget.py").write_text(
         "# sample g1_budget.py\n",
+        encoding="utf-8",
+    )
+    (sample_repo / "scripts" / "dalton" / "realrun" / "g3_publish.py").write_text(
+        "# sample g3_publish.py\n",
         encoding="utf-8",
     )
 
@@ -560,23 +620,47 @@ def test_check_report_claims_and_generated_evidence_table_on_sample_files(
     assert tampered_res["summary"]["sha256_mismatches_count"] == 2
     assert tampered_res["summary"]["generated_block_mismatches_count"] == 1
 
-    # Generic G3 sourced ratio check (Must-Fix #10): compares arbitrary N/M against g3_publish.json
+    # Designated G3 evaluation fields check inside generated block (ignores unrelated ratios in prose)
     g3_json = raw_dir / "g3_publish.json"
     g3_json.write_text(
         json.dumps(
             {
+                "evidence_version": 2,
+                "git_sha": "1234abcd",
+                "git_dirty": False,
+                "backend_git_sha": "1234abcd",
+                "backend_git_dirty": False,
+                "test_user_id": "realrun-pm-a",
+                "valid": True,
+                "journal": {
+                    "totals": {
+                        "total_calls": 4,
+                        "fresh_calls": 4,
+                        "replayed_calls": 0,
+                        "conversation_turns": 0,
+                        "cash_usd": 0.0,
+                        "notional_usd": 0.05,
+                        "combined_cash_usd": 0.0,
+                    }
+                },
                 "evaluation": {
                     "true_verified_in_gold_count": 88,
                     "gold_sourced_total": 88,
+                    "false_verified_in_gold_count": 0,
                     "false_unverified_in_gold_count": 0,
                     "sourced_uncertain_in_gold_count": 0,
-                }
+                },
             }
         ),
         encoding="utf-8",
     )
     ratio_match_md = sample_repo / "docs" / "ratio-match.md"
-    ratio_match_md.write_text("有源核实率 `88 / 88 = 100.0%`\n", encoding="utf-8")
+    ratio_match_md.write_text(
+        "无关正文比例 `3 / 4 = 75.0%`\n\n"
+        f"{GENERATED_START_MARKER}\n{GENERATED_END_MARKER}\n",
+        encoding="utf-8",
+    )
+    update_markdown_generated_block(ratio_match_md, evidence_dir=raw_dir, repo_root=sample_repo)
     assert (
         compare_legacy_report(ratio_match_md, evidence_dir=raw_dir, repo_root=sample_repo)[
             "g3_evaluation_mismatches"
@@ -584,12 +668,18 @@ def test_check_report_claims_and_generated_evidence_table_on_sample_files(
         == []
     )
     ratio_mismatch_md = sample_repo / "docs" / "ratio-mismatch.md"
-    ratio_mismatch_md.write_text("有源核实率 `61 / 61 = 100.0%`\n", encoding="utf-8")
+    ratio_mismatch_md.write_text(
+        ratio_match_md.read_text(encoding="utf-8").replace(
+            "| 金标准真阳核实数 (`true_verified_in_gold_count`) | `88` |",
+            "| 金标准真阳核实数 (`true_verified_in_gold_count`) | `61` |",
+        ),
+        encoding="utf-8",
+    )
     mismatches = compare_legacy_report(
         ratio_mismatch_md, evidence_dir=raw_dir, repo_root=sample_repo
     )["g3_evaluation_mismatches"]
     assert len(mismatches) == 1
-    assert "actual evidence is 88/88" in mismatches[0]
+    assert "true_verified_in_gold_count" in mismatches[0]
 
 
 def test_static_script_scan_detects_from_src_and_insert_into(tmp_path: Path) -> None:
@@ -606,4 +696,107 @@ def test_static_script_scan_detects_from_src_and_insert_into(tmp_path: Path) -> 
     assert "from_src_import" in kinds
     assert "insert_into:dalton_watch_signals" in kinds
     assert "forbidden_check_env_probe_call" in kinds
+
+
+def test_all_realrun_scripts_import_cleanly() -> None:
+    """Every `g*.py` (and supporting script) in `scripts/dalton/realrun/` must import cleanly."""
+    realrun_dir = Path(__file__).resolve().parents[3] / "scripts" / "dalton" / "realrun"
+    g_scripts = sorted(realrun_dir.glob("g*.py"))
+    assert len(g_scripts) >= 7
+    for script_path in g_scripts:
+        mod_name = f"scripts.dalton.realrun.{script_path.stem}"
+        mod = importlib.import_module(mod_name)
+        assert callable(getattr(mod, "main", None)), f"{mod_name} is missing callable main()"
+    g1_mod = importlib.import_module("scripts.dalton.realrun.g1_budget")
+    assert callable(getattr(g1_mod, "require_internal_service_token", None))
+
+
+def test_g3_discover_migrated_workspaces_matches_by_name_with_pagination() -> None:
+    from scripts.dalton.realrun import g3_publish
+
+    class _FakeClient:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        def get(
+            self,
+            path: str,
+            *,
+            params: dict[str, Any] | None = None,
+            expected_status: int | tuple[int, ...] | None = 200,
+        ) -> tuple[int, dict[str, Any]]:
+            self.calls.append({"path": path, "params": dict(params or {})})
+            offset = int((params or {}).get("offset", 0))
+            if offset == 0:
+                return (
+                    200,
+                    {
+                        "workspaces": [
+                            {"workspace_id": "ws-meta", "name": "META", "status": "ready"},
+                            {"workspace_id": "ws-amzn", "name": "AMZN", "status": "ready"},
+                            {"workspace_id": "ws-del", "name": "GOOGL", "status": "deleted"},
+                        ],
+                        "total": 5,
+                    },
+                )
+            return (
+                200,
+                {
+                    "workspaces": [
+                        {"workspace_id": "ws-googl", "name": "GOOGL", "status": "ready"},
+                        {"workspace_id": "ws-msft", "name": "MSFT", "status": "ready"},
+                    ],
+                    "total": 5,
+                },
+            )
+
+    fake_client = _FakeClient()
+    mapping = g3_publish._discover_migrated_company_workspaces(fake_client)  # type: ignore[arg-type]
+    assert mapping == {
+        "META": "ws-meta",
+        "AMZN": "ws-amzn",
+        "GOOGL": "ws-googl",
+        "MSFT": "ws-msft",
+    }
+    assert len(fake_client.calls) == 2
+    assert fake_client.calls[0]["params"] == {"limit": 100, "offset": 0}
+
+
+def test_g6_lenses_inputs_has_multiperiod_provenance_and_no_fwd_total() -> None:
+    from scripts.dalton.realrun import g6_lenses
+
+    repo_root = Path(__file__).resolve().parents[3]
+    fixture_path = repo_root / "tests" / "fixtures" / "dalton" / "g6" / "lenses_inputs.json"
+    payload = json.loads(fixture_path.read_text(encoding="utf-8"))
+    companies = payload["companies"]
+    assert len(companies) == 3
+    for comp in companies:
+        ticker = comp["ticker"]
+        assert ticker in g6_lenses.ANALYST_CREDIBILITY_BY_TICKER
+        ret = comp["return_score"]
+        assert "fwd_total" not in ret
+        for section in (comp["netcash"], ret, comp["earnings_quality"]):
+            for metric_key, item in section.items():
+                assert isinstance(item.get("accession"), str) and item["accession"].strip(), (
+                    f"{ticker}.{metric_key} missing accession"
+                )
+        # Multi-period / prior-year items must not point solely to the single current-quarter accession
+        single_current_acc = comp["filing"]["accession"]
+        for mp_section, mp_key in (
+            (ret, "annual"),
+            (ret, "ttm_div"),
+            (comp["earnings_quality"], "beginning_assets"),
+            (comp["earnings_quality"], "ni"),
+        ):
+            assert mp_section[mp_key]["accession"] != single_current_acc
+
+
+
+def test_pr_baseline_script_exists_and_executable() -> None:
+    import os
+
+    repo_root = Path(__file__).resolve().parents[3]
+    script = repo_root / "scripts" / "dalton" / "pr_baseline.sh"
+    assert script.is_file()
+    assert os.access(script, os.X_OK)
 

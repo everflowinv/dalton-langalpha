@@ -170,7 +170,7 @@ def _capture_rejection_banner_screenshot(
     from playwright.sync_api import sync_playwright
 
     svc_token = require_internal_service_token()
-    target_url = f"{frontend_url.rstrip('/')}/t/{thread_id}"
+    target_url = f"{frontend_url.rstrip('/')}/chat/t/{thread_id}"
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -184,14 +184,20 @@ def _capture_rejection_banner_screenshot(
             )
             page = context.new_page()
             resp = page.goto(target_url, wait_until="networkidle", timeout=30000)
-            if resp is None or resp.status >= 400:
-                page.goto(frontend_url.rstrip("/"), wait_until="networkidle", timeout=30000)
+            assert resp is not None and resp.status < 400, (
+                f"Failed to load frontend chat route {target_url}: status={getattr(resp, 'status', None)}"
+            )
 
             textarea = page.locator("textarea").first
-            if textarea.count() > 0 and textarea.is_visible():
-                textarea.fill("继续下一轮分析（日现金额度耗尽验证）")
-                textarea.press("Enter")
-                page.wait_for_timeout(2500)
+            textarea.wait_for(state="visible", timeout=15000)
+            textarea.fill("继续下一轮分析（日现金额度耗尽验证）")
+            textarea.press("Enter")
+
+            banner = page.get_by_text("今日预算").first
+            banner.wait_for(state="visible", timeout=15000)
+            assert banner.is_visible(), (
+                "Expected budget-exhausted banner ('今日预算') to be visible before taking screenshot"
+            )
 
             raw_bytes = page.screenshot(full_page=True)
         finally:
@@ -366,7 +372,10 @@ def main() -> int:
         #    until daily settled cash spend reaches `cap_usd`, then next turn via `POST /api/v1/threads/{thread_id}/messages`
         #    is rejected with HTTP 429 (`dalton_daily_budget`).
         subagent_turns: list[dict[str, Any]] = []
-        for turn_idx in range(1, 6):
+        spend_deadline = time.monotonic() + 600.0
+        turn_idx = 0
+        reached_cap = False
+        while time.monotonic() < spend_deadline:
             _, cur_today = client.get("/api/v1/dalton/budget/today")
             cur_settled = (
                 float(cur_today.get("settled_usd") or 0.0)
@@ -374,8 +383,10 @@ def main() -> int:
                 + float(cur_today.get("unreserved_usage_usd") or 0.0)
             )
             if cur_settled >= cap_usd and float(cur_today.get("open_reserved_usd") or 0.0) == 0.0:
+                reached_cap = True
                 break
 
+            turn_idx += 1
             prev_settled_only = float(cur_today.get("settled_usd") or 0.0)
             subagent_prompt = (
                 f"请在本轮响应中同时并行调用 3 次 `Task` 工具（3 个并行子任务均使用 `subagent_type='general-purpose'`，分别命名为 `批次{turn_idx}-A`、`批次{turn_idx}-B`、`批次{turn_idx}-C`）。\n"
@@ -400,8 +411,9 @@ def main() -> int:
             sub_summary = _extract_sse_summary(sub_events)
 
             after_turn_today = cur_today
-            deadline = time.time() + 120.0
-            while time.time() < deadline:
+            settle_deadline = time.monotonic() + 120.0
+            settled_confirmed = False
+            while time.monotonic() < settle_deadline:
                 time.sleep(2.0)
                 _, after_turn_today = client.get("/api/v1/dalton/budget/today")
                 new_settled_only = float(after_turn_today.get("settled_usd") or 0.0)
@@ -413,7 +425,13 @@ def main() -> int:
                     confirm_open = float(confirm_today.get("open_reserved_usd") or 0.0)
                     after_turn_today = confirm_today
                     if confirm_open == 0.0 and abs(confirm_settled - new_settled_only) < 1e-9:
+                        settled_confirmed = True
                         break
+
+            if not settled_confirmed:
+                raise TimeoutError(
+                    f"Timed out after 120s waiting for budget settlement after subagent turn {turn_idx}: {after_turn_today}"
+                )
 
             subagent_turns.append(
                 {
@@ -431,7 +449,13 @@ def main() -> int:
                 + float(after_turn_today.get("unreserved_usage_usd") or 0.0)
             )
             if settled_total >= cap_usd and float(after_turn_today.get("open_reserved_usd") or 0.0) == 0.0:
+                reached_cap = True
                 break
+
+        if not reached_cap:
+            raise TimeoutError(
+                f"Timed out after 600s waiting for settled cash spend to reach cap_usd={cap_usd} (turns={turn_idx})"
+            )
 
         _, budget_at_cap = client.get("/api/v1/dalton/budget/today")
         assert float(budget_at_cap.get("spent_usd") or 0.0) >= cap_usd, (

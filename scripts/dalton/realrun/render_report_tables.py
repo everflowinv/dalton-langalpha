@@ -304,24 +304,38 @@ def compare_legacy_report(
     if g3_path.is_file():
         g3_data = json.loads(g3_path.read_text(encoding="utf-8"))
         ev = g3_data.get("evaluation") or {}
-        sourced_total = ev.get("gold_sourced_total", ev.get("sourced_total"))
-        true_verified = ev.get("true_verified_in_gold_count", ev.get("true_verified_count"))
-        false_unverified = ev.get("false_unverified_in_gold_count", ev.get("false_unverified_count"))
-        sourced_uncertain = ev.get("sourced_uncertain_in_gold_count", ev.get("sourced_uncertain_count"))
-        if sourced_total is not None and true_verified is not None:
-            actual_num = int(true_verified)
-            actual_den = int(sourced_total)
-            actual_pct = round((actual_num / actual_den) * 100.0, 2) if actual_den > 0 else 0.0
-            for ratio_m in re.finditer(r"`?(\d+)\s*/\s*(\d+)\s*=\s*([0-9.]+)%`?", text):
-                claimed_num = int(ratio_m.group(1))
-                claimed_den = int(ratio_m.group(2))
-                claimed_pct = float(ratio_m.group(3))
-                if (claimed_num, claimed_den) != (actual_num, actual_den) or abs(claimed_pct - actual_pct) > 0.1:
-                    g3_eval_diffs.append(
-                        f"G3 recall: report claims {claimed_num}/{claimed_den} ({claimed_pct}%), "
-                        f"actual evidence is {actual_num}/{actual_den} ({actual_pct}%) "
-                        f"(false_unverified={false_unverified}, sourced_uncertain={sourced_uncertain})"
-                    )
+        designated_g3_fields = {
+            "gold_sourced_total": ev.get("gold_sourced_total", ev.get("sourced_total")),
+            "true_verified_in_gold_count": ev.get("true_verified_in_gold_count", ev.get("true_verified_count")),
+            "false_verified_in_gold_count": ev.get("false_verified_in_gold_count", ev.get("false_verified_count")),
+            "false_unverified_in_gold_count": ev.get("false_unverified_in_gold_count", ev.get("false_unverified_count")),
+            "sourced_uncertain_in_gold_count": ev.get("sourced_uncertain_in_gold_count", ev.get("sourced_uncertain_count")),
+        }
+        gen_block_m = re.search(
+            r"^[ \t]*"
+            + re.escape(GENERATED_START_MARKER)
+            + r"[ \t]*\r?\n(.*?)^[ \t]*"
+            + re.escape(GENERATED_END_MARKER)
+            + r"[ \t]*$",
+            text,
+            re.DOTALL | re.MULTILINE,
+        )
+        block_scope = gen_block_m.group(1) if gen_block_m else ""
+        if block_scope:
+            for field_name, actual_val in designated_g3_fields.items():
+                if actual_val is None:
+                    continue
+                field_m = re.search(
+                    rf"\(`{re.escape(field_name)}`\)\s*\|\s*`([^`]+)`\s*\|",
+                    block_scope,
+                )
+                if field_m:
+                    claimed_val = field_m.group(1).strip()
+                    if claimed_val != str(actual_val):
+                        g3_eval_diffs.append(
+                            f"G3 {field_name}: generated block claims {claimed_val}, "
+                            f"actual evidence is {actual_val}"
+                        )
 
     return {
         "report": str(p.relative_to(repo_root) if p.is_relative_to(repo_root) else p),
