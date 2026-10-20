@@ -66,7 +66,9 @@ if str(REPO_ROOT) not in sys.path:
 from scripts.dalton.realrun._common import (  # noqa: E402
     RealRunHttpClient,
     build_evidence_envelope,
+    default_shanghai_date,
     now_utc_iso,
+    preflight_realrun_script,
     write_evidence_and_summary,
 )
 from scripts.dalton.realrun.check_env import _read_bridge_token  # noqa: E402
@@ -327,6 +329,45 @@ def _query_preflight_and_signals(execution_id: str, workspace_id: str | None = N
     )
 
 
+SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
+
+
+def _parse_shanghai_datetime(raw_val: Any) -> datetime | None:
+    """Parse an ISO date or datetime string into an aware `Asia/Shanghai` `datetime` object."""
+    text = str(raw_val or "").strip()
+    if not text:
+        return None
+    normalized = text[:-1] + "+00:00" if text.endswith("Z") else text
+    try:
+        dt = datetime.fromisoformat(normalized)
+    except ValueError:
+        try:
+            dt = datetime.strptime(text[:10], "%Y-%m-%d")
+        except ValueError:
+            return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=SHANGHAI_TZ)
+    return dt.astimezone(SHANGHAI_TZ)
+
+
+def _signal_belongs_to_current_execution(
+    sig: dict[str, Any],
+    *,
+    exec_id: str,
+    trigger_started_shanghai: datetime,
+    preflight_signal_keys: set[str],
+) -> bool:
+    """Return True only if `sig` was produced by the current execution `exec_id` at or after `trigger_started_shanghai`."""
+    woken_id = str(sig.get("woken_execution_id") or "").strip()
+    if woken_id == exec_id:
+        return True
+    sig_key = str(sig.get("signal_key") or "").strip()
+    detected_dt = _parse_shanghai_datetime(sig.get("detected_at"))
+    if detected_dt is None or detected_dt < trigger_started_shanghai:
+        return False
+    return bool(sig_key and sig_key in preflight_signal_keys)
+
+
 def _check_live_internal_literature_today(
     client: RealRunHttpClient,
     *,
@@ -336,7 +377,9 @@ def _check_live_internal_literature_today(
     googl_ws_id: str,
     bridge_base_url: str = "http://127.0.0.1:8960",
 ) -> dict[str, Any]:
-    """Check today's internal literature (in Asia/Shanghai) via authenticated MCP bridge and trigger internal probe when docs exist (Review Item 9)."""
+    """Check today's internal literature (using `Asia/Shanghai` `datetime` objects) via authenticated MCP bridge
+    and trigger internal probe when docs exist, scoping signal assertions strictly to the current execution (Review Item 9).
+    """
     token = _read_bridge_token()
     if not token:
         raise RuntimeError(
@@ -344,7 +387,9 @@ def _check_live_internal_literature_today(
             "refusing to skip internal literature check silently (Review Item 9)."
         )
     mcp_url = f"{bridge_base_url.rstrip('/')}/mcp/{token}"
-    today_shanghai = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d")
+    now_shanghai = datetime.now(SHANGHAI_TZ)
+    today_shanghai_date = now_shanghai.date()
+    today_shanghai = today_shanghai_date.isoformat()
     counts_by_ticker: dict[str, int] = {"META": 0, "GOOGL": 0}
 
     with httpx.Client(timeout=20.0, trust_env=False) as http_client:
@@ -392,10 +437,10 @@ def _check_live_internal_literature_today(
                         if isinstance(candidates, list):
                             for c in candidates:
                                 if isinstance(c, dict):
-                                    pub_at = str(
-                                        c.get("published_at") or c.get("date") or c.get("created_at") or ""
+                                    pub_dt = _parse_shanghai_datetime(
+                                        c.get("published_at") or c.get("date") or c.get("created_at")
                                     )
-                                    if pub_at.startswith(today_shanghai):
+                                    if pub_dt is not None and pub_dt.date() == today_shanghai_date:
                                         counts_by_ticker[ticker] += 1
 
     meta_new = counts_by_ticker["META"]
@@ -407,6 +452,9 @@ def _check_live_internal_literature_today(
             "meta_new_docs_count": 0,
             "googl_new_docs_count": 0,
             "has_new_docs_today": False,
+            "status": "G4 场景②未完成",
+            "incomplete_reason": "当日无新增内部文献（G4 场景②未完成）",
+            "triggered_runs": [],
         }
 
     triggered_runs: list[dict[str, Any]] = []
@@ -416,6 +464,7 @@ def _check_live_internal_literature_today(
     ):
         if new_cnt <= 0:
             continue
+        trigger_started_shanghai = datetime.now(SHANGHAI_TZ)
         st_trig, trig_body = client.request("POST", f"/api/v1/automations/{watch_id}/trigger")
         assert st_trig == 200 and isinstance(trig_body, dict), (
             f"Internal literature trigger failed for {ticker}: {st_trig} {trig_body}"
@@ -423,14 +472,27 @@ def _check_live_internal_literature_today(
         exec_id = str(trig_body.get("execution_id") or trig_body.get("automation_execution_id"))
         exec_row = _wait_for_execution(client, watch_id, exec_id, timeout_s=180.0)
         db_state = _query_preflight_and_signals(exec_id, ws_id)
+        pf_signals = ((db_state.get("preflight_log") or {}).get("signals")) or []
+        preflight_signal_keys = {
+            str(ps.get("signal_key") or "").strip()
+            for ps in pf_signals
+            if isinstance(ps, dict) and ps.get("signal_key")
+        }
         internal_signals = [
             s
             for s in (db_state.get("signals") or [])
             if isinstance(s, dict)
             and (s.get("probe") == "internal" or str(s.get("signal_key") or "").startswith("internal:"))
+            and _signal_belongs_to_current_execution(
+                s,
+                exec_id=exec_id,
+                trigger_started_shanghai=trigger_started_shanghai,
+                preflight_signal_keys=preflight_signal_keys,
+            )
         ]
         assert len(internal_signals) >= 1, (
-            f"Expected >= 1 internal literature signal in dalton_signals for {ticker} when {new_cnt} docs exist today, "
+            f"Expected >= 1 internal literature signal produced by current execution {exec_id} "
+            f"(since {trigger_started_shanghai.isoformat()}) in dalton_signals for {ticker} when {new_cnt} docs exist today, "
             f"got signals={db_state.get('signals')}"
         )
         triggered_runs.append(
@@ -449,6 +511,7 @@ def _check_live_internal_literature_today(
         "meta_new_docs_count": meta_new,
         "googl_new_docs_count": googl_new,
         "has_new_docs_today": True,
+        "status": "completed",
         "triggered_runs": triggered_runs,
     }
 
@@ -456,11 +519,13 @@ def _check_live_internal_literature_today(
 def main() -> int:
     parser = argparse.ArgumentParser(description="G4 Real-Run Evidence Generator (P0J §5 G4)")
     parser.add_argument("--backend", default="http://127.0.0.1:8000")
-    parser.add_argument("--date", default="20261019")
+    parser.add_argument("--date", default=default_shanghai_date())
     parser.add_argument("--pm-user", default="realrun-pm-a")
     parser.add_argument("--other-user", default="realrun-user-b")
     parser.add_argument("--record", action="store_true", help="Write evidence JSON and summary under var/dalton/")
     args = parser.parse_args()
+
+    preflight_realrun_script("G4", record=args.record, backend=args.backend)
 
     started_at = now_utc_iso()
     pm_user = args.pm_user
@@ -905,14 +970,20 @@ def main() -> int:
 
         # Scenario 5: Trigger dalton-director-daily when no actionable items remain -> Zero-Token Skip
         print("[G4] Scenario 5: Triggering dalton-director-daily when 0 actionable items remain ...", flush=True)
+        _, budget_before_s5 = client.request("GET", "/api/v1/dalton/budget/today")
+        spent_before_s5 = float((budget_before_s5 or {}).get("spent_usd") or 0.0)
         st_s5, s5_trig = client.request("POST", f"/api/v1/automations/{director_daily_id}/trigger")
         assert st_s5 == 200, f"Scenario 5 trigger failed: {st_s5} {s5_trig}"
         s5_exec_id = str(s5_trig.get("execution_id") or s5_trig.get("automation_execution_id"))
         s5_exec = _wait_for_execution(client, director_daily_id, s5_exec_id, timeout_s=60.0)
         s5_db = _query_preflight_and_signals(s5_exec_id, None)
+        _, budget_after_s5 = client.request("GET", "/api/v1/dalton/budget/today")
+        spent_after_s5 = float((budget_after_s5 or {}).get("spent_usd") or 0.0)
+        s5_cash_spend_usd = max(0.0, round(spent_after_s5 - spent_before_s5, 6))
+        assert s5_cash_spend_usd == 0.0, f"Expected Scenario 5 zero-token skip to spend $0.00, got ${s5_cash_spend_usd:.6f}"
         print(
             f"[G4] Scenario 5 done: exec_status={s5_exec.get('status')} "
-            f"preflight={((s5_db.get('preflight_log') or {}).get('reason'))}",
+            f"preflight={((s5_db.get('preflight_log') or {}).get('reason'))} cash_spend=${s5_cash_spend_usd:.2f}",
             flush=True,
         )
 
@@ -941,14 +1012,25 @@ def main() -> int:
                 max_events=2500,
             )
             assert st_sub == 200 and sub_err is None, f"Cash spend turn {turn_idx} failed: {st_sub} {sub_err}"
-            for _ in range(30):
+            settle_deadline = time.monotonic() + 60.0
+            settled = False
+            while time.monotonic() < settle_deadline:
                 _, poll_today = client.request("GET", "/api/v1/dalton/budget/today")
-                if float((poll_today or {}).get("spent_usd") or 0.0) >= 0.01 and float((poll_today or {}).get("open_reserved_usd") or 0.0) == 0.0:
+                if float((poll_today or {}).get("open_reserved_usd") or 0.0) == 0.0:
+                    settled = True
                     break
                 time.sleep(2.0)
+            if not settled:
+                raise TimeoutError(
+                    f"Timed out after 60s waiting for open_reserved_usd == 0.0 after turn {turn_idx}"
+                )
 
         _, budget_before_s6 = client.request("GET", "/api/v1/dalton/budget/today")
         spent_before_s6 = float((budget_before_s6 or {}).get("spent_usd") or 0.0)
+        if spent_before_s6 < 0.01:
+            raise TimeoutError(
+                f"Failed to accumulate >= $0.01 cash spend before Scenario 6: spent_usd={spent_before_s6}"
+            )
         print(f"[G4] Scenario 6 cash spend before lowering cap: ${spent_before_s6:.6f}", flush=True)
         st_cap_low, cap_low_body = client.request(
             "PUT",
@@ -998,9 +1080,11 @@ def main() -> int:
         "skip_reason": s2_exec.get("skip_reason"),
         "preflight_decision": (s2_db.get("preflight_log") or {}).get("decision"),
         "preflight_reason": (s2_db.get("preflight_log") or {}).get("reason"),
+        "internal_literature_subitem": internal_lit_check,
+        "g4_scenario_2_status": (
+            "completed" if internal_lit_check["has_new_docs_today"] else "G4 场景②未完成"
+        ),
     }
-    if internal_lit_check["has_new_docs_today"]:
-        scenario_2_dict["internal_literature_subitem"] = internal_lit_check
 
     scenario_results = {
         "test_user_ids": [pm_user, other_user],
@@ -1058,6 +1142,7 @@ def main() -> int:
             "skip_reason": s5_exec.get("skip_reason"),
             "preflight_decision": (s5_db.get("preflight_log") or {}).get("decision"),
             "preflight_reason": (s5_db.get("preflight_log") or {}).get("reason"),
+            "cash_spend_usd": s5_cash_spend_usd,
         },
         "scenario_6_shared_budget_exhausted_and_once_defer": {
             "spent_usd_before_cap_lower": spent_before_s6,
@@ -1127,9 +1212,11 @@ def main() -> int:
     if internal_lit_check["has_new_docs_today"]:
         s2_note += (
             f"；内部文献子场景：当天有新资料（`meta_new_docs={internal_lit_check['meta_new_docs_count']}`, "
-            f"`googl_new_docs={internal_lit_check['googl_new_docs_count']}`），触发自动化并产生信号 "
-            f"`{len(internal_lit_check['triggered_executions'])}` 次"
+            f"`googl_new_docs={internal_lit_check['googl_new_docs_count']}`），触发自动化并产生本次执行信号 "
+            f"`{len(internal_lit_check['triggered_runs'])}` 次"
         )
+    else:
+        s2_note += "；内部文献子场景：当日无新增内部文献（**G4 场景②未完成**）"
 
     extra_md = [
         (
@@ -1160,7 +1247,7 @@ def main() -> int:
         (
             f"场景 ⑤ 每日研究总监零信号跳过：`dalton-director-daily` (`exec={s5_exec_id[:8]}…`) 预检决策 "
             f"`{((s5_db.get('preflight_log') or {}).get('decision'))}` / `{((s5_db.get('preflight_log') or {}).get('reason'))}`，"
-            f"执行状态 `{s5_exec.get('status')}` (`{s5_exec.get('skip_reason')}`)，零待办事项时直接跳过，大模型花费 `$0.00`"
+            f"执行状态 `{s5_exec.get('status')}` (`{s5_exec.get('skip_reason')}`)，零待办事项时直接跳过，大模型花费 `${s5_cash_spend_usd:.2f}`"
         ),
         (
             f"场景 ⑥ 共享日预算熔断与一次性任务顺延：`dalton-googl-watch` 与 `dalton-googl-earn-2q26-tm3` 均以 "
@@ -1178,7 +1265,14 @@ def main() -> int:
         key_findings.append(
             (
                 "Scenario 2 (Internal literature subscenario)",
-                f"meta_new_docs={internal_lit_check['meta_new_docs_count']}, googl_new_docs={internal_lit_check['googl_new_docs_count']}, triggered_executions={len(internal_lit_check['triggered_executions'])}",
+                f"meta_new_docs={internal_lit_check['meta_new_docs_count']}, googl_new_docs={internal_lit_check['googl_new_docs_count']}, triggered_runs={len(internal_lit_check['triggered_runs'])}",
+            )
+        )
+    else:
+        key_findings.append(
+            (
+                "Scenario 2 (Internal literature subscenario)",
+                "G4 场景②未完成（当日无新增内部文献）",
             )
         )
     key_findings.extend(
@@ -1186,7 +1280,7 @@ def main() -> int:
             ("Scenario 3a (dalton_agenda_note)", f"agenda v{latest_ag_ver.get('version_no')} (source={latest_ag_ver.get('source')}, questions={len(ag_open_questions)})"),
             ("Scenario 3b (Due validation V-201 wake)", f"status={s3_exec.get('status')}, reason={(s3_db.get('preflight_log') or {}).get('reason')}, verdict={s3_verdicts[0].get('verdict_id')} ({s3_verdicts[0].get('word')})"),
             ("Scenario 4 (Coverage board open signals & 2-user isolation)", json.dumps({"open_signals_by_ticker": open_signals_by_ticker, "two_user_isolation": two_user_isolation})),
-            ("Scenario 5 (Director daily zero-signal skip)", f"status={s5_exec.get('status')}, reason={(s5_db.get('preflight_log') or {}).get('reason')}"),
+            ("Scenario 5 (Director daily zero-signal skip)", f"status={s5_exec.get('status')}, reason={(s5_db.get('preflight_log') or {}).get('reason')}, cash_spend_usd=${s5_cash_spend_usd:.2f}"),
             ("Scenario 6 (Budget exhausted & once-task defer)", f"watch_reason={(s6_w_db.get('preflight_log') or {}).get('reason')}, tm3_status={tm3_after_body.get('status')}, next_run_at={tm3_after_body.get('next_run_at')}"),
         ]
     )

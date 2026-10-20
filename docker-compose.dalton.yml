@@ -1,5 +1,10 @@
 services:
   backend:
+    build:
+      context: .
+      dockerfile: scripts/dalton/Dockerfile.dalton
+      args:
+        BUILD_GIT_SHA: ${BUILD_GIT_SHA:-}
     entrypoint: ["/usr/bin/tini", "-s", "--", "/app/scripts/dalton/docker_entrypoint_dalton.sh"]
     command: ["uv", "run", "python", "server.py", "--host", "0.0.0.0", "--port", "8000", "--reload"]
     mem_limit: 2g
@@ -8,7 +13,6 @@ services:
       REDIS_URL: "redis://:${REDIS_PASSWORD:-redis}@redis:6379/0"
     volumes:
       - .:/host_repo:ro
-      - ./.git:/app/.git:ro
       - ./agent_config.dalton.yaml:/app/agent_config.dalton.yaml:ro
       - ./workflows:/app/workflows:ro
       - ./config/dalton:/app/config/dalton:ro

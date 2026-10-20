@@ -45,8 +45,11 @@ if str(REPO_ROOT) not in sys.path:
 from scripts.dalton.realrun._common import (  # noqa: E402
     RealRunHttpClient,
     build_evidence_envelope,
+    default_shanghai_date,
     new_test_user_id,
     now_utc_iso,
+    preflight_realrun_script,
+    require_internal_service_token,
     write_evidence_and_summary,
 )
 from scripts.dalton.realrun.journal_dump import build_dsn_from_env  # noqa: E402
@@ -155,174 +158,66 @@ def _fetch_publish_requests_for_thread(thread_id: str) -> list[dict[str, Any]]:
 def _capture_rejection_banner_screenshot(
     *,
     output_path: Path,
-    rejected_status: int,
-    rejected_body: dict[str, Any],
-    budget_today: dict[str, Any],
-) -> dict[str, Any]:
-    """Render the frontend rejection alert banner + DaltonBudgetCard state via headless Chrome and save PNG."""
+    frontend_url: str,
+    user_id: str,
+    workspace_id: str,
+    thread_id: str,
+) -> tuple[dict[str, Any], bytes]:
+    """Open the live frontend application (`frontend_url`) in headless Chromium as `user_id`,
+    trigger the budget-exhausted chat submission on the live page so the real UI renders the
+    rejection alert banner, and return `(metadata, png_bytes)` without writing to disk before the gate.
+    """
     from playwright.sync_api import sync_playwright
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    detail = rejected_body.get("detail") if isinstance(rejected_body, dict) else {}
-    if not isinstance(detail, dict):
-        detail = {"message": str(rejected_body)}
+    svc_token = require_internal_service_token()
+    target_url = f"{frontend_url.rstrip('/')}/t/{thread_id}"
 
-    msg = str(detail.get("message") or "")
-    used_credits = detail.get("used_credits")
-    credit_limit = detail.get("credit_limit")
-    remaining_credits = detail.get("remaining_credits")
-    retry_after = detail.get("retry_after")
-    cap_usd = float(budget_today.get("cap_usd") or 0.0)
-    spent_usd = float(budget_today.get("spent_usd") or 0.0)
-    settled_usd = float(budget_today.get("settled_usd") or 0.0)
-    journal_cash_usd = float(budget_today.get("journal_cash_usd") or 0.0)
-    notional_usd = float(budget_today.get("subscription_notional_usd") or 0.0)
-
-    html = f"""<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8" />
-<title>Dalton Daily Budget Exhausted — HTTP {rejected_status}</title>
-<style>
-  :root {{
-    --color-bg-page: #0b0f17;
-    --color-bg-card: #111827;
-    --color-border-default: #1f2937;
-    --color-text-primary: #f9fafb;
-    --color-text-secondary: #d1d5db;
-    --color-text-tertiary: #9ca3af;
-    --color-loss: #ef4444;
-  }}
-  body {{
-    margin: 0;
-    padding: 32px;
-    background: var(--color-bg-page);
-    color: var(--color-text-primary);
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-  }}
-  .container {{
-    max-width: 840px;
-    margin: 0 auto;
-    display: flex;
-    flex-direction: column;
-    gap: 20px;
-  }}
-  .card {{
-    background: var(--color-bg-card);
-    border: 1px solid var(--color-border-default);
-    border-radius: 10px;
-    padding: 20px;
-  }}
-  .banner {{
-    background: rgba(239, 68, 68, 0.12);
-    border: 1px solid rgba(239, 68, 68, 0.45);
-    border-radius: 10px;
-    padding: 18px 20px;
-    display: flex;
-    flex-direction: column;
-    gap: 10px;
-  }}
-  .banner-title {{
-    color: #fca5a5;
-    font-weight: 600;
-    font-size: 15px;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-  }}
-  .banner-msg {{
-    color: #fee2e2;
-    font-size: 14px;
-    line-height: 1.55;
-  }}
-  .meta {{
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-    font-size: 12px;
-    color: var(--color-text-tertiary);
-    display: flex;
-    flex-wrap: wrap;
-    gap: 16px;
-  }}
-  .bar-bg {{
-    width: 100%;
-    height: 10px;
-    background: #1f2937;
-    border-radius: 999px;
-    overflow: hidden;
-    margin: 10px 0;
-  }}
-  .bar-fill {{
-    width: 100%;
-    height: 100%;
-    background: var(--color-loss);
-  }}
-</style>
-</head>
-<body>
-  <div class="container">
-    <div class="card" data-testid="dalton-budget-card">
-      <div style="display:flex;justify-content:space-between;align-items:center;">
-        <span style="font-weight:600;font-size:15px;">Dalton 本地日美元预算</span>
-        <span class="meta">{budget_today.get("day")} ({budget_today.get("timezone")})</span>
-      </div>
-      <div style="display:flex;justify-content:space-between;font-size:13px;margin-top:12px;">
-        <span>今日已用 <strong>${spent_usd:.6f}</strong> / 日额度 <strong>${cap_usd:.4f}</strong></span>
-        <span class="meta">剩余 $0.0000</span>
-      </div>
-      <div class="bar-bg"><div class="bar-fill"></div></div>
-      <div class="meta">
-        <span>已结算(子智能体/对话)：${settled_usd:.6f}</span>
-        <span>日志直调现金(探测等)：${journal_cash_usd:.6f}</span>
-        <span>订阅名义用量（不计入现金额度）：${notional_usd:.6f}</span>
-      </div>
-      <div style="font-size:12px;color:#9ca3af;margin-top:8px;">
-        注：设置页填写的现金类 BYOK Key 同样计入本地日美元现金额度（L24）
-      </div>
-    </div>
-
-    <div class="banner" role="alert" data-testid="chat-rate-limit-banner">
-      <div class="banner-title">
-        <span>对话请求被拒绝 — HTTP {rejected_status} ({detail.get("type")})</span>
-        <span class="meta">Retry-After: {retry_after}s</span>
-      </div>
-      <div class="banner-msg">{msg}</div>
-      <div class="meta">
-        <span>type: {detail.get("type")}</span>
-        <span>used_credits: {used_credits}</span>
-        <span>credit_limit: {credit_limit}</span>
-        <span>remaining_credits: {remaining_credits}</span>
-      </div>
-    </div>
-  </div>
-</body>
-</html>
-"""
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, channel="chrome")
+        browser = p.chromium.launch(headless=True)
         try:
-            page = browser.new_page(viewport={"width": 960, "height": 420})
-            page.set_content(html, wait_until="load")
+            context = browser.new_context(
+                viewport={"width": 1280, "height": 800},
+                extra_http_headers={
+                    "X-User-Id": user_id,
+                    "X-Service-Token": svc_token,
+                },
+            )
+            page = context.new_page()
+            resp = page.goto(target_url, wait_until="networkidle", timeout=30000)
+            if resp is None or resp.status >= 400:
+                page.goto(frontend_url.rstrip("/"), wait_until="networkidle", timeout=30000)
+
+            textarea = page.locator("textarea").first
+            if textarea.count() > 0 and textarea.is_visible():
+                textarea.fill("继续下一轮分析（日现金额度耗尽验证）")
+                textarea.press("Enter")
+                page.wait_for_timeout(2500)
+
             raw_bytes = page.screenshot(full_page=True)
         finally:
             browser.close()
 
-    if "--record" in sys.argv:
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_bytes(raw_bytes)
-    return {
-        "screenshot_path": str(output_path.relative_to(REPO_ROOT)),
-        "bytes": len(raw_bytes),
-        "sha256": hashlib.sha256(raw_bytes).hexdigest(),
-    }
+    return (
+        {
+            "screenshot_path": str(output_path.relative_to(REPO_ROOT)),
+            "frontend_url": target_url,
+            "bytes": len(raw_bytes),
+            "sha256": hashlib.sha256(raw_bytes).hexdigest(),
+        },
+        raw_bytes,
+    )
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="G1 Real-Run Evidence Generator (P0I §7 G1)")
     parser.add_argument("--backend", default="http://127.0.0.1:8000")
+    parser.add_argument("--frontend", default="http://localhost:5173")
     parser.add_argument("--cap-usd", type=float, default=0.30)
-    parser.add_argument("--date", default="20261019")
+    parser.add_argument("--date", default=default_shanghai_date())
     parser.add_argument("--record", action="store_true", help="Write evidence JSON and summary under var/dalton/")
     args = parser.parse_args()
+
+    preflight_realrun_script("G1", record=args.record, backend=args.backend)
 
     started_at = now_utc_iso()
     base_user_id = new_test_user_id("g1")
@@ -573,11 +468,12 @@ def main() -> int:
             / f"realrun-{args.date}"
             / "g1_budget_exhausted_banner.png"
         )
-        screenshot_info = _capture_rejection_banner_screenshot(
+        screenshot_info, screenshot_bytes = _capture_rejection_banner_screenshot(
             output_path=screenshot_path,
-            rejected_status=rejected_status,
-            rejected_body=rejected_body or {},
-            budget_today=budget_at_cap,
+            frontend_url=args.frontend,
+            user_id=user_a,
+            workspace_id=workspace_id,
+            thread_id=thread_id,
         )
 
     # 7. Two-user budget isolation: while user_a is rejected with HTTP 429, user_b (normal daily cap)
@@ -771,6 +667,9 @@ def main() -> int:
         notes=notes,
         record=args.record,
     )
+    if args.record:
+        screenshot_path.parent.mkdir(parents=True, exist_ok=True)
+        screenshot_path.write_bytes(screenshot_bytes)
     print(f"G1 evidence (record={args.record}): {written_raw} (sha256={sha})")
     print(f"G1 summary  (record={args.record}): {written_md}")
     return 0

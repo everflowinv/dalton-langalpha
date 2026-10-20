@@ -45,7 +45,9 @@ if str(REPO_ROOT) not in sys.path:
 from scripts.dalton.realrun._common import (  # noqa: E402
     RealRunHttpClient,
     build_evidence_envelope,
+    default_shanghai_date,
     now_utc_iso,
+    preflight_realrun_script,
     write_evidence_and_summary,
 )
 
@@ -54,10 +56,6 @@ BROKER_BASE_URL = "http://127.0.0.1:18789/dalton-broker/v1"
 BROKER_STATE_DIR = Path.home() / ".openclaw" / "state" / "plugins" / "dalton-langalpha-broker"
 BROKER_TOKEN_PATH = BROKER_STATE_DIR / "broker.token"
 BROKER_INVOCATIONS_PATH = BROKER_STATE_DIR / "invocations.json"
-
-REALRUN_VAR_DIR = REPO_ROOT / "var" / "dalton-realrun"
-INITIATE_CACHE_PATH = REALRUN_VAR_DIR / "g5_2_initiate.json"
-CALLBACK_URL_FILE = REALRUN_VAR_DIR / "g5_2_callback_url.txt"
 
 
 def _sanitize_oauth_dict(obj: Any) -> Any:
@@ -93,9 +91,10 @@ def _read_broker_invocation_entry(invocation_id: str) -> dict[str, Any] | None:
 
 
 def _wait_for_broker_json_health(
-    client: httpx.Client, prev_started_at: str | None = None
+    client: httpx.Client, prev_started_at: str | None = None, timeout_s: float = 180.0
 ) -> dict[str, Any]:
-    for _ in range(180):
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
         try:
             r = client.get(f"{BROKER_BASE_URL}/health", timeout=5.0)
             if r.status_code == 200 and "application/json" in r.headers.get("content-type", ""):
@@ -107,7 +106,9 @@ def _wait_for_broker_json_health(
         except Exception:
             pass
         time.sleep(1.0)
-    raise RuntimeError("Timed out waiting for OpenClaw broker /dalton-broker/v1/health JSON")
+    raise TimeoutError(
+        f"Timed out after {timeout_s}s waiting for OpenClaw broker /dalton-broker/v1/health JSON"
+    )
 
 
 def _run_g5_1_broker() -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -148,12 +149,18 @@ def _run_g5_1_broker() -> tuple[dict[str, Any], list[dict[str, Any]]]:
 
         disk_entry_disconnect: dict[str, Any] | None = None
         disk_status = None
-        for _ in range(30):
+        disconnect_deadline = time.monotonic() + 30.0
+        while time.monotonic() < disconnect_deadline:
             disk_entry_disconnect = _read_broker_invocation_entry(disconnect_inv_id)
             disk_status = (disk_entry_disconnect or {}).get("status")
             if disk_status == "completed":
                 break
             time.sleep(0.5)
+        if disk_status != "completed":
+            raise TimeoutError(
+                f"Timed out after 30s waiting for disconnect invocation {disconnect_inv_id} "
+                f"to reach 'completed' (got {disk_status!r})"
+            )
 
         replay_resp = client.post(
             f"{BROKER_BASE_URL}/chat/completions",
@@ -315,7 +322,7 @@ def _run_g5_1_broker() -> tuple[dict[str, Any], list[dict[str, Any]]]:
 def _initiate_g5_2_for_user(base_url: str, user_id: str, *, record: bool = False) -> dict[str, Any]:
     """Initiate Antigravity OAuth login for `user_id`."""
     with RealRunHttpClient(
-        base_url=base_url, user_id=user_id, timeout_s=30.0, skip_env_preflight=True
+        base_url=base_url, user_id=user_id, timeout_s=30.0, record=record
     ) as client:
         client.ensure_user()
         st_init, body_init = client.post("/api/v1/oauth/antigravity/initiate")
@@ -336,11 +343,6 @@ def _initiate_g5_2_for_user(base_url: str, user_id: str, *, record: bool = False
             "state_prefix": expected_state[:10],
             "authorize_url": authorize_url,
         }
-        if record:
-            REALRUN_VAR_DIR.mkdir(parents=True, exist_ok=True)
-            INITIATE_CACHE_PATH.write_text(
-                json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-            )
         return payload
 
 
@@ -349,22 +351,22 @@ def _run_g5_2_antigravity(
     user_a: str,
     user_b: str,
     callback_url: str | None = None,
+    *,
+    record: bool = False,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """Run G5.2 Antigravity Docker manual callback paste + 4-round Gemini tool calling + 2-user isolation."""
     resolved_callback = (callback_url or "").strip()
-    if not resolved_callback and CALLBACK_URL_FILE.is_file():
-        resolved_callback = CALLBACK_URL_FILE.read_text(encoding="utf-8").strip()
     if not resolved_callback:
         raise RuntimeError(
-            "G5.2 requires a live browser callback URL on every run (no cached receipt fallback allowed). "
+            "G5.2 requires a live browser callback URL on every run (no cached receipt or file fallback allowed). "
             "Run `--mode g5.2-initiate` first, complete the Google OAuth flow in the browser, and pass "
             "the redirected callback URL via `--callback-url <url>`."
         )
 
     with RealRunHttpClient(
-        base_url=base_url, user_id=user_a, timeout_s=240.0
+        base_url=base_url, user_id=user_a, timeout_s=240.0, record=record
     ) as client_a, RealRunHttpClient(
-        base_url=base_url, user_id=user_b, timeout_s=60.0
+        base_url=base_url, user_id=user_b, timeout_s=60.0, record=record
     ) as client_b:
         client_a.ensure_user()
         client_b.ensure_user()
@@ -454,8 +456,6 @@ def _run_g5_2_antigravity(
                 "body": sanitized_cb_body,
             },
         }
-        if CALLBACK_URL_FILE.is_file():
-            CALLBACK_URL_FILE.unlink()
 
         # Also run missing-state / wrong-state 400 checks on user_b (without touching user_a's connected token)
         init_b_status, init_b_body = client_b.post("/api/v1/oauth/antigravity/initiate")
@@ -682,7 +682,7 @@ def _run_g5_2_antigravity(
 def main() -> int:
     parser = argparse.ArgumentParser(description="G5 Broker & Antigravity OAuth Real-Run Verification")
     parser.add_argument("--backend", default=DEFAULT_BACKEND_URL, help="Backend base URL")
-    parser.add_argument("--date", default="20261019", help="Evidence date folder YYYYMMDD")
+    parser.add_argument("--date", default=default_shanghai_date(), help="Evidence date folder YYYYMMDD")
     parser.add_argument(
         "--mode",
         choices=("all", "g5.1", "g5.2", "g5.2-initiate"),
@@ -703,6 +703,8 @@ def main() -> int:
 
     user_a = "realrun-pm-a"
     user_b = "realrun-user-b"
+
+    preflight_realrun_script("G5", record=args.record, backend=args.backend, user_id=user_a)
 
     if args.mode == "g5.2-initiate":
         init_info = _initiate_g5_2_for_user(args.backend, user_a, record=args.record)
@@ -775,7 +777,7 @@ def main() -> int:
     if args.mode in ("all", "g5.2"):
         t0_2 = now_utc_iso()
         g5_2_payload, g5_2_assertions = _run_g5_2_antigravity(
-            args.backend, user_a, user_b, callback_url=args.callback_url
+            args.backend, user_a, user_b, callback_url=args.callback_url, record=args.record
         )
         t1_2 = now_utc_iso()
         env_g5_2 = build_evidence_envelope(

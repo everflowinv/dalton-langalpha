@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Shared utilities for Dalton real-run evidence scripts (P0I §2.1–§2.2, P0J §1.2–§1.6, L37, L40–L42).
+"""Shared utilities for Dalton real-run evidence scripts (P0I §2.1–§2.2, P0J §1.2–§1.6, §8.1 #13, L37, L40–L42).
 
 Responsibilities:
 1. Build the mandatory v2 evidence envelope (`evidence_version: 2`, `git_sha`, `git_dirty`,
@@ -9,14 +9,15 @@ Responsibilities:
    `conversation_usages`, `assertions`, `summary_title`, `key_findings`, `notes`,
    `valid`, `invalid_reasons`).
 2. Validate `synthetic` declarations against the 6 allowed injection categories and the
-   explicit `COMMITTED_TEST_HOOKS` registry with exact category/entry_point matching (P0J §1.5, L37).
-3. Enforce clean working tree (excluding no tracked directories), merged-into-main ancestry,
-   live backend version parity, live `check_env` pass, and `INTERNAL_SERVICE_TOKEN`
-   per-user identity self-check (L40, L41).
-4. Support `--record`: without `--record`, perform dry-run verification without writing any files;
-   with `--record`, write raw evidence JSON and runtime summary Markdown exclusively under `var/dalton/`,
-   and provide a one-shot command to render summaries from `var/dalton/` into
-   `docs/dalton/dev-guide/trial-runs/realrun-<YYYYMMDD>/G<N>.md` after all families complete (L42).
+   explicit `COMMITTED_TEST_HOOKS` registry with full-string (`fullmatch`) and exact matching (P0J §1.5, L37).
+3. Enforce `INTERNAL_SERVICE_TOKEN` per-user identity and live backend health on all runs (L40),
+   and enforce the formal evidence gate (`--record`: clean working tree, merged into `origin/dalton/main`
+   after `git fetch`, backend SHA/dirty parity, and pre-run `check_env` pass) before running or writing
+   any evidence (P0J §1.3, §1.4, §8.1 #13, L41).
+4. Support `--record`: without `--record`, run in debug mode (`DEBUG RUN — NOT EVIDENCE` printed at start)
+   and write zero files; with `--record`, write raw evidence JSON and runtime summary Markdown exclusively
+   under `var/dalton/`, and provide `--render-docs` to render summaries (and G6 comparison doc) from
+   `var/dalton/` into `docs/dalton/dev-guide/trial-runs/` after all families complete (L42).
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ import argparse
 from collections.abc import Callable
 from datetime import datetime, timezone
 import hashlib
+import inspect
 import json
 import os
 from pathlib import Path
@@ -33,6 +35,7 @@ import subprocess
 import sys
 from typing import Any
 import uuid
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 import httpx
@@ -57,14 +60,11 @@ COMMITTED_TEST_HOOKS: dict[str, dict[str, str]] = {
     "scripts/dalton/researchdata_bridge.py": {
         "module": "scripts/dalton/researchdata_bridge.py",
         "code_location": "scripts/dalton/researchdata_bridge.py:168-190",
-        "flags": "--simulate-upstream / DALTON_BRIDGE_TEST_MODE / DALTON_BRIDGE_TEST_DELAY_S",
-        "description": "Simulate >240s upstream delay or synthetic upstream errors on researchdata_bridge.py (G7.A / G7.C).",
-    },
-    "integrations/openclaw/dalton-langalpha-broker": {
-        "module": "integrations/openclaw/dalton-langalpha-broker/src/invoke.mjs",
-        "code_location": "integrations/openclaw/dalton-langalpha-broker/src/invoke.mjs:287-382",
-        "flags": "replayOnly / crash-before-clear",
-        "description": "Broker v2 idempotency journal pending/indeterminate test hook (G5.A).",
+        "flags": "DALTON_BRIDGE_TEST_MODE / DALTON_BRIDGE_TEST_DELAY_S",
+        "description": (
+            "Simulate >240s upstream delay on researchdata_bridge.py via "
+            "DALTON_BRIDGE_TEST_MODE and DALTON_BRIDGE_TEST_DELAY_S (G7.A)."
+        ),
     },
 }
 
@@ -86,21 +86,36 @@ _EMAIL_PATTERN = re.compile(
     r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"
 )
 
-_SETTINGS_BUDGET_RE = re.compile(r"^(?:PUT\s+)?/api/v1/dalton/budget$")
+_SETTINGS_BUDGET_RE = re.compile(r"(?:PUT\s+)?/api/v1/dalton/budget")
 _KNOWLEDGE_AGENDA_RE = re.compile(
-    r"^(?:(?:(?:POST|PUT)\s+)?/api/v1/dalton/knowledge/[^/\s]+/agenda(?:/(?:import|items))?|dalton_agenda_(?:note|update))$"
+    r"(?:(?:POST|PUT)\s+)?/api/v1/dalton/knowledge/[^/\s]+/agenda(?:/(?:import|items))?|dalton_agenda_(?:note|update)"
 )
 _KNOWLEDGE_IMPORT_ROUTE_RE = re.compile(
-    r"(?:POST\s+)?/api/v1/dalton/knowledge/[^/\s]+/(?:[A-Za-z0-9_{}-]+/)?import\b"
+    r"(?:POST\s+)?/api/v1/dalton/knowledge/[^/\s]+/(?:[A-Za-z0-9_{}-]+/)?import"
+    r"(?:\s+\(tests/fixtures/[A-Za-z0-9_./\-]+\.json(?:,\s*tests/fixtures/[A-Za-z0-9_./\-]+\.json)*\))?"
 )
-_FIXTURE_REL_PATH_RE = re.compile(r"\b(tests/fixtures/[A-Za-z0-9_./\-]+\.json)\b")
-_WATCH_UNSEE_RE = re.compile(r"^dalton_watch_state(?:\.state)?[.:]seen_accessions$")
+_FIXTURE_REL_PATH_RE = re.compile(r"tests/fixtures/[A-Za-z0-9_./\-]+\.json")
+_WATCH_UNSEE_RE = re.compile(r"dalton_watch_state(?:\.state)?[.:]seen_accessions")
 
 _GLOBAL_REQUEST_TRACE: list[dict[str, Any]] = []
+_DEBUG_BANNER_PRINTED = False
+_PREFLIGHT_ENV_CHECK_CACHE: dict[tuple[str, int], dict[str, Any]] = {}
 
 
 def now_utc_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def default_shanghai_date() -> str:
+    return datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y%m%d")
+
+
+def ensure_debug_banner_printed() -> None:
+    """Print `DEBUG RUN — NOT EVIDENCE` once at the start of any non-`--record` run (P0J §8.1 #13)."""
+    global _DEBUG_BANNER_PRINTED
+    if not _DEBUG_BANNER_PRINTED:
+        print("DEBUG RUN — NOT EVIDENCE", flush=True)
+        _DEBUG_BANNER_PRINTED = True
 
 
 def get_git_sha(short: bool = True) -> str:
@@ -120,54 +135,91 @@ def is_git_dirty() -> bool:
     return bool(raw.strip())
 
 
+def _fetch_origin_dalton_main() -> bool:
+    res = subprocess.run(
+        [
+            "git",
+            "-c",
+            "safe.directory=*",
+            "--no-optional-locks",
+            "-C",
+            str(REPO_ROOT),
+            "fetch",
+            "origin",
+            "dalton/main",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    return res.returncode == 0
+
+
 def is_head_merged_into_main(ref: str = "origin/dalton/main") -> bool:
-    """Return True if HEAD is an ancestor of (or equal to) `origin/dalton/main` (or `dalton/main`)."""
-    for candidate in (ref, "dalton/main"):
-        res = subprocess.run(
-            [
-                "git",
-                "-c",
-                "safe.directory=*",
-                "--no-optional-locks",
-                "-C",
-                str(REPO_ROOT),
-                "merge-base",
-                "--is-ancestor",
-                "HEAD",
-                candidate,
-            ],
-            capture_output=True,
-            text=True,
-        )
-        if res.returncode == 0:
-            return True
-    return False
+    """Return True if HEAD is an ancestor of (or equal to) `origin/dalton/main` after `git fetch` (no local branch fallback)."""
+    if ref != "origin/dalton/main":
+        raise ValueError(f"Merge check only recognizes 'origin/dalton/main', got: {ref!r}")
+    if not _fetch_origin_dalton_main():
+        return False
+    res = subprocess.run(
+        [
+            "git",
+            "-c",
+            "safe.directory=*",
+            "--no-optional-locks",
+            "-C",
+            str(REPO_ROOT),
+            "merge-base",
+            "--is-ancestor",
+            "HEAD",
+            "origin/dalton/main",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    return res.returncode == 0
 
 
 def is_main_ancestor_of_head(ref: str = "origin/dalton/main") -> bool:
-    """Return True if `origin/dalton/main` is an ancestor of HEAD (or HEAD is an ancestor of `origin/dalton/main`)."""
-    if is_head_merged_into_main(ref):
+    """Return True if `origin/dalton/main` is an ancestor of HEAD (or HEAD is merged into `origin/dalton/main`)."""
+    if ref != "origin/dalton/main":
+        raise ValueError(f"Ancestry check only recognizes 'origin/dalton/main', got: {ref!r}")
+    if not _fetch_origin_dalton_main():
+        return False
+    res = subprocess.run(
+        [
+            "git",
+            "-c",
+            "safe.directory=*",
+            "--no-optional-locks",
+            "-C",
+            str(REPO_ROOT),
+            "merge-base",
+            "--is-ancestor",
+            "origin/dalton/main",
+            "HEAD",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if res.returncode == 0:
         return True
-    for candidate in (ref, "dalton/main"):
-        res = subprocess.run(
-            [
-                "git",
-                "-c",
-                "safe.directory=*",
-                "--no-optional-locks",
-                "-C",
-                str(REPO_ROOT),
-                "merge-base",
-                "--is-ancestor",
-                candidate,
-                "HEAD",
-            ],
-            capture_output=True,
-            text=True,
-        )
-        if res.returncode == 0:
-            return True
-    return False
+    res_merged = subprocess.run(
+        [
+            "git",
+            "-c",
+            "safe.directory=*",
+            "--no-optional-locks",
+            "-C",
+            str(REPO_ROOT),
+            "merge-base",
+            "--is-ancestor",
+            "HEAD",
+            "origin/dalton/main",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    return res_merged.returncode == 0
 
 
 def _validate_entry_point_for_kind(
@@ -182,20 +234,20 @@ def _validate_entry_point_for_kind(
         raise ValueError(f"Synthetic declaration for kind '{kind}' must specify a non-empty 'entry_point'")
 
     if kind == "settings_api_budget":
-        if not _SETTINGS_BUDGET_RE.match(ep):
+        if not _SETTINGS_BUDGET_RE.fullmatch(ep):
             raise ValueError(
                 f"Synthetic kind 'settings_api_budget' requires exact entry_point 'PUT /api/v1/dalton/budget', got: {ep!r}"
             )
     elif kind == "knowledge_api_agenda":
-        if not _KNOWLEDGE_AGENDA_RE.match(ep):
+        if not _KNOWLEDGE_AGENDA_RE.fullmatch(ep):
             raise ValueError(
                 f"Synthetic kind 'knowledge_api_agenda' requires exact knowledge agenda endpoint or tool "
                 f"('POST /api/v1/dalton/knowledge/{{ws}}/agenda/import' or 'dalton_agenda_update'), got: {ep!r}"
             )
     elif kind == "knowledge_api_import_fixture":
-        if not _KNOWLEDGE_IMPORT_ROUTE_RE.search(ep):
+        if not _KNOWLEDGE_IMPORT_ROUTE_RE.fullmatch(ep):
             raise ValueError(
-                f"Synthetic kind 'knowledge_api_import_fixture' requires knowledge import endpoint in entry_point, got: {ep!r}"
+                f"Synthetic kind 'knowledge_api_import_fixture' requires full-string match on knowledge import endpoint, got: {ep!r}"
             )
         fixture_candidates = list(_FIXTURE_REL_PATH_RE.findall(ep))
         if item and isinstance(item.get("fixture_path"), str) and item["fixture_path"].strip():
@@ -208,32 +260,33 @@ def _validate_entry_point_for_kind(
                 f"(in entry_point or fixture_path), got: {ep!r}"
             )
         for rel_fix in fixture_candidates:
-            if not rel_fix.startswith("tests/fixtures/"):
+            if not _FIXTURE_REL_PATH_RE.fullmatch(rel_fix):
                 raise ValueError(
-                    f"Synthetic kind 'knowledge_api_import_fixture' fixture must reside under 'tests/fixtures/', got: {rel_fix!r}"
+                    f"Synthetic kind 'knowledge_api_import_fixture' fixture must match 'tests/fixtures/*.json', got: {rel_fix!r}"
                 )
             if not (repo_root / rel_fix).is_file():
                 raise ValueError(
                     f"Synthetic kind 'knowledge_api_import_fixture' fixture file does not exist: {rel_fix!r}"
                 )
     elif kind == "watch_state_unsee_filing":
-        if not _WATCH_UNSEE_RE.match(ep):
+        if not _WATCH_UNSEE_RE.fullmatch(ep):
             raise ValueError(
                 f"Synthetic kind 'watch_state_unsee_filing' requires exact 'dalton_watch_state.state.seen_accessions', got: {ep!r}"
             )
     elif kind == "committed_test_hook":
-        matched_hook = any(
-            ep == hook_key or ep.startswith(f"{hook_key} ") or ep.startswith(f"{hook_key}:")
-            for hook_key in COMMITTED_TEST_HOOKS
-        )
-        if not matched_hook:
-            raise ValueError(
-                f"Synthetic kind 'committed_test_hook' entry_point {ep!r} is not registered in "
-                f"COMMITTED_TEST_HOOKS {sorted(COMMITTED_TEST_HOOKS.keys())}"
-            )
         for hook_key, meta in COMMITTED_TEST_HOOKS.items():
             if not meta.get("code_location"):
                 raise ValueError(f"COMMITTED_TEST_HOOKS[{hook_key!r}] is missing mandatory 'code_location'")
+        valid_hook_entries = set(COMMITTED_TEST_HOOKS.keys()) | {
+            meta["code_location"]
+            for meta in COMMITTED_TEST_HOOKS.values()
+            if meta.get("code_location")
+        }
+        if ep not in valid_hook_entries:
+            raise ValueError(
+                f"Synthetic kind 'committed_test_hook' entry_point {ep!r} is not registered in "
+                f"COMMITTED_TEST_HOOKS {sorted(valid_hook_entries)}"
+            )
     elif kind == "committed_fixture_input":
         if not _FIXTURE_REL_PATH_RE.fullmatch(ep):
             raise ValueError(
@@ -249,40 +302,26 @@ def validate_synthetic_declarations(
     synthetic: list[Any],
     *,
     repo_root: Path = REPO_ROOT,
-) -> list[dict[str, Any] | str]:
+) -> list[dict[str, Any]]:
     """Validate `synthetic` list against P0G §0.2 / P0J §1.5 6 allowed injection categories and COMMITTED_TEST_HOOKS."""
-    validated: list[dict[str, Any] | str] = []
+    validated: list[dict[str, Any]] = []
     for item in synthetic:
-        if isinstance(item, str):
-            raw_str = item.strip()
-            for bad in FORBIDDEN_SYNTHETIC_SUBSTRINGS:
-                if bad in raw_str:
-                    raise ValueError(f"Forbidden synthetic injection declared: {raw_str}")
-            parts = raw_str.split(":", 1)
-            kind_prefix = parts[0].strip()
-            entry_point = parts[1].strip() if len(parts) > 1 else ""
-            if kind_prefix not in ALLOWED_SYNTHETIC_KINDS:
-                raise ValueError(
-                    f"Synthetic kind '{kind_prefix}' is not in ALLOWED_SYNTHETIC_KINDS "
-                    f"{sorted(ALLOWED_SYNTHETIC_KINDS)}"
-                )
-            _validate_entry_point_for_kind(kind_prefix, entry_point, repo_root=repo_root)
-            validated.append(raw_str)
-        elif isinstance(item, dict):
-            kind = str(item.get("kind") or "").strip()
-            entry_point = str(item.get("entry_point") or "").strip()
-            for bad in FORBIDDEN_SYNTHETIC_SUBSTRINGS:
-                if bad == kind or bad in entry_point:
-                    raise ValueError(f"Forbidden synthetic injection declared: {item!r}")
-            if kind not in ALLOWED_SYNTHETIC_KINDS:
-                raise ValueError(
-                    f"Synthetic kind '{kind}' is not in ALLOWED_SYNTHETIC_KINDS "
-                    f"{sorted(ALLOWED_SYNTHETIC_KINDS)}"
-                )
-            _validate_entry_point_for_kind(kind, entry_point, item=item, repo_root=repo_root)
-            validated.append(item)
-        else:
-            raise TypeError(f"Unsupported synthetic item type: {type(item).__name__}")
+        if not isinstance(item, dict):
+            raise TypeError(
+                f"Synthetic declaration must be a dict with 'kind' and 'entry_point' (bare strings are forbidden), got: {type(item).__name__}"
+            )
+        kind = str(item.get("kind") or "").strip()
+        entry_point = str(item.get("entry_point") or "").strip()
+        for bad in FORBIDDEN_SYNTHETIC_SUBSTRINGS:
+            if bad == kind or bad in entry_point:
+                raise ValueError(f"Forbidden synthetic injection declared: {item!r}")
+        if kind not in ALLOWED_SYNTHETIC_KINDS:
+            raise ValueError(
+                f"Synthetic kind '{kind}' is not in ALLOWED_SYNTHETIC_KINDS "
+                f"{sorted(ALLOWED_SYNTHETIC_KINDS)}"
+            )
+        _validate_entry_point_for_kind(kind, entry_point, item=item, repo_root=repo_root)
+        validated.append(item)
     return validated
 
 
@@ -362,22 +401,61 @@ def _probe_backend_health_sync(base_url: str, user_id: str) -> dict[str, Any]:
     return data
 
 
+def _default_live_env_check(backend_url: str) -> dict[str, Any]:
+    from scripts.dalton.realrun.check_env import run_all_checks
+
+    target_url = backend_url if backend_url.startswith("http") else "http://127.0.0.1:8000"
+    return run_all_checks(backend_url=target_url)
+
+
+def _get_or_run_env_check(
+    base_url: str,
+    env_check_fn: Callable[[str], dict[str, Any]],
+) -> dict[str, Any]:
+    target_url = base_url if base_url.startswith("http") else "http://127.0.0.1:8000"
+    key = (target_url.rstrip("/"), id(env_check_fn))
+    if key not in _PREFLIGHT_ENV_CHECK_CACHE:
+        _PREFLIGHT_ENV_CHECK_CACHE[key] = env_check_fn(target_url)
+    return _PREFLIGHT_ENV_CHECK_CACHE[key]
+
+
 def assert_clean_and_synced_environment(
     *,
     base_url: str = "http://127.0.0.1:8000",
     user_id: str = "realrun-pm-a",
+    record: bool | None = None,
     git_sha_fn: Callable[[], str] = get_git_sha,
     git_dirty_fn: Callable[[], bool] = is_git_dirty,
     merged_main_fn: Callable[[], bool] = is_head_merged_into_main,
     main_ancestor_fn: Callable[[], bool] = is_main_ancestor_of_head,
     health_fn: Callable[[str, str], dict[str, Any]] = _probe_backend_health_sync,
+    env_check_fn: Callable[[str], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Fail fast (exit code != 0) if worktree is dirty, HEAD is not in main, backend is unreachable, or SHA/dirty drifts (L40, L41)."""
+    """Validate environment before running a real-run script (P0J §1.3, §1.4, §8.1 #13, L40, L41).
+
+    - Always requires `INTERNAL_SERVICE_TOKEN` and a live, healthy backend with a known `git_sha`.
+    - When `record=False` (no `--record` on CLI): prints `DEBUG RUN — NOT EVIDENCE` once and allows
+      running on unmerged/dirty branches for debugging without writing any files.
+    - When `record=True` (`--record` on CLI or explicit `record=True`): enforces clean working tree,
+      merged into `origin/dalton/main`, backend SHA/dirty parity, and pre-run `check_env` pass
+      before any evidence family logic executes.
+    """
+    if record is None:
+        record = "--record" in sys.argv
+
     svc_token = os.getenv("INTERNAL_SERVICE_TOKEN", "").strip()
     if not svc_token:
         raise SystemExit(
             "ERROR: INTERNAL_SERVICE_TOKEN is not set in environment/.env (L40). Refusing to run real-run script."
         )
+
+    if not record:
+        ensure_debug_banner_printed()
+        try:
+            return health_fn(base_url, user_id)
+        except Exception as exc:
+            raise SystemExit(f"ERROR: {exc}") from exc
+
     if git_dirty_fn():
         raise SystemExit(
             "ERROR: Working tree is dirty (git status --porcelain is non-empty, L41). "
@@ -412,28 +490,51 @@ def assert_clean_and_synced_environment(
         raise SystemExit(
             "ERROR: Backend reported git_dirty=True at startup (L41). Restart backend from a clean working tree."
         )
+
+    resolved_env_check = env_check_fn or _default_live_env_check
+    try:
+        env_payload = _get_or_run_env_check(base_url, resolved_env_check)
+    except Exception as exc:
+        raise SystemExit(f"ERROR: Pre-run check_env failed before family execution: {exc}") from exc
+    if not isinstance(env_payload, dict) or not env_payload.get("all_passed", False):
+        failed_list = env_payload.get("failed_checks") if isinstance(env_payload, dict) else "unknown"
+        raise SystemExit(
+            f"ERROR: Pre-run check_env failed before family execution (failed_checks={failed_list}, P0J §1.4)."
+        )
     return health
+
+
+def preflight_realrun_script(
+    family: str | None = None,
+    *,
+    record: bool | None = None,
+    base_url: str = "http://127.0.0.1:8000",
+    backend: str | None = None,
+    user_id: str = "realrun-pm-a",
+) -> dict[str, Any]:
+    """Run script-entry preflight before any family work or file creation (P0J §1.3, §1.4, §8.1 #13)."""
+    _ = family
+    resolved_url = backend if backend else base_url
+    return assert_clean_and_synced_environment(
+        base_url=resolved_url,
+        user_id=user_id,
+        record=record,
+    )
 
 
 def new_test_user_id(
     family: str,
     *,
+    record: bool | None = None,
     preflight_fn: Callable[..., Any] | None = assert_clean_and_synced_environment,
 ) -> str:
     """Create a fresh, unique test user ID so runs never hit stale cached journal rows."""
     if preflight_fn is not None:
-        preflight_fn()
+        preflight_fn(record=record)
     slug = re.sub(r"[^a-z0-9]+", "-", family.lower()).strip("-")
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
     short_uid = uuid.uuid4().hex[:8]
     return f"realrun-{slug}-{stamp}-{short_uid}"
-
-
-def _default_live_env_check(backend_url: str) -> dict[str, Any]:
-    from scripts.dalton.realrun.check_env import run_all_checks
-
-    target_url = backend_url if backend_url.startswith("http") else "http://127.0.0.1:8000"
-    return run_all_checks(backend_url=target_url)
 
 
 def build_evidence_envelope(
@@ -452,6 +553,7 @@ def build_evidence_envelope(
     sub_item: str | None = None,
     request_trace: list[dict[str, Any]] | None = None,
     assertions: list[dict[str, Any]] | None = None,
+    record: bool | None = None,
     git_sha_fn: Callable[[], str] = get_git_sha,
     git_dirty_fn: Callable[[], bool] = is_git_dirty,
     merged_main_fn: Callable[[], bool] = is_head_merged_into_main,
@@ -460,6 +562,9 @@ def build_evidence_envelope(
     env_check_fn: Callable[[str], dict[str, Any]] = _default_live_env_check,
 ) -> dict[str, Any]:
     """Construct a P0J §1.3 v2 compliant evidence JSON dictionary with live identity, version & check_env self-checks."""
+    if record is None:
+        record = "--record" in sys.argv
+
     started_iso = format_iso_utc(started_at) or now_utc_iso()
     ended_iso = format_iso_utc(ended_at) or now_utc_iso()
     validated_synthetic = validate_synthetic_declarations(synthetic)
@@ -474,11 +579,13 @@ def build_evidence_envelope(
     health = assert_clean_and_synced_environment(
         base_url=probe_url,
         user_id=allowed_users[0] if allowed_users else test_user_id,
+        record=record,
         git_sha_fn=git_sha_fn,
         git_dirty_fn=git_dirty_fn,
         merged_main_fn=merged_main_fn,
         main_ancestor_fn=main_ancestor_fn,
         health_fn=health_fn,
+        env_check_fn=env_check_fn,
     )
 
     if journal is None:
@@ -508,8 +615,8 @@ def build_evidence_envelope(
         or ("env" if os.getenv("DALTON_PM_USER_IDS", "").strip() else "default")
     )
 
-    env_payload = env_check_fn(probe_url)
-    if not isinstance(env_payload, dict) or not env_payload.get("all_passed", False):
+    env_payload = _get_or_run_env_check(probe_url, env_check_fn)
+    if record and (not isinstance(env_payload, dict) or not env_payload.get("all_passed", False)):
         failed_list = env_payload.get("failed_checks") if isinstance(env_payload, dict) else "unknown"
         raise RuntimeError(
             f"Live check_env failed during build_evidence_envelope (failed_checks={failed_list}); "
@@ -519,10 +626,14 @@ def build_evidence_envelope(
     invalid_reasons: list[str] = []
     if git_dirty:
         invalid_reasons.append("worktree_git_dirty")
+    if not merged_main_fn():
+        invalid_reasons.append("head_not_merged_into_origin_dalton_main")
     if backend_git_dirty:
         invalid_reasons.append("backend_git_dirty")
     if backend_git_sha != git_sha:
         invalid_reasons.append(f"backend_git_sha_mismatch:{backend_git_sha}!={git_sha}")
+    if not isinstance(env_payload, dict) or not env_payload.get("all_passed", False):
+        invalid_reasons.append("check_env_not_all_passed")
     if "local-dev-user" in allowed_users:
         invalid_reasons.append("test_user_id_is_local_dev_user")
 
@@ -777,13 +888,26 @@ def render_summary_markdown(
 
 
 def _redirect_docs_summary_to_var(md_path: Path, repo_root: Path = REPO_ROOT) -> Path:
-    """Redirect any `docs/dalton/...` runtime summary path to `var/dalton/...` so runtime never dirties `docs/` (Review Item 15)."""
+    """Redirect any `docs/dalton/...` runtime summary path to `var/dalton/...` so runtime never dirties `docs/`."""
     docs_root = (repo_root / "docs" / "dalton").resolve()
     try:
         rel_under_dalton = md_path.resolve().relative_to(docs_root)
         return repo_root / "var" / "dalton" / rel_under_dalton
     except ValueError:
         return md_path
+
+
+def _assert_path_under_var(path: Path, *, repo_root: Path = REPO_ROOT) -> None:
+    """Ensure `path` resolves strictly under `<repo_root>/var/`."""
+    resolved = path.resolve()
+    repo_var = (repo_root / "var").resolve()
+    try:
+        resolved.relative_to(repo_var)
+        return
+    except ValueError as exc:
+        raise ValueError(
+            f"Evidence raw_json_path must reside under {repo_var}, got: {path}"
+        ) from exc
 
 
 def write_evidence_and_summary(
@@ -798,6 +922,7 @@ def write_evidence_and_summary(
     record: bool | None = None,
     git_dirty_fn: Callable[[], bool] = is_git_dirty,
     merged_main_fn: Callable[[], bool] = is_head_merged_into_main,
+    repo_root: Path = REPO_ROOT,
 ) -> tuple[Path, Path, str]:
     """Validate and optionally write raw JSON + runtime Markdown summary under `var/dalton/` when `--record` is enabled."""
     if record is None:
@@ -808,6 +933,39 @@ def write_evidence_and_summary(
     envelope["key_findings"] = [[k, v] for k, v in key_findings]
     envelope["notes"] = list(notes or [])
     assert_no_credentials_in_obj(envelope)
+
+    raw_path = Path(raw_json_path)
+    if not raw_path.is_absolute():
+        raw_path = repo_root / raw_path
+    _assert_path_under_var(raw_path, repo_root=repo_root)
+
+    try:
+        rel_raw = raw_path.relative_to(repo_root).as_posix()
+    except ValueError:
+        rel_raw = raw_path.as_posix()
+
+    raw_md_path = Path(summary_md_path)
+    if not raw_md_path.is_absolute():
+        raw_md_path = repo_root / raw_md_path
+    md_path = _redirect_docs_summary_to_var(raw_md_path, repo_root=repo_root)
+
+    serialized_json = json.dumps(envelope, ensure_ascii=False, indent=2) + "\n"
+    sha256_hex = hashlib.sha256(serialized_json.encode("utf-8")).hexdigest()
+
+    md_text = render_summary_markdown(
+        family_code=family_code,
+        title=title,
+        raw_json_rel_path=rel_raw,
+        raw_json_sha256=sha256_hex,
+        envelope=envelope,
+        key_findings=key_findings,
+        notes=notes,
+    )
+    assert_no_credentials_in_obj({"markdown": md_text})
+
+    if not record:
+        ensure_debug_banner_printed()
+        return raw_path, md_path, sha256_hex
 
     if envelope.get("git_dirty") or git_dirty_fn():
         raise SystemExit(
@@ -835,37 +993,6 @@ def write_evidence_and_summary(
             f"ERROR: Evidence marked valid=False (reasons: {envelope.get('invalid_reasons')})"
         )
 
-    raw_path = Path(raw_json_path)
-    if not raw_path.is_absolute():
-        raw_path = REPO_ROOT / raw_path
-
-    try:
-        rel_raw = raw_path.relative_to(REPO_ROOT).as_posix()
-    except ValueError:
-        rel_raw = raw_path.as_posix()
-
-    raw_md_path = Path(summary_md_path)
-    if not raw_md_path.is_absolute():
-        raw_md_path = REPO_ROOT / raw_md_path
-    md_path = _redirect_docs_summary_to_var(raw_md_path, repo_root=REPO_ROOT)
-
-    serialized_json = json.dumps(envelope, ensure_ascii=False, indent=2) + "\n"
-    sha256_hex = hashlib.sha256(serialized_json.encode("utf-8")).hexdigest()
-
-    md_text = render_summary_markdown(
-        family_code=family_code,
-        title=title,
-        raw_json_rel_path=rel_raw,
-        raw_json_sha256=sha256_hex,
-        envelope=envelope,
-        key_findings=key_findings,
-        notes=notes,
-    )
-    assert_no_credentials_in_obj({"markdown": md_text})
-
-    if not record:
-        return raw_path, md_path, sha256_hex
-
     raw_path.parent.mkdir(parents=True, exist_ok=True)
     raw_path.write_text(serialized_json, encoding="utf-8")
 
@@ -879,7 +1006,7 @@ def render_summaries_from_var_to_docs(
     date_str: str,
     repo_root: Path = REPO_ROOT,
 ) -> list[str]:
-    """Render `G<N>.md` into `docs/dalton/dev-guide/trial-runs/realrun-<date>/` strictly from `var/dalton/trial-runs/realrun-<date>/*.json` (L42, Item 15)."""
+    """Render `G<N>.md` (and G6 comparison doc when G6 is present) into `docs/dalton/dev-guide/trial-runs/` strictly from `var/dalton/trial-runs/realrun-<date>/*.json` (L42, Item 15)."""
     var_dir = repo_root / "var" / "dalton" / "trial-runs" / f"realrun-{date_str}"
     if not var_dir.is_dir():
         raise FileNotFoundError(f"Evidence directory not found: {var_dir}")
@@ -893,7 +1020,6 @@ def render_summaries_from_var_to_docs(
             continue
         sub_item = str(payload.get("sub_item") or "")
         if sub_item and not sub_item.endswith(".all") and "_" in json_file.stem:
-            # Skip sub-item intermediate JSONs like g5_1_broker.json if g5_broker_and_antigravity.json exists
             m_sub = re.match(r"^g[1-7]_\d+_", json_file.name)
             if m_sub:
                 continue
@@ -914,6 +1040,23 @@ def render_summaries_from_var_to_docs(
         out_md = docs_dir / f"{family_code}.md"
         out_md.write_text(md_text, encoding="utf-8")
         written.append(out_md.relative_to(repo_root).as_posix())
+
+        if family_code == "G6" and isinstance(payload.get("tickers"), dict):
+            from scripts.dalton.realrun.g6_lenses import render_comparison_markdown
+
+            comp_md = render_comparison_markdown(payload["tickers"], run_date=date_str)
+            assert_no_credentials_in_obj({"markdown": comp_md})
+            comp_out = (
+                repo_root
+                / "docs"
+                / "dalton"
+                / "dev-guide"
+                / "trial-runs"
+                / "G6-financial-lenses-comparison-20261018.md"
+            )
+            comp_out.parent.mkdir(parents=True, exist_ok=True)
+            comp_out.write_text(comp_md, encoding="utf-8")
+            written.append(comp_out.relative_to(repo_root).as_posix())
     return written
 
 
@@ -927,7 +1070,7 @@ class RealRunHttpClient:
         user_id: str,
         timeout_s: float = 120.0,
         extra_headers: dict[str, str] | None = None,
-        skip_env_preflight: bool = False,
+        record: bool | None = None,
         preflight_fn: Callable[..., Any] | None = assert_clean_and_synced_environment,
     ) -> None:
         self.base_url = base_url.rstrip("/")
@@ -942,8 +1085,8 @@ class RealRunHttpClient:
                 "refusing to fall back to unauthenticated requests."
             )
 
-        if not skip_env_preflight and preflight_fn is not None:
-            preflight_fn(base_url=self.base_url, user_id=self.user_id)
+        if preflight_fn is not None:
+            preflight_fn(base_url=self.base_url, user_id=self.user_id, record=record)
 
         headers = {
             "X-User-Id": self.user_id,
@@ -956,6 +1099,36 @@ class RealRunHttpClient:
             headers=headers,
             timeout=timeout_s,
             trust_env=False,
+        )
+
+    @classmethod
+    def _for_check_env_probe(
+        cls,
+        base_url: str = "http://127.0.0.1:8000",
+        *,
+        user_id: str,
+        timeout_s: float = 30.0,
+        extra_headers: dict[str, str] | None = None,
+    ) -> RealRunHttpClient:
+        """Dedicated constructor for `scripts/dalton/realrun/check_env.py` only (avoids recursive check_env preflight).
+
+        Refuses to run if invoked from any module other than `check_env.py`.
+        """
+        frame = inspect.currentframe()
+        caller_frame = frame.f_back if frame is not None else None
+        caller_file = Path(caller_frame.f_code.co_filename).resolve() if caller_frame is not None else None
+        expected_check_env = (REPO_ROOT / "scripts" / "dalton" / "realrun" / "check_env.py").resolve()
+        if caller_file != expected_check_env:
+            raise RuntimeError(
+                f"_for_check_env_probe is reserved exclusively for {expected_check_env}, "
+                f"cannot be called from {caller_file}"
+            )
+        return cls(
+            base_url=base_url,
+            user_id=user_id,
+            timeout_s=timeout_s,
+            extra_headers=extra_headers,
+            preflight_fn=None,
         )
 
     def close(self) -> None:
@@ -1108,7 +1281,7 @@ def main(argv: list[str] | None = None) -> int:
         description="Render trial-run Markdown summaries from var/dalton/trial-runs/realrun-<date>/ into docs/dalton/dev-guide/trial-runs/realrun-<date>/ (P0J §1.6, L42)."
     )
     parser.add_argument("--render-docs", action="store_true", required=True, help="Render G<N>.md summaries into docs/")
-    parser.add_argument("--date", required=True, help="Trial-run date string (YYYYMMDD)")
+    parser.add_argument("--date", default=default_shanghai_date(), help="Trial-run date string (YYYYMMDD)")
     args = parser.parse_args(argv)
     written = render_summaries_from_var_to_docs(date_str=args.date)
     print(json.dumps({"rendered_summaries": written}, ensure_ascii=False, indent=2))

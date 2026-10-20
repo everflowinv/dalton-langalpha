@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import subprocess
 import time
 from datetime import datetime, timezone
@@ -44,11 +45,43 @@ from src.server.database.pool import get_db_connection
 
 logger = logging.getLogger(__name__)
 
-def _compute_startup_git_info() -> tuple[str, bool]:
-    """Compute (git_sha_8char, git_dirty) once at backend startup (P0J §1.3, L41)."""
+BUILD_GIT_SHA_FILE = Path("/app/.build_git_sha")
+BUILD_FILES_SHA256_FILE = Path("/app/.build_files.sha256")
+
+
+def _read_image_build_git_sha(build_sha_file: Path = BUILD_GIT_SHA_FILE) -> str:
+    env_sha = os.getenv("DALTON_IMAGE_BUILD_GIT_SHA", "").strip()
+    if env_sha:
+        return env_sha[:8]
+    if build_sha_file.is_file():
+        try:
+            return build_sha_file.read_text(encoding="utf-8").strip()[:8]
+        except Exception:
+            return ""
+    return ""
+
+
+def _compute_startup_git_info(
+    *,
+    in_docker: bool = _IN_DOCKER,
+    host_repo_path: Path = Path("/host_repo"),
+    build_sha_file: Path = BUILD_GIT_SHA_FILE,
+    build_files_sha256_file: Path = BUILD_FILES_SHA256_FILE,
+) -> tuple[str, bool]:
+    """Compute (git_sha_8char, git_dirty) once at backend startup (P0J §1.3, L41).
+
+    In Docker, also compares the image build SHA (`/app/.build_git_sha`) and
+    baked file manifest (`/app/.build_files.sha256`) against the mounted
+    repository's HEAD; if they differ (or if `.build_git_sha` is missing),
+    reports `git_dirty=True`.
+    """
     git_sha = "unknown"
     git_dirty = True
-    git_root = Path("/host_repo") if (_IN_DOCKER and Path("/host_repo/.git").exists()) else REPO_ROOT
+    git_root = (
+        host_repo_path
+        if (in_docker and (host_repo_path / ".git").exists())
+        else REPO_ROOT
+    )
     try:
         git_sha = subprocess.check_output(
             [
@@ -82,6 +115,21 @@ def _compute_startup_git_info() -> tuple[str, bool]:
             timeout=5.0,
         )
         git_dirty = bool(raw_status.strip())
+        if in_docker:
+            image_build_sha = _read_image_build_git_sha(build_sha_file)
+            if not image_build_sha or image_build_sha != git_sha:
+                git_dirty = True
+            elif build_files_sha256_file.is_file() and (host_repo_path / ".git").exists():
+                chk = subprocess.run(
+                    ["sha256sum", "--status", "-c", str(build_files_sha256_file)],
+                    cwd=str(host_repo_path),
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=10.0,
+                    check=False,
+                )
+                if chk.returncode != 0:
+                    git_dirty = True
     except Exception as exc:
         logger.debug("Failed to compute startup git info: %s", exc)
     return git_sha, git_dirty

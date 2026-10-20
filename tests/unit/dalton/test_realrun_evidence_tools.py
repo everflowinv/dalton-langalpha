@@ -11,6 +11,7 @@ import pytest
 
 from scripts.dalton.check_report_claims import scan_reports
 from scripts.dalton.realrun._common import (
+    RealRunHttpClient,
     assert_clean_and_synced_environment,
     assert_no_credentials_in_obj,
     build_evidence_envelope,
@@ -28,10 +29,12 @@ from scripts.dalton.realrun.journal_dump import (
 from scripts.dalton.realrun.render_report_tables import (
     GENERATED_END_MARKER,
     GENERATED_START_MARKER,
+    compare_legacy_report,
     update_markdown_generated_block,
     verify_generated_evidence_block,
 )
 from src.config.env import LOCAL_DEV_USER_ID
+from src.dalton.services import openclaw_admin
 from src.dalton.settings import DaltonConfig, get_dalton_config, get_pm_user_ids_source
 
 
@@ -114,7 +117,7 @@ def test_journal_dump_normalize_rows_and_strip_body_fields() -> None:
 
 
 def test_common_synthetic_validation_and_artifact_writing(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", "test-service-token-value")
     valid_synthetic = [
@@ -128,21 +131,54 @@ def test_common_synthetic_validation_and_artifact_writing(
             "entry_point": "POST /api/v1/dalton/knowledge/ws-123/evidence/import (tests/fixtures/dalton/g3/googl_sec_evidence.json)",
             "description": "Import committed G3 evidence fixture",
         },
-        "committed_test_hook:scripts/dalton/researchdata_bridge.py:168-190",
+        {
+            "kind": "committed_test_hook",
+            "entry_point": "scripts/dalton/researchdata_bridge.py:168-190",
+            "reason": "Use committed >240s delay hook for G7",
+        },
     ]
     validated = validate_synthetic_declarations(valid_synthetic)
     assert len(validated) == 3
 
+    # Bare strings are rejected (Must-Fix #11)
+    with pytest.raises((TypeError, ValueError), match="must be a dict"):
+        validate_synthetic_declarations(["committed_test_hook:scripts/dalton/researchdata_bridge.py:168-190"])  # type: ignore[list-item]
+
     with pytest.raises(ValueError, match="not in ALLOWED_SYNTHETIC_KINDS"):
-        validate_synthetic_declarations(["bridge_delay_hook:sleep_s=242"])
+        validate_synthetic_declarations([{"kind": "bridge_delay_hook", "entry_point": "sleep_s=242"}])
 
     with pytest.raises(ValueError, match="Forbidden synthetic injection"):
-        validate_synthetic_declarations(["registered_test_hook:fake"])
+        validate_synthetic_declarations([{"kind": "registered_test_hook", "entry_point": "fake"}])
 
     with pytest.raises(ValueError, match="Forbidden synthetic injection"):
-        validate_synthetic_declarations(["direct_signal_insert:dalton_watch_signals"])
+        validate_synthetic_declarations([{"kind": "direct_signal_insert", "entry_point": "dalton_watch_signals"}])
 
-    # Exact category-to-entry_point matching (Item 13):
+    with pytest.raises(ValueError, match="not registered in COMMITTED_TEST_HOOKS"):
+        validate_synthetic_declarations(
+            [{"kind": "committed_test_hook", "entry_point": "--simulate-upstream"}]
+        )
+
+    # Full-string match on entry_point (Must-Fix #11): trailing garbage rejected
+    with pytest.raises(ValueError, match="requires exact entry_point"):
+        validate_synthetic_declarations(
+            [
+                {
+                    "kind": "settings_api_budget",
+                    "entry_point": "PUT /api/v1/dalton/budget --extra-unregistered-suffix",
+                }
+            ]
+        )
+
+    with pytest.raises(ValueError, match="not registered in COMMITTED_TEST_HOOKS"):
+        validate_synthetic_declarations(
+            [
+                {
+                    "kind": "committed_test_hook",
+                    "entry_point": "scripts/dalton/researchdata_bridge.py:168-190 (trailing text)",
+                }
+            ]
+        )
+
     with pytest.raises(ValueError, match="requires exact knowledge agenda endpoint"):
         validate_synthetic_declarations(
             [
@@ -174,23 +210,72 @@ def test_common_synthetic_validation_and_artifact_writing(
     with pytest.raises(ValueError, match="email address pattern"):
         assert_no_credentials_in_obj({"user_email": "analyst@example.com"})
 
-    # Preflight rejection checks via explicit callable injection (Item 5)
+    injected_health = lambda _url, uid: {  # noqa: E731
+        "git_sha": "1234abcd",
+        "git_dirty": False,
+        "deployment": "docker",
+        "user_id": uid,
+    }
+    injected_env = lambda _url: {  # noqa: E731
+        "all_passed": True,
+        "deployment": "docker",
+        "checks": {"identity": {"status": "PASS"}},
+    }
+    failing_env = lambda _url: {  # noqa: E731
+        "all_passed": False,
+        "deployment": "docker",
+        "checks": {"conversation_transport": {"status": "FAIL"}},
+    }
+
+    # Debug mode (record=False) allows dirty/unmerged branches and prints DEBUG RUN — NOT EVIDENCE (§8.1 #13)
+    debug_health = assert_clean_and_synced_environment(
+        base_url="http://127.0.0.1:8000",
+        user_id="realrun-g1-20261019-abcd1234",
+        record=False,
+        git_sha_fn=lambda: "1234abcd",
+        git_dirty_fn=lambda: True,
+        merged_main_fn=lambda: False,
+        health_fn=injected_health,
+    )
+    assert debug_health["deployment"] == "docker"
+    captured = capsys.readouterr()
+    assert "DEBUG RUN — NOT EVIDENCE" in captured.out
+
+    # Record mode (record=True) enforces clean tree, merged into origin/dalton/main, and check_env preflight
     with pytest.raises(SystemExit, match="Working tree is dirty"):
         assert_clean_and_synced_environment(
             base_url="http://127.0.0.1:8000",
             user_id="realrun-g1-20261019-abcd1234",
+            record=True,
             git_sha_fn=lambda: "1234abcd",
             git_dirty_fn=lambda: True,
             merged_main_fn=lambda: True,
+            health_fn=injected_health,
+            env_check_fn=injected_env,
         )
 
     with pytest.raises(SystemExit, match="not merged into origin/dalton/main"):
         assert_clean_and_synced_environment(
             base_url="http://127.0.0.1:8000",
             user_id="realrun-g1-20261019-abcd1234",
+            record=True,
             git_sha_fn=lambda: "1234abcd",
             git_dirty_fn=lambda: False,
             merged_main_fn=lambda: False,
+            health_fn=injected_health,
+            env_check_fn=injected_env,
+        )
+
+    with pytest.raises(SystemExit, match="Pre-run check_env failed before family execution"):
+        assert_clean_and_synced_environment(
+            base_url="http://127.0.0.1:8000",
+            user_id="realrun-g1-20261019-abcd1234",
+            record=True,
+            git_sha_fn=lambda: "1234abcd",
+            git_dirty_fn=lambda: False,
+            merged_main_fn=lambda: True,
+            health_fn=injected_health,
+            env_check_fn=failing_env,
         )
 
     fake_journal = {
@@ -224,18 +309,6 @@ def test_common_synthetic_validation_and_artifact_writing(
             "conversation_usages_unavailable": False,
             "unexpected_user_ids": [],
         },
-    }
-
-    injected_health = lambda _url, uid: {  # noqa: E731
-        "git_sha": "1234abcd",
-        "git_dirty": False,
-        "deployment": "docker",
-        "user_id": uid,
-    }
-    injected_env = lambda _url: {  # noqa: E731
-        "all_passed": True,
-        "deployment": "docker",
-        "checks": {"identity": {"status": "PASS"}},
     }
 
     envelope = build_evidence_envelope(
@@ -296,6 +369,19 @@ def test_common_synthetic_validation_and_artifact_writing(
     raw_path = tmp_path / "var" / "dalton" / "trial-runs" / "realrun-20261019" / "g1_budget.json"
     md_path = tmp_path / "var" / "dalton" / "trial-runs" / "realrun-20261019" / "G1.md"
 
+    # Reject raw_json_path outside var/ (Must-Fix #12)
+    with pytest.raises(ValueError, match="Evidence raw_json_path must reside under"):
+        write_evidence_and_summary(
+            family_code="G1",
+            title="预算三连真实运行验证",
+            raw_json_path=tmp_path / "docs" / "dalton" / "g1_budget.json",
+            summary_md_path=md_path,
+            envelope=envelope,
+            key_findings=[("日额度阻断", "402 budget_exceeded")],
+            record=False,
+            repo_root=tmp_path,
+        )
+
     # Dry-run (record=False) must NOT write any files to disk (Item 15)
     dry_raw, dry_md, dry_sha = write_evidence_and_summary(
         family_code="G1",
@@ -308,6 +394,7 @@ def test_common_synthetic_validation_and_artifact_writing(
         record=False,
         git_dirty_fn=lambda: False,
         merged_main_fn=lambda: True,
+        repo_root=tmp_path,
     )
     assert not dry_raw.exists()
     assert not dry_md.exists()
@@ -325,6 +412,7 @@ def test_common_synthetic_validation_and_artifact_writing(
         record=True,
         git_dirty_fn=lambda: False,
         merged_main_fn=lambda: True,
+        repo_root=tmp_path,
     )
     assert written_raw.is_file()
     assert written_md.is_file()
@@ -341,6 +429,41 @@ def test_common_synthetic_validation_and_artifact_writing(
     expected_doc = tmp_path / "docs" / "dalton" / "dev-guide" / "trial-runs" / "realrun-20261019" / "G1.md"
     assert expected_doc.is_file()
     assert sha256_hex in expected_doc.read_text(encoding="utf-8")
+
+
+def test_for_check_env_probe_caller_guard_and_docker_build_sha_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", "test-service-token-value")
+    with pytest.raises(RuntimeError, match="reserved exclusively for"):
+        RealRunHttpClient._for_check_env_probe(
+            base_url="http://127.0.0.1:8000", user_id="realrun-env-probe-123"
+        )
+
+    # Docker build SHA drift detection (Must-Fix #7):
+    # If running inside Docker and /app/.build_git_sha differs from git HEAD SHA, git_dirty must be True
+    build_sha_file = tmp_path / ".build_git_sha"
+    build_sha_file.write_text("deadbeef\n", encoding="utf-8")
+
+    def _fake_check_output(cmd: list[str], **_kwargs: object) -> str:
+        if "rev-parse" in cmd:
+            return "94a8d368\n"
+        return ""
+
+    monkeypatch.setattr(openclaw_admin.subprocess, "check_output", _fake_check_output)
+    sha_mismatch, dirty_mismatch = openclaw_admin._compute_startup_git_info(
+        in_docker=True, build_sha_file=build_sha_file
+    )
+    assert sha_mismatch == "94a8d368"
+    assert dirty_mismatch is True
+
+    # Matching build SHA and clean git status -> git_dirty is False
+    build_sha_file.write_text("94a8d368\n", encoding="utf-8")
+    sha_match, dirty_match = openclaw_admin._compute_startup_git_info(
+        in_docker=True, build_sha_file=build_sha_file
+    )
+    assert sha_match == "94a8d368"
+    assert dirty_match is False
 
 
 def test_check_report_claims_and_generated_evidence_table_on_sample_files(
@@ -437,12 +560,44 @@ def test_check_report_claims_and_generated_evidence_table_on_sample_files(
     assert tampered_res["summary"]["sha256_mismatches_count"] == 2
     assert tampered_res["summary"]["generated_block_mismatches_count"] == 1
 
+    # Generic G3 sourced ratio check (Must-Fix #10): compares arbitrary N/M against g3_publish.json
+    g3_json = raw_dir / "g3_publish.json"
+    g3_json.write_text(
+        json.dumps(
+            {
+                "evaluation": {
+                    "true_verified_in_gold_count": 88,
+                    "gold_sourced_total": 88,
+                    "false_unverified_in_gold_count": 0,
+                    "sourced_uncertain_in_gold_count": 0,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    ratio_match_md = sample_repo / "docs" / "ratio-match.md"
+    ratio_match_md.write_text("有源核实率 `88 / 88 = 100.0%`\n", encoding="utf-8")
+    assert (
+        compare_legacy_report(ratio_match_md, evidence_dir=raw_dir, repo_root=sample_repo)[
+            "g3_evaluation_mismatches"
+        ]
+        == []
+    )
+    ratio_mismatch_md = sample_repo / "docs" / "ratio-mismatch.md"
+    ratio_mismatch_md.write_text("有源核实率 `61 / 61 = 100.0%`\n", encoding="utf-8")
+    mismatches = compare_legacy_report(
+        ratio_mismatch_md, evidence_dir=raw_dir, repo_root=sample_repo
+    )["g3_evaluation_mismatches"]
+    assert len(mismatches) == 1
+    assert "actual evidence is 88/88" in mismatches[0]
+
 
 def test_static_script_scan_detects_from_src_and_insert_into(tmp_path: Path) -> None:
     bad_script = tmp_path / "g9_bad.py"
     bad_script.write_text(
         "from src.dalton.llm import router\n"
-        "cur.execute('INSERT INTO dalton_watch_signals VALUES (1)')\n",
+        "cur.execute('INSERT INTO dalton_watch_signals VALUES (1)')\n"
+        "RealRunHttpClient._for_check_env_probe(base_url='http://127.0.0.1:8000', user_id='u')\n",
         encoding="utf-8",
     )
     res = scan_realrun_scripts([bad_script])
@@ -450,4 +605,5 @@ def test_static_script_scan_detects_from_src_and_insert_into(tmp_path: Path) -> 
     kinds = {v["kind"] for v in res["violations"]}
     assert "from_src_import" in kinds
     assert "insert_into:dalton_watch_signals" in kinds
+    assert "forbidden_check_env_probe_call" in kinds
 

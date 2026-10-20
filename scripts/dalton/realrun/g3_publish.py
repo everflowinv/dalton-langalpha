@@ -48,7 +48,9 @@ if str(REPO_ROOT) not in sys.path:
 from scripts.dalton.realrun._common import (  # noqa: E402
     RealRunHttpClient,
     build_evidence_envelope,
+    default_shanghai_date,
     now_utc_iso,
+    preflight_realrun_script,
     write_evidence_and_summary,
 )
 
@@ -450,7 +452,7 @@ def _evaluate_gold_standard(
     )
 
     return {
-        "gold_version": gold_doc.get("version"),
+        "gold_version": gold_doc.get("schema_version"),
         "gold_total_items": len(gold_items),
         "gold_sourced_total": sourced_total,
         "false_verified_in_gold_count": len(false_verified_in_gold),
@@ -505,36 +507,65 @@ def _collect_all_extracted_raws(aud: dict[str, Any]) -> list[str]:
     return raws
 
 
-LIVE_MIGRATED_WORKSPACES: dict[str, str] = {
-    "META": "0d9c7b91-2db8-587e-903c-5a98ac8deee1",
-    "AMZN": "83d1d873-beb4-5fd1-9655-ffb39af506d2",
-    "GOOGL": "f0725330-1d25-52c2-9052-8f95537e2eb4",
-    "MSFT": "1ee3520c-1fa9-5f19-9c0a-1625d3e27ee4",
-}
+MIGRATED_COMPANY_TICKERS: tuple[str, ...] = ("META", "AMZN", "GOOGL", "MSFT")
+
+
+def _discover_migrated_company_workspaces(
+    client: RealRunHttpClient,
+) -> dict[str, str]:
+    """Query `GET /api/v1/workspaces` as `realrun-pm-a` and resolve the 4 migrated company
+    workspaces (`META`, `AMZN`, `GOOGL`, `MSFT`) by `config.ticker` and `config.dalton_company == True`.
+    """
+    st_ws, ws_body = client.get("/api/v1/workspaces", params={"limit": 100})
+    assert st_ws == 200 and isinstance(ws_body, dict), (
+        f"GET /api/v1/workspaces failed while discovering migrated company workspaces: {st_ws} {ws_body}"
+    )
+    workspaces = ws_body.get("workspaces") or []
+    discovered: dict[str, str] = {}
+    for ws in workspaces:
+        if not isinstance(ws, dict):
+            continue
+        cfg = ws.get("config") or {}
+        if not isinstance(cfg, dict) or cfg.get("dalton_company") is not True:
+            continue
+        ticker = str(cfg.get("ticker") or "").strip().upper()
+        ws_id = str(ws.get("workspace_id") or "").strip()
+        if ticker in MIGRATED_COMPANY_TICKERS and ws_id and ticker not in discovered:
+            discovered[ticker] = ws_id
+
+    assert set(discovered.keys()) == set(MIGRATED_COMPANY_TICKERS), (
+        f"Expected GET /api/v1/workspaces to return all 4 migrated company workspaces "
+        f"{list(MIGRATED_COMPANY_TICKERS)}, got {discovered}"
+    )
+    return {t: discovered[t] for t in MIGRATED_COMPANY_TICKERS}
 
 
 def _verify_legacy_migrated_theses_via_http(
     client: RealRunHttpClient,
 ) -> dict[str, Any]:
-    """Query the 4 live migrated companies' `legacy_thesis` version history via
-    `GET /api/v1/dalton/knowledge/{ws}/thesis/versions` as `realrun-pm-a` without importing fixtures (P0J §5 G3).
+    """Discover the 4 live migrated company workspaces via `GET /api/v1/workspaces` as `realrun-pm-a`
+    and verify their `legacy_thesis` version history via `GET /api/v1/dalton/knowledge/{ws}/thesis/versions`,
+    binding the remediation reason check directly to the latest version (P0J §5 G3).
     """
+    discovered_workspaces = _discover_migrated_company_workspaces(client)
     company_histories: dict[str, Any] = {}
 
-    for ticker, ws_id in LIVE_MIGRATED_WORKSPACES.items():
+    for ticker, ws_id in discovered_workspaces.items():
         st_vers, vers_body = client.get(f"/api/v1/dalton/knowledge/{ws_id}/thesis/versions")
         assert st_vers == 200 and isinstance(vers_body, dict), (
             f"GET /api/v1/dalton/knowledge/{ws_id}/thesis/versions failed for live {ticker}: {st_vers} {vers_body}"
         )
-        items = vers_body.get("items") or []
+        items = [it for it in (vers_body.get("items") or []) if isinstance(it, dict)]
         assert len(items) >= 2, (
             f"Expected at least 2 thesis versions (v1 migration + v2 legacy_thesis remediation) in live {ticker} workspace {ws_id}, got {len(items)}"
         )
-        reasons = [str(it.get("reason") or "") for it in items]
-        assert any("迁移的旧认知不作为核实依据" in r for r in reasons), (
-            f"Expected remediation reason '迁移的旧认知不作为核实依据' in live {ticker} versions, got {reasons}"
+        latest_item = max(items, key=lambda it: int(it.get("version_no") or 0))
+        latest_ver_no = int(latest_item.get("version_no") or 0)
+        latest_reason = str(latest_item.get("reason") or "")
+        assert "迁移的旧认知不作为核实依据" in latest_reason, (
+            f"Expected latest version v{latest_ver_no} in live {ticker} ({ws_id}) to have remediation reason "
+            f"'迁移的旧认知不作为核实依据', got {latest_reason!r}"
         )
-        latest_ver_no = max(int(it.get("version_no") or 1) for it in items)
         st_latest, latest_doc = client.get(
             f"/api/v1/dalton/knowledge/{ws_id}/thesis/versions/{latest_ver_no}"
         )
@@ -552,6 +583,7 @@ def _verify_legacy_migrated_theses_via_http(
         )
         company_histories[ticker] = {
             "workspace_id": ws_id,
+            "discovered_via": "GET /api/v1/workspaces (config.ticker + config.dalton_company=true)",
             "versions_endpoint": f"GET /api/v1/dalton/knowledge/{ws_id}/thesis/versions",
             "versions_count": len(items),
             "versions": [
@@ -564,6 +596,7 @@ def _verify_legacy_migrated_theses_via_http(
                 for it in items
             ],
             "latest_version_no": latest_ver_no,
+            "latest_version_reason": latest_reason,
             "legacy_thesis_evidence_count": legacy_ev_count,
             "total_evidence_count": len(ev_list),
         }
@@ -575,22 +608,39 @@ def _verify_legacy_migrated_theses_via_http(
 
 
 def main(argv: list[str] | None = None) -> int:
+    default_date = default_shanghai_date()
     parser = argparse.ArgumentParser(description="Run G3 publication audit real-run verification over HTTP.")
     parser.add_argument("--backend", default="http://127.0.0.1:8000", help="Backend base URL")
+    parser.add_argument("--date", default=default_date, help="Shanghai date YYYYMMDD")
     parser.add_argument("--pm-user", default="realrun-pm-a", help="PM user ID in pm_user_ids")
     parser.add_argument("--other-user", default="realrun-user-b", help="Second user ID for isolation checks")
     parser.add_argument(
         "--json-out",
-        default="var/dalton/trial-runs/realrun-20261019/g3_publish.json",
-        help="Output JSON path",
+        default=None,
+        help="Output JSON path (defaults to var/dalton/trial-runs/realrun-<date>/g3_publish.json)",
     )
     parser.add_argument(
         "--md-out",
-        default="var/dalton/trial-runs/realrun-20261019/G3.md",
-        help="Output Markdown summary path",
+        default=None,
+        help="Output Markdown summary path (defaults to var/dalton/trial-runs/realrun-<date>/G3.md)",
     )
     parser.add_argument("--record", action="store_true", help="Write evidence JSON and summary under var/dalton/")
+    parser.add_argument(
+        "--only-migrated-check",
+        action="store_true",
+        help="Debug helper: verify gold_standard.json schema_version and 4 migrated company workspaces via HTTP (disallowed with --record)",
+    )
     args = parser.parse_args(argv)
+
+    if args.only_migrated_check and args.record:
+        raise SystemExit("ERROR: --only-migrated-check cannot be combined with --record")
+
+    preflight_realrun_script("G3", record=args.record, backend=args.backend)
+
+    if not args.json_out:
+        args.json_out = f"var/dalton/trial-runs/realrun-{args.date}/g3_publish.json"
+    if not args.md_out:
+        args.md_out = f"var/dalton/trial-runs/realrun-{args.date}/G3.md"
 
     started_at = now_utc_iso()
     pm_user = args.pm_user
@@ -600,7 +650,26 @@ def main(argv: list[str] | None = None) -> int:
     run_nonce = datetime.now(timezone.utc).strftime("%H%M%S")
 
     gold_doc = json.loads((G3_FIXTURES_DIR / "gold_standard.json").read_text(encoding="utf-8"))
-    assert int(gold_doc.get("version") or 0) >= 2, f"Expected gold_standard.json version >= 2, got {gold_doc.get('version')}"
+    assert int(gold_doc.get("schema_version") or 0) >= 2, (
+        f"Expected gold_standard.json schema_version >= 2, got {gold_doc.get('schema_version')}"
+    )
+    if args.only_migrated_check:
+        with RealRunHttpClient(args.backend, user_id=pm_user, timeout_s=120.0) as client:
+            client.ensure_user()
+            legacy_theses_history = _verify_legacy_migrated_theses_via_http(client)
+        print(
+            json.dumps(
+                {
+                    "gold_schema_version": gold_doc.get("schema_version"),
+                    "gold_total_items": len(gold_doc.get("items") or []),
+                    "legacy_migrated_theses_versions": legacy_theses_history,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+
     googl_draft = (G3_FIXTURES_DIR / "googl_draft.md").read_text(encoding="utf-8")
     amzn_draft = (G3_FIXTURES_DIR / "amzn_draft.md").read_text(encoding="utf-8")
     colloquial_draft = (G3_FIXTURES_DIR / "colloquial_only_draft.md").read_text(encoding="utf-8")
