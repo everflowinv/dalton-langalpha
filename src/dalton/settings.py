@@ -15,7 +15,7 @@ from typing import Any
 import yaml
 from pydantic import BaseModel, Field
 
-from src.config.env import HOST_IP
+from src.config.env import HOST_IP, LOCAL_DEV_USER_ID
 from src.config.settings import HOST_MODE
 
 logger = logging.getLogger(__name__)
@@ -56,7 +56,7 @@ class DaltonKnowledgeConfig(BaseModel):
     enabled: bool = True
     max_doc_bytes: int = Field(default=1_048_576, gt=0)
     pm_user_ids: list[str] = Field(
-        default_factory=lambda: ["local-dev-user", "local_dev_user", "default"]
+        default_factory=lambda: [LOCAL_DEV_USER_ID, "local_dev_user", "default"]
     )
 
 
@@ -121,7 +121,7 @@ class DaltonConfig(BaseModel):
 
     enabled: bool = True
     pm_user_ids: list[str] = Field(
-        default_factory=lambda: ["local-dev-user", "local_dev_user", "default"]
+        default_factory=lambda: [LOCAL_DEV_USER_ID, "local_dev_user", "default"]
     )
     timezone: str = "Asia/Shanghai"
     models: DaltonModelsConfig = Field(default_factory=DaltonModelsConfig)

@@ -1808,6 +1808,7 @@ async def get_run_charge_usd(run_ref: str) -> Decimal | None
 | catalog-cache | `src/server/app/api_keys.py` | `list_models()` 开头 | 约 4 |
 | router | `src/server/app/setup.py` | 约第 1324 行 | 2 |
 | budget-gate | `src/server/services/credit_gate_port.py` | `build_run_credit_gate`、`verify_credit_gate_wiring` | 约 6 |
+| budget-gate | `src/server/app/setup.py` | `lifespan` 启动时 `verify_credit_gate_wiring` 仅在 `DaltonStartupConfigError` 时阻断启动 | 约 5 |
 | budget-admission | `src/server/dependencies/usage_limits.py` | `enforce_credit_limit` | 3 |
 | settings-section | `web/src/pages/Settings/panels/ModelTab.tsx` | Providers & accounts 小节之后 | 2 |
 | query-keys | `web/src/lib/queryKeys.ts` | `dalton` 键组 | 约 8 |

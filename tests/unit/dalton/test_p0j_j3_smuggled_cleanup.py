@@ -6,7 +6,7 @@ import json
 import logging
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, create_autospec, patch
+from unittest.mock import create_autospec, patch
 
 import psycopg
 import pytest
@@ -66,36 +66,60 @@ def _make_spec_conn(cur: Any) -> Any:
 @pytest.mark.asyncio
 async def test_verdicts_two_workspaces_same_day_no_id_collision(monkeypatch: pytest.MonkeyPatch) -> None:
     """J3 §2.1: Two workspaces writing a verdict on the same day get distinct VD-YYYYMMDD-NN IDs without PK collision."""
-    inserted_ids: list[str] = []
+    inserted_rows: list[dict[str, Any]] = []
+    lock_keys: list[str] = []
+    select_sqls: list[str] = []
 
     cur = create_autospec(_CursorProto, instance=True)
     cur.__aenter__.return_value = cur
     cur.__aexit__.return_value = None
 
-    last_op = {"kind": ""}
+    last_op: dict[str, Any] = {"kind": "", "selected": []}
 
     async def _exec(sql: str, params: Any = None) -> None:
         s = " ".join(str(sql).split())
-        if "SELECT verdict_id FROM dalton_verdicts" in s:
+        if "pg_advisory_xact_lock" in s:
+            last_op["kind"] = "lock"
+            lock_keys.append(str(params[0]) if params else "")
+        elif "SELECT verdict_id FROM dalton_verdicts" in s:
             last_op["kind"] = "select_ids"
+            select_sqls.append(s)
+            # Simulate pre-fix vs post-fix SQL: if WHERE workspace_id is present, filter by workspace_id
+            if "workspace_id" in s.lower():
+                ws_param = str(params[0]) if params else ""
+                like_param = str(params[1]) if params and len(params) > 1 else ""
+                prefix = like_param.rstrip("%")
+                last_op["selected"] = [
+                    {"verdict_id": r["verdict_id"]}
+                    for r in inserted_rows
+                    if r["workspace_id"] == ws_param and str(r["verdict_id"]).startswith(prefix)
+                ]
+            else:
+                like_param = str(params[0]) if params else ""
+                prefix = like_param.rstrip("%")
+                last_op["selected"] = [
+                    {"verdict_id": r["verdict_id"]}
+                    for r in inserted_rows
+                    if str(r["verdict_id"]).startswith(prefix)
+                ]
         elif "INSERT INTO dalton_verdicts" in s:
             last_op["kind"] = "insert"
             vid = str(params[0])
-            assert vid not in inserted_ids, f"Duplicate verdict_id {vid}"
-            inserted_ids.append(vid)
-            last_op["row"] = {
+            existing_ids = {r["verdict_id"] for r in inserted_rows}
+            assert vid not in existing_ids, f"Duplicate verdict_id {vid}"
+            row = {
                 "verdict_id": vid,
                 "user_id": params[1],
                 "workspace_id": params[2],
                 "verdict_at": params[3],
                 "word": params[4],
             }
-        else:
-            last_op["kind"] = "lock"
+            inserted_rows.append(row)
+            last_op["row"] = row
 
     async def _fetchall() -> list[dict[str, Any]]:
         if last_op["kind"] == "select_ids":
-            return [{"verdict_id": vid} for vid in inserted_ids]
+            return list(last_op["selected"])
         return []
 
     async def _fetchone() -> dict[str, Any] | None:
@@ -130,6 +154,10 @@ async def test_verdicts_two_workspaces_same_day_no_id_collision(monkeypatch: pyt
     assert r1["verdict_id"] == "VD-20261019-01"
     assert r2["verdict_id"] == "VD-20261019-02"
     assert r1["verdict_id"] != r2["verdict_id"]
+    assert lock_keys == ["dalton:verdict:20261019", "dalton:verdict:20261019"]
+    assert len(select_sqls) == 2
+    for sql_str in select_sqls:
+        assert "workspace_id" not in sql_str.lower()
 
 
 def test_validate_malformed_thresholds_input_does_not_crash() -> None:
@@ -289,18 +317,61 @@ def test_schemas_remove_guidance_keep_company_guidance_and_legacy_docs_pass() ->
     errs = validate_schema("thesis", bad_thesis)
     assert errs, "Expected 'guidance' label to be rejected by common.schema.json"
 
-    # Legacy migrated documents and G3 SEC evidence fixtures must still pass schema validation
-    migration_root = REPO_ROOT / "var" / "dalton" / "migration" / "Home" / "dalton" / "companies"
-    if migration_root.exists():
-        for ticker_dir in sorted(migration_root.iterdir()):
-            data_dir = ticker_dir / "data"
-            if not data_dir.is_dir():
-                continue
-            for doc_file in sorted(data_dir.glob("*.json")):
-                doc_key = doc_file.stem
-                payload = json.loads(doc_file.read_text(encoding="utf-8"))
-                doc_errs = validate_schema(doc_key, payload)
-                assert doc_errs == [], f"{ticker_dir.name}/{doc_file.name} failed validation: {doc_errs}"
+    # Unconditional validation of legacy document shapes + remediate_doc_payload conversion of 'guidance' -> 'company_guidance'
+    from scripts.dalton.migrate_legacy_knowledge import remediate_doc_payload
+
+    remediated_thesis, changed = remediate_doc_payload("thesis", bad_thesis)
+    assert changed is True
+    assert remediated_thesis["evidence"][0]["figures"][0]["label"] == "company_guidance"
+    assert validate_schema("thesis", remediated_thesis) == []
+
+    legacy_docs: dict[str, dict[str, Any]] = {
+        "thesis": remediated_thesis,
+        "models": {
+            "schema_version": 1,
+            "current": "v1",
+            "versions": [
+                {
+                    "id": "v1",
+                    "path": "model/amzn_v1.xlsx",
+                    "sha256": "0" * 64,
+                    "created_at": "2026-10-19T00:00:00Z",
+                    "reason": "Initial model",
+                    "recalculated": True,
+                    "key_outputs": [
+                        {
+                            "name": "capex",
+                            "cell": "Summary!B10",
+                            "value": 220.0,
+                            "unit": "USD_bn",
+                            "period": "LTM",
+                        }
+                    ],
+                }
+            ],
+        },
+        "agenda": {
+            "schema_version": 1,
+            "as_of": "2026-10-19T00:00:00Z",
+            "open_questions": [],
+            "next_validations": [],
+            "watch": {
+                "filings": {"sources": ["sec"], "forms": ["10-Q", "10-K"]},
+                "events": [
+                    {
+                        "id": "W1",
+                        "type": "earnings",
+                        "date": None,
+                        "note": "Pending IR confirmation",
+                        "date_status": "unknown",
+                    }
+                ],
+            },
+            "wake_conditions": [],
+        },
+    }
+    for doc_key, doc_payload in legacy_docs.items():
+        assert validate_schema(doc_key, doc_payload) == [], f"Legacy {doc_key} failed validation"
 
     for ev_fixture in ("googl_sec_evidence.json", "amzn_sec_evidence.json"):
         ev_path = REPO_ROOT / "tests" / "fixtures" / "dalton" / "g3" / ev_fixture
@@ -384,6 +455,7 @@ def test_antigravity_sanitize_gemini_schema_flattening_and_deref_debug_log(
         patch(
             "langchain_core.utils.json_schema.dereference_refs",
             side_effect=ValueError("cyclic ref"),
+            autospec=True,
         ),
         caplog.at_level(logging.DEBUG, logger=ag_client.logger.name),
     ):
@@ -455,15 +527,41 @@ def test_researchdata_bridge_test_delay_try_except_and_test_mode(monkeypatch: py
 
 
 @pytest.mark.asyncio
-async def test_dalton_startup_config_error_vs_transient_db_error(monkeypatch: pytest.MonkeyPatch) -> None:
-    """J3 §3.1: RolePolicyError and missing migration raise DaltonStartupConfigError; transient DB error does not."""
+async def test_dalton_startup_config_error_vs_transient_db_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """J3 §3.1: RolePolicyError (via PTC_CONFIG_FILE) and missing migration raise DaltonStartupConfigError; transient DB error does not."""
+    from src.dalton.llm import role_policy as rp_mod
+
     assert issubclass(RolePolicyError, DaltonStartupConfigError)
 
-    # 1. Missing migration raises DaltonStartupConfigError
+    # 0. Bad assist role via PTC_CONFIG_FILE raises RolePolicyError (which is a DaltonStartupConfigError)
+    bad_cfg_file = tmp_path / "agent_config.yaml"
+    bad_cfg_file.write_text(
+        "llm:\n  name: claude-opus-5-5-oauth\n  assist: muse-spark-1.3-contributor-oauth\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PTC_CONFIG_FILE", str(bad_cfg_file))
+    with pytest.raises(RolePolicyError, match="muse-spark-1.3-contributor-oauth"):
+        rp_mod.enforce_role_policy_on_startup()
+
+    # Also verify base + agent_config.dalton.yaml overlay merge when PTC_CONFIG_FILE points to base file
+    bad_cfg_file.write_text("llm:\n  name: claude-opus-5-5-oauth\n", encoding="utf-8")
+    overlay_file = tmp_path / "agent_config.dalton.yaml"
+    overlay_file.write_text("llm:\n  assist: muse-spark-1.3-contributor-oauth\n", encoding="utf-8")
+    monkeypatch.setenv("APP_ENV", "dalton")
+    with pytest.raises(RolePolicyError, match="muse-spark-1.3-contributor-oauth"):
+        rp_mod.enforce_role_policy_on_startup()
+    monkeypatch.delenv("PTC_CONFIG_FILE", raising=False)
+    monkeypatch.delenv("APP_ENV", raising=False)
+
+    # 1. Missing migration (psycopg.errors.UndefinedTable) raises DaltonStartupConfigError
     cur_missing = create_autospec(_CursorProto, instance=True)
     cur_missing.__aenter__.return_value = cur_missing
     cur_missing.__aexit__.return_value = None
-    cur_missing.execute.side_effect = RuntimeError("relation alembic_version_dalton does not exist")
+    cur_missing.execute.side_effect = psycopg.errors.UndefinedTable(
+        'relation "alembic_version_dalton" does not exist'
+    )
     conn_missing = _make_spec_conn(cur_missing)
 
     monkeypatch.setattr("src.dalton.llm.role_policy.enforce_role_policy_on_startup", lambda config=None: [])
@@ -488,7 +586,7 @@ async def test_dalton_startup_config_error_vs_transient_db_error(monkeypatch: py
 
 @pytest.mark.asyncio
 async def test_assist_scope_always_includes_user_id(monkeypatch: pytest.MonkeyPatch) -> None:
-    """J3 §1: assist_json always includes user_id (including LOCAL_DEV_USER_ID) in eff_scope."""
+    """J3 §1: assist_json always includes user_id (including LOCAL_DEV_USER_ID) in eff_scope without workspace_id prefix."""
     captured_scopes: list[str] = []
     mock_complete = create_autospec(assist_mod.dalton_complete)
 
@@ -517,7 +615,88 @@ async def test_assist_scope_always_includes_user_id(monkeypatch: pytest.MonkeyPa
         payload={"a": 1},
         schema={"type": "object", "properties": {"ok": {"type": "boolean"}}},
         user_id=LOCAL_DEV_USER_ID,
+        workspace_id="ws-123",
     )
     assert len(captured_scopes) == 1
     assert captured_scopes[0].startswith(f"assist:{LOCAL_DEV_USER_ID}:unit.test:")
+    assert ":ws:" not in captured_scopes[0]
+
+
+@pytest.mark.asyncio
+async def test_board_and_director_apply_owner_filter_for_local_dev_user(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """J3 §1 (L39): board.py and probes/director.py filter by WHERE user_id = %s when user_id=LOCAL_DEV_USER_ID, and global maintenance does not inflate per-user counts."""
+    from src.dalton.autonomy import board as board_mod
+    from src.dalton.autonomy.probes import director as director_mod
+    from src.dalton.database import publications as pub_db
+
+    executed_board: list[tuple[str, Any]] = []
+    cur_board = create_autospec(_CursorProto, instance=True)
+    cur_board.__aenter__.return_value = cur_board
+    cur_board.__aexit__.return_value = None
+
+    async def _exec_board(sql: str, params: Any = None) -> None:
+        executed_board.append((" ".join(str(sql).split()), params))
+
+    cur_board.execute.side_effect = _exec_board
+    cur_board.fetchall.return_value = []
+    conn_board = _make_spec_conn(cur_board)
+
+    mock_budget = create_autospec(board_mod.get_budget_today)
+    mock_budget.return_value = {"cap_usd": 10.0, "spent_usd": 1.0, "open_reserved_usd": 0.0}
+    monkeypatch.setattr(board_mod, "get_budget_today", mock_budget)
+    monkeypatch.setattr(board_mod, "get_db_connection", lambda: conn_board)
+
+    await board_mod.build_coverage_board(user_id=LOCAL_DEV_USER_ID)
+    ws_queries = [(s, p) for s, p in executed_board if "FROM workspaces" in s]
+    assert len(ws_queries) == 1
+    assert "user_id = %s" in ws_queries[0][0]
+    assert ws_queries[0][1] == (LOCAL_DEV_USER_ID,)
+
+    # System context (user_id=None) does not filter workspaces by user_id and passes user_id=None to get_budget_today
+    executed_board.clear()
+    await board_mod.build_coverage_board(user_id=None)
+    ws_queries_sys = [(s, p) for s, p in executed_board if "FROM workspaces" in s]
+    assert len(ws_queries_sys) == 1
+    assert "user_id = %s" not in ws_queries_sys[0][0]
+    mock_budget.assert_awaited_with(user_id=None)
+
+    # Director probe with user_id=LOCAL_DEV_USER_ID filters all 3 queries by user_id and does not add global expired_sys to user's publish_near_or_past_ttl
+    executed_dir: list[tuple[str, Any]] = []
+    cur_dir = create_autospec(_CursorProto, instance=True)
+    cur_dir.__aenter__.return_value = cur_dir
+    cur_dir.__aexit__.return_value = None
+
+    async def _exec_dir(sql: str, params: Any = None) -> None:
+        executed_dir.append((" ".join(str(sql).split()), params))
+
+    cur_dir.execute.side_effect = _exec_dir
+    cur_dir.fetchall.return_value = []
+    cur_dir.fetchone.return_value = {"cnt": 0}
+    conn_dir = _make_spec_conn(cur_dir)
+
+    mock_expire = create_autospec(pub_db.expire_stale_publications)
+    mock_expire.return_value = [{"request_id": "other-user-req-1"}, {"request_id": "other-user-req-2"}]
+    mock_prune = create_autospec(journal_mod.prune_expired_journal_responses)
+    mock_prune.return_value = 0
+
+    monkeypatch.setattr("src.server.database.pool.get_db_connection", lambda: conn_dir)
+    monkeypatch.setattr(pub_db, "expire_stale_publications", mock_expire)
+    monkeypatch.setattr(journal_mod, "prune_expired_journal_responses", mock_prune)
+
+    sigs, state = await director_mod.probe_director(
+        kind="director_daily",
+        watch_state={},
+        persist=True,
+        user_id=LOCAL_DEV_USER_ID,
+    )
+    assert len(executed_dir) == 3
+    for sql_s, params_p in executed_dir:
+        assert "WHERE user_id = %s" in sql_s
+        assert LOCAL_DEV_USER_ID in (params_p or ())
+    # Global expired requests from other users must not inflate LOCAL_DEV_USER_ID's publish_near_or_past_ttl
+    assert state["last_director_check_counts"]["publish_near_or_past_ttl"] == 0
+    assert sigs == []
+
 

@@ -171,12 +171,7 @@ async def assist_json(
             default=str,
         )
         payload_sha = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()[:24]
-        if scope_ref:
-            eff_scope = scope_ref
-        elif workspace_id:
-            eff_scope = f"assist:{user_id}:ws:{workspace_id}:{task}:{payload_sha}"
-        else:
-            eff_scope = f"assist:{user_id}:{task}:{payload_sha}"
+        eff_scope = scope_ref or f"assist:{user_id}:{task}:{payload_sha}"
 
         schema_json = json.dumps(schema, ensure_ascii=False, indent=2)
         system_prompt = (

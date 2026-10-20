@@ -1592,6 +1592,10 @@ def remediate_doc_payload(doc_key: str, doc: dict[str, Any]) -> tuple[dict[str, 
         for ev in updated.get("evidence") or []:
             if not isinstance(ev, dict):
                 continue
+            for fig in ev.get("figures") or []:
+                if isinstance(fig, dict) and fig.get("label") == "guidance":
+                    fig["label"] = "company_guidance"
+                    changed = True
             src = ev.get("source")
             if not isinstance(src, dict):
                 continue
@@ -1614,7 +1618,7 @@ async def remediate_migrated_workspaces(
     workspace_ids: list[str],
     backend_by_workspace: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """Append a new knowledge version for any workspace with fabricated defaults or legacy_thesis evidence."""
+    """Append a new knowledge version for any workspace with fabricated defaults, legacy_thesis, or guidance label."""
     from src.dalton.database import knowledge as db_knowledge
     from src.dalton.knowledge import service as knowledge_service
 
@@ -1624,14 +1628,19 @@ async def remediate_migrated_workspaces(
             latest = await db_knowledge.latest_version(ws_id, doc_key)
             if not latest or not isinstance(latest.get("content"), dict):
                 continue
+            orig_text = json.dumps(latest["content"], ensure_ascii=False)
             cleaned, changed = remediate_doc_payload(doc_key, latest["content"])
             if not changed:
                 continue
-            reason = (
-                "迁移的旧认知不作为核实依据"
-                if doc_key == "thesis"
-                else "移除迁移脚本编造的数值"
-            )
+            if doc_key == "thesis":
+                if '"label": "guidance"' in orig_text and "sources/legacy/" not in orig_text:
+                    reason = "将 figures.label 枚举值从 guidance 修正为 company_guidance"
+                elif '"label": "guidance"' in orig_text:
+                    reason = "迁移的旧认知不作为核实依据；并将 figures.label 从 guidance 修正为 company_guidance"
+                else:
+                    reason = "迁移的旧认知不作为核实依据"
+            else:
+                reason = "移除迁移脚本编造的数值"
             res = await knowledge_service.apply_update(
                 user_id=user_id,
                 workspace_id=ws_id,

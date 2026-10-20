@@ -314,16 +314,14 @@ async def probe_director(
             "unconfirmed_earnings_14d": 0,
         }
     elif persist:
-        expired_sys = 0
-        if user_id is not None:
-            expired_sys = await _run_daily_system_maintenance(ttl_hours=ttl_hours, user_id=None)
         counts = await _check_db_actionable_work(
             now_dt=now_dt,
             now_date=now_date,
             ttl_hours=ttl_hours,
             user_id=user_id,
         )
-        counts["publish_near_or_past_ttl"] += expired_sys
+        if user_id is not None:
+            await _run_daily_system_maintenance(ttl_hours=ttl_hours, user_id=None)
     else:
         counts = {
             "due_validations": 0,

@@ -332,19 +332,32 @@ class RolePolicyError(DaltonStartupConfigError):
 
 
 def _load_default_agent_config() -> dict[str, Any]:
-    env_cfg = os.environ.get("PTC_CONFIG_FILE", "").strip()
-    if env_cfg:
-        cand = Path(env_cfg)
-        cfg_path = cand if cand.is_absolute() else (REPO_ROOT / cand)
-    else:
-        cfg_path = REPO_ROOT / "agent_config.dalton.yaml"
-    if not cfg_path.exists():
+    from ptc_agent.config.file_utils import (
+        AGENT_CONFIG_FILE,
+        _deep_merge,
+        _read_yaml,
+        find_config_file,
+        load_yaml_config,
+    )
+
+    cfg_path = find_config_file(
+        AGENT_CONFIG_FILE,
+        search_paths=[REPO_ROOT],
+        env_var="PTC_CONFIG_FILE",
+    )
+    if cfg_path is None:
         return {}
     try:
-        import yaml
-
-        loaded = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
-        return loaded if isinstance(loaded, dict) else {}
+        loaded = load_yaml_config(str(cfg_path), use_cache=False)
+        if not isinstance(loaded, dict):
+            return {}
+        if not os.getenv("APP_ENV", "").strip() and cfg_path.name == AGENT_CONFIG_FILE:
+            dalton_overlay = cfg_path.with_name(f"{cfg_path.stem}.dalton{cfg_path.suffix}")
+            if dalton_overlay.is_file():
+                overlay_cfg = _read_yaml(dalton_overlay)
+                if isinstance(overlay_cfg, dict):
+                    loaded = _deep_merge(loaded, overlay_cfg)
+        return loaded
     except Exception:
         return {}
 

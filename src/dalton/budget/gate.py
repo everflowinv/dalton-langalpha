@@ -7,6 +7,7 @@ from decimal import Decimal
 from typing import Any, Optional
 
 from fastapi import HTTPException
+import psycopg
 from psycopg.rows import dict_row
 
 from src.config.env import HOST_MODE, USD_TO_CREDITS_RATE
@@ -15,6 +16,8 @@ from src.dalton.budget.port import (
     format_daily_budget_exhausted_message,
 )
 from src.dalton.budget.service import reconcile_and_summarize_day
+from src.dalton.llm import role_policy
+from src.dalton.llm.role_policy import DaltonStartupConfigError
 from src.dalton.settings import (
     get_dalton_settings,
     is_dalton_budget_gate_enabled,
@@ -142,13 +145,7 @@ async def verify_local_wiring() -> None:
     when startup must fail fast; other transient errors (e.g. DB temporarily unreachable)
     propagate as non-`DaltonStartupConfigError` so `setup.py` logs a warning.
     """
-    import psycopg
-    from src.dalton.llm.role_policy import (
-        DaltonStartupConfigError as _DaltonStartupConfigError,
-        enforce_role_policy_on_startup,
-    )
-
-    enforce_role_policy_on_startup()
+    role_policy.enforce_role_policy_on_startup()
 
     try:
         if not is_dalton_budget_gate_enabled():
@@ -169,7 +166,7 @@ async def verify_local_wiring() -> None:
                 v_row = await cur.fetchone()
                 version_num = (v_row or {}).get("version_num")
                 if not version_num:
-                    raise _DaltonStartupConfigError(
+                    raise DaltonStartupConfigError(
                         "[DaltonBudget] alembic_version_dalton has no version_num; "
                         "run Dalton database migrations before starting with DALTON_BUDGET_GATE=1."
                     )
@@ -196,24 +193,15 @@ async def verify_local_wiring() -> None:
                 cfg_count,
                 default_cap,
             )
-    except _DaltonStartupConfigError as exc:
+    except DaltonStartupConfigError as exc:
         logger.error("[DaltonBudget] Startup wiring verification failed: %s", exc)
         raise
     except Exception as exc:
-        logger.error("[DaltonBudget] Startup wiring verification failed: %s", exc)
-        msg_lower = str(exc).lower()
-        if isinstance(exc, psycopg.errors.UndefinedTable) or (
-            "does not exist" in msg_lower
-            and (
-                "alembic_version_dalton" in msg_lower
-                or "dalton_budget_" in msg_lower
-            )
-        ):
-            raise _DaltonStartupConfigError(
+        if isinstance(exc, psycopg.errors.UndefinedTable) or getattr(exc, "sqlstate", None) == "42P01":
+            logger.error("[DaltonBudget] Startup wiring verification failed: %s", exc)
+            raise DaltonStartupConfigError(
                 f"[DaltonBudget] Missing Dalton database migration: {exc}"
             ) from exc
+        logger.warning("[DaltonBudget] Startup wiring verification failed: %s", exc)
         raise
-
-
-from src.dalton.llm.role_policy import DaltonStartupConfigError  # noqa: E402
 

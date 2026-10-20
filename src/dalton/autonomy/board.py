@@ -11,7 +11,6 @@ from zoneinfo import ZoneInfo
 import yaml
 from psycopg.rows import dict_row
 
-from src.config.env import LOCAL_DEV_USER_ID
 from src.dalton.budget.service import get_budget_today
 from src.dalton.settings import get_dalton_settings
 from src.server.database.pool import get_db_connection
@@ -104,7 +103,7 @@ async def build_coverage_board(
 
     budget_raw: dict[str, Any] = {}
     try:
-        budget_raw = await get_budget_today(user_id=user_id or LOCAL_DEV_USER_ID)
+        budget_raw = await get_budget_today(user_id=user_id)
     except Exception as e:
         logger.warning("[DALTON_BOARD] get_budget_today failed: %s", e)
 
