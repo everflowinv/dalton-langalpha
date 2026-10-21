@@ -110,9 +110,8 @@ async def _run_daily_system_maintenance(
     try:
         from src.dalton.database.publications import expire_stale_publications
 
-        expired_rows = await expire_stale_publications(ttl_hours=ttl_hours)
-        if expired_rows:
-            expired_count = len(expired_rows)
+        # Returns the number of rows it expired, not the rows.
+        expired_count = int(await expire_stale_publications(ttl_hours=ttl_hours) or 0)
     except Exception as e:
         logger.warning("[DALTON_DIRECTOR_PROBE] expire_stale_publications failed: %s", e)
 
@@ -128,6 +127,32 @@ async def _run_daily_system_maintenance(
     except Exception as e:
         logger.warning("[DALTON_DIRECTOR_PROBE] prune_expired_journal_responses failed: %s", e)
     return expired_count
+
+
+async def run_daily_system_maintenance() -> dict[str, int]:
+    """System-context daily maintenance entrypoint; runs with `user_id=None` and accepts no external IDs."""
+    settings = get_dalton_settings()
+    ttl_hours = int(getattr(settings.publish, "approval_ttl_hours", 72) or 72)
+    expired_publications = await _run_daily_system_maintenance(
+        ttl_hours=ttl_hours,
+        user_id=None,
+    )
+    expired_signals = 0
+    try:
+        from src.dalton.database import watch as watch_db
+
+        sig_rows = await watch_db.expire_old_signals(
+            max_age_days=7,
+            workspace_id=None,
+            system_maintenance=True,
+        )
+        expired_signals = len(sig_rows or [])
+    except Exception as e:
+        logger.warning("[DALTON_DIRECTOR_PROBE] expire_old_signals failed: %s", e)
+    return {
+        "expired_publications": expired_publications,
+        "expired_signals": expired_signals,
+    }
 
 
 async def _check_db_actionable_work(
@@ -320,8 +345,6 @@ async def probe_director(
             ttl_hours=ttl_hours,
             user_id=user_id,
         )
-        if user_id is not None:
-            await _run_daily_system_maintenance(ttl_hours=ttl_hours, user_id=None)
     else:
         counts = {
             "due_validations": 0,

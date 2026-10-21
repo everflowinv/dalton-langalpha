@@ -15,7 +15,9 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
-from src.config.env import LOCAL_DEV_USER_ID
+from fastapi import HTTPException
+
+from src.dalton.auth import verify_workspace_access
 from src.dalton.autonomy.backoff import (
     clear_probe_backoff,
     is_in_backoff,
@@ -118,6 +120,9 @@ async def _triage_signals_with_llm(
     Returns ``(kept_signals, skipped_signals, triage_reason)``.
     Conservative fallback: if ``assist_json`` fails, errors, or returns invalid data, all signals wake.
     """
+    if not user_id or not str(user_id).strip():
+        raise ValueError("user_id is required")
+    user_id = str(user_id).strip()
     if not signals:
         return [], [], "no_triage_signals"
 
@@ -180,7 +185,7 @@ async def _triage_signals_with_llm(
             instructions=system_prompt,
             payload=user_payload,
             schema=TRIAGE_OUTPUT_SCHEMA,
-            user_id=str(user_id or LOCAL_DEV_USER_ID),
+            user_id=user_id,
             workspace_id=workspace_id,
         )
     except Exception as e:
@@ -346,6 +351,9 @@ def is_dalton_automation(automation: dict[str, Any]) -> bool:
 
 async def _check_budget_available(user_id: Optional[str] = None) -> tuple[bool, Optional[str]]:
     """Return (False, 'budget_exhausted') if the shared daily USD budget is exhausted (A1, A14)."""
+    if not user_id or not str(user_id).strip():
+        raise ValueError("user_id is required")
+    user_id = str(user_id).strip()
     try:
         from src.dalton.budget.service import get_budget_today
 
@@ -400,7 +408,8 @@ async def _defer_once_automation_on_budget_exhausted(
     automation["status"] = "active"
 
     automation_id = str(automation.get("automation_id") or "") or None
-    if persist and automation_id:
+    user_id = str(automation.get("user_id") or "").strip() or None
+    if persist and automation_id and user_id:
         try:
             from src.server.database.pool import get_db_connection
 
@@ -412,33 +421,65 @@ async def _defer_once_automation_on_budget_exhausted(
                         SET status = 'active',
                             next_run_at = COALESCE(next_run_at, last_run_at, NOW()) + INTERVAL '1 day'
                         WHERE automation_id = %s
+                          AND user_id = %s
                           AND status IN ('active', 'executing')
                         """,
-                        (automation_id,),
+                        (automation_id, user_id),
                     )
         except Exception as e:
             logger.warning("[DALTON_PREFLIGHT] defer once automation failed for %s: %s", automation_id, e)
 
 
+@dataclass(frozen=True)
+class _VerifiedAutomationOwnership:
+    """Verified `(user_id, workspace_id)` ownership result required by `_preflight_check_inner`."""
+
+    user_id: str
+    workspace_id: str
+
+
+async def _verify_automation_workspace_ownership(
+    automation: dict[str, Any],
+) -> _VerifiedAutomationOwnership:
+    """Verify ``user_id`` and ``workspace_id`` ownership for a Dalton automation fail-closed."""
+    raw_user_id = automation.get("user_id")
+    if not raw_user_id or not str(raw_user_id).strip():
+        raise ValueError("user_id is required")
+    user_id = str(raw_user_id).strip()
+    raw_ws_id = automation.get("workspace_id")
+    workspace_id = str(raw_ws_id).strip() if raw_ws_id is not None else ""
+    if not workspace_id or workspace_id.lower() == "home":
+        raise HTTPException(
+            status_code=403,
+            detail="Valid workspace_id is required for Dalton automation execution",
+        )
+    await verify_workspace_access(workspace_id, user_id)
+    return _VerifiedAutomationOwnership(user_id=user_id, workspace_id=workspace_id)
+
+
 async def _preflight_check_inner(
     automation: dict[str, Any],
     execution_id: str,
+    ownership: _VerifiedAutomationOwnership,
     *,
     watch_state_override: Optional[dict[str, Any]] = None,
     agenda_doc_override: Optional[dict[str, Any]] = None,
     persist: bool = True,
 ) -> PreflightResult:
     """Inner implementation of `preflight_check` wrapped by `asyncio.wait_for` (A3)."""
+    if not is_dalton_automation(automation):
+        return PreflightResult(should_wake=True, decision="passthrough", reason="non_dalton")
+
+    if not isinstance(ownership, _VerifiedAutomationOwnership):
+        raise TypeError("ownership must be a _VerifiedAutomationOwnership instance")
+    user_id = ownership.user_id
+    workspace_id = ownership.workspace_id
+
     settings = get_dalton_settings()
     if not settings.autonomy.enabled:
         return PreflightResult(should_wake=True, decision="passthrough", reason="autonomy_disabled")
 
-    if not is_dalton_automation(automation):
-        return PreflightResult(should_wake=True, decision="passthrough", reason="non_dalton")
-
     automation_id = str(automation.get("automation_id") or "") or None
-    workspace_id = str(automation["workspace_id"]) if automation.get("workspace_id") else None
-    user_id = str(automation.get("user_id") or LOCAL_DEV_USER_ID)
     name = str(automation.get("name") or "dalton-task")
     ticker = _extract_ticker(automation)
     kind = _determine_kind(automation)
@@ -733,7 +774,11 @@ async def _preflight_check_inner(
     signal_ids_to_mark = [str(s["signal_id"]) for s in woke_signals if s.get("signal_id")]
     if persist and signal_ids_to_mark:
         try:
-            claimed_raw = await watch_db.claim_signals_woken(signal_ids_to_mark, execution_id)
+            claimed_raw = await watch_db.claim_signals_woken(
+                signal_ids_to_mark,
+                execution_id,
+                workspace_id=workspace_id,
+            )
             claimed_ids = {
                 str(r.get("signal_id") if isinstance(r, dict) else r)
                 for r in (claimed_raw or [])
@@ -823,16 +868,47 @@ async def preflight_check(
     timeout_s: Optional[float] = None,
 ) -> PreflightResult:
     """Run zero-token preflight + optional LLM triage bounded by `preflight_timeout_s` (45s default, A3)."""
+    if not is_dalton_automation(automation):
+        return PreflightResult(should_wake=True, decision="passthrough", reason="non_dalton")
+
+    settings = get_dalton_settings()
     eff_timeout = float(
         timeout_s
         if timeout_s is not None
-        else (get_dalton_settings().autonomy.preflight_timeout_s or 45)
+        else (settings.autonomy.preflight_timeout_s or 45)
     )
+
+    # Workspace ownership check MUST complete BEFORE `autonomy.enabled` and BEFORE "timeout -> conservative wake":
+    # if ownership verification times out or fails, refuse execution and never wake.
+    try:
+        verified_ownership = await asyncio.wait_for(
+            _verify_automation_workspace_ownership(automation),
+            timeout=eff_timeout,
+        )
+    except asyncio.TimeoutError:
+        name = str(automation.get("name") or "dalton-task")
+        logger.warning(
+            "[DALTON_PREFLIGHT] workspace ownership verification timed out after %.1fs for %s; refusing to wake",
+            eff_timeout,
+            name,
+        )
+        return PreflightResult(
+            should_wake=False,
+            decision="skip",
+            reason="workspace_access_timeout",
+            signals=[],
+            wake_context=None,
+        )
+
+    if not settings.autonomy.enabled:
+        return PreflightResult(should_wake=True, decision="passthrough", reason="autonomy_disabled")
+
     try:
         return await asyncio.wait_for(
             _preflight_check_inner(
                 automation,
                 execution_id,
+                verified_ownership,
                 watch_state_override=watch_state_override,
                 agenda_doc_override=agenda_doc_override,
                 persist=persist,
@@ -878,10 +954,46 @@ async def decide(
     try:
         if not is_dalton_automation(automation):
             return None
-        res = await preflight_check(automation, execution_id)
+        raw_user_id = automation.get("user_id")
+        if not raw_user_id or not str(raw_user_id).strip():
+            logger.warning(
+                "[DALTON_PREFLIGHT] decide() skipping Dalton automation %r (execution_id=%s): user_id is missing",
+                automation.get("name"),
+                execution_id,
+            )
+            return PreflightResult(
+                should_wake=False,
+                decision="skip",
+                reason="missing_user_id",
+                signals=[],
+            )
+        try:
+            res = await preflight_check(automation, execution_id)
+        except (HTTPException, PermissionError, ValueError) as exc:
+            detail = getattr(exc, "detail", str(exc))
+            status_code = getattr(exc, "status_code", 403)
+            logger.warning(
+                "[DALTON_PREFLIGHT] decide() skipping Dalton automation %r (execution_id=%s): workspace %r access denied (%s: %s)",
+                automation.get("name"),
+                execution_id,
+                automation.get("workspace_id"),
+                status_code,
+                detail,
+            )
+            return PreflightResult(
+                should_wake=False,
+                decision="skip",
+                reason="workspace_access_denied",
+                signals=[],
+            )
         if res.decision == "passthrough":
             return None
         return res
     except Exception as e:
-        logger.warning("[DALTON_PREFLIGHT] decide() unexpected error (waking fallback): %s", e)
-        return None
+        logger.warning("[DALTON_PREFLIGHT] decide() unexpected error (skipping fail-closed): %s", e)
+        return PreflightResult(
+            should_wake=False,
+            decision="skip",
+            reason="preflight_error",
+            signals=[],
+        )

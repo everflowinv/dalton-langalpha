@@ -33,6 +33,10 @@ async def authenticate_websocket(websocket: WebSocket) -> str:
     Violation) and a ``WebSocketException`` is raised so the caller's
     handler exits cleanly.
     """
+    # DALTON-HOOK(dalton-auth): verify WebSocket JWT + allowlist when Dalton auth is enabled
+    from src.dalton.auth import authenticate_dalton_websocket, is_dalton_supabase_auth_enabled
+    if is_dalton_supabase_auth_enabled():
+        return await authenticate_dalton_websocket(websocket)
     if HOST_MODE == "oss":
         return LOCAL_DEV_USER_ID
 

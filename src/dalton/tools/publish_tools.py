@@ -7,7 +7,6 @@ from typing import Annotated, Any, Literal
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool, tool
 
-from src.config.env import LOCAL_DEV_USER_ID
 from src.dalton.database.publications import resolve_thread_author_model
 from src.dalton.publish.service import run_check_draft, run_publish
 from src.dalton.tools.knowledge_tools import (
@@ -46,15 +45,15 @@ def create_publish_tools(filesystem_backend: Any = None) -> list[BaseTool]:
         Returns: one-line summary of total, matched, exempt, and unverified figures plus the audit file path.
         """
         user_id, workspace_id, thread_id, _ = _extract_run_identity(config)
-        if not workspace_id:
-            return "ERROR: workspace_id is required in RunnableConfig."
+        if not user_id or not workspace_id:
+            return "ERROR: user_id and workspace_id are required in RunnableConfig."
         res = await run_check_draft(
             workspace_id=workspace_id,
             draft_path=draft_path,
             facts_path=facts_path,
             backend=filesystem_backend,
             use_llm_judge=True,
-            user_id=user_id or LOCAL_DEV_USER_ID,
+            user_id=user_id,
             thread_id=thread_id,
         )
         return str(res["message"])

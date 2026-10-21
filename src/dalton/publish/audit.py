@@ -9,7 +9,6 @@ import logging
 import re
 from typing import Any
 
-from src.config.env import LOCAL_DEV_USER_ID
 from src.dalton.publish.match import (
     UNIT_BASE,
     MatchCandidate,
@@ -418,11 +417,14 @@ async def judge_figures_batch_with_llm(
     batch_items: list[tuple[int, ExtractedFigure, list[dict[str, Any]]]],
     *,
     section_title: str = "",
-    user_id: str = LOCAL_DEV_USER_ID,
+    user_id: str,
     workspace_id: str | None = None,
     thread_id: str | None = None,
 ) -> dict[int, tuple[str, dict[str, Any]]]:
     """Run grounded LLM source-consistency judgment (`audit.judge`) for a batch of up to 10 figures in one section (P0I §1.6)."""
+    if not user_id or not str(user_id).strip():
+        raise ValueError("user_id is required")
+    user_id = str(user_id).strip()
     if not batch_items:
         return {}
     if assist_json is None:
@@ -698,12 +700,15 @@ async def aaudit_draft(
     facts_markdown: str | None = None,
     metric_aliases: dict[str, list[str]] | None = None,
     use_llm_judge: bool = True,
-    user_id: str = LOCAL_DEV_USER_ID,
+    user_id: str,
     workspace_id: str | None = None,
     thread_id: str | None = None,
     total_timeout_s: float = 120.0,
 ) -> AuditResult:
     """Async 4-step figure audit (P0H §1.2 / P0I §1): Step A extract -> Step B LLM label -> Step C match -> Step D LLM judge + anchor."""
+    if not user_id or not str(user_id).strip():
+        raise ValueError("user_id is required")
+    user_id = str(user_id).strip()
     draft_sha = hashlib.sha256(draft_markdown.encode("utf-8")).hexdigest()
     extracted = extract_figures(draft_markdown)
     labeling_incomplete = False

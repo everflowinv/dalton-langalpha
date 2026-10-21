@@ -60,6 +60,10 @@ def _service_token_user_id(request: Request) -> tuple[bool, Optional[str]]:
     """
     if not _SERVICE_TOKEN:
         return False, None
+    # DALTON-HOOK(dalton-auth): require >=32-char service token when Dalton auth is enabled
+    from src.dalton.auth import is_dalton_service_token_valid, is_dalton_supabase_auth_enabled
+    if is_dalton_supabase_auth_enabled() and not is_dalton_service_token_valid(_SERVICE_TOKEN):
+        return False, None
     token = request.headers.get("X-Service-Token")
     if not token:
         return False, None
@@ -86,6 +90,11 @@ async def get_current_user_id(
         if not user_id:
             raise HTTPException(status_code=401, detail="Missing X-User-Id")
         return user_id
+
+    # DALTON-HOOK(dalton-auth): verify Supabase JWT + allowlist when Dalton auth is enabled
+    from src.dalton.auth import is_dalton_supabase_auth_enabled, verify_dalton_bearer
+    if is_dalton_supabase_auth_enabled():
+        return (await verify_dalton_bearer(credentials, missing_detail="Missing authentication")).user_id
 
     if HOST_MODE == "oss":
         return LOCAL_DEV_USER_ID
@@ -114,6 +123,10 @@ async def get_optional_user_id(
     matched, user_id = _service_token_user_id(request)
     if matched:
         return user_id
+    # DALTON-HOOK(dalton-auth): verify optional Supabase JWT + allowlist when Dalton auth is enabled
+    from src.dalton.auth import is_dalton_supabase_auth_enabled, verify_dalton_optional_bearer
+    if is_dalton_supabase_auth_enabled():
+        return await verify_dalton_optional_bearer(credentials)
     if HOST_MODE == "oss":
         return LOCAL_DEV_USER_ID
     if credentials is None:
@@ -152,6 +165,10 @@ async def get_viewer(
         return Viewer(await get_optional_user_id(request, credentials))
     except HTTPException as e:
         if e.status_code == 401:
+            return Viewer(None)
+        # DALTON-HOOK(dalton-auth): treat non-allowlisted 403 as anonymous viewer on public share pages
+        from src.dalton.auth import is_dalton_supabase_auth_enabled
+        if e.status_code == 403 and is_dalton_supabase_auth_enabled():
             return Viewer(None)
         if e.status_code == 503:
             return Viewer(None, unconfirmed=e)

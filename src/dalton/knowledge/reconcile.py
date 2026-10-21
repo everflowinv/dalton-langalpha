@@ -8,6 +8,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Any
 
+from src.dalton.auth import verify_workspace_access
 from src.dalton.database import knowledge as db_knowledge
 from src.dalton.database import publications as db_publications
 from src.dalton.database import verdicts as db_verdicts
@@ -48,6 +49,7 @@ async def detect_direct_edits(
       ``apply_pending`` backs up the edited markdown to ``history/`` on the next turn.
     - Tampering or deletion of ``published/**`` files is logged and surfaced as a warning.
     """
+    await verify_workspace_access(workspace_id, user_id)
     meta = await get_file_metadata_for_sync(workspace_id)
     latest_all = await db_knowledge.list_all_latest_for_workspace(
         workspace_id, valid_only=False
@@ -243,6 +245,8 @@ async def apply_pending(
     user_id: str | None = None,
 ) -> dict[str, Any]:
     """Reconcile any unwritten versions and refresh ``agent.md`` at turn start (PK.5)."""
+    if user_id is not None:
+        await verify_workspace_access(workspace_id, user_id)
     if backend is None:
         return {"written": 0, "alerts": []}
 

@@ -29,3 +29,5 @@ web/src/config/__tests__/brand.test.tsx
 web/src/components/brand/EverflowMark.tsx
 web/src/components/brand/BrandMark.tsx
 web/src/components/brand/__tests__/
+web/src/config/daltonAuth.ts
+web/src/config/__tests__/daltonAuth.test.ts

@@ -192,6 +192,7 @@ async def test_match_figures_all_orders_and_discrepancies() -> None:
         models_doc=models_doc,
         provenance_records=provenance_records,
         use_llm_judge=False,
+        user_id="local-dev-user",
     )
     assert audit_ok.passed, f"Unmatched: {audit_ok.unmatched}"
     assert audit_ok.matched == 8
@@ -215,6 +216,7 @@ async def test_match_figures_all_orders_and_discrepancies() -> None:
         models_doc=models_doc,
         provenance_records=provenance_records,
         use_llm_judge=False,
+        user_id="local-dev-user",
     )
     assert not audit_bad.passed
     reasons_by_raw = {u["raw"]: u["reason"] for u in audit_bad.unmatched}
@@ -267,6 +269,7 @@ async def test_facts_ledger_order_0_matching() -> None:
         thesis_doc=thesis_doc,
         facts_markdown=facts_md,
         use_llm_judge=False,
+        user_id="local-dev-user",
     )
     assert audit.passed
     assert audit.matched == 1
@@ -445,7 +448,7 @@ async def test_g31_counterexamples_units_footnotes_tables_and_sec_accession(
             }
         ]
     }
-    res = await aaudit_draft(draft, thesis_doc=thesis_doc)
+    res = await aaudit_draft(draft, thesis_doc=thesis_doc, user_id="local-dev-user")
     assert res.passed, f"Unexpected failures: {res.unmatched}"
     assert res.labeling_incomplete is False
     assert len(res.verified) == 9
@@ -463,7 +466,7 @@ async def test_g31_provenance_rejects_wrong_metric_or_period_r4_3() -> None:
         }
     }
     draft = "2Q26 广告收入同比 +21.0%[^p1]。\n\n[^p1]: prov:prov-sec-001\n"
-    res = await aaudit_draft(draft, provenance_records=provenance_records, use_llm_judge=False)
+    res = await aaudit_draft(draft, provenance_records=provenance_records, use_llm_judge=False, user_id="local-dev-user")
     assert not res.passed
     assert len(res.unverified) == 1
     assert len(res.contradicted) == 0
@@ -612,6 +615,7 @@ async def test_g31_llm_judge_reverification_and_uncertain_bucket_does_not_block(
             }
         },
         use_llm_judge=False,
+        user_id="local-dev-user",
     )
     assert mixed_res.passed, f"Unexpected failures on mixed consensus+evidence line: {mixed_res.unmatched}"
     assert len(mixed_res.verified) == 2
@@ -654,6 +658,7 @@ async def test_g31_llm_judge_reverification_and_uncertain_bucket_does_not_block(
         thesis_doc={
             "evidence": [{"id": "E0001", "fact": "2Q26 某细分指标在北美市场表现良好。"}]
         },
+        user_id="local-dev-user",
     )
     assert res.labeling_incomplete is True
     assert len(res.uncertain) == 1
@@ -724,6 +729,7 @@ async def test_g31_realistic_report_false_positive_rate_at_most_2() -> None:
         models_doc=models_doc,
         provenance_records=provenance_records,
         use_llm_judge=False,
+        user_id="local-dev-user",
     )
     false_positives = len(res.contradicted) + len(res.unverified)
     assert false_positives == 0, f"Unexpected false positives ({false_positives}): {res.unmatched}"
@@ -899,7 +905,7 @@ async def test_p0i_ten_r3_false_verified_counterexamples(
             }
         ]
     }
-    det_res = await aaudit_draft(draft, thesis_doc=thesis_doc, use_llm_judge=False)
+    det_res = await aaudit_draft(draft, thesis_doc=thesis_doc, use_llm_judge=False, user_id="local-dev-user")
     assert det_res.matched == 0, f"Order 4 must never auto-verify unfootnoted figures: {det_res.matches}"
 
     mock_assist = create_autospec(assist_json)
@@ -964,7 +970,7 @@ async def test_p0i_ten_r3_false_verified_counterexamples(
     monkeypatch.setattr(numbers_mod, "assist_json", mock_assist)
     monkeypatch.setattr(audit_mod, "assist_json", mock_assist)
 
-    full_res = await aaudit_draft(draft, thesis_doc=thesis_doc, use_llm_judge=True)
+    full_res = await aaudit_draft(draft, thesis_doc=thesis_doc, use_llm_judge=True, user_id="local-dev-user")
     assert full_res.matched == 0
     incidental_raws = {i["raw"] for i in full_res.incidental}
     assert {"600", "500"}.issubset(incidental_raws)
@@ -1085,7 +1091,7 @@ async def test_p0i_legacy_thesis_excluded_from_verification_and_step_d() -> None
         ]
     }
     draft = "2Q26 广告收入为 594 亿美元[^E-LEGACY-001]。\n\n[^E-LEGACY-001]: evidence:E-LEGACY-001\n"
-    res = await aaudit_draft(draft, thesis_doc=thesis_doc, use_llm_judge=False)
+    res = await aaudit_draft(draft, thesis_doc=thesis_doc, use_llm_judge=False, user_id="local-dev-user")
     assert res.matched == 0
     assert len(res.unverified) == 1
     assert "旧认知中的说法，尚未用原始来源核实" in res.unverified[0]["hint"]
@@ -1191,8 +1197,8 @@ async def test_p0i_section_batch_cache_isolation(
     monkeypatch.setattr(numbers_mod, "assist_json", mock_assist)
     monkeypatch.setattr(audit_mod, "assist_json", mock_assist)
 
-    await aaudit_draft(draft_v1, thesis_doc=thesis_doc, use_llm_judge=True)
-    await aaudit_draft(draft_v2, thesis_doc=thesis_doc, use_llm_judge=True)
+    await aaudit_draft(draft_v1, thesis_doc=thesis_doc, use_llm_judge=True, user_id="local-dev-user")
+    await aaudit_draft(draft_v2, thesis_doc=thesis_doc, use_llm_judge=True, user_id="local-dev-user")
 
     assert len(captured_label_sec2) == 2
     assert captured_label_sec2[0] == captured_label_sec2[1]
@@ -1237,7 +1243,7 @@ async def test_p0i_g3_gold_standard_and_cross_control_zero_false_verified(
             assert src["ref"].get("accession") or src["ref"].get("url")
 
     # 1. Cross-control: GOOGL draft audited against META evidence MUST produce 0 verified figures!
-    cross_det = await aaudit_draft(googl_draft, thesis_doc=meta_ev, use_llm_judge=False)
+    cross_det = await aaudit_draft(googl_draft, thesis_doc=meta_ev, use_llm_judge=False, user_id="local-dev-user")
     assert cross_det.matched == 0, f"Cross-control (GOOGL draft vs META evidence) false verified: {cross_det.matches}"
 
     # 2. Audit GOOGL and AMZN drafts using gold-standard-informed Step B & Step D autospec double
@@ -1330,10 +1336,10 @@ async def test_p0i_g3_gold_standard_and_cross_control_zero_false_verified(
     monkeypatch.setattr(audit_mod, "assist_json", mock_assist)
 
     current_report["name"] = "GOOGL"
-    googl_res = await aaudit_draft(googl_draft, thesis_doc=googl_ev, use_llm_judge=True)
+    googl_res = await aaudit_draft(googl_draft, thesis_doc=googl_ev, use_llm_judge=True, user_id="local-dev-user")
 
     current_report["name"] = "AMZN"
-    amzn_res = await aaudit_draft(amzn_draft, thesis_doc=amzn_ev, use_llm_judge=True)
+    amzn_res = await aaudit_draft(amzn_draft, thesis_doc=amzn_ev, use_llm_judge=True, user_id="local-dev-user")
 
     for rep_name, res in [("GOOGL", googl_res), ("AMZN", amzn_res)]:
         assert res.labeling_incomplete is False
@@ -1408,7 +1414,7 @@ async def test_p0j_j2_failed_batch_never_excludes_figures_and_colloquial_always_
     monkeypatch.setattr(numbers_mod, "assist_json", mock_assist)
     monkeypatch.setattr(audit_mod, "assist_json", mock_assist)
 
-    col_res = await aaudit_draft(colloquial_draft, thesis_doc={"evidence": []}, use_llm_judge=True)
+    col_res = await aaudit_draft(colloquial_draft, thesis_doc={"evidence": []}, use_llm_judge=True, user_id="local-dev-user")
     assert any("渠道观察" in s for s in seen_sections)
     extracted_raws = {u["raw"] for u in col_res.unverified}
     assert expected_raws.issubset(extracted_raws)
@@ -1464,6 +1470,7 @@ async def test_p0j_j2_failed_batch_never_excludes_figures_and_colloquial_always_
     labeled_figs, ok = await numbers_mod.label_figures_with_status(
         draft_with_figs,
         figs,
+        user_id="local-dev-user",
         stats_out=stats,
     )
     assert ok is False
@@ -1473,7 +1480,7 @@ async def test_p0j_j2_failed_batch_never_excludes_figures_and_colloquial_always_
         assert lf.label_hint == "reported"
         assert lf.incidental_category == ""
 
-    audit_fail_res = await aaudit_draft(draft_with_figs, thesis_doc={"evidence": []}, use_llm_judge=True)
+    audit_fail_res = await aaudit_draft(draft_with_figs, thesis_doc={"evidence": []}, use_llm_judge=True, user_id="local-dev-user")
     assert audit_fail_res.labeling_incomplete is True
     assert len(audit_fail_res.incidental) == 0
     assert audit_fail_res.figures == 3
@@ -1596,7 +1603,7 @@ async def test_p0j_j2_decimal_version_number_two_counterexamples(
     monkeypatch.setattr(numbers_mod, "assist_json", mock_assist_fin)
     monkeypatch.setattr(audit_mod, "assist_json", mock_assist_fin)
 
-    res_fin = await aaudit_draft(draft_fin, thesis_doc=thesis_empty, use_llm_judge=True)
+    res_fin = await aaudit_draft(draft_fin, thesis_doc=thesis_empty, use_llm_judge=True, user_id="local-dev-user")
     assert judge_called_fin is True
     assert len(res_fin.incidental) == 0
     assert len(res_fin.uncertain) == 0
@@ -1668,7 +1675,7 @@ async def test_p0j_j2_decimal_version_number_two_counterexamples(
     monkeypatch.setattr(numbers_mod, "assist_json", mock_assist_ver)
     monkeypatch.setattr(audit_mod, "assist_json", mock_assist_ver)
 
-    res_ver = await aaudit_draft(draft_ver, thesis_doc=thesis_with_source, use_llm_judge=True)
+    res_ver = await aaudit_draft(draft_ver, thesis_doc=thesis_with_source, use_llm_judge=True, user_id="local-dev-user")
     assert res_ver.matched == 1
     assert res_ver.matches[0]["raw"] == "5.5"
     assert len(res_ver.uncertain) == 0
@@ -1724,7 +1731,7 @@ async def test_p0j_j2_assist_fallback_unified_and_role_policy_family_check(
 
     schema = {"type": "object", "properties": {"items": {"type": "array"}}, "required": ["items"]}
     with caplog.at_level("INFO"):
-        res = await assist_mod.assist_json("audit.label_figures", "Label figures", {"figures": []}, schema)
+        res = await assist_mod.assist_json("audit.label_figures", "Label figures", {"figures": []}, schema, user_id="local-dev-user")
     assert res.ok is True
     assert res.model == "deepseek-flash"
     assert calls == ["gemini-3.8-flash-low-oauth", "deepseek-flash"]
@@ -1756,7 +1763,7 @@ async def test_p0j_j2_assist_fallback_unified_and_role_policy_family_check(
             )
 
         mock_complete.side_effect = _no_fb_effect
-        res_no_fb = await assist_mod.assist_json("audit.label_figures", "Label figures", {"figures": []}, schema)
+        res_no_fb = await assist_mod.assist_json("audit.label_figures", "Label figures", {"figures": []}, schema, user_id="local-dev-user")
         assert res_no_fb.ok is False
         assert calls == ["gemini-3.8-flash-low-oauth"], (
             f"Unexpected fallback for {non_fb_status}/{non_fb_kind}: {calls}"
@@ -1777,7 +1784,7 @@ async def test_p0j_j2_assist_fallback_unified_and_role_policy_family_check(
         )
 
     mock_complete.side_effect = _all_fail_effect
-    res_all_fail = await assist_mod.assist_json("audit.label_figures", "Label figures", {"figures": []}, schema)
+    res_all_fail = await assist_mod.assist_json("audit.label_figures", "Label figures", {"figures": []}, schema, user_id="local-dev-user")
     assert res_all_fail.ok is False
     assert calls == ["gemini-3.8-flash-low-oauth", "deepseek-flash", "ocb-deepseek-deepseek-flash"]
     assert res_all_fail.model == "ocb-deepseek-deepseek-flash"
@@ -1880,6 +1887,7 @@ async def test_p0j_j2b_risk_and_disclaimer_section_sent_to_step_b_and_labeled(
     labeled, ok = await label_figures_with_status(
         md,
         figs,
+        user_id="local-dev-user",
         stats_out=stats,
     )
     assert ok is True
@@ -2091,7 +2099,7 @@ async def test_p0j_j5h_extra_figures_loop_expands_qualifier_preserving_value_and
 
     mock_assist = create_autospec(assist_json, side_effect=fake_assist_json)
     monkeypatch.setattr("src.dalton.publish.numbers.assist_json", mock_assist)
-    labeled, ok = await label_figures_with_status(md, figs)
+    labeled, ok = await label_figures_with_status(md, figs, user_id="local-dev-user")
     assert ok is True
     assert [(f.raw, f.value, f.unit, f.footnote_id) for f in labeled] == [
         ("近一半", 50.0, "pct", None),

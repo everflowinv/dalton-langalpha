@@ -7,7 +7,6 @@ import os
 from pathlib import Path
 from typing import Any
 
-from src.config.env import LOCAL_DEV_USER_ID
 from src.dalton.llm.openclaw_catalog import FAMILY_PREFIX_TABLE, infer_family_from_model_id
 from src.dalton.llm.overlay import load_dalton_meta, load_overlay_data
 from src.dalton.settings import get_disabled_providers, is_broker_models_enabled
@@ -169,11 +168,14 @@ def is_forbidden_for_roles(model_key: str | None) -> bool:
 
 
 async def explain_model_availability(
-    user_id: str = LOCAL_DEV_USER_ID,
     *,
+    user_id: str,
     require_tool_calling: bool = False,
 ) -> dict[str, dict[str, Any]]:
     """Return availability status and reason for every model key in the merged catalog."""
+    if not user_id or not str(user_id).strip():
+        raise ValueError("user_id is required")
+    user_id = str(user_id).strip()
     from src.llms.llm import ModelConfig
 
     mc = ModelConfig()
@@ -266,13 +268,15 @@ async def explain_model_availability(
 
 
 async def available_model_keys(
-    user_id: str = LOCAL_DEV_USER_ID,
     *,
+    user_id: str,
     require_tool_calling: bool = False,
 ) -> set[str]:
     """Return the set of model keys currently available for `user_id` (P0N.5 #4)."""
+    if not user_id or not str(user_id).strip():
+        raise ValueError("user_id is required")
     report = await explain_model_availability(
-        user_id, require_tool_calling=require_tool_calling
+        user_id=user_id, require_tool_calling=require_tool_calling
     )
     return {k for k, v in report.items() if v.get("available")}
 

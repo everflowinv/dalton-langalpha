@@ -79,6 +79,16 @@ class ProvenanceGCService:
         bodies written just before this boot.
         """
         while not self._shutdown_event.is_set():
+            # DALTON-HOOK(dalton-auth): run system-context daily maintenance (approval expiry, 30d journal pruning, 7d signal expiry) without user input IDs
+            try:
+                from src.dalton.autonomy.probes.director import (
+                    run_daily_system_maintenance,
+                )
+
+                await run_daily_system_maintenance()
+            except Exception:
+                logger.error("[ProvenanceGC] Dalton daily system maintenance failed", exc_info=True)
+
             try:
                 deleted = await sweep_orphan_bodies(grace_days=self._grace_days)
                 if deleted:

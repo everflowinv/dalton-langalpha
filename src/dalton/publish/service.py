@@ -9,16 +9,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from fastapi import HTTPException
 from langgraph.types import interrupt
 
-from src.config.env import LOCAL_DEV_USER_ID
+from src.dalton.auth import verify_workspace_access
 from src.dalton.database import knowledge as db_knowledge
 from src.dalton.database import publications as db_publications
 from src.dalton.knowledge.paths import PUBLISHED_INDEX, RENDERED
 from src.dalton.knowledge.render import render_published_index_md
 from src.dalton.knowledge.service import apply_update
 from src.dalton.publish.audit import (
-    AuditResult,
     aaudit_draft,
     render_annotated_draft,
     render_audit_md,
@@ -100,10 +100,14 @@ async def run_check_draft(
     models_doc: dict[str, Any] | None = None,
     provenance_records: dict[str, dict[str, Any]] | None = None,
     use_llm_judge: bool = True,
-    user_id: str = LOCAL_DEV_USER_ID,
+    user_id: str,
     thread_id: str | None = None,
 ) -> dict[str, Any]:
     """Execute ``check_draft``: audit figures via ``aaudit_draft``, write ``.audit.md`` and ``.annotated.md``, never block (PK.9 / P0I §1.7)."""
+    if not user_id or not str(user_id).strip():
+        raise ValueError("user_id is required")
+    user_id = str(user_id).strip()
+    await verify_workspace_access(workspace_id, user_id)
     if backend is None:
         return {"ok": False, "message": "ERROR: filesystem backend is unavailable."}
 
@@ -218,6 +222,10 @@ async def run_publish(
     interrupt_fn: Any = None,
 ) -> dict[str, Any]:
     """Execute the full PK.11 re-entrant publication governance state machine."""
+    if not user_id or not str(user_id).strip():
+        raise ValueError("user_id is required")
+    user_id = str(user_id).strip()
+    await verify_workspace_access(workspace_id, user_id)
     if backend is None:
         return {"ok": False, "message": "ERROR: filesystem backend is unavailable."}
 
@@ -280,6 +288,12 @@ async def run_publish(
                 "ok": False,
                 "message": f"ERROR: publish_request {request_id} not found in this workspace.",
             }
+        row_owner = str(row.get("user_id") or "").strip()
+        if not row_owner or row_owner != user_id:
+            raise HTTPException(
+                status_code=403,
+                detail="Publication request does not belong to current user",
+            )
         created = False
     else:
         row, created = await db_publications.get_or_create_request(

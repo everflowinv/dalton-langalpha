@@ -4,6 +4,7 @@ import { useTranslation } from 'react-i18next';
 import type { EmailOtpType } from '@supabase/supabase-js';
 import { useAuth } from '../../contexts/AuthContext';
 import { isPlatformMode, APP_ENTRY_PATH } from '../../config/hostMode';
+import { isDaltonAuth } from '../../config/daltonAuth'; // DALTON-HOOK(dalton-auth): allow password reset route when Dalton auth is enabled
 import { authErrorMessage } from '../../lib/authErrors';
 import { useShellHandoff } from './useShellHandoff';
 import ShellHandoff from './ShellHandoff';
@@ -38,7 +39,7 @@ function ResetPassword() {
   const ranRef = useRef(false);
 
   useEffect(() => {
-    if (!isPlatformMode) return;
+    if (!(isPlatformMode || isDaltonAuth)) return; // DALTON-HOOK(dalton-auth): verify recovery OTP when Dalton auth is enabled
     // The app is redeeming this one. Bail BEFORE claiming the run, so pressing
     // "continue in this browser" can still take it back.
     if (handingOff) return;
@@ -63,7 +64,7 @@ function ResetPassword() {
     })();
   }, [verifyEmailOtp, handingOff]);
 
-  if (!isPlatformMode) {
+  if (!(isPlatformMode || isDaltonAuth)) { // DALTON-HOOK(dalton-auth): render password reset route when Dalton auth is enabled
     return <Navigate to={APP_ENTRY_PATH} replace />;
   }
 

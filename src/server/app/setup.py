@@ -193,8 +193,10 @@ async def lifespan(app: FastAPI):
 
     # Security warnings (one-time, startup only)
     from src.config.env import HOST_MODE
+    # DALTON-HOOK(dalton-auth): log Dalton Supabase auth status instead of auth-disabled warning when enabled
+    from src.dalton.auth import log_dalton_auth_startup_if_enabled
 
-    if HOST_MODE == "oss":
+    if HOST_MODE == "oss" and not await log_dalton_auth_startup_if_enabled(logger):
         logger.warning(
             "HOST_MODE=oss: authentication is disabled. "
             "All endpoints are accessible without a token. "

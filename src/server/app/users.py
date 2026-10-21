@@ -108,6 +108,10 @@ async def sync_user(
     """
     user_id = auth_info.user_id
     auth_provider = auth_info.auth_provider
+    # DALTON-HOOK(dalton-auth): validate token email and disable legacy email migration in Dalton mode
+    from src.dalton.auth import resolve_dalton_sync_email
+
+    sync_email, allow_legacy_migration = resolve_dalton_sync_email(auth_info, body.email)
 
     # 1. Already exists by UUID?
     existing = await db_get_user(user_id)
@@ -141,8 +145,9 @@ async def sync_user(
         return UserWithPreferencesResponse(user=user_resp, preferences=pref_resp)
 
     # 2. Legacy email-based user?
-    if body.email:
-        legacy = await find_user_by_email(body.email)
+    # DALTON-HOOK(dalton-auth): legacy email migration disabled in Dalton mode; new user uses token email
+    if allow_legacy_migration and sync_email:
+        legacy = await find_user_by_email(sync_email)
         if legacy:
             migrated = await migrate_user_id(legacy["user_id"], user_id)
             if migrated:
@@ -161,7 +166,7 @@ async def sync_user(
     # browser-locale and English-fallback at render time.
     user = await create_user_from_auth(
         user_id=user_id,
-        email=body.email,
+        email=sync_email,
         name=body.name,
         avatar_url=body.avatar_url,
         auth_provider=auth_provider,
@@ -182,9 +187,14 @@ async def create_user(
     user_id: CurrentUserId,
 ):
     """Create a new user. Raises 409 if user_id already exists."""
+    # DALTON-HOOK(dalton-auth): ignore body email on POST /users when Dalton auth is enabled; use verified token email
+    from src.dalton.auth import resolve_dalton_create_user_email
+
+    effective_email = resolve_dalton_create_user_email(user_id, request.email)
+
     user = await db_create_user(
         user_id=user_id,
-        email=request.email,
+        email=effective_email,
         name=request.name,
         avatar_url=request.avatar_url,
         timezone=request.timezone,
@@ -249,9 +259,14 @@ async def update_current_user(
     if not existing:
         raise_not_found("User")
 
+    # DALTON-HOOK(dalton-auth): ignore body email on PUT /users/me when Dalton auth is enabled
+    from src.dalton.auth import is_dalton_supabase_auth_enabled
+
+    effective_email = None if is_dalton_supabase_auth_enabled() else request.email
+
     user = await db_update_user(
         user_id=user_id,
-        email=request.email,
+        email=effective_email,
         name=request.name,
         avatar_url=request.avatar_url,
         timezone=request.timezone,

@@ -411,6 +411,7 @@ async def test_assist_json_validation_and_conservative_fallback():
             "Check if figure is supported",
             {"figure": "512M"},
             schema,
+            user_id="local-dev-user",
         )
         assert isinstance(ok_res, AssistResult)
         assert ok_res.ok is True
@@ -438,6 +439,7 @@ async def test_assist_json_validation_and_conservative_fallback():
             "Check if figure is supported",
             {"figure": "512M"},
             schema,
+            user_id="local-dev-user",
         )
         assert bad_schema_res.ok is False
         assert bad_schema_res.data is None
@@ -453,6 +455,7 @@ async def test_assist_json_validation_and_conservative_fallback():
             "Check if figure is supported",
             {"figure": "512M"},
             schema,
+            user_id="local-dev-user",
         )
         assert timeout_res.ok is False
         assert timeout_res.data is None

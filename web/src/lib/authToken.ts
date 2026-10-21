@@ -14,6 +14,7 @@
  */
 import type { Session } from '@supabase/supabase-js';
 import { isPlatformMode } from '../config/hostMode';
+import { isDaltonAuth } from '../config/daltonAuth'; // DALTON-HOOK(dalton-auth): attach Supabase token when Dalton auth is enabled
 import { tokenEndpointCooldownRemainingMs } from './authCooldown';
 import { supabase } from './supabase';
 import { setStorageUser } from './userStorage';
@@ -103,7 +104,8 @@ let generation = 0;
  * (web/AGENTS.md).
  */
 function authClient() {
-  return isPlatformMode ? supabase : null;
+  // DALTON-HOOK(dalton-auth): read session from Supabase client when Dalton auth is enabled
+  return isPlatformMode || isDaltonAuth ? supabase : null;
 }
 
 function currentUserId(): string | null {

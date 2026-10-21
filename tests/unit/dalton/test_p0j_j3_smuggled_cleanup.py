@@ -383,6 +383,16 @@ def test_schemas_remove_guidance_keep_company_guidance_and_legacy_docs_pass() ->
 @pytest.mark.asyncio
 async def test_append_verdict_records_dropped_fields_in_warnings(monkeypatch: pytest.MonkeyPatch) -> None:
     """J3 §2.5: append_verdict records dropped temporary signal fields in returned warnings[]."""
+    from src.server.database import workspace as ws_db
+
+    monkeypatch.setattr(
+        ws_db,
+        "get_workspace",
+        create_autospec(
+            ws_db.get_workspace,
+            return_value={"workspace_id": "ws-1", "user_id": "user-1"},
+        ),
+    )
     mock_latest_valid = create_autospec(knowledge_service.db_knowledge.latest_valid_version)
     mock_latest_valid.return_value = None
     mock_latest = create_autospec(knowledge_service.db_knowledge.latest_version)

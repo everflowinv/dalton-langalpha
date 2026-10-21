@@ -153,7 +153,12 @@ def auth_unavailable(retry_after: int) -> HTTPException:
 
 async def warm_jwks() -> None:
     """Load the signing keys at startup so the first request doesn't wait."""
-    if HOST_MODE != "oss" and SUPABASE_URL:
+    # DALTON-HOOK(dalton-auth): warm JWKS in OSS mode when Dalton Supabase auth is enabled
+    from src.config import settings as app_settings
+    from src.dalton.auth import is_dalton_supabase_auth_enabled
+    if (HOST_MODE != "oss" and SUPABASE_URL) or (
+        is_dalton_supabase_auth_enabled() and bool(SUPABASE_URL or app_settings.SUPABASE_URL)
+    ):
         await _signing_keys.refresh()
 
 
@@ -197,6 +202,10 @@ async def verify_jwt_token(
     When Supabase auth is disabled (``SUPABASE_URL`` unset), returns a
     static local-dev user ID without requiring a token.
     """
+    # DALTON-HOOK(dalton-auth): verify Supabase JWT + allowlist when Dalton auth is enabled
+    from src.dalton.auth import is_dalton_supabase_auth_enabled, verify_dalton_bearer
+    if is_dalton_supabase_auth_enabled():
+        return (await verify_dalton_bearer(credentials)).user_id
     if HOST_MODE == "oss":
         return LOCAL_DEV_USER_ID
     if credentials is None:
@@ -211,6 +220,10 @@ async def get_current_auth_info(
 
     Used by the auth-sync endpoint to persist the provider on first login.
     """
+    # DALTON-HOOK(dalton-auth): verify Supabase JWT + allowlist for /auth/sync when Dalton auth is enabled
+    from src.dalton.auth import is_dalton_supabase_auth_enabled, verify_dalton_bearer
+    if is_dalton_supabase_auth_enabled():
+        return await verify_dalton_bearer(credentials)
     if HOST_MODE == "oss":
         return AuthInfo(user_id=LOCAL_DEV_USER_ID)
     if credentials is None:

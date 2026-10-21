@@ -317,6 +317,16 @@ async def _stored_workspace(automation: Dict[str, Any]) -> Dict[str, Any]:
             "The automation's workspace was not found "
             "(workspace may have been deleted)"
         )
+    # DALTON-HOOK(dalton-auth): verify workspace belongs to automation owner before thread creation
+    from src.dalton.settings import is_dalton_supabase_auth_enabled
+
+    if is_dalton_supabase_auth_enabled():
+        ws_owner = str(workspace.get("user_id") or "").strip()
+        auto_owner = str(automation.get("user_id") or "").strip()
+        if not ws_owner or not auto_owner or ws_owner != auto_owner:
+            raise ValueError(
+                "The automation's workspace does not belong to the automation owner"
+            )
     return workspace
 
 
@@ -386,6 +396,21 @@ class AutomationExecutor:
     ) -> str:
         """The pinned thread ``place`` continues, else a new titled one, which
         'continue' pins in place of any pin the run left behind."""
+        # DALTON-HOOK(dalton-auth): verify workspace belongs to automation owner before pre-creating thread
+        from src.dalton.settings import is_dalton_supabase_auth_enabled
+
+        if is_dalton_supabase_auth_enabled():
+            ws_owner = str((place.workspace or {}).get("user_id") or "").strip()
+            auto_owner = str(automation.get("user_id") or "").strip()
+            if (
+                not ws_owner
+                or not auto_owner
+                or ws_owner != auto_owner
+                or str((place.workspace or {}).get("workspace_id") or "") != str(workspace_id or "")
+            ):
+                raise ValueError(
+                    "The automation's workspace does not belong to the automation owner"
+                )
         if place.thread_id is not None:
             return place.thread_id
         thread_id = str(uuid4())

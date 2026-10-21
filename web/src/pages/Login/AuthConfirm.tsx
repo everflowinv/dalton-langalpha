@@ -4,6 +4,7 @@ import { useTranslation } from 'react-i18next';
 import type { EmailOtpType } from '@supabase/supabase-js';
 import { useAuth } from '../../contexts/AuthContext';
 import { isPlatformMode, APP_ENTRY_PATH } from '../../config/hostMode';
+import { isDaltonAuth } from '../../config/daltonAuth'; // DALTON-HOOK(dalton-auth): allow email confirm route when Dalton auth is enabled
 import { AUTH_BROADCAST_CHANNEL, type AuthBroadcastMessage } from '../../lib/oauthPopup';
 import { authErrorMessage } from '../../lib/authErrors';
 import { useShellHandoff } from './useShellHandoff';
@@ -47,7 +48,7 @@ function AuthConfirm() {
   const ranRef = useRef(false);
 
   useEffect(() => {
-    if (!isPlatformMode) return;
+    if (!(isPlatformMode || isDaltonAuth)) return; // DALTON-HOOK(dalton-auth): verify email OTP when Dalton auth is enabled
     // The app is redeeming this one. Bail BEFORE claiming the run, so pressing
     // "continue in this browser" can still take it back -- a token consumed
     // here is a token the app can no longer use.
@@ -143,7 +144,7 @@ function AuthConfirm() {
     return () => clearTimeout(timer);
   }, [pkceFallback, isLoggedIn, navigate]);
 
-  if (!isPlatformMode) {
+  if (!(isPlatformMode || isDaltonAuth)) { // DALTON-HOOK(dalton-auth): render confirm route when Dalton auth is enabled
     return <Navigate to={APP_ENTRY_PATH} replace />;
   }
 

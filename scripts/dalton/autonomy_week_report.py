@@ -20,8 +20,8 @@ if str(REPO_ROOT) not in sys.path:
 from src.dalton.autonomy.report import generate_weekly_autonomy_report  # noqa: E402
 
 
-async def _run(days: int, out_path: str | None, as_json: bool) -> int:
-    report = await generate_weekly_autonomy_report(days=days)
+async def _run(days: int, user_id: str, out_path: str | None, as_json: bool) -> int:
+    report = await generate_weekly_autonomy_report(days=days, user_id=user_id)
     if out_path:
         target = Path(out_path)
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -33,13 +33,14 @@ async def _run(days: int, out_path: str | None, as_json: bool) -> int:
     return 0
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Generate Dalton weekly autonomy report.")
     parser.add_argument("--days", type=int, default=7, help="Lookback window in days (default: 7)")
+    parser.add_argument("--user-id", required=True, help="Owner user_id (required)")
     parser.add_argument("--out", default=None, help="Optional output markdown file path")
     parser.add_argument("--json", action="store_true", help="Print full JSON report to stdout")
-    args = parser.parse_args()
-    return asyncio.run(_run(args.days, args.out, args.json))
+    args = parser.parse_args(argv)
+    return asyncio.run(_run(args.days, args.user_id, args.out, args.json))
 
 
 if __name__ == "__main__":

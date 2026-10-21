@@ -10,7 +10,7 @@ from typing import Any
 
 import pytest
 
-from src.dalton.knowledge.ops import OpError, apply_ops, diff_documents, next_item_id
+from src.dalton.knowledge.ops import OpError, apply_ops, diff_documents
 from src.dalton.knowledge.paths import (
     AGENT_SUMMARY_END,
     AGENT_SUMMARY_START,
@@ -22,19 +22,15 @@ from src.dalton.knowledge.paths import (
     rendered_path,
 )
 from src.dalton.knowledge.render import (
-     MAX_AGENT_BLOCK_CHARS,
+    MAX_AGENT_BLOCK_CHARS,
     render_agent_block,
     render_document_md,
-    render_published_index_md,
-    render_verdicts_md,
     update_agent_md_block,
 )
 from src.dalton.knowledge.validate import (
     SCHEMA_NAMES,
     check_all_schemas,
-    validate_schema,
     validate_update,
-    validate_verdict,
 )
 
 
@@ -510,6 +506,16 @@ async def test_service_apply_update_and_append_verdict(monkeypatch: pytest.Monke
     from src.dalton.database import knowledge as db_knowledge
     from src.dalton.database import verdicts as db_verdicts
     from src.dalton.knowledge import service
+    from src.server.database import workspace as ws_db
+
+    monkeypatch.setattr(
+        ws_db,
+        "get_workspace",
+        create_autospec(
+            ws_db.get_workspace,
+            return_value={"workspace_id": "ws-1", "user_id": "user-1"},
+        ),
+    )
 
     store: dict[str, list[dict[str, Any]]] = {}
     verdict_store: list[dict[str, Any]] = []
@@ -782,6 +788,16 @@ async def test_field_and_path_repair_with_warnings_and_assist_fallback(
     from src.dalton.knowledge import service
     from src.dalton.knowledge.ops import repair_knowledge_ops
     from src.dalton.llm.assist import AssistResult, assist_json
+    from src.server.database import workspace as ws_db
+
+    monkeypatch.setattr(
+        ws_db,
+        "get_workspace",
+        create_autospec(
+            ws_db.get_workspace,
+            return_value={"workspace_id": "ws1", "user_id": "u1"},
+        ),
+    )
 
     store: dict[str, list[dict[str, Any]]] = {}
 

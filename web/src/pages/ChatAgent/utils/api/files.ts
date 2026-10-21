@@ -3,6 +3,7 @@
  */
 import { api } from '@/api/client';
 import { isPlatformMode } from '@/config/hostMode';
+import { isDaltonAuth } from '@/config/daltonAuth'; // DALTON-HOOK(dalton-auth): use authenticated blob download when Dalton auth is enabled
 import { withDownloadNotice, workspaceDownloadKey, type DownloadProgressReport } from '../downloadNotice';
 import type { FileRefResolution } from '../../components/filePanel/types';
 import type { BackupResponse, BackupStatusResponse } from '@/types/api';
@@ -99,7 +100,8 @@ async function saveWorkspaceFile(
   );
   // Without a bearer token the download route itself is a plain GET, so the
   // browser can stream it to disk too; with one, only a blob can carry it.
-  const direct = data?.url ?? (isPlatformMode ? null : directDownloadUrl(workspaceId, filePath));
+  // DALTON-HOOK(dalton-auth): direct GET carries no bearer token; fetch blob when Dalton auth is enabled
+  const direct = data?.url ?? (isPlatformMode || isDaltonAuth ? null : directDownloadUrl(workspaceId, filePath));
   const href = direct ?? (await downloadWorkspaceFile(workspaceId, filePath, report));
   // Signed out while this was being prepared: the file is the last account's.
   if (!current()) {

@@ -7,6 +7,7 @@ import { useTheme } from '../../contexts/ThemeContext';
 import { BrandMark } from '@/components/brand/BrandMark'; // DALTON-HOOK(brand-name)
 import { BRAND_MARK } from '@/config/brand'; // DALTON-HOOK(brand-name)
 import { APP_ENTRY_PATH, isPlatformMode } from '@/config/hostMode';
+import { isDaltonAuth } from '@/config/daltonAuth'; // DALTON-HOOK(dalton-auth): offer sign-in on private share links when Dalton auth is enabled
 // Named for the ink, not the theme: logo.svg is drawn in white for a dark page,
 // logo-dark.svg in near-black for a light one.
 import logoOnDark from '../../assets/img/logo.svg';
@@ -33,7 +34,8 @@ export default function ShareUnavailable({ variant = 'unavailable', onRetry }: S
   const { theme } = useTheme();
   const { isLoggedIn, isInitialized } = useAuth();
   const logo = theme === 'light' ? logoOnLight : logoOnDark;
-  const offerSignIn = variant === 'unavailable' && isPlatformMode && isInitialized && !isLoggedIn;
+  // DALTON-HOOK(dalton-auth): offer sign-in when Dalton auth is enabled
+  const offerSignIn = variant === 'unavailable' && (isPlatformMode || isDaltonAuth) && isInitialized && !isLoggedIn;
 
   // The whole link comes back, so an app opened at a page reopens there.
   const signIn = () => {

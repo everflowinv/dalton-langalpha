@@ -9,7 +9,6 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
-from src.config.env import LOCAL_DEV_USER_ID
 from src.dalton.settings import REPO_ROOT, get_dalton_config
 
 logger = logging.getLogger(__name__)
@@ -240,6 +239,9 @@ async def run_review(
     thread_id: str | None = None,
 ) -> ReviewResult:
     """Run authoritative server-side independent review via ``dalton_complete`` (PK.10 / G3.2)."""
+    if not user_id or not str(user_id).strip():
+        raise ValueError("user_id is required")
+    user_id = str(user_id).strip()
     author_family = family_of(author_model)
     if not author_model or author_family == "unknown":
         return ReviewResult(
@@ -255,7 +257,7 @@ async def run_review(
         try:
             from src.dalton.services.provider_status import explain_model_availability
 
-            avail_map = await explain_model_availability(str(user_id))
+            avail_map = await explain_model_availability(user_id=user_id)
             avail_set = {
                 k
                 for k, v in avail_map.items()
@@ -299,7 +301,7 @@ async def run_review(
 
             comp = await dalton_complete(
                 None,
-                user_id=user_id or LOCAL_DEV_USER_ID,
+                user_id=user_id,
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 purpose="publish.review",

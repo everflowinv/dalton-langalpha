@@ -89,7 +89,11 @@ def main(argv: list[str] | None = None) -> int:
 
     availability_report = {}
     try:
-        availability_report = asyncio.run(explain_model_availability(args.user_id))
+        availability_report = asyncio.run(
+            explain_model_availability(user_id=args.user_id)
+        )
+    except TypeError:
+        raise
     except Exception:
         availability_report = {}
 
