@@ -234,6 +234,12 @@ async def resolve_effective_task_cap(
     return default_task_cap_usd
 
 
+# Mirrors `src.server.database.runs.credit_ledger._ABANDONED_SETTLE_GRACE` (upstream sweep only stamps `in_flight_credits > 0` rows).
+_ABANDONED_SETTLE_GRACE = "30 minutes"
+# Late subagent usage rows arrive within milliseconds to minutes; 2 days covers midnight rollover without scanning all historical settled rows on every admission.
+_LATE_USAGE_RATCHET_WINDOW = "2 days"
+
+
 async def reconcile_reservations_sql(
     conn: Any,
     user_id: str,
@@ -245,7 +251,8 @@ async def reconcile_reservations_sql(
     so per-call cash costs (`platform` and `byok`) are summed in USD while `oauth` calls are 0.
     """
     async with conn.cursor() as cur:
-        # 1. Settle completed runs with settled usage
+        # 1. Settle completed runs once parent and all child subagent runs are billing-settled.
+        # Upstream terminal status does not imply billing-settled (`subagent_runs` finalizes before collector inserts `task` usage and stamps `usage_settled_at`).
         await cur.execute(
             """
             WITH run_usage AS (
@@ -279,13 +286,70 @@ async def reconcile_reservations_sql(
               AND NOT EXISTS (
                   SELECT 1 FROM subagent_runs sr
                   WHERE sr.parent_run_id = r.run_ref
-                    AND sr.status = 'in_progress'
+                    AND (sr.usage_settled_at IS NULL OR sr.status = 'in_progress')
               )
             """,
             (rate, user_id),
         )
 
-        # 2. Expire stale open leases conservatively (never release)
+        # 2. Conservatively settle runs with abandoned unsettled subagent runs after the 30m grace window.
+        # Terminal status does not imply billing-settled, and upstream `settle_abandoned` skips BYOK rows (`in_flight_credits = 0`) if a collector crashes.
+        # Mirrors upstream's dual-clock guard (both parent `usage_settled_at` and child `finalized_at` older than 30m) because the collector starts only after the parent run reaches terminal state.
+        await cur.execute(
+            f"""
+            WITH abandoned_usage AS (
+                SELECT
+                    r.reservation_id,
+                    r.run_ref,
+                    COALESCE(
+                        SUM(dalton_cash_usd(cu.token_usage::jsonb, cu.total_credits, cu.infrastructure_credits, %s)),
+                        0
+                    ) AS usage_usd
+                FROM dalton_budget_reservations r
+                LEFT JOIN conversation_usages cu
+                    ON cu.conversation_response_id = r.run_ref
+                WHERE r.user_id = %s
+                  AND r.state IN ('open', 'released')
+                GROUP BY r.reservation_id, r.run_ref
+            )
+            UPDATE dalton_budget_reservations r
+            SET state = 'settled',
+                settled_at = NOW(),
+                settled_usd = GREATEST(r.reserved_usd, r.observed_usd, au.usage_usd),
+                settle_source = 'conservative'
+            FROM abandoned_usage au,
+                 conversation_responses cr
+            WHERE r.reservation_id = au.reservation_id
+              AND cr.conversation_response_id = r.run_ref
+              AND cr.usage_settled_at IS NOT NULL
+              AND cr.usage_settled_at < NOW() - INTERVAL '{_ABANDONED_SETTLE_GRACE}'
+              AND r.state IN ('open', 'released')
+              AND NOT EXISTS (
+                  SELECT 1 FROM subagent_runs sr
+                  WHERE sr.parent_run_id = r.run_ref
+                    AND sr.status = 'in_progress'
+              )
+              AND EXISTS (
+                  SELECT 1 FROM subagent_runs sr
+                  WHERE sr.parent_run_id = r.run_ref
+                    AND sr.usage_settled_at IS NULL
+                    AND sr.finalized_at < NOW() - INTERVAL '{_ABANDONED_SETTLE_GRACE}'
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM subagent_runs sr
+                  WHERE sr.parent_run_id = r.run_ref
+                    AND sr.usage_settled_at IS NULL
+                    AND (
+                        sr.finalized_at IS NULL
+                        OR sr.finalized_at >= NOW() - INTERVAL '{_ABANDONED_SETTLE_GRACE}'
+                    )
+              )
+            """,
+            (rate, user_id),
+        )
+
+        # 3. Expire stale open leases conservatively (never release).
+        # An open lease past `expires_at` is not billing-settled, so charge `GREATEST(reserved, observed, usage)`.
         await cur.execute(
             """
             WITH stale_usage AS (
@@ -316,7 +380,8 @@ async def reconcile_reservations_sql(
             (rate, user_id),
         )
 
-        # 3. Ratchet expired reservations upward if recovery sweep later persisted higher usage
+        # 4. Ratchet expired reservations upward if recovery sweep or collector later persisted higher usage.
+        # Terminal status does not imply billing-settled, so usage rows can land after lease expiry.
         await cur.execute(
             """
             WITH exp_usage AS (
@@ -339,6 +404,36 @@ async def reconcile_reservations_sql(
             WHERE r.reservation_id = eu.reservation_id
               AND r.state = 'expired'
               AND eu.usage_usd > COALESCE(r.settled_usd, 0)
+            """,
+            (rate, user_id),
+        )
+
+        # 5. Ratchet recently settled reservations upward if late `task` usage rows landed after an earlier settlement (`settle_source` unchanged).
+        # Because subagent terminal status precedes billing-settled (`usage_settled_at`), any late usage on `run_ref` must unfreeze `settled_usd`.
+        await cur.execute(
+            f"""
+            WITH settled_usage AS (
+                SELECT
+                    r.reservation_id,
+                    COALESCE(
+                        SUM(dalton_cash_usd(cu.token_usage::jsonb, cu.total_credits, cu.infrastructure_credits, %s)),
+                        0
+                    ) AS usage_usd
+                FROM dalton_budget_reservations r
+                JOIN conversation_usages cu
+                    ON cu.conversation_response_id = r.run_ref
+                WHERE r.user_id = %s
+                  AND r.state = 'settled'
+                  AND r.settled_at > NOW() - INTERVAL '{_LATE_USAGE_RATCHET_WINDOW}'
+                GROUP BY r.reservation_id
+            )
+            UPDATE dalton_budget_reservations r
+            SET settled_usd = GREATEST(COALESCE(r.settled_usd, 0), su.usage_usd)
+            FROM settled_usage su
+            WHERE r.reservation_id = su.reservation_id
+              AND r.state = 'settled'
+              AND r.settled_at > NOW() - INTERVAL '{_LATE_USAGE_RATCHET_WINDOW}'
+              AND su.usage_usd > COALESCE(r.settled_usd, 0)
             """,
             (rate, user_id),
         )
