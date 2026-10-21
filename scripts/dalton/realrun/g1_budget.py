@@ -265,6 +265,15 @@ def _capture_rejection_banner_screenshot(
 
             textarea = page.locator("textarea").first
             textarea.wait_for(state="visible", timeout=15000)
+            # A test user that never dismissed the page intros gets an onboarding dialog over the chat;
+            # it swallows Enter, so the 429 turn would never be sent. Close it the way a user would.
+            dialog = page.get_by_role("dialog")
+            for _ in range(5):
+                if not (dialog.count() and dialog.first.is_visible()):
+                    break
+                page.keyboard.press("Escape")
+                page.wait_for_timeout(500)
+            assert not (dialog.count() and dialog.first.is_visible()), "Onboarding dialog still covers the chat page"
             textarea.fill("继续下一轮分析（日现金额度耗尽验证）")
             textarea.press("Enter")
 
