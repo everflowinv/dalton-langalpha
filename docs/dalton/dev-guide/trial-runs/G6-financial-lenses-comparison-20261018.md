@@ -1,5 +1,7 @@
 # G6.2 财务镜头脚本真实运行与基金原脚本对比记录 (2026-10-19 统一锚点重算)
 
+> **作废说明（2026-10-21 第四轮审查后追加）：** 本文档下方的 2026-10-19 汇总表把受限现金扣了两次，表中数值与对应产物文件不一致，现已作废。本轮按实跑证据由脚本重新生成的对比记录见 `docs/dalton/dev-guide/trial-runs/G6-financial-lenses-comparison-2026-10-21.md`（对应证据摘要见 `docs/dalton/dev-guide/trial-runs/realrun-2026-10-21/G6.md`）。原有内容原样保留于下方备查。
+
 - **运行日期**：2026-10-19（修正 2026-10-18 手填锚点不一致问题，统一传入 `--anchors`）
 - **对应指南**：`P0I-round3-fixes.md` §6 (`I6`)、`P0H-round2-fixes.md` §6 (`G6`)
 - **真实运行产物路径**：
@@ -21,6 +23,8 @@
 ## 1. 按 `SKILL.md` 统一 `--anchors` 命令真实运行汇总（`BABA`、`0700.HK`、`META`）
 
 三组标的先由 `anchors.py` 生成锚点 JSON，再将 `--anchors <anchors.json>` 统一传给 `netcash.py`、`return_score.py`、`earnings_quality.py`（所有镜头输出均带 `"anchors_source": "anchors"` 且 `market_cap_usd_mn`、`fx_rate_to_usd`、`period_end` 完全一致）：
+
+### 已作废：受限现金被扣了两次
 
 | 标的 | 交易币种 | 财报币种 (`--reporting-currency`) | 锁定汇率 (`fx_rate_to_usd`) | 锁定市值 (`market_cap_usd_mn`) | 口径 A 基础净现金 (`basic_net_cash_usd`) | 口径 B 严格净现金 (`strict_net_cash_usd`) | 隐含经营资产 (Strict) | 股东回报评分 (`final_score`) | 盈利质量 (`overall_quality` / Operating Sloan) |
 |---|---|---|---|---|---|---|---|---|---|
