@@ -70,6 +70,7 @@ from scripts.dalton.realrun._common import (  # noqa: E402
     build_evidence_envelope,
     build_realrun_workspace_config,
     default_shanghai_date,
+    delete_workspace_when_idle,
     load_repo_dotenv,
     now_utc_iso,
     preflight_realrun_script,
@@ -706,7 +707,7 @@ def _cleanup_g4_state(
                         cleanup_errors.append(f"delete_idle_auto_{auto_id_del}_exception:{type(exc).__name__}")
                 for ws_id_del in created_idle_ws_ids:
                     try:
-                        st_del_iw, _ = cleanup_idle.delete(f"/api/v1/workspaces/{ws_id_del}")
+                        st_del_iw = delete_workspace_when_idle(cleanup_idle, ws_id_del)
                         if st_del_iw not in (200, 204, 404):
                             cleanup_errors.append(f"delete_idle_ws_{ws_id_del}:http_{st_del_iw}")
                     except Exception as exc:
@@ -726,7 +727,7 @@ def _cleanup_g4_state(
                         cleanup_errors.append(f"delete_pm_auto_{auto_id_del}_exception:{type(exc).__name__}")
                 for ws_id_del in created_ws_ids:
                     try:
-                        st_del_pw, _ = cleanup_pm.delete(f"/api/v1/workspaces/{ws_id_del}")
+                        st_del_pw = delete_workspace_when_idle(cleanup_pm, ws_id_del)
                         if st_del_pw not in (200, 204, 404):
                             cleanup_errors.append(f"delete_pm_ws_{ws_id_del}:http_{st_del_pw}")
                     except Exception as exc:

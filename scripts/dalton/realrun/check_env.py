@@ -49,6 +49,7 @@ from scripts.dalton.realrun._common import (  # noqa: E402
     RealRunHttpClient,
     assert_no_credentials_in_obj,
     build_realrun_workspace_config,
+    delete_workspace_when_idle,
     get_git_sha,
     is_git_dirty,
     is_valid_realrun_workspace_row,
@@ -758,7 +759,7 @@ def check_conversation_transport(
                 ) as cleanup_client:
                     if ws_id:
                         try:
-                            st_del_ws, _ = cleanup_client.delete(f"/api/v1/workspaces/{ws_id}")
+                            st_del_ws = delete_workspace_when_idle(cleanup_client, ws_id)
                             if st_del_ws not in (200, 204, 404):
                                 workspace_cleanup_error = f"workspace_delete_http_{st_del_ws}"
                                 cleanup_errors.append(workspace_cleanup_error)

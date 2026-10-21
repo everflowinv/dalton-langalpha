@@ -2566,3 +2566,26 @@ def test_g1_gate_would_refuse_mirrors_admission_gate(today: dict, refused: bool)
     floor = g1_mod._admission_floor_usd()
     assert floor == Decimal(str(get_dalton_settings().budget.admission_floor_usd or 0.25))
     assert g1_mod._gate_would_refuse(today, floor) is refused
+
+
+def test_delete_workspace_when_idle_retries_busy_409_but_not_published_409() -> None:
+    from unittest.mock import create_autospec
+
+    from scripts.dalton.realrun._common import RealRunHttpClient, delete_workspace_when_idle
+
+    busy = (409, {"detail": "Workspace has runs in progress"})
+
+    client = create_autospec(RealRunHttpClient, instance=True)
+    client.delete.side_effect = [busy, busy, (204, None)]
+    assert delete_workspace_when_idle(client, "ws-1", timeout_s=5.0, poll_s=0.0) == 204
+    assert client.delete.call_count == 3
+
+    published = create_autospec(RealRunHttpClient, instance=True)
+    published.delete.return_value = (409, {"detail": "该工作区含已发布研报，禁止删除；请归档。"})
+    assert delete_workspace_when_idle(published, "ws-2", timeout_s=5.0, poll_s=0.0) == 409
+    assert published.delete.call_count == 1
+
+    stuck = create_autospec(RealRunHttpClient, instance=True)
+    stuck.delete.return_value = busy
+    assert delete_workspace_when_idle(stuck, "ws-3", timeout_s=0.0, poll_s=0.0) == 409
+    assert stuck.delete.call_count == 1
