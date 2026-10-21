@@ -383,6 +383,7 @@ class TestBrokerResultMapping:
 
         tool = build_web_search_tool(max_results=5, wrapper=mock_wrapper)
         assert "OpenClaw 搜索不区分 topic，忽略该参数" in (tool.description or "")
+        assert "rather than putting dates in `query`" in (tool.description or "")
         content, artifact = await tool.coroutine(
             query="NVIDIA Q3 revenue",
             start_date="2026-10-01",

@@ -1250,3 +1250,95 @@ async def test_cancel_and_reap_cancels_pending_tasks_even_if_caller_is_cancelled
         await reaper
     assert ae.cancelled() and gp.cancelled()
     assert sorted(finished) == ["alphaengine", "guidepoint"]
+
+
+async def _send_raw_bridge_request(
+    bridge: rb.ResearchDataBridge,
+    path: str,
+    body_obj: dict[str, Any],
+    headers: dict[str, str] | None = None,
+) -> tuple[int, dict[str, Any]]:
+    body_bytes = json.dumps(body_obj).encode("utf-8")
+    hdr_lines = [
+        f"POST {path} HTTP/1.1",
+        "Host: 127.0.0.1:8960",
+        "Content-Type: application/json",
+        f"Content-Length: {len(body_bytes)}",
+    ]
+    for hk, hv in (headers or {}).items():
+        hdr_lines.append(f"{hk}: {hv}")
+    raw_req = ("\r\n".join(hdr_lines) + "\r\n\r\n").encode("utf-8") + body_bytes
+
+    reader = asyncio.StreamReader()
+    reader.feed_data(raw_req)
+    reader.feed_eof()
+
+    writer = create_autospec(asyncio.StreamWriter, instance=True)
+    await rb._handle_client(bridge, reader, writer)
+
+    written: bytes = b"".join(call.args[0] for call in writer.write.call_args_list)
+    head_bytes, payload_bytes = written.split(b"\r\n\r\n", 1)
+    status_line = head_bytes.splitlines()[0].decode("utf-8")
+    status_code = int(status_line.split(" ", 2)[1])
+    return status_code, json.loads(payload_bytes.decode("utf-8"))
+
+
+@pytest.mark.asyncio
+async def test_bridge_accepts_header_token_rejects_bad_token_401_and_keeps_legacy_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("DALTON_BRIDGE_TOKEN", "secret-bridge-token")
+    bridge = _make_bridge(tmp_path, monkeypatch)
+    ping_rpc = {"jsonrpc": "2.0", "id": 1, "method": "ping"}
+
+    # 1. Header token (Authorization: Bearer <token> and X-Dalton-Bridge-Token) on /mcp -> 200
+    status_bearer, body_bearer = await _send_raw_bridge_request(
+        bridge,
+        "/mcp",
+        ping_rpc,
+        headers={"Authorization": "Bearer secret-bridge-token"},
+    )
+    assert status_bearer == 200
+    assert body_bearer == {"jsonrpc": "2.0", "id": 1, "result": {}}
+
+    status_xhdr, body_xhdr = await _send_raw_bridge_request(
+        bridge,
+        "/mcp",
+        ping_rpc,
+        headers={"X-Dalton-Bridge-Token": "secret-bridge-token"},
+    )
+    assert status_xhdr == 200
+    assert body_xhdr == {"jsonrpc": "2.0", "id": 1, "result": {}}
+
+    # 2. Wrong or missing token -> 401
+    status_bad_hdr, _ = await _send_raw_bridge_request(
+        bridge,
+        "/mcp",
+        ping_rpc,
+        headers={"Authorization": "Bearer wrong-token"},
+    )
+    assert status_bad_hdr == 401
+
+    status_missing_hdr, _ = await _send_raw_bridge_request(
+        bridge,
+        "/mcp",
+        ping_rpc,
+    )
+    assert status_missing_hdr == 401
+
+    status_bad_path, _ = await _send_raw_bridge_request(
+        bridge,
+        "/mcp/wrong-token",
+        ping_rpc,
+    )
+    assert status_bad_path == 401
+
+    # 3. Legacy path /mcp/<token> still works -> 200
+    status_legacy, body_legacy = await _send_raw_bridge_request(
+        bridge,
+        "/mcp/secret-bridge-token",
+        ping_rpc,
+    )
+    assert status_legacy == 200
+    assert body_legacy == {"jsonrpc": "2.0", "id": 1, "result": {}}
+

@@ -560,7 +560,7 @@ def build_web_search_tool(
         - Verify or update information
 
         Args:
-            query: Search query to look up
+            query: Search query to look up. Filter by time with `start_date`/`end_date` rather than putting dates in `query`.
             time_range: Filter by recency - 'day'/'d' (24h), 'week'/'w' (7d),
                 'month'/'m' (30d), 'year'/'y' (365d).
                 Ignored if start_date or end_date is provided.
