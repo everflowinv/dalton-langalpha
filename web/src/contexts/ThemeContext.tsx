@@ -1,4 +1,5 @@
 import React, { createContext, useContext, useState, useEffect, useLayoutEffect, useMemo } from 'react';
+import { faviconHref } from '../config/brand'; // DALTON-HOOK(brand-name)
 import { desktop } from '../lib/desktop';
 
 type ThemePreference = 'light' | 'dark' | 'auto';
@@ -46,7 +47,7 @@ export function ThemeProvider({ children }: { children: React.ReactNode }) {
     document.documentElement.setAttribute('data-theme', theme);
     localStorage.setItem('theme', preference);
     const favicon = document.querySelector('link[rel="icon"]') as HTMLLinkElement | null;
-    if (favicon) favicon.href = theme === 'light' ? '/logo-favicon.svg' : '/logo-favicon-dark.svg';
+    if (favicon) favicon.href = faviconHref(theme); // DALTON-HOOK(brand-name)
     // The desktop window's background has to equal the page's, because during a
     // live resize the frame outruns the paint and that colour fills the gap.
     // Optional call: an older shell predates this method and simply does not

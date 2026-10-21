@@ -3,6 +3,8 @@ import { useSearchParams } from 'react-router';
 import { Mail, Link2 } from 'lucide-react';
 import { Input } from '../../components/ui/input';
 import { useTranslation, Trans } from 'react-i18next';
+import { BrandMark } from '@/components/brand/BrandMark'; // DALTON-HOOK(brand-name)
+import { BRAND_MARK, BRAND_NAME } from '@/config/brand'; // DALTON-HOOK(brand-name)
 import { useAuth } from '../../contexts/AuthContext';
 import { authErrorMessage, type AuthErrorInfo } from '../../lib/authErrors';
 import PasswordInput from './PasswordInput';
@@ -260,8 +262,8 @@ function LoginPage() {
       <div className="login-page__auth-pane">
         <div className="login-page__auth-inner">
         <div className="login-page__card-header">
-          <LogoIcon className="login-page__logo-icon" />
-          <h1 className="login-page__title">LangAlpha</h1>
+          {BRAND_MARK === 'everflow' ? <BrandMark className="login-page__logo-icon" /> : <LogoIcon className="login-page__logo-icon" />} {/* DALTON-HOOK(brand-name) */}
+          <h1 className="login-page__title">{BRAND_NAME}</h1> {/* DALTON-HOOK(brand-name) */}
         </div>
 
         {view === 'method' && (

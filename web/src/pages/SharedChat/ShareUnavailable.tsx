@@ -4,6 +4,8 @@ import { useTranslation } from 'react-i18next';
 import { Button } from '@/components/ui/button';
 import { useAuth } from '../../contexts/AuthContext';
 import { useTheme } from '../../contexts/ThemeContext';
+import { BrandMark } from '@/components/brand/BrandMark'; // DALTON-HOOK(brand-name)
+import { BRAND_MARK } from '@/config/brand'; // DALTON-HOOK(brand-name)
 import { APP_ENTRY_PATH, isPlatformMode } from '@/config/hostMode';
 // Named for the ink, not the theme: logo.svg is drawn in white for a dark page,
 // logo-dark.svg in near-black for a light one.
@@ -44,7 +46,7 @@ export default function ShareUnavailable({ variant = 'unavailable', onRetry }: S
       className="flex flex-col items-center justify-center min-h-screen gap-4 px-4 text-center"
       style={{ backgroundColor: 'var(--color-bg-page)' }}
     >
-      <img src={logo} alt="LangAlpha" className="h-8 opacity-60" />
+      {BRAND_MARK === 'everflow' ? <BrandMark className="h-8 w-8 opacity-60" /> : <img src={logo} alt="LangAlpha" className="h-8 opacity-60" />} {/* DALTON-HOOK(brand-name) */}
       <h1 className="text-lg font-semibold title-font" style={{ color: 'var(--color-text-primary)' }}>
         {variant === 'failed' ? t('shareLink.loadFailedTitle') : t('shareLink.unavailableTitle')}
       </h1>

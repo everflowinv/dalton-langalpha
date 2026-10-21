@@ -461,7 +461,7 @@
     "autoApproveWorkspaceCreationDesc": "A workspace for new work is created without an approval card."
   },
   "dashboard": {
-    "title": "LangAlpha",
+    "title": "{{brand}}",
     "searchPlaceholder": "Search by symbol or company name...",
     "searching": "Searching...",
     "noResults": "No results found",
@@ -1039,7 +1039,7 @@
       "conversation": {
         "title": "Workbench",
         "description": "A chat-first console: greeting, live chat input, and one-click resume.",
-        "placeholder": "Put LangAlpha to work — a ticker to unpack, a filing to parse, a thesis to stress-test…",
+        "placeholder": "Put {{brand}} to work — a ticker to unpack, a filing to parse, a thesis to stress-test…",
         "resume": "Resume",
         "untitledThread": "Untitled thread",
         "greetingLate": "Up late",
@@ -1283,7 +1283,7 @@
     "workspaceLimitReached": "You've reached your workspace limit.",
     "options": "Options",
     "noWorkspacesFound": "No workspaces found",
-    "welcomeTitle": "Welcome to LangAlpha",
+    "welcomeTitle": "Welcome to {{brand}}",
     "welcomeDesc": "Get started by setting up your preferences or creating a workspace.",
     "createWorkspace": "Create Workspace",
     "failedLoadWorkspaces": "Failed to load workspaces. Please refresh the page.",
@@ -1500,7 +1500,7 @@
     "loadFailedBody": "Something went wrong on the way. Try again in a moment.",
     "retry": "Retry",
     "signIn": "Sign in",
-    "goToLangAlpha": "Go to LangAlpha"
+    "goToLangAlpha": "Go to {{brand}}"
   },
   "chat": {
     "backToWorkflow": "Back to workflow",
@@ -3184,7 +3184,7 @@
     "antigravityStep1Title": "Open the Google sign-in page",
     "antigravityStep1Desc": "Click the button below. A new tab opens to accounts.google.com.",
     "antigravityStep2Title": "Sign in and grant access",
-    "antigravityStep2Desc": "Approve the permission request for LangAlpha. The page then redirects back to this machine automatically — nothing to copy.",
+    "antigravityStep2Desc": "Approve the permission request for {{brand}}. The page then redirects back to this machine automatically — nothing to copy.",
     "antigravityStep3Title": "Done",
     "antigravityStep3Desc": "This screen detects the connection by itself and moves on.",
     "oauthAgreeGoogle": "I understand my Google account tokens are stored encrypted and my subscription quota is used for requests.",
@@ -3542,7 +3542,7 @@
           "desc": "Choose default models and connect providers in Settings."
         },
         "integrations": {
-          "title": "Use LangAlpha on other platforms",
+          "title": "Use {{brand}} on other platforms",
           "desc": "Reach the agent from Slack, email, and more via platform integrations."
         }
       },
@@ -4354,7 +4354,7 @@
       "uninstallFailed": "Uninstall failed",
       "uninstallConfirmYes": "Uninstall",
       "uninstallConfirmNo": "Keep",
-      "sourceBundled": "Ships with LangAlpha",
+      "sourceBundled": "Ships with {{brand}}",
       "updateKeysTitle": "Update {{plugin}}",
       "updateKeysSubmit": "Check and update",
       "uninstalledRemoved": "Removed {{what}}.",
@@ -5446,7 +5446,7 @@
       "neverSynced": "Never synced",
       "modelTableToggle": "Model Details",
       "diffTitle": "OpenClaw Model Sync Preview",
-      "diffSummary": "Review catalog changes before applying to LangAlpha",
+      "diffSummary": "Review catalog changes before applying to {{brand}}",
       "upToDate": "Already up to date with OpenClaw",
       "unchangedCount": "{{count}} models unchanged",
       "inUseWarning": "Warning: Removed or hidden models are currently referenced in role configuration",

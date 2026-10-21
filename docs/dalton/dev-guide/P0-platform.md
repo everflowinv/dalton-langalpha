@@ -1831,6 +1831,7 @@ async def get_run_charge_usd(run_ref: str) -> Decimal | None
 | native-oauth-ui | `web/src/hooks/useConfiguredProviders.ts`、`web/src/pages/Settings/panels/ConnectedAccounts.tsx`、`web/src/pages/Setup/steps/connectStep/OAuthConnect.tsx`、`web/src/pages/Setup/steps/MethodStep.tsx`、`web/src/pages/Setup/steps/connectStep/shared.tsx`、`web/src/lib/brandArt.ts` | Antigravity / Muse OAuth UI 委托至 Dalton 子模块 | 各 1–4 |
 | workspace-delete-guard | `src/server/app/workspaces.py` | `delete_workspace` 检查正式发布报告（G3.3 / L13） | 约 5 |
 | no-strike | `src/server/database/automation_executions.py` | `_count_strike` 豁免 `dalton-*` 自动停用并按时间退避（G4.4 / P0F.3） | 约 8 |
+| brand-name | `web/index.html`、`web/src/vite-env.d.ts`、`web/src/main.tsx`、`web/src/i18n.ts`、`web/src/locales/__tests__/keys.test.ts`、`web/src/contexts/ThemeContext.tsx`、`web/src/components/PageLoading/PageLoading.tsx`、`web/src/components/Sidebar/AppSidebar.tsx`、`web/src/pages/ChatAgent/components/chatView/mainAgent.ts`、`web/src/pages/ChatAgent/components/mcp/KindTile.tsx`、`web/src/pages/Login/LoginPage.tsx`、`web/src/pages/Setup/SetupWizard.tsx`、`web/src/pages/SharedChat/ShareTopBar.tsx`、`web/src/pages/SharedChat/ShareUnavailable.tsx`、`web/src/pages/SharedChat/SharedChatView.tsx`、`web/src/pages/Legal/Legal.tsx`、`web/src/pages/Legal/PrivacyPolicy.tsx` | 构建期品牌名称（`BRAND_NAME` / `{{brand}}` 插值）与图形标志（`BRAND_MARK` / `BrandMark` / favicon）切换，默认保持上游原样 | 各 1–5 |
 
 **数据篇（P0D）引入的钩子**（也在 P0 阶段落地，`check_hooks.sh` 一并核对）：
 

@@ -1,5 +1,6 @@
 import i18n, { type BackendModule, type Resource, type ResourceKey } from 'i18next';
 import { initReactI18next } from 'react-i18next';
+import { BRAND_NAME } from './config/brand'; // DALTON-HOOK(brand-name)
 import { detectLocale, isSupported, type Locale } from './lib/locale';
 
 // Locale resolution (cookie → browser language → English) lives in ./lib/locale,
@@ -58,7 +59,7 @@ export async function initI18n(resources?: Resource): Promise<void> {
       // Only the exact code. The default also asks the loader for `zh` and
       // `en`, which have no catalogs.
       load: 'currentOnly',
-      interpolation: { escapeValue: false },
+      interpolation: { escapeValue: false, defaultVariables: { brand: BRAND_NAME } }, // DALTON-HOOK(brand-name)
     });
   if (!i18n.hasResourceBundle(lng, 'translation')) {
     throw new Error(`[i18n] the ${lng} catalog did not load`);

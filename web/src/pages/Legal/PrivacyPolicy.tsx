@@ -1,5 +1,6 @@
 import type { ReactNode } from 'react';
 import { Link } from 'react-router';
+import { BRAND_NAME } from '@/config/brand'; // DALTON-HOOK(brand-name)
 
 const EFFECTIVE_DATE = 'April 18, 2026';
 
@@ -16,7 +17,7 @@ function PrivacyPolicy() {
             className="text-sm hover:underline"
             style={{ color: 'var(--color-text-secondary)' }}
           >
-            &larr; Back to LangAlpha
+            &larr; Back to {BRAND_NAME /* DALTON-HOOK(brand-name) */}
           </Link>
           <h1 className="mt-4 text-3xl font-semibold tracking-tight">Privacy Policy</h1>
           <p className="mt-2 text-sm" style={{ color: 'var(--color-text-secondary)' }}>
@@ -279,7 +280,7 @@ function PrivacyPolicy() {
           style={{ borderColor: 'var(--color-border-subtle)', color: 'var(--color-text-secondary)' }}
         >
           <Link to="/" className="hover:underline">
-            &larr; Back to LangAlpha
+            &larr; Back to {BRAND_NAME /* DALTON-HOOK(brand-name) */}
           </Link>
         </footer>
       </article>

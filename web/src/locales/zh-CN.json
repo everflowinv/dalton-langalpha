@@ -459,7 +459,7 @@
     "autoApproveWorkspaceCreationDesc": "为新任务创建工作区时不再弹出审批卡片。"
   },
   "dashboard": {
-    "title": "LangAlpha",
+    "title": "{{brand}}",
     "searchPlaceholder": "搜索股票代码或公司名称...",
     "searching": "搜索中...",
     "noResults": "未找到结果",
@@ -1037,7 +1037,7 @@
       "conversation": {
         "title": "工作台",
         "description": "对话优先的控制台：问候语、实时输入框，一键继续。",
-        "placeholder": "把任务交给 LangAlpha — 拆解一只标的、解析一份财报、压力测试一条投资逻辑……",
+        "placeholder": "把任务交给 {{brand}} — 拆解一只标的、解析一份财报、压力测试一条投资逻辑……",
         "resume": "继续对话",
         "untitledThread": "未命名对话",
         "greetingLate": "夜深了",
@@ -1281,7 +1281,7 @@
     "workspaceLimitReached": "您的工作区数量已达上限。",
     "options": "选项",
     "noWorkspacesFound": "未找到工作区",
-    "welcomeTitle": "欢迎使用 LangAlpha",
+    "welcomeTitle": "欢迎使用 {{brand}}",
     "welcomeDesc": "开始设置您的偏好或创建工作区。",
     "createWorkspace": "创建工作区",
     "failedLoadWorkspaces": "加载工作区失败，请刷新页面。",
@@ -1498,7 +1498,7 @@
     "loadFailedBody": "加载过程中出了点问题，请稍后重试。",
     "retry": "重试",
     "signIn": "登录",
-    "goToLangAlpha": "前往 LangAlpha"
+    "goToLangAlpha": "前往 {{brand}}"
   },
   "chat": {
     "backToWorkflow": "返回工作流",
@@ -3150,7 +3150,7 @@
     "antigravityStep1Title": "打开 Google 登录页",
     "antigravityStep1Desc": "点击下方按钮，会在新标签页打开 accounts.google.com。",
     "antigravityStep2Title": "登录并授权",
-    "antigravityStep2Desc": "确认对 LangAlpha 的授权请求，页面会自动重定向回本机 —— 无需复制任何内容。",
+    "antigravityStep2Desc": "确认对 {{brand}} 的授权请求，页面会自动重定向回本机 —— 无需复制任何内容。",
     "antigravityStep3Title": "完成",
     "antigravityStep3Desc": "本页面会自动检测到连接成功并继续。",
     "oauthAgreeGoogle": "我了解我的 Google 账号令牌会被加密存储，请求将消耗我的订阅额度。",
@@ -3508,8 +3508,8 @@
           "desc": "在设置的模型页选择默认模型并连接服务商。"
         },
         "integrations": {
-          "title": "在其他平台使用 LangAlpha",
-          "desc": "通过平台集成，在 Slack、邮件等平台使用 LangAlpha。"
+          "title": "在其他平台使用 {{brand}}",
+          "desc": "通过平台集成，在 Slack、邮件等平台使用 {{brand}}。"
         }
       },
       "interview": {
@@ -4299,7 +4299,7 @@
       "uninstallFailed": "卸载失败",
       "uninstallConfirmYes": "卸载",
       "uninstallConfirmNo": "保留",
-      "sourceBundled": "随 LangAlpha 提供",
+      "sourceBundled": "随 {{brand}} 提供",
       "updateKeysTitle": "更新 {{plugin}}",
       "updateKeysSubmit": "检查并更新",
       "uninstalledRemoved": "已移除 {{what}}。",

@@ -109,6 +109,7 @@ function collectKeys(): { keys: Set<string>; perFile: Map<string, string[]> } {
 // or carry a spread is skipped, since what it passes is not in the text.
 
 const VAR = /\{\{\s*-?\s*([A-Za-z_$][\w$]*)/g;
+const DEFAULT_INTERPOLATION_VARS = new Set(['brand']); // DALTON-HOOK(brand-name)
 
 function stringVariants(obj: unknown, key: string): string[] {
   return PLURAL_SUFFIXES.map((suffix) => lookup(obj, key + suffix)).filter((v): v is string => typeof v === 'string');
@@ -222,7 +223,9 @@ describe('locale interpolation (src-wide)', () => {
         for (const text of stringVariants(catalog, site.key)) {
           VAR.lastIndex = 0;
           let v: RegExpExecArray | null;
-          while ((v = VAR.exec(text)) !== null) if (!site.passed.has(v[1])) missing.add(v[1]);
+          while ((v = VAR.exec(text)) !== null) {
+            if (!site.passed.has(v[1]) && !DEFAULT_INTERPOLATION_VARS.has(v[1])) missing.add(v[1]); // DALTON-HOOK(brand-name)
+          }
         }
         if (missing.size) offenders.push(`  - ${site.key} (${name}) needs ${[...missing].join(', ')} in ${site.file}`);
       }
