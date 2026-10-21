@@ -1841,6 +1841,7 @@ async def get_run_charge_usd(run_ref: str) -> Decimal | None
 | dalton-auth | `src/server/app/users.py` | `sync_user`（令牌邮箱校验与禁用邮箱迁移）、`create_user` 与 `update_current_user`（忽略请求体邮箱，仅用令牌邮箱） | 各 2–5 |
 | dalton-auth | `src/server/services/automation_executor.py` | `_stored_workspace` 与 `_resolve_thread` 预建线程前校验工作区归属 | 各 10–15 |
 | dalton-auth | `web/src/contexts/AuthContext.tsx`、`web/src/lib/authToken.ts`、`web/src/lib/userStorage.ts`、`web/src/pages/Login/LoginPage.tsx`、`web/src/pages/Login/AuthConfirm.tsx`、`web/src/pages/Login/ResetPassword.tsx`、`web/src/pages/ChatAgent/utils/api/files.ts`、`web/src/pages/SharedChat/ShareUnavailable.tsx` | OSS 模式下按 `isDaltonAuth` 启用 Supabase 会话流、按用户去重 `/auth/sync` 与 403 登出、隐藏自助注册 | 各 1–15 |
+| home-workspace-alias | `src/server/database/home_workspace.py` | `get_home_workspace_id` 先查 `DALTON_HOME_WORKSPACE_ALIASES` 别名映射，未命中再走 uuid5 | 约 5 |
 
 **数据篇（P0D）引入的钩子**（也在 P0 阶段落地，`check_hooks.sh` 一并核对）：
 

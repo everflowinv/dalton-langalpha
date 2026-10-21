@@ -21,6 +21,11 @@ UNBOUND = "unbound"
 
 
 def get_home_workspace_id(user_id: str) -> str:
+    # DALTON-HOOK(home-workspace-alias): return pre-migration Home workspace_id when aliased
+    from src.dalton.settings import get_home_workspace_alias
+
+    if alias := get_home_workspace_alias(user_id):
+        return alias
     return str(uuid.uuid5(HOME_WORKSPACE_NAMESPACE, user_id))
 
 

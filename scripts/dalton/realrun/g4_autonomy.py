@@ -48,7 +48,6 @@ import json
 import os
 import sys
 import time
-import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -64,13 +63,13 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from scripts.dalton.realrun._common import (  # noqa: E402
-    HOME_WORKSPACE_NAMESPACE,
     RealRunHttpClient,
     assert_no_conflicting_dalton_automation,
     build_evidence_envelope,
     build_realrun_workspace_config,
     default_shanghai_date,
     delete_workspace_when_idle,
+    get_home_workspace_id,
     load_repo_dotenv,
     now_utc_iso,
     preflight_realrun_script,
@@ -569,7 +568,7 @@ def _run_scenario_5_director_daily_zero_token_skip(
     )
     created_ws_ids.append(idle_ws_id)
 
-    expected_home_ws_id = str(uuid.uuid5(HOME_WORKSPACE_NAMESPACE, idle_user_id))
+    expected_home_ws_id = get_home_workspace_id(idle_user_id)
     allowed_ws_ids = {expected_home_ws_id, idle_ws_id}
     unexpected_ws: list[dict[str, str]] = []
     limit = 100
