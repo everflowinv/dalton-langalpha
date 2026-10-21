@@ -25,6 +25,26 @@ def _is_stale(claimed_at: Any, stale_after_s: int, now_utc: datetime | None = No
     return (now - claimed_at) > timedelta(seconds=max(1, int(stale_after_s)))
 
 
+def is_journal_response_replayable(stored: Any) -> bool:
+    """Return True only when a `state='done'` journal payload can be replayed without re-calling the LLM."""
+    if stored is None:
+        return False
+    if isinstance(stored, dict):
+        if stored.get("replayable") is False:
+            return False
+        data = stored.get("data")
+        if isinstance(data, dict):
+            if data.get("replayable") is False:
+                return False
+            cards = data.get("cards")
+            if isinstance(cards, list) and any(
+                isinstance(c, dict) and not str(c.get("quote") or "").strip()
+                for c in cards
+            ):
+                return False
+    return True
+
+
 async def fetch_journal_entry(
     invocation_id: str,
     *,
@@ -129,7 +149,7 @@ async def inspect_journal_state(
 
             state = str(row.get("state") or "")
             if state == "done":
-                if row.get("response") is None:
+                if not is_journal_response_replayable(row.get("response")):
                     return "proceed", row
                 return "done", row
 
@@ -246,7 +266,7 @@ async def claim_journal_invocation(
                 return "conflict", existing
 
             state = str(existing.get("state") or "")
-            if state == "done" and existing.get("response") is not None:
+            if state == "done" and is_journal_response_replayable(existing.get("response")):
                 return "done", existing
 
             if state == "pending":
@@ -309,7 +329,7 @@ async def claim_journal_invocation(
 async def complete_journal_done(
     invocation_id: str,
     *,
-    response: dict[str, Any],
+    response: dict[str, Any] | None,
     usage: dict[str, Any] | None = None,
     cash_usd: Decimal = Decimal("0"),
     notional_usd: Decimal = Decimal("0"),
@@ -317,8 +337,12 @@ async def complete_journal_done(
     billing_type: str | None = None,
     conn: Any = None,
 ) -> dict[str, Any] | None:
-    """Transition a journal row to `state='done'` with response, usage, and costs."""
-    resp_json = json.dumps(response, ensure_ascii=False, default=str)
+    """Transition a journal row to `state='done'` with response (or NULL when `persist_raw=False`), usage, and costs."""
+    resp_json = (
+        json.dumps(response, ensure_ascii=False, default=str)
+        if response is not None
+        else None
+    )
     usage_json = json.dumps(usage or {}, ensure_ascii=False, default=str)
 
     async def _do_update(c: Any) -> dict[str, Any] | None:

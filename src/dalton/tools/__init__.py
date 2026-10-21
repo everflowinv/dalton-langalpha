@@ -22,13 +22,16 @@ def build_dalton_tools(
     """Return role-appropriate Dalton tools to bind onto the main agent (`DALTON-HOOK(dalton-tools)`).
 
     - `chief_of_staff` (Home / Research Director):
-      `dalton_coverage_board`, `dalton_record_plan`, `dalton_agenda_note`, `dalton_schedule_automation`
+      `dalton_coverage_board`, `dalton_record_plan`, `dalton_agenda_note`, `dalton_schedule_automation`, `conversation_search`
     - `analyst` (Company workspace):
-      `knowledge_update`, `knowledge_append_verdict`, `check_draft`, `publish_report`, `dalton_schedule_automation`
+      `knowledge_update`, `knowledge_append_verdict`, `check_draft`, `publish_report`, `dalton_schedule_automation`, `conversation_search`
     """
     settings = get_dalton_settings()
     is_enabled = enabled if enabled is not None else (
-        settings.knowledge.enabled or settings.publish.enabled or settings.autonomy.enabled
+        settings.knowledge.enabled
+        or settings.publish.enabled
+        or settings.autonomy.enabled
+        or settings.conversations.enabled
     )
     if not is_enabled:
         return []
@@ -38,6 +41,13 @@ def build_dalton_tools(
     if role == "chief_of_staff":
         if settings.autonomy.enabled:
             tools.extend(build_director_tools(role=role, filesystem_backend=filesystem_backend))
+        if settings.conversations.enabled:
+            try:
+                from src.dalton.tools.conversation_tools import create_conversation_tools
+
+                tools.extend(create_conversation_tools())
+            except Exception as e:
+                logger.debug("[DALTON_TOOLS] conversation_tools not loaded: %s", e)
         return tools
 
     # Analyst workspace tools
@@ -59,5 +69,13 @@ def build_dalton_tools(
 
     if settings.autonomy.enabled:
         tools.extend(build_director_tools(role=role, filesystem_backend=filesystem_backend))
+
+    if settings.conversations.enabled:
+        try:
+            from src.dalton.tools.conversation_tools import create_conversation_tools
+
+            tools.extend(create_conversation_tools())
+        except Exception as e:
+            logger.debug("[DALTON_TOOLS] conversation_tools not loaded: %s", e)
 
     return tools
