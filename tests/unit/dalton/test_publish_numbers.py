@@ -752,6 +752,106 @@ async def test_g32_reviewer_refuses_none_or_unknown_author_model() -> None:
 
 
 @pytest.mark.asyncio
+async def test_g32_reviewer_falls_back_to_next_cross_family_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.dalton.llm import complete as complete_mod
+    from src.dalton.llm.complete import DaltonCompleteResult, dalton_complete
+    from src.dalton.publish.review import run_review
+
+    bundle = ReviewBundle(
+        title="META 3Q26",
+        kind="earnings",
+        draft_markdown="# Draft",
+        audit_summary={},
+    )
+    candidates = [
+        "gpt-6.1-sol-oauth",
+        "claude-sonnet-5-5-oauth",
+        "gemini-4-argon-high-oauth",
+        "ocb-xai-grok-4.7",
+    ]
+    called_models: list[str] = []
+
+    async def _side_effect(
+        llm_service: Any = None,
+        *,
+        user_id: str | None = None,
+        system_prompt: str | None = None,
+        user_prompt: str = "",
+        scope_ref: str | None = None,
+        purpose: str = "dalton.complete",
+        model: str | None = None,
+        request_model: str | None = None,
+        response_schema: Any = None,
+        slot: str = "primary",
+        reasoning_effort: str | None = None,
+        timeout_s: float = 60.0,
+        is_byok: bool = False,
+        disable_tracing: bool = False,
+        workspace_id: str | None = None,
+        thread_id: str | None = None,
+        stale_after_s: float = 360.0,
+        resend_indeterminate: bool = False,
+        raise_on_error: bool = False,
+    ) -> DaltonCompleteResult:
+        eff = str(request_model or model or "")
+        called_models.append(eff)
+        if eff == "gpt-6.1-sol-oauth":
+            return DaltonCompleteResult(
+                ok=False,
+                status="failed",
+                model=eff,
+                error="http_4xx: OAuth token expired",
+            )
+        return DaltonCompleteResult(
+            ok=True,
+            status="done",
+            model=eff,
+            data=ReviewVerdict(verdict="pass", summary="All good"),
+            usage={"input_tokens": 100, "output_tokens": 20},
+            cash_usd=0.0,
+            notional_usd=0.01,
+            invocation_id="lj1:rev-ok",
+        )
+
+    mock_complete = create_autospec(dalton_complete, side_effect=_side_effect)
+    monkeypatch.setattr(complete_mod, "dalton_complete", mock_complete)
+
+    res = await run_review(
+        user_id="u1",
+        author_model="claude-opus-5-5-oauth",
+        bundle=bundle,
+        candidates=candidates,
+    )
+    assert res.status == "done"
+    assert res.model == "gemini-4-argon-high-oauth"
+    assert res.family == "google-gemini"
+    assert called_models == ["gpt-6.1-sol-oauth", "gemini-4-argon-high-oauth"]
+
+    # When all cross-family candidates fail -> returns unavailable
+    called_models.clear()
+    mock_all_fail = create_autospec(
+        dalton_complete,
+        return_value=DaltonCompleteResult(
+            ok=False,
+            status="failed",
+            model="ocb-xai-grok-4.7",
+            error="upstream_timeout",
+        ),
+    )
+    monkeypatch.setattr(complete_mod, "dalton_complete", mock_all_fail)
+    res_fail = await run_review(
+        user_id="u1",
+        author_model="claude-opus-5-5-oauth",
+        bundle=bundle,
+        candidates=candidates,
+    )
+    assert res_fail.status == "unavailable"
+    assert mock_all_fail.await_count == 3
+
+
+@pytest.mark.asyncio
 async def test_p0i_ten_r3_false_verified_counterexamples(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

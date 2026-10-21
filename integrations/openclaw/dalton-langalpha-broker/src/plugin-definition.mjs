@@ -229,6 +229,7 @@ export function createPluginDefinition(deps = {}) {
               journal: brokerState.journal,
               replayStore,
               logger: api.logger,
+              runtimeVersion: api.runtime?.version || currentCfg?.meta?.lastTouchedVersion,
               deps,
             });
             return true;
@@ -243,6 +244,7 @@ export function createPluginDefinition(deps = {}) {
               journal: brokerState.journal,
               replayStore,
               logger: api.logger,
+              runtimeVersion: api.runtime?.version || currentCfg?.meta?.lastTouchedVersion,
               deps,
             });
             return true;

@@ -44,7 +44,8 @@ from src.dalton.settings import get_dalton_broker_token, get_dalton_broker_url  
 def _fetch_broker_catalog(broker_url: str, token: str) -> dict[str, Any]:
     url = f"{broker_url.rstrip('/')}/models?detail=1"
     headers = {"Authorization": f"Bearer {token}"} if token else {}
-    with httpx.Client(timeout=10.0) as client:
+    # /models?detail=1 probes every provider and takes ~50 s on the owner's gateway.
+    with httpx.Client(timeout=120.0) as client:
         resp = client.get(url, headers=headers)
         resp.raise_for_status()
         data = resp.json()

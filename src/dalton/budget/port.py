@@ -67,7 +67,7 @@ class LocalBudgetPort:
         """Acquire or renew a cash budget lease for `run_ref` (G1.1 / P0N.6).
 
         Even when the main turn uses an OAuth subscription (`byok=True`), subagents
-        (e.g. `grok-4.7`) and background models (`deepseek-flash`) share the same lease
+        on cash models and background models (`deepseek-flash`) share the same lease
         and spend cash credits. Therefore, `byok` never bypasses the daily USD cap.
         """
         settings = get_dalton_settings().budget

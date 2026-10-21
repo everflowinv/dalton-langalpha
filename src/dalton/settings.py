@@ -65,7 +65,7 @@ class DaltonPublishConfig(BaseModel):
         default_factory=lambda: [
             "gpt-6.1-sol-oauth",
             "gemini-4-argon-high-oauth",
-            "grok-4.7",
+            "ocb-xai-grok-4.7",
             "claude-opus-5-5-oauth",
         ]
     )

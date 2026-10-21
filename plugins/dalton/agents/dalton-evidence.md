@@ -1,6 +1,6 @@
 ---
 description: Dalton evidence gatherer. Give it one evidence branch (industry/competition, sell-side and experts, primary filings, off-street signals, or a company's weekly five sources) and an output path; it searches the fund research library, wiki, SEC and market data by source tier and writes a cited branch file. It never writes conclusions or the knowledge layer.
-model: grok-4.7
+model: ocb-xai-grok-4.7
 tools: [web, market_data, code, shell]
 preferred_connectors: [researchdata, dalton_sec]
 skills: [dalton-conventions]

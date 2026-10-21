@@ -170,9 +170,9 @@ def test_default_role_config_has_zero_warnings():
         },
         "subagents": {
             "definitions": {
-                "research": {"model": "grok-4.7"},
-                "data-prep": {"model": "grok-4.7"},
-                "general-purpose": {"model": "grok-4.7"},
+                "research": {"model": "ocb-xai-grok-4.7"},
+                "data-prep": {"model": "ocb-xai-grok-4.7"},
+                "general-purpose": {"model": "ocb-xai-grok-4.7"},
             }
         },
     }

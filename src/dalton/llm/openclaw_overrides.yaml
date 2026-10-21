@@ -10,10 +10,17 @@ muse-cli-gateway/muse-wonder-full-1.0:
 xai/grok-4.7:
   speed: 3
   intelligence: 4
-  pricing:
-    input: 3.0
-    output: 15.0
-    cached_input: 0.75
+  billing: subscription
+xai/grok-4.3:
+  billing: subscription
+xai/grok-build-0.1:
+  billing: subscription
+xai/grok-4.7-build-fast:
+  billing: subscription
+xai/grok-4.6:
+  billing: subscription
+xai/grok-4.5:
+  billing: subscription
 openai/gpt-6.1-sol:
   speed: 3
   intelligence: 5
