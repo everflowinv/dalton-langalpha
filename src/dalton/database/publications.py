@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Sequence
 from datetime import date, datetime, timezone
 from typing import Any
@@ -11,6 +12,8 @@ from psycopg.rows import dict_row
 
 from src.server.database.pool import get_db_connection
 from src.server.utils.pg_sanitize import SafeJson, strip_pg_nul_str
+
+logger = logging.getLogger(__name__)
 
 _REQ_COLS = """
     publish_request_id, user_id, workspace_id, conversation_thread_id,
