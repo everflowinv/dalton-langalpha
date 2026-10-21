@@ -13,7 +13,7 @@ Verifies against the live HTTP backend (`http://127.0.0.1:8000`) under `realrun-
 4. Verifies startup fail-fast (`RolePolicyError` / `DaltonStartupConfigError`) by launching a real backend child process
    (`uvicorn src.server.app:app`) with a temporary config file (`PTC_CONFIG_FILE`) setting
    `llm.assist: muse-cli-gateway/muse-spark-1.3-contributor`, asserting non-zero exit code and startup error log.
-5. Restores `realrun-pm-a`'s original budget configuration via `_restore_budget_state` and deletes temporary workspaces in `finally`.
+5. Restores `realrun-pm-a`'s original budget and BYOK API keys configuration via `_restore_budget_state` and `_restore_api_keys_state`, and deletes temporary workspaces in `finally`.
 """
 
 from __future__ import annotations
@@ -39,12 +39,17 @@ from scripts.dalton.realrun._common import (  # noqa: E402
     build_evidence_envelope,
     build_realrun_workspace_config,
     default_shanghai_date,
+    ensure_temporary_deepseek_byok,
     load_repo_dotenv,
     now_utc_iso,
     preflight_realrun_script,
     write_evidence_and_summary,
 )
-from scripts.dalton.realrun.check_env import _restore_budget_state  # noqa: E402
+from scripts.dalton.realrun.check_env import (  # noqa: E402
+    _restore_api_keys_state,
+    _restore_budget_state,
+    _snapshot_api_keys_state,
+)
 
 
 def _verify_startup_fail_fast() -> dict[str, Any]:
@@ -127,6 +132,41 @@ def _verify_startup_fail_fast() -> dict[str, Any]:
     }
 
 
+def _build_g2_byok_evidence_fields(
+    *,
+    pm_user: str,
+    key_modified_pm: bool,
+    restore_key_err_pm: str | None,
+    restore_budget_err_pm: str | None,
+) -> dict[str, Any]:
+    """Build truthful evidence fields for G2 temporary DeepSeek BYOK key setup/cleanup (P0J §8.1 #19)."""
+    temp_deleted_pm = bool(key_modified_pm and restore_key_err_pm is None)
+    api_keys_restored: bool | str = (restore_key_err_pm is None) if key_modified_pm else "not_applicable"
+    budget_restored = restore_budget_err_pm is None
+    settings_endpoint = (
+        "PUT /api/v1/users/me/api-keys"
+        if key_modified_pm
+        else "GET /api/v1/users/me/api-keys (preexisting key preserved)"
+    )
+    key_write_skipped_reason = None if key_modified_pm else "preexisting_user_deepseek_key_preserved"
+    pm_key_desc = (
+        f"临时 BYOK Key 已删除={temp_deleted_pm}"
+        if key_modified_pm
+        else "既有 BYOK Key 保留未改动（未写入、未删除）"
+    )
+    return {
+        "user_id": pm_user,
+        "settings_endpoint": settings_endpoint,
+        "byok_provider": "deepseek",
+        "temporary_key_written": bool(key_modified_pm),
+        "temporary_key_deleted": temp_deleted_pm,
+        "key_write_skipped_reason": key_write_skipped_reason,
+        "api_keys_restored": api_keys_restored,
+        "budget_restored": budget_restored,
+        "restoration_summary": f"PM 用户 ({pm_user}) 预算已恢复={budget_restored}（{pm_key_desc}）",
+    }
+
+
 def main() -> int:
     load_repo_dotenv()
     parser = argparse.ArgumentParser(description="G2 Real-Run Evidence Generator (P0J §5 G2)")
@@ -204,6 +244,11 @@ def main() -> int:
     prior_budget_pm: dict[str, Any] | None = None
     was_configured_pm = False
     budget_modified_pm = False
+    prior_keys_pm: dict[str, Any] | None = None
+    key_modified_pm = False
+    restore_key_err_pm: str | None = None
+    restore_budget_err_pm: str | None = None
+    active_base_exc: BaseException | None = None
 
     try:
         with (
@@ -217,6 +262,7 @@ def main() -> int:
             if st_prior_b == 200 and isinstance(body_prior_b, dict):
                 prior_budget_pm = body_prior_b
                 was_configured_pm = bool(body_prior_b.get("configured"))
+            prior_keys_pm = _snapshot_api_keys_state(pm_client)
             st_prior_bt, body_prior_bt = pm_client.get("/api/v1/dalton/budget/today")
             baseline_spent_pm = (
                 float(body_prior_bt.get("spent_usd") or 0.0)
@@ -260,13 +306,16 @@ def main() -> int:
             assert st_ws_b in (200, 201) and ws_b_resp.get("workspace_id")
             user_b_ws_id = str(ws_b_resp["workspace_id"])
 
-            # 2. Configure budget for pm_user (DeepSeek probe uses platform fallback key in LLMService/resolve_model_client)
+            # 2. Configure budget and temporary DeepSeek BYOK key for pm_user (preserving any pre-existing user key per P0J §8.1 #19)
             st_budget_put, resp_budget_put = pm_client.put(
                 "/api/v1/dalton/budget",
                 json_body={"daily_cap_usd": g2_cap_usd, "default_task_cap_usd": 1.0},
             )
             assert st_budget_put == 200, f"PUT /api/v1/dalton/budget failed: {st_budget_put} {resp_budget_put}"
             budget_modified_pm = True
+            if not bool((prior_keys_pm or {}).get("had_user_deepseek_key")):
+                key_modified_pm = True
+            ensure_temporary_deepseek_byok(pm_client, prior_keys_pm)
 
             # 3. Enumerate all /api/v1/dalton routes from /openapi.json
             st_spec, openapi_spec = pm_client.get("/openapi.json")
@@ -435,7 +484,7 @@ def main() -> int:
                 params={"workspace_id": sample_ws_id},
             )
 
-            # 4. Probe configured providers (cash DeepSeek via platform fallback + Antigravity OAuth subscription models) + 1 unconfigured provider under pm_user
+            # 4. Probe configured providers (cash DeepSeek via user BYOK key + Antigravity OAuth subscription models) + 1 unconfigured provider under pm_user
             configured_probes: list[tuple[str, dict[str, Any]]] = [
                 ("deepseek", {"model_key": "deepseek-flash"}),
                 ("antigravity-oauth", {"model_key": "gemini-3.8-flash-low-oauth"}),
@@ -478,52 +527,144 @@ def main() -> int:
                 f"{m} {p}" for (m, p) in enumerated_routes if (m, p) not in called_set
             ]
             assert not uncalled_routes, f"Uncalled Dalton routes: {uncalled_routes}"
+    except BaseException as exc:
+        if not isinstance(exc, Exception):
+            active_base_exc = exc
+        raise
     finally:
         cleanup_errors: list[str] = []
+        pending_base_exc: BaseException | None = None
+
+        def _open_cleanup_client(
+            target_user: str,
+            err_prefix: str,
+        ) -> tuple[RealRunHttpClient | None, bool]:
+            nonlocal pending_base_exc
+            try:
+                return (
+                    RealRunHttpClient(
+                        base_url=args.backend,
+                        user_id=target_user,
+                        timeout_s=30.0,
+                        record=False,
+                    ),
+                    True,
+                )
+            except BaseException as exc:
+                if not isinstance(exc, Exception) and pending_base_exc is None:
+                    pending_base_exc = exc
+                # The client only fails to open when the backend health check fails, and then no
+                # restore request could succeed either; record it so the manual-deletion note fires.
+                cleanup_errors.append(f"{err_prefix}:{type(exc).__name__}")
+                return None, False
+
+        cleanup_pm, should_close_pm = _open_cleanup_client(pm_user, "cleanup_pm_exception")
         try:
-            with RealRunHttpClient(base_url=args.backend, user_id=pm_user, timeout_s=30.0, record=False) as cleanup_pm:
+            if cleanup_pm is not None:
                 if created_auto_id:
                     try:
                         st_del_auto, _ = cleanup_pm.delete(f"/api/v1/automations/{created_auto_id}")
                         if st_del_auto not in (200, 204, 404):
                             cleanup_errors.append(f"delete_auto_pm:http_{st_del_auto}")
-                    except Exception as exc:
+                    except BaseException as exc:
+                        if not isinstance(exc, Exception) and pending_base_exc is None:
+                            pending_base_exc = exc
                         cleanup_errors.append(f"delete_auto_pm_exception:{type(exc).__name__}")
                 if sample_ws_id:
                     try:
                         st_del_ws_pm, _ = cleanup_pm.delete(f"/api/v1/workspaces/{sample_ws_id}")
                         if st_del_ws_pm not in (200, 204, 404):
                             cleanup_errors.append(f"delete_ws_pm:http_{st_del_ws_pm}")
-                    except Exception as exc:
+                    except BaseException as exc:
+                        if not isinstance(exc, Exception) and pending_base_exc is None:
+                            pending_base_exc = exc
                         cleanup_errors.append(f"delete_ws_pm_exception:{type(exc).__name__}")
+                if key_modified_pm:
+                    try:
+                        restore_key_err_pm = _restore_api_keys_state(
+                            cleanup_pm,
+                            prior_state=prior_keys_pm,
+                        )
+                        if restore_key_err_pm is not None:
+                            cleanup_errors.append(f"restore_key_pm:{restore_key_err_pm}")
+                    except BaseException as exc:
+                        if not isinstance(exc, Exception) and pending_base_exc is None:
+                            pending_base_exc = exc
+                        restore_key_err_pm = f"restore_key_pm_exception:{type(exc).__name__}"
+                        cleanup_errors.append(restore_key_err_pm)
                 if budget_modified_pm:
                     try:
-                        err_pm = _restore_budget_state(
+                        restore_budget_err_pm = _restore_budget_state(
                             cleanup_pm,
                             user_id=pm_user,
                             was_configured=was_configured_pm,
                             prior_budget=prior_budget_pm,
                         )
-                        if err_pm is not None:
-                            cleanup_errors.append(f"restore_budget_pm:{err_pm}")
-                    except Exception as exc:
-                        cleanup_errors.append(f"restore_budget_pm_exception:{type(exc).__name__}")
-        except Exception as exc:
-            cleanup_errors.append(f"cleanup_pm_exception:{type(exc).__name__}")
+                        if restore_budget_err_pm is not None:
+                            cleanup_errors.append(f"restore_budget_pm:{restore_budget_err_pm}")
+                    except BaseException as exc:
+                        if not isinstance(exc, Exception) and pending_base_exc is None:
+                            pending_base_exc = exc
+                        restore_budget_err_pm = f"restore_budget_pm_exception:{type(exc).__name__}"
+                        cleanup_errors.append(restore_budget_err_pm)
+            elif key_modified_pm:
+                restore_key_err_pm = "restore_key_pm_no_client"
+                cleanup_errors.append(restore_key_err_pm)
+        finally:
+            if cleanup_pm is not None and should_close_pm:
+                try:
+                    cleanup_pm.close()
+                except Exception:
+                    pass
+
+        if key_modified_pm and restore_key_err_pm is not None:
+            cleanup_errors.append("临时 DeepSeek key 仍在 realrun-pm-a 上，需要手动删除")
 
         if user_b_ws_id:
+            cleanup_b, should_close_b = _open_cleanup_client(other_user, "delete_ws_b_exception")
             try:
-                with RealRunHttpClient(base_url=args.backend, user_id=other_user, timeout_s=30.0, record=False) as cleanup_b:
-                    st_del_ws_b, _ = cleanup_b.delete(f"/api/v1/workspaces/{user_b_ws_id}")
-                    if st_del_ws_b not in (200, 204, 404):
-                        cleanup_errors.append(f"delete_ws_b:http_{st_del_ws_b}")
-            except Exception as exc:
-                cleanup_errors.append(f"delete_ws_b_exception:{type(exc).__name__}")
+                if cleanup_b is not None:
+                    try:
+                        st_del_ws_b, _ = cleanup_b.delete(f"/api/v1/workspaces/{user_b_ws_id}")
+                        if st_del_ws_b not in (200, 204, 404):
+                            cleanup_errors.append(f"delete_ws_b:http_{st_del_ws_b}")
+                    except BaseException as exc:
+                        if not isinstance(exc, Exception) and pending_base_exc is None:
+                            pending_base_exc = exc
+                        cleanup_errors.append(f"delete_ws_b_exception:{type(exc).__name__}")
+            finally:
+                if cleanup_b is not None and should_close_b:
+                    try:
+                        cleanup_b.close()
+                    except Exception:
+                        pass
+
+        if cleanup_errors:
+            # Printed here because an interrupt or an integer SystemExit re-raised below carries no message,
+            # and a temporary key left on the account must never go unreported.
+            print(f"G2 cleanup/restoration failed: {cleanup_errors}", file=sys.stderr, flush=True)
+
+        unrecoverable_base_exc = pending_base_exc or active_base_exc
+        if unrecoverable_base_exc is not None:
+            if cleanup_errors and isinstance(unrecoverable_base_exc, SystemExit):
+                orig_code = unrecoverable_base_exc.code
+                if isinstance(orig_code, str) or orig_code is None:
+                    raise SystemExit(
+                        f"{orig_code or ''}; G2 cleanup/restoration failed: {cleanup_errors}".lstrip("; ")
+                    ) from unrecoverable_base_exc
+            raise unrecoverable_base_exc
 
         if cleanup_errors:
             raise RuntimeError(
                 f"G2 cleanup/restoration failed: {cleanup_errors}"
             )
+
+    byok_evidence = _build_g2_byok_evidence_fields(
+        pm_user=pm_user,
+        key_modified_pm=key_modified_pm,
+        restore_key_err_pm=restore_key_err_pm,
+        restore_budget_err_pm=restore_budget_err_pm,
+    )
 
     startup_fail_check = _verify_startup_fail_fast()
     assert startup_fail_check["failed_fast"] is True, (
@@ -553,6 +694,21 @@ def main() -> int:
                 "non_pm_user_http_status": st_imp_user_b,
                 "non_pm_user_response": body_imp_user_b,
             },
+            "deepseek_byok_setup": {
+                "user_id": byok_evidence["user_id"],
+                "settings_endpoint": byok_evidence["settings_endpoint"],
+                "byok_provider": byok_evidence["byok_provider"],
+                "temporary_key_written": byok_evidence["temporary_key_written"],
+                "temporary_key_deleted": byok_evidence["temporary_key_deleted"],
+                "key_write_skipped_reason": byok_evidence["key_write_skipped_reason"],
+                "api_keys_restored": byok_evidence["api_keys_restored"],
+                "budget_restored": byok_evidence["budget_restored"],
+            },
+            "temporary_key_written": byok_evidence["temporary_key_written"],
+            "temporary_key_deleted": byok_evidence["temporary_key_deleted"],
+            "key_write_skipped_reason": byok_evidence["key_write_skipped_reason"],
+            "api_keys_restored": byok_evidence["api_keys_restored"],
+            "budget_restored": byok_evidence["budget_restored"],
             "probes": probe_results,
             "unconfigured_provider_probe": body_unconf,
             "budget_today_after_probe": {
@@ -600,6 +756,7 @@ def main() -> int:
                 "真实后端子进程启动拒绝校验 (`PTC_CONFIG_FILE` 设 `assist=muse-spark-1.3-contributor`)",
                 f"failed_fast={startup_fail_check['failed_fast']} (exit_code={startup_fail_check['exit_code']})",
             ),
+            ("运行后状态恢复", byok_evidence["restoration_summary"]),
         ],
         notes=[
             f"所有 {len(enumerated_routes)} 条 `/api/v1/dalton/*` 路由均从运行中后端的 `GET /openapi.json` 动态枚举并在 `{pm_user}` / `{other_user}` 下逐一调用，断言 `uncalled_routes == []`，全程不触碰 `local-dev-user`。",

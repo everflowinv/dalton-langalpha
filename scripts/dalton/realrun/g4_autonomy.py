@@ -46,7 +46,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import subprocess
 import sys
 import time
 import uuid
@@ -74,6 +73,7 @@ from scripts.dalton.realrun._common import (  # noqa: E402
     load_repo_dotenv,
     now_utc_iso,
     preflight_realrun_script,
+    resolve_deepseek_key,
     write_evidence_and_summary,
 )
 from scripts.dalton.realrun.check_env import (  # noqa: E402
@@ -85,18 +85,6 @@ from scripts.dalton.realrun.check_env import (  # noqa: E402
     _snapshot_subagent_state,
 )
 from scripts.dalton.realrun.journal_dump import build_dsn_from_env  # noqa: E402
-
-
-def _resolve_deepseek_key() -> str:
-    env_val = os.environ.get("DEEPSEEK_API_KEY", "").strip()
-    if env_val:
-        return env_val
-    keychain_script = Path(
-        os.path.expanduser("~/.openclaw/workspace/scripts/deepseek_keychain_secret.sh")
-    )
-    if keychain_script.is_file():
-        return subprocess.check_output([str(keychain_script), "get"], text=True).strip()
-    raise RuntimeError("Could not resolve DeepSeek API key from env or keychain script")
 
 
 def _build_company_doc(ticker: str, name: str, cik: str) -> dict[str, Any]:
@@ -765,7 +753,7 @@ def _ensure_deepseek_byok_for_g4(
     """
     if bool((prior_keys_state or {}).get("had_user_deepseek_key")):
         return False
-    ds_key = _resolve_deepseek_key()
+    ds_key = resolve_deepseek_key()
     st_byok, _ = client.request(
         "PUT",
         "/api/v1/users/me/api-keys",

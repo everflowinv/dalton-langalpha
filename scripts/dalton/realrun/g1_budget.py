@@ -29,8 +29,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
-import subprocess
 import sys
 import time
 from decimal import Decimal
@@ -50,6 +48,7 @@ from scripts.dalton.realrun._common import (  # noqa: E402
     build_evidence_envelope,
     build_realrun_workspace_config,
     default_shanghai_date,
+    ensure_temporary_deepseek_byok,
     load_repo_dotenv,
     now_utc_iso,
     preflight_realrun_script,
@@ -64,18 +63,6 @@ from scripts.dalton.realrun.check_env import (  # noqa: E402
     _snapshot_subagent_state,
 )
 from scripts.dalton.realrun.journal_dump import build_dsn_from_env  # noqa: E402
-
-
-def _resolve_deepseek_key() -> str:
-    env_val = os.environ.get("DEEPSEEK_API_KEY", "").strip()
-    if env_val:
-        return env_val
-    keychain_script = Path(
-        os.path.expanduser("~/.openclaw/workspace/scripts/deepseek_keychain_secret.sh")
-    )
-    if keychain_script.is_file():
-        return subprocess.check_output([str(keychain_script), "get"], text=True).strip()
-    raise RuntimeError("Could not resolve DeepSeek API key from DEEPSEEK_API_KEY or keychain script")
 
 
 def _extract_sse_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
@@ -445,26 +432,6 @@ def _cleanup_g1_state(
     return errors
 
 
-def _ensure_deepseek_byok_for_g1(
-    client: RealRunHttpClient,
-    prior_keys_state: dict[str, Any] | None,
-) -> bool:
-    """Write a temporary DeepSeek BYOK key only when the user has none configured (D6).
-
-    Returns True when a temporary key was written (`PUT /api/v1/users/me/api-keys`),
-    or False when an existing user key was preserved without modification.
-    """
-    if bool((prior_keys_state or {}).get("had_user_deepseek_key")):
-        return False
-    ds_key = _resolve_deepseek_key()
-    st_k, _ = client.put(
-        "/api/v1/users/me/api-keys",
-        json_body={"byok_enabled": True, "api_keys": {"deepseek": ds_key}},
-    )
-    assert st_k == 200, f"PUT /api/v1/users/me/api-keys failed: status={st_k}"
-    return True
-
-
 def _assert_g1_added_cash_spend(
     *,
     baseline_spent_a: float,
@@ -618,7 +585,9 @@ def main() -> int:
             # 2. Scenario ②: Configure BYOK cash key in Settings (`PUT /api/v1/users/me/api-keys`)
             #    only when the user does NOT already have a DeepSeek key (D6), and verify cash spend
             #    is counted in `GET /api/v1/dalton/budget/today`
-            key_modified_a = _ensure_deepseek_byok_for_g1(client, prior_keys_a)
+            if not bool((prior_keys_a or {}).get("had_user_deepseek_key")):
+                key_modified_a = True
+            ensure_temporary_deepseek_byok(client, prior_keys_a)
 
             _, today_before_probe = client.get("/api/v1/dalton/budget/today")
             spent_before_probe = float(today_before_probe.get("spent_usd") or 0.0)
@@ -883,7 +852,9 @@ def main() -> int:
             assert st_b_cfg == 200, f"user_b PUT /api/v1/dalton/budget failed: {st_b_cfg} {b_cfg}"
             budget_modified_b = True
 
-            key_modified_b = _ensure_deepseek_byok_for_g1(client_b, prior_keys_b)
+            if not bool((prior_keys_b or {}).get("had_user_deepseek_key")):
+                key_modified_b = True
+            ensure_temporary_deepseek_byok(client_b, prior_keys_b)
 
             st_b_ws, b_ws = client_b.post(
                 "/api/v1/workspaces",

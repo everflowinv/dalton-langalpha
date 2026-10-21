@@ -1792,5 +1792,216 @@ async def test_p0j_j2b_risk_and_disclaimer_section_sent_to_step_b_and_labeled(
     assert {f.metric for f in labeled_risk} == {"欧盟监管罚款", "营业利润率变动"}
 
 
+@pytest.mark.parametrize(
+    ("line_text", "raw_sub", "expected_raw", "expected_pos"),
+    [
+        # "近一半" -> "近一半" (both when LLM extracted "一半" and when LLM already extracted "近一半")
+        ("渠道调研显示，近一半的企业客户已把推理负载迁到自研芯片。", "一半", "近一半", 7),
+        ("渠道调研显示，近一半的企业客户已把推理负载迁到自研芯片。", "近一半", "近一半", 7),
+        # "超过三成" -> "超过三成"
+        ("调查显示，超过三成的企业计划在明年扩大 AI 预算。", "三成", "超过三成", 5),
+        ("调查显示，超过三成的企业计划在明年扩大 AI 预算。", "超过三成", "超过三成", 5),
+        # "将近一半" longest match (must match "将近" rather than "近")
+        ("渠道调研显示，将近一半的企业客户已把推理负载迁到自研芯片。", "一半", "将近一半", 7),
+        ("渠道调研显示，将近一半的企业客户已把推理负载迁到自研芯片。", "近一半", "将近一半", 7),
+        # Negated qualifiers matched as complete longest-first qualifiers (do not strip negation)
+        ("调查显示，不超过三成的客户选择缩减预算。", "三成", "不超过三成", 5),
+        ("调查显示，未超过三成的客户选择缩减预算。", "三成", "未超过三成", 5),
+        ("调查显示，没超过三成的客户选择缩减预算。", "三成", "没超过三成", 5),
+        ("调查显示，不超三成的客户选择缩减预算。", "三成", "不超三成", 5),
+        ("调查显示，未超三成的客户选择缩减预算。", "三成", "未超三成", 5),
+        ("调查显示，不能超过三成的客户选择缩减预算。", "三成", "不能超过三成", 5),
+        ("调查显示，没有超过三成的客户选择缩减预算。", "三成", "没有超过三成", 5),
+        ("调查显示，不逾三成的客户选择缩减预算。", "三成", "不逾三成", 5),
+        ("调查显示，未逾三成的客户选择缩减预算。", "三成", "未逾三成", 5),
+        # Compound words ending in single-char '近' / '约' / '超' must NOT expand
+        ("最近一半的企业客户完成了迁移。", "一半", "一半", 2),
+        ("附近一半的园区已接入新电网。", "一半", "一半", 2),
+        ("新近一半的订单来自海外。", "一半", "一半", 2),
+        ("靠近一半的节点处于满载状态。", "一半", "一半", 2),
+        ("合约一半的金额将在今年确认。", "一半", "一半", 2),
+        ("签约三成的客户选择了三年期合同。", "三成", "三成", 2),
+        ("高超三成的对手仍未盈利。", "三成", "三成", 2),
+        ("赶超三成的历史峰值。", "三成", "三成", 2),
+        # No preceding qualifier -> unchanged
+        ("大半的新签合同带有产能预留条款。", "大半", "大半", 0),
+        ("一家头部客户把明年的 GPU 预算砍掉一半，转投自研加速器。", "砍掉一半", "砍掉一半", 17),
+        ("渠道商预计明年 Trainium 出货量倍增。", "倍增", "倍增", 20),
+        # Qualifier not immediately adjacent (separated by other characters) -> unchanged
+        ("近两年有一半的企业客户已把推理负载迁到自研芯片。", "一半", "一半", 4),
+        ("超过市场预期，三成客户选择续约。", "三成", "三成", 7),
+        ("大约在明年年中，四成订单将交付。", "四成", "四成", 8),
+    ],
+)
+def test_p0j_j5h_expand_colloquial_raw_with_qualifier(
+    line_text: str, raw_sub: str, expected_raw: str, expected_pos: int
+) -> None:
+    """P0J.J5h (Part B): Direct unit tests for `_expand_colloquial_raw_with_qualifier`."""
+    from src.dalton.publish.numbers import (
+        COLLOQUIAL_APPROX_QUALIFIERS,
+        SINGLE_CHAR_QUALIFIER_EXCLUDED_PRECEDING,
+        _expand_colloquial_raw_with_qualifier,
+    )
+
+    assert callable(match_figures)
+    required_qualifiers = {
+        "近",
+        "将近",
+        "接近",
+        "约",
+        "大约",
+        "约为",
+        "超",
+        "超过",
+        "逾",
+        "不到",
+        "不足",
+        "近乎",
+        "几乎",
+        "多达",
+        "不超过",
+        "未超过",
+        "没超过",
+        "不超",
+        "未超",
+        "不逾",
+        "未逾",
+    }
+    assert required_qualifiers.issubset(set(COLLOQUIAL_APPROX_QUALIFIERS))
+    assert list(COLLOQUIAL_APPROX_QUALIFIERS) == sorted(
+        COLLOQUIAL_APPROX_QUALIFIERS, key=len, reverse=True
+    )
+    assert {"最", "附", "新", "靠", "邻", "贴", "逼", "亲", "就"}.issubset(
+        SINGLE_CHAR_QUALIFIER_EXCLUDED_PRECEDING["近"]
+    )
+    assert {
+        "合",
+        "签",
+        "制",
+        "预",
+        "公",
+        "条",
+        "节",
+        "婚",
+        "违",
+        "践",
+        "履",
+        "契",
+        "相",
+        "邀",
+        "隐",
+    }.issubset(SINGLE_CHAR_QUALIFIER_EXCLUDED_PRECEDING["约"])
+    assert {"高", "赶"}.issubset(SINGLE_CHAR_QUALIFIER_EXCLUDED_PRECEDING["超"])
+    assert _expand_colloquial_raw_with_qualifier(line_text, raw_sub) == (
+        expected_raw,
+        expected_pos,
+    )
+
+    # Same line with two occurrences of '一半', where only the second has '近' immediately before it
+    same_line = "上半年完成一半，下半年完成近一半。"
+    first_raw, first_pos = _expand_colloquial_raw_with_qualifier(same_line, "一半", 0)
+    assert (first_raw, first_pos) == ("一半", 5)
+    second_raw, second_pos = _expand_colloquial_raw_with_qualifier(
+        same_line, "一半", first_pos + len("一半")
+    )
+    assert (second_raw, second_pos) == ("近一半", 13)
+
+
+@pytest.mark.asyncio
+async def test_p0j_j5h_extra_figures_loop_expands_qualifier_preserving_value_and_unit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P0J.J5h (Part B): `extra_figures` merge loop expands `raw` with adjacent qualifier while keeping `value` and `unit` unchanged, including multiple occurrences on the same line."""
+    from src.dalton.llm.assist import AssistResult
+    from src.dalton.publish.numbers import extract_figures, label_figures_with_status
+
+    md = (
+        "# 渠道观察\n\n"
+        "- 渠道调研显示，近一半的企业客户已把推理负载迁到自研芯片。\n"
+        "- 调查显示，超过三成的企业计划扩大预算，不超过三成的企业维持原状。\n"
+        "- 上半年完成一半[^1]，下半年完成近一半[^2]。\n\n"
+        "[^1]: https://example.com/h1\n"
+        "[^2]: https://example.com/h2\n"
+    )
+    figs = extract_figures(md)
+    assert figs == []
+
+    async def fake_assist_json(
+        task: str,
+        instructions: str,
+        payload: dict[str, Any],
+        schema: dict[str, Any],
+        **kwargs: Any,
+    ) -> AssistResult:
+        return AssistResult(
+            ok=True,
+            status="ok",
+            data={
+                "items": [],
+                "extra_figures": [
+                    {
+                        "raw": "一半",
+                        "line": 3,
+                        "value": 50.0,
+                        "unit": "pct",
+                        "metric": "",
+                        "period": "",
+                        "kind": "reported",
+                    },
+                    {
+                        "raw": "三成",
+                        "line": 4,
+                        "value": 30.0,
+                        "unit": "pct",
+                        "metric": "",
+                        "period": "",
+                        "kind": "reported",
+                    },
+                    {
+                        "raw": "三成",
+                        "line": 4,
+                        "value": 30.0,
+                        "unit": "pct",
+                        "metric": "",
+                        "period": "",
+                        "kind": "reported",
+                    },
+                    {
+                        "raw": "一半",
+                        "line": 5,
+                        "value": 50.0,
+                        "unit": "pct",
+                        "metric": "",
+                        "period": "",
+                        "kind": "reported",
+                    },
+                    {
+                        "raw": "一半",
+                        "line": 5,
+                        "value": 50.0,
+                        "unit": "pct",
+                        "metric": "",
+                        "period": "",
+                        "kind": "reported",
+                    },
+                ],
+            },
+            model="gemini-3.8-flash-low-oauth",
+        )
+
+    mock_assist = create_autospec(assist_json, side_effect=fake_assist_json)
+    monkeypatch.setattr("src.dalton.publish.numbers.assist_json", mock_assist)
+    labeled, ok = await label_figures_with_status(md, figs)
+    assert ok is True
+    assert [(f.raw, f.value, f.unit, f.footnote_id) for f in labeled] == [
+        ("近一半", 50.0, "pct", None),
+        ("超过三成", 30.0, "pct", None),
+        ("不超过三成", 30.0, "pct", None),
+        ("一半", 50.0, "pct", "1"),
+        ("近一半", 50.0, "pct", "2"),
+    ]
+
+
+
 
 

@@ -98,9 +98,82 @@ EXEMPT_MARKERS: tuple[str, ...] = tuple(
     f"{ob}{w}{cb}" for w in EXEMPT_MARKER_WORDS for ob, cb in EXEMPT_MARKER_BRACKETS
 )
 
+# Approximate qualifiers immediately preceding colloquial numbers, ordered longest-first (P0J J5h)
+COLLOQUIAL_APPROX_QUALIFIERS: tuple[str, ...] = (
+    # Longer negations first, so a suffix match never trims them down to the positive "超过".
+    "不能超过",
+    "不会超过",
+    "不得超过",
+    "没有超过",
+    "并未超过",
+    "不超过",
+    "未超过",
+    "没超过",
+    "将近",
+    "接近",
+    "大约",
+    "约为",
+    "超过",
+    "不超",
+    "未超",
+    "不逾",
+    "未逾",
+    "不到",
+    "不足",
+    "近乎",
+    "几乎",
+    "多达",
+    "近",
+    "约",
+    "超",
+    "逾",
+)
+
+SINGLE_CHAR_QUALIFIER_EXCLUDED_PRECEDING: dict[str, frozenset[str]] = {
+    "近": frozenset(("最", "附", "新", "靠", "邻", "贴", "逼", "亲", "就")),
+    "约": frozenset(
+        ("合", "签", "制", "预", "公", "条", "节", "婚", "违", "践", "履", "契", "相", "邀", "隐")
+    ),
+    "超": frozenset(("高", "赶")),
+    "逾": frozenset(),
+}
+
 
 def has_exempt_marker(text: str) -> bool:
     return any(m in text for m in EXEMPT_MARKERS)
+
+
+def _expand_colloquial_raw_with_qualifier(
+    line_text: str,
+    raw_sub: str,
+    start: int = 0,
+) -> tuple[str, int]:
+    """Expand a colloquial figure `raw_sub` leftward when immediately preceded by an approximate qualifier on `line_text`.
+
+    Returns `(expanded_raw, expanded_start_index)` for the occurrence at or after `start`.
+    """
+    if not line_text or not raw_sub:
+        return raw_sub, -1
+    pos = line_text.find(raw_sub, max(0, start))
+    if pos < 0:
+        return raw_sub, -1
+    core = raw_sub
+    core_pos = pos
+    for q in COLLOQUIAL_APPROX_QUALIFIERS:
+        if raw_sub.startswith(q) and len(raw_sub) > len(q):
+            core = raw_sub[len(q) :]
+            core_pos = pos + len(q)
+            break
+    prefix = line_text[:core_pos]
+    for q in COLLOQUIAL_APPROX_QUALIFIERS:
+        if not prefix.endswith(q):
+            continue
+        if len(q) == 1:
+            excluded_prev = SINGLE_CHAR_QUALIFIER_EXCLUDED_PRECEDING.get(q, frozenset())
+            if len(prefix) >= 2 and prefix[-2] in excluded_prev:
+                continue
+        return q + core, core_pos - len(q)
+    return raw_sub, pos
 
 
 # Core financial number regex:
@@ -1153,7 +1226,8 @@ STEP_B_LABEL_INSTRUCTIONS = (
     "as `incidental`. "
     "2) Also scan markdown_excerpt for any colloquial Chinese numbers not already in extracted_figures "
     "(such as '两成', '四成', '五分之一', '四分之三', '过半', '减半', '翻番', '腰斩') "
-    "and return them in `extra_figures` with exact `raw` substring from the draft, `line` number, "
+    "and return them in `extra_figures` with exact `raw` substring from the draft "
+    "(`raw` 必须包含紧挨在数字前面的约数限定词，如 '将近四成'、'不到五分之一'), `line` number, "
     "numeric `value` (e.g. 20.0 for 两成, 50.0 for 过半/减半/腰斩, 2.0 for 翻番), `unit` ('pct' or 'x'), "
     "`metric`, `period`, and `kind`."
 )
@@ -1232,7 +1306,20 @@ async def label_figures_with_status(
         batches.append(("", 1, markdown_text[:6000], [], 0, 0))
 
     fig_counter = len(figures)
-    existing_raws_by_line = {(f.location.get("line"), f.raw) for f in figures}
+    existing_raws_by_line: set[tuple[int, int, str]] = set()
+    for f in figures:
+        f_line = f.location.get("line")
+        if isinstance(f_line, int) and 1 <= f_line <= len(lines) and f.raw:
+            l_txt = lines[f_line - 1]
+            search_pos = 0
+            while search_pos <= len(l_txt):
+                found_pos = l_txt.find(f.raw, search_pos)
+                if found_pos < 0:
+                    break
+                if (f_line, found_pos, f.raw) not in existing_raws_by_line:
+                    existing_raws_by_line.add((f_line, found_pos, f.raw))
+                    break
+                search_pos = found_pos + max(1, len(f.raw))
 
     labeled_count = 0
     failed_batches = 0
@@ -1383,11 +1470,34 @@ async def label_figures_with_status(
                         matched_line_no = idx
                         matched_line_text = l_text
                         break
-            if not matched_line_text or (matched_line_no, raw_sub) in existing_raws_by_line:
+            if not matched_line_text:
                 continue
-            existing_raws_by_line.add((matched_line_no, raw_sub))
 
-            raw_pos = matched_line_text.find(raw_sub)
+            orig_raw_sub = raw_sub
+            selected_raw: str | None = None
+            raw_pos = -1
+            search_start = 0
+            while search_start <= len(matched_line_text):
+                occ_pos = matched_line_text.find(orig_raw_sub, search_start)
+                if occ_pos < 0:
+                    break
+                cand_raw, cand_pos = _expand_colloquial_raw_with_qualifier(
+                    matched_line_text, orig_raw_sub, occ_pos
+                )
+                if (
+                    (matched_line_no, occ_pos, orig_raw_sub) not in existing_raws_by_line
+                    and (matched_line_no, cand_pos, cand_raw) not in existing_raws_by_line
+                ):
+                    selected_raw = cand_raw
+                    raw_pos = cand_pos
+                    existing_raws_by_line.add((matched_line_no, occ_pos, orig_raw_sub))
+                    existing_raws_by_line.add((matched_line_no, cand_pos, cand_raw))
+                    break
+                search_start = occ_pos + max(1, len(orig_raw_sub))
+
+            if selected_raw is None or raw_pos < 0:
+                continue
+            raw_sub = selected_raw
             line_fns = [
                 (fm.start(), fm.group(1))
                 for fm in _FOOTNOTE_REF_RE.finditer(matched_line_text)

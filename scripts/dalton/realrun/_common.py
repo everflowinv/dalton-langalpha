@@ -78,6 +78,42 @@ def resolve_local_dev_user_id() -> str:
     return (os.getenv("AUTH_USER_ID") or "").strip() or "local-dev-user"
 
 
+def resolve_deepseek_key() -> str:
+    """Resolve the DeepSeek cash API key from `DEEPSEEK_API_KEY` or the local keychain script."""
+    env_val = os.environ.get("DEEPSEEK_API_KEY", "").strip()
+    if env_val:
+        return env_val
+    keychain_script = Path(
+        os.path.expanduser("~/.openclaw/workspace/scripts/deepseek_keychain_secret.sh")
+    )
+    if keychain_script.is_file():
+        return subprocess.check_output([str(keychain_script), "get"], text=True).strip()
+    raise RuntimeError("Could not resolve DeepSeek API key from env or keychain script")
+
+
+def ensure_temporary_deepseek_byok(
+    client: RealRunHttpClient,
+    prior_keys_state: dict[str, Any] | None,
+) -> bool:
+    """Write a temporary DeepSeek BYOK key only when the user has none configured (P0J §8.1 #19, D6).
+
+    Raises ValueError (fail-closed) if `prior_keys_state` is None or not a dict.
+    Returns True when a temporary key was written (`PUT /api/v1/users/me/api-keys`),
+    or False when an existing user key was preserved without modification.
+    """
+    if not isinstance(prior_keys_state, dict):
+        raise ValueError("prior_keys_state is required (fail-closed)")
+    if bool(prior_keys_state.get("had_user_deepseek_key")):
+        return False
+    ds_key = resolve_deepseek_key()
+    st_k, _ = client.put(
+        "/api/v1/users/me/api-keys",
+        json_body={"byok_enabled": True, "api_keys": {"deepseek": ds_key}},
+    )
+    assert st_k == 200, f"PUT /api/v1/users/me/api-keys failed: status={st_k}"
+    return True
+
+
 def build_realrun_workspace_config(
     script_name: str, extra: dict[str, Any] | None = None
 ) -> dict[str, Any]:
