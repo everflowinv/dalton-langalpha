@@ -31,3 +31,7 @@ services:
     environment:
       VITE_BRAND_NAME: ${VITE_BRAND_NAME:-Everflow}
       VITE_BRAND_MARK: ${VITE_BRAND_MARK:-everflow}
+      # Supabase sign-in (docs/dalton/dev-guide/AUTH-DEPLOY.md); empty keeps the no-login local mode.
+      VITE_DALTON_AUTH: ${VITE_DALTON_AUTH:-}
+      VITE_SUPABASE_URL: ${VITE_SUPABASE_URL:-}
+      VITE_SUPABASE_PUBLISHABLE_KEY: ${VITE_SUPABASE_PUBLISHABLE_KEY:-}
