@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-import asyncio
 import dataclasses
 import logging
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
@@ -268,9 +266,14 @@ async def run_review(
         except Exception:
             pass
 
+    remaining_candidates = (
+        list(candidates)
+        if candidates is not None
+        else list(get_dalton_config().publish.reviewer_models)
+    )
     model = pick_reviewer_model(
         author_model,
-        candidates=candidates,
+        candidates=remaining_candidates,
         available_models=eff_available,
     )
     if not model or family_of(model) == author_family:
@@ -285,60 +288,76 @@ async def run_review(
     system_prompt = load_agent_body("dalton-reviewer")
     user_prompt = render_review_input(bundle)
 
-    try:
-        from src.dalton.llm.complete import dalton_complete
+    last_failure: ReviewResult | None = None
+    while model and family_of(model) != author_family:
+        cand_family = family_of(model)
+        remaining_candidates = [
+            c for c in remaining_candidates if c != model and family_of(c) != cand_family
+        ]
+        try:
+            from src.dalton.llm.complete import dalton_complete
 
-        comp = await dalton_complete(
-            None,
-            user_id=user_id or LOCAL_DEV_USER_ID,
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
-            purpose="publish.review",
-            request_model=model,
-            response_schema=ReviewVerdict,
-            slot="primary",
-            reasoning_effort="high",
-            timeout_s=300.0,
-            workspace_id=workspace_id,
-            thread_id=thread_id,
-            raise_on_error=False,
-        )
-        if not comp.ok:
-            return ReviewResult(
+            comp = await dalton_complete(
+                None,
+                user_id=user_id or LOCAL_DEV_USER_ID,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                purpose="publish.review",
+                request_model=model,
+                response_schema=ReviewVerdict,
+                slot="primary",
+                reasoning_effort="high",
+                timeout_s=300.0,
+                workspace_id=workspace_id,
+                thread_id=thread_id,
+                raise_on_error=False,
+            )
+            if not comp.ok:
+                last_failure = ReviewResult(
+                    status="unavailable",
+                    model=model,
+                    family=cand_family,
+                    reason=f"独立审稿调用失败：{comp.error or comp.status}",
+                )
+            else:
+                verdict_obj = comp.data
+                usage = dict(comp.usage) if isinstance(comp.usage, dict) else {}
+                usage["replayed"] = bool(comp.replayed)
+                usage["cached"] = bool(comp.cached)
+                usage["cash_usd"] = float(comp.cash_usd)
+                usage["notional_usd"] = float(comp.notional_usd)
+                usage["invocation_id"] = comp.invocation_id
+
+                if isinstance(verdict_obj, dict):
+                    verdict_obj = ReviewVerdict.model_validate(verdict_obj)
+                if not isinstance(verdict_obj, ReviewVerdict):
+                    raise ValueError(f"Unexpected review output type: {type(verdict_obj)}")
+
+                if verdict_obj.must_fix and verdict_obj.verdict != "revise":
+                    verdict_obj.verdict = "revise"
+
+                return ReviewResult(
+                    status="done",
+                    model=model,
+                    family=cand_family,
+                    verdict=verdict_obj,
+                    usage=usage,
+                )
+        except Exception as e:
+            logger.warning("Independent review call failed on model %s: %s", model, e)
+            last_failure = ReviewResult(
                 status="unavailable",
                 model=model,
-                family=family_of(model),
-                reason=f"独立审稿调用失败：{comp.error or comp.status}",
+                family=cand_family,
+                reason=f"独立审稿调用失败：{e}",
             )
-        verdict_obj = comp.data
-        usage = dict(comp.usage) if isinstance(comp.usage, dict) else {}
-        usage["replayed"] = bool(comp.replayed)
-        usage["cached"] = bool(comp.cached)
-        usage["cash_usd"] = float(comp.cash_usd)
-        usage["notional_usd"] = float(comp.notional_usd)
-        usage["invocation_id"] = comp.invocation_id
 
-        if isinstance(verdict_obj, dict):
-            verdict_obj = ReviewVerdict.model_validate(verdict_obj)
-        if not isinstance(verdict_obj, ReviewVerdict):
-            raise ValueError(f"Unexpected review output type: {type(verdict_obj)}")
-
-        if verdict_obj.must_fix and verdict_obj.verdict != "revise":
-            verdict_obj.verdict = "revise"
-
-        return ReviewResult(
-            status="done",
-            model=model,
-            family=family_of(model),
-            verdict=verdict_obj,
-            usage=usage,
+        model = pick_reviewer_model(
+            author_model,
+            candidates=remaining_candidates,
+            available_models=eff_available,
         )
-    except Exception as e:
-        logger.warning("Independent review call failed on model %s: %s", model, e)
-        return ReviewResult(
-            status="unavailable",
-            model=model,
-            family=family_of(model),
-            reason=f"独立审稿调用失败：{e}",
-        )
+
+    assert last_failure is not None
+    return last_failure
 

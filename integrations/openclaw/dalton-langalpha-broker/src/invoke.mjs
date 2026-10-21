@@ -5,6 +5,7 @@ import {
   clampThinkingLevel,
   calculateCost,
   prepareSimpleCompletionModelForAgent,
+  createXaiGrokOAuthHeadersWrapper,
 } from "./sdk-bridge.mjs";
 import { sendJson, sendOpenAiError, beginSse, writeSseData, endSse, readJsonBody } from "./http.mjs";
 import {
@@ -52,32 +53,68 @@ function isPreparedResultOk(prepared) {
   );
 }
 
+function cloneModelWithBaseUrl(target, baseUrl) {
+  const clone = Object.create(
+    Object.getPrototypeOf(target),
+    Object.getOwnPropertyDescriptors(target),
+  );
+  for (const sym of Object.getOwnPropertySymbols(target)) {
+    const desc = Object.getOwnPropertyDescriptor(target, sym);
+    if (desc) {
+      Object.defineProperty(clone, sym, desc);
+    }
+  }
+  if (!clone.baseUrl && baseUrl) {
+    try {
+      Object.defineProperty(clone, "baseUrl", {
+        value: baseUrl,
+        enumerable: true,
+        configurable: true,
+        writable: true,
+      });
+    } catch {
+      // A non-configurable baseUrl cannot be backfilled; send the model unchanged.
+      return target;
+    }
+  }
+  return clone;
+}
+
 /**
  * Extracts the bound `completionTransport` model when `prepareSimpleCompletionModelForAgent`
  * attached `Symbol("openclaw.modelLlmRuntime")` (matching OpenClaw's internal
  * `completeWithPreparedSimpleCompletionModel`), while preserving plain objects in unit tests.
  */
-export function resolveStreamExecutionModel(model) {
+export function resolveStreamExecutionModel(model, cfg) {
   if (!model || typeof model !== "object") return model;
+  const fallbackBaseUrl =
+    model.baseUrl || cfg?.models?.providers?.[model.provider]?.baseUrl || undefined;
   const runtimeSym = Object.getOwnPropertySymbols(model).find(
     (s) => s.description === "openclaw.modelLlmRuntime",
   );
-  if (!runtimeSym) return model;
+  if (!runtimeSym) {
+    if (!model.baseUrl && fallbackBaseUrl) {
+      return cloneModelWithBaseUrl(model, fallbackBaseUrl);
+    }
+    return model;
+  }
   const binding = model[runtimeSym];
   const transport = binding?.completionTransport;
-  if (!transport || typeof transport !== "object") return model;
-  const bound = { ...transport };
-  for (const sym of Object.getOwnPropertySymbols(transport)) {
-    Object.defineProperty(bound, sym, {
-      value: transport[sym],
-      enumerable: false,
-      configurable: true,
-    });
+  if (!transport || typeof transport !== "object") {
+    if (!model.baseUrl && fallbackBaseUrl) {
+      return cloneModelWithBaseUrl(model, fallbackBaseUrl);
+    }
+    return model;
+  }
+  const bound = cloneModelWithBaseUrl(transport, fallbackBaseUrl);
+  if (bound === transport) {
+    // The transport could not be cloned with a baseUrl; never rebind (or mutate) the original.
+    return model;
   }
   Object.defineProperty(bound, runtimeSym, {
     value: {
       ...binding,
-      completionTransport: transport,
+      completionTransport: bound,
     },
     enumerable: false,
     configurable: true,
@@ -187,11 +224,16 @@ export async function handleChatCompletions(
     journal,
     replayStore,
     logger,
+    runtimeVersion,
     deps = {},
   },
 ) {
   const prepareModelFn = deps.prepareSimpleCompletionModelForAgent || prepareSimpleCompletionModelForAgent;
-  const streamSimpleFn = deps.streamSimple || streamSimple;
+  const streamSimpleFn = createXaiGrokOAuthHeadersWrapper(
+    deps.streamSimple || streamSimple,
+    runtimeVersion,
+    logger,
+  );
   const calculateCostFn = deps.calculateCost || calculateCost;
 
   const release = limiter.tryAcquire();
@@ -488,7 +530,7 @@ export async function handleChatCompletions(
       invocationRecorded = true;
     }
 
-    const executionModel = resolveStreamExecutionModel(model);
+    const executionModel = resolveStreamExecutionModel(model, cfg);
     const eventStream = streamSimpleFn(executionModel, context, streamOpts);
 
     if (!wantStream) {

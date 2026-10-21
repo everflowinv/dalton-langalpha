@@ -1,12 +1,12 @@
 {
   "meta": {
-    "generated_at": "2026-10-18T13:57:04Z",
+    "generated_at": "2026-10-21T17:03:44Z",
     "source": "broker+openclaw_config",
     "broker_version": "2.0.0",
     "openclaw_version": "unknown",
     "counts": {
-      "catalog": 27,
-      "visible": 24,
+      "catalog": 30,
+      "visible": 27,
       "hidden": 3,
       "text_only": 13
     },
@@ -81,33 +81,6 @@
           "openclaw.rateCard": 4.0
         },
         "chosen": 4.0
-      },
-      {
-        "ref": "xai/grok-4.7",
-        "field": "input",
-        "values": {
-          "broker.cost": 2.0,
-          "openclaw.rateCard": 3.0
-        },
-        "chosen": 3.0
-      },
-      {
-        "ref": "xai/grok-4.7",
-        "field": "output",
-        "values": {
-          "broker.cost": 6.0,
-          "openclaw.rateCard": 15.0
-        },
-        "chosen": 15.0
-      },
-      {
-        "ref": "xai/grok-4.7",
-        "field": "cached_input",
-        "values": {
-          "broker.cost": 0.5,
-          "openclaw.rateCard": 0.75
-        },
-        "chosen": 0.75
       }
     ],
     "warnings": [
@@ -617,14 +590,14 @@
       "visible": true,
       "speed": 3,
       "intelligence": 4,
-      "context": 500000,
+      "context": 256000,
       "input_modalities": [
         "text",
         "image"
       ],
       "prompt_guidance": "lean",
       "parameters": {
-        "max_tokens": 128000
+        "max_tokens": 64000
       },
       "reasoning": {
         "efforts": [
@@ -670,6 +643,83 @@
       "speed": 3,
       "intelligence": 4,
       "context": 1000000,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "prompt_guidance": "lean",
+      "parameters": {
+        "max_tokens": 64000
+      },
+      "reasoning": {
+        "efforts": [
+          "low",
+          "medium",
+          "high"
+        ],
+        "default": "high",
+        "write": "parameters.reasoning_effort"
+      }
+    },
+    "ocb-xai-grok-4.7-build-fast": {
+      "model_id": "xai/grok-4.7-build-fast",
+      "provider": "openclaw-broker",
+      "display_name": "Grok 4.7 Fast · OpenClaw",
+      "visible": true,
+      "speed": 3,
+      "intelligence": 4,
+      "context": 256000,
+      "input_modalities": [
+        "text"
+      ],
+      "prompt_guidance": "lean",
+      "parameters": {
+        "max_tokens": 64000
+      },
+      "reasoning": {
+        "efforts": [
+          "low",
+          "medium",
+          "high"
+        ],
+        "default": "high",
+        "write": "parameters.reasoning_effort"
+      }
+    },
+    "ocb-xai-grok-4.6": {
+      "model_id": "xai/grok-4.6",
+      "provider": "openclaw-broker",
+      "display_name": "Grok 4.6 · OpenClaw",
+      "visible": true,
+      "speed": 3,
+      "intelligence": 4,
+      "context": 256000,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "prompt_guidance": "lean",
+      "parameters": {
+        "max_tokens": 64000
+      },
+      "reasoning": {
+        "efforts": [
+          "low",
+          "medium",
+          "high"
+        ],
+        "default": "high",
+        "write": "parameters.reasoning_effort"
+      }
+    },
+    "ocb-xai-grok-4.5": {
+      "model_id": "xai/grok-4.5",
+      "provider": "openclaw-broker",
+      "display_name": "Grok 4.5 · OpenClaw",
+      "visible": true,
+      "speed": 3,
+      "intelligence": 4,
+      "context": 256000,
       "input_modalities": [
         "text",
         "image"
@@ -1368,24 +1418,26 @@
           "name": "Grok 4.7",
           "is_reasoning": true,
           "description": "Grok 4.7 via Dalton broker v2",
-          "context_window": 500000,
-          "max_output": 128000,
+          "context_window": 256000,
+          "max_output": 64000,
           "pricing": {
-            "input": 3.0,
-            "output": 15.0,
-            "cached_input": 0.75,
+            "pricing_type": "subscription",
             "unit": "per_1m_tokens"
           },
-          "notional_pricing": null,
+          "notional_pricing": {
+            "input": 2.0,
+            "output": 6.0,
+            "cached_input": 0.5,
+            "unit": "per_1m_tokens"
+          },
           "dalton": {
             "openclaw_ref": "xai/grok-4.7",
             "upstream_provider": "xai",
             "family": "xai-grok",
-            "billing": "cash",
+            "billing": "subscription",
             "tool_calling": true,
             "price_sources": [
-              "broker.cost",
-              "openclaw.rateCard"
+              "broker.cost"
             ]
           }
         },
@@ -1397,17 +1449,20 @@
           "context_window": 256000,
           "max_output": 64000,
           "pricing": {
+            "pricing_type": "subscription",
+            "unit": "per_1m_tokens"
+          },
+          "notional_pricing": {
             "input": 1.0,
             "output": 2.0,
             "cached_input": 0.2,
             "unit": "per_1m_tokens"
           },
-          "notional_pricing": null,
           "dalton": {
             "openclaw_ref": "xai/grok-build-0.1",
             "upstream_provider": "xai",
             "family": "xai-grok",
-            "billing": "cash",
+            "billing": "subscription",
             "tool_calling": true,
             "price_sources": [
               "broker.cost"
@@ -1422,17 +1477,97 @@
           "context_window": 1000000,
           "max_output": 64000,
           "pricing": {
+            "pricing_type": "subscription",
+            "unit": "per_1m_tokens"
+          },
+          "notional_pricing": {
             "input": 1.25,
             "output": 2.5,
             "cached_input": 0.2,
             "unit": "per_1m_tokens"
           },
-          "notional_pricing": null,
           "dalton": {
             "openclaw_ref": "xai/grok-4.3",
             "upstream_provider": "xai",
             "family": "xai-grok",
-            "billing": "cash",
+            "billing": "subscription",
+            "tool_calling": true,
+            "price_sources": [
+              "broker.cost"
+            ]
+          }
+        },
+        {
+          "id": "xai/grok-4.7-build-fast",
+          "name": "Grok 4.7 Fast",
+          "is_reasoning": true,
+          "description": "Grok 4.7 Fast via Dalton broker v2",
+          "context_window": 256000,
+          "max_output": 64000,
+          "pricing": {
+            "pricing_type": "subscription",
+            "unit": "per_1m_tokens"
+          },
+          "notional_pricing": null,
+          "dalton": {
+            "openclaw_ref": "xai/grok-4.7-build-fast",
+            "upstream_provider": "xai",
+            "family": "xai-grok",
+            "billing": "subscription",
+            "tool_calling": true,
+            "price_sources": []
+          }
+        },
+        {
+          "id": "xai/grok-4.6",
+          "name": "Grok 4.6",
+          "is_reasoning": true,
+          "description": "Grok 4.6 via Dalton broker v2",
+          "context_window": 256000,
+          "max_output": 64000,
+          "pricing": {
+            "pricing_type": "subscription",
+            "unit": "per_1m_tokens"
+          },
+          "notional_pricing": {
+            "input": 2.0,
+            "output": 6.0,
+            "cached_input": 0.5,
+            "unit": "per_1m_tokens"
+          },
+          "dalton": {
+            "openclaw_ref": "xai/grok-4.6",
+            "upstream_provider": "xai",
+            "family": "xai-grok",
+            "billing": "subscription",
+            "tool_calling": true,
+            "price_sources": [
+              "broker.cost"
+            ]
+          }
+        },
+        {
+          "id": "xai/grok-4.5",
+          "name": "Grok 4.5",
+          "is_reasoning": true,
+          "description": "Grok 4.5 via Dalton broker v2",
+          "context_window": 256000,
+          "max_output": 64000,
+          "pricing": {
+            "pricing_type": "subscription",
+            "unit": "per_1m_tokens"
+          },
+          "notional_pricing": {
+            "input": 2.0,
+            "output": 6.0,
+            "cached_input": 0.3,
+            "unit": "per_1m_tokens"
+          },
+          "dalton": {
+            "openclaw_ref": "xai/grok-4.5",
+            "upstream_provider": "xai",
+            "family": "xai-grok",
+            "billing": "subscription",
             "tool_calling": true,
             "price_sources": [
               "broker.cost"

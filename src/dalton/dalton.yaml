@@ -28,7 +28,7 @@ publish:
   reviewer_models:
     - "gpt-6.1-sol-oauth"
     - "gemini-4-argon-high-oauth"
-    - "grok-4.7"
+    - "ocb-xai-grok-4.7"
     - "claude-opus-5-5-oauth"
   extract_model: null
   approval_ttl_hours: 168
