@@ -9,6 +9,9 @@ services:
     entrypoint: ["/usr/bin/tini", "-s", "--", "/app/scripts/dalton/docker_entrypoint_dalton.sh"]
     command: ["uv", "run", "python", "server.py", "--host", "0.0.0.0", "--port", "8000", "--reload"]
     mem_limit: 2g
+    # Chromium (scrapling's browser tier) crashes pages ("Page crashed", then a dead
+    # driver pipe) with Docker's default 64 MB /dev/shm, which hung the whole backend.
+    shm_size: "1gb"
     memswap_limit: 2g
     environment:
       REDIS_URL: "redis://:${REDIS_PASSWORD:-redis}@redis:6379/0"
