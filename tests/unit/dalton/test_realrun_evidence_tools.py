@@ -2015,10 +2015,10 @@ def test_r2_round2_cleanup_autospec_d5_d6_d7(monkeypatch: pytest.MonkeyPatch) ->
     # 3. D6: Setup and cleanup behavior for both had_user_deepseek_key=True and had_user_deepseek_key=False
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-deepseek-key")
 
-    # 3a. had_user_deepseek_key=True -> neither G1 nor G4 setup calls PUT, and _restore_api_keys_state is a no-op
+    # 3a. had_user_deepseek_key=True -> neither _common/G1/G2 nor G4 setup calls PUT, and _restore_api_keys_state is a no-op
     existing_key_client = create_autospec(RealRunHttpClient, instance=True)
     assert (
-        g1_budget._ensure_deepseek_byok_for_g1(
+        _common.ensure_temporary_deepseek_byok(
             existing_key_client,
             {"byok_enabled": True, "had_user_deepseek_key": True},
         )
@@ -2064,11 +2064,17 @@ def test_r2_round2_cleanup_autospec_d5_d6_d7(monkeypatch: pytest.MonkeyPatch) ->
     assert "保留未删除" in ev_preserved["user_b_cleanup_note"]
     assert "已删除用户 B" not in ev_preserved["user_b_cleanup_note"]
 
-    # 3b. had_user_deepseek_key=False -> G1 and G4 setup write temporary key via PUT, and evidence fields record write + delete
+    # 3b. had_user_deepseek_key=False -> _common/G1/G2 and G4 setup write temporary key via PUT, and evidence fields record write + delete
+    from scripts.dalton.realrun import g2_providers
+
     no_key_client_g1 = create_autospec(RealRunHttpClient, instance=True)
+    with pytest.raises(ValueError, match="prior_keys_state is required"):
+        _common.ensure_temporary_deepseek_byok(no_key_client_g1, None)
+    no_key_client_g1.put.assert_not_called()
+
     no_key_client_g1.put.return_value = (200, {"ok": True})
     assert (
-        g1_budget._ensure_deepseek_byok_for_g1(
+        _common.ensure_temporary_deepseek_byok(
             no_key_client_g1,
             {"byok_enabled": False, "had_user_deepseek_key": False},
         )
@@ -2078,6 +2084,26 @@ def test_r2_round2_cleanup_autospec_d5_d6_d7(monkeypatch: pytest.MonkeyPatch) ->
         "/api/v1/users/me/api-keys",
         json_body={"byok_enabled": True, "api_keys": {"deepseek": "sk-test-deepseek-key"}},
     )
+    g2_ev_written = g2_providers._build_g2_byok_evidence_fields(
+        pm_user="realrun-pm-a",
+        key_modified_pm=True,
+        restore_key_err_pm=None,
+        restore_budget_err_pm=None,
+    )
+    assert g2_ev_written["temporary_key_written"] is True
+    assert g2_ev_written["temporary_key_deleted"] is True
+    assert g2_ev_written["api_keys_restored"] is True
+    assert g2_ev_written["key_write_skipped_reason"] is None
+    g2_ev_preserved = g2_providers._build_g2_byok_evidence_fields(
+        pm_user="realrun-pm-a",
+        key_modified_pm=False,
+        restore_key_err_pm=None,
+        restore_budget_err_pm=None,
+    )
+    assert g2_ev_preserved["temporary_key_written"] is False
+    assert g2_ev_preserved["temporary_key_deleted"] is False
+    assert g2_ev_preserved["api_keys_restored"] == "not_applicable"
+    assert g2_ev_preserved["key_write_skipped_reason"] == "preexisting_user_deepseek_key_preserved"
 
     no_key_client_g4 = create_autospec(RealRunHttpClient, instance=True)
     no_key_client_g4.request.return_value = (200, {"ok": True})
