@@ -256,7 +256,9 @@ def _capture_rejection_banner_screenshot(
                     svc_token=svc_token,
                 ),
             )
-            resp = page.goto(target_url, wait_until="networkidle", timeout=30000)
+            # Not "networkidle": the chat page holds the per-user thread-events SSE feed open, so the
+            # network never goes idle. The explicit textarea and banner waits below gate the capture.
+            resp = page.goto(target_url, wait_until="load", timeout=30000)
             assert resp is not None and resp.status < 400, (
                 f"Failed to load frontend chat route {target_url}: status={getattr(resp, 'status', None)}"
             )
