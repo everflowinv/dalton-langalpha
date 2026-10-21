@@ -1844,6 +1844,7 @@ async def get_run_charge_usd(run_ref: str) -> Decimal | None
 | skills-registry | `src/ptc_agent/agent/middleware/skills/registry.py` | 文件末尾合并 `DALTON_SKILL_DEFINITIONS` | 2–3 |
 | provenance-declared | `src/ptc_agent/agent/middleware/provenance/middleware.py` | `_extract_execute_code`、`_extract_direct_mcp` 产出 `mcp_tool` 后展开 `_sources` | 约 4 |
 | provenance-type | `web/src/types/sse.ts`、`web/src/pages/ChatAgent/components/SourcesPanel.tsx` | `research_doc` 类型与渲染分派 | 约 3 |
+| web-search-openclaw | `src/tools/web/manifest.py`、`src/tools/web/search.py` | `get_web_providers` 调用 `register_openclaw_web_provider`、`_PROVIDER_BUILDERS` 注册 `openclaw` | 约 8 |
 
 细节见 P0D 的 P0-D.2（超时）、P0-D.3（来源显示降级版）和 P1.1（skill 注册）。PK 篇的钩子列在 PK §5；`check_hooks.sh` 比对的是"本附录 + PK §5"的并集。P3 的来源定位改动（P0-D.3b）落地时再并入本表。
 

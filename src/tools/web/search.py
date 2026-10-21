@@ -23,10 +23,17 @@ def _lazy_builder(provider: str):
     return build
 
 
+def _dalton_openclaw_builder(**kwargs):  # DALTON-HOOK(web-search-openclaw)
+    from src.dalton.web_search.provider import build_web_search_tool
+
+    return build_web_search_tool(**kwargs)
+
+
 # Provider name -> tool builder. Adding a provider = one entry here, one
 # provider module with build_web_search_tool, one manifest entry.
 _PROVIDER_BUILDERS = {
-    name: _lazy_builder(name) for name in ("tavily", "serper", "bocha", "exa", "parallel")
+    **{name: _lazy_builder(name) for name in ("tavily", "serper", "bocha", "exa", "parallel")},
+    "openclaw": _dalton_openclaw_builder,  # DALTON-HOOK(web-search-openclaw)
 }
 
 

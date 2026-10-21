@@ -35,3 +35,5 @@ subagents:
       model: "ocb-xai-grok-4.7"
     general-purpose:
       model: "ocb-xai-grok-4.7"
+
+search_api: "openclaw"

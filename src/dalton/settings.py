@@ -249,6 +249,35 @@ def get_dalton_researchdata_url() -> str:
     return url.replace("{HOST_IP}", HOST_IP) if url else ""
 
 
+def get_dalton_web_search_bridge_token() -> str:
+    """Return ``DALTON_WEB_SEARCH_BRIDGE_TOKEN`` from environment (empty string if unset).
+
+    Uses a dedicated token rather than ``INTERNAL_SERVICE_TOKEN`` so the host-side
+    launchd bridge never receives the backend's internal service-dispatch credential.
+    """
+    return os.getenv("DALTON_WEB_SEARCH_BRIDGE_TOKEN", "").strip()
+
+
+def get_dalton_web_search_bridge_url(host: str | None = None) -> str:
+    """Return the resolved host-side OpenClaw web search HTTP bridge base URL."""
+    resolved_host = host or HOST_IP
+    explicit = os.getenv("DALTON_WEB_SEARCH_BRIDGE_URL", "").strip()
+    if explicit:
+        return explicit.replace("{HOST_IP}", resolved_host).rstrip("/")
+    return f"http://{resolved_host}:8961"
+
+
+def get_dalton_web_search_bridge_queue_timeout_seconds(default: float = 30.0) -> float:
+    """Return ``DALTON_WEB_SEARCH_BRIDGE_QUEUE_TIMEOUT_S`` from environment."""
+    raw = os.getenv("DALTON_WEB_SEARCH_BRIDGE_QUEUE_TIMEOUT_S", "").strip()
+    if not raw:
+        return float(default)
+    try:
+        return max(0.001, float(raw))
+    except ValueError:
+        return float(default)
+
+
 def get_sec_user_agent() -> str:
     """Return ``SEC_USER_AGENT`` from environment with a compliant fallback."""
     return (

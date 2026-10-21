@@ -42,6 +42,7 @@ ALLOWED_HOOKS=(
   "skills-registry"
   "provenance-declared"
   "provenance-type"
+  "web-search-openclaw"
   # PK knowledge, publish & autonomy hooks
   "knowledge-reconcile"
   "knowledge-reconcile-mw"
