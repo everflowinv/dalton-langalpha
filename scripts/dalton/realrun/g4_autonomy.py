@@ -231,6 +231,7 @@ def _find_filing_accession(
     *,
     target_form: str,
     require_item_202: bool = False,
+    exclude_accessions: frozenset[str] = frozenset(),
 ) -> dict[str, Any]:
     recent = ((sec_data.get("filings") or {}).get("recent")) or {}
     accessions = recent.get("accessionNumber") or []
@@ -245,6 +246,8 @@ def _find_filing_accession(
             continue
         if require_item_202 and "2.02" not in raw_items:
             continue
+        if str(acc) in exclude_accessions:
+            continue
         return {
             "accession_number": str(acc),
             "form": form,
@@ -254,6 +257,33 @@ def _find_filing_accession(
     raise RuntimeError(
         f"Could not find real SEC filing form={target_form} require_item_202={require_item_202} in top 100 submissions"
     )
+
+
+def _previously_triaged_accessions(user_id: str) -> frozenset[str]:
+    """Accessions this user's `assist.preflight.triage` has already decided (read-only).
+
+    The triage's journal scope is the user plus the payload, so re-triaging a filing the same user already
+    had triaged replays the stored answer instead of calling the model; scenario 2 must pick a fresh one.
+    """
+    with psycopg.connect(build_dsn_from_env(), row_factory=dict_row) as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT response FROM dalton_llm_journal "
+            "WHERE user_id = %s AND purpose = 'assist.preflight.triage' AND state = 'done'",
+            (user_id,),
+        )
+        rows = cur.fetchall()
+    seen: set[str] = set()
+    for row in rows:
+        resp = row.get("response") or {}
+        try:
+            parsed = json.loads(resp.get("text") or "{}") if isinstance(resp, dict) else {}
+        except (TypeError, ValueError):
+            continue
+        for decision in parsed.get("decisions") or []:
+            key = str((decision or {}).get("signal_key") or "")
+            if key.startswith("filing:"):
+                seen.add(key.removeprefix("filing:"))
+    return frozenset(seen)
 
 
 def _unsee_filing_in_watch_state(workspace_id: str, ticker: str, accession_to_remove: str) -> dict[str, Any]:
@@ -884,7 +914,11 @@ def main() -> int:
             # Fetch live SEC submissions for META to identify real 8-K (Item 2.02) and Form 4 accessions
             meta_sec_data = _fetch_sec_submissions("0001326801")
             real_8k_202 = _find_filing_accession(meta_sec_data, target_form="8-K", require_item_202=True)
-            real_form4 = _find_filing_accession(meta_sec_data, target_form="4", require_item_202=False)
+            triaged_before = _previously_triaged_accessions(pm_user)
+            real_form4 = _find_filing_accession(
+                meta_sec_data, target_form="4", require_item_202=False, exclude_accessions=triaged_before
+            )
+            real_form4["skipped_previously_triaged"] = len(triaged_before)
             acc_8k = real_8k_202["accession_number"]
             acc_form4 = real_form4["accession_number"]
 
