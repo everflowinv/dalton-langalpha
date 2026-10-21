@@ -2783,3 +2783,26 @@ def test_g3_make_unique_alpha_tag_and_cache_window_counts() -> None:
         "2026-10-21T10:05:00.000000Z",
         "2026-10-21T10:05:20.000000Z",
     ) == (1, 1)
+
+
+@pytest.mark.parametrize("with_combined", [False, True])
+def test_render_summaries_keeps_g5_subitems_unless_combined_file_exists(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, with_combined: bool
+) -> None:
+    from unittest.mock import create_autospec
+
+    from scripts.dalton.realrun import _common as common_mod
+
+    var_dir = tmp_path / "var" / "dalton" / "trial-runs" / "realrun-20261021"
+    var_dir.mkdir(parents=True)
+    (var_dir / "g5_1_broker.json").write_text(json.dumps({"family": "G5.1", "sub_item": "G5.1"}))
+    (var_dir / "g5_2_antigravity.json").write_text(json.dumps({"family": "G5.2", "sub_item": "G5.2"}))
+    if with_combined:
+        (var_dir / "g5_broker_and_antigravity.json").write_text(json.dumps({"family": "G5", "sub_item": "G5.all"}))
+
+    fake_render = create_autospec(common_mod.render_summary_markdown, return_value="# stub\n")
+    monkeypatch.setattr(common_mod, "render_summary_markdown", fake_render)
+
+    written = common_mod.render_summaries_from_var_to_docs(date_str="20261021", repo_root=tmp_path)
+    names = sorted(Path(w).name for w in written)
+    assert names == (["G5.md"] if with_combined else ["G5.1.md", "G5.2.md"])
