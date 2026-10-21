@@ -11,7 +11,7 @@ import {
   Telescope,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
-import { LangAlphaMark } from '@/components/brand/LangAlphaMark';
+import { BrandMark } from '@/components/brand/BrandMark'; // DALTON-HOOK(brand-name)
 import { SubagentsRings } from '@/components/ui/subagents-rings';
 import { IdentityTile, TILE_SIZES, type TileSize } from './IdentityTile';
 
@@ -44,7 +44,7 @@ const KIND_GLYPH: Record<MarkKind, ComponentType<{ className?: string }>> = {
   server: Server,
   secret: KeyRound,
   subagent: SubagentsRings,
-  langalpha: LangAlphaMark,
+  langalpha: BrandMark, // DALTON-HOOK(brand-name)
 };
 
 export type MarkKind = 'plugin' | 'skill' | 'server' | 'secret' | 'subagent' | 'langalpha';

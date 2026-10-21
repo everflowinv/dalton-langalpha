@@ -15,6 +15,8 @@ interface ImportMetaEnv {
   // integrations. Cross-app links only; never a router target.
   readonly VITE_PLATFORM_URL?: string;
   readonly VITE_CONTACT_EMAILS?: string;
+  readonly VITE_BRAND_NAME?: string; // DALTON-HOOK(brand-name)
+  readonly VITE_BRAND_MARK?: 'langalpha' | 'everflow'; // DALTON-HOOK(brand-name)
 }
 
 /** The installed monaco-editor release, from `scripts/monaco-version.ts`. */

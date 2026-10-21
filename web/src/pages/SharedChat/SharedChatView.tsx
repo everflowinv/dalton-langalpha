@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { Link } from 'react-router';
+import { BRAND_NAME } from '@/config/brand'; // DALTON-HOOK(brand-name)
 import { ArrowLeft, FolderOpen } from 'lucide-react';
 import { motion, type PanInfo } from '@/lib/framer';
 import { ScrollArea } from '@/components/ui/scroll-area';
@@ -576,7 +577,7 @@ export default function SharedChatView({ shareToken, metadata }: SharedChatViewP
               to="/"
               className="p-2 rounded-md transition-colors shrink-0"
               style={{ color: 'var(--color-text-primary)' }}
-              title="Back to LangAlpha"
+              title={`Back to ${BRAND_NAME}`} // DALTON-HOOK(brand-name)
               onMouseEnter={(e) => { e.currentTarget.style.backgroundColor = 'var(--color-border-muted)'; }}
               onMouseLeave={(e) => { e.currentTarget.style.backgroundColor = ''; }}
             >
@@ -666,7 +667,7 @@ export default function SharedChatView({ shareToken, metadata }: SharedChatViewP
                       <span className="text-xs px-1" style={{ color: 'var(--color-text-tertiary)' }}>
                         Powered by{' '}
                         <Link to="/" className="hover:underline" style={{ color: 'var(--color-accent-primary)' }}>
-                          LangAlpha
+                          {BRAND_NAME} {/* DALTON-HOOK(brand-name) */}
                         </Link>
                       </span>
                       <button

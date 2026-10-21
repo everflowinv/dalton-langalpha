@@ -1,5 +1,6 @@
 import React from 'react';
 import { useTranslation } from 'react-i18next';
+import { BRAND_NAME } from '@/config/brand'; // DALTON-HOOK(brand-name)
 import './PageLoading.css';
 
 /**
@@ -77,7 +78,7 @@ function buildByteWalk(word: string, dwell: number): string[] {
   return frames;
 }
 
-const BYTE_WALK = buildByteWalk('LangAlpha', 6);
+const BYTE_WALK = buildByteWalk(BRAND_NAME, 6); // DALTON-HOOK(brand-name)
 const BYTE_WALK_STYLE = { '--pl-frames': String(BYTE_WALK.length) } as React.CSSProperties;
 
 interface PageLoadingProps {

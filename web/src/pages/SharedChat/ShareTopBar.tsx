@@ -1,6 +1,7 @@
 import React from 'react';
 import { Link } from 'react-router';
 import type { LucideIcon } from 'lucide-react';
+import { BRAND_NAME } from '@/config/brand'; // DALTON-HOOK(brand-name)
 import { Button } from '@/components/ui/button';
 
 interface ShareTopBarProps {
@@ -13,7 +14,7 @@ export function ShareTopBar({ name, actions }: ShareTopBarProps): React.ReactEle
   return (
     // The drag band inside the desktop shell; the page has no other chrome.
     <header className="share-topbar" data-chrome="drag">
-      <Link to="/" className="share-topbar-brand title-font">LangAlpha</Link>
+      <Link to="/" className="share-topbar-brand title-font">{BRAND_NAME}</Link> {/* DALTON-HOOK(brand-name) */}
       <span className="share-topbar-sep" aria-hidden="true">/</span>
       <h1 className="share-topbar-name" title={name}>{name}</h1>
       {actions && <div className="share-topbar-actions">{actions}</div>}

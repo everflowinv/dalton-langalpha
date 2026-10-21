@@ -4,6 +4,7 @@ import { Input } from '@/components/ui/input';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog';
 import { useQueryClient } from '@tanstack/react-query';
 import { queryKeys } from '@/lib/queryKeys';
+import { BRAND_NAME } from '@/config/brand';
 import { useTranslation } from 'react-i18next';
 import {
   initiateAntigravityOAuth,
@@ -281,7 +282,7 @@ export function AntigravityAccountRow({
                 <div className="shrink-0 h-6 w-6 rounded-full flex items-center justify-center text-xs font-bold" style={{ backgroundColor: 'var(--color-accent-soft)', color: 'var(--color-accent-primary)' }}>2</div>
                 <div>
                   <p className="text-sm font-medium" style={{ color: 'var(--color-text-primary)' }}>{t('setup.antigravityStep2Title', 'Sign in and grant access')}</p>
-                  <p className="text-xs mt-0.5" style={{ color: 'var(--color-text-tertiary)' }}>{t('setup.antigravityStep2Desc', 'Approve the permission request for LangAlpha. The page then redirects back to this machine automatically — nothing to copy.')}</p>
+                  <p className="text-xs mt-0.5" style={{ color: 'var(--color-text-tertiary)' }}>{t('setup.antigravityStep2Desc', `Approve the permission request for ${BRAND_NAME}. The page then redirects back to this machine automatically — nothing to copy.`)}</p>
                 </div>
               </div>
 

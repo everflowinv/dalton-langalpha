@@ -1,4 +1,5 @@
 import { Link } from 'react-router';
+import { BRAND_NAME } from '@/config/brand'; // DALTON-HOOK(brand-name)
 
 function Legal() {
   return (
@@ -13,7 +14,7 @@ function Legal() {
             className="text-sm hover:underline"
             style={{ color: 'var(--color-text-secondary)' }}
           >
-            &larr; Back to LangAlpha
+            &larr; Back to {BRAND_NAME /* DALTON-HOOK(brand-name) */}
           </Link>
           <h1 className="mt-4 text-3xl font-semibold tracking-tight">Legal &amp; Attribution</h1>
           <p className="mt-2 text-sm" style={{ color: 'var(--color-text-secondary)' }}>

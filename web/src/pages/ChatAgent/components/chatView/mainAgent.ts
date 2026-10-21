@@ -1,3 +1,4 @@
+import { BRAND_NAME } from '@/config/brand'; // DALTON-HOOK(brand-name)
 import { ZERO_USAGE } from '../../utils/tokenUsage';
 import type { AgentInfo } from './types';
 
@@ -5,7 +6,7 @@ import type { AgentInfo } from './types';
 export const MAIN_AGENT: AgentInfo = {
   id: 'main',
   name: 'Lead Agent',
-  displayName: 'LangAlpha',
+  displayName: BRAND_NAME, // DALTON-HOOK(brand-name)
   taskId: '',
   description: '',
   type: 'main',

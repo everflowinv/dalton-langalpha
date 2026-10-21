@@ -4,6 +4,8 @@ import { useTranslation } from 'react-i18next';
 import { ArrowLeft, ArrowRight, LayoutGrid, PanelLeftClose, PanelLeftOpen, Plus, SquarePen } from 'lucide-react';
 import logoLight from '../../assets/img/logo.svg';
 import logoDark from '../../assets/img/logo-dark.svg';
+import { BrandMark } from '@/components/brand/BrandMark'; // DALTON-HOOK(brand-name)
+import { BRAND_MARK, BRAND_NAME } from '@/config/brand'; // DALTON-HOOK(brand-name)
 import { useTheme } from '../../contexts/ThemeContext';
 import { useNavActive } from '../nav/useNavActive';
 import { useNavItems } from '../nav/useNavItems';
@@ -195,7 +197,7 @@ function AppSidebar({ collapsed, onToggleCollapse, width, onWidthChange }: AppSi
           onClick={() => navigate('/dashboard')}
           aria-label={t('sidebar.dashboard')}
         >
-          <img src={logo} alt="" style={{ width: '28px', height: '28px', objectFit: 'contain' }} />
+          {BRAND_MARK === 'everflow' ? <BrandMark className="h-7 w-7 shrink-0" /> : <img src={logo} alt="" style={{ width: '28px', height: '28px', objectFit: 'contain' }} />} {/* DALTON-HOOK(brand-name) */}
         </button>
         <button
           className="sidebar-rail-toggle"
@@ -252,8 +254,8 @@ function AppSidebar({ collapsed, onToggleCollapse, width, onWidthChange }: AppSi
           onClick={() => navigate('/dashboard')}
           aria-label={t('sidebar.dashboard')}
         >
-          <img src={logo} alt="" style={{ width: '28px', height: '28px', objectFit: 'contain' }} />
-          <span className="sidebar-wordmark title-font">LangAlpha</span>
+          {BRAND_MARK === 'everflow' ? <BrandMark className="h-7 w-7 shrink-0" /> : <img src={logo} alt="" style={{ width: '28px', height: '28px', objectFit: 'contain' }} />} {/* DALTON-HOOK(brand-name) */}
+          <span className="sidebar-wordmark title-font">{BRAND_NAME}</span> {/* DALTON-HOOK(brand-name) */}
         </button>
         <button
           className="sidebar-collapse-btn"

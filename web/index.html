@@ -334,7 +334,8 @@
       (function(){
         var t = document.documentElement.getAttribute('data-theme');
         var favicon = document.querySelector('link[rel="icon"]');
-        if (favicon) favicon.href = t === 'light' ? '/logo-favicon.svg' : '/logo-favicon-dark.svg';
+        var isEverflow = '%VITE_BRAND_MARK%' === 'everflow'; // DALTON-HOOK(brand-name)
+        if (favicon) favicon.href = isEverflow ? (t === 'light' ? '/everflow/favicon.svg' : '/everflow/favicon-dark.svg') : (t === 'light' ? '/logo-favicon.svg' : '/logo-favicon-dark.svg'); // DALTON-HOOK(brand-name)
       })();
     </script>
     <div id="window-drag" aria-hidden="true"></div>

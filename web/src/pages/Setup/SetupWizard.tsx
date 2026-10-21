@@ -8,6 +8,8 @@ import { useConfiguredProviders } from '@/hooks/useConfiguredProviders';
 import { useUser } from '@/hooks/useUser';
 import { skipSetup } from '@/hooks/useSetupGate';
 
+import { BrandMark } from '@/components/brand/BrandMark'; // DALTON-HOOK(brand-name)
+import { BRAND_MARK } from '@/config/brand'; // DALTON-HOOK(brand-name)
 import { isPlatformMode } from '@/config/hostMode';
 import logoLight from '@/assets/img/logo.svg';
 import logoDark from '@/assets/img/logo-dark.svg';
@@ -178,7 +180,7 @@ export default function SetupWizard() {
 
       {/* Branded header */}
       <header className="flex flex-col items-center gap-3 sm:gap-4 pt-5 sm:pt-10 pb-2 px-4">
-        <img src={logo} alt="LangAlpha" className="h-7" />
+        {BRAND_MARK === 'everflow' ? <BrandMark className="h-7 w-7" /> : <img src={logo} alt="LangAlpha" className="h-7" />} {/* DALTON-HOOK(brand-name) */}
         <h1
           className="text-center font-semibold text-lg sm:text-2xl"
           style={{
