@@ -1,6 +1,6 @@
 ---
 name: dalton-thesis-delta
-description: "每晚覆盖公司 thesis 增量跟踪：由后端预检（consensus/sec/internal/price 探针）通过 <dalton_wake> 唤醒后，运行 collect.py 生成一致预期快照与增量包，按 materiality.md 判断是否存在重要变化；有重要变化才写增量笔记、更新知识层并推送 PM，无重要变化只记 NO_CHANGE 与 seen.json 不打扰 PM。触发词：thesis delta、每晚增量、日常跟踪、/dalton-thesis-delta。"
+description: "采集覆盖公司最新一致预期变化、新公告、内部研究库与卖方增量，对照现有知识层判断是否构成实质性变化，仅在有重要变化时写增量笔记并更新知识层。用于覆盖公司的日常增量跟踪或检查近期基本面有无边际变化；无实质变化时快速短路完成，有变化时需几分钟。"
 ---
 
 # Dalton 每晚 Thesis 增量跟踪（`dalton-thesis-delta`）

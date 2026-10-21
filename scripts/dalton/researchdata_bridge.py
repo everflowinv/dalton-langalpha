@@ -39,6 +39,8 @@ MAX_REQUEST_BYTES = 256 * 1024  # 256 KiB
 
 DEFAULT_ROUTE_TIMEOUT_S = 240
 LONG_READ_TIMEOUT_S = 600
+FANOUT_ALPHAENGINE_TIMEOUT_S = 60
+FANOUT_GUIDEPOINT_TIMEOUT_S = 90
 
 LONG_READ_OPERATIONS: frozenset[str] = frozenset(
     {
@@ -89,6 +91,44 @@ ROUTE_TIMEOUTS: dict[str, tuple[int, int]] = {
     "treasury": (DEFAULT_ROUTE_TIMEOUT_S, DEFAULT_ROUTE_TIMEOUT_S),
     "cn-hk": (DEFAULT_ROUTE_TIMEOUT_S, DEFAULT_ROUTE_TIMEOUT_S),
 }
+
+
+
+async def _reap_process(proc: Any) -> None:
+    """Wait for a killed subprocess to exit even if this task is cancelled meanwhile.
+
+    A cancel during the wait would otherwise leave the child unreaped; the
+    cancellation is re-raised once the child is gone.
+    """
+    waiter = asyncio.ensure_future(proc.wait())
+    cancelled = False
+    while not waiter.done():
+        try:
+            await asyncio.shield(waiter)
+        except asyncio.CancelledError:
+            cancelled = True
+        except Exception:
+            break
+    if cancelled:
+        raise asyncio.CancelledError()
+
+
+async def _cancel_and_reap(tasks: "tuple[asyncio.Task[Any], ...]") -> None:
+    """Cancel unfinished fan-out tasks and wait for them, surviving a cancel of the caller."""
+    pending = [t for t in tasks if not t.done()]
+    for t in pending:
+        t.cancel()
+    if not pending:
+        return
+    gathered = asyncio.ensure_future(asyncio.gather(*pending, return_exceptions=True))
+    cancelled = False
+    while not gathered.done():
+        try:
+            await asyncio.shield(gathered)
+        except asyncio.CancelledError:
+            cancelled = True
+    if cancelled:
+        raise asyncio.CancelledError()
 
 
 class SubprocessExitError(RuntimeError):
@@ -191,7 +231,50 @@ class BridgeConfig:
             return 0.0
 
 
+RESEARCH_EVIDENCE_AND_ROUTE_GUIDE: str = (
+    '各来源提供什么证据：事实 → filings/公司公告（dalton_sec / finance(route="sec") / get_sec_filing）；'
+    "解读 → alphaengine 卖方研报与会议纪要；一线视角 → guidepoint 专家访谈；"
+    "管理层原话 → transcript 业绩会转写稿；日常信息流 → sales-notes / tmtb / funda-ai；"
+    "市场在反应什么 → X（x-api 技能）与网页新闻（WebSearch）；"
+    "all 覆盖本地四库（company-wiki + sales-notes + tmtb + funda-ai）外加并行的 AlphaEngine 与 Guidepoint 检索（不含 transcript）。\n"
+    "何时选用哪个路由（按研究情境，基于 catalog）：\n"
+    "- 需要卖方观点、研报、会议纪要、目标价与预测变化 → alphaengine：卖方研报与会议纪要（来源：AlphaEngine，先 search_library 再 get_document）；\n"
+    "- 需要行业一线的专业判断与经营反馈（供应链、渠道、客户、竞品、技术路线） → guidepoint：专家访谈与一线经营反馈（来源：Guidepoint）；\n"
+    "- 需要管理层原话与业绩会口径 → transcript：业绩电话会转写稿（来源：AlphaEngine 业绩会 ASR 稿（主）/ roic.ai（兜底））；\n"
+    "- 需要已入库的公司与行业历史沉淀资料 → company-wiki：已入库公司与行业资料（来源：本地 company-wiki，只读，params.company=TICKER）；\n"
+    "- 需要交易台反馈、买方预期（bogey/whisper）、卖方销售邮件与市场摘要 → sales-notes：卖方销售邮件与市场摘要（来源：本地 market-digest 私有库）；\n"
+    "- 需要 TMT 行业每日焦点与科技股卖方观点汇编 → tmtb：TMT Breakout 本地原文缓存（来源：AlphaEngine TMTB 已入库副本）；\n"
+    "- 需要独立研究机构 FUNDA AI 的深度邮件与图表 → funda-ai：FUNDA AI 原邮件与图表（来源：fundaai@substack.com，MBOX 历史及 Gmail 增量，独立本地库）；\n"
+    "- 不确定资料在哪个库，或需一次全面初筛 → all：内部研究资料跨库检索（本地库 company-wiki + sales-notes + tmtb + funda-ai，外加并行的 AlphaEngine 与 Guidepoint 检索；不含 transcript 电话会转写稿，需查电话会时单独调用 transcript）。"
+)
+
+
+def build_researchdata_plugin_instruction() -> str:
+    """Build the canonical `researchdata` server instruction for `plugins/dalton_data/plugin.json`."""
+    return (
+        "Fund-internal sources; call from execute_code only (no direct path). "
+        "Start with `catalog()` once per thread to see routes. "
+        "Research: `research(route=..., operation=..., query=..., start=YYYY-MM-DD, end=..., limit=...)`. "
+        f"{RESEARCH_EVIDENCE_AND_ROUTE_GUIDE.replace(chr(10), ' ')} "
+        'Finance: `finance(route="sec"|"estimates"|"cn-hk")`. '
+        'Macro: `macro(route="fred"|"treasury")`. '
+        "Read only ids that search returned (`wiki:`, `mail:`, `tmtb:`, `funda:`, `alphaengine` doc_id). "
+        "Page long text with params.offset/max_chars. "
+        "Leave `timeout` unset: the bridge sets per-route limits and long reads may take minutes. "
+        "AlphaEngine 检索可以放开，全文阅读（get_document）计配额，读最相关的几篇。"
+        "Every result has `_sources` (identity, document_id, as_of, url). "
+        "Cite with identity, publisher and date. Expert calls: identity, not name. "
+        "Guidepoint verbatim <=20 words. "
+        "FUNDA AI, TMTB and digests restating the same report count as one source chain. "
+        "Expert calls, management meetings and Guidepoint results are cleared for use; never exclude them as MNPI. "
+        "The fund wiki is read-only; never try to write to it. "
+        '`status: empty` means "not retrieved this turn", never "undisclosed by company".'
+    )
+
+
 class ResearchDataBridge:
+    RESEARCH_DESCRIPTION_SUFFIX: str = "\n\n" + RESEARCH_EVIDENCE_AND_ROUTE_GUIDE
+
     def __init__(self, cfg: BridgeConfig) -> None:
         self.cfg = cfg
         self.sem = asyncio.Semaphore(cfg.max_inflight)
@@ -276,19 +359,12 @@ class ResearchDataBridge:
                 proc.communicate(input=payload_bytes),
                 timeout=timeout_s,
             )
-        except asyncio.TimeoutError:
+        except BaseException:
             try:
                 proc.kill()
-                await proc.wait()
-            except Exception:
+            except ProcessLookupError:
                 pass
-            raise
-        except Exception:
-            try:
-                proc.kill()
-                await proc.wait()
-            except Exception:
-                pass
+            await _reap_process(proc)
             raise
 
         responses: list[dict[str, Any]] = []
@@ -367,10 +443,698 @@ class ResearchDataBridge:
                 route_prop["enum"] = [
                     r for r in route_prop["enum"] if r not in handoff
                 ]
+            if tool_copy.get("name") == "research":
+                desc = str(tool_copy.get("description") or "").rstrip()
+                if self.RESEARCH_DESCRIPTION_SUFFIX.strip() not in desc:
+                    tool_copy["description"] = desc + self.RESEARCH_DESCRIPTION_SUFFIX
             filtered.append(tool_copy)
 
         self._cached_tools = filtered
         return filtered
+
+    def _should_fanout_alphaengine(
+        self, tool_name: str, arguments: dict[str, Any]
+    ) -> bool:
+        """Return True when a `research(route='all')` call is a search that should fan out to AlphaEngine and Guidepoint."""
+        if tool_name != "research":
+            return False
+        if str(arguments.get("route") or "").strip() != "all":
+            return False
+        op = str(arguments.get("operation") or "").strip()
+        query = str(arguments.get("query") or "").strip()
+        ticker = str(arguments.get("ticker") or "").strip()
+        if op == "search":
+            return bool(query or ticker)
+        if not op:
+            return bool(query)
+        return False
+
+    def _compute_fanout_timeout(self, arguments: dict[str, Any], default_cap_s: int) -> int:
+        """Compute clamped fanout timeout capped at `default_cap_s` (60s for AlphaEngine, 90s for Guidepoint)."""
+        ceiling = max(10, self.cfg.caller_budget_s - 25)
+        req_timeout = arguments.get("timeout")
+        if isinstance(req_timeout, int) and not isinstance(req_timeout, bool) and req_timeout > 0:
+            chosen = min(req_timeout, default_cap_s)
+        else:
+            chosen = default_cap_s
+        return max(5, min(chosen, default_cap_s, ceiling))
+
+    def _build_alphaengine_fanout_args(
+        self, arguments: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Map `research(route='all')` search arguments to `route='alphaengine'` parameters.
+
+        Mapping basis:
+        - `data_gateway.py` sets `accepted['alphaengine'] = {'query', 'start', 'end'}` and rejects
+          `--ticker` (and `series`/`concept`/`item`/`document`/`form`/`dataset`/`as_of`/`vintage`)
+          with ValueError; if `ticker` was provided on `all`, fold it into `query`.
+        - `data_gateway.py` and `config/data_sources.json` restrict `alphaengine` operations to
+          `['search_library', 'get_document', 'auth_status', 'list_filters']`, so `operation` is
+          mapped to `'search_library'`.
+        - `alphaengine-mcp/server.mjs` (`requireDatePair`) requires `start` (`date_from`) and `end`
+          (`date_to`) as a pair; if `start` is given without `end`, default `end` to today's UTC
+          date, and omit a lone `end` without `start`.
+        - Local-library `params` keys (`sources`, `layer`, `search_mode`, etc.) are omitted because
+          `search_library` sets `additionalProperties: false`.
+        - Timeout is capped at `FANOUT_ALPHAENGINE_TIMEOUT_S` (60s).
+        """
+        query = str(arguments.get("query") or "").strip()
+        ticker = str(arguments.get("ticker") or "").strip()
+        if ticker and ticker.lower() not in query.lower():
+            query = f"{ticker} {query}".strip() if query else ticker
+
+        ae_args: dict[str, Any] = {
+            "route": "alphaengine",
+            "operation": "search_library",
+            "query": query,
+        }
+        start = str(arguments.get("start") or "").strip()
+        end = str(arguments.get("end") or "").strip()
+        if start and end:
+            ae_args["start"] = start
+            ae_args["end"] = end
+        elif start and not end:
+            ae_args["start"] = start
+            ae_args["end"] = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+        limit = arguments.get("limit")
+        if isinstance(limit, int) and not isinstance(limit, bool) and limit > 0:
+            ae_args["limit"] = min(limit, 100)
+
+        ae_args["timeout"] = self._compute_fanout_timeout(
+            arguments, FANOUT_ALPHAENGINE_TIMEOUT_S
+        )
+        return ae_args
+
+    def _build_guidepoint_fanout_args(
+        self, arguments: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Map `research(route='all')` search arguments to `route='guidepoint'` parameters.
+
+        Mapping basis:
+        - `catalog()` (`config/data_sources.json`) registers `guidepoint` with
+          `operations: ['search_library']` (forwarded to `mcp__guidepoint__search_library`).
+        - `researchdata_mcp.py` (`call_tool`) forwards top-level string fields + `limit` + `timeout`
+          + `params` to `data_gateway.py fetch guidepoint`.
+        - `data_gateway.py` (`build_command`) sets `accepted['guidepoint'] = {'query', 'start', 'end'}`
+          and raises ValueError if `--ticker` (or `series`/`concept`/`item`/`document`/`form`/
+          `dataset`/`as_of`/`vintage`) is passed; if `ticker` was provided on `all`, fold it into `query`.
+        - `data_gateway.py` (`native_request`) maps `start` -> `start_date`, `end` -> `end_date`,
+          and `limit` -> `size` (clamped to `min(limit, 40)`).
+        - Local-library `params` keys (`sources`, `layer`, `media`, `search_mode`, `company`,
+          `sector`, `tag`, `indexed_since`, `sender`, `no_decay`, `offset`, `max_chars`) are omitted;
+          only Guidepoint-native optional keys (`keywords`, `recency_bias`) are forwarded if present.
+        - Timeout is capped at `FANOUT_GUIDEPOINT_TIMEOUT_S` (90s).
+        """
+        query = str(arguments.get("query") or "").strip()
+        ticker = str(arguments.get("ticker") or "").strip()
+        if ticker and ticker.lower() not in query.lower():
+            query = f"{ticker} {query}".strip() if query else ticker
+
+        gp_args: dict[str, Any] = {
+            "route": "guidepoint",
+            "operation": "search_library",
+            "query": query,
+        }
+        start = str(arguments.get("start") or "").strip()
+        end = str(arguments.get("end") or "").strip()
+        if start and end and start <= end:
+            gp_args["start"] = start
+            gp_args["end"] = end
+        elif start and not end:
+            gp_args["start"] = start
+        elif end and not start:
+            gp_args["end"] = end
+
+        limit = arguments.get("limit")
+        if isinstance(limit, int) and not isinstance(limit, bool) and limit > 0:
+            gp_args["limit"] = min(limit, 40)
+
+        raw_params = arguments.get("params")
+        if isinstance(raw_params, dict):
+            gp_params: dict[str, Any] = {}
+            if isinstance(raw_params.get("keywords"), list):
+                kw = [str(k).strip() for k in raw_params["keywords"] if str(k).strip()]
+                if kw:
+                    gp_params["keywords"] = kw
+            if isinstance(raw_params.get("recency_bias"), str) and raw_params["recency_bias"].strip():
+                gp_params["recency_bias"] = raw_params["recency_bias"].strip()
+            if gp_params:
+                gp_args["params"] = gp_params
+
+        gp_args["timeout"] = self._compute_fanout_timeout(
+            arguments, FANOUT_GUIDEPOINT_TIMEOUT_S
+        )
+        return gp_args
+
+    async def _run_alphaengine_fanout(
+        self, req_id: Any, ae_args: dict[str, Any], ae_budget_s: float
+    ) -> dict[str, Any]:
+        """Run the parallel `route='alphaengine'` search and normalize its result or failure state."""
+        ae_timeout = int(ae_args.get("timeout") or FANOUT_ALPHAENGINE_TIMEOUT_S)
+        ae_rpc_req = {
+            "jsonrpc": "2.0",
+            "id": f"{req_id}:alphaengine" if req_id is not None else "1:alphaengine",
+            "method": "tools/call",
+            "params": {"name": "research", "arguments": ae_args},
+        }
+        try:
+            ae_resps = await self._run_stdio_rpc(
+                [ae_rpc_req], timeout_s=ae_budget_s
+            )
+        except asyncio.TimeoutError:
+            reason = f"alphaengine timed out after {ae_timeout}s"
+            logger.warning("alphaengine fanout timeout timeout_s=%d", ae_timeout)
+            return {
+                "ok": False,
+                "status": "timeout",
+                "route": "alphaengine",
+                "reason": reason,
+                "count": 0,
+                "results": [],
+                "raw_payload": None,
+            }
+        except SubprocessExitError as exc:
+            reason = f"SubprocessExitError(exit_code={exc.exit_code})"
+            logger.warning("alphaengine fanout failed: %s", reason)
+            return {
+                "ok": False,
+                "status": "failed",
+                "route": "alphaengine",
+                "reason": reason,
+                "count": 0,
+                "results": [],
+                "raw_payload": None,
+            }
+        except Exception as exc:
+            reason = type(exc).__name__
+            logger.warning("alphaengine fanout failed: %s", reason)
+            return {
+                "ok": False,
+                "status": "failed",
+                "route": "alphaengine",
+                "reason": reason,
+                "count": 0,
+                "results": [],
+                "raw_payload": None,
+            }
+
+        if not ae_resps or not isinstance(ae_resps[0], dict):
+            return {
+                "ok": False,
+                "status": "failed",
+                "route": "alphaengine",
+                "reason": "Empty response from researchdata_mcp",
+                "count": 0,
+                "results": [],
+                "raw_payload": None,
+            }
+
+        ae_resp = ae_resps[0]
+        if isinstance(ae_resp.get("error"), dict):
+            err_msg = str(ae_resp["error"].get("message") or "RPC error")[:200]
+            status = "timeout" if "timeout" in err_msg.lower() or "timed out" in err_msg.lower() else "failed"
+            return {
+                "ok": False,
+                "status": status,
+                "route": "alphaengine",
+                "reason": err_msg,
+                "count": 0,
+                "results": [],
+                "raw_payload": None,
+            }
+
+        res_obj = ae_resp.get("result")
+        ae_payload: dict[str, Any] | None = None
+        if isinstance(res_obj, dict):
+            blocks = res_obj.get("content")
+            if isinstance(blocks, list) and blocks and isinstance(blocks[0], dict) and isinstance(blocks[0].get("text"), str):
+                try:
+                    parsed = json.loads(blocks[0]["text"])
+                    if isinstance(parsed, dict):
+                        ae_payload = parsed
+                except Exception:
+                    ae_payload = None
+            if ae_payload is None and isinstance(res_obj.get("structuredContent"), dict):
+                ae_payload = res_obj["structuredContent"]
+
+        if not isinstance(ae_payload, dict):
+            return {
+                "ok": False,
+                "status": "failed",
+                "route": "alphaengine",
+                "reason": "Invalid JSON payload from alphaengine",
+                "count": 0,
+                "results": [],
+                "raw_payload": None,
+            }
+
+        inner = ae_payload.get("data") if isinstance(ae_payload.get("data"), dict) else ae_payload
+        is_err = (
+            bool(isinstance(res_obj, dict) and res_obj.get("isError"))
+            or ae_payload.get("ok") is False
+            or bool(isinstance(inner, dict) and inner.get("isError"))
+        )
+        if is_err:
+            err_text = str(
+                ae_payload.get("error")
+                or ae_payload.get("reason")
+                or ""
+            ).strip()
+            if not err_text and isinstance(inner, dict) and isinstance(inner.get("content"), list):
+                c_blocks = inner["content"]
+                if c_blocks and isinstance(c_blocks[0], dict):
+                    err_text = str(c_blocks[0].get("text") or "").strip()
+            reason = (err_text or "alphaengine call returned error")[:200]
+            raw_status = str(ae_payload.get("status") or "").strip().lower()
+            status = (
+                "timeout"
+                if raw_status == "timeout" or "timeout" in reason.lower() or "timed out" in reason.lower()
+                else "failed"
+            )
+            return {
+                "ok": False,
+                "status": status,
+                "route": "alphaengine",
+                "reason": reason,
+                "count": 0,
+                "results": [],
+                "raw_payload": ae_payload,
+            }
+
+        sc = (
+            source_identity._unwrap_mcp_proxy_payload(inner)
+            if isinstance(inner, dict)
+            else source_identity._unwrap_mcp_proxy_payload(ae_payload)
+        )
+        raw_items = (
+            sc.get("results")
+            if isinstance(sc, dict) and isinstance(sc.get("results"), list)
+            else None
+        )
+        if not isinstance(raw_items, list):
+            top_sc = source_identity._unwrap_mcp_proxy_payload(ae_payload)
+            raw_items = (
+                top_sc.get("results")
+                if isinstance(top_sc, dict) and isinstance(top_sc.get("results"), list)
+                else []
+            )
+
+        ae_items: list[dict[str, Any]] = []
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
+            norm = dict(item)
+            doc_id = str(
+                norm.get("doc_id")
+                or norm.get("id")
+                or norm.get("document_id")
+                or ""
+            ).strip()
+            norm["route"] = "alphaengine"
+            norm.setdefault("source", "alphaengine")
+            if doc_id:
+                full_doc_id = (
+                    doc_id
+                    if doc_id.startswith("alphaengine:")
+                    else f"alphaengine:{doc_id}"
+                )
+                norm.setdefault("document_id", full_doc_id)
+                norm.setdefault("canonical_id", full_doc_id)
+            if norm.get("publish_time") and not norm.get("published_at"):
+                norm["published_at"] = norm["publish_time"]
+            ae_items.append(norm)
+
+        return {
+            "ok": True,
+            "status": "ok",
+            "route": "alphaengine",
+            "reason": None,
+            "count": len(ae_items),
+            "results": ae_items,
+            "raw_payload": ae_payload,
+        }
+
+    async def _run_guidepoint_fanout(
+        self, req_id: Any, gp_args: dict[str, Any], gp_budget_s: float
+    ) -> dict[str, Any]:
+        """Run the parallel `route='guidepoint'` search and normalize its result or failure state."""
+        gp_timeout = int(gp_args.get("timeout") or FANOUT_GUIDEPOINT_TIMEOUT_S)
+        gp_rpc_req = {
+            "jsonrpc": "2.0",
+            "id": f"{req_id}:guidepoint" if req_id is not None else "1:guidepoint",
+            "method": "tools/call",
+            "params": {"name": "research", "arguments": gp_args},
+        }
+        try:
+            gp_resps = await self._run_stdio_rpc(
+                [gp_rpc_req], timeout_s=gp_budget_s
+            )
+        except asyncio.TimeoutError:
+            reason = f"guidepoint timed out after {gp_timeout}s"
+            logger.warning("guidepoint fanout timeout timeout_s=%d", gp_timeout)
+            return {
+                "ok": False,
+                "status": "timeout",
+                "route": "guidepoint",
+                "reason": reason,
+                "count": 0,
+                "results": [],
+                "raw_payload": None,
+            }
+        except SubprocessExitError as exc:
+            reason = f"SubprocessExitError(exit_code={exc.exit_code})"
+            logger.warning("guidepoint fanout failed: %s", reason)
+            return {
+                "ok": False,
+                "status": "failed",
+                "route": "guidepoint",
+                "reason": reason,
+                "count": 0,
+                "results": [],
+                "raw_payload": None,
+            }
+        except Exception as exc:
+            reason = type(exc).__name__
+            logger.warning("guidepoint fanout failed: %s", reason)
+            return {
+                "ok": False,
+                "status": "failed",
+                "route": "guidepoint",
+                "reason": reason,
+                "count": 0,
+                "results": [],
+                "raw_payload": None,
+            }
+
+        if not gp_resps or not isinstance(gp_resps[0], dict):
+            return {
+                "ok": False,
+                "status": "failed",
+                "route": "guidepoint",
+                "reason": "Empty response from researchdata_mcp",
+                "count": 0,
+                "results": [],
+                "raw_payload": None,
+            }
+
+        gp_resp = gp_resps[0]
+        if isinstance(gp_resp.get("error"), dict):
+            err_msg = str(gp_resp["error"].get("message") or "RPC error")[:200]
+            status = "timeout" if "timeout" in err_msg.lower() or "timed out" in err_msg.lower() else "failed"
+            return {
+                "ok": False,
+                "status": status,
+                "route": "guidepoint",
+                "reason": err_msg,
+                "count": 0,
+                "results": [],
+                "raw_payload": None,
+            }
+
+        res_obj = gp_resp.get("result")
+        gp_payload: dict[str, Any] | None = None
+        if isinstance(res_obj, dict):
+            blocks = res_obj.get("content")
+            if isinstance(blocks, list) and blocks and isinstance(blocks[0], dict) and isinstance(blocks[0].get("text"), str):
+                try:
+                    parsed = json.loads(blocks[0]["text"])
+                    if isinstance(parsed, dict):
+                        gp_payload = parsed
+                except Exception:
+                    gp_payload = None
+            if gp_payload is None and isinstance(res_obj.get("structuredContent"), dict):
+                gp_payload = res_obj["structuredContent"]
+
+        if not isinstance(gp_payload, dict):
+            return {
+                "ok": False,
+                "status": "failed",
+                "route": "guidepoint",
+                "reason": "Invalid JSON payload from guidepoint",
+                "count": 0,
+                "results": [],
+                "raw_payload": None,
+            }
+
+        inner = gp_payload.get("data") if isinstance(gp_payload.get("data"), dict) else gp_payload
+        is_err = (
+            bool(isinstance(res_obj, dict) and res_obj.get("isError"))
+            or gp_payload.get("ok") is False
+            or bool(isinstance(inner, dict) and inner.get("isError"))
+        )
+        if is_err:
+            err_text = str(
+                gp_payload.get("error")
+                or gp_payload.get("reason")
+                or ""
+            ).strip()
+            if not err_text and isinstance(inner, dict) and isinstance(inner.get("content"), list):
+                c_blocks = inner["content"]
+                if c_blocks and isinstance(c_blocks[0], dict):
+                    err_text = str(c_blocks[0].get("text") or "").strip()
+            reason = (err_text or "guidepoint call returned error")[:200]
+            raw_status = str(gp_payload.get("status") or "").strip().lower()
+            status = (
+                "timeout"
+                if raw_status == "timeout" or "timeout" in reason.lower() or "timed out" in reason.lower()
+                else "failed"
+            )
+            return {
+                "ok": False,
+                "status": status,
+                "route": "guidepoint",
+                "reason": reason,
+                "count": 0,
+                "results": [],
+                "raw_payload": gp_payload,
+            }
+
+        sc = source_identity._unwrap_mcp_proxy_payload(inner) if isinstance(inner, dict) else gp_payload
+        raw_items = sc.get("data") if isinstance(sc, dict) and isinstance(sc.get("data"), list) else None
+        if not isinstance(raw_items, list) and isinstance(sc, dict):
+            raw_items = sc.get("results") if isinstance(sc.get("results"), list) else None
+        if not isinstance(raw_items, list):
+            raw_items = (
+                gp_payload.get("data")
+                if isinstance(gp_payload.get("data"), list)
+                else gp_payload.get("results")
+                if isinstance(gp_payload.get("results"), list)
+                else []
+            )
+
+        gp_items: list[dict[str, Any]] = []
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
+            norm = dict(item)
+            raw_id = str(
+                norm.get("id")
+                or norm.get("transcript_id")
+                or norm.get("document_id")
+                or ""
+            ).strip()
+            m = source_identity._GP_ID_RE.search(raw_id)
+            base_id = m.group(1) if m else raw_id
+            norm["route"] = "guidepoint"
+            norm.setdefault("source", "guidepoint")
+            if base_id:
+                full_doc_id = (
+                    base_id
+                    if base_id.startswith("guidepoint:")
+                    else f"guidepoint:{base_id}"
+                )
+                norm.setdefault("document_id", full_doc_id)
+                norm.setdefault("canonical_id", full_doc_id)
+            if norm.get("transcript_name") and not norm.get("title"):
+                norm["title"] = norm["transcript_name"]
+            if norm.get("date") and not norm.get("published_at"):
+                norm["published_at"] = norm["date"]
+            if isinstance(norm.get("respondent"), dict) and "full_name" in norm["respondent"]:
+                norm["respondent"] = {
+                    k: v for k, v in norm["respondent"].items() if k != "full_name"
+                }
+            gp_items.append(norm)
+
+        return {
+            "ok": True,
+            "status": "ok",
+            "route": "guidepoint",
+            "reason": None,
+            "count": len(gp_items),
+            "results": gp_items,
+            "raw_payload": gp_payload,
+        }
+
+    def _merge_alphaengine_into_all(
+        self,
+        payload: dict[str, Any],
+        declared_local: list[dict[str, Any]],
+        ae_outcome: dict[str, Any],
+        ae_args: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Merge AlphaEngine fanout results/status into `route='all'` payload and declared sources."""
+        if ae_outcome.get("ok"):
+            ae_items = list(ae_outcome.get("results") or [])
+            ae_section: dict[str, Any] = {
+                "ok": True,
+                "status": "ok",
+                "route": "alphaengine",
+                "count": len(ae_items),
+                "results": ae_items,
+            }
+        else:
+            st = str(ae_outcome.get("status") or "failed")
+            reason = str(ae_outcome.get("reason") or st)
+            ae_items = []
+            ae_section = {
+                "ok": False,
+                "status": st,
+                "route": "alphaengine",
+                "reason": reason,
+                "error": reason,
+                "count": 0,
+                "results": [],
+            }
+
+        payload["alphaengine"] = ae_section
+        if isinstance(payload.get("source_status"), dict):
+            payload["source_status"]["alphaengine"] = {
+                k: v for k, v in ae_section.items() if k != "results"
+            }
+
+        if ae_items and isinstance(payload.get("results"), list):
+            existing_ids = {
+                str(r.get("canonical_id") or r.get("document_id") or "")
+                for r in payload["results"]
+                if isinstance(r, dict)
+            }
+            existing_ids.discard("")
+            for item in ae_items:
+                cid = str(item.get("canonical_id") or item.get("document_id") or "")
+                if cid and cid in existing_ids:
+                    continue
+                if cid:
+                    existing_ids.add(cid)
+                payload["results"].append(item)
+            if "result_count" in payload:
+                payload["result_count"] = len(payload["results"])
+            if payload.get("ok") is True and payload.get("status") == "empty":
+                payload["status"] = "ok"
+
+        merged_declared: list[dict[str, Any]] = []
+        seen_doc_ids: set[str] = set()
+        for src in declared_local:
+            if not isinstance(src, dict):
+                continue
+            doc_id = str(src.get("document_id") or "")
+            if doc_id:
+                seen_doc_ids.add(doc_id)
+            merged_declared.append(src)
+
+        raw_ae = ae_outcome.get("raw_payload")
+        if ae_outcome.get("ok") and isinstance(raw_ae, dict):
+            declared_ae = source_identity.declare("research", ae_args, raw_ae)
+            for src in declared_ae:
+                if not isinstance(src, dict):
+                    continue
+                src_copy = dict(src)
+                src_copy["route"] = "alphaengine"
+                doc_id = str(src_copy.get("document_id") or "")
+                if doc_id and doc_id in seen_doc_ids:
+                    continue
+                if doc_id:
+                    seen_doc_ids.add(doc_id)
+                merged_declared.append(src_copy)
+                if len(merged_declared) >= source_identity.MAX_SOURCES_PER_CALL:
+                    break
+
+        return merged_declared[: source_identity.MAX_SOURCES_PER_CALL]
+
+    def _merge_guidepoint_into_all(
+        self,
+        payload: dict[str, Any],
+        declared_so_far: list[dict[str, Any]],
+        gp_outcome: dict[str, Any],
+        gp_args: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Merge Guidepoint fanout results/status into `route='all'` payload and declared sources."""
+        if gp_outcome.get("ok"):
+            gp_items = list(gp_outcome.get("results") or [])
+            gp_section: dict[str, Any] = {
+                "ok": True,
+                "status": "ok",
+                "route": "guidepoint",
+                "count": len(gp_items),
+                "results": gp_items,
+            }
+        else:
+            st = str(gp_outcome.get("status") or "failed")
+            reason = str(gp_outcome.get("reason") or st)
+            gp_items = []
+            gp_section = {
+                "ok": False,
+                "status": st,
+                "route": "guidepoint",
+                "reason": reason,
+                "error": reason,
+                "count": 0,
+                "results": [],
+            }
+
+        payload["guidepoint"] = gp_section
+        if isinstance(payload.get("source_status"), dict):
+            payload["source_status"]["guidepoint"] = {
+                k: v for k, v in gp_section.items() if k != "results"
+            }
+
+        if gp_items and isinstance(payload.get("results"), list):
+            existing_ids = {
+                str(r.get("id") or r.get("canonical_id") or r.get("document_id") or "")
+                for r in payload["results"]
+                if isinstance(r, dict)
+            }
+            existing_ids.discard("")
+            for item in gp_items:
+                cid = str(item.get("id") or item.get("canonical_id") or item.get("document_id") or "")
+                if cid and cid in existing_ids:
+                    continue
+                if cid:
+                    existing_ids.add(cid)
+                payload["results"].append(item)
+            if "result_count" in payload:
+                payload["result_count"] = len(payload["results"])
+            if payload.get("ok") is True and payload.get("status") == "empty":
+                payload["status"] = "ok"
+
+        merged_declared: list[dict[str, Any]] = []
+        seen_doc_ids: set[str] = set()
+        for src in declared_so_far:
+            if not isinstance(src, dict):
+                continue
+            doc_id = str(src.get("document_id") or "")
+            if doc_id:
+                seen_doc_ids.add(doc_id)
+            merged_declared.append(src)
+
+        raw_gp = gp_outcome.get("raw_payload")
+        if gp_outcome.get("ok") and isinstance(raw_gp, dict):
+            declared_gp = source_identity.declare("research", gp_args, raw_gp)
+            for src in declared_gp:
+                if not isinstance(src, dict):
+                    continue
+                src_copy = dict(src)
+                src_copy["route"] = "guidepoint"
+                doc_id = str(src_copy.get("document_id") or "")
+                if doc_id and doc_id in seen_doc_ids:
+                    continue
+                if doc_id:
+                    seen_doc_ids.add(doc_id)
+                merged_declared.append(src_copy)
+                if len(merged_declared) >= source_identity.MAX_SOURCES_PER_CALL:
+                    break
+
+        return merged_declared[: source_identity.MAX_SOURCES_PER_CALL]
 
     def _read_usage_today(self) -> dict[str, int]:
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -453,6 +1217,16 @@ class ResearchDataBridge:
         if tool_name != "catalog":
             call_args["timeout"] = eff_timeout
 
+        do_fanout = self._should_fanout_alphaengine(tool_name, arguments)
+        ae_args: dict[str, Any] | None = (
+            self._build_alphaengine_fanout_args(arguments) if do_fanout else None
+        )
+        gp_args: dict[str, Any] | None = (
+            self._build_guidepoint_fanout_args(arguments) if do_fanout else None
+        )
+        ae_outcome: dict[str, Any] | None = None
+        gp_outcome: dict[str, Any] | None = None
+
         t0 = time.monotonic()
         test_delay_s = self.cfg.resolve_test_delay_s()
         async with self.sem:
@@ -462,8 +1236,9 @@ class ResearchDataBridge:
                         asyncio.sleep(test_delay_s),
                         timeout=float(eff_timeout),
                     )
+                elapsed_so_far = time.monotonic() - t0
                 remaining_budget_s = max(
-                    5.0, float(eff_timeout) - (time.monotonic() - t0) + 5.0
+                    5.0, float(eff_timeout) - elapsed_so_far + 5.0
                 )
                 rpc_req = {
                     "jsonrpc": "2.0",
@@ -471,9 +1246,132 @@ class ResearchDataBridge:
                     "method": "tools/call",
                     "params": {"name": tool_name, "arguments": call_args},
                 }
-                resps = await self._run_stdio_rpc(
-                    [rpc_req], timeout_s=remaining_budget_s
-                )
+                if ae_args is not None and gp_args is not None:
+                    ae_timeout = int(
+                        ae_args.get("timeout") or FANOUT_ALPHAENGINE_TIMEOUT_S
+                    )
+                    ae_budget_s = max(
+                        5.0, float(ae_timeout) - elapsed_so_far + 5.0
+                    )
+                    gp_timeout = int(
+                        gp_args.get("timeout") or FANOUT_GUIDEPOINT_TIMEOUT_S
+                    )
+                    gp_budget_s = max(
+                        5.0, float(gp_timeout) - elapsed_so_far + 5.0
+                    )
+                    ae_task = asyncio.create_task(
+                        self._run_alphaengine_fanout(req_id, ae_args, ae_budget_s)
+                    )
+                    gp_task = asyncio.create_task(
+                        self._run_guidepoint_fanout(req_id, gp_args, gp_budget_s)
+                    )
+                    try:
+                        try:
+                            resps = await self._run_stdio_rpc(
+                                [rpc_req], timeout_s=remaining_budget_s
+                            )
+                        except (asyncio.TimeoutError, Exception) as local_exc:
+                            # Let online calls that are already done finish before cancelling the rest.
+                            await asyncio.sleep(0)
+                            if not ae_task.done():
+                                ae_task.cancel()
+                            if not gp_task.done():
+                                gp_task.cancel()
+                            raw_ae, raw_gp = await asyncio.gather(
+                                ae_task, gp_task, return_exceptions=True
+                            )
+                            is_local_timeout = isinstance(local_exc, asyncio.TimeoutError)
+                            local_st = "timeout" if is_local_timeout else "failed"
+                            local_reason = (
+                                f"researchdata_bridge timed out after {eff_timeout}s on {tool_name}/{route}"
+                                if is_local_timeout
+                                else (
+                                    f"SubprocessExitError(exit_code={local_exc.exit_code})"
+                                    if isinstance(local_exc, SubprocessExitError)
+                                    else type(local_exc).__name__
+                                )
+                            )
+                            ae_outcome = (
+                                raw_ae
+                                if isinstance(raw_ae, dict)
+                                else {
+                                    "ok": False,
+                                    "status": "canceled",
+                                    "route": "alphaengine",
+                                    "reason": f"canceled after local all {local_st}",
+                                    "count": 0,
+                                    "results": [],
+                                    "raw_payload": None,
+                                }
+                            )
+                            gp_outcome = (
+                                raw_gp
+                                if isinstance(raw_gp, dict)
+                                else {
+                                    "ok": False,
+                                    "status": "canceled",
+                                    "route": "guidepoint",
+                                    "reason": f"canceled after local all {local_st}",
+                                    "count": 0,
+                                    "results": [],
+                                    "raw_payload": None,
+                                }
+                            )
+                            any_online_ok = bool(
+                                ae_outcome.get("ok") or gp_outcome.get("ok")
+                            )
+                            fallback_payload: dict[str, Any] = {
+                                "ok": any_online_ok,
+                                "status": "ok" if any_online_ok else local_st,
+                                "error": local_reason,
+                                "results": [],
+                                "result_count": 0,
+                                "source_status": {
+                                    "local_all": {
+                                        "ok": False,
+                                        "status": local_st,
+                                        "reason": local_reason,
+                                        "error": local_reason,
+                                        "count": 0,
+                                    }
+                                },
+                            }
+                            resps = [
+                                {
+                                    "jsonrpc": "2.0",
+                                    "id": req_id if req_id is not None else 1,
+                                    "result": {
+                                        "content": [
+                                            {
+                                                "type": "text",
+                                                "text": json.dumps(
+                                                    fallback_payload,
+                                                    ensure_ascii=False,
+                                                ),
+                                            }
+                                        ],
+                                        "structuredContent": dict(fallback_payload),
+                                        "isError": not any_online_ok,
+                                    },
+                                }
+                            ]
+                        except BaseException:
+                            ae_task.cancel()
+                            gp_task.cancel()
+                            await asyncio.gather(
+                                ae_task, gp_task, return_exceptions=True
+                            )
+                            raise
+                        else:
+                            ae_outcome, gp_outcome = await asyncio.gather(ae_task, gp_task)
+                    finally:
+                        # Whatever ends the fan-out (an error, a cancel mid-handler), no online
+                        # subprocess outlives the call: cancel what is still running and reap it.
+                        await _cancel_and_reap((ae_task, gp_task))
+                else:
+                    resps = await self._run_stdio_rpc(
+                        [rpc_req], timeout_s=remaining_budget_s
+                    )
             except asyncio.TimeoutError:
                 elapsed_ms = int((time.monotonic() - t0) * 1000)
                 logger.warning(
@@ -534,6 +1432,14 @@ class ResearchDataBridge:
                         payload["route_count"] = len(payload["routes"])
 
                     declared = source_identity.declare(tool_name, arguments, payload)
+                    if ae_outcome is not None and ae_args is not None:
+                        declared = self._merge_alphaengine_into_all(
+                            payload, declared, ae_outcome, ae_args
+                        )
+                    if gp_outcome is not None and gp_args is not None:
+                        declared = self._merge_guidepoint_into_all(
+                            payload, declared, gp_outcome, gp_args
+                        )
                     declared_count = len(declared)
                     status_str = str(payload.get("status") or ("ok" if payload.get("ok") else "error"))
 
@@ -554,11 +1460,7 @@ class ResearchDataBridge:
                     }
                     blocks[0]["text"] = json.dumps(enriched, ensure_ascii=False)
                     if isinstance(result_obj.get("structuredContent"), dict):
-                        result_obj["structuredContent"] = {
-                            "_declared_sources": declared,
-                            "_sources": declared,
-                            **result_obj["structuredContent"],
-                        }
+                        result_obj["structuredContent"] = dict(enriched)
 
         logger.info(
             "tools/call tool=%s route=%s op=%s status=%s declared_sources=%d elapsed_ms=%d",

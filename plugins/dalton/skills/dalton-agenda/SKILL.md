@@ -1,6 +1,6 @@
 ---
 name: dalton-agenda
-description: Closes every research session with verdict recording, agenda updates, and optional verification scheduling.
+description: "完成每次研究会话的收尾三步：追加事件五词判断日志、更新待验证问题与跟踪议程，并为明确日期的验证节点配置自动唤醒任务。任何研究任务形成结论或更新认知后收尾时使用；直接调用工具，快速完成。"
 ---
 
 # dalton-agenda — 研究议程与收尾闭环技能（PK.14）

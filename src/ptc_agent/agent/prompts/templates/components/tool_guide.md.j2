@@ -16,6 +16,8 @@ Routing:
 {% if finance_enabled %}
 - Direct question about a stock or company → Financial (Direct)
 {% endif %}
+{# DALTON-HOOK(tool-guide-research) #}
+- 研究服务（{% if tool_summary and not thread_id %}`MCP Tools (via Python)`{% else %}`<mcp-servers>`{% endif %}，经一次简短 `ExecuteCode`）提供卖方、专家、管理层原话和内部笔记，是解释“发生了什么、为什么”时的主要证据，与网页搜索互补。
 - Need to compute, compare, model, or chart → MCP (via Python)
 - File, search, shell{% if web_enabled %}, or web{% endif %} operations → Core
 {% if crawl_enabled %}

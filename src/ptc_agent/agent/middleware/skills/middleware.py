@@ -375,11 +375,15 @@ class SkillsMiddleware(AgentMiddleware):
         Returns:
             Formatted manifest string, or None if no skills to list
         """
+        # DALTON-HOOK(skills-manifest-lead)
         lines = [
             "## Available Skills",
             "",
-            "Skills provide specialized capabilities. "
-            "To activate, read `.agents/skills/{name}/SKILL.md`.",
+            "These are established workflows for the fund's regular work. "
+            "Before starting work a skill describes, read `.agents/skills/{name}/SKILL.md` "
+            "and follow its method instead of improvising; even a brief reply can borrow "
+            "its 'which sources to check and in what order'. "
+            "Casual chat and single-source lookups do not need a skill.",
             "",
         ]
 

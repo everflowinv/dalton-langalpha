@@ -17,6 +17,8 @@
 
 ## 2. 来源身份与 `researchdata` 的 `_sources.identity` 对照表
 
+各来源提供的证据与 `research` 路由选用规则，统一以 `<mcp-servers>` 中 `researchdata` 的说明与 `.agents/tools/docs/researchdata/research.md`（由 `scripts/dalton/researchdata_bridge.py` 的 `RESEARCH_EVIDENCE_AND_ROUTE_GUIDE` 单一来源生成）为准，此处不再重复抄录。
+
 所有工具返回的 `_sources` 条目按以下规则映射来源身份（`identity`）：
 
 | 路由与操作（route / operation） | `document_id` 格式 | `identity`（来源身份） | `publisher`（发布方） | `as_of` 口径 |
@@ -28,7 +30,7 @@
 | `sales-notes` (`search` / `read`) | `mail:<id>` / `digest:<id>` | 单封邮件 → `broker_report`；汇总层 `layer=digest` → `derived` (`independent=false`) | 发件人 `original_source` | `date` (`document_date`) |
 | `tmtb` (`search` / `read`) | `tmtb:<id>` | `news`（第三方通讯） | `"TMTB"` | `date` |
 | `funda-ai` (`search` / `read`) | `funda:<id>` | `derived` (`independent=false`) | `"FUNDA AI"` | `published_at` |
-| `all` (`search` 联搜) | 保留各源 `document_id`，合并 `alternate_document_ids` | 按所属原始源规则映射 | 各源发布方 | 各源日期 |
+| `all` (`search` 联搜：本地 4 库 + AlphaEngine + Guidepoint) | 保留各源 `document_id`，合并 `alternate_document_ids` | 按所属原始源规则映射 | 各源发布方 | 各源日期 |
 | `sec` (`researchdata` 或 `dalton_sec`) | `sec:{accession}` | `filing` | `"SEC EDGAR"` | `filing_date` (`filed`) |
 | `estimates` (`consensus`) | `estimates:yahoo:{ticker}:{fetched_at}` | `street_estimate` | `"Yahoo Finance via yfinance"` | `fetched_at` |
 | `fred` / `treasury` | `fred:{series}` / `treasury:{dataset}` | `official_data` | `"FRED"` / `"US Treasury"` | `observation_date` |

@@ -1,6 +1,6 @@
 ---
 name: dalton-financial-lenses
-description: "Dalton 三把财务镜头与盈利质量计算：在同一报告期、汇率与市值锚点下，计算基础/严格净现金（Definition A/B）、隐含资产（折前/折后及隐含经营资产）、股东回报 R1/R2/R3 二十分制评分与盈利质量（Sloan 比率、CFO/NI、CCC）。触发词：财务镜头、净现金、net cash、隐含资产、hidden assets、股东回报、R1/R2/R3、盈利质量。"
+description: "在同一报告期、汇率与市值锚点下，拉取一手财报计算基础/严格净现金、折前/折后隐含资产、股东回报 R1/R2/R3 评分与盈利质量指标。用户需要严谨核验公司真实资产底垫、现金成色或股东回报力度时使用；需查财报附注并跑脚本，数分钟可完成。"
 ---
 
 # Dalton 财务镜头（`dalton-financial-lenses`）

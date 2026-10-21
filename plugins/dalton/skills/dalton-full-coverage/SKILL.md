@@ -1,6 +1,6 @@
 ---
 name: dalton-full-coverage
-description: "买方完整覆盖（Full Coverage / 12问深度备忘录与三表DCF模型）：启动 full-coverage workflow 完成一手材料与数字底表（FACTS-LEDGER）、12问问题清单（frame）、A/B/C/D 四支线并行取证、15页Excel模型（三表+DCF+Comps+Facts+Guidance vs Actual+Street vs House）、三段式12问投资备忘录、模型与成稿双审稿、知识层修订与 publish_report 正式发布。触发词：/full-coverage、完整覆盖、深度覆盖、深度报告、投资备忘录、full coverage、investment memo。"
+description: "完成一手数字底表、四支线并行取证、15 页动态公式 Excel 三表与 DCF 模型、三段式 12 问深度投资备忘录及双审稿发布。对重点标的开展立项级深度建仓研究、需要完整估值模型与正式备忘录时使用；属于最重度完整深度研究。"
 ---
 
 # Dalton 买方完整覆盖（`dalton-full-coverage`）

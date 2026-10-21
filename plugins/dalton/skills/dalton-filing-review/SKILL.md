@@ -1,6 +1,6 @@
 ---
 name: dalton-filing-review
-description: "覆盖公司 SEC 公告审阅（公告监控响应）：被 watch 预检的 sec 探针通过 <dalton_wake> 唤醒（或手动指定 accession）后，按 form-guide.md 审阅 10-Q/10-K、8-K、融资文件（S-3/424B）、DEF 14A、13D/13G 与 Form 4，对照 thesis/debate 给出事件五词结论，写事件笔记并更新知识层。触发词：公告审阅、filing review、10-Q 审阅、10-K 审阅、8-K 审阅、/dalton-filing-review。"
+description: "审阅公司最新 SEC 公告（10-Q/10-K、8-K、融资文件、代理声明及股权变动），比对数字与风险措辞变化，给出对核心论点的五词结论并更新知识层。公司披露新公告、需要核查细节与判断投资影响时使用；视公告篇幅几分钟内可完成。"
 ---
 
 # Dalton 公司公告审阅（`dalton-filing-review`）

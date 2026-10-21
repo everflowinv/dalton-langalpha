@@ -1,6 +1,6 @@
 ---
 name: dalton-company-background
-description: Rapid 9-section company background sheet (business, segments, 3Y annual, 4Q quarterly, balance sheet, market data, moat, catalysts, risks) with strict fact-vs-view separation.
+description: "产出一份事实与观点严格分离的九节公司基本面速览（业务与分部、三年年报、四季季报、资产负债表、市场数据、商业模式与竞争、看点与风险）。用户想快速摸清一家公司靠什么赚钱、财务体量与当前估值时使用；不跑重型工作流，几分钟内可完成。"
 ---
 
 # dalton-company-background — 公司背景速览（PS.3）

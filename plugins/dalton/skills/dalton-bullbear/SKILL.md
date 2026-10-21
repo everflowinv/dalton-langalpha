@@ -1,6 +1,6 @@
 ---
 name: dalton-bullbear
-description: "个股多空争论（Bull/Bear Discussion）：默认在对话内快速交付共识、2–4个核心Debate、盈利预测修正三层与隐含费用空间、3–6个月催化剂与改判条件；需要完整文档时启动 bullbear-doc workflow 产出 v4.2 结构长稿（含独立股东回报支线与财务体检）。触发词：/bullbear、多空观点、多空在争什么、bull bear、earnings revision、variant perception、近期催化剂。"
+description: "梳理个股市场共识、2–4 个核心多空分歧、盈利预测修正轨迹与隐含费用空间、近期催化剂及改判条件。用户想弄清市场对某只股票在争什么、预期差在哪时使用；对话快速版几分钟可完成，若要求完整 v4.2 长稿则启动多阶段深度工作流。"
 ---
 
 # Dalton 个股多空讨论（`dalton-bullbear`）

@@ -1,6 +1,6 @@
 ---
 name: dalton-earnings-calendar
-description: "每周一次确认覆盖名单下一次财报的官方披露日期，维护 pending/confirmed/reported 三态台账，经 REST helper 生成或改期 tm3/t0/tp1 自动任务并同步 agenda.watch.events，执行读回对账与固定顺序总结。触发词：财报日历、更新财报日期、earnings calendar。"
+description: "逐家核实覆盖名单下一次财报的公司官方披露日期，维护三态台账并为已确认标的自动排程财报前瞻、快讯与次日深度链任务。定期巡检或需要确认覆盖公司财报日期并排定跟踪计划时使用；几分钟内可完成。"
 ---
 
 # Dalton 财报日历维护（`dalton-earnings-calendar`）

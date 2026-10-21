@@ -1,6 +1,6 @@
 ---
 name: dalton-knowledge
-description: "Maintain a company workspace's structured knowledge layer (thesis, debate, drivers, management, lessons, agenda, models, verdicts) through knowledge_update and knowledge_append_verdict."
+description: "维护覆盖公司工作区的结构化知识层（核心论点、多空焦点、经营驱动、管理层、经验教训、研究议程、模型登记与判断日志）并保持读写一致。需要查阅公司既有认知或通过受控工具更新知识文档时使用；按需读写，轻量快速。"
 ---
 
 # Dalton 公司知识层维护（Company Knowledge Layer）

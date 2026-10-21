@@ -40,6 +40,9 @@ ALLOWED_HOOKS=(
   # P0-D data & P1 skills hooks
   "mcp-call-timeout"
   "skills-registry"
+  "skills-manifest-lead"
+  "cos-research-depth"
+  "tool-guide-research"
   "provenance-declared"
   "provenance-type"
   "web-search-openclaw"
