@@ -395,11 +395,17 @@ class TestBrokerResultMapping:
             date_after="2026-10-01",
             date_before="2026-10-20",
         )
+        # The grounded answer leads the list as an answer_box the UI skips; results follow unchanged.
         assert isinstance(content, list)
-        assert len(content) == 1
-        assert content[0]["title"] == "NVIDIA Investor Relations"
-        assert content[0]["url"] == "https://investor.nvidia.com/news"
-        assert content[0]["content"] == ""
+        assert content[0] == {
+            "type": "answer_box",
+            "title": "OpenClaw 综合答案（来源见下）",
+            "content": "NVIDIA Q3 revenue beat expectations.",
+        }
+        assert content[1]["title"] == "NVIDIA Investor Relations"
+        assert content[1]["url"] == "https://investor.nvidia.com/news"
+        assert content[1]["content"] == ""
+        assert len(artifact["results"]) == 1
         assert artifact["answer"] == "NVIDIA Q3 revenue beat expectations."
         assert artifact["search_engine"] == "openclaw"
 

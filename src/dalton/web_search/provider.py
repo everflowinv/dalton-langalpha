@@ -51,6 +51,7 @@ BRIDGE_BUSY_MESSAGE = "OpenClaw 网页搜索繁忙，请稍后重试"
 RATE_LIMITED_MESSAGE = "OpenClaw 网页搜索触发限流，请稍后重试"
 EMPTY_RESULTS_MESSAGE = "OpenClaw 网页搜索返回空结果"
 ANSWER_ONLY_HEADING = "OpenClaw 综合答案（无来源链接）"
+ANSWER_WITH_SOURCES_HEADING = "OpenClaw 综合答案（来源见下）"
 
 _PARAM_ERROR_CODES = frozenset(
     {
@@ -102,6 +103,19 @@ class OpenClawSearchEmptyResultError(RuntimeError):
 
     def __init__(self, message: str = EMPTY_RESULTS_MESSAGE) -> None:
         super().__init__(message or EMPTY_RESULTS_MESSAGE)
+
+
+def _answer_with_sources(answer: str, results: List[Dict[str, Any]]) -> Union[str, List[Dict[str, Any]]]:
+    """The model-visible content when the broker returns a synthesized answer.
+
+    Grounded providers (Gemini) return the answer plus citation links that carry no
+    snippet, so the result list alone would show the model only domain names. The
+    answer leads the list as an ``answer_box`` item: the UI's search cards and
+    citation hovers keep reading the same JSON list and skip non page/news items.
+    """
+    if not results:
+        return f"{ANSWER_ONLY_HEADING}\n{answer}"
+    return [{"type": "answer_box", "title": ANSWER_WITH_SOURCES_HEADING, "content": answer}, *results]
 
 
 def unwrap_untrusted_text(value: Any) -> str:
@@ -583,8 +597,8 @@ def build_web_search_tool(
                 response_time=elapsed,
                 include_favicon=include_favicon,
             )
-            if not cleaned_results and artifact.get("answer"):
-                return f"{ANSWER_ONLY_HEADING}\n{artifact['answer']}", artifact
+            if artifact.get("answer"):
+                return _answer_with_sources(artifact["answer"], cleaned_results), artifact
             return cleaned_results, artifact
         except OpenClawSearchEmptyResultError as exc:
             error_message = str(exc)
