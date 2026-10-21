@@ -14,10 +14,11 @@ Verifies against the live HTTP backend (`http://127.0.0.1:8000`) for a fresh tes
    - Verifies that the first `publish.review` call executes fresh (`replayed=false`, `total_tokens > 0`) and the second
      `publish.review` call hits the `dalton_llm_journal` cache (`replayed=true`, `cached=true`, `cash_usd=0.0`,
      `usage.replay_count >= 1`).
-3. Scenario ① (Claude subscription lead model dispatches cash subagent `deepseek-flash` until cap is reached, next turn rejected with HTTP 429):
+3. Scenario ① (Claude subscription lead model dispatches cash subagent `deepseek-flash` until admission would refuse, next turn rejected with HTTP 429):
    - Overrides `general-purpose` subagent to `deepseek-flash` via `PUT /api/v1/subagents/general-purpose`.
    - Sends conversation turn(s) via `POST /api/v1/threads/{thread_id}/messages` (`llm_model="claude-sonnet-5-5-low-oauth"`)
-     where the lead model dispatches the `general-purpose` (`deepseek-flash`) subagent until `spent_usd >= cap_usd`.
+     where the lead model dispatches the `general-purpose` (`deepseek-flash`) subagent until admission would refuse
+     the next turn, i.e. `cap_usd - spent_usd < budget.admission_floor_usd` (the gate's own condition, `gate.py`).
    - Sends the subsequent turn via `POST /api/v1/threads/{thread_id}/messages` and asserts HTTP `429` with
      `detail.type == "dalton_daily_budget"`.
    - Captures a screenshot of the frontend rejection banner (`var/dalton/trial-runs/realrun-<date>/g1_budget_exhausted_banner.png`).
@@ -32,10 +33,12 @@ import os
 import subprocess
 import sys
 import time
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 import psycopg
+import yaml
 from psycopg.rows import dict_row
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -282,6 +285,27 @@ def _capture_rejection_banner_screenshot(
         },
         raw_bytes,
     )
+
+
+def _admission_floor_usd() -> Decimal:
+    """`budget.admission_floor_usd` from the committed `src/dalton/dalton.yaml`.
+
+    The gate refuses a turn once `cap - spent < floor`, so spend can never reach the cap itself. Under
+    `--record` the version gate guarantees the backend runs this same commit, hence this same file.
+    """
+    raw = yaml.safe_load((REPO_ROOT / "src" / "dalton" / "dalton.yaml").read_text(encoding="utf-8")) or {}
+    return Decimal(str((raw.get("budget") or {}).get("admission_floor_usd") or 0.25))
+
+
+def _gate_would_refuse(today: dict[str, Any], floor_usd: Decimal) -> bool:
+    """Mirror `enforce_local_admission` (`src/dalton/budget/gate.py`) on a `/budget/today` payload.
+
+    Decimal, like the gate: float subtraction lands on the wrong side of the floor at the boundary. The
+    payload's amounts are floats, so this is a prediction for when to stop spending; the real 429 on the
+    next turn stays the check of record.
+    """
+    available = Decimal(str(today.get("cap_usd") or 0)) - Decimal(str(today.get("spent_usd") or 0))
+    return not today.get("configured", True) or available <= 0 or available < floor_usd
 
 
 def _cleanup_g1_state(
@@ -562,6 +586,10 @@ def main() -> int:
             )
             baseline_spent_a = float(init_today_a.get("spent_usd") or 0.0)
             cap_usd = round(baseline_spent_a + cap_delta_usd, 6)
+            floor_usd = _admission_floor_usd()
+            assert Decimal(str(cap_delta_usd)) > floor_usd, (
+                f"--cap-usd {cap_delta_usd} must exceed admission_floor_usd {floor_usd}, or the first turn is refused"
+            )
 
             # 1. Set daily budget cap to (today's already spent cash + $0.30) via Settings API for user A (P0J §8.1 #19)
             st_b, budget_cfg = client.put(
@@ -676,20 +704,16 @@ def main() -> int:
             )
 
             # 5. Scenario ①: Lead model (`claude-sonnet-5-5-low-oauth`) dispatches cash subagent (`deepseek-flash`)
-            #    until daily settled cash spend reaches `cap_usd`, then next turn via `POST /api/v1/threads/{thread_id}/messages`
-            #    is rejected with HTTP 429 (`dalton_daily_budget`).
+            #    until admission would refuse the next turn (`cap_usd - spent_usd < admission_floor_usd`, the gate's own
+            #    condition), then the next turn via `POST /api/v1/threads/{thread_id}/messages` is rejected with HTTP 429
+            #    (`dalton_daily_budget`).
             subagent_turns: list[dict[str, Any]] = []
             spend_deadline = time.monotonic() + 600.0
             turn_idx = 0
             reached_cap = False
             while time.monotonic() < spend_deadline:
                 _, cur_today = client.get("/api/v1/dalton/budget/today")
-                cur_settled = (
-                    float(cur_today.get("settled_usd") or 0.0)
-                    + float(cur_today.get("journal_cash_usd") or 0.0)
-                    + float(cur_today.get("unreserved_usage_usd") or 0.0)
-                )
-                if cur_settled >= cap_usd and float(cur_today.get("open_reserved_usd") or 0.0) == 0.0:
+                if _gate_would_refuse(cur_today, floor_usd) and float(cur_today.get("open_reserved_usd") or 0.0) == 0.0:
                     reached_cap = True
                     break
 
@@ -750,23 +774,32 @@ def main() -> int:
                         "remaining_usd_after_turn": after_turn_today.get("remaining_usd"),
                     }
                 )
-                settled_total = (
-                    float(after_turn_today.get("settled_usd") or 0.0)
-                    + float(after_turn_today.get("journal_cash_usd") or 0.0)
-                    + float(after_turn_today.get("unreserved_usage_usd") or 0.0)
-                )
-                if settled_total >= cap_usd and float(after_turn_today.get("open_reserved_usd") or 0.0) == 0.0:
+                if _gate_would_refuse(after_turn_today, floor_usd) and float(
+                    after_turn_today.get("open_reserved_usd") or 0.0
+                ) == 0.0:
                     reached_cap = True
                     break
 
             if not reached_cap:
                 raise TimeoutError(
-                    f"Timed out after 600s waiting for settled cash spend to reach cap_usd={cap_usd} (turns={turn_idx})"
+                    f"Timed out after 600s waiting for cap_usd={cap_usd} - spent_usd < admission_floor_usd={floor_usd} "
+                    f"(turns={turn_idx})"
                 )
 
+            assert any(
+                tc.get("name") == "Task"
+                for turn in subagent_turns
+                for batch in turn["sse_summary"]["tool_calls"]
+                for tc in batch["tool_calls"]
+            ), (
+                f"No cash subagent (`Task`) turn ran before the admission floor was reached (cap_usd={cap_usd}, "
+                f"floor_usd={floor_usd}, turns={turn_idx}); raise --cap-usd"
+            )
+
             _, budget_at_cap = client.get("/api/v1/dalton/budget/today")
-            assert float(budget_at_cap.get("spent_usd") or 0.0) >= cap_usd, (
-                f"Expected spent_usd >= {cap_usd} before rejection turn, got {budget_at_cap}"
+            assert _gate_would_refuse(budget_at_cap, floor_usd), (
+                f"Expected cap_usd - spent_usd < admission_floor_usd {floor_usd} before rejection turn, "
+                f"got {budget_at_cap}"
             )
 
             # 6. Next turn on `POST /api/v1/threads/{thread_id}/messages` -> rejected with HTTP 429

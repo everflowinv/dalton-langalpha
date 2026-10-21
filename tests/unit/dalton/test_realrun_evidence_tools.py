@@ -2520,3 +2520,23 @@ def test_g5_2_record_mode_uses_record_false_client_for_callback_exchange_and_rec
     assert client_record_args == [("realrun-pm-a", False)]
     assert preflight_record_args == [("G5", True)]
 
+
+
+@pytest.mark.parametrize(
+    ("today", "refused"),
+    [
+        # cap - spent == 0.250000 exactly: the gate admits (float subtraction would say 0.2499...)
+        ({"configured": True, "cap_usd": 0.251096, "spent_usd": 0.001096}, False),
+        ({"configured": True, "cap_usd": 0.30, "spent_usd": 0.076475}, True),
+        ({"configured": True, "cap_usd": 0.30, "spent_usd": 0.003}, False),
+        ({"configured": False, "cap_usd": 0.0, "spent_usd": 0.0}, True),
+        ({"configured": True, "cap_usd": 0.30, "spent_usd": 0.31}, True),
+    ],
+)
+def test_g1_gate_would_refuse_mirrors_admission_gate(today: dict, refused: bool) -> None:
+    from src.dalton.settings import get_dalton_settings
+
+    g1_mod = importlib.import_module("scripts.dalton.realrun.g1_budget")
+    floor = g1_mod._admission_floor_usd()
+    assert floor == Decimal(str(get_dalton_settings().budget.admission_floor_usd or 0.25))
+    assert g1_mod._gate_would_refuse(today, floor) is refused
