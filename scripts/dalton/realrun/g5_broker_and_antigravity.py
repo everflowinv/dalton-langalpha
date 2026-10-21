@@ -330,8 +330,11 @@ def _run_g5_1_broker() -> tuple[dict[str, Any], list[dict[str, Any]]]:
 
 def _initiate_g5_2_for_user(base_url: str, user_id: str, *, record: bool = False) -> dict[str, Any]:
     """Initiate Antigravity OAuth login for `user_id`."""
+    _ = record
+    # Always use record=False: login initiation happens before OAuth callback exchange (when
+    # oauth_token_provenance cannot pass yet) and writes no evidence files.
     with RealRunHttpClient(
-        base_url=base_url, user_id=user_id, timeout_s=30.0, record=record
+        base_url=base_url, user_id=user_id, timeout_s=30.0, record=False
     ) as client:
         client.ensure_user()
         st_init, body_init = client.post("/api/v1/oauth/antigravity/initiate")
@@ -460,8 +463,13 @@ def _exchange_g5_2_docker_callback(
         f"Callback URL must include localhost port and state query parameter: {resolved_callback!r}"
     )
 
+    _ = record
+    # Always use record=False: callers must first pass _assert_pre_callback_git_and_backend_gate
+    # (version gates plus every check_env check except oauth_token_provenance and
+    # conversation_transport); main() runs the full preflight with record=args.record right after
+    # the exchange, and the exchange itself writes no evidence files.
     with RealRunHttpClient(
-        base_url=base_url, user_id=user_a, timeout_s=120.0, record=record
+        base_url=base_url, user_id=user_a, timeout_s=120.0, record=False
     ) as client_a:
         client_a.ensure_user()
 
