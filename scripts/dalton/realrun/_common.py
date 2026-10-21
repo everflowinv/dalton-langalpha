@@ -1218,6 +1218,13 @@ def render_summaries_from_var_to_docs(
     docs_dir.mkdir(parents=True, exist_ok=True)
 
     written: list[str] = []
+    # Sub-item files (`g5_1_*.json`) are skipped only when the family's combined `--mode all` file
+    # exists; G5.2 needs a human OAuth callback, so it is normally recorded on its own.
+    families_with_combined = {
+        str(p.get("sub_item") or "").split(".")[0]
+        for p in (json.loads(f.read_text(encoding="utf-8")) for f in var_dir.glob("g*.json"))
+        if isinstance(p, dict) and str(p.get("sub_item") or "").endswith(".all")
+    }
     for json_file in sorted(var_dir.glob("g*.json")):
         payload = json.loads(json_file.read_text(encoding="utf-8"))
         if not isinstance(payload, dict):
@@ -1225,7 +1232,7 @@ def render_summaries_from_var_to_docs(
         sub_item = str(payload.get("sub_item") or "")
         if sub_item and not sub_item.endswith(".all") and "_" in json_file.stem:
             m_sub = re.match(r"^g[1-7]_\d+_", json_file.name)
-            if m_sub:
+            if m_sub and sub_item.split(".")[0] in families_with_combined:
                 continue
         family_code = str(payload.get("family") or _infer_family_from_script(json_file.name))
         sha256_hex = compute_file_sha256(json_file)
