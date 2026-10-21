@@ -88,6 +88,7 @@ def sanitize_usage_metadata(raw_usage: Any) -> dict[str, Any]:
         "replayed",
         "cached",
         "replay_count",
+        "last_replayed_at",
         "latency_ms",
         "attempt",
     }
@@ -119,7 +120,17 @@ def normalize_journal_rows(
     window_user_ids: list[str] | None = None,
     unexpected_user_ids: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Normalize raw `dalton_llm_journal` rows (and optional conversation usage rows) into `{rows, totals}`."""
+    """Normalize raw `dalton_llm_journal` rows (and optional conversation usage rows) into `{rows, totals}`.
+
+    Replay counting semantics:
+    - Rows created within the window (`created_at >= since_dt`): the row itself counts as 1 fresh call
+      (`replayed=False`), and its `usage.replay_count` is expanded into replay entries (`replayed=True`,
+      since all those replays occurred after creation within the current run).
+    - Rows created before the window (`created_at < since_dt`) selected via `usage.last_replayed_at`:
+      marked `replayed=True` and `replayed_from_before_window=True`, counted as 1 replay (a lower bound,
+      because the product only records the latest replay timestamp), with 0 added to window `totals`,
+      `by_purpose`, and `by_model` spend (`cash_usd` / `notional_usd`).
+    """
     rows: list[dict[str, Any]] = []
     total_cash = Decimal("0")
     total_notional = Decimal("0")
@@ -135,11 +146,8 @@ def normalize_journal_rows(
         usage = sanitize_usage_metadata(r.get("usage"))
         created_at = r.get("created_at")
         is_replayed = bool(r.get("replayed") or usage.get("replayed") or usage.get("cached"))
-        if (
-            not is_replayed
-            and since_dt is not None
-            and isinstance(created_at, datetime)
-        ):
+        replayed_from_before_window = False
+        if since_dt is not None and isinstance(created_at, datetime):
             c_utc = (
                 created_at.replace(tzinfo=timezone.utc)
                 if created_at.tzinfo is None
@@ -147,14 +155,17 @@ def normalize_journal_rows(
             )
             if c_utc < since_dt:
                 is_replayed = True
+                replayed_from_before_window = True
 
         cash_dec = Decimal(str(r.get("cash_usd") or "0"))
         notional_dec = Decimal(str(r.get("notional_usd") or "0"))
+        effective_cash_dec = Decimal("0") if replayed_from_before_window else cash_dec
+        effective_notional_dec = Decimal("0") if replayed_from_before_window else notional_dec
         state = str(r.get("state") or "")
         purpose = str(r.get("purpose") or "unknown")
         model_key = str(r.get("model_key") or "unknown")
 
-        row_item = {
+        row_item: dict[str, Any] = {
             "invocation_id": str(r.get("invocation_id") or ""),
             "user_id": r.get("user_id"),
             "scope_ref": str(r.get("scope_ref") or ""),
@@ -175,11 +186,13 @@ def normalize_journal_rows(
             "completed_at": format_iso_utc(r.get("completed_at")),
             "created_at": format_iso_utc(created_at),
         }
+        if replayed_from_before_window:
+            row_item["replayed_from_before_window"] = True
         rows.append(row_item)
 
         if state in ("done", "indeterminate"):
-            total_cash += cash_dec
-            total_notional += notional_dec
+            total_cash += effective_cash_dec
+            total_notional += effective_notional_dec
         if state == "done":
             done_calls += 1
         elif state == "failed":
@@ -201,9 +214,9 @@ def normalize_journal_rows(
             p_bucket["replayed_calls"] += 1
         else:
             p_bucket["fresh_calls"] += 1
-        p_bucket["cash_usd"] = round(float(Decimal(str(p_bucket["cash_usd"])) + cash_dec), 6)
+        p_bucket["cash_usd"] = round(float(Decimal(str(p_bucket["cash_usd"])) + effective_cash_dec), 6)
         p_bucket["notional_usd"] = round(
-            float(Decimal(str(p_bucket["notional_usd"])) + notional_dec), 6
+            float(Decimal(str(p_bucket["notional_usd"])) + effective_notional_dec), 6
         )
 
         m_bucket = by_model.setdefault(
@@ -215,9 +228,9 @@ def normalize_journal_rows(
             m_bucket["replayed_calls"] += 1
         else:
             m_bucket["fresh_calls"] += 1
-        m_bucket["cash_usd"] = round(float(Decimal(str(m_bucket["cash_usd"])) + cash_dec), 6)
+        m_bucket["cash_usd"] = round(float(Decimal(str(m_bucket["cash_usd"])) + effective_cash_dec), 6)
         m_bucket["notional_usd"] = round(
-            float(Decimal(str(m_bucket["notional_usd"])) + notional_dec), 6
+            float(Decimal(str(m_bucket["notional_usd"])) + effective_notional_dec), 6
         )
 
         replay_cnt = int(usage.get("replay_count") or 0) if not is_replayed else 0
@@ -333,7 +346,12 @@ def dump_journal(
     include_null_user: bool = False,
     include_conversation_usages: bool = True,
 ) -> dict[str, Any]:
-    """Query `dalton_llm_journal` (and optionally `conversation_usages`) for `(user_id, [since, until])`."""
+    """Query `dalton_llm_journal` (and optionally `conversation_usages`) for `(user_id, [since, until])`.
+
+    Note: If a cached row with `created_at` before the window is replayed multiple times within
+    a single run, it is counted as a single replay in that window because the product only records
+    the timestamp of the latest replay (`usage.last_replayed_at`).
+    """
     from datetime import timedelta
 
     user_ids = _normalize_user_id_list(user_id)
@@ -357,12 +375,17 @@ def dump_journal(
                         cash_usd, notional_usd, error_kind,
                         claimed_at, completed_at, created_at
                     FROM dalton_llm_journal
-                    WHERE created_at >= %s
-                      AND created_at <= %s
+                    WHERE (
+                        (created_at >= %s AND created_at <= %s)
+                        OR (
+                            (usage->>'last_replayed_at')::timestamptz >= %s
+                            AND (usage->>'last_replayed_at')::timestamptz <= %s
+                        )
+                    )
                       AND (user_id = ANY(%s) OR user_id IS NULL)
                     ORDER BY created_at ASC, invocation_id ASC
                     """,
-                    (since_dt, until_dt, user_ids),
+                    (since_dt, until_dt, since_dt, until_dt, user_ids),
                 )
             else:
                 cur.execute(
@@ -373,12 +396,17 @@ def dump_journal(
                         cash_usd, notional_usd, error_kind,
                         claimed_at, completed_at, created_at
                     FROM dalton_llm_journal
-                    WHERE created_at >= %s
-                      AND created_at <= %s
+                    WHERE (
+                        (created_at >= %s AND created_at <= %s)
+                        OR (
+                            (usage->>'last_replayed_at')::timestamptz >= %s
+                            AND (usage->>'last_replayed_at')::timestamptz <= %s
+                        )
+                    )
                       AND user_id = ANY(%s)
                     ORDER BY created_at ASC, invocation_id ASC
                     """,
-                    (since_dt, until_dt, user_ids),
+                    (since_dt, until_dt, since_dt, until_dt, user_ids),
                 )
             journal_rows = [dict(r) for r in cur.fetchall()]
 
@@ -386,10 +414,13 @@ def dump_journal(
                 """
                 SELECT DISTINCT COALESCE(NULLIF(BTRIM(user_id), ''), '<NULL>') AS uid
                 FROM dalton_llm_journal
-                WHERE created_at >= %s
-                  AND created_at <= %s
+                WHERE (created_at >= %s AND created_at <= %s)
+                   OR (
+                       (usage->>'last_replayed_at')::timestamptz >= %s
+                       AND (usage->>'last_replayed_at')::timestamptz <= %s
+                   )
                 """,
-                (since_dt, until_dt),
+                (since_dt, until_dt, since_dt, until_dt),
             )
             for row in cur.fetchall():
                 if row.get("uid"):

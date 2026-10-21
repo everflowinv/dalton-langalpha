@@ -37,6 +37,7 @@ import json
 import random
 import sys
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -59,8 +60,63 @@ from scripts.dalton.realrun._common import (  # noqa: E402
     write_evidence_and_summary,
 )
 from scripts.dalton.realrun.check_env import _restore_budget_state  # noqa: E402
+from scripts.dalton.realrun.journal_dump import parse_iso_utc  # noqa: E402
 
 G3_FIXTURES_DIR = REPO_ROOT / "tests" / "fixtures" / "dalton" / "g3"
+
+_AUDIT_PURPOSES: frozenset[str] = frozenset({"assist.audit.label_figures", "assist.audit.judge"})
+
+
+def _now_utc_iso_us() -> str:
+    """Return current UTC timestamp with microsecond precision (`YYYY-MM-DDTHH:MM:SS.ffffffZ`)."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def _make_unique_alpha_tag() -> str:
+    """Return an 8-character lowercase ASCII letter tag (no digits) mapped from `uuid4().hex`."""
+    return "".join(chr(ord("a") + int(ch, 16)) for ch in uuid.uuid4().hex[:8])
+
+
+def _count_window_fresh_and_replayed(
+    journal_rows: list[dict[str, Any]],
+    window_since: str,
+    window_until: str,
+) -> tuple[int, int]:
+    """Count `(fresh_calls, replayed_calls)` for audit calls (`assist.audit.label_figures`,
+    `assist.audit.judge`) within `[window_since, window_until]`, deduplicated by `invocation_id`
+    (ignoring `replay_count` expansion copies).
+    """
+    since_dt = parse_iso_utc(window_since)
+    until_dt = parse_iso_utc(window_until)
+    fresh_count = 0
+    replayed_count = 0
+    seen_invocation_ids: set[str] = set()
+    for r in journal_rows:
+        if r.get("purpose") not in _AUDIT_PURPOSES:
+            continue
+        inv_id = str(r.get("invocation_id") or "")
+        if not inv_id or inv_id in seen_invocation_ids:
+            continue
+        seen_invocation_ids.add(inv_id)
+
+        created_raw = r.get("created_at")
+        if created_raw and not (r.get("replayed") and not r.get("replayed_from_before_window")):
+            try:
+                created_dt = parse_iso_utc(str(created_raw))
+                if since_dt <= created_dt <= until_dt:
+                    fresh_count += 1
+            except Exception:
+                pass
+
+        replayed_raw = (r.get("usage") or {}).get("last_replayed_at")
+        if replayed_raw:
+            try:
+                replayed_dt = parse_iso_utc(str(replayed_raw))
+                if since_dt <= replayed_dt <= until_dt:
+                    replayed_count += 1
+            except Exception:
+                pass
+    return fresh_count, replayed_count
 
 
 def _wrap_evidence_as_valid_thesis(
@@ -959,16 +1015,19 @@ def main(argv: list[str] | None = None) -> int:
             # 6. Section-Level Cache Hit on Partial Draft Modification in `ws_googl`
             # ------------------------------------------------------------------
             print("[G3] 6/7 Running Section-Level Cache Hit test (modifying 1 section of GOOGL in ws_googl) ...", flush=True)
+            edit_tag = _make_unique_alpha_tag()
             googl_v2_lines = googl_draft.splitlines()
             modified_once = False
             for i_line, line_txt in enumerate(googl_v2_lines):
                 if "110%" in line_txt and not modified_once:
-                    googl_v2_lines[i_line] = line_txt.replace("110%", "112%", 1)
+                    googl_v2_lines[i_line] = (
+                        f"{line_txt.replace('110%', '112%', 1)}（微调批次 {edit_tag}）"
+                    )
                     modified_once = True
                     break
             googl_draft_v2 = "\n".join(googl_v2_lines) + "\n"
             _write_draft_via_http(client, ws_googl, "drafts/googl_v2.md", googl_draft_v2)
-            cache_t0 = now_utc_iso()
+            cache_t0 = _now_utc_iso_us()
             googl_v2_run = _run_publish_via_thread_http(
                 client,
                 workspace_id=ws_googl,
@@ -977,7 +1036,7 @@ def main(argv: list[str] | None = None) -> int:
                 kind="full_coverage",
                 slug=f"googl-deep-dive-v2-{run_nonce}",
             )
-            cache_t1 = now_utc_iso()
+            cache_t1 = _now_utc_iso_us()
             googl_v2_audit = googl_v2_run["audit"]
             print(
                 f"[G3] GOOGL v2 cache re-run done in {googl_v2_run['elapsed_s']}s: "
@@ -1132,12 +1191,23 @@ def main(argv: list[str] | None = None) -> int:
 
     journal_rows = evidence["journal"]["rows"]
     replayed_rows = [r for r in journal_rows if r.get("replayed")]
+    fresh_rows = [r for r in journal_rows if not r.get("replayed")]
     fresh_judge_rows = [
         r for r in journal_rows if r.get("purpose") == "assist.audit.judge" and not r.get("replayed")
     ]
     fresh_label_rows = [
         r for r in journal_rows if r.get("purpose") == "assist.audit.label_figures" and not r.get("replayed")
     ]
+    cache_window_fresh_calls, cache_window_replayed_calls = _count_window_fresh_and_replayed(
+        journal_rows,
+        cache_t0,
+        cache_t1,
+    )
+    evidence["scenarios"]["section_cache_rerun_googl_v2"]["edit_tag"] = edit_tag
+    evidence["scenarios"]["section_cache_rerun_googl_v2"]["fresh_calls"] = cache_window_fresh_calls
+    evidence["scenarios"]["section_cache_rerun_googl_v2"]["replayed_calls"] = cache_window_replayed_calls
+    evidence["section_cache_rerun_fresh_calls"] = cache_window_fresh_calls
+    evidence["section_cache_rerun_replayed_calls"] = cache_window_replayed_calls
 
     googl_lbl = googl_audit.get("labeling") or {}
     amzn_lbl = amzn_audit.get("labeling") or {}
@@ -1156,7 +1226,8 @@ def main(argv: list[str] | None = None) -> int:
         and int(inj_audit.get("exempt") or 0) >= 1
         and len(matched_colloq_tokens) == 4
         and eval_metrics["out_of_gold_false_verified_count"] == 0
-        and len(replayed_rows) > 0
+        and cache_window_fresh_calls >= 1
+        and cache_window_replayed_calls >= 1
     )
     evidence["acceptance_pass"] = acceptance_pass
 
@@ -1168,10 +1239,10 @@ def main(argv: list[str] | None = None) -> int:
         f"误排除（真实研究事实数字被标为 `incidental`）：**{eval_metrics['misclassified_financial_incidental_count']}**（标准：**0**；两份报告共排除非核验对象 {eval_metrics['incidental_total_combined']} 个，已在下方全量逐条列出原句、数字与九类归属）",
         f"「未能判断 (`uncertain`)」比例（LLM 在位时）：**{eval_metrics['total_uncertain_combined']} / {eval_metrics['total_figures_combined']} ({eval_metrics['uncertain_ratio']*100:.2f}%)**（标准：<= 10%）",
         f"标注覆盖（Step B `audit.label_figures`）：GOOGL `{googl_lbl.get('labeled')}/{googl_lbl.get('total')}` (`failed_batches={googl_lbl.get('failed_batches')}`)；AMZN `{amzn_lbl.get('labeled')}/{amzn_lbl.get('total')}` (`failed_batches={amzn_lbl.get('failed_batches')}`)",
-        f"注入防御 + 口语数字（`三成`）+ `〔假设〕` 豁免：`verified={inj_audit.get('verified')}`，`exempt={inj_audit.get('exempt')}`（`>=1`），`figures={inj_audit.get('figures')}`，附 `replayed=false` `assist.audit.judge` 日志记录 {len(fresh_judge_rows)} 条",
+        f"注入防御 + 口语数字（`三成`）+ `〔假设〕` 豁免：`verified={inj_audit.get('verified')}`，`exempt={inj_audit.get('exempt')}`（`>=1`），`figures={inj_audit.get('figures')}`，本次运行新调用 {len(fresh_rows)} 条、缓存回放 {len(replayed_rows)} 条（其中 `replayed=false` `assist.audit.judge` {len(fresh_judge_rows)} 条）",
         f"口语数字反例草稿（`colloquial_only_draft.md`）：真实 LLM 抽取出全部 4 个口语数字 `{matched_colloq_tokens}`（完整抽出列表：`{colloq_extracted_raws}`），无固定词表依赖",
         f"金标准范围外「已核实」抽样核对：范围外共 {eval_metrics['out_of_gold_verified_total']} 个已核实，抽样 {eval_metrics['out_of_gold_verified_sample_count']} 个，错放 **{eval_metrics['out_of_gold_false_verified_count']}**（标准：**0**）",
-        f"单节修改重跑缓存命中（GOOGL v2，同一工作区 `{ws_googl}`）：重跑耗时 `{googl_v2_run['elapsed_s']}s`，未修改章节命中 `dalton_llm_journal` 缓存产生 `replayed=true` 记录 **{len(replayed_rows)}** 条",
+        f"单节修改重跑缓存命中（GOOGL v2，同一工作区 `{ws_googl}`，微调批次 `{edit_tag}`）：重跑耗时 `{googl_v2_run['elapsed_s']}s`；第 6 步窗口 `[{cache_t0}, {cache_t1}]` 内，审计调用新调用 **{cache_window_fresh_calls}** 条、回放 **{cache_window_replayed_calls}** 条",
         f"四家迁移公司（META/AMZN/GOOGL/MSFT）`legacy_thesis` 版本历史：均通过 `GET /api/v1/dalton/knowledge/{{ws}}/thesis/versions` 验证保留 v1 初始迁移与 v2 `legacy_thesis` 降级版本（证据条数：META={legacy_theses_history['META']['legacy_thesis_evidence_count']}，AMZN={legacy_theses_history['AMZN']['legacy_thesis_evidence_count']}，GOOGL={legacy_theses_history['GOOGL']['legacy_thesis_evidence_count']}，MSFT={legacy_theses_history['MSFT']['legacy_thesis_evidence_count']}）",
         f"两用户隔离（`{pm_user}` vs `{other_user}`）：`{other_user}` 访问 `{pm_user}` 工作区返回 HTTP `{st_b_ws_access}`，可见对方审批请求 `0` 条、结论 `0` 条",
     ]
@@ -1214,9 +1285,12 @@ def main(argv: list[str] | None = None) -> int:
         ("exempt_marker_count (`〔假设〕`, 标准: >=1)", inj_audit.get("exempt", 0)),
         ("colloquial_counterexample_extracted (`近一半`/`大半`/`砍掉一半`/`倍增`)", matched_colloq_tokens),
         ("out_of_gold_false_verified_count (标准: 0)", f"{eval_metrics['out_of_gold_false_verified_count']} / {eval_metrics['out_of_gold_verified_sample_count']}"),
-        ("section_cache_rerun_replayed_calls", len(replayed_rows)),
+        ("section_cache_rerun_fresh_calls", cache_window_fresh_calls),
+        ("section_cache_rerun_replayed_calls", cache_window_replayed_calls),
         ("fresh_label_figures_calls", len(fresh_label_rows)),
         ("fresh_judge_calls", len(fresh_judge_rows)),
+        ("total_fresh_calls", len(fresh_rows)),
+        ("total_replayed_calls", len(replayed_rows)),
     ]
 
     raw_path, md_path, json_sha = write_evidence_and_summary(

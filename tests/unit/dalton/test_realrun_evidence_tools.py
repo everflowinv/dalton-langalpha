@@ -112,10 +112,13 @@ def test_journal_dump_normalize_rows_and_strip_body_fields() -> None:
     assert normalized["totals"]["fresh_calls"] == 1
     assert normalized["totals"]["replayed_calls"] == 1
     assert normalized["totals"]["done_calls"] == 2
-    assert normalized["totals"]["cash_usd"] == pytest.approx(0.0012)
-    assert normalized["totals"]["notional_usd"] == pytest.approx(0.0154)
+    assert normalized["totals"]["cash_usd"] == pytest.approx(0.0)
+    assert normalized["totals"]["notional_usd"] == pytest.approx(0.0142)
     assert normalized["rows"][0]["replayed"] is False
     assert normalized["rows"][1]["replayed"] is True
+    assert normalized["rows"][1]["replayed_from_before_window"] is True
+    assert normalized["rows"][1]["cash_usd"] == pytest.approx(0.0012)
+    assert normalized["rows"][1]["notional_usd"] == pytest.approx(0.0012)
 
 
 def test_common_synthetic_validation_and_artifact_writing(
@@ -2589,3 +2592,194 @@ def test_delete_workspace_when_idle_retries_busy_409_but_not_published_409() -> 
     stuck.delete.return_value = busy
     assert delete_workspace_when_idle(stuck, "ws-3", timeout_s=0.0, poll_s=0.0) == 409
     assert stuck.delete.call_count == 1
+
+
+def test_journal_dump_replayed_row_with_last_replayed_at_in_window() -> None:
+    since_dt = parse_iso_utc("2026-10-21T10:00:00Z")
+    raw_rows = [
+        {
+            "invocation_id": "inv-replayed-in-window",
+            "user_id": "realrun-pm-a",
+            "scope_ref": "assist:realrun-pm-a:audit.label_figures:abc",
+            "purpose": "assist.audit.label_figures",
+            "model_key": "gemini-3.8-flash-low-oauth",
+            "provider": "antigravity-oauth",
+            "billing_type": "cash",
+            "state": "done",
+            "attempt": 1,
+            "usage": {
+                "input_tokens": 500,
+                "output_tokens": 120,
+                "replay_count": 2,
+                "last_replayed_at": "2026-10-21T10:02:15.123456Z",
+            },
+            "cash_usd": Decimal("0.045000"),
+            "notional_usd": Decimal("0.045000"),
+            "error_kind": None,
+            "claimed_at": datetime(2026, 10, 20, 8, 0, 0, tzinfo=timezone.utc),
+            "completed_at": datetime(2026, 10, 20, 8, 0, 2, tzinfo=timezone.utc),
+            "created_at": datetime(2026, 10, 20, 8, 0, 0, tzinfo=timezone.utc),
+        }
+    ]
+    normalized = normalize_journal_rows(raw_rows, since_dt=since_dt)
+    assert len(normalized["rows"]) == 1
+    assert normalized["rows"][0]["replayed"] is True
+    assert normalized["rows"][0]["cached"] is True
+    assert normalized["rows"][0]["replayed_from_before_window"] is True
+    assert normalized["rows"][0]["cash_usd"] == pytest.approx(0.045)
+    assert normalized["rows"][0]["notional_usd"] == pytest.approx(0.045)
+    assert normalized["rows"][0]["usage"]["last_replayed_at"] == "2026-10-21T10:02:15.123456Z"
+    assert normalized["totals"]["replayed_calls"] == 1
+    assert normalized["totals"]["fresh_calls"] == 0
+    assert normalized["totals"]["cash_usd"] == pytest.approx(0.0)
+    assert normalized["totals"]["notional_usd"] == pytest.approx(0.0)
+    assert normalized["totals"]["by_purpose"]["assist.audit.label_figures"]["cash_usd"] == pytest.approx(0.0)
+    assert normalized["totals"]["by_purpose"]["assist.audit.label_figures"]["notional_usd"] == pytest.approx(0.0)
+    assert normalized["totals"]["by_model"]["gemini-3.8-flash-low-oauth"]["cash_usd"] == pytest.approx(0.0)
+    assert normalized["totals"]["by_model"]["gemini-3.8-flash-low-oauth"]["notional_usd"] == pytest.approx(0.0)
+
+
+def test_g3_make_unique_alpha_tag_and_cache_window_counts() -> None:
+    from scripts.dalton.realrun import g3_publish
+
+    tags = [g3_publish._make_unique_alpha_tag() for _ in range(20)]
+    for t in tags:
+        assert len(t) == 8
+        assert t.isalpha() and t.islower()
+        assert not any(ch.isdigit() for ch in t)
+    assert len(set(tags)) == len(tags)
+
+    since_dt = parse_iso_utc("2026-10-21T10:00:00.000000Z")
+    # 1. Row created in run (Step 1, 10:01:00Z, outside Step 6 window), replay_count=3,
+    #    last_replayed_at inside Step 6 window [10:05:00.000000Z, 10:05:20.000000Z] -> fresh=0, replayed=1
+    normalized_step1_replayed = normalize_journal_rows(
+        [
+            {
+                "invocation_id": "inv-created-in-step1-replayed-3x",
+                "user_id": "realrun-pm-a",
+                "scope_ref": "assist:realrun-pm-a:audit.label_figures:sec2",
+                "purpose": "assist.audit.label_figures",
+                "model_key": "gemini-3.8-flash-low-oauth",
+                "provider": "antigravity-oauth",
+                "billing_type": "subscription",
+                "state": "done",
+                "attempt": 1,
+                "usage": {
+                    "input_tokens": 500,
+                    "output_tokens": 100,
+                    "replay_count": 3,
+                    "last_replayed_at": "2026-10-21T10:05:10.500000Z",
+                },
+                "cash_usd": Decimal("0"),
+                "notional_usd": Decimal("0.001"),
+                "created_at": datetime(2026, 10, 21, 10, 1, 0, tzinfo=timezone.utc),
+            }
+        ],
+        since_dt=since_dt,
+    )
+    assert len(normalized_step1_replayed["rows"]) == 4  # 1 fresh + 3 expanded replay items
+    assert g3_publish._count_window_fresh_and_replayed(
+        normalized_step1_replayed["rows"],
+        "2026-10-21T10:05:00.000000Z",
+        "2026-10-21T10:05:20.000000Z",
+    ) == (0, 1)
+
+    # 2. Row with last_replayed_at outside Step 6 window -> (0, 0)
+    # 3. publish.review row inside Step 6 window -> excluded from audit counts -> (0, 0)
+    normalized_outside_and_review = normalize_journal_rows(
+        [
+            {
+                "invocation_id": "inv-replayed-outside-step6",
+                "user_id": "realrun-pm-a",
+                "scope_ref": "assist:realrun-pm-a:audit.judge:sec3",
+                "purpose": "assist.audit.judge",
+                "model_key": "gemini-3.8-flash-low-oauth",
+                "provider": "antigravity-oauth",
+                "billing_type": "subscription",
+                "state": "done",
+                "attempt": 1,
+                "usage": {
+                    "input_tokens": 300,
+                    "output_tokens": 80,
+                    "replay_count": 1,
+                    "last_replayed_at": "2026-10-21T10:03:00.000000Z",
+                },
+                "cash_usd": Decimal("0"),
+                "notional_usd": Decimal("0.001"),
+                "created_at": datetime(2026, 10, 20, 8, 0, 0, tzinfo=timezone.utc),
+            },
+            {
+                "invocation_id": "inv-publish-review-in-step6",
+                "user_id": "realrun-pm-a",
+                "scope_ref": "review:googl-v2",
+                "purpose": "publish.review",
+                "model_key": "claude-sonnet-5-5-low-oauth",
+                "provider": "anthropic-oauth",
+                "billing_type": "subscription",
+                "state": "done",
+                "attempt": 1,
+                "usage": {
+                    "input_tokens": 1000,
+                    "output_tokens": 200,
+                    "replay_count": 1,
+                    "last_replayed_at": "2026-10-21T10:05:15.000000Z",
+                },
+                "cash_usd": Decimal("0"),
+                "notional_usd": Decimal("0.01"),
+                "created_at": datetime(2026, 10, 21, 10, 5, 14, tzinfo=timezone.utc),
+            },
+        ],
+        since_dt=since_dt,
+    )
+    assert g3_publish._count_window_fresh_and_replayed(
+        normalized_outside_and_review["rows"],
+        "2026-10-21T10:05:00.000000Z",
+        "2026-10-21T10:05:20.000000Z",
+    ) == (0, 0)
+
+    # Combined: 1 prior-replayed in Step 6 + 1 fresh audit.judge in Step 6 -> (1, 1)
+    normalized_combined = normalize_journal_rows(
+        [
+            {
+                "invocation_id": "inv-prior-replayed-in-step6",
+                "user_id": "realrun-pm-a",
+                "scope_ref": "assist:realrun-pm-a:audit.label_figures:sec2",
+                "purpose": "assist.audit.label_figures",
+                "model_key": "gemini-3.8-flash-low-oauth",
+                "provider": "antigravity-oauth",
+                "billing_type": "subscription",
+                "state": "done",
+                "attempt": 1,
+                "usage": {
+                    "input_tokens": 500,
+                    "output_tokens": 100,
+                    "replay_count": 3,
+                    "last_replayed_at": "2026-10-21T10:05:10.500000Z",
+                },
+                "cash_usd": Decimal("0"),
+                "notional_usd": Decimal("0.001"),
+                "created_at": datetime(2026, 10, 20, 8, 0, 0, tzinfo=timezone.utc),
+            },
+            {
+                "invocation_id": "inv-fresh-in-step6",
+                "user_id": "realrun-pm-a",
+                "scope_ref": "assist:realrun-pm-a:audit.judge:sec1-v2",
+                "purpose": "assist.audit.judge",
+                "model_key": "gemini-3.8-flash-low-oauth",
+                "provider": "antigravity-oauth",
+                "billing_type": "subscription",
+                "state": "done",
+                "attempt": 1,
+                "usage": {"input_tokens": 510, "output_tokens": 105},
+                "cash_usd": Decimal("0"),
+                "notional_usd": Decimal("0.001"),
+                "created_at": datetime(2026, 10, 21, 10, 5, 12, 250000, tzinfo=timezone.utc),
+            },
+        ],
+        since_dt=since_dt,
+    )
+    assert g3_publish._count_window_fresh_and_replayed(
+        normalized_combined["rows"],
+        "2026-10-21T10:05:00.000000Z",
+        "2026-10-21T10:05:20.000000Z",
+    ) == (1, 1)

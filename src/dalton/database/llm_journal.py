@@ -363,14 +363,15 @@ mark_journal_done = complete_journal_done
 
 
 async def record_journal_replay(invocation_id: str, *, conn: Any = None) -> None:
-    """Increment `usage.replay_count` when a completed journal row is served from cache."""
+    """Increment `usage.replay_count` and stamp `usage.last_replayed_at` (ISO 8601 UTC) when served from cache."""
     async def _do_inc(c: Any) -> None:
         async with c.cursor() as cur:
             await cur.execute(
                 """
                 UPDATE dalton_llm_journal
                 SET usage = COALESCE(usage, '{}'::jsonb) || jsonb_build_object(
-                    'replay_count', COALESCE((usage->>'replay_count')::int, 0) + 1
+                    'replay_count', COALESCE((usage->>'replay_count')::int, 0) + 1,
+                    'last_replayed_at', to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')
                 )
                 WHERE invocation_id = %s AND state = 'done'
                 """,
