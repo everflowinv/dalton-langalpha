@@ -33,6 +33,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import time
 from typing import Any
 import uuid
 from zoneinfo import ZoneInfo
@@ -76,6 +77,30 @@ VALID_REALRUN_SCRIPTS = frozenset(
 def resolve_local_dev_user_id() -> str:
     """Resolve `LOCAL_DEV_USER_ID` following `src/config/env.py` (`os.getenv('AUTH_USER_ID', 'local-dev-user')`)."""
     return (os.getenv("AUTH_USER_ID") or "").strip() or "local-dev-user"
+
+
+_PUBLISHED_WORKSPACE_DELETE_DETAIL = "已发布研报"
+
+
+def delete_workspace_when_idle(
+    client: RealRunHttpClient,
+    workspace_id: str,
+    *,
+    timeout_s: float = 180.0,
+    poll_s: float = 5.0,
+) -> int:
+    """DELETE a workspace this run created, waiting out runs still finishing in it; return the last status.
+
+    A turn that dispatched background subagents gets a follow-up turn when they report back, so right after the
+    script's last request the workspace can still be busy (409 from upstream `WorkspaceBusyError`). The 409 for a
+    workspace holding published reports is permanent and is returned at once.
+    """
+    deadline = time.monotonic() + timeout_s
+    while True:
+        status, body = client.delete(f"/api/v1/workspaces/{workspace_id}")
+        if status != 409 or _PUBLISHED_WORKSPACE_DELETE_DETAIL in str(body) or time.monotonic() >= deadline:
+            return status
+        time.sleep(poll_s)
 
 
 def resolve_deepseek_key() -> str:

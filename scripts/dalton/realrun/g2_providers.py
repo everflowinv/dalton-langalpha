@@ -39,6 +39,7 @@ from scripts.dalton.realrun._common import (  # noqa: E402
     build_evidence_envelope,
     build_realrun_workspace_config,
     default_shanghai_date,
+    delete_workspace_when_idle,
     ensure_temporary_deepseek_byok,
     load_repo_dotenv,
     now_utc_iso,
@@ -572,7 +573,7 @@ def main() -> int:
                         cleanup_errors.append(f"delete_auto_pm_exception:{type(exc).__name__}")
                 if sample_ws_id:
                     try:
-                        st_del_ws_pm, _ = cleanup_pm.delete(f"/api/v1/workspaces/{sample_ws_id}")
+                        st_del_ws_pm = delete_workspace_when_idle(cleanup_pm, sample_ws_id)
                         if st_del_ws_pm not in (200, 204, 404):
                             cleanup_errors.append(f"delete_ws_pm:http_{st_del_ws_pm}")
                     except BaseException as exc:
@@ -625,7 +626,7 @@ def main() -> int:
             try:
                 if cleanup_b is not None:
                     try:
-                        st_del_ws_b, _ = cleanup_b.delete(f"/api/v1/workspaces/{user_b_ws_id}")
+                        st_del_ws_b = delete_workspace_when_idle(cleanup_b, user_b_ws_id)
                         if st_del_ws_b not in (200, 204, 404):
                             cleanup_errors.append(f"delete_ws_b:http_{st_del_ws_b}")
                     except BaseException as exc:

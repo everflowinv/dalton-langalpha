@@ -48,6 +48,7 @@ from scripts.dalton.realrun._common import (  # noqa: E402
     build_evidence_envelope,
     build_realrun_workspace_config,
     default_shanghai_date,
+    delete_workspace_when_idle,
     ensure_temporary_deepseek_byok,
     load_repo_dotenv,
     now_utc_iso,
@@ -347,7 +348,7 @@ def _cleanup_g1_state(
             with RealRunHttpClient(base_url=backend_url, user_id=user_a, timeout_s=30.0) as cleanup_a:
                 if workspace_id:
                     try:
-                        st_del_a, _ = cleanup_a.delete(f"/api/v1/workspaces/{workspace_id}")
+                        st_del_a = delete_workspace_when_idle(cleanup_a, workspace_id)
                         if st_del_a not in (200, 204, 404):
                             errors["ws_a_err"] = f"workspace_a_delete_http_{st_del_a}"
                     except Exception as exc:
@@ -389,7 +390,7 @@ def _cleanup_g1_state(
             with RealRunHttpClient(base_url=backend_url, user_id=user_b, timeout_s=30.0) as cleanup_b:
                 if ws_b_id:
                     try:
-                        st_del_b, _ = cleanup_b.delete(f"/api/v1/workspaces/{ws_b_id}")
+                        st_del_b = delete_workspace_when_idle(cleanup_b, ws_b_id)
                         if st_del_b not in (200, 204, 404):
                             errors["ws_b_err"] = f"workspace_b_delete_http_{st_del_b}"
                     except Exception as exc:
