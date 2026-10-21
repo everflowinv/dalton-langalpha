@@ -42,6 +42,11 @@ from dotenv import load_dotenv
 import httpx
 
 from scripts.dalton.realrun.journal_dump import dump_journal, format_iso_utc
+from src.server.database.home_workspace import (
+    HOME_WORKSPACE_NAMESPACE as HOME_WORKSPACE_NAMESPACE,
+    get_home_workspace_id as get_home_workspace_id,
+    is_home_id,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
@@ -59,7 +64,6 @@ KNOWN_MIGRATED_WORKSPACES: dict[str, str] = {
 
 REALRUN_WORKSPACE_MARKER_KEY = "realrun_ephemeral"
 REALRUN_WORKSPACE_SCRIPT_KEY = "realrun_script"
-HOME_WORKSPACE_NAMESPACE = uuid.UUID("f1a50000-0000-5000-e000-f1a500000000")
 VALID_REALRUN_SCRIPTS = frozenset(
     {
         "check_env.py",
@@ -175,10 +179,9 @@ def is_valid_realrun_workspace_row(
         return True, "config_realrun_ephemeral"
 
     # A user's Home row is created idempotently by POST /api/v1/workspaces/home with deterministic
-    # UUIDv5(HOME_WORKSPACE_NAMESPACE, user_id) and cannot be deleted via DELETE /api/v1/workspaces/{id}.
+    # get_home_workspace_id(user_id) and cannot be deleted via DELETE /api/v1/workspaces/{id}.
     if user_id.startswith("realrun-") and name == "Home":
-        expected_home_id = str(uuid.uuid5(HOME_WORKSPACE_NAMESPACE, user_id)).lower()
-        if ws_id == expected_home_id:
+        if is_home_id(user_id, ws_id):
             return True, "deterministic_user_home"
 
     return False, "unmarked_realrun_workspace"

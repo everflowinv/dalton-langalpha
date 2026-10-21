@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
+import uuid
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -330,3 +331,67 @@ def get_sec_user_agent() -> str:
 def get_openclaw_gateway_token() -> str:
     """Return ``OPENCLAW_GATEWAY_TOKEN`` (used only by P0.5 --target gateway control group)."""
     return os.getenv("OPENCLAW_GATEWAY_TOKEN", "").strip()
+
+
+def parse_home_workspace_aliases(raw: str | None) -> dict[str, str]:
+    """Parse ``DALTON_HOME_WORKSPACE_ALIASES`` (``user_id:workspace_id[,user_id:workspace_id]``).
+
+    Malformed entries are logged at WARNING and ignored without raising.
+    Valid workspace UUIDs are normalized to canonical lowercase strings.
+    """
+    if not raw or not raw.strip():
+        return {}
+    aliases: dict[str, str] = {}
+    for entry in raw.split(","):
+        item = entry.strip()
+        if not item:
+            continue
+        parts = item.split(":")
+        if len(parts) != 2:
+            logger.warning(
+                "Ignoring malformed DALTON_HOME_WORKSPACE_ALIASES entry %r: expected 'user_id:workspace_id'",
+                item,
+            )
+            continue
+        uid, wid = parts[0].strip(), parts[1].strip()
+        if not uid or not wid:
+            logger.warning(
+                "Ignoring malformed DALTON_HOME_WORKSPACE_ALIASES entry %r: empty user_id or workspace_id",
+                item,
+            )
+            continue
+        try:
+            normalized_wid = str(uuid.UUID(wid))
+        except ValueError:
+            logger.warning(
+                "Ignoring malformed DALTON_HOME_WORKSPACE_ALIASES entry %r: invalid workspace_id UUID %r",
+                item,
+                wid,
+            )
+            continue
+        aliases[uid] = normalized_wid
+    return aliases
+
+
+@lru_cache(maxsize=8)
+def _cached_home_workspace_aliases(raw: str) -> dict[str, str]:
+    return parse_home_workspace_aliases(raw)
+
+
+def get_home_workspace_aliases() -> dict[str, str]:
+    """Return cached ``{user_id: workspace_id}`` map from ``DALTON_HOME_WORKSPACE_ALIASES``."""
+    raw = os.getenv("DALTON_HOME_WORKSPACE_ALIASES", "")
+    return _cached_home_workspace_aliases(raw)
+
+
+get_home_workspace_aliases.cache_clear = _cached_home_workspace_aliases.cache_clear  # type: ignore[attr-defined]
+
+
+def get_home_workspace_alias(user_id: str) -> str | None:
+    """Return the aliased Home ``workspace_id`` for ``user_id`` if configured, else ``None``."""
+    if not user_id:
+        return None
+    return get_home_workspace_aliases().get(user_id)
+
+
+HOME_WORKSPACE_ALIASES: dict[str, str] = get_home_workspace_aliases()
