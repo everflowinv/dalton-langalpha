@@ -274,6 +274,11 @@ def _capture_rejection_banner_screenshot(
                 page.keyboard.press("Escape")
                 page.wait_for_timeout(500)
             assert not (dialog.count() and dialog.first.is_visible()), "Onboarding dialog still covers the chat page"
+            # The non-modal "快速上手" checklist floats over the message column and hides the banner's text.
+            hide_guide = page.get_by_role("button", name="隐藏引导")
+            if hide_guide.count() and hide_guide.first.is_visible():
+                hide_guide.first.click()
+                page.wait_for_timeout(500)
             textarea.fill("继续下一轮分析（日现金额度耗尽验证）")
             textarea.press("Enter")
 
