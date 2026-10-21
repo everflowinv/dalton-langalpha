@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import dataclasses
 import json
-import re
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -474,7 +473,7 @@ def _check_soft_warnings(
             warnings.append(
                 {
                     "code": "lesson_deleted",
-                    "path": f"/lessons/{deleted_ids if False else deleted_id}",
+                    "path": f"/lessons/{deleted_id}",
                     "message": f"lesson {deleted_id} was deleted; prefer op='retract' instead",
                 }
             )

@@ -4,7 +4,9 @@
 Listens on `127.0.0.1:8960` (configurable via `DALTON_BRIDGE_HOST` / `DALTON_BRIDGE_PORT`).
 Endpoints:
   - `GET /healthz` (unauthenticated health & quota check)
-  - `POST /mcp/<token>` (Streamable HTTP JSON-RPC 2.0 endpoint)
+  - `POST /mcp` (Streamable HTTP JSON-RPC 2.0 endpoint; authenticated via
+    `Authorization: Bearer <token>` or `X-Dalton-Bridge-Token` header; legacy
+    `POST /mcp/<token>` path remains accepted during transition)
 
 Pure Python 3.11+ standard library only.
 """
@@ -20,7 +22,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 # Ensure sibling `source_identity.py` is importable regardless of cwd
 _SCRIPT_DIR = Path(__file__).resolve().parent
@@ -1505,6 +1507,18 @@ async def _send_http(
         pass
 
 
+def _extract_supplied_token(headers: Mapping[str, str]) -> str:
+    """Extract bridge authentication token from `Authorization: Bearer <token>` or `X-Dalton-Bridge-Token`."""
+    lowered = {k.lower(): v for k, v in headers.items()}
+    auth_header = lowered.get("authorization", "").strip()
+    if auth_header.lower().startswith("bearer "):
+        return auth_header[7:].strip()
+    bridge_header = lowered.get("x-dalton-bridge-token", "").strip()
+    if bridge_header:
+        return bridge_header
+    return ""
+
+
 async def _handle_client(
     bridge: ResearchDataBridge,
     reader: asyncio.StreamReader,
@@ -1569,18 +1583,21 @@ async def _handle_client(
             await _send_http(writer, 200, "OK", health_payload)
             return
 
-        # Route 2: /mcp/<token>
-        if not path.startswith("/mcp/"):
+        # Route 2: /mcp (header token) or legacy /mcp/<token> (path token, deprecated)
+        if path in ("/mcp", "/mcp/"):
+            supplied_token = _extract_supplied_token(headers)
+        elif path.startswith("/mcp/"):
+            supplied_token = path[len("/mcp/") :].strip("/") or _extract_supplied_token(headers)
+        else:
             await _send_http(writer, 404, "Not Found", {"error": "Not Found"})
             return
 
-        supplied_token = path[len("/mcp/") :].strip("/")
         expected_token = bridge.cfg.token
         if not expected_token or not supplied_token or not hmac.compare_digest(
             supplied_token.encode("utf-8"), expected_token.encode("utf-8")
         ):
             # Constant-time rejection; NEVER log supplied_token or path
-            await _send_http(writer, 404, "Not Found", {"error": "Not Found"})
+            await _send_http(writer, 401, "Unauthorized", {"error": "Unauthorized"})
             return
 
         if method in ("GET", "DELETE"):
@@ -1726,6 +1743,9 @@ async def main() -> None:
         lambda r, w: _handle_client(bridge, r, w),
         host=cfg.host,
         port=cfg.port,
+    )
+    logger.warning(
+        "路径令牌已弃用 (POST /mcp/<token> is deprecated; use POST /mcp with Authorization: Bearer <token> or X-Dalton-Bridge-Token)"
     )
     logger.info(
         "Listening on http://%s:%d (server_version=%s, max_inflight=%d, caller_budget_s=%d)",
