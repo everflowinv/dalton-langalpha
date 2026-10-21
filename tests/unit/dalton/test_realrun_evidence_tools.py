@@ -2347,5 +2347,176 @@ def test_r2_round2_cleanup_autospec_d5_d6_d7(monkeypatch: pytest.MonkeyPatch) ->
     cleanup_probe_sse.delete.assert_called_once_with("/api/v1/workspaces/ws-probe-sse")
 
 
+def test_g5_2_record_mode_uses_record_false_client_for_callback_exchange_and_record_true_preflight_after(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import create_autospec
 
+    import httpx
+
+    from scripts.dalton.realrun import (
+        _common,
+        check_env as _check_env_mod,
+        g5_broker_and_antigravity,
+    )
+
+    monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", "test-service-token-value")
+
+    client_record_args: list[tuple[str, bool | None]] = []
+    preflight_record_args: list[tuple[str | None, bool | None]] = []
+
+    def _make_g5_autospec_client(
+        base_url: str = "http://127.0.0.1:8000",
+        *,
+        user_id: str,
+        timeout_s: float = 120.0,
+        extra_headers: dict[str, str] | None = None,
+        record: bool | None = None,
+    ) -> _common.RealRunHttpClient:
+        client_record_args.append((user_id, record))
+        inst = create_autospec(_common.RealRunHttpClient, instance=True)
+        inst.__enter__.return_value = inst
+        inst.__exit__.return_value = None
+        inst.get.return_value = (200, {"deployment": "docker"})
+
+        def _post(
+            path: str,
+            *,
+            json_body: object = None,
+            headers: dict[str, str] | None = None,
+        ) -> tuple[int, dict[str, object]]:
+            if path == "/api/v1/oauth/antigravity/initiate":
+                return (
+                    200,
+                    {
+                        "authorize_url": "https://accounts.google.com/o/oauth2/v2/auth?state=s1234567890",
+                        "port": 51121,
+                    },
+                )
+            if path == "/api/v1/oauth/antigravity/poll":
+                return 200, {"pending": True}
+            if path == "/api/v1/oauth/antigravity/callback":
+                cb_in = str((json_body or {}).get("callback_input", "")) if isinstance(json_body, dict) else ""
+                if "state=s1" in cb_in:
+                    return 200, {"success": True, "connected": True, "email": "u@example.com"}
+                return 400, {"detail": "invalid state"}
+            raise AssertionError(f"Unexpected POST path: {path}")
+
+        inst.post.side_effect = _post
+        return inst
+
+    mock_client_cls = create_autospec(_common.RealRunHttpClient, side_effect=_make_g5_autospec_client)
+    mock_httpx_get = create_autospec(
+        httpx.get,
+        side_effect=httpx.ConnectError("Connection refused"),
+    )
+    mock_dotenv = create_autospec(g5_broker_and_antigravity.load_repo_dotenv, return_value=False)
+    mock_pre_gate = create_autospec(
+        g5_broker_and_antigravity._assert_pre_callback_git_and_backend_gate,
+        return_value={"deployment": "docker"},
+    )
+    mock_post_checks = create_autospec(
+        _check_env_mod.run_all_checks,
+        return_value={"all_passed": True, "checks": {}},
+    )
+
+    def _rec_preflight(
+        family: str | None = None,
+        *,
+        record: bool | None = None,
+        base_url: str = "http://127.0.0.1:8000",
+        backend: str | None = None,
+        user_id: str = "realrun-pm-a",
+    ) -> dict[str, object]:
+        preflight_record_args.append((family, record))
+        return {"deployment": "docker"}
+
+    mock_preflight = create_autospec(
+        g5_broker_and_antigravity.preflight_realrun_script,
+        side_effect=_rec_preflight,
+    )
+    mock_run_g5_2 = create_autospec(
+        g5_broker_and_antigravity._run_g5_2_antigravity,
+        return_value=(
+            {
+                "deployment": "docker",
+                "oauth_status_and_isolation": {
+                    "user_a": {"status_body": {"connected": True}},
+                    "user_b_isolation": {"status_body": {"connected": False}},
+                },
+                "gemini_4_round_tool_calling": {
+                    "tool_calls_count": 4,
+                    "tool_call_results_count": 4,
+                    "gemini_model_invocations_count": 5,
+                },
+                "docker_callback_paste_flow": {
+                    "callback_missing_state": {"http_status": 400},
+                    "callback_wrong_state": {"http_status": 400},
+                    "callback_real_paste_exchange": {"http_status": 200},
+                },
+            },
+            [{"passed": True}],
+        ),
+    )
+    mock_build_env = create_autospec(
+        g5_broker_and_antigravity.build_evidence_envelope,
+        return_value={"deployment": "docker", "assertions": [{"passed": True}]},
+    )
+    mock_write_ev = create_autospec(
+        g5_broker_and_antigravity.write_evidence_and_summary,
+        return_value=(Path("/tmp/g5.json"), Path("/tmp/G5.md"), "abc123"),
+    )
+    mock_sleep = create_autospec(g5_broker_and_antigravity.time.sleep, return_value=None)
+
+    monkeypatch.setattr(g5_broker_and_antigravity, "RealRunHttpClient", mock_client_cls)
+    monkeypatch.setattr(g5_broker_and_antigravity.httpx, "get", mock_httpx_get)
+    monkeypatch.setattr(g5_broker_and_antigravity, "load_repo_dotenv", mock_dotenv)
+    monkeypatch.setattr(
+        g5_broker_and_antigravity,
+        "_assert_pre_callback_git_and_backend_gate",
+        mock_pre_gate,
+    )
+    monkeypatch.setattr(g5_broker_and_antigravity, "run_all_checks", mock_post_checks)
+    monkeypatch.setattr(
+        g5_broker_and_antigravity,
+        "preflight_realrun_script",
+        mock_preflight,
+    )
+    monkeypatch.setattr(
+        g5_broker_and_antigravity,
+        "_run_g5_2_antigravity",
+        mock_run_g5_2,
+    )
+    monkeypatch.setattr(
+        g5_broker_and_antigravity,
+        "build_evidence_envelope",
+        mock_build_env,
+    )
+    monkeypatch.setattr(
+        g5_broker_and_antigravity,
+        "write_evidence_and_summary",
+        mock_write_ev,
+    )
+    monkeypatch.setattr(g5_broker_and_antigravity.time, "sleep", mock_sleep)
+
+    # Pre-exchange _initiate_g5_2_for_user always creates its client with record=False
+    g5_broker_and_antigravity._initiate_g5_2_for_user(
+        "http://127.0.0.1:8000", "realrun-pm-a", record=True
+    )
+    assert client_record_args == [("realrun-pm-a", False)]
+    client_record_args.clear()
+
+    rc = g5_broker_and_antigravity.main(
+        [
+            "--mode",
+            "g5.2",
+            "--record",
+            "--callback-url",
+            "http://localhost:51121/oauth-callback?code=c1&state=s1",
+        ]
+    )
+    assert rc == 0
+    # Callback exchange client is created with record=False, while post-exchange preflight runs with record=True
+    assert client_record_args == [("realrun-pm-a", False)]
+    assert preflight_record_args == [("G5", True)]
 
