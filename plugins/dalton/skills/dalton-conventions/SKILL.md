@@ -1,11 +1,11 @@
 ---
 name: dalton-conventions
-description: "Fund methodology for Dalton (fundamental long-biased hedge fund): research questions by coverage stage, source hierarchy and identity, expert-call compliance, model period standards, risk/reward standards, five-word event verdicts, Chinese delivery. Read before any Dalton deliverable or knowledge-file write."
+description: "Dalton 基金投研方法论总纲：规定覆盖阶段问题、六级来源层级与去重、专家合规、模型期间、风险收益、五词结论与中文规范。产出 Dalton 交付物、模型或改知识层前必读，也适用于聊天中解释涨跌、事件或分歧；纯规范读取，轻量快速。"
 ---
 
 # Dalton 基金方法论
 
-本文件是 Dalton 基金投研方法论总纲。所有 Dalton 研究交付物、财务模型、事件点评与公司知识层写入前，必须先读本文件，并按任务加载 `references/` 下的对应细则。通用底座请同时遵循 `.agents/skills/research-conventions/SKILL.md`。
+本文件是 Dalton 基金投研方法论总纲。所有 Dalton 研究交付物、财务模型、事件点评与公司知识层写入前（以及聊天中解释涨跌、事件或分歧的回答），必须先读本文件，并按任务加载 `references/` 下的对应细则。通用底座请同时遵循 `.agents/skills/research-conventions/SKILL.md`。
 
 ## 1. 角色与边界
 
@@ -36,6 +36,7 @@ Dalton 继承 `.agents/skills/research-conventions/SKILL.md` 的通用投研纪�
 6. **先量化异动，再找原因**：股价波动先用同组公司（peers）和板块 ETF 分清是板块 beta 还是个股 alpha，再按层级排查原因。
 7. **只写重要变化**：日常跟踪无实质变化就不推送；成稿坚持判断先行，中文交付并保留英文专业术语。
 8. **诚实汇报边界**：拿不到的数据写"本轮未取得"（不等于"公司未披露"）；没有把握时说明缺什么证据，不用相近口径顶替。
+9. **解释类回答的多源印证**：解释类回答的可信度来自不同类型来源的相互印证：事实来源加至少一类解读来源（卖方、专家或管理层原话）；只拿到一类时，在回答里写明缺哪一类；不用一条卖方观点代表市场共识。
 
 ## 4. 按任务找参考
 
@@ -64,7 +65,7 @@ Dalton 继承 `.agents/skills/research-conventions/SKILL.md` 的通用投研纪�
 
 ## 6. 数据入口速查
 
-- **内部研究与另类数据（`researchdata`）**：`research` 工具支持 `company-wiki`（基金只读 wiki）、`all`（wiki + sales-notes + tmtb + funda-ai RRF 联搜）、`alphaengine`（卖方研报与纪要）、`guidepoint`（专家库）、`transcript`（业绩会/电话会）、`sales-notes`、`tmtb`、`funda-ai`；`finance` 工具支持 `sec`、`estimates`、`cn-hk`；`macro` 工具支持 `fred`、`treasury`。
+- **内部研究与另类数据（`researchdata`）**：各来源提供的证据与 `research` 路由选用规则，统一以 `<mcp-servers>` 中 `researchdata` 的说明与 `.agents/tools/docs/researchdata/research.md`（由 `scripts/dalton/researchdata_bridge.py` 的 `RESEARCH_EVIDENCE_AND_ROUTE_GUIDE` 单一来源生成，并在运行期结合 `catalog()`）为准；此外，`finance` 工具支持 `sec`、`estimates`、`cn-hk`，`macro` 工具支持 `fred`、`treasury`。
 - **一手 SEC 财报与核验（`dalton_sec`）**：`get_company_facts`（提取 R1–R10 规范期间与衍生单季值）、`list_filings`（按 accession 列举申报文件并配合脚本核验）。
 - **行情与历史估值（默认 `yfinance`）**：股价、复权收益率与相对表现默认使用 `yf_price`（配合 `.agents/skills/research-conventions/references/market-data-rules.md` 统一基准日）；历史估值倍数使用 `fundamentals.get_historical_valuation` 或 `yf_fundamentals`。
 - **卖方一致预期（`estimates`）**：调用 `researchdata.finance(route="estimates", ticker=T)`，一律标为 `street_estimate`（写明 `"Yahoo Finance via yfinance"`、`fetched_at`、期间键与分析师人数）。Yahoo 无历史 as-of，每次取数必须保存快照到工作区 `data/consensus/<YYYY-MM-DD_HHMM>.json`（附 `_meta{route, fetched_at, source}`）；其中的 `implied_model` 是模型推导（税率默认取最近一季），必须标为 `model-derived`。

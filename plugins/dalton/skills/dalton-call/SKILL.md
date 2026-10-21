@@ -1,6 +1,6 @@
 ---
 name: dalton-call
-description: "生成高确信度投资建议（Conviction Call）：先做 6 条证据门禁硬检（不满足则诚实输出“暂无高 conviction”而绝不硬凑），通过门禁后完成预期差三问、2–5 条可证伪主张、三档情景与 scenario_irr.py 概率加权 IRR 计算、仓位级别（Core/Tactical/Small）、对冲方案及退出与监控条件，经 PM 审批后更新知识层。触发词：conviction call、推荐报告、高确信度建议、买入建议、做空建议、/call、/dalton-call。"
+description: "经六条证据门禁硬检后产出高确信度投资建议：含驱动级预期差三问、可证伪主张、三情景概率加权 IRR、仓位与对冲及退出条件（未达门禁则诚实输出暂无高 conviction）。用户需要将研究转化为建仓/加仓/做空建议时使用；几分钟内可完成。"
 ---
 
 # 高确信度投资建议（Conviction Call）

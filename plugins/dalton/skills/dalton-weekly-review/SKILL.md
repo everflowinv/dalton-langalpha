@@ -1,6 +1,6 @@
 ---
 name: dalton-weekly-review
-description: "启动每周覆盖周会（weekly-coverage-review workflow）：在 Home 对全覆盖名单做同组异动筛选（screen_movers.py）与 EPS 修正 vs 估值倍数归因（attribution.py），Core 逐家并行五源深挖，Watch 仅对命中公司定向检索，汇总一周 verdicts.md 观点变化并给出至少一条 conviction call 或“暂无高 conviction”，知识层修改以提案经 delegate_to_analyst 交办。触发词：周会、覆盖周报、weekly review、/weekly-review。"
+description: "在 Home 对全覆盖名单做周度异动筛选及盈利修正与估值归因，对核心覆盖逐家五源深挖、观察名单按命中定向检索，汇总一周观点变化与投资建议。用于每周复盘全组合覆盖标的的边际变化与投资机会；属于跨公司多支线深度工作流，耗时较长。"
 ---
 
 # Dalton 覆盖周报与周会启动器（`dalton-weekly-review`）

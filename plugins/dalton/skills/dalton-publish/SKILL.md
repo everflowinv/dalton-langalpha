@@ -1,6 +1,6 @@
 ---
 name: dalton-publish
-description: "Draft verification (check_draft) and formal publication governance (publish_report): footnote conventions, facts ledger, independent cross-family review, and PM approval."
+description: "执行研究草稿的数字与来源脚注核验（check_draft）及正式发布流程（publish_report：数字核验、跨模型家族独立审稿、PM 审批与不可变归档）。研究成稿准备自检或提交正式发布时使用；视审稿轮次需数分钟。"
 ---
 
 # Dalton 发布治理与数字核验（Publication Governance）

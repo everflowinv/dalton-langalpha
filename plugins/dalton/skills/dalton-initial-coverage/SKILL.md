@@ -1,6 +1,6 @@
 ---
 name: dalton-initial-coverage
-description: "买方初次覆盖（Initial Coverage / 12问初筛）：启动 initial-coverage workflow 并行执行公司背景、行业与竞争、三把财务镜头、估值历史与可比四条支线，汇总多空快速版与12问初筛报告，并初始化公司知识层（company/thesis/debate/drivers/management/agenda 与 NEW_THESIS 结论）。触发词：/initial-coverage、初次覆盖、首次覆盖、初筛报告、initial coverage。"
+description: "并行执行公司背景、行业竞争、三把财务镜头与估值历史四条支线，产出一份买方 12 问初筛报告并建立公司初始知识层。将新标的纳入覆盖、需要在深入建模前全面评估商业质量与多空焦点时使用；属于多支线并行深度研究，耗时较长。"
 ---
 
 # Dalton 买方初次覆盖（`dalton-initial-coverage`）

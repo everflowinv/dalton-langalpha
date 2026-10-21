@@ -1842,6 +1842,9 @@ async def get_run_charge_usd(run_ref: str) -> Decimal | None
 | mcp-call-timeout | `src/ptc_agent/core/sandbox/mcp_client_runtime.py` | `_ServerCfg`、`_normalize`、`tools/call` 的预算取值 | 约 6 |
 | mcp-call-timeout | `src/ptc_agent/core/sandbox/tool_overlay.py` | `executable_keys` 加 `call_timeout_s` | 1 |
 | skills-registry | `src/ptc_agent/agent/middleware/skills/registry.py` | 文件末尾合并 `DALTON_SKILL_DEFINITIONS` | 2–3 |
+| skills-manifest-lead | `src/ptc_agent/agent/middleware/skills/middleware.py` | `SkillsMiddleware.build_manifest` 引导语（动手前先读匹配流程，闲聊与单源查询除外） | 约 6 |
+| cos-research-depth | `src/ptc_agent/agent/prompts/templates/components/chief_of_staff.md.j2` | `What you do, and what you hand off` 与 `Examples` 区分查数与解释、允许一次简短 `ExecuteCode` 查研究库、借用分析流程方法 | 约 4 |
+| tool-guide-research | `src/ptc_agent/agent/prompts/templates/components/tool_guide.md.j2` | `Routing` 增加解释类问题调用 `<mcp-servers>` 研究服务并与网页搜索并用 | 2 |
 | provenance-declared | `src/ptc_agent/agent/middleware/provenance/middleware.py` | `_extract_execute_code`、`_extract_direct_mcp` 产出 `mcp_tool` 后展开 `_sources` | 约 4 |
 | provenance-type | `web/src/types/sse.ts`、`web/src/pages/ChatAgent/components/SourcesPanel.tsx` | `research_doc` 类型与渲染分派 | 约 3 |
 | web-search-openclaw | `src/tools/web/manifest.py`、`src/tools/web/search.py` | `get_web_providers` 调用 `register_openclaw_web_provider`、`_PROVIDER_BUILDERS` 注册 `openclaw` | 约 8 |

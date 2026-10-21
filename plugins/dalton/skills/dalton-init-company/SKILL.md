@@ -1,6 +1,6 @@
 ---
 name: dalton-init-company
-description: "Initialize or upgrade a Dalton company coverage workspace skeleton (agent.md with managed summary block, directory structure, READMEs, and idempotent .dalton/init.json manifest) without overwriting analyst-modified files."
+description: "初始化或升级覆盖公司的标准工作区目录骨架（含带托管摘要块的 agent.md、各目录说明及幂等清单），不覆盖分析师已改文件。新建覆盖公司工作区或补齐缺失目录结构时使用；运行本地脚本即可快速完成。"
 ---
 
 # Dalton 公司工作区骨架初始化（`dalton-init-company`）

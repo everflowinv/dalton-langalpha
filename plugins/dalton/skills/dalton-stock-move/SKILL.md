@@ -1,6 +1,6 @@
 ---
 name: dalton-stock-move
-description: "分析个股股价异动（涨跌归因）：先跑量化脚本对比同组中位数与板块 ETF（区分板块 beta 与个股 alpha、计算 60 日超额 z 值与 20 日量比），再按 filing → 新闻 → 卖方 → 社媒顺序找原因，给出对 thesis/debate 的含义与事件五词结论；支持价格触发自动运行（beta 无个股事件不推送）。触发词：股价异动、今天为什么跌、今天为什么涨、stock move、异动归因、/dalton-stock-move。"
+description: "解释某只股票一段时间内的大幅涨跌：先区分板块/大盘带动还是公司自身原因，再按公告、新闻、卖方、专家与社媒找证据，给出对投资逻辑的含义与五词结论。用户想知道股票为什么涨跌时使用；有现成数据时几分钟内可完成，不要求先有该公司的覆盖工作区。"
 ---
 
 # Dalton 股价异动归因（`dalton-stock-move`）
@@ -8,12 +8,14 @@ description: "分析个股股价异动（涨跌归因）：先跑量化脚本对
 Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the first deliverable.
 公司认知按 `.agents/skills/dalton-knowledge/SKILL.md` 的读序读（`agent.md` 托管块 → `thesis.md` → `debate.md` → 按需 `drivers.md`、`management.md`、`verdicts.md`、`agenda.md`）；收尾按 `.agents/skills/dalton-agenda/SKILL.md` 的三步。
 
+在聊天里回答“为什么涨跌”时，只借用本流程的证据来源与顺序（先分清板块还是个股，再看公告、新闻、卖方、专家与社媒），不跑量化脚本、不写研究文件和知识层，并说明可以交给分析员做完整归因；在公司工作区里做正式归因时才走完整流程。
+
 ## 目标与原则
 
-股价异动时，**先做量化分解（对比同组中位数与板块 ETF，分清是板块 beta、个股 alpha 还是两者兼有，以及放量程度），再按 filing → 新闻 → 卖方 → 社媒的固定顺序找原因**，最后给出归因判断、对本公司 thesis/debate 的含义与事件五词结论（遵循“价格变动先分解再当证据”原则）。
+股价异动时，**先做量化分解（对比同组中位数与板块 ETF，分清是板块 beta、个股 alpha 还是两者兼有，以及放量程度），再按 filing → 新闻 → 卖方与专家 → 社媒的固定顺序找原因**，最后给出归因判断、对本公司 thesis/debate 的含义与事件五词结论（遵循“价格变动先分解再当证据”原则）。
 
 - **硬性门槛**：第 1、2 步量化脚本必须成功且 `data_ok=true` 才能下结论；若最新日线未出或数据缺失，立即停止归因并写明原因，严禁凭训练记忆补全。
-- **全部定性线索带出处**：第 3–6 步每条 filing、新闻、卖方观点、社媒讨论必须带日期、链接或 `doc_id`，且核对发布时间在检索窗口内。
+- **全部定性线索带出处**：第 3–6 步每条 filing、新闻、卖方观点、专家访谈、社媒讨论必须带日期、链接或 `doc_id`，且核对发布时间在检索窗口内。
 - **价格触发自动任务的不打扰原则（Beta No-Push Rule）**：当由价格触发自动任务（`dalton-<t>-move-up.json` / `dalton-<t>-move-down.json`）唤醒，且量化判定为 `sector_beta`、同时第 3–6 步确认无个股层面事件时，只用 `knowledge_append_verdict` 写一条 `NO_CHANGE`（`progress="none"`），**不向 PM 推送通知**。
 
 ---
@@ -70,7 +72,7 @@ python3 .agents/skills/dalton-stock-move/scripts/move_quant.py analyze \
 - 逐条核对结果的实际发布日期是否在定性窗口内，剔除窗口外的旧闻。
 - 每条保留的新闻必须附上标题、来源媒体、发布日期、原始链接，并标明是**一手报道**（公司新闻稿、路透/彭博首发、监管原文）还是**二手转载**。
 
-### 第 5 步：卖方观点与内部研究库
+### 第 5 步：卖方观点、专家访谈与内部研究库
 
 通过 PTC（在沙箱代码中调用 `researchdata`）：
 1. **AlphaEngine 卖方研报与点评**：
@@ -88,7 +90,9 @@ python3 .agents/skills/dalton-stock-move/scripts/move_quant.py analyze \
    对解释本次异动最相关的研报调用 `get_document(params={"doc_id": ...})` 读取正文。
 2. **卖方销售邮件与 TMTB**：
    同一时间窗口检索 `research(route="sales-notes", ...)` 与 `research(route="tmtb", ...)`，提取买方持仓、whisper、资金流或大行 desk 点评。
-3. **身份与状态纪律**：
+3. **Guidepoint 专家访谈与一线反馈**：
+   同一时间窗口检索 `research(route="guidepoint", operation="search_library", query=f"{company_name} {ticker}", start=search_start, end=search_end, limit=10)`（或用 `route="all"` 一次联搜本地库、AlphaEngine 与 Guidepoint），核查供应链、渠道、客户或竞品的一线变化；引用时写访谈日期与专家身份（不写姓名），原文引用不超过 20 词，专家给出的经营数字标为“单一来源估计”。
+4. **身份与状态纪律**：
    - 列出机构、日期、作者、标题和 `doc_id`，提炼评级/目标价变化与核心论点。
    - **卖方观点必须明确写成“卖方说法”（如“据 Morgan Stanley（2026-10-16 [doc_id]）观点……”），绝不当作已验证事实。**
    - 严格区分并分别写明三种异常/空状态：`Desktop 未登录`、`工具调用失败`、`窗口内无新研报`，不得将未登录或报错混写为“无新研报”。

@@ -1,11 +1,14 @@
-"""Unit tests for `src/dalton/provenance/declared_sources.py` and `scripts/dalton/source_identity.py`."""
+"""Unit tests for `src/dalton/provenance/declared_sources.py`, `scripts/dalton/source_identity.py`, and `scripts/dalton/researchdata_bridge.py`."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
+from unittest.mock import create_autospec
 
 import pytest
 
@@ -14,6 +17,7 @@ SCRIPTS_DALTON = REPO_ROOT / "scripts" / "dalton"
 if str(SCRIPTS_DALTON) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DALTON))
 
+import researchdata_bridge as rb  # noqa: E402
 import source_identity  # noqa: E402
 from ptc_agent.agent.middleware.provenance.middleware import ProvenanceMiddleware  # noqa: E402
 from src.dalton.provenance.declared_sources import expand_declared_sources  # noqa: E402
@@ -341,3 +345,908 @@ class TestSourceIdentityRoutes:
             {"ok": True, "ticker": "00700", "rows": [{"date": "2026-09-15", "title": "Next Day Disclosure", "pdf_link": "https://hkexnews.hk/1.pdf", "index": 1}]},
         )
         assert cnhk_decl[0]["identity"] == "filing" and cnhk_decl[0]["url"] == "https://hkexnews.hk/1.pdf"
+
+
+def _make_bridge(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> rb.ResearchDataBridge:
+    monkeypatch.setenv("DALTON_BRIDGE_USAGE_FILE", str(tmp_path / "usage.json"))
+    monkeypatch.setenv("DALTON_BRIDGE_TEST_MODE", "0")
+    cfg = rb.BridgeConfig()
+    return rb.ResearchDataBridge(cfg)
+
+
+def _make_subprocess_double(
+    responder: Any,
+) -> Any:
+    """Create a `create_autospec(asyncio.create_subprocess_exec)` double."""
+    exec_mock = create_autospec(asyncio.create_subprocess_exec)
+
+    async def _fake_exec(*args: Any, **kwargs: Any) -> asyncio.subprocess.Process:
+        proc = create_autospec(asyncio.subprocess.Process, instance=True)
+        proc.returncode = 0
+
+        async def _communicate(input: bytes | None = None) -> tuple[bytes, bytes]:
+            lines = (input or b"").decode("utf-8").splitlines()
+            reqs = [json.loads(line) for line in lines if line.strip()]
+            out_lines, rc = await responder(reqs)
+            proc.returncode = rc
+            stdout_bytes = (
+                "\n".join(json.dumps(obj, ensure_ascii=False) for obj in out_lines) + "\n"
+            ).encode("utf-8") if out_lines else b""
+            return stdout_bytes, b""
+
+        proc.communicate.side_effect = _communicate
+        return proc
+
+    exec_mock.side_effect = _fake_exec
+    return exec_mock
+
+
+def _local_all_payload() -> dict[str, Any]:
+    return {
+        "ok": True,
+        "status": "ok",
+        "results": [
+            {
+                "document_id": "mail:8801",
+                "canonical_id": "mail:8801",
+                "source": "sales-notes",
+                "original_source": "Goldman Sachs",
+                "title": "CATL Sales Note",
+                "date": "2026-04-16",
+                "layer": "raw",
+                "snippet": "GS comment on CATL move.",
+            }
+        ],
+        "ranking": "priority_tier_desc,published_at_desc_with_90d_decay,fts_score_desc",
+        "source_status": {
+            "company-wiki": {"ok": True, "status": "ok", "count": 0},
+            "sales-notes": {"ok": True, "status": "ok", "count": 1},
+            "tmtb": {"ok": True, "status": "ok", "count": 0},
+            "funda-ai": {"ok": True, "status": "ok", "count": 0},
+        },
+        "retrieved_at": "2026-04-17T00:00:00+00:00",
+        "local_only": True,
+        "result_count": 1,
+    }
+
+
+def _alphaengine_ok_payload() -> dict[str, Any]:
+    return {
+        "ok": True,
+        "status": "ok",
+        "executed": True,
+        "operation": "search_library",
+        "data": {
+            "content": [{"type": "text", "text": "Found 1 document"}],
+            "structuredContent": {
+                "query": "CATL 宁德时代",
+                "total_upstream": 1,
+                "returned": 1,
+                "results": [
+                    {
+                        "doc_id": "99001122",
+                        "title": "CATL: Volume Drop Assessment",
+                        "publish_time": "2026-04-16",
+                        "sources": ["Morgan Stanley"],
+                        "snippet": "MS assessment on CATL.",
+                        "source_attribution": {
+                            "markdown": "[Morgan Stanley — CATL (16 Apr 2026)](https://www.alphaengine.io/document/99001122)"
+                        },
+                    }
+                ],
+                "has_more": False,
+            },
+            "isError": False,
+        },
+    }
+
+
+def _guidepoint_ok_payload() -> dict[str, Any]:
+    return {
+        "ok": True,
+        "status": "ok",
+        "route": "guidepoint",
+        "operation": "search_library",
+        "data": {
+            "content": [{"type": "text", "text": "Found 1 transcript"}],
+            "structuredContent": {
+                "data": [
+                    {
+                        "id": "library_ts:gp-778899",
+                        "transcript_name": "China EV Battery Supply Chain & Pricing",
+                        "date": "2026-04-15",
+                        "reference_url": "https://new.guidepoint.com/transcripts/gp-778899",
+                        "respondent": {
+                            "full_name": "Zhang San",
+                            "title": "Former VP of Procurement",
+                            "company": "Leading NEV OEM",
+                        },
+                        "highlights": ["LFP cell pricing pressure easing in Q2"],
+                    }
+                ]
+            },
+            "isError": False,
+        },
+    }
+
+
+def _mcp_tool_response(req_id: Any, payload: dict[str, Any], *, is_error: bool = False) -> dict[str, Any]:
+    return {
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "result": {
+            "content": [{"type": "text", "text": json.dumps(payload, ensure_ascii=False)}],
+            "isError": is_error,
+        },
+    }
+
+
+class TestResearchAllAlphaEngineAndGuidepointFanout:
+    def test_fanout_timeout_constants(self) -> None:
+        assert rb.FANOUT_ALPHAENGINE_TIMEOUT_S == 60
+        assert rb.FANOUT_GUIDEPOINT_TIMEOUT_S == 90
+
+    @pytest.mark.asyncio
+    async def test_fanout_triggered_on_all_search_and_merges_results(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bridge = _make_bridge(tmp_path, monkeypatch)
+        recorded_calls: list[dict[str, Any]] = []
+
+        async def _responder(reqs: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+            req = reqs[0]
+            params = req["params"]
+            args = params["arguments"]
+            recorded_calls.append(args)
+            if args["route"] == "all":
+                return [_mcp_tool_response(req["id"], _local_all_payload())], 0
+            if args["route"] == "alphaengine":
+                return [_mcp_tool_response(req["id"], _alphaengine_ok_payload())], 0
+            if args["route"] == "guidepoint":
+                return [_mcp_tool_response(req["id"], _guidepoint_ok_payload())], 0
+            raise AssertionError(f"Unexpected route: {args['route']}")
+
+        exec_double = _make_subprocess_double(_responder)
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", exec_double)
+
+        resp = await bridge.handle_tools_call(
+            "req-1",
+            {
+                "name": "research",
+                "arguments": {
+                    "route": "all",
+                    "operation": "search",
+                    "query": "CATL 宁德时代",
+                    "ticker": "300750.SZ",
+                    "start": "2026-03-01",
+                    "end": "2026-04-17",
+                    "limit": 5,
+                    "params": {
+                        "layer": "raw",
+                        "sources": ["sales-notes"],
+                        "keywords": ["LFP"],
+                        "recency_bias": "1y",
+                    },
+                    "document": "ignored-doc",
+                },
+            },
+        )
+
+        routes_called = [c["route"] for c in recorded_calls]
+        assert sorted(routes_called) == ["all", "alphaengine", "guidepoint"]
+
+        ae_call = next(c for c in recorded_calls if c["route"] == "alphaengine")
+        assert ae_call["operation"] == "search_library"
+        assert ae_call["query"] == "300750.SZ CATL 宁德时代"
+        assert ae_call["start"] == "2026-03-01"
+        assert ae_call["end"] == "2026-04-17"
+        assert ae_call["limit"] == 5
+        assert ae_call["timeout"] == rb.FANOUT_ALPHAENGINE_TIMEOUT_S == 60
+        assert "ticker" not in ae_call
+        assert "params" not in ae_call
+        assert "document" not in ae_call
+
+        gp_call = next(c for c in recorded_calls if c["route"] == "guidepoint")
+        assert gp_call["operation"] == "search_library"
+        assert gp_call["query"] == "300750.SZ CATL 宁德时代"
+        assert gp_call["start"] == "2026-03-01"
+        assert gp_call["end"] == "2026-04-17"
+        assert gp_call["limit"] == 5
+        assert gp_call["timeout"] == rb.FANOUT_GUIDEPOINT_TIMEOUT_S == 90
+        assert gp_call["params"] == {"keywords": ["LFP"], "recency_bias": "1y"}
+        assert "ticker" not in gp_call
+        assert "document" not in gp_call
+
+        body = json.loads(resp["result"]["content"][0]["text"])
+        assert body["ok"] is True
+        assert body["alphaengine"]["ok"] is True
+        assert body["alphaengine"]["status"] == "ok"
+        assert body["alphaengine"]["route"] == "alphaengine"
+        assert body["alphaengine"]["count"] == 1
+        assert body["alphaengine"]["results"][0]["route"] == "alphaengine"
+        assert body["alphaengine"]["results"][0]["document_id"] == "alphaengine:99001122"
+        assert body["source_status"]["alphaengine"]["status"] == "ok"
+
+        assert body["guidepoint"]["ok"] is True
+        assert body["guidepoint"]["status"] == "ok"
+        assert body["guidepoint"]["route"] == "guidepoint"
+        assert body["guidepoint"]["count"] == 1
+        gp_item = body["guidepoint"]["results"][0]
+        assert gp_item["route"] == "guidepoint"
+        assert gp_item["document_id"] == "guidepoint:gp-778899"
+        assert "full_name" not in gp_item["respondent"]
+        assert gp_item["respondent"]["title"] == "Former VP of Procurement"
+        assert body["source_status"]["guidepoint"]["status"] == "ok"
+
+        ae_in_results = [r for r in body["results"] if r.get("route") == "alphaengine"]
+        gp_in_results = [r for r in body["results"] if r.get("route") == "guidepoint"]
+        assert len(ae_in_results) == 1
+        assert len(gp_in_results) == 1
+        assert body["result_count"] == 3
+
+        declared = body["_declared_sources"]
+        assert len(declared) == 3
+        by_route = {d["route"]: d for d in declared}
+        assert "sales-notes" in by_route
+        assert "alphaengine" in by_route
+        assert "guidepoint" in by_route
+        assert by_route["alphaengine"]["document_id"] == "alphaengine:99001122"
+        assert by_route["alphaengine"]["publisher"] == "Morgan Stanley"
+        assert by_route["guidepoint"]["document_id"] == "guidepoint:gp-778899"
+        assert by_route["guidepoint"]["title"] == "China EV Battery Supply Chain & Pricing"
+        assert by_route["guidepoint"]["publisher"] == "Guidepoint (Former VP of Procurement, Leading NEV OEM)"
+        assert by_route["guidepoint"]["identity"] == "expert"
+
+    @pytest.mark.asyncio
+    async def test_fanout_triggered_when_operation_omitted_with_query(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bridge = _make_bridge(tmp_path, monkeypatch)
+        recorded_calls: list[dict[str, Any]] = []
+
+        async def _responder(reqs: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+            req = reqs[0]
+            args = req["params"]["arguments"]
+            recorded_calls.append(args)
+            if args["route"] == "all":
+                return [_mcp_tool_response(req["id"], _local_all_payload())], 0
+            if args["route"] == "guidepoint":
+                return [_mcp_tool_response(req["id"], _guidepoint_ok_payload())], 0
+            return [_mcp_tool_response(req["id"], _alphaengine_ok_payload())], 0
+
+        monkeypatch.setattr(
+            asyncio, "create_subprocess_exec", _make_subprocess_double(_responder)
+        )
+
+        await bridge.handle_tools_call(
+            "req-2",
+            {"name": "research", "arguments": {"route": "all", "query": "CATL"}},
+        )
+        assert sorted(c["route"] for c in recorded_calls) == ["all", "alphaengine", "guidepoint"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "tool_name,arguments",
+        [
+            ("research", {"route": "all", "operation": "read", "document": "mail:8801"}),
+            ("research", {"route": "all", "operation": "get_document", "document": "wiki:1"}),
+            ("research", {"route": "all", "operation": "list"}),
+            ("research", {"route": "all"}),
+            ("research", {"route": "sales-notes", "operation": "search", "query": "CATL"}),
+            ("finance", {"route": "sec", "operation": "search", "query": "CATL"}),
+        ],
+    )
+    async def test_fanout_not_triggered_for_non_all_search(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        tool_name: str,
+        arguments: dict[str, Any],
+    ) -> None:
+        bridge = _make_bridge(tmp_path, monkeypatch)
+        recorded_calls: list[dict[str, Any]] = []
+
+        async def _responder(reqs: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+            req = reqs[0]
+            recorded_calls.append(req["params"]["arguments"])
+            return [_mcp_tool_response(req["id"], {"ok": True, "status": "ok", "results": []})], 0
+
+        monkeypatch.setattr(
+            asyncio, "create_subprocess_exec", _make_subprocess_double(_responder)
+        )
+
+        await bridge.handle_tools_call(
+            "req-non-fanout", {"name": tool_name, "arguments": arguments}
+        )
+        assert len(recorded_calls) == 1
+        assert recorded_calls[0]["route"] == arguments["route"]
+
+    @pytest.mark.asyncio
+    async def test_alphaengine_failure_preserves_local_and_guidepoint_results(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bridge = _make_bridge(tmp_path, monkeypatch)
+
+        async def _responder(reqs: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+            req = reqs[0]
+            args = req["params"]["arguments"]
+            if args["route"] == "all":
+                return [_mcp_tool_response(req["id"], _local_all_payload())], 0
+            if args["route"] == "guidepoint":
+                return [_mcp_tool_response(req["id"], _guidepoint_ok_payload())], 0
+            return [], 2
+
+        monkeypatch.setattr(
+            asyncio, "create_subprocess_exec", _make_subprocess_double(_responder)
+        )
+
+        resp = await bridge.handle_tools_call(
+            "req-fail",
+            {
+                "name": "research",
+                "arguments": {"route": "all", "operation": "search", "query": "CATL"},
+            },
+        )
+        assert not resp["result"].get("isError")
+        body = json.loads(resp["result"]["content"][0]["text"])
+        assert body["ok"] is True
+        assert body["status"] == "ok"
+        assert len(body["results"]) == 2
+        assert body["results"][0]["document_id"] == "mail:8801"
+        assert body["results"][1]["document_id"] == "guidepoint:gp-778899"
+        assert len(body["_declared_sources"]) == 2
+        assert body["alphaengine"]["ok"] is False
+        assert body["alphaengine"]["status"] == "failed"
+        assert "SubprocessExitError" in body["alphaengine"]["reason"]
+        assert body["source_status"]["alphaengine"]["status"] == "failed"
+        assert body["guidepoint"]["ok"] is True
+        assert body["source_status"]["guidepoint"]["status"] == "ok"
+
+    @pytest.mark.asyncio
+    async def test_alphaengine_timeout_preserves_local_and_guidepoint_results(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bridge = _make_bridge(tmp_path, monkeypatch)
+        orig_rpc = bridge._run_stdio_rpc
+
+        async def _rpc_side_effect(
+            requests: list[dict[str, Any]], timeout_s: float
+        ) -> list[dict[str, Any]]:
+            req = requests[0]
+            args = req["params"]["arguments"]
+            if args["route"] == "alphaengine":
+                raise asyncio.TimeoutError()
+            if args["route"] == "guidepoint":
+                return [_mcp_tool_response(req["id"], _guidepoint_ok_payload())]
+            return [_mcp_tool_response(req["id"], _local_all_payload())]
+
+        rpc_double = create_autospec(orig_rpc, side_effect=_rpc_side_effect)
+        monkeypatch.setattr(bridge, "_run_stdio_rpc", rpc_double)
+
+        resp = await bridge.handle_tools_call(
+            "req-timeout",
+            {
+                "name": "research",
+                "arguments": {"route": "all", "operation": "search", "query": "CATL"},
+            },
+        )
+        assert not resp["result"].get("isError")
+        body = json.loads(resp["result"]["content"][0]["text"])
+        assert body["ok"] is True
+        assert len(body["results"]) == 2
+        assert body["alphaengine"]["ok"] is False
+        assert body["alphaengine"]["status"] == "timeout"
+        assert "timed out" in body["alphaengine"]["reason"]
+        assert body["source_status"]["alphaengine"]["status"] == "timeout"
+        assert body["guidepoint"]["ok"] is True
+        assert body["source_status"]["guidepoint"]["status"] == "ok"
+
+    @pytest.mark.asyncio
+    async def test_guidepoint_failure_preserves_local_and_alphaengine_results(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bridge = _make_bridge(tmp_path, monkeypatch)
+
+        async def _responder(reqs: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+            req = reqs[0]
+            args = req["params"]["arguments"]
+            if args["route"] == "all":
+                return [_mcp_tool_response(req["id"], _local_all_payload())], 0
+            if args["route"] == "alphaengine":
+                return [_mcp_tool_response(req["id"], _alphaengine_ok_payload())], 0
+            return [], 2
+
+        monkeypatch.setattr(
+            asyncio, "create_subprocess_exec", _make_subprocess_double(_responder)
+        )
+
+        resp = await bridge.handle_tools_call(
+            "req-gp-fail",
+            {
+                "name": "research",
+                "arguments": {"route": "all", "operation": "search", "query": "CATL"},
+            },
+        )
+        assert not resp["result"].get("isError")
+        body = json.loads(resp["result"]["content"][0]["text"])
+        assert body["ok"] is True
+        assert body["status"] == "ok"
+        assert len(body["results"]) == 2
+        assert {r["document_id"] for r in body["results"]} == {
+            "mail:8801",
+            "alphaengine:99001122",
+        }
+        assert body["alphaengine"]["ok"] is True
+        assert body["guidepoint"]["ok"] is False
+        assert body["guidepoint"]["status"] == "failed"
+        assert "SubprocessExitError" in body["guidepoint"]["reason"]
+        assert body["source_status"]["guidepoint"]["status"] == "failed"
+
+    @pytest.mark.asyncio
+    async def test_guidepoint_timeout_preserves_local_and_alphaengine_results(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bridge = _make_bridge(tmp_path, monkeypatch)
+        orig_rpc = bridge._run_stdio_rpc
+
+        async def _rpc_side_effect(
+            requests: list[dict[str, Any]], timeout_s: float
+        ) -> list[dict[str, Any]]:
+            req = requests[0]
+            args = req["params"]["arguments"]
+            if args["route"] == "guidepoint":
+                raise asyncio.TimeoutError()
+            if args["route"] == "alphaengine":
+                return [_mcp_tool_response(req["id"], _alphaengine_ok_payload())]
+            return [_mcp_tool_response(req["id"], _local_all_payload())]
+
+        rpc_double = create_autospec(orig_rpc, side_effect=_rpc_side_effect)
+        monkeypatch.setattr(bridge, "_run_stdio_rpc", rpc_double)
+
+        resp = await bridge.handle_tools_call(
+            "req-gp-timeout",
+            {
+                "name": "research",
+                "arguments": {"route": "all", "operation": "search", "query": "CATL"},
+            },
+        )
+        assert not resp["result"].get("isError")
+        body = json.loads(resp["result"]["content"][0]["text"])
+        assert body["ok"] is True
+        assert len(body["results"]) == 2
+        assert body["alphaengine"]["ok"] is True
+        assert body["guidepoint"]["ok"] is False
+        assert body["guidepoint"]["status"] == "timeout"
+        assert "timed out" in body["guidepoint"]["reason"]
+        assert body["source_status"]["guidepoint"]["status"] == "timeout"
+
+    @pytest.mark.asyncio
+    async def test_stdio_rpc_cancellation_kills_and_waits_subprocess(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bridge = _make_bridge(tmp_path, monkeypatch)
+        started = asyncio.Event()
+        block = asyncio.Event()
+        spawned_procs: list[asyncio.subprocess.Process] = []
+
+        exec_mock = create_autospec(asyncio.create_subprocess_exec)
+
+        async def _fake_exec(*args: Any, **kwargs: Any) -> asyncio.subprocess.Process:
+            proc = create_autospec(asyncio.subprocess.Process, instance=True)
+            proc.returncode = None
+
+            async def _communicate(input: bytes | None = None) -> tuple[bytes, bytes]:
+                started.set()
+                await block.wait()
+                return b"", b""
+
+            proc.communicate.side_effect = _communicate
+            spawned_procs.append(proc)
+            return proc
+
+        exec_mock.side_effect = _fake_exec
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", exec_mock)
+
+        task = asyncio.create_task(
+            bridge._run_stdio_rpc([{"jsonrpc": "2.0", "id": 1, "method": "ping"}], timeout_s=30.0)
+        )
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert len(spawned_procs) == 1
+        spawned_procs[0].kill.assert_called_once()
+        spawned_procs[0].wait.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_local_all_fast_failure_cleans_up_pending_fanout_and_keeps_completed_online_results(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bridge = _make_bridge(tmp_path, monkeypatch)
+        gp_blocked = asyncio.Event()
+        procs_by_route: dict[str, asyncio.subprocess.Process] = {}
+
+        exec_mock = create_autospec(asyncio.create_subprocess_exec)
+
+        async def _fake_exec(*args: Any, **kwargs: Any) -> asyncio.subprocess.Process:
+            proc = create_autospec(asyncio.subprocess.Process, instance=True)
+            proc.returncode = 0
+
+            async def _communicate(input: bytes | None = None) -> tuple[bytes, bytes]:
+                lines = (input or b"").decode("utf-8").splitlines()
+                req = json.loads(lines[0])
+                route = req["params"]["arguments"]["route"]
+                procs_by_route[route] = proc
+                if route == "alphaengine":
+                    out = _mcp_tool_response(req["id"], _alphaengine_ok_payload())
+                    return (json.dumps(out, ensure_ascii=False) + "\n").encode("utf-8"), b""
+                if route == "guidepoint":
+                    await gp_blocked.wait()
+                    return b"", b""
+                proc.returncode = 2
+                return b"", b""
+
+            proc.communicate.side_effect = _communicate
+            return proc
+
+        exec_mock.side_effect = _fake_exec
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", exec_mock)
+
+        resp = await bridge.handle_tools_call(
+            "req-local-fast-fail",
+            {
+                "name": "research",
+                "arguments": {"route": "all", "operation": "search", "query": "CATL"},
+            },
+        )
+        assert not resp["result"].get("isError")
+        body = json.loads(resp["result"]["content"][0]["text"])
+        assert resp["result"]["structuredContent"] == body
+        assert body["ok"] is True
+        assert body["status"] == "ok"
+        assert [r["document_id"] for r in body["results"]] == ["alphaengine:99001122"]
+        assert body["alphaengine"]["ok"] is True
+        assert body["alphaengine"]["status"] == "ok"
+        assert body["guidepoint"]["ok"] is False
+        assert body["guidepoint"]["status"] == "canceled"
+        assert body["source_status"]["local_all"]["status"] == "failed"
+        assert body["source_status"]["alphaengine"]["status"] == "ok"
+        assert body["source_status"]["guidepoint"]["status"] == "canceled"
+        assert [d["document_id"] for d in body["_declared_sources"]] == ["alphaengine:99001122"]
+
+        procs_by_route["guidepoint"].kill.assert_called_once()
+        procs_by_route["guidepoint"].wait.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_local_all_timeout_preserves_completed_alphaengine_and_guidepoint_results(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bridge = _make_bridge(tmp_path, monkeypatch)
+        orig_rpc = bridge._run_stdio_rpc
+
+        async def _rpc_side_effect(
+            requests: list[dict[str, Any]], timeout_s: float
+        ) -> list[dict[str, Any]]:
+            req = requests[0]
+            route = req["params"]["arguments"]["route"]
+            if route == "all":
+                await asyncio.sleep(0)
+                raise asyncio.TimeoutError()
+            if route == "alphaengine":
+                return [_mcp_tool_response(req["id"], _alphaengine_ok_payload())]
+            return [_mcp_tool_response(req["id"], _guidepoint_ok_payload())]
+
+        rpc_double = create_autospec(orig_rpc, side_effect=_rpc_side_effect)
+        monkeypatch.setattr(bridge, "_run_stdio_rpc", rpc_double)
+
+        resp = await bridge.handle_tools_call(
+            "req-local-timeout",
+            {
+                "name": "research",
+                "arguments": {"route": "all", "operation": "search", "query": "CATL"},
+            },
+        )
+        assert not resp["result"].get("isError")
+        body = json.loads(resp["result"]["content"][0]["text"])
+        assert resp["result"]["structuredContent"] == body
+        assert body["ok"] is True
+        assert {r["document_id"] for r in body["results"]} == {
+            "alphaengine:99001122",
+            "guidepoint:gp-778899",
+        }
+        assert body["source_status"]["local_all"]["status"] == "timeout"
+        assert body["source_status"]["alphaengine"]["status"] == "ok"
+        assert body["source_status"]["guidepoint"]["status"] == "ok"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("shape", ["content_text_json", "data_results"])
+    async def test_alphaengine_unwraps_proxy_text_json_and_data_results_and_syncs_structured_content(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shape: str
+    ) -> None:
+        bridge = _make_bridge(tmp_path, monkeypatch)
+        item = {
+            "doc_id": "99001122",
+            "title": "CATL: Volume Drop Assessment",
+            "publish_time": "2026-04-16",
+            "sources": ["Morgan Stanley"],
+            "snippet": "MS assessment on CATL.",
+        }
+        if shape == "content_text_json":
+            ae_payload: dict[str, Any] = {
+                "ok": True,
+                "status": "ok",
+                "data": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": json.dumps({"results": [item]}, ensure_ascii=False),
+                        }
+                    ],
+                    "isError": False,
+                },
+            }
+        else:
+            ae_payload = {
+                "ok": True,
+                "status": "ok",
+                "data": {"results": [item]},
+            }
+
+        async def _responder(reqs: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+            req = reqs[0]
+            route = req["params"]["arguments"]["route"]
+            if route == "all":
+                local_p = _local_all_payload()
+                return [
+                    {
+                        "jsonrpc": "2.0",
+                        "id": req["id"],
+                        "result": {
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": json.dumps(local_p, ensure_ascii=False),
+                                }
+                            ],
+                            "structuredContent": dict(local_p),
+                            "isError": False,
+                        },
+                    }
+                ], 0
+            if route == "alphaengine":
+                return [_mcp_tool_response(req["id"], ae_payload)], 0
+            return [_mcp_tool_response(req["id"], _guidepoint_ok_payload())], 0
+
+        monkeypatch.setattr(
+            asyncio, "create_subprocess_exec", _make_subprocess_double(_responder)
+        )
+
+        resp = await bridge.handle_tools_call(
+            f"req-{shape}",
+            {
+                "name": "research",
+                "arguments": {"route": "all", "operation": "search", "query": "CATL"},
+            },
+        )
+        body = json.loads(resp["result"]["content"][0]["text"])
+        sc = resp["result"]["structuredContent"]
+        assert sc == body
+        assert body["alphaengine"]["ok"] is True
+        assert body["alphaengine"]["count"] == 1
+        assert body["alphaengine"]["results"][0]["document_id"] == "alphaengine:99001122"
+        assert sc["alphaengine"]["count"] == 1
+        assert sc["guidepoint"]["count"] == 1
+        assert sc["result_count"] == 3
+        assert {d["route"] for d in body["_declared_sources"]} == {
+            "sales-notes",
+            "alphaengine",
+            "guidepoint",
+        }
+
+
+class TestToolsListResearchDescription:
+    @pytest.mark.asyncio
+    async def test_research_description_appends_situational_route_guidance(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bridge = _make_bridge(tmp_path, monkeypatch)
+
+        async def _responder(reqs: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+            req = reqs[0]
+            if req["method"] == "initialize":
+                return [
+                    {
+                        "jsonrpc": "2.0",
+                        "id": req["id"],
+                        "result": {
+                            "protocolVersion": "2024-11-05",
+                            "serverInfo": {"name": "researchdata", "version": "1.0.0"},
+                        },
+                    }
+                ], 0
+            if req["method"] == "tools/list":
+                return [
+                    {
+                        "jsonrpc": "2.0",
+                        "id": req["id"],
+                        "result": {
+                            "tools": [
+                                {
+                                    "name": "research",
+                                    "description": "Internal research library, transcripts, broker notes, and expert interviews.",
+                                    "inputSchema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "route": {
+                                                "type": "string",
+                                                "enum": [
+                                                    "all",
+                                                    "alphaengine",
+                                                    "guidepoint",
+                                                    "transcript",
+                                                    "company-wiki",
+                                                    "sales-notes",
+                                                    "tmtb",
+                                                    "funda-ai",
+                                                    "employee",
+                                                ],
+                                            }
+                                        },
+                                    },
+                                },
+                                {
+                                    "name": "catalog",
+                                    "description": "List routes.",
+                                    "inputSchema": {"type": "object", "properties": {}},
+                                },
+                            ]
+                        },
+                    }
+                ], 0
+            raise AssertionError(f"Unexpected method: {req['method']}")
+
+        monkeypatch.setattr(
+            asyncio, "create_subprocess_exec", _make_subprocess_double(_responder)
+        )
+
+        tools = await bridge.get_filtered_tools()
+        research_tool = next(t for t in tools if t["name"] == "research")
+        catalog_tool = next(t for t in tools if t["name"] == "catalog")
+
+        desc = research_tool["description"]
+        assert "Internal research library" in desc
+        assert "各来源提供什么证据：" in desc
+        assert "何时选用哪个路由（按研究情境，基于 catalog）：" in desc
+        assert "→ alphaengine：卖方研报与会议纪要（来源：AlphaEngine，先 search_library 再 get_document）" in desc
+        assert "→ guidepoint：专家访谈与一线经营反馈（来源：Guidepoint）" in desc
+        assert "→ transcript：业绩电话会转写稿（来源：AlphaEngine 业绩会 ASR 稿（主）/ roic.ai（兜底））" in desc
+        assert "→ company-wiki：已入库公司与行业资料（来源：本地 company-wiki，只读，params.company=TICKER）" in desc
+        assert "→ sales-notes：卖方销售邮件与市场摘要（来源：本地 market-digest 私有库）" in desc
+        assert "→ tmtb：TMT Breakout 本地原文缓存（来源：AlphaEngine TMTB 已入库副本）" in desc
+        assert "→ funda-ai：FUNDA AI 原邮件与图表（来源：fundaai@substack.com" in desc
+        assert "→ all：内部研究资料跨库检索（本地库 company-wiki + sales-notes + tmtb + funda-ai，外加并行的 AlphaEngine 与 Guidepoint 检索；不含 transcript 电话会转写稿" in desc
+
+        assert "employee" not in research_tool["inputSchema"]["properties"]["route"]["enum"]
+        assert catalog_tool["description"] == "List routes."
+
+    def test_plugin_json_instruction_shares_single_source_with_bridge(self) -> None:
+        plugin_path = (
+            Path(__file__).resolve().parents[3] / "plugins" / "dalton_data" / "plugin.json"
+        )
+        plugin_data = json.loads(plugin_path.read_text(encoding="utf-8"))
+        srv = plugin_data["extensions"]["ai.langalpha"]["servers"]["researchdata"]
+        assert srv["instruction"] == rb.build_researchdata_plugin_instruction()
+        assert rb.RESEARCH_EVIDENCE_AND_ROUTE_GUIDE.replace("\n", " ") in srv["instruction"]
+        assert "Keep date windows narrow" not in srv["instruction"]
+        assert "AlphaEngine full text is quota-limited, so read only what you need" not in srv["instruction"]
+        assert "检索可以放开，全文阅读（get_document）计配额，读最相关的几篇" in srv["instruction"]
+
+
+class TestDaltonSkillRegistrySingleSource:
+    def test_all_22_dalton_skills_match_skill_md_frontmatter(self) -> None:
+        import yaml
+
+        from ptc_agent.agent.middleware.skills.dalton_registry import (
+            DALTON_SKILL_DEFINITIONS,
+            DALTON_SKILLS_DIR,
+            _DALTON_SKILL_SPECS,
+        )
+        from ptc_agent.agent.middleware.skills.registry import SKILL_REGISTRY
+
+        assert len(_DALTON_SKILL_SPECS) == 22
+        assert len(DALTON_SKILL_DEFINITIONS) == 22
+
+        for name, skill_def in DALTON_SKILL_DEFINITIONS.items():
+            skill_md = DALTON_SKILLS_DIR / name / "SKILL.md"
+            assert skill_md.is_file(), f"Missing SKILL.md for {name}"
+            text = skill_md.read_text(encoding="utf-8")
+            assert text.startswith("---\n")
+            end_idx = text.find("\n---\n", 4)
+            frontmatter = yaml.safe_load(text[4:end_idx])
+            expected_desc = frontmatter["description"].strip()
+
+            assert expected_desc, f"Empty description in {skill_md}"
+            assert skill_def.description == expected_desc
+            assert SKILL_REGISTRY[name].description == expected_desc
+            assert "触发词" not in expected_desc, f"{name} still has trigger keyword list"
+            assert len(expected_desc) <= 120, f"{name} description exceeds 120 chars: {len(expected_desc)}"
+
+    def test_missing_skill_md_raises_at_load(self, tmp_path: Path) -> None:
+        from ptc_agent.agent.middleware.skills.dalton_registry import (
+            build_dalton_skill_definitions,
+            read_skill_description,
+        )
+
+        with pytest.raises(FileNotFoundError, match="Missing Dalton SKILL.md"):
+            read_skill_description("dalton-nonexistent", skills_dir=tmp_path)
+
+        with pytest.raises(FileNotFoundError, match="Missing Dalton SKILL.md"):
+            build_dalton_skill_definitions(skills_dir=tmp_path)
+
+    def test_missing_or_empty_description_raises_at_load(self, tmp_path: Path) -> None:
+        from ptc_agent.agent.middleware.skills.dalton_registry import read_skill_description
+
+        skill_dir = tmp_path / "dalton-broken"
+        skill_dir.mkdir(parents=True)
+        skill_md = skill_dir / "SKILL.md"
+
+        skill_md.write_text("# No frontmatter\n", encoding="utf-8")
+        with pytest.raises(ValueError, match="Missing YAML frontmatter"):
+            read_skill_description("dalton-broken", skills_dir=tmp_path)
+
+        skill_md.write_text("---\nname: dalton-broken\n---\nbody\n", encoding="utf-8")
+        with pytest.raises(ValueError, match="Missing or empty 'description'"):
+            read_skill_description("dalton-broken", skills_dir=tmp_path)
+
+        skill_md.write_text("---\nname: dalton-broken\ndescription: '   '\n---\nbody\n", encoding="utf-8")
+        with pytest.raises(ValueError, match="Missing or empty 'description'"):
+            read_skill_description("dalton-broken", skills_dir=tmp_path)
+
+
+
+
+class _SlowWaitProcess:
+    """A stand-in for an asyncio subprocess whose wait() takes a little while."""
+
+    def __init__(self) -> None:
+        self.waited = False
+
+    async def wait(self) -> int:
+        await asyncio.sleep(0.05)
+        self.waited = True
+        return -9
+
+
+@pytest.mark.asyncio
+async def test_reap_process_finishes_waiting_when_cancelled_mid_wait() -> None:
+    proc = _SlowWaitProcess()
+    task = asyncio.create_task(rb._reap_process(proc))
+    await asyncio.sleep(0.01)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert proc.waited is True
+
+
+@pytest.mark.asyncio
+async def test_cancel_and_reap_cancels_pending_tasks_even_if_caller_is_cancelled() -> None:
+    finished: list[str] = []
+
+    async def online(name: str) -> None:
+        try:
+            await asyncio.sleep(10)
+        finally:
+            await asyncio.sleep(0.02)
+            finished.append(name)
+
+    ae = asyncio.create_task(online("alphaengine"))
+    gp = asyncio.create_task(online("guidepoint"))
+    await asyncio.sleep(0)
+    reaper = asyncio.create_task(rb._cancel_and_reap((ae, gp)))
+    await asyncio.sleep(0.005)
+    reaper.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await reaper
+    assert ae.cancelled() and gp.cancelled()
+    assert sorted(finished) == ["alphaengine", "guidepoint"]

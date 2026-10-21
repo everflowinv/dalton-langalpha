@@ -1,6 +1,6 @@
 ---
 name: dalton-earnings-preview
-description: "财报前三个交易日（T-3）产出一份财报前瞻：区分五类预期门槛（buyside bogey）与高频数据、业绩关注点与 EPS 质量及指引隐含门槛、按机制聚类的核心 debate 与一轮 X、三情景与期权隐含波动，并生成结构化 predictions.json 供财报后对账。触发词：财报前瞻、earnings preview、T-3 前瞻。"
+description: "产出财报前瞻报告与可对账的结构化预测清单：厘清五类预期门槛（含买方 bogey）与高频数据、EPS 质量与指引隐含门槛、核心分歧及三情景反应框架。公司临近发榜、用户想明确预期门槛与看点时使用；需多源检索，几分钟内可完成。"
 ---
 
 # Dalton 财报前瞻（`dalton-earnings-preview`）

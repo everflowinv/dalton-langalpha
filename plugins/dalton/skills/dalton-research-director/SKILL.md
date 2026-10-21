@@ -1,6 +1,6 @@
 ---
 name: dalton-research-director
-description: Autonomous Research Director running in Dalton Home — scores coverage board, allocates daily/weekly budget, delegates to company analysts, and coordinates cross-company research.
+description: "在 Home 运行全覆盖池巡检：按确定性公式为覆盖公司紧迫度评分，在预算内将高优研究委派给对应公司分析师，并更新全局看板与调度日志。需要统筹全覆盖名单每日/每周研究排程与跨公司任务分配时使用；需数分钟完成巡检与派单。"
 ---
 
 # dalton-research-director — 自主研究总监技能（PK.19）

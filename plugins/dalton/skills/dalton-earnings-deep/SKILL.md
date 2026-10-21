@@ -1,6 +1,6 @@
 ---
 name: dalton-earnings-deep
-description: "财报次日（T+1 交易日 20:00）启动 earnings-deep-update 深度链（也可独立产出八节深度点评）：并行完成八节深度报告与 Excel 模型更新，随后执行前瞻 predictions.json 逐条对账、thesis 支柱校准与管理层指引兑现记录更新，审稿后写入知识层工作版本。触发词：财报深度点评、earnings deep、八节财报报告、T+1 深度链。"
+description: "财报后并行产出八节深度点评报告与更新后的 Excel 财务模型，逐条对账财报前瞻预测、校准核心论点支柱并更新管理层指引兑现记录。卖方点评与电话会到齐后需要完整复盘季报并滚动模型与认知时使用；属于完整深度研究工作流。"
 ---
 
 # Dalton 财报深度链与八节点评（`dalton-earnings-deep`）

@@ -1,6 +1,6 @@
 ---
 name: dalton-topic-research
-description: "启动专题研究（topic-research workflow）：围绕产业、竞争、监管或技术专题按 Phase 0–7 执行多集群并行证据收集（精读全文 + 内部纪要/Guidepoint 20 词限制）、盲区检查（写下“盲区检查完成”）、置信度标注校验（validate_topic.py）、数字核验与 dalton-reviewer 独立审稿，回写相关公司知识层与复利教训，不写回基金 wiki。触发词：专题研究、专题深度、行业研究、竞争格局研究、topic research、/topic-research。"
+description: "围绕跨公司产业趋势、竞争格局、监管或技术专题，按多信息集群并行搜集一手披露、卖方研报与专家访谈证据，经盲区检查与独立审稿产出深度专题报告并回写相关公司知识层。用户想深挖某个行业或技术关键问题时使用；属于完整深度研究工作流。"
 ---
 
 # 专题研究（Topic Research）
