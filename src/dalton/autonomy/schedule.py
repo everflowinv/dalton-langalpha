@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
-from src.config.env import LOCAL_DEV_USER_ID
+from src.dalton.auth import (
+    resolve_caller_home_workspace_id,
+    verify_workspace_access,
+)
 from src.dalton.settings import get_dalton_settings
+
+logger = logging.getLogger(__name__)
 
 DALTON_NAME_RE = re.compile(r"^dalton-[a-z0-9][a-z0-9._-]{1,62}$")
 
@@ -326,10 +332,10 @@ def build_global_director_specs(
 
 
 async def schedule_dalton_automation_helper(
-    user_id: str = LOCAL_DEV_USER_ID,
     name: Optional[str] = None,
     spec: Optional[dict[str, Any]] = None,
     *,
+    user_id: str,
     workspace_id: Optional[str] = None,
     entry: Optional[dict[str, Any]] = None,
     ticker: Optional[str] = None,
@@ -339,15 +345,33 @@ async def schedule_dalton_automation_helper(
     """Idempotently create, update, pause, resume, or list Dalton (`dalton-*`) automations (G4.5).
 
     Supports both:
-    - ``schedule_dalton_automation_helper(user_id, name, spec)``
+    - ``schedule_dalton_automation_helper(name, spec, user_id=...)``
     - ``schedule_dalton_automation_helper(user_id=..., workspace_id=..., name=..., entry=...)``
     """
+    if not user_id or not str(user_id).strip():
+        raise ValueError("user_id is required")
+    user_id = str(user_id).strip()
     from src.server.database import automation as auto_db
 
     merged_spec: dict[str, Any] = dict(spec or entry or {})
     resolved_action = str(action or merged_spec.get("action") or "upsert").strip().lower()
     resolved_name = str(name or merged_spec.get("name") or "").strip()
-    ws_id = workspace_id if workspace_id is not None else merged_spec.get("workspace_id")
+    raw_ws = workspace_id if workspace_id is not None else merged_spec.get("workspace_id")
+    ws_id_str = str(raw_ws or "").strip()
+    if resolved_action == "list":
+        if ws_id_str and ws_id_str.lower() != "home":
+            await verify_workspace_access(ws_id_str, user_id)
+            ws_id: Optional[str] = ws_id_str
+        elif ws_id_str.lower() == "home":
+            ws_id = await resolve_caller_home_workspace_id(user_id)
+        else:
+            ws_id = None
+    else:
+        if not ws_id_str or ws_id_str.lower() == "home":
+            ws_id = await resolve_caller_home_workspace_id(user_id)
+        else:
+            await verify_workspace_access(ws_id_str, user_id)
+            ws_id = ws_id_str
     tz = str(merged_spec.get("timezone") or merged_spec.get("timezone_name") or get_dalton_settings().autonomy.timezone)
     resolved_ticker = ticker or (merged_spec.get("metadata") or {}).get("ticker") or merged_spec.get("ticker")
 

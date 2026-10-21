@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Optional
 
+from fastapi import HTTPException
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
@@ -181,11 +182,31 @@ async def list_pending_signals(
             return [_with_signal_status(dict(r)) for r in rows]
 
 
+def _require_scoped_ws_uuid(workspace_id: Optional[str]) -> uuid.UUID:
+    """Require a non-empty, non-Home workspace_id and resolve it to UUID."""
+    cleaned = str(workspace_id or "").strip()
+    if not cleaned or cleaned.lower() == "home":
+        raise HTTPException(
+            status_code=403,
+            detail="Valid workspace_id is required to resolve signals",
+        )
+    ws_uuid = _resolve_ws_uuid(cleaned)
+    if ws_uuid == HOME_WORKSPACE_SENTINEL:
+        raise HTTPException(
+            status_code=403,
+            detail="Valid workspace_id is required to resolve signals",
+        )
+    return ws_uuid
+
+
 async def claim_signals_woken(
     signal_ids: list[str],
     execution_id: str,
+    *,
+    workspace_id: Optional[str] = None,
 ) -> list[dict[str, Any]]:
     """Atomically claim unwoken signals for ``execution_id`` using ``UPDATE ... WHERE woken_execution_id IS NULL RETURNING *`` (R5-12)."""
+    ws_uuid = _require_scoped_ws_uuid(workspace_id)
     if not signal_ids:
         return []
     exec_uuid = _try_uuid(execution_id) or uuid.uuid5(uuid.NAMESPACE_DNS, str(execution_id))
@@ -201,6 +222,7 @@ async def claim_signals_woken(
                     woken_at = NOW(),
                     payload = COALESCE(payload, '{}'::jsonb) || '{"status": "woken"}'::jsonb
                 WHERE signal_id = ANY(%s)
+                  AND workspace_id = %s
                   AND woken_execution_id IS NULL
                   AND resolved_at IS NULL
                   AND expired_at IS NULL
@@ -208,7 +230,7 @@ async def claim_signals_woken(
                           summary, payload, detected_at, woken_execution_id, woken_at,
                           resolved_at, expired_at
                 """,
-                (exec_uuid, sig_uuids),
+                (exec_uuid, sig_uuids, ws_uuid),
             )
             rows = await cur.fetchall()
             return [_with_signal_status(dict(r)) for r in (rows or [])]
@@ -217,10 +239,48 @@ async def claim_signals_woken(
 async def mark_signals_woken(
     signal_ids: list[str],
     execution_id: str,
+    *,
+    workspace_id: Optional[str] = None,
 ) -> int:
     """Stamp woken_execution_id and woken_at on the given signals (atomic claim)."""
-    claimed = await claim_signals_woken(signal_ids, execution_id)
+    claimed = await claim_signals_woken(signal_ids, execution_id, workspace_id=workspace_id)
     return len(claimed)
+
+
+async def verify_signal_refs_in_workspace(
+    signal_refs: Optional[list[str]],
+    workspace_id: Optional[str],
+) -> None:
+    """Verify that ``workspace_id`` is valid and every UUID in ``signal_refs`` belongs to ``workspace_id``."""
+    ws_uuid = _require_scoped_ws_uuid(workspace_id)
+    refs = [str(r).strip() for r in (signal_refs or []) if r and str(r).strip()]
+    sig_uuids = [u for r in refs if (u := _try_uuid(r)) is not None]
+    if not sig_uuids:
+        return
+    async with get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT signal_id, workspace_id
+                FROM dalton_signals
+                WHERE signal_id = ANY(%s)
+                """,
+                (sig_uuids,),
+            )
+            rows = await cur.fetchall()
+    found_ws: dict[uuid.UUID, Optional[uuid.UUID]] = {}
+    for r in rows or []:
+        sid_raw = r.get("signal_id") if isinstance(r, dict) else r[0]
+        wid_raw = r.get("workspace_id") if isinstance(r, dict) else r[1]
+        sid_u = _try_uuid(sid_raw)
+        if sid_u is not None:
+            found_ws[sid_u] = _try_uuid(wid_raw)
+    for u in sig_uuids:
+        if u not in found_ws or found_ws[u] != ws_uuid:
+            raise HTTPException(
+                status_code=403,
+                detail=f"Signal '{u}' does not belong to workspace '{workspace_id}'",
+            )
 
 
 async def resolve_signals(
@@ -233,6 +293,7 @@ async def resolve_signals(
     execution_id: Optional[str] = None,
 ) -> int:
     """Mark signals as resolved by UUID, signal_key / ref suffix, or woken_execution_id (G4.2)."""
+    ws_uuid = _require_scoped_ws_uuid(workspace_id)
     refs = list(signal_ids or []) + list(signal_refs or [])
     refs = [str(r).strip() for r in refs if r and str(r).strip()]
     exec_uuid = _try_uuid(execution_id)
@@ -248,7 +309,6 @@ async def resolve_signals(
         else:
             key_refs.append(ref)
 
-    ws_uuid = _try_uuid(workspace_id)
     patch_obj: dict[str, Any] = {"status": "resolved"}
     if resolved_by:
         patch_obj["resolved_by"] = str(resolved_by)
@@ -259,22 +319,43 @@ async def resolve_signals(
             if sig_uuids:
                 await cur.execute(
                     """
+                    SELECT signal_id, workspace_id
+                    FROM dalton_signals
+                    WHERE signal_id = ANY(%s)
+                    """,
+                    (sig_uuids,),
+                )
+                rows = await cur.fetchall()
+                found_ws: dict[uuid.UUID, Optional[uuid.UUID]] = {}
+                for r in rows or []:
+                    sid_raw = r.get("signal_id") if isinstance(r, dict) else r[0]
+                    wid_raw = r.get("workspace_id") if isinstance(r, dict) else r[1]
+                    sid_u = _try_uuid(sid_raw)
+                    if sid_u is not None:
+                        found_ws[sid_u] = _try_uuid(wid_raw)
+                for u in sig_uuids:
+                    if u not in found_ws or found_ws[u] != ws_uuid:
+                        raise HTTPException(
+                            status_code=403,
+                            detail=f"Signal '{u}' does not belong to workspace '{workspace_id}'",
+                        )
+
+                await cur.execute(
+                    """
                     UPDATE dalton_signals
                     SET resolved_at = NOW(),
                         payload = COALESCE(payload, '{}'::jsonb) || %s::jsonb
                     WHERE signal_id = ANY(%s)
+                      AND workspace_id = %s
                       AND resolved_at IS NULL
                     """,
-                    (Jsonb(patch_obj), sig_uuids),
+                    (Jsonb(patch_obj), sig_uuids, ws_uuid),
                 )
                 total_updated += cur.rowcount or 0
 
             for kref in key_refs:
-                scope_clauses = ["resolved_at IS NULL"]
-                params: list[Any] = [Jsonb(patch_obj)]
-                if ws_uuid is not None:
-                    scope_clauses.append("workspace_id = %s")
-                    params.append(ws_uuid)
+                scope_clauses = ["resolved_at IS NULL", "workspace_id = %s"]
+                params: list[Any] = [Jsonb(patch_obj), ws_uuid]
                 if ticker:
                     scope_clauses.append("ticker = %s")
                     params.append(ticker.upper())
@@ -302,9 +383,10 @@ async def resolve_signals(
                     SET resolved_at = NOW(),
                         payload = COALESCE(payload, '{}'::jsonb) || %s::jsonb
                     WHERE woken_execution_id = %s
+                      AND workspace_id = %s
                       AND resolved_at IS NULL
                     """,
-                    (Jsonb(patch_obj), exec_uuid),
+                    (Jsonb(patch_obj), exec_uuid, ws_uuid),
                 )
                 total_updated += cur.rowcount or 0
 
@@ -316,12 +398,18 @@ async def expire_old_signals(
     *,
     max_age_days: int = 7,
     workspace_id: Optional[str] = None,
+    system_maintenance: bool = False,
 ) -> list[dict[str, Any]]:
     """Mark unresolved signals older than ``max_age_days`` (default 7d) as expired (G4.2)."""
     import inspect
 
     days = max(1, int(max_age_days))
-    ws_uuid = _try_uuid(workspace_id)
+    cleaned_ws = str(workspace_id or "").strip()
+    if (not cleaned_ws or cleaned_ws.lower() == "home") and not system_maintenance:
+        raise ValueError("workspace_id is required unless system_maintenance=True")
+    ws_uuid = _resolve_ws_uuid(cleaned_ws) if (cleaned_ws and cleaned_ws.lower() != "home") else None
+    if ws_uuid is None and not system_maintenance:
+        raise ValueError("workspace_id is required unless system_maintenance=True")
 
     async def _run_with_cursor(c: Any) -> list[dict[str, Any]]:
         if ws_uuid is not None:

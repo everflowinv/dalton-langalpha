@@ -220,9 +220,13 @@ def _is_service_request(raw_request: Request | None) -> bool:
     token, or oss mode has no token configured to check, which trusts the
     self-dispatch."""
     from src.config.settings import HOST_MODE
+    # DALTON-HOOK(dalton-auth): require service token match for self-dispatch when Dalton auth is enabled
+    from src.dalton.auth import is_dalton_service_request, is_dalton_supabase_auth_enabled
 
     token = _get_service_token()
     sent = raw_request.headers.get("X-Service-Token", "") if raw_request else ""
+    if is_dalton_supabase_auth_enabled():
+        return is_dalton_service_request(sent, token)
     return service_token_matches(sent, token) or (HOST_MODE == "oss" and not token)
 
 
@@ -526,7 +530,14 @@ async def _handle_send_message(
         # reconnect an account, and a refusal would drop it. A person's send
         # names no model while its client has not read the thread yet, and
         # gets the refusal rather than an answer from a model it never chose.
-        from_service = service_token_matches(_req_token, _svc_token) or is_dispatch
+        # DALTON-HOOK(dalton-auth): reuse _is_service_request result (with >=32-char check) when Dalton auth is enabled
+        from src.dalton.auth import is_dalton_supabase_auth_enabled
+
+        from_service = (
+            is_internal
+            if is_dalton_supabase_auth_enabled()
+            else service_token_matches(_req_token, _svc_token)
+        ) or is_dispatch
         config = await thread_model.resolve_turn_config(
             user_id,
             thread_id,

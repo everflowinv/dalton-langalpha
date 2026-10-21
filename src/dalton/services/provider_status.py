@@ -13,7 +13,6 @@ from typing import Any
 
 import yaml
 
-from src.config.env import LOCAL_DEV_USER_ID
 from src.dalton.database.provider_events import (
     count_provider_errors_24h,
     get_last_refresh_event,
@@ -26,7 +25,6 @@ from src.dalton.llm.providers import ensure_provider_enabled
 from src.dalton.llm.role_policy import (
     check_roles,
     explain_model_availability,
-    family_of,
 )
 from src.dalton.settings import get_disabled_providers, is_broker_models_enabled
 
@@ -99,8 +97,13 @@ def _load_role_model_assignments() -> list[dict[str, str]]:
 
 async def _fetch_usage_stats_24h(
     model_to_provider: dict[str, str],
+    *,
+    user_id: str,
 ) -> dict[str, dict[str, Any]]:
-    """Query last 24h `conversation_usages` and `dalton_llm_journal` per provider."""
+    """Query last 24h `conversation_usages` and `dalton_llm_journal` per provider for `user_id`."""
+    if not user_id or not str(user_id).strip():
+        raise ValueError("user_id is required")
+    user_id = str(user_id).strip()
     stats: dict[str, dict[str, Any]] = {}
     since = datetime.now(timezone.utc) - timedelta(hours=24)
 
@@ -123,11 +126,11 @@ async def _fetch_usage_stats_24h(
                     """
                     SELECT created_at, token_usage
                     FROM conversation_usages
-                    WHERE created_at >= %s
+                    WHERE user_id = %s AND created_at >= %s
                     ORDER BY created_at DESC
                     LIMIT 500
                     """,
-                    (since,),
+                    (user_id, since),
                 )
                 rows = await cur.fetchall()
                 for row in rows:
@@ -152,11 +155,11 @@ async def _fetch_usage_stats_24h(
                         """
                         SELECT provider, model_key, completed_at, created_at
                         FROM dalton_llm_journal
-                        WHERE state = 'done' AND created_at >= %s
+                        WHERE user_id = %s AND state = 'done' AND created_at >= %s
                         ORDER BY created_at DESC
                         LIMIT 500
                         """,
-                        (since,),
+                        (user_id, since),
                     )
                     jrows = await cur.fetchall()
                     for jr in jrows:
@@ -175,8 +178,11 @@ async def _fetch_usage_stats_24h(
     return stats
 
 
-async def get_providers_status(user_id: str = LOCAL_DEV_USER_ID) -> dict[str, Any]:
+async def get_providers_status(*, user_id: str) -> dict[str, Any]:
     """Build the `GET /api/v1/dalton/providers/status` payload (P0N.8 §3)."""
+    if not user_id or not str(user_id).strip():
+        raise ValueError("user_id is required")
+    user_id = str(user_id).strip()
     from src.llms.llm import ModelConfig
 
     mc = ModelConfig()
@@ -240,7 +246,7 @@ async def get_providers_status(user_id: str = LOCAL_DEV_USER_ID) -> dict[str, An
         if p and p != "openclaw-broker" and p not in candidate_providers and p in flat_providers:
             candidate_providers.append(p)
 
-    usage_stats = await _fetch_usage_stats_24h(model_to_provider)
+    usage_stats = await _fetch_usage_stats_24h(model_to_provider, user_id=user_id)
 
     providers_out: list[dict[str, Any]] = []
     now = datetime.now(timezone.utc)
@@ -303,7 +309,7 @@ async def get_providers_status(user_id: str = LOCAL_DEV_USER_ID) -> dict[str, An
                     }
                 )
 
-        recent_events = await list_recent_provider_events(prov, limit=10)
+        recent_events = await list_recent_provider_events(prov, user_id=user_id, limit=10)
         recent_errors = [
             {
                 "at": ev.get("created_at"),
@@ -316,7 +322,7 @@ async def get_providers_status(user_id: str = LOCAL_DEV_USER_ID) -> dict[str, An
             for ev in recent_events
             if str(ev.get("kind") or "").endswith("fail")
         ]
-        errors_24h = await count_provider_errors_24h(prov)
+        errors_24h = await count_provider_errors_24h(prov, user_id=user_id)
         ust = usage_stats.get(prov) or {"calls_24h": 0, "last_success": None}
 
         # Also check latest probe_ok event if no usage last_success
@@ -362,7 +368,7 @@ async def get_providers_status(user_id: str = LOCAL_DEV_USER_ID) -> dict[str, An
         except Exception as e:
             broker_health = {"status": "error", "error": sanitize_error_text(str(e))}
 
-    avail_map = await explain_model_availability(user_id)
+    avail_map = await explain_model_availability(user_id=user_id)
     avail_set = {k for k, v in avail_map.items() if v.get("available")}
     role_warnings = check_roles(available_models=avail_set)
 
@@ -430,12 +436,15 @@ class _ProbeLLMService:
 async def probe_provider(
     provider: str,
     *,
-    user_id: str = LOCAL_DEV_USER_ID,
+    user_id: str,
     model: str | None = None,
     model_key: str | None = None,
     timeout_s: float = 30.0,
 ) -> dict[str, Any]:
     """Run a user-initiated live PONG probe against `provider` via `dalton_complete` (P0N.8 §4, P0H §4 P1/P2)."""
+    if not user_id or not str(user_id).strip():
+        raise ValueError("user_id is required")
+    user_id = str(user_id).strip()
     from src.llms.llm import ModelConfig
 
     mc = ModelConfig()
@@ -547,9 +556,12 @@ async def probe_provider(
         }
 
 
-async def get_available_models_report(user_id: str = LOCAL_DEV_USER_ID) -> dict[str, Any]:
+async def get_available_models_report(*, user_id: str) -> dict[str, Any]:
     """Return `GET /api/v1/dalton/providers/available-models` payload (P0N.8 §5)."""
-    report = await explain_model_availability(user_id)
+    if not user_id or not str(user_id).strip():
+        raise ValueError("user_id is required")
+    user_id = str(user_id).strip()
+    report = await explain_model_availability(user_id=user_id)
     available = sorted(k for k, v in report.items() if v.get("available"))
     return {
         "user_id": user_id,

@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 
 from psycopg.rows import dict_row
 
-from src.config.env import LOCAL_DEV_USER_ID, USD_TO_CREDITS_RATE
+from src.config.env import USD_TO_CREDITS_RATE
 from src.dalton.database.budget import (
     acquire_budget_advisory_lock,
     delete_task_cap,
@@ -454,11 +454,14 @@ async def reconcile_and_summarize_day(
     }
 
 
-async def get_budget_today(user_id: str = LOCAL_DEV_USER_ID) -> dict[str, Any]:
+async def get_budget_today(*, user_id: str) -> dict[str, Any]:
     """Public read function (P0.8 §10): reconcile and return today's budget state.
 
     Used by `/api/v1/dalton/budget/today`, PK preflight, Research Director, and PS automations.
     """
+    if not user_id or not str(user_id).strip():
+        raise ValueError("user_id is required")
+    user_id = str(user_id).strip()
     async with get_db_connection() as conn:
         async with conn.transaction():
             summary = await reconcile_and_summarize_day(conn, user_id)

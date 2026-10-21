@@ -9,9 +9,10 @@ import json
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, create_autospec
+from unittest.mock import create_autospec
 from zoneinfo import ZoneInfo
 
+from psycopg import AsyncCursor
 import pytest
 
 from src.dalton.autonomy.backoff import (
@@ -125,6 +126,13 @@ async def test_automation_naming_templates_and_schedule_helper(monkeypatch):
 
     # Test idempotent schedule_dalton_automation_helper (G4.5, A8) with create_autospec (L33)
     from src.server.database import automation as auto_db
+    from src.server.database import workspace as ws_db
+
+    mock_get_workspace = create_autospec(
+        ws_db.get_workspace,
+        return_value={"workspace_id": "ws-meta", "user_id": "user-1"},
+    )
+    monkeypatch.setattr(ws_db, "get_workspace", mock_get_workspace)
 
     store: list[dict[str, Any]] = []
 
@@ -225,9 +233,9 @@ async def test_automation_naming_templates_and_schedule_helper(monkeypatch):
     monkeypatch.setattr(auto_db, "update_automation", mock_update)
 
     res_create = await schedule_dalton_automation_helper(
-        "user-1",
         "dalton-meta-watch",
         specs[0],
+        user_id="user-1",
         workspace_id="ws-meta",
     )
     assert res_create["ok"] is True
@@ -235,7 +243,6 @@ async def test_automation_naming_templates_and_schedule_helper(monkeypatch):
 
     # A8: naive next_run_at gets ZoneInfo("Asia/Shanghai") attached
     res_once = await schedule_dalton_automation_helper(
-        "user-1",
         "dalton-meta-earn-2026q3-t0",
         {
             "name": "dalton-meta-earn-2026q3-t0",
@@ -244,6 +251,7 @@ async def test_automation_naming_templates_and_schedule_helper(monkeypatch):
             "timezone": "Asia/Shanghai",
             "instruction": "T0 flash",
         },
+        user_id="user-1",
         workspace_id="ws-meta",
     )
     assert res_once["ok"] is True
@@ -436,6 +444,19 @@ async def test_preflight_direct_wake_vs_llm_triage_and_fallback(monkeypatch):
         "workspace_id": "22222222-2222-2222-2222-222222222222",
     }
     assert is_dalton_automation(auto) is True
+    from src.server.database import workspace as ws_db
+
+    monkeypatch.setattr(
+        ws_db,
+        "get_workspace",
+        create_autospec(
+            ws_db.get_workspace,
+            return_value={
+                "workspace_id": "22222222-2222-2222-2222-222222222222",
+                "user_id": "local-dev-user",
+            },
+        ),
+    )
 
     # Case 1: Routine Form 4 -> assist_json (autospec!) returns wake=False -> preflight skips
     mock_assist_skip = create_autospec(assist_json)
@@ -545,6 +566,19 @@ async def test_a1_budget_keys_a3_timeout_a5_agenda_note_a7_director_a9_once_defe
     assert board["budget"]["allocatable_usd"] == 0.0
 
     # A9: When budget is exhausted on a 'once' automation, preflight postpones next_run_at by +1d and settlement uses defer_once_1d
+    from src.server.database import workspace as ws_db
+
+    monkeypatch.setattr(
+        ws_db,
+        "get_workspace",
+        create_autospec(
+            ws_db.get_workspace,
+            return_value={
+                "workspace_id": "22222222-2222-2222-2222-222222222222",
+                "user_id": "local-dev-user",
+            },
+        ),
+    )
     mock_log_budget = create_autospec(watch_db.insert_preflight_log)
     mock_log_budget.return_value = {}
     monkeypatch.setattr(watch_db, "insert_preflight_log", mock_log_budget)
@@ -590,6 +624,7 @@ async def test_a1_budget_keys_a3_timeout_a5_agenda_note_a7_director_a9_once_defe
             "automation_id": "11111111-1111-1111-1111-111111111111",
             "name": "dalton-meta-watch",
             "trigger_type": "cron",
+            "user_id": "local-dev-user",
             "workspace_id": "22222222-2222-2222-2222-222222222222",
         },
         "exec-timeout",
@@ -697,6 +732,7 @@ async def test_a1_budget_keys_a3_timeout_a5_agenda_note_a7_director_a9_once_defe
             "automation_id": "11111111-1111-1111-1111-111111111111",
             "name": "dalton-meta-watch",
             "trigger_type": "cron",
+            "user_id": "local-dev-user",
             "workspace_id": "22222222-2222-2222-2222-222222222222",
         },
         "33333333-3333-3333-3333-333333333333",
@@ -713,11 +749,25 @@ async def test_a1_budget_keys_a3_timeout_a5_agenda_note_a7_director_a9_once_defe
 
 
 @pytest.mark.asyncio
-async def test_preflight_check_skips_when_no_signals_and_wakes_once():
+async def test_preflight_check_skips_when_no_signals_and_wakes_once(monkeypatch):
+    from src.server.database import workspace as ws_db
+
+    monkeypatch.setattr(
+        ws_db,
+        "get_workspace",
+        create_autospec(
+            ws_db.get_workspace,
+            return_value={
+                "workspace_id": "22222222-2222-2222-2222-222222222222",
+                "user_id": "local-dev-user",
+            },
+        ),
+    )
     auto = {
         "automation_id": "11111111-1111-1111-1111-111111111111",
         "name": "dalton-meta-watch",
         "trigger_type": "cron",
+        "user_id": "local-dev-user",
         "workspace_id": "22222222-2222-2222-2222-222222222222",
     }
     watch_state: dict = {}
@@ -806,11 +856,15 @@ async def test_signal_lifecycle_resolve_and_expire(monkeypatch):
     assert mock_resolve.call_args.kwargs["resolved_by"] == "VD-20261018-01"
 
     # Test expire_old_signals with mock cursor
-    mock_cur = AsyncMock()
+    mock_cur = create_autospec(AsyncCursor, instance=True)
     mock_cur.fetchall.return_value = [
         {"signal_id": "sig-old-1", "signal_key": "filing:old", "status": "pending"}
     ]
-    expired = await watch_db.expire_old_signals(mock_cur, max_age_days=7)
+    expired = await watch_db.expire_old_signals(
+        mock_cur,
+        max_age_days=7,
+        workspace_id="22222222-2222-2222-2222-222222222222",
+    )
     assert len(expired) == 1
     assert expired[0]["status"] == "expired"
     sql_executed = mock_cur.execute.call_args[0][0]
@@ -926,6 +980,19 @@ async def test_p0i_i5_autonomy_low_risk_fixes(
     )
 
     # 4. preflight.py returns skip with reason="claim_failed" when claim_signals_woken raises
+    from src.server.database import workspace as ws_db
+
+    monkeypatch.setattr(
+        ws_db,
+        "get_workspace",
+        create_autospec(
+            ws_db.get_workspace,
+            return_value={
+                "workspace_id": "22222222-2222-2222-2222-222222222222",
+                "user_id": "u-1",
+            },
+        ),
+    )
     monkeypatch.setattr(
         preflight_mod,
         "_check_budget_available",

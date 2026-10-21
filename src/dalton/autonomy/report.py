@@ -9,7 +9,6 @@ from typing import Any
 
 from psycopg.rows import dict_row
 
-from src.config.env import LOCAL_DEV_USER_ID
 from src.dalton.budget.service import get_budget_today
 from src.server.database.pool import get_db_connection
 
@@ -31,6 +30,9 @@ async def generate_weekly_autonomy_report(
     week: str | None = None,
 ) -> dict[str, Any]:
     """Compile a 7-day autonomy report across preflight logs, signals, verdicts, and publications."""
+    if not user_id or not str(user_id).strip():
+        raise ValueError("user_id is required")
+    user_id = str(user_id).strip()
     now = datetime.now(timezone.utc)
     since = now - timedelta(days=days)
 
@@ -52,11 +54,16 @@ async def generate_weekly_autonomy_report(
             async with conn.cursor(row_factory=dict_row) as cur:
                 await cur.execute(
                     """
-                    SELECT decision, reason
-                    FROM dalton_preflight_log
-                    WHERE checked_at >= %s
+                    SELECT p.decision, p.reason
+                    FROM dalton_preflight_log p
+                    LEFT JOIN workspaces w ON w.workspace_id = p.workspace_id
+                    LEFT JOIN automations a ON a.automation_id = p.automation_id
+                    WHERE p.checked_at >= %s
+                      AND COALESCE(w.user_id, a.user_id) = %s
+                      AND (w.user_id IS NULL OR w.user_id = %s)
+                      AND (a.user_id IS NULL OR a.user_id = %s)
                     """,
-                    (since,),
+                    (since, user_id, user_id, user_id),
                 )
                 for row in await cur.fetchall():
                     preflight_total += 1
@@ -69,11 +76,17 @@ async def generate_weekly_autonomy_report(
 
                 await cur.execute(
                     """
-                    SELECT woken_execution_id, resolved_at, expired_at
-                    FROM dalton_signals
-                    WHERE detected_at >= %s
+                    SELECT s.woken_execution_id, s.resolved_at, s.expired_at
+                    FROM dalton_signals s
+                    LEFT JOIN workspaces w ON w.workspace_id = s.workspace_id
+                    LEFT JOIN automation_executions e ON e.automation_execution_id = s.woken_execution_id
+                    LEFT JOIN automations a ON a.automation_id = e.automation_id
+                    WHERE s.detected_at >= %s
+                      AND COALESCE(w.user_id, a.user_id) = %s
+                      AND (w.user_id IS NULL OR w.user_id = %s)
+                      AND (a.user_id IS NULL OR a.user_id = %s)
                     """,
-                    (since,),
+                    (since, user_id, user_id, user_id),
                 )
                 for row in await cur.fetchall():
                     signals_detected += 1
@@ -88,9 +101,9 @@ async def generate_weekly_autonomy_report(
                     """
                     SELECT workspace_id, ticker, word
                     FROM dalton_verdicts
-                    WHERE verdict_at >= %s
+                    WHERE user_id = %s AND verdict_at >= %s
                     """,
-                    (since,),
+                    (user_id, since),
                 )
                 for row in await cur.fetchall():
                     v = str(row.get("word") or "")
@@ -102,9 +115,9 @@ async def generate_weekly_autonomy_report(
                     """
                     SELECT COUNT(*) AS cnt
                     FROM dalton_publications
-                    WHERE created_at >= %s
+                    WHERE user_id = %s AND created_at >= %s
                     """,
-                    (since,),
+                    (user_id, since),
                 )
                 pub_row = await cur.fetchone()
                 publications_count = int((pub_row or {}).get("cnt") or 0)
@@ -113,8 +126,9 @@ async def generate_weekly_autonomy_report(
                     """
                     SELECT COUNT(*) AS cnt
                     FROM dalton_publish_requests
-                    WHERE status = 'awaiting_pm'
-                    """
+                    WHERE user_id = %s AND status = 'awaiting_pm'
+                    """,
+                    (user_id,),
                 )
                 req_row = await cur.fetchone()
                 pending_approvals_count = int((req_row or {}).get("cnt") or 0)
@@ -123,7 +137,7 @@ async def generate_weekly_autonomy_report(
 
     budget: dict[str, Any] = {}
     try:
-        budget = await get_budget_today(user_id=user_id or LOCAL_DEV_USER_ID)
+        budget = await get_budget_today(user_id=user_id)
     except Exception as e:
         logger.warning("[DALTON_WEEK_REPORT] get_budget_today failed: %s", e)
 

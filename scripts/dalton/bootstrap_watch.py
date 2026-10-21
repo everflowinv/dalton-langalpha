@@ -69,9 +69,9 @@ async def _seed_workspace_cik(workspace_id: str, ticker: str) -> None:
 
 async def _upsert_automation_spec(user_id: str, spec: dict[str, Any]) -> dict[str, Any]:
     return await schedule_dalton_automation_helper(
-        user_id,
         spec["name"],
         spec,
+        user_id=user_id,
         workspace_id=spec.get("workspace_id"),
     )
 

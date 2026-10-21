@@ -87,33 +87,9 @@ def _require_pm_user(user_id: str) -> None:
 async def _verify_workspace_access(workspace_id: str, user_id: str) -> None:
     """Verify that ``workspace_id`` belongs to ``user_id`` fail-closed (G2 #2, R4-8, R5-1, P0J §8.1 #14)."""
     _require_dalton_enabled()
-    try:
-        from src.server.database.workspace import get_workspace
+    from src.dalton.auth import verify_workspace_access
 
-        ws = await get_workspace(workspace_id)
-    except HTTPException:
-        raise
-    except Exception as exc:
-        logger.error(
-            "Database error verifying workspace access for workspace_id=%s: %s",
-            workspace_id,
-            exc,
-        )
-        raise HTTPException(
-            status_code=503,
-            detail="Database unavailable while verifying workspace access",
-        ) from exc
-    if ws is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Workspace '{workspace_id}' not found",
-        )
-    owner = str(ws.get("user_id") or "").strip()
-    if not owner or owner != str(user_id):
-        raise HTTPException(
-            status_code=403,
-            detail="Workspace does not belong to current user",
-        )
+    await verify_workspace_access(workspace_id, user_id)
 
 
 # ---------------------------------------------------------------------------
@@ -248,7 +224,7 @@ async def delete_task_cap_endpoint(
 @handle_api_exceptions("get dalton budget today", logger)
 async def get_budget_today_endpoint(user_id: CurrentUserId) -> dict[str, Any]:
     _require_dalton_enabled()
-    return await get_budget_today(user_id)
+    return await get_budget_today(user_id=user_id)
 
 
 # ---------------------------------------------------------------------------
@@ -433,16 +409,22 @@ async def put_dalton_automation_endpoint(
     user_id: CurrentUserId,
 ) -> dict[str, Any]:
     _require_dalton_enabled()
-    if body.workspace_id:
-        await _verify_workspace_access(body.workspace_id, user_id)
+    from src.dalton.auth import resolve_caller_home_workspace_id
     from src.dalton.tools.director_tools import schedule_dalton_automation_helper
 
     spec = body.entry or body.spec or body.model_dump(exclude={"workspace_id", "entry", "spec"}, exclude_none=True)
+    raw_ws = body.workspace_id if body.workspace_id is not None else (spec or {}).get("workspace_id")
+    ws_str = str(raw_ws or "").strip()
+    if not ws_str or ws_str.lower() == "home":
+        resolved_ws_id = await resolve_caller_home_workspace_id(user_id)
+    else:
+        await _verify_workspace_access(ws_str, user_id)
+        resolved_ws_id = ws_str
     return await schedule_dalton_automation_helper(
         user_id=user_id,
         name=name,
         spec=spec,
-        workspace_id=body.workspace_id,
+        workspace_id=resolved_ws_id,
     )
 
 

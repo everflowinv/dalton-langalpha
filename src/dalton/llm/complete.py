@@ -12,7 +12,6 @@ from typing import Any, Literal, Type
 
 from pydantic import BaseModel
 
-from src.config.env import LOCAL_DEV_USER_ID
 from src.dalton.budget.port import (
     format_daily_budget_exhausted_message,
     format_task_cap_exhausted_message,
@@ -419,7 +418,7 @@ def _finish(result: DaltonCompleteResult, *, raise_on_error: bool) -> DaltonComp
 async def dalton_complete(
     llm_service: Any = None,
     *,
-    user_id: str | None = LOCAL_DEV_USER_ID,
+    user_id: str,
     user_prompt: str = "",
     system_prompt: str | None = None,
     scope_ref: str | None = None,
@@ -467,7 +466,9 @@ async def dalton_complete(
         slot=slot,
     )
     inv_id = invocation_id or computed_inv_id
-    eff_user_id = user_id or LOCAL_DEV_USER_ID
+    if not user_id or not str(user_id).strip():
+        raise ValueError("user_id is required")
+    eff_user_id = str(user_id).strip()
 
     # 1. Inspect journal first so cached replays (`done`) and indeterminate/in-flight states
     #    return immediately without charging or re-sending.

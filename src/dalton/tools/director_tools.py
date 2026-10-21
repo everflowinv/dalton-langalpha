@@ -4,17 +4,18 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import date, datetime, timezone
+from datetime import date
 from typing import Any, Optional
 
+from fastapi import HTTPException
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool, tool
 
-from src.config.env import LOCAL_DEV_USER_ID
+from src.dalton.auth import verify_workspace_access
 from src.dalton.autonomy.board import build_coverage_board
 from src.dalton.autonomy.schedule import (
-    schedule_dalton_automation_helper,
-    validate_automation_name,
+    schedule_dalton_automation_helper as schedule_dalton_automation_helper,
+    validate_automation_name as validate_automation_name,
 )
 from src.dalton.database import plans as plans_db
 from src.dalton.settings import get_dalton_settings
@@ -102,7 +103,9 @@ def build_director_tools(
             JSON string with `date`, `tz`, `budget`, `companies`, `candidates`, and `est_cost_by_kind`.
         """
         configurable = (config or {}).get("configurable") or {}
-        user_id = str(configurable.get("user_id") or LOCAL_DEV_USER_ID)
+        user_id = str(configurable.get("user_id") or "").strip()
+        if not user_id:
+            raise ValueError("user_id is required")
         board = await build_coverage_board(user_id=user_id)
         return json.dumps(board, ensure_ascii=False, default=str)
 
@@ -126,7 +129,12 @@ def build_director_tools(
             plan_date: Optional ISO date string (`YYYY-MM-DD`); defaults to today.
         """
         configurable = (config or {}).get("configurable") or {}
-        user_id = str(configurable.get("user_id") or LOCAL_DEV_USER_ID)
+        user_id = str(configurable.get("user_id") or "").strip()
+        if not user_id:
+            raise ValueError("user_id is required")
+        for d in dispatches or []:
+            if isinstance(d, dict) and ("workspace_id" in d or d.get("workspace_id")):
+                await verify_workspace_access(str(d.get("workspace_id") or ""), user_id)
         board = await build_coverage_board(user_id=user_id)
         budget = board.get("budget") or {}
         cap_usd = float(budget.get("cap_usd") or 0.0)
@@ -154,22 +162,14 @@ def build_director_tools(
         configurable = (config or {}).get("configurable") or {}
         thread_id = configurable.get("thread_id")
 
-        existing = await plans_db.get_daily_plan(p_date)
         board_snap = {
+            "user_id": user_id,
             "companies_count": len(board.get("companies") or []),
             "candidates": board.get("candidates") or [],
         }
-        if existing:
-            revs = list((existing.get("board_snapshot") or {}).get("revisions") or [])
-            revs.append(
-                {
-                    "replaced_at": datetime.now(timezone.utc).isoformat(),
-                    "dispatches": existing.get("dispatches") or [],
-                }
-            )
-            board_snap["revisions"] = revs
 
         saved = await plans_db.upsert_daily_plan(
+            user_id=user_id,
             plan_date=p_date,
             budget_snapshot=budget,
             board_snapshot=board_snap,
@@ -233,12 +233,15 @@ def build_director_tools(
             why: Context or rationale for adding this question.
             ticker: Optional ticker symbol (e.g. "AMZN").
         """
+        configurable = (config or {}).get("configurable") or {}
+        user_id = str(configurable.get("user_id") or "").strip()
+        if not user_id:
+            raise ValueError("user_id is required")
+        await verify_workspace_access(workspace_id, user_id)
         try:
             from src.dalton.database.knowledge import latest_version
             from src.dalton.knowledge.service import apply_update
 
-            configurable = (config or {}).get("configurable") or {}
-            user_id = str(configurable.get("user_id") or LOCAL_DEV_USER_ID)
             latest = await latest_version(workspace_id, "agenda")
             base_ver = int(latest["version_no"]) if latest else None
             urg_norm = {
@@ -276,6 +279,8 @@ def build_director_tools(
                 thread_id=str(configurable.get("thread_id")) if configurable.get("thread_id") else None,
             )
             return json.dumps(res, ensure_ascii=False, default=str)
+        except HTTPException:
+            raise
         except Exception as e:
             logger.warning("[DALTON_DIRECTOR] dalton_agenda_note fallback: %s", e)
             return json.dumps(
@@ -311,10 +316,10 @@ def build_director_tools(
             workspace_id: Workspace UUID (defaults to current workspace in config).
             ticker: Optional company ticker for naming validation.
         """
-        from src.dalton.autonomy.schedule import schedule_dalton_automation_helper
-
         configurable = (config or {}).get("configurable") or {}
-        user_id = str(configurable.get("user_id") or LOCAL_DEV_USER_ID)
+        user_id = str(configurable.get("user_id") or "").strip()
+        if not user_id:
+            raise ValueError("user_id is required")
         ws_id = workspace_id or configurable.get("workspace_id")
         tz = timezone_name or get_dalton_settings().autonomy.timezone
 
@@ -331,9 +336,9 @@ def build_director_tools(
             "ticker": ticker,
         }
         result = await schedule_dalton_automation_helper(
-            user_id,
             name,
             spec,
+            user_id=user_id,
             workspace_id=ws_id,
             ticker=ticker,
             role=role,

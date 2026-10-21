@@ -180,6 +180,46 @@ def is_budget_gate_enabled() -> bool:
 is_dalton_budget_gate_enabled = is_budget_gate_enabled
 
 
+SUPABASE_PUBLISHABLE_KEY: str = os.getenv("SUPABASE_PUBLISHABLE_KEY", "")
+_IMPORT_SUPABASE_PUBLISHABLE_KEY = SUPABASE_PUBLISHABLE_KEY
+
+
+def get_supabase_publishable_key() -> str:
+    """Return ``SUPABASE_PUBLISHABLE_KEY`` from environment or settings."""
+    from src.config import settings as app_settings
+
+    app_val = getattr(app_settings, "SUPABASE_PUBLISHABLE_KEY", None)
+    if isinstance(app_val, str) and app_val.strip():
+        return app_val.strip()
+    if SUPABASE_PUBLISHABLE_KEY != _IMPORT_SUPABASE_PUBLISHABLE_KEY:
+        return SUPABASE_PUBLISHABLE_KEY.strip()
+    return os.getenv("SUPABASE_PUBLISHABLE_KEY", SUPABASE_PUBLISHABLE_KEY).strip()
+
+
+def get_dalton_auth_mode() -> str:
+    """Return ``DALTON_AUTH_MODE`` normalized to lowercase (default ``oss``, optional ``supabase``)."""
+    raw = os.getenv("DALTON_AUTH_MODE", "oss").strip().lower()
+    return raw or "oss"
+
+
+def get_dalton_allowed_emails() -> frozenset[str]:
+    """Return lowercase email allowlist parsed from ``DALTON_ALLOWED_EMAILS`` (comma-separated)."""
+    raw = os.getenv("DALTON_ALLOWED_EMAILS", "")
+    return frozenset(e.strip().lower() for e in raw.split(",") if e.strip())
+
+
+def is_dalton_supabase_auth_enabled() -> bool:
+    """Whether Dalton Supabase authentication + email allowlist is active in OSS mode.
+
+    Returns True whenever ``HOST_MODE == 'oss'`` and ``DALTON_AUTH_MODE == 'supabase'``
+    so a missing ``SUPABASE_URL`` enters the Dalton auth path and fails closed with 503
+    instead of falling back to passwordless ``local-dev-user``.
+    """
+    from src.config import settings as app_settings
+
+    return app_settings.HOST_MODE == "oss" and get_dalton_auth_mode() == "supabase"
+
+
 def is_broker_models_enabled() -> bool:
     """Whether OpenClaw broker v2 (`ocb-*`) models are enabled in the catalog (P0N.1)."""
     env_flag = os.getenv("DALTON_BROKER_ENABLED")

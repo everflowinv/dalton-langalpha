@@ -21,7 +21,6 @@ from typing import Any
 import jsonschema
 import yaml
 
-from src.config.env import LOCAL_DEV_USER_ID
 from src.dalton.database.provider_events import sanitize_error_text
 from src.dalton.llm.complete import dalton_complete
 from src.dalton.settings import DALTON_YAML_PATH, REPO_ROOT, get_assist_fallback_models
@@ -168,7 +167,7 @@ async def assist_json(
     payload: dict[str, Any],
     schema: dict[str, Any],
     *,
-    user_id: str = LOCAL_DEV_USER_ID,
+    user_id: str,
     role: str = "assist",
     scope_ref: str | None = None,
     timeout_s: float = 60.0,
@@ -183,7 +182,9 @@ async def assist_json(
     """
     t0 = time.monotonic()
     resolved_model = str(model or "")
-    user_id = str(user_id or LOCAL_DEV_USER_ID).strip()
+    if not user_id or not str(user_id).strip():
+        raise ValueError("user_id is required")
+    user_id = str(user_id).strip()
 
     try:
         resolved_model = resolve_assist_model(role=role, explicit_model=model)

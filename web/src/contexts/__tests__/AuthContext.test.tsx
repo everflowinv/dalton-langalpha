@@ -15,6 +15,7 @@ const mockOnAuthStateChange = vi.fn().mockReturnValue({
 });
 
 const mockSignUp = vi.fn().mockResolvedValue({ data: { user: null, session: null }, error: null });
+const mockSignOut = vi.fn().mockResolvedValue({ error: null }); // DALTON-HOOK(dalton-auth): spy on signOut for 403 logout tests
 const mockSignInWithOtp = vi.fn().mockResolvedValue({ data: { user: null, session: null }, error: null });
 const mockResetPasswordForEmail = vi.fn().mockResolvedValue({ data: {}, error: null });
 const mockResend = vi.fn().mockResolvedValue({ data: { user: null, session: null }, error: null });
@@ -29,7 +30,7 @@ vi.mock('../../lib/supabase', () => ({
       signInWithPassword: vi.fn(),
       signUp: (...args: unknown[]) => mockSignUp(...args),
       signInWithOAuth: vi.fn(),
-      signOut: vi.fn(),
+      signOut: (...args: unknown[]) => mockSignOut(...args),
       signInWithOtp: (...args: unknown[]) => mockSignInWithOtp(...args),
       resetPasswordForEmail: (...args: unknown[]) => mockResetPasswordForEmail(...args),
       resend: (...args: unknown[]) => mockResend(...args),
@@ -74,6 +75,19 @@ vi.mock('@/pages/ChatAgent/hooks/useNavigationData', () => ({
 vi.mock('@/lib/navThreadsStore', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/lib/navThreadsStore')>()),
   resetSharedWorkspaceThreads: () => mockResetSharedWorkspaceThreads(),
+}));
+
+// DALTON-HOOK(dalton-auth): mock toast and daltonAuth switch for 403 logout & INITIAL_SESSION sync tests
+const mockToast = vi.fn();
+vi.mock('@/components/ui/use-toast', () => ({
+  toast: (...args: unknown[]) => mockToast(...args),
+}));
+
+const daltonAuthState = { isDaltonAuth: false };
+vi.mock('@/config/daltonAuth', () => ({
+  get isDaltonAuth() {
+    return daltonAuthState.isDaltonAuth;
+  },
 }));
 
 // Dynamic import so mocks and env stubs are applied first
@@ -368,6 +382,221 @@ describe('AuthContext', () => {
       });
 
       expect(mockClearAuthToken).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  // DALTON-HOOK(dalton-auth): verify 403 sign-out gating on isDaltonAuth and INITIAL_SESSION sync
+  describe('Dalton auth 403 sign-out and INITIAL_SESSION sync', () => {
+    const session = {
+      user: { id: 'user-dalton-1', email: 'revoked@dalton.org', user_metadata: {} },
+      access_token: 'tok-dalton',
+      expires_at: 4102444800,
+    };
+
+    beforeEach(() => {
+      daltonAuthState.isDaltonAuth = false;
+    });
+
+    it('does not sign out on /auth/sync 403 or sync on INITIAL_SESSION when isDaltonAuth is false', async () => {
+      const fetchSpy = vi
+        .spyOn(globalThis, 'fetch')
+        .mockResolvedValue(new Response(null, { status: 403 }));
+
+      renderWithQueryClient(
+        <AuthProvider>
+          <TestConsumer />
+        </AuthProvider>
+      );
+      await waitFor(() => expect(mockOnAuthStateChange).toHaveBeenCalled());
+      const handler = mockOnAuthStateChange.mock.calls[0][0] as (
+        event: string,
+        session: unknown,
+      ) => void;
+
+      await act(async () => {
+        handler('INITIAL_SESSION', session);
+      });
+      expect(fetchSpy).not.toHaveBeenCalled();
+
+      await act(async () => {
+        handler('SIGNED_IN', session);
+      });
+      await waitFor(() => expect(fetchSpy).toHaveBeenCalledTimes(1));
+      expect(mockSignOut).not.toHaveBeenCalled();
+      expect(mockToast).not.toHaveBeenCalled();
+
+      fetchSpy.mockRestore();
+    });
+
+    it('syncs on INITIAL_SESSION when isDaltonAuth is true and signs out with toast on 403', async () => {
+      daltonAuthState.isDaltonAuth = true;
+      const fetchSpy = vi
+        .spyOn(globalThis, 'fetch')
+        .mockResolvedValue(new Response(null, { status: 403 }));
+
+      renderWithQueryClient(
+        <AuthProvider>
+          <TestConsumer />
+        </AuthProvider>
+      );
+      await waitFor(() => expect(mockOnAuthStateChange).toHaveBeenCalled());
+      const handler = mockOnAuthStateChange.mock.calls[0][0] as (
+        event: string,
+        session: unknown,
+      ) => void;
+
+      await act(async () => {
+        handler('INITIAL_SESSION', session);
+      });
+
+      await waitFor(() => expect(fetchSpy).toHaveBeenCalledTimes(1));
+      await waitFor(() => expect(mockSignOut).toHaveBeenCalledTimes(1));
+      expect(mockToast).toHaveBeenCalledWith({
+        variant: 'destructive',
+        title: '该账号无权访问',
+      });
+
+      fetchSpy.mockRestore();
+      daltonAuthState.isDaltonAuth = false;
+    });
+
+    it('does not coalesce /auth/sync across users or sign out account B when account A in-flight sync returns 403', async () => {
+      daltonAuthState.isDaltonAuth = true;
+
+      const sessionA = {
+        user: { id: 'user-a', email: 'a@outside.org', user_metadata: {} },
+        access_token: 'tok-a',
+        expires_at: 4102444800,
+      };
+      const sessionB = {
+        user: { id: 'user-b', email: 'b@dalton.org', user_metadata: {} },
+        access_token: 'tok-b',
+        expires_at: 4102444800,
+      };
+
+      let resolveFetchA!: (value: Response) => void;
+      const fetchAPromise = new Promise<Response>((resolve) => {
+        resolveFetchA = resolve;
+      });
+      let resolveFetchB!: (value: Response) => void;
+      const fetchBPromise = new Promise<Response>((resolve) => {
+        resolveFetchB = resolve;
+      });
+
+      const fetchSpy = vi
+        .spyOn(globalThis, 'fetch')
+        .mockImplementation((_input, init) => {
+          const authHeader = (init?.headers as Record<string, string> | undefined)?.Authorization;
+          if (authHeader === 'Bearer tok-a') {
+            return fetchAPromise;
+          }
+          return fetchBPromise;
+        });
+
+      renderWithQueryClient(
+        <AuthProvider>
+          <TestConsumer />
+        </AuthProvider>
+      );
+      await waitFor(() => expect(mockOnAuthStateChange).toHaveBeenCalled());
+      const handler = mockOnAuthStateChange.mock.calls[0][0] as (
+        event: string,
+        session: unknown,
+      ) => void;
+
+      // 1. Account A signs in; A's /auth/sync is in flight
+      await act(async () => {
+        handler('SIGNED_IN', sessionA);
+      });
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      expect(screen.getByTestId('userId').textContent).toBe('user-a');
+
+      // 2. Switch to account B before A's /auth/sync returns -> B sends its own /auth/sync
+      await act(async () => {
+        handler('SIGNED_IN', sessionB);
+      });
+      expect(fetchSpy).toHaveBeenCalledTimes(2);
+      expect(screen.getByTestId('userId').textContent).toBe('user-b');
+
+      // 3. A's stale /auth/sync returns 403 -> must NOT sign out B or show toast
+      await act(async () => {
+        resolveFetchA(new Response(null, { status: 403 }));
+        await fetchAPromise;
+      });
+      expect(mockSignOut).not.toHaveBeenCalled();
+      expect(mockToast).not.toHaveBeenCalled();
+      expect(screen.getByTestId('userId').textContent).toBe('user-b');
+      expect(screen.getByTestId('isLoggedIn').textContent).toBe('true');
+
+      // 4. B's /auth/sync succeeds cleanly
+      await act(async () => {
+        resolveFetchB(
+          new Response(JSON.stringify({ user: { user: 'user-b' }, preferences: null }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          })
+        );
+        await fetchBPromise;
+      });
+      expect(mockSignOut).not.toHaveBeenCalled();
+
+      fetchSpy.mockRestore();
+      daltonAuthState.isDaltonAuth = false;
+    });
+
+    it('preserves upstream single-promise deduplication when isDaltonAuth is false', async () => {
+      daltonAuthState.isDaltonAuth = false;
+
+      const sessionA = {
+        user: { id: 'user-a', email: 'a@example.com', user_metadata: {} },
+        access_token: 'tok-a',
+        expires_at: 4102444800,
+      };
+      const sessionB = {
+        user: { id: 'user-b', email: 'b@example.com', user_metadata: {} },
+        access_token: 'tok-b',
+        expires_at: 4102444800,
+      };
+
+      let resolveFetch!: (value: Response) => void;
+      const fetchPromise = new Promise<Response>((resolve) => {
+        resolveFetch = resolve;
+      });
+      const fetchSpy = vi.spyOn(globalThis, 'fetch').mockReturnValue(fetchPromise);
+
+      renderWithQueryClient(
+        <AuthProvider>
+          <TestConsumer />
+        </AuthProvider>
+      );
+      await waitFor(() => expect(mockOnAuthStateChange).toHaveBeenCalled());
+      const handler = mockOnAuthStateChange.mock.calls[0][0] as (
+        event: string,
+        session: unknown,
+      ) => void;
+
+      await act(async () => {
+        handler('SIGNED_IN', sessionA);
+      });
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+
+      await act(async () => {
+        handler('SIGNED_IN', sessionB);
+      });
+      // When isDaltonAuth is false, upstream single _syncPromise coalesces concurrent syncs
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+
+      await act(async () => {
+        resolveFetch(
+          new Response(JSON.stringify({ preferences: { theme: 'dark' } }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          })
+        );
+        await fetchPromise;
+      });
+
+      fetchSpy.mockRestore();
     });
   });
 });

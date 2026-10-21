@@ -6,6 +6,7 @@ import { useTranslation, Trans } from 'react-i18next';
 import { BrandMark } from '@/components/brand/BrandMark'; // DALTON-HOOK(brand-name)
 import { BRAND_MARK, BRAND_NAME } from '@/config/brand'; // DALTON-HOOK(brand-name)
 import { useAuth } from '../../contexts/AuthContext';
+import { isDaltonAuth } from '../../config/daltonAuth'; // DALTON-HOOK(dalton-auth): restrict login page to email+password without signup
 import { authErrorMessage, type AuthErrorInfo } from '../../lib/authErrors';
 import PasswordInput from './PasswordInput';
 import PasswordStrength from './PasswordStrength';
@@ -89,8 +90,9 @@ function LoginPage() {
     resendConfirmation,
   } = useAuth();
   const [searchParams] = useSearchParams();
+  // DALTON-HOOK(dalton-auth): start directly on email+password view without signup or OAuth method picker
   const [view, setView] = useState<LoginView>(
-    searchParams.get('mode') === 'signup' ? 'signup' : 'method'
+    isDaltonAuth ? 'login' : searchParams.get('mode') === 'signup' ? 'signup' : 'method'
   );
   const [loginEmail, setLoginEmail] = useState('');
   const [loginPassword, setLoginPassword] = useState('');
@@ -364,7 +366,7 @@ function LoginPage() {
                     {t('auth.resendConfirmationCta')}
                   </button>
                 )}
-                {error.code === 'invalid_credentials' && (
+                {error.code === 'invalid_credentials' && !isDaltonAuth && (
                   /* Shown for every failed login (Supabase returns the same
                      code whether the password is wrong or the account is
                      OAuth-only, to prevent enumeration), so the hint must
@@ -389,10 +391,15 @@ function LoginPage() {
             >
               {isSubmitting ? t('auth.loggingIn') : t('auth.login')}
             </button>
-            <SwitchPrompt i18nKey="auth.noAccount" onSwitch={() => goToView('signup')} />
-            <button type="button" className="login-page__back" onClick={() => goToView('method')}>
-              {t('auth.backToOptions')}
-            </button>
+            {/* DALTON-HOOK(dalton-auth): hide signup entry and OAuth method back-button in Dalton auth mode */}
+            {!isDaltonAuth && (
+              <>
+                <SwitchPrompt i18nKey="auth.noAccount" onSwitch={() => goToView('signup')} />
+                <button type="button" className="login-page__back" onClick={() => goToView('method')}>
+                  {t('auth.backToOptions')}
+                </button>
+              </>
+            )}
           </form>
         )}
 

@@ -5,9 +5,11 @@ from __future__ import annotations
 import logging
 from typing import Annotated, Any, Literal
 
+from fastapi import HTTPException
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool, tool
 
+from src.dalton.auth import verify_workspace_access
 from src.dalton.knowledge.reconcile import apply_pending
 from src.dalton.knowledge.service import append_verdict, apply_update
 from src.server.database.pool import get_db_connection
@@ -149,6 +151,8 @@ async def resolve_verdict_signals(
             resolved_by=str(verdict_id) if verdict_id else None,
             execution_id=eff_exec_id,
         )
+    except (HTTPException, PermissionError, ValueError):
+        raise
     except Exception as e:
         logger.warning("[DALTON_KNOWLEDGE_TOOLS] Could not resolve signals for verdict %s: %s", verdict_id, e)
         return 0
@@ -189,6 +193,7 @@ def create_knowledge_tools(filesystem_backend: Any = None) -> list[BaseTool]:
         if not user_id or not workspace_id:
             return "ERROR: user_id and workspace_id are required in RunnableConfig."
 
+        await verify_workspace_access(workspace_id, user_id)
         await _maybe_reconcile(workspace_id, user_id)
         res = await apply_update(
             user_id=user_id,
@@ -221,6 +226,13 @@ def create_knowledge_tools(filesystem_backend: Any = None) -> list[BaseTool]:
         user_id, workspace_id, thread_id, run_id = _extract_run_identity(config)
         if not user_id or not workspace_id:
             return "ERROR: user_id and workspace_id are required in RunnableConfig."
+
+        await verify_workspace_access(workspace_id, user_id)
+        refs = extract_verdict_signal_refs(verdict)
+        if refs:
+            from src.dalton.database import watch as watch_db
+
+            await watch_db.verify_signal_refs_in_workspace(refs, workspace_id)
 
         await _maybe_reconcile(workspace_id, user_id)
         origin_type, auto_exec_id = await _resolve_thread_origin(thread_id)

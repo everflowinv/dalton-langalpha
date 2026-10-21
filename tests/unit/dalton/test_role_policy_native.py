@@ -140,6 +140,7 @@ async def test_resolve_assist_model_and_startup_wiring_reject_contributor_model(
         instructions="Return JSON",
         payload={"x": 1},
         schema={"type": "object"},
+        user_id="local-dev-user",
         model="muse-spark-1.3-contributor-oauth",
     )
     assert res.ok is False

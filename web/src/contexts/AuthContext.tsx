@@ -10,6 +10,7 @@ import { resetSharedWorkspaceThreads } from '@/lib/navThreadsStore';
 import { runAuthResets } from '../lib/authResets';
 import { detectedTimezone } from '@/lib/deviceTimezone';
 import { revokeAllConnectedApps } from '@/api/connectedApps';
+import { toast } from '@/components/ui/use-toast'; // DALTON-HOOK(dalton-auth): notify when /auth/sync returns 403
 
 import type {
   AuthError,
@@ -45,6 +46,7 @@ export interface AuthContextValue {
 const AuthContext = createContext<AuthContextValue | null>(null);
 
 import { isPlatformMode } from '@/config/hostMode';
+import { isDaltonAuth } from '@/config/daltonAuth'; // DALTON-HOOK(dalton-auth): enable Supabase auth in OSS mode
 import { LOCAL_USER_ID } from '@/config/localUser';
 import { withShellReturn } from '../lib/desktopAuthHandoff';
 
@@ -84,12 +86,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   // Skip all Supabase logic in OSS mode. `supabase` is checked separately
   // because it keys on the two Supabase env vars, not on the host mode: a
   // platform build with those unset still has no client to talk to.
-  if (!isPlatformMode || !supabase) {
+  // DALTON-HOOK(dalton-auth): use SupabaseAuthProvider when Dalton auth is enabled
+  if (!(isPlatformMode || isDaltonAuth) || !supabase) {
     // Say so loudly in that second case. The fallback renders a signed-in
     // local-dev UI, which for a platform build is a misconfiguration wearing a
     // working app's face: requests go out unauthenticated and the backend
     // rejects them, with nothing on screen to explain why.
-    if (isPlatformMode) {
+    if (isPlatformMode || isDaltonAuth) {
       console.error(
         '[auth] VITE_HOST_MODE=platform but VITE_SUPABASE_URL/_KEY are unset, '
         + 'so there is no auth client. Falling back to the local-dev context; '
@@ -104,6 +107,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
 // Module-level — deduplicates concurrent syncUser calls within the same tab
 let _syncPromise: Promise<void> | null = null;
+// DALTON-HOOK(dalton-auth): key in-flight /auth/sync promises by user id when isDaltonAuth is true
+const _syncPromises = new Map<string, Promise<void>>();
 
 /** Inner provider that uses hooks — only rendered when Supabase auth is enabled. */
 function SupabaseAuthProvider({ children }: { children: React.ReactNode }) {
@@ -120,8 +125,15 @@ function SupabaseAuthProvider({ children }: { children: React.ReactNode }) {
   /** Sync user on actual sign-in: create/migrate + backfill fields. Seed React Query cache. */
   const syncUser = useCallback(async (sess: Session) => {
     if (!sess) return;
-    if (_syncPromise) return _syncPromise;
-    _syncPromise = (async () => {
+    // DALTON-HOOK(dalton-auth): deduplicate /auth/sync per user and drop stale responses only when isDaltonAuth is true
+    const syncUserId = sess.user?.id ?? '';
+    if (isDaltonAuth) {
+      const existingPromise = _syncPromises.get(syncUserId);
+      if (existingPromise) return existingPromise;
+    } else if (_syncPromise) {
+      return _syncPromise;
+    }
+    const promise = (async () => {
       try {
         const token = sess.access_token;
         const meta = sess.user?.user_metadata ?? {};
@@ -141,8 +153,24 @@ function SupabaseAuthProvider({ children }: { children: React.ReactNode }) {
             // load. See `useSyncUserLocale`.
           }),
         });
+        // DALTON-HOOK(dalton-auth): drop stale response and sign out on 403 only in Dalton auth mode
+        if (isDaltonAuth && lastUserIdRef.current !== syncUserId) {
+          return;
+        }
+        if (isDaltonAuth && res.status === 403) {
+          toast({
+            variant: 'destructive',
+            title: '该账号无权访问',
+          });
+          await sb.auth.signOut();
+          queryClient.clear();
+          return;
+        }
         if (res.ok) {
           const data = await res.json();
+          if (isDaltonAuth && lastUserIdRef.current !== syncUserId) {
+            return;
+          }
           // Seed preferences cache (auth/sync is authoritative for these).
           // Do NOT seed user.me() here — auth/sync omits fields like
           // access_tier, and seeding would overwrite the correct value
@@ -155,11 +183,20 @@ function SupabaseAuthProvider({ children }: { children: React.ReactNode }) {
       } catch (err) {
         console.error('[auth] syncUser failed:', err);
       } finally {
-        _syncPromise = null;
+        if (isDaltonAuth) {
+          _syncPromises.delete(syncUserId);
+        } else {
+          _syncPromise = null;
+        }
       }
     })();
-    return _syncPromise;
-  }, [queryClient]);
+    if (isDaltonAuth) {
+      _syncPromises.set(syncUserId, promise);
+    } else {
+      _syncPromise = promise;
+    }
+    return promise;
+  }, [queryClient, sb]); // DALTON-HOOK(dalton-auth): include sb in syncUser deps for 403 signOut
 
   // Bootstrap: read existing session and listen for auth changes.
   useEffect(() => {
@@ -201,8 +238,9 @@ function SupabaseAuthProvider({ children }: { children: React.ReactNode }) {
       lastUserIdRef.current = sess?.user?.id ?? null;
       setSession(sess);
       if (sess) {
-        if (event === 'SIGNED_IN') {
-          syncUser(sess);  // Full sync only on actual login
+        // DALTON-HOOK(dalton-auth): also sync on INITIAL_SESSION when Dalton auth is enabled so 403 signs out
+        if (event === 'SIGNED_IN' || (isDaltonAuth && event === 'INITIAL_SESSION')) {
+          syncUser(sess);  // Full sync on actual login (and initial session in Dalton mode)
         } else if (event === 'INITIAL_SESSION' || event === 'TOKEN_REFRESHED') {
           // INITIAL_SESSION: getSession() above already triggers invalidation
           // TOKEN_REFRESHED: no backend call needed
@@ -232,12 +270,17 @@ function SupabaseAuthProvider({ children }: { children: React.ReactNode }) {
   );
 
   const signupWithEmail = useCallback(
-    (email: string, password: string, name: string) =>
-      sb.auth.signUp({
+    (email: string, password: string, name: string) => {
+      // DALTON-HOOK(dalton-auth): disable signupWithEmail in Dalton auth mode
+      if (isDaltonAuth) {
+        return Promise.resolve();
+      }
+      return sb.auth.signUp({
         email,
         password,
         options: { data: { name }, emailRedirectTo: emailConfirmUrl() },
-      }),
+      });
+    },
     [sb.auth]
   );
 
@@ -245,7 +288,8 @@ function SupabaseAuthProvider({ children }: { children: React.ReactNode }) {
     (email: string) =>
       sb.auth.signInWithOtp({
         email,
-        options: { shouldCreateUser: true, emailRedirectTo: emailConfirmUrl() },
+        // DALTON-HOOK(dalton-auth): do not create users via magic link in Dalton auth mode
+        options: { shouldCreateUser: !isDaltonAuth, emailRedirectTo: emailConfirmUrl() },
       }),
     [sb.auth]
   );

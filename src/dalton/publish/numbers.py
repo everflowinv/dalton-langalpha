@@ -9,8 +9,6 @@ from typing import Any, Literal, get_args
 
 from pydantic import BaseModel, Field, model_validator
 
-from src.config.env import LOCAL_DEV_USER_ID
-
 try:
     from src.dalton.llm.assist import assist_json
 except ImportError:  # pragma: no cover
@@ -1237,12 +1235,15 @@ async def label_figures_with_status(
     markdown_text: str,
     figures: list[ExtractedFigure],
     *,
-    user_id: str = LOCAL_DEV_USER_ID,
+    user_id: str,
     workspace_id: str | None = None,
     thread_id: str | None = None,
     stats_out: dict[str, Any] | None = None,
 ) -> tuple[list[ExtractedFigure], bool]:
     """Step B LLM figure labeling (`audit.label_figures`) across all figures and sections (P0I §1.4, L28, L35, L43)."""
+    if not user_id or not str(user_id).strip():
+        raise ValueError("user_id is required")
+    user_id = str(user_id).strip()
     total_initial = len(figures)
     if assist_json is None:
         for f in figures:

@@ -1832,6 +1832,15 @@ async def get_run_charge_usd(run_ref: str) -> Decimal | None
 | workspace-delete-guard | `src/server/app/workspaces.py` | `delete_workspace` 检查正式发布报告（G3.3 / L13） | 约 5 |
 | no-strike | `src/server/database/automation_executions.py` | `_count_strike` 豁免 `dalton-*` 自动停用并按时间退避（G4.4 / P0F.3） | 约 8 |
 | brand-name | `web/index.html`、`web/src/vite-env.d.ts`、`web/src/main.tsx`、`web/src/i18n.ts`、`web/src/locales/__tests__/keys.test.ts`、`web/src/contexts/ThemeContext.tsx`、`web/src/components/PageLoading/PageLoading.tsx`、`web/src/components/Sidebar/AppSidebar.tsx`、`web/src/pages/ChatAgent/components/chatView/mainAgent.ts`、`web/src/pages/ChatAgent/components/mcp/KindTile.tsx`、`web/src/pages/Login/LoginPage.tsx`、`web/src/pages/Setup/SetupWizard.tsx`、`web/src/pages/SharedChat/ShareTopBar.tsx`、`web/src/pages/SharedChat/ShareUnavailable.tsx`、`web/src/pages/SharedChat/SharedChatView.tsx`、`web/src/pages/Legal/Legal.tsx`、`web/src/pages/Legal/PrivacyPolicy.tsx` | 构建期品牌名称（`BRAND_NAME` / `{{brand}}` 插值）与图形标志（`BRAND_MARK` / `BrandMark` / favicon）切换，默认保持上游原样 | 各 1–5 |
+| dalton-auth | `src/server/auth/jwt_bearer.py` | `warm_jwks`、`verify_jwt_token`、`get_current_auth_info` 委托 Dalton Supabase 认证与邮箱白名单校验 | 各 3–5 |
+| dalton-auth | `src/server/utils/api.py` | `_service_token_user_id`（`>=32` 字符校验）、`get_current_user_id`、`get_optional_user_id`、`get_viewer` | 各 3–5 |
+| dalton-auth | `src/server/auth/ws_auth.py` | `authenticate_websocket` 委托 `authenticate_dalton_websocket` | 3 |
+| dalton-auth | `src/server/app/setup.py` | `lifespan` 启动时调用 `await log_dalton_auth_startup_if_enabled` | 约 4 |
+| dalton-auth | `src/config/settings.py` | `background_dispatch_requires_token` 要求合法 `INTERNAL_SERVICE_TOKEN` | 约 6 |
+| dalton-auth | `src/server/app/threads/messaging.py` | `_is_service_request` 与 `_handle_send_message`（`from_service` 复用 `_is_service_request`） | 各 3–7 |
+| dalton-auth | `src/server/app/users.py` | `sync_user`（令牌邮箱校验与禁用邮箱迁移）、`create_user` 与 `update_current_user`（忽略请求体邮箱，仅用令牌邮箱） | 各 2–5 |
+| dalton-auth | `src/server/services/automation_executor.py` | `_stored_workspace` 与 `_resolve_thread` 预建线程前校验工作区归属 | 各 10–15 |
+| dalton-auth | `web/src/contexts/AuthContext.tsx`、`web/src/lib/authToken.ts`、`web/src/lib/userStorage.ts`、`web/src/pages/Login/LoginPage.tsx`、`web/src/pages/Login/AuthConfirm.tsx`、`web/src/pages/Login/ResetPassword.tsx`、`web/src/pages/ChatAgent/utils/api/files.ts`、`web/src/pages/SharedChat/ShareUnavailable.tsx` | OSS 模式下按 `isDaltonAuth` 启用 Supabase 会话流、按用户去重 `/auth/sync` 与 403 登出、隐藏自助注册 | 各 1–15 |
 
 **数据篇（P0D）引入的钩子**（也在 P0 阶段落地，`check_hooks.sh` 一并核对）：
 

@@ -1,4 +1,5 @@
 import { isPlatformMode } from '../config/hostMode';
+import { isDaltonAuth } from '../config/daltonAuth'; // DALTON-HOOK(dalton-auth): scope storage per user when Dalton auth is enabled
 import { LOCAL_USER_ID, hasAuthEnv } from '../config/localUser';
 
 /**
@@ -37,7 +38,8 @@ export function setStorageUser(userId: string | null): void {
  * client, a platform build without its Supabase env included.
  */
 function currentUser(): string | null {
-  return isPlatformMode && hasAuthEnv ? platformUser : LOCAL_USER_ID;
+  // DALTON-HOOK(dalton-auth): scope storage by signed-in user when Dalton auth is enabled
+  return (isPlatformMode || isDaltonAuth) && hasAuthEnv ? platformUser : LOCAL_USER_ID;
 }
 
 function scoped(userId: string, key: string): string {
