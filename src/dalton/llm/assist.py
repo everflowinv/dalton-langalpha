@@ -15,7 +15,7 @@ import json
 import logging
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import jsonschema
@@ -41,6 +41,8 @@ class AssistResult:
     cost_usd: float = 0.0
     cached: bool = False
     status: str = "ok"
+    usage: dict[str, Any] = field(default_factory=dict)
+    error_kind: str | None = None
 
 
 def _read_yaml_dict(path: Any) -> dict[str, Any]:
@@ -175,6 +177,9 @@ async def assist_json(
     llm_service: Any = None,
     workspace_id: str | None = None,
     thread_id: str | None = None,
+    resend_indeterminate: bool = False,
+    persist_raw: bool = True,
+    skip_journal: bool = False,
 ) -> AssistResult:
     """Invoke a cheap/subscription LLM for structured JSON judgment, cached in Postgres.
 
@@ -217,7 +222,10 @@ async def assist_json(
             timeout_s=timeout_s,
             workspace_id=workspace_id,
             thread_id=thread_id,
+            resend_indeterminate=resend_indeterminate,
             raise_on_error=False,
+            persist_raw=persist_raw,
+            skip_journal=skip_journal,
         )
         if model is None and _is_safe_to_fallback(comp):
             primary_model = resolved_model
@@ -245,6 +253,8 @@ async def assist_json(
                     workspace_id=workspace_id,
                     thread_id=thread_id,
                     raise_on_error=False,
+                    persist_raw=persist_raw,
+                    skip_journal=skip_journal,
                 )
                 comp = comp_fb
                 resolved_model = fb_cand
@@ -272,6 +282,8 @@ async def assist_json(
                 cost_usd=comp.cash_usd,
                 cached=comp.cached,
                 status=comp.status,
+                usage=dict(getattr(comp, "usage", None) or {}),
+                error_kind=getattr(comp, "error_kind", None),
             )
 
         parsed = _extract_json_dict(comp.data, comp.text)
@@ -294,6 +306,8 @@ async def assist_json(
             cost_usd=comp.cash_usd,
             cached=comp.cached,
             status="ok",
+            usage=dict(getattr(comp, "usage", None) or {}),
+            error_kind=getattr(comp, "error_kind", None),
         )
     except Exception as exc:
         elapsed_ms = int((time.monotonic() - t0) * 1000)

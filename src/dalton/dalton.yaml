@@ -46,3 +46,27 @@ autonomy:
     base_hours: 24
     max_days: 30
   vendor_quota_alert_ratio: 0.8
+
+conversations:
+  enabled: true
+  extractor_model: "gemini-4-argon-medium-oauth"
+  prompt_version: "conv_card_v1"
+  embedding_model: "gemini-embedding-001"
+  embedding_model_preferred: "gemini-embedding-2-preview"
+  embedding_dimensions: 3072
+  hourly_token_budget: 120000
+  default_backfill_days: 14
+  max_segment_gap_minutes: 30
+  max_segment_chars: 6000
+  max_segment_events: 25
+  rate_limit_initial_backoff_seconds: 30.0
+  rate_limit_max_backoff_seconds: 900.0
+  recency_half_life_days: 180.0
+  recency_floor: 0.7
+  inbox_dir: "var/dalton/conversations/inbox"
+  cursors_file: "var/dalton/conversations/cursors.json"
+  export_cursors_file: "var/dalton/conversations/export_cursors.json"
+  agents:
+    - "main"
+    - "chem"
+    - "marco"

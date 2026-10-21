@@ -114,6 +114,30 @@ class DaltonAutonomyConfig(BaseModel):
     )
 
 
+class DaltonConversationsConfig(BaseModel):
+    """OpenClaw conversation archive settings (MVP Phase 1)."""
+
+    enabled: bool = True
+    extractor_model: str = "gemini-4-argon-medium-oauth"
+    prompt_version: str = "conv_card_v1"
+    embedding_model: str = "gemini-embedding-001"
+    embedding_model_preferred: str = "gemini-embedding-2-preview"
+    embedding_dimensions: int = Field(default=3072, gt=0)
+    hourly_token_budget: int = Field(default=120_000, gt=0)
+    default_backfill_days: int = Field(default=14, gt=0)
+    max_segment_gap_minutes: int = Field(default=30, gt=0)
+    max_segment_chars: int = Field(default=6000, gt=0)
+    max_segment_events: int = Field(default=25, gt=0)
+    rate_limit_initial_backoff_seconds: float = Field(default=30.0, gt=0)
+    rate_limit_max_backoff_seconds: float = Field(default=900.0, gt=0)
+    recency_half_life_days: float = Field(default=180.0, gt=0)
+    recency_floor: float = Field(default=0.7, ge=0.0, le=1.0)
+    inbox_dir: str = "var/dalton/conversations/inbox"
+    cursors_file: str = "var/dalton/conversations/cursors.json"
+    export_cursors_file: str = "var/dalton/conversations/export_cursors.json"
+    agents: list[str] = Field(default_factory=lambda: ["main", "chem", "marco"])
+
+
 class DaltonConfig(BaseModel):
     """Root Dalton behavioral configuration loaded from ``src/dalton/dalton.yaml``."""
 
@@ -125,6 +149,9 @@ class DaltonConfig(BaseModel):
     knowledge: DaltonKnowledgeConfig = Field(default_factory=DaltonKnowledgeConfig)
     publish: DaltonPublishConfig = Field(default_factory=DaltonPublishConfig)
     autonomy: DaltonAutonomyConfig = Field(default_factory=DaltonAutonomyConfig)
+    conversations: DaltonConversationsConfig = Field(
+        default_factory=DaltonConversationsConfig
+    )
 
 
 def _parse_env_pm_user_ids() -> list[str] | None:
@@ -317,6 +344,40 @@ def get_dalton_web_search_bridge_queue_timeout_seconds(default: float = 30.0) ->
         return max(0.001, float(raw))
     except ValueError:
         return float(default)
+
+
+def get_dalton_bridge_token() -> str:
+    """Return ``DALTON_BRIDGE_TOKEN`` from environment or parsed from ``DALTON_RESEARCHDATA_URL``."""
+    tok = os.getenv("DALTON_BRIDGE_TOKEN", "").strip()
+    if tok:
+        return tok
+    rd_url = get_dalton_researchdata_url()
+    if "/mcp/" in rd_url:
+        return rd_url.split("/mcp/", 1)[1].strip("/")
+    return ""
+
+
+def get_dalton_bridge_embed_url(host: str | None = None) -> str:
+    """Return the host bridge `/embed` URL for container-to-host embedding calls."""
+    resolved_host = host or HOST_IP or "host.docker.internal"
+    explicit = os.getenv("DALTON_BRIDGE_EMBED_URL", "").strip()
+    if explicit:
+        url = explicit.replace("{HOST_IP}", resolved_host).rstrip("/")
+        if "/embed/" in url:
+            url = url.split("/embed/", 1)[0] + "/embed"
+        return url
+    rd_url = get_dalton_researchdata_url()
+    if rd_url and "/mcp/" in rd_url:
+        base, _ = rd_url.split("/mcp/", 1)
+        if host:
+            from urllib.parse import urlparse, urlunparse
+
+            parsed = urlparse(base)
+            port_suffix = f":{parsed.port}" if parsed.port else ":8960"
+            base = urlunparse((parsed.scheme or "http", f"{resolved_host}{port_suffix}", "", "", "", ""))
+        return f"{base.rstrip('/')}/embed"
+    port = os.getenv("DALTON_BRIDGE_PORT", "8960").strip() or "8960"
+    return f"http://{resolved_host}:{port}/embed"
 
 
 def get_sec_user_agent() -> str:

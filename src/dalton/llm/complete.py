@@ -31,6 +31,7 @@ from src.dalton.database.llm_journal import (
     complete_journal_done,
     complete_journal_failed,
     inspect_journal_state,
+    is_journal_response_replayable,
     record_journal_replay,
 )
 from src.dalton.database.provider_events import record_provider_event, sanitize_error_text
@@ -308,6 +309,128 @@ def _unwrap_content_blocks(val: Any) -> str:
     return str(val if val is not None else "")
 
 
+_REDACTED_CARD_METADATA_KEYS: tuple[str, ...] = (
+    "type",
+    "topic_label",
+    "claim",
+    "tickers",
+    "entities",
+    "sectors",
+    "figures",
+    "quote_event_id",
+    "cited_sources",
+    "confidence",
+)
+_REDACTED_FIGURE_KEYS: tuple[str, ...] = ("metric", "value", "unit", "period")
+_RAW_TEXT_FIELD_NAMES: frozenset[str] = frozenset(
+    {
+        "quote",
+        "quotes",
+        "text",
+        "raw_text",
+        "event_text",
+        "content",
+        "events",
+        "messages",
+        "transcript",
+        "body",
+        "raw",
+    }
+)
+
+
+def _strip_raw_fields(val: Any) -> Any:
+    """Recursively strip verbatim quote and raw event text fields from structured payloads."""
+    if isinstance(val, dict):
+        return {
+            str(k): _strip_raw_fields(v)
+            for k, v in val.items()
+            if str(k).strip().lower() not in _RAW_TEXT_FIELD_NAMES
+        }
+    if isinstance(val, list):
+        return [_strip_raw_fields(item) for item in val]
+    return val
+
+
+def _redact_card_for_journal(card: dict[str, Any]) -> dict[str, Any]:
+    """Keep only structured card metadata (never `quote` or raw event text) for `dalton_llm_journal`."""
+    redacted: dict[str, Any] = {}
+    for k in _REDACTED_CARD_METADATA_KEYS:
+        if k not in card:
+            continue
+        if k == "figures":
+            figs: list[dict[str, Any]] = []
+            for f in card.get("figures") or []:
+                if isinstance(f, dict):
+                    # Scalars only: a nested object could carry quoted source text.
+                    figs.append(
+                        {
+                            fk: f[fk]
+                            for fk in _REDACTED_FIGURE_KEYS
+                            if fk in f and (f[fk] is None or isinstance(f[fk], (str, int, float, bool)))
+                        }
+                    )
+            redacted["figures"] = figs
+        else:
+            redacted[k] = _strip_raw_fields(card[k])
+    return redacted
+
+
+def _redact_response_for_journal(db_resp: dict[str, Any]) -> dict[str, Any] | None:
+    """Build a privacy-safe journal payload when `persist_raw=False`.
+
+    Omits raw free-form text responses, strips `quote` and any raw event text fields from
+    structured extraction cards (retaining only structured metadata), and marks the journal
+    payload `replayable=False` because downstream quote verification requires raw text.
+    """
+    if not isinstance(db_resp, dict):
+        return None
+    kind = db_resp.get("kind")
+    data = db_resp.get("data")
+    if kind == "text" and isinstance(db_resp.get("text"), str):
+        raw_txt = db_resp["text"].strip()
+        if raw_txt.startswith("```"):
+            lines = raw_txt.splitlines()
+            if len(lines) >= 2 and lines[-1].strip() == "```":
+                raw_txt = "\n".join(lines[1:-1]).strip()
+        if raw_txt.startswith("{") and raw_txt.endswith("}"):
+            try:
+                parsed_obj = json.loads(raw_txt)
+                if isinstance(parsed_obj, dict) and ("cards" in parsed_obj or "category" in parsed_obj):
+                    kind = "json"
+                    data = parsed_obj
+            except Exception:
+                return None
+    if kind in ("json", "structured") and isinstance(data, dict):
+        cat = str(data.get("category") or "").strip().lower()
+        if cat in ("ops", "private"):
+            return {
+                "kind": kind,
+                "replayable": False,
+                "data": {"category": cat, "topic_label": "", "cards": []},
+            }
+        if "cards" in data or "category" in data:
+            raw_cards = data.get("cards") if isinstance(data.get("cards"), list) else []
+            redacted_cards = [
+                _redact_card_for_journal(c) for c in raw_cards if isinstance(c, dict)
+            ]
+            return {
+                "kind": kind,
+                "replayable": False,
+                "data": {
+                    "category": cat or "research",
+                    "topic_label": str(data.get("topic_label") or "").strip(),
+                    "cards": redacted_cards,
+                },
+            }
+        return {
+            "kind": kind,
+            "replayable": False,
+            "data": _strip_raw_fields(data),
+        }
+    return None
+
+
 def _serialize_response_payload(raw_out: Any) -> tuple[dict[str, Any], Any, str | None]:
     """Convert `LLMService.complete` output into `(json_dict_for_db, parsed_data, text)`."""
     if isinstance(raw_out, BaseModel):
@@ -437,6 +560,8 @@ async def dalton_complete(
     thread_id: str | None = None,
     raise_on_error: bool = False,
     disable_tracing: bool = True,
+    persist_raw: bool = True,
+    skip_journal: bool = False,
 ) -> DaltonCompleteResult:
     """Execute a server-side one-shot LLM call with budget gating and Postgres journal idempotency (G1.3, P0N.7)."""
     effective_model = (model or request_model or "").strip()
@@ -472,11 +597,15 @@ async def dalton_complete(
 
     # 1. Inspect journal first so cached replays (`done`) and indeterminate/in-flight states
     #    return immediately without charging or re-sending.
-    action, existing_row = await inspect_journal_state(
-        inv_id,
-        request_hash=request_hash,
-        stale_after_s=stale_after_s,
-        resend_indeterminate=resend_indeterminate,
+    action, existing_row = (
+        ("proceed", None)
+        if skip_journal
+        else await inspect_journal_state(
+            inv_id,
+            request_hash=request_hash,
+            stale_after_s=stale_after_s,
+            resend_indeterminate=resend_indeterminate,
+        )
     )
 
     if action == "conflict":
@@ -494,7 +623,11 @@ async def dalton_complete(
             raise_on_error=raise_on_error,
         )
 
-    if action == "done" and existing_row is not None:
+    if (
+        action == "done"
+        and existing_row is not None
+        and is_journal_response_replayable(existing_row.get("response"))
+    ):
         try:
             await record_journal_replay(inv_id)
         except Exception as exc:
@@ -555,7 +688,7 @@ async def dalton_complete(
         )
 
     # 2. Budget admission check for cash models (`billing_type != 'oauth'`)
-    if billing_type != "oauth":
+    if billing_type != "oauth" and not skip_journal:
         try:
             admitted, err_kind, err_msg = await _check_cash_budget_admission(
                 eff_user_id,
@@ -594,21 +727,25 @@ async def dalton_complete(
             )
 
     # 3. Atomically claim invocation in `dalton_llm_journal`
-    claim_action, claimed_row = await claim_journal_invocation(
-        invocation_id=inv_id,
-        user_id=eff_user_id,
-        scope_ref=eff_scope,
-        purpose=purpose,
-        model_key=effective_model,
-        provider=provider,
-        billing_type=billing_type,
-        request_hash=request_hash,
-        stale_after_s=stale_after_s,
-        resend_indeterminate=resend_indeterminate,
+    claim_action, claimed_row = (
+        ("proceed", {"attempt": 1})
+        if skip_journal
+        else await claim_journal_invocation(
+            invocation_id=inv_id,
+            user_id=eff_user_id,
+            scope_ref=eff_scope,
+            purpose=purpose,
+            model_key=effective_model,
+            provider=provider,
+            billing_type=billing_type,
+            request_hash=request_hash,
+            stale_after_s=stale_after_s,
+            resend_indeterminate=resend_indeterminate,
+        )
     )
     attempt = int(claimed_row.get("attempt") or 1)
 
-    if claim_action == "done":
+    if claim_action == "done" and is_journal_response_replayable(claimed_row.get("response")):
         try:
             await record_journal_replay(inv_id)
         except Exception as exc:
@@ -697,16 +834,18 @@ async def dalton_complete(
             effective_model, billing_type, usage_dict
         )
         db_resp, parsed_data, text_val = _serialize_response_payload(out_obj)
+        journal_resp = db_resp if persist_raw else _redact_response_for_journal(db_resp)
 
-        await complete_journal_done(
-            inv_id,
-            response=db_resp,
-            usage=usage_dict,
-            cash_usd=cash_dec,
-            notional_usd=notional_dec,
-            provider=provider,
-            billing_type=billing_type,
-        )
+        if not skip_journal:
+            await complete_journal_done(
+                inv_id,
+                response=journal_resp,
+                usage=usage_dict,
+                cash_usd=cash_dec,
+                notional_usd=notional_dec,
+                provider=provider,
+                billing_type=billing_type,
+            )
 
         return DaltonCompleteResult(
             ok=True,
@@ -731,38 +870,39 @@ async def dalton_complete(
         else:
             target_state, error_kind = _classify_exception(exc)
         safe_msg = sanitize_error_text(exc, max_len=240)
-        try:
-            await complete_journal_failed(
-                inv_id,
-                error_kind=error_kind,
-                error_text=safe_msg,
-                state=target_state,
-                cash_usd=cash_dec,
-                notional_usd=notional_dec,
-            )
-        except Exception as journal_exc:
-            logger.error(
-                "[DaltonComplete] complete_journal_failed failed for %s (original %s: %s): %s",
-                inv_id,
-                error_kind,
-                safe_msg,
-                journal_exc,
-                exc_info=True,
-            )
-        if provider:
-            await record_provider_event(
-                provider,
-                "journal_fail",
-                user_id=eff_user_id,
-                model_key=effective_model,
-                detail={
-                    "purpose": purpose,
-                    "error_kind": error_kind,
-                    "state": target_state,
-                    "message": safe_msg,
-                },
-                best_effort=True,
-            )
+        if not skip_journal:
+            try:
+                await complete_journal_failed(
+                    inv_id,
+                    error_kind=error_kind,
+                    error_text=safe_msg,
+                    state=target_state,
+                    cash_usd=cash_dec,
+                    notional_usd=notional_dec,
+                )
+            except Exception as journal_exc:
+                logger.error(
+                    "[DaltonComplete] complete_journal_failed failed for %s (original %s: %s): %s",
+                    inv_id,
+                    error_kind,
+                    safe_msg,
+                    journal_exc,
+                    exc_info=True,
+                )
+            if provider:
+                await record_provider_event(
+                    provider,
+                    "journal_fail",
+                    user_id=eff_user_id,
+                    model_key=effective_model,
+                    detail={
+                        "purpose": purpose,
+                        "error_kind": error_kind,
+                        "state": target_state,
+                        "message": safe_msg,
+                    },
+                    best_effort=True,
+                )
         return _finish(
             DaltonCompleteResult(
                 ok=False,

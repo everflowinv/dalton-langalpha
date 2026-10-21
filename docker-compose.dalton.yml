@@ -1,4 +1,10 @@
 services:
+  postgres:
+    build:
+      context: .
+      dockerfile: scripts/dalton/Dockerfile.postgres
+    image: dalton-postgres:18-pgvector
+
   backend:
     build:
       context: .

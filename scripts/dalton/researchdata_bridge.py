@@ -38,6 +38,7 @@ logging.basicConfig(
 logger = logging.getLogger("researchdata_bridge")
 
 MAX_REQUEST_BYTES = 256 * 1024  # 256 KiB
+MAX_EMBED_REQUEST_BYTES = 128 * 1024  # 128 KiB dedicated limit for /embed
 
 DEFAULT_ROUTE_TIMEOUT_S = 240
 LONG_READ_TIMEOUT_S = 600
@@ -141,10 +142,11 @@ class SubprocessExitError(RuntimeError):
         super().__init__(f"researchdata_mcp exited without JSON response (exit_code={exit_code})")
 
 
-def _load_env_file(path: Path) -> None:
-    """Load simple KEY=VALUE lines into os.environ if not already set."""
+def _read_env_file_dict(path: Path) -> dict[str, str]:
+    """Parse simple KEY=VALUE lines from `path` without consulting `os.environ`."""
+    out: dict[str, str] = {}
     if not path.is_file():
-        return
+        return out
     try:
         for raw_line in path.read_text(encoding="utf-8").splitlines():
             line = raw_line.strip()
@@ -153,10 +155,29 @@ def _load_env_file(path: Path) -> None:
             k, v = line.split("=", 1)
             k = k.strip()
             v = v.strip().strip("'").strip('"')
-            if k and k not in os.environ:
-                os.environ[k] = v
+            if k:
+                out[k] = v
     except Exception as exc:
         logger.warning("Failed reading env file %s: %s", path, type(exc).__name__)
+    return out
+
+
+def _load_env_file(path: Path) -> None:
+    """Load simple KEY=VALUE lines into `os.environ`.
+
+    `GEMINI_API_KEY` is authoritative from `path` (never inherited from process environment),
+    while non-secret `DALTON_BRIDGE_*` runtime knobs only populate `os.environ` if unset.
+    """
+    parsed = _read_env_file_dict(path)
+    if "GEMINI_API_KEY" in parsed and parsed["GEMINI_API_KEY"].strip():
+        os.environ["GEMINI_API_KEY"] = parsed["GEMINI_API_KEY"].strip()
+    else:
+        os.environ.pop("GEMINI_API_KEY", None)
+    for k, v in parsed.items():
+        if k == "GEMINI_API_KEY":
+            continue
+        if k not in os.environ:
+            os.environ[k] = v
 
 
 class BridgeConfig:
@@ -196,6 +217,13 @@ class BridgeConfig:
         )
         self.max_inflight: int = max(
             1, int(os.environ.get("DALTON_BRIDGE_MAX_INFLIGHT", "2"))
+        )
+        self.embed_max_inflight: int = max(
+            1, int(os.environ.get("DALTON_BRIDGE_EMBED_MAX_INFLIGHT", "2"))
+        )
+        self.embed_max_bytes: int = max(
+            4096,
+            int(os.environ.get("DALTON_BRIDGE_EMBED_MAX_BYTES", str(MAX_EMBED_REQUEST_BYTES))),
         )
         # Default 625s matches agent_config.dalton.yaml call_timeout_s=625 (625 - 25 = 600s long-read ceiling)
         self.caller_budget_s: int = max(
@@ -280,10 +308,13 @@ class ResearchDataBridge:
     def __init__(self, cfg: BridgeConfig) -> None:
         self.cfg = cfg
         self.sem = asyncio.Semaphore(cfg.max_inflight)
+        self.embed_sem = asyncio.Semaphore(cfg.embed_max_inflight)
         self.server_version: str = "unknown"
         self._cached_tools: list[dict[str, Any]] | None = None
         self._cached_version: str | None = None
         self._usage_lock = asyncio.Lock()
+        self._resolved_embed_model: str | None = None
+        self._resolved_embed_dims: int | None = None
 
     def handoff_routes(self) -> set[str]:
         """Return route IDs whose `kind` is `agent_tool` or `skill` in `data_sources.json`."""
@@ -1475,6 +1506,209 @@ class ResearchDataBridge:
         )
         return resp
 
+    def _resolve_company_wiki_python_and_cli(self) -> tuple[str, Path]:
+        """Locate the OpenClaw company-wiki skill Python binary and CLI script without modifying them."""
+        skill_dir = self.cfg.ocw_root / "skills" / "company-wiki"
+        cli_script = skill_dir / "scripts" / "company_wiki_cli.py"
+        for candidate in (
+            skill_dir / "venv" / "bin" / "python",
+            self.cfg.ocw_root / "skills" / "market-digest" / "venv" / "bin" / "python",
+        ):
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return str(candidate), cli_script
+        return self.cfg.python_bin, cli_script
+
+    async def _run_company_wiki_embed(
+        self,
+        texts: list[str],
+        task_type: str,
+        requested_model: str | None = None,
+        timeout_s: float = 120.0,
+    ) -> dict[str, Any]:
+        """Invoke OpenClaw company-wiki's embedding functions in a read-only subprocess.
+
+        Reads `GEMINI_API_KEY` strictly from `self.cfg.env_path` so process environment variables
+        can never override or supply the `/embed` key.
+        """
+        env_file_vars = _read_env_file_dict(self.cfg.env_path)
+        gemini_api_key = env_file_vars.get("GEMINI_API_KEY", "").strip()
+        if not gemini_api_key:
+            return {
+                "ok": False,
+                "status": "error",
+                "error": "GEMINI_API_KEY not configured in bridge env file",
+            }
+
+        py_bin, cli_script = self._resolve_company_wiki_python_and_cli()
+        if not cli_script.is_file():
+            return {
+                "ok": False,
+                "status": "error",
+                "error": "company_wiki_cli.py not found under OpenClaw workspace",
+            }
+
+        driver_code = (
+            "import contextlib, importlib.util, io, json, pathlib, sys\n"
+            "sys.dont_write_bytecode = True\n"
+            "req = json.loads(sys.stdin.read())\n"
+            "spec = importlib.util.spec_from_file_location('company_wiki_cli', req['cli_script'])\n"
+            "mod = importlib.util.module_from_spec(spec)\n"
+            "spec.loader.exec_module(mod)\n"
+            "try:\n"
+            "    cfg_path = pathlib.Path(getattr(mod, 'CONFIG_PATH', pathlib.Path(req['cli_script']).resolve().parent.parent / 'config.json'))\n"
+            "    if not cfg_path.is_file():\n"
+            "        raise FileNotFoundError('company-wiki config.json not found')\n"
+            "    cfg = json.loads(cfg_path.read_text(encoding='utf-8'))\n"
+            "    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):\n"
+            "        model_name = req.get('model')\n"
+            "        dims = req.get('dims')\n"
+            "        if not model_name:\n"
+            "            model_name, dims = mod.resolve_embedding_model(cfg)\n"
+            "        else:\n"
+            "            dims = int(dims or cfg.get('embedding', {}).get('dimensions', 3072))\n"
+            "        texts = req.get('texts') or []\n"
+            "        if req.get('task_type') == 'RETRIEVAL_QUERY':\n"
+            "            vecs = [[float(x) for x in mod.embed_query(t, model_name)] for t in texts]\n"
+            "        else:\n"
+            "            vecs = [[float(x) for x in v] for v in mod.embed_texts(texts, model_name)]\n"
+            "    if vecs and vecs[0]:\n"
+            "        dims = len(vecs[0])\n"
+            "    print(json.dumps({'ok': True, 'status': 'ok', 'model': model_name, 'dimensions': dims, 'embeddings': vecs}))\n"
+            "except FileNotFoundError:\n"
+            "    print(json.dumps({'ok': False, 'status': 'error', 'error': 'company_wiki_config_missing'}))\n"
+            "except SystemExit:\n"
+            "    print(json.dumps({'ok': False, 'status': 'error', 'error': 'company-wiki embedding exited'}))\n"
+            "except Exception as e:\n"
+            "    print(json.dumps({'ok': False, 'status': 'error', 'error': type(e).__name__}))\n"
+        )
+
+        cmd = [py_bin, "-B", "-W", "ignore", "-c", driver_code]
+        subproc_env = {
+            **os.environ,
+            **env_file_vars,
+            "GEMINI_API_KEY": gemini_api_key,
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            cwd=str(self.cfg.ocw_root),
+            env=subproc_env,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        req_payload = {
+            "cli_script": str(cli_script),
+            "texts": texts,
+            "task_type": task_type,
+            "model": requested_model or self._resolved_embed_model,
+            "dims": self._resolved_embed_dims,
+        }
+        try:
+            stdout_bytes, _ = await asyncio.wait_for(
+                proc.communicate(input=json.dumps(req_payload, ensure_ascii=False).encode("utf-8")),
+                timeout=timeout_s,
+            )
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+                await proc.wait()
+            except Exception:
+                pass
+            return {"ok": False, "status": "timeout", "error": "Embedding subprocess timed out"}
+        except Exception as exc:
+            try:
+                proc.kill()
+                await proc.wait()
+            except Exception:
+                pass
+            return {"ok": False, "status": "error", "error": type(exc).__name__}
+
+        for line in reversed(stdout_bytes.decode("utf-8", errors="replace").splitlines()):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                parsed = json.loads(line)
+                if isinstance(parsed, dict):
+                    return parsed
+            except Exception:
+                continue
+        return {
+            "ok": False,
+            "status": "error",
+            "error": f"Embedding subprocess returned no JSON (exit_code={proc.returncode})",
+        }
+
+    async def handle_embed(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        """Handle `POST /embed` requests without logging input text or secrets."""
+        raw_texts = body.get("texts")
+        if raw_texts is None and "input" in body:
+            raw_texts = body.get("input")
+        if raw_texts is None and "text" in body:
+            raw_texts = [body.get("text")]
+        if isinstance(raw_texts, str):
+            texts = [raw_texts]
+        elif isinstance(raw_texts, list) and all(isinstance(x, str) for x in raw_texts):
+            texts = [x for x in raw_texts]
+        else:
+            return 400, {"ok": False, "status": "bad_request", "error": "texts must be a string or list of strings"}
+
+        if not texts or len(texts) > 100:
+            return 400, {"ok": False, "status": "bad_request", "error": "texts must contain 1..100 items"}
+
+        task_type = str(body.get("task_type") or "RETRIEVAL_DOCUMENT").strip().upper()
+        if task_type not in ("RETRIEVAL_DOCUMENT", "RETRIEVAL_QUERY"):
+            task_type = "RETRIEVAL_DOCUMENT"
+        req_model = str(body.get("model") or "").strip() or None
+
+        t0 = time.monotonic()
+        async with self.embed_sem:
+            res = await self._run_company_wiki_embed(
+                texts=texts,
+                task_type=task_type,
+                requested_model=req_model,
+                timeout_s=120.0,
+            )
+        elapsed_ms = int((time.monotonic() - t0) * 1000)
+
+        if res.get("ok") and isinstance(res.get("embeddings"), list):
+            model_used = str(res.get("model") or "gemini-embedding-001")
+            dims_used = int(res.get("dimensions") or 3072)
+            if not req_model:
+                self._resolved_embed_model = model_used
+                self._resolved_embed_dims = dims_used
+            logger.info(
+                "embed count=%d task_type=%s model=%s dims=%d status=ok elapsed_ms=%d",
+                len(texts),
+                task_type,
+                model_used,
+                dims_used,
+                elapsed_ms,
+            )
+            return 200, {
+                "ok": True,
+                "status": "ok",
+                "model": model_used,
+                "dimensions": dims_used,
+                "embeddings": res["embeddings"],
+            }
+
+        err_msg = str(res.get("error") or "embedding_failed")
+        logger.warning(
+            "embed count=%d task_type=%s status=error error=%s elapsed_ms=%d",
+            len(texts),
+            task_type,
+            err_msg,
+            elapsed_ms,
+        )
+        return 502, {
+            "ok": False,
+            "status": str(res.get("status") or "error"),
+            "error": err_msg,
+        }
+
 
 async def _send_http(
     writer: asyncio.StreamWriter,
@@ -1549,9 +1783,13 @@ async def _handle_client(
                 headers[hk.strip().lower()] = hv.strip()
 
         content_length = int(headers.get("content-length") or "0")
-        if content_length > MAX_REQUEST_BYTES:
+        max_bytes = bridge.cfg.embed_max_bytes if path == "/embed" else MAX_REQUEST_BYTES
+        if content_length > max_bytes:
             await _send_http(
-                writer, 413, "Payload Too Large", {"error": "Request body exceeds 256 KiB"}
+                writer,
+                413,
+                "Payload Too Large",
+                {"error": f"Request body exceeds {max_bytes} bytes"},
             )
             return
 
@@ -1577,13 +1815,41 @@ async def _handle_client(
                 "status": "ok",
                 "server_version": bridge.server_version,
                 "max_inflight": bridge.cfg.max_inflight,
+                "embed_max_inflight": bridge.cfg.embed_max_inflight,
+                "embed_max_bytes": bridge.cfg.embed_max_bytes,
                 "caller_budget_s": bridge.cfg.caller_budget_s,
                 "alphaengine_get_document_today": bridge._read_usage_today(),
             }
             await _send_http(writer, 200, "OK", health_payload)
             return
 
-        # Route 2: /mcp (header token) or legacy /mcp/<token> (path token, deprecated)
+        # Route 2: POST /embed (header token only; path tokens rejected)
+        if path == "/embed":
+            supplied_token = _extract_supplied_token(headers)
+            expected_token = bridge.cfg.token
+            if not expected_token or not supplied_token or not hmac.compare_digest(
+                supplied_token.encode("utf-8"), expected_token.encode("utf-8")
+            ):
+                await _send_http(writer, 404, "Not Found", {"error": "Not Found"})
+                return
+            if method != "POST":
+                await _send_http(
+                    writer, 405, "Method Not Allowed", {"error": "Method Not Allowed"}
+                )
+                return
+            try:
+                embed_body = json.loads(body_bytes.decode("utf-8"))
+                if not isinstance(embed_body, dict):
+                    raise ValueError("Expected JSON object")
+            except Exception:
+                await _send_http(writer, 400, "Bad Request", {"ok": False, "error": "Parse error"})
+                return
+            code, payload = await bridge.handle_embed(embed_body)
+            status_label = "OK" if code == 200 else ("Bad Request" if code == 400 else "Bad Gateway")
+            await _send_http(writer, code, status_label, payload)
+            return
+
+        # Route 3: /mcp (header token) or legacy /mcp/<token> (path token, deprecated)
         if path in ("/mcp", "/mcp/"):
             supplied_token = _extract_supplied_token(headers)
         elif path.startswith("/mcp/"):
