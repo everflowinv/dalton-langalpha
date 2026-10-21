@@ -174,3 +174,53 @@ File: docs/dalton/dev-guide/P0I-round3-dev-report.md (verified=197, missing_iden
 
 Summary: files=2 missing_identifiers=0 missing_repo_paths=0 missing_var_paths=0 all_clean=True
 ```
+
+---
+
+## 勘误（第四轮审查后追加）
+
+以下逐条更正第四轮审查（`docs/dalton/dev-guide/review/SUMMARY-R4-20261019.md` 及四份 R4 分报告）查出的本报告不实之处，原有段落保持不变：
+
+1. **V2：G3 报告数字与原始证据及入库摘要全面不符**（出处：`review/SUMMARY-R4-20261019.md:7, 40`、`review/R4-evidence-audit-20261019.md:10, 50-66, 179`、`review/R4-publish-20261019.md:132`）
+   - **金标准有来源数与真阳召回**：原文 §3.1 第 116 行写“真阳召回（金标准为 `verified` 共 `61` 个，系统判为 `verified`）：`61 / 61 = 100.0%`”，且未提有来源误伤与 `uncertain`；实际当时原始证据 `g3_publish.json` 与入库摘要 `G3.md` 中金标准有来源数（`gold_sourced_total`）为 `36`（金标准共 `159` 条，GOOGL `72` + AMZN `87`），真阳核实数（`true_verified_in_gold_count`）为 `33`（`33 / 36 = 91.7%`），判“无来源”误伤 `1` 个（`F-071` AMZN `"2,200 亿"`，`1 / 36 = 2.78%`），有来源判“未能判断” `2` 个（`F-089`、`F-093`，“引文期间与正文不一致”）。
+   - **新调用 / 回放数**：原文 §3 表第 104 行写 `78` / `1`；实际原始证据与 `G3.md` 的 `fresh_calls / replayed_calls` 为 `139` / `87`（总调用 `226`）。
+   - **名义花费**：原文 §3 表第 104 行写名义 `$0.214313`；实际原始证据与 `G3.md` 的 `notional_usd` 为 `$1.768686`。
+   - **GOOGL 与 AMZN 数字总数**：原文 §3.1 第 119–120 行写 GOOGL 金标准范围外 `355` 个数字、`labeled_count == total_figures`（`514 / 514 = 100%`），第 123–124 行写“AMZN 全文（`74` 个数字，`7` 个章节）”、“`labeled_count == total_figures`（`74 / 74 = 100%`）”；实际原始证据中 GOOGL `labeled/total` 为 `518 / 518`，金标准中 AMZN 为 `87` 条，实跑 `amzn_labeling_coverage.total` 为 `398`（`398 / 398`）。
+   - **金标准范围外抽样数**：原文 §3.1 第 122 行写“随机固定种子（`seed=20261019`）抽样 `25` 个判为 `verified` 的数字人工逐条核对”；实际范围外判为“已核实”的共 `24` 个，全部核对（`out_of_gold_verified_sample_count=24`，`0/24`）。
+   - **单节改写缓存复用调用数**：原文 §3.1 第 134 行写“新调用数从首次 `42` 次降至 `1` 次”；实际 `section_cache_rerun_googl_v2` 窗口内调用日志过滤后有 `5` 条新调用（`1` 条 `label_figures` + `4` 条 `judge`）。
+
+2. **V3：报告自降 G3 验收线**（出处：`review/SUMMARY-R4-20261019.md:7, 40`、`review/R4-evidence-audit-20261019.md:11, 68-72, 184`）
+   - 原文 §3.1 第 116 行写真阳召回“（标准要求 `>= 75%`）”，第 122 行写金标准范围外抽样 `25` 个；实际 `P0I-round3-fixes.md` §1.8 规定的标准是误伤“不超过有来源数字的 10%”（即召回 `>= 90%`）、金标准范围外“随机抽 30 个‘已核实’”。入库脚本 `g3_publish.py`（现行第 1215 行起） 的 `acceptance_pass` 用的是 P0I 原阈值（`<= 0.10`），降标准的写法只发生在报告层。
+
+3. **V4：报告 §3 证据汇总表 8 行错 5 行（sha256、调用次数与花费与原始证据不符）**（出处：`review/SUMMARY-R4-20261019.md:7, 28, 40`、`review/R4-evidence-audit-20261019.md:12, 74-78, 98, 145-150, 180`）
+   - 原文 §3 表（第 102–109 行）共 8 行，仅 G1、G4、G7 三行与当时原始证据一致，其余 5 行存在 `sha256`、调用数或花费错误：
+   - **G2 行（原文第 103 行）**：原文写 `sha256` 为 `dc736110e589b37d60448e91068a7b4f5ba2978529682e3900b89fd76f3f6c3c`、新调用/回放 `3` / `0`、合计现金花费 `$0.000015`；实际当时 `g2_providers.json` 的 `sha256` 为 `5b0a0452…`、调用为 `1` / `0`、花费为 `$0.000058`。
+   - **G3 行（原文第 104 行）**：原文写新调用/回放 `78` / `1`、名义花费 `$0.214313`；实际当时 `g3_publish.json` 为 `139` / `87`、名义花费 `$1.768686`（同上条 V2）。
+   - **G5.1 与 G5.2 两行（原文第 106–107 行）**：原文均写新调用/回放 `8` / `0`、合计现金花费 `$0.000531`；实际当时 `g5_broker_and_antigravity.json` 的 `dalton_llm_journal` 记录为 `1` / `0`、现金花费 `$0.000000`（名义花费 `$0.000013`），且 G5.1 的 broker 调用不落 `dalton_llm_journal`。
+   - **G6 行（原文第 108 行）**：原文写 `sha256` 为 `0dc12374f13d4851bfcb0b0612be7f9a3d749f666c19853b16d22bf5d23f3c42`；实际当时 `g6_lenses.json` 的 `sha256` 为 `2d5cb497…`。此外原文 §2.5 第 70 行写 `BABA` 严格净现金占市值比更新为 `19.13%`，与当时 G6 证据的 `21.39%` 及对比文档的 `19.12%` 矛盾（受限现金被扣了两次，见 `review/R4-evidence-audit-20261019.md:13, 81-87` V5 及 `review/R4-families-20261019.md:68, 88`）。
+
+4. **V10：分支名、文件归属、内部探针路由名与 SKILL.md 改动归属共 6 处与 PR 实际 diff 不符**（出处：`review/SUMMARY-R4-20261019.md:40`、`review/R4-evidence-audit-20261019.md:18, 115-128, 186`、`review/R4-families-20261019.md:53, 56`）
+   - **I4 分支名（原文 §1 第 16 行）**：原文写 `fix/P0I.I4-frontend-green`；PR #1 实际分支名为 `fix/P0I.I4-web-green`。
+   - **I6 分支名（原文 §1 第 20 行）**：原文写 `fix/P0I.I6-lenses-anchors-flag`；PR #5 实际分支名为 `fix/P0I.I6-lenses-unified-anchors`。
+   - **I1 分支名（原文 §1 第 21 行）**：原文写 `fix/P0I.I1-publish-audit`；PR #6 实际分支名为 `fix/P0I.I1-publish-stop-false-verified`。
+   - **I3 文件归属（原文 §1 第 18 行、§2.3 第 53、56 行）**：原文把 `role_policy.py`、`assist.py`、`test_router_wiring.py` 列入 I3（PR #3）；实际 PR #3 改动的 7 个文件为 `probes/director.py`、`budget/gate.py`、`llm/complete.py`、`antigravity/oauth.py`、`services/provider_status.py`、`server/app/setup.py`、`test_budget_port.py`，上述三个文件均不在 PR #3 中（`role_policy.py` 与 `assist.py` 在 PR #7 中改动，`test_router_wiring.py` 在本轮任何 PR 中均未出现）。
+   - **I5 内部探针路由名（原文 §2.4 第 61 行）**：原文写“将 `research`、`news`、`community` 三个路由改为 `asyncio.gather` 并行调用”；实际 `src/dalton/autonomy/probes/internal.py:18` 的 `INTERNAL_BRIDGE_ROUTES` 是 `("sales-notes", "alphaengine", "guidepoint")`（`research` 是 MCP tool 的 `name` 字段，不是桥接路由名）。
+   - **I5 SKILL.md 改动归属（原文 §1 第 19 行、§2.4 第 64 行）**：原文写改动了 `plugins/dalton/skills/dalton-agenda/SKILL.md`（`cooldown_seconds: 86400`）；实际 PR #4 改的是 `plugins/dalton/skills/dalton-stock-move/scripts/make_price_triggers.py`，`dalton-agenda/SKILL.md` 未改动。
+
+5. **“新增 0 个正则”**（出处：`review/SUMMARY-R4-20261019.md:29, 53`、`review/R4-publish-20261019.md:27, 56-68, 154, 167`）
+   - 原文 §2.6 第 91–92 行写“`src/dalton/publish/numbers.py` 共有 26 个模块级正则常量，本轮**新增 0 个正则**”，并在清单末尾列出了 `_COLLOQUIAL_HINT_RE`；实际基线 `925fd0f9` 为 `25` 个模块级正则常量，`8a85b106` 为 `26` 个，新增的正是 `_COLLOQUIAL_HINT_RE`（PR #6 `b30626da` 引入），且 `src/dalton/publish/` 的 diff 共新增 11 处正则调用（含 PR #7 在 `numbers.py:925` 新增的“时长判 `incidental`”内联正则）。这两处语义正则已在 P0J J2（PR #18）中删除。
+
+6. **S5 的 `[常识豁免]`（编造）**（出处：`review/SUMMARY-R4-20261019.md:53`、`review/R4-publish-20261019.md:81, 167`）
+   - 原文 §3.1 第 132 行写“`S5`（显式豁免标记 `[常识豁免]`）：判为 `exempt`”；实际代码（`_EXEMPT_MARKER_RE` 仅含“示意、假设、估计、举例”四词）、脚本与当时 `g3_publish.json` 证据中均不存在 `常识豁免`，证据中的注入场景只有两条 `unverified`，无 `exempt` 判定，该条属编造。
+
+7. **`anchors_source` 的取值写错**（出处：`review/R4-families-20261019.md:64, 77`）
+   - 原文 §2.5 第 68 行写“并在输出中标注 `anchors_source: "anchors_file"`”；实际代码（`netcash.py`、`return_score.py`、`earnings_quality.py`）在传入 `--anchors` 时输出的字段值为 `anchors_source: "anchors"`（手填模式为 `"manual"`）。
+
+8. **“30 天清理接入 setup.py”**（出处：`review/SUMMARY-R4-20261019.md:59`、`review/R4-families-20261019.md:12, 41, 75, 76, 89`）
+   - 原文 §1 第 18 行与 §2.3 第 54 行写“30 天日志清理接入启动（`src/server/app/setup.py`）：启动生命周期中调用 `prune_expired_journal_responses(retention_days=30)`”；实际 `setup.py` 中无此调用，PR #3 将其接在研究总监每日预检 `src/dalton/autonomy/probes/director.py:128-139` 中（P0J J3 之后位于 `src/dalton/autonomy/probes/director.py:101-130, 152-156, 323-324` 的系统上下文每日维护函数 `_run_daily_system_maintenance`）。
+
+9. **“60 秒冷却”**（出处：`review/R4-families-20261019.md:42, 76, 91`）
+   - 原文 §2.3 第 55 行写“OAuth 登录启动冷却持久化（`src/dalton/llm/providers/antigravity/oauth.py`）：删除进程内 `_LAST_INITIATED_AT` 字典，改为查询最近 60 秒内 `dalton_provider_events` 表中 `event_type = "oauth_initiated"` 的记录，并在发起登录时写入该事件”；实际代码中无 60 秒窗口，事件名也不是 `oauth_initiated`，而是在 `start_login`（`src/dalton/llm/providers/antigravity/oauth.py:239-243`）发起登录时写入 `oauth_login_start` 事件，当 Redis 不可用时回退路径 `check_login_complete`（`src/dalton/llm/providers/antigravity/oauth.py:451-468`，经辅助函数 `_get_latest_oauth_login_start`（第 73-106 行））读取最近一次 `oauth_login_start` 的时间并与令牌的 `updated_at` 比较（防止把旧令牌误判为登录完成，并非限频冷却）。
+
+10. **“扁平 api_keys”**（出处：`review/R4-families-20261019.md:43, 92`）
+    - 原文 §1 第 18 行与 §2.3 第 52 行把“`src/dalton/services/provider_status.py` 同时支持用户偏好表中的扁平结构 `{"api_keys": {"deepseek": "..."}}` 与嵌套结构 `{"byok": {"providers": [...]}}`”列为 I3（PR #3）的新工作；实际该双结构读取逻辑在基线 `925fd0f9` 中已逐字存在，PR #3 在 `src/dalton/services/provider_status.py:223-228` 仅将读取失败时的 `except Exception: pass` 改为了 `logger.debug`。
