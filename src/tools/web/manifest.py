@@ -143,11 +143,7 @@ def _parse_capability(provider: str, verb: str, entry: Dict[str, Any]) -> Capabi
 
 
 @lru_cache(maxsize=1)
-def get_web_providers() -> Mapping[str, WebProviderSpec]:
-    """Load and validate all provider specs, keyed by provider name.
-
-    Read-only mapping: the lru_cache shares one object across all callers.
-    """
+def _load_base_web_providers() -> Mapping[str, WebProviderSpec]:  # DALTON-HOOK(web-search-openclaw)
     manifest = _load_manifest()
     providers: Dict[str, WebProviderSpec] = {}
 
@@ -168,6 +164,24 @@ def get_web_providers() -> Mapping[str, WebProviderSpec]:
     if not providers:
         raise RuntimeError(f"No web providers defined in {_MANIFEST_PATH}")
     return MappingProxyType(providers)
+
+
+def get_web_providers() -> Mapping[str, WebProviderSpec]:
+    """Load and validate all provider specs, keyed by provider name.
+
+    Read-only mapping: the lru_cache shares one object across all callers.
+    """
+    from src.config.tool_settings import get_search_api  # DALTON-HOOK(web-search-openclaw)
+
+    if get_search_api() != "openclaw":  # DALTON-HOOK(web-search-openclaw)
+        return _load_base_web_providers()
+    from src.dalton.web_search_spec import register_openclaw_web_provider  # DALTON-HOOK(web-search-openclaw)
+
+    return register_openclaw_web_provider(_load_base_web_providers())  # DALTON-HOOK(web-search-openclaw)
+
+
+get_web_providers.cache_clear = _load_base_web_providers.cache_clear  # type: ignore[attr-defined]  # DALTON-HOOK(web-search-openclaw)
+get_web_providers.cache_info = _load_base_web_providers.cache_info  # type: ignore[attr-defined]
 
 
 def get_web_provider_spec(name: str) -> Optional[WebProviderSpec]:
