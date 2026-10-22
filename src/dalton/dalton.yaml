@@ -15,9 +15,10 @@ models:
     - "ocb-deepseek-deepseek-flash"
 
 budget:
-  # Default daily cap USD when user has not saved a DB row yet.
-  # null = fail-closed ("未设置日预算") until configured in Settings -> Dalton Budget.
-  default_daily_cap_usd: null
+  # Default daily cap USD when user has not saved a DB row yet (null = fail-closed,
+  # "未设置日预算"). 100 matches the owner's own cap, so team members who never opened
+  # Settings -> Dalton Budget are not refused at $0 before any model call.
+  default_daily_cap_usd: 100
   default_task_cap_usd: null
   reserve_chunk_usd: 1.00
   admission_floor_usd: 0.25
