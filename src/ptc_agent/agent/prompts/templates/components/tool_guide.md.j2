@@ -17,11 +17,19 @@ Routing:
 - Direct question about a stock or company → Financial (Direct)
 {% endif %}
 {# DALTON-HOOK(tool-guide-research) #}
+{# DALTON-HOOK(data-map) #}
 - 研究服务（{% if tool_summary and not thread_id %}`MCP Tools (via Python)`{% else %}`<mcp-servers>`{% endif %}，经一次简短 `ExecuteCode`）提供卖方、专家、管理层原话和内部笔记，是解释“发生了什么、为什么”时的主要证据，与网页搜索互补。
+- 下结论前先对照地图：说“证据不足/无法确定”之前，先对照下方数据地图看还有哪些相关来源没查；回答某家公司或主题时，先用 `conversation_search` 查团队以前的观点、假设和决定，并在答案里说明与之前看法相比有什么变化。
 - Need to compute, compare, model, or chart → MCP (via Python)
 - File, search, shell{% if web_enabled %}, or web{% endif %} operations → Core
 {% if crawl_enabled %}
 - A whole site rather than one page → **WebMap** to see what exists, then **WebFetch** the pages you need, and **WebCrawl** only when you genuinely need many at once
+{% endif %}
+{% if dalton_data_map %}
+
+<data_map>
+{{ dalton_data_map }}
+</data_map>
 {% endif %}
 {% if finance_enabled %}
 

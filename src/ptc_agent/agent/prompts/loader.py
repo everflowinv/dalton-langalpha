@@ -91,6 +91,14 @@ class PromptLoader:
             **self._config.get("defaults", {}),
             **kwargs,  # User can override date if needed
         }
+        # DALTON-HOOK(data-map): inject system-generated data map (with static unprobed fallback)
+        if "dalton_data_map" not in context and template_name in (
+            "system.md.j2",
+            "components/tool_guide.md.j2",
+        ):
+            from src.dalton.data_map import resolve_prompt_data_map
+
+            context["dalton_data_map"] = resolve_prompt_data_map()
         return template.render(**context)
 
     def get_system_prompt(self, **kwargs: Any) -> str:

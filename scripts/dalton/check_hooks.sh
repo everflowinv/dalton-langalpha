@@ -68,6 +68,7 @@ ALLOWED_HOOKS=(
   "sandbox-inline-write-limit"
   "team-credentials"
   "yfinance-prev-close"
+  "data-map"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

@@ -1864,6 +1864,7 @@ async def get_run_charge_usd(run_ref: str) -> Decimal | None
 | provenance-type | `web/src/types/sse.ts`、`web/src/pages/ChatAgent/components/SourcesPanel.tsx` | `research_doc` 类型与渲染分派 | 约 3 |
 | web-search-openclaw | `src/tools/web/manifest.py`、`src/tools/web/search.py` | `get_web_providers` 调用 `register_openclaw_web_provider`、`_PROVIDER_BUILDERS` 注册 `openclaw` | 约 8 |
 | x-search-openclaw | `src/ptc_agent/agent/agent.py`、`src/ptc_agent/agent/middleware/provenance/middleware.py` | `search_api == "openclaw"` 时给主智能体及子智能体 `web` 工具集绑定直接工具 `x_search`，并在 `ProvenanceMiddleware._extractors` 注册 `"x_search"` | 约 10 |
+| data-map | `src/server/app/setup.py`、`src/ptc_agent/agent/graph.py`、`src/ptc_agent/agent/prompts/loader.py`、`src/ptc_agent/agent/prompts/templates/components/tool_guide.md.j2`、`src/ptc_agent/agent/prompts/templates/components/chief_of_staff.md.j2` | 启动生命周期后台触发一次数据源体检并管理任务句柄；回合入口按天从 Postgres 读取数据地图快照（2s 超时或未命中回退静态未体检清单，按 `search_api` 过滤 `x_search`）并注入 `<data_map>` 与“下结论前先对照数据地图、问到公司/主题先查 `conversation_search` 并说明观点变化”原则 | 各 2–12 |
 
 细节见 P0D 的 P0-D.2（超时）、P0-D.3（来源显示降级版）和 P1.1（skill 注册）。PK 篇的钩子列在 PK §5；`check_hooks.sh` 比对的是"本附录 + PK §5"的并集。P3 的来源定位改动（P0-D.3b）落地时再并入本表。
 

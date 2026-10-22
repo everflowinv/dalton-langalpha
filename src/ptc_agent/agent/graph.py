@@ -150,6 +150,10 @@ async def build_ptc_graph(
         fetch_user_data_counts(user_id),
         _read_workspace_naming(conversation_id),
     )
+    # DALTON-HOOK(data-map): warm per-turn data map from Postgres daily cache (falls back to static unprobed map)
+    from src.dalton.data_map import warm_turn_data_map
+
+    await warm_turn_data_map(search_api=getattr(config, "search_api", None))
 
     inner_agent = ptc_agent.create_agent(
         sandbox=session.sandbox,
@@ -257,6 +261,10 @@ async def build_ptc_graph_with_session(
         vault_secrets = await get_user_secrets_decrypted(user_id)
     else:
         vault_secrets = dict(getattr(session.sandbox, "vault_secrets", None) or {})
+    # DALTON-HOOK(data-map): warm per-turn data map from Postgres daily cache (falls back to static unprobed map)
+    from src.dalton.data_map import warm_turn_data_map
+
+    await warm_turn_data_map(search_api=getattr(config, "search_api", None))
 
     inner_agent = ptc_agent.create_agent(
         sandbox=session.sandbox,
