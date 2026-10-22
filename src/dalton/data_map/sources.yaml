@@ -72,13 +72,13 @@ catalog_routes:
   fred:
     category: macro
     title: FRED宏观
-    rules: "按series查"
+    rules: "series+start+end必填"
     description: "美国通胀/就业/GDP/利率序列，查宏观与折现率。"
   treasury:
     category: macro
-    title: 美债与发债
-    rules: "财政部官方"
-    description: "美债收益率曲线、拍卖与TGA，查利率与流动性。"
+    title: TGA与联邦债务
+    rules: "operation=treasury, dataset=tga|debt"
+    description: "财政部TGA日度余额与联邦债务（百万美元/美元），查流动性；国债收益率走fred（DGS2/DGS10）。"
 
 direct_tools:
   conversation_search:
