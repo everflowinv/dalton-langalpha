@@ -1709,7 +1709,9 @@ async def test_p0j_j2_assist_fallback_unified_and_role_policy_family_check(
     async def _complete_side_effect(**kwargs: Any) -> DaltonCompleteResult:
         req_model = str(kwargs.get("request_model") or "")
         calls.append(req_model)
-        if req_model == "gemini-3.8-flash-low-oauth":
+        # The configured assist model (whatever agent_config.dalton.yaml names) fails pre-send;
+        # only the fallback succeeds.
+        if req_model != "deepseek-flash":
             return DaltonCompleteResult(
                 ok=False,
                 status="failed",
@@ -1734,7 +1736,7 @@ async def test_p0j_j2_assist_fallback_unified_and_role_policy_family_check(
         res = await assist_mod.assist_json("audit.label_figures", "Label figures", {"figures": []}, schema, user_id="local-dev-user")
     assert res.ok is True
     assert res.model == "deepseek-flash"
-    assert calls == ["gemini-3.8-flash-low-oauth", "deepseek-flash"]
+    assert len(calls) == 2 and calls[0] != "deepseek-flash" and calls[1] == "deepseek-flash"
     assert any("switching to assist_fallback=deepseek-flash" in r.message for r in caplog.records)
 
     # Non-fallbackable statuses/error_kinds MUST NOT trigger fallback
@@ -1765,7 +1767,7 @@ async def test_p0j_j2_assist_fallback_unified_and_role_policy_family_check(
         mock_complete.side_effect = _no_fb_effect
         res_no_fb = await assist_mod.assist_json("audit.label_figures", "Label figures", {"figures": []}, schema, user_id="local-dev-user")
         assert res_no_fb.ok is False
-        assert calls == ["gemini-3.8-flash-low-oauth"], (
+        assert len(calls) == 1 and calls[0] not in ("deepseek-flash", "ocb-deepseek-deepseek-flash"), (
             f"Unexpected fallback for {non_fb_status}/{non_fb_kind}: {calls}"
         )
 
@@ -1786,7 +1788,7 @@ async def test_p0j_j2_assist_fallback_unified_and_role_policy_family_check(
     mock_complete.side_effect = _all_fail_effect
     res_all_fail = await assist_mod.assist_json("audit.label_figures", "Label figures", {"figures": []}, schema, user_id="local-dev-user")
     assert res_all_fail.ok is False
-    assert calls == ["gemini-3.8-flash-low-oauth", "deepseek-flash", "ocb-deepseek-deepseek-flash"]
+    assert calls[1:] == ["deepseek-flash", "ocb-deepseek-deepseek-flash"] and calls[0] != "deepseek-flash"
     assert res_all_fail.model == "ocb-deepseek-deepseek-flash"
     assert "ocb-deepseek-deepseek-flash" in (res_all_fail.error or "")
 
