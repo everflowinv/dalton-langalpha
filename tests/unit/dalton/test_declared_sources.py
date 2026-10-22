@@ -350,6 +350,10 @@ class TestSourceIdentityRoutes:
 def _make_bridge(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> rb.ResearchDataBridge:
     monkeypatch.setenv("DALTON_BRIDGE_USAGE_FILE", str(tmp_path / "usage.json"))
     monkeypatch.setenv("DALTON_BRIDGE_TEST_MODE", "0")
+    # Never read the host's bridge env file (it carries the real proxy and token).
+    empty_env = tmp_path / "bridge.env"
+    empty_env.write_text("", encoding="utf-8")
+    monkeypatch.setenv("DALTON_BRIDGE_ENV_FILE", str(empty_env))
     dummy_py = tmp_path / "dummy_python"
     dummy_py.write_text("#!/bin/sh\n", encoding="utf-8")
     dummy_xq = tmp_path / "xueqiu_posts.py"
@@ -2685,9 +2689,13 @@ class TestCommunityExecutors:
             "--days",
             "14",
             "--quick",
+            "--save-dir",
+            str(bridge.cfg.cache_dir / "last30days-memory"),
             "--emit=json",
         ]
         assert "bash" not in observed_cmds[0]
+        # Never the engine default ~/Documents/Last30Days (TCC-protected under launchd).
+        assert "Documents" not in " ".join(observed_cmds[0])
         assert observed_envs[0]["FROM_BROWSER"] == "off"
         assert observed_envs[0]["LAST30DAYS_ALLOW_ENGINE_PLAN"] == "1"
         assert observed_envs[0]["EXCLUDE_SOURCES"] == "hn,reddit"

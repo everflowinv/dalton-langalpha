@@ -2659,6 +2659,12 @@ class ResearchDataBridge:
                 cmd.append("--quick")
             if plan_file is not None:
                 cmd.extend(["--plan", str(plan_file.resolve())])
+            # The engine's default memory dir is ~/Documents/Last30Days. Under launchd that folder is
+            # TCC-protected, so the engine's first scandir blocks forever on a permission prompt no one
+            # can see (observed 2026-10-22: 600 s timeout with no socket open). Keep it in our cache.
+            save_dir = self.cfg.cache_dir / "last30days-memory"
+            save_dir.mkdir(parents=True, exist_ok=True)
+            cmd.extend(["--save-dir", str(save_dir)])
             cmd.append("--emit=json")
             return cmd
 
