@@ -334,6 +334,34 @@ describe('StockHeader price section (market convention)', () => {
     expect(ext?.textContent).toContain('(+2.00%)');
   });
 
+  it('yfinance pre-market snapshot (ginlix-aligned shape) headlines yesterday close and renders pre-market price and move', () => {
+    // DALTON-HOOK(extended-hours-quotes): yfinance pre-market aligns previous_close/price/regular_close to yesterday's close.
+    const preStatus = { market: 'extended-hours', afterHours: false, earlyHours: true, providers: ['yfinance'] } as Record<string, unknown>;
+    const yfPreSnap: SnapshotData = {
+      symbol: 'GOOG',
+      price: 330.95,
+      regular_close: 330.95,
+      previous_close: 330.95,
+      change: -2.45,
+      change_percent: -0.7403,
+      regular_trading_change: -5.45,
+      regular_trading_change_percent: -1.6201,
+      early_trading_change: -2.45,
+      early_trading_change_percent: -0.7403,
+      market_status: 'early_trading',
+      source: 'yfinance',
+    };
+    const { container } = render(
+      <Header inputs={{ symbol: 'GOOG', marketStatus: preStatus, snapshot: yfPreSnap, realTimePrice: { ...quoteRow, price: 330.95, change: -2.45, changePercent: -0.74 } }} />,
+    );
+    expect(headlineFigure(container)).toBe('330.95');
+    expect(container.querySelector('.stock-change')).toBeNull();
+    const ext = container.querySelector('.stock-extended-hours');
+    expect(ext?.textContent).toContain('328.50');
+    expect(ext?.textContent).toContain('-2.45');
+    expect(ext?.textContent).toContain('(-0.74%)');
+  });
+
   it('regular session renders the row price and change pair unchanged', () => {
     const openStatus = { market: 'open', afterHours: false, earlyHours: false, providers: [] } as Record<string, unknown>;
     render(

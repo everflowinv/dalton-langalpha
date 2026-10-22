@@ -368,3 +368,219 @@ class TestKnownAssetClass:
         )
         assert stamp.startswith("[Live: COMP $9.12 ")
         assert "after-hours" in stamp
+
+
+class TestExtendedHoursAndPrevCloseWording:
+    """DALTON-HOOK(extended-hours-quotes): Lock the three quote_format change wordings."""
+
+    _PRE_ET = _ET.localize(datetime(2026, 10, 22, 8, 4, 0))
+    _REG_ET = _ET.localize(datetime(2026, 10, 22, 14, 30, 0))
+    _POST_ET = _ET.localize(datetime(2026, 10, 22, 17, 15, 0))
+    _PREV_CLOSE_MS = int(_ET.localize(datetime(2026, 10, 21, 16, 0, 0)).timestamp() * 1000)
+    _TODAY_CLOSE_MS = int(_ET.localize(datetime(2026, 10, 22, 16, 0, 0)).timestamp() * 1000)
+
+    def test_regular_session_writes_today(self):
+        # DALTON-HOOK(extended-hours-quotes)
+        snap = {
+            "symbol": "GOOG",
+            "price": 330.95,
+            "change_percent": -1.62,
+            "volume": 19_200_000,
+            "market_status": "open",
+            "tier": "delayed_15m",
+        }
+        line = format_quote_line(snap, at=self._REG_ET)
+        assert "GOOG  $330.95  -1.62% today  vol 19.2M" in line
+
+    def test_previous_trading_day_without_extended_price_writes_prev_close(self):
+        # DALTON-HOOK(extended-hours-quotes)
+        snap = {
+            "symbol": "GOOG",
+            "price": 330.95,
+            "change_percent": -1.62,
+            "volume": 19_200_000,
+            "as_of": self._PREV_CLOSE_MS,
+            "regular_only": True,
+            "tier": "delayed_15m",
+        }
+        line = format_quote_line(snap, at=self._PRE_ET)
+        assert "-1.62% prev close" in line
+        assert "today" not in line
+        assert "(pre" in line
+
+    def test_extended_hours_appends_pre_and_post_segments(self):
+        # DALTON-HOOK(extended-hours-quotes): Split regular close + regular move from pre-market/after-hours price + move.
+        # 1) yfinance pre-market snapshot (regular_as_of from yesterday 10/21, as_of from today 10/22 08:04 ET)
+        pre_snap = {
+            "symbol": "GOOG",
+            "price": 330.95,
+            "regular_close": 330.95,
+            "previous_close": 330.95,
+            "last_trade_price": 328.50,
+            "change": -2.45,
+            "change_percent": -0.7403,
+            "regular_trading_change": -5.45,
+            "regular_trading_change_percent": -1.6201,
+            "early_trading_change": -2.45,
+            "early_trading_change_percent": -0.7403,
+            "volume": 19_200_000,
+            "market_status": "early_trading",
+            "as_of": int(self._PRE_ET.timestamp() * 1000),
+            "regular_as_of": self._PREV_CLOSE_MS,
+            "regular_trading_date": "2026-10-21",
+            "regular_only": False,
+            "tier": "delayed_15m",
+        }
+        pre_line = format_quote_line(pre_snap, at=self._PRE_ET)
+        assert "GOOG  $330.95  -1.62% prev close  pre-market $328.50 -0.74%  vol 19.2M" in pre_line
+
+        # 2) yfinance after-hours snapshot (regular_as_of from today 10/22 16:00 ET, as_of from today 17:15 ET)
+        post_snap = {
+            "symbol": "GOOG",
+            "price": 330.95,
+            "regular_close": 330.95,
+            "previous_close": 336.40,
+            "last_trade_price": 333.76,
+            "change": -2.64,
+            "change_percent": -0.7848,
+            "regular_trading_change": -5.45,
+            "regular_trading_change_percent": -1.6201,
+            "late_trading_change": 2.81,
+            "late_trading_change_percent": 0.8491,
+            "volume": 19_200_000,
+            "market_status": "late_trading",
+            "as_of": int(self._POST_ET.timestamp() * 1000),
+            "regular_as_of": self._TODAY_CLOSE_MS,
+            "regular_trading_date": "2026-10-22",
+            "regular_only": False,
+            "tier": "delayed_15m",
+        }
+        post_line = format_quote_line(post_snap, at=self._POST_ET)
+        assert "GOOG  $330.95  -1.62% today  after-hours $333.76 +0.85%  vol 19.2M" in post_line
+
+        # 3) ginlix-data AMD after-hours sample (change_percent=1.025 is blended; regular_trading_change_percent=1.104)
+        amd_at = _ET.localize(datetime(2026, 8, 31, 17, 31, 25))
+        amd_snap = {
+            "symbol": "AMD",
+            "price": 470.72,
+            "regular_close": 470.72,
+            "previous_close": 465.58,
+            "last_trade_price": 470.35,
+            "change": 4.77,
+            "change_percent": 1.025,
+            "regular_trading_change": 5.14,
+            "regular_trading_change_percent": 1.104,
+            "early_trading_change": 0.66,
+            "early_trading_change_percent": 0.142,
+            "late_trading_change": -0.37,
+            "late_trading_change_percent": -0.0786,
+            "volume": 12_439_819,
+            "market_status": "late_trading",
+            "as_of": int(amd_at.timestamp() * 1000),
+            "source": "ginlix-data",
+            "tier": "realtime",
+        }
+        amd_line = format_quote_line(amd_snap, at=amd_at)
+        assert "AMD  $470.72  +1.10% today  after-hours $470.35 -0.08%  vol 12.4M (post)" == amd_line
+
+    def test_missing_regular_timestamp_uses_neutral_last_close_label(self):
+        # DALTON-HOOK(extended-hours-quotes): When _print_time_ms and regularMarketTime are both absent,
+        # extended-hours as_of must not be used to claim regular move is 'today' or 'prev close'.
+        no_reg_ts_post = {
+            "symbol": "GOOG",
+            "price": 330.95,
+            "regular_close": 330.95,
+            "previous_close": 336.40,
+            "last_trade_price": 333.76,
+            "regular_trading_change": -5.45,
+            "regular_trading_change_percent": -1.6201,
+            "late_trading_change": 2.81,
+            "late_trading_change_percent": 0.8491,
+            "volume": 19_200_000,
+            "market_status": "late_trading",
+            "as_of": int(self._POST_ET.timestamp() * 1000),
+            "regular_as_of": None,
+            "regular_trading_date": None,
+            "regular_only": False,
+            "tier": "delayed_15m",
+        }
+        line = format_quote_line(no_reg_ts_post, at=self._POST_ET)
+        assert "GOOG  $330.95  -1.62% last close  after-hours $333.76 +0.85%  vol 19.2M" in line
+        assert "today" not in line
+        assert "prev close" not in line
+
+    def test_overnight_and_weekend_use_last_close_not_today(self):
+        # DALTON-HOOK(extended-hours-quotes): 'today' requires regular session date == venue calendar date.
+        # 1) Same day 17:15 ET (2026-10-22): regular_trading_date == 2026-10-22 -> 'today'
+        base_post = {
+            "symbol": "GOOG",
+            "price": 330.95,
+            "regular_close": 330.95,
+            "previous_close": 336.40,
+            "last_trade_price": 333.76,
+            "regular_trading_change": -5.45,
+            "regular_trading_change_percent": -1.6201,
+            "late_trading_change": 2.81,
+            "late_trading_change_percent": 0.8491,
+            "volume": 19_200_000,
+            "market_status": "late_trading",
+            "as_of": int(self._POST_ET.timestamp() * 1000),
+            "regular_as_of": self._TODAY_CLOSE_MS,
+            "regular_trading_date": "2026-10-22",
+            "regular_only": False,
+            "tier": "delayed_15m",
+        }
+        same_day_line = format_quote_line(base_post, at=self._POST_ET)
+        assert "GOOG  $330.95  -1.62% today  after-hours $333.76 +0.85%  vol 19.2M" in same_day_line
+
+        # 2) Next day 02:00 ET (2026-10-23): regular_trading_date is 2026-10-22 -> 'last close'
+        overnight_et = _ET.localize(datetime(2026, 10, 23, 2, 0, 0))
+        overnight_line = format_quote_line(dict(base_post), at=overnight_et)
+        assert "GOOG  $330.95  -1.62% last close  after-hours $333.76 +0.85%  vol 19.2M" in overnight_line
+        assert "today" not in overnight_line
+
+        # 3) Saturday 12:00 ET (2026-10-24) reading Friday 2026-10-23 snapshot -> 'last close'
+        sat_et = _ET.localize(datetime(2026, 10, 24, 12, 0, 0))
+        fri_close_ms = int(_ET.localize(datetime(2026, 10, 23, 16, 0, 0)).timestamp() * 1000)
+        fri_post_ms = int(_ET.localize(datetime(2026, 10, 23, 18, 30, 0)).timestamp() * 1000)
+        sat_snap = {
+            **base_post,
+            "as_of": fri_post_ms,
+            "regular_as_of": fri_close_ms,
+            "regular_trading_date": "2026-10-23",
+        }
+        sat_line = format_quote_line(sat_snap, at=sat_et)
+        assert "GOOG  $330.95  -1.62% last close  after-hours $333.76 +0.85%  vol 19.2M" in sat_line
+        assert "today" not in sat_line
+
+    def test_missing_regular_change_percent_computes_or_omits_never_falls_back_to_blended(self):
+        # DALTON-HOOK(extended-hours-quotes): Do not fall back to blended change_percent when ext_part is present.
+        amd_at = _ET.localize(datetime(2026, 8, 31, 17, 31, 25))
+        # 1) ginlix after-hours shape without regular_trading_change_percent, but with regular_close and previous_close:
+        # computes (470.72 - 465.58) / 465.58 * 100 = +1.10%, never using blended change_percent=-9.99.
+        computable_snap = {
+            "symbol": "AMD",
+            "price": 470.72,
+            "regular_close": 470.72,
+            "previous_close": 465.58,
+            "last_trade_price": 470.35,
+            "change": 4.77,
+            "change_percent": -9.99,
+            "regular_trading_change": None,
+            "regular_trading_change_percent": None,
+            "late_trading_change": -0.37,
+            "late_trading_change_percent": -0.0786,
+            "volume": 12_439_819,
+            "market_status": "late_trading",
+            "as_of": int(amd_at.timestamp() * 1000),
+            "source": "ginlix-data",
+            "tier": "realtime",
+        }
+        computable_line = format_quote_line(computable_snap, at=amd_at)
+        assert "AMD  $470.72  +1.10% today  after-hours $470.35 -0.08%  vol 12.4M (post)" == computable_line
+
+        # 2) ginlix shape where regular move cannot be computed (previous_close is None): omits main pct.
+        uncomputable_snap = {**computable_snap, "previous_close": None}
+        uncomputable_line = format_quote_line(uncomputable_snap, at=amd_at)
+        assert "AMD  $470.72  after-hours $470.35 -0.08%  vol 12.4M (post)" == uncomputable_line
+        assert "-9.99%" not in uncomputable_line

@@ -23,6 +23,7 @@ from .display import (
     venue_phase,
 )
 from .utils import finite_or_none, get_market_session
+from src.dalton.extended_hours import format_quote_change_parts  # DALTON-HOOK(extended-hours-quotes)
 from src.utils.market_hours import ET
 
 _SESSION_LABELS = {
@@ -301,11 +302,14 @@ def _line(row: _Row, prev_price: Optional[float], at: Optional[datetime]) -> str
     snap = row.snap
     parts = [_symbol_label(snap)]
     price = current_price(snap)
-    if price is not None:
-        parts.append(_fmt_price(price, row.ref))
-    pct = finite_or_none(snap.get("change_percent"))
-    if pct is not None:
-        parts.append(f"{'+' if pct >= 0 else ''}{pct:.2f}% today")
+    # DALTON-HOOK(extended-hours-quotes): Split regular close + regular move from pre-market/after-hours price + move.
+    phase = venue_phase(row.ref, at) if row.ref is not None else None
+    main_price, change_parts = format_quote_change_parts(
+        snap, row.ref, at, phase, fallback_price=price, fmt_price=_fmt_price
+    )
+    if main_price is not None:
+        parts.append(_fmt_price(main_price, row.ref))
+    parts.extend(change_parts)
     vol = finite_or_none(snap.get("volume"))
     if vol:
         parts.append(f"vol {_fmt_volume(int(vol))}")
