@@ -19,6 +19,9 @@ services:
     # driver pipe) with Docker's default 64 MB /dev/shm, which hung the whole backend.
     shm_size: "1gb"
     memswap_limit: 2g
+    # Replace upstream 0.0.0.0:8000 port binding with loopback-only (requires Docker Compose v2.24.4+).
+    ports: !override
+      - "127.0.0.1:${BACKEND_PORT:-8000}:8000"
     # Inject DALTON_WEB_SEARCH_BRIDGE_TOKEN from the host 0600 env file without
     # writing the bridge token into repo .env or process arguments.
     env_file:
@@ -34,6 +37,9 @@ services:
       - ./var/dalton:/app/var/dalton
 
   frontend:
+    # Replace upstream 0.0.0.0:5173 port binding with loopback-only (requires Docker Compose v2.24.4+).
+    ports: !override
+      - "127.0.0.1:${FRONTEND_PORT:-5173}:5173"
     environment:
       VITE_BRAND_NAME: ${VITE_BRAND_NAME:-Everflow}
       VITE_BRAND_MARK: ${VITE_BRAND_MARK:-everflow}
@@ -41,3 +47,14 @@ services:
       VITE_DALTON_AUTH: ${VITE_DALTON_AUTH:-}
       VITE_SUPABASE_URL: ${VITE_SUPABASE_URL:-}
       VITE_SUPABASE_PUBLISHABLE_KEY: ${VITE_SUPABASE_PUBLISHABLE_KEY:-}
+
+  edge:
+    image: caddy:2.9.1-alpine
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "127.0.0.1:${DALTON_EDGE_PORT:-8088}:8088"
+    volumes:
+      - ./deploy/dalton/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./web/dist:/srv:ro
