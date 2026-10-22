@@ -1,0 +1,22 @@
+{
+  "两融核心": {
+    "status": "completed",
+    "detail": "3985行, 最新: 2026-10-21, 融资余额: 26397.8亿, 融券余额: 171.9亿",
+    "updated": "2026-10-22 10:00:05"
+  },
+  "宽基ETF份额": {
+    "status": "completed",
+    "detail": "最新: 2026-10-21",
+    "updated": "2026-10-22 10:00:12"
+  },
+  "北向资金": {
+    "status": "failed",
+    "detail": "script /Users/everflow/.openclaw/workspace/scripts/northbound.py exited with 1",
+    "updated": "2026-10-22 10:00:30"
+  },
+  "量化中性拥挤/Unwind": {
+    "status": "completed",
+    "detail": "信号更新至 2026-10-21, regime=normal_or_Expanding",
+    "updated": "2026-10-22 10:00:41"
+  }
+}

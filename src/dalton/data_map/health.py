@@ -362,6 +362,8 @@ def build_route_probe_spec(route_id: str, category: str) -> tuple[str, dict[str,
                 "limit": 1,
             },
         )
+    if rid == "market-regime":
+        return "macro", {"route": "market-regime", "operation": "snapshot"}
 
     tool_name = cat if cat in ("research", "finance", "macro", "news", "community") else "research"
     return tool_name, {"route": rid, "operation": "search", "query": "NVDA", "limit": 1}
@@ -590,10 +592,18 @@ async def _execute_probes(
     for rid, cat in routes_to_probe:
         tool_name, tool_args = build_route_probe_spec(rid, cat)
 
-        async def _probe_route(t_name: str = tool_name, t_args: dict[str, Any] = tool_args) -> dict[str, Any]:
+        async def _probe_route(
+            r_id: str = rid,
+            t_name: str = tool_name,
+            t_args: dict[str, Any] = tool_args,
+        ) -> dict[str, Any]:
             res = await call_bridge(t_name, t_args, timeout_s=clamped_timeout)
             if isinstance(res, Mapping):
                 _validate_bridge_payload(res)
+                if r_id == "market-regime" and isinstance(res.get("date"), str):
+                    m = _DATE_PREFIX_RE.search(res["date"])
+                    if m:
+                        return {"latest_date": m.group(1)}
             return {"latest_date": extract_latest_date(res)}
 
         tasks.append(

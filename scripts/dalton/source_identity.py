@@ -580,6 +580,42 @@ def _declare_cnhk(arguments: dict[str, Any], inner: dict[str, Any], fallback_as_
     return out[:MAX_SOURCES_PER_CALL]
 
 
+def _declare_market_regime(arguments: dict[str, Any], inner: dict[str, Any], fallback_as_of: str) -> list[dict[str, Any]]:
+    if inner.get("ok") is False:
+        return []
+    op = str(inner.get("operation") or arguments.get("operation") or "snapshot").strip() or "snapshot"
+    raw_as_of = inner.get("date") or inner.get("trade_date") or ""
+    if not raw_as_of and isinstance(inner.get("as_of"), str):
+        raw_as_of = inner["as_of"]
+    elif not raw_as_of and isinstance(inner.get("as_of"), dict):
+        as_of_map = inner["as_of"]
+        raw_as_of = (
+            as_of_map.get("us")
+            or as_of_map.get("cn_crowding")
+            or as_of_map.get("cn_margin")
+            or as_of_map.get("bbg")
+            or ""
+        )
+    as_of = str(raw_as_of or fallback_as_of)[:10]
+    doc_id = f"regime:{op}:{as_of}" if as_of else f"regime:{op}"
+    url = inner.get("source_url") if isinstance(inner.get("source_url"), str) else None
+    return [
+        _make_entry(
+            document_id=doc_id,
+            route="market-regime",
+            identity="derived",
+            publisher="OpenClaw",
+            title=f"Regime {op}",
+            as_of=as_of,
+            as_of_basis="date",
+            source_type="data_api",
+            url=url,
+            private=True,
+            independent=False,
+        )
+    ]
+
+
 def declare(tool: str, arguments: dict[str, Any] | None, payload: dict[str, Any] | None) -> list[dict[str, Any]]:
     """Return up to 50 structured source records for a `researchdata` tool call result."""
     if not isinstance(payload, dict):
@@ -616,6 +652,8 @@ def declare(tool: str, arguments: dict[str, Any] | None, payload: dict[str, Any]
         return _declare_estimates(args, inner, fallback_as_of)
     if route in ("fred", "treasury"):
         return _declare_macro(route, args, inner, fallback_as_of)
+    if route == "market-regime":
+        return _declare_market_regime(args, inner, fallback_as_of)
     if route == "cn-hk":
         return _declare_cnhk(args, inner, fallback_as_of)
 

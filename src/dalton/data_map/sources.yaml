@@ -79,6 +79,11 @@ catalog_routes:
     title: TGA与联邦债务
     rules: "operation=treasury, dataset=tga|debt"
     description: "财政部TGA日度余额与联邦债务（百万美元/美元），查流动性；国债收益率走fred（DGS2/DGS10）。"
+  market-regime:
+    category: macro
+    title: 市场状态与拥挤度
+    rules: "operation=snapshot|us_topbottom|crowding|cn_leverage"
+    description: "大盘过热/超卖、顶部底部阶段、拥挤度、两融杠杆；回答大盘和仓位问题时先读"
 
 direct_tools:
   conversation_search:

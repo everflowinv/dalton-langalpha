@@ -64,7 +64,9 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 
 ### 第 2 步：价量与同组对比量化（第 1、2 步合一，必须成功）
 
-按 `.agents/skills/dalton-stock-move/references/peer-groups.md` 的优先级解析同组（peer group）和板块 ETF（优先读 `../Home/dalton/coverage.yaml`），运行统一量化脚本：
+1. **量化前先读市场状态快照（`market-regime`）**：
+   - 在运行量化脚本前，先在沙箱中调用 `macro(route="market-regime", operation="snapshot")` 读取最新市场状态（美股顶部/底部框架 `stage` 与 `summary`、`put_hedge` 提醒、动量 `momentum.reading`、A 股/港股/亚洲读数及 `as_of` 日期），把当前所处的市场阶段与情绪/拥挤度读数写进“大盘/板块 beta”的判断依据；若返回 `stale=true`，必须在归因中显式注明数据滞后及 `as_of` / `warnings` 说明。
+2. 按 `.agents/skills/dalton-stock-move/references/peer-groups.md` 的优先级解析同组（peer group）和板块 ETF（优先读 `../Home/dalton/coverage.yaml`），运行统一量化脚本：
 
 ```bash
 python3 .agents/skills/dalton-stock-move/scripts/move_quant.py analyze \

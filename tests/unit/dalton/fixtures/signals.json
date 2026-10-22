@@ -1,0 +1,137 @@
+{
+  "ok": true,
+  "generated_at": "2026-10-22T14:21:14Z",
+  "date": "2026-10-22",
+  "as_of": {
+    "us": "2026-10-21",
+    "bbg": "2026-10-22",
+    "cn_margin": "2026-10-21",
+    "cn_crowding": "2026-10-21",
+    "index_history": "2026-10-21"
+  },
+  "us_market": {
+    "topbottom": {
+      "top_framework": {
+        "ok": true,
+        "stage": "无信号",
+        "active": false,
+        "strength": "none",
+        "summary": "当前无活跃顶部周期；最近一次在 2026-03-04 收盘确认调整（4 项预警）",
+        "window_remaining_td": 0,
+        "excess_timeout_remaining_td": 0,
+        "metrics": {
+          "sp500_close": 5850.12,
+          "ndx_close": 20310.45
+        },
+        "environment": {
+          "regime": "neutral"
+        },
+        "projection": {
+          "status": "inactive"
+        },
+        "put_hedge": {
+          "active": false,
+          "vvix": 100.32,
+          "vix": 18.23,
+          "vvix_vix_ratio": 5.5,
+          "reading": "不提醒：未处于活跃顶部周期（VVIX 100.3 / VIX 18.23）"
+        },
+        "active_cycle": null,
+        "latest_transition": {
+          "date": "2026-03-04",
+          "event": "confirmed_correction"
+        },
+        "regime_rule": "top_v2",
+        "thresholds": {
+          "vvix_alert": 110.0
+        },
+        "cycles": [
+          {"cycle_id": "2026-02", "stage": "confirmed"},
+          {"cycle_id": "2025-07", "stage": "confirmed"}
+        ],
+        "warnings": []
+      },
+      "bottom_framework": {
+        "ok": true,
+        "stage": "预警",
+        "active": true,
+        "summary": "预警：2026-10-14 周期股/防御股相对指数RSI14≤32；等待压力",
+        "window_remaining_td": 9,
+        "metrics": {
+          "cyc_def_rsi14": 31.4
+        },
+        "projection": {
+          "window_td": 15
+        },
+        "alert_projection": {
+          "expires_in_td": 9
+        },
+        "active_cycle": {
+          "start_date": "2026-10-14",
+          "stage": "预警"
+        },
+        "active_confirmation": null,
+        "latest_transition": {
+          "date": "2026-10-14",
+          "to_stage": "预警"
+        },
+        "macro_policy_rule": "standard",
+        "regime_rule": "bottom_v2",
+        "thresholds": {
+          "cyc_def_rsi14": 32.0
+        },
+        "cycles": [
+          {"cycle_id": "2026-10", "stage": "预警"}
+        ],
+        "signals": [
+          {"id": "cyc_def_rsi", "triggered": true}
+        ],
+        "warnings": [],
+        "environment": {
+          "signals": {"vix_spike": false}
+        }
+      }
+    },
+    "momentum": {
+      "hits": 0,
+      "reading": "GSCBHMOM RSI14 36.4",
+      "gscbhmom": 36.43
+    },
+    "ndx_spw": {
+      "hits": 0,
+      "reading": "NDX/SPW RSI14 51.2",
+      "rsi14": 51.2
+    },
+    "tech_rotation": {
+      "reading": "中性"
+    },
+    "sectors": []
+  },
+  "us_stocks": {
+    "megacap": []
+  },
+  "cn_a": {
+    "hits": 2,
+    "reading": "两融余额 RSI14 13.3，国证2000 拥挤度 2.8%",
+    "margin_rsi14": 13.3,
+    "smallcap": {
+      "crowding_pct": 2.8
+    }
+  },
+  "hk": {
+    "hits": 1,
+    "reading": "AH溢价 RSI30 -71.5（30日均值 1.298 → 最新 1.278，阈值 ±50）",
+    "ah_rsi30": -71.5
+  },
+  "asia": {
+    "hits": 2,
+    "reading": "韩国 20 · 日本 54 · 台湾 82",
+    "rows": [
+      {"market": "KR", "rsi14": 20},
+      {"market": "JP", "rsi14": 54},
+      {"market": "TW", "rsi14": 82}
+    ]
+  },
+  "footnotes": [],
+  "warnings": []
+}

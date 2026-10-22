@@ -14,15 +14,18 @@ Pure Python 3.11+ standard library only.
 from __future__ import annotations
 
 import asyncio
+import csv
 import hmac
 import json
 import logging
 import os
+import re
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping
+from zoneinfo import ZoneInfo
 
 # Ensure sibling `source_identity.py` is importable regardless of cwd
 _SCRIPT_DIR = Path(__file__).resolve().parent
@@ -92,8 +95,211 @@ ROUTE_TIMEOUTS: dict[str, tuple[int, int]] = {
     "estimates": (DEFAULT_ROUTE_TIMEOUT_S, DEFAULT_ROUTE_TIMEOUT_S),
     "fred": (DEFAULT_ROUTE_TIMEOUT_S, DEFAULT_ROUTE_TIMEOUT_S),
     "treasury": (DEFAULT_ROUTE_TIMEOUT_S, DEFAULT_ROUTE_TIMEOUT_S),
+    "market-regime": (15, 30),
     "cn-hk": (DEFAULT_ROUTE_TIMEOUT_S, DEFAULT_ROUTE_TIMEOUT_S),
 }
+
+MARKET_REGIME_OPERATIONS: tuple[str, ...] = (
+    "snapshot",
+    "us_topbottom",
+    "crowding",
+    "cn_leverage",
+)
+
+CN_LEVERAGE_KEY_COLUMNS: tuple[str, ...] = (
+    "date",
+    "unwind_pressure_score",
+    "unwind_direction",
+    "regime",
+    "gross_leverage_score",
+    "neutral_crowding_score",
+    "crowding_score",
+)
+
+_LOCAL_PATH_RE = re.compile(r"/Users/[^\s,;:\"')\]>]+")
+
+
+def _scrub_local_paths(text: Any) -> str:
+    """Replace host absolute paths starting with `/Users/` with `<local>`."""
+    if text is None:
+        return ""
+    return _LOCAL_PATH_RE.sub("<local>", str(text)).strip()
+
+MARKET_REGIME_CATALOG_ENTRY: dict[str, Any] = {
+    "id": "market-regime",
+    "category": "macro",
+    "tool": "macro",
+    "kind": "bridge_readonly",
+    "name": "Market Regime & Crowding Monitor",
+    "description": "大盘过热/超卖、顶部底部阶段、拥挤度、两融杠杆；回答大盘和仓位问题时先读。",
+    "operations": list(MARKET_REGIME_OPERATIONS),
+    "default_operation": "snapshot",
+    "parameters": {
+        "operation": {
+            "type": "string",
+            "enum": list(MARKET_REGIME_OPERATIONS),
+            "default": "snapshot",
+        },
+        "top": {
+            "type": "integer",
+            "default": 10,
+            "maximum": 30,
+            "description": "crowding 返回条数（默认 10，最多 30）",
+        },
+        "order": {
+            "type": "string",
+            "enum": ["high", "low"],
+            "default": "high",
+            "description": "crowding 排序方向（high / low）",
+        },
+        "category": {
+            "type": "string",
+            "description": "crowding 按类别过滤（可选）",
+        },
+        "query": {
+            "type": "string",
+            "description": "crowding 按指数名称或代码过滤（可选）",
+        },
+    },
+}
+
+
+def _easter_sunday(year: int) -> date:
+    """Compute Easter Sunday for a given Gregorian year (Anonymous Gregorian algorithm)."""
+    a = year % 19
+    b = year // 100
+    c = year % 100
+    d = b // 4
+    e = b % 4
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i = c // 4
+    k = c % 4
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    month = (h + l - 7 * m + 114) // 31
+    day = ((h + l - 7 * m + 114) % 31) + 1
+    return date(year, month, day)
+
+
+def _nth_weekday(year: int, month: int, weekday: int, n: int) -> date:
+    """Return the n-th (1-based) occurrence of weekday (0=Mon..6=Sun) in (year, month)."""
+    first = date(year, month, 1)
+    offset = (weekday - first.weekday()) % 7
+    return first + timedelta(days=offset + 7 * (n - 1))
+
+
+def _last_weekday(year: int, month: int, weekday: int) -> date:
+    """Return the last occurrence of weekday (0=Mon..6=Sun) in (year, month)."""
+    next_first = date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)
+    last_day = next_first - timedelta(days=1)
+    offset = (last_day.weekday() - weekday) % 7
+    return last_day - timedelta(days=offset)
+
+
+def _observed(d: date, allow_prior_year: bool = False) -> date | None:
+    """NYSE weekend observance rule: Saturday -> Friday, Sunday -> Monday."""
+    if d.weekday() == 5:
+        obs = d - timedelta(days=1)
+        if obs.year < d.year and not allow_prior_year:
+            return None
+        return obs
+    if d.weekday() == 6:
+        return d + timedelta(days=1)
+    return d
+
+
+def _us_nyse_holidays(year: int) -> set[date]:
+    """Return the set of NYSE full-day holidays for `year` using stdlib."""
+    holidays: set[date] = set()
+    nyd = _observed(date(year, 1, 1), allow_prior_year=False)
+    if nyd:
+        holidays.add(nyd)
+    if year >= 1998:
+        holidays.add(_nth_weekday(year, 1, 0, 3))
+    holidays.add(_nth_weekday(year, 2, 0, 3))
+    holidays.add(_easter_sunday(year) - timedelta(days=2))
+    holidays.add(_last_weekday(year, 5, 0))
+    if year >= 2022:
+        jt = _observed(date(year, 6, 19))
+        if jt:
+            holidays.add(jt)
+    ind = _observed(date(year, 7, 4))
+    if ind:
+        holidays.add(ind)
+    holidays.add(_nth_weekday(year, 9, 0, 1))
+    holidays.add(_nth_weekday(year, 11, 3, 4))
+    xmas = _observed(date(year, 12, 25))
+    if xmas:
+        holidays.add(xmas)
+    return holidays
+
+
+def _cn_fixed_holidays(year: int) -> set[date]:
+    """Return a Gregorian fixed-holiday subset approximation for A-shares (SSE/SZSE).
+
+    Note: This is an approximation covering only fixed Gregorian holidays (Jan 1,
+    May 1, Oct 1-3); it excludes lunar holidays (Spring Festival, Qingming, Dragon
+    Boat, Mid-Autumn) and State Council lieu-day adjustments (调休/补假).
+    """
+    return {
+        date(year, 1, 1),
+        date(year, 5, 1),
+        date(year, 10, 1),
+        date(year, 10, 2),
+        date(year, 10, 3),
+    }
+
+
+def _is_us_trading_day(d: date) -> bool:
+    return d.weekday() < 5 and d not in _us_nyse_holidays(d.year)
+
+
+def _is_cn_trading_day(d: date) -> bool:
+    # Approximation: weekdays minus Gregorian fixed CN holidays (excludes lunar/调休).
+    return d.weekday() < 5 and d not in _cn_fixed_holidays(d.year)
+
+
+def _latest_us_trading_day(ref_date: date) -> date:
+    """Return `ref_date` if it is an NYSE trading day, otherwise step back to the most recent NYSE trading day."""
+    d = ref_date
+    while not _is_us_trading_day(d):
+        d -= timedelta(days=1)
+    return d
+
+
+def _latest_cn_trading_day(ref_date: date) -> date:
+    """Return `ref_date` if it is an A-share trading day (approximate), otherwise step back."""
+    d = ref_date
+    while not _is_cn_trading_day(d):
+        d -= timedelta(days=1)
+    return d
+
+
+def _prev_cn_trading_day(ref_date: date, steps: int = 1) -> date:
+    """Return `steps` A-share trading days before `_latest_cn_trading_day(ref_date)`."""
+    d = _latest_cn_trading_day(ref_date)
+    for _ in range(max(0, steps)):
+        d -= timedelta(days=1)
+        while not _is_cn_trading_day(d):
+            d -= timedelta(days=1)
+    return d
+
+
+def _parse_csv_scalar(val: Any) -> Any:
+    """Convert numeric CSV cell strings to int/float while keeping text values intact."""
+    if not isinstance(val, str):
+        return val
+    s = val.strip()
+    if s == "":
+        return None
+    try:
+        if "." not in s and "e" not in s.lower():
+            return int(s)
+        return float(s)
+    except ValueError:
+        return s
 
 
 
@@ -215,6 +421,46 @@ class BridgeConfig:
         self.data_sources_json: Path = (
             self.ocw_root / "config" / "data_sources.json"
         )
+        self.sentiment_signals_json: Path = Path(
+            os.environ.get("DALTON_SENTIMENT_SIGNALS_JSON")
+            or os.environ.get("DALTON_MARKET_REGIME_SIGNALS_JSON")
+            or str(
+                self.ocw_root
+                / "research-outputs"
+                / "sentiment-dashboard"
+                / "signals.json"
+            )
+        )
+        self.index_crowding_json: Path = Path(
+            os.environ.get("DALTON_INDEX_CROWDING_JSON")
+            or os.environ.get("DALTON_MARKET_REGIME_CROWDING_JSON")
+            or str(
+                self.ocw_root
+                / "research-outputs"
+                / "index-crowding"
+                / "official-all.json"
+            )
+        )
+        self.cn_leverage_status_json: Path = Path(
+            os.environ.get("DALTON_CN_LEVERAGE_STATUS_JSON")
+            or os.environ.get("DALTON_MARKET_REGIME_LEVERAGE_STATUS_JSON")
+            or str(
+                self.ocw_root
+                / "state"
+                / "cn-leverage"
+                / "pipeline_status.json"
+            )
+        )
+        self.cn_leverage_unwind_csv: Path = Path(
+            os.environ.get("DALTON_CN_LEVERAGE_UNWIND_CSV")
+            or os.environ.get("DALTON_MARKET_REGIME_UNWIND_CSV")
+            or str(
+                self.ocw_root
+                / "state"
+                / "cn-leverage"
+                / "quant_unwind_signals.csv"
+            )
+        )
         self.max_inflight: int = max(
             1, int(os.environ.get("DALTON_BRIDGE_MAX_INFLIGHT", "2"))
         )
@@ -315,6 +561,7 @@ class ResearchDataBridge:
         self._usage_lock = asyncio.Lock()
         self._resolved_embed_model: str | None = None
         self._resolved_embed_dims: int | None = None
+        self._file_cache: dict[str, tuple[int, int, Any]] = {}
 
     def handoff_routes(self) -> set[str]:
         """Return route IDs whose `kind` is `agent_tool` or `skill` in `data_sources.json`."""
@@ -480,6 +727,60 @@ class ResearchDataBridge:
                 desc = str(tool_copy.get("description") or "").rstrip()
                 if self.RESEARCH_DESCRIPTION_SUFFIX.strip() not in desc:
                     tool_copy["description"] = desc + self.RESEARCH_DESCRIPTION_SUFFIX
+            elif tool_copy.get("name") == "macro":
+                if isinstance(route_prop, dict) and isinstance(route_prop.get("enum"), list):
+                    if "market-regime" not in route_prop["enum"]:
+                        route_prop["enum"].append("market-regime")
+                if isinstance(props, dict):
+                    op_prop = props.get("operation")
+                    if isinstance(op_prop, dict):
+                        op_desc = str(op_prop.get("description") or "").rstrip()
+                        if "market-regime" not in op_desc:
+                            op_prop["description"] = (
+                                f"{op_desc} For market-regime: snapshot (default), us_topbottom, crowding, cn_leverage."
+                            ).strip()
+                    else:
+                        props["operation"] = {
+                            "type": "string",
+                            "description": "Operation name (for market-regime: snapshot, us_topbottom, crowding, cn_leverage).",
+                        }
+                    props.setdefault(
+                        "top",
+                        {
+                            "type": "integer",
+                            "default": 10,
+                            "maximum": 30,
+                            "description": "For market-regime crowding: number of rows to return (default 10, max 30).",
+                        },
+                    )
+                    props.setdefault(
+                        "order",
+                        {
+                            "type": "string",
+                            "enum": ["high", "low"],
+                            "default": "high",
+                            "description": "For market-regime crowding: sort order by crowding_percentile (high or low).",
+                        },
+                    )
+                    props.setdefault(
+                        "category",
+                        {
+                            "type": "string",
+                            "description": "For market-regime crowding: optional category filter.",
+                        },
+                    )
+                    props.setdefault(
+                        "query",
+                        {
+                            "type": "string",
+                            "description": "For market-regime crowding: optional filter by index name or code.",
+                        },
+                    )
+                m_desc = str(tool_copy.get("description") or "").rstrip()
+                if "market-regime" not in m_desc:
+                    tool_copy["description"] = (
+                        f"{m_desc} Market regime & crowding: route='market-regime' (operations: snapshot, us_topbottom, crowding, cn_leverage)."
+                    ).strip()
             filtered.append(tool_copy)
 
         self._cached_tools = filtered
@@ -1211,6 +1512,432 @@ class ResearchDataBridge:
             except Exception as exc:
                 logger.warning("Failed to record alphaengine usage: %s", type(exc).__name__)
 
+    def _reference_date(self) -> date:
+        """Return the current `America/New_York` calendar date for market-regime freshness checks."""
+        return datetime.now(ZoneInfo("America/New_York")).date()
+
+    def _read_cached_json_sync(
+        self, path: Path, *, strip_crowding_history: bool = False
+    ) -> tuple[str, dict[str, Any] | None, str | None]:
+        """Read and parse a JSON object file synchronously with in-process `(mtime_ns, size)` caching."""
+        try:
+            st = path.stat()
+        except FileNotFoundError:
+            return ("source_missing", None, f"Source file not found: {path.name}")
+        except OSError as exc:
+            return ("source_missing", None, f"Cannot access {path.name}: {type(exc).__name__}")
+        if not path.is_file():
+            return ("source_missing", None, f"Not a regular file: {path.name}")
+
+        cache_key = f"json:{int(strip_crowding_history)}:{path}"
+        cached = self._file_cache.get(cache_key)
+        if cached is not None and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
+            return ("ok", cached[2], None)
+
+        try:
+            raw_text = path.read_text(encoding="utf-8")
+            parsed = json.loads(raw_text)
+        except FileNotFoundError:
+            return ("source_missing", None, f"Source file not found: {path.name}")
+        except Exception as exc:
+            return ("invalid_source", None, f"Failed to parse JSON in {path.name}: {type(exc).__name__}")
+
+        if not isinstance(parsed, dict):
+            return ("invalid_source", None, f"Expected JSON object in {path.name}")
+
+        if strip_crowding_history and isinstance(parsed.get("rows"), list):
+            parsed = dict(parsed)
+            parsed["rows"] = [
+                {k: v for k, v in r.items() if k != "history_1y"}
+                for r in parsed["rows"]
+                if isinstance(r, dict)
+            ]
+
+        self._file_cache[cache_key] = (st.st_mtime_ns, st.st_size, parsed)
+        return ("ok", parsed, None)
+
+    def _read_cached_csv_sync(
+        self, path: Path
+    ) -> tuple[str, list[dict[str, str]] | None, str | None]:
+        """Read and parse a CSV file synchronously with in-process `(mtime_ns, size)` caching."""
+        try:
+            st = path.stat()
+        except FileNotFoundError:
+            return ("source_missing", None, f"Source file not found: {path.name}")
+        except OSError as exc:
+            return ("source_missing", None, f"Cannot access {path.name}: {type(exc).__name__}")
+        if not path.is_file():
+            return ("source_missing", None, f"Not a regular file: {path.name}")
+
+        cache_key = f"csv:{path}"
+        cached = self._file_cache.get(cache_key)
+        if cached is not None and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
+            return ("ok", cached[2], None)
+
+        try:
+            raw_text = path.read_text(encoding="utf-8")
+            lines = [ln for ln in raw_text.splitlines() if ln.strip()]
+            if not lines:
+                return ("invalid_source", None, f"Empty CSV in {path.name}")
+            reader = csv.DictReader(lines)
+            if not reader.fieldnames or "date" not in reader.fieldnames:
+                return ("invalid_source", None, f"Invalid CSV header in {path.name}")
+            rows: list[dict[str, str]] = []
+            for r in reader:
+                if not isinstance(r, dict) or None in r:
+                    return ("invalid_source", None, f"Malformed CSV row in {path.name}")
+                if not str(r.get("date") or "").strip():
+                    return ("invalid_source", None, f"Missing date value in {path.name}")
+                rows.append({str(k): str(v or "") for k, v in r.items() if k is not None})
+        except FileNotFoundError:
+            return ("source_missing", None, f"Source file not found: {path.name}")
+        except Exception as exc:
+            return ("invalid_source", None, f"Failed to parse CSV in {path.name}: {type(exc).__name__}")
+
+        if not rows:
+            return ("invalid_source", None, f"No data rows in {path.name}")
+
+        self._file_cache[cache_key] = (st.st_mtime_ns, st.st_size, rows)
+        return ("ok", rows, None)
+
+    def _build_market_regime_sync(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Build the `macro(route='market-regime')` response synchronously (called via `asyncio.to_thread`)."""
+        raw_params = arguments.get("params")
+        params: dict[str, Any] = dict(raw_params) if isinstance(raw_params, dict) else {}
+        op = (
+            str(arguments.get("operation") or params.get("operation") or "snapshot")
+            .strip()
+            .lower()
+            or "snapshot"
+        )
+        if op not in MARKET_REGIME_OPERATIONS:
+            return {
+                "ok": False,
+                "status": "invalid_source",
+                "route": "market-regime",
+                "operation": op,
+                "error": f"Unsupported market-regime operation '{op}' (expected one of {list(MARKET_REGIME_OPERATIONS)})",
+            }
+
+        ref_date = self._reference_date()
+        latest_us_td = _latest_us_trading_day(ref_date).isoformat()
+        latest_cn_td_m1 = _prev_cn_trading_day(ref_date, 1).isoformat()
+
+        if op in ("snapshot", "us_topbottom"):
+            status, data, err = self._read_cached_json_sync(self.cfg.sentiment_signals_json)
+            if status != "ok" or data is None:
+                return {
+                    "ok": False,
+                    "status": status,
+                    "route": "market-regime",
+                    "operation": op,
+                    "error": err or status,
+                }
+            if data.get("ok") is False:
+                return {
+                    "ok": False,
+                    "status": "invalid_source",
+                    "route": "market-regime",
+                    "operation": op,
+                    "error": "signals.json reported ok=false",
+                }
+            us_market = data.get("us_market")
+            topbottom = us_market.get("topbottom") if isinstance(us_market, dict) else None
+            top_fw = topbottom.get("top_framework") if isinstance(topbottom, dict) else None
+            bot_fw = topbottom.get("bottom_framework") if isinstance(topbottom, dict) else None
+            if not isinstance(top_fw, dict) or not isinstance(bot_fw, dict):
+                return {
+                    "ok": False,
+                    "status": "invalid_source",
+                    "route": "market-regime",
+                    "operation": op,
+                    "error": "Malformed signals.json: missing us_market.topbottom frameworks",
+                }
+
+            sig_date = str(data.get("date") or "").strip()[:10]
+            raw_as_of = data.get("as_of")
+            as_of_dict = dict(raw_as_of) if isinstance(raw_as_of, dict) else {}
+            raw_warnings = data.get("warnings")
+            warnings: list[str] = (
+                [_scrub_local_paths(w) for w in raw_warnings if str(w).strip()]
+                if isinstance(raw_warnings, list)
+                else []
+            )
+            us_stale = False
+            if not sig_date or sig_date < latest_us_td:
+                us_stale = True
+                warnings.append(
+                    f"signals.json date ({sig_date or 'missing'}) is earlier than latest US trading day ({latest_us_td})"
+                )
+
+            if op == "snapshot":
+                cn_crowding_as_of = str(as_of_dict.get("cn_crowding") or "").strip()[:10]
+                cn_margin_as_of = str(as_of_dict.get("cn_margin") or "").strip()[:10]
+                cn_stale = False
+                if cn_crowding_as_of and cn_crowding_as_of < latest_cn_td_m1:
+                    cn_stale = True
+                    warnings.append(
+                        f"cn_crowding as_of ({cn_crowding_as_of}) is earlier than latest A-share trading day minus 1 ({latest_cn_td_m1})"
+                    )
+                if cn_margin_as_of and cn_margin_as_of < latest_cn_td_m1:
+                    cn_stale = True
+                    warnings.append(
+                        f"cn_margin as_of ({cn_margin_as_of}) is earlier than latest A-share trading day minus 1 ({latest_cn_td_m1})"
+                    )
+
+                mom = us_market.get("momentum") if isinstance(us_market.get("momentum"), dict) else {}
+                ndx_spw = us_market.get("ndx_spw") if isinstance(us_market.get("ndx_spw"), dict) else {}
+                cn_a = data.get("cn_a") if isinstance(data.get("cn_a"), dict) else {}
+                hk = data.get("hk") if isinstance(data.get("hk"), dict) else {}
+                asia = data.get("asia") if isinstance(data.get("asia"), dict) else {}
+                snap_res: dict[str, Any] = {
+                    "ok": True,
+                    "status": "ok",
+                    "route": "market-regime",
+                    "operation": "snapshot",
+                    "date": sig_date,
+                    "as_of": as_of_dict,
+                    "stale": us_stale,
+                    "us_topbottom": {
+                        "top_framework": {
+                            "stage": top_fw.get("stage"),
+                            "active": top_fw.get("active"),
+                            "summary": top_fw.get("summary"),
+                            "window_remaining_td": top_fw.get("window_remaining_td"),
+                        },
+                        "bottom_framework": {
+                            "stage": bot_fw.get("stage"),
+                            "active": bot_fw.get("active"),
+                            "summary": bot_fw.get("summary"),
+                            "window_remaining_td": bot_fw.get("window_remaining_td"),
+                        },
+                    },
+                    "put_hedge": top_fw.get("put_hedge"),
+                    "momentum": {
+                        "reading": mom.get("reading"),
+                        "gscbhmom": mom.get("gscbhmom"),
+                    },
+                    "cn_a": {
+                        "reading": cn_a.get("reading"),
+                        "margin_rsi14": cn_a.get("margin_rsi14"),
+                        "stale": cn_stale,
+                    },
+                    "hk": {
+                        "reading": hk.get("reading"),
+                        "ah_rsi30": hk.get("ah_rsi30"),
+                    },
+                    "asia": {
+                        "reading": asia.get("reading"),
+                    },
+                    "warnings": warnings,
+                }
+                if ndx_spw.get("rsi14") is not None:
+                    snap_res["ndx_spw"] = {
+                        "rsi14": ndx_spw.get("rsi14"),
+                    }
+                return snap_res
+
+            def _strip_large_arrays(fw: dict[str, Any]) -> dict[str, Any]:
+                return {
+                    k: v
+                    for k, v in fw.items()
+                    if k not in ("cycles", "signals", "history", "rows", "series")
+                    and (k == "warnings" or not isinstance(v, list))
+                }
+
+            return {
+                "ok": True,
+                "status": "ok",
+                "route": "market-regime",
+                "operation": "us_topbottom",
+                "date": sig_date,
+                "generated_at": data.get("generated_at"),
+                "as_of": as_of_dict,
+                "stale": us_stale,
+                "top_framework": _strip_large_arrays(top_fw),
+                "bottom_framework": _strip_large_arrays(bot_fw),
+                "warnings": warnings,
+            }
+
+        if op == "crowding":
+            status, data, err = self._read_cached_json_sync(
+                self.cfg.index_crowding_json, strip_crowding_history=True
+            )
+            if status != "ok" or data is None:
+                return {
+                    "ok": False,
+                    "status": status,
+                    "route": "market-regime",
+                    "operation": "crowding",
+                    "error": err or status,
+                }
+            raw_rows = data.get("rows")
+            if data.get("ok") is False or not isinstance(raw_rows, list):
+                return {
+                    "ok": False,
+                    "status": "invalid_source",
+                    "route": "market-regime",
+                    "operation": "crowding",
+                    "error": "Malformed official-all.json: missing rows list",
+                }
+
+            trade_date = str(data.get("trade_date") or "").strip()[:10]
+            warnings = []
+            stale = False
+            if not trade_date or trade_date < latest_cn_td_m1:
+                stale = True
+                warnings.append(
+                    f"crowding trade_date ({trade_date or 'missing'}) is earlier than latest A-share trading day minus 1 ({latest_cn_td_m1})"
+                )
+
+            raw_top = arguments.get("top")
+            if raw_top is None:
+                raw_top = params.get("top")
+            if raw_top is None:
+                raw_top = arguments.get("limit") if arguments.get("limit") is not None else params.get("limit")
+            try:
+                top_n = max(1, min(int(raw_top), 30)) if raw_top is not None and not isinstance(raw_top, bool) else 10
+            except (TypeError, ValueError):
+                top_n = 10
+
+            raw_order = str(arguments.get("order") or params.get("order") or "high").strip().lower()
+            order = "low" if raw_order == "low" else "high"
+            category_filter = str(arguments.get("category") or params.get("category") or "").strip()
+            query_filter = str(arguments.get("query") or params.get("query") or "").strip()
+
+            filtered_rows: list[dict[str, Any]] = []
+            cat_lower = category_filter.lower()
+            q_lower = query_filter.lower()
+            for r in raw_rows:
+                if not isinstance(r, dict):
+                    continue
+                clean_r = {k: v for k, v in r.items() if k != "history_1y"}
+                if cat_lower:
+                    row_cat = f"{clean_r.get('category') or ''} {clean_r.get('category_code') or ''}".lower()
+                    if cat_lower not in row_cat:
+                        continue
+                if q_lower:
+                    row_q = f"{clean_r.get('index_name') or ''} {clean_r.get('index_code') or ''}".lower()
+                    if q_lower not in row_q:
+                        continue
+                filtered_rows.append(clean_r)
+
+            def _crowding_sort_key(item: dict[str, Any]) -> float:
+                val = item.get("crowding_percentile")
+                try:
+                    return float(val) if val is not None else (-1e9 if order == "high" else 1e9)
+                except (TypeError, ValueError):
+                    return -1e9 if order == "high" else 1e9
+
+            filtered_rows.sort(key=_crowding_sort_key, reverse=(order == "high"))
+            selected_rows = filtered_rows[:top_n]
+            return {
+                "ok": True,
+                "status": "ok",
+                "route": "market-regime",
+                "operation": "crowding",
+                "trade_date": trade_date,
+                "as_of": trade_date,
+                "stale": stale,
+                "order": order,
+                "top": top_n,
+                "category": category_filter or None,
+                "query": query_filter or None,
+                "index_count": data.get("index_count", len(raw_rows)),
+                "matched_count": len(filtered_rows),
+                "count": len(selected_rows),
+                "rows": selected_rows,
+                "warnings": warnings,
+            }
+
+        # op == "cn_leverage"
+        p_status, pipe_data, p_err = self._read_cached_json_sync(self.cfg.cn_leverage_status_json)
+        if p_status != "ok" or pipe_data is None:
+            return {
+                "ok": False,
+                "status": p_status,
+                "route": "market-regime",
+                "operation": "cn_leverage",
+                "error": p_err or p_status,
+            }
+        if not pipe_data or not all(
+            isinstance(v, dict) and "status" in v for v in pipe_data.values()
+        ):
+            return {
+                "ok": False,
+                "status": "invalid_source",
+                "route": "market-regime",
+                "operation": "cn_leverage",
+                "error": "Malformed pipeline_status.json: expected mapping of pipeline status dicts",
+            }
+
+        c_status, csv_rows, c_err = self._read_cached_csv_sync(self.cfg.cn_leverage_unwind_csv)
+        if c_status != "ok" or csv_rows is None:
+            return {
+                "ok": False,
+                "status": c_status,
+                "route": "market-regime",
+                "operation": "cn_leverage",
+                "error": c_err or c_status,
+            }
+
+        tail_raw = csv_rows[-5:]
+        unwind_rows: list[dict[str, Any]] = []
+        for r in tail_raw:
+            item: dict[str, Any] = {}
+            for col in CN_LEVERAGE_KEY_COLUMNS:
+                if col in r:
+                    item[col] = _parse_csv_scalar(r[col])
+            if len(item) <= 1 and len(r) > 1:
+                for k, v in list(r.items())[:6]:
+                    item[k] = _parse_csv_scalar(v)
+            unwind_rows.append(item)
+
+        latest_date = str(unwind_rows[-1].get("date") or "").strip()[:10] if unwind_rows else ""
+        warnings = []
+        stale = False
+        if not latest_date or latest_date < latest_cn_td_m1:
+            stale = True
+            warnings.append(
+                f"cn_leverage unwind date ({latest_date or 'missing'}) is earlier than latest A-share trading day minus 1 ({latest_cn_td_m1})"
+            )
+
+        pipeline_rows: list[dict[str, Any]] = []
+        for p_name, p_info in pipe_data.items():
+            if not isinstance(p_info, dict):
+                continue
+            st_val = str(p_info.get("status") or "").strip()
+            pipeline_rows.append(
+                {
+                    "name": str(p_name),
+                    "status": st_val,
+                    "updated": p_info.get("updated"),
+                }
+            )
+            if st_val.lower() not in ("completed", "ok", "success", ""):
+                detail_clean = _scrub_local_paths(p_info.get("detail") or "")
+                warn_msg = f"pipeline {p_name} status={st_val}"
+                if detail_clean:
+                    warn_msg = f"{warn_msg}: {detail_clean}"
+                warnings.append(warn_msg)
+
+        return {
+            "ok": True,
+            "status": "ok",
+            "route": "market-regime",
+            "operation": "cn_leverage",
+            "date": latest_date,
+            "as_of": latest_date,
+            "stale": stale,
+            "pipeline_status": pipeline_rows,
+            "latest_unwind": unwind_rows,
+            "warnings": warnings,
+        }
+
+    async def _handle_market_regime(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Read and parse OpenClaw market-regime files in a background thread (`asyncio.to_thread`)."""
+        return await asyncio.to_thread(self._build_market_regime_sync, arguments)
+
     async def handle_tools_call(
         self, req_id: Any, params: dict[str, Any]
     ) -> dict[str, Any]:
@@ -1279,7 +2006,30 @@ class ResearchDataBridge:
                     "method": "tools/call",
                     "params": {"name": tool_name, "arguments": call_args},
                 }
-                if ae_args is not None and gp_args is not None:
+                if route == "market-regime":
+                    mr_payload = await asyncio.wait_for(
+                        self._handle_market_regime(arguments),
+                        timeout=remaining_budget_s,
+                    )
+                    resps = [
+                        {
+                            "jsonrpc": "2.0",
+                            "id": req_id if req_id is not None else 1,
+                            "result": {
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": json.dumps(
+                                            mr_payload, ensure_ascii=False
+                                        ),
+                                    }
+                                ],
+                                "structuredContent": dict(mr_payload),
+                                "isError": not bool(mr_payload.get("ok")),
+                            },
+                        }
+                    ]
+                elif ae_args is not None and gp_args is not None:
                     ae_timeout = int(
                         ae_args.get("timeout") or FANOUT_ALPHAENGINE_TIMEOUT_S
                     )
@@ -1455,13 +2205,22 @@ class ResearchDataBridge:
                     payload = None
 
                 if isinstance(payload, dict):
-                    # Filter handoff routes from catalog() output too
+                    # Filter handoff routes from catalog() output and include market-regime
                     if tool_name == "catalog" and isinstance(payload.get("routes"), list):
                         payload["routes"] = [
                             r
                             for r in payload["routes"]
                             if isinstance(r, dict) and r.get("id") not in handoff
                         ]
+                        cat_filter = str(arguments.get("category") or "").strip().lower()
+                        if not cat_filter or cat_filter == "macro":
+                            existing_ids = {
+                                str(r.get("id") or "")
+                                for r in payload["routes"]
+                                if isinstance(r, dict)
+                            }
+                            if "market-regime" not in existing_ids:
+                                payload["routes"].append(dict(MARKET_REGIME_CATALOG_ENTRY))
                         payload["route_count"] = len(payload["routes"])
 
                     declared = source_identity.declare(tool_name, arguments, payload)
