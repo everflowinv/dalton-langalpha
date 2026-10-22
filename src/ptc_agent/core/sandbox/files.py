@@ -54,7 +54,11 @@ if TYPE_CHECKING:
 
 logger = structlog.get_logger(__name__)
 
-_INLINE_TEXT_WRITE_LIMIT = 256 * 1024
+# DALTON-HOOK(sandbox-inline-write-limit): the inline write ships the base64 payload inside one
+# `sh -c` argument, and Linux caps a single argv string at MAX_ARG_STRLEN (128 KiB), so on the
+# Docker runtime any text between ~96 and 256 KiB failed with exit 255 ("argument list too
+# long", empty stderr). 64 KiB raw is ~87 KiB encoded; larger files take the verified upload path.
+_INLINE_TEXT_WRITE_LIMIT = 64 * 1024
 _INLINE_TEXT_MARKER = "__LANGALPHA_TEXT_PAYLOAD__"
 # Grep output past this renders off the event loop. Rendering costs about
 # 9 ms per MB, so 128 KiB holds the loop near 1 ms, while smaller outputs, the
