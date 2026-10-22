@@ -21,7 +21,8 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Mapping, Sequence
-from datetime import timedelta
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 import json
 import logging
 import os
@@ -283,9 +284,15 @@ async def default_bridge_rpc_call(
     return _validate_bridge_payload(parsed_payload, result_obj=result_obj)
 
 
+def _probe_today() -> date:
+    return datetime.now(ZoneInfo("America/New_York")).date()
+
+
 def build_route_probe_spec(route_id: str, category: str) -> tuple[str, dict[str, Any]]:
     """Return `(tool_name, arguments)` for a minimal real probe of a `researchdata` route."""
-    today = today_cache_date()
+    # Upstream routes reject an end date past *their* today (US); the Shanghai cache date runs a
+    # day ahead every evening ET, which failed alphaengine/cn-hk probes.
+    today = _probe_today()
     start_30d = (today - timedelta(days=30)).isoformat()
     end_today = today.isoformat()
 
@@ -342,9 +349,19 @@ def build_route_probe_spec(route_id: str, category: str) -> tuple[str, dict[str,
             },
         )
     if rid == "fred":
-        return "macro", {"route": "fred", "series": "DGS10", "limit": 1}
+        return "macro", {"route": "fred", "series": "DGS10", "start": start_30d, "end": end_today, "limit": 1}
     if rid == "treasury":
-        return "macro", {"route": "treasury", "operation": "rates", "limit": 1}
+        return (
+            "macro",
+            {
+                "route": "treasury",
+                "operation": "treasury",
+                "dataset": "tga",
+                "start": start_30d,
+                "end": end_today,
+                "limit": 1,
+            },
+        )
 
     tool_name = cat if cat in ("research", "finance", "macro", "news", "community") else "research"
     return tool_name, {"route": rid, "operation": "search", "query": "NVDA", "limit": 1}
@@ -372,7 +389,7 @@ async def default_x_search_probe(*, timeout_s: float = DEFAULT_ITEM_TIMEOUT_S) -
     """Minimal real probe for `x_search`."""
     from src.dalton.web_search.x_search import OpenClawXSearchWrapper, map_x_search_response
 
-    today = today_cache_date()
+    today = _probe_today()
     from_d = (today - timedelta(days=7)).isoformat()
     to_d = today.isoformat()
     wrapper = OpenClawXSearchWrapper(timeout_seconds=clamp_timeout_s(timeout_s))
