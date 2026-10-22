@@ -20,11 +20,13 @@ Checks:
 from __future__ import annotations
 
 import argparse
+import calendar
+from datetime import date
 import json
 import re
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 CITATION_RE = re.compile(r"\[S(\d+)\]")
 SOURCE_DEF_RE = re.compile(r"^\s*(?:[-*]\s+|\d+\.\s+)?\[S(\d+)\]\s+(.+)$")
@@ -34,6 +36,32 @@ MED_TAG_RE = re.compile(r"【中(?:[：:][^】]*)?】")
 LOW_TAG_RE = re.compile(r"【低(?:[：:][^】]*)?】")
 CONFLICT_TAG_RE = re.compile(r"【冲突(?:[：:][^】]*)?】")
 CORRECTION_TAG_RE = re.compile(r"【更正(?:[：:][^】]*)?】")
+STALE_TAG_RE = re.compile(r"【陈旧(?:[：:][^】]*)?】")
+
+STALE_THRESHOLD_DAYS = 183
+
+ISO_DATE_RE = re.compile(r"(?<!\d)((?:19|20)\d{2})-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])(?!\d)")
+CN_YM_RE = re.compile(
+    r"(?<!\d)((?:19|20)\d{2})\s*年\s*(1[0-2]|0?[1-9])\s*月(?:\s*(3[01]|[12]\d|0?[1-9])\s*日)?"
+)
+QUARTER_RE = re.compile(r"(?<![A-Za-z0-9])((?:19|20)\d{2})\s*[Qq]([1-4])(?![A-Za-z0-9])")
+HEADER_LABELED_DATE_RE = re.compile(
+    r"(?:\*{1,2}|_{1,2})?(?:报告日期|成稿日期)(?:\*{1,2}|_{1,2})?\s*[：:]\s*(?:\*{1,2}|_{1,2})?\s*((?:19|20)\d{2}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01]))"
+)
+URL_STRIP_RE = re.compile(r"https?://\S+", re.IGNORECASE)
+SOURCE_EXCLUDED_DATE_RE = re.compile(
+    r"(?:访问日期|检索日期|accessed(?:\s+on|\s+date)?)\s*(?:[：:]|\s+)?\s*"
+    r"(?:(?:19|20)\d{2}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])|"
+    r"(?:19|20)\d{2}\s*年\s*(?:1[0-2]|0?[1-9])\s*月(?:\s*(?:3[01]|[12]\d|0?[1-9])\s*日)?)",
+    re.IGNORECASE,
+)
+SOURCE_PUB_DATE_LABEL_RE = re.compile(
+    r"(?:(?<!访问)(?<!检索)(?:发布日期|发布于|发布|日期)|(?<![A-Za-z])(?:Published|(?<!accessed\s)(?<!access\s)Date)(?![A-Za-z]))"
+    r"\s*(?:[：:]|\s+)\s*"
+    r"((?:19|20)\d{2}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])|"
+    r"(?:19|20)\d{2}\s*年\s*(?:1[0-2]|0?[1-9])\s*月(?:\s*(?:3[01]|[12]\d|0?[1-9])\s*日)?)",
+    re.IGNORECASE,
+)
 
 REQUIRED_SECTIONS = [
     "执行摘要",
@@ -61,10 +89,87 @@ def split_body_and_sources(text: str) -> Tuple[str, str, int]:
     return body, sources, sources_idx + 2
 
 
-def validate_markdown(text: str) -> Dict[str, Any]:
+def _parse_single_date_str(raw: str) -> Optional[date]:
+    s = (raw or "").strip()
+    if not s:
+        return None
+    m_iso = ISO_DATE_RE.search(s)
+    if m_iso:
+        try:
+            return date(int(m_iso.group(1)), int(m_iso.group(2)), int(m_iso.group(3)))
+        except ValueError:
+            return None
+    m_cn = CN_YM_RE.search(s)
+    if m_cn:
+        y, m, d = int(m_cn.group(1)), int(m_cn.group(2)), m_cn.group(3)
+        day = int(d) if d else calendar.monthrange(y, m)[1]
+        try:
+            return date(y, m, day)
+        except ValueError:
+            return None
+    m_q = QUARTER_RE.search(s)
+    if m_q:
+        y, q = int(m_q.group(1)), int(m_q.group(2))
+        q_month = q * 3
+        q_day = calendar.monthrange(y, q_month)[1]
+        return date(y, q_month, q_day)
+    return None
+
+
+def resolve_report_date(text: str, as_of: Optional[str | date] = None) -> date:
+    """Resolve report date from `报告日期` / `成稿日期` in report header, falling back to `--as-of` and then today."""
+    lines = text.splitlines()
+    header_lines: List[str] = []
+    for line in lines[:30]:
+        if re.match(r"^##\s+", line.strip()):
+            break
+        header_lines.append(line)
+    header_text = "\n".join(header_lines)
+
+    m_labeled = HEADER_LABELED_DATE_RE.search(header_text)
+    if m_labeled:
+        parsed = _parse_single_date_str(m_labeled.group(1))
+        if parsed is not None:
+            return parsed
+
+    if isinstance(as_of, date):
+        return as_of
+    if isinstance(as_of, str) and as_of.strip():
+        parsed = _parse_single_date_str(as_of)
+        if parsed is not None:
+            return parsed
+
+    return date.today()
+
+
+def _extract_source_pub_date(source_text: str) -> Optional[Tuple[str, date]]:
+    """Extract `(matched_date_str, resolved_date)` only when an explicit publication date label is present."""
+    cleaned = URL_STRIP_RE.sub("", source_text or "")
+    cleaned = SOURCE_EXCLUDED_DATE_RE.sub("", cleaned)
+
+    m_pub = SOURCE_PUB_DATE_LABEL_RE.search(cleaned)
+    if not m_pub:
+        return None
+
+    raw_token = m_pub.group(1).strip()
+    parsed = _parse_single_date_str(raw_token)
+    if parsed is None:
+        return None
+    m_iso = ISO_DATE_RE.search(raw_token)
+    if m_iso:
+        return m_iso.group(0), parsed
+    m_cn = CN_YM_RE.search(raw_token)
+    if m_cn:
+        return m_cn.group(0), parsed
+    return raw_token, parsed
+
+
+def validate_markdown(text: str, *, as_of: Optional[str | date] = None) -> Dict[str, Any]:
     errors: List[Dict[str, Any]] = []
     warnings: List[Dict[str, Any]] = []
+    stale_unmarked: List[Dict[str, Any]] = []
 
+    report_date = resolve_report_date(text, as_of=as_of)
     body, sources_section, sources_start_line = split_body_and_sources(text)
     body_lines = body.splitlines()
 
@@ -174,6 +279,7 @@ def validate_markdown(text: str) -> Dict[str, Any]:
             m = SOURCE_DEF_RE.match(raw_line)
             if m:
                 cid = m.group(1)
+                source_body = m.group(2)
                 if cid in defined_citations:
                     errors.append(
                         {
@@ -184,6 +290,37 @@ def validate_markdown(text: str) -> Dict[str, Any]:
                         }
                     )
                 defined_citations[cid] = line_no
+
+                if not STALE_TAG_RE.search(raw_line):
+                    pub_info = _extract_source_pub_date(source_body)
+                    if pub_info is not None:
+                        matched_date_str, parsed_dt = pub_info
+                        age_days = (report_date - parsed_dt).days
+                        if age_days > STALE_THRESHOLD_DAYS:
+                            entry = {
+                                "line": line_no,
+                                "source_id": f"S{cid}",
+                                "date": matched_date_str,
+                                "resolved_date": parsed_dt.isoformat(),
+                                "as_of": report_date.isoformat(),
+                                "age_days": age_days,
+                                "excerpt": raw_line.strip()[:120],
+                            }
+                            stale_unmarked.append(entry)
+                            warnings.append(
+                                {
+                                    "code": "STALE_UNMARKED",
+                                    "line": line_no,
+                                    "source_id": f"S{cid}",
+                                    "date": matched_date_str,
+                                    "age_days": age_days,
+                                    "message": (
+                                        f"第 {line_no} 行来源 [S{cid}] 发布日期 {matched_date_str} 距报告日期（{report_date.isoformat()}）"
+                                        f"已达 {age_days} 天（>{STALE_THRESHOLD_DAYS} 天），且条目未标注【陈旧】。"
+                                    ),
+                                    "excerpt": raw_line.strip()[:120],
+                                }
+                            )
 
     missing_defs = sorted((int(c) for c in used_citations if c not in defined_citations))
     for cid in missing_defs:
@@ -231,6 +368,7 @@ def validate_markdown(text: str) -> Dict[str, Any]:
     passed = len(errors) == 0
     return {
         "passed": passed,
+        "as_of": report_date.isoformat(),
         "counts": {
             "high": high_count,
             "medium": med_count,
@@ -244,6 +382,7 @@ def validate_markdown(text: str) -> Dict[str, Any]:
         },
         "blind_spot_checked": blind_spot_checked,
         "missing_sections": missing_sections,
+        "stale_unmarked": stale_unmarked,
         "errors": errors,
         "warnings": warnings,
     }
@@ -251,6 +390,7 @@ def validate_markdown(text: str) -> Dict[str, Any]:
 
 def run_self_test() -> int:
     sample_valid = """# 专题研究：CoWoS 先进封装供需格局（时间范围：2026Q1–2026Q4）
+> **报告日期**：2026-10-22
 
 ## 执行摘要
 - 2026Q4 台积电 CoWoS 月产能将达 7.5 万片【高】[S1][S2][S3]。
@@ -285,6 +425,49 @@ def run_self_test() -> int:
     res_valid = validate_markdown(sample_valid)
     assert res_valid["passed"] is True, f"Expected sample_valid to pass, got: {res_valid}"
     assert res_valid["counts"]["low_ratio"] == 0.1667, f"Unexpected low_ratio: {res_valid['counts']}"
+    assert res_valid["stale_unmarked"] == [], f"Expected no stale_unmarked, got: {res_valid['stale_unmarked']}"
+
+    sample_stale = """# 专题研究：存储周期复盘
+> **时间范围**：近 30 天（截至 2020-01-01）
+
+## 执行摘要
+- 2025Q4 行业渠道库存天数为 14 周，2025年12月 DRAM 现货价见底回升【高】[S1][S2][S3]。
+- 2025Q3 合约价环比持平【低：单一渠道样本】[S4]。
+
+## 对覆盖公司的含义
+- 影响评估【中】[S1][S2]。
+
+## 情景推演
+- 三档推演【中】[S1][S2]。
+
+## 风险与触发条件
+- 风险监控【中】[S1][S2]。
+
+## 信息缺口与局限
+- 盲区检查完成。
+
+## 数字核验表
+| 指标 | 报告数值 | 原始来源 | 核验状态 |
+|---|---|---|---|
+| 库存 | 14 周 | [S1] | PASS |
+
+## Sources
+- [S1] 某报告, 2025-01-01（访问日期：2026-10-22）
+- [S2] 2025年12月行业回顾（检索日期：2025-01-01, accessed: 2025-01-01, https://example.com/2025-01-01/doc）
+- [S3] 标题 | 机构 | 发布日期 2025-01-01 | URL
+- [S4] 历史底部品类统计 | 机构 | 发布日期 2025-06-01 | URL【陈旧】
+"""
+    res_stale = validate_markdown(sample_stale, as_of="2026-10-22")
+    assert res_stale["as_of"] == "2026-10-22", (
+        f"Expected header '截至 2020-01-01' to be ignored in favor of as_of, got: {res_stale['as_of']}"
+    )
+    assert res_stale["passed"] is True, f"Stale unmarked should emit warning, not error: {res_stale['errors']}"
+    stale_sources = [(item["source_id"], item["date"]) for item in res_stale["stale_unmarked"]]
+    assert stale_sources == [("S3", "2025-01-01")], (
+        f"Unexpected stale_unmarked sources: {stale_sources}"
+    )
+    warn_codes = {w["code"] for w in res_stale["warnings"]}
+    assert "STALE_UNMARKED" in warn_codes, f"Missing STALE_UNMARKED in {warn_codes}"
 
     sample_invalid = """# 专题草稿
 ## 执行摘要
@@ -312,6 +495,7 @@ def main() -> int:
     )
     parser.add_argument("cmd", nargs="?", choices=["self-test"], help="Optional 'self-test' subcommand.")
     parser.add_argument("--input", "-i", type=str, help="Path to the markdown topic report.")
+    parser.add_argument("--as-of", type=str, default=None, help="Fallback report date (YYYY-MM-DD) when header has no date.")
     parser.add_argument("--json", action="store_true", help="Output validation result as JSON.")
     parser.add_argument("--self-test", action="store_true", help="Run built-in unit self-tests.")
     args = parser.parse_args()
@@ -328,7 +512,7 @@ def main() -> int:
         return 2
 
     text = path.read_text(encoding="utf-8")
-    result = validate_markdown(text)
+    result = validate_markdown(text, as_of=args.as_of)
 
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))

@@ -60,24 +60,31 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 
 按集群并行派发 3–6 个 `dalton-evidence` 子代理，每个集群遵守以下硬约束：
 
-1. **精读全文**：每个集群在广度搜索（5–8 轮中英查询）后，必须挑选 **3–5 篇最高质量长文 / 原始文件调用全文读取**（`researchdata.research(route="alphaengine", operation="get_document")`、`web_fetch` 或 SEC 原文 `researchdata.finance(route="sec")`），严禁仅凭搜索摘要写结论。
-2. **内部记忆库与专家网络必查**：
+1. **精读全文与港 A 股交叉核对**：
+   - 每个集群在广度搜索（5–8 轮中英查询）后，必须挑选 **3–5 篇最高质量长文 / 原始文件调用全文读取**（`researchdata.research(route="alphaengine", operation="get_document")`、`web_fetch` 或 SEC 原文 `researchdata.finance(route="sec")`），严禁仅凭搜索摘要写结论。
+   - **港股、A 股公司的财务和经营数字**，必须用 `researchdata.finance(route="cn-hk", ...)` 交叉核对：`ask` 取平台值，`filings` 回公告原文；具体规则直接遵循 `.agents/skills/dalton-conventions/references/evidence-and-sources.md` 的 A/H（`cn-hk`）一节，不重复展开。
+2. **内部记忆库、专家网络与社区情绪/线索层**：
    - 检索 `researchdata.research(route="sales-notes")`、`researchdata.research(route="tmtb")`、`researchdata.research(route="funda-ai")`。
    - 检索 `researchdata.research(route="guidepoint")` 相关专家访谈。**合规红线：Guidepoint 内容以提炼观点为主，直接引用原文每篇不得超过 20 个英文词，严禁将完整访谈全文贴入报告。**
-3. **结构化证据包返回**：每条证据必须带完整 `[S#]` 来源（标题、机构/作者、发布日期、URL/doc_id）、数据所属期（如 `2026Q2`）及原文关键数字。
+   - **社区层（雪球、员工评论、`last30days`）作为情绪和线索层**：对照 `<data_map>`，如果数据地图里有这些路由就调用采集情绪与一线线索；如果没有（或路由不可用），直接写进报告的“未查来源与缺口”。
+3. **结构化证据包与时效性纪律**：
+   - **每条数字证据都要同时带“数据所属期”（如 `2026Q2`）和“发布日期”（如 `2026-08-15`）**，并附完整 `[S#]` 来源（标题、机构/作者、发布日期、URL/doc_id）及原文关键数字。
+   - **发布日期超过 6 个月的证据标 `【陈旧】`**：只能作背景，不能作核心论据；用作核心论据之前，必须找到 6 个月内的更新，或者明确写明找不到。
 
 ---
 
 ## 4. Phase 3 & Phase 3.5 — 交叉验证与盲区检查（Cross-Verification & Blind Spot Gate）
 
-1. **逐条标注置信度（遵循 [references/principles.md](references/principles.md)）**：
+1. **逐条标注置信度与时效（遵循 [references/principles.md](references/principles.md)）**：
    - `【高】`：≥3 个独立可信来源相互印证（同一来源被多家媒体转述只算 1 个）。
    - `【中】`：2 个独立来源印证，或 1 个权威一手来源（如 SEC 10-K 原文）。
    - `【低】`：单一非一手来源、管理层单方口径、或搜索合成推断（**必须写明低置信原因**）。
    - `【冲突】`：不同可信来源给出矛盾数字或相反结论——**必须原样保留各方口径与来源（如“来源 A 称‘数千人’[S15]，来源 B 称‘数百人’[S16]”），严禁折中合并成“数百至数千人”**。
    - `【更正】`：修正过往报告或市场流传的错误数据时，必须写明：**原错误值 → 更正后值 → 更正依据**。
+   - `【陈旧】`：每条数字证据都必须带“数据所属期”和“发布日期”；发布日期超过 6 个月的证据必须标 `【陈旧】`，只能作背景，不能作核心论据（用作核心论据前必须找到 6 个月内的更新，或写明找不到）。
 2. **Phase 3.5 盲区检查硬门禁**：
-   - 对照 Phase 0 的 5–8 个核心问题逐一核查：是否有问题尚无一手数据？是否有反方最强论据未被检索？是否有时间超过 6 个月的陈旧数据未做最新校验？
+   - 对照 Phase 0 的 5–8 个核心问题逐一核查：是否有问题尚无一手数据？是否有反方最强论据未被检索？是否有发布日期超过 6 个月的陈旧数据未标 `【陈旧】` 或未找 6 个月内更新？港股与 A 股财务/经营数字是否已按 `.agents/skills/dalton-conventions/references/evidence-and-sources.md` 的 A/H 一节通过 `finance(route="cn-hk", ...)`（`ask` + `filings`）交叉核对？
+   - **对照 `<data_map>` 盘点未查来源**：写结论之前必须对照 `<data_map>`，在报告“未查来源与缺口”小节列出“相关但未查的来源”并说明原因（含社区层雪球、员工评论、`last30days` 等在数据地图中缺失或未用的情况）。
    - 若存在关键缺口，最多追加派发 **≤2 个补漏 `dalton-evidence` 子代理**定向补齐。
    - 补齐后（或确认无盲区后），必须在工作流记录与底稿核验区明确写下 **`盲区检查完成`**（未写下“盲区检查完成”不得进入 Phase 4 写作）。
 
