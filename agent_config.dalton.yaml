@@ -4,11 +4,11 @@
 # Applied over agent_config.yaml when APP_ENV=dalton.
 
 llm:
-  # Defaults for anyone without a saved model preference (the team accounts hold no personal
-  # OAuth/BYOK credentials), so they go through the shared OpenClaw broker (ocb-*), which any
-  # signed-in user may use. Personal-OAuth models (*-oauth) stay available to whoever connected them.
-  name: "ocb-openai-gpt-6-astra"
-  background: "deepseek-flash"
+  # Defaults for anyone without a saved model preference: the owner's own choices. Model
+  # credentials are team-shared (credentials.sharing: team, #66), so the owner's *-oauth
+  # connections serve every member; the OpenClaw broker model is the fallback if they lapse.
+  name: "gpt-6-astra-oauth"
+  background: "gemini-4-argon-low-oauth"
   assist: "ocb-google-gemini-3.8-flash"
   compaction: ""
   fetch: ""
