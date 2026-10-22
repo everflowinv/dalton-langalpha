@@ -64,6 +64,7 @@ ALLOWED_HOOKS=(
   "dalton-auth"
   "home-workspace-alias"
   "team-sharing"
+  "sandbox-inline-write-limit"
   "yfinance-prev-close"
 )
 
