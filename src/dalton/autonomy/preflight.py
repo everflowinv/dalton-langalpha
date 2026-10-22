@@ -26,6 +26,7 @@ from src.dalton.autonomy.backoff import (
 from src.dalton.autonomy.probes import ProbeSignal
 from src.dalton.autonomy.probes.agenda import probe_agenda
 from src.dalton.autonomy.probes.calendar import probe_calendar
+from src.dalton.autonomy.probes.cnhk import probe_cnhk_filings
 from src.dalton.autonomy.probes.director import probe_director
 from src.dalton.autonomy.probes.earnings import probe_earnings
 from src.dalton.autonomy.probes.internal import probe_internal
@@ -70,17 +71,20 @@ def is_direct_wake_signal(sig: dict[str, Any] | ProbeSignal) -> bool:
     Direct wake rules:
     - SEC 10-K, 10-Q, 20-F -> direct wake
     - SEC 8-K containing Item 2.02 -> direct wake
+    - CN/HK (cnhk) P1 filings -> direct wake; P2 filings -> LLM triage
     - Agenda due items (catalyst / validation / open_question / pm_question / next_action) -> direct wake
     - Earnings window (T-3 / T0 / T+1 / release) -> direct wake
     - Director / calendar / schedule / price triggers -> direct wake
-    All other SEC forms (8-K without 2.02, Form 4, 13D/G, 6-K, DEF 14A) and internal docs go to LLM triage.
+    All other SEC forms (8-K without 2.02, Form 4, 13D/G, 6-K, DEF 14A), cnhk P2 filings, and internal docs go to LLM triage.
     """
     if isinstance(sig, ProbeSignal):
         probe = sig.probe
+        priority = sig.priority
         payload = sig.payload or {}
         summary = sig.summary or ""
     else:
         probe = str(sig.get("probe") or "")
+        priority = str(sig.get("priority") or "")
         payload = sig.get("payload") if isinstance(sig.get("payload"), dict) else {}
         summary = str(sig.get("summary") or "")
 
@@ -98,6 +102,10 @@ def is_direct_wake_signal(sig: dict[str, Any] | ProbeSignal) -> bool:
             if any("2.02" in str(it) for it in items) or "2.02" in summary:
                 return True
         return False
+
+    if probe == "cnhk":
+        prio = str(priority or payload.get("priority") or "").strip().upper()
+        return prio == "P1"
 
     if probe == "internal":
         return False
@@ -278,6 +286,12 @@ class PreflightResult:
         return self.wake_context
 
 
+def _sanitize_untrusted_wake_field(val: Any, max_len: int = 200) -> str:
+    """Sanitize untrusted external text for `<dalton_wake>` by stripping CR/LF, removing `<`/`>`, and truncating."""
+    cleaned = str(val or "").replace("\r", "").replace("\n", "").replace("<", "").replace(">", "").strip()
+    return cleaned[:max_len]
+
+
 def format_wake_directive(
     *,
     automation_name: str,
@@ -299,9 +313,18 @@ def format_wake_directive(
         prio = sig.get("priority") or "P1"
         key = sig.get("signal_key") or ""
         sig_id = sig.get("signal_id") or ""
-        summary = sig.get("summary") or ""
+        summary = _sanitize_untrusted_wake_field(sig.get("summary") or "")
         id_attr = f", signal_id={sig_id}" if sig_id else ""
+        payload = sig.get("payload") if isinstance(sig.get("payload"), dict) else {}
         lines.append(f"  {idx}. [{prio}][{probe}] {summary} (key={key}{id_attr})")
+        if probe == "cnhk" or payload.get("source") == "cninfo":
+            src_val = _sanitize_untrusted_wake_field(payload.get("source") or "cninfo")
+            date_val = _sanitize_untrusted_wake_field(payload.get("date") or "")
+            title_val = _sanitize_untrusted_wake_field(payload.get("title") or "")
+            link_val = _sanitize_untrusted_wake_field(payload.get("pdf_link") or "")
+            lines.append(
+                f"     data (untrusted): source={src_val} | date={date_val} | title={title_val} | pdf_link={link_val}"
+            )
     if keys_hint:
         lines.append(f"  trigger_signals: [{keys_hint}]")
     lines.append("</dalton_wake>")
@@ -576,7 +599,7 @@ async def _preflight_check_inner(
             )
         )
     else:
-        # Standard company_watch: run the 4 company probes (agenda, sec, earnings, internal) with time-based backoff
+        # Standard company_watch: run the 5 company probes (agenda, sec, cnhk, earnings, internal) with time-based backoff
         t_sym = ticker or "UNKNOWN"
         eff_ws_id = workspace_id if persist else None
         probe_runners = [
@@ -592,6 +615,15 @@ async def _preflight_check_inner(
             (
                 "sec",
                 lambda st: probe_sec(
+                    ticker=t_sym,
+                    watch_state=st,
+                    workspace_id=eff_ws_id,
+                    allow_network=persist,
+                ),
+            ),
+            (
+                "cnhk",
+                lambda st: probe_cnhk_filings(
                     ticker=t_sym,
                     watch_state=st,
                     workspace_id=eff_ws_id,
@@ -629,7 +661,10 @@ async def _preflight_check_inner(
                 continue
             try:
                 sigs, state = await runner(state)
-                state = clear_probe_backoff(state, probe_name)
+                if probe_name == "cnhk" and state.get("cnhk_probe_degraded"):
+                    state = record_probe_backoff(state, probe_name, "cnhk_probe_degraded")
+                else:
+                    state = clear_probe_backoff(state, probe_name)
                 emitted.extend(sigs)
             except Exception as err:
                 logger.warning(
