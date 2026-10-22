@@ -57,6 +57,8 @@ class Policy:
     # A batch may run the whole-thread claims pass it needs, rather than
     # raise ClaimsPassNeeded.
     claims_pass: bool = True
+    # DALTON-HOOK(team-sharing): non-owner reads project in memory without storing slices/lines.
+    persist: bool = True
 
 
 @dataclass
@@ -94,11 +96,15 @@ class _Pending:
     before the request returns, so a later read in it never misses its own
     writes, and the post-turn refresh and backfill still finish theirs."""
 
-    def __init__(self, thread_id: str) -> None:
+    def __init__(self, thread_id: str, *, persist: bool = True) -> None:
         self._thread_id = thread_id
+        self._persist = persist
         self._tasks: list[asyncio.Task[None]] = []
 
     def start(self, writes: _Writes) -> None:
+        # DALTON-HOOK(team-sharing): skip DB writeback when persist=False
+        if not self._persist:
+            return
         if writes.turns or writes.updates or writes.runs:
             self._tasks.append(asyncio.create_task(writes.store(self._thread_id)))
 
@@ -138,7 +144,8 @@ class _ColdRead:
         self._stale = [ti for ti, _ in stale]
         self._policy = policy
         self.lane = run_lane.RunLane(reader, inputs.thread_id, inputs.run_facts)
-        self.pending = _Pending(inputs.thread_id)
+        # DALTON-HOOK(team-sharing): pass policy.persist to _Pending
+        self.pending = _Pending(inputs.thread_id, persist=policy.persist)
         # Stale turns projected or replayed as stubs.
         self._done: set[Any] = set()
         # Slices read for turns not yet done: a batch the claims pass

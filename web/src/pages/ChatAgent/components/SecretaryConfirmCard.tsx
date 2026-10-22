@@ -176,7 +176,8 @@ function SecretaryConfirmCard({ proposalData, onApprove, onReject }: SecretaryCo
         </div>
       </div>
 
-      {/* Actions */}
+      {/* DALTON-HOOK(team-sharing): hide interactive approval actions in read-only mode */}
+      {(onApprove || onReject) && (
       <div className="pt-3 flex items-center gap-2">
         <motion.button
           onClick={(e: React.MouseEvent) => { e.stopPropagation(); onApprove?.(); }}
@@ -201,7 +202,9 @@ function SecretaryConfirmCard({ proposalData, onApprove, onReject }: SecretaryCo
           <X className="h-3.5 w-3.5" />
           Decline
         </motion.button>
+        {/* DALTON-HOOK(team-sharing): read-only for a teammate's workspace */}
       </div>
+      )}
     </motion.div>
   );
 }

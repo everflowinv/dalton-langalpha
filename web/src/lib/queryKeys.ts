@@ -47,6 +47,8 @@ export const queryKeys = {
     detail: (id: string) => [...queryKeys.workspaces.details(), id],
     home:   () => [...queryKeys.workspaces.all, 'home'],
     quota:  () => [...queryKeys.workspaces.all, 'quota'],
+    // DALTON-HOOK(team-sharing): team workspaces grouped by colleague
+    team:   () => [...queryKeys.workspaces.all, 'team'],
   },
   // The signed prefix the owner's report iframes load under, one per workspace
   // because the grant covers the whole workspace and nothing narrower. Its own

@@ -56,7 +56,11 @@ const sameLabels = (a: PreviewEntry, b: PreviewEntry) =>
  * entry outlives its tab — closing a tab closes a view, it does not stop the
  * server — so the group stays the way back to an app already started.
  */
-export function usePreviews(workspaceId: string) {
+export function usePreviews(
+  workspaceId: string,
+  // DALTON-HOOK(team-sharing): block preview sandbox requests in colleague mirror mode
+  { teamReadOnly = false }: { teamReadOnly?: boolean } = {},
+) {
   const [map, setMap] = useState<Map<number, PreviewEntry>>(() => new Map());
   // Read by callbacks that must not take `map` as a dependency: they land in
   // FilePanel effect deps, and a new identity per URL arrival would re-run them.
@@ -89,7 +93,8 @@ export function usePreviews(workspaceId: string) {
 
   /** Mint a signed URL for a port and land it, unless a newer request overtook this one. */
   const mint = useCallback(async (spec: PreviewSpec, force: boolean) => {
-    if (!workspaceId) return;
+    // DALTON-HOOK(team-sharing): never mint preview URL or start sandbox in colleague mirror mode
+    if (!workspaceId || teamReadOnly) return;
     const ws = workspaceId;
     const { port } = spec;
     const ticket = (seqRef.current.get(port) ?? 0) + 1;
@@ -125,10 +130,12 @@ export function usePreviews(workspaceId: string) {
       if (stale()) return;
       patch(port, () => ({ url: '', loading: false, error: true }));
     }
-  }, [workspaceId, patch]);
+  }, [workspaceId, teamReadOnly, patch]);
 
   /** Note an app without reaching for it — what a restored tab and the tree list need. */
   const register = useCallback((spec: PreviewSpec) => {
+    // DALTON-HOOK(team-sharing): do not register preview entries in colleague mirror mode
+    if (teamReadOnly) return;
     setMap((prev) => {
       const before = prev.get(spec.port);
       const next = merge(spec, before);
@@ -137,13 +144,14 @@ export function usePreviews(workspaceId: string) {
       out.set(spec.port, next);
       return out;
     });
-  }, []);
+  }, [teamReadOnly]);
 
   /** The agent published an app, or the reader asked for it again: always a fresh URL. */
   const open = useCallback((spec: PreviewSpec) => {
+    if (teamReadOnly) return;
     register(spec);
     void mint(merge(spec, mapRef.current.get(spec.port)), false);
-  }, [register, mint]);
+  }, [teamReadOnly, register, mint]);
 
   /**
    * Coming back to a preview tab. A URL minted recently is still good, an older
@@ -152,18 +160,21 @@ export function usePreviews(workspaceId: string) {
    * port nothing is listening on.
    */
   const ensure = useCallback((port: number) => {
+    if (teamReadOnly) return;
     const entry = mapRef.current.get(port);
     if (!entry || entry.loading || entry.error) return;
     const fresh = entry.url && Date.now() - (entry.mintedAt ?? 0) < URL_FRESH_MS;
     if (fresh) return;
     void mint(entry, false);
-  }, [mint]);
+  }, [teamReadOnly, mint]);
 
   /** Refresh: restart the process behind the port and take a new URL. */
   const refresh = useCallback((port: number) => {
+    // DALTON-HOOK(team-sharing): do not refresh preview in colleague mirror mode
+    if (teamReadOnly) return;
     const entry = mapRef.current.get(port);
     if (entry) void mint(entry, true);
-  }, [mint]);
+  }, [teamReadOnly, mint]);
 
   const previews = useMemo(() => [...map.values()].sort((a, b) => a.port - b.port), [map]);
 

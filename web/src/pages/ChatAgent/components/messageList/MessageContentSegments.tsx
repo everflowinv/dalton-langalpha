@@ -337,65 +337,66 @@ export const MessageContentSegments = memo(function MessageContentSegments({ seg
             <UserQuestionCard
               key={block.key}
               questionData={qd as any} // TODO: type properly, QuestionData not exported
-              onAnswer={readOnly ? undefined : (answer: string) => onAnswerQuestion!(answer, (block as UserQuestionRenderBlock).segment.questionId!, qd.interruptId as string)}
-              onSkip={readOnly ? undefined : () => onSkipQuestion!((block as UserQuestionRenderBlock).segment.questionId!, qd.interruptId as string)}
+              // DALTON-HOOK(team-sharing): omit answer/skip callbacks in read-only mode
+              onAnswer={!readOnly && onAnswerQuestion ? (answer: string) => onAnswerQuestion(answer, (block as UserQuestionRenderBlock).segment.questionId!, qd.interruptId as string) : undefined}
+              onSkip={!readOnly && onSkipQuestion ? () => onSkipQuestion((block as UserQuestionRenderBlock).segment.questionId!, qd.interruptId as string) : undefined}
             />
           );
         }
 
         if (block.type === 'create_workspace') {
-          if (readOnly) return null;
           const wd = (block as CreateWorkspaceRenderBlock).proposal ?? workspaceProposals[(block as CreateWorkspaceRenderBlock).segment.proposalId!];
           if (!wd) return null;
           return (
             <CreateWorkspaceCard
               key={block.key}
               proposalData={wd as any} // TODO: type properly, ProposalData not exported
-              onApprove={onApproveCreateWorkspace ? () => onApproveCreateWorkspace(wd) : undefined}
-              onReject={onRejectCreateWorkspace ? () => onRejectCreateWorkspace(wd) : undefined}
+              // DALTON-HOOK(team-sharing): render proposal card without action buttons in read-only mode
+              onApprove={!readOnly && onApproveCreateWorkspace ? () => onApproveCreateWorkspace(wd) : undefined}
+              onReject={!readOnly && onRejectCreateWorkspace ? () => onRejectCreateWorkspace(wd) : undefined}
             />
           );
         }
 
         if (block.type === 'start_question') {
-          if (readOnly) return null;
           const sqd = questionProposals[(block as StartQuestionRenderBlock).segment.proposalId!];
           if (!sqd) return null;
           return (
             <StartQuestionCard
               key={block.key}
               proposalData={sqd as any} // TODO: type properly, ProposalData not exported
-              onApprove={onApproveStartQuestion ? () => onApproveStartQuestion(sqd) : undefined}
-              onReject={onRejectStartQuestion ? () => onRejectStartQuestion(sqd) : undefined}
+              // DALTON-HOOK(team-sharing): render proposal card without action buttons in read-only mode
+              onApprove={!readOnly && onApproveStartQuestion ? () => onApproveStartQuestion(sqd) : undefined}
+              onReject={!readOnly && onRejectStartQuestion ? () => onRejectStartQuestion(sqd) : undefined}
             />
           );
         }
 
         if (block.type === 'ptc_agent') {
-          if (readOnly) return null;
           const pad = (block as PTCAgentRenderBlock).proposal ?? ptcAgentProposals[(block as PTCAgentRenderBlock).segment.proposalId!];
           if (!pad) return null;
           return (
             <PTCAgentCard
               key={block.key}
               proposalData={pad as any}
-              onApprove={onApprovePTCAgent ? (overrides?: { report_back?: boolean }) => onApprovePTCAgent(pad, overrides, (block as PTCAgentRenderBlock).segment.proposalId!, pad.interruptId as string) : undefined}
-              onReject={onRejectPTCAgent ? () => onRejectPTCAgent(pad, (block as PTCAgentRenderBlock).segment.proposalId!, pad.interruptId as string) : undefined}
+              // DALTON-HOOK(team-sharing): render PTC card without action buttons in read-only mode
+              onApprove={!readOnly && onApprovePTCAgent ? (overrides?: { report_back?: boolean }) => onApprovePTCAgent(pad, overrides, (block as PTCAgentRenderBlock).segment.proposalId!, pad.interruptId as string) : undefined}
+              onReject={!readOnly && onRejectPTCAgent ? () => onRejectPTCAgent(pad, (block as PTCAgentRenderBlock).segment.proposalId!, pad.interruptId as string) : undefined}
               dispatcherContext={dispatcherContext}
             />
           );
         }
 
         if (block.type === 'delete_workspace' || block.type === 'stop_workspace' || block.type === 'delete_thread') {
-          if (readOnly) return null;
           const sad = secretaryActionProposals[(block as SecretaryActionRenderBlock).segment.proposalId!];
           if (!sad) return null;
           return (
             <SecretaryConfirmCard
               key={block.key}
               proposalData={sad as any}
-              onApprove={onApproveSecretaryAction ? () => onApproveSecretaryAction(sad) : undefined}
-              onReject={onRejectSecretaryAction ? () => onRejectSecretaryAction(sad) : undefined}
+              // DALTON-HOOK(team-sharing): render secretary confirm card without action buttons in read-only mode
+              onApprove={!readOnly && onApproveSecretaryAction ? () => onApproveSecretaryAction(sad) : undefined}
+              onReject={!readOnly && onRejectSecretaryAction ? () => onRejectSecretaryAction(sad) : undefined}
             />
           );
         }

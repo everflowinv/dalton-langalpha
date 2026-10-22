@@ -138,7 +138,8 @@ function CreateWorkspaceCard({ proposalData, onApprove, onReject }: CreateWorksp
         )}
       </div>
 
-      {/* Actions */}
+      {/* DALTON-HOOK(team-sharing): hide interactive approval actions in read-only mode */}
+      {(onApprove || onReject) && (
       <div className="pt-3 flex items-center gap-2">
         <motion.button
           disabled={saving}
@@ -184,7 +185,9 @@ function CreateWorkspaceCard({ proposalData, onApprove, onReject }: CreateWorksp
           <X className="h-3.5 w-3.5" />
           {t('chat.createWorkspaceCard.decline')}
         </motion.button>
+        {/* DALTON-HOOK(team-sharing): read-only for a teammate's workspace */}
       </div>
+      )}
     </motion.div>
   );
 }

@@ -73,6 +73,8 @@ export interface FileViewerProps {
   onViewerLink?: OpenFileHandler;
   /** The serve prefix a share was handed; omitted, the owner's grant serves HTML. */
   servePrefix?: string;
+  // DALTON-HOOK(team-sharing): render HTML from mirror without owner file-grant in colleague mirror mode
+  teamReadOnly?: boolean;
 }
 
 /** The open file, rendered by whichever viewer its bytes belong to. */
@@ -186,6 +188,8 @@ export function FileViewer(props: FileViewerProps): React.ReactElement {
             anchor={focus.htmlAnchor}
             anchorSeq={focus.seq}
             onTriggerDownload={props.onDownloadInFallback}
+            // DALTON-HOOK(team-sharing): forward teamReadOnly to HtmlViewer
+            teamReadOnly={props.teamReadOnly}
           />
         </DocumentErrorBoundary>
       </Suspense>

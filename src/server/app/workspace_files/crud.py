@@ -177,7 +177,18 @@ async def list_workspace_files(
     """List files in a workspace's sandbox, or from DB if stopped."""
 
     workspace = await db_get_workspace(workspace_id)
-    require_workspace_owner(workspace, user_id=x_user_id)
+    # --- DALTON-HOOK(team-sharing): begin ---
+    from src.dalton.settings import is_dalton_supabase_auth_enabled
+
+    is_non_owner_reader = False
+    if is_dalton_supabase_auth_enabled():
+        from src.dalton.sharing import require_workspace_reader
+
+        workspace = await require_workspace_reader(workspace, x_user_id)
+        is_non_owner_reader = workspace.get("user_id") != x_user_id
+    else:
+        require_workspace_owner(workspace, user_id=x_user_id)
+    # --- DALTON-HOOK(team-sharing): end ---
 
     if is_unbound(workspace):
         return {"files": [], "sandbox_ready": False, "reason": HOME_NOT_ON_COMPUTER_REASON}
@@ -191,8 +202,8 @@ async def list_workspace_files(
     if requested_dir is None:
         raise HTTPException(status_code=404, detail="Not found")
 
-    # DB fallback for stopped workspaces (unless auto_start requested)
-    if not auto_start and served_from_mirror(workspace.get("status")):
+    # DALTON-HOOK(team-sharing): non-owner team readers always read from DB mirror (never sandbox)
+    if is_non_owner_reader or (not auto_start and served_from_mirror(workspace.get("status"))):
         file_tree = await FilePersistenceService.get_file_tree(workspace_id)
         # Filter by path prefix if specified
         normalized_path = _normalize_requested_path(path, work_dir, previous_dirs)
@@ -203,18 +214,25 @@ async def list_workspace_files(
                 if f["path"].startswith(normalized_path + "/")
                 or f["path"] == normalized_path
             ]
-        allow_hidden = _requested_hidden_ok(path, work_dir, previous_dirs)
+        allow_hidden = (
+            False
+            if is_non_owner_reader
+            else _requested_hidden_ok(path, work_dir, previous_dirs)
+        )
+        allow_system = False if is_non_owner_reader else include_system
         files = [
             f["path"]
             for f in file_tree
             if not _is_always_hidden_path(f["path"])
-            and (include_system or not _is_system_path(f["path"]))
+            and (allow_system or not _is_system_path(f["path"]))
             and (allow_hidden or not _is_hidden_path(f["path"]))
             # A row at a virtual path predates the backup skipping its folder;
             # a read answers from the DB, so only the splice may list one.
             and not _virtual_file(f["path"])
         ]
-        files = await _with_virtual_files(files, normalized_path, workspace["user_id"])
+        # DALTON-HOOK(team-sharing): omit owner-private virtual files for non-owner readers
+        if not is_non_owner_reader:
+            files = await _with_virtual_files(files, normalized_path, workspace["user_id"])
         return {
             "workspace_id": workspace_id,
             "path": path,
@@ -339,7 +357,18 @@ async def resolve_workspace_file(
     never guesses from a listing that may predate the file.
     """
     workspace = await db_get_workspace(workspace_id)
-    require_workspace_owner(workspace, user_id=x_user_id)
+    # --- DALTON-HOOK(team-sharing): begin ---
+    from src.dalton.settings import is_dalton_supabase_auth_enabled
+
+    is_non_owner_reader = False
+    if is_dalton_supabase_auth_enabled():
+        from src.dalton.sharing import require_workspace_reader
+
+        workspace = await require_workspace_reader(workspace, x_user_id)
+        is_non_owner_reader = workspace.get("user_id") != x_user_id
+    else:
+        require_workspace_owner(workspace, user_id=x_user_id)
+    # --- DALTON-HOOK(team-sharing): end ---
 
     if is_unbound(workspace):
         return {"status": "unavailable", "reason": HOME_NOT_ON_COMPUTER_REASON, "matches": []}
@@ -349,10 +378,11 @@ async def resolve_workspace_file(
         raise HTTPException(status_code=400, detail="A file reference is required")
 
     virtual = None
-    for candidate in candidates:
-        if await _present_virtual_file(candidate, x_user_id):
-            virtual = candidate
-            break
+    if not is_non_owner_reader:
+        for candidate in candidates:
+            if await _present_virtual_file(candidate, x_user_id):
+                virtual = candidate
+                break
     if virtual:
         return {
             "status": "resolved",
@@ -362,9 +392,23 @@ async def resolve_workspace_file(
         }
 
     name = candidates[0].rsplit("/", 1)[-1]
-    if served_from_mirror(workspace.get("status")):
+    if is_non_owner_reader or served_from_mirror(workspace.get("status")):
         file_tree = await FilePersistenceService.get_file_tree(workspace_id)
-        paths = [f["path"] for f in file_tree if f["path"].rsplit("/", 1)[-1] == name]
+        paths = [
+            f["path"]
+            for f in file_tree
+            if f["path"].rsplit("/", 1)[-1] == name
+            # DALTON-HOOK(team-sharing): hide system/hidden paths for non-owner mirror readers
+            and not (
+                is_non_owner_reader
+                and (
+                    _is_always_hidden_path(f["path"])
+                    or _is_hidden_path(f["path"])
+                    or _is_system_path(f["path"])
+                    or bool(_virtual_file(f["path"]))
+                )
+            )
+        ]
         source = "database"
     else:
         async with _acquire_sandbox_to_change(workspace_id, x_user_id) as (sandbox, workspace):
@@ -419,7 +463,22 @@ async def read_workspace_file(
 ) -> dict[str, Any]:
     """Read a file from the workspace's sandbox, or from DB if stopped."""
 
-    workspace = await owned_workspace_on_computer(workspace_id, x_user_id)
+    # --- DALTON-HOOK(team-sharing): begin ---
+    from src.dalton.settings import is_dalton_supabase_auth_enabled
+
+    is_non_owner_reader = False
+    if is_dalton_supabase_auth_enabled():
+        from src.dalton.sharing import require_workspace_reader
+
+        workspace = await require_workspace_reader(
+            await db_get_workspace(workspace_id), x_user_id
+        )
+        if is_unbound(workspace):
+            raise HTTPException(status_code=400, detail="Home is not on a computer yet")
+        is_non_owner_reader = workspace.get("user_id") != x_user_id
+    else:
+        workspace = await owned_workspace_on_computer(workspace_id, x_user_id)
+    # --- DALTON-HOOK(team-sharing): end ---
 
     # Virtual DB-backed JSON files (user profile, automations) are served from
     # the DB, independent of sandbox state. Works whether the workspace is
@@ -429,6 +488,8 @@ async def read_workspace_file(
     normalized_for_virtual = _normalize_requested_path(path, work_dir, previous_dirs)
     virtual = _virtual_file(normalized_for_virtual)
     if virtual:
+        if is_non_owner_reader:
+            raise HTTPException(status_code=404, detail="File not found")
         text_content = await _load_virtual_file(
             virtual, normalized_for_virtual, x_user_id
         )
@@ -450,11 +511,18 @@ async def read_workspace_file(
             "source": virtual.source,
         }
 
-    # DB fallback for stopped workspaces
-    if served_from_mirror(workspace.get("status")):
+    # DALTON-HOOK(team-sharing): DB fallback for stopped workspaces, or always for non-owner team readers
+    if is_non_owner_reader or served_from_mirror(workspace.get("status")):
         normalized_path = _normalize_requested_path(path, work_dir, previous_dirs)
         if not normalized_path:
             raise HTTPException(status_code=400, detail="File path is required")
+        if is_non_owner_reader and (
+            _is_always_hidden_path(normalized_path)
+            or _is_hidden_path(normalized_path)
+            or _is_system_path(normalized_path)
+            or bool(_virtual_file(normalized_path))
+        ):
+            raise HTTPException(status_code=404, detail="File not found")
 
         # Parallel: fetch vault secrets + file content in one round-trip window
         vault_secrets, file_record = await asyncio.gather(
@@ -722,7 +790,22 @@ async def download_workspace_file(
     """Download raw bytes from the workspace's sandbox, or from DB if stopped."""
     disposition = "attachment" if attachment else "inline"
 
-    workspace = await owned_workspace_on_computer(workspace_id, x_user_id)
+    # --- DALTON-HOOK(team-sharing): begin ---
+    from src.dalton.settings import is_dalton_supabase_auth_enabled
+
+    is_non_owner_reader = False
+    if is_dalton_supabase_auth_enabled():
+        from src.dalton.sharing import require_workspace_reader
+
+        workspace = await require_workspace_reader(
+            await db_get_workspace(workspace_id), x_user_id
+        )
+        if is_unbound(workspace):
+            raise HTTPException(status_code=400, detail="Home is not on a computer yet")
+        is_non_owner_reader = workspace.get("user_id") != x_user_id
+    else:
+        workspace = await owned_workspace_on_computer(workspace_id, x_user_id)
+    # --- DALTON-HOOK(team-sharing): end ---
 
     work_dir = owner_work_dir(workspace)
     previous_dirs = previous_dir_names_of(workspace)
@@ -732,17 +815,26 @@ async def download_workspace_file(
     virtual_path = _normalize_requested_path(path, work_dir, previous_dirs)
     virtual = _virtual_file(virtual_path)
     if virtual:
+        if is_non_owner_reader:
+            raise HTTPException(status_code=404, detail="File not found")
         text = await _load_virtual_file(virtual, virtual_path, x_user_id)
         filename = virtual_path.rsplit("/", 1)[-1]
         return _build_download_response(
             text.encode(), filename, "application/json", request, disposition
         )
 
-    # DB fallback for stopped workspaces
-    if served_from_mirror(workspace.get("status")):
+    # DALTON-HOOK(team-sharing): DB fallback for stopped workspaces, or always for non-owner team readers
+    if is_non_owner_reader or served_from_mirror(workspace.get("status")):
         normalized_path = _normalize_requested_path(path, work_dir, previous_dirs)
         if not normalized_path:
             raise HTTPException(status_code=400, detail="File path is required")
+        if is_non_owner_reader and (
+            _is_always_hidden_path(normalized_path)
+            or _is_hidden_path(normalized_path)
+            or _is_system_path(normalized_path)
+            or bool(_virtual_file(normalized_path))
+        ):
+            raise HTTPException(status_code=404, detail="File not found")
 
         # Parallel: fetch vault secrets + file content in one round-trip window
         vault_secrets, file_record = await asyncio.gather(
@@ -752,10 +844,27 @@ async def download_workspace_file(
         if not file_record:
             raise HTTPException(status_code=404, detail="File not found")
 
+        # DALTON-HOOK(team-sharing): reject binary file download for non-owner readers
+        if is_non_owner_reader and (
+            file_record.get("is_binary") or _is_binary(normalized_path)
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail="Binary file download is not available in read-only mode",
+            )
+
         content = await http_file_bytes(file_record, user_id=workspace["user_id"])
 
         filename = file_record.get("file_name", "download")
         mime = file_record.get("mime_type") or "application/octet-stream"
+
+        if is_non_owner_reader and not (
+            _is_text_content_type(mime) or _is_utf8(content)
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail="Binary file download is not available in read-only mode",
+            )
 
         if _is_text_content_type(mime) or _is_utf8(content):
             content = get_redactor().redact_bytes(content, vault_secrets=vault_secrets)
@@ -880,7 +989,22 @@ async def workspace_file_download_url(
     disk. The link skips secret redaction: it is the owner's own file, and
     redacting would mean carrying the bytes through this process.
     """
-    workspace = await owned_workspace_on_computer(workspace_id, x_user_id)
+    # --- DALTON-HOOK(team-sharing): begin ---
+    from src.dalton.settings import is_dalton_supabase_auth_enabled
+
+    if is_dalton_supabase_auth_enabled():
+        from src.dalton.sharing import require_workspace_reader
+
+        workspace = await require_workspace_reader(
+            await db_get_workspace(workspace_id), x_user_id
+        )
+        if is_unbound(workspace):
+            raise HTTPException(status_code=400, detail="Home is not on a computer yet")
+        if workspace.get("user_id") != x_user_id:
+            return {"url": None}
+    else:
+        workspace = await owned_workspace_on_computer(workspace_id, x_user_id)
+    # --- DALTON-HOOK(team-sharing): end ---
 
     layout = owner_layout(workspace)
     work_dir = layout.workspace

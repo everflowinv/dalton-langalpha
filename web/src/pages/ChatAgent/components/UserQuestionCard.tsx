@@ -286,6 +286,9 @@ function UserQuestionCard({ questionData, onAnswer, onSkip }: UserQuestionCardPr
     }
   };
 
+  // DALTON-HOOK(team-sharing): read-only for a teammate's workspace
+  const canAct = Boolean(onAnswer || onSkip);
+
   return (
     <motion.div
       initial={{ opacity: 0, y: 8 }}
@@ -314,7 +317,14 @@ function UserQuestionCard({ questionData, onAnswer, onSkip }: UserQuestionCardPr
                 ease: [0.22, 1, 0.36, 1],
               }}
             >
-              {allow_multiple ? (
+              {/* DALTON-HOOK(team-sharing): render non-interactive options when read-only */}
+              {!canAct ? (
+                <ResolvedOption
+                  label={option}
+                  isSelected={false}
+                  isMulti={allow_multiple}
+                />
+              ) : allow_multiple ? (
                 <OptionCheckbox
                   id={`q-opt-${option}`}
                   label={option}
@@ -332,6 +342,9 @@ function UserQuestionCard({ questionData, onAnswer, onSkip }: UserQuestionCardPr
         </div>
       )}
 
+      {/* DALTON-HOOK(team-sharing): hide interactive question controls in read-only mode */}
+      {canAct && (
+      <>
       {/* Multi-select submit button */}
       {allow_multiple && selected.size > 0 && (
         <div className="pt-1 pb-2">
@@ -409,7 +422,10 @@ function UserQuestionCard({ questionData, onAnswer, onSkip }: UserQuestionCardPr
           <SkipForward className="h-3.5 w-3.5" />
           Skip
         </button>
+        {/* DALTON-HOOK(team-sharing): read-only for a teammate's workspace */}
       </div>
+      </>
+      )}
     </motion.div>
   );
 }

@@ -100,6 +100,8 @@ interface FilePanelProps {
   filesError?: string | null;
   onRefreshFiles?: () => void;
   readOnly?: boolean;
+  // DALTON-HOOK(team-sharing): distinguish colleague mirror read-only from owner sibling read-only
+  teamReadOnly?: boolean;
   /** Whether this viewer may save a file's bytes. A copy-link share grants
    *  `allow_files` without `allow_download`, and the download endpoint refuses
    *  what `allow_files` alone opened, so an offered save fails after the click. */
@@ -154,6 +156,8 @@ function FilePanel({
   filesError = null,
   onRefreshFiles,
   readOnly = false,
+  // DALTON-HOOK(team-sharing): distinguish colleague mirror read-only from owner sibling read-only
+  teamReadOnly = false,
   canDownload = true,
   singleFileMode = false,
   persistTabs = true,
@@ -202,7 +206,8 @@ function FilePanel({
   // The reader's memory and memo stores open here as tabs. A share reads
   // through an adapter with no workspace id: it browses someone else's files
   // and has no stores to show.
-  const stores = !!workspaceId;
+  // DALTON-HOOK(team-sharing): hide personal memory/memo stores in colleague mirror mode
+  const stores = !!workspaceId && !teamReadOnly && !(readOnly && !singleFileMode);
   // A file the tree never got is not a file that is gone, so this flag also
   // decides what a missed reference is told.
   const filesRestoreIncomplete = wsData?.files_restore_incomplete === true;
@@ -231,7 +236,8 @@ function FilePanel({
   const listingTab = isListingTab(activeTab);
   const selectedFile = activeTab.kind === 'file' ? activeTab.path : null;
 
-  const previews = usePreviews(workspaceId);
+  // DALTON-HOOK(team-sharing): block preview sandbox requests in colleague mirror mode
+  const previews = usePreviews(workspaceId, { teamReadOnly });
 
   const { body, loading: fileLoading, error: readError, readAt, refetch } = useFileBody({
     cache, path: selectedFile, workspaceStatus: wsData?.status,
@@ -384,6 +390,9 @@ function FilePanel({
   usePanelTarget({
     target, tabs, previews, openFileRef, cancelPending,
     clearSearch, setTreeOpen, setScopeDir, onTargetHandled,
+    // DALTON-HOOK(team-sharing): suppress preview sandbox startup and personal memo in colleague mirror mode
+    onTargetMemoHandled,
+    teamReadOnly,
   });
 
   // Opening a singleton tab drops a reference still resolving, like any other
@@ -395,8 +404,9 @@ function FilePanel({
   const viewInMemo = stores ? openMemo : null;
 
   const handleAddToMemo = useAddToMemo({ workspaceId, downloadFileAsArrayBufferFn, readFileFullFn, onSwitchToMemoTab: viewInMemo });
-  const memoedMap = useWorkspaceMemoIndex(workspaceId);
-  const memoEntry = selectedFile ? memoedMap.get(selectedFile) ?? null : null;
+  // DALTON-HOOK(team-sharing): do not index or show personal memo state on colleague workspace files
+  const memoedMap = useWorkspaceMemoIndex(teamReadOnly ? '' : workspaceId);
+  const memoEntry = !teamReadOnly && selectedFile ? memoedMap.get(selectedFile) ?? null : null;
   const { status: memoStaleStatus, sandboxText: memoStaleSandboxText, refresh: refreshMemoStale } = useMemoStaleCheck({
     workspaceId, selectedFile, fileMime, memoSha256: memoEntry?.sha256 ?? null, readFileFullFn,
   });
@@ -429,7 +439,8 @@ function FilePanel({
       tabs.openFile(filePath, { pin: true });
       onAddContext({ path: filePath });
     } else if (action === 'add-to-memo') {
-      handleAddToMemo(filePath);
+      // DALTON-HOOK(team-sharing): block Add to Memo in colleague mirror mode
+      if (!teamReadOnly) void handleAddToMemo(filePath);
     } else if (action === 'open') {
       void openFileAt(filePath);
     } else if (action === 'open-new-tab') {
@@ -439,7 +450,7 @@ function FilePanel({
     } else if (action === 'download-many') {
       void downloads.downloadMany([...selection.selectedPaths]);
     }
-  }, [onAddContext, handleAddToMemo, openFileAt, downloads, selection.selectedPaths, setContextMenu, tabs]);
+  }, [onAddContext, teamReadOnly, handleAddToMemo, openFileAt, downloads, selection.selectedPaths, setContextMenu, tabs]);
 
   /**
    * Coming back to a tab whose file the agent has rewritten re-reads it. The
@@ -596,11 +607,13 @@ function FilePanel({
 
   /** Opening a running app from the tree: the tab it already has, or a new one. */
   const openPreviewTab = useCallback((port: number) => {
+    // DALTON-HOOK(team-sharing): do not open preview or start sandbox in colleague mirror mode
+    if (teamReadOnly) return;
     const entry = previews.byPort.get(port);
     cancelPending();
     tabs.openPreview({ port, title: entry?.title, path: entry?.path, command: entry?.command });
     previews.ensure(port);
-  }, [previews, tabs, cancelPending]);
+  }, [teamReadOnly, previews, tabs, cancelPending]);
 
   // Only a tab the tree sits beside takes a drop; every other kind shows
   // something that is not a folder.
@@ -639,7 +652,9 @@ function FilePanel({
       {activeTab.kind === 'preview' && (
         <PreviewCrumbs
           entry={previews.byPort.get(activeTab.port) ?? { port: activeTab.port, url: '', loading: true, error: false, reloadToken: 0 }}
-          onRefresh={() => previews.refresh(activeTab.port)}
+          // DALTON-HOOK(team-sharing): disable preview refresh in colleague mirror mode
+          onRefresh={() => { if (!teamReadOnly) previews.refresh(activeTab.port); }}
+          refreshDisabled={teamReadOnly}
           workspaceId={readOnly ? null : workspaceId}
         />
       )}
@@ -668,6 +683,8 @@ function FilePanel({
               readFileFullFn={readFileFullFn}
               servePrefix={apiAdapter?.servePrefix}
               canShare={canShare}
+              // DALTON-HOOK(team-sharing): avoid owner-only grant fetch in colleague mirror mode
+              teamReadOnly={teamReadOnly}
               editorRef={edit.editorRef}
               canUndo={edit.canUndo}
               canRedo={edit.canRedo}
@@ -751,7 +768,8 @@ function FilePanel({
                     : t('context.addToContext')}
                 </button>
               )}
-              <PreviewPanes tabs={tabs.tabs} activeId={activeTab.id} previews={previews} />
+              {/* DALTON-HOOK(team-sharing): pass teamReadOnly so colleague mirror does not start preview sandbox */}
+              <PreviewPanes tabs={tabs.tabs} activeId={activeTab.id} previews={previews} teamReadOnly={teamReadOnly} />
               <ActiveTabBody
                 activeTab={activeTab}
                 tabs={tabs}
@@ -788,6 +806,8 @@ function FilePanel({
                   onContentMouseUp: handleContentMouseUp,
                   onViewerLink: handleViewerLink,
                   onAnchorLink: handleAnchorLink,
+                  // DALTON-HOOK(team-sharing): forward teamReadOnly to FileViewer / HtmlViewer
+                  teamReadOnly,
                 }}
                 onPageCount={onPageCount}
                 canUpload={!readOnly}
@@ -850,7 +870,8 @@ function FilePanel({
           onAction={handleContextMenuAction}
           onClose={() => setContextMenu(null)}
           canAddContext={!!onAddContext}
-          memoState={memoMimeForName(contextMenu.filePath)
+          // DALTON-HOOK(team-sharing): hide Add to Memo in colleague mirror mode
+          memoState={!teamReadOnly && memoMimeForName(contextMenu.filePath)
             ? (memoedMap.has(contextMenu.filePath) ? 'present' : 'absent')
             : null}
           canDownload={canDownload}

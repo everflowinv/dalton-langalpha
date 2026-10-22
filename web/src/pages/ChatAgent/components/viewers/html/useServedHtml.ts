@@ -28,8 +28,10 @@ export function useServedHtml(
   workspaceId: string | null | undefined,
   filePath: string | null,
   servePrefix?: string,
+  // DALTON-HOOK(team-sharing): skip owner-only file-grant and share-link in colleague mirror mode
+  options?: { teamReadOnly?: boolean },
 ): ServedHtml {
-  const owner = !servePrefix && !!filePath;
+  const owner = !servePrefix && !!filePath && !options?.teamReadOnly;
   const grant = useWorkspaceFileGrant(owner ? workspaceId : null);
   const { data: link } = useShareLink(
     owner ? workspaceId : null,

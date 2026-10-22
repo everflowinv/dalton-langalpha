@@ -17,6 +17,10 @@ import { isValidUuid } from './utils/uuid';
 import { shouldLeaveThreadRoute } from './utils/threadRouteGuard';
 import ChatView from './components/ChatView';
 import ComputersDialogHost from './components/ComputersDialogHost';
+// DALTON-HOOK(team-sharing): check workspace ownership before marking thread seen
+import { isDaltonAuth } from '@/config/daltonAuth';
+import { useWorkspace } from '@/hooks/useWorkspace';
+import { useTeamReadOnly } from './components/dalton/TeamSharing';
 import './ChatAgent.css';
 
 // View depth for direction-aware transitions: gallery(0) → threads(1) → chat(2)
@@ -76,11 +80,6 @@ function ChatAgent(): React.ReactElement | null {
   // absent so they never reach workspace routes or API calls.
   const urlWorkspaceId = isValidUuid(rawUrlWorkspaceId) ? rawUrlWorkspaceId : undefined;
   const stateWorkspaceId = state?.workspaceId && isValidUuid(state.workspaceId) ? state.workspaceId : null;
-
-  // The route-level threadId is what the user is actually looking at — publish
-  // it so a run finishing on the visible thread never gets an unseen dot, and
-  // opening a finished thread stamps the durable seen cursor.
-  useActiveThreadPublisher(threadId);
 
   // Detect browser-initiated navigation (iOS swipe-back, Android back button).
   // When popstate triggers navigation, iOS Safari already shows its own page
@@ -177,6 +176,16 @@ function ChatAgent(): React.ReactElement | null {
   if (workspaceId && workspaceId !== resolvedWorkspaceId) {
     setResolvedWorkspaceId(workspaceId);
   }
+
+  // DALTON-HOOK(team-sharing): only publish active thread / seen cursor when ownership is confirmed
+  const { data: activeWorkspace } = useWorkspace(isDaltonAuth ? workspaceId : null);
+  const teamReadOnly = useTeamReadOnly(workspaceId, activeWorkspace);
+  const canMarkSeen = !isDaltonAuth || Boolean(workspaceId && activeWorkspace && !teamReadOnly.isReadOnly);
+
+  // The route-level threadId is what the user is actually looking at — publish
+  // it so a run finishing on the visible thread never gets an unseen dot, and
+  // opening a finished thread stamps the durable seen cursor.
+  useActiveThreadPublisher(threadId, { canMarkSeen });
 
   const queryClient = useQueryClient();
 

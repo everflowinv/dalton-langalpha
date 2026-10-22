@@ -36,6 +36,12 @@ import iconComputerLight from '../../../assets/img/icon-computer.svg';
 import iconComputerDark from '../../../assets/img/icon-computer-dark.svg';
 import { useTheme } from '../../../contexts/ThemeContext';
 import { motion, AnimatePresence } from '@/lib/framer';
+// DALTON-HOOK(team-sharing): read-only state, banner, and disabled composer for colleague workspaces
+import {
+  TeamReadOnlyBanner,
+  TeamReadOnlyComposer,
+  useTeamReadOnly,
+} from './dalton/TeamSharing';
 
 interface ThreadRecord {
   thread_id: string;
@@ -86,6 +92,8 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
   // Home runs the full agent with a folder of its own, so its files show. It
   // still has no machine controls of its own.
   const isHome = isHomeWorkspace(wsData);
+  // DALTON-HOOK(team-sharing): detect read-only colleague workspace
+  const teamReadOnly = useTeamReadOnly(workspaceId, wsData);
 
   // Archived view toggle. Both views live under the byWorkspace prefix
   // (queryKeys.threads.gallery), so prefix invalidations refresh both — and
@@ -206,6 +214,8 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
     workspaceId,
     workspaceName,
     includeSystem: showSystemFiles,
+    // DALTON-HOOK(team-sharing): enforce readOnly on FilePanel for colleague workspaces
+    readOnly: teamReadOnly.isReadOnly,
   });
   // A path names a sibling by its folder from the workspace it was written
   // in: the gallery's own for the link router, the shown one's for the
@@ -678,9 +688,10 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
 
             {/* Workspace Header */}
             <div className="w-full flex flex-col items-center mt-2 md:mt-[8vh] enter-fade-up enter-fade-up-d1">
+              {/* DALTON-HOOK(team-sharing): disable sandbox settings panel and show read-only banner for colleague workspaces */}
               <div
-                className="flex items-center justify-center transition-colors cursor-pointer"
-                onClick={!isHome ? () => setShowSandboxPanel(true) : undefined}
+                className={`flex items-center justify-center transition-colors ${!isHome && !teamReadOnly.isReadOnly ? 'cursor-pointer' : ''}`}
+                onClick={!isHome && !teamReadOnly.isReadOnly ? () => setShowSandboxPanel(true) : undefined}
               >
                 {isHome ? (
                   <HomeRowIcon className="w-10 h-10" style={{ color: 'var(--color-accent-primary)' }} />
@@ -694,6 +705,11 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
               >
                 {workspaceName}
               </h1>
+              {teamReadOnly.isReadOnly && (
+                <div className="mt-2">
+                  <TeamReadOnlyBanner ownerName={teamReadOnly.ownerName} />
+                </div>
+              )}
               <div className="flex items-center gap-2 mt-2 text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
                 <span>{t('thread.workspace')}</span>
                 <div className="size-[3px] rounded-full bg-current opacity-50"></div>
@@ -703,19 +719,24 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
 
             {/* Chat Input */}
             <div className="w-full enter-fade-up enter-fade-up-d2 relative z-20">
-              <ChatInput
-                ref={chatInputRef}
-                onSend={handleSendMessage as any} // TODO: type properly — ChatInput expects strict ReadyAttachment[]
-                disabled={isSendingMessage || !workspaceId}
-                files={ownFiles}
-                dropdownDirection="down"
-                // The turn this composer sends lands in this workspace, so the
-                // slash menu has to be scoped to it too: without this it lists
-                // the account-level skills, hiding the workspace's own and
-                // still offering ones it has disabled.
-                selectedWorkspaceId={workspaceId}
-                minRows={2}
-              />
+              {/* DALTON-HOOK(team-sharing): replace writable ChatInput with disabled read-only composer */}
+              {teamReadOnly.isReadOnly ? (
+                <TeamReadOnlyComposer ownerName={teamReadOnly.ownerName} />
+              ) : (
+                <ChatInput
+                  ref={chatInputRef}
+                  onSend={handleSendMessage as any} // TODO: type properly — ChatInput expects strict ReadyAttachment[]
+                  disabled={isSendingMessage || !workspaceId}
+                  files={ownFiles}
+                  dropdownDirection="down"
+                  // The turn this composer sends lands in this workspace, so the
+                  // slash menu has to be scoped to it too: without this it lists
+                  // the account-level skills, hiding the workspace's own and
+                  // still offering ones it has disabled.
+                  selectedWorkspaceId={workspaceId}
+                  minRows={2}
+                />
+              )}
             </div>
 
             {/* Files Card */}
@@ -843,13 +864,14 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
                             previous view's rows the toggle has already
                             flipped, so the view flag would offer Archive on
                             an archived row. */}
+                        {/* DALTON-HOOK(team-sharing): hide thread mutation actions in read-only mode */}
                         <ThreadCard
                           thread={thread}
                           onClick={handleThreadClick}
-                          onDelete={handleDeleteClick}
-                          onRename={handleRenameClick}
-                          onArchive={!thread.archived_at ? handleArchive : undefined}
-                          onUnarchive={thread.archived_at ? handleUnarchive : undefined}
+                          onDelete={teamReadOnly.isReadOnly ? undefined : handleDeleteClick}
+                          onRename={teamReadOnly.isReadOnly ? undefined : handleRenameClick}
+                          onArchive={!teamReadOnly.isReadOnly && !thread.archived_at ? handleArchive : undefined}
+                          onUnarchive={!teamReadOnly.isReadOnly && thread.archived_at ? handleUnarchive : undefined}
                         />
                       </motion.div>
                     ))}
@@ -902,7 +924,7 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
                 filesLoading={panelFilesLoading}
                 filesError={panelFilesError}
                 onRefreshFiles={refreshPanelFiles}
-                onAddContext={handleAddContext as any} // TODO: type properly
+                onAddContext={teamReadOnly.isReadOnly ? null : (handleAddContext as any)} // DALTON-HOOK(team-sharing)
                 showSystemFiles={showSystemFiles}
                 onToggleSystemFiles={() => {
                   setShowSystemFiles((v) => {
@@ -911,6 +933,8 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
                   });
                 }}
                 readOnly={panelAccess.readOnly}
+                // DALTON-HOOK(team-sharing): pass teamReadOnly separately from sibling readOnly
+                teamReadOnly={panelAccess.teamReadOnly}
                 singleFileMode={panelAccess.singleFileMode}
                 onReturnHome={panelAccess.onReturnHome}
                 returnLabel={panelAccess.returnLabel}
@@ -946,7 +970,8 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
       />
 
       {/* Sandbox Settings Panel */}
-      {showSandboxPanel && (
+      {/* DALTON-HOOK(team-sharing): never render sandbox settings in read-only mode */}
+      {showSandboxPanel && !teamReadOnly.isReadOnly && (
         <SandboxSettingsPanel
           onClose={() => setShowSandboxPanel(false)}
           workspaceId={workspaceId}

@@ -10,12 +10,21 @@ import { useWorkspaceFiles } from '../../hooks/useWorkspaceFiles';
  * even while a sibling's are on screen: the turn wrote its own, and listing
  * the sibling's would start its computer.
  */
-export function usePanelFiles({ isHome, workspaceId, workspaceName = null, includeSystem }: {
+export function usePanelFiles({
+  isHome,
+  workspaceId,
+  workspaceName = null,
+  includeSystem,
+  // DALTON-HOOK(team-sharing): force read-only file panel for colleague workspaces
+  readOnly = false,
+}: {
   isHome: boolean;
   workspaceId: string;
   /** The view's own workspace, which the way back from a sibling is labelled with; Home's says Home. */
   workspaceName?: string | null;
   includeSystem: boolean;
+  // DALTON-HOOK(team-sharing): force read-only file panel for colleague workspaces
+  readOnly?: boolean;
 }) {
   const [override, setOverride] = useState<string | null>(null);
   const shownId = override ?? workspaceId;
@@ -39,11 +48,13 @@ export function usePanelFiles({ isHome, workspaceId, workspaceName = null, inclu
     /** FilePanel's access props, spread onto every mount. */
     panelAccess: showsSibling
       ? {
-          readOnly: true, singleFileMode: true, canShare: false, isHome: false,
+          // DALTON-HOOK(team-sharing): keep teamReadOnly separate from sibling readOnly
+          readOnly: true, teamReadOnly: readOnly, singleFileMode: true, canShare: false, isHome: false,
           onReturnHome: () => setOverride(null), returnLabel: isHome ? null : workspaceName,
         }
       : {
-          readOnly: false, singleFileMode: false, canShare: true, isHome,
+          // DALTON-HOOK(team-sharing): enforce readOnly and disable sharing on team workspaces
+          readOnly, teamReadOnly: readOnly, singleFileMode: false, canShare: !readOnly, isHome,
           onReturnHome: null, returnLabel: null,
         },
   };

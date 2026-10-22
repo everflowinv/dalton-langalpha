@@ -103,6 +103,12 @@ import { usePanelFiles } from './chatView/usePanelFiles';
 import { usePanelChartSelections } from './chatView/usePanelChartSelections';
 import { SelectionChips } from '@/pages/MarketView/components/SelectionChips';
 import { useMessageActionBundles } from './chatView/useMessageActionBundles';
+// DALTON-HOOK(team-sharing): read-only state, banner, and disabled composer for colleague threads
+import {
+  TeamReadOnlyBanner,
+  TeamReadOnlyComposer,
+  useTeamReadOnly,
+} from './dalton/TeamSharing';
 
 
 // Clears the composer floating over the transcript's bottom edge (its height
@@ -138,6 +144,8 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   const isHome = isHomeWorkspace(workspaceRecord);
   // Home is named for what it stands for.
   const workspaceName = (isHome ? t('agents.allWorkspaces') : workspaceRecord?.name) || initialWorkspaceName || '';
+  // DALTON-HOOK(team-sharing): detect read-only colleague workspace/thread
+  const teamReadOnly = useTeamReadOnly(workspaceId, workspaceRecord);
 
   // The model a navigation's first message goes out with, captured at mount:
   // ChatAgent keeps up to five ChatViews rendered at once (display:none, not
@@ -220,7 +228,14 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     refreshOwn: refreshOwnFiles,
     mentionFiles,
     panelAccess: filePanelAccess,
-  } = usePanelFiles({ isHome, workspaceId, workspaceName, includeSystem: showSystemFiles });
+  } = usePanelFiles({
+    isHome,
+    workspaceId,
+    workspaceName,
+    includeSystem: showSystemFiles,
+    // DALTON-HOOK(team-sharing): enforce readOnly on FilePanel for colleague workspaces
+    readOnly: teamReadOnly.isReadOnly,
+  });
   // A path names a sibling by its folder from the workspace it was written
   // in: the chat's for the transcript, the panel's for the files it shows.
   const chatFolders = useComputerFolders(workspaceId);
@@ -869,6 +884,8 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     messages,
     subagentTranscripts,
     watching: showWatchChip,
+    // DALTON-HOOK(team-sharing): suppress preview sandbox startup in read-only mode
+    readOnly: teamReadOnly.isReadOnly,
   });
   // The file panel's props are one compiled scope, so this handler's per-chunk
   // identity would re-create every inline prop beside it and re-render the panel.
@@ -997,6 +1014,8 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     editDrafts,
     onSendMessage: handleSendMessage,
     chatInputRef,
+    // DALTON-HOOK(team-sharing): withhold mutation/interactive callbacks in read-only mode
+    readOnly: teamReadOnly.isReadOnly,
   });
 
   // The dispatcher's deep-link context for PTC-agent proposal cards. Memoized:
@@ -1151,6 +1170,8 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   useEffect(() => {
     // Hidden views must not send initial messages (R7 — all views share useLocation)
     if (!isActive) return;
+    // DALTON-HOOK(team-sharing): never auto-send initialMessage or onboarding kickoff in read-only mode
+    if (teamReadOnly.isReadOnly) return;
     // Only proceed if we have the required IDs
     if (!workspaceId || !threadId) {
       return;
@@ -1231,7 +1252,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
         }, 100);
       }
     }
-  }, [location.state, workspaceId, threadId, isLoading, isLoadingHistory, handleSendMessage, navigate, location.pathname, isActive, subagentsToSend]);
+  }, [location.state, workspaceId, threadId, isLoading, isLoadingHistory, handleSendMessage, navigate, location.pathname, isActive, subagentsToSend, teamReadOnly.isReadOnly]);
 
   // Re-seed the composer from navigation state when there's no
   // initialMessage (the auto-send branch above already consumes them inline).
@@ -1240,7 +1261,8 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   // with the agent", which hands it a sentence to finish rather than send.
   const composerReseedRef = useRef(false);
   useEffect(() => {
-    if (composerReseedRef.current) return;
+    // DALTON-HOOK(team-sharing): do not reseed composer in read-only mode
+    if (composerReseedRef.current || teamReadOnly.isReadOnly) return;
     const navState = location.state as LocationState | null;
     const snaps = navState?.widgetSnapshots;
     const draft = navState?.draftMessage;
@@ -1249,7 +1271,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     snaps?.forEach((s) => chatInputRef.current?.addWidgetSnapshot(s));
     if (draft) chatInputRef.current?.setValue(draft);
     navigate(location.pathname, { replace: true, state: { ...navState, widgetSnapshots: undefined, draftMessage: undefined } });
-  }, [location.state, location.pathname, navigate]);
+  }, [location.state, location.pathname, navigate, teamReadOnly.isReadOnly]);
 
 
 
@@ -1415,6 +1437,10 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
             <h1 className="text-base font-semibold whitespace-nowrap title-font truncate" style={{ color: 'var(--color-text-primary)' }}>
               {workspaceName || t('thread.workspace')}
             </h1>
+            {/* DALTON-HOOK(team-sharing): display read-only banner in top bar */}
+            {teamReadOnly.isReadOnly && (
+              <TeamReadOnlyBanner ownerName={teamReadOnly.ownerName} compact />
+            )}
             {isLoadingHistory ? (
               <span className="text-xs whitespace-nowrap" style={{ color: 'var(--color-text-tertiary)' }}>
                 {t('chat.loadingHistory')}
@@ -1423,7 +1449,8 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
           </div>
 
           <div className="flex items-center gap-2">
-            {currentThreadId && currentThreadId !== '__default__' && (
+            {/* DALTON-HOOK(team-sharing): hide ShareButton in read-only mode */}
+            {currentThreadId && currentThreadId !== '__default__' && !teamReadOnly.isReadOnly && (
               <ShareButton threadId={currentThreadId} initialIsShared={threadIsShared} workspaceId={workspaceId} />
             )}
             <button
@@ -1477,7 +1504,8 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
               onMouseUp={handleMessageMouseUp}
             >
               {/* Message selection tooltip */}
-              {msgSelectionTooltip && (() => {
+              {/* DALTON-HOOK(team-sharing): hide add-to-context tooltip in read-only mode */}
+              {msgSelectionTooltip && !teamReadOnly.isReadOnly && (() => {
                 const lines = (msgSelectionTooltip.text.match(/\n/g) || []).length + 1;
                 return (
                   <div
@@ -1514,6 +1542,9 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                             isLoadingHistory={isLoadingHistory}
                             feedbackByTurn={feedbackByTurn}
                             dispatcherContext={dispatcherContext}
+                            // DALTON-HOOK(team-sharing): render message cards in read-only mode while preserving file cards
+                            readOnly={teamReadOnly.isReadOnly}
+                            allowFiles={teamReadOnly.isReadOnly}
                           />
                         </DispatchStatusProvider>
                       </MessageActionsProvider>
@@ -1545,7 +1576,8 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                         onOpenChild={handleOpenSubagentTask}
                         resolveChildTelemetry={resolveSubagentTelemetry}
                         onStop={
-                          currentThreadId && currentThreadId !== '__default__'
+                          // DALTON-HOOK(team-sharing): disable workflow/subagent stop in read-only mode
+                          !teamReadOnly.isReadOnly && currentThreadId && currentThreadId !== '__default__'
                             ? () => cancelSubagentTask(currentThreadId, taskIdFromAgentId(activeAgent.id) ?? activeAgent.id)
                             : undefined
                         }
@@ -1591,6 +1623,9 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                                 messages={activeAgent.messages as MessageRecord[]}
                                 isSubagentView={true}
                                 isLoading={subagentTurnLive}
+                                // DALTON-HOOK(team-sharing): render subagent message cards in read-only mode while preserving file cards
+                                readOnly={teamReadOnly.isReadOnly}
+                                allowFiles={teamReadOnly.isReadOnly}
                               />
                             </DispatchStatusProvider>
                           </MessageActionsProvider>
@@ -1648,7 +1683,10 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                   content does (TRANSCRIPT_BOTTOM_PAD): nothing in the stack
                   reads it. */}
               <div className="w-full max-w-3xl sibling-space-y-3 relative pointer-events-auto [--composer-h:initial]">
-                {activeAgentId === 'main' ? (
+                {/* DALTON-HOOK(team-sharing): replace writable composer with disabled read-only composer */}
+                {teamReadOnly.isReadOnly ? (
+                  <TeamReadOnlyComposer ownerName={teamReadOnly.ownerName} />
+                ) : activeAgentId === 'main' ? (
                   <>
                     {/* Only rows with a surface of their own sit here: the
                         transcript scrolls beneath this stack, and a bare line
@@ -1824,7 +1862,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                   filesLoading={filesLoading}
                   filesError={filesError}
                   onRefreshFiles={refreshFiles}
-                  onAddContext={handleAddContext}
+                  onAddContext={teamReadOnly.isReadOnly ? null : handleAddContext} // DALTON-HOOK(team-sharing)
                   showSystemFiles={showSystemFiles}
                   onToggleSystemFiles={() => {
                     setShowSystemFiles((v) => {
@@ -1886,7 +1924,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                       filesLoading={filesLoading}
                       filesError={filesError}
                       onRefreshFiles={refreshFiles}
-                      onAddContext={handleAddContext}
+                      onAddContext={teamReadOnly.isReadOnly ? null : handleAddContext} // DALTON-HOOK(team-sharing)
                       showSystemFiles={showSystemFiles}
                       onToggleSystemFiles={() => {
                         setShowSystemFiles((v) => {

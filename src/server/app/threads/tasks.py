@@ -34,7 +34,16 @@ async def get_subagent_task_status(
     ``{status, error}`` on demand so the view can hydrate without a full
     thread reload — the same ledger truth replay stamps at load time.
     """
-    await auth_api.require_thread_owner(thread_id, x_user_id)
+    # --- DALTON-HOOK(team-sharing): begin ---
+    from src.dalton.settings import is_dalton_supabase_auth_enabled
+
+    if is_dalton_supabase_auth_enabled():
+        from src.dalton.sharing import require_thread_reader
+
+        await require_thread_reader(thread_id, x_user_id)
+    else:
+        await auth_api.require_thread_owner(thread_id, x_user_id)
+    # --- DALTON-HOOK(team-sharing): end ---
     from src.server.services.history.task_status import resolve_task_details
 
     details = await resolve_task_details(thread_id, [task_id])
@@ -64,7 +73,16 @@ async def get_subagent_task_history(
     items replay emits (empty for an unknown or still-running task, whose
     transcript belongs to its live stream).
     """
-    await auth_api.require_thread_owner(thread_id, x_user_id)
+    # --- DALTON-HOOK(team-sharing): begin ---
+    from src.dalton.settings import is_dalton_supabase_auth_enabled
+
+    if is_dalton_supabase_auth_enabled():
+        from src.dalton.sharing import require_thread_reader
+
+        await require_thread_reader(thread_id, x_user_id)
+    else:
+        await auth_api.require_thread_owner(thread_id, x_user_id)
+    # --- DALTON-HOOK(team-sharing): end ---
     from src.server.services.history.replay.run_lane import (
         project_task_transcript,
     )
