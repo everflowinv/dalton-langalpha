@@ -270,6 +270,8 @@ export const queryKeys = {
     budgetToday:     () => [...queryKeys.dalton.all, 'budget', 'today'],
     coverageBoard:   (tier = 'all', staleOnly = false) => [...queryKeys.dalton.all, 'coverage', 'board', tier, staleOnly],
     autonomyReport:  (week?: string) => [...queryKeys.dalton.all, 'autonomy', 'report', week ?? 'current'],
+    // DALTON-HOOK(team-credentials): team-shared credentials status query key scoped by user
+    credentialsStatus: (userId?: string | null) => [...queryKeys.dalton.all, 'credentials', 'status', userId ?? 'current'],
   },
 };
 

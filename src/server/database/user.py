@@ -17,6 +17,7 @@ from src.llms.preferences import MOVED_MODEL_KEYS, TuningError
 from src.server.database.pool import get_db_connection
 from src.server.database.user_lock import lock_user_profile
 from src.server.utils.db import UpdateQueryBuilder
+from src.dalton.credentials import credential_user_id  # DALTON-HOOK(team-credentials): resolve shared team credential holder
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +31,8 @@ def _gate_cols(alias: str = "users") -> str:
 
 _HAS_API_KEY = "EXISTS (SELECT 1 FROM user_api_keys WHERE user_api_keys.user_id = users.user_id) AS has_api_key"
 _HAS_OAUTH = "EXISTS (SELECT 1 FROM user_oauth_tokens WHERE user_oauth_tokens.user_id = users.user_id) AS has_oauth_token"
+_HAS_API_KEY_CRED = "EXISTS (SELECT 1 FROM user_api_keys WHERE user_api_keys.user_id = %s) AS has_api_key"
+_HAS_OAUTH_CRED = "EXISTS (SELECT 1 FROM user_oauth_tokens WHERE user_oauth_tokens.user_id = %s) AS has_oauth_token"
 
 
 # ==================== User Operations ====================
@@ -72,21 +75,39 @@ async def create_user(
                 raise ValueError(f"User {user_id} already exists")
 
             # Insert new user
-            await cur.execute("""
-                INSERT INTO users (
-                    user_id, email, name, avatar_url, timezone, locale,
-                    onboarding_completed, created_at, updated_at
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, FALSE, NOW(), NOW())
-                RETURNING
-                    user_id, email, name, avatar_url, timezone, locale,
-                    onboarding_completed,
-                    COALESCE(personalization_completed, FALSE) AS personalization_completed,
-                    auth_provider,
-                    created_at, updated_at, last_login_at,
-                    """ + _HAS_API_KEY + """,
-                    """ + _HAS_OAUTH + """
-            """, (user_id, email, name, avatar_url, timezone, locale))
+            cred_user_id = credential_user_id(user_id)  # DALTON-HOOK(team-credentials): resolve credential status from holder only
+            if cred_user_id != user_id:
+                await cur.execute("""
+                    INSERT INTO users (
+                        user_id, email, name, avatar_url, timezone, locale,
+                        onboarding_completed, created_at, updated_at
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, FALSE, NOW(), NOW())
+                    RETURNING
+                        user_id, email, name, avatar_url, timezone, locale,
+                        onboarding_completed,
+                        COALESCE(personalization_completed, FALSE) AS personalization_completed,
+                        auth_provider,
+                        created_at, updated_at, last_login_at,
+                        """ + _HAS_API_KEY_CRED + """,
+                        """ + _HAS_OAUTH_CRED + """
+                """, (user_id, email, name, avatar_url, timezone, locale, cred_user_id, cred_user_id))
+            else:
+                await cur.execute("""
+                    INSERT INTO users (
+                        user_id, email, name, avatar_url, timezone, locale,
+                        onboarding_completed, created_at, updated_at
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, FALSE, NOW(), NOW())
+                    RETURNING
+                        user_id, email, name, avatar_url, timezone, locale,
+                        onboarding_completed,
+                        COALESCE(personalization_completed, FALSE) AS personalization_completed,
+                        auth_provider,
+                        created_at, updated_at, last_login_at,
+                        """ + _HAS_API_KEY + """,
+                        """ + _HAS_OAUTH + """
+                """, (user_id, email, name, avatar_url, timezone, locale))
 
             result = await cur.fetchone()
 
@@ -165,33 +186,61 @@ async def create_user_from_auth(
     ``timezone``, and ``locale`` are only written when the existing value
     is NULL (lazy backfill on next login).
     """
+    cred_user_id = credential_user_id(user_id)  # DALTON-HOOK(team-credentials): resolve credential status from holder only
     async with get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
-            await cur.execute("""
-                INSERT INTO users (
-                    user_id, email, name, avatar_url, auth_provider,
-                    timezone, locale,
-                    onboarding_completed, created_at, updated_at
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, FALSE, NOW(), NOW())
-                ON CONFLICT (user_id) DO UPDATE
-                SET
-                    email = COALESCE(EXCLUDED.email, users.email),
-                    name = COALESCE(EXCLUDED.name, users.name),
-                    avatar_url = COALESCE(EXCLUDED.avatar_url, users.avatar_url),
-                    auth_provider = COALESCE(users.auth_provider, EXCLUDED.auth_provider),
-                    timezone = COALESCE(EXCLUDED.timezone, users.timezone),
-                    locale = COALESCE(EXCLUDED.locale, users.locale),
-                    updated_at = NOW()
-                RETURNING
-                    user_id, email, name, avatar_url, timezone, locale,
-                    onboarding_completed,
-                    COALESCE(personalization_completed, FALSE) AS personalization_completed,
-                    auth_provider,
-                    created_at, updated_at, last_login_at,
-                    """ + _HAS_API_KEY + """,
-                    """ + _HAS_OAUTH + """
-            """, (user_id, email, name, avatar_url, auth_provider, timezone, locale))
+            if cred_user_id != user_id:
+                await cur.execute("""
+                    INSERT INTO users (
+                        user_id, email, name, avatar_url, auth_provider,
+                        timezone, locale,
+                        onboarding_completed, created_at, updated_at
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, FALSE, NOW(), NOW())
+                    ON CONFLICT (user_id) DO UPDATE
+                    SET
+                        email = COALESCE(EXCLUDED.email, users.email),
+                        name = COALESCE(EXCLUDED.name, users.name),
+                        avatar_url = COALESCE(EXCLUDED.avatar_url, users.avatar_url),
+                        auth_provider = COALESCE(users.auth_provider, EXCLUDED.auth_provider),
+                        timezone = COALESCE(EXCLUDED.timezone, users.timezone),
+                        locale = COALESCE(EXCLUDED.locale, users.locale),
+                        updated_at = NOW()
+                    RETURNING
+                        user_id, email, name, avatar_url, timezone, locale,
+                        onboarding_completed,
+                        COALESCE(personalization_completed, FALSE) AS personalization_completed,
+                        auth_provider,
+                        created_at, updated_at, last_login_at,
+                        """ + _HAS_API_KEY_CRED + """,
+                        """ + _HAS_OAUTH_CRED + """
+                """, (user_id, email, name, avatar_url, auth_provider, timezone, locale, cred_user_id, cred_user_id))
+            else:
+                await cur.execute("""
+                    INSERT INTO users (
+                        user_id, email, name, avatar_url, auth_provider,
+                        timezone, locale,
+                        onboarding_completed, created_at, updated_at
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, FALSE, NOW(), NOW())
+                    ON CONFLICT (user_id) DO UPDATE
+                    SET
+                        email = COALESCE(EXCLUDED.email, users.email),
+                        name = COALESCE(EXCLUDED.name, users.name),
+                        avatar_url = COALESCE(EXCLUDED.avatar_url, users.avatar_url),
+                        auth_provider = COALESCE(users.auth_provider, EXCLUDED.auth_provider),
+                        timezone = COALESCE(EXCLUDED.timezone, users.timezone),
+                        locale = COALESCE(EXCLUDED.locale, users.locale),
+                        updated_at = NOW()
+                    RETURNING
+                        user_id, email, name, avatar_url, timezone, locale,
+                        onboarding_completed,
+                        COALESCE(personalization_completed, FALSE) AS personalization_completed,
+                        auth_provider,
+                        created_at, updated_at, last_login_at,
+                        """ + _HAS_API_KEY + """,
+                        """ + _HAS_OAUTH + """
+                """, (user_id, email, name, avatar_url, auth_provider, timezone, locale))
             result = await cur.fetchone()
 
             # Ensure a preferences row exists so the user can configure
@@ -216,20 +265,36 @@ async def get_user(user_id: str) -> Optional[Dict[str, Any]]:
     Returns:
         User dict or None if not found
     """
+    # DALTON-HOOK(team-credentials): resolve credential status (has_api_key / has_oauth_token) from holder only
+    cred_user_id = credential_user_id(user_id)
     async with get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
-            await cur.execute("""
-                SELECT
-                    user_id, email, name, avatar_url, timezone, locale,
-                    onboarding_completed,
-                    COALESCE(personalization_completed, FALSE) AS personalization_completed,
-                    auth_provider,
-                    created_at, updated_at, last_login_at,
-                    """ + _HAS_API_KEY + """,
-                    """ + _HAS_OAUTH + """
-                FROM users
-                WHERE user_id = %s
-            """, (user_id,))
+            if cred_user_id != user_id:
+                await cur.execute("""
+                    SELECT
+                        user_id, email, name, avatar_url, timezone, locale,
+                        onboarding_completed,
+                        COALESCE(personalization_completed, FALSE) AS personalization_completed,
+                        auth_provider,
+                        created_at, updated_at, last_login_at,
+                        """ + _HAS_API_KEY_CRED + """,
+                        """ + _HAS_OAUTH_CRED + """
+                    FROM users
+                    WHERE user_id = %s
+                """, (cred_user_id, cred_user_id, user_id))
+            else:
+                await cur.execute("""
+                    SELECT
+                        user_id, email, name, avatar_url, timezone, locale,
+                        onboarding_completed,
+                        COALESCE(personalization_completed, FALSE) AS personalization_completed,
+                        auth_provider,
+                        created_at, updated_at, last_login_at,
+                        """ + _HAS_API_KEY + """,
+                        """ + _HAS_OAUTH + """
+                    FROM users
+                    WHERE user_id = %s
+                """, (user_id,))
 
             result = await cur.fetchone()
             return dict(result) if result else None
@@ -281,14 +346,15 @@ async def update_user(
     if not builder.has_updates():
         return await get_user(user_id)
 
+    cred_user_id = credential_user_id(user_id)  # DALTON-HOOK(team-credentials): resolve credential status from holder only
     returning_columns = [
         "user_id", "email", "name", "avatar_url", "timezone", "locale",
         "onboarding_completed",
         "COALESCE(personalization_completed, FALSE) AS personalization_completed",
         "auth_provider",
         "created_at", "updated_at", "last_login_at",
-        _HAS_API_KEY,
-        _HAS_OAUTH,
+        _HAS_API_KEY_CRED if cred_user_id != user_id else _HAS_API_KEY,
+        _HAS_OAUTH_CRED if cred_user_id != user_id else _HAS_OAUTH,
     ]
 
     query, params = builder.build(
@@ -297,6 +363,8 @@ async def update_user(
         where_params=[user_id],
         returning_columns=returning_columns,
     )
+    if cred_user_id != user_id:
+        params = (*params, cred_user_id, cred_user_id)
 
     async with get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
@@ -332,31 +400,57 @@ async def upsert_user(
     Returns:
         User dict (created or updated)
     """
+    cred_user_id = credential_user_id(user_id)  # DALTON-HOOK(team-credentials): resolve credential status from holder only
     async with get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
-            await cur.execute("""
-                INSERT INTO users (
-                    user_id, email, name, avatar_url, timezone, locale,
-                    onboarding_completed, created_at, updated_at
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, FALSE, NOW(), NOW())
-                ON CONFLICT (user_id) DO UPDATE
-                SET
-                    email = COALESCE(EXCLUDED.email, users.email),
-                    name = COALESCE(EXCLUDED.name, users.name),
-                    avatar_url = COALESCE(EXCLUDED.avatar_url, users.avatar_url),
-                    timezone = COALESCE(EXCLUDED.timezone, users.timezone),
-                    locale = COALESCE(EXCLUDED.locale, users.locale),
-                    updated_at = NOW()
-                RETURNING
-                    user_id, email, name, avatar_url, timezone, locale,
-                    onboarding_completed,
-                    COALESCE(personalization_completed, FALSE) AS personalization_completed,
-                    auth_provider,
-                    created_at, updated_at, last_login_at,
-                    """ + _HAS_API_KEY + """,
-                    """ + _HAS_OAUTH + """
-            """, (user_id, email, name, avatar_url, timezone, locale))
+            if cred_user_id != user_id:
+                await cur.execute("""
+                    INSERT INTO users (
+                        user_id, email, name, avatar_url, timezone, locale,
+                        onboarding_completed, created_at, updated_at
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, FALSE, NOW(), NOW())
+                    ON CONFLICT (user_id) DO UPDATE
+                    SET
+                        email = COALESCE(EXCLUDED.email, users.email),
+                        name = COALESCE(EXCLUDED.name, users.name),
+                        avatar_url = COALESCE(EXCLUDED.avatar_url, users.avatar_url),
+                        timezone = COALESCE(EXCLUDED.timezone, users.timezone),
+                        locale = COALESCE(EXCLUDED.locale, users.locale),
+                        updated_at = NOW()
+                    RETURNING
+                        user_id, email, name, avatar_url, timezone, locale,
+                        onboarding_completed,
+                        COALESCE(personalization_completed, FALSE) AS personalization_completed,
+                        auth_provider,
+                        created_at, updated_at, last_login_at,
+                        """ + _HAS_API_KEY_CRED + """,
+                        """ + _HAS_OAUTH_CRED + """
+                """, (user_id, email, name, avatar_url, timezone, locale, cred_user_id, cred_user_id))
+            else:
+                await cur.execute("""
+                    INSERT INTO users (
+                        user_id, email, name, avatar_url, timezone, locale,
+                        onboarding_completed, created_at, updated_at
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, FALSE, NOW(), NOW())
+                    ON CONFLICT (user_id) DO UPDATE
+                    SET
+                        email = COALESCE(EXCLUDED.email, users.email),
+                        name = COALESCE(EXCLUDED.name, users.name),
+                        avatar_url = COALESCE(EXCLUDED.avatar_url, users.avatar_url),
+                        timezone = COALESCE(EXCLUDED.timezone, users.timezone),
+                        locale = COALESCE(EXCLUDED.locale, users.locale),
+                        updated_at = NOW()
+                    RETURNING
+                        user_id, email, name, avatar_url, timezone, locale,
+                        onboarding_completed,
+                        COALESCE(personalization_completed, FALSE) AS personalization_completed,
+                        auth_provider,
+                        created_at, updated_at, last_login_at,
+                        """ + _HAS_API_KEY + """,
+                        """ + _HAS_OAUTH + """
+                """, (user_id, email, name, avatar_url, timezone, locale))
 
             result = await cur.fetchone()
             logger.info(f"[user_db] upsert_user user_id={user_id}")
@@ -663,23 +757,43 @@ async def get_user_with_preferences(user_id: str) -> Optional[Dict[str, Any]]:
     Returns:
         Dict with 'user' and 'preferences' keys, or None if user not found
     """
+    # DALTON-HOOK(team-credentials): resolve credential status (has_api_key / has_oauth_token) from holder only
+    cred_user_id = credential_user_id(user_id)
     async with get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
-            await cur.execute("""
-                SELECT
-                    u.user_id, u.email, u.name, u.avatar_url, u.timezone, u.locale,
-                    u.onboarding_completed,
-                    COALESCE(u.personalization_completed, FALSE) AS personalization_completed,
-                    u.auth_provider,
-                    u.created_at, u.updated_at, u.last_login_at,
-                    """ + _gate_cols("u") + """,
-                    p.user_preference_id, p.risk_preference, p.investment_preference,
-                    p.agent_preference, p.other_preference, p.model_preference,
-                    p.created_at as pref_created_at, p.updated_at as pref_updated_at
-                FROM users u
-                LEFT JOIN user_preferences p ON u.user_id = p.user_id
-                WHERE u.user_id = %s
-            """, (user_id,))
+            if cred_user_id != user_id:
+                await cur.execute("""
+                    SELECT
+                        u.user_id, u.email, u.name, u.avatar_url, u.timezone, u.locale,
+                        u.onboarding_completed,
+                        COALESCE(u.personalization_completed, FALSE) AS personalization_completed,
+                        u.auth_provider,
+                        u.created_at, u.updated_at, u.last_login_at,
+                        """ + _HAS_API_KEY_CRED + """,
+                        """ + _HAS_OAUTH_CRED + """,
+                        p.user_preference_id, p.risk_preference, p.investment_preference,
+                        p.agent_preference, p.other_preference, p.model_preference,
+                        p.created_at as pref_created_at, p.updated_at as pref_updated_at
+                    FROM users u
+                    LEFT JOIN user_preferences p ON u.user_id = p.user_id
+                    WHERE u.user_id = %s
+                """, (cred_user_id, cred_user_id, user_id))
+            else:
+                await cur.execute("""
+                    SELECT
+                        u.user_id, u.email, u.name, u.avatar_url, u.timezone, u.locale,
+                        u.onboarding_completed,
+                        COALESCE(u.personalization_completed, FALSE) AS personalization_completed,
+                        u.auth_provider,
+                        u.created_at, u.updated_at, u.last_login_at,
+                        """ + _gate_cols("u") + """,
+                        p.user_preference_id, p.risk_preference, p.investment_preference,
+                        p.agent_preference, p.other_preference, p.model_preference,
+                        p.created_at as pref_created_at, p.updated_at as pref_updated_at
+                    FROM users u
+                    LEFT JOIN user_preferences p ON u.user_id = p.user_id
+                    WHERE u.user_id = %s
+                """, (user_id,))
 
             result = await cur.fetchone()
             if not result:

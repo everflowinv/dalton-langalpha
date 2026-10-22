@@ -13,6 +13,7 @@ from psycopg.rows import dict_row
 
 from src.server.database.pool import get_db_connection
 from src.server.database.encryption import get_encryption_key
+from src.dalton.credentials import credential_user_id  # DALTON-HOOK(team-credentials): resolve shared team credential holder
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +29,7 @@ async def upsert_oauth_tokens(
     expires_at: Optional[datetime] = None,
 ) -> None:
     """Insert or update OAuth tokens for a provider (encrypted)."""
+    actor_user_id, user_id = user_id, credential_user_id(user_id)  # DALTON-HOOK(team-credentials): write to team credential holder
     enc_key = get_encryption_key()
     async with get_db_connection() as conn:
         async with conn.cursor() as cur:
@@ -56,7 +58,7 @@ async def upsert_oauth_tokens(
                 ),
             )
             logger.debug(
-                f"[oauth_tokens] upsert user_id={user_id} provider={provider}"
+                f"[oauth_tokens] upsert user_id={actor_user_id} credential_user_id={user_id} provider={provider}"  # DALTON-HOOK(team-credentials)
             )
 
 
@@ -70,6 +72,7 @@ async def get_oauth_tokens(
         {access_token, refresh_token, account_id, email, plan_type, expires_at}
         or None if not found.
     """
+    user_id = credential_user_id(user_id)  # DALTON-HOOK(team-credentials): read team credential holder tokens
     enc_key = get_encryption_key()
     async with get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
@@ -95,6 +98,7 @@ async def get_oauth_tokens(
 
 async def delete_oauth_tokens(user_id: str, provider: str) -> None:
     """Remove OAuth tokens for a provider."""
+    actor_user_id, user_id = user_id, credential_user_id(user_id)  # DALTON-HOOK(team-credentials): delete from team credential holder
     async with get_db_connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(
@@ -102,7 +106,7 @@ async def delete_oauth_tokens(user_id: str, provider: str) -> None:
                 (user_id, provider),
             )
             logger.info(
-                f"[oauth_tokens] deleted user_id={user_id} provider={provider}"
+                f"[oauth_tokens] deleted user_id={actor_user_id} credential_user_id={user_id} provider={provider}"  # DALTON-HOOK(team-credentials)
             )
 
 
@@ -115,6 +119,7 @@ async def get_oauth_status(
     Returns:
         {connected: bool, account_id, email, plan_type}
     """
+    user_id = credential_user_id(user_id)  # DALTON-HOOK(team-credentials): check team credential holder status
     async with get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
@@ -146,6 +151,7 @@ async def has_any_oauth_token(user_id: str) -> bool:
     The cache is explicitly invalidated by ``invalidate_oauth_active_cache``
     whenever tokens are written/deleted.
     """
+    user_id = credential_user_id(user_id)  # DALTON-HOOK(team-credentials): check & cache by team credential holder
     from src.utils.cache.redis_cache import get_cache_client
 
     cache_key = f"oauth_active:{user_id}"
@@ -177,6 +183,7 @@ async def has_any_oauth_token(user_id: str) -> bool:
 
 async def invalidate_oauth_active_cache(user_id: str) -> None:
     """Delete the cached ``has_any_oauth_token`` result so the next call hits the DB."""
+    user_id = credential_user_id(user_id)  # DALTON-HOOK(team-credentials): invalidate cache for team credential holder
     from src.utils.cache.redis_cache import get_cache_client
 
     cache = get_cache_client()

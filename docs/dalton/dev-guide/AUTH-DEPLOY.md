@@ -51,3 +51,16 @@
 
 - 浏览器端行情 WebSocket（`/ws/v1/market-data/aggregates/{market}`，见 `src/server/app/market_data_ws.py:402`）在握手阶段通过查询参数 `?token=<access_token>` 传递 Supabase JWT。
 - 公网部署时，**必须在反向代理 / 网关层对 `/ws/v1/market-data/aggregates/{market}`（建议覆盖整个 `/ws/` 握手路径）访问日志（access log）中的 `token` 查询参数做脱敏或关闭查询串记录**（例如在 Nginx `log_format` 中使用 `$uri` 替代 `$request_uri`，或用 `map` 将 `token=[^&]+` 替换为 `token=REDACTED`），防止 JWT 写入明文访问日志。
+
+---
+
+## 5. 团队共用凭据（`credentials.sharing: team | "off"`）
+
+- **配置开关**：`src/dalton/dalton.yaml` 中的 `credentials.sharing: team | "off"`（例如关闭时写 `sharing: "off"`，解析器也兼容未加引号被 YAML 1.1 解析为布尔 `false` 的 `sharing: off`；默认 `team`）。仅在 **Dalton Supabase 登录开启**（`DALTON_AUTH_MODE=supabase`）且 **环境变量 `DALTON_PM_USER_IDS` 已配置且非空**时生效；未设置 `DALTON_PM_USER_IDS`、设为空字符串 `""` 或关闭 Supabase 登录时一律等同 `"off"`（保持上游按 `user_id` 隔离的多租户行为）。
+- **单一凭据持有人**：启用 `team` 共享后，`src/dalton/credentials.py:credential_user_id(user_id)` 将所有团队成员的模型凭据读写透明解析到 **`DALTON_PM_USER_IDS` 的第一个用户 ID**（持有人）。任何成员连接模型 OAuth 或填写非空 BYOK API Key，均写入持有人名下并立即对全队生效；OAuth 活跃缓存、BYOK 缓存与 Redis OAuth 刷新锁（`oauth:refresh:{holder_id}:{provider}`）均按持有人 ID 计算。
+- **共享范围与隔离边界**：
+  - **共享（仅限模型凭据）**：`user_oauth_tokens`（模型 OAuth：Codex / Claude / Antigravity / Muse）、`user_api_keys`（BYOK 密钥、`base_url`）以及 `users.byok_enabled`（用户资料表中的 `has_api_key` / `has_oauth_token` 统一只看解析后的持有人）。
+  - **仍按本人隔离**：
+    1. **MCP 服务器、插件、Vault 密钥与出网授权（egress grants）**：在上游与交易授权级别（`trading_permissions`）、插件复合外键、egress grant 及各工作区 schema/配置版本号强绑定，共享会导致持有人交易权限越权扩散及跨用户目录/工作区状态冲突，因此保持按人隔离。
+    2. **用户资料与审计**：用户资料、偏好（`user_preferences`）、工作区、线程、记忆、日预算、`dalton_provider_events` 日志与 `dalton_llm_journal.user_id` 均记实际调用者（共享开启时 `usage.credential_user_id` 记录所借用的持有人 ID）。
+- **断开、清空与关闭权限**：所有白名单成员均可连接模型 OAuth、新增或更新为非空 BYOK API Key（可同时附带该 provider 的 `base_url`）、开启 `byok_enabled=true`；**仅 PM 用户（`DALTON_PM_USER_IDS`）可断开模型 OAuth、删除/置空 API Key（含传 `""` 或借 `base_url` 写空）、单独修改/清空已有密钥的 `base_url`（未同时提供非空新密钥）或将 `byok_enabled` 设为 `false`**，非 PM 成员调用返回 `403`（`"团队共用凭据只能由管理员断开"`），前端通过 React Query（`queryKeys.dalton.credentialsStatus`）按当前登录用户获取权限并对非 PM 成员隐藏断开按钮。

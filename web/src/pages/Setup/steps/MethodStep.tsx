@@ -18,6 +18,9 @@ import { isPlatformMode } from '@/config/hostMode';
 import { useAllModels } from '@/hooks/useAllModels';
 import { modelPrefs, splitPreferenceWrite } from '@/lib/modelPreferences';
 import type { PreferencePatch, PreferencesLike } from '@/lib/modelPreferences';
+// DALTON-HOOK(team-credentials): team-shared credentials hint & PM disconnect guard
+import { isDaltonAuth } from '@/config/daltonAuth';
+import { TEAM_SHARED_CREDENTIALS_HINT, useTeamCredentials } from '@/hooks/useTeamCredentials'; // DALTON-HOOK(team-credentials)
 
 // ---------------------------------------------------------------------------
 // Method card data
@@ -72,10 +75,12 @@ function ConfiguredBanner({
   providers,
   onSkip,
   onRemove,
+  canDisconnect = true, // DALTON-HOOK(team-credentials): PM-only disconnect/remove guard
 }: {
   providers: ConfiguredProvider[];
   onSkip: () => void;
   onRemove: (provider: ConfiguredProvider) => void;
+  canDisconnect?: boolean;
 }) {
   const { t } = useTranslation();
   const [expanded, setExpanded] = useState(false);
@@ -141,14 +146,17 @@ function ConfiguredBanner({
                     : t('setup.apiKeyBadge')}
                 </span>
               </div>
-              <button
-                type="button"
-                onClick={() => onRemove(p)}
-                className="text-xs shrink-0 px-2 py-1 rounded transition-colors hover:opacity-80"
-                style={{ color: 'var(--color-loss)' }}
-              >
-                {p.access_type === 'oauth' ? t('setup.disconnectProvider') : t('setup.removeProvider')}
-              </button>
+              {/* DALTON-HOOK(team-credentials): hide remove/disconnect button for non-PM team members */}
+              {canDisconnect && (
+                <button
+                  type="button"
+                  onClick={() => onRemove(p)}
+                  className="text-xs shrink-0 px-2 py-1 rounded transition-colors hover:opacity-80"
+                  style={{ color: 'var(--color-loss)' }}
+                >
+                  {p.access_type === 'oauth' ? t('setup.disconnectProvider') : t('setup.removeProvider')}
+                </button>
+              )}
             </div>
           ))}
         </div>
@@ -166,6 +174,9 @@ export default function MethodStep() {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   const { providers: configuredProviders, hasAny: hasConfigured } = useConfiguredProviders();
+  // DALTON-HOOK(team-credentials): team-shared credentials status
+  const { isShared: isTeamShared, canDisconnect } = useTeamCredentials();
+  const allowDisconnect = !isDaltonAuth || canDisconnect;
   const { user, isLoading: userLoading } = useUser();
   const [localRedeemed, setLocalRedeemed] = useState(false);
   const hasPlatformAccess = (user?.access_tier ?? -1) >= 0 || localRedeemed;
@@ -320,12 +331,19 @@ export default function MethodStep() {
 
   return (
     <div className="flex flex-col gap-4 sm:gap-6">
+      {/* DALTON-HOOK(team-credentials): team-shared credentials hint */}
+      {isDaltonAuth && isTeamShared && (
+        <p className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
+          {TEAM_SHARED_CREDENTIALS_HINT}
+        </p>
+      )}
       {/* Configured providers banner (visible when looping back) */}
       {hasConfigured && (
         <ConfiguredBanner
           providers={configuredProviders}
           onSkip={handleSkipToDefaults}
           onRemove={handleRemoveProvider}
+          canDisconnect={allowDisconnect}
         />
       )}
 

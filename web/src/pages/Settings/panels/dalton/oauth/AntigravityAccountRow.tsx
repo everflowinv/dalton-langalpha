@@ -17,8 +17,10 @@ import {
 
 export function AntigravityAccountRow({
   onError,
+  canDisconnect = true,
 }: {
   onError?: (msg: string | null) => void;
+  canDisconnect?: boolean;
 }) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
@@ -182,17 +184,20 @@ export function AntigravityAccountRow({
             </div>
           </div>
           <div className="shrink-0">
+            {/* DALTON-HOOK(team-credentials): hide disconnect button for non-PM team members */}
             {status.connected ? (
-              <button
-                type="button"
-                onClick={handleDisconnect}
-                disabled={isDisconnecting}
-                className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium transition-colors"
-                style={{ color: 'var(--color-loss)', backgroundColor: 'transparent', border: '1px solid var(--color-loss)' }}
-              >
-                <Unlink className="h-3 w-3" />
-                {isDisconnecting ? t('common.loading', 'Loading...') : t('settings.disconnect', 'Disconnect')}
-              </button>
+              canDisconnect ? (
+                <button
+                  type="button"
+                  onClick={handleDisconnect}
+                  disabled={isDisconnecting}
+                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium transition-colors"
+                  style={{ color: 'var(--color-loss)', backgroundColor: 'transparent', border: '1px solid var(--color-loss)' }}
+                >
+                  <Unlink className="h-3 w-3" />
+                  {isDisconnecting ? t('common.loading', 'Loading...') : t('settings.disconnect', 'Disconnect')}
+                </button>
+              ) : null
             ) : !isPolling ? (
               <button
                 type="button"

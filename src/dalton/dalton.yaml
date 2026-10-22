@@ -2,6 +2,9 @@
 enabled: true
 timezone: "Asia/Shanghai"
 
+credentials:
+  sharing: team
+
 models:
   broker:
     enabled: true            # OpenClaw broker v2 parallel path; false hides ocb-* from catalog

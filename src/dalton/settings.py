@@ -11,10 +11,10 @@ import os
 import uuid
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from src.config.env import HOST_IP, LOCAL_DEV_USER_ID
 from src.config.settings import HOST_MODE
@@ -139,12 +139,35 @@ class DaltonConversationsConfig(BaseModel):
     agents: list[str] = Field(default_factory=lambda: ["main", "chem", "marco"])
 
 
+class DaltonCredentialsConfig(BaseModel):
+    """Team credential sharing configuration (`credentials.sharing: team | "off"`)."""
+
+    sharing: Literal["team", "off"] = "team"
+
+    @field_validator("sharing", mode="before")
+    @classmethod
+    def _normalize_sharing(cls, v: Any) -> Any:
+        if v is False:
+            return "off"
+        if v is True:
+            return "team"
+        if isinstance(v, str):
+            lowered = v.strip().lower()
+            if lowered in ("off", "false"):
+                return "off"
+            if lowered in ("team", "true", "on"):
+                return "team"
+        return v
+
+
 class DaltonConfig(BaseModel):
     """Root Dalton behavioral configuration loaded from ``src/dalton/dalton.yaml``."""
 
     enabled: bool = True
     pm_user_ids: list[str] = Field(default_factory=lambda: [LOCAL_DEV_USER_ID])
+    configured_pm_user_ids: list[str] = Field(default_factory=list)
     timezone: str = "Asia/Shanghai"
+    credentials: DaltonCredentialsConfig = Field(default_factory=DaltonCredentialsConfig)
     models: DaltonModelsConfig = Field(default_factory=DaltonModelsConfig)
     budget: DaltonBudgetDefaults = Field(default_factory=DaltonBudgetDefaults)
     knowledge: DaltonKnowledgeConfig = Field(default_factory=DaltonKnowledgeConfig)
@@ -169,6 +192,11 @@ def get_pm_user_ids_source() -> str:
     return "env" if _parse_env_pm_user_ids() is not None else "default"
 
 
+def get_configured_pm_user_ids() -> list[str]:
+    """Return explicitly configured PM user IDs from ``DALTON_PM_USER_IDS`` (empty when unset or blank)."""
+    return list(get_dalton_config().configured_pm_user_ids)
+
+
 @lru_cache(maxsize=1)
 def _load_base_dalton_config() -> DaltonConfig:
     """Load and cache ``src/dalton/dalton.yaml``."""
@@ -183,7 +211,9 @@ def get_dalton_config() -> DaltonConfig:
     base = _load_base_dalton_config()
     env_pm = _parse_env_pm_user_ids()
     if env_pm is not None:
-        return base.model_copy(update={"pm_user_ids": env_pm})
+        return base.model_copy(
+            update={"pm_user_ids": env_pm, "configured_pm_user_ids": env_pm}
+        )
     return base
 
 

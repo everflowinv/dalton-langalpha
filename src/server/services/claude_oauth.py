@@ -219,7 +219,9 @@ async def get_valid_token(user_id: str) -> dict | None:
     Uses Redis SETNX lock to prevent concurrent refresh.
     Returns None if user hasn't connected.
     """
-    tokens = await get_oauth_tokens(user_id, CLAUDE_PROVIDER)
+    from src.dalton.credentials import credential_user_id  # DALTON-HOOK(team-credentials): key refresh lock & tokens by team credential holder
+    cred_user_id = credential_user_id(user_id)
+    tokens = await get_oauth_tokens(cred_user_id, CLAUDE_PROVIDER)
     if not tokens:
         return None
 
@@ -233,14 +235,14 @@ async def get_valid_token(user_id: str) -> dict | None:
     from src.utils.cache.redis_cache import get_cache_client
 
     cache = get_cache_client()
-    lock_key = f"oauth:refresh:{user_id}:{CLAUDE_PROVIDER}"
+    lock_key = f"oauth:refresh:{cred_user_id}:{CLAUDE_PROVIDER}"  # DALTON-HOOK(team-credentials)
     # Released only by its owner, so a refresh that outlives the lock cannot
     # free the next holder's. None (Redis unavailable) refreshes uncoordinated.
     lock_token = secrets.token_hex(16)
     acquired = await cache.acquire_lock(lock_key, lock_token, REFRESH_LOCK_TTL_MS)
     if acquired is False:
         # Another request is refreshing: use what it stores.
-        tokens = await await_refreshed_tokens(user_id, CLAUDE_PROVIDER)
+        tokens = await await_refreshed_tokens(cred_user_id, CLAUDE_PROVIDER)  # DALTON-HOOK(team-credentials)
         if tokens:
             return {"access_token": tokens["access_token"], "plan_type": tokens.get("plan_type")}
         return None
@@ -262,7 +264,7 @@ async def get_valid_token(user_id: str) -> dict | None:
         )
 
         try:
-            await invalidate_oauth_active_cache(user_id)
+            await invalidate_oauth_active_cache(cred_user_id)  # DALTON-HOOK(team-credentials)
         except Exception:
             pass
 

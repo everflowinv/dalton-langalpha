@@ -243,6 +243,33 @@ async def list_team_workspaces_endpoint(
     return {"members": members}
 
 
+@router.get("/credentials/status")
+@handle_api_exceptions("get team credentials status", logger)
+async def get_team_credentials_status_endpoint(
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    """Return team credential sharing status and caller disconnect permission (`DALTON-HOOK(team-credentials)`)."""
+    from src.dalton.credentials import (
+        credential_user_id,
+        get_team_credential_holder_id,
+        is_credential_admin,
+        is_team_credential_sharing_enabled,
+    )
+    from src.dalton.settings import get_dalton_config
+
+    cfg = get_dalton_config()
+    enabled = is_team_credential_sharing_enabled()
+    can_disconnect = is_credential_admin(user_id)
+    return {
+        "sharing": cfg.credentials.sharing,
+        "enabled": enabled,
+        "holder_user_id": get_team_credential_holder_id(),
+        "credential_user_id": credential_user_id(user_id),
+        "is_pm": can_disconnect,
+        "can_disconnect": can_disconnect,
+    }
+
+
 @router.get("/knowledge/{workspace_id}/{doc}/versions")
 @handle_api_exceptions("list knowledge versions", logger)
 async def list_knowledge_versions_endpoint(
