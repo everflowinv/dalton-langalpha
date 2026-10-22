@@ -71,6 +71,7 @@ ALLOWED_HOOKS=(
   "data-map"
   "stock-move-upgrade"
   "extended-hours-quotes"
+  "market-regime"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

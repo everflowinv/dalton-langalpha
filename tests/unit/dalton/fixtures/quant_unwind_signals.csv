@@ -1,0 +1,7 @@
+date,gross_leverage_score,neutral_crowding_score,crowding_score,long_unwind_pressure_score,short_squeeze_pressure_score,unwind_pressure_score,unwind_risk_score,unwind_direction,unwind_progress_score,regime,gross_watch_flag,long_unwind_trigger_flag,short_squeeze_trigger_flag,unwind_trigger_flag,multi_leg_unwind_confirmation,unwind_active_flag,flow_leg_count,financing_balance_cny100m,financing_balance_to_float_mktcap_pct,neutral_relative_basis_pct,extra_ignored_col
+2026-10-14,68.2,44.1,58.6,41.0,32.5,41.0,45.2,long_unwind_bias,35.0,normal_or_Expanding,1,0,0,0,0,0,1,26510.2,2.41,-0.32,foo1
+2026-10-15,67.5,43.8,58.0,43.2,31.0,43.2,46.8,long_unwind_bias,38.1,normal_or_Expanding,1,0,0,0,0,0,1,26480.5,2.40,-0.35,foo2
+2026-10-16,66.9,42.5,57.2,45.6,30.2,45.6,48.1,long_unwind_bias,40.4,normal_or_Expanding,1,0,0,0,0,0,1,26450.1,2.39,-0.38,foo3
+2026-10-19,66.1,41.9,56.5,49.8,29.5,49.8,50.5,long_unwind_bias,44.2,normal_or_Expanding,1,0,0,0,0,0,1,26420.8,2.38,-0.41,foo4
+2026-10-20,65.8,41.2,56.0,51.2,29.1,51.2,51.8,balanced,46.0,normal_or_Expanding,1,0,0,0,0,0,1,26410.0,2.38,-0.40,foo5
+2026-10-21,65.4,40.8,55.6,52.14,28.9,52.14,52.4,balanced,47.5,normal_or_Expanding,1,0,0,0,0,0,1,26397.8,2.37,-0.39,foo6

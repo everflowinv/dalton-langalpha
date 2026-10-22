@@ -57,6 +57,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
    - 只对阶段 1 命中的 Watch 公司派 `dalton-evidence` 子智能体（超出 64 槽位上限的余下命中公司写进“口径与缺口”，下次优先）；
    - 按 `.agents/skills/dalton-weekly-review/references/watch-rules.md` 检索并写 `dalton/research/weekly-<end>/watch-<TICKER>.md`。
 4. **阶段 4：汇总与 Conviction Call（`汇总与 call`）**：
+   - **周报开头先写“市场状态”小段**：调用 `macro(route="market-regime", operation="snapshot")` 以及 `macro(route="market-regime", operation="crowding", top=5, order="high")`、`macro(route="market-regime", operation="crowding", top=5, order="low")`，在周会稿开头增加“市场状态”一小段，概述美股顶部/底部阶段与提醒、动量、A 股/港股/亚洲读数以及指数拥挤度最高/最低的前 5 个板块（标明 `as_of` 数据日期；若 `stale=true` 则注明）；
    - 对 Core 中标记 `call_candidate: true` 的公司（最多 3 家）按 `.agents/skills/dalton-call/SKILL.md` 做证据门槛与三情景 IRR 核对，输出 `call-<TICKER>.md`（不过门槛即输出“暂无高 conviction”及缺口）；
    - 按 `.agents/skills/dalton-weekly-review/templates/weekly.md` 汇总全部材料、各公司本周 `verdicts.md` 与 `proposals/`，生成周会稿 `dalton/drafts/<end>-weekly.md`。
 

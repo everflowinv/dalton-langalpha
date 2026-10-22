@@ -34,6 +34,7 @@
 | `sec` (`researchdata` 或 `dalton_sec`) | `sec:{accession}` | `filing` | `"SEC EDGAR"` | `filing_date` (`filed`) |
 | `estimates` (`consensus`) | `estimates:yahoo:{ticker}:{fetched_at}` | `street_estimate` | `"Yahoo Finance via yfinance"` | `fetched_at` |
 | `fred` / `treasury` | `fred:{series}` / `treasury:{dataset}` | `official_data` | `"FRED"` / `"US Treasury"` | `observation_date` |
+| `market-regime` (`snapshot` / `us_topbottom` / `crowding` / `cn_leverage`) | `regime:<op>:<date>` | `derived`（OpenClaw 监控二手读数） | `"OpenClaw"` | 数据日期（`date` / `trade_date` / `as_of`） |
 | `cn-hk` (`filings`) | `cn-hk:{ticker}:{date}:{index}` | `filing` | `"cninfo"`（巨潮资讯；港股未覆盖时补 HKEXnews 原文链接） | 公告日期 (`date`) |
 | `cn-hk` (`ask`) | 无独立归档 ID（平台聚合表） | 二手初值线索（非 `filing`，核心财务数须回公告核实） | 底层平台（AkShare / 东财 / 同花顺 / 新浪等，见 `plan.source`） | 报告期 / 查询日（无历史 as-of 保证） |
 
@@ -124,3 +125,16 @@
    - **A+H 双重上市股本对齐**：对 A+H 两地上市公司，总市值与稀释总股本必须覆盖全部已发行股份（A 股 + H 股总和，并参考 `operation="ask", query="AH溢价"` 核对两地价差），与合并财务报表口径保持一致。
 4. **无历史 Point-in-Time（`as-of`）保证**：
    - `cn-hk` 的日期窗口仅过滤交易日或报告期，不代表历史某时点可见的未重述版本；涉及历史回测或跨期对比时需结合法定公告发布日期（`filed` / `date`）核实。
+
+---
+
+## 12. 市场状态与仓位拥挤度（`market-regime`）口径纪律
+
+调用 `researchdata.macro(route="market-regime", operation="snapshot"|"us_topbottom"|"crowding"|"cn_leverage")` 引用市场状态、美股顶部/底部框架、指数拥挤度与 A 股杠杆监控时，必须严格遵守以下三条规则：
+
+1. **二手读数必须标注数据日期（`as_of` / `date` / `trade_date`）**：
+   - `market-regime` 是 OpenClaw 每日生成的监控二手读数（`document_id` 为 `regime:<op>:<date>`，`identity="derived"`，`publisher="OpenClaw"`），引用任何读数时必须显式标注对应的数据日期（如 `signals.json` 的 `date`、`as_of` 各分项日期、拥挤度的 `trade_date` 或去杠杆信号的 `date`）；当返回 `stale=true` 时，必须在正文中注明数据滞后及 `warnings`。
+2. **顶部和底部的“阶段（`stage`）”是框架状态，不是预测**：
+   - `us_topbottom`（`top_framework` / `bottom_framework`）中的 `stage`（如“无信号”、“预警”等）与 `summary` 仅代表监控框架当前所处的条件状态，绝不是对未来走势的概率预测，**严禁将其写成或解读为“上涨概率”或“下跌概率”**。
+3. **拥挤度 `probability_pct` 属于源站统计，必须原样标注来源**：
+   - `crowding` 返回的 `probability_direction`、`probability_pct` 与 `probability_horizon_days` 是源站（LeguLegu 乐估乐股历史分位回测）给出的历史统计值，引用时必须原样标注来源与统计口径，不得包装成我们自己的模型预测。

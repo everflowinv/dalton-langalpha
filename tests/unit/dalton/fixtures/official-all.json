@@ -1,0 +1,137 @@
+{
+  "ok": true,
+  "generated_at": "2026-10-22T11:30:02Z",
+  "source": "legulegu-index-crowding-official",
+  "source_url": "https://legulegu.com/stockdata/index-crowding",
+  "static_html_url": "https://legulegu.com/s/index-crowding",
+  "trade_date": "2026-10-21",
+  "index_count": 6,
+  "methodology": {
+    "window": "1y"
+  },
+  "rows": [
+    {
+      "index_code": "000905.SH",
+      "index_name": "中证500",
+      "category_code": "broad",
+      "category": "宽基指数",
+      "crowding_percentile": 12.5,
+      "crowding_level_code": "low",
+      "crowding_level": "低拥挤",
+      "probability_direction": "上涨",
+      "probability_pct": 68.0,
+      "probability_horizon_days": 20,
+      "historical_avg_return_pct": 3.4,
+      "daily_change_pct": -0.62,
+      "trade_date": "2026-10-21",
+      "detail_url": "https://legulegu.com/stockdata/index-crowding-detail?code=000905.SH",
+      "rank_low_to_high": 2,
+      "history_1y": [
+        {"date": "2026-10-20", "crowding": 13.1},
+        {"date": "2026-10-21", "crowding": 12.5}
+      ]
+    },
+    {
+      "index_code": "399303.SZ",
+      "index_name": "国证2000",
+      "category_code": "broad",
+      "category": "宽基指数",
+      "crowding_percentile": 2.8,
+      "crowding_level_code": "extremely_low",
+      "crowding_level": "极低拥挤",
+      "probability_direction": "上涨",
+      "probability_pct": 78.5,
+      "probability_horizon_days": 20,
+      "historical_avg_return_pct": 5.1,
+      "daily_change_pct": -1.15,
+      "trade_date": "2026-10-21",
+      "detail_url": "https://legulegu.com/stockdata/index-crowding-detail?code=399303.SZ",
+      "rank_low_to_high": 1,
+      "history_1y": [
+        {"date": "2026-10-20", "crowding": 3.2},
+        {"date": "2026-10-21", "crowding": 2.8}
+      ]
+    },
+    {
+      "index_code": "931071.CSI",
+      "index_name": "人工智能",
+      "category_code": "theme",
+      "category": "主题指数",
+      "crowding_percentile": 94.2,
+      "crowding_level_code": "extremely_high",
+      "crowding_level": "极高拥挤",
+      "probability_direction": "下跌",
+      "probability_pct": 64.0,
+      "probability_horizon_days": 20,
+      "historical_avg_return_pct": -2.8,
+      "daily_change_pct": 1.85,
+      "trade_date": "2026-10-21",
+      "detail_url": "https://legulegu.com/stockdata/index-crowding-detail?code=931071.CSI",
+      "rank_low_to_high": 6,
+      "history_1y": [
+        {"date": "2026-10-20", "crowding": 92.0},
+        {"date": "2026-10-21", "crowding": 94.2}
+      ]
+    },
+    {
+      "index_code": "H30184.CSI",
+      "index_name": "中证半导体",
+      "category_code": "sector",
+      "category": "行业指数",
+      "crowding_percentile": 88.6,
+      "crowding_level_code": "high",
+      "crowding_level": "高拥挤",
+      "probability_direction": "下跌",
+      "probability_pct": 61.2,
+      "probability_horizon_days": 20,
+      "historical_avg_return_pct": -1.9,
+      "daily_change_pct": 1.12,
+      "trade_date": "2026-10-21",
+      "detail_url": "https://legulegu.com/stockdata/index-crowding-detail?code=H30184.CSI",
+      "rank_low_to_high": 5,
+      "history_1y": [
+        {"date": "2026-10-21", "crowding": 88.6}
+      ]
+    },
+    {
+      "index_code": "000300.SH",
+      "index_name": "沪深300",
+      "category_code": "broad",
+      "category": "宽基指数",
+      "crowding_percentile": 45.0,
+      "crowding_level_code": "normal",
+      "crowding_level": "正常",
+      "probability_direction": "上涨",
+      "probability_pct": 53.0,
+      "probability_horizon_days": 20,
+      "historical_avg_return_pct": 0.8,
+      "daily_change_pct": 0.15,
+      "trade_date": "2026-10-21",
+      "detail_url": "https://legulegu.com/stockdata/index-crowding-detail?code=000300.SH",
+      "rank_low_to_high": 3,
+      "history_1y": [
+        {"date": "2026-10-21", "crowding": 45.0}
+      ]
+    },
+    {
+      "index_code": "399975.SZ",
+      "index_name": "证券公司",
+      "category_code": "sector",
+      "category": "行业指数",
+      "crowding_percentile": 72.4,
+      "crowding_level_code": "high",
+      "crowding_level": "偏高拥挤",
+      "probability_direction": "下跌",
+      "probability_pct": 56.5,
+      "probability_horizon_days": 20,
+      "historical_avg_return_pct": -0.9,
+      "daily_change_pct": 0.44,
+      "trade_date": "2026-10-21",
+      "detail_url": "https://legulegu.com/stockdata/index-crowding-detail?code=399975.SZ",
+      "rank_low_to_high": 4,
+      "history_1y": [
+        {"date": "2026-10-21", "crowding": 72.4}
+      ]
+    }
+  ]
+}
