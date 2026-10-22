@@ -4,12 +4,16 @@
 # Applied over agent_config.yaml when APP_ENV=dalton.
 
 llm:
-  name: "claude-opus-5-5-oauth"
+  # Defaults for anyone without a saved model preference (the team accounts hold no personal
+  # OAuth/BYOK credentials), so they go through the shared OpenClaw broker (ocb-*), which any
+  # signed-in user may use. Personal-OAuth models (*-oauth) stay available to whoever connected them.
+  name: "ocb-openai-gpt-6-astra"
   background: "deepseek-flash"
-  assist: "gemini-3.8-flash-low-oauth"
+  assist: "ocb-google-gemini-3.8-flash"
   compaction: ""
   fetch: ""
-  fallback: []
+  fallback:
+    - "ocb-google-gemini-4-argon"
 
 sandbox:
   provider: "docker"

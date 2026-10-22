@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from unittest.mock import create_autospec
 
 import httpx
@@ -119,7 +120,7 @@ class TestBrokerSignatureCompatibility:
         assert exc_info.value.code == "INVALID_REQUEST"
 
     def test_http_timeout_derived_from_queue_plus_broker_timeout_plus_margin(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         assert DEFAULT_QUEUE_TIMEOUT_SECONDS == 30.0
         assert HTTP_TIMEOUT_MARGIN_SECONDS == 15.0
@@ -127,6 +128,13 @@ class TestBrokerSignatureCompatibility:
         assert DEFAULT_HTTP_TIMEOUT_SECONDS == 105.0
         assert compute_http_timeout_seconds(45_000, queue_timeout_seconds=30.0) == 90.0
 
+        # Isolate from the operator's ~/.config/dalton/web-search-bridge.env, which the
+        # config would otherwise load into os.environ (e.g. a raised queue timeout).
+        empty_env = tmp_path / "bridge.env"
+        empty_env.write_text("")
+        monkeypatch.setenv("DALTON_WEB_SEARCH_BRIDGE_ENV_FILE", str(empty_env))
+        for var in ("DALTON_WEB_SEARCH_BRIDGE_QUEUE_TIMEOUT_S", "DALTON_WEB_SEARCH_BRIDGE_MAX_INFLIGHT"):
+            monkeypatch.delenv(var, raising=False)
         monkeypatch.setenv("DALTON_WEB_SEARCH_BRIDGE_TOKEN", "fake-bridge-token")
         cfg = WebSearchBridgeConfig()
         assert cfg.http_timeout_s == DEFAULT_HTTP_TIMEOUT_SECONDS
