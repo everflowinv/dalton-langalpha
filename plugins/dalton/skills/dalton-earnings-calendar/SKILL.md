@@ -14,7 +14,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 
 每周六 09:00（Asia/Shanghai，即美东周五收盘后）或按需对 `Home/dalton/coverage.yaml` 覆盖名单逐家核查下一次财报的**公司官方**披露日期，维护 `pending / confirmed / reported` 三态台账（`Home/dalton/earnings-calendar.json`）。
 
-- **只认公司官方来源**：仅公司 IR 新闻稿、IR Events 页面、SEC 8-K/6-K 明确披露未来发布日期时，才标为 `confirmed`（`date_status: confirmed`）并创建财报链自动任务。
+- **只认公司官方来源**：仅公司 IR 新闻稿、IR Events 页面、美股 SEC 8-K/6-K 或港股/A 股交易所法定排期公告（通过 `researchdata.finance(route="cn-hk", operation="filings", ...)` 或披露易 HKEXnews 原文核实的董事会会议召期通告、定期报告预约披露时间表）明确披露未来发布日期时，才标为 `confirmed`（`date_status: confirmed`）并创建财报链自动任务。
 - **聚合日历一律标“待确认”**：FMP、yfinance、Nasdaq、Zacks、Earnings Whispers、WSJ、MarketWatch、`get_earnings_calendar` 等给出的日期只记为 `pending`（附 `tentative_date`、`tentative_sources`），`date_status: estimated`，界面与总结显示“待确认”，**在官方公布前绝不建 `tm3/t0/tp1` 自动任务**（若 `tentative_date` 在 10 天内，只建一条 T-5 的 `once` 日期复查任务，仅复查日期不做研究）。详见 [`references/classification.md`](references/classification.md)。
 - **跨工作区建任务走 REST helper**：Home 的研究总监不跨工作区直接写自动任务文件，统一调用后端 REST helper `PUT /api/v1/dalton/automations/{name}` 创建或原地改期；分析师在本公司工作区补建时可直接写文件（常设授权）。
 - **无工作区不建链**：只为 `workspace.status=active` 的公司创建自动任务链；没有工作区的 Core 公司列入总结“缺工作区”，严禁在 Home 工作区跑出无知识层支撑的前瞻。
@@ -103,7 +103,7 @@ python3 .agents/skills/dalton-earnings-calendar/scripts/calendar_state.py --json
 1. **检索词与时间窗**：先算 `SEARCH_START_DATE = 今天 - 180 天`。每家公司执行两条检索：
    - `"{公司}" "to report" "{季度}" results`（限 180 天内）
    - `"{公司}" earnings date announcement`（限 180 天内）
-2. **官方源确认**：阅读公司 IR 页面（`coverage.yaml` 中的 `earnings.ir_url`）或 SEC 8-K/6-K 原文确认。判定标准严格执行 [`references/classification.md`](references/classification.md)。
+2. **官方源确认**：美股阅读公司 IR 页面（`coverage.yaml` 中的 `earnings.ir_url`）或 SEC 8-K/6-K 原文确认；港股与 A 股调用 `researchdata.finance(route="cn-hk", operation="filings", ticker=CODE_5_OR_6, start=SEARCH_START_DATE, end=TODAY, limit=20)`（港股传 5 位零填充纯数字如 `"00700"`，A 股传 6 位纯数字如 `"600519"`）检索巨潮资讯披露的董事会会议召期通告（Date of Board Meeting）或定期报告预约披露公告原文（港股若 `cn-hk filings` 未覆盖则用 `web_search` 查披露易 `site:hkexnews.hk` 原文链接确认）。判定标准严格执行 [`references/classification.md`](references/classification.md)。
 3. **逐家追加 JSONL**：每查完一家，立即用 `json.dumps` 追加一行到 `Home/dalton/research/earnings-scan-<YYYY-MM-DD>.jsonl`（禁止手写字符串拼接）。字段固定为：
    `ticker, name, status, earnings_date, timing, quarter_label, confidence, source_url, evidence, notes`
    - 工具报错或超时写 `"status": "scan_failed"`，**严禁写成 `"not_announced"`**。

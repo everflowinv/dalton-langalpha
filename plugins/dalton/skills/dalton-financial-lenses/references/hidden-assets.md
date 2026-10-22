@@ -22,6 +22,14 @@
 - 普通品牌价值、客户关系、自研软件等无独立变现市场的无形资产
 - 缺乏可靠独立估值依据的经营性资源
 
+### 港股与 A 股科目映射及取数核实（`route="cn-hk"`）
+1. **初值线索（`operation="ask"`）**：
+   - 调用 `researchdata.finance(route="cn-hk", operation="ask", query=f"{code_or_name} 港股资产负债表", limit=50)`（港股）或 `query=f"{code_or_name} 资产负债表"`（A 股），提取长期股权投资（`LONG_EQUITY_INVEST` / 于联营公司及合营企业之投资）、其他权益工具投资、其他非流动金融资产、按公允价值计入损益/其他全面收益之非流动金融资产、投资性房地产（`INVEST_REALESTATE`）等科目初值。
+2. **回法定公告附注核实（`operation="filings"` + 披露易退路，必做）**：
+   - 必须调用 `researchdata.finance(route="cn-hk", operation="filings", ticker=code_5_or_6, start=..., end=..., limit=20)` 查阅最新年报/中报附注（港股未覆盖时用 `web_search` 查 `site:hkexnews.hk` 原文链接），确认重要的被投上市联营公司名称、持股比例、账面价值及公允价值披露，并与第一把镜头已纳入净现金端的短期银行理财/货币基金严格去重。
+3. **跨市场被投股权估值与币种换算**：
+   - 当被投上市公司在 A 股或港股上市且账面值 ≥ 目标公司美元市值的 0.5% 时，可通过 `researchdata.finance(route="cn-hk", operation="ask", query=f"{被投公司代码或简称} 行情", limit=5)` 或 `yfinance` 获取最新市值（注意核对复权与总股本口径），按被投公司交易币种汇率折算为美元后乘以持股比例作为折前估值（`gross_estimated_value_usd`），再按 §3.2 标准折扣率打折。
+
 ---
 
 ## 2. 与净现金（第一把镜头）去重硬规则

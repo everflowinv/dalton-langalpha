@@ -85,7 +85,7 @@ def detect_market(ticker: str) -> str:
     t = ticker.strip().upper()
     if t.endswith(".HK"):
         return "HK"
-    if t.endswith((".SS", ".SZ", ".SH", ".BJ")):
+    if t.endswith((".SS", ".SZ", ".SH", ".BJ")) or re.fullmatch(r"(SH|SZ|BJ)\d{6}", t):
         return "CN"
     if t.endswith(".T"):
         return "JP"
@@ -97,7 +97,7 @@ def detect_market(ticker: str) -> str:
         return "TW"
     if t.endswith(".L"):
         return "UK"
-    if re.fullmatch(r"\d{1,5}", t):
+    if re.fullmatch(r"\d{1,6}", t):
         return "HK" if len(t) <= 5 else "CN"
     return "US"
 
@@ -111,6 +111,27 @@ def normalize_hk_ticker(ticker: str) -> str:
     if re.fullmatch(r"\d{1,5}", t):
         digits = t.lstrip("0") or "0"
         return f"{digits.zfill(4)}.HK"
+    return t
+
+
+def normalize_cn_ticker(ticker: str) -> str:
+    t = ticker.strip().upper()
+    m_pref = re.fullmatch(r"(SH|SZ|BJ)(\d{6})", t)
+    if m_pref:
+        pref, digits = m_pref.group(1), m_pref.group(2)
+        suffix = ".SS" if pref == "SH" else (".SZ" if pref == "SZ" else ".BJ")
+        return f"{digits}{suffix}"
+    if t.endswith(".SH"):
+        return f"{t[:-3]}.SS"
+    if t.endswith((".SS", ".SZ", ".BJ")):
+        return t
+    if re.fullmatch(r"\d{6}", t):
+        if t.startswith(("920", "4", "8")):
+            return f"{t}.BJ"
+        if t.startswith(("900", "5", "6", "9")):
+            return f"{t}.SS"
+        if t.startswith(("0", "1", "2", "3")):
+            return f"{t}.SZ"
     return t
 
 
@@ -208,7 +229,12 @@ def build_anchors(
 
     explicit_fin_ccy = financial_currency or reporting_currency
     market = detect_market(ticker)
-    normalized_ticker = normalize_hk_ticker(ticker) if market == "HK" else ticker.strip().upper()
+    if market == "HK":
+        normalized_ticker = normalize_hk_ticker(ticker)
+    elif market == "CN":
+        normalized_ticker = normalize_cn_ticker(ticker)
+    else:
+        normalized_ticker = ticker.strip().upper()
     default_ccy = MARKET_DEFAULT_CURRENCY.get(market, "USD")
 
     if not allow_network:

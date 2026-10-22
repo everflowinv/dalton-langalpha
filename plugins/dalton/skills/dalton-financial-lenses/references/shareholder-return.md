@@ -28,6 +28,13 @@
   - 现金流量表：`PaymentsForRepurchaseOfCommonStock`（回购现金支出）、`PaymentsOfDividends` 或 `PaymentsOfDividendsCommonStock`（分红现金支出）、`ShareBasedCompensation`（SBC 费用）；
   - 股本变化：资产负债表封面股数、股东权益变动表（发行新股、员工计划行权/RSU 归属、回购注销/库存股变动）；
   - 正文检索：10-K/10-Q 中检索 `"share repurchase"`、`"repurchase program"`、`"dividend"` 核查剩余授权额度与最新一季执行节奏。同一份 filing 内交叉核对单位。
+- **港股与 A 股一手取数线索（`route="cn-hk"`）**：
+  - **初值提取（`operation="ask"`，二手线索）**：按单一意图分别调用 `researchdata.finance(route="cn-hk", operation="ask", query=f"{code_or_name} 分红", limit=50)` 与 `researchdata.finance(route="cn-hk", operation="ask", query=f"{code_or_name} 回购", limit=50)` 获取分红送转汇总（`fhps` / `fhps_detail`）与股份回购记录（`repurchase`），并结合现金流量表（`query=f"{code_or_name} 现金流"` / `"{code_or_name} 港股现金流"`）中的“分配股利、利润或偿付利息支付的现金”与“回购股份支付的现金 / 支付其他与筹资活动有关的现金”提取初值。
+  - **回法定公告原文核实（`operation="filings"` + 披露易退路，必做）**：平台汇总表属二手初值，必须调用 `researchdata.finance(route="cn-hk", operation="filings", ticker=code_5_or_6, start=..., end=..., limit=20)` 调取巨潮资讯（cninfo）的年报/中报附注（股本变动表、股息附注、股份支付 SBC 附注）、权益分派实施公告及回购进展/实施结果公告核实；港股若 `cn-hk filings` 未覆盖某份业绩公告或“翌日披露报表（Next Day Disclosure Return）”，必须用 `web_search` 查港交所披露易（`site:hkexnews.hk`）核对原文链接。
+  - **A/H 回购、分红、币种与复权细则**：
+    1. **实际执行 vs 方案授权**：A 股回购方案公告中的“拟回购资金总额上下限”属于授权额度，严禁计入已实现回报；只计回购进展/实施结果公告或现金流量表确认的**实际已支付回购总金额**。港股以财报附注或披露易“翌日披露报表”中实际在场内买回的累计金额为准。
+    2. **回购用途与真实回报比例**：A 股公司回购常用于“员工持股计划或股权激励”（存放于回购专用证券账户未注销），该部分必须归入 `dilution_offset`，仅明确用于“注销并减少注册资本”的部分计入 `true_return`；港股场内回购通常注销（或在新规下转入库存股），须核对期初期末已发行股份总数及员工购股权/奖励股份（RSU）新发股数以计算 `true_return_share`。
+    3. **币种折算与除权核对**：港股公司常以 `HKD` 宣派每股股息或披露场内回购金额，而财报以 `CNY` 列报。以 `HKD` 计价的回购/派息总额须按 `anchors.json` 的 `listing_fx.rate`（`HKD -> USD`）换算为美元，以 `CNY` 列报的现金流/附注总额按 `fx.rate`（`CNY -> USD`）换算为美元，统一除以 `anchors.py` 锁定的当前美元市值基准；同时核查区间内送转股、拆股/合股除权，避免股数基数失真。
 
 ---
 

@@ -49,7 +49,7 @@ python3 .agents/skills/dalton-thesis-delta/scripts/collect.py collect \
 2. 读取 `research/tracker/<run_id>/packet.md` 及关联的新文档摘段/原文：
    - 内部库新文档（`sales-notes`、`tmtb`、`funda-ai`、`company-wiki`）：先读摘段，必要时通过 PTC `researchdata.research(..., operation="read", document=...)` 读全文；
    - AlphaEngine 新研报：先看摘要，挑带新数字（盈利预测修正、capex/费用、目标价/评级变化、核心 KPI 调查）的研报调 `get_document` 读全文（每轮最多 3 篇；遇配额或未登录即停并记录状态）；
-   - SEC 新公告：若当日 `dalton-filing-review` 或 `dalton-earnings-flash` 已经在 `verdicts.md` 写过同一份公告的结论，直接引用，不重复拆解；否则读取对应 Item 或附件。
+   - SEC / 港股与 A 股新公告：若当日 `dalton-filing-review` 或 `dalton-earnings-flash` 已经在 `verdicts.md` 写过同一份公告的结论，直接引用，不重复拆解；否则美股读取对应 SEC Item 或附件，港股与 A 股调用 `researchdata.finance(route="cn-hk", operation="filings", ticker=CODE_5_OR_6, start=..., end=..., limit=20)` 读取巨潮法定公告原文（港股未覆盖时用 `web_search` 查披露易 `site:hkexnews.hk` 原文链接），并可调用 `researchdata.finance(route="cn-hk", operation="ask", query=..., limit=20)` 辅助核查资金流、两融、回购或股东变动（平台财务表仅作初值，核心数字回公告核实）。
 3. 严格按 `.agents/skills/dalton-thesis-delta/references/materiality.md` 的十条标准判定本轮是否为**重要变化（`material=yes`）**：
    - **重要（任一命中即 `material=yes`）**：
      1. 自动提示命中下一财年 EPS、下一财年/下一季收入或目标价均值变化阈值，且经核查非单纯口径噪音；
