@@ -21,6 +21,7 @@ from src.utils.market_hours import interval_seconds
 
 # DALTON-HOOK(yfinance-prev-close)
 from .yahoo import regular_previous_close, yahoo_symbol, yahoo_ticker
+from src.dalton.extended_hours import enrich_yfinance_snapshot_extended_hours  # DALTON-HOOK(extended-hours-quotes)
 
 logger = logging.getLogger(__name__)
 
@@ -210,7 +211,7 @@ def _fetch_single_snapshot(sym: str) -> dict[str, Any] | None:
         high = _finite(fi.get("dayHigh"))
         low = _finite(fi.get("dayLow"))
         volume = _finite(fi.get("lastVolume"))
-        return {
+        snap = {
             "symbol": sym,
             "name": None,
             "price": round(price, 4),
@@ -229,6 +230,7 @@ def _fetch_single_snapshot(sym: str) -> dict[str, Any] | None:
             "as_of": _print_time_ms(ticker),
             "regular_only": True,
         }
+        return enrich_yfinance_snapshot_extended_hours(snap, sym, ticker)  # DALTON-HOOK(extended-hours-quotes)
     except Exception:
         logger.warning("yfinance.snapshot.failed | symbol=%s", sym, exc_info=True)
         return None

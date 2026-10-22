@@ -70,6 +70,7 @@ ALLOWED_HOOKS=(
   "yfinance-prev-close"
   "data-map"
   "stock-move-upgrade"
+  "extended-hours-quotes"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

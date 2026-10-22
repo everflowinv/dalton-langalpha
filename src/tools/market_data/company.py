@@ -447,7 +447,8 @@ def _quote_detail_rows(
 def _snapshot_price_lines(snap: Dict[str, Any], status: str, cur: DisplaySpec) -> List[str]:
     """Regular close, the extended-hours print off it, and the day's move."""
     out = []
-    reg_close = snap.get("price")  # session.close = regular session close
+    # DALTON-HOOK(extended-hours-quotes): Compare against regular_close and require late_trading_change when closed.
+    reg_close = snap.get("regular_close") if snap.get("regular_close") is not None else snap.get("price")
     last_price = snap.get("last_trade_price")  # actual current price
     reg_change = snap.get("regular_trading_change")
     reg_change_pct = snap.get("regular_trading_change_percent")
@@ -460,11 +461,14 @@ def _snapshot_price_lines(snap: Dict[str, Any], status: str, cur: DisplaySpec) -
         else:
             out.append(f"**Regular Close:** {fmt_price(reg_close, cur)}")
 
-    is_extended = status in ("early_trading", "late_trading")
+    is_extended = status in ("early_trading", "late_trading") or (
+        status == "closed" and snap.get("late_trading_change") is not None
+    )
     if is_extended and last_price is not None and reg_close is not None and last_price != reg_close:
+        ext_key = "early_trading" if status == "early_trading" else "late_trading"
         ext_label = "Pre-Market" if status == "early_trading" else "After-Hours"
-        ext_change = snap.get(f"{status}_change")
-        ext_change_pct = snap.get(f"{status}_change_percent")
+        ext_change = snap.get(f"{ext_key}_change")
+        ext_change_pct = snap.get(f"{ext_key}_change_percent")
         if ext_change is not None and ext_change_pct is not None:
             sign = _plus(ext_change)
             out.append(

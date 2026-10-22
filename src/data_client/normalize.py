@@ -34,6 +34,9 @@ from market_protocol.symbology import UNKNOWN_MIC
 # ratios — scale-invariant; volume is a share count — never scaled.
 _SNAPSHOT_PRICE_FIELDS = (
     "price", "change", "previous_close", "open", "high", "low",
+    # DALTON-HOOK(extended-hours-quotes): Scale extended-hours price and dollar-change fields.
+    "last_trade_price", "regular_close", "early_trading_change",
+    "late_trading_change", "regular_trading_change",
 )
 
 

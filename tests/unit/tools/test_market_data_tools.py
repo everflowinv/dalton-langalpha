@@ -2149,11 +2149,106 @@ class TestFetchQuote:
             clock.return_value.is_closed.return_value = True
             content, artifact = await fetch_quote(["600519.SH", "920395.BJ"])
 
-        assert "920395.BJ  CN¥6.68  +0.91% today" in content
+        # DALTON-HOOK(extended-hours-quotes): A closed prior-day daily close labels its move 'last close', not 'today'.
+        assert "920395.BJ  CN¥6.68  +0.91% last close" in content
         assert "no data" not in content
         bj = artifact["quotes"][1]
         assert (bj["source"], bj["tier"], bj["currency"]) == ("daily", "eod", "CNY")
         assert [r["symbol"] for r in names.await_args.args[0]] == ["600519.SH", "920395.BJ"]
+
+    @pytest.mark.asyncio
+    async def test_extended_hours_quote_splits_regular_close_and_after_hours_segments(self):
+        # DALTON-HOOK(extended-hours-quotes): Fixed clock + create_autospec covering both pre-market and after-hours.
+        from unittest.mock import create_autospec
+        from src.data_client import get_market_data_provider
+        from src.data_client.market_data_provider import MarketDataProvider
+        from src.tools.market_data.company import _snapshot_price_lines
+
+        pre_et = datetime(2026, 10, 22, 8, 4, 0, tzinfo=ZoneInfo("America/New_York"))
+        post_et = datetime(2026, 10, 22, 17, 15, 0, tzinfo=ZoneInfo("America/New_York"))
+
+        class _PreClock(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return pre_et.astimezone(tz) if tz else pre_et
+
+        class _PostClock(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return post_et.astimezone(tz) if tz else post_et
+
+        pre_snaps = [
+            {
+                "symbol": "GOOG",
+                "price": 330.95,
+                "regular_close": 330.95,
+                "previous_close": 330.95,
+                "last_trade_price": 328.50,
+                "change": -2.45,
+                "change_percent": -0.7403,
+                "regular_trading_change": -5.45,
+                "regular_trading_change_percent": -1.6201,
+                "early_trading_change": -2.45,
+                "early_trading_change_percent": -0.7403,
+                "volume": 19_200_000,
+                "market_status": "early_trading",
+                "as_of": int(pre_et.timestamp() * 1000),
+                "regular_trading_date": "2026-10-21",
+                "regular_only": False,
+                "tier": "delayed_15m",
+            }
+        ]
+        pre_provider = create_autospec(MarketDataProvider, instance=True)
+        pre_provider.get_snapshots.return_value = pre_snaps
+        mock_get_pre_mdp = create_autospec(get_market_data_provider, return_value=pre_provider)
+        with (
+            patch(f"{_QUOTES_MOD}.get_market_data_provider", new=mock_get_pre_mdp),
+            patch(f"{_QUOTES_MOD}.datetime", _PreClock),
+        ):
+            pre_content, _ = await fetch_quote(["GOOG"])
+        assert "GOOG  $330.95  -1.62% prev close  pre-market $328.50 -0.74%  vol 19.2M" in pre_content
+
+        post_snaps = [
+            {
+                "symbol": "GOOG",
+                "price": 330.95,
+                "regular_close": 330.95,
+                "previous_close": 336.40,
+                "last_trade_price": 333.76,
+                "change": -2.64,
+                "change_percent": -0.7848,
+                "regular_trading_change": -5.45,
+                "regular_trading_change_percent": -1.6201,
+                "late_trading_change": 2.81,
+                "late_trading_change_percent": 0.8491,
+                "volume": 19_200_000,
+                "market_status": "late_trading",
+                "as_of": int(post_et.timestamp() * 1000),
+                "regular_trading_date": "2026-10-22",
+                "regular_only": False,
+                "tier": "delayed_15m",
+            }
+        ]
+        post_provider = create_autospec(MarketDataProvider, instance=True)
+        post_provider.get_snapshots.return_value = post_snaps
+        mock_get_post_mdp = create_autospec(get_market_data_provider, return_value=post_provider)
+        with (
+            patch(f"{_QUOTES_MOD}.get_market_data_provider", new=mock_get_post_mdp),
+            patch(f"{_QUOTES_MOD}.datetime", _PostClock),
+        ):
+            post_content, _ = await fetch_quote(["GOOG"])
+        assert "GOOG  $330.95  -1.62% today  after-hours $333.76 +0.85%  vol 19.2M" in post_content
+
+        closed_with_late = _snapshot_price_lines(
+            {**post_snaps[0], "price": 999.0, "regular_close": 330.95}, "closed", "USD"
+        )
+        assert any("**After-Hours Price:** $333.76" in ln for ln in closed_with_late)
+        closed_odd_lot = _snapshot_price_lines(
+            {**post_snaps[0], "late_trading_change": None, "late_trading_change_percent": None},
+            "closed",
+            "USD",
+        )
+        assert not any("After-Hours Price" in ln for ln in closed_odd_lot)
 
     @pytest.mark.asyncio
     async def test_a_missing_listing_stays_missing_while_its_venue_trades(self):
