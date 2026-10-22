@@ -1398,6 +1398,34 @@ uv run python scripts/dalton/migrate_legacy_knowledge.py \
 
 ---
 
+## P1.4b OpenClaw 对话归档与回填（`scripts/dalton/conversation_archive.py`）
+
+### 日常增量任务（默认值不变）
+
+每日定时任务使用 `src/dalton/dalton.yaml` 中的默认配置（`extract_concurrency: 1`、`hourly_token_budget: 120000`），保持单并发串行平稳运行：
+
+```bash
+.venv/bin/python scripts/dalton/conversation_archive.py run
+```
+
+### 回填
+
+当需要将历史对话大批量回填（例如回填至 `2026-04-30` 约 1 万个片段）且 Antigravity（agy）OAuth 额度充足时，建议通过 CLI 显式传入并发与每小时 token 预算参数：
+
+```bash
+.venv/bin/python scripts/dalton/conversation_archive.py backfill \
+  --since 2026-04-30 \
+  --concurrency 4 \
+  --hourly-token-budget 1500000
+```
+
+- **推荐回填参数**：`--concurrency 4 --hourly-token-budget 1500000`（仅对本次回填进程生效；每日增量任务仍用 `dalton.yaml` 默认值 `extract_concurrency: 1`、`hourly_token_budget: 120000`）。
+- **逐段有序落盘与进度可见**：并发抽取时，结果按原始片段顺序缓冲，每次将已连续完成的前缀（最多 `N = concurrency` 段）批量向量化并在单个数据库事务中写入 `dalton_conversation_cards`（含 `content_hash` 去重与按时间顺序的 `supersedes`）和 `dalton_conversation_processed`，同时实时更新 `dalton_conversation_runs` 的进度计数（`segments_processed`、`cards_inserted`、`total_tokens` 等），每完成一个片段向 `stderr` 无缓冲输出一行 `INFO` 进度日志。
+- **运行锁与防重入**：启动时获取 Postgres 会话级 advisory lock（`pg_try_advisory_lock(hashtext('dalton_conversation_archive'))`）。若已有归档进程在运行，立即打印 `"已有归档在运行"` 并以退出码 `2` 退出；拿到锁后会自动将此前崩溃残留的 `status='running'` 行标记为 `abandoned`。
+- **被杀后如何续跑**：若进程因 `SIGTERM`、`SIGKILL`、容器重建或配额耗尽被中断，已连续完成的前缀片段均已事务落盘并记录在 `dalton_conversation_processed` 中（inbox `.jsonl` 文件也会保留至文件内所有分片均处理完毕）。续跑时**直接原样重新执行同一条命令**（或加上 `--skip-host-export` 直接消费已在 `var/dalton/conversations/inbox/` 中的 `.jsonl` 文件），管线会自动跳过已记录在 `dalton_conversation_processed` 中的片段，只重做被杀当时正在进行中及后续未完成的片段。
+
+---
+
 ## P1.5 P1 验收清单
 
 蓝图的完成标准：问"你对 META 的看法和主要 debate"，回答引用的是迁入的认知，而且符合方法论的结构。
