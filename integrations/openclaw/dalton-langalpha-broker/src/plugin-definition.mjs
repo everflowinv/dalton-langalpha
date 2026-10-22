@@ -5,6 +5,7 @@ import { verifyLoopbackAndOrigin, verifyBearerToken, ensureScopedTokenFile } fro
 import { sendJson, sendOpenAiError } from "./http.mjs";
 import { listBrokerModels } from "./models.mjs";
 import { handleChatCompletions, handleLegacyInvoke } from "./invoke.mjs";
+import { handleXSearch } from "./x-search.mjs";
 import { createBrokerJournal } from "./journal.mjs";
 import { createConcurrencyLimiter } from "./limits.mjs";
 import { createReplayStore } from "./replay-state.mjs";
@@ -245,6 +246,19 @@ export function createPluginDefinition(deps = {}) {
               replayStore,
               logger: api.logger,
               runtimeVersion: api.runtime?.version || currentCfg?.meta?.lastTouchedVersion,
+              deps,
+            });
+            return true;
+          }
+
+          // 7. POST /dalton-broker/v1/x-search
+          if (method === "POST" && subPath === "/x-search") {
+            await handleXSearch(req, res, {
+              cfg: currentCfg,
+              pluginConfig,
+              limiter,
+              modelAuth: api.runtime?.modelAuth,
+              logger: api.logger,
               deps,
             });
             return true;

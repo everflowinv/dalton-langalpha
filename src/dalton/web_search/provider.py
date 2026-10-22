@@ -632,6 +632,20 @@ def build_web_search_tool(
     return web_search
 
 
+from src.dalton.web_search.x_search import (  # noqa: E402
+    OpenClawXSearchWrapper,
+    X_ANSWER_ONLY_HEADING,
+    X_ANSWER_WITH_SOURCES_HEADING,
+    X_BRIDGE_BUSY_MESSAGE,
+    X_BRIDGE_UNAVAILABLE_MESSAGE,
+    X_EMPTY_RESULTS_MESSAGE,
+    X_RATE_LIMITED_MESSAGE,
+    X_UNTRUSTED_NOTICE,
+    build_x_search_tool,
+    map_x_search_response,
+)
+
+
 __all__ = [
     "ANSWER_ONLY_HEADING",
     "BRIDGE_BUSY_MESSAGE",
@@ -645,11 +659,21 @@ __all__ = [
     "OpenClawSearchEmptyResultError",
     "OpenClawSearchRequestError",
     "OpenClawSearchWrapper",
+    "OpenClawXSearchWrapper",
     "RATE_LIMITED_MESSAGE",
+    "X_ANSWER_ONLY_HEADING",
+    "X_ANSWER_WITH_SOURCES_HEADING",
+    "X_BRIDGE_BUSY_MESSAGE",
+    "X_BRIDGE_UNAVAILABLE_MESSAGE",
+    "X_EMPTY_RESULTS_MESSAGE",
+    "X_RATE_LIMITED_MESSAGE",
+    "X_UNTRUSTED_NOTICE",
     "build_web_search_tool",
+    "build_x_search_tool",
     "compute_http_timeout_seconds",
     "extract_broker_payload",
     "map_broker_response",
+    "map_x_search_response",
     "register_openclaw_web_provider",
     "unwrap_untrusted_text",
 ]

@@ -7,6 +7,7 @@ const req = Module.createRequire(import.meta.url);
 
 let cachedLlm = null;
 let cachedSimpleRuntime = null;
+let cachedXSearch = null;
 
 function loadSdkSubpath(subpath) {
   try {
@@ -56,6 +57,58 @@ export function calculateCost(model, usage) {
 
 export function prepareSimpleCompletionModelForAgent(params) {
   return getSimpleRuntimeSdk().prepareSimpleCompletionModelForAgent(params);
+}
+
+function getXSearchModule() {
+  if (!cachedXSearch) {
+    try {
+      cachedXSearch = req("openclaw/dist/extensions/xai/x-search.js");
+    } catch {
+      const candidates = [
+        path.resolve(
+          path.dirname(process.execPath),
+          "..",
+          "lib",
+          "node_modules",
+          "openclaw",
+          "dist",
+          "extensions",
+          "xai",
+          "x-search.js",
+        ),
+        path.join(
+          os.homedir(),
+          ".openclaw",
+          "tools",
+          "node",
+          "lib",
+          "node_modules",
+          "openclaw",
+          "dist",
+          "extensions",
+          "xai",
+          "x-search.js",
+        ),
+      ];
+      let lastErr;
+      for (const candidate of candidates) {
+        try {
+          cachedXSearch = req(candidate);
+          break;
+        } catch (err) {
+          lastErr = err;
+        }
+      }
+      if (!cachedXSearch) {
+        throw lastErr;
+      }
+    }
+  }
+  return cachedXSearch;
+}
+
+export function createXSearchTool(options) {
+  return getXSearchModule().createXSearchTool(options);
 }
 
 const XAI_PROVIDER_IDS = new Set(["xai", "x-ai"]);

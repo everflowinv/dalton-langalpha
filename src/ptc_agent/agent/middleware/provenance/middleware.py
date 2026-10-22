@@ -326,6 +326,7 @@ class ProvenanceMiddleware(AgentMiddleware):
             str, Callable[[Any, Any], Iterable[ProvenanceSource]]
         ] = {
             "WebSearch": self._extract_web_search,
+            "x_search": self._extract_web_search,  # DALTON-HOOK(x-search-openclaw)
             "WebFetch": self._extract_web_fetch,
             "get_sec_filing": self._extract_sec_filing,
             "Read": self._extract_file_read,
