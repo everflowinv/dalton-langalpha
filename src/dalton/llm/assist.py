@@ -40,6 +40,7 @@ class AssistResult:
     model: str | None = None
     cost_usd: float = 0.0
     cached: bool = False
+    replayed: bool = False
     status: str = "ok"
     usage: dict[str, Any] = field(default_factory=dict)
     error_kind: str | None = None
@@ -163,6 +164,38 @@ def _extract_json_dict(raw_data: Any, raw_text: str | None) -> dict[str, Any]:
     return parsed
 
 
+def _normalize_schema_enums(instance: Any, schema: Any) -> Any:
+    """Strip surrounding whitespace and match string enum values case-insensitively when unique."""
+    if not isinstance(schema, dict):
+        return instance
+    enum_vals = schema.get("enum")
+    if isinstance(enum_vals, list) and isinstance(instance, str):
+        stripped = instance.strip()
+        if stripped in enum_vals:
+            return stripped
+        lowered = stripped.lower()
+        matches = [
+            member
+            for member in enum_vals
+            if isinstance(member, str) and member.lower() == lowered
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        return instance
+    if isinstance(instance, dict):
+        props = schema.get("properties")
+        if isinstance(props, dict):
+            for k, prop_schema in props.items():
+                if k in instance:
+                    instance[k] = _normalize_schema_enums(instance[k], prop_schema)
+    elif isinstance(instance, list):
+        item_schema = schema.get("items")
+        if isinstance(item_schema, dict):
+            for idx, item in enumerate(instance):
+                instance[idx] = _normalize_schema_enums(item, item_schema)
+    return instance
+
+
 async def assist_json(
     task: str,
     instructions: str,
@@ -190,6 +223,7 @@ async def assist_json(
     if not user_id or not str(user_id).strip():
         raise ValueError("user_id is required")
     user_id = str(user_id).strip()
+    comp: Any = None
 
     try:
         resolved_model = resolve_assist_model(role=role, explicit_model=model)
@@ -263,6 +297,8 @@ async def assist_json(
 
         elapsed_ms = int((time.monotonic() - t0) * 1000)
         used_model = comp.model or resolved_model
+        is_cached = bool(getattr(comp, "cached", False) or getattr(comp, "replayed", False))
+        is_replayed = bool(getattr(comp, "replayed", False) or getattr(comp, "cached", False))
 
         if not comp.ok:
             logger.warning(
@@ -280,7 +316,8 @@ async def assist_json(
                 error=comp.error or comp.status,
                 model=used_model,
                 cost_usd=comp.cash_usd,
-                cached=comp.cached,
+                cached=is_cached,
+                replayed=is_replayed,
                 status=comp.status,
                 usage=dict(getattr(comp, "usage", None) or {}),
                 error_kind=getattr(comp, "error_kind", None),
@@ -288,6 +325,7 @@ async def assist_json(
 
         parsed = _extract_json_dict(comp.data, comp.text)
         if isinstance(schema, dict) and schema:
+            parsed = _normalize_schema_enums(parsed, schema)
             jsonschema.validate(instance=parsed, schema=schema)
 
         logger.info(
@@ -296,7 +334,7 @@ async def assist_json(
             used_model,
             elapsed_ms,
             comp.cash_usd,
-            comp.cached,
+            is_cached,
         )
         return AssistResult(
             ok=True,
@@ -304,7 +342,8 @@ async def assist_json(
             error=None,
             model=used_model,
             cost_usd=comp.cash_usd,
-            cached=comp.cached,
+            cached=is_cached,
+            replayed=is_replayed,
             status="ok",
             usage=dict(getattr(comp, "usage", None) or {}),
             error_kind=getattr(comp, "error_kind", None),
@@ -312,10 +351,26 @@ async def assist_json(
     except Exception as exc:
         elapsed_ms = int((time.monotonic() - t0) * 1000)
         safe_err = sanitize_error_text(exc, max_len=200)
+        err_model = (
+            (comp.model if comp is not None and getattr(comp, "model", None) else resolved_model)
+            or resolved_model
+        )
+        err_cached = (
+            bool(getattr(comp, "cached", False) or getattr(comp, "replayed", False))
+            if comp is not None
+            else False
+        )
+        err_replayed = (
+            bool(getattr(comp, "replayed", False) or getattr(comp, "cached", False))
+            if comp is not None
+            else False
+        )
+        err_usage = dict(getattr(comp, "usage", None) or {}) if comp is not None else {}
+        err_cost = float(getattr(comp, "cash_usd", 0.0) or 0.0) if comp is not None else 0.0
         logger.warning(
             "[DaltonAssist] task=%s model=%s elapsed_ms=%d status=error error=%s",
             task,
-            resolved_model,
+            err_model,
             elapsed_ms,
             safe_err,
         )
@@ -323,8 +378,11 @@ async def assist_json(
             ok=False,
             data=None,
             error=safe_err,
-            model=resolved_model,
-            cost_usd=0.0,
-            cached=False,
+            model=err_model,
+            cost_usd=err_cost,
+            cached=err_cached,
+            replayed=err_replayed,
             status="error",
+            usage=err_usage,
+            error_kind=type(exc).__name__,
         )
