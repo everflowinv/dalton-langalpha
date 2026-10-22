@@ -15,18 +15,18 @@
 - **逻辑边界**：合成式或公开检索不保证枚举完整，**严禁用“X 上没搜到某负面消息”来证明该风险不存在**。
 
 ### D2. 雪球与中文投资社区讨论（中概股、港股、A 股及全球科技龙头适用）
-- 检索关于目标公司的深度分析帖与高赞财报拆解（雪球专用接口当前不可用，通过公开 `web_search` 检索并核对原帖链接；若目标公司为港股或 A 股，按单一意图分别调用 `researchdata.finance(route="cn-hk", operation="ask", query=f"{code_or_name} 机构调研", limit=50)` 与 `researchdata.finance(route="cn-hk", operation="ask", query=f"{code_or_name} 股东户数", limit=50)` 采集机构调研纪要与股东户数变化）。
-- 重点提取：高水平个人/机构投资者对公司商业模式细节、渠道调研、分部拆算的独立推演，以及散户情绪拥挤度。
+- 调用 `researchdata.community(route="xueqiu", operation="posts", ticker=..., pages=2)`（港股传 5 位如 `"00700"`、`"06181"`，A 股传 `"SH600519"` / `"SZ300750"`）与 `researchdata.community(route="xueqiu", operation="search", query=f"{公司名/TICKER}", pages=2)` 检索关于目标公司的深度分析帖与高赞财报拆解，对关键长帖调用 `operation="post"` 读全文、调用 `operation="comments"` 读高赞评论（若目标公司为港股或 A 股，按单一意图分别调用 `researchdata.finance(route="cn-hk", operation="ask", query=f"{code_or_name} 机构调研", limit=50)` 与 `researchdata.finance(route="cn-hk", operation="ask", query=f"{code_or_name} 股东户数", limit=50)` 采集机构调研纪要与股东户数变化）。
+- 重点提取：高水平个人/机构投资者对公司商业模式细节、渠道调研、分部拆算的独立推演，以及散户情绪拥挤度；引用时必须带平台、日期与原帖 URL。
 
 ### D3. 员工评价与组织文化信号（Glassdoor / Blind / 职场社区）
-- 检索目标公司的员工评价与职场讨论，重点服务 **Q4（Good People：管理层与企业文化）**：
+- 默认调用免费的 `researchdata.community(route="employee", operation="blind", company=..., pages=2)` 与 `researchdata.community(route="employee", operation="summary", company=..., pages=40)` 采集员工评价与聚合趋势（注意：Blind 第 31 条以后的锁死占位正文 `body_locked: true` / lorem ipsum 不得作为证据；付费源 `operation="indeed"` 与 `operation="glassdoor"` 默认关闭，**只有在用户明确要求时**才传 `allow_paid=True` 调用），重点服务 **Q4（Good People：管理层与企业文化）**：
   - CEO 支持率、商业前景评分、薪酬与激励兑现度；
   - 研发与销售团队的人员流动方向（核心人才流向哪家竞对，或从哪家竞对挖人）；
   - 内部组织架构重组、官僚化/大公司病、一线员工对管理层战略（如 AI 转型、降本增效）真实执行情况的反馈。
 - 若第三方职场站点受防爬限制只能获取聚合摘要，如实注明覆盖范围，不在单一站点上耗费过多检索预算。
 
-### D4. 科技/行业社区与新闻聚合（HN / YouTube / 垂直论坛 / 深度报道）
-- 检索 Hacker News、技术论坛、行业垂直媒体及深度调查报道（排除公司公关通稿复述）。
+### D4. 科技/行业社区与跨平台情绪聚合（`last30days` / HN / YouTube / StockTwits / Polymarket）
+- 调用 `researchdata.community(route="last30days", query=f"{公司名} {TICKER}", days=30)`（不传 `--search` 以自动启用 StockTwits）聚合 Reddit、X、YouTube、Hacker News、StockTwits 与 Polymarket 的近 30 天跨平台社区情绪与讨论焦点（Polymarket 仅作市场定价信号，不算事实证据），并配合检索垂直论坛及深度调查报道（排除公司公关通稿复述）。
 - 关注：公司内部战略转向、核心高管/技术骨干离职内幕、上下游合作伙伴关系变化、产品重大故障或客户维权事件。
 
 ### D5. 招聘与组织扩张/收缩先行信号

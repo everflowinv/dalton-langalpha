@@ -350,6 +350,20 @@ class TestSourceIdentityRoutes:
 def _make_bridge(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> rb.ResearchDataBridge:
     monkeypatch.setenv("DALTON_BRIDGE_USAGE_FILE", str(tmp_path / "usage.json"))
     monkeypatch.setenv("DALTON_BRIDGE_TEST_MODE", "0")
+    dummy_py = tmp_path / "dummy_python"
+    dummy_py.write_text("#!/bin/sh\n", encoding="utf-8")
+    dummy_xq = tmp_path / "xueqiu_posts.py"
+    dummy_xq.write_text("# dummy\n", encoding="utf-8")
+    dummy_emp = tmp_path / "employee_reviews_cli.py"
+    dummy_emp.write_text("# dummy\n", encoding="utf-8")
+    dummy_l30 = tmp_path / "last30days.py"
+    dummy_l30.write_text("# dummy\n", encoding="utf-8")
+    monkeypatch.setenv("DALTON_OCW_PYTHON", str(dummy_py))
+    monkeypatch.setenv("DALTON_XUEQIU_SCRIPT", str(dummy_xq))
+    monkeypatch.setenv("DALTON_EMPLOYEE_PYTHON", str(dummy_py))
+    monkeypatch.setenv("DALTON_EMPLOYEE_CLI_SCRIPT", str(dummy_emp))
+    monkeypatch.setenv("DALTON_LAST30DAYS_PYTHON", str(dummy_py))
+    monkeypatch.setenv("DALTON_LAST30DAYS_SCRIPT", str(dummy_l30))
     cfg = rb.BridgeConfig()
     return rb.ResearchDataBridge(cfg)
 
@@ -1342,3 +1356,1515 @@ async def test_bridge_accepts_header_token_rejects_bad_token_401_and_keeps_legac
     assert status_legacy == 200
     assert body_legacy == {"jsonrpc": "2.0", "id": 1, "result": {}}
 
+
+class TestCommunityExecutors:
+    @pytest.mark.asyncio
+    async def test_handoff_only_releases_three_community_routes_and_keeps_others_filtered(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ds_file = tmp_path / "data_sources.json"
+        ds_file.write_text(
+            json.dumps(
+                {
+                    "routes": [
+                        {"id": "xueqiu", "kind": "skill"},
+                        {"id": "employee", "kind": "skill"},
+                        {"id": "last30days", "kind": "skill"},
+                        {"id": "agent-reach", "kind": "skill"},
+                        {"id": "x-timeline", "kind": "skill"},
+                        {"id": "web-news", "kind": "agent_tool"},
+                        {"id": "web-page", "kind": "agent_tool"},
+                        {"id": "filings", "kind": "agent_tool"},
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        bridge = _make_bridge(tmp_path, monkeypatch)
+        bridge.cfg.data_sources_json = ds_file
+
+        handoff = bridge.handoff_routes()
+        assert "xueqiu" not in handoff
+        assert "employee" not in handoff
+        assert "last30days" not in handoff
+        assert {"agent-reach", "x-timeline", "web-news", "web-page", "filings"} <= handoff
+
+        for blocked in ("agent-reach", "x-timeline", "web-news", "web-page", "filings"):
+            resp = await bridge.handle_tools_call(
+                10,
+                {"name": "community", "arguments": {"route": blocked}},
+            )
+            body = json.loads(resp["result"]["content"][0]["text"])
+            assert body["ok"] is False
+            assert body["status"] == "handoff_filtered"
+
+    @pytest.mark.asyncio
+    async def test_tools_list_and_catalog_expose_three_community_routes_and_schemas(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bridge = _make_bridge(tmp_path, monkeypatch)
+
+        async def _responder(
+            reqs: list[dict[str, Any]],
+        ) -> tuple[list[dict[str, Any]], int]:
+            req = reqs[0]
+            if req["method"] == "initialize":
+                return [
+                    {
+                        "jsonrpc": "2.0",
+                        "id": req["id"],
+                        "result": {
+                            "protocolVersion": "2024-11-05",
+                            "serverInfo": {"name": "researchdata", "version": "1.0.0"},
+                        },
+                    }
+                ], 0
+            if req["method"] == "tools/list":
+                return [
+                    {
+                        "jsonrpc": "2.0",
+                        "id": req["id"],
+                        "result": {
+                            "tools": [
+                                {
+                                    "name": "community",
+                                    "description": "Community sources.",
+                                    "inputSchema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "route": {
+                                                "type": "string",
+                                                "enum": [
+                                                    "xueqiu",
+                                                    "employee",
+                                                    "last30days",
+                                                    "agent-reach",
+                                                    "x-timeline",
+                                                ],
+                                            }
+                                        },
+                                    },
+                                }
+                            ]
+                        },
+                    }
+                ], 0
+            if req["method"] == "tools/call" and req["params"]["name"] == "catalog":
+                cat_payload = {
+                    "ok": True,
+                    "status": "ok",
+                    "routes": [
+                        {"id": "xueqiu", "kind": "skill", "category": "community", "operations": []},
+                        {"id": "employee", "kind": "skill", "category": "community", "operations": []},
+                        {"id": "last30days", "kind": "skill", "category": "community", "operations": []},
+                        {"id": "agent-reach", "kind": "skill", "category": "community", "operations": []},
+                    ],
+                }
+                return [
+                    {
+                        "jsonrpc": "2.0",
+                        "id": req["id"],
+                        "result": {
+                            "content": [{"type": "text", "text": json.dumps(cat_payload)}]
+                        },
+                    }
+                ], 0
+            raise AssertionError(f"Unexpected method: {req}")
+
+        monkeypatch.setattr(
+            asyncio, "create_subprocess_exec", _make_subprocess_double(_responder)
+        )
+
+        tools = await bridge.get_filtered_tools()
+        comm_tool = next(t for t in tools if t["name"] == "community")
+        enum_vals = comm_tool["inputSchema"]["properties"]["route"]["enum"]
+        assert enum_vals == ["xueqiu", "employee", "last30days"]
+        assert "allow_paid" in comm_tool["inputSchema"]["properties"]
+        assert "plan" in comm_tool["inputSchema"]["properties"]
+        assert "xueqiu" in comm_tool["description"]
+        assert "employee" in comm_tool["description"]
+        assert "last30days" in comm_tool["description"]
+
+        cat_resp = await bridge.handle_tools_call(20, {"name": "catalog", "arguments": {}})
+        cat_body = json.loads(cat_resp["result"]["content"][0]["text"])
+        by_id = {r["id"]: r for r in cat_body["routes"]}
+        assert "agent-reach" not in by_id
+        assert by_id["xueqiu"]["operations"] == ["posts", "post", "comments", "search", "user"]
+        assert "ticker" in by_id["xueqiu"]["parameters"]
+        assert by_id["employee"]["operations"] == ["blind", "summary", "indeed", "glassdoor"]
+        assert "allow_paid" in by_id["employee"]["parameters"]
+        assert by_id["last30days"]["operations"] == ["search"]
+        assert "plan" in by_id["last30days"]["parameters"]
+
+    @pytest.mark.asyncio
+    async def test_parameter_whitelist_and_injection_rejection(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bridge = _make_bridge(tmp_path, monkeypatch)
+        exec_mock = create_autospec(asyncio.create_subprocess_exec)
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", exec_mock)
+
+        bad_calls = [
+            # Shell injection in ticker
+            {"route": "xueqiu", "operation": "posts", "ticker": "00700; rm -rf /"},
+            # Disallowed operation (self-test)
+            {"route": "xueqiu", "operation": "self-test"},
+            # Pages out of range (1..3 for xueqiu)
+            {"route": "xueqiu", "operation": "posts", "ticker": "00700", "pages": 4},
+            # Non-whitelisted URL domain for xueqiu
+            {"route": "xueqiu", "operation": "post", "url": "https://evil.com/xueqiu.com/123"},
+            # Glassdoor URL passed to xueqiu
+            {"route": "xueqiu", "operation": "post", "url": "https://www.glassdoor.com/Reviews/1"},
+            # Non-numeric post_id
+            {"route": "xueqiu", "operation": "comments", "post_id": "123;id"},
+            # Disallowed self-test on employee
+            {"route": "employee", "operation": "self-test"},
+            # Shell injection in company
+            {"route": "employee", "operation": "blind", "company": "NVIDIA && curl evil.com"},
+            # Pages out of range for blind (max 3) and summary (max 40)
+            {"route": "employee", "operation": "blind", "company": "NVIDIA", "pages": 5},
+            {"route": "employee", "operation": "summary", "company": "NVIDIA", "pages": 41},
+            # Xueqiu URL passed to employee glassdoor
+            {
+                "route": "employee",
+                "operation": "glassdoor",
+                "url": "https://xueqiu.com/S/NVDA",
+                "allow_paid": True,
+            },
+            # Extra parameter on last30days (e.g. search or non-search operation)
+            {"route": "last30days", "query": "NVDA", "search": "reddit"},
+            {"route": "last30days", "query": "NVDA", "operation": "self-test"},
+            # Days out of range (1..30)
+            {"route": "last30days", "query": "NVDA", "days": 31},
+            # Invalid plan missing ranking_query
+            {
+                "route": "last30days",
+                "query": "NVDA",
+                "plan": {"subqueries": [{"search_query": "NVDA"}]},
+            },
+        ]
+
+        for idx, args in enumerate(bad_calls):
+            resp = await bridge.handle_tools_call(
+                100 + idx,
+                {"name": "community", "arguments": args},
+            )
+            body = json.loads(resp["result"]["content"][0]["text"])
+            assert body["ok"] is False, f"Expected failure for {args}"
+            assert body["status"] == "invalid_arguments"
+
+        # Subprocess must never be spawned for any rejected input
+        assert exec_mock.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_employee_paid_source_switch_and_free_operations(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bridge = _make_bridge(tmp_path, monkeypatch)
+        exec_mock = create_autospec(asyncio.create_subprocess_exec)
+
+        async def _fake_exec(*cmd: Any, **kwargs: Any) -> asyncio.subprocess.Process:
+            proc = create_autospec(asyncio.subprocess.Process, instance=True)
+            proc.returncode = 0
+            out = {
+                "ok": True,
+                "source": "indeed" if "indeed" in cmd else "glassdoor",
+                "company": "Nvidia",
+                "count": 1,
+                "reviews": [
+                    {
+                        "id": "rev-1",
+                        "source": "indeed" if "indeed" in cmd else "glassdoor",
+                        "url": "https://www.glassdoor.com/Reviews/Employee-Review-1.htm",
+                        "created_at": "2026-10-19",
+                        "jobgroup": "Hardware Engineer",
+                        "summary": "Great GPU culture",
+                    }
+                ],
+            }
+            proc.communicate.return_value = (json.dumps(out).encode("utf-8"), b"")
+            return proc
+
+        exec_mock.side_effect = _fake_exec
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", exec_mock)
+
+        # 1. indeed and glassdoor without allow_paid=True -> paid_source_not_allowed
+        for paid_args in (
+            {"route": "employee", "operation": "indeed", "company": "Nvidia", "pages": 2},
+            {
+                "route": "employee",
+                "operation": "glassdoor",
+                "url": "https://www.glassdoor.com/Reviews/NVIDIA-Reviews-E7633.htm",
+            },
+            {
+                "route": "employee",
+                "operation": "indeed",
+                "company": "Nvidia",
+                "allow_paid": False,
+            },
+        ):
+            resp = await bridge.handle_tools_call(
+                200, {"name": "community", "arguments": paid_args}
+            )
+            body = json.loads(resp["result"]["content"][0]["text"])
+            assert body["ok"] is False
+            assert body["status"] == "paid_source_not_allowed"
+            assert body["error_code"] == "paid_source_not_allowed"
+
+        assert exec_mock.await_count == 0
+
+        # 2. With allow_paid=True -> executes subprocess and returns unified envelope + _sources
+        resp_ok = await bridge.handle_tools_call(
+            201,
+            {
+                "name": "community",
+                "arguments": {
+                    "route": "employee",
+                    "operation": "glassdoor",
+                    "url": "https://www.glassdoor.com/Reviews/NVIDIA-Reviews-E7633.htm",
+                    "allow_paid": True,
+                },
+            },
+        )
+        body_ok = json.loads(resp_ok["result"]["content"][0]["text"])
+        assert exec_mock.await_count == 1
+        assert body_ok["ok"] is True
+        assert body_ok["status"] == "ok"
+        assert len(body_ok["_sources"]) == 1
+        src = body_ok["_sources"][0]
+        assert src["platform"] == "glassdoor"
+        assert src["url"] == "https://www.glassdoor.com/Reviews/Employee-Review-1.htm"
+        assert src["date"] == "2026-10-19"
+        assert src["author"] == "Hardware Engineer"
+
+    @pytest.mark.asyncio
+    async def test_three_failure_statuses_and_stderr_sanitization_last_500_chars(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bridge = _make_bridge(tmp_path, monkeypatch)
+        exec_mock = create_autospec(asyncio.create_subprocess_exec)
+        mode = ["script_error"]
+
+        async def _fake_exec(*cmd: Any, **kwargs: Any) -> asyncio.subprocess.Process:
+            proc = create_autospec(asyncio.subprocess.Process, instance=True)
+            long_prefix = "P" * 600
+            dirty_stderr = (
+                f"{long_prefix} Authorization: Bearer sk-secretToken9876543210 "
+                "Cookie: xq_a_token=secretCookieVal123\nfinal error tail"
+            ).encode("utf-8")
+            if mode[0] == "script_error":
+                proc.returncode = 2
+                proc.communicate.return_value = (b"", dirty_stderr)
+            elif mode[0] == "invalid_output":
+                proc.returncode = 0
+                proc.communicate.return_value = (b"not-a-json-document", dirty_stderr)
+            else:
+                proc.returncode = 0
+                proc.communicate.return_value = (b"[]", dirty_stderr)
+            return proc
+
+        exec_mock.side_effect = _fake_exec
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", exec_mock)
+
+        for expected_status in ("script_error", "invalid_output", "empty"):
+            mode[0] = expected_status
+            resp = await bridge.handle_tools_call(
+                300,
+                {
+                    "name": "community",
+                    "arguments": {
+                        "route": "xueqiu",
+                        "operation": "posts",
+                        "ticker": "00700",
+                        "pages": 1,
+                    },
+                },
+            )
+            body = json.loads(resp["result"]["content"][0]["text"])
+            assert body["ok"] is False
+            assert body["status"] == expected_status
+            assert body["_sources"] == []
+            assert body["_declared_sources"] == []
+            assert "sk-secretToken" not in body["stderr"]
+            assert "secretCookieVal" not in body["stderr"]
+            assert "[REDACTED]" in body["stderr"]
+            assert body["stderr"].endswith("final error tail")
+            assert len(body["stderr"]) <= 500
+
+    @pytest.mark.asyncio
+    async def test_timeout_reaps_subprocess_and_last30days_plan_tempfile_deleted(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cache_dir = tmp_path / "bridge-cache"
+        monkeypatch.setenv("DALTON_BRIDGE_CACHE_DIR", str(cache_dir))
+        bridge = _make_bridge(tmp_path, monkeypatch)
+
+        exec_mock = create_autospec(asyncio.create_subprocess_exec)
+        killed = [False]
+        waited = [False]
+        observed_plan_path: list[Path] = []
+        should_timeout = [False]
+
+        async def _fake_exec(*cmd: Any, **kwargs: Any) -> asyncio.subprocess.Process:
+            proc = create_autospec(asyncio.subprocess.Process, instance=True)
+            cmd_list = list(cmd)
+            if "--plan" in cmd_list:
+                idx = cmd_list.index("--plan")
+                p_path = Path(cmd_list[idx + 1])
+                observed_plan_path.append(p_path)
+                assert p_path.is_file()
+                assert p_path.parent == cache_dir.resolve()
+                assert bridge.cfg.ocw_root.resolve() not in p_path.parents
+
+            def _kill() -> None:
+                killed[0] = True
+
+            async def _wait() -> int:
+                waited[0] = True
+                return -9
+
+            async def _communicate(input: bytes | None = None) -> tuple[bytes, bytes]:
+                if should_timeout[0]:
+                    await asyncio.sleep(30.0)
+                out = {
+                    "schema_version": "1.4",
+                    "query": "NVDA",
+                    "generated_at": "2026-10-22T12:00:00Z",
+                    "results": [
+                        {
+                            "candidate_id": "c1",
+                            "source": "stocktwits",
+                            "url": "https://stocktwits.com/symbol/NVDA/1",
+                            "published_at": "2026-10-22",
+                            "author": "chip_bull",
+                            "title": "NVDA Blackwell demand strong",
+                        }
+                    ],
+                }
+                proc.returncode = 0
+                return json.dumps(out).encode("utf-8"), b""
+
+            proc.terminate.side_effect = _kill
+            proc.kill.side_effect = _kill
+            proc.wait.side_effect = _wait
+            proc.communicate.side_effect = _communicate
+            return proc
+
+        exec_mock.side_effect = _fake_exec
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", exec_mock)
+
+        plan_payload = {
+            "subqueries": [
+                {
+                    "label": "primary",
+                    "search_query": "NVDA Blackwell",
+                    "ranking_query": "How is NVDA Blackwell sentiment?",
+                    "sources": ["reddit", "x", "stocktwits", "polymarket"],
+                    "weight": 1.0,
+                }
+            ]
+        }
+
+        # 1. Successful call with plan -> plan file created in cache_dir and deleted afterwards
+        resp_ok = await bridge.handle_tools_call(
+            401,
+            {
+                "name": "community",
+                "arguments": {
+                    "route": "last30days",
+                    "query": "NVDA",
+                    "days": 14,
+                    "quick": True,
+                    "plan": plan_payload,
+                },
+            },
+        )
+        body_ok = json.loads(resp_ok["result"]["content"][0]["text"])
+        assert body_ok["ok"] is True
+        assert body_ok["status"] == "ok"
+        assert len(observed_plan_path) == 1
+        assert not observed_plan_path[0].exists()
+        assert list(cache_dir.glob("last30days-plan-*.json")) == []
+        assert body_ok["_sources"][0]["platform"] == "stocktwits"
+        assert body_ok["_sources"][0]["url"] == "https://stocktwits.com/symbol/NVDA/1"
+        assert body_ok["_sources"][0]["date"] == "2026-10-22"
+        assert body_ok["_sources"][0]["author"] == "chip_bull"
+
+        # 2. Timeout -> kills and reaps subprocess AND deletes plan temp file
+        should_timeout[0] = True
+        monkeypatch.setattr(bridge, "compute_timeout", lambda *_a, **_kw: 1)
+        resp_to = await bridge.handle_tools_call(
+            402,
+            {
+                "name": "community",
+                "arguments": {
+                    "route": "last30days",
+                    "query": "NVDA",
+                    "days": 7,
+                    "plan": plan_payload,
+                },
+            },
+        )
+        body_to = json.loads(resp_to["result"]["content"][0]["text"])
+        assert body_to["ok"] is False
+        assert body_to["status"] == "timeout"
+        assert killed[0] is True
+        assert waited[0] is True
+        assert len(observed_plan_path) == 2
+        assert not observed_plan_path[1].exists()
+        assert list(cache_dir.glob("last30days-plan-*.json")) == []
+
+    @pytest.mark.asyncio
+    async def test_ptc_wrapper_default_params_ignored_and_route_timeouts_enforced(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bridge = _make_bridge(tmp_path, monkeypatch)
+        exec_mock = create_autospec(asyncio.create_subprocess_exec)
+
+        async def _fake_exec(*cmd: Any, **kwargs: Any) -> asyncio.subprocess.Process:
+            proc = create_autospec(asyncio.subprocess.Process, instance=True)
+            proc.returncode = 0
+            out = {
+                "ok": True,
+                "posts": [
+                    {
+                        "id": "101",
+                        "url": "https://xueqiu.com/100/101",
+                        "created_at": "2026-10-22 14:30",
+                        "created_at_ms": 1761114600000,
+                        "author": "value_investor",
+                        "title": "600519 analysis",
+                    }
+                ],
+                "reviews": [
+                    {
+                        "id": "r1",
+                        "source": "blind",
+                        "url": "https://www.teamblind.com/company/NVIDIA/reviews",
+                        "created_at": "2026-10-21",
+                        "jobgroup": "Engineering",
+                        "summary": "Solid team",
+                    }
+                ],
+                "results": [
+                    {
+                        "candidate_id": "c1",
+                        "source": "stocktwits",
+                        "url": "https://stocktwits.com/symbol/NVDA/1",
+                        "published_at": "2026-10-22",
+                        "author": "trader1",
+                        "title": "Bullish",
+                    }
+                ],
+            }
+            proc.communicate.return_value = (json.dumps(out).encode("utf-8"), b"")
+            return proc
+
+        exec_mock.side_effect = _fake_exec
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", exec_mock)
+
+        upstream_defaults = {
+            "mode": "fetch",
+            "limit": 3,
+            "timeout": 180,
+            "series": "DGS10",
+            "concept": "Revenues",
+            "item": "Item 7",
+            "document": "doc-1",
+            "form": "10-K",
+            "dataset": "edgar",
+            "start": "2026-01-01",
+            "end": "2026-10-22",
+            "as_of": "2026-10-22",
+            "vintage": "2026-10-22",
+            "params": {"offset": 0},
+        }
+
+        # Verify timeout is determined solely by executor route config, ignoring timeout=180
+        assert (
+            bridge.compute_timeout(
+                "community", {"route": "xueqiu", **upstream_defaults}
+            )
+            == 60
+        )
+        assert (
+            bridge.compute_timeout(
+                "community", {"route": "employee", **upstream_defaults}
+            )
+            == 120
+        )
+        assert (
+            bridge.compute_timeout(
+                "community", {"route": "last30days", **upstream_defaults}
+            )
+            == 600
+        )
+
+        # All 3 routes accept the full wrapper argument payload
+        for req_id, route_args in (
+            (
+                501,
+                {
+                    "route": "xueqiu",
+                    "operation": "posts",
+                    "ticker": "06181",
+                    "pages": 1,
+                    **upstream_defaults,
+                },
+            ),
+            (
+                502,
+                {
+                    "route": "employee",
+                    "operation": "blind",
+                    "company": "NVIDIA",
+                    "pages": 1,
+                    **upstream_defaults,
+                },
+            ),
+            (
+                503,
+                {
+                    "route": "last30days",
+                    "operation": "search",
+                    "query": "NVDA Blackwell",
+                    "days": 30,
+                    "quick": True,
+                    **upstream_defaults,
+                },
+            ),
+        ):
+            resp = await bridge.handle_tools_call(
+                req_id, {"name": "community", "arguments": route_args}
+            )
+            body = json.loads(resp["result"]["content"][0]["text"])
+            assert body["ok"] is True, f"Failed for {route_args}: {body}"
+            assert body["status"] == "ok"
+
+        assert exec_mock.await_count == 3
+
+    @pytest.mark.asyncio
+    async def test_redaction_of_json_dict_keys_and_sanitized_error_data_summary(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        raw_log = (
+            '{"token": "secretJsonToken12345", "xq_a_token": "xqJsonSecret999"} '
+            "{'cookie': 'xq_a_token=dictCookieVal888; u=123'} "
+            "xq_a_token=inlineXqToken777; Authorization: Bearer bearerSecret666 "
+            "api_key='singleQuoteKey555'"
+        )
+        cleaned = rb.sanitize_stderr_text(raw_log, max_len=500)
+        for leaked in (
+            "secretJsonToken12345",
+            "xqJsonSecret999",
+            "dictCookieVal888",
+            "inlineXqToken777",
+            "bearerSecret666",
+            "singleQuoteKey555",
+        ):
+            assert leaked not in cleaned
+        assert "[REDACTED]" in cleaned
+
+        bridge = _make_bridge(tmp_path, monkeypatch)
+        exec_mock = create_autospec(asyncio.create_subprocess_exec)
+
+        async def _fake_exec(*cmd: Any, **kwargs: Any) -> asyncio.subprocess.Process:
+            proc = create_autospec(asyncio.subprocess.Process, instance=True)
+            proc.returncode = 0
+            dirty_json = {
+                "ok": False,
+                "error": 'Auth failed with {"token": "leaked_err_token_123"} and xq_a_token=leaked_xq_456',
+                "cookie": "xq_a_token=raw_uncleaned_cookie_value",
+                "raw_headers": {"Authorization": "Bearer raw_uncleaned_bearer_token"},
+            }
+            proc.communicate.return_value = (
+                json.dumps(dirty_json).encode("utf-8"),
+                b"'cookie': 'stderr_cookie_secret_999'",
+            )
+            return proc
+
+        exec_mock.side_effect = _fake_exec
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", exec_mock)
+
+        resp = await bridge.handle_tools_call(
+            510,
+            {
+                "name": "community",
+                "arguments": {"route": "xueqiu", "operation": "posts", "ticker": "00700"},
+            },
+        )
+        body = json.loads(resp["result"]["content"][0]["text"])
+        assert body["ok"] is False
+        assert body["status"] == "script_error"
+        serialized = json.dumps(body)
+        for secret in (
+            "leaked_err_token_123",
+            "leaked_xq_456",
+            "raw_uncleaned_cookie_value",
+            "raw_uncleaned_bearer_token",
+            "stderr_cookie_secret_999",
+        ):
+            assert secret not in serialized
+        assert "cookie" not in body["data"]
+        assert "raw_headers" not in body["data"]
+        assert body["data"]["status"] == "script_error"
+        assert body["data"]["route"] == "xueqiu"
+
+    @pytest.mark.asyncio
+    async def test_sigterm_process_group_then_sigkill_order_on_timeout(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bridge = _make_bridge(tmp_path, monkeypatch)
+        monkeypatch.setattr(rb, "COMMUNITY_SIGTERM_GRACE_S", 0.02)
+        monkeypatch.setattr(bridge, "compute_timeout", lambda *_a, **_kw: 1)
+
+        events: list[str] = []
+        killpg_mock = create_autospec(rb.os.killpg)
+
+        def _record_killpg(pgid: int, sig: int) -> None:
+            if sig == rb.signal.SIGTERM:
+                events.append(f"killpg:SIGTERM:{pgid}")
+            elif sig == rb.signal.SIGKILL:
+                events.append(f"killpg:SIGKILL:{pgid}")
+            else:
+                events.append(f"killpg:{sig}:{pgid}")
+
+        killpg_mock.side_effect = _record_killpg
+        monkeypatch.setattr(rb.os, "killpg", killpg_mock)
+
+        exec_mock = create_autospec(asyncio.create_subprocess_exec)
+
+        async def _fake_exec(*cmd: Any, **kwargs: Any) -> asyncio.subprocess.Process:
+            assert kwargs.get("start_new_session") is True
+            events.append("spawn:start_new_session=True")
+            proc = create_autospec(asyncio.subprocess.Process, instance=True)
+            proc.pid = 43210
+            proc.returncode = None
+
+            async def _communicate(input: bytes | None = None) -> tuple[bytes, bytes]:
+                await asyncio.sleep(30.0)
+                return b"", b""
+
+            wait_calls = [0]
+
+            async def _wait() -> int:
+                wait_calls[0] += 1
+                if wait_calls[0] == 1:
+                    events.append("wait:grace_after_sigterm")
+                    await asyncio.sleep(10.0)
+                events.append("wait:reap_after_sigkill")
+                proc.returncode = -9
+                return -9
+
+            proc.communicate.side_effect = _communicate
+            proc.wait.side_effect = _wait
+            return proc
+
+        exec_mock.side_effect = _fake_exec
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", exec_mock)
+
+        resp = await bridge.handle_tools_call(
+            520,
+            {
+                "name": "community",
+                "arguments": {"route": "last30days", "query": "NVDA"},
+            },
+        )
+        body = json.loads(resp["result"]["content"][0]["text"])
+        assert body["ok"] is False
+        assert body["status"] == "timeout"
+        assert events == [
+            "spawn:start_new_session=True",
+            "killpg:SIGTERM:43210",
+            "wait:grace_after_sigterm",
+            "killpg:SIGKILL:43210",
+            "wait:reap_after_sigkill",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_employee_invokes_venv_python_directly_and_missing_files_return_source_missing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bridge = _make_bridge(tmp_path, monkeypatch)
+        observed_cmds: list[list[str]] = []
+        exec_mock = create_autospec(asyncio.create_subprocess_exec)
+
+        async def _fake_exec(*cmd: Any, **kwargs: Any) -> asyncio.subprocess.Process:
+            observed_cmds.append([str(c) for c in cmd])
+            proc = create_autospec(asyncio.subprocess.Process, instance=True)
+            proc.returncode = 0
+            out = {
+                "ok": True,
+                "source": "blind",
+                "company": "NVIDIA",
+                "count": 1,
+                "reviews": [
+                    {
+                        "id": "b1",
+                        "source": "blind",
+                        "url": "https://www.teamblind.com/company/NVIDIA/reviews",
+                        "created_at": "2026-10-20",
+                        "jobgroup": "SWE",
+                        "summary": "Great",
+                    }
+                ],
+            }
+            proc.communicate.return_value = (json.dumps(out).encode("utf-8"), b"")
+            return proc
+
+        exec_mock.side_effect = _fake_exec
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", exec_mock)
+
+        resp_ok = await bridge.handle_tools_call(
+            530,
+            {
+                "name": "community",
+                "arguments": {"route": "employee", "operation": "blind", "company": "NVIDIA"},
+            },
+        )
+        body_ok = json.loads(resp_ok["result"]["content"][0]["text"])
+        assert body_ok["ok"] is True
+        assert len(observed_cmds) == 1
+        assert observed_cmds[0][0] == str(bridge.cfg.employee_python)
+        assert observed_cmds[0][1] == str(bridge.cfg.employee_cli_script)
+        assert "bash" not in observed_cmds[0]
+        assert not observed_cmds[0][1].endswith("run.sh")
+
+        # When interpreter or CLI file is missing -> source_missing, no subprocess spawned
+        bridge.cfg.employee_python = tmp_path / "nonexistent_venv_python"
+        resp_missing = await bridge.handle_tools_call(
+            531,
+            {
+                "name": "community",
+                "arguments": {"route": "employee", "operation": "blind", "company": "NVIDIA"},
+            },
+        )
+        body_missing = json.loads(resp_missing["result"]["content"][0]["text"])
+        assert body_missing["ok"] is False
+        assert body_missing["status"] == "source_missing"
+        assert body_missing["error_code"] == "source_missing"
+        assert len(observed_cmds) == 1  # No additional subprocess spawned
+
+    @pytest.mark.asyncio
+    async def test_temp_dir_rejects_any_path_inside_real_openclaw_tree(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fake_ocw_tree = tmp_path / ".openclaw"
+        fake_workspace = fake_ocw_tree / "workspace"
+        fake_workspace.mkdir(parents=True)
+        outside_workspace_in_ocw = fake_ocw_tree / "other-subdir" / "cache"
+        monkeypatch.setenv("DALTON_OCW_ROOT", str(fake_workspace))
+        monkeypatch.setenv("DALTON_BRIDGE_CACHE_DIR", str(outside_workspace_in_ocw))
+        bridge = _make_bridge(tmp_path, monkeypatch)
+
+        exec_mock = create_autospec(asyncio.create_subprocess_exec)
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", exec_mock)
+
+        resp = await bridge.handle_tools_call(
+            540,
+            {
+                "name": "community",
+                "arguments": {
+                    "route": "last30days",
+                    "query": "NVDA",
+                    "plan": {
+                        "subqueries": [
+                            {"search_query": "NVDA", "ranking_query": "NVDA sentiment"}
+                        ]
+                    },
+                },
+            },
+        )
+        body = json.loads(resp["result"]["content"][0]["text"])
+        assert body["ok"] is False
+        assert body["status"] == "invalid_arguments"
+        assert "~/.openclaw" in body["error"]
+        assert exec_mock.await_count == 0
+
+    def test_subprocess_env_proxy_and_claudecode_stripping(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        for k in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+            monkeypatch.delenv(k, raising=False)
+        monkeypatch.setenv("CLAUDECODE", "1")
+        monkeypatch.setenv("CLAUDE_CODE_ENTRYPOINT", "cli")
+        monkeypatch.setenv("CLAUDE_CODE_SSE_PORT", "12345")
+        monkeypatch.setenv("DALTON_BRIDGE_SUBPROCESS_PROXY", "http://127.0.0.1:7890")
+
+        bridge = _make_bridge(tmp_path, monkeypatch)
+        env = bridge._build_community_subprocess_env()
+        assert "CLAUDECODE" not in env
+        assert "CLAUDE_CODE_ENTRYPOINT" not in env
+        assert "CLAUDE_CODE_SSE_PORT" not in env
+        for pk in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+            assert env[pk] == "http://127.0.0.1:7890"
+
+        # When DALTON_BRIDGE_SUBPROCESS_PROXY is not configured, do not inject proxy vars
+        monkeypatch.delenv("DALTON_BRIDGE_SUBPROCESS_PROXY", raising=False)
+        bridge_no_proxy = _make_bridge(tmp_path, monkeypatch)
+        env_no_proxy = bridge_no_proxy._build_community_subprocess_env()
+        for pk in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+            assert pk not in env_no_proxy
+
+    @pytest.mark.asyncio
+    async def test_last30days_degraded_vs_empty_vs_partial_warnings(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bridge = _make_bridge(tmp_path, monkeypatch)
+        exec_mock = create_autospec(asyncio.create_subprocess_exec)
+        payload_queue: list[dict[str, Any]] = []
+
+        async def _fake_exec(*cmd: Any, **kwargs: Any) -> asyncio.subprocess.Process:
+            proc = create_autospec(asyncio.subprocess.Process, instance=True)
+            proc.returncode = 0
+            out = payload_queue.pop(0)
+            proc.communicate.return_value = (json.dumps(out).encode("utf-8"), b"")
+            return proc
+
+        exec_mock.side_effect = _fake_exec
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", exec_mock)
+
+        # 1. Degraded: failure states in source_status and 0 items -> ok=False, status="degraded"
+        payload_queue.append(
+            {
+                "query": "NVDA",
+                "results": [],
+                "source_status": {
+                    "x": {"state": "auth-failed", "reason": "token expired"},
+                    "stocktwits": {"state": "timeout", "reason": "timed out"},
+                    "polymarket": "no-results",
+                },
+            }
+        )
+        resp_deg = await bridge.handle_tools_call(
+            550, {"name": "community", "arguments": {"route": "last30days", "query": "NVDA"}}
+        )
+        body_deg = json.loads(resp_deg["result"]["content"][0]["text"])
+        assert body_deg["ok"] is False
+        assert body_deg["status"] == "degraded"
+        assert "source_status" in body_deg
+        assert body_deg["source_status"]["x"]["state"] == "auth-failed"
+        assert body_deg["source_status"]["stocktwits"]["state"] == "timeout"
+
+        # 2. Empty: all sources are no-results and 0 items -> ok=False, status="empty"
+        payload_queue.append(
+            {
+                "query": "ObscureTopicXYZ",
+                "results": [],
+                "source_status": {
+                    "x": {"state": "no-results"},
+                    "stocktwits": {"state": "no-results"},
+                    "polymarket": {"state": "no-results"},
+                },
+            }
+        )
+        resp_emp = await bridge.handle_tools_call(
+            551,
+            {
+                "name": "community",
+                "arguments": {"route": "last30days", "query": "ObscureTopicXYZ"},
+            },
+        )
+        body_emp = json.loads(resp_emp["result"]["content"][0]["text"])
+        assert body_emp["ok"] is False
+        assert body_emp["status"] == "empty"
+
+        # 3. Partial items + failed sources -> ok=True, status="ok", failed sources in warnings
+        payload_queue.append(
+            {
+                "query": "NVDA",
+                "results": [
+                    {
+                        "candidate_id": "c1",
+                        "source": "stocktwits",
+                        "url": "https://stocktwits.com/symbol/NVDA/1",
+                        "published_at": "2026-10-22",
+                        "author": "bull_trader",
+                        "title": "NVDA strong",
+                    }
+                ],
+                "source_status": {
+                    "stocktwits": {"state": "ok", "count": 1},
+                    "x": {"state": "rate-limited"},
+                    "polymarket": {"state": "unreachable"},
+                },
+            }
+        )
+        resp_part = await bridge.handle_tools_call(
+            552, {"name": "community", "arguments": {"route": "last30days", "query": "NVDA"}}
+        )
+        body_part = json.loads(resp_part["result"]["content"][0]["text"])
+        assert body_part["ok"] is True
+        assert body_part["status"] == "ok"
+        warnings_joined = " ".join(body_part.get("warnings") or [])
+        assert "x" in warnings_joined and "rate-limited" in warnings_joined
+        assert "polymarket" in warnings_joined and "unreachable" in warnings_joined
+
+    @pytest.mark.asyncio
+    async def test_queue_wait_counts_toward_deadline_and_skips_spawn_on_timeout(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bridge = _make_bridge(tmp_path, monkeypatch)
+        monkeypatch.setattr(bridge, "compute_timeout", lambda *_a, **_kw: 1)
+        exec_mock = create_autospec(asyncio.create_subprocess_exec)
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", exec_mock)
+
+        # Hold the single last30days semaphore slot so the queued request times out before spawning
+        sem = bridge.community_sems["last30days"]
+        await sem.acquire()
+        try:
+            # Make compute_timeout return a tiny budget via _handle_community_call
+            resp = await bridge._handle_community_call(
+                560,
+                "last30days",
+                {"route": "last30days", "query": "NVDA"},
+                eff_timeout=0,
+            )
+        finally:
+            sem.release()
+
+        body = json.loads(resp["result"]["content"][0]["text"])
+        assert body["ok"] is False
+        assert body["status"] == "timeout"
+        assert exec_mock.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_catalog_category_filter_and_xueqiu_beijing_timezone_and_blind_rule(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bridge = _make_bridge(tmp_path, monkeypatch)
+
+        async def _responder(
+            reqs: list[dict[str, Any]],
+        ) -> tuple[list[dict[str, Any]], int]:
+            req = reqs[0]
+            cat_payload = {
+                "ok": True,
+                "status": "ok",
+                "routes": [
+                    {"id": "sec", "kind": "cli", "category": "finance", "operations": ["list-filings"]},
+                ],
+            }
+            return [_mcp_tool_response(req["id"], cat_payload)], 0
+
+        monkeypatch.setattr(
+            asyncio, "create_subprocess_exec", _make_subprocess_double(_responder)
+        )
+
+        # 1. catalog(category="finance") must NOT append community routes
+        resp_fin = await bridge.handle_tools_call(
+            570, {"name": "catalog", "arguments": {"category": "finance"}}
+        )
+        body_fin = json.loads(resp_fin["result"]["content"][0]["text"])
+        fin_ids = {r["id"] for r in body_fin["routes"]}
+        assert fin_ids == {"sec"}
+
+        # 2. catalog(category="community") appends the 3 community routes
+        resp_comm = await bridge.handle_tools_call(
+            571, {"name": "catalog", "arguments": {"category": "community"}}
+        )
+        body_comm = json.loads(resp_comm["result"]["content"][0]["text"])
+        comm_ids = {r["id"] for r in body_comm["routes"]}
+        assert {"xueqiu", "employee", "last30days"} <= comm_ids
+
+        # 3. Xueqiu _sources date converts created_at_ms and YYYY-MM-DD HH:MM to +08:00 ISO
+        xq_decl = source_identity.declare(
+            "community",
+            {"route": "xueqiu", "operation": "posts", "ticker": "06181"},
+            {
+                "ok": True,
+                "status": "ok",
+                "data": [
+                    {
+                        "id": "9001",
+                        "url": "https://xueqiu.com/111/9001",
+                        "created_at": "2026-10-22 14:30",
+                        "created_at_ms": 1761114600000,
+                        "author": "kol_a",
+                        "title": "Post with ms",
+                    },
+                    {
+                        "id": "9002",
+                        "url": "https://xueqiu.com/111/9002",
+                        "created_at": "2026-10-22 09:15",
+                        "author": "kol_b",
+                        "title": "Post without ms",
+                    },
+                ],
+            },
+        )
+        assert len(xq_decl) == 2
+        assert xq_decl[0]["date"].endswith("+08:00")
+        assert "T" in xq_decl[0]["date"]
+        assert xq_decl[1]["date"] == "2026-10-22T09:15:00+08:00"
+
+        # 4. Blind evidence rule in evidence-and-sources.md
+        ev_md = (
+            REPO_ROOT
+            / "plugins"
+            / "dalton"
+            / "skills"
+            / "dalton-conventions"
+            / "references"
+            / "evidence-and-sources.md"
+        ).read_text(encoding="utf-8")
+        assert "仅可用于统计评分等元数据" in ev_md
+        assert "不能**用于做正文词频统计" in ev_md
+
+    @pytest.mark.asyncio
+    async def test_last30days_maintenance_commands_and_dash_prefix_rejected(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bridge = _make_bridge(tmp_path, monkeypatch)
+        exec_mock = create_autospec(asyncio.create_subprocess_exec)
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", exec_mock)
+
+        forbidden_queries = [
+            "setup",
+            "SETUP",
+            "  setup  ",
+            "self-test",
+            "doctor",
+            "diagnose",
+            "preflight",
+            "welcome",
+            "install",
+            "upgrade",
+            "library",
+            "library feed",
+            "library search",
+            "library search NVDA",
+            "queue",
+            "queue list",
+            "queue cover",
+            "queue cover 12",
+            "-h",
+            "--help",
+            "--diagnose",
+            "--welcome",
+            "-setup",
+        ]
+        for idx, q in enumerate(forbidden_queries):
+            resp = await bridge.handle_tools_call(
+                600 + idx,
+                {
+                    "name": "community",
+                    "arguments": {"route": "last30days", "query": q},
+                },
+            )
+            body = json.loads(resp["result"]["content"][0]["text"])
+            assert body["ok"] is False, f"Expected rejection for query={q!r}"
+            assert body["status"] == "invalid_arguments"
+            assert body["error_code"] == "invalid_arguments"
+
+        assert exec_mock.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_partial_success_sanitizes_source_status_and_errors_by_source(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bridge = _make_bridge(tmp_path, monkeypatch)
+        exec_mock = create_autospec(asyncio.create_subprocess_exec)
+
+        async def _fake_exec(*cmd: Any, **kwargs: Any) -> asyncio.subprocess.Process:
+            proc = create_autospec(asyncio.subprocess.Process, instance=True)
+            proc.returncode = 0
+            out = {
+                "schema_version": "1.4",
+                "query": "NVDA",
+                "results": [
+                    {
+                        "candidate_id": "c1",
+                        "source": "stocktwits",
+                        "url": "https://stocktwits.com/symbol/NVDA/1",
+                        "published_at": "2026-10-22",
+                        "author": "bull_1",
+                        "title": "NVDA demand solid",
+                    }
+                ],
+                "source_status": {
+                    "stocktwits": {"state": "ok", "count": 1},
+                    "x": {
+                        "state": "error",
+                        "error": "Auth failed with token=secretSourceStatusToken111",
+                        "detail": "Authorization: Bearer secretBearerInDetail222",
+                        "api_key": "rawApiKeyField333",
+                    },
+                },
+                "errors_by_source": {
+                    "x": "Request failed: token=secretErrorsBySourceToken444; cookie=xq_a_token=secretCookie555",
+                    "youtube": {"reason": "api_key='secretYoutubeKey666'"},
+                },
+                "x_error": "x_degraded: token=secretTopLevelXError777",
+            }
+            proc.communicate.return_value = (json.dumps(out).encode("utf-8"), b"")
+            return proc
+
+        exec_mock.side_effect = _fake_exec
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", exec_mock)
+
+        resp = await bridge.handle_tools_call(
+            620,
+            {"name": "community", "arguments": {"route": "last30days", "query": "NVDA"}},
+        )
+        body = json.loads(resp["result"]["content"][0]["text"])
+        assert body["ok"] is True
+        assert body["status"] == "ok"
+        serialized = json.dumps(body)
+        for secret in (
+            "secretSourceStatusToken111",
+            "secretBearerInDetail222",
+            "rawApiKeyField333",
+            "secretErrorsBySourceToken444",
+            "secretCookie555",
+            "secretYoutubeKey666",
+            "secretTopLevelXError777",
+        ):
+            assert secret not in serialized
+        assert "[REDACTED]" in json.dumps(body["data"]["source_status"])
+        assert "[REDACTED]" in json.dumps(body["data"]["errors_by_source"])
+        assert "[REDACTED]" in body["data"]["x_error"]
+
+    @pytest.mark.asyncio
+    async def test_url_validation_rejects_backslashes_and_forwards_canonical_url(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bridge = _make_bridge(tmp_path, monkeypatch)
+        observed_cmds: list[list[str]] = []
+        exec_mock = create_autospec(asyncio.create_subprocess_exec)
+
+        async def _fake_exec(*cmd: Any, **kwargs: Any) -> asyncio.subprocess.Process:
+            observed_cmds.append([str(c) for c in cmd])
+            proc = create_autospec(asyncio.subprocess.Process, instance=True)
+            proc.returncode = 0
+            out = {
+                "ok": True,
+                "reviews": [
+                    {
+                        "id": "gd1",
+                        "source": "glassdoor",
+                        "url": "https://www.glassdoor.com/Reviews/NVIDIA-Reviews-E7633.htm",
+                        "created_at": "2026-10-20",
+                        "jobgroup": "Engineer",
+                        "summary": "Good",
+                    }
+                ],
+                "id": "99",
+                "url": "https://xueqiu.com/12345/67890",
+                "created_at": "2026-10-22 10:00",
+                "author": "user1",
+                "title": "Title",
+            }
+            proc.communicate.return_value = (json.dumps(out).encode("utf-8"), b"")
+            return proc
+
+        exec_mock.side_effect = _fake_exec
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", exec_mock)
+
+        malicious_urls = [
+            (
+                "employee",
+                "glassdoor",
+                r"https://attacker.example\.glassdoor.com/Reviews",
+            ),
+            (
+                "xueqiu",
+                "post",
+                r"https://attacker.example\.xueqiu.com/123/456",
+            ),
+            (
+                "employee",
+                "glassdoor",
+                "https://glassdoor.com@attacker.example/Reviews",
+            ),
+            (
+                "employee",
+                "glassdoor",
+                "https://%67lassdoor.com/Reviews",
+            ),
+            (
+                "xueqiu",
+                "post",
+                "https://www.%78ueqiu.com/123/456",
+            ),
+            (
+                "employee",
+                "glassdoor",
+                "https://www.glassdoor.com/Reviews\nInjected",
+            ),
+        ]
+        for idx, (route, op, bad_url) in enumerate(malicious_urls):
+            args: dict[str, Any] = {
+                "route": route,
+                "operation": op,
+                "url": bad_url,
+            }
+            if route == "employee":
+                args["allow_paid"] = True
+            resp = await bridge.handle_tools_call(
+                630 + idx, {"name": "community", "arguments": args}
+            )
+            body = json.loads(resp["result"]["content"][0]["text"])
+            assert body["ok"] is False, f"Expected failure for URL {bad_url!r}"
+            assert body["status"] == "invalid_arguments"
+
+        assert len(observed_cmds) == 0
+
+        # Canonical URL must be passed to the script, not the raw input string
+        raw_gd_url = "HTTPS://WWW.Glassdoor.COM./Reviews/NVIDIA-Reviews-E7633.htm?sort=date"
+        resp_ok = await bridge.handle_tools_call(
+            640,
+            {
+                "name": "community",
+                "arguments": {
+                    "route": "employee",
+                    "operation": "glassdoor",
+                    "url": raw_gd_url,
+                    "allow_paid": True,
+                },
+            },
+        )
+        body_ok = json.loads(resp_ok["result"]["content"][0]["text"])
+        assert body_ok["ok"] is True
+        assert len(observed_cmds) == 1
+        url_arg_idx = observed_cmds[0].index("--url") + 1
+        assert (
+            observed_cmds[0][url_arg_idx]
+            == "https://www.glassdoor.com/Reviews/NVIDIA-Reviews-E7633.htm?sort=date"
+        )
+
+    @pytest.mark.asyncio
+    async def test_last30days_invokes_engine_venv_python_directly_with_env_and_source_missing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("EXCLUDE_SOURCES", "hn")
+        bridge = _make_bridge(tmp_path, monkeypatch)
+        observed_cmds: list[list[str]] = []
+        observed_envs: list[dict[str, str]] = []
+        exec_mock = create_autospec(asyncio.create_subprocess_exec)
+
+        async def _fake_exec(*cmd: Any, **kwargs: Any) -> asyncio.subprocess.Process:
+            observed_cmds.append([str(c) for c in cmd])
+            observed_envs.append(dict(kwargs.get("env") or {}))
+            proc = create_autospec(asyncio.subprocess.Process, instance=True)
+            proc.returncode = 0
+            out = {
+                "query": "NVDA",
+                "results": [
+                    {
+                        "candidate_id": "c1",
+                        "source": "stocktwits",
+                        "url": "https://stocktwits.com/symbol/NVDA/1",
+                        "published_at": "2026-10-22",
+                        "author": "u1",
+                        "title": "NVDA",
+                    }
+                ],
+                "source_status": {"stocktwits": {"state": "ok", "count": 1}},
+            }
+            proc.communicate.return_value = (json.dumps(out).encode("utf-8"), b"")
+            return proc
+
+        exec_mock.side_effect = _fake_exec
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", exec_mock)
+
+        resp_ok = await bridge.handle_tools_call(
+            650,
+            {
+                "name": "community",
+                "arguments": {"route": "last30days", "query": "NVDA", "days": 14, "quick": True},
+            },
+        )
+        body_ok = json.loads(resp_ok["result"]["content"][0]["text"])
+        assert body_ok["ok"] is True
+        assert len(observed_cmds) == 1
+        assert observed_cmds[0] == [
+            str(bridge.cfg.last30days_python),
+            str(bridge.cfg.last30days_script),
+            "NVDA",
+            "--days",
+            "14",
+            "--quick",
+            "--emit=json",
+        ]
+        assert "bash" not in observed_cmds[0]
+        assert observed_envs[0]["FROM_BROWSER"] == "off"
+        assert observed_envs[0]["LAST30DAYS_ALLOW_ENGINE_PLAN"] == "1"
+        assert observed_envs[0]["EXCLUDE_SOURCES"] == "hn,reddit"
+
+        # Missing python interpreter -> source_missing
+        bridge.cfg.last30days_python = tmp_path / "missing_l30_python"
+        resp_missing_py = await bridge.handle_tools_call(
+            651,
+            {"name": "community", "arguments": {"route": "last30days", "query": "NVDA"}},
+        )
+        body_missing_py = json.loads(resp_missing_py["result"]["content"][0]["text"])
+        assert body_missing_py["ok"] is False
+        assert body_missing_py["status"] == "source_missing"
+        assert len(observed_cmds) == 1
+
+    @pytest.mark.asyncio
+    async def test_last30days_strict_empty_vs_degraded_and_partial_warnings(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bridge = _make_bridge(tmp_path, monkeypatch)
+        exec_mock = create_autospec(asyncio.create_subprocess_exec)
+        payload_queue: list[dict[str, Any]] = []
+
+        async def _fake_exec(*cmd: Any, **kwargs: Any) -> asyncio.subprocess.Process:
+            proc = create_autospec(asyncio.subprocess.Process, instance=True)
+            proc.returncode = 0
+            out = payload_queue.pop(0)
+            proc.communicate.return_value = (json.dumps(out).encode("utf-8"), b"")
+            return proc
+
+        exec_mock.side_effect = _fake_exec
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", exec_mock)
+
+        # 1. Non-no-results states with 0 items (payment-required, missing, broken, skipped-unconfigured, schema-drift, or empty source_status) -> degraded
+        for idx, src_status in enumerate(
+            [
+                {"x": {"state": "payment-required"}, "stocktwits": {"state": "no-results"}},
+                {"x": {"state": "missing"}},
+                {"x": {"state": "broken"}},
+                {"x": {"state": "skipped-unconfigured"}},
+                {"x": {"state": "schema-drift"}},
+                {},
+            ]
+        ):
+            payload_queue.append(
+                {"query": "NVDA", "results": [], "source_status": src_status}
+            )
+            resp = await bridge.handle_tools_call(
+                660 + idx,
+                {"name": "community", "arguments": {"route": "last30days", "query": "NVDA"}},
+            )
+            body = json.loads(resp["result"]["content"][0]["text"])
+            assert body["ok"] is False, f"Expected degraded for {src_status}"
+            assert body["status"] == "degraded"
+            assert "source_status" in body
+
+        # 2. Has items + partial / schema-drift / payment-required -> ok=True, all non-(ok/no-results) in warnings
+        payload_queue.append(
+            {
+                "query": "NVDA",
+                "results": [
+                    {
+                        "candidate_id": "c1",
+                        "source": "stocktwits",
+                        "url": "https://stocktwits.com/symbol/NVDA/1",
+                        "published_at": "2026-10-22",
+                        "author": "u1",
+                        "title": "NVDA",
+                    }
+                ],
+                "source_status": {
+                    "stocktwits": {"state": "ok", "count": 1},
+                    "polymarket": {"state": "no-results"},
+                    "x": {"state": "partial"},
+                    "youtube": {"state": "schema-drift"},
+                },
+            }
+        )
+        resp_warn = await bridge.handle_tools_call(
+            670,
+            {"name": "community", "arguments": {"route": "last30days", "query": "NVDA"}},
+        )
+        body_warn = json.loads(resp_warn["result"]["content"][0]["text"])
+        assert body_warn["ok"] is True
+        assert body_warn["status"] == "ok"
+        warnings_text = " ".join(body_warn.get("warnings") or [])
+        assert "x" in warnings_text and "partial" in warnings_text
+        assert "youtube" in warnings_text and "schema-drift" in warnings_text
+        assert "polymarket" not in warnings_text
+
+    @pytest.mark.asyncio
+    async def test_process_group_reap_when_leader_exits_early_but_child_remains_alive(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bridge = _make_bridge(tmp_path, monkeypatch)
+        monkeypatch.setattr(rb, "COMMUNITY_SIGTERM_GRACE_S", 0.03)
+        monkeypatch.setattr(bridge, "compute_timeout", lambda *_a, **_kw: 1)
+
+        events: list[str] = []
+        child_alive = [True]
+        killpg_mock = create_autospec(rb.os.killpg)
+
+        def _fake_killpg(pgid: int, sig: int) -> None:
+            if not child_alive[0]:
+                raise ProcessLookupError(3, "No such process")
+            if sig == rb.signal.SIGTERM:
+                events.append(f"killpg:SIGTERM:{pgid}")
+            elif sig == 0:
+                if f"killpg:0:{pgid}" not in events:
+                    events.append(f"killpg:0:{pgid}")
+            elif sig == rb.signal.SIGKILL:
+                events.append(f"killpg:SIGKILL:{pgid}")
+                child_alive[0] = False
+
+        killpg_mock.side_effect = _fake_killpg
+        monkeypatch.setattr(rb.os, "killpg", killpg_mock)
+
+        exec_mock = create_autospec(asyncio.create_subprocess_exec)
+
+        async def _fake_exec(*cmd: Any, **kwargs: Any) -> asyncio.subprocess.Process:
+            proc = create_autospec(asyncio.subprocess.Process, instance=True)
+            proc.pid = 54321
+            # Simulate group leader already exited (returncode=0), while child in process group holds pipe open
+            proc.returncode = 0
+
+            async def _communicate(input: bytes | None = None) -> tuple[bytes, bytes]:
+                await asyncio.sleep(30.0)
+                return b"", b""
+
+            async def _wait() -> int:
+                events.append("wait:leader_reaped")
+                return 0
+
+            proc.communicate.side_effect = _communicate
+            proc.wait.side_effect = _wait
+            return proc
+
+        exec_mock.side_effect = _fake_exec
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", exec_mock)
+
+        resp = await bridge.handle_tools_call(
+            680,
+            {"name": "community", "arguments": {"route": "last30days", "query": "NVDA"}},
+        )
+        body = json.loads(resp["result"]["content"][0]["text"])
+        assert body["ok"] is False
+        assert body["status"] == "timeout"
+        assert events == [
+            "killpg:SIGTERM:54321",
+            "killpg:0:54321",
+            "killpg:SIGKILL:54321",
+            "wait:leader_reaped",
+        ]
+
+
+
+
+
+
+def test_secret_key_regex_keeps_author_fields_and_token_counts() -> None:
+    """Author attribution and token-count fields are evidence, not secrets."""
+    import researchdata_bridge as rb
+
+    for kept in ("author", "author_id", "totalTokens", "promptTokens"):
+        assert not rb._SECRET_KEY_NAME_RE.search(kept), kept
+    for secret in ("auth", "auth_token", "Authorization", "api_key", "xq_a_token", "token", "cookie"):
+        assert rb._SECRET_KEY_NAME_RE.search(secret), secret
+    payload = {"author": "西门居士", "author_id": 7295972385, "token": "abc123secret"}
+    out = rb._sanitize_community_payload_metadata(dict(payload))
+    assert out["author"] == "西门居士" and out["author_id"] == 7295972385
+    assert out["token"] == "[REDACTED]"
+
+
+def test_community_url_rejects_surrounding_whitespace() -> None:
+    import pytest
+    import researchdata_bridge as rb
+
+    for bad in (" https://xueqiu.com/1/2", "https://xueqiu.com/1/2\n"):
+        with pytest.raises(ValueError):
+            rb._validate_community_url(bad, required_domain="xueqiu.com")

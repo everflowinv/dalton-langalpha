@@ -95,6 +95,13 @@ def format_health_status(record: Mapping[str, Any] | None) -> str:
         if not reason:
             reason = "调用失败"
         return f"不可用({reason[:32]})"
+    unprobed_reason = str(
+        (record.get("detail") or {}).get("reason")
+        if isinstance(record.get("detail"), Mapping)
+        else ""
+    ).strip() or str(record.get("error_type") or "").strip()
+    if unprobed_reason:
+        return f"未体检({unprobed_reason[:32]})"
     return "未体检"
 
 
@@ -147,7 +154,11 @@ def merge_catalog_routes(
             if not route_id or route_id in effective_handoff:
                 continue
             kind = str(raw_route.get("kind") or "").strip().lower()
-            if kind in ("agent_tool", "skill"):
+            if kind in ("agent_tool", "skill") and route_id not in (
+                "xueqiu",
+                "employee",
+                "last30days",
+            ):
                 continue
             seen_ids.add(route_id)
             yaml_entry = yaml_routes.get(route_id)

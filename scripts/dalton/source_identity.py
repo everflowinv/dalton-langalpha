@@ -7,7 +7,10 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import datetime, timedelta, timezone
 from typing import Any
+
+_BEIJING_TZ = timezone(timedelta(hours=8))
 
 MAX_SOURCES_PER_CALL = 50
 MAX_DOC_ID_LEN = 200
@@ -616,6 +619,318 @@ def _declare_market_regime(arguments: dict[str, Any], inner: dict[str, Any], fal
     ]
 
 
+def _format_xueqiu_iso_date(
+    item: dict[str, Any], fallback_as_of: str | None
+) -> tuple[str, str | None]:
+    """Convert Xueqiu `created_at_ms` (or numeric `created_at`) to ISO-8601 with `+08:00`, or parse `YYYY-MM-DD HH:MM` as Beijing time."""
+    for ts_key in ("created_at_ms", "created_at"):
+        ts_val = item.get(ts_key)
+        if isinstance(ts_val, bool) or ts_val is None:
+            continue
+        ms: float | None = None
+        if isinstance(ts_val, (int, float)) and ts_val > 0:
+            ms = float(ts_val)
+        elif isinstance(ts_val, str) and ts_val.strip().isdigit():
+            ms = float(ts_val.strip())
+        if ms is not None and ms > 0:
+            if ms < 1e11:
+                ms *= 1000.0
+            dt = datetime.fromtimestamp(ms / 1000.0, tz=_BEIJING_TZ)
+            return dt.isoformat(timespec="seconds"), dt.strftime("%Y-%m-%d")
+
+    raw_date = str(
+        item.get("created_at")
+        or item.get("date")
+        or item.get("published_at")
+        or fallback_as_of
+        or ""
+    ).strip()
+    if not raw_date:
+        return "", fallback_as_of
+
+    normalized = raw_date.replace("T", " ")
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            dt = datetime.strptime(normalized, fmt).replace(tzinfo=_BEIJING_TZ)
+            return dt.isoformat(timespec="seconds"), dt.strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+
+    as_of = raw_date[:10] if len(raw_date) >= 10 else fallback_as_of
+    return raw_date, as_of
+
+
+def _declare_xueqiu(
+    arguments: dict[str, Any],
+    payload: dict[str, Any],
+    inner: dict[str, Any],
+    fallback_as_of: str,
+) -> list[dict[str, Any]]:
+    raw_data = payload.get("data")
+    items: list[dict[str, Any]] = []
+    if isinstance(raw_data, list):
+        items = [x for x in raw_data if isinstance(x, dict)]
+    elif isinstance(inner.get("posts"), list):
+        items = [x for x in inner["posts"] if isinstance(x, dict)]
+    elif isinstance(inner.get("comments"), list):
+        items = [x for x in inner["comments"] if isinstance(x, dict)]
+    elif isinstance(inner.get("results"), list):
+        items = [x for x in inner["results"] if isinstance(x, dict)]
+    elif isinstance(inner.get("items"), list):
+        items = [x for x in inner["items"] if isinstance(x, dict)]
+    elif isinstance(raw_data, dict) and any(
+        k in raw_data for k in ("id", "url", "text", "title", "author", "created_at", "created_at_ms")
+    ):
+        items = [raw_data]
+    elif any(k in inner for k in ("id", "url", "text", "title", "author", "created_at", "created_at_ms")) and "data" not in inner:
+        items = [inner]
+
+    out: list[dict[str, Any]] = []
+    req_url = str(arguments.get("url") or "").strip()
+    req_post_id = str(arguments.get("post_id") or "").strip()
+
+    for idx, item in enumerate(items):
+        item_id = str(item.get("id") or item.get("post_id") or "").strip()
+        url = str(item.get("url") or "").strip()
+        if not url:
+            if req_url:
+                url = req_url
+            elif req_post_id:
+                url = f"https://xueqiu.com/status/{req_post_id}"
+            elif item_id:
+                url = f"https://xueqiu.com/status/{item_id}"
+        iso_date, as_of = _format_xueqiu_iso_date(item, fallback_as_of)
+        author = (
+            str(item.get("author") or item.get("user") or item.get("screen_name") or "雪球用户").strip()
+            or "雪球用户"
+        )
+        title = str(item.get("title") or item.get("text") or f"雪球 {item_id or (idx + 1)}").strip()
+        doc_id = f"xueqiu:{item_id}" if item_id else f"xueqiu:{idx + 1}"
+        entry = _make_entry(
+            document_id=doc_id,
+            route="xueqiu",
+            identity="news",
+            publisher="雪球",
+            title=title,
+            as_of=as_of,
+            as_of_basis="publish_time",
+            source_type="community_post",
+            url=url or None,
+            private=False,
+            independent=True,
+        )
+        entry["platform"] = "xueqiu"
+        entry["url"] = _trunc(url, MAX_URL_LEN)
+        entry["date"] = _trunc(iso_date or as_of, 64)
+        entry["author"] = _trunc(author, 120)
+        out.append(entry)
+        if len(out) >= MAX_SOURCES_PER_CALL:
+            break
+    return out[:MAX_SOURCES_PER_CALL]
+
+
+def _declare_employee(
+    arguments: dict[str, Any],
+    payload: dict[str, Any],
+    inner: dict[str, Any],
+    fallback_as_of: str,
+) -> list[dict[str, Any]]:
+    if inner.get("ok") is False:
+        return []
+    raw_data = payload.get("data")
+    reviews: list[dict[str, Any]] = []
+    if isinstance(raw_data, list):
+        reviews = [x for x in raw_data if isinstance(x, dict)]
+    elif isinstance(inner.get("reviews"), list):
+        reviews = [x for x in inner["reviews"] if isinstance(x, dict)]
+    elif isinstance(inner.get("results"), list):
+        reviews = [x for x in inner["results"] if isinstance(x, dict)]
+    elif isinstance(inner.get("items"), list):
+        reviews = [x for x in inner["items"] if isinstance(x, dict)]
+
+    default_platform = (
+        str(inner.get("source") or arguments.get("operation") or "blind").strip().lower() or "blind"
+    )
+    if default_platform == "summary":
+        default_platform = "blind"
+    company = str(inner.get("company") or arguments.get("company") or "").strip()
+    req_url = str(inner.get("url") or arguments.get("url") or "").strip()
+    out: list[dict[str, Any]] = []
+
+    for idx, r in enumerate(reviews):
+        platform = str(r.get("source") or default_platform).strip().lower() or default_platform
+        rev_id = str(r.get("id") or "").strip()
+        url = str(r.get("url") or req_url or "").strip()
+        if not url and company and platform == "blind":
+            url = f"https://www.teamblind.com/company/{company}/reviews"
+        raw_date = str(
+            r.get("created_at") or r.get("date") or r.get("published_at") or fallback_as_of or ""
+        ).strip()
+        as_of = raw_date[:10] if raw_date else fallback_as_of
+        author = (
+            str(
+                r.get("author")
+                or r.get("jobgroup")
+                or r.get("job_title")
+                or r.get("role")
+                or "Anonymous Employee"
+            ).strip()
+            or "Anonymous Employee"
+        )
+        title = str(
+            r.get("summary") or r.get("title") or f"{company or platform} review {rev_id or (idx + 1)}"
+        ).strip()
+        doc_id = f"employee:{platform}:{rev_id}" if rev_id else f"employee:{platform}:{idx + 1}"
+        entry = _make_entry(
+            document_id=doc_id,
+            route="employee",
+            identity="news",
+            publisher=platform.capitalize(),
+            title=title,
+            as_of=as_of,
+            as_of_basis="publish_time",
+            source_type="employee_review",
+            url=url or None,
+            private=False,
+            independent=True,
+        )
+        entry["platform"] = _trunc(platform, 60)
+        entry["url"] = _trunc(url, MAX_URL_LEN)
+        entry["date"] = _trunc(raw_date or as_of, 64)
+        entry["author"] = _trunc(author, 120)
+        out.append(entry)
+        if len(out) >= MAX_SOURCES_PER_CALL:
+            break
+
+    if not out and (
+        inner.get("monthly_ratings")
+        or inner.get("top_pros_terms")
+        or inner.get("top_cons_terms")
+        or inner.get("overall_rating")
+        or inner.get("count")
+    ):
+        url = req_url or (
+            f"https://www.teamblind.com/company/{company}/reviews"
+            if company
+            else "https://www.teamblind.com"
+        )
+        latest_month = ""
+        monthly = inner.get("monthly_ratings")
+        if isinstance(monthly, list):
+            months = [
+                str(m.get("month") or "").strip()
+                for m in monthly
+                if isinstance(m, dict) and str(m.get("month") or "").strip()
+            ]
+            if months:
+                latest_month = max(months)
+        raw_date = latest_month or fallback_as_of
+        as_of = raw_date[:10] if raw_date else fallback_as_of
+        doc_id = f"employee:{default_platform}:{company or 'summary'}:summary"
+        entry = _make_entry(
+            document_id=doc_id,
+            route="employee",
+            identity="news",
+            publisher=default_platform.capitalize(),
+            title=f"{company or default_platform} employee review summary",
+            as_of=as_of,
+            as_of_basis="publish_time",
+            source_type="employee_review",
+            url=url,
+            private=False,
+            independent=True,
+        )
+        entry["platform"] = _trunc(default_platform, 60)
+        entry["url"] = _trunc(url, MAX_URL_LEN)
+        entry["date"] = _trunc(raw_date or as_of, 64)
+        entry["author"] = "Blind Aggregate"
+        out.append(entry)
+
+    return out[:MAX_SOURCES_PER_CALL]
+
+
+def _declare_last30days(
+    arguments: dict[str, Any],
+    payload: dict[str, Any],
+    inner: dict[str, Any],
+    fallback_as_of: str,
+) -> list[dict[str, Any]]:
+    raw_data = payload.get("data")
+    candidates: list[dict[str, Any]] = []
+    if isinstance(raw_data, list):
+        candidates = [x for x in raw_data if isinstance(x, dict)]
+    elif isinstance(inner.get("results"), list):
+        candidates = [x for x in inner["results"] if isinstance(x, dict)]
+    elif isinstance(inner.get("ranked_candidates"), list):
+        candidates = [x for x in inner["ranked_candidates"] if isinstance(x, dict)]
+    elif isinstance(inner.get("items"), list):
+        candidates = [x for x in inner["items"] if isinstance(x, dict)]
+    elif isinstance(inner.get("items_by_source"), dict):
+        for src_name, src_items in inner["items_by_source"].items():
+            if isinstance(src_items, list):
+                for item in src_items:
+                    if isinstance(item, dict):
+                        candidates.append({"source": src_name, **item})
+
+    gen_date = str(inner.get("generated_at") or fallback_as_of or "")[:10]
+    out: list[dict[str, Any]] = []
+    for idx, item in enumerate(candidates):
+        sources_list = item.get("sources")
+        platform = str(
+            item.get("source")
+            or item.get("platform")
+            or (sources_list[0] if isinstance(sources_list, list) and sources_list else "")
+            or "last30days"
+        ).strip().lower()
+        url = str(item.get("url") or "").strip()
+        raw_date = str(
+            item.get("published_at")
+            or item.get("created_at")
+            or item.get("date")
+            or gen_date
+            or fallback_as_of
+            or ""
+        ).strip()
+        as_of = raw_date[:10] if raw_date else (gen_date or fallback_as_of)
+        author = (
+            str(
+                item.get("author")
+                or item.get("author_handle")
+                or item.get("user")
+                or item.get("subreddit")
+                or item.get("channel")
+                or platform
+            ).strip()
+            or platform
+        )
+        cand_id = str(item.get("candidate_id") or item.get("id") or "").strip()
+        title = str(
+            item.get("title") or item.get("text") or item.get("summary") or f"{platform} {cand_id or (idx + 1)}"
+        ).strip()
+        doc_id = f"last30days:{platform}:{cand_id}" if cand_id else f"last30days:{platform}:{idx + 1}"
+        entry = _make_entry(
+            document_id=doc_id,
+            route="last30days",
+            identity="news",
+            publisher=platform,
+            title=title,
+            as_of=as_of,
+            as_of_basis="publish_time",
+            source_type="community_post",
+            url=url or None,
+            private=False,
+            independent=True,
+        )
+        entry["platform"] = _trunc(platform, 60)
+        entry["url"] = _trunc(url, MAX_URL_LEN)
+        entry["date"] = _trunc(raw_date or as_of, 64)
+        entry["author"] = _trunc(author, 120)
+        out.append(entry)
+        if len(out) >= MAX_SOURCES_PER_CALL:
+            break
+    return out[:MAX_SOURCES_PER_CALL]
+
+
 def declare(tool: str, arguments: dict[str, Any] | None, payload: dict[str, Any] | None) -> list[dict[str, Any]]:
     """Return up to 50 structured source records for a `researchdata` tool call result."""
     if not isinstance(payload, dict):
@@ -656,5 +971,11 @@ def declare(tool: str, arguments: dict[str, Any] | None, payload: dict[str, Any]
         return _declare_market_regime(args, inner, fallback_as_of)
     if route == "cn-hk":
         return _declare_cnhk(args, inner, fallback_as_of)
+    if route == "xueqiu":
+        return _declare_xueqiu(args, payload, inner, fallback_as_of)
+    if route == "employee":
+        return _declare_employee(args, payload, inner, fallback_as_of)
+    if route == "last30days":
+        return _declare_last30days(args, payload, inner, fallback_as_of)
 
     return []
