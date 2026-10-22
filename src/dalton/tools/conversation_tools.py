@@ -40,7 +40,7 @@ def create_conversation_tools() -> list[BaseTool]:
         *,
         config: RunnableConfig,
     ) -> str:
-        """Search the OpenClaw human conversation archive for structured knowledge cards and verbatim quotes.
+        """Use when asked about any company, topic, or sector to check the team's prior views, model assumptions, decisions, and open todos first, or when verbatim quotes and OpenClaw provenance are needed.
         Covers `source_type=conversation` discussion cards only, not external filings or research documents; `limit` is capped at 50.
 
         Args:

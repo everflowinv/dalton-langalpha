@@ -167,6 +167,10 @@ def _log_container_hardening() -> None:
 # ============================================================================
 # Lifespan Context Manager
 # ============================================================================
+# DALTON-HOOK(data-map): hold strong reference to startup health-check task
+_dalton_health_startup_task: asyncio.Task | None = None
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize resources when server starts, cleanup when stops."""
@@ -176,7 +180,8 @@ async def lifespan(app: FastAPI):
         workspace_manager, \
         checkpointer, \
         store, \
-        llm_service
+        llm_service, \
+        _dalton_health_startup_task
 
     # Configure logging based on environment settings (first thing on startup)
     configure_logging()
@@ -689,6 +694,15 @@ async def lifespan(app: FastAPI):
             name="warm-brokerage-marks",
         )
 
+    # DALTON-HOOK(data-map): run background data-source health check loop on startup
+    if os.getenv("DALTON_HEALTH_ON_STARTUP", "1").strip().lower() not in ("0", "false", "no"):
+        from src.dalton.data_map.health import run_startup_health_check_loop
+
+        _dalton_health_startup_task = asyncio.create_task(
+            run_startup_health_check_loop(),
+            name="dalton-startup-data-source-health",
+        )
+
     # Startup leaves ~700k import-time objects (pydantic schemas, routes,
     # module state) that never die, and every full collection re-walks them
     # while the loop is frozen. Freezing moves them out of the collector for
@@ -701,6 +715,11 @@ async def lifespan(app: FastAPI):
 
     # Shutdown
     logger.info("Application shutdown started...")
+    # DALTON-HOOK(data-map): cancel startup data-source health task on shutdown
+    if _dalton_health_startup_task is not None:
+        _dalton_health_startup_task.cancel()
+        await asyncio.gather(_dalton_health_startup_task, return_exceptions=True)
+        _dalton_health_startup_task = None
     # Awaited, so a warm-up stopped midway releases its lock while Redis is
     # still open; a lock left to expire skips the warm-up of a quick restart.
     # The refreshes go after it, since the warm-up can start them.
