@@ -21,7 +21,7 @@ def yahoo_symbol(symbol: str, *, is_index: bool = False) -> str:
     takes a caret.
     """
     s = vendor_spelling(symbol)
-    if not is_index or s.startswith("^") or "." in s:
+    if not is_index or s.startswith("^") or "." in s or "=" in s:  # DALTON-HOOK(stock-move-upgrade)
         return s
     return f"^{s}"
 

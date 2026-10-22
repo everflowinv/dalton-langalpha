@@ -49,7 +49,7 @@ from data_client.market_data_provider import symbol_market
 from data_client.normalize import minor_unit_scale, normalize_bars, scale_price
 from data_client.ginlix_data.cn_source import GinlixDataCnSource
 from data_client.ginlix_data.directory import NameDirectory
-from market_protocol import to_canonical, to_display, to_legacy_api
+from market_protocol import is_family_index, to_canonical, to_display, to_legacy_api  # DALTON-HOOK(stock-move-upgrade)
 from market_protocol.enums import AssetClass
 
 try:
@@ -123,7 +123,10 @@ def _resolve(
     """
     try:
         ref = to_canonical(symbol, asset_class=asset_class)
-        return to_display(ref), to_legacy_api(ref), ref.price_currency, ref.tz
+        legacy = (  # DALTON-HOOK(stock-move-upgrade)
+            f"^{to_legacy_api(ref)}" if is_family_index(ref) else to_legacy_api(ref)
+        )
+        return to_display(ref), legacy, ref.price_currency, ref.tz
     except Exception:  # noqa: BLE001
         return symbol, symbol, None, None
 
@@ -182,6 +185,7 @@ async def _fetch_stock_series(
     interval: str,
     start_date: Optional[str],
     end_date: Optional[str],
+    extended_hours: bool = False,  # DALTON-HOOK(stock-move-upgrade)
 ) -> tuple[Optional[dict], Optional[dict]]:
     """Fetch stock OHLCV: ginlix-data (CN daily, then US) → FMP fallback (global).
 
@@ -194,7 +198,9 @@ async def _fetch_stock_series(
     resolved = _resolve(symbol)
     (name, _), (ok, err) = await asyncio.gather(
         _names.display_names(resolved[1]),
-        _fetch_stock_bars(resolved, interval, start_date, end_date),
+        _fetch_stock_bars(
+            resolved, interval, start_date, end_date, extended_hours=extended_hours
+        ),
     )
     if ok is not None and name:
         ok["name"] = name
@@ -206,6 +212,7 @@ async def _fetch_stock_bars(
     interval: str,
     start_date: Optional[str],
     end_date: Optional[str],
+    extended_hours: bool = False,  # DALTON-HOOK(stock-move-upgrade)
 ) -> tuple[Optional[dict], Optional[dict]]:
     display, legacy, currency, timezone = resolved
     canonical, err = _resolve_interval(interval, _STOCK_INTERVALS, symbol=display)
@@ -255,7 +262,11 @@ async def _fetch_stock_bars(
             }, None
 
     # ginlix-data's US tier (US equities only; returns None for anything else).
-    ginlix_result = await _ginlix.fetch_stock_data(legacy, canonical, start_date, end_date)
+    ginlix_result = (
+        None
+        if legacy.startswith("^")  # DALTON-HOOK(stock-move-upgrade)
+        else await _ginlix.fetch_stock_data(legacy, canonical, start_date, end_date)
+    )
     refused: Optional[dict] = None
     if isinstance(ginlix_result, dict):
         status = ginlix_result.get("status")
@@ -299,7 +310,11 @@ async def _fetch_stock_bars(
             rows = await client.get_stock_price(legacy, from_date=start_date, to_date=end_date)
         else:
             rows = await client.get_intraday_chart(
-                legacy, canonical, from_date=start_date, to_date=end_date
+                legacy,
+                canonical,
+                from_date=start_date,
+                to_date=end_date,
+                **({"extended": True} if extended_hours else {}),  # DALTON-HOOK(stock-move-upgrade)
             )
     except Exception as e:  # noqa: BLE001
         return None, refused or error_from_exception(
@@ -349,27 +364,30 @@ async def get_stock_data(
     interval: str = "1day",
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
+    extended_hours: bool = False,  # DALTON-HOOK(stock-move-upgrade)
 ) -> _OUT_GET_STOCK_DATA:
     """Fetch OHLCV price bars for a stock; use for historical charts/analysis.
 
-    Intervals: 1min|5min|15min|30min|1hour|4hour|1day (aliases like "1d"/"daily"
-    accepted). start_date and end_date are required for intraday.
+    Intervals: 1min|5min|15min|30min|1hour|4hour|1day ("1d"/"daily" accepted);
+    start_date and end_date required for intraday.
 
     Args:
-        symbol: Ticker — US "AAPL", HK "0700.HK", A-share "600519.SH", LSE "VOD.L".
+        symbol: US "AAPL", HK "0700.HK", CN "600519.SH", UK "VOD.L", futures "NQ=F", index "^TNX".
         interval: Bar size; one of the intervals above.
-        start_date: "YYYY-MM-DD" (append " HH:MM" for intraday time filtering).
-        end_date: "YYYY-MM-DD" (append " HH:MM" for intraday time filtering).
+        start_date: "YYYY-MM-DD[ HH:MM]" start filter.
+        end_date: "YYYY-MM-DD[ HH:MM]" end filter.
+        extended_hours: Include pre/post-market intraday bars (default False).
 
     Returns:
         dict: {symbol, interval, currency, timezone, count, data, source,
         name?}. data: list of {date, open, high, low, close, volume} ascending
-        (oldest first); date exchange-local "YYYY-MM-DD" (daily) or
-        "YYYY-MM-DD HH:MM:SS" (intraday); prices in `currency` major units.
-        name: local-language company name, CN and HK listings only. On error:
-        {error: <code>, detail}.
+        (oldest first); date exchange-local "YYYY-MM-DD[ HH:MM:SS]"; prices in
+        `currency` major units. name: local-language name (CN/HK only). On
+        error: {error: <code>, detail}.
     """
-    env, err = await _fetch_stock_series(symbol, interval, start_date, end_date)
+    env, err = await _fetch_stock_series(
+        symbol, interval, start_date, end_date, extended_hours=extended_hours
+    )
     if err is not None:
         return err
     return make_response(**env)
@@ -392,6 +410,7 @@ async def get_asset_data(
     interval: str = "1day",
     from_date: Optional[str] = None,
     to_date: Optional[str] = None,
+    extended_hours: bool = False,  # DALTON-HOOK(stock-move-upgrade)
 ) -> _OUT_GET_ASSET_DATA:
     """Fetch OHLCV bars for a stock, commodity, crypto, or forex pair.
 
@@ -399,18 +418,19 @@ async def get_asset_data(
     required for intraday.
 
     Args:
-        symbol: Stock "AAPL", commodity "GCUSD", crypto "BTCUSD", forex "EURUSD".
+        symbol: Stock "AAPL", commodity "GCUSD"/"CL=F", crypto "BTCUSD", fx "EURUSD".
         asset_type: One of stock|commodity|crypto|forex.
         interval: Bar size; see intervals above.
-        from_date: "YYYY-MM-DD" (append " HH:MM" for intraday time filtering).
-        to_date: "YYYY-MM-DD" (append " HH:MM" for intraday time filtering).
+        from_date: "YYYY-MM-DD[ HH:MM]" start filter.
+        to_date: "YYYY-MM-DD[ HH:MM]" end filter.
+        extended_hours: Include pre/post-market intraday bars (default False).
 
     Returns:
         dict: {symbol, asset_type, interval, currency, timezone, count, data,
         source, name?}. data: list of {date, open, high, low, close, volume}
-        ascending (oldest first); date exchange-local "YYYY-MM-DD[ HH:MM:SS]";
-        prices in `currency` major units. name: local-language company name,
-        CN and HK stock listings only. On error: {error: <code>, detail}.
+        ascending (oldest first); exchange-local "YYYY-MM-DD[ HH:MM:SS]"; prices
+        in `currency` major units. name: local-language name (CN/HK stock only).
+        On error: {error: <code>, detail}.
     """
     at = asset_type.lower().strip()
     if at not in {"stock", "commodity", "crypto", "forex"}:
@@ -421,7 +441,9 @@ async def get_asset_data(
         )
 
     if at == "stock":
-        env, err = await _fetch_stock_series(symbol, interval, from_date, to_date)
+        env, err = await _fetch_stock_series(  # DALTON-HOOK(stock-move-upgrade)
+            symbol, interval, from_date, to_date, extended_hours=extended_hours  # DALTON-HOOK(stock-move-upgrade)
+        )  # DALTON-HOOK(stock-move-upgrade)
         if err is not None:
             return err
         env["asset_type"] = at
@@ -455,6 +477,7 @@ async def get_asset_data(
         )
 
     try:
+        ext_kw = {"extended": True} if extended_hours else {}  # DALTON-HOOK(stock-move-upgrade)
         if canonical in DAILY_INTERVALS:
             if at == "commodity":
                 rows = await client.get_commodity_price(symbol, from_date=from_date, to_date=to_date)
@@ -464,15 +487,15 @@ async def get_asset_data(
                 rows = await client.get_forex_price(symbol, from_date=from_date, to_date=to_date)
         elif at == "commodity":
             rows = await client.get_commodity_intraday_chart(
-                symbol, canonical, from_date=from_date, to_date=to_date
+                symbol, canonical, from_date=from_date, to_date=to_date, **ext_kw
             )
         elif at == "crypto":
             rows = await client.get_crypto_intraday_chart(
-                symbol, canonical, from_date=from_date, to_date=to_date
+                symbol, canonical, from_date=from_date, to_date=to_date, **ext_kw
             )
         else:
             rows = await client.get_forex_intraday_chart(
-                symbol, canonical, from_date=from_date, to_date=to_date
+                symbol, canonical, from_date=from_date, to_date=to_date, **ext_kw
             )
     except Exception as e:  # noqa: BLE001
         return error_from_exception(

@@ -3,6 +3,7 @@
 
 from typing import Optional, Dict, Any, List, Tuple
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo  # DALTON-HOOK(stock-move-upgrade)
 import contextlib
 import logging
 import asyncio
@@ -21,9 +22,12 @@ from .quote_format import FRESHNESS_WORDS, build_live_stamp
 from .utils import finite_or_none, format_percentage
 from src.data_client import get_market_data_provider
 from src.data_client.freshness import Freshness, FreshnessLabel, measure_bars, measure_daily
+from src.data_client.market_data_provider import symbol_market  # DALTON-HOOK(stock-move-upgrade)
 from src.data_client.normalize import series_lineage
 from src.data_client.ginlix_data.directory import display_names
-from market_protocol import AssetClass, PriceTreatment
+from src.utils.market_hours import interval_seconds  # DALTON-HOOK(stock-move-upgrade)
+from market_protocol import AssetClass, PriceTreatment, market_of  # DALTON-HOOK(stock-move-upgrade)
+from market_protocol.calendars import get_calendar  # DALTON-HOOK(stock-move-upgrade)
 
 from ._shared import _get_user_id, _normalize_market_bars
 
@@ -324,6 +328,44 @@ _CHART_FRESHNESS_WORDS = {
 }
 
 
+def _apply_extended_hours_freshness(
+    freshness: Freshness,
+    interval: str,
+    now: Optional[datetime] = None,
+    symbol: Optional[str] = None,
+    ref=None,
+) -> Freshness:  # DALTON-HOOK(stock-move-upgrade)
+    """Measure chart freshness against US extended hours (04:00-20:00 ET) when extended_hours=True."""
+    actual = freshness.actual_latest
+    if actual is None:
+        return freshness
+    mkt = market_of(ref) if ref is not None else (symbol_market(symbol) if symbol else "us")
+    if mkt != "us":
+        return freshness
+    et_tz = ZoneInfo("America/New_York")
+    base_now = now or datetime.now(timezone.utc)
+    if base_now.tzinfo is None:
+        base_now = base_now.replace(tzinfo=et_tz)
+    et_now = base_now.astimezone(et_tz)
+    mins = et_now.hour * 60 + et_now.minute
+    if not get_calendar("XNYS").is_trading_day(et_now.date()) or not (4 * 60 <= mins < 20 * 60):
+        return freshness
+    period_s = max(1, interval_seconds(interval))
+    now_ms = int(et_now.timestamp() * 1000)
+    expected_ms = (now_ms // (period_s * 1000)) * (period_s * 1000)
+    lag_s = max(0, (now_ms - actual) // 1000)
+    label = FreshnessLabel.DELAYED if lag_s > 2 * period_s else FreshnessLabel.LIVE
+    return freshness.model_copy(
+        update={
+            "expected_latest": expected_ms,
+            "lag_s": int(lag_s),
+            "label": label,
+            "closed": False,
+            "measured": True,
+        }
+    )
+
+
 def _chart_freshness_line(ref, freshness: Freshness) -> Optional[str]:
     """One line naming the chart series' provider and lag; None when it is current."""
     words = _CHART_FRESHNESS_WORDS.get(freshness.label)
@@ -401,6 +443,7 @@ async def fetch_daily_prices(
     end_date: Optional[str] = None,
     limit: Optional[int] = None,
     config: Optional[RunnableConfig] = None,
+    extended_hours: bool = False,  # DALTON-HOOK(stock-move-upgrade)
 ) -> Tuple[str, Dict[str, Any]]:
     """
     Fetch historical daily OHLCV price data for a stock.
@@ -569,6 +612,7 @@ No price data available for the specified period."""
                     to_date=intraday_to,
                     is_index=is_index,
                     user_id=user_id,
+                    **({"extended_hours": True} if extended_hours else {}),  # DALTON-HOOK(stock-move-upgrade)
                 )
                 if intraday_bars and len(intraday_bars) > 5:
                     # Normalize and sort oldest-first for charting
@@ -599,6 +643,14 @@ No price data available for the specified period."""
                         is_index=is_index, source=intraday_source,
                         tier=series_lineage(intraday_source, ref)[1].value,
                     )
+                    if extended_hours and (market_of(ref) if ref is not None else symbol_market(symbol)) == "us":  # DALTON-HOOK(stock-move-upgrade)
+                        chart_freshness = _apply_extended_hours_freshness(
+                            chart_freshness,
+                            intraday_interval,
+                            now=venue_local_time(ref),
+                            symbol=symbol,
+                            ref=ref,
+                        )
                     logger.debug(
                         f"Fetched {len(chart_ohlcv)} intraday ({intraday_interval}) "
                         f"data points for {symbol}"

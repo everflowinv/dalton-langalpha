@@ -837,12 +837,15 @@ class FMPClient:
         interval: str,
         from_date: Optional[str] = None,
         to_date: Optional[str] = None,
+        extended: bool = False,  # DALTON-HOOK(stock-move-upgrade)
     ) -> List[Dict]:
         params: Dict[str, Any] = {"symbol": symbol}
         if from_date:
             params["from"] = from_date
         if to_date:
             params["to"] = to_date
+        if extended:  # DALTON-HOOK(stock-move-upgrade)
+            params["extended"] = "true"
 
         return await self._make_request(
             f"historical-chart/{interval}", params=params
@@ -862,8 +865,11 @@ class FMPClient:
         interval: str,
         from_date: Optional[str] = None,
         to_date: Optional[str] = None,
+        extended: bool = False,  # DALTON-HOOK(stock-move-upgrade)
     ) -> List[Dict]:
-        return await self.get_intraday_chart(symbol, interval, from_date, to_date)
+        return await self.get_intraday_chart(
+            symbol, interval, from_date, to_date, extended=extended
+        )
 
     async def get_crypto_price(
         self,
@@ -879,8 +885,11 @@ class FMPClient:
         interval: str,
         from_date: Optional[str] = None,
         to_date: Optional[str] = None,
+        extended: bool = False,  # DALTON-HOOK(stock-move-upgrade)
     ) -> List[Dict]:
-        return await self.get_intraday_chart(symbol, interval, from_date, to_date)
+        return await self.get_intraday_chart(
+            symbol, interval, from_date, to_date, extended=extended
+        )
 
     async def get_forex_price(
         self,
@@ -896,8 +905,11 @@ class FMPClient:
         interval: str,
         from_date: Optional[str] = None,
         to_date: Optional[str] = None,
+        extended: bool = False,  # DALTON-HOOK(stock-move-upgrade)
     ) -> List[Dict]:
-        return await self.get_intraday_chart(symbol, interval, from_date, to_date)
+        return await self.get_intraday_chart(
+            symbol, interval, from_date, to_date, extended=extended
+        )
 
     # =====================================================================
     # Stock Search

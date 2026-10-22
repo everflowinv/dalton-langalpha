@@ -30,6 +30,7 @@ import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 # ── 判定阈值常量（PS.10 统一标准，第一次周会后可按误报率微调） ──────────────────
 BETA_MAX_EXCESS_PP = 3.0     # |窗口超额| < 3 个百分点
@@ -41,6 +42,31 @@ MIN_HIST_SAMPLES = 20        # 历史样本数 > 20 才计算 σ 和 z 值
 ADTV_LOOKBACK_DAYS = 20      # 当日成交量对比前 20 个交易日均量（不含当日）
 
 PRIVATE_TICKERS = {"SPCX", "OPENAI", "ANTHROPIC"}
+DEFAULT_FUTURES = ["NQ=F", "ES=F"]
+NON_US_EXTENDED_UNSUPPORTED_SUFFIXES = (
+    ".HK", ".SH", ".SS", ".SZ", ".T", ".L", ".KS", ".KQ", ".TW", ".TWO",
+    ".DE", ".PA", ".AS", ".TO", ".AX", ".SI", ".NS", ".BO",
+)
+
+
+def supports_extended_session(symbol: str) -> tuple[bool, str | None]:
+    """检查标的是否支持美股盘前/盘后（pre/post）分钟线计算。"""
+    s = (symbol or "").strip().upper()
+    if not s:
+        return False, "标的代码为空"
+    if s in PRIVATE_TICKERS:
+        return False, f"未上市标的 {s} 不支持行情查询"
+    if s.startswith("^"):
+        return (
+            False,
+            f"指数标的 {s} 不含盘前/盘后分钟线（prepost），请改用指数期货（如 NQ=F、ES=F）或退回 --session regular。",
+        )
+    if any(s.endswith(sfx) for sfx in NON_US_EXTENDED_UNSUPPORTED_SUFFIXES):
+        return (
+            False,
+            f"非美股标的 {s} 不支持美股盘前/盘后分钟线（pre/post），请退回使用 --session regular。",
+        )
+    return True, None
 
 DEFAULT_PEER_MAP: dict[str, list[str]] = {
     "META": ["GOOGL", "AMZN", "MSFT", "AAPL", "SNAP", "PINS", "RDDT"],
@@ -362,7 +388,6 @@ def compute_quant_from_frames(
     t_adj = adj_close_df[target].dropna()
     t_adj = t_adj[t_adj.index <= end_ts]
     t_close = close_df[target].dropna().reindex(t_adj.index)
-    t_vol = volume_df[target].dropna().reindex(t_adj.index)
 
     if len(t_adj) < 2:
         return {
@@ -538,6 +563,7 @@ def compute_quant_from_frames(
 
     return {
         "ok": True,
+        "session": "regular",
         "ticker": target,
         "close": round(last_close_unadj, 2),
         "change_pct": round(target_change_pct, 2) if target_change_pct is not None else None,
@@ -565,6 +591,376 @@ def compute_quant_from_frames(
     }
 
 
+INTRADAY_RETENTION_DAYS: dict[str, int] = {
+    "1m": 7,
+    "5m": 60,
+    "15m": 60,
+    "30m": 60,
+    "60m": 730,
+    "1h": 730,
+}
+
+
+def _is_us_trading_day(dt: date) -> bool:
+    """判断 dt 是否为美股（XNYS/NYSE）交易日；无日历库时按工作日判断。"""
+    ds = dt.isoformat()
+    try:
+        import exchange_calendars as xcals  # type: ignore
+
+        cal = xcals.get_calendar("XNYS")
+        if hasattr(cal, "is_session"):
+            return bool(cal.is_session(ds))
+    except Exception:
+        pass
+    try:
+        import pandas_market_calendars as mcal  # type: ignore
+
+        nyse = mcal.get_calendar("NYSE")
+        sched = nyse.schedule(start_date=ds, end_date=ds)
+        return not sched.empty
+    except Exception:
+        pass
+    if dt.weekday() >= 5:
+        return False
+    holidays = _stdlib_nyse_holidays(dt.year)
+    return holidays is None or dt not in holidays
+
+
+def _stdlib_nyse_holidays(year: int) -> set[date] | None:
+    """NYSE full-day holidays from the sibling earnings-calendar skill's stdlib calendar, or None if it is absent."""
+    path = Path(__file__).resolve().parents[2] / "dalton-earnings-calendar" / "scripts" / "trading_days.py"
+    if not path.is_file():
+        return None
+    try:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("_dalton_trading_days", path)
+        mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+        spec.loader.exec_module(mod)  # type: ignore[union-attr]
+        return set(mod.us_nyse_holidays(year))
+    except Exception:
+        return None
+
+
+def _latest_us_trading_day_on_or_before(dt: date) -> date:
+    cur = dt
+    for _ in range(14):
+        if _is_us_trading_day(cur):
+            return cur
+        cur -= timedelta(days=1)
+    return cur
+
+
+def _previous_trading_day(dt: date) -> date:
+    return _latest_us_trading_day_on_or_before(dt - timedelta(days=1))
+
+
+def _default_us_target_date(now_et: datetime | None = None) -> date:
+    """未传 --end 时，目标日取美东当天；若当天为周末或节假日，取最近一个交易日。"""
+    et_tz = ZoneInfo("America/New_York")
+    cur_dt = (now_et or datetime.now(et_tz)).astimezone(et_tz).date()
+    return _latest_us_trading_day_on_or_before(cur_dt)
+
+
+def _resolve_regular_close_minutes(dt: date, et_tz: ZoneInfo) -> tuple[int, bool]:
+    """查询美股日历获取 dt 当日常规收盘时刻（分钟数，默认 16:00=960，提前收市日 13:00=780）及是否完成校验。"""
+    ds = dt.isoformat()
+    try:
+        import exchange_calendars as xcals  # type: ignore
+
+        cal = xcals.get_calendar("XNYS")
+        if cal.is_session(ds):
+            close_ts = cal.session_close(ds).tz_convert(et_tz)
+            return close_ts.hour * 60 + close_ts.minute, True
+        return 16 * 60, True
+    except Exception:
+        pass
+
+    try:
+        import pandas_market_calendars as mcal  # type: ignore
+
+        nyse = mcal.get_calendar("NYSE")
+        sched = nyse.schedule(start_date=ds, end_date=ds)
+        if not sched.empty and "market_close" in sched.columns:
+            close_ts = sched["market_close"].iloc[0].tz_convert(et_tz)
+            return close_ts.hour * 60 + close_ts.minute, True
+        return 16 * 60, True
+    except Exception:
+        return 16 * 60, False
+
+
+def compute_session_quant_from_intraday(
+    target: str,
+    peers: list[str],
+    sector_etf: str | None,
+    close_df,
+    volume_df=None,
+    session: str = "pre",
+    session_date: str | None = None,
+    futures: list[str] | None = None,
+) -> dict[str, Any]:
+    """
+    基于含盘前盘后（prepost=True）的日内分钟线计算盘前（pre）或盘后（post）异动，
+    并同步对照同组中位数、板块 ETF 与指数期货（NQ=F / ES=F）。
+    """
+    import numpy as np
+    import pandas as pd
+
+    sess = (session or "pre").strip().lower()
+    if sess not in ("pre", "post"):
+        return {
+            "ok": False,
+            "data_ok": False,
+            "session": sess,
+            "ticker": target,
+            "error": f"Unsupported intraday session: {session} (expected pre or post)",
+            "warnings": [f"Unsupported session {session}"],
+        }
+
+    ok_sym, reason = supports_extended_session(target)
+    if not ok_sym:
+        return {
+            "ok": False,
+            "data_ok": False,
+            "session": sess,
+            "ticker": target,
+            "unsupported_session": True,
+            "fallback_hint": "请改用 --session regular 计算常规交易时段涨跌。",
+            "error": reason,
+            "warnings": [reason or f"Unsupported extended session for {target}"],
+        }
+
+    warnings_list: list[str] = []
+    et_tz = ZoneInfo("America/New_York")
+
+    if close_df is None or close_df.empty or target not in close_df.columns:
+        return {
+            "ok": False,
+            "data_ok": False,
+            "session": sess,
+            "ticker": target,
+            "error": f"No intraday price series found for {target}",
+            "warnings": [f"Missing intraday series for {target}"],
+        }
+
+    df_c = close_df.copy()
+    if getattr(df_c.index, "tz", None) is None:
+        df_c.index = pd.to_datetime(df_c.index).tz_localize(et_tz)
+    else:
+        df_c.index = pd.to_datetime(df_c.index).tz_convert(et_tz)
+    df_c = df_c.sort_index()
+
+    df_v = None
+    if volume_df is not None and not volume_df.empty:
+        df_v = volume_df.copy()
+        if getattr(df_v.index, "tz", None) is None:
+            df_v.index = pd.to_datetime(df_v.index).tz_localize(et_tz)
+        else:
+            df_v.index = pd.to_datetime(df_v.index).tz_convert(et_tz)
+        df_v = df_v.sort_index()
+
+    t_series = df_c[target].dropna()
+    if t_series.empty:
+        return {
+            "ok": False,
+            "data_ok": False,
+            "session": sess,
+            "ticker": target,
+            "error": f"Empty intraday series for {target}",
+            "warnings": [f"Empty intraday series for {target}"],
+        }
+
+    target_dt = date.fromisoformat(session_date) if session_date else _default_us_target_date()
+    last_bar_dt = t_series.index[-1].date()
+    data_ok = True
+    if last_bar_dt != target_dt:
+        data_ok = False
+        warnings_list.append(f"最新分钟线停在 {last_bar_dt.isoformat()}")
+
+    close_mins_cache: dict[date, int] = {}
+    target_fail_reason: list[str] = []
+
+    def _get_close_mins(d: date) -> int:
+        if d not in close_mins_cache:
+            c_mins, checked = _resolve_regular_close_minutes(d, et_tz)
+            close_mins_cache[d] = c_mins
+            if not checked and "未校验提前收市日" not in warnings_list:
+                warnings_list.append("未校验提前收市日")
+        return close_mins_cache[d]
+
+    _get_close_mins(target_dt)
+
+    def _slice_symbol_session(sym: str) -> dict[str, Any] | None:
+        if sym not in df_c.columns:
+            return None
+        s = df_c[sym].dropna()
+        if s.empty:
+            return None
+
+        dates = pd.Series(s.index.date, index=s.index)
+        mins = pd.Series(s.index.hour * 60 + s.index.minute, index=s.index)
+
+        if sess == "pre":
+            # 盘前窗口：04:00 <= t < 09:30 ET；基准：前一交易日常规时段最后一根（09:30 <= t < 收盘时刻），不得退回更早交易日或其他时段
+            sess_mask = (dates == target_dt) & (mins >= 4 * 60) & (mins < 9 * 60 + 30)
+            sess_bars = s[sess_mask]
+            prev_dt = _previous_trading_day(target_dt)
+            prev_close_mins = _get_close_mins(prev_dt)
+            base_bars = s[(dates == prev_dt) & (mins >= 9 * 60 + 30) & (mins < prev_close_mins)]
+            if sess_bars.empty or base_bars.empty:
+                if sym == target:
+                    if base_bars.empty:
+                        target_fail_reason.append(
+                            f"{target} 缺少前一交易日 {prev_dt.isoformat()} 常规时段（09:30 <= t < 收盘）基准分钟线数据"
+                        )
+                    if sess_bars.empty:
+                        target_fail_reason.append(
+                            f"{target} 缺少 {target_dt.isoformat()} 盘前时段（04:00 <= t < 09:30 ET）分钟线数据"
+                        )
+                return None
+        else:
+            # 盘后窗口：收盘时刻 <= t < 20:00 ET；基准：当日常规时段最后一根（09:30 <= t < 收盘时刻），不得退回其他时段
+            close_mins = _get_close_mins(target_dt)
+            day_bars = s[dates == target_dt]
+            day_mins = mins[dates == target_dt]
+            sess_bars = day_bars[(day_mins >= close_mins) & (day_mins < 20 * 60)]
+            base_bars = day_bars[(day_mins >= 9 * 60 + 30) & (day_mins < close_mins)]
+            if sess_bars.empty or base_bars.empty:
+                if sym == target:
+                    if base_bars.empty:
+                        target_fail_reason.append(
+                            f"{target} 缺少当日 {target_dt.isoformat()} 常规时段（09:30 <= t < 收盘）基准分钟线数据"
+                        )
+                    if sess_bars.empty:
+                        target_fail_reason.append(
+                            f"{target} 缺少 {target_dt.isoformat()} 盘后时段（收盘 <= t < 20:00 ET）分钟线数据"
+                        )
+                return None
+
+        p0 = float(base_bars.iloc[-1])
+        p1 = float(sess_bars.iloc[-1])
+        if not p0:
+            return None
+        chg_pct = (p1 / p0 - 1.0) * 100.0
+        vol_sum: int | None = None
+        if df_v is not None and sym in df_v.columns:
+            v_slice = df_v[sym].reindex(sess_bars.index).dropna()
+            if not v_slice.empty:
+                raw_vol_sum = int(v_slice.sum())
+                if raw_vol_sum == 0 and bool((v_slice == 0).all()):
+                    vol_sum = None
+                    if "yfinance 未提供盘前/盘后成交量" not in warnings_list:
+                        warnings_list.append("yfinance 未提供盘前/盘后成交量")
+                else:
+                    vol_sum = raw_vol_sum
+        return {
+            "ticker": sym,
+            "base_close": round(p0, 2),
+            "close": round(p1, 2),
+            "change_pct": round(chg_pct, 2),
+            "base_timestamp": base_bars.index[-1].strftime("%Y-%m-%d %H:%M:%S%z"),
+            "end_timestamp": sess_bars.index[-1].strftime("%Y-%m-%d %H:%M:%S%z"),
+            "session_volume": vol_sum,
+            "bar_count": int(len(sess_bars)),
+        }
+
+    t_info = _slice_symbol_session(target)
+    if t_info is None:
+        err_msg = "; ".join(target_fail_reason) or (
+            f"No {sess}-market bars or prior regular close found for {target} on {target_dt.isoformat()}"
+        )
+        return {
+            "ok": False,
+            "data_ok": False,
+            "session": sess,
+            "ticker": target,
+            "session_date": target_dt.isoformat(),
+            "error": err_msg,
+            "fallback_hint": "当前日期尚无盘前/盘后分钟线或对应常规时段基准收盘数据，请核对时段或退回 --session regular。",
+            "warnings": [*warnings_list, *target_fail_reason],
+        }
+
+    peer_rows: list[dict[str, Any]] = []
+    for p in peers:
+        if p == target:
+            continue
+        ok_p, p_reason = supports_extended_session(p)
+        if not ok_p:
+            warnings_list.append(p_reason or f"同组标的 {p} 不支持 {sess} 时段，已跳过")
+            continue
+        p_info = _slice_symbol_session(p)
+        if p_info is None:
+            warnings_list.append(f"同组标的 {p} 缺少 {sess} 时段分钟线数据，已跳过")
+            continue
+        peer_rows.append({
+            "ticker": p,
+            "base_close": p_info["base_close"],
+            "close": p_info["close"],
+            "change_pct": p_info["change_pct"],
+            "session_volume": p_info["session_volume"],
+        })
+
+    peer_changes = [r["change_pct"] for r in peer_rows if r.get("change_pct") is not None]
+    peer_median = float(np.median(peer_changes)) if peer_changes else None
+
+    etf_info = _slice_symbol_session(sector_etf) if sector_etf else None
+    etf_change = etf_info["change_pct"] if etf_info is not None else None
+
+    fut_list = futures if futures is not None else list(DEFAULT_FUTURES)
+    futures_rows: list[dict[str, Any]] = []
+    for f_sym in fut_list:
+        f_info = _slice_symbol_session(f_sym)
+        if f_info is None:
+            warnings_list.append(f"期货标的 {f_sym} 缺少对应时段分钟线数据，已跳过")
+            continue
+        futures_rows.append({
+            "ticker": f_sym,
+            "base_close": f_info["base_close"],
+            "close": f_info["close"],
+            "change_pct": f_info["change_pct"],
+        })
+
+    primary_future = futures_rows[0]["ticker"] if futures_rows else None
+    futures_change = futures_rows[0]["change_pct"] if futures_rows else None
+
+    target_change_pct = t_info["change_pct"]
+    alpha_vs_peers = (target_change_pct - peer_median) if peer_median is not None else None
+    alpha_vs_sector = (target_change_pct - etf_change) if etf_change is not None else None
+    alpha_vs_futures = (target_change_pct - futures_change) if futures_change is not None else None
+
+    ref_alpha = alpha_vs_peers if alpha_vs_peers is not None else (
+        alpha_vs_sector if alpha_vs_sector is not None else alpha_vs_futures
+    )
+    assessment = classify_move(ref_alpha, None)
+
+    return {
+        "ok": True,
+        "data_ok": data_ok,
+        "session": sess,
+        "ticker": target,
+        "session_date": target_dt.isoformat(),
+        "base_timestamp": t_info["base_timestamp"],
+        "end_timestamp": t_info["end_timestamp"],
+        "base_close": t_info["base_close"],
+        "close": t_info["close"],
+        "change_pct": target_change_pct,
+        "session_volume": t_info["session_volume"],
+        "bar_count": t_info["bar_count"],
+        "peers": peer_rows,
+        "peer_median": round(peer_median, 2) if peer_median is not None else None,
+        "sector_etf": sector_etf,
+        "etf_change": round(etf_change, 2) if etf_change is not None else None,
+        "futures": futures_rows,
+        "futures_benchmark": primary_future,
+        "futures_change": round(futures_change, 2) if futures_change is not None else None,
+        "alpha_vs_peers": round(alpha_vs_peers, 2) if alpha_vs_peers is not None else None,
+        "alpha_vs_sector": round(alpha_vs_sector, 2) if alpha_vs_sector is not None else None,
+        "alpha_vs_futures": round(alpha_vs_futures, 2) if alpha_vs_futures is not None else None,
+        "assessment": assessment,
+        "warnings": warnings_list,
+    }
+
+
 def run_analyze(
     ticker: str,
     window: str = "1d",
@@ -572,13 +968,120 @@ def run_analyze(
     etf_arg: str | None = None,
     coverage_path: str | None = None,
     end_override: str | None = None,
+    session: str = "regular",
+    futures_arg: str | None = None,
+    intraday_interval: str = "5m",
 ) -> dict[str, Any]:
-    """拉取 yfinance 数据并执行统一异动量化分析。"""
+    """拉取 yfinance 数据并执行统一异动量化分析（支持 regular / pre / post 时段）。"""
     import pandas as pd
     import yfinance as yf  # type: ignore
 
     t = ticker.upper().strip()
+    sess = (session or "regular").strip().lower()
     peers, sector_etf = resolve_peers_and_etf(t, peers_arg, etf_arg, coverage_path)
+
+    if sess in ("pre", "post"):
+        ok_sym, reason = supports_extended_session(t)
+        if not ok_sym:
+            return {
+                "ok": False,
+                "data_ok": False,
+                "session": sess,
+                "ticker": t,
+                "unsupported_session": True,
+                "fallback_hint": "请改用 --session regular 计算常规交易时段涨跌。",
+                "error": reason,
+                "warnings": [reason or f"Unsupported extended session for {t}"],
+            }
+        explicit_date = bool(
+            end_override
+            or re.match(r"^\d{4}-\d{2}-\d{2}$", (window or "").strip())
+            or " to " in (window or "").strip()
+        )
+        target_dt = (
+            parse_window_spec(window, end_override)[0]
+            if explicit_date
+            else _default_us_target_date()
+        )
+        sess_date = target_dt.isoformat()
+        prev_trading_dt = _previous_trading_day(target_dt)
+        iv = (intraday_interval or "5m").strip().lower()
+        max_retention_days = INTRADAY_RETENTION_DAYS.get(iv, 60)
+        today_et = datetime.now(ZoneInfo("America/New_York")).date()
+        span_age_days = max((today_et - prev_trading_dt).days, (today_et - target_dt).days)
+        if span_age_days > max_retention_days:
+            msg = (
+                f"请求区间 {prev_trading_dt.isoformat()} 至 {target_dt.isoformat()} 距今 {span_age_days} 天，"
+                f"超出分钟线保留期（{iv} 约 {max_retention_days} 天）"
+            )
+            return {
+                "ok": False,
+                "data_ok": False,
+                "session": sess,
+                "ticker": t,
+                "session_date": target_dt.isoformat(),
+                "error": msg,
+                "fallback_hint": "请改用 --session regular 使用日线数据归因。",
+                "warnings": [msg],
+            }
+        fut_syms = (
+            [f.strip().upper() for f in futures_arg.split(",") if f.strip()]
+            if futures_arg
+            else list(DEFAULT_FUTURES)
+        )
+        supported_peers = [p for p in peers if supports_extended_session(p)[0]]
+        symbols = sorted(
+            {t}
+            | set(supported_peers)
+            | ({sector_etf} if sector_etf and supports_extended_session(sector_etf)[0] else set())
+            | set(fut_syms)
+        )
+        dl_start = prev_trading_dt.isoformat()
+        dl_end = (target_dt + timedelta(days=1)).isoformat()
+        raw = yf.download(
+            symbols,
+            start=dl_start,
+            end=dl_end,
+            interval=iv,
+            prepost=True,
+            auto_adjust=False,
+            group_by="ticker",
+            progress=False,
+            threads=True,
+        )
+        if raw is None or raw.empty:
+            return {
+                "ok": False,
+                "data_ok": False,
+                "session": sess,
+                "ticker": t,
+                "error": f"yfinance returned empty intraday (prepost) data for {symbols}",
+                "warnings": ["yfinance returned empty intraday dataframe"],
+            }
+
+        def extract_intraday_field(field: str) -> pd.DataFrame:
+            out = {}
+            if isinstance(raw.columns, pd.MultiIndex):
+                lvl0 = set(raw.columns.get_level_values(0))
+                for s in symbols:
+                    if s in lvl0 and field in raw[s].columns:
+                        out[s] = raw[s][field]
+            elif field in raw.columns:
+                out[symbols[0] if len(symbols) == 1 else t] = raw[field]
+            return pd.DataFrame(out)
+
+        close_df = extract_intraday_field("Close")
+        vol_df = extract_intraday_field("Volume")
+        return compute_session_quant_from_intraday(
+            target=t,
+            peers=peers,
+            sector_etf=sector_etf,
+            close_df=close_df,
+            volume_df=vol_df,
+            session=sess,
+            session_date=sess_date,
+            futures=fut_syms,
+        )
 
     end_dt, start_dt, n_days, _ = parse_window_spec(window, end_override)
     # 往前多拉约 140 个自然日以保证窗口起点前有至少 60 个交易日算 σ
@@ -684,6 +1187,41 @@ def run_self_test() -> dict[str, Any]:
         require_end_bar=True,
     )
 
+    # 构造盘前异动合成测试：前一交易日 15:55 收盘 100，当日盘前 08:30 GOOGL 跌至 96 (-4%)，同组与 NQ=F 跌 -1%
+    pre_idx = pd.to_datetime([
+        "2026-10-20 15:50:00-04:00",
+        "2026-10-20 15:55:00-04:00",
+        "2026-10-21 04:15:00-04:00",
+        "2026-10-21 08:30:00-04:00",
+    ])
+    pre_close = pd.DataFrame(
+        {
+            "GOOGL": [100.0, 100.0, 98.0, 96.0],
+            "META": [100.0, 100.0, 99.5, 99.0],
+            "AMZN": [100.0, 100.0, 99.2, 99.0],
+            "QQQ": [100.0, 100.0, 99.3, 98.8],
+            "NQ=F": [20000.0, 20000.0, 19900.0, 19800.0],
+            "ES=F": [5800.0, 5800.0, 5780.0, 5765.2],
+        },
+        index=pre_idx,
+    )
+    res_pre = compute_session_quant_from_intraday(
+        target="GOOGL",
+        peers=["META", "AMZN"],
+        sector_etf="QQQ",
+        close_df=pre_close,
+        session="pre",
+        session_date="2026-10-21",
+        futures=["NQ=F", "ES=F"],
+    )
+    res_unsup = compute_session_quant_from_intraday(
+        target="0700.HK",
+        peers=[],
+        sector_etf=None,
+        close_df=pre_close,
+        session="pre",
+    )
+
     checks = {
         "alpha_classification": res_alpha["assessment"] == "stock_specific",
         "alpha_volume_ratio": res_alpha["volume_vs_adtv"] == 2.8,
@@ -691,8 +1229,17 @@ def run_self_test() -> dict[str, Any]:
         "beta_classification": res_beta["assessment"] == "sector_beta",
         "beta_excess_zero": abs(res_beta["alpha_vs_peers"]) < 0.01,
         "data_ok_true": res_alpha["data_ok"] is True,
+        "pre_session_change": res_pre["ok"] and abs(res_pre["change_pct"] - (-4.0)) < 0.01,
+        "pre_session_futures": abs(res_pre["futures_change"] - (-1.0)) < 0.01,
+        "unsupported_fallback": (res_unsup["ok"] is False and res_unsup.get("unsupported_session") is True),
     }
-    return {"ok": all(checks.values()), "checks": checks, "sample_alpha": res_alpha, "sample_beta": res_beta}
+    return {
+        "ok": all(checks.values()),
+        "checks": checks,
+        "sample_alpha": res_alpha,
+        "sample_beta": res_beta,
+        "sample_pre": res_pre,
+    }
 
 
 def print_human(res: dict[str, Any]) -> None:
@@ -724,8 +1271,15 @@ def main() -> int:
     p_an = sub.add_parser("analyze", help="量化目标股票的区间涨跌、量比、同组中位数、60日超额 z 值与 beta/alpha 分类")
     p_an.add_argument("--ticker", required=True, help="目标股票代码，如 META")
     p_an.add_argument("--window", default="1d", help="时间窗口：1d, 1w, 1m, 3m, YYYY-MM-DD, 或 'YYYY-MM-DD to YYYY-MM-DD'")
+    p_an.add_argument(
+        "--session",
+        default="regular",
+        choices=["regular", "pre", "post"],
+        help="交易时段：regular（默认日线窗口）、pre（盘前分钟线）、post（盘后分钟线）",
+    )
     p_an.add_argument("--peers", help="覆盖同组列表（逗号分隔，如 GOOGL,AMZN,MSFT）")
     p_an.add_argument("--etf", help="覆盖板块 ETF（如 XLK, QQQ）")
+    p_an.add_argument("--futures", help="覆盖指数期货列表（逗号分隔，默认 NQ=F,ES=F）")
     p_an.add_argument("--coverage", help="coverage.yaml 路径（默认自动查找 ../Home/dalton/coverage.yaml）")
     p_an.add_argument("--end", help="指定窗口终点日期 YYYY-MM-DD")
     p_an.add_argument("--out", help="将 JSON 结果同时写入指定文件路径")
@@ -754,6 +1308,8 @@ def main() -> int:
             etf_arg=args.etf,
             coverage_path=args.coverage,
             end_override=args.end,
+            session=args.session,
+            futures_arg=args.futures,
         )
     except Exception as e:
         res = {"ok": False, "data_ok": False, "ticker": args.ticker, "error": str(e), "warnings": [str(e)]}

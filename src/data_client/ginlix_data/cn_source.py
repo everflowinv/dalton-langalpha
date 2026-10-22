@@ -159,6 +159,7 @@ class GinlixDataCnSource:
         to_date: str | None = None,
         is_index: bool = False,
         user_id: str | None = None,
+        extended_hours: bool = False,  # DALTON-HOOK(stock-move-upgrade)
     ) -> FetchResult:
         try:
             schema = schema_for_legacy(interval)

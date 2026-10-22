@@ -100,7 +100,7 @@ direct_tools:
     category: market
     title: 行情与K线
     call: "get_quote/get_daily_prices/get_market_overview"
-    description: "美/港/A股及指数报价、日K与大盘，核对股价与复盘。"
+    description: "美/港/A股及指数报价、日K与大盘；期货/大宗(NQ=F、ES=F、CL=F、GC=F)、美债收益率(^TNX)与VIX(延迟15分钟)；get_daily_prices(extended_hours=True)含美股盘前盘后分时。核对股价、异动与盘前盘后。"
   company_options_screener:
     category: market
     title: 公司与期权选股
@@ -116,9 +116,9 @@ unavailable_sources:
   - id: hkexnews
     title: 港交所披露易公告
     note: "未接通，用 `web_search` 查 `site:hkexnews.hk`。"
-  - id: futures_commodities
-    title: 期货与大宗商品实时行情
-    note: "ES/NQ期货、原油、黄金等未接专门行情源；用web_search/x_search/sales-notes/tmtb查侧面报道，勿假装查过实时期货报价。"
+  - id: futures_realtime
+    title: 期货与大宗商品实时(非延迟)行情
+    note: "yfinance期货报价延迟约15分钟；需要实时价位时如实注明延迟，不要当实时报价。"
   - id: xueqiu
     title: 雪球(xueqiu)
     note: "handoff过滤，不可用。"

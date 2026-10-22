@@ -199,6 +199,8 @@ def market_of(ref: InstrumentRef) -> str:
         return "crypto"
     if ref.asset_class is AssetClass.FX:
         return "fx"
+    if ref.symbol.endswith("=F"):  # DALTON-HOOK(stock-move-upgrade)
+        return "other"
     info = _MICS.get(ref.calendar_id if ref.mic == "INDEX" else ref.mic)
     return info.market if info is not None else "other"
 
@@ -514,7 +516,12 @@ def _venue_ref(
         currency=currency,
         price_currency=seed.get("price_currency", currency),
         display_unit=seed.get("display_unit", info.display_unit),
-        calendar_id=seed.get("calendar_id", info.calendar_id),
+        # WEEKDAYS_24_5 (UTC Mon-Sat) is an FX-calendar approximation for `*=F` futures;
+        # CME equity index futures open Sunday 18:00 ET and halt daily 17:00-18:00 ET for
+        # maintenance, neither of which is modeled here. DALTON-HOOK(stock-move-upgrade)
+        calendar_id=seed.get(  # DALTON-HOOK(stock-move-upgrade)
+            "calendar_id", WEEKDAYS_24_5 if symbol.endswith("=F") else info.calendar_id
+        ),
         tz=info.tz,
     )
 
