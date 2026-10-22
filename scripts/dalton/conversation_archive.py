@@ -8,6 +8,14 @@ Subcommands:
   unbounded time-based exponential backoff on 429 / quota exhaustion (never drops a segment
   by retry count), interruptible and resumable via session cursors and `content_hash`.
 - `--dry-run`: Run export, segmentation, and extraction/stats without writing to Postgres or workspaces.
+
+Exit codes:
+- `0`: All segments completed.
+- `2`: Another archive process currently holds the Postgres advisory lock (`ArchiveAlreadyRunningError`).
+- `3`: One or more segments remained incomplete (still `in_flight` after deferred retries, a
+  transient network failure after retries, or a non-retryable extraction error such as invalid
+  JSON); safe to re-run because the prefix commit cursor was not advanced past incomplete segments.
+- Other non-zero (e.g. `1`): Fatal error (such as `PermanentQuotaError`).
 """
 
 from __future__ import annotations
@@ -17,9 +25,12 @@ import asyncio
 import inspect
 import json
 import logging
+import os
 import re
+import resource
 import sys
 import time
+import tracemalloc
 import uuid
 from collections import deque
 from datetime import date, datetime, timedelta
@@ -49,8 +60,10 @@ from src.dalton.conversations.extractor import (  # noqa: E402
     deduplicate_candidate_cards,
     expand_event_chunks,
     extract_segment_cards,
+    is_in_flight_error,
     is_permanent_quota_error,
     is_rate_limit_or_quota_error,
+    is_transient_network_error,
     resolve_dedup_and_supersedes,
     segment_events,
 )
@@ -59,6 +72,7 @@ from src.dalton.conversations.render import (  # noqa: E402
     render_and_write_conversation_digests,
 )
 from src.dalton.database import conversations as db_conv  # noqa: E402
+from src.dalton.llm.complete import resolve_model_billing_and_provider  # noqa: E402
 from src.dalton.settings import get_dalton_settings  # noqa: E402
 from src.server.database import pool as _db_pool_mod  # noqa: E402
 from src.server.database.pool import get_or_create_pool, open_session_connection  # noqa: E402
@@ -69,6 +83,51 @@ logger = logging.getLogger("dalton.conversation_archive")
 
 ET_TZ = ZoneInfo("America/New_York")
 DEFAULT_RESERVED_OUTPUT_TOKENS = 1024
+DEFAULT_STALE_AFTER_S = 900
+TRANSIENT_BACKOFF_DELAYS_S: tuple[float, ...] = (2.0, 4.0, 8.0, 16.0, 32.0)
+DEFAULT_DEFER_RETRY_MIN_S = 30.0
+DEFAULT_DEFER_RETRY_MAX_S = 60.0
+DEFAULT_DEFER_EXTRA_AFTER_STALE_S = 60.0
+EXIT_CODE_OK = 0
+EXIT_CODE_LOCK_HELD = 2
+EXIT_CODE_INCOMPLETE = 3
+MEM_TRACE_ENV_VAR = "DALTON_ARCHIVE_MEM_TRACE"
+MEM_TRACE_SEGMENT_INTERVAL = 20
+
+
+def _is_mem_trace_enabled() -> bool:
+    return os.environ.get(MEM_TRACE_ENV_VAR, "").strip() == "1"
+
+
+def _maybe_start_tracemalloc() -> bool:
+    if not _is_mem_trace_enabled():
+        return False
+    if not tracemalloc.is_tracing():
+        tracemalloc.start(25)
+    return True
+
+
+def _log_tracemalloc_top10(segments_seen: int) -> str | None:
+    """When `DALTON_ARCHIVE_MEM_TRACE=1`, log top 10 `tracemalloc` allocation sites (`file:line` and size)."""
+    if not _is_mem_trace_enabled():
+        return None
+    if not tracemalloc.is_tracing():
+        tracemalloc.start(25)
+    snapshot = tracemalloc.take_snapshot()
+    top_stats = snapshot.statistics("lineno")[:10]
+    entries: list[str] = []
+    for idx, stat in enumerate(top_stats, start=1):
+        frame = stat.traceback[0] if stat.traceback else None
+        loc = f"{frame.filename}:{frame.lineno}" if frame else "<unknown>:0"
+        size_kib = stat.size / 1024.0
+        entries.append(f"#{idx} {loc} size={stat.size}B ({size_kib:.1f}KiB, count={stat.count})")
+    cur_bytes, peak_bytes = tracemalloc.get_traced_memory()
+    msg = (
+        f"[MEM_TRACE segments={segments_seen} current={cur_bytes}B peak={peak_bytes}B] "
+        + "; ".join(entries)
+    )
+    logger.info("%s", msg)
+    return msg
 
 
 class _UnbufferedStderrHandler(logging.StreamHandler):
@@ -513,6 +572,53 @@ def archive_billing_user_id() -> str:
     return archive_owner_user_id()
 
 
+def _did_journal_short_circuit_without_send(outcome: SegmentExtractionOutcome) -> bool:
+    """Return True when the journal returned early or replayed a cached result without sending a new upstream LLM request."""
+    if bool(getattr(outcome, "cached", False) or getattr(outcome, "replayed", False)):
+        return True
+    if outcome.total_tokens > 0 or outcome.input_tokens > 0 or outcome.output_tokens > 0:
+        return False
+    if is_in_flight_error(outcome):
+        return True
+    status = str(outcome.status or "").lower()
+    ek = str(outcome.error_kind or "").lower()
+    err = str(outcome.error or "")
+    if status in ("in_flight", "conflict", "budget_exhausted") or ek in (
+        "in_flight",
+        "indeterminate",
+        "conflict",
+        "pre_send",
+        "budget_exhausted",
+        "budget_db_error",
+    ):
+        return True
+    if (
+        "正在由另一个进程执行中" in err
+        or "上次调用在返回前中断" in err
+        or "Journal state is " in err
+        or "collided with mismatched request_hash" in err
+    ):
+        return True
+    return False
+
+
+def _extraction_error_reason(outcome: SegmentExtractionOutcome) -> str:
+    """Format `extraction_error:<异常类型>` for non-transient segment extraction failures."""
+    err_text = str(outcome.error or "").strip()
+    ek = str(outcome.error_kind or "").strip()
+    m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s*:", err_text)
+    prefix = m.group(1) if m else ""
+    if prefix and (prefix.endswith(("Error", "Exception")) or not ek):
+        exc_type = prefix
+    elif ek:
+        exc_type = ek
+    elif prefix:
+        exc_type = prefix
+    else:
+        exc_type = "SegmentExtractionError"
+    return f"extraction_error:{exc_type}"
+
+
 async def extract_segment_with_infinite_backoff(
     segment: list[dict[str, Any]],
     *,
@@ -525,18 +631,30 @@ async def extract_segment_with_infinite_backoff(
     limiter: HourlyTokenBudgetLimiter | None = None,
     estimated_tokens: int = 1000,
     reservation: BudgetReservation | int | None = None,
+    deadline: float | None = None,
+    clock_fn: Callable[[], float] | None = None,
     dry_run: bool = False,
     extract_fn: Callable[..., Coroutine[Any, Any, SegmentExtractionOutcome]] = extract_segment_cards,
     sleep_fn: Callable[[float], Coroutine[Any, Any, None]] = asyncio.sleep,
 ) -> tuple[SegmentExtractionOutcome, int]:
-    """Extract cards from `segment`, backing off by time indefinitely on transient 429 / quota exhaustion.
+    """Extract cards from `segment`, backing off indefinitely on 429 and retrying transient network/5xx errors up to 5 times (2->4->8->16->32s).
 
-    Re-checks the hourly token budget before every retry and stops immediately on permanent quota errors.
-    Returns `(outcome, rate_limit_retries)`.
+    Re-checks the hourly token budget before every 429 or transient retry and stops immediately on permanent quota errors.
+    Only passes `resend_indeterminate=True` when `billing_type == "oauth"`.
+    Accumulates per-segment token usage (`input_tokens`, `output_tokens`, `total_tokens`) across all non-replayed attempts,
+    kept separate from per-attempt limiter reservation settlement.
+    Returns `(outcome, retries)`.
     """
-    attempt = 0
+    rl_attempt = 0
+    transient_attempt = 0
+    acc_input_tokens = 0
+    acc_output_tokens = 0
+    acc_total_tokens = 0
+    needs_budget_recheck = False
     init_s = max(0.01, float(initial_backoff_s))
     cap_s = max(init_s, float(max_backoff_s))
+    billing_type, _ = resolve_model_billing_and_provider(extractor_model)
+    eff_resend_indeterminate = billing_type == "oauth"
     sig = inspect.signature(extract_fn)
     supports_persist_raw = "persist_raw" in sig.parameters
     supports_skip_journal = "skip_journal" in sig.parameters
@@ -546,10 +664,30 @@ async def extract_segment_with_infinite_backoff(
         else (BudgetReservation(reservation, estimated_tokens) if type(reservation) is int else None)
     )
 
+    def _now_mono() -> float:
+        return clock_fn() if clock_fn is not None else time.monotonic()
+
+    def _settle_attempt_reservation(short_circuit: bool, attempt_tok: int) -> None:
+        if limiter is not None and current_reservation is not None:
+            if short_circuit:
+                limiter.release_reservation(current_reservation)
+            else:
+                limiter.record_tokens(
+                    attempt_tok or estimated_tokens,
+                    reservation=current_reservation,
+                )
+
+    def _with_accumulated_usage(out: SegmentExtractionOutcome) -> SegmentExtractionOutcome:
+        out.input_tokens = acc_input_tokens
+        out.output_tokens = acc_output_tokens
+        out.total_tokens = acc_total_tokens
+        return out
+
     while True:
         if limiter is not None:
-            if attempt > 0:
+            if needs_budget_recheck:
                 new_res = await limiter.wait_for_budget(estimated_tokens)
+                needs_budget_recheck = False
                 if current_reservation is not None:
                     current_reservation.rebind(new_res)
                 else:
@@ -563,6 +701,23 @@ async def extract_segment_with_infinite_backoff(
                     )
             else:
                 await limiter.wait_for_rate_limit_pause()
+
+        if deadline is not None and _now_mono() >= deadline:
+            if limiter is not None and current_reservation is not None:
+                limiter.release_reservation(current_reservation)
+            return (
+                _with_accumulated_usage(
+                    SegmentExtractionOutcome(
+                        model_used=extractor_model,
+                        ok=False,
+                        status="in_flight",
+                        error_kind="in_flight_timeout",
+                        in_flight=True,
+                        error="in_flight_timeout",
+                    )
+                ),
+                rl_attempt + transient_attempt,
+            )
 
         extra_kwargs: dict[str, Any] = {}
         if supports_persist_raw:
@@ -578,7 +733,7 @@ async def extract_segment_with_infinite_backoff(
                 prompt_version=prompt_version,
                 user_id=user_id,
                 llm_service=llm_service,
-                resend_indeterminate=True,
+                resend_indeterminate=eff_resend_indeterminate,
                 **extra_kwargs,
             )
         except Exception as exc:
@@ -589,50 +744,157 @@ async def extract_segment_with_infinite_backoff(
                     type(exc).__name__,
                     status_code=getattr(exc, "status_code", None),
                 ) from exc
-            if not is_rate_limit_or_quota_error(exc):
-                if limiter is not None and current_reservation is not None:
-                    limiter.release_reservation(current_reservation)
-                raise
-            outcome = SegmentExtractionOutcome(
-                model_used=extractor_model,
-                ok=False,
-                rate_limited=True,
-                error=type(exc).__name__,
-            )
+            if is_in_flight_error(exc):
+                outcome = SegmentExtractionOutcome(
+                    model_used=extractor_model,
+                    ok=False,
+                    status="in_flight",
+                    error_kind="in_flight",
+                    in_flight=True,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+            elif is_rate_limit_or_quota_error(exc):
+                outcome = SegmentExtractionOutcome(
+                    model_used=extractor_model,
+                    ok=False,
+                    rate_limited=True,
+                    error=type(exc).__name__,
+                )
+            elif is_transient_network_error(exc):
+                status_code = getattr(exc, "status_code", None) or getattr(
+                    getattr(exc, "response", None), "status_code", None
+                )
+                err_kind = (
+                    f"http_{status_code}"
+                    if isinstance(status_code, int) and status_code in (502, 503, 504)
+                    else ("timeout" if "timeout" in type(exc).__name__.lower() else "stream_cut")
+                )
+                outcome = SegmentExtractionOutcome(
+                    model_used=extractor_model,
+                    ok=False,
+                    status="indeterminate",
+                    error_kind=err_kind,
+                    transient_error=True,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+            else:
+                outcome = SegmentExtractionOutcome(
+                    model_used=extractor_model,
+                    ok=False,
+                    status="error",
+                    error_kind=type(exc).__name__,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
 
         if outcome.permanent_quota_error:
             if limiter is not None and current_reservation is not None:
                 limiter.release_reservation(current_reservation)
             raise PermanentQuotaError(outcome.error or "permanent_quota_error")
 
-        if not outcome.rate_limited:
-            return outcome, attempt
-
-        if limiter is not None:
-            rl_tokens = outcome.total_tokens or (outcome.input_tokens + outcome.output_tokens) or estimated_tokens
-            limiter.record_tokens(rl_tokens, reservation=current_reservation)
-
-        delay = min(cap_s, init_s * (2 ** min(attempt, 8)))
-        attempt += 1
-        pause_until: float | None = None
-        if limiter is not None:
-            pause_until = limiter.notify_rate_limit_backoff(delay)
-        logger.warning(
-            "Rate limit / quota exhaustion on segment (attempt=%d); backing off for %.1fs before retry",
-            attempt,
-            delay,
+        attempt_short_circuit = _did_journal_short_circuit_without_send(outcome)
+        attempt_in_tok = 0 if attempt_short_circuit else int(outcome.input_tokens or 0)
+        attempt_out_tok = 0 if attempt_short_circuit else int(outcome.output_tokens or 0)
+        attempt_tot_tok = (
+            0
+            if attempt_short_circuit
+            else int(outcome.total_tokens or (attempt_in_tok + attempt_out_tok))
         )
-        uses_custom_clock = getattr(limiter, "_uses_custom_clock", True) if limiter is not None else True
-        t_sleep0 = limiter._clock() if (limiter is not None and not uses_custom_clock) else 0.0
-        try:
-            await sleep_fn(delay)
-            if limiter is not None and not uses_custom_clock:
-                elapsed_sleep = max(0.0, limiter._clock() - t_sleep0)
-                if elapsed_sleep < delay * 0.5:
-                    limiter._virtual_time_offset += delay - elapsed_sleep
-        finally:
+        acc_input_tokens += attempt_in_tok
+        acc_output_tokens += attempt_out_tok
+        acc_total_tokens += attempt_tot_tok
+
+        if outcome.ok:
+            _settle_attempt_reservation(attempt_short_circuit, attempt_tot_tok)
+            return _with_accumulated_usage(outcome), rl_attempt + transient_attempt
+
+        if is_in_flight_error(outcome):
+            outcome.in_flight = True
+            outcome.status = outcome.status or "in_flight"
+            outcome.error_kind = outcome.error_kind or "in_flight"
+            _settle_attempt_reservation(attempt_short_circuit, attempt_tot_tok)
+            return _with_accumulated_usage(outcome), rl_attempt + transient_attempt
+
+        if outcome.rate_limited or is_rate_limit_or_quota_error(outcome):
             if limiter is not None:
-                limiter.clear_rate_limit_backoff(pause_until)
+                _settle_attempt_reservation(attempt_short_circuit, attempt_tot_tok)
+                needs_budget_recheck = True
+
+            if deadline is not None and _now_mono() >= deadline:
+                return (
+                    _with_accumulated_usage(
+                        SegmentExtractionOutcome(
+                            model_used=extractor_model,
+                            ok=False,
+                            status="in_flight",
+                            error_kind="in_flight_timeout",
+                            in_flight=True,
+                            error="in_flight_timeout",
+                        )
+                    ),
+                    rl_attempt + transient_attempt,
+                )
+
+            delay = min(cap_s, init_s * (2 ** min(rl_attempt, 8)))
+            rl_attempt += 1
+            pause_until: float | None = None
+            if limiter is not None:
+                pause_until = limiter.notify_rate_limit_backoff(delay)
+            logger.warning(
+                "Rate limit / quota exhaustion on segment (attempt=%d); backing off for %.1fs before retry",
+                rl_attempt,
+                delay,
+            )
+            uses_custom_clock = (
+                getattr(limiter, "_uses_custom_clock", True) if limiter is not None else True
+            )
+            t_sleep0 = limiter._clock() if (limiter is not None and not uses_custom_clock) else 0.0
+            try:
+                await sleep_fn(delay)
+                if limiter is not None and not uses_custom_clock:
+                    elapsed_sleep = max(0.0, limiter._clock() - t_sleep0)
+                    if elapsed_sleep < delay * 0.5:
+                        limiter._virtual_time_offset += delay - elapsed_sleep
+            finally:
+                if limiter is not None:
+                    limiter.clear_rate_limit_backoff(pause_until)
+            continue
+
+        if is_transient_network_error(outcome):
+            outcome.transient_error = True
+            if transient_attempt < len(TRANSIENT_BACKOFF_DELAYS_S):
+                if limiter is not None:
+                    _settle_attempt_reservation(attempt_short_circuit, attempt_tot_tok)
+                    needs_budget_recheck = True
+                if deadline is not None and _now_mono() >= deadline:
+                    return (
+                        _with_accumulated_usage(
+                            SegmentExtractionOutcome(
+                                model_used=extractor_model,
+                                ok=False,
+                                status="in_flight",
+                                error_kind="in_flight_timeout",
+                                in_flight=True,
+                                error="in_flight_timeout",
+                            )
+                        ),
+                        rl_attempt + transient_attempt,
+                    )
+                delay = TRANSIENT_BACKOFF_DELAYS_S[transient_attempt]
+                transient_attempt += 1
+                logger.warning(
+                    "Transient network/upstream error on segment (retry=%d/%d, backoff=%.1fs): %s",
+                    transient_attempt,
+                    len(TRANSIENT_BACKOFF_DELAYS_S),
+                    delay,
+                    outcome.error,
+                )
+                await sleep_fn(delay)
+                continue
+            _settle_attempt_reservation(attempt_short_circuit, attempt_tot_tok)
+            return _with_accumulated_usage(outcome), rl_attempt + transient_attempt
+
+        _settle_attempt_reservation(attempt_short_circuit, attempt_tot_tok)
+        return _with_accumulated_usage(outcome), rl_attempt + transient_attempt
 
 
 def read_inbox_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -688,6 +950,49 @@ def _flush_log_handlers() -> None:
         pass
 
 
+def _compact_card_for_dry_run_pool(card: dict[str, Any]) -> dict[str, Any]:
+    """Keep only fields needed by `compute_batch_supersedes` in dry-run active pool, dropping raw quotes/text."""
+    return {
+        "card_id": card.get("card_id"),
+        "status": card.get("status", "active"),
+        "tickers": list(card.get("tickers") or []),
+        "figures": [
+            {
+                "metric": f.get("metric"),
+                "value": f.get("value"),
+                "unit": f.get("unit"),
+                "period": f.get("period"),
+            }
+            for f in (card.get("figures") or [])
+            if isinstance(f, dict)
+        ],
+        "ts": card.get("ts"),
+        "seq_range": list(card.get("seq_range") or []),
+        "supersedes": card.get("supersedes"),
+        "superseded_card_ids": list(card.get("superseded_card_ids") or []),
+        "superseded_by_card_id": card.get("superseded_by_card_id"),
+    }
+
+
+def _compact_rendered_summary(rendered: dict[str, Any]) -> dict[str, Any]:
+    """Return a summary of rendered files without retaining full per-card `card_locations` maps."""
+    return {
+        "company_files": list(rendered.get("company_files") or []),
+        "topic_files": list(rendered.get("topic_files") or []),
+        "removed_files": list(rendered.get("removed_files") or []),
+        "unmapped_tickers": list(rendered.get("unmapped_tickers") or []),
+        "rendered_dates": list(rendered.get("rendered_dates") or []),
+    }
+
+
+def _get_maxrss_stats() -> tuple[int, float]:
+    """Return `(raw_ru_maxrss, maxrss_mib)` for the current process via `resource.getrusage`."""
+    rusage = resource.getrusage(resource.RUSAGE_SELF)
+    raw_rss = int(rusage.ru_maxrss)
+    rss_kb = raw_rss / 1024.0 if sys.platform == "darwin" else float(raw_rss)
+    return raw_rss, round(rss_kb / 1024.0, 2)
+
+
 async def process_weekly_batch(
     batch_events: list[dict[str, Any]],
     *,
@@ -700,11 +1005,16 @@ async def process_weekly_batch(
     dry_run: bool = False,
     initial_backoff_s: float = 30.0,
     max_backoff_s: float = 900.0,
+    stale_after_s: int = DEFAULT_STALE_AFTER_S,
+    defer_retry_min_s: float = DEFAULT_DEFER_RETRY_MIN_S,
+    defer_retry_max_s: float = DEFAULT_DEFER_RETRY_MAX_S,
     extract_concurrency: int | None = None,
     concurrency: int | None = None,
+    llm_service: Any = None,
     extract_fn: Callable[..., Coroutine[Any, Any, SegmentExtractionOutcome]] = extract_segment_cards,
     embed_fn: Callable[..., Coroutine[Any, Any, tuple[list[list[float]], str]]] = embed_texts_via_bridge,
     sleep_fn: Callable[[float], Coroutine[Any, Any, None]] = asyncio.sleep,
+    clock_fn: Callable[[], float] | None = None,
     backend_by_ticker: dict[str, Any] | None = None,
     home_backend: Any = None,
     conn: Any = None,
@@ -717,6 +1027,7 @@ async def process_weekly_batch(
     )
     run_id = f"{mode}_{window_start.isoformat()}_{window_end.isoformat()}_{uuid.uuid4().hex[:8]}"
     embedding_model_used = cfg.embedding_model_preferred
+    total_events_read = len(batch_events)
 
     if not dry_run:
         await db_conv.insert_run_start(
@@ -736,11 +1047,18 @@ async def process_weekly_batch(
         max_segment_chars=cfg.max_segment_chars,
         max_segment_events=cfg.max_segment_events,
     )
+    batch_events.clear()
+    batch_events = []
     total_segments = len(segments)
+    _maybe_start_tracemalloc()
+    segments_trace_counter = 0
 
-    candidate_cards: list[dict[str, Any]] = []
-    accepted_cards: list[dict[str, Any]] = []
-    completed_processed_rows: list[dict[str, Any]] = []
+    cards_extracted = 0
+    cards_accepted = 0
+    accepted_dates: set[str] = set()
+    processed_chunk_keys: list[tuple[str, str, str, int]] = []
+    dry_run_active_pool: list[dict[str, Any]] = []
+    dry_run_seen_hashes: set[str] = set()
     segments_flushed = 0
     quotes_rejected = 0
     segments_discarded = 0
@@ -753,26 +1071,73 @@ async def process_weekly_batch(
     superseded_count = 0
 
     completed_by_idx: dict[int, tuple[list[dict[str, Any]], SegmentExtractionOutcome, int]] = {}
+    deferred_by_idx: dict[int, tuple[list[dict[str, Any]], SegmentExtractionOutcome, int]] = {}
+    incomplete_by_idx: dict[int, dict[str, Any]] = {}
     next_to_flush = 0
     flush_failed = False
     flush_lock = asyncio.Lock()
     sem = asyncio.Semaphore(eff_concurrency)
     abort_flag = False
 
+    def _make_incomplete_record(
+        seg_idx: int,
+        seg: list[dict[str, Any]],
+        outcome: SegmentExtractionOutcome,
+        retries_used: int,
+        *,
+        status: str = "failed",
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        first_ev = seg[0] if seg else {}
+        last_ev = seg[-1] if seg else {}
+        inflight = is_in_flight_error(outcome)
+        eff_reason = reason or (
+            "in_flight_timeout"
+            if inflight
+            else (
+                "blocked_by_incomplete_prefix"
+                if status == "blocked"
+                else (outcome.error_kind or "transient_error")
+            )
+        )
+        return {
+            "segment_index": seg_idx,
+            "window_start": window_start.isoformat(),
+            "window_end": window_end.isoformat(),
+            "agent": str(first_ev.get("agent") or ""),
+            "session_id": str(first_ev.get("session_id") or ""),
+            "first_event_id": str(first_ev.get("event_id") or ""),
+            "last_event_id": str(last_ev.get("event_id") or ""),
+            "seq_range": [int(first_ev.get("seq", 0)), int(last_ev.get("seq", 0))],
+            "events_count": len(seg),
+            "status": status,
+            "reason": eff_reason,
+            "error_kind": outcome.error_kind or eff_reason,
+            "retries": int(retries_used),
+            "input_tokens": int(outcome.input_tokens),
+            "output_tokens": int(outcome.output_tokens),
+            "total_tokens": int(outcome.total_tokens),
+            "error": outcome.error or eff_reason,
+        }
+
     async def _flush_ready_prefix() -> None:
         nonlocal next_to_flush, flush_failed, abort_flag, embedding_model_used
         nonlocal segments_flushed, quotes_rejected, segments_discarded
         nonlocal input_tokens, output_tokens, total_tokens, rate_limit_retries
-        nonlocal cards_inserted, deduped_count, superseded_count
+        nonlocal cards_extracted, cards_accepted, cards_inserted, deduped_count, superseded_count
 
         async with flush_lock:
             if flush_failed:
                 return
             try:
                 while next_to_flush in completed_by_idx:
+                    if incomplete_by_idx and next_to_flush >= min(incomplete_by_idx):
+                        break
                     ready_batch: list[tuple[int, list[dict[str, Any]], SegmentExtractionOutcome, int]] = []
                     peek_idx = next_to_flush
                     while peek_idx in completed_by_idx and len(ready_batch) < eff_concurrency:
+                        if incomplete_by_idx and peek_idx >= min(incomplete_by_idx):
+                            break
                         seg, outcome, rl_retries = completed_by_idx[peek_idx]
                         ready_batch.append((peek_idx, seg, outcome, rl_retries))
                         peek_idx += 1
@@ -809,11 +1174,25 @@ async def process_weekly_batch(
                     if dry_run:
                         acc_cards, dedup_cnt, sup_cnt = resolve_dedup_and_supersedes(
                             batch_candidate_cards,
-                            existing_hashes=set(),
-                            existing_active_cards=list(accepted_cards),
+                            existing_hashes=dry_run_seen_hashes,
+                            existing_active_cards=dry_run_active_pool,
                         )
-                        for seg_idx, _, _, _ in ready_batch:
+                        for c in acc_cards:
+                            ch = c.get("content_hash")
+                            if ch:
+                                dry_run_seen_hashes.add(str(ch))
+                            dry_run_active_pool.append(_compact_card_for_dry_run_pool(c))
+                        dry_run_active_pool[:] = [
+                            c for c in dry_run_active_pool if c.get("status") == "active"
+                        ]
+                        for seg_idx, seg_list, seg_outcome, _ in ready_batch:
                             completed_by_idx.pop(seg_idx, None)
+                            seg_list.clear()
+                            seg_outcome.cards.clear()
+                            if 0 <= seg_idx < len(segments):
+                                segments[seg_idx].clear()
+                                segments[seg_idx] = []
+                        ready_batch.clear()
                         next_to_flush = peek_idx
                         segments_flushed += batch_segments
                         rate_limit_retries += batch_rl_retries
@@ -822,12 +1201,15 @@ async def process_weekly_batch(
                         total_tokens += batch_tot_tokens
                         quotes_rejected += batch_quotes_rejected
                         segments_discarded += batch_segments_discarded
-                        candidate_cards.extend(batch_candidate_cards)
-                        accepted_cards.extend(acc_cards)
+                        cards_extracted += len(batch_candidate_cards)
+                        cards_accepted += len(acc_cards)
                         deduped_count += dedup_cnt
                         superseded_count += sup_cnt
                         for _seg_cards, seg_rows in per_seg_items:
-                            completed_processed_rows.extend(seg_rows)
+                            for r in seg_rows:
+                                processed_chunk_keys.append(
+                                    (r["agent"], r["session_id"], r["event_id"], int(r["chunk_idx"]))
+                                )
                         continue
 
                     all_hashes = [
@@ -872,8 +1254,9 @@ async def process_weekly_batch(
 
                     batch_cards_inserted = 0
                     batch_superseded_count = 0
-                    batch_accepted_cards: list[dict[str, Any]] = []
-                    batch_processed_rows: list[dict[str, Any]] = []
+                    batch_accepted_count = 0
+                    batch_accepted_dates: set[str] = set()
+                    batch_processed_keys: list[tuple[str, str, str, int]] = []
 
                     emb_offset = 0
                     async with db_conv.transaction_scope(conn) as tx_conn:
@@ -889,20 +1272,27 @@ async def process_weekly_batch(
                                 )
                                 batch_cards_inserted += ins_cnt
                                 batch_superseded_count += sup_cnt
-                                batch_accepted_cards.extend(ins_cards)
+                                batch_accepted_count += len(ins_cards)
+                                for c in ins_cards:
+                                    d_et = str(c.get("date_et") or "")[:10]
+                                    if d_et:
+                                        batch_accepted_dates.add(d_et)
                             if seg_rows:
                                 await db_conv.record_processed_event_chunks(
                                     seg_rows,
                                     conn=tx_conn,
                                 )
-                                batch_processed_rows.extend(seg_rows)
+                                for r in seg_rows:
+                                    batch_processed_keys.append(
+                                        (r["agent"], r["session_id"], r["event_id"], int(r["chunk_idx"]))
+                                    )
 
                         await db_conv.update_run_progress(
                             run_id,
                             embedding_model=batch_emb_model,
-                            events_read=len(batch_events),
+                            events_read=total_events_read,
                             segments_processed=segments_flushed + batch_segments,
-                            cards_extracted=len(candidate_cards) + len(batch_candidate_cards),
+                            cards_extracted=cards_extracted + len(batch_candidate_cards),
                             cards_inserted=cards_inserted + batch_cards_inserted,
                             cards_deduped=deduped_count + batch_dedup_cnt,
                             cards_superseded=superseded_count + batch_superseded_count,
@@ -918,8 +1308,14 @@ async def process_weekly_batch(
                             conn=tx_conn,
                         )
 
-                    for seg_idx, _, _, _ in ready_batch:
+                    for seg_idx, seg_list, seg_outcome, _ in ready_batch:
                         completed_by_idx.pop(seg_idx, None)
+                        seg_list.clear()
+                        seg_outcome.cards.clear()
+                        if 0 <= seg_idx < len(segments):
+                            segments[seg_idx].clear()
+                            segments[seg_idx] = []
+                    ready_batch.clear()
                     next_to_flush = peek_idx
                     embedding_model_used = batch_emb_model
                     segments_flushed += batch_segments
@@ -929,60 +1325,127 @@ async def process_weekly_batch(
                     total_tokens += batch_tot_tokens
                     quotes_rejected += batch_quotes_rejected
                     segments_discarded += batch_segments_discarded
-                    candidate_cards.extend(batch_candidate_cards)
+                    cards_extracted += len(batch_candidate_cards)
                     deduped_count += batch_dedup_cnt
                     cards_inserted += batch_cards_inserted
                     superseded_count += batch_superseded_count
-                    accepted_cards.extend(batch_accepted_cards)
-                    completed_processed_rows.extend(batch_processed_rows)
+                    cards_accepted += batch_accepted_count
+                    accepted_dates.update(batch_accepted_dates)
+                    processed_chunk_keys.extend(batch_processed_keys)
             except BaseException:
                 flush_failed = True
                 abort_flag = True
                 raise
 
-    async def _extract_one_segment(seg_idx: int, seg: list[dict[str, Any]]) -> None:
+    async def _run_segment_attempt(
+        seg: list[dict[str, Any]],
+        *,
+        deadline: float | None = None,
+        clock_override: Callable[[], float] | None = None,
+    ) -> tuple[SegmentExtractionOutcome, int, float]:
+        nonlocal segments_trace_counter
+        active_clock = clock_override or clock_fn
+        now_fn = active_clock if active_clock is not None else time.monotonic
+        est_tokens = estimate_segment_tokens(seg, hourly_budget=limiter.hourly_budget)
+        t0 = now_fn()
+        reservation = await limiter.wait_for_budget(est_tokens)
+        if deadline is not None and now_fn() >= deadline:
+            limiter.release_reservation(reservation)
+            return (
+                SegmentExtractionOutcome(
+                    model_used=extractor_model,
+                    ok=False,
+                    status="in_flight",
+                    error_kind="in_flight_timeout",
+                    in_flight=True,
+                    error="in_flight_timeout",
+                ),
+                0,
+                max(0.0, now_fn() - t0),
+            )
+        try:
+            outcome, rl_retries = await extract_segment_with_infinite_backoff(
+                seg,
+                extractor_model=extractor_model,
+                prompt_version=prompt_version,
+                user_id=archive_billing_user_id(),
+                llm_service=llm_service,
+                initial_backoff_s=initial_backoff_s,
+                max_backoff_s=max_backoff_s,
+                limiter=limiter,
+                estimated_tokens=est_tokens,
+                reservation=reservation,
+                deadline=deadline,
+                clock_fn=active_clock,
+                dry_run=dry_run,
+                extract_fn=extract_fn,
+                sleep_fn=sleep_fn,
+            )
+        except BaseException:
+            limiter.release_reservation(reservation)
+            raise
+        elapsed_s = max(0.0, now_fn() - t0)
+        segments_trace_counter += 1
+        if segments_trace_counter % MEM_TRACE_SEGMENT_INTERVAL == 0:
+            _log_tracemalloc_top10(segments_trace_counter)
+            _flush_log_handlers()
+        return outcome, rl_retries, elapsed_s
+
+    async def _extract_one_segment(seg_idx: int) -> None:
         nonlocal abort_flag
 
         async with sem:
             if abort_flag:
                 return
-            est_tokens = estimate_segment_tokens(seg, hourly_budget=limiter.hourly_budget)
-            t0 = time.monotonic()
-            reservation = await limiter.wait_for_budget(est_tokens)
+            seg = segments[seg_idx] if 0 <= seg_idx < len(segments) else []
             try:
-                outcome, rl_retries = await extract_segment_with_infinite_backoff(
-                    seg,
-                    extractor_model=extractor_model,
-                    prompt_version=prompt_version,
-                    user_id=archive_billing_user_id(),
-                    initial_backoff_s=initial_backoff_s,
-                    max_backoff_s=max_backoff_s,
-                    limiter=limiter,
-                    estimated_tokens=est_tokens,
-                    reservation=reservation,
-                    dry_run=dry_run,
-                    extract_fn=extract_fn,
-                    sleep_fn=sleep_fn,
-                )
-                consumed = (
-                    outcome.total_tokens
-                    or (outcome.input_tokens + outcome.output_tokens)
-                    or est_tokens
-                )
-                limiter.record_tokens(consumed, reservation=reservation)
+                outcome, rl_retries, elapsed_s = await _run_segment_attempt(seg)
             except BaseException:
-                limiter.release_reservation(reservation)
                 abort_flag = True
                 raise
 
             if outcome.permanent_quota_error:
                 abort_flag = True
                 raise PermanentQuotaError(outcome.error or "permanent_quota_error")
+            if is_in_flight_error(outcome):
+                deferred_by_idx[seg_idx] = (seg, outcome, rl_retries)
+                seg = []
+                logger.warning(
+                    "Segment %d/%d is in_flight in journal; queued for deferred retry after weekly batch",
+                    seg_idx + 1,
+                    total_segments,
+                )
+                _flush_log_handlers()
+                return
             if not outcome.ok:
-                abort_flag = True
-                raise SegmentExtractionError(outcome.error or "segment_extraction_failed")
+                fail_reason = (
+                    (outcome.error_kind or "transient_error")
+                    if is_transient_network_error(outcome)
+                    else _extraction_error_reason(outcome)
+                )
+                incomplete_by_idx[seg_idx] = _make_incomplete_record(
+                    seg_idx,
+                    seg,
+                    outcome,
+                    rl_retries,
+                    status="failed",
+                    reason=fail_reason,
+                )
+                seg.clear()
+                if 0 <= seg_idx < len(segments):
+                    segments[seg_idx] = []
+                seg = []
+                logger.warning(
+                    "Segment %d/%d incomplete (%s, retries=%d): %s",
+                    seg_idx + 1,
+                    total_segments,
+                    fail_reason,
+                    rl_retries,
+                    outcome.error,
+                )
+                _flush_log_handlers()
+                return
 
-            elapsed_s = max(0.0, time.monotonic() - t0)
             seg_tokens = outcome.total_tokens or (outcome.input_tokens + outcome.output_tokens)
             logger.info(
                 "Segment %d/%d completed: tokens=%d (in=%d, out=%d) elapsed=%.2fs status=%s",
@@ -997,14 +1460,15 @@ async def process_weekly_batch(
             _flush_log_handlers()
 
             completed_by_idx[seg_idx] = (seg, outcome, rl_retries)
+            seg = []
             await asyncio.shield(_flush_ready_prefix())
 
     tasks: list[asyncio.Task[None]] = []
     try:
         if segments:
             tasks = [
-                asyncio.create_task(_extract_one_segment(idx, seg))
-                for idx, seg in enumerate(segments)
+                asyncio.create_task(_extract_one_segment(idx))
+                for idx in range(len(segments))
             ]
             done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
             first_exc: BaseException | None = None
@@ -1026,18 +1490,170 @@ async def process_weekly_batch(
 
             await asyncio.shield(_flush_ready_prefix())
 
+            if deferred_by_idx:
+                max_defer_wait_s = max(
+                    0.0, float(stale_after_s) + DEFAULT_DEFER_EXTRA_AFTER_STALE_S
+                )
+                min_interval_s = max(0.01, float(defer_retry_min_s))
+                max_interval_s = max(min_interval_s, float(defer_retry_max_s))
+
+                def _defer_now() -> float:
+                    if clock_fn is not None:
+                        return clock_fn()
+                    return time.monotonic()
+
+                defer_start_mono = _defer_now()
+                deadline = defer_start_mono + max_defer_wait_s
+                defer_pass = 0
+
+                while deferred_by_idx and _defer_now() < deadline:
+                    raw_interval = min(
+                        max_interval_s, min_interval_s * (2 ** min(defer_pass, 1))
+                    )
+                    remaining_s = deadline - _defer_now()
+                    if remaining_s <= 0.0:
+                        break
+                    sleep_interval = min(raw_interval, remaining_s)
+                    waited_s = max(0.0, _defer_now() - defer_start_mono)
+                    logger.info(
+                        "Waiting %.1fs before retrying %d deferred in_flight segment(s) (waited=%.1f/%.1fs)",
+                        sleep_interval,
+                        len(deferred_by_idx),
+                        waited_s,
+                        max_defer_wait_s,
+                    )
+                    _flush_log_handlers()
+                    await sleep_fn(sleep_interval)
+                    defer_pass += 1
+                    if _defer_now() >= deadline:
+                        break
+
+                    for seg_idx, (seg, prev_outcome, prev_retries) in sorted(
+                        list(deferred_by_idx.items())
+                    ):
+                        if _defer_now() >= deadline:
+                            break
+                        async with sem:
+                            if _defer_now() >= deadline:
+                                break
+                            outcome, rl_retries, elapsed_s = await _run_segment_attempt(
+                                seg,
+                                deadline=deadline,
+                                clock_override=_defer_now,
+                            )
+
+                        outcome.input_tokens += prev_outcome.input_tokens
+                        outcome.output_tokens += prev_outcome.output_tokens
+                        outcome.total_tokens += prev_outcome.total_tokens
+                        total_seg_retries = prev_retries + rl_retries
+                        if outcome.permanent_quota_error:
+                            abort_flag = True
+                            raise PermanentQuotaError(
+                                outcome.error or "permanent_quota_error"
+                            )
+                        if outcome.ok:
+                            deferred_by_idx.pop(seg_idx, None)
+                            seg_tokens = outcome.total_tokens or (
+                                outcome.input_tokens + outcome.output_tokens
+                            )
+                            logger.info(
+                                "Segment %d/%d completed after deferred retry: tokens=%d (in=%d, out=%d) elapsed=%.2fs status=%s",
+                                seg_idx + 1,
+                                total_segments,
+                                seg_tokens,
+                                outcome.input_tokens,
+                                outcome.output_tokens,
+                                elapsed_s,
+                                "discarded" if outcome.discarded_segment else "extracted",
+                            )
+                            _flush_log_handlers()
+                            completed_by_idx[seg_idx] = (seg, outcome, total_seg_retries)
+                            seg = []
+                            await asyncio.shield(_flush_ready_prefix())
+                        elif is_in_flight_error(outcome):
+                            deferred_by_idx[seg_idx] = (seg, outcome, total_seg_retries)
+                            seg = []
+                        else:
+                            deferred_by_idx.pop(seg_idx, None)
+                            fail_reason = (
+                                (outcome.error_kind or "transient_error")
+                                if is_transient_network_error(outcome)
+                                else _extraction_error_reason(outcome)
+                            )
+                            incomplete_by_idx[seg_idx] = _make_incomplete_record(
+                                seg_idx,
+                                seg,
+                                outcome,
+                                total_seg_retries,
+                                status="failed",
+                                reason=fail_reason,
+                            )
+                            seg.clear()
+                            if 0 <= seg_idx < len(segments):
+                                segments[seg_idx] = []
+                            seg = []
+
+                if deferred_by_idx:
+                    final_waited_s = max(0.0, _defer_now() - defer_start_mono)
+                    for seg_idx, (seg, last_outcome, total_seg_retries) in sorted(
+                        deferred_by_idx.items()
+                    ):
+                        incomplete_by_idx[seg_idx] = _make_incomplete_record(
+                            seg_idx,
+                            seg,
+                            last_outcome,
+                            total_seg_retries,
+                            status="failed",
+                            reason="in_flight_timeout",
+                        )
+                        seg.clear()
+                        if 0 <= seg_idx < len(segments):
+                            segments[seg_idx] = []
+                        logger.warning(
+                            "Segment %d/%d still in_flight after %.1fs deferred retries; marking incomplete (prefix cursor held at %d)",
+                            seg_idx + 1,
+                            total_segments,
+                            final_waited_s,
+                            next_to_flush,
+                        )
+                    _flush_log_handlers()
+                    deferred_by_idx.clear()
+
+                await asyncio.shield(_flush_ready_prefix())
+
+        for seg_idx, (seg, outcome, rl_retries) in sorted(completed_by_idx.items()):
+            incomplete_by_idx[seg_idx] = _make_incomplete_record(
+                seg_idx,
+                seg,
+                outcome,
+                rl_retries,
+                status="blocked",
+                reason="blocked_by_incomplete_prefix",
+            )
+            seg.clear()
+            outcome.cards.clear()
+
+        for inc_rec in incomplete_by_idx.values():
+            input_tokens += int(inc_rec.get("input_tokens", 0))
+            output_tokens += int(inc_rec.get("output_tokens", 0))
+            total_tokens += int(inc_rec.get("total_tokens", 0))
+            rate_limit_retries += int(inc_rec.get("retries", 0))
+
+        tasks.clear()
+        completed_by_idx.clear()
+        for rem_seg in segments:
+            rem_seg.clear()
+        segments.clear()
+
         rendered_summary: dict[str, Any] = {"company_files": [], "topic_files": []}
         if not dry_run:
             unrendered_dates = await db_conv.list_unrendered_dates(conn=conn)
-            touched_dates = sorted(
-                set(unrendered_dates)
-                | {str(c.get("date_et") or "")[:10] for c in accepted_cards if c.get("date_et")}
-            )
+            touched_dates = sorted(set(unrendered_dates) | accepted_dates)
             if touched_dates:
                 date_cards = await db_conv.list_cards_for_dates(
                     touched_dates, active_only=False, conn=conn
                 )
-                rendered_summary = await render_and_write_conversation_digests(
+                raw_rendered = await render_and_write_conversation_digests(
                     date_cards,
                     target_dates=touched_dates,
                     user_id=archive_owner_user_id(),
@@ -1045,30 +1661,59 @@ async def process_weekly_batch(
                     home_backend=home_backend,
                     conn=conn,
                 )
-                rendered_dates = rendered_summary.get("rendered_dates")
+                del date_cards
+                rendered_dates = raw_rendered.get("rendered_dates")
                 if rendered_dates is None:
                     rendered_dates = list(touched_dates)
                 if rendered_dates:
                     await db_conv.mark_dates_rendered(
                         rendered_dates,
-                        card_locations=rendered_summary.get("card_locations"),
+                        card_locations=raw_rendered.get("card_locations"),
                         conn=conn,
                     )
+                rendered_summary = _compact_rendered_summary(raw_rendered)
+                del raw_rendered
+
+        incomplete_segments = [incomplete_by_idx[k] for k in sorted(incomplete_by_idx)]
+        finish_status = "failed" if incomplete_segments else "completed"
+        finish_error = (
+            f"incomplete_segments={len(incomplete_segments)}"
+            if incomplete_segments
+            else None
+        )
+        maxrss_raw, maxrss_mib = _get_maxrss_stats()
+        logger.info(
+            "Weekly batch %s..%s finished: segments_processed=%d/%d incomplete=%d cards_inserted=%d maxrss=%d (%.2f MiB)",
+            window_start.isoformat(),
+            window_end.isoformat(),
+            segments_flushed,
+            total_segments,
+            len(incomplete_segments),
+            cards_accepted if dry_run else cards_inserted,
+            maxrss_raw,
+            maxrss_mib,
+        )
+        _flush_log_handlers()
 
         batch_summary = {
             "run_id": run_id,
+            "status": finish_status,
+            "error_text": finish_error,
             "mode": mode,
             "dry_run": dry_run,
             "window_start": window_start.isoformat(),
             "window_end": window_end.isoformat(),
             "extractor_model": extractor_model,
             "embedding_model": embedding_model_used,
-            "events_read": len(batch_events),
+            "events_read": total_events_read,
             "segments_processed": segments_flushed,
             "segments_discarded": segments_discarded,
-            "cards_extracted": len(candidate_cards),
-            "cards_accepted": len(accepted_cards),
-            "cards_inserted": len(accepted_cards) if dry_run else cards_inserted,
+            "next_to_flush": next_to_flush,
+            "incomplete_segments_count": len(incomplete_segments),
+            "incomplete_segments": incomplete_segments,
+            "cards_extracted": cards_extracted,
+            "cards_accepted": cards_accepted,
+            "cards_inserted": cards_accepted if dry_run else cards_inserted,
             "cards_deduped": deduped_count,
             "cards_superseded": superseded_count,
             "quotes_rejected": quotes_rejected,
@@ -1076,21 +1721,20 @@ async def process_weekly_batch(
             "output_tokens": output_tokens,
             "total_tokens": total_tokens,
             "rate_limit_retries": rate_limit_retries,
+            "maxrss": maxrss_raw,
+            "maxrss_mib": maxrss_mib,
             "rendered": rendered_summary,
-            "processed_chunk_keys": [
-                (r["agent"], r["session_id"], r["event_id"], int(r["chunk_idx"]))
-                for r in completed_processed_rows
-            ],
+            "processed_chunk_keys": list(processed_chunk_keys),
         }
 
         if not dry_run:
             await db_conv.update_run_finish(
                 run_id,
-                status="completed",
+                status=finish_status,
                 embedding_model=embedding_model_used,
-                events_read=len(batch_events),
+                events_read=total_events_read,
                 segments_processed=segments_flushed,
-                cards_extracted=len(candidate_cards),
+                cards_extracted=cards_extracted,
                 cards_inserted=cards_inserted,
                 cards_deduped=deduped_count,
                 cards_superseded=superseded_count,
@@ -1101,8 +1745,12 @@ async def process_weekly_batch(
                 total_tokens=total_tokens,
                 stats={
                     "rate_limit_retries": rate_limit_retries,
+                    "incomplete_segments_count": len(incomplete_segments),
+                    "incomplete_segments": incomplete_segments,
+                    "maxrss": maxrss_raw,
                     "rendered": rendered_summary,
                 },
+                error_text=finish_error,
                 conn=conn,
             )
 
@@ -1133,9 +1781,9 @@ async def process_weekly_batch(
                         run_id,
                         status=run_status,
                         embedding_model=embedding_model_used,
-                        events_read=len(batch_events),
+                        events_read=total_events_read,
                         segments_processed=segments_flushed,
-                        cards_extracted=len(candidate_cards),
+                        cards_extracted=cards_extracted,
                         cards_inserted=cards_inserted,
                         cards_deduped=deduped_count,
                         cards_superseded=superseded_count,
@@ -1173,10 +1821,15 @@ async def run_archive_pipeline(
     hourly_token_budget: int | None = None,
     extract_concurrency: int | None = None,
     concurrency: int | None = None,
+    stale_after_s: int = DEFAULT_STALE_AFTER_S,
+    defer_retry_min_s: float = DEFAULT_DEFER_RETRY_MIN_S,
+    defer_retry_max_s: float = DEFAULT_DEFER_RETRY_MAX_S,
     skip_host_export: bool = False,
+    llm_service: Any = None,
     extract_fn: Callable[..., Coroutine[Any, Any, SegmentExtractionOutcome]] = extract_segment_cards,
     embed_fn: Callable[..., Coroutine[Any, Any, tuple[list[list[float]], str]]] = embed_texts_via_bridge,
     sleep_fn: Callable[[float], Coroutine[Any, Any, None]] = asyncio.sleep,
+    clock_fn: Callable[[], float] | None = None,
     backend_by_ticker: dict[str, Any] | None = None,
     home_backend: Any = None,
     conn: Any = None,
@@ -1267,12 +1920,29 @@ async def run_archive_pipeline(
             else:
                 pending_inbox_files = sorted(inbox_dir.glob("*.jsonl")) if inbox_dir.is_dir() else []
 
+        limiter_kwargs: dict[str, Any] = {"sleep_fn": sleep_fn}
+        if clock_fn is not None:
+            limiter_kwargs["clock_fn"] = clock_fn
         limiter = HourlyTokenBudgetLimiter(
             eff_budget,
-            sleep_fn=sleep_fn,
+            **limiter_kwargs,
         )
 
+        shared_llm_service = llm_service
+        if shared_llm_service is None and not dry_run and extract_fn is extract_segment_cards:
+            try:
+                from ptc_agent.config import load_from_files
+                from src.server.services.llm.service import LLMService
+
+                agent_cfg = await load_from_files()
+                if getattr(agent_cfg, "llm", None) is not None and hasattr(agent_cfg.llm, "fallback"):
+                    agent_cfg.llm.fallback = []
+                shared_llm_service = LLMService(agent_config=agent_cfg, logger=logger)
+            except Exception as exc:
+                logger.debug("Lazy shared LLMService init skipped: %s", exc)
+
         batch_results: list[dict[str, Any]] = []
+        all_incomplete_segments: list[dict[str, Any]] = []
         events_total = 0
         files_consumed: list[str] = []
 
@@ -1302,6 +1972,8 @@ async def run_archive_pipeline(
                     persisted_plans=persisted_plans,
                 )
                 all_file_chunk_keys = sorted({_chunk_key(ch) for ch in file_chunks})
+            raw_events.clear()
+            del raw_events
 
             unprocessed_chunks: list[dict[str, Any]] = []
             rule_discarded_rows: list[dict[str, Any]] = []
@@ -1314,11 +1986,15 @@ async def run_archive_pipeline(
                     rule_discarded_rows.append(_make_processed_row(ch, "discarded"))
                     continue
                 unprocessed_chunks.append(ch)
+            file_chunks.clear()
+            del file_chunks
 
             if not dry_run and rule_discarded_rows:
                 await db_conv.record_processed_event_chunks(rule_discarded_rows, conn=conn)
                 for r in rule_discarded_rows:
                     processed_keys.add((r["agent"], r["session_id"], r["event_id"], int(r["chunk_idx"])))
+            rule_discarded_rows.clear()
+            del rule_discarded_rows
 
             events_total += len(unprocessed_chunks)
             weekly_batches = group_events_by_weekly_window(
@@ -1326,8 +2002,11 @@ async def run_archive_pipeline(
                 since_date=eff_since,
                 until_date=eff_until,
             )
+            unprocessed_chunks.clear()
+            del unprocessed_chunks
 
-            for w_start, w_end, b_events in weekly_batches:
+            while weekly_batches:
+                w_start, w_end, b_events = weekly_batches.pop(0)
                 b_summary = await process_weekly_batch(
                     b_events,
                     mode=mode,
@@ -1339,23 +2018,32 @@ async def run_archive_pipeline(
                     dry_run=dry_run,
                     initial_backoff_s=cfg.rate_limit_initial_backoff_seconds,
                     max_backoff_s=cfg.rate_limit_max_backoff_seconds,
+                    stale_after_s=stale_after_s,
+                    defer_retry_min_s=defer_retry_min_s,
+                    defer_retry_max_s=defer_retry_max_s,
                     extract_concurrency=eff_concurrency,
+                    llm_service=shared_llm_service,
                     extract_fn=extract_fn,
                     embed_fn=embed_fn,
                     sleep_fn=sleep_fn,
+                    clock_fn=clock_fn,
                     backend_by_ticker=backend_by_ticker,
                     home_backend=home_backend,
                     conn=conn,
                 )
-                for k in b_summary.get("processed_chunk_keys") or []:
+                b_events.clear()
+                del b_events
+                for k in b_summary.pop("processed_chunk_keys", None) or []:
                     processed_keys.add(tuple(k))
+                for inc_seg in b_summary.get("incomplete_segments") or []:
+                    all_incomplete_segments.append(dict(inc_seg))
                 batch_results.append(b_summary)
 
             if not dry_run and set(all_file_chunk_keys).issubset(processed_keys):
                 f_path.unlink(missing_ok=True)
                 files_consumed.append(f_path.name)
 
-        if not dry_run and not is_backfill and deferred_export_cursors is not None:
+        if not dry_run and not is_backfill and deferred_export_cursors is not None and not all_incomplete_segments:
             save_cursors_file(deferred_export_cursors, eff_export_cursors)
 
         # Retry rendering for any previously stored cards whose digest files were not yet written
@@ -1364,7 +2052,7 @@ async def run_archive_pipeline(
             pending_dates = await db_conv.list_unrendered_dates(conn=conn)
             if pending_dates:
                 date_cards = await db_conv.list_cards_for_dates(pending_dates, active_only=False, conn=conn)
-                rendered_retry_summary = await render_and_write_conversation_digests(
+                raw_retry_rendered = await render_and_write_conversation_digests(
                     date_cards,
                     target_dates=pending_dates,
                     user_id=archive_owner_user_id(),
@@ -1372,18 +2060,23 @@ async def run_archive_pipeline(
                     home_backend=home_backend,
                     conn=conn,
                 )
-                retry_rendered_dates = rendered_retry_summary.get("rendered_dates")
+                del date_cards
+                retry_rendered_dates = raw_retry_rendered.get("rendered_dates")
                 if retry_rendered_dates is None:
                     retry_rendered_dates = list(pending_dates)
                 if retry_rendered_dates:
                     await db_conv.mark_dates_rendered(
                         retry_rendered_dates,
-                        card_locations=rendered_retry_summary.get("card_locations"),
+                        card_locations=raw_retry_rendered.get("card_locations"),
                         conn=conn,
                     )
+                rendered_retry_summary = _compact_rendered_summary(raw_retry_rendered)
+                del raw_retry_rendered
 
+        has_incomplete = len(all_incomplete_segments) > 0
         return {
-            "ok": True,
+            "ok": not has_incomplete,
+            "exit_code": EXIT_CODE_INCOMPLETE if has_incomplete else EXIT_CODE_OK,
             "mode": mode,
             "dry_run": dry_run,
             "since": eff_since.isoformat(),
@@ -1397,6 +2090,8 @@ async def run_archive_pipeline(
             "rendered_retry": rendered_retry_summary,
             "batches_count": len(batch_results),
             "events_total": events_total,
+            "incomplete_segments_total": len(all_incomplete_segments),
+            "incomplete_segments": all_incomplete_segments,
             "cards_inserted_total": sum(int(b.get("cards_inserted", 0)) for b in batch_results),
             "cards_deduped_total": sum(int(b.get("cards_deduped", 0)) for b in batch_results),
             "cards_superseded_total": sum(int(b.get("cards_superseded", 0)) for b in batch_results),
@@ -1415,6 +2110,14 @@ async def run_archive_pipeline(
                 await asyncio.shield(lock_conn.close())
             except BaseException:
                 pass
+
+
+EXIT_CODE_EPILOG = """Exit codes:
+  0  All segments completed
+  2  Another archive run holds the Postgres advisory lock
+  3  One or more segments remained incomplete (safe to re-run)
+  1  Fatal error (e.g. PermanentQuotaError)
+"""
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -1437,14 +2140,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     parser = argparse.ArgumentParser(
         description="Dalton OpenClaw Conversation Archive CLI (run / backfill)",
+        epilog=EXIT_CODE_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
         parents=[common],
     )
     subparsers = parser.add_subparsers(dest="subcommand")
-    subparsers.add_parser("run", parents=[common], help="Run incremental daily conversation extraction")
+    subparsers.add_parser(
+        "run",
+        parents=[common],
+        help="Run incremental daily conversation extraction",
+        epilog=EXIT_CODE_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     subparsers.add_parser(
         "backfill",
         parents=[common],
         help="Backfill historical conversations in weekly batches with token budget pacing",
+        epilog=EXIT_CODE_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     return parser
 
@@ -1507,9 +2220,15 @@ def main(argv: list[str] | None = None) -> int:
     try:
         summary = asyncio.run(_async_main(args))
     except ArchiveAlreadyRunningError as exc:
-        return int(exc.code if isinstance(exc.code, int) else 2)
+        return int(exc.code if isinstance(exc.code, int) else EXIT_CODE_LOCK_HELD)
     print(json.dumps(summary, ensure_ascii=False, default=str))
-    return 0
+    if (
+        int(summary.get("incomplete_segments_total") or 0) > 0
+        or bool(summary.get("incomplete_segments"))
+        or summary.get("exit_code") == EXIT_CODE_INCOMPLETE
+    ):
+        return EXIT_CODE_INCOMPLETE
+    return EXIT_CODE_OK
 
 
 if __name__ == "__main__":

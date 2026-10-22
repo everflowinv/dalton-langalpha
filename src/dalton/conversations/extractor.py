@@ -15,10 +15,13 @@ from typing import Any
 
 from src.config.env import LOCAL_DEV_USER_ID
 from src.dalton.database.conversations import build_card_search_text
-from src.dalton.llm.assist import AssistResult, assist_json
+from src.dalton.llm.assist import AssistResult, _normalize_schema_enums, assist_json
+from src.dalton.llm.complete import resolve_model_billing_and_provider
 from src.dalton.settings import get_dalton_settings
 
 logger = logging.getLogger(__name__)
+
+VALID_SEGMENT_CATEGORIES: frozenset[str] = frozenset({"research", "ops", "private"})
 
 VALID_CARD_TYPES: frozenset[str] = frozenset(
     {
@@ -179,7 +182,36 @@ class SegmentExtractionOutcome:
     total_tokens: int = 0
     rate_limited: bool = False
     permanent_quota_error: bool = False
+    status: str = ""
+    error_kind: str | None = None
+    in_flight: bool = False
+    transient_error: bool = False
+    cached: bool = False
+    replayed: bool = False
     error: str | None = None
+
+
+def normalize_card_enum_fields(payload: dict[str, Any]) -> dict[str, Any]:
+    """Strip whitespace and lowercase enum fields (`category`, `cards[].type`), rejecting invalid values."""
+    _normalize_schema_enums(payload, EXTRACTION_RESPONSE_SCHEMA)
+    if "category" in payload and payload["category"] is not None:
+        cat = str(payload["category"]).strip().lower()
+        payload["category"] = cat
+        if cat not in VALID_SEGMENT_CATEGORIES:
+            allowed_cats = list(EXTRACTION_RESPONSE_SCHEMA["properties"]["category"]["enum"])
+            raise ValueError(f"ValidationError: {cat!r} is not one of {allowed_cats}")
+    raw_cards = payload.get("cards")
+    if isinstance(raw_cards, list):
+        allowed_types = list(
+            EXTRACTION_RESPONSE_SCHEMA["properties"]["cards"]["items"]["properties"]["type"]["enum"]
+        )
+        for card in raw_cards:
+            if isinstance(card, dict) and "type" in card and card["type"] is not None:
+                c_type = str(card["type"]).strip().lower()
+                card["type"] = c_type
+                if c_type not in VALID_CARD_TYPES:
+                    raise ValueError(f"ValidationError: {c_type!r} is not one of {allowed_types}")
+    return payload
 
 
 def normalize_whitespace(text: str) -> str:
@@ -283,9 +315,12 @@ def enforce_speaker_and_agent_citation(
     cleaned_sources = [
         str(s).strip() for s in (cited_sources or []) if s is not None and str(s).strip()
     ]
-    eff_type = str(card_type or "opinion").strip().lower()
+    eff_type = str(card_type if card_type is not None else "opinion").strip().lower()
     if eff_type not in VALID_CARD_TYPES:
-        eff_type = "opinion"
+        allowed_types = list(
+            EXTRACTION_RESPONSE_SCHEMA["properties"]["cards"]["items"]["properties"]["type"]["enum"]
+        )
+        raise ValueError(f"ValidationError: {eff_type!r} is not one of {allowed_types}")
 
     # Rule: agent (Eve) fact/estimate/model_assumption requires non-empty cited_sources
     # where every cited source is present as a substring in the segment's raw event text.
@@ -347,16 +382,12 @@ def _split_oversized_event(
 
     if len(text) <= limit:
         spans = [[0, len(text)]]
-        return [
-            {
-                **ev,
-                "chunk_idx": int(ev.get("chunk_idx", 0)),
-                "chunk_count": 1,
-                "chunk_max_chars": limit,
-                "chunk_spans": spans,
-                "_chunk_expanded": True,
-            }
-        ]
+        ev["chunk_idx"] = int(ev.get("chunk_idx", 0))
+        ev["chunk_count"] = 1
+        ev["chunk_max_chars"] = limit
+        ev["chunk_spans"] = spans
+        ev["_chunk_expanded"] = True
+        return [ev]
 
     spans = []
     pos = 0
@@ -632,16 +663,16 @@ def compute_batch_supersedes(
             newer_superseding_cards: list[dict[str, Any]] = []
             newer_seen_ids: set[str] = set()
 
+            pool_ordered = sorted(
+                active_pool,
+                key=_card_display_sort_key,
+                reverse=True,
+            )
             for fig in card_figures:
                 m_key, p_key = _normalize_figure_key(fig.get("metric"), fig.get("period"))
                 if not m_key or not p_key:
                     continue
 
-                pool_ordered = sorted(
-                    active_pool,
-                    key=_card_display_sort_key,
-                    reverse=True,
-                )
                 for prev in pool_ordered:
                     if prev.get("status") != "active":
                         continue
@@ -709,17 +740,32 @@ def resolve_dedup_and_supersedes(
 
 
 def _extract_error_Inspection(
-    res: AssistResult | BaseException | str,
+    res: AssistResult | SegmentExtractionOutcome | BaseException | str,
 ) -> tuple[bool, int | None, str, str, str, str]:
-    """Normalize `AssistResult`, exception, or error string into `(is_ok, status_code, cls_name, status, error_kind, err_text)`."""
+    """Normalize `AssistResult`, `SegmentExtractionOutcome`, exception, or error string into `(is_ok, status_code, cls_name, status, error_kind, err_text)`."""
     if isinstance(res, AssistResult):
+        err_text = str(res.error or "").lower()
+        m = re.search(r"(?:http_|status[=_:\s]*)?([45]\d{2})\b", err_text, re.IGNORECASE)
+        code = int(m.group(1)) if m else None
         return (
             bool(res.ok),
-            None,
+            code,
             "assistresult",
             str(res.status or "").lower(),
             str(res.error_kind or "").lower(),
-            str(res.error or "").lower(),
+            err_text,
+        )
+    if isinstance(res, SegmentExtractionOutcome):
+        err_text = str(res.error or "").lower()
+        m = re.search(r"(?:http_|status[=_:\s]*)?([45]\d{2})\b", err_text, re.IGNORECASE)
+        code = int(m.group(1)) if m else None
+        return (
+            bool(res.ok),
+            code,
+            "segmentextractionoutcome",
+            str(res.status or "").lower(),
+            str(res.error_kind or "").lower(),
+            err_text,
         )
     if isinstance(res, BaseException):
         status_code = getattr(res, "status_code", None) or getattr(
@@ -741,6 +787,87 @@ def _extract_error_Inspection(
     m = re.search(r"(?:http_|status[=_:\s]*)?([45]\d{2})\b", err_str, re.IGNORECASE)
     code = int(m.group(1)) if m else None
     return False, code, "str", "", "", err_str
+
+
+def is_in_flight_error(
+    res: AssistResult | SegmentExtractionOutcome | BaseException | str,
+) -> bool:
+    """Return True if an extraction result or exception indicates a journal `in_flight` collision."""
+    if isinstance(res, SegmentExtractionOutcome) and res.in_flight:
+        return True
+    is_ok, _status_code, cls_name, status, ek, err = _extract_error_Inspection(res)
+    if is_ok:
+        return False
+    if status == "in_flight" or ek == "in_flight" or cls_name == "journalinflight":
+        return True
+    for marker in (
+        "in_flight",
+        "journal state is in_flight",
+        "正在由另一个进程执行中",
+    ):
+        if marker in err:
+            return True
+    return False
+
+
+def is_transient_network_error(
+    res: AssistResult | SegmentExtractionOutcome | BaseException | str,
+) -> bool:
+    """Return True for transient network/upstream errors (`RemoteProtocolError`, `ReadError`, `ConnectError`, `ReadTimeout`, HTTP 502/503/504)."""
+    if isinstance(res, SegmentExtractionOutcome) and res.transient_error:
+        return True
+    is_ok, status_code, cls_name, status, ek, err = _extract_error_Inspection(res)
+    if (
+        is_ok
+        or is_permanent_quota_error(res)
+        or is_rate_limit_or_quota_error(res)
+        or is_in_flight_error(res)
+    ):
+        return False
+    if status == "indeterminate" and ek == "indeterminate":
+        return False
+    if status_code in (502, 503, 504):
+        return True
+    if ek in ("stream_cut", "timeout", "http_502", "http_503", "http_504"):
+        return True
+    if cls_name in (
+        "remoteprotocolerror",
+        "readerror",
+        "connecterror",
+        "readtimeout",
+        "connecttimeout",
+        "writeerror",
+        "writetimeout",
+        "pooltimeout",
+        "protocolerror",
+        "timeouterror",
+        "connectionerror",
+        "connectionreseterror",
+    ):
+        return True
+    for marker in (
+        "remoteprotocolerror",
+        "peer closed connection",
+        "incomplete chunked read",
+        "server disconnected",
+        "readerror",
+        "connecterror",
+        "readtimeout",
+        "connecttimeout",
+        "writetimeout",
+        "pooltimeout",
+        "timed out",
+        "http_502",
+        "http_503",
+        "http_504",
+        "502 bad gateway",
+        "503 service unavailable",
+        "503 upstream",
+        "504 gateway timeout",
+    ):
+        if marker in err:
+            return True
+    return False
 
 
 def is_permanent_quota_error(res: AssistResult | BaseException | str) -> bool:
@@ -854,6 +981,9 @@ async def extract_segment_cards(
     ).hexdigest()[:20]
     scope_ref = f"conv_extract:{user_id}:{seg_digest}"
 
+    billing_type, _ = resolve_model_billing_and_provider(eff_model)
+    eff_resend_indeterminate = bool(resend_indeterminate and billing_type == "oauth")
+
     res = await assist_json(
         task="conversation.extract_cards",
         instructions=EXTRACTION_SYSTEM_INSTRUCTIONS,
@@ -865,7 +995,7 @@ async def extract_segment_cards(
         timeout_s=180.0,
         model=eff_model,
         llm_service=llm_service,
-        resend_indeterminate=resend_indeterminate,
+        resend_indeterminate=eff_resend_indeterminate,
         persist_raw=persist_raw,
         skip_journal=skip_journal,
     )
@@ -875,6 +1005,8 @@ async def extract_segment_cards(
     out_tok = int(usage.get("output_tokens") or 0)
     tot_tok = int(usage.get("total_tokens") or (in_tok + out_tok))
     used_model = str(res.model or eff_model)
+    is_cached = bool(getattr(res, "cached", False) or getattr(res, "replayed", False))
+    is_replayed = bool(getattr(res, "replayed", False) or getattr(res, "cached", False))
 
     if not res.ok or not isinstance(res.data, dict):
         return SegmentExtractionOutcome(
@@ -885,7 +1017,29 @@ async def extract_segment_cards(
             total_tokens=tot_tok,
             rate_limited=is_rate_limit_or_quota_error(res),
             permanent_quota_error=is_permanent_quota_error(res),
+            status=str(res.status or ""),
+            error_kind=res.error_kind,
+            in_flight=is_in_flight_error(res),
+            transient_error=is_transient_network_error(res),
+            cached=is_cached,
+            replayed=is_replayed,
             error=res.error or res.status,
+        )
+
+    try:
+        normalize_card_enum_fields(res.data)
+    except ValueError as exc:
+        return SegmentExtractionOutcome(
+            ok=False,
+            model_used=used_model,
+            input_tokens=in_tok,
+            output_tokens=out_tok,
+            total_tokens=tot_tok,
+            status="error",
+            error_kind="ValidationError",
+            cached=is_cached,
+            replayed=is_replayed,
+            error=str(exc),
         )
 
     category = str(res.data.get("category") or "research").strip().lower()
@@ -903,6 +1057,8 @@ async def extract_segment_cards(
             input_tokens=in_tok,
             output_tokens=out_tok,
             total_tokens=tot_tok,
+            cached=is_cached,
+            replayed=is_replayed,
         )
 
     valid_cards: list[dict[str, Any]] = []
@@ -1008,4 +1164,6 @@ async def extract_segment_cards(
         input_tokens=in_tok,
         output_tokens=out_tok,
         total_tokens=tot_tok,
+        cached=is_cached,
+        replayed=is_replayed,
     )
