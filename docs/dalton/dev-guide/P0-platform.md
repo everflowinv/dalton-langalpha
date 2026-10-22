@@ -1844,6 +1844,7 @@ async def get_run_charge_usd(run_ref: str) -> Decimal | None
 | home-workspace-alias | `src/server/database/home_workspace.py` | `get_home_workspace_id` 先查 `DALTON_HOME_WORKSPACE_ALIASES` 别名映射，未命中再走 uuid5 | 约 5 |
 | team-sharing | `src/server/app/workspaces.py`、`src/server/app/threads/crud.py`、`src/server/app/threads/messaging.py`、`src/server/app/threads/provenance.py`、`src/server/app/threads/tasks.py`、`src/server/app/workspace_files/crud.py` | 读接口在 `is_dalton_supabase_auth_enabled()` 开启时调用 `require_workspace_reader` / `require_thread_reader`，同事文件读取强制走数据库镜像 `workspace_files` | 各 6–20 |
 | team-sharing | `web/src/lib/queryKeys.ts`、`web/src/components/Sidebar/AppSidebar.tsx`、`web/src/pages/ChatAgent/hooks/useWarmWorkspaceSandbox.ts`、`web/src/pages/ChatAgent/components/chatView/usePanelFiles.ts`、`web/src/pages/ChatAgent/components/FilePanel.tsx`、`web/src/pages/ChatAgent/components/ThreadGallery.tsx`、`web/src/pages/ChatAgent/components/ChatView.tsx` | 侧边栏团队工作区按人分组折叠展示、同事工作区/线程进入只读模式（顶部显示"只读 · 来自 <同事名>"、禁用写操作、不预热他人沙箱、文件面板仅展示镜像文件） | 各 1–25 |
+| yfinance-prev-close | `src/data_client/yfinance/yahoo.py`、`src/data_client/yfinance/data_source.py`、`src/data_client/yfinance/financial_source.py` | 日内涨跌的基准改用 `regularMarketPreviousClose`（`fast_info.previousClose` 对美股不是前一交易日正式收盘价）；yfinance 报价补上 `yearHigh` / `yearLow` / `avgVolume` | 各 1–18 |
 
 **数据篇（P0D）引入的钩子**（也在 P0 阶段落地，`check_hooks.sh` 一并核对）：
 
