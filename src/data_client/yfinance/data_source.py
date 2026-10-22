@@ -19,7 +19,8 @@ from market_protocol.calendars import get_calendar, session_bounds
 from market_protocol.enums import AssetClass
 from src.utils.market_hours import interval_seconds
 
-from .yahoo import yahoo_symbol, yahoo_ticker
+# DALTON-HOOK(yfinance-prev-close)
+from .yahoo import regular_previous_close, yahoo_symbol, yahoo_ticker
 
 logger = logging.getLogger(__name__)
 
@@ -199,7 +200,7 @@ def _fetch_single_snapshot(sym: str) -> dict[str, Any] | None:
         price = _finite(fi.get("lastPrice"))
         if price is None:
             return None
-        prev = _finite(fi.get("previousClose"))
+        prev = regular_previous_close(fi)  # DALTON-HOOK(yfinance-prev-close)
         change = price - prev if prev else 0.0
         change_pct = (change / prev * 100) if prev else 0.0
         open_ = _finite(fi.get("open"))
