@@ -254,15 +254,49 @@ async def fetch_quote(
         listings = [resolve_listing(s, asset_class) for s in syms]
         resolved = [spelling for _, spelling in listings]
         asked = {snapshot_key(spelling): ref for ref, spelling in listings if ref is not None}
-        snaps = await provider.get_snapshots(resolved, asset_type=asset_type, user_id=user_id)
+        # DALTON-HOOK(stock-move-upgrade): caret-prefixed indexes (^TNX, ^VIX) passed in a
+        # mixed "stocks" batch resolve to AssetClass.INDEX with their caret stripped; query
+        # them on the indices path so Yahoo/FMP re-apply the caret.
+        if asset_type == "stocks" and any(
+            ref is not None and ref.asset_class is AssetClass.INDEX for ref, _ in listings
+        ):
+            stock_resolved = [
+                sp for ref, sp in listings if ref is None or ref.asset_class is not AssetClass.INDEX
+            ]
+            index_resolved = [
+                sp for ref, sp in listings if ref is not None and ref.asset_class is AssetClass.INDEX
+            ]
+            snaps = []
+            if stock_resolved:
+                snaps.extend(
+                    await provider.get_snapshots(
+                        stock_resolved, asset_type="stocks", user_id=user_id
+                    )
+                )
+            if index_resolved:
+                snaps.extend(
+                    await provider.get_snapshots(
+                        index_resolved, asset_type="indices", user_id=user_id
+                    )
+                )
+        else:
+            snaps = await provider.get_snapshots(resolved, asset_type=asset_type, user_id=user_id)
         if asset_type == "stocks":
             # A listing no provider quotes (Beijing has no realtime one) reads
             # its last daily close while its venue is closed, as the REST
             # quote routes do; empty, the agent goes to the web for it.
             from src.server.services.cache.quote_daily_fallback import fill_from_daily
 
-            served = [(asked[k], s) for s in snaps if (k := snapshot_key(s.get("symbol"))) in asked]
-            filled = await fill_from_daily(served, list(asked.values()), user_id)
+            stock_asked = [
+                r for r in asked.values() if r.asset_class is not AssetClass.INDEX
+            ]  # DALTON-HOOK(stock-move-upgrade)
+            served = [
+                (asked[k], s)
+                for s in snaps
+                if (k := snapshot_key(s.get("symbol"))) in asked
+                and asked[k].asset_class is not AssetClass.INDEX
+            ]
+            filled = await fill_from_daily(served, stock_asked, user_id)
             snaps = [*snaps, *(row for _, row in filled[len(served):])]
         # The card names each row as the REST routes do; a daily row has none.
         await fill_quote_names(snaps)
@@ -288,7 +322,12 @@ async def fetch_quote(
             snap.update(stamp_quote(snap, retrieved_at, ref=ref))
             # The card prints each row in its listing currency; an index level
             # is a bare number, so index rows carry none.
-            if asset_type == "stocks" and ref is not None and not snap.get("currency"):
+            if (
+                asset_type == "stocks"
+                and ref is not None
+                and ref.asset_class is not AssetClass.INDEX  # DALTON-HOOK(stock-move-upgrade)
+                and not snap.get("currency")
+            ):
                 snap["currency"] = ref.price_currency
             all_realtime = all_realtime and is_live(snap["freshness"])
         content = format_quote_block(snaps, at=retrieved_at)

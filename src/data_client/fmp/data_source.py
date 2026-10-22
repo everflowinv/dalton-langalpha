@@ -77,7 +77,7 @@ class FMPDataSource:
     @staticmethod
     def _api_symbol(symbol: str, is_index: bool) -> str:
         # Suffixed index symbols (000300.SH) are already valid — never caret them.
-        if not is_index or symbol.startswith("^") or "." in symbol:
+        if not is_index or symbol.startswith("^") or "." in symbol or "=" in symbol:  # DALTON-HOOK(stock-move-upgrade)
             return symbol
         return f"^{symbol}"
 
@@ -108,6 +108,7 @@ class FMPDataSource:
         to_date: str | None = None,
         is_index: bool = False,
         user_id: str | None = None,
+        extended_hours: bool = False,  # DALTON-HOOK(stock-move-upgrade)
     ) -> list[dict[str, Any]]:
         if interval not in self._SUPPORTED_INTERVALS:
             raise ValueError(
@@ -122,6 +123,7 @@ class FMPDataSource:
                 interval=interval,
                 from_date=from_date,
                 to_date=to_date,
+                **({"extended": True} if extended_hours else {}),  # DALTON-HOOK(stock-move-upgrade)
             )
         bars = [self._normalize(bar, tz, scale) for bar in (data or [])]
         bars.sort(key=lambda b: b["time"])

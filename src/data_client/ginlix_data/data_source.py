@@ -114,6 +114,7 @@ class GinlixDataSource:
         to_date: str | None = None,
         is_index: bool = False,
         user_id: str | None = None,
+        extended_hours: bool = False,  # DALTON-HOOK(stock-move-upgrade)
     ) -> FetchResult:
         market = "index" if is_index else "stock"
         api_symbol = index_ticker(symbol) if is_index else symbol

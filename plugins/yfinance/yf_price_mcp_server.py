@@ -56,6 +56,7 @@ _YF_INTERVAL = {
 # yfinance-native granularities with no canonical equivalent — passed through
 # and echoed verbatim. (4hour is canonical but yfinance has no such bar.)
 _YF_NATIVE_INTERVALS = frozenset({"2m", "90m", "5d", "3mo"})
+_YF_INTRADAY_INTERVALS = frozenset({"1m", "2m", "5m", "15m", "30m", "1h", "90m"})  # DALTON-HOOK(stock-move-upgrade)
 _SUPPORTED_INTERVALS = sorted(_YF_INTERVAL) + sorted(_YF_NATIVE_INTERVALS)
 
 # Minor-unit quote currencies yfinance may declare → (major ISO 4217, divisor).
@@ -213,24 +214,25 @@ def get_stock_history(
     ticker: str,
     period: str = "1y",
     interval: str = "1d",
+    extended_hours: bool = False,  # DALTON-HOOK(stock-move-upgrade)
 ) -> _OUT_GET_STOCK_HISTORY:
     """Historical OHLCV price bars for one stock — charts, returns, technicals.
 
     Args:
-        ticker: Symbol — US "AAPL", HK "0700.HK", A-share "600519.SH".
-        period: 1d,5d,1mo,3mo,6mo,1y,2y,5y,10y,ytd,max.
-        interval: 1min|5min|15min|30min|1hour|1day|1week|1month (native
-            2m|90m|5d|3mo accepted; 4hour unsupported). Intraday lookback is
+        ticker: US "AAPL", HK "0700.HK", CN "600519.SH", futures "NQ=F", index "^TNX".
+        period: 1d,5d,1mo,3mo,6mo,1y,2y,5y,10y,ytd,max. Intraday lookback is
             capped by yfinance.
+        interval: 1min|5min|15min|30min|1hour|1day|1week|1month (2m|90m|5d|3mo
+            accepted; 4hour unsupported).
+        extended_hours: Include pre/post-market intraday bars (default False).
 
     Returns:
         dict: {symbol, interval, period, currency, timezone, count, data,
-        source}. data is a list of {date, open, high, low, close, volume,
-        dividends?, splits?}
-        ascending (oldest first); date is exchange-local "YYYY-MM-DD" or
-        "YYYY-MM-DD HH:MM:SS" intraday, timezone is the IANA zone, prices in
-        `currency` major units (minor-unit GBp/pence auto-converted to major).
-        On error: {error, detail} — not_found|unsupported_interval|upstream_error.
+        source}. data: list of {date, open, high, low, close, volume,
+        dividends?, splits?} ascending (oldest first); exchange-local
+        "YYYY-MM-DD[ HH:MM:SS]", prices in `currency` major units (GBp/pence
+        auto-converted). On error: {error, detail} —
+        not_found|unsupported_interval|upstream_error.
     """
     symbol, yf_symbol, currency = boundary(ticker)
     yf_interval, echo_interval, err = _resolve_interval(interval)
@@ -239,7 +241,10 @@ def get_stock_history(
         return err
     try:
         stock = yf.Ticker(yf_symbol)
-        df = stock.history(period=period, interval=yf_interval)
+        hist_kwargs: dict[str, Any] = {"period": period, "interval": yf_interval}
+        if extended_hours and yf_interval in _YF_INTRADAY_INTERVALS:  # DALTON-HOOK(stock-move-upgrade)
+            hist_kwargs["prepost"] = True
+        df = stock.history(**hist_kwargs)
         resp_currency, divisor = _price_scale(stock, currency)
         history = _serialize_history(df, divisor)
         if not history:
@@ -279,24 +284,24 @@ def get_multiple_stocks_history(
     tickers: List[str],
     period: str = "1y",
     interval: str = "1d",
+    extended_hours: bool = False,  # DALTON-HOOK(stock-move-upgrade)
 ) -> _OUT_GET_MULTIPLE_STOCKS_HISTORY:
     """Historical OHLCV bars for several stocks — compare price series.
 
     Args:
-        tickers: Symbols, e.g. ["AAPL", "MSFT", "0700.HK"].
+        tickers: Symbols, e.g. ["AAPL", "MSFT", "0700.HK", "NQ=F", "^TNX"].
         period: 1d,5d,1mo,3mo,6mo,1y,2y,5y,10y,ytd,max.
-        interval: 1min|5min|15min|30min|1hour|1day|1week|1month (native
-            2m|90m|5d|3mo accepted; 4hour unsupported).
+        interval: 1min|5min|15min|30min|1hour|1day|1week|1month (2m|90m|5d|3mo
+            accepted; 4hour unsupported).
+        extended_hours: Include pre/post-market intraday bars (default False).
 
     Returns:
         dict: {interval, count, data, source, period, errors?}. data is keyed by
         canonical symbol → {count, currency?, timezone?, data}; each inner data
         is a list of {date, open, high, low, close, volume, dividends?, splits?}
-        ascending (oldest first), exchange-local "YYYY-MM-DD[ HH:MM:SS]"; count
-        is total bars. Prices in major units (GBp/pence auto-converted).
-        Failed symbols are listed in errors as
-        {error, detail, symbol}; a bad interval returns
-        {error: unsupported_interval, detail, supported}.
+        ascending (oldest first), exchange-local "YYYY-MM-DD[ HH:MM:SS]", prices
+        in major units (GBp auto-converted). Failed symbols in errors as {error,
+        detail, symbol}; bad interval returns {error: unsupported_interval, detail, supported}.
     """
     yf_interval, echo_interval, err = _resolve_interval(interval)
     if err is not None:
@@ -310,7 +315,10 @@ def get_multiple_stocks_history(
         symbol, yf_symbol, currency = boundary(t)
         try:
             stock = yf.Ticker(yf_symbol)
-            df = stock.history(period=period, interval=yf_interval)
+            hist_kwargs: dict[str, Any] = {"period": period, "interval": yf_interval}
+            if extended_hours and yf_interval in _YF_INTRADAY_INTERVALS:  # DALTON-HOOK(stock-move-upgrade)
+                hist_kwargs["prepost"] = True
+            df = stock.history(**hist_kwargs)
             resp_currency, divisor = _price_scale(stock, currency)
             history = _serialize_history(df, divisor)
             entry: dict[str, Any] = {"count": len(history)}

@@ -69,6 +69,7 @@ ALLOWED_HOOKS=(
   "team-credentials"
   "yfinance-prev-close"
   "data-map"
+  "stock-move-upgrade"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)
@@ -264,14 +265,36 @@ if git rev-parse --verify "$BASE_REF" >/dev/null 2>&1; then
     fi
   done
 
-  # P0F.2 #3: Verify agent_docstring_lock.json is additive-only vs BASE_REF and only adds dalton_* keys
+  # P0F.2 #3: Verify agent_docstring_lock.json is additive-only vs BASE_REF (except pinned sha256 hook keys) and only adds dalton_* keys
   if ! "${PYTHON_CMD[@]}" - "$BASE_REF" <<'PY'
-import json, subprocess, sys
+import hashlib, json, subprocess, sys
 base_ref = sys.argv[1]
 base_json = json.loads(subprocess.check_output(["git", "show", f"{base_ref}:tests/unit/mcp_servers/agent_docstring_lock.json"], text=True))
 cur_json = json.loads(open("tests/unit/mcp_servers/agent_docstring_lock.json", encoding="utf-8").read())
+pinned_modified_sha256 = {
+    "direct:get_daily_prices": "8ac5caef9f4daf0aaeba4243dd3523871fe4d1b5887004580b510a7d5c026098",
+    "direct:get_quote": "3048022c2ebe1b63286a638dcfb09da38f4510fb24b3006b840c8a1a54ca93cd",
+    "mcp:price_data:get_asset_data": "ddaeb61647241627897cbf68ae19a28bd8ed3b015e0060e7649421b6fbb75372",
+    "mcp:price_data:get_stock_data": "1207da227ebdfcfd4d706e737fec94345e54cb7cdd32f21c3087e0dfa53336e8",
+    "mcp:yf_price:get_multiple_stocks_history": "f7c61b74abe894ccbe723329e971a2e2ea27d8c735ae6ddb490b4ea6c33f12ad",
+    "mcp:yf_price:get_stock_history": "bc8586db7b45021313669c22a045a3a554403fa5a334056772aef8c8e09ca0ad",
+}
 errors = []
+for k, expected_sha in pinned_modified_sha256.items():
+    if k not in cur_json:
+        errors.append(f"Missing pinned key {k} from agent_docstring_lock.json")
+    else:
+        cur_sha = hashlib.sha256(
+            json.dumps(cur_json[k], sort_keys=True, ensure_ascii=False).encode("utf-8")
+        ).hexdigest()
+        if cur_sha != expected_sha:
+            errors.append(
+                f"Pinned key {k} in agent_docstring_lock.json has sha256={cur_sha}, "
+                f"expected {expected_sha}"
+            )
 for k, v in base_json.items():
+    if k in pinned_modified_sha256:
+        continue
     if k not in cur_json:
         errors.append(f"Removed upstream key {k} from agent_docstring_lock.json")
     elif cur_json[k] != v:

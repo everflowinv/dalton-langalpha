@@ -8,15 +8,37 @@ description: "解释某只股票一段时间内的大幅涨跌：先区分板块
 Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the first deliverable.
 公司认知按 `.agents/skills/dalton-knowledge/SKILL.md` 的读序读（`agent.md` 托管块 → `thesis.md` → `debate.md` → 按需 `drivers.md`、`management.md`、`verdicts.md`、`agenda.md`）；收尾按 `.agents/skills/dalton-agenda/SKILL.md` 的三步。
 
-在聊天里回答“为什么涨跌”时，只借用本流程的证据来源与顺序（先分清板块还是个股，再看公告、新闻、卖方、专家与社媒），不跑量化脚本、不写研究文件和知识层，并说明可以交给分析员做完整归因；在公司工作区里做正式归因时才走完整流程。
+在聊天里回答“为什么涨跌”时，**同样先跑量化脚本（`scripts/move_quant.py` 几秒即可出结果，盘前/盘后加 `--session pre|post`）**，并按本流程的证据来源与方法取证，但不写工作区研究文件和知识层，结尾说明可以交给分析员在公司工作区做正式归因入库；在公司工作区里做正式归因时走完整九步流程。
 
 ## 目标与原则
 
-股价异动时，**先做量化分解（对比同组中位数与板块 ETF，分清是板块 beta、个股 alpha 还是两者兼有，以及放量程度），再按 filing → 新闻 → 卖方与专家 → 社媒的固定顺序找原因**，最后给出归因判断、对本公司 thesis/debate 的含义与事件五词结论（遵循“价格变动先分解再当证据”原则）。
+股价异动时，**先做量化分解（对比同组中位数、板块 ETF 与指数期货，分清是板块/宏观 beta、个股 alpha 还是两者兼有，以及放量程度），再按 filing/同行财报 → 隔夜宏观与跨资产时间线 → 收盘总结（TMTB/交易台）与卖方/专家 → 新闻 → 社媒的取证方法找原因**，最后给出归因判断、对本公司 thesis/debate 的含义与事件五词结论（遵循“价格变动先分解再当证据”原则）。
 
-- **硬性门槛**：第 1、2 步量化脚本必须成功且 `data_ok=true` 才能下结论；若最新日线未出或数据缺失，立即停止归因并写明原因，严禁凭训练记忆补全。
+- **硬性门槛**：第 1、2 步量化脚本必须成功且 `data_ok=true` 才能下结论；若最新日线/盘外分钟线未出或数据缺失，立即停止归因并写明原因，严禁凭训练记忆补全。
 - **全部定性线索带出处**：第 3–6 步每条 filing、新闻、卖方观点、专家访谈、社媒讨论必须带日期、链接或 `doc_id`，且核对发布时间在检索窗口内。
 - **价格触发自动任务的不打扰原则（Beta No-Push Rule）**：当由价格触发自动任务（`dalton-<t>-move-up.json` / `dalton-<t>-move-down.json`）唤醒，且量化判定为 `sector_beta`、同时第 3–6 步确认无个股层面事件时，只用 `knowledge_append_verdict` 写一条 `NO_CHANGE`（`progress="none"`），**不向 PM 推送通知**。
+
+---
+
+## 盘前 / 盘后 / 盘中异动的取证方法与去 Beta 方法
+
+当用户询问“盘前为什么跌/涨”、“盘后为什么异动”或“今天盘中为什么跳水”时，按以下取证方法推进（作为调查方法，而非机械死板的单步路由）：
+
+1. **先量化问题所指时段的涨跌（盘外分钟线）**：
+   - 运行 `move_quant.py analyze --ticker {TICKER} --session pre|post|regular`（或在工具调用中开启 `extended_hours=True` 获取含盘前盘后的 1m/5m/30m 分钟线），准确量化**问题所指时段**（如盘前 `04:00–09:30 ET` 相对前一日正股收盘、盘后 `16:00–20:00 ET` 相对当日正股收盘）的涨跌幅与成交量。
+   - 同步对照**同组中位数**、**板块 ETF**（如 `QQQ`、`SMH`、`XLK`）以及**指数期货**（`NQ=F`、`ES=F`、`YM=F`、`RTY=F`）在同一时段的涨跌。若不支持盘外分钟线的市场/标的（如港股、A 股或纯指数），按脚本退回提示改用常规时段或对应期货/ETF 代理。
+2. **对齐隔夜宏观与跨资产 30 分钟时间线**：
+   - 拉取原油（`BZ=F`、`CL=F`）、黄金（`GC=F`）、10 年期美债收益率（`^TNX`）、美元指数（`DX-Y.NYB`）、波动率（`^VIX`）及指数期货（`NQ=F`、`ES=F`）的隔夜/盘内 30 分钟线（`interval="30min", extended_hours=True`）。
+   - 将目标股票盘前/盘后/盘中拐点与上述跨资产走势按 30 分钟时间线对齐：排查是否在地缘冲突推升油价、美债收益率跳升、或纳指期货急挫的同一时刻同步异动。
+3. **排查同组大公司前一晚盘后财报与公告**：
+   - 盘前或开盘异动高频源于**同组龙头前一晚盘后（AMC）或当日盘前（BMO）发布的财报、指引或资本开支口径**（例如 META 盘后财报影响 GOOGL/SNAP/PINS 次日盘前）。必须核查同组核心公司前晚至当日的 8-K / 财报新闻稿与盘后股价表现。
+4. **完整精读当天的收盘总结与交易台评论（TMTB / Sales Notes）**：
+   - 先用 `research(route="tmtb", operation="search_library", query=..., start=..., end=...)` 与 `research(route="sales-notes", operation="search_library", ...)` 搜索当日与前一日的科技/宏观收盘总结及交易台晨报/晚报；
+   - **命中后必须调用 `research(route="tmtb"|"sales-notes", operation="read", document=...)`（或 `get_document`）读取全文**，绝不能只看搜索列表的标题或片段摘要。
+5. **去 Beta 与持续性检验方法（参照中国消费周报口径）**：
+   - **先除各自市场基准再取同组中位数**：当同组包含跨市场标的（或需剥离大盘指数影响）时，先用每只股票收益除以各自所属市场基准（`(1 + r_stock) / (1 + r_MarketBench) - 1`，如美股对 `SPY`/`QQQ`、港股对恒指/恒科、A 股对沪深 300）得到去市场 beta 后的相对收益，再取同组中位数；
+   - **检查是否单一驱动**：对比去 beta 前后的同组离散度与方向一致性，判断异动是由单一宏观/行业因子统一下杀，还是由公司个体事件驱动；
+   - **持续性看 4 周与 13 周**：除当前异动窗口外，同步拉取 `4w`（约 1 个月）与 `13w`（约 1 个季度）的去 beta 累计超额表现，判断本次异动是短期情绪冲击/均值回归，还是 4 周与 13 周持续强弱趋势的延续。
 
 ---
 
@@ -48,11 +70,12 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 python3 .agents/skills/dalton-stock-move/scripts/move_quant.py analyze \
   --ticker {TICKER} \
   --window "{WINDOW}" \
+  --session {SESSION} \
   --coverage ../Home/dalton/coverage.yaml \
   --json
 ```
 
-（若用户指定了对比同组或 ETF，可追加 `--peers A,B,C`、`--etf XLK`。）
+（`--session` 默认为 `regular`；盘前异动传 `--session pre`，盘后异动传 `--session post`。若用户指定了对比同组、ETF 或指数期货，可追加 `--peers A,B,C`、`--etf XLK`、`--futures NQ=F,ES=F`。）
 
 - 检查返回的 JSON：
   - `ok` 必须为 `true`，且 `data_ok` 必须为 `true`。若最新一根日线尚未生成导致 `data_ok: false`，**立即停止归因**，向用户或日志说明“最新交易日行情尚未就绪（`data_ok=false`），暂不下归因结论”。
@@ -92,7 +115,7 @@ python3 .agents/skills/dalton-stock-move/scripts/move_quant.py analyze \
    ```
    对解释本次异动最相关的研报调用 `get_document(params={"doc_id": ...})` 读取正文。
 2. **卖方销售邮件与 TMTB**：
-   同一时间窗口检索 `research(route="sales-notes", ...)` 与 `research(route="tmtb", ...)`，提取买方持仓、whisper、资金流或大行 desk 点评。
+   同一时间窗口检索 `research(route="sales-notes", ...)` 与 `research(route="tmtb", ...)`，提取买方持仓、whisper、资金流或大行 desk 点评；**搜索命中后必须用 `research(route="tmtb"|"sales-notes", operation="read", document=...)`（或 `get_document`）完整读取正文**，不得只凭标题或摘要下判断。
 3. **Guidepoint 专家访谈与一线反馈**：
    同一时间窗口检索 `research(route="guidepoint", operation="search_library", query=f"{company_name} {ticker}", start=search_start, end=search_end, limit=10)`（或用 `route="all"` 一次联搜本地库、AlphaEngine 与 Guidepoint），核查供应链、渠道、客户或竞品的一线变化；引用时写访谈日期与专家身份（不写姓名），原文引用不超过 20 词，专家给出的经营数字标为“单一来源估计”。
 4. **身份与状态纪律**：
@@ -122,10 +145,13 @@ python3 .agents/skills/dalton-stock-move/scripts/move_quant.py analyze \
    - **对 thesis 的含义**：这次异动背后的事实是否触及某个核心支柱（确认/警告/证伪阈值）或某条关键 debate？当前市场定价是对还是错（过度反应 / 反应不足 / 合理反映了基本面变化）？
    - **事件结论五词**：从 `NO_CHANGE`（无变化）、`THESIS_STRENGTHENED`（强化）、`THESIS_WEAKENED`（削弱）、`THESIS_BROKEN`（证伪）、`NEW_THESIS`（新论点）中选定一个，并用一句话写清理由。
    - **下一项验证**：接下来观察什么指标或事件、什么时间见分晓。
-3. 按 `.agents/skills/dalton-stock-move/templates/stock-move.md` 写入 `research/<YYYY-MM-DD>-stock-move.md`，并在对话中输出相同结构（若为价格触发的静默 beta 轮次，见第 9 步）。
+3. **说“证据不足 / 原因暂缺”之前的必查清单校验**：
+   - 在给出“证据不足”或“原因暂缺”之前，**必须先显式列出还没查或未取到的相关来源**（逐项对照：①目标时段盘外分钟线及同组/ETF/期货 `NQ=F`、`ES=F` 对比；②隔夜宏观 `BZ=F`/`CL=F`/`^TNX`/`DX-Y.NYB`/`^VIX` 30 分钟时间线；③同组大公司前一晚盘后财报/8-K；④当日 TMTB 与 Sales Notes 全文 `operation="read"`；⑤公司公告与新闻；⑥X 社媒讨论）。只要有任一相关来源尚未核查，先补查该来源，禁止在未查完前直接下“证据不足”结论。
+4. 按 `.agents/skills/dalton-stock-move/templates/stock-move.md` 写入 `research/<YYYY-MM-DD>-stock-move.md`，并在对话中输出相同结构（若为价格触发的静默 beta 轮次，见第 9 步）。
 
 ### 第 9 步：收尾三步与推送规则
 
+0. **收尾前自检**：若拟定结论包含“证据不足 / 原因暂缺”，先列出所有未核查的相关来源并补齐取证；确认全部渠道均已核查后，在输出中附上已核查来源清单。
 1. **写入事件结论**：调用 `knowledge_append_verdict`：
    - `verdict.verdict`：五词正式枚举（如 `"NO_CHANGE"`、`"THESIS_STRENGTHENED"` 等）；
    - `verdict.trigger.kind`：`"price_move"`（若由价格触发唤醒，`trigger.ref` 填入触发任务名或信号 id）；

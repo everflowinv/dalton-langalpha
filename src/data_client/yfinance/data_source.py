@@ -114,6 +114,7 @@ def _fetch_history(
     start: str | None,
     end: str | None,
     scale: float = 1.0,
+    extended_hours: bool = False,  # DALTON-HOOK(stock-move-upgrade)
 ) -> list[dict[str, Any]]:
     """Synchronous helper — called via ``asyncio.to_thread``."""
     ticker = yahoo_ticker(symbol)
@@ -123,6 +124,8 @@ def _fetch_history(
     # price_treatment=split_adjusted, so conventions never blend across a
     # provider failover.
     kwargs: dict[str, Any] = {"interval": interval, "auto_adjust": False}
+    if extended_hours and interval in _DEFAULT_LOOKBACK:  # DALTON-HOOK(stock-move-upgrade)
+        kwargs["prepost"] = True
     if start:
         kwargs["start"] = start
     if end:
@@ -246,6 +249,7 @@ class YFinanceDataSource:
         to_date: str | None = None,
         is_index: bool = False,
         user_id: str | None = None,
+        extended_hours: bool = False,  # DALTON-HOOK(stock-move-upgrade)
     ) -> list[dict[str, Any]]:
         yf_interval = _INTERVAL_MAP.get(interval)
         if yf_interval is None:
@@ -255,7 +259,13 @@ class YFinanceDataSource:
         api_symbol = self._api_symbol(symbol, is_index)
         scale = minor_unit_scale(symbol)
         bars = await asyncio.to_thread(
-            _fetch_history, api_symbol, yf_interval, from_date, to_date, scale
+            _fetch_history,
+            api_symbol,
+            yf_interval,
+            from_date,
+            to_date,
+            scale,
+            extended_hours,
         )
         return _place_in_sessions(bars, symbol, is_index, interval)
 

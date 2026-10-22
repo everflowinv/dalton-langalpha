@@ -66,6 +66,8 @@ def symbol_market(symbol: str) -> str:
     # Shanghai listing here too.
     s = display_spelling(symbol)
     try:
+        if s.endswith("=F"):  # DALTON-HOOK(stock-move-upgrade)
+            return "other"
         if "." not in s:
             return market_of(to_canonical(s)) if s.startswith("^") else "us"
         if s.endswith(".US"):
@@ -417,11 +419,13 @@ class MarketDataProvider:
         to_date: str | None = None,
         is_index: bool = False,
         user_id: str | None = None,
+        extended_hours: bool = False,  # DALTON-HOOK(stock-move-upgrade)
     ) -> tuple[list[dict[str, Any]], str, bool]:
         return await self._fetch_from(
             source_name, "get_intraday", symbol,
             interval=interval, from_date=from_date, to_date=to_date,
             is_index=is_index, user_id=user_id,
+            **({"extended_hours": True} if extended_hours else {}),  # DALTON-HOOK(stock-move-upgrade)
         )
 
     async def get_daily_from(
@@ -449,6 +453,7 @@ class MarketDataProvider:
         to_date: str | None = None,
         is_index: bool = False,
         user_id: str | None = None,
+        extended_hours: bool = False,  # DALTON-HOOK(stock-move-upgrade)
     ) -> list[dict[str, Any]]:
         return await self._try_chain(
             "get_intraday",
@@ -459,6 +464,7 @@ class MarketDataProvider:
             to_date=to_date,
             is_index=is_index,
             user_id=user_id,
+            **({"extended_hours": True} if extended_hours else {}),  # DALTON-HOOK(stock-move-upgrade)
         )
 
     async def get_intraday_with_source(
@@ -469,6 +475,7 @@ class MarketDataProvider:
         to_date: str | None = None,
         is_index: bool = False,
         user_id: str | None = None,
+        extended_hours: bool = False,  # DALTON-HOOK(stock-move-upgrade)
     ) -> tuple[list[dict[str, Any]], str, bool]:
         """Like ``get_intraday`` but also returns source name and truncated flag."""
         return await self._try_chain_with_source(
@@ -480,6 +487,7 @@ class MarketDataProvider:
             to_date=to_date,
             is_index=is_index,
             user_id=user_id,
+            **({"extended_hours": True} if extended_hours else {}),  # DALTON-HOOK(stock-move-upgrade)
         )
 
     async def get_daily(

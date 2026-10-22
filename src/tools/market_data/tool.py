@@ -34,19 +34,26 @@ async def get_daily_prices(
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
     limit: Optional[int] = None,
+    extended_hours: bool = False,  # DALTON-HOOK(stock-move-upgrade)
 ) -> Tuple[Union[List[Dict[str, Any]], str], Dict[str, Any]]:
     """
     Historical daily OHLCV bars for one stock — for price history, trends, returns,
     and charting.
 
     Args:
-        symbol: US "AAPL", A-share "600519.SH", HK "0700.HK".
+        symbol: US "AAPL", A-share "600519.SH", HK "0700.HK", futures "NQ=F"/"CL=F", index "^TNX"/"^VIX".
         start_date: Start "YYYY-MM-DD" (optional).
         end_date: End "YYYY-MM-DD" (optional).
         limit: Max records when no date range is given (default 60 trading days).
+        extended_hours: Include pre/post-market bars in the intraday chart series (default False).
     """
     content, artifact = await fetch_daily_prices(
-        symbol, start_date, end_date, limit, config=config
+        symbol,
+        start_date,
+        end_date,
+        limit,
+        config=config,
+        **({"extended_hours": True} if extended_hours else {}),  # DALTON-HOOK(stock-move-upgrade)
     )
     return content, artifact
 
@@ -78,10 +85,10 @@ async def get_quote(
     current price, including a re-check right before stating a price in your answer.
 
     Args:
-        symbols: Up to 20 tickers — US "NVDA", A-share "600519.SH", HK "0700.HK".
-        asset_type: "stocks" (default) or "indices" for index symbols like "^GSPC".
+        symbols: Up to 20 tickers — US "NVDA", A-share "600519.SH", HK "0700.HK", futures "NQ=F"/"CL=F", index "^TNX"/"^VIX".
+        asset_type: "stocks" (default) or "indices" for index symbols like "^GSPC" (caret-prefixed "^TNX"/"^VIX" auto-route in either mode).
     """
-    content, artifact = await fetch_quote(symbols, asset_type=asset_type, config=config)
+    content, artifact = await fetch_quote(symbols, asset_type=asset_type, config=config)  # DALTON-HOOK(stock-move-upgrade)
     return content, artifact
 
 

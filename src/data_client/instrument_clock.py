@@ -225,6 +225,7 @@ _US_CALENDAR_INDEXES = frozenset(
 ) | {
     "NYA", "XAX", "OEX", "MID", "SML", "SOX", "RUI", "RUA",
     "DJT", "DJU", "W5000", "WLSH",
+    "TNX", "TYX", "FVX", "IRX",  # DALTON-HOOK(stock-move-upgrade)
 }
 
 

@@ -162,7 +162,7 @@ def test_render_data_map_markdown_contents_date_free_title_and_search_api() -> N
     # 4. cn-hk description and HKEXnews unavailable note
     assert "巨潮公告（`filings`）＋港 A 股财务、估值、资金面（`ask`）" in md
     assert "港交所披露易公告:未接通，用 `web_search` 查 `site:hkexnews.hk`。" in md
-    assert "期货与大宗商品实时行情" in md
+    assert "期货与大宗商品实时(非延迟)行情" in md
 
     # 5. Token budget < 1500 tokens
     tokens = map_builder.estimate_data_map_tokens(md)
