@@ -131,7 +131,7 @@ python3 .agents/skills/dalton-stock-move/scripts/move_quant.py analyze \
 - 只保留有实质内容的帖子（管理层/官方账号表态、具体业务数据拆解、行业上下游交叉验证、知名机构/基本面投资人分析、突发事件一线反应）。
 - 过滤纯情绪宣泄与 meme。
 - `x_search` 的综合摘要可能编造事实（例：把未发布的财报说成已发布），只能当线索；结论只引用有链接的具体帖子，并用公告、新闻或研究库核实。
-- 附上作者 handle、帖子链接（及发帖时间，如有），明确区分**有信息量的专业观点（informed opinion）**与**散户情绪**。（雪球专用接口当前不可用；如需补充中文社区讨论，可通过公开 `web_search` 检索并核实原帖链接，或在报告中如实注明“雪球不可用”。）
+- 附上作者 handle、帖子链接（及发帖时间，如有），明确区分**有信息量的专业观点（informed opinion）**与**散户情绪**。若目标公司为港股、A 股或中概股，调用 `researchdata.community(route="xueqiu", operation="posts", ticker=..., pages=2)`（港股传 5 位代码如 `"00700"`、`"06181"`，A 股传 `"SH600519"` / `"SZ300750"`；如需全文或评论可追加 `operation="post"` / `"comments"`）拉取异动日前后的讨论流，区分中文 KOL 深度拆解与散户情绪，且只引用带原帖链接（`url`）和发帖时间（`created_at`）的帖子。
 
 ### 第 7 步：并行组织原则
 

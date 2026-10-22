@@ -6,12 +6,9 @@ handoff_filtered_routes:
   - web-news
   - web-page
   - filings
-  - last30days
   - agent-reach
   - x-timeline
   - x-search
-  - xueqiu
-  - employee
 
 catalog_routes:
   all:
@@ -78,19 +75,34 @@ catalog_routes:
     category: macro
     title: TGA与联邦债务
     rules: "operation=treasury, dataset=tga|debt"
-    description: "财政部TGA日度余额与联邦债务（百万美元/美元），查流动性；国债收益率走fred（DGS2/DGS10）。"
+    description: "财政部TGA余额与联邦债务，查流动性；收益率走fred。"
   market-regime:
     category: macro
     title: 市场状态与拥挤度
     rules: "operation=snapshot|us_topbottom|crowding|cn_leverage"
     description: "大盘过热/超卖、顶部底部阶段、拥挤度、两融杠杆；回答大盘和仓位问题时先读"
+  xueqiu:
+    category: community
+    title: 雪球讨论
+    rules: "posts/post/comments/search/user,pages≤3"
+    description: "港A股与中概散户及KOL观点。"
+  employee:
+    category: community
+    title: 员工评论
+    rules: "blind/summary免费;付费须allow_paid=True"
+    description: "员工侧情绪与组织变化。"
+  last30days:
+    category: community
+    title: 跨平台社区情绪
+    rules: "query+days≤30"
+    description: "跨平台与StockTwits/Polymarket情绪。"
 
 direct_tools:
   conversation_search:
     category: memory
     title: 团队对话归档
     call: "conversation_search"
-    description: "团队过往事实、预测、模型假设、观点、问题、决定、待办卡片及原话出处，查公司/主题既有看法并对比变化。"
+    description: "团队过往事实、预测、假设、观点、问题、决定、待办卡片及原话，查既有看法并对比变化。"
   web_search:
     category: web
     title: 全网新闻
@@ -105,7 +117,7 @@ direct_tools:
     category: market
     title: 行情与K线
     call: "get_quote/get_daily_prices/get_market_overview"
-    description: "美/港/A股及指数报价、日K与大盘；期货/大宗(NQ=F、ES=F、CL=F、GC=F)、美债收益率(^TNX)与VIX(延迟15分钟)；get_daily_prices(extended_hours=True)含美股盘前盘后分时。核对股价、异动与盘前盘后。"
+    description: "美/港/A股及指数报价与日K；期货/大宗(NQ=F、ES=F、CL=F、GC=F)、^TNX与VIX(延迟15分)；extended_hours=True含美股盘外分时。"
   company_options_screener:
     category: market
     title: 公司与期权选股
@@ -123,13 +135,7 @@ unavailable_sources:
     note: "未接通，用 `web_search` 查 `site:hkexnews.hk`。"
   - id: futures_realtime
     title: 期货与大宗商品实时(非延迟)行情
-    note: "yfinance期货报价延迟约15分钟；需要实时价位时如实注明延迟，不要当实时报价。"
-  - id: xueqiu
-    title: 雪球(xueqiu)
-    note: "handoff过滤，不可用。"
-  - id: employee
-    title: 员工评论(employee/Glassdoor/Blind)
-    note: "handoff过滤，不可用。"
+    note: "yfinance期货延迟约15分钟，注明延迟。"
   - id: institutional_13f_flow
     title: 13F持仓与暗池/期权异动流
     note: "未接通(静态期权链用get_options_chain)。"

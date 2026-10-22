@@ -58,6 +58,7 @@ _DATE_PREFIX_RE = re.compile(r"\b(20\d{2}-\d{2}-\d{2})\b")
 # Data-intrinsic date keys only (never `fetched_at`, `retrieved_at`, or envelope `as_of`).
 _DATA_DATE_KEYS: tuple[str, ...] = (
     "date",
+    "created_at",
     "filing_date",
     "report_date",
     "observation_date",
@@ -69,6 +70,10 @@ _DATA_DATE_KEYS: tuple[str, ...] = (
     "trade_date",
     "datetime",
     "timestamp",
+)
+
+BRIDGE_COMMUNITY_ROUTES: frozenset[str] = frozenset(
+    {"xueqiu", "employee", "last30days"}
 )
 
 _SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
@@ -117,6 +122,9 @@ def extract_latest_date(payload: Any) -> str | None:
                 "_declared_sources",
                 "_sources",
                 "results",
+                "reviews",
+                "posts",
+                "items",
                 "rows",
                 "data",
                 "quotes",
@@ -364,6 +372,21 @@ def build_route_probe_spec(route_id: str, category: str) -> tuple[str, dict[str,
         )
     if rid == "market-regime":
         return "macro", {"route": "market-regime", "operation": "snapshot"}
+    if rid == "xueqiu":
+        return (
+            "community",
+            {"route": "xueqiu", "operation": "posts", "ticker": "00700", "pages": 1},
+        )
+    if rid == "employee":
+        return (
+            "community",
+            {"route": "employee", "operation": "blind", "company": "NVIDIA", "pages": 1},
+        )
+    if rid == "last30days":
+        return (
+            "community",
+            {"route": "last30days", "query": "NVDA", "days": 7, "quick": True},
+        )
 
     tool_name = cat if cat in ("research", "finance", "macro", "news", "community") else "research"
     return tool_name, {"route": rid, "operation": "search", "query": "NVDA", "limit": 1}
@@ -555,7 +578,10 @@ async def _execute_probes(
                 if isinstance(r, Mapping)
                 and str(r.get("id") or "").strip()
                 and str(r.get("id") or "").strip() not in handoff_routes
-                and str(r.get("kind") or "").strip().lower() not in ("agent_tool", "skill")
+                and (
+                    str(r.get("kind") or "").strip().lower() not in ("agent_tool", "skill")
+                    or str(r.get("id") or "").strip() in BRIDGE_COMMUNITY_ROUTES
+                )
             ]
     except Exception as exc:
         logger.warning(
@@ -590,6 +616,23 @@ async def _execute_probes(
     tasks: list[asyncio.Task[dict[str, Any]]] = []
 
     for rid, cat in routes_to_probe:
+        if rid == "last30days":
+            async def _unprobed_last30days(
+                r_id: str = rid, r_cat: str = cat
+            ) -> dict[str, Any]:
+                return {
+                    "source_id": r_id,
+                    "category": r_cat,
+                    "status": "unprobed",
+                    "latency_ms": 0,
+                    "latest_date": None,
+                    "error_type": "成本高跳过探测",
+                    "detail": {"reason": "成本高跳过探测"},
+                }
+
+            tasks.append(asyncio.create_task(_unprobed_last30days()))
+            continue
+
         tool_name, tool_args = build_route_probe_spec(rid, cat)
 
         async def _probe_route(
@@ -604,6 +647,46 @@ async def _execute_probes(
                     m = _DATE_PREFIX_RE.search(res["date"])
                     if m:
                         return {"latest_date": m.group(1)}
+                elif r_id == "xueqiu":
+                    raw_data = res.get("data")
+                    has_posts = (
+                        (isinstance(raw_data, list) and len(raw_data) > 0)
+                        or (
+                            isinstance(raw_data, Mapping)
+                            and bool(
+                                raw_data.get("posts")
+                                or raw_data.get("results")
+                                or raw_data.get("items")
+                            )
+                        )
+                        or bool(
+                            res.get("posts")
+                            or res.get("results")
+                            or res.get("_sources")
+                        )
+                    )
+                    if not has_posts:
+                        raise RuntimeError("空结果")
+                elif r_id == "employee":
+                    raw_data = res.get("data")
+                    has_reviews = (
+                        (isinstance(raw_data, list) and len(raw_data) > 0)
+                        or (
+                            isinstance(raw_data, Mapping)
+                            and bool(
+                                raw_data.get("reviews")
+                                or raw_data.get("results")
+                                or raw_data.get("count")
+                            )
+                        )
+                        or bool(
+                            res.get("reviews")
+                            or res.get("results")
+                            or res.get("_sources")
+                        )
+                    )
+                    if not has_reviews:
+                        raise RuntimeError("空结果")
             return {"latest_date": extract_latest_date(res)}
 
         tasks.append(

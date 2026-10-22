@@ -72,6 +72,7 @@ ALLOWED_HOOKS=(
   "stock-move-upgrade"
   "extended-hours-quotes"
   "market-regime"
+  "community-executors"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

@@ -20,8 +20,11 @@ import json
 import logging
 import os
 import re
+import signal
 import sys
 import time
+import urllib.parse
+import uuid
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping
@@ -97,7 +100,365 @@ ROUTE_TIMEOUTS: dict[str, tuple[int, int]] = {
     "treasury": (DEFAULT_ROUTE_TIMEOUT_S, DEFAULT_ROUTE_TIMEOUT_S),
     "market-regime": (15, 30),
     "cn-hk": (DEFAULT_ROUTE_TIMEOUT_S, DEFAULT_ROUTE_TIMEOUT_S),
+    "xueqiu": (60, 60),
+    "employee": (120, 120),
+    "last30days": (600, 600),
 }
+
+BRIDGE_COMMUNITY_ROUTES: frozenset[str] = frozenset(
+    {"xueqiu", "employee", "last30days"}
+)
+
+COMMUNITY_ROUTE_CONCURRENCY: dict[str, int] = {
+    "xueqiu": 2,
+    "employee": 2,
+    "last30days": 1,
+}
+
+COMMUNITY_SIGTERM_GRACE_S: float = 5.0
+
+UPSTREAM_GENERIC_COMMUNITY_PARAMS: frozenset[str] = frozenset(
+    {
+        "mode",
+        "limit",
+        "timeout",
+        "series",
+        "concept",
+        "item",
+        "document",
+        "form",
+        "dataset",
+        "start",
+        "end",
+        "as_of",
+        "vintage",
+        "params",
+    }
+)
+
+_LAST30DAYS_HEALTHY_STATES: frozenset[str] = frozenset({"ok", "no-results"})
+
+_LAST30DAYS_FORBIDDEN_QUERY_COMMANDS: frozenset[str] = frozenset(
+    {
+        "setup",
+        "self-test",
+        "doctor",
+        "diagnose",
+        "preflight",
+        "welcome",
+        "install",
+        "upgrade",
+        "update",
+        "init",
+        "config",
+        "configure",
+        "auth",
+        "login",
+        "store-key",
+        "resolve-save-dir",
+        "discover",
+        "drill",
+        "verify-freshness",
+        "library",
+        "library feed",
+        "library search",
+        "queue",
+        "queue list",
+        "queue cover",
+    }
+)
+
+_LAST30DAYS_FORBIDDEN_QUERY_PREFIXES: tuple[str, ...] = (
+    "setup ",
+    "self-test ",
+    "doctor ",
+    "diagnose ",
+    "preflight ",
+    "welcome ",
+    "install ",
+    "upgrade ",
+    "library feed ",
+    "library search ",
+    "queue list ",
+    "queue cover ",
+)
+
+_COMMUNITY_ERROR_METADATA_KEYS: frozenset[str] = frozenset(
+    {
+        "source_status",
+        "errors_by_source",
+        "error_by_source",
+        "source_errors",
+        "errors",
+        "error",
+        "warnings",
+        "warning",
+        "diagnostics",
+        "diagnostic",
+        "quality",
+        "reason",
+        "detail",
+        "details",
+        "hint",
+        "hints",
+        "status_detail",
+        "failure_reason",
+    }
+)
+
+_SECRET_KEY_NAME_RE = re.compile(
+    # `auth` only as a whole word so `author`/`author_id` survive; `token` not as a count (`totalTokens`).
+    r"(?i)(?:api[_-]?key|apikey|token(?!s)|secret|password|passwd|cookie|authorization|(?<![a-z])auth(?![a-z])|credential|session[_-]?id|xq_[a-z_]+)"
+)
+
+_STDERR_SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (
+        re.compile(
+            r"""(?i)(['"]?[A-Za-z0-9_.\-]*(?:api[_-]?key|apikey|token|secret|password|passwd|cookie|set-cookie|authorization|proxy-authorization|x-api-key|auth|credential|session[_-]?id|xq_[a-z0-9_]+)[A-Za-z0-9_.\-]*['"]?\s*[:=]\s*)(['"])(?:\\.|(?!\2).)*\2"""
+        ),
+        r"\1\2[REDACTED]\2",
+    ),
+    (
+        re.compile(
+            r"(?i)(\b(?:proxy-)?authorization\s*[:=]\s*)(?:(?:bearer|basic|digest|token)\s+)?(?!['\"]?\[REDACTED\])[^\s;,'\"}\]\r\n]+"
+        ),
+        r"\1[REDACTED]",
+    ),
+    (
+        re.compile(r"(?i)(\bbearer\s+)(?!\[REDACTED\])[A-Za-z0-9._\-+/=~]{4,}"),
+        r"\1[REDACTED]",
+    ),
+    (
+        re.compile(
+            r"(?i)(['\"]?\b[A-Za-z0-9_.\-]*(?:api[_-]?key|apikey|token|secret|password|passwd|cookie|set-cookie|authorization|proxy-authorization|x-api-key|auth|credential|session[_-]?id|xq_[a-z0-9_]+)[A-Za-z0-9_.\-]*['\"]?\s*[:=]\s*)(?!['\"]?\[REDACTED\])[^\s;,'\"}\]\r\n]+"
+        ),
+        r"\1[REDACTED]",
+    ),
+    (re.compile(r"\b(sk-[A-Za-z0-9_\-]{8,})\b"), "[REDACTED]"),
+    (re.compile(r"\b(xai-[A-Za-z0-9_\-]{8,})\b"), "[REDACTED]"),
+    (re.compile(r"\b(tvly-[A-Za-z0-9_\-]{8,})\b"), "[REDACTED]"),
+    (re.compile(r"\b(fc-[A-Za-z0-9_\-]{8,})\b"), "[REDACTED]"),
+    (re.compile(r"\b(ghp_[A-Za-z0-9_\-]{8,})\b"), "[REDACTED]"),
+    (re.compile(r"\b(github_pat_[A-Za-z0-9_\-]{8,})\b"), "[REDACTED]"),
+    (re.compile(r"://[^/\s:@]+:[^/\s@]+@"), "://[REDACTED]@"),
+)
+
+
+def sanitize_stderr_text(raw: str | bytes | None, *, max_len: int = 500) -> str:
+    """Sanitize secrets from subprocess stderr first, then keep at most the last `max_len` chars."""
+    if raw is None:
+        return ""
+    if isinstance(raw, bytes):
+        text = raw.decode("utf-8", errors="replace")
+    else:
+        text = str(raw)
+    text = text.strip()
+    if not text:
+        return ""
+    for pat, repl in _STDERR_SECRET_PATTERNS:
+        text = pat.sub(repl, text)
+    if len(text) > max_len:
+        text = text[-max_len:]
+    return text.strip()
+
+
+def _sanitize_metadata_tree(obj: Any, *, max_str_len: int = 300) -> Any:
+    """Recursively sanitize strings and redact secret-keyed fields in metadata structures."""
+    if obj is None or isinstance(obj, (int, float, bool)):
+        return obj
+    if isinstance(obj, str):
+        return sanitize_stderr_text(obj, max_len=max_str_len)
+    if isinstance(obj, list):
+        return [_sanitize_metadata_tree(item, max_str_len=max_str_len) for item in obj]
+    if isinstance(obj, dict):
+        cleaned_dict: dict[str, Any] = {}
+        for k, v in obj.items():
+            k_str = str(k).strip()[:64]
+            if not k_str:
+                continue
+            if _SECRET_KEY_NAME_RE.search(k_str):
+                cleaned_dict[k_str] = "[REDACTED]"
+            else:
+                cleaned_dict[k_str] = _sanitize_metadata_tree(v, max_str_len=max_str_len)
+        return cleaned_dict
+    return sanitize_stderr_text(str(obj), max_len=max_str_len)
+
+
+def _sanitize_source_status_map(raw_status: Any) -> dict[str, Any]:
+    """Return a sanitized copy of `last30days` `source_status` without raw secrets."""
+    if not isinstance(raw_status, dict):
+        return {}
+    cleaned: dict[str, Any] = {}
+    for src, val in raw_status.items():
+        src_key = str(src).strip()[:64]
+        if not src_key or _SECRET_KEY_NAME_RE.search(src_key):
+            continue
+        if isinstance(val, str):
+            cleaned[src_key] = sanitize_stderr_text(val, max_len=120)
+        elif isinstance(val, dict):
+            entry_out: dict[str, Any] = {}
+            for k, v in val.items():
+                k_str = str(k).strip()
+                if not k_str or _SECRET_KEY_NAME_RE.search(k_str):
+                    continue
+                if isinstance(v, (int, float, bool)) or v is None:
+                    entry_out[k_str] = v
+                else:
+                    entry_out[k_str] = _sanitize_metadata_tree(v, max_str_len=200)
+            cleaned[src_key] = entry_out
+    return cleaned
+
+
+def _sanitize_community_payload_metadata(parsed: Any) -> Any:
+    """Sanitize `source_status`, `errors_by_source`, and all error/diagnostic metadata in `parsed` in-place."""
+    if not isinstance(parsed, dict):
+        return parsed
+    for k in list(parsed.keys()):
+        k_str = str(k).strip()
+        val = parsed[k]
+        if _SECRET_KEY_NAME_RE.search(k_str):
+            parsed[k] = "[REDACTED]"
+        elif k_str == "source_status":
+            parsed[k] = _sanitize_source_status_map(val)
+        elif k_str in _COMMUNITY_ERROR_METADATA_KEYS or k_str.endswith(
+            ("_error", "_errors", "_warning", "_warnings", "_status")
+        ):
+            parsed[k] = _sanitize_metadata_tree(val, max_str_len=300)
+    return parsed
+
+
+def sanitize_error_data_summary(
+    parsed: Any,
+    *,
+    route: str,
+    operation: str,
+    status: str,
+    error: str,
+) -> dict[str, Any]:
+    """Build a sanitized summary dict for `ok: false` community responses instead of exposing raw objects."""
+    summary: dict[str, Any] = {
+        "route": route,
+        "status": status,
+        "error": sanitize_stderr_text(error, max_len=500),
+    }
+    if operation:
+        summary["operation"] = operation
+    if isinstance(parsed, dict):
+        err_code = parsed.get("error_code") or parsed.get("code")
+        if isinstance(err_code, (str, int)) and not isinstance(err_code, bool):
+            summary["error_code"] = sanitize_stderr_text(str(err_code), max_len=120)
+        if route == "last30days":
+            if isinstance(parsed.get("source_status"), dict):
+                summary["source_status"] = _sanitize_source_status_map(
+                    parsed["source_status"]
+                )
+            if isinstance(parsed.get("errors_by_source"), dict):
+                summary["errors_by_source"] = _sanitize_metadata_tree(
+                    parsed["errors_by_source"], max_str_len=200
+                )
+    return summary
+
+
+def _pg_is_alive(pgid: int) -> bool:
+    """Return True if process group `pgid` still has at least one live member."""
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+async def _terminate_and_reap_process(
+    proc: Any, *, term_timeout_s: float = COMMUNITY_SIGTERM_GRACE_S
+) -> None:
+    """Send SIGTERM to the subprocess process group first, wait up to `term_timeout_s`, then SIGKILL and reap."""
+    cancelled = False
+    pid = getattr(proc, "pid", None)
+    has_pgid = isinstance(pid, int) and pid > 0
+    pg_alive = False
+    sent_pg_term = False
+
+    if has_pgid:
+        try:
+            os.killpg(pid, signal.SIGTERM)
+            sent_pg_term = True
+            pg_alive = True
+        except ProcessLookupError:
+            sent_pg_term = True
+            pg_alive = False
+        except OSError:
+            sent_pg_term = False
+
+    leader_alive = not isinstance(getattr(proc, "returncode", None), int)
+    if not sent_pg_term and leader_alive:
+        try:
+            proc.terminate()
+        except ProcessLookupError:
+            leader_alive = False
+
+    if leader_alive or pg_alive:
+        deadline = time.monotonic() + max(0.0, float(term_timeout_s))
+        waiter = asyncio.ensure_future(proc.wait()) if leader_alive else None
+        timed_out = False
+
+        if waiter is not None:
+            while not waiter.done():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    timed_out = True
+                    break
+                try:
+                    await asyncio.wait_for(asyncio.shield(waiter), timeout=remaining)
+                except asyncio.TimeoutError:
+                    timed_out = not waiter.done()
+                    break
+                except asyncio.CancelledError:
+                    cancelled = True
+                except Exception:
+                    break
+
+        if not timed_out and has_pgid and pg_alive:
+            while _pg_is_alive(pid):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    timed_out = True
+                    break
+                try:
+                    await asyncio.sleep(min(0.02, remaining))
+                except asyncio.CancelledError:
+                    cancelled = True
+                    timed_out = _pg_is_alive(pid)
+                    break
+            else:
+                pg_alive = False
+
+        if timed_out or (waiter is not None and not waiter.done()) or (has_pgid and pg_alive):
+            sent_pg_kill = False
+            if has_pgid:
+                try:
+                    os.killpg(pid, signal.SIGKILL)
+                    sent_pg_kill = True
+                except ProcessLookupError:
+                    sent_pg_kill = True
+                except OSError:
+                    sent_pg_kill = False
+            if not sent_pg_kill and not isinstance(getattr(proc, "returncode", None), int):
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+
+    try:
+        await _reap_process(proc)
+    except asyncio.CancelledError:
+        cancelled = True
+    if cancelled:
+        raise asyncio.CancelledError()
+
 
 MARKET_REGIME_OPERATIONS: tuple[str, ...] = (
     "snapshot",
@@ -302,7 +663,6 @@ def _parse_csv_scalar(val: Any) -> Any:
         return s
 
 
-
 async def _reap_process(proc: Any) -> None:
     """Wait for a killed subprocess to exit even if this task is cancelled meanwhile.
 
@@ -418,6 +778,80 @@ class BridgeConfig:
                 str(self.ocw_root / "scripts" / "researchdata_mcp.py"),
             )
         ).resolve()
+        self.xueqiu_script: Path = Path(
+            os.environ.get(
+                "DALTON_XUEQIU_SCRIPT",
+                str(self.ocw_root / "scripts" / "xueqiu_posts.py"),
+            )
+        ).expanduser().resolve()
+        self.employee_python: Path = Path(
+            os.path.abspath(
+                os.path.expanduser(
+                    os.environ.get(
+                        "DALTON_EMPLOYEE_PYTHON",
+                        str(
+                            self.ocw_root
+                            / "skills"
+                            / "employee-reviews"
+                            / "venv"
+                            / "bin"
+                            / "python"
+                        ),
+                    )
+                )
+            )
+        )
+        self.employee_cli_script: Path = Path(
+            os.environ.get(
+                "DALTON_EMPLOYEE_CLI_SCRIPT",
+                os.environ.get(
+                    "DALTON_EMPLOYEE_SCRIPT",
+                    str(
+                        self.ocw_root
+                        / "skills"
+                        / "employee-reviews"
+                        / "scripts"
+                        / "employee_reviews_cli.py"
+                    ),
+                ),
+            )
+        ).expanduser().resolve()
+        self.employee_script: Path = self.employee_cli_script
+        default_l30_engine: Path = Path(
+            os.environ.get(
+                "DALTON_LAST30DAYS_ENGINE_DIR",
+                "~/.local/share/last30days/3.27.2-openclaw-argon-20261013",
+            )
+        ).expanduser()
+        self.last30days_python: Path = Path(
+            os.path.abspath(
+                os.path.expanduser(
+                    os.environ.get(
+                        "DALTON_LAST30DAYS_PYTHON",
+                        str(default_l30_engine / "venv" / "bin" / "python"),
+                    )
+                )
+            )
+        )
+        self.last30days_cli_script: Path = Path(
+            os.environ.get(
+                "DALTON_LAST30DAYS_CLI_SCRIPT",
+                os.environ.get(
+                    "DALTON_LAST30DAYS_SCRIPT",
+                    str(default_l30_engine / "scripts" / "last30days.py"),
+                ),
+            )
+        ).expanduser().resolve()
+        self.last30days_script: Path = self.last30days_cli_script
+        self.subprocess_proxy: str = os.environ.get(
+            "DALTON_BRIDGE_SUBPROCESS_PROXY", ""
+        ).strip()
+        self.cache_dir: Path = Path(
+            os.environ.get(
+                "DALTON_BRIDGE_CACHE_DIR",
+                os.path.expanduser("~/Library/Caches/dalton-researchdata-bridge"),
+            )
+        ).expanduser().resolve()
         self.data_sources_json: Path = (
             self.ocw_root / "config" / "data_sources.json"
         )
@@ -548,13 +982,288 @@ def build_researchdata_plugin_instruction() -> str:
     )
 
 
+COMMUNITY_DESCRIPTION_SUFFIX: str = (
+    "\n\n社区与另类数据路由（由 bridge 执行）：\n"
+    "- xueqiu（雪球讨论与个股情绪）：operation ∈ {posts, post, comments, search, user}；"
+    "参数：ticker（如 00700、06181、SH600519、SZ300750）、url（仅限 xueqiu.com）、post_id、query、pages（1-3）。\n"
+    "- employee（员工评论 Blind / Indeed / Glassdoor）：operation ∈ {blind, summary, indeed, glassdoor}；"
+    "参数：company、url（仅限 glassdoor.com）、pages（blind/indeed 1-3，summary 1-40）、allow_paid（bool，indeed/glassdoor 必须显式传 allow_paid=True）。\n"
+    "- last30days（跨平台社区情绪 Reddit / X / StockTwits / Polymarket）："
+    "参数：query、days（1-30，默认 30）、quick（bool）、plan（可选对象，每个 subquery 须含 search_query 与 ranking_query）。"
+)
+
+COMMUNITY_CATALOG_ROUTE_SPECS: dict[str, dict[str, Any]] = {
+    "xueqiu": {
+        "id": "xueqiu",
+        "category": "community",
+        "kind": "cli",
+        "title": "雪球讨论与个股情绪",
+        "operations": ["posts", "post", "comments", "search", "user"],
+        "parameters": {
+            "operation": "posts | post | comments | search | user",
+            "ticker": "股票代码（posts 必填，港股 5 位如 00700/06181，A 股如 SH600519/SZ300750）",
+            "url": "帖子或用户主页 URL（post/user 必填，仅允许 xueqiu.com 域名）",
+            "post_id": "雪球帖子 ID（comments 必填，纯数字字符串）",
+            "query": "搜索关键词（search 必填）",
+            "pages": "翻页数（1-3，默认 1）",
+        },
+        "rules": [
+            "港股、A股、中概散户与中文 KOL 情绪首选",
+            "仅算情绪与线索，不算事实证据；引用须带平台、日期与原帖 URL",
+        ],
+    },
+    "employee": {
+        "id": "employee",
+        "category": "community",
+        "kind": "cli",
+        "title": "员工评价与内部反馈 (Blind / Indeed / Glassdoor)",
+        "operations": ["blind", "summary", "indeed", "glassdoor"],
+        "parameters": {
+            "operation": "blind | summary | indeed | glassdoor",
+            "company": "公司名称或 slug（blind/summary/indeed 必填，如 NVIDIA）",
+            "url": "Glassdoor 评论页 URL（glassdoor 必填，仅允许 glassdoor.com 域名）",
+            "pages": "翻页数（blind/indeed 1-3，summary 1-40）",
+            "allow_paid": "是否允许调用付费源（bool，indeed 与 glassdoor 必须显式传 allow_paid=True）",
+        },
+        "rules": [
+            "blind 与 summary 免费；indeed 与 glassdoor 付费，默认禁用（须 allow_paid=True）",
+            "Blind 第 31 条以后的锁死占位正文（lorem ipsum）不得作为证据",
+        ],
+    },
+    "last30days": {
+        "id": "last30days",
+        "category": "community",
+        "kind": "cli",
+        "title": "近30天跨平台社区情绪 (Reddit / X / StockTwits / Polymarket)",
+        "operations": ["search"],
+        "parameters": {
+            "operation": "search（可选，默认 search）",
+            "query": "检索主题（必填，不传 --search 以自动启用 StockTwits）",
+            "days": "回溯天数（1-30，默认 30）",
+            "quick": "快速模式（bool，可选）",
+            "plan": "自定义检索计划对象（可选，subqueries 每项须同时含 search_query 与 ranking_query）",
+        },
+        "rules": [
+            "覆盖 Reddit、X、YouTube、HN、Polymarket、StockTwits 跨平台情绪",
+            "Polymarket 仅算市场定价信号，不算事实证据",
+        ],
+    },
+}
+
+_TICKER_RE = re.compile(r"^[A-Za-z0-9._\-]{1,32}$")
+_POST_ID_RE = re.compile(r"^[0-9]{1,32}$")
+_COMPANY_RE = re.compile(r"^[A-Za-z0-9 .,_\\-]{1,100}$")
+_ALLOWED_URL_DOMAINS: tuple[str, ...] = ("xueqiu.com", "glassdoor.com")
+
+
+def _validate_community_url(url: Any, *, required_domain: str) -> str:
+    """Validate and canonicalize URL, then enforce strict domain allowlist (`xueqiu.com` / `glassdoor.com`)."""
+    if not isinstance(url, str):
+        raise ValueError("url must be a string")
+    if any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in url):
+        raise ValueError("url contains invalid whitespace or control characters")
+    cleaned = url
+    if not cleaned or len(cleaned) > 500:
+        raise ValueError("url length must be between 1 and 500 characters")
+    if "\\" in cleaned:
+        raise ValueError("url must not contain backslashes")
+    if "@" in cleaned:
+        raise ValueError("url must not contain '@'")
+    if any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in cleaned):
+        raise ValueError("url contains invalid whitespace or control characters")
+    parsed = urllib.parse.urlsplit(cleaned)
+    scheme = parsed.scheme.lower()
+    if scheme not in ("http", "https"):
+        raise ValueError("url scheme must be http or https")
+    if parsed.username or parsed.password or "@" in (parsed.netloc or ""):
+        raise ValueError("url must not contain credentials")
+    raw_hostname = parsed.hostname or ""
+    if "%" in (parsed.netloc or "") or "%" in raw_hostname:
+        raise ValueError("url hostname must not contain percent-encoding")
+    host = raw_hostname.lower().rstrip(".")
+    if not host or ".." in host or any(
+        ch not in "abcdefghijklmnopqrstuvwxyz0123456789.-" for ch in host
+    ):
+        raise ValueError("url is missing or has invalid hostname")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("url has invalid port") from exc
+    canonical_netloc = f"{host}:{port}" if port is not None else host
+    canonical_path = parsed.path or "/"
+    canonical_url = urllib.parse.urlunsplit(
+        (scheme, canonical_netloc, canonical_path, parsed.query, parsed.fragment)
+    )
+    reparsed = urllib.parse.urlparse(canonical_url)
+    verified_host = (reparsed.hostname or "").lower()
+    if (
+        not verified_host
+        or "%" in (reparsed.netloc or "")
+        or "\\" in canonical_url
+        or "@" in canonical_url
+    ):
+        raise ValueError("canonical url validation failed")
+    if not any(
+        verified_host == d or verified_host.endswith(f".{d}")
+        for d in _ALLOWED_URL_DOMAINS
+    ):
+        raise ValueError(
+            f"url domain '{verified_host}' is not allowed (only xueqiu.com and glassdoor.com)"
+        )
+    req_dom = required_domain.lower().rstrip(".")
+    if not (verified_host == req_dom or verified_host.endswith(f".{req_dom}")):
+        raise ValueError(f"url domain '{verified_host}' must match '{req_dom}'")
+    return canonical_url
+
+
+def _validate_clean_text(val: Any, *, field_name: str, max_len: int) -> str:
+    if not isinstance(val, str):
+        raise ValueError(f"{field_name} must be a string")
+    cleaned = val.strip()
+    if not cleaned or len(cleaned) > max_len:
+        raise ValueError(f"{field_name} length must be between 1 and {max_len} characters")
+    if any(ord(ch) < 32 for ch in cleaned):
+        raise ValueError(f"{field_name} contains control characters")
+    if cleaned.startswith("-"):
+        raise ValueError(f"{field_name} must not start with '-'")
+    return cleaned
+
+
+def _validate_int_range(
+    val: Any, *, field_name: str, min_val: int, max_val: int, default: int
+) -> int:
+    if val is None:
+        return default
+    if isinstance(val, bool) or not isinstance(val, int):
+        raise ValueError(f"{field_name} must be an integer")
+    if val < min_val or val > max_val:
+        raise ValueError(f"{field_name} must be between {min_val} and {max_val}")
+    return val
+
+
+def _validate_last30days_plan(plan: Any) -> dict[str, Any]:
+    if not isinstance(plan, dict) or not plan:
+        raise ValueError("plan must be a non-empty JSON object")
+    subqueries = plan.get("subqueries")
+    if not isinstance(subqueries, list) or not subqueries or len(subqueries) > 10:
+        raise ValueError("plan.subqueries must be a non-empty list (max 10 items)")
+    for idx, sq in enumerate(subqueries):
+        if not isinstance(sq, dict):
+            raise ValueError(f"plan.subqueries[{idx}] must be an object")
+        s_q = sq.get("search_query")
+        r_q = sq.get("ranking_query")
+        if not isinstance(s_q, str) or not s_q.strip() or len(s_q.strip()) > 300:
+            raise ValueError(f"plan.subqueries[{idx}].search_query must be a non-empty string (<=300 chars)")
+        if not isinstance(r_q, str) or not r_q.strip() or len(r_q.strip()) > 300:
+            raise ValueError(f"plan.subqueries[{idx}].ranking_query must be a non-empty string (<=300 chars)")
+    encoded = json.dumps(plan, ensure_ascii=False)
+    if len(encoded.encode("utf-8")) > 32768:
+        raise ValueError("plan exceeds 32 KiB limit")
+    return plan
+
+
+def _is_within_openclaw_tree(target_dir: Path, ocw_root: Path) -> bool:
+    """Return True if resolved `target_dir` falls anywhere under the real `~/.openclaw` tree or `ocw_root`."""
+    real_target = target_dir.expanduser().resolve()
+    forbidden_roots: set[Path] = {
+        Path("~/.openclaw").expanduser().resolve(),
+        ocw_root.expanduser().resolve(),
+    }
+    resolved_ocw = ocw_root.expanduser().resolve()
+    if resolved_ocw.name == "workspace" and resolved_ocw.parent != resolved_ocw:
+        forbidden_roots.add(resolved_ocw.parent)
+    for anc in (resolved_ocw, *resolved_ocw.parents):
+        if anc.name == ".openclaw":
+            forbidden_roots.add(anc)
+    for root in forbidden_roots:
+        if real_target == root or root in real_target.parents:
+            return True
+    return False
+
+
+def _extract_last30days_source_state(entry: Any) -> str:
+    if isinstance(entry, str):
+        return entry.strip().lower()
+    if isinstance(entry, dict):
+        return str(entry.get("state") or entry.get("status") or "").strip().lower()
+    return ""
+
+
+def _has_last30days_items(parsed: Any) -> bool:
+    if not isinstance(parsed, dict):
+        return False
+    for list_key in ("results", "ranked_candidates", "items", "clusters"):
+        if isinstance(parsed.get(list_key), list) and len(parsed[list_key]) > 0:
+            return True
+    if isinstance(parsed.get("items_by_source"), dict):
+        for src_items in parsed["items_by_source"].values():
+            if isinstance(src_items, list) and len(src_items) > 0:
+                return True
+    return False
+
+
+def _is_all_last30days_no_results(raw_src_status: Any) -> bool:
+    """Return True only when `source_status` is a non-empty dict where every source state is `no-results`."""
+    if not isinstance(raw_src_status, dict) or not raw_src_status:
+        return False
+    for src_val in raw_src_status.values():
+        if _extract_last30days_source_state(src_val) != "no-results":
+            return False
+    return True
+
+
+def _is_empty_community_output(route: str, operation: str, parsed: Any) -> bool:
+    if parsed is None:
+        return True
+    if isinstance(parsed, list):
+        return len(parsed) == 0
+    if not isinstance(parsed, dict) or not parsed:
+        return True
+
+    if route == "xueqiu":
+        for list_key in ("posts", "comments", "results", "items"):
+            if isinstance(parsed.get(list_key), list):
+                return len(parsed[list_key]) == 0
+        if operation == "post":
+            return not any(parsed.get(k) for k in ("id", "text", "title", "url"))
+        return False
+
+    if route == "employee":
+        if isinstance(parsed.get("reviews"), list):
+            return len(parsed["reviews"]) == 0
+        if operation == "summary":
+            return not (
+                parsed.get("count")
+                or parsed.get("monthly_ratings")
+                or parsed.get("top_pros_terms")
+                or parsed.get("top_cons_terms")
+                or parsed.get("overall_rating")
+            )
+        for list_key in ("results", "items"):
+            if isinstance(parsed.get(list_key), list):
+                return len(parsed[list_key]) == 0
+        return False
+
+    if route == "last30days":
+        if _has_last30days_items(parsed):
+            return False
+        return _is_all_last30days_no_results(parsed.get("source_status"))
+
+    return False
+
+
 class ResearchDataBridge:
     RESEARCH_DESCRIPTION_SUFFIX: str = "\n\n" + RESEARCH_EVIDENCE_AND_ROUTE_GUIDE
+    COMMUNITY_DESCRIPTION_SUFFIX: str = COMMUNITY_DESCRIPTION_SUFFIX
 
     def __init__(self, cfg: BridgeConfig) -> None:
         self.cfg = cfg
         self.sem = asyncio.Semaphore(cfg.max_inflight)
         self.embed_sem = asyncio.Semaphore(cfg.embed_max_inflight)
+        self.community_sems: dict[str, asyncio.Semaphore] = {
+            r: asyncio.Semaphore(limit)
+            for r, limit in COMMUNITY_ROUTE_CONCURRENCY.items()
+        }
         self.server_version: str = "unknown"
         self._cached_tools: list[dict[str, Any]] | None = None
         self._cached_version: str | None = None
@@ -564,7 +1273,7 @@ class ResearchDataBridge:
         self._file_cache: dict[str, tuple[int, int, Any]] = {}
 
     def handoff_routes(self) -> set[str]:
-        """Return route IDs whose `kind` is `agent_tool` or `skill` in `data_sources.json`."""
+        """Return route IDs whose `kind` is `agent_tool` or `skill` in `data_sources.json`, excluding bridge-executed community routes."""
         try:
             raw = json.loads(
                 self.cfg.data_sources_json.read_text(encoding="utf-8")
@@ -578,6 +1287,7 @@ class ResearchDataBridge:
                 if isinstance(r, dict)
                 and r.get("id")
                 and r.get("kind") in ("agent_tool", "skill")
+                and str(r["id"]) not in BRIDGE_COMMUNITY_ROUTES
             }
         except Exception as exc:
             logger.warning("Failed to load data_sources.json: %s", type(exc).__name__)
@@ -585,12 +1295,9 @@ class ResearchDataBridge:
                 "web-news",
                 "web-page",
                 "filings",
-                "last30days",
                 "agent-reach",
                 "x-timeline",
                 "x-search",
-                "xueqiu",
-                "employee",
             }
 
     def compute_timeout(self, tool_name: str, arguments: dict[str, Any]) -> int:
@@ -600,6 +1307,9 @@ class ResearchDataBridge:
             default_s, max_s = ROUTE_TIMEOUTS["catalog"]
         else:
             route = str(arguments.get("route") or "").strip()
+            if route in BRIDGE_COMMUNITY_ROUTES:
+                default_s, max_s = ROUTE_TIMEOUTS[route]
+                return max(5, min(default_s, max_s, ceiling))
             op = str(arguments.get("operation") or arguments.get("action") or "").strip()
             key = f"{route}:{op}"
             if key in ROUTE_TIMEOUTS:
@@ -719,14 +1429,109 @@ class ResearchDataBridge:
                 else {}
             )
             route_prop = props.get("route")
+            tool_name = str(tool_copy.get("name") or "")
             if isinstance(route_prop, dict) and isinstance(route_prop.get("enum"), list):
-                route_prop["enum"] = [
-                    r for r in route_prop["enum"] if r not in handoff
-                ]
-            if tool_copy.get("name") == "research":
+                if tool_name == "community":
+                    kept = [r for r in route_prop["enum"] if r not in handoff]
+                    for comm_r in ("xueqiu", "employee", "last30days"):
+                        if comm_r not in kept:
+                            kept.append(comm_r)
+                    route_prop["enum"] = kept
+                else:
+                    route_prop["enum"] = [
+                        r
+                        for r in route_prop["enum"]
+                        if r not in handoff and r not in BRIDGE_COMMUNITY_ROUTES
+                    ]
+            if tool_name == "research":
                 desc = str(tool_copy.get("description") or "").rstrip()
                 if self.RESEARCH_DESCRIPTION_SUFFIX.strip() not in desc:
                     tool_copy["description"] = desc + self.RESEARCH_DESCRIPTION_SUFFIX
+            elif tool_name == "community":
+                desc = str(tool_copy.get("description") or "").rstrip()
+                if self.COMMUNITY_DESCRIPTION_SUFFIX.strip() not in desc:
+                    tool_copy["description"] = desc + self.COMMUNITY_DESCRIPTION_SUFFIX
+                if isinstance(props, dict):
+                    for gen_key in UPSTREAM_GENERIC_COMMUNITY_PARAMS:
+                        if isinstance(props.get(gen_key), dict):
+                            props[gen_key].pop("default", None)
+                    props.setdefault(
+                        "operation",
+                        {
+                            "type": "string",
+                            "description": "xueqiu: posts|post|comments|search|user; employee: blind|summary|indeed|glassdoor; last30days: search (optional, default search)",
+                        },
+                    )
+                    props.setdefault(
+                        "ticker",
+                        {
+                            "type": "string",
+                            "description": "Stock symbol for xueqiu posts (e.g. 00700, 06181, SH600519, SZ300750).",
+                        },
+                    )
+                    props.setdefault(
+                        "url",
+                        {
+                            "type": "string",
+                            "description": "Target URL (xueqiu.com for xueqiu post/user; glassdoor.com for employee glassdoor).",
+                        },
+                    )
+                    props.setdefault(
+                        "post_id",
+                        {
+                            "type": "string",
+                            "description": "Xueqiu post ID for comments operation.",
+                        },
+                    )
+                    props.setdefault(
+                        "query",
+                        {
+                            "type": "string",
+                            "description": "Search keyword/topic for xueqiu search or last30days.",
+                        },
+                    )
+                    props.setdefault(
+                        "company",
+                        {
+                            "type": "string",
+                            "description": "Company name/slug for employee blind/summary/indeed (e.g. NVIDIA).",
+                        },
+                    )
+                    props.setdefault(
+                        "pages",
+                        {
+                            "type": "integer",
+                            "description": "Page count (xueqiu: 1-3; employee blind/indeed: 1-3; employee summary: 1-40).",
+                        },
+                    )
+                    props.setdefault(
+                        "allow_paid",
+                        {
+                            "type": "boolean",
+                            "description": "Must be true to allow paid employee operations (indeed, glassdoor); default false.",
+                        },
+                    )
+                    props.setdefault(
+                        "days",
+                        {
+                            "type": "integer",
+                            "description": "Lookback window in days for last30days (1-30, default 30).",
+                        },
+                    )
+                    props.setdefault(
+                        "quick",
+                        {
+                            "type": "boolean",
+                            "description": "Quick mode for last30days.",
+                        },
+                    )
+                    props.setdefault(
+                        "plan",
+                        {
+                            "type": "object",
+                            "description": "Optional query plan object for last30days (each subquery requires search_query and ranking_query).",
+                        },
+                    )
             elif tool_copy.get("name") == "macro":
                 if isinstance(route_prop, dict) and isinstance(route_prop.get("enum"), list):
                     if "market-regime" not in route_prop["enum"]:
@@ -1512,6 +2317,818 @@ class ResearchDataBridge:
             except Exception as exc:
                 logger.warning("Failed to record alphaengine usage: %s", type(exc).__name__)
 
+    @staticmethod
+    def _make_tool_result_response(
+        req_id: Any, payload: dict[str, Any], *, is_error: bool
+    ) -> dict[str, Any]:
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps(payload, ensure_ascii=False),
+                    }
+                ],
+                "structuredContent": dict(payload),
+                "isError": is_error,
+            },
+        }
+
+    def _build_community_subprocess_env(self) -> dict[str, str]:
+        """Build subprocess environment with CLAUDECODE/CLAUDE_CODE_* stripped and optional proxy applied."""
+        env: dict[str, str] = {
+            k: v
+            for k, v in os.environ.items()
+            if k != "CLAUDECODE" and not k.startswith("CLAUDE_CODE_")
+        }
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        env["LAST30DAYS_ALLOW_ENGINE_PLAN"] = "1"
+        env["FROM_BROWSER"] = "off"
+        existing_excl = env.get("EXCLUDE_SOURCES", "").strip()
+        excl_parts = [p.strip() for p in existing_excl.split(",") if p.strip()]
+        if "reddit" not in [p.lower() for p in excl_parts]:
+            excl_parts.append("reddit")
+        env["EXCLUDE_SOURCES"] = ",".join(excl_parts)
+        has_proxy = any(
+            bool(env.get(pk, "").strip())
+            for pk in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY")
+        )
+        if not has_proxy:
+            proxy = (
+                self.cfg.subprocess_proxy
+                or os.environ.get("DALTON_BRIDGE_SUBPROCESS_PROXY", "")
+            ).strip()
+            if proxy:
+                env["http_proxy"] = proxy
+                env["https_proxy"] = proxy
+                env["HTTP_PROXY"] = proxy
+                env["HTTPS_PROXY"] = proxy
+                env["ALL_PROXY"] = proxy
+        return env
+
+    def _check_community_source_files(self, route: str) -> str | None:
+        """Return an error description if required interpreter or script files are missing, without installing anything."""
+        if route == "employee":
+            if not self.cfg.employee_python.is_file():
+                return f"Employee reviews Python interpreter not found: {self.cfg.employee_python}"
+            if not self.cfg.employee_cli_script.is_file():
+                return f"Employee reviews CLI script not found: {self.cfg.employee_cli_script}"
+            return None
+        if route == "xueqiu":
+            if not Path(self.cfg.python_bin).is_file():
+                return f"Xueqiu Python interpreter not found: {self.cfg.python_bin}"
+            if not self.cfg.xueqiu_script.is_file():
+                return f"Xueqiu script not found: {self.cfg.xueqiu_script}"
+            return None
+        if route == "last30days":
+            if not self.cfg.last30days_python.is_file():
+                return f"last30days Python interpreter not found: {self.cfg.last30days_python}"
+            if not self.cfg.last30days_script.is_file():
+                return f"last30days CLI script not found: {self.cfg.last30days_script}"
+            return None
+        return None
+
+    def _validate_and_build_community_cmd(
+        self,
+        route: str,
+        arguments: dict[str, Any],
+        plan_file: Path | None = None,
+    ) -> list[str]:
+        """Validate community route arguments strictly against whitelists (ignoring upstream generic defaults) and return exec argv list."""
+        clean_args = {
+            k: v
+            for k, v in arguments.items()
+            if k not in UPSTREAM_GENERIC_COMMUNITY_PARAMS
+        }
+        if route == "xueqiu":
+            allowed_keys = {
+                "route",
+                "operation",
+                "ticker",
+                "url",
+                "post_id",
+                "query",
+                "pages",
+            }
+            extra = set(clean_args.keys()) - allowed_keys
+            if extra:
+                raise ValueError(f"Unsupported parameters for xueqiu: {sorted(extra)}")
+            op = clean_args.get("operation")
+            if not isinstance(op, str) or op not in (
+                "posts",
+                "post",
+                "comments",
+                "search",
+                "user",
+            ):
+                raise ValueError(
+                    "xueqiu operation must be one of: posts, post, comments, search, user"
+                )
+            if op == "posts":
+                for forbidden in ("url", "post_id", "query"):
+                    if clean_args.get(forbidden) is not None:
+                        raise ValueError(f"Parameter '{forbidden}' is not allowed for xueqiu posts")
+                raw_ticker = clean_args.get("ticker")
+                if not isinstance(raw_ticker, str):
+                    raise ValueError("ticker is required and must be a string")
+                ticker = raw_ticker.strip()
+                if not ticker or ticker.startswith("-") or not _TICKER_RE.fullmatch(ticker):
+                    raise ValueError("ticker format is invalid")
+                pages = _validate_int_range(
+                    clean_args.get("pages"),
+                    field_name="pages",
+                    min_val=1,
+                    max_val=3,
+                    default=1,
+                )
+                return [
+                    self.cfg.python_bin,
+                    str(self.cfg.xueqiu_script),
+                    "--json",
+                    "posts",
+                    ticker,
+                    "--pages",
+                    str(pages),
+                ]
+            if op == "post":
+                for forbidden in ("ticker", "post_id", "query", "pages"):
+                    if clean_args.get(forbidden) is not None:
+                        raise ValueError(f"Parameter '{forbidden}' is not allowed for xueqiu post")
+                url = _validate_community_url(
+                    clean_args.get("url"), required_domain="xueqiu.com"
+                )
+                return [
+                    self.cfg.python_bin,
+                    str(self.cfg.xueqiu_script),
+                    "--json",
+                    "post",
+                    url,
+                ]
+            if op == "comments":
+                for forbidden in ("ticker", "url", "query"):
+                    if clean_args.get(forbidden) is not None:
+                        raise ValueError(
+                            f"Parameter '{forbidden}' is not allowed for xueqiu comments"
+                        )
+                raw_post_id = clean_args.get("post_id")
+                if not isinstance(raw_post_id, str):
+                    raise ValueError("post_id is required and must be a string")
+                post_id = raw_post_id.strip()
+                if not _POST_ID_RE.fullmatch(post_id):
+                    raise ValueError("post_id must be a numeric string (1-32 digits)")
+                pages = _validate_int_range(
+                    clean_args.get("pages"),
+                    field_name="pages",
+                    min_val=1,
+                    max_val=3,
+                    default=1,
+                )
+                return [
+                    self.cfg.python_bin,
+                    str(self.cfg.xueqiu_script),
+                    "--json",
+                    "comments",
+                    post_id,
+                    "--pages",
+                    str(pages),
+                ]
+            if op == "search":
+                for forbidden in ("ticker", "url", "post_id"):
+                    if clean_args.get(forbidden) is not None:
+                        raise ValueError(
+                            f"Parameter '{forbidden}' is not allowed for xueqiu search"
+                        )
+                query = _validate_clean_text(
+                    clean_args.get("query"), field_name="query", max_len=200
+                )
+                pages = _validate_int_range(
+                    clean_args.get("pages"),
+                    field_name="pages",
+                    min_val=1,
+                    max_val=3,
+                    default=1,
+                )
+                return [
+                    self.cfg.python_bin,
+                    str(self.cfg.xueqiu_script),
+                    "search",
+                    query,
+                    "--pages",
+                    str(pages),
+                    "--json",
+                ]
+            # op == "user"
+            for forbidden in ("ticker", "post_id", "query"):
+                if clean_args.get(forbidden) is not None:
+                    raise ValueError(f"Parameter '{forbidden}' is not allowed for xueqiu user")
+            url = _validate_community_url(
+                clean_args.get("url"), required_domain="xueqiu.com"
+            )
+            pages = _validate_int_range(
+                clean_args.get("pages"),
+                field_name="pages",
+                min_val=1,
+                max_val=3,
+                default=1,
+            )
+            return [
+                self.cfg.python_bin,
+                str(self.cfg.xueqiu_script),
+                "--json",
+                "user",
+                url,
+                "--pages",
+                str(pages),
+            ]
+
+        if route == "employee":
+            allowed_keys = {
+                "route",
+                "operation",
+                "company",
+                "url",
+                "pages",
+                "allow_paid",
+            }
+            extra = set(clean_args.keys()) - allowed_keys
+            if extra:
+                raise ValueError(f"Unsupported parameters for employee: {sorted(extra)}")
+            op = clean_args.get("operation")
+            if not isinstance(op, str) or op not in (
+                "blind",
+                "summary",
+                "indeed",
+                "glassdoor",
+            ):
+                raise ValueError(
+                    "employee operation must be one of: blind, summary, indeed, glassdoor"
+                )
+            allow_paid = clean_args.get("allow_paid")
+            if allow_paid is not None and not isinstance(allow_paid, bool):
+                raise ValueError("allow_paid must be a boolean")
+            if op in ("blind", "summary", "indeed"):
+                if clean_args.get("url") is not None:
+                    raise ValueError(f"Parameter 'url' is not allowed for employee {op}")
+                raw_company = clean_args.get("company")
+                if not isinstance(raw_company, str):
+                    raise ValueError("company is required and must be a string")
+                company = raw_company.strip()
+                if (
+                    not company
+                    or company.startswith("-")
+                    or not _COMPANY_RE.fullmatch(company)
+                ):
+                    raise ValueError("company format is invalid")
+                max_pages = 40 if op == "summary" else 3
+                default_pages = 40 if op == "summary" else 1
+                pages = _validate_int_range(
+                    clean_args.get("pages"),
+                    field_name="pages",
+                    min_val=1,
+                    max_val=max_pages,
+                    default=default_pages,
+                )
+                return [
+                    str(self.cfg.employee_python),
+                    str(self.cfg.employee_cli_script),
+                    op,
+                    "--company",
+                    company,
+                    "--pages",
+                    str(pages),
+                    "--json",
+                ]
+            # op == "glassdoor"
+            for forbidden in ("company", "pages"):
+                if clean_args.get(forbidden) is not None:
+                    raise ValueError(
+                        f"Parameter '{forbidden}' is not allowed for employee glassdoor"
+                    )
+            url = _validate_community_url(
+                clean_args.get("url"), required_domain="glassdoor.com"
+            )
+            return [
+                str(self.cfg.employee_python),
+                str(self.cfg.employee_cli_script),
+                "glassdoor",
+                "--url",
+                url,
+                "--json",
+            ]
+
+        if route == "last30days":
+            allowed_keys = {"route", "operation", "query", "days", "quick", "plan"}
+            extra = set(clean_args.keys()) - allowed_keys
+            if extra:
+                raise ValueError(f"Unsupported parameters for last30days: {sorted(extra)}")
+            raw_op = clean_args.get("operation")
+            if raw_op is not None:
+                if not isinstance(raw_op, str) or raw_op.strip() not in ("", "search"):
+                    raise ValueError("last30days operation must be 'search' or omitted")
+            query = _validate_clean_text(
+                clean_args.get("query"), field_name="query", max_len=300
+            )
+            norm_query = " ".join(query.lower().split())
+            if (
+                norm_query in _LAST30DAYS_FORBIDDEN_QUERY_COMMANDS
+                or norm_query.startswith(_LAST30DAYS_FORBIDDEN_QUERY_PREFIXES)
+            ):
+                raise ValueError(
+                    f"Maintenance command '{query}' is not allowed for last30days"
+                )
+            days = _validate_int_range(
+                clean_args.get("days"),
+                field_name="days",
+                min_val=1,
+                max_val=30,
+                default=30,
+            )
+            quick = clean_args.get("quick")
+            if quick is not None and not isinstance(quick, bool):
+                raise ValueError("quick must be a boolean")
+            cmd = [
+                str(self.cfg.last30days_python),
+                str(self.cfg.last30days_script),
+                query,
+                "--days",
+                str(days),
+            ]
+            if quick is True:
+                cmd.append("--quick")
+            if plan_file is not None:
+                cmd.extend(["--plan", str(plan_file.resolve())])
+            cmd.append("--emit=json")
+            return cmd
+
+        raise ValueError(f"Unsupported community route '{route}'")
+
+    async def _handle_community_call(
+        self,
+        req_id: Any,
+        route: str,
+        arguments: dict[str, Any],
+        eff_timeout: int,
+    ) -> dict[str, Any]:
+        """Execute `xueqiu`, `employee`, or `last30days` directly via subprocess without shell."""
+        operation = str(arguments.get("operation") or "").strip()
+        if route == "last30days" and not operation:
+            operation = "search"
+
+        # Paid source gate for employee indeed/glassdoor
+        if route == "employee" and operation in ("indeed", "glassdoor"):
+            if arguments.get("allow_paid") is not True:
+                paid_err_msg = (
+                    f"Employee operation '{operation}' uses a paid source and requires "
+                    "allow_paid=True."
+                )
+                paid_err = {
+                    "_declared_sources": [],
+                    "_sources": [],
+                    "ok": False,
+                    "status": "paid_source_not_allowed",
+                    "error_code": "paid_source_not_allowed",
+                    "error": paid_err_msg,
+                    "data": sanitize_error_data_summary(
+                        None,
+                        route=route,
+                        operation=operation,
+                        status="paid_source_not_allowed",
+                        error=paid_err_msg,
+                    ),
+                }
+                return self._make_tool_result_response(req_id, paid_err, is_error=True)
+
+        plan_obj: dict[str, Any] | None = None
+        if route == "last30days" and arguments.get("plan") is not None:
+            try:
+                plan_obj = _validate_last30days_plan(arguments.get("plan"))
+            except ValueError as exc:
+                err_payload = {
+                    "_declared_sources": [],
+                    "_sources": [],
+                    "ok": False,
+                    "status": "invalid_arguments",
+                    "error_code": "invalid_arguments",
+                    "error": str(exc),
+                    "data": sanitize_error_data_summary(
+                        None,
+                        route=route,
+                        operation=operation,
+                        status="invalid_arguments",
+                        error=str(exc),
+                    ),
+                }
+                return self._make_tool_result_response(req_id, err_payload, is_error=True)
+
+        plan_file: Path | None = None
+        try:
+            if plan_obj is not None:
+                cache_root = self.cfg.cache_dir.expanduser().resolve()
+                if _is_within_openclaw_tree(cache_root, self.cfg.ocw_root):
+                    err_msg = "Bridge cache_dir must not be inside ~/.openclaw"
+                    err_payload = {
+                        "_declared_sources": [],
+                        "_sources": [],
+                        "ok": False,
+                        "status": "invalid_arguments",
+                        "error_code": "invalid_arguments",
+                        "error": err_msg,
+                        "data": sanitize_error_data_summary(
+                            None,
+                            route=route,
+                            operation=operation,
+                            status="invalid_arguments",
+                            error=err_msg,
+                        ),
+                    }
+                    return self._make_tool_result_response(
+                        req_id, err_payload, is_error=True
+                    )
+                cache_root.mkdir(parents=True, exist_ok=True)
+                plan_file = cache_root / f"last30days-plan-{uuid.uuid4().hex}.json"
+                plan_file.write_text(
+                    json.dumps(plan_obj, ensure_ascii=False), encoding="utf-8"
+                )
+
+            try:
+                cmd = self._validate_and_build_community_cmd(
+                    route, arguments, plan_file=plan_file
+                )
+            except ValueError as exc:
+                err_payload = {
+                    "_declared_sources": [],
+                    "_sources": [],
+                    "ok": False,
+                    "status": "invalid_arguments",
+                    "error_code": "invalid_arguments",
+                    "error": str(exc),
+                    "data": sanitize_error_data_summary(
+                        None,
+                        route=route,
+                        operation=operation,
+                        status="invalid_arguments",
+                        error=str(exc),
+                    ),
+                }
+                return self._make_tool_result_response(req_id, err_payload, is_error=True)
+
+            missing_err = self._check_community_source_files(route)
+            if missing_err is not None:
+                missing_payload = {
+                    "_declared_sources": [],
+                    "_sources": [],
+                    "ok": False,
+                    "status": "source_missing",
+                    "error_code": "source_missing",
+                    "error": missing_err,
+                    "data": sanitize_error_data_summary(
+                        None,
+                        route=route,
+                        operation=operation,
+                        status="source_missing",
+                        error=missing_err,
+                    ),
+                }
+                return self._make_tool_result_response(
+                    req_id, missing_payload, is_error=True
+                )
+
+            route_sem = self.community_sems.get(route) or self.sem
+            t0 = time.monotonic()
+            deadline = t0 + float(eff_timeout)
+            test_delay_s = self.cfg.resolve_test_delay_s()
+            subproc_env = self._build_community_subprocess_env()
+
+            try:
+                wait_for_sem_s = deadline - time.monotonic()
+                if wait_for_sem_s <= 0:
+                    raise asyncio.TimeoutError()
+                await asyncio.wait_for(route_sem.acquire(), timeout=wait_for_sem_s)
+                try:
+                    if test_delay_s > 0.0:
+                        rem_before_delay = deadline - time.monotonic()
+                        if rem_before_delay <= 0:
+                            raise asyncio.TimeoutError()
+                        await asyncio.wait_for(
+                            asyncio.sleep(test_delay_s),
+                            timeout=rem_before_delay,
+                        )
+                    remaining_budget_s = deadline - time.monotonic()
+                    if remaining_budget_s <= 0:
+                        raise asyncio.TimeoutError()
+                    proc = await asyncio.create_subprocess_exec(
+                        *cmd,
+                        cwd=str(self.cfg.ocw_root),
+                        env=subproc_env,
+                        stdin=asyncio.subprocess.DEVNULL,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        start_new_session=True,
+                    )
+                    try:
+                        stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                            proc.communicate(),
+                            timeout=remaining_budget_s,
+                        )
+                    except BaseException:
+                        await _terminate_and_reap_process(
+                            proc, term_timeout_s=COMMUNITY_SIGTERM_GRACE_S
+                        )
+                        raise
+                finally:
+                    route_sem.release()
+            except asyncio.TimeoutError:
+                elapsed_ms = int((time.monotonic() - t0) * 1000)
+                logger.warning(
+                    "community tools/call timeout route=%s op=%s timeout_s=%d elapsed_ms=%d",
+                    route,
+                    operation,
+                    eff_timeout,
+                    elapsed_ms,
+                )
+                timeout_msg = f"researchdata_bridge timed out after {eff_timeout}s on community/{route}"
+                timeout_payload = {
+                    "_declared_sources": [],
+                    "_sources": [],
+                    "ok": False,
+                    "status": "timeout",
+                    "data": sanitize_error_data_summary(
+                        None,
+                        route=route,
+                        operation=operation,
+                        status="timeout",
+                        error=timeout_msg,
+                    ),
+                    "error": timeout_msg,
+                }
+                return self._make_tool_result_response(
+                    req_id, timeout_payload, is_error=True
+                )
+
+            elapsed_ms = int((time.monotonic() - t0) * 1000)
+            stderr_tail = sanitize_stderr_text(stderr_bytes, max_len=500)
+            rc = proc.returncode if proc.returncode is not None else 0
+
+            if rc != 0:
+                err_msg = stderr_tail or f"Script exited with non-zero code {rc}"
+                err_payload = {
+                    "_declared_sources": [],
+                    "_sources": [],
+                    "ok": False,
+                    "status": "script_error",
+                    "data": sanitize_error_data_summary(
+                        None,
+                        route=route,
+                        operation=operation,
+                        status="script_error",
+                        error=err_msg,
+                    ),
+                    "error": err_msg,
+                    "stderr": stderr_tail,
+                    "exit_code": rc,
+                }
+                logger.warning(
+                    "community script_error route=%s op=%s exit_code=%s elapsed_ms=%d",
+                    route,
+                    operation or "-",
+                    rc,
+                    elapsed_ms,
+                )
+                return self._make_tool_result_response(
+                    req_id, err_payload, is_error=True
+                )
+
+            stdout_text = stdout_bytes.decode("utf-8", errors="replace").strip()
+            parsed: Any = None
+            valid_json = False
+            if stdout_text:
+                try:
+                    parsed = json.loads(stdout_text)
+                    if isinstance(parsed, (dict, list)):
+                        valid_json = True
+                except Exception:
+                    for line in reversed(stdout_text.splitlines()):
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            candidate = json.loads(line)
+                            if isinstance(candidate, (dict, list)):
+                                parsed = candidate
+                                valid_json = True
+                                break
+                        except Exception:
+                            continue
+
+            if not valid_json:
+                inv_msg = stderr_tail or "Script output is not valid JSON"
+                err_payload = {
+                    "_declared_sources": [],
+                    "_sources": [],
+                    "ok": False,
+                    "status": "invalid_output",
+                    "data": sanitize_error_data_summary(
+                        None,
+                        route=route,
+                        operation=operation,
+                        status="invalid_output",
+                        error=inv_msg,
+                    ),
+                    "error": inv_msg,
+                    "stderr": stderr_tail,
+                }
+                logger.warning(
+                    "community invalid_output route=%s op=%s elapsed_ms=%d",
+                    route,
+                    operation or "-",
+                    elapsed_ms,
+                )
+                return self._make_tool_result_response(
+                    req_id, err_payload, is_error=True
+                )
+
+            parsed = _sanitize_community_payload_metadata(parsed)
+
+            if isinstance(parsed, dict) and parsed.get("ok") is False:
+                err_msg = sanitize_stderr_text(
+                    str(parsed.get("error") or stderr_tail or "Script reported ok=false"),
+                    max_len=500,
+                )
+                err_payload = {
+                    "_declared_sources": [],
+                    "_sources": [],
+                    "ok": False,
+                    "status": "script_error",
+                    "data": sanitize_error_data_summary(
+                        parsed,
+                        route=route,
+                        operation=operation,
+                        status="script_error",
+                        error=err_msg,
+                    ),
+                    "error": err_msg,
+                    "stderr": stderr_tail,
+                }
+                return self._make_tool_result_response(
+                    req_id, err_payload, is_error=True
+                )
+
+            if route == "last30days":
+                raw_src_status = (
+                    parsed.get("source_status") if isinstance(parsed, dict) else None
+                )
+                sanitized_src_status = _sanitize_source_status_map(raw_src_status)
+                if isinstance(parsed, dict) and "source_status" in parsed:
+                    parsed["source_status"] = sanitized_src_status
+                non_healthy_sources: dict[str, str] = {}
+                if isinstance(raw_src_status, dict):
+                    for src_name, src_val in raw_src_status.items():
+                        state = _extract_last30days_source_state(src_val) or "unknown"
+                        if state not in _LAST30DAYS_HEALTHY_STATES:
+                            non_healthy_sources[str(src_name)] = state
+                has_items = _has_last30days_items(parsed)
+                if not has_items:
+                    if _is_all_last30days_no_results(raw_src_status):
+                        empty_msg = (
+                            stderr_tail or f"No results returned from community/{route}"
+                        )
+                        empty_payload: dict[str, Any] = {
+                            "_declared_sources": [],
+                            "_sources": [],
+                            "ok": False,
+                            "status": "empty",
+                            "source_status": sanitized_src_status,
+                            "data": sanitize_error_data_summary(
+                                parsed,
+                                route=route,
+                                operation=operation,
+                                status="empty",
+                                error=empty_msg,
+                            ),
+                            "error": empty_msg,
+                            "stderr": stderr_tail,
+                        }
+                        logger.info(
+                            "community empty route=%s op=%s elapsed_ms=%d",
+                            route,
+                            operation or "-",
+                            elapsed_ms,
+                        )
+                        return self._make_tool_result_response(
+                            req_id, empty_payload, is_error=True
+                        )
+                    if non_healthy_sources:
+                        deg_msg = (
+                            stderr_tail
+                            or "last30days failed with degraded sources: "
+                            + ", ".join(
+                                f"{k} ({v})"
+                                for k, v in sorted(non_healthy_sources.items())
+                            )
+                        )
+                    else:
+                        deg_msg = (
+                            stderr_tail
+                            or "last30days returned no items with empty source_status"
+                        )
+                    degraded_payload = {
+                        "_declared_sources": [],
+                        "_sources": [],
+                        "ok": False,
+                        "status": "degraded",
+                        "source_status": sanitized_src_status,
+                        "data": sanitize_error_data_summary(
+                            parsed,
+                            route=route,
+                            operation=operation,
+                            status="degraded",
+                            error=deg_msg,
+                        ),
+                        "error": deg_msg,
+                        "stderr": stderr_tail,
+                    }
+                    return self._make_tool_result_response(
+                        req_id, degraded_payload, is_error=True
+                    )
+                if isinstance(parsed, dict) and non_healthy_sources:
+                    existing_warnings = (
+                        list(parsed.get("warnings"))
+                        if isinstance(parsed.get("warnings"), list)
+                        else []
+                    )
+                    for src_name, state in sorted(non_healthy_sources.items()):
+                        warn_line = f"Source '{src_name}' failed with status '{state}'"
+                        if warn_line not in existing_warnings:
+                            existing_warnings.append(warn_line)
+                    parsed["warnings"] = [
+                        sanitize_stderr_text(str(w), max_len=300)
+                        for w in existing_warnings
+                    ]
+
+            if _is_empty_community_output(route, operation, parsed):
+                empty_msg = stderr_tail or f"No results returned from community/{route}"
+                empty_payload = {
+                    "_declared_sources": [],
+                    "_sources": [],
+                    "ok": False,
+                    "status": "empty",
+                    "data": sanitize_error_data_summary(
+                        parsed,
+                        route=route,
+                        operation=operation,
+                        status="empty",
+                        error=empty_msg,
+                    ),
+                    "error": empty_msg,
+                    "stderr": stderr_tail,
+                }
+                logger.info(
+                    "community empty route=%s op=%s elapsed_ms=%d",
+                    route,
+                    operation or "-",
+                    elapsed_ms,
+                )
+                return self._make_tool_result_response(
+                    req_id, empty_payload, is_error=True
+                )
+
+            base_envelope: dict[str, Any] = {
+                "ok": True,
+                "status": "ok",
+                "data": parsed,
+            }
+            declared = source_identity.declare("community", arguments, base_envelope)
+            enriched: dict[str, Any] = {
+                "_declared_sources": declared,
+                "_sources": declared,
+                "ok": True,
+                "status": "ok",
+                "data": parsed,
+            }
+            if (
+                route == "last30days"
+                and isinstance(parsed, dict)
+                and isinstance(parsed.get("warnings"), list)
+                and parsed["warnings"]
+            ):
+                enriched["warnings"] = list(parsed["warnings"])
+            logger.info(
+                "tools/call tool=community route=%s op=%s status=ok declared_sources=%d elapsed_ms=%d",
+                route,
+                operation or "-",
+                len(declared),
+                elapsed_ms,
+            )
+            return self._make_tool_result_response(req_id, enriched, is_error=False)
+        finally:
+            if plan_file is not None:
+                try:
+                    plan_file.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
     def _reference_date(self) -> date:
         """Return the current `America/New_York` calendar date for market-regime freshness checks."""
         return datetime.now(ZoneInfo("America/New_York")).date()
@@ -1973,6 +3590,23 @@ class ResearchDataBridge:
             }
 
         eff_timeout = self.compute_timeout(tool_name, arguments)
+        if tool_name == "community" or route in BRIDGE_COMMUNITY_ROUTES:
+            if tool_name not in ("community", "") or route not in BRIDGE_COMMUNITY_ROUTES:
+                err_payload = {
+                    "_declared_sources": [],
+                    "_sources": [],
+                    "ok": False,
+                    "status": "invalid_arguments",
+                    "error_code": "invalid_arguments",
+                    "error": (
+                        f"Invalid community tool/route combination: tool='{tool_name}', route='{route}'."
+                    ),
+                    "data": None,
+                }
+                return self._make_tool_result_response(req_id, err_payload, is_error=True)
+            return await self._handle_community_call(
+                req_id, route, arguments, eff_timeout
+            )
         call_args = dict(arguments)
         if tool_name != "catalog":
             call_args["timeout"] = eff_timeout
@@ -2205,22 +3839,49 @@ class ResearchDataBridge:
                     payload = None
 
                 if isinstance(payload, dict):
-                    # Filter handoff routes from catalog() output and include market-regime
+                    # Filter handoff routes from catalog() output and include market-regime + community routes
                     if tool_name == "catalog" and isinstance(payload.get("routes"), list):
-                        payload["routes"] = [
-                            r
-                            for r in payload["routes"]
-                            if isinstance(r, dict) and r.get("id") not in handoff
-                        ]
-                        cat_filter = str(arguments.get("category") or "").strip().lower()
-                        if not cat_filter or cat_filter == "macro":
+                        req_category = str(arguments.get("category") or "").strip().lower()
+                        include_community = not req_category or req_category == "community"
+                        include_macro = not req_category or req_category == "macro"
+                        kept_routes: list[dict[str, Any]] = []
+                        seen_comm: set[str] = set()
+                        for r in payload["routes"]:
+                            if not isinstance(r, dict):
+                                continue
+                            rid = str(r.get("id") or "").strip()
+                            if not rid or rid in handoff:
+                                continue
+                            if rid in COMMUNITY_CATALOG_ROUTE_SPECS:
+                                if not include_community:
+                                    continue
+                                seen_comm.add(rid)
+                                merged_r = dict(r)
+                                merged_r.update(
+                                    json.loads(
+                                        json.dumps(COMMUNITY_CATALOG_ROUTE_SPECS[rid])
+                                    )
+                                )
+                                kept_routes.append(merged_r)
+                            else:
+                                kept_routes.append(r)
+                        if include_macro:
                             existing_ids = {
                                 str(r.get("id") or "")
-                                for r in payload["routes"]
+                                for r in kept_routes
                                 if isinstance(r, dict)
                             }
                             if "market-regime" not in existing_ids:
-                                payload["routes"].append(dict(MARKET_REGIME_CATALOG_ENTRY))
+                                kept_routes.append(dict(MARKET_REGIME_CATALOG_ENTRY))
+                        if include_community:
+                            for comm_id in ("xueqiu", "employee", "last30days"):
+                                if comm_id not in seen_comm and comm_id not in handoff:
+                                    kept_routes.append(
+                                        json.loads(
+                                            json.dumps(COMMUNITY_CATALOG_ROUTE_SPECS[comm_id])
+                                        )
+                                    )
+                        payload["routes"] = kept_routes
                         payload["route_count"] = len(payload["routes"])
 
                     declared = source_identity.declare(tool_name, arguments, payload)

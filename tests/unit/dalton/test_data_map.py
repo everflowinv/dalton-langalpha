@@ -28,12 +28,9 @@ FIXED_HANDOFF_ROUTES: frozenset[str] = frozenset(
         "web-news",
         "web-page",
         "filings",
-        "last30days",
         "agent-reach",
         "x-timeline",
         "x-search",
-        "xueqiu",
-        "employee",
     }
 )
 
@@ -53,11 +50,13 @@ def _sample_catalog_routes() -> list[dict[str, Any]]:
         {"id": "cn-hk", "category": "finance", "title": "港A股财务公告", "rules": ["operation=ask|filings"]},
         {"id": "fred", "category": "macro", "title": "FRED宏观", "rules": ["按series查"]},
         {"id": "treasury", "category": "macro", "title": "美债与发债", "rules": ["财政部官方"]},
+        {"id": "xueqiu", "category": "community", "title": "雪球讨论", "kind": "skill"},
+        {"id": "employee", "category": "community", "title": "员工评论", "kind": "skill"},
+        {"id": "last30days", "category": "community", "title": "跨平台社区情绪", "kind": "skill"},
         # Undocumented route present in catalog but not in sources.yaml:
         {"id": "new-alt-route", "category": "research", "title": "实验研究源", "rules": ["按ticker查询"]},
         # Filtered routes that handoff_routes excludes:
-        {"id": "xueqiu", "category": "community", "title": "雪球"},
-        {"id": "employee", "category": "community", "title": "员工评论"},
+        {"id": "agent-reach", "category": "community", "title": "Agent Reach", "kind": "skill"},
         {"id": "web-news", "category": "news", "title": "网页新闻", "kind": "agent_tool"},
     ]
 
@@ -82,6 +81,14 @@ def _sample_health_map() -> dict[str, dict[str, Any]]:
         "cn-hk": {"status": "available", "latency_ms": 175, "latest_date": "2026-10-22"},
         "fred": {"status": "available", "latency_ms": 60, "latest_date": "2026-10-01"},
         "treasury": {"status": "available", "latency_ms": 70, "latest_date": "2026-10-21"},
+        "xueqiu": {"status": "available", "latency_ms": 310, "latest_date": "2026-10-22"},
+        "employee": {"status": "available", "latency_ms": 480, "latest_date": "2026-10-20"},
+        "last30days": {
+            "status": "unprobed",
+            "latency_ms": 0,
+            "error_type": "成本高跳过探测",
+            "detail": {"reason": "成本高跳过探测"},
+        },
     }
 
 
@@ -122,8 +129,10 @@ def test_merge_catalog_routes_filters_handoff_and_marks_undocumented() -> None:
     )
     ids = [r["id"] for r in merged]
 
-    assert "xueqiu" not in ids
-    assert "employee" not in ids
+    assert "xueqiu" in ids
+    assert "employee" in ids
+    assert "last30days" in ids
+    assert "agent-reach" not in ids
     assert "web-news" not in ids
     assert "cn-hk" in ids
     assert "tmtb" in ids
@@ -152,8 +161,13 @@ def test_render_data_map_markdown_contents_date_free_title_and_search_api() -> N
     assert "下结论前先对照地图" in md
     assert "`tmtb`[research/TMT总结|可用]" in md
     assert "`guidepoint`[research/专家访谈|不可用(DesktopLoginRequired)]" in md
+    assert "`xueqiu`[community/雪球讨论|可用]" in md
+    assert "`employee`[community/员工评论|可用]" in md
+    assert "`last30days`[community/跨平台社区情绪|未体检(成本高跳过探测)]" in md
     assert "`company_options_screener`(公司与期权选股|未体检|" in md
     assert "`new-alt-route`[research/实验研究源|未体检]:未写说明" in md
+    assert "雪球(xueqiu):handoff过滤" not in md
+    assert "员工评论(employee/Glassdoor/Blind):handoff过滤" not in md
 
     # 3. Direct tools: no get_market_movers; x_search present when search_api=="openclaw"
     assert "get_market_movers" not in md
@@ -345,7 +359,10 @@ def test_resolve_endpoint_and_cn_hk_probe_spec(
     url, token, handoff = health_mod.resolve_researchdata_endpoint_and_token()
     assert url == "http://127.0.0.1:8960/mcp/tok-abc"
     assert token == "tok-abc"
-    assert "xueqiu" in handoff
+    assert "agent-reach" in handoff
+    assert "xueqiu" not in handoff
+    assert "employee" not in handoff
+    assert "last30days" not in handoff
 
     tool_name, args = health_mod.build_route_probe_spec("cn-hk", "finance")
     assert tool_name == "finance"
@@ -353,6 +370,14 @@ def test_resolve_endpoint_and_cn_hk_probe_spec(
     assert args["operation"] == "filings"
     assert args["ticker"] == "300750"
     assert args["end"] <= map_builder.today_cache_date().isoformat()
+
+    xq_tool, xq_args = health_mod.build_route_probe_spec("xueqiu", "community")
+    assert xq_tool == "community"
+    assert xq_args == {"route": "xueqiu", "operation": "posts", "ticker": "00700", "pages": 1}
+
+    emp_tool, emp_args = health_mod.build_route_probe_spec("employee", "community")
+    assert emp_tool == "community"
+    assert emp_args == {"route": "employee", "operation": "blind", "company": "NVIDIA", "pages": 1}
 
 
 @pytest.mark.asyncio
@@ -538,10 +563,29 @@ async def test_health_check_isolation_separate_backends_and_dedicated_lock(
         if tool_name == "catalog":
             return {"ok": True, "routes": _sample_catalog_routes()}
         rid = str(arguments.get("route") or "")
+        if rid == "last30days":
+            raise AssertionError("last30days must not execute a real probe")
         if rid == "guidepoint":
             raise asyncio.TimeoutError("timed out")
         if rid == "alphaengine":
             raise RuntimeError("Bearer sk-secret999999999999 failed")
+        if rid == "xueqiu":
+            return {
+                "ok": True,
+                "status": "ok",
+                "data": [{"id": "101", "created_at": "2026-10-22 10:00", "url": "https://xueqiu.com/1/101"}],
+            }
+        if rid == "employee":
+            return {
+                "ok": True,
+                "status": "ok",
+                "data": {
+                    "ok": True,
+                    "source": "blind",
+                    "count": 1,
+                    "reviews": [{"id": "r1", "created_at": "2026-10-20"}],
+                },
+            }
         return {"ok": True, "date": "2026-10-21", "route": rid}
 
     mock_bridge_caller = create_autospec(health_mod.default_bridge_rpc_call, side_effect=_fake_bridge_rpc)
@@ -606,6 +650,12 @@ async def test_health_check_isolation_separate_backends_and_dedicated_lock(
     assert by_id["sec_filings"]["latest_date"] == "2026-10-18"
     assert by_id["tmtb"]["status"] == "available"
     assert by_id["tmtb"]["latest_date"] == "2026-10-21"
+    assert by_id["xueqiu"]["status"] == "available"
+    assert by_id["xueqiu"]["latest_date"] == "2026-10-22"
+    assert by_id["employee"]["status"] == "available"
+    assert by_id["employee"]["latest_date"] == "2026-10-20"
+    assert by_id["last30days"]["status"] == "unprobed"
+    assert "成本高跳过探测" in str(by_id["last30days"]["detail"]["reason"])
 
     assert by_id["guidepoint"]["status"] == "unavailable"
     assert by_id["guidepoint"]["error_type"] == "TimeoutError"
