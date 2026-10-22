@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import date
 from typing import Any
 
@@ -12,6 +14,88 @@ from psycopg.types.json import Jsonb
 from src.server.database.pool import get_db_connection
 
 logger = logging.getLogger(__name__)
+
+ARCHIVE_ADVISORY_LOCK_KEY = "dalton_conversation_archive"
+DEFAULT_ABANDONED_RUN_ERROR_TEXT = (
+    "abandoned: previous archive run left status='running' when new run acquired advisory lock"
+)
+
+
+@asynccontextmanager
+async def transaction_scope(conn: Any = None) -> AsyncIterator[Any]:
+    """Acquire a DB connection (if `conn` is None) and run the body inside a single transaction."""
+    async with get_db_connection(conn) as db_conn:
+        async with db_conn.transaction():
+            yield db_conn
+
+
+async def try_acquire_archive_run_lock(
+    conn: Any = None,
+    *,
+    lock_key: str = ARCHIVE_ADVISORY_LOCK_KEY,
+) -> bool:
+    """Acquire a Postgres session-level advisory lock for the archive pipeline (`pg_try_advisory_lock(hashtext(%s))`)."""
+    sql = "SELECT pg_try_advisory_lock(hashtext(%s)) AS locked"
+    async with get_db_connection(conn) as db_conn:
+        async with db_conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(sql, (str(lock_key),))
+            row = await cur.fetchone()
+            if isinstance(row, dict):
+                return bool(row.get("locked"))
+            if isinstance(row, (tuple, list)) and row:
+                return bool(row[0])
+            return False
+
+
+async def release_archive_run_lock(
+    conn: Any = None,
+    *,
+    lock_key: str = ARCHIVE_ADVISORY_LOCK_KEY,
+) -> bool:
+    """Release the Postgres session-level advisory lock acquired by `try_acquire_archive_run_lock`."""
+    sql = "SELECT pg_advisory_unlock(hashtext(%s)) AS unlocked"
+    async with get_db_connection(conn) as db_conn:
+        async with db_conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(sql, (str(lock_key),))
+            row = await cur.fetchone()
+            if isinstance(row, dict):
+                return bool(row.get("unlocked"))
+            if isinstance(row, (tuple, list)) and row:
+                return bool(row[0])
+            return False
+
+
+async def mark_stale_running_runs_abandoned(
+    *,
+    error_text: str = DEFAULT_ABANDONED_RUN_ERROR_TEXT,
+    exclude_run_id: str | None = None,
+    conn: Any = None,
+) -> int:
+    """Mark leftover `status = 'running'` rows in `dalton_conversation_runs` as `abandoned` after acquiring the run lock."""
+    if exclude_run_id:
+        sql = """
+            UPDATE dalton_conversation_runs
+            SET status       = 'abandoned',
+                error_text   = COALESCE(NULLIF(error_text, ''), %s),
+                completed_at = COALESCE(completed_at, NOW())
+            WHERE status = 'running'
+              AND run_id <> %s
+        """
+        params: tuple[Any, ...] = (str(error_text), str(exclude_run_id))
+    else:
+        sql = """
+            UPDATE dalton_conversation_runs
+            SET status       = 'abandoned',
+                error_text   = COALESCE(NULLIF(error_text, ''), %s),
+                completed_at = COALESCE(completed_at, NOW())
+            WHERE status = 'running'
+        """
+        params = (str(error_text),)
+    async with get_db_connection(conn) as db_conn:
+        async with db_conn.transaction():
+            async with db_conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(sql, params)
+                return int(cur.rowcount or 0)
 
 _CARD_SELECT_COLS = """
     card_id, source_type, agent, session_id, session_key, generation, channel, chat_type,
@@ -553,6 +637,69 @@ async def insert_run_start(
                 )
                 row = await cur.fetchone()
                 return dict(row) if row else {"run_id": run_id, "status": "running"}
+
+
+async def update_run_progress(
+    run_id: str,
+    *,
+    embedding_model: str | None = None,
+    events_read: int = 0,
+    segments_processed: int = 0,
+    cards_extracted: int = 0,
+    cards_inserted: int = 0,
+    cards_deduped: int = 0,
+    cards_superseded: int = 0,
+    quotes_rejected: int = 0,
+    segments_discarded: int = 0,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    total_tokens: int = 0,
+    stats: dict[str, Any] | None = None,
+    conn: Any = None,
+) -> dict[str, Any] | None:
+    """Update live progress counters on an in-flight `dalton_conversation_runs` row."""
+    sql = """
+        UPDATE dalton_conversation_runs
+        SET embedding_model    = COALESCE(%s, embedding_model),
+            events_read        = %s,
+            segments_processed = %s,
+            cards_extracted    = %s,
+            cards_inserted     = %s,
+            cards_deduped      = %s,
+            cards_superseded   = %s,
+            quotes_rejected    = %s,
+            segments_discarded = %s,
+            input_tokens       = %s,
+            output_tokens      = %s,
+            total_tokens       = %s,
+            stats              = %s
+        WHERE run_id = %s
+        RETURNING *
+    """
+    async with get_db_connection(conn) as db_conn:
+        async with db_conn.transaction():
+            async with db_conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    sql,
+                    (
+                        embedding_model,
+                        int(events_read),
+                        int(segments_processed),
+                        int(cards_extracted),
+                        int(cards_inserted),
+                        int(cards_deduped),
+                        int(cards_superseded),
+                        int(quotes_rejected),
+                        int(segments_discarded),
+                        int(input_tokens),
+                        int(output_tokens),
+                        int(total_tokens),
+                        Jsonb(stats or {}),
+                        run_id,
+                    ),
+                )
+                row = await cur.fetchone()
+                return dict(row) if row else None
 
 
 async def update_run_finish(

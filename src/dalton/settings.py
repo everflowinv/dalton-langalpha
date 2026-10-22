@@ -124,6 +124,7 @@ class DaltonConversationsConfig(BaseModel):
     embedding_model_preferred: str = "gemini-embedding-2-preview"
     embedding_dimensions: int = Field(default=3072, gt=0)
     hourly_token_budget: int = Field(default=120_000, gt=0)
+    extract_concurrency: int = Field(default=1, ge=1)
     default_backfill_days: int = Field(default=14, gt=0)
     max_segment_gap_minutes: int = Field(default=30, gt=0)
     max_segment_chars: int = Field(default=6000, gt=0)
