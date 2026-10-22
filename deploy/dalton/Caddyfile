@@ -1,0 +1,96 @@
+# Dalton public edge gateway (Tailscale Funnel :8443 -> 127.0.0.1:8088 -> Caddy)
+# TLS terminates at Tailscale Funnel; Caddy serves plain HTTP on 127.0.0.1:8088.
+{
+	auto_https off
+	admin off
+}
+
+:8088 {
+	root * /srv
+	encode zstd gzip
+
+	# Redact ?token=<jwt> in access logs (e.g. /ws/v1/market-data/aggregates/* handshake)
+	# while preserving non-sensitive query parameters for troubleshooting.
+	log {
+		output stdout
+		format filter {
+			wrap json
+			fields {
+				request>uri query {
+					replace token REDACTED
+				}
+			}
+		}
+	}
+
+	# Baseline security response headers.
+	# Strict-Transport-Security is intentionally omitted because TLS terminates at Tailscale Funnel.
+	# Content-Security-Policy is deferred to a follow-up item (see docs/dalton/dev-guide/PUBLIC-DEPLOY.md).
+	header {
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		X-Frame-Options "SAMEORIGIN"
+		-Server
+	}
+
+	# 1. Reverse proxy only /api/* and /ws/* to backend:8000.
+	# Strip external X-Service-Token and X-User-Id headers so the internal service-token
+	# channel cannot be invoked from the public edge.
+	# flush_interval -1 disables response buffering for SSE streams; WebSocket upgrades are native.
+	@backend_routes path /api/* /ws/*
+	handle @backend_routes {
+		request_header -X-Service-Token
+		request_header -X-User-Id
+		reverse_proxy backend:8000 {
+			header_up -X-Service-Token
+			header_up -X-User-Id
+			flush_interval -1
+		}
+	}
+
+	# 2. Build version manifest (/version.json): never cached, never SPA-fallback (must 404 when absent).
+	@version_manifest {
+		method GET HEAD
+		path /version.json
+	}
+	handle @version_manifest {
+		header Cache-Control "no-cache, no-store, must-revalidate"
+		file_server
+	}
+
+	# 3. Hashed build assets (/assets/*): long-cached when present, real 404 when absent (no SPA fallback).
+	@static_assets {
+		method GET HEAD
+		path /assets/*
+	}
+	handle @static_assets {
+		@asset_exists file
+		header @asset_exists Cache-Control "public, max-age=31536000, immutable"
+		file_server
+	}
+
+	# 4. Reject backend-only root endpoints outside /api/* and /ws/* with 404 instead of SPA fallback.
+	@blocked_paths path /health /health/* /docs /docs/* /redoc /redoc/* /openapi.json /metrics /metrics/*
+	handle @blocked_paths {
+		respond 404
+	}
+
+	# 5. SPA static files & index.html fallback (GET/HEAD only; index.html is never cached).
+	@spa_read {
+		method GET HEAD
+	}
+	handle @spa_read {
+		route {
+			rewrite / /index.html
+			try_files {path} /index.html
+			@index_doc path /index.html
+			header @index_doc Cache-Control "no-cache, no-store, must-revalidate"
+			file_server
+		}
+	}
+
+	# 6. All other paths / methods outside /api/*, /ws/*, and static GET/HEAD return 404.
+	handle {
+		respond 404
+	}
+}

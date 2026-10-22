@@ -4,6 +4,7 @@ src/dalton/
 workflows/
 scripts/dalton/
 config/dalton/
+deploy/dalton/
 docs/dalton/
 integrations/openclaw/
 tests/unit/dalton/
