@@ -9,6 +9,9 @@ import { useTranslation } from 'react-i18next';
 // DALTON-HOOK(native-oauth-ui): P0N.3 Antigravity & Meta Muse OAuth rows
 import { AntigravityAccountRow } from './dalton/oauth/AntigravityAccountRow';
 import { MuseAccountRow } from './dalton/oauth/MuseAccountRow';
+// DALTON-HOOK(team-credentials): team-shared credentials hint & PM disconnect guard
+import { isDaltonAuth } from '@/config/daltonAuth';
+import { TEAM_SHARED_CREDENTIALS_HINT, useTeamCredentials } from '@/hooks/useTeamCredentials'; // DALTON-HOOK(team-credentials)
 
 interface CodexDeviceCode {
   user_code: string;
@@ -30,6 +33,9 @@ interface OAuthStatus {
 export function ConnectedAccounts() {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
+  // DALTON-HOOK(team-credentials): team-shared credentials state
+  const { isShared: isTeamShared, canDisconnect } = useTeamCredentials();
+  const allowDisconnect = !isDaltonAuth || canDisconnect;
 
   // Connected Accounts (Codex OAuth — Device Code Flow)
   const [codexOAuthStatus, setCodexOAuthStatus] = useState<OAuthStatus>({ connected: false });
@@ -240,6 +246,12 @@ export function ConnectedAccounts() {
         <p className="text-xs mb-3" style={{ color: 'var(--color-text-tertiary)' }}>
           {t('settings.connectedAccountsDesc', 'Connect external accounts to use models through your existing subscriptions.')}
         </p>
+        {/* DALTON-HOOK(team-credentials): team-shared credentials hint */}
+        {isDaltonAuth && isTeamShared && (
+          <p className="text-xs mb-3" style={{ color: 'var(--color-text-tertiary)' }}>
+            {TEAM_SHARED_CREDENTIALS_HINT}
+          </p>
+        )}
 
         {/* ChatGPT Codex card */}
         <div
@@ -280,17 +292,20 @@ export function ConnectedAccounts() {
             </div>
             {/* The description wraps instead: a squeezed CJK label breaks between any two characters. */}
             <div className="shrink-0">
+              {/* DALTON-HOOK(team-credentials): hide disconnect button for non-PM team members */}
               {codexOAuthStatus.connected ? (
-                <button
-                  type="button"
-                  onClick={handleCodexDisconnect}
-                  disabled={isDisconnectingCodex}
-                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium transition-colors"
-                  style={{ color: 'var(--color-loss)', backgroundColor: 'transparent', border: '1px solid var(--color-loss)' }}
-                >
-                  <Unlink className="h-3 w-3" />
-                  {isDisconnectingCodex ? t('common.loading', 'Loading...') : t('settings.disconnect', 'Disconnect')}
-                </button>
+                allowDisconnect ? (
+                  <button
+                    type="button"
+                    onClick={handleCodexDisconnect}
+                    disabled={isDisconnectingCodex}
+                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium transition-colors"
+                    style={{ color: 'var(--color-loss)', backgroundColor: 'transparent', border: '1px solid var(--color-loss)' }}
+                  >
+                    <Unlink className="h-3 w-3" />
+                    {isDisconnectingCodex ? t('common.loading', 'Loading...') : t('settings.disconnect', 'Disconnect')}
+                  </button>
+                ) : null
               ) : !codexDeviceCode ? (
                 <button
                   type="button"
@@ -395,17 +410,20 @@ export function ConnectedAccounts() {
               </div>
             </div>
             <div className="shrink-0">
+              {/* DALTON-HOOK(team-credentials): hide disconnect button for non-PM team members */}
               {claudeOAuthStatus.connected ? (
-                <button
-                  type="button"
-                  onClick={handleClaudeDisconnect}
-                  disabled={isDisconnectingClaude}
-                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium transition-colors"
-                  style={{ color: 'var(--color-loss)', backgroundColor: 'transparent', border: '1px solid var(--color-loss)' }}
-                >
-                  <Unlink className="h-3 w-3" />
-                  {isDisconnectingClaude ? t('common.loading', 'Loading...') : t('settings.disconnect', 'Disconnect')}
-                </button>
+                allowDisconnect ? (
+                  <button
+                    type="button"
+                    onClick={handleClaudeDisconnect}
+                    disabled={isDisconnectingClaude}
+                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium transition-colors"
+                    style={{ color: 'var(--color-loss)', backgroundColor: 'transparent', border: '1px solid var(--color-loss)' }}
+                  >
+                    <Unlink className="h-3 w-3" />
+                    {isDisconnectingClaude ? t('common.loading', 'Loading...') : t('settings.disconnect', 'Disconnect')}
+                  </button>
+                ) : null
               ) : !claudeAuthorizeUrl ? (
                 <button
                   type="button"
@@ -478,8 +496,9 @@ export function ConnectedAccounts() {
         </div>
 
         {/* DALTON-HOOK(native-oauth-ui): P0N.3 Antigravity & Meta Muse OAuth rows */}
-        <AntigravityAccountRow onError={setAccountsError} />
-        <MuseAccountRow onError={setAccountsError} />
+        {/* DALTON-HOOK(team-credentials): pass allowDisconnect to Antigravity & Muse rows */}
+        <AntigravityAccountRow onError={setAccountsError} canDisconnect={allowDisconnect} />
+        <MuseAccountRow onError={setAccountsError} canDisconnect={allowDisconnect} />
 
         {accountsError && (
           <div className="p-3 rounded-md mt-2" style={{ backgroundColor: 'var(--color-loss-soft)', border: '1px solid var(--color-border-loss)' }}>

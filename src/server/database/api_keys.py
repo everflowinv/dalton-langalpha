@@ -15,6 +15,7 @@ from psycopg.rows import dict_row
 
 from src.server.database.pool import get_db_connection
 from src.server.database.encryption import get_encryption_key as _get_encryption_key
+from src.dalton.credentials import credential_user_id  # DALTON-HOOK(team-credentials): resolve shared team credential holder
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +27,7 @@ async def get_user_api_keys(user_id: str) -> Dict[str, Any]:
     Returns:
         { byok_enabled: bool, keys: { provider: api_key_plaintext, ... } }
     """
+    user_id = credential_user_id(user_id)  # DALTON-HOOK(team-credentials): read BYOK keys from team credential holder
     enc_key = _get_encryption_key()
     async with get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
@@ -57,6 +59,7 @@ async def set_byok_enabled(user_id: str, enabled: bool) -> bool:
     Returns:
         The new byok_enabled value.
     """
+    actor_user_id, user_id = user_id, credential_user_id(user_id)  # DALTON-HOOK(team-credentials): write BYOK toggle on team credential holder
     async with get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
@@ -64,7 +67,7 @@ async def set_byok_enabled(user_id: str, enabled: bool) -> bool:
                 (enabled, user_id),
             )
             result = await cur.fetchone()
-            logger.info(f"[api_keys_db] set_byok_enabled user_id={user_id} enabled={enabled}")
+            logger.info(f"[api_keys_db] set_byok_enabled user_id={actor_user_id} credential_user_id={user_id} enabled={enabled}")  # DALTON-HOOK(team-credentials)
             return bool(result["byok_enabled"]) if result else False
 
 
@@ -74,6 +77,7 @@ async def upsert_api_key(
     """
     Insert or update a single provider key (encrypted) and optional base_url.
     """
+    actor_user_id, user_id = user_id, credential_user_id(user_id)  # DALTON-HOOK(team-credentials): write API key to team credential holder
     enc_key = _get_encryption_key()
     async with get_db_connection() as conn:
         async with conn.cursor() as cur:
@@ -88,26 +92,28 @@ async def upsert_api_key(
                 """,
                 (user_id, provider, api_key, enc_key, base_url),
             )
-            logger.info(f"[api_keys_db] upsert_key user_id={user_id} provider={provider}")
+            logger.info(f"[api_keys_db] upsert_key user_id={actor_user_id} credential_user_id={user_id} provider={provider}")  # DALTON-HOOK(team-credentials)
 
 
 async def delete_api_key(user_id: str, provider: str) -> None:
     """
     Remove one provider key.
     """
+    actor_user_id, user_id = user_id, credential_user_id(user_id)  # DALTON-HOOK(team-credentials): delete API key from team credential holder
     async with get_db_connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(
                 "DELETE FROM user_api_keys WHERE user_id = %s AND provider = %s",
                 (user_id, provider),
             )
-            logger.info(f"[api_keys_db] delete_key user_id={user_id} provider={provider}")
+            logger.info(f"[api_keys_db] delete_key user_id={actor_user_id} credential_user_id={user_id} provider={provider}")  # DALTON-HOOK(team-credentials)
 
 
 async def get_key_for_provider(user_id: str, provider: str) -> Optional[str]:
     """
     Quick lookup: return the decrypted API key for a specific provider, or None.
     """
+    user_id = credential_user_id(user_id)  # DALTON-HOOK(team-credentials): read API key from team credential holder
     enc_key = _get_encryption_key()
     async with get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
@@ -130,6 +136,7 @@ async def is_byok_active(user_id: str) -> bool:
     a correlated subquery on every chat message.  The cache is explicitly
     invalidated by ``invalidate_byok_cache`` whenever keys are written/deleted.
     """
+    user_id = credential_user_id(user_id)  # DALTON-HOOK(team-credentials): check & cache BYOK by team credential holder
     from src.utils.cache.redis_cache import get_cache_client
 
     cache_key = f"byok_active:{user_id}"
@@ -169,6 +176,7 @@ async def is_byok_active(user_id: str) -> bool:
 
 async def invalidate_byok_cache(user_id: str) -> None:
     """Delete the cached ``is_byok_active`` result so the next call hits the DB."""
+    user_id = credential_user_id(user_id)  # DALTON-HOOK(team-credentials): invalidate BYOK cache for team credential holder
     from src.utils.cache.redis_cache import get_cache_client
 
     cache = get_cache_client()
@@ -181,6 +189,7 @@ async def invalidate_byok_cache(user_id: str) -> None:
 
 async def update_base_url(user_id: str, provider: str, base_url: str | None) -> None:
     """Update base_url on an existing API key row (no-op if row doesn't exist)."""
+    actor_user_id, user_id = user_id, credential_user_id(user_id)  # DALTON-HOOK(team-credentials): update base_url on team credential holder
     async with get_db_connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(
@@ -190,11 +199,11 @@ async def update_base_url(user_id: str, provider: str, base_url: str | None) -> 
             )
             if cur.rowcount == 0:
                 logger.warning(
-                    f"[api_keys_db] update_base_url no-op: no key row for user_id={user_id} provider={provider}"
+                    f"[api_keys_db] update_base_url no-op: no key row for user_id={actor_user_id} credential_user_id={user_id} provider={provider}"  # DALTON-HOOK(team-credentials)
                 )
             else:
                 logger.info(
-                    f"[api_keys_db] update_base_url user_id={user_id} provider={provider}"
+                    f"[api_keys_db] update_base_url user_id={actor_user_id} credential_user_id={user_id} provider={provider}"  # DALTON-HOOK(team-credentials)
                 )
 
 
@@ -204,6 +213,7 @@ async def get_base_url_for_provider(user_id: str, provider: str) -> str | None:
     Single-row indexed lookup — no PGP decryption, no join.  Used by
     ``list_provider_models`` which only needs the URL, not the key.
     """
+    user_id = credential_user_id(user_id)  # DALTON-HOOK(team-credentials): read base_url from team credential holder
     async with get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
@@ -224,6 +234,7 @@ async def get_byok_config_for_provider(
     Returns {"api_key": str, "base_url": str | None} otherwise.
     Saves a round-trip vs calling is_byok_active() + get_key_for_provider() separately.
     """
+    user_id = credential_user_id(user_id)  # DALTON-HOOK(team-credentials): read BYOK config from team credential holder
     enc_key = _get_encryption_key()
     async with get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
@@ -257,6 +268,7 @@ async def get_byok_configs_for_providers(
     """
     if not providers:
         return {}
+    user_id = credential_user_id(user_id)  # DALTON-HOOK(team-credentials): read batch BYOK configs from team credential holder
     enc_key = _get_encryption_key()
     async with get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:

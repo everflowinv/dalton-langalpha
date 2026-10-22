@@ -9,12 +9,17 @@ import { useUpdateApiKeys } from '@/hooks/useApiKeys';
 import { queryKeys } from '@/lib/queryKeys';
 import { useTranslation } from 'react-i18next';
 import { getApiFormatKey, testApiKey, type LocationState } from './shared';
+// DALTON-HOOK(team-credentials): team-shared credentials hint
+import { isDaltonAuth } from '@/config/daltonAuth';
+import { TEAM_SHARED_CREDENTIALS_HINT, useTeamCredentials } from '@/hooks/useTeamCredentials'; // DALTON-HOOK(team-credentials)
 
 export function ApiKeyConnect({ state }: { state: LocationState }) {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const updateApiKeys = useUpdateApiKeys();
   const { t } = useTranslation();
+  // DALTON-HOOK(team-credentials): team-shared credentials status
+  const { isShared: isTeamShared } = useTeamCredentials();
 
   const method = state.method ?? 'api_key';
   const provider = state.provider ?? '';
@@ -148,6 +153,12 @@ export function ApiKeyConnect({ state }: { state: LocationState }) {
               ? t('setup.codingPlanDesc')
               : t('setup.apiKeyInputDesc')}
         </p>
+        {/* DALTON-HOOK(team-credentials): team-shared credentials hint */}
+        {isDaltonAuth && isTeamShared && (
+          <p className="text-xs mt-1" style={{ color: 'var(--color-text-tertiary)' }}>
+            {TEAM_SHARED_CREDENTIALS_HINT}
+          </p>
+        )}
       </div>
 
       {/* Region toggle — shown when provider has region variants */}

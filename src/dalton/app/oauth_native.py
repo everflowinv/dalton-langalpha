@@ -149,6 +149,8 @@ async def muse_status(user_id: CurrentUserId):
 @router.delete("/muse")
 async def muse_disconnect(user_id: CurrentUserId):
     """Delete stored Muse OAuth tokens."""
+    from src.dalton.credentials import require_credential_admin
+    require_credential_admin(user_id)
     await delete_oauth_tokens(user_id, MUSE_PROVIDER)
     try:
         await invalidate_oauth_active_cache(user_id)
@@ -218,6 +220,8 @@ async def antigravity_status(user_id: CurrentUserId):
 @router.delete("/antigravity")
 async def antigravity_disconnect(user_id: CurrentUserId):
     """Delete stored Antigravity OAuth tokens."""
+    from src.dalton.credentials import require_credential_admin
+    require_credential_admin(user_id)
     await delete_oauth_tokens(user_id, ANTIGRAVITY_PROVIDER)
     try:
         await invalidate_oauth_active_cache(user_id)

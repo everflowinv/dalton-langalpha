@@ -187,6 +187,8 @@ async def codex_status(user_id: CurrentUserId):
 @router.delete("/codex")
 async def codex_disconnect(user_id: CurrentUserId):
     """Delete stored OAuth tokens."""
+    from src.dalton.credentials import require_credential_admin  # DALTON-HOOK(team-credentials): only PM users may disconnect shared OAuth
+    require_credential_admin(user_id)
     await delete_oauth_tokens(user_id, CODEX_PROVIDER)
     try:
         await invalidate_oauth_active_cache(user_id)
@@ -318,6 +320,8 @@ async def claude_status(user_id: CurrentUserId):
 @router.delete("/claude")
 async def claude_disconnect(user_id: CurrentUserId):
     """Delete stored Claude OAuth tokens."""
+    from src.dalton.credentials import require_credential_admin  # DALTON-HOOK(team-credentials): only PM users may disconnect shared OAuth
+    require_credential_admin(user_id)
     await delete_oauth_tokens(user_id, CLAUDE_PROVIDER)
     try:
         await invalidate_oauth_active_cache(user_id)

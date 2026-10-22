@@ -470,7 +470,9 @@ async def check_login_complete(user_id: str) -> bool:
 
 async def get_valid_token(user_id: str) -> dict | None:
     """Get a valid access token, refreshing if needed."""
-    tokens = await get_oauth_tokens(user_id, ANTIGRAVITY_PROVIDER)
+    from src.dalton.credentials import credential_user_id  # DALTON-HOOK(team-credentials): key refresh lock & tokens by team credential holder
+    cred_user_id = credential_user_id(user_id)
+    tokens = await get_oauth_tokens(cred_user_id, ANTIGRAVITY_PROVIDER)
     if not tokens:
         return None
 
@@ -482,11 +484,11 @@ async def get_valid_token(user_id: str) -> dict | None:
     from src.utils.cache.redis_cache import get_cache_client
 
     cache = get_cache_client()
-    lock_key = f"oauth:refresh:{user_id}:{ANTIGRAVITY_PROVIDER}"
+    lock_key = f"oauth:refresh:{cred_user_id}:{ANTIGRAVITY_PROVIDER}"
     lock_token = secrets.token_hex(16)
     acquired = await cache.acquire_lock(lock_key, lock_token, REFRESH_LOCK_TTL_MS)
     if acquired is False:
-        tokens = await await_refreshed_tokens(user_id, ANTIGRAVITY_PROVIDER)
+        tokens = await await_refreshed_tokens(cred_user_id, ANTIGRAVITY_PROVIDER)
         if tokens:
             return {"access_token": tokens["access_token"], "plan_type": tokens.get("plan_type")}
         return None
@@ -508,7 +510,7 @@ async def get_valid_token(user_id: str) -> dict | None:
         )
 
         try:
-            await invalidate_oauth_active_cache(user_id)
+            await invalidate_oauth_active_cache(cred_user_id)
         except Exception as exc:
             logger.debug("[antigravity_oauth] invalidate_oauth_active_cache skipped: %s", type(exc).__name__)
 

@@ -24,6 +24,9 @@ vi.mock('@/pages/Dashboard/utils/api', () => ({
 }));
 // A signed-in user with no platform access and no provider yet: the one state
 // that offers the invitation code.
+vi.mock('@/contexts/AuthContext', () => ({ // DALTON-HOOK(team-credentials)
+  useAuth: () => ({ userId: 'u-1', logout: vi.fn() }), // DALTON-HOOK(team-credentials)
+})); // DALTON-HOOK(team-credentials)
 vi.mock('@/hooks/useUser', () => ({
   useUser: () => ({ user: { access_tier: -1 }, isLoading: false }),
 }));

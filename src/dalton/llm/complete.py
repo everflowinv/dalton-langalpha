@@ -34,6 +34,10 @@ from src.dalton.database.llm_journal import (
     is_journal_response_replayable,
     record_journal_replay,
 )
+from src.dalton.credentials import (  # DALTON-HOOK(team-credentials): record credential_user_id in journal usage while user_id stays caller
+    credential_user_id,
+    is_team_credential_sharing_enabled,
+)
 from src.dalton.database.provider_events import record_provider_event, sanitize_error_text
 from src.dalton.llm.overlay import load_dalton_meta, load_overlay_data
 from src.dalton.settings import get_dalton_settings
@@ -829,7 +833,9 @@ async def dalton_complete(
         else:
             out_obj, token_usage = raw_result, {}
 
-        usage_dict = token_usage if isinstance(token_usage, dict) else {}
+        usage_dict = dict(token_usage) if isinstance(token_usage, dict) else {}
+        if eff_user_id and is_team_credential_sharing_enabled():  # DALTON-HOOK(team-credentials): stamp credential holder into usage while billing/journal user_id stays caller
+            usage_dict.setdefault("credential_user_id", credential_user_id(eff_user_id))
         cash_dec, notional_dec = compute_call_costs(
             effective_model, billing_type, usage_dict
         )

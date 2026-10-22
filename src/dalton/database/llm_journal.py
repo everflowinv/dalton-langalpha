@@ -10,6 +10,10 @@ from typing import Any
 
 from psycopg.rows import dict_row
 
+from src.dalton.credentials import (  # DALTON-HOOK(team-credentials): stamp credential holder in journal usage while user_id stays caller
+    credential_user_id,
+    is_team_credential_sharing_enabled,
+)
 from src.dalton.database.provider_events import sanitize_error_text
 from src.server.database.pool import get_db_connection
 
@@ -210,29 +214,62 @@ async def claim_journal_invocation(
     - `'indeterminate'`: prior attempt crashed/timed out; do not resend unless `resend_indeterminate=True`
     - `'conflict'`: `invocation_id` exists with a mismatched `request_hash`
     """
+    # DALTON-HOOK(team-credentials): keep user_id as caller and stamp credential_user_id in usage JSONB only when sharing is enabled
+    sharing_enabled = is_team_credential_sharing_enabled()
+    initial_usage = (
+        {"credential_user_id": credential_user_id(str(user_id))}
+        if sharing_enabled and user_id
+        else None
+    )
+
     async def _do_claim(c: Any) -> tuple[str, dict[str, Any]]:
         async with c.cursor(row_factory=dict_row) as cur:
-            await cur.execute(
-                """
-                INSERT INTO dalton_llm_journal (
-                    invocation_id, user_id, scope_ref, purpose, model_key,
-                    provider, billing_type, request_hash, state, attempt, claimed_at
+            if initial_usage is not None:
+                initial_usage_json = json.dumps(initial_usage, ensure_ascii=False, default=str)
+                await cur.execute(
+                    """
+                    INSERT INTO dalton_llm_journal (
+                        invocation_id, user_id, scope_ref, purpose, model_key,
+                        provider, billing_type, request_hash, usage, state, attempt, claimed_at
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, 'pending', 1, NOW())
+                    ON CONFLICT (invocation_id) DO NOTHING
+                    RETURNING *
+                    """,
+                    (
+                        invocation_id,
+                        user_id,
+                        scope_ref,
+                        purpose,
+                        model_key,
+                        provider,
+                        billing_type,
+                        request_hash,
+                        initial_usage_json,
+                    ),
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'pending', 1, NOW())
-                ON CONFLICT (invocation_id) DO NOTHING
-                RETURNING *
-                """,
-                (
-                    invocation_id,
-                    user_id,
-                    scope_ref,
-                    purpose,
-                    model_key,
-                    provider,
-                    billing_type,
-                    request_hash,
-                ),
-            )
+            else:
+                await cur.execute(
+                    """
+                    INSERT INTO dalton_llm_journal (
+                        invocation_id, user_id, scope_ref, purpose, model_key,
+                        provider, billing_type, request_hash, state, attempt, claimed_at
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'pending', 1, NOW())
+                    ON CONFLICT (invocation_id) DO NOTHING
+                    RETURNING *
+                    """,
+                    (
+                        invocation_id,
+                        user_id,
+                        scope_ref,
+                        purpose,
+                        model_key,
+                        provider,
+                        billing_type,
+                        request_hash,
+                    ),
+                )
             inserted = await cur.fetchone()
             if inserted:
                 return "claimed", dict(inserted)
@@ -248,7 +285,7 @@ async def claim_journal_invocation(
             )
             existing_raw = await cur.fetchone()
             if not existing_raw:
-                return "claimed", {
+                fallback_row: dict[str, Any] = {
                     "invocation_id": invocation_id,
                     "user_id": user_id,
                     "scope_ref": scope_ref,
@@ -260,6 +297,9 @@ async def claim_journal_invocation(
                     "state": "pending",
                     "attempt": 1,
                 }
+                if initial_usage is not None:
+                    fallback_row["usage"] = initial_usage
+                return "claimed", fallback_row
 
             existing = dict(existing_raw)
             if existing.get("request_hash") and str(existing["request_hash"]) != str(request_hash):
@@ -345,15 +385,21 @@ async def complete_journal_done(
     )
     usage_json = json.dumps(usage or {}, ensure_ascii=False, default=str)
 
+    usage_clause = (
+        "COALESCE(usage, '{}'::jsonb) || %s::jsonb"
+        if is_team_credential_sharing_enabled()
+        else "%s::jsonb"
+    )
+
     async def _do_update(c: Any) -> dict[str, Any] | None:
         async with c.cursor(row_factory=dict_row) as cur:
             await cur.execute(
-                """
+                f"""
                 UPDATE dalton_llm_journal
                 SET state = 'done',
                     completed_at = NOW(),
                     response = %s::jsonb,
-                    usage = %s::jsonb,
+                    usage = {usage_clause},
                     cash_usd = %s,
                     notional_usd = %s,
                     provider = COALESCE(%s, provider),

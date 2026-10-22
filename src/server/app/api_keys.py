@@ -220,6 +220,18 @@ async def update_api_keys(body: UpdateApiKeysRequest, user_id: CurrentUserId):
     - byok_enabled: toggle the global switch
     - api_keys: { "openai": "sk-..." } to set, { "openai": null } to delete
     """
+    # DALTON-HOOK(team-credentials): validate all credential-admin permissions before any DB or cache writes
+    if (  # DALTON-HOOK(team-credentials)
+        body.byok_enabled is False  # DALTON-HOOK(team-credentials)
+        or any(not (v or "").strip() for v in (body.api_keys or {}).values())  # DALTON-HOOK(team-credentials)
+        or any(  # DALTON-HOOK(team-credentials)
+            not (body.api_keys and (body.api_keys.get(p) or "").strip())  # DALTON-HOOK(team-credentials)
+            for p in (body.base_urls or {})  # DALTON-HOOK(team-credentials)
+        )  # DALTON-HOOK(team-credentials)
+    ):  # DALTON-HOOK(team-credentials)
+        from src.dalton.credentials import require_credential_admin  # DALTON-HOOK(team-credentials)
+        require_credential_admin(user_id)  # DALTON-HOOK(team-credentials)
+
     # Toggle BYOK if requested
     if body.byok_enabled is not None:
         await set_byok_enabled(user_id, body.byok_enabled)
@@ -275,6 +287,8 @@ async def update_api_keys(body: UpdateApiKeysRequest, user_id: CurrentUserId):
 @router.delete("/api/v1/users/me/api-keys/{provider}")
 async def remove_api_key(provider: str, user_id: CurrentUserId):
     """Remove one provider's API key."""
+    from src.dalton.credentials import require_credential_admin  # DALTON-HOOK(team-credentials): only PM users may delete shared API keys
+    require_credential_admin(user_id)
     custom_providers = await _get_custom_providers(user_id)
     allowed = _get_allowed_providers(custom_providers)
     if provider not in allowed:
