@@ -10,6 +10,8 @@ import type { PreviewEntry } from './usePreviews';
 interface PreviewCrumbsProps {
   entry: PreviewEntry;
   onRefresh: () => void;
+  // DALTON-HOOK(team-sharing): disable refresh button in colleague mirror mode
+  refreshDisabled?: boolean;
   /** The owner's workspace; null on a read-only panel, which offers no link. */
   workspaceId?: string | null;
 }
@@ -20,7 +22,7 @@ interface PreviewCrumbsProps {
  * carries no chrome of its own — the tab's X is its close, and this row is
  * where everything else lives, so the panel keeps one header shape.
  */
-export function PreviewCrumbs({ entry, onRefresh, workspaceId = null }: PreviewCrumbsProps): React.ReactElement {
+export function PreviewCrumbs({ entry, onRefresh, refreshDisabled = false, workspaceId = null }: PreviewCrumbsProps): React.ReactElement {
   const { t } = useTranslation();
   const name = entry.title || t('filePanel.previewTab');
 
@@ -62,13 +64,14 @@ export function PreviewCrumbs({ entry, onRefresh, workspaceId = null }: PreviewC
             : <Link2 className="h-3.5 w-3.5" />}
         </button>
       )}
+      {/* DALTON-HOOK(team-sharing): disable preview refresh button in colleague mirror mode */}
       <button
         type="button"
-        onClick={onRefresh}
+        onClick={refreshDisabled ? undefined : onRefresh}
         className="file-panel-icon-btn shrink-0"
         title={t('filePanel.reloadApp')}
         aria-label={t('filePanel.reloadApp')}
-        disabled={entry.loading}
+        disabled={entry.loading || refreshDisabled}
       >
         {entry.loading ? <Loader size={14} className="text-current" /> : <RefreshCw className="h-3.5 w-3.5" />}
       </button>

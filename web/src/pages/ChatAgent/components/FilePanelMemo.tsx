@@ -42,7 +42,8 @@ function shortenFilename(name: string, max = 22): string {
 // --- useWorkspaceMemoIndex: workspace path → memo entry, for badge + banner lookup ---
 
 export function useWorkspaceMemoIndex(workspaceId: string): Map<string, MemoEntry> {
-  const { data: memoListData } = useUserMemoList(true);
+  // DALTON-HOOK(team-sharing): skip personal memo index fetch when workspaceId is empty
+  const { data: memoListData } = useUserMemoList(Boolean(workspaceId));
   return useMemo(() => {
     const map = new Map<string, MemoEntry>();
     const entries = memoListData?.entries ?? [];

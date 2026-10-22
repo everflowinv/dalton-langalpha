@@ -63,6 +63,7 @@ ALLOWED_HOOKS=(
   "brand-name"
   "dalton-auth"
   "home-workspace-alias"
+  "team-sharing"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)
@@ -100,8 +101,13 @@ else
   BASE_REF="${DALTON_BASE_REF:-$MERGE_BASE}"
 fi
 
+PYTHON_CMD=(".venv/bin/python")
+if [[ ! -x ".venv/bin/python" ]]; then
+  PYTHON_CMD=("uv" "run" "--no-sync" "python")
+fi
+
 if [[ "$AUDIT" -eq 1 ]]; then
-  uv run --no-sync python - "$BASE_REF" <<'PY'
+  "${PYTHON_CMD[@]}" - "$BASE_REF" <<'PY'
 import pathlib, re, subprocess, sys
 
 base_ref = sys.argv[1]
@@ -254,7 +260,7 @@ if git rev-parse --verify "$BASE_REF" >/dev/null 2>&1; then
   done
 
   # P0F.2 #3: Verify agent_docstring_lock.json is additive-only vs BASE_REF and only adds dalton_* keys
-  if ! uv run --no-sync python - "$BASE_REF" <<'PY'
+  if ! "${PYTHON_CMD[@]}" - "$BASE_REF" <<'PY'
 import json, subprocess, sys
 base_ref = sys.argv[1]
 base_json = json.loads(subprocess.check_output(["git", "show", f"{base_ref}:tests/unit/mcp_servers/agent_docstring_lock.json"], text=True))

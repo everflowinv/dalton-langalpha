@@ -36,7 +36,16 @@ async def get_provenance(thread_id: str, x_user_id: CurrentUserId):
     the structured input a post-hoc verification agent consumes.
     """
     try:
-        await auth_api.require_thread_owner(thread_id, x_user_id)
+        # --- DALTON-HOOK(team-sharing): begin ---
+        from src.dalton.settings import is_dalton_supabase_auth_enabled
+
+        if is_dalton_supabase_auth_enabled():
+            from src.dalton.sharing import require_thread_reader
+
+            await require_thread_reader(thread_id, x_user_id)
+        else:
+            await auth_api.require_thread_owner(thread_id, x_user_id)
+        # --- DALTON-HOOK(team-sharing): end ---
         rows = await get_provenance_for_thread(thread_id)
 
         turns: dict[int, dict] = {}
@@ -126,7 +135,16 @@ async def get_provenance_bodies(
     one request from materializing tens of MB.
     """
     try:
-        await auth_api.require_thread_owner(thread_id, x_user_id)
+        # --- DALTON-HOOK(team-sharing): begin ---
+        from src.dalton.settings import is_dalton_supabase_auth_enabled
+
+        if is_dalton_supabase_auth_enabled():
+            from src.dalton.sharing import require_thread_reader
+
+            await require_thread_reader(thread_id, x_user_id)
+        else:
+            await auth_api.require_thread_owner(thread_id, x_user_id)
+        # --- DALTON-HOOK(team-sharing): end ---
 
         from src.server.database.pool import get_db_connection
         from src.server.database.provenance_bodies import fetch_result_bodies
@@ -198,7 +216,16 @@ async def get_provenance_record_body(
     caller's thread.
     """
     try:
-        await auth_api.require_thread_owner(thread_id, x_user_id)
+        # --- DALTON-HOOK(team-sharing): begin ---
+        from src.dalton.settings import is_dalton_supabase_auth_enabled
+
+        if is_dalton_supabase_auth_enabled():
+            from src.dalton.sharing import require_thread_reader
+
+            await require_thread_reader(thread_id, x_user_id)
+        else:
+            await auth_api.require_thread_owner(thread_id, x_user_id)
+        # --- DALTON-HOOK(team-sharing): end ---
         row = await get_provenance_record(thread_id, provenance_record_id)
         if row is None:
             raise HTTPException(status_code=404, detail="Provenance record not found")

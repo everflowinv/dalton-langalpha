@@ -17,6 +17,9 @@ interface PanelTargetArgs {
   /** Called with the ask's `seq` for a kind consumed on arrival (`ONE_SHOT_KINDS`);
    *  a memory or memo target is cleared by its tab's body instead, once it has the entry. */
   onTargetHandled?: (seq?: number) => void;
+  // DALTON-HOOK(team-sharing): suppress preview sandbox startup and personal memo in colleague mirror mode
+  onTargetMemoHandled?: (seq?: number) => void;
+  teamReadOnly?: boolean;
 }
 
 /**
@@ -28,7 +31,7 @@ interface PanelTargetArgs {
  * folded away, only a new ask does.
  */
 export function usePanelTarget({
-  target, tabs, previews, openFileRef, cancelPending, clearSearch, setTreeOpen, setScopeDir, onTargetHandled,
+  target, tabs, previews, openFileRef, cancelPending, clearSearch, setTreeOpen, setScopeDir, onTargetHandled, onTargetMemoHandled, teamReadOnly = false,
 }: PanelTargetArgs): void {
   const lastDirAsk = useRef<string | null>(null);
   useEffect(() => {
@@ -53,6 +56,11 @@ export function usePanelTarget({
         return;
       }
       case 'preview':
+        // DALTON-HOOK(team-sharing): do not open preview or start sandbox in colleague mirror mode
+        if (teamReadOnly) {
+          onTargetHandled?.(target.seq);
+          return;
+        }
         // The agent published an app: its tab, and a URL fresh enough to load.
         cancelPending();
         tabs.openPreview(target);
@@ -86,6 +94,12 @@ export function usePanelTarget({
         tabs.openMemory();
         return;
       case 'memo':
+        // DALTON-HOOK(team-sharing): do not open viewer's personal MemoPanel in colleague mirror mode
+        if (teamReadOnly) {
+          onTargetMemoHandled?.(target.seq);
+          onTargetHandled?.(target.seq);
+          return;
+        }
         cancelPending();
         tabs.openMemo();
         return;

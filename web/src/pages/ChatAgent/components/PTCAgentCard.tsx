@@ -288,6 +288,9 @@ function PTCAgentCard({ proposalData, onApprove, onReject, dispatcherContext }: 
         <span className="shrink-0 text-[0.6875rem] font-medium" style={{ color: 'var(--color-text-quaternary)' }}>{t('chat.ptcCard.awaitingApproval')}</span>
       }
     >
+      {/* DALTON-HOOK(team-sharing): hide interactive toggle and approval buttons in read-only mode */}
+      {(onApprove || onReject) && (
+      <>
       {/* Report-back toggle */}
       <button
         type="button"
@@ -338,6 +341,8 @@ function PTCAgentCard({ proposalData, onApprove, onReject, dispatcherContext }: 
           {t('chat.ptcCard.decline')}
         </button>
       </div>
+      </>
+      )}
     </MissionPanel>
   );
 }

@@ -385,7 +385,18 @@ async def get_workspace(workspace_id: str, x_user_id: CurrentUserId):
     """
     try:
         workspace = await db_get_workspace(workspace_id)
-        require_workspace_owner(workspace, user_id=x_user_id)
+        # --- DALTON-HOOK(team-sharing): begin ---
+        from src.dalton.settings import is_dalton_supabase_auth_enabled
+
+        if is_dalton_supabase_auth_enabled():
+            from src.dalton.sharing import require_workspace_reader
+
+            workspace = await require_workspace_reader(workspace, x_user_id)
+            if workspace.get("user_id") != x_user_id:
+                workspace = {**workspace, "sandbox_id": None, "computer_id": None}
+        else:
+            require_workspace_owner(workspace, user_id=x_user_id)
+        # --- DALTON-HOOK(team-sharing): end ---
 
         return _workspace_to_response(workspace)
 

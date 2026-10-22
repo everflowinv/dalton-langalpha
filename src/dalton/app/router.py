@@ -84,12 +84,12 @@ def _require_pm_user(user_id: str) -> None:
         )
 
 
-async def _verify_workspace_access(workspace_id: str, user_id: str) -> None:
+async def _verify_workspace_access(workspace_id: str, user_id: str) -> dict[str, Any]:
     """Verify that ``workspace_id`` belongs to ``user_id`` fail-closed (G2 #2, R4-8, R5-1, P0J §8.1 #14)."""
     _require_dalton_enabled()
     from src.dalton.auth import verify_workspace_access
 
-    await verify_workspace_access(workspace_id, user_id)
+    return await verify_workspace_access(workspace_id, user_id)
 
 
 # ---------------------------------------------------------------------------
@@ -232,6 +232,17 @@ async def get_budget_today_endpoint(user_id: CurrentUserId) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+@router.get("/workspaces/team")
+@handle_api_exceptions("list team workspaces", logger)
+async def list_team_workspaces_endpoint(
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    from src.dalton.sharing import list_team_workspaces
+
+    members = await list_team_workspaces(user_id)
+    return {"members": members}
+
+
 @router.get("/knowledge/{workspace_id}/{doc}/versions")
 @handle_api_exceptions("list knowledge versions", logger)
 async def list_knowledge_versions_endpoint(
@@ -241,9 +252,16 @@ async def list_knowledge_versions_endpoint(
     limit: int = Query(default=50, ge=1, le=200),
     before: int | None = Query(default=None),
 ) -> dict[str, Any]:
-    await _verify_workspace_access(workspace_id, user_id)
+    _require_dalton_enabled()
     from src.dalton.database import knowledge as db_knowledge
+    from src.dalton.settings import is_dalton_supabase_auth_enabled
+    from src.dalton.sharing import require_workspace_reader
 
+    if is_dalton_supabase_auth_enabled():
+        workspace = await require_workspace_reader(workspace_id, user_id)
+    else:
+        workspace = await _verify_workspace_access(workspace_id, user_id)
+    owner_id = str((workspace or {}).get("user_id") or user_id)
     rows = await db_knowledge.list_versions(
         workspace_id=workspace_id,
         doc_key=doc,
@@ -253,7 +271,7 @@ async def list_knowledge_versions_endpoint(
     items = [
         r
         for r in rows
-        if not r.get("user_id") or str(r.get("user_id")) == str(user_id)
+        if not r.get("user_id") or str(r.get("user_id")) in {str(user_id), owner_id}
     ]
     return {"items": items}
 
@@ -266,15 +284,24 @@ async def get_knowledge_version_endpoint(
     n: int,
     user_id: CurrentUserId,
 ) -> dict[str, Any]:
-    await _verify_workspace_access(workspace_id, user_id)
+    _require_dalton_enabled()
     from src.dalton.database import knowledge as db_knowledge
+    from src.dalton.settings import is_dalton_supabase_auth_enabled
+    from src.dalton.sharing import require_workspace_reader
 
+    if is_dalton_supabase_auth_enabled():
+        workspace = await require_workspace_reader(workspace_id, user_id)
+    else:
+        workspace = await _verify_workspace_access(workspace_id, user_id)
+    owner_id = str((workspace or {}).get("user_id") or user_id)
     row = await db_knowledge.get_version(
         workspace_id=workspace_id,
         doc_key=doc,
         version_no=n,
     )
-    if row is None or (row.get("user_id") and str(row.get("user_id")) != str(user_id)):
+    if row is None or (
+        row.get("user_id") and str(row.get("user_id")) not in {str(user_id), owner_id}
+    ):
         raise HTTPException(status_code=404, detail="Knowledge version not found")
     return row
 
@@ -288,9 +315,15 @@ async def diff_knowledge_versions_endpoint(
     from_version: int = Query(..., alias="from"),
     to_version: int = Query(..., alias="to"),
 ) -> dict[str, Any]:
-    await _verify_workspace_access(workspace_id, user_id)
+    _require_dalton_enabled()
     from src.dalton.knowledge import service as knowledge_service
+    from src.dalton.settings import is_dalton_supabase_auth_enabled
+    from src.dalton.sharing import require_workspace_reader
 
+    if is_dalton_supabase_auth_enabled():
+        await require_workspace_reader(workspace_id, user_id)
+    else:
+        await _verify_workspace_access(workspace_id, user_id)
     diffs = await knowledge_service.diff_versions(
         workspace_id=workspace_id,
         doc_key=doc,
@@ -342,12 +375,19 @@ async def list_verdicts_endpoint(
     limit: int = Query(default=50, ge=1, le=200),
 ) -> dict[str, Any]:
     _require_dalton_enabled()
-    if workspace_id:
-        await _verify_workspace_access(workspace_id, user_id)
     from src.dalton.database import verdicts as verdicts_db
+    from src.dalton.settings import is_dalton_supabase_auth_enabled
+    from src.dalton.sharing import require_workspace_reader
 
+    target_user_id = user_id
+    if workspace_id:
+        if is_dalton_supabase_auth_enabled():
+            workspace = await require_workspace_reader(workspace_id, user_id)
+        else:
+            workspace = await _verify_workspace_access(workspace_id, user_id)
+        target_user_id = str((workspace or {}).get("user_id") or user_id)
     items = await verdicts_db.list_user_verdicts(
-        user_id=user_id,
+        user_id=target_user_id,
         workspace_id=workspace_id,
         since=since,
         until=until,
@@ -363,12 +403,19 @@ async def list_publications_endpoint(
     workspace_id: str | None = Query(default=None),
 ) -> dict[str, Any]:
     _require_dalton_enabled()
-    if workspace_id:
-        await _verify_workspace_access(workspace_id, user_id)
     from src.dalton.database import publications as pub_db
+    from src.dalton.settings import is_dalton_supabase_auth_enabled
+    from src.dalton.sharing import require_workspace_reader
 
+    target_user_id: str | None = user_id
+    if workspace_id:
+        if is_dalton_supabase_auth_enabled():
+            workspace = await require_workspace_reader(workspace_id, user_id)
+        else:
+            workspace = await _verify_workspace_access(workspace_id, user_id)
+        target_user_id = str((workspace or {}).get("user_id") or user_id)
     items = await pub_db.list_publications(
-        workspace_id=workspace_id, user_id=user_id
+        workspace_id=workspace_id, user_id=target_user_id
     )
     return {"items": items}
 
@@ -381,9 +428,23 @@ async def get_publication_endpoint(
 ) -> dict[str, Any]:
     _require_dalton_enabled()
     from src.dalton.database import publications as pub_db
+    from src.dalton.settings import is_dalton_supabase_auth_enabled
+    from src.dalton.sharing import require_team_reader, require_workspace_reader
 
     row = await pub_db.get_publication(publication_id)
-    if row is None or str(row.get("user_id")) != str(user_id):
+    if row is None:
+        raise HTTPException(status_code=404, detail="Publication not found")
+    if is_dalton_supabase_auth_enabled():
+        if row.get("workspace_id"):
+            await require_workspace_reader(str(row["workspace_id"]), user_id)
+            pub_owner = str(row.get("user_id") or "").strip()
+            if pub_owner and pub_owner != str(user_id):
+                await require_team_reader(pub_owner)
+        else:
+            await require_team_reader(user_id)
+            if str(row.get("user_id")) != str(user_id):
+                raise HTTPException(status_code=403, detail="Forbidden")
+    elif str(row.get("user_id")) != str(user_id):
         raise HTTPException(status_code=404, detail="Publication not found")
     return row
 

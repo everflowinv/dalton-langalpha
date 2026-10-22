@@ -44,6 +44,8 @@ export function useRightPanel({
   messages,
   subagentTranscripts = NO_TRANSCRIPTS,
   watching = false,
+  // DALTON-HOOK(team-sharing): prevent preview sandbox startup in read-only mode
+  readOnly = false,
 }: {
   isMobile: boolean;
   workspaceId: string;
@@ -62,6 +64,8 @@ export function useRightPanel({
   subagentTranscripts?: readonly (readonly TranscriptMessage[])[];
   /** A market watch is running, so a watch call's row opens its live Status tab. */
   watching?: boolean;
+  // DALTON-HOOK(team-sharing): prevent preview sandbox startup in read-only mode
+  readOnly?: boolean;
 }) {
   const location = useLocation();
   const navigate = useNavigate();
@@ -435,6 +439,8 @@ export function useRightPanel({
    * sibling (`data.workspaceId`) runs there and is asked for there.
    */
   const handleOpenPreview = useCallback((data: PreviewData) => {
+    // DALTON-HOOK(team-sharing): do not open preview or start sandbox in read-only mode
+    if (readOnly) return;
     const appWorkspaceId = data.workspaceId ?? workspaceId;
     if (!isMobile) {
       const land = () => landInFilePanel(
@@ -470,7 +476,7 @@ export function useRightPanel({
     if (data.loading && !data.url && appWorkspaceId) {
       resolveAndSetPreview(appWorkspaceId, data.port, data.command, data.path);
     }
-  }, [isMobile, landInFilePanel, filePanelWorkspaceId, leaveFiles, setFilePanelWorkspaceId, applyPanelWidth, pushPanelHistory, workspaceId, resolveAndSetPreview]);
+  }, [readOnly, isMobile, landInFilePanel, filePanelWorkspaceId, leaveFiles, setFilePanelWorkspaceId, applyPanelWidth, pushPanelHistory, workspaceId, resolveAndSetPreview]);
 
   /**
    * An `/a/` link in a reply, opened as the panel tab its item already has:
@@ -609,7 +615,8 @@ export function useRightPanel({
       return;
     }
     const artifact = toolCallProcess.toolCallResult?.artifact as Record<string, unknown> | undefined;
-    if (artifact?.type === 'preview_url' && artifact.port && workspaceId) {
+    // DALTON-HOOK(team-sharing): in read-only mode, show tool detail instead of starting preview sandbox
+    if (!readOnly && artifact?.type === 'preview_url' && artifact.port && workspaceId) {
       const port = artifact.port as number;
       const title = artifact.title as string | undefined;
       const command = artifact.command as string | undefined;
@@ -645,7 +652,7 @@ export function useRightPanel({
     applyPanelWidth(detailPanelWidth(toolCallProcess));
     setRightPanelType('detail');
     pushPanelHistory();
-  }, [isMobile, getToolCallProcess, landInFilePanel, applyPanelWidth, pushPanelHistory, workspaceId, handleOpenPreview, watching]);
+  }, [readOnly, isMobile, getToolCallProcess, landInFilePanel, applyPanelWidth, pushPanelHistory, workspaceId, handleOpenPreview, watching]);
 
   // Close the mobile detail sheet
   const handleCloseDetailPanel = useCallback(() => {

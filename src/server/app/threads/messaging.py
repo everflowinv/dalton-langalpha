@@ -959,8 +959,23 @@ async def replay_thread_messages(
         # Preserve existing 404/403 semantics from require_thread_owner
         if rows is None:
             raise HTTPException(status_code=404, detail="Thread not found")
-        if rows.owner_id != x_user_id:
+        # --- DALTON-HOOK(team-sharing): begin ---
+        from src.dalton.settings import is_dalton_supabase_auth_enabled
+
+        is_non_owner_reader = False
+        if is_dalton_supabase_auth_enabled():
+            from src.dalton.sharing import require_thread_reader
+
+            await require_thread_reader(
+                thread_id,
+                x_user_id,
+                owner_id=rows.owner_id,
+                workspace_id=rows.thread.get("workspace_id"),
+            )
+            is_non_owner_reader = rows.owner_id != x_user_id
+        elif rows.owner_id != x_user_id:
             raise HTTPException(status_code=403, detail="Forbidden")
+        # --- DALTON-HOOK(team-sharing): end ---
 
         from src.server.services.history.replay import (
             CheckpointReplayUnavailable,
@@ -969,9 +984,15 @@ async def replay_thread_messages(
         )
 
         try:
-            page, resolved_source = await read_replay_page(
-                rows, source=source, before_turn=before_turn, limit=limit
-            )
+            # DALTON-HOOK(team-sharing): non-owner reads project in memory without DB writeback
+            replay_kwargs: dict[str, object] = {
+                "source": source,
+                "before_turn": before_turn,
+                "limit": limit,
+            }
+            if is_non_owner_reader:
+                replay_kwargs["persist"] = False
+            page, resolved_source = await read_replay_page(rows, **replay_kwargs)
         except CheckpointReplayUnavailable as e:
             raise HTTPException(
                 status_code=409,
@@ -1007,7 +1028,8 @@ async def replay_thread_messages(
             # resume instead of its content. Additive: a snapshot outage (None)
             # just omits the frame, and v1 clients ignore the unknown event.
             # An older page holds no in-flight run.
-            if before_turn is None:
+            # DALTON-HOOK(team-sharing): omit live in-flight snapshot for non-owner reader
+            if before_turn is None and not is_non_owner_reader:
                 from src.server.services.history.snapshot import (
                     build_thread_snapshot,
                 )
@@ -1081,8 +1103,67 @@ async def get_thread_status(
     meta = await get_thread_auth_meta(thread_id)
     if meta is None:
         raise HTTPException(status_code=404, detail="Thread not found")
-    if meta["user_id"] != x_user_id:
+    # --- DALTON-HOOK(team-sharing): begin ---
+    from src.dalton.settings import is_dalton_supabase_auth_enabled
+
+    is_non_owner_reader = False
+    if is_dalton_supabase_auth_enabled():
+        from src.dalton.sharing import require_thread_reader
+
+        await require_thread_reader(
+            thread_id,
+            x_user_id,
+            owner_id=meta["user_id"],
+            workspace_id=meta.get("workspace_id"),
+        )
+        is_non_owner_reader = meta["user_id"] != x_user_id
+    elif meta["user_id"] != x_user_id:
         raise HTTPException(status_code=403, detail="Forbidden")
+
+    if is_non_owner_reader:
+        if fields == "report_back":
+            return {
+                "pending_report_back": False,
+                "report_back_run_id": None,
+                "recent_report_back_run_ids": [],
+                "active_tasks": [],
+                "owed_threads": [],
+            }
+        from src.server.contracts.status import to_public
+        from src.server.database.conversation import get_latest_turn_index
+        from src.server.database.runs import lifecycle as tl_db
+
+        latest = await tl_db.get_latest_attempt(thread_id)
+        if latest is not None and latest.get("status") == "in_progress":
+            persisted_status = to_public(
+                latest["status"],
+                cancel_requested_at=latest.get("cancel_requested_at"),
+            )
+        else:
+            persisted_status = (
+                to_public(latest["status"]) if latest is not None else "idle"
+            )
+        row_ts = latest.get("created_at") if latest is not None else None
+        last_update = row_ts.isoformat() if hasattr(row_ts, "isoformat") else None
+        latest_turn_index = await get_latest_turn_index(thread_id)
+        return {
+            "thread_id": thread_id,
+            "run_id": None,
+            "status": persisted_status,
+            "can_reconnect": False,
+            "latest_turn_index": latest_turn_index,
+            "token_totals": None,
+            "last_update": last_update,
+            "progress": None,
+            "active_tasks": [],
+            "is_shared": False,
+            "pending_report_back": False,
+            "report_back_run_id": None,
+            "recent_report_back_run_ids": [],
+            "owed_threads": [],
+            "pending_steers": [],
+        }
+    # --- DALTON-HOOK(team-sharing): end ---
     if fields == "report_back":
         from src.server.services.report_back.handoff.status import read_report_back_slice
 

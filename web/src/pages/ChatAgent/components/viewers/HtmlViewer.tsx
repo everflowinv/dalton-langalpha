@@ -33,6 +33,8 @@ interface HtmlViewerProps {
    *  twice is two requests rather than one unchanged prop. Read only alongside
    *  `anchor`. */
   anchorSeq?: number | null;
+  // DALTON-HOOK(team-sharing): render mirror HTML in sandboxed srcDoc iframe when teamReadOnly
+  teamReadOnly?: boolean;
 }
 
 export default function HtmlViewer({
@@ -44,6 +46,7 @@ export default function HtmlViewer({
   servePrefix,
   anchor = null,
   anchorSeq = null,
+  teamReadOnly = false,
 }: HtmlViewerProps) {
   const { t } = useTranslation();
   const { theme } = useTheme();
@@ -73,7 +76,9 @@ export default function HtmlViewer({
     if (anchor) scrollToAnchor(anchor);
   }, [request, anchor, scrollToAnchor]);
 
-  const served = useServedHtml(workspaceId, filePath, servePrefix);
+  // DALTON-HOOK(team-sharing): skip owner-only grant in colleague mirror mode and use mirror srcDoc preview
+  const isReadOnlyMirror = teamReadOnly && !servePrefix;
+  const served = useServedHtml(workspaceId, filePath, servePrefix, { teamReadOnly });
   const servedUrl = served.themedUrl;
 
   const actions = useHtmlActions({
@@ -95,6 +100,18 @@ export default function HtmlViewer({
         <iframe
           ref={iframeRef}
           src={anchor ? `${servedUrl}#${encodeURIComponent(anchor)}` : servedUrl}
+          sandbox={SERVED_HTML_SANDBOX}
+          className="html-viewer-frame"
+          title={fileName || 'HTML Preview'}
+          onLoad={pushTheme}
+        />
+      );
+    }
+    if (isReadOnlyMirror) {
+      return (
+        <iframe
+          ref={iframeRef}
+          srcDoc={content}
           sandbox={SERVED_HTML_SANDBOX}
           className="html-viewer-frame"
           title={fileName || 'HTML Preview'}
@@ -142,7 +159,7 @@ export default function HtmlViewer({
         {/* Download/Save-as-PDF and the share link live in the file panel header. */}
         <HtmlActionBar
           onFullscreen={() => setFullscreen(true)}
-          fullscreenDisabled={!servedUrl}
+          fullscreenDisabled={!servedUrl && !isReadOnlyMirror}
           onOpenInNewTab={actions.openInNewTab}
         />
       </div>
@@ -159,16 +176,28 @@ export default function HtmlViewer({
           </SyntaxHighlighter>
         </div>
       )}
-      {fullscreen && servedUrl && (
-        <HtmlFullscreenModal
-          variant="file"
-          open={fullscreen}
-          onOpenChange={setFullscreen}
-          title={fileName}
-          servedUrl={servedUrl}
-          actions={actions}
-          canDownload={!!onTriggerDownload}
-        />
+      {fullscreen && (servedUrl || isReadOnlyMirror) && (
+        servedUrl ? (
+          <HtmlFullscreenModal
+            variant="file"
+            open={fullscreen}
+            onOpenChange={setFullscreen}
+            title={fileName}
+            servedUrl={servedUrl}
+            actions={actions}
+            canDownload={!!onTriggerDownload}
+          />
+        ) : (
+          <HtmlFullscreenModal
+            variant="widget"
+            open={fullscreen}
+            onOpenChange={setFullscreen}
+            title={fileName}
+            srcDoc={content}
+            actions={actions}
+            canDownload={!!onTriggerDownload}
+          />
+        )
       )}
     </div>
   );

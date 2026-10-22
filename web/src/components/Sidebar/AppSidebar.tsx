@@ -21,6 +21,9 @@ import { useChatRoute } from './useChatRoute';
 import { useSidebarAgents } from '@/pages/ChatAgent/components/sidebarAgentsBridge';
 import { useWorkspaceLabel } from '@/hooks/useWorkspaceLabel';
 import { SIDEBAR_DEFAULT_WIDTH, clampSidebarWidth } from './sidebarWidth';
+// DALTON-HOOK(team-sharing): collapsible Team workspaces section
+import { TeamWorkspacesSection } from '@/pages/ChatAgent/components/dalton/TeamSharing';
+import { isDaltonAuth } from '@/config/daltonAuth';
 import './Sidebar.css';
 
 interface NavigationLike {
@@ -317,6 +320,8 @@ function AppSidebar({ collapsed, onToggleCollapse, width, onWidthChange }: AppSi
 
       <div className="sidebar-tree">
         <NavigationPanel {...navTreeProps} />
+        {/* DALTON-HOOK(team-sharing): Team workspaces section below My Workspaces */}
+        {isDaltonAuth && <TeamWorkspacesSection currentWorkspaceId={currentWorkspaceId} />}
       </div>
 
       <div className="sidebar-panel-bottom">

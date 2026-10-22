@@ -9,6 +9,8 @@ interface PreviewPanesProps {
   tabs: FileTab[];
   activeId: string;
   previews: PreviewsApi;
+  // DALTON-HOOK(team-sharing): suppress preview registration, ensure, and refresh in colleague mirror mode
+  teamReadOnly?: boolean;
 }
 
 /**
@@ -16,7 +18,7 @@ interface PreviewPanesProps {
  * tab switch must not reload a running server, drop its scroll position or
  * discard what was typed into it.
  */
-export function PreviewPanes({ tabs, activeId, previews }: PreviewPanesProps): React.ReactElement | null {
+export function PreviewPanes({ tabs, activeId, previews, teamReadOnly = false }: PreviewPanesProps): React.ReactElement | null {
   const previewTabs = useMemo(
     () => tabs.filter((t): t is Extract<FileTab, { kind: 'preview' }> => t.kind === 'preview'),
     [tabs],
@@ -29,10 +31,12 @@ export function PreviewPanes({ tabs, activeId, previews }: PreviewPanesProps): R
   // something to mint against.
   const { register, ensure, byPort } = previews;
   useEffect(() => {
+    // DALTON-HOOK(team-sharing): do not register restored preview entries in colleague mirror mode
+    if (teamReadOnly) return;
     previewTabs.forEach((tab) => register({
       port: tab.port, title: tab.title, path: tab.previewPath, command: tab.command,
     }));
-  }, [previewTabs, register]);
+  }, [teamReadOnly, previewTabs, register]);
 
   // A signed preview URL is short-lived, so arriving at the tab is when it is
   // minted, not when the tab was opened, and not for tabs nobody is looking at.
@@ -40,8 +44,9 @@ export function PreviewPanes({ tabs, activeId, previews }: PreviewPanesProps): R
   // registered and activated in the same commit, and the mint has nothing to
   // read until that registration lands.
   useEffect(() => {
-    if (activePort != null) ensure(activePort);
-  }, [activePort, ensure, byPort]);
+    // DALTON-HOOK(team-sharing): do not mint preview URL / start sandbox in colleague mirror mode
+    if (!teamReadOnly && activePort != null) ensure(activePort);
+  }, [teamReadOnly, activePort, ensure, byPort]);
 
   if (!previewTabs.length) return null;
   return (
@@ -58,7 +63,8 @@ export function PreviewPanes({ tabs, activeId, previews }: PreviewPanesProps): R
               loading={entry?.loading ?? true}
               error={entry?.error}
               reloadToken={entry?.reloadToken}
-              onRefresh={() => previews.refresh(tab.port)}
+              // DALTON-HOOK(team-sharing): do not refresh preview in colleague mirror mode
+              onRefresh={teamReadOnly ? undefined : () => previews.refresh(tab.port)}
             />
           </div>
         );

@@ -134,6 +134,8 @@ async def build_replay_page(
     before_turn: Any | None = None,
     limit: int | None = None,
     turn_fallback: bool = False,
+    # DALTON-HOOK(team-sharing): allow read-only projection without DB writeback
+    persist: bool = True,
 ) -> ReplayPage:
     """Replay lines for one page of the thread: with ``limit``, the newest N
     checkpointed turns before ``before_turn`` (all of them without it), plus
@@ -175,7 +177,8 @@ async def build_replay_page(
         inputs,
         anchored,
         [(ti, a) for ti, a in page if a is not None],
-        cold.Policy(turn_fallback=turn_fallback),
+        # DALTON-HOOK(team-sharing): forward persist flag to cold.Policy
+        cold.Policy(turn_fallback=turn_fallback, persist=persist),
     )
     tip_interrupts: list[dict[str, Any]] = []
     if before_turn is None:
@@ -225,6 +228,8 @@ async def read_replay_page(
     source: Literal["auto", "checkpoint"] = "auto",
     before_turn: Any | None = None,
     limit: int | None = None,
+    # DALTON-HOOK(team-sharing): allow read-only projection without DB writeback
+    persist: bool = True,
 ) -> tuple[ReplayPage, str]:
     """The page a thread replays as, and its source (``checkpoint`` or ``stub``).
 
@@ -250,6 +255,7 @@ async def read_replay_page(
             before_turn=before_turn,
             limit=limit,
             turn_fallback=source == "auto",
+            persist=persist,
         )
         return page, "checkpoint"
     except DATABASE_UNAVAILABLE:

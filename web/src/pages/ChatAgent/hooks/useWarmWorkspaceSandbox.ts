@@ -27,6 +27,9 @@ import { useEffect, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 
 import { useWorkspace } from '@/hooks/useWorkspace';
+// DALTON-HOOK(team-sharing): never warm or connect to a colleague's sandbox
+import { isDaltonAuth } from '@/config/daltonAuth';
+import { useUser } from '@/hooks/useUser';
 
 import { streamWorkspaceEvents } from '../utils/api';
 import { patchWorkspaceStatusInCaches, warmWorkspace } from '../utils/warmWorkspace';
@@ -42,7 +45,13 @@ export function useWarmWorkspaceSandbox(workspaceId: string | null): WarmingStat
   // Wait for the row, which tells the warm whether this is Home. Deciding once
   // keeps a cold entry into Home from warming it as a plain workspace first,
   // then again as Home with a second events stream.
-  const rowRead = useWorkspace(workspaceId).data !== undefined;
+  const wsData = useWorkspace(workspaceId).data;
+  // --- DALTON-HOOK(team-sharing): begin ---
+  const { user: currentUser } = useUser({ enabled: Boolean(workspaceId) && isDaltonAuth });
+  const rowRead = isDaltonAuth
+    ? wsData !== undefined && Boolean(currentUser?.user_id && wsData?.user_id === currentUser.user_id)
+    : wsData !== undefined;
+  // --- DALTON-HOOK(team-sharing): end ---
 
   useEffect(() => {
     if (!workspaceId || !rowRead) return;

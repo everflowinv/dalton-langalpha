@@ -44,6 +44,8 @@ export interface MessageActionSources {
   editDrafts: EditDraftStore;
   onSendMessage: (text: string) => unknown;
   chatInputRef: RefObject<ChatInputHandle | null>;
+  // DALTON-HOOK(team-sharing): withhold mutation/interactive actions in read-only mode
+  readOnly?: boolean;
 }
 
 /**
@@ -99,38 +101,55 @@ export function useMessageActionBundles(src: MessageActionSources): {
 
   // The main transcript's action surface. Every member is identity-stable, so
   // this object is built once and never re-renders the memoized message tree.
-  const messageActions = useMemo<MessageActions>(() => ({
-    onOpenFile: stableOpenFile,
-    onDownloadFile: stableDownloadFile,
-    downloadKeyFor: stableDownloadKeyFor,
-    onRevealFiles: stableRevealFiles,
-    onOpenSources: stableOpenSources,
-    onToolCallDetailClick: stableToolCallDetail,
-    onOpenChart: stableOpenChart,
-    onOpenSubagentTask: stableOpenSubagentTask,
-    onOpenDispatcher: stableOpenDispatcher,
-    onAnswerQuestion: stableAnswerQuestion,
-    onSkipQuestion: stableSkipQuestion,
-    onApproveCreateWorkspace: stableApproveCreateWorkspace,
-    onRejectCreateWorkspace: stableRejectCreateWorkspace,
-    onApproveStartQuestion: stableApproveStartQuestion,
-    onRejectStartQuestion: stableRejectStartQuestion,
-    onApprovePTCAgent: stableApprovePTCAgent,
-    onRejectPTCAgent: stableRejectPTCAgent,
-    onApproveSecretaryAction: stableApproveSecretaryAction,
-    onRejectSecretaryAction: stableRejectSecretaryAction,
-    onResumeCreditPause: stableResumeCreditPause,
-    onApproveToolCall: stableApproveToolCall,
-    onRejectToolCall: stableRejectToolCall,
-    onEditMessage: stableEditMessage,
-    onRegenerate: stableRegenerate,
-    onRetry: stableRetry,
-    editDrafts,
-    onThumbUp: stableThumbUp,
-    onThumbDown: stableThumbDown,
-    onReportWithAgent: stableReportWithAgent,
-    onWidgetSendPrompt: stableSendMessage,
-  }), [
+  // DALTON-HOOK(team-sharing): in read-only mode, expose only navigation actions
+  const readOnly = Boolean(src.readOnly);
+  const messageActions = useMemo<MessageActions>(() => (
+    readOnly
+      ? {
+          onOpenFile: stableOpenFile,
+          onDownloadFile: stableDownloadFile,
+          downloadKeyFor: stableDownloadKeyFor,
+          onRevealFiles: stableRevealFiles,
+          onOpenSources: stableOpenSources,
+          onToolCallDetailClick: stableToolCallDetail,
+          onOpenChart: stableOpenChart,
+          onOpenSubagentTask: stableOpenSubagentTask,
+          onOpenDispatcher: stableOpenDispatcher,
+        }
+      : {
+          onOpenFile: stableOpenFile,
+          onDownloadFile: stableDownloadFile,
+          downloadKeyFor: stableDownloadKeyFor,
+          onRevealFiles: stableRevealFiles,
+          onOpenSources: stableOpenSources,
+          onToolCallDetailClick: stableToolCallDetail,
+          onOpenChart: stableOpenChart,
+          onOpenSubagentTask: stableOpenSubagentTask,
+          onOpenDispatcher: stableOpenDispatcher,
+          onAnswerQuestion: stableAnswerQuestion,
+          onSkipQuestion: stableSkipQuestion,
+          onApproveCreateWorkspace: stableApproveCreateWorkspace,
+          onRejectCreateWorkspace: stableRejectCreateWorkspace,
+          onApproveStartQuestion: stableApproveStartQuestion,
+          onRejectStartQuestion: stableRejectStartQuestion,
+          onApprovePTCAgent: stableApprovePTCAgent,
+          onRejectPTCAgent: stableRejectPTCAgent,
+          onApproveSecretaryAction: stableApproveSecretaryAction,
+          onRejectSecretaryAction: stableRejectSecretaryAction,
+          onResumeCreditPause: stableResumeCreditPause,
+          onApproveToolCall: stableApproveToolCall,
+          onRejectToolCall: stableRejectToolCall,
+          onEditMessage: stableEditMessage,
+          onRegenerate: stableRegenerate,
+          onRetry: stableRetry,
+          editDrafts,
+          onThumbUp: stableThumbUp,
+          onThumbDown: stableThumbDown,
+          onReportWithAgent: stableReportWithAgent,
+          onWidgetSendPrompt: stableSendMessage,
+        }
+  ), [
+    readOnly,
     stableOpenFile, stableDownloadFile, stableDownloadKeyFor, stableRevealFiles, stableOpenSources, stableToolCallDetail,
     stableOpenChart, stableOpenSubagentTask, stableOpenDispatcher, stableAnswerQuestion, stableSkipQuestion, stableApproveCreateWorkspace,
     stableRejectCreateWorkspace, stableApproveStartQuestion, stableRejectStartQuestion,

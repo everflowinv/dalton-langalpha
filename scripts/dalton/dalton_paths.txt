@@ -31,3 +31,4 @@ web/src/components/brand/BrandMark.tsx
 web/src/components/brand/__tests__/
 web/src/config/daltonAuth.ts
 web/src/config/__tests__/daltonAuth.test.ts
+web/src/components/Sidebar/__tests__/TeamSharing.test.tsx

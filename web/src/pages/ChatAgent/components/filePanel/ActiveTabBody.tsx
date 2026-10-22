@@ -87,6 +87,8 @@ export function ActiveTabBody({
           onTargetMemoHandled={onTargetMemoHandled}
           onOpenFile={onOpenFile}
           marketWatch={marketWatch}
+          // DALTON-HOOK(team-sharing): forward teamReadOnly to block personal MemoPanel in colleague mirror mode
+          teamReadOnly={file.teamReadOnly}
         />
       );
     case 'sources':

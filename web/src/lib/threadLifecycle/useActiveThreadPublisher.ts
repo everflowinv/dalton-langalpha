@@ -19,20 +19,33 @@ import {
   useThreadRunStatus,
 } from './store';
 
-export function useActiveThreadPublisher(threadId: string | null | undefined): void {
+// DALTON-HOOK(team-sharing): allow gating active-thread seen writeback until workspace ownership is confirmed
+export interface ActiveThreadPublisherOptions {
+  canMarkSeen?: boolean;
+}
+
+export function useActiveThreadPublisher(
+  threadId: string | null | undefined,
+  options?: ActiveThreadPublisherOptions,
+): void {
+  const canMarkSeen = options?.canMarkSeen ?? true;
   const tid = threadId && threadId !== '__default__' ? threadId : null;
   const status = useThreadRunStatus(tid ?? '');
 
   useEffect(() => {
+    if (!canMarkSeen) {
+      setActiveThread(null);
+      return;
+    }
     setActiveThread(tid);
     return () => setActiveThread(null);
-  }, [tid]);
+  }, [tid, canMarkSeen]);
 
   useEffect(() => {
-    if (!tid || !TERMINAL_FAMILY.has(status)) return;
+    if (!canMarkSeen || !tid || !TERMINAL_FAMILY.has(status)) return;
     const eff = getEffectiveObservation(tid);
     if (eff?.runId && TERMINAL_FAMILY.has(eff.status)) {
       markThreadSeen(tid, eff.runId);
     }
-  }, [tid, status]);
+  }, [tid, status, canMarkSeen]);
 }

@@ -67,6 +67,8 @@ interface FileHeaderActionsProps {
   servePrefix?: string;
   /** Offer the selected file's share dialog: the owner's own panel only. */
   canShare?: boolean;
+  // DALTON-HOOK(team-sharing): skip owner-only grant/share-link in colleague mirror mode
+  teamReadOnly?: boolean;
   // Edit mode callbacks
   editorRef: React.RefObject<any>;
   canUndo: boolean;
@@ -96,6 +98,7 @@ function FileHeaderActions({
   readFileFullFn,
   servePrefix,
   canShare = false,
+  teamReadOnly = false,
   editorRef,
   canUndo,
   canRedo,
@@ -123,6 +126,8 @@ function FileHeaderActions({
     workspaceId,
     selectedFile && isHtmlFile(selectedFile) ? selectedFile : null,
     servePrefix,
+    // DALTON-HOOK(team-sharing): pass teamReadOnly so colleague mirror never requests file-grant
+    { teamReadOnly },
   );
 
   const handleExportHtmlPdf = async () => {
