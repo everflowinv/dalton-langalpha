@@ -28,6 +28,16 @@
 基础净现金占市值比 (%) = 基础净现金 / 美元市值基准 × 100%
 ```
 
+### 1.4 港股与 A 股取数及公告核实规范（`route="cn-hk"`）
+1. **初值提取（`operation="ask"`，二手线索）**：
+   - 调用 `researchdata.finance(route="cn-hk", operation="ask", query=f"{code_or_name} 港股资产负债表", limit=50)`（港股，如 `"00700 港股资产负债表"`）或 `query=f"{code_or_name} 资产负债表"`（A 股，如 `"600519 资产负债表"`）拉取货币资金（`MONETARYFUNDS` / 现金及现金等价物）、交易性金融资产（`TRAD_FIN_ASSET` / 按公允价值计入损益的金融资产）、短期借款（`SHORT_LOAN`）、一年内到期的非流动负债（`NONCURRENT_LIAB_1YEAR`）、长期借款（`LONG_LOAN`）、应付债券（`BOND_PAYABLE`）、租赁负债（`LEASE_LIAB`）、应付票据（`NOTE_PAYABLE`）、合同负债（`CONTRACT_LIAB`）、其他应收款与流动资产/流动负债合计作为初值。
+2. **回法定公告附注核实（`operation="filings"` + 披露易退路，必做）**：
+   - 平台标准化资产负债表不区分受限资金、定期存款期限与理财底层资产。必须调用 `researchdata.finance(route="cn-hk", operation="filings", ticker=code_5_or_6, start=..., end=..., limit=20)` 读取最新年报/中报/季报 PDF（`pdf_link`）的财务报表附注（港股若 `cn-hk filings` 未覆盖则用 `web_search` 查披露易 `site:hkexnews.hk` 原文链接），逐项核实：
+     - **A 股附注核查点**：“货币资金”附注中的银行承兑汇票保证金、信用证保证金、履约保证金、诉讼冻结资金等**受限货币资金**（基础口径纳入、严格口径全额作为不自由现金扣除）与大额存单/定期存款；“交易性金融资产 / 其他流动资产”附注中的结构性存款与银行理财；“应付票据”附注中的银行承兑汇票与商业承兑汇票。
+     - **港股附注核查点**：财报附注中的“受限制银行结余及已抵押存款（Restricted bank balances and pledged deposits）”、“原到期日超过三个月的定期存款（Term deposits with initial terms of over three months）”、“按公允价值计入损益之金融资产（FVPL）”中的短期理财/货币基金部分（须与隐含资产中的非流动战略投资严格区分）。
+3. **币种换算纪律**：
+   - 港股若以人民币（`CNY`）编制财报、以港币（`HKD`）交易，所有资产负债表与附注科目必须按 `anchors.json` 中的报表汇率 `fx.rate`（`CNY -> USD`）换算为美元，再与美元市值基准对比，**严禁按港币汇率（`HKD -> USD`）换算人民币报表科目**。
+
 ---
 
 ## 2. 严格净现金（Strict Net Cash / Definition B）

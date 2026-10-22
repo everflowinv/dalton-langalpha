@@ -29,8 +29,9 @@
 
 1. **第一步：内部研究库（零外部配额消耗）**：
    - 先查 `sales-notes`、`tmtb`、`funda-ai`、`company-wiki` 在本周窗口内提及该公司的段落。许多二线标的的异动在卖方 sales desk 日报或 TMTB 中已有现成的一句话解释。
-2. **第二步：异常交易日定向新闻检索**：
+2. **第二步：异常交易日定向公告与新闻检索**：
    - 针对 `flags` 中标出的异常交易日，调用 `web_search`（带 `date_after`/`date_before`）检索 `"{公司名/TICKER} stock {异常日} why"`，定位公告、业绩、指引或大行评级动作。
+   - 若命中的 Watch 公司为**港股或 A 股标的**，同步调用 `researchdata.finance(route="cn-hk", operation="filings", ticker=code_5_or_6, start=base_minus_1d, end=min(end_plus_1d, TODAY), limit=20)`（`end` 不得晚于当天 `TODAY`）检索巨潮法定公告（港股披露易未覆盖时用 `web_search` 查 `site:hkexnews.hk` 原文链接），并按单一意图、带具体异常交易日分别调用 `researchdata.finance(route="cn-hk", operation="ask", ...)` 核查异动日资金流（如 `query="宁德时代 300750 2026-10-21 主力资金净流入和成交额"`）、龙虎榜（`query=f"{code_or_name} {异常日} 龙虎榜"`）、两融（`query=f"{code_or_name} {异常日} 两融"`）、回购（`query=f"{code_or_name} 回购"`）或 AH 溢价（`query="AH溢价"`）变化（不把多个意图拼入同一条 `ask`；读取返回 `summary` 与来源，若回退至同花顺即时口径须标明，拿不到历史日数据则写明缺口；平台财务表仅作初值，核心财务数字回公告核实）。
 3. **第三步：社交媒体 X（按需补充）**：
    - 若前两步仍未完全解释异动，检索 X 上的基本面讨论线索（必须与价格时间线吻合）。
 4. **第四步：AlphaEngine 卖方研报（严格受控，排在全部 Core 完成之后）**：

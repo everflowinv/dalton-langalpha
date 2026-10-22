@@ -34,7 +34,8 @@
 | `sec` (`researchdata` 或 `dalton_sec`) | `sec:{accession}` | `filing` | `"SEC EDGAR"` | `filing_date` (`filed`) |
 | `estimates` (`consensus`) | `estimates:yahoo:{ticker}:{fetched_at}` | `street_estimate` | `"Yahoo Finance via yfinance"` | `fetched_at` |
 | `fred` / `treasury` | `fred:{series}` / `treasury:{dataset}` | `official_data` | `"FRED"` / `"US Treasury"` | `observation_date` |
-| `cn-hk` (`filings`) | `cninfo:{id}` | `filing` | `"巨潮资讯"` | 公告日期 |
+| `cn-hk` (`filings`) | `cn-hk:{ticker}:{date}:{index}` | `filing` | `"cninfo"`（巨潮资讯；港股未覆盖时补 HKEXnews 原文链接） | 公告日期 (`date`) |
+| `cn-hk` (`ask`) | 无独立归档 ID（平台聚合表） | 二手初值线索（非 `filing`，核心财务数须回公告核实） | 底层平台（AkShare / 东财 / 同花顺 / 新浪等，见 `plan.source`） | 报告期 / 查询日（无历史 as-of 保证） |
 
 ---
 
@@ -80,7 +81,7 @@
 
 ## 8. 数字底表原则（Primary Table Rule）
 
-- **目标公司的历史财务数字只取一手法定底表**（SEC 10-K/10-Q/20-F 或官方财报附注）：研报、新闻或摘要里引用的目标公司历史财务数据只能作线索，入表与成稿前必须用 `dalton_sec` 或 `researchdata.finance(route="sec")` 核对底表。
+- **目标公司的历史财务数字只取一手法定底表**（美股 SEC 10-K/10-Q/20-F、港股 HKEX 披露易业绩公告与年报/中报、A 股巨潮资讯法定定期报告与公告附注）：研报、新闻、摘要或 `researchdata.finance(route="cn-hk", operation="ask")` 平台财务表里引用的目标公司历史财务数据只能作初筛线索与初值，入表与成稿前美股必须用 `dalton_sec` 或 `researchdata.finance(route="sec")` 核对底表，港股与 A 股必须用 `researchdata.finance(route="cn-hk", operation="filings", ticker=..., start=..., end=..., limit=...)` 调取官方公告原文/PDF（港股若 `cn-hk filings` 未覆盖则用 `web_search` 查 HKEXnews `site:hkexnews.hk` 原文链接）核实。
 - **拿不到就写"本轮未取得"**：如果某个细分指标底表未披露，直接写"未披露 / 本轮未取得"，**严禁用口径相近但不同的数字顶替**（例如不得用总 GMV 顶替自营 GMV，不得用含税收入顶替不含税收入）。
 
 ---
@@ -101,3 +102,25 @@
 
 - **Guidepoint 专家材料**：单次直接原文引用**不超过 20 个英文词**（或等长中文），且必须附带 `source_attribution`（专家职位/公司身份 + 访谈日期，不写姓名）。
 - **其他受版权保护的研报与纪要**：直接原文引用**不超过连续 3 句话**；超出部分必须使用分析性转述并标注来源身份与日期。
+
+---
+
+## 11. 港股与 A 股（`cn-hk`）数据口径与核验纪律
+
+针对港股（HKEX）与 A 股（上交所/深交所/北交所）标的，调用 `researchdata.finance(route="cn-hk", ...)` 时必须严格执行以下四条口径规则：
+
+1. **平台财务表属二手初值，核心数字必须回法定公告核实**：
+   - `researchdata.finance(route="cn-hk", operation="ask", query=..., limit=...)` 返回的利润表、资产负债表、现金流量表、财务指标、估值与分红回购汇总（底层源自 AkShare、东方财富、同花顺、新浪、腾讯等公开聚合接口）均属于**二手数据，仅可作为初筛与初值线索**。
+   - 凡进入数字底表（`facts.md`）、财务镜头、财报点评或正式报告的**核心财务数字**（营业收入、毛利、营业利润、归母净利润、Non-IFRS/经调整利润、现金及定期存款、受限资金、理财/FVPL、有息负债、总股本、分红与实际回购金额），必须调用 `researchdata.finance(route="cn-hk", operation="filings", ticker=..., start=..., end=..., limit=...)` 获取巨潮资讯（cninfo）法定公告 PDF（`pdf_link`）或原文核实。
+   - **港股披露易（HKEXnews）退路**：若港股某份业绩公告、翌日披露报表（Next Day Disclosure Return）或通函未被 `cn-hk` 的 `operation="filings"` 覆盖，必须使用 `web_search` 检索港交所披露易（`site:hkexnews.hk` 或公司 IR 官网）并核对公告原文链接与正文。
+2. **Bridge 参数 Schema 与代码格式约束**：
+   - `cn-hk` 只用 `operation`（`"ask"` 或 `"filings"`）、`ticker`、`query`、`start`（`YYYY-MM-DD`）、`end`（`YYYY-MM-DD`）、`limit`（`1..100`）。
+   - `operation="filings"` 必传 `ticker`、`start`、`end`：`filings` 的 `end` 不得晚于当天（`TODAY`），否则整次调用失败（返回 `ok: false`）；当检索窗口终点做跨日外推（如 `end_plus_1d`）时，必须取 `end=min(end_plus_1d, TODAY)`。`ticker` 必须传**纯数字代码**——港股传 **5 位零填充数字**（如 `"00700"`、`"03690"`、`"09988"`），A 股传 **6 位纯数字**（如 `"600519"`、`"300750"`、`"000858"`），**不得带 `.HK` / `.SS` / `.SZ` 后缀**。
+   - `operation="ask"` 必传自然语言 `query`，每次调用只查**单一意图**（不要在同一条 query 中拼接多个意图）：在 `query` 中写明 5 位港股代码、6 位 A 股代码或中文简称及单一意图；其中资金流类查询必须带具体日期（如 `"宁德时代 300750 2026-10-21 主力资金净流入和成交额"`），两融、龙虎榜、十大股东、分红、回购、三表与 AH 溢价等各自单独调用一条 `ask`（如 `"00700 港股利润表"`、`"00700 港股资产负债表"`、`"600519 2026-10-21 两融"`、`"600519 2026-10-21 龙虎榜"`、`"600519 十大股东"`、`"00700 分红"`、`"00700 回购"`、`"AH溢价"`）。
+3. **复权、分红、拆股、资金流回退口径与币种核对**：
+   - **`ask` 返回的 `summary` 与回退口径核查**：必须读取 `ask` 返回的 `summary` 和实际来源（`plan.source`）；例如东财资金流接口失败时会自动退到同花顺**当日即时**口径并在 `summary` 里注明，成稿必须标注实际口径，若拿不到指定历史日的数据就如实写明缺口，不得把即时/最新值当作窗口内历史日终数。
+   - **回报与复权口径**：核对区间涨跌幅与历史股东回报时，必须核实前/后复权状态（`cn-hk` 底层 A 股日线默认前复权 `qfq`，港股日线默认不复权；当触发腾讯/新浪/东财跨源回退时，必须检查返回中的 `plan.source` 并在底稿注明复权口径），同时核查区间内的现金分红、送转股、拆股/合股除权。
+   - **交易币种与报表币种严格分离**：港股大量公司以港币交易（`listing_currency="HKD"`）、以人民币或美元编制财报（`financial_currency="CNY"` 或 `"USD"`）；A 股以人民币交易并编制财报（`CNY`）。运行 `anchors.py` 及计算市值、EV、每股指标与三把财务镜头时，必须显式传入 `--listing-currency`、`--financial-currency` 及对应汇率（`--listing-fx-rate`、`--fx-rate`），**严禁把港币市值/股价与人民币报表金额按 1:1 混算或套错汇率**。
+   - **A+H 双重上市股本对齐**：对 A+H 两地上市公司，总市值与稀释总股本必须覆盖全部已发行股份（A 股 + H 股总和，并参考 `operation="ask", query="AH溢价"` 核对两地价差），与合并财务报表口径保持一致。
+4. **无历史 Point-in-Time（`as-of`）保证**：
+   - `cn-hk` 的日期窗口仅过滤交易日或报告期，不代表历史某时点可见的未重述版本；涉及历史回测或跨期对比时需结合法定公告发布日期（`filed` / `date`）核实。

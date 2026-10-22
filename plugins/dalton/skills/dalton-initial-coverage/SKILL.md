@@ -18,7 +18,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 
 - `ticker`：规范股票代码（如 `META`、`APP`）
 - `company`：公司名称
-- `market`：市场（本阶段支持 `US`；港股/A 股深度支持在 P6）
+- `market`：市场（支持 `US`、`HK`、`CN`；港股与 A 股通过 `researchdata.finance(route="cn-hk", operation="filings"|"ask", ...)` 获取法定公告、财务表初值、行情、资金流、两融、股东与 AH 溢价——平台财务表仅作二手初值线索，核心财务数字必须回法定公告原文核实，港股披露易未覆盖时用 `web_search` 查 `site:hkexnews.hk` 原文链接，回报与估值核对复权、分红、拆股与交易/报表币种）
 - `workspace_dir`：当前公司工作区根目录（如 `.` 或工作区路径）
 - `as_of`：基准日期（`YYYY-MM-DD`，默认今天）
 - `peers`（可选）：可比同业代码列表；不提供时由行业支线与估值支线自行选定 5–8 家竞争对手及 ≥3 家一档可比公司，并写明选取理由

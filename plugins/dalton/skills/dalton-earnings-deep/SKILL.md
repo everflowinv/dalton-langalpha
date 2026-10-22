@@ -49,7 +49,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
        --benchmarks QQQ,SPY --sector-etf XLC --markdown
      ```
    - **卖方与独立研究窗口**：检索发布时刻至发布后 3 个交易日内的 AlphaEngine 卖方报告、FUNDA AI 与 TMTB 点评，以及 `[T0, T0+24h)` 的 `sales-notes`。
-   - **证据层级与四类信息标注**：遵守 `10-Q/10-K > 8-K EX-99.1 > 新闻稿 > 演示稿 > 电话会` 优先级；只在电话会口头提及的指引标 `call-only guidance`；所有内容严格区分 **事实 / 管理层指引 / 市场预期 / 研究判断**。
+   - **证据层级与四类信息标注**：美股遵守 `10-Q/10-K > 8-K EX-99.1 > 新闻稿 > 演示稿 > 电话会` 优先级；港股与 A 股通过 `researchdata.finance(route="cn-hk", operation="filings", ticker=CODE_5_OR_6, start=..., end=..., limit=20)` 调取法定定期报告与业绩公告（港股未覆盖时用 `web_search` 查披露易 `site:hkexnews.hk` 原文链接），`operation="ask"` 平台财务表仅作二手初值，核心数字一律回公告核实，并核对复权、分红、拆股与交易/报表币种；只在电话会口头提及的指引标 `call-only guidance`；所有内容严格区分 **事实 / 管理层指引 / 市场预期 / 研究判断**。
 
 2. **支线 B —— Excel 模型更新（`model_path` 非空时运行）**：
    - 先读 `.agents/skills/model-update/SKILL.md`，触发类型设为 `Results`。

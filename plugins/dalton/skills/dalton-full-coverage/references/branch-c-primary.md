@@ -8,8 +8,8 @@
 
 ## 产出章节结构（C1–C7，按顺序撰写）
 
-### C1. 最近 4 份定期报告精读与跨期 Diff（10-K/20-F 与 10-Q/6-K）
-使用 `dalton_sec.list_filings`、`researchdata.finance(route="sec")`（`read-item`、`search-text`、`attachments`）及自带 `get_sec_filing` 逐期比对最近 4 份定期报告：
+### C1. 最近 4 份定期报告精读与跨期 Diff（10-K/20-F、10-Q/6-K 及港股/A 股定期报告）
+美股使用 `dalton_sec.list_filings`、`researchdata.finance(route="sec")`（`read-item`、`search-text`、`attachments`）及自带 `get_sec_filing`；港股与 A 股调用 `researchdata.finance(route="cn-hk", operation="filings", ticker=CODE_5_OR_6, start=..., end=..., limit=20)`（港股传 5 位零填充纯数字如 `"00700"`，A 股传 6 位纯数字如 `"600519"`；港股披露易若未覆盖则用 `web_search` 查 `site:hkexnews.hk` 原文链接；`operation="ask"` 平台财务表仅作二手初值线索，核心数字一律回法定公告核实并引用 `facts.md`）逐期比对最近 4 份定期报告：
 1. **MD&A 措辞漂移**：管理层对收入增长驱动、利润率变化、资本开支回报的解释口径在过去 4 个季度是否发生微妙变化（例如从强调“新增客户数”转向强调“存量大客户 ARPU”，或停止披露某个曾经高调宣传的运营指标）。
 2. **Risk Factors（风险因素）逐条 Diff**：对比最新定期报告与上一期的 Risk Factors，**重点标出新增条目、删除条目、排序大幅前移或措辞从“可能（may）”升级为“已经（have experienced）”的条目**——这是最具前瞻信息量的法律披露。
 3. **分部披露与口径变更**：分部划分、分部利润定义或成本分摊规则是否发生重述或合并，解释背后的经营意图。
@@ -48,10 +48,10 @@
    - **指标差异**：收入指引和利润率/费用指引哪个更保守？
    - **年度指引修正节奏**：公司通常在哪一个季度（如 Q4 报或 Q1 报）给出全年初始指引，又通常在哪个季度（如 Q2 或 Q3）开始上修或下修全年区间？
 
-### C5. 重大 8-K 事件、内部人交易与股权结构变化
-- **8-K / 6-K 重大事项**：过去 12–24 个月的并购重组、大额发债/增发、核心高管/CFO/审计师变更、重大诉讼或监管调查。
-- **内部人交易（Form 4 / 144）**：梳理高管与董事近一年的增减持方向、金额、均价，**必须区分属于预先设定的 10b5-1 自动交易计划还是非计划主动买卖（Open Market Purchase / Sale）**。
-- **大股东与投票权结构（SC 13D/13G & Proxy）**：创始人投票权比例（AB 股双层架构）、主要机构股东进出。
+### C5. 重大 8-K/临时公告事件、内部人交易与股权结构变化
+- **8-K / 6-K 及港股/A 股重大临时公告**：过去 12–24 个月的并购重组、大额发债/配售增发、核心高管/CFO/审计师变更、重大诉讼或监管调查（港股与 A 股通过 `researchdata.finance(route="cn-hk", operation="filings", ticker=CODE_5_OR_6, start=..., end=..., limit=50)` 检索，港股披露易未覆盖时用 `web_search` 查 `site:hkexnews.hk` 原文链接）。
+- **内部人交易（Form 4 / 144 及港股权益披露 / A 股董监高增减持）**：梳理高管与董事近一年的增减持方向、金额、均价；美股**必须区分属于预先设定的 10b5-1 自动交易计划还是非计划主动买卖（Open Market Purchase / Sale）**；港股与 A 股按单一意图分别调用 `researchdata.finance(route="cn-hk", operation="ask", query=f"{code_or_name} 高管持股", limit=50)` 与 `researchdata.finance(route="cn-hk", operation="ask", query=f"{code_or_name} 限售解禁", limit=50)`，结合法定减持/增持公告及港交所披露易权益披露（DI）核实。
+- **大股东与投票权结构（SC 13D/13G & Proxy / 十大股东）**：创始人投票权比例（AB 股/同股不同权架构）、主要机构股东进出与股权质押情况（港股与 A 股按单一意图分别调用 `researchdata.finance(route="cn-hk", operation="ask", query=f"{code_or_name} 十大股东", limit=50)` 与 `researchdata.finance(route="cn-hk", operation="ask", query=f"{code_or_name} 股权质押", limit=50)` 并回定期报告核实）。
 
 ### C6. 逐题证据小结与缺口
 - 按 `references/branch-common.md` 第四节格式，汇总 Q1–Q5、Q9、Q10、Q12 的一手证据、最强反证与未决缺口。

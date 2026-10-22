@@ -8,7 +8,7 @@
 
 ### 1. 一手证据优先级阶梯（Evidence Ladder）
 报告中所有实际财务与经营数字必须按以下优先级从高到低采信，并在句末或表注给出可在 30 秒内定位的出处（文件 + 页码/表名/章节/电话会说话人）：
-1. 已提交的当季 **`10-Q` / `10-K`**（外国私人发行人 **`6-K` / `20-F`**，港股 P6 为 **HKEX 业绩公告**）；
+1. 已提交的当季 **`10-Q` / `10-K`**（外国私人发行人 **`6-K` / `20-F`**；港股与 A 股为通过 `researchdata.finance(route="cn-hk", operation="filings", ticker=CODE_5_OR_6, start=..., end=..., limit=20)` 获取的 **HKEX 披露易业绩公告/中报/年报与巨潮资讯法定定期报告**，港股若 `cn-hk filings` 未覆盖则用 `web_search` 查 `site:hkexnews.hk` 原文链接；`researchdata.finance(route="cn-hk", operation="ask", ...)` 平台财务表仅作二手初值线索，核心财务数字必须回法定公告原文核实）；
 2. 披露当季业绩的 **`8-K EX-99.1`** 及其财务附表（Financial Supplement）；
 3. 公司官方 **财报新闻稿（Earnings Release）**；
 4. 公司官方 **业绩演示 PPT（Investor Presentation）与预备发言稿（Prepared Remarks）**；
@@ -215,7 +215,7 @@
 ### 资料来源
 
 完整列出本报告采用的每一份一手与二手材料：
-- **SEC / 监管 Filings**：10-Q / 10-K / 8-K / 6-K 链接与 accession 编号
+- **SEC / 港股与 A 股监管 Filings**：美股 10-Q / 10-K / 8-K / 6-K 链接与 accession 编号；港股与 A 股 `cn-hk` 法定公告 `document_id`（`cn-hk:{ticker}:{date}:{index}`）、巨潮资讯 `pdf_link` 或港交所披露易（HKEXnews）原文链接
 - **公司 IR 材料**：财报新闻稿、业绩会演示 PPT、Financial Supplement URL
 - **电话会纪要**：AlphaEngine `doc_id` 与标题、日期
 - **内部研究库（AlphaEngine / FUNDA AI / TMTB / Sales Notes）**：机构/来源身份、标题、发布日期与 `doc_id` / `funda:ID` / `tmtb:ID` / `mail:ID`

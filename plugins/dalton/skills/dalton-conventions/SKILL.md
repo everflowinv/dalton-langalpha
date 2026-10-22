@@ -66,7 +66,8 @@ Dalton 继承 `.agents/skills/research-conventions/SKILL.md` 的通用投研纪�
 ## 6. 数据入口速查
 
 - **内部研究与另类数据（`researchdata`）**：各来源提供的证据与 `research` 路由选用规则，统一以 `<mcp-servers>` 中 `researchdata` 的说明与 `.agents/tools/docs/researchdata/research.md`（由 `scripts/dalton/researchdata_bridge.py` 的 `RESEARCH_EVIDENCE_AND_ROUTE_GUIDE` 单一来源生成，并在运行期结合 `catalog()`）为准；此外，`finance` 工具支持 `sec`、`estimates`、`cn-hk`，`macro` 工具支持 `fred`、`treasury`。
-- **一手 SEC 财报与核验（`dalton_sec`）**：`get_company_facts`（提取 R1–R10 规范期间与衍生单季值）、`list_filings`（按 accession 列举申报文件并配合脚本核验）。
+- **一手 SEC 财报与核验（`dalton_sec`）**：美股使用 `get_company_facts`（提取 R1–R10 规范期间与衍生单季值）、`list_filings`（按 accession 列举申报文件并配合脚本核验）。
+- **港股与 A 股公告及数据（`cn-hk`）**：调用 `researchdata.finance(route="cn-hk", operation="filings", ticker=..., start=..., end=..., limit=...)` 获取巨潮资讯（cninfo）A 股/港股公告与 PDF 链接（港股传 5 位纯数字如 `"00700"`，A 股传 6 位纯数字如 `"600519"`；港股披露易若未覆盖则用 `web_search` 查 `site:hkexnews.hk` 原文链接）；调用 `researchdata.finance(route="cn-hk", operation="ask", query=..., limit=...)` 查询行情、资金流、两融、龙虎榜、股东、分红回购、AH 溢价及财务表初值（平台财务表属二手初值，核心财务数字必须回公告原文核实；回报与估值须核对复权、分红、拆股与交易/报表币种）。
 - **行情与历史估值（默认 `yfinance`）**：股价、复权收益率与相对表现默认使用 `yf_price`（配合 `.agents/skills/research-conventions/references/market-data-rules.md` 统一基准日）；历史估值倍数使用 `fundamentals.get_historical_valuation` 或 `yf_fundamentals`。
 - **卖方一致预期（`estimates`）**：调用 `researchdata.finance(route="estimates", ticker=T)`，一律标为 `street_estimate`（写明 `"Yahoo Finance via yfinance"`、`fetched_at`、期间键与分析师人数）。Yahoo 无历史 as-of，每次取数必须保存快照到工作区 `data/consensus/<YYYY-MM-DD_HHMM>.json`（附 `_meta{route, fetched_at, source}`）；其中的 `implied_model` 是模型推导（税率默认取最近一季），必须标为 `model-derived`。
 

@@ -26,11 +26,14 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 ### Step 1：确认报告期间与三期对比基线
 - 核实最新发布的财年与财季标签（沿用公司自身命名，如 `FY26Q3`，严格区分财季与自然季）。
 - 准备三组对比期间：**当季（Current Quarter）、上一季（Prior Quarter）、去年同期（Year-Ago Quarter）**。
-- 若正式 `10-Q` / `10-K` 尚未提交，使用财报 `8-K EX-99.1`（外国私人发行人用 `6-K` 业绩附件；港股在 P6 用 HKEX 公告）并在 `Sources` 中明确注明。
+- 若美股正式 `10-Q` / `10-K` 尚未提交，使用财报 `8-K EX-99.1`（外国私人发行人用 `6-K` 业绩附件）；港股与 A 股使用 `researchdata.finance(route="cn-hk", operation="filings", ticker=CODE_5_OR_6, start=..., end=..., limit=20)` 调取的巨潮资讯（cninfo）定期报告/业绩公告或港交所披露易（HKEXnews）官方业绩公告，并在 `Sources` 中明确注明。
 
 ### Step 2：一手披露先行（含上一季同比与上次指引）
-- 通过 `dalton_sec.list_filings` / `researchdata.finance(route="sec")` 及公司 IR 页面获取当季财报新闻稿（Earnings Release）、财务补充表（Financial Supplement）和演示稿（Investor Presentation）。
-- **强制调取上一季财报新闻稿或电话会**：提取**上一季报告的同比增速（prior-quarter YoY）**与**上一季发布的本季/全年官方指引**。**严禁拿本季环比（QoQ）冒充“上一季同比增速”**，也严禁凭卖方转述代替上次官方指引。
+- **美股（含 ADR）**：通过 `dalton_sec.list_filings` / `researchdata.finance(route="sec")` 及公司 IR 页面获取当季财报新闻稿（Earnings Release）、财务补充表（Financial Supplement）和演示稿（Investor Presentation）。
+- **港股与 A 股（`route="cn-hk"`）**：
+  1. 在 PTC 中调用 `researchdata.finance(route="cn-hk", operation="filings", ticker=CODE_5_OR_6, start=SEARCH_START, end=min(SEARCH_END, TODAY), limit=20)`（`end` 不得晚于当天 `TODAY`；港股传 5 位零填充纯数字如 `"00700"`，A 股传 6 位纯数字如 `"600519"`，不带 `.HK`/`.SS`/`.SZ` 后缀），获取当季及上一季的定期报告、业绩公告、业绩快报/预告原文与 `pdf_link`；若港股披露易（HKEXnews）公告未被 `cn-hk` 的 `filings` 覆盖，必须使用 `web_search` 检索披露易（`site:hkexnews.hk`）及公司 IR 页面并核对公告原文链接。
+  2. 可按单一意图分别调用 `researchdata.finance(route="cn-hk", operation="ask", query=f"{code_or_name} 利润表", limit=20)`（港股查 `f"{code_or_name} 港股利润表"`）或 `query=f"{code_or_name} 业绩快报"` 提取平台财务摘要作为初值线索，但**所有核心财务数字与分部/KPI 数据必须回法定公告原文核实**，并严格核对报表币种（`CNY`/`HKD`/`USD`）与会计准则口径（IFRS / CAS / Non-IFRS）。
+- **强制调取上一季财报新闻稿、公告或电话会**：提取**上一季报告的同比增速（prior-quarter YoY）**与**上一季发布的本季/全年官方指引**。**严禁拿本季环比（QoQ）冒充“上一季同比增速”**，也严禁凭卖方转述代替上次官方指引。
 
 ### Step 3：电话会全文与 Q&A 提炼
 - 调用 `researchdata.research(route="transcript", ticker=T, limit=2)` 定位本次财报电话会，并用 `researchdata.research(route="alphaengine", operation="get_document", params={"doc_id": ...})` 按 `offset` 分页读完全文。

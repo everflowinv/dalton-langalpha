@@ -23,11 +23,11 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 
 - `ticker`：规范股票代码（如 `META`、`MSFT`）
 - `company`：公司名称
-- `market`：市场（本阶段支持 `US`）
+- `market`：市场（支持 `US`、`HK`、`CN`；港股与 A 股的一手公告与财务初值通过 `researchdata.finance(route="cn-hk", operation="filings"|"ask", ...)` 获取，平台财务表仅作二手初值线索，核心财务数字必须回法定公告原文核实，港股披露易未覆盖时用 `web_search` 查 `site:hkexnews.hk` 原文链接；回报与估值核对复权、分红、拆股与币种）
 - `workspace_dir`：当前公司工作区路径
 - `as_of`：基准日期（`YYYY-MM-DD`）
 - `profile`：`"tob"`（面向企业）或 `"toc"`（面向消费者），决定 D 支线做从业者信号表还是多平台产品体验表
-- `form`：`"10-K"`（美国本土发行人）或 `"20-F"`（外国私人发行人）
+- `form`：`"10-K"`（美国本土发行人）、`"20-F"`（外国私人发行人）或 `"annual_report"`（港股/A 股年度报告）
 - `pm_brief`（可选）：PM 的具体研究指示或假设
 - `focus_questions`（可选）：PM 要求重点深挖的问题列表
 

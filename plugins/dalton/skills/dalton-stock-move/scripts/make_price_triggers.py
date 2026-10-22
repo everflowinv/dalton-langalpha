@@ -139,7 +139,7 @@ def main() -> int:
     parser.add_argument("--out-dir", required=True, help="输出目录路径")
     parser.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD_PCT, help="默认单日涨跌触发阈值百分数（默认 4.0）")
     parser.add_argument("--compute-vol", action="store_true", help="对高波动股票按 2 倍 60 日日波动率动态计算阈值")
-    parser.add_argument("--include-non-us", action="store_true", help="是否包含港股/A股（本阶段默认只生成美股）")
+    parser.add_argument("--include-non-us", action="store_true", help="是否包含港股/A股（默认只生成美股，传此参数同时生成 .HK/.SS/.SZ 标的）")
     parser.add_argument("--delivery", help="指定 PM 通知渠道（逗号分隔）")
     parser.add_argument("--json", action="store_true", help="输出 JSON 汇总")
 
@@ -177,9 +177,9 @@ def main() -> int:
             continue
         market = str(c.get("market") or "US").upper()
         if not args.include_non_us and (market != "US" or "." in ticker or len(ticker) > 10):
-            skipped.append({"ticker": ticker, "reason": "non_us_deferred_to_p6"})
+            skipped.append({"ticker": ticker, "reason": "non_us_skipped_by_default"})
             continue
-        if not re.match(r"^[A-Z0-9-]{1,10}$", ticker):
+        if not re.match(r"^[A-Z0-9.-]{1,12}$", ticker):
             skipped.append({"ticker": ticker, "reason": "invalid_symbol_format"})
             continue
 

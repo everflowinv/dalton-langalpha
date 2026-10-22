@@ -26,7 +26,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 1. **窗口定义**：
    - `end`：最近一个完整交易日收盘日期（`YYYY-MM-DD`）；
    - `base`：上周同一工作日收盘日期（默认 `end` 往前 7–8 个自然日，对齐 1W 完整交易周）；
-   - 港股、A 股或美股休市日在周会稿开头注明，休市市场不参与当周横截面比较（本阶段港股/A 股只做价格筛选，深度检索在 P6）。
+   - 港股、A 股或美股休市日在周会稿开头注明，休市市场不参与当周横截面比较；港股与 A 股覆盖标的全量接入深度检索（除内部研究库、AlphaEngine、新闻与 X 外，统一通过 `researchdata.finance(route="cn-hk", operation="filings"|"ask", ...)` 检索巨潮/港股公告、资金流、两融、龙虎榜、回购分红与 AH 溢价，港股披露易未覆盖时用 `web_search` 查 HKEXnews 原文链接；平台财务表仅作二手初值，核心财务数回公告核实，回报核对复权、分红、拆股与币种）。
 2. **覆盖名单路径**：`Home/dalton/coverage.yaml`（工作区内相对路径 `dalton/coverage.yaml`）。
 
 ### 第 2 步：启动 `weekly-coverage-review` Workflow

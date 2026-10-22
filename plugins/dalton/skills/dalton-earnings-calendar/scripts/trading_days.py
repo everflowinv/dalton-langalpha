@@ -9,7 +9,7 @@ Usage:
 Priority:
   1. exchange_calendars (if installed in sandbox)
   2. pandas_market_calendars (if installed in sandbox)
-  3. Built-in stdlib NYSE/US market holiday calendar (XNYS/XNAS) & weekday fallback for XHKG/XSHG (full HK/CN calendar in P6)
+  3. Built-in stdlib NYSE/US market holiday calendar (XNYS/XNAS); for XHKG/XSHG/XSHE, stdlib only covers a subset of Gregorian fixed holidays (excludes lunar holidays, mainland lieu-day adjustments, and HK make-up holidays — prioritize external exchange calendars when scheduling HK/A-share dates)
 """
 
 import argparse
@@ -125,13 +125,57 @@ def us_nyse_holidays(year: int) -> set[date]:
     return holidays
 
 
+def hk_fixed_holidays(year: int) -> set[date]:
+    """Return a subset of Gregorian fixed HKEX holidays for `year` (stdlib fallback only).
+
+    Note: Excludes lunar holidays (Lunar New Year, Ching Ming, Buddha's Birthday,
+    Dragon Boat, Mid-Autumn, Chung Yeung) and HK make-up holidays (补假). Cannot
+    be used as a complete exchange calendar; prioritize external exchange calendars
+    when scheduling HK dates.
+    """
+    easter = _easter_sunday(year)
+    holidays: set[date] = {
+        date(year, 1, 1),   # New Year's Day
+        easter - timedelta(days=2),  # Good Friday
+        easter + timedelta(days=1),  # Easter Monday
+        date(year, 5, 1),   # Labour Day
+        date(year, 7, 1),   # HKSAR Establishment Day
+        date(year, 10, 1),  # National Day
+        date(year, 12, 25), # Christmas Day
+        date(year, 12, 26), # First weekday after Christmas Day
+    }
+    return holidays
+
+
+def cn_fixed_holidays(year: int) -> set[date]:
+    """Return a subset of Gregorian fixed A-share (SSE/SZSE) holidays for `year` (stdlib fallback only).
+
+    Note: Excludes lunar holidays (Spring Festival, Qingming, Dragon Boat, Mid-Autumn)
+    and State Council lieu-day/bridge adjustments (调休/补假). Cannot be used as a
+    complete exchange calendar; prioritize external exchange calendars when scheduling
+    A-share dates.
+    """
+    return {
+        date(year, 1, 1),   # New Year's Day
+        date(year, 5, 1),   # Labour Day
+        date(year, 10, 1),  # National Day (Oct 1-3 fixed Gregorian subset)
+        date(year, 10, 2),
+        date(year, 10, 3),
+    }
+
+
 def is_trading_day_stdlib(d: date, exchange: str = "XNYS") -> bool:
     if d.weekday() >= 5:
         return False
     ex = exchange.upper()
     if ex in ("XNYS", "XNAS", "NYSE", "NASDAQ", "US"):
         return d not in us_nyse_holidays(d.year)
-    # P6 adds full XHKG/XSHG holiday tables; weekday check + Jan 1 / Oct 1 / May 1 basic guard
+    # HK/CN stdlib fallback only checks a subset of Gregorian fixed holidays (no lunar/调休/补假);
+    # use external exchange calendars first when scheduling HK/A-share dates.
+    if ex in ("XHKG", "HKEX", "HK"):
+        return d not in hk_fixed_holidays(d.year)
+    if ex in ("XSHG", "XSHE", "SSE", "SZSE", "CN"):
+        return d not in cn_fixed_holidays(d.year)
     return True
 
 
