@@ -47,5 +47,6 @@ export function useActiveThreadPublisher(
     if (eff?.runId && TERMINAL_FAMILY.has(eff.status)) {
       markThreadSeen(tid, eff.runId);
     }
+  // DALTON-HOOK(team-sharing): read-only for a teammate's workspace
   }, [tid, status, canMarkSeen]);
 }

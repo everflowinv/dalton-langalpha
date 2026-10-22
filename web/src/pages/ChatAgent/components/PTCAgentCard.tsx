@@ -340,6 +340,7 @@ function PTCAgentCard({ proposalData, onApprove, onReject, dispatcherContext }: 
         >
           {t('chat.ptcCard.decline')}
         </button>
+        {/* DALTON-HOOK(team-sharing): read-only for a teammate's workspace */}
       </div>
       </>
       )}

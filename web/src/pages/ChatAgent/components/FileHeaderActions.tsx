@@ -98,6 +98,7 @@ function FileHeaderActions({
   readFileFullFn,
   servePrefix,
   canShare = false,
+  // DALTON-HOOK(team-sharing): read-only for a teammate's workspace
   teamReadOnly = false,
   editorRef,
   canUndo,

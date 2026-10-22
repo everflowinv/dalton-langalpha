@@ -149,6 +149,7 @@ function StartQuestionCard({ proposalData, onApprove, onReject }: StartQuestionC
           <X className="h-3.5 w-3.5" />
           {t('chat.skip')}
         </motion.button>
+        {/* DALTON-HOOK(team-sharing): read-only for a teammate's workspace */}
       </div>
       )}
     </motion.div>

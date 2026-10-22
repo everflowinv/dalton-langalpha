@@ -286,6 +286,7 @@ function UserQuestionCard({ questionData, onAnswer, onSkip }: UserQuestionCardPr
     }
   };
 
+  // DALTON-HOOK(team-sharing): read-only for a teammate's workspace
   const canAct = Boolean(onAnswer || onSkip);
 
   return (
@@ -421,6 +422,7 @@ function UserQuestionCard({ questionData, onAnswer, onSkip }: UserQuestionCardPr
           <SkipForward className="h-3.5 w-3.5" />
           Skip
         </button>
+        {/* DALTON-HOOK(team-sharing): read-only for a teammate's workspace */}
       </div>
       </>
       )}

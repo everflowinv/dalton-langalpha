@@ -255,6 +255,7 @@ async def read_replay_page(
             before_turn=before_turn,
             limit=limit,
             turn_fallback=source == "auto",
+            # DALTON-HOOK(team-sharing): read-only for a teammate's workspace
             persist=persist,
         )
         return page, "checkpoint"

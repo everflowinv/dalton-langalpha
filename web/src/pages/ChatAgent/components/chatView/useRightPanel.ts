@@ -476,6 +476,7 @@ export function useRightPanel({
     if (data.loading && !data.url && appWorkspaceId) {
       resolveAndSetPreview(appWorkspaceId, data.port, data.command, data.path);
     }
+  // DALTON-HOOK(team-sharing): read-only for a teammate's workspace
   }, [readOnly, isMobile, landInFilePanel, filePanelWorkspaceId, leaveFiles, setFilePanelWorkspaceId, applyPanelWidth, pushPanelHistory, workspaceId, resolveAndSetPreview]);
 
   /**
@@ -652,6 +653,7 @@ export function useRightPanel({
     applyPanelWidth(detailPanelWidth(toolCallProcess));
     setRightPanelType('detail');
     pushPanelHistory();
+  // DALTON-HOOK(team-sharing): read-only for a teammate's workspace
   }, [readOnly, isMobile, getToolCallProcess, landInFilePanel, applyPanelWidth, pushPanelHistory, workspaceId, handleOpenPreview, watching]);
 
   // Close the mobile detail sheet

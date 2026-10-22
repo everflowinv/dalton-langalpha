@@ -202,6 +202,7 @@ function SecretaryConfirmCard({ proposalData, onApprove, onReject }: SecretaryCo
           <X className="h-3.5 w-3.5" />
           Decline
         </motion.button>
+        {/* DALTON-HOOK(team-sharing): read-only for a teammate's workspace */}
       </div>
       )}
     </motion.div>
