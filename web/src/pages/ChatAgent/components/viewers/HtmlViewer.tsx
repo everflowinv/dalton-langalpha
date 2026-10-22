@@ -107,6 +107,7 @@ export default function HtmlViewer({
         />
       );
     }
+    // DALTON-HOOK(team-sharing): a teammate's HTML previews from the mirror in a sandboxed iframe
     if (isReadOnlyMirror) {
       return (
         <iframe
@@ -157,6 +158,7 @@ export default function HtmlViewer({
           </button>
         </div>
         {/* Download/Save-as-PDF and the share link live in the file panel header. */}
+        {/* DALTON-HOOK(team-sharing): a teammate's HTML previews from the mirror in a sandboxed iframe */}
         <HtmlActionBar
           onFullscreen={() => setFullscreen(true)}
           fullscreenDisabled={!servedUrl && !isReadOnlyMirror}
