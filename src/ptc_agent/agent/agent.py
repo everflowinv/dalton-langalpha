@@ -449,6 +449,14 @@ class PTCAgent:
         )
         tools.append(web_search_tool)
         tools.append(web_fetch_tool)
+        # DALTON-HOOK(x-search-openclaw)
+        x_search_tools: list[Any] = []
+        if str(self.config.search_api or "").strip().lower() == "openclaw":
+            from src.dalton.web_search.x_search import build_x_search_tool
+
+            x_search_tool = build_x_search_tool()
+            tools.append(x_search_tool)
+            x_search_tools.append(x_search_tool)
 
         # Site-crawl tools (PTC-only): experimental opt-in feature, further
         # tier-gated at resolve time. The factory returns [] when the crawl
@@ -619,7 +627,7 @@ class PTCAgent:
                 execute_code=execute_code_tool,
                 bash=bash_tool,
                 filesystem=subagent_filesystem_tools,
-                web=[web_search_tool, web_fetch_tool],
+                web=[web_search_tool, web_fetch_tool, *x_search_tools],  # DALTON-HOOK(x-search-openclaw)
                 finance=finance_tools,
                 todo=todo_tools,
                 search_tool=search_tool,

@@ -27,9 +27,13 @@ import hmac
 import json
 import logging
 import os
+import re
 import stat
 import sys
 import time
+import urllib.error
+import urllib.request
+from datetime import date
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -46,6 +50,7 @@ from web_search_broker_protocol import (  # noqa: E402
     DEFAULT_QUEUE_TIMEOUT_SECONDS,
     DEFAULT_TIMEOUT_MS,
     WebSearchBrokerError,
+    _require_owner_only,
     build_core_request,
     compute_http_timeout_seconds,
     invoke_broker_over_socket,
@@ -61,6 +66,119 @@ logger = logging.getLogger("web_search_bridge")
 MAX_REQUEST_BYTES = 64 * 1024  # 64 KiB
 DEFAULT_QUEUE_TIMEOUT_S = DEFAULT_QUEUE_TIMEOUT_SECONDS
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_MAX_X_HANDLES = 20
+
+
+def _is_valid_yyyy_mm_dd(value: Any) -> bool:
+    if not isinstance(value, str) or not _DATE_RE.match(value):
+        return False
+    try:
+        date.fromisoformat(value)
+        return True
+    except ValueError:
+        return False
+
+
+def _normalize_x_handles(raw: Any, field_name: str) -> list[str] | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, list):
+        raise WebSearchBrokerError(
+            f"{field_name} must be a list of strings", code="INVALID_REQUEST"
+        )
+    cleaned: list[str] = []
+    for item in raw:
+        if not isinstance(item, str):
+            raise WebSearchBrokerError(
+                f"{field_name} entries must be strings", code="INVALID_REQUEST"
+            )
+        handle = item.strip().lstrip("@").strip()
+        if not handle:
+            raise WebSearchBrokerError(
+                f"{field_name} entries must not be empty", code="INVALID_REQUEST"
+            )
+        cleaned.append(handle)
+    if len(cleaned) > _MAX_X_HANDLES:
+        raise WebSearchBrokerError(
+            f"{field_name} cannot exceed {_MAX_X_HANDLES} handles",
+            code="INVALID_REQUEST",
+        )
+    return cleaned or None
+
+
+def invoke_broker_x_search(
+    *,
+    broker_url: str,
+    broker_token: str,
+    payload: Mapping[str, Any],
+    timeout_ms: int,
+    max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
+) -> dict[str, Any]:
+    """Invoke ``POST /dalton-broker/v1/x-search`` on the local OpenClaw gateway."""
+    endpoint = (
+        broker_url
+        if broker_url.endswith("/x-search")
+        else f"{broker_url.rstrip('/')}/x-search"
+    )
+    req_bytes = json.dumps(dict(payload), ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        endpoint,
+        data=req_bytes,
+        headers={
+            "Authorization": f"Bearer {broker_token}",
+            "Content-Type": "application/json; charset=utf-8",
+            "Accept": "application/json",
+        },
+        method="POST",
+    )
+    timeout_s = max(5.0, float(timeout_ms) / 1000.0 + 5.0)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            raw_bytes = resp.read(max_response_bytes + 1)
+    except urllib.error.HTTPError as exc:
+        try:
+            err_bytes = exc.read(max_response_bytes + 1)
+            parsed_err = json.loads(err_bytes.decode("utf-8", errors="replace"))
+            if isinstance(parsed_err, Mapping):
+                if parsed_err.get("ok") is False and isinstance(parsed_err.get("error"), Mapping):
+                    return dict(parsed_err)
+                inner_err = parsed_err.get("error")
+                if isinstance(inner_err, Mapping):
+                    return {
+                        "ok": False,
+                        "error": {
+                            "code": str(inner_err.get("code") or f"HTTP_{exc.code}"),
+                            "message": str(inner_err.get("message") or f"Broker HTTP {exc.code}"),
+                        },
+                    }
+        except Exception:
+            pass
+        raise WebSearchBrokerError(
+            f"OpenClaw broker returned HTTP {exc.code}", code="BROKER_HTTP_ERROR"
+        ) from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise WebSearchBrokerError(
+            f"OpenClaw broker unreachable: {type(exc).__name__}",
+            code="BROKER_UNAVAILABLE",
+        ) from exc
+
+    if len(raw_bytes) > max_response_bytes:
+        raise WebSearchBrokerError(
+            "OpenClaw broker response exceeded max_response_bytes",
+            code="FRAME_TOO_LARGE",
+        )
+    try:
+        parsed = json.loads(raw_bytes.decode("utf-8"))
+    except Exception as exc:
+        raise WebSearchBrokerError(
+            "OpenClaw broker returned non-JSON response", code="INVALID_JSON"
+        ) from exc
+    if not isinstance(parsed, Mapping):
+        raise WebSearchBrokerError(
+            "OpenClaw broker response must be a JSON object", code="INVALID_JSON"
+        )
+    return dict(parsed)
 
 
 def _load_env_file(path: Path) -> None:
@@ -89,14 +207,14 @@ class WebSearchBridgeConfig:
     """
 
     def __init__(self) -> None:
+        explicit_env_file = os.environ.get("DALTON_WEB_SEARCH_BRIDGE_ENV_FILE")
         env_path = Path(
-            os.environ.get(
-                "DALTON_WEB_SEARCH_BRIDGE_ENV_FILE",
-                os.path.expanduser("~/.config/dalton/web-search-bridge.env"),
-            )
+            explicit_env_file
+            or os.path.expanduser("~/.config/dalton/web-search-bridge.env")
         ).expanduser()
         self.env_path: Path = env_path
-        _load_env_file(env_path)
+        if explicit_env_file or "PYTEST_CURRENT_TEST" not in os.environ:
+            _load_env_file(env_path)
 
         raw_host = os.environ.get("DALTON_WEB_SEARCH_BRIDGE_HOST", "127.0.0.1").strip()
         if raw_host not in _LOOPBACK_HOSTS:
@@ -151,6 +269,23 @@ class WebSearchBridgeConfig:
             self.default_timeout_ms,
             queue_timeout_seconds=self.queue_timeout_s,
         )
+        self.broker_url: str = (
+            os.environ.get(
+                "DALTON_BROKER_URL",
+                "http://127.0.0.1:18789/dalton-broker/v1",
+            )
+            .strip()
+            .rstrip("/")
+        )
+        self.broker_token: str = os.environ.get("DALTON_BROKER_TOKEN", "").strip()
+        self.broker_token_path: Path = Path(
+            os.environ.get(
+                "DALTON_BROKER_TOKEN_PATH",
+                os.path.expanduser(
+                    "~/.openclaw/state/plugins/dalton-langalpha-broker/broker.token"
+                ),
+            )
+        ).expanduser()
 
 
 class WebSearchBridge:
@@ -350,6 +485,219 @@ class WebSearchBridge:
             return http_status, broker_reply
         return 200, broker_reply
 
+    def _load_broker_bearer_token(self) -> str:
+        if self.cfg.broker_token:
+            return self.cfg.broker_token
+        _require_owner_only(self.cfg.broker_token_path, "openclaw broker token")
+        try:
+            token = self.cfg.broker_token_path.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise WebSearchBrokerError(
+                f"Cannot read OpenClaw broker token file: {type(exc).__name__}",
+                code="BROKER_AUTH_UNAVAILABLE",
+            ) from exc
+        if not token:
+            raise WebSearchBrokerError(
+                "OpenClaw broker token file is empty",
+                code="BROKER_AUTH_UNAVAILABLE",
+            )
+        return token
+
+    async def handle_x_search(self, body: Mapping[str, Any]) -> tuple[int, dict[str, Any]]:
+        """Validate ``{query, handles?/allowed_x_handles?, excluded_x_handles?, from_date?, to_date?, timeoutMs?}``, queue on ``self.sem``, and call broker."""
+        query = body.get("query")
+        if not isinstance(query, str) or not query.strip():
+            return 400, {
+                "ok": False,
+                "error": {"code": "INVALID_REQUEST", "message": "query is required"},
+            }
+
+        raw_timeout = body.get("timeoutMs", self.cfg.default_timeout_ms)
+        if isinstance(raw_timeout, bool) or not isinstance(raw_timeout, int) or raw_timeout < 1:
+            return 400, {
+                "ok": False,
+                "error": {"code": "INVALID_REQUEST", "message": "timeoutMs must be a positive integer"},
+            }
+        timeout_ms = min(raw_timeout, DEFAULT_MAX_TIMEOUT_MS)
+
+        try:
+            raw_allowed = (
+                body.get("allowed_x_handles")
+                if "allowed_x_handles" in body
+                else body.get("handles")
+            )
+            allowed_handles = _normalize_x_handles(raw_allowed, "allowed_x_handles")
+            excluded_handles = _normalize_x_handles(
+                body.get("excluded_x_handles"), "excluded_x_handles"
+            )
+        except WebSearchBrokerError as exc:
+            return 400, {
+                "ok": False,
+                "error": {"code": exc.code, "message": str(exc)},
+            }
+
+        if allowed_handles and excluded_handles:
+            return 400, {
+                "ok": False,
+                "error": {
+                    "code": "INVALID_REQUEST",
+                    "message": "allowed_x_handles and excluded_x_handles cannot be combined",
+                },
+            }
+
+        from_date = body.get("from_date") if "from_date" in body else body.get("fromDate")
+        to_date = body.get("to_date") if "to_date" in body else body.get("toDate")
+        if from_date is not None and not _is_valid_yyyy_mm_dd(from_date):
+            return 400, {
+                "ok": False,
+                "error": {
+                    "code": "INVALID_REQUEST",
+                    "message": "from_date must be a YYYY-MM-DD string",
+                },
+            }
+        if to_date is not None and not _is_valid_yyyy_mm_dd(to_date):
+            return 400, {
+                "ok": False,
+                "error": {
+                    "code": "INVALID_REQUEST",
+                    "message": "to_date must be a YYYY-MM-DD string",
+                },
+            }
+        if from_date is not None and to_date is not None and from_date > to_date:
+            return 400, {
+                "ok": False,
+                "error": {
+                    "code": "INVALID_REQUEST",
+                    "message": "from_date must not be later than to_date",
+                },
+            }
+
+        broker_payload: dict[str, Any] = {
+            "query": query.strip(),
+            "timeoutMs": timeout_ms,
+        }
+        if allowed_handles:
+            broker_payload["allowed_x_handles"] = allowed_handles
+        if excluded_handles:
+            broker_payload["excluded_x_handles"] = excluded_handles
+        if from_date is not None:
+            broker_payload["from_date"] = from_date
+        if to_date is not None:
+            broker_payload["to_date"] = to_date
+
+        t0 = time.monotonic()
+        deadline = t0 + self.cfg.queue_timeout_s
+        try:
+            await asyncio.wait_for(self.sem.acquire(), timeout=self.cfg.queue_timeout_s)
+        except asyncio.TimeoutError:
+            elapsed_ms = int((time.monotonic() - t0) * 1000)
+            logger.warning(
+                "x_search bridge busy queue_timeout_s=%.1f elapsed_ms=%d",
+                self.cfg.queue_timeout_s,
+                elapsed_ms,
+            )
+            return 503, {
+                "ok": False,
+                "error": {
+                    "code": "bridge_busy",
+                    "message": "X search bridge is busy (concurrency queue timeout)",
+                },
+            }
+
+        try:
+            broker_token = self._load_broker_bearer_token()
+            backoff_s = 0.05
+            while True:
+                broker_reply = await asyncio.to_thread(
+                    invoke_broker_x_search,
+                    broker_url=self.cfg.broker_url,
+                    broker_token=broker_token,
+                    payload=broker_payload,
+                    timeout_ms=timeout_ms,
+                    max_response_bytes=DEFAULT_MAX_RESPONSE_BYTES,
+                )
+                ok_attempt = broker_reply.get("ok") is True
+                err_attempt = (
+                    broker_reply.get("error")
+                    if isinstance(broker_reply.get("error"), Mapping)
+                    else {}
+                )
+                err_code_attempt = (
+                    str(err_attempt.get("code") or "") if not ok_attempt else ""
+                )
+                if not ok_attempt and err_code_attempt == "bridge_busy":
+                    remaining_s = deadline - time.monotonic()
+                    if remaining_s <= 0:
+                        elapsed_ms = int((time.monotonic() - t0) * 1000)
+                        logger.warning(
+                            "x_search broker busy retry exhausted queue_timeout_s=%.1f elapsed_ms=%d",
+                            self.cfg.queue_timeout_s,
+                            elapsed_ms,
+                        )
+                        return 503, {
+                            "ok": False,
+                            "error": {
+                                "code": "bridge_busy",
+                                "message": "X search broker is busy (concurrency queue timeout)",
+                            },
+                        }
+                    await asyncio.sleep(min(backoff_s, remaining_s))
+                    backoff_s = min(backoff_s * 2.0, 0.5)
+                    continue
+                break
+        except WebSearchBrokerError as exc:
+            elapsed_ms = int((time.monotonic() - t0) * 1000)
+            logger.warning(
+                "x_search broker error code=%s elapsed_ms=%d",
+                exc.code,
+                elapsed_ms,
+            )
+            status = 400 if exc.code == "INVALID_REQUEST" else 503
+            return status, {
+                "ok": False,
+                "error": {"code": exc.code, "message": str(exc)},
+            }
+        except Exception as exc:
+            elapsed_ms = int((time.monotonic() - t0) * 1000)
+            logger.error(
+                "x_search bridge unexpected error type=%s elapsed_ms=%d",
+                type(exc).__name__,
+                elapsed_ms,
+            )
+            return 503, {
+                "ok": False,
+                "error": {
+                    "code": "BRIDGE_INTERNAL_ERROR",
+                    "message": "X search bridge internal error",
+                },
+            }
+        finally:
+            self.sem.release()
+
+        elapsed_ms = int((time.monotonic() - t0) * 1000)
+        ok = broker_reply.get("ok") is True
+        err_obj = broker_reply.get("error") if isinstance(broker_reply.get("error"), Mapping) else {}
+        err_code = str(err_obj.get("code") or "-") if not ok else "-"
+        logger.info(
+            "x_search completed status=%s error_code=%s elapsed_ms=%d",
+            "ok" if ok else "error",
+            err_code,
+            elapsed_ms,
+        )
+        if not ok:
+            if err_code in ("PROVIDER_RATE_LIMITED", "RATE_LIMITED"):
+                http_status = 429
+            elif err_code in ("PROVIDER_PERMISSION_DENIED", "AUTH_REQUIRED", "AUTH_INVALID", "AUTH_EXPIRED"):
+                http_status = 403
+            elif err_code in ("INVALID_REQUEST", "MISSING_FIELD", "UNKNOWN_FIELD"):
+                http_status = 400
+            elif err_code == "bridge_busy":
+                http_status = 503
+            else:
+                http_status = 502
+            return http_status, broker_reply
+        return 200, broker_reply
+
 
 async def _send_http(
     writer: asyncio.StreamWriter,
@@ -450,7 +798,7 @@ async def _handle_client(
             )
             return
 
-        if path not in ("/search", "/v1/search"):
+        if path not in ("/search", "/v1/search", "/x-search", "/v1/x-search"):
             await _send_http(writer, 404, "Not Found", {"ok": False, "error": "Not Found"})
             return
 
@@ -492,7 +840,10 @@ async def _handle_client(
             )
             return
 
-        status_code, reply_payload = await bridge.handle_search(body_obj)
+        if path in ("/x-search", "/v1/x-search"):
+            status_code, reply_payload = await bridge.handle_x_search(body_obj)
+        else:
+            status_code, reply_payload = await bridge.handle_search(body_obj)
         status_text = {
             200: "OK",
             400: "Bad Request",
