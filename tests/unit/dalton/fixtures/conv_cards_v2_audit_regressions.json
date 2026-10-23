@@ -1,0 +1,272 @@
+[
+  {
+    "card_id": "v2_b01fde7b1d24",
+    "type": "opinion",
+    "claim": "据Meta内部人士访谈，Muse上线约两周时日活大约100万，付费用户刚过1,000，免费档每周给1亿token，且该人士承认是在送钱、目前也没有确定怎么赚钱。",
+    "figures": [
+      {"metric": "Muse上线时长", "value": "约两周", "unit": "", "period": ""},
+      {"metric": "Muse日活", "value": 100, "unit": "万", "period": "上线约两周时"},
+      {"metric": "Muse付费用户", "value": ">1000", "unit": "人", "period": "上线约两周时"},
+      {"metric": "Muse免费档额度", "value": 1, "unit": "亿token/周", "period": ""}
+    ],
+    "quote": "上线约两周时，日活大约 100 万，付费用户刚过 1,000。免费档每周给 1 亿 token，他自己承认是「在送钱」，目前也没有确定怎么赚钱。",
+    "tickers": [],
+    "confidence": 0.7,
+    "topic_label": "Muse早期用户数据与免费额度",
+    "grok_verdict": {"fidelity": "✗", "figures": "△", "type": "✓", "tickers_topic": "✗"},
+    "codex_verdict": {"fidelity": "✗", "figures": "△", "type": "✓", "tickers_topic": "✗"}
+  },
+  {
+    "card_id": "v2_e1dbcdf39e31",
+    "type": "opinion",
+    "claim": "巴克莱（Ross Sandler，6/4）模型测算谷歌搜索量 2024 年为 4.8 万亿次、2025 年 5.2 万亿次（日均约 142 亿）、2026 年 5.5 万亿次（日均约 151 亿）、2027 年 5.8 万亿次、2028 年 6.1 万亿次，年增速 5% 到 7%；商业查询约占 20%（2026 年约 1.1 万亿次），平均每次搜索收入 $0.047，仅算商业查询约 $0.25。",
+    "figures": [
+      {"metric": "搜索量", "value": 4.8, "unit": "万亿次", "period": "2024"},
+      {"metric": "搜索量", "value": 5.2, "unit": "万亿次", "period": "2025"},
+      {"metric": "日均搜索量", "value": 142, "unit": "亿次", "period": "2025"},
+      {"metric": "搜索量", "value": 5.5, "unit": "万亿次", "period": "2026"},
+      {"metric": "日均搜索量", "value": 151, "unit": "亿次", "period": "2026"},
+      {"metric": "搜索量", "value": 5.8, "unit": "万亿次", "period": "2027"},
+      {"metric": "搜索量", "value": 6.1, "unit": "万亿次", "period": "2028"},
+      {"metric": "搜索量年增长率", "value": "5-7", "unit": "%", "period": ""},
+      {"metric": "商业查询占比", "value": 20, "unit": "%", "period": ""},
+      {"metric": "商业查询量", "value": 1.1, "unit": "万亿次", "period": "2026"},
+      {"metric": "平均每次搜索收入", "value": 0.047, "unit": "美元", "period": ""},
+      {"metric": "商业查询单次收入", "value": 0.25, "unit": "美元", "period": ""}
+    ],
+    "quote": "- 巴克莱（Ross Sandler，6/4）的模型：2025 年 5.2 万亿次（日均约 142 亿），2026 年 5.5 万亿次（日均约 151 亿），2027 年 5.8 万亿次，2028 年 6.1 万亿次，每年增长 5% 到 7%。商业查询约占 20%，2026 年约 1.1 万亿次。平均每次搜索收入 $0.047，只算商业查询的话约 $0.25。巴克莱给 2024 年的数是 4.8 万亿，比官方说法略低。",
+    "tickers": [],
+    "confidence": 0.9,
+    "topic_label": "Google 搜索量与 DAU 测算",
+    "grok_verdict": {"fidelity": "△", "figures": "△", "type": "✗", "tickers_topic": "✗"},
+    "codex_verdict": {"fidelity": "✗", "figures": "△", "type": "✗", "tickers_topic": "✗"}
+  },
+  {
+    "card_id": "v2_b64e8dd14d8e",
+    "type": "opinion",
+    "claim": "亚朵全年指引维持新开480-490家、关店约80家，净开约400+家；Q2只开了101家；在营酒店2,175家（+19.2%），pipeline为811家（对比2025年末779家仍在净增）；中期锚为5000家、5-7年，隐含每年净开400-470家。",
+    "figures": [
+      {"metric": "全年新开店指引", "value": "480-490", "unit": "家", "period": ""},
+      {"metric": "全年关店指引", "value": "~80", "unit": "家", "period": ""},
+      {"metric": "全年净开店指引", "value": "400+", "unit": "家", "period": ""},
+      {"metric": "开店数", "value": 101, "unit": "家", "period": "Q2"},
+      {"metric": "在营酒店数", "value": 2175, "unit": "家", "period": ""},
+      {"metric": "在营酒店增速", "value": 19.2, "unit": "%", "period": ""},
+      {"metric": "pipeline酒店数", "value": 811, "unit": "家", "period": ""},
+      {"metric": "pipeline酒店数", "value": 779, "unit": "家", "period": "2025年末"},
+      {"metric": "中期酒店数量目标", "value": 5000, "unit": "家", "period": "5-7年"},
+      {"metric": "中期目标隐含每年净开店数", "value": "400-470", "unit": "家", "period": ""}
+    ],
+    "quote": "背景：全年指引维持 480-490 家新开、关店约 80 家，净开约 400+。Q2 只开了 101 家，上半年明显低于全年进度的一半，所以\"下半年加速\"是指引能否达成的关键；酒店开业历来 Q4 最重，但市场想要证据而不是惯性。在营 2,175 家（+19.2%），pipeline 811 家（对比 2025 年末 779 家，还在净增）。中期锚是 5000 家、5-7 年，隐含每年净开 400-470 家。",
+    "tickers": [],
+    "confidence": 0.9,
+    "topic_label": "亚朵开店指引与pipeline情况",
+    "grok_verdict": {"fidelity": "△", "figures": "✓", "type": "✗", "tickers_topic": "✓"},
+    "codex_verdict": {"fidelity": "✗", "figures": "△", "type": "✗", "tickers_topic": "✗"}
+  },
+  {
+    "card_id": "v2_114c2aa5ca39",
+    "type": "fact",
+    "claim": "据 finviz/MarketBeat 经 Gemini 汇总的数据，MKSI 卖空股数在 8/14 为 549 万股（占比 8.16%），8 月底升至 625 万股（占比 9.64%）；yfinance 显示的卖空比例为 10.5%（期数不同）。",
+    "figures": [
+      {"metric": "MKSI 卖空股数", "value": 549, "unit": "万股", "period": "8/14"},
+      {"metric": "MKSI 卖空比例", "value": 8.16, "unit": "%", "period": "8/14"},
+      {"metric": "MKSI 卖空股数", "value": 625, "unit": "万股", "period": "8月底"},
+      {"metric": "MKSI 卖空比例", "value": 9.64, "unit": "%", "period": "8月底"},
+      {"metric": "yfinance MKSI 卖空比例", "value": 10.5, "unit": "%", "period": ""}
+    ],
+    "quote": "**卖空在 8 月内上升（Q7）**。finviz/MarketBeat 经 Gemini 汇总：8/14 为 549 万股、8.16%；8 月底 625 万股、9.64%。与 yfinance 的 10.5% 同量级但期数不同。",
+    "tickers": ["MKSI"],
+    "confidence": 0.9,
+    "topic_label": "MKSI 8月卖空数据",
+    "grok_verdict": {"fidelity": "✓", "figures": "✓", "type": "✓", "tickers_topic": "✓"},
+    "codex_verdict": {"fidelity": "✗", "figures": "✓", "type": "✓", "tickers_topic": "✗"}
+  },
+  {
+    "card_id": "v2_c0e3043c9649",
+    "type": "fact",
+    "claim": "Muse上线一周就登上美国App Store免费榜第一；据Apptopia数据，Muse前12天在美国和加拿大的iOS下载量为180万次，ChatGPT同期为130万次。",
+    "figures": [
+      {"metric": "Muse美国和加拿大iOS下载", "value": 180, "unit": "万次", "period": "前12天"},
+      {"metric": "ChatGPT美国和加拿大iOS下载", "value": 130, "unit": "万次", "period": ""}
+    ],
+    "quote": "Muse 上线一周就登上美国 App Store 免费榜第一。Apptopia 的数据是，Muse 前 12 天在美国和加拿大的 iOS 下载 180 万次，ChatGPT 同期 130 万次。",
+    "tickers": [],
+    "confidence": 0.95,
+    "topic_label": "Meta Muse上线初期iOS下载量数据",
+    "grok_verdict": {"fidelity": "✓", "figures": "△", "type": "✓", "tickers_topic": "✓"},
+    "codex_verdict": {"fidelity": "✓", "figures": "△", "type": "✓", "tickers_topic": "✗"}
+  },
+  {
+    "card_id": "v2_e91a4e64c02e",
+    "type": "fact",
+    "claim": "北京岚锋、岚沣、澜烽锁定 36 个月至 2028 年 6 月；IDG、启明、迅雷等 28 名股东共 2.27 亿股（占 56.5%）已于 2026 年 6 月 11 日解禁，截至 10/7 巨潮上尚无这几家的减持预披露公告。",
+    "figures": [
+      {"metric": "北京岚锋、岚沣、澜烽锁定期", "value": 36, "unit": "个月", "period": "至2028年6月"},
+      {"metric": "解禁股东人数", "value": 28, "unit": "名", "period": "2026年6月11日"},
+      {"metric": "解禁股数", "value": 2.27, "unit": "亿股", "period": "2026年6月11日"},
+      {"metric": "解禁股数占比", "value": 56.5, "unit": "%", "period": "2026年6月11日"}
+    ],
+    "quote": "解禁：北京岚锋、岚沣、澜烽锁定 36 个月，到 2028 年 6 月。IDG、启明、迅雷等 28 名股东共 2.27 亿股（占 56.5%）已经在 2026 年 6 月 11 日解禁。截至 10/7，巨潮上还没有这几家的减持预披露公告。",
+    "tickers": ["XNET"],
+    "confidence": 0.9,
+    "topic_label": "影石创新限售股解禁情况",
+    "grok_verdict": {"fidelity": "✓", "figures": "✓", "type": "✗", "tickers_topic": "✗"},
+    "codex_verdict": {"fidelity": "✓", "figures": "✓", "type": "✓", "tickers_topic": "✗"}
+  },
+  {
+    "card_id": "v2_ebcb67dd7bb2",
+    "type": "fact",
+    "claim": "招股书认定刘靖康为实控人的一条理由是其表决权超过 34%（可否决需三分之二通过的事项），但 IPO 稀释后（34.00% × 3.60 亿股 / 4.01 亿股）降至 30.53%，他一人已无法否决修改章程、增发、重组等特别决议；由于全体股东在招股书中承诺不谋求控制权，且 IDG、启明、迅雷均为财务投资人，因此控制权本身风险不大。",
+    "figures": [
+      {"metric": "IPO前实控人认定表决权比例", "value": ">34", "unit": "%", "period": ""},
+      {"metric": "IPO前总股本", "value": 3.6, "unit": "亿股", "period": ""},
+      {"metric": "IPO稀释后总股本", "value": 4.01, "unit": "亿股", "period": ""},
+      {"metric": "IPO稀释后刘靖康直接支配表决权比例", "value": 30.53, "unit": "%", "period": ""}
+    ],
+    "quote": "招股书认定刘靖康是实控人，一条理由是他的表决权超过 34%，需要三分之二通过的事项他能否决。IPO 稀释以后这条不成立了：34.00% 乘以 3.60 亿股除以 4.01 亿股，等于 30.53%。全体股东在招股书里承诺不谋求控制权，IDG、启明、迅雷也都是财务投资人，所以控制权本身风险不大。但修改章程、增发、重组这类特别决议，他一个人已经否决不了。",
+    "tickers": ["XNET"],
+    "confidence": 0.9,
+    "topic_label": "影石创新股权与控制权结构",
+    "grok_verdict": {"fidelity": "✓", "figures": "✓", "type": "✗", "tickers_topic": "✗"},
+    "codex_verdict": {"fidelity": "✓", "figures": "✓", "type": "✗", "tickers_topic": "✗"}
+  },
+  {
+    "card_id": "v2_0c8ae250e18c",
+    "type": "opinion",
+    "claim": "Eve认为当前最值得等待的组合是原框架给出两日修复确认，同时融资仍在收缩、受压股票却不再下跌，届时才有依据判断去杠杆正从“压低价格”转为“被市场消化”；该建议仅作为辅助层结合建议，未修改原框架、看板或仓位规则，也尚未证明有额外择时收益。",
+    "figures": [],
+    "quote": "**现在最值得等的组合是：原框架给出两日修复确认，同时融资仍在收缩、受压股票却不再下跌。** 那时我们才有依据说，去杠杆正从“压低价格”转为“被市场消化”。\n\n这只是辅助层的结合建议，**未修改原框架、看板或仓位规则，也尚未证明有额外择时收益。**",
+    "tickers": [],
+    "confidence": 0.9,
+    "topic_label": "A股底部修复观察信号建议",
+    "grok_verdict": {"fidelity": "△", "figures": "—", "type": "✓", "tickers_topic": "✗"},
+    "codex_verdict": {"fidelity": "△", "figures": "—", "type": "✓", "tickers_topic": "✗"}
+  },
+  {
+    "card_id": "v2_7382e111a2d9",
+    "type": "fact",
+    "claim": "谷歌二季度 10-Q 披露 6 月签了一份短期租约，不可撤销承诺约 58 亿美元（三季度起算）；10 月到次年 3 月六个月按全价算为 55.2 亿美元，加爬坡费正好约 58 亿美元，谷歌真正锁定的只有这六个月，最早 2027 年 3 月底能退，若租满全期则为 304 亿美元。",
+    "figures": [
+      {"metric": "短期租约不可撤销承诺", "value": 58, "unit": "亿美元", "period": "三季度起算"},
+      {"metric": "六个月全价租金", "value": 55.2, "unit": "亿美元", "period": "10 月到次年 3 月"},
+      {"metric": "租满全期总金额", "value": 304, "unit": "亿美元", "period": ""}
+    ],
+    "quote": "- **谷歌那边的口径：** 二季度 10-Q 写的是 6 月签了一份短期租约，不可撤销承诺约 58 亿，三季度起算。10 月到次年 3 月这六个月按全价算是 55.2 亿，再加爬坡费，正好约 58 亿。所以谷歌真正锁定的只有这六个月，最早 2027 年 3 月底能退。如果租满全期，是 304 亿。",
+    "tickers": ["GOOGL"],
+    "confidence": 0.95,
+    "topic_label": "谷歌 10-Q 短期租约承诺与锁定期测算",
+    "grok_verdict": {"fidelity": "✓", "figures": "△", "type": "✗", "tickers_topic": "✓"},
+    "codex_verdict": {"fidelity": "✗", "figures": "✗", "type": "✗", "tickers_topic": "✓"}
+  },
+  {
+    "card_id": "v2_76651895b370",
+    "type": "model_assumption",
+    "claim": "按220亿倒算，卖250GWh对应单位净利约88元/kWh，卖260GWh约85元/kWh，比2Q的约96至97元/kWh低10%左右，已把锂价下跌带来的存货减值和9月开征的消费税算进去；今晚若出到240亿以上、单位净利守住0.09元/Wh才算超预期，若只有220至230亿则算符合已经很低的预期。",
+    "figures": [
+      {"metric": "倒算基准利润", "value": 220, "unit": "亿元", "period": ""},
+      {"metric": "卖250GWh对应单位净利", "value": 88, "unit": "元/kWh", "period": ""},
+      {"metric": "卖260GWh对应单位净利", "value": 85, "unit": "元/kWh", "period": ""},
+      {"metric": "单位净利", "value": "96-97", "unit": "元/kWh", "period": "2Q"},
+      {"metric": "单位净利环比降幅", "value": 10, "unit": "%", "period": ""},
+      {"metric": "超预期利润门槛", "value": ">240", "unit": "亿元", "period": ""},
+      {"metric": "超预期单位净利门槛", "value": 0.09, "unit": "元/Wh", "period": ""},
+      {"metric": "符合低预期利润区间", "value": "220-230", "unit": "亿元", "period": ""}
+    ],
+    "quote": "按 220 亿倒算（我的计算）：卖 250GWh 对应单位净利约 88 元/kWh，卖 260GWh 约 85 元/kWh，比 2Q 的约 96 至 97 元/kWh 低 10% 左右。也就是说，220 亿已经把锂价跌带来的存货减值、9 月开征的消费税都算进去了。所以今晚出到 240 亿以上、单位净利守住 0.09 元/Wh，才算超预期；只有 220 至 230 亿，算是符合已经很低的预期。",
+    "tickers": ["3750.HK"],
+    "confidence": 0.95,
+    "topic_label": "宁德时代3Q单位净利倒算与超预期门槛",
+    "grok_verdict": {"fidelity": "✓", "figures": "△", "type": "✓", "tickers_topic": "✗"},
+    "codex_verdict": {"fidelity": "✓", "figures": "✗", "type": "✓", "tickers_topic": "✗"}
+  },
+  {
+    "card_id": "v2_18e39ac4ab23",
+    "type": "opinion",
+    "claim": "康师傅控股（0322.HK）价格为12.86，RSI为69.7，30D涨幅14.2%，触发今日MACD日线金叉及周线金叉；布鲁可集团（0325.HK）价格为66.3，RSI为85.6，30D涨幅44.6%，触发周线金叉并以1.6x量比放量突破200MA（64.37）。",
+    "figures": [
+      {"metric": "康师傅控股价格", "value": 12.86, "unit": "", "period": ""},
+      {"metric": "康师傅控股RSI", "value": 69.7, "unit": "", "period": ""},
+      {"metric": "康师傅控股涨跌幅", "value": 14.2, "unit": "%", "period": "30D"},
+      {"metric": "_verification", "value": "unsupported:44.6,1.6,64.37", "unit": "", "period": ""}
+    ],
+    "quote": "**康師傅控股有限公司(0322.HK)** 价格=12.86 RSI=69.7 30D=14.2% → ⚡ MACD日线金叉! (今日) | 🌟 周线金叉",
+    "tickers": ["0322.HK", "0325.HK"],
+    "confidence": 0.4,
+    "topic_label": "康师傅控股与布鲁可集团技术面止跌信号",
+    "grok_verdict": {"fidelity": "✗", "figures": "✓", "type": "✓", "tickers_topic": "✗"},
+    "codex_verdict": {"fidelity": "✗", "figures": "✓", "type": "✓", "tickers_topic": "✗"}
+  },
+  {
+    "card_id": "v2_ad0fce6d833d",
+    "type": "todo",
+    "claim": "Eve认为未来2–3个季度AI算力需求端尚未见顶（置信度中等偏高），若出现GPU租价转跌、S-1显示ARR明显高于实际确认收入、或企业给token预算设上限从个例（如Uber、Salesforce）变得普遍则会改判；同时待10/28 GOOGL三季报测试剔除TPU整机销售后的云增速。",
+    "figures": [],
+    "quote": "我对未来 2–3 个季度的判断是置信度中等偏高。出现以下情况我会改判：GPU 租价转跌；S-1 显示 ARR 明显高于实际确认的收入；企业给 token 预算设上限从个例变得普遍（FUNDA 6/23 提过 Uber、Salesforce 等几个个例）。下周 GOOGL 10/28 的三季报可以先拿来测一下：剔除 TPU 整机销售之后，云还剩多少增速。",
+    "tickers": ["UBER", "CRM", "GOOGL"],
+    "confidence": 0.85,
+    "topic_label": "AI需求见顶跟踪指标与GOOGL三季报待验证项",
+    "grok_verdict": {"fidelity": "✗", "figures": "—", "type": "✓", "tickers_topic": "✗"},
+    "codex_verdict": {"fidelity": "✗", "figures": "—", "type": "✓", "tickers_topic": "✓"}
+  },
+  {
+    "card_id": "v2_e35d75d0735b",
+    "type": "opinion",
+    "claim": "摩根大通同时将中创新航降到中性（目标价40港元降到17港元）、亿纬锂能降到低配（目标价60元降到33元）、先导智能A/H和璞泰来都降到中性。",
+    "figures": [
+      {"metric": "中创新航原目标价", "value": 40, "unit": "港元", "period": ""},
+      {"metric": "中创新航新目标价", "value": 17, "unit": "港元", "period": ""},
+      {"metric": "亿纬锂能原目标价", "value": 60, "unit": "元", "period": ""},
+      {"metric": "亿纬锂能新目标价", "value": 33, "unit": "元", "period": ""}
+    ],
+    "quote": "同时下调的还有：中创新航降到中性（目标价 40 港元降到 17 港元）、亿纬锂能降到低配（60 元降到 33 元）、先导智能 A/H 和璞泰来都降到中性。",
+    "tickers": ["3931.HK", "300014.SZ", "300450.SZ", "603659.SS"],
+    "confidence": 0.95,
+    "topic_label": "摩根大通下调中创新航、亿纬锂能、先导智能与璞泰来评级",
+    "grok_verdict": {"fidelity": "△", "figures": "✓", "type": "✓", "tickers_topic": "✓"},
+    "codex_verdict": {"fidelity": "✗", "figures": "✓", "type": "✓", "tickers_topic": "✗"}
+  },
+  {
+    "card_id": "v2_f6fafaac280d",
+    "type": "fact",
+    "claim": "美股7/31财季中，Salesforce的Agentforce+Data360 ARR同比增长210%，Palo Alto的NGS ARR同比增长63%（公司级口径）；优必选2026H1总收入同比增长104.2%，领跑具身智能链。",
+    "figures": [
+      {"metric": "Salesforce Agentforce+Data360 ARR同比增速", "value": 210, "unit": "%", "period": "7/31财季"},
+      {"metric": "Palo Alto NGS ARR同比增速", "value": 63, "unit": "%", "period": "7/31财季"},
+      {"metric": "优必选总收入同比增速", "value": 104.2, "unit": "%", "period": "2026H1"}
+    ],
+    "quote": "美股 7/31 财季 AI 商业化口径整体上移：Salesforce Agentforce+Data360 ARR 同比 +210%、Palo Alto NGS ARR +63%（公司级口径）；优必选 2026H1 总收入 +104.2% 领跑具身智能链。",
+    "tickers": ["CRM", "PANW", "9880.HK"],
+    "confidence": 0.9,
+    "topic_label": "Salesforce、Palo Alto与优必选AI商业化指标",
+    "grok_verdict": {"fidelity": "✓", "figures": "✓", "type": "✗", "tickers_topic": "✓"},
+    "codex_verdict": {"fidelity": "✓", "figures": "✓", "type": "✗", "tickers_topic": "✓"}
+  },
+  {
+    "card_id": "v2_bb4895823474",
+    "type": "opinion",
+    "claim": "对于香港/中国大陆税收居民，在美股本土标的中，BOXX 是税务效率最高、体验最省心的方案之一，它通过期权盒式套利（Box Spread）将类固收收益完全转化为资本利得且不产生现金分红，从而绕开美股对非居民 30%（香港税民）或 10%（大陆税民）的股息预扣税（WHT）。",
+    "figures": [
+      {"metric": "香港税民美股股息预扣税率", "value": 30, "unit": "%", "period": ""},
+      {"metric": "大陆税民美股股息预扣税率", "value": 10, "unit": "%", "period": ""}
+    ],
+    "quote": "**你目前选择的 BOXX 已经是美股本土标的中税务效率最高、体验最省心的方案之一。** 它通过期权盒式套利（Box Spread）将类固收收益完全转化为资本利得，不产生现金分红，从而绕开了美股对非居民 30%（香港税民）或 10%（大陆税民）的股息预扣税（WHT）。",
+    "tickers": ["BOXX"],
+    "confidence": 0.9,
+    "topic_label": "现金类ETF税务与费率对比",
+    "grok_verdict": {"fidelity": "✓", "figures": "✓", "type": "✓", "tickers_topic": "✗"},
+    "codex_verdict": {"fidelity": "✓", "figures": "✓", "type": "✓", "tickers_topic": "✗"}
+  },
+  {
+    "card_id": "v2_a65948015208",
+    "type": "opinion",
+    "claim": "陈哲认为，把Astra当成具身研究员是最具颠覆性的第三层用法（即Physical RSI，物理AI自进化）：它凭借工具调用能力在Blender里搭3D环境、生成资产并设定属性，再调用仿真器自主调试、修改和优化运动策略，完成“real-to-sim-to-real”闭环；同时陈哲判断长期看受实时性与边缘算力约束，机器人系统可能是分层的（云端通用模型负责低频推理，端侧轻量VLA负责高频执行），但通用基座巨头如OpenAI完全可能通过模型蒸馏做出轻量化的端侧动作模型，因此做VLA等具身模型公司的价值依然受到挑战。",
+    "figures": [],
+    "quote": "但我认为，最让人头皮发麻、具有颠覆性的是第三层：把 Astra 当成一个具身研究员。凭借很强的工具调用能力，它可以在 Blender 里搭 3D 环境，生成资产并设定属性，然后再调用仿真器自主调试、修改和优化运动策略，自己把建模、训练和调优都干了，完成了 “real-to-sim-to-real”（真实到仿真到真实）的闭环。\n这也就是所谓的 Physical RSI（物理 AI 自进化）：在物理世界里，AI 开始自己训练 AI。\n晚点：在第三种用法上，有看到什么具体探索吗？\n陈哲：我知道很多创业公司正在试这个方向，甚至有新的公司会以 Physical RSI 去融资。不过还没有特别重磅的公开成果。我们可以期待 Q4 的更多进展。\n晚点：在第一种用法上，就是直接让 Astra 生成位姿、做部分 VLA 的工作，Astra 在哪些任务上做得更好，又不太擅长哪些任务？\n陈哲：首先，在显著需要推理能力和空间理解能力的任务上，Astra 的能力明显比 VLA 强。\n第二是泛化能力，VLA 此前的瓶颈之一就是泛化性不佳，物体换个颜色或位置，模型就懵了。而通用模型的体量和训练方法都使它的泛化能力更突出。\n但 Astra 不擅长精细操作，比如扣纽扣、插拔线束这种有摩擦、形变的动作。很多 VLA 模型，会专门获得这类精细操作的遥操数据来做后训练，这是通用模型缺少的。\n晚点：它现在还有一个显著缺点，就是速度比较慢，结合它不擅长精细操作，是不是可以认为，这是通用模型和物理模型未来会分层存在的论据之一？\n陈哲：我认为长期看，整个机器人系统确实有可能是分层的。但这并非因为大模型永远做不到物理模型今天能做的事，而是因为实时性与边缘算力的约束。\n就像无人驾驶，低频的决策可以放到云端，能接受一两秒的延时，但毫秒级的避障与控制要放在车上完成。所以未来更可能是：通用模型在云端，负责低频推理，端侧轻量 VLA 负责高频执行。\n但即使有分层，做 VLA 等具身模型公司的价值依然受到挑战。未来的通用基座巨头完全可能通过模型蒸馏，得到一个轻量化的端侧动作模型。也就是说，VLA 还存在，但有可能是 OpenAI 这类公司就把它做了。",
+    "tickers": [],
+    "confidence": 0.9,
+    "topic_label": "Physical RSI与机器人系统云端-端侧分层演进判断",
+    "grok_verdict": {"fidelity": "✗", "figures": "—", "type": "✓", "tickers_topic": "✓"},
+    "codex_verdict": {"fidelity": "△", "figures": "—", "type": "✓", "tickers_topic": "✓"}
+  }
+]

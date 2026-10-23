@@ -1063,10 +1063,17 @@ async def process_weekly_batch(
     quotes_rejected = 0
     segments_discarded = 0
     cards_flagged_unsupported_number = 0
+    cards_flagged_unsupported_names = 0
+    cards_flagged_unsupported_conclusion = 0
     soft_unsupported_numbers = 0
     figures_dropped = 0
     periods_cleared = 0
+    currencies_stripped = 0
     tickers_dropped = 0
+    tickers_dropped_private = 0
+    tickers_dropped_channel = 0
+    tickers_backfilled = 0
+    types_corrected = 0
     input_tokens = 0
     output_tokens = 0
     total_tokens = 0
@@ -1128,7 +1135,9 @@ async def process_weekly_batch(
     async def _flush_ready_prefix() -> None:
         nonlocal next_to_flush, flush_failed, abort_flag, embedding_model_used
         nonlocal segments_flushed, quotes_rejected, segments_discarded
-        nonlocal cards_flagged_unsupported_number, soft_unsupported_numbers, figures_dropped, periods_cleared, tickers_dropped
+        nonlocal cards_flagged_unsupported_number, cards_flagged_unsupported_names, cards_flagged_unsupported_conclusion
+        nonlocal soft_unsupported_numbers, figures_dropped, periods_cleared, currencies_stripped
+        nonlocal tickers_dropped, tickers_dropped_private, tickers_dropped_channel, tickers_backfilled, types_corrected
         nonlocal input_tokens, output_tokens, total_tokens, rate_limit_retries
         nonlocal cards_extracted, cards_accepted, cards_inserted, deduped_count, superseded_count
 
@@ -1159,10 +1168,17 @@ async def process_weekly_batch(
                     batch_quotes_rejected = 0
                     batch_segments_discarded = 0
                     batch_cards_flagged_unsupported_number = 0
+                    batch_cards_flagged_unsupported_names = 0
+                    batch_cards_flagged_unsupported_conclusion = 0
                     batch_soft_unsupported_numbers = 0
                     batch_figures_dropped = 0
                     batch_periods_cleared = 0
+                    batch_currencies_stripped = 0
                     batch_tickers_dropped = 0
+                    batch_tickers_dropped_private = 0
+                    batch_tickers_dropped_channel = 0
+                    batch_tickers_backfilled = 0
+                    batch_types_corrected = 0
                     batch_candidate_cards: list[dict[str, Any]] = []
                     per_seg_items: list[tuple[list[dict[str, Any]], list[dict[str, Any]]]] = []
                     for _seg_idx, seg, outcome, rl_retries in ready_batch:
@@ -1175,12 +1191,31 @@ async def process_weekly_batch(
                         batch_cards_flagged_unsupported_number += int(
                             getattr(outcome, "cards_flagged_unsupported_number", 0)
                         )
+                        batch_cards_flagged_unsupported_names += int(
+                            getattr(outcome, "cards_flagged_unsupported_names", 0)
+                        )
+                        batch_cards_flagged_unsupported_conclusion += int(
+                            getattr(outcome, "cards_flagged_unsupported_conclusion", 0)
+                        )
                         batch_soft_unsupported_numbers += int(
                             getattr(outcome, "soft_unsupported_numbers", 0)
                         )
                         batch_figures_dropped += int(getattr(outcome, "figures_dropped", 0))
                         batch_periods_cleared += int(getattr(outcome, "periods_cleared", 0))
+                        batch_currencies_stripped += int(
+                            getattr(outcome, "currencies_stripped", 0)
+                        )
                         batch_tickers_dropped += int(getattr(outcome, "tickers_dropped", 0))
+                        batch_tickers_dropped_private += int(
+                            getattr(outcome, "tickers_dropped_private", 0)
+                        )
+                        batch_tickers_dropped_channel += int(
+                            getattr(outcome, "tickers_dropped_channel", 0)
+                        )
+                        batch_tickers_backfilled += int(
+                            getattr(outcome, "tickers_backfilled", 0)
+                        )
+                        batch_types_corrected += int(getattr(outcome, "types_corrected", 0))
                         if outcome.discarded_segment:
                             batch_segments_discarded += 1
                             seg_status = "discarded"
@@ -1222,10 +1257,19 @@ async def process_weekly_batch(
                         quotes_rejected += batch_quotes_rejected
                         segments_discarded += batch_segments_discarded
                         cards_flagged_unsupported_number += batch_cards_flagged_unsupported_number
+                        cards_flagged_unsupported_names += batch_cards_flagged_unsupported_names
+                        cards_flagged_unsupported_conclusion += (
+                            batch_cards_flagged_unsupported_conclusion
+                        )
                         soft_unsupported_numbers += batch_soft_unsupported_numbers
                         figures_dropped += batch_figures_dropped
                         periods_cleared += batch_periods_cleared
+                        currencies_stripped += batch_currencies_stripped
                         tickers_dropped += batch_tickers_dropped
+                        tickers_dropped_private += batch_tickers_dropped_private
+                        tickers_dropped_channel += batch_tickers_dropped_channel
+                        tickers_backfilled += batch_tickers_backfilled
+                        types_corrected += batch_types_corrected
                         cards_extracted += len(batch_candidate_cards)
                         cards_accepted += len(acc_cards)
                         deduped_count += dedup_cnt
@@ -1333,12 +1377,33 @@ async def process_weekly_batch(
                                     cards_flagged_unsupported_number
                                     + batch_cards_flagged_unsupported_number
                                 ),
+                                "cards_flagged_unsupported_names": (
+                                    cards_flagged_unsupported_names
+                                    + batch_cards_flagged_unsupported_names
+                                ),
+                                "cards_flagged_unsupported_conclusion": (
+                                    cards_flagged_unsupported_conclusion
+                                    + batch_cards_flagged_unsupported_conclusion
+                                ),
                                 "soft_unsupported_numbers": (
                                     soft_unsupported_numbers + batch_soft_unsupported_numbers
                                 ),
                                 "figures_dropped": figures_dropped + batch_figures_dropped,
                                 "periods_cleared": periods_cleared + batch_periods_cleared,
+                                "currencies_stripped": (
+                                    currencies_stripped + batch_currencies_stripped
+                                ),
                                 "tickers_dropped": tickers_dropped + batch_tickers_dropped,
+                                "tickers_dropped_private": (
+                                    tickers_dropped_private + batch_tickers_dropped_private
+                                ),
+                                "tickers_dropped_channel": (
+                                    tickers_dropped_channel + batch_tickers_dropped_channel
+                                ),
+                                "tickers_backfilled": (
+                                    tickers_backfilled + batch_tickers_backfilled
+                                ),
+                                "types_corrected": types_corrected + batch_types_corrected,
                             },
                             conn=tx_conn,
                         )
@@ -1361,10 +1426,19 @@ async def process_weekly_batch(
                     quotes_rejected += batch_quotes_rejected
                     segments_discarded += batch_segments_discarded
                     cards_flagged_unsupported_number += batch_cards_flagged_unsupported_number
+                    cards_flagged_unsupported_names += batch_cards_flagged_unsupported_names
+                    cards_flagged_unsupported_conclusion += (
+                        batch_cards_flagged_unsupported_conclusion
+                    )
                     soft_unsupported_numbers += batch_soft_unsupported_numbers
                     figures_dropped += batch_figures_dropped
                     periods_cleared += batch_periods_cleared
+                    currencies_stripped += batch_currencies_stripped
                     tickers_dropped += batch_tickers_dropped
+                    tickers_dropped_private += batch_tickers_dropped_private
+                    tickers_dropped_channel += batch_tickers_dropped_channel
+                    tickers_backfilled += batch_tickers_backfilled
+                    types_corrected += batch_types_corrected
                     cards_extracted += len(batch_candidate_cards)
                     deduped_count += batch_dedup_cnt
                     cards_inserted += batch_cards_inserted
@@ -1665,12 +1739,23 @@ async def process_weekly_batch(
             cards_flagged_unsupported_number += int(
                 getattr(outcome, "cards_flagged_unsupported_number", 0)
             )
+            cards_flagged_unsupported_names += int(
+                getattr(outcome, "cards_flagged_unsupported_names", 0)
+            )
+            cards_flagged_unsupported_conclusion += int(
+                getattr(outcome, "cards_flagged_unsupported_conclusion", 0)
+            )
             soft_unsupported_numbers += int(
                 getattr(outcome, "soft_unsupported_numbers", 0)
             )
             figures_dropped += int(getattr(outcome, "figures_dropped", 0))
             periods_cleared += int(getattr(outcome, "periods_cleared", 0))
+            currencies_stripped += int(getattr(outcome, "currencies_stripped", 0))
             tickers_dropped += int(getattr(outcome, "tickers_dropped", 0))
+            tickers_dropped_private += int(getattr(outcome, "tickers_dropped_private", 0))
+            tickers_dropped_channel += int(getattr(outcome, "tickers_dropped_channel", 0))
+            tickers_backfilled += int(getattr(outcome, "tickers_backfilled", 0))
+            types_corrected += int(getattr(outcome, "types_corrected", 0))
             incomplete_by_idx[seg_idx] = _make_incomplete_record(
                 seg_idx,
                 seg,
@@ -1758,10 +1843,17 @@ async def process_weekly_batch(
             "segments_processed": segments_flushed,
             "segments_discarded": segments_discarded,
             "cards_flagged_unsupported_number": cards_flagged_unsupported_number,
+            "cards_flagged_unsupported_names": cards_flagged_unsupported_names,
+            "cards_flagged_unsupported_conclusion": cards_flagged_unsupported_conclusion,
             "soft_unsupported_numbers": soft_unsupported_numbers,
             "figures_dropped": figures_dropped,
             "periods_cleared": periods_cleared,
+            "currencies_stripped": currencies_stripped,
             "tickers_dropped": tickers_dropped,
+            "tickers_dropped_private": tickers_dropped_private,
+            "tickers_dropped_channel": tickers_dropped_channel,
+            "tickers_backfilled": tickers_backfilled,
+            "types_corrected": types_corrected,
             "next_to_flush": next_to_flush,
             "incomplete_segments_count": len(incomplete_segments),
             "incomplete_segments": incomplete_segments,
@@ -1802,10 +1894,17 @@ async def process_weekly_batch(
                     "incomplete_segments_count": len(incomplete_segments),
                     "incomplete_segments": incomplete_segments,
                     "cards_flagged_unsupported_number": cards_flagged_unsupported_number,
+                    "cards_flagged_unsupported_names": cards_flagged_unsupported_names,
+                    "cards_flagged_unsupported_conclusion": cards_flagged_unsupported_conclusion,
                     "soft_unsupported_numbers": soft_unsupported_numbers,
                     "figures_dropped": figures_dropped,
                     "periods_cleared": periods_cleared,
+                    "currencies_stripped": currencies_stripped,
                     "tickers_dropped": tickers_dropped,
+                    "tickers_dropped_private": tickers_dropped_private,
+                    "tickers_dropped_channel": tickers_dropped_channel,
+                    "tickers_backfilled": tickers_backfilled,
+                    "types_corrected": types_corrected,
                     "maxrss": maxrss_raw,
                     "rendered": rendered_summary,
                 },
@@ -1835,12 +1934,23 @@ async def process_weekly_batch(
             cards_flagged_unsupported_number += int(
                 getattr(rem_outcome, "cards_flagged_unsupported_number", 0)
             )
+            cards_flagged_unsupported_names += int(
+                getattr(rem_outcome, "cards_flagged_unsupported_names", 0)
+            )
+            cards_flagged_unsupported_conclusion += int(
+                getattr(rem_outcome, "cards_flagged_unsupported_conclusion", 0)
+            )
             soft_unsupported_numbers += int(
                 getattr(rem_outcome, "soft_unsupported_numbers", 0)
             )
             figures_dropped += int(getattr(rem_outcome, "figures_dropped", 0))
             periods_cleared += int(getattr(rem_outcome, "periods_cleared", 0))
+            currencies_stripped += int(getattr(rem_outcome, "currencies_stripped", 0))
             tickers_dropped += int(getattr(rem_outcome, "tickers_dropped", 0))
+            tickers_dropped_private += int(getattr(rem_outcome, "tickers_dropped_private", 0))
+            tickers_dropped_channel += int(getattr(rem_outcome, "tickers_dropped_channel", 0))
+            tickers_backfilled += int(getattr(rem_outcome, "tickers_backfilled", 0))
+            types_corrected += int(getattr(rem_outcome, "types_corrected", 0))
 
         if not dry_run:
             is_interrupt = isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt))
@@ -1866,10 +1976,17 @@ async def process_weekly_batch(
                             "rate_limit_retries": rate_limit_retries,
                             "segments_total": total_segments,
                             "cards_flagged_unsupported_number": cards_flagged_unsupported_number,
+                            "cards_flagged_unsupported_names": cards_flagged_unsupported_names,
+                            "cards_flagged_unsupported_conclusion": cards_flagged_unsupported_conclusion,
                             "soft_unsupported_numbers": soft_unsupported_numbers,
                             "figures_dropped": figures_dropped,
                             "periods_cleared": periods_cleared,
+                            "currencies_stripped": currencies_stripped,
                             "tickers_dropped": tickers_dropped,
+                            "tickers_dropped_private": tickers_dropped_private,
+                            "tickers_dropped_channel": tickers_dropped_channel,
+                            "tickers_backfilled": tickers_backfilled,
+                            "types_corrected": types_corrected,
                         },
                         error_text=format_safe_run_error(exc),
                         conn=conn,
@@ -2174,12 +2291,33 @@ async def run_archive_pipeline(
             "cards_flagged_unsupported_number_total": sum(
                 int(b.get("cards_flagged_unsupported_number", 0)) for b in batch_results
             ),
+            "cards_flagged_unsupported_names_total": sum(
+                int(b.get("cards_flagged_unsupported_names", 0)) for b in batch_results
+            ),
+            "cards_flagged_unsupported_conclusion_total": sum(
+                int(b.get("cards_flagged_unsupported_conclusion", 0)) for b in batch_results
+            ),
             "soft_unsupported_numbers_total": sum(
                 int(b.get("soft_unsupported_numbers", 0)) for b in batch_results
             ),
             "figures_dropped_total": sum(int(b.get("figures_dropped", 0)) for b in batch_results),
             "periods_cleared_total": sum(int(b.get("periods_cleared", 0)) for b in batch_results),
+            "currencies_stripped_total": sum(
+                int(b.get("currencies_stripped", 0)) for b in batch_results
+            ),
             "tickers_dropped_total": sum(int(b.get("tickers_dropped", 0)) for b in batch_results),
+            "tickers_dropped_private_total": sum(
+                int(b.get("tickers_dropped_private", 0)) for b in batch_results
+            ),
+            "tickers_dropped_channel_total": sum(
+                int(b.get("tickers_dropped_channel", 0)) for b in batch_results
+            ),
+            "tickers_backfilled_total": sum(
+                int(b.get("tickers_backfilled", 0)) for b in batch_results
+            ),
+            "types_corrected_total": sum(
+                int(b.get("types_corrected", 0)) for b in batch_results
+            ),
             "total_tokens": sum(int(b.get("total_tokens", 0)) for b in batch_results),
             "batches": batch_results,
         }

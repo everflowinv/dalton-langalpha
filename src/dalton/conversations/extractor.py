@@ -40,6 +40,8 @@ VALID_CARD_TYPES: frozenset[str] = frozenset(
     }
 )
 
+DEFAULT_PROMPT_VERSION: str = "conv_card_v2_3"
+
 # Private / unlisted companies must stay in `entities[]` rather than `tickers[]`
 PRIVATE_COMPANIES: frozenset[str] = frozenset(
     {
@@ -47,11 +49,15 @@ PRIVATE_COMPANIES: frozenset[str] = frozenset(
         "ANTHROPIC",
         "XAI",
         "SPACEX",
+        "SPCX",
         "STRIPE",
         "DATABRICKS",
         "BYTEDANCE",
         "TIKTOK",
         "SHEIN",
+        "0625.HK",
+        "希音",
+        "SHEIN 希音",
         "ANDURIL",
         "SCALEAI",
         "SCALE AI",
@@ -63,17 +69,43 @@ PRIVATE_COMPANIES: frozenset[str] = frozenset(
         "DEEPSEEK",
         "MOONSHOT",
         "KIMI",
-        "ZHIPU",
         "UNITREE",
         "宇树",
         "宇树科技",
         "月之暗面",
-        "智谱",
         "字节",
         "字节跳动",
         "小红书",
         "华为",
     }
+)
+
+# Trading / brokerage channel names and their corresponding listed ticker codes.
+# Never backfilled or retained in `tickers[]` unless the company appears in `claim`
+# as a discussed subject (i.e. without "买/下单/开户/可买/渠道" in the same sentence).
+TRADING_CHANNEL_NAMES: tuple[str, ...] = (
+    "盈透",
+    "IBKR",
+    "Interactive Brokers",
+    "富途",
+    "老虎",
+    "雪球",
+    "长桥",
+    "嘉信",
+    "Schwab",
+    "Robinhood",
+)
+
+TRADING_CHANNEL_TICKERS: dict[str, tuple[str, ...]] = {
+    "IBKR": ("盈透", "盈透证券", "IBKR", "Interactive Brokers"),
+    "FUTU": ("富途", "富途控股", "Futu", "FUTU"),
+    "TIGR": ("老虎", "老虎证券", "UP Fintech", "TIGR"),
+    "SCHW": ("嘉信", "嘉信理财", "Charles Schwab", "Schwab", "SCHW"),
+    "HOOD": ("Robinhood", "HOOD"),
+}
+
+_TRADING_CHANNEL_VERB_RE = re.compile(
+    r"(?:(?<!不)(?:可买|可以买|能买|能够买)|买卖|(?<![存潜实现内外自费作信])(?:在|用|通过)[^。！？!?；;\n，,]{0,20}买(?![点入回方盘家单断壳])|下单|开户|渠道)"
 )
 
 EXTRACTION_RESPONSE_SCHEMA: dict[str, Any] = {
@@ -160,22 +192,24 @@ EXTRACTION_SYSTEM_INSTRUCTIONS = """你是 Dalton 投研团队的对话历史整
    - 若为 `"ops"` 或 `"private"`，`cards` 必须返回空数组 `[]`。
 2. **原文逐字引用 (`quote` & `quote_event_id`)、证据覆盖、保留限定与归属**：
    - 每张卡的 `quote` **必须逐字摘自输入事件 `text` 的原话子串**，绝不能改写、概括、拼接或编造！`quote_event_id` 必须填写该句原话所在事件的 `event_id`。
-   - **证据覆盖**：`claim` 的每个实质分句、`figures` 的每个指标，都必须由**本卡 `quote`** 直接支持；不能把同段对话里其他位置的信息写进本卡；覆盖不到的就拆卡或删掉；`cited_sources`、`topic_label` 不能替代证据。
-   - **保留限定与归属**：保留“应该、可能、怀疑、初步、约、以上、超过、一度、用途含”等限定词，不得改成确定值或“证实/已经/全部用于”；保留条件、时间范围和主体归属；指代不清时扩大连续引用，不要自行补全名称；一条 `quote` 里有多家公司时，不得张冠李戴。
+   - **证据覆盖**：`claim` 的每个实质分句、`figures` 的每个指标，都必须由**本卡 `quote`** 直接支持；不能把同段对话里其他位置的信息写进本卡；覆盖不到的就拆卡或删掉；`cited_sources`、`topic_label` 不能替代证据。`claim` 和 `topic_label` 不得出现 `quote` 里没有的公司、机构、产品、说话人；不得出现 `quote` 里没有的结论（如“见顶”“止跌”“资金流”“费率对比”）；quote 里写的是英文全称时，claim 不要自行缩写成 quote 里没有出现的缩写词。
+   - **主体补全禁令**：主体在 `quote` 里只是代词或省略时，扩大连续引用；扩大后仍然覆盖不到，就删掉这张卡或这一句，不得根据 `topic_label` 或相邻卡片补全。
+   - **保留限定与归属**：保留“应该、可能、怀疑、初步、约、以上、超过、一度、用途含”等限定词，以及“尚无公开成果”“原文没打开”一类会影响证据强度的限制语，不得改成确定值或“证实/已经/全部用于”；保留条件、时间范围和主体归属；访谈体按“某某：”分段，上一段里的“我认为”不能并到下一位说话人；一条 `quote` 里有多家公司时，不得张冠李戴。
 3. **卡片类型 (`type`) 与说话人来源 (`cited_sources`)**（按优先级定义，内容混合时优先拆卡）：
-   - `"fact"`：已经发生、且本卡 `quote` 里有具体来源的实际数（若原话来自 `agent` 如 Eve，只有当本卡 `quote` 中明确给出了具体资料来源时才可标为 `"fact"` 并填入 `cited_sources`；无明确引用来源一律不得当作事实）。
-   - `"estimate"`：他人的预测、一致预期、指引、TAM（引用 Gartner 只说明“Gartner 这么估”，预测本身标为 `"estimate"` 而非 `"fact"`）。
-   - `"model_assumption"`：抽取者自己的倍数、倒算、情景测算（agent 自己的情景测算不要求外部来源，但数字必须由本卡 `quote` 支持）。
+   - `"fact"`：已经发生、且本卡 `quote` 里有具体来源的实际数（若原话来自 `agent` 如 Eve，只有当本卡 `quote` 中明确给出了具体资料来源时才可标为 `"fact"` 并填入 `cited_sources`；无明确引用来源一律不得当作事实）。事实来源必须覆盖 `claim` 里每一句当作 `fact` 的数字句，只覆盖了其中一句就拆卡；“引用某报告”只覆盖报告明确披露的那几句，不覆盖随后自行推导的结论。
+   - `"estimate"`：第三方模型预测、公司经营指引、他人的预测、一致预期、TAM 一律标 `"estimate"`（引用 Gartner 或卖方模型只说明来源，预测和指引本身标为 `"estimate"` 而非 `"fact"` 或 `"opinion"`）。
+   - `"model_assumption"`：原说话人的测算，即原说话人自己做的倍数、倒算、情景推演（“我算”“隐含”“按全价算”“粗算”）（agent 自己的情景测算不要求外部来源，但数字必须由本卡 `quote` 支持）。
    - `"opinion"`：判断、建议、技术信号。
    - `"todo"`：带验证条件和到期日的待办，证实或证伪的阈值要写进 `claim`。
+   - `cited_sources` 只填 `quote` 里实际出现的来源名称。
 4. **上市公司 (`tickers`) vs 未上市私企 (`entities`)**：
-   - `tickers` 只放本卡 `quote` 正文里作为讨论对象出现的上市公司股票代码（大写）；信源机构（如 Gartner 对应 `IT`）不放；写明“剔除/未采用”的不放；`quote` 没点名公司时留空 `[]`。
+   - `tickers` 只放本卡 `quote` 正文里作为讨论对象（本卡主体）出现的上市公司股票代码（大写）；股东、客户、被比较方如果不是本卡的主体，不放进 `tickers`；信源机构（如 Gartner 对应 `IT`）不放；写明“剔除/未采用”的不放；没有别名映射的代码，只有代码本身出现在 `quote` 里时才保留，否则删除；`quote` 没点名公司时留空 `[]`。
    - 未上市私企（如 `OpenAI`, `Anthropic`, `ByteDance`, `SpaceX`, `Stripe`, `Databricks`, `DeepSeek`, `Unitree`）放入 `entities`，**禁止**放入 `tickers`。
 5. **结构化指标 (`figures`)**：
    - 当原话包含明确数值指标时，提取 `{metric, value, unit, period}`。
-   - `value` 的数字必须出现在本卡 `quote` 里；区间和上下限原样保留（可以用字符串，如 `">35"`、`"25-35"`）。
-   - `quote` 没写期间时 `period` 留空 `""`，不得用消息日期或报告日期代替。
-   - 不得改写口径（年增速不是 CAGR，利润率不是营业利润率）。
+   - `value` 的数字必须出现在本卡 `quote` 里；“约、大约、左右、以上”保留在 `value` 字符串里（例如 `"约142"`、`"约95"`、`"10%左右"`、`"240以上"`），区间和上下限原样保留（可以用字符串，如 `">35"`、`"25-35"`）。
+   - `quote` 没写期间时 `period` 留空 `""`，不得用消息日期或报告日期代替；“同期、上期”只能继承本卡 `quote` 里写明的期间。
+   - 不得改写口径（年增速不是 CAGR，利润率不是营业利润率，自身增速不得改成某业务增速，未写同比/环比不得补写，仅写“亿”且本卡无法确定币种时不得补“美元”）；权重、占比、系数（如“权重为 0.25”）不要把 unit 写成“倍”。
    - 多家公司时 `metric` 要带上公司名，或者拆卡。
 """
 
@@ -190,10 +224,17 @@ class SegmentExtractionOutcome:
     cards_raw_count: int = 0
     quotes_rejected: int = 0
     cards_flagged_unsupported_number: int = 0
+    cards_flagged_unsupported_names: int = 0
+    cards_flagged_unsupported_conclusion: int = 0
     soft_unsupported_numbers: int = 0
     figures_dropped: int = 0
     periods_cleared: int = 0
+    currencies_stripped: int = 0
     tickers_dropped: int = 0
+    tickers_dropped_private: int = 0
+    tickers_dropped_channel: int = 0
+    tickers_backfilled: int = 0
+    types_corrected: int = 0
     discarded_segment: bool = False
     model_used: str = ""
     input_tokens: int = 0
@@ -274,11 +315,55 @@ def verify_verbatim_quote(
     return False, None
 
 
+def _is_private_company_ticker(raw_ticker: str) -> bool:
+    """Return True if `raw_ticker` or any of its mapped aliases resolves to `PRIVATE_COMPANIES`."""
+    ts = str(raw_ticker or "").strip()
+    if not ts:
+        return False
+    upper_t = ts.upper()
+    if upper_t in PRIVATE_COMPANIES or ts in PRIVATE_COMPANIES:
+        return True
+    canon_t = canonicalize_ticker_key(upper_t)
+    if canon_t in PRIVATE_COMPANIES:
+        return True
+    alias_map = _load_ticker_company_aliases()
+    for a in alias_map.get(canon_t, ()):
+        if a in PRIVATE_COMPANIES or a.upper() in PRIVATE_COMPANIES:
+            return True
+    return False
+
+
+def _is_trading_channel_discussed_in_claim(canon_ticker: str, claim: str | None) -> bool:
+    """Return True if `canon_ticker` (in `TRADING_CHANNEL_TICKERS`) appears in `claim` and the sentence
+    containing it does NOT include `'买'`, `'下单'`, `'开户'`, `'可买'`, or `'渠道'`.
+    """
+    c_text = str(claim or "").strip()
+    if not c_text:
+        return False
+    alias_map = _load_ticker_company_aliases()
+    names: list[str] = list(TRADING_CHANNEL_TICKERS.get(canon_ticker, ()))
+    for a in alias_map.get(canon_ticker, ()):
+        if a not in names:
+            names.append(a)
+    for ch_name in TRADING_CHANNEL_NAMES:
+        if ch_name not in names and any(ch_name.lower() == n.lower() for n in names):
+            names.append(ch_name)
+    sents = _split_sentences(c_text)
+    if not sents:
+        return False
+    matched_sents = [
+        s for s in sents if any(_alias_matches_in_text(na, s) for na in names)
+    ]
+    if not matched_sents:
+        return False
+    return any(not _TRADING_CHANNEL_VERB_RE.search(s) for s in matched_sents)
+
+
 def normalize_tickers_and_entities(
     raw_tickers: list[Any] | None,
     raw_entities: list[Any] | None,
 ) -> tuple[list[str], list[str]]:
-    """Route known private companies (OpenAI, Anthropic, etc.) into `entities[]` and normalize tickers."""
+    """Route known private companies (OpenAI, Anthropic, SpaceX/SPCX, etc.) into `entities[]` and normalize tickers."""
     tickers: list[str] = []
     entities: list[str] = []
 
@@ -287,14 +372,24 @@ def normalize_tickers_and_entities(
         if es and es not in entities:
             entities.append(es)
 
+    alias_map = _load_ticker_company_aliases()
     for t in raw_tickers or []:
         ts = str(t or "").strip()
         if not ts:
             continue
         upper_t = ts.upper()
-        if upper_t in PRIVATE_COMPANIES or ts in PRIVATE_COMPANIES:
-            if ts not in entities and upper_t not in {x.upper() for x in entities}:
-                entities.append(ts)
+        if _is_private_company_ticker(ts):
+            canon_t = canonicalize_ticker_key(upper_t)
+            entity_label = ts
+            if upper_t == "SPCX":
+                entity_label = "SpaceX"
+            elif canon_t in alias_map:
+                for a in alias_map[canon_t]:
+                    if a.upper() != upper_t and not re.match(r"^\d", a):
+                        entity_label = a
+                        break
+            if entity_label not in entities and entity_label.upper() not in {x.upper() for x in entities}:
+                entities.append(entity_label)
         else:
             if upper_t not in tickers:
                 tickers.append(upper_t)
@@ -368,22 +463,89 @@ def enforce_speaker_and_agent_citation(
 SUPPLEMENTAL_TICKER_ALIASES: dict[str, tuple[str, ...]] = {
     "688008.SS": ("澜起科技", "澜起", "Montage"),
     "688008.SH": ("澜起科技", "澜起", "Montage"),
+    "6809.HK": ("澜起科技", "澜起", "Montage"),
     "688041.SS": ("海光信息", "海光", "Hygon"),
     "688041.SH": ("海光信息", "海光", "Hygon"),
     "688775.SH": ("影石创新", "影石", "Insta360"),
     "688775.SS": ("影石创新", "影石", "Insta360"),
     "300750.SZ": ("宁德时代", "宁德", "CATL"),
+    "3750.HK": ("宁德时代", "宁德", "CATL"),
     "0700.HK": ("腾讯控股", "腾讯", "Tencent"),
     "3606.HK": ("福耀玻璃", "福耀", "Fuyao"),
     "600660.SS": ("福耀玻璃", "福耀", "Fuyao"),
+    "600660.SH": ("福耀玻璃", "福耀", "Fuyao"),
     "000333.SZ": ("美的集团", "美的", "Midea"),
+    "0300.HK": ("美的集团", "美的", "Midea"),
+    "000651.SZ": ("格力电器", "格力", "Gree"),
     "002714.SZ": ("牧原股份", "牧原食品", "牧原", "Muyuan"),
-    "300413.SZ": ("芒果超媒",),
+    "300413.SZ": ("芒果超媒", "芒果TV", "芒果 TV", "芒果台", "芒果"),
     "002028.SZ": ("思源电气", "思源", "Sieyuan"),
     "002050.SZ": ("三花智控", "三花", "Sanhua"),
+    "2050.HK": ("三花智控", "三花", "Sanhua"),
+    "600690.SS": ("海尔智家", "海尔", "Haier"),
+    "600690.SH": ("海尔智家", "海尔", "Haier"),
+    "6690.HK": ("海尔智家", "海尔", "Haier"),
+    "002594.SZ": ("比亚迪", "BYD"),
+    "1211.HK": ("比亚迪", "BYD"),
+    "601888.SS": ("中国中免", "中免"),
+    "601888.SH": ("中国中免", "中免"),
+    "1880.HK": ("中国中免", "中免"),
+    "600941.SS": ("中国移动", "中移动", "China Mobile"),
+    "600941.SH": ("中国移动", "中移动", "China Mobile"),
+    "0941.HK": ("中国移动", "中移动", "China Mobile"),
+    "002352.SZ": ("顺丰控股", "顺丰", "SF Holding"),
+    "6936.HK": ("顺丰控股", "顺丰", "SF Holding"),
+    "603259.SS": ("药明康德", "WuXi AppTec"),
+    "603259.SH": ("药明康德", "WuXi AppTec"),
+    "2359.HK": ("药明康德", "WuXi AppTec"),
+    "601899.SS": ("紫金矿业", "紫金", "Zijin"),
+    "601899.SH": ("紫金矿业", "紫金", "Zijin"),
+    "2899.HK": ("紫金矿业", "紫金", "Zijin"),
+    "688981.SS": ("中芯国际", "中芯", "SMIC"),
+    "688981.SH": ("中芯国际", "中芯", "SMIC"),
+    "0981.HK": ("中芯国际", "中芯", "SMIC"),
+    "3931.HK": ("中创新航",),
+    "300014.SZ": ("亿纬锂能", "亿纬"),
+    "300450.SZ": ("先导智能",),
+    "603659.SS": ("璞泰来",),
+    "603659.SH": ("璞泰来",),
+    "600809.SS": ("山西汾酒", "汾酒"),
+    "600809.SH": ("山西汾酒", "汾酒"),
+    "000568.SZ": ("泸州老窖", "老窖"),
+    "002304.SZ": ("洋河股份", "洋河"),
+    "300308.SZ": ("中际旭创", "旭创", "Innolight"),
+    "002463.SZ": ("沪电股份", "沪电", "WUS"),
+    "002371.SZ": ("北方华创", "Naura"),
+    "688012.SS": ("中微公司", "中微", "AMEC"),
+    "688012.SH": ("中微公司", "中微", "AMEC"),
+    "9880.HK": ("优必选", "UBTECH"),
+    "9988.HK": ("阿里巴巴", "Alibaba", "阿里"),
+    "9618.HK": ("京东", "JD.com", "JD"),
+    "9999.HK": ("网易", "NetEase"),
+    "9888.HK": ("百度", "Baidu"),
+    "9961.HK": ("携程", "Trip.com"),
+    "2423.HK": ("贝壳", "KE Holdings"),
+    "9626.HK": ("哔哩哔哩", "Bilibili"),
+    "1179.HK": ("华住", "H World"),
     "000719.SZ": ("中原传媒",),
+    "300033.SZ": ("同花顺",),
+    "1357.HK": ("美图公司", "美图", "Meitu"),
+    "2513.HK": ("智谱", "智谱华章", "Zhipu"),
+    "3696.HK": ("英矽智能", "英矽", "Insilico"),
+    "3317.HK": ("迅策", "Xunce"),
+    "002230.SZ": ("科大讯飞", "讯飞"),
+    "300058.SZ": ("蓝色光标",),
+    "0268.HK": ("金蝶国际", "金蝶", "Kingdee"),
+    "0354.HK": ("中软国际", "Chinasoft"),
+    "2228.HK": ("晶泰控股", "晶泰科技", "晶泰", "XtalPi"),
+    "9638.HK": ("法拉帝", "Ferretti"),
+    "8035.T": ("Tokyo Electron", "东京电子"),
+    "000660.KS": ("SK海力士", "SK Hynix", "Hynix", "海力士"),
     "5803.T": ("藤仓", "Fujikura"),
     "6857.T": ("爱德万", "爱德万测试", "Advantest"),
+    "7581.T": ("萨莉亚", "Saizeriya"),
+    "GTLB": ("GitLab",),
+    "ESTC": ("Elastic",),
     "SNPS": ("Synopsys", "新思科技", "新思"),
     "AVGO": ("Broadcom", "博通"),
     "NVDA": ("Nvidia", "英伟达"),
@@ -391,16 +553,202 @@ SUPPLEMENTAL_TICKER_ALIASES: dict[str, tuple[str, ...]] = {
     "TSM": ("Taiwan Semiconductor", "TSMC", "台积电"),
     "AMZN": ("Amazon", "亚马逊"),
     "BABA": ("阿里巴巴", "Alibaba", "阿里"),
+    "NOW": ("ServiceNow",),
+    "WDAY": ("Workday",),
+    "PANW": ("Palo Alto", "Palo Alto Networks"),
+    "SOUN": ("SoundHound",),
+    "EL": ("雅诗兰黛", "Estée Lauder", "Estee Lauder"),
+    "MKSI": ("MKS Instruments", "MKS"),
+    "BBY": ("Best Buy",),
     "IQ": ("iQIYI", "爱奇艺"),
     "HUBS": ("HubSpot",),
+    "AMD": ("AMD", "Advanced Micro Devices", "超威半导体"),
     "EFX": ("Equifax",),
     "TRU": ("TransUnion",),
 }
 
-# Tickers of research/data providers that are frequently cited as sources rather than discussed subjects.
+# A+H dual-listed pairs: when backfilling a company name in `quote` whose ticker is missing from `tickers`,
+# both the A-share and H-share codes are backfilled.
+DUAL_LISTED_TICKER_GROUPS: tuple[tuple[str, str], ...] = (
+    ("300750.SZ", "3750.HK"),
+    ("688008.SS", "6809.HK"),
+    ("000333.SZ", "0300.HK"),
+    ("002050.SZ", "2050.HK"),
+    ("600660.SS", "3606.HK"),
+    ("002594.SZ", "1211.HK"),
+    ("601888.SS", "1880.HK"),
+    ("600941.SS", "0941.HK"),
+    ("002352.SZ", "6936.HK"),
+    ("603259.SS", "2359.HK"),
+    ("601899.SS", "2899.HK"),
+    ("688981.SS", "0981.HK"),
+)
+
+# Tickers of research/data/sell-side institutions that are frequently cited as sources rather than discussed subjects.
 SOURCE_INSTITUTION_TICKERS: dict[str, tuple[str, ...]] = {
     "IT": ("Gartner",),
+    "SPGI": ("S&P", "S&P Global", "标普"),
+    "MCO": ("Moody's", "穆迪"),
+    "MS": ("Morgan Stanley", "摩根士丹利", "大摩"),
+    "GS": ("Goldman Sachs", "Goldman", "高盛"),
+    "JPM": ("JPMorgan", "JP Morgan", "J.P. Morgan", "摩根大通", "小摩"),
+    "BAC": ("Bank of America", "BofA", "美银", "美银证券"),
+    "C": ("Citigroup", "Citi", "花旗"),
+    "UBS": ("UBS", "瑞银"),
+    "BCS": ("Barclays", "巴克莱"),
+    "DB": ("Deutsche Bank", "德银"),
+    "HSBC": ("HSBC", "汇丰"),
 }
+
+# Extensible table of media/research institutions and named speakers checked in `claim`/`topic_label` against `quote`.
+KNOWN_INSTITUTION_PROPER_NAMES_TABLE: tuple[tuple[str, ...], ...] = (
+    ("晚点聊",),
+    ("陈哲",),
+    ("Bernstein", "伯恩斯坦"),
+    ("Jefferies", "杰富瑞"),
+    ("Gartner",),
+    ("SemiAnalysis",),
+    ("Apptopia",),
+    ("VisibleAlpha", "Visible Alpha"),
+    ("Piper Sandler", "Piper"),
+    ("TD Cowen",),
+    ("Guggenheim",),
+    ("Guidepoint",),
+    ("中泰",),
+    ("招商",),
+)
+
+# Extensible table of conclusion words forbidden in `claim` when absent from `quote`.
+FORBIDDEN_CONCLUSION_WORDS_TABLE: tuple[str, ...] = (
+    "止跌",
+    "见顶",
+    "触底",
+    "筑底",
+    "反转",
+    "资金流",
+    "资金流入",
+    "资金流出",
+    "主力流入",
+    "主力流出",
+    "费率更低",
+    "费率更高",
+)
+
+# Extensible keyword tables for programmatic card `type` correction.
+FACT_TO_ESTIMATE_KEYWORDS_TABLE: tuple[str, ...] = (
+    "指引",
+    "预计",
+    "预期",
+    "有望",
+    "将",
+    "计划",
+    "将达",
+    "guidance",
+    "expects",
+    "expected to",
+    "target",
+    "今明两年",
+    "以后会有",
+)
+
+_REALIZED_EXPECTATION_MASK_RE = re.compile(
+    r"(?:原预期内|落在原预期|原预期|此前预期"
+    r"|(?:超|超出|好于|优于|低于|不及|弱于|符合|合乎)了?(?:市场|一致|分析师|卖方|机构|此前|原|的)*(?:预期)"
+    r"|预期内"
+    r"|(?:将)?目标价"
+    r"|(?:训练|激励|股权激励|期权激励|限制性股票|回购|股份回购|股票回购|员工持股|持股)计划"
+    r"|(?<![A-Za-z0-9])(?:price\s+targets?|target\s+prices?)(?![A-Za-z0-9])"
+    r"|(?<![A-Za-z0-9])in\s+line\s+with\s+(?:the\s+|market\s+|street\s+|consensus\s+|analyst\s+)?(?:expectations?|targets?|guidance|estimates?)(?![A-Za-z0-9])"
+    r"|(?<![A-Za-z0-9])(?:beat|beats|beating|missed|misses|missing|miss|above|below|ahead\s+of|short\s+of|met|meets|meeting)"
+    r"(?:\s+(?:the\s+|market\s+|street\s+|consensus\s+|analyst\s+)?(?:expectations?|targets?|guidance|estimates?))?(?![A-Za-z0-9]))",
+    flags=re.IGNORECASE,
+)
+
+_FORWARD_JIANG_RE = re.compile(
+    r"(?:即将|(?<!已)(?<!曾)(?<!已经)(?<!曾经)将(?:要|会|于|在|达|达到|增长|增持|提升|提高|扩大|扩产|推出|发布|上线|量产|投产|实现|录得|进入|开启|启动|翻倍|突破|保持|维持|继续|持续|迎来|受益|贡献|带来|成为|达产|交付|出货|放量))"
+)
+
+REALIZED_FACT_PHRASES_TABLE: tuple[str, ...] = (
+    "事实：",
+    "已经实现",
+    "已实现",
+    "实际实现",
+    "实际录得",
+    "已公布",
+    "已经完成",
+    "已完成",
+    "已经达成",
+    "已达成",
+    "结果 Q1",
+    "结果 Q2",
+    "结果 Q3",
+    "结果 Q4",
+    "结果 1Q",
+    "结果 2Q",
+    "结果 3Q",
+    "结果 4Q",
+)
+
+ESTIMATE_TO_FACT_PHRASES_TABLE: tuple[str, ...] = (
+    "事实：",
+    "已实现",
+    "已经实现",
+    "实际实现",
+    "实际录得",
+    "已公布",
+    "财报显示",
+    "reported",
+    "actual",
+)
+
+THIRD_PARTY_FORECAST_PHRASES_TABLE: tuple[str, ...] = (
+    "卖方预计",
+    "卖方预测",
+    "卖方口径",
+    "它估计",
+    "一致预期为",
+    "consensus expects",
+    "consensus forecasts",
+    "consensus is",
+)
+
+_THIRD_PARTY_FORECAST_EN_RE = re.compile(
+    r"\b(?<!already\s)(?<!is\s)(?<!are\s)"
+    r"(?:"
+    r"(?:(?:street|market|bloomberg|sell[-\s]?side)\s+)?consensus\s+"
+    r"(?:(?:for\s+[^.!?;,\n]{1,30}?\s+)?(?:expects?|forecasts?|estimates?|projects?|models?|sees?|is|at|of|calls\s+for)\b)"
+    r"|(?:sell[-\s]?side|street)\s+(?:consensus\s+)?(?:expects?|forecasts?|estimates?|projects?|models?)\b"
+    r")"
+    r"[^.!?;,\n]*?\d",
+    flags=re.IGNORECASE,
+)
+
+SELF_CALCULATION_KEYWORDS_TABLE: tuple[str, ...] = (
+    "我算",
+    "我粗估",
+    "我们算",
+    "倒算",
+)
+
+_UNVERIFIED_SOURCE_RE = re.compile(
+    r"(?:原文[^。！？；;\n]{0,6}(?:没|未)打开"
+    r"|(?:没|未)打开原文"
+    r"|(?:没|未)[^。！？；;\n]{0,6}核对"
+    r"|未核实|没核实|未经核实"
+    r"|(?:没|未)看原文"
+    r"|\bunverified\b)",
+    flags=re.IGNORECASE,
+)
+
+OPINION_TO_MODEL_ASSUMPTION_KEYWORDS_TABLE: tuple[str, ...] = (
+    "隐含",
+    "假设",
+    "倒算",
+    "情景",
+)
+
+_AN_SUAN_RE = re.compile(r"按[^。！？；;\n，,]{1,25}算(?!力)")
+_THIRD_PARTY_AN_SUAN_RE = re.compile(r"它说[^。！？；;\n]*?按[^。！？；;\n，,]{1,25}算(?!力)")
 
 _ENGLISH_MONTH_NUMBERS: dict[str, int] = {
     "jan": 1,
@@ -531,17 +879,31 @@ def _load_ticker_company_aliases() -> dict[str, tuple[str, ...]]:
                 disp_name = str(entry.get("name") or "").strip()
                 if disp_name:
                     names.append(disp_name)
-                search_names = (entry.get("aliases") or {}).get("search_names") or []
+                aliases_obj = entry.get("aliases") or {}
+                search_names = aliases_obj.get("search_names") or []
+                secondary_tickers: list[str] = []
                 for sn in search_names:
                     sn_str = str(sn or "").strip()
                     if sn_str and sn_str not in names:
                         names.append(sn_str)
+                    if re.match(r"^(?:\d{1,6}\.(?:HK|SS|SH|SZ|T|TW|KS)|[A-Z]{2,5}(?:[.-][A-Z])?)$", sn_str):
+                        secondary_tickers.append(sn_str.upper())
+                for extra_field in ("adr", "a_ticker", "h_ticker", "hk_ticker", "cn_ticker"):
+                    extra_t = str(aliases_obj.get(extra_field) or "").strip().upper()
+                    if extra_t:
+                        if extra_t not in names:
+                            names.append(extra_t)
+                        secondary_tickers.append(extra_t)
                 _register(ticker, names)
+                for sec_t in secondary_tickers:
+                    _register(sec_t, names)
         except Exception:
             pass
 
     for ticker, extra_names in SUPPLEMENTAL_TICKER_ALIASES.items():
         _register(ticker, list(extra_names))
+    for ticker, inst_names in SOURCE_INSTITUTION_TICKERS.items():
+        _register(ticker, list(inst_names))
 
     return {k: tuple(v) for k, v in mapping.items()}
 
@@ -779,6 +1141,43 @@ METRIC_UNITS_TABLE: tuple[str, ...] = (
     r"秒",
 )
 
+# Extensible table of indicator names that qualify a following number as a metric value
+# even without a trailing `%` or currency unit (e.g. `价格=66.3`, `价格为66.3`, `RSI=85.6`, `PE 25`, `EV/EBIT 15`).
+METRIC_PREFIX_INDICATORS_TABLE: tuple[str, ...] = (
+    # Price & valuation levels
+    r"收盘价",
+    r"开盘价",
+    r"目标价",
+    r"行权价",
+    r"成本价",
+    r"成交价",
+    r"发行价",
+    r"转换价",
+    r"转股价",
+    r"赎回价",
+    r"现价",
+    r"股价",
+    r"价格",
+    r"均价",
+    r"收于",
+    # Technical indicators
+    r"(?<![A-Za-z0-9])RSI(?![A-Za-z0-9])",
+    r"量比",
+    # Valuation multiples & financial ratios
+    r"市盈率",
+    r"市净率",
+    r"市销率",
+    r"(?<![A-Za-z0-9])(?:EV\s*/\s*(?:EBITDA|EBIT|Sales|Revenue)|P\s*/\s*[EBS]|PE|PB|PS|PEG|ROE|ROIC|ROA|ETR|EPS|BPS|DPS|NAV)(?![A-Za-z0-9])",
+)
+
+_METRIC_INDICATOR_PREFIX_CORE = "(?:" + "|".join(METRIC_PREFIX_INDICATORS_TABLE) + ")"
+_METRIC_INDICATOR_PREFIX_TAIL_RE = re.compile(
+    rf"{_METRIC_INDICATOR_PREFIX_CORE}"
+    rf"(?:\s*(?:[=:：]|为|是|约|约为|大约|大概|达|达到|报|收于|跌至|升至|降至|回升至|回落至|高于|低于|突破|跌破|从|由|在|仅|只有|给|给到|维持))*"
+    rf"\s*[（(]?\s*[-−+~～≈><≥≤]?\s*$",
+    flags=re.IGNORECASE,
+)
+
 _CURRENCY_PREFIX_RE = (
     r"(?:US\$|HK\$|NT\$|S\$|A\$|C\$|CA\$|\$|¥|￥|€|£"
     r"|(?<![A-Za-z])(?:USD|CNY|RMB|HKD|JPY|EUR|GBP|CHF|SGD|AUD|CAD)(?![A-Za-z])"
@@ -958,6 +1357,21 @@ _CN_NUM_MENTION_RE = re.compile(
     rf"|(?<=[十百千万亿])(?P<approx>[多余])"
     rf"|(?<=[百千万亿])(?!分之|地|般|方|姓|科|货))"
 )
+_FORECAST_NUM_CORE = rf"(?:{_ARABIC_NUM_CORE}|{re.sub(r'\(\?P<\w+>', '(?:', _CN_NUM_MENTION_RE.pattern)})"
+_THIRD_PARTY_FORECAST_RE = re.compile(
+    r"(?:"
+    r"(?:(?:卖方|机构|券商|投行|报告|分析师)\s*(?:口径)?\s*(?:称[^。！？!?；;\n]{0,40}?)?(?:预计|预测|估计|估算)"
+    r"|它\s*(?:预计|预测|估计|估算)"
+    r"|(?<!已是)(?<!是)(?<!为)(?<!成)(?:市场|彭博|卖方)?一致预期\s*(?:为|是|在|达|达到|约|预计|预测|增长|增速|营收|收入|利润|净利))"
+    r"(?:(?![。！？!?；;\n，]|,(?!\d)).){0,120}?"
+    rf"{_FORECAST_NUM_CORE}"
+    r")"
+    r"|(?:(?:预计|预测|估计)"
+    r"(?=[^。！？!?；;\n，]{0,120}?[（(]?卖方(?:口径|预计|预测))"
+    r"(?:(?![。！？!?；;\n，]|,(?!\d)).){0,120}?"
+    rf"{_FORECAST_NUM_CORE}"
+    r"(?:(?![。！？!?；;\n，]|,(?!\d)).){0,120}?[（(]?卖方(?:口径|预计|预测))"
+)
 
 _FINANCIAL_CONTEXT_RE = re.compile(
     r"(?:\$|¥|￥|€|£|(?<![A-Za-z])(?:USD|CNY|RMB|HKD|JPY|EUR|GBP|yuan|dollars?|cents?|shares?|pieces?|units?|"
@@ -1016,6 +1430,44 @@ def _build_number_forms(raw_num: str, unit_str: str | None = None) -> tuple[str 
     return canon, forms
 
 
+_EN_NUM_WORD_MAP: dict[str, str] = {
+    "one": "1",
+    "two": "2",
+    "three": "3",
+    "four": "4",
+    "five": "5",
+    "six": "6",
+    "seven": "7",
+    "eight": "8",
+    "nine": "9",
+    "ten": "10",
+    "eleven": "11",
+    "twelve": "12",
+}
+
+_EN_ORDINAL_QUARTER_MAP: dict[str, str] = {
+    "first": "1",
+    "second": "2",
+    "third": "3",
+    "fourth": "4",
+}
+
+_EN_NUM_MENTION_RE = re.compile(
+    r"(?<![A-Za-z0-9\-])"
+    r"(?:"
+    r"(?P<and_other>and\s+(?P<other_num>one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s+other\b)"
+    r"|(?P<dozen>a\s+dozen)"
+    r"|(?P<half>half(?!\s*-\s*year\b|\s+year\b))"
+    r"|(?P<ord>first|second|third|fourth)(?=\s+quarters?\b)"
+    r"|(?P<card>(?:one(?!\s*-\s*(?:time|off)\b|\s+of\b)|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve))"
+    r")"
+    r"(?![A-Za-z0-9\-])"
+    rf"(?:\s*(?P<u_en>{_UNIT_CORE}))?"
+    rf"(?:\s*(?P<p_en>{_METRIC_POST_UNIT_RE}))?",
+    flags=re.IGNORECASE,
+)
+
+
 def _parse_number_mentions_detailed(
     text: str, *, strip_non_metrics: bool = True
 ) -> list[tuple[str, set[str], bool]]:
@@ -1050,12 +1502,13 @@ def _parse_number_mentions_detailed(
             u2 = None
 
         eff_u1 = u1 if u1 is not None else u2
-        has_unit_1 = bool(eff_cur or eff_u1 or eff_post)
+        has_indicator_prefix = bool(_METRIC_INDICATOR_PREFIX_TAIL_RE.search(cleaned[: match.start()]))
+        has_unit_1 = bool(eff_cur or eff_u1 or eff_post or has_indicator_prefix)
         c1, f1 = _build_number_forms(n1, eff_u1)
         if c1 is not None:
             mentions.append((c1, f1, has_unit_1))
         if n2:
-            has_unit_2 = bool(eff_cur or u2 or eff_u1 or eff_post)
+            has_unit_2 = bool(eff_cur or u2 or eff_u1 or eff_post or has_indicator_prefix)
             c2, f2 = _build_number_forms(n2, u2 or eff_u1)
             if c2 is not None:
                 mentions.append((c2, f2, has_unit_2))
@@ -1084,6 +1537,48 @@ def _parse_number_mentions_detailed(
                 break
         has_cn_unit = bool(cn_match.group("post") or any(cn_tok.endswith(u) for u in ("万亿", "亿", "万", "千", "百")))
         mentions.append((raw_canon, forms, has_cn_unit))
+        for idx in range(cn_match.start(), cn_match.end()):
+            masked_chars[idx] = " "
+
+    remaining_en = "".join(masked_chars)
+    for en_match in _EN_NUM_MENTION_RE.finditer(remaining_en):
+        u_en = en_match.group("u_en")
+        p_en = en_match.group("p_en")
+        if u_en and not _is_short_en_mag_allowed(
+            u_en,
+            text=remaining_en,
+            span_start=en_match.start(),
+            span_end=en_match.end(),
+            cur_prefix=None,
+            post_unit=p_en,
+        ):
+            u_en = None
+        has_en_unit = bool(u_en or p_en)
+        if en_match.group("and_other"):
+            other_w = en_match.group("other_num").lower()
+            base_num = _EN_NUM_WORD_MAP[other_w]
+            c_en, f_en = _build_number_forms(base_num, u_en)
+            if c_en is not None:
+                f_en.add(str(int(base_num) + 1))
+                mentions.append((c_en, f_en, has_en_unit))
+        elif en_match.group("dozen"):
+            c_en, f_en = _build_number_forms("12", u_en)
+            if c_en is not None:
+                mentions.append((c_en, f_en, has_en_unit))
+        elif en_match.group("half"):
+            c_en, f_en = _build_number_forms("0.5", u_en)
+            if c_en is not None:
+                mentions.append((c_en, f_en, has_en_unit))
+        elif en_match.group("ord"):
+            ord_w = en_match.group("ord").lower()
+            c_en, f_en = _build_number_forms(_EN_ORDINAL_QUARTER_MAP[ord_w], u_en)
+            if c_en is not None:
+                mentions.append((c_en, f_en, has_en_unit))
+        elif en_match.group("card"):
+            card_w = en_match.group("card").lower()
+            c_en, f_en = _build_number_forms(_EN_NUM_WORD_MAP[card_w], u_en)
+            if c_en is not None:
+                mentions.append((c_en, f_en, has_en_unit))
 
     return mentions
 
@@ -1188,7 +1683,7 @@ def _is_year_supported_in_quote(yr4: str, quote: str) -> bool:
     return False
 
 
-def is_period_supported_by_quote(period: str, quote: str) -> bool:
+def _is_period_supported_in_text(period: str, quote: str) -> bool:
     """Return True if `period` is empty, appears literally in `quote` (with alphanumeric boundaries),
     or has every structured component (year, half-year, quarter, month, day/range endpoint) supported by `quote`.
     """
@@ -1383,9 +1878,186 @@ def is_period_supported_by_quote(period: str, quote: str) -> bool:
     return True
 
 
+_SENTENCE_SPLIT_RE = re.compile(
+    r"[。！？；\n]+"
+    r"|(?<=\bInc\.)\s+(?=[A-Z])|(?<=\bLtd\.)\s+(?=[A-Z])|(?<=\bCorp\.)\s+(?=[A-Z])|(?<=\bCo\.)\s+(?=[A-Z])"
+    r"|(?<![A-Za-z]\.[A-Za-z])(?<!\bInc)(?<!\bLtd)(?<!\bCorp)(?<!\bCo)(?<!\bvs)(?<!\bMr)(?<!\bDr)(?<!\bSt)(?<!\bNo)"
+    r"\.(?!\d|[A-Za-z])(?:\s+|$)"
+    r"|[!?;\n]+(?:\s+|$)"
+)
+_CLAUSE_SPLIT_CN_COMMA_RE = re.compile(r"[，,]+")
+
+
+def _split_sentences(text: str, *, split_cn_comma: bool = False) -> list[str]:
+    """Split `text` into sentences (or clauses when `split_cn_comma=True`) in linear time,
+    splitting Chinese `。！？；` (and `，` when `split_cn_comma=True`) and English `. ! ? ;` followed by whitespace
+    while preserving decimals (`3.5`), abbreviations (`U.S.`, `Inc.`), and ticker suffixes (`.HK`, `.SS`).
+    """
+    s = str(text or "")
+    if not s:
+        return []
+    parts = [p.strip() for p in _SENTENCE_SPLIT_RE.split(s) if p and p.strip()]
+    if not split_cn_comma:
+        return parts
+    clauses: list[str] = []
+    for p in parts:
+        for sub in re.split(r"，+", p):
+            if sub and sub.strip():
+                clauses.append(sub.strip())
+    return clauses
+
+
+def is_period_supported_by_quote(
+    period: str,
+    quote: str,
+    *,
+    value: Any = None,
+    unit: str = "",
+) -> bool:
+    """Return True if `period` is supported by `quote` and anchored in the same sentence as `value`."""
+    p = str(period or "").strip()
+    if not p:
+        return True
+    q = str(quote or "")
+    if not _is_period_supported_in_text(p, q):
+        return False
+
+    sents = _split_sentences(q, split_cn_comma=False)
+    if not sents:
+        return False
+
+    if value is not None:
+        fig_mentions = _extract_figure_value_mentions(value, unit=str(unit or "").strip())
+        if fig_mentions:
+            matching_sents = [
+                s
+                for s in sents
+                if all(not forms.isdisjoint(extract_quote_supported_numbers(s)) for _raw, forms in fig_mentions)
+            ]
+            if not matching_sents:
+                return False
+            return any(_is_period_supported_in_text(p, s) for s in matching_sents)
+
+    return any(_is_period_supported_in_text(p, s) for s in sents)
+
+
+_CURRENCY_UNIT_SPECS: tuple[tuple[str, str], ...] = (
+    (r"美元|美金|USD[_\s]*|US\$|\$", r"(?:美元|美金|刀|(?<![A-Za-z])USD(?![A-Za-z])|US\$|(?<![A-Za-z])\$|dollars?\b)"),
+    (r"港元|港币|HKD[_\s]*|HK\$", r"(?:港元|港币|(?<![A-Za-z])HKD(?![A-Za-z])|HK\$)"),
+    (
+        r"人民币|RMB[_\s]*|CNY[_\s]*",
+        r"(?:人民币|元人民币|(?<![A-Za-z])(?:RMB|CNY)(?![A-Za-z])|(?<![美港日欧韩澳加新台币])元|块|(?<![A-Za-z])yuan(?![A-Za-z]))",
+    ),
+    (r"日元|JPY[_\s]*", r"(?:日元|(?<![A-Za-z])JPY(?![A-Za-z])|円|(?<![A-Za-z])yen(?![A-Za-z]))"),
+    (r"欧元|EUR[_\s]*|€", r"(?:欧元|(?<![A-Za-z])EUR(?![A-Za-z])|€)"),
+    (r"英镑|GBP[_\s]*|£", r"(?:英镑|(?<![A-Za-z])GBP(?![A-Za-z])|£)"),
+    (
+        r"元",
+        r"(?:人民币|元人民币|(?<![A-Za-z])(?:RMB|CNY)(?![A-Za-z])|(?<![美港日欧韩澳加新台币])元|块|(?<![A-Za-z])yuan(?![A-Za-z]))",
+    ),
+)
+
+
+_NON_RMB_CURRENCY_SPAN_RE = re.compile(
+    r"(?:新台币|台币|韩元|新加坡元|澳元|加元|美元|美金|港元|港币|日元|欧元|英镑)"
+    r"(?:\s*[-−+~～≈><≥≤]?\s*[\d,.]+(?:\s*(?:万\s*亿|亿|千\s*万|百\s*万|万|千|百))?\s*元)?",
+    flags=re.IGNORECASE,
+)
+
+
+def strip_unsupported_currency_from_unit(
+    unit: str,
+    value: Any,
+    quote: str,
+    *,
+    period: str = "",
+) -> tuple[str, bool]:
+    """If `unit` contains a currency (`美元`, `元`, `港元`, `USD`, `USD_bn`, `CNY_yi`, etc.)
+    but the sentence in `quote` containing `value` lacks that currency token, strip the currency from `unit`.
+    Also clears `倍`/`x`/`X` when the sentence in `quote` containing `value` lacks `倍`/`x`/`X`/`times`,
+    returning `("", True)`. Returns `(cleaned_unit, was_stripped)`.
+    """
+    u = str(unit or "").strip()
+    if not u:
+        return u, False
+    q = str(quote or "")
+    sents = _split_sentences(q, split_cn_comma=False)
+    if not sents:
+        return u, False
+
+    fig_mentions = _extract_figure_value_mentions(value, unit=u)
+    matching_sents = [
+        s
+        for s in sents
+        if fig_mentions and all(not forms.isdisjoint(extract_quote_supported_numbers(s)) for _raw, forms in fig_mentions)
+    ]
+    if period:
+        period_sents = [s for s in matching_sents if _is_period_supported_in_text(period, s)]
+        if period_sents:
+            matching_sents = period_sents
+    if not matching_sents:
+        matching_sents = sents
+
+    if u in ("倍", "x", "X"):
+        sent_has_mult = any(
+            bool(re.search(r"(?:倍|(?<![A-Za-z])[xX](?![A-Za-z])|\btimes\b)", s, flags=re.IGNORECASE))
+            for s in matching_sents
+        )
+        if not sent_has_mult:
+            return "", True
+        return u, False
+
+    for unit_pat, q_cur_pat in _CURRENCY_UNIT_SPECS:
+        if not re.search(unit_pat, u, flags=re.IGNORECASE):
+            continue
+        if unit_pat == r"元" and re.search(r"(?:美元|港元|日元|欧元|韩元|新台币)", u):
+            continue
+        is_rmb_spec = unit_pat in (r"人民币|RMB[_\s]*|CNY[_\s]*", r"元")
+        sent_has_cur = any(
+            bool(
+                re.search(
+                    q_cur_pat,
+                    _NON_RMB_CURRENCY_SPAN_RE.sub(" ", s) if is_rmb_spec else s,
+                    flags=re.IGNORECASE,
+                )
+            )
+            for s in matching_sents
+        )
+        if not sent_has_cur:
+            new_u = re.sub(unit_pat, "", u, flags=re.IGNORECASE).strip(" _/")
+            return new_u, new_u != u
+        break
+    return u, False
+
+
 AMBIGUOUS_SHORT_ALIAS_WORDS: dict[str, tuple[str, ...]] = {
     "美的": ("完美的", "精美的", "优美的", "甜美的", "柔美的"),
+    "芒果": ("超媒", "TV", "台"),
 }
+
+_TRAD_TO_SIMP_TABLE = str.maketrans(
+    "騰訊阿裡團網東攜濟藥寧時亞長車農華潤島撈體申國瑪優鋪黃電移動聯礦鋁兗匯豐團險壽銀恆設業郵儲興發證廣財際導積詠鴻業富達緯創穎碩學聲電訊爾藍韋荊紀瀾創軟雲網萬數紀湯曠視訊飛匯術邁療醫達實製翰攜錦順遞龍置貝務綠鴻產氣鐵航遠電實創敏機義萊協綠陽風爾濱車思變繼電丹銀萊麥傑標譽萬愛測東科學勝倉製作產發電機臺偉馬遜圖譜滬億為鋰來瀘選殼嗶傳試薩詩蘭藝滙點陳節紅書螞蟻遊階躍樹擴張續貨賣買計預報會議與對開關價",
+    "腾讯阿里团网东携济药宁时亚长车农华润岛捞体申国玛优铺黄电移动联矿铝兖汇丰团险寿银恒设业邮储兴发证广财际导积咏鸿业富达纬创颖硕学声电讯尔蓝韦荆纪澜创软云网万数纪汤旷视讯飞汇术迈疗医达实制翰携锦顺递龙置贝务绿鸿产气铁航远电实创敏机义莱协绿阳风尔滨车思变继电丹银莱麦杰标誉万爱测东科学胜仓制作产发电机台伟马逊图谱沪亿为锂来泸选壳哔传试萨诗兰艺汇点陈节红书蚂蚁游阶跃树扩张续货卖买计预报会议与对开关价",
+)
+
+
+def _normalize_trad_to_simp(text: str) -> str:
+    return str(text or "").translate(_TRAD_TO_SIMP_TABLE)
+
+
+@lru_cache(maxsize=4096)
+def _compiled_alias_regex(alias: str) -> re.Pattern[str]:
+    if alias.isascii():
+        if alias.isdigit():
+            return re.compile(rf"(?<![A-Za-z0-9.]){re.escape(alias)}(?![A-Za-z0-9.])")
+        if len(alias) <= 2:
+            return re.compile(rf"(?<![A-Za-z0-9]){re.escape(alias)}(?![A-Za-z0-9])")
+        return re.compile(rf"(?<![A-Za-z0-9]){re.escape(alias)}(?![A-Za-z0-9])", flags=re.IGNORECASE)
+    if alias == "芒果":
+        req_suffixes = AMBIGUOUS_SHORT_ALIAS_WORDS.get("芒果", ("超媒", "TV", "台"))
+        sfx_pat = "|".join(re.escape(s) for s in req_suffixes)
+        return re.compile(rf"芒果\s*(?:{sfx_pat})", flags=re.IGNORECASE)
+    return re.compile(re.escape(alias))
 
 
 def _alias_matches_in_text(alias: str, text: str) -> bool:
@@ -1393,49 +2065,177 @@ def _alias_matches_in_text(alias: str, text: str) -> bool:
     if not alias or not text:
         return False
     if alias.isascii():
-        if len(alias) <= 2 or alias.isdigit():
-            return bool(re.search(rf"(?<![A-Za-z0-9.]){re.escape(alias)}(?![A-Za-z0-9.])", text))
-        return bool(
-            re.search(
-                rf"(?<![A-Za-z0-9]){re.escape(alias)}(?![A-Za-z0-9])",
-                text,
-                flags=re.IGNORECASE,
-            )
-        )
+        return bool(_compiled_alias_regex(alias).search(text))
+    norm_alias = _normalize_trad_to_simp(alias)
+    norm_text = _normalize_trad_to_simp(text)
+    if norm_alias == "芒果":
+        return bool(_compiled_alias_regex("芒果").search(norm_text))
     # Short Chinese company names (海光, 腾讯, 美的) are ordinary substrings in running text ("在海光",
     # "的腾讯"), so a CJK-boundary rule loses real mentions. Only names that collide with common
     # words carry an explicit list of the words to ignore.
-    if len(alias) < 3:
-        masked = text
-        for word in AMBIGUOUS_SHORT_ALIAS_WORDS.get(alias, ()):
+    if len(norm_alias) < 3:
+        masked = norm_text
+        for word in AMBIGUOUS_SHORT_ALIAS_WORDS.get(norm_alias, ()):
             masked = masked.replace(word, " ")
-        return alias in masked
-    return alias in text
+        return norm_alias in masked
+    return norm_alias in norm_text
 
 
 _EXCLUSION_STOP_RE = (
     r"[，。；;：:！!？?\n后外并但而（）()]"
+    r"|,(?!\d)|\.(?![A-Za-z0-9])"
     r"|同时|继续|保留|持有|买入|增持|加仓|建仓|看多|看好"
 )
 
+_EXCLUSION_PREFIX_RE = re.compile(
+    rf"(?:(?<!不)(?:剔除|排除|除去|不含|未采用)|(?<![A-Za-z])(?:excluding|excludes|ex-))"
+    rf"\s*((?:(?!{_EXCLUSION_STOP_RE}).)*)",
+    flags=re.IGNORECASE,
+)
 
-def validate_tickers_against_quote(
+_EN_PASSIVE_EXCLUSION_RE = re.compile(
+    r"(?<![A-Za-z])(?:(?:is|are|was|were|be|been)\s+)?not\s+(?:used|included)(?![A-Za-z])",
+    flags=re.IGNORECASE,
+)
+_EN_ACTIVE_EXCLUSION_RE = re.compile(
+    r"(?<![A-Za-z])(?:doesn['’]t|don['’]t|does\s+not|do\s+not|did\s+not|didn['’]t)\s+use(?![A-Za-z])",
+    flags=re.IGNORECASE,
+)
+_EN_PRONOUN_OBJECT_RE = re.compile(
+    r"^\s*(?:them|it|they|these|those|either|both)\b",
+    flags=re.IGNORECASE,
+)
+
+_CUSTOMER_ORDER_EXCLUSION_RE = re.compile(
+    r"(?:的\s*([A-Za-z0-9\u4e00-\u9fff]{2,12})\s*订单|['’]s\s+([A-Za-z0-9]{2,15})\s+orders?\b)",
+    flags=re.IGNORECASE,
+)
+
+
+def _extract_excluded_spans_and_clean_quote(quote: str) -> tuple[list[str], str]:
+    """Extract excluded spans (Chinese and English prefix/clause exclusions and customer-order modifiers)
+    and return `(excluded_spans, cleaned_quote)` using linear clause splitting.
+    """
+    q = str(quote or "")
+    if not q:
+        return [], ""
+    excluded_spans: list[str] = []
+    for m in _EXCLUSION_PREFIX_RE.finditer(q):
+        span = m.group(1)
+        if span and span.strip():
+            excluded_spans.append(span)
+    for m in _CUSTOMER_ORDER_EXCLUSION_RE.finditer(q):
+        span = m.group(1) or m.group(2)
+        if span and span.strip():
+            excluded_spans.append(span)
+
+    clauses = _split_sentences(q, split_cn_comma=True)
+    cleaned_clauses: list[str] = []
+    for clause in clauses:
+        if "未予采用" in clause:
+            excluded_spans.append(clause)
+            continue
+        pas_m = _EN_PASSIVE_EXCLUSION_RE.search(clause)
+        if pas_m is not None:
+            before_verb = clause[: pas_m.start()].strip(" .!?;,，。！？；")
+            after_verb = clause[pas_m.end() :].strip(" .!?;,，。！？；")
+            if before_verb:
+                excluded_spans.append(before_verb)
+            clause = after_verb
+        else:
+            act_m = _EN_ACTIVE_EXCLUSION_RE.search(clause)
+            if act_m is not None:
+                before_verb = clause[: act_m.start()]
+                after_verb_full = clause[act_m.end() :]
+                obj_parts = re.split(r",(?!\d)", after_verb_full, maxsplit=1)
+                obj_span = obj_parts[0].strip(" .!?;,，。！？；")
+                rest_after_comma = obj_parts[1].strip() if len(obj_parts) > 1 else ""
+                if not obj_span or _EN_PRONOUN_OBJECT_RE.match(obj_span):
+                    so_parts = re.split(r",\s*so\b", before_verb, maxsplit=1, flags=re.IGNORECASE)
+                    if len(so_parts) > 1:
+                        if so_parts[0].strip():
+                            excluded_spans.append(so_parts[0].strip())
+                        clause = rest_after_comma
+                    else:
+                        clause = f"{before_verb} {rest_after_comma}".strip()
+                else:
+                    excluded_spans.append(obj_span)
+                    clause = f"{before_verb} {rest_after_comma}".strip()
+        clause_cleaned = _EXCLUSION_PREFIX_RE.sub(" ", clause)
+        clause_cleaned = _CUSTOMER_ORDER_EXCLUSION_RE.sub(" ", clause_cleaned)
+        if clause_cleaned.strip():
+            cleaned_clauses.append(clause_cleaned)
+
+    cleaned = " ".join(cleaned_clauses)
+    return excluded_spans, cleaned
+
+
+_INSTITUTION_SOURCE_VERB_AFTER_RE = (
+    r"(?:\s*(?:\d{4}\s*年\s*)?(?:\d{1,2}\s*[月/.-]\s*\d{1,2}\s*日?\s*)?)?"
+    r"(?:\s*(?:的分析师|分析师|的研报|研报|的研究|研究报告|报告|的晨报|晨报))?"
+    r"\s*(?:预计|预测|估算|估计|称|认为|指出|表示)"
+)
+_INSTITUTION_SOURCE_PREP_BEFORE_RE = (
+    r"(?:据|根据|按照|引用|引述|援引|来自|来源[：:]?[^。\n]{0,20}|卖方[：:]?\s*)\s*"
+)
+
+
+def _is_institution_used_as_source(canon_t: str, text: str, cited_sources: list[str]) -> bool:
+    """Return True only when an institution (`SOURCE_INSTITUTION_TICKERS`) is used as an information source
+    (e.g. `高盛预计/称/认为/指出/表示/估计`, `在高盛的研报/会上`, `according to Goldman`, or listed in `cited_sources`),
+    and False when the institution itself is the subject of the card (e.g. `摩根大通Q3净利息收入增长`).
+    """
+    src_names = SOURCE_INSTITUTION_TICKERS.get(canon_t, ())
+    if not src_names:
+        return False
+    t_str = _normalize_trad_to_simp(str(text or ""))
+    in_cited = any(
+        any(_normalize_trad_to_simp(sn).lower() in _normalize_trad_to_simp(s).lower() for sn in src_names if len(sn) >= 2)
+        for s in cited_sources
+    )
+    if in_cited:
+        return True
+
+    for sn in src_names:
+        norm_sn = _normalize_trad_to_simp(sn)
+        if not _alias_matches_in_text(norm_sn, t_str):
+            continue
+        esc = re.escape(norm_sn)
+        zai_full_pat = rf"在\s*{esc}\s*(?:的)?(?:研报|研究报告|报告|会上|会议)"
+        if norm_sn.isascii():
+            src_pat = re.compile(
+                rf"(?:(?<![A-Za-z])according\s+to\s+{esc}(?![A-Za-z])"
+                rf"|(?<![A-Za-z]){esc}(?:['’]s)?\s+(?:(?:analysts?|research|reports?|notes?)\s+)?(?:estimates?|forecasts?|expects?|believes?|says?|said|noted|points?\s+out)(?![A-Za-z])"
+                rf"|{_INSTITUTION_SOURCE_PREP_BEFORE_RE}{esc}(?![A-Za-z])"
+                rf"|{zai_full_pat}"
+                rf"|(?<![A-Za-z]){esc}{_INSTITUTION_SOURCE_VERB_AFTER_RE})",
+                flags=re.IGNORECASE,
+            )
+        else:
+            src_pat = re.compile(
+                rf"(?:{_INSTITUTION_SOURCE_PREP_BEFORE_RE}{esc}|{zai_full_pat}|{esc}{_INSTITUTION_SOURCE_VERB_AFTER_RE})",
+                flags=re.IGNORECASE,
+            )
+        if src_pat.search(t_str):
+            return True
+
+    return False
+
+
+def _validate_tickers_against_quote_detailed(
     tickers: list[str],
     quote: str,
     *,
     cited_sources: list[str] | None = None,
-) -> tuple[list[str], int]:
-    """Filter `tickers` so only symbols or mapped company names (`coverage.yaml` + `SUPPLEMENTAL_TICKER_ALIASES`)
-    present as discussed subjects in `quote` remain. Returns `(kept_tickers, tickers_dropped)`.
+    claim: str | None = None,
+) -> tuple[list[str], int, int, int]:
+    """Filter `tickers` against `quote`, dropping private companies (`tickers_dropped_private`),
+    trading channels not discussed as subjects in `claim` (`tickers_dropped_channel`),
+    source institutions, excluded companies, and unsupported symbols.
+    Returns `(kept_tickers, tickers_dropped, tickers_dropped_private, tickers_dropped_channel)`.
     """
     q = str(quote or "")
-    # Extract short excluded target phrases immediately following "剔除/不含/排除/除去/未采用" (ignoring "不排除").
-    # Phrase stops at "后/外/并/但/而/同时/继续/保留/持有..." or clause punctuation, not the end of the sentence.
-    exclusion_Phrase_re = re.compile(
-        rf"(?<!不)(?:剔除|排除|除去|不含|未采用)\s*((?:(?!{_EXCLUSION_STOP_RE}).)*)"
-    )
-    excluded_spans = [m.group(1) for m in exclusion_Phrase_re.finditer(q) if m.group(1).strip()]
-    q_without_exclusions = exclusion_Phrase_re.sub(" ", q)
+    excluded_spans, q_without_exclusions = _extract_excluded_spans_and_clean_quote(q)
 
     q_no_generic_it = re.sub(
         r"(?:数据中心\s*IT|IT\s*(?:容量|服务|支出|基础设施|系统|设备|行业|部门|预算|人员|外包|架构|成本))",
@@ -1448,19 +2248,33 @@ def validate_tickers_against_quote(
 
     kept: list[str] = []
     dropped = 0
+    dropped_private = 0
+    dropped_channel = 0
+    seen_priv: set[str] = set()
     for raw_t in tickers or []:
         t = str(raw_t or "").strip().upper()
         if not t:
             continue
         canon_t = canonicalize_ticker_key(t)
 
+        if _is_private_company_ticker(t):
+            if canon_t not in seen_priv:
+                seen_priv.add(canon_t)
+                dropped += 1
+                dropped_private += 1
+            continue
+
+        if canon_t in TRADING_CHANNEL_TICKERS:
+            check_text = claim if claim is not None else q
+            if not _is_trading_channel_discussed_in_claim(canon_t, check_text):
+                dropped += 1
+                dropped_channel += 1
+                continue
+
         if canon_t in SOURCE_INSTITUTION_TICKERS:
-            src_names = SOURCE_INSTITUTION_TICKERS[canon_t]
-            is_source_attr = any(any(sn.lower() in s.lower() for sn in src_names) for s in srcs) or any(
-                bool(re.search(rf"\b{re.escape(sn)}\s*(?:估算|预测|预计|表示|称|报告|数据)", q))
-                for sn in src_names
-            )
-            if is_source_attr and not re.search(r"(?<![A-Za-z0-9])IT(?![A-Za-z0-9])", q_no_generic_it):
+            if _is_institution_used_as_source(canon_t, q, srcs) and not re.search(
+                r"(?<![A-Za-z0-9])IT(?![A-Za-z0-9])", q_no_generic_it
+            ):
                 dropped += 1
                 continue
 
@@ -1472,7 +2286,7 @@ def validate_tickers_against_quote(
             if a not in cand_names:
                 cand_names.append(a)
 
-        # If any alias/code of this ticker is the target of an explicit exclusion phrase (e.g. "剔除WIT后...", "已剔除WIT。"), drop it.
+        # If any alias/code of this ticker is the target of an explicit exclusion phrase (e.g. "剔除WIT后...", "doesn't use them"), drop it.
         if excluded_spans and any(
             _alias_matches_in_text(alias, span) for span in excluded_spans for alias in cand_names
         ):
@@ -1482,16 +2296,797 @@ def validate_tickers_against_quote(
         target_q = q_no_generic_it if canon_t == "IT" else q_without_exclusions
         matched = any(_alias_matches_in_text(alias, target_q) for alias in cand_names)
 
-        if matched or canon_t not in alias_map:
-            # No name mapping means we cannot tell a missing mention from a name we do not know
-            # (e.g. 海光 for 688041.SS); keep it rather than lose a real subject. Exclusions and
-            # source institutions above still drop.
+        if matched:
             if t not in kept:
                 kept.append(t)
         else:
             dropped += 1
 
+    return kept, dropped, dropped_private, dropped_channel
+
+
+def validate_tickers_against_quote(
+    tickers: list[str],
+    quote: str,
+    *,
+    cited_sources: list[str] | None = None,
+    claim: str | None = None,
+) -> tuple[list[str], int]:
+    """Filter `tickers` so only symbols or mapped company names (`coverage.yaml` + `SUPPLEMENTAL_TICKER_ALIASES`)
+    present as discussed subjects in `quote` remain. Returns `(kept_tickers, tickers_dropped)`.
+    """
+    kept, dropped, _priv, _chan = _validate_tickers_against_quote_detailed(
+        tickers,
+        quote,
+        cited_sources=cited_sources,
+        claim=claim,
+    )
     return kept, dropped
+
+
+_COMPANY_ACRONYM_NAMES_FOR_BACKFILL: frozenset[str] = frozenset(
+    {"MKS", "CATL", "SMIC", "TSMC", "BYD", "ASML", "WUS", "AMEC"}
+)
+
+
+def _is_company_name_for_backfill(alias: str) -> bool:
+    """Return True if `alias` is a company name (Chinese or English company name) rather than a bare ticker code."""
+    s = str(alias or "").strip()
+    if not s:
+        return False
+    if not s.isascii():
+        return True
+    if s.upper() == "PULTE":
+        # "Pulte" alone in FHFA news refers to Director Bill Pulte; "PulteGroup" is the company name.
+        return False
+    if s.upper() in _COMPANY_ACRONYM_NAMES_FOR_BACKFILL:
+        return True
+    if re.match(r"^(?:\d{1,6}(?:\.[A-Z]{1,3})?|[A-Z]{1,5}(?:[.-][A-Z])?)$", s):
+        return False
+    return len(s) >= 4
+
+
+def backfill_tickers_from_quote(
+    kept_tickers: list[str],
+    quote: str,
+    *,
+    cited_sources: list[str] | None = None,
+    claim: str | None = None,
+    topic_label: str | None = None,
+) -> tuple[list[str], int]:
+    """Backfill ticker code(s) when a known company name (`coverage.yaml` + `SUPPLEMENTAL_TICKER_ALIASES`)
+    appears as the card subject in `claim` or `topic_label` (and in `quote`) and its ticker is missing from `kept_tickers`.
+    - Dual-listed A+H companies (`DUAL_LISTED_TICKER_GROUPS`) get both A and H tickers backfilled.
+    - Private companies (`PRIVATE_COMPANIES`) and trading channels (`TRADING_CHANNEL_TICKERS`, unless discussed as a subject in `claim`) are never backfilled.
+    - Source institutions (`SOURCE_INSTITUTION_TICKERS` / `cited_sources`) are skipped only when used as a source, and backfilled when they are the subject of the card.
+    - Companies appearing only in excluded spans (`剔除/不含/排除/除去/未采用/excluding/doesn't use/...`) are never backfilled.
+    """
+    q = str(quote or "")
+    if not q.strip():
+        return list(kept_tickers or []), 0
+
+    _excluded_spans, q_for_backfill = _extract_excluded_spans_and_clean_quote(q)
+    # Mask conditional brokerage-account clauses ("如果你在用 IBKR", "如果你在用富途/老虎等券商")
+    q_for_backfill = re.sub(r"如果你在用[^：:\n]{1,25}", " ", q_for_backfill)
+
+    has_subject_scope = claim is not None or topic_label is not None
+    raw_subject_text = f"{claim or ''}\n{topic_label or ''}" if has_subject_scope else q_for_backfill
+    _, subject_text = _extract_excluded_spans_and_clean_quote(raw_subject_text)
+
+    srcs = [str(s or "") for s in (cited_sources or [])]
+    alias_map = _load_ticker_company_aliases()
+
+    dual_pair_by_canon: dict[str, tuple[str, str]] = {}
+    for a_code, h_code in DUAL_LISTED_TICKER_GROUPS:
+        ca = canonicalize_ticker_key(a_code)
+        ch = canonicalize_ticker_key(h_code)
+        pair = (ca, ch)
+        dual_pair_by_canon[ca] = pair
+        dual_pair_by_canon[ch] = pair
+
+    out_tickers = list(kept_tickers or [])
+    existing_canon: set[str] = {canonicalize_ticker_key(t) for t in out_tickers if t}
+    # Expand `existing_canon` with any co-aliases sharing company names so we don't duplicate ADR/HK/A codes
+    # when the card already holds one ticker for that company.
+    for ct in list(existing_canon):
+        if ct in dual_pair_by_canon:
+            existing_canon.update(dual_pair_by_canon[ct])
+        ct_names = {a for a in alias_map.get(ct, ()) if _is_company_name_for_backfill(a)}
+        if ct_names:
+            for other_k, other_aliases in alias_map.items():
+                if ct_names & {a for a in other_aliases if _is_company_name_for_backfill(a)}:
+                    existing_canon.add(other_k)
+
+    backfilled = 0
+    visited_groups: set[tuple[str, ...]] = set()
+
+    for canon_t in alias_map:
+        if canon_t in SOURCE_INSTITUTION_TICKERS:
+            check_src_text = f"{claim or ''}\n{q_for_backfill}" if claim is not None else q_for_backfill
+            if _is_institution_used_as_source(canon_t, check_src_text, srcs):
+                continue
+        if _is_private_company_ticker(canon_t):
+            continue
+        if canon_t in TRADING_CHANNEL_TICKERS:
+            check_claim = claim if claim is not None else q_for_backfill
+            if not _is_trading_channel_discussed_in_claim(canon_t, check_claim):
+                continue
+        group_keys: tuple[str, ...] = dual_pair_by_canon.get(canon_t, (canon_t,))
+        if group_keys in visited_groups:
+            continue
+        visited_groups.add(group_keys)
+
+        if any(gk in existing_canon for gk in group_keys):
+            continue
+
+        group_aliases: list[str] = []
+        for gk in group_keys:
+            for a in alias_map.get(gk, ()):
+                if a not in group_aliases:
+                    group_aliases.append(a)
+
+        name_aliases = [a for a in group_aliases if _is_company_name_for_backfill(a)]
+        if not name_aliases:
+            continue
+
+        # Skip if any name alias is cited as a source institution in `cited_sources`
+        if any(any(na.lower() in s.lower() for na in name_aliases if len(na) >= 2) for s in srcs):
+            continue
+
+        # Item 1: Only backfill companies that appear in `claim` or `topic_label` AND in `q_for_backfill`
+        if has_subject_scope and not any(_alias_matches_in_text(na, subject_text) for na in name_aliases):
+            continue
+
+        matched_in_quote = any(_alias_matches_in_text(na, q_for_backfill) for na in name_aliases)
+        if not matched_in_quote:
+            continue
+
+        for gk in group_keys:
+            if gk not in out_tickers:
+                out_tickers.append(gk)
+                backfilled += 1
+            existing_canon.add(gk)
+        # Also mark any co-ticker sharing the same company name as covered
+        group_name_set = set(name_aliases)
+        for other_k, other_aliases in alias_map.items():
+            if group_name_set & {a for a in other_aliases if _is_company_name_for_backfill(a)}:
+                existing_canon.add(other_k)
+
+    return out_tickers, backfilled
+
+
+_STANDALONE_YEAR_RE = re.compile(
+    r"(?<![A-Za-z0-9.$¥￥€£])(?:"
+    r"(?:FY|CY)\s*(?:(?:19|20)?\d{2})(?:[EFef](?![A-Za-z0-9]))?"
+    r"|(?:19|20)\d{2}(?:\s*年|[EFef](?![A-Za-z0-9]))"
+    r")(?!\s*(?:\d|\.|%|亿|万|千|百|元|美元|港元|日元|欧元|英镑|倍|bn|mn|million|billion|trillion)\b)",
+    flags=re.IGNORECASE,
+)
+
+
+def _has_third_party_forecast_in_quote(q_text: str) -> bool:
+    has_candidate = any(
+        (bool(re.search(rf"\b{re.escape(kw)}\b", q_text, flags=re.IGNORECASE)) if kw.isascii() else (kw in q_text))
+        for kw in THIRD_PARTY_FORECAST_PHRASES_TABLE
+    ) or bool(
+        re.search(
+            r"(?:卖方|机构|券商|投行|报告|分析师|一致预期|它|consensus|sell[-\s]?side|street)",
+            q_text,
+            flags=re.IGNORECASE,
+        )
+    )
+    if not has_candidate:
+        return False
+    for s in _split_sentences(q_text, split_cn_comma=True):
+        if "已是" in s or re.search(r"\balready\b", s, flags=re.IGNORECASE):
+            continue
+        s_no_year = _STANDALONE_YEAR_RE.sub(" ", s)
+        has_num = bool(re.search(r"\d", s_no_year)) or bool(_CN_NUM_MENTION_RE.search(s_no_year))
+        if not has_num:
+            continue
+        if _THIRD_PARTY_FORECAST_RE.search(s_no_year) or _THIRD_PARTY_FORECAST_EN_RE.search(s_no_year):
+            return True
+    return False
+
+
+def _has_self_calculation_in_quote(q_text: str) -> bool:
+    if any(kw in q_text for kw in SELF_CALCULATION_KEYWORDS_TABLE):
+        return True
+    q_masked = _THIRD_PARTY_AN_SUAN_RE.sub(" ", q_text)
+    if "它估计" in q_text or "卖方" in q_text:
+        return False
+    return bool(_AN_SUAN_RE.search(q_masked))
+
+
+def has_unverified_source_in_quote(quote: str) -> bool:
+    """Return True if `quote` contains a disclaimer that the primary text/source was not opened or verified."""
+    return bool(_UNVERIFIED_SOURCE_RE.search(str(quote or "")))
+
+
+def _has_forward_estimate_keyword(text: str) -> bool:
+    masked = _REALIZED_EXPECTATION_MASK_RE.sub(" ", str(text or ""))
+    if _FORWARD_JIANG_RE.search(masked):
+        return True
+    for kw in FACT_TO_ESTIMATE_KEYWORDS_TABLE:
+        if kw == "将":
+            continue
+        if kw.isascii():
+            if re.search(rf"(?<![A-Za-z0-9]){re.escape(kw)}(?![A-Za-z0-9])", masked, flags=re.IGNORECASE):
+                return True
+        elif kw in masked:
+            return True
+    return False
+
+
+def correct_card_type_by_keywords(
+    card_type: str,
+    claim: str,
+    quote: str,
+) -> tuple[str, int]:
+    """Bidirectionally correct `card_type` by keywords:
+    - `fact` with `has_unverified_source_in_quote(quote)` stays `fact` (flagged via `unverified_source`).
+    - `fact` with `FACT_TO_ESTIMATE_KEYWORDS_TABLE` in `claim` or `quote` (after masking realized expectation
+      comparison phrases like `超预期`/`beat expectations`) and no `REALIZED_FACT_PHRASES_TABLE` in `quote` -> `estimate`.
+    - `opinion` or `model_assumption` with explicit third-party forecast phrasing + number in `quote` and no
+      self-calculation phrasing -> `estimate`.
+    - `opinion` with `OPINION_TO_MODEL_ASSUMPTION_KEYWORDS_TABLE` or self `按…算` in `quote` -> `model_assumption`.
+    - `estimate` with `ESTIMATE_TO_FACT_PHRASES_TABLE` in `quote` and no `FACT_TO_ESTIMATE_KEYWORDS_TABLE` -> `fact`.
+    Returns `(corrected_type, types_corrected_count)`.
+    """
+    eff_t = str(card_type or "").strip().lower()
+    c_text = str(claim or "")
+    q_text = str(quote or "")
+    combined = f"{c_text}\n{q_text}"
+
+    if eff_t == "fact":
+        if has_unverified_source_in_quote(q_text):
+            return "fact", 0
+        has_realized = any(p in q_text for p in REALIZED_FACT_PHRASES_TABLE)
+        if not has_realized and _has_forward_estimate_keyword(combined):
+            return "estimate", 1
+
+    elif eff_t in ("opinion", "model_assumption"):
+        if _has_third_party_forecast_in_quote(q_text) and not _has_self_calculation_in_quote(q_text):
+            return "estimate", 1
+        if eff_t == "opinion":
+            q_masked = _THIRD_PARTY_AN_SUAN_RE.sub(" ", q_text)
+            has_calc = any(kw in q_text for kw in OPINION_TO_MODEL_ASSUMPTION_KEYWORDS_TABLE) or bool(
+                _AN_SUAN_RE.search(q_masked)
+            )
+            if has_calc:
+                return "model_assumption", 1
+
+    elif eff_t == "estimate":
+        has_fact_marker = False
+        for p in ESTIMATE_TO_FACT_PHRASES_TABLE:
+            if p.isascii():
+                if re.search(rf"\b{re.escape(p)}\b", q_text, flags=re.IGNORECASE):
+                    has_fact_marker = True
+                    break
+            elif p in q_text:
+                has_fact_marker = True
+                break
+        if has_fact_marker:
+            check_scope = c_text if ("事实：" in q_text and c_text.strip()) else f"{c_text}\n{q_text}"
+            if not _has_forward_estimate_keyword(check_scope):
+                return "fact", 1
+
+    return eff_t, 0
+
+
+_ENGLISH_NON_PROPER_ALLOWLIST: frozenset[str] = frozenset(
+    {
+        "AI",
+        "AI4S",
+        "API",
+        "ARR",
+        "ASP",
+        "AWS",
+        "B2B",
+        "B2C",
+        "BM25",
+        "BOJ",
+        "BP",
+        "BPS",
+        "CAGR",
+        "CAPEX",
+        "CEO",
+        "CFO",
+        "CNY",
+        "COO",
+        "CPA",
+        "CPC",
+        "CPI",
+        "CPM",
+        "CPU",
+        "CRM",
+        "CTO",
+        "CY",
+        "DAU",
+        "DC",
+        "DCF",
+        "DRAM",
+        "EBIT",
+        "EBITDA",
+        "EPS",
+        "ERP",
+        "ESG",
+        "ETF",
+        "EUR",
+        "EUV",
+        "EV",
+        "EXW",
+        "FCF",
+        "FDE",
+        "FOB",
+        "FX",
+        "FY",
+        "GAAP",
+        "GBP",
+        "GDP",
+        "GMV",
+        "GPU",
+        "GW",
+        "GWH",
+        "HBM",
+        "HG",
+        "HK",
+        "HKD",
+        "HKT",
+        "HY",
+        "IAA",
+        "IAP",
+        "IDC",
+        "IG",
+        "II",
+        "III",
+        "IP",
+        "IPO",
+        "IR",
+        "IT",
+        "IV",
+        "JPY",
+        "KRW",
+        "KWH",
+        "LLM",
+        "LP",
+        "LTM",
+        "MA",
+        "MACD",
+        "MAU",
+        "MI",
+        "MOM",
+        "MRR",
+        "MWH",
+        "NAND",
+        "NDR",
+        "NGS",
+        "NIM",
+        "NON",
+        "NRR",
+        "NTM",
+        "OP",
+        "OPEX",
+        "OS",
+        "OTC",
+        "PB",
+        "PC",
+        "PCE",
+        "PE",
+        "PEG",
+        "PMI",
+        "PP",
+        "PPI",
+        "PR",
+        "PS",
+        "PT",
+        "PV",
+        "QOQ",
+        "RAM",
+        "RMB",
+        "ROE",
+        "ROI",
+        "ROIC",
+        "RPO",
+        "RSI",
+        "SAAS",
+        "SBC",
+        "SEC",
+        "SKU",
+        "SMB",
+        "SOHO",
+        "SQL",
+        "SS",
+        "SH",
+        "SSD",
+        "SZ",
+        "TAM",
+        "TCO",
+        "TMT",
+        "TPU",
+        "TTM",
+        "TV",
+        "TWD",
+        "UAE",
+        "UK",
+        "URL",
+        "US",
+        "USA",
+        "USD",
+        "UTC",
+        "VAT",
+        "VC",
+        "VIP",
+        "VLA",
+        "VR",
+        "AR",
+        "WACC",
+        "WFE",
+        "WH",
+        "WHT",
+        "WIFI",
+        "YOY",
+        "YTD",
+        "EVE",
+        "OWNER",
+        "PARTICIPANT",
+        "BEAR",
+        "BULL",
+        "BASE",
+        "DEBATE",
+        "STREET",
+        "APP",
+        "STORE",
+        "WEB",
+        "CLOUD",
+        "IOS",
+        "PRO",
+        "MAX",
+        "MINI",
+        "PLUS",
+        "ULTRA",
+        "LITE",
+        "PRIME",
+        "DAY",
+        "VS",
+        # Common financial & sentence-initial English terms
+        "REVENUE",
+        "REVENUES",
+        "SALES",
+        "PROFIT",
+        "PROFITS",
+        "MARGIN",
+        "MARGINS",
+        "INCOME",
+        "EARNINGS",
+        "GROWTH",
+        "COST",
+        "COSTS",
+        "CASH",
+        "FLOW",
+        "DEBT",
+        "EQUITY",
+        "ASSET",
+        "ASSETS",
+        "VALUATION",
+        "TARGET",
+        "PRICE",
+        "SHARE",
+        "SHARES",
+        "STOCK",
+        "MARKET",
+        "TOTAL",
+        "NET",
+        "GROSS",
+        "OPERATING",
+        "FREE",
+        "ANNUAL",
+        "QUARTER",
+        "QUARTERLY",
+        "YEAR",
+        "HALF",
+        "MONTH",
+        "WEEK",
+        "GUIDANCE",
+        "ESTIMATE",
+        "ESTIMATES",
+        "CONSENSUS",
+        "RESULT",
+        "RESULTS",
+        "REPORT",
+        "DATA",
+        "MODEL",
+        "VOLUME",
+        "ORDER",
+        "ORDERS",
+        "DEMAND",
+        "SUPPLY",
+        "CAPACITY",
+        "RATIO",
+        "RATE",
+        "RATES",
+        "YIELD",
+        "RETURN",
+        "LOSS",
+        "TAX",
+        "FEE",
+        "FEES",
+        "USER",
+        "USERS",
+        "CUSTOMER",
+        "CUSTOMERS",
+        "PRODUCT",
+        "PRODUCTS",
+        "SERVICE",
+        "SERVICES",
+        "BUSINESS",
+        "SEGMENT",
+        "COMPANY",
+        "GROUP",
+        "SECTOR",
+        "INDUSTRY",
+        "GLOBAL",
+        "CHINA",
+        "DOMESTIC",
+        "OVERSEAS",
+        "HIGH",
+        "LOW",
+        "AVERAGE",
+        "KEY",
+        "CORE",
+        "MAIN",
+        "NEW",
+        "OLD",
+        "FIRST",
+        "SECOND",
+        "THIRD",
+        "FOURTH",
+        "ONE",
+        "TWO",
+        "THREE",
+        "FOUR",
+        "FIVE",
+        "SIX",
+        "SEVEN",
+        "EIGHT",
+        "NINE",
+        "TEN",
+        "THE",
+        "AND",
+        "FOR",
+        "WITH",
+        "FROM",
+        "INTO",
+        "OVER",
+        "UNDER",
+        "AFTER",
+        "BEFORE",
+        "DURING",
+        "WHILE",
+        "SINCE",
+        "UNTIL",
+        "ABOVE",
+        "BELOW",
+        "BETWEEN",
+        "AMONG",
+        "THROUGH",
+        "AGAINST",
+        "DESPITE",
+        "WITHOUT",
+        "WITHIN",
+    }
+)
+
+
+def _is_non_proper_english_token(tok: str) -> bool:
+    u = tok.strip().upper()
+    if not u or len(u) < 2:
+        return True
+    if u in _ENGLISH_NON_PROPER_ALLOWLIST:
+        return True
+    if re.match(
+        r"^(?:[1-4]Q|Q[1-4]|[12]H|H[12]|FY\d{2,4}E?|\d{2,4}(?:Q[1-4]|H[12]|FY|E|A)|\d+D|\d+MA|MA\d+|\d+X|\d+BP|M\d{1,2}|W\d{1,2}|V\d+|P\d+|B\d{2,3}|H\d{2,3}|A\d{2,3})$",
+        u,
+    ):
+        return True
+    return bool(
+        re.match(
+            r"^(?:JAN|JANUARY|FEB|FEBRUARY|MAR|MARCH|APR|APRIL|MAY|JUN|JUNE|JUL|JULY|AUG|AUGUST|SEP|SEPT|SEPTEMBER|OCT|OCTOBER|NOV|NOVEMBER|DEC|DECEMBER)$",
+            u,
+        )
+    )
+
+
+@lru_cache(maxsize=1)
+def _build_entity_alias_groups() -> tuple[tuple[str, ...], ...]:
+    """Group all aliases and ticker codes belonging to the same company/institution so that if any alias
+    of the entity appears in `quote` (e.g. `SMIC`, `Sieyuan`, `Hynix`, `Tencent`, `澜起`), another alias
+    of the same entity in `claim`/`topic_label` (e.g. `中芯国际`, `思源电气`, `SK海力士`, `腾讯`, `澜起科技`) is supported.
+    """
+    alias_map = _load_ticker_company_aliases()
+    raw_groups: list[set[str]] = []
+
+    for aliases in alias_map.values():
+        g = {str(a).strip() for a in aliases if str(a).strip()}
+        if g:
+            raw_groups.append(g)
+    for canon_inst, inst_aliases in SOURCE_INSTITUTION_TICKERS.items():
+        g = {canon_inst} | {str(a).strip() for a in inst_aliases if str(a).strip()}
+        raw_groups.append(g)
+    for inst_group in KNOWN_INSTITUTION_PROPER_NAMES_TABLE:
+        g = {str(a).strip() for a in inst_group if str(a).strip()}
+        if g:
+            raw_groups.append(g)
+
+    # Merge overlapping groups that share any non-trivial company/institution name
+    merged: list[set[str]] = []
+    for g in raw_groups:
+        g_names = {a for a in g if (not a.isascii()) or len(a) >= 4}
+        placed = False
+        for mg in merged:
+            mg_names = {a for a in mg if (not a.isascii()) or len(a) >= 4}
+            if (g_names and (g_names & mg_names)) or (g & mg):
+                mg.update(g)
+                placed = True
+                break
+        if not placed:
+            merged.append(set(g))
+
+    return tuple(tuple(sorted(mg, key=lambda x: (-len(x), x))) for mg in merged)
+
+
+def _is_acronym_supported_by_quote_phrase(acronym: str, quote: str) -> bool:
+    """Return True if `acronym` is an all-uppercase 3-6 letter token and `quote` contains a contiguous
+    word window of exact length `len(acronym)` whose initial letters equal `acronym` (2-letter acronyms
+    are never supported by generic phrases regardless of capitalization, e.g. `Market Share` does not support `MS`).
+    """
+    tok = str(acronym or "").strip()
+    if not re.match(r"^[A-Z]{3,6}$", tok):
+        return False
+    q = str(quote or "")
+    if not q:
+        return False
+    k = len(tok)
+    for m in re.finditer(r"[A-Za-z]+(?:[\s\-]+[A-Za-z]+)+", q):
+        words = [w for w in re.split(r"[\s\-]+", m.group(0)) if w]
+        if len(words) < k:
+            continue
+        for i in range(len(words) - k + 1):
+            window = words[i : i + k]
+            if "".join(w[0].upper() for w in window) == tok:
+                return True
+    return False
+
+
+def _validate_proper_nouns_and_clean_topic(
+    claim_text: str,
+    topic_label: str,
+    quote: str,
+) -> tuple[list[str], str]:
+    """Check company/institution names (from known alias tables) and uppercase/capitalized English proper nouns/codes
+    in `claim_text` and `topic_label` against `quote`.
+    - Unsupported names in `topic_label` (plus `A股` and `FORBIDDEN_CONCLUSION_WORDS_TABLE` when absent from `quote`)
+      are stripped from `topic_label`.
+    - Unsupported names in `claim_text` are returned in `unsupported_names`.
+    """
+    q = _normalize_trad_to_simp(str(quote or ""))
+    c_text = _normalize_trad_to_simp(str(claim_text or ""))
+    t_text = _normalize_trad_to_simp(str(topic_label or ""))
+    raw_t_text = str(topic_label or "")
+
+    groups = _build_entity_alias_groups()
+    unsupported_in_claim: list[str] = []
+    unsupported_in_topic: list[str] = []
+
+    def _group_supported_in_quote(group: tuple[str, ...]) -> bool:
+        return any(_alias_matches_in_text(a, q) for a in group)
+
+    # 1. Check known company/institution names from alias groups
+    for group in groups:
+        # Only match proper company/institution names (non-ASCII names or unambiguous English names, not bare ticker codes)
+        check_names = [a for a in group if (not a.isascii()) or _is_company_name_for_backfill(a)]
+        if not check_names:
+            continue
+        claim_hit = next((a for a in check_names if _alias_matches_in_text(a, c_text)), None)
+        topic_hits = [a for a in check_names if _alias_matches_in_text(a, t_text)]
+        if not claim_hit and not topic_hits:
+            continue
+        if _group_supported_in_quote(group):
+            continue
+        if claim_hit and claim_hit not in unsupported_in_claim:
+            unsupported_in_claim.append(claim_hit)
+        for th in topic_hits:
+            if th not in unsupported_in_topic:
+                unsupported_in_topic.append(th)
+
+    # 2. Check uppercase/capitalized English proper nouns and exchange-suffixed ticker codes
+    def _find_unsupported_english_tokens(text: str, *, skip_sentence_initial: bool = True) -> list[str]:
+        if not text:
+            return []
+        found: list[str] = []
+        # First check exchange-suffixed codes like `9638.HK`, `YACHT.MI`, `300750.SZ`
+        for cm in re.finditer(
+            r"(?<![A-Za-z0-9])(?:\d{4,6}\.(?:SZ|SS|SH|HK|T|TW|KS)|[A-Z]{1,6}\.(?:MI|L|PA|DE|AS|SW|TO|AX))(?![A-Za-z0-9])",
+            text,
+        ):
+            code_tok = cm.group(0)
+            matching_groups = [g for g in groups if any(code_tok.upper() == a.upper() for a in g)]
+            is_sup = _alias_matches_in_text(code_tok, q) or any(
+                _group_supported_in_quote(g) for g in matching_groups
+            )
+            if not is_sup and code_tok not in found:
+                found.append(code_tok)
+
+        text_no_codes = re.sub(
+            r"(?<![A-Za-z0-9])(?:\d{4,6}\.(?:SZ|SS|SH|HK|T|TW|KS)|[A-Z]{1,6}\.(?:MI|L|PA|DE|AS|SW|TO|AX))(?![A-Za-z0-9])",
+            " ",
+            text,
+        )
+        # Mask model/product version tokens like `Qwen3-8B`, `GPT-6`, `Fable 5.1`, `H100`, `B200`, `WiFi7`
+        text_no_codes = re.sub(
+            r"\b(?:Qwen\d*(?:-\d+[A-Za-z]*)?|GPT-\d+[A-Za-z]*|WiFi\d+)\b",
+            " ",
+            text_no_codes,
+            flags=re.IGNORECASE,
+        )
+        sents_to_scan = _split_sentences(text_no_codes, split_cn_comma=False) if skip_sentence_initial else [text_no_codes]
+        for sent in sents_to_scan:
+            for wm in re.finditer(r"(?<![A-Za-z0-9_])[A-Z][A-Za-z0-9]{1,}(?![A-Za-z0-9_])", sent):
+                word = wm.group(0)
+                if _is_non_proper_english_token(word):
+                    continue
+                if skip_sentence_initial and not word.isupper():
+                    prefix = sent[: wm.start()]
+                    after = sent[wm.end() :]
+                    if not prefix.strip() and not re.match(r"^\s*[\u4e00-\u9fff]", after):
+                        continue
+                matching_groups = [g for g in groups if any(word.lower() == a.lower() for a in g)]
+                is_sup = (
+                    _alias_matches_in_text(word, q)
+                    or any(_group_supported_in_quote(g) for g in matching_groups)
+                    or _is_acronym_supported_by_quote_phrase(word, q)
+                )
+                if not is_sup and word not in found:
+                    found.append(word)
+        return found
+
+    for en_tok in _find_unsupported_english_tokens(c_text, skip_sentence_initial=True):
+        if not any(en_tok.lower() in existing.lower() or existing.lower() in en_tok.lower() for existing in unsupported_in_claim):
+            unsupported_in_claim.append(en_tok)
+
+    for en_tok in _find_unsupported_english_tokens(t_text, skip_sentence_initial=False):
+        if en_tok not in unsupported_in_topic:
+            unsupported_in_topic.append(en_tok)
+
+    # Also strip "A股" / "A 股" and forbidden conclusion words from `topic_label` when absent from `quote`
+    cleaned_topic = raw_t_text
+    if cleaned_topic:
+        for bad_t in sorted(unsupported_in_topic, key=len, reverse=True):
+            if bad_t.isascii():
+                cleaned_topic = re.sub(
+                    rf"(?<![A-Za-z0-9]){re.escape(bad_t)}(?![A-Za-z0-9])",
+                    "",
+                    cleaned_topic,
+                )
+            else:
+                cleaned_topic = cleaned_topic.replace(bad_t, "")
+                # Also strip Traditional variants if `raw_t_text` had Traditional characters
+                if _normalize_trad_to_simp(cleaned_topic) != cleaned_topic:
+                    norm_topic = _normalize_trad_to_simp(cleaned_topic)
+                    while bad_t in norm_topic:
+                        idx = norm_topic.index(bad_t)
+                        cleaned_topic = cleaned_topic[:idx] + cleaned_topic[idx + len(bad_t) :]
+                        norm_topic = _normalize_trad_to_simp(cleaned_topic)
+        for concl_word in FORBIDDEN_CONCLUSION_WORDS_TABLE:
+            if concl_word in _normalize_trad_to_simp(cleaned_topic) and concl_word not in q:
+                cleaned_topic = cleaned_topic.replace(concl_word, "")
+        if ("A股" in cleaned_topic or "A 股" in cleaned_topic) and ("A股" not in q and "A 股" not in q):
+            cleaned_topic = re.sub(r"A\s*股", "", cleaned_topic)
+        # Clean up empty parentheses, leftover slashes, and leading/trailing punctuation
+        cleaned_topic = re.sub(r"[（(]\s*[/|、，,\-–—\s]*\s*[）)]", "", cleaned_topic)
+        cleaned_topic = re.sub(r"\s+", " ", cleaned_topic).strip(" ·|/-–—、，,：:")
+
+    return unsupported_in_claim, cleaned_topic
 
 
 @dataclass
@@ -1505,26 +3100,27 @@ class CardValidationResult:
     tickers: list[str] = field(default_factory=list)
     unsupported_claim_numbers: list[str] = field(default_factory=list)
     soft_unsupported_claim_numbers: list[str] = field(default_factory=list)
+    unsupported_names: list[str] = field(default_factory=list)
+    unsupported_conclusions: list[str] = field(default_factory=list)
+    unverified_source: bool = False
     soft_unsupported_numbers: int = 0
     figures_dropped: int = 0
     periods_cleared: int = 0
+    currencies_stripped: int = 0
     tickers_dropped: int = 0
+    tickers_dropped_private: int = 0
+    tickers_dropped_channel: int = 0
+    tickers_backfilled: int = 0
+    types_corrected: int = 0
 
 
 def validate_candidate_card(
     card: dict[str, Any],
     quote: str | None = None,
 ) -> CardValidationResult:
-    """Validate candidate card's numbers (`claim` & `figures.value`), `figures.period`, and `tickers` against `quote`.
-
-    - Figures whose `value` contains numbers absent from `quote` are deleted (`figures_dropped`).
-    - Remaining figures whose non-empty `period` lacks year/quarter/month support in `quote` have `period` cleared (`periods_cleared`).
-    - Tickers whose symbol and mapped company names (`coverage.yaml` + `SUPPLEMENTAL_TICKER_ALIASES`) are absent from `quote`
-      (or appear only as excluded items / source institutions) are removed (`tickers_dropped`).
-    - When `claim` contains metric numbers with units unsupported by `quote` (`unsupported_claim_numbers`), the card is
-      NOT rejected (`ok=True`, `status='active'`); instead its `confidence` is capped at `min(confidence, 0.4)` and a
-      `{"metric": "_verification", "value": "unsupported:<nums>", "unit": "", "period": ""}` marker is appended to `figures`.
-      Unmatched bare numbers, years, dates, identifiers, and indicator windows are recorded in `soft_unsupported_numbers`.
+    """Validate candidate card's numbers (`claim` & `figures.value`), `figures.period`, `figures.unit` currency,
+    `tickers` (validation + alias backfill), proper nouns (`claim` & `topic_label`), forbidden conclusions,
+    and keyword-based `type` corrections against `quote`.
     """
     eff_quote = str(quote if quote is not None else (card.get("quote") or ""))
     q_numbers = extract_quote_supported_numbers(eff_quote)
@@ -1533,6 +3129,7 @@ def validate_candidate_card(
     kept_figures: list[dict[str, Any]] = []
     figures_dropped = 0
     periods_cleared = 0
+    currencies_stripped = 0
 
     for fig in raw_figures:
         if not isinstance(fig, dict) or fig.get("metric") is None or fig.get("value") is None:
@@ -1545,29 +3142,69 @@ def validate_candidate_card(
             figures_dropped += 1
             continue
         raw_period = str(fig.get("period") or "").strip()
-        if raw_period and not is_period_supported_by_quote(raw_period, eff_quote):
+        if raw_period and not is_period_supported_by_quote(
+            raw_period, eff_quote, value=fig.get("value"), unit=fig_unit
+        ):
             eff_period = ""
             periods_cleared += 1
         else:
             eff_period = raw_period
+        eff_unit, was_cur_stripped = strip_unsupported_currency_from_unit(
+            fig_unit, fig.get("value"), eff_quote, period=eff_period
+        )
+        if was_cur_stripped:
+            currencies_stripped += 1
         kept_figures.append(
             {
                 "metric": str(fig.get("metric") or "").strip(),
                 "value": fig.get("value"),
-                "unit": fig_unit,
+                "unit": eff_unit,
                 "period": eff_period,
             }
         )
 
+    claim_text = str(card.get("claim") or "")
+    raw_topic_label = str(card.get("topic_label") or "")
+    unsupported_names, cleaned_topic_label = _validate_proper_nouns_and_clean_topic(
+        claim_text, raw_topic_label, eff_quote
+    )
+    if "topic_label" in card:
+        card["topic_label"] = cleaned_topic_label
+
     raw_tickers = card.get("tickers") if isinstance(card.get("tickers"), list) else []
     raw_sources = card.get("cited_sources") if isinstance(card.get("cited_sources"), list) else []
-    kept_tickers, tickers_dropped = validate_tickers_against_quote(
+    clean_sources = [str(s) for s in raw_sources if s is not None]
+    (
+        kept_tickers,
+        tickers_dropped,
+        tickers_dropped_private,
+        tickers_dropped_channel,
+    ) = _validate_tickers_against_quote_detailed(
         [str(t) for t in raw_tickers if t is not None],
         eff_quote,
-        cited_sources=[str(s) for s in raw_sources if s is not None],
+        cited_sources=clean_sources,
+        claim=claim_text,
+    )
+    kept_tickers, tickers_backfilled = backfill_tickers_from_quote(
+        kept_tickers,
+        eff_quote,
+        cited_sources=clean_sources,
+        claim=claim_text,
+        topic_label=cleaned_topic_label,
     )
 
-    claim_text = str(card.get("claim") or "")
+    unsupported_conclusions: list[str] = []
+    for word in FORBIDDEN_CONCLUSION_WORDS_TABLE:
+        if word in claim_text and word not in eff_quote and word not in unsupported_conclusions:
+            unsupported_conclusions.append(word)
+
+    types_corrected = 0
+    if "type" in card and card.get("type") is not None:
+        corrected_type, types_corrected = correct_card_type_by_keywords(
+            str(card.get("type") or ""), claim_text, eff_quote
+        )
+        card["type"] = corrected_type
+
     claim_mentions = _parse_number_mentions_detailed(claim_text, strip_non_metrics=True)
     unsupported_claim_nums: list[str] = []
     soft_unsupported_claim_nums: list[str] = []
@@ -1611,8 +3248,41 @@ def validate_candidate_card(
         orig_conf = 0.8
     orig_conf = max(0.0, min(1.0, orig_conf))
 
+    eff_conf = orig_conf
+    unverified_source = False
+    if str(card.get("type") or "").strip().lower() == "fact" and has_unverified_source_in_quote(eff_quote):
+        unverified_source = True
+        eff_conf = min(eff_conf, 0.5)
+        kept_figures.append(
+            {
+                "metric": "_verification",
+                "value": "unverified_source",
+                "unit": "",
+                "period": "",
+            }
+        )
+    if unsupported_names:
+        eff_conf = min(eff_conf, 0.4)
+        kept_figures.append(
+            {
+                "metric": "_verification",
+                "value": f"unsupported_names:{','.join(unsupported_names)}",
+                "unit": "",
+                "period": "",
+            }
+        )
+    if unsupported_conclusions:
+        eff_conf = min(eff_conf, 0.4)
+        kept_figures.append(
+            {
+                "metric": "_verification",
+                "value": f"unsupported_conclusion:{','.join(unsupported_conclusions)}",
+                "unit": "",
+                "period": "",
+            }
+        )
     if unsupported_claim_nums:
-        eff_conf = min(orig_conf, 0.4)
+        eff_conf = min(eff_conf, 0.4)
         kept_figures.append(
             {
                 "metric": "_verification",
@@ -1621,8 +3291,6 @@ def validate_candidate_card(
                 "period": "",
             }
         )
-    else:
-        eff_conf = orig_conf
 
     ok = True
     status = "active"
@@ -1640,10 +3308,18 @@ def validate_candidate_card(
         tickers=kept_tickers,
         unsupported_claim_numbers=unsupported_claim_nums,
         soft_unsupported_claim_numbers=soft_unsupported_claim_nums,
+        unsupported_names=unsupported_names,
+        unsupported_conclusions=unsupported_conclusions,
+        unverified_source=unverified_source,
         soft_unsupported_numbers=soft_unsupported_numbers,
         figures_dropped=figures_dropped,
         periods_cleared=periods_cleared,
+        currencies_stripped=currencies_stripped,
         tickers_dropped=tickers_dropped,
+        tickers_dropped_private=tickers_dropped_private,
+        tickers_dropped_channel=tickers_dropped_channel,
+        tickers_backfilled=tickers_backfilled,
+        types_corrected=types_corrected,
     )
 
 
@@ -2247,7 +3923,7 @@ async def extract_segment_cards(
     """Extract and validate knowledge cards from one conversation segment via `assist_json`."""
     cfg = get_dalton_settings().conversations
     eff_model = (extractor_model or cfg.extractor_model).strip()
-    eff_prompt_ver = (prompt_version or cfg.prompt_version).strip()
+    eff_prompt_ver = (prompt_version or cfg.prompt_version or DEFAULT_PROMPT_VERSION).strip()
 
     if not segment:
         return SegmentExtractionOutcome(ok=True, model_used=eff_model)
@@ -2349,7 +4025,6 @@ async def extract_segment_cards(
         )
 
     category = str(res.data.get("category") or "research").strip().lower()
-    seg_topic_label = str(res.data.get("topic_label") or "").strip()
     raw_cards = res.data.get("cards") if isinstance(res.data.get("cards"), list) else []
 
     if category in ("ops", "private"):
@@ -2370,10 +4045,17 @@ async def extract_segment_cards(
     valid_cards: list[dict[str, Any]] = []
     quotes_rejected = 0
     cards_flagged_unsupported_number = 0
+    cards_flagged_unsupported_names = 0
+    cards_flagged_unsupported_conclusion = 0
     soft_unsupported_numbers = 0
     figures_dropped = 0
     periods_cleared = 0
+    currencies_stripped = 0
     tickers_dropped = 0
+    tickers_dropped_private = 0
+    tickers_dropped_channel = 0
+    tickers_backfilled = 0
+    types_corrected = 0
 
     for raw_c in raw_cards:
         if not isinstance(raw_c, dict):
@@ -2397,8 +4079,19 @@ async def extract_segment_cards(
             quote=raw_quote,
             segment_events=segment,
         )
+        raw_tickers_list = raw_c.get("tickers") if isinstance(raw_c.get("tickers"), list) else []
+        private_dropped_in_norm = 0
+        seen_priv_norm: set[str] = set()
+        for rt in raw_tickers_list:
+            rt_str = str(rt or "").strip()
+            if not rt_str:
+                continue
+            rt_canon = canonicalize_ticker_key(rt_str.upper())
+            if rt_canon not in seen_priv_norm and _is_private_company_ticker(rt_str):
+                seen_priv_norm.add(rt_canon)
+                private_dropped_in_norm += 1
         tickers, entities = normalize_tickers_and_entities(
-            raw_c.get("tickers") if isinstance(raw_c.get("tickers"), list) else [],
+            raw_tickers_list,
             raw_c.get("entities") if isinstance(raw_c.get("entities"), list) else [],
         )
         sectors = [
@@ -2418,18 +4111,22 @@ async def extract_segment_cards(
                     }
                 )
 
-        conf = float(raw_c.get("confidence", 0.8))
+        raw_conf = raw_c.get("confidence", 0.8)
+        conf = float(0.8 if raw_conf is None else raw_conf)
         conf = max(0.0, min(1.0, conf))
 
         ev_ts = str(matched_ev.get("ts") or first_ev.get("ts") or datetime.now(timezone.utc).isoformat())
         ev_date_et = str(matched_ev.get("date_et") or first_ev.get("date_et") or ev_ts[:10])
-        topic_label = str(raw_c.get("topic_label") or seg_topic_label or "").strip()
+        topic_label = str(raw_c.get("topic_label") or "").strip()
         claim = str(raw_c.get("claim") or "").strip()
         if not claim:
             continue
 
+        pre_corr_type = eff_type
         candidate_for_validation: dict[str, Any] = {
             "claim": claim,
+            "topic_label": topic_label,
+            "type": eff_type,
             "figures": figures,
             "tickers": tickers,
             "quote": raw_quote,
@@ -2439,14 +4136,34 @@ async def extract_segment_cards(
         val_res = validate_candidate_card(candidate_for_validation, quote=raw_quote)
         figures_dropped += val_res.figures_dropped
         periods_cleared += val_res.periods_cleared
-        tickers_dropped += val_res.tickers_dropped
+        currencies_stripped += val_res.currencies_stripped
+        tickers_dropped += private_dropped_in_norm + val_res.tickers_dropped
+        tickers_dropped_private += private_dropped_in_norm + val_res.tickers_dropped_private
+        tickers_dropped_channel += val_res.tickers_dropped_channel
+        tickers_backfilled += val_res.tickers_backfilled
         soft_unsupported_numbers += val_res.soft_unsupported_numbers
         if val_res.unsupported_claim_numbers:
             cards_flagged_unsupported_number += 1
+        if val_res.unsupported_names:
+            cards_flagged_unsupported_names += 1
+        if val_res.unsupported_conclusions:
+            cards_flagged_unsupported_conclusion += 1
 
         tickers = val_res.tickers
         figures = val_res.figures
         conf = val_res.confidence
+        topic_label = str(candidate_for_validation.get("topic_label") or "").strip()
+        eff_type = str(candidate_for_validation.get("type") or eff_type)
+        # Re-enforce source citation constraints once on the final post-correction card type (no loop).
+        speaker, eff_type, cited_sources = enforce_speaker_and_agent_citation(
+            eff_type,
+            cited_sources,
+            matched_ev,
+            quote=raw_quote,
+            segment_events=segment,
+        )
+        if eff_type != pre_corr_type:
+            types_corrected += val_res.types_corrected
 
         card_dict: dict[str, Any] = {
             "card_id": card_id,
@@ -2492,10 +4209,17 @@ async def extract_segment_cards(
         cards_raw_count=len(raw_cards),
         quotes_rejected=quotes_rejected,
         cards_flagged_unsupported_number=cards_flagged_unsupported_number,
+        cards_flagged_unsupported_names=cards_flagged_unsupported_names,
+        cards_flagged_unsupported_conclusion=cards_flagged_unsupported_conclusion,
         soft_unsupported_numbers=soft_unsupported_numbers,
         figures_dropped=figures_dropped,
         periods_cleared=periods_cleared,
+        currencies_stripped=currencies_stripped,
         tickers_dropped=tickers_dropped,
+        tickers_dropped_private=tickers_dropped_private,
+        tickers_dropped_channel=tickers_dropped_channel,
+        tickers_backfilled=tickers_backfilled,
+        types_corrected=types_corrected,
         discarded_segment=False,
         model_used=used_model,
         input_tokens=in_tok,

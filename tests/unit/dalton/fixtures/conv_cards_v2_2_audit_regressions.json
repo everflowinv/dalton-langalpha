@@ -1,0 +1,258 @@
+[
+  {
+    "card_id": "v22_0b0936821124",
+    "type": "estimate",
+    "claim": "据 TMTB 转述（没看原始记录），黄仁勋 9 月在高盛会上说每吉瓦约 600 亿的成本每年能收约 500 亿租金，SpaceX CFO 在同一个会上说他们的托管价在每瓦 30 到 50 美元。",
+    "figures": [
+      {"metric": "每吉瓦成本", "value": "约600", "unit": "亿", "period": ""},
+      {"metric": "每吉瓦每年租金", "value": "约500", "unit": "亿", "period": ""},
+      {"metric": "SpaceX托管价", "value": "30-50", "unit": "美元/瓦", "period": ""}
+    ],
+    "quote": "- **和市场租价比：**\n  - 黄仁勋 9 月在高盛会上说，每吉瓦约 600 亿的成本，每年能收约 500 亿租金。\n  - SpaceX CFO 在同一个会上说，他们的托管价在每瓦 30 到 50 美元。\n  - 谷歌付的是这个区间的上沿，相当于临时要最新的卡、还要几个月内交付的价格。这两条都是 TMTB 转述的。",
+    "tickers": ["SPCX"],
+    "confidence": 0.8,
+    "topic_label": "市场算力租价与SpaceX托管价区间"
+  },
+  {
+    "card_id": "v22_691cfefe91e4",
+    "type": "fact",
+    "claim": "7月上旬Anthropic在《Claude操作机器人》（Claude Plays Robotics）一文中测试了Claude Opus 4.7、Claude Mythos Preview、GPT-5.4、Gemini 3.1 Pro Preview、Kimi K2.6和Qwen 3.6-Plus等12个模型控制机器人的表现，测试涵盖经典控制、运动控制（含宇树Go2四足狗和G1人形上的表现）和操作三类任务，并观察了直接输出动作、编程Python控制器、监督其它机器人策略模型（如VLA）、从头训练并部署强化学习策略4种接口（权重皆为0.25，和为1），其中一种方法就是让模型生成末端执行器的位姿。",
+    "figures": [
+      {"metric": "Anthropic测试控制机器人的模型数量", "value": 12, "unit": "个", "period": "7月上旬"},
+      {"metric": "Anthropic观察的控制接口数量", "value": 4, "unit": "种", "period": ""},
+      {"metric": "各控制接口权重", "value": 0.25, "unit": "倍", "period": ""}
+    ],
+    "quote": "陈哲：其实 7 月上旬 Anthropic 在《Claude 操作机器人》（Claude Plays Robotics）一文中就做了铺垫，他们当时测试了 Claude Opus 4.7、Claude Mythos Preview、GPT-5.4、Gemini 3.1 Pro Preview、Kimi K2.6 和 Qwen 3.6-Plus 等 12 个模型控制机器人的表现。其中一种方法，就是让模型生成末端执行器的位姿。\nAnthropic 在 Claude Plays Robotics 中展示的数据。对于选取的模型，Anthropic 团队测了三类任：经典控制、运动控制（Locomotion，这部分测了各模型在宇树 Go2 四足狗和 G1 人形上的表现）和操作（Manipulation）；并观察了 4 种接口（interface）也就是四种控制方法：橙色是让模型直接输出动作；蓝色是让模型先编程一个 Python 控制器，再由程序读取机器人状态并连续生成动作；绿色是让模型去监督其它的机器人策略模型，比如监督一个 VLA 模型；紫色是让模型设计奖励函数、策略网络和训练计划，从头训练并部署一个强化学习策略。柱顶数字是各模型在不同机器人、任务和 interface 上的标准化综合得分，并非任务成功率；四种接口的权重皆为 0.25，和为 1 。",
+    "tickers": [],
+    "confidence": 0.85,
+    "topic_label": "Anthropic《Claude操作机器人》多模型控制测试"
+  },
+  {
+    "card_id": "v22_511e15a42663",
+    "type": "opinion",
+    "claim": "光模块景气仍在但已是一致预期，中际旭创和沪电股份建议持有而非加仓，27Q1的催化（3.2T放量、CPO订单）是景气延续而非拐点。",
+    "figures": [],
+    "quote": "**Optical modules: still booming, but already consensus.** Innolight and WUS are holds, not adds. The 27Q1 news there (3.2T volume, co-packaged optics orders) extends the boom rather than turning it.",
+    "tickers": [],
+    "confidence": 0.85,
+    "topic_label": "光模块及中际旭创、沪电股份操作观点"
+  },
+  {
+    "card_id": "v22_f02b05b12ff5",
+    "type": "opinion",
+    "claim": "Eve认为爱尔兰注册累积型ETF（UCITS Acc，核心标的为IB01、VDST）是终极最优解：在爱尔兰与美国税收协定下底层美债利息免税，且作为累积型ETF不派发分红，股息预扣税为0%；同时不属于美国资产，完全免除针对非美籍居民（NRA）持有超过6万美元美国本土资产（包括BOXX、SGOV）所面临的18%–40%美国遗产税；且IB01管理费率仅0.07%，显著低于BOXX约0.19%的净费率（两者年化利差约0.12%）。",
+    "figures": [
+      {"metric": "爱尔兰注册累积型ETF股息预扣税", "value": 0, "unit": "%", "period": ""},
+      {"metric": "非美籍居民美国本土资产遗产税免征门槛", "value": 6, "unit": "万美元", "period": ""},
+      {"metric": "美国遗产税税率", "value": "18-40", "unit": "%", "period": ""},
+      {"metric": "IB01管理费率", "value": 0.07, "unit": "%", "period": ""},
+      {"metric": "BOXX净费率", "value": "约0.19", "unit": "%", "period": ""},
+      {"metric": "IB01与BOXX年化利差", "value": "约0.12", "unit": "%", "period": ""}
+    ],
+    "quote": "### 一、 终极最优解：爱尔兰注册累积型 ETF（UCITS Acc）\n* **核心标的**：**IB01**（iShares $ Treasury Bond 0-1yr UCITS ETF，美元累积型）、**VDST**（Vanguard 0-1年美债 UCITS ETF）\n* **交易地点**：伦敦证券交易所（LSE）/ 泛欧交易所，美元计价（Interactive Brokers 盈透直接可买）\n* **税务与费率优势**：\n  1. **股息预扣税 0%**：爱尔兰与美国税收协定下，底层美债利息免税；且该类 ETF 为**累积型（Accumulating）**，利息自动滚入净值，**不派发任何分红**，完全不存在 WHT。\n  2. **彻底免除美国遗产税（US Estate Tax）**：这是持有 BOXX 和 SGOV 最大的潜在盲点——非美籍居民（NRA）持有超过 6 万美元的美国本土资产（US Situs Assets，包括美股本土注册的 BOXX、SGOV），若发生意外面临高达 18%–40% 的美国遗产税。而爱尔兰注册的 UCITS ETF **不属于美国资产，完全免除该税**。\n  3. **费率显著低于 BOXX**：IB01 管理费率仅 **0.07%**，而 BOXX 净费率约为 **0.19%**（两者年化利差约 0.12%）。",
+    "tickers": ["IB01", "VDST", "BOXX", "SGOV", "IBKR"],
+    "confidence": 0.9,
+    "topic_label": "爱尔兰注册累积型美债ETF优势分析"
+  },
+  {
+    "card_id": "v22_facfd532208d",
+    "type": "opinion",
+    "claim": "阿里巴巴（BABA）、拼多多（PDD）、网易（NTES）、京东（JD）、携程（TCOM）、富途控股（FUTU）、贝壳（BEKE）、百胜中国（YUMC）均触发周线金叉技术信号；其中BABA价格124.35（30D=10.7%）、PDD价格89.28（30D=5.6%）、NTES价格124.27（30D=-5.4%）、JD价格31.07（30D=7.6%）、TCOM价格45.81（30D=8.1%）、FUTU价格105.78（30D=9.8%）、BEKE价格17.25（30D=7.4%）、YUMC价格47.78（30D=8.8%）。",
+    "figures": [
+      {"metric": "BABA价格", "value": 124.35, "unit": "", "period": ""},
+      {"metric": "FUTU价格", "value": 105.78, "unit": "", "period": ""}
+    ],
+    "quote": "**阿里巴巴集团控股有限公司(BABA)** 价格=124.35 RSI=64.8 30D=10.7% → 🌟 周线金叉\n  **PDD Holdings Inc.(PDD)** 价格=89.28 RSI=67.8 30D=5.6% → 🌟 周线金叉\n  **網易股份有限公司(NTES)** 价格=124.27 RSI=56.0 30D=-5.4% → 🌟 周线金叉\n  **京东(JD)** 价格=31.07 RSI=57.2 30D=7.6% → 🌟 周线金叉\n  **携程旅游信息技术(上海)有限公司(TCOM)** 价格=45.81 RSI=66.8 30D=8.1% → 🌟 周线金叉\n  **Futu Holdings Limited(FUTU)** 价格=105.78 RSI=61.1 30D=9.8% → 🌟 周线金叉\n  **贝壳控股有限公司(BEKE)** 价格=17.25 RSI=65.4 30D=7.4% → 🌟 周线金叉\n  **百勝中國控股有限公司(YUMC)** 价格=47.78 RSI=77.5 30D=8.8% → 🌟 周线金叉",
+    "tickers": ["BABA", "PDD", "NTES", "JD", "TCOM", "FUTU", "BEKE", "YUMC"],
+    "confidence": 0.85,
+    "topic_label": "头部中概消费与互联网标的周线金叉信号"
+  },
+  {
+    "card_id": "v22_8f73b698883f",
+    "type": "fact",
+    "claim": "中信里昂今天发布的南京糖酒会反馈显示：客流是疫情以来最弱的一次；中秋国庆期间，湖南白酒动销同比-10%到-15%，江苏超过-20%；回款发货进度方面，汾酒为75%，泸州老窖和洋河只有55%到60%。",
+    "figures": [
+      {"metric": "湖南白酒动销同比", "value": "-10%到-15%", "unit": "%", "period": "中秋国庆期间"},
+      {"metric": "江苏白酒动销同比", "value": "超过-20%", "unit": "%", "period": "中秋国庆期间"},
+      {"metric": "汾酒回款发货进度", "value": 75, "unit": "%", "period": ""},
+      {"metric": "泸州老窖回款发货进度", "value": "55-60", "unit": "%", "period": ""},
+      {"metric": "洋河回款发货进度", "value": "55-60", "unit": "%", "period": ""}
+    ],
+    "quote": "- 汾酒 -5.7%，泸州老窖 -3.0%。中信里昂今天发了南京糖酒会反馈：\n  - 客流是疫情以来最弱的一次。\n  - 中秋国庆期间，湖南白酒动销同比 -10% 到 -15%，江苏超过 -20%。\n  - 回款发货进度：汾酒 75%，老窖和洋河只有 55% 到 60%。",
+    "tickers": [],
+    "confidence": 0.95,
+    "topic_label": "中信里昂南京糖酒会白酒动销与回款反馈"
+  },
+  {
+    "card_id": "v22_ab31dc53f356",
+    "type": "model_assumption",
+    "claim": "下修理由是问题出在盈利能力而非需求本身，2027年全球动力加储能电池需求仍按增长20%至25%算（高于市场预期）；车企利润变差导致税负往上游转，估计2027年电池消费税和出口退税两项合计超过1,000亿元（还没算整车出口退税的下调），宁德作为利润最厚的一方会先扛这部分负担。",
+    "figures": [
+      {"metric": "全球动力加储能电池需求增速假设", "value": "20-25", "unit": "%", "period": "2027年"},
+      {"metric": "估计电池消费税和出口退税两项合计", "value": "超过1000", "unit": "亿元", "period": "2027年"}
+    ],
+    "quote": "- 下修理由：它说问题出在盈利能力，需求本身没问题，2027 年全球动力加储能电池需求仍按增长 20% 至 25% 算，高于市场预期。\n  - 车企利润在变差，税负会往上游转。它估计 2027 年电池消费税和出口退税两项合计超过 1,000 亿元，还没算整车出口退税的下调。\n  - 宁德作为利润最厚的一方，会先扛这部分负担。",
+    "tickers": ["300750.SZ", "3750.HK"],
+    "confidence": 0.9,
+    "topic_label": "2027年全球电池需求增速与行业税负估计"
+  },
+  {
+    "card_id": "v22_31ad8112a9ec",
+    "type": "fact",
+    "claim": "UBS Evidence Lab显示芒果2Q26与7M26平均MAU同比分别降11%与13%。",
+    "figures": [
+      {"metric": "平均MAU同比变动", "value": -11, "unit": "%", "period": "2Q26"},
+      {"metric": "平均MAU同比变动", "value": -13, "unit": "%", "period": "7M26"}
+    ],
+    "quote": "但 UBS Evidence Lab 显示芒果 2Q26 与 7M26 平均 MAU 同比分别降 11% 与 13%",
+    "tickers": [],
+    "confidence": 0.9,
+    "topic_label": "UBS Evidence Lab芒果MAU数据"
+  },
+  {
+    "card_id": "v22_6b9dca9e63a0",
+    "type": "opinion",
+    "claim": "再鼎医药（ZLAB）触发止跌信号：价格为25.23，RSI为76.6，30日涨跌幅为28.6%，RSI近20日最低19回升至77，近5日出现MACD日线金叉及周线金叉。",
+    "figures": [
+      {"metric": "价格", "value": 25.23, "unit": "", "period": ""},
+      {"metric": "RSI", "value": 76.6, "unit": "", "period": ""},
+      {"metric": "涨跌幅", "value": 28.6, "unit": "%", "period": "30D"},
+      {"metric": "近20日最低RSI", "value": 19, "unit": "", "period": "近20日"}
+    ],
+    "quote": "**再鼎医药有限公司(ZLAB)** 价格=25.23 RSI=76.6 30D=28.6% → 📈 RSI超卖回升: 近20日最低19 → 现77 | ⚡ MACD日线金叉 (近5日) | 🌟 周线金叉",
+    "tickers": ["ZLAB"],
+    "confidence": 0.85,
+    "topic_label": "再鼎医药技术止跌信号"
+  },
+  {
+    "card_id": "v22_3bb06b5dee29",
+    "type": "estimate",
+    "claim": "GitLab 在渠道访谈中 7 月季度 bookings 达标到超计划 5%–10%（主要靠老客户扩张和 Ultimate 安全版升级，新客户仅达标）；10 月季度管道覆盖为 3.2–3.4 倍（上季同期为 2.8–3.0 倍），但销售周期拉长了 10%–15%。",
+    "figures": [
+      {"metric": "管道覆盖倍数", "value": "3.2-3.4", "unit": "倍", "period": "10月季度"},
+      {"metric": "管道覆盖倍数", "value": "2.8-3.0", "unit": "倍", "period": "上季同期"},
+      {"metric": "销售周期拉长幅度", "value": "10-15", "unit": "%", "period": ""}
+    ],
+    "quote": "我读了 Guidepoint 9/15 到 10/17 的 63 份美国 SaaS 渠道访谈。**结论是实质性加速的只有两家：Dynatrace 和 Procore，而且都还只是渠道数据。放缓最明确的是 HubSpot 和 monday.com。** ServiceNow、Datadog 这些大票是\"不错，但没再提速\"。\n- **次一档，都只有单一来源：**\n  - 网络安全：同一位顾问上调了三家的全年预期，CrowdStrike 从 15%+ 到约 20%，Palo Alto 从约 15% 到 17%–18%（含 CyberArk 并购），Zscaler 从 10% 到 12%–13%。\n- **ServiceNow：5 家伙伴分化。**\n- **GitLab：** 7 月季度 bookings 达标到超计划 5%–10%，主要靠老客户扩张和 Ultimate 安全版升级，新客户只是达标。10 月季度管道覆盖 3.2–3.4 倍，上季同期是 2.8–3.0 倍；但销售周期长了 10%–15%。",
+    "tickers": [],
+    "confidence": 0.85,
+    "topic_label": "GitLab渠道bookings与管道覆盖情况"
+  },
+  {
+    "card_id": "v22_d58e0441d511",
+    "type": "fact",
+    "claim": "据 Search Engine Land 和 MarTech 报道的 Datos/SparkToro 今年 1 月报告摘要（报告原文未打开成功、尚未核对），2025 年美国桌面端人均谷歌搜索次数同比下降近 20%，欧洲只降了 2% 到 3%，而全球总量还在涨 7%。",
+    "figures": [
+      {"metric": "美国桌面端人均谷歌搜索次数同比变化", "value": "下降近20", "unit": "%", "period": "2025年"},
+      {"metric": "欧洲桌面端人均谷歌搜索次数同比变化", "value": "下降2-3", "unit": "%", "period": "2025年"},
+      {"metric": "全球谷歌搜索总量增长", "value": 7, "unit": "%", "period": ""}
+    ],
+    "quote": "- Datos/SparkToro 今年 1 月的报告说，2025 年美国桌面端人均谷歌搜索次数同比下降近 20%，欧洲只降了 2% 到 3%。全球总量却还在涨 7%，增量应该主要来自移动端和 App、新兴市场，以及 AI Mode 的追问。这份报告的原文我没打开成功，数字来自 Search Engine Land 和 MarTech 报道的摘要，还没核对过。",
+    "tickers": ["GOOGL"],
+    "confidence": 0.7,
+    "topic_label": "谷歌 2025 年美欧桌面端人均搜索量与全球总量变化"
+  },
+  {
+    "card_id": "v22_1d3de3669d94",
+    "type": "opinion",
+    "claim": "Eve对芒果超媒当前立场偏Bear（中等置信度）：这轮大涨主要交易《后西游记》跑通卫视黄金档AI长剧后的降本预期与平台重估，但2026年8月芒果TV月度总时长（MTS）同比下滑27%（DAU同比-17%），1H26会员收入同比下跌22.6%至19.33亿元、2Q26单季扣非净利转负至-600万元（核心经营亏损约1亿元）；在免费短剧日均消耗用户125分钟、AI让内容供给无限化的环境下，AIGC降本尚难抵消用户时长流失与订阅去杠杆，决定回报的核心变量是4Q26至1H27会员收入能否止跌回升，以及AI剧能否在不稀释会员ARPU的前提下实质降低每年近60亿元的无形资产摊销。",
+    "figures": [
+      {"metric": "芒果TV月度总时长（MTS）同比变动", "value": -27, "unit": "%", "period": "2026年8月"},
+      {"metric": "芒果TV DAU同比变动", "value": -17, "unit": "%", "period": "2026年8月"},
+      {"metric": "会员收入", "value": 19.33, "unit": "亿元", "period": "1H26"},
+      {"metric": "会员收入同比变动", "value": -22.6, "unit": "%", "period": "1H26"},
+      {"metric": "单季扣非净利", "value": -600, "unit": "万元", "period": "2Q26"},
+      {"metric": "核心经营亏损", "value": "约1", "unit": "亿元", "period": "2Q26"},
+      {"metric": "免费短剧日均消耗用户时长", "value": 125, "unit": "分钟", "period": ""},
+      {"metric": "每年无形资产摊销", "value": "近60", "unit": "亿元", "period": ""}
+    ],
+    "quote": "**核心判断：当前立场偏 Bear（中等置信度）。**\n2026 年 10 月 14 日芒果超媒收报 25.64 元（总市值 479.65 亿元），较 8 月底约 14 元上涨约 81%，对应 Goldman Sachs 2027E 归母净利润 13.05 亿元约 37 倍 PE（对应 Citi 2026E/2027E 净利 2.97 亿/5.48 亿元为 161 倍/88 倍 PE）。这轮大涨主要在交易《后西游记》跑通卫视黄金档 AI 长剧后的降本预期与平台重估；但基本面上，2026 年 8 月芒果 TV 月度总时长（MTS）同比下滑 27%（DAU 同比 -17%），1H26 会员收入同比下跌 22.6% 至 19.33 亿元、2Q26 单季扣非净利转负至 -600 万元（核心经营亏损约 1 亿元）。在免费短剧日均消耗用户 125 分钟、AI 让内容供给无限化的环境下，AIGC 降本尚难抵消用户时长流失与订阅去杠杆。决定回报的核心变量是 4Q26 至 1H27 会员收入能否止跌回升，以及 AI 剧能否在不稀释会员 ARPU 的前提下实质降低每年近 60 亿元的无形资产摊销。",
+    "tickers": [],
+    "confidence": 0.9,
+    "topic_label": "芒果超媒Bull/Bear核心判断"
+  },
+  {
+    "card_id": "v22_e84937510fc1",
+    "type": "opinion",
+    "claim": "当前文档存在未核实项：多数数据来自公开报告和券商观点的网页搜索，仅招银国际（CMBI）等四家券商的报告直接从AlphaEngine阅读，公司财务数据尚未逐一核对财报原件；估值（如腾讯约13.7倍远期市盈率）来自第三方网站且未核实；思源电气北美排产计划和三花智控的特斯拉订单规模两项仅为媒体报道，无公司确认；藤仓（Fujikura）和爱德万测试（Advantest）的指引数据在不同来源间不一致，文档未予采用。",
+    "figures": [
+      {"metric": "腾讯远期市盈率(第三方网站未核实)", "value": "约13.7", "unit": "x", "period": ""}
+    ],
+    "quote": "**Not yet verified:**\n- Most figures come from web searches of public reports and broker views. Only the reports from CMBI and three other brokers were read directly from AlphaEngine. Company financials haven't been checked against filings one by one.\n- Valuations (such as Tencent at about 13.7x forward earnings) come from third-party websites and are unchecked.\n- Two items are media reports only, with no company confirmation: Sieyuan's North American production schedule and the size of Sanhua's Tesla order.\n- Fujikura's and Advantest's guidance figures were inconsistent across sources, so the document doesn't use them.",
+    "tickers": ["0700.HK", "002028.SZ", "002050.SZ", "TSLA", "5803.T", "6857.T"],
+    "confidence": 0.85,
+    "topic_label": "研究报告数据来源限制与未核实项说明"
+  },
+  {
+    "card_id": "v22_9bd5b2c7e788",
+    "type": "opinion",
+    "claim": "华为昇腾960DT将于27Q1发布（比计划提前三个季度），阿里平头哥真武V900芯片将于27Q1开始批量销售，芯片订单将在26Q4至27Q1传导至晶圆厂和设备商，设备端首选北方华创和中微公司。",
+    "figures": [],
+    "quote": "Huawei's Ascend 960DT launches in 27Q1, three quarters ahead of plan, and Alibaba's T-Head chip Zhenwu V900 starts volume sales in 27Q1. Chip orders will reach foundries and equipment makers from 26Q4 to 27Q1. Brokers have raised SMIC's 2027 net profit forecast from 7.7bn to 12.5bn yuan. The equipment picks are Naura and AMEC.",
+    "tickers": [],
+    "confidence": 0.85,
+    "topic_label": "国产AI芯片27Q1产品周期与设备选股"
+  },
+  {
+    "card_id": "v22_ea4a5347e261",
+    "type": "opinion",
+    "claim": "卖方口径预计Anthropic于9-10月IPO（待官方）。",
+    "figures": [],
+    "quote": "Anthropic 预计 9-10 月 IPO（卖方口径待官方）",
+    "tickers": [],
+    "confidence": 0.8,
+    "topic_label": "Anthropic预计IPO时间窗口"
+  },
+  {
+    "card_id": "v22_cd43110a06ce",
+    "type": "estimate",
+    "claim": "萨莉亚截至 8 月的 FY2026 合并报表口径总收入同比增长 17.4%，营业利润同比增长 5.9%；摩根大通 10 月 14 日称萨莉亚自 10 月 29 日起平均提价 6%（高于此前 2.5% 的假设），提价后客流是关键。",
+    "figures": [
+      {"metric": "合并报表口径总收入同比增速", "value": 17.4, "unit": "%", "period": "截至8月的FY2026"},
+      {"metric": "营业利润同比增速", "value": 5.9, "unit": "%", "period": "截至8月的FY2026"},
+      {"metric": "平均提价幅度", "value": 6, "unit": "%", "period": "10月29日起"},
+      {"metric": "此前提价假设", "value": 2.5, "unit": "%", "period": ""}
+    ],
+    "quote": "**萨莉亚 · 休闲正餐｜盈利修复押在提价与下半年**\n\n- 事实：截至 8 月的 FY2026 合并报表口径总收入同比 +17.4%，营业利润同比 +5.9%。\n- 交叉：10 月 14 日决算短信给出 FY2027 营业利润指引同比 +29.1%，上半年指引同比 -0.6%，增长重心在下半年。\n- 卖方：摩根大通 10 月 14 日称，10 月 29 日起平均提价 6%，高于此前 2.5% 的假设；提价后客流是关键。\n- 来源：萨莉亚决算短信、摩根大通，10 月 14 日。",
+    "tickers": [],
+    "confidence": 0.95,
+    "topic_label": "萨莉亚FY2026业绩与提价计划"
+  },
+  {
+    "card_id": "v22_b4db5f4c7ca0",
+    "type": "estimate",
+    "claim": "Elastic 在单一来源渠道访谈中，Archera 客户的承诺额增速从约 30.5% 升到 33% 以上，受搜索和向量索引驱动；但另一家伙伴仅落在 12%–16% 的原预期内。",
+    "figures": [
+      {"metric": "Archera客户前期承诺额增速", "value": "约30.5%", "unit": "%", "period": ""},
+      {"metric": "Archera客户近期承诺额增速", "value": "33%以上", "unit": "%", "period": ""},
+      {"metric": "另一伙伴增速原预期区间", "value": "12-16", "unit": "%", "period": ""}
+    ],
+    "quote": "- Elastic：Archera 客户的承诺额增速从约 30.5% 升到 33% 以上，靠搜索和向量索引；但另一家伙伴只是落在 12%–16% 的原预期内。",
+    "tickers": [],
+    "confidence": 0.85,
+    "topic_label": "Elastic渠道伙伴承诺额增速"
+  },
+  {
+    "card_id": "v22_8b5b1e3a0dd5",
+    "type": "estimate",
+    "claim": "摩根士丹利（MS）估算Meta的Muse消费级应用达到1亿日活就需要1–4 GW算力。",
+    "figures": [
+      {"metric": "Muse消费级应用日活假设", "value": 1, "unit": "亿", "period": ""},
+      {"metric": "Muse消费级应用1亿日活所需算力", "value": "1-4", "unit": "GW", "period": ""}
+    ],
+    "quote": "Meta 的推荐算法升级、Muse 消费级应用（MS 估算 1 亿日活就要 1–4 GW 算力）、Google 搜索和 Gemini（用户从 4 亿涨到 10 亿）、Coding Agent，再加上前沿模型下一代预训练和强化学习（RL），这些全是大厂自己在烧卡，根本不走企业软件采购流程。",
+    "tickers": [],
+    "confidence": 0.9,
+    "topic_label": "摩根士丹利对Meta Muse应用算力需求估算"
+  },
+  {
+    "card_id": "v22_bf1790fd1ca2",
+    "type": "opinion",
+    "claim": "Oppenheimer的Rick Schafer认为存在一种可能：台积电自己拥有并运营一座工厂，只给特斯拉、SpaceX、xAI供货，由SpaceX出资或承诺采购量。Jefferies 10/5的晨报引用Sherman的看法，认为最可信的是台积电控股的德州工厂，由Musk那边出钱、签长期晶圆采购协议。台积电进来会用自己的工艺，交易台担心英特尔的14A会被挤出去。",
+    "figures": [],
+    "quote": "Oppenheimer 的 Rick Schafer 提到一种可能：台积电自己拥有并运营一座工厂，只给特斯拉、SpaceX、xAI 供货，SpaceX 出资或者承诺采购量。Jefferies 10/5 的晨报引用 Sherman 的看法，认为最可信的是台积电控股的德州工厂，由 Musk 那边出钱、签长期晶圆采购协议。台积电进来会用自己的工艺，交易台担心英特尔的 14A 会被挤出去。",
+    "tickers": ["TSM", "INTC", "SPCX"],
+    "confidence": 0.9,
+    "topic_label": "卖方对台积电参与合作方式的看法"
+  }
+]

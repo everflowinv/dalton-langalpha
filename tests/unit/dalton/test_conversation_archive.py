@@ -5588,7 +5588,7 @@ async def test_card_fidelity_programmatic_validation_and_sample_regressions(
     from copy import deepcopy
     from src.dalton.settings import get_dalton_settings
 
-    assert get_dalton_settings().conversations.prompt_version == "conv_card_v2"
+    assert get_dalton_settings().conversations.prompt_version == "conv_card_v2_3"
     assert "证据覆盖" in extractor_mod.EXTRACTION_SYSTEM_INSTRUCTIONS
     assert "保留限定与归属" in extractor_mod.EXTRACTION_SYSTEM_INSTRUCTIONS
 
@@ -5663,15 +5663,23 @@ async def test_card_fidelity_programmatic_validation_and_sample_regressions(
     assert cand_lanqi["figures"] == orig_lanqi["figures"]
 
     # 5b. Positive sample card: cc_22905e2fd37cc08e068703b4 — numbers not falsely rejected (`ok=True`, `figures_dropped=0`),
-    #     while `ATAT` (only in cited_sources URL, not in quote) is dropped and `FY2026`/`2026Q2` periods (year 2026 not in quote) are cleared.
+    #     while `ATAT` (only in cited_sources URL, not in quote) is dropped, `FY2026`/`2026Q2` periods (year 2026 not in quote) are cleared,
+    #     and `亚朵` (in claim, absent from quote) is flagged via `unsupported_names:亚朵`.
     orig_atour = deepcopy(sample_by_id["cc_22905e2fd37cc08e068703b4"])
     cand_atour = deepcopy(orig_atour)
     res_atour = extractor_mod.validate_candidate_card(cand_atour)
     assert res_atour.ok is True
     assert res_atour.status == "active"
     assert res_atour.unsupported_claim_numbers == []
+    assert res_atour.unsupported_names == ["亚朵"]
     assert res_atour.figures_dropped == 0
-    assert len(res_atour.figures) == 4
+    assert len([f for f in res_atour.figures if f["metric"] != "_verification"]) == 4
+    assert res_atour.figures[-1] == {
+        "metric": "_verification",
+        "value": "unsupported_names:亚朵",
+        "unit": "",
+        "period": "",
+    }
     assert res_atour.tickers == []
     assert res_atour.tickers_dropped == 1
     assert res_atour.periods_cleared == 4
@@ -5780,11 +5788,16 @@ async def test_card_fidelity_programmatic_validation_and_sample_regressions(
     lanqi_out = by_quote[sample_by_id["cc_af0f4051d0d2a2ab831b3fa5"]["quote"]]
     assert lanqi_out["tickers"] == ["688008.SS"]
     assert lanqi_out["figures"] == sample_by_id["cc_af0f4051d0d2a2ab831b3fa5"]["figures"]
-    assert lanqi_out["prompt_version"] == "conv_card_v2"
+    assert lanqi_out["prompt_version"] == "conv_card_v2_3"
 
     atour_out = by_quote[sample_by_id["cc_22905e2fd37cc08e068703b4"]["quote"]]
     assert atour_out["tickers"] == []
-    assert [f["value"] for f in atour_out["figures"]] == ["25-30", 1.575, 63.2, 40]
+    assert [f["value"] for f in atour_out["figures"] if f["metric"] != "_verification"] == [
+        "25-30",
+        1.575,
+        63.2,
+        40,
+    ]
     assert all(f["period"] == "" for f in atour_out["figures"])
     assert atour_out["type"] == "fact"
 
@@ -6131,14 +6144,18 @@ async def test_card_fidelity_programmatic_validation_and_sample_regressions(
 def test_unmapped_ticker_is_kept_but_mapped_absent_one_is_dropped(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A ticker with no name mapping cannot be proven absent (海光 → 688041.SS), so it stays;
-    a ticker that has a name mapping but is absent from quote is dropped.
+    """An unmapped ticker is kept ONLY when the ticker code itself appears in `quote`;
+    both mapped and unmapped tickers absent from `quote` are dropped.
     """
     from src.dalton.conversations import extractor as ex
 
     quote = "海光自己二季度营收增长 65%，按招商的盈利预测，市盈率约 109 倍。"
-    kept, dropped = ex.validate_tickers_against_quote(["688999.SS", "NVDA"], quote)
-    assert kept == ["688999.SS"] and dropped == 1
+    kept, dropped = ex.validate_tickers_against_quote(["688041.SS", "688999.SS", "NVDA"], quote)
+    assert kept == ["688041.SS"] and dropped == 2
+
+    quote_with_code = "康師傅控股有限公司(0322.HK) 价格=12.86 RSI=69.7"
+    kept_code, dropped_absent = ex.validate_tickers_against_quote(["0322.HK", "0325.HK"], quote_with_code)
+    assert kept_code == ["0322.HK"] and dropped_absent == 1
 
     monkeypatch.setattr(
         ex,
@@ -6148,8 +6165,12 @@ def test_unmapped_ticker_is_kept_but_mapped_absent_one_is_dropped(
             return_value={"NVDA": ("NVDA", "Nvidia", "英伟达")},
         ),
     )
-    kept_unmapped, dropped_mapped = ex.validate_tickers_against_quote(["688041.SS", "NVDA"], quote)
-    assert kept_unmapped == ["688041.SS"] and dropped_mapped == 1
+    kept_unmapped_absent, dropped_both = ex.validate_tickers_against_quote(["688041.SS", "NVDA"], quote)
+    assert kept_unmapped_absent == [] and dropped_both == 2
+    kept_unmapped_present, dropped_one = ex.validate_tickers_against_quote(
+        ["688041.SS", "NVDA"], "688041.SS 二季度营收增长 65%"
+    )
+    assert kept_unmapped_present == ["688041.SS"] and dropped_one == 1
 
 
 def test_short_chinese_alias_matches_in_running_text_but_not_inside_common_words() -> None:
@@ -6396,8 +6417,8 @@ async def test_round5_flag_instead_of_reject_parsing_fixes_and_enumeration_count
     assert res_flag.unsupported_claim_numbers == ["56"]
     assert res_flag.figures_dropped == 1
     assert res_flag.figures == [
-        {"metric": "rev_start", "value": 220, "unit": "CNY_yi", "period": ""},
-        {"metric": "rev_end", "value": 343, "unit": "CNY_yi", "period": ""},
+        {"metric": "rev_start", "value": 220, "unit": "yi", "period": ""},
+        {"metric": "rev_end", "value": 343, "unit": "yi", "period": ""},
         {"metric": "_verification", "value": "unsupported:56", "unit": "", "period": ""},
     ]
 
@@ -6467,7 +6488,7 @@ async def test_round5_flag_instead_of_reject_parsing_fixes_and_enumeration_count
             "tickers": [],
         },
         quote=(
-            "市值USD7,176.0mn，2026-06-30基准净现金RMB-4,001.615mn，严格净现金RMB-6,544.096mn；"
+            "海尔智家市值USD7,176.0mn，2026-06-30基准净现金RMB-4,001.615mn，严格净现金RMB-6,544.096mn；"
             "欢聚净现金USD3,059.315mn；安踏净现金RMB31,844百万元；"
             "创维经营现金流转为净流出RMB34.57亿元；目标价HK$70.00。"
         ),
@@ -6593,6 +6614,1553 @@ def test_yi_fen_masking_respects_multi_digit_numerals_only() -> None:
     assert flagged("周一一个月内完成交付") == []
     assert flagged("已签署十一份订单") == ["11"]
     assert flagged("已签署一百零一份订单") == ["101"]
+
+
+def test_conv_card_v2_1_audit_regressions_prompt_tickers_and_indicator_numbers() -> None:
+    """v2.1 regression suite driven by `fixtures/conv_cards_v2_audit_regressions.json`:
+    1. Prompt rules for evidence coverage, subject completion ban, interview speaker boundaries,
+       qualifying phrases (`尚无公开成果`), `fact` per-clause coverage, `estimate` for third-party
+       models & company guidance, `model_assumption` for original speaker's calculations (`原说话人的测算`),
+       `cited_sources` verbatim in `quote`, `tickers` subject-only & unmapped code rule, and `figures`
+       preserving `约/大约/左右/以上` and quote-scoped `同期/上期`.
+    2. `validate_tickers_against_quote`: unmapped tickers dropped unless the code itself appears in `quote`;
+       A+H dual-listing aliases (`300750.SZ`/`3750.HK`, `688008.SS`/`6809.HK`, `000333.SZ`/`0300.HK`,
+       `002050.SZ`/`2050.HK`, `600660.SS`/`3606.HK`) loaded and matched.
+    3. `validate_candidate_card`: indicator-prefixed numbers (`价格=`, `RSI=`, `收盘价`, `市盈率`, `PE`,
+       `EV/EBIT` in `METRIC_PREFIX_INDICATORS_TABLE`) treated as metric numbers and counted in
+       `unsupported_claim_numbers` (catching `66.3` and `85.6` on `v2_18e39ac4ab23`).
+    4. `prompt_version` updated to `conv_card_v2_3`.
+    """
+    from copy import deepcopy
+    from src.dalton.conversations import extractor as ex
+    from src.dalton.settings import DaltonConversationsConfig, get_dalton_settings
+
+    # --- Item 6: prompt_version == conv_card_v2_3 ---
+    get_dalton_settings.cache_clear()
+    assert DaltonConversationsConfig().prompt_version == "conv_card_v2_3"
+    assert get_dalton_settings().conversations.prompt_version == "conv_card_v2_3"
+
+    # --- Items 1-4: Prompt rule clauses ---
+    prompt = ex.EXTRACTION_SYSTEM_INSTRUCTIONS
+    # Item 1: Evidence coverage, no unquoted entities/speakers/conclusions, subject completion ban, interview segmentation, qualifiers
+    assert "不得出现 `quote` 里没有的公司、机构、产品、说话人" in prompt
+    assert "见顶" in prompt and "止跌" in prompt and "资金流" in prompt
+    assert "主体在 `quote` 里只是代词或省略时，扩大连续引用；扩大后仍然覆盖不到，就删掉这张卡或这一句，不得根据 `topic_label` 或相邻卡片补全" in prompt
+    assert "访谈体按“某某：”分段，上一段里的“我认为”不能并到下一位说话人" in prompt
+    assert "尚无公开成果" in prompt
+    # Item 2: Card types & cited_sources
+    assert "事实来源必须覆盖 `claim` 里每一句当作 `fact` 的数字句，只覆盖了其中一句就拆卡" in prompt
+    assert "第三方模型预测、公司经营指引" in prompt
+    assert "原说话人的测算" in prompt
+    assert "抽取者自己的" not in prompt
+    assert "“我算”“隐含”“按全价算”“粗算”" in prompt
+    assert "“引用某报告”只覆盖报告明确披露的那几句，不覆盖随后自行推导的结论" in prompt
+    assert "`cited_sources` 只填 `quote` 里实际出现的来源名称" in prompt
+    # Item 3: Tickers prompt rules
+    assert "股东、客户、被比较方如果不是本卡的主体，不放进 `tickers`" in prompt
+    assert "没有别名映射的代码，只有代码本身出现在 `quote` 里时才保留，否则删除" in prompt
+    # Item 4: Figures prompt rules
+    assert "“约、大约、左右、以上”保留在 `value` 字符串里" in prompt
+    assert '"约142"' in prompt
+    assert "“同期、上期”只能继承本卡 `quote` 里写明的期间" in prompt
+
+    # --- Load v2 audit regression fixture (never reading `.agy/`) ---
+    fixture_path = Path(__file__).resolve().parent / "fixtures" / "conv_cards_v2_audit_regressions.json"
+    cards = json.loads(fixture_path.read_text(encoding="utf-8"))
+    by_id = {c["card_id"]: c for c in cards}
+    assert len(by_id) >= 12
+
+    # --- Item 5 & Item 3 on v2_18e39ac4ab23: 66.3 and 85.6 flagged in unsupported_claim_numbers, 0325.HK dropped ---
+    c_18e = deepcopy(by_id["v2_18e39ac4ab23"])
+    res_18e = ex.validate_candidate_card(c_18e)
+    assert res_18e.ok is True
+    assert res_18e.confidence == 0.4
+    assert res_18e.tickers == ["0322.HK"]
+    assert res_18e.tickers_dropped == 1
+    assert res_18e.unsupported_claim_numbers == ["66.3", "85.6", "44.6", "1.6", "64.37"]
+    assert res_18e.figures[-1] == {
+        "metric": "_verification",
+        "value": "unsupported:66.3,85.6,44.6,1.6,64.37",
+        "unit": "",
+        "period": "",
+    }
+
+    # --- Item 5: Extensible METRIC_PREFIX_INDICATORS_TABLE coverage ---
+    for prefix_expr in ("价格=66.3", "RSI=85.6", "收盘价 557.64", "市盈率 25", "PE=30", "EV/EBIT 18.5"):
+        res_ind = ex.validate_candidate_card(
+            {"claim": f"某公司 {prefix_expr}。", "figures": [], "tickers": []},
+            quote="某公司近期表现平稳。",
+        )
+        assert res_ind.confidence == 0.4, f"Expected indicator prefix {prefix_expr!r} to be flagged"
+        assert len(res_ind.unsupported_claim_numbers) == 1
+
+    # --- Item 3 on v2_76651895b370 (3750.HK absent from quote), v2_114c2aa5ca39 (MKSI absent), v2_e91a4e64c02e & v2_ebcb67dd7bb2 (XNET absent) ---
+    for cid_drop in ("v2_76651895b370", "v2_114c2aa5ca39", "v2_e91a4e64c02e", "v2_ebcb67dd7bb2"):
+        c_item = deepcopy(by_id[cid_drop])
+        res_item = ex.validate_candidate_card(c_item)
+        assert res_item.tickers == [], f"Expected tickers to be dropped for {cid_drop}"
+        assert res_item.tickers_dropped == 1
+
+    # Unmapped ticker whose code DOES appear in quote (v2_bb4895823474: BOXX) is kept
+    c_boxx = deepcopy(by_id["v2_bb4895823474"])
+    res_boxx = ex.validate_candidate_card(c_boxx)
+    assert res_boxx.tickers == ["BOXX"]
+    assert res_boxx.tickers_dropped == 0
+
+    # A+H dual-listed mappings: CATL 300750.SZ / 3750.HK and peers match when company name is in quote
+    ex._load_ticker_company_aliases.cache_clear()
+    for ah_tickers, company_quote in [
+        (["300750.SZ", "3750.HK"], "宁德时代三季度电池出货量与单位净利超预期"),
+        (["688008.SS", "6809.HK"], "澜起科技互连类芯片毛利率创新高"),
+        (["000333.SZ", "0300.HK"], "美的集团海外空调出口同比增长21%"),
+        (["002050.SZ", "2050.HK"], "三花智控机器人执行器产线进展顺利"),
+        (["600660.SS", "3606.HK"], "福耀玻璃海外市占率持续提升"),
+    ]:
+        kept_ah, dropped_ah = ex.validate_tickers_against_quote(ah_tickers, company_quote)
+        assert kept_ah == ah_tickers and dropped_ah == 0
+
+    # Agent fact card without cited source in quote (v2_f6fafaac280d) downgrades to opinion
+    _spk, eff_type, _srcs = ex.enforce_speaker_and_agent_citation(
+        by_id["v2_f6fafaac280d"]["type"],
+        [],
+        {"message_role": "assistant", "text": by_id["v2_f6fafaac280d"]["quote"]},
+        quote=by_id["v2_f6fafaac280d"]["quote"],
+    )
+    assert eff_type == "opinion"
+
+
+@pytest.mark.asyncio
+async def test_conv_card_v2_2_programmatic_fallbacks_and_audit_regressions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """v2.2 programmatic validation fallbacks driven by `fixtures/conv_cards_v2_1_audit_regressions.json`:
+    1. `topic_label` does NOT backfill from `seg_topic_label` when card `topic_label` is omitted/empty.
+    2. Proper-noun validation (`unsupported_names`) strips unsupported company/institution/proper names
+       from `topic_label` and flags `claim` with `confidence <= 0.4` and `unsupported_names:<names>`.
+    3. Forbidden conclusion words (`FORBIDDEN_CONCLUSION_WORDS_TABLE`) in `claim` absent from `quote`
+       flag `confidence <= 0.4` and `unsupported_conclusion:<words>`.
+    4. Keyword-based `type` correction (`fact -> estimate`, `opinion -> model_assumption`) counted in `types_corrected`.
+    5. Alias-based ticker backfill (`tickers_backfilled`), including A+H dual-listed pairs, while skipping
+       source institutions and excluded companies (`剔除/不含`).
+    6. Same-sentence period anchoring (`is_period_supported_by_quote` with `figure_value` across `。！？；\\n`).
+    7. Stripping unsupported currency from `figures.unit` (`currencies_stripped`).
+    8. `prompt_version == 'conv_card_v2_3'` and all new counters propagated into weekly batch summaries.
+    """
+    from copy import deepcopy
+    from src.dalton.conversations import extractor as ex
+    from src.dalton.settings import DaltonConversationsConfig, get_dalton_settings
+
+    get_dalton_settings.cache_clear()
+    assert DaltonConversationsConfig().prompt_version == "conv_card_v2_3"
+    assert get_dalton_settings().conversations.prompt_version == "conv_card_v2_3"
+
+    fixture_path = (
+        Path(__file__).resolve().parent / "fixtures" / "conv_cards_v2_1_audit_regressions.json"
+    )
+    by_id = {c["card_id"]: c for c in json.loads(fixture_path.read_text(encoding="utf-8"))}
+    assert len(by_id) == 11
+
+    # --- Item 2: Proper-noun validation (`v21_82d1bcb330b2`, `v21_1136705dbec4`, `v21_676e010b7206`, `v21_9d8e0e9966ec`) ---
+    c_ddog = deepcopy(by_id["v21_82d1bcb330b2"])
+    res_ddog = ex.validate_candidate_card(c_ddog)
+    assert res_ddog.confidence == 0.4
+    assert "Datadog" in res_ddog.unsupported_names
+    assert "Datadog" not in c_ddog["topic_label"]
+    assert any(
+        f["metric"] == "_verification" and "unsupported_names:Datadog" in f["value"]
+        for f in res_ddog.figures
+    )
+
+    c_zycm = deepcopy(by_id["v21_1136705dbec4"])
+    res_zycm = ex.validate_candidate_card(c_zycm)
+    assert res_zycm.confidence == 0.4
+    assert "中原传媒" in res_zycm.unsupported_names
+    assert "中原传媒" not in c_zycm["topic_label"]
+    assert any(
+        f["metric"] == "_verification" and "unsupported_names:中原传媒" in f["value"]
+        for f in res_zycm.figures
+    )
+
+    c_ferretti = deepcopy(by_id["v21_676e010b7206"])
+    res_ferretti = ex.validate_candidate_card(c_ferretti)
+    assert res_ferretti.unsupported_names == []
+    assert c_ferretti["topic_label"] == ""
+
+    c_latepost = deepcopy(by_id["v21_9d8e0e9966ec"])
+    res_latepost = ex.validate_candidate_card(c_latepost)
+    assert res_latepost.confidence == 0.4
+    assert {"晚点聊", "陈哲"}.issubset(set(res_latepost.unsupported_names))
+
+    # --- Item 3 & Item 7: Forbidden conclusion words + currency stripping (`v21_e0955af6436b`) ---
+    c_popmart = deepcopy(by_id["v21_e0955af6436b"])
+    res_popmart = ex.validate_candidate_card(c_popmart)
+    assert res_popmart.confidence == 0.4
+    assert "止跌" in res_popmart.unsupported_conclusions
+    assert "泡泡玛特" in res_popmart.unsupported_names
+    assert c_popmart["topic_label"] == ""
+    assert res_popmart.currencies_stripped == 6
+    assert all(
+        f["unit"] == "" for f in res_popmart.figures if f["metric"] != "_verification"
+    )
+    verif_vals = [f["value"] for f in res_popmart.figures if f["metric"] == "_verification"]
+    assert any("unsupported_conclusion:止跌" in v for v in verif_vals)
+    assert any("unsupported_names:泡泡玛特" in v for v in verif_vals)
+
+    # --- Item 4 & Item 7: Keyword-based type correction + currency stripping (`v21_923ce4b11825`) ---
+    c_kol = deepcopy(by_id["v21_923ce4b11825"])
+    corr_type_kol, corr_cnt_kol = ex.correct_card_type_by_keywords(
+        c_kol["type"], c_kol["claim"], c_kol["quote"]
+    )
+    assert corr_type_kol == "estimate" and corr_cnt_kol == 1
+    res_kol = ex.validate_candidate_card(c_kol)
+    assert res_kol.currencies_stripped == 1
+    assert res_kol.figures[0]["unit"] == "万"
+
+    # --- Item 4, Item 5 & Item 6: `opinion -> model_assumption`, A+H ticker backfill, same-sentence period ---
+    c_catl = deepcopy(by_id["v21_030732b1fda5"])
+    corr_type_catl, corr_cnt_catl = ex.correct_card_type_by_keywords(
+        c_catl["type"], c_catl["claim"], c_catl["quote"]
+    )
+    assert corr_type_catl == "model_assumption" and corr_cnt_catl == 1
+    res_catl = ex.validate_candidate_card(c_catl)
+    assert res_catl.tickers == ["300750.SZ", "3750.HK"]
+    assert res_catl.tickers_backfilled == 2
+    assert "摩根大通" in res_catl.unsupported_names
+    assert res_catl.confidence == 0.4
+
+    c_atour_v21 = deepcopy(by_id["v21_b64e8dd14d8e"])
+    corr_type_atour, corr_cnt_atour = ex.correct_card_type_by_keywords(
+        c_atour_v21["type"], c_atour_v21["claim"], c_atour_v21["quote"]
+    )
+    assert corr_type_atour == "model_assumption" and corr_cnt_atour == 1
+    res_atour_v21 = ex.validate_candidate_card(c_atour_v21)
+    assert c_atour_v21["topic_label"] == ""
+    assert res_atour_v21.periods_cleared == 3
+    fig_periods_by_val = {
+        str(f["value"]): f["period"]
+        for f in res_atour_v21.figures
+        if f["metric"] != "_verification"
+    }
+    assert fig_periods_by_val["2175"] == ""
+    assert fig_periods_by_val["+19.2"] == ""
+    assert fig_periods_by_val["811"] == ""
+    assert fig_periods_by_val["101"] == "Q2"
+    assert fig_periods_by_val["500"] == "全年"
+
+    # --- Item 5 & Item 6: Ticker backfill & same-sentence period on `v21_91a9eb6d35f0`, `v21_3bf61c4efa60`, `v21_f202f73c375d` ---
+    c_insta_v21 = deepcopy(by_id["v21_91a9eb6d35f0"])
+    res_insta_v21 = ex.validate_candidate_card(c_insta_v21)
+    assert res_insta_v21.tickers == ["688775.SS"]
+    assert res_insta_v21.tickers_backfilled == 1
+
+    c_ai_apps = deepcopy(by_id["v21_3bf61c4efa60"])
+    res_ai_apps = ex.validate_candidate_card(c_ai_apps)
+    assert c_ai_apps["topic_label"] == ""
+    assert {"300033.SZ", "1357.HK", "2513.HK", "3696.HK", "3317.HK"}.issubset(
+        set(res_ai_apps.tickers)
+    )
+    assert res_ai_apps.tickers_backfilled == 5
+
+    c_el = deepcopy(by_id["v21_f202f73c375d"])
+    res_el = ex.validate_candidate_card(c_el)
+    assert res_el.tickers == ["EL"]
+    assert res_el.tickers_backfilled == 1
+    assert res_el.periods_cleared == 2
+    assert [f["period"] for f in res_el.figures] == ["FY2027", "FY2027", "FY2027", "", ""]
+
+    # Excluded company after `剔除/不含` is NOT backfilled, while non-excluded subject company IS backfilled
+    bf_tickers, bf_cnt = ex.backfill_tickers_from_quote(
+        [],
+        "剔除中芯国际后，澜起科技互连类芯片毛利率回升至69.3%。",
+        claim="剔除中芯国际后，澜起科技互连类芯片毛利率回升至69.3%。",
+    )
+    assert "0981.HK" not in bf_tickers and "688981.SS" not in bf_tickers
+    assert {"688008.SS", "6809.HK"}.issubset(set(bf_tickers))
+    assert bf_cnt == 2
+
+    # --- Item 1 & Item 8: End-to-end `extract_segment_cards` + `process_weekly_batch` counters & no seg_topic_label backfill ---
+    seg_v22 = [
+        {
+            "agent": "main",
+            "session_id": "sess-v22",
+            "session_key": "agent:main:discord:channel:v22",
+            "channel": "discord",
+            "chat_type": "channel",
+            "event_id": "ev-v22-1",
+            "seq": 1,
+            "ts": "2026-04-06T10:00:00+00:00",
+            "date_et": "2026-04-06",
+            "message_role": "assistant",
+            "speaker": {"sender_id_hash": "agent:main", "name": "Eve", "is_owner": False, "role": "agent"},
+            "text": "\n".join(
+                [
+                    by_id["v21_676e010b7206"]["quote"],
+                    by_id["v21_b64e8dd14d8e"]["quote"],
+                    by_id["v21_e0955af6436b"]["quote"],
+                    by_id["v21_923ce4b11825"]["quote"],
+                    by_id["v21_030732b1fda5"]["quote"],
+                ]
+            ),
+        }
+    ]
+    llm_cards_v22 = []
+    for cid in (
+        "v21_676e010b7206",
+        "v21_b64e8dd14d8e",
+        "v21_e0955af6436b",
+        "v21_923ce4b11825",
+        "v21_030732b1fda5",
+    ):
+        item = deepcopy(by_id[cid])
+        item["quote_event_id"] = "ev-v22-1"
+        if cid == "v21_676e010b7206":
+            # Model omitted card topic_label while segment-level topic_label is set
+            item["topic_label"] = ""
+        llm_cards_v22.append(item)
+
+    mock_assist_v22 = create_autospec(
+        ex.assist_json,
+        return_value=AssistResult(
+            ok=True,
+            status="ok",
+            data={
+                "category": "research",
+                "topic_label": "法拉帝 (9638.HK / YACHT.MI)",
+                "cards": llm_cards_v22,
+            },
+            model="gemini-4-argon-medium-oauth",
+            usage={"input_tokens": 400, "output_tokens": 200, "total_tokens": 600},
+        ),
+    )
+    monkeypatch.setattr(ex, "assist_json", mock_assist_v22)
+
+    out_v22 = await ex.extract_segment_cards(seg_v22)
+    assert out_v22.ok is True
+    assert len(out_v22.cards) == 5
+    by_q = {c["quote"]: c for c in out_v22.cards}
+    # Item 1: `topic_label` is NOT backfilled from `seg_topic_label` ("法拉帝 (9638.HK / YACHT.MI)")
+    assert by_q[by_id["v21_676e010b7206"]["quote"]]["topic_label"] == ""
+    assert out_v22.cards_flagged_unsupported_names == 2
+    assert out_v22.cards_flagged_unsupported_conclusion == 1
+    assert out_v22.currencies_stripped == 7
+    assert out_v22.tickers_backfilled == 2
+    assert out_v22.types_corrected >= 2
+
+    batch_v22 = await archive_cli.process_weekly_batch(
+        [dict(ev) for ev in seg_v22],
+        mode="run",
+        window_start=date(2026, 4, 6),
+        window_end=date(2026, 4, 6),
+        limiter=archive_cli.HourlyTokenBudgetLimiter(100_000),
+        extractor_model="gemini-4-argon-medium-oauth",
+        prompt_version="conv_card_v2_2",
+        dry_run=True,
+    )
+    assert batch_v22["cards_flagged_unsupported_names"] == 2
+    assert batch_v22["cards_flagged_unsupported_conclusion"] == 1
+    assert batch_v22["currencies_stripped"] == 7
+    assert batch_v22["tickers_backfilled"] == 2
+    assert batch_v22["types_corrected"] >= 2
+
+
+@pytest.mark.asyncio
+async def test_conv_card_v2_3_audit_regressions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """v2.3 regression suite driven by `fixtures/conv_cards_v2_2_audit_regressions.json`:
+    1. `backfill_tickers_from_quote` only backfills companies present in `claim` or `topic_label`
+       (never whole-quote collateral companies like NOW/PANW/HUBS on `v22_3bb06b5dee29`, 0981.HK on
+       `v22_9bd5b2c7e788`, GOOGL on `v22_0b0936821124`/`v22_8b5b1e3a0dd5`, or customer TSLA on `v22_e84937510fc1`).
+    2. Private companies (`SPCX`, `PRIVATE_COMPANIES`) and trading channels (`TRADING_CHANNEL_NAMES` /
+       `TRADING_CHANNEL_TICKERS` unless discussed in `claim`) are never backfilled and are dropped when
+       supplied by the model (`v22_0b0936821124`, `v22_bf1790fd1ca2`, `v22_f02b05b12ff5`, vs `v22_facfd532208d`).
+    3. English exclusion phrases (`excluding`, `excludes`, `not used`, `doesn't use`, `don't use`,
+       `does not use`, `not included`, `ex-`) drop/prevent backfill of excluded companies (`v22_e84937510fc1`).
+    4. Expanded `SUPPLEMENTAL_TICKER_ALIASES` (`GTLB`, `ESTC`, `7581.T`, `600809.SS`, `000568.SZ`,
+       `002304.SZ`, `300413.SZ` with `芒果` ambiguity guard, `300308.SZ` Innolight, `002463.SZ` WUS,
+       `002371.SZ` Naura, `688012.SS` AMEC).
+    5. False-positive flag fixes: English number words (`one`..`twelve`, `a dozen`, `half`, `first`..`fourth`
+       before `quarter`, `and <num> other` -> `num + 1` on `v22_9bd5b2c7e788`, `v22_e84937510fc1`),
+       short token `.` boundary (`K2` in `Kimi K2.6` on `v22_691cfefe91e4`), and acronym-to-phrase
+       support (`CPO` <- `co-packaged optics` on `v22_511e15a42663`).
+    6. Bidirectional `correct_card_type_by_keywords` (`opinion`/`model_assumption -> estimate` on
+       `v22_ea4a5347e261` and `v22_ab31dc53f356`; `estimate -> fact` on `v22_cd43110a06ce`;
+       `unverified_source` flagging with `confidence <= 0.5` on `v22_d58e0441d511`).
+    7. `topic_label` strips `FORBIDDEN_CONCLUSION_WORDS_TABLE` (`止跌` on `v22_6b9dca9e63a0`).
+    8. `strip_unsupported_currency_from_unit` clears `倍`/`x` when the sentence lacks `倍`/`x`/`times`
+       (`v22_691cfefe91e4`), plus prompt rules for full-name-vs-acronym and weight/ratio units.
+    9. `prompt_version == 'conv_card_v2_3'` and `tickers_dropped_private` / `tickers_dropped_channel`
+       in weekly batch summaries.
+    """
+    from copy import deepcopy
+    from src.dalton.conversations import extractor as ex
+    from src.dalton.settings import DaltonConversationsConfig, get_dalton_settings
+
+    get_dalton_settings.cache_clear()
+    assert DaltonConversationsConfig().prompt_version == "conv_card_v2_3"
+    assert get_dalton_settings().conversations.prompt_version == "conv_card_v2_3"
+
+    prompt = ex.EXTRACTION_SYSTEM_INSTRUCTIONS
+    assert "quote 里写的是英文全称时，claim 不要自行缩写成 quote 里没有出现的缩写词" in prompt
+    assert "权重、占比、系数（如“权重为 0.25”）不要把 unit 写成“倍”" in prompt
+
+    fixture_path = (
+        Path(__file__).resolve().parent / "fixtures" / "conv_cards_v2_2_audit_regressions.json"
+    )
+    by_id = {c["card_id"]: c for c in json.loads(fixture_path.read_text(encoding="utf-8"))}
+    assert len(by_id) == 19
+
+    # --- Item 1 & Item 4: Subject-only ticker backfill + expanded alias table ---
+    ex._load_ticker_company_aliases.cache_clear()
+
+    # v22_3bb06b5dee29: GitLab in claim/topic -> GTLB backfilled; NOW/PANW/HUBS in quote only -> NOT backfilled
+    c_gtlb = deepcopy(by_id["v22_3bb06b5dee29"])
+    res_gtlb = ex.validate_candidate_card(c_gtlb)
+    assert res_gtlb.tickers == ["GTLB"]
+    assert res_gtlb.tickers_backfilled == 1
+
+    # v22_9bd5b2c7e788: `three quarters ahead of plan` supports `三个季度`; Naura/AMEC/Alibaba backfilled; SMIC (0981.HK) NOT backfilled
+    c_9bd = deepcopy(by_id["v22_9bd5b2c7e788"])
+    res_9bd = ex.validate_candidate_card(c_9bd)
+    assert res_9bd.unsupported_claim_numbers == []
+    assert res_9bd.confidence == 0.85
+    assert "0981.HK" not in res_9bd.tickers and "688981.SS" not in res_9bd.tickers
+    assert {"BABA", "002371.SZ", "688012.SS"}.issubset(set(res_9bd.tickers))
+
+    # v22_8b5b1e3a0dd5: Meta in claim/topic -> META backfilled; Google in quote only -> GOOGL NOT backfilled
+    c_8b5 = deepcopy(by_id["v22_8b5b1e3a0dd5"])
+    res_8b5 = ex.validate_candidate_card(c_8b5)
+    assert res_8b5.tickers == ["META"]
+    assert "GOOGL" not in res_8b5.tickers
+
+    # v22_8f73b698883f: 汾酒/泸州老窖(老窖)/洋河 -> 600809.SS, 000568.SZ, 002304.SZ backfilled
+    c_8f7 = deepcopy(by_id["v22_8f73b698883f"])
+    res_8f7 = ex.validate_candidate_card(c_8f7)
+    assert {"600809.SS", "000568.SZ", "002304.SZ"}.issubset(set(res_8f7.tickers))
+    assert res_8f7.tickers_backfilled == 3
+
+    # v22_1d3de3669d94 vs v22_31ad8112a9ec: `芒果超媒`/`芒果TV` backfills 300413.SZ; bare `芒果` without `超媒`/`TV`/`台` does not, nor is it flagged in unsupported_names
+    c_1d3 = deepcopy(by_id["v22_1d3de3669d94"])
+    res_1d3 = ex.validate_candidate_card(c_1d3)
+    assert res_1d3.tickers == ["300413.SZ"]
+    assert res_1d3.tickers_backfilled == 1
+
+    c_31a = deepcopy(by_id["v22_31ad8112a9ec"])
+    res_31a = ex.validate_candidate_card(c_31a)
+    assert res_31a.tickers == []
+    assert res_31a.unsupported_names == []
+    # When quote has `芒果` and claim has `芒果超媒`, `300413.SZ` still validates if supplied
+    c_31a_with_super = deepcopy(by_id["v22_31ad8112a9ec"])
+    c_31a_with_super["claim"] = "UBS Evidence Lab显示芒果TV 2Q26与7M26平均MAU同比分别降11%与13%。"
+    c_31a_with_super["quote"] = "但 UBS Evidence Lab 显示芒果TV 2Q26 与 7M26 平均 MAU 同比分别降 11% 与 13%"
+    assert ex.validate_candidate_card(c_31a_with_super).tickers == ["300413.SZ"]
+    assert not ex._alias_matches_in_text("芒果", "今天买了一箱海南芒果")
+
+    # v22_b4db5f4c7ca0: Elastic -> ESTC backfilled; `原预期内` does NOT flip `estimate` to `fact`
+    c_b4d = deepcopy(by_id["v22_b4db5f4c7ca0"])
+    res_b4d = ex.validate_candidate_card(c_b4d)
+    assert res_b4d.tickers == ["ESTC"]
+    assert res_b4d.tickers_backfilled == 1
+    assert c_b4d["type"] == "estimate"
+    assert res_b4d.types_corrected == 0
+
+    # --- Item 2: Private companies (`SPCX`) and trading channels (`IBKR` vs `FUTU`) ---
+    c_0b0 = deepcopy(by_id["v22_0b0936821124"])
+    res_0b0 = ex.validate_candidate_card(c_0b0)
+    assert res_0b0.tickers == []
+    assert res_0b0.tickers_dropped == 1
+    assert res_0b0.tickers_dropped_private == 1
+
+    c_bf1 = deepcopy(by_id["v22_bf1790fd1ca2"])
+    res_bf1 = ex.validate_candidate_card(c_bf1)
+    assert res_bf1.tickers == ["TSM", "INTC"]
+    assert res_bf1.tickers_dropped == 1
+    assert res_bf1.tickers_dropped_private == 1
+
+    c_f02 = deepcopy(by_id["v22_f02b05b12ff5"])
+    res_f02 = ex.validate_candidate_card(c_f02)
+    assert res_f02.tickers == ["IB01", "VDST", "BOXX", "SGOV"]
+    assert res_f02.tickers_dropped == 1
+    assert res_f02.tickers_dropped_channel == 1
+
+    c_fac = deepcopy(by_id["v22_facfd532208d"])
+    res_fac = ex.validate_candidate_card(c_fac)
+    assert "FUTU" in res_fac.tickers
+    assert res_fac.tickers_dropped_channel == 0
+
+    # --- Item 3 & Item 5a: English exclusions (`doesn't use`) & `CMBI and three other` (=4) + `Two items` (=2) on `v22_e84937510fc1` ---
+    c_e84 = deepcopy(by_id["v22_e84937510fc1"])
+    res_e84 = ex.validate_candidate_card(c_e84)
+    assert res_e84.unsupported_claim_numbers == []
+    assert res_e84.confidence == 0.85
+    assert "5803.T" not in res_e84.tickers and "6857.T" not in res_e84.tickers
+    assert "TSLA" not in res_e84.tickers
+    assert {"0700.HK", "002028.SZ", "002050.SZ"}.issubset(set(res_e84.tickers))
+
+    # --- Item 5b & Item 8: `K2` in `Kimi K2.6` not flagged, and `unit: "倍"` on weight `0.25` cleared (`v22_691cfefe91e4`) ---
+    c_691 = deepcopy(by_id["v22_691cfefe91e4"])
+    res_691 = ex.validate_candidate_card(c_691)
+    assert res_691.unsupported_names == []
+    assert res_691.confidence == 0.85
+    weight_fig = next(f for f in res_691.figures if f["value"] == 0.25)
+    assert weight_fig["unit"] == ""
+    assert res_691.currencies_stripped == 1
+
+    # --- Item 5c & Item 4: `CPO` supported by `co-packaged optics`, and Innolight/WUS backfilled (`v22_511e15a42663`) ---
+    c_511 = deepcopy(by_id["v22_511e15a42663"])
+    res_511 = ex.validate_candidate_card(c_511)
+    assert res_511.unsupported_names == []
+    assert res_511.confidence == 0.85
+    assert {"300308.SZ", "002463.SZ"} == set(res_511.tickers)
+    assert res_511.tickers_backfilled == 2
+    assert c_511["type"] == "opinion"
+    assert res_511.types_corrected == 0
+
+    # --- Item 6: Bidirectional `type` correction & `unverified_source` flagging ---
+    c_ea4 = deepcopy(by_id["v22_ea4a5347e261"])
+    res_ea4 = ex.validate_candidate_card(c_ea4)
+    assert c_ea4["type"] == "estimate"
+    assert res_ea4.types_corrected == 1
+
+    c_ab3 = deepcopy(by_id["v22_ab31dc53f356"])
+    res_ab3 = ex.validate_candidate_card(c_ab3)
+    assert c_ab3["type"] == "estimate"
+    assert res_ab3.types_corrected == 1
+
+    c_cd4 = deepcopy(by_id["v22_cd43110a06ce"])
+    res_cd4 = ex.validate_candidate_card(c_cd4)
+    assert c_cd4["type"] == "fact"
+    assert res_cd4.types_corrected == 1
+    assert res_cd4.tickers == ["7581.T"]
+    assert res_cd4.tickers_backfilled == 1
+
+    c_d58 = deepcopy(by_id["v22_d58e0441d511"])
+    res_d58 = ex.validate_candidate_card(c_d58)
+    assert c_d58["type"] == "fact"
+    assert res_d58.types_corrected == 0
+    assert res_d58.unverified_source is True
+    assert res_d58.confidence == 0.5
+    assert any(
+        f["metric"] == "_verification" and f["value"] == "unverified_source"
+        for f in res_d58.figures
+    )
+
+    # --- Item 7: `topic_label` strips `FORBIDDEN_CONCLUSION_WORDS_TABLE` (`止跌` on `v22_6b9dca9e63a0`) ---
+    c_6b9 = deepcopy(by_id["v22_6b9dca9e63a0"])
+    res_6b9 = ex.validate_candidate_card(c_6b9)
+    assert res_6b9.confidence == 0.4
+    assert "止跌" in res_6b9.unsupported_conclusions
+    assert "止跌" not in c_6b9["topic_label"]
+    assert c_6b9["topic_label"] == "再鼎医药技术信号"
+
+    # --- Item 9: `tickers_dropped_private` and `tickers_dropped_channel` in `extract_segment_cards` & `process_weekly_batch` ---
+    seg_v23 = [
+        {
+            "agent": "main",
+            "session_id": "sess-v23",
+            "session_key": "agent:main:discord:channel:v23",
+            "channel": "discord",
+            "chat_type": "channel",
+            "event_id": "ev-v23-1",
+            "seq": 1,
+            "ts": "2026-04-06T10:00:00+00:00",
+            "date_et": "2026-04-06",
+            "message_role": "assistant",
+            "speaker": {"sender_id_hash": "agent:main", "name": "Eve", "is_owner": False, "role": "agent"},
+            "text": "\n".join(
+                [
+                    by_id["v22_0b0936821124"]["quote"],
+                    by_id["v22_f02b05b12ff5"]["quote"],
+                    by_id["v22_ea4a5347e261"]["quote"],
+                ]
+            ),
+        }
+    ]
+    llm_cards_v23 = []
+    for cid in ("v22_0b0936821124", "v22_f02b05b12ff5", "v22_ea4a5347e261"):
+        item = deepcopy(by_id[cid])
+        item["quote_event_id"] = "ev-v23-1"
+        if cid == "v22_ea4a5347e261" and not item.get("cited_sources"):
+            item["cited_sources"] = ["卖方口径"]
+        llm_cards_v23.append(item)
+
+    mock_assist_v23 = create_autospec(
+        ex.assist_json,
+        return_value=AssistResult(
+            ok=True,
+            status="ok",
+            data={
+                "category": "research",
+                "topic_label": "v2.3回归测试",
+                "cards": llm_cards_v23,
+            },
+            model="gemini-4-argon-medium-oauth",
+            usage={"input_tokens": 300, "output_tokens": 150, "total_tokens": 450},
+        ),
+    )
+    monkeypatch.setattr(ex, "assist_json", mock_assist_v23)
+
+    out_v23 = await ex.extract_segment_cards(seg_v23)
+    assert out_v23.ok is True
+    assert out_v23.tickers_dropped_private == 1
+    assert out_v23.tickers_dropped_channel == 1
+    assert out_v23.types_corrected >= 1
+
+    batch_v23 = await archive_cli.process_weekly_batch(
+        [dict(ev) for ev in seg_v23],
+        mode="run",
+        window_start=date(2026, 4, 6),
+        window_end=date(2026, 4, 6),
+        limiter=archive_cli.HourlyTokenBudgetLimiter(100_000),
+        extractor_model="gemini-4-argon-medium-oauth",
+        prompt_version="conv_card_v2_3",
+        dry_run=True,
+    )
+    assert batch_v23["tickers_dropped_private"] == 1
+    assert batch_v23["tickers_dropped_channel"] == 1
+    assert batch_v23["types_corrected"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_conv_card_v2_3_round6_review_fixes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 6 code review fixes (Items 1-14) and lead-reproduced cases (prompt_version kept at `conv_card_v2_3`)."""
+    import time as time_mod
+    from src.dalton.conversations import extractor as ex
+
+    # --- Item 1: `estimate -> fact` requires explicit realized phrases and uses shared forward keyword table ---
+    assert ex.correct_card_type_by_keywords("estimate", "收入增长10%", "实际收入有望增长10%") == ("estimate", 0)
+    assert ex.correct_card_type_by_keywords("estimate", "利润增长", "实际上明年利润将增长15%") == ("estimate", 0)
+    assert ex.correct_card_type_by_keywords("estimate", "实控人", "实际控制人计划增持") == ("estimate", 0)
+    assert ex.correct_card_type_by_keywords("estimate", "增速12-16%", "仅落在12%-16%的原预期内") == ("estimate", 0)
+    assert ex.correct_card_type_by_keywords("estimate", "增速12-16%", "落在原预期区间") == ("estimate", 0)
+    assert ex.correct_card_type_by_keywords("estimate", "Q3营收增长20%", "财报显示Q3营收已实现同比增长20%") == ("fact", 1)
+    assert ex.correct_card_type_by_keywords("estimate", "Q3利润10亿", "已公布Q3实际录得净利润10亿元") == ("fact", 1)
+    assert ex.correct_card_type_by_keywords("estimate", "Q3营收增长20%", "已实现Q3增长20%，全年expected to增长25%") == (
+        "estimate",
+        0,
+    )
+
+    # --- Item 2: `fact -> estimate` masks realized-vs-expectation phrases and removes `目标价`/`price target` ---
+    assert ex.correct_card_type_by_keywords("fact", "Q3营收超预期", "Q3营收同比增长12%，超预期") == ("fact", 0)
+    for realized_exp_phrase in (
+        "好于预期",
+        "低于预期",
+        "不及预期",
+        "符合预期",
+        "beat target",
+        "missed the target",
+        "in line with target",
+    ):
+        assert ex.correct_card_type_by_keywords(
+            "fact",
+            f"Q3业绩{realized_exp_phrase}",
+            f"Q3 revenue {realized_exp_phrase}",
+        ) == ("fact", 0)
+    assert ex.correct_card_type_by_keywords("fact", "上调目标价至100元", "大摩上调目标价至100元") == ("fact", 0)
+    assert ex.correct_card_type_by_keywords("fact", "Price target raised to $100", "Morgan Stanley raised price target to $100") == (
+        "fact",
+        0,
+    )
+
+    # --- Item 3: `opinion`/`model_assumption -> estimate` requires explicit third-party forecast + verb + number ---
+    assert ex.correct_card_type_by_keywords("opinion", "维持持有", "already consensus, holds, not adds") == (
+        "opinion",
+        0,
+    )
+    assert ex.correct_card_type_by_keywords("opinion", "市场已达成共识", "这已是共识，市场共识是看多") == ("opinion", 0)
+    assert ex.correct_card_type_by_keywords("opinion", "卖方预计明年增长20%", "卖方预计2026年营收增长20%") == (
+        "estimate",
+        1,
+    )
+    assert ex.correct_card_type_by_keywords("opinion", "一致预期100亿", "市场一致预期为100亿元") == ("estimate", 1)
+    assert ex.correct_card_type_by_keywords("opinion", "Consensus revenue", "Consensus expects revenue of $10B") == (
+        "estimate",
+        1,
+    )
+    assert ex.correct_card_type_by_keywords("model_assumption", "Consensus EPS", "Consensus is $5.20") == (
+        "estimate",
+        1,
+    )
+
+    # --- Item 4: Re-enforce source citation check once after keyword-based type correction ---
+    seg_item4 = [
+        {
+            "agent": "main",
+            "session_id": "sess-r6-item4",
+            "session_key": "agent:main:discord:channel:r6",
+            "channel": "discord",
+            "chat_type": "channel",
+            "event_id": "ev-r6-1",
+            "seq": 1,
+            "ts": "2026-10-20T10:00:00+00:00",
+            "date_et": "2026-10-20",
+            "message_role": "assistant",
+            "speaker": {"sender_id_hash": "agent:main", "name": "Eve", "is_owner": False, "role": "agent"},
+            "text": "卖方预计2026年公司营收增长20%。",
+        }
+    ]
+    orig_assist_json = ex.assist_json
+    mock_assist_item4 = create_autospec(
+        orig_assist_json,
+        return_value=AssistResult(
+            ok=True,
+            status="ok",
+            data={
+                "category": "research",
+                "topic_label": "营收预测",
+                "cards": [
+                    {
+                        "type": "estimate",
+                        "topic_label": "营收预测",
+                        "claim": "卖方预计2026年公司营收增长20%。",
+                        "tickers": [],
+                        "entities": [],
+                        "sectors": [],
+                        "figures": [],
+                        "quote": "卖方预计2026年公司营收增长20%。",
+                        "quote_event_id": "ev-r6-1",
+                        "cited_sources": [],
+                        "confidence": None,
+                    }
+                ],
+            },
+            model="gemini-4-argon-medium-oauth",
+            usage={"input_tokens": 100, "output_tokens": 50, "total_tokens": 150},
+        ),
+    )
+    monkeypatch.setattr(ex, "assist_json", mock_assist_item4)
+    out_item4 = await ex.extract_segment_cards(seg_item4)
+    assert out_item4.ok is True
+    assert len(out_item4.cards) == 1
+    assert out_item4.cards[0]["type"] == "opinion"
+    assert out_item4.cards[0]["confidence"] == 0.8
+
+    # --- Item 5: Linear clause-scoped exclusion, English verb object exclusion, and <0.1s on 8,000 chars ---
+    spans_cn, cleaned_cn = ex._extract_excluded_spans_and_clean_quote("腾讯维持买入，藤仓数据未予采用。")
+    assert "腾讯" in cleaned_cn
+    assert not any("腾讯" in s for s in spans_cn)
+    assert "藤仓" not in cleaned_cn
+    assert any("藤仓" in s for s in spans_cn)
+    assert ex.validate_tickers_against_quote(["0700.HK", "5803.T"], "腾讯维持买入，藤仓数据未予采用。") == (
+        ["0700.HK"],
+        1,
+    )
+
+    spans_en, cleaned_en = ex._extract_excluded_spans_and_clean_quote(
+        "Nvidia does not use Intel chips. AMD sales grew."
+    )
+    assert "Nvidia" in cleaned_en
+    assert "AMD" in cleaned_en
+    assert "Intel" not in cleaned_en
+    assert any("Intel" in s for s in spans_en)
+    assert not any("Nvidia" in s or "AMD" in s for s in spans_en)
+    assert ex.validate_tickers_against_quote(
+        ["NVDA", "INTC", "AMD"], "Nvidia does not use Intel chips. AMD sales grew."
+    ) == (["NVDA", "AMD"], 1)
+
+    long_no_excl = ("Nvidia Inc. reported U.S. revenue of 3.5 billion for 0700.HK peers. " * 125)[:8000]
+    assert len(long_no_excl) == 8000
+    t_start = time_mod.perf_counter()
+    long_spans, long_cleaned = ex._extract_excluded_spans_and_clean_quote(long_no_excl)
+    elapsed_excl = time_mod.perf_counter() - t_start
+    assert elapsed_excl < 0.1
+    assert long_spans == []
+    assert "Nvidia" in long_cleaned
+
+    # --- Item 6: Same-sentence period check splits on English period `. ` ---
+    en_two_sents = "2025 revenue was 10 million. Profit was 5 million."
+    assert ex.is_period_supported_by_quote("2025", en_two_sents, value=10, unit="million") is True
+    assert ex.is_period_supported_by_quote("2025", en_two_sents, value=5, unit="million") is False
+    res_profit_period = ex.validate_candidate_card(
+        {
+            "claim": "Profit was 5 million.",
+            "figures": [{"metric": "profit", "value": 5, "unit": "million", "period": "2025"}],
+            "tickers": [],
+        },
+        quote=en_two_sents,
+    )
+    assert res_profit_period.periods_cleared == 1
+    assert res_profit_period.figures[0]["period"] == ""
+
+    # --- Item 7: English number words (`half` -> `0.5` only; `one-time`/`one-off`/`half-year`/`one of` ignored; `has_unit=True` with unit) ---
+    half_nums = ex.extract_quote_supported_numbers("Valuation was cut in half.")
+    assert "0.5" in half_nums
+    assert "50" not in half_nums
+    assert (
+        ex.extract_quote_supported_numbers(
+            "Excluded one-time and one-off items in the half-year report for one of the segments."
+        )
+        == set()
+    )
+    assert ex.extract_claim_numbers("Revenue grew five million and margin rose two %.") == ["5", "2"]
+    res_en_unit_num = ex.validate_candidate_card(
+        {"claim": "Revenue grew five million.", "figures": [], "tickers": []},
+        quote="Revenue grew steadily.",
+    )
+    assert res_en_unit_num.unsupported_claim_numbers == ["5"]
+    assert res_en_unit_num.confidence == 0.4
+
+    # --- Item 8: Normalized currency units (`USD_bn`, `CNY_yi`, `RMB_mn`) & strict RMB matching (`10亿美元` != RMB) ---
+    assert ex.strip_unsupported_currency_from_unit("USD_bn", 10, "公司收入 10 亿。") == ("bn", True)
+    assert ex.strip_unsupported_currency_from_unit("CNY_yi", 10, "公司收入 10 亿。") == ("yi", True)
+    assert ex.strip_unsupported_currency_from_unit("RMB_mn", 50, "公司收入 50 百万。") == ("mn", True)
+    assert ex.strip_unsupported_currency_from_unit("CNY_yi", 10, "公司收入 10 亿美元。") == ("yi", True)
+    assert ex.strip_unsupported_currency_from_unit("RMB_mn", 10, "公司收入 10 亿美元。") == ("mn", True)
+    assert ex.strip_unsupported_currency_from_unit("亿元", 10, "公司收入 10 亿美元。") == ("亿", True)
+    assert ex.strip_unsupported_currency_from_unit("人民币", 10, "公司收入 10 亿美元。") == ("", True)
+    assert ex.strip_unsupported_currency_from_unit("元", 100, "售价 100 港元。") == ("", True)
+    assert ex.strip_unsupported_currency_from_unit("元", 100, "售价新台币 100 元。") == ("", True)
+    assert ex.strip_unsupported_currency_from_unit("CNY_yi", 10, "公司收入 10 亿元。") == ("CNY_yi", False)
+    assert ex.strip_unsupported_currency_from_unit("CNY_yi", 10, "公司收入 10 亿元人民币。") == ("CNY_yi", False)
+    assert ex.strip_unsupported_currency_from_unit("RMB_mn", 50, "净现金 RMB 50mn。") == ("RMB_mn", False)
+
+    # --- Item 9: Clearing `倍` returns `was_stripped=True` and increments `currencies_stripped` ---
+    assert ex.strip_unsupported_currency_from_unit("倍", 0.25, "权重为 0.25。") == ("", True)
+    res_bei = ex.validate_candidate_card(
+        {
+            "claim": "权重为 0.25。",
+            "figures": [{"metric": "weight", "value": 0.25, "unit": "倍", "period": ""}],
+            "tickers": [],
+        },
+        quote="权重为 0.25。",
+    )
+    assert res_bei.currencies_stripped == 1
+    assert res_bei.figures[0]["unit"] == ""
+
+    # --- Item 10: Trading channel `买` narrowed to channel context; `富途宣布买回股份` keeps FUTU ---
+    res_futu_buyback = ex.validate_candidate_card(
+        {
+            "claim": "富途宣布买回股份，维持买入评级。",
+            "figures": [],
+            "tickers": ["FUTU"],
+        },
+        quote="富途宣布买回股份，多家券商维持富途买入评级。",
+    )
+    assert res_futu_buyback.tickers == ["FUTU"]
+    assert res_futu_buyback.tickers_dropped_channel == 0
+
+    res_futu_channel = ex.validate_candidate_card(
+        {
+            "claim": "在富途买美股很方便。",
+            "figures": [],
+            "tickers": ["FUTU"],
+        },
+        quote="在富途买美股很方便，开户即可下单。",
+    )
+    assert res_futu_channel.tickers == []
+    assert res_futu_channel.tickers_dropped_channel == 1
+
+    # --- Item 11: Source institution backfilled when it is the card's subject ---
+    res_jpm_subj = ex.validate_candidate_card(
+        {
+            "claim": "摩根大通Q3净利息收入增长10%。",
+            "topic_label": "摩根大通Q3业绩",
+            "figures": [],
+            "tickers": [],
+        },
+        quote="摩根大通Q3净利息收入增长10%。",
+    )
+    assert res_jpm_subj.tickers == ["JPM"]
+    assert res_jpm_subj.tickers_backfilled == 1
+
+    res_gs_subj = ex.validate_candidate_card(
+        {
+            "claim": "高盛Q3投行业务收入增长25%。",
+            "topic_label": "高盛Q3业绩",
+            "figures": [],
+            "tickers": [],
+        },
+        quote="高盛Q3投行业务收入增长25%。",
+    )
+    assert res_gs_subj.tickers == ["GS"]
+    assert res_gs_subj.tickers_backfilled == 1
+
+    res_gs_src = ex.validate_candidate_card(
+        {
+            "claim": "According to Goldman, Apple iPhone revenue grew 8%.",
+            "topic_label": "Apple iPhone revenue",
+            "figures": [],
+            "tickers": [],
+        },
+        quote="According to Goldman, Apple iPhone revenue grew 8%.",
+    )
+    assert res_gs_src.tickers == ["AAPL"]
+    assert "GS" not in res_gs_src.tickers
+
+    # --- Item 12: Proper-noun check fixes (sentence-initial financial words, acronym vs `market share`, Traditional/Simplified Chinese) ---
+    res_en_common = ex.validate_candidate_card(
+        {
+            "claim": "Revenue grew 10%. Sales and Profit expanded. Margin reached 25%.",
+            "topic_label": "Revenue and Margin",
+            "figures": [],
+            "tickers": [],
+        },
+        quote="total top-line up 10%, bottom-line up, profitability at 25%.",
+    )
+    assert res_en_common.unsupported_names == []
+
+    assert ex._is_acronym_supported_by_quote_phrase("MS", "market share expanded to 30%") is False
+    res_ms_vs_mkt_share = ex.validate_candidate_card(
+        {
+            "claim": "MS预计市场份额提升至30%。",
+            "topic_label": "市场份额",
+            "figures": [],
+            "tickers": [],
+        },
+        quote="market share expanded to 30%.",
+    )
+    assert "MS" in res_ms_vs_mkt_share.unsupported_names
+
+    res_trad_simp_1 = ex.validate_candidate_card(
+        {
+            "claim": "腾讯Q3游戏收入同比增长12%。",
+            "topic_label": "腾讯游戏",
+            "figures": [],
+            "tickers": [],
+        },
+        quote="騰訊Q3遊戲收入同比增長12%。",
+    )
+    assert res_trad_simp_1.unsupported_names == []
+    assert res_trad_simp_1.tickers == ["0700.HK"]
+
+    res_trad_simp_2 = ex.validate_candidate_card(
+        {
+            "claim": "騰訊Q3遊戲收入同比增長12%。",
+            "topic_label": "騰訊遊戲",
+            "figures": [],
+            "tickers": [],
+        },
+        quote="腾讯Q3游戏收入同比增长12%。",
+    )
+    assert res_trad_simp_2.unsupported_names == []
+    assert res_trad_simp_2.tickers == ["0700.HK"]
+
+    # --- Item 13: Private company drop counters match between `validate_candidate_card` and `extract_segment_cards` ---
+    priv_card_input = {
+        "type": "opinion",
+        "topic_label": "SpaceX发射频次",
+        "claim": "SpaceX全年星舰发射频次继续提升。",
+        "tickers": ["SPCX", "TSLA"],
+        "entities": [],
+        "sectors": [],
+        "figures": [],
+        "quote": "SpaceX 与 Tesla 协同推进，全年星舰发射频次继续提升。",
+        "quote_event_id": "ev-priv-1",
+        "cited_sources": [],
+        "confidence": 0.85,
+    }
+    direct_priv_res = ex.validate_candidate_card(
+        {
+            "claim": priv_card_input["claim"],
+            "topic_label": priv_card_input["topic_label"],
+            "type": priv_card_input["type"],
+            "figures": [],
+            "tickers": list(priv_card_input["tickers"]),
+            "quote": priv_card_input["quote"],
+            "cited_sources": [],
+            "confidence": 0.85,
+        },
+        quote=priv_card_input["quote"],
+    )
+    seg_priv = [
+        {
+            "agent": "main",
+            "session_id": "sess-priv",
+            "session_key": "agent:main:discord:channel:priv",
+            "channel": "discord",
+            "chat_type": "channel",
+            "event_id": "ev-priv-1",
+            "seq": 1,
+            "ts": "2026-10-20T10:00:00+00:00",
+            "date_et": "2026-10-20",
+            "message_role": "user",
+            "speaker": {"sender_id_hash": "owner", "name": "Owner", "is_owner": True, "role": "owner"},
+            "text": priv_card_input["quote"],
+        }
+    ]
+    monkeypatch.setattr(
+        ex,
+        "assist_json",
+        create_autospec(
+            orig_assist_json,
+            return_value=AssistResult(
+                ok=True,
+                status="ok",
+                data={"category": "research", "topic_label": "SpaceX", "cards": [dict(priv_card_input)]},
+                model="gemini-4-argon-medium-oauth",
+                usage={"input_tokens": 80, "output_tokens": 40, "total_tokens": 120},
+            ),
+        ),
+    )
+    seg_priv_out = await ex.extract_segment_cards(seg_priv)
+    assert direct_priv_res.tickers_dropped == seg_priv_out.tickers_dropped == 1
+    assert direct_priv_res.tickers_dropped_private == seg_priv_out.tickers_dropped_private == 1
+    assert direct_priv_res.tickers == seg_priv_out.cards[0]["tickers"] == ["TSLA"]
+
+    # --- Item 14: `lru_cache` on alias regex, `资金流` in `FORBIDDEN_CONCLUSION_WORDS_TABLE` ---
+    assert hasattr(ex._compiled_alias_regex, "cache_info")
+    assert "资金流" in ex.FORBIDDEN_CONCLUSION_WORDS_TABLE
+    res_zijinliu = ex.validate_candidate_card(
+        {
+            "claim": "该板块近期资金流明显改善。",
+            "topic_label": "板块资金流分析",
+            "figures": [],
+            "tickers": [],
+        },
+        quote="该板块近期成交额温和放大。",
+    )
+    assert "资金流" in res_zijinliu.unsupported_conclusions
+    assert res_zijinliu.confidence == 0.4
+    assert "资金流" not in res_zijinliu.figures[0].get("metric", "")
+
+
+def test_round7_item1_third_party_forecast_no_early_return() -> None:
+    """Round 7 Item 1: `THIRD_PARTY_FORECAST_PHRASES_TABLE` does not early-return without checking
+    subject + forecast verb + number in the same clause, and clauses with `已是`/`already` are excluded.
+    """
+    from src.dalton.conversations import extractor as ex
+
+    assert ex.correct_card_type_by_keywords("opinion", "一致预期看多", "consensus is bullish") == ("opinion", 0)
+    assert ex.correct_card_type_by_keywords("opinion", "卖方预计好转", "卖方预计会更好") == ("opinion", 0)
+    assert ex.correct_card_type_by_keywords("opinion", "一致预期100亿", "已是一致预期为100亿") == ("opinion", 0)
+    assert ex.correct_card_type_by_keywords("opinion", "Consensus $10B", "It is already consensus expects $10B") == (
+        "opinion",
+        0,
+    )
+    assert ex.correct_card_type_by_keywords("opinion", "卖方预计增长20%", "卖方预计2026年收入增长20%") == (
+        "estimate",
+        1,
+    )
+
+
+def test_round7_item2_realized_fact_phrases_do_not_veto_forward_estimates() -> None:
+    """Round 7 Item 2: `财报显示` and `法说会纪要` removed from `REALIZED_FACT_PHRASES_TABLE` so forward
+    estimates in filings/call notes flip from `fact` to `estimate`, while `已实现`/`已公布`/`实际录得` remain.
+    """
+    from src.dalton.conversations import extractor as ex
+
+    assert "财报显示" not in ex.REALIZED_FACT_PHRASES_TABLE
+    assert "法说会纪要" not in ex.REALIZED_FACT_PHRASES_TABLE
+    for kept_phrase in ("已实现", "已公布", "实际录得"):
+        assert kept_phrase in ex.REALIZED_FACT_PHRASES_TABLE
+
+    assert ex.correct_card_type_by_keywords(
+        "fact", "公司预计2026年收入增长20%", "财报显示公司预计2026年收入增长20%"
+    ) == ("estimate", 1)
+    assert ex.correct_card_type_by_keywords(
+        "fact", "明年营收预计增长20%", "法说会纪要：明年营收预计增长20%"
+    ) == ("estimate", 1)
+
+
+def test_round7_item3_institution_source_verbs_narrowed() -> None:
+    """Round 7 Item 3: Source institution verbs narrowed to `预计/称/认为/指出/表示/估计` and `according to <机构>`
+    (plus `在<机构>的研报/会上`), so `发布`/`上调`/`披露` keep or backfill the institution ticker.
+    """
+    from src.dalton.conversations import extractor as ex
+
+    for claim_and_quote, expected_ticker in [
+        ("高盛发布三季报", "GS"),
+        ("摩根大通上调股息至每股3美元", "JPM"),
+        ("高盛披露Q3净利润增长10%", "GS"),
+    ]:
+        res_bf = ex.validate_candidate_card(
+            {"claim": claim_and_quote, "topic_label": claim_and_quote, "figures": [], "tickers": []},
+            quote=claim_and_quote,
+        )
+        assert res_bf.tickers == [expected_ticker]
+        assert res_bf.tickers_backfilled == 1
+
+        res_keep = ex.validate_candidate_card(
+            {
+                "claim": claim_and_quote,
+                "topic_label": claim_and_quote,
+                "figures": [],
+                "tickers": [expected_ticker],
+            },
+            quote=claim_and_quote,
+        )
+        assert res_keep.tickers == [expected_ticker]
+        assert res_keep.tickers_dropped == 0
+
+    res_src = ex.validate_candidate_card(
+        {
+            "claim": "高盛预计英伟达收入增长",
+            "topic_label": "英伟达收入预测",
+            "figures": [],
+            "tickers": [],
+        },
+        quote="高盛预计英伟达收入增长",
+    )
+    assert res_src.tickers == ["NVDA"]
+    assert "GS" not in res_src.tickers
+
+
+def test_round7_item4_english_exclusion_passive_pronoun_and_comma() -> None:
+    """Round 7 Item 4: Passive `X are not used in/by Y` excludes subject X and keeps Y; pronoun object
+    (`Nvidia does not use them.`) does not exclude subject; comma-separated clause (`does not use Intel chips, AMD grew`)
+    keeps AMD.
+    """
+    from src.dalton.conversations import extractor as ex
+
+    assert ex.validate_tickers_against_quote(
+        ["NVDA", "INTC", "AMD"],
+        "Intel chips are not used in Nvidia servers. AMD sales grew.",
+    ) == (["NVDA", "AMD"], 1)
+
+    assert ex.validate_tickers_against_quote(
+        ["NVDA", "INTC"],
+        "Intel chips are not used by Nvidia.",
+    ) == (["NVDA"], 1)
+
+    assert ex.validate_tickers_against_quote(
+        ["NVDA"],
+        "Nvidia does not use them.",
+    ) == (["NVDA"], 0)
+
+    assert ex.validate_tickers_against_quote(
+        ["NVDA", "INTC", "AMD"],
+        "Nvidia does not use Intel chips, AMD grew.",
+    ) == (["NVDA", "AMD"], 1)
+
+
+def test_round7_item5_sentence_split_after_abbreviation_and_proper_noun_scan() -> None:
+    """Round 7 Item 5: Abbreviations (`Inc.`, `Ltd.`, `Corp.`, `Co.`) split sentences when followed by
+    whitespace and an uppercase letter starting a new sentence, shared by period check, exclusions, and proper-noun scan.
+    """
+    from src.dalton.conversations import extractor as ex
+
+    q_period = "2025 sales were led by Nvidia Inc. Profit was 5 million."
+    assert ex.is_period_supported_by_quote("2025", q_period, value=5, unit="million") is False
+
+    q_excl = "Nvidia does not use Intel Inc. AMD sales grew."
+    assert ex.validate_tickers_against_quote(["NVDA", "INTC", "AMD"], q_excl) == (["NVDA", "AMD"], 1)
+
+    res_proper = ex.validate_candidate_card(
+        {
+            "claim": "Nvidia Inc. Operational efficiency improved.",
+            "topic_label": "Nvidia",
+            "figures": [],
+            "tickers": ["NVDA"],
+        },
+        quote="Nvidia Inc. efficiency improved.",
+    )
+    assert "Operational" not in res_proper.unsupported_names
+
+
+def test_round7_item6_realized_expectation_mask_modifiers() -> None:
+    """Round 7 Item 6: Realized expectation phrases allow intermediate `市场`/`一致`/`分析师` modifiers."""
+    from src.dalton.conversations import extractor as ex
+
+    for phrase in ("超出市场预期", "好于一致预期", "低于市场预期", "符合一致预期", "不及分析师预期"):
+        assert ex.correct_card_type_by_keywords(
+            "fact",
+            f"Q3营收{phrase}",
+            f"公司Q3营收同比增长15%，{phrase}。",
+        ) == ("fact", 0)
+
+
+def test_round7_item7_forward_jiang_and_jihua_disambiguation() -> None:
+    """Round 7 Item 7: `将` only triggers on `将+verb` / `将要` / `即将` (excluding `已将` / `将其` / `将…出售给`),
+    and `计划` does not trigger on `激励计划` / `回购计划` / `员工持股计划`.
+    """
+    from src.dalton.conversations import extractor as ex
+
+    for non_fwd_quote in (
+        "公司已将非核心业务剥离，收回现金10亿元。",
+        "公司将其列为核心资产，账面价值5亿元。",
+        "公司将子公司出售给第三方，作价8亿元。",
+        "公司披露2025年股权激励计划，授予100万股。",
+        "董事会通过股份回购计划，已回购5000万元。",
+        "公司完成员工持股计划非交易过户。",
+    ):
+        assert ex.correct_card_type_by_keywords("fact", non_fwd_quote, non_fwd_quote) == ("fact", 0)
+
+    for fwd_quote in (
+        "公司即将发布新一代芯片。",
+        "公司将要扩产50%。",
+        "明年营收将增长20%。",
+        "公司计划明年在海外新建工厂。",
+    ):
+        assert ex.correct_card_type_by_keywords("fact", fwd_quote, fwd_quote) == ("estimate", 1)
+
+
+def test_round7_item8_trading_channel_preposition_and_buy_boundaries() -> None:
+    """Round 7 Item 8: `在/用/通过` must not match inside `存在`, `买` must not match `买点`/`买回`/`买入`,
+    and `可以买`/`能够买` are recognized as trading-channel phrases.
+    """
+    from src.dalton.conversations import extractor as ex
+
+    res_keep = ex.validate_candidate_card(
+        {"claim": "富途存在买点", "figures": [], "tickers": ["FUTU"]},
+        quote="富途存在买点，估值具备吸引力。",
+    )
+    assert res_keep.tickers == ["FUTU"]
+    assert res_keep.tickers_dropped_channel == 0
+
+    for drop_claim in ("富途可以买港股", "富途能够买美股"):
+        res_drop = ex.validate_candidate_card(
+            {"claim": drop_claim, "figures": [], "tickers": ["FUTU"]},
+            quote=drop_claim,
+        )
+        assert res_drop.tickers == []
+        assert res_drop.tickers_dropped_channel == 1
+
+
+def test_round7_item9_trad_to_simp_table_coverage() -> None:
+    """Round 7 Item 9: Traditional-to-Simplified table covers `臺偉馬遜圖譜滬億為` so `臺積電` <-> `台积电`
+    and `英偉達` <-> `英伟达` match without flagging unsupported names.
+    """
+    from src.dalton.conversations import extractor as ex
+
+    for trad_ch, simp_ch in zip("臺偉馬遜圖譜滬億為", "台伟马逊图谱沪亿为", strict=True):
+        assert ex._normalize_trad_to_simp(trad_ch) == simp_ch
+
+    res_tsm = ex.validate_candidate_card(
+        {"claim": "臺積電CoWoS產能持續擴張。", "topic_label": "臺積電", "figures": [], "tickers": []},
+        quote="台积电CoWoS产能持续扩张。",
+    )
+    assert res_tsm.unsupported_names == []
+    assert res_tsm.tickers == ["TSM"]
+
+    res_nvda = ex.validate_candidate_card(
+        {"claim": "英偉達B200出貨放量。", "topic_label": "英偉達", "figures": [], "tickers": []},
+        quote="英伟达B200出货放量。",
+    )
+    assert res_nvda.unsupported_names == []
+    assert res_nvda.tickers == ["NVDA"]
+
+
+def test_round7_item10_two_letter_acronym_not_supported_by_phrase() -> None:
+    """Round 7 Item 10: 2-letter acronyms cannot be supported by generic 2-word phrases regardless of case (`Market Share` != `MS`)."""
+    from src.dalton.conversations import extractor as ex
+
+    assert ex._is_acronym_supported_by_quote_phrase("MS", "Market Share expanded to 30%") is False
+    assert ex._is_acronym_supported_by_quote_phrase("MS", "market share expanded to 30%") is False
+    res = ex.validate_candidate_card(
+        {"claim": "MS预计份额提升至30%。", "topic_label": "份额", "figures": [], "tickers": []},
+        quote="Market Share expanded to 30%.",
+    )
+    assert "MS" in res.unsupported_names
+
+
+@pytest.mark.asyncio
+async def test_round7_item11_types_corrected_and_duplicate_private_ticker_counts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 7 Item 11: `types_corrected` only counts when the final post-citation type differs from the
+    pre-correction type; duplicate private company tickers (`["SPCX", "SPCX"]`) are counted after deduplication.
+    """
+    from src.dalton.conversations import extractor as ex
+
+    seg = [
+        {
+            "agent": "main",
+            "session_id": "sess-r7-11",
+            "session_key": "agent:main:discord:channel:r7-11",
+            "channel": "discord",
+            "chat_type": "channel",
+            "event_id": "ev-r7-11",
+            "seq": 1,
+            "ts": "2026-10-20T10:00:00+00:00",
+            "date_et": "2026-10-20",
+            "message_role": "assistant",
+            "speaker": {"sender_id_hash": "agent:main", "name": "Eve", "is_owner": False, "role": "agent"},
+            "text": "卖方预计2026年SpaceX收入增长20%。",
+        }
+    ]
+    orig_assist = ex.assist_json
+    monkeypatch.setattr(
+        ex,
+        "assist_json",
+        create_autospec(
+            orig_assist,
+            return_value=AssistResult(
+                ok=True,
+                status="ok",
+                data={
+                    "category": "research",
+                    "topic_label": "SpaceX",
+                    "cards": [
+                        {
+                            "type": "estimate",
+                            "topic_label": "SpaceX预测",
+                            "claim": "卖方预计2026年SpaceX收入增长20%。",
+                            "tickers": ["SPCX", "SPCX"],
+                            "entities": [],
+                            "sectors": [],
+                            "figures": [],
+                            "quote": "卖方预计2026年SpaceX收入增长20%。",
+                            "quote_event_id": "ev-r7-11",
+                            "cited_sources": [],
+                            "confidence": 0.8,
+                        }
+                    ],
+                },
+                model="gemini-4-argon-medium-oauth",
+                usage={"input_tokens": 80, "output_tokens": 40, "total_tokens": 120},
+            ),
+        ),
+    )
+    out = await ex.extract_segment_cards(seg)
+    assert out.cards[0]["type"] == "opinion"
+    assert out.types_corrected == 0
+    assert out.tickers_dropped == 1
+    assert out.tickers_dropped_private == 1
+
+    direct = ex.validate_candidate_card(
+        {
+            "claim": "卖方预计2026年SpaceX收入增长20%。",
+            "topic_label": "SpaceX预测",
+            "type": "opinion",
+            "figures": [],
+            "tickers": ["SPCX", "SPCX"],
+            "quote": "卖方预计2026年SpaceX收入增长20%。",
+            "cited_sources": [],
+            "confidence": 0.8,
+        },
+        quote="卖方预计2026年SpaceX收入增长20%。",
+    )
+    assert direct.tickers_dropped == out.tickers_dropped == 1
+    assert direct.tickers_dropped_private == out.tickers_dropped_private == 1
+
+
+def test_round7_item12_remove_unrequested_ddog_alias() -> None:
+    """Round 7 Item 12: `DDOG` / `Datadog` removed from `SUPPLEMENTAL_TICKER_ALIASES`."""
+    from src.dalton.conversations import extractor as ex
+
+    assert "DDOG" not in ex.SUPPLEMENTAL_TICKER_ALIASES
+
+
+def test_round8_item1_trad_to_simp_sell_buy_order() -> None:
+    """Round 8 Item 1: `賣買` maps to `卖买` (not reversed); `賣方` normalizes to `卖方`."""
+    from src.dalton.conversations import extractor as ex
+
+    assert ex._normalize_trad_to_simp("賣方") == "卖方"
+    assert ex._normalize_trad_to_simp("買方") == "买方"
+    assert ex._normalize_trad_to_simp("賣買") == "卖买"
+
+
+def test_round8_item2_abbreviation_sentence_split_only_company_suffixes() -> None:
+    """Round 8 Item 2: Sentence splitting after abbreviation only applies to `Inc.`, `Ltd.`, `Corp.`, `Co.`
+    followed by space + uppercase word; `U.S.`, `U.K.`, `e.g.`, `i.e.` and `letter.letter.` do not split.
+    """
+    from src.dalton.conversations import extractor as ex
+
+    assert ex.is_period_supported_by_quote(
+        "2025",
+        "2025 U.S. GAAP profit was 5 million.",
+        value=5,
+        unit="million",
+    )
+    assert ex._split_sentences("e.g. Nvidia and Broadcom") == ["e.g. Nvidia and Broadcom"]
+    assert ex._split_sentences("Nvidia Inc. Profit was 5 million.") == [
+        "Nvidia Inc.",
+        "Profit was 5 million",
+    ]
+    assert not ex.is_period_supported_by_quote(
+        "2025",
+        "2025 sales were led by Nvidia Inc. Profit was 5 million.",
+        value=5,
+        unit="million",
+    )
+
+
+def test_round8_item3_third_party_forecast_requires_verb_and_non_year_number_in_same_clause() -> None:
+    """Round 8 Item 3: Third-party forecast requires subject, forecast verb, and non-standalone-year number in the same clause."""
+    from src.dalton.conversations import extractor as ex
+
+    assert ex.correct_card_type_by_keywords("fact", "利润增长20%", "利润增长20%（卖方口径）") == ("fact", 0)
+    assert ex.correct_card_type_by_keywords("opinion", "利润增长20%", "利润增长20%（卖方口径）") == ("opinion", 0)
+    assert ex.correct_card_type_by_keywords(
+        "opinion",
+        "公司预计推进改革",
+        "公司预计推进改革（卖方口径），参考2024年年报",
+    ) == ("opinion", 0)
+    assert ex.correct_card_type_by_keywords(
+        "opinion",
+        "公司预计推进改革",
+        "公司预计2024年推进改革（卖方口径）",
+    ) == ("opinion", 0)
+    # Round 7 negative and positive examples still pass
+    assert ex.correct_card_type_by_keywords("opinion", "一致预期看多", "consensus is bullish") == ("opinion", 0)
+    assert ex.correct_card_type_by_keywords("opinion", "卖方预计好转", "卖方预计会更好") == ("opinion", 0)
+    assert ex.correct_card_type_by_keywords("opinion", "一致预期100亿", "已是一致预期为100亿") == ("opinion", 0)
+    assert ex.correct_card_type_by_keywords("opinion", "卖方预计增长20%", "卖方预计2026年收入增长20%") == (
+        "estimate",
+        1,
+    )
+
+
+def test_round8_item4_institution_source_bridge_and_laizi_chenbao() -> None:
+    """Round 8 Item 4: Restore `research`, `report`, `note` before English source verbs, `来自<机构>`, and `<机构>晨报指出`."""
+    from src.dalton.conversations import extractor as ex
+
+    for quote, claim in (
+        ("Goldman research expects Nvidia revenue to grow 20%.", "Goldman research expects Nvidia revenue to grow 20%."),
+        ("Goldman report says Nvidia revenue grew 20%.", "Goldman report says Nvidia revenue grew 20%."),
+        ("来自高盛的数据显示英伟达收入增长20%。", "来自高盛的数据显示英伟达收入增长20%。"),
+        ("高盛晨报指出英伟达收入增长20%。", "高盛晨报指出英伟达收入增长20%。"),
+    ):
+        kept, _ = ex.validate_tickers_against_quote(["GS", "NVDA"], quote, claim=claim)
+        assert kept == ["NVDA"]
+        bf, _ = ex.backfill_tickers_from_quote([], quote, claim=claim)
+        assert bf == ["NVDA"]
+
+
+def test_round8_item5_negated_trading_channel_kept() -> None:
+    """Round 8 Item 5: Negated `不可以买` / `不能够买` is not treated as a trading channel."""
+    from src.dalton.conversations import extractor as ex
+
+    kept, _ = ex.validate_tickers_against_quote(["FUTU"], "富途不可以买港股。", claim="富途不可以买港股。")
+    assert kept == ["FUTU"]
+    bf, _ = ex.backfill_tickers_from_quote([], "富途不可以买港股。", claim="富途不可以买港股。")
+    assert bf == ["FUTU"]
+
+
+def test_round8_item6_realized_expectation_mask_le_and_de() -> None:
+    """Round 8 Item 6: Allow `了` and `的` in realized expectation comparisons (`超出了市场预期`, `好于市场的预期`)."""
+    from src.dalton.conversations import extractor as ex
+
+    for phrase in ("超出了市场预期", "好于市场的预期"):
+        assert ex.correct_card_type_by_keywords("fact", f"Q3营收{phrase}", f"Q3营收同比增长15%，{phrase}。") == (
+            "fact",
+            0,
+        )
+
+
+def test_round8_item7_completed_aspect_yijing_jiang() -> None:
+    """Round 8 Item 7: `已经将` / `曾经将` completed aspect does not trigger `fact -> estimate`."""
+    from src.dalton.conversations import extractor as ex
+
+    assert ex.correct_card_type_by_keywords("fact", "已经将产能扩大", "公司已经将产能扩大至10万片。") == ("fact", 0)
+    assert ex.correct_card_type_by_keywords("fact", "曾经将产能扩大", "公司曾经将产能扩大至10万片。") == ("fact", 0)
+    assert ex.correct_card_type_by_keywords(
+        "fact",
+        "已经将于2024年到期的债券提前偿还",
+        "公司已经将于2024年到期的债券提前偿还。",
+    ) == ("fact", 0)
+    assert ex.correct_card_type_by_keywords(
+        "fact",
+        "曾经将于2023年到期的债券提前偿还",
+        "公司曾经将于2023年到期的债券提前偿还。",
+    ) == ("fact", 0)
+
+
+def test_round9_item1_year_rule_preserves_four_digit_amounts() -> None:
+    """Round 9 Item 1: `_STANDALONE_YEAR_RE` only strips explicit year tokens (`2026年`, `FY26`, `FY2026`, `CY2026`, `2026E`/`2026F`)
+    and preserves 4-digit amounts with units/currency or bare 4-digit numbers.
+    """
+    from src.dalton.conversations import extractor as ex
+
+    assert ex.correct_card_type_by_keywords("opinion", "卖方预计2026年净利润2000亿元", "卖方预计2026年净利润2000亿元") == (
+        "estimate",
+        1,
+    )
+    assert ex.correct_card_type_by_keywords("opinion", "预计收入2000万元", "预计收入为2000万元（卖方口径）") == (
+        "estimate",
+        1,
+    )
+    assert ex.correct_card_type_by_keywords(
+        "opinion",
+        "Consensus revenue $2000M",
+        "consensus expects revenue of $2000 million",
+    ) == ("estimate", 1)
+    assert ex.correct_card_type_by_keywords(
+        "opinion",
+        "Consensus target 2050",
+        "consensus expects a target of 2050",
+    ) == ("estimate", 1)
+    assert ex.correct_card_type_by_keywords(
+        "opinion",
+        "公司预计推进改革",
+        "公司预计推进改革（卖方口径），参考2024年年报",
+    ) == ("opinion", 0)
+
+
+def test_round9_item2_sell_side_suffix_required() -> None:
+    """Round 9 Item 2: `[（(]?卖方(?:口径|预计|预测)` suffix is mandatory so `卖方维持中性` does not trigger."""
+    from src.dalton.conversations import extractor as ex
+
+    assert ex.correct_card_type_by_keywords("opinion", "公司预计净利增长20%", "公司预计净利增长20%卖方维持中性") == (
+        "opinion",
+        0,
+    )
+
+
+def test_round9_item3_chinese_numerals_and_thousand_separator_commas() -> None:
+    """Round 9 Item 3: Third-party forecast structure recognizes Chinese numerals (`_CN_NUM_MENTION_RE`) and thousand-separator commas (`1,000`)."""
+    from src.dalton.conversations import extractor as ex
+
+    assert ex.correct_card_type_by_keywords("opinion", "预计收入十五亿", "预计收入十五亿（卖方口径）") == (
+        "estimate",
+        1,
+    )
+    assert ex.correct_card_type_by_keywords("opinion", "预计利润为三亿元", "预计利润为三亿元（卖方口径）") == (
+        "estimate",
+        1,
+    )
+    assert ex.correct_card_type_by_keywords("opinion", "预计收入为1,000万元", "预计收入为1,000万元（卖方口径）") == (
+        "estimate",
+        1,
+    )
+
+
+def test_round10_third_party_forecast_number_slot_and_no_backtracking() -> None:
+    """Round 10: `_THIRD_PARTY_FORECAST_RE` number slot only accepts Arabic numbers or `_CN_NUM_MENTION_RE`
+    (not single Chinese numeral characters in `三星`/`进一步`/`下一代`/`十分`/`一方面`/`一般`/`一致看好`),
+    and completes in < 0.1s on an 8,000-char text containing many `预计`/`一`/`十` without `卖方口径`.
+    """
+    import time as time_mod
+
+    from src.dalton.conversations import extractor as ex
+
+    assert ex.correct_card_type_by_keywords("opinion", "卖方预计三星电子收入增长20%", "卖方预计三星电子收入增长20%") == (
+        "estimate",
+        1,
+    )
+    assert ex.correct_card_type_by_keywords("opinion", "卖方预计进一步提升毛利率至30%", "卖方预计进一步提升毛利率至30%") == (
+        "estimate",
+        1,
+    )
+    assert ex.correct_card_type_by_keywords("opinion", "卖方预计下一代产品收入三亿元", "卖方预计下一代产品收入三亿元") == (
+        "estimate",
+        1,
+    )
+    assert ex.correct_card_type_by_keywords("opinion", "卖方预计十分看好2000亿元", "卖方预计十分看好2000亿元") == (
+        "estimate",
+        1,
+    )
+    assert ex.correct_card_type_by_keywords("opinion", "分析师预计一方面2000亿元", "分析师预计一方面2000亿元") == (
+        "estimate",
+        1,
+    )
+    assert ex.correct_card_type_by_keywords("opinion", "机构预计一般在2000亿元", "机构预计一般在2000亿元") == (
+        "estimate",
+        1,
+    )
+    assert ex.correct_card_type_by_keywords("opinion", "卖方预计一致看好2000亿元", "卖方预计一致看好2000亿元") == (
+        "estimate",
+        1,
+    )
+    assert ex.correct_card_type_by_keywords("opinion", "分析师预计一方面十五亿", "分析师预计一方面十五亿") == (
+        "estimate",
+        1,
+    )
+
+    long_text = ("公司预计一方面十分一般进一步一十它认为100但未采用 " * 450)[:8000]
+    assert len(long_text) == 8000
+    t0 = time_mod.perf_counter()
+    res = ex.correct_card_type_by_keywords("opinion", "长文测试", long_text)
+    m_raw = ex._THIRD_PARTY_FORECAST_RE.search(long_text)
+    elapsed = time_mod.perf_counter() - t0
+    assert res == ("opinion", 0)
+    assert m_raw is None
+    assert elapsed < 0.1
+
+
+
 
 
 @pytest.mark.asyncio

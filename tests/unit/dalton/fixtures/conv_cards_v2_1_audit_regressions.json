@@ -1,0 +1,214 @@
+[
+  {
+    "card_id": "v21_82d1bcb330b2",
+    "ts": "2026-04-04T20:26:59.017000+00:00",
+    "date_et": "2026-04-04",
+    "type": "model_assumption",
+    "speaker": "assistant",
+    "tickers": [],
+    "topic_label": "Datadog 估值与增长",
+    "claim": "Datadog 的长期增速预计将回落至 15-18%，届时以 25-30x P/FCF 估值，相较当前约 55x P/FCF 有约一半的估值压缩空间；若未来 3 年维持 20%+ 增长，自由现金流翻倍可抵消估值腰斩，股价或横盘消化估值。",
+    "quote": "**核心问题**：什么时候增速掉到 15-18%？如果那时候给 25-30x P/FCF，从现在的 55x 算下来估值要砍一半——靠 3 年 20%+ 增长能不能把 FCF 翻倍来抵消估值压缩？如果能，股价大概率横盘消化估值；如果增速掉得更快，就有双杀风险。",
+    "figures": [
+      {"metric": "长期增速", "value": "15-18", "unit": "%", "period": ""},
+      {"metric": "远期P/FCF", "value": "25-30", "unit": "x", "period": ""},
+      {"metric": "当前P/FCF", "value": "55", "unit": "x", "period": ""},
+      {"metric": "中期增速假设", "value": "20+", "unit": "%", "period": "未来3年"}
+    ],
+    "cited_sources": [],
+    "confidence": 0.8
+  },
+  {
+    "card_id": "v21_1136705dbec4",
+    "ts": "2026-04-07T01:41:28.149000+00:00",
+    "date_et": "2026-04-06",
+    "type": "opinion",
+    "speaker": "assistant",
+    "tickers": [],
+    "topic_label": "中原传媒经营与分红分析",
+    "claim": "中原传媒当前股息率超过5%，动态PE约8倍，账上净现金流充裕但分红率仅40%出头；其教材教辅主业受河南出生人口下滑压制，但高教职教扩招与中高考教辅刚需可对冲6-10年，主要跟踪风险为分红率下降、教材降价集采及并购资本开支。",
+    "quote": "**核心矛盾**：账上躺着大把净现金流，但分红率只有 40% 出头。如果管理层响应国资委市值管理号召把分红率提到 55-60%，股息率直接跳到 7%+，股价至少有 30% 的重估空间；如果不提，就是一个 5%+ 的类固收底仓。\n**护城河与教材周期**：河南出生人口确实在降，但高教/职教扩招 + 中高考教辅刚需能对冲一部分，未来 6-10 年主业不会塌。当前 8x 动态 PE 已经把人口悲观预期打得很满了。\n**跟踪指标**：① 分红率是否下调；② 教材降价/集采政策冲击；③ 有没有乱搞并购消耗账上现金。",
+    "figures": [
+      {"metric": "当前股息率", "value": "超过5", "unit": "%", "period": ""},
+      {"metric": "动态PE", "value": "8", "unit": "x", "period": ""},
+      {"metric": "当前分红率", "value": "40", "unit": "%", "period": ""},
+      {"metric": "主业缓冲期", "value": "6-10", "unit": "年", "period": ""}
+    ],
+    "cited_sources": [],
+    "confidence": 0.82
+  },
+  {
+    "card_id": "v21_676e010b7206",
+    "ts": "2026-04-01T14:00:00+00:00",
+    "date_et": "2026-04-01",
+    "type": "opinion",
+    "speaker": "assistant",
+    "tickers": [],
+    "topic_label": "法拉帝 (9638.HK / YACHT.MI)",
+    "claim": "游艇在船东总财富中的占比从早年的5-10%下降至如今的1-2%，由于占比较小，船东在经济下行期仍倾向于保留游艇作为避风港。",
+    "quote": "以前游艇可能占船东财富的 5-10%，现在随着超级富豪财富膨胀，只占 1-2% 甚至更低。占比这么小，哪怕宏观不好，他们也不会卖游艇，反而觉得在海上是最安全的避风港。",
+    "figures": [
+      {"metric": "早年游艇占船东财富比例", "value": "5-10", "unit": "%", "period": ""},
+      {"metric": "当前游艇占船东财富比例", "value": "1-2", "unit": "%", "period": ""}
+    ],
+    "cited_sources": [],
+    "confidence": 0.82
+  },
+  {
+    "card_id": "v21_b64e8dd14d8e",
+    "ts": "2026-04-01T15:00:00+00:00",
+    "date_et": "2026-04-01",
+    "type": "opinion",
+    "speaker": "assistant",
+    "tickers": [],
+    "topic_label": "亚朵 (ATAT)",
+    "claim": "在全年开店目标500家的背景下，若剔除Q2仅开101家的低基数影响，隐含单季正常开店速度为130-140家，对应年化开店能力已超过500家。",
+    "quote": "如果全年 500 家目标不变，刨掉 Q2 的 101 家，隐含其他三个季度平均每季要开 130-140 家，年化下来开店能力其实已经超 500 家了。截至目前门店总数 2175 家（同比 +19.2%），储备店 811 家；Q2 只开了 101 家。",
+    "figures": [
+      {"metric": "门店总数", "value": 2175, "unit": "家", "period": "Q2"},
+      {"metric": "门店总数同比增速", "value": "+19.2", "unit": "%", "period": "Q2"},
+      {"metric": "新开门店数", "value": 101, "unit": "家", "period": "Q2"},
+      {"metric": "储备门店数", "value": 811, "unit": "家", "period": "Q2"},
+      {"metric": "全年新开门店目标", "value": 500, "unit": "家", "period": "全年"},
+      {"metric": "隐含单季正常开店速度", "value": "130-140", "unit": "家/季", "period": ""}
+    ],
+    "cited_sources": [],
+    "confidence": 0.82
+  },
+  {
+    "card_id": "v21_9d8e0e9966ec",
+    "ts": "2026-04-04T20:26:59.017000+00:00",
+    "date_et": "2026-04-04",
+    "type": "fact",
+    "speaker": "user",
+    "tickers": [],
+    "topic_label": "大语言模型范式演进",
+    "claim": "陈哲在《晚点聊》第 147 期节目中复盘了过去三年 AI 大语言模型行业在每个关键时间节点的共识、非共识、技术突破及投资机会。",
+    "quote": "本期节目我们系统复盘过去三年（2023年初至2026年初）大语言模型行业走过的六个关键节点，看看每个节点上当时的共识是什么、非共识是什么，哪些技术突破改变了方向，以及对应的投资机会在哪里。",
+    "figures": [],
+    "cited_sources": ["晚点聊"],
+    "confidence": 0.72
+  },
+  {
+    "card_id": "v21_e0955af6436b",
+    "ts": "2026-04-01T16:00:00+00:00",
+    "date_et": "2026-04-01",
+    "type": "fact",
+    "speaker": "assistant",
+    "tickers": ["9992.HK"],
+    "topic_label": "泡泡玛特 (9992.HK)",
+    "claim": "泡泡玛特 LABUBU PT 1.0 二手均价走势为：1月92元、2月94元、3月93元，已完全止跌；SP 二手均价从1月123元回落至2月118元、3月110元。",
+    "quote": "- **LABUBU**：PT 1.0 二手均价 1月 92、2月 94、3月 93；SP 1月 123、2月 118、3月 110。",
+    "figures": [
+      {"metric": "LABUBU PT 1.0 二手均价", "value": 92, "unit": "元", "period": "1月"},
+      {"metric": "LABUBU PT 1.0 二手均价", "value": 94, "unit": "元", "period": "2月"},
+      {"metric": "LABUBU PT 1.0 二手均价", "value": 93, "unit": "元", "period": "3月"},
+      {"metric": "SP 二手均价", "value": 123, "unit": "元", "period": "1月"},
+      {"metric": "SP 二手均价", "value": 118, "unit": "元", "period": "2月"},
+      {"metric": "SP 二手均价", "value": 110, "unit": "元", "period": "3月"}
+    ],
+    "cited_sources": [],
+    "confidence": 0.88
+  },
+  {
+    "card_id": "v21_923ce4b11825",
+    "ts": "2026-04-02T10:00:00+00:00",
+    "date_et": "2026-04-02",
+    "type": "fact",
+    "speaker": "user",
+    "tickers": [],
+    "topic_label": "渠道与KOL投放策略",
+    "claim": "公司目前合作的 KOL 报价已谈至 5 万美元，预计 3 月将迎来一波集中宣发。",
+    "quote": "现在谈的 KOL 报价已经谈到 5 万了，3 月份会有一波集中宣发。",
+    "figures": [
+      {"metric": "KOL报价", "value": 5, "unit": "万美元", "period": ""},
+      {"metric": "集中宣发时间", "value": "3月", "unit": "", "period": "3月"}
+    ],
+    "cited_sources": [],
+    "confidence": 0.8
+  },
+  {
+    "card_id": "v21_030732b1fda5",
+    "ts": "2026-04-06T00:09:49.007000+00:00",
+    "date_et": "2026-04-05",
+    "type": "opinion",
+    "speaker": "assistant",
+    "tickers": [],
+    "topic_label": "宁德时代2027年稼动率与排产测算",
+    "claim": "摩根大通测算，即便假设宁德时代 2027 年电池稼动率回落至 80-85%，隐含的产量增速仍超过 25%，按 1.54 TWh 产量与 11.4 亿元/GWh 单价测算，2027 年收入与净利润分别可达 1.76 万亿元和 1760 亿元，净利率重回 10% 以上。",
+    "quote": "就算我们把 2027 年的稼动率假设从今年的近 95% 下调到 80-85%，隐含的产量增速依然超过 25%。按 1.54 TWh 产量、单 GWh 均价 11.4 亿（含储能系统和换电柜拉动）算，2027 年宁德收入能到 1.76 万亿，如果净利率回到 10% 以上（>0.10 元/Wh），净利润就是 1760 亿+。",
+    "figures": [
+      {"metric": "稼动率假设", "value": "80-85", "unit": "%", "period": "2027年"},
+      {"metric": "隐含产量增速", "value": "超过25", "unit": "%", "period": "2027年"},
+      {"metric": "产量预测", "value": 1.54, "unit": "TWh", "period": "2027年"},
+      {"metric": "单GWh均价假设", "value": 11.4, "unit": "亿元/GWh", "period": "2027年"},
+      {"metric": "营业收入预测", "value": 1.76, "unit": "万亿元", "period": "2027年"},
+      {"metric": "净利润预测", "value": 1760, "unit": "亿元", "period": "2027年"},
+      {"metric": "净利率假设", "value": "超过10", "unit": "%", "period": "2027年"},
+      {"metric": "单Wh净利假设", "value": "超过0.10", "unit": "元/Wh", "period": "2027年"}
+    ],
+    "cited_sources": ["摩根大通"],
+    "confidence": 0.82
+  },
+  {
+    "card_id": "v21_91a9eb6d35f0",
+    "ts": "2026-04-06T12:00:00+00:00",
+    "date_et": "2026-04-06",
+    "type": "fact",
+    "speaker": "assistant",
+    "tickers": [],
+    "topic_label": "影石创新 (688775.SS)",
+    "claim": "影石创新在全景相机市场的全球市占率长期维持在67%-70%以上。",
+    "quote": "影石创新在全景相机这一细分赛道的全球市占率长期维持在 67%-70% 以上。",
+    "figures": [
+      {"metric": "全景相机全球市占率", "value": "67-70+", "unit": "%", "period": ""}
+    ],
+    "cited_sources": [],
+    "confidence": 0.88
+  },
+  {
+    "card_id": "v21_3bf61c4efa60",
+    "ts": "2026-04-04T20:30:00+00:00",
+    "date_et": "2026-04-04",
+    "type": "fact",
+    "speaker": "user",
+    "tickers": [],
+    "topic_label": "Headline",
+    "claim": "中国企业在垂类AI应用上具备场景与数据优势，代表性案例包括：同花顺爱问财月活超1800万、付费转化率4.7%；美图月活2.8亿、付费率4.7%、年经常性收入（ARR）超15亿元；智谱年经常性收入（ARR）超8亿元、毛利率超50%；英矽智能管线推进周期缩短至12-18个月、单项目里程碑付款数千万至上亿美元；迅策科技资产管理规模（AUM）覆盖超10万亿元、客户留存率超95%。",
+    "quote": "- **金融（同花顺·爱问财）**：MAU 1800万+，付费率 4.7%；\n- **影像设计（美图）**：MAU 2.8亿，付费率 4.7%，ARR 15亿+；\n- **通用底座（智谱）**：ARR 8亿+，毛利率 50%+；\n- **AI 制药（英矽智能）**：PCC 研发周期压到 12-18 个月，单管线首付款/里程碑几千万到上亿美金；\n- **资管数据（迅策科技）**：覆盖资管规模 10 万亿+，留存率 95%+。",
+    "figures": [
+      {"metric": "同花顺爱问财MAU", "value": "1800+", "unit": "万", "period": ""},
+      {"metric": "同花顺爱问财付费率", "value": 4.7, "unit": "%", "period": ""},
+      {"metric": "美图MAU", "value": 2.8, "unit": "亿", "period": ""},
+      {"metric": "美图付费率", "value": 4.7, "unit": "%", "period": ""},
+      {"metric": "美图ARR", "value": "15+", "unit": "亿元", "period": ""},
+      {"metric": "智谱ARR", "value": "8+", "unit": "亿元", "period": ""},
+      {"metric": "智谱毛利率", "value": "50+", "unit": "%", "period": ""},
+      {"metric": "英矽智能研发周期", "value": "12-18", "unit": "个月", "period": ""},
+      {"metric": "迅策科技覆盖AUM", "value": "10+", "unit": "万亿元", "period": ""},
+      {"metric": "迅策科技客户留存率", "value": "95+", "unit": "%", "period": ""}
+    ],
+    "cited_sources": [],
+    "confidence": 0.88
+  },
+  {
+    "card_id": "v21_f202f73c375d",
+    "ts": "2026-04-06T03:07:38.015000+00:00",
+    "date_et": "2026-04-05",
+    "type": "estimate",
+    "speaker": "assistant",
+    "tickers": [],
+    "topic_label": "雅诗兰黛财务预测与利润率拆分",
+    "claim": "高盛预计雅诗兰黛FY2027有机收入增长4.6%（其中护肤+4%、彩妆+3%、护发+2%、香水+9%），高于彭博一致预期的3.8%和Bernstein预期的3.7%；Bernstein预计FY2027护肤与彩妆均增长3.2%，但护发下滑1.0%。",
+    "quote": "高盛模型给雅诗兰黛 FY2027 的有机收入增速是 +4.6%（拆分看：护肤 +4%、彩妆 +3%、护发 +2%、香水 +9%），明显比彭博一致预期的 +3.8% 和 Bernstein 的 +3.7% 更乐观；Bernstein 对护肤和彩妆都只给 +3.2%，护发甚至是 -1.0%。",
+    "figures": [
+      {"metric": "高盛预测有机收入增速", "value": 4.6, "unit": "%", "period": "FY2027"},
+      {"metric": "彭博一致预期有机收入增速", "value": 3.8, "unit": "%", "period": "FY2027"},
+      {"metric": "Bernstein预测有机收入增速", "value": 3.7, "unit": "%", "period": "FY2027"},
+      {"metric": "Bernstein预测护肤收入增速", "value": 3.2, "unit": "%", "period": "FY2027"},
+      {"metric": "Bernstein预测护发收入增速", "value": -1.0, "unit": "%", "period": "FY2027"}
+    ],
+    "cited_sources": ["高盛", "彭博", "Bernstein"],
+    "confidence": 0.88
+  }
+]
