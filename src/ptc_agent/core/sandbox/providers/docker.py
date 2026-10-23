@@ -1037,9 +1037,11 @@ class DockerProvider(SandboxProvider):
         # Publish proxy ports so preview URLs are reachable from the host.
         # Use dynamic host ports (HostPort: "") so multiple containers can
         # coexist without port conflicts.
+        # DALTON-HOOK(sandbox-port-bind): bind previews to loopback, not every interface; the
+        # backend still reaches them through host.docker.internal, the LAN no longer can.
         if proxy_ports:
             host_config["PortBindings"] = {
-                f"{p}/tcp": [{"HostPort": ""}] for p in proxy_ports
+                f"{p}/tcp": [{"HostIp": "127.0.0.1", "HostPort": ""}] for p in proxy_ports
             }
 
         binds: list[str] = list(self._config.volumes)  # extra user-defined mounts

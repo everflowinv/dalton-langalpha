@@ -1523,9 +1523,11 @@ class TestDockerProviderPreviewConfig:
         assert "PortBindings" in host_config
         assert "13000/tcp" in host_config["PortBindings"]
         # Verify dynamic host ports (empty string = Docker picks)
-        assert host_config["PortBindings"]["13000/tcp"] == [{"HostPort": ""}]
-        assert host_config["PortBindings"]["13001/tcp"] == [{"HostPort": ""}]
-        assert host_config["PortBindings"]["13002/tcp"] == [{"HostPort": ""}]
+        # DALTON-HOOK(sandbox-port-bind): previews are bound to loopback
+        loopback = [{"HostIp": "127.0.0.1", "HostPort": ""}]
+        assert host_config["PortBindings"]["13000/tcp"] == loopback
+        assert host_config["PortBindings"]["13001/tcp"] == loopback
+        assert host_config["PortBindings"]["13002/tcp"] == loopback
 
         assert "ExposedPorts" in container_config
         assert "13000/tcp" in container_config["ExposedPorts"]
