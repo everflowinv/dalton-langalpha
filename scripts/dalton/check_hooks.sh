@@ -58,6 +58,7 @@ ALLOWED_HOOKS=(
   "precheck-label"
   "no-strike"
   "workspace-delete-guard"
+  "docs-readme"
   "dalton-nav"
   "publish-card"
   "i18n"
