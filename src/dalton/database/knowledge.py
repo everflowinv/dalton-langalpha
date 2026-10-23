@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime
 from typing import Any
 from uuid import UUID
 
@@ -108,10 +107,12 @@ async def insert_version(
     thread_id: str | None = None,
     run_id: str | None = None,
     tool_call_id: str | None = None,
+    enforce_base: bool = False,
 ) -> dict[str, Any]:
     """Insert a new immutable version row under an advisory transaction lock.
 
-    When ``source == 'tool'``, enforces CAS against ``base_version_no``.
+    When ``source == 'tool'`` (or ``enforce_base``), enforces CAS against ``base_version_no``;
+    reconcile uses ``enforce_base`` so two concurrent passes cannot both append.
     When ``source == 'import'`` and a version already exists, raises ``VersionConflict``.
     When ``source in ('direct_edit', 'publish', 'server')``, appends after the latest version.
     """
@@ -135,7 +136,7 @@ async def insert_version(
             latest = _serialize_row(await cur.fetchone())
             latest_no = latest["version_no"] if latest else None
 
-            if source == "tool":
+            if source == "tool" or enforce_base:
                 if base_version_no != latest_no:
                     raise VersionConflict(doc_key, base_version_no, latest)
             elif source == "import":
@@ -273,6 +274,26 @@ async def latest_by_user(user_id: str, doc_key: str) -> list[dict[str, Any]]:
             )
             rows = await cur.fetchall()
             return [_serialize_row(r) for r in rows if r is not None]  # type: ignore[misc]
+
+
+async def latest_written_valid_version(
+    workspace_id: str, doc_key: str
+) -> dict[str, Any] | None:
+    """Return the newest valid version whose files were written to the sandbox."""
+    async with get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                f"""
+                SELECT {_KV_COLS}
+                FROM dalton_knowledge_versions
+                WHERE workspace_id = %s AND doc_key = %s
+                  AND schema_valid = TRUE AND files_written_at IS NOT NULL
+                ORDER BY version_no DESC
+                LIMIT 1
+                """,
+                (workspace_id, doc_key),
+            )
+            return _serialize_row(await cur.fetchone())
 
 
 async def list_all_latest_for_workspace(
