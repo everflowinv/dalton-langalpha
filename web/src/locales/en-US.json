@@ -458,7 +458,8 @@
     "autoApproveHandoffs": "Hand off work without asking",
     "autoApproveHandoffsDesc": "Tasks go to a workspace's Analyst without an approval card. Each hand-off still shows as a card you can follow or stop.",
     "autoApproveWorkspaceCreation": "Create workspaces without asking",
-    "autoApproveWorkspaceCreationDesc": "A workspace for new work is created without an approval card."
+    "autoApproveWorkspaceCreationDesc": "A workspace for new work is created without an approval card.",
+    "xaiConnectTitle": "Connect xAI Grok (SuperGrok)"
   },
   "dashboard": {
     "title": "{{brand}}",
@@ -3281,7 +3282,17 @@
     "errorSavePrefs": "Failed to save model preferences.",
     "providerLabel": "Provider",
     "notSet": "Not set",
-    "notConfigured": "Not configured"
+    "notConfigured": "Not configured",
+    "errorXaiOAuth": "Could not start xAI Grok sign-in. Please try again.",
+    "oauthXaiDesc": "Use Grok models with your SuperGrok subscription",
+    "enterCodeOnXai": "Confirm this code on auth.x.ai",
+    "xaiStep1Title": "Open the xAI verification page",
+    "xaiStep1Desc": "Click the button below to generate a one-time code and open auth.x.ai.",
+    "xaiStep2Title": "Confirm the code",
+    "xaiStep2Desc": "Sign in with your xAI account and approve the code shown here.",
+    "xaiStep3Title": "Done",
+    "xaiStep3Desc": "This screen detects the approval automatically.",
+    "usageCountsXai": "Requests count against your SuperGrok subscription quota, exactly as they would in the Grok CLI."
   },
   "marketView": {
     "companyOverview": "Company Overview",
