@@ -414,24 +414,23 @@ async def test_oauth_refresh_lock_key_uses_holder_id_and_events_record_actor(
     assert f"upsert user_id={MEMBER_ID} credential_user_id={HOLDER_ID} provider=antigravity-oauth" in caplog.text
     assert agy_events == [(MEMBER_ID, "refresh_ok")]
 
-    # 3d. Muse OAuth when lock is acquired: DB write targets HOLDER_ID, DB log & event record MEMBER_ID as actor
+    # 3d. Muse OAuth minted key storage & retrieval: DB write targets HOLDER_ID, DB log & event record MEMBER_ID as actor
     muse_events: list[tuple[str, str]] = []
 
     async def _muse_record_event(user_id: str, kind: str, detail: dict[str, Any] | None = None) -> None:
         muse_events.append((user_id, kind))
 
+    minted_holder_row = {
+        **fresh_row,
+        "access_token": "muse-minted-api-key",
+        "refresh_token": "",
+        "account_id": muse_oauth_mod.MUSE_API_KEY_ACCOUNT_ID,
+        "plan_type": "Pro",
+    }
     monkeypatch.setattr(
         muse_oauth_mod,
         "get_oauth_tokens",
-        create_autospec(muse_oauth_mod.get_oauth_tokens, return_value=expired_row),
-    )
-    monkeypatch.setattr(
-        muse_oauth_mod,
-        "refresh_tokens",
-        create_autospec(
-            muse_oauth_mod.refresh_tokens,
-            return_value={"access_token": "muse-new-tok", "refresh_token": "muse-new-ref", "expires_in": 3600},
-        ),
+        create_autospec(muse_oauth_mod.get_oauth_tokens, return_value=minted_holder_row),
     )
     monkeypatch.setattr(
         muse_oauth_mod,
@@ -445,10 +444,19 @@ async def test_oauth_refresh_lock_key_uses_holder_id_and_events_record_actor(
     )
 
     caplog.clear()
+    await muse_oauth_mod.save_minted_credentials(
+        MEMBER_ID,
+        {
+            "api_key": "muse-minted-api-key",
+            "base_url": "https://api.meta.ai/v1",
+            "subs_tier_name": "Pro",
+            "user_email": "pm@dalton.test",
+            "is_subs_active": True,
+        },
+    )
     muse_tok = await muse_oauth_mod.get_valid_token(MEMBER_ID)
     assert muse_tok is not None
-    assert muse_tok["access_token"] == "muse-new-tok"
-    assert lock_keys[-1] == f"oauth:refresh:{HOLDER_ID}:muse-oauth"
+    assert muse_tok["access_token"] == "muse-minted-api-key"
     assert executed_refresh[-1][1][0] == HOLDER_ID
     assert f"upsert user_id={MEMBER_ID} credential_user_id={HOLDER_ID} provider=muse-oauth" in caplog.text
     assert muse_events == [(MEMBER_ID, "refresh_ok")]
