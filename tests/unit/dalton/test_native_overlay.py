@@ -37,7 +37,7 @@ def test_native_overlay_does_not_collide_with_upstream():
     assert native is not None
 
     native_models = native.get("models") or {}
-    assert len(native_models) == 26
+    assert len(native_models) == 28
     overlap = set(native_models) & set(upstream_models)
     assert not overlap, f"Native overlay models collide with upstream: {overlap}"
 
@@ -979,3 +979,285 @@ async def test_muse_401_invalid_api_key_classified_as_auth_expired_and_outer_com
     assert xai_probe["ok"] is False
     assert xai_probe["error_kind"] == "http_401"
 
+
+@pytest.mark.asyncio
+async def test_glm_coding_models_overlay_provider_and_httpx_mock_transport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import anthropic
+    import httpx
+    from langchain_anthropic import ChatAnthropic
+    from src.llms.llm import create_llm
+
+    LLM._model_config = None
+    mc = ModelConfig()
+    dalton_meta = load_dalton_meta()
+
+    for key, expected_id, expected_modalities in (
+        ("glm-5.3-plan", "glm-5.3", ["text"]),
+        ("glm-5.3-flash-plan", "glm-5.3-flash", ["text", "image", "pdf"]),
+    ):
+        cfg = mc.get_model_config(key)
+        assert cfg is not None
+        assert cfg["provider"] == "z-ai-cn-coding"
+        assert cfg["model_id"] == expected_id
+        assert cfg["context"] == 1000000
+        assert cfg["input_modalities"] == expected_modalities
+        assert cfg["parameters"]["max_tokens"] == 128000
+        assert cfg["parameters"]["thinking"] == {"type": "enabled"}
+        assert "extra_body" not in cfg["parameters"]
+        assert cfg["reasoning"] == {
+            "efforts": ["low", "high", "max"],
+            "default": "low",
+            "write": "parameters.output_config.effort",
+            "on": {"parameters.thinking.type": "enabled"},
+        }
+
+        meta = dalton_meta.get(key) or {}
+        assert meta == {
+            "family": "zai-glm",
+            "billing": "subscription",
+            "notional_ref": f"{expected_id}-cn",
+            "tool_calling": True,
+        }
+
+    pinfo = mc.get_provider_info("z-ai-cn-coding")
+    assert pinfo["sdk"] == "anthropic"
+    assert pinfo["base_url"] == "https://open.bigmodel.cn/api/anthropic"
+    assert pinfo["env_key"] == "ZAI_CN_CODING_API_KEY"
+    assert pinfo["access_type"] == "coding_plan"
+
+    # Platform key resolution from .env (ZAI_CN_CODING_API_KEY) without BYOK, intercepted by httpx.MockTransport
+    dummy_token = "unit-test-zai-coding-token"
+    monkeypatch.setenv("ZAI_CN_CODING_API_KEY", dummy_token)
+    client = create_llm("glm-5.3-plan")
+    assert isinstance(client, ChatAnthropic)
+    assert client.model == "glm-5.3"
+    assert client.anthropic_api_url == "https://open.bigmodel.cn/api/anthropic"
+
+    captured_requests: list[httpx.Request] = []
+
+    def _make_sse(text: str, in_tok: int = 12, out_tok: int = 6) -> bytes:
+        events = [
+            (
+                "message_start",
+                {
+                    "type": "message_start",
+                    "message": {
+                        "id": "msg_glm_test_01",
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [],
+                        "model": "glm-5.3",
+                        "stop_reason": None,
+                        "stop_sequence": None,
+                        "usage": {
+                            "input_tokens": in_tok,
+                            "output_tokens": 0,
+                            "cache_creation_input_tokens": 0,
+                            "cache_read_input_tokens": 0,
+                        },
+                    },
+                },
+            ),
+            (
+                "content_block_start",
+                {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "thinking", "thinking": ""},
+                },
+            ),
+            (
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "thinking_delta", "thinking": "checking ping"},
+                },
+            ),
+            ("content_block_stop", {"type": "content_block_stop", "index": 0}),
+            (
+                "content_block_start",
+                {
+                    "type": "content_block_start",
+                    "index": 1,
+                    "content_block": {"type": "text", "text": ""},
+                },
+            ),
+            (
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": 1,
+                    "delta": {"type": "text_delta", "text": text},
+                },
+            ),
+            ("content_block_stop", {"type": "content_block_stop", "index": 1}),
+            (
+                "message_delta",
+                {
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                    "usage": {"input_tokens": in_tok, "output_tokens": out_tok},
+                },
+            ),
+            ("message_stop", {"type": "message_stop"}),
+        ]
+        return "".join(
+            f"event: {ev}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+            for ev, data in events
+        ).encode("utf-8")
+
+    async def _handler(request: httpx.Request) -> httpx.Response:
+        captured_requests.append(request)
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_make_sse("PONG", in_tok=12, out_tok=6),
+        )
+
+    mock_http = httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="https://open.bigmodel.cn/api/anthropic",
+    )
+    client.__dict__["_async_client"] = anthropic.AsyncAnthropic(
+        api_key=dummy_token,
+        base_url="https://open.bigmodel.cn/api/anthropic",
+        http_client=mock_http,
+    )
+    try:
+        resp = await client.ainvoke([HumanMessage(content="ping")])
+    finally:
+        await mock_http.aclose()
+
+    assert len(captured_requests) == 1
+    req = captured_requests[0]
+    assert str(req.url) == "https://open.bigmodel.cn/api/anthropic/v1/messages"
+    assert "open.bigmodel.cn/api/anthropic" in str(req.url)
+    assert req.headers.get("x-api-key") == dummy_token
+    body = json.loads(req.content.decode("utf-8"))
+    assert body["model"] == "glm-5.3"
+    assert body["thinking"] == {"type": "enabled"}
+    assert body["output_config"] == {"effort": "low"}
+    assert resp.usage_metadata["input_tokens"] == 12
+    assert resp.usage_metadata["output_tokens"] == 6
+
+
+@pytest.mark.asyncio
+async def test_glm_coding_plan_only_accepts_own_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify z-ai-cn-coding only accepts its own BYOK key or ZAI_CN_CODING_API_KEY env var,
+    never falling back to parent z-ai-cn or sibling variants."""
+    from unittest.mock import create_autospec
+    from langchain_anthropic import ChatAnthropic
+    from ptc_agent.config.agent import CredentialSource
+    import src.server.database.api_keys as api_keys_mod
+    import src.server.services.llm.user_models as user_models_mod
+    from src.llms.llm import LLM, MissingProviderKeyError, create_llm
+    from src.server.services.llm.clients import (
+        _candidate_slugs,
+        resolve_byok_llm_client,
+        resolve_model_client,
+    )
+
+    LLM._model_config = None
+    mc = LLM.get_model_config()
+
+    # Candidate walk for coding_plan variant is strictly isolated to its own slug
+    assert _candidate_slugs("z-ai-cn-coding", mc) == ["z-ai-cn-coding"]
+    # Non-coding-plan parent still walks its family
+    assert "z-ai" in _candidate_slugs("z-ai-cn", mc)
+
+    monkeypatch.setattr(
+        user_models_mod,
+        "get_custom_model_config",
+        create_autospec(user_models_mod.get_custom_model_config, return_value=None),
+    )
+
+    parent_token = "parent-zai-cn-cash-token"
+    own_byok_token = "own-zai-cn-coding-byok-token"
+    env_coding_token = "env-zai-cn-coding-token"
+    orig_get_byok = api_keys_mod.get_byok_configs_for_providers
+
+    # Case 1: Parent z-ai-cn has BYOK key, z-ai-cn-coding has none, env is unset -> no client / unconfigured
+    monkeypatch.delenv("ZAI_CN_CODING_API_KEY", raising=False)
+
+    async def _byok_only_parent(user_id: str, providers: list[str]) -> dict:
+        store = {"z-ai-cn": {"api_key": parent_token, "base_url": None}}
+        return {p: store[p] for p in providers if p in store}
+
+    monkeypatch.setattr(
+        api_keys_mod,
+        "get_byok_configs_for_providers",
+        create_autospec(
+            orig_get_byok,
+            side_effect=_byok_only_parent,
+        ),
+    )
+
+    byok_client = await resolve_byok_llm_client("u-glm", "glm-5.3-plan", True)
+    assert byok_client is None
+
+    rc_unconfigured = await resolve_model_client(
+        "u-glm",
+        "glm-5.3-plan",
+        is_byok=True,
+        allow_platform_fallback=True,
+    )
+    assert rc_unconfigured.client is None
+    assert rc_unconfigured.credential_source == CredentialSource.NONE
+
+    with pytest.raises(MissingProviderKeyError):
+        create_llm("glm-5.3-plan")
+
+    # Case 2: z-ai-cn-coding has its own BYOK key -> uses its own BYOK key
+    async def _byok_own_and_parent(user_id: str, providers: list[str]) -> dict:
+        store = {
+            "z-ai-cn": {"api_key": parent_token, "base_url": None},
+            "z-ai-cn-coding": {"api_key": own_byok_token, "base_url": None},
+        }
+        return {p: store[p] for p in providers if p in store}
+
+    monkeypatch.setattr(
+        api_keys_mod,
+        "get_byok_configs_for_providers",
+        create_autospec(
+            orig_get_byok,
+            side_effect=_byok_own_and_parent,
+        ),
+    )
+
+    rc_own_byok = await resolve_model_client(
+        "u-glm",
+        "glm-5.3-plan",
+        is_byok=True,
+        allow_platform_fallback=True,
+    )
+    assert isinstance(rc_own_byok.client, ChatAnthropic)
+    assert rc_own_byok.credential_source == CredentialSource.BYOK
+    assert rc_own_byok.client.anthropic_api_key.get_secret_value() == own_byok_token
+    assert rc_own_byok.client.anthropic_api_url == "https://open.bigmodel.cn/api/anthropic"
+
+    # Case 3: Only env ZAI_CN_CODING_API_KEY is set (even if parent z-ai-cn has a BYOK key) -> uses env key
+    monkeypatch.setattr(
+        api_keys_mod,
+        "get_byok_configs_for_providers",
+        create_autospec(
+            orig_get_byok,
+            side_effect=_byok_only_parent,
+        ),
+    )
+    monkeypatch.setenv("ZAI_CN_CODING_API_KEY", env_coding_token)
+
+    rc_env = await resolve_model_client(
+        "u-glm",
+        "glm-5.3-plan",
+        is_byok=True,
+        allow_platform_fallback=True,
+    )
+    assert isinstance(rc_env.client, ChatAnthropic)
+    assert rc_env.credential_source == CredentialSource.PLATFORM
+    assert rc_env.client.anthropic_api_key.get_secret_value() == env_coding_token
+    assert rc_env.client.anthropic_api_url == "https://open.bigmodel.cn/api/anthropic"

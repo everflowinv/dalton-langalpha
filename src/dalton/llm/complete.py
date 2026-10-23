@@ -17,6 +17,7 @@ from src.dalton.budget.port import (
     format_task_cap_exhausted_message,
 )
 from src.dalton.budget.service import (
+    _is_subscription_model,
     _notional_price_index,
     _resolve_provider_for_model,
     reconcile_and_summarize_day,
@@ -224,7 +225,7 @@ def compute_call_costs(
     except Exception as exc:
         logger.debug("[DaltonComplete] calculate_cost_from_per_call_records failed: %s", exc)
 
-    if billing_type == "oauth":
+    if billing_type == "oauth" or _is_subscription_model(model_key, billing_type):
         if calc_cost > Decimal("0"):
             return Decimal("0"), calc_cost
         idx = _notional_price_index()

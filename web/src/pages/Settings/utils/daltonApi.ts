@@ -227,6 +227,9 @@ export interface DaltonProviderStatusItem {
     subs_tier_name?: string | null;
     subs_usage?: DaltonMuseSubsUsage | null;
     base_url?: string | null;
+    billing_mode?: string;
+    status_text?: string;
+    hint?: string;
   };
   quota?: {
     credit_usage_percent?: number | null;

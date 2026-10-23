@@ -66,6 +66,14 @@ def is_dalton_oauth_provider(provider: str) -> bool:
     return provider in DALTON_OAUTH_PROVIDERS
 
 
+def is_isolated_coding_plan_provider(provider: str, mc: Any) -> bool:
+    """Return True when ``provider`` is a coding-plan variant that only accepts its own slug key."""
+    if not provider or mc is None:
+        return False
+    info = mc.get_provider_info(provider) if hasattr(mc, "get_provider_info") else None
+    return isinstance(info, dict) and info.get("access_type") == "coding_plan"
+
+
 def disabled_providers() -> set[str]:
     """Return the set of disabled provider slugs from env / dalton.yaml."""
     return get_disabled_providers()

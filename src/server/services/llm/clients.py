@@ -89,6 +89,10 @@ def _candidate_slugs(provider: str, mc) -> list[str]:
     Shared by ``_walk_byok_candidates`` (key lookup) and STEP-0 prefetch so the
     two can't drift. Excludes platform-only siblings (BYOK keys never live there).
     """
+    # DALTON-HOOK(team-credentials): coding_plan variants only accept their own slug key
+    from src.dalton.llm.providers import is_isolated_coding_plan_provider
+    if is_isolated_coding_plan_provider(provider, mc):
+        return [provider]
     parent = mc.get_parent_provider(provider)
     candidates: list[str] = [provider]
     # Nested variants (e.g. z-ai-cn-coding under z-ai-cn) parent to the

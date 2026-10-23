@@ -43,11 +43,16 @@ _DEFAULT_PROBE_MODELS: dict[str, str] = {
     "antigravity-oauth": "gemini-3.8-flash-low-oauth",
     "muse-oauth": "muse-spark-1.3-oauth",
     "xai-oauth": "grok-4.7-oauth",
+    "z-ai-cn-coding": "glm-5.3-flash-plan",
     "xai": "grok-4.3",
     "deepseek": "deepseek-flash",
     "z-ai": "glm-5.3-flash",
     "openai": "gpt-6-luna",
     "gemini": "gemini-3-flash",
+}
+
+_PROVIDER_DISPLAY_NAMES: dict[str, str] = {
+    "z-ai-cn-coding": "智谱 GLM（Coding Plan）",
 }
 
 
@@ -90,8 +95,13 @@ def _load_role_model_assignments() -> list[dict[str, str]]:
 
     from src.dalton.settings import get_dalton_settings
 
-    for rev_m in get_dalton_settings().publish.reviewer_models:
+    settings = get_dalton_settings()
+    for rev_m in settings.publish.reviewer_models:
         roles.append({"role": "reviewer_candidate", "model": str(rev_m)})
+
+    extractor_m = str(settings.conversations.extractor_model or "").strip()
+    if extractor_m:
+        roles.append({"role": "conversations.extractor_model", "model": extractor_m})
 
     return roles
 
@@ -241,6 +251,7 @@ async def get_providers_status(*, user_id: str) -> dict[str, Any]:
         "antigravity-oauth",
         "muse-oauth",
         "xai-oauth",
+        "z-ai-cn-coding",
         "xai",
         "deepseek",
     ]
@@ -258,7 +269,8 @@ async def get_providers_status(*, user_id: str) -> dict[str, Any]:
         parent = str(pinfo.get("parent_provider") or "")
         access_type = str(pinfo.get("access_type") or ("oauth" if prov.endswith("-oauth") else "api_key"))
         is_oauth = access_type == "oauth" or prov.endswith("-oauth")
-        billing = "subscription" if is_oauth else "cash"
+        is_subscription = is_oauth or access_type == "coding_plan" or prov == "z-ai-cn-coding"
+        billing = "subscription" if is_subscription else "cash"
         enabled = prov not in disabled and (not parent or parent not in disabled)
 
         configured = False
@@ -408,7 +420,10 @@ async def get_providers_status(*, user_id: str) -> dict[str, Any]:
         else:
             env_key = str(pinfo.get("env_key") or f"{prov.upper().replace('-', '_')}_API_KEY")
             has_env = bool(env_key and os.environ.get(env_key, "").strip())
-            has_byok = prov in byok_providers or (parent and parent in byok_providers)
+            if access_type == "coding_plan" or prov == "z-ai-cn-coding":
+                has_byok = prov in byok_providers
+            else:
+                has_byok = prov in byok_providers or (parent and parent in byok_providers)
             configured = has_env or has_byok
             credential_info = {
                 "source": "env" if has_env else ("byok" if has_byok else "none"),
@@ -416,8 +431,20 @@ async def get_providers_status(*, user_id: str) -> dict[str, Any]:
                 "has_env": has_env,
                 "has_byok": has_byok,
             }
+            if access_type == "coding_plan" or prov == "z-ai-cn-coding":
+                credential_info["billing_mode"] = "subscription"
+                if configured:
+                    credential_info["status_text"] = (
+                        f".env ({env_key}) 已配置（订阅制）"
+                        if has_env
+                        else "BYOK 已配置（订阅制）"
+                    )
+                    credential_info["hint"] = "已配置（订阅制，包月不占现金额度）"
+                else:
+                    credential_info["status_text"] = "未配置"
+                    credential_info["hint"] = f"在 .env 配置 {env_key} 后重建后端"
             # With the .env key present the BYOK copy is redundant, not a risk: say nothing.
-            if has_byok and not has_env:
+            if has_byok and not has_env and billing == "cash":
                 warnings.append(
                     {
                         "code": "byok_cash_key",
@@ -456,7 +483,7 @@ async def get_providers_status(*, user_id: str) -> dict[str, Any]:
 
         row_payload: dict[str, Any] = {
             "provider": prov,
-            "display_name": str(pinfo.get("display_name") or prov),
+            "display_name": _PROVIDER_DISPLAY_NAMES.get(prov) or str(pinfo.get("display_name") or prov),
             "access_type": access_type,
             "billing": billing,
             "enabled": enabled,
@@ -537,13 +564,14 @@ class _ProbeLLMService:
         return_token_usage: bool = False,
     ) -> Any:
         from langchain_core.messages import HumanMessage, SystemMessage
+        from src.dalton.llm.complete import _unwrap_content_blocks
 
         messages = [
             SystemMessage(content=system_prompt or "Reply with exactly: PONG"),
             HumanMessage(content=user_prompt or "ping"),
         ]
         resp = await self._client.ainvoke(messages)
-        text = str(getattr(resp, "content", "") or "").strip()
+        text = _unwrap_content_blocks(getattr(resp, "content", "")).strip()
         raw_usage = getattr(resp, "usage_metadata", None) or {}
         usage_dict = dict(raw_usage) if isinstance(raw_usage, dict) else {}
         if return_token_usage:
