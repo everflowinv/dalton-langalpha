@@ -105,7 +105,11 @@ async def _query_bridge_internal_docs(
     if not sym or sym == "UNKNOWN":
         return []
 
-    bridge_url = os.environ.get("DALTON_BRIDGE_MCP_URL") or ""
+    # The backend runs in a container, where 127.0.0.1 is not the host the bridge listens on:
+    # use the configured researchdata URL (host.docker.internal) before the loopback guess.
+    from src.dalton.settings import get_dalton_researchdata_url
+
+    bridge_url = os.environ.get("DALTON_BRIDGE_MCP_URL") or get_dalton_researchdata_url()
     if not bridge_url:
         token = os.environ.get("DALTON_BRIDGE_TOKEN") or ""
         port = os.environ.get("DALTON_BRIDGE_PORT") or "8960"

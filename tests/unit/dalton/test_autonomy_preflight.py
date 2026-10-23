@@ -943,6 +943,7 @@ async def test_p0i_i5_autonomy_low_risk_fixes(
 
     # 2. internal.py logs warning once per hour when bridge is unconfigured
     monkeypatch.delenv("DALTON_BRIDGE_MCP_URL", raising=False)
+    monkeypatch.delenv("DALTON_RESEARCHDATA_URL", raising=False)
     monkeypatch.delenv("DALTON_BRIDGE_TOKEN", raising=False)
     monkeypatch.setattr(internal_mod, "_LAST_UNCONFIGURED_WARN_AT", 0.0)
     with caplog.at_level("WARNING"):
@@ -1729,3 +1730,22 @@ def test_topic_research_validate_stale_unmarked() -> None:
 
 
 
+
+
+@pytest.mark.asyncio
+async def test_internal_probe_uses_researchdata_url_inside_container(monkeypatch):
+    """In the backend container 127.0.0.1 is not the host: the configured researchdata URL wins."""
+    from src.dalton.autonomy.probes import internal as internal_mod
+
+    monkeypatch.delenv("DALTON_BRIDGE_MCP_URL", raising=False)
+    monkeypatch.setenv("DALTON_BRIDGE_TOKEN", "tok")
+    monkeypatch.setenv("DALTON_RESEARCHDATA_URL", "http://host.docker.internal:8960/mcp/tok")
+    seen: list[str] = []
+
+    def fake_fetch(*, bridge_url, route, ticker, since_ts=None, timeout_s=8.0):
+        seen.append(bridge_url)
+        return []
+
+    monkeypatch.setattr(internal_mod, "_fetch_bridge_route_sync", fake_fetch)
+    await internal_mod._query_bridge_internal_docs(ticker="GOOGL", allow_network=True)
+    assert seen and all(u.startswith("http://host.docker.internal:8960/mcp/tok") for u in seen)
