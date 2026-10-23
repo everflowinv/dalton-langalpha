@@ -499,6 +499,7 @@ async def test_analyst_offer_carries_where_the_work_was_asked_for_inline():
     )
 
 
+# DALTON-HOOK(i18n): system notices (subagent and analyst handoff) carry the keep-the-user-language line.
 @pytest.mark.asyncio
 async def test_analyst_report_message_includes_language_notice():
     from src.server.services.report_back.handoff import executor
