@@ -22,6 +22,8 @@ from src.dalton.budget.service import (
 from src.dalton.services.native_admin import (
     get_native_status,
     run_native_check,
+    run_native_retire,
+    run_native_restore,
     run_native_sync,
 )
 from src.dalton.services.openclaw_admin import (
@@ -49,6 +51,10 @@ class OpenClawSyncRequest(BaseModel):
 
 class NativeModelSyncRequest(BaseModel):
     models: list[str] = Field(min_length=1)
+
+
+class NativeModelKeysRequest(BaseModel):
+    keys: list[str] = Field(min_length=1)
 
 
 class ProviderProbeRequest(BaseModel):
@@ -175,6 +181,26 @@ async def sync_native_models_endpoint(
 ) -> dict[str, Any]:
     _require_pm_user(user_id)
     return await run_native_sync(user_id=user_id, model_keys=body.models)
+
+
+@router.post("/native-models/retire")
+@handle_api_exceptions("retire native provider models", logger)
+async def retire_native_models_endpoint(
+    body: NativeModelKeysRequest,
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    _require_pm_user(user_id)
+    return await run_native_retire(user_id=user_id, model_keys=body.keys)
+
+
+@router.post("/native-models/restore")
+@handle_api_exceptions("restore retired native models", logger)
+async def restore_native_models_endpoint(
+    body: NativeModelKeysRequest,
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    _require_pm_user(user_id)
+    return await run_native_restore(user_id=user_id, model_keys=body.keys)
 
 
 # ---------------------------------------------------------------------------

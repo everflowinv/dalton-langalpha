@@ -8,6 +8,8 @@ import {
   fetchNativeModelsStatus,
   fetchOpenClawHealth,
   fetchOpenClawStatus,
+  restoreNativeModels,
+  retireNativeModels,
   syncNativeModels,
   fetchDaltonSystemJobs,
   runDaltonSystemJobNow,
@@ -77,6 +79,34 @@ export function useNativeModelsSync() {
     onSuccess: (res) => {
       void queryClient.invalidateQueries({ queryKey: queryKeys.dalton.all });
       if (res.applied) {
+        void queryClient.invalidateQueries({ queryKey: queryKeys.models.all });
+      }
+    },
+  });
+}
+
+// Retire/restore rewrite the runtime overlay (the `retired` list), so both the
+// Dalton status and the model lists every worker serves must refresh.
+export function useNativeModelsRetire() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (params: { keys: string[] }) => retireNativeModels(params),
+    onSuccess: (res) => {
+      void queryClient.invalidateQueries({ queryKey: queryKeys.dalton.all });
+      if (res.retired_keys.length > 0) {
+        void queryClient.invalidateQueries({ queryKey: queryKeys.models.all });
+      }
+    },
+  });
+}
+
+export function useNativeModelsRestore() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (params: { keys: string[] }) => restoreNativeModels(params),
+    onSuccess: (res) => {
+      void queryClient.invalidateQueries({ queryKey: queryKeys.dalton.all });
+      if (res.restored_keys.length > 0) {
         void queryClient.invalidateQueries({ queryKey: queryKeys.models.all });
       }
     },

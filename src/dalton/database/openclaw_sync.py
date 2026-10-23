@@ -138,6 +138,8 @@ async def fetch_recent_sync_runs() -> tuple[dict[str, Any] | None, dict[str, Any
 
 async def find_user_referenced_models() -> dict[str, list[str]]:
     """Return `{model_key: [reference_source, ...]}` across all users' preferences and subagents (P0.7 §3.1)."""
+    from src.server.services.llm.availability import _MODEL_PREF_KEYS
+
     refs: dict[str, list[str]] = {}
 
     def _add(model_key: Any, source: str) -> None:
@@ -160,12 +162,11 @@ async def find_user_referenced_models() -> dict[str, list[str]]:
                 for bag in (mp, op):
                     if not isinstance(bag, dict):
                         continue
-                    for k in (
-                        "preferred_model",
-                        "preferred_background_model",
-                        "fetch_model",
-                        "compaction_model",
-                    ):
+                    # The same key list the per-turn resolver reads
+                    # (src/server/services/llm/config.py), so a saved legacy
+                    # `summarization_model` counts exactly as long as the
+                    # resolver would still use it.
+                    for k in _MODEL_PREF_KEYS:
                         if bag.get(k):
                             _add(bag.get(k), f"user:{uid}:{k}")
                     fb = bag.get("fallback_models")

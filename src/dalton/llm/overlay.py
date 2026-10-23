@@ -188,6 +188,53 @@ def _in_upstream_raw_manifest_test() -> bool:
     return any(t in cur for t in _UPSTREAM_RAW_MANIFEST_TESTS)
 
 
+def _drop_retired_models(
+    retired: list[dict[str, Any]],
+    llm_config: dict[str, Any],
+    manifest: dict[str, Any],
+) -> None:
+    """Hide PM-retired models: drop their keys from `llm_config` and their pricing
+    rows from the manifest's per-provider model lists.
+
+    Runs after every overlay source is merged, so it covers models defined in
+    the upstream manifest, `native_overlay.json`, the native-sync runtime
+    overlay, and `openclaw_overlay.json` alike — an upstream re-merge can never
+    bring a retired key back. A pricing row survives when a key that is not
+    retired still serves the same `model_id`, since the row prices that
+    survivor too.
+    """
+    manifest_models = manifest.get("models")
+    dropped_pairs: list[tuple[str, str]] = []
+    for record in retired:
+        key = str(record.get("key") or "")
+        if not key:
+            continue
+        entry = llm_config.pop(key, None)
+        if isinstance(entry, dict):
+            provider = str(entry.get("provider") or "")
+            model_id = str(entry.get("model_id") or "")
+            if provider and model_id:
+                dropped_pairs.append((provider, model_id))
+
+    if not isinstance(manifest_models, dict) or not dropped_pairs:
+        return
+    surviving_pairs = {
+        (str(entry.get("provider") or ""), str(entry.get("model_id") or ""))
+        for entry in llm_config.values()
+        if isinstance(entry, dict)
+    }
+    for provider, model_id in set(dropped_pairs):
+        if (provider, model_id) in surviving_pairs:
+            continue
+        pricing = manifest_models.get(provider)
+        if isinstance(pricing, list) and model_id:
+            manifest_models[provider] = [
+                item
+                for item in pricing
+                if not (isinstance(item, dict) and str(item.get("id")) == model_id)
+            ]
+
+
 def apply_model_overlay(
     llm_config: dict[str, Any],
     manifest: dict[str, Any],
@@ -196,6 +243,8 @@ def apply_model_overlay(
     """Merge Dalton overlays (`native_overlay.json` → native-sync runtime overlay → `openclaw_overlay.json`) into `llm_config` and `manifest`.
 
     Never overwrites existing upstream model keys or provider_config groups; logs an error and skips on collision.
+    Afterwards the native-sync overlay's PM-retired keys are dropped (see
+    `_drop_retired_models`), so they stay hidden wherever they were defined.
     """
     if path is None and _in_upstream_raw_manifest_test():
         return None
@@ -209,12 +258,21 @@ def apply_model_overlay(
         return stamp
 
     broker_on = is_broker_models_enabled()
+    retired_records: list[dict[str, Any]] = []
     for name, src_path in OVERLAY_SOURCES:
         if name == "openclaw" and not broker_on:
             continue
         overlay = load_overlay_data(src_path)
         if overlay:
             _merge_single_overlay(overlay, name, llm_config, manifest)
+            if name == "native_sync":
+                retired_records = [
+                    item
+                    for item in overlay.get("retired") or []
+                    if isinstance(item, dict)
+                ]
+    if retired_records:
+        _drop_retired_models(retired_records, llm_config, manifest)
     return stamp
 
 

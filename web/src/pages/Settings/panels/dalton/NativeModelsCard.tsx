@@ -1,12 +1,14 @@
 import React, { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import type { TFunction } from 'i18next';
-import { AlertTriangle, RefreshCw, Search } from 'lucide-react';
+import { AlertTriangle, ChevronDown, ChevronRight, RefreshCw, RotateCcw, Search } from 'lucide-react';
 import { useTeamCredentials } from '@/hooks/useTeamCredentials';
 import { Button } from '@/components/ui/button';
 import { StatusPill } from '@/components/mcp/McpPrimitives';
 import {
   useNativeModelsCheck,
+  useNativeModelsRestore,
+  useNativeModelsRetire,
   useNativeModelsStatus,
   useNativeModelsSync,
 } from '../../hooks/useOpenClaw';
@@ -70,16 +72,20 @@ export function NativeModelsCard({ embedded = false }: { embedded?: boolean } = 
   const statusQuery = useNativeModelsStatus(true);
   const checkMutation = useNativeModelsCheck();
   const syncMutation = useNativeModelsSync();
+  const retireMutation = useNativeModelsRetire();
+  const restoreMutation = useNativeModelsRestore();
 
   const [dialogOpen, setDialogOpen] = useState(false);
   const [checkResult, setCheckResult] = useState<NativeModelsCheckResponse | null>(null);
   const [viewingStoredDiff, setViewingStoredDiff] = useState(false);
+  const [retiredExpanded, setRetiredExpanded] = useState(false);
   const [banner, setBanner] = useState<{ tone: 'profit' | 'loss'; text: string } | null>(null);
 
   const statusData = statusQuery.data;
   const lastCheck = statusData?.last_check;
   const added = statusData?.diff.added ?? [];
   const deprecatedCount = statusData?.diff.deprecated.length ?? 0;
+  const retired = statusData?.retired ?? [];
 
   const openStoredDiff = () => {
     setBanner(null);
@@ -115,6 +121,56 @@ export function NativeModelsCard({ embedded = false }: { embedded?: boolean } = 
           count: res.added_keys.length,
         }),
       });
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setBanner({ tone: 'loss', text: msg });
+    }
+  };
+
+  const handleConfirmRetire = async (keys: string[]) => {
+    if (keys.length === 0) return;
+    try {
+      const res = await retireMutation.mutateAsync({ keys });
+      setDialogOpen(false);
+      const inUse = res.results.filter((r) => r.status === 'in_use');
+      const retiredCount = res.retired_keys.length;
+      setBanner({
+        tone: retiredCount > 0 ? 'profit' : 'loss',
+        text:
+          t('dalton.nativeModels.retireDone', {
+            defaultValue: '已下线 {{count}} 个模型，已热加载。',
+            count: retiredCount,
+          }) +
+          (inUse.length > 0
+            ? ' ' +
+              t('dalton.nativeModels.retireInUseSkipped', {
+                defaultValue: '另有 {{count}} 个模型仍在使用中，未下线：{{keys}}',
+                count: inUse.length,
+                keys: inUse.map((r) => r.key).join(', '),
+              })
+            : ''),
+      });
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setBanner({ tone: 'loss', text: msg });
+    }
+  };
+
+  const handleRestore = async (key: string) => {
+    setBanner(null);
+    try {
+      const res = await restoreMutation.mutateAsync({ keys: [key] });
+      if (res.restored_keys.includes(key)) {
+        setBanner({
+          tone: 'profit',
+          text: t('dalton.nativeModels.restoreDone', {
+            defaultValue: '已恢复 {{keys}}，重新出现在模型列表中。',
+            keys: key,
+          }),
+        });
+      } else {
+        setBanner({ tone: 'loss', text: t('dalton.nativeModels.restoreMissing', '该模型不在下线名单中。') });
+      }
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       setBanner({ tone: 'loss', text: msg });
@@ -244,6 +300,63 @@ export function NativeModelsCard({ embedded = false }: { embedded?: boolean } = 
         )}
       </div>
 
+      {/* Retired models (collapsible): hidden from the catalog by the PM, restorable anytime */}
+      {retired.length > 0 && (
+        <div className="pt-1" data-testid="dalton-native-models-retired-section">
+          <button
+            type="button"
+            onClick={() => setRetiredExpanded((v) => !v)}
+            className="flex items-center gap-1 text-xs font-medium"
+            style={{ color: 'var(--color-text-secondary)' }}
+          >
+            {retiredExpanded ? (
+              <ChevronDown className="h-3.5 w-3.5" />
+            ) : (
+              <ChevronRight className="h-3.5 w-3.5" />
+            )}
+            <span>
+              {t('dalton.nativeModels.retiredToggle', {
+                defaultValue: '已下线的模型（{{count}}）',
+                count: retired.length,
+              })}
+            </span>
+          </button>
+          {retiredExpanded && (
+            <div className="mt-2 flex flex-col gap-1.5">
+              {retired.map((item) => (
+                <div
+                  key={item.key}
+                  className="flex items-center justify-between gap-2 text-xs"
+                  data-testid={`dalton-native-models-retired-${item.key}`}
+                >
+                  <span className="flex flex-col">
+                    <span className="font-mono" style={{ color: 'var(--color-text-primary)' }}>
+                      {item.key}
+                    </span>
+                    <span style={{ color: 'var(--color-text-tertiary)' }}>
+                      {item.provider}
+                      {item.retired_at ? ` · ${item.retired_at}` : ''}
+                    </span>
+                  </span>
+                  {isPm && (
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      disabled={restoreMutation.isPending}
+                      onClick={() => void handleRestore(item.key)}
+                      data-testid={`dalton-native-models-restore-${item.key}`}
+                    >
+                      <RotateCcw className="h-3.5 w-3.5 mr-1.5" />
+                      {t('dalton.nativeModels.restore', '恢复')}
+                    </Button>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
       <p className="text-[11px]" style={{ color: 'var(--color-text-tertiary)' }}>
         {t(
           'dalton.nativeModels.footnote',
@@ -259,7 +372,9 @@ export function NativeModelsCard({ embedded = false }: { embedded?: boolean } = 
         unchanged={dialogUnchanged}
         applying={syncMutation.isPending}
         canSync={isPm}
+        retiring={retireMutation.isPending}
         onConfirmSync={(keys) => void handleConfirmSync(keys)}
+        onConfirmRetire={(keys) => void handleConfirmRetire(keys)}
       />
     </div>
   );
