@@ -113,6 +113,18 @@ async def main_async(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _run_with_pool(args) -> int:
+    """Standalone runs must open the app pool themselves; only the server lifespan does it otherwise."""
+    from src.server.database.pool import get_or_create_pool
+
+    pool = get_or_create_pool()
+    await pool.open()
+    try:
+        return await main_async(args)
+    finally:
+        await pool.close()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Bootstrap Dalton autonomous watch automations.")
     parser.add_argument("--tickers", default="", help="Comma-separated tickers (e.g. META,AMZN,GOOGL,MSFT)")
@@ -123,7 +135,7 @@ def main() -> int:
     parser.add_argument("--include-global", action="store_true", help="Also bootstrap Home director & calendar automations")
     parser.add_argument("--dry-run", action="store_true", help="Print specs without writing to Postgres")
     args = parser.parse_args()
-    return asyncio.run(main_async(args))
+    return asyncio.run(_run_with_pool(args))
 
 
 if __name__ == "__main__":
