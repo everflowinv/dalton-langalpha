@@ -590,8 +590,8 @@ async def test_fetch_models_and_billing_and_error_classification() -> None:
             "data": [
                 {
                     "id": "grok-4.7",
+                    "name": "Grok 4.7",
                     "context_window": 256000,
-                    "max_completion_tokens": 128000,
                     "supports_reasoning_effort": True,
                     "reasoning_efforts": ["low", "medium", "high"],
                 }
@@ -602,7 +602,9 @@ async def test_fetch_models_and_billing_and_error_classification() -> None:
     models = await fetch_xai_models("tok-abc", client=mock_http)
     assert len(models) == 1
     assert models[0]["id"] == "grok-4.7"
+    assert models[0]["name"] == "Grok 4.7"
     assert models[0]["context_window"] == 256000
+    assert "max_completion_tokens" not in models[0]
     assert models[0]["supports_reasoning_effort"] is True
 
     # Billing endpoint: 200 OK with config.creditUsagePercent

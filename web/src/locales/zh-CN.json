@@ -5366,6 +5366,40 @@
       "applySync": "确认同步",
       "forceApply": "仍然强制同步"
     },
+    "nativeModels": {
+      "title": "原生模型同步",
+      "foundNew": "发现 {{count}} 个新模型",
+      "check": "检查",
+      "checking": "检查中...",
+      "viewDiff": "查看差异",
+      "pmOnly": "仅 PM 可执行检查与同步",
+      "pmOnlyHint": "仅查看模式（检查与同步需 PM 权限）",
+      "lastCheck": "上次检查",
+      "neverChecked": "尚未检查",
+      "runtimeOverlay": "运行时 overlay",
+      "noOverlay": "未生成",
+      "noChanges": "检查完成：没有新增或下线的原生模型。",
+      "syncDone": "已加入 {{count}} 个模型，已热加载。",
+      "loading": "加载上次检查结果...",
+      "footnote": "打开设置页不会自动拉取；检查使用团队凭证调用各供应商的模型列表接口，确认后只把新增模型写入运行时 overlay。",
+      "diffTitle": "原生模型同步预览",
+      "diffSummary": "确认后仅把勾选的新模型追加到运行时 overlay（var/dalton/catalog），并热加载；不修改任何文件或默认设置。",
+      "upToDate": "没有发现新增或下线的原生模型；{{count}} 个模型与当前目录一致。",
+      "added": "新增模型",
+      "keyConflictHint": "存在冲突的条目（key 与现有模型重名，或与其他供应商的新增重复）不会同步，需人工确认命名。",
+      "deprecated": "疑似下线模型",
+      "deprecatedHint": "下线仅提示，不会自动删除；模型仍保留在目录中，可继续使用。",
+      "inUse": "使用中",
+      "notReferenced": "未被引用",
+      "applying": "同步中...",
+      "apply": "加入所选模型",
+      "providerOk": "{{count}} 个模型",
+      "providerUnsupported": "不提供列表",
+      "providerError": "检查失败",
+      "providerNever": "尚未检查",
+      "duplicateNameHint": "显示名与其他模型重复，可能是旧别名（默认未勾选）",
+      "claudeThinkingNote": "新增的 Claude 模型暂不带推理强度设置。"
+    },
     "publish": {
       "cardTitle": "正式研究报告发布审批（PM 终审）",
       "labelingIncompleteWarning": "标注未完成，口语数字和指标可能未核验",
@@ -5407,7 +5441,8 @@
       "brokerSectionTitle": "OpenClaw broker（并行路径）",
       "subscriptionBadge": "订阅",
       "cashBadge": "现金",
-      "tosRiskBadge": "条款风险"
+      "tosRiskBadge": "条款风险",
+      "nativeModelsSectionTitle": "原生模型同步（订阅模型目录）"
     }
   }
 }

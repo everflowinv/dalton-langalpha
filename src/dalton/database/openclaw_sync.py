@@ -105,7 +105,7 @@ def _normalize_sync_row(row: dict[str, Any] | None) -> dict[str, Any] | None:
 
 
 async def fetch_recent_sync_runs() -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-    """Return `(last_run, last_succeeded_run)` from `dalton_openclaw_sync_runs`."""
+    """Return `(last_run, last_succeeded_run)` from OpenClaw runs (`source='openclaw'`, d012)."""
     async with get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
@@ -114,6 +114,7 @@ async def fetch_recent_sync_runs() -> tuple[dict[str, Any] | None, dict[str, Any
                     *,
                     (status = 'running' AND started_at < NOW() - INTERVAL '5 minutes') AS is_stale_running
                 FROM dalton_openclaw_sync_runs
+                WHERE source = 'openclaw'
                 ORDER BY started_at DESC
                 LIMIT 1
                 """
@@ -126,7 +127,7 @@ async def fetch_recent_sync_runs() -> tuple[dict[str, Any] | None, dict[str, Any
                     *,
                     FALSE AS is_stale_running
                 FROM dalton_openclaw_sync_runs
-                WHERE status = 'succeeded' AND dry_run = FALSE
+                WHERE source = 'openclaw' AND status = 'succeeded' AND dry_run = FALSE
                 ORDER BY started_at DESC
                 LIMIT 1
                 """

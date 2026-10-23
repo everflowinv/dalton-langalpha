@@ -9,11 +9,13 @@ import {
 import { useProviderStatus } from '../../hooks/useProviderStatus';
 import { ProviderRow } from './ProviderRow';
 import { OpenClawCard } from './OpenClawCard';
+import { NativeModelsCard } from './NativeModelsCard';
 
 export function ProviderStatusCard() {
   const { t } = useTranslation();
   const statusQuery = useProviderStatus(true);
   const [brokerExpanded, setBrokerExpanded] = useState(false);
+  const [nativeModelsExpanded, setNativeModelsExpanded] = useState(false);
 
   const data = statusQuery.data;
   const providers = data?.providers ?? [];
@@ -146,6 +148,34 @@ export function ProviderStatusCard() {
           )}
         </div>
       )}
+
+      {/* Native-subscription model sync card (check → confirm → add-only runtime overlay) */}
+      <div
+        className="pt-2.5 mt-1"
+        style={{ borderTop: '1px solid var(--color-border-muted)' }}
+      >
+        <button
+          type="button"
+          onClick={() => setNativeModelsExpanded((v) => !v)}
+          className="flex items-center gap-2 text-xs font-medium w-full text-left"
+          style={{ color: 'var(--color-text-secondary)' }}
+          data-testid="dalton-native-models-toggle"
+        >
+          {nativeModelsExpanded ? (
+            <ChevronDown className="h-3.5 w-3.5" />
+          ) : (
+            <ChevronRight className="h-3.5 w-3.5" />
+          )}
+          <span>
+            {t('dalton.providers.nativeModelsSectionTitle', '原生模型同步（订阅模型目录）')}
+          </span>
+        </button>
+        {nativeModelsExpanded && (
+          <div className="mt-2.5">
+            <NativeModelsCard embedded />
+          </div>
+        )}
+      </div>
     </div>
   );
 }

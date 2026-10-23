@@ -146,22 +146,26 @@ def load_upstream_bare_pricing() -> dict[str, dict[str, Any]]:
     return out
 
 
+# Upstream reasoning-level spellings → catalog effort names (shared with the
+# native model sync, which maps per-provider levels onto the same scale).
+_REASONING_LEVEL_MAP: dict[str, str] = {
+    "off": "none",
+    "none": "none",
+    "minimal": "low",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "max",
+}
+
+
 def _normalize_reasoning_efforts(levels: list[str] | None) -> list[str]:
     if not levels:
         return ["low", "medium", "high"]
-    mapping = {
-        "off": "none",
-        "none": "none",
-        "minimal": "low",
-        "low": "low",
-        "medium": "medium",
-        "high": "high",
-        "xhigh": "xhigh",
-        "max": "max",
-    }
     seen: list[str] = []
     for lv in levels:
-        mapped = mapping.get(str(lv).lower())
+        mapped = _REASONING_LEVEL_MAP.get(str(lv).lower())
         if mapped and mapped not in seen:
             seen.append(mapped)
     return seen or ["low", "medium", "high"]
