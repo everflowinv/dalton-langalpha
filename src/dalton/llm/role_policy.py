@@ -622,6 +622,42 @@ def check_roles(
             }
         )
 
+    # Number audit chain (publish.audit_model + audit_fallback_models): same
+    # contributor ban as every role, and it must be configured at all.
+    pub_cfg = get_dalton_settings().publish
+    audit_chain = [m for m in [pub_cfg.audit_model, *pub_cfg.audit_fallback_models] if m and m.strip()]
+    if not (pub_cfg.audit_model or "").strip():
+        warnings.append(
+            {
+                "code": "audit_model_missing",
+                "role": "audit",
+                "model": "",
+                "message": "数字核验未配置模型：请在 dalton.yaml 的 publish.audit_model 指定。",
+                "link": "/settings?tab=model",
+            }
+        )
+    for a_m in audit_chain:
+        if is_forbidden_for_roles(a_m):
+            warnings.append(
+                {
+                    "code": "role_forbidden_model",
+                    "role": "audit",
+                    "model": a_m,
+                    "message": f"数字核验模型 {a_m} 为 contributor 禁用变体（L21 严禁用于任何基金研究角色）。",
+                    "link": "/settings?tab=model",
+                }
+            )
+        elif available_models is not None and a_m not in available_models:
+            warnings.append(
+                {
+                    "code": "role_model_unavailable",
+                    "role": "audit",
+                    "model": a_m,
+                    "message": f"数字核验模型 {a_m} 当前不可用（凭据未配置或供应商已关闭）。",
+                    "link": "/settings?tab=model",
+                }
+            )
+
     for fb_m in assist_fb_models:
         fb_fam = family_of(fb_m)
         if fb_fam == "unknown":

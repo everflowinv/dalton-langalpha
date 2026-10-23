@@ -74,7 +74,7 @@ def resolve_assist_model(role: str = "assist", explicit_model: str | None = None
     1. `explicit_model` if provided
     2. `agent_config.dalton.yaml` `llm.<role>` (e.g. `llm.assist`)
     3. `src/dalton/dalton.yaml` `llm.<role>` or `publish.extract_model`
-    4. `'gemini-3.8-flash-low-oauth'` if present in merged model catalog, else `'deepseek-flash'`
+    4. `src/dalton/dalton.yaml` `models.assist_model`
 
     Raises `RolePolicyError` if the resolved model is marked `forbidden_for_roles` (L21).
     """
@@ -101,16 +101,10 @@ def resolve_assist_model(role: str = "assist", explicit_model: str | None = None
         if isinstance(ext_val, str) and ext_val.strip():
             return _validate_assist_candidate(role, ext_val)
 
-    try:
-        from src.llms.llm import LLM
+    # Last resort is the configured `models.assist_model` (dalton.yaml), never a name in code.
+    from src.dalton.settings import get_dalton_config
 
-        catalog = LLM.get_model_config().llm_config or {}
-        if "gemini-3.8-flash-low-oauth" in catalog:
-            return "gemini-3.8-flash-low-oauth"
-    except Exception:
-        pass
-
-    return "deepseek-flash"
+    return _validate_assist_candidate(role, get_dalton_config().models.assist_model)
 
 
 def resolve_assist_fallback_models(role: str = "assist_fallback") -> list[str]:
@@ -156,6 +150,13 @@ def _is_safe_to_fallback(comp: Any) -> bool:
     if ek == "billing":
         return not _has_stream_output_started(comp)
     return ek == "pre_send" or (ek.startswith("http_4") and ek != "http_429")
+
+
+def _is_timeout_or_rate_limit(comp: Any) -> bool:
+    if comp.ok:
+        return False
+    text = f"{getattr(comp, 'error_kind', '') or ''} {getattr(comp, 'error', '') or ''}".lower()
+    return "timeout" in text or "http_429" in text or "429" in text or "rate_limit" in text
 
 
 def _extract_json_dict(raw_data: Any, raw_text: str | None) -> dict[str, Any]:
@@ -235,8 +236,18 @@ async def assist_json(
     resend_indeterminate: bool = False,
     persist_raw: bool = True,
     skip_journal: bool = False,
+    fallback_models: list[str] | None = None,
+    deadline: float | None = None,
 ) -> AssistResult:
     """Invoke a cheap/subscription LLM for structured JSON judgment, cached in Postgres.
+
+    ``fallback_models`` replaces the shared assist fallbacks for a task that names its
+    own model chain. For such a chain each candidate is judged by its own billing: a
+    subscription-billed model may be re-sent after an indeterminate call and may be
+    left for the next candidate after a timeout or 429, since neither can charge cash
+    twice; a cash model keeps the double-charge guard. ``deadline`` (``time.monotonic``)
+    is handed to every call: past it a journalled result still replays, but nothing new
+    is sent, and each send's timeout is capped to the time left at the moment of sending.
 
     Never raises: returns `AssistResult(ok=False, data=None, error=...)` on any error.
     """
@@ -249,6 +260,24 @@ async def assist_json(
 
     try:
         resolved_model = resolve_assist_model(role=role, explicit_model=model)
+        own_chain = fallback_models is not None
+
+        def _is_subscription(m: str) -> bool:
+            from src.dalton.llm.complete import resolve_model_billing_and_provider
+
+            return resolve_model_billing_and_provider(m)[0] == "oauth"
+
+        def _resend_for(m: str) -> bool:
+            return bool(resend_indeterminate) or (own_chain and _is_subscription(m))
+
+        # Every candidate passes the policy check (L21) before anything is sent, so a
+        # forbidden fallback fails fast rather than after a primary result is discarded.
+        fb_list = (
+            [_validate_assist_candidate(f"{role}_fallback", m) for m in fallback_models if m and m.strip()]
+            if own_chain
+            else (resolve_assist_fallback_models() if model is None else [])
+        )
+
         payload_json = json.dumps(
             payload if isinstance(payload, dict) else {"value": payload},
             sort_keys=True,
@@ -276,16 +305,28 @@ async def assist_json(
             response_schema=schema,
             slot="background",
             timeout_s=timeout_s,
+            deadline=deadline,
             workspace_id=workspace_id,
             thread_id=thread_id,
-            resend_indeterminate=resend_indeterminate,
+            resend_indeterminate=_resend_for(resolved_model),
             raise_on_error=False,
             persist_raw=persist_raw,
             skip_journal=skip_journal,
         )
-        if model is None and _is_safe_to_fallback(comp):
+        def _should_fall_back(c: Any, m: str) -> bool:
+            if c.ok:
+                return False
+            if _is_safe_to_fallback(c):
+                return True
+            # Past the deadline nothing new can be sent, but a fallback may still have a
+            # journalled answer from an earlier run: let the chain look (replay only).
+            if own_chain and deadline is not None and time.monotonic() >= deadline:
+                return True
+            return own_chain and _is_subscription(m) and _is_timeout_or_rate_limit(c)
+
+        if fb_list and _should_fall_back(comp, resolved_model):
             primary_model = resolved_model
-            for fb_cand in resolve_assist_fallback_models():
+            for fb_cand in fb_list:
                 if fb_cand == primary_model:
                     continue
                 logger.info(
@@ -306,15 +347,17 @@ async def assist_json(
                     response_schema=schema,
                     slot="background",
                     timeout_s=timeout_s,
+                    deadline=deadline,
                     workspace_id=workspace_id,
                     thread_id=thread_id,
+                    resend_indeterminate=_resend_for(fb_cand),
                     raise_on_error=False,
                     persist_raw=persist_raw,
                     skip_journal=skip_journal,
                 )
                 comp = comp_fb
                 resolved_model = fb_cand
-                if comp_fb.ok or not _is_safe_to_fallback(comp_fb):
+                if comp_fb.ok or not _should_fall_back(comp_fb, fb_cand):
                     break
 
         elapsed_ms = int((time.monotonic() - t0) * 1000)

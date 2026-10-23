@@ -9,7 +9,7 @@ llm:
   # the owner's *-oauth connections serve every member.
   name: "claude-opus-5-5-oauth"
   background: "gemini-4-argon-low-oauth"
-  assist: "ocb-google-gemini-3.8-flash"
+  assist: "gemini-3.8-flash-low-oauth"
   compaction: ""
   fetch: ""
   fallback:

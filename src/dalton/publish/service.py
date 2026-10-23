@@ -376,8 +376,12 @@ async def run_publish(
             thread_id=thread_id,
         )
         audit_path, annotated_path = _derive_sidecar_paths(draft_path)
-        await backend.awrite_text(audit_path, await asyncio.to_thread(render_audit_md, audit, draft_path=draft_path))
-        await backend.awrite_text(annotated_path, await asyncio.to_thread(render_annotated_draft, draft_text, audit))
+        await backend.awrite_text(
+            audit_path, await asyncio.to_thread(render_audit_md, audit, draft_path=draft_path)
+        )
+        await backend.awrite_text(
+            annotated_path, await asyncio.to_thread(render_annotated_draft, draft_text, audit)
+        )
 
         if not audit.passed:
             await db_publications.transition(

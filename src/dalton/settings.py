@@ -67,11 +67,20 @@ class DaltonPublishConfig(BaseModel):
         default_factory=lambda: [
             "gpt-6.1-sol-oauth",
             "gemini-4-argon-high-oauth",
-            "ocb-xai-grok-4.7",
+            "grok-4.7-oauth",
             "claude-opus-5-5-oauth",
         ]
     )
     extract_model: str | None = None
+    # Number audit (check_draft / publish): labelling and judging figures. Its own
+    # models, not the shared assist slot. Named in dalton.yaml only; empty here so a
+    # missing config fails loudly instead of quietly picking a model.
+    audit_model: str = ""
+    audit_fallback_models: list[str] = Field(default_factory=list)
+    audit_timeout_s: float = Field(default=300.0, gt=0)
+    audit_concurrency: int = Field(default=4, ge=1, le=16)
+    # Wall-time budget for one whole audit (extraction, labelling, matching, judge), seconds.
+    audit_total_timeout_s: float = Field(default=1800.0, gt=0)
     approval_ttl_hours: int = Field(default=168, gt=0)
     max_file_bytes: int = Field(default=20_971_520, gt=0)
     consensus_providers: list[str] = Field(

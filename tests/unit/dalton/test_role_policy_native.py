@@ -210,6 +210,7 @@ def test_glm_coding_role_policy_extractor_and_main_roles() -> None:
             available_models={
                 "claude-opus-5-5-oauth",
                 "gemini-3.8-flash-low-oauth",
+                "gemini-4-argon-medium-oauth",  # publish.audit_model
                 "gpt-6.1-sol-oauth",
                 "deepseek-flash",
                 "ocb-deepseek-deepseek-flash",
