@@ -181,6 +181,245 @@ async def _repair_ops_paths_with_assist(
     return repaired, warnings
 
 
+def _deref_schema_node(
+    node: Any,
+    cur_root: dict[str, Any],
+    schemas: dict[str, dict[str, Any]],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Resolve local ``#/$defs/...`` and cross-schema ``<doc>#/$defs/...`` references."""
+    if not isinstance(node, dict):
+        return {}, cur_root
+    curr = node
+    root = cur_root
+    for _ in range(8):
+        ref = curr.get("$ref")
+        if not isinstance(ref, str):
+            break
+        if ref.startswith("#/$defs/"):
+            def_name = ref.split("#/$defs/", 1)[1]
+            target = (root.get("$defs") or {}).get(def_name)
+            if isinstance(target, dict):
+                curr = target
+                continue
+            break
+        if "#/$defs/" in ref:
+            ext_key, def_name = ref.split("#/$defs/", 1)
+            ext_root = schemas.get(ext_key) or {}
+            target = (ext_root.get("$defs") or {}).get(def_name)
+            if isinstance(target, dict):
+                curr = target
+                root = ext_root
+                continue
+            break
+        break
+    return curr, root
+
+
+def _describe_schema_field(
+    prop_node: Any,
+    cur_root: dict[str, Any],
+    schemas: dict[str, dict[str, Any]],
+) -> str:
+    """Format a compact single-line description of a schema property's type, enum, and nested constraints."""
+    resolved, eff_root = _deref_schema_node(prop_node, cur_root, schemas)
+    raw_type = resolved.get("type")
+    union_branches = resolved.get("oneOf") or resolved.get("anyOf")
+
+    obj_branch: dict[str, Any] | None = (
+        resolved if resolved.get("type") == "object" and isinstance(resolved.get("properties"), dict) else None
+    )
+    enum_vals: list[Any] | None = (
+        resolved["enum"] if isinstance(resolved.get("enum"), list) else None
+    )
+
+    if isinstance(union_branches, list) and union_branches:
+        branch_types: list[str] = []
+        has_iso_date = False
+        has_null = False
+        for b in union_branches:
+            if not isinstance(b, dict):
+                continue
+            b_ref = str(b.get("$ref") or "")
+            if b_ref.endswith("/isoDate"):
+                has_iso_date = True
+            b_res, _ = _deref_schema_node(b, eff_root, schemas)
+            bt = b_res.get("type")
+            if isinstance(bt, list):
+                for x in bt:
+                    s = str(x)
+                    if s == "null":
+                        has_null = True
+                    elif s not in branch_types:
+                        branch_types.append(s)
+            elif isinstance(bt, str):
+                if bt == "null":
+                    has_null = True
+                elif bt not in branch_types:
+                    branch_types.append(bt)
+            elif isinstance(b_res.get("enum"), list):
+                if "string" not in branch_types:
+                    branch_types.append("string")
+            if b_res.get("type") == "object" and isinstance(b_res.get("properties"), dict) and obj_branch is None:
+                obj_branch = b_res
+            if enum_vals is None and isinstance(b_res.get("enum"), list):
+                enum_vals = b_res["enum"]
+        if has_iso_date:
+            base_union = ["date" if t == "string" else t for t in branch_types] or ["date"]
+            if has_null:
+                base_union.append("null")
+            type_str = "|".join(base_union) + " (string)"
+        else:
+            if has_null:
+                branch_types.append("null")
+            type_str = "|".join(branch_types) if branch_types else "any"
+    elif isinstance(raw_type, list):
+        type_str = "|".join(str(t) for t in raw_type)
+    elif raw_type == "array" and isinstance(resolved.get("items"), dict):
+        item_res, _ = _deref_schema_node(resolved["items"], eff_root, schemas)
+        item_t = item_res.get("type")
+        if not item_t and isinstance(item_res.get("enum"), list):
+            item_t = "string"
+        item_t = item_t or "any"
+        if isinstance(item_t, list):
+            item_t = "|".join(str(x) for x in item_t)
+        type_str = f"array<{item_t}>"
+        if isinstance(item_res.get("enum"), list):
+            type_str += f" (items enum={json.dumps(item_res['enum'], ensure_ascii=False)})"
+    elif isinstance(raw_type, str):
+        ref_str = str(prop_node.get("$ref") or "") if isinstance(prop_node, dict) else ""
+        if ref_str.endswith("/isoDate"):
+            type_str = "date (string)"
+        else:
+            type_str = raw_type
+    elif "const" in resolved:
+        type_str = f"const={json.dumps(resolved['const'], ensure_ascii=False)}"
+    elif enum_vals is not None:
+        type_str = "string"
+    else:
+        type_str = "any"
+
+    parts = [type_str]
+    if enum_vals is not None:
+        parts.append(f"enum={json.dumps(enum_vals, ensure_ascii=False)}")
+    if obj_branch is not None:
+        sub_req = obj_branch.get("required") or []
+        if sub_req:
+            parts.append(f"required={json.dumps(sub_req, ensure_ascii=False)}")
+        if "additionalProperties" in obj_branch:
+            parts.append(f"additionalProperties={json.dumps(obj_branch['additionalProperties'])}")
+    return ", ".join(parts)
+
+
+def _format_expected_structures(
+    doc_key: str,
+    errors: list[dict[str, Any]],
+    *,
+    max_chars: int = 1500,
+) -> str:
+    """Extract expected JSON Schema object structure (required, field types, enum, additionalProperties) for failing paths."""
+    if not errors:
+        return ""
+    schemas, _ = _load_schemas_and_registry()
+    doc_schema = schemas.get(doc_key)
+    if not isinstance(doc_schema, dict):
+        return ""
+
+    root_node, root_ctx = _deref_schema_node(doc_schema, doc_schema, schemas)
+    seen_paths: set[str] = set()
+    blocks: list[str] = []
+
+    for err in errors:
+        if not isinstance(err, dict):
+            continue
+        err_path = str(err.get("path") or "/")
+        segs = [s for s in err_path.split("/") if s]
+        cur_node, cur_root = root_node, root_ctx
+        history: list[tuple[str, dict[str, Any], dict[str, Any]]] = [("/", cur_node, cur_root)]
+        built_segs: list[str] = []
+
+        for seg in segs:
+            cur_node, cur_root = _deref_schema_node(cur_node, cur_root, schemas)
+            if seg.isdigit() and isinstance(cur_node.get("items"), dict):
+                cur_node, cur_root = _deref_schema_node(cur_node["items"], cur_root, schemas)
+                built_segs.append(seg)
+                history.append(("/" + "/".join(built_segs), cur_node, cur_root))
+            elif isinstance(cur_node.get("properties"), dict) and seg in cur_node["properties"]:
+                cur_node, cur_root = _deref_schema_node(
+                    cur_node["properties"][seg], cur_root, schemas
+                )
+                built_segs.append(seg)
+                history.append(("/" + "/".join(built_segs), cur_node, cur_root))
+            elif isinstance(cur_node.get("items"), dict):
+                item_node, item_root = _deref_schema_node(cur_node["items"], cur_root, schemas)
+                if isinstance(item_node.get("properties"), dict) and seg in item_node["properties"]:
+                    cur_node, cur_root = _deref_schema_node(
+                        item_node["properties"][seg], item_root, schemas
+                    )
+                    built_segs.append(seg)
+                    history.append(("/" + "/".join(built_segs), cur_node, cur_root))
+                else:
+                    break
+            else:
+                break
+
+        target_path, target_node, target_root = history[-1]
+        if not isinstance(target_node.get("properties"), dict):
+            if isinstance(target_node.get("items"), dict):
+                item_node, item_root = _deref_schema_node(
+                    target_node["items"], target_root, schemas
+                )
+                if isinstance(item_node.get("properties"), dict):
+                    target_path = f"{target_path.rstrip('/')}/*"
+                    target_node, target_root = item_node, item_root
+            if not isinstance(target_node.get("properties"), dict):
+                for h_path, h_node, h_root in reversed(history[:-1]):
+                    if isinstance(h_node.get("properties"), dict):
+                        target_path, target_node, target_root = h_path, h_node, h_root
+                        break
+
+        if not isinstance(target_node.get("properties"), dict) or target_path in seen_paths:
+            continue
+        seen_paths.add(target_path)
+
+        req_fields = [k for k in (target_node.get("required") or []) if k != "official"]
+        add_props = target_node.get("additionalProperties", True)
+        props = {
+            k: v
+            for k, v in (target_node.get("properties") or {}).items()
+            if k != "official"
+        }
+        req_set = set(req_fields)
+        lines = [
+            f"Expected structure for {target_path} "
+            f"(required={json.dumps(req_fields, ensure_ascii=False)}, "
+            f"additionalProperties={json.dumps(add_props)}):"
+        ]
+        for fname, fschema in props.items():
+            fdesc = _describe_schema_field(fschema, target_root, schemas)
+            req_tag = " [required]" if fname in req_set else ""
+            lines.append(f"  {fname}: {fdesc}{req_tag}")
+        blocks.append("\n".join(lines))
+
+    if not blocks:
+        return ""
+    combined = "\n".join(blocks)
+    if len(combined) > max_chars:
+        ellipsis_line = "…（其余字段省略）"
+        budget = max_chars - len(ellipsis_line) - 1
+        kept_lines: list[str] = []
+        cur_len = 0
+        for line in combined.splitlines():
+            add_len = len(line) if not kept_lines else len(line) + 1
+            if cur_len + add_len > budget:
+                break
+            kept_lines.append(line)
+            cur_len += add_len
+        if not kept_lines:
+            return ellipsis_line[:max_chars]
+        return "\n".join(kept_lines) + "\n" + ellipsis_line
+    return combined
+
+
 def _schema_props_for_path(schema_obj: dict[str, Any], err_path: str) -> list[str]:
     """Return allowed property names for the schema container at ``err_path`` (resolving local ``#/$defs/``)."""
     defs = schema_obj.get("$defs") or {}
@@ -620,12 +859,14 @@ async def apply_update(
         val.warnings = [*repair_warnings, *val.warnings]
 
     if not val.ok:
+        schema_hint = _format_expected_structures(doc_key, val.errors)
+        hint_suffix = f"\n\n{schema_hint}" if schema_hint else ""
         return {
             "ok": False,
             "error": val.errors[0]["code"],
             "problems": val.errors,
             "warnings": val.warnings,
-            "message": f"Validation failed for {doc_key} (NOT SAVED):\n{val.format_problems()}",
+            "message": f"Validation failed for {doc_key} (NOT SAVED):\n{val.format_problems()}{hint_suffix}",
         }
 
     # Step 4: Insert version into DB
@@ -758,11 +999,13 @@ async def append_verdict(
             }
         )
     if not val.ok:
+        schema_hint = _format_expected_structures("verdict", val.errors)
+        hint_suffix = f"\n\n{schema_hint}" if schema_hint else ""
         return {
             "ok": False,
             "error": "schema_error",
             "problems": val.errors,
-            "message": f"Invalid verdict payload (NOT SAVED):\n{val.format_problems()}",
+            "message": f"Invalid verdict payload (NOT SAVED):\n{val.format_problems()}{hint_suffix}",
         }
 
     if not had_id:

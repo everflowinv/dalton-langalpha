@@ -210,11 +210,13 @@ def task_report_message(
     # call, so "after your previous turn ended" can be false.
     when = " while you were working" if steered else ""
     outcome = "FAILED" if report.failed else "finished"
+    # DALTON-HOOK(i18n): Prevent language drift after English subagent completion notices
     return (
         "<system>\n"
         f"Background subagent {report.display_id} ({subagent_type or 'subagent'}) "
         f"{outcome}{when}.\n"
         f"Task description: {report.description or ''}\n"
+        "This notice is from the system, not the user. Keep writing to the user in the language of their request.\n"
         "</system>"
     )
 

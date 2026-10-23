@@ -314,14 +314,49 @@ async def test_task_offer_steers_an_owed_report():
         offer = await steer._task_offer(_task_job())
 
     assert offer.job_id == "job-1"
+    # DALTON-HOOK(i18n): task_report_message includes system-language notice
     assert offer.content == (
         "<system>\n"
         "Background subagent Task-abc123 (research) finished while you were "
         "working.\n"
         "Task description: look things up\n"
+        "This notice is from the system, not the user. Keep writing to the user in the language of their request.\n"
         "</system>"
     )
     assert offer.report_source["kind"] == "task"
+
+
+def test_task_report_message_includes_language_notice_and_preserves_fields():
+    from src.server.models.chat import TaskReport
+    from src.server.services.report_back.subagent import task_report_message
+
+    report = TaskReport(
+        kind="task",
+        task_id="abc123",
+        display_id="Task-abc123",
+        description="collect Cloud segment revenue",
+        failed=False,
+    )
+    msg_posted = task_report_message(report, "dalton-evidence", steered=False)
+    assert msg_posted == (
+        "<system>\n"
+        "Background subagent Task-abc123 (dalton-evidence) finished.\n"
+        "Task description: collect Cloud segment revenue\n"
+        "This notice is from the system, not the user. Keep writing to the user in the language of their request.\n"
+        "</system>"
+    )
+
+    msg_steered = task_report_message(report, "dalton-evidence", steered=True)
+    assert (
+        "Background subagent Task-abc123 (dalton-evidence) finished while you were working.\n"
+        in msg_steered
+    )
+    assert "Task description: collect Cloud segment revenue\n" in msg_steered
+    assert (
+        "This notice is from the system, not the user. Keep writing to the user in the language of their request.\n"
+        in msg_steered
+    )
+    assert msg_steered.startswith("<system>\n") and msg_steered.endswith("\n</system>")
 
 
 # ---------------------------------------------------------------------------
@@ -367,9 +402,11 @@ async def test_analyst_offer_steers_an_owed_report():
         offer = await steer._analyst_offer(_analyst_job(), "t-1")
 
     assert offer.job_id == "job-1"
+    # DALTON-HOOK(i18n): Analyst report_message carries language-preservation notice
     assert offer.content == (
         "<system>\n"
         "The analysis you dispatched (thread ptc-1 in a workspace) has completed.\n"
+        "This notice is from the system, not the user. Keep writing to the user in the language of their request.\n"
         "</system>"
     )
     assert offer.report_source == {"kind": "analyst", "thread_id": "ptc-1"}
@@ -455,7 +492,33 @@ async def test_analyst_offer_carries_where_the_work_was_asked_for_inline():
     assert offer.content == (
         "<system>\n"
         "The analysis you dispatched (thread ptc-1 in a workspace) has completed.\n"
+        "This notice is from the system, not the user. Keep writing to the user in the language of their request.\n"
         "</system>"
     ) + build_directive_reminder(
         [DirectiveContext(content="Asked in a Slack conversation.")]
     )
+
+
+@pytest.mark.asyncio
+async def test_analyst_report_message_includes_language_notice():
+    from src.server.services.report_back.handoff import executor
+
+    with patch.object(
+        executor, "_workspace_name", autospec=True, return_value="GOOGL"
+    ):
+        msg, source = await executor.report_message(
+            "ptc-99",
+            {"ptc_workspace_id": "ws-googl"},
+            "completed",
+            steered=False,
+        )
+    assert msg == (
+        "<system>\n"
+        'The analysis you dispatched (thread ptc-99 in the "GOOGL" workspace) has completed.\n'
+        "This notice is from the system, not the user. Keep writing to the user in the language of their request.\n"
+        "</system>"
+    )
+    assert source.kind == "analyst"
+    assert source.thread_id == "ptc-99"
+    assert source.workspace_name == "GOOGL"
+

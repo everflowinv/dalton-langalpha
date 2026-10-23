@@ -447,10 +447,12 @@ async def report_message(
     ptc_workspace_id = origin.get("ptc_workspace_id")
     ws_name = await _workspace_name(ptc_workspace_id)
     ws_label = f'the "{ws_name}" workspace' if ws_name else "a workspace"
+    # DALTON-HOOK(i18n): Prevent language drift after English analyst report-back notices
     message = (
         "<system>\n"
         f"The analysis you dispatched (thread {ptc_thread_id} in {ws_label}) "
         f"{_OUTCOME_INSTRUCTIONS[final_status]}\n"
+        "This notice is from the system, not the user. Keep writing to the user in the language of their request.\n"
         "</system>"
     )
     reminder = requested_from.reminder(origin) if steered else None

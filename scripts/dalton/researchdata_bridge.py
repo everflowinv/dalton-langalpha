@@ -960,7 +960,10 @@ RESEARCH_EVIDENCE_AND_ROUTE_GUIDE: str = (
 
 
 def build_researchdata_plugin_instruction() -> str:
-    """Build the canonical `researchdata` server instruction for `plugins/dalton_data/plugin.json`."""
+    """Build the canonical `researchdata` server instruction for `plugins/dalton_data/plugin.json`.
+
+    Pagination range in `params`: `offset` (>= 0) and `max_chars` (1..30000; values > 30000 are clamped to 30000).
+    """
     return (
         "Fund-internal sources; call from execute_code only (no direct path). "
         "Start with `catalog()` once per thread to see routes. "
@@ -969,7 +972,7 @@ def build_researchdata_plugin_instruction() -> str:
         'Finance: `finance(route="sec"|"estimates"|"cn-hk")`. '
         'Macro: `macro(route="fred"|"treasury")`. '
         "Read only ids that search returned (`wiki:`, `mail:`, `tmtb:`, `funda:`, `alphaengine` doc_id). "
-        "Page long text with params.offset/max_chars. "
+        "Page long text with params.offset/max_chars (offset >= 0, max_chars 1-30000). "
         "Leave `timeout` unset: the bridge sets per-route limits and long reads may take minutes. "
         "AlphaEngine 检索可以放开，全文阅读（get_document）计配额，读最相关的几篇。"
         "Every result has `_sources` (identity, document_id, as_of, url). "
@@ -980,6 +983,119 @@ def build_researchdata_plugin_instruction() -> str:
         "The fund wiki is read-only; never try to write to it. "
         '`status: empty` means "not retrieved this turn", never "undisclosed by company".'
     )
+
+
+INTERNAL_LIBRARY_ROUTES: frozenset[str] = frozenset(
+    {"company-wiki", "sales-notes", "tmtb", "funda-ai", "all", "sales-mail"}
+)
+INTERNAL_LIBRARY_READ_OPERATIONS: frozenset[str] = frozenset({"read"})
+MAX_CHARS_FLOOR: int = 1
+MAX_CHARS_CEILING: int = 30000
+TRANSCRIPT_QUERY_IGNORED_NOTE: str = (
+    "transcript 的 query 只用来传公司名，主题检索请在拿到 doc_id 后读正文。"
+)
+TRANSCRIPT_ROIC_403_ERROR: str = "AlphaEngine 无匹配，roic 回退已不可用。"
+TRANSCRIPT_ROIC_403_HINT: str = "用公司名（| 分隔中英文）重试，或者扩大 start/end。"
+TRANSCRIPT_CATALOG_RULE: str = (
+    "transcript 的 query 只用来传公司名（可用 | 分隔中英文，给了 ticker 时勿传主题词查询），"
+    "主题检索请在拿到 doc_id 后读正文；roic 回退已不可用（403），无匹配时用公司名（| 分隔中英文）重试或扩大 start/end。"
+)
+INTERNAL_LIBRARY_PAGINATION_RULE: str = (
+    "正文分页参数范围：params.offset >= 0，params.max_chars 为 1–30000（超出 30000 自动截断为 30000）；"
+    "读取用顶层 document 参数传带前缀 ID（wiki:/mail:/tmtb:/digest:/funda:），纯数字 ID 属 AlphaEngine 文档。"
+)
+
+_TRANSCRIPT_TOPIC_EN_RE = re.compile(
+    r"\b(?:"
+    r"earnings|call|guidance|capex|capital|expenditures?|revenue|margin|results|"
+    r"outlook|transcript|conference|quarter|"
+    r"q[1-4]|fy(?:\d{2,4})?|20\d\d"
+    r")\b",
+    re.IGNORECASE,
+)
+_TRANSCRIPT_TOPIC_ZH_KEYWORDS: tuple[str, ...] = (
+    "业绩",
+    "电话会",
+    "指引",
+    "资本开支",
+    "营收",
+    "利润率",
+)
+_ROIC_403_TEXT_RE = re.compile(
+    r"403(?:\s*:?\s*|\s+client\s+error:\s*)forbidden",
+    re.IGNORECASE,
+)
+
+
+def _parse_int_param(val: Any) -> int | None:
+    """Parse an int or integer string (excluding bool), returning None if not an integer."""
+    if isinstance(val, bool):
+        return None
+    if isinstance(val, int):
+        return val
+    if isinstance(val, str):
+        s = val.strip()
+        if re.fullmatch(r"[+-]?\d+", s):
+            try:
+                return int(s)
+            except ValueError:
+                return None
+    return None
+
+
+def _is_topic_query_for_transcript(query: str) -> bool:
+    """Return True only when `query` contains explicit topic signals (earnings/quarter/year/metric terms)."""
+    q = query.strip()
+    if not q or "|" in q:
+        return False
+    if _TRANSCRIPT_TOPIC_EN_RE.search(q):
+        return True
+    return any(kw in q for kw in _TRANSCRIPT_TOPIC_ZH_KEYWORDS)
+
+
+def _rewrite_transcript_roic_403(payload: dict[str, Any]) -> None:
+    """Rewrite error and hint when structured fallback/source is `roic` and status is 403 / `403 Forbidden`."""
+    if payload.get("ok") is not False:
+        return
+    data_dict = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    fallback_obj = (
+        payload.get("fallback") if "fallback" in payload else data_dict.get("fallback")
+    )
+    fallback_dict = fallback_obj if isinstance(fallback_obj, dict) else {}
+
+    role_candidates: list[str] = []
+    if isinstance(fallback_obj, str):
+        role_candidates.append(fallback_obj)
+    for d in (payload, data_dict, fallback_dict):
+        for k in ("fallback", "argv_role", "source"):
+            val = d.get(k)
+            if isinstance(val, str):
+                role_candidates.append(val)
+
+    is_roic = any(
+        c.strip().lower() in ("roic", "roic.ai", "fallback_roic")
+        for c in role_candidates
+    )
+    if not is_roic:
+        return
+
+    has_403_status = any(
+        (isinstance(d.get(k), int) and not isinstance(d.get(k), bool) and d.get(k) == 403)
+        or (isinstance(d.get(k), str) and d.get(k).strip() == "403")
+        for d in (payload, data_dict, fallback_dict)
+        for k in ("status_code", "http_status", "code")
+    )
+    has_403_error_text = any(
+        isinstance(d.get(k), str) and bool(_ROIC_403_TEXT_RE.search(d[k]))
+        for d in (payload, data_dict, fallback_dict)
+        for k in ("error", "stderr", "message")
+    )
+    if has_403_status or has_403_error_text:
+        payload["error"] = TRANSCRIPT_ROIC_403_ERROR
+        payload["hint"] = TRANSCRIPT_ROIC_403_HINT
+        if isinstance(payload.get("data"), dict):
+            payload["data"]["error"] = TRANSCRIPT_ROIC_403_ERROR
+            payload["data"]["hint"] = TRANSCRIPT_ROIC_403_HINT
 
 
 COMMUNITY_DESCRIPTION_SUFFIX: str = (
@@ -1253,7 +1369,17 @@ def _is_empty_community_output(route: str, operation: str, parsed: Any) -> bool:
 
 
 class ResearchDataBridge:
-    RESEARCH_DESCRIPTION_SUFFIX: str = "\n\n" + RESEARCH_EVIDENCE_AND_ROUTE_GUIDE
+    """HTTP-to-stdio MCP bridge for OpenClaw `researchdata`.
+
+    Normalizes `params.offset` (>= 0) and `params.max_chars` (1..30000), guides internal-library
+    document IDs vs numeric AlphaEngine IDs, and prevents topic queries from derailing `transcript`.
+    """
+
+    RESEARCH_DESCRIPTION_SUFFIX: str = (
+        "\n\n"
+        + RESEARCH_EVIDENCE_AND_ROUTE_GUIDE
+        + "\n分页参数范围：params.offset >= 0，params.max_chars 为 1–30000（超出 30000 自动截断为 30000）。"
+    )
     COMMUNITY_DESCRIPTION_SUFFIX: str = COMMUNITY_DESCRIPTION_SUFFIX
 
     def __init__(self, cfg: BridgeConfig) -> None:
@@ -1447,6 +1573,12 @@ class ResearchDataBridge:
                 desc = str(tool_copy.get("description") or "").rstrip()
                 if self.RESEARCH_DESCRIPTION_SUFFIX.strip() not in desc:
                     tool_copy["description"] = desc + self.RESEARCH_DESCRIPTION_SUFFIX
+                if isinstance(props, dict) and isinstance(props.get("params"), dict):
+                    p_desc = str(props["params"].get("description") or "").rstrip()
+                    if "1-30000" not in p_desc and "1–30000" not in p_desc:
+                        props["params"]["description"] = (
+                            f"{p_desc} 分页范围：offset >= 0，max_chars 1–30000。"
+                        ).strip()
             elif tool_name == "community":
                 desc = str(tool_copy.get("description") or "").rstrip()
                 if self.COMMUNITY_DESCRIPTION_SUFFIX.strip() not in desc:
@@ -3617,6 +3749,111 @@ class ResearchDataBridge:
         if tool_name != "catalog":
             call_args["timeout"] = eff_timeout
 
+        params_clamped: dict[str, list[Any]] = {}
+        raw_params_obj = call_args.get("params")
+        if isinstance(raw_params_obj, dict):
+            clamped_p = dict(raw_params_obj)
+            mc_raw = clamped_p.get("max_chars")
+            mc_int = _parse_int_param(mc_raw)
+            if mc_int is not None:
+                if mc_int > MAX_CHARS_CEILING:
+                    params_clamped["max_chars"] = [mc_raw, MAX_CHARS_CEILING]
+                    clamped_p["max_chars"] = MAX_CHARS_CEILING
+                elif mc_int < MAX_CHARS_FLOOR:
+                    params_clamped["max_chars"] = [mc_raw, MAX_CHARS_FLOOR]
+                    clamped_p["max_chars"] = MAX_CHARS_FLOOR
+                elif isinstance(mc_raw, str):
+                    clamped_p["max_chars"] = mc_int
+            off_raw = clamped_p.get("offset")
+            off_int = _parse_int_param(off_raw)
+            if off_int is not None:
+                if off_int < 0:
+                    params_clamped["offset"] = [off_raw, 0]
+                    clamped_p["offset"] = 0
+                elif isinstance(off_raw, str):
+                    clamped_p["offset"] = off_int
+            call_args["params"] = clamped_p
+
+        params_mapped_hint: str | None = None
+        if tool_name == "research" and route in INTERNAL_LIBRARY_ROUTES:
+            p_dict = call_args.get("params")
+            if isinstance(p_dict, dict):
+                doc_keys_present = [
+                    k for k in ("document", "doc_id", "id", "document_id") if k in p_dict
+                ]
+                if doc_keys_present:
+                    bad_k = doc_keys_present[0]
+                    extracted_doc = ""
+                    for k in doc_keys_present:
+                        v = p_dict.get(k)
+                        if not extracted_doc and v is not None and str(v).strip():
+                            extracted_doc = str(v).strip()
+                    how_to_pass_msg = (
+                        f"未知内部资料参数: {bad_k}。内部资料库不支持 params.{bad_k}；"
+                        f'读取文档请传顶层参数 research(route="{route}", operation="read", '
+                        f'document="{extracted_doc or "<wiki:|mail:|tmtb:|digest:|funda:><id>"}", '
+                        'params={"offset": 0, "max_chars": 30000})。'
+                    )
+                    if (
+                        operation in INTERNAL_LIBRARY_READ_OPERATIONS
+                        and (call_args.get("document") or extracted_doc)
+                    ):
+                        p_clean = dict(p_dict)
+                        for k in doc_keys_present:
+                            p_clean.pop(k, None)
+                        call_args["params"] = p_clean
+                        if not call_args.get("document"):
+                            call_args["document"] = extracted_doc
+                        params_mapped_hint = (
+                            f'内部资料库读取请传顶层参数 document="{call_args["document"]}"'
+                            f"（而非 params.{bad_k}），桥接层已自动映射。"
+                        )
+                    elif not operation:
+                        # operation 为空时保持原样，只在结果里返回一条"应该怎么传"的提示
+                        params_mapped_hint = how_to_pass_msg
+                    else:
+                        err_payload: dict[str, Any] = {
+                            "_declared_sources": [],
+                            "_sources": [],
+                            "ok": False,
+                            "status": "error",
+                            "error": how_to_pass_msg,
+                            "hint": how_to_pass_msg,
+                        }
+                        if params_clamped:
+                            err_payload["params_clamped"] = params_clamped
+                        return self._make_tool_result_response(
+                            req_id, err_payload, is_error=True
+                        )
+
+            doc_candidate = str(call_args.get("document") or "").strip()
+            if doc_candidate and re.fullmatch(r"\d+", doc_candidate):
+                ae_hint = (
+                    f'这是 AlphaEngine 文档，用 research(route="alphaengine", '
+                    f'operation="get_document", params={{"doc_id": "{doc_candidate}"}}) 读取'
+                )
+                err_payload = {
+                    "_declared_sources": [],
+                    "_sources": [],
+                    "ok": False,
+                    "status": "error",
+                    "document_id": doc_candidate,
+                    "doc_id": doc_candidate,
+                    "error": ae_hint,
+                    "hint": ae_hint,
+                }
+                if params_clamped:
+                    err_payload["params_clamped"] = params_clamped
+                return self._make_tool_result_response(req_id, err_payload, is_error=True)
+
+        transcript_query_ignored: str | None = None
+        if tool_name == "research" and route == "transcript":
+            t_ticker = str(call_args.get("ticker") or "").strip()
+            t_query = str(call_args.get("query") or "").strip()
+            if t_ticker and t_query and _is_topic_query_for_transcript(t_query):
+                transcript_query_ignored = t_query
+                call_args.pop("query", None)
+
         do_fanout = self._should_fanout_alphaengine(tool_name, arguments)
         ae_args: dict[str, Any] | None = (
             self._build_alphaengine_fanout_args(arguments) if do_fanout else None
@@ -3870,7 +4107,17 @@ class ResearchDataBridge:
                                 )
                                 kept_routes.append(merged_r)
                             else:
-                                kept_routes.append(r)
+                                r_copy = dict(r)
+                                rules_list = list(r_copy.get("rules") or [])
+                                if rid == "transcript":
+                                    if TRANSCRIPT_CATALOG_RULE not in rules_list:
+                                        rules_list.append(TRANSCRIPT_CATALOG_RULE)
+                                    r_copy["rules"] = rules_list
+                                elif rid in INTERNAL_LIBRARY_ROUTES:
+                                    if INTERNAL_LIBRARY_PAGINATION_RULE not in rules_list:
+                                        rules_list.append(INTERNAL_LIBRARY_PAGINATION_RULE)
+                                    r_copy["rules"] = rules_list
+                                kept_routes.append(r_copy)
                         if include_macro:
                             existing_ids = {
                                 str(r.get("id") or "")
@@ -3889,6 +4136,37 @@ class ResearchDataBridge:
                                     )
                         payload["routes"] = kept_routes
                         payload["route_count"] = len(payload["routes"])
+
+                    if tool_name == "research" and route == "transcript":
+                        _rewrite_transcript_roic_403(payload)
+                        if transcript_query_ignored is not None:
+                            payload["query_ignored"] = transcript_query_ignored
+                            payload["query_ignored_note"] = TRANSCRIPT_QUERY_IGNORED_NOTE
+                            existing_note = str(payload.get("note") or "").strip()
+                            payload["note"] = (
+                                f"{existing_note} {TRANSCRIPT_QUERY_IGNORED_NOTE}".strip()
+                                if existing_note
+                                else TRANSCRIPT_QUERY_IGNORED_NOTE
+                            )
+                            if isinstance(payload.get("data"), dict):
+                                payload["data"]["query_ignored"] = transcript_query_ignored
+                                d_note = str(payload["data"].get("note") or "").strip()
+                                payload["data"]["note"] = (
+                                    f"{d_note} {TRANSCRIPT_QUERY_IGNORED_NOTE}".strip()
+                                    if d_note
+                                    else TRANSCRIPT_QUERY_IGNORED_NOTE
+                                )
+
+                    if params_clamped:
+                        payload["params_clamped"] = params_clamped
+                    if params_mapped_hint:
+                        # Keep the downstream hint (truncation, errors); the mapping note rides along.
+                        prior_hint = str(payload.get("hint") or "").strip()
+                        payload["hint"] = (
+                            f"{prior_hint} {params_mapped_hint}"
+                            if prior_hint and params_mapped_hint not in prior_hint
+                            else params_mapped_hint
+                        )
 
                     declared = source_identity.declare(tool_name, arguments, payload)
                     if ae_outcome is not None and ae_args is not None:
