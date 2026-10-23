@@ -5,6 +5,12 @@ timezone: "Asia/Shanghai"
 credentials:
   sharing: team
 
+llm:
+  # Number audit (check_draft / publish): labelling and judging figures, read via
+  # assist role "audit". Measured on a 48k-character draft: argon-medium labelled all
+  # 27 batches in 139s; the OpenClaw-relayed 3.8 flash timed out on most of them.
+  audit: "gemini-4-argon-medium-oauth"
+
 models:
   broker:
     enabled: true            # OpenClaw broker v2 parallel path; false hides ocb-* from catalog

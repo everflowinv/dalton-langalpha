@@ -497,7 +497,11 @@ async def judge_figures_batch_with_llm(
         user_id=user_id,
         workspace_id=workspace_id,
         thread_id=thread_id,
-        timeout_s=90.0,
+        role="audit",
+        timeout_s=300.0,
+        # Subscription models: a call that timed out may be re-sent rather than
+        # refused as "possibly billed", or a re-run after a timeout fails at once.
+        resend_indeterminate=True,
     )
     if not res.ok or not isinstance(res.data, dict):
         err_msg = res.error or "assist_failed"
@@ -710,7 +714,10 @@ async def aaudit_draft(
         raise ValueError("user_id is required")
     user_id = str(user_id).strip()
     draft_sha = hashlib.sha256(draft_markdown.encode("utf-8")).hexdigest()
-    extracted = extract_figures(draft_markdown)
+    # CPU-bound steps run off the event loop: on a long draft they took minutes and
+    # starved every request (health checks included) until the watchdog restarted
+    # the backend mid-turn.
+    extracted = await asyncio.to_thread(extract_figures, draft_markdown)
     labeling_incomplete = False
     labeling_stats: dict[str, Any] = {}
 
@@ -726,10 +733,11 @@ async def aaudit_draft(
         )
         labeling_incomplete = not labeling_ok
 
-    facts_ledger = parse_facts_ledger(facts_markdown) if facts_markdown else {}
+    facts_ledger = await asyncio.to_thread(parse_facts_ledger, facts_markdown) if facts_markdown else {}
 
     # Step C: Deterministic footnote matching (Orders 0–3) & candidate collection
-    outcomes = match_figures(
+    outcomes = await asyncio.to_thread(
+        match_figures,
         extracted,
         thesis_doc=thesis_doc,
         models_doc=models_doc,
@@ -745,26 +753,29 @@ async def aaudit_draft(
         pending_by_section: dict[str, list[tuple[int, ExtractedFigure, list[dict[str, Any]]]]] = {}
         pending_cands_by_idx: dict[int, list[dict[str, Any]]] = {}
 
-        for idx, out in enumerate(outcomes):
-            fig = out.figure
-            if fig.exempt or out.matched or fig.label_hint == "incidental":
-                continue
-            if (fig.footnote_target and _RequiresModelCellOnly(fig)) or out.reason in CONTRADICTED_REASONS:
-                continue
-            cand_sources = retrieve_candidate_sources(
-                fig,
-                thesis_doc=thesis_doc,
-                models_doc=models_doc,
-                model_cells=model_cells,
-                provenance_records=provenance_records,
-                facts_ledger=facts_ledger,
-                metric_aliases=metric_aliases,
-            )
-            if not cand_sources:
-                continue
-            pending_cands_by_idx[idx] = cand_sources
-            sec_key = str(fig.location.get("section") or "")
-            pending_by_section.setdefault(sec_key, []).append((idx, fig, cand_sources))
+        def _collect_candidates() -> None:
+            for idx, out in enumerate(outcomes):
+                fig = out.figure
+                if fig.exempt or out.matched or fig.label_hint == "incidental":
+                    continue
+                if (fig.footnote_target and _RequiresModelCellOnly(fig)) or out.reason in CONTRADICTED_REASONS:
+                    continue
+                cand_sources = retrieve_candidate_sources(
+                    fig,
+                    thesis_doc=thesis_doc,
+                    models_doc=models_doc,
+                    model_cells=model_cells,
+                    provenance_records=provenance_records,
+                    facts_ledger=facts_ledger,
+                    metric_aliases=metric_aliases,
+                )
+                if not cand_sources:
+                    continue
+                pending_cands_by_idx[idx] = cand_sources
+                sec_key = str(fig.location.get("section") or "")
+                pending_by_section.setdefault(sec_key, []).append((idx, fig, cand_sources))
+
+        await asyncio.to_thread(_collect_candidates)
 
         section_batches: list[tuple[str, list[tuple[int, ExtractedFigure, list[dict[str, Any]]]]]] = []
         for sec_key, sec_items in pending_by_section.items():
@@ -876,7 +887,7 @@ async def aaudit_draft(
                                 )
 
         # Re-run Order 5 so derived figures can use figures verified by Step D (P0I §1.2, L34)
-        outcomes = apply_derived_figure_matching(outcomes)
+        outcomes = await asyncio.to_thread(apply_derived_figure_matching, outcomes)
 
         # Attach top 5 candidates to any remaining unverified/uncertain items (P0I §1.6)
         for idx, cand_sources in pending_cands_by_idx.items():
@@ -894,7 +905,8 @@ async def aaudit_draft(
                     break
             outcomes[idx].candidates = merged_cands[:5]
 
-    return _build_audit_result(
+    return await asyncio.to_thread(
+        _build_audit_result,
         draft_sha,
         extracted,
         outcomes,

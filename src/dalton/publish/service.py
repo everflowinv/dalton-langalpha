@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import hashlib
 import logging
@@ -144,8 +145,8 @@ async def run_check_draft(
     )
 
     audit_path, annotated_path = _derive_sidecar_paths(draft_path)
-    audit_md = render_audit_md(audit, draft_path=draft_path)
-    annotated_md = render_annotated_draft(draft_text, audit)
+    audit_md = await asyncio.to_thread(render_audit_md, audit, draft_path=draft_path)
+    annotated_md = await asyncio.to_thread(render_annotated_draft, draft_text, audit)
     await backend.awrite_text(audit_path, audit_md)
     await backend.awrite_text(annotated_path, annotated_md)
 
@@ -375,8 +376,8 @@ async def run_publish(
             thread_id=thread_id,
         )
         audit_path, annotated_path = _derive_sidecar_paths(draft_path)
-        await backend.awrite_text(audit_path, render_audit_md(audit, draft_path=draft_path))
-        await backend.awrite_text(annotated_path, render_annotated_draft(draft_text, audit))
+        await backend.awrite_text(audit_path, await asyncio.to_thread(render_audit_md, audit, draft_path=draft_path))
+        await backend.awrite_text(annotated_path, await asyncio.to_thread(render_annotated_draft, draft_text, audit))
 
         if not audit.passed:
             await db_publications.transition(
