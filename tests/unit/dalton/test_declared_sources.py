@@ -2896,3 +2896,345 @@ def test_community_url_rejects_surrounding_whitespace() -> None:
     for bad in (" https://xueqiu.com/1/2", "https://xueqiu.com/1/2\n"):
         with pytest.raises(ValueError):
             rb._validate_community_url(bad, required_domain="xueqiu.com")
+
+
+class TestBridgeResearchParamsAndTranscriptGuards:
+    @pytest.mark.asyncio
+    async def test_max_chars_and_offset_clamping(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bridge = _make_bridge(tmp_path, monkeypatch)
+        forwarded_args: list[dict[str, Any]] = []
+
+        async def _responder(reqs: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+            req = reqs[0]
+            args = req["params"]["arguments"]
+            forwarded_args.append(args)
+            return [
+                _mcp_tool_response(
+                    req["id"],
+                    {
+                        "ok": True,
+                        "status": "ok",
+                        "document": {"document_id": "tmtb:12345", "content": "text"},
+                    },
+                )
+            ], 0
+
+        monkeypatch.setattr(
+            asyncio, "create_subprocess_exec", _make_subprocess_double(_responder)
+        )
+
+        resp = await bridge.handle_tools_call(
+            "clamp-1",
+            {
+                "name": "research",
+                "arguments": {
+                    "route": "tmtb",
+                    "operation": "read",
+                    "document": "tmtb:12345",
+                    "params": {"max_chars": 50000, "offset": -10},
+                },
+            },
+        )
+        assert len(forwarded_args) == 1
+        assert forwarded_args[0]["params"]["max_chars"] == 30000
+        assert forwarded_args[0]["params"]["offset"] == 0
+
+        body = json.loads(resp["result"]["content"][0]["text"])
+        assert body["ok"] is True
+        assert body["params_clamped"] == {"max_chars": [50000, 30000], "offset": [-10, 0]}
+
+        # String integer values and max_chars < 1 are also clamped and recorded
+        resp_str = await bridge.handle_tools_call(
+            "clamp-2",
+            {
+                "name": "research",
+                "arguments": {
+                    "route": "tmtb",
+                    "operation": "read",
+                    "document": "tmtb:12345",
+                    "params": {"max_chars": "0", "offset": "-5"},
+                },
+            },
+        )
+        assert forwarded_args[-1]["params"]["max_chars"] == 1
+        assert forwarded_args[-1]["params"]["offset"] == 0
+        body_str = json.loads(resp_str["result"]["content"][0]["text"])
+        assert body_str["params_clamped"] == {"max_chars": ["0", 1], "offset": ["-5", 0]}
+
+    @pytest.mark.asyncio
+    async def test_numeric_alphaengine_doc_id_on_internal_library_returns_hint(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bridge = _make_bridge(tmp_path, monkeypatch)
+
+        resp = await bridge.handle_tools_call(
+            "ae-id-1",
+            {
+                "name": "research",
+                "arguments": {
+                    "route": "sales-notes",
+                    "operation": "read",
+                    "document": "190000041634994",
+                },
+            },
+        )
+        assert resp["result"]["isError"] is True
+        body = json.loads(resp["result"]["content"][0]["text"])
+        assert body["ok"] is False
+        assert body["document_id"] == "190000041634994"
+        expected_hint = (
+            '这是 AlphaEngine 文档，用 research(route="alphaengine", '
+            'operation="get_document", params={"doc_id": "190000041634994"}) 读取'
+        )
+        assert expected_hint in body["error"]
+        assert expected_hint in body["hint"]
+
+    @pytest.mark.asyncio
+    async def test_internal_library_maps_params_document_to_top_level(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bridge = _make_bridge(tmp_path, monkeypatch)
+        forwarded_args: list[dict[str, Any]] = []
+
+        async def _responder(reqs: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+            req = reqs[0]
+            args = req["params"]["arguments"]
+            forwarded_args.append(args)
+            if not args.get("operation"):
+                return [
+                    _mcp_tool_response(
+                        req["id"],
+                        {
+                            "ok": False,
+                            "status": "error",
+                            "error": "未知内部资料参数: document",
+                        },
+                        is_error=True,
+                    )
+                ], 0
+            return [
+                _mcp_tool_response(
+                    req["id"],
+                    {
+                        "ok": True,
+                        "status": "ok",
+                        "document": {"document_id": "mail:888", "content": "hello"},
+                    },
+                )
+            ], 0
+
+        monkeypatch.setattr(
+            asyncio, "create_subprocess_exec", _make_subprocess_double(_responder)
+        )
+
+        # Explicit operation="read" maps params.document to top-level document
+        resp = await bridge.handle_tools_call(
+            "map-doc-1",
+            {
+                "name": "research",
+                "arguments": {
+                    "route": "sales-notes",
+                    "operation": "read",
+                    "params": {"document": "mail:888", "max_chars": 60000},
+                },
+            },
+        )
+        assert len(forwarded_args) == 1
+        assert forwarded_args[0]["document"] == "mail:888"
+        assert "document" not in forwarded_args[0]["params"]
+        assert forwarded_args[0]["params"]["max_chars"] == 30000
+        body = json.loads(resp["result"]["content"][0]["text"])
+        assert body["ok"] is True
+        assert body["params_clamped"] == {"max_chars": [60000, 30000]}
+        assert "顶层参数" in body["hint"]
+
+        # route="all" with an explicit read is a legal library read and maps the same way
+        await bridge.handle_tools_call(
+            "map-doc-all",
+            {
+                "name": "research",
+                "arguments": {
+                    "route": "all",
+                    "operation": "read",
+                    "params": {"document": "mail:888"},
+                },
+            },
+        )
+        assert forwarded_args[-1]["document"] == "mail:888"
+        assert "document" not in forwarded_args[-1]["params"]
+
+        # Empty operation keeps call_args unchanged and attaches guidance hint in the result
+        resp_empty_op = await bridge.handle_tools_call(
+            "map-doc-empty-op",
+            {
+                "name": "research",
+                "arguments": {
+                    "route": "sales-notes",
+                    "params": {"document": "mail:888"},
+                },
+            },
+        )
+        assert "document" not in forwarded_args[-1]
+        assert forwarded_args[-1]["params"]["document"] == "mail:888"
+        assert not forwarded_args[-1].get("operation")
+        body_empty_op = json.loads(resp_empty_op["result"]["content"][0]["text"])
+        assert 'operation="read"' in body_empty_op["hint"]
+        assert 'document="mail:888"' in body_empty_op["hint"]
+
+    @pytest.mark.asyncio
+    async def test_transcript_drops_topic_query_and_rewrites_roic_403(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bridge = _make_bridge(tmp_path, monkeypatch)
+        forwarded_args: list[dict[str, Any]] = []
+
+        async def _responder(reqs: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+            req = reqs[0]
+            name = req["params"]["name"]
+            args = req["params"].get("arguments") or {}
+            if name == "catalog":
+                return [
+                    _mcp_tool_response(
+                        req["id"],
+                        {
+                            "ok": True,
+                            "routes": [
+                                {
+                                    "id": "transcript",
+                                    "category": "research",
+                                    "rules": ["默认近 400 天"],
+                                },
+                                {
+                                    "id": "company-wiki",
+                                    "category": "research",
+                                    "rules": ["只读本地 wiki"],
+                                },
+                            ],
+                        },
+                    )
+                ], 0
+            forwarded_args.append(args)
+            if args.get("ticker") == "GOOGL":
+                return [
+                    _mcp_tool_response(
+                        req["id"],
+                        {
+                            "ok": True,
+                            "status": "ok",
+                            "data": {"ok": True, "source": "alphaengine", "transcripts": []},
+                        },
+                    )
+                ], 0
+            if args.get("ticker") == "AE_NON_ROIC_ERR":
+                return [
+                    _mcp_tool_response(
+                        req["id"],
+                        {
+                            "ok": False,
+                            "status": "error",
+                            "source": "alphaengine",
+                            "error": "upstream timeout discussing roic metric 403bps",
+                            "hint": "keep original hint",
+                        },
+                    )
+                ], 0
+            # Simulate roic fallback 403
+            return [
+                _mcp_tool_response(
+                    req["id"],
+                    {
+                        "ok": False,
+                        "status": "error",
+                        "data": {"ok": False, "error": "HTTP Error 403: Forbidden"},
+                        "fallback": {"source": "roic", "reason": "alphaengine_no_match"},
+                        "hint": "old hint",
+                    },
+                )
+            ], 0
+
+        monkeypatch.setattr(
+            asyncio, "create_subprocess_exec", _make_subprocess_double(_responder)
+        )
+
+        # 1. Topic query with ticker is dropped before forwarding
+        resp_topic = await bridge.handle_tools_call(
+            "tr-1",
+            {
+                "name": "research",
+                "arguments": {
+                    "route": "transcript",
+                    "ticker": "GOOGL",
+                    "query": "Q2 2026 earnings call capital expenditures",
+                },
+            },
+        )
+        assert "query" not in forwarded_args[-1]
+        body_topic = json.loads(resp_topic["result"]["content"][0]["text"])
+        assert body_topic["query_ignored"] == "Q2 2026 earnings call capital expenditures"
+        assert "transcript 的 query 只用来传公司名，主题检索请在拿到 doc_id 后读正文" in body_topic["note"]
+
+        # Multi-word company names without topic signals are ALL preserved
+        kept_company_queries = [
+            "Alphabet|谷歌|Google",
+            "Alphabet Inc",
+            "Meta Platforms",
+            "Berkshire Hathaway",
+            "Ping An",
+            "Taiwan Semiconductor Manufacturing",
+            "腾讯 控股",
+        ]
+        for idx, company_q in enumerate(kept_company_queries):
+            await bridge.handle_tools_call(
+                f"tr-keep-{idx}",
+                {
+                    "name": "research",
+                    "arguments": {
+                        "route": "transcript",
+                        "ticker": "GOOGL",
+                        "query": company_q,
+                    },
+                },
+            )
+            assert forwarded_args[-1].get("query") == company_q
+
+        # 2. roic 403 fallback rewrites error and hint ONLY on structured roic + 403/403 Forbidden
+        resp_403 = await bridge.handle_tools_call(
+            "tr-3",
+            {
+                "name": "research",
+                "arguments": {
+                    "route": "transcript",
+                    "ticker": "UNKNOWN",
+                },
+            },
+        )
+        body_403 = json.loads(resp_403["result"]["content"][0]["text"])
+        assert body_403["error"] == "AlphaEngine 无匹配，roic 回退已不可用。"
+        assert body_403["hint"] == "用公司名（| 分隔中英文）重试，或者扩大 start/end。"
+
+        resp_non_roic = await bridge.handle_tools_call(
+            "tr-non-roic",
+            {
+                "name": "research",
+                "arguments": {
+                    "route": "transcript",
+                    "ticker": "AE_NON_ROIC_ERR",
+                },
+            },
+        )
+        body_non_roic = json.loads(resp_non_roic["result"]["content"][0]["text"])
+        assert body_non_roic["error"] == "upstream timeout discussing roic metric 403bps"
+        assert body_non_roic["hint"] == "keep original hint"
+
+        # 3. catalog includes transcript and pagination rules
+        resp_cat = await bridge.handle_tools_call(
+            "cat-1", {"name": "catalog", "arguments": {}}
+        )
+        cat_body = json.loads(resp_cat["result"]["content"][0]["text"])
+        tr_route = next(r for r in cat_body["routes"] if r["id"] == "transcript")
+        wiki_route = next(r for r in cat_body["routes"] if r["id"] == "company-wiki")
+        assert any("只用来传公司名" in rl for rl in tr_route["rules"])
+        assert any("1–30000" in rl for rl in wiki_route["rules"])
+

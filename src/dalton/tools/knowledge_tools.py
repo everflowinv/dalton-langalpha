@@ -187,6 +187,7 @@ def create_knowledge_tools(filesystem_backend: Any = None) -> list[BaseTool]:
         Read data/<doc>.json first and pass its version as base_version (null only to create the document).
         Ops address list items by id, e.g. {"op":"append","path":"/evidence","value":{...}},
         {"op":"set","path":"/pillars/P2/status","value":"watch"}. reason says why, in one or two sentences.
+        On validation failure, the returned message includes the expected schema structure (失败时返回的信息里带有期望结构，照着补齐再提交).
         Returns: the new version and the rendered file, or the list of problems to fix.
         """
         user_id, workspace_id, thread_id, run_id = _extract_run_identity(config)
@@ -221,6 +222,7 @@ def create_knowledge_tools(filesystem_backend: Any = None) -> list[BaseTool]:
     ) -> str:
         """Record an event verdict (NO_CHANGE/THESIS_STRENGTHENED/THESIS_WEAKENED/THESIS_BROKEN/NEW_THESIS) and its next validation; every research session that looked at new evidence ends with one.
 
+        On validation failure, the returned message includes the expected schema structure (失败时返回的信息里带有期望结构，照着补齐再提交).
         Returns: the verdict id and the agenda version it updated.
         """
         user_id, workspace_id, thread_id, run_id = _extract_run_identity(config)

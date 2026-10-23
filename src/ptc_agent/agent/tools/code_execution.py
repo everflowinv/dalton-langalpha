@@ -78,6 +78,7 @@ def create_execute_code_tool(
         Configured execute_code tool function
     """
 
+    # DALTON-HOOK(dalton-tools): Remind agent that each ExecuteCode call runs in a fresh process
     @tool("ExecuteCode", response_format="content_and_artifact")
     async def execute_code(
         code: str,
@@ -87,6 +88,7 @@ def create_execute_code_tool(
 
         Use for: disposable one-shots — quick MCP calls, small transforms, sanity checks.
         Do not use for iterative or reusable code - write to a file and run via Bash instead.
+        Each call is a fresh process: re-import modules and reload data from files; nothing from an earlier call survives.
         Import MCP tools: from tools.{server} import {tool}
 
         Args:

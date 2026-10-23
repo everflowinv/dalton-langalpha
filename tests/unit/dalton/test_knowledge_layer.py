@@ -1018,3 +1018,148 @@ def test_g34_migrated_docs_have_no_fabricated_numbers_and_remediation() -> None:
     assert cleaned_drv["historical_valuation_driver"]["multiple_share_pct"] is None
 
 
+@pytest.mark.asyncio
+async def test_validation_failure_includes_expected_schema_structure_and_enum(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import create_autospec
+    from src.dalton.database import knowledge as db_knowledge
+    from src.dalton.database import verdicts as db_verdicts
+    from src.dalton.knowledge import service
+    from src.dalton.llm.assist import AssistResult, assist_json
+    from src.server.database import workspace as ws_db
+
+    monkeypatch.setattr(
+        ws_db,
+        "get_workspace",
+        create_autospec(
+            ws_db.get_workspace,
+            return_value={"workspace_id": "ws1", "user_id": "u1"},
+        ),
+    )
+    monkeypatch.setattr(
+        db_knowledge,
+        "latest_version",
+        create_autospec(db_knowledge.latest_version, return_value=None),
+    )
+    monkeypatch.setattr(
+        db_knowledge,
+        "latest_valid_version",
+        create_autospec(db_knowledge.latest_valid_version, return_value=None),
+    )
+    monkeypatch.setattr(
+        service,
+        "assist_json",
+        create_autospec(
+            assist_json,
+            return_value=AssistResult(ok=False, data=None, error="disabled"),
+        ),
+    )
+
+    # 1. Construct a drivers update with a reading missing unit/period/as_of and label not in enum (plus a second reading missing unit/period/label/as_of)
+    bad_drivers = {
+        "schema_version": 1,
+        "as_of": "2026-10-22T00:00:00Z",
+        "historical_valuation_driver": {
+            "summary": "EPS driven",
+            "window": "2023-2026",
+            "eps_share_pct": 80.0,
+            "multiple_share_pct": 20.0,
+        },
+        "drivers": [
+            {
+                "id": "K1",
+                "name": "Search & YouTube Ad Revenue",
+                "kind": "volume",
+                "description": "Monetization of commercial queries",
+                "updated_at": "2026-10-22T00:00:00Z",
+                "leading_indicators": [
+                    {
+                        "id": "K1.1",
+                        "name": "Paid clicks YoY",
+                        "source": "10-Q",
+                        "frequency": "quarterly",
+                        "good_direction": "up",
+                        "readings": [
+                            {
+                                "value": 5.0,
+                                "label": "unverified_guess",
+                                "ref": {"kind": "filing", "accession": "0001652044-26-000042"},
+                            },
+                            {
+                                "value": 6.0,
+                                "ref": {"kind": "filing", "accession": "0001652044-26-000043"},
+                            },
+                        ],
+                    }
+                ],
+            }
+        ],
+    }
+
+    res = await service.apply_update(
+        user_id="u1",
+        workspace_id="ws1",
+        doc_key="drivers",
+        ops=[{"op": "create", "value": bad_drivers}],
+        reason="Create drivers with invalid reading",
+        base_version=None,
+    )
+    assert res["ok"] is False
+    msg = res["message"]
+    assert "Expected structure for /drivers/0/leading_indicators/0/readings/0" in msg
+    assert 'required=["value", "unit", "period", "as_of", "ref", "label"]' in msg
+    assert "additionalProperties=false" in msg
+    assert (
+        'enum=["reported", "company_guidance", "consensus", "estimate", "assumption", "research_judgement"]'
+        in msg
+    )
+    # Same path (/drivers/0/leading_indicators/0/readings/0) must only be attached once even though it had multiple errors (missing required + invalid enum)
+    assert msg.count("Expected structure for /drivers/0/leading_indicators/0/readings/0 ") == 1
+
+    # 2. Also verify append_verdict includes expected structure on schema error
+    monkeypatch.setattr(
+        db_verdicts,
+        "list_verdicts",
+        create_autospec(db_verdicts.list_verdicts, return_value=[]),
+    )
+    res_v = await service.append_verdict(
+        user_id="u1",
+        workspace_id="ws1",
+        verdict={
+            "event": {"type": "earnings", "summary": "Q2"},
+            "verdict": "INVALID_VERDICT_ENUM",
+        },
+    )
+    assert res_v["ok"] is False
+    v_msg = res_v["message"]
+    assert "Expected structure for / (" in v_msg
+    assert 'required=["at", "trigger", "event", "verdict", "rationale", "next_validation", "progress"]' in v_msg
+    assert 'enum=["NO_CHANGE", "THESIS_STRENGTHENED", "THESIS_WEAKENED", "THESIS_BROKEN", "NEW_THESIS"]' in v_msg
+
+    # 3. Verify agenda next_validations[].due drills into oneOf/$ref and shows date|null instead of any
+    agenda_struct = service._format_expected_structures(
+        "agenda",
+        [{"path": "/next_validations/0", "code": "schema_error", "message": "missing required"}],
+    )
+    assert "Expected structure for /next_validations/0" in agenda_struct
+    assert "due: date|null" in agenda_struct
+    assert "due: any" not in agenda_struct
+
+    # 4. Verify line-based truncation drops incomplete last line and appends '…（其余字段省略）' within max_chars
+    multi_errors = [
+        {"path": "/", "code": "schema_error", "message": "root err"},
+        {"path": "/open_questions/0", "code": "schema_error", "message": "q err"},
+        {"path": "/next_validations/0", "code": "schema_error", "message": "v err"},
+        {"path": "/watch/events/0", "code": "schema_error", "message": "w err"},
+        {"path": "/pm_handoffs/0", "code": "schema_error", "message": "h err"},
+    ]
+    truncated_struct = service._format_expected_structures(
+        "agenda", multi_errors, max_chars=450
+    )
+    assert len(truncated_struct) <= 450
+    assert truncated_struct.splitlines()[-1] == "…（其余字段省略）"
+
+
+
+
