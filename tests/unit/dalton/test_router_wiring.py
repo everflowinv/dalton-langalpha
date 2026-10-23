@@ -77,6 +77,7 @@ def client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
     import src.dalton.autonomy.system_jobs as system_jobs_mod
     import src.dalton.budget.service as budget_svc
     import src.dalton.database.budget as budget_db
+    import src.dalton.database.coverage as coverage_db
     import src.dalton.database.knowledge as knowledge_db
     import src.dalton.database.llm_journal as journal_db
     import src.dalton.database.openclaw_sync as oc_sync_db
@@ -103,6 +104,7 @@ def client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
         auto_db,
         budget_svc,
         budget_db,
+        coverage_db,
         knowledge_db,
         journal_db,
         oc_sync_db,

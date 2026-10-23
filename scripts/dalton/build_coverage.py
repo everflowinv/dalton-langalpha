@@ -13,14 +13,12 @@ Python source files are parsed with `ast` (`ast.parse` + `ast.literal_eval`) and
 from __future__ import annotations
 
 import argparse
+import asyncio
 import ast
 import hashlib
 import json
 import os
 import sys
-import urllib.error
-import urllib.parse
-import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -28,6 +26,8 @@ from typing import Any
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 DEFAULT_OUT = REPO_ROOT / "config" / "dalton" / "coverage.yaml"
 DEFAULT_OVERRIDES = REPO_ROOT / "config" / "dalton" / "coverage.overrides.yaml"
 
@@ -397,64 +397,11 @@ def write_coverage_yaml(out_path: Path, doc: dict[str, Any]) -> bool:
     return True
 
 
-def sync_to_home_workspace(api_base: str, yaml_path: Path, target_relpath: str = "dalton/coverage.yaml") -> bool:
-    """Idempotently upload `coverage.yaml` to `Home/dalton/coverage.yaml` via LangAlpha REST API."""
-    content = yaml_path.read_text(encoding="utf-8")
-    local_sha = hashlib.sha256(content.encode("utf-8")).hexdigest()
+def sync_to_user_coverage_db(user_id: str, yaml_path: Path) -> int:
+    """Seed the specified user's coverage roster in PostgreSQL from `yaml_path`."""
+    from scripts.dalton.seed_user_coverage import run_seed
 
-    # 1. Resolve Home workspace ID
-    req = urllib.request.Request(
-        f"{api_base.rstrip('/')}/api/v1/workspaces/home",
-        method="POST",
-        headers={"Content-Type": "application/json"},
-        data=b"{}",
-    )
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        home_data = json.loads(resp.read().decode("utf-8"))
-    workspace_id = home_data["workspace_id"]
-
-    # 2. Ensure Home workspace is started
-    start_req = urllib.request.Request(
-        f"{api_base.rstrip('/')}/api/v1/workspaces/{workspace_id}/start?lazy=false",
-        method="POST",
-        headers={"Content-Type": "application/json"},
-        data=b"{}",
-    )
-    try:
-        with urllib.request.urlopen(start_req, timeout=120):
-            pass
-    except urllib.error.HTTPError as e:
-        if e.code not in (200, 201, 204, 409):
-            raise
-
-    # 3. Check existing file hash in Home workspace for idempotency
-    encoded_path = urllib.parse.quote(target_relpath, safe="")
-    read_url = f"{api_base.rstrip('/')}/api/v1/workspaces/{workspace_id}/files/read?path={encoded_path}"
-    try:
-        with urllib.request.urlopen(read_url, timeout=30) as resp:
-            remote_payload = json.loads(resp.read().decode("utf-8"))
-            remote_content = remote_payload.get("content", "")
-            remote_sha = hashlib.sha256(remote_content.encode("utf-8")).hexdigest()
-            if remote_sha == local_sha:
-                print(f"[sync] Unchanged (sha256={local_sha[:12]}), 0 writes to Home/{target_relpath}")
-                return False
-    except urllib.error.HTTPError as e:
-        if e.code != 404:
-            raise
-
-    # 4. Write updated file to Home workspace
-    write_url = f"{api_base.rstrip('/')}/api/v1/workspaces/{workspace_id}/files/write?path={encoded_path}"
-    payload = json.dumps({"content": content}).encode("utf-8")
-    put_req = urllib.request.Request(
-        write_url,
-        method="PUT",
-        headers={"Content-Type": "application/json"},
-        data=payload,
-    )
-    with urllib.request.urlopen(put_req, timeout=30):
-        pass
-    print(f"[sync] Wrote Home/{target_relpath} (sha256={local_sha[:12]})")
-    return True
+    return asyncio.run(run_seed(user_id=user_id, yaml_path=yaml_path, apply=True))
 
 
 def print_report(doc: dict[str, Any], discrepancies: list[dict[str, Any]]) -> None:
@@ -478,8 +425,13 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Build and check Dalton canonical coverage.yaml")
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT, help="Output YAML path")
     parser.add_argument("--check", action="store_true", help="Validate counts, discrepancies, and existing YAML")
-    parser.add_argument("--sync", action="store_true", help="Idempotently sync coverage.yaml to Home workspace via REST")
-    parser.add_argument("--api", default="http://localhost:8000", help="LangAlpha REST API base URL for --sync")
+    parser.add_argument("--sync", action="store_true", help="Seed coverage.yaml into PostgreSQL for --user")
+    parser.add_argument(
+        "--user",
+        default=os.environ.get("DALTON_USER_ID"),
+        help="Target user_id when --sync is specified",
+    )
+    parser.add_argument("--api", default="http://localhost:8000", help="Deprecated (retained for CLI compatibility)")
     args = parser.parse_args(argv)
 
     doc, discrepancies = build_coverage_data()
@@ -520,7 +472,11 @@ def main(argv: list[str] | None = None) -> int:
     print_report(doc, discrepancies)
 
     if args.sync:
-        sync_to_home_workspace(args.api, args.out)
+        target_user = str(args.user or "").strip()
+        if not target_user:
+            print("ERROR: --sync requires --user <user_id> (or DALTON_USER_ID)", file=sys.stderr)
+            return 2
+        return sync_to_user_coverage_db(target_user, args.out)
 
     return 0
 

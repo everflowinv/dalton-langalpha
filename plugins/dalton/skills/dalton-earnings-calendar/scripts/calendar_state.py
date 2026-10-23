@@ -3,11 +3,12 @@
 calendar_state.py — Atomic ledger management CLI for Dalton earnings calendar (PS.7).
 
 Subcommands:
-  list   : Read coverage.yaml and earnings-calendar.json, print unique counts and entries.
-  check  : Check a ticker's status and date against the ledger (`--ticker --date`).
-  mark   : Atomically update a company's ledger entry (confirmed or pending/estimated), recording history on date changes.
-  roll   : Roll confirmed entries whose release date (`date`) is strictly before `--today` into `reported`, and re-register as `pending` for the next quarter.
-  diff   : Reconcile scan JSONL file(s) (`--scan <jsonl>`) against the ledger and optionally verify automation JSON files.
+  list    : Read coverage.yaml and earnings-calendar.json, print unique counts and entries.
+  check   : Check a ticker's status and date against the ledger (`--ticker --date`).
+  mark    : Atomically update a company's ledger entry (confirmed or pending/estimated), recording history on date changes.
+  roll    : Roll confirmed entries whose release date (`date`) is strictly before `--today` into `reported`, and re-register as `pending` for the next quarter.
+  diff    : Reconcile scan JSONL file(s) (`--scan <jsonl>`) against the ledger and optionally verify automation JSON files.
+  publish : Validate and publish earnings-calendar.json to PUT /api/v1/dalton/earnings/calendar/mirror (max 1 MB).
 """
 
 import argparse
@@ -18,7 +19,12 @@ import os
 from pathlib import Path
 import re
 import sys
+import urllib.error
+import urllib.request
 from zoneinfo import ZoneInfo
+
+
+MAX_MIRROR_BYTES = 1_048_576  # 1 MB
 
 
 CHAIN_BY_TIER = {
@@ -709,6 +715,127 @@ def cmd_diff(args: argparse.Namespace) -> int:
     return 0 if reconciled else 2
 
 
+def validate_ledger_for_publish(ledger: dict) -> bytes:
+    """Validate ledger structure and 1 MB size limit before publishing to the server mirror."""
+    if not isinstance(ledger, dict):
+        raise ValueError("ledger must be a JSON object")
+    entries = ledger.get("entries")
+    if not isinstance(entries, dict):
+        raise ValueError("ledger.entries must be a JSON object keyed by ticker")
+    for ticker, ent in entries.items():
+        if not isinstance(ent, dict):
+            raise ValueError(f"ledger.entries[{ticker!r}] must be an object")
+        st = str(ent.get("status") or "pending").lower()
+        if st not in ("confirmed", "pending", "reported"):
+            raise ValueError(f"ledger.entries[{ticker!r}].status invalid: {st!r}")
+    reported = ledger.get("reported")
+    if reported is not None and not isinstance(reported, list):
+        raise ValueError("ledger.reported must be a JSON array")
+
+    encoded = json.dumps({"ledger": ledger}, ensure_ascii=False).encode("utf-8")
+    raw_ledger_bytes = len(json.dumps(ledger, ensure_ascii=False).encode("utf-8"))
+    if raw_ledger_bytes > MAX_MIRROR_BYTES:
+        raise ValueError(f"ledger exceeds 1 MB limit ({raw_ledger_bytes} > {MAX_MIRROR_BYTES} bytes)")
+    return encoded
+
+
+def _build_publish_headers(args: argparse.Namespace) -> dict[str, str]:
+    headers: dict[str, str] = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    token = (
+        getattr(args, "token", None)
+        or os.environ.get("DALTON_AUTH_TOKEN")
+        or os.environ.get("SUPABASE_ACCESS_TOKEN")
+        or os.environ.get("AUTH_TOKEN")
+    )
+    service_token = getattr(args, "service_token", None) or os.environ.get("INTERNAL_SERVICE_TOKEN")
+    user_id = (
+        getattr(args, "user_id", None)
+        or os.environ.get("DALTON_USER_ID")
+        or os.environ.get("X_USER_ID")
+        or os.environ.get("AUTH_USER_ID")
+    )
+    if token:
+        tok_str = str(token).strip()
+        if not tok_str.lower().startswith("bearer "):
+            tok_str = f"Bearer {tok_str}"
+        headers["Authorization"] = tok_str
+    if service_token:
+        headers["X-Service-Token"] = str(service_token).strip()
+    if user_id:
+        headers["X-User-Id"] = str(user_id).strip()
+    return headers
+
+
+def cmd_publish(args: argparse.Namespace) -> int:
+    state_path = Path(args.state) if args.state else _default_state_path()
+    if not state_path.exists():
+        raise FileNotFoundError(f"Ledger file not found at {state_path}")
+    ledger = load_ledger(state_path, create=False)
+    body_bytes = validate_ledger_for_publish(ledger)
+
+    api_base = (
+        getattr(args, "api_url", None)
+        or os.environ.get("DALTON_API_URL")
+        or os.environ.get("LANGALPHA_API_URL")
+        or os.environ.get("API_BASE_URL")
+        or "http://127.0.0.1:8000"
+    ).rstrip("/")
+    endpoint = f"{api_base}/api/v1/dalton/earnings/calendar/mirror"
+    headers = _build_publish_headers(args)
+
+    req = urllib.request.Request(endpoint, data=body_bytes, headers=headers, method="PUT")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            resp_raw = resp.read().decode("utf-8")
+            resp_data = json.loads(resp_raw) if resp_raw.strip() else {}
+    except urllib.error.HTTPError as exc:
+        err_body = ""
+        try:
+            err_body = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            pass
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "status_code": exc.code,
+                    "error": f"HTTP {exc.code}: {err_body or exc.reason}",
+                    "endpoint": endpoint,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 1
+    except urllib.error.URLError as exc:
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "error": f"Connection failed to {endpoint}: {exc.reason}",
+                    "endpoint": endpoint,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 1
+
+    out = {
+        "ok": True,
+        "state_path": str(state_path),
+        "endpoint": endpoint,
+        "entries_count": len(ledger.get("entries") or {}),
+        "reported_count": len(ledger.get("reported") or []),
+        "response": resp_data,
+    }
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Dalton earnings calendar ledger CLI (PS.7)")
     p.add_argument("--json", action="store_true", help="Output JSON format")
@@ -766,6 +893,14 @@ def build_parser() -> argparse.ArgumentParser:
     sp_diff.add_argument("--automations-dir", default=None, help="Optional directory to read back automation JSON files")
     sp_diff.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
     sp_diff.set_defaults(fn=cmd_diff)
+
+    sp_pub = sub.add_parser("publish", help="Publish earnings-calendar.json to server mirror")
+    sp_pub.add_argument("--api-url", default=None, help="Server base URL (default: http://127.0.0.1:8000)")
+    sp_pub.add_argument("--token", default=None, help="Bearer token for Authorization header")
+    sp_pub.add_argument("--service-token", default=None, help="Internal service token (X-Service-Token)")
+    sp_pub.add_argument("--user-id", default=None, help="Target user_id header (X-User-Id)")
+    sp_pub.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
+    sp_pub.set_defaults(fn=cmd_publish)
 
     return p
 

@@ -5,10 +5,7 @@ from __future__ import annotations
 
 import logging
 import re
-from pathlib import Path
 from typing import Any
-
-import yaml
 
 from src.dalton.autonomy.schedule import (
     build_company_watch_specs,
@@ -16,6 +13,7 @@ from src.dalton.autonomy.schedule import (
     schedule_dalton_automation_helper,
     user_automations_lock,
 )
+from src.dalton.coverage import get_user_tier
 from src.server.database import automation as auto_db
 from src.server.database import workspace as ws_db
 from src.server.database.home_workspace import is_home_row
@@ -33,35 +31,24 @@ _TICKER_FROM_AUTO_NAME_RE = re.compile(
 _CLEAN_TICKER_RE = re.compile(r"^([A-Za-z0-9]{1,10}(?:\.[A-Za-z]{1,4})?)")
 
 
-def _load_coverage_tiers() -> dict[str, str]:
-    """Load ticker -> tier mapping from ``config/dalton/coverage.yaml``."""
-    repo_root = Path(__file__).resolve().parents[3]
-    cov_path = repo_root / "config" / "dalton" / "coverage.yaml"
-    if not cov_path.exists():
-        return {}
-    try:
-        raw = yaml.safe_load(cov_path.read_text(encoding="utf-8")) or {}
-        entries = raw.get("companies") or raw.get("coverage") or []
-        out: dict[str, str] = {}
-        for item in entries:
-            if isinstance(item, dict) and item.get("ticker"):
-                t_key = str(item["ticker"]).strip().upper()
-                tier_val = str(item.get("tier") or "").strip().lower()
-                if t_key and tier_val:
-                    out[t_key] = tier_val
-        return out
-    except Exception as exc:
-        logger.warning("[DALTON_TRACKING] Failed to read coverage.yaml: %s", exc)
-        return {}
-
-
-def resolve_default_tier(ticker: str, explicit_tier: str | None = None) -> str:
-    """Resolve tier for ``ticker``; defaults to ``coverage.yaml`` entry or ``'watch'``."""
+async def resolve_default_tier(
+    ticker: str,
+    explicit_tier: str | None = None,
+    *,
+    user_id: str | None = None,
+) -> str:
+    """Resolve tier for ``ticker`` from ``user_id``'s coverage roster or default to ``'watch'``."""
     if explicit_tier and str(explicit_tier).strip():
         return str(explicit_tier).strip().lower()
-    tiers = _load_coverage_tiers()
     t_upper = str(ticker or "").strip().upper()
-    return tiers.get(t_upper, "watch")
+    if user_id and t_upper:
+        try:
+            user_tier = await get_user_tier(user_id, t_upper)
+            if user_tier:
+                return user_tier
+        except Exception as exc:
+            logger.warning("[DALTON_TRACKING] Failed resolving user tier for %s/%s: %s", user_id, t_upper, exc)
+    return "watch"
 
 
 def _extract_ticker_from_text(raw: str | None) -> str | None:
@@ -377,7 +364,7 @@ async def get_tracking_status(user_id: str, workspace_id: str) -> dict[str, Any]
         raise ValueError("workspace_id is required")
 
     ticker, company_rows = await _load_company_automations(uid, ws_id)
-    tier = resolve_default_tier(ticker)
+    tier = await resolve_default_tier(ticker, user_id=uid)
     return _derive_status_and_details(
         workspace_id=ws_id,
         ticker=ticker,
@@ -408,7 +395,7 @@ async def enable_tracking(
 
     async with user_automations_lock(uid) as conn:
         ticker, company_rows = await _load_company_automations(uid, ws_id, conn=conn)
-        resolved_tier = resolve_default_tier(ticker, tier)
+        resolved_tier = await resolve_default_tier(ticker, tier, user_id=uid)
 
         current = _derive_status_and_details(
             workspace_id=ws_id,
@@ -490,7 +477,7 @@ async def disable_tracking(user_id: str, workspace_id: str) -> dict[str, Any]:
 
     async with user_automations_lock(uid) as conn:
         ticker, company_rows = await _load_company_automations(uid, ws_id, conn=conn)
-        resolved_tier = resolve_default_tier(ticker)
+        resolved_tier = await resolve_default_tier(ticker, user_id=uid)
         specs = build_company_watch_specs(
             ticker=ticker,
             workspace_id=ws_id,
