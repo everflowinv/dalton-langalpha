@@ -1,416 +1,253 @@
+<!-- DALTON-HOOK(docs-readme): this fork's README describes Dalton; the upstream LangAlpha README is linked below. -->
 <p align="center">
-  <img src="web/public/logo_words.png" alt="LangAlpha" height="110" />
+  <img src="web/public/everflow/favicon.svg" alt="Everflow Dalton" height="80" />
 </p>
 
-<h3 align="center">The harness for agentic trading.</h3>
+<h3 align="center">Dalton：基金的 AI 研究分析师</h3>
 
 <p align="center">
-  Open-source AI agents that research the market, build the thesis,<br>
-  and trade your own brokerage account within the permissions you set.
-</p>
-
-<p align="center">
-  <a href="https://langalpha.ai"><strong>Try LangAlpha ↗</strong></a> ·
-  <a href="#get-started"><strong>Get started</strong></a> ·
-  <a href="#agentic-trading"><strong>Agentic trading</strong></a> ·
-  <a href="#harness-design"><strong>Harness design</strong></a> ·
-  <a href="#full-stack-architecture"><strong>Full-stack architecture</strong></a> ·
-  <a href="#security"><strong>Security</strong></a>
-  <br />
-  English · <a href="docs/README.zh-CN.md">简体中文</a> · <a href="docs/README.ja-JP.md">日本語</a>
+  它像一名新入职的分析师那样工作：学会基金的研究方法，覆盖公司，持续跟踪，<br>
+  回答 PM 的问题，在周会上复盘并给出观点。它会自己安排研究，不用每次都由你来派活。
 </p>
 
 <p align="center">
-  <a href="https://github.com/ginlix-ai/langalpha/stargazers"><img src="https://img.shields.io/github/stars/ginlix-ai/langalpha?style=flat-square" alt="GitHub stars" /></a>
-  <img src="https://img.shields.io/badge/license-Apache%202.0-green?style=flat-square" alt="License: Apache 2.0" />
-  <img src="https://img.shields.io/badge/python-3.13+-blue?style=flat-square" alt="Python 3.13+" />
-  <a href="https://github.com/langchain-ai/langchain"><img src="https://img.shields.io/badge/LangChain-1c3c3c?style=flat-square&logo=langchain&logoColor=white" alt="LangChain" /></a>
-  <a href="https://github.com/ginlix-ai/langalpha/releases"><img src="https://img.shields.io/badge/desktop-macOS%20%7C%20Windows%20%7C%20Linux-555?style=flat-square" alt="Desktop app" /></a>
+  <a href="#一分钟看懂"><strong>一分钟看懂</strong></a> ·
+  <a href="#开始使用"><strong>开始使用</strong></a> ·
+  <a href="#日常怎么用"><strong>日常怎么用</strong></a> ·
+  <a href="#它会自己做什么"><strong>它会自己做什么</strong></a> ·
+  <a href="#常见问题"><strong>常见问题</strong></a> ·
+  <a href="docs/dalton/ARCHITECTURE.md"><strong>技术文档</strong></a>
 </p>
 
-<p align="center">
-  <img src="https://raw.githubusercontent.com/ginlix-ai/LangAlpha/main/docs/images/hero-cbrs-research-dashboard.webp" alt="The demo-cbrs workspace: the agent checking the CBRS quote, pulling filings and running two analysts on the left, and on the right the CBRS dashboard built from that research, open on the price since the IPO with its event markers and a selected event's note and sources" width="900" />
-</p>
+---
 
-## Why LangAlpha
+<!-- DALTON-HOOK(docs-readme) -->
+## 一分钟看懂
 
-Most AI finance tools answer questions. We believe investment research is Bayesian: you write down a thesis and what would prove it wrong, then every earnings print, filing and price move raises or lowers your conviction, and your position with it. That loop runs for weeks or months, and no single prompt captures it.
+把 Dalton 想象成一个**小型研究团队**：
+
+| 角色 | 在系统里叫什么 | 负责什么 |
+|---|---|---|
+| **研究总监** | Chief of Staff，在 **Home** 工作区 | 看全局：你问"今天哪些公司有变化"、"帮我比较 GOOGL 和 META 的云业务"，找它。它会把具体的研究派给对应公司的分析师 |
+| **公司分析师** | 每家公司一个**工作区**（比如 GOOGL 工作区） | 专门负责这一家公司：建覆盖、建模型、读公告、跟财报、写报告 |
+| **档案柜** | 每个公司工作区里的**知识档案** | 记录这家公司的 thesis、核心争论、关键驱动因素、管理层、历次结论。分析师每次研究都在这份档案上接着做，不会从零开始 |
+| **审稿人** | 独立审稿模型 | 正式报告发布前，用**另一家公司的模型**挑错，避免自己审自己 |
+| **你（PM）** | 审批人 | 正式报告必须由 PM 点"批准"才会发布 |
 
-Coding agents got good once they had a harness built for code: a codebase that persists, where every commit builds on the last, plus the tools, memory and runtime around the model. LangAlpha brings that harness to markets, from vibe coding to vibe investing. It works with any model, so every better model makes it better. Two convictions shape it:
+Dalton 和普通的 AI 问答有三点不同：
 
-- **A trade is a loop, not a tool call.** The thesis lives in a workspace, and research, sizing, the order and the watch that follows each feed new evidence back into it.
-- **Autonomy needs a boundary you set.** Agents act within the permissions you grant, and every order takes one governed path.
+1. **它有记忆，而且记的是"研究档案"，不是聊天记录。** thesis 是什么、上次结论是什么、还有哪些问题没验证，都写在档案里，下次研究直接接着做。
+2. **它会自己推进研究。** 打开"自动跟踪"后，有新公告、新研报、股价大动、财报临近，它都会自己处理，并在档案里记下结论。
+3. **正式报告有关卡。** 发布前系统会逐个核验报告里的数字，找不到出处或与证据矛盾的数字会挡住发布；再经过独立审稿和 PM 审批，才算正式发布。草稿阶段只提示问题，不拦着你继续研究。
 
-<p align="center">
-  <img src="https://raw.githubusercontent.com/ginlix-ai/LangAlpha/main/docs/images/diagrams/loop.webp" alt="A trade is a loop: a hunch leads to research and a thesis kept in the workspace, then sizing and risk, an order and a watch, and the watch feeds new evidence back into the thesis and moves its conviction" width="880" />
-</p>
+---
 
-## Feature highlights
+<!-- DALTON-HOOK(docs-readme) -->
+## 开始使用
 
-Most of these examples come from one workspace on Cerebras (CBRS). See it work in action with [this shared conversation](https://app.langalpha.ai/s/z7rvgK3P9vZN), from the first question to the initiation report sent to Slack.
+<!-- DALTON-HOOK(docs-readme) -->
+### 1. 登录
 
-### 🔎 Research with a team of agents
+用浏览器打开团队的 Dalton 地址，用公司邮箱登录。只有名单里的邮箱能登录。
 
-Ask a question and LangAlpha splits it across parallel analysts that read filings, pull prices, options and macro data, and run the numbers in code. Send a follow-up at any time to redirect them mid-run. On CBRS, the run ended in [an HTML primer](https://app.langalpha.ai/a/lep06ly8Qjfa) on what Cerebras sells, how fast it grows and who pays for it.
+<!-- DALTON-HOOK(docs-readme) -->
+### 2. 连接 AI 模型（第一次使用，或者页面提示"请重新连接"时）
 
-<p align="center">
-  <img src="https://raw.githubusercontent.com/ginlix-ai/LangAlpha/main/docs/images/chat-cbrs-research-subagents-primer.webp" alt="A CBRS question fanned out to four subagents, listed under the lead agent in the sidebar, next to the primer's section on who pays Cerebras" width="800" />
-  <br />
-  <sub><b>Subagents</b>: four analysts work the question under the lead agent, each card counting its tools and tokens, and one <code>/html-report</code> turns their findings into the primer on the right</sub>
-</p>
+进入 **设置 → 模型**，可以看到各个模型账号的状态。大多数模型走团队的**订阅账号**，不按次收费：
 
-### 🗂️ Keep every idea in a workspace
+| 账号 | 用途 |
+|---|---|
+| OpenAI GPT（ChatGPT 会员订阅，系统里叫 Codex） | 主分析师的默认模型 |
+| Claude、Google Gemini（订阅） | 后台任务、审稿等 |
+| xAI Grok（SuperGrok 订阅） | 备选（子代理和取证默认使用的 Grok 由管理员通过 OpenClaw 接入，不需要你连接） |
+| Meta Muse（订阅） | 备选 |
+| 智谱 GLM（Coding Plan 订阅） | 备选 |
 
-One workspace per thesis, sector or portfolio. Files, chats and the agent's own notes are still there tomorrow, so each session builds on the last instead of starting over.
+看到"请重新连接"，点对应的连接按钮，按页面提示完成：多数是在弹出的网页里用该账号登录并确认授权（和"用微信或 Google 账号登录某个网站"是一回事），有的需要输入页面上显示的验证码。**PM 连一次，全队共用**，同事不需要各自连接。
 
-> *"Build me an interactive dashboard on CBRS from what we've found so far in this workspace: the price with the key events, revenue growth, customer concentration, and how much rides on OpenAI. I want to click around it."*
+<!-- DALTON-HOOK(docs-readme) -->
+### 3. 看懂页面
 
-A new thread builds it from the research and files earlier threads left in the workspace: [a live dashboard you can play with](https://app.langalpha.ai/a/DB8NBmVeudB1).
+- **左侧栏**：各个工作区。点 **Home**（或"All workspaces"）就是在找研究总监；点某家公司的名字（如 GOOGL）就是在找这家公司的专属分析师。"团队"分组里可以看到同事的工作区（只读）。
+- **覆盖一家新公司**：在 Home 里对研究总监说"开始覆盖 NVDA"，或在左侧栏新建一个以股票代码命名的工作区，然后在里面运行首次覆盖。
+- **对话区**：和分析师说话的地方。分析师的每一步操作（查数据、跑代码、读文件）都会显示成卡片，可以点开看。
+- **文件面板**：工作区里的所有文件，包括知识档案、模型 Excel、报告草稿、已发布报告。
 
-<table align="center">
-  <tr>
-    <td width="50%" align="center" valign="top"><img src="https://raw.githubusercontent.com/ginlix-ai/LangAlpha/main/docs/images/chat-cbrs-workspace-data-files.webp" alt="The demo-cbrs workspace mid-research: the agent loading the xlsx and dcf-model skills and running code for market inputs, beside revenue_history.json open from the overview task's data folder in a file tree with one folder per task" /><br /><sub><b>Workspace Files</b>: bulk data lands in files, not the agent's context. Prices, filings and model inputs fill each task's data/ folder in the file tree</sub></td>
-    <td width="50%" align="center" valign="top"><img src="https://raw.githubusercontent.com/ginlix-ai/LangAlpha/main/docs/images/chat-cbrs-dashboard-openai-exposure.webp" alt="The dashboard thread: the build request and a follow-up that merges another thread's event files, beside the live CBRS dashboard on how much rides on OpenAI, with its exposure ledger and backlog stress test" /><br /><sub><b>Running apps</b>: the agent builds interactive dashboards. Click a bar, marker or row to see its source, drag the OpenAI backlog stress test, or @ another thread's files to merge them in</sub></td>
-  </tr>
-</table>
+---
 
-### ⏰ Agents that keep watch
+<!-- DALTON-HOOK(docs-readme) -->
+## 日常怎么用
 
-Schedule a brief before the open, or wake an agent when a stock crosses a price or moves a set percentage in a day. Results land in one feed, and in Slack, Discord, Telegram, Feishu or iMessage if you connect them and pick them for delivery.
+<!-- DALTON-HOOK(docs-readme) -->
+### 直接说话
 
-> *"Keep watch on CBRS for me. Check the model's assumptions every Monday, update it after Q3 results, and tell me if the stock breaks above our bull value or below $95."*
+用平时和分析师说话的方式就行，不需要特殊格式。例如：
 
-The agent sets up four automations in the workspace: a weekly assumption check, a one-time model update the morning after Q3 results, and two price triggers, at the bull-case value from the DCF model and at $95, the level that would change the rating. Each run starts from the model and notes in the workspace and reports to Slack.
+- 在 **GOOGL 工作区**里说："Search 本季增速放缓主要是什么原因？和一致预期比怎么样？"
+- 在 **Home** 里说："这周覆盖池里有哪些公司出现了 thesis 变化？"
+- 在 **Home** 里说："帮我看一下 NVDA 今天为什么跌了 6%。"（不需要先建工作区）
 
-<table align="center">
-  <tr>
-    <td width="50%" align="center" valign="top"><img src="https://raw.githubusercontent.com/ginlix-ai/LangAlpha/main/docs/images/automations-cbrs-schedules-price-watches.webp" alt="Automations page with a weekly CBRS check, a post-earnings model update and two price triggers" /><br /><sub><b>Automations</b>: every schedule and price watch on one page, with how far each watch is from firing and where its results go</sub></td>
-    <td width="50%" align="center" valign="top"><img src="https://raw.githubusercontent.com/ginlix-ai/LangAlpha/main/docs/images/automations-cbrs-new-price-move.webp" alt="A new automation that wakes the agent when CBRS rises 15% from the previous close, with its instruction and delivery to a Slack DM" /><br /><sub><b>On a price move</b>: wake the agent on a % move from the previous close or the day open, with today's move shown against your threshold</sub></td>
-  </tr>
-</table>
+<!-- DALTON-HOOK(docs-readme) -->
+### 常用的"快捷命令"
 
-### 📑 Get the deliverable, not just an answer
+在输入框里打 `/` 会弹出命令列表。**不用背**：直接用大白话说"帮我做一下 META 的首次覆盖"，效果和输入 `/initial-coverage` 一样。最常用的几个：
 
-Excel models with live formulas, PDF and HTML reports, slide decks and interactive dashboards. Built-in skills cover DCF, comps, earnings previews, initiating coverage, morning notes and trade pitches.
+| 命令 | 在哪里用 | 做什么 |
+|---|---|---|
+| `/initial-coverage` | 公司工作区 | **首次覆盖**：公司背景、行业、财务三镜头（净现金、隐含资产、股东回报三项"体检"）、估值历史四条线并行，产出买方 12 问初筛报告（生意模式、竞争壁垒、增长驱动、财务质量、估值、多空分歧等 12 个核心问题），并建立这家公司的知识档案 |
+| `/full-coverage` | 公司工作区 | **完整覆盖**：事实底表、四条取证线、带公式的 Excel 模型（含 DCF）、12 问 memo、两轮审稿 |
+| `/bullbear` | 公司工作区 | 多空分析：一致预期 vs 2–4 个核心争论、预期修正、催化剂 |
+| `/dalton-earnings-preview` | 公司工作区 | 财报前瞻：给出可以事后核对的预测清单 |
+| `/dalton-earnings-flash` | 公司工作区 | 财报快讯：发布后第一时间的解读和初步结论 |
+| `/dalton-earnings-deep` | 公司工作区 | 财报深度点评：八段式点评、thesis 校准；已有财务模型时同时更新模型 |
+| `/dalton-filing-review` | 公司工作区 | 读一份公告（美股 SEC、港股、A 股）并给出结论 |
+| `/dalton-stock-move` | 任何地方 | 解释一次大的股价异动：先判断是板块还是公司自身，再找证据 |
+| `/dalton-call` | 公司工作区 | 高 conviction 观点：先过六道证据检查（逻辑是否完整、分歧是否落到具体驱动因素、三种情景的估值是否算清等），再给情景加权收益和仓位建议；证据不够时只陈述事实，不硬给买卖建议 |
+| `/pm-qa` | 任何地方 | 按五段式回答 PM 关于覆盖公司的问题 |
+| `/weekly-review` | Home | 覆盖池周度复盘 |
+| `/topic-research` | Home | 跨公司主题研究，比如"AI agent 对搜索广告的影响" |
+| `/dalton-director` | Home | 让研究总监扫一遍覆盖池，按紧急程度在当天预算内派活 |
 
-> *"Write it up like a sell-side initiation on CBRS: rating, price target, the thesis, what the market is pricing in, the scenarios, peers, key risks, and the charts. Use the research and the model we already have."*
+<!-- DALTON-HOOK(docs-readme) -->
+### 读懂知识档案
 
-The initiating-coverage skill builds on the research and the reverse DCF workbook from earlier in the thread, and writes ten pages: a Sell with a $130 target, scenarios, peers, risks and seven charts, as a PDF with [an HTML version](https://app.langalpha.ai/a/eedVW2kllALZ). Select a range in the spreadsheet panel and send it back to the agent to ask about it. With Slack connected, ask it to send everything over and every file arrives in your DM, ready to open there.
+每个公司工作区的根目录下有这些文件。**这是分析师对这家公司的全部认知**：
 
-<table align="center">
-  <tr>
-    <td width="50%" align="center" valign="top"><img src="https://raw.githubusercontent.com/ginlix-ai/LangAlpha/main/docs/images/chat-cbrs-initiation-report.webp" alt="A ten-page CBRS initiation report open beside the chat, with revenue and customer-concentration charts" /><br /><sub><b>File panel</b>: read the HTML report rendered or as source, with the filings and press releases behind it cited inline</sub></td>
-    <td width="50%" align="center" valign="top"><img src="https://raw.githubusercontent.com/ginlix-ai/LangAlpha/main/docs/images/chat-cbrs-dcf-comps-workbook.webp" alt="The CBRS reverse DCF workbook in the spreadsheet panel, with a selected cell ready to add to the chat" /><br /><sub><b>Spreadsheet</b>: a real workbook with live formulas across DCF, WACC, Comps and Checks, beside the research runs that fed its comps</sub></td>
-  </tr>
-</table>
+| 文件 | 内容 |
+|---|---|
+| `thesis.md` | 投资逻辑：核心观点、支撑的证据、什么情况下会证伪 |
+| `debate.md` | 市场上的核心争论，以及多空双方各自的论据 |
+| `drivers.md` | 关键驱动因素和跟踪指标（比如 Search 的点击量和 CPC、云的 backlog），以及已经拿到的最近读数和来源 |
+| `management.md` | 管理层和他们的指引风格 |
+| `agenda.md` | 研究议程：还没回答的问题、下一个验证点和时间 |
+| `lessons.md` | 复盘教训 |
+| `verdicts.md` | 研究的**结论记录**（最近 60 条），每条用五个词之一：无变化 / 强化 / 削弱 / 证伪 / 新论点 |
+| `published/` | 已正式发布的报告（发布后不可修改） |
+| `drafts/` | 报告草稿 |
+| `model/` | 财务模型 Excel |
 
-<table align="center">
-  <tr>
-    <td width="50%" align="center" valign="top"><img src="https://raw.githubusercontent.com/ginlix-ai/LangAlpha/main/docs/images/chat-cbrs-initiation-peers.webp" alt="The initiation request beside the CBRS report in the PDF viewer, on the page that tests the bull case against peer valuations and margins" /><br /><sub><b>PDF viewer</b>: flip and zoom through the finished PDF beside the chat, here on the page that tests the bull case against peer multiples and margins</sub></td>
-    <td width="50%" align="center" valign="top"><img src="https://raw.githubusercontent.com/ginlix-ai/LangAlpha/main/docs/images/slack-cbrs-deliverables-dm.webp" alt="The agent sending the initiation report, workbook, dashboard and research notes to a Slack DM, with the report open in Slack" /><br /><sub><b>Slack</b>: the whole package in two messages, deliverables then research notes, each file in its own threaded reply</sub></td>
-  </tr>
-</table>
+**想修改档案，最好直接告诉分析师**，比如"把 thesis 的第二个支柱改成……"，它会按规范写入并留下修改理由。如果你直接改了这些 `.md` 文件，系统会保存你的修改并提醒分析师合入；在分析师合入之前，正式档案不会变。档案的每个版本都会留底，可以回看改了什么、为什么改。
 
-### 📈 Chart with the agent
+<!-- DALTON-HOOK(docs-readme) -->
+### 日常笔记和正式报告
 
-Live market charts the agent can read and draw on from any chat: support and resistance, trendlines, Fibonacci levels and event markers, saved per symbol and timeframe. Outside Market View, the drawing arrives as a chart card that opens the same chart beside the conversation.
+- **日常笔记**：财报快讯、公告点评、异动解释、增量检查等，写在工作区的 `research/` 里，并直接在对话中告诉你结论，**不需要审批**。
+- **正式报告**：首次覆盖、完整覆盖、多空报告、深度点评、调整观点等，先写成 `drafts/` 里的草稿，走下面的发布流程后才进入 `published/`。
 
-> *"Chart CBRS since its IPO and mark what moved it: earnings, deals, analyst calls and lock-ups."*
+### 发布一份正式报告
 
-The agent works out what moved the stock on each big day, then draws it on the live chart: 18 event badges, 4 lock-up markers, and lines at the $185 IPO price and the consensus target. Hover a badge to read its note.
+1. 让分析师写报告。草稿放在 `drafts/` 里。
+2. 分析师调用发布时，系统自动做两道检查：
+   - **数字核验**：逐个核对报告里的数字，看能否对上出处（档案里的证据、模型单元格、原始文件）。找不到出处或与证据矛盾的数字会挡住发布；拿不准的、以及明确标为假设或估计的数字会列出来，交给 PM 判断；
+   - **独立审稿**：用另一家公司的模型审一遍，审稿人和作者不能是同一家的模型。
+3. 两道都通过后，对话里会弹出一张**发布审批卡片**，列出核验结果、拿不准的地方和审稿意见。**只有 PM 能点"批准"**。
+4. 批准后，报告写入 `published/`。正式版本不覆盖，需要更正时发布一个新版本。批准只对当时的正文和附件有效，发布完成前如果内容又被改动，需要重新审批。
 
-<p align="center">
-  <img src="https://raw.githubusercontent.com/ginlix-ai/LangAlpha/main/docs/images/chart-cbrs-post-ipo-event-annotations.webp" alt="Live CBRS daily chart with agent-drawn event badges, lock-up markers and reference lines since the IPO" width="800" />
-  <br />
-  <sub><b>Live chart</b>: each note sits on the day the stock reacted, and the chat lists every move in a table with the source behind it</sub>
-</p>
+如果是自动任务里写的报告，系统不会打断你，而是把"待审批"放进议程，等你下次打开时处理。
 
-### 🧾 See the evidence behind every answer
+---
 
-A Sources panel lists each filing, web page, data call and file the agent touched in a turn, even the data calls made from its own Python and Bash, so you can check the work instead of trusting it.
+<!-- DALTON-HOOK(docs-readme) -->
+## 它会自己做什么
 
-<p align="center">
-  <img src="https://raw.githubusercontent.com/ginlix-ai/LangAlpha/main/docs/images/chat-cbrs-sources-panel.webp" alt="Sources panel listing the subagent reads, SEC filings, market data and data-tool calls behind one turn" width="800" />
-  <br />
-  <sub><b>Sources</b>: switch between this turn's 14 sources and the thread's 560, grouped into web search and crawling, SEC filings, market data and data tools, each with the prompt or arguments it ran with</sub>
-</p>
+<!-- DALTON-HOOK(docs-readme) -->
+### 自动跟踪
 
-## Agentic trading
+覆盖名单分两档：**核心标的（Core）**是重点覆盖的公司，**观察名单（Watch）**是需要留意但不深度跟踪的公司。两档的盯盘频率不同。
 
-We are committed to making LangAlpha the best harness for agentic trading. Brokers now let AI agents trade real accounts, and the agents plugging in are general-purpose, so an order is one more tool call among many. In LangAlpha it is the one call the harness is built around:
+一家公司打开"自动跟踪"后，系统会为它安排三件事：
 
-- **Limits that hold whatever the model does.** What each connection may do, which orders wait for your approval, and the rule that an approved order runs exactly once are enforced on the host, on the one [governed path](#governed-orders) every order takes. No prompt, and no script the agent writes, can widen them, and they stay the same for every model you run.
-- **An order path you can read.** Every check an order passes, from the model's call to the request your broker receives, is code in this repository. You can read it before trusting it with money, and run it on your own machine under the same controls.
+| 任务 | 什么时候 | 做什么 |
+|---|---|---|
+| **盯盘** | 核心标的：周一至周五 6:00–20:30 每 30 分钟一次；观察名单：周一至周五早上 7:30 一次（美股按美东时间，A 股和港股按北京时间；目前不识别节假日） | 先做一轮**低成本**的检查：SEC 或巨潮有没有新公告、有没有新研报和专家纪要、议程里有没有到期的验证点、财报日是否临近。**什么都没有就直接跳过**；有事才唤醒分析师去处理 |
+| **每日增量** | 周一至周五 21:30 | 检查 thesis 有没有增量变化，没有就提前结束 |
+| **异动解释** | 股价较前收盘涨跌超过 ±4% 时 | 自动判断是板块原因还是公司自身原因，找出证据。如果只是大盘或板块共振、没有公司自身的催化，只记一笔"无变化" |
 
-Four brokerages connect today, under the same controls:
 
-| | Robinhood | Interactive Brokers | moomoo | Webull |
-| --- | :---: | :---: | :---: | :---: |
-| Account, positions, history | ✅ | ✅ | ✅ | ✅ |
-| Market data and watchlists | ✅ | ✅ | ✅ | ✅ |
-| Order preview | ✅ | | | |
-| Paper trading | | | ✅ | |
-| Staged orders, confirmed in the broker's app | | ✅ | | |
-| Live orders | ✅ | | ✅ | |
+另外，**财报日历**（见下一节）确认财报日期后，会为核心标的单独排好"财报三连"：财报前 3 个工作日早上 8:00 做前瞻，发布后 30 分钟出快讯，发布后下一个工作日晚上 8:00 做深度点评。
 
-Robinhood connects from the desktop app, because Robinhood only accepts sign-ins that return to a local app. moomoo covers US, Greater China, Japan and Southeast Asian markets.
+分析师每次被唤醒、处理完之后，都要在 `verdicts.md` 里记一条五词结论，并更新研究议程。
 
-When you connect one, you choose what it may do, from read-only to paper trading to live orders.
+> **怎么打开**：目前请联系系统管理员开启（GOOGL 已开启）。即将上线的版本里：首次覆盖完成后会默认打开；公司工作区里有开关可以随时开关；也可以直接对研究总监或分析师说"开始跟踪 NVDA"、"暂停 GOOGL 的跟踪"。
 
-<table align="center">
-  <tr>
-    <td width="50%" align="center" valign="top"><img src="https://raw.githubusercontent.com/ginlix-ai/LangAlpha/main/docs/images/plugins-brokerages-capabilities.webp" alt="Brokerages tab of the Plugins page, showing what each brokerage connection can do" /><br /><sub><b>Brokerages</b>: connect your brokerage account; each card lists what the agent can do there before you link it</sub></td>
-    <td width="50%" align="center" valign="top"><img src="https://raw.githubusercontent.com/ginlix-ai/LangAlpha/main/docs/images/plugins-robinhood-connect-capabilities.webp" alt="Connecting Robinhood, with a switch for each thing the agent may do, from market data to live orders, and live orders left off" /><br /><sub><b>Capabilities</b>: switch on only what you trust. Orders sized against your positions wait on an approval card, and nothing reaches the broker until you say yes</sub></td>
-  </tr>
-</table>
+<!-- DALTON-HOOK(docs-readme) -->
+### 研究总监
 
-## Get started
+研究总监（Home）可以在周一至周五早上 7:30（北京时间）把覆盖池里待办的研究排一次序，依据是这件事的价值、紧急程度和距上次研究的时间；然后在当天预算内把研究派给各公司的分析师。周六上午 10:00 做一次周度复盘，给出观点变化和 call；周六 9:00 运行**财报日历**：确认覆盖名单未来几周的财报日期（只认公司官方公告），为已经建了工作区的公司排好"财报三连"。目前**财报日历已开启**，每日派活和周度复盘还没有开启。
 
-**Use the model you already pay for.** Sign in with a Claude or ChatGPT subscription, use a coding plan from Kimi, GLM or MiniMax, bring any API key, or run a local model when you self-host.
+---
 
-**Work where you are.** Use the browser, the [desktop app](https://github.com/ginlix-ai/langalpha/releases) for macOS, Windows and Linux, or Slack, Discord, Telegram, Feishu and iMessage on [LangAlpha.ai](https://langalpha.ai).
+<!-- DALTON-HOOK(docs-readme) -->
+## 它能用哪些数据
 
-**Hosted (beta).** Sign up at [LangAlpha.ai](https://langalpha.ai) to start free or trial with one of our plans. Market data, cloud sandboxes, brokerage connections and channels are set up for you. Plans and features may change during the beta.
+| 类别 | 来源 |
+|---|---|
+| 美股公告与财报 | SEC EDGAR：10-K、10-Q、8-K、Form 4 等，含结构化财务数据 |
+| 港股与 A 股公告 | 巨潮资讯（A 股、港股法定公告的官方转载平台）：公告和 PDF 原文。仅英文版的港股公告，再去港交所披露易查 |
+| 港股与 A 股行情和财务 | 行情、资金流、两融、龙虎榜、股东、分红回购、AH 溢价 |
+| 一致预期 | Yahoo Finance 一致预期 |
+| 卖方研报与会议纪要 | AlphaEngine |
+| 专家访谈 | Guidepoint（专家匿名，只写职务；引用原话不超过 20 个词） |
+| 业绩电话会 | 电话会转写稿 |
+| 内部资料 | 公司 wiki、卖方销售邮件、TMT Breakout（科技行业每日纪要）、FUNDA AI（独立研究） |
+| 宏观 | FRED、美国财政部、市场拥挤度和过热指标 |
+| 社区与舆情 | 雪球、员工评论（Blind 等）、X：跨账号搜索，以及固定账号的时间线 |
+| 行情 | 行情、日线、美股盘前盘后（部分品种有延迟，使用时注意报价时间） |
+| 网页 | 网页搜索、网页正文读取。读取失败时自动改用 Firecrawl 再试 |
+| 团队的历史讨论 | OpenClaw 里的团队对话，每天整理成**知识卡片**，分析师可以检索"之前团队怎么看这件事" |
 
-**Self-host.** All you need is Docker:
+系统每天给数据源做一次体检：能不能用、探测到的最近资料是哪一天，结果会告诉分析师，所以它知道自己能拿到什么。（个别调用成本高的来源不做自动体检。）
 
-```bash
-git clone https://github.com/ginlix-ai/langalpha.git && cd langalpha
-make config   # wizard: model, data sources, sandbox, web search
-make up       # Postgres, Redis, backend and web app
-```
+---
 
-Open [http://localhost:5173](http://localhost:5173). The API listens on port 8000, with interactive docs at `/docs`.
+<!-- DALTON-HOOK(docs-readme) -->
+## 费用和额度
 
-**How self-host differs.** Agents, workspaces, automations, skills and governed orders run the same. The rest differs:
+- 大部分模型走**订阅账号**，用多少都不额外付费，系统只记录一个"名义成本"供参考。
+- 少数按次付费的模型和服务，受**每天的现金额度**限制，默认每天 100 美元。用完后，自动任务会暂停，第二天再继续；你的手动对话会提示额度不足。
+- 盯盘的检查本身成本很低：大部分时候只是查一下有没有新东西；少数信号需要一个小模型判断要不要唤醒分析师。
+- 设置 → 模型 页面可以看到今天的花费和剩余额度。
 
-| | Hosted | Self-host |
-| --- | --- | --- |
-| Market data | Live quotes for US equities and options, with extended hours. China A-shares coming soon | Yahoo Finance or FMP quotes, refreshed every 60 seconds and shown as delayed |
-| Options and market structure | Options chains and snapshots, short interest, float and top movers | Not available |
-| Price triggers | Fire on live ticks | Poll every 30 seconds against the delayed quotes |
-| Channels | Chat and get automation results in Slack, Discord, Telegram, Feishu and iMessage | Web app and desktop app. Automation results go to a webhook you run (`AUTOMATION_WEBHOOK_URL`) |
-| Accounts | Sign-in with separate data per user | One local user with no sign-in, so anyone who can reach it acts as you, connected brokerages included. Keep it on your machine or a private network |
-| Models | Models included with your plan, your own keys, or Claude and ChatGPT sign-in | Your own keys, coding plans, local models, or Claude and ChatGPT sign-in |
-| Availability | Runs 24/7 on AWS in US East, so automations and price triggers fire while your computer sleeps | Runs only while your machine and its Docker stack are up |
-| Remote access | Browser, desktop app and channels from anywhere | The web app and API listen on every network interface, so your local network can reach them. Reaching it from outside means exposing it yourself, behind a VPN or an authenticating proxy |
-| Operations | Upgrades, migrations, backups and sandbox capacity are handled for you | You run upgrades, database migrations and backups. Docker sandboxes share your machine's CPU, memory and disk |
+---
 
-<details>
-<summary><b>Optional keys and what they unlock</b></summary>
+<!-- DALTON-HOOK(docs-readme) -->
+## 常见问题
 
-| Key | Unlocks |
-| --- | --- |
-| `FMP_API_KEY` | Fundamentals, financial statements, macro and analyst data ([free tier](https://site.financialmodelingprep.com/)) |
-| `DAYTONA_API_KEY` | Cloud sandboxes from [Daytona](https://www.daytona.io/). Without it, sandboxes run in local Docker |
-| `R2_*`, `S3_*` or `OSS_*`, with `storage.provider` | Object storage on Cloudflare R2, AWS S3, Alibaba OSS or MinIO. Holds workspace file snapshots, memos, attachments, skill archives, large transcripts and chat widget data, and serves downloads over signed links. Without a bucket these bytes stay in Postgres and chart image capture is off |
-| `TAVILY_API_KEY`, `SERPER_API_KEY`, `EXA_API_KEY`, `PARALLEL_API_KEY`, `BOCHA_API_KEY` | Web search. The engine is chosen by `search_api` in `agent_config.yaml` (default `tavily`) or per user in Settings |
-| `FIRECRAWL_API_KEY` | Upgraded web fetch and site crawling. The built-in crawler needs no key |
-| `X_BEARER_TOKEN` | X post search and thread lookup. Add it as a vault secret on the Plugins page |
-| `LANGSMITH_API_KEY`, `OTEL_EXPORTER_OTLP_ENDPOINT` | Tracing and metrics |
+**支持哪些市场？股票代码怎么写？**
+美股、港股、A 股都支持。直接写代码（如 `META`、`0700.HK`、`600519`）或公司中文名都可以。
 
-With no data keys you still get Yahoo Finance prices, fundamentals, analyst data and screening, SEC EDGAR filings, and a local Docker sandbox. Run `make help` for every command, or see [CONTRIBUTING.md](CONTRIBUTING.md#quick-start) to run the backend and web app on your host.
+**我手上有研报 PDF、访谈纪要或自己的 Excel 模型，怎么给它？**
+在对话框里作为附件发给分析师，或者上传到这家公司工作区的 `sources/`（资料）、`model/`（模型）文件夹。
 
-</details>
+**深度报告要跑很久，中途可以关掉网页吗？**
+可以。任务在服务器上运行，关掉网页或切到别的工作区都不影响，回来后结果都在。
 
-## Harness design
+**分析师说的数字可信吗？**
+引用的来源会显示成卡片，可以点开看原文。对草稿，可以让分析师"核验一下这份草稿"，系统会生成一份核验报告和一份逐个标注了数字的副本。正式发布时，找不到出处或与证据矛盾的数字会挡住发布，并且要经过独立审稿和 PM 审批。
 
-**What context reaches the model, in what form, and what it can act on define the harness.**
+**我直接改了 thesis.md，分析师会知道吗？**
+会。系统会保存你的修改，并提醒分析师把它合入正式档案；在合入之前，正式档案不变。更省事的做法是直接对分析师说你想怎么改。
 
-Where a convention already exists, LangAlpha follows the one frontier labs ship in their own agents: file tools that read, write, edit and search, a Bash shell, skills as `SKILL.md` files, and a workspace `agent.md` in the style of `AGENTS.md`. Those shapes are likely in a model's training data, so it arrives knowing how to use them.
+**它能下单交易吗？**
+本团队目前只把 Dalton 用于研究，没有配置任何交易账户。
 
-### Workspaces and memory
+**它会不会一直在后台花钱？**
+花费受每日现金额度约束。盯盘没事时只做低成本的检查；每日增量检查、周度复盘这类定期任务即使没有新事件也会运行，但大多用的是订阅模型，不额外付现金。
 
-A thesis is tracked for weeks, months or longer, far past any context window. Workspaces and memory are what keep the agent on the same goal across that span, which is why it gets a full workspace and file system from the start: they are the foundation the rest builds on.
+**看不到同事的工作区？**
+在左侧栏的"团队"分组里。同事的工作区你只能看，不能改。
 
-A **computer** owns one sandbox. Each **workspace** is a folder on it, with its own threads, files and notes, so a second idea opens in seconds instead of booting a new machine. Workspaces on one computer share an OS user; use separate computers when you want isolation.
+**模型页面显示"请重新连接"？**
+点对应的连接按钮重新授权即可。团队模式下，需要 PM 来连。
 
-Each folder holds an `agent.md` the agent maintains (goals, findings, an index of threads and files), a shared `data/` directory, and one folder per task. Memory, settings and history live on the server, not in any one sandbox. A FUSE mount shows them on every computer as ordinary files, so they carry across computers and sandbox rebuilds, and Bash, code and the file tools all reach them the same way:
+**我想查团队以前在群里讨论过的观点？**
+直接问分析师，比如"之前团队对 AppLovin 的电商广告怎么看？"。它会去检索团队对话整理出的知识卡片，并标明出处。
 
-| Store | What it holds |
-| --- | --- |
-| Memory | Durable preferences and findings, per user and per workspace. The agent manages these proactively: it saves what it learns about you and your work, and updates or removes entries that go stale |
-| Profile | Your portfolio, watchlist and preferences, as JSON files the agent reads and updates |
-| Automations | One JSON file per automation. The agent creates, edits or pauses one by writing its file; the server validates each save before it takes effect and reports a refused one in the tool result |
-| Workflows | Saved workflow scripts the agent can run by name, edit or add to |
-| Memos | PDFs and notes you upload, extracted and indexed so the agent can cite them. Read-only to the agent |
-| Transcripts | Every past thread, searchable, so the agent can look up what it did last week. Read-only |
+---
 
-### Programmatic tool calling
+<!-- DALTON-HOOK(docs-readme) -->
+## 给技术同事
 
-LangAlpha has been built around programmatic tool calling since its first release in January 2026. Rather than calling tools one JSON call at a time, the agent writes Python that imports them: LangAlpha turns any [MCP](https://modelcontextprotocol.io) server into a Python module with its docs, and the code runs in the sandbox. Two reasons drive it:
-
-- **Tools cost context before they are used.** Bound as JSON tools, every server's schemas ride along on every call, whether the turn needs them or not. Here the prompt carries one line per server, and the agent reads a server's full docs from a file the first time it needs them. That saves tokens, keeps noise out, and a new server costs one line.
-- **Financial data is tables, not prose.** Ten years of daily bars for a dozen tickers is about 30,000 rows. A model cannot work that as text, and pasting it in would fill the window. In code the agent aggregates and transforms it, charts it, and feeds it into a valuation model or a backtest, and only the result comes back to the context.
-
-<p align="center">
-  <img src="https://raw.githubusercontent.com/ginlix-ai/LangAlpha/main/docs/images/diagrams/ptc.webp" alt="Programmatic tool calling: the model writes code that imports MCP servers as Python modules in the sandbox, the raw rows stay in the sandbox, and only the result returns to the model" width="880" />
-</p>
-
-Code is the default, not the only path. Any MCP tool can instead run as a plain JSON tool call, set per tool on the Plugins page. That suits sensitive operations such as account actions, where every call should be visible on its own, and an order tool always runs this way, on the [governed path](#governed-orders).
-
-### Data and tools
-
-Bulk data is worked in code through the Python modules, and quick lookups are bound **direct**: a quote, a company overview, a filing or a screen is a single JSON tool call and shows as a card in the chat. A result too large for the context, from either path, is saved to a file with a preview left in its place, and the agent opens the file in code when the preview is not enough.
-
-The sources span three kinds of data:
-
-- **Market data**: quotes, price history for stocks, indices, crypto, FX and commodities, options chains, screeners, and market and sector overviews.
-- **Fundamentals and macro**: financial statements and ratios, analyst data, insider trades, earnings and economic calendars, macro series and the yield curve.
-- **Filings and text**: SEC filings and earnings call transcripts, X posts and web pages.
-
-LangAlpha's own data servers are made to be digested by code: every market-data tool returns the same envelope (`symbol`, `currency`, `timezone`, `count`, `data`, `source`), time series run oldest first, and failures come back as typed error codes, so agent code indexes the result instead of parsing prose.
-
-Providers fall back per market: the real-time feed on LangAlpha.ai for US data, FMP for fundamentals and macro, and Yahoo Finance as the free floor. Web search supports Tavily, Serper, Exa, Parallel and Bocha, and web fetch uses a built-in crawler with optional Firecrawl delegation behind per-provider circuit breakers.
-
-Beyond data, the agent works with these tools:
-
-| Group | What the agent can do |
-| --- | --- |
-| Code and files | Run Python and shell commands, long jobs in the background; read, write, edit and search files; share a preview link to an app it serves from the sandbox |
-| Web | Search, fetch a page, and with Firecrawl crawl or map a whole site |
-| Output | Render an interactive widget in the chat, and draw annotations on a stock's live chart |
-| Coordination | Dispatch [subagents and workflows](#subagents-and-teams-of-agents), ask you a structured question, and keep a todo list if you turn it on |
-| Your connections | Brokerage and remote MCP servers over OAuth or header auth, and Agent Plugins |
-| Messaging | On LangAlpha.ai, message you on a connected channel, with files attached |
-
-The **data provenance** layer records every source the agent touches, outside the model's context: market data and MCP calls, whether the model calls a tool directly or the agent's Python or Bash calls it in the sandbox, web searches and fetched pages, SEC filings, and the files, memos and memory the agent reads. Each record carries the provider, the redacted arguments, a timestamp and a fingerprint of the result, keeps the result itself up to 64 KB, and is tied to the turn and to the agent, main or subagent, that made the call. The Sources panel lists them per turn, and the API returns the same records, so an answer can be checked against what it was built on.
-
-### Subagents and teams of agents
-
-The main agent hands work to **subagents**, each with its own context window, for three reasons:
-
-- **More work, at once.** Subagents run in the background, several in parallel, while the main agent keeps working or keeps talking to you.
-- **Wider and deeper research.** A question fans out, one subagent per company, segment or source, each free to dig as deep as its piece needs.
-- **A main agent that keeps the big picture.** A subagent hands back its findings, not the searches and tool calls behind them, so the main agent's context holds the thesis and the plan and stays on track.
-
-Five ship built in (`research`, `general-purpose`, `data-prep`, `equity-analyst`, `report-builder`), and you can define more in `agent_config.yaml`. They stay reachable: the main agent can send a running subagent new instructions, or resume a finished one with its full history. Each one's tool calls and output stream to the UI live, and you can message one directly.
-
-**Workflows** carry scale further. For a large study the agent runs a workflow, a short JavaScript program that fans work out to subagents with `agent()`, `parallel()` and `pipeline()` in a sandboxed QuickJS runtime on the server. It can run a saved workflow by name or write a new one on the spot. The program, not the conversation, is the loop, so a hundred-company screen does not cost a hundred turns, though it still spends the tokens of a hundred subagents.
-
-<p align="center">
-  <img src="https://raw.githubusercontent.com/ginlix-ai/LangAlpha/main/docs/images/diagrams/teams.webp" alt="The main agent, whose context holds only the thesis, the plan and the findings, hands work to subagents and to a workflow that fans out to a hundred agent() calls; each sends back its findings, not its tool calls, and the subagents share the workspace files" width="880" />
-</p>
-
-### How the context is built
-
-Every model call is assembled in layers, ordered from most stable to most volatile, so a long session keeps hitting the provider's prompt cache.
-
-<p align="center">
-  <img src="https://raw.githubusercontent.com/ginlix-ai/LangAlpha/main/docs/images/diagrams/context.webp" alt="One model call as five layers from most stable to most volatile: tools, system prompt, a frozen thread baseline, history and a market-stamp tail, with a cache point after each of the first four" width="880" />
-</p>
-
-- **System prompt.** One template, rendered at the guidance level of the model in use.
-- **Thread baseline.** Read once when a turn starts, then frozen: the workspace, your profile, the MCP server roster, the skills manifest, `agent.md`, both memory tiers and the memo index. When one of them changes later, the agent gets a short row saying what changed and the baseline stays byte-identical. It is rebuilt after a compaction or once 20 rows pile up.
-- **Runtime rows.** Each turn opens with a row giving the time, the market session when it changed, and how long it has been since the last turn, sent the way each provider expects.
-- **Steering.** A message you send while an agent works, main agent or subagent, lands before its next model call.
-- **Compaction.** Old tool arguments are trimmed first, with the originals kept as files. Near the model's limit, older turns fold into a summary, the full transcript is saved, and the summary tells the agent where to read it.
-
-### Models
-
-LangAlpha isn't tuned only for frontier models. The same tools and middleware drive every model, so an open-weight model can get you comparable results at a fraction of the cost. Switch providers mid-thread, and a failed call retries, then falls back to a model you configure.
-
-Most providers accept the Chat Completions format, but for several it is a compatibility layer that drops what matters. For each provider, LangAlpha picks the API format that serves its models best, such as the OpenAI [Responses API](https://platform.openai.com/docs/api-reference/responses) for OpenAI and Codex, and the Anthropic [Messages API](https://docs.anthropic.com/en/api/messages) for Claude, Kimi, MiniMax and DeepSeek. Two things drive the choice:
-
-- **Thinking is preserved.** Reasoning returns to the model within a turn and across turns, in its provider's own form: Anthropic's signed thinking blocks, OpenAI's encrypted reasoning items, GLM's reasoning text.
-- **Runtime context rides the right channel.** The harness feeds the model a lot of runtime context. It goes as a `developer` message on OpenAI-shaped APIs and a mid-conversation `system` message on Anthropic and GLM, which honor it, and inside the user message elsewhere.
-
-Three dials tune each model, set account-wide or per model in Settings:
-
-- **Prompt guidance.** Frontier models get a lean prompt; smaller models get a detailed one with worked examples and step-by-step procedures. Both come from one template, so they never drift apart.
-- **Reasoning effort.** One scale from `none` to `max`, written to each vendor's own parameter and stepped down to the nearest level a model offers. Override it for a single message from the composer.
-- **Compaction profile.** Four presets, from aggressive to relaxed, set how early a long thread is compacted. By default the model's context window picks one.
-
-| How you connect | Providers |
-| --- | --- |
-| Subscription sign-in | Claude (Claude Code), ChatGPT (Codex) |
-| Coding plans | Kimi, GLM, MiniMax |
-| API key | OpenAI, Anthropic, Gemini, DeepSeek, Qwen (DashScope), Kimi (Moonshot), GLM (Zhipu), MiniMax, OpenRouter, Groq, Cerebras |
-| Local | Ollama, LM Studio, vLLM |
-
-Keys and OAuth tokens are encrypted at rest with pgcrypto.
-
-### Skills and plugins
-
-Skills follow the [Agent Skills](https://agentskills.io/specification) specification and plugins the [Agent Plugins 1.0.0](https://agent-plugins.org) format. The built-in MCP servers and skills ship as plugin bundles in [`plugins/`](plugins/), the same format you upload or install from a git URL on the Plugins page. On top of the standards, LangAlpha adds:
-
-- **Skills load on demand.** The prompt carries one manifest line per skill, and the full skill loads by slash command or when the agent reads its `SKILL.md`. Tools a skill brings, such as the automation tools, stay hidden until it loads.
-- **Your skills, your commands.** Upload a skill as a zip and give it a slash command of your choosing, or have the agent install one from GitHub into a workspace.
-- **One extension block for plugins.** `mcp.json` stays closed to the format's own fields. Everything LangAlpha adds sits in `plugin.json` under `extensions["ai.langalpha"]`, the format's one extension point: a `description` and an `instruction` per server, which reach the prompt; a `tool_exposure_mode` of `summary` or `detailed`, for how much of each tool the agent sees up front; and `secrets`, naming each credential a server needs and where it binds. Strip the block and the package still installs in any Agent Plugins host. Details in [`plugins/README.md`](plugins/README.md).
-- **Third-party servers run isolated.** A server whose code LangAlpha does not own launches through pinned `uvx` or `npx`, never from the app's own environment, so an SDK upgrade on one side cannot break the other.
-
-<p align="center">
-  <img src="https://raw.githubusercontent.com/ginlix-ai/LangAlpha/main/docs/images/plugins-builtin-packages.webp" alt="Packages tab of the Plugins page, listing the six built-in plugin bundles" width="720" />
-  <br />
-  <sub><b>Packages</b>: six built-in bundles of MCP servers and skills, each switched on or off as one, with room for 50 of your own</sub>
-</p>
-
-38 skills ship built in:
-
-| Bundle | Skills |
-| --- | --- |
-| Research | DCF model, comps analysis, 3-statement model, model update and check, initiating coverage, earnings preview and analysis, thesis tracker, trade pitch, company profile, competitive analysis, sector overview, impact analysis, catalyst calendar, idea generation, morning note, market watch, deck check |
-| Deliverables | Excel, Word, PowerPoint, PDF, HTML report, interactive dashboard, inline widget, chart annotation, UI design |
-| Service | Automations, onboarding, user profile and portfolio, secretary, workflows, product help, self-improvement |
-| Alternative data | X research, web scraping |
-
-Acknowledgement: some research skills are adapted from [anthropics/financial-services-plugins](https://github.com/anthropics/financial-services-plugins).
-
-## Full-stack architecture
-
-<p align="center">
-  <img src="https://raw.githubusercontent.com/ginlix-ai/LangAlpha/main/docs/images/diagrams/architecture.webp" alt="Architecture: web, desktop and chat channels reach a multi-worker FastAPI backend whose run lifecycle drives the agent; the agent works in a sandboxed computer whose files persist to Postgres and object storage, and brokerage and remote MCP calls leave through an egress relay that attaches the credentials" width="880" />
-</p>
-
-A turn runs as a background run, independent of the HTTP connection that started it. Events stream over SSE through a per-run Redis stream, so a closed tab or a dropped network loses nothing: the client reconnects and catches up, and finished turns replay from the LangGraph checkpoint. Postgres is the source of truth and Redis is transport, so the backend runs with several workers and any of them can serve the stream, drain the queue or recover an orphaned run. When configured, agent runs trace to LangSmith and the backend exports traces and metrics over OpenTelemetry.
-
-**Files outlive the sandbox.** After each turn, and whenever a computer stops, every workspace folder that changed is snapshotted. The manifest is one Postgres row per path. The bytes go from the sandbox straight to S3-compatible object storage, or stay in Postgres when you run without one. The file browser and downloads keep working while the computer is off, and a recreated sandbox is restored from the snapshot. A Daytona computer left stopped for a week also archives its whole disk to cold storage and resumes from it on the next start.
-
-The **channel gateway** is part of LangAlpha.ai. It carries Slack, Discord, Telegram, Feishu and iMessage conversations into the same chat API the web app uses, and posts automation results to the channel you pick.
-
-### Governed orders
-
-An order moves real money, so it gets its own path. Order tools are pinned to direct JSON calls: one call is one order the system can see, show and stop. A sandbox script could place any number of orders in a single execution, so order tools are never exposed there.
-
-<p align="center">
-  <img src="https://raw.githubusercontent.com/ginlix-ai/LangAlpha/main/docs/images/diagrams/orders.webp" alt="A governed order: the model's order call is recorded and shown to you for approval, the approval mints an execution token, and the egress relay verifies it, claims the single dispatch and sends the order with the stored credential" width="880" />
-</p>
-
-- **Consent per connection.** When you connect a brokerage you pick which capability groups it carries. The relay refuses any call outside them, whatever the model asks for.
-- **Approval per order.** Live and staged orders wait for you by default and paper orders do not. Each mode is a switch you control.
-- **Exactly one execution.** An approval mints a short-lived token bound to that attempt, that tool and a hash of those arguments. A changed argument, a replay or a second call fails at the relay.
-- **Broker credentials stay out of the sandbox.** Brokerage OAuth tokens and remote MCP credentials are attached by the relay on the host, so code the agent writes never sees them.
-- **A ledger you can read.** Every attempt, approval, rejection and fill lands on the Orders page, and a reconciler settles orders against the broker's own records.
-
-### Security
-
-- **Vault.** Store an API key once and use it from code in any workspace with `from vault import get`. Secrets are encrypted at rest and only the owner can reveal or change them.
-- **Leak redaction.** Every tool result is scanned for known secret values before it reaches the model, and matches are replaced with `[REDACTED:NAME]`. Downloads and shared files get the same treatment.
-- **Sandboxed execution.** Agent code runs in a Daytona or Docker sandbox, and protected-path guards refuse tool calls that reach into system directories.
-
-## Roadmap
-
-- [x] Research harness: data in code, persistent workspaces, agent teams
-- [x] LangAlpha.ai and the desktop app
-- [x] Brokerage connections with governed orders
-- [ ] Agents tuned for crypto and prediction markets
-- [ ] Let your own AI agent (ChatGPT, Claude) hand trades to LangAlpha
-
-## Contributing
-
-Issues and pull requests are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md). The repo holds the backend and agent core ([`src/`](src/)), the web app ([`web/`](web/)), the desktop shell ([`desktop/`](desktop/)) and built-in plugins ([`plugins/`](plugins/)). For partnerships, email [contact@ginlix.ai](mailto:contact@ginlix.ai).
-
-<a href="https://star-history.com/#ginlix-ai/langalpha&Date">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=ginlix-ai/langalpha&type=Date&theme=dark" />
-    <img alt="Star history" src="https://api.star-history.com/svg?repos=ginlix-ai/langalpha&type=Date" width="600" />
-  </picture>
-</a>
-
-## Disclaimer
-
-LangAlpha is software, not a financial adviser. Nothing it produces is investment advice or a recommendation to buy or sell any security. Agents act only within the permissions you grant, and you are responsible for every order placed on your accounts. Do your own due diligence.
-
-## License
-
-[Apache 2.0](LICENSE)
+- 系统架构、部署和开发规范：[docs/dalton/ARCHITECTURE.md](docs/dalton/ARCHITECTURE.md)
+- 开发历史与各阶段的设计：[docs/dalton/dev-guide/README.md](docs/dalton/dev-guide/README.md)
+- Dalton 构建在开源项目 LangAlpha 之上，上游的说明见 [docs/README.zh-CN.md](docs/README.zh-CN.md) 或 [ginlix-ai/langalpha](https://github.com/ginlix-ai/langalpha)。
