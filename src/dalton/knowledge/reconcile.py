@@ -37,6 +37,56 @@ from src.server.services.persistence.resolve import resolve_file_text_or_none
 logger = logging.getLogger(__name__)
 
 
+def same_content(a: Any, b: Any) -> bool:
+    """Compare two documents as parsed JSON, so key order and whitespace never count."""
+    if a is None or b is None:
+        return a is b
+    return canonical_json(a)[0] == canonical_json(b)[0]
+
+
+async def _insert_reconcile_version(
+    *,
+    user_id: str,
+    workspace_id: str,
+    doc_key: str,
+    base_version_no: int | None,
+    content: dict[str, Any],
+    content_sha256: str,
+    reason: str,
+    warnings: list[dict[str, Any]],
+    schema_valid: bool,
+    edited_path: str,
+) -> dict[str, Any] | None:
+    """Append a ``direct_edit`` version only if the doc is still at ``base_version_no``.
+
+    The CAS runs under ``insert_version``'s per-(workspace, doc) advisory lock, so two
+    end-of-turn passes on different workers cannot both record the same edit; the loser
+    gets ``None``.
+    """
+    try:
+        return await db_knowledge.insert_version(
+            user_id=user_id,
+            workspace_id=workspace_id,
+            doc_key=doc_key,
+            base_version_no=base_version_no,
+            content=content,
+            content_sha256=content_sha256,
+            ops=None,
+            reason=reason,
+            evidence_refs=[],
+            source="direct_edit",
+            warnings=warnings,
+            schema_valid=schema_valid,
+            edited_path=edited_path,
+            enforce_base=True,
+        )
+    except db_knowledge.VersionConflict as vc:
+        logger.info(
+            "[dalton.reconcile] skip %s in workspace %s: %s", doc_key, workspace_id, vc
+        )
+        return None
+
+
 async def detect_direct_edits(
     workspace_id: str, user_id: str
 ) -> dict[str, Any]:
@@ -88,99 +138,135 @@ async def detect_direct_edits(
                         parsed = json.loads(raw_text)
                         if not isinstance(parsed, dict):
                             raise ValueError("top-level JSON value must be an object")
-                        old_valid_content = (
-                            latest_valid["content"] if latest_valid else None
-                        )
-                        val = validate_update(
-                            doc_key,
-                            old_valid_content,
-                            parsed,
-                            source="direct_edit",
-                            reason="direct_edit",
-                        )
-                        schema_valid = val.ok
-                        warnings = [*val.errors, *val.warnings]
                         content_to_store = parsed
+                        parse_error = None
+                        # Canonical, so the hash names the content, not the file's bytes.
+                        _, store_sha = canonical_json(parsed)
+                        unchanged = latest is not None and same_content(
+                            parsed, latest.get("content")
+                        )
                     except Exception as parse_err:
-                        schema_valid = False
-                        warnings = [
-                            {
-                                "code": "invalid_json",
-                                "path": "/",
-                                "message": str(parse_err),
-                            }
-                        ]
                         content_to_store = {"_raw": raw_text[:65536]}
+                        parse_error = parse_err
+                        # ``_raw`` is truncated, so only the full-text hash can tell
+                        # two invalid files apart.
+                        store_sha = raw_sha
+                        unchanged = (
+                            latest is not None
+                            and isinstance(latest.get("content"), dict)
+                            and "_raw" in latest["content"]
+                            and latest.get("content_sha256") == raw_sha
+                        )
 
-                    new_row = await db_knowledge.insert_version(
-                        user_id=user_id,
-                        workspace_id=workspace_id,
-                        doc_key=doc_key,
-                        base_version_no=latest["version_no"] if latest else None,
-                        content=content_to_store,
-                        content_sha256=mirror_sha or raw_sha,
-                        ops=None,
-                        reason="检测到未经 knowledge_update 的直接修改（文件面板或命令行）",
-                        evidence_refs=[],
-                        source="direct_edit",
-                        warnings=warnings,
-                        schema_valid=schema_valid,
-                        edited_path=j_path,
-                    )
-                    recorded_versions.append(new_row)
-                    latest = new_row
-                    if schema_valid:
-                        latest_valid = new_row
+                    if unchanged:
+                        # Only the bytes differ (key order, whitespace, or a hash taken
+                        # from another serialization): not an edit.
+                        content_to_store = None
+
+                    if content_to_store is not None:
+                        if parse_error is None:
+                            old_valid_content = (
+                                latest_valid["content"] if latest_valid else None
+                            )
+                            val = validate_update(
+                                doc_key,
+                                old_valid_content,
+                                content_to_store,
+                                source="direct_edit",
+                                reason="direct_edit",
+                            )
+                            schema_valid = val.ok
+                            warnings = [*val.errors, *val.warnings]
+                        else:
+                            schema_valid = False
+                            warnings = [
+                                {
+                                    "code": "invalid_json",
+                                    "path": "/",
+                                    "message": str(parse_error),
+                                }
+                            ]
+
+                        new_row = await _insert_reconcile_version(
+                            user_id=user_id,
+                            workspace_id=workspace_id,
+                            doc_key=doc_key,
+                            base_version_no=latest["version_no"] if latest else None,
+                            content=content_to_store,
+                            content_sha256=store_sha,
+                            reason="检测到未经 knowledge_update 的直接修改（文件面板或命令行）",
+                            warnings=warnings,
+                            schema_valid=schema_valid,
+                            edited_path=j_path,
+                        )
+                        if new_row is None:
+                            # A concurrent pass (or a tool write) moved the doc on;
+                            # whoever got there first owns this doc for this round.
+                            continue
+                        recorded_versions.append(new_row)
+                        latest = new_row
+                        if schema_valid:
+                            latest_valid = new_row
 
         # 2. Check rendered <doc>.md
         md_rel = rendered_path(doc_key)
         if md_rel and latest_valid is not None:
             md_meta = meta.get(md_rel)
-            if md_meta and md_meta.get("kind") == "file":
-                expected_md = render_document_md(
-                    doc_key,
-                    latest_valid["content"],
-                    version_no=int(latest_valid["version_no"]),
-                    at=latest_valid.get("created_at"),
-                    ticker=ticker,
-                )
-                if expected_md:
-                    expected_sha = hashlib.sha256(
-                        expected_md.encode("utf-8")
-                    ).hexdigest()
-                    actual_sha = md_meta.get("content_hash")
-                    already_flagged = (
-                        latest is not None
-                        and latest.get("edited_path") == md_rel
-                        and any(
-                            isinstance(w, dict)
-                            and w.get("md_sha256") == actual_sha
-                            for w in (latest.get("warnings") or [])
-                        )
+            actual_sha = (md_meta or {}).get("content_hash")
+            if md_meta and md_meta.get("kind") == "file" and actual_sha:
+                expected_rows = [latest_valid]
+                if latest_valid.get("files_written_at") is None:
+                    # Its re-render is still pending (apply_pending runs at the next
+                    # turn start), so the file legitimately shows the last version
+                    # whose files were written.
+                    written = await db_knowledge.latest_written_valid_version(
+                        workspace_id, doc_key
                     )
-                    if actual_sha and actual_sha != expected_sha and not already_flagged:
-                        md_row = await db_knowledge.insert_version(
-                            user_id=user_id,
-                            workspace_id=workspace_id,
-                            doc_key=doc_key,
-                            base_version_no=latest["version_no"] if latest else None,
-                            content=latest_valid["content"],
-                            content_sha256=latest_valid["content_sha256"],
-                            ops=None,
-                            reason="渲染文件被直接修改；修改内容已存入 history/，请用 knowledge_update 合入",
-                            evidence_refs=[],
-                            source="direct_edit",
-                            warnings=[
-                                {
-                                    "code": "rendered_md_edited",
-                                    "path": md_rel,
-                                    "md_sha256": actual_sha,
-                                    "message": f"{md_rel} was directly modified",
-                                }
-                            ],
-                            schema_valid=True,
-                            edited_path=md_rel,
+                    if written is not None:
+                        expected_rows.append(written)
+                expected_shas = {
+                    hashlib.sha256(md.encode("utf-8")).hexdigest()
+                    for md in (
+                        render_document_md(
+                            doc_key,
+                            row["content"],
+                            version_no=int(row["version_no"]),
+                            at=row.get("created_at"),
+                            ticker=ticker,
                         )
+                        for row in expected_rows
+                    )
+                    if md
+                }
+                already_flagged = (
+                    latest is not None
+                    and latest.get("edited_path") == md_rel
+                    and any(
+                        isinstance(w, dict) and w.get("md_sha256") == actual_sha
+                        for w in (latest.get("warnings") or [])
+                    )
+                )
+                if expected_shas and actual_sha not in expected_shas and not already_flagged:
+                    md_row = await _insert_reconcile_version(
+                        user_id=user_id,
+                        workspace_id=workspace_id,
+                        doc_key=doc_key,
+                        base_version_no=latest["version_no"] if latest else None,
+                        content=latest_valid["content"],
+                        content_sha256=latest_valid["content_sha256"],
+                        reason="渲染文件被直接修改；修改内容已存入 history/，请用 knowledge_update 合入",
+                        warnings=[
+                            {
+                                "code": "rendered_md_edited",
+                                "path": md_rel,
+                                "md_sha256": actual_sha,
+                                "message": f"{md_rel} was directly modified",
+                            }
+                        ],
+                        schema_valid=True,
+                        edited_path=md_rel,
+                    )
+                    if md_row is not None:
                         recorded_versions.append(md_row)
 
     # 3. Check published/** files against dalton_publication_files

@@ -60,8 +60,19 @@ _REPAIR_FIELD_SCHEMA: dict[str, Any] = {
 
 
 def canonical_json(doc: dict[str, Any]) -> tuple[str, str]:
-    """Serialize ``doc`` canonically (indent=2, UTF-8, trailing newline) and return ``(text, sha256)``."""
-    text = json.dumps(doc, sort_keys=False, ensure_ascii=False, indent=2) + "\n"
+    """Serialize ``doc`` canonically and return ``(text, sha256)``.
+
+    Keys are sorted because the content makes a jsonb round-trip between hashing and
+    writing ``data/<doc>.json``, and jsonb reorders keys; an order-dependent text gave a
+    stored ``content_sha256`` that never matched the written file, which reconcile then
+    read as a direct edit.
+    """
+    text = (
+        json.dumps(
+            doc, sort_keys=True, ensure_ascii=False, indent=2, separators=(",", ": ")
+        )
+        + "\n"
+    )
     sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
     return text, sha
 
