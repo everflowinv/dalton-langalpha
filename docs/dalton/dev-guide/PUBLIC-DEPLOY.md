@@ -8,7 +8,7 @@
 
 ```
 公网团队成员浏览器
-  https://everflowdemac-mini.taild2c767.ts.net:8443
+  https://<主机名>.<tailnet>.ts.net:8443
         │
         │  TLS 终止于 Tailscale Funnel (:8443)
         ▼
@@ -69,7 +69,7 @@
 除 [`AUTH-DEPLOY.md`](AUTH-DEPLOY.md) §1 所列的前后端认证变量（`DALTON_AUTH_MODE=supabase`、`DALTON_ALLOWED_EMAILS`、`SUPABASE_URL`、`SUPABASE_PUBLISHABLE_KEY`、`INTERNAL_SERVICE_TOKEN`、`DALTON_PM_USER_IDS`、`VITE_DALTON_AUTH=supabase`、`VITE_SUPABASE_URL`、`VITE_SUPABASE_PUBLISHABLE_KEY`）外，建议在 `.env` 中设置：
 
 ```dotenv
-PUBLIC_APP_URL=https://everflowdemac-mini.taild2c767.ts.net:8443
+PUBLIC_APP_URL=https://<主机名>.<tailnet>.ts.net:8443
 ```
 确保后端生成的分享链接（`/a/<code>`、`/s/<code>`）指向公网入口而非 `http://localhost:5173`。
 
@@ -81,13 +81,13 @@ PUBLIC_APP_URL=https://everflowdemac-mini.taild2c767.ts.net:8443
 
 1. **Site URL**：
    ```text
-   https://everflowdemac-mini.taild2c767.ts.net:8443
+   https://<主机名>.<tailnet>.ts.net:8443
    ```
 2. **Redirect URLs**（添加以下允许跳转地址，供密码重置与邮箱确认跳转使用）：
    ```text
-   https://everflowdemac-mini.taild2c767.ts.net:8443/reset-password
-   https://everflowdemac-mini.taild2c767.ts.net:8443/auth/confirm
-   https://everflowdemac-mini.taild2c767.ts.net:8443/callback
+   https://<主机名>.<tailnet>.ts.net:8443/reset-password
+   https://<主机名>.<tailnet>.ts.net:8443/auth/confirm
+   https://<主机名>.<tailnet>.ts.net:8443/callback
    ```
    - `/reset-password`：密码重置邮件落地页（见 `web/src/contexts/AuthContext.tsx` 中 `passwordResetUrl()`）。
    - `/auth/confirm`：邮箱 OTP / 确认链接落地页（见 `emailConfirmUrl()`）。
@@ -219,4 +219,4 @@ tailscale funnel status
     ```
     确认监听地址全部为 `127.0.0.1:8000`、`127.0.0.1:5173`、`127.0.0.1:8088`（无 `*:8000` 或 `*:5173`）。
   - 从同一局域网的另一台设备访问 `http://<本机局域网IP>:8000` 与 `http://<本机局域网IP>:5173`，确认连接被拒绝。
-- [ ] **公网回归验证**：通过 `https://everflowdemac-mini.taild2c767.ts.net:8443` 访问登录页、白名单账号登录、非白名单账号 403 拦截、密码重置邮件跳转 `/reset-password` 正常。
+- [ ] **公网回归验证**：通过 `https://<主机名>.<tailnet>.ts.net:8443` 访问登录页、白名单账号登录、非白名单账号 403 拦截、密码重置邮件跳转 `/reset-password` 正常。

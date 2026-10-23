@@ -213,7 +213,7 @@ frontmatter 只写 `name` 和 `description`（随包 skill 不解析其他键）
 | 渲染与投递 | 飞书分块写入、`feishu_grant_perm.sh`、Discord 不用表格、禁止 `$` 和 `~`（飞书 LaTeX/删除线）、`<url>` 包裹 | 删除。LangAlpha 渲染 Markdown；投递走自动任务 `delivery` 或 PK 定义的通知 |
 | 时间与批次上限 | 25 分钟硬杀、10/12/8 分钟检索上限、900 秒批次、每节落盘标记 `<!-- 已落盘 -->` | 删除。改用 workflow 的 `child_timeout` 和本地预算 |
 | 写死的模型 | `claude-cli-gateway/claude-opus-5-5`、`openai/gpt-6.1-sol`、`google/gemini-4-argon` 等 | 删除。lead 和子智能体模型由 P0.6 的角色配置决定（可切换）；草稿期审稿人模型写在 `plugins/dalton/agents/dalton-reviewer.md` 一处（manifest 键，如 `ocb-openai-gpt-6.1-sol`），发布时审稿人由 PK 的 `reviewer_models` 按 `role_policy.family_of()` 选 |
-| 人名与账号 | Richard、Mark、Lumos、Eve、`richard.lu.everflowinv@gmail.com`、飞书 folder token | 改成工作区配置（覆盖名单文件、PM 称呼），不写进 skill |
+| 人名与账号 | Richard、Mark、Lumos、Eve、PM 的个人邮箱、飞书 folder token | 改成工作区配置（覆盖名单文件、PM 称呼），不写进 skill |
 | OpenClaw 运行时调用 | `sessions_spawn`、`sessions_yield`、`researchdata__*` 工具名、`data_gateway.py`、`NO_REPLY` | 换成 workflow `agent()` 和 P0D 的 MCP 函数 |
 | 本机特殊情况 | roic.ai 403、东财被封、Reddit 无路由、AlphaEngine 每日约 190 次额度 | 不写进方法；额度类约束由数据接口返回错误时处理 |
 
