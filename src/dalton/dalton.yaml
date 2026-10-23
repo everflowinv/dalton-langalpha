@@ -75,7 +75,7 @@ autonomy:
 conversations:
   enabled: true
   extractor_model: "gemini-4-argon-medium-oauth"
-  prompt_version: "conv_card_v2"
+  prompt_version: "conv_card_v2_3"
   embedding_model: "gemini-embedding-001"
   embedding_model_preferred: "gemini-embedding-2-preview"
   embedding_dimensions: 3072
