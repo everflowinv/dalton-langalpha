@@ -317,7 +317,9 @@ def _classify_exception(
         return "failed", "pre_send"
 
     if isinstance(status_code, int):
-        if status_code in (400, 401, 403, 404, 422):
+        if status_code in (400, 401, 403, 404, 422, 426):
+            # 426 Upgrade Required: the request was refused before any work (e.g. an
+            # outdated client version), so it is a clean failure, not an unknown outcome.
             return "failed", f"http_{status_code}"
         if status_code == 429:
             return "indeterminate", "http_429"
