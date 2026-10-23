@@ -41,3 +41,8 @@ subagents:
       model: "ocb-xai-grok-4.7"
 
 search_api: "openclaw"
+
+# Fetch falls through the chain per URL: in-house first; Firecrawl only for the
+# URLs in-house could not fetch (403, anti-bot, JS-only pages). Firecrawl bills
+# per call and shares the OpenClaw account, so it stays second.
+fetch_chain: ["inhouse", "firecrawl"]
