@@ -3,8 +3,10 @@
 Fetches each native provider's available-model list with the team credential's
 token, diffs it against the merged catalog, and builds add-only entries for the
 runtime overlay at `var/dalton/catalog/native_sync_overlay.json`. Never edits
-anything under `src/`, never removes or hides existing models, and never adds a
-model to a default setting. Tokens reach the fetchers as call arguments only;
+anything under `src/` and never adds a model to a default setting. The only
+removal path is the PM-driven `retired` list in the same runtime file: the
+overlay merge hides those keys, and a restore unhides them — model entries
+themselves are never deleted. Tokens reach the fetchers as call arguments only;
 they never appear in listings, diffs, errors, or the overlay.
 """
 
@@ -437,8 +439,15 @@ def suggest_native_model_key(provider: str, upstream_id: str) -> str:
 def build_native_diff(
     listings: dict[str, ProviderListing],
     llm_config: dict[str, dict[str, Any]],
+    retired_keys: set[str] | None = None,
 ) -> dict[str, Any]:
-    """Classify each provider's catalog entries into added / deprecated / unchanged."""
+    """Classify each provider's catalog entries into added / deprecated / unchanged.
+
+    `retired_keys` (the runtime overlay's retire list) marks an upstream
+    re-appearance of a previously retired model as `previously_retired` instead
+    of offering it as a plain addition — restoring is an explicit PM action.
+    """
+    retired_keys = retired_keys or set()
     added: list[dict[str, Any]] = []
     deprecated: list[dict[str, Any]] = []
     unchanged = 0
@@ -495,6 +504,7 @@ def build_native_diff(
                     "reasoning_efforts": um.reasoning_efforts,
                     "reasoning_default": um.reasoning_default,
                     "visibility": um.visibility,
+                    "previously_retired": suggested in retired_keys,
                 }
             )
         for key, entry in sorted(current.items()):
@@ -743,6 +753,65 @@ def load_native_sync_overlay(
     return load_overlay_data(path or NATIVE_SYNC_OVERLAY_PATH)
 
 
+def load_retired_models(path: Path | None = None) -> list[dict[str, Any]]:
+    """Return the runtime overlay's `retired` records (`{key, provider, retired_at, retired_by}`)."""
+    retired = (load_native_sync_overlay(path) or {}).get("retired")
+    if not isinstance(retired, list):
+        return []
+    return [dict(item) for item in retired if isinstance(item, dict) and item.get("key")]
+
+
+def retired_key_set(path: Path | None = None) -> set[str]:
+    return {str(item["key"]) for item in load_retired_models(path)}
+
+
+def read_retired_keys_strict(path: Path | None = None) -> set[str]:
+    """The retire list, failing loud for callers that must not mistake a broken
+    read for an empty one (confirm-sync's previously-retired gate).
+
+    A missing file is the normal never-retired state and reads as empty; a file
+    that cannot be parsed, or is not a JSON object, raises ValueError. The
+    tolerant `retired_key_set` sits behind `load_overlay_data`, which swallows
+    a corrupt file to None — exactly the silent "nothing retired" this avoids.
+    """
+    target = path or NATIVE_SYNC_OVERLAY_PATH
+    try:
+        raw = json.loads(target.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return set()
+    except Exception as exc:
+        raise ValueError(f"native sync overlay unreadable: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise ValueError("native sync overlay is not a JSON object")
+    retired = raw.get("retired")
+    if not isinstance(retired, list):
+        return set()
+    return {
+        str(item["key"])
+        for item in retired
+        if isinstance(item, dict) and item.get("key")
+    }
+
+
+def _write_overlay_atomic(overlay_out: dict[str, Any], target: Path) -> str:
+    """Credential-check and atomically replace `target`, returning the new `mtime:size` stamp."""
+    assert_no_credentials(overlay_out)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = target.with_suffix(".json.tmp")
+    tmp_path.write_text(
+        json.dumps(overlay_out, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    os.replace(tmp_path, target)
+    st = target.stat()
+    return f"{st.st_mtime_ns}:{st.st_size}"
+
+
+def _append_history(existing: dict[str, Any], event: dict[str, Any]) -> list[dict[str, Any]]:
+    history = list((existing.get("meta") or {}).get("history") or [])
+    history.append(event)
+    return history[-20:]
+
+
 def write_native_sync_overlay(
     models: dict[str, dict[str, Any]],
     dalton_meta: dict[str, dict[str, Any]],
@@ -754,7 +823,7 @@ def write_native_sync_overlay(
 
     Returns the new `mtime:size` stamp. A key already present in the file is
     skipped untouched — existing entries are never modified or removed, so a
-    re-sync of the same key is a no-op.
+    re-sync of the same key is a no-op. The `retired` list rides along as-is.
     """
     target = path or NATIVE_SYNC_OVERLAY_PATH
     existing = load_native_sync_overlay(target) or {}
@@ -765,31 +834,124 @@ def write_native_sync_overlay(
     for key, meta in copy.deepcopy(dalton_meta).items():
         merged_meta.setdefault(key, meta)
 
-    history = list((existing.get("meta") or {}).get("history") or [])
-    history.append(
-        {
-            "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "added_keys": sorted(added_keys),
-        }
-    )
     overlay_out = {
         "schema": NATIVE_SYNC_OVERLAY_SCHEMA,
         "meta": {
             "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "source": "native-model-sync",
             "model_count": len(merged_models),
-            "history": history[-20:],
+            "history": _append_history(
+                existing,
+                {
+                    "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "added_keys": sorted(added_keys),
+                },
+            ),
         },
         "models": merged_models,
+        "retired": list(existing.get("retired") or []),
         "providers": {"provider_config": {}, "provider_variants": {}, "models": {}},
         "dalton_meta": merged_meta,
     }
-    assert_no_credentials(overlay_out)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = target.with_suffix(".json.tmp")
-    tmp_path.write_text(
-        json.dumps(overlay_out, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
-    )
-    os.replace(tmp_path, target)
-    st = target.stat()
-    return f"{st.st_mtime_ns}:{st.st_size}"
+    return _write_overlay_atomic(overlay_out, target)
+
+
+def retire_native_models(
+    records: list[dict[str, Any]],
+    *,
+    path: Path | None = None,
+) -> str:
+    """Append retire records (`{key, provider, retired_at, retired_by}`) to the overlay's `retired` list.
+
+    Idempotent per key: a key already retired keeps its original record. Models
+    and dalton_meta entries stay in the file untouched, so a restore brings the
+    model back exactly as it was.
+    """
+    target = path or NATIVE_SYNC_OVERLAY_PATH
+    existing = load_native_sync_overlay(target) or {}
+    retired = [dict(item) for item in existing.get("retired") or [] if isinstance(item, dict)]
+    known = {str(item.get("key")) for item in retired}
+    added: list[str] = []
+    for record in records:
+        key = str(record.get("key") or "")
+        if not key or key in known:
+            continue
+        retired.append(dict(record))
+        known.add(key)
+        added.append(key)
+    overlay_out = {
+        "schema": NATIVE_SYNC_OVERLAY_SCHEMA,
+        "meta": {
+            "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "source": "native-model-sync",
+            "model_count": len(existing.get("models") or {}),
+            # A no-op retire (every key already retired) leaves no history noise.
+            "history": (
+                _append_history(
+                    existing,
+                    {
+                        "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        "retired_keys": sorted(added),
+                    },
+                )
+                if added
+                else list((existing.get("meta") or {}).get("history") or [])
+            ),
+        },
+        "models": dict(existing.get("models") or {}),
+        "retired": retired,
+        "providers": dict(existing.get("providers") or {})
+        or {"provider_config": {}, "provider_variants": {}, "models": {}},
+        "dalton_meta": dict(existing.get("dalton_meta") or {}),
+    }
+    return _write_overlay_atomic(overlay_out, target)
+
+
+def restore_native_models(
+    keys: list[str],
+    *,
+    path: Path | None = None,
+) -> tuple[str, list[str]]:
+    """Remove `keys` from the overlay's `retired` list; return `(stamp, restored_keys)`.
+
+    Only the `retired` record is removed — the model entry itself was never
+    deleted, so the merge brings the model straight back into the catalog.
+    """
+    target = path or NATIVE_SYNC_OVERLAY_PATH
+    existing = load_native_sync_overlay(target) or {}
+    wanted = {str(k) for k in keys}
+    retired: list[dict[str, Any]] = []
+    restored: list[str] = []
+    for item in existing.get("retired") or []:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("key")) in wanted:
+            restored.append(str(item.get("key")))
+            continue
+        retired.append(dict(item))
+    overlay_out = {
+        "schema": NATIVE_SYNC_OVERLAY_SCHEMA,
+        "meta": {
+            "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "source": "native-model-sync",
+            "model_count": len(existing.get("models") or {}),
+            # A no-op restore (nothing on the retired list) leaves no history noise.
+            "history": (
+                _append_history(
+                    existing,
+                    {
+                        "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        "restored_keys": sorted(set(restored)),
+                    },
+                )
+                if restored
+                else list((existing.get("meta") or {}).get("history") or [])
+            ),
+        },
+        "models": dict(existing.get("models") or {}),
+        "retired": retired,
+        "providers": dict(existing.get("providers") or {})
+        or {"provider_config": {}, "provider_variants": {}, "models": {}},
+        "dalton_meta": dict(existing.get("dalton_meta") or {}),
+    }
+    return _write_overlay_atomic(overlay_out, target), sorted(set(restored))

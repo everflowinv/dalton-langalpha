@@ -325,6 +325,8 @@ export interface NativeModelAddedItem {
   reasoning_efforts?: string[] | null;
   reasoning_default?: string | null;
   visibility?: string | null;
+  /** Upstream re-lists a model the PM retired; shown as a note, never auto-restored. */
+  previously_retired?: boolean;
 }
 
 export interface NativeModelDeprecatedItem {
@@ -333,6 +335,13 @@ export interface NativeModelDeprecatedItem {
   model_id?: string | null;
   display_name?: string | null;
   in_use_by?: string[];
+}
+
+export interface NativeModelRetiredItem {
+  key: string;
+  provider?: string | null;
+  retired_at?: string | null;
+  retired_by?: string | null;
 }
 
 export interface NativeProviderListingRow {
@@ -368,6 +377,7 @@ export interface NativeModelsStatusResponse {
     deprecated: NativeModelDeprecatedItem[];
     unchanged: number;
   };
+  retired: NativeModelRetiredItem[];
   overlay: {
     exists: boolean;
     generated_at?: string | null;
@@ -397,6 +407,26 @@ export interface NativeModelsSyncResponse {
   synced_at: string;
 }
 
+export interface NativeModelRetireResultItem {
+  key: string;
+  status: 'retired' | 'in_use' | 'not_deprecated';
+  in_use_by?: string[];
+}
+
+export interface NativeModelsRetireResponse {
+  run_id: string;
+  results: NativeModelRetireResultItem[];
+  retired_keys: string[];
+  retired_at: string;
+}
+
+export interface NativeModelsRestoreResponse {
+  run_id: string;
+  results: { key: string; status: 'restored' | 'not_retired' }[];
+  restored_keys: string[];
+  restored_at: string;
+}
+
 export async function fetchNativeModelsStatus(): Promise<NativeModelsStatusResponse> {
   const { data } = await api.get<NativeModelsStatusResponse>('/api/v1/dalton/native-models/status');
   return data;
@@ -409,6 +439,16 @@ export async function checkNativeModels(): Promise<NativeModelsCheckResponse> {
 
 export async function syncNativeModels(params: { models: string[] }): Promise<NativeModelsSyncResponse> {
   const { data } = await api.post<NativeModelsSyncResponse>('/api/v1/dalton/native-models/sync', params);
+  return data;
+}
+
+export async function retireNativeModels(params: { keys: string[] }): Promise<NativeModelsRetireResponse> {
+  const { data } = await api.post<NativeModelsRetireResponse>('/api/v1/dalton/native-models/retire', params);
+  return data;
+}
+
+export async function restoreNativeModels(params: { keys: string[] }): Promise<NativeModelsRestoreResponse> {
+  const { data } = await api.post<NativeModelsRestoreResponse>('/api/v1/dalton/native-models/restore', params);
   return data;
 }
 

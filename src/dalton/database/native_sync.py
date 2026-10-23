@@ -40,17 +40,22 @@ async def create_native_sync_run(
     kind: str,
     conn: Any | None = None,
 ) -> str:
-    """Insert a native run row (`kind` is `check` or `sync`; check rides `dry_run=TRUE`)."""
+    """Insert a native run row (`kind` is `check`, `sync`, `retire` or `restore`; check rides `dry_run=TRUE`).
+
+    The row carries `diff={"kind": ...}` from the start, so a run that never
+    reaches a successful finish still tells its kind apart — the status queries
+    and the kind filters read it back off this column.
+    """
     async with get_db_connection(conn) as db:
         async with db.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 """
                 INSERT INTO dalton_openclaw_sync_runs
-                    (started_by, dry_run, forced, status, source)
-                VALUES (%s, %s, FALSE, 'running', %s)
+                    (started_by, dry_run, forced, status, source, diff)
+                VALUES (%s, %s, FALSE, 'running', %s, %s::jsonb)
                 RETURNING run_id::text AS run_id
                 """,
-                (started_by, kind == "check", NATIVE_RUN_SOURCE),
+                (started_by, kind == "check", NATIVE_RUN_SOURCE, json.dumps({"kind": kind})),
             )
             row = await cur.fetchone()
             assert row is not None
@@ -68,6 +73,8 @@ async def finish_native_sync_run(
     overlay_stamp: str | None = None,
     conn: Any | None = None,
 ) -> None:
+    """Close a run out. A `diff` of None keeps what the row already holds, so a
+    failed finish never erases the `kind` written at create time."""
     async with get_db_connection(conn) as db:
         async with db.cursor() as cur:
             await cur.execute(
@@ -76,7 +83,7 @@ async def finish_native_sync_run(
                 SET status = %s,
                     finished_at = NOW(),
                     counts = %s::jsonb,
-                    diff = %s::jsonb,
+                    diff = COALESCE(%s::jsonb, diff),
                     warnings = %s::jsonb,
                     error = %s,
                     overlay_stamp = %s
@@ -111,7 +118,11 @@ def _normalize_run_row(row: dict[str, Any] | None) -> dict[str, Any] | None:
 
 
 async def fetch_recent_native_runs() -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-    """Return `(last_check_run, last_sync_run)` from native runs (any status)."""
+    """Return `(last_check_run, last_sync_run)` from native runs (any status).
+
+    Retire/restore runs are neither: `last_sync` keeps meaning "the last model
+    sync", and a retire must not stand in as one.
+    """
     async with get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
@@ -121,6 +132,7 @@ async def fetch_recent_native_runs() -> tuple[dict[str, Any] | None, dict[str, A
                         AS is_stale_running
                 FROM dalton_openclaw_sync_runs
                 WHERE source = 'native' AND dry_run = TRUE
+                    AND COALESCE(diff->>'kind', '') NOT IN ('retire', 'restore')
                 ORDER BY started_at DESC
                 LIMIT 1
                 """
@@ -134,6 +146,7 @@ async def fetch_recent_native_runs() -> tuple[dict[str, Any] | None, dict[str, A
                         AS is_stale_running
                 FROM dalton_openclaw_sync_runs
                 WHERE source = 'native' AND dry_run = FALSE
+                    AND COALESCE(diff->>'kind', '') NOT IN ('retire', 'restore')
                 ORDER BY started_at DESC
                 LIMIT 1
                 """
@@ -142,15 +155,18 @@ async def fetch_recent_native_runs() -> tuple[dict[str, Any] | None, dict[str, A
             return last_check, last_sync
 
 
-async def fetch_last_succeeded_native_check() -> dict[str, Any] | None:
+async def fetch_last_succeeded_native_check(
+    conn: Any | None = None,
+) -> dict[str, Any] | None:
     """Return the latest succeeded native check run (its diff feeds a confirm-sync)."""
-    async with get_db_connection() as conn:
-        async with conn.cursor(row_factory=dict_row) as cur:
+    async with get_db_connection(conn) as db:
+        async with db.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 """
                 SELECT *, FALSE AS is_stale_running
                 FROM dalton_openclaw_sync_runs
                 WHERE source = 'native' AND dry_run = TRUE AND status = 'succeeded'
+                    AND COALESCE(diff->>'kind', '') NOT IN ('retire', 'restore')
                 ORDER BY started_at DESC
                 LIMIT 1
                 """
