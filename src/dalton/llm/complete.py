@@ -49,6 +49,17 @@ logger = logging.getLogger(__name__)
 class JournalError(RuntimeError):
     """Base error for journaled one-shot LLM calls."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        error_kind: str | None = None,
+        status_code: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.error_kind = error_kind
+        self.status_code = status_code
+
 
 class JournalInFlight(JournalError):
     """Another worker is currently executing the same invocation."""
@@ -241,6 +252,7 @@ def _classify_exception(
 
     Returns:
         - `('failed', 'pre_send')` when request was never sent
+        - `('failed', 'auth_expired')` when `muse-oauth` returns 401 / `invalid_api_key`
         - `('failed', 'http_4xx')` on explicit 400/401/403/404 rejection without charge
         - `('indeterminate', ...)` on timeout, 429, 5xx, stream cut, or unknown mid-flight error
     """
@@ -269,6 +281,17 @@ def _classify_exception(
     cls_name = exc.__class__.__name__
     msg = str(exc)
     msg_lower = msg.lower()
+    eff_provider = provider or getattr(exc, "provider", None)
+
+    status_code = getattr(exc, "status_code", None) or getattr(
+        getattr(exc, "response", None), "status_code", None
+    )
+
+    if eff_provider == "muse-oauth":
+        from src.dalton.llm.providers.muse.client import is_muse_auth_expired_error
+
+        if is_muse_auth_expired_error(exc):
+            return "failed", "auth_expired"
 
     if cls_name in (
         "MissingProviderKeyError",
@@ -292,9 +315,6 @@ def _classify_exception(
     ):
         return "failed", "pre_send"
 
-    status_code = getattr(exc, "status_code", None) or getattr(
-        getattr(exc, "response", None), "status_code", None
-    )
     if isinstance(status_code, int):
         if status_code in (400, 401, 403, 404, 422):
             return "failed", f"http_{status_code}"
@@ -558,14 +578,18 @@ def _finish(result: DaltonCompleteResult, *, raise_on_error: bool) -> DaltonComp
         return result
     msg = result.error or result.status
     if result.status == "indeterminate":
-        raise JournalIndeterminate(msg)
+        raise JournalIndeterminate(msg, error_kind=result.error_kind)
     if result.status == "in_flight":
-        raise JournalInFlight(msg)
+        raise JournalInFlight(msg, error_kind=result.error_kind)
     if result.status == "budget_exhausted":
-        raise BudgetExhaustedError(msg)
+        raise BudgetExhaustedError(msg, error_kind=result.error_kind)
     if result.status == "conflict":
-        raise JournalConflict(msg)
-    raise JournalError(msg)
+        raise JournalConflict(msg, error_kind=result.error_kind)
+    raise JournalError(
+        msg,
+        error_kind=result.error_kind,
+        status_code=401 if result.error_kind == "auth_expired" else None,
+    )
 
 
 async def dalton_complete(
@@ -906,6 +930,9 @@ async def dalton_complete(
             target_state, error_kind = _classify_exception(exc, provider=provider)
             stream_started, chunks_received = get_stream_progress(exc)
         safe_msg = sanitize_error_text(exc, max_len=240)
+        if provider == "muse-oauth" and error_kind == "auth_expired":
+            if "请重新连接 Muse" not in safe_msg:
+                safe_msg = f"{safe_msg}（请重新连接 Muse）"
         if not skip_journal:
             try:
                 await complete_journal_failed(

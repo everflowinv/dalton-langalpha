@@ -179,6 +179,19 @@ export interface DaltonBudgetToday {
   }>;
 }
 
+export interface DaltonMuseSubsUsage {
+  window?: {
+    used_percent?: number | null;
+    window_duration_mins?: number | null;
+    resets_at?: string | number | null;
+  } | null;
+  weekly?: {
+    used_percent?: number | null;
+    resets_at?: string | number | null;
+  } | null;
+  tier?: string | null;
+}
+
 export interface DaltonProviderStatusItem {
   provider: string;
   display_name: string;
@@ -186,6 +199,9 @@ export interface DaltonProviderStatusItem {
   billing: 'subscription' | 'cash';
   enabled: boolean;
   configured: boolean;
+  is_subs_active?: boolean | null;
+  subs_tier_name?: string | null;
+  subs_usage?: DaltonMuseSubsUsage | null;
   credential: {
     source?: string;
     email?: string | null;
@@ -205,6 +221,12 @@ export interface DaltonProviderStatusItem {
       subscription_tier?: string | null;
       token_expired?: boolean;
     } | null;
+    reconnect_required?: boolean;
+    status_message?: string | null;
+    is_subs_active?: boolean | null;
+    subs_tier_name?: string | null;
+    subs_usage?: DaltonMuseSubsUsage | null;
+    base_url?: string | null;
   };
   quota?: {
     credit_usage_percent?: number | null;

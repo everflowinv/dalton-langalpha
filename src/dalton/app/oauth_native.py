@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
@@ -30,8 +29,12 @@ from src.dalton.llm.providers.antigravity.oauth import (
 )
 from src.dalton.llm.providers.muse.oauth import (
     MUSE_PROVIDER,
+    get_muse_cached_meta,
+    is_invalidated_muse_token,
+    is_minted_muse_token,
     poll_device_authorization as muse_poll_device_authorization,
     request_device_code as muse_request_device_code,
+    save_minted_credentials as muse_save_minted_credentials,
 )
 from src.dalton.llm.providers.xai_grok.oauth import (
     MAX_POLL_WAIT_SECONDS as XAI_MAX_POLL_WAIT_SECONDS,
@@ -45,7 +48,6 @@ from src.server.database.oauth_tokens import (
     delete_oauth_tokens,
     get_oauth_status,
     invalidate_oauth_active_cache,
-    upsert_oauth_tokens,
 )
 from src.server.utils.api import CurrentUserId
 
@@ -108,41 +110,33 @@ async def muse_device_poll(user_id: CurrentUserId):
     device = json.loads(raw)
 
     try:
-        result = await muse_poll_device_authorization(device["device_code"])
+        result = await muse_poll_device_authorization(device["device_code"], user_id=user_id)
     except ValueError as e:
         await cache.client.delete(f"oauth:muse:device:{user_id}")
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error(f"[oauth] Muse device poll error for user_id={user_id}: {type(e).__name__}")
-        raise HTTPException(status_code=502, detail="Failed to poll Meta")
+        raise HTTPException(status_code=502, detail="Failed to poll Meta or mint Muse API key")
 
     if result is None:
         return {"pending": True}
 
     try:
-        expires_at = datetime.now(timezone.utc) + timedelta(seconds=result.get("expires_in", 3600))
-
-        await upsert_oauth_tokens(
-            user_id=user_id,
-            provider=MUSE_PROVIDER,
-            access_token=result["access_token"],
-            refresh_token=result.get("refresh_token", ""),
-            account_id="",
-            email=None,
-            plan_type="muse",
-            expires_at=expires_at,
-        )
-
-        try:
-            await invalidate_oauth_active_cache(user_id)
-        except Exception:
-            pass
+        if not result.get("_saved"):
+            result = await muse_save_minted_credentials(user_id, result)
 
         await cache.client.delete(f"oauth:muse:device:{user_id}")
 
         logger.info(f"[oauth] Muse connected for user_id={user_id}")
-        return {"success": True}
+        return {
+            "success": True,
+            "email": result.get("email"),
+            "plan_type": result.get("plan_type"),
+        }
 
+    except ValueError as e:
+        logger.error(f"[oauth] Muse API key mint/save failed for user_id={user_id}: {type(e).__name__}")
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error(f"[oauth] Muse token storage failed for user_id={user_id}: {type(e).__name__}")
         raise HTTPException(status_code=400, detail=f"Token storage failed: {type(e).__name__}")
@@ -151,17 +145,42 @@ async def muse_device_poll(user_id: CurrentUserId):
 @router.get("/muse/status")
 async def muse_status(user_id: CurrentUserId):
     """Return connection status (no token decryption — fast check)."""
-    return await get_oauth_status(user_id, MUSE_PROVIDER)
+    st = await get_oauth_status(user_id, MUSE_PROVIDER) or {"connected": False}
+    if st.get("connected"):
+        if is_invalidated_muse_token(st) or not is_minted_muse_token(st):
+            return {
+                **st,
+                "connected": False,
+                "reconnect_required": True,
+                "message": "请重新连接 Muse",
+            }
+        meta = await get_muse_cached_meta(user_id)
+        if isinstance(meta, dict):
+            st = {
+                **st,
+                "is_subs_active": meta.get("is_subs_active"),
+                "subs_tier_name": meta.get("subs_tier_name") or st.get("plan_type"),
+                "subs_usage": meta.get("subs_usage") or {},
+            }
+    return st
 
 
 @router.delete("/muse")
 async def muse_disconnect(user_id: CurrentUserId):
     """Delete stored Muse OAuth tokens."""
-    from src.dalton.credentials import require_credential_admin
+    from src.dalton.credentials import credential_user_id, require_credential_admin
+    from src.utils.cache.redis_cache import get_cache_client
+
     require_credential_admin(user_id)
     await delete_oauth_tokens(user_id, MUSE_PROVIDER)
     try:
         await invalidate_oauth_active_cache(user_id)
+    except Exception:
+        pass
+    try:
+        cache = get_cache_client()
+        if getattr(cache, "enabled", False) and getattr(cache, "client", None):
+            await cache.client.delete(f"oauth:muse:meta:{credential_user_id(user_id)}")
     except Exception:
         pass
     logger.info(f"[oauth] Muse disconnected for user_id={user_id}")

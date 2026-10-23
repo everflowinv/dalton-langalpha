@@ -265,6 +265,7 @@ async def get_providers_status(*, user_id: str) -> dict[str, Any]:
         credential_info: dict[str, Any] = {}
         quota_info: dict[str, Any] | None = None
         warnings: list[dict[str, str]] = []
+        muse_row_extras: dict[str, Any] = {}
 
         if is_oauth:
             try:
@@ -324,6 +325,84 @@ async def get_providers_status(*, user_id: str) -> dict[str, Any]:
                             "[provider_status] xai-oauth billing query skipped: %s",
                             type(qexc).__name__,
                         )
+                if prov == "muse-oauth":
+                    from src.dalton.credentials import credential_user_id
+                    from src.dalton.llm.providers.muse.oauth import (
+                        get_muse_cached_meta,
+                        get_oauth_tokens as get_muse_oauth_tokens,
+                        is_invalidated_muse_token,
+                        is_minted_muse_token,
+                    )
+
+                    muse_meta = await get_muse_cached_meta(user_id)
+                    row_check: dict[str, Any] = dict(st)
+                    if "account_id" not in row_check:
+                        try:
+                            tok_row = await get_muse_oauth_tokens(credential_user_id(user_id), prov)
+                            if isinstance(tok_row, dict):
+                                row_check = tok_row
+                                configured = True
+                        except Exception:
+                            pass
+
+                    if configured and (
+                        is_invalidated_muse_token(row_check)
+                        or ("account_id" in row_check and not is_minted_muse_token(row_check))
+                    ):
+                        configured = False
+                        credential_info["reconnect_required"] = True
+                        credential_info["status_message"] = "请重新连接 Muse"
+                        warnings.append(
+                            {
+                                "code": "muse_reconnect_required",
+                                "message": (
+                                    "Muse 凭据已失效（401 invalid_api_key），请重新连接 Muse。"
+                                    if is_invalidated_muse_token(row_check)
+                                    else "Muse 凭据已失效或为未换发 API key 的旧版 token，请重新连接 Muse。"
+                                ),
+                            }
+                        )
+
+                    is_subs_active = (
+                        muse_meta.get("is_subs_active") if isinstance(muse_meta, dict) else None
+                    )
+                    subs_tier_name = (
+                        (muse_meta.get("subs_tier_name") if isinstance(muse_meta, dict) else None)
+                        or credential_info.get("plan_type")
+                    )
+                    raw_usage = (
+                        muse_meta.get("subs_usage")
+                        if isinstance(muse_meta, dict) and isinstance(muse_meta.get("subs_usage"), dict)
+                        else {}
+                    )
+                    win_u = raw_usage.get("window") if isinstance(raw_usage.get("window"), dict) else {}
+                    wk_u = raw_usage.get("weekly") if isinstance(raw_usage.get("weekly"), dict) else {}
+                    subs_usage: dict[str, Any] = (
+                        {
+                            "window": {
+                                "used_percent": win_u.get("used_percent"),
+                                "window_duration_mins": win_u.get("window_duration_mins"),
+                                "resets_at": win_u.get("resets_at"),
+                            },
+                            "weekly": {
+                                "used_percent": wk_u.get("used_percent"),
+                                "resets_at": wk_u.get("resets_at"),
+                            },
+                            "tier": raw_usage.get("tier"),
+                        }
+                        if raw_usage
+                        else {}
+                    )
+                    credential_info["is_subs_active"] = is_subs_active
+                    credential_info["subs_tier_name"] = subs_tier_name
+                    credential_info["subs_usage"] = subs_usage
+                    if isinstance(muse_meta, dict) and muse_meta.get("base_url"):
+                        credential_info["base_url"] = muse_meta.get("base_url")
+                    muse_row_extras = {
+                        "is_subs_active": is_subs_active,
+                        "subs_tier_name": subs_tier_name,
+                        "subs_usage": subs_usage,
+                    }
             except Exception:
                 credential_info = {"source": "oauth", "connected": False}
         else:
@@ -357,7 +436,7 @@ async def get_providers_status(*, user_id: str) -> dict[str, Any]:
                 ),
             }
             for ev in recent_events
-            if str(ev.get("kind") or "").endswith("fail")
+            if str(ev.get("kind") or "").endswith("fail") or ev.get("kind") == "auth_expired"
         ]
         errors_24h = await count_provider_errors_24h(prov, user_id=user_id)
         ust = usage_stats.get(prov) or {"calls_24h": 0, "last_success": None}
@@ -375,26 +454,27 @@ async def get_providers_status(*, user_id: str) -> dict[str, Any]:
                     }
                 break
 
-        providers_out.append(
-            {
-                "provider": prov,
-                "display_name": str(pinfo.get("display_name") or prov),
-                "access_type": access_type,
-                "billing": billing,
-                "enabled": enabled,
-                "configured": configured,
-                "credential": credential_info,
-                "quota": quota_info,
-                "last_success": last_success,
-                "recent_errors": recent_errors,
-                "errors_24h": errors_24h,
-                "calls_24h": ust.get("calls_24h", 0),
-                "used_by_roles": roles_by_provider.get(prov, []),
-                "warnings": warnings,
-                "tos_risk": "high" if prov in _HIGH_TOS_RISK_PROVIDERS else "none",
-                "default_probe_model": _pick_probe_model(prov, provider_models.get(prov, []), meta_map),
-            }
-        )
+        row_payload: dict[str, Any] = {
+            "provider": prov,
+            "display_name": str(pinfo.get("display_name") or prov),
+            "access_type": access_type,
+            "billing": billing,
+            "enabled": enabled,
+            "configured": configured,
+            "credential": credential_info,
+            "quota": quota_info,
+            "last_success": last_success,
+            "recent_errors": recent_errors,
+            "errors_24h": errors_24h,
+            "calls_24h": ust.get("calls_24h", 0),
+            "used_by_roles": roles_by_provider.get(prov, []),
+            "warnings": warnings,
+            "tos_risk": "high" if prov in _HIGH_TOS_RISK_PROVIDERS else "none",
+            "default_probe_model": _pick_probe_model(prov, provider_models.get(prov, []), meta_map),
+        }
+        if muse_row_extras:
+            row_payload.update(muse_row_extras)
+        providers_out.append(row_payload)
 
     broker_enabled = is_broker_models_enabled()
     broker_health: dict[str, Any] | None = None
@@ -561,15 +641,23 @@ async def probe_provider(
     except Exception as exc:
         latency_ms = int((time.perf_counter() - t0) * 1000)
         status_code = getattr(exc, "status_code", None)
+        exc_error_kind = getattr(exc, "error_kind", None)
         msg = sanitize_error_text(f"{type(exc).__name__}: {exc}")
-        if status_code in (401, 403) or "401" in msg or "403" in msg or "unauthorized" in msg.lower():
+        msg_lower = msg.lower()
+        from src.dalton.llm.providers.muse.client import is_muse_auth_expired_error
+
+        if provider == "muse-oauth" and is_muse_auth_expired_error(exc):
+            error_kind = "auth_expired"
+            if "请重新连接 Muse" not in msg:
+                msg = f"{msg}（请重新连接 Muse）"
+        elif status_code in (401, 403) or "401" in msg or "403" in msg or "unauthorized" in msg_lower:
             error_kind = f"http_{status_code or 401}"
         elif status_code == 429 or "429" in msg:
             error_kind = "http_429"
         elif isinstance(exc, asyncio.TimeoutError):
             error_kind = "timeout"
         else:
-            error_kind = type(exc).__name__
+            error_kind = exc_error_kind or type(exc).__name__
 
         await record_provider_event(
             provider=provider,
