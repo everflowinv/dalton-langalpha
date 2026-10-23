@@ -152,6 +152,22 @@ class ModelResilienceMiddleware(AgentMiddleware):
         self.initial_delay = initial_delay
         self.max_delay = max_delay
         self.jitter = jitter
+        # DALTON-HOOK(oauth-dispatch): clients rebuilt after a mid-turn 401, keyed by the
+        # id of the client they replace (kept alongside, so the id cannot be reused). Lives
+        # on this per-build instance only; every later call of the turn uses the fresh one.
+        self._oauth_replacements: dict[int, tuple[Any, Any]] = {}
+
+    def _current_client(self, client: Any) -> Any:  # DALTON-HOOK(oauth-dispatch)
+        hit = self._oauth_replacements.get(id(client))
+        return hit[1] if hit is not None and hit[0] is client else client
+
+    async def _refresh_oauth_client(self, base: Any, failed: Any) -> Any | None:  # DALTON-HOOK(oauth-dispatch)
+        from src.dalton.llm.oauth_refresh import rebuild_oauth_client
+
+        fresh = await rebuild_oauth_client(failed)
+        if fresh is not None:
+            self._oauth_replacements[id(base)] = (base, fresh)
+        return fresh
 
     # ------------------------------------------------------------------
     # Helpers
@@ -399,6 +415,14 @@ class ModelResilienceMiddleware(AgentMiddleware):
 
         for index, (name, client) in enumerate(candidates):
             req = request if client is None else request.override(model=client)
+            # DALTON-HOOK(oauth-dispatch): use a client already refreshed earlier in the turn;
+            # on a 401 rebuild it once with a fresh token and retry the same model before
+            # falling back, since the stored credential is usually fine.
+            base = req.model
+            current = self._current_client(base)
+            if current is not base:
+                req = req.override(model=current)
+            oauth_refreshed = False
             attempts = 0
             escalated = False
             while True:
@@ -406,6 +430,16 @@ class ModelResilienceMiddleware(AgentMiddleware):
                 try:
                     return await handler(req)
                 except Exception as exc:
+                    if not oauth_refreshed and extract_status_code(exc) == 401:
+                        oauth_refreshed = True
+                        fresh = await self._refresh_oauth_client(base, req.model)
+                        if fresh is not None:
+                            self._emit_retry(name, attempts, exc, 401, 0.0)
+                            req = req.override(model=fresh)
+                            # The refreshed client starts its own count, so the
+                            # one-retry rule for a stalled stream still applies.
+                            attempts = 0
+                            continue
                     status, recovery = self._decide(
                         exc, attempts, req, escalated=escalated
                     )
