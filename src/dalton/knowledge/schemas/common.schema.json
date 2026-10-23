@@ -10,7 +10,10 @@
     "label": {"type": "string", "enum": ["reported","company_guidance","consensus","estimate","assumption","research_judgement"],
               "description": "蓝图 §3.1 第 2 条：估计、假设、公司指引、一致预期分层标注"},
     "sourceTier": {"type": "integer", "minimum": 1, "maximum": 6,
-                   "description": "1 filing > 2 公司公告 > 3 署名研报 > 4 官方/协会数据 > 5 专家(标身份) > 6 新闻(只作线索)"},
+                   "description": "1 filing(监管财报) > 2 company_release/transcript(公司公告/电话会或业绩会转写，含 AlphaEngine ASR 稿) > 3 broker_report/consensus(署名研报/一致预期) > 4 official_data(官方/协会数据) > 5 expert/internal_note(专家标身份/团队内部对话或纪要) > 6 news(新闻，只作线索)；新增的 model 证据必须引用模型单元格并且不能标 tier 1（默认 2-3）"},
+    "sourceType": {"type": "string",
+                   "enum": ["filing","company_release","transcript","broker_report","consensus","official_data","expert","news","model","internal_note","legacy_thesis"],
+                   "description": "证据来源类型及默认可信度等级（tier）：filing=1（监管财报）、company_release=2（公司公告/新闻稿）、transcript=2（电话会/业绩会转写，包括 AlphaEngine ASR 稿；卖方回访记 3）、broker_report=3（署名研报）、consensus=3（一致预期）、official_data=4（官方/协会数据）、expert=5（专家访谈，标身份）、news=6（新闻，只作线索）、model=2-3（本方模型推导；新增的 model 证据必须引用模型单元格，并且不能标 tier 1）、internal_note=3-5（团队内部对话或纪要，默认 5）、legacy_thesis=3-5（历史迁移论点）"},
     "evidenceRef": {
       "type": "object", "additionalProperties": false,
       "properties": {

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from unittest.mock import create_autospec, patch
@@ -133,6 +134,12 @@ async def test_verdicts_two_workspaces_same_day_no_id_collision(monkeypatch: pyt
 
     conn = _make_spec_conn(cur)
     monkeypatch.setattr(verdicts_mod, "get_db_connection", lambda: conn)
+    fixed_clock = datetime(2026, 10, 23, 23, 59, 59, 654321, tzinfo=timezone.utc)
+    monkeypatch.setattr(
+        verdicts_mod,
+        "_now_utc",
+        create_autospec(verdicts_mod._now_utc, return_value=fixed_clock),
+    )
 
     v_payload = {
         "at": "2026-10-19T12:00:00Z",
@@ -151,10 +158,11 @@ async def test_verdicts_two_workspaces_same_day_no_id_collision(monkeypatch: pyt
         workspace_id="ws-beta",
         verdict=v_payload,
     )
-    assert r1["verdict_id"] == "VD-20261019-01"
-    assert r2["verdict_id"] == "VD-20261019-02"
+    assert r1["verdict_id"] == "VD-20261023-01"
+    assert r2["verdict_id"] == "VD-20261023-02"
     assert r1["verdict_id"] != r2["verdict_id"]
-    assert lock_keys == ["dalton:verdict:20261019", "dalton:verdict:20261019"]
+    assert r1["verdict_at"] == fixed_clock
+    assert lock_keys == ["dalton:verdict:20261023", "dalton:verdict:20261023"]
     assert len(select_sqls) == 2
     for sql_str in select_sqls:
         assert "workspace_id" not in sql_str.lower()

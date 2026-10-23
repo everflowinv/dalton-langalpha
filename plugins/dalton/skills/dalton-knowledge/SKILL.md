@@ -30,11 +30,11 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 2. **事件或预检唤醒**：先读 `agenda.md`，再读唤醒原因关联的支柱与驱动。
 3. **撰写正式报告**：先读 `thesis.md`、`debate.md`、`management.md` 及 `model/` 当前版本。
 
-## 3. 三条硬性不变量（违反时工具拒写）
+## 3. 硬性不变量（违反时工具拒写）
 
 1. **证据台账只追加（`append_only_violation`）**：`thesis.evidence` 的已有条目必须原样保留在原位置；更正旧证据时，用 `append` 新增一条并填 `supersedes: "E-YYYYMMDD-NN"`。
 2. **正式版本只经发布写入（`official_is_publish_only`）**：`thesis.official` 代表 PM 批准的正式 House View 快照，只能由 `publish_report(..., updates_thesis=True)` 写入，工具路径一律禁止修改。
-3. **目标价必须指向模型单元格（`target_needs_model_cell`）**：`house_view.target` 必须包含 `model_ref: {"kind": "model_cell", "path": "model/<TICKER>-model-v<NN>.xlsx", "cell": "Model!F42"}`，且该模型文件已登记在 `data/models.json` 的 `versions` 中。
+3. **目标价与模型证据必须指向模型单元格（`target_needs_model_cell` / `model_needs_model_cell` / `model_tier_1_forbidden`）**：`house_view.target` 必须包含 `model_ref: {"kind": "model_cell", "path": "model/<TICKER>-model-v<NN>.xlsx", "cell": "Model!F42"}`，且该模型文件已登记在 `data/models.json` 的 `versions` 中；`source.type="model"` 的证据同样必须引用 `kind="model_cell"`（含 `path` 与 `Sheet!Cell`），且默认 tier 为 2–3，**禁止标 tier 1**。
 
 ## 4. `knowledge_update` 操作语言（Ops）示例
 
@@ -108,5 +108,12 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 ## 6. 直接修改提示的合入与来源纪律
 
 - **处理直接修改提示**：若 `agent.md` 托管块提示 `⚠ data/<doc>.json 被直接修改` 或 `ℹ <doc>.md 被直接修改`，先读对应的 `history/<doc>/...-edited.md` 或 `data/<doc>.json`，用 `knowledge_update` 将有效修改正式合入，消除告警。
-- **来源层级（Tier 1–6）**：1 监管财报（10-K/10-Q/8-K） > 2 公司官方公告/电话会 > 3 署名卖方研报 > 4 官方/行业协会统计 > 5 专家访谈（**只写身份如"前 Meta 广告产品总监"，严禁写个人姓名**） > 6 新闻报道（仅作线索）。
+- **来源层级（Tier 1–6）与 `source.type` 枚举**：
+  - Tier 1：`filing`（监管财报：10-K/10-Q/8-K/20-F）
+  - Tier 2：`company_release`（公司官方公告/新闻稿/IR 演示文稿）、`transcript`（电话会/业绩会转写，包括 AlphaEngine ASR 稿；若为卖方回访转写可记 tier 3）
+  - Tier 3：`broker_report`（署名卖方研报）、`consensus`（一致预期，如 Yahoo Finance / Visible Alpha / 彭博一致预期，直接记 `consensus` 而不必硬塞进 `broker_report`）
+  - Tier 4：`official_data`（官方/行业协会统计）
+  - Tier 5：`expert`（专家访谈，**只写身份如"前 Meta 广告产品总监"，严禁写个人姓名**）、`internal_note`（团队内部对话或纪要，默认 tier 5，视引述内容可记 3–5）
+  - Tier 6：`news`（新闻报道，仅作线索）
+  - 特殊类型：`model`（本方模型推导，默认 tier 2–3，**必须引用模型单元格 `kind="model_cell"` 且禁止标 tier 1**）、`legacy_thesis`（历史迁移论点，旧数据兼容，tier 3–5）。
 - **严谨表述**：本轮未取到某项数据，只能写"本轮未取得"，严禁推断为"公司未披露"。

@@ -23,7 +23,7 @@
 {% if doc.next_validations %}
 | ID | 预计日期 | 状态 | 验证事项 | 预期结果 | 数据来源 |
 |---|---|---|---|---|---|
-{% for v in doc.next_validations %}| **{{ v.id }}** | {{ v.due }} | `{{ v.status }}` | {{ v.what }} | {{ v.expected }} | {{ v.source or "—" }} |
+{% for v in doc.next_validations %}| **{{ v.id }}** | {{ v.due or "—" }} | `{{ v.status }}` | {{ v.what }} | {{ v.expected or "—" }} | {{ v.source or "—" }} |
 {% endfor %}
 {% else %}
 暂无待验证事项。

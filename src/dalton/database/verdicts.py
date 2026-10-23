@@ -29,6 +29,11 @@ def _serialize_row(row: dict[str, Any] | None) -> dict[str, Any] | None:
     }
 
 
+def _now_utc() -> datetime:
+    """Return current UTC timestamp with full clock precision."""
+    return datetime.now(timezone.utc)
+
+
 def _day_str(day: date | datetime | str | None = None) -> str:
     if isinstance(day, str) and len(day) >= 8:
         clean = day[:10].replace("-", "")
@@ -38,7 +43,7 @@ def _day_str(day: date | datetime | str | None = None) -> str:
         return day.astimezone(timezone.utc).strftime("%Y%m%d")
     if isinstance(day, date):
         return day.strftime("%Y%m%d")
-    return datetime.now(timezone.utc).strftime("%Y%m%d")
+    return _now_utc().strftime("%Y%m%d")
 
 
 async def next_verdict_id(
@@ -90,17 +95,8 @@ async def insert_verdict(
     origin_type: str | None = None,
 ) -> dict[str, Any]:
     """Assign a ``VD-YYYYMMDD-NN`` ID under an advisory lock and insert into ``dalton_verdicts``."""
-    at_raw = verdict.get("at")
-    if isinstance(at_raw, str) and at_raw:
-        try:
-            verdict_at = datetime.fromisoformat(at_raw.replace("Z", "+00:00"))
-        except ValueError:
-            verdict_at = datetime.now(timezone.utc)
-    elif isinstance(at_raw, datetime):
-        verdict_at = at_raw
-    else:
-        verdict_at = datetime.now(timezone.utc)
-
+    verdict_at = _now_utc().astimezone(timezone.utc)
+    now_iso = verdict_at.isoformat().replace("+00:00", "Z")
     day_stamp = _day_str(verdict_at)
     lock_key = f"dalton:verdict:{day_stamp}"
 
@@ -123,7 +119,7 @@ async def insert_verdict(
                 verdict_id = await next_verdict_id(
                     workspace_id, day_stamp, cur=cur
                 )
-            payload = {**verdict, "id": verdict_id}
+            payload = {**verdict, "id": verdict_id, "at": now_iso}
 
             await cur.execute(
                 f"""
@@ -177,7 +173,7 @@ async def list_verdicts(
                     SELECT {_VERDICT_COLS}
                     FROM dalton_verdicts
                     WHERE workspace_id = %s AND verdict_at >= %s
-                    ORDER BY verdict_at DESC
+                    ORDER BY verdict_at DESC, length(verdict_id) DESC, verdict_id DESC
                     LIMIT %s
                     """,
                     (workspace_id, since, capped),
@@ -188,7 +184,7 @@ async def list_verdicts(
                     SELECT {_VERDICT_COLS}
                     FROM dalton_verdicts
                     WHERE workspace_id = %s
-                    ORDER BY verdict_at DESC
+                    ORDER BY verdict_at DESC, length(verdict_id) DESC, verdict_id DESC
                     LIMIT %s
                     """,
                     (workspace_id, capped),
@@ -228,7 +224,7 @@ async def list_user_verdicts(
                 SELECT {_VERDICT_COLS}
                 FROM dalton_verdicts
                 WHERE {where_sql}
-                ORDER BY verdict_at DESC
+                ORDER BY verdict_at DESC, length(verdict_id) DESC, verdict_id DESC
                 LIMIT %s
                 """,
                 tuple(params),

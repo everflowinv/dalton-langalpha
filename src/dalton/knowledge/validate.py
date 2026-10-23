@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+from collections import Counter
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -33,12 +34,15 @@ MAX_PROBLEMS = 10
 _SOURCE_TYPE_EXPECTED_TIERS: dict[str, set[int]] = {
     "filing": {1},
     "company_release": {2},
+    "transcript": {2, 3},
     "broker_report": {3},
+    "consensus": {3},
     "official_data": {4},
     "expert": {5},
     "news": {6},
-    "model": {1, 2, 3},
+    "model": {2, 3},
     "internal_note": {3, 4, 5},
+    "legacy_thesis": {3, 4, 5},
 }
 
 
@@ -258,6 +262,88 @@ def _check_hard_invariants(
                             }
                         )
 
+    # I4: newly added model evidence must reference a model cell and cannot have tier 1
+    old_ev_ids = {
+        str(item.get("id"))
+        for item in (old_ev if isinstance(old_ev, list) else [])
+        if isinstance(item, dict) and item.get("id")
+    }
+    ev_list = new_doc.get("evidence") if "evidence" in new_doc else new_doc.get("evidence_log")
+    if isinstance(ev_list, list):
+        # Old ids are exempt below, so a new entry must not borrow one. Count
+        # against the old doc so duplicates already stored stay writable.
+        allowed_ev_ids = Counter(
+            str(item.get("id"))
+            for item in (old_ev if isinstance(old_ev, list) else [])
+            if isinstance(item, dict) and item.get("id")
+        )
+        seen_ev_ids: Counter[str] = Counter()
+        for idx, ev in enumerate(ev_list):
+            if not isinstance(ev, dict):
+                continue
+            ev_id = str(ev.get("id") or "")
+            if ev_id:
+                seen_ev_ids[ev_id] += 1
+            if ev_id and seen_ev_ids[ev_id] > max(allowed_ev_ids[ev_id], 1):
+                errors.append(
+                    {
+                        "code": "duplicate_evidence_id",
+                        "path": f"/evidence/{idx}/id",
+                        "message": f"evidence id {ev_id!r} appears more than once",
+                    }
+                )
+                continue
+            if ev_id and ev_id in old_ev_ids:
+                continue
+            src = ev.get("source")
+            if not isinstance(src, dict) or src.get("type") != "model":
+                continue
+            stier = src.get("tier")
+            if stier == 1:
+                errors.append(
+                    {
+                        "code": "model_tier_1_forbidden",
+                        "path": f"/evidence/{idx}/source/tier",
+                        "message": "evidence with source.type='model' cannot have tier=1 (default tier is 2–3)",
+                    }
+                )
+            ref = src.get("ref")
+            if not isinstance(ref, dict):
+                errors.append(
+                    {
+                        "code": "model_needs_model_cell",
+                        "path": f"/evidence/{idx}/source/ref",
+                        "message": (
+                            "evidence with source.type='model' must have ref pointing to a model cell "
+                            "(kind='model_cell', path='model/<file>.xlsx', cell='<Sheet>!<Cell>')"
+                        ),
+                    }
+                )
+            else:
+                r_kind = ref.get("kind")
+                r_path = ref.get("path") or ref.get("file") or ""
+                r_cell = ref.get("cell") or ""
+                r_sheet = ref.get("sheet") or ""
+                has_sheet_and_cell = bool(
+                    (r_sheet and r_cell)
+                    or (
+                        "!" in str(r_cell)
+                        and len(str(r_cell).split("!")) == 2
+                        and all(str(r_cell).split("!"))
+                    )
+                )
+                if r_kind != "model_cell" or not r_path or not has_sheet_and_cell:
+                    errors.append(
+                        {
+                            "code": "model_needs_model_cell",
+                            "path": f"/evidence/{idx}/source/ref",
+                            "message": (
+                                "evidence with source.type='model' must have ref with kind='model_cell', "
+                                "path='model/<file>.xlsx', and cell='<Sheet>!<Cell>'"
+                            ),
+                        }
+                    )
+
     return errors
 
 
@@ -411,8 +497,17 @@ def _check_soft_warnings(
                     }
                 )
 
+        # Only new entries: an append-only legacy entry cannot be corrected, so
+        # warning on it every update is noise.
+        legacy_ev_ids = {
+            str(item.get("id"))
+            for item in ((old_doc or {}).get("evidence") or [])
+            if isinstance(item, dict) and item.get("id")
+        }
         for idx, ev in enumerate(new_doc.get("evidence") or []):
             if not isinstance(ev, dict):
+                continue
+            if str(ev.get("id") or "") in legacy_ev_ids:
                 continue
             src = ev.get("source") or {}
             stype = src.get("type")

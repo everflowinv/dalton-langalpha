@@ -10,8 +10,6 @@ import statistics
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from src.dalton.settings import get_dalton_config
-
 
 class OpError(ValueError):
     """Raised when an operation path or payload cannot be applied."""
@@ -256,7 +254,14 @@ def _ensure_nested_ids_and_defaults(
             doc["official"] = None
         hv = doc.get("house_view")
         if isinstance(hv, dict):
-            hv.setdefault("updated_at", now_str)
+            old_hv = (old_doc or {}).get("house_view") if isinstance(old_doc, dict) else None
+            if old_doc is None or old_hv != hv or not hv.get("updated_at"):
+                hv["updated_at"] = now_str
+        mv = doc.get("market_view")
+        if isinstance(mv, dict):
+            old_mv = (old_doc or {}).get("market_view") if isinstance(old_doc, dict) else None
+            if old_doc is None or old_mv != mv or not mv.get("updated_at"):
+                mv["updated_at"] = now_str
         pillars = doc.get("pillars")
         if isinstance(pillars, list):
             for idx, pillar in enumerate(pillars):
@@ -1092,6 +1097,30 @@ def apply_ops(
             )
 
     # Post-processing: maintain automatic histories and server-computed fields
+    if doc_key == "thesis":
+        touched_hv = any(
+            isinstance(op, dict)
+            and (
+                op.get("op") == "create"
+                or str(op.get("path") or "") == "/house_view"
+                or str(op.get("path") or "").startswith("/house_view/")
+            )
+            for op in repaired_ops
+        )
+        if touched_hv and isinstance(doc.get("house_view"), dict):
+            doc["house_view"]["updated_at"] = now_str
+        touched_mv = any(
+            isinstance(op, dict)
+            and (
+                op.get("op") == "create"
+                or str(op.get("path") or "") == "/market_view"
+                or str(op.get("path") or "").startswith("/market_view/")
+            )
+            for op in repaired_ops
+        )
+        if touched_mv and isinstance(doc.get("market_view"), dict):
+            doc["market_view"]["updated_at"] = now_str
+
     _maintain_histories_after_ops(
         doc_key,
         old_snapshot,
@@ -1131,8 +1160,9 @@ def _maintain_histories_after_ops(
         if isinstance(old_hv, dict) and isinstance(new_hv, dict):
             old_cmp = {k: v for k, v in old_hv.items() if k != "updated_at"}
             new_cmp = {k: v for k, v in new_hv.items() if k != "updated_at"}
-            if old_cmp != new_cmp:
+            if old_cmp != new_cmp or old_hv.get("updated_at") != new_hv.get("updated_at"):
                 new_hv["updated_at"] = now_str
+            if old_cmp != new_cmp:
                 hvh = new_doc.setdefault("house_view_history", [])
                 old_hvh_len = len(old_doc.get("house_view_history") or [])
                 if len(hvh) == old_hvh_len:
@@ -1147,6 +1177,13 @@ def _maintain_histories_after_ops(
                     if verdict_id:
                         entry["verdict_id"] = verdict_id
                     hvh.append(entry)
+        elif isinstance(new_hv, dict):
+            new_hv["updated_at"] = now_str
+
+        old_mv = old_doc.get("market_view")
+        new_mv = new_doc.get("market_view")
+        if isinstance(new_mv, dict) and old_mv != new_mv:
+            new_mv["updated_at"] = now_str
 
         # 2. Check pillar status changes
         old_pillars = {
