@@ -156,6 +156,8 @@ export function ProviderRow({ item }: { item: DaltonProviderStatusItem }) {
                 >
                   去连接 OAuth
                 </a>
+              ) : item.provider === 'xai' ? (
+                '直连未启用：Grok 目前经 OpenClaw 代理使用（ocb-xai-*）'
               ) : (
                 `在 .env 配置 ${item.credential?.env_key ?? 'API_KEY'} 后重启`
               )}

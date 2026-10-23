@@ -401,7 +401,17 @@ def test_providers_status_reads_real_byok_dict_shape(
     assert xai_row["configured"] is True
     assert xai_row["credential"]["has_byok"] is True
     assert any(w["code"] == "byok_cash_key" for w in xai_row["warnings"])
+    assert "L19" not in resp.text
     assert "xai-test-key-not-leaked" not in resp.text
+
+    # With the .env key also present, the BYOK copy is redundant: no warning.
+    monkeypatch.setenv("XAI_API_KEY", "env-key-not-leaked")
+    resp_env = client.get("/api/v1/dalton/providers/status")
+    xai_env = next(p for p in resp_env.json()["providers"] if p["provider"] == "xai")
+    assert xai_env["credential"]["source"] == "env"
+    assert not any(w["code"] == "byok_cash_key" for w in xai_env["warnings"])
+    assert "env-key-not-leaked" not in resp_env.text
+    monkeypatch.delenv("XAI_API_KEY", raising=False)
 
     avail_resp = client.get("/api/v1/dalton/providers/available-models")
     assert avail_resp.status_code == 200
