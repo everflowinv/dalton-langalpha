@@ -97,4 +97,15 @@ def is_retryable_error(exc: BaseException, status_code: int | None = None) -> bo
     """
     if status_code is None:
         status_code = extract_status_code(exc)
+    # DALTON-HOOK(xai-oauth): route Grok billing exhaustion straight to fallback; retry rate_limit only for xAI without overriding non-retryable statuses
+    try:
+        from src.dalton.llm.providers.xai_grok.client import classify_xai_error
+
+        xai_kind = classify_xai_error(exc, require_xai_origin=True)
+        if xai_kind == "billing":
+            return False
+        if xai_kind == "rate_limit" and status_code not in NON_RETRYABLE_STATUSES:
+            return True
+    except Exception:
+        pass
     return status_code not in NON_RETRYABLE_STATUSES

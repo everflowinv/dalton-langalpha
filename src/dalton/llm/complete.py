@@ -86,6 +86,8 @@ class DaltonCompleteResult:
     attempt: int = 1
     error_kind: str | None = None
     error: str | None = None
+    stream_started: bool = False
+    chunks_received: int = 0
 
     @property
     def cost_usd(self) -> float:
@@ -229,7 +231,12 @@ def compute_call_costs(
     return calc_cost, Decimal("0")
 
 
-def _classify_exception(exc: BaseException) -> tuple[str, str]:
+def _classify_exception(
+    exc: BaseException,
+    *,
+    provider: str | None = None,
+    sdk: str | None = None,
+) -> tuple[str, str]:
     """Classify an LLM invocation error into `(target_state, error_kind)` per P0N.7 §3.
 
     Returns:
@@ -239,6 +246,25 @@ def _classify_exception(exc: BaseException) -> tuple[str, str]:
     """
     if isinstance(exc, ( asyncio.TimeoutError, TimeoutError)):
         return "indeterminate", "timeout"
+
+    from src.dalton.llm.providers.xai_grok.client import (
+        classify_xai_error,
+        has_stream_started,
+    )
+
+    status_code = getattr(exc, "status_code", None) or getattr(
+        getattr(exc, "response", None), "status_code", None
+    )
+    xai_kind = classify_xai_error(
+        exc,
+        provider=provider,
+        sdk=sdk,
+        require_xai_origin=True,
+    )
+    if xai_kind == "billing" and not has_stream_started(exc):
+        return "failed", "billing"
+    if xai_kind == "rate_limit" and status_code not in (400, 401, 403, 404, 422):
+        return "indeterminate", "rate_limit"
 
     cls_name = exc.__class__.__name__
     msg = str(exc)
@@ -870,11 +896,15 @@ async def dalton_complete(
             attempt=attempt,
         )
     except Exception as exc:
+        from src.dalton.llm.providers.xai_grok.client import get_stream_progress
+
         if llm_call_completed:
             target_state = "indeterminate"
             error_kind = "post_call_error"
+            stream_started, chunks_received = True, 0
         else:
-            target_state, error_kind = _classify_exception(exc)
+            target_state, error_kind = _classify_exception(exc, provider=provider)
+            stream_started, chunks_received = get_stream_progress(exc)
         safe_msg = sanitize_error_text(exc, max_len=240)
         if not skip_journal:
             try:
@@ -916,10 +946,16 @@ async def dalton_complete(
                 model=effective_model,
                 provider=provider,
                 billing_type=billing_type,
+                usage={
+                    "stream_started": stream_started,
+                    "chunks_received": chunks_received,
+                },
                 invocation_id=inv_id,
                 attempt=attempt,
                 error_kind=error_kind,
                 error=safe_msg,
+                stream_started=stream_started,
+                chunks_received=chunks_received,
             ),
             raise_on_error=raise_on_error,
         )

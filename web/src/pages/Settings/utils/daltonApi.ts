@@ -196,7 +196,24 @@ export interface DaltonProviderStatusItem {
     env_key?: string;
     has_env?: boolean;
     has_byok?: boolean;
+    token_expired?: boolean;
+    quota?: {
+      credit_usage_percent?: number | null;
+      used?: number | null;
+      monthly_limit?: number | null;
+      current_period?: unknown;
+      subscription_tier?: string | null;
+      token_expired?: boolean;
+    } | null;
   };
+  quota?: {
+    credit_usage_percent?: number | null;
+    used?: number | null;
+    monthly_limit?: number | null;
+    current_period?: unknown;
+    subscription_tier?: string | null;
+    token_expired?: boolean;
+  } | null;
   last_success?: {
     at?: string;
     model?: string;

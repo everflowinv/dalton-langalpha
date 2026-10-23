@@ -90,6 +90,7 @@ def client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
     import src.dalton.llm.complete as complete_mod
     import src.dalton.llm.providers.antigravity.oauth as ag_oauth
     import src.dalton.llm.providers.muse.oauth as muse_oauth
+    import src.dalton.llm.providers.xai_grok.oauth as xai_oauth
     import src.dalton.services.openclaw_admin as oc_admin
     import src.dalton.services.provider_status as ps_mod
     import src.server.database.automation as auto_db
@@ -148,7 +149,7 @@ def client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
             },
         ),
     )
-    for o_mod in (oauth_db, ag_oauth, muse_oauth):
+    for o_mod in (oauth_db, ag_oauth, muse_oauth, xai_oauth):
         if hasattr(o_mod, "get_oauth_tokens"):
             monkeypatch.setattr(
                 o_mod,
@@ -316,6 +317,7 @@ def client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
         ("GET", "/api/v1/dalton/autonomy/report", None),
         ("GET", "/api/v1/oauth/antigravity/status", None),
         ("GET", "/api/v1/oauth/muse/status", None),
+        ("GET", "/api/v1/oauth/xai/status", None),
     ],
 )
 def test_every_dalton_route_resolves_without_500(

@@ -5,6 +5,7 @@ import type { ConfiguredProvider } from '@/hooks/useConfiguredProviders';
 import {
   getAntigravityOAuthStatus,
   getMuseOAuthStatus,
+  getXaiOAuthStatus,
 } from '../utils/daltonOAuthApi';
 
 export function useDaltonOAuthProviders() {
@@ -18,6 +19,13 @@ export function useDaltonOAuthProviders() {
   const { data: museStatus, isLoading: museLoading } = useQuery({
     queryKey: queryKeys.oauth.muse(),
     queryFn: getMuseOAuthStatus,
+    staleTime: 60_000,
+    retry: false,
+  });
+
+  const { data: xaiStatus, isLoading: xaiLoading } = useQuery({
+    queryKey: queryKeys.oauth.xai(),
+    queryFn: getXaiOAuthStatus,
     staleTime: 60_000,
     retry: false,
   });
@@ -40,11 +48,19 @@ export function useDaltonOAuthProviders() {
         plan_type: museStatus.plan_type ?? null,
       });
     }
+    if (xaiStatus?.connected) {
+      list.push({
+        provider: 'xai-oauth',
+        display_name: 'xAI Grok (SuperGrok)',
+        access_type: 'oauth',
+        plan_type: xaiStatus.plan_type ?? null,
+      });
+    }
     return list;
-  }, [antigravityStatus, museStatus]);
+  }, [antigravityStatus, museStatus, xaiStatus]);
 
   return {
     extraProviders,
-    isLoading: antigravityLoading || museLoading,
+    isLoading: antigravityLoading || museLoading || xaiLoading,
   };
 }

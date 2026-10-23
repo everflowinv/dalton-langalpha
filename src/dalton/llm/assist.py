@@ -128,11 +128,33 @@ def resolve_assist_fallback_model(role: str = "assist_fallback") -> str | None:
     return models[0] if models else None
 
 
+def _has_stream_output_started(comp: Any) -> bool:
+    """Return True if the call already started streaming or produced output before failing."""
+    if getattr(comp, "stream_started", False):
+        return True
+    if int(getattr(comp, "chunks_received", 0) or 0) > 0:
+        return True
+    if getattr(comp, "data", None) is not None:
+        return True
+    if str(getattr(comp, "text", None) or ""):
+        return True
+    usage = getattr(comp, "usage", None)
+    if isinstance(usage, dict) and (
+        int(usage.get("output_tokens") or 0) > 0
+        or int(usage.get("chunks_received") or 0) > 0
+        or bool(usage.get("stream_started"))
+    ):
+        return True
+    return False
+
+
 def _is_safe_to_fallback(comp: Any) -> bool:
-    """Return True only when `dalton_complete` failed safely without charge (`pre_send` or `4xx`)."""
+    """Return True only when `dalton_complete` failed safely without charge (`pre_send`, pre-stream `billing`, or `4xx`)."""
     if comp.ok or getattr(comp, "status", None) != "failed":
         return False
     ek = str(getattr(comp, "error_kind", None) or "").strip().lower()
+    if ek == "billing":
+        return not _has_stream_output_started(comp)
     return ek == "pre_send" or (ek.startswith("http_4") and ek != "http_429")
 
 

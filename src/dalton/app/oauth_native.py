@@ -33,6 +33,14 @@ from src.dalton.llm.providers.muse.oauth import (
     poll_device_authorization as muse_poll_device_authorization,
     request_device_code as muse_request_device_code,
 )
+from src.dalton.llm.providers.xai_grok.oauth import (
+    MAX_POLL_WAIT_SECONDS as XAI_MAX_POLL_WAIT_SECONDS,
+    XAI_PLAN_TYPE,
+    XAI_PROVIDER,
+    poll_device_authorization as xai_poll_device_authorization,
+    request_device_code as xai_request_device_code,
+    save_xai_tokens,
+)
 from src.server.database.oauth_tokens import (
     delete_oauth_tokens,
     get_oauth_status,
@@ -228,4 +236,153 @@ async def antigravity_disconnect(user_id: CurrentUserId):
     except Exception:
         pass
     logger.info(f"[oauth] Antigravity disconnected for user_id={user_id}")
+    return {"success": True}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# xAI Grok OAuth — RFC 8628 Device Code Flow (SuperGrok subscription)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@router.post("/xai/device/initiate")
+async def xai_device_initiate(user_id: CurrentUserId):
+    """Start xAI device code flow. Returns user_code + verification URL."""
+    from src.utils.cache.redis_cache import get_cache_client
+
+    cache = get_cache_client()
+    if not cache.enabled or not cache.client:
+        raise HTTPException(status_code=503, detail="Cache unavailable for OAuth")
+
+    try:
+        device = await xai_request_device_code(user_id=user_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"[oauth] xAI device code request failed: {type(e).__name__}")
+        raise HTTPException(status_code=502, detail="Failed to request device code from xAI")
+
+    ttl = min(XAI_MAX_POLL_WAIT_SECONDS, max(60, int(device.get("expires_in") or XAI_MAX_POLL_WAIT_SECONDS)))
+    expires_at_ts = int(datetime.now(timezone.utc).timestamp()) + ttl
+    await cache.client.set(
+        f"oauth:xai:device:{user_id}",
+        json.dumps(
+            {
+                "device_code": device["device_code"],
+                "token_endpoint": device.get("token_endpoint"),
+                "interval": int(device.get("interval") or 5),
+                "ttl": ttl,
+                "expires_at": expires_at_ts,
+            }
+        ),
+        ex=ttl,
+    )
+
+    logger.info(f"[oauth] xAI device code initiated for user_id={user_id}")
+    return {
+        "user_code": device["user_code"],
+        "verification_url": device["verification_url"],
+        "interval": device["interval"],
+    }
+
+
+@router.post("/xai/device/poll")
+async def xai_device_poll(user_id: CurrentUserId):
+    """Poll for xAI device authorization."""
+    from src.utils.cache.redis_cache import get_cache_client
+
+    cache = get_cache_client()
+    if not cache.enabled or not cache.client:
+        raise HTTPException(status_code=503, detail="Cache unavailable")
+
+    device_key = f"oauth:xai:device:{user_id}"
+    raw = await cache.client.get(device_key)
+    if not raw:
+        raise HTTPException(status_code=400, detail="No pending xAI authorization. Please initiate again.")
+
+    device = json.loads(raw)
+    cur_interval = int(device.get("interval") or 5)
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    raw_expires_at = device.get("expires_at")
+    if isinstance(raw_expires_at, (int, float)) and int(raw_expires_at) <= now_ts:
+        await cache.client.delete(device_key)
+        raise HTTPException(status_code=400, detail="The xAI sign-in request expired before it was approved (expired_token).")
+
+    try:
+        result = await xai_poll_device_authorization(
+            device["device_code"],
+            token_endpoint=device.get("token_endpoint"),
+            interval=cur_interval,
+            user_id=user_id,
+        )
+    except ValueError as e:
+        await cache.client.delete(device_key)
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"[oauth] xAI device poll error for user_id={user_id}: {type(e).__name__}")
+        raise HTTPException(status_code=502, detail="Failed to poll xAI")
+
+    if result.get("pending"):
+        new_interval = int(result.get("interval") or cur_interval)
+        if new_interval != cur_interval:
+            device["interval"] = new_interval
+            initial_ttl = int(device.get("ttl") or XAI_MAX_POLL_WAIT_SECONDS)
+            remaining_ttl: int | None = None
+            if isinstance(raw_expires_at, (int, float)):
+                remaining_ttl = int(raw_expires_at) - int(datetime.now(timezone.utc).timestamp())
+            elif hasattr(cache.client, "ttl"):
+                try:
+                    redis_ttl = await cache.client.ttl(device_key)
+                    if isinstance(redis_ttl, int) and redis_ttl > 0:
+                        remaining_ttl = redis_ttl
+                except Exception:
+                    pass
+            if remaining_ttl is None:
+                remaining_ttl = initial_ttl
+            if remaining_ttl <= 0:
+                await cache.client.delete(device_key)
+                raise HTTPException(status_code=400, detail="The xAI sign-in request expired before it was approved (expired_token).")
+            await cache.client.set(
+                device_key,
+                json.dumps(device),
+                ex=min(initial_ttl, remaining_ttl),
+            )
+        return {"pending": True, "interval": new_interval}
+
+    try:
+        await save_xai_tokens(user_id, result)
+        try:
+            await invalidate_oauth_active_cache(user_id)
+        except Exception:
+            pass
+        await cache.client.delete(f"oauth:xai:device:{user_id}")
+        logger.info(f"[oauth] xAI connected for user_id={user_id}")
+        return {
+            "success": True,
+            "account_id": result.get("account_id") or result.get("accountId") or "",
+            "email": result.get("email"),
+            "display_name": result.get("displayName") or result.get("display_name"),
+            "plan_type": XAI_PLAN_TYPE,
+        }
+    except Exception as e:
+        logger.error(f"[oauth] xAI token storage failed for user_id={user_id}: {type(e).__name__}")
+        raise HTTPException(status_code=400, detail=f"Token storage failed: {type(e).__name__}")
+
+
+@router.get("/xai/status")
+async def xai_status(user_id: CurrentUserId):
+    """Return xAI connection status (no token decryption — fast check)."""
+    return await get_oauth_status(user_id, XAI_PROVIDER)
+
+
+@router.delete("/xai")
+async def xai_disconnect(user_id: CurrentUserId):
+    """Delete stored xAI OAuth tokens."""
+    from src.dalton.credentials import require_credential_admin
+    require_credential_admin(user_id)
+    await delete_oauth_tokens(user_id, XAI_PROVIDER)
+    try:
+        await invalidate_oauth_active_cache(user_id)
+    except Exception:
+        pass
+    logger.info(f"[oauth] xAI disconnected for user_id={user_id}")
     return {"success": True}

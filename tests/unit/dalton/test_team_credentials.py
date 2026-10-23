@@ -611,6 +611,7 @@ async def test_non_pm_delete_and_disconnect_forbidden_while_pm_allowed(
         lambda: oauth_app.claude_disconnect(user_id=MEMBER_ID),
         lambda: oauth_native_app.muse_disconnect(user_id=MEMBER_ID),
         lambda: oauth_native_app.antigravity_disconnect(user_id=MEMBER_ID),
+        lambda: oauth_native_app.xai_disconnect(user_id=MEMBER_ID),
         lambda: api_keys_app.remove_api_key(provider="openai", user_id=MEMBER_ID),
         lambda: api_keys_app.update_api_keys(
             body=UpdateApiKeysRequest(api_keys={"openai": None}),

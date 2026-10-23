@@ -333,6 +333,23 @@ def get_dalton_broker_token() -> str:
     return os.getenv("DALTON_BROKER_TOKEN", "").strip()
 
 
+XAI_OAUTH_CLIENT_ID: str = os.getenv("DALTON_XAI_OAUTH_CLIENT_ID", "")
+_IMPORT_XAI_OAUTH_CLIENT_ID = XAI_OAUTH_CLIENT_ID
+
+
+def get_xai_oauth_client_id() -> str:
+    """Return ``DALTON_XAI_OAUTH_CLIENT_ID`` from environment (no default value)."""
+    if XAI_OAUTH_CLIENT_ID != _IMPORT_XAI_OAUTH_CLIENT_ID:
+        return XAI_OAUTH_CLIENT_ID.strip()
+    return os.getenv("DALTON_XAI_OAUTH_CLIENT_ID", XAI_OAUTH_CLIENT_ID).strip()
+
+
+def get_xai_grok_client_version() -> str:
+    """Return configured xAI Grok CLI client version (default ``1.0.4``)."""
+    raw = os.getenv("DALTON_XAI_GROK_CLIENT_VERSION", "").strip()
+    return raw or "1.0.4"
+
+
 def get_dalton_broker_url(host: str | None = None) -> str:
     """Return the resolved OpenClaw broker v2 base URL."""
     resolved_host = host or HOST_IP
