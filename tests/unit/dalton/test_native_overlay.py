@@ -23,6 +23,7 @@ from src.dalton.llm.providers.antigravity.client import (
     _messages_to_gemini,
 )
 from src.dalton.llm.providers.antigravity.oauth import parse_callback_input
+from src.dalton.llm.providers.muse import build_muse_client
 from src.llms.llm import LLM, ModelConfig
 from src.llms.pricing_utils import find_model_pricing
 
