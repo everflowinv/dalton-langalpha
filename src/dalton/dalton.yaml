@@ -20,20 +20,14 @@ network:
     - "https://1.1.1.1/dns-query"
     - "https://dns.google/resolve"
 
-llm:
-  # Number audit (check_draft / publish): labelling and judging figures, read via
-  # assist role "audit". Measured on a 48k-character draft: argon-medium labelled all
-  # 27 batches in 139s; the OpenClaw-relayed 3.8 flash timed out on most of them.
-  audit: "gemini-4-argon-medium-oauth"
-
 models:
   broker:
     enabled: true            # OpenClaw broker v2 parallel path; false hides ocb-* from catalog
   disabled_providers: []     # Provider kill switch (P0N.8, L17). Example: ["muse-oauth"]
   assist_model: "gemini-3.8-flash-low-oauth"
+  # Must sit outside every reviewer family (role_policy L20), hence not Gemini/GPT/Grok/Claude.
   assist_fallback_model:
     - "deepseek-flash"
-    - "ocb-deepseek-deepseek-flash"
 
 budget:
   # Default daily cap USD when user has not saved a DB row yet (null = fail-closed,
@@ -56,6 +50,16 @@ publish:
     - "grok-4.7-oauth"
     - "claude-opus-5-5-oauth"
   extract_model: null
+  # Number audit (check_draft / publish). Measured on a 48k-character initial
+  # coverage draft (27 batches): argon-medium 139s with no failed batch and the
+  # best agreement with the other two; the OpenClaw-relayed 3.8 flash failed 24.
+  audit_model: "gemini-4-argon-medium-oauth"
+  audit_fallback_models:
+    - "gpt-6.1-sol-oauth"
+    - "claude-opus-5-5-oauth"
+  audit_timeout_s: 300
+  audit_concurrency: 4
+  audit_total_timeout_s: 1800
   approval_ttl_hours: 168
   max_file_bytes: 20971520
   consensus_providers:

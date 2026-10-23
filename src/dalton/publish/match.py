@@ -353,6 +353,34 @@ def _is_consensus_provenance(prov_rec: dict[str, Any]) -> bool:
     return False
 
 
+class SourceParseCache:
+    """Parsed source bodies for one audit run.
+
+    Every draft figure is compared against every source body, so parsing a body per
+    comparison made the audit O(figures x sources) full parses: 784 figures against 43
+    sources took about six minutes. One instance lives for one audit and is passed
+    down; nothing is kept between requests. Callers only read the parsed figures.
+    """
+
+    def __init__(self) -> None:
+        self._figures: dict[str, tuple[ExtractedFigure, ...]] = {}
+        self._periods: dict[str, frozenset[str]] = {}
+
+    def figures(self, body: str) -> tuple[ExtractedFigure, ...]:
+        hit = self._figures.get(body)
+        if hit is None:
+            hit = self._figures[body] = tuple(extract_figures(body))
+        return hit
+
+    def periods(self, body: str) -> frozenset[str]:
+        hit = self._periods.get(body)
+        if hit is None:
+            hit = self._periods[body] = frozenset(
+                normalize_period(pm.group(1)) for pm in _PERIOD_TOKEN_RE.finditer(body)
+            ) - {""}
+        return hit
+
+
 def _inspect_text_source(
     fig: ExtractedFigure,
     body: str,
@@ -360,6 +388,7 @@ def _inspect_text_source(
     source_id: str = "",
     kind: str = "prov",
     metric_aliases: dict[str, list[str]] | None = None,
+    source_cache: SourceParseCache | None = None,
 ) -> tuple[bool, str, str | None, str, list[MatchCandidate]]:
     """Unit-normalized numeric comparison in a text body with period and metric compatibility (G3.1 R4-3 / P0I L36).
 
@@ -368,11 +397,10 @@ def _inspect_text_source(
     if not body or not body.strip():
         return False, "", None, "", []
 
-    src_figures = extract_figures(body)
+    cache = source_cache if source_cache is not None else SourceParseCache()
+    src_figures = cache.figures(body)
     fig_p = normalize_period(fig.period)
-    all_body_periods = {
-        normalize_period(pm.group(1)) for pm in _PERIOD_TOKEN_RE.finditer(body)
-    } - {""}
+    all_body_periods = cache.periods(body)
 
     cands: list[MatchCandidate] = []
     best_reason: str | None = None
@@ -593,11 +621,14 @@ def match_figures(
     provenance_records: dict[str, dict[str, Any]] | None = None,
     facts_ledger: dict[str, dict[str, Any]] | None = None,
     metric_aliases: dict[str, list[str]] | None = None,
+    source_cache: SourceParseCache | None = None,
 ) -> list[MatchOutcome]:
     """Step C: Match footnoted figures (Orders 0–3) and collect candidates for unfootnoted figures (P0I §1.2, L34, L36).
 
     Unfootnoted figures NEVER become `matched=True` here; Order 0b and Order 4 only produce candidates for Step D.
     """
+    if source_cache is None:
+        source_cache = SourceParseCache()
     evidence_list = (thesis_doc or {}).get("evidence") or []
     evidence_by_id = {
         str(e["id"]): e
@@ -760,6 +791,7 @@ def match_figures(
                     source_id=eid,
                     kind="evidence",
                     metric_aliases=metric_aliases,
+                    source_cache=source_cache,
                 )
                 if f_hit:
                     return MatchOutcome(
@@ -902,6 +934,7 @@ def match_figures(
                 source_id=pid,
                 kind="prov",
                 metric_aliases=metric_aliases,
+                source_cache=source_cache,
             )
             if hit:
                 return MatchOutcome(
@@ -1087,6 +1120,7 @@ def match_figures(
                 source_id=pid,
                 kind="prov",
                 metric_aliases=metric_aliases,
+                source_cache=source_cache,
             )
             if hit:
                 auto_candidates.append(
@@ -1126,6 +1160,7 @@ def retrieve_candidate_sources(
     facts_ledger: dict[str, dict[str, Any]] | None = None,
     metric_aliases: dict[str, list[str]] | None = None,
     limit: int = 8,
+    source_cache: SourceParseCache | None = None,
 ) -> list[dict[str, Any]]:
     """Retrieve candidate source snippets for Step D (P0I §1.6, L34).
 
@@ -1134,6 +1169,7 @@ def retrieve_candidate_sources(
     - When total candidate sources > 30, sorts by (footnote_match, value_match, period_match, metric_match)
       and returns the top `max(limit, 8)` entries.
     """
+    cache = source_cache if source_cache is not None else SourceParseCache()
     all_entries: list[tuple[tuple[int, int, int, int, int], int, dict[str, Any]]] = []
     fig_p = normalize_period(fig.period)
     fn_target = (fig.footnote_target or "").strip()
@@ -1145,12 +1181,10 @@ def retrieve_candidate_sources(
         if not text:
             return 0, 0
         if fig_p:
-            body_periods = {
-                normalize_period(pm.group(1)) for pm in _PERIOD_TOKEN_RE.finditer(text)
-            } - {""}
+            body_periods = cache.periods(text)
             if fig_p in body_periods or fig_p.lower() in text.lower():
                 p_hit = 1
-        for sf in extract_figures(text):
+        for sf in cache.figures(text):
             if sf.exempt:
                 continue
             ok_v, _, _ = values_within_tolerance(fig, sf.value, sf.unit, sf.scale)

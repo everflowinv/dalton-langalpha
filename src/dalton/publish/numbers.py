@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import time
 import dataclasses
 import re
 from typing import Any, Literal, get_args
 
 from pydantic import BaseModel, Field, model_validator
+
+from src.dalton.settings import get_dalton_config
 
 try:
     from src.dalton.llm.assist import assist_json
@@ -281,6 +284,18 @@ class ExtraFigureItem(BaseModel):
                 for k, v in data.items()
             }
         return data
+
+
+_LABEL_DEADLINE_GRACE_S = 5.0
+
+
+@dataclasses.dataclass(frozen=True)
+class _LabelBatchUnfinished:
+    """Stand-in result for a label batch cut off by the audit deadline."""
+
+    error: str
+    ok: bool = False
+    data: Any = None
 
 
 class FigureLabels(BaseModel):
@@ -1239,6 +1254,7 @@ async def label_figures_with_status(
     workspace_id: str | None = None,
     thread_id: str | None = None,
     stats_out: dict[str, Any] | None = None,
+    deadline: float | None = None,
 ) -> tuple[list[ExtractedFigure], bool]:
     """Step B LLM figure labeling (`audit.label_figures`) across all figures and sections (P0I §1.4, L28, L35, L43)."""
     if not user_id or not str(user_id).strip():
@@ -1327,7 +1343,8 @@ async def label_figures_with_status(
     failed_batch_details: list[dict[str, Any]] = []
     llm_period_overrides = 0
 
-    sem = asyncio.Semaphore(4)
+    pub = get_dalton_config().publish
+    sem = asyncio.Semaphore(pub.audit_concurrency)
     label_schema = FigureLabels.model_json_schema()
 
     prepared_batches: list[
@@ -1376,206 +1393,237 @@ async def label_figures_with_status(
                 user_id=user_id,
                 workspace_id=workspace_id,
                 thread_id=thread_id,
-                role="audit",
-                timeout_s=300.0,
-                # Subscription models: a call that timed out may be re-sent rather than
-                # refused as "possibly billed", or a re-run after a timeout fails at once.
-                resend_indeterminate=True,
+                timeout_s=pub.audit_timeout_s,
+                model=pub.audit_model,
+                fallback_models=pub.audit_fallback_models,
+                deadline=deadline,
             )
 
-    batch_results = await asyncio.gather(*[_call_label_batch(pb[8]) for pb in prepared_batches])
-
-    for (batch_idx, sec_title, c_start, chunk_text, batch_figs, s_idx, e_idx, local_to_fig, _payload), res in zip(
-        prepared_batches, batch_results, strict=False
-    ):
-        for f in batch_figs:
-            f.label_hint = "reported"
-            f.incidental_category = ""
-
-        if not res.ok or not res.data:
-            failed_batches += 1
-            failed_batch_details.append(
-                {
-                    "batch_index": batch_idx,
-                    "start_fig": s_idx,
-                    "end_fig": e_idx,
-                    "section": sec_title,
-                }
-            )
-            continue
-
+    if not prepared_batches:
+        batch_results = []
+    elif deadline is None:
+        batch_results = await asyncio.gather(*[_call_label_batch(pb[8]) for pb in prepared_batches])
+    else:
+        # Outer guard on the audit budget: a batch still running at the deadline is
+        # cancelled and counted failed, like any other failed batch. Its journal row
+        # stays claimed, so the cancelled call can never be billed twice. The finally
+        # also covers the audit itself being cancelled: no batch outlives it.
+        label_tasks = [asyncio.create_task(_call_label_batch(pb[8])) for pb in prepared_batches]
         try:
-            parsed = FigureLabels.model_validate(res.data)
-        except Exception:
-            failed_batches += 1
-            failed_batch_details.append(
+            await asyncio.wait(
+                label_tasks, timeout=max(0.0, deadline - time.monotonic()) + _LABEL_DEADLINE_GRACE_S
+            )
+        finally:
+            unfinished = [t for t in label_tasks if not t.done()]
+            for t in unfinished:
+                t.cancel()
+            if unfinished:
+                await asyncio.gather(*unfinished, return_exceptions=True)
+        batch_results = []
+        for t in label_tasks:
+            if t.cancelled() or t.exception() is not None:
+                batch_results.append(
+                    _LabelBatchUnfinished(error="核验总时限已到，该批未完成" if t.cancelled() else str(t.exception()))
+                )
+            else:
+                batch_results.append(t.result())
+
+    def _apply_label_results(batch_results: list[Any]) -> tuple[list[ExtractedFigure], bool]:
+        # Pure CPU over the draft text; run off the event loop (see aaudit_draft).
+        nonlocal failed_batches, labeled_count, llm_period_overrides, fig_counter
+        for (batch_idx, sec_title, c_start, chunk_text, batch_figs, s_idx, e_idx, local_to_fig, _payload), res in zip(
+            prepared_batches, batch_results, strict=False
+        ):
+            for f in batch_figs:
+                f.label_hint = "reported"
+                f.incidental_category = ""
+
+            if not res.ok or not res.data:
+                failed_batches += 1
+                failed_batch_details.append(
+                    {
+                        "batch_index": batch_idx,
+                        "start_fig": s_idx,
+                        "end_fig": e_idx,
+                        "section": sec_title,
+                    }
+                )
+                continue
+
+            try:
+                parsed = FigureLabels.model_validate(res.data)
+            except Exception:
+                failed_batches += 1
+                failed_batch_details.append(
+                    {
+                        "batch_index": batch_idx,
+                        "start_fig": s_idx,
+                        "end_fig": e_idx,
+                        "section": sec_title,
+                    }
+                )
+                continue
+
+            labeled_count += len(batch_figs)
+            for item in parsed.items:
+                target = local_to_fig.get(item.id)
+                if target is None:
+                    continue
+
+                raw_kind = item.kind.strip().lower() if item.kind else "reported"
+                if raw_kind not in _VALID_LABEL_KINDS:
+                    raw_kind = "reported"
+                inc_cat = (item.incidental_category or "").strip()
+                reject_reasons = _incidental_guard_reject_reasons(target, item.unit)
+                if raw_kind == "incidental" and not reject_reasons:
+                    target.label_hint = "incidental"
+                    target.incidental_category = inc_cat or "未给类别"
+                else:
+                    target.label_hint = "reported" if raw_kind == "incidental" else raw_kind
+                    if (
+                        raw_kind == "incidental"
+                        and reject_reasons == ["decimals"]
+                        and inc_cat in _DECIMAL_UNCERTAIN_CATEGORIES
+                    ):
+                        target.incidental_category = inc_cat
+
+                if item.metric and item.metric.strip():
+                    target.metric = item.metric.strip()
+
+                if item.period and item.period.strip():
+                    p_raw = item.period.strip()
+                    if p_raw.lower() in ("none", "n/a", "null", "spot", "intraday", "无", "-"):
+                        if target.period:
+                            llm_period_overrides += 1
+                        target.period = ""
+                    else:
+                        norm_p = normalize_period(p_raw) or p_raw
+                        if norm_p != target.period:
+                            llm_period_overrides += 1
+                        target.period = norm_p
+
+                if item.unit and item.unit.strip():
+                    u_clean = item.unit.strip()
+                    if target.label_hint != "incidental" or u_clean in ("other", "count"):
+                        target.unit = u_clean
+
+            for extra in parsed.extra_figures:
+                raw_sub = (extra.raw or "").strip()
+                if not raw_sub:
+                    continue
+                matched_line_no = extra.line if 1 <= extra.line <= len(lines) else 1
+                matched_line_text = ""
+                if 1 <= matched_line_no <= len(lines) and raw_sub in lines[matched_line_no - 1]:
+                    matched_line_text = lines[matched_line_no - 1]
+                else:
+                    for idx, l_text in enumerate(lines, start=1):
+                        if raw_sub in l_text:
+                            matched_line_no = idx
+                            matched_line_text = l_text
+                            break
+                if not matched_line_text:
+                    continue
+
+                orig_raw_sub = raw_sub
+                selected_raw: str | None = None
+                raw_pos = -1
+                search_start = 0
+                while search_start <= len(matched_line_text):
+                    occ_pos = matched_line_text.find(orig_raw_sub, search_start)
+                    if occ_pos < 0:
+                        break
+                    cand_raw, cand_pos = _expand_colloquial_raw_with_qualifier(
+                        matched_line_text, orig_raw_sub, occ_pos
+                    )
+                    if (
+                        (matched_line_no, occ_pos, orig_raw_sub) not in existing_raws_by_line
+                        and (matched_line_no, cand_pos, cand_raw) not in existing_raws_by_line
+                    ):
+                        selected_raw = cand_raw
+                        raw_pos = cand_pos
+                        existing_raws_by_line.add((matched_line_no, occ_pos, orig_raw_sub))
+                        existing_raws_by_line.add((matched_line_no, cand_pos, cand_raw))
+                        break
+                    search_start = occ_pos + max(1, len(orig_raw_sub))
+
+                if selected_raw is None or raw_pos < 0:
+                    continue
+                raw_sub = selected_raw
+                line_fns = [
+                    (fm.start(), fm.group(1))
+                    for fm in _FOOTNOTE_REF_RE.finditer(matched_line_text)
+                ]
+                fn_id: str | None = None
+                after_fns = [fid for pos, fid in line_fns if pos >= raw_pos + len(raw_sub) - 1]
+                if after_fns:
+                    fn_id = after_fns[0]
+                elif line_fns:
+                    fn_id = line_fns[-1][1]
+                fn_target = _resolve_footnote_target(fn_id, footnotes)
+                is_exempt = matched_line_text.strip().startswith(">") or has_exempt_marker(matched_line_text)
+                kind_val = (
+                    extra.kind.lower()
+                    if extra.kind and extra.kind.lower() in _VALID_LABEL_KINDS
+                    else "reported"
+                )
+                if kind_val == "incidental":
+                    kind_val = "reported"
+                period_val = normalize_period(extra.period) if extra.period else ""
+                if not period_val:
+                    pm = _PERIOD_TOKEN_RE.search(matched_line_text)
+                    if pm:
+                        period_val = normalize_period(pm.group(1))
+                metric_val = extra.metric or _extract_metric_from_context(
+                    matched_line_text, raw_pos, raw_pos + len(raw_sub)
+                )
+
+                fig_counter += 1
+                new_fig = ExtractedFigure(
+                    id=f"F-{fig_counter:03d}",
+                    raw=raw_sub,
+                    value=extra.value,
+                    decimals=0,
+                    unit=extra.unit or "pct",
+                    scale=1.0,
+                    currency=None,
+                    metric=metric_val,
+                    period=period_val,
+                    label_hint=kind_val,
+                    footnote_id=fn_id,
+                    footnote_target=fn_target,
+                    location={
+                        "line": matched_line_no,
+                        "table": False,
+                        "row": None,
+                        "col": None,
+                        "sentence": matched_line_text.strip(),
+                        "section": sec_title,
+                    },
+                    exempt=is_exempt,
+                    exempt_reason="illustrative" if is_exempt else None,
+                )
+                figures.append(new_fig)
+                labeled_count += 1
+
+        incidental_excluded = sum(
+            1 for f in figures if not f.exempt and f.label_hint == "incidental"
+        )
+        if stats_out is not None:
+            stats_out.update(
                 {
-                    "batch_index": batch_idx,
-                    "start_fig": s_idx,
-                    "end_fig": e_idx,
-                    "section": sec_title,
+                    "total": len(figures),
+                    "labeled": labeled_count,
+                    "batches": len(batches),
+                    "failed_batches": failed_batches,
+                    "failed_batch_details": failed_batch_details,
+                    "incidental_excluded": incidental_excluded,
+                    "llm_period_overrides": llm_period_overrides,
                 }
             )
-            continue
 
-        labeled_count += len(batch_figs)
-        for item in parsed.items:
-            target = local_to_fig.get(item.id)
-            if target is None:
-                continue
+        return figures, failed_batches == 0
 
-            raw_kind = item.kind.strip().lower() if item.kind else "reported"
-            if raw_kind not in _VALID_LABEL_KINDS:
-                raw_kind = "reported"
-            inc_cat = (item.incidental_category or "").strip()
-            reject_reasons = _incidental_guard_reject_reasons(target, item.unit)
-            if raw_kind == "incidental" and not reject_reasons:
-                target.label_hint = "incidental"
-                target.incidental_category = inc_cat or "未给类别"
-            else:
-                target.label_hint = "reported" if raw_kind == "incidental" else raw_kind
-                if (
-                    raw_kind == "incidental"
-                    and reject_reasons == ["decimals"]
-                    and inc_cat in _DECIMAL_UNCERTAIN_CATEGORIES
-                ):
-                    target.incidental_category = inc_cat
-
-            if item.metric and item.metric.strip():
-                target.metric = item.metric.strip()
-
-            if item.period and item.period.strip():
-                p_raw = item.period.strip()
-                if p_raw.lower() in ("none", "n/a", "null", "spot", "intraday", "无", "-"):
-                    if target.period:
-                        llm_period_overrides += 1
-                    target.period = ""
-                else:
-                    norm_p = normalize_period(p_raw) or p_raw
-                    if norm_p != target.period:
-                        llm_period_overrides += 1
-                    target.period = norm_p
-
-            if item.unit and item.unit.strip():
-                u_clean = item.unit.strip()
-                if target.label_hint != "incidental" or u_clean in ("other", "count"):
-                    target.unit = u_clean
-
-        for extra in parsed.extra_figures:
-            raw_sub = (extra.raw or "").strip()
-            if not raw_sub:
-                continue
-            matched_line_no = extra.line if 1 <= extra.line <= len(lines) else 1
-            matched_line_text = ""
-            if 1 <= matched_line_no <= len(lines) and raw_sub in lines[matched_line_no - 1]:
-                matched_line_text = lines[matched_line_no - 1]
-            else:
-                for idx, l_text in enumerate(lines, start=1):
-                    if raw_sub in l_text:
-                        matched_line_no = idx
-                        matched_line_text = l_text
-                        break
-            if not matched_line_text:
-                continue
-
-            orig_raw_sub = raw_sub
-            selected_raw: str | None = None
-            raw_pos = -1
-            search_start = 0
-            while search_start <= len(matched_line_text):
-                occ_pos = matched_line_text.find(orig_raw_sub, search_start)
-                if occ_pos < 0:
-                    break
-                cand_raw, cand_pos = _expand_colloquial_raw_with_qualifier(
-                    matched_line_text, orig_raw_sub, occ_pos
-                )
-                if (
-                    (matched_line_no, occ_pos, orig_raw_sub) not in existing_raws_by_line
-                    and (matched_line_no, cand_pos, cand_raw) not in existing_raws_by_line
-                ):
-                    selected_raw = cand_raw
-                    raw_pos = cand_pos
-                    existing_raws_by_line.add((matched_line_no, occ_pos, orig_raw_sub))
-                    existing_raws_by_line.add((matched_line_no, cand_pos, cand_raw))
-                    break
-                search_start = occ_pos + max(1, len(orig_raw_sub))
-
-            if selected_raw is None or raw_pos < 0:
-                continue
-            raw_sub = selected_raw
-            line_fns = [
-                (fm.start(), fm.group(1))
-                for fm in _FOOTNOTE_REF_RE.finditer(matched_line_text)
-            ]
-            fn_id: str | None = None
-            after_fns = [fid for pos, fid in line_fns if pos >= raw_pos + len(raw_sub) - 1]
-            if after_fns:
-                fn_id = after_fns[0]
-            elif line_fns:
-                fn_id = line_fns[-1][1]
-            fn_target = _resolve_footnote_target(fn_id, footnotes)
-            is_exempt = matched_line_text.strip().startswith(">") or has_exempt_marker(matched_line_text)
-            kind_val = (
-                extra.kind.lower()
-                if extra.kind and extra.kind.lower() in _VALID_LABEL_KINDS
-                else "reported"
-            )
-            if kind_val == "incidental":
-                kind_val = "reported"
-            period_val = normalize_period(extra.period) if extra.period else ""
-            if not period_val:
-                pm = _PERIOD_TOKEN_RE.search(matched_line_text)
-                if pm:
-                    period_val = normalize_period(pm.group(1))
-            metric_val = extra.metric or _extract_metric_from_context(
-                matched_line_text, raw_pos, raw_pos + len(raw_sub)
-            )
-
-            fig_counter += 1
-            new_fig = ExtractedFigure(
-                id=f"F-{fig_counter:03d}",
-                raw=raw_sub,
-                value=extra.value,
-                decimals=0,
-                unit=extra.unit or "pct",
-                scale=1.0,
-                currency=None,
-                metric=metric_val,
-                period=period_val,
-                label_hint=kind_val,
-                footnote_id=fn_id,
-                footnote_target=fn_target,
-                location={
-                    "line": matched_line_no,
-                    "table": False,
-                    "row": None,
-                    "col": None,
-                    "sentence": matched_line_text.strip(),
-                    "section": sec_title,
-                },
-                exempt=is_exempt,
-                exempt_reason="illustrative" if is_exempt else None,
-            )
-            figures.append(new_fig)
-            labeled_count += 1
-
-    incidental_excluded = sum(
-        1 for f in figures if not f.exempt and f.label_hint == "incidental"
-    )
-    if stats_out is not None:
-        stats_out.update(
-            {
-                "total": len(figures),
-                "labeled": labeled_count,
-                "batches": len(batches),
-                "failed_batches": failed_batches,
-                "failed_batch_details": failed_batch_details,
-                "incidental_excluded": incidental_excluded,
-                "llm_period_overrides": llm_period_overrides,
-            }
-        )
-
-    return figures, failed_batches == 0
+    return await asyncio.to_thread(_apply_label_results, batch_results)
 
 
 

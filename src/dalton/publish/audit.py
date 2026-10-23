@@ -7,12 +7,14 @@ import dataclasses
 import hashlib
 import logging
 import re
+import time
 from typing import Any
 
 from src.dalton.publish.match import (
     UNIT_BASE,
     MatchCandidate,
     MatchOutcome,
+    SourceParseCache,
     _RequiresModelCellOnly,
     apply_derived_figure_matching,
     match_figures,
@@ -33,6 +35,7 @@ from src.dalton.publish.numbers import (
     normalize_period,
     parse_facts_ledger,
 )
+from src.dalton.settings import get_dalton_config
 
 try:
     from src.dalton.llm.assist import assist_json
@@ -40,6 +43,8 @@ except ImportError:  # pragma: no cover
     assist_json = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
+
+_DEADLINE_GRACE_S = 5.0
 _EXEMPT_MARKERS_PROMPT = ", ".join(f"`{m}`" for m in EXEMPT_MARKERS)
 
 REASON_ZH: dict[str, str] = {
@@ -420,6 +425,7 @@ async def judge_figures_batch_with_llm(
     user_id: str,
     workspace_id: str | None = None,
     thread_id: str | None = None,
+    deadline: float | None = None,
 ) -> dict[int, tuple[str, dict[str, Any]]]:
     """Run grounded LLM source-consistency judgment (`audit.judge`) for a batch of up to 10 figures in one section (P0I §1.6)."""
     if not user_id or not str(user_id).strip():
@@ -489,6 +495,7 @@ async def judge_figures_batch_with_llm(
         "from inside `quote` that names the metric. "
         f"3) Only return `exempt` if the draft `sentence` itself explicitly contains one of: {_EXEMPT_MARKERS_PROMPT}."
     )
+    pub = get_dalton_config().publish
     res = await assist_json(
         task="audit.judge",
         instructions=judge_instructions,
@@ -497,11 +504,10 @@ async def judge_figures_batch_with_llm(
         user_id=user_id,
         workspace_id=workspace_id,
         thread_id=thread_id,
-        role="audit",
-        timeout_s=300.0,
-        # Subscription models: a call that timed out may be re-sent rather than
-        # refused as "possibly billed", or a re-run after a timeout fails at once.
-        resend_indeterminate=True,
+        timeout_s=pub.audit_timeout_s,
+        model=pub.audit_model,
+        fallback_models=pub.audit_fallback_models,
+        deadline=deadline,
     )
     if not res.ok or not isinstance(res.data, dict):
         err_msg = res.error or "assist_failed"
@@ -516,8 +522,16 @@ async def judge_figures_batch_with_llm(
             for idx, _, _ in batch_items
         }
 
+    return await asyncio.to_thread(_verify_judge_items, batch_items, res.data, local_map)
+
+
+def _verify_judge_items(
+    batch_items: list[tuple[int, ExtractedFigure, list[dict[str, Any]]]],
+    data: dict[str, Any],
+    local_map: dict[str, tuple[int, ExtractedFigure, list[dict[str, Any]]]],
+) -> dict[int, tuple[str, dict[str, Any]]]:
     results: dict[int, tuple[str, dict[str, Any]]] = {}
-    raw_items = res.data.get("items") or res.data.get("verdicts")
+    raw_items = data.get("items") or data.get("verdicts")
     if isinstance(raw_items, list):
         for v_item in raw_items:
             if not isinstance(v_item, dict):
@@ -530,9 +544,9 @@ async def judge_figures_batch_with_llm(
                 continue
             idx, fig, cands = target_tuple
             results[idx] = verify_llm_judge_verdict(fig, v_item, cands)
-    elif "verdict" in res.data and len(batch_items) == 1:
+    elif "verdict" in data and len(batch_items) == 1:
         idx, fig, cands = batch_items[0]
-        results[idx] = verify_llm_judge_verdict(fig, res.data, cands)
+        results[idx] = verify_llm_judge_verdict(fig, data, cands)
 
     for idx, _, _ in batch_items:
         if idx not in results:
@@ -707,16 +721,23 @@ async def aaudit_draft(
     user_id: str,
     workspace_id: str | None = None,
     thread_id: str | None = None,
-    total_timeout_s: float = 120.0,
 ) -> AuditResult:
     """Async 4-step figure audit (P0H §1.2 / P0I §1): Step A extract -> Step B LLM label -> Step C match -> Step D LLM judge + anchor."""
     if not user_id or not str(user_id).strip():
         raise ValueError("user_id is required")
     user_id = str(user_id).strip()
+    pub = get_dalton_config().publish
+    if use_llm_judge and not (pub.audit_model or "").strip():
+        raise ValueError("数字核验未配置模型：请在 dalton.yaml 的 publish.audit_model 指定。")
+    # One budget for the whole audit, from here on: extraction, labelling, matching and
+    # judging. Model calls past it send nothing new (journalled results still replay),
+    # so the run ends near the deadline however calls fail.
+    deadline = time.monotonic() + pub.audit_total_timeout_s
+    source_cache = SourceParseCache()
     draft_sha = hashlib.sha256(draft_markdown.encode("utf-8")).hexdigest()
-    # CPU-bound steps run off the event loop: on a long draft they took minutes and
-    # starved every request (health checks included) until the watchdog restarted
-    # the backend mid-turn.
+    # The pure CPU steps below run in a worker thread: on a long draft they take
+    # minutes, and on the event loop they starved every request, including /health,
+    # until the watchdog restarted the backend mid-turn.
     extracted = await asyncio.to_thread(extract_figures, draft_markdown)
     labeling_incomplete = False
     labeling_stats: dict[str, Any] = {}
@@ -730,6 +751,7 @@ async def aaudit_draft(
             workspace_id=workspace_id,
             thread_id=thread_id,
             stats_out=labeling_stats,
+            deadline=deadline,
         )
         labeling_incomplete = not labeling_ok
 
@@ -745,37 +767,23 @@ async def aaudit_draft(
         provenance_records=provenance_records,
         facts_ledger=facts_ledger,
         metric_aliases=metric_aliases,
+        source_cache=source_cache,
     )
 
     # Step D: Section-batched concurrent LLM judge (`Semaphore(4)`, <=10 figs/batch) + code anchoring (P0I §1.5–§1.6)
     if use_llm_judge:
-        sem = asyncio.Semaphore(4)
-        pending_by_section: dict[str, list[tuple[int, ExtractedFigure, list[dict[str, Any]]]]] = {}
-        pending_cands_by_idx: dict[int, list[dict[str, Any]]] = {}
-
-        def _collect_candidates() -> None:
-            for idx, out in enumerate(outcomes):
-                fig = out.figure
-                if fig.exempt or out.matched or fig.label_hint == "incidental":
-                    continue
-                if (fig.footnote_target and _RequiresModelCellOnly(fig)) or out.reason in CONTRADICTED_REASONS:
-                    continue
-                cand_sources = retrieve_candidate_sources(
-                    fig,
-                    thesis_doc=thesis_doc,
-                    models_doc=models_doc,
-                    model_cells=model_cells,
-                    provenance_records=provenance_records,
-                    facts_ledger=facts_ledger,
-                    metric_aliases=metric_aliases,
-                )
-                if not cand_sources:
-                    continue
-                pending_cands_by_idx[idx] = cand_sources
-                sec_key = str(fig.location.get("section") or "")
-                pending_by_section.setdefault(sec_key, []).append((idx, fig, cand_sources))
-
-        await asyncio.to_thread(_collect_candidates)
+        sem = asyncio.Semaphore(pub.audit_concurrency)
+        pending_by_section, pending_cands_by_idx = await asyncio.to_thread(
+            _collect_judge_candidates,
+            outcomes,
+            thesis_doc=thesis_doc,
+            models_doc=models_doc,
+            model_cells=model_cells,
+            provenance_records=provenance_records,
+            facts_ledger=facts_ledger,
+            metric_aliases=metric_aliases,
+            source_cache=source_cache,
+        )
 
         section_batches: list[tuple[str, list[tuple[int, ExtractedFigure, list[dict[str, Any]]]]]] = []
         for sec_key, sec_items in pending_by_section.items():
@@ -793,6 +801,7 @@ async def aaudit_draft(
                     user_id=user_id,
                     workspace_id=workspace_id,
                     thread_id=thread_id,
+                    deadline=deadline,
                 )
             for idx, fig, _ in batch_items:
                 out = outcomes[idx]
@@ -834,9 +843,11 @@ async def aaudit_draft(
                         candidates=out.candidates,
                     )
 
-        total_pending_figs = len(pending_cands_by_idx)
         if section_batches:
-            eff_timeout_s = min(900.0, max(120.0, float(total_timeout_s), total_pending_figs * 2.0))
+            # The rest of the audit-wide budget, not one call's timeout: a batch may run
+            # the whole fallback chain. Calls are capped to the deadline themselves; the
+            # grace lets the last ones return their result instead of being cancelled.
+            eff_timeout_s = max(0.0, deadline - time.monotonic()) + _DEADLINE_GRACE_S
 
             task_to_indices: dict[asyncio.Task[None], list[int]] = {}
             tasks: list[asyncio.Task[None]] = []
@@ -913,6 +924,46 @@ async def aaudit_draft(
         labeling_incomplete=labeling_incomplete,
         labeling_stats=labeling_stats,
     )
+
+
+def _collect_judge_candidates(
+    outcomes: list[MatchOutcome],
+    *,
+    thesis_doc: dict[str, Any] | None,
+    models_doc: dict[str, Any] | None,
+    model_cells: dict[str, dict[str, Any]] | None,
+    provenance_records: dict[str, dict[str, Any]] | None,
+    facts_ledger: dict[str, dict[str, Any]],
+    metric_aliases: dict[str, list[str]] | None,
+    source_cache: SourceParseCache | None = None,
+) -> tuple[
+    dict[str, list[tuple[int, ExtractedFigure, list[dict[str, Any]]]]],
+    dict[int, list[dict[str, Any]]],
+]:
+    pending_by_section: dict[str, list[tuple[int, ExtractedFigure, list[dict[str, Any]]]]] = {}
+    pending_cands_by_idx: dict[int, list[dict[str, Any]]] = {}
+    for idx, out in enumerate(outcomes):
+        fig = out.figure
+        if fig.exempt or out.matched or fig.label_hint == "incidental":
+            continue
+        if (fig.footnote_target and _RequiresModelCellOnly(fig)) or out.reason in CONTRADICTED_REASONS:
+            continue
+        cand_sources = retrieve_candidate_sources(
+            fig,
+            thesis_doc=thesis_doc,
+            models_doc=models_doc,
+            model_cells=model_cells,
+            provenance_records=provenance_records,
+            facts_ledger=facts_ledger,
+            metric_aliases=metric_aliases,
+            source_cache=source_cache,
+        )
+        if not cand_sources:
+            continue
+        pending_cands_by_idx[idx] = cand_sources
+        sec_key = str(fig.location.get("section") or "")
+        pending_by_section.setdefault(sec_key, []).append((idx, fig, cand_sources))
+    return pending_by_section, pending_cands_by_idx
 
 
 def render_audit_md(audit: AuditResult, *, draft_path: str = "") -> str:

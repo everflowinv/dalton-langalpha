@@ -406,6 +406,10 @@ async def test_g31_counterexamples_units_footnotes_tables_and_sec_accession(
         workspace_id: str | None = None,
         thread_id: str | None = None,
         resend_indeterminate: bool = False,
+        persist_raw: bool = True,
+        skip_journal: bool = False,
+        fallback_models: list[str] | None = None,
+        deadline: float | None = None,
     ) -> AssistResult:
         if task == "audit.label_figures":
             return AssistResult(
@@ -1737,7 +1741,9 @@ async def test_p0j_j2_assist_fallback_unified_and_role_policy_family_check(
         res = await assist_mod.assist_json("audit.label_figures", "Label figures", {"figures": []}, schema, user_id="local-dev-user")
     assert res.ok is True
     assert res.model == "deepseek-flash"
-    assert len(calls) == 2 and calls[0] != "deepseek-flash" and calls[1] == "deepseek-flash"
+    # Every configured fallback before deepseek-flash fails pre-send too, so it is tried last.
+    assert calls[0] != "deepseek-flash" and calls[-1] == "deepseek-flash"
+    assert len(calls) == 1 + len(assist_mod.resolve_assist_fallback_models())
     assert any("switching to assist_fallback=deepseek-flash" in r.message for r in caplog.records)
 
     # Non-fallbackable statuses/error_kinds MUST NOT trigger fallback
@@ -1768,7 +1774,7 @@ async def test_p0j_j2_assist_fallback_unified_and_role_policy_family_check(
         mock_complete.side_effect = _no_fb_effect
         res_no_fb = await assist_mod.assist_json("audit.label_figures", "Label figures", {"figures": []}, schema, user_id="local-dev-user")
         assert res_no_fb.ok is False
-        assert len(calls) == 1 and calls[0] not in ("deepseek-flash", "ocb-deepseek-deepseek-flash"), (
+        assert len(calls) == 1 and calls[0] not in assist_mod.resolve_assist_fallback_models(), (
             f"Unexpected fallback for {non_fb_status}/{non_fb_kind}: {calls}"
         )
 
@@ -1789,9 +1795,10 @@ async def test_p0j_j2_assist_fallback_unified_and_role_policy_family_check(
     mock_complete.side_effect = _all_fail_effect
     res_all_fail = await assist_mod.assist_json("audit.label_figures", "Label figures", {"figures": []}, schema, user_id="local-dev-user")
     assert res_all_fail.ok is False
-    assert calls[1:] == ["deepseek-flash", "ocb-deepseek-deepseek-flash"] and calls[0] != "deepseek-flash"
-    assert res_all_fail.model == "ocb-deepseek-deepseek-flash"
-    assert "ocb-deepseek-deepseek-flash" in (res_all_fail.error or "")
+    fbs = assist_mod.resolve_assist_fallback_models()
+    assert calls[1:] == fbs and calls[0] not in fbs
+    assert res_all_fail.model == fbs[-1]
+    assert fbs[-1] in (res_all_fail.error or "")
 
     # Role policy: assist_fallback (from DALTON_ASSIST_FALLBACK_MODEL / dalton.yaml) compared against ALL reviewer_models
     base_role_cfg = {

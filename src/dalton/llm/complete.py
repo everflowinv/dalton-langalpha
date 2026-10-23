@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 import hashlib
 import json
 import logging
@@ -243,6 +244,10 @@ def compute_call_costs(
     return calc_cost, Decimal("0")
 
 
+class DeadlineBeforeSendError(Exception):
+    """The caller's deadline passed before the request went upstream: nothing was sent."""
+
+
 def _classify_exception(
     exc: BaseException,
     *,
@@ -257,6 +262,8 @@ def _classify_exception(
         - `('failed', 'http_4xx')` on explicit 400/401/403/404 rejection without charge
         - `('indeterminate', ...)` on timeout, 429, 5xx, stream cut, or unknown mid-flight error
     """
+    if isinstance(exc, DeadlineBeforeSendError):
+        return "failed", "deadline"
     if isinstance(exc, ( asyncio.TimeoutError, TimeoutError)):
         return "indeterminate", "timeout"
 
@@ -619,8 +626,15 @@ async def dalton_complete(
     disable_tracing: bool = True,
     persist_raw: bool = True,
     skip_journal: bool = False,
+    deadline: float | None = None,
 ) -> DaltonCompleteResult:
-    """Execute a server-side one-shot LLM call with budget gating and Postgres journal idempotency (G1.3, P0N.7)."""
+    """Execute a server-side one-shot LLM call with budget gating and Postgres journal idempotency (G1.3, P0N.7).
+
+    ``deadline`` (``time.monotonic``) bounds only a new upstream send: the journal is
+    consulted first, so a finished call still replays after the deadline; the time
+    left is re-read just before sending (after the journal, claim and config waits)
+    and caps the model timeout.
+    """
     effective_model = (model or request_model or "").strip()
     if not effective_model:
         effective_model = "deepseek-flash" if slot == "background" else "claude-opus-5-5-oauth"
@@ -864,6 +878,11 @@ async def dalton_complete(
             else None
         )
 
+        send_timeout_s = timeout_s
+        if deadline is not None:
+            send_timeout_s = min(timeout_s, deadline - time.monotonic())
+            if send_timeout_s <= 0:
+                raise DeadlineBeforeSendError("deadline reached before the request was sent")
         raw_result = await asyncio.wait_for(
             llm_service.complete(
                 user_id=user_id,
@@ -877,7 +896,7 @@ async def dalton_complete(
                 disable_tracing=disable_tracing,
                 return_token_usage=True,
             ),
-            timeout=timeout_s,
+            timeout=send_timeout_s,
         )
         llm_call_completed = True
 
