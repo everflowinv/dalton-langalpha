@@ -30,6 +30,7 @@ ALLOWED_HOOKS=(
   "oauth-dispatch"
   "provider-kill-switch"
   "native-oauth-ui"
+  "sandbox-port-bind"
   "catalog-cache"
   "router"
   "budget-gate"
