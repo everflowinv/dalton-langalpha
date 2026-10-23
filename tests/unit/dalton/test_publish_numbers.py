@@ -405,6 +405,7 @@ async def test_g31_counterexamples_units_footnotes_tables_and_sec_accession(
         llm_service: Any = None,
         workspace_id: str | None = None,
         thread_id: str | None = None,
+        resend_indeterminate: bool = False,
     ) -> AssistResult:
         if task == "audit.label_figures":
             return AssistResult(

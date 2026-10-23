@@ -1376,7 +1376,11 @@ async def label_figures_with_status(
                 user_id=user_id,
                 workspace_id=workspace_id,
                 thread_id=thread_id,
-                timeout_s=90.0,
+                role="audit",
+                timeout_s=300.0,
+                # Subscription models: a call that timed out may be re-sent rather than
+                # refused as "possibly billed", or a re-run after a timeout fails at once.
+                resend_indeterminate=True,
             )
 
     batch_results = await asyncio.gather(*[_call_label_batch(pb[8]) for pb in prepared_batches])
