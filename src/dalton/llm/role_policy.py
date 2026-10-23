@@ -193,7 +193,18 @@ async def explain_model_availability(
         for prov_key in _OAUTH_PROVIDER_TOKEN_KEYS:
             try:
                 st = await get_oauth_status(user_id, prov_key)
-                oauth_connected[prov_key] = bool(st and st.get("connected"))
+                connected = bool(st and st.get("connected"))
+                if connected and prov_key == "muse-oauth":
+                    from src.dalton.llm.providers.muse.oauth import (
+                        is_invalidated_muse_token,
+                        is_minted_muse_token,
+                    )
+
+                    if is_invalidated_muse_token(st) or (
+                        isinstance(st, dict) and "account_id" in st and not is_minted_muse_token(st)
+                    ):
+                        connected = False
+                oauth_connected[prov_key] = connected
             except Exception:
                 oauth_connected[prov_key] = False
     except Exception:

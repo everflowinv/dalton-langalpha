@@ -85,6 +85,37 @@ export function ProviderRow({ item }: { item: DaltonProviderStatusItem }) {
     return `余 ${hours}h`;
   };
 
+  const formatLocalResetTime = (raw: string | number | null | undefined): string | null => {
+    if (raw == null || raw === '') return null;
+    let d: Date;
+    if (typeof raw === 'number') {
+      d = new Date(raw < 1e12 ? raw * 1000 : raw);
+    } else if (/^\d+$/.test(String(raw).trim())) {
+      const n = Number(String(raw).trim());
+      d = new Date(n < 1e12 ? n * 1000 : n);
+    } else {
+      d = new Date(raw);
+    }
+    if (Number.isNaN(d.getTime())) return String(raw);
+    return d.toLocaleString();
+  };
+
+  const isMuse = item.provider === 'muse-oauth';
+  const museSubsActive = item.is_subs_active ?? item.credential?.is_subs_active;
+  const museTierName = item.subs_tier_name ?? item.credential?.subs_tier_name;
+  const museUsage = item.subs_usage ?? item.credential?.subs_usage;
+  const museWindow = museUsage?.window;
+  const museWeekly = museUsage?.weekly;
+  const museWindowReset = formatLocalResetTime(museWindow?.resets_at);
+  const museWeeklyReset = formatLocalResetTime(museWeekly?.resets_at);
+
+  const showMuseSubsStatus =
+    isMuse && (typeof museSubsActive === 'boolean' || Boolean(museTierName));
+  const showMuseWindow =
+    isMuse && museWindow?.used_percent != null && museWindowReset != null;
+  const showMuseWeekly =
+    isMuse && museWeekly?.used_percent != null && museWeeklyReset != null;
+
   return (
     <div
       className="rounded-md px-3 py-2.5 flex flex-col gap-1.5"
@@ -218,6 +249,35 @@ export function ProviderRow({ item }: { item: DaltonProviderStatusItem }) {
           </span>
         )}
       </div>
+
+      {/* Muse subscription & quota usage line */}
+      {(showMuseSubsStatus || showMuseWindow || showMuseWeekly) && (
+        <div
+          className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px]"
+          style={{ color: 'var(--color-text-secondary)' }}
+          data-testid="dalton-muse-subs-usage"
+        >
+          {showMuseSubsStatus && (
+            <span>
+              {typeof museSubsActive === 'boolean'
+                ? `订阅：${museSubsActive ? '有效' : '未生效'}${
+                    museTierName ? ` (${museTierName})` : ''
+                  }`
+                : `订阅：${museTierName}`}
+            </span>
+          )}
+          {showMuseWindow && (
+            <span>
+              5 小时窗口已用 {museWindow!.used_percent}%，{museWindowReset} 重置
+            </span>
+          )}
+          {showMuseWeekly && (
+            <span>
+              本周已用 {museWeekly!.used_percent}%，{museWeeklyReset} 重置
+            </span>
+          )}
+        </div>
+      )}
 
       {/* Warnings */}
       {(item.warnings ?? []).map((w, idx) => (
