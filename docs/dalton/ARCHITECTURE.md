@@ -33,7 +33,7 @@ Dalton 是构建在开源项目 LangAlpha 之上的基金研究分析师。LangA
   └─ 对话归档（每天 21:15） conversation_archive.py run（launchd: com.dalton.conversation-archive）
 
 Docker（colima，数据盘在 EveSSD）
-  ├─ backend   FastAPI + LangGraph，127.0.0.1:8000；挂载 src、scripts、plugins、libs、workflows、config/dalton
+  ├─ backend   FastAPI + LangGraph，127.0.0.1:8000；挂载 src、scripts、plugins、mcp_servers、migrations、libs/market-protocol、workflows、config/dalton、var/dalton
   ├─ postgres  dalton-postgres:18-pgvector
   ├─ redis
   ├─ frontend  127.0.0.1:5173（开发）；生产包 web/dist 由 edge 提供
@@ -87,7 +87,7 @@ Docker（colima，数据盘在 EveSSD）
 `publish_report`（`src/dalton/tools/publish_tools.py`）对应的状态机在 `src/dalton/publish/service.py`，状态保存在 `dalton_publish_requests` 表：
 
 1. **数字核验**：报告里的每个数字，都要对照 thesis 的证据、模型单元格、来源记录和事实底表，最后由 LLM 判定。只要有未核实或互相矛盾的数字，状态就是 `audit_failed`。
-2. **独立审稿**：审稿人必须和作者属于不同的模型家族（`src/dalton/publish/review.py`），按 7 项检查。审稿意见为"需修改"时，状态是 `review_revise`。
+2. **独立审稿**：审稿人从 `publish.reviewer_models`（`src/dalton/dalton.yaml`）里挑，必须和作者属于不同的模型家族（`src/dalton/publish/review.py`），按 7 项检查。审稿意见为"需修改"时，状态是 `review_revise`。
 3. **PM 审批**：
    - 交互式线程里会弹出审批卡片（`PublishApprovalCard.tsx`，钩子 `publish-card`）；
    - 自动任务里不打断，状态停在 `awaiting_pm`，并在议程里加一项待审批；
@@ -143,7 +143,7 @@ Docker（colima，数据盘在 EveSSD）
   - 额度按每块 1 美元预留，租期 300 秒。
 - **只有现金花费计入额度。** `*-oauth` 模型和标记为 subscription 的模型只记名义成本。Coding Plan 的 GLM 配了价格为 0 的价格卡，这样每条计费路径算出来的现金都是 0。
 - 预检发现额度用完时，跳过本次唤醒；一次性任务顺延一天。
-- 相关代码：钩子 `budget-gate`、`budget-admission`；接口 `/budget*`；设置页的 `DaltonBudgetCard`。
+- 相关代码：钩子 `budget-gate`、`budget-admission`；接口 `/api/v1/dalton/budget*`；设置页的 `DaltonBudgetCard`。
 
 ## 8. 模型接入
 
@@ -188,7 +188,8 @@ Docker（colima，数据盘在 EveSSD）
 - 资料库探测"最新一条"的方式：
   - tmtb、funda-ai、company-wiki 用按时间排序的 `list`；
   - alphaengine、guidepoint、sales-notes 用 30 天窗口搜索；transcript 用 120 天窗口，因为电话会按季度开；
-  - `all` 取它实际查询的六个来源中最新的日期。
+  - `all` 取它实际查询的六个来源中最新的日期；
+  - last30days 调用成本高，不做自动探测，状态固定为 `unprobed`。
 - 港股公告走 `cn-hk` 路线的 `filings` 操作（巨潮的 hke 栏目），覆盖率大约 95%；仅英文版的公告和股东大会投票结果，退回 `site:hkexnews.hk` 搜索。
 
 **其他数据入口**：
@@ -215,7 +216,7 @@ Docker（colima，数据盘在 EveSSD）
 - 程序会做兜底校验：数字、期间、币种、专名、结论词、ticker；
 - 向量化后存入 `dalton_conversation_cards`（pgvector），用 `content_hash` 去重。
 
-**使用**：分析师和 Chief of Staff 都可以用 `conversation_search` 检索卡片。检索方式是向量、trigram 和 RRF 混合排序，带 180 天半衰期的时间衰减。卡片还会按天渲染到各公司工作区的 `conversations/<日期>.md` 中。
+**使用**：分析师和 Chief of Staff 都可以用 `conversation_search` 检索卡片。检索方式是向量、trigram 和 RRF 混合排序，带 180 天半衰期的时间衰减。卡片还会按天渲染成文件：只涉及一家公司、并且这家公司已有工作区的卡片，写到该工作区的 `conversations/<日期>.md`；跨公司主题的卡片，以及还没有工作区的公司的卡片，写到 Home 的 `research/topics/conversations/<日期>.md`（`src/dalton/conversations/render.py`）。
 
 **调度**：每天 21:15 由 launchd 运行（宿主机上的脚本）。抽取版本由 `conversations.prompt_version` 控制。
 
@@ -241,7 +242,7 @@ Docker（colima，数据盘在 EveSSD）
 
 1. 部署用的 checkout 在 `~/Projects/dalton-langalpha`（`dalton/main`），先 fast-forward 到最新。
 2. 后端：
-   - `src`、`scripts`、`plugins`、`libs` 是 bind mount 进容器的，只改了代码时，`docker restart dalton-langalpha-backend-1` 就够了；
+   - `src`、`scripts`、`plugins`、`mcp_servers`、`libs/market-protocol` 等是 bind mount 进容器的，只改了这些目录下的代码时，`docker restart dalton-langalpha-backend-1` 就够了；
    - 改了 `.env` 时，必须执行 `docker compose -f docker-compose.yml -f docker-compose.dalton.yml up -d --no-deps backend` 重建容器，`restart` 不会重新读 `env_file`。
 3. 前端：`bash scripts/dalton/build_frontend_prod.sh --require-supabase`。
 4. 桥接层：`launchctl kickstart -k gui/$(id -u)/com.dalton.researchdata-bridge`。
@@ -254,8 +255,8 @@ Docker（colima，数据盘在 EveSSD）
 | 检查项 | 位置 |
 |---|---|
 | 后端 | `/health` |
-| 供应商状态 | `/providers/status` |
-| 今日预算 | `/budget/today` |
+| 供应商状态 | `/api/v1/dalton/providers/status` |
+| 今日预算 | `/api/v1/dalton/budget/today` |
 | 桥接层 | `/healthz`，含 xreach 版本 |
 | 数据地图 | `dalton_data_source_health` 表 |
 
