@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import hashlib
+import hmac
+import json
 import logging
 import re
 import time
@@ -34,13 +36,14 @@ from src.dalton.publish.numbers import (
     match_ltm_periods,
     normalize_period,
     parse_facts_ledger,
+    parse_footnotes,
 )
 from src.dalton.llm.model_prefs import (
     resolve_dalton_audit_fallback_models,
     resolve_dalton_audit_model,
     resolve_dalton_audit_timeout_s,
 )
-from src.dalton.settings import get_dalton_config
+from src.dalton.settings import get_dalton_audit_cache_hmac_key, get_dalton_config
 
 try:
     from src.dalton.llm.assist import assist_json
@@ -60,6 +63,272 @@ REASON_ZH: dict[str, str] = {
 }
 
 CONTRADICTED_REASONS = frozenset({"source_conflict"})
+
+AUDIT_PROMPT_VERSION = "audit_v1"
+_AUDIT_CACHE_TAG_RE = re.compile(r"<!--\s*dalton:audit-cache\b")
+_AUDIT_CACHE_RE = re.compile(
+    r"<!--\s*dalton:audit-cache\s*\n(.*?)\n-->",
+    re.DOTALL,
+)
+_REQUIRED_CACHE_STR_KEYS = (
+    "draft_sha256",
+    "inputs_sha256",
+    "config_sha256",
+    "audit_model",
+    "prompt_version",
+)
+_REQUIRED_CACHE_INT_KEYS = ("figures", "matched", "exempt")
+_REQUIRED_CACHE_LIST_KEYS = (
+    "unmatched",
+    "matches",
+    "contradicted",
+    "unverified",
+    "uncertain",
+    "incidental",
+)
+_REQUIRED_CACHE_KEYS = (
+    *_REQUIRED_CACHE_STR_KEYS,
+    *_REQUIRED_CACHE_INT_KEYS,
+    *_REQUIRED_CACHE_LIST_KEYS,
+    "labeling_incomplete",
+    "labeling",
+)
+
+
+def _sign_audit_cache_payload(
+    payload: dict[str, Any], *, hmac_key: bytes | None = None
+) -> str | None:
+    """Compute HMAC-SHA256 signature over the canonical JSON representation of ``payload``."""
+    key = hmac_key if hmac_key is not None else get_dalton_audit_cache_hmac_key()
+    if key is None:
+        return None
+    canonical = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hmac.new(
+        key,
+        canonical,
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _validate_and_verify_cache_payload(
+    cached: Any, *, hmac_key: bytes | None = None
+) -> dict[str, Any] | None:
+    """Validate field presence, types, and HMAC-SHA256 signature of a parsed audit cache dict."""
+    key = hmac_key if hmac_key is not None else get_dalton_audit_cache_hmac_key()
+    if key is None:
+        return None
+    if not isinstance(cached, dict):
+        return None
+    sig = cached.get("hmac_sha256")
+    if not isinstance(sig, str) or not sig:
+        return None
+    expected_keys = set(_REQUIRED_CACHE_KEYS) | {"hmac_sha256"}
+    if set(cached.keys()) != expected_keys:
+        return None
+    for k in _REQUIRED_CACHE_STR_KEYS:
+        if not isinstance(cached.get(k), str):
+            return None
+    for k in _REQUIRED_CACHE_INT_KEYS:
+        val = cached.get(k)
+        if not isinstance(val, int) or isinstance(val, bool) or val < 0:
+            return None
+    for k in _REQUIRED_CACHE_LIST_KEYS:
+        val = cached.get(k)
+        if not isinstance(val, list) or not all(isinstance(x, dict) for x in val):
+            return None
+    if not isinstance(cached.get("labeling_incomplete"), bool):
+        return None
+    if not isinstance(cached.get("labeling"), dict):
+        return None
+    if cached["matched"] != len(cached["matches"]):
+        return None
+    if cached["unmatched"] != (cached["contradicted"] + cached["unverified"]):
+        return None
+
+    unsigned = {k: cached[k] for k in _REQUIRED_CACHE_KEYS}
+    expected_sig = _sign_audit_cache_payload(unsigned, hmac_key=key)
+    if not expected_sig or not hmac.compare_digest(sig, expected_sig):
+        return None
+    return unsigned
+
+
+def format_conflict_lead(
+    contradicted_items: list[dict[str, Any]],
+    contradicted_count: int | None = None,
+) -> str:
+    """Return a leading conflict alert sentence when ``contradicted_count > 0``."""
+    cnt = (
+        len(contradicted_items)
+        if contradicted_count is None
+        else int(contradicted_count)
+    )
+    if cnt <= 0:
+        return ""
+    ids = [
+        str(item.get("id")).strip()
+        for item in contradicted_items
+        if isinstance(item, dict) and item.get("id")
+    ]
+    if ids:
+        return f"发现 {cnt} 处冲突（{'、'.join(ids)}）。"
+    return f"发现 {cnt} 处冲突。"
+
+
+def format_audit_counts_phrase(
+    verified: int,
+    contradicted: int,
+    unverified: int,
+    not_required: int,
+) -> str:
+    """Format the canonical 4-bucket figure audit breakdown."""
+    return (
+        f"已核实 {verified} / 冲突 {contradicted} / "
+        f"未核实 {unverified} / 不需核实 {not_required}"
+    )
+
+
+def format_audit_summary_from_dict(
+    audit_info: dict[str, Any] | None,
+    *,
+    audit_path: str | None = None,
+) -> str:
+    """Format a unified audit summary string from an ``AuditResult.to_dict()`` dictionary."""
+    if not isinstance(audit_info, dict) or not audit_info:
+        return ""
+    verified_cnt = int(audit_info.get("verified", audit_info.get("matched", 0)) or 0)
+    contradicted_items = [
+        x for x in (audit_info.get("contradicted_items") or []) if isinstance(x, dict)
+    ]
+    if "contradicted" in audit_info and audit_info.get("contradicted") is not None:
+        contradicted_cnt = int(audit_info.get("contradicted") or 0)
+    elif contradicted_items:
+        contradicted_cnt = len(contradicted_items)
+    else:
+        contradicted_cnt = sum(
+            1
+            for u in (audit_info.get("unmatched") or [])
+            if isinstance(u, dict) and u.get("reason") in CONTRADICTED_REASONS
+        )
+        if not contradicted_items:
+            contradicted_items = [
+                u
+                for u in (audit_info.get("unmatched") or [])
+                if isinstance(u, dict) and u.get("reason") in CONTRADICTED_REASONS
+            ]
+    if "unverified" in audit_info and audit_info.get("unverified") is not None:
+        unverified_cnt = int(audit_info.get("unverified") or 0)
+    elif "unverified_items" in audit_info:
+        unverified_cnt = len(audit_info.get("unverified_items") or [])
+    else:
+        unmatched_all = list(audit_info.get("unmatched") or [])
+        unverified_cnt = max(0, len(unmatched_all) - contradicted_cnt)
+    if "uncertain" in audit_info and audit_info.get("uncertain") is not None:
+        uncertain_cnt = int(audit_info.get("uncertain") or 0)
+    else:
+        uncertain_cnt = len(audit_info.get("uncertain_items") or [])
+    exempt_cnt = int(audit_info.get("exempt") or 0)
+    if isinstance(audit_info.get("incidental"), list):
+        incidental_cnt = len(audit_info["incidental"])
+    elif "incidental" in audit_info and audit_info.get("incidental") is not None:
+        incidental_cnt = int(audit_info.get("incidental") or 0)
+    else:
+        incidental_cnt = len(audit_info.get("incidental_items") or [])
+    not_required_cnt = int(
+        audit_info.get("not_required", exempt_cnt + incidental_cnt) or 0
+    )
+    total_cnt = (
+        verified_cnt
+        + contradicted_cnt
+        + unverified_cnt
+        + not_required_cnt
+        + uncertain_cnt
+    )
+    lead = format_conflict_lead(contradicted_items, contradicted_cnt)
+    counts = format_audit_counts_phrase(
+        verified_cnt,
+        contradicted_cnt,
+        unverified_cnt,
+        not_required_cnt,
+    )
+    unc_part = (
+        f"（另有未能判断 {uncertain_cnt}，不计入以上四项）"
+        if uncertain_cnt
+        else ""
+    )
+    arrow = f" → {audit_path}" if audit_path else ""
+    return f"{lead}共 {total_cnt} 个数字：{counts}{unc_part}{arrow}"
+
+
+def compute_audit_inputs_sha256(
+    *,
+    draft_markdown: str = "",
+    facts_markdown: str | None = None,
+    thesis_doc: dict[str, Any] | None = None,
+    models_doc: dict[str, Any] | None = None,
+    model_cells: dict[str, dict[str, Any]] | None = None,
+    provenance_records: dict[str, dict[str, Any]] | None = None,
+    metric_aliases: dict[str, list[str]] | None = None,
+) -> str:
+    """Compute a deterministic SHA-256 over citation table and facts/ledger/knowledge inputs."""
+    payload = {
+        "footnotes": parse_footnotes(draft_markdown) if draft_markdown else {},
+        "facts_markdown": facts_markdown or "",
+        "facts_ledger": parse_facts_ledger(facts_markdown or ""),
+        "thesis_doc": thesis_doc or {},
+        "models_doc": models_doc or {},
+        "model_cells": model_cells or {},
+        "provenance_records": provenance_records or {},
+        "metric_aliases": metric_aliases or {},
+    }
+    encoded = json.dumps(
+        payload, sort_keys=True, ensure_ascii=False, default=str
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def compute_audit_config_fingerprint(
+    *,
+    use_llm_judge: bool = True,
+    prompt_version: str | None = None,
+    audit_model: str | None = None,
+    audit_fallback_models: list[str] | None = None,
+    audit_timeout_s: float | None = None,
+) -> tuple[str, list[str], str, str]:
+    """Return ``(model, fallback_models, prompt_version, config_sha256)`` for audit cache validation."""
+    pub = get_dalton_config().publish
+    eff_model = (
+        audit_model if audit_model is not None else (pub.audit_model or "")
+    ).strip()
+    eff_fallbacks = list(
+        audit_fallback_models if audit_fallback_models is not None else (pub.audit_fallback_models or [])
+    )
+    eff_timeout = float(audit_timeout_s if audit_timeout_s is not None else pub.audit_timeout_s)
+    if prompt_version is not None:
+        eff_prompt_version = prompt_version
+    elif getattr(pub, "prompt_version", "audit_v1") != "audit_v1":
+        eff_prompt_version = str(pub.prompt_version)
+    elif getattr(pub, "audit_prompt_version", "audit_v1") != "audit_v1":
+        eff_prompt_version = str(pub.audit_prompt_version)
+    else:
+        eff_prompt_version = AUDIT_PROMPT_VERSION
+    cfg_payload = {
+        "audit_model": eff_model,
+        "audit_fallback_models": eff_fallbacks,
+        "audit_timeout_s": eff_timeout,
+        "audit_total_timeout_s": float(pub.audit_total_timeout_s),
+        "audit_concurrency": int(pub.audit_concurrency),
+        "prompt_version": eff_prompt_version,
+        "use_llm_judge": bool(use_llm_judge),
+    }
+    cfg_sha = hashlib.sha256(
+        json.dumps(cfg_payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+    return eff_model, eff_fallbacks, eff_prompt_version, cfg_sha
 
 JUDGE_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -104,6 +373,27 @@ _CANONICAL_UNIT_TOKEN_RE = re.compile(
 )
 
 
+
+async def resolve_audit_config_fingerprint(
+    user_id: str,
+    *,
+    use_llm_judge: bool = True,
+    prompt_version: str | None = None,
+) -> tuple[str, list[str], str, str]:
+    """The config fingerprint for ``user_id``'s effective audit settings.
+
+    The audit runs on the per-user model, fallbacks and timeout (user, then the
+    team PM, then dalton.yaml), so a cached result may only be reused when
+    those resolved values — not the raw yaml — are unchanged.
+    """
+    return compute_audit_config_fingerprint(
+        use_llm_judge=use_llm_judge,
+        prompt_version=prompt_version,
+        audit_model=await resolve_dalton_audit_model(user_id),
+        audit_fallback_models=await resolve_dalton_audit_fallback_models(user_id),
+        audit_timeout_s=float(await resolve_dalton_audit_timeout_s(user_id)),
+    )
+
 def _normalize_ws(text: str) -> str:
     return " ".join((text or "").split())
 
@@ -125,6 +415,11 @@ class AuditResult:
     outcomes: list[MatchOutcome] = dataclasses.field(default_factory=list)
     labeling_incomplete: bool = False
     labeling: dict[str, Any] = dataclasses.field(default_factory=dict)
+    reused: bool = False
+    inputs_sha256: str = ""
+    config_sha256: str = ""
+    audit_model: str = ""
+    prompt_version: str = ""
 
     @property
     def passed(self) -> bool:
@@ -154,6 +449,13 @@ class AuditResult:
     def uncertain_count(self) -> int:
         return len(self.uncertain)
 
+    @property
+    def not_required_count(self) -> int:
+        return self.exempt + len(self.incidental)
+
+    def conflict_lead_sentence(self) -> str:
+        return format_conflict_lead(self.contradicted)
+
     def to_dict(self) -> dict[str, Any]:
         footnote_cnt = sum(
             1 for m in self.matches if m.get("verified_by") == "footnote"
@@ -176,6 +478,12 @@ class AuditResult:
             "uncertain": len(self.uncertain),
             "exempt": self.exempt,
             "incidental": len(self.incidental),
+            "not_required": self.not_required_count,
+            "reused": self.reused,
+            "inputs_sha256": self.inputs_sha256,
+            "config_sha256": self.config_sha256,
+            "audit_model": self.audit_model,
+            "prompt_version": self.prompt_version,
             "labeling_incomplete": self.labeling_incomplete,
             "labeling": self.labeling,
             "verified_by_counts": {
@@ -196,12 +504,7 @@ class AuditResult:
         }
 
     def summary_line(self, audit_path: str | None = None) -> str:
-        arrow = f" → {audit_path}" if audit_path else ""
-        unc_part = f", {len(self.uncertain)} uncertain" if self.uncertain else ""
-        return (
-            f"{self.figures} figures: {self.matched} matched, "
-            f"{self.exempt} exempt, {len(self.unmatched)} unverified{unc_part}{arrow}"
-        )
+        return format_audit_summary_from_dict(self.to_dict(), audit_path=audit_path)
 
 
 AuditReport = AuditResult
@@ -700,7 +1003,7 @@ def _build_audit_result(
 
     return AuditResult(
         draft_sha256=draft_sha,
-        figures=len(extracted) - len(incidental_list),
+        figures=len(extracted),
         matched=len(matched_list),
         exempt=exempt_count,
         unmatched=unmatched_blocking,
@@ -728,14 +1031,46 @@ async def aaudit_draft(
     user_id: str,
     workspace_id: str | None = None,
     thread_id: str | None = None,
+    previous_audit_md: str | None = None,
+    prompt_version: str | None = None,
 ) -> AuditResult:
     """Async 4-step figure audit (P0H §1.2 / P0I §1): Step A extract -> Step B LLM label -> Step C match -> Step D LLM judge + anchor."""
     if not user_id or not str(user_id).strip():
         raise ValueError("user_id is required")
     user_id = str(user_id).strip()
+    config_fp = await resolve_audit_config_fingerprint(
+        user_id, use_llm_judge=use_llm_judge, prompt_version=prompt_version
+    )
+    if previous_audit_md:
+        cached = try_load_reusable_audit_from_md(
+            previous_audit_md,
+            draft_markdown=draft_markdown,
+            thesis_doc=thesis_doc,
+            models_doc=models_doc,
+            model_cells=model_cells,
+            provenance_records=provenance_records,
+            facts_markdown=facts_markdown,
+            metric_aliases=metric_aliases,
+            use_llm_judge=use_llm_judge,
+            prompt_version=prompt_version,
+            config_fingerprint=config_fp,
+        )
+        if cached is not None:
+            return cached
     pub = get_dalton_config().publish
     if use_llm_judge and not (await resolve_dalton_audit_model(user_id)).strip():
         raise ValueError("数字核验未配置模型：请在 dalton.yaml 的 publish.audit_model 指定。")
+    eff_model, _eff_fallbacks, eff_prompt_ver, cfg_sha = config_fp
+    inputs_sha = await asyncio.to_thread(
+        compute_audit_inputs_sha256,
+        draft_markdown=draft_markdown,
+        facts_markdown=facts_markdown,
+        thesis_doc=thesis_doc,
+        models_doc=models_doc,
+        model_cells=model_cells,
+        provenance_records=provenance_records,
+        metric_aliases=metric_aliases,
+    )
     # One budget for the whole audit, from here on: extraction, labelling, matching and
     # judging. Model calls past it send nothing new (journalled results still replay),
     # so the run ends near the deadline however calls fail.
@@ -923,7 +1258,7 @@ async def aaudit_draft(
                     break
             outcomes[idx].candidates = merged_cands[:5]
 
-    return await asyncio.to_thread(
+    built = await asyncio.to_thread(
         _build_audit_result,
         draft_sha,
         extracted,
@@ -931,6 +1266,12 @@ async def aaudit_draft(
         labeling_incomplete=labeling_incomplete,
         labeling_stats=labeling_stats,
     )
+    built.reused = False
+    built.inputs_sha256 = inputs_sha
+    built.config_sha256 = cfg_sha
+    built.audit_model = eff_model
+    built.prompt_version = eff_prompt_ver
+    return built
 
 
 def _collect_judge_candidates(
@@ -951,9 +1292,19 @@ def _collect_judge_candidates(
     pending_cands_by_idx: dict[int, list[dict[str, Any]]] = {}
     for idx, out in enumerate(outcomes):
         fig = out.figure
-        if fig.exempt or out.matched or fig.label_hint == "incidental":
+        if (
+            fig.exempt
+            or out.matched
+            or out.lock_unverified
+            or fig.label_hint == "incidental"
+        ):
             continue
-        if (fig.footnote_target and _RequiresModelCellOnly(fig)) or out.reason in CONTRADICTED_REASONS:
+        if (
+            ((fig.footnote_target or fig.footnote_targets) and _RequiresModelCellOnly(fig))
+            or out.reason in CONTRADICTED_REASONS
+            or bool(fig.missing_citations)
+            or bool(fig.duplicate_citations)
+        ):
             continue
         cand_sources = retrieve_candidate_sources(
             fig,
@@ -975,17 +1326,34 @@ def _collect_judge_candidates(
 
 def render_audit_md(audit: AuditResult, *, draft_path: str = "") -> str:
     """Render the Chinese audit sidecar ``drafts/<slug>.audit.md`` sorted by line number (PK.9 / G3.1)."""
+    counts_str = format_audit_counts_phrase(
+        audit.matched,
+        len(audit.contradicted),
+        len(audit.unverified),
+        audit.not_required_count,
+    )
+    unc_str = (
+        f"（另有未能判断 {len(audit.uncertain)}，不计入以上四项）"
+        if audit.uncertain
+        else ""
+    )
+    summary_str = format_audit_summary_from_dict(audit.to_dict())
     lines = [
         f"# 数字核验报告（Draft Audit）：`{draft_path or 'draft'}`",
         "",
-        f"- **草稿哈希**：`{audit.draft_sha256[:16]}…`",
-        (
-            f"- **数字总数**：{audit.figures}（已核实 {audit.matched} ｜ 冲突 {len(audit.contradicted)} "
-            f"｜ 未核实 {len(audit.unverified)} ｜ 未能判断 {len(audit.uncertain)} ｜ 豁免 {audit.exempt}）"
-        ),
-        f"- **核验状态**：{'✅ 通过' if audit.passed else '❌ 存在未核实或冲突数字'}",
-        "",
     ]
+    conflict_lead = audit.conflict_lead_sentence()
+    if conflict_lead:
+        lines.extend([f"> ⚠️ **{conflict_lead}**", ""])
+    lines.extend(
+        [
+            f"- **核验摘要**：{summary_str}",
+            f"- **草稿哈希**：`{audit.draft_sha256[:16]}…`",
+            f"- **数字总数**：{audit.figures}（{counts_str}{unc_str}；豁免 {audit.exempt}、附带 {len(audit.incidental)}）",
+            f"- **核验状态**：{'✅ 通过' if audit.passed else '❌ 存在未核实或冲突数字'}",
+            "",
+        ]
+    )
 
     if audit.unmatched:
         lines.append("## 未核实与冲突数字清单（按行号排序）")
@@ -1036,7 +1404,127 @@ def render_audit_md(audit: AuditResult, *, draft_path: str = "") -> str:
             )
         lines.append("")
 
+    cache_payload = {
+        "draft_sha256": audit.draft_sha256,
+        "inputs_sha256": audit.inputs_sha256,
+        "config_sha256": audit.config_sha256,
+        "audit_model": audit.audit_model,
+        "prompt_version": audit.prompt_version,
+        "figures": audit.figures,
+        "matched": audit.matched,
+        "exempt": audit.exempt,
+        "unmatched": audit.unmatched,
+        "matches": audit.matches,
+        "contradicted": audit.contradicted,
+        "unverified": audit.unverified,
+        "uncertain": audit.uncertain,
+        "incidental": audit.incidental,
+        "labeling_incomplete": audit.labeling_incomplete,
+        "labeling": audit.labeling,
+    }
+    sig = _sign_audit_cache_payload(cache_payload)
+    if sig is not None:
+        signed_cache_payload = {
+            **cache_payload,
+            "hmac_sha256": sig,
+        }
+        cache_json = json.dumps(signed_cache_payload, ensure_ascii=False, sort_keys=True)
+        lines.append(f"<!-- dalton:audit-cache\n{cache_json}\n-->")
+    else:
+        logger.warning(
+            "DALTON_AUDIT_CACHE_KEY is not configured; skipping audit sidecar cache signing."
+        )
+
     return "\n".join(lines) + "\n"
+
+
+def try_load_reusable_audit_from_md(
+    sidecar_md: str | None,
+    *,
+    draft_markdown: str,
+    thesis_doc: dict[str, Any] | None = None,
+    models_doc: dict[str, Any] | None = None,
+    model_cells: dict[str, dict[str, Any]] | None = None,
+    provenance_records: dict[str, dict[str, Any]] | None = None,
+    facts_markdown: str | None = None,
+    metric_aliases: dict[str, list[str]] | None = None,
+    use_llm_judge: bool = True,
+    prompt_version: str | None = None,
+    audit_model: str | None = None,
+    config_fingerprint: tuple[str, list[str], str, str],
+) -> AuditResult | None:
+    """Restore a signed cached ``AuditResult`` (with ``reused=True``) from ``.audit.md`` when draft, inputs, and config match."""
+    try:
+        if not sidecar_md or not isinstance(sidecar_md, str):
+            return None
+        hmac_key = get_dalton_audit_cache_hmac_key()
+        if hmac_key is None:
+            logger.warning(
+                "DALTON_AUDIT_CACHE_KEY is not configured; skipping audit sidecar cache reuse."
+            )
+            return None
+        if len(_AUDIT_CACHE_TAG_RE.findall(sidecar_md)) != 1:
+            return None
+        matches = _AUDIT_CACHE_RE.findall(sidecar_md)
+        if len(matches) != 1:
+            return None
+        raw_cached = json.loads(matches[0])
+        cached = _validate_and_verify_cache_payload(raw_cached, hmac_key=hmac_key)
+        if cached is None:
+            return None
+
+        draft_sha = hashlib.sha256(draft_markdown.encode("utf-8")).hexdigest()
+        if cached["draft_sha256"] != draft_sha:
+            return None
+
+        inputs_sha = compute_audit_inputs_sha256(
+            draft_markdown=draft_markdown,
+            facts_markdown=facts_markdown,
+            thesis_doc=thesis_doc,
+            models_doc=models_doc,
+            model_cells=model_cells,
+            provenance_records=provenance_records,
+            metric_aliases=metric_aliases,
+        )
+        if not cached["inputs_sha256"] or cached["inputs_sha256"] != inputs_sha:
+            return None
+
+        # Always the caller's per-user fingerprint (resolve_audit_config_fingerprint):
+        # the raw yaml values would let a user's own model change reuse an old result.
+        eff_model, _eff_fallbacks, eff_prompt_ver, cfg_sha = config_fingerprint
+        if (
+            not cached["config_sha256"]
+            or cached["config_sha256"] != cfg_sha
+            or cached["audit_model"] != eff_model
+            or cached["prompt_version"] != eff_prompt_ver
+        ):
+            return None
+
+        contradicted_list = list(cached["contradicted"])
+        unverified_list = list(cached["unverified"])
+        unmatched_list = list(cached["unmatched"])
+        return AuditResult(
+            draft_sha256=draft_sha,
+            figures=int(cached["figures"]),
+            matched=int(cached["matched"]),
+            exempt=int(cached["exempt"]),
+            unmatched=unmatched_list,
+            matches=list(cached["matches"]),
+            contradicted=contradicted_list,
+            unverified=unverified_list,
+            uncertain=list(cached["uncertain"]),
+            incidental=list(cached["incidental"]),
+            outcomes=[],
+            labeling_incomplete=bool(cached["labeling_incomplete"]),
+            labeling=dict(cached["labeling"]),
+            reused=True,
+            inputs_sha256=inputs_sha,
+            config_sha256=cfg_sha,
+            audit_model=eff_model,
+            prompt_version=eff_prompt_ver,
+        )
+    except Exception:
+        return None
 
 
 def render_annotated_draft(draft_markdown: str, audit: AuditResult) -> str:

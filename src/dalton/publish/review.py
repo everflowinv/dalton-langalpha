@@ -202,14 +202,16 @@ def render_review_input(bundle: ReviewBundle, *, max_chars: int = 120_000) -> st
     if total_len > max_chars:
         debate = debate[: max(0, max_chars - len(numbered_draft) - len(thesis))]
 
+    from src.dalton.publish.audit import format_audit_summary_from_dict
+
+    aud = bundle.audit_summary or {}
+    summary_str = format_audit_summary_from_dict(aud) or "共 0 个数字：已核实 0 / 冲突 0 / 未核实 0 / 不需核实 0"
+
     sections = [
         f"# 待审报告：《{bundle.title}》（类型：{bundle.kind}）",
         "",
         "## 数字核验摘要",
-        f"总数字：{bundle.audit_summary.get('figures', 0)}，"
-        f"已匹配：{bundle.audit_summary.get('matched', 0)}，"
-        f"豁免：{bundle.audit_summary.get('exempt', 0)}，"
-        f"未核实：{len(bundle.audit_summary.get('unmatched') or [])}",
+        summary_str,
         "",
         "## 报告正文（带行号）",
         numbered_draft,

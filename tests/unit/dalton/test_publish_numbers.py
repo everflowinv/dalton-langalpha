@@ -2121,6 +2121,1475 @@ async def test_p0j_j5h_extra_figures_loop_expands_qualifier_preserving_value_and
     ]
 
 
+@pytest.mark.asyncio
+async def test_citation_table_lookup_missing_hint_and_multi_citations() -> None:
+    """Verify [引用N] mapping via ## 引用 table, multi-citation [引用3][引用5], and missing/unrecognized citation hint."""
+    thesis_doc = {
+        "evidence": [
+            {
+                "id": "E-20261023-01",
+                "fact": "2Q26 ad revenue reached 59.4 bn USD.",
+                "figures": [
+                    {
+                        "metric": "广告收入",
+                        "value": 59.4,
+                        "unit": "USD_bn",
+                        "period": "2Q26",
+                        "label": "reported",
+                    }
+                ],
+            },
+            {
+                "id": "E-20261023-02",
+                "fact": "2Q26 Family of Apps operating income was 32.1 bn USD.",
+                "figures": [
+                    {
+                        "metric": "营业利润",
+                        "value": 32.1,
+                        "unit": "USD_bn",
+                        "period": "2Q26",
+                        "label": "reported",
+                    }
+                ],
+            },
+        ]
+    }
+    models_doc = {
+        "versions": [
+            {
+                "path": "model/META-model-v01.xlsx",
+                "recalculated": True,
+                "sha256": "abc123",
+                "key_outputs": [
+                    {
+                        "name": "自由现金流",
+                        "cell": "DCF!C12",
+                        "value": 15.5,
+                        "unit": "USD_bn",
+                        "period": "2Q26",
+                    }
+                ],
+            }
+        ]
+    }
+    draft = (
+        "# META 初次覆盖\n\n"
+        "2Q26 广告收入为 594 亿美元（10-Q [引用1]）。\n"
+        "2Q26 自由现金流为 155 亿美元 [引用2][引用3]。\n"
+        "卖方预计 2Q26 资本开支为 180 亿美元（UBS [引用9]）。\n"
+        "另有渠道调研预测 2Q26 收入为 610 亿美元（某券商 [引用10]）。\n\n"
+        "## 引用清单\n"
+        "[引用1] SEC 10-Q｜2Q26 季报\n\n"
+        "## 引用\n"
+        "[引用1]: evidence:E-20261023-01\n"
+        "[引用2]: evidence:E-20261023-02\n"
+        "[引用3]: model:model/META-model-v01.xlsx!DCF!C12\n"
+        "[引用10]: 某未识别格式来源说明\n"
+    )
+    footnotes = parse_footnotes(draft)
+    assert footnotes["引用1"] == "evidence:E-20261023-01"
+    assert footnotes["引用3"] == "model:model/META-model-v01.xlsx!DCF!C12"
+
+    res = await aaudit_draft(
+        draft,
+        thesis_doc=thesis_doc,
+        models_doc=models_doc,
+        use_llm_judge=False,
+        user_id="local-dev-user",
+    )
+    assert res.matched == 2
+    verified_raws = {m["raw"] for m in res.matches}
+    assert "594 亿美元" in verified_raws
+    assert "155 亿美元" in verified_raws
+
+    unverified_by_raw = {u["raw"]: u for u in res.unverified}
+    assert "180 亿美元" in unverified_by_raw
+    assert unverified_by_raw["180 亿美元"]["reason"] == "unverified"
+    assert unverified_by_raw["180 亿美元"]["hint"] == "[引用9] 在引用表中没有对应项"
+
+    assert "610 亿美元" in unverified_by_raw
+    assert unverified_by_raw["610 亿美元"]["reason"] == "unverified"
+    assert unverified_by_raw["610 亿美元"]["hint"] == "[引用10] 在引用表中没有对应项"
+
+
+@pytest.mark.asyncio
+async def test_audit_summaries_separate_contradicted_and_lead_with_conflict_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify check_draft, publish_report, sidecar .audit.md, and review input separate 冲突 and lead with conflict IDs."""
+    from src.dalton import auth as dalton_auth
+    from src.dalton.database import knowledge as db_knowledge
+    from src.dalton.database import publications as db_publications
+    from src.dalton.publish import service as publish_svc
+
+    thesis_doc = {
+        "evidence": [
+            {
+                "id": "E-20261023-01",
+                "fact": "2Q26 ad revenue 59.4B USD; operating income 24.3B USD.",
+                "figures": [
+                    {
+                        "metric": "广告收入",
+                        "value": 59.4,
+                        "unit": "USD_bn",
+                        "period": "2Q26",
+                        "label": "reported",
+                    },
+                    {
+                        "metric": "营业利润",
+                        "value": 24.3,
+                        "unit": "USD_bn",
+                        "period": "2Q26",
+                        "label": "reported",
+                    },
+                ],
+            }
+        ]
+    }
+    draft = (
+        "# META 报告\n\n"
+        "2Q26 广告收入为 594 亿美元 [引用1]。\n"
+        "2Q26 营业利润为 290 亿美元 [引用1]。\n"
+        "2Q26 资本开支为 180 亿美元（UBS [引用9]）。\n"
+        "假设算力投入翻倍至 500 亿美元〔示意〕。\n\n"
+        "## 引用\n"
+        "[引用1]: evidence:E-20261023-01\n"
+    )
+    audit = await aaudit_draft(
+        draft,
+        thesis_doc=thesis_doc,
+        use_llm_judge=False,
+        user_id="local-dev-user",
+    )
+    assert audit.matched == 1
+    assert len(audit.contradicted) == 1
+    assert len(audit.unverified) == 1
+    assert audit.not_required_count == 1
+    conflict_id = audit.contradicted[0]["id"]
+
+    summary = audit.summary_line("drafts/meta.audit.md")
+    assert summary.startswith(f"发现 1 处冲突（{conflict_id}）。")
+    assert "已核实 1 / 冲突 1 / 未核实 1 / 不需核实 1" in summary
+
+    audit_md = render_audit_md(audit, draft_path="drafts/meta.md")
+    assert f"发现 1 处冲突（{conflict_id}）。" in audit_md.splitlines()[2]
+    assert "已核实 1 / 冲突 1 / 未核实 1 / 不需核实 1" in audit_md
+
+    bundle = ReviewBundle(
+        title="META",
+        kind="initial_coverage",
+        draft_markdown=draft,
+        audit_summary=audit.to_dict(),
+    )
+    rev_input = render_review_input(bundle)
+    assert f"发现 1 处冲突（{conflict_id}）。" in rev_input
+    assert "已核实 1 / 冲突 1 / 未核实 1 / 不需核实 1" in rev_input
+
+    class _BackendProto:
+        async def aread_text(self, path: str) -> str | None: ...
+        async def awrite_text(self, path: str, content: str) -> None: ...
+
+    files_store: dict[str, str] = {"drafts/meta.md": draft}
+    backend = create_autospec(_BackendProto, instance=True)
+    backend.aread_text.side_effect = lambda p: files_store.get(p)
+    backend.awrite_text.side_effect = lambda p, c: files_store.__setitem__(p, c)
+
+    monkeypatch.setattr(
+        publish_svc,
+        "verify_workspace_access",
+        create_autospec(dalton_auth.verify_workspace_access, return_value={"workspace_id": "ws-1"}),
+    )
+    monkeypatch.setattr(
+        publish_svc,
+        "_load_workspace_provenance",
+        create_autospec(publish_svc._load_workspace_provenance, return_value={}),
+    )
+    monkeypatch.setattr(
+        db_knowledge,
+        "list_all_latest_for_workspace",
+        create_autospec(
+            db_knowledge.list_all_latest_for_workspace,
+            return_value={"thesis": {"content": thesis_doc, "version_no": 1}},
+        ),
+    )
+    monkeypatch.setattr(
+        db_publications,
+        "resolve_thread_author_model",
+        create_autospec(db_publications.resolve_thread_author_model, return_value="claude-opus-5-5-oauth"),
+    )
+    monkeypatch.setattr(
+        db_publications,
+        "get_or_create_request",
+        create_autospec(
+            db_publications.get_or_create_request,
+            return_value=({"publish_request_id": "req-1", "status": "auditing"}, True),
+        ),
+    )
+    monkeypatch.setattr(
+        db_publications,
+        "transition",
+        create_autospec(
+            db_publications.transition,
+            return_value={"publish_request_id": "req-1", "status": "audit_failed"},
+        ),
+    )
+    monkeypatch.setattr(
+        publish_svc,
+        "aaudit_draft",
+        create_autospec(publish_svc.aaudit_draft, return_value=audit),
+    )
+
+    pub_fail = await publish_svc.run_publish(
+        user_id="local-dev-user",
+        workspace_id="ws-1",
+        thread_id="t-1",
+        tool_call_id="tc-1",
+        draft_path="drafts/meta.md",
+        title="META",
+        kind="initial_coverage",
+        slug="meta",
+        backend=backend,
+    )
+    assert pub_fail["status"] == "audit_failed"
+    assert pub_fail["message"].startswith(f"发现 1 处冲突（{conflict_id}）。")
+    assert "已核实 1 / 冲突 1 / 未核实 1 / 不需核实 1" in pub_fail["message"]
+
+
+@pytest.mark.asyncio
+async def test_audit_sidecar_reuse_and_invalidation_on_draft_or_config_change(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify check_draft reuses .audit.md when unchanged, and re-runs when draft or config changes."""
+    from src.dalton import auth as dalton_auth
+    from src.dalton.llm.assist import AssistResult, assist_json
+    from src.dalton.publish import audit as audit_mod
+    from src.dalton.publish import service as publish_svc
+
+    monkeypatch.setenv("DALTON_AUDIT_CACHE_KEY", "unit-test-dedicated-audit-cache-key")
+
+    class _BackendProto:
+        async def aread_text(self, path: str) -> str | None: ...
+        async def awrite_text(self, path: str, content: str) -> None: ...
+
+    draft_v1 = (
+        "# META 报告\n\n"
+        "2Q26 广告收入为 594 亿美元 [引用1]。\n\n"
+        "## 引用\n"
+        "[引用1]: evidence:E-20261023-01\n"
+    )
+    thesis_doc = {
+        "evidence": [
+            {
+                "id": "E-20261023-01",
+                "fact": "2Q26 ad revenue 59.4B USD.",
+                "figures": [
+                    {
+                        "metric": "广告收入",
+                        "value": 59.4,
+                        "unit": "USD_bn",
+                        "period": "2Q26",
+                        "label": "reported",
+                    }
+                ],
+            }
+        ]
+    }
+    files_store: dict[str, str] = {"drafts/meta.md": draft_v1}
+    backend = create_autospec(_BackendProto, instance=True)
+    backend.aread_text.side_effect = lambda p: files_store.get(p)
+    backend.awrite_text.side_effect = lambda p, c: files_store.__setitem__(p, c)
+
+    monkeypatch.setattr(
+        publish_svc,
+        "verify_workspace_access",
+        create_autospec(dalton_auth.verify_workspace_access, return_value={"workspace_id": "ws-1"}),
+    )
+
+    async def _fake_assist(
+        task: str,
+        instructions: str,
+        payload: dict[str, Any],
+        schema: dict[str, Any],
+        **kwargs: Any,
+    ) -> AssistResult:
+        return AssistResult(
+            ok=True,
+            status="ok",
+            data={
+                "items": [
+                    {
+                        "id": "B-001",
+                        "kind": "reported",
+                        "metric": "广告收入",
+                        "period": "2Q26",
+                        "unit": "USD_bn",
+                    }
+                ],
+                "extra_figures": [],
+            },
+            model="gemini-3.8-flash-low-oauth",
+        )
+
+    mock_assist = create_autospec(assist_json, side_effect=_fake_assist)
+    monkeypatch.setattr("src.dalton.publish.numbers.assist_json", mock_assist)
+    monkeypatch.setattr("src.dalton.publish.audit.assist_json", mock_assist)
+
+    # 1. Initial run: executes LLM and writes sidecar
+    res1 = await publish_svc.run_check_draft(
+        user_id="local-dev-user",
+        workspace_id="ws-1",
+        draft_path="drafts/meta.md",
+        backend=backend,
+        thesis_doc=thesis_doc,
+        models_doc={},
+        provenance_records={},
+        use_llm_judge=True,
+    )
+    assert res1["ok"] is True
+    assert res1["reused"] is False
+    assert res1["audit"]["reused"] is False
+    assert mock_assist.call_count == 1
+
+    # 2. Second run with identical draft, inputs, and config: reuses sidecar without calling LLM
+    res2 = await publish_svc.run_check_draft(
+        user_id="local-dev-user",
+        workspace_id="ws-1",
+        draft_path="drafts/meta.md",
+        backend=backend,
+        thesis_doc=thesis_doc,
+        models_doc={},
+        provenance_records={},
+        use_llm_judge=True,
+    )
+    assert res2["ok"] is True
+    assert res2["reused"] is True
+    assert res2["audit"]["reused"] is True
+    assert mock_assist.call_count == 1
+
+    # 3. Change 1 character in draft -> re-runs LLM
+    files_store["drafts/meta.md"] = draft_v1.replace("META 报告", "META 报告！")
+    res3 = await publish_svc.run_check_draft(
+        user_id="local-dev-user",
+        workspace_id="ws-1",
+        draft_path="drafts/meta.md",
+        backend=backend,
+        thesis_doc=thesis_doc,
+        models_doc={},
+        provenance_records={},
+        use_llm_judge=True,
+    )
+    assert res3["reused"] is False
+    assert res3["audit"]["reused"] is False
+    assert mock_assist.call_count == 2
+
+    # Same modified draft again -> reuses
+    res3_reuse = await publish_svc.run_check_draft(
+        user_id="local-dev-user",
+        workspace_id="ws-1",
+        draft_path="drafts/meta.md",
+        backend=backend,
+        thesis_doc=thesis_doc,
+        models_doc={},
+        provenance_records={},
+        use_llm_judge=True,
+    )
+    assert res3_reuse["reused"] is True
+    assert mock_assist.call_count == 2
+
+    # 4. Change config (prompt_version or audit_model) -> re-runs LLM
+    monkeypatch.setattr(audit_mod, "AUDIT_PROMPT_VERSION", "audit_v2")
+    res4 = await publish_svc.run_check_draft(
+        user_id="local-dev-user",
+        workspace_id="ws-1",
+        draft_path="drafts/meta.md",
+        backend=backend,
+        thesis_doc=thesis_doc,
+        models_doc={},
+        provenance_records={},
+        use_llm_judge=True,
+    )
+    assert res4["reused"] is False
+    assert res4["audit"]["reused"] is False
+    assert res4["audit"]["prompt_version"] == "audit_v2"
+    assert mock_assist.call_count == 3
 
 
 
+    # 5. The user switches to their own audit model (per-user preference, not
+    # yaml): the sidecar written under the old effective model must not be
+    # reused by run_check_draft.
+    before = mock_assist.call_count
+    real_resolve = audit_mod.resolve_dalton_audit_model
+
+    async def _user_model(user_id: str | None = None) -> str:
+        return "claude-opus-5-5-oauth"
+
+    monkeypatch.setattr(
+        audit_mod,
+        "resolve_dalton_audit_model",
+        create_autospec(real_resolve, side_effect=_user_model),
+    )
+    res_user = await publish_svc.run_check_draft(
+        user_id="local-dev-user",
+        workspace_id="ws-1",
+        draft_path="drafts/meta.md",
+        backend=backend,
+        thesis_doc=thesis_doc,
+        models_doc={},
+        provenance_records={},
+        use_llm_judge=True,
+    )
+    assert res_user["reused"] is False
+    assert mock_assist.call_count > before
+
+@pytest.mark.asyncio
+async def test_audit_cache_hmac_tamper_wrong_type_and_multiple_blocks_rerun(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Verify missing DALTON_AUDIT_CACHE_KEY disables reuse with warning, and with key set, tampered/invalid/multi-block caches rerun."""
+    import logging
+    from src.dalton.publish import audit as audit_mod
+    from src.dalton.settings import get_dalton_audit_cache_hmac_key
+
+    monkeypatch.setenv("DALTON_AUDIT_CACHE_KEY", "unit-test-dedicated-audit-cache-key")
+
+    draft = (
+        "# META 报告\n\n"
+        "2Q26 广告收入为 594 亿美元 [引用1]。\n"
+        "2Q26 资本开支为 180 亿美元 [引用9]。\n\n"
+        "## 引用\n"
+        "[引用1]: evidence:E-20261023-01\n"
+    )
+    thesis_doc = {
+        "evidence": [
+            {
+                "id": "E-20261023-01",
+                "fact": "2Q26 ad revenue 59.4B USD.",
+                "figures": [
+                    {
+                        "metric": "广告收入",
+                        "value": 59.4,
+                        "unit": "USD_bn",
+                        "period": "2Q26",
+                        "label": "reported",
+                    }
+                ],
+            }
+        ]
+    }
+    initial = await aaudit_draft(
+        draft,
+        thesis_doc=thesis_doc,
+        use_llm_judge=False,
+        user_id="local-dev-user",
+    )
+    assert initial.reused is False
+    assert initial.matched == 1
+    assert len(initial.unverified) == 1
+
+    valid_md = render_audit_md(initial, draft_path="drafts/meta.md")
+    reused = await aaudit_draft(
+        draft,
+        thesis_doc=thesis_doc,
+        use_llm_judge=False,
+        user_id="local-dev-user",
+        previous_audit_md=valid_md,
+    )
+    assert reused.reused is True
+
+    # 0. When DALTON_AUDIT_CACHE_KEY is unset (even if DALTON_BRIDGE_TOKEN / INTERNAL_SERVICE_TOKEN exist),
+    # cache is never reused and a warning is logged without leaking any secret value.
+    monkeypatch.delenv("DALTON_AUDIT_CACHE_KEY", raising=False)
+    monkeypatch.setenv("DALTON_BRIDGE_TOKEN", "bridge-token-must-not-be-used")
+    monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", "internal-token-must-not-be-used")
+    assert get_dalton_audit_cache_hmac_key() is None
+    with caplog.at_level(logging.WARNING, logger="src.dalton.publish.audit"):
+        caplog.clear()
+        no_key_res = await aaudit_draft(
+            draft,
+            thesis_doc=thesis_doc,
+            use_llm_judge=False,
+            user_id="local-dev-user",
+            previous_audit_md=valid_md,
+        )
+        assert no_key_res.reused is False
+        assert any("DALTON_AUDIT_CACHE_KEY" in rec.message for rec in caplog.records)
+        assert all("bridge-token-must-not-be-used" not in rec.message for rec in caplog.records)
+        no_key_md = render_audit_md(no_key_res, draft_path="drafts/meta.md")
+        assert "<!-- dalton:audit-cache" not in no_key_md
+
+    monkeypatch.setenv("DALTON_AUDIT_CACHE_KEY", "unit-test-dedicated-audit-cache-key")
+
+    # 1. Tamper a conclusion field (change unverified/unmatched to empty, matched to 2) -> HMAC fails & re-runs
+    m = audit_mod._AUDIT_CACHE_RE.search(valid_md)
+    assert m is not None
+    tampered_obj = json.loads(m.group(1))
+    tampered_obj["unverified"] = []
+    tampered_obj["unmatched"] = []
+    tampered_md = valid_md.replace(m.group(1), json.dumps(tampered_obj, ensure_ascii=False, sort_keys=True))
+    res_tampered = await aaudit_draft(
+        draft,
+        thesis_doc=thesis_doc,
+        use_llm_judge=False,
+        user_id="local-dev-user",
+        previous_audit_md=tampered_md,
+    )
+    assert res_tampered.reused is False
+    assert len(res_tampered.unverified) == 1
+
+    # 2. Wrong field type (e.g. matched is a string or bool, or contradicted is not a list) -> re-runs without raising
+    wrong_type_obj = json.loads(m.group(1))
+    wrong_type_obj["matched"] = "1"
+    wrong_type_md = valid_md.replace(m.group(1), json.dumps(wrong_type_obj, ensure_ascii=False))
+    res_wrong_type = await aaudit_draft(
+        draft,
+        thesis_doc=thesis_doc,
+        use_llm_judge=False,
+        user_id="local-dev-user",
+        previous_audit_md=wrong_type_md,
+    )
+    assert res_wrong_type.reused is False
+
+    bool_int_obj = json.loads(m.group(1))
+    bool_int_obj["figures"] = True
+    bool_int_md = valid_md.replace(m.group(1), json.dumps(bool_int_obj, ensure_ascii=False))
+    res_bool_int = await aaudit_draft(
+        draft,
+        thesis_doc=thesis_doc,
+        use_llm_judge=False,
+        user_id="local-dev-user",
+        previous_audit_md=bool_int_md,
+    )
+    assert res_bool_int.reused is False
+
+    # 3. Two cache blocks in the same sidecar -> treated as cache miss & re-runs
+    two_blocks_md = valid_md + "\n" + valid_md[valid_md.index("<!-- dalton:audit-cache") :]
+    res_two_blocks = await aaudit_draft(
+        draft,
+        thesis_doc=thesis_doc,
+        use_llm_judge=False,
+        user_id="local-dev-user",
+        previous_audit_md=two_blocks_md,
+    )
+    assert res_two_blocks.reused is False
+
+
+@pytest.mark.asyncio
+async def test_parse_footnotes_citation_table_scope_code_block_and_duplicate_definition() -> None:
+    """Verify parse_footnotes only reads ## 引用 outside code/comments, and marks conflicting duplicate [引用N] as unverified."""
+    thesis_doc = {
+        "evidence": [
+            {
+                "id": "E-20261023-01",
+                "fact": "2Q26 ad revenue 59.4B USD.",
+                "figures": [
+                    {
+                        "metric": "广告收入",
+                        "value": 59.4,
+                        "unit": "USD_bn",
+                        "period": "2Q26",
+                        "label": "reported",
+                    }
+                ],
+            },
+            {
+                "id": "E-20261023-02",
+                "fact": "2Q26 ad revenue 59.4B USD (alt).",
+                "figures": [
+                    {
+                        "metric": "广告收入",
+                        "value": 59.4,
+                        "unit": "USD_bn",
+                        "period": "2Q26",
+                        "label": "reported",
+                    }
+                ],
+            },
+        ]
+    }
+    draft = (
+        "# META 报告\n\n"
+        "[引用8]: evidence:E-20261023-01\n\n"
+        "```markdown\n"
+        "## 引用\n"
+        "[引用7]: evidence:E-20261023-01\n"
+        "```\n\n"
+        "<!--\n"
+        "## 引用\n"
+        "[引用6]: evidence:E-20261023-01\n"
+        "-->\n\n"
+        "2Q26 广告收入为 594 亿美元 [引用7]。\n"
+        "2Q26 广告收入为 594 亿美元 [引用8]。\n"
+        "2Q26 广告收入为 594 亿美元 [引用1]。\n\n"
+        "## 引用\n"
+        "```markdown\n"
+        "[引用7]: evidence:E-20261023-01\n"
+        "```\n"
+        "[引用1]: evidence:E-20261023-01\n"
+        "[引用1]: evidence:E-20261023-02\n"
+    )
+    footnotes = parse_footnotes(draft)
+    assert "引用7" not in footnotes
+    assert "引用8" not in footnotes
+    assert "引用6" not in footnotes
+
+    res = await aaudit_draft(
+        draft,
+        thesis_doc=thesis_doc,
+        use_llm_judge=False,
+        user_id="local-dev-user",
+    )
+    assert res.matched == 0
+    assert len(res.unverified) == 3
+    hints = [u["hint"] for u in res.unverified]
+    assert any("[引用7] 在引用表中没有对应项" in h for h in hints)
+    assert any("[引用8] 在引用表中没有对应项" in h for h in hints)
+    assert any("重复定义" in h and "[引用1]" in h for h in hints)
+
+
+@pytest.mark.asyncio
+async def test_missing_or_nonexistent_citation_locked_unverified_against_derived_and_judge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify figures with missing [引用N] or non-existent evidence/model target cannot be rescued by derived or LLM judge."""
+    from src.dalton.llm.assist import AssistResult, assist_json
+
+    thesis_doc = {
+        "evidence": [
+            {
+                "id": "E-20261023-01",
+                "fact": "2Q26 revenue was 100B USD and operating profit was 20B USD (operating margin 20%).",
+                "figures": [
+                    {
+                        "metric": "营业收入",
+                        "value": 100.0,
+                        "unit": "USD_bn",
+                        "period": "2Q26",
+                        "label": "reported",
+                    },
+                    {
+                        "metric": "营业利润",
+                        "value": 20.0,
+                        "unit": "USD_bn",
+                        "period": "2Q26",
+                        "label": "reported",
+                    },
+                ],
+            }
+        ]
+    }
+    draft = (
+        "# META 报告\n\n"
+        "2Q26 营业收入为 100 亿美元 [引用1]，2Q26 营业利润为 20 亿美元 [引用1]，2Q26 营业利润率为 20% [引用9]。\n"
+        "此外 2Q26 营业利润率为 20% [引用2]。\n\n"
+        "## 引用\n"
+        "[引用1]: evidence:E-20261023-01\n"
+        "[引用2]: evidence:E-DOES-NOT-EXIST\n"
+    )
+
+    async def _fake_assist(
+        task: str,
+        instructions: str,
+        payload: dict[str, Any],
+        schema: dict[str, Any],
+        **kwargs: Any,
+    ) -> AssistResult:
+        if task == "audit.label_figures":
+            return AssistResult(
+                ok=True,
+                status="ok",
+                data={
+                    "items": [
+                        {
+                            "id": f["id"],
+                            "kind": "derived" if "%" in f["raw"] else "reported",
+                            "metric": f["metric"],
+                            "period": "2Q26",
+                            "unit": f["unit"],
+                        }
+                        for f in payload.get("extracted_figures", [])
+                    ],
+                    "extra_figures": [],
+                },
+                model="gemini-3.8-flash-low-oauth",
+            )
+        return AssistResult(
+            ok=True,
+            status="ok",
+            data={
+                "items": [
+                    {
+                        "id": f["id"],
+                        "verdict": "supported",
+                        "matched_source_id": "evidence:E-20261023-01",
+                        "quote": "2Q26 revenue was 100B USD and operating profit was 20B USD (operating margin 20%).",
+                        "quote_number_raw": "20%",
+                        "quote_metric_raw": "operating margin",
+                        "explanation": "Matched",
+                    }
+                    for f in payload.get("figures", [])
+                ]
+            },
+            model="gemini-3.8-flash-low-oauth",
+        )
+
+    mock_assist = create_autospec(assist_json, side_effect=_fake_assist)
+    monkeypatch.setattr("src.dalton.publish.numbers.assist_json", mock_assist)
+    monkeypatch.setattr("src.dalton.publish.audit.assist_json", mock_assist)
+
+    res = await aaudit_draft(
+        draft,
+        thesis_doc=thesis_doc,
+        use_llm_judge=True,
+        user_id="local-dev-user",
+    )
+    assert res.matched == 2
+    assert len(res.unverified) == 2
+    unverified_raws = [u["raw"] for u in res.unverified]
+    assert unverified_raws == ["20%", "20%"]
+    hints = [u["hint"] for u in res.unverified]
+    assert any("[引用9] 在引用表中没有对应项" in h for h in hints)
+    assert any("Evidence E-DOES-NOT-EXIST not found" in h for h in hints)
+
+
+@pytest.mark.asyncio
+async def test_audit_config_and_inputs_fingerprints_rerun_on_each_change(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify changing audit_timeout_s, audit_total_timeout_s, audit_concurrency, or metric_aliases triggers a re-run."""
+    from src.dalton.settings import get_dalton_config
+
+    monkeypatch.setenv("DALTON_AUDIT_CACHE_KEY", "unit-test-dedicated-audit-cache-key")
+
+    draft = (
+        "# META 报告\n\n"
+        "2Q26 广告收入为 594 亿美元 [引用1]。\n\n"
+        "## 引用\n"
+        "[引用1]: evidence:E-20261023-01\n"
+    )
+    thesis_doc = {
+        "evidence": [
+            {
+                "id": "E-20261023-01",
+                "fact": "2Q26 ad revenue 59.4B USD.",
+                "figures": [
+                    {
+                        "metric": "广告收入",
+                        "value": 59.4,
+                        "unit": "USD_bn",
+                        "period": "2Q26",
+                        "label": "reported",
+                    }
+                ],
+            }
+        ]
+    }
+    pub_cfg = get_dalton_config().publish
+
+    res0 = await aaudit_draft(
+        draft,
+        thesis_doc=thesis_doc,
+        use_llm_judge=False,
+        user_id="local-dev-user",
+    )
+    sidecar = render_audit_md(res0, draft_path="drafts/meta.md")
+
+    res_hit = await aaudit_draft(
+        draft,
+        thesis_doc=thesis_doc,
+        use_llm_judge=False,
+        user_id="local-dev-user",
+        previous_audit_md=sidecar,
+    )
+    assert res_hit.reused is True
+
+    # 1. audit_timeout_s change
+    monkeypatch.setattr(pub_cfg, "audit_timeout_s", pub_cfg.audit_timeout_s + 10.0)
+    res_t1 = await aaudit_draft(
+        draft,
+        thesis_doc=thesis_doc,
+        use_llm_judge=False,
+        user_id="local-dev-user",
+        previous_audit_md=sidecar,
+    )
+    assert res_t1.reused is False
+    sidecar = render_audit_md(res_t1, draft_path="drafts/meta.md")
+
+    # 2. audit_total_timeout_s change
+    monkeypatch.setattr(pub_cfg, "audit_total_timeout_s", pub_cfg.audit_total_timeout_s + 60.0)
+    res_t2 = await aaudit_draft(
+        draft,
+        thesis_doc=thesis_doc,
+        use_llm_judge=False,
+        user_id="local-dev-user",
+        previous_audit_md=sidecar,
+    )
+    assert res_t2.reused is False
+    sidecar = render_audit_md(res_t2, draft_path="drafts/meta.md")
+
+    # 3. audit_concurrency change
+    monkeypatch.setattr(pub_cfg, "audit_concurrency", max(1, pub_cfg.audit_concurrency - 1))
+    res_t3 = await aaudit_draft(
+        draft,
+        thesis_doc=thesis_doc,
+        use_llm_judge=False,
+        user_id="local-dev-user",
+        previous_audit_md=sidecar,
+    )
+    assert res_t3.reused is False
+    sidecar = render_audit_md(res_t3, draft_path="drafts/meta.md")
+
+    # 4. metric_aliases change
+    res_t4 = await aaudit_draft(
+        draft,
+        thesis_doc=thesis_doc,
+        metric_aliases={"ad_revenue": ["核心广告营收"]},
+        use_llm_judge=False,
+        user_id="local-dev-user",
+        previous_audit_md=sidecar,
+    )
+    assert res_t4.reused is False
+
+
+@pytest.mark.asyncio
+async def test_publish_retry_early_return_reenters_auditing_on_input_or_config_change_and_unifies_summaries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify publish_report early-return checks input/config fingerprints and all exit points use unified summary."""
+    from src.dalton import auth as dalton_auth
+    from src.dalton.database import knowledge as db_knowledge
+    from src.dalton.database import publications as db_publications
+    from src.dalton.publish import service as publish_svc
+    from src.dalton.publish.files import compute_bundle_sha256
+
+    draft = (
+        "# META 报告\n\n"
+        "2Q26 广告收入为 594 亿美元 [引用1]。\n"
+        "2Q26 营业利润为 290 亿美元 [引用1]。\n\n"
+        "## 引用\n"
+        "[引用1]: evidence:E-20261023-01\n"
+    )
+    thesis_v1 = {
+        "evidence": [
+            {
+                "id": "E-20261023-01",
+                "fact": "2Q26 ad revenue 59.4B USD; operating income 24.3B USD.",
+                "figures": [
+                    {
+                        "metric": "广告收入",
+                        "value": 59.4,
+                        "unit": "USD_bn",
+                        "period": "2Q26",
+                        "label": "reported",
+                    },
+                    {
+                        "metric": "营业利润",
+                        "value": 24.3,
+                        "unit": "USD_bn",
+                        "period": "2Q26",
+                        "label": "reported",
+                    },
+                ],
+            }
+        ]
+    }
+    from src.dalton.publish.audit import compute_audit_config_fingerprint
+
+    audit_fail = await aaudit_draft(
+        draft,
+        thesis_doc=thesis_v1,
+        use_llm_judge=False,
+        user_id="local-dev-user",
+    )
+    _, _, _, publish_cfg_sha = compute_audit_config_fingerprint(use_llm_judge=True)
+    audit_fail.config_sha256 = publish_cfg_sha
+    assert not audit_fail.passed
+    bundle_sha = compute_bundle_sha256(draft.encode("utf-8"), [])
+
+    class _BackendProto:
+        async def aread_text(self, path: str) -> str | None: ...
+        async def awrite_text(self, path: str, content: str) -> None: ...
+
+    files_store: dict[str, str] = {"drafts/meta.md": draft}
+    backend = create_autospec(_BackendProto, instance=True)
+    backend.aread_text.side_effect = lambda p: files_store.get(p)
+    backend.awrite_text.side_effect = lambda p, c: files_store.__setitem__(p, c)
+
+    monkeypatch.setattr(
+        publish_svc,
+        "verify_workspace_access",
+        create_autospec(dalton_auth.verify_workspace_access, return_value={"workspace_id": "ws-1"}),
+    )
+    monkeypatch.setattr(
+        publish_svc,
+        "_load_workspace_provenance",
+        create_autospec(publish_svc._load_workspace_provenance, return_value={}),
+    )
+    monkeypatch.setattr(
+        db_publications,
+        "resolve_thread_author_model",
+        create_autospec(db_publications.resolve_thread_author_model, return_value="claude-opus-5-5-oauth"),
+    )
+
+    # 1. Existing audit_failed request with identical bundle_sha256, inputs_sha256, config_sha256 -> early return with unified summary
+    existing_row = {
+        "publish_request_id": "req-1",
+        "workspace_id": "ws-1",
+        "user_id": "local-dev-user",
+        "status": "audit_failed",
+        "bundle_sha256": bundle_sha,
+        "audit": audit_fail.to_dict(),
+    }
+    mock_list_latest = create_autospec(
+        db_knowledge.list_all_latest_for_workspace,
+        return_value={"thesis": {"content": thesis_v1, "version_no": 1}},
+    )
+    monkeypatch.setattr(
+        db_knowledge,
+        "list_all_latest_for_workspace",
+        mock_list_latest,
+    )
+    monkeypatch.setattr(
+        db_publications,
+        "get_or_create_request",
+        create_autospec(db_publications.get_or_create_request, return_value=(existing_row, False)),
+    )
+    mock_transition = create_autospec(
+        db_publications.transition,
+        return_value={**existing_row, "status": "auditing"},
+    )
+    monkeypatch.setattr(db_publications, "transition", mock_transition)
+
+    early_res = await publish_svc.run_publish(
+        user_id="local-dev-user",
+        workspace_id="ws-1",
+        thread_id="t-1",
+        tool_call_id="tc-1",
+        draft_path="drafts/meta.md",
+        title="META",
+        kind="initial_coverage",
+        slug="meta",
+        backend=backend,
+    )
+    assert early_res["status"] == "audit_failed"
+    assert mock_transition.call_count == 0
+    conflict_id = audit_fail.contradicted[0]["id"]
+    assert early_res["message"].startswith(f"发现 1 处冲突（{conflict_id}）。")
+    assert "已核实 1 / 冲突 1 / 未核实 0 / 不需核实 0" in early_res["message"]
+
+    # 2. Update thesis_doc (inputs_sha256 changes while draft bundle_sha256 is unchanged) -> transitions back to auditing
+    import copy
+
+    thesis_v2 = copy.deepcopy(thesis_v1)
+    thesis_v2["evidence"][0]["figures"][1]["value"] = 29.0
+    audit_pass = await aaudit_draft(
+        draft,
+        thesis_doc=thesis_v2,
+        use_llm_judge=False,
+        user_id="local-dev-user",
+    )
+    assert audit_pass.passed
+    mock_list_latest.return_value = {"thesis": {"content": thesis_v2, "version_no": 2}}
+    monkeypatch.setattr(
+        publish_svc,
+        "aaudit_draft",
+        create_autospec(publish_svc.aaudit_draft, return_value=audit_pass),
+    )
+
+    async def _transition_side_effect(
+        publish_request_id: str,
+        from_statuses: Any,
+        to: str,
+        **cols: Any,
+    ) -> dict[str, Any]:
+        existing_row["status"] = to
+        existing_row.update(cols)
+        return dict(existing_row)
+
+    mock_transition.side_effect = _transition_side_effect
+    monkeypatch.setattr(
+        publish_svc,
+        "_append_agenda_pm_handoff",
+        create_autospec(publish_svc._append_agenda_pm_handoff, return_value=None),
+    )
+    from src.dalton.publish.review import ReviewResult, ReviewVerdict
+
+    monkeypatch.setattr(
+        publish_svc,
+        "run_review",
+        create_autospec(
+            publish_svc.run_review,
+            return_value=ReviewResult(
+                status="done",
+                model="gpt-6.1-sol-oauth",
+                family="openai-gpt",
+                verdict=ReviewVerdict(verdict="pass", summary="ok", items=[], must_fix=[], nice_to_have=[]),
+            ),
+        ),
+    )
+
+    unattended_res = await publish_svc.run_publish(
+        user_id="local-dev-user",
+        workspace_id="ws-1",
+        thread_id="t-1",
+        tool_call_id="tc-1",
+        draft_path="drafts/meta.md",
+        title="META",
+        kind="initial_coverage",
+        slug="meta",
+        origin_type="automation",
+        backend=backend,
+    )
+    assert unattended_res["status"] == "awaiting_pm"
+    assert mock_transition.call_count >= 1
+    assert "已核实 2 / 冲突 0 / 未核实 0 / 不需核实 0" in unattended_res["message"]
+
+    # 3. Verify denominator consistency when incidental and uncertain items exist
+    from src.dalton.publish.audit import AuditResult, format_audit_summary_from_dict
+
+    aud_mixed = AuditResult(
+        draft_sha256="a" * 64,
+        figures=7,
+        matched=2,
+        exempt=1,
+        contradicted=[{"id": "F-003", "raw": "10%", "line": 3, "reason": "source_conflict"}],
+        unverified=[{"id": "F-004", "raw": "20%", "line": 4, "reason": "unverified"}],
+        uncertain=[{"id": "F-005", "raw": "3.5", "line": 5, "reason": "uncertain"}],
+        incidental=[{"id": "F-006", "raw": "100", "line": 6, "incidental_category": "历史背景"}],
+        unmatched=[
+            {"id": "F-003", "raw": "10%", "line": 3, "reason": "source_conflict"},
+            {"id": "F-004", "raw": "20%", "line": 4, "reason": "unverified"},
+        ],
+    )
+    s_mixed = format_audit_summary_from_dict(aud_mixed.to_dict())
+    assert s_mixed.startswith("发现 1 处冲突（F-003）。")
+    assert "共 7 个数字：已核实 2 / 冲突 1 / 未核实 1 / 不需核实 2（另有未能判断 1，不计入以上四项）" in s_mixed
+
+
+@pytest.mark.asyncio
+async def test_multi_citation_with_missing_or_broken_target_locks_unverified(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify a figure with multiple citations ([引用1][引用9] where 1 is valid and 9 is missing/broken) is locked unverified."""
+    from src.dalton.llm.assist import AssistResult, assist_json
+
+    thesis_doc = {
+        "evidence": [
+            {
+                "id": "E-20261023-01",
+                "fact": "2Q26 revenue was 100B USD and operating profit was 20B USD (operating margin 20%).",
+                "figures": [
+                    {
+                        "metric": "营业收入",
+                        "value": 100.0,
+                        "unit": "USD_bn",
+                        "period": "2Q26",
+                        "label": "reported",
+                    },
+                    {
+                        "metric": "营业利润",
+                        "value": 20.0,
+                        "unit": "USD_bn",
+                        "period": "2Q26",
+                        "label": "reported",
+                    },
+                ],
+            },
+            {
+                "id": "E-20261023-02",
+                "fact": "2Q26 capex was 15B USD.",
+                "figures": [
+                    {
+                        "metric": "资本开支",
+                        "value": 15.0,
+                        "unit": "USD_bn",
+                        "period": "2Q26",
+                        "label": "reported",
+                    }
+                ],
+            },
+        ]
+    }
+    models_doc = {
+        "schema_version": 1,
+        "current": "v1",
+        "versions": [
+            {
+                "id": "v1",
+                "path": "model/meta_v1.xlsx",
+                "sha256": "abc12345",
+                "recalculated": True,
+                "key_outputs": [
+                    {"name": "目标价", "cell": "DCF!C12", "value": 850.0, "unit": "USD", "period": "FY2026"}
+                ],
+            }
+        ],
+    }
+    draft = (
+        "# META 报告\n\n"
+        "2Q26 营业收入为 100 亿美元 [引用1]，2Q26 营业利润为 20 亿美元 [引用1]。\n"
+        "2Q26 营业利润率为 20% [引用1][引用9]。\n"
+        "2Q26 营业收入为 100 亿美元 [引用1][引用2]。\n"
+        "FY26 目标价为 $850 [引用3][引用9]。\n"
+        "3Q26 资本开支为 15 亿美元 [引用4][引用2]。\n\n"
+        "## 引用\n"
+        "[引用1]: evidence:E-20261023-01\n"
+        "[引用2]: evidence:E-DOES-NOT-EXIST\n"
+        "[引用3]: model:model/meta_v1.xlsx#DCF!C12\n"
+        "[引用4]: evidence:E-20261023-02\n"
+    )
+
+    async def _fake_assist(
+        task: str,
+        instructions: str,
+        payload: dict[str, Any],
+        schema: dict[str, Any],
+        **kwargs: Any,
+    ) -> AssistResult:
+        if task == "audit.label_figures":
+            return AssistResult(
+                ok=True,
+                status="ok",
+                data={
+                    "items": [
+                        {
+                            "id": f["id"],
+                            "kind": "derived" if "%" in f["raw"] else "reported",
+                            "metric": f["metric"],
+                            "period": f["period"] or "2Q26",
+                            "unit": f["unit"],
+                        }
+                        for f in payload.get("extracted_figures", [])
+                    ],
+                    "extra_figures": [],
+                },
+                model="gemini-3.8-flash-low-oauth",
+            )
+        return AssistResult(
+            ok=True,
+            status="ok",
+            data={
+                "items": [
+                    {
+                        "id": f["id"],
+                        "verdict": "supported",
+                        "matched_source_id": "evidence:E-20261023-01",
+                        "quote": "2Q26 revenue was 100B USD and operating profit was 20B USD (operating margin 20%).",
+                        "quote_number_raw": f["raw"],
+                        "quote_metric_raw": "operating margin",
+                        "explanation": "Matched",
+                    }
+                    for f in payload.get("figures", [])
+                ]
+            },
+            model="gemini-3.8-flash-low-oauth",
+        )
+
+    mock_assist = create_autospec(assist_json, side_effect=_fake_assist)
+    monkeypatch.setattr("src.dalton.publish.numbers.assist_json", mock_assist)
+    monkeypatch.setattr("src.dalton.publish.audit.assist_json", mock_assist)
+
+    res = await aaudit_draft(
+        draft,
+        thesis_doc=thesis_doc,
+        models_doc=models_doc,
+        use_llm_judge=True,
+        user_id="local-dev-user",
+    )
+    # Only the first two single-citation [引用1] figures match; all 4 multi-citation figures with a broken ref stay unverified
+    assert res.matched == 2
+    assert len(res.unverified) == 4
+    unverified_raws = [u["raw"] for u in res.unverified]
+    assert unverified_raws == ["20%", "100 亿美元", "$850", "15 亿美元"]
+    assert "[引用9] 在引用表中没有对应项" in res.unverified[0]["hint"]
+    assert "Evidence E-DOES-NOT-EXIST not found" in res.unverified[1]["hint"]
+    assert "[引用9] 在引用表中没有对应项" in res.unverified[2]["hint"]
+    assert "Evidence E-DOES-NOT-EXIST not found" in res.unverified[3]["hint"]
+
+
+@pytest.mark.asyncio
+async def test_citation_and_traditional_footnote_separate_namespaces() -> None:
+    """Verify traditional footnote [^引用1]: cannot resolve [引用1] in prose, and [引用1]: cannot resolve [^引用1]."""
+    thesis_doc = {
+        "evidence": [
+            {
+                "id": "E-20261023-01",
+                "fact": "2Q26 ad revenue 59.4B USD.",
+                "figures": [
+                    {
+                        "metric": "广告收入",
+                        "value": 59.4,
+                        "unit": "USD_bn",
+                        "period": "2Q26",
+                        "label": "reported",
+                    }
+                ],
+            }
+        ]
+    }
+    # Case 1: Prose uses [引用1], but definition is traditional footnote [^引用1]:
+    draft_trad_def = (
+        "# META 报告\n\n"
+        "2Q26 广告收入为 594 亿美元 [引用1]。\n\n"
+        "## 引用\n"
+        "[^引用1]: evidence:E-20261023-01\n"
+    )
+    fn_map = parse_footnotes(draft_trad_def)
+    assert "引用1" not in fn_map
+    res1 = await aaudit_draft(
+        draft_trad_def,
+        thesis_doc=thesis_doc,
+        use_llm_judge=False,
+        user_id="local-dev-user",
+    )
+    assert res1.matched == 0
+    assert len(res1.unverified) == 1
+    assert res1.unverified[0]["hint"] == "[引用1] 在引用表中没有对应项"
+
+    # Case 2: Prose uses [^引用1], but definition is citation table [引用1]:
+    draft_cit_def = (
+        "# META 报告\n\n"
+        "2Q26 广告收入为 594 亿美元[^引用1]。\n\n"
+        "## 引用\n"
+        "[引用1]: evidence:E-20261023-01\n"
+    )
+    res2 = await aaudit_draft(
+        draft_cit_def,
+        thesis_doc=thesis_doc,
+        use_llm_judge=False,
+        user_id="local-dev-user",
+    )
+    assert res2.matched == 0
+    assert len(res2.unverified) == 1
+
+
+@pytest.mark.asyncio
+async def test_publish_remaining_exit_points_include_unified_audit_summary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify review_unavailable, review_revise, and PM rejected exit points all include the 4-bucket audit summary."""
+    # The rejected branch is PM-only; pin the PM list so the host's
+    # DALTON_PM_USER_IDS cannot turn it into awaiting_pm.
+    monkeypatch.setenv("DALTON_PM_USER_IDS", "local-dev-user")
+    from src.dalton import auth as dalton_auth
+    from src.dalton.database import knowledge as db_knowledge
+    from src.dalton.database import publications as db_publications
+    from src.dalton.publish import service as publish_svc
+    from src.dalton.publish.files import compute_bundle_sha256
+    from src.dalton.publish.review import ReviewResult, ReviewVerdict
+
+    draft = (
+        "# META 报告\n\n"
+        "2Q26 广告收入为 594 亿美元 [引用1]。\n\n"
+        "## 引用\n"
+        "[引用1]: evidence:E-20261023-01\n"
+    )
+    thesis_doc = {
+        "evidence": [
+            {
+                "id": "E-20261023-01",
+                "fact": "2Q26 ad revenue 59.4B USD.",
+                "figures": [
+                    {
+                        "metric": "广告收入",
+                        "value": 59.4,
+                        "unit": "USD_bn",
+                        "period": "2Q26",
+                        "label": "reported",
+                    }
+                ],
+            }
+        ]
+    }
+    audit_ok = await aaudit_draft(
+        draft,
+        thesis_doc=thesis_doc,
+        use_llm_judge=False,
+        user_id="local-dev-user",
+    )
+    assert audit_ok.passed
+    bundle_sha = compute_bundle_sha256(draft.encode("utf-8"), [])
+
+    class _BackendProto:
+        async def aread_text(self, path: str) -> str | None: ...
+        async def awrite_text(self, path: str, content: str) -> None: ...
+
+    files_store: dict[str, str] = {"drafts/meta.md": draft}
+    backend = create_autospec(_BackendProto, instance=True)
+    backend.aread_text.side_effect = lambda p: files_store.get(p)
+    backend.awrite_text.side_effect = lambda p, c: files_store.__setitem__(p, c)
+
+    monkeypatch.setattr(
+        publish_svc,
+        "verify_workspace_access",
+        create_autospec(dalton_auth.verify_workspace_access, return_value={"workspace_id": "ws-1"}),
+    )
+    monkeypatch.setattr(
+        publish_svc,
+        "_load_workspace_provenance",
+        create_autospec(publish_svc._load_workspace_provenance, return_value={}),
+    )
+    monkeypatch.setattr(
+        db_knowledge,
+        "list_all_latest_for_workspace",
+        create_autospec(
+            db_knowledge.list_all_latest_for_workspace,
+            return_value={"thesis": {"content": thesis_doc, "version_no": 1}},
+        ),
+    )
+    monkeypatch.setattr(
+        db_publications,
+        "resolve_thread_author_model",
+        create_autospec(db_publications.resolve_thread_author_model, return_value="claude-opus-5-5-oauth"),
+    )
+    monkeypatch.setattr(
+        publish_svc,
+        "_append_agenda_pm_handoff",
+        create_autospec(publish_svc._append_agenda_pm_handoff, return_value=None),
+    )
+
+    state_row: dict[str, Any] = {
+        "publish_request_id": "req-exit",
+        "workspace_id": "ws-1",
+        "user_id": "local-dev-user",
+        "status": "reviewing",
+        "bundle_sha256": bundle_sha,
+        "audit": audit_ok.to_dict(),
+    }
+
+    async def _transition_side_effect(
+        publish_request_id: str,
+        from_statuses: Any,
+        to: str,
+        **cols: Any,
+    ) -> dict[str, Any]:
+        state_row["status"] = to
+        state_row.update(cols)
+        return dict(state_row)
+
+    monkeypatch.setattr(
+        db_publications,
+        "get_or_create_request",
+        create_autospec(db_publications.get_or_create_request, side_effect=lambda **kw: (dict(state_row), False)),
+    )
+    monkeypatch.setattr(
+        db_publications,
+        "transition",
+        create_autospec(db_publications.transition, side_effect=_transition_side_effect),
+    )
+
+    # 1. review_unavailable exit point
+    mock_run_review = create_autospec(
+        publish_svc.run_review,
+        return_value=ReviewResult(status="unavailable", reason="no reviewer credentials"),
+    )
+    monkeypatch.setattr(publish_svc, "run_review", mock_run_review)
+    res_unavail = await publish_svc.run_publish(
+        user_id="local-dev-user",
+        workspace_id="ws-1",
+        thread_id="t-1",
+        tool_call_id="tc-1",
+        draft_path="drafts/meta.md",
+        title="META",
+        kind="initial_coverage",
+        slug="meta",
+        backend=backend,
+    )
+    assert res_unavail["status"] == "review_unavailable"
+    assert "已核实 1 / 冲突 0 / 未核实 0 / 不需核实 0" in res_unavail["message"]
+
+    # 2. review_revise exit point
+    state_row["status"] = "reviewing"
+    mock_run_review.return_value = ReviewResult(
+        status="done",
+        model="gpt-6.1-sol-oauth",
+        family="openai-gpt",
+        verdict=ReviewVerdict(
+            verdict="revise",
+            summary="need fix",
+            items=[],
+            must_fix=["补充风险章节"],
+            nice_to_have=[],
+        ),
+    )
+    res_revise = await publish_svc.run_publish(
+        user_id="local-dev-user",
+        workspace_id="ws-1",
+        thread_id="t-1",
+        tool_call_id="tc-1",
+        draft_path="drafts/meta.md",
+        title="META",
+        kind="initial_coverage",
+        slug="meta",
+        backend=backend,
+    )
+    assert res_revise["status"] == "review_revise"
+    assert "已核实 1 / 冲突 0 / 未核实 0 / 不需核实 0" in res_revise["message"]
+
+    # 3. PM rejected exit point
+    state_row["status"] = "awaiting_pm"
+    res_rejected = await publish_svc.run_publish(
+        user_id="local-dev-user",
+        workspace_id="ws-1",
+        thread_id="t-1",
+        tool_call_id="tc-1",
+        draft_path="drafts/meta.md",
+        title="META",
+        kind="initial_coverage",
+        slug="meta",
+        origin_type="user",
+        backend=backend,
+        interrupt_fn=lambda _payload: {"decisions": [{"type": "reject", "message": "暂缓发布"}]},
+    )
+    assert res_rejected["status"] == "rejected"
+    assert "已核实 1 / 冲突 0 / 未核实 0 / 不需核实 0" in res_rejected["message"]
+    assert "PM 拒绝发布：暂缓发布" in res_rejected["message"]
+
+
+
+
+
+
+
+
+
+
+@pytest.mark.asyncio
+async def test_audit_config_fingerprint_follows_the_users_resolved_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cache reuse keys on the per-user audit model/fallbacks/timeout, not the
+    raw yaml: changing a user's audit model must invalidate the cache."""
+    from src.dalton.publish import audit as audit_mod
+
+    models = {"model": "gemini-4-argon-medium-oauth"}
+
+    async def _model(user_id: str | None = None) -> str:
+        return models["model"]
+
+    async def _fallbacks(user_id: str | None = None) -> list[str]:
+        return ["gpt-6.1-sol-oauth"]
+
+    async def _timeout(user_id: str | None = None) -> int:
+        return 300
+
+    monkeypatch.setattr(audit_mod, "resolve_dalton_audit_model", create_autospec(audit_mod.resolve_dalton_audit_model, side_effect=_model))
+    monkeypatch.setattr(
+        audit_mod,
+        "resolve_dalton_audit_fallback_models",
+        create_autospec(audit_mod.resolve_dalton_audit_fallback_models, side_effect=_fallbacks),
+    )
+    monkeypatch.setattr(
+        audit_mod,
+        "resolve_dalton_audit_timeout_s",
+        create_autospec(audit_mod.resolve_dalton_audit_timeout_s, side_effect=_timeout),
+    )
+
+    first = await audit_mod.resolve_audit_config_fingerprint("u1")
+    models["model"] = "claude-opus-5-5-oauth"
+    second = await audit_mod.resolve_audit_config_fingerprint("u1")
+
+    assert first[0] == "gemini-4-argon-medium-oauth"
+    assert second[0] == "claude-opus-5-5-oauth"
+    assert first[3] != second[3]

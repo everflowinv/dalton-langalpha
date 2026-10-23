@@ -127,7 +127,8 @@ python3 .agents/skills/dalton-earnings-preview/scripts/predictions.py validate \
    - [ ] 信息身份、期间、口径完整保留，同源转述已去重不重复计票；
    - [ ] 历史回测模式下确认零未来信息泄漏（所有来源日期 `<= as_of`）；
    - [ ] “本轮未取得”与“通路/工具失败”分开写明；
-   - [ ] `predictions.py validate --strict` 通过，正文第五节“核对清单”与 `predictions.json` 一一对应。
+   - [ ] `predictions.py validate --strict` 通过，正文第五节“核对清单”与 `predictions.json` 一一对应；
+   - [ ] 末尾必须附引用表（在报告末尾 `## 引用` 一节按每行一条写出 `[引用1]: evidence:E-20261023-01` 或 `[引用3]: model:model/META-model-v01.xlsx!DCF!C12` 等核验来源对应关系）。
 3. **知识层写入与 `dalton-agenda` 收尾三步**：
    - 调用 `knowledge_update(doc="drivers", ...)` 追加本轮取得的高频指标最新读数；
    - 调用 `knowledge_update(doc="debate", ...)` 标注本次财报可检验的 debate；

@@ -267,3 +267,8 @@
 3. `[引用3]` {电话会纪要 AlphaEngine doc_id 与日期}
 4. `[引用4]` {AlphaEngine 卖方报告 / FUNDA AI / TMTB / Sales Notes 引用清单（机构、标题、日期、ID）}
 5. `[引用5]` {一致预期快照 `data/consensus/...`、行情基准与模型版本 `model/<TICKER>-model-v<NN>.xlsx`}
+
+<!-- 末尾必须附引用表 -->
+## 引用
+[引用1]: evidence:E-20261023-01
+[引用3]: model:model/META-model-v01.xlsx!DCF!C12

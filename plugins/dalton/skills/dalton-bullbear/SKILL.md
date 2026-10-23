@@ -100,7 +100,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
      - **否则**（`workflow.enabled` 未关闭）：`RunWorkflow` 不在工具列表时，先用 **Read 工具**（不要用 Bash `cat`）读 `.agents/skills/run-workflow/SKILL.md` 后重试；仍没有就停下，告诉 PM「RunWorkflow 不可用」，不要自行手动派发 Task 子智能体代跑。
 
 3. **主智能体核查与收尾**
-   - 检查 `drafts/<as_of>-bullbear.md` 是否存在，运行 `python .agents/skills/dalton-bullbear/scripts/bb_check.py drafts/<as_of>-bullbear.md` 确认 0 WARN。
+   - 检查 `drafts/<as_of>-bullbear.md` 是否存在，运行 `python .agents/skills/dalton-bullbear/scripts/bb_check.py drafts/<as_of>-bullbear.md` 确认 0 WARN。末尾必须附引用表（在报告末尾 `## 引用` 一节逐行写出 `[引用1]: evidence:E-20261023-01` 或 `[引用3]: model:model/META-model-v01.xlsx!DCF!C12` 等对应关系）。
    - 可选调用 `check_draft(draft_path="drafts/<as_of>-bullbear.md")` 查看数字核验反馈（草稿期不阻断）。
    - 执行下方知识层写入，向 PM 汇报核心判断、各 Debate 倾向变化及审稿结论。
 

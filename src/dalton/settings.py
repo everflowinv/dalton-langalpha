@@ -6,6 +6,8 @@ so service/handler modules never call ``os.getenv`` directly (per ``src/server/A
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import ipaddress
 import logging
 import os
@@ -74,6 +76,8 @@ class DaltonPublishConfig(BaseModel):
     audit_concurrency: int = Field(default=4, ge=1, le=16)
     # Wall-time budget for one whole audit (extraction, labelling, matching, judge), seconds.
     audit_total_timeout_s: float = Field(default=1800.0, gt=0)
+    audit_prompt_version: str = "audit_v1"
+    prompt_version: str = "audit_v1"
     approval_ttl_hours: int = Field(default=168, gt=0)
     max_file_bytes: int = Field(default=20_971_520, gt=0)
     consensus_providers: list[str] = Field(
@@ -689,3 +693,12 @@ def get_home_workspace_alias(user_id: str) -> str | None:
 
 
 HOME_WORKSPACE_ALIASES: dict[str, str] = get_home_workspace_aliases()
+
+def get_dalton_audit_cache_hmac_key() -> bytes | None:
+    """Derive the HMAC-SHA256 signing key for `.audit.md` cache blocks solely from ``DALTON_AUDIT_CACHE_KEY``."""
+    seed = os.getenv("DALTON_AUDIT_CACHE_KEY", "").strip()
+    if not seed:
+        return None
+    return hmac.new(seed.encode("utf-8"), b"dalton-audit-cache-v1", hashlib.sha256).digest()
+
+
