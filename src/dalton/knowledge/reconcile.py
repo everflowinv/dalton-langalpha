@@ -140,13 +140,25 @@ async def detect_direct_edits(
                             raise ValueError("top-level JSON value must be an object")
                         content_to_store = parsed
                         parse_error = None
+                        # Canonical, so the hash names the content, not the file's bytes.
+                        _, store_sha = canonical_json(parsed)
+                        unchanged = latest is not None and same_content(
+                            parsed, latest.get("content")
+                        )
                     except Exception as parse_err:
                         content_to_store = {"_raw": raw_text[:65536]}
                         parse_error = parse_err
+                        # ``_raw`` is truncated, so only the full-text hash can tell
+                        # two invalid files apart.
+                        store_sha = raw_sha
+                        unchanged = (
+                            latest is not None
+                            and isinstance(latest.get("content"), dict)
+                            and "_raw" in latest["content"]
+                            and latest.get("content_sha256") == raw_sha
+                        )
 
-                    if latest is not None and same_content(
-                        content_to_store, latest.get("content")
-                    ):
+                    if unchanged:
                         # Only the bytes differ (key order, whitespace, or a hash taken
                         # from another serialization): not an edit.
                         content_to_store = None
@@ -181,7 +193,7 @@ async def detect_direct_edits(
                             doc_key=doc_key,
                             base_version_no=latest["version_no"] if latest else None,
                             content=content_to_store,
-                            content_sha256=mirror_sha or raw_sha,
+                            content_sha256=store_sha,
                             reason="检测到未经 knowledge_update 的直接修改（文件面板或命令行）",
                             warnings=warnings,
                             schema_valid=schema_valid,

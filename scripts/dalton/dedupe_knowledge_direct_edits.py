@@ -8,10 +8,14 @@ edits whose content equals the previous version, each followed by a ``<doc>.md``
 A row is listed when it is
 - a ``data/<doc>.json`` direct_edit whose content equals the previous version's content
   (compared as parsed JSON), or
-- a ``<doc>.md`` marker whose immediate predecessor is such a row (the header bump);
+- a ``<doc>.md`` ``rendered_md_edited`` marker that immediately follows such a row and
+  whose recorded md hash equals the render of the version before it or of the duplicate
+  itself, i.e. the md was provably a stale auto-render and only the header bumped;
 and only when the listed rows are the tail of that doc's history, so deleting them never
-leaves a later version pointing at a missing base. Docs whose spurious rows are followed
-by real versions are reported and left alone.
+leaves a later version pointing at a missing base, and none of them was ever written to
+the sandbox (``files_written_at IS NULL``; the script never syncs files). Any other
+direct_edit after a duplicate (a real md edit, for one) leaves the whole doc alone, and a
+doc with a written candidate is refused; both are reported.
 
 Default is a read-only dry run (``default_transaction_read_only``). ``--apply`` needs
 ``--expect-count``; it writes a JSON snapshot of the rows first, then in one transaction
@@ -23,6 +27,7 @@ for that transaction only, and asserts the deleted row count.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from datetime import UTC, datetime
@@ -40,6 +45,7 @@ from scripts.dalton.migrate_owner_identity import (  # noqa: E402
     build_conninfo,
     resolve_db_params,
 )
+from src.dalton.knowledge.render import render_document_md  # noqa: E402
 
 TRIGGER = "trg_dalton_kv_guard"
 
@@ -58,44 +64,87 @@ def _canon(value: Any) -> str:
     return json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
 
 
+def _md_sha(doc_key: str, row: dict[str, Any], ticker: str) -> str | None:
+    md = render_document_md(
+        doc_key,
+        row["content"],
+        version_no=int(row["version_no"]),
+        at=row.get("created_at"),
+        ticker=ticker,
+    )
+    return hashlib.sha256(md.encode("utf-8")).hexdigest() if md else None
+
+
+def _is_stale_md_marker(
+    doc_key: str,
+    marker: dict[str, Any],
+    dup: dict[str, Any],
+    earlier: list[dict[str, Any]],
+    ticker: str,
+) -> bool:
+    if marker["source"] != "direct_edit" or marker["edited_path"] != f"{doc_key}.md":
+        return False
+    md_shas = [
+        w.get("md_sha256")
+        for w in (marker["warnings"] or [])
+        if isinstance(w, dict) and w.get("code") == "rendered_md_edited"
+    ]
+    if len(md_shas) != 1 or not md_shas[0]:
+        return False
+    prev_valid = next((v for v in reversed(earlier) if v.get("schema_valid", True)), None)
+    stale = {_md_sha(doc_key, dup, ticker)}
+    if prev_valid is not None:
+        stale.add(_md_sha(doc_key, prev_valid, ticker))
+    return md_shas[0] in stale
+
+
 def find_spurious(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[str]]:
     """Return ``(deletable_rows, notes)`` from one workspace's rows ordered by doc, version."""
     by_doc: dict[str, list[dict[str, Any]]] = {}
     for r in rows:
         by_doc.setdefault(r["doc_key"], []).append(r)
+    company_valid = [r for r in by_doc.get("company", []) if r.get("schema_valid", True)]
+    ticker = str(
+        ((company_valid[-1]["content"] or {}) if company_valid else {}).get("ticker") or ""
+    ).upper()
 
     deletable: list[dict[str, Any]] = []
     notes: list[str] = []
     for doc_key, versions in sorted(by_doc.items()):
         spurious_ids: set[str] = set()
-        for prev, cur in zip(versions, versions[1:]):
-            if cur["source"] != "direct_edit":
-                continue
-            if cur["edited_path"] == f"data/{doc_key}.json":
-                if _canon(cur["content"]) == _canon(prev["content"]):
-                    spurious_ids.add(cur["knowledge_version_id"])
-            elif (
-                prev["knowledge_version_id"] in spurious_ids
-                and cur["edited_path"] == f"{doc_key}.md"
-                and any(
-                    isinstance(w, dict) and w.get("code") == "rendered_md_edited"
-                    for w in (cur["warnings"] or [])
-                )
+        for i in range(1, len(versions)):
+            prev, cur = versions[i - 1], versions[i]
+            if (
+                cur["source"] == "direct_edit"
+                and cur["edited_path"] == f"data/{doc_key}.json"
+                and _canon(cur["content"]) == _canon(prev["content"])
+            ):
+                spurious_ids.add(cur["knowledge_version_id"])
+            elif prev["knowledge_version_id"] in spurious_ids and _is_stale_md_marker(
+                doc_key, cur, prev, versions[: i - 1], ticker
             ):
                 spurious_ids.add(cur["knowledge_version_id"])
         if not spurious_ids:
             continue
+        listed = sorted(
+            v["version_no"] for v in versions if v["knowledge_version_id"] in spurious_ids
+        )
         first = min(
             i for i, v in enumerate(versions) if v["knowledge_version_id"] in spurious_ids
         )
         tail = versions[first:]
-        if all(v["knowledge_version_id"] in spurious_ids for v in tail):
-            deletable.extend(tail)
-        else:
+        if not all(v["knowledge_version_id"] in spurious_ids for v in tail):
             notes.append(
-                f"{doc_key}: spurious rows are followed by real versions; left alone "
-                f"({sorted(v['version_no'] for v in versions if v['knowledge_version_id'] in spurious_ids)})"
+                f"{doc_key}: duplicates {listed} are followed by versions that are not "
+                "provably spurious; left alone"
             )
+        elif any(v["files_written_at"] is not None for v in tail):
+            notes.append(
+                f"{doc_key}: REFUSED, duplicates {listed} include a version already "
+                "written to the sandbox (files_written_at set); not deleting"
+            )
+        else:
+            deletable.extend(tail)
     return deletable, notes
 
 

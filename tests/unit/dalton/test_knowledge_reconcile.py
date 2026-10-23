@@ -301,41 +301,114 @@ async def test_concurrent_reconciles_record_at_most_one_version(
         assert call.kwargs["enforce_base"] is True
 
 
-def test_dedupe_script_lists_only_spurious_tail() -> None:
+def _hist_row(doc_key, no, source, content, edited_path=None, md_sha=None, written=False):
+    warnings = (
+        [{"code": "rendered_md_edited", "path": edited_path, "md_sha256": md_sha}]
+        if md_sha
+        else []
+    )
+    return {
+        "knowledge_version_id": f"{doc_key}-{no}",
+        "doc_key": doc_key,
+        "version_no": no,
+        "source": source,
+        "content": content,
+        "edited_path": edited_path,
+        "warnings": warnings,
+        "schema_valid": True,
+        "files_written_at": datetime(2026, 10, 23, tzinfo=timezone.utc) if written else None,
+        "created_at": datetime(2026, 10, 23, 15, 0, no, tzinfo=timezone.utc),
+    }
+
+
+def _rendered_sha(row: dict[str, Any]) -> str:
+    from src.dalton.knowledge.render import render_document_md
+
+    md = render_document_md(
+        "lessons", row["content"], version_no=row["version_no"], at=row["created_at"]
+    )
+    return hashlib.sha256(md.encode()).hexdigest()
+
+
+def test_dedupe_script_lists_only_provably_spurious_tail() -> None:
+    from scripts.dalton.dedupe_knowledge_direct_edits import find_spurious
+
+    doc = _lessons_doc()
+    v1 = _hist_row("lessons", 1, "tool", doc, written=True)
+    # The incident shape: same-content json row, then the md header bump whose
+    # recorded hash is the stale v1 render.
+    v2 = _hist_row("lessons", 2, "direct_edit", _jsonb_order(doc), "data/lessons.json")
+    v3 = _hist_row("lessons", 3, "direct_edit", doc, "lessons.md", md_sha=_rendered_sha(v1))
+
+    deletable, notes = find_spurious([v1, v2, v3])
+
+    assert [r["knowledge_version_id"] for r in deletable] == ["lessons-2", "lessons-3"]
+    assert notes == []
+
+
+def test_dedupe_script_keeps_doc_with_real_md_edit_after_header_bump() -> None:
+    from scripts.dalton.dedupe_knowledge_direct_edits import find_spurious
+
+    doc = _lessons_doc()
+    v1 = _hist_row("lessons", 1, "tool", doc, written=True)
+    v2 = _hist_row("lessons", 2, "direct_edit", doc, "data/lessons.json")
+    v3 = _hist_row("lessons", 3, "direct_edit", doc, "lessons.md", md_sha="f" * 64)
+
+    deletable, notes = find_spurious([v1, v2, v3])
+
+    assert deletable == []
+    assert len(notes) == 1 and "left alone" in notes[0]
+
+
+def test_dedupe_script_refuses_written_candidates_and_keeps_real_edits() -> None:
     from scripts.dalton.dedupe_knowledge_direct_edits import find_spurious
 
     doc = _lessons_doc()
     edited = copy.deepcopy(doc)
     edited["lessons"][0]["statement"] = "real edit"
-
-    def row(doc_key, no, source, content, edited_path=None, codes=()):
-        return {
-            "knowledge_version_id": f"{doc_key}-{no}",
-            "doc_key": doc_key,
-            "version_no": no,
-            "source": source,
-            "content": content,
-            "edited_path": edited_path,
-            "warnings": [{"code": c} for c in codes],
-        }
-
     rows = [
-        # The incident shape: tool v1, same-content json row, then the md header bump.
-        row("lessons", 1, "tool", doc),
-        row("lessons", 2, "direct_edit", _jsonb_order(doc), "data/lessons.json"),
-        row("lessons", 3, "direct_edit", doc, "lessons.md", ("rendered_md_edited",)),
-        # A real edit, and a real md edit after a real version, stay.
-        row("debate", 1, "tool", doc),
-        row("debate", 2, "direct_edit", edited, "data/debate.json"),
-        row("agenda", 1, "tool", doc),
-        row("agenda", 2, "direct_edit", doc, "agenda.md", ("rendered_md_edited",)),
-        # Spurious rows followed by a real version are not deletable.
-        row("thesis", 1, "tool", doc),
-        row("thesis", 2, "direct_edit", doc, "data/thesis.json"),
-        row("thesis", 3, "tool", edited),
+        _hist_row("lessons", 1, "tool", doc, written=True),
+        _hist_row("lessons", 2, "direct_edit", doc, "data/lessons.json", written=True),
+        _hist_row("debate", 1, "tool", doc, written=True),
+        _hist_row("debate", 2, "direct_edit", edited, "data/debate.json"),
+        _hist_row("thesis", 1, "tool", doc, written=True),
+        _hist_row("thesis", 2, "direct_edit", doc, "data/thesis.json"),
+        _hist_row("thesis", 3, "tool", edited),
     ]
 
     deletable, notes = find_spurious(rows)
 
-    assert [r["knowledge_version_id"] for r in deletable] == ["lessons-2", "lessons-3"]
-    assert len(notes) == 1 and notes[0].startswith("thesis:")
+    assert deletable == []
+    assert sorted(n.split(":")[0] for n in notes) == ["lessons", "thesis"]
+    assert "REFUSED" in next(n for n in notes if n.startswith("lessons"))
+
+
+@pytest.mark.asyncio
+async def test_direct_edit_json_row_stores_canonical_sha(env: dict[str, Any]) -> None:
+    await _tool_write(env, _lessons_doc())
+    edited = _lessons_doc()
+    edited["lessons"][0]["statement"] = "Edited by hand"
+    env["backend"].files[data_path("lessons")] = json.dumps(edited)
+
+    out = await reconcile.detect_direct_edits(WS, USER)
+
+    assert out["recorded_versions"][0]["content_sha256"] == canonical_json(edited)[1]
+    assert (await reconcile.detect_direct_edits(WS, USER))["recorded_versions"] == []
+
+
+@pytest.mark.asyncio
+async def test_invalid_json_compared_by_full_raw_sha(env: dict[str, Any]) -> None:
+    await _tool_write(env, _lessons_doc())
+    prefix = "{" + "x" * 70000
+    env["backend"].files[data_path("lessons")] = prefix + "A"
+
+    first = await reconcile.detect_direct_edits(WS, USER)
+    assert len(first["recorded_versions"]) == 1
+    assert first["recorded_versions"][0]["schema_valid"] is False
+
+    # Same truncated ``_raw`` prefix, different file: still a new edit.
+    env["backend"].files[data_path("lessons")] = prefix + "B"
+    second = await reconcile.detect_direct_edits(WS, USER)
+    assert len(second["recorded_versions"]) == 1
+
+    assert (await reconcile.detect_direct_edits(WS, USER))["recorded_versions"] == []
