@@ -301,11 +301,12 @@ async def get_providers_status(*, user_id: str) -> dict[str, Any]:
                 "has_env": has_env,
                 "has_byok": has_byok,
             }
-            if has_byok:
+            # With the .env key present the BYOK copy is redundant, not a risk: say nothing.
+            if has_byok and not has_env:
                 warnings.append(
                     {
                         "code": "byok_cash_key",
-                        "message": f"现金供应商 {prov} 配置了设置页 BYOK key（L19 建议放入 .env {env_key}，以便运行中实时强制执行日额度上限）。",
+                        "message": f"现金供应商 {prov} 的 key 只配置在 BYOK 中；建议放入 .env {env_key}，运行中才能实时执行日额度上限。",
                     }
                 )
 
