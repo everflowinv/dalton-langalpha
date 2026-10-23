@@ -371,8 +371,9 @@ async def test_muse_headers_main_and_subagent_wire_transport_and_traceparent():
     assert nested_headers["x-tbh-parent-thread-id"] == sub_session_id
 
 
-def test_muse_brotli_decompression():
-    import brotli
+def test_muse_mint_response_gzip_decoding():
+    # The mint endpoint answers gzip when br is not advertised (httpx omits br without brotli installed).
+    import gzip
     import httpx
 
     payload = {
@@ -388,12 +389,12 @@ def test_muse_brotli_decompression():
         },
     }
     raw_json = json.dumps(payload).encode("utf-8")
-    compressed = brotli.compress(raw_json)
+    compressed = gzip.compress(raw_json)
     assert compressed != raw_json
 
     resp = httpx.Response(
         200,
-        headers={"content-encoding": "br", "content-type": "application/json"},
+        headers={"content-encoding": "gzip", "content-type": "application/json"},
         content=compressed,
     )
     assert resp.json() == payload
@@ -403,7 +404,7 @@ def test_muse_brotli_decompression():
 async def test_muse_poll_mints_api_key_and_caches_metadata(monkeypatch: pytest.MonkeyPatch):
     from datetime import datetime, timezone
     from unittest.mock import create_autospec, patch
-    import brotli
+    import gzip
     import httpx
     import redis.asyncio as aioredis
     import src.dalton.app.oauth_native as oauth_native_mod
@@ -432,7 +433,7 @@ async def test_muse_poll_mints_api_key_and_caches_metadata(monkeypatch: pytest.M
             "tier": "Pro",
         },
     }
-    compressed_mint_body = brotli.compress(
+    compressed_mint_body = gzip.compress(
         json.dumps(mint_response_payload).encode("utf-8")
     )
 
@@ -449,7 +450,7 @@ async def test_muse_poll_mints_api_key_and_caches_metadata(monkeypatch: pytest.M
         if url == muse_oauth_mod.MUSE_MINT_KEY_URL:
             return httpx.Response(
                 200,
-                headers={"content-encoding": "br", "content-type": "application/json"},
+                headers={"content-encoding": "gzip", "content-type": "application/json"},
                 content=compressed_mint_body,
             )
         raise AssertionError(f"Unexpected URL: {url}")
