@@ -5,6 +5,21 @@ timezone: "Asia/Shanghai"
 credentials:
   sharing: team
 
+network:
+  # The host proxy runs in fake-IP mode: inside the backend container DNS answers
+  # every public host with an address in 198.18.0.0/15 (benchmarking space, which
+  # Python classes as private). The in-house fetch guard lets exactly these ranges
+  # through; an entry overlapping RFC1918, loopback, link-local or ULA is dropped
+  # with an error log.
+  fake_ip_cidrs: ["198.18.0.0/15"]
+  # A fake-IP hides where the proxy will really connect, so for a fake-IP answer
+  # the guard also looks up the host's real A/AAAA records over DNS-over-HTTPS
+  # (JSON API, tried in order, 3s timeout) and blocks if any is private or the
+  # lookup fails.
+  fake_ip_real_resolver:
+    - "https://1.1.1.1/dns-query"
+    - "https://dns.google/resolve"
+
 llm:
   # Number audit (check_draft / publish): labelling and judging figures, read via
   # assist role "audit". Measured on a 48k-character draft: argon-medium labelled all

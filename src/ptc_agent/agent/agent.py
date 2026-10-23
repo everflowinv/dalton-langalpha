@@ -20,7 +20,8 @@ from ptc_agent.core.paths import SandboxLayout, WorkspaceLayout
 from ptc_agent.core.project_context import ProjectContext
 from ptc_agent.agent.limits import UNBOUNDED_RECURSION_LIMIT
 from ptc_agent.agent.main_state import MainAgentState
-from deepagents.middleware.patch_tool_calls import PatchToolCallsMiddleware
+# DALTON-HOOK(dalton-patch-tool-calls): dangling calls are reported as possibly run, not cancelled.
+from src.dalton.middleware.patch_tool_calls import DaltonPatchToolCallsMiddleware
 from langchain_anthropic.middleware import AnthropicPromptCachingMiddleware
 
 from ptc_agent.agent.middleware import (
@@ -808,7 +809,7 @@ class PTCAgent:
                 AnthropicPromptCachingMiddleware(unsupported_model_behavior="ignore"),
                 OpenAIPromptCachingMiddleware(),
                 EmptyToolCallRetryMiddleware(),
-                PatchToolCallsMiddleware(),
+                DaltonPatchToolCallsMiddleware(),  # DALTON-HOOK(dalton-patch-tool-calls)
                 # Innermost: carries the turn's rows in the shape this model
                 # accepts and pins the tail breakpoint on the last block.
                 TailEnvelopeMiddleware(
@@ -991,7 +992,7 @@ class PTCAgent:
                     else []
                 ),
                 EmptyToolCallRetryMiddleware(),
-                PatchToolCallsMiddleware(),
+                DaltonPatchToolCallsMiddleware(),  # DALTON-HOOK(dalton-patch-tool-calls)
                 context.turn,
                 # DALTON-HOOK(knowledge-reconcile-mw): reconcile direct edits and pending knowledge files before baseline reads agent.md (PK.5).
                 DaltonReconcileMiddleware(workspace_id=workspace_id_for_memory, backend=filesystem_backend, user_id=user_id),

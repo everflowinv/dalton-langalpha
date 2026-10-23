@@ -26,8 +26,36 @@ class BlockedAddressError(httpx.RequestError):
     """A request target resolved to a private/reserved address."""
 
 
-def _ip_is_blocked(ip: str) -> bool:
+# DALTON-HOOK(fake-ip-allow): behind a fake-IP proxy every public host resolves
+# into a benchmarking range that ``is_private`` flags; only the configured ranges
+# are exempt (src/dalton/network.py). An unavailable or unreadable config exempts
+# nothing, so the upstream check applies unchanged.
+def _is_fake_ip(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    try:
+        from src.dalton.network import is_fake_ip_exempt
+
+        return is_fake_ip_exempt(addr)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+async def _fake_ip_block_reason(host: str, addresses: list[str]) -> str | None:
+    if not any(_is_fake_ip(ipaddress.ip_address(ip)) for ip in addresses):
+        return None
+    try:
+        from src.dalton.network import fake_ip_block_reason
+
+        return await fake_ip_block_reason(
+            host, addresses, lambda ip: _ip_is_blocked(ip, allow_fake_ip=False)
+        )
+    except Exception as exc:  # noqa: BLE001 - fail closed
+        return f"Blocked {host!r}: fake-IP check failed ({type(exc).__name__})"
+
+
+def _ip_is_blocked(ip: str, *, allow_fake_ip: bool = True) -> bool:
     addr = ipaddress.ip_address(ip)
+    if allow_fake_ip and _is_fake_ip(addr):  # DALTON-HOOK(fake-ip-allow)
+        return False
     return (
         addr.is_private
         or addr.is_loopback
@@ -64,10 +92,18 @@ class GuardedAsyncTransport(httpx.AsyncHTTPTransport):
             raise BlockedAddressError(
                 f"DNS resolution failed for {host!r}", request=request
             ) from exc
+        # TODO(dns-rebinding): the check resolves the host, then the connection
+        # below resolves it again, so a host can answer public here and private
+        # there. Closing it means connecting to the address checked here.
         for ip in addresses:
             if _ip_is_blocked(ip):
                 raise BlockedAddressError(
                     f"Blocked private/reserved address {ip} for host {host!r}",
                     request=request,
                 )
+        # DALTON-HOOK(fake-ip-allow): a fake-IP answer hides the real target the
+        # proxy will connect to; check the host's real addresses as well.
+        reason = await _fake_ip_block_reason(host, addresses)
+        if reason:
+            raise BlockedAddressError(reason, request=request)
         return await super().handle_async_request(request)

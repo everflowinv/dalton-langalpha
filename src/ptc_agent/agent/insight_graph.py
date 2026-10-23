@@ -8,7 +8,8 @@ no store, no runtime context.
 
 from typing import Any
 
-from deepagents.middleware.patch_tool_calls import PatchToolCallsMiddleware
+# DALTON-HOOK(dalton-patch-tool-calls): dangling calls are reported as possibly run, not cancelled.
+from src.dalton.middleware.patch_tool_calls import DaltonPatchToolCallsMiddleware
 from langchain.agents import create_agent
 from langchain_anthropic.middleware import AnthropicPromptCachingMiddleware
 
@@ -103,7 +104,7 @@ def build_insight_graph(config: AgentConfig) -> Any:
             AnthropicPromptCachingMiddleware(unsupported_model_behavior="ignore"),
             OpenAIPromptCachingMiddleware(),
             EmptyToolCallRetryMiddleware(),
-            PatchToolCallsMiddleware(),
+            DaltonPatchToolCallsMiddleware(),  # DALTON-HOOK(dalton-patch-tool-calls)
             # Inside model resilience, so it sanitizes against the model a
             # fallback actually calls.
             ReasoningCompatibilityMiddleware(),
