@@ -70,7 +70,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 当 PM 要求完整文档、深度多空成稿，或议程自动任务触发完整成稿时：
 
 1. **加载 workflow 工具**
-   - 先读 `.agents/skills/run-workflow/SKILL.md` 以解锁 `RunWorkflow`。
+   - 用 Read 工具读 `.agents/skills/run-workflow/SKILL.md` 了解 workflow 规范（workflow 启用时，加载本 skill 会自动解锁 `RunWorkflow`）。
    - 读 `.agents/skills/dalton-bullbear/references/v42-structure.md` 与 `references/return-branch.md` 了解产物标准。
 
 2. **启动 `bullbear-doc`**
@@ -95,7 +95,9 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
      - **阶段 3（主稿）**：按 `references/v42-structure.md` 和 `templates/bullbear.md` 撰写 `main.md`，跑 `scripts/bb_check.py` 修到 0 WARN。
      - **阶段 4（合并与审稿）**：把 `return.md` 插入 `<!-- INSERT:return -->`、`return_appendix.md` 插入 `<!-- INSERT:return_appendix -->`，生成 `drafts/<as_of>-bullbear.md`，复跑 `bb_check.py` 到 0 WARN，并派 `dalton-reviewer` 独立审稿。
      - **阶段 5（修订）**：按审稿意见处理全部 P0 与可改 P1，复跑 `bb_check.py` 确认 0 WARN。
-   - **Workflow 不可用时的降级路径**：若 `config.yaml: workflow.enabled` 关闭导致 `RunWorkflow` 不可用，主智能体按上述阶段 1→5 的顺序手动执行脚本与支线写作，最终输出到 `drafts/<as_of>-bullbear.md`。
+   - **Workflow 不可用时的降级路径**：
+     - **`workflow.enabled` 已关闭**（工具列表本来就不会有 `RunWorkflow`）：主智能体按上述阶段 1→5 的顺序手动执行脚本与支线写作，最终输出到 `drafts/<as_of>-bullbear.md`，并逐阶段核对产物。
+     - **否则**（`workflow.enabled` 未关闭）：`RunWorkflow` 不在工具列表时，先用 **Read 工具**（不要用 Bash `cat`）读 `.agents/skills/run-workflow/SKILL.md` 后重试；仍没有就停下，告诉 PM「RunWorkflow 不可用」，不要自行手动派发 Task 子智能体代跑。
 
 3. **主智能体核查与收尾**
    - 检查 `drafts/<as_of>-bullbear.md` 是否存在，运行 `python .agents/skills/dalton-bullbear/scripts/bb_check.py drafts/<as_of>-bullbear.md` 确认 0 WARN。

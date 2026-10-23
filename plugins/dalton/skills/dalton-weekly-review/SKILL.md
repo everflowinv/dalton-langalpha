@@ -10,7 +10,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 
 ## 运行位置与职责边界
 
-1. **先读 `run-workflow`**：执行本 skill 第一步必须先读取 `.agents/skills/run-workflow/SKILL.md` 以解锁 `RunWorkflow` 工具。
+1. **先读 `run-workflow`**：执行本 skill 第一步必须先用 Read 工具读取 `.agents/skills/run-workflow/SKILL.md` 了解 workflow 规范（workflow 启用时，加载本 skill 会自动解锁 `RunWorkflow`）。
 2. **在 Home 运行**：周会是跨公司的全局复盘，在 `Home` 工作区由研究总监（Chief of Staff）运行（对应每周末自动任务 `dalton-director-weekly.json`）。
 3. **只读兄弟工作区、只写周会目录**：
    - 子智能体通过相对路径读取各公司工作区的知识层（如 `../META/thesis.md`、`../META/debate.md`、`../META/verdicts.md`、`../META/data/consensus/`；批量概览可先调 `dalton_coverage_board`）；
@@ -44,7 +44,11 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 }
 ```
 
-#### Workflow 内部四阶段概览（当 `workflow.enabled` 关闭时按此顺序手动执行）：
+Workflow 不可用时：
+- **`workflow.enabled` 已关闭**（工具列表本来就不会有 `RunWorkflow`）：主智能体按下列四阶段的顺序手动执行，并逐阶段核对产物。
+- **否则**（`workflow.enabled` 未关闭）：`RunWorkflow` 不在工具列表时，先用 **Read 工具**（不要用 Bash `cat`）读 `.agents/skills/run-workflow/SKILL.md` 后重试；仍没有就停下，告诉 PM「RunWorkflow 不可用」，不要自行手动派发 Task 子智能体代跑。
+
+#### Workflow 内部四阶段概览（仅当 `workflow.enabled` 关闭时按此顺序手动执行）：
 1. **阶段 1：筛选与归因（`筛选`）**：
    - 运行 `.agents/skills/dalton-weekly-review/scripts/screen_movers.py` 与 `.agents/skills/dalton-weekly-review/scripts/attribution.py`；
    - 输出 `dalton/research/weekly-<end>/screen.json` 与 `attribution.json`；

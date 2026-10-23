@@ -30,7 +30,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 ## 二、执行流程（启动 `initial-coverage` workflow）
 
 1. **加载 `run-workflow` 工具**
-   - 先读 `.agents/skills/run-workflow/SKILL.md` 解锁 `RunWorkflow` 工具。
+   - 用 Read 工具读 `.agents/skills/run-workflow/SKILL.md` 了解 workflow 规范（workflow 启用时，加载本 skill 会自动解锁 `RunWorkflow`）。
    - 读 `.agents/skills/dalton-conventions/SKILL.md` 确认买方初筛标准。
 
 2. **调用 `RunWorkflow`**
@@ -61,7 +61,8 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
    - **阶段 5（独立审稿与修订）**：由 `dalton-reviewer` 审阅重点题（Q1–Q5、Q7、Q8、Q12）、壁垒判断与估值分解表，再由修订子智能体完成 P0 修改并同步更新 `knowledge-proposal.json`。
 
 3. **Workflow 不可用时的手动降级路径**
-   - 若 `config.yaml: workflow.enabled` 关闭导致 `RunWorkflow` 不可用，主智能体按上述阶段 1→5 的顺序依次派发 `dalton-evidence` / `general-purpose` 子智能体（或亲自执行）生成全部产物文件。
+   - **`workflow.enabled` 已关闭**（工具列表本来就不会有 `RunWorkflow`）：主智能体按上述阶段 1→5 的顺序手动执行（依次派发 `dalton-evidence` / `general-purpose` 子智能体或亲自执行），生成全部产物文件，并逐阶段核对产物。
+   - **否则**（`workflow.enabled` 未关闭）：`RunWorkflow` 不在工具列表时，先用 **Read 工具**（不要用 Bash `cat`）读 `.agents/skills/run-workflow/SKILL.md` 后重试；仍没有就停下，告诉 PM「RunWorkflow 不可用」，不要自行手动派发 Task 子智能体代跑。
 
 ---
 

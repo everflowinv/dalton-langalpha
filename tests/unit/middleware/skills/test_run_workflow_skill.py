@@ -72,7 +72,9 @@ def test_skill_md_frontmatter_matches_registry(shipped_skill_md):
 
 def test_tool_hidden_until_skill_loaded():
     middleware = SkillsMiddleware()
-    assert middleware._tool_to_skills[TOOL_NAME] == {SKILL_NAME}
+    # DALTON-HOOK(skill-autoload): Dalton orchestration skills requiring
+    # run-workflow gate RunWorkflow too.
+    assert SKILL_NAME in middleware._tool_to_skills[TOOL_NAME]
 
     run_workflow = SimpleNamespace(name=TOOL_NAME)
     plain = SimpleNamespace(name="execute_code")
