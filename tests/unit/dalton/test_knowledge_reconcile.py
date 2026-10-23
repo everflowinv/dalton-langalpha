@@ -412,3 +412,40 @@ async def test_invalid_json_compared_by_full_raw_sha(env: dict[str, Any]) -> Non
     assert len(second["recorded_versions"]) == 1
 
     assert (await reconcile.detect_direct_edits(WS, USER))["recorded_versions"] == []
+
+
+def test_dedupe_script_keeps_consecutive_md_markers() -> None:
+    from scripts.dalton.dedupe_knowledge_direct_edits import find_spurious
+
+    doc = _lessons_doc()
+    v1 = _hist_row("lessons", 1, "tool", doc, written=True)
+    v2 = _hist_row("lessons", 2, "direct_edit", doc, "data/lessons.json")
+    stale = _rendered_sha(v1)
+    v3 = _hist_row("lessons", 3, "direct_edit", doc, "lessons.md", md_sha=stale)
+    # A second md marker right after the first is not a header bump of a json duplicate.
+    v4 = _hist_row("lessons", 4, "direct_edit", doc, "lessons.md", md_sha=stale)
+
+    deletable, notes = find_spurious([v1, v2, v3, v4])
+
+    assert deletable == []
+    assert len(notes) == 1 and "left alone" in notes[0]
+
+
+def test_dedupe_script_compares_invalid_json_by_full_sha() -> None:
+    from scripts.dalton.dedupe_knowledge_direct_edits import find_spurious
+
+    raw = {"_raw": "{" + "x" * 10}
+    v1 = _hist_row("lessons", 1, "tool", _lessons_doc(), written=True)
+    v2 = _hist_row("lessons", 2, "direct_edit", raw, "data/lessons.json", written=True)
+    v2["schema_valid"] = False
+    v2["content_sha256"] = "a" * 64
+    same = {**_hist_row("lessons", 3, "direct_edit", raw, "data/lessons.json"),
+            "schema_valid": False, "content_sha256": "a" * 64}
+    differs = {**same, "knowledge_version_id": "lessons-3b", "content_sha256": "b" * 64}
+
+    deletable, _ = find_spurious([v1, v2, same])
+    assert [r["knowledge_version_id"] for r in deletable] == ["lessons-3"]
+
+    # Same truncated ``_raw``, different full-text sha: not provably a duplicate.
+    deletable, notes = find_spurious([v1, v2, differs])
+    assert deletable == [] and notes == []

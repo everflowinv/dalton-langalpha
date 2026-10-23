@@ -98,6 +98,22 @@ def _is_stale_md_marker(
     return md_shas[0] in stale
 
 
+def _is_raw(content: Any) -> bool:
+    return isinstance(content, dict) and "_raw" in content
+
+
+def _same_json(cur: dict[str, Any], prev: dict[str, Any]) -> bool:
+    """Equal parsed content; invalid-JSON rows only by their full-text sha (``_raw`` is truncated)."""
+    if _is_raw(cur["content"]) or _is_raw(prev["content"]):
+        return (
+            _is_raw(cur["content"])
+            and _is_raw(prev["content"])
+            and bool(cur["content_sha256"])
+            and cur["content_sha256"] == prev["content_sha256"]
+        )
+    return _canon(cur["content"]) == _canon(prev["content"])
+
+
 def find_spurious(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[str]]:
     """Return ``(deletable_rows, notes)`` from one workspace's rows ordered by doc, version."""
     by_doc: dict[str, list[dict[str, Any]]] = {}
@@ -117,11 +133,13 @@ def find_spurious(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], lis
             if (
                 cur["source"] == "direct_edit"
                 and cur["edited_path"] == f"data/{doc_key}.json"
-                and _canon(cur["content"]) == _canon(prev["content"])
+                and _same_json(cur, prev)
             ):
                 spurious_ids.add(cur["knowledge_version_id"])
-            elif prev["knowledge_version_id"] in spurious_ids and _is_stale_md_marker(
-                doc_key, cur, prev, versions[: i - 1], ticker
+            elif (
+                prev["knowledge_version_id"] in spurious_ids
+                and prev["edited_path"] == f"data/{doc_key}.json"
+                and _is_stale_md_marker(doc_key, cur, prev, versions[: i - 1], ticker)
             ):
                 spurious_ids.add(cur["knowledge_version_id"])
         if not spurious_ids:
@@ -224,12 +242,13 @@ def run(
             cur.execute(f"ALTER TABLE dalton_knowledge_versions DISABLE TRIGGER {TRIGGER}")
             cur.execute(
                 "DELETE FROM dalton_knowledge_versions "
-                "WHERE workspace_id = %s AND knowledge_version_id = ANY(%s::uuid[])",
+                "WHERE workspace_id = %s AND knowledge_version_id = ANY(%s::uuid[]) "
+                "AND files_written_at IS NULL",
                 (workspace_id, expected_ids),
             )
             deleted = cur.rowcount
             cur.execute(f"ALTER TABLE dalton_knowledge_versions ENABLE TRIGGER {TRIGGER}")
-            if deleted != len(expected_ids):
+            if deleted != len(expected_ids) or deleted != expect_count:
                 raise RuntimeError(
                     f"deleted {deleted} rows, expected {len(expected_ids)}; rolled back"
                 )
