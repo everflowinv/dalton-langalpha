@@ -637,7 +637,31 @@ async def dalton_complete(
     """
     effective_model = (model or request_model or "").strip()
     if not effective_model:
-        effective_model = "deepseek-flash" if slot == "background" else "claude-opus-5-5-oauth"
+        try:
+            from src.dalton.llm.role_policy import _load_default_agent_config
+
+            llm_cfg = _load_default_agent_config().get("llm") or {}
+            if slot == "background":
+                effective_model = str(llm_cfg.get("background") or "").strip()
+            else:
+                effective_model = str(
+                    llm_cfg.get("name") or llm_cfg.get("preferred_model") or ""
+                ).strip()
+        except Exception:
+            pass
+        if not effective_model and slot == "background":
+            try:
+                from src.dalton.settings import get_dalton_settings
+
+                effective_model = str(
+                    get_dalton_settings().models.assist_model or ""
+                ).strip()
+            except Exception:
+                pass
+    if not effective_model:
+        raise ValueError(
+            f"默认模型未配置（slot={slot}，请在 agent_config.dalton.yaml / dalton.yaml 中配置或显式传入 model）"
+        )
 
     billing_type, provider = resolve_model_billing_and_provider(effective_model)
     if scope_ref:

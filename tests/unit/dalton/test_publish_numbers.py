@@ -275,16 +275,17 @@ async def test_facts_ledger_order_0_matching() -> None:
     assert audit.matched == 1
 
 
-def test_cross_family_reviewer_selection_and_verdict() -> None:
+@pytest.mark.asyncio
+async def test_cross_family_reviewer_selection_and_verdict() -> None:
     assert family_of("claude-opus-4-7") == "anthropic-claude"
     assert family_of("gpt-5.4") == "openai-gpt"
     assert family_of("gemini-3.1-pro") == "google-gemini"
 
     candidates = ["claude-opus-4-7", "gpt-5.4", "gemini-3.1-pro"]
-    assert pick_reviewer_model("claude-sonnet-4-6", candidates=candidates) == "gpt-5.4"
-    assert pick_reviewer_model("gpt-5.4", candidates=candidates) == "claude-opus-4-7"
+    assert await pick_reviewer_model("claude-sonnet-4-6", candidates=candidates) == "gpt-5.4"
+    assert await pick_reviewer_model("gpt-5.4", candidates=candidates) == "claude-opus-4-7"
     assert (
-        pick_reviewer_model(
+        await pick_reviewer_model(
             "claude-opus-4-7",
             candidates=candidates,
             available_models={"claude-opus-4-7"},
@@ -744,9 +745,9 @@ async def test_g31_realistic_report_false_positive_rate_at_most_2() -> None:
 async def test_g32_reviewer_refuses_none_or_unknown_author_model() -> None:
     from src.dalton.publish.review import run_review
 
-    assert pick_reviewer_model(None) is None
-    assert pick_reviewer_model("") is None
-    assert pick_reviewer_model("unknown-custom-model-v1") is None
+    assert await pick_reviewer_model(None) is None
+    assert await pick_reviewer_model("") is None
+    assert await pick_reviewer_model("unknown-custom-model-v1") is None
 
     bundle = ReviewBundle(
         title="META 3Q26",
@@ -1743,7 +1744,7 @@ async def test_p0j_j2_assist_fallback_unified_and_role_policy_family_check(
     assert res.model == "deepseek-flash"
     # Every configured fallback before deepseek-flash fails pre-send too, so it is tried last.
     assert calls[0] != "deepseek-flash" and calls[-1] == "deepseek-flash"
-    assert len(calls) == 1 + len(assist_mod.resolve_assist_fallback_models())
+    assert len(calls) == 1 + len(await assist_mod.resolve_assist_fallback_models())
     assert any("switching to assist_fallback=deepseek-flash" in r.message for r in caplog.records)
 
     # Non-fallbackable statuses/error_kinds MUST NOT trigger fallback
@@ -1774,7 +1775,7 @@ async def test_p0j_j2_assist_fallback_unified_and_role_policy_family_check(
         mock_complete.side_effect = _no_fb_effect
         res_no_fb = await assist_mod.assist_json("audit.label_figures", "Label figures", {"figures": []}, schema, user_id="local-dev-user")
         assert res_no_fb.ok is False
-        assert len(calls) == 1 and calls[0] not in assist_mod.resolve_assist_fallback_models(), (
+        assert len(calls) == 1 and calls[0] not in (await assist_mod.resolve_assist_fallback_models()), (
             f"Unexpected fallback for {non_fb_status}/{non_fb_kind}: {calls}"
         )
 
@@ -1795,7 +1796,7 @@ async def test_p0j_j2_assist_fallback_unified_and_role_policy_family_check(
     mock_complete.side_effect = _all_fail_effect
     res_all_fail = await assist_mod.assist_json("audit.label_figures", "Label figures", {"figures": []}, schema, user_id="local-dev-user")
     assert res_all_fail.ok is False
-    fbs = assist_mod.resolve_assist_fallback_models()
+    fbs = await assist_mod.resolve_assist_fallback_models()
     assert calls[1:] == fbs and calls[0] not in fbs
     assert res_all_fail.model == fbs[-1]
     assert fbs[-1] in (res_all_fail.error or "")

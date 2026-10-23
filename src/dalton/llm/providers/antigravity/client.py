@@ -12,7 +12,7 @@ CLI uses, reverse-engineered from CLI 1.4.2 traffic:
 
       {
         "project": "aicode-consumers",          # consumer-tier project id
-        "model":   "gemini-4-argon-high",       # TOP-LEVEL, not inside request
+        "model":   "<model_id>",                # TOP-LEVEL, not inside request
         "requestId": "agent/<uuid>/<ms>/<uuid>/1",
         "userAgent": "antigravity",             # body-level client id
         "requestType": "agent",

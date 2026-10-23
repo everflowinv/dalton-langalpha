@@ -23,7 +23,16 @@ const h = vi.hoisted(() => ({
     anthropic: { models: ['claude-big', 'claude-small'] },
     deepseek: { models: ['deepseek-flash'] },
   } as Record<string, { models?: string[] }>,
-  systemDefaults: { default_model: 'deepseek-flash', background_model: 'deepseek-flash', fallback_models: [] },
+  // DALTON-HOOK(settings-section): Dalton role defaults ride the system_defaults payload
+  systemDefaults: {
+    default_model: 'deepseek-flash',
+    background_model: 'deepseek-flash',
+    fallback_models: [],
+    dalton_audit_model: 'gemini-4-argon-medium-oauth',
+    dalton_audit_fallback_models: ['gpt-6.1-sol-oauth', 'claude-opus-5-5-oauth'],
+    dalton_audit_timeout_s: 300,
+    dalton_extract_model: 'deepseek-flash',
+  } as Record<string, unknown>,
   validModelNames: new Set(['gpt-sol', 'gpt-terra', 'gpt-luna', 'claude-big', 'claude-small', 'deepseek-flash']),
   rawModels: {} as Record<string, { models?: string[] }>,
   rawApiResponse: null as Record<string, unknown> | null,
@@ -128,11 +137,15 @@ vi.mock('@/components/model/ModelSelector', () => ({
 // The fallback list moved out of ModelTierConfig into the Advanced section's
 // own picker. It still maps `selected` with no catalog filter, so what renders
 // is exactly the panel's state — which is what the cleanup effect must prune.
+// DALTON-HOOK(settings-section): the picker renders its description so Dalton fallback hints are testable
 vi.mock('@/components/model/FallbackModelsPicker', () => ({
-  FallbackModelsPicker: (props: { selected?: string[] }) => (
-    <ul data-testid="fallback-chips">
-      {(props.selected ?? []).map((m) => <li key={m}>{m}</li>)}
-    </ul>
+  FallbackModelsPicker: (props: { selected?: string[]; label?: string; description?: string }) => (
+    <div data-testid="fallback-picker" aria-label={props.label}>
+      {props.description && <p>{props.description}</p>}
+      <ul data-testid="fallback-chips">
+        {(props.selected ?? []).map((m) => <li key={m}>{m}</li>)}
+      </ul>
+    </div>
   ),
 }));
 
@@ -160,6 +173,11 @@ vi.mock('@/pages/ChatAgent/utils/api', () => ({
 // Onboarding — Settings renders replay/reset buttons; no provider in this harness.
 vi.mock('@/pages/Onboarding', () => ({
   useOnboarding: () => ({ replayGuides: vi.fn(), resetOnboarding: vi.fn() }),
+}));
+
+// DALTON-HOOK(settings-section): stub DaltonSection card in Settings shell harness
+vi.mock('@/pages/Settings/panels/dalton/DaltonSection', () => ({
+  DaltonSection: () => null,
 }));
 
 // Import after mocks are registered.
@@ -277,7 +295,16 @@ describe('Settings: Auto defaults', () => {
       expect(background().selectedOptions[0].textContent).toBe('Auto (deepseek-flash)');
       expect(options(background())).not.toContain('Same as Default model');
     } finally {
-      h.systemDefaults = { default_model: 'deepseek-flash', background_model: 'deepseek-flash', fallback_models: [] };
+      // DALTON-HOOK(settings-section): restore the Dalton role defaults too
+      h.systemDefaults = {
+        default_model: 'deepseek-flash',
+        background_model: 'deepseek-flash',
+        fallback_models: [],
+        dalton_audit_model: 'gemini-4-argon-medium-oauth',
+        dalton_audit_fallback_models: ['gpt-6.1-sol-oauth', 'claude-opus-5-5-oauth'],
+        dalton_audit_timeout_s: 300,
+        dalton_extract_model: 'deepseek-flash',
+      };
     }
   });
 
@@ -304,3 +331,79 @@ describe('Settings: Auto defaults', () => {
     expect(background().selectedOptions[0].textContent).toBe('Auto (deepseek-flash)');
   });
 });
+
+// DALTON-HOOK(settings-section): test Dalton timeout draft editing and system-only catalog filtering
+describe('Settings: Dalton routing controls', () => {
+  it('allows typing 300 digit-by-digit from empty in the audit timeout input and saves on blur or Enter', async () => {
+    localStorage.setItem('settings:modelMode', 'advanced');
+    renderModelTab();
+
+    const timeoutInput = (await screen.findByLabelText(/Figure audit timeout/i)) as HTMLInputElement;
+    expect(timeoutInput.value).toBe('');
+    expect(timeoutInput.placeholder).toContain('300');
+
+    const auditSelect = screen.getByRole('combobox', { name: 'Figure audit model' }) as HTMLSelectElement;
+    expect(auditSelect.options[0].textContent).toContain('gemini-4-argon-medium-oauth');
+    const extractSelect = screen.getByRole('combobox', { name: 'Conversation archive extraction model' }) as HTMLSelectElement;
+    expect(extractSelect.options[0].textContent).toContain('deepseek-flash');
+    expect(
+      screen.getByText(/gpt-6\.1-sol-oauth, claude-opus-5-5-oauth/),
+    ).toBeInTheDocument();
+
+    // Type '3', '30', '300' digit-by-digit without triggering intermediate writes or clamping
+    fireEvent.change(timeoutInput, { target: { value: '3' } });
+    expect(timeoutInput.value).toBe('3');
+    expect(h.mutate).not.toHaveBeenCalled();
+
+    fireEvent.change(timeoutInput, { target: { value: '30' } });
+    expect(timeoutInput.value).toBe('30');
+    expect(h.mutate).not.toHaveBeenCalled();
+
+    fireEvent.change(timeoutInput, { target: { value: '300' } });
+    expect(timeoutInput.value).toBe('300');
+    expect(h.mutate).not.toHaveBeenCalled();
+
+    // Commit on blur -> saves 300
+    fireEvent.blur(timeoutInput);
+    expect(h.mutate).toHaveBeenLastCalledWith({
+      model_preference: { dalton_audit_timeout_s: 300 },
+    });
+
+    // Out-of-range value on Enter shows Chinese error message and does not save
+    h.mutate.mockClear();
+    fireEvent.change(timeoutInput, { target: { value: '45' } });
+    fireEvent.keyDown(timeoutInput, { key: 'Enter' });
+    expect(h.mutate).not.toHaveBeenCalled();
+    expect(screen.getByRole('alert')).toHaveTextContent('数字核验超时必须在 60–1800 秒之间');
+  });
+
+  // DALTON-HOOK(settings-section): verify Dalton dropdowns exclude custom_models
+  it('excludes user custom_models from Dalton model selectors while keeping system catalog models', async () => {
+    localStorage.setItem('settings:modelMode', 'advanced');
+    h.catalog = {
+      openai: { models: ['gpt-sol', 'my-custom-model'] },
+      anthropic: { models: ['claude-big'] },
+      deepseek: { models: ['deepseek-flash'] },
+    };
+    h.preferences = {
+      model_preference: {
+        custom_models: [{ name: 'my-custom-model', model_id: 'gpt-x', provider: 'openai' }],
+      },
+      other_preference: {},
+    };
+    try {
+      renderModelTab();
+      const auditSelect = (await screen.findByRole('combobox', { name: 'Figure audit model' })) as HTMLSelectElement;
+      const optionValues = [...auditSelect.options].map((o) => o.value);
+      expect(optionValues).toContain('gpt-sol');
+      expect(optionValues).not.toContain('my-custom-model');
+    } finally {
+      h.catalog = {
+        openai: { models: ['gpt-sol', 'gpt-terra', 'gpt-luna'] },
+        anthropic: { models: ['claude-big', 'claude-small'] },
+        deepseek: { models: ['deepseek-flash'] },
+      };
+    }
+  });
+});
+

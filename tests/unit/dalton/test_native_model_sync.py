@@ -42,6 +42,24 @@ from src.dalton.llm.overlay import load_dalton_meta
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _isolated_native_sync_overlay(tmp_path, monkeypatch):
+    """Never read the deployment's runtime overlay: `var/` can be the live
+    directory (a symlinked checkout), where real retirements would hide keys
+    these tests expect."""
+    import src.dalton.llm.overlay as overlay_mod
+
+    path = tmp_path / "native_sync_overlay.json"
+    monkeypatch.setattr(nc, "NATIVE_SYNC_OVERLAY_PATH", path)
+    monkeypatch.setattr(overlay_mod, "NATIVE_SYNC_OVERLAY_PATH", path)
+    monkeypatch.setattr(
+        overlay_mod,
+        "OVERLAY_SOURCES",
+        [(name, path if name == "native_sync" else src) for name, src in overlay_mod.OVERLAY_SOURCES],
+    )
+    return path
+
+
 def test_overlay_sources_merge_order_places_native_sync_between_native_and_openclaw():
     from src.dalton.llm.overlay import OVERLAY_SOURCES
 
@@ -1100,10 +1118,10 @@ def test_reference_source_agent_config_llm_keys_traversed_generically(monkeypatc
 
 
 def test_agent_config_refs_union_with_dalton_file_under_any_app_env(monkeypatch):
-    """`APP_ENV=production` must not hide `agent_config.dalton.yaml`'s `llm.assist`.
+    """`APP_ENV=production` must not hide `agent_config.dalton.yaml`'s `llm:` section.
 
     The role-policy merge skips the dalton overlay when APP_ENV is set to
-    something else, but `resolve_assist_model` reads the file directly — so the
+    something else, but the reference collector reads the file directly — so the
     direct read still collects it, unioned with whatever the merge produced
     from the real base file.
     """
@@ -1113,8 +1131,8 @@ def test_agent_config_refs_union_with_dalton_file_under_any_app_env(monkeypatch)
 
     refs = mr.agent_config_refs()
 
-    # The dalton file's assist key arrived via the direct read …
-    assert any("agent_config.llm.assist" in labels for labels in refs.values())
+    # The dalton file's own background model arrived via the direct read …
+    assert "agent_config.llm.background" in refs.get("gemini-4-argon-low-oauth", [])
     # … and the production-merged base config still contributes its llm.
     assert any("agent_config.llm.name" in labels for labels in refs.values())
 
@@ -1315,7 +1333,7 @@ def test_reference_source_dalton_settings_walks_model_fields(monkeypatch, tmp_pa
     config = DaltonConfig()
     config.models.assist_model = "gemini-3.8-flash-low-oauth"
     config.models.assist_fallback_model = ["gpt-6.1-sol-oauth", "grok-4.3-oauth"]
-    config.publish.extract_model = "claude-opus-5-5-oauth"
+    config.conversations.extractor_model = "claude-opus-5-5-oauth"
 
     monkeypatch.setattr(
         settings_mod,
@@ -1341,7 +1359,7 @@ def test_reference_source_dalton_settings_walks_model_fields(monkeypatch, tmp_pa
     assert "models.assist_model" in refs["gemini-3.8-flash-low-oauth"]
     assert "models.assist_fallback_model" in refs["gpt-6.1-sol-oauth"]
     assert "models.assist_fallback_model" in refs["grok-4.3-oauth"]
-    assert "publish.extract_model" in refs["claude-opus-5-5-oauth"]
+    assert "conversations.extractor_model" in refs["claude-opus-5-5-oauth"]
     for reviewer in config.publish.reviewer_models:
         assert "publish.reviewer_models" in refs.get(reviewer, [])
     assert "conversations.extractor_model" in refs.get(
@@ -2356,3 +2374,28 @@ def test_read_retired_keys_strict_raises_on_permission_error(tmp_path, monkeypat
     with pytest.raises(ValueError):
         nc.read_retired_keys_strict(target)
     assert denied.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_user_preference_refs_include_dalton_role_models(monkeypatch):
+    import src.dalton.database.openclaw_sync as osync
+
+    fake_db, _cur = _query_db_fake(
+        [
+            {
+                "user_id": "u1",
+                "model_preference": {
+                    "dalton_audit_model": "gemini-4-argon-medium-oauth",
+                    "dalton_reviewer_models": ["grok-4.7-oauth"],
+                },
+                "other_preference": {},
+                "agent_preference": {},
+            }
+        ]
+    )
+    monkeypatch.setattr(osync, "get_db_connection", fake_db)
+
+    refs = await osync.find_user_referenced_models()
+
+    assert "user:u1:dalton_audit_model" in refs["gemini-4-argon-medium-oauth"]
+    assert "user:u1:dalton_reviewer_models" in refs["grok-4.7-oauth"]

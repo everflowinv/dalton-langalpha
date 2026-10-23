@@ -37,20 +37,6 @@ _HIGH_TOS_RISK_PROVIDERS = frozenset(
     {"claude-oauth", "codex-oauth", "antigravity-oauth", "muse-oauth", "xai-oauth"}
 )
 
-_DEFAULT_PROBE_MODELS: dict[str, str] = {
-    "claude-oauth": "claude-sonnet-5-5-oauth",
-    "codex-oauth": "gpt-6.1-sol-oauth",
-    "antigravity-oauth": "gemini-3.8-flash-low-oauth",
-    "muse-oauth": "muse-spark-1.3-oauth",
-    "xai-oauth": "grok-4.7-oauth",
-    "z-ai-cn-coding": "glm-5.3-flash-plan",
-    "xai": "grok-4.3",
-    "deepseek": "deepseek-flash",
-    "z-ai": "glm-5.3-flash",
-    "openai": "gpt-6-luna",
-    "gemini": "gemini-3-flash",
-}
-
 _PROVIDER_DISPLAY_NAMES: dict[str, str] = {
     "z-ai-cn-coding": "智谱 GLM（Coding Plan）",
 }
@@ -66,15 +52,20 @@ def _load_role_model_assignments() -> list[dict[str, str]]:
         except Exception:
             cfg = {}
 
-    llm_cfg = cfg.get("llm") if isinstance(cfg.get("llm"), dict) else {}
-    lead = str(llm_cfg.get("name") or "claude-opus-5-5-oauth")
-    roles.append({"role": "lead", "model": lead})
+    from src.dalton.settings import get_dalton_settings
 
-    bg = str(llm_cfg.get("background") or "deepseek-flash")
+    settings = get_dalton_settings()
+
+    llm_cfg = cfg.get("llm") if isinstance(cfg.get("llm"), dict) else {}
+    lead = str(llm_cfg.get("name") or "").strip()
+    if lead:
+        roles.append({"role": "lead", "model": lead})
+
+    bg = str(llm_cfg.get("background") or "").strip()
     if bg:
         roles.append({"role": "background", "model": bg})
 
-    assist = str(llm_cfg.get("assist") or "gemini-3.8-flash-low-oauth")
+    assist = str(llm_cfg.get("assist") or settings.models.assist_model or "").strip()
     if assist:
         roles.append({"role": "assist", "model": assist})
 
@@ -93,9 +84,6 @@ def _load_role_model_assignments() -> list[dict[str, str]]:
             if m:
                 roles.append({"role": f"subagent:{name}", "model": str(m)})
 
-    from src.dalton.settings import get_dalton_settings
-
-    settings = get_dalton_settings()
     for rev_m in settings.publish.reviewer_models:
         roles.append({"role": "reviewer_candidate", "model": str(rev_m)})
 
@@ -515,7 +503,21 @@ async def get_providers_status(*, user_id: str) -> dict[str, Any]:
 
     avail_map = await explain_model_availability(user_id=user_id)
     avail_set = {k for k, v in avail_map.items() if v.get("available")}
-    role_warnings = check_roles(available_models=avail_set)
+    from src.dalton.llm.model_prefs import (
+        resolve_dalton_assist_fallback_models,
+        resolve_dalton_assist_model,
+        resolve_dalton_reviewer_models,
+    )
+
+    assist_model = await resolve_dalton_assist_model(user_id)
+    assist_fallback_models = await resolve_dalton_assist_fallback_models(user_id)
+    reviewer_models = await resolve_dalton_reviewer_models(user_id)
+    role_warnings = check_roles(
+        assist_model=assist_model,
+        assist_fallback_models=assist_fallback_models,
+        reviewer_models=reviewer_models,
+        available_models=avail_set,
+    )
 
     return {
         "generated_at": now.isoformat(),
@@ -533,7 +535,10 @@ def _pick_probe_model(
     models: list[str],
     meta_map: dict[str, dict[str, Any]],
 ) -> str | None:
-    preferred = _DEFAULT_PROBE_MODELS.get(provider)
+    from src.dalton.settings import get_dalton_settings
+
+    probe_models = get_dalton_settings().models.probe_models or {}
+    preferred = probe_models.get(provider)
     if preferred and preferred in models:
         return preferred
     for m in models:

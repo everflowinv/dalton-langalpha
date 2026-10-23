@@ -34,7 +34,8 @@ def test_family_of_native_and_broker_models():
     assert family_of("ocb-openai-gpt-6.1-sol") == "openai-gpt"
 
 
-def test_select_independent_reviewer_across_lead_families():
+@pytest.mark.asyncio
+async def test_select_independent_reviewer_across_lead_families():
     """P0N.5 N11: reviewer family always differs from lead family, including Antigravity-hosted Claude."""
     candidates = [
         "gpt-6.1-sol-oauth",
@@ -43,12 +44,12 @@ def test_select_independent_reviewer_across_lead_families():
         "claude-opus-5-5-oauth",
     ]
     # 1. Lead = claude-opus-5-5-oauth -> picks gpt-6.1-sol-oauth
-    rev1 = select_independent_reviewer("claude-opus-5-5-oauth", candidates)
+    rev1 = await select_independent_reviewer("claude-opus-5-5-oauth", candidates)
     assert rev1 == "gpt-6.1-sol-oauth"
     assert family_of(rev1) != family_of("claude-opus-5-5-oauth")
 
     # 2. Lead = gpt-6-astra-oauth -> skips gpt-6.1-sol-oauth, picks gemini-4-argon-high-oauth
-    rev2 = select_independent_reviewer("gpt-6-astra-oauth", candidates)
+    rev2 = await select_independent_reviewer("gpt-6-astra-oauth", candidates)
     assert rev2 == "gemini-4-argon-high-oauth"
     assert family_of(rev2) != family_of("gpt-6-astra-oauth")
 
@@ -59,26 +60,27 @@ def test_select_independent_reviewer_across_lead_families():
         "gpt-6.1-sol-oauth",
         "gemini-4-argon-high-oauth",
     ]
-    rev3 = select_independent_reviewer("claude-opus-5-5-high-oauth", candidates_claude_first)
+    rev3 = await select_independent_reviewer("claude-opus-5-5-high-oauth", candidates_claude_first)
     assert rev3 == "gpt-6.1-sol-oauth"
     assert family_of(rev3) != "anthropic-claude"
 
     # 4. When gpt-6.1-sol-oauth is unavailable (e.g. ChatGPT disconnected), skips to gemini-4-argon-high-oauth
     available = {"gemini-4-argon-high-oauth", "grok-4.7", "claude-opus-5-5-oauth"}
-    rev4 = select_independent_reviewer(
+    rev4 = await select_independent_reviewer(
         "claude-opus-5-5-oauth", candidates, available_models=available
     )
     assert rev4 == "gemini-4-argon-high-oauth"
 
 
-def test_contributor_models_forbidden_for_all_roles():
+@pytest.mark.asyncio
+async def test_contributor_models_forbidden_for_all_roles():
     """P0N.5 L21 / N24: contributor OAuth variants are forbidden for any role and emit a warning."""
     assert is_forbidden_for_roles("muse-spark-1.3-contributor-oauth") is True
     assert is_forbidden_for_roles("muse-beacon-1.1-contributor-oauth") is True
     assert is_forbidden_for_roles("muse-spark-1.3-oauth") is False
 
     # Cannot be selected as reviewer even if listed first
-    rev = select_independent_reviewer(
+    rev = await select_independent_reviewer(
         "claude-opus-5-5-oauth",
         ["muse-spark-1.3-contributor-oauth", "grok-4.7"],
     )
@@ -130,7 +132,7 @@ async def test_resolve_assist_model_and_startup_wiring_reject_contributor_model(
     from src.dalton.llm.role_policy import RolePolicyError
 
     with pytest.raises(RolePolicyError, match="muse-spark-1.3-contributor-oauth"):
-        assist_mod.resolve_assist_model(
+        await assist_mod.resolve_assist_model(
             role="assist", explicit_model="muse-spark-1.3-contributor-oauth"
         )
 

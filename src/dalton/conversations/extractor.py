@@ -1,7 +1,7 @@
 """Container-side conversation segmentation, LLM card extraction, quote verification, and deduplication.
 
 Follows Dalton's LLM contract (`assist_json` -> `dalton_complete` -> `LLMService.complete`,
-never `create_llm()`), defaulting to Antigravity's `gemini-4-argon-medium-oauth`.
+never `create_llm()`), resolving the extraction model via `resolve_dalton_extract_model`.
 """
 
 from __future__ import annotations
@@ -22,6 +22,7 @@ from src.config.env import LOCAL_DEV_USER_ID
 from src.dalton.database.conversations import build_card_search_text
 from src.dalton.llm.assist import AssistResult, _normalize_schema_enums, assist_json
 from src.dalton.llm.complete import resolve_model_billing_and_provider
+from src.dalton.llm.model_prefs import resolve_dalton_extract_model
 from src.dalton.settings import get_dalton_settings
 
 logger = logging.getLogger(__name__)
@@ -3922,7 +3923,9 @@ async def extract_segment_cards(
 ) -> SegmentExtractionOutcome:
     """Extract and validate knowledge cards from one conversation segment via `assist_json`."""
     cfg = get_dalton_settings().conversations
-    eff_model = (extractor_model or cfg.extractor_model).strip()
+    eff_model = (extractor_model or "").strip()
+    if not eff_model:
+        eff_model = (await resolve_dalton_extract_model(user_id)).strip()
     eff_prompt_ver = (prompt_version or cfg.prompt_version or DEFAULT_PROMPT_VERSION).strip()
 
     if not segment:
@@ -3972,10 +3975,10 @@ async def extract_segment_cards(
         payload=payload,
         schema=EXTRACTION_RESPONSE_SCHEMA,
         user_id=user_id,
-        role="conversation_extract",
+        role="extract",
         scope_ref=scope_ref,
         timeout_s=180.0,
-        model=eff_model,
+        model=eff_model or None,
         llm_service=llm_service,
         resend_indeterminate=eff_resend_indeterminate,
         persist_raw=persist_raw,

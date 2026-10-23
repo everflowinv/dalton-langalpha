@@ -7,6 +7,8 @@
  * same on its side. Drop the fallback with the server's.
  */
 
+// DALTON-HOOK(settings-section): zod for the Dalton model_preference keys below
+import * as z from 'zod/mini';
 import type { CustomModelEntry } from '@/components/model/types';
 import type { ModelProfile } from './modelTuning';
 
@@ -58,7 +60,40 @@ export interface ModelPreferences extends ModelProfile {
   /** Absent reads as `ask`. */
   default_model_scope?: DefaultModelScope | null;
   background_follows?: BackgroundFollows | null;
+  // DALTON-HOOK(settings-section): Dalton model settings stored in model_preference
+  dalton_audit_model?: string | null;
+  dalton_audit_fallback_models?: string[] | null;
+  dalton_audit_timeout_s?: number | null;
+  dalton_assist_model?: string | null;
+  dalton_assist_fallback_models?: string[] | null;
+  dalton_reviewer_models?: string[] | null;
+  dalton_extract_model?: string | null;
 }
+
+// DALTON-HOOK(settings-section): Zod boundary schema for Dalton model_preference keys
+const daltonStrOrNull = z.catch(z.nullable(z.optional(z.string())), undefined);
+const daltonStrListOrNull = z.catch(
+  z.nullable(z.optional(z.array(z.string()))),
+  undefined,
+);
+const daltonTimeoutOrNull = z.catch(
+  z.nullable(
+    z.optional(
+      z.int().check(z.minimum(60), z.maximum(1800)),
+    ),
+  ),
+  undefined,
+);
+
+export const DaltonModelPrefsSchema = z.object({
+  dalton_audit_model: daltonStrOrNull,
+  dalton_audit_fallback_models: daltonStrListOrNull,
+  dalton_audit_timeout_s: daltonTimeoutOrNull,
+  dalton_assist_model: daltonStrOrNull,
+  dalton_assist_fallback_models: daltonStrListOrNull,
+  dalton_reviewer_models: daltonStrListOrNull,
+  dalton_extract_model: daltonStrOrNull,
+});
 
 /**
  * The keys migration 034 moved out of `other_preference`, and so the only ones
@@ -103,6 +138,14 @@ export const MODEL_PREF_KEYS: ReadonlySet<string> = new Set<string>([
   'prompt_guidance',
   'default_model_scope',
   'background_follows',
+  // DALTON-HOOK(settings-section): route Dalton model settings to model_preference
+  'dalton_audit_model',
+  'dalton_audit_fallback_models',
+  'dalton_audit_timeout_s',
+  'dalton_assist_model',
+  'dalton_assist_fallback_models',
+  'dalton_reviewer_models',
+  'dalton_extract_model',
 ]);
 
 /**
@@ -126,6 +169,19 @@ export function modelPrefs(prefs: unknown): ModelPreferences {
   }
   for (const [key, value] of Object.entries(current)) {
     if (value !== null && value !== undefined) merged[key] = value;
+  }
+  // DALTON-HOOK(settings-section): sanitize Dalton model preference keys at the boundary
+  const daltonParsed = DaltonModelPrefsSchema.safeParse(merged);
+  if (daltonParsed.success) {
+    for (const [k, v] of Object.entries(daltonParsed.data)) {
+      if (k in merged) {
+        if (v === undefined || v === null) {
+          delete merged[k];
+        } else {
+          merged[k] = v;
+        }
+      }
+    }
   }
   return merged as ModelPreferences;
 }

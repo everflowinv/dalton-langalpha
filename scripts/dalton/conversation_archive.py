@@ -73,6 +73,7 @@ from src.dalton.conversations.render import (  # noqa: E402
 )
 from src.dalton.database import conversations as db_conv  # noqa: E402
 from src.dalton.llm.complete import resolve_model_billing_and_provider  # noqa: E402
+from src.dalton.llm.model_prefs import resolve_dalton_extract_model  # noqa: E402
 from src.dalton.settings import get_dalton_settings  # noqa: E402
 from src.server.database import pool as _db_pool_mod  # noqa: E402
 from src.server.database.pool import get_or_create_pool, open_session_connection  # noqa: E402
@@ -2031,7 +2032,9 @@ async def run_archive_pipeline(
     today_et = datetime.now(ET_TZ).date()
     eff_since = since_date or (today_et - timedelta(days=int(cfg.default_backfill_days or 14)))
     eff_until = until_date or today_et
-    eff_model = (extractor_model or cfg.extractor_model).strip()
+    eff_model = (extractor_model or "").strip()
+    if not eff_model:
+        eff_model = (await resolve_dalton_extract_model(archive_billing_user_id())).strip()
     eff_budget = int(hourly_token_budget or cfg.hourly_token_budget)
     eff_concurrency = max(
         1,

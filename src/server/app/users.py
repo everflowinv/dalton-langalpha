@@ -729,6 +729,15 @@ async def update_preferences(
 
         _validate_model_tuning(model_pref, effective)
         _validate_default_model_choices(model_pref)
+        # DALTON-HOOK(settings-section): validate Dalton model preference keys (catalog membership, dedup, timeout 60..1800)
+        from src.dalton.llm.model_prefs import validate_dalton_model_preferences
+
+        try:
+            validate_dalton_model_preferences(
+                model_pref, effective_model_preference=effective
+            )
+        except TuningError as exc:
+            raise _tuning_400(exc) from exc
 
         # After validation, so a bad level in the patch still gets its 400 and
         # only levels already in the row are cleared.

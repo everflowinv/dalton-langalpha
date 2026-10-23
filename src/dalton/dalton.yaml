@@ -24,10 +24,24 @@ models:
   broker:
     enabled: true            # OpenClaw broker v2 parallel path; false hides ocb-* from catalog
   disabled_providers: []     # Provider kill switch (P0N.8, L17). Example: ["muse-oauth"]
+  # Single source of truth for Dalton auxiliary task (assist) model defaults
+  # (agent_config.dalton.yaml no longer defines llm.assist).
   assist_model: "gemini-3.8-flash-low-oauth"
   # Must sit outside every reviewer family (role_policy L20), hence not Gemini/GPT/Grok/Claude.
   assist_fallback_model:
     - "deepseek-flash"
+  probe_models:
+    claude-oauth: "claude-sonnet-5-5-oauth"
+    codex-oauth: "gpt-6.1-sol-oauth"
+    antigravity-oauth: "gemini-3.8-flash-low-oauth"
+    muse-oauth: "muse-spark-1.3-oauth"
+    xai-oauth: "grok-4.7-oauth"
+    z-ai-cn-coding: "glm-5.3-flash-plan"
+    xai: "grok-4.3"
+    deepseek: "deepseek-flash"
+    z-ai: "glm-5.3-flash"
+    openai: "gpt-6-luna"
+    gemini: "gemini-3-flash"
 
 budget:
   # Default daily cap USD when user has not saved a DB row yet (null = fail-closed,
@@ -49,7 +63,6 @@ publish:
     - "gemini-4-argon-high-oauth"
     - "grok-4.7-oauth"
     - "claude-opus-5-5-oauth"
-  extract_model: null
   # Number audit (check_draft / publish). Measured on a 48k-character initial
   # coverage draft (27 batches): argon-medium 139s with no failed batch and the
   # best agreement with the other two; the OpenClaw-relayed 3.8 flash failed 24.
@@ -79,7 +92,8 @@ autonomy:
 
 conversations:
   enabled: true
-  extractor_model: "gemini-4-argon-medium-oauth"
+  # 2026-10-23 盲评中忠实度和覆盖度最高
+  extractor_model: "deepseek-flash"
   prompt_version: "conv_card_v2_3"
   embedding_model: "gemini-embedding-001"
   embedding_model_preferred: "gemini-embedding-2-preview"
