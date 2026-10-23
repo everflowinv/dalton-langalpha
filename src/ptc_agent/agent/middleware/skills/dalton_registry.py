@@ -22,6 +22,11 @@ DALTON_SKILLS_DIR: Path = (
 
 _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*(?:\n|$)", re.DOTALL)
 
+# Orchestration skills that launch a workflow require run-workflow, so loading
+# them unlocks RunWorkflow too (SkillsMiddleware unlocks required skills' tools)
+# and a user disable of run-workflow alone cannot strand their RunWorkflow call.
+_RW = "run-workflow"
+
 # (skill_name, command, requires)
 _DALTON_SKILL_SPECS: tuple[tuple[str, str | None, tuple[str, ...]], ...] = (
     ("dalton-conventions", None, ("research-conventions",)),
@@ -32,18 +37,18 @@ _DALTON_SKILL_SPECS: tuple[tuple[str, str | None, tuple[str, ...]], ...] = (
     ("dalton-research-director", "dalton-director", ("dalton-conventions", "research-conventions")),
     ("dalton-financial-lenses", "dalton-financial-lenses", ("dalton-conventions", "research-conventions")),
     ("dalton-company-background", "dalton-company-background", ("dalton-conventions", "research-conventions")),
-    ("dalton-bullbear", "bullbear", ("dalton-conventions", "research-conventions")),
-    ("dalton-initial-coverage", "initial-coverage", ("dalton-conventions", "research-conventions")),
-    ("dalton-full-coverage", "full-coverage", ("dalton-conventions", "research-conventions")),
+    ("dalton-bullbear", "bullbear", ("dalton-conventions", "research-conventions", _RW)),
+    ("dalton-initial-coverage", "initial-coverage", ("dalton-conventions", "research-conventions", _RW)),
+    ("dalton-full-coverage", "full-coverage", ("dalton-conventions", "research-conventions", _RW)),
     ("dalton-earnings-calendar", "dalton-earnings-calendar", ("dalton-conventions", "research-conventions")),
     ("dalton-earnings-preview", "dalton-earnings-preview", ("dalton-conventions", "research-conventions")),
     ("dalton-earnings-flash", "dalton-earnings-flash", ("dalton-conventions", "research-conventions")),
-    ("dalton-earnings-deep", "dalton-earnings-deep", ("dalton-conventions", "research-conventions")),
+    ("dalton-earnings-deep", "dalton-earnings-deep", ("dalton-conventions", "research-conventions", _RW)),
     ("dalton-stock-move", "dalton-stock-move", ("dalton-conventions", "research-conventions")),
     ("dalton-thesis-delta", "dalton-thesis-delta", ("dalton-conventions", "research-conventions")),
     ("dalton-filing-review", "dalton-filing-review", ("dalton-conventions", "research-conventions")),
-    ("dalton-weekly-review", "weekly-review", ("dalton-conventions", "research-conventions")),
-    ("dalton-topic-research", "topic-research", ("dalton-conventions", "research-conventions")),
+    ("dalton-weekly-review", "weekly-review", ("dalton-conventions", "research-conventions", _RW)),
+    ("dalton-topic-research", "topic-research", ("dalton-conventions", "research-conventions", _RW)),
     ("dalton-call", "dalton-call", ("dalton-conventions", "research-conventions")),
     ("dalton-pm-qa", "pm-qa", ("dalton-conventions", "research-conventions")),
 )

@@ -42,6 +42,7 @@ ALLOWED_HOOKS=(
   "mcp-call-timeout"
   "skills-registry"
   "skills-manifest-lead"
+  "skill-autoload"
   "cos-research-depth"
   "tool-guide-research"
   "provenance-declared"

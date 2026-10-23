@@ -221,9 +221,12 @@ class SkillsMiddleware(AgentMiddleware):
         )
 
         # Tool name to the skills that gate it (a tool can belong to several).
+        # DALTON-HOOK(skill-autoload): a skill also unlocks the tools of the
+        # registry skills it ``requires`` (transitively), so an orchestration
+        # skill that requires run-workflow unlocks RunWorkflow on its own load.
         self._tool_to_skills: dict[str, set[str]] = {}
-        for skill_name, skill_def in self.skill_registry.items():
-            for tool_name in skill_def.tool_names:
+        for skill_name in self.skill_registry:
+            for tool_name in self._gated_tools(skill_name):
                 self._tool_to_skills.setdefault(tool_name, set()).add(skill_name)
 
         # Build mapping of SKILL.md paths → skill names (for auto-load)
@@ -240,6 +243,28 @@ class SkillsMiddleware(AgentMiddleware):
             has_filesystem_scan=bool(self._backend and self._sources),
             known_skills_count=len(self._known_skills),
         )
+
+    def _gated_tools(self, skill_name: str) -> set[str]:
+        """Tools a skill's load unlocks: its own plus its required skills'.
+
+        DALTON-HOOK(skill-autoload). A required skill missing from this
+        build's registry (e.g. run-workflow on a build without RunWorkflow)
+        contributes nothing.
+        """
+        tools: set[str] = set()
+        seen: set[str] = set()
+        pending = [skill_name]
+        while pending:
+            name = pending.pop()
+            if name in seen:
+                continue
+            seen.add(name)
+            skill_def = self.skill_registry.get(name)
+            if skill_def is None:
+                continue
+            tools.update(skill_def.tool_names)
+            pending.extend(skill_def.requires)
+        return tools
 
     async def abefore_agent(
         self, state: Any, runtime: Any, *, config: RunnableConfig | None = None
@@ -381,7 +406,8 @@ class SkillsMiddleware(AgentMiddleware):
             "",
             "These are established workflows for the fund's regular work. "
             "Before starting work a skill describes, read `.agents/skills/{name}/SKILL.md` "
-            "and follow its method instead of improvising; even a brief reply can borrow "
+            "with the Read tool (that is what unlocks the skill's tools) and follow "
+            "its method instead of improvising; even a brief reply can borrow "
             "its 'which sources to check and in what order'. "
             "Casual chat and single-source lookups do not need a skill.",
             "",
@@ -484,17 +510,30 @@ class SkillsMiddleware(AgentMiddleware):
             return result
 
         tool_call = request.tool_call
-        matched_skill = self._match_skill_from_read(
-            tool_call.get("name"), tool_call.get("args", {})
+        tool_name = tool_call.get("name")
+        tool_args = tool_call.get("args", {})
+        matched_skill = self._match_skill_from_read(tool_name, tool_args)
+        # DALTON-HOOK(skill-autoload): a SKILL.md read through Bash `cat` or
+        # ExecuteCode `open(...)` loads the skill too, not only Read.
+        from src.dalton.skill_reads import match_skills_from_shell_read
+
+        matched_skills = (
+            [matched_skill]
+            if matched_skill
+            else match_skills_from_shell_read(
+                tool_name, tool_args, self._skill_md_to_name, result
+            )
         )
-        if matched_skill and isinstance(result, ToolMessage):
+        if matched_skills and isinstance(result, ToolMessage):
             logger.info(
                 "Auto-loading skill from SKILL.md read",
-                skill_name=matched_skill,
+                skill_name=matched_skills[0],
+                skill_names=matched_skills,
+                tool_name=tool_name,
             )
             return Command(
                 update={
-                    LOADED_SKILLS_KEY: [matched_skill],
+                    LOADED_SKILLS_KEY: matched_skills,
                     "messages": [result],  # preserve original Read result
                 },
             )

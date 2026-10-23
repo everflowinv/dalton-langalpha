@@ -10,12 +10,20 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 
 ---
 
+## 独立八节点评模式（用户明确只要八节点评）
+
+用户明确要求“只写八节深度点评报告、不跑完整 workflow”时，不调用 `RunWorkflow`（与 `RunWorkflow` 是否可用、`workflow.enabled` 是否开启无关）：主智能体在当前会话内按下述 Step 2 的四个阶段顺序直接执行，并逐阶段核对产物。其余情况一律走下面的深度链 workflow。
+
+---
+
 ## 第一步：加载 Workflow 工具与确认运行模式
 
-1. **必读 `run-workflow`**：执行任何操作前，先读 `.agents/skills/run-workflow/SKILL.md` 以解锁 `RunWorkflow` 工具。
-2. **双模式路由**：
-   - **默认模式（深度链 `earnings-deep-update` workflow）**：当由 PS.7 创建的 `tp1` 自动任务触发（T+1 交易日 20:00，此时卖方财报后报告已基本到齐）或用户要求完整财报后更新时，调用 `RunWorkflow(workflow="earnings-deep-update", params={...})`。
-   - **回退 / 独立八节点评模式（Standalone Fallback）**：若平台 `workflow.enabled` 关闭，或用户明确要求“只写八节深度点评报告、不跑完整 workflow”，主智能体在当前会话内按本 skill 下述四个阶段顺序直接执行。
+1. **必读 `run-workflow`**：执行任何操作前，先用 Read 工具读 `.agents/skills/run-workflow/SKILL.md` 了解 workflow 规范（workflow 启用时，加载本 skill 会自动解锁 `RunWorkflow`）。
+2. **深度链 workflow**：
+   - **默认（`earnings-deep-update` workflow）**：当由 PS.7 创建的 `tp1` 自动任务触发（T+1 交易日 20:00，此时卖方财报后报告已基本到齐）或用户要求完整财报后更新时，调用 `RunWorkflow(workflow="earnings-deep-update", params={...})`。
+   - **Workflow 不可用时**：
+     - **`workflow.enabled` 已关闭**（工具列表本来就不会有 `RunWorkflow`）：主智能体按本 skill 下述四个阶段的顺序手动执行，并逐阶段核对产物。
+     - **否则**（`workflow.enabled` 未关闭）：`RunWorkflow` 不在工具列表时，先用 **Read 工具**（不要用 Bash `cat`）读 `.agents/skills/run-workflow/SKILL.md` 后重试；仍没有就停下，告诉 PM「RunWorkflow 不可用」，不要自行手动派发 Task 子智能体代跑。
 
 ---
 
@@ -37,6 +45,8 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 ---
 
 ## Step 2：四阶段执行内容（Workflow 内部支线 / 独立回退顺序）
+
+> 以下阶段由 `earnings-deep-update` workflow 执行。仅当 `workflow.enabled` 已关闭，或处于上面的独立八节点评模式时，才由主智能体按这些阶段手动执行。
 
 ### 阶段 1：八节深度点评 ∥ 模型更新（并行）
 

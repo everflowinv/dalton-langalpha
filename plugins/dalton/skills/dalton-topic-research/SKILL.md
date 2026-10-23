@@ -10,7 +10,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 
 ## 0. 启动工作流（第一步必读）
 
-1. **先读 `.agents/skills/run-workflow/SKILL.md`**，解锁 `RunWorkflow` 工具。
+1. **先用 Read 工具读 `.agents/skills/run-workflow/SKILL.md`**，了解 workflow 规范（workflow 启用时，加载本 skill 会自动解锁 `RunWorkflow`）。
 2. **范围确认与锁定**：
    - 在与 PM 对话时，先用 **≤3 个问题**确认并锁定 5 项范围：
      1. **研究问题与边界**（核心要回答什么、不回答什么）
@@ -33,8 +33,13 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
        }
    )
    ```
+   Workflow 不可用时：
+   - **`workflow.enabled` 已关闭**（工具列表本来就不会有 `RunWorkflow`）：主智能体按下述 Phase 的顺序手动执行，并逐阶段核对产物。
+   - **否则**（`workflow.enabled` 未关闭）：`RunWorkflow` 不在工具列表时，先用 **Read 工具**（不要用 Bash `cat`）读 `.agents/skills/run-workflow/SKILL.md` 后重试；仍没有就停下，告诉 PM「RunWorkflow 不可用」，不要自行手动派发 Task 子智能体代跑。
 
 ---
+
+> **第 1–6 节是 workflow 内部各阶段说明（Phase 0–6，由 `RunWorkflow` 执行）。** 仅当 `workflow.enabled` 已关闭时，才由主智能体按这些阶段手动执行。第 7 节（Phase 7）由主智能体在 workflow 结束后亲自完成。
 
 ## 1. Phase 0 — 研究规划（Research Planning）
 
@@ -115,7 +120,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 
 ---
 
-## 7. Phase 7 — 知识层回写与收盘三步（Knowledge Layer Update & Handoff）
+## 7. Phase 7 — 知识层回写与收盘三步（Knowledge Layer Update & Handoff，workflow 结束后主智能体必做）
 
 1. **更新当前公司知识层**（若在公司工作区）：
    - 将专题沉淀的结构性变化通过 `knowledge_update` 写入 `drivers` 或 `debate`。
