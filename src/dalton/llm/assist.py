@@ -11,6 +11,7 @@ Rules:
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import logging
 import re
@@ -19,11 +20,10 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import jsonschema
-import yaml
 
 from src.dalton.database.provider_events import sanitize_error_text
 from src.dalton.llm.complete import dalton_complete
-from src.dalton.settings import DALTON_YAML_PATH, REPO_ROOT, get_assist_fallback_models
+from src.dalton.llm.model_prefs import dalton_model_pref
 
 logger = logging.getLogger(__name__)
 
@@ -46,16 +46,6 @@ class AssistResult:
     error_kind: str | None = None
 
 
-def _read_yaml_dict(path: Any) -> dict[str, Any]:
-    try:
-        if path.exists():
-            data = yaml.safe_load(path.read_text(encoding="utf-8"))
-            return data if isinstance(data, dict) else {}
-    except Exception:
-        pass
-    return {}
-
-
 def _validate_assist_candidate(role: str, candidate: str) -> str:
     from src.dalton.llm.role_policy import RolePolicyError, is_forbidden_for_roles
 
@@ -67,58 +57,66 @@ def _validate_assist_candidate(role: str, candidate: str) -> str:
     return cand
 
 
-def resolve_assist_model(role: str = "assist", explicit_model: str | None = None) -> str:
-    """Resolve model key for `role` (default `'assist'`).
+async def resolve_assist_model(
+    role: str = "assist",
+    explicit_model: str | None = None,
+    *,
+    user_id: str | None = None,
+) -> str:
+    """Resolve model key for `role` (default `'assist'`) via `dalton_model_pref`.
 
     Priority:
     1. `explicit_model` if provided
-    2. `agent_config.dalton.yaml` `llm.<role>` (e.g. `llm.assist`)
-    3. `src/dalton/dalton.yaml` `llm.<role>` or `publish.extract_model`
-    4. `src/dalton/dalton.yaml` `models.assist_model`
+    2. `dalton_model_pref(user_id, <pref_key>)` (user -> team PM holder -> `dalton.yaml` default:
+       - `assist` -> `dalton_assist_model` (default `models.assist_model`)
+       - `extract` / `conversation_extract` -> `dalton_extract_model` (default `conversations.extractor_model`)
+       - `audit` -> `dalton_audit_model` (default `publish.audit_model`))
 
+    Returns `""` when unconfigured so the caller can report that no model is configured.
     Raises `RolePolicyError` if the resolved model is marked `forbidden_for_roles` (L21).
     """
     if explicit_model and explicit_model.strip():
         return _validate_assist_candidate(role, explicit_model)
 
-    agent_cfg_path = REPO_ROOT / "agent_config.dalton.yaml"
-    agent_cfg = _read_yaml_dict(agent_cfg_path)
-    llm_block = agent_cfg.get("llm")
-    if isinstance(llm_block, dict):
-        role_val = llm_block.get(role)
-        if isinstance(role_val, str) and role_val.strip():
-            return _validate_assist_candidate(role, role_val)
-
-    dalton_cfg = _read_yaml_dict(DALTON_YAML_PATH)
-    dalton_llm = dalton_cfg.get("llm")
-    if isinstance(dalton_llm, dict):
-        role_val = dalton_llm.get(role)
-        if isinstance(role_val, str) and role_val.strip():
-            return _validate_assist_candidate(role, role_val)
-    publish_block = dalton_cfg.get("publish")
-    if isinstance(publish_block, dict) and role in ("assist", "extract"):
-        ext_val = publish_block.get("extract_model")
-        if isinstance(ext_val, str) and ext_val.strip():
-            return _validate_assist_candidate(role, ext_val)
-
-    # Last resort is the configured `models.assist_model` (dalton.yaml), never a name in code.
-    from src.dalton.settings import get_dalton_config
-
-    return _validate_assist_candidate(role, get_dalton_config().models.assist_model)
+    if role == "audit":
+        pref_key = "dalton_audit_model"
+    elif role in ("extract", "conversation_extract"):
+        pref_key = "dalton_extract_model"
+    else:
+        pref_key = "dalton_assist_model"
+    val = await dalton_model_pref(user_id, pref_key)
+    if isinstance(val, str) and val.strip():
+        return _validate_assist_candidate(role, val)
+    return ""
 
 
-def resolve_assist_fallback_models(role: str = "assist_fallback") -> list[str]:
-    """Resolve fallback model list for `assist_json` from `settings.get_assist_fallback_models()` (P0J.J2)."""
+async def resolve_assist_fallback_models(
+    role: str = "assist_fallback",
+    *,
+    user_id: str | None = None,
+) -> list[str]:
+    """Resolve fallback model list for `assist_json` via `dalton_model_pref` (P0J.J2)."""
+    pref_key = (
+        "dalton_audit_fallback_models"
+        if role in ("audit", "audit_fallback")
+        else "dalton_assist_fallback_models"
+    )
+    raw = await dalton_model_pref(user_id, pref_key)
+    items = raw if isinstance(raw, list) else ([raw] if isinstance(raw, str) else [])
     return [
-        _validate_assist_candidate(role, m)
-        for m in get_assist_fallback_models()
-        if m and m.strip()
+        _validate_assist_candidate(role, str(m))
+        for m in items
+        if isinstance(m, str) and m.strip()
     ]
 
 
-def resolve_assist_fallback_model(role: str = "assist_fallback") -> str | None:
+async def resolve_assist_fallback_model(
+    role: str = "assist_fallback",
+    *,
+    user_id: str | None = None,
+) -> str | None:
     """Return the first configured assist fallback model, if any."""
-    models = resolve_assist_fallback_models(role=role)
+    models = await resolve_assist_fallback_models(role=role, user_id=user_id)
     return models[0] if models else None
 
 
@@ -259,7 +257,32 @@ async def assist_json(
     comp: Any = None
 
     try:
-        resolved_model = resolve_assist_model(role=role, explicit_model=model)
+        resolved_or_coro = resolve_assist_model(
+            role=role, explicit_model=model, user_id=user_id
+        )
+        resolved_model = (
+            await resolved_or_coro
+            if inspect.isawaitable(resolved_or_coro)
+            else resolved_or_coro
+        )
+        if not resolved_model or not str(resolved_model).strip():
+            unconfigured_msg = (
+                "数字核验模型（dalton_audit_model / publish.audit_model）未配置"
+                if role == "audit"
+                else (
+                    "抽取任务模型（dalton_extract_model / conversations.extractor_model）未配置"
+                    if role in ("extract", "conversation_extract")
+                    else "辅助任务模型（dalton_assist_model / models.assist_model）未配置"
+                )
+            )
+            return AssistResult(
+                ok=False,
+                data=None,
+                error=unconfigured_msg,
+                model="",
+                status="failed",
+                error_kind="unconfigured_model",
+            )
         own_chain = fallback_models is not None
 
         def _is_subscription(m: str) -> bool:
@@ -272,11 +295,20 @@ async def assist_json(
 
         # Every candidate passes the policy check (L21) before anything is sent, so a
         # forbidden fallback fails fast rather than after a primary result is discarded.
-        fb_list = (
-            [_validate_assist_candidate(f"{role}_fallback", m) for m in fallback_models if m and m.strip()]
-            if own_chain
-            else (resolve_assist_fallback_models() if model is None else [])
-        )
+        if own_chain:
+            fb_list = [
+                _validate_assist_candidate(f"{role}_fallback", m)
+                for m in fallback_models
+                if m and m.strip()
+            ]
+        elif model is None:
+            fb_role = "audit_fallback" if role == "audit" else f"{role}_fallback"
+            fb_or_coro = resolve_assist_fallback_models(role=fb_role, user_id=user_id)
+            fb_list = (
+                await fb_or_coro if inspect.isawaitable(fb_or_coro) else fb_or_coro
+            )
+        else:
+            fb_list = []
 
         payload_json = json.dumps(
             payload if isinstance(payload, dict) else {"value": payload},

@@ -37,8 +37,9 @@ class DaltonModelsConfig(BaseModel):
 
     broker: DaltonBrokerModelsConfig = Field(default_factory=DaltonBrokerModelsConfig)
     disabled_providers: list[str] = Field(default_factory=list)
-    assist_model: str = "gemini-3.8-flash-low-oauth"
+    assist_model: str = ""
     assist_fallback_model: str | list[str] = Field(default_factory=list)
+    probe_models: dict[str, str] = Field(default_factory=dict)
 
 
 class DaltonBudgetDefaults(BaseModel):
@@ -63,15 +64,7 @@ class DaltonPublishConfig(BaseModel):
     """Publication governance settings (PK.8-PK.13, P0N.5)."""
 
     enabled: bool = True
-    reviewer_models: list[str] = Field(
-        default_factory=lambda: [
-            "gpt-6.1-sol-oauth",
-            "gemini-4-argon-high-oauth",
-            "grok-4.7-oauth",
-            "claude-opus-5-5-oauth",
-        ]
-    )
-    extract_model: str | None = None
+    reviewer_models: list[str] = Field(default_factory=list)
     # Number audit (check_draft / publish): labelling and judging figures. Its own
     # models, not the shared assist slot. Named in dalton.yaml only; empty here so a
     # missing config fails loudly instead of quietly picking a model.
@@ -129,10 +122,10 @@ class DaltonConversationsConfig(BaseModel):
     """OpenClaw conversation archive settings (MVP Phase 1)."""
 
     enabled: bool = True
-    extractor_model: str = "gemini-4-argon-medium-oauth"
+    extractor_model: str = ""
     prompt_version: str = "conv_card_v2_3"
-    embedding_model: str = "gemini-embedding-001"
-    embedding_model_preferred: str = "gemini-embedding-2-preview"
+    embedding_model: str = ""
+    embedding_model_preferred: str = ""
     embedding_dimensions: int = Field(default=3072, gt=0)
     hourly_token_budget: int = Field(default=120_000, gt=0)
     extract_concurrency: int = Field(default=1, ge=1)

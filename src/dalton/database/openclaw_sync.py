@@ -138,6 +138,7 @@ async def fetch_recent_sync_runs() -> tuple[dict[str, Any] | None, dict[str, Any
 
 async def find_user_referenced_models() -> dict[str, list[str]]:
     """Return `{model_key: [reference_source, ...]}` across all users' preferences and subagents (P0.7 §3.1)."""
+    from src.dalton.llm.model_prefs import DALTON_MODEL_LIST_KEYS, DALTON_SINGLE_MODEL_KEYS
     from src.server.services.llm.availability import _MODEL_PREF_KEYS
 
     refs: dict[str, list[str]] = {}
@@ -173,6 +174,14 @@ async def find_user_referenced_models() -> dict[str, list[str]]:
                     if isinstance(fb, list):
                         for item in fb:
                             _add(item, f"user:{uid}:fallback_models")
+                    # Dalton role models saved under Settings > Models (advanced).
+                    for k in DALTON_SINGLE_MODEL_KEYS:
+                        _add(bag.get(k), f"user:{uid}:{k}")
+                    for k in DALTON_MODEL_LIST_KEYS:
+                        vals = bag.get(k)
+                        if isinstance(vals, list):
+                            for item in vals:
+                                _add(item, f"user:{uid}:{k}")
 
                 if isinstance(ap, dict):
                     sub_models = ap.get("subagent_models") or ap.get("subagents") or {}

@@ -890,6 +890,10 @@ async def list_models():
             # model's own declaration when a turn resolves guidance, so the
             # client cannot name what "Default" will do without it.
             "prompt_guidance": get_prompt_guidance_default(),
+            # DALTON-HOOK(settings-section): expose Dalton model defaults from dalton.yaml
+            **__import__(
+                "src.dalton.llm.model_prefs", fromlist=["get_dalton_system_defaults"]
+            ).get_dalton_system_defaults(),
         },
         "compaction_profiles": COMPACTION_PROFILES,
         "search_providers": search_providers,

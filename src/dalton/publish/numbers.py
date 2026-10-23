@@ -10,6 +10,11 @@ from typing import Any, Literal, get_args
 
 from pydantic import BaseModel, Field, model_validator
 
+from src.dalton.llm.model_prefs import (
+    resolve_dalton_audit_fallback_models,
+    resolve_dalton_audit_model,
+    resolve_dalton_audit_timeout_s,
+)
 from src.dalton.settings import get_dalton_config
 
 try:
@@ -1345,6 +1350,9 @@ async def label_figures_with_status(
 
     pub = get_dalton_config().publish
     sem = asyncio.Semaphore(pub.audit_concurrency)
+    audit_model = await resolve_dalton_audit_model(user_id)
+    audit_fallback_models = await resolve_dalton_audit_fallback_models(user_id)
+    audit_timeout_s = await resolve_dalton_audit_timeout_s(user_id)
     label_schema = FigureLabels.model_json_schema()
 
     prepared_batches: list[
@@ -1393,9 +1401,9 @@ async def label_figures_with_status(
                 user_id=user_id,
                 workspace_id=workspace_id,
                 thread_id=thread_id,
-                timeout_s=pub.audit_timeout_s,
-                model=pub.audit_model,
-                fallback_models=pub.audit_fallback_models,
+                timeout_s=audit_timeout_s,
+                model=audit_model,
+                fallback_models=audit_fallback_models,
                 deadline=deadline,
             )
 

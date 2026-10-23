@@ -9,7 +9,8 @@ llm:
   # the owner's *-oauth connections serve every member.
   name: "claude-opus-5-5-oauth"
   background: "gemini-4-argon-low-oauth"
-  assist: "gemini-3.8-flash-low-oauth"
+  # Assist (auxiliary JSON task) model defaults live in src/dalton/dalton.yaml
+  # under models.assist_model / models.assist_fallback_model (not here).
   compaction: ""
   fetch: ""
   fallback:

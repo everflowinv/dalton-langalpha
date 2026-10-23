@@ -1221,3 +1221,160 @@ async def test_a_non_boolean_subagents_default_is_rejected(client, value):
     assert resp.status_code == 400
     assert "subagents_default" in resp.json()["detail"]
     upsert.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# PUT /users/me/preferences: Dalton model_preference keys validation
+# DALTON-HOOK(settings-section): test Dalton model_preference validation with create_autospec
+# ---------------------------------------------------------------------------
+
+
+@asynccontextmanager
+async def _dalton_prefs_endpoint(stored_model_preference=None):
+    """DALTON-HOOK(settings-section): preferences PUT harness using create_autospec instead of bare AsyncMock."""
+    from unittest.mock import create_autospec
+    import src.server.app.users as users_mod
+
+    get_user_mock = create_autospec(users_mod.db_get_user, return_value=_user())
+    get_prefs_mock = create_autospec(
+        users_mod.db_get_user_preferences,
+        return_value={"model_preference": stored_model_preference or {}},
+    )
+    upsert_mock = create_autospec(
+        users_mod.upsert_user_preferences, return_value=_prefs()
+    )
+    onboarding_mock = create_autospec(users_mod.maybe_complete_onboarding)
+    with (
+        patch.object(users_mod, "db_get_user", new=get_user_mock),
+        patch.object(users_mod, "db_get_user_preferences", new=get_prefs_mock),
+        patch.object(users_mod, "upsert_user_preferences", new=upsert_mock),
+        patch.object(users_mod, "maybe_complete_onboarding", new=onboarding_mock),
+    ):
+        yield upsert_mock
+
+
+@pytest.mark.asyncio
+async def test_dalton_model_preference_valid_dedup_and_clear_accepted(client):
+    """DALTON-HOOK(settings-section): valid catalog models, deduplicated lists, and timeout 60..1800 are saved."""
+    async with _dalton_prefs_endpoint() as upsert:
+        resp = await client.put(
+            "/api/v1/users/me/preferences",
+            json={
+                "model_preference": {
+                    "dalton_audit_model": "gemini-3.8-flash-low-oauth",
+                    "dalton_audit_fallback_models": [
+                        "deepseek-flash",
+                        "gpt-6.1-sol-oauth",
+                        "deepseek-flash",
+                    ],
+                    "dalton_audit_timeout_s": 300,
+                    "dalton_assist_model": "gemini-3.8-flash-low-oauth",
+                    "dalton_assist_fallback_models": ["deepseek-flash"],
+                    "dalton_reviewer_models": [
+                        "gpt-6.1-sol-oauth",
+                        "claude-opus-5-5-oauth",
+                        "gpt-6.1-sol-oauth",
+                    ],
+                    "dalton_extract_model": "",
+                }
+            },
+        )
+
+    assert resp.status_code == 200
+    saved_mp = upsert.await_args.kwargs["model_preference"]
+    assert saved_mp["dalton_audit_model"] == "gemini-3.8-flash-low-oauth"
+    assert saved_mp["dalton_audit_fallback_models"] == [
+        "deepseek-flash",
+        "gpt-6.1-sol-oauth",
+    ]
+    assert saved_mp["dalton_audit_timeout_s"] == 300
+    assert saved_mp["dalton_reviewer_models"] == [
+        "gpt-6.1-sol-oauth",
+        "claude-opus-5-5-oauth",
+    ]
+    assert saved_mp["dalton_extract_model"] is None
+
+
+@pytest.mark.parametrize(
+    "bad_mp, expected_field",
+    [
+        # DALTON-HOOK(settings-section): reject unknown models, contributor models, and out-of-range timeouts
+        ({"dalton_audit_model": "nonexistent-model-xyz"}, "dalton_audit_model"),
+        (
+            {"dalton_assist_model": "muse-spark-1.3-contributor-oauth"},
+            "dalton_assist_model",
+        ),
+        (
+            {"dalton_reviewer_models": ["gpt-6.1-sol-oauth", "unknown-model-999"]},
+            "dalton_reviewer_models",
+        ),
+        ({"dalton_reviewer_models": "not-a-list"}, "dalton_reviewer_models"),
+        ({"dalton_audit_timeout_s": 59}, "dalton_audit_timeout_s"),
+        ({"dalton_audit_timeout_s": 1801}, "dalton_audit_timeout_s"),
+        ({"dalton_audit_timeout_s": True}, "dalton_audit_timeout_s"),
+        ({"dalton_audit_timeout_s": "300"}, "dalton_audit_timeout_s"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_dalton_model_preference_invalid_values_rejected(
+    client, bad_mp, expected_field
+):
+    """DALTON-HOOK(settings-section): invalid Dalton model_preference values get a 400."""
+    async with _dalton_prefs_endpoint() as upsert:
+        resp = await client.put(
+            "/api/v1/users/me/preferences",
+            json={"model_preference": bad_mp},
+        )
+
+    assert resp.status_code == 400
+    assert expected_field in resp.json()["detail"]
+    upsert.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_dalton_model_preference_rejects_custom_models_with_chinese_reason(
+    client,
+):
+    """DALTON-HOOK(settings-section): Dalton model settings reject custom_models from effective catalog with a Chinese reason."""
+    stored = {
+        "custom_models": [
+            {"name": "my-custom-gpt", "model_id": "gpt-4o", "provider": "openai"}
+        ]
+    }
+    async with _dalton_prefs_endpoint(stored_model_preference=stored) as upsert:
+        resp = await client.put(
+            "/api/v1/users/me/preferences",
+            json={"model_preference": {"dalton_audit_model": "my-custom-gpt"}},
+        )
+
+    assert resp.status_code == 400
+    detail = resp.json()["detail"]
+    assert "dalton_audit_model" in detail
+    assert "my-custom-gpt" in detail
+    assert "自定义模型无法被团队其他成员继承，请选择系统目录中的模型" in detail
+    upsert.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_dalton_stored_legacy_custom_value_does_not_block_unrelated_preference_update(
+    client,
+):
+    """DALTON-HOOK(settings-section): updating unrelated model_preference fields succeeds even if stored Dalton fields hold legacy custom/removed models."""
+    stored = {
+        "custom_models": [
+            {"name": "legacy-custom-gpt", "model_id": "gpt-4o", "provider": "openai"}
+        ],
+        "dalton_audit_model": "legacy-custom-gpt",
+        "dalton_reviewer_models": ["legacy-removed-model"],
+    }
+    async with _dalton_prefs_endpoint(stored_model_preference=stored) as upsert:
+        resp = await client.put(
+            "/api/v1/users/me/preferences",
+            json={"model_preference": {"preferred_model": "gpt-6.1-sol-oauth"}},
+        )
+
+    assert resp.status_code == 200
+    upsert.assert_awaited_once()
+
+
+

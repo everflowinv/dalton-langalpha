@@ -23,10 +23,10 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from src.dalton.llm.role_policy import (  # noqa: E402
+    _select_independent_reviewer_from_candidates,
     check_roles,
     explain_model_availability,
     family_of,
-    select_independent_reviewer,
 )
 from src.dalton.settings import get_dalton_settings  # noqa: E402
 
@@ -102,14 +102,14 @@ def main(argv: list[str] | None = None) -> int:
         available_set = {k for k, v in availability_report.items() if v.get("available")}
 
     # Draft-stage subagent reviewer needs tool calling to read sources
-    subagent_reviewer = select_independent_reviewer(
+    subagent_reviewer = _select_independent_reviewer_from_candidates(
         lead_model,
         candidates,
         require_tool_calling=True,
         available_models=available_set,
     )
     # Server-side publish reviewer does not require tool calling
-    server_reviewer = select_independent_reviewer(
+    server_reviewer = _select_independent_reviewer_from_candidates(
         lead_model,
         candidates,
         require_tool_calling=False,

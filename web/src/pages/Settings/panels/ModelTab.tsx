@@ -63,7 +63,8 @@ export function ModelTab() {
   const tierAllows = useSearchTierAllows();
   const { preferences: prefsData } = usePreferences();
   const { mutate } = useUpdatePreferences();
-  const { models: visibleModels, metadata: modelMetadata, modelAccessMap, systemDefaults: hookSystemDefaults, validModelNames, rawModels, isLoading: modelsLoading, compactionProfiles, searchProviders } = useAllModels();
+  // DALTON-HOOK(settings-section): customModels is read to keep custom models out of the Dalton selectors
+  const { models: visibleModels, metadata: modelMetadata, modelAccessMap, systemDefaults: hookSystemDefaults, customModels, validModelNames, rawModels, isLoading: modelsLoading, compactionProfiles, searchProviders } = useAllModels();
   const { t } = useTranslation();
   const modelSlotCopy = useModelSlotCopy();
 
@@ -136,6 +137,77 @@ export function ModelTab() {
     background: deploymentBackground && label(deploymentBackground),
   };
   const defaultModelScope = readDefaultModelScope(prefsData);
+
+  // DALTON-HOOK(settings-section): format "留空 = 使用系统默认（xxx）" from backend system_defaults
+  const daltonDefaultHint = (val: string | string[] | number | undefined | null) => {
+    if (Array.isArray(val)) {
+      const items = val.map((m) => m.trim()).filter(Boolean);
+      return items.length > 0
+        ? t('settings.modelTuning.daltonEmptyDefault', { value: items.join(', ') })
+        : t('settings.modelTuning.daltonEmptyDefaultUnset');
+    }
+    if (typeof val === 'number' && Number.isFinite(val)) {
+      return t('settings.modelTuning.daltonEmptyDefault', { value: String(val) });
+    }
+    if (typeof val === 'string' && val.trim().length > 0) {
+      return t('settings.modelTuning.daltonEmptyDefault', { value: val.trim() });
+    }
+    return t('settings.modelTuning.daltonEmptyDefaultUnset');
+  };
+
+  // DALTON-HOOK(settings-section): Dalton pickers only offer system catalog models (exclude custom_models)
+  const daltonSystemModels = useMemo(() => {
+    const customSet = new Set<string>();
+    for (const cm of customModels ?? []) {
+      if (cm?.name) customSet.add(cm.name);
+    }
+    for (const cm of (mPref.custom_models as Array<{ name?: string }> | undefined) ?? []) {
+      if (cm?.name) customSet.add(cm.name);
+    }
+    if (customSet.size === 0) return visibleModels;
+    const filtered: typeof visibleModels = {};
+    for (const [provider, data] of Object.entries(visibleModels)) {
+      const sysList = (data.models ?? []).filter((m) => !customSet.has(m));
+      if (sysList.length > 0) {
+        filtered[provider] = { ...data, models: sysList };
+      }
+    }
+    return filtered;
+  }, [visibleModels, customModels, mPref.custom_models]);
+
+  // DALTON-HOOK(settings-section): string draft state for Dalton figure audit timeout (60..1800)
+  const storedAuditTimeout = mPref.dalton_audit_timeout_s;
+  const [auditTimeoutDraft, setAuditTimeoutDraft] = useState<string>(() =>
+    storedAuditTimeout != null ? String(storedAuditTimeout) : '',
+  );
+  const [auditTimeoutError, setAuditTimeoutError] = useState<string | null>(null);
+  useEffect(() => {
+    setAuditTimeoutDraft(storedAuditTimeout != null ? String(storedAuditTimeout) : '');
+    setAuditTimeoutError(null);
+  }, [storedAuditTimeout]);
+
+  const commitAuditTimeout = useCallback(
+    (rawInput: string) => {
+      const trimmed = rawInput.trim();
+      if (!trimmed) {
+        setAuditTimeoutError(null);
+        if (storedAuditTimeout != null) {
+          write({ dalton_audit_timeout_s: null });
+        }
+        return;
+      }
+      const parsed = Number(trimmed);
+      if (!Number.isInteger(parsed) || parsed < 60 || parsed > 1800) {
+        setAuditTimeoutError('数字核验超时必须在 60–1800 秒之间');
+        return;
+      }
+      setAuditTimeoutError(null);
+      if (parsed !== storedAuditTimeout) {
+        write({ dalton_audit_timeout_s: parsed });
+      }
+    },
+    [storedAuditTimeout, write],
+  );
 
   // Close starred-model picker on click outside
   useEffect(() => {
@@ -432,6 +504,111 @@ export function ModelTab() {
                   models={visibleModels}
                   metadata={modelMetadata}
                 />
+                {/* DALTON-HOOK(settings-section): Dalton model routing settings */}
+                <div className="pt-2 border-t flex flex-col gap-4" style={{ borderColor: 'var(--color-border-muted)' }}>
+                  <h4 className="text-xs font-semibold uppercase tracking-wider" style={{ color: 'var(--color-text-secondary)' }}>
+                    {t('settings.modelTuning.daltonHeading')}
+                  </h4>
+                  <ModelSelector
+                    label={t('settings.modelTuning.daltonAuditModel')}
+                    description={`${t('settings.modelTuning.daltonAuditModelDesc')} ${daltonDefaultHint(hookSystemDefaults?.dalton_audit_model)}`}
+                    value={mPref.dalton_audit_model ?? ''}
+                    onChange={(v) => write({ dalton_audit_model: v || null })}
+                    models={daltonSystemModels}
+                    placeholder={daltonDefaultHint(hookSystemDefaults?.dalton_audit_model)}
+                    modelAccess={modelAccessMap}
+                    metadata={modelMetadata}
+                  />
+                  <FallbackModelsPicker
+                    label={t('settings.modelTuning.daltonAuditFallbackModels')}
+                    description={`${t('settings.modelTuning.daltonAuditFallbackModelsDesc')} ${daltonDefaultHint(hookSystemDefaults?.dalton_audit_fallback_models)}`}
+                    selected={mPref.dalton_audit_fallback_models ?? []}
+                    onChange={(list) => write({ dalton_audit_fallback_models: list.length > 0 ? list : null })}
+                    models={daltonSystemModels}
+                    metadata={modelMetadata}
+                  />
+                  {/* DALTON-HOOK(settings-section): Dalton figure audit timeout and auxiliary/reviewer/extract models */}
+                  <div className="flex flex-col gap-1.5">
+                    <label
+                      htmlFor="dalton-audit-timeout-input"
+                      className="text-sm font-medium"
+                      style={{ color: 'var(--color-text-primary)' }}
+                    >
+                      {t('settings.modelTuning.daltonAuditTimeoutS')}
+                    </label>
+                    <p className="text-xs leading-relaxed" style={{ color: 'var(--color-text-tertiary)' }}>
+                      {`${t('settings.modelTuning.daltonAuditTimeoutSDesc')} ${daltonDefaultHint(hookSystemDefaults?.dalton_audit_timeout_s ?? 300)}`}
+                    </p>
+                    <input
+                      id="dalton-audit-timeout-input"
+                      type="number"
+                      min={60}
+                      max={1800}
+                      step={1}
+                      value={auditTimeoutDraft}
+                      placeholder={daltonDefaultHint(hookSystemDefaults?.dalton_audit_timeout_s ?? 300)}
+                      onChange={(e) => {
+                        setAuditTimeoutDraft(e.target.value);
+                        if (auditTimeoutError) setAuditTimeoutError(null);
+                      }}
+                      onBlur={(e) => commitAuditTimeout(e.currentTarget.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') {
+                          e.preventDefault();
+                          commitAuditTimeout(e.currentTarget.value);
+                        }
+                      }}
+                      className="w-full max-w-xs rounded-md px-3 py-1.5 text-sm"
+                      style={{
+                        backgroundColor: 'var(--color-bg-input)',
+                        border: '1px solid var(--color-border-muted)',
+                        color: 'var(--color-text-primary)',
+                      }}
+                    />
+                    {auditTimeoutError && (
+                      <p role="alert" className="text-xs" style={{ color: 'var(--color-icon-danger)' }}>
+                        {auditTimeoutError}
+                      </p>
+                    )}
+                  </div>
+                  {/* DALTON-HOOK(settings-section): Dalton assist, reviewer, and extract model selectors */}
+                  <ModelSelector
+                    label={t('settings.modelTuning.daltonAssistModel')}
+                    description={`${t('settings.modelTuning.daltonAssistModelDesc')} ${daltonDefaultHint(hookSystemDefaults?.dalton_assist_model)}`}
+                    value={mPref.dalton_assist_model ?? ''}
+                    onChange={(v) => write({ dalton_assist_model: v || null })}
+                    models={daltonSystemModels}
+                    placeholder={daltonDefaultHint(hookSystemDefaults?.dalton_assist_model)}
+                    modelAccess={modelAccessMap}
+                    metadata={modelMetadata}
+                  />
+                  <FallbackModelsPicker
+                    label={t('settings.modelTuning.daltonAssistFallbackModels')}
+                    description={`${t('settings.modelTuning.daltonAssistFallbackModelsDesc')} ${daltonDefaultHint(hookSystemDefaults?.dalton_assist_fallback_models)}`}
+                    selected={mPref.dalton_assist_fallback_models ?? []}
+                    onChange={(list) => write({ dalton_assist_fallback_models: list.length > 0 ? list : null })}
+                    models={daltonSystemModels}
+                    metadata={modelMetadata}
+                  />
+                  <FallbackModelsPicker
+                    label={t('settings.modelTuning.daltonReviewerModels')}
+                    description={`${t('settings.modelTuning.daltonReviewerModelsDesc')} ${daltonDefaultHint(hookSystemDefaults?.dalton_reviewer_models)}`}
+                    selected={mPref.dalton_reviewer_models ?? []}
+                    onChange={(list) => write({ dalton_reviewer_models: list.length > 0 ? list : null })}
+                    models={daltonSystemModels}
+                    metadata={modelMetadata}
+                  />
+                  <ModelSelector
+                    label={t('settings.modelTuning.daltonExtractModel')}
+                    description={`${t('settings.modelTuning.daltonExtractModelDesc')} ${daltonDefaultHint(hookSystemDefaults?.dalton_extract_model)}`}
+                    value={mPref.dalton_extract_model ?? ''}
+                    onChange={(v) => write({ dalton_extract_model: v || null })}
+                    models={daltonSystemModels}
+                    placeholder={daltonDefaultHint(hookSystemDefaults?.dalton_extract_model)}
+                    modelAccess={modelAccessMap}
+                    metadata={modelMetadata}
+                  />
+                </div>
               </div>
             </div>
           </>

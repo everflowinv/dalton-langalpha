@@ -35,6 +35,11 @@ from src.dalton.publish.numbers import (
     normalize_period,
     parse_facts_ledger,
 )
+from src.dalton.llm.model_prefs import (
+    resolve_dalton_audit_fallback_models,
+    resolve_dalton_audit_model,
+    resolve_dalton_audit_timeout_s,
+)
 from src.dalton.settings import get_dalton_config
 
 try:
@@ -495,7 +500,9 @@ async def judge_figures_batch_with_llm(
         "from inside `quote` that names the metric. "
         f"3) Only return `exempt` if the draft `sentence` itself explicitly contains one of: {_EXEMPT_MARKERS_PROMPT}."
     )
-    pub = get_dalton_config().publish
+    audit_model = await resolve_dalton_audit_model(user_id)
+    audit_fallback_models = await resolve_dalton_audit_fallback_models(user_id)
+    audit_timeout_s = await resolve_dalton_audit_timeout_s(user_id)
     res = await assist_json(
         task="audit.judge",
         instructions=judge_instructions,
@@ -504,9 +511,9 @@ async def judge_figures_batch_with_llm(
         user_id=user_id,
         workspace_id=workspace_id,
         thread_id=thread_id,
-        timeout_s=pub.audit_timeout_s,
-        model=pub.audit_model,
-        fallback_models=pub.audit_fallback_models,
+        timeout_s=audit_timeout_s,
+        model=audit_model,
+        fallback_models=audit_fallback_models,
         deadline=deadline,
     )
     if not res.ok or not isinstance(res.data, dict):
@@ -727,7 +734,7 @@ async def aaudit_draft(
         raise ValueError("user_id is required")
     user_id = str(user_id).strip()
     pub = get_dalton_config().publish
-    if use_llm_judge and not (pub.audit_model or "").strip():
+    if use_llm_judge and not (await resolve_dalton_audit_model(user_id)).strip():
         raise ValueError("数字核验未配置模型：请在 dalton.yaml 的 publish.audit_model 指定。")
     # One budget for the whole audit, from here on: extraction, labelling, matching and
     # judging. Model calls past it send nothing new (journalled results still replay),

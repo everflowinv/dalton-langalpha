@@ -296,19 +296,14 @@ async def available_model_keys(
     return {k for k, v in report.items() if v.get("available")}
 
 
-def select_independent_reviewer(
+def _select_independent_reviewer_from_candidates(
     lead_model: str,
-    candidates: list[str] | None = None,
+    candidates: list[str],
     *,
     require_tool_calling: bool = False,
     available_models: set[str] | None = None,
 ) -> str | None:
-    """Pick the first candidate whose `family_of()` differs from `lead_model` and is available."""
-    if candidates is None:
-        from src.dalton.settings import get_dalton_settings
-
-        candidates = list(get_dalton_settings().publish.reviewer_models)
-
+    """Pick the first candidate from an explicit list whose `family_of()` differs from `lead_model` and is available."""
     lead_family = family_of(lead_model)
     if lead_family == "unknown":
         return None
@@ -340,6 +335,29 @@ def select_independent_reviewer(
                 continue
         return cand
     return None
+
+
+async def select_independent_reviewer(
+    lead_model: str,
+    candidates: list[str] | None = None,
+    *,
+    require_tool_calling: bool = False,
+    available_models: set[str] | None = None,
+    user_id: str | None = None,
+) -> str | None:
+    """Pick the first candidate whose `family_of()` differs from `lead_model` and is available."""
+    if candidates is None:
+        from src.dalton.llm.model_prefs import dalton_model_pref
+
+        resolved_cands = await dalton_model_pref(user_id, "dalton_reviewer_models")
+        candidates = list(resolved_cands) if isinstance(resolved_cands, list) else []
+
+    return _select_independent_reviewer_from_candidates(
+        lead_model,
+        candidates,
+        require_tool_calling=require_tool_calling,
+        available_models=available_models,
+    )
 
 
 class DaltonStartupConfigError(RuntimeError):
@@ -417,6 +435,8 @@ def _resolve_assist_fallback_models_for_policy() -> list[str]:
 def check_roles(
     config: dict[str, Any] | None = None,
     *,
+    assist_model: str | None = None,
+    assist_fallback_models: list[str] | None = None,
     reviewer_models: list[str] | None = None,
     available_models: set[str] | None = None,
 ) -> list[dict[str, str]]:
@@ -435,10 +455,10 @@ def check_roles(
     lead_model = str(
         llm_cfg.get("name")
         or llm_cfg.get("preferred_model")
-        or "claude-opus-5-5-oauth"
-    )
+        or ""
+    ).strip()
 
-    if is_forbidden_for_roles(lead_model):
+    if lead_model and is_forbidden_for_roles(lead_model):
         warnings.append(
             {
                 "code": "role_forbidden_model",
@@ -449,7 +469,7 @@ def check_roles(
             }
         )
 
-    if is_text_only(lead_model):
+    if lead_model and is_text_only(lead_model):
         warnings.append(
             {
                 "code": "lead_text_only",
@@ -460,7 +480,7 @@ def check_roles(
             }
         )
 
-    if available_models is not None and lead_model not in available_models:
+    if lead_model and available_models is not None and lead_model not in available_models:
         warnings.append(
             {
                 "code": "role_model_unavailable",
@@ -478,7 +498,22 @@ def check_roles(
     # use forbidden contributor models.
     from src.dalton.settings import get_dalton_settings
 
-    assist_fb_models = _resolve_assist_fallback_models_for_policy()
+    assist_fb_models = (
+        list(assist_fallback_models)
+        if assist_fallback_models is not None
+        else _resolve_assist_fallback_models_for_policy()
+    )
+    models_cfg = cfg.get("models") if isinstance(cfg.get("models"), dict) else {}
+    eff_assist_model = (
+        str(assist_model).strip()
+        if assist_model is not None
+        else str(
+            llm_cfg.get("assist")
+            or models_cfg.get("assist_model")
+            or (get_dalton_settings().models.assist_model if config is None else "")
+            or ""
+        ).strip()
+    )
     conv_cfg = cfg.get("conversations") if isinstance(cfg.get("conversations"), dict) else {}
     extractor_model = str(
         conv_cfg.get("extractor_model")
@@ -490,7 +525,7 @@ def check_roles(
     ).strip()
 
     aux_slots: list[tuple[str, str]] = [
-        ("assist", str(llm_cfg.get("assist") or "").strip()),
+        ("assist", eff_assist_model),
         *[("assist_fallback", fb_m) for fb_m in assist_fb_models],
         ("background", str(llm_cfg.get("background") or "").strip()),
         (
@@ -605,22 +640,23 @@ def check_roles(
                 }
             )
 
-    chosen_reviewer = select_independent_reviewer(
-        lead_model,
-        eff_reviewer_models,
-        require_tool_calling=False,
-        available_models=available_models,
-    )
-    if chosen_reviewer is None:
-        warnings.append(
-            {
-                "code": "reviewer_same_family",
-                "role": "reviewer",
-                "model": lead_model,
-                "message": f"审稿候选列表中没有与主模型 {lead_model}（家族 {family_of(lead_model)}）不同家族且可用的模型。",
-                "link": "/settings?tab=model",
-            }
+    if lead_model:
+        chosen_reviewer = _select_independent_reviewer_from_candidates(
+            lead_model,
+            eff_reviewer_models,
+            require_tool_calling=False,
+            available_models=available_models,
         )
+        if chosen_reviewer is None:
+            warnings.append(
+                {
+                    "code": "reviewer_same_family",
+                    "role": "reviewer",
+                    "model": lead_model,
+                    "message": f"审稿候选列表中没有与主模型 {lead_model}（家族 {family_of(lead_model)}）不同家族且可用的模型。",
+                    "link": "/settings?tab=model",
+                }
+            )
 
     # Number audit chain (publish.audit_model + audit_fallback_models): same
     # contributor ban as every role, and it must be configured at all.

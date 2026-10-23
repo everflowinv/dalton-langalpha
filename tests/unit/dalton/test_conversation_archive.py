@@ -8167,7 +8167,7 @@ def test_round10_third_party_forecast_number_slot_and_no_backtracking() -> None:
 async def test_conversation_archive_extract_with_glm_5_3_coding_anthropic_transport(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Verify `extractor_model` default remains `ocb-zai-glm-5.3` in dalton.yaml/settings.py,
+    """Verify `extractor_model` default remains `deepseek-flash` in dalton.yaml/settings.py,
     and `conversation_archive._extract_with_retry` / `extract_segment_cards` succeeds with
     `extractor_model='glm-5.3-plan'` over Anthropic protocol (`open.bigmodel.cn/api/anthropic`,
     `x-api-key` header, thinking + text blocks, JSON schema validation, and token accounting)."""
@@ -8182,8 +8182,8 @@ async def test_conversation_archive_extract_with_glm_5_3_coding_anthropic_transp
     from src.dalton.settings import get_dalton_settings
     from src.llms import llm as llm_mod
 
-    # Default extractor_model in dalton.yaml and settings.py must remain unchanged
-    assert get_dalton_settings().conversations.extractor_model == "gemini-4-argon-medium-oauth"
+    # Default extractor_model in dalton.yaml is deepseek-flash (2026-10-23 blind eval winner)
+    assert get_dalton_settings().conversations.extractor_model == "deepseek-flash"
 
     llm_mod.LLM._model_config = None
     dummy_token = "unit-test-glm-archive-token"

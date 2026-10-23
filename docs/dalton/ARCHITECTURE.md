@@ -160,6 +160,8 @@ Docker（colima，数据盘在 EveSSD）
 
 **团队凭据**（`src/dalton/credentials.py`）：同时满足四个条件时，经 `credential_user_id` 解析的用户模型凭据会统一落到第一位 PM 名下：Dalton 启用、使用 Dalton 的 Supabase 登录模式、`credentials.sharing: team`、设置了 `DALTON_PM_USER_IDS`。宿主机上的数据服务密钥不在这个机制内。
 
+**Dalton 模型路由设置**（`src/dalton/llm/model_prefs.py`）：数字核验模型与备选及超时（`dalton_audit_model`、`dalton_audit_fallback_models`、`dalton_audit_timeout_s`）、辅助任务模型与备选（`dalton_assist_model`、`dalton_assist_fallback_models`）、审稿模型候选（`dalton_reviewer_models`）、对话归档抽卡模型（`dalton_extract_model`）统一在前端「设置 → 模型」页面的「路由（Routing）→ Dalton」区域修改，存入 `user_preferences.model_preference`。读取时经 `dalton_model_pref(user_id, key)` 按以下顺序生效：**当前用户自己的设置 → 团队凭证持有人（`src/dalton/credentials.py` 解析出的第一位 PM）的设置 → `src/dalton/dalton.yaml` 配置文件默认值**；留空即回退到下一层，源码中不硬编码具体模型名。
+
 ## 9. 数据接入
 
 **researchdata 桥接**（`scripts/dalton/researchdata_bridge.py`）在宿主机上运行，只用 Python 标准库：

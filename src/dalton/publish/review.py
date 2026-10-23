@@ -9,7 +9,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
-from src.dalton.settings import REPO_ROOT, get_dalton_config
+from src.dalton.settings import REPO_ROOT
 
 logger = logging.getLogger(__name__)
 
@@ -130,11 +130,12 @@ def family_of(model_key: str | None) -> str:
     return "unknown"
 
 
-def pick_reviewer_model(
+async def pick_reviewer_model(
     author_model: str | None,
     *,
     candidates: list[str] | None = None,
     available_models: set[str] | None = None,
+    user_id: str | None = None,
 ) -> str | None:
     """Pick the first candidate reviewer model whose family differs from ``author_model`` (PK.10 / G3.2).
 
@@ -144,31 +145,26 @@ def pick_reviewer_model(
     if not author_model or author_family == "unknown":
         return None
 
-    candidate_list = (
-        list(candidates)
-        if candidates is not None
-        else list(get_dalton_config().publish.reviewer_models)
+    from src.dalton.llm.role_policy import select_independent_reviewer
+
+    chosen = await select_independent_reviewer(
+        str(author_model),
+        candidates,
+        require_tool_calling=False,
+        available_models=available_models,
+        user_id=user_id,
     )
-    if available_models is not None:
-        candidate_list = [c for c in candidate_list if c in available_models]
+    if chosen and family_of(chosen) not in ("unknown", author_family):
+        return chosen
 
-    try:
-        from src.dalton.llm.role_policy import select_independent_reviewer
-
-        chosen = select_independent_reviewer(
-            str(author_model),
-            candidate_list,
-            require_tool_calling=False,
-        )
-        if chosen and family_of(chosen) not in ("unknown", author_family):
-            return chosen
-    except Exception:
-        pass
-
-    for cand in candidate_list:
-        cand_family = family_of(cand)
-        if cand_family != "unknown" and cand_family != author_family:
-            return cand
+    if candidates is not None:
+        candidate_list = list(candidates)
+        if available_models is not None:
+            candidate_list = [c for c in candidate_list if c in available_models]
+        for cand in candidate_list:
+            cand_family = family_of(cand)
+            if cand_family != "unknown" and cand_family != author_family:
+                return cand
     return None
 
 
@@ -268,15 +264,14 @@ async def run_review(
         except Exception:
             pass
 
-    remaining_candidates = (
-        list(candidates)
-        if candidates is not None
-        else list(get_dalton_config().publish.reviewer_models)
+    remaining_candidates: list[str] | None = (
+        list(candidates) if candidates is not None else None
     )
-    model = pick_reviewer_model(
+    model = await pick_reviewer_model(
         author_model,
         candidates=remaining_candidates,
         available_models=eff_available,
+        user_id=user_id,
     )
     if not model or family_of(model) == author_family:
         return ReviewResult(
@@ -293,6 +288,13 @@ async def run_review(
     last_failure: ReviewResult | None = None
     while model and family_of(model) != author_family:
         cand_family = family_of(model)
+        if remaining_candidates is None:
+            from src.dalton.llm.model_prefs import dalton_model_pref
+
+            resolved_cands = await dalton_model_pref(user_id, "dalton_reviewer_models")
+            remaining_candidates = (
+                list(resolved_cands) if isinstance(resolved_cands, list) else []
+            )
         remaining_candidates = [
             c for c in remaining_candidates if c != model and family_of(c) != cand_family
         ]
@@ -354,10 +356,11 @@ async def run_review(
                 reason=f"独立审稿调用失败：{e}",
             )
 
-        model = pick_reviewer_model(
+        model = await pick_reviewer_model(
             author_model,
             candidates=remaining_candidates,
             available_models=eff_available,
+            user_id=user_id,
         )
 
     assert last_failure is not None

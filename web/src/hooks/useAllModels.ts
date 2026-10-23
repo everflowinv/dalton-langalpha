@@ -17,6 +17,14 @@ interface SystemDefaults {
   fallback_models?: string[];
   /** Deployment-pinned `prompt.guidance`; absent or null on the `auto` default. */
   prompt_guidance?: string | null;
+  // DALTON-HOOK(settings-section): Dalton model defaults returned by GET /api/v1/models
+  dalton_audit_model?: string;
+  dalton_audit_fallback_models?: string[];
+  dalton_audit_timeout_s?: number;
+  dalton_assist_model?: string;
+  dalton_assist_fallback_models?: string[];
+  dalton_reviewer_models?: string[];
+  dalton_extract_model?: string;
 }
 
 export interface CompactionProfilePreset {

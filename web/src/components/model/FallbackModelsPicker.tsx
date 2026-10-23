@@ -16,6 +16,9 @@ export function FallbackModelsPicker({
   models,
   filterProviders,
   metadata,
+  // DALTON-HOOK(settings-section): optional custom label and description for Dalton fallback/reviewer pickers
+  label,
+  description,
 }: {
   selected: string[]
   onChange: (models: string[]) => void
@@ -23,6 +26,8 @@ export function FallbackModelsPicker({
   filterProviders?: string[]
   /** Optional model metadata: chips and rows print its display_name */
   metadata?: Record<string, ModelMetadataEntry>
+  label?: string
+  description?: string
 }) {
   const { t } = useTranslation()
   const copy = useModelSlotCopy()
@@ -81,17 +86,18 @@ export function FallbackModelsPicker({
 
   return (
     <div ref={containerRef} className="flex flex-col gap-1.5">
+      {/* DALTON-HOOK(settings-section): render custom label/description when provided */}
       <label
         className="text-sm font-medium"
         style={{ color: "var(--color-text-primary)" }}
       >
-        {t("settings.fallbackModels")}
+        {label ?? t("settings.fallbackModels")}
       </label>
       <p
         className="text-xs leading-relaxed"
         style={{ color: "var(--color-text-tertiary)" }}
       >
-        {copy.fallbackDesc}
+        {description ?? copy.fallbackDesc}
       </p>
 
       {/* Selected chips with remove */}
