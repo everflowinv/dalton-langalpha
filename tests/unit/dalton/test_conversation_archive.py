@@ -6593,3 +6593,233 @@ def test_yi_fen_masking_respects_multi_digit_numerals_only() -> None:
     assert flagged("周一一个月内完成交付") == []
     assert flagged("已签署十一份订单") == ["11"]
     assert flagged("已签署一百零一份订单") == ["101"]
+
+
+@pytest.mark.asyncio
+async def test_conversation_archive_extract_with_glm_5_3_coding_anthropic_transport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify `extractor_model` default remains `ocb-zai-glm-5.3` in dalton.yaml/settings.py,
+    and `conversation_archive._extract_with_retry` / `extract_segment_cards` succeeds with
+    `extractor_model='glm-5.3-plan'` over Anthropic protocol (`open.bigmodel.cn/api/anthropic`,
+    `x-api-key` header, thinking + text blocks, JSON schema validation, and token accounting)."""
+    import anthropic
+    import httpx
+    from langchain_anthropic import ChatAnthropic
+    import scripts.dalton.conversation_archive as archive_mod
+    import src.server.database.api_keys as api_keys_mod
+    import src.server.services.llm.config as llm_config_mod
+    import src.server.services.llm.service as llm_service_mod
+    import src.server.services.llm.user_models as user_models_mod
+    from src.dalton.settings import get_dalton_settings
+    from src.llms import llm as llm_mod
+
+    # Default extractor_model in dalton.yaml and settings.py must remain unchanged
+    assert get_dalton_settings().conversations.extractor_model == "gemini-4-argon-medium-oauth"
+
+    llm_mod.LLM._model_config = None
+    dummy_token = "unit-test-glm-archive-token"
+    monkeypatch.setenv("ZAI_CN_CODING_API_KEY", dummy_token)
+    monkeypatch.setattr(
+        user_models_mod,
+        "get_model_preference",
+        create_autospec(user_models_mod.get_model_preference, return_value={}),
+    )
+    monkeypatch.setattr(
+        llm_config_mod,
+        "load_user_context",
+        create_autospec(llm_config_mod.load_user_context, return_value=None),
+    )
+    monkeypatch.setattr(
+        llm_config_mod,
+        "gate_capabilities",
+        create_autospec(llm_config_mod.gate_capabilities, return_value={}),
+    )
+    monkeypatch.setattr(
+        api_keys_mod,
+        "get_byok_configs_for_providers",
+        create_autospec(api_keys_mod.get_byok_configs_for_providers, return_value={}),
+    )
+
+    captured_requests: list[httpx.Request] = []
+    extraction_payload = {
+        "category": "research",
+        "topic_label": "META AI Capex",
+        "cards": [
+            {
+                "type": "model_assumption",
+                "topic_label": "META 2026 Capex",
+                "claim": "META 2026 年资本开支模型假设为 680 亿美元。",
+                "tickers": ["META"],
+                "entities": [],
+                "sectors": ["Internet"],
+                "figures": [
+                    {
+                        "metric": "capex",
+                        "value": 680,
+                        "unit": "USD_bn",
+                        "period": "FY2026",
+                    }
+                ],
+                "quote": "META 2026 年资本开支我们按 680 亿美元建模。",
+                "quote_event_id": "ev-glm-01",
+                "cited_sources": [],
+                "confidence": 0.9,
+            }
+        ],
+    }
+
+    async def _anthropic_handler(request: httpx.Request) -> httpx.Response:
+        captured_requests.append(request)
+        text_json = json.dumps(extraction_payload, ensure_ascii=False)
+        events = [
+            (
+                "message_start",
+                {
+                    "type": "message_start",
+                    "message": {
+                        "id": "msg_glm_archive_01",
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [],
+                        "model": "glm-5.3",
+                        "stop_reason": None,
+                        "stop_sequence": None,
+                        "usage": {
+                            "input_tokens": 210,
+                            "output_tokens": 0,
+                            "cache_creation_input_tokens": 0,
+                            "cache_read_input_tokens": 0,
+                        },
+                    },
+                },
+            ),
+            (
+                "content_block_start",
+                {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "thinking", "thinking": ""},
+                },
+            ),
+            (
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {
+                        "type": "thinking_delta",
+                        "thinking": "Analyzing segment events and extracting cards...",
+                    },
+                },
+            ),
+            ("content_block_stop", {"type": "content_block_stop", "index": 0}),
+            (
+                "content_block_start",
+                {
+                    "type": "content_block_start",
+                    "index": 1,
+                    "content_block": {"type": "text", "text": ""},
+                },
+            ),
+            (
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": 1,
+                    "delta": {"type": "text_delta", "text": text_json},
+                },
+            ),
+            ("content_block_stop", {"type": "content_block_stop", "index": 1}),
+            (
+                "message_delta",
+                {
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                    "usage": {"input_tokens": 210, "output_tokens": 95},
+                },
+            ),
+            ("message_stop", {"type": "message_stop"}),
+        ]
+        sse_bytes = "".join(
+            f"event: {ev}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+            for ev, data in events
+        ).encode("utf-8")
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=sse_bytes,
+        )
+
+    mock_http = httpx.AsyncClient(
+        transport=httpx.MockTransport(_anthropic_handler),
+        base_url="https://open.bigmodel.cn/api/anthropic",
+    )
+    orig_create_llm = llm_mod.create_llm
+
+    def _patched_create_llm(model: str, **kwargs: Any) -> Any:
+        client = orig_create_llm(model, **kwargs)
+        if isinstance(client, ChatAnthropic):
+            client.__dict__["_async_client"] = anthropic.AsyncAnthropic(
+                api_key=dummy_token,
+                base_url="https://open.bigmodel.cn/api/anthropic",
+                http_client=mock_http,
+            )
+        return client
+
+    patched_create = create_autospec(llm_mod.create_llm, side_effect=_patched_create_llm)
+    monkeypatch.setattr(llm_mod, "create_llm", patched_create)
+    monkeypatch.setattr(llm_service_mod, "create_llm", patched_create)
+
+    segment = [
+        {
+            "agent": "main",
+            "session_id": "sess_glm_01",
+            "session_key": "agent:main:feishu:direct:1",
+            "channel": "feishu",
+            "chat_type": "direct",
+            "event_id": "ev-glm-01",
+            "seq": 1,
+            "created_at_ms": 1761206400000,
+            "ts": "2026-10-23T08:00:00+00:00",
+            "date_et": "2026-10-23",
+            "message_role": "user",
+            "speaker": {
+                "sender_id_hash": "hash_owner",
+                "name": "PM",
+                "is_owner": True,
+                "role": "owner",
+            },
+            "text": "META 2026 年资本开支我们按 680 亿美元建模。",
+        }
+    ]
+
+    try:
+        outcome, retries = await archive_mod.extract_segment_with_infinite_backoff(
+            segment,
+            extractor_model="glm-5.3-plan",
+            prompt_version="conv_card_v2",
+            dry_run=True,
+        )
+    finally:
+        await mock_http.aclose()
+
+    assert retries == 0
+    assert outcome.ok is True
+    assert outcome.model_used == "glm-5.3-plan"
+    assert outcome.category == "research"
+    assert len(outcome.cards) == 1
+    assert outcome.cards[0]["tickers"] == ["META"]
+    assert outcome.input_tokens == 210
+    assert outcome.output_tokens == 95
+    assert outcome.total_tokens == 305
+
+    assert len(captured_requests) == 1
+    req = captured_requests[0]
+    assert str(req.url) == "https://open.bigmodel.cn/api/anthropic/v1/messages"
+    assert req.headers.get("x-api-key") == dummy_token
+    req_body = json.loads(req.content.decode("utf-8"))
+    assert req_body["model"] == "glm-5.3"
+    assert req_body["thinking"] == {"type": "enabled"}
+    assert "response_format" not in req_body
+

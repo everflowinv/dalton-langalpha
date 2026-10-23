@@ -665,6 +665,68 @@
         "supports_reasoning_effort": false,
         "store": false
       }
+    },
+    "glm-5.3-plan": {
+      "prompt_guidance": "lean",
+      "model_id": "glm-5.3",
+      "provider": "z-ai-cn-coding",
+      "visible": true,
+      "speed": 2,
+      "intelligence": 4,
+      "context": 1000000,
+      "input_modalities": [
+        "text"
+      ],
+      "parameters": {
+        "max_tokens": 128000,
+        "thinking": {
+          "type": "enabled"
+        }
+      },
+      "reasoning": {
+        "efforts": [
+          "low",
+          "high",
+          "max"
+        ],
+        "default": "low",
+        "write": "parameters.output_config.effort",
+        "on": {
+          "parameters.thinking.type": "enabled"
+        }
+      }
+    },
+    "glm-5.3-flash-plan": {
+      "prompt_guidance": "lean",
+      "model_id": "glm-5.3-flash",
+      "provider": "z-ai-cn-coding",
+      "visible": true,
+      "speed": 3,
+      "intelligence": 3,
+      "context": 1000000,
+      "input_modalities": [
+        "text",
+        "image",
+        "pdf"
+      ],
+      "parameters": {
+        "max_tokens": 128000,
+        "thinking": {
+          "type": "enabled"
+        }
+      },
+      "reasoning": {
+        "efforts": [
+          "low",
+          "high",
+          "max"
+        ],
+        "default": "low",
+        "write": "parameters.output_config.effort",
+        "on": {
+          "parameters.thinking.type": "enabled"
+        }
+      }
     }
   },
   "providers": {
@@ -824,6 +886,42 @@
           },
           "context_window": 1000000,
           "max_output": 64000
+        }
+      ],
+      "z-ai-cn-coding": [
+        {
+          "id": "glm-5.3",
+          "alias": [
+            "glm-5.3-plan"
+          ],
+          "name": "GLM-5.3 (Coding Plan)",
+          "is_reasoning": true,
+          "description": "Z.AI GLM-5.3 via Coding Plan domestic Anthropic subscription endpoint",
+          "pricing": {
+            "input": 0.0,
+            "cached_input": 0.0,
+            "output": 0.0,
+            "unit": "per_1m_tokens"
+          },
+          "context_window": 1000000,
+          "max_output": 128000
+        },
+        {
+          "id": "glm-5.3-flash",
+          "alias": [
+            "glm-5.3-flash-plan"
+          ],
+          "name": "GLM-5.3-Flash (Coding Plan)",
+          "is_reasoning": true,
+          "description": "Z.AI GLM-5.3-Flash via Coding Plan domestic Anthropic subscription endpoint",
+          "pricing": {
+            "input": 0.0,
+            "cached_input": 0.0,
+            "output": 0.0,
+            "unit": "per_1m_tokens"
+          },
+          "context_window": 1000000,
+          "max_output": 128000
         }
       ]
     }
@@ -1235,6 +1333,18 @@
       "billing": "subscription",
       "tool_calling": true,
       "notional_ref": "claude-haiku-5-5"
+    },
+    "glm-5.3-plan": {
+      "family": "zai-glm",
+      "billing": "subscription",
+      "notional_ref": "glm-5.3-cn",
+      "tool_calling": true
+    },
+    "glm-5.3-flash-plan": {
+      "family": "zai-glm",
+      "billing": "subscription",
+      "notional_ref": "glm-5.3-flash-cn",
+      "tool_calling": true
     }
   }
 }
