@@ -97,7 +97,7 @@ def _notional_price_index() -> dict[str, dict[str, float]]:
 
     # P0N.6 §4: Also read load_dalton_meta() for subscription models (notional_pricing / notional_ref)
     try:
-        from src.llms.pricing_utils import find_model_pricing
+        from src.llms.pricing_utils import find_model_pricing, resolve_pricing_identity
 
         dalton_meta = load_dalton_meta() or {}
         native_overlay = load_overlay_data(NATIVE_OVERLAY_PATH) or {}
@@ -115,14 +115,19 @@ def _notional_price_index() -> dict[str, dict[str, float]]:
                 if ref_id in out:
                     rates = out[ref_id]
                 else:
-                    card = find_model_pricing(ref_id)
+                    ref_prov, ref_pricing_id = resolve_pricing_identity(ref_id)
+                    card = find_model_pricing(ref_pricing_id, provider=ref_prov)
+                    if card is None and ref_pricing_id != ref_id:
+                        card = find_model_pricing(ref_id)
                     if isinstance(card, dict):
                         rates = _extract_rates_from_card(card)
             if rates is not None:
                 out[str(key)] = rates
                 m_entry = native_models.get(key) if isinstance(native_models, dict) else None
                 if isinstance(m_entry, dict) and m_entry.get("model_id"):
-                    out.setdefault(str(m_entry["model_id"]), rates)
+                    mid = str(m_entry["model_id"])
+                    if (dalton_meta.get(mid) or {}).get("billing") != "cash":
+                        out.setdefault(mid, rates)
     except Exception as exc:
         logger.debug("[DaltonBudget] _notional_price_index dalton_meta lookup skipped: %s", exc)
 
@@ -158,6 +163,14 @@ def _notional_price_index() -> dict[str, dict[str, float]]:
     return out
 
 
+def _is_subscription_model(model_name: str, billing_type: str = "") -> bool:
+    """Return True when `model_name` or `billing_type` denotes a subscription/OAuth model."""
+    if billing_type == "oauth" or model_name.endswith("-oauth"):
+        return True
+    meta = (load_dalton_meta() or {}).get(model_name)
+    return isinstance(meta, dict) and str(meta.get("billing") or "") == "subscription"
+
+
 def compute_subscription_notional_usd(token_usage_rows: list[dict[str, Any]]) -> Decimal:
     """Estimate nominal USD consumed today by subscription (`pricing_type=='subscription'`) and OAuth models."""
     idx = _notional_price_index()
@@ -172,17 +185,19 @@ def compute_subscription_notional_usd(token_usage_rows: list[dict[str, Any]]) ->
         for model_name, stats in by_model.items():
             if not isinstance(stats, dict):
                 continue
+            m_name = str(model_name)
             rates_list = stats.get("rates") or []
-            is_oauth = any(
+            has_oauth_rate = any(
                 isinstance(r, dict) and r.get("billing_type") == "oauth"
                 for r in rates_list
             )
-            if is_oauth and stats.get("total_cost"):
+            is_sub = _is_subscription_model(m_name, "oauth" if has_oauth_rate else "")
+            if has_oauth_rate and stats.get("total_cost"):
                 total += Decimal(str(stats["total_cost"]))
                 continue
 
-            card = idx.get(str(model_name))
-            if card is not None and (is_oauth or float(stats.get("total_cost") or 0.0) == 0.0):
+            card = idx.get(m_name)
+            if card is not None and (is_sub or float(stats.get("total_cost") or 0.0) == 0.0):
                 in_tok = int(stats.get("input_tokens") or 0)
                 out_tok = int(stats.get("output_tokens") or 0)
                 cached_tok = int(stats.get("cached_tokens") or 0)
@@ -193,10 +208,14 @@ def compute_subscription_notional_usd(token_usage_rows: list[dict[str, Any]]) ->
                     + out_tok * card["output"]
                 ) / 1_000_000.0
                 total += Decimal(f"{usd:.6f}")
+            elif is_sub and stats.get("total_cost"):
+                total += Decimal(str(stats["total_cost"]))
     return total.quantize(Decimal("0.000001"))
 
 
 def _resolve_provider_for_model(model_name: str, billing_type: str = "platform") -> str:
+    if model_name.startswith("grok-") and model_name.endswith("-oauth"):
+        return "xai-oauth"
     try:
         from src.llms.pricing_utils import detect_provider_for_model
 
@@ -216,6 +235,10 @@ def _resolve_provider_for_model(model_name: str, billing_type: str = "platform")
             return "antigravity-oauth"
         if model_name.startswith("muse-"):
             return "muse-oauth"
+        if model_name.startswith("grok-"):
+            return "xai-oauth"
+    if model_name.startswith("glm-") and model_name.endswith("-plan"):
+        return "z-ai-cn-coding"
     if model_name.startswith("grok-"):
         return "xai"
     if model_name.startswith("deepseek-"):
@@ -251,11 +274,12 @@ def compute_provider_breakdown(
                     continue
                 m_name = str(c.get("model_name") or "unknown")
                 b_type = str(c.get("billing_type") or "platform")
-                prov = _resolve_provider_for_model(m_name, b_type)
+                is_sub = _is_subscription_model(m_name, b_type)
+                prov = _resolve_provider_for_model(m_name, "oauth" if is_sub else b_type)
                 b = _ensure(prov)
                 b["calls"] += 1
                 cost_dec = Decimal(str(c.get("cost") or "0"))
-                if b_type == "oauth":
+                if is_sub:
                     if cost_dec > Decimal("0"):
                         b["notional_usd"] += cost_dec
                     elif m_name in idx:
@@ -278,11 +302,17 @@ def compute_provider_breakdown(
             continue
         m_name = str(j.get("model_key") or "unknown")
         b_type = str(j.get("billing_type") or "platform")
-        prov = str(j.get("provider") or _resolve_provider_for_model(m_name, b_type))
+        is_sub = _is_subscription_model(m_name, b_type)
+        prov = str(j.get("provider") or _resolve_provider_for_model(m_name, "oauth" if is_sub else b_type))
         b = _ensure(prov)
         b["calls"] += 1
-        b["cash_usd"] += Decimal(str(j.get("cash_usd") or "0"))
-        b["notional_usd"] += Decimal(str(j.get("notional_usd") or "0"))
+        cash_val = Decimal(str(j.get("cash_usd") or "0"))
+        notional_val = Decimal(str(j.get("notional_usd") or "0"))
+        if is_sub:
+            b["notional_usd"] += notional_val if notional_val > Decimal("0") else cash_val
+        else:
+            b["cash_usd"] += cash_val
+            b["notional_usd"] += notional_val
 
     return {
         prov: {

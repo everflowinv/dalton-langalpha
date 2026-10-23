@@ -581,6 +581,152 @@
         ],
         "store": false
       }
+    },
+    "grok-4.7-oauth": {
+      "model_id": "grok-4.7",
+      "provider": "xai-oauth",
+      "display_name": "Grok 4.7 (OAuth)",
+      "visible": true,
+      "speed": 3,
+      "intelligence": 5,
+      "context": 256000,
+      "supports_reasoning_effort": true,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "parameters": {
+        "max_tokens": 64000,
+        "reasoning": {
+          "summary": "auto"
+        },
+        "include": [
+          "reasoning.encrypted_content"
+        ],
+        "store": false
+      },
+      "reasoning": {
+        "efforts": [
+          "low",
+          "medium",
+          "high"
+        ],
+        "default": "high",
+        "write": "parameters.reasoning.effort"
+      }
+    },
+    "grok-4.3-oauth": {
+      "model_id": "grok-4.3",
+      "provider": "xai-oauth",
+      "display_name": "Grok 4.3 (OAuth)",
+      "visible": true,
+      "speed": 3,
+      "intelligence": 4,
+      "context": 1000000,
+      "supports_reasoning_effort": true,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "parameters": {
+        "max_tokens": 64000,
+        "reasoning": {
+          "summary": "auto"
+        },
+        "include": [
+          "reasoning.encrypted_content"
+        ],
+        "store": false
+      },
+      "reasoning": {
+        "efforts": [
+          "low",
+          "medium",
+          "high"
+        ],
+        "default": "high",
+        "write": "parameters.reasoning.effort"
+      }
+    },
+    "grok-4.7-build-fast-oauth": {
+      "model_id": "grok-4.7-build-fast",
+      "provider": "xai-oauth",
+      "display_name": "Grok 4.7 Build Fast (OAuth)",
+      "visible": true,
+      "speed": 5,
+      "intelligence": 4,
+      "context": 256000,
+      "supports_reasoning_effort": false,
+      "input_modalities": [
+        "text"
+      ],
+      "parameters": {
+        "max_tokens": 64000,
+        "supports_reasoning_effort": false,
+        "store": false
+      }
+    },
+    "glm-5.3-plan": {
+      "prompt_guidance": "lean",
+      "model_id": "glm-5.3",
+      "provider": "z-ai-cn-coding",
+      "visible": true,
+      "speed": 2,
+      "intelligence": 4,
+      "context": 1000000,
+      "input_modalities": [
+        "text"
+      ],
+      "parameters": {
+        "max_tokens": 128000,
+        "thinking": {
+          "type": "enabled"
+        }
+      },
+      "reasoning": {
+        "efforts": [
+          "low",
+          "high",
+          "max"
+        ],
+        "default": "low",
+        "write": "parameters.output_config.effort",
+        "on": {
+          "parameters.thinking.type": "enabled"
+        }
+      }
+    },
+    "glm-5.3-flash-plan": {
+      "prompt_guidance": "lean",
+      "model_id": "glm-5.3-flash",
+      "provider": "z-ai-cn-coding",
+      "visible": true,
+      "speed": 3,
+      "intelligence": 3,
+      "context": 1000000,
+      "input_modalities": [
+        "text",
+        "image",
+        "pdf"
+      ],
+      "parameters": {
+        "max_tokens": 128000,
+        "thinking": {
+          "type": "enabled"
+        }
+      },
+      "reasoning": {
+        "efforts": [
+          "low",
+          "high",
+          "max"
+        ],
+        "default": "low",
+        "write": "parameters.output_config.effort",
+        "on": {
+          "parameters.thinking.type": "enabled"
+        }
+      }
     }
   },
   "providers": {
@@ -622,6 +768,15 @@
         "prompt_cache_key": true,
         "display_name": "xAI Grok",
         "operator_channel": "developer"
+      },
+      "xai-oauth": {
+        "sdk": "grok",
+        "base_url": "https://cli-chat-proxy.grok.com/v1",
+        "env_key": null,
+        "access_type": "oauth",
+        "use_response_api": true,
+        "prompt_cache_key": true,
+        "display_name": "xAI Grok (SuperGrok OAuth)"
       }
     },
     "provider_variants": {},
@@ -731,6 +886,42 @@
           },
           "context_window": 1000000,
           "max_output": 64000
+        }
+      ],
+      "z-ai-cn-coding": [
+        {
+          "id": "glm-5.3",
+          "alias": [
+            "glm-5.3-plan"
+          ],
+          "name": "GLM-5.3 (Coding Plan)",
+          "is_reasoning": true,
+          "description": "Z.AI GLM-5.3 via Coding Plan domestic Anthropic subscription endpoint",
+          "pricing": {
+            "input": 0.0,
+            "cached_input": 0.0,
+            "output": 0.0,
+            "unit": "per_1m_tokens"
+          },
+          "context_window": 1000000,
+          "max_output": 128000
+        },
+        {
+          "id": "glm-5.3-flash",
+          "alias": [
+            "glm-5.3-flash-plan"
+          ],
+          "name": "GLM-5.3-Flash (Coding Plan)",
+          "is_reasoning": true,
+          "description": "Z.AI GLM-5.3-Flash via Coding Plan domestic Anthropic subscription endpoint",
+          "pricing": {
+            "input": 0.0,
+            "cached_input": 0.0,
+            "output": 0.0,
+            "unit": "per_1m_tokens"
+          },
+          "context_window": 1000000,
+          "max_output": 128000
         }
       ]
     }
@@ -901,6 +1092,28 @@
     "grok-4.3": {
       "family": "xai-grok",
       "billing": "cash",
+      "tool_calling": true
+    },
+    "grok-4.7-oauth": {
+      "family": "xai-grok",
+      "billing": "subscription",
+      "notional_ref": "grok-4.7",
+      "supports_reasoning_effort": true,
+      "tool_calling": true
+    },
+    "grok-4.3-oauth": {
+      "family": "xai-grok",
+      "billing": "subscription",
+      "notional_ref": "grok-4.3",
+      "supports_reasoning_effort": true,
+      "tool_calling": true
+    },
+    "grok-4.7-build-fast-oauth": {
+      "family": "xai-grok",
+      "billing": "subscription",
+      "notional_ref": "grok-4.7",
+      "comment": "Approximate notional pricing from same-family grok-4.7 (no exact cash catalog entry for grok-4.7-build-fast).",
+      "supports_reasoning_effort": false,
       "tool_calling": true
     },
     "gpt-5.6-terra": {
@@ -1120,6 +1333,18 @@
       "billing": "subscription",
       "tool_calling": true,
       "notional_ref": "claude-haiku-5-5"
+    },
+    "glm-5.3-plan": {
+      "family": "zai-glm",
+      "billing": "subscription",
+      "notional_ref": "glm-5.3-cn",
+      "tool_calling": true
+    },
+    "glm-5.3-flash-plan": {
+      "family": "zai-glm",
+      "billing": "subscription",
+      "notional_ref": "glm-5.3-flash-cn",
+      "tool_calling": true
     }
   }
 }

@@ -73,8 +73,32 @@ _DATA_DATE_KEYS: tuple[str, ...] = (
 )
 
 BRIDGE_COMMUNITY_ROUTES: frozenset[str] = frozenset(
-    {"xueqiu", "employee", "last30days"}
+    {"xueqiu", "employee", "last30days", "x-timeline"}
 )
+
+# Local libraries whose upstream `list` operation is `ORDER BY date DESC`; their probes read
+# the newest rows directly instead of a relevance-ranked search.
+LOCAL_LIBRARY_SUBROUTES: tuple[str, ...] = (
+    "company-wiki",
+    "sales-notes",
+    "tmtb",
+    "funda-ai",
+)
+
+# Routes whose catalog parameters accept a `start`/`end` date window and only rank by
+# relevance upstream; probes search the last `PROBE_WINDOW_DAYS_DEFAULT` days first so
+# `latest_date` reflects the newest item, not the most relevant one (guidepoint
+# `query=NVDA, limit=1` used to surface 2023-08-24).
+WINDOWED_PROBE_ROUTE_IDS: frozenset[str] = frozenset(
+    {
+        "alphaengine",
+        "guidepoint",
+        "transcript",
+        "sales-notes",
+    }
+)
+PROBE_WINDOW_DAYS_DEFAULT = 30
+PROBE_WINDOW_DAYS_EXPANDED = 365
 
 _SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"(?i)\b(bearer)\s+[A-Za-z0-9._~+/=-]{6,}"),
@@ -296,18 +320,31 @@ def _probe_today() -> date:
     return datetime.now(ZoneInfo("America/New_York")).date()
 
 
-def build_route_probe_spec(route_id: str, category: str) -> tuple[str, dict[str, Any]]:
-    """Return `(tool_name, arguments)` for a minimal real probe of a `researchdata` route."""
+def build_route_probe_spec(
+    route_id: str, category: str, *, window_days: int = PROBE_WINDOW_DAYS_DEFAULT
+) -> tuple[str, dict[str, Any]]:
+    """Return `(tool_name, arguments)` for a minimal real probe of a `researchdata` route.
+
+    `window_days` sets the `start`/`end` window for routes in `WINDOWED_PROBE_ROUTE_IDS`
+    (ignored elsewhere); the caller widens it to `PROBE_WINDOW_DAYS_EXPANDED` when the
+    default window returns nothing. The `all` route has no date-sorted upstream operation,
+    so `_execute_probes` aggregates its four local sublibraries instead of using this spec.
+    """
     # Upstream routes reject an end date past *their* today (US); the Shanghai cache date runs a
     # day ahead every evening ET, which failed alphaengine/cn-hk probes.
     today = _probe_today()
-    start_30d = (today - timedelta(days=30)).isoformat()
+    days = max(1, int(window_days))
+    start_window = (today - timedelta(days=days)).isoformat()
     end_today = today.isoformat()
 
     rid = route_id.strip()
     cat = (category or "research").strip()
-    if rid == "all":
-        return "research", {"route": "all", "operation": "search", "query": "NVDA", "limit": 1}
+    if rid in WINDOWED_PROBE_ROUTE_IDS:
+        window = {"start": start_window, "end": end_today}
+        limit = 3
+    else:
+        window = {}
+        limit = 1
     if rid == "alphaengine":
         return (
             "research",
@@ -315,31 +352,33 @@ def build_route_probe_spec(route_id: str, category: str) -> tuple[str, dict[str,
                 "route": "alphaengine",
                 "operation": "search_library",
                 "query": "NVDA",
-                "start": start_30d,
-                "end": end_today,
-                "limit": 1,
+                "limit": limit,
+                **window,
             },
         )
     if rid == "guidepoint":
         return (
             "research",
-            {"route": "guidepoint", "operation": "search_library", "query": "NVDA", "limit": 1},
-        )
-    if rid == "transcript":
-        return "research", {"route": "transcript", "ticker": "NVDA", "limit": 1}
-    if rid == "company-wiki":
-        return (
-            "research",
             {
-                "route": "company-wiki",
-                "operation": "search",
+                "route": "guidepoint",
+                "operation": "search_library",
                 "query": "NVDA",
-                "params": {"company": "NVDA"},
-                "limit": 1,
+                "limit": limit,
+                **window,
             },
         )
-    if rid in ("sales-notes", "tmtb", "funda-ai"):
-        return "research", {"route": rid, "operation": "search", "query": "NVDA", "limit": 1}
+    if rid == "transcript":
+        # Calls come once a quarter, so a 30-day window is often empty and the gateway's
+        # empty-match fallback (roic) answers 403; start with a full quarter.
+        q_window = {"start": (today - timedelta(days=max(days, 120))).isoformat(), "end": today.isoformat()}
+        return "research", {"route": "transcript", "ticker": "NVDA", "limit": limit, **q_window}
+    if rid == "sales-notes":
+        # Its `list` does not return within the probe budget; a windowed search does.
+        return "research", {"route": rid, "operation": "search", "query": "NVDA", "limit": 3, **window}
+    if rid in LOCAL_LIBRARY_SUBROUTES:
+        # Upstream `list` is `ORDER BY date DESC`, so the first rows are the newest —
+        # no relevance ranking to work around and no date window needed.
+        return "research", {"route": rid, "operation": "list", "limit": 3}
     if rid == "sec":
         return "finance", {"route": "sec", "operation": "list-filings", "ticker": "NVDA", "limit": 1}
     if rid == "estimates":
@@ -351,13 +390,13 @@ def build_route_probe_spec(route_id: str, category: str) -> tuple[str, dict[str,
                 "route": "cn-hk",
                 "operation": "filings",
                 "ticker": "300750",
-                "start": start_30d,
+                "start": start_window,
                 "end": end_today,
                 "limit": 1,
             },
         )
     if rid == "fred":
-        return "macro", {"route": "fred", "series": "DGS10", "start": start_30d, "end": end_today, "limit": 1}
+        return "macro", {"route": "fred", "series": "DGS10", "start": start_window, "end": end_today, "limit": 1}
     if rid == "treasury":
         return (
             "macro",
@@ -365,7 +404,7 @@ def build_route_probe_spec(route_id: str, category: str) -> tuple[str, dict[str,
                 "route": "treasury",
                 "operation": "treasury",
                 "dataset": "tga",
-                "start": start_30d,
+                "start": start_window,
                 "end": end_today,
                 "limit": 1,
             },
@@ -386,6 +425,12 @@ def build_route_probe_spec(route_id: str, category: str) -> tuple[str, dict[str,
         return (
             "community",
             {"route": "last30days", "query": "NVDA", "days": 7, "quick": True},
+        )
+    if rid == "x-timeline":
+        # Public mega-account; 3 items are enough for `latest_date` = newest returned post.
+        return (
+            "community",
+            {"route": "x-timeline", "operation": "tweets", "handle": "nvidia", "count": 3},
         )
 
     tool_name = cat if cat in ("research", "finance", "macro", "news", "community") else "research"
@@ -502,7 +547,7 @@ async def _run_single_probe(
                 if latest_raw is None:
                     latest_raw = extract_latest_date(outcome)
                 latest_date = str(latest_raw).strip()[:32] if latest_raw else None
-                for k in ("total_cards", "min_date", "count"):
+                for k in ("total_cards", "min_date", "count", "window_days"):
                     if k in outcome and outcome[k] is not None:
                         detail[k] = outcome[k]
             return {
@@ -614,6 +659,7 @@ async def _execute_probes(
 
     # 2. Schedule all probes with bounded concurrency and per-item timeout <= 60s
     tasks: list[asyncio.Task[dict[str, Any]]] = []
+    all_route_requested = False
 
     for rid, cat in routes_to_probe:
         if rid == "last30days":
@@ -633,61 +679,117 @@ async def _execute_probes(
             tasks.append(asyncio.create_task(_unprobed_last30days()))
             continue
 
+        if rid == "all":
+            # `all` aggregates relevance-ranked searches with no date-sorted operation;
+            # its row is derived after the gather from the four local sublibrary probes.
+            all_route_requested = True
+            continue
+
         tool_name, tool_args = build_route_probe_spec(rid, cat)
 
         async def _probe_route(
             r_id: str = rid,
+            r_cat: str = cat,
             t_name: str = tool_name,
             t_args: dict[str, Any] = tool_args,
+            r_windowed: bool = rid in WINDOWED_PROBE_ROUTE_IDS,
         ) -> dict[str, Any]:
-            res = await call_bridge(t_name, t_args, timeout_s=clamped_timeout)
+            async def _attempt(window_days: int) -> dict[str, Any]:
+                call_args = (
+                    t_args
+                    if window_days == PROBE_WINDOW_DAYS_DEFAULT
+                    else build_route_probe_spec(r_id, r_cat, window_days=window_days)[1]
+                )
+                res = await call_bridge(t_name, call_args, timeout_s=clamped_timeout)
+                if isinstance(res, Mapping):
+                    _validate_bridge_payload(res)
+                    if r_id == "xueqiu":
+                        raw_data = res.get("data")
+                        has_posts = (
+                            (isinstance(raw_data, list) and len(raw_data) > 0)
+                            or (
+                                isinstance(raw_data, Mapping)
+                                and bool(
+                                    raw_data.get("posts")
+                                    or raw_data.get("results")
+                                    or raw_data.get("items")
+                                )
+                            )
+                            or bool(
+                                res.get("posts")
+                                or res.get("results")
+                                or res.get("_sources")
+                            )
+                        )
+                        if not has_posts:
+                            raise RuntimeError("空结果")
+                    elif r_id == "employee":
+                        raw_data = res.get("data")
+                        has_reviews = (
+                            (isinstance(raw_data, list) and len(raw_data) > 0)
+                            or (
+                                isinstance(raw_data, Mapping)
+                                and bool(
+                                    raw_data.get("reviews")
+                                    or raw_data.get("results")
+                                    or raw_data.get("count")
+                                )
+                            )
+                            or bool(
+                                res.get("reviews")
+                                or res.get("results")
+                                or res.get("_sources")
+                            )
+                        )
+                        if not has_reviews:
+                            raise RuntimeError("空结果")
+                    elif r_id == "x-timeline":
+                        raw_data = res.get("data")
+                        items = (
+                            raw_data.get("items")
+                            if isinstance(raw_data, Mapping)
+                            else None
+                        )
+                        if not isinstance(items, list) or not items:
+                            raise RuntimeError("空结果")
+                return res
+
+            adopted_expanded = False
+            try:
+                res = await _attempt(PROBE_WINDOW_DAYS_DEFAULT)
+            except (asyncio.TimeoutError, httpx.TimeoutException):
+                # A timeout means the route is slow, not that the window is empty.
+                raise
+            else:
+                if r_windowed and extract_latest_date(res) is None:
+                    widened = await _attempt(PROBE_WINDOW_DAYS_EXPANDED)
+                    if extract_latest_date(widened) is not None:
+                        res = widened
+                        adopted_expanded = True
+
             if isinstance(res, Mapping):
-                _validate_bridge_payload(res)
                 if r_id == "market-regime" and isinstance(res.get("date"), str):
                     m = _DATE_PREFIX_RE.search(res["date"])
                     if m:
                         return {"latest_date": m.group(1)}
-                elif r_id == "xueqiu":
+                if r_id == "x-timeline":
                     raw_data = res.get("data")
-                    has_posts = (
-                        (isinstance(raw_data, list) and len(raw_data) > 0)
-                        or (
-                            isinstance(raw_data, Mapping)
-                            and bool(
-                                raw_data.get("posts")
-                                or raw_data.get("results")
-                                or raw_data.get("items")
-                            )
-                        )
-                        or bool(
-                            res.get("posts")
-                            or res.get("results")
-                            or res.get("_sources")
-                        )
+                    items = (
+                        raw_data.get("items") if isinstance(raw_data, Mapping) else None
                     )
-                    if not has_posts:
-                        raise RuntimeError("空结果")
-                elif r_id == "employee":
-                    raw_data = res.get("data")
-                    has_reviews = (
-                        (isinstance(raw_data, list) and len(raw_data) > 0)
-                        or (
-                            isinstance(raw_data, Mapping)
-                            and bool(
-                                raw_data.get("reviews")
-                                or raw_data.get("results")
-                                or raw_data.get("count")
-                            )
-                        )
-                        or bool(
-                            res.get("reviews")
-                            or res.get("results")
-                            or res.get("_sources")
-                        )
+                    dates = [
+                        str(it.get("created_at") or "")[:10]
+                        for it in (items or [])
+                        if isinstance(it, Mapping) and len(str(it.get("created_at") or "")) >= 10
+                    ]
+                    latest = max(
+                        (d for d in dates if _DATE_PREFIX_RE.fullmatch(d)), default=None
                     )
-                    if not has_reviews:
-                        raise RuntimeError("空结果")
-            return {"latest_date": extract_latest_date(res)}
+                    return {"latest_date": latest}
+            outcome: dict[str, Any] = {"latest_date": extract_latest_date(res)}
+            if r_windowed and adopted_expanded:
+                outcome["window_days"] = PROBE_WINDOW_DAYS_EXPANDED
+            return outcome
 
         tasks.append(
             asyncio.create_task(
@@ -753,7 +855,69 @@ async def _execute_probes(
     )
 
     probe_results: list[dict[str, Any]] = list(await asyncio.gather(*tasks))
+    if all_route_requested:
+        probe_results.append(_aggregate_all_route_row(probe_results))
     return probe_results, catalog_routes, handoff_routes
+
+
+def _aggregate_all_route_row(probe_results: list[dict[str, Any]]) -> dict[str, Any]:
+    """Derive the `all` row from the four local sublibrary probes (max `latest_date`).
+
+    `all` aggregates relevance-ranked searches upstream and has no date-sorted operation,
+    so its freshness is the newest date across the sublibraries it fans out to.
+    """
+    rows_by_id = {
+        str(r.get("source_id")): r
+        for r in probe_results
+        if isinstance(r, Mapping) and r.get("source_id")
+    }
+    # `all` fans out to the local libraries plus AlphaEngine and Guidepoint.
+    sources = (*LOCAL_LIBRARY_SUBROUTES, "alphaengine", "guidepoint")
+    sub_rows = [rows_by_id[sub] for sub in sources if isinstance(rows_by_id.get(sub), Mapping)]
+    missing = [sub for sub in sources if not isinstance(rows_by_id.get(sub), Mapping)]
+    if not sub_rows:
+        return {
+            "source_id": "all",
+            "category": "research",
+            "status": "unprobed",
+            "latency_ms": 0,
+            "latest_date": None,
+            "error_type": "子库探测缺失",
+            "detail": {"reason": "all 路线的来源探测结果缺失，无法聚合"},
+        }
+    latest_dates = [
+        str(r.get("latest_date"))
+        for r in sub_rows
+        if isinstance(r.get("latest_date"), str) and r["latest_date"]
+    ]
+    latency_ms = max(int(r.get("latency_ms") or 0) for r in sub_rows)
+    if any(r.get("status") == "available" for r in sub_rows):
+        return {
+            "source_id": "all",
+            "category": "research",
+            "status": "available",
+            "latency_ms": latency_ms,
+            "latest_date": max(latest_dates) if latest_dates else None,
+            "error_type": None,
+            "detail": {
+                "subroute_latest": {
+                    str(r.get("source_id")): r.get("latest_date") for r in sub_rows
+                },
+                **({"missing_sources": missing} if missing else {}),
+            },
+        }
+    first_failed = next(
+        (r for r in sub_rows if r.get("status") == "unavailable"), sub_rows[0]
+    )
+    return {
+        "source_id": "all",
+        "category": "research",
+        "status": "unavailable",
+        "latency_ms": latency_ms,
+        "latest_date": None,
+        "error_type": first_failed.get("error_type"),
+        "detail": {"reason": str((first_failed.get("detail") or {}).get("reason") or "本地四库均不可用")},
+    }
 
 
 async def run_all_health_checks(

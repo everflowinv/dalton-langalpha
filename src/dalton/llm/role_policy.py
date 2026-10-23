@@ -19,6 +19,7 @@ _OAUTH_PROVIDER_TOKEN_KEYS: dict[str, str] = {
     "codex-oauth": "codex-oauth",
     "antigravity-oauth": "antigravity-oauth",
     "muse-oauth": "muse-oauth",
+    "xai-oauth": "xai-oauth",
 }
 
 
@@ -260,9 +261,12 @@ async def explain_model_availability(
             else:
                 env_key = str(prov_info.get("env_key") or "")
                 has_env = bool(env_key and os.environ.get(env_key, "").strip())
-                has_byok = provider in byok_providers or (
-                    parent_provider and parent_provider in byok_providers
-                )
+                if access_type == "coding_plan" or provider == "z-ai-cn-coding":
+                    has_byok = provider in byok_providers
+                else:
+                    has_byok = provider in byok_providers or (
+                        parent_provider and parent_provider in byok_providers
+                    )
                 if env_key and not (has_env or has_byok):
                     reasons.append("api_key_missing")
 
@@ -467,10 +471,23 @@ def check_roles(
             }
         )
 
-    # Validate auxiliary LLM slots: assist, assist_fallback, background, compaction, fetch (P0H §4 P3, P0J.J2)
-    # Note: assist (and compaction/background) are non-tool structured/background slots,
-    # so they do not require tool-calling, but they MUST NOT use forbidden contributor models.
+    # Validate auxiliary LLM slots: assist, assist_fallback, background, compaction, fetch,
+    # conversations.extractor_model (P0H §4 P3, P0J.J2).
+    # Note: assist (and compaction/background/conversations.extractor_model) are non-tool
+    # structured/background slots, so they do not require tool-calling, but they MUST NOT
+    # use forbidden contributor models.
+    from src.dalton.settings import get_dalton_settings
+
     assist_fb_models = _resolve_assist_fallback_models_for_policy()
+    conv_cfg = cfg.get("conversations") if isinstance(cfg.get("conversations"), dict) else {}
+    extractor_model = str(
+        conv_cfg.get("extractor_model")
+        or cfg.get("conversations.extractor_model")
+        or llm_cfg.get("conversations.extractor_model")
+        or llm_cfg.get("extractor_model")
+        or (get_dalton_settings().conversations.extractor_model if config is None else "")
+        or ""
+    ).strip()
 
     aux_slots: list[tuple[str, str]] = [
         ("assist", str(llm_cfg.get("assist") or "").strip()),
@@ -481,6 +498,7 @@ def check_roles(
             str(llm_cfg.get("compaction") or llm_cfg.get("summarization") or "").strip(),
         ),
         ("fetch", str(llm_cfg.get("fetch") or "").strip()),
+        ("conversations.extractor_model", extractor_model),
     ]
     for role_name, role_model in aux_slots:
         if not role_model:

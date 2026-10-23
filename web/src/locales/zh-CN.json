@@ -456,7 +456,8 @@
     "autoApproveHandoffs": "交给分析师前不再询问",
     "autoApproveHandoffsDesc": "任务直接交给工作区的分析师，不再弹出审批卡片。每次交接仍会显示为卡片，方便你查看进度或停止运行。",
     "autoApproveWorkspaceCreation": "创建工作区前不再询问",
-    "autoApproveWorkspaceCreationDesc": "为新任务创建工作区时不再弹出审批卡片。"
+    "autoApproveWorkspaceCreationDesc": "为新任务创建工作区时不再弹出审批卡片。",
+    "xaiConnectTitle": "连接 xAI Grok（SuperGrok）"
   },
   "dashboard": {
     "title": "{{brand}}",
@@ -3247,7 +3248,17 @@
     "errorSavePrefs": "保存模型偏好失败。",
     "providerLabel": "提供商",
     "notSet": "未设置",
-    "notConfigured": "未配置"
+    "notConfigured": "未配置",
+    "errorXaiOAuth": "无法启动 xAI Grok 登录，请重试。",
+    "oauthXaiDesc": "用你的 SuperGrok 订阅使用 Grok 模型",
+    "enterCodeOnXai": "在 auth.x.ai 上确认这个代码",
+    "xaiStep1Title": "打开 xAI 验证页面",
+    "xaiStep1Desc": "点击下方按钮，生成一次性代码并打开 auth.x.ai。",
+    "xaiStep2Title": "确认代码",
+    "xaiStep2Desc": "用你的 xAI 账号登录，并批准这里显示的代码。",
+    "xaiStep3Title": "完成",
+    "xaiStep3Desc": "批准后，本页面会自动识别。",
+    "usageCountsXai": "请求计入你的 SuperGrok 订阅额度，与在 Grok CLI 中使用时完全相同。"
   },
   "marketView": {
     "companyOverview": "公司概览",

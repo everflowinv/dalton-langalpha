@@ -1257,3 +1257,193 @@ async def test_p0i_i3_startup_fail_fast_and_journal_pruning_and_oauth_events(
         )
 
 
+@pytest.mark.asyncio
+async def test_glm_coding_subscription_budget_and_provider_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify glm-5.3-plan and glm-5.3-flash-plan are classified as subscription in budget
+    (zero cash cap usage, nominal cost tracked) and provider_status renders z-ai-cn-coding
+    both with and without env credentials without ever exposing the credential value or prefix."""
+    import json
+    from unittest.mock import create_autospec
+    import src.dalton.services.provider_status as ps_mod
+    import src.server.database.api_keys as api_keys_mod
+    from src.dalton.budget.service import (
+        _notional_price_index,
+        _resolve_provider_for_model,
+        compute_provider_breakdown,
+        compute_subscription_notional_usd,
+    )
+    from src.dalton.llm.complete import (
+        compute_call_costs,
+        resolve_model_billing_and_provider,
+    )
+    from src.llms.llm import LLM
+    from src.llms.pricing_utils import find_model_pricing, resolve_pricing_identity
+    from src.utils.tracking.core import calculate_cost_from_per_call_records
+
+    LLM._model_config = None
+
+    for m_key in ("glm-5.3-plan", "glm-5.3-flash-plan"):
+        b_type, prov = resolve_model_billing_and_provider(m_key)
+        assert b_type == "oauth"
+        assert prov == "z-ai-cn-coding"
+        assert _resolve_provider_for_model(m_key, "platform") == "z-ai-cn-coding"
+        assert _resolve_provider_for_model(m_key, "oauth") == "z-ai-cn-coding"
+
+        # 0-price card in overlay: find_model_pricing returns 0 on all lookup paths
+        direct_card = find_model_pricing(m_key)
+        assert direct_card is not None
+        assert direct_card["input"] == 0.0
+        assert direct_card["output"] == 0.0
+        assert direct_card["cached_input"] == 0.0
+
+        resolved_prov, resolved_id = resolve_pricing_identity(m_key, billing_type="platform")
+        assert resolved_prov == "z-ai-cn-coding"
+        prov_card = find_model_pricing(resolved_id, provider=resolved_prov)
+        assert prov_card is not None
+        assert prov_card["input"] == 0.0
+        assert prov_card["output"] == 0.0
+        assert prov_card["cached_input"] == 0.0
+
+    # Nominal index resolves notional_ref -> domestic glm-5.3-cn / glm-5.3-flash-cn prices
+    notional_idx = _notional_price_index()
+    assert notional_idx["glm-5.3-plan"] == {
+        "input": 1.14,
+        "output": 4.0,
+        "cached_input": 0.29,
+    }
+    assert notional_idx["glm-5.3-flash-plan"] == {
+        "input": 0.114,
+        "output": 0.4,
+        "cached_input": 0.033,
+    }
+
+    # glm-5.3-plan: subscription billing -> zero cash cost, positive nominal cost (domestic -cn rate)
+    for bt in ("oauth", "platform"):
+        cash_53, notional_53 = compute_call_costs(
+            "glm-5.3-plan",
+            bt,
+            {"input_tokens": 1000, "output_tokens": 500, "cached_tokens": 0},
+        )
+        assert cash_53 == Decimal("0")
+        assert notional_53 == Decimal("0.003140")
+
+        cash_flash, notional_flash = compute_call_costs(
+            "glm-5.3-flash-plan",
+            bt,
+            {"input_tokens": 1000, "output_tokens": 500, "cached_tokens": 0},
+        )
+        assert cash_flash == Decimal("0")
+        assert notional_flash == Decimal("0.000314")
+
+    # Platform billing chain (TokenUsageTracker -> calculate_cost_from_per_call_records, NOT dalton_complete):
+    # cash cost is 0.0 and budget settlement records cash_usd == 0, notional_usd > 0 (domestic -cn rates).
+    platform_tracker_usage = calculate_cost_from_per_call_records(
+        [
+            {
+                "model_name": "glm-5.3-plan",
+                "billing_type": "platform",
+                "usage": {
+                    "input_tokens": 100_000,
+                    "output_tokens": 50_000,
+                    "cached_tokens": 0,
+                },
+            },
+            {
+                "model_name": "glm-5.3-flash-plan",
+                "billing_type": "platform",
+                "usage": {
+                    "input_tokens": 50_000,
+                    "output_tokens": 20_000,
+                    "cached_tokens": 0,
+                },
+            },
+        ]
+    )
+    assert platform_tracker_usage["total_cost"] == 0.0
+    assert platform_tracker_usage["platform_cost"] == 0.0
+    assert all(c["cost"] == 0.0 for c in platform_tracker_usage["per_call_costs"])
+
+    tu_rows = [{"token_usage": platform_tracker_usage}]
+    # 100k*1.14/1M + 50k*4.0/1M = 0.314000; 50k*0.114/1M + 20k*0.4/1M = 0.013700 -> total 0.327700
+    sub_notional = compute_subscription_notional_usd(tu_rows)
+    assert sub_notional == Decimal("0.327700")
+    assert sub_notional > Decimal("0")
+
+    breakdown = compute_provider_breakdown(tu_rows, journal_rows=[])
+    assert "z-ai-cn-coding" in breakdown
+    assert breakdown["z-ai-cn-coding"]["cash_usd"] == 0.0
+    assert breakdown["z-ai-cn-coding"]["notional_usd"] == 0.3277
+    assert breakdown["z-ai-cn-coding"]["calls"] == 2
+
+    # Provider status row: with and without ZAI_CN_CODING_API_KEY
+    monkeypatch.setattr(
+        api_keys_mod,
+        "get_user_api_keys",
+        create_autospec(
+            api_keys_mod.get_user_api_keys,
+            return_value={"byok_enabled": False, "keys": {}, "base_urls": {}},
+        ),
+    )
+    monkeypatch.setattr(
+        ps_mod,
+        "_fetch_usage_stats_24h",
+        create_autospec(ps_mod._fetch_usage_stats_24h, return_value={}),
+    )
+    monkeypatch.setattr(
+        ps_mod,
+        "list_recent_provider_events",
+        create_autospec(ps_mod.list_recent_provider_events, return_value=[]),
+    )
+    monkeypatch.setattr(
+        ps_mod,
+        "count_provider_errors_24h",
+        create_autospec(ps_mod.count_provider_errors_24h, return_value=0),
+    )
+    monkeypatch.setattr(
+        ps_mod,
+        "explain_model_availability",
+        create_autospec(ps_mod.explain_model_availability, return_value={}),
+    )
+    monkeypatch.setattr(
+        ps_mod,
+        "is_broker_models_enabled",
+        create_autospec(ps_mod.is_broker_models_enabled, return_value=False),
+    )
+
+    # Case 1: unconfigured (no ZAI_CN_CODING_API_KEY)
+    monkeypatch.delenv("ZAI_CN_CODING_API_KEY", raising=False)
+    st_missing = await ps_mod.get_providers_status(user_id="u-glm")
+    row_missing = next(
+        p for p in st_missing["providers"] if p["provider"] == "z-ai-cn-coding"
+    )
+    assert row_missing["display_name"] == "智谱 GLM（Coding Plan）"
+    assert row_missing["billing"] == "subscription"
+    assert row_missing["configured"] is False
+    assert row_missing["credential"]["env_key"] == "ZAI_CN_CODING_API_KEY"
+    assert (
+        row_missing["credential"]["hint"]
+        == "在 .env 配置 ZAI_CN_CODING_API_KEY 后重建后端"
+    )
+
+    # Case 2: configured via .env
+    sentinel = "zhipu-test-marker-98765"
+    monkeypatch.setenv("ZAI_CN_CODING_API_KEY", sentinel)
+    st_configured = await ps_mod.get_providers_status(user_id="u-glm")
+    row_configured = next(
+        p for p in st_configured["providers"] if p["provider"] == "z-ai-cn-coding"
+    )
+    assert row_configured["display_name"] == "智谱 GLM（Coding Plan）"
+    assert row_configured["billing"] == "subscription"
+    assert row_configured["configured"] is True
+    assert row_configured["credential"]["has_env"] is True
+    assert "已配置" in row_configured["credential"]["status_text"]
+    assert "订阅制" in row_configured["credential"]["status_text"]
+    assert "订阅制" in row_configured["credential"]["hint"]
+    serialized = json.dumps(row_configured, ensure_ascii=False)
+    assert sentinel not in serialized
+    assert sentinel[:6] not in serialized
+
+
+

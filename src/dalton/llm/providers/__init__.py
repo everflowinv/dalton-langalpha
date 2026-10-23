@@ -9,7 +9,9 @@ from src.dalton.settings import get_disabled_providers
 SdkBuilder = Callable[[Any, str | None], Any]
 TokenGetter = Callable[[str], Awaitable[dict | None]]
 
-DALTON_OAUTH_PROVIDERS: frozenset[str] = frozenset({"antigravity-oauth", "muse-oauth"})
+DALTON_OAUTH_PROVIDERS: frozenset[str] = frozenset(
+    {"antigravity-oauth", "muse-oauth", "xai-oauth"}
+)
 
 
 class ProviderDisabledError(RuntimeError):
@@ -27,20 +29,24 @@ class ProviderDisabledError(RuntimeError):
 def _sdk_builders() -> dict[str, SdkBuilder]:
     from .antigravity import build_antigravity_client
     from .muse.client import build_muse_client
+    from .xai_grok.client import build_grok_client
 
     return {
         "antigravity": lambda llm, ck: build_antigravity_client(llm),
         "muse": build_muse_client,
+        "grok": build_grok_client,
     }
 
 
 def _oauth_getters() -> dict[str, TokenGetter]:
     from .antigravity.oauth import get_valid_token as ag_get_valid_token
     from .muse.oauth import get_valid_token as muse_get_valid_token
+    from .xai_grok.oauth import get_valid_token as xai_get_valid_token
 
     return {
         "antigravity-oauth": ag_get_valid_token,
         "muse-oauth": muse_get_valid_token,
+        "xai-oauth": xai_get_valid_token,
     }
 
 
@@ -58,6 +64,14 @@ def dalton_oauth_token_getter(provider: str) -> TokenGetter | None:
 def is_dalton_oauth_provider(provider: str) -> bool:
     """Whether ``provider`` is a Dalton-owned OAuth provider."""
     return provider in DALTON_OAUTH_PROVIDERS
+
+
+def is_isolated_coding_plan_provider(provider: str, mc: Any) -> bool:
+    """Return True when ``provider`` is a coding-plan variant that only accepts its own slug key."""
+    if not provider or mc is None:
+        return False
+    info = mc.get_provider_info(provider) if hasattr(mc, "get_provider_info") else None
+    return isinstance(info, dict) and info.get("access_type") == "coding_plan"
 
 
 def disabled_providers() -> set[str]:

@@ -78,6 +78,33 @@ export async function disconnectMuseOAuth(): Promise<{ success: boolean }> {
   return data;
 }
 
+export async function initiateXaiDevice(): Promise<DeviceCodeResponse> {
+  const { data } = await api.post('/api/v1/oauth/xai/device/initiate');
+  return data;
+}
+
+export async function pollXaiDevice(): Promise<{
+  success?: boolean;
+  pending?: boolean;
+  account_id?: string | null;
+  email?: string | null;
+  plan_type?: string | null;
+  interval?: number;
+}> {
+  const { data } = await api.post('/api/v1/oauth/xai/device/poll');
+  return data;
+}
+
+export async function getXaiOAuthStatus(): Promise<OAuthStatusResponse> {
+  const { data } = await api.get('/api/v1/oauth/xai/status');
+  return data;
+}
+
+export async function disconnectXaiOAuth(): Promise<{ success: boolean }> {
+  const { data } = await api.delete('/api/v1/oauth/xai');
+  return data;
+}
+
 export async function disconnectDaltonOAuth(
   provider: string,
 ): Promise<boolean> {
@@ -87,6 +114,10 @@ export async function disconnectDaltonOAuth(
   }
   if (provider === 'muse-oauth' || provider === 'meta' || provider === 'muse') {
     await disconnectMuseOAuth();
+    return true;
+  }
+  if (provider === 'xai-oauth' || provider === 'xai') {
+    await disconnectXaiOAuth();
     return true;
   }
   return false;
