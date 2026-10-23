@@ -8,7 +8,7 @@
 
 在多支线并行取证与三段式长文写作中，不同子任务各自临时拉数极易造成“同一指标在不同章节数值或口径打架”。因此完整覆盖执行以下**铁律**：
 
-1. **阶段 0 统一锁表**：由阶段 0 子任务一次性提取一手法定财报（美股通过 `dalton_sec` 与 `researchdata.finance(route="sec")`；港股与 A 股通过 `researchdata.finance(route="cn-hk", operation="filings", ticker=CODE_5_OR_6, start=..., end=..., limit=20)` 调取巨潮/港股定期报告与业绩公告，港股未覆盖时用 `web_search` 查 `site:hkexnews.hk` 原文链接；`operation="ask"` 平台财务表仅作初值线索，核心数字一律回法定公告原文核实，回报与估值核对复权、分红、拆股与币种）、运行 `dalton-financial-lenses` 三把镜头、计算盈利质量指标，并用 `scripts/facts.py set` 写入 `research/<D>-fc/facts.md`。
+1. **阶段 0 统一锁表**：由阶段 0 子任务一次性提取一手法定财报（美股通过 `dalton_sec` 与 `researchdata.finance(route="sec")`；港股与 A 股通过 `researchdata.finance(route="cn-hk", operation="filings", ticker=CODE_5_OR_6, start=..., end=..., limit=20)` 调取巨潮/港股定期报告与业绩公告，查不到，或者需要仅英文版的公告时，再用 `web_search` 查 `site:hkexnews.hk`；`operation="ask"` 平台财务表仅作初值线索，核心数字一律回法定公告原文核实，回报与估值核对复权、分红、拆股与币种）、运行 `dalton-financial-lenses` 三把镜头、计算盈利质量指标，并用 `scripts/facts.py set` 写入 `research/<D>-fc/facts.md`。
 2. **后续阶段只读底表**：阶段 1（A/B/C/D 四条支线）、阶段 2（Excel 建模）、阶段 3（memo 三段写作）、阶段 4（独立审稿）**引用目标公司的任何财务与市场数字，只能使用 `facts.md` 中的数字**。
 3. **缺数回补机制**：若后续阶段发现某个必须使用的目标公司数字不在 `facts.md` 中，正文中显式标注 `底表缺 X`，并调用 `scripts/facts.py set` 补入 `facts.md`（附一手来源与期间），严禁在正文里私自临时拉数或从二手研报抄数字。
 4. **唯一例外（同业与竞对数字）**：竞争对手和可比公司的财务数字不在目标公司底表内，由 A 支线与建模支线通过实时工具（`dalton_sec`、`fundamentals`、`yfinance`）现取，每个同业数字后必须标注 `（期间，来源）`。

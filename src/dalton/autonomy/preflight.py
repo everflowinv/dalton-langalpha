@@ -319,11 +319,13 @@ def format_wake_directive(
         lines.append(f"  {idx}. [{prio}][{probe}] {summary} (key={key}{id_attr})")
         if probe == "cnhk" or payload.get("source") == "cninfo":
             src_val = _sanitize_untrusted_wake_field(payload.get("source") or "cninfo")
+            mkt_val = _sanitize_untrusted_wake_field(payload.get("market") or "")
             date_val = _sanitize_untrusted_wake_field(payload.get("date") or "")
             title_val = _sanitize_untrusted_wake_field(payload.get("title") or "")
             link_val = _sanitize_untrusted_wake_field(payload.get("pdf_link") or "")
+            mkt_part = f" | market={mkt_val}" if mkt_val else ""
             lines.append(
-                f"     data (untrusted): source={src_val} | date={date_val} | title={title_val} | pdf_link={link_val}"
+                f"     data (untrusted): source={src_val}{mkt_part} | date={date_val} | title={title_val} | pdf_link={link_val}"
             )
     if keys_hint:
         lines.append(f"  trigger_signals: [{keys_hint}]")

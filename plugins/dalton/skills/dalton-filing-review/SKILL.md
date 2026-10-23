@@ -11,8 +11,8 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 ## 目标与触发方式
 
 覆盖公司披露新监管公告时，分析师读取公告原文、核对数字与措辞变化、判断对 thesis 与 debate 的影响并给出事件五词结论：
-- **自动唤醒（美股 SEC 与 A 股（含 A+H 的 H 股公告）巨潮公告；纯港股仍靠手动或研究任务）**：由 `dalton-<t>-watch.json` 配合后端 PK.16 的 `sec` 与 `cnhk` 探针发现新公告，注入 `<dalton_wake>`（美股 SEC 含 `kind="filing"`、信号 `id`、表单类型与 `accession` 号；A 股公告 payload 带上 `title`、`date`、`pdf_link`、`source="cninfo"`）；纯港股巨潮不覆盖，仍靠手动或研究任务调用 `cn-hk` 的 `filings` 或检索披露易。
-- **手动或研究任务调用**：`/dalton-filing-review {TICKER} {FORM} {ACCESSION}`（美股若未传 accession，先调 `dalton_sec.list_filings` 取最新一份该表单；港股与 A 股调用 `researchdata.finance(route="cn-hk", operation="filings", ticker=CODE_5_OR_6, start=SEARCH_START, end=min(SEARCH_END, TODAY), limit=20)` 取最新法定公告，`end` 不得晚于当天 `TODAY`，港股披露易未覆盖时用 `web_search` 查 `site:hkexnews.hk` 原文链接）。
+- **自动唤醒（美股 SEC 与 A 股、港股巨潮公告）**：由 `dalton-<t>-watch.json` 配合后端 PK.16 注入 `<dalton_wake>`——美股由 `sec` 探针发现（含 `kind="filing"`、信号 `id`、表单类型与 `accession` 号）；A 股和港股公告都由 cnhk 探针经巨潮发现（payload 带上 `title`、`date`、`pdf_link`、`source="cninfo"`）。
+- **手动或研究任务调用**：`/dalton-filing-review {TICKER} {FORM} {ACCESSION}`（美股若未传 accession，先调 `dalton_sec.list_filings` 取最新一份该表单；港股与 A 股调用 `researchdata.finance(route="cn-hk", operation="filings", ticker=CODE_5_OR_6, start=SEARCH_START, end=min(SEARCH_END, TODAY), limit=20)` 取最新法定公告，`end` 不得晚于当天 `TODAY`；查不到，或者需要仅英文版的公告时，再用 `web_search` 查 `site:hkexnews.hk`）。
 - **来源阶梯**：严格遵循 `定期报告（10-Q/10-K/20-F/年报/中报/季报） > 临时重大事项公告（8-K/6-K/业绩公告） > 新闻稿` 的一手权威优先级；`researchdata.finance(route="cn-hk", operation="ask", ...)` 平台数据仅作二手初值线索，核心财务数字一律以法定公告原文为准。
 - **Watch 表单配置初始化**：若读取 `agenda.md`（`data/agenda.json`）发现 `watch.filings.forms` 尚未设置，按 `.agents/skills/dalton-filing-review/references/watch-forms.md` 的推荐配置调用 `knowledge_update(doc="agenda", ...)` 写入。
 
@@ -30,7 +30,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 
 ### 第 2 步：按 `form-guide.md` 逐项审阅公告要点
 
-先读取 `.agents/skills/dalton-filing-review/references/form-guide.md`。美股用 `researchdata.finance(route="sec", ...)`（`read-item` / `search-text` / `attachments`）或 `get_sec_filing` 读取正文，用 `dalton_sec.get_company_facts` 拉取结构化 XBRL 事实；港股与 A 股调用 `researchdata.finance(route="cn-hk", operation="filings", ticker=CODE_5_OR_6, start=SEARCH_START, end=min(SEARCH_END, TODAY), limit=20)`（`end` 不得晚于当天 `TODAY`；港股传 5 位零填充纯数字如 `"00700"`，A 股传 6 位纯数字如 `"600519"`）获取巨潮资讯法定公告 `pdf_link` 原文（港股披露易未覆盖时用 `web_search` 查 `site:hkexnews.hk` 原文链接），并可按单一意图辅以 `researchdata.finance(route="cn-hk", operation="ask", query=..., limit=20)` 提取三表、分红、回购或股东变动初值线索（核心财务数必须回公告原文核实，核对复权、分红、拆股与交易/报表币种）：
+先读取 `.agents/skills/dalton-filing-review/references/form-guide.md`。美股用 `researchdata.finance(route="sec", ...)`（`read-item` / `search-text` / `attachments`）或 `get_sec_filing` 读取正文，用 `dalton_sec.get_company_facts` 拉取结构化 XBRL 事实；港股与 A 股调用 `researchdata.finance(route="cn-hk", operation="filings", ticker=CODE_5_OR_6, start=SEARCH_START, end=min(SEARCH_END, TODAY), limit=20)`（`end` 不得晚于当天 `TODAY`；港股传 5 位零填充纯数字如 `"00700"`，A 股传 6 位纯数字如 `"600519"`）获取巨潮资讯法定公告 `pdf_link` 原文（查不到，或者需要仅英文版的公告时，再用 `web_search` 查 `site:hkexnews.hk`），并可按单一意图辅以 `researchdata.finance(route="cn-hk", operation="ask", query=..., limit=20)` 提取三表、分红、回购或股东变动初值线索（核心财务数必须回公告原文核实，核对复权、分红、拆股与交易/报表币种）：
 
 1. **10-Q / 10-K（及外国发行人 20-F）**：
    - **MD&A 措辞变化**：与上一期对比增长驱动、利润率解释、流动性与资本开支（Capex）指引措辞的变化；

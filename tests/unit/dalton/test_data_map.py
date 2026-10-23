@@ -173,9 +173,15 @@ def test_render_data_map_markdown_contents_date_free_title_and_search_api() -> N
     assert "get_market_movers" not in md
     assert "- `x_search`" in md
 
-    # 4. cn-hk description and HKEXnews unavailable note
-    assert "巨潮公告（`filings`）＋港 A 股财务、估值、资金面（`ask`）" in md
-    assert "港交所披露易公告:未接通，用 `web_search` 查 `site:hkexnews.hk`。" in md
+    # 4. cn-hk description and HKEXnews removed from unavailable_sources
+    spec = map_builder.load_sources_spec()
+    unavail_ids = [item.get("id") for item in spec.get("unavailable_sources", [])]
+    assert "hkexnews" not in unavail_ids
+    assert (
+        "`filings` 覆盖 A 股和港股的法定公告（巨潮转载），港股约有 5% 的缺口，"
+        "主要是仅英文版公告和股东大会投票结果，这类需要原文时，用 `web_search` 查 `site:hkexnews.hk`"
+    ) in md
+    assert "港交所披露易公告" not in md
     assert "期货与大宗商品实时(非延迟)行情" in md
 
     # 5. Token budget < 1500 tokens

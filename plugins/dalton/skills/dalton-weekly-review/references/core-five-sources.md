@@ -38,7 +38,7 @@
 1. 执行 1 次带显式日期范围（`date_after = base - 1d`、`date_before = end + 1d`）的常规新闻检索；
 2. 对 `screen.json` 中该公司出现**放量（量比 ≥ 2.0x）或单日明显偏离同组（|日超额| ≥ 3pp 或 |z| ≥ 2）**的每个异常交易日，额外执行 1 次定向检索：`"{公司名/TICKER} stock {YYYY-MM-DD} why"`。
 3. **港股与 A 股必加 `cn-hk` 深度检索（公告 + 资金面/交易结构）**：
-   - **一手公告核查（`operation="filings"`）**：调用 `researchdata.finance(route="cn-hk", operation="filings", ticker=code_5_or_6, start=base_minus_1d, end=min(end_plus_1d, TODAY), limit=20)`（`filings` 的 `end` 不得晚于当天 `TODAY`，否则整次调用失败；港股传 5 位零填充纯数字如 `"00700"`，A 股传 6 位纯数字如 `"600519"`，不带 `.HK`/`.SS`/`.SZ` 后缀），检索窗口内巨潮资讯（cninfo）发布的业绩、回购、股东增减持、重大合同或监管公告及 `pdf_link`；若港股披露易（HKEXnews）公告未被 `cn-hk` 的 `filings` 覆盖，必须用 `web_search`（`site:hkexnews.hk`）检索披露易并核对官方原文链接。
+   - **一手公告核查（`operation="filings"`）**：调用 `researchdata.finance(route="cn-hk", operation="filings", ticker=code_5_or_6, start=base_minus_1d, end=min(end_plus_1d, TODAY), limit=20)`（`filings` 的 `end` 不得晚于当天 `TODAY`，否则整次调用失败；港股传 5 位零填充纯数字如 `"00700"`，A 股传 6 位纯数字如 `"600519"`，不带 `.HK`/`.SS`/`.SZ` 后缀），检索窗口内巨潮资讯（cninfo）发布的业绩、回购、股东增减持、重大合同或监管公告及 `pdf_link`；查不到，或者需要仅英文版的公告时，再用 `web_search` 查 `site:hkexnews.hk`。
    - **资金流、两融、龙虎榜、股东/回购与 AH 溢价（`operation="ask"`）**：每次调用只查**单一意图**（不要把多个意图拼成一条 query）：资金流类查询必须带具体异动日或窗口日期（如 `query="宁德时代 300750 2026-10-21 主力资金净流入和成交额"`）；两融（`query=f"{code_or_name} {event_date} 两融"`）、龙虎榜（`query=f"{code_or_name} {event_date} 龙虎榜"`）、大宗交易（`query=f"{code_or_name} {event_date} 大宗交易"`）、回购（`query=f"{code_or_name} 回购"`）、分红（`query=f"{code_or_name} 分红"`）、AH 溢价（`query="AH溢价"`）各自单独调用一条 `ask`。必须检查返回的 `summary` 与实际来源：若东财接口失败回退到同花顺当日即时口径，成稿必须标明口径；拿不到指定历史日的数据就写明缺口，不得把即时/最新值当作窗口内日终数。若涉及财务报表数字，平台数据仅作二手初值线索，核心数字必须回法定公告原文核实；核对周度与区间回报时须核实复权口径（A 股默认前复权 `qfq`、港股默认不复权，跨源回退核查 `plan.source`）、分红、拆股与币种。
 
 ### 4. 社交媒体 X

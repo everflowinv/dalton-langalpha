@@ -46,7 +46,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
    - 若涉及 AI 收入占比、大单 TCV/RPO 或 AI 降本提效，遵循 `references/ai-revenue-rules.md` 核对口径。
 
 5. **一手指引与公告核对**
-   - 美股用 `dalton_sec.list_filings` 与 `researchdata.finance(route="sec")` 核对最新 8-K / 10-Q / 10-K 的业绩指引原文与电话会纪要，记录 accession 与期间；港股与 A 股调用 `researchdata.finance(route="cn-hk", operation="filings", ticker=CODE_5_OR_6, start=..., end=..., limit=20)`（港股未覆盖时用 `web_search` 查披露易 `site:hkexnews.hk` 原文链接）核对最新定期报告与业绩公告原文（`operation="ask"` 平台财务表仅作二手初值，核心财务数字回公告核实，回报核对复权、分红、拆股与币种）。分析师提问中提及但管理层未确认的数字，标为“分析师提问口径，管理层未确认”。
+   - 美股用 `dalton_sec.list_filings` 与 `researchdata.finance(route="sec")` 核对最新 8-K / 10-Q / 10-K 的业绩指引原文与电话会纪要，记录 accession 与期间；港股与 A 股调用 `researchdata.finance(route="cn-hk", operation="filings", ticker=CODE_5_OR_6, start=..., end=..., limit=20)`（查不到，或者需要仅英文版的公告时，再用 `web_search` 查 `site:hkexnews.hk`）核对最新定期报告与业绩公告原文（`operation="ask"` 平台财务表仅作二手初值，核心财务数字回公告核实，回报核对复权、分红、拆股与币种）。分析师提问中提及但管理层未确认的数字，标为“分析师提问口径，管理层未确认”。
 
 6. **按固定结构在对话中回复**（除非 PM 要求写文件，否则直接在对话输出）：
 
