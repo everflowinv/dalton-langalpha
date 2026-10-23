@@ -197,6 +197,8 @@ def compute_subscription_notional_usd(token_usage_rows: list[dict[str, Any]]) ->
 
 
 def _resolve_provider_for_model(model_name: str, billing_type: str = "platform") -> str:
+    if model_name.startswith("grok-") and model_name.endswith("-oauth"):
+        return "xai-oauth"
     try:
         from src.llms.pricing_utils import detect_provider_for_model
 
@@ -216,6 +218,8 @@ def _resolve_provider_for_model(model_name: str, billing_type: str = "platform")
             return "antigravity-oauth"
         if model_name.startswith("muse-"):
             return "muse-oauth"
+        if model_name.startswith("grok-"):
+            return "xai-oauth"
     if model_name.startswith("grok-"):
         return "xai"
     if model_name.startswith("deepseek-"):

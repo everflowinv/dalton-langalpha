@@ -38,6 +38,8 @@ export const queryKeys = {
     // DALTON-HOOK(query-keys): P0N.3 Antigravity & Meta Muse OAuth query keys
     antigravity: () => [...queryKeys.oauth.all, 'antigravity'],
     muse:   () => [...queryKeys.oauth.all, 'muse'],
+    // DALTON-HOOK(xai-oauth): xAI Grok OAuth query key
+    xai:    () => [...queryKeys.oauth.all, 'xai'],
   },
   workspaces: {
     all:    ['workspaces'],

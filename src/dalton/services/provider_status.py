@@ -34,7 +34,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 AGENT_CONFIG_PATH = REPO_ROOT / "agent_config.dalton.yaml"
 
 _HIGH_TOS_RISK_PROVIDERS = frozenset(
-    {"claude-oauth", "codex-oauth", "antigravity-oauth", "muse-oauth"}
+    {"claude-oauth", "codex-oauth", "antigravity-oauth", "muse-oauth", "xai-oauth"}
 )
 
 _DEFAULT_PROBE_MODELS: dict[str, str] = {
@@ -42,6 +42,7 @@ _DEFAULT_PROBE_MODELS: dict[str, str] = {
     "codex-oauth": "gpt-6.1-sol-oauth",
     "antigravity-oauth": "gemini-3.8-flash-low-oauth",
     "muse-oauth": "muse-spark-1.3-oauth",
+    "xai-oauth": "grok-4.7-oauth",
     "xai": "grok-4.3",
     "deepseek": "deepseek-flash",
     "z-ai": "glm-5.3-flash",
@@ -239,6 +240,7 @@ async def get_providers_status(*, user_id: str) -> dict[str, Any]:
         "codex-oauth",
         "antigravity-oauth",
         "muse-oauth",
+        "xai-oauth",
         "xai",
         "deepseek",
     ]
@@ -261,6 +263,7 @@ async def get_providers_status(*, user_id: str) -> dict[str, Any]:
 
         configured = False
         credential_info: dict[str, Any] = {}
+        quota_info: dict[str, Any] | None = None
         warnings: list[dict[str, str]] = []
         muse_row_extras: dict[str, Any] = {}
 
@@ -289,6 +292,39 @@ async def get_providers_status(*, user_id: str) -> dict[str, Any]:
                     "seconds_left": seconds_left,
                     "last_refresh": last_refresh,
                 }
+                if prov == "xai-oauth" and configured:
+                    try:
+                        from src.dalton.llm.providers.xai_grok.oauth import (
+                            fetch_xai_billing,
+                            get_valid_token as get_xai_valid_token,
+                        )
+
+                        valid_tok = await get_xai_valid_token(user_id)
+                        access_tok = (valid_tok or {}).get("access_token")
+                        if access_tok:
+                            quota_info = await fetch_xai_billing(str(access_tok))
+                            credential_info["quota"] = quota_info
+                            if quota_info.get("token_expired"):
+                                credential_info["token_expired"] = True
+                                warnings.append(
+                                    {
+                                        "code": "oauth_token_expired",
+                                        "message": "xAI OAuth 令牌已过期（401/403），请重新连接。",
+                                    }
+                                )
+                        else:
+                            credential_info["token_expired"] = True
+                            warnings.append(
+                                {
+                                    "code": "oauth_token_expired",
+                                    "message": "xAI OAuth 令牌刷新失败或已过期，请重新连接。",
+                                }
+                            )
+                    except Exception as qexc:
+                        logger.debug(
+                            "[provider_status] xai-oauth billing query skipped: %s",
+                            type(qexc).__name__,
+                        )
                 if prov == "muse-oauth":
                     from src.dalton.credentials import credential_user_id
                     from src.dalton.llm.providers.muse.oauth import (
@@ -426,6 +462,7 @@ async def get_providers_status(*, user_id: str) -> dict[str, Any]:
             "enabled": enabled,
             "configured": configured,
             "credential": credential_info,
+            "quota": quota_info,
             "last_success": last_success,
             "recent_errors": recent_errors,
             "errors_24h": errors_24h,

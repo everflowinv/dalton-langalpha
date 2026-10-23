@@ -19,6 +19,7 @@ _OAUTH_PROVIDER_TOKEN_KEYS: dict[str, str] = {
     "codex-oauth": "codex-oauth",
     "antigravity-oauth": "antigravity-oauth",
     "muse-oauth": "muse-oauth",
+    "xai-oauth": "xai-oauth",
 }
 
 

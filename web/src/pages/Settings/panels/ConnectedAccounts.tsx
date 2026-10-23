@@ -9,6 +9,8 @@ import { useTranslation } from 'react-i18next';
 // DALTON-HOOK(native-oauth-ui): P0N.3 Antigravity & Meta Muse OAuth rows
 import { AntigravityAccountRow } from './dalton/oauth/AntigravityAccountRow';
 import { MuseAccountRow } from './dalton/oauth/MuseAccountRow';
+// DALTON-HOOK(xai-oauth): xAI Grok OAuth row
+import { XaiAccountRow } from './dalton/oauth/XaiAccountRow';
 // DALTON-HOOK(team-credentials): team-shared credentials hint & PM disconnect guard
 import { isDaltonAuth } from '@/config/daltonAuth';
 import { TEAM_SHARED_CREDENTIALS_HINT, useTeamCredentials } from '@/hooks/useTeamCredentials'; // DALTON-HOOK(team-credentials)
@@ -499,6 +501,8 @@ export function ConnectedAccounts() {
         {/* DALTON-HOOK(team-credentials): pass allowDisconnect to Antigravity & Muse rows */}
         <AntigravityAccountRow onError={setAccountsError} canDisconnect={allowDisconnect} />
         <MuseAccountRow onError={setAccountsError} canDisconnect={allowDisconnect} />
+        {/* DALTON-HOOK(xai-oauth): xAI Grok OAuth row with team-credentials disconnect guard */}
+        <XaiAccountRow onError={setAccountsError} canDisconnect={allowDisconnect} />
 
         {accountsError && (
           <div className="p-3 rounded-md mt-2" style={{ backgroundColor: 'var(--color-loss-soft)', border: '1px solid var(--color-border-loss)' }}>

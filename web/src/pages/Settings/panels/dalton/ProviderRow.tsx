@@ -236,6 +236,30 @@ export function ProviderRow({ item }: { item: DaltonProviderStatusItem }) {
           </span>
         )}
         {formatSecondsLeft(secondsLeft) && <span>{formatSecondsLeft(secondsLeft)}</span>}
+        {(() => {
+          const q = item.quota ?? item.credential?.quota;
+          if (!q) return null;
+          if (q.token_expired) {
+            return <span style={{ color: 'var(--color-loss)' }}>额度：令牌已过期</span>;
+          }
+          if (typeof q.credit_usage_percent === 'number') {
+            return (
+              <span>
+                额度已用：{q.credit_usage_percent.toFixed(1)}%
+                {q.subscription_tier ? ` (${q.subscription_tier})` : ''}
+              </span>
+            );
+          }
+          if (typeof q.used === 'number' && typeof q.monthly_limit === 'number') {
+            return (
+              <span>
+                额度：{q.used}/{q.monthly_limit}
+                {q.subscription_tier ? ` (${q.subscription_tier})` : ''}
+              </span>
+            );
+          }
+          return null;
+        })()}
         {item.last_success?.at && (
           <span>
             最近成功：{item.last_success.at.slice(0, 19).replace('T', ' ')} (

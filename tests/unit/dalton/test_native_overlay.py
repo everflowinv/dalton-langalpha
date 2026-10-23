@@ -37,7 +37,7 @@ def test_native_overlay_does_not_collide_with_upstream():
     assert native is not None
 
     native_models = native.get("models") or {}
-    assert len(native_models) == 23
+    assert len(native_models) == 26
     overlap = set(native_models) & set(upstream_models)
     assert not overlap, f"Native overlay models collide with upstream: {overlap}"
 
@@ -118,9 +118,11 @@ def test_build_antigravity_and_muse_clients_with_session_headers():
 def test_oauth_dispatch_helpers():
     assert is_dalton_oauth_provider("antigravity-oauth")
     assert is_dalton_oauth_provider("muse-oauth")
+    assert is_dalton_oauth_provider("xai-oauth")
     assert not is_dalton_oauth_provider("codex-oauth")
     assert dalton_oauth_token_getter("antigravity-oauth") is not None
     assert dalton_oauth_token_getter("muse-oauth") is not None
+    assert dalton_oauth_token_getter("xai-oauth") is not None
     assert dalton_oauth_token_getter("claude-oauth") is None
 
 

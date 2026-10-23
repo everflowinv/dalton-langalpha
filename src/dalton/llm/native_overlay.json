@@ -581,6 +581,90 @@
         ],
         "store": false
       }
+    },
+    "grok-4.7-oauth": {
+      "model_id": "grok-4.7",
+      "provider": "xai-oauth",
+      "display_name": "Grok 4.7 (OAuth)",
+      "visible": true,
+      "speed": 3,
+      "intelligence": 5,
+      "context": 256000,
+      "supports_reasoning_effort": true,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "parameters": {
+        "max_tokens": 64000,
+        "reasoning": {
+          "summary": "auto"
+        },
+        "include": [
+          "reasoning.encrypted_content"
+        ],
+        "store": false
+      },
+      "reasoning": {
+        "efforts": [
+          "low",
+          "medium",
+          "high"
+        ],
+        "default": "high",
+        "write": "parameters.reasoning.effort"
+      }
+    },
+    "grok-4.3-oauth": {
+      "model_id": "grok-4.3",
+      "provider": "xai-oauth",
+      "display_name": "Grok 4.3 (OAuth)",
+      "visible": true,
+      "speed": 3,
+      "intelligence": 4,
+      "context": 1000000,
+      "supports_reasoning_effort": true,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "parameters": {
+        "max_tokens": 64000,
+        "reasoning": {
+          "summary": "auto"
+        },
+        "include": [
+          "reasoning.encrypted_content"
+        ],
+        "store": false
+      },
+      "reasoning": {
+        "efforts": [
+          "low",
+          "medium",
+          "high"
+        ],
+        "default": "high",
+        "write": "parameters.reasoning.effort"
+      }
+    },
+    "grok-4.7-build-fast-oauth": {
+      "model_id": "grok-4.7-build-fast",
+      "provider": "xai-oauth",
+      "display_name": "Grok 4.7 Build Fast (OAuth)",
+      "visible": true,
+      "speed": 5,
+      "intelligence": 4,
+      "context": 256000,
+      "supports_reasoning_effort": false,
+      "input_modalities": [
+        "text"
+      ],
+      "parameters": {
+        "max_tokens": 64000,
+        "supports_reasoning_effort": false,
+        "store": false
+      }
     }
   },
   "providers": {
@@ -622,6 +706,15 @@
         "prompt_cache_key": true,
         "display_name": "xAI Grok",
         "operator_channel": "developer"
+      },
+      "xai-oauth": {
+        "sdk": "grok",
+        "base_url": "https://cli-chat-proxy.grok.com/v1",
+        "env_key": null,
+        "access_type": "oauth",
+        "use_response_api": true,
+        "prompt_cache_key": true,
+        "display_name": "xAI Grok (SuperGrok OAuth)"
       }
     },
     "provider_variants": {},
@@ -901,6 +994,28 @@
     "grok-4.3": {
       "family": "xai-grok",
       "billing": "cash",
+      "tool_calling": true
+    },
+    "grok-4.7-oauth": {
+      "family": "xai-grok",
+      "billing": "subscription",
+      "notional_ref": "grok-4.7",
+      "supports_reasoning_effort": true,
+      "tool_calling": true
+    },
+    "grok-4.3-oauth": {
+      "family": "xai-grok",
+      "billing": "subscription",
+      "notional_ref": "grok-4.3",
+      "supports_reasoning_effort": true,
+      "tool_calling": true
+    },
+    "grok-4.7-build-fast-oauth": {
+      "family": "xai-grok",
+      "billing": "subscription",
+      "notional_ref": "grok-4.7",
+      "comment": "Approximate notional pricing from same-family grok-4.7 (no exact cash catalog entry for grok-4.7-build-fast).",
+      "supports_reasoning_effort": false,
       "tool_calling": true
     },
     "gpt-5.6-terra": {
