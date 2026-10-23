@@ -675,6 +675,13 @@ async def test_health_check_isolation_separate_backends_and_dedicated_lock(
     mock_lock_conn.close.assert_awaited_once()
 
     # Startup check skips immediately when today's cache already exists
+    from src.server.database import automation as auto_db
+
+    monkeypatch.setattr(
+        auto_db,
+        "list_all_automations",
+        create_autospec(auto_db.list_all_automations, return_value=[]),
+    )
     mock_open_lock.reset_mock()
     mock_get_cached.return_value = {"cache_date": "2026-10-22", "rendered_markdown": "## Dalton 数据地图"}
     skipped_summary = await health_mod.run_startup_health_check_once(open_lock_connection=mock_open_lock)
@@ -686,13 +693,17 @@ async def test_health_check_isolation_separate_backends_and_dedicated_lock(
 @pytest.mark.asyncio
 async def test_startup_health_check_loop_cross_day_exception_and_cancel(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """`run_startup_health_check_loop`:
-    1) Skips when today's (`Asia/Shanghai`) snapshot already exists;
-    2) Catches single wake-up exceptions without terminating the loop;
-    3) Runs again after crossing midnight (`Asia/Shanghai`) into a new day with no snapshot;
-    4) Propagates `asyncio.CancelledError`.
+    """`run_startup_health_check_loop` exercises real `_is_data_health_paused_by_user` (mocking only DB queries):
+    1) Skips when `dalton-data-health` row is paused / `paused_by_user=True`;
+    2) Skips and logs warning when pause-state DB query fails (never treats error as unpaused);
+    3) Skips when a health check record exists within the last 24 hours;
+    4) Runs once when neither condition holds, without entering a periodic sleep loop.
     """
+    from src.server.database import automation as auto_db
+
+    monkeypatch.setenv("DALTON_PM_USER_IDS", "pm-admin")
     current_day = [date(2026, 10, 22)]
     mock_today = create_autospec(
         health_mod.today_cache_date,
@@ -713,15 +724,28 @@ async def test_startup_health_check_loop_cross_day_exception_and_cancel(
     cached_by_date: dict[date, dict[str, Any]] = {
         date(2026, 10, 22): {"cache_date": "2026-10-22", "rendered_markdown": "## Dalton 数据地图"},
     }
-    raise_on_next_read = [False]
+    automation_rows: list[dict[str, Any]] = [
+        {
+            "automation_id": "auto-dh-1",
+            "user_id": "pm-admin",
+            "name": "dalton-data-health",
+            "status": "paused",
+            "metadata": {"dalton_managed": True, "dalton_kind": "data_health", "paused_by_user": True},
+        }
+    ]
+    raise_db_error = [False]
+
+    async def _fake_list_all_automations(user_id: str, *, conn: Any = None) -> list[dict[str, Any]]:
+        if raise_db_error[0]:
+            raise RuntimeError("db query failure")
+        return [dict(r) for r in automation_rows if r.get("user_id") == user_id]
 
     async def _fake_get_cached(cache_date: date, *, conn: Any = None) -> dict[str, Any] | None:
-        if raise_on_next_read[0]:
-            raise_on_next_read[0] = False
-            raise RuntimeError("transient db error")
         return cached_by_date.get(cache_date)
 
+    mock_list_all = create_autospec(auto_db.list_all_automations, side_effect=_fake_list_all_automations)
     mock_get_cached = create_autospec(db_data_map.get_cached_data_map, side_effect=_fake_get_cached)
+    mock_fetch_health = create_autospec(db_data_map.fetch_all_source_health, return_value={})
     mock_lock_conn = create_autospec(AsyncConnection, instance=True)
     mock_open_lock = create_autospec(
         health_mod.db_pool.open_session_connection,
@@ -752,45 +776,64 @@ async def test_startup_health_check_loop_cross_day_exception_and_cancel(
         return_value=([{"source_id": "tmtb", "status": "available"}], [], set(FIXED_HANDOFF_ROUTES)),
     )
 
+    monkeypatch.setattr(auto_db, "list_all_automations", mock_list_all)
     monkeypatch.setattr(db_data_map, "get_cached_data_map", mock_get_cached)
+    monkeypatch.setattr(db_data_map, "fetch_all_source_health", mock_fetch_health)
     monkeypatch.setattr(db_data_map, "try_acquire_health_run_lock", mock_try_lock)
     monkeypatch.setattr(db_data_map, "release_health_run_lock", mock_rel_lock)
     monkeypatch.setattr(db_data_map, "upsert_source_health_batch", mock_upsert_batch)
     monkeypatch.setattr(health_mod, "refresh_daily_data_map", mock_refresh_map)
     monkeypatch.setattr(health_mod, "_execute_probes", mock_execute_probes)
 
-    sleep_calls: list[float] = []
+    mock_sleep = create_autospec(asyncio.sleep)
 
-    async def _fake_sleep(seconds: float) -> None:
-        sleep_calls.append(seconds)
-        step = len(sleep_calls)
-        if step == 1:
-            # Iteration 1 skipped because 2026-10-22 was already cached.
-            # Next wake-up simulates a transient exception inside the loop.
-            assert mock_open_lock.await_count == 0
-            raise_on_next_read[0] = True
-            return
-        if step == 2:
-            # Iteration 2 survived the exception; now advance clock across midnight to 2026-10-23.
-            assert mock_open_lock.await_count == 0
-            current_day[0] = date(2026, 10, 23)
-            return
-        # Iteration 3 ran the health check for 2026-10-23; now cancel the loop.
-        raise asyncio.CancelledError()
+    # 1) Skipped when dalton-data-health is paused by user (via real _is_data_health_paused_by_user)
+    res_paused = await health_mod.run_startup_health_check_loop(
+        open_lock_connection=mock_open_lock,
+        sleep_fn=mock_sleep,
+    )
+    assert res_paused is not None
+    assert res_paused["skipped"] == "paused_by_user"
+    assert mock_open_lock.await_count == 0
+    assert mock_sleep.await_count == 0
 
-    mock_sleep = create_autospec(asyncio.sleep, side_effect=_fake_sleep)
-
-    with pytest.raises(asyncio.CancelledError):
-        await health_mod.run_startup_health_check_loop(
-            interval_s=3600.0,
+    # 2) Skipped and logged when pause-state DB query fails (never treated as unpaused)
+    raise_db_error[0] = True
+    with caplog.at_level("WARNING"):
+        res_err = await health_mod.run_startup_health_check_loop(
             open_lock_connection=mock_open_lock,
             sleep_fn=mock_sleep,
         )
+    assert res_err is not None
+    assert res_err["skipped"] == "pause_query_failed"
+    assert mock_open_lock.await_count == 0
+    assert mock_execute_probes.await_count == 0
+    assert "pause query failed" in caplog.text
 
-    assert sleep_calls == [3600.0, 3600.0, 3600.0]
+    # 3) Skipped when a recent health check record exists within 24h
+    raise_db_error[0] = False
+    automation_rows.clear()
+    res_cached = await health_mod.run_startup_health_check_loop(
+        open_lock_connection=mock_open_lock,
+        sleep_fn=mock_sleep,
+    )
+    assert res_cached is not None
+    assert res_cached["skipped"] == "already_cached"
+    assert mock_open_lock.await_count == 0
+    assert mock_sleep.await_count == 0
+
+    # 4) Runs once on a fresh day with no 24h record and returns immediately (no sleep loop)
+    current_day[0] = date(2026, 10, 23)
+    res_ran = await health_mod.run_startup_health_check_loop(
+        open_lock_connection=mock_open_lock,
+        sleep_fn=mock_sleep,
+    )
+    assert res_ran is not None
+    assert res_ran.get("skipped") is None
     assert refreshed_dates == [date(2026, 10, 23)]
     mock_open_lock.assert_awaited_once()
     mock_execute_probes.assert_awaited_once()
+    assert mock_sleep.await_count == 0
 
 
 def test_conversation_search_docstring_contract() -> None:

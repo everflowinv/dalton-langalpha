@@ -340,7 +340,7 @@ def _extract_ticker(automation: dict[str, Any]) -> Optional[str]:
     name = str(automation.get("name") or "").strip().lower()
     if name.startswith("dalton-"):
         parts = name.split("-")
-        if len(parts) >= 3 and parts[1] not in ("earnings", "director"):
+        if len(parts) >= 3 and parts[1] not in ("earnings", "director", "data"):
             return parts[1].upper()
     return None
 
@@ -356,6 +356,8 @@ def _determine_kind(automation: dict[str, Any]) -> str:
         return "director_daily"
     if name == "dalton-director-weekly":
         return "director_weekly"
+    if name == "dalton-data-health":
+        return "data_health"
     if name.endswith("-watch"):
         return "company_watch"
     if name.endswith("-delta"):
@@ -501,13 +503,62 @@ async def _preflight_check_inner(
     workspace_id = ownership.workspace_id
 
     settings = get_dalton_settings()
-    if not settings.autonomy.enabled:
-        return PreflightResult(should_wake=True, decision="passthrough", reason="autonomy_disabled")
-
     automation_id = str(automation.get("automation_id") or "") or None
     name = str(automation.get("name") or "dalton-task")
     ticker = _extract_ticker(automation)
     kind = _determine_kind(automation)
+
+    if kind == "data_health":
+        from src.dalton.data_map.health import run_all_health_checks
+
+        health_summary_text = "体检完成"
+        health_payload: dict[str, Any] = {}
+        try:
+            res = await run_all_health_checks(persist=persist)
+            if isinstance(res, dict):
+                avail = res.get("available_count", 0)
+                checked = res.get("checked_count", 0)
+                unavail = res.get("unavailable_count", 0)
+                health_summary_text = (
+                    f"体检完成：可用 {avail}/{checked}（不可用 {unavail}）"
+                )
+                health_payload = {
+                    "checked_count": checked,
+                    "available_count": avail,
+                    "unavailable_count": unavail,
+                }
+        except asyncio.TimeoutError:
+            raise
+        except Exception as exc:
+            logger.warning("[DALTON_PREFLIGHT] run_all_health_checks failed: %s", exc)
+            err_detail = str(exc).strip()
+            err_summary = f"{type(exc).__name__}: {err_detail}" if err_detail else type(exc).__name__
+            health_summary_text = f"体检失败：{err_summary}"[:160]
+            health_payload = {"error": type(exc).__name__}
+
+        if persist:
+            try:
+                await watch_db.insert_preflight_log(
+                    automation_id=automation_id,
+                    automation_execution_id=execution_id,
+                    workspace_id=workspace_id,
+                    decision="skip",
+                    reason=health_summary_text,
+                    signals=[health_payload] if health_payload else [],
+                )
+            except Exception as e:
+                logger.warning("[DALTON_PREFLIGHT] log insert failed: %s", e)
+
+        return PreflightResult(
+            should_wake=False,
+            decision="skip",
+            reason=health_summary_text,
+            signals=[],
+            wake_context=None,
+        )
+
+    if not settings.autonomy.enabled:
+        return PreflightResult(should_wake=True, decision="passthrough", reason="autonomy_disabled")
 
     try:
         tz = ZoneInfo(settings.autonomy.timezone)
@@ -909,11 +960,13 @@ async def preflight_check(
         return PreflightResult(should_wake=True, decision="passthrough", reason="non_dalton")
 
     settings = get_dalton_settings()
-    eff_timeout = float(
-        timeout_s
-        if timeout_s is not None
-        else (settings.autonomy.preflight_timeout_s or 45)
-    )
+    kind = _determine_kind(automation)
+    if timeout_s is not None:
+        eff_timeout = float(timeout_s)
+    elif kind == "data_health":
+        eff_timeout = float(getattr(settings.autonomy, "data_health_timeout_s", 600.0) or 600.0)
+    else:
+        eff_timeout = float(settings.autonomy.preflight_timeout_s or 45)
 
     # Workspace ownership check MUST complete BEFORE `autonomy.enabled` and BEFORE "timeout -> conservative wake":
     # if ownership verification times out or fails, refuse execution and never wake.
@@ -937,7 +990,7 @@ async def preflight_check(
             wake_context=None,
         )
 
-    if not settings.autonomy.enabled:
+    if kind != "data_health" and not settings.autonomy.enabled:
         return PreflightResult(should_wake=True, decision="passthrough", reason="autonomy_disabled")
 
     try:
@@ -954,6 +1007,32 @@ async def preflight_check(
         )
     except asyncio.TimeoutError:
         name = str(automation.get("name") or "dalton-task")
+        if kind == "data_health":
+            timeout_reason = "体检超时"
+            logger.warning(
+                "[DALTON_PREFLIGHT] data_health preflight timed out after %.1fs for %s; skipping without wake",
+                eff_timeout,
+                name,
+            )
+            if persist:
+                try:
+                    await watch_db.insert_preflight_log(
+                        automation_id=str(automation.get("automation_id") or "") or None,
+                        automation_execution_id=execution_id,
+                        workspace_id=verified_ownership.workspace_id,
+                        decision="skip",
+                        reason=timeout_reason,
+                        signals=[{"error": "TimeoutError", "timeout_s": eff_timeout}],
+                    )
+                except Exception as e:
+                    logger.warning("[DALTON_PREFLIGHT] log insert failed: %s", e)
+            return PreflightResult(
+                should_wake=False,
+                decision="skip",
+                reason=timeout_reason,
+                signals=[],
+                wake_context=None,
+            )
         ticker = _extract_ticker(automation)
         logger.warning(
             "[DALTON_PREFLIGHT] preflight_check timed out after %.1fs for %s; waking conservatively",

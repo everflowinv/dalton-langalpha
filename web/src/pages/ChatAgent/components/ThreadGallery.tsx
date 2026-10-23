@@ -42,6 +42,8 @@ import {
   TeamReadOnlyComposer,
   useTeamReadOnly,
 } from './dalton/TeamSharing';
+// DALTON-HOOK(coverage-tracking): company workspace auto-tracking toggle
+import { WorkspaceTrackingToggle } from './dalton/WorkspaceTrackingToggle';
 
 interface ThreadRecord {
   thread_id: string;
@@ -715,6 +717,15 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
                 <div className="size-[3px] rounded-full bg-current opacity-50"></div>
                 <span>{totalThreads ?? threads.length} {(totalThreads ?? threads.length) === 1 ? t('thread.thread') : t('thread.threads')}</span>
               </div>
+              {/* DALTON-HOOK(coverage-tracking): company workspace auto-tracking toggle */}
+              {!isHome && workspaceId && (
+                <div className="mt-3">
+                  <WorkspaceTrackingToggle
+                    workspaceId={workspaceId}
+                    readOnly={teamReadOnly.isReadOnly}
+                  />
+                </div>
+              )}
             </div>
 
             {/* Chat Input */}

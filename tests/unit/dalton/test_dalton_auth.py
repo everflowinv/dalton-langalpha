@@ -1735,11 +1735,37 @@ class TestDaltonAuthRound6WriteIsolation:
     async def test_put_automation_and_schedule_helper_resolve_empty_workspace_to_caller_home_and_block_global_expire(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        from contextlib import asynccontextmanager
+        from psycopg import AsyncConnection
+        import src.dalton.autonomy.schedule as schedule_mod
         from src.dalton.app import router as dalton_router
         from src.dalton.autonomy.probes import director as director_probe
         from src.dalton.database import watch as watch_db
         from src.server.database import automation as auto_db
         from src.server.database import workspace as ws_db
+
+        lock_conn = create_autospec(AsyncConnection, instance=True)
+
+        @asynccontextmanager
+        async def _fake_tx(*args: Any, **kwargs: Any):
+            yield lock_conn
+
+        lock_conn.transaction.side_effect = _fake_tx
+
+        @asynccontextmanager
+        async def _fake_get_db_conn():
+            yield lock_conn
+
+        monkeypatch.setattr(
+            schedule_mod,
+            "get_db_connection",
+            create_autospec(schedule_mod.get_db_connection, side_effect=_fake_get_db_conn),
+        )
+        monkeypatch.setattr(
+            auto_db,
+            "lock_user_automations",
+            create_autospec(auto_db.lock_user_automations, return_value=None),
+        )
 
         ws_home_alice = "99999999-9999-9999-9999-999999999999"
         ws_bob = "22222222-2222-2222-2222-222222222222"
@@ -1760,13 +1786,18 @@ class TestDaltonAuthRound6WriteIsolation:
         mock_list_auto = create_autospec(
             auto_db.list_automations, return_value=([], 0)
         )
+        mock_list_all_auto = create_autospec(
+            auto_db.list_all_automations, return_value=[]
+        )
         mock_create_auto = create_autospec(
             auto_db.create_automation,
             return_value={"automation_id": "auto-1", "name": "dalton-director-daily"},
         )
+        monkeypatch.setenv("DALTON_PM_USER_IDS", "user-alice")
         monkeypatch.setattr(ws_db, "get_or_create_home_workspace", mock_home)
         monkeypatch.setattr(ws_db, "get_workspace", mock_get_ws)
         monkeypatch.setattr(auto_db, "list_automations", mock_list_auto)
+        monkeypatch.setattr(auto_db, "list_all_automations", mock_list_all_auto)
         monkeypatch.setattr(auto_db, "create_automation", mock_create_auto)
 
         # 1. PUT /dalton/automations/{name} with workspace_id=None resolves to caller's Home workspace

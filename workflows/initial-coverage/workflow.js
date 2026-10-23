@@ -94,6 +94,23 @@ const fix =
         { agentType: 'general-purpose', label: '修订', phase: '审稿', schema: OUT }
       )
 
+phase('自动跟踪')
+const tracking =
+  draft === null
+    ? { ok: false, skipped: true, reason: '初筛成稿未完成' }
+    : {
+        action: 'enable',
+        source: 'coverage_finish',
+        tool: 'dalton_coverage_tracking',
+        call: 'dalton_coverage_tracking(action="enable", source="coverage_finish")',
+        respect_user_pause: true,
+      }
+if (draft !== null) {
+  log(
+    `初筛完成，收尾需调用 dalton_coverage_tracking(action="enable", source="coverage_finish") 开启 ${T} 自动跟踪（若 paused_by_user 则保持关闭）`
+  )
+}
+
 return {
   ok: draft !== null,
   draft: `${W}/drafts/${D}-initial-coverage.md`,
@@ -101,4 +118,5 @@ return {
   missing,
   review_done: review !== null,
   fix_summary: fix && fix.summary,
+  tracking,
 }

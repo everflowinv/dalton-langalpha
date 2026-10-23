@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.dalton.conversation-archive</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>__REPO_ROOT__/scripts/dalton/launchd/archive_daily.sh</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>__REPO_ROOT__</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>DALTON_REPO_ROOT</key>
+        <string>__REPO_ROOT__</string>
+        <key>DALTON_REPO_PYTHON</key>
+        <string>__PYTHON_BIN__</string>
+        <key>DALTON_BRIDGE_ENV_FILE</key>
+        <string>__HOME__/.config/dalton/researchdata-bridge.env</string>
+        <key>DALTON_ARCHIVE_STATE_FILE</key>
+        <string>__HOME__/.config/dalton/conversation-archive-state.json</string>
+        <key>DALTON_ARCHIVE_STATUS_FILE</key>
+        <string>__HOME__/.cache/dalton/conversation-archive-status.json</string>
+    </dict>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>21</integer>
+        <key>Minute</key>
+        <integer>15</integer>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>__HOME__/Library/Logs/dalton-conversation-archive.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Library/Logs/dalton-conversation-archive.err.log</string>
+</dict>
+</plist>

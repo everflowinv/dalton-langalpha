@@ -67,6 +67,7 @@ autonomy:
   min_wake_usd: 0.50
   event_reserve_ratio: 0.2
   preflight_timeout_s: 45
+  data_health_timeout_s: 600
   backoff:
     base_hours: 24
     max_days: 30

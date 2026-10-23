@@ -126,6 +126,23 @@ const kp =
         { agentType: 'general-purpose', label: '知识层修订草案', phase: '修订', schema: OUT }
       )
 
+phase('自动跟踪')
+const tracking =
+  memo3 === null
+    ? { ok: false, skipped: true, reason: 'memo 未完成' }
+    : {
+        action: 'enable',
+        source: 'coverage_finish',
+        tool: 'dalton_coverage_tracking',
+        call: 'dalton_coverage_tracking(action="enable", source="coverage_finish")',
+        respect_user_pause: true,
+      }
+if (memo3 !== null) {
+  log(
+    `完整覆盖完成，收尾需调用 dalton_coverage_tracking(action="enable", source="coverage_finish") 开启 ${T} 自动跟踪（若 paused_by_user 则保持关闭）`
+  )
+}
+
 return {
   ok: memo3 !== null,
   memo: `${W}/drafts/${D}-memo.md`,
@@ -134,4 +151,5 @@ return {
   model_check: mcheck && `${R}/model-check.md`,
   knowledge_revision: kp && `${R}/knowledge-revision.json`,
   evidence_missing: evMissing,
+  tracking,
 }

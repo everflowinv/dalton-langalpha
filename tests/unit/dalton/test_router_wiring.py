@@ -16,47 +16,43 @@ from unittest.mock import create_autospec
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from psycopg import AsyncConnection, AsyncCursor
 
 from src.dalton.app import dalton_router
 from src.server.utils.api import get_current_user_id
 
 
-class _FakeCursor:
-    def __init__(self) -> None:
-        self.description = []
-        self.rowcount = 1
-
-    async def execute(self, query: str, params: Any = None) -> None:
-        return None
-
-    async def fetchone(self) -> dict[str, Any] | None:
-        return None
-
-    async def fetchall(self) -> list[dict[str, Any]]:
-        return []
-
-    async def __aenter__(self) -> "_FakeCursor":
-        return self
-
-    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
-        return False
+def _make_spec_cursor() -> Any:
+    cur = create_autospec(AsyncCursor, instance=True)
+    cur.description = []
+    cur.rowcount = 1
+    cur.execute.return_value = None
+    cur.fetchone.return_value = None
+    cur.fetchall.return_value = []
+    cur.__aenter__.return_value = cur
+    cur.__aexit__.return_value = False
+    return cur
 
 
-class _FakeConn:
-    def cursor(self, *args: Any, **kwargs: Any) -> _FakeCursor:
-        return _FakeCursor()
+def _make_spec_conn() -> Any:
+    conn = create_autospec(AsyncConnection, instance=True)
+    conn.cursor.side_effect = lambda *args, **kwargs: _make_spec_cursor()
 
     @asynccontextmanager
-    async def transaction(self):
+    async def _fake_tx(*args: Any, **kwargs: Any):
         yield
 
-    async def commit(self) -> None:
-        return None
+    conn.transaction.side_effect = _fake_tx
+    conn.commit.return_value = None
+    return conn
 
 
 @asynccontextmanager
-async def _fake_db_connection():
-    yield _FakeConn()
+async def _fake_db_connection(conn: Any = None):
+    if conn is not None:
+        yield conn
+        return
+    yield _make_spec_conn()
 
 
 class _StubLLMClient:
@@ -75,10 +71,10 @@ def client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
     # Patch DB pool at the lowest layer so real service + database functions execute
     # their imports and parameter bindings without needing a live Postgres server.
     # Every test double uses create_autospec (L33) so wrong parameter names fail immediately.
-    from ptc_agent.config.agent import CredentialSource
-    from src.server.services.llm.user_models import ModelSource
     import src.dalton.autonomy.board as board_mod
     import src.dalton.autonomy.report as report_mod
+    import src.dalton.autonomy.schedule as schedule_mod
+    import src.dalton.autonomy.system_jobs as system_jobs_mod
     import src.dalton.budget.service as budget_svc
     import src.dalton.database.budget as budget_db
     import src.dalton.database.knowledge as knowledge_db
@@ -98,9 +94,13 @@ def client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
     import src.server.database.pool as pool_mod
     import src.server.database.workspace as ws_db
     import src.server.services.llm.clients as llm_clients_mod
+    from ptc_agent.config.agent import CredentialSource
+    from src.server.services.llm.user_models import ModelSource
 
     for mod in (
         pool_mod,
+        schedule_mod,
+        auto_db,
         budget_svc,
         budget_db,
         knowledge_db,
@@ -112,12 +112,17 @@ def client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
         verdicts_db,
         board_mod,
         report_mod,
+        system_jobs_mod,
         ps_mod,
         oauth_db,
         complete_mod,
     ):
         if hasattr(mod, "get_db_connection"):
-            monkeypatch.setattr(mod, "get_db_connection", _fake_db_connection)
+            monkeypatch.setattr(
+                mod,
+                "get_db_connection",
+                create_autospec(mod.get_db_connection, side_effect=_fake_db_connection),
+            )
 
     monkeypatch.setattr(
         ws_db,
@@ -146,6 +151,38 @@ def client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
                 "automation_id": "00000000-0000-0000-0000-000000000099",
                 "name": "dalton-meta-watch",
                 "status": "active",
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        auto_db,
+        "update_automation",
+        create_autospec(
+            auto_db.update_automation,
+            return_value={
+                "automation_id": "00000000-0000-0000-0000-000000000099",
+                "name": "dalton-data-health",
+                "status": "active",
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        system_jobs_mod,
+        "_call_host_bridge",
+        create_autospec(
+            system_jobs_mod._call_host_bridge,
+            return_value=(200, {"ok": True, "status": "on", "enabled": True, "jobs": []}),
+        ),
+    )
+    monkeypatch.setattr(
+        system_jobs_mod,
+        "_trigger_automation_row_async",
+        create_autospec(
+            system_jobs_mod._trigger_automation_row_async,
+            return_value={
+                "execution_id": "00000000-0000-0000-0000-000000000077",
+                "automation_id": "00000000-0000-0000-0000-000000000099",
+                "status": "triggered",
             },
         ),
     )
@@ -315,6 +352,27 @@ def client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
         ),
         ("GET", "/api/v1/dalton/coverage/board", None),
         ("GET", "/api/v1/dalton/autonomy/report", None),
+        (
+            "GET",
+            "/api/v1/dalton/tracking/00000000-0000-0000-0000-000000000001",
+            None,
+        ),
+        (
+            "POST",
+            "/api/v1/dalton/tracking/00000000-0000-0000-0000-000000000001",
+            {"enabled": True},
+        ),
+        ("GET", "/api/v1/dalton/system-jobs", None),
+        (
+            "POST",
+            "/api/v1/dalton/system-jobs/dalton-data-health",
+            {"enabled": True},
+        ),
+        (
+            "POST",
+            "/api/v1/dalton/system-jobs/conversation-archive/run",
+            None,
+        ),
         ("GET", "/api/v1/oauth/antigravity/status", None),
         ("GET", "/api/v1/oauth/muse/status", None),
         ("GET", "/api/v1/oauth/xai/status", None),
@@ -346,10 +404,10 @@ def test_probe_provider_executes_via_dalton_complete_and_checks_pong(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """P0H §4 P1/P2/Low #6: probe endpoint resolves client with real signature, runs via dalton_complete, and requires PONG."""
-    from ptc_agent.config.agent import CredentialSource
-    from src.server.services.llm.user_models import ModelSource
     import src.dalton.llm.complete as complete_mod
     import src.server.services.llm.clients as llm_clients_mod
+    from ptc_agent.config.agent import CredentialSource
+    from src.server.services.llm.user_models import ModelSource
 
     # 1. PONG reply -> ok=True, journal recorded via complete_journal_done
     resp = client.post("/api/v1/dalton/providers/xai/probe", json={"model_key": "grok-4.7"})
@@ -515,5 +573,68 @@ def test_workspace_ownership_and_pm_guards(
         "/api/v1/dalton/knowledge/00000000-0000-0000-0000-000000000001/thesis/versions"
     )
     assert r_no_owner.status_code == 403
+
+
+def test_automation_lock_failure_returns_503_with_chinese_reason(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When acquiring the user automation advisory lock fails, endpoints return 503 with Chinese reason (never 500)."""
+    import src.dalton.autonomy.schedule as schedule_mod
+    import src.server.database.automation as auto_db
+
+    @asynccontextmanager
+    async def _failing_db_conn(conn: Any = None):
+        raise RuntimeError("Conversation database pool is not open")
+        yield  # pragma: no cover
+
+    schedule_mod.get_db_connection.side_effect = _failing_db_conn
+
+    for method, path, payload in (
+        (
+            "PUT",
+            "/api/v1/dalton/automations/dalton-meta-watch",
+            {
+                "workspace_id": "00000000-0000-0000-0000-000000000001",
+                "entry": {
+                    "trigger_type": "cron",
+                    "cron_expression": "0 7 * * 1-5",
+                    "instruction": "watch META",
+                },
+            },
+        ),
+        (
+            "POST",
+            "/api/v1/dalton/tracking/00000000-0000-0000-0000-000000000001",
+            {"enabled": True},
+        ),
+        (
+            "POST",
+            "/api/v1/dalton/system-jobs/dalton-data-health",
+            {"enabled": True},
+        ),
+    ):
+        resp = client.request(method, path, json=payload)
+        assert resp.status_code == 503, f"{method} {path} expected 503, got {resp.status_code}: {resp.text}"
+        detail = resp.json().get("detail", "")
+        assert "获取用户自动任务并发锁失败" in detail
+
+    # Also verify failure inside pg_advisory_xact_lock (lock_user_automations) returns 503 with Chinese reason
+    schedule_mod.get_db_connection.side_effect = _fake_db_connection
+    monkeypatch.setattr(
+        auto_db,
+        "lock_user_automations",
+        create_autospec(
+            auto_db.lock_user_automations,
+            side_effect=RuntimeError("pg_advisory_xact_lock failed"),
+        ),
+    )
+    resp_lock = client.post(
+        "/api/v1/dalton/tracking/00000000-0000-0000-0000-000000000001",
+        json={"enabled": False},
+    )
+    assert resp_lock.status_code == 503
+    assert "获取用户自动任务并发锁失败" in resp_lock.json().get("detail", "")
+
 
 

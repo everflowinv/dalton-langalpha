@@ -155,6 +155,7 @@ async def create_automation(
     max_failures: int = 3,
     delivery_config: Optional[Dict[str, Any]] = None,
     metadata: Optional[Dict[str, Any]] = None,
+    status: str = "active",  # DALTON-HOOK(coverage-tracking)
     conn=None,
 ) -> Dict[str, Any]:
     """Create a new automation.
@@ -191,7 +192,7 @@ async def create_automation(
                             %s,
                             %s, %s, %s, %s,
                             %s, %s,
-                            'active', %s, 0,
+                            %s, %s, 0,
                             %s, %s,
                             NOW(), NOW()
                         )
@@ -204,6 +205,7 @@ async def create_automation(
                         instruction, workspace_id, llm_model,
                         Json(additional_context) if additional_context else None,
                         thread_strategy, conversation_thread_id,
+                        status or "active",  # DALTON-HOOK(coverage-tracking)
                         max_failures,
                         Json(delivery_config or {}),
                         Json(metadata or {}),

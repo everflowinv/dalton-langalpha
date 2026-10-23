@@ -1,11 +1,15 @@
+# ruff: noqa: BLE001, S110
 """Automation naming, templates, and idempotent scheduling helpers for Dalton (PK.15)."""
 
 from __future__ import annotations
 
+import asyncio
+import contextvars
 import logging
 import re
-from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
+from contextlib import asynccontextmanager
+from datetime import UTC, datetime, timedelta
+from typing import Any
 from zoneinfo import ZoneInfo
 
 from src.dalton.auth import (
@@ -13,13 +17,90 @@ from src.dalton.auth import (
     verify_workspace_access,
 )
 from src.dalton.settings import get_dalton_settings
+from src.server.database.pool import get_db_connection
 
 logger = logging.getLogger(__name__)
 
 DALTON_NAME_RE = re.compile(r"^dalton-[a-z0-9][a-z0-9._-]{1,62}$")
 
+_inproc_user_locks: dict[str, asyncio.Lock] = {}
+_held_user_locks: contextvars.ContextVar[frozenset[tuple[int, str]]] = contextvars.ContextVar(
+    "_held_user_locks", default=frozenset()
+)
+_held_user_conn: contextvars.ContextVar[dict[tuple[int, str], Any] | None] = contextvars.ContextVar(
+    "_held_user_conn", default=None
+)
 
-def validate_automation_name(name: str, ticker: Optional[str] = None) -> tuple[bool, Optional[str]]:
+
+class AutomationLockError(RuntimeError):
+    """Raised when acquiring the user automation advisory lock fails."""
+
+
+@asynccontextmanager
+async def user_automations_lock(user_id: str, *, conn: Any = None):
+    """Serialize read-modify-write on a user's automations via ``auto_db.lock_user_automations``."""
+    from src.server.database import automation as auto_db
+
+    uid = str(user_id or "").strip()
+    if conn is not None or not uid:
+        yield conn
+        return
+
+    task = asyncio.current_task()
+    task_key = (id(task) if task is not None else 0, uid)
+    held = _held_user_locks.get()
+    if task_key in held:
+        conn_map = _held_user_conn.get() or {}
+        yield conn_map.get(task_key)
+        return
+
+    inproc_lock = _inproc_user_locks.setdefault(uid, asyncio.Lock())
+    lock_acquired = False
+    try:
+        async with inproc_lock, get_db_connection() as db_conn, db_conn.transaction():
+            await auto_db.lock_user_automations(uid, conn=db_conn)
+            lock_acquired = True
+            tok_held = _held_user_locks.set(held | {task_key})
+            prev_map = dict(_held_user_conn.get() or {})
+            prev_map[task_key] = db_conn
+            tok_conn = _held_user_conn.set(prev_map)
+            try:
+                yield db_conn
+            finally:
+                _held_user_conn.reset(tok_conn)
+                _held_user_locks.reset(tok_held)
+    except Exception as exc:
+        if not lock_acquired:
+            raise AutomationLockError(f"获取用户自动任务并发锁失败：{exc}") from exc
+        raise
+
+
+async def list_all_user_automations(
+    user_id: str,
+    *,
+    name_prefix: str | None = None,
+    conn: Any = None,
+) -> list[dict[str, Any]]:
+    """Fetch all automations for ``user_id`` via ``auto_db.list_all_automations``, optionally filtered by ``name_prefix``."""
+    from src.server.database import automation as auto_db
+
+    uid = str(user_id or "").strip()
+    if not uid:
+        return []
+
+    raw_rows = await auto_db.list_all_automations(uid, conn=conn)
+    rows = [dict(r) for r in (raw_rows or []) if isinstance(r, dict)]
+    if name_prefix:
+        pfx = name_prefix.strip().lower()
+        rows = [
+            r
+            for r in rows
+            if str(r.get("name") or "").strip().lower().startswith(pfx)
+        ]
+    return rows
+
+
+def validate_automation_name(name: str, ticker: str | None = None) -> tuple[bool, str | None]:
     """Validate that an automation name follows the `dalton-*` convention.
 
     If ``ticker`` is provided (analyst workspace), the name must start with
@@ -40,7 +121,7 @@ def build_company_watch_specs(
     ticker: str,
     workspace_id: str,
     tier: str = "Core",
-    timezone_name: Optional[str] = None,
+    timezone_name: str | None = None,
 ) -> list[dict[str, Any]]:
     """Return the standard automation definitions for a covered company (PK.15 / A13)."""
     t_upper = ticker.upper()
@@ -183,7 +264,7 @@ def build_earnings_window_specs(
     workspace_id: str,
     period: str,
     report_at: datetime | str,
-    timezone_name: Optional[str] = None,
+    timezone_name: str | None = None,
 ) -> list[dict[str, Any]]:
     """Build T-3d preview, T+0 flash, and T+1d deep-update one-shot automations for an earnings release."""
     tz = timezone_name or get_dalton_settings().autonomy.timezone
@@ -191,12 +272,12 @@ def build_earnings_window_specs(
     t_lower = ticker.lower()
     p_slug = re.sub(r"[^a-z0-9]+", "", period.lower()) or "next"
     if isinstance(report_at, str):
-        report_at = datetime.fromisoformat(report_at.replace("Z", "+00:00"))
+        report_at = datetime.fromisoformat(report_at)
     if report_at.tzinfo is None:
         try:
             report_at = report_at.replace(tzinfo=ZoneInfo(tz))
         except Exception:
-            report_at = report_at.replace(tzinfo=timezone.utc)
+            report_at = report_at.replace(tzinfo=UTC)
     else:
         try:
             report_at = report_at.astimezone(ZoneInfo(tz))
@@ -270,7 +351,7 @@ def build_earnings_window_specs(
 
 def build_global_director_specs(
     *,
-    timezone_name: Optional[str] = None,
+    timezone_name: str | None = None,
 ) -> list[dict[str, Any]]:
     """Build Home-level automations: earnings calendar scan, daily director, weekly director (PK.15/PK.19/A13)."""
     tz = timezone_name or get_dalton_settings().autonomy.timezone
@@ -328,19 +409,35 @@ def build_global_director_specs(
                 "dalton_kind": "director_weekly",
             },
         },
+        {
+            "name": "dalton-data-health",
+            "description": "Dalton 数据地图每日体检（零 token 预检直接写库，不唤醒智能体）",
+            "trigger_type": "cron",
+            "cron_expression": "0 7 * * *",
+            "timezone": tz,
+            "workspace_id": None,
+            "thread_strategy": "new",
+            "instruction": "执行数据源与数据地图每日体检（由 preflight 零 token 直接完成并跳过唤醒）。",
+            "metadata": {
+                "dalton_managed": True,
+                "dalton_kind": "data_health",
+            },
+        },
     ]
 
 
 async def schedule_dalton_automation_helper(
-    name: Optional[str] = None,
-    spec: Optional[dict[str, Any]] = None,
+    name: str | None = None,
+    spec: dict[str, Any] | None = None,
     *,
     user_id: str,
-    workspace_id: Optional[str] = None,
-    entry: Optional[dict[str, Any]] = None,
-    ticker: Optional[str] = None,
+    workspace_id: str | None = None,
+    caller_workspace_id: str | None = None,
+    entry: dict[str, Any] | None = None,
+    ticker: str | None = None,
     role: str = "chief_of_staff",
-    action: Optional[str] = None,
+    action: str | None = None,
+    conn: Any = None,
 ) -> dict[str, Any]:
     """Idempotently create, update, pause, resume, or list Dalton (`dalton-*`) automations (G4.5).
 
@@ -352,16 +449,50 @@ async def schedule_dalton_automation_helper(
         raise ValueError("user_id is required")
     user_id = str(user_id).strip()
     from src.server.database import automation as auto_db
+    from src.server.database.home_workspace import is_home_row
 
     merged_spec: dict[str, Any] = dict(spec or entry or {})
     resolved_action = str(action or merged_spec.get("action") or "upsert").strip().lower()
     resolved_name = str(name or merged_spec.get("name") or "").strip()
     raw_ws = workspace_id if workspace_id is not None else merged_spec.get("workspace_id")
     ws_id_str = str(raw_ws or "").strip()
+    home_job_names = {str(s["name"]) for s in build_global_director_specs()}
+
+    if role != "chief_of_staff":
+        if caller_workspace_id is not None:
+            caller_ws = str(caller_workspace_id or "").strip()
+            if not caller_ws or caller_ws.lower() == "home":
+                return {
+                    "ok": False,
+                    "error": "forbidden_workspace",
+                    "message": "公司分析师必须在当前公司工作区内调用此工具。",
+                }
+            if ws_id_str and ws_id_str != caller_ws:
+                if ws_id_str.lower() == "home":
+                    return {
+                        "ok": False,
+                        "error": "forbidden_scope",
+                        "message": "公司分析师只能操作当前工作区的任务，禁止操作 Home 全局任务。",
+                    }
+                return {
+                    "ok": False,
+                    "error": "forbidden_workspace",
+                    "message": "公司分析师只能操作当前工作区的任务，禁止跨工作区操作。",
+                }
+            ws_id_str = caller_ws
+        if resolved_action != "list" and (not ws_id_str or ws_id_str.lower() == "home"):
+            return {
+                "ok": False,
+                "error": "forbidden_scope",
+                "message": "公司分析师只能操作当前工作区的任务，禁止操作 Home 全局任务。",
+            }
+
+    is_home_target = False
+    ws_row: dict[str, Any] | None = None
     if resolved_action == "list":
         if ws_id_str and ws_id_str.lower() != "home":
-            await verify_workspace_access(ws_id_str, user_id)
-            ws_id: Optional[str] = ws_id_str
+            ws_row = await verify_workspace_access(ws_id_str, user_id)
+            ws_id: str | None = ws_id_str
         elif ws_id_str.lower() == "home":
             ws_id = await resolve_caller_home_workspace_id(user_id)
         else:
@@ -369,16 +500,23 @@ async def schedule_dalton_automation_helper(
     else:
         if not ws_id_str or ws_id_str.lower() == "home":
             ws_id = await resolve_caller_home_workspace_id(user_id)
+            is_home_target = True
         else:
-            await verify_workspace_access(ws_id_str, user_id)
+            ws_row = await verify_workspace_access(ws_id_str, user_id)
             ws_id = ws_id_str
+            is_home_target = bool(
+                isinstance(ws_row, dict)
+                and (is_home_row(ws_row) or ws_row.get("is_home"))
+            )
+
     tz = str(merged_spec.get("timezone") or merged_spec.get("timezone_name") or get_dalton_settings().autonomy.timezone)
     resolved_ticker = ticker or (merged_spec.get("metadata") or {}).get("ticker") or merged_spec.get("ticker")
 
     if resolved_action == "list":
-        rows, _ = await auto_db.list_automations(
-            user_id=user_id,
-            limit=100,
+        rows = await list_all_user_automations(
+            user_id,
+            name_prefix="dalton-",
+            conn=conn,
         )
         dalton_rows = [
             {
@@ -398,6 +536,51 @@ async def schedule_dalton_automation_helper(
     if not resolved_name:
         return {"ok": False, "error": "缺少自动任务名称 `name`。"}
 
+    if resolved_name in home_job_names:
+        is_home_target = True
+
+    if is_home_target:
+        if role != "chief_of_staff":
+            return {
+                "ok": False,
+                "error": "forbidden_scope",
+                "message": "公司分析师只能操作当前工作区的任务，禁止操作 Home 全局任务。",
+            }
+        from src.dalton.autonomy.system_jobs import is_pm_user
+
+        if not is_pm_user(user_id):
+            return {
+                "ok": False,
+                "error": "forbidden_pm",
+                "message": "只有 PM 用户可以修改或启停 Home 全局任务。",
+            }
+    elif role != "chief_of_staff":
+        from src.dalton.autonomy.tracking import _resolve_workspace_ticker
+
+        ws_ticker = ""
+        if ws_id:
+            try:
+                ws_ticker = str(await _resolve_workspace_ticker(ws_id) or "").strip().upper()
+            except Exception:
+                return {
+                    "ok": False,
+                    "error": "forbidden_workspace",
+                    "message": f"无法解析当前工作区（{ws_id}）对应的公司 ticker，拒绝操作。",
+                }
+        if not ws_ticker:
+            return {
+                "ok": False,
+                "error": "forbidden_workspace",
+                "message": f"无法解析当前工作区（{ws_id}）对应的公司 ticker，拒绝操作。",
+            }
+        if resolved_ticker and str(resolved_ticker).strip().upper() != ws_ticker:
+            return {
+                "ok": False,
+                "error": "forbidden_workspace",
+                "message": f"公司分析师只能操作当前工作区（{ws_ticker}）的任务，禁止操作 {resolved_ticker}。",
+            }
+        resolved_ticker = ws_ticker
+
     valid, err_msg = validate_automation_name(
         resolved_name,
         ticker=str(resolved_ticker) if (resolved_ticker and role != "chief_of_staff") else None,
@@ -405,120 +588,176 @@ async def schedule_dalton_automation_helper(
     if not valid:
         return {"ok": False, "error": err_msg}
 
-    rows, _ = await auto_db.list_automations(user_id=user_id, limit=200)
-    existing = next(
-        (
-            r
-            for r in rows
-            if r.get("name") == resolved_name
-            and (not ws_id or not r.get("workspace_id") or str(r.get("workspace_id")) == str(ws_id))
-        ),
-        None,
+    name_prefix = (
+        f"dalton-{str(resolved_ticker).lower()}-"
+        if resolved_ticker and resolved_name.startswith(f"dalton-{str(resolved_ticker).lower()}-")
+        else resolved_name
     )
 
-    if resolved_action in ("pause", "resume"):
-        if not existing:
-            return {"ok": False, "error": f"未找到任务 `{resolved_name}`"}
-        new_status = "paused" if resolved_action == "pause" else "active"
-        updated = await auto_db.update_automation(
-            str(existing["automation_id"]),
+    async with user_automations_lock(user_id, conn=conn) as active_conn:
+        conn_kw = {"conn": active_conn} if active_conn is not None else {}
+        rows = await list_all_user_automations(
             user_id,
-            status=new_status,
+            name_prefix=name_prefix,
+            conn=active_conn,
+        )
+        existing = next(
+            (
+                r
+                for r in rows
+                if r.get("name") == resolved_name
+                and (
+                    (not ws_id or not r.get("workspace_id") or str(r.get("workspace_id")) == str(ws_id))
+                    if is_home_target or role == "chief_of_staff"
+                    else str(r.get("workspace_id") or "") == str(ws_id)
+                )
+            ),
+            None,
+        )
+        if existing is not None and not is_home_target:
+            existing_ws = str(existing.get("workspace_id") or "").strip()
+            if not existing_ws or str(existing.get("name") or "") in home_job_names:
+                if role != "chief_of_staff":
+                    return {
+                        "ok": False,
+                        "error": "forbidden_scope",
+                        "message": "公司分析师只能操作当前工作区的任务，禁止操作 Home 全局任务。",
+                    }
+                from src.dalton.autonomy.system_jobs import is_pm_user
+
+                if not is_pm_user(user_id):
+                    return {
+                        "ok": False,
+                        "error": "forbidden_pm",
+                        "message": "只有 PM 用户可以修改或启停 Home 全局任务。",
+                    }
+
+        if resolved_action in ("pause", "resume"):
+            if not existing:
+                return {"ok": False, "error": f"未找到任务 `{resolved_name}`"}
+            new_status = "paused" if resolved_action == "pause" else "active"
+            updated = await auto_db.update_automation(
+                str(existing["automation_id"]),
+                user_id,
+                status=new_status,
+                **conn_kw,
+            )
+            return {
+                "ok": True,
+                "action": resolved_action,
+                "automation_id": str((updated or existing).get("automation_id")),
+                "name": resolved_name,
+                "status": new_status,
+            }
+
+        if resolved_action != "upsert":
+            return {"ok": False, "error": f"不支持的 action: {resolved_action}"}
+
+        instruction = merged_spec.get("instruction") or merged_spec.get("prompt")
+        if not instruction and not existing:
+            return {"ok": False, "error": "新建任务必须提供 `instruction`。"}
+
+        next_run_raw = merged_spec.get("next_run_at") or merged_spec.get("run_at")
+        next_dt: datetime | None = None
+        if isinstance(next_run_raw, datetime):
+            next_dt = next_run_raw
+        elif isinstance(next_run_raw, str) and next_run_raw.strip():
+            next_dt = datetime.fromisoformat(next_run_raw.strip())
+        if next_dt is not None and next_dt.tzinfo is None:
+            try:
+                next_dt = next_dt.replace(tzinfo=ZoneInfo(tz))
+            except Exception:
+                next_dt = next_dt.replace(tzinfo=UTC)
+
+        explicit_status = str(merged_spec.get("status") or "").strip().lower()
+        cron_for_next = merged_spec.get("cron_expression") or merged_spec.get("cron")
+        trigger_for_next = str(merged_spec.get("trigger_type") or ("cron" if cron_for_next else "once"))
+        if next_dt is None and trigger_for_next == "cron" and cron_for_next and explicit_status != "paused":
+            # The scheduler only claims rows with a non-null next_run_at; a cron job created
+            # without one never fires. Compute it the same way the upstream API does.
+            from src.server.services.automation_scheduler import AutomationScheduler
+
+            next_dt = AutomationScheduler.calculate_first_run(str(cron_for_next), tz or "UTC")
+
+        description = merged_spec.get("description")
+        cron_expression = merged_spec.get("cron_expression") or merged_spec.get("cron")
+        trigger_type = str(merged_spec.get("trigger_type") or ("cron" if cron_expression else "once"))
+        trigger_config = merged_spec.get("trigger_config")
+        meta = dict(merged_spec.get("metadata") or {})
+        meta.setdefault("dalton_managed", True)
+        if resolved_ticker and not meta.get("ticker"):
+            meta["ticker"] = str(resolved_ticker).upper()
+
+        if existing:
+            existing_meta = (
+                dict(existing.get("metadata") or {})
+                if isinstance(existing.get("metadata"), dict)
+                else {}
+            )
+            merged_meta = {**existing_meta, **meta}
+            for mk, mv in list(merged_meta.items()):
+                if mv is None:
+                    merged_meta.pop(mk, None)
+
+            existing_is_paused = str(existing.get("status") or "").strip().lower() == "paused"
+            patch: dict[str, Any] = {}
+            if instruction is not None:
+                patch["instruction"] = instruction
+            if description is not None:
+                patch["description"] = description
+            if cron_expression is not None:
+                patch["cron_expression"] = cron_expression
+            if tz:
+                patch["timezone"] = tz
+            if trigger_config is not None:
+                patch["trigger_config"] = trigger_config
+            if explicit_status == "paused":
+                patch["next_run_at"] = None
+            elif next_dt is not None and (not existing_is_paused or explicit_status == "active"):
+                patch["next_run_at"] = next_dt
+            if merged_meta:
+                patch["metadata"] = merged_meta
+            if explicit_status:
+                patch["status"] = explicit_status
+            updated = await auto_db.update_automation(
+                str(existing["automation_id"]),
+                user_id,
+                **conn_kw,
+                **patch,
+            )
+            return {
+                "ok": True,
+                "action": "updated",
+                "automation_id": str((updated or existing).get("automation_id")),
+                "name": resolved_name,
+            }
+
+        clean_meta = {k: v for k, v in meta.items() if v is not None}
+        create_kw: dict[str, Any] = dict(conn_kw)
+        if explicit_status and explicit_status != "active":
+            create_kw["status"] = explicit_status
+        created = await auto_db.create_automation(
+            user_id=user_id,
+            name=resolved_name,
+            description=description,
+            trigger_type=trigger_type,
+            cron_expression=cron_expression,
+            timezone=tz,
+            trigger_config=trigger_config,
+            next_run_at=None if explicit_status == "paused" else next_dt,
+            instruction=instruction or "",
+            workspace_id=ws_id,
+            llm_model=merged_spec.get("llm_model"),
+            additional_context=merged_spec.get("additional_context"),
+            thread_strategy=str(merged_spec.get("thread_strategy") or "new"),
+            conversation_thread_id=merged_spec.get("conversation_thread_id"),
+            delivery_config=merged_spec.get("delivery_config"),
+            metadata=clean_meta,
+            **create_kw,
         )
         return {
             "ok": True,
-            "action": resolved_action,
-            "automation_id": str((updated or existing).get("automation_id")),
-            "name": resolved_name,
-            "status": new_status,
-        }
-
-    if resolved_action != "upsert":
-        return {"ok": False, "error": f"不支持的 action: {resolved_action}"}
-
-    instruction = merged_spec.get("instruction") or merged_spec.get("prompt")
-    if not instruction and not existing:
-        return {"ok": False, "error": "新建任务必须提供 `instruction`。"}
-
-    next_run_raw = merged_spec.get("next_run_at") or merged_spec.get("run_at")
-    next_dt: Optional[datetime] = None
-    if isinstance(next_run_raw, datetime):
-        next_dt = next_run_raw
-    elif isinstance(next_run_raw, str) and next_run_raw.strip():
-        next_dt = datetime.fromisoformat(next_run_raw.strip().replace("Z", "+00:00"))
-    if next_dt is not None and next_dt.tzinfo is None:
-        try:
-            next_dt = next_dt.replace(tzinfo=ZoneInfo(tz))
-        except Exception:
-            next_dt = next_dt.replace(tzinfo=timezone.utc)
-
-    cron_for_next = merged_spec.get("cron_expression") or merged_spec.get("cron")
-    trigger_for_next = str(merged_spec.get("trigger_type") or ("cron" if cron_for_next else "once"))
-    if next_dt is None and trigger_for_next == "cron" and cron_for_next:
-        # The scheduler only claims rows with a non-null next_run_at; a cron job created
-        # without one never fires. Compute it the same way the upstream API does.
-        from src.server.services.automation_scheduler import AutomationScheduler
-
-        next_dt = AutomationScheduler.calculate_first_run(str(cron_for_next), tz or "UTC")
-
-    description = merged_spec.get("description")
-    cron_expression = merged_spec.get("cron_expression") or merged_spec.get("cron")
-    trigger_type = str(merged_spec.get("trigger_type") or ("cron" if cron_expression else "once"))
-    trigger_config = merged_spec.get("trigger_config")
-    meta = dict(merged_spec.get("metadata") or {})
-    meta.setdefault("dalton_managed", True)
-    if resolved_ticker and not meta.get("ticker"):
-        meta["ticker"] = str(resolved_ticker).upper()
-
-    if existing:
-        patch: dict[str, Any] = {}
-        if instruction is not None:
-            patch["instruction"] = instruction
-        if description is not None:
-            patch["description"] = description
-        if cron_expression is not None:
-            patch["cron_expression"] = cron_expression
-        if tz:
-            patch["timezone"] = tz
-        if trigger_config is not None:
-            patch["trigger_config"] = trigger_config
-        if next_dt is not None:
-            patch["next_run_at"] = next_dt
-        if meta:
-            patch["metadata"] = meta
-        updated = await auto_db.update_automation(
-            str(existing["automation_id"]),
-            user_id,
-            **patch,
-        )
-        return {
-            "ok": True,
-            "action": "updated",
-            "automation_id": str((updated or existing).get("automation_id")),
+            "action": "created",
+            "automation_id": str(created.get("automation_id")),
             "name": resolved_name,
         }
-
-    created = await auto_db.create_automation(
-        user_id=user_id,
-        name=resolved_name,
-        description=description,
-        trigger_type=trigger_type,
-        cron_expression=cron_expression,
-        timezone=tz,
-        trigger_config=trigger_config,
-        next_run_at=next_dt,
-        instruction=instruction or "",
-        workspace_id=ws_id,
-        llm_model=merged_spec.get("llm_model"),
-        additional_context=merged_spec.get("additional_context"),
-        thread_strategy=str(merged_spec.get("thread_strategy") or "new"),
-        conversation_thread_id=merged_spec.get("conversation_thread_id"),
-        delivery_config=merged_spec.get("delivery_config"),
-        metadata=meta,
-    )
-    return {
-        "ok": True,
-        "action": "created",
-        "automation_id": str(created.get("automation_id")),
-        "name": resolved_name,
-    }

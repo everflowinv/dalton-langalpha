@@ -215,6 +215,10 @@ _SECRET_KEY_NAME_RE = re.compile(
 
 _STDERR_SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (
+        re.compile(r"(?im)^([^\r\n]*?\b(?:set-)?cookie\s*:\s*)[^\r\n]+$"),
+        r"\1[REDACTED]",
+    ),
+    (
         re.compile(
             r"""(?i)(['"]?[A-Za-z0-9_.\-]*(?:api[_-]?key|apikey|token|secret|password|passwd|cookie|set-cookie|authorization|proxy-authorization|x-api-key|auth|credential|session[_-]?id|xq_[a-z0-9_]+)[A-Za-z0-9_.\-]*['"]?\s*[:=]\s*)(['"])(?:\\.|(?!\2).)*\2"""
         ),
@@ -243,6 +247,13 @@ _STDERR_SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\b(ghp_[A-Za-z0-9_\-]{8,})\b"), "[REDACTED]"),
     (re.compile(r"\b(github_pat_[A-Za-z0-9_\-]{8,})\b"), "[REDACTED]"),
     (re.compile(r"://[^/\s:@]+:[^/\s@]+@"), "://[REDACTED]@"),
+    (re.compile(r"\b[0-9a-fA-F]{40,}\b"), "[REDACTED]"),
+    (
+        re.compile(
+            r"(?<![A-Za-z0-9_.\-/])(?=[A-Za-z0-9+/_-]*[A-Za-z0-9])[A-Za-z0-9+/_-]{40,}={0,2}(?![A-Za-z0-9_.\-/])"
+        ),
+        "[REDACTED]",
+    ),
 )
 
 
@@ -479,14 +490,48 @@ CN_LEVERAGE_KEY_COLUMNS: tuple[str, ...] = (
     "crowding_score",
 )
 
-_LOCAL_PATH_RE = re.compile(r"/Users/[^\s,;:\"')\]>]+")
+_LOCAL_PATH_RE = re.compile(r"/(?:Users|private|opt|tmp|var)/[^\s,;:\"')\]>]+")
 
 
 def _scrub_local_paths(text: Any) -> str:
-    """Replace host absolute paths starting with `/Users/` with `<local>`."""
+    """Replace host absolute paths starting with `/Users/`, `/private/`, `/opt/`, `/tmp/`, or `/var/` with `<local>`."""
     if text is None:
         return ""
     return _LOCAL_PATH_RE.sub("<local>", str(text)).strip()
+
+
+def _atomic_write_json_locked(path: Path, payload: dict[str, Any], *, label: str = "state") -> bool:
+    """Atomically write JSON via a unique temp file + rename under an ``fcntl.flock`` lock."""
+    import fcntl
+
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = path.with_name(f"{path.name}.lock")
+        tmp_path = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
+        with lock_path.open("a+", encoding="utf-8") as lock_fh:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+            try:
+                tmp_path.write_text(
+                    json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+                os.replace(tmp_path, path)
+            finally:
+                try:
+                    if tmp_path.exists():
+                        tmp_path.unlink()
+                except Exception:
+                    pass
+                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+        return True
+    except Exception as exc:
+        logger.warning(
+            "Failed writing %s file %s: %s",
+            label,
+            _scrub_local_paths(str(path)),
+            type(exc).__name__,
+        )
+        return False
 
 MARKET_REGIME_CATALOG_ENTRY: dict[str, Any] = {
     "id": "market-regime",
@@ -923,6 +968,62 @@ class BridgeConfig:
                 os.path.expanduser("~/.cache/dalton/bridge-usage.json"),
             )
         )
+        self.archive_state_file: Path = Path(
+            os.environ.get(
+                "DALTON_ARCHIVE_STATE_FILE",
+                os.path.expanduser("~/.config/dalton/conversation-archive-state.json"),
+            )
+        ).expanduser()
+        self.archive_status_file: Path = Path(
+            os.environ.get(
+                "DALTON_ARCHIVE_STATUS_FILE",
+                os.path.expanduser("~/.cache/dalton/conversation-archive-status.json"),
+            )
+        ).expanduser()
+        self.archive_log_file: Path = Path(
+            os.environ.get(
+                "DALTON_ARCHIVE_LOG_FILE",
+                os.path.expanduser("~/Library/Logs/dalton-conversation-archive.log"),
+            )
+        ).expanduser()
+        self.archive_err_log_file: Path = Path(
+            os.environ.get(
+                "DALTON_ARCHIVE_ERR_LOG_FILE",
+                os.path.expanduser("~/Library/Logs/dalton-conversation-archive.err.log"),
+            )
+        ).expanduser()
+        self.conversation_archive_py: Path = Path(
+            os.environ.get(
+                "DALTON_CONVERSATION_ARCHIVE_PY",
+                str(_SCRIPT_DIR / "conversation_archive.py"),
+            )
+        ).expanduser().resolve()
+        self.repo_python: Path = Path(
+            os.environ.get(
+                "DALTON_REPO_PYTHON",
+                str(_SCRIPT_DIR.parents[1] / ".venv" / "bin" / "python"),
+            )
+        ).expanduser()
+        try:
+            self.archive_startup_probe_s: float = max(
+                0.05,
+                float(os.environ.get("DALTON_ARCHIVE_STARTUP_PROBE_S", "0.5") or 0.5),
+            )
+        except ValueError:
+            self.archive_startup_probe_s = 0.5
+        try:
+            self.archive_run_timeout_s: float = max(
+                1.0,
+                float(os.environ.get("DALTON_ARCHIVE_RUN_TIMEOUT_S", "10800") or 10800.0),
+            )
+        except ValueError:
+            self.archive_run_timeout_s = 10800.0
+        self.ops_status_file: Path = Path(
+            os.environ.get(
+                "DALTON_OPS_STATUS_FILE",
+                os.path.expanduser("~/.cache/dalton/ops-jobs-status.json"),
+            )
+        ).expanduser()
         self.test_mode: bool = os.environ.get("DALTON_BRIDGE_TEST_MODE", "0").strip().lower() in (
             "1",
             "true",
@@ -1613,6 +1714,10 @@ class ResearchDataBridge:
         self._resolved_embed_dims: int | None = None
         self._file_cache: dict[str, tuple[int, int, Any]] = {}
         self._xreach_version_cache: tuple[float, dict[str, Any]] | None = None
+        self._archive_run_lock = asyncio.Lock()
+        self._archive_proc: Any = None
+        self._archive_watch_task: asyncio.Task[Any] | None = None
+        self._archive_last_status: dict[str, Any] = {}
 
     def handoff_routes(self) -> set[str]:
         """Return route IDs whose `kind` is `agent_tool` or `skill` in `data_sources.json`, excluding bridge-executed community routes."""
@@ -4907,6 +5012,702 @@ class ResearchDataBridge:
             "error": err_msg,
         }
 
+    def read_archive_enabled(self) -> bool:
+        """Read whether daily conversation-archive schedule is enabled from bridge state file (default True)."""
+        path = self.cfg.archive_state_file
+        if not path.is_file():
+            return True
+        try:
+            raw = path.read_text(encoding="utf-8").strip()
+            if not raw:
+                return True
+            if raw.lower() in ("false", "0", "off", "disabled"):
+                return False
+            if raw.lower() in ("true", "1", "on", "enabled"):
+                return True
+            data = json.loads(raw)
+            if isinstance(data, dict) and "enabled" in data:
+                return bool(data["enabled"])
+        except Exception as exc:
+            logger.warning("Failed reading archive state file: %s", type(exc).__name__)
+        return True
+
+    def write_archive_enabled(self, enabled: bool) -> dict[str, Any]:
+        """Atomically persist conversation-archive schedule state file."""
+        path = self.cfg.archive_state_file
+        payload = {
+            "enabled": bool(enabled),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if not _atomic_write_json_locked(path, payload, label="archive_state"):
+            raise OSError("写入宿主机归档开关状态文件失败")
+        return payload
+
+    def _compute_next_archive_run_at(
+        self,
+        *,
+        enabled: bool,
+        now: datetime | None = None,
+    ) -> str | None:
+        """Compute next daily 21:15 (`Asia/Shanghai`) run timestamp when enabled, else None."""
+        if not enabled:
+            return None
+        try:
+            tz = ZoneInfo("Asia/Shanghai")
+        except Exception:
+            tz = timezone.utc
+        cur = (now or datetime.now(tz)).astimezone(tz)
+        candidate = cur.replace(hour=21, minute=15, second=0, microsecond=0)
+        if candidate <= cur:
+            candidate = candidate + timedelta(days=1)
+        return candidate.isoformat()
+
+    def _archive_pid_files(self) -> list[Path]:
+        """Return PID file path(s) in the same directory as the archive status/state files."""
+        explicit = os.environ.get("DALTON_ARCHIVE_PID_FILE", "").strip()
+        if explicit:
+            return [Path(explicit).expanduser()]
+        paths: list[Path] = []
+        for parent in (self.cfg.archive_status_file.parent, self.cfg.archive_state_file.parent):
+            cand = parent / "conversation-archive.pid"
+            if cand not in paths:
+                paths.append(cand)
+        return paths
+
+    def _archive_lock_file(self) -> Path:
+        """Return the shared flock lock file in the same directory as the archive status file."""
+        status_path = self.cfg.archive_status_file
+        return status_path.with_name(f"{status_path.name}.lock")
+
+    @staticmethod
+    def _pid_is_alive(pid: int) -> bool:
+        if pid <= 0:
+            return False
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return False
+
+    def _write_archive_pid_file(self, pid: int | None) -> str:
+        """Atomically check for an active PID and write ``pid`` under the shared status-dir ``flock``.
+
+        Returns:
+            ``"written"`` when ``pid`` was persisted, ``"already_running"`` when a live process
+            holds the PID file, or ``"error"`` when locking or writing the PID file fails.
+        """
+        import fcntl
+
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+            return "error"
+        lock_path = self._archive_lock_file()
+        try:
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            with lock_path.open("a+", encoding="utf-8") as lock_fh:
+                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+                try:
+                    for p in self._archive_pid_files():
+                        if not p.is_file():
+                            continue
+                        try:
+                            raw = p.read_text(encoding="utf-8").strip()
+                            existing_pid = int(raw)
+                            if existing_pid != pid and self._pid_is_alive(existing_pid):
+                                return "already_running"
+                        except Exception:
+                            pass
+                    for p in self._archive_pid_files():
+                        p.parent.mkdir(parents=True, exist_ok=True)
+                        tmp_p = p.with_name(f".{p.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
+                        tmp_p.write_text(f"{pid}\n", encoding="utf-8")
+                        os.replace(tmp_p, p)
+                    return "written"
+                finally:
+                    fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+        except Exception as exc:
+            logger.warning("Failed writing archive pid file: %s", type(exc).__name__)
+            return "error"
+
+    def _remove_archive_pid_file(self, *, expected_pid: int | None = None) -> None:
+        """Remove PID file(s) under the shared ``flock`` only when owned by ``expected_pid`` (or dead)."""
+        import fcntl
+
+        lock_path = self._archive_lock_file()
+        try:
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            with lock_path.open("a+", encoding="utf-8") as lock_fh:
+                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+                try:
+                    for p in self._archive_pid_files():
+                        if not p.is_file():
+                            continue
+                        try:
+                            raw = p.read_text(encoding="utf-8").strip()
+                            if expected_pid is not None:
+                                if raw.isdigit() and int(raw) != int(expected_pid):
+                                    continue
+                            elif raw.isdigit() and self._pid_is_alive(int(raw)):
+                                continue
+                            p.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                finally:
+                    fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
+
+    def _is_archive_proc_running(self) -> bool:
+        """Check whether an archive process is alive under the shared status-dir ``flock``."""
+        import fcntl
+
+        proc = self._archive_proc
+        if proc is not None and getattr(proc, "returncode", None) is None:
+            return True
+        lock_path = self._archive_lock_file()
+        try:
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            with lock_path.open("a+", encoding="utf-8") as lock_fh:
+                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+                try:
+                    for p in self._archive_pid_files():
+                        if not p.is_file():
+                            continue
+                        try:
+                            raw = p.read_text(encoding="utf-8").strip()
+                            pid = int(raw)
+                            if self._pid_is_alive(pid):
+                                return True
+                            p.unlink(missing_ok=True)
+                        except Exception:
+                            try:
+                                p.unlink(missing_ok=True)
+                            except Exception:
+                                pass
+                finally:
+                    fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
+        return False
+
+    def _read_archive_status_file(self) -> dict[str, Any]:
+        path = self.cfg.archive_status_file
+        if not path.is_file():
+            return dict(self._archive_last_status)
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                merged = {**data, **self._archive_last_status}
+                if data.get("last_run_at") and (
+                    not merged.get("last_run_at")
+                    or str(data["last_run_at"]) >= str(merged.get("last_run_at") or "")
+                ):
+                    merged.update(data)
+                return merged
+        except Exception as exc:
+            logger.warning("Failed reading archive status file: %s", type(exc).__name__)
+        return dict(self._archive_last_status)
+
+    def _write_archive_status_file(self, payload: dict[str, Any]) -> None:
+        self._archive_last_status = dict(payload)
+        path = self.cfg.archive_status_file
+        _atomic_write_json_locked(path, payload, label="archive_status")
+
+    @staticmethod
+    def _read_complete_tail_lines(
+        path: Path,
+        *,
+        max_lines: int = 25,
+        max_scan_bytes: int = 4 * 1024 * 1024,
+    ) -> list[str]:
+        """Read the last ``max_lines`` complete lines from ``path`` without truncating a line's leading prefix."""
+        with path.open("rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            file_size = fh.tell()
+            if file_size <= 0:
+                return []
+            block_size = 65536
+            pos = file_size
+            blocks: list[bytes] = []
+            newline_count = 0
+            scanned = 0
+            while pos > 0 and newline_count <= max_lines and scanned < max_scan_bytes:
+                read_len = min(block_size, pos, max_scan_bytes - scanned)
+                pos -= read_len
+                fh.seek(pos, os.SEEK_SET)
+                chunk = fh.read(read_len)
+                blocks.append(chunk)
+                newline_count += chunk.count(b"\n")
+                scanned += read_len
+            raw = b"".join(reversed(blocks))
+            if pos > 0:
+                first_nl = raw.find(b"\n")
+                if first_nl == -1:
+                    return []
+                raw = raw[first_nl + 1 :]
+            decoded = raw.decode("utf-8", errors="replace").strip()
+            if not decoded:
+                return []
+            return decoded.splitlines()[-max_lines:]
+
+    def _read_sanitized_archive_log_tail(self, *, max_len: int = 8192) -> str:
+        """Read complete tail lines of conversation-archive logs, sanitize secrets/paths first, then truncate to 8 KiB."""
+        chunks: list[str] = []
+        mem_tail = self._archive_last_status.get("log_tail")
+        if isinstance(mem_tail, str) and mem_tail.strip():
+            chunks.append(mem_tail.strip())
+        for log_path in (self.cfg.archive_log_file, self.cfg.archive_err_log_file):
+            if not log_path.is_file():
+                continue
+            try:
+                lines = self._read_complete_tail_lines(log_path, max_lines=25)
+                if lines:
+                    chunks.append("\n".join(lines))
+            except Exception:
+                continue
+        combined = "\n".join(chunks).strip()
+        if not combined:
+            return ""
+        path_scrubbed = _scrub_local_paths(combined)
+        sanitized = sanitize_stderr_text(
+            path_scrubbed,
+            max_len=max(len(path_scrubbed) + 1024, max_len, 8192),
+        )
+        cleaned = _scrub_local_paths(sanitized)
+        byte_cap = min(max(1, int(max_len)), 8192)
+        encoded = cleaned.encode("utf-8")
+        if len(encoded) > byte_cap:
+            cleaned = encoded[-byte_cap:].decode("utf-8", errors="ignore").strip()
+        if len(cleaned) > max_len:
+            cleaned = cleaned[-max_len:].strip()
+        return _scrub_local_paths(cleaned)
+
+    @staticmethod
+    def _format_archive_result_label(
+        *,
+        running: bool,
+        exit_code: int | None,
+    ) -> str | None:
+        if running:
+            return "运行中"
+        if exit_code is None:
+            return None
+        if exit_code == 0:
+            return "成功 (exit_code=0)"
+        if exit_code == 2:
+            return "已在运行，跳过"
+        if exit_code == 3:
+            return "部分未完成 (exit_code=3)"
+        return f"失败 (exit_code={exit_code})"
+
+    async def handle_get_conversation_archive(self) -> tuple[int, dict[str, Any]]:
+        """Handle `GET /jobs/conversation-archive`."""
+        enabled = self.read_archive_enabled()
+        running = self._is_archive_proc_running()
+        status_data = self._read_archive_status_file()
+        last_run_at = status_data.get("last_run_at")
+        raw_exit = status_data.get("exit_code")
+        exit_code: int | None = (
+            int(raw_exit)
+            if isinstance(raw_exit, int) and not isinstance(raw_exit, bool)
+            else None
+        )
+        if not last_run_at and self.cfg.archive_log_file.is_file():
+            try:
+                mtime = self.cfg.archive_log_file.stat().st_mtime
+                last_run_at = datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
+            except Exception:
+                pass
+        saved_last_result = status_data.get("last_result")
+        if running:
+            last_result: str | None = "运行中"
+        elif isinstance(saved_last_result, str) and saved_last_result.strip():
+            last_result = _scrub_local_paths(
+                sanitize_stderr_text(saved_last_result.strip(), max_len=200)
+            )
+        else:
+            last_result = self._format_archive_result_label(
+                running=running,
+                exit_code=exit_code,
+            )
+        log_tail = self._read_sanitized_archive_log_tail()
+        next_run_at = self._compute_next_archive_run_at(enabled=enabled)
+        return 200, {
+            "ok": True,
+            "key": "conversation-archive",
+            "enabled": enabled,
+            "status": "on" if enabled else "off",
+            "running": running,
+            "last_run_at": last_run_at,
+            "exit_code": exit_code,
+            "last_result": last_result,
+            "log_tail": log_tail,
+            "next_run_at": next_run_at,
+        }
+
+    async def handle_toggle_conversation_archive(
+        self, enabled: bool
+    ) -> tuple[int, dict[str, Any]]:
+        """Handle `POST /jobs/conversation-archive/{enable|disable}`."""
+        try:
+            state = self.write_archive_enabled(bool(enabled))
+        except Exception as exc:
+            logger.warning("Failed toggling conversation archive state: %s", type(exc).__name__)
+            return 500, {
+                "ok": False,
+                "key": "conversation-archive",
+                "status": "error",
+                "error": "写入宿主机归档开关状态文件失败",
+            }
+        next_run_at = self._compute_next_archive_run_at(enabled=bool(enabled))
+        return 200, {
+            "ok": True,
+            "key": "conversation-archive",
+            "enabled": bool(enabled),
+            "status": "on" if enabled else "off",
+            "updated_at": state["updated_at"],
+            "next_run_at": next_run_at,
+        }
+
+    def _resolve_archive_python_bin(self) -> str:
+        if self.cfg.repo_python.is_file() and os.access(self.cfg.repo_python, os.X_OK):
+            return str(self.cfg.repo_python)
+        if os.path.exists(self.cfg.python_bin):
+            return self.cfg.python_bin
+        return sys.executable
+
+    async def _terminate_and_cleanup_archive_proc(
+        self,
+        proc: Any,
+        *,
+        log_fh: Any = None,
+        remove_pid: bool = True,
+        terminate_timeout_s: float = 10.0,
+        kill_timeout_s: float = 5.0,
+        initial_wait_rc: int | None = None,
+        initial_cancelled: asyncio.CancelledError | None = None,
+    ) -> tuple[bool, int | None, asyncio.CancelledError | None]:
+        """Terminate/kill ``proc`` if still running, wait with timeouts, and only clean up PID/log/ref once exited."""
+        cancelled_exc = initial_cancelled
+        wait_rc = initial_wait_rc
+
+        rc = getattr(proc, "returncode", None) if proc is not None else None
+        if not isinstance(rc, int) or isinstance(rc, bool):
+            rc = wait_rc
+
+        if proc is not None and rc is None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            try:
+                w = await asyncio.wait_for(proc.wait(), timeout=terminate_timeout_s)
+                if isinstance(w, int) and not isinstance(w, bool):
+                    wait_rc = w
+            except BaseException as exc:
+                if isinstance(exc, asyncio.CancelledError) and cancelled_exc is None:
+                    cancelled_exc = exc
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                try:
+                    w = await asyncio.wait_for(proc.wait(), timeout=kill_timeout_s)
+                    if isinstance(w, int) and not isinstance(w, bool):
+                        wait_rc = w
+                except BaseException as exc2:
+                    if isinstance(exc2, asyncio.CancelledError) and cancelled_exc is None:
+                        cancelled_exc = exc2
+
+        rc = getattr(proc, "returncode", None) if proc is not None else None
+        if not isinstance(rc, int) or isinstance(rc, bool):
+            rc = wait_rc
+        proc_exited = proc is None or (isinstance(rc, int) and not isinstance(rc, bool))
+
+        if proc_exited:
+            if log_fh is not None:
+                try:
+                    log_fh.flush()
+                except Exception:
+                    pass
+                try:
+                    log_fh.close()
+                except Exception:
+                    pass
+            if proc is not None:
+                if self._archive_proc is proc:
+                    self._archive_proc = None
+                if remove_pid:
+                    self._remove_archive_pid_file(expected_pid=getattr(proc, "pid", None))
+
+        return (
+            proc_exited,
+            (int(rc) if isinstance(rc, int) and not isinstance(rc, bool) else None),
+            cancelled_exc,
+        )
+
+    async def _watch_archive_proc(
+        self,
+        proc: Any,
+        started_at: str,
+        log_fh: Any = None,
+    ) -> None:
+        """Wait for an asynchronous `conversation_archive.py run` subprocess and record its outcome."""
+        timed_out = False
+        cancelled_exc: asyncio.CancelledError | None = None
+        watcher_error: str | None = None
+        wait_rc: int | None = None
+        try:
+            w = await asyncio.wait_for(proc.wait(), timeout=self.cfg.archive_run_timeout_s)
+            if isinstance(w, int) and not isinstance(w, bool):
+                wait_rc = w
+        except asyncio.TimeoutError:
+            timed_out = True
+            logger.warning(
+                "Archive subprocess (pid=%s) timed out after %.1fs",
+                getattr(proc, "pid", None),
+                self.cfg.archive_run_timeout_s,
+            )
+        except asyncio.CancelledError as exc:
+            cancelled_exc = exc
+            watcher_error = "CancelledError"
+            logger.warning("Archive watcher cancelled (pid=%s)", getattr(proc, "pid", None))
+        except BaseException as exc:
+            watcher_error = type(exc).__name__
+            logger.warning("Archive watcher error: %s", watcher_error)
+        finally:
+            proc_exited, rc_val, cancelled_exc = await self._terminate_and_cleanup_archive_proc(
+                proc,
+                log_fh=log_fh,
+                remove_pid=True,
+                terminate_timeout_s=10.0,
+                kill_timeout_s=5.0,
+                initial_wait_rc=wait_rc,
+                initial_cancelled=cancelled_exc,
+            )
+            tail = self._read_sanitized_archive_log_tail(max_len=8192)
+            exit_code_val = int(rc_val) if proc_exited and rc_val is not None else 1
+            if timed_out:
+                last_result = "运行超时"
+            elif exit_code_val == 2:
+                last_result = "已在运行，跳过"
+            elif watcher_error and exit_code_val != 0:
+                last_result = f"失败 ({watcher_error})"
+            else:
+                last_result = self._format_archive_result_label(
+                    running=False,
+                    exit_code=exit_code_val,
+                )
+            self._write_archive_status_file(
+                {
+                    "last_run_at": started_at,
+                    "finished_at": datetime.now(timezone.utc).isoformat(),
+                    "exit_code": exit_code_val,
+                    "last_result": last_result,
+                    "log_tail": tail,
+                }
+            )
+        if cancelled_exc is not None:
+            raise cancelled_exc
+
+    async def handle_run_conversation_archive(self) -> tuple[int, dict[str, Any]]:
+        """Handle `POST /jobs/conversation-archive/run`.
+
+        Prevents duplicate launches via PID file + advisory lock (exit code 2 -> `already_running`).
+        """
+        async with self._archive_run_lock:
+            if self._is_archive_proc_running():
+                return 200, {
+                    "ok": False,
+                    "key": "conversation-archive",
+                    "status": "already_running",
+                    "already_running": True,
+                    "error": "已有归档在运行",
+                }
+
+            py_bin = self._resolve_archive_python_bin()
+            script_path = self.cfg.conversation_archive_py
+            repo_root = script_path.parents[2] if len(script_path.parents) >= 3 else _SCRIPT_DIR.parent
+            env_vars = {
+                **os.environ,
+                **_read_env_file_dict(self.cfg.env_path),
+                "PYTHONDONTWRITEBYTECODE": "1",
+            }
+            repo_env = repo_root / ".env"
+            if repo_env.is_file():
+                for k, v in _read_env_file_dict(repo_env).items():
+                    env_vars.setdefault(k, v)
+
+            started_at = datetime.now(timezone.utc).isoformat()
+            log_fh: Any = None
+            try:
+                self.cfg.archive_log_file.parent.mkdir(parents=True, exist_ok=True)
+                log_fh = self.cfg.archive_log_file.open("ab")
+            except Exception as exc:
+                logger.warning("Failed opening archive log file: %s", type(exc).__name__)
+                log_fh = None
+
+            proc: Any = None
+            pid_written = False
+            watcher_registered = False
+            startup_cancelled: asyncio.CancelledError | None = None
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    py_bin,
+                    str(script_path),
+                    "run",
+                    cwd=str(repo_root),
+                    env=env_vars,
+                    stdout=log_fh if log_fh is not None else asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.STDOUT if log_fh is not None else asyncio.subprocess.DEVNULL,
+                )
+                self._archive_proc = proc
+                proc_pid = getattr(proc, "pid", None)
+                pid_status = self._write_archive_pid_file(proc_pid)
+                if pid_status == "already_running":
+                    return 200, {
+                        "ok": False,
+                        "key": "conversation-archive",
+                        "status": "already_running",
+                        "already_running": True,
+                        "error": "已有归档在运行",
+                    }
+                if pid_status != "written":
+                    return 500, {
+                        "ok": False,
+                        "key": "conversation-archive",
+                        "status": "error",
+                        "error": "写入团队对话归档 PID 文件失败",
+                    }
+                pid_written = True
+
+                # Wait briefly to catch immediate exit code 2 when another process holds the Postgres advisory lock
+                probe_s = self.cfg.archive_startup_probe_s
+                try:
+                    await asyncio.wait_for(asyncio.shield(proc.wait()), timeout=probe_s)
+                except asyncio.TimeoutError:
+                    pass
+
+                rc = getattr(proc, "returncode", None)
+                if rc == 2:
+                    self._write_archive_status_file(
+                        {
+                            "last_run_at": started_at,
+                            "finished_at": datetime.now(timezone.utc).isoformat(),
+                            "exit_code": 2,
+                            "last_result": "已在运行，跳过",
+                            "log_tail": self._read_sanitized_archive_log_tail(max_len=8192),
+                        }
+                    )
+                    return 200, {
+                        "ok": False,
+                        "key": "conversation-archive",
+                        "status": "already_running",
+                        "already_running": True,
+                        "exit_code": 2,
+                        "last_result": "已在运行，跳过",
+                        "error": "已有归档在运行",
+                    }
+
+                self._archive_watch_task = asyncio.create_task(
+                    self._watch_archive_proc(proc, started_at, log_fh)
+                )
+                watcher_registered = True
+                return 200, {
+                    "ok": True,
+                    "key": "conversation-archive",
+                    "status": "started",
+                    "async": True,
+                    "pid": proc_pid,
+                    "started_at": started_at,
+                }
+            except asyncio.CancelledError as exc:
+                startup_cancelled = exc
+                raise
+            finally:
+                if not watcher_registered:
+                    _, _, cleanup_cancelled = await self._terminate_and_cleanup_archive_proc(
+                        proc,
+                        log_fh=log_fh,
+                        remove_pid=pid_written,
+                        terminate_timeout_s=2.0,
+                        kill_timeout_s=2.0,
+                        initial_cancelled=startup_cancelled,
+                    )
+                    if cleanup_cancelled is not None and startup_cancelled is None:
+                        raise cleanup_cancelled
+
+    async def handle_get_ops_jobs(self) -> tuple[int, dict[str, Any]]:
+        """Handle `GET /jobs/ops` for read-only host operational jobs."""
+        default_ops = [
+            {
+                "key": "ops-db-backup",
+                "kind": "ops_db_backup",
+                "title": "数据库备份",
+                "status": "unknown",
+                "last_run_at": None,
+                "last_result": None,
+                "next_run_at": None,
+            },
+            {
+                "key": "ops-log-rotate",
+                "kind": "ops_log_rotate",
+                "title": "日志轮转",
+                "status": "unknown",
+                "last_run_at": None,
+                "last_result": None,
+                "next_run_at": None,
+            },
+            {
+                "key": "ops-backend-watchdog",
+                "kind": "ops_backend_watchdog",
+                "title": "后端看门狗",
+                "status": "unknown",
+                "last_run_at": None,
+                "last_result": None,
+                "next_run_at": None,
+            },
+        ]
+        if not self.cfg.ops_status_file.is_file():
+            return 200, {"ok": True, "jobs": default_ops}
+        try:
+            raw = json.loads(self.cfg.ops_status_file.read_text(encoding="utf-8"))
+            by_key = raw.get("jobs") if isinstance(raw, dict) else raw
+            mapped: dict[str, dict[str, Any]] = {}
+            if isinstance(by_key, dict):
+                for k, v in by_key.items():
+                    if isinstance(v, dict):
+                        mapped[str(k)] = v
+            elif isinstance(by_key, list):
+                for item in by_key:
+                    if isinstance(item, dict) and item.get("key"):
+                        mapped[str(item["key"])] = item
+            out: list[dict[str, Any]] = []
+            for item in default_ops:
+                override = mapped.get(item["key"]) or {}
+                raw_st = str(override.get("status") or "unknown").strip().lower()
+                st = raw_st if raw_st in ("on", "off", "partial", "unknown") else "unknown"
+                last_res = override.get("last_result")
+                out.append(
+                    {
+                        **item,
+                        "status": st,
+                        "last_run_at": override.get("last_run_at"),
+                        "last_result": (
+                            _scrub_local_paths(sanitize_stderr_text(str(last_res), max_len=200))
+                            if last_res is not None
+                            else None
+                        ),
+                        "next_run_at": override.get("next_run_at"),
+                    }
+                )
+            return 200, {"ok": True, "jobs": out}
+        except Exception:
+            return 200, {"ok": True, "jobs": default_ops}
+
 
 async def _send_http(
     writer: asyncio.StreamWriter,
@@ -5046,6 +5847,52 @@ async def _handle_client(
             code, payload = await bridge.handle_embed(embed_body)
             status_label = "OK" if code == 200 else ("Bad Request" if code == 400 else "Bad Gateway")
             await _send_http(writer, code, status_label, payload)
+            return
+
+        # Route 2b: /jobs/conversation-archive* and /jobs/ops (header token auth)
+        if path == "/jobs/ops" or path.startswith("/jobs/conversation-archive"):
+            supplied_token = _extract_supplied_token(headers)
+            expected_token = bridge.cfg.token
+            if not expected_token or not supplied_token or not hmac.compare_digest(
+                supplied_token.encode("utf-8"), expected_token.encode("utf-8")
+            ):
+                await _send_http(writer, 401, "Unauthorized", {"ok": False, "error": "Unauthorized"})
+                return
+
+            if path == "/jobs/conversation-archive":
+                if method != "GET":
+                    await _send_http(writer, 405, "Method Not Allowed", {"error": "Method Not Allowed"})
+                    return
+                code, payload = await bridge.handle_get_conversation_archive()
+                await _send_http(writer, code, "OK", payload)
+                return
+
+            if path == "/jobs/conversation-archive/run":
+                if method != "POST":
+                    await _send_http(writer, 405, "Method Not Allowed", {"error": "Method Not Allowed"})
+                    return
+                code, payload = await bridge.handle_run_conversation_archive()
+                await _send_http(writer, code, "OK", payload)
+                return
+
+            if path in ("/jobs/conversation-archive/enable", "/jobs/conversation-archive/disable"):
+                if method != "POST":
+                    await _send_http(writer, 405, "Method Not Allowed", {"error": "Method Not Allowed"})
+                    return
+                enable_flag = path.endswith("/enable")
+                code, payload = await bridge.handle_toggle_conversation_archive(enable_flag)
+                await _send_http(writer, code, "OK", payload)
+                return
+
+            if path == "/jobs/ops":
+                if method != "GET":
+                    await _send_http(writer, 405, "Method Not Allowed", {"error": "Method Not Allowed"})
+                    return
+                code, payload = await bridge.handle_get_ops_jobs()
+                await _send_http(writer, code, "OK", payload)
+                return
+
+            await _send_http(writer, 404, "Not Found", {"error": "Not Found"})
             return
 
         # Route 3: /mcp (header token) or legacy /mcp/<token> (path token, deprecated)

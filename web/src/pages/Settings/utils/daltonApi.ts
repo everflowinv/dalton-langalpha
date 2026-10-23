@@ -472,3 +472,98 @@ export async function fetchDaltonBudgetToday(): Promise<DaltonBudgetToday> {
   const { data } = await api.get<DaltonBudgetToday>('/api/v1/dalton/budget/today');
   return data;
 }
+
+export type DaltonSystemJobScope = 'company' | 'home' | 'host' | 'ops';
+export type DaltonSystemJobStatus = 'on' | 'off' | 'partial' | 'unknown';
+
+export interface DaltonSystemJobItem {
+  key: string;
+  kind: string;
+  scope: DaltonSystemJobScope;
+  title?: string;
+  description?: string;
+  schedule?: string;
+  timezone?: string;
+  workspace_id?: string;
+  ticker?: string;
+  tier?: string;
+  status: DaltonSystemJobStatus;
+  enabled?: boolean;
+  paused_by_user?: boolean;
+  last_run_at: string | null;
+  last_result: string | null;
+  next_run_at: string | null;
+  can_toggle: boolean;
+  can_run_now: boolean;
+  config?: {
+    extractor_model?: string;
+    model?: string;
+    prompt_version?: string;
+    extract_concurrency?: number;
+    concurrency?: number;
+  };
+  exit_code?: number | null;
+  log_tail?: string;
+  running?: boolean;
+  missing_tasks?: string[];
+}
+
+export interface DaltonSystemJobsResponse {
+  ok: boolean;
+  is_pm?: boolean;
+  jobs: DaltonSystemJobItem[];
+  groups?: {
+    company: DaltonSystemJobItem[];
+    home: DaltonSystemJobItem[];
+    host: DaltonSystemJobItem[];
+    ops: DaltonSystemJobItem[];
+  };
+}
+
+export interface DaltonSystemJobToggleResponse {
+  ok: boolean;
+  job?: DaltonSystemJobItem;
+  jobs?: DaltonSystemJobItem[];
+  error?: string;
+  message?: string;
+}
+
+export interface DaltonSystemJobRunResponse {
+  ok: boolean;
+  key: string;
+  scope: DaltonSystemJobScope;
+  async: boolean;
+  status: string;
+  already_running?: boolean;
+  execution_id?: string;
+  automation_id?: string;
+  where_to_check?: string;
+  message?: string;
+  error?: string;
+}
+
+export async function fetchDaltonSystemJobs(): Promise<DaltonSystemJobsResponse> {
+  const { data } = await api.get<DaltonSystemJobsResponse>('/api/v1/dalton/system-jobs');
+  return data;
+}
+
+export async function toggleDaltonSystemJob(
+  key: string,
+  enabled: boolean,
+): Promise<DaltonSystemJobToggleResponse> {
+  const { data } = await api.post<DaltonSystemJobToggleResponse>(
+    `/api/v1/dalton/system-jobs/${encodeURIComponent(key)}`,
+    { enabled },
+  );
+  return data;
+}
+
+export async function runDaltonSystemJobNow(
+  key: string,
+): Promise<DaltonSystemJobRunResponse> {
+  const { data } = await api.post<DaltonSystemJobRunResponse>(
+    `/api/v1/dalton/system-jobs/${encodeURIComponent(key)}/run`,
+    {},
+  );
+  return data;
+}

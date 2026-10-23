@@ -840,31 +840,41 @@ class AutomationExecutor:
             f"[AUTOMATION_EXEC] Starting execution: "
             f"automation_id={automation_id} execution_id={execution_id}"
         )
-        # DALTON-HOOK(preflight): zero-LLM wake/skip decision for dalton-* automations
-        from src.dalton.autonomy import preflight as dalton_preflight
+        # DALTON-HOOK(preflight): zero-LLM wake/skip decision for dalton-* automations; start heartbeat before preflight so 600s data_health preflight is not swept as stale
+        keep_alive = asyncio.create_task(
+            _keep_alive(execution_id),
+            name=f"automation_heartbeat_{execution_id[:8]}",
+        )
+        try:
+            from src.dalton.autonomy import preflight as dalton_preflight
 
-        decision = await dalton_preflight.decide(automation, execution_id)
-        if decision is not None and decision.skip:
-            await settle(
-                automation,
+            decision = await dalton_preflight.decide(automation, execution_id)
+            if decision is not None and decision.skip:
+                await settle(
+                    automation,
+                    execution_id,
+                    Outcome.PRECHECK_SKIPPED,
+                    workspace_id=str(automation.get("workspace_id") or "") or None,
+                    skip_reason="precheck",
+                    excerpt=decision.summary[:300],
+                )
+                keep_alive.cancel()
+                return
+            if not await exec_db.transition_execution(
                 execution_id,
-                Outcome.PRECHECK_SKIPPED,
-                workspace_id=str(automation.get("workspace_id") or "") or None,
-                skip_reason="precheck",
-                excerpt=decision.summary[:300],
-            )
-            return
-        if not await exec_db.transition_execution(
-            execution_id,
-            from_statuses=("pending",),
-            to="running",
-            started_at=datetime.now(timezone.utc),
-        ):
-            logger.warning(
-                f"[AUTOMATION_EXEC] Not starting: execution_id={execution_id} "
-                f"was settled before it began"
-            )
-            return
+                from_statuses=("pending",),
+                to="running",
+                started_at=datetime.now(timezone.utc),
+            ):
+                logger.warning(
+                    f"[AUTOMATION_EXEC] Not starting: execution_id={execution_id} "
+                    f"was settled before it began"
+                )
+                keep_alive.cancel()
+                return
+        except BaseException:
+            keep_alive.cancel()
+            raise
 
         _trigger = automation.get("trigger_type") or "unknown"
         _exec_span = _otel_tracer.start_span(
@@ -873,10 +883,6 @@ class AutomationExecutor:
                 "automation_id": _obs_hash_id(automation_id),
                 "trigger": _trigger,
             },
-        )
-        keep_alive = asyncio.create_task(
-            _keep_alive(execution_id),
-            name=f"automation_heartbeat_{execution_id[:8]}",
         )
 
         firing = _Firing(

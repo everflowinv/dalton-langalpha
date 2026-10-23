@@ -694,12 +694,12 @@ async def lifespan(app: FastAPI):
             name="warm-brokerage-marks",
         )
 
-    # DALTON-HOOK(data-map): run background data-source health check loop on startup
+    # DALTON-HOOK(data-map): run one-shot data-source health check on startup if not checked in 24h and not paused
     if os.getenv("DALTON_HEALTH_ON_STARTUP", "1").strip().lower() not in ("0", "false", "no"):
-        from src.dalton.data_map.health import run_startup_health_check_loop
+        from src.dalton.data_map.health import run_startup_health_check_once
 
         _dalton_health_startup_task = asyncio.create_task(
-            run_startup_health_check_loop(),
+            run_startup_health_check_once(),
             name="dalton-startup-data-source-health",
         )
 

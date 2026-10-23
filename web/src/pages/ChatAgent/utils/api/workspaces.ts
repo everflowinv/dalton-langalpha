@@ -144,4 +144,58 @@ export async function streamWorkspaceEvents(
   );
 }
 
+// DALTON-HOOK(coverage-tracking): company workspace auto-tracking API requests
+export interface WorkspaceTrackingTask {
+  automation_id: string | null;
+  name: string;
+  description?: string | null;
+  trigger_type?: 'cron' | 'price' | 'once' | string;
+  cron_expression?: string | null;
+  timezone?: string | null;
+  status: 'active' | 'paused' | 'missing' | string;
+  exists: boolean;
+  next_run_at?: string | null;
+  paused_by_user?: boolean;
+  standard?: boolean;
+}
+
+// DALTON-HOOK(coverage-tracking): company workspace auto-tracking response contract
+export interface WorkspaceTrackingResponse {
+  ok: boolean;
+  workspace_id: string;
+  ticker: string;
+  tier: string;
+  timezone: string;
+  status: 'enabled' | 'disabled' | 'incomplete';
+  enabled: boolean;
+  paused_by_user: boolean;
+  label: string;
+  missing_tasks: string[];
+  paused_tasks: string[];
+  active_tasks: string[];
+  tasks: WorkspaceTrackingTask[];
+  can_edit?: boolean;
+}
+
+// DALTON-HOOK(coverage-tracking): fetch company workspace auto-tracking status
+export async function fetchWorkspaceTracking(
+  workspaceId: string,
+): Promise<WorkspaceTrackingResponse> {
+  const { data } = await api.get<WorkspaceTrackingResponse>(
+    `/api/v1/dalton/tracking/${encodeURIComponent(workspaceId)}`,
+  );
+  return data;
+}
+
+export async function updateWorkspaceTracking(
+  workspaceId: string,
+  enabled: boolean,
+): Promise<WorkspaceTrackingResponse> {
+  const { data } = await api.post<WorkspaceTrackingResponse>(
+    `/api/v1/dalton/tracking/${encodeURIComponent(workspaceId)}`,
+    { enabled },
+  );
+  return data;
+}
+
 // --- Threads ---

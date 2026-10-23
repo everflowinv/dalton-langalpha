@@ -118,8 +118,13 @@ Workflow 返回后，主智能体按以下 4 步完成收尾：
    - **注意**：`attachments` 必须同时附带模型文件（`role: "model"`）和数字底表 `research/<D>-fc/facts.md`（`role: "facts"`，作为发布核验的对账基准）；其余支线文件与草稿审稿意见留在 `research/`，不进发布包。
    - 若核验退回或服务端独立审稿返回 `revise`，逐条修订后再调 `publish_report`，直至进入 PM 审批卡（`awaiting_pm`）。
 
-### 第 4 步：PM 批准生效
-- PM 在审批卡片上批准后，发布管线自动将 `thesis.official`（含正式 house view）写入知识层，并在 `published/` 下生成不可变正式副本。
+### 第 4 步：开启自动跟踪与完成判定
+1. 调用 `dalton_coverage_tracking(action="enable", source="coverage_finish")` 开启（或补齐）该公司的标准自动跟踪任务（`watch`、`delta`、`move-up`、`move-down`）。若用户之前手动关闭过（带 `paused_by_user` 标记），`source="coverage_finish"` 会自动保持关闭状态，不重新打开。
+2. **完成判定**：
+   - `drafts/<D>-memo.md`、`model/<TICKER>-model-v01.xlsx` 及 `research/<D>-fc/facts.md` 均已通过校验；
+   - 知识层（含 `company.coverage_stage="full"`）与 `knowledge_append_verdict` 已落库；
+   - 已调用 `dalton_coverage_tracking(action="enable", source="coverage_finish")` 并检查确认自动跟踪已开启（`status="enabled"`，或因 `paused_by_user=true` 保持关闭）；
+   - `publish_report` 已提交进入 PM 审批卡（`awaiting_pm`），PM 在审批卡片上批准后，发布管线自动将 `thesis.official`（含正式 house view）写入知识层，并在 `published/` 下生成不可变正式副本。
 
 ---
 
