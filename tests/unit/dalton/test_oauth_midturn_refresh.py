@@ -283,11 +283,37 @@ async def test_refresh_does_not_eat_the_stalled_stream_retry(events, resolver):
         if len(calls) == 1:
             raise _expired()
         if len(calls) == 2:
-            raise TimeoutError("stream stalled: no chunk within 120s (chunks_received=0)")
+            raise _stall()
         return "ok"
 
     assert await mw.awrap_model_call(_FakeRequest(primary), handler) == "ok"
     assert calls == ["t0", "t1", "t1"]
+
+
+def _stall():
+    exc = TimeoutError("no chunk within the bound")
+    exc.chunks_received = 0  # what is_stalled_stream keys on
+    return exc
+
+
+@pytest.mark.asyncio
+async def test_second_stall_after_refresh_ends_the_candidate(events, resolver):
+    primary = _oauth_model("claude-opus-5-5-oauth", "t0")
+    fallback = _FakeModel("muse-wonder-1.0-oauth")
+    mw = _mw(primary, [("muse-wonder-1.0-oauth", fallback)])
+    calls = []
+
+    async def handler(req):
+        calls.append(req.model.model)
+        if req.model is fallback:
+            return "ok"
+        if len(calls) == 1:
+            raise _expired()
+        raise _stall()
+
+    assert await mw.awrap_model_call(_FakeRequest(primary), handler) == "ok"
+    # refused token, refreshed stall, one stall retry, then the fallback
+    assert calls == ["claude-opus-5-5-oauth"] * 3 + ["muse-wonder-1.0-oauth"]
 
 
 @pytest.mark.asyncio

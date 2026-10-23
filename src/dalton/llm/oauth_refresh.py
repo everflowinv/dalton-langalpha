@@ -68,13 +68,17 @@ async def _expire_stored_token(spec: OAuthRebuildSpec) -> None:
     (revoked early, or a lifetime shorter than the one recorded).
     """
     from src.dalton.credentials import credential_user_id
+    from src.server.database.encryption import get_encryption_key
     from src.server.database.pool import get_db_connection
 
+    # Conditional on the stored token still being the refused one: if another worker
+    # refreshed it meanwhile, its new token is left alone (one atomic statement).
     async with get_db_connection() as conn:
         await conn.execute(
             "UPDATE user_oauth_tokens SET expires_at = NOW() "
-            "WHERE user_id = %s AND provider = %s AND expires_at > NOW()",
-            (credential_user_id(spec.user_id), spec.provider),
+            "WHERE user_id = %s AND provider = %s AND expires_at > NOW() "
+            "AND left(encode(sha256(convert_to(pgp_sym_decrypt(access_token, %s), 'UTF8')), 'hex'), 16) = %s",
+            (credential_user_id(spec.user_id), spec.provider, get_encryption_key(), spec.token_digest),
         )
 
 
