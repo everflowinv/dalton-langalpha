@@ -21,8 +21,12 @@ from src.dalton.knowledge.render import render_published_index_md
 from src.dalton.knowledge.service import apply_update
 from src.dalton.publish.audit import (
     aaudit_draft,
+    resolve_audit_config_fingerprint,
+    compute_audit_inputs_sha256,
+    format_audit_summary_from_dict,
     render_annotated_draft,
     render_audit_md,
+    try_load_reusable_audit_from_md,
 )
 from src.dalton.publish.files import (
     compute_bundle_sha256,
@@ -41,6 +45,21 @@ def _derive_sidecar_paths(draft_path: str) -> tuple[str, str]:
     stem = p.stem
     parent = str(p.parent) if str(p.parent) != "." else "drafts"
     return f"{parent}/{stem}.audit.md", f"{parent}/{stem}.annotated.md"
+
+
+async def _read_optional_text(backend: Any, path: str) -> str | None:
+    if hasattr(backend, "aread_text"):
+        try:
+            return await backend.aread_text(path)
+        except Exception:
+            return None
+    if hasattr(backend, "adownload_file_bytes"):
+        try:
+            raw = await backend.adownload_file_bytes(path)
+            return raw.decode("utf-8") if raw is not None else None
+        except Exception:
+            return None
+    return None
 
 
 async def _load_workspace_provenance(
@@ -132,6 +151,30 @@ async def run_check_draft(
     if provenance_records is None:
         provenance_records = await _load_workspace_provenance(workspace_id)
 
+    audit_path, annotated_path = _derive_sidecar_paths(draft_path)
+    existing_audit_md = await _read_optional_text(backend, audit_path)
+    cached_audit = try_load_reusable_audit_from_md(
+        existing_audit_md,
+        draft_markdown=draft_text,
+        thesis_doc=thesis_doc,
+        models_doc=models_doc,
+        provenance_records=provenance_records,
+        facts_markdown=facts_text,
+        use_llm_judge=use_llm_judge,
+        config_fingerprint=await resolve_audit_config_fingerprint(
+            user_id, use_llm_judge=use_llm_judge
+        ),
+    )
+    if cached_audit is not None:
+        return {
+            "ok": True,
+            "reused": True,
+            "audit": cached_audit.to_dict(),
+            "audit_path": audit_path,
+            "annotated_path": annotated_path,
+            "message": cached_audit.summary_line(audit_path),
+        }
+
     audit = await aaudit_draft(
         draft_text,
         thesis_doc=thesis_doc,
@@ -144,7 +187,6 @@ async def run_check_draft(
         thread_id=thread_id,
     )
 
-    audit_path, annotated_path = _derive_sidecar_paths(draft_path)
     audit_md = await asyncio.to_thread(render_audit_md, audit, draft_path=draft_path)
     annotated_md = await asyncio.to_thread(render_annotated_draft, draft_text, audit)
     await backend.awrite_text(audit_path, audit_md)
@@ -152,11 +194,19 @@ async def run_check_draft(
 
     return {
         "ok": True,
+        "reused": False,
         "audit": audit.to_dict(),
         "audit_path": audit_path,
         "annotated_path": annotated_path,
         "message": audit.summary_line(audit_path),
     }
+
+
+def _prefix_with_audit_summary(row: dict[str, Any], message: str) -> str:
+    """Prefix ``message`` with the unified 4-bucket figure audit summary if ``row['audit']`` is present."""
+    audit_dict = row.get("audit") if isinstance(row.get("audit"), dict) else None
+    summary = format_audit_summary_from_dict(audit_dict)
+    return f"{summary}。{message}" if summary else message
 
 
 async def _append_agenda_pm_handoff(
@@ -324,32 +374,70 @@ async def run_publish(
             else None
         )
         paths = [f["path"] for f in (pub.get("files") or [])] if pub else []
+        audit_summary = format_audit_summary_from_dict(
+            row.get("audit") if isinstance(row.get("audit"), dict) else None
+        )
+        msg_prefix = f"{audit_summary} · " if audit_summary else ""
         return {
             "ok": True,
             "status": "published",
             "publication_id": row.get("publication_id"),
             "paths": paths,
-            "message": f"Published {ticker} ({title}): {', '.join(paths)} · publication {row.get('publication_id')}",
+            "audit": row.get("audit"),
+            "message": f"{msg_prefix}Published {ticker} ({title}): {', '.join(paths)} · publication {row.get('publication_id')}",
         }
 
     if status in ("rejected", "expired", "superseded"):
         return {
             "ok": False,
             "status": status,
-            "message": (
+            "audit": row.get("audit"),
+            "message": _prefix_with_audit_summary(
+                row,
                 f"Publish request {req_id} is {status}: "
-                f"{row.get('decision_message') or row.get('error') or 'please fix and call publish_report again.'}"
+                f"{row.get('decision_message') or row.get('error') or 'please fix and call publish_report again.'}",
             ),
         }
 
+    prov_records: dict[str, dict[str, Any]] | None = None
     if status in ("audit_failed", "review_revise", "review_unavailable") and not created:
-        if row.get("bundle_sha256") == bundle_sha256:
+        prov_records = await _load_workspace_provenance(workspace_id)
+        current_inputs_sha = await asyncio.to_thread(
+            compute_audit_inputs_sha256,
+            draft_markdown=draft_text,
+            facts_markdown=facts_text,
+            thesis_doc=thesis_doc,
+            models_doc=models_doc,
+            provenance_records=prov_records,
+        )
+        _, _, _, current_cfg_sha = await resolve_audit_config_fingerprint(user_id, use_llm_judge=True)
+        prev_audit = row.get("audit") if isinstance(row.get("audit"), dict) else {}
+        prev_inputs_sha = str(prev_audit.get("inputs_sha256") or "")
+        prev_cfg_sha = str(prev_audit.get("config_sha256") or "")
+        if (
+            row.get("bundle_sha256") == bundle_sha256
+            and bool(prev_inputs_sha)
+            and prev_inputs_sha == current_inputs_sha
+            and bool(prev_cfg_sha)
+            and prev_cfg_sha == current_cfg_sha
+        ):
+            audit_path, annotated_path = _derive_sidecar_paths(draft_path)
+            audit_summary = format_audit_summary_from_dict(
+                prev_audit,
+                audit_path=audit_path if status == "audit_failed" else None,
+            )
+            msg_prefix = f"{audit_summary}。" if audit_summary else ""
             return {
                 "ok": False,
                 "status": status,
-                "message": f"Publish request {req_id} remains in {status}; update the draft before retrying.",
+                "audit": prev_audit or None,
+                "audit_path": audit_path,
+                "annotated_path": annotated_path,
+                "message": (
+                    f"{msg_prefix}Publish request {req_id} remains in {status}; update the draft before retrying."
+                ),
             }
-        # Bundle changed -> re-enter auditing
+        # Bundle, inputs, or audit config changed -> re-enter auditing
         updated = await db_publications.transition(
             req_id,
             (status,),
@@ -363,25 +451,40 @@ async def run_publish(
 
     # Step 2: Figure Audit (when status == 'auditing')
     if status == "auditing":
-        prov_records = await _load_workspace_provenance(workspace_id)
-        audit = await aaudit_draft(
-            draft_text,
+        if prov_records is None:
+            prov_records = await _load_workspace_provenance(workspace_id)
+        audit_path, annotated_path = _derive_sidecar_paths(draft_path)
+        existing_audit_md = await _read_optional_text(backend, audit_path)
+        audit = try_load_reusable_audit_from_md(
+            existing_audit_md,
+            draft_markdown=draft_text,
             thesis_doc=thesis_doc,
             models_doc=models_doc,
             provenance_records=prov_records,
             facts_markdown=facts_text,
             use_llm_judge=True,
-            user_id=user_id,
-            workspace_id=workspace_id,
-            thread_id=thread_id,
+            config_fingerprint=await resolve_audit_config_fingerprint(
+                user_id, use_llm_judge=True
+            ),
         )
-        audit_path, annotated_path = _derive_sidecar_paths(draft_path)
-        await backend.awrite_text(
-            audit_path, await asyncio.to_thread(render_audit_md, audit, draft_path=draft_path)
-        )
-        await backend.awrite_text(
-            annotated_path, await asyncio.to_thread(render_annotated_draft, draft_text, audit)
-        )
+        if audit is None:
+            audit = await aaudit_draft(
+                draft_text,
+                thesis_doc=thesis_doc,
+                models_doc=models_doc,
+                provenance_records=prov_records,
+                facts_markdown=facts_text,
+                use_llm_judge=True,
+                user_id=user_id,
+                workspace_id=workspace_id,
+                thread_id=thread_id,
+            )
+            await backend.awrite_text(
+                audit_path, await asyncio.to_thread(render_audit_md, audit, draft_path=draft_path)
+            )
+            await backend.awrite_text(
+                annotated_path, await asyncio.to_thread(render_annotated_draft, draft_text, audit)
+            )
 
         if not audit.passed:
             await db_publications.transition(
@@ -393,10 +496,13 @@ async def run_publish(
             return {
                 "ok": False,
                 "status": "audit_failed",
+                "reused": audit.reused,
                 "audit": audit.to_dict(),
+                "audit_path": audit_path,
+                "annotated_path": annotated_path,
                 "message": (
-                    f"Audit failed ({len(audit.unmatched)} unverified/contradicted figure(s)): "
-                    f"see {audit_path}. Fix footnotes/figures and call publish_report again."
+                    f"{audit.summary_line(audit_path)}。"
+                    f"请根据 {audit_path} 修复冲突与未核实数字后重新调用 publish_report。"
                 ),
             }
 
@@ -450,9 +556,11 @@ async def run_publish(
             return {
                 "ok": False,
                 "status": "review_unavailable",
-                "message": (
+                "audit": row.get("audit"),
+                "message": _prefix_with_audit_summary(
+                    row,
                     f"无法发布：缺少独立审稿（{rev_res.reason}）。"
-                    f"草稿保留在 {draft_path}，审稿恢复后再调用。"
+                    f"草稿保留在 {draft_path}，审稿恢复后再调用。",
                 ),
             }
 
@@ -467,10 +575,12 @@ async def run_publish(
             return {
                 "ok": False,
                 "status": "review_revise",
+                "audit": row.get("audit"),
                 "review": rev_dict,
-                "message": (
+                "message": _prefix_with_audit_summary(
+                    row,
                     f"Independent review ({rev_dict.get('model')} / {rev_dict.get('family')}) "
-                    f"requested revisions: {fixes}"
+                    f"requested revisions: {fixes}",
                 ),
             }
 
@@ -497,7 +607,11 @@ async def run_publish(
             return {
                 "ok": False,
                 "status": "superseded",
-                "message": "草稿在审批前已被修改（superseded），请重新调用 publish_report。",
+                "audit": row.get("audit"),
+                "message": _prefix_with_audit_summary(
+                    row,
+                    "草稿在审批前已被修改（superseded），请重新调用 publish_report。",
+                ),
             }
 
         # 4a. Unattended run -> do NOT emit interrupt(); record pm_handoff and stop at awaiting_pm
@@ -509,11 +623,16 @@ async def run_publish(
                 kind="publish_approval",
                 backend=backend,
             )
+            audit_summary = format_audit_summary_from_dict(
+                row.get("audit") if isinstance(row.get("audit"), dict) else None
+            )
+            msg_prefix = f"{audit_summary}。" if audit_summary else ""
             return {
                 "ok": False,
                 "status": "awaiting_pm",
                 "request_id": req_id,
-                "message": f"已通过数字核验与独立审稿，等待 PM 审批，request_id={req_id}",
+                "audit": row.get("audit"),
+                "message": f"{msg_prefix}已通过数字核验与独立审稿，等待 PM 审批，request_id={req_id}",
             }
 
         # 4b. Interactive thread -> emit ToolApprovalCard interrupt (aligned schema G3.2)
@@ -536,10 +655,15 @@ async def run_publish(
         incidental_cnt = int(
             audit_info.get("incidental", len(audit_info.get("incidental_items") or []))
         )
+        contradicted_items = list(audit_info.get("contradicted_items") or [])
         uncertain_items = list(audit_info.get("uncertain_items") or [])
         unverified_items = list(audit_info.get("unverified_items") or [])
         llm_verified_items = list(audit_info.get("llm_verified_items") or [])
         incidental_items = list(audit_info.get("incidental_items") or [])
+        not_required_cnt = int(
+            audit_info.get("not_required", exempt_cnt + incidental_cnt)
+        )
+        reused_flag = bool(audit_info.get("reused", False))
         labeling = dict(audit_info.get("labeling") or {})
         verified_by_counts = dict(
             audit_info.get("verified_by_counts")
@@ -555,9 +679,12 @@ async def run_publish(
             "uncertain": uncertain_cnt,
             "exempt": exempt_cnt,
             "incidental": incidental_cnt,
+            "not_required": not_required_cnt,
+            "reused": reused_flag,
             "labeling_incomplete": labeling_incomplete,
             "labeling": labeling,
             "verified_by_counts": verified_by_counts,
+            "contradicted_items": contradicted_items,
             "uncertain_items": uncertain_items,
             "unverified_items": unverified_items,
             "llm_verified_items": llm_verified_items,
@@ -573,11 +700,7 @@ async def run_publish(
             or review_info.get("must_fix")
             or [],
         }
-        audit_summary_str = (
-            f"{audit_info.get('figures', 0)} 个数字："
-            f"{verified_cnt} 已核实，{contradicted_cnt} 冲突，"
-            f"{unverified_cnt} 未核实，{uncertain_cnt} 未能判断，{exempt_cnt} 豁免"
-        )
+        audit_summary_str = format_audit_summary_from_dict(audit_info)
         reviewer_summary_str = (
             f"通过 · {reviewer_payload['model']} （{reviewer_payload['family']}）"
         )
@@ -655,7 +778,11 @@ async def run_publish(
             return {
                 "ok": False,
                 "status": "awaiting_pm",
-                "message": f"只有 PM（{sorted(pm_users)}）能批准正式发布。",
+                "audit": row.get("audit"),
+                "message": _prefix_with_audit_summary(
+                    row,
+                    f"只有 PM（{sorted(pm_users)}）能批准正式发布。",
+                ),
             }
 
         now_dt = datetime.now(timezone.utc)
@@ -671,7 +798,11 @@ async def run_publish(
             return {
                 "ok": False,
                 "status": "rejected",
-                "message": f"PM 拒绝发布：{dec_msg or '无附加说明'}",
+                "audit": row.get("audit"),
+                "message": _prefix_with_audit_summary(
+                    row,
+                    f"PM 拒绝发布：{dec_msg or '无附加说明'}",
+                ),
             }
 
         row = (
@@ -700,7 +831,11 @@ async def run_publish(
             return {
                 "ok": False,
                 "status": "superseded",
-                "message": "草稿在审批后被改动，请重新发布（superseded）。",
+                "audit": row.get("audit"),
+                "message": _prefix_with_audit_summary(
+                    row,
+                    "草稿在审批后被改动，请重新发布（superseded）。",
+                ),
             }
         row = claimed
         status = "publishing"
@@ -842,13 +977,18 @@ async def run_publish(
 
         paths_str = ", ".join(f["path"] for f in files_meta)
         notes_str = f" ({'; '.join(file_notes)})" if file_notes else ""
+        audit_summary = format_audit_summary_from_dict(
+            row.get("audit") if isinstance(row.get("audit"), dict) else None
+        )
+        msg_prefix = f"{audit_summary} · " if audit_summary else ""
         res_out: dict[str, Any] = {
             "ok": True,
             "status": "published",
             "publication_id": pub_id,
             "paths": [f["path"] for f in files_meta],
+            "audit": row.get("audit"),
             "message": (
-                f"Published {ticker} {title}: {paths_str}"
+                f"{msg_prefix}Published {ticker} {title}: {paths_str}"
                 f"{official_ver_note} · publication {pub_id[:8]}{notes_str}"
             ),
         }

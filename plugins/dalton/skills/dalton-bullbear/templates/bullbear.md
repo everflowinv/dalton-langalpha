@@ -103,3 +103,8 @@
 - AlphaEngine（foreign_report / sell_side_comment / meeting_minutes）：{命中数与采用数}
 - Guidepoint 专家纪要：{命中数与采用数}
 - 一手披露（SEC filing / 电话会）：{覆盖期次与 accession}
+
+<!-- 末尾必须附引用表 -->
+## 引用
+[引用1]: evidence:E-20261023-01
+[引用2]: model:model/META-model-v01.xlsx!DCF!C12

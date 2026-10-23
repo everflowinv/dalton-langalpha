@@ -4,16 +4,11 @@ from __future__ import annotations
 
 import dataclasses
 import io
-import json
 import re
-from pathlib import Path
 from typing import Any
 
 from src.dalton.publish.numbers import (
     ExtractedFigure,
-    _determine_unit_and_scale,
-    _extract_metric_from_context,
-    _NUMBER_RE,
     _PERIOD_TOKEN_RE,
     extract_figures,
     normalize_period,
@@ -133,6 +128,7 @@ class MatchOutcome:
     reason: str | None = None
     hint: str = ""
     candidates: list[MatchCandidate] = dataclasses.field(default_factory=list)
+    lock_unverified: bool = False
 
 
 def _is_legacy_thesis_evidence(ev: dict[str, Any]) -> bool:
@@ -537,6 +533,9 @@ def apply_derived_figure_matching(outcomes: list[MatchOutcome]) -> list[MatchOut
     for idx, out in enumerate(outcomes):
         if (
             out.matched
+            or out.lock_unverified
+            or bool(out.figure.missing_citations)
+            or bool(out.figure.duplicate_citations)
             or out.figure.exempt
             or out.figure.label_hint == "incidental"
             or out.reason == "source_conflict"
@@ -670,7 +669,13 @@ def match_figures(
             fid = target_ref[2:].strip()
             frow = facts_map.get(fid)
             if not frow or not frow.get("ref"):
-                return None
+                return MatchOutcome(
+                    figure=fig,
+                    matched=False,
+                    reason="unverified",
+                    hint=f"Facts ledger entry {fid} not found",
+                    lock_unverified=True,
+                )
             return _try_match_target(fig, str(frow["ref"]))
 
         # Order 1: evidence:<E-id>
@@ -690,6 +695,7 @@ def match_figures(
                     matched=False,
                     reason="unverified",
                     hint=f"Evidence {eid} not found in thesis.json",
+                    lock_unverified=True,
                 )
             # P0I §1.3 / L34: legacy_thesis cannot verify figures
             if _is_legacy_thesis_evidence(ev):
@@ -817,16 +823,21 @@ def match_figures(
                 )
             return None
 
-        # Order 2: model:<path>#<Sheet>!<Cell>
+        # Order 2: model:<path>#<Sheet>!<Cell> or model:<path>!<Sheet>!<Cell>
         if target_ref.startswith("model:"):
             m_spec = target_ref.split(":", 1)[1].strip()
-            cell_info = cells_map.get(m_spec)
+            cell_info = (
+                cells_map.get(m_spec)
+                or cells_map.get(m_spec.replace("!", "#", 1))
+                or cells_map.get(m_spec.replace("#", "!", 1))
+            )
             if not cell_info:
                 return MatchOutcome(
                     figure=fig,
                     matched=False,
                     reason="unverified",
                     hint=f"Model cell {m_spec} not found",
+                    lock_unverified=True,
                 )
             if cell_info.get("recalculated") is False:
                 return MatchOutcome(
@@ -834,6 +845,7 @@ def match_figures(
                     matched=False,
                     reason="unverified",
                     hint=f"Model {m_spec} has recalculated=false in models.json; run recalc.py first",
+                    lock_unverified=True,
                 )
             c_val = float(cell_info["value"])
             c_unit = str(cell_info.get("unit") or fig.unit)
@@ -921,6 +933,7 @@ def match_figures(
                     matched=False,
                     reason="unverified",
                     hint=f"Provenance record {pid} not found",
+                    lock_unverified=True,
                 )
             body_text = str(
                 prec.get("body")
@@ -955,6 +968,33 @@ def match_figures(
 
         return None
 
+    def _merge_failed_outcomes(
+        fig: ExtractedFigure, failed_outs: list[MatchOutcome]
+    ) -> MatchOutcome:
+        if len(failed_outs) == 1:
+            return failed_outs[0]
+        has_conflict = any(o.reason == "source_conflict" for o in failed_outs)
+        locked = any(o.lock_unverified for o in failed_outs)
+        hints: list[str] = []
+        cands: list[MatchCandidate] = []
+        seen_cands: set[tuple[str, str, float]] = set()
+        for o in failed_outs:
+            if o.hint and o.hint not in hints:
+                hints.append(o.hint)
+            for c in o.candidates:
+                key = (c.kind, c.id, c.value)
+                if key not in seen_cands:
+                    seen_cands.add(key)
+                    cands.append(c)
+        return MatchOutcome(
+            figure=fig,
+            matched=False,
+            reason="source_conflict" if has_conflict else "unverified",
+            hint="；".join(hints) if hints else failed_outs[0].hint,
+            candidates=cands,
+            lock_unverified=locked,
+        )
+
     for fig in figures:
         if fig.exempt:
             outcomes.append(
@@ -968,12 +1008,64 @@ def match_figures(
             )
             continue
 
+        targets = (
+            list(fig.footnote_targets)
+            if fig.footnote_targets
+            else ([fig.footnote_target] if fig.footnote_target else [])
+        )
+        target_evals: list[tuple[str, MatchOutcome | None]] = [
+            (t, _try_match_target(fig, t)) for t in targets
+        ]
+
+        # Inspect ALL citations on the figure up front: missing, duplicate, or non-existent target locks unverified.
+        broken_hints: list[str] = []
+        broken_cands: list[MatchCandidate] = []
+        if fig.duplicate_citations:
+            broken_hints.append(
+                f"{'、'.join(fig.duplicate_citations)} 在引用表中重复定义"
+            )
+        if fig.missing_citations:
+            broken_hints.append(
+                f"{'、'.join(fig.missing_citations)} 在引用表中没有对应项"
+            )
+        for _t, out in target_evals:
+            if out is not None and out.lock_unverified:
+                if out.hint and out.hint not in broken_hints:
+                    broken_hints.append(out.hint)
+                for c in out.candidates:
+                    broken_cands.append(c)
+        if broken_hints:
+            outcomes.append(
+                MatchOutcome(
+                    figure=fig,
+                    matched=False,
+                    reason="unverified",
+                    hint="；".join(broken_hints),
+                    candidates=broken_cands,
+                    lock_unverified=True,
+                )
+            )
+            continue
+
         # House target price / IRR / 3-scenario returns with explicit footnote must point to model cells
-        if _RequiresModelCellOnly(fig) and fig.footnote_target:
-            if fig.footnote_target.startswith("model:"):
-                out = _try_match_target(fig, fig.footnote_target)
-                if out is not None:
-                    outcomes.append(out)
+        if _RequiresModelCellOnly(fig) and targets:
+            model_evals = [
+                (t, out) for t, out in target_evals if t.startswith("model:")
+            ]
+            if model_evals:
+                model_outs: list[MatchOutcome] = []
+                matched_model_out: MatchOutcome | None = None
+                for _t, out in model_evals:
+                    if out is not None:
+                        if out.matched:
+                            matched_model_out = out
+                            break
+                        model_outs.append(out)
+                if matched_model_out is not None:
+                    outcomes.append(matched_model_out)
+                    continue
+                if model_outs:
+                    outcomes.append(_merge_failed_outcomes(fig, model_outs))
                     continue
             outcomes.append(
                 MatchOutcome(
@@ -981,22 +1073,33 @@ def match_figures(
                     matched=False,
                     reason="unverified",
                     hint="目标价、IRR、三情景收益必须指向模型单元格（model:<path>#<Sheet>!<Cell>）",
+                    lock_unverified=True,
                 )
             )
             continue
 
-        # Step C: Explicit footnote matching (Orders 0, 1, 2, 3)
-        if fig.footnote_target:
-            out = _try_match_target(fig, fig.footnote_target)
-            if out is not None:
-                outcomes.append(out)
+        # Step C: Explicit footnote / citation matching (Orders 0, 1, 2, 3)
+        if targets:
+            matched_out: MatchOutcome | None = None
+            failed_outs: list[MatchOutcome] = []
+            for _t, out in target_evals:
+                if out is not None:
+                    if out.matched:
+                        matched_out = out
+                        break
+                    failed_outs.append(out)
+            if matched_out is not None:
+                outcomes.append(matched_out)
+                continue
+            if failed_outs:
+                outcomes.append(_merge_failed_outcomes(fig, failed_outs))
                 continue
             outcomes.append(
                 MatchOutcome(
                     figure=fig,
                     matched=False,
                     reason="unverified",
-                    hint=f"脚注来源 {fig.footnote_target} 中未找到匹配指标或数值",
+                    hint=f"脚注来源 {targets[0]} 中未找到匹配指标或数值",
                 )
             )
             continue
@@ -1299,7 +1402,10 @@ def retrieve_candidate_sources(
                     },
                 )
     for m_spec, c_info in merged_cells.items():
-        fn_hit = int(fn_target == f"model:{m_spec}")
+        fn_hit = int(
+            fn_target == f"model:{m_spec}"
+            or fn_target == f"model:{m_spec.replace('#', '!', 1)}"
+        )
         cm = str(c_info.get("metric") or "")
         cp = normalize_period(c_info.get("period"))
         cu = str(c_info.get("unit") or "other")

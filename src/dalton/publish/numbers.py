@@ -83,6 +83,10 @@ _ENTITY_ID_RE = re.compile(
 )
 _FOOTNOTE_DEF_RE = re.compile(r"^\s*\[\^([^\]]+)\]:\s*(.+?)\s*$")
 _FOOTNOTE_REF_RE = re.compile(r"\[\^([^\]]+)\]")
+_CITATION_DEF_RE = re.compile(r"^\s*(?:[-*]\s*)?\[((?:回报)?引用\d+)\]:\s*(.+?)\s*$")
+_CITATION_REF_RE = re.compile(r"\[((?:回报)?引用\d+)\]")
+_ANY_FOOTNOTE_REF_RE = re.compile(r"\[\^([^\]]+)\]|\[((?:回报)?引用\d+)\]")
+_KNOWN_SOURCE_PREFIXES = ("f:", "evidence:", "model:", "prov:")
 _MARKDOWN_LINK_RE = re.compile(r"\[[^\]]*\]\([^)]+\)")
 _INLINE_CODE_RE = re.compile(r"`[^`]+`")
 _HEADING_PREFIX_RE = re.compile(
@@ -338,6 +342,10 @@ class ExtractedFigure:
     label_hint: str
     footnote_id: str | None = None
     footnote_target: str | None = None
+    footnote_ids: list[str] = dataclasses.field(default_factory=list)
+    footnote_targets: list[str] = dataclasses.field(default_factory=list)
+    missing_citations: list[str] = dataclasses.field(default_factory=list)
+    duplicate_citations: list[str] = dataclasses.field(default_factory=list)
     location: dict[str, Any] = dataclasses.field(default_factory=dict)
     exempt: bool = False
     exempt_reason: str | None = None
@@ -568,18 +576,81 @@ def _extract_metric_from_context(
     return sentence.strip()[:32]
 
 
+_DUPLICATE_CITATION_TARGET = "__DUPLICATE_CITATION__"
+_CITATION_SECTION_HEADING_RE = re.compile(r"^##\s+引用\s*$")
+_TOP_HEADING_RE = re.compile(r"^#{1,2}\s+")
+
+
+def _parse_footnote_namespaces(
+    markdown_text: str,
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Parse traditional footnotes ``[^id]: target`` and ``## 引用`` entries ``[引用N]: target`` into separate namespaces."""
+    traditional_footnotes: dict[str, str] = {}
+    citation_table: dict[str, str] = {}
+    in_code_block = False
+    in_html_comment = False
+    in_citation_section = False
+
+    for raw_line in markdown_text.splitlines():
+        stripped = raw_line.strip()
+
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            in_code_block = not in_code_block
+            continue
+        if in_code_block:
+            continue
+
+        if "<!--" in stripped:
+            if "-->" not in stripped:
+                in_html_comment = True
+            continue
+        if in_html_comment:
+            if "-->" in stripped:
+                in_html_comment = False
+            continue
+
+        if stripped.startswith("#"):
+            if _CITATION_SECTION_HEADING_RE.match(stripped):
+                in_citation_section = True
+            elif _TOP_HEADING_RE.match(stripped):
+                in_citation_section = False
+            continue
+
+        m = _FOOTNOTE_DEF_RE.match(raw_line)
+        is_citation = False
+        if not m and in_citation_section:
+            m = _CITATION_DEF_RE.match(raw_line)
+            is_citation = m is not None
+        if not m:
+            continue
+
+        fn_id = (
+            re.sub(r"\s+", "", m.group(1).strip())
+            if is_citation
+            else m.group(1).strip()
+        )
+        raw_target = m.group(2).strip()
+        # Keep the primary locator token before any parenthetical commentary
+        target_tok = re.split(r"[\s（(]", raw_target, maxsplit=1)[0].strip().strip("`")
+        ns = citation_table if is_citation else traditional_footnotes
+        if fn_id in ns:
+            existing = ns[fn_id]
+            if existing == _DUPLICATE_CITATION_TARGET or existing != target_tok:
+                ns[fn_id] = _DUPLICATE_CITATION_TARGET
+            continue
+        ns[fn_id] = target_tok
+    return traditional_footnotes, citation_table
+
+
 def parse_footnotes(markdown_text: str) -> dict[str, str]:
-    """Parse Markdown footnote definitions ``[^id]: target`` into ``{id: target_prefix}``."""
-    footnotes: dict[str, str] = {}
-    for line in markdown_text.splitlines():
-        m = _FOOTNOTE_DEF_RE.match(line)
-        if m:
-            fn_id = m.group(1).strip()
-            raw_target = m.group(2).strip()
-            # Keep the primary locator token before any parenthetical commentary
-            target_tok = re.split(r"[\s（(]", raw_target, maxsplit=1)[0].strip()
-            footnotes[fn_id] = target_tok
-    return footnotes
+    """Parse Markdown footnote definitions ``[^id]: target`` and ``[引用N]: target`` (under ``## 引用``) into ``{id: target_prefix}``."""
+    traditional_footnotes, citation_table = _parse_footnote_namespaces(markdown_text)
+    merged = {
+        (f"^{k}" if _is_citation_id(k) else k): v
+        for k, v in traditional_footnotes.items()
+    }
+    merged.update(citation_table)
+    return merged
 
 
 def parse_facts_ledger(facts_markdown: str) -> dict[str, dict[str, Any]]:
@@ -629,20 +700,152 @@ def _clean_metric_header(header_text: str) -> str:
     return cleaned or header_text.strip(" *")
 
 
+def _is_citation_id(fn_id: str | None) -> bool:
+    return bool(fn_id and re.match(r"^(?:回报)?引用\d+$", fn_id.strip()))
+
+
+def _format_extracted_ref_id(m: re.Match[str]) -> str:
+    if m.group(2) is not None:
+        return m.group(2).strip()
+    raw_id = (m.group(1) or "").strip()
+    return f"^{raw_id}" if _is_citation_id(raw_id) else raw_id
+
+
 def _resolve_footnote_target(
-    fn_id: str | None, footnotes: dict[str, str]
+    fn_id: str | None,
+    traditional_footnotes: dict[str, str],
+    citation_table: dict[str, str] | None = None,
 ) -> str | None:
-    """Resolve footnote ID to its target prefix, supporting inline [^E0001] and [^E-...] evidence refs."""
+    """Resolve footnote ID to its target prefix, keeping ``[引用N]`` and ``[^id]`` in separate namespaces."""
     if not fn_id:
         return None
-    if fn_id in footnotes:
-        return footnotes[fn_id]
     s = fn_id.strip()
-    if re.match(r"^E-?\d+$", s, re.IGNORECASE) or s.upper().startswith("E-"):
-        return f"evidence:{s}"
-    if s.startswith(("evidence:", "run:", "filing:", "attachment:")):
-        return s
+    cits = (
+        citation_table
+        if citation_table is not None
+        else {k: v for k, v in traditional_footnotes.items() if _is_citation_id(k)}
+    )
+    if _is_citation_id(s):
+        norm_s = re.sub(r"\s+", "", s)
+        target = cits.get(norm_s) or cits.get(s)
+        if target and target != _DUPLICATE_CITATION_TARGET and target.startswith(_KNOWN_SOURCE_PREFIXES):
+            return target
+        return None
+    trad_key = s[1:] if s.startswith("^") else s
+    if citation_table is None and _is_citation_id(trad_key):
+        target = traditional_footnotes.get(f"^{trad_key}")
+        if target is not None:
+            return None if target == _DUPLICATE_CITATION_TARGET else target
+    elif trad_key in traditional_footnotes:
+        target = traditional_footnotes[trad_key]
+        return None if target == _DUPLICATE_CITATION_TARGET else target
+    if re.match(r"^E-?\d+$", trad_key, re.IGNORECASE) or trad_key.upper().startswith("E-"):
+        return f"evidence:{trad_key}"
+    if trad_key.startswith(("evidence:", "run:", "filing:", "attachment:")):
+        return trad_key
     return None
+
+
+def _find_all_footnotes(text: str) -> list[str]:
+    """Extract all ``[^id]`` and ``[引用N]`` identifiers in order of appearance."""
+    return [
+        _format_extracted_ref_id(m)
+        for m in _ANY_FOOTNOTE_REF_RE.finditer(text)
+    ]
+
+
+def _find_footnotes_for_span(line_text: str, end_pos: int) -> list[str]:
+    """Find the footnote/citation cluster at or after ``end_pos`` on ``line_text``."""
+    matches = [
+        (m.start(), m.end(), _format_extracted_ref_id(m))
+        for m in _ANY_FOOTNOTE_REF_RE.finditer(line_text)
+    ]
+    if not matches:
+        return []
+    first_idx: int | None = None
+    for idx, (start, _end, _fid) in enumerate(matches):
+        if start >= end_pos - 1:
+            first_idx = idx
+            break
+    if first_idx is not None:
+        cluster = [matches[first_idx][2]]
+        k = first_idx + 1
+        while k < len(matches):
+            between = line_text[matches[k - 1][1] : matches[k][0]]
+            if re.fullmatch(r"[\s,，、/；;]*", between):
+                cluster.append(matches[k][2])
+                k += 1
+            else:
+                break
+        return cluster
+    # Fallback: last cluster on the line
+    last_idx = len(matches) - 1
+    start_idx = last_idx
+    while start_idx > 0:
+        between = line_text[matches[start_idx - 1][1] : matches[start_idx][0]]
+        if re.fullmatch(r"[\s,，、/；;]*", between):
+            start_idx -= 1
+        else:
+            break
+    return [matches[k][2] for k in range(start_idx, last_idx + 1)]
+
+
+def _resolve_footnote_bundle(
+    fn_ids: list[str],
+    traditional_footnotes: dict[str, str],
+    citation_table: dict[str, str] | None = None,
+) -> tuple[str | None, str | None, list[str], list[str], list[str], list[str]]:
+    """Resolve a list of footnote/citation IDs into primary ID/target, all targets, missing citations, and duplicate citations."""
+    cits = (
+        citation_table
+        if citation_table is not None
+        else {k: v for k, v in traditional_footnotes.items() if _is_citation_id(k)}
+    )
+    fn_id = fn_ids[0] if fn_ids else None
+    targets: list[str] = []
+    missing_citations: list[str] = []
+    duplicate_citations: list[str] = []
+    for fid in fn_ids:
+        if _is_citation_id(fid):
+            s = re.sub(r"\s+", "", fid.strip())
+            raw_entry = cits.get(s) or cits.get(fid.strip())
+            if raw_entry == _DUPLICATE_CITATION_TARGET:
+                label = f"[{s}]"
+                if label not in duplicate_citations:
+                    duplicate_citations.append(label)
+                continue
+            target = _resolve_footnote_target(fid, traditional_footnotes, cits)
+            if target is not None:
+                if target not in targets:
+                    targets.append(target)
+            else:
+                label = f"[{s}]"
+                if label not in missing_citations:
+                    missing_citations.append(label)
+        else:
+            trad_key = fid.strip()[1:] if fid.strip().startswith("^") else fid.strip()
+            raw_entry = (
+                traditional_footnotes.get(f"^{trad_key}")
+                if citation_table is None and _is_citation_id(trad_key)
+                else traditional_footnotes.get(trad_key)
+            )
+            if raw_entry == _DUPLICATE_CITATION_TARGET:
+                label = f"[^{trad_key}]"
+                if label not in duplicate_citations:
+                    duplicate_citations.append(label)
+                continue
+            target = _resolve_footnote_target(fid, traditional_footnotes, cits)
+            if target is not None and target not in targets:
+                targets.append(target)
+    fn_target = targets[0] if targets else None
+    return (
+        fn_id,
+        fn_target,
+        list(fn_ids),
+        targets,
+        missing_citations,
+        duplicate_citations,
+    )
 
 
 def _split_md_table_row(line: str) -> list[str]:
@@ -672,7 +875,7 @@ def _mask_excluded_spans(line: str) -> str:
 
     _blank(_INLINE_CODE_RE)
     _blank(_MARKDOWN_LINK_RE)
-    _blank(_FOOTNOTE_REF_RE)
+    _blank(_ANY_FOOTNOTE_REF_RE)
     _blank(_SEC_ACCESSION_RE)
     _blank(_HYPHEN_DOC_CODE_RE)
     _blank(_ISO_DATE_RE)
@@ -692,7 +895,7 @@ def _mask_excluded_spans(line: str) -> str:
 
 def extract_figures(markdown_text: str) -> list[ExtractedFigure]:
     """Extract all figures (including exempt ones marked ``exempt=True``) from Markdown text (PK.9)."""
-    footnotes = parse_footnotes(markdown_text)
+    traditional_footnotes, citation_table = _parse_footnote_namespaces(markdown_text)
     lines = markdown_text.splitlines()
 
     figures: list[ExtractedFigure] = []
@@ -706,7 +909,7 @@ def extract_figures(markdown_text: str) -> list[ExtractedFigure]:
 
     # Track Markdown table state
     table_headers: list[str] | None = None
-    table_shared_footnote: str | None = None
+    table_shared_footnotes: list[str] = []
     table_caption: str = ""
 
     i = 0
@@ -736,8 +939,8 @@ def extract_figures(markdown_text: str) -> list[ExtractedFigure]:
             i += 1
             continue
 
-        # Footnote definition line
-        if _FOOTNOTE_DEF_RE.match(raw_line):
+        # Footnote or citation definition line
+        if _FOOTNOTE_DEF_RE.match(raw_line) or _CITATION_DEF_RE.match(raw_line):
             i += 1
             continue
 
@@ -751,7 +954,7 @@ def extract_figures(markdown_text: str) -> list[ExtractedFigure]:
                 current_section_period = normalize_period(pm.group(1))
             last_caption_line = heading_text
             table_headers = None
-            table_shared_footnote = None
+            table_shared_footnotes = []
             table_caption = ""
             # Strip heading numbering before scanning heading for any actual financial numbers
             scan_line = _HEADING_PREFIX_RE.sub(
@@ -764,7 +967,7 @@ def extract_figures(markdown_text: str) -> list[ExtractedFigure]:
 
         if not stripped:
             table_headers = None
-            table_shared_footnote = None
+            table_shared_footnotes = []
             table_caption = ""
             i += 1
             continue
@@ -781,9 +984,9 @@ def extract_figures(markdown_text: str) -> list[ExtractedFigure]:
             ):
                 table_headers = cells
                 table_caption = last_caption_line
-                fn_m = _FOOTNOTE_REF_RE.search(stripped)
-                if fn_m:
-                    table_shared_footnote = fn_m.group(1)
+                hdr_fns = _find_all_footnotes(stripped)
+                if hdr_fns:
+                    table_shared_footnotes = hdr_fns
                 i += 2
                 continue
             if _is_separator_row(cells):
@@ -791,18 +994,17 @@ def extract_figures(markdown_text: str) -> list[ExtractedFigure]:
                 continue
 
             if table_headers is not None and cells:
-                row_header = _FOOTNOTE_REF_RE.sub("", cells[0]).strip(" *")
+                row_header = _ANY_FOOTNOTE_REF_RE.sub("", cells[0]).strip(" *")
                 if row_header.lower() in ("来源", "数据来源", "source", "sources"):
-                    fn_m = _FOOTNOTE_REF_RE.search(stripped)
-                    if fn_m:
-                        table_shared_footnote = fn_m.group(1)
+                    src_fns = _find_all_footnotes(stripped)
+                    if src_fns:
+                        table_shared_footnotes = src_fns
                     i += 1
                     continue
 
-                row_fn_m = _FOOTNOTE_REF_RE.search(cells[0])
-                row_fn = row_fn_m.group(1) if row_fn_m else None
+                row_fns = _find_all_footnotes(cells[0])
                 table_header_0 = (
-                    _FOOTNOTE_REF_RE.sub("", table_headers[0]).strip(" *")
+                    _ANY_FOOTNOTE_REF_RE.sub("", table_headers[0]).strip(" *")
                     if table_headers
                     else ""
                 )
@@ -820,25 +1022,15 @@ def extract_figures(markdown_text: str) -> list[ExtractedFigure]:
                 for col_idx in range(start_col, len(cells)):
                     cell_text = cells[col_idx]
                     col_header = (
-                        _FOOTNOTE_REF_RE.sub("", table_headers[col_idx]).strip(" *")
+                        _ANY_FOOTNOTE_REF_RE.sub("", table_headers[col_idx]).strip(" *")
                         if col_idx < len(table_headers)
                         else ""
                     )
-                    col_fn_m = (
-                        _FOOTNOTE_REF_RE.search(table_headers[col_idx])
+                    col_fns = (
+                        _find_all_footnotes(table_headers[col_idx])
                         if col_idx < len(table_headers)
-                        else None
+                        else []
                     )
-                    col_fn = col_fn_m.group(1) if col_fn_m else None
-
-                    cell_fn_m = _FOOTNOTE_REF_RE.search(cell_text)
-                    fn_id = (
-                        (cell_fn_m.group(1) if cell_fn_m else None)
-                        or row_fn
-                        or col_fn
-                        or table_shared_footnote
-                    )
-                    fn_target = _resolve_footnote_target(fn_id, footnotes)
 
                     eff_row_header = "" if col_idx == 0 else row_header
                     clean_row = _clean_metric_header(eff_row_header)
@@ -895,6 +1087,20 @@ def extract_figures(markdown_text: str) -> list[ExtractedFigure]:
                         if is_neg:
                             val = -val
 
+                        raw_cell_end = nm.start() + len(nm.group("full").rstrip())
+                        cell_fns = _find_footnotes_for_span(cell_text, raw_cell_end)
+                        eff_fns = cell_fns or row_fns or col_fns or table_shared_footnotes
+                        (
+                            fn_id,
+                            fn_target,
+                            fn_ids,
+                            fn_targets,
+                            missing_cits,
+                            dup_cits,
+                        ) = _resolve_footnote_bundle(
+                            eff_fns, traditional_footnotes, citation_table
+                        )
+
                         currency, unit, scale = _determine_unit_and_scale(
                             nm.group("currency"),
                             nm.group("scale"),
@@ -923,6 +1129,10 @@ def extract_figures(markdown_text: str) -> list[ExtractedFigure]:
                                 label_hint=label_hint,
                                 footnote_id=fn_id,
                                 footnote_target=fn_target,
+                                footnote_ids=fn_ids,
+                                footnote_targets=fn_targets,
+                                missing_citations=missing_cits,
+                                duplicate_citations=dup_cits,
                                 location={
                                     "line": line_no,
                                     "table": True,
@@ -939,7 +1149,7 @@ def extract_figures(markdown_text: str) -> list[ExtractedFigure]:
                 continue
         else:
             table_headers = None
-            table_shared_footnote = None
+            table_shared_footnotes = []
             table_caption = ""
             if len(stripped) <= 80:
                 last_caption_line = stripped
@@ -957,7 +1167,7 @@ def extract_figures(markdown_text: str) -> list[ExtractedFigure]:
 
         # Mask filing forms (e.g. "10-Q" in "Q2 10-Q") and inline refs before scanning for period tokens
         period_scan_line = scan_line
-        for pat in (_INLINE_CODE_RE, _MARKDOWN_LINK_RE, _FOOTNOTE_REF_RE, _FILING_FORM_RE):
+        for pat in (_INLINE_CODE_RE, _MARKDOWN_LINK_RE, _ANY_FOOTNOTE_REF_RE, _FILING_FORM_RE):
             period_scan_line = pat.sub(lambda m: " " * len(m.group(0)), period_scan_line)
         line_periods = sorted(
             [
@@ -966,10 +1176,6 @@ def extract_figures(markdown_text: str) -> list[ExtractedFigure]:
             ]
             + [(pos, "LTM") for pos in match_ltm_periods(period_scan_line)]
         )
-        line_footnotes = [
-            (fm.start(), fm.group(1))
-            for fm in _FOOTNOTE_REF_RE.finditer(raw_line)
-        ]
 
         is_exempt = is_blockquote or has_exempt_marker(raw_line)
         exempt_reason = (
@@ -1023,15 +1229,19 @@ def extract_figures(markdown_text: str) -> list[ExtractedFigure]:
                     if following_same_clause:
                         period = following_same_clause[0]
 
-            # Nearest footnote at or after this number on the same line
-            fn_id: str | None = None
+            # Nearest footnote/citation cluster at or after this number on the same line
             raw_tok_end = nm.start() + len(nm.group("full").rstrip())
-            after_fns = [fid for pos, fid in line_footnotes if pos >= raw_tok_end - 1]
-            if after_fns:
-                fn_id = after_fns[0]
-            elif line_footnotes:
-                fn_id = line_footnotes[-1][1]
-            fn_target = _resolve_footnote_target(fn_id, footnotes)
+            fn_cluster = _find_footnotes_for_span(raw_line, raw_tok_end)
+            (
+                fn_id,
+                fn_target,
+                fn_ids,
+                fn_targets,
+                missing_cits,
+                dup_cits,
+            ) = _resolve_footnote_bundle(
+                fn_cluster, traditional_footnotes, citation_table
+            )
 
             metric = _extract_metric_from_context(scan_line, nm.start(), nm.end())
             ctx_left = scan_line[max(0, nm.start() - 25) : nm.start()]
@@ -1066,6 +1276,10 @@ def extract_figures(markdown_text: str) -> list[ExtractedFigure]:
                     label_hint="reported",
                     footnote_id=fn_id,
                     footnote_target=fn_target,
+                    footnote_ids=fn_ids,
+                    footnote_targets=fn_targets,
+                    missing_citations=missing_cits,
+                    duplicate_citations=dup_cits,
                     location={
                         "line": line_no,
                         "table": False,
@@ -1288,7 +1502,7 @@ async def label_figures_with_status(
             )
         return figures, False
 
-    footnotes = parse_footnotes(markdown_text)
+    traditional_footnotes, citation_table = _parse_footnote_namespaces(markdown_text)
     lines = markdown_text.splitlines()
     outline, chunks = _split_markdown_sections_and_chunks(markdown_text, max_chunk_chars=6000)
 
@@ -1313,8 +1527,17 @@ async def label_figures_with_status(
                 s_idx = fig_ordinal_map[sub[0].id]
                 e_idx = fig_ordinal_map[sub[-1].id]
                 batches.append((sec_title, c_start, chunk_text, sub, s_idx, e_idx))
-        elif chunk_text.strip():
-            batches.append((sec_title, c_start, chunk_text, [], 0, 0))
+        elif chunk_text.strip() and sec_title.strip() != "引用":
+            non_def_lines = [
+                ln
+                for ln in chunk_text.splitlines()
+                if ln.strip()
+                and not ln.strip().startswith("#")
+                and not _FOOTNOTE_DEF_RE.match(ln)
+                and not _CITATION_DEF_RE.match(ln)
+            ]
+            if non_def_lines:
+                batches.append((sec_title, c_start, chunk_text, [], 0, 0))
 
     leftover = [f for f in figures if f.id not in assigned_ids]
     if leftover:
@@ -1557,17 +1780,19 @@ async def label_figures_with_status(
                 if selected_raw is None or raw_pos < 0:
                     continue
                 raw_sub = selected_raw
-                line_fns = [
-                    (fm.start(), fm.group(1))
-                    for fm in _FOOTNOTE_REF_RE.finditer(matched_line_text)
-                ]
-                fn_id: str | None = None
-                after_fns = [fid for pos, fid in line_fns if pos >= raw_pos + len(raw_sub) - 1]
-                if after_fns:
-                    fn_id = after_fns[0]
-                elif line_fns:
-                    fn_id = line_fns[-1][1]
-                fn_target = _resolve_footnote_target(fn_id, footnotes)
+                fn_cluster = _find_footnotes_for_span(
+                    matched_line_text, raw_pos + len(raw_sub)
+                )
+                (
+                    fn_id,
+                    fn_target,
+                    fn_ids,
+                    fn_targets,
+                    missing_cits,
+                    dup_cits,
+                ) = _resolve_footnote_bundle(
+                    fn_cluster, traditional_footnotes, citation_table
+                )
                 is_exempt = matched_line_text.strip().startswith(">") or has_exempt_marker(matched_line_text)
                 kind_val = (
                     extra.kind.lower()
@@ -1599,6 +1824,10 @@ async def label_figures_with_status(
                     label_hint=kind_val,
                     footnote_id=fn_id,
                     footnote_target=fn_target,
+                    footnote_ids=fn_ids,
+                    footnote_targets=fn_targets,
+                    missing_citations=missing_cits,
+                    duplicate_citations=dup_cits,
                     location={
                         "line": matched_line_no,
                         "table": False,

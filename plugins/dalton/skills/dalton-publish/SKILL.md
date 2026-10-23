@@ -27,6 +27,8 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 3. `prov:<provenance_record_id>`：指向本工作区线程的 provenance 来源记录。**凡是标注为"一致预期 / consensus"的数字，必须指向一致预期接口记录（provider 前缀 `estimates:` 或 `yf_analysis`，或 identity `street_estimate`）**。
 4. `f:<id>`：指向 `attachments` 中 `role="facts"` 附件（如 `drafts/<slug>.facts.md`）内 `<!-- FACTS-LEDGER -->` 表格的对应行，核验引擎会继续校验该行的 `ref`。
 
+若报告正文采用 `[引用N]`（如 `（UBS [引用9]）` 或 `[引用3][引用5]`），**末尾必须附引用表**：在报告末尾的 `## 引用` 一节按每行一条列出对应关系（例如 `[引用1]: evidence:E-20261023-01` 或 `[引用3]: model:model/META-model-v01.xlsx!DCF!C12`，模型单元格分隔符 `#` 与 `!` 均支持）。
+
 豁免规则：
 - 引用块（`> ...`）中管理层原话里的数字自动豁免；
 - 显式带 `〔示意〕`、`[示意]`、`（示意）`、`〔假设〕`、`[假设]`、`（假设）`、`〔估计〕`、`[估计]`、`（估计）`、`〔举例〕`、`[举例]`、`（举例）` 标记的数字自动豁免。

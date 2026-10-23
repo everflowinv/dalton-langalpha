@@ -137,6 +137,7 @@
   ```
   超过 3 个月的材料在日期后标 `（超 3 个月）`。
 - 清单末尾附 **信源覆盖段**：说明内部库（sales-notes、tmtb、funda-ai、company-wiki）、AlphaEngine（foreign_report、sell_side_comment、meeting_minutes）、Guidepoint、SEC filing 等各来源命中数与实际采用数，未取得的写明原因（无相关结果 / 渠道失败 / 未覆盖）。
+- **末尾必须附引用表**：在报告末尾的 `## 引用` 一节每行一条写出对应关系，形如 `[引用1]: evidence:E-20261023-01` 或 `[引用3]: model:model/META-model-v01.xlsx!DCF!C12`（右边为 `evidence:`、`model:`、`prov:`、`f:` 之一）。
 
 ---
 

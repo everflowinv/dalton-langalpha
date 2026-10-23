@@ -89,6 +89,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
    - 若用户之前曾手动关闭过跟踪（任务元数据含 `paused_by_user`），`source="coverage_finish"` 会自动跳过重新开启并保持关闭状态，不要强制覆盖用户选择。
 
 4. **汇报与可选发布**
+   - 末尾必须附引用表：确认报告末尾的 `## 引用` 一节已按每行一条写出对应关系（形如 `[引用1]: evidence:E-20261023-01` 或 `[引用3]: model:model/META-model-v01.xlsx!DCF!C12`）。
    - 可调用 `check_draft(draft_path="drafts/<D>-initial-coverage.md")` 检查数字核验反馈。
    - 向 PM 汇报核心判断（≤3 句）、12 问重点题结论、估值分解结果、初始倾向（关注 / 观察 / 暂不覆盖 / 建议推进完整覆盖）、研究议程及自动跟踪状态。
    - 初次覆盖默认保留为草稿；若 PM 明确要求正式发布，调用 `publish_report(draft_path="drafts/<D>-initial-coverage.md", title="...", kind="initial_coverage", slug="...")`。

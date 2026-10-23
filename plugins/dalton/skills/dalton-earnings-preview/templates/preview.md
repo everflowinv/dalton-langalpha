@@ -121,3 +121,8 @@
 ### 引用清单
 1. `[引用1]` {机构／作者身份}，《{标题}》，{YYYY-MM-DD}，{doc_id / mail:ID / তমtb:ID / funda:ID / SEC URL}，{章节／页码／图片 ID}。
 2. `[引用2]` ……
+
+<!-- 末尾必须附引用表 -->
+## 引用
+[引用1]: evidence:E-20261023-01
+[引用2]: model:model/META-model-v01.xlsx!DCF!C12

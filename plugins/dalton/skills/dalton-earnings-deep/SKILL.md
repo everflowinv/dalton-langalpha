@@ -108,6 +108,7 @@ Workflow 结束后（或独立模式完成后），由当前主智能体读取 `
    - 在 `agenda_ops` 中写入下一季需要跟踪验证的事项；
    - **重大异常升级（PM Escalation）**：若终判为 `THESIS_BROKEN` 或任一核心支柱状态变为 `impaired` / `broken`，必须立即通过通知渠道推送 PM，并在 `agenda_ops` 中写入一条 `pm_handoffs`（PK.14）。
 3. **草稿核验与发布/推送**：
+   - 末尾必须附引用表：在报告末尾的 `## 引用` 一节按每行一条写出对应关系（形如 `[引用1]: evidence:E-20261023-01` 或 `[引用3]: model:model/META-model-v01.xlsx!DCF!C12`）；
    - 调用 `check_draft` 生成数字核验报告 `drafts/<D>-deep-<quarter>.audit.md`；
    - 当 PM 要求正式发布时，调用 `publish_report(draft_path="drafts/<D>-deep-<quarter>.md", kind="earnings_review", attachments=[新模型路径])`；
    - 将深度报告核心结论、前瞻对账得分、模型变动及 thesis 校准摘要推送给 PM。
