@@ -35,7 +35,7 @@ Dalton 继承 `.agents/skills/research-conventions/SKILL.md` 的通用投研纪�
 5. **区分来源身份，合并转述链**：公司指引、卖方一致预期、具体机构预测、明确的买方门槛、专家单一来源估计、作者判断必须分开标注；同一份研报被多渠道转述只算一条。
 6. **先量化异动，再找原因**：股价波动先用同组公司（peers）和板块 ETF 分清是板块 beta 还是个股 alpha，再按层级排查原因。
 7. **只写重要变化**：日常跟踪无实质变化就不推送；成稿坚持判断先行，中文交付并保留英文专业术语。
-8. **诚实汇报边界**：拿不到的数据写"本轮未取得"（不等于"公司未披露"）；没有把握时说明缺什么证据，不用相近口径顶替。
+8. **诚实汇报边界**：拿不到的数据写"本轮未取得"（不等于"公司未披露"）；没有把握时说明缺什么证据，不用相近口径顶替。**`ok: false` 不等于"没有数据"**：调用 `researchdata` 返回 `ok: false` 时，必须按返回中的 `hint` 处理（修正参数、换 `operation` 或换替代数据源重试）；如果仍无法解决，必须在报告里如实写明这个数据源取数失败（及错误类别），**严禁把 `ok: false` 写成"没有相关信息"或"没有数据"**。真正的"没有匹配"返回 `ok: true` 加空结果并带 `empty_reason`。
 9. **解释类回答的多源印证**：解释类回答的可信度来自不同类型来源的相互印证：事实来源加至少一类解读来源（卖方、专家或管理层原话）；只拿到一类时，在回答里写明缺哪一类；不用一条卖方观点代表市场共识。
 
 ## 4. 按任务找参考
@@ -65,7 +65,7 @@ Dalton 继承 `.agents/skills/research-conventions/SKILL.md` 的通用投研纪�
 
 ## 6. 数据入口速查
 
-- **内部研究与另类数据（`researchdata`）**：各来源提供的证据与 `research` 路由选用规则，统一以 `<mcp-servers>` 中 `researchdata` 的说明与 `.agents/tools/docs/researchdata/research.md`（由 `scripts/dalton/researchdata_bridge.py` 的 `RESEARCH_EVIDENCE_AND_ROUTE_GUIDE` 单一来源生成，并在运行期结合 `catalog()`）为准；此外，`finance` 工具支持 `sec`、`estimates`、`cn-hk`，`macro` 工具支持 `fred`、`treasury`。
+- **内部研究与另类数据（`researchdata`）**：各来源提供的证据与 `research` 路由选用规则，统一以 `<mcp-servers>` 中 `researchdata` 的说明与 `.agents/tools/docs/researchdata/research.md`（由 `scripts/dalton/researchdata_bridge.py` 的 `RESEARCH_EVIDENCE_AND_ROUTE_GUIDE` 单一来源生成，并在运行期结合 `catalog()` / `catalog(route=...)`）为准；此外，`finance` 工具支持 `sec`、`estimates`、`cn-hk`，`macro` 工具支持 `fred`、`treasury`、`market-regime`，`community` 工具支持 `xueqiu`、`employee`、`last30days`、`x-timeline`。不确定路由参数时先查 `catalog(route=...)`；每次返回均带 `normalized_params` 展示实际生效的标准参数；遇到 `ok: false` 必须按 `hint` 处理或如实报告数据源取数失败，不得当成"没有数据"。
 - **一手 SEC 财报与核验（`dalton_sec`）**：美股使用 `get_company_facts`（提取 R1–R10 规范期间与衍生单季值）、`list_filings`（按 accession 列举申报文件并配合脚本核验）。
 - **港股与 A 股公告及数据（`cn-hk`）**：调用 `researchdata.finance(route="cn-hk", operation="filings", ticker=..., start=..., end=..., limit=...)` 获取巨潮资讯（cninfo）A 股/港股公告与 PDF 链接（港股传 5 位纯数字如 `"00700"`，A 股传 6 位纯数字如 `"600519"`；查不到，或者需要仅英文版的公告时，再用 `web_search` 查 `site:hkexnews.hk`）；调用 `researchdata.finance(route="cn-hk", operation="ask", query=..., limit=...)` 查询行情、资金流、两融、龙虎榜、股东、分红回购、AH 溢价及财务表初值（平台财务表属二手初值，核心财务数字必须回公告原文核实；回报与估值须核对复权、分红、拆股与交易/报表币种）。
 - **行情与历史估值（默认 `yfinance`）**：股价、复权收益率与相对表现默认使用 `yf_price`（配合 `.agents/skills/research-conventions/references/market-data-rules.md` 统一基准日）；历史估值倍数使用 `fundamentals.get_historical_valuation` 或 `yf_fundamentals`。

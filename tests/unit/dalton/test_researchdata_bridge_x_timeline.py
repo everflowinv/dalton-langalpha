@@ -342,35 +342,40 @@ class TestXTimelineParamValidation:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         bridge = _make_bridge(tmp_path, monkeypatch)
-        exec_mock, _calls = _xreach_exec_double(_load_fixture())
+        exec_mock, calls = _xreach_exec_double(_load_fixture())
         monkeypatch.setattr(asyncio, "create_subprocess_exec", exec_mock)
 
-        for idx, legacy in enumerate(("params", "start", "end")):
-            body = await _call(
-                bridge,
-                500 + idx,
-                {"route": "x-timeline", "handle": "nvidia", legacy: "2026-10-01"},
-            )
-            assert body["ok"] is False, f"expected rejection for {legacy}"
-            assert body["status"] == "invalid_arguments"
-            assert "since/until" in body["error"]
+        # `params` is not accepted on x-timeline -> rejected with unknown_parameters
+        body_params = await _call(
+            bridge,
+            500,
+            {"route": "x-timeline", "handle": "nvidia", "params": {"offset": 0}},
+        )
+        assert body_params["ok"] is False
+        assert body_params["status"] == "invalid_arguments"
+        assert body_params["error_code"] == "unknown_parameters"
         assert exec_mock.await_count == 0
 
-        # `timeout` is injected by the PTC wrapper on every call; it must be accepted and ignored
-        # (along with the other generic params `limit`/`mode`, which never reach xreach).
+        # `start`/`end`/`limit` on x-timeline map to `since`/`until`/`count` (and `timeout`/`mode` are ignored)
         body = await _call(
             bridge,
             510,
             {
                 "route": "x-timeline",
                 "handle": "nvidia",
-                "timeout": 180,
+                "start": "2026-10-21",
+                "end": "2026-10-21",
                 "limit": 3,
+                "timeout": 180,
                 "mode": "fetch",
             },
         )
         assert body["ok"] is True, body
-        assert body["data"]["returned"] == 15  # count defaults to 20, nothing truncated
+        assert body["data"]["returned"] == 3
+        assert calls[0][3:5] == ["-n", "3"]
+        assert body["normalized_params"]["since"] == "2026-10-21"
+        assert body["normalized_params"]["until"] == "2026-10-21"
+        assert body["normalized_params"]["count"] == 3
 
 
 class TestXTimelineNormalization:
@@ -441,8 +446,9 @@ class TestXTimelineNormalization:
         body_out = await _call(
             bridge, 9, {"route": "x-timeline", "handle": "nvidia", "until": "2026-10-20", "count": 20}
         )
-        assert body_out["ok"] is False
+        assert body_out["ok"] is True
         assert body_out["status"] == "empty"
+        assert body_out["empty_reason"] == "no_matching_items"
 
     def test_source_identity_dedupes_by_status_id(self) -> None:
         item = _load_fixture()["items"][0]
@@ -520,6 +526,54 @@ class TestXTimelineNormalization:
         body_full = await _call(bridge, 31, {"route": "x-timeline", "handle": "nvidia", "count": 20})
         assert len(body_full["data"]["items"]) == 15  # nothing truncated
         assert body_full["data"]["has_more"] is False  # upstream hasMore preserved
+
+    @pytest.mark.asyncio
+    async def test_exit_zero_with_429_error_json_returns_ok_false_and_is_error_true(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bridge = _make_bridge(tmp_path, monkeypatch)
+        exec_mock, _calls = _xreach_exec_double(
+            {"ok": False, "error": "HTTP 429 Too Many Requests: rate limit exceeded"}
+        )
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", exec_mock)
+
+        resp = await bridge.handle_tools_call(
+            40,
+            {
+                "name": "community",
+                "arguments": {"route": "x-timeline", "handle": "nvidia", "count": 5},
+            },
+        )
+        assert resp["result"]["isError"] is True
+        body = json.loads(resp["result"]["content"][0]["text"])
+        assert body["ok"] is False
+        assert "empty_reason" not in body
+        assert body["error_category"] == "权限或额度"
+        assert "429 Too Many Requests" in body["error"]
+        assert body["hint"]
+
+    @pytest.mark.asyncio
+    async def test_exit_zero_with_status_rate_limited_only_returns_ok_false(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bridge = _make_bridge(tmp_path, monkeypatch)
+        # X exits 0 with ONLY {"status": "rate_limited"} (no ok, no error) -> must stay ok=False, isError=True
+        exec_mock, _calls = _xreach_exec_double({"status": "rate_limited"})
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", exec_mock)
+        resp_status = await bridge.handle_tools_call(
+            41,
+            {
+                "name": "community",
+                "arguments": {"route": "x-timeline", "handle": "nvidia", "count": 5},
+            },
+        )
+        assert resp_status["result"]["isError"] is True
+        body_status = json.loads(resp_status["result"]["content"][0]["text"])
+        assert body_status["ok"] is False
+        assert "empty_reason" not in body_status
+        assert body_status["error_category"] == "权限或额度"
+        assert "rate_limited" in body_status["error"]
+        assert body_status["hint"]
 
 
 class TestXreachVersionProbe:
