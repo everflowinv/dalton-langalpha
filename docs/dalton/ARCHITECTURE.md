@@ -80,25 +80,27 @@ Docker（colima，数据盘在 EveSSD）
   - `thesis.official` 只能通过发布来写；
   - house view 的目标价必须指向 `models.json` 里登记过的模型单元格。
 - **版本**：每个版本留一份快照 `history/<doc>/<UTC>-vNNNN.json`。数据库表 `dalton_knowledge_versions` 不允许删除，也不允许改内容；`dalton_verdicts` 不允许修改。
-- **手动修改**：用户直接改了文件，回合结束后系统会检测到，下一回合自动同步（`src/dalton/knowledge/reconcile.py`，钩子 `knowledge-reconcile`）。
+- **手动修改**（`src/dalton/knowledge/reconcile.py`，钩子 `knowledge-reconcile`）：
+  - 改了渲染出来的 `.md`：修改稿存入 `history/`，记一条 `source=direct_edit` 的版本和 `rendered_md_edited` 警告，Markdown 从最近一次有效的 JSON 重新生成；分析师需要用 `knowledge_update` 把修改合入；
+  - 改了 `data/*.json`：按 schema 校验，通过的作为新版本，不通过的回退并记警告。
 
 ## 5. 发布治理
 
 `publish_report`（`src/dalton/tools/publish_tools.py`）对应的状态机在 `src/dalton/publish/service.py`，状态保存在 `dalton_publish_requests` 表：
 
-1. **数字核验**：报告里的每个数字，都要对照 thesis 的证据、模型单元格、来源记录和事实底表，最后由 LLM 判定。只要有未核实或互相矛盾的数字，状态就是 `audit_failed`。
+1. **数字核验**（`src/dalton/publish/audit.py`、`numbers.py`）：先做确定性匹配，对照 thesis 的证据、模型单元格、来源记录和事实底表；匹配不上且符合条件的，再交给 LLM 判定，并校验它引用的依据。有 `unverified` 或 `contradicted` 的数字，状态就是 `audit_failed`；`uncertain` 的交给 PM；明确标为假设、估计、示意的数字和结构性数字豁免。
 2. **独立审稿**：审稿人从 `publish.reviewer_models`（`src/dalton/dalton.yaml`）里挑，必须和作者属于不同的模型家族（`src/dalton/publish/review.py`），按 7 项检查。审稿意见为"需修改"时，状态是 `review_revise`。
 3. **PM 审批**：
    - 交互式线程里会弹出审批卡片（`PublishApprovalCard.tsx`，钩子 `publish-card`）；
    - 自动任务里不打断，状态停在 `awaiting_pm`，并在议程里加一项待审批；
-   - 只有 `DALTON_PM_USER_IDS` 里的用户能批准。
-4. **一次批准对应一次发布**：批准之后，草稿内容的 sha256 一旦变化，状态就变成 `superseded`。
+   - 只有 `DALTON_PM_USER_IDS` 里的用户能批准，而且发布请求必须属于当前用户。所以目前不是一个"任意 PM 都能接手同事请求"的团队审批队列。
+4. **一次批准对应一次发布**：批准绑定的是正文加附件组成的发布包的 sha256；在消费这次批准之前，发布包一旦变化，状态就变成 `superseded`。已经完成的发布不受之后草稿修改的影响。
 5. **写入**：
-   - 生成不可修改的文件 `published/<日期>-<slug>.md`，以及可选的 `.xlsx`；
+   - 生成 `published/<日期>-<slug>.md`，以及可选的 `.xlsx`。按约定不覆盖，更正时发布新版本。沙箱里的文件不是操作系统层面的只读文件，但发布记录里存了校验值，文件被改动会被检测出来；
    - `dalton_publications` 和 `dalton_publication_files` 两张表不允许修改；
    - 如果设置了 `updates_thesis`，就写入 `thesis.official`。
 
-`check_draft` 只做核验、不拦截，结果写到 `drafts/<slug>.audit.md`。
+`check_draft` 只做核验、不拦截：在输入文件旁边生成 `.audit.md` 和 `.annotated.md`，原稿不动。
 
 ## 6. 自主研究
 
@@ -113,31 +115,32 @@ Docker（colima，数据盘在 EveSSD）
 |---|---|
 | `sec` | SEC EDGAR |
 | `cnhk` | 巨潮公告，覆盖 A 股和纯港股，标题匹配做了繁简归一 |
-| `internal` | 销售邮件、AlphaEngine、Guidepoint、电话会转写有没有新文档 |
+| `internal` | 销售邮件、AlphaEngine、Guidepoint 有没有新文档 |
 | `agenda` | 议程里到期的验证点和事件 |
-| `earnings` | 是否处于 T-3、T0、T+1 窗口 |
+| `earnings` | 按自然日判断是否处于财报前 1–3 天、当天、后 1 天（与一次性财报任务按工作日排期是两套算法） |
 | `calendar`、`director` | 给 Home 的任务用 |
 
-- 每个探针各自按时间退避，间隔依次为 2 分钟、10 分钟、30 分钟、2 小时。
+- 探针**失败后**各自按时间退避，间隔依次为 2 分钟、10 分钟、30 分钟、2 小时。
 - 信号存在 `dalton_signals` 表里去重，7 天过期。每次决策记录在 `dalton_preflight_log`。
-- 10-K、10-Q、8-K（Item 2.02）、巨潮 P1、议程、财报、价格这几类信号**直接唤醒**；其他信号先合并起来，用一次 assist 模型做分诊。所以严格说，预检并不是"零 token"。
+- 10-K、10-Q、20-F、8-K（Item 2.02）、巨潮 P1、议程、财报、日历、总监、排期、价格这几类信号**直接唤醒**；其他信号先合并起来，用一次 assist 模型做分诊。所以严格说，预检并不是"零 token"。
 
 **标准任务**（`src/dalton/autonomy/schedule.py`）：
 
 - 每家公司：
-  - `dalton-<t>-watch`：核心标的在交易日 06:00–20:00 每 30 分钟一次；观察名单每天 07:30 一次。
+  - `dalton-<t>-watch`：核心标的周一至周五 06:00–20:30 每 30 分钟一次；观察名单周一至周五 07:30 一次。cron 只排除周末，不识别交易所节假日。
   - `dalton-<t>-delta`：21:30。
   - `-move-up` / `-move-down`：相对前收盘涨跌超过 ±4% 时触发，冷却 24 小时。
   - 时区：A 股、港股用 Asia/Shanghai，其余用 America/New_York。
-- 财报的一次性任务：`-earn-<p>-tm3`、`-t0`、`-tp1`。
+- 财报的一次性任务（由财报日历排出，不属于公司跟踪的标准任务）：`-earn-<p>-tm3`（提前 3 个工作日 08:00）、`-t0`（登记的发布时间 + 30 分钟）、`-tp1`（下一个工作日 20:00）。
 - Home：`dalton-earnings-calendar`（周六 09:00）、`dalton-director-daily`（交易日 07:30）、`dalton-director-weekly`（周六 10:00），时区是 `autonomy.timezone`。
 - 建立方式：脚本 `scripts/dalton/bootstrap_watch.py`，或者工具 `dalton_schedule_automation`。cron 任务必须带 `next_run_at`，因为调度器只认领 `next_run_at` 不为空且已经到时间的行。见 #88。
 
-**研究总监**：`dalton_coverage_board` 给覆盖池打分，分数 = 权重 × 紧急度 × 多久没更新；`dalton_record_plan` 拒绝当天预算放不下的计划，并把计划写到 `dalton/plans/<日期>.md`。
+**研究总监**：`dalton_coverage_board` 给候选研究任务打分（`src/dalton/autonomy/board.py`），依据是问题价值、紧急度和研究的陈旧程度，不同类型的候选处理方式不同；`dalton_record_plan` 拒绝当天预算放不下的计划，并把计划写到 `dalton/plans/<日期>.md`。
 
 ## 7. 预算与计费
 
 - 只有一个约束：**每人每日的现金额度**，外加可选的单任务上限。不限调用次数，也不限重试次数（`src/dalton/budget/`）。
+  - 本地闸门要在 `HOST_MODE=oss` 且 `DALTON_BUDGET_GATE=1` 时才生效（`src/dalton/budget/gate.py`）。当前部署两者都已设置。
   - 默认每天 100 美元，按 Asia/Shanghai 的自然日计算。
   - 剩余不足 0.25 美元时拒绝新请求，返回 HTTP 429。
   - 额度按每块 1 美元预留，租期 300 秒。
@@ -147,7 +150,7 @@ Docker（colima，数据盘在 EveSSD）
 
 ## 8. 模型接入
 
-模型接入以 `src/dalton/llm/native_overlay.json` 为准，它被合并进上游模型目录（钩子 `llm-overlay`），`dalton_meta` 字段标明每个模型的家族和计费方式。
+模型目录由三部分合并而成：上游 manifest、`src/dalton/llm/native_overlay.json`、`src/dalton/llm/openclaw_overlay.json`（钩子 `llm-overlay`）。`dalton_meta` 字段标明每个模型的家族和计费方式。各个角色默认用哪个模型，由配置文件和代理定义决定。
 
 | 接入方式 | 供应商 | 说明 |
 |---|---|---|
@@ -166,7 +169,7 @@ Docker（colima，数据盘在 EveSSD）
 - 审稿人必须和作者属于不同家族；
 - 可以通过 `models.disabled_providers` 整体关掉某个供应商。
 
-**团队凭据**：在 `credentials.sharing: team` 并设置了 `DALTON_PM_USER_IDS` 时，所有凭据都解析到第一位 PM（`src/dalton/credentials.py`）。
+**团队凭据**（`src/dalton/credentials.py`）：同时满足四个条件时，经 `credential_user_id` 解析的用户模型凭据会统一落到第一位 PM 名下：Dalton 启用、使用 Dalton 的 Supabase 登录模式、`credentials.sharing: team`、设置了 `DALTON_PM_USER_IDS`。宿主机上的数据服务密钥不在这个机制内。
 
 ## 9. 数据接入
 
@@ -182,7 +185,7 @@ Docker（colima，数据盘在 EveSSD）
   - 传错位置的 document id 会被映射或给出提示；
   - transcript 路线的主题词查询会被丢弃，只用 ticker 去查。
 
-**数据地图**：可用性和说明以 `src/dalton/data_map/sources.yaml` 为准。
+**数据地图**：静态说明来自 `src/dalton/data_map/sources.yaml`，实际的路由结合运行时 catalog，可用性取自体检记录；没有体检记录的显示"未体检"（`src/dalton/data_map/builder.py`）。
 
 - 每天体检一次（`src/dalton/data_map/health.py`），结果写进 `dalton_data_source_health`，再渲染进提示词。
 - 资料库探测"最新一条"的方式：
@@ -216,7 +219,7 @@ Docker（colima，数据盘在 EveSSD）
 - 程序会做兜底校验：数字、期间、币种、专名、结论词、ticker；
 - 向量化后存入 `dalton_conversation_cards`（pgvector），用 `content_hash` 去重。
 
-**使用**：分析师和 Chief of Staff 都可以用 `conversation_search` 检索卡片。检索方式是向量、trigram 和 RRF 混合排序，带 180 天半衰期的时间衰减。卡片还会按天渲染成文件：只涉及一家公司、并且这家公司已有工作区的卡片，写到该工作区的 `conversations/<日期>.md`；跨公司主题的卡片，以及还没有工作区的公司的卡片，写到 Home 的 `research/topics/conversations/<日期>.md`（`src/dalton/conversations/render.py`）。
+**使用**：分析师和 Chief of Staff 都可以用 `conversation_search` 检索卡片。检索方式是向量、trigram 和 RRF 混合排序，时间衰减的半衰期参数为 180 天，权重最低不低于 0.7。卡片还会按天渲染成文件：只涉及一家公司、并且这家公司已有工作区的卡片，写到该工作区的 `conversations/<日期>.md`；跨公司主题的卡片，以及还没有工作区的公司的卡片，写到 Home 的 `research/topics/conversations/<日期>.md`（`src/dalton/conversations/render.py`）。
 
 **调度**：每天 21:15 由 launchd 运行（宿主机上的脚本）。抽取版本由 `conversations.prompt_version` 控制。
 
@@ -230,7 +233,7 @@ Docker（colima，数据盘在 EveSSD）
 - **基线**：
   - `scripts/dalton/pr_baseline.sh --pr N --baseline-only` 依次运行：钩子审计、Python 单测、broker 的 Node 测试、Web 类型检查和 vitest，以及 PR 描述核查（描述里用反引号标注的路径和标识符必须在仓库里存在）；
   - 结果会作为评论发到 PR 上。
-- **多 worker**：后端以多个 worker 运行。请求路径上不能有进程内的全局状态；状态以 Postgres 为准，Redis 只做协调。
+- **多 worker**：代码必须兼容多 worker 部署（当前 Dalton 的 compose 是单 worker、带 reload）。请求路径上不能有进程内的全局状态；状态以 Postgres 为准，Redis 只做协调。
 - **测试替身**：只用 `create_autospec`，或者 `patch(..., autospec=True)`。
 - **开发流程**：
   - 由 agy（或 GLM）在独立克隆里开发，grok 和 codex 分别独立审查，lead 汇总意见并负责合并、部署；
@@ -265,4 +268,4 @@ Docker（colima，数据盘在 EveSSD）
 - 以 `docker compose run` 启动的一次性容器（例如对话归档回填），会被 `docker compose restart backend` 连带重启。所以只重启后端时，用 `docker restart`。
 - 数据库写操作只走脚本：先存档，在事务里执行，并断言影响的行数。
 
-**已知问题**：`tests/unit/server/services` 下有 7 个用例在主分支上本来就失败（自动任务结算、livefs、插件解析器），跟 Dalton 的改动无关，有待单独排查。
+**已观察到的问题**：2026-10-23 在提交 `7263bce7` 和 `c3088a67` 上，以同一环境运行 `tests/unit/server/services`，都有同样的 7 个用例失败（自动任务结算 `precheck_skipped` 四例、livefs 一例、插件解析器两例）。原因待排查。`pr_baseline.sh` 不运行这个目录。
