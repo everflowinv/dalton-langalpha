@@ -5575,6 +5575,1021 @@ async def test_journal_replay_cached_or_replayed_propagates_to_outcome_and_skips
     assert summary["total_tokens"] == 0
 
 
+@pytest.mark.asyncio
+async def test_card_fidelity_programmatic_validation_and_sample_regressions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify programmatic card validation (`validate_candidate_card`, quote-scoped `cited_sources`,
+    `conv_card_v2` prompt version, and weekly batch counters) against `fixtures/conv_cards_audit_sample.json`
+    negative cases (`cc_07a818e64dd168360e63afa4`, `cc_e55f5248f685901e4fb349ea`,
+    `cc_c602f34f600becc09bfff75a`, `cc_112c70a292c9d5886db987ab`) and positive cases
+    (`cc_af0f4051d0d2a2ab831b3fa5`, `cc_22905e2fd37cc08e068703b4`), plus unit/number/period/ticker/exception regressions.
+    """
+    from copy import deepcopy
+    from src.dalton.settings import get_dalton_settings
+
+    assert get_dalton_settings().conversations.prompt_version == "conv_card_v2"
+    assert "证据覆盖" in extractor_mod.EXTRACTION_SYSTEM_INSTRUCTIONS
+    assert "保留限定与归属" in extractor_mod.EXTRACTION_SYSTEM_INSTRUCTIONS
+
+    sample_path = Path(__file__).resolve().parent / "fixtures" / "conv_cards_audit_sample.json"
+    sample_by_id = {
+        c["card_id"]: c for c in json.loads(sample_path.read_text(encoding="utf-8"))
+    }
+
+    # 1. Negative sample card: cc_07a818e64dd168360e63afa4 (55, 8, 125 not in quote; 2026 year not in quote)
+    c_hormuz = deepcopy(sample_by_id["cc_07a818e64dd168360e63afa4"])
+    res_hormuz = extractor_mod.validate_candidate_card(c_hormuz)
+    assert res_hormuz.ok is True
+    assert res_hormuz.status == "active"
+    assert res_hormuz.confidence == 0.4
+    assert set(res_hormuz.unsupported_claim_numbers) >= {"55", "8", "125"}
+    assert res_hormuz.figures_dropped == 2
+    assert res_hormuz.periods_cleared == 2
+    assert [f["value"] for f in res_hormuz.figures if f["metric"] != "_verification"] == [82, 79]
+    assert res_hormuz.figures[0]["period"] == ""
+    assert res_hormuz.figures[1]["period"] == ""
+    assert res_hormuz.figures[-1]["metric"] == "_verification"
+    assert res_hormuz.figures[-1]["value"].startswith("unsupported:")
+
+    # 2. Negative sample card: cc_e55f5248f685901e4fb349ea (29.5, 9.7, 9.8, 1.5, 0.42 not in quote; 688775.SH and 2026 not in quote)
+    c_insta = deepcopy(sample_by_id["cc_e55f5248f685901e4fb349ea"])
+    res_insta = extractor_mod.validate_candidate_card(c_insta)
+    assert res_insta.ok is True
+    assert res_insta.status == "active"
+    assert res_insta.confidence == 0.4
+    assert set(res_insta.unsupported_claim_numbers) >= {"29.5", "9.7", "9.8", "1.5", "0.42"}
+    assert res_insta.figures_dropped == 5
+    assert res_insta.periods_cleared == 1
+    assert [f["value"] for f in res_insta.figures if f["metric"] != "_verification"] == [31.9]
+    assert res_insta.figures[0]["period"] == ""
+    assert res_insta.figures[-1]["metric"] == "_verification"
+    assert res_insta.figures[-1]["value"].startswith("unsupported:")
+    assert res_insta.tickers == []
+    assert res_insta.tickers_dropped == 1
+
+    # 3. Negative sample card: cc_c602f34f600becc09bfff75a (`IT` is Gartner source ticker; `FY2027E` lacks 2027 in quote)
+    c_gartner = deepcopy(sample_by_id["cc_c602f34f600becc09bfff75a"])
+    res_gartner = extractor_mod.validate_candidate_card(c_gartner)
+    assert res_gartner.ok is True
+    assert res_gartner.tickers == []
+    assert res_gartner.tickers_dropped == 1
+    assert len(res_gartner.figures) == 4
+    assert res_gartner.figures_dropped == 0
+    assert res_gartner.periods_cleared == 1
+    assert [f["period"] for f in res_gartner.figures] == ["by 2030", "by 2030", "", "FY2028E"]
+
+    # 4. Negative sample card: cc_112c70a292c9d5886db987ab (`WIT` explicitly excluded; period not in quote)
+    c_it_serv = deepcopy(sample_by_id["cc_112c70a292c9d5886db987ab"])
+    res_it_serv = extractor_mod.validate_candidate_card(c_it_serv)
+    assert res_it_serv.ok is True
+    assert res_it_serv.tickers == ["INFY", "KD", "CTSH"]
+    assert res_it_serv.tickers_dropped == 1
+    assert res_it_serv.periods_cleared == 1
+    assert res_it_serv.figures[0]["value"] == 12.4
+    assert res_it_serv.figures[0]["period"] == ""
+
+    # 5a. Positive sample card: cc_af0f4051d0d2a2ab831b3fa5 preserved intact
+    orig_lanqi = deepcopy(sample_by_id["cc_af0f4051d0d2a2ab831b3fa5"])
+    cand_lanqi = deepcopy(orig_lanqi)
+    res_lanqi = extractor_mod.validate_candidate_card(cand_lanqi)
+    assert res_lanqi.ok is True
+    assert res_lanqi.status == "active"
+    assert res_lanqi.figures_dropped == 0
+    assert res_lanqi.periods_cleared == 0
+    assert res_lanqi.tickers_dropped == 0
+    assert cand_lanqi["claim"] == orig_lanqi["claim"]
+    assert cand_lanqi["tickers"] == orig_lanqi["tickers"]
+    assert cand_lanqi["figures"] == orig_lanqi["figures"]
+
+    # 5b. Positive sample card: cc_22905e2fd37cc08e068703b4 — numbers not falsely rejected (`ok=True`, `figures_dropped=0`),
+    #     while `ATAT` (only in cited_sources URL, not in quote) is dropped and `FY2026`/`2026Q2` periods (year 2026 not in quote) are cleared.
+    orig_atour = deepcopy(sample_by_id["cc_22905e2fd37cc08e068703b4"])
+    cand_atour = deepcopy(orig_atour)
+    res_atour = extractor_mod.validate_candidate_card(cand_atour)
+    assert res_atour.ok is True
+    assert res_atour.status == "active"
+    assert res_atour.unsupported_claim_numbers == []
+    assert res_atour.figures_dropped == 0
+    assert len(res_atour.figures) == 4
+    assert res_atour.tickers == []
+    assert res_atour.tickers_dropped == 1
+    assert res_atour.periods_cleared == 4
+    assert all(f["period"] == "" for f in res_atour.figures)
+
+    # 6. Verify quote-scoped citation check (`extractor.py:346`): source in sibling event but NOT in card quote -> downgraded to opinion
+    segment = [
+        {
+            "agent": "main",
+            "session_id": "sess-fid-1",
+            "session_key": "agent:main:discord:channel:fid",
+            "channel": "discord",
+            "chat_type": "channel",
+            "event_id": "ev-fid-1",
+            "seq": 1,
+            "ts": "2026-10-20T10:00:00+00:00",
+            "date_et": "2026-10-20",
+            "message_role": "assistant",
+            "speaker": {"sender_id_hash": "agent:main", "name": "Eve", "is_owner": False, "role": "agent"},
+            "text": (
+                sample_by_id["cc_07a818e64dd168360e63afa4"]["quote"]
+                + "\n"
+                + sample_by_id["cc_e55f5248f685901e4fb349ea"]["quote"]
+                + "\n"
+                + sample_by_id["cc_c602f34f600becc09bfff75a"]["quote"]
+                + "\n"
+                + sample_by_id["cc_112c70a292c9d5886db987ab"]["quote"]
+                + "\n"
+                + sample_by_id["cc_af0f4051d0d2a2ab831b3fa5"]["quote"]
+            ),
+        },
+        {
+            "agent": "main",
+            "session_id": "sess-fid-1",
+            "session_key": "agent:main:discord:channel:fid",
+            "channel": "discord",
+            "chat_type": "channel",
+            "event_id": "ev-fid-2",
+            "seq": 2,
+            "ts": "2026-10-20T10:01:00+00:00",
+            "date_et": "2026-10-20",
+            "message_role": "user",
+            "speaker": {"sender_id_hash": "owner", "name": "Owner", "is_owner": True, "role": "owner"},
+            "text": (
+                "来源备忘：2026 年半年报；https://www.stocktitan.net/news/ATAT/atour-lifestyle-holdings-limited-reports-second-quarter-2026-4x8ywbp6nmz3.html\n"
+                + sample_by_id["cc_22905e2fd37cc08e068703b4"]["quote"]
+            ),
+        },
+    ]
+
+    raw_llm_cards = []
+    for cid, ev_id in [
+        ("cc_07a818e64dd168360e63afa4", "ev-fid-1"),
+        ("cc_e55f5248f685901e4fb349ea", "ev-fid-1"),
+        ("cc_c602f34f600becc09bfff75a", "ev-fid-1"),
+        ("cc_112c70a292c9d5886db987ab", "ev-fid-1"),
+        ("cc_af0f4051d0d2a2ab831b3fa5", "ev-fid-1"),
+        ("cc_22905e2fd37cc08e068703b4", "ev-fid-2"),
+    ]:
+        item = deepcopy(sample_by_id[cid])
+        item["quote_event_id"] = ev_id
+        raw_llm_cards.append(item)
+
+    mock_assist = create_autospec(
+        extractor_mod.assist_json,
+        return_value=AssistResult(
+            ok=True,
+            status="ok",
+            data={
+                "category": "research",
+                "topic_label": "卡片忠实度回归测试",
+                "cards": raw_llm_cards,
+            },
+            model="gemini-4-argon-medium-oauth",
+            usage={"input_tokens": 500, "output_tokens": 250, "total_tokens": 750},
+        ),
+    )
+    monkeypatch.setattr(extractor_mod, "assist_json", mock_assist)
+
+    outcome = await extractor_mod.extract_segment_cards(segment)
+    assert outcome.ok is True
+    assert outcome.cards_flagged_unsupported_number == 2
+    assert outcome.figures_dropped == 7  # 2 from hormuz + 5 from insta360
+    assert outcome.periods_cleared == 9  # 2 hormuz + 1 insta360 + 1 gartner + 1 it_serv + 4 atour
+    assert outcome.tickers_dropped == 4  # 1 insta360 + 1 gartner (IT) + 1 it_serv (WIT) + 1 atour (ATAT)
+    assert len(outcome.cards) == 6
+
+    by_quote = {c["quote"]: c for c in outcome.cards}
+    hormuz_out = by_quote[sample_by_id["cc_07a818e64dd168360e63afa4"]["quote"]]
+    assert hormuz_out["status"] == "active"
+    assert hormuz_out["confidence"] == 0.4
+    assert hormuz_out["figures"][-1]["metric"] == "_verification"
+
+    insta_out = by_quote[sample_by_id["cc_e55f5248f685901e4fb349ea"]["quote"]]
+    assert insta_out["status"] == "active"
+    assert insta_out["confidence"] == 0.4
+    assert insta_out["figures"][-1]["metric"] == "_verification"
+
+    gartner_out = by_quote[sample_by_id["cc_c602f34f600becc09bfff75a"]["quote"]]
+    assert gartner_out["tickers"] == []
+
+    it_serv_out = by_quote[sample_by_id["cc_112c70a292c9d5886db987ab"]["quote"]]
+    assert it_serv_out["tickers"] == ["INFY", "KD", "CTSH"]
+    assert it_serv_out["figures"][0]["period"] == ""
+
+    lanqi_out = by_quote[sample_by_id["cc_af0f4051d0d2a2ab831b3fa5"]["quote"]]
+    assert lanqi_out["tickers"] == ["688008.SS"]
+    assert lanqi_out["figures"] == sample_by_id["cc_af0f4051d0d2a2ab831b3fa5"]["figures"]
+    assert lanqi_out["prompt_version"] == "conv_card_v2"
+
+    atour_out = by_quote[sample_by_id["cc_22905e2fd37cc08e068703b4"]["quote"]]
+    assert atour_out["tickers"] == []
+    assert [f["value"] for f in atour_out["figures"]] == ["25-30", 1.575, 63.2, 40]
+    assert all(f["period"] == "" for f in atour_out["figures"])
+    assert atour_out["type"] == "fact"
+
+    # 7. Verify agent citation check: `fact` without quote-verified source downgrades to `opinion`,
+    #    whereas agent `model_assumption` without external source is preserved (while still subject to number validation).
+    _spk, downgraded_type, _srcs = extractor_mod.enforce_speaker_and_agent_citation(
+        "fact",
+        ["2026 年半年报"],
+        segment[0],
+        quote=sample_by_id["cc_e55f5248f685901e4fb349ea"]["quote"],
+        segment_events=segment,
+    )
+    assert downgraded_type == "opinion"
+
+    _spk_ma, kept_ma_type, _srcs_ma = extractor_mod.enforce_speaker_and_agent_citation(
+        "model_assumption",
+        [],
+        segment[0],
+        quote="按 25 倍 PE 粗算，目标市值约 500 亿美元。",
+        segment_events=segment,
+    )
+    assert kept_ma_type == "model_assumption"
+
+    # 8. Magnitude conversion & number extraction regressions (Items 1 & 4):
+    # - `8.5万亿` supports `8500 USD_bn` and `85000亿`
+    res_85tn = extractor_mod.validate_candidate_card(
+        {
+            "claim": "AI 数据中心累计需取得 8500 USD_bn（即 85000亿）收入。",
+            "figures": [{"metric": "rev", "value": 8500, "unit": "USD_bn", "period": ""}],
+            "tickers": [],
+            "quote": "累计要收 8.5 万亿美元。",
+        }
+    )
+    assert res_85tn.ok is True
+    assert res_85tn.figures_dropped == 0
+
+    # - `1.2万` <-> `12000` in both directions
+    assert extractor_mod.validate_candidate_card(
+        {"claim": "出货量达 12000 台。", "figures": [], "tickers": [], "quote": "出货量达 1.2万 台。"}
+    ).ok is True
+    assert extractor_mod.validate_candidate_card(
+        {"claim": "出货量达 1.2万 台。", "figures": [], "tickers": [], "quote": "出货量达 12000 台。"}
+    ).ok is True
+
+    # - `quote` has `1亿元` -> `claim` with `10000亿元` MUST be flagged (`confidence=0.4`, `_verification` figure)
+    res_1yi_vs_10000yi = extractor_mod.validate_candidate_card(
+        {
+            "claim": "公司净利润达到 10000亿元。",
+            "figures": [{"metric": "net_profit", "value": 10000, "unit": "CNY_yi", "period": ""}],
+            "tickers": [],
+            "quote": "公司净利润达到 1亿元。",
+        }
+    )
+    assert res_1yi_vs_10000yi.ok is True
+    assert res_1yi_vs_10000yi.status == "active"
+    assert res_1yi_vs_10000yi.confidence == 0.4
+    assert res_1yi_vs_10000yi.unsupported_claim_numbers == ["10000"]
+    assert res_1yi_vs_10000yi.figures_dropped == 1
+    assert res_1yi_vs_10000yi.figures == [
+        {"metric": "_verification", "value": "unsupported:10000", "unit": "", "period": ""}
+    ]
+
+    # - Chinese numerals (`一百万`) and scientific notation (`1e6`) on both sides
+    assert extractor_mod.validate_candidate_card(
+        {
+            "claim": "训练使用了 1e6 小时数据（约 100万 小时）。",
+            "figures": [{"metric": "hours", "value": "1e6", "unit": "hours", "period": ""}],
+            "tickers": [],
+            "quote": "训练使用了超过一百万小时的数据。",
+        }
+    ).ok is True
+
+    # - Chinese numerals in ordinary words ("一度", "十分", "一直", "一些", "一致", "一般", "万一", "百分之百地", "三番五次")
+    #   must NOT be treated as metric numbers; only Chinese numerals followed by units/classifiers count.
+    assert extractor_mod.validate_candidate_card(
+        {"claim": "股价一度涨到80元", "figures": [], "tickers": [], "quote": "股价曾涨到80元"}
+    ).ok is True
+    assert extractor_mod.validate_candidate_card(
+        {"claim": "十分看好", "figures": [], "tickers": [], "quote": "非常看好"}
+    ).ok is True
+    assert (
+        extractor_mod.extract_claim_numbers(
+            "他一直有一些一般看法，与市场一致，万一百分之百地三番五次验证。"
+        )
+        == []
+    )
+    assert extractor_mod.validate_candidate_card(
+        {"claim": "研发投入 100万元。", "figures": [], "tickers": [], "quote": "研发投入一百万元。"}
+    ).ok is True
+    assert extractor_mod.validate_candidate_card(
+        {"claim": "研发投入一百万元。", "figures": [], "tickers": [], "quote": "研发投入 100万元。"}
+    ).ok is True
+    assert extractor_mod.validate_candidate_card(
+        {
+            "claim": "营收 3 亿，增长 2 倍，毛利提升 10 个百分点，占 5 成。",
+            "figures": [],
+            "tickers": [],
+            "quote": "营收三亿，增长两倍，毛利提升十个百分点，占五成。",
+        }
+    ).ok is True
+
+    # - Numeric ranges followed by units (`10-12 GW`, `7-12%`, `25-35亿`) must count both endpoints,
+    #   whereas unit-free `MM-DD` / `YYYY-MM` dates are masked and cannot support metric numbers.
+    assert extractor_mod.validate_candidate_card(
+        {
+            "claim": "装机容量 10-12 GW，毛利率 7-12%，估值 25-35亿。",
+            "figures": [
+                {"metric": "cap", "value": "10-12", "unit": "GW", "period": ""},
+                {"metric": "gm", "value": "7-12", "unit": "%", "period": ""},
+                {"metric": "val", "value": "25-35", "unit": "CNY_yi", "period": ""},
+            ],
+            "tickers": [],
+            "quote": "预计装机 10-12 GW，毛利率 7-12%，对应 25-35亿。",
+        }
+    ).ok is True
+    assert (
+        extractor_mod.validate_candidate_card(
+            {
+                "claim": "装机容量 12 GW。",
+                "figures": [],
+                "tickers": [],
+                "quote": "10-12 发布新产品公告。",
+            }
+        ).unsupported_claim_numbers
+        == ["12"]
+    )
+    assert (
+        extractor_mod.validate_candidate_card(
+            {
+                "claim": "装机容量 15 GW。",
+                "figures": [],
+                "tickers": [],
+                "quote": "预计装机 10-12 GW。",
+            }
+        ).unsupported_claim_numbers
+        == ["15"]
+    )
+
+    # - Dates (`YYYY-MM-DD`, `MM-DD`, `YYYY年M月D日`), indicator windows (`30D`, `50MA`, `200MA`),
+    #   and model/product codes (`Qwen2.5`, `H100`, `WiFi7`) cannot support metric numbers in claim/figures
+    res_non_metric_leak = extractor_mod.validate_candidate_card(
+        {
+            "claim": "收入增长 2.5%，毛利率 50%，出货 100 万台，单价 7 美元，目标价 2026 美元。",
+            "figures": [{"metric": "gm", "value": 50, "unit": "percent", "period": ""}],
+            "tickers": [],
+            "quote": "2026-08-12（08-12，2026年8月12日）跟踪 Qwen2.5、H100 与 WiFi7：30D 跌破 50MA 与 200MA。",
+        }
+    )
+    assert res_non_metric_leak.ok is True
+    assert res_non_metric_leak.confidence == 0.4
+    assert set(res_non_metric_leak.unsupported_claim_numbers) >= {"2.5", "50", "100", "7", "2026"}
+    assert res_non_metric_leak.figures_dropped == 1
+
+    # 9. Period validation regressions (Item 5 & Round 3 Item 3):
+    assert extractor_mod.is_period_supported_by_quote("30D", "RSI=51.4 30D=-5.1%") is True
+    assert extractor_mod.is_period_supported_by_quote("7月", "7 月估 25–35 亿元") is True
+    assert extractor_mod.is_period_supported_by_quote("2H2026", "2H 2026 指引上调") is True
+    assert extractor_mod.is_period_supported_by_quote("2H2026", "下半年服务器增长 80% 以上") is False
+    assert extractor_mod.is_period_supported_by_quote("1H", "过去半年需求回暖") is False
+    assert extractor_mod.is_period_supported_by_quote("FY2026", "全年指引上调，今年和明年继续高增") is False
+    assert extractor_mod.is_period_supported_by_quote("current", "价格=84.43") is False
+    assert extractor_mod.is_period_supported_by_quote("current", "trading at current levels") is True
+    assert extractor_mod.is_period_supported_by_quote("annual", "annual expense ratio 0.07%") is True
+    assert extractor_mod.is_period_supported_by_quote("historical", "只看历史均值") is False
+    assert extractor_mod.is_period_supported_by_quote("2026Q2", "2026年营收增长20%") is False
+    assert extractor_mod.is_period_supported_by_quote("2026年第二季度", "2026年营收增长20%") is False
+    assert extractor_mod.is_period_supported_by_quote("2026Q2", "2026年第二季度营收增长20%") is True
+    assert extractor_mod.is_period_supported_by_quote("1H2026", "2026年 H100 出货翻倍") is False
+    assert extractor_mod.is_period_supported_by_quote("H1", "H100 出货翻倍") is False
+    assert extractor_mod.is_period_supported_by_quote("H2", "H20 与 H200 出货翻倍") is False
+    assert extractor_mod.is_period_supported_by_quote("2026-07-23 至 08-31", "2026-07-23 单日数据") is False
+    assert extractor_mod.is_period_supported_by_quote("2026-07-23 至 08-31", "2026年7月23日至8月31日累计数据") is True
+    assert extractor_mod.is_period_supported_by_quote("7月", "毛利率提升 7-12%") is False
+
+    # 10. Ticker exclusion scope, HK code normalization, and short Chinese alias boundary regressions (Items 6, 7, 8):
+    # - "剔除WIT后INFY上涨", "剔除WIT并保留INFY", "剔除WIT但继续持有INFY" -> keep INFY, drop WIT
+    for ex_quote in ("剔除WIT后INFY上涨", "剔除WIT并保留INFY", "剔除WIT但继续持有INFY"):
+        kept_ex1, dropped_ex1 = extractor_mod.validate_tickers_against_quote(
+            ["WIT", "INFY"], ex_quote
+        )
+        assert kept_ex1 == ["INFY"]
+        assert dropped_ex1 == 1
+
+    # - "WIT价格有误，已剔除WIT。" -> drop WIT
+    kept_ex2, dropped_ex2 = extractor_mod.validate_tickers_against_quote(
+        ["WIT"], "WIT价格有误，已剔除WIT。"
+    )
+    assert kept_ex2 == []
+    assert dropped_ex2 == 1
+
+    # - "不排除" is not an exclusion
+    kept_ex3, dropped_ex3 = extractor_mod.validate_tickers_against_quote(
+        ["WIT"], "不排除WIT四季度反弹"
+    )
+    assert kept_ex3 == ["WIT"]
+    assert dropped_ex3 == 0
+
+    # - HK leading zeros & suffixes: `700.HK`, `0700.HK`, `00700` all match each other and Tencent aliases
+    for hk_variant in ("700.HK", "0700.HK", "00700"):
+        assert extractor_mod.validate_tickers_against_quote([hk_variant], "腾讯 Q2 游戏流水增长")[0] == [hk_variant]
+        assert extractor_mod.validate_tickers_against_quote([hk_variant], "00700 领涨港股")[0] == [hk_variant]
+        assert extractor_mod.validate_tickers_against_quote([hk_variant], "700.HK 领涨港股")[0] == [hk_variant]
+
+    # - Short Chinese alias (< 3 chars): "完美的" must NOT match "美的" (000333.SZ); product names H100/B200 must NOT match NVDA
+    assert extractor_mod.validate_tickers_against_quote(["000333.SZ"], "交出了一份完美的答卷") == ([], 1)
+    assert extractor_mod.validate_tickers_against_quote(["000333.SZ"], "美的 2026H1 海外大增") == (["000333.SZ"], 0)
+    assert extractor_mod.validate_tickers_against_quote(["000333.SZ"], "美的集团空调海外大增") == (["000333.SZ"], 0)
+    assert extractor_mod.validate_tickers_against_quote(["NVDA"], "H100 与 B200/B300 租赁价格回升") == ([], 1)
+
+    # 11. Verify weekly batch summary aggregates the 4 new validation counters next to segments_*
+    limiter = archive_cli.HourlyTokenBudgetLimiter(100_000)
+    batch_summary = await archive_cli.process_weekly_batch(
+        [dict(ev) for ev in segment],
+        mode="run",
+        window_start=date(2026, 10, 20),
+        window_end=date(2026, 10, 20),
+        limiter=limiter,
+        extractor_model="gemini-4-argon-medium-oauth",
+        prompt_version="conv_card_v2",
+        dry_run=True,
+    )
+    assert batch_summary["segments_processed"] == 1
+    assert batch_summary["cards_flagged_unsupported_number"] == 2
+    assert "soft_unsupported_numbers" in batch_summary
+    assert batch_summary["figures_dropped"] == 7
+    assert batch_summary["periods_cleared"] == 9
+    assert batch_summary["tickers_dropped"] == 4
+
+    # 12. Exception path regression (Item 10): when a batch fails/aborts after an earlier batch flushed,
+    #     `update_run_finish` submits `stats` containing the validation counters accumulated so far.
+    seg_events_two_batches = [
+        {
+            "agent": "main",
+            "session_id": "sess-exc-1",
+            "session_key": "agent:main:discord:channel:exc1",
+            "channel": "discord",
+            "chat_type": "channel",
+            "event_id": "ev-exc-1",
+            "seq": 1,
+            "created_at_ms": 1760950000000,
+            "ts": "2026-10-20T10:00:00+00:00",
+            "date_et": "2026-10-20",
+            "message_role": "user",
+            "text": "第一段对话讨论算力数据。",
+        },
+        {
+            "agent": "main",
+            "session_id": "sess-exc-2",
+            "session_key": "agent:main:discord:channel:exc2",
+            "channel": "discord",
+            "chat_type": "channel",
+            "event_id": "ev-exc-2",
+            "seq": 1,
+            "created_at_ms": 1760957200000,
+            "ts": "2026-10-20T12:00:00+00:00",
+            "date_et": "2026-10-20",
+            "message_role": "user",
+            "text": "第二段对话触发配额异常。",
+        },
+    ]
+
+    seg_call_idx = 0
+
+    async def _extract_first_ok_second_boom(
+        seg_arg: list[dict[str, Any]], **kwargs: Any
+    ) -> extractor_mod.SegmentExtractionOutcome:
+        nonlocal seg_call_idx
+        seg_call_idx += 1
+        if seg_call_idx == 1:
+            return extractor_mod.SegmentExtractionOutcome(
+                ok=True,
+                category="research",
+                cards=[],
+                cards_raw_count=3,
+                cards_flagged_unsupported_number=2,
+                soft_unsupported_numbers=4,
+                figures_dropped=5,
+                periods_cleared=3,
+                tickers_dropped=1,
+                model_used="gemini-4-argon-medium-oauth",
+                input_tokens=100,
+                output_tokens=50,
+                total_tokens=150,
+            )
+        return extractor_mod.SegmentExtractionOutcome(
+            ok=False,
+            rate_limited=True,
+            permanent_quota_error=True,
+            error="http_429_permanent_quota",
+            model_used="gemini-4-argon-medium-oauth",
+        )
+
+    mock_insert_run = create_autospec(db_conv.insert_run_start, return_value=None)
+    mock_progress_run = create_autospec(db_conv.update_run_progress, return_value=None)
+    mock_finish_run = create_autospec(db_conv.update_run_finish, return_value=None)
+    mock_record_proc = create_autospec(db_conv.record_processed_event_chunks, return_value=1)
+    monkeypatch.setattr(db_conv, "insert_run_start", mock_insert_run)
+    monkeypatch.setattr(db_conv, "update_run_progress", mock_progress_run)
+    monkeypatch.setattr(db_conv, "update_run_finish", mock_finish_run)
+    monkeypatch.setattr(db_conv, "record_processed_event_chunks", mock_record_proc)
+
+    mock_tx = create_autospec(AsyncTransaction, instance=True)
+    mock_tx.__aenter__.return_value = mock_tx
+    mock_tx.__aexit__.return_value = False
+    mock_conn = create_autospec(AsyncConnection, instance=True)
+    mock_conn.transaction.return_value = mock_tx
+
+    with pytest.raises(archive_cli.PermanentQuotaError):
+        await archive_cli.process_weekly_batch(
+            seg_events_two_batches,
+            mode="run",
+            window_start=date(2026, 10, 20),
+            window_end=date(2026, 10, 20),
+            limiter=archive_cli.HourlyTokenBudgetLimiter(100_000),
+            extractor_model="gemini-4-argon-medium-oauth",
+            prompt_version="conv_card_v2",
+            dry_run=False,
+            extract_concurrency=1,
+            extract_fn=create_autospec(
+                extractor_mod.extract_segment_cards,
+                side_effect=_extract_first_ok_second_boom,
+            ),
+            conn=mock_conn,
+        )
+
+    assert mock_finish_run.await_count == 1
+    finish_kwargs = mock_finish_run.call_args.kwargs
+    assert finish_kwargs["status"] == "failed"
+    assert finish_kwargs["segments_processed"] == 1
+    finish_stats = finish_kwargs["stats"]
+    assert finish_stats["cards_flagged_unsupported_number"] == 2
+    assert finish_stats["soft_unsupported_numbers"] == 4
+    assert finish_stats["figures_dropped"] == 5
+    assert finish_stats["periods_cleared"] == 3
+    assert finish_stats["tickers_dropped"] == 1
 
 
 
+
+
+
+
+
+def test_unmapped_ticker_is_kept_but_mapped_absent_one_is_dropped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ticker with no name mapping cannot be proven absent (海光 → 688041.SS), so it stays;
+    a ticker that has a name mapping but is absent from quote is dropped.
+    """
+    from src.dalton.conversations import extractor as ex
+
+    quote = "海光自己二季度营收增长 65%，按招商的盈利预测，市盈率约 109 倍。"
+    kept, dropped = ex.validate_tickers_against_quote(["688999.SS", "NVDA"], quote)
+    assert kept == ["688999.SS"] and dropped == 1
+
+    monkeypatch.setattr(
+        ex,
+        "_load_ticker_company_aliases",
+        create_autospec(
+            ex._load_ticker_company_aliases,
+            return_value={"NVDA": ("NVDA", "Nvidia", "英伟达")},
+        ),
+    )
+    kept_unmapped, dropped_mapped = ex.validate_tickers_against_quote(["688041.SS", "NVDA"], quote)
+    assert kept_unmapped == ["688041.SS"] and dropped_mapped == 1
+
+
+def test_short_chinese_alias_matches_in_running_text_but_not_inside_common_words() -> None:
+    from src.dalton.conversations import extractor as ex
+
+    assert ex.AMBIGUOUS_SHORT_ALIAS_WORDS["美的"] == (
+        "完美的",
+        "精美的",
+        "优美的",
+        "甜美的",
+        "柔美的",
+    )
+    assert ex._alias_matches_in_text("海光", "海光自己二季度营收增长 65%")
+    assert ex._alias_matches_in_text("腾讯", "同期的腾讯视频同比 -40%")
+    assert not ex._alias_matches_in_text("美的", "这是一个完美的季度")
+    assert ex._alias_matches_in_text("美的", "美的集团股份有限公司(000333.SZ)")
+
+
+@pytest.mark.asyncio
+async def test_round4_narrow_card_rejection_and_rejected_audit_sample() -> None:
+    """Round 4:
+    1. Only metric numbers with units in `claim` cause whole-card rejection (`unsupported_claim_numbers`);
+       unmatched bare integers, years, dates, codes, and MA windows are recorded in `soft_unsupported_numbers`.
+    2. English magnitudes (`$1.2B` <-> `12亿美元`, `120 万美元` <-> `$1.2M`, `3.5bn` <-> `35亿`) match bidirectionally;
+       `m` is treated as million only with currency/amount/quantity context.
+    3. Symmetric MA windows (`50MA`, `MA50`, `50日均线`, `50日线`, `50D`, `30D`) are stripped on both sides while
+       attached MA prices (`跌破200MA!(125.23)`) still participate in validation.
+    4. Full Chinese classifier support (`个、段、家、只、次、名、位、条、项、款、台、套、份、轮、批、季、年、月、天、周、倍、成`)
+       while excluding `一成不变`, `一度`, `十分`.
+    5. Date mask unit guard only guards real units in `METRIC_UNITS_TABLE` / `_UNIT_CORE`, not arbitrary English words.
+    6. Verify all 25 cards in `tests/unit/dalton/fixtures/conv_cards_rejected_audit.json`.
+    """
+    from src.dalton.conversations import extractor as ex
+
+    # --- Item 1: Unit-gated whole-card rejection vs soft_unsupported_numbers ---
+    bare_card = {
+        "claim": "欧洲议会通过文本（P10_TA(2026)0334）要求调查稀土领域行为，涉及编号 42 与 99。",
+        "quote": "原文要求调查中国在稀土领域的胁迫行为。",
+        "figures": [
+            {"metric": "unsupported_fig", "value": 42, "unit": "count", "period": ""},
+        ],
+        "tickers": [],
+    }
+    bare_res = ex.validate_candidate_card(bare_card, quote=bare_card["quote"])
+    assert bare_res.ok is True
+    assert bare_res.unsupported_claim_numbers == []
+    assert bare_res.soft_unsupported_numbers >= 2
+    assert bare_res.figures_dropped == 1
+    assert bare_res.figures == []
+
+    unit_card = {
+        "claim": "公司预计明年毛利率提升 5 个百分点，新增产值 8.5 亿元。",
+        "quote": "公司预计明年毛利率明显提升。",
+        "figures": [],
+        "tickers": [],
+    }
+    unit_res = ex.validate_candidate_card(unit_card, quote=unit_card["quote"])
+    assert unit_res.ok is True
+    assert unit_res.status == "active"
+    assert unit_res.confidence == 0.4
+    assert unit_res.unsupported_claim_numbers == ["5", "8.5"]
+    assert unit_res.figures == [
+        {"metric": "_verification", "value": "unsupported:5,8.5", "unit": "", "period": ""}
+    ]
+
+    # --- Item 2: English magnitudes ($1.2B <-> 12亿美元, 120 万美元 <-> $1.2M, 3.5bn <-> 35亿) ---
+    for q_txt, c_txt in [
+        ("本季收入 $1.2B", "本季收入为 12 亿美元"),
+        ("本季收入为 12 亿美元", "本季收入 $1.2B"),
+        ("服务费收入 120 万美元", "服务费收入达 $1.2M"),
+        ("服务费收入达 $1.2M", "服务费收入 120 万美元"),
+        ("指引自由现金流 3.5bn", "指引自由现金流 35 亿"),
+        ("指引自由现金流 35 亿", "指引自由现金流 3.5bn"),
+    ]:
+        res_dir = ex.validate_candidate_card({"claim": c_txt, "figures": [], "tickers": []}, quote=q_txt)
+        assert res_dir.ok is True, f"Failed direction: quote={q_txt!r} -> claim={c_txt!r}"
+        assert res_dir.unsupported_claim_numbers == []
+
+    # Lowercase `m` without currency/financial context is NOT expanded to 1,000,000
+    assert "100000000" not in ex.extract_quote_supported_numbers("距离海岸线 100m 处建设雷达站")
+    assert "17000000" in ex.extract_quote_supported_numbers("expects an FX loss of 17m yuan in H1")
+
+    # --- Item 3: Symmetric MA windows (`50MA`, `MA50`, `50日均线`, `50日线`, `50D`, `30D`) & MA prices ---
+    res_ma_sym = ex.validate_candidate_card(
+        {
+            "claim": "股价突破 50 日均线与 200 日线，过去 30D 与 50D 动量转正。",
+            "figures": [],
+            "tickers": [],
+        },
+        quote="股价突破 50MA 与 MA200，近期动量转正。",
+    )
+    assert res_ma_sym.ok is True
+    assert res_ma_sym.unsupported_claim_numbers == []
+
+    # MA price itself (`跌破200MA!(125.23)`) still participates in validation
+    res_ma_price_bad = ex.validate_candidate_card(
+        {
+            "claim": "股价跌破200MA!(125.23)，趋势转空。",
+            "figures": [],
+            "tickers": [],
+        },
+        quote="股价跌破200MA!(118.50)，趋势转空。",
+    )
+    assert res_ma_price_bad.ok is True
+    assert res_ma_price_bad.confidence == 0.4
+    assert "125.23" in res_ma_price_bad.unsupported_claim_numbers
+
+    res_ma_price_good = ex.validate_candidate_card(
+        {
+            "claim": "股价跌破 200 日均线（125.23），趋势转空。",
+            "figures": [],
+            "tickers": [],
+        },
+        quote="股价跌破200MA!(125.23)，趋势转空。",
+    )
+    assert res_ma_price_good.ok is True
+    assert res_ma_price_good.unsupported_claim_numbers == []
+
+    # --- Item 4: Chinese classifiers & idiom exclusions ---
+    for cn_phrase, ar_phrase in [
+        ("已有三个客户签约", "已有 3 个客户签约"),
+        ("转股期分两段", "转股期分 2 段"),
+        ("调查了七家卖方", "调查了 7 家卖方"),
+        ("完成三轮问询", "完成 3 轮问询"),
+        ("签署五份合同", "签署 5 份合同"),
+        ("电感均价二十多元", "电感均价约 20 多元"),
+    ]:
+        r1 = ex.validate_candidate_card({"claim": ar_phrase, "figures": [], "tickers": []}, quote=cn_phrase)
+        r2 = ex.validate_candidate_card({"claim": cn_phrase, "figures": [], "tickers": []}, quote=ar_phrase)
+        assert r1.ok is True and r2.ok is True, f"Classifier mismatch: {cn_phrase!r} <-> {ar_phrase!r}"
+
+    res_idioms = ex.validate_candidate_card(
+        {
+            "claim": "行业格局并非一成不变，股价一度回调但十分稳健，三番五次测试底部。",
+            "figures": [],
+            "tickers": [],
+        },
+        quote="行业格局仍在演进，股价曾回调但非常稳健，多次测试底部。",
+    )
+    assert res_idioms.ok is True
+    assert res_idioms.unsupported_claim_numbers == []
+
+    # --- Item 5: Date mask unit guard only guards real units, not arbitrary English words ---
+    # `07-23 UTC` has an English timezone word (not a unit), so `07-23` is masked as a date;
+    # `10-12 GW` and `10-12 shares` have real units in `METRIC_UNITS_TABLE`, so `10` and `12` are preserved.
+    q_date_tz = ex.extract_quote_supported_numbers("会议将于 07-23 UTC 召开")
+    assert "7" not in q_date_tz and "23" not in q_date_tz
+    q_unit_range = ex.extract_quote_supported_numbers("新增装机 10-12 GW，回购 15-20 shares")
+    assert {"10", "12", "15", "20"}.issubset(q_unit_range)
+
+    # --- Item 6: Verify 25 rejected audit cards from fixture ---
+    fixture_path = Path(__file__).resolve().parent / "fixtures" / "conv_cards_rejected_audit.json"
+    audit_cards = json.loads(fixture_path.read_text(encoding="utf-8"))
+    assert len(audit_cards) == 25
+
+    both_false_reject_ids: list[str] = []
+    both_correct_reject_rejected_ids: list[str] = []
+    both_correct_reject_bare_exception_ids: list[str] = []
+    split_ids: list[str] = []
+
+    for item in audit_cards:
+        cid = item["card_id"]
+        consensus = item["consensus"]
+        res = ex.validate_candidate_card(
+            {
+                "claim": item["claim"],
+                "figures": [dict(f) for f in item.get("figures", [])],
+                "tickers": list(item.get("tickers", [])),
+                "cited_sources": list(item.get("cited_sources", [])),
+            },
+            quote=item["quote"],
+        )
+        if consensus == "both_false_reject":
+            both_false_reject_ids.append(cid)
+            assert res.ok is True, f"both_false_reject card {cid} was still rejected: {res.unsupported_claim_numbers}"
+            assert res.unsupported_claim_numbers == []
+        elif consensus == "split":
+            split_ids.append(cid)
+            assert res.ok is True, f"split card {cid} (identifier/code) should not be rejected: {res.unsupported_claim_numbers}"
+            assert res.unsupported_claim_numbers == []
+            assert res.soft_unsupported_numbers > 0
+        elif consensus == "both_correct_reject":
+            if cid == "cc_31a6e507886bb4a5a3812d36":
+                # #17 has only bare unitless numbers in claim (`(6682.HK，27.48)`, `(5802.T，2211.0)`),
+                # so under the unit-only rule it has no unsupported metric numbers while dropping its 2 unsupported figures.
+                both_correct_reject_bare_exception_ids.append(cid)
+                assert res.ok is True
+                assert res.unsupported_claim_numbers == []
+                assert res.soft_unsupported_numbers == 4
+                assert res.figures_dropped == 2
+            else:
+                both_correct_reject_rejected_ids.append(cid)
+                assert res.ok is True
+                assert res.status == "active"
+                assert res.confidence == 0.4, f"both_correct_reject card {cid} should be flagged with confidence=0.4"
+                assert len(res.unsupported_claim_numbers) > 0
+                assert res.figures[-1]["metric"] == "_verification"
+                assert res.figures[-1]["value"].startswith("unsupported:")
+
+    assert len(both_false_reject_ids) == 10
+    assert len(split_ids) == 3
+    assert len(both_correct_reject_rejected_ids) == 11
+    assert both_correct_reject_bare_exception_ids == ["cc_31a6e507886bb4a5a3812d36"]
+
+
+@pytest.mark.asyncio
+async def test_round5_flag_instead_of_reject_parsing_fixes_and_enumeration_counts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 5:
+    1. Unsupported unit-bearing numbers in `claim` no longer reject the card (`ok=True`, `status='active'`);
+       instead `confidence` is capped at `min(orig, 0.4)`, `figures` receives a `_verification` marker entry,
+       the weekly summary counts `cards_flagged_unsupported_number`, and `conversation_search` exposes
+       `verification: 'unsupported_numbers'` on flagged cards without altering its docstring.
+    2. Parsing fixes:
+       - Alphabetic currency codes tightly attached to numbers (`USD7,176.0mn`, `RMB31,844`, `RMB34.57亿元`, `HK$70.00`, `RMB-4,001.615mn`)
+       - Thousands-separator commas vs CSV/field-separator commas (`45,,,70.00`, `1,2,3`, `,-15%,25,100.00,20X,"5,109,588"`)
+       - Uppercase `5M` / `> 5M downloads` converted to `500万` (`5000000`); `Qwen3-8B` stripped
+       - `3/15` without date context preserved as fraction (`3` and `15`), masked only with date context
+       - `"一份"`, `"一下"`, `"一起"`, `"一点"`, `"一次性"` not treated as metric numbers
+    3. Simple derivable enumeration counts: `quote` enumerating `TOL PHM DHI` supports `"三家"` in `claim`.
+    """
+    from src.dalton.conversations import extractor as ex
+    from src.dalton.conversations import search as search_mod
+    from src.dalton.tools import conversation_tools as conv_tools_mod
+
+    # --- Item 1: Flagging (`confidence <= 0.4`, `_verification` figure, `status='active'`) & `conversation_search` ---
+    flagged_card = {
+        "claim": "从 220 亿增至 343 亿，增幅达 56%。",
+        "quote": "收入从 220 亿增长到 343 亿。",
+        "figures": [
+            {"metric": "rev_start", "value": 220, "unit": "CNY_yi", "period": ""},
+            {"metric": "rev_end", "value": 343, "unit": "CNY_yi", "period": ""},
+            {"metric": "rev_yoy", "value": 56, "unit": "percent", "period": ""},
+        ],
+        "tickers": [],
+        "confidence": 0.85,
+    }
+    res_flag = ex.validate_candidate_card(flagged_card, quote=flagged_card["quote"])
+    assert res_flag.ok is True
+    assert res_flag.status == "active"
+    assert res_flag.confidence == 0.4
+    assert flagged_card["confidence"] == 0.4
+    assert res_flag.unsupported_claim_numbers == ["56"]
+    assert res_flag.figures_dropped == 1
+    assert res_flag.figures == [
+        {"metric": "rev_start", "value": 220, "unit": "CNY_yi", "period": ""},
+        {"metric": "rev_end", "value": 343, "unit": "CNY_yi", "period": ""},
+        {"metric": "_verification", "value": "unsupported:56", "unit": "", "period": ""},
+    ]
+
+    # When original confidence is already below 0.4 (e.g. 0.25), `min(orig, 0.4)` preserves 0.25
+    low_conf_card = {
+        "claim": "毛利率提升 5 个百分点。",
+        "quote": "毛利率有所改善。",
+        "figures": [],
+        "tickers": [],
+        "confidence": 0.25,
+    }
+    res_low = ex.validate_candidate_card(low_conf_card, quote=low_conf_card["quote"])
+    assert res_low.ok is True
+    assert res_low.confidence == 0.25
+    assert low_conf_card["confidence"] == 0.25
+
+    # `conversation_search` exposes `verification: "unsupported_numbers"` on cards with `_verification` figure
+    mock_hybrid = create_autospec(
+        search_mod.hybrid_search_conversations,
+        return_value={
+            "ok": True,
+            "query": "石头科技",
+            "count": 2,
+            "cards": [
+                {
+                    "card_id": "cc_flagged_1",
+                    "claim": "净现金增长 56%",
+                    "figures": [
+                        {"metric": "_verification", "value": "unsupported:56", "unit": "", "period": ""}
+                    ],
+                },
+                {
+                    "card_id": "cc_clean_2",
+                    "claim": "市值 71.76 亿美元",
+                    "figures": [
+                        {"metric": "market_cap", "value": 7176.0, "unit": "USD_mn", "period": ""}
+                    ],
+                },
+            ],
+        },
+    )
+    monkeypatch.setattr(conv_tools_mod, "hybrid_search_conversations", mock_hybrid)
+    tool_fn = conv_tools_mod.create_conversation_tools()[0]
+    raw_json = await tool_fn.ainvoke(
+        {"query": "石头科技"},
+        config={"configurable": {"user_id": "u-test-1", "workspace_id": "ws-1", "thread_id": "th-1"}},
+    )
+    parsed_search = json.loads(raw_json)
+    assert parsed_search["cards"][0]["verification"] == "unsupported_numbers"
+    assert "verification" not in parsed_search["cards"][1]
+
+    # --- Item 2a: Alphabetic currency codes tightly attached to numbers ---
+    # (`USD7,176.0mn`, `USD3,059.315mn`, `RMB-4,001.615mn`, `RMB31,844`, `RMB34.57亿元`, `HK$70.00`)
+    res_glued_cur = ex.validate_candidate_card(
+        {
+            "claim": (
+                "海尔智家最新市值约71.76亿美元，2026年6月30日基准净现金为-4,001.615百万元、"
+                "严格净现金为-6,544.096百万元；欢聚基准净现金3,059.315百万美元；"
+                "安踏严格净现金31,844百万元；创维经营现金流净流出34.57亿元人民币；目标价70港元。"
+            ),
+            "figures": [
+                {"metric": "market_cap", "value": 7176.0, "unit": "USD_mn", "period": ""},
+                {"metric": "base_net_cash", "value": -4001.615, "unit": "RMB_mn", "period": "2026-06-30"},
+                {"metric": "ocf", "value": -3.457, "unit": "RMB_bn", "period": ""},
+                {"metric": "tp", "value": 70.0, "unit": "HKD", "period": ""},
+            ],
+            "tickers": [],
+        },
+        quote=(
+            "市值USD7,176.0mn，2026-06-30基准净现金RMB-4,001.615mn，严格净现金RMB-6,544.096mn；"
+            "欢聚净现金USD3,059.315mn；安踏净现金RMB31,844百万元；"
+            "创维经营现金流转为净流出RMB34.57亿元；目标价HK$70.00。"
+        ),
+    )
+    assert res_glued_cur.unsupported_claim_numbers == []
+    assert res_glued_cur.figures_dropped == 0
+    assert res_glued_cur.confidence == 0.8
+
+    # --- Item 2b: Thousands-separator commas vs field-separator (CSV/list) commas ---
+    # (`45,,,70.00`, `1,2,3`, and CSV `,-15%,25,100.00,20X,"5,109,588"`)
+    q_csv_1 = ex.extract_quote_supported_numbers("36690,海尔智家,家电,57.40,-3%,45,,,70.00,20X,3.50,35")
+    assert {"45", "70", "20", "3.5", "35"}.issubset(q_csv_1)
+    q_csv_2 = ex.extract_quote_supported_numbers(
+        '300750.SZ,宁德时代,动力电池,15376,337.90,625.00,85%,-15%,25,100.00,20X,"5,109,588"'
+    )
+    assert {"25", "100", "20", "5109588"}.issubset(q_csv_2)
+    assert "25100" not in q_csv_2
+    q_list = ex.extract_quote_supported_numbers("分批建仓比例为 1,2,3 档")
+    assert {"1", "2", "3"}.issubset(q_list)
+    assert "123" not in q_list
+
+    res_csv_claim = ex.validate_candidate_card(
+        {
+            "claim": "宁德时代目标价625.00元，潜在涨幅85%，2027E PE为25倍，2025A EPS为100.00元（对应PE 20倍）。",
+            "figures": [],
+            "tickers": [],
+        },
+        quote='300750.SZ,宁德时代,动力电池,15376,337.90,625.00,85%,-15%,25,100.00,20X,"5,109,588"',
+    )
+    assert res_csv_claim.unsupported_claim_numbers == []
+
+    # --- Item 2c: Uppercase `5M` / `> 5M downloads` <-> `500万`, and `Qwen3-8B` stripping ---
+    res_5m = ex.validate_candidate_card(
+        {
+            "claim": "应用下载量超过500万次。",
+            "figures": [{"metric": "downloads", "value": ">5", "unit": "million", "period": ""}],
+            "tickers": [],
+        },
+        quote="（> 5M downloads）",
+    )
+    assert res_5m.unsupported_claim_numbers == []
+    assert res_5m.figures_dropped == 0
+    assert "5000000" in ex.extract_quote_supported_numbers("活跃用户达 5M")
+
+    res_qwen = ex.validate_candidate_card(
+        {
+            "claim": "基于Qwen3-8B的实测显示吞吐量提升58.3%。",
+            "figures": [],
+            "tickers": [],
+        },
+        quote="Qwen3-8B 实测吞吐量提升 +58.3%。",
+    )
+    assert res_qwen.unsupported_claim_numbers == []
+
+    # --- Item 2d: `3/15` without date context is preserved as fraction (`3` and `15`), masked only with date context ---
+    res_3_15 = ex.validate_candidate_card(
+        {
+            "claim": "15只标的中仅3只（3/15）股价在50日均线之上。",
+            "figures": [{"metric": "stocks_above_50dma", "value": 3, "unit": "count_out_of_15", "period": ""}],
+            "tickers": [],
+        },
+        quote=">50MA 只有 3/15：GOOG、TSM、WDC",
+    )
+    assert res_3_15.unsupported_claim_numbers == []
+    assert res_3_15.figures_dropped == 0
+    assert "3" not in ex.extract_quote_supported_numbers("截至 3/15 收盘股价企稳")
+
+    # --- Item 2e: `"一份"`, `"一下"`, `"一起"`, `"一点"`, `"一次性"` are NOT metric numbers ---
+    res_cn_words = ex.validate_candidate_card(
+        {
+            "claim": "整理了一份纪要，等一下一起看一点数据，剔除一次性影响后利润增长20%。",
+            "figures": [],
+            "tickers": [],
+        },
+        quote="利润增长20%。",
+    )
+    assert res_cn_words.unsupported_claim_numbers == []
+    assert res_cn_words.confidence == 0.8
+
+    # --- No enumeration-count exemption (lead, round 5 review): a count not in the quote is
+    # flagged, and an unrelated "3%" can no longer ride on a three-name list. Flag, never drop.
+    res_enum_tickers = ex.validate_candidate_card(
+        {"claim": "三家公司收入增长3%。", "figures": [], "tickers": []},
+        quote="TOL PHM DHI",
+    )
+    assert "3" in res_enum_tickers.unsupported_claim_numbers
+    assert res_enum_tickers.ok is True and res_enum_tickers.confidence == 0.4
+
+    res_eleven = ex.validate_candidate_card(
+        {"claim": "已签署十一份订单", "figures": [], "tickers": []},
+        quote="订单已经签署",
+    )
+    assert res_eleven.unsupported_claim_numbers == ["11"]
+
+
+
+
+def test_render_shows_verification_flag_not_as_key_figure() -> None:
+    from src.dalton.conversations.render import render_conversation_digest_md
+
+    card = {
+        "card_id": "cc_test", "type": "fact", "claim": "全年收入增长56%", "quote": "Q3 +51%",
+        "date_et": "2026-10-20", "confidence": 0.4, "tickers": [], "entities": [], "sectors": [],
+        "figures": [
+            {"metric": "revenue_growth", "value": "51", "unit": "%", "period": "Q3"},
+            {"metric": "_verification", "value": "unsupported:56", "unit": "", "period": ""},
+        ],
+    }
+    md = render_conversation_digest_md([card], date_et="2026-10-20")
+    flag_line = next(line for line in md.splitlines() if "⚠ 核验" in line)
+    assert "（56）" in flag_line
+    assert "`_verification`" not in md
+    assert "`revenue_growth` = `51`" in md
+
+
+def test_yi_fen_masking_respects_multi_digit_numerals_only() -> None:
+    from src.dalton.conversations import extractor as ex
+
+    def flagged(claim: str, quote: str = "无") -> list[str]:
+        return ex.validate_candidate_card({"claim": claim, "figures": [], "tickers": []}, quote=quote).unsupported_claim_numbers
+
+    assert flagged("周二一份纪要显示需求平稳") == []
+    assert flagged("周一一个月内完成交付") == []
+    assert flagged("已签署十一份订单") == ["11"]
+    assert flagged("已签署一百零一份订单") == ["101"]

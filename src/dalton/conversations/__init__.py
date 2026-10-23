@@ -7,6 +7,7 @@ from src.dalton.conversations.embedder import (
 from src.dalton.conversations.extractor import (
     EXTRACTION_RESPONSE_SCHEMA,
     PRIVATE_COMPANIES,
+    CardValidationResult,
     SegmentExtractionOutcome,
     compute_batch_supersedes,
     compute_content_hash,
@@ -19,6 +20,7 @@ from src.dalton.conversations.extractor import (
     normalize_whitespace,
     resolve_dedup_and_supersedes,
     segment_events,
+    validate_candidate_card,
     verify_verbatim_quote,
 )
 from src.dalton.conversations.render import (
@@ -37,6 +39,7 @@ from src.dalton.conversations.search import (
 )
 
 __all__ = [
+    "CardValidationResult",
     "EXTRACTION_RESPONSE_SCHEMA",
     "PRIVATE_COMPANIES",
     "SegmentExtractionOutcome",
@@ -62,6 +65,7 @@ __all__ = [
     "rrf_fuse_cards",
     "segment_events",
     "topic_conversation_path",
+    "validate_candidate_card",
     "verify_verbatim_quote",
     "write_conversation_file_to_backend",
 ]
