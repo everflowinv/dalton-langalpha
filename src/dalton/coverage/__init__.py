@@ -11,6 +11,7 @@ from src.dalton.coverage.models import (
     build_coverage_doc,
     company_to_row,
     dump_coverage_yaml,
+    extract_row_group_ids,
     infer_market,
     make_new_company_dict,
     normalize_source,
@@ -20,6 +21,7 @@ from src.dalton.coverage.models import (
 )
 from src.dalton.coverage.service import (
     GROUP_REFRESH_INTERVAL_DAYS,
+    CoverageDataSourceError,
     add_coverage_group,
     add_user_coverage_tickers,
     ensure_user_earnings_calendar_automation,
@@ -47,6 +49,7 @@ from src.dalton.coverage.service import (
 
 __all__ = [
     "CANONICAL_COMPANY_KEY_ORDER",
+    "CoverageDataSourceError",
     "DEDICATED_COMPANY_KEYS",
     "GROUP_REFRESH_INTERVAL_DAYS",
     "MAX_MIRROR_LEDGER_BYTES",
@@ -58,6 +61,7 @@ __all__ = [
     "company_to_row",
     "dump_coverage_yaml",
     "ensure_user_earnings_calendar_automation",
+    "extract_row_group_ids",
     "get_user_aliases",
     "get_user_aliases_sync",
     "get_user_coverage",

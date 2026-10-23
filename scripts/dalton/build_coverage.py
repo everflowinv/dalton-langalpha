@@ -401,7 +401,13 @@ def sync_to_user_coverage_db(user_id: str, yaml_path: Path) -> int:
     """Seed the specified user's coverage roster in PostgreSQL from `yaml_path`."""
     from scripts.dalton.seed_user_coverage import run_seed
 
-    return asyncio.run(run_seed(user_id=user_id, yaml_path=yaml_path, apply=True))
+    res = asyncio.run(run_seed(user_id=user_id, yaml_path=yaml_path, apply=True))
+    print(
+        f"[sync] Seeded {res.get('written_count', 0)} companies (Core={res.get('core_count', 0)}, "
+        f"Watch={res.get('watch_count', 0)}) for user={user_id} from {yaml_path}"
+    )
+    print(json.dumps(res, ensure_ascii=False, indent=2, default=str))
+    return 0 if res.get("ok") else 1
 
 
 def print_report(doc: dict[str, Any], discrepancies: list[dict[str, Any]]) -> None:

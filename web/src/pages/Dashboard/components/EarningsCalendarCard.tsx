@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback, useMemo } from 'react';
+import React, { useEffect, useState, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 import { createPortal } from 'react-dom';
 import { ChevronRight, X, Calendar } from 'lucide-react';
@@ -8,14 +8,13 @@ import { useLocale } from '@/hooks/useLocale';
 import { useNow } from '@/hooks/useNow';
 import { createDateFormatter, shortMonthDay, shortWeekday } from '@/lib/format';
 import { localDateStr } from '@/lib/utils';
-import { getEarningsCalendar } from '../utils/api';
 // DALTON-HOOK(user-coverage): per-user coverage earnings calendar tab, badges, and 90-day modal view
 import {
   type DaltonEarningsEntry,
   type EarningsScope,
   EarningsScopeTabs,
   UserEarningsBadges,
-  getUserEarningsCalendar,
+  useEarningsCalendarQuery,
 } from './dalton/UserEarningsCalendar';
 
 interface EarningsEntry extends DaltonEarningsEntry {
@@ -377,43 +376,15 @@ function EarningsModal({ earnings, onClose }: EarningsModalProps) {
 
 function EarningsCalendarCard() {
   const { t } = useTranslation();
-  // DALTON-HOOK(user-coverage): default to "mine" ("我的") tab; "market" ("全市场") keeps upstream FMP behavior
+  // DALTON-HOOK(user-coverage): default to "mine" ("我的") tab; React Query keys by scope + user so switching tabs never races
   const [scope, setScope] = useState<EarningsScope>('mine');
-  const [allEarnings, setAllEarnings] = useState<EarningsEntry[]>([]);
-  const [loading, setLoading] = useState(true);
   const [modalOpen, setModalOpen] = useState(false);
-
-  const fetchEarnings = useCallback(async () => {
-    setLoading(true);
-    try {
-      const today = Date.now();
-      if (scope === 'mine') {
-        const from = localDateStr(today - 5 * 86400000);
-        const to = localDateStr(today + 90 * 86400000);
-        const result = await getUserEarningsCalendar({ from, to });
-        setAllEarnings((result?.data || []) as EarningsEntry[]);
-      } else {
-        const from = localDateStr(today - 5 * 86400000);
-        const to = localDateStr(today + 5 * 86400000);
-        const result = await getEarningsCalendar({ from, to });
-        // Filter to US-market symbols only (no dot-suffix like .BK, .TW, .L, .TO, etc.)
-        const usOnly = ((result?.data || []) as EarningsEntry[]).filter((e) => e.symbol && !e.symbol.includes('.'));
-        setAllEarnings(usOnly);
-      }
-    } catch (err: unknown) {
-      console.error('[EarningsCalendarCard] fetch failed:', (err as Error)?.message);
-      setAllEarnings([]);
-    } finally {
-      setLoading(false);
-    }
-  }, [scope]);
-
-  useEffect(() => {
-    fetchEarnings();
-  }, [fetchEarnings]);
 
   const now = useNow();
   const todayStr = localDateStr(now);
+  const { data: queryEarnings, isLoading: loading } = useEarningsCalendarQuery(scope, now);
+  // DALTON-HOOK(user-coverage): bind earnings rows from scoped React Query cache
+  const allEarnings = (queryEarnings ?? []) as EarningsEntry[];
 
   const { recent, upcoming } = useMemo(() => {
     const r = allEarnings.filter((e) => e.date < todayStr).sort((a, b) => b.date.localeCompare(a.date));
@@ -475,6 +446,7 @@ function EarningsCalendarCard() {
               </div>
             ))
           ) : previewItems.length === 0 ? (
+            /* DALTON-HOOK(user-coverage): per-scope empty state copy ("暂无财报数据" vs market empty period) */
             <p className="text-sm py-4 text-center" style={{ color: 'var(--color-text-secondary)' }}>
               {scope === 'mine'
                 ? t('dashboard.earningsCalendarCard.emptyData')

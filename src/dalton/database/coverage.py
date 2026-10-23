@@ -5,30 +5,15 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any, Mapping
 
 from psycopg.rows import dict_row
 
-from src.server.database import pool as _pool_mod
+from src.dalton.coverage.models import extract_row_group_ids
 from src.server.database.pool import get_db_connection
 
 logger = logging.getLogger(__name__)
-
-_ORIG_GET_DB_CONNECTION = get_db_connection
-
-
-@asynccontextmanager
-async def _open_db_connection():
-    """Resolve `get_db_connection` respecting monkeypatches on either this module or `pool`."""
-    fn = (
-        get_db_connection
-        if get_db_connection is not _ORIG_GET_DB_CONNECTION
-        else _pool_mod.get_db_connection
-    )
-    async with fn() as conn:
-        yield conn
 
 
 def _normalize_row(row: Mapping[str, Any] | None) -> dict[str, Any] | None:
@@ -75,7 +60,7 @@ async def list_coverage_rows(
     if not uid:
         return []
 
-    async def _run(c: Any) -> list[dict[str, Any]]:
+    async with get_db_connection(conn) as c:
         async with c.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 """
@@ -92,16 +77,10 @@ async def list_coverage_rows(
             rows = await cur.fetchall()
             return [_normalize_row(r) for r in rows if r is not None]  # type: ignore[misc]
 
-    if conn is not None:
-        return await _run(conn)
-    async with _open_db_connection() as c:
-        return await _run(c)
-
 
 async def list_all_coverage_rows(*, conn: Any = None) -> list[dict[str, Any]]:
     """Return all `dalton_coverage` rows across all users (used for union alias fallback)."""
-
-    async def _run(c: Any) -> list[dict[str, Any]]:
+    async with get_db_connection(conn) as c:
         async with c.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 """
@@ -116,11 +95,6 @@ async def list_all_coverage_rows(*, conn: Any = None) -> list[dict[str, Any]]:
             rows = await cur.fetchall()
             return [_normalize_row(r) for r in rows if r is not None]  # type: ignore[misc]
 
-    if conn is not None:
-        return await _run(conn)
-    async with _open_db_connection() as c:
-        return await _run(c)
-
 
 async def get_coverage_row(
     user_id: str,
@@ -134,7 +108,7 @@ async def get_coverage_row(
     if not uid or not sym:
         return None
 
-    async def _run(c: Any) -> dict[str, Any] | None:
+    async with get_db_connection(conn) as c:
         async with c.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 """
@@ -149,11 +123,6 @@ async def get_coverage_row(
             )
             return _normalize_row(await cur.fetchone())
 
-    if conn is not None:
-        return await _run(conn)
-    async with _open_db_connection() as c:
-        return await _run(c)
-
 
 async def count_coverage_rows(user_id: str, *, conn: Any = None) -> int:
     """Count `dalton_coverage` rows for `user_id`."""
@@ -161,7 +130,7 @@ async def count_coverage_rows(user_id: str, *, conn: Any = None) -> int:
     if not uid:
         return 0
 
-    async def _run(c: Any) -> int:
+    async with get_db_connection(conn) as c:
         async with c.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 "SELECT COUNT(*)::int AS cnt FROM dalton_coverage WHERE user_id = %s",
@@ -170,20 +139,19 @@ async def count_coverage_rows(user_id: str, *, conn: Any = None) -> int:
             row = await cur.fetchone()
             return int((row or {}).get("cnt") or 0)
 
-    if conn is not None:
-        return await _run(conn)
-    async with _open_db_connection() as c:
-        return await _run(c)
-
 
 async def upsert_coverage_rows(
     user_id: str,
     rows: list[dict[str, Any]],
     *,
+    expected_unique_count: int | None = None,
     conn: Any = None,
 ) -> tuple[int, list[dict[str, Any]]]:
     """Upsert coverage rows for `user_id` under per-user advisory lock.
 
+    When `expected_unique_count` is provided, verifies inside the same transaction
+    that the unique upserted ticker count matches `expected_unique_count`, rolling
+    back the transaction if the assertion fails.
     Returns `(previous_count, upserted_rows)`.
     """
     uid = str(user_id or "").strip()
@@ -221,15 +189,31 @@ async def upsert_coverage_rows(
                         NOW() + (%s * INTERVAL '1 microsecond'), NOW()
                     )
                     ON CONFLICT (user_id, ticker) DO UPDATE
-                    SET name = EXCLUDED.name,
-                        tier = EXCLUDED.tier,
-                        market = EXCLUDED.market,
-                        peer_group = EXCLUDED.peer_group,
+                    SET name = CASE
+                            WHEN EXCLUDED.name <> '' THEN EXCLUDED.name
+                            ELSE dalton_coverage.name
+                        END,
+                        tier = CASE
+                            WHEN EXCLUDED.source = 'group' THEN dalton_coverage.tier
+                            ELSE EXCLUDED.tier
+                        END,
+                        market = CASE
+                            WHEN EXCLUDED.market <> '' THEN EXCLUDED.market
+                            ELSE dalton_coverage.market
+                        END,
+                        peer_group = CASE
+                            WHEN EXCLUDED.peer_group <> '' THEN EXCLUDED.peer_group
+                            ELSE dalton_coverage.peer_group
+                        END,
                         peers = EXCLUDED.peers,
                         aliases = EXCLUDED.aliases,
                         earnings = EXCLUDED.earnings,
                         extra = EXCLUDED.extra,
-                        source = EXCLUDED.source,
+                        source = CASE
+                            WHEN EXCLUDED.source = 'group' AND dalton_coverage.source <> 'group'
+                                THEN dalton_coverage.source
+                            ELSE EXCLUDED.source
+                        END,
                         group_id = COALESCE(EXCLUDED.group_id, dalton_coverage.group_id),
                         updated_at = NOW()
                     RETURNING
@@ -258,11 +242,34 @@ async def upsert_coverage_rows(
                     norm = _normalize_row(fetched)
                     if norm is not None:
                         upserted.append(norm)
+
+            if expected_unique_count is not None:
+                unique_tickers = {str(r["ticker"]).strip().upper() for r in upserted}
+                await cur.execute(
+                    """
+                    SELECT COUNT(DISTINCT ticker)::int AS cnt
+                    FROM dalton_coverage
+                    WHERE user_id = %s AND ticker = ANY(%s)
+                    """,
+                    (uid, list(unique_tickers)),
+                )
+                cnt_row = await cur.fetchone()
+                db_unique_count = int((cnt_row or {}).get("cnt") or 0)
+                if (
+                    len(upserted) != expected_unique_count
+                    or len(unique_tickers) != expected_unique_count
+                    or db_unique_count != expected_unique_count
+                ):
+                    raise AssertionError(
+                        f"Written unique row count (upserted={len(upserted)}, "
+                        f"unique={len(unique_tickers)}, db={db_unique_count}) "
+                        f"does not match expected company count ({expected_unique_count})"
+                    )
         return prev_count, upserted
 
     if conn is not None:
         return await _run_in_tx(conn)
-    async with _open_db_connection() as c:
+    async with get_db_connection() as c:
         async with c.transaction():
             return await _run_in_tx(c)
 
@@ -295,7 +302,7 @@ async def delete_coverage_tickers(
 
     if conn is not None:
         return await _run_in_tx(conn)
-    async with _open_db_connection() as c:
+    async with get_db_connection() as c:
         async with c.transaction():
             return await _run_in_tx(c)
 
@@ -334,7 +341,7 @@ async def update_coverage_tier(
 
     if conn is not None:
         return await _run_in_tx(conn)
-    async with _open_db_connection() as c:
+    async with get_db_connection() as c:
         async with c.transaction():
             return await _run_in_tx(c)
 
@@ -382,7 +389,7 @@ async def mark_coverage_rows_group_stale(
 
     if conn is not None:
         return await _run_in_tx(conn)
-    async with _open_db_connection() as c:
+    async with get_db_connection() as c:
         async with c.transaction():
             return await _run_in_tx(c)
 
@@ -397,7 +404,7 @@ async def list_coverage_groups(
     if not uid:
         return []
 
-    async def _run(c: Any) -> list[dict[str, Any]]:
+    async with get_db_connection(conn) as c:
         async with c.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 """
@@ -419,11 +426,6 @@ async def list_coverage_groups(
             rows = await cur.fetchall()
             return [_normalize_row(r) for r in rows if r is not None]  # type: ignore[misc]
 
-    if conn is not None:
-        return await _run(conn)
-    async with _open_db_connection() as c:
-        return await _run(c)
-
 
 async def get_coverage_group(
     user_id: str,
@@ -437,7 +439,7 @@ async def get_coverage_group(
     if not uid or not gid:
         return None
 
-    async def _run(c: Any) -> dict[str, Any] | None:
+    async with get_db_connection(conn) as c:
         async with c.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 """
@@ -456,11 +458,6 @@ async def get_coverage_group(
                 (uid, gid),
             )
             return _normalize_row(await cur.fetchone())
-
-    if conn is not None:
-        return await _run(conn)
-    async with _open_db_connection() as c:
-        return await _run(c)
 
 
 async def insert_coverage_group(
@@ -511,7 +508,7 @@ async def insert_coverage_group(
 
     if conn is not None:
         return await _run_in_tx(conn)
-    async with _open_db_connection() as c:
+    async with get_db_connection() as c:
         async with c.transaction():
             return await _run_in_tx(c)
 
@@ -554,7 +551,7 @@ async def update_coverage_group_resolved(
 
     if conn is not None:
         return await _run_in_tx(conn)
-    async with _open_db_connection() as c:
+    async with get_db_connection() as c:
         async with c.transaction():
             return await _run_in_tx(c)
 
@@ -565,7 +562,7 @@ async def delete_coverage_group_and_exclusive_members(
     *,
     conn: Any = None,
 ) -> dict[str, Any]:
-    """Delete a coverage group and any coverage entries added exclusively via that group (`source='group'`)."""
+    """Delete a coverage group and remove only those coverage entries that belong to no other group and were not manually added."""
     uid = str(user_id or "").strip()
     gid = str(group_id or "").strip()
     if not uid or not gid:
@@ -573,26 +570,60 @@ async def delete_coverage_group_and_exclusive_members(
 
     async def _run_in_tx(c: Any) -> dict[str, Any]:
         await acquire_coverage_advisory_lock(c, uid)
-        async with c.cursor(row_factory=dict_row) as cur:
-            await cur.execute(
-                """
-                DELETE FROM dalton_coverage
-                WHERE user_id = %s AND group_id = %s::uuid AND source = 'group'
-                RETURNING ticker
-                """,
-                (uid, gid),
-            )
-            del_rows = await cur.fetchall()
-            removed_tickers = [str(r["ticker"]) for r in del_rows if r and r.get("ticker")]
+        rows = await list_coverage_rows(uid, conn=c)
+        to_delete_tickers: list[str] = []
+        to_update_rows: list[tuple[str, str | None, str]] = []
 
-            await cur.execute(
-                """
-                UPDATE dalton_coverage
-                SET group_id = NULL, updated_at = NOW()
-                WHERE user_id = %s AND group_id = %s::uuid
-                """,
-                (uid, gid),
-            )
+        for r in rows:
+            gids = extract_row_group_ids(r)
+            if gid not in gids and str(r.get("group_id") or "") != gid:
+                continue
+            remaining = [g for g in gids if g != gid]
+            src = str(r.get("source") or "chat").strip().lower()
+            sym = str(r["ticker"]).strip().upper()
+            if src == "group" and not remaining:
+                to_delete_tickers.append(sym)
+            else:
+                new_extra = dict(r.get("extra") or {})
+                if remaining:
+                    new_extra["group_ids"] = remaining
+                    new_primary: str | None = remaining[0]
+                else:
+                    new_extra.pop("group_ids", None)
+                    new_primary = None
+                to_update_rows.append(
+                    (
+                        sym,
+                        new_primary,
+                        json.dumps(new_extra, ensure_ascii=False),
+                    )
+                )
+
+        removed_tickers: list[str] = []
+        async with c.cursor(row_factory=dict_row) as cur:
+            if to_delete_tickers:
+                await cur.execute(
+                    """
+                    DELETE FROM dalton_coverage
+                    WHERE user_id = %s AND ticker = ANY(%s)
+                    RETURNING ticker
+                    """,
+                    (uid, to_delete_tickers),
+                )
+                del_rows = await cur.fetchall()
+                removed_tickers = [str(r["ticker"]) for r in del_rows if r and r.get("ticker")]
+
+            for sym, new_primary, new_extra_json in to_update_rows:
+                await cur.execute(
+                    """
+                    UPDATE dalton_coverage
+                    SET group_id = %s::uuid,
+                        extra = %s::jsonb,
+                        updated_at = NOW()
+                    WHERE user_id = %s AND ticker = %s
+                    """,
+                    (new_primary, new_extra_json, uid, sym),
+                )
 
             await cur.execute(
                 """
@@ -612,7 +643,7 @@ async def delete_coverage_group_and_exclusive_members(
 
     if conn is not None:
         return await _run_in_tx(conn)
-    async with _open_db_connection() as c:
+    async with get_db_connection() as c:
         async with c.transaction():
             return await _run_in_tx(c)
 
@@ -627,7 +658,7 @@ async def get_earnings_calendar_mirror(
     if not uid:
         return None
 
-    async def _run(c: Any) -> dict[str, Any] | None:
+    async with get_db_connection(conn) as c:
         async with c.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 """
@@ -638,11 +669,6 @@ async def get_earnings_calendar_mirror(
                 (uid,),
             )
             return _normalize_row(await cur.fetchone())
-
-    if conn is not None:
-        return await _run(conn)
-    async with _open_db_connection() as c:
-        return await _run(c)
 
 
 async def upsert_earnings_calendar_mirror(
@@ -677,6 +703,6 @@ async def upsert_earnings_calendar_mirror(
 
     if conn is not None:
         return await _run_in_tx(conn)
-    async with _open_db_connection() as c:
+    async with get_db_connection() as c:
         async with c.transaction():
             return await _run_in_tx(c)

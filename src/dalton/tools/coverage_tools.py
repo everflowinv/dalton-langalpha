@@ -11,6 +11,7 @@ from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool, tool
 
 from src.dalton.coverage import (
+    CoverageDataSourceError,
     add_coverage_group,
     add_user_coverage_tickers,
     list_user_coverage_summary,
@@ -216,6 +217,9 @@ def build_coverage_tools(*, role: str = "chief_of_staff") -> list[BaseTool]:
                         break
             res = await remove_coverage_group(user_id, matched_id or target_gid)
             return json.dumps(res, ensure_ascii=False, default=str)
+        except CoverageDataSourceError as exc:
+            logger.warning("[DALTON_COVERAGE_TOOL] action=%s data source error: %s", act, exc)
+            return json.dumps(exc.to_dict(), ensure_ascii=False, default=str)
         except Exception as exc:
             logger.warning("[DALTON_COVERAGE_TOOL] action=%s failed: %s", act, exc)
             return json.dumps(

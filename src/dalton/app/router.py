@@ -884,6 +884,7 @@ async def mutate_user_coverage_endpoint(
 ) -> dict[str, Any]:
     _require_dalton_enabled()
     from src.dalton.coverage import (
+        CoverageDataSourceError,
         add_user_coverage_tickers,
         remove_user_coverage_tickers,
         set_user_coverage_tier,
@@ -911,6 +912,8 @@ async def mutate_user_coverage_endpoint(
                 tickers,
                 tier=body.tier or "watch",
             )
+    except CoverageDataSourceError as exc:
+        raise HTTPException(status_code=503, detail=exc.to_dict()) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -943,7 +946,7 @@ async def preview_user_coverage_group_endpoint(
     user_id: CurrentUserId,
 ) -> dict[str, Any]:
     _require_dalton_enabled()
-    from src.dalton.coverage import preview_coverage_group
+    from src.dalton.coverage import CoverageDataSourceError, preview_coverage_group
 
     _ = user_id
     try:
@@ -951,6 +954,8 @@ async def preview_user_coverage_group_endpoint(
             label=body.label,
             criteria=body.criteria,
         )
+    except CoverageDataSourceError as exc:
+        raise HTTPException(status_code=503, detail=exc.to_dict()) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -962,7 +967,7 @@ async def create_user_coverage_group_endpoint(
     user_id: CurrentUserId,
 ) -> dict[str, Any]:
     _require_dalton_enabled()
-    from src.dalton.coverage import add_coverage_group
+    from src.dalton.coverage import CoverageDataSourceError, add_coverage_group
 
     try:
         return await add_coverage_group(
@@ -972,6 +977,8 @@ async def create_user_coverage_group_endpoint(
             default_tier=body.default_tier,
             auto_refresh=body.auto_refresh,
         )
+    except CoverageDataSourceError as exc:
+        raise HTTPException(status_code=503, detail=exc.to_dict()) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -986,7 +993,7 @@ async def delete_user_coverage_group_endpoint(
     from src.dalton.coverage import remove_coverage_group
 
     res = await remove_coverage_group(str(user_id).strip(), group_id)
-    if not res.get("ok"):
+    if not res.get("ok") or res.get("deleted") is False:
         raise HTTPException(status_code=404, detail=str(res.get("error") or "Group not found"))
     return res
 
@@ -998,12 +1005,16 @@ async def resolve_user_coverage_group_endpoint(
     user_id: CurrentUserId,
 ) -> dict[str, Any]:
     _require_dalton_enabled()
-    from src.dalton.coverage import resolve_coverage_group
+    from src.dalton.coverage import CoverageDataSourceError, resolve_coverage_group
 
     try:
         res = await resolve_coverage_group(str(user_id).strip(), group_id)
+    except CoverageDataSourceError as exc:
+        raise HTTPException(status_code=503, detail=exc.to_dict()) from exc
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        msg = str(exc)
+        status = 404 if "not found" in msg.lower() else 400
+        raise HTTPException(status_code=status, detail=msg) from exc
     if not res.get("ok"):
         raise HTTPException(status_code=404, detail=str(res.get("error") or "Group not found"))
     return res

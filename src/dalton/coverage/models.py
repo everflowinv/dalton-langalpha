@@ -79,12 +79,30 @@ def _ensure_json_obj(val: Any, default: Any) -> Any:
     return val
 
 
+def extract_row_group_ids(row: Mapping[str, Any]) -> list[str]:
+    """Return deduplicated list of group UUIDs that `row` belongs to."""
+    out: list[str] = []
+    extra = _ensure_json_obj(row.get("extra"), {})
+    if isinstance(extra, Mapping):
+        raw_list = extra.get("group_ids")
+        if isinstance(raw_list, (list, tuple)):
+            for item in raw_list:
+                gid = str(item or "").strip()
+                if gid and gid not in out:
+                    out.append(gid)
+    primary = str(row.get("group_id") or "").strip()
+    if primary and primary not in out:
+        out.insert(0, primary)
+    return out
+
+
 def company_to_row(
     company: Mapping[str, Any],
     *,
     user_id: str,
     source: str = "seed",
     group_id: str | None = None,
+    group_ids: list[str] | tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
     """Convert a `coverage.yaml` company dict into a `dalton_coverage` row dict losslessly."""
     uid = str(user_id or "").strip()
@@ -113,6 +131,29 @@ def company_to_row(
         k: v for k, v in company.items() if k not in DEDICATED_COMPANY_KEYS
     }
 
+    merged_gids: list[str] = []
+    if isinstance(extra.get("group_ids"), (list, tuple)):
+        for g in extra["group_ids"]:
+            gs = str(g or "").strip()
+            if gs and gs not in merged_gids:
+                merged_gids.append(gs)
+    if group_ids:
+        for g in group_ids:
+            gs = str(g or "").strip()
+            if gs and gs not in merged_gids:
+                merged_gids.append(gs)
+    if group_id:
+        gs = str(group_id).strip()
+        if gs and gs not in merged_gids:
+            merged_gids.append(gs)
+
+    if merged_gids:
+        extra["group_ids"] = merged_gids
+        eff_group_id: str | None = merged_gids[0]
+    else:
+        extra.pop("group_ids", None)
+        eff_group_id = None
+
     return {
         "user_id": uid,
         "ticker": raw_ticker,
@@ -125,7 +166,7 @@ def company_to_row(
         "earnings": earnings,
         "extra": extra,
         "source": src,
-        "group_id": str(group_id) if group_id else None,
+        "group_id": eff_group_id,
     }
 
 
@@ -160,7 +201,12 @@ def row_to_company(row: Mapping[str, Any]) -> dict[str, Any]:
             result[key] = extra[key]
 
     for key, val in extra.items():
-        if key not in result and key not in dedicated_map and not key.startswith("_"):
+        if (
+            key not in result
+            and key not in dedicated_map
+            and key != "group_ids"
+            and not key.startswith("_")
+        ):
             result[key] = val
 
     return result

@@ -14,6 +14,9 @@ import yaml
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from psycopg import AsyncConnection, AsyncTransaction
+from psycopg_pool import AsyncConnectionPool
+
 from src.dalton.app import dalton_router
 import src.dalton.autonomy.board as board_mod
 import src.dalton.autonomy.preflight as preflight_mod
@@ -26,6 +29,7 @@ from src.dalton.coverage.models import (
     build_coverage_doc,
     company_to_row,
     dump_coverage_yaml,
+    extract_row_group_ids,
     row_to_company,
     validate_earnings_calendar_ledger,
 )
@@ -99,13 +103,17 @@ class _InMemoryCoverageStore:
         rows: list[dict[str, Any]],
         *,
         conn: Any = None,
+        expected_unique_count: int | None = None,
     ) -> tuple[int, list[dict[str, Any]]]:
         _ = conn
         uid = str(user_id).strip()
         prev_count = await self.count_coverage_rows(uid)
+        snapshot = {k: dict(v) for k, v in self.rows.items()}
         upserted: list[dict[str, Any]] = []
+        seen_tickers: set[str] = set()
         for row in rows:
             sym = str(row["ticker"]).strip().upper()
+            seen_tickers.add(sym)
             key = (uid, sym)
             now = self._next_ts()
             existing = self.rows.get(key)
@@ -127,24 +135,42 @@ class _InMemoryCoverageStore:
                     "updated_at": now,
                 }
             else:
+                incoming_src = str(row.get("source") or "chat").lower()
+                eff_tier = (
+                    existing["tier"]
+                    if incoming_src == "group"
+                    else str(row.get("tier") or existing.get("tier") or "watch").lower()
+                )
+                eff_source = (
+                    existing["source"]
+                    if incoming_src == "group" and existing.get("source") != "group"
+                    else incoming_src
+                )
                 stored = {
                     "user_id": uid,
                     "ticker": sym,
                     "name": row.get("name") or existing.get("name") or sym,
-                    "tier": str(row.get("tier") or existing.get("tier") or "watch").lower(),
+                    "tier": eff_tier,
                     "market": row.get("market") or existing.get("market") or "US",
                     "peer_group": row.get("peer_group") if row.get("peer_group") is not None else existing.get("peer_group"),
                     "peers": list(row.get("peers") or []),
                     "aliases": dict(row.get("aliases") or {}),
                     "earnings": dict(row.get("earnings") or {}),
                     "extra": dict(row.get("extra") or {}),
-                    "source": row.get("source") or existing.get("source") or "chat",
+                    "source": eff_source,
                     "group_id": str(row["group_id"]) if row.get("group_id") else existing.get("group_id"),
                     "added_at": existing["added_at"],
                     "updated_at": now,
                 }
             self.rows[key] = stored
             upserted.append(dict(stored))
+        if expected_unique_count is not None and (
+            len(upserted) != expected_unique_count or len(seen_tickers) != expected_unique_count
+        ):
+            self.rows = snapshot
+            raise AssertionError(
+                f"Written unique row count ({len(seen_tickers)}) does not match expected count ({expected_unique_count})"
+            )
         return prev_count, upserted
 
     async def update_coverage_tier(
@@ -283,20 +309,41 @@ class _InMemoryCoverageStore:
             return {"deleted": False, "group_id": gid, "removed_tickers": []}
         label = self.groups[(uid, gid)].get("label")
         removed: list[str] = []
+        kept_shared: list[str] = []
+        kept_manual: list[str] = []
         for key in list(self.rows.keys()):
+            if key[0] != uid:
+                continue
             row = self.rows[key]
-            if key[0] == uid and str(row.get("group_id") or "") == gid:
-                if row.get("source") == "group":
-                    removed.append(key[1])
-                    del self.rows[key]
+            gids = extract_row_group_ids(row)
+            if gid not in gids:
+                continue
+            remaining = [g for g in gids if g != gid]
+            src = str(row.get("source") or "chat").strip().lower()
+            if src == "group" and not remaining:
+                removed.append(key[1])
+                del self.rows[key]
+            else:
+                extra = dict(row.get("extra") or {})
+                if remaining:
+                    extra["group_ids"] = remaining
                 else:
-                    row["group_id"] = None
+                    extra.pop("group_ids", None)
+                row["extra"] = extra
+                row["group_id"] = remaining[0] if remaining else None
+                row["updated_at"] = self._next_ts()
+                if src == "group":
+                    kept_shared.append(key[1])
+                else:
+                    kept_manual.append(key[1])
         del self.groups[(uid, gid)]
         return {
             "deleted": True,
             "group_id": gid,
             "label": label,
             "removed_tickers": sorted(removed),
+            "kept_shared_tickers": sorted(kept_shared),
+            "kept_manual_tickers": sorted(kept_manual),
         }
 
     async def get_earnings_calendar_mirror(
@@ -327,26 +374,39 @@ class _InMemoryCoverageStore:
         return dict(row)
 
 
-def _wire_coverage_store(monkeypatch: pytest.MonkeyPatch, store: _InMemoryCoverageStore) -> None:
+def _wire_coverage_store(monkeypatch: pytest.MonkeyPatch, store: _InMemoryCoverageStore) -> AsyncConnectionPool:
+    fake_tx = create_autospec(AsyncTransaction, instance=True)
+    fake_tx.__aenter__.return_value = fake_tx
+    fake_tx.__aexit__.return_value = False
+
+    fake_conn = create_autospec(AsyncConnection, instance=True)
+    fake_conn.transaction.return_value = fake_tx
+
+    fake_pool = create_autospec(AsyncConnectionPool, instance=True)
+    fake_pool.open.return_value = None
+    fake_pool.close.return_value = None
+
     @asynccontextmanager
-    async def _fake_conn():
-        class _DummyTx:
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *args: Any):
-                return False
-
-        class _DummyConn:
-            def transaction(self):
-                return _DummyTx()
-
-        yield _DummyConn()
+    async def _fake_conn_cm(conn: Any = None):
+        yield conn if conn is not None else fake_conn
 
     import src.server.database.pool as pool_mod
 
-    monkeypatch.setattr(coverage_db, "get_db_connection", _fake_conn)
-    monkeypatch.setattr(pool_mod, "get_db_connection", _fake_conn)
+    monkeypatch.setattr(
+        pool_mod,
+        "get_or_create_pool",
+        create_autospec(pool_mod.get_or_create_pool, return_value=fake_pool),
+    )
+    monkeypatch.setattr(
+        coverage_db,
+        "get_db_connection",
+        create_autospec(coverage_db.get_db_connection, side_effect=_fake_conn_cm),
+    )
+    monkeypatch.setattr(
+        pool_mod,
+        "get_db_connection",
+        create_autospec(pool_mod.get_db_connection, side_effect=_fake_conn_cm),
+    )
 
     for fn_name in (
         "acquire_coverage_advisory_lock",
@@ -373,6 +433,7 @@ def _wire_coverage_store(monkeypatch: pytest.MonkeyPatch, store: _InMemoryCovera
             fn_name,
             create_autospec(orig, side_effect=bound),
         )
+    return fake_pool
 
 
 def test_coverage_yaml_lossless_round_trip() -> None:
@@ -414,7 +475,12 @@ async def test_seed_script_dry_run_and_apply_and_user_isolation(
         "ensure_user_earnings_calendar_automation",
         create_autospec(
             coverage_svc.ensure_user_earnings_calendar_automation,
-            return_value={"ok": True, "created": True},
+            return_value={
+                "ok": True,
+                "action": "created",
+                "automation_id": "auto-cal-1",
+                "name": "dalton-earnings-calendar",
+            },
         ),
     )
 
@@ -491,7 +557,6 @@ async def test_four_server_callers_use_per_user_coverage(
     assert await sec_probe_mod.resolve_company_cik("ACME", allow_network=False, user_id=USER_BOB) is None
 
     # 4) extractor.py
-    extractor_mod._load_ticker_company_aliases.cache_clear()
     alice_ext_aliases = extractor_mod._load_ticker_company_aliases(USER_ALICE)
     assert "Acme Robotics" in alice_ext_aliases.get("ACME", ())
 
@@ -580,8 +645,8 @@ async def test_cos_coverage_tool_binding_actions_and_quarterly_preflight(
 
     monkeypatch.setattr(
         coverage_svc,
-        "_fetch_fmp_screener_rows",
-        create_autospec(coverage_svc._fetch_fmp_screener_rows, side_effect=_fake_screener),
+        "_fetch_yf_screener_rows",
+        create_autospec(coverage_svc._fetch_yf_screener_rows, side_effect=_fake_screener),
     )
     monkeypatch.setattr(
         coverage_svc,
@@ -595,7 +660,7 @@ async def test_cos_coverage_tool_binding_actions_and_quarterly_preflight(
     tool = build_coverage_tools(role="chief_of_staff")[0]
     cfg = {"configurable": {"user_id": USER_ALICE}}
 
-    # 1) add specific tickers (one valid, one invalid) -> first non-empty triggers auto-creation of dalton-earnings-calendar
+    # 1) add specific tickers (one valid, one invalid) -> non-empty roster triggers idempotent ensure of dalton-earnings-calendar
     add_out = json.loads(
         await tool.ainvoke(
             {"action": "add", "tickers": ["NVDA", "FAKE999"], "tier": "core"},
@@ -770,7 +835,12 @@ async def test_router_coverage_and_earnings_calendar_mirror_and_non_pm_system_jo
         "ensure_user_earnings_calendar_automation",
         create_autospec(
             coverage_svc.ensure_user_earnings_calendar_automation,
-            return_value={"ok": True, "created": True},
+            return_value={
+                "ok": True,
+                "action": "created",
+                "automation_id": "auto-cal-1",
+                "name": "dalton-earnings-calendar",
+            },
         ),
     )
 
@@ -863,3 +933,430 @@ async def test_router_coverage_and_earnings_calendar_mirror_and_non_pm_system_jo
     )
     assert other_home_job["can_toggle"] is False
     assert other_home_job["can_run_now"] is False
+
+
+@pytest.mark.asyncio
+async def test_yfinance_primary_screener_otc_filter_and_structured_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 2 Item 1: yfinance is primary for screener & validation, filters out OTC & duplicate stems, and raises structured error on upstream failure."""
+    raw_rows = [
+        {"symbol": "NVDA", "companyName": "NVIDIA Corporation", "exchange": "NMS", "exchangeShortName": "NMS", "marketCap": 3_000_000_000_000},
+        {"symbol": "TSM", "companyName": "Taiwan Semiconductor Manufacturing Co.", "exchange": "NYQ", "exchangeShortName": "NYQ", "marketCap": 1_000_000_000_000},
+        {"symbol": "ASML", "companyName": "ASML Holding N.V.", "exchange": "NMS", "exchangeShortName": "NMS", "marketCap": 400_000_000_000},
+        {"symbol": "ASMLF", "companyName": "ASML Holding N.V.", "exchange": "PNK", "exchangeShortName": "PNK", "marketCap": 400_000_000_000},
+        {"symbol": "TOELY", "companyName": "Tokyo Electron Ltd", "exchange": "PNK", "exchangeShortName": "PNK", "marketCap": 100_000_000_000},
+        {"symbol": "GOOGL", "companyName": "Alphabet Inc.", "exchange": "NMS", "exchangeShortName": "NMS", "marketCap": 2_000_000_000_000},
+        {"symbol": "GOOG", "companyName": "Alphabet Inc.", "exchange": "NMS", "exchangeShortName": "NMS", "marketCap": 1_900_000_000_000},
+    ]
+    filtered = coverage_svc._filter_mainboard_screener_rows(raw_rows)
+    filtered_syms = [r["symbol"] for r in filtered]
+    assert "ASMLF" not in filtered_syms
+    assert "TOELY" not in filtered_syms
+    # Duplicate company stem "Alphabet" deduplicated to primary higher market-cap listing
+    assert filtered_syms == ["NVDA", "TSM", "ASML", "GOOGL"]
+
+    # Ticker validation: yfinance primary succeeds even when FMP fails with 402/429
+    monkeypatch.setenv("FMP_API_KEY", "test-fmp-key")
+    yf_lookup_mock = create_autospec(
+        coverage_svc._lookup_via_yfinance,
+        return_value={"ticker": "MU", "name": "Micron Technology, Inc.", "market": "US", "sector": "Technology", "industry": "Semiconductors"},
+    )
+    monkeypatch.setattr(coverage_svc, "_lookup_via_yfinance", yf_lookup_mock)
+    monkeypatch.setattr(
+        coverage_svc,
+        "_lookup_via_fmp_profile",
+        create_autospec(
+            coverage_svc._lookup_via_fmp_profile,
+            side_effect=coverage_svc.CoverageDataSourceError("fmp", "FMP returned HTTP 402", status_code=402),
+        ),
+    )
+    enriched = await coverage_svc.validate_and_enrich_ticker("MU")
+    assert enriched is not None
+    assert enriched["ticker"] == "MU"
+    assert enriched["name"] == "Micron Technology, Inc."
+
+    # When both yfinance and FMP fail with upstream errors, raises CoverageDataSourceError (not None / "not_found")
+    yf_lookup_mock.return_value = None
+    yf_lookup_mock.side_effect = coverage_svc.CoverageDataSourceError("yfinance", "rate limited")
+    with pytest.raises(coverage_svc.CoverageDataSourceError) as exc_info:
+        await coverage_svc.validate_and_enrich_ticker("MU")
+    assert exc_info.value.provider in {"yfinance", "fmp"}
+    assert "test-fmp-key" not in str(exc_info.value)
+
+    # Without FMP key configured, raises yfinance CoverageDataSourceError directly
+    monkeypatch.delenv("FMP_API_KEY", raising=False)
+    with pytest.raises(coverage_svc.CoverageDataSourceError) as exc_info_yf:
+        await coverage_svc.validate_and_enrich_ticker("MU")
+    assert exc_info_yf.value.provider == "yfinance"
+
+
+@pytest.mark.asyncio
+async def test_seed_pool_lifecycle_row_assertion_and_build_coverage_exit_code(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Round 2 Items 2, 3, 4: synchronous get_or_create_pool + open/close, transactional duplicate/row-count rejection, and integer exit code in build_coverage."""
+    store = _InMemoryCoverageStore()
+    _wire_coverage_store(monkeypatch, store)
+    monkeypatch.setattr(
+        coverage_svc,
+        "sync_user_coverage_to_home",
+        create_autospec(coverage_svc.sync_user_coverage_to_home, return_value=True),
+    )
+    monkeypatch.setattr(
+        coverage_svc,
+        "ensure_user_earnings_calendar_automation",
+        create_autospec(
+            coverage_svc.ensure_user_earnings_calendar_automation,
+            return_value={"ok": True, "action": "created", "automation_id": "auto-cal-1", "name": "dalton-earnings-calendar"},
+        ),
+    )
+
+    from scripts.dalton import build_coverage as build_cov_mod
+    from scripts.dalton import seed_user_coverage as seed_mod
+    import src.server.database.pool as pool_mod
+
+    # Duplicate ticker in YAML must be rejected before committing and leave 0 rows in DB
+    dup_yaml = tmp_path / "dup_coverage.yaml"
+    dup_yaml.write_text(
+        yaml.safe_dump(
+            {
+                "version": 2,
+                "companies": [
+                    {"ticker": "NVDA", "name": "NVIDIA", "tier": "core", "market": "US"},
+                    {"ticker": "NVDA", "name": "NVIDIA Dup", "tier": "watch", "market": "US"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="Duplicate ticker"):
+        await seed_mod.run_seed(user_id=USER_ALICE, yaml_path=dup_yaml, apply=True)
+    assert await store.count_coverage_rows(USER_ALICE) == 0
+
+    # Pool open() and close() were called on the autospec pool returned by get_or_create_pool()
+    fake_pool = pool_mod.get_or_create_pool.return_value
+    assert fake_pool.open.await_count >= 1
+    assert fake_pool.close.await_count >= 1
+
+    # build_coverage.sync_to_user_coverage_db returns integer exit code 0 on success and 1 on error
+    import asyncio
+
+    orig_run_seed = seed_mod.run_seed
+    run_seed_mock = create_autospec(
+        orig_run_seed,
+        return_value={"ok": True, "mode": "applied", "written_count": 105},
+    )
+    monkeypatch.setattr(seed_mod, "run_seed", run_seed_mock)
+    rc_ok = await asyncio.to_thread(
+        build_cov_mod.sync_to_user_coverage_db,
+        user_id=USER_ALICE,
+        yaml_path=COVERAGE_YAML_PATH,
+    )
+    assert rc_ok == 0 and isinstance(rc_ok, int)
+
+    run_seed_mock.return_value = {"ok": False, "error": "boom"}
+    rc_err = await asyncio.to_thread(
+        build_cov_mod.sync_to_user_coverage_db,
+        user_id=USER_ALICE,
+        yaml_path=COVERAGE_YAML_PATH,
+    )
+    assert rc_err == 1 and isinstance(rc_err, int)
+
+
+@pytest.mark.asyncio
+async def test_extractor_per_owner_aliases_for_stripping_and_proper_nouns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 2 Item 5: extractor strips company aliases and validates proper nouns using conversation owner's coverage aliases."""
+    store = _InMemoryCoverageStore()
+    _wire_coverage_store(monkeypatch, store)
+
+    # Alice has company "ZETA" with Chinese alias "泽塔99科技" (contains digits that should be stripped only for Alice or union fallback)
+    await store.upsert_coverage_rows(
+        USER_ALICE,
+        [
+            company_to_row(
+                {
+                    "ticker": "ZETA",
+                    "name": "Zeta Semi Corp",
+                    "tier": "core",
+                    "market": "US",
+                    "aliases": {"search_names": ["泽塔99科技", "ZetaSemi"]},
+                },
+                user_id=USER_ALICE,
+                source="chat",
+            )
+        ],
+    )
+
+    alice_strip = extractor_mod._chinese_company_aliases_for_stripping(USER_ALICE)
+    bob_strip = extractor_mod._chinese_company_aliases_for_stripping(USER_BOB)
+    union_strip = extractor_mod._chinese_company_aliases_for_stripping(None)
+    assert "泽塔99科技" in alice_strip
+    assert "泽塔99科技" not in bob_strip
+    assert "泽塔99科技" in union_strip
+
+    # Number parsing for Alice strips "99" inside "泽塔99科技", leaving only "25", whereas for Bob "99" is not stripped
+    alice_nums = extractor_mod.parse_number_mentions("泽塔99科技今年营收增长25%", user_id=USER_ALICE)
+    bob_nums = extractor_mod.parse_number_mentions("泽塔99科技今年营收增长25%", user_id=USER_BOB)
+    assert [n[0] for n in alice_nums] == ["25"]
+    assert "99" in [n[0] for n in bob_nums]
+
+    # Entity alias groups for proper noun validation include ZETA for Alice, not for Bob
+    alice_groups = extractor_mod._build_entity_alias_groups(USER_ALICE)
+    bob_groups = extractor_mod._build_entity_alias_groups(USER_BOB)
+    assert any("泽塔99科技" in grp for grp in alice_groups)
+    assert not any("泽塔99科技" in grp for grp in bob_groups)
+
+
+@pytest.mark.asyncio
+async def test_multi_group_membership_include_validation_and_preflight_autonomy_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 2 Items 6, 7, 8, 9: multi-group membership preservation on delete, unvalidated criteria.include rejection, idempotent automation check, and preflight sync when autonomy.enabled=False."""
+    store = _InMemoryCoverageStore()
+    _wire_coverage_store(monkeypatch, store)
+
+    home_sync_calls: list[str] = []
+
+    async def _fake_sync_home(
+        user_id: str,
+        *,
+        yaml_text: str | None = None,
+        backend: Any = None,
+        rel_path: str = "dalton/coverage.yaml",
+    ) -> bool:
+        _ = (yaml_text, backend, rel_path)
+        home_sync_calls.append(user_id)
+        return True
+
+    monkeypatch.setattr(
+        coverage_svc,
+        "sync_user_coverage_to_home",
+        create_autospec(coverage_svc.sync_user_coverage_to_home, side_effect=_fake_sync_home),
+    )
+    monkeypatch.setattr(
+        preflight_mod,
+        "sync_user_coverage_to_home",
+        create_autospec(preflight_mod.sync_user_coverage_to_home, side_effect=_fake_sync_home),
+    )
+
+    ensure_calls: list[str] = []
+
+    async def _fake_ensure(user_id: str) -> dict[str, Any]:
+        ensure_calls.append(user_id)
+        return {"ok": True, "action": "exists", "automation_id": "auto-cal-1", "name": "dalton-earnings-calendar"}
+
+    monkeypatch.setattr(
+        coverage_svc,
+        "ensure_user_earnings_calendar_automation",
+        create_autospec(coverage_svc.ensure_user_earnings_calendar_automation, side_effect=_fake_ensure),
+    )
+
+    async def _fake_validate(ticker: str) -> dict[str, Any] | None:
+        sym = ticker.strip().upper()
+        if sym in {"NVDA", "AVGO", "TSM"}:
+            return {"ticker": sym, "name": f"{sym} Inc", "market": "US", "sector": "Technology", "industry": "Semiconductors"}
+        return None
+
+    monkeypatch.setattr(
+        coverage_svc,
+        "validate_and_enrich_ticker",
+        create_autospec(coverage_svc.validate_and_enrich_ticker, side_effect=_fake_validate),
+    )
+    yf_screener_mock = create_autospec(
+        coverage_svc._fetch_yf_screener_rows,
+        return_value=[
+            {"symbol": "NVDA", "companyName": "NVIDIA", "exchangeShortName": "NMS"},
+            {"symbol": "AVGO", "companyName": "Broadcom", "exchangeShortName": "NMS"},
+        ],
+    )
+    monkeypatch.setattr(coverage_svc, "_fetch_yf_screener_rows", yf_screener_mock)
+    monkeypatch.setattr(
+        coverage_svc,
+        "_user_workspace_tickers",
+        create_autospec(coverage_svc._user_workspace_tickers, return_value={}),
+    )
+
+    # Group 1 includes NVDA, AVGO (from screener) + TSM (valid include) + BOGUS99 (invalid include -> rejected/not_found)
+    g1 = await coverage_svc.add_coverage_group(
+        USER_ALICE,
+        label="Group One",
+        criteria={"country": "US", "industry": "Semiconductors", "include": ["TSM", "BOGUS99"]},
+        default_tier="watch",
+    )
+    assert g1["ok"] is True
+    assert g1["not_found"] == ["BOGUS99"]
+    assert await store.get_coverage_row(USER_ALICE, "BOGUS99") is None
+    assert await store.get_coverage_row(USER_ALICE, "TSM") is not None
+
+    # Group 2 also matches NVDA (shared between Group 1 and Group 2)
+    yf_screener_mock.return_value = [
+        {"symbol": "NVDA", "companyName": "NVIDIA", "exchangeShortName": "NMS"},
+    ]
+    g2 = await coverage_svc.add_coverage_group(
+        USER_ALICE,
+        label="Group Two",
+        criteria={"country": "US", "industry": "Semiconductors"},
+        default_tier="watch",
+    )
+    assert g2["ok"] is True
+    g1_id = g1["group"]["group_id"]
+    g2_id = g2["group"]["group_id"]
+
+    nvda_row = await store.get_coverage_row(USER_ALICE, "NVDA")
+    assert nvda_row is not None
+    assert set(nvda_row["extra"].get("group_ids", [])) == {g1_id, g2_id}
+
+    # Deleting Group 1 removes AVGO and TSM (exclusive to Group 1), but keeps NVDA (still in Group 2)
+    rm1 = await coverage_svc.remove_coverage_group(USER_ALICE, group_id=g1_id)
+    assert rm1["ok"] is True
+    assert set(rm1["removed_tickers"]) == {"AVGO", "TSM"}
+    nvda_after = await store.get_coverage_row(USER_ALICE, "NVDA")
+    assert nvda_after is not None
+    assert nvda_after["extra"].get("group_ids") == [g2_id]
+    assert nvda_after["group_id"] == g2_id
+
+    # ensure_user_earnings_calendar_automation was called on every mutation while roster is non-empty
+    assert len(ensure_calls) >= 3
+
+    # Preflight syncs Home/dalton/coverage.yaml even when autonomy.enabled is False
+    home_sync_calls.clear()
+    disabled_cfg = preflight_mod.get_dalton_settings().model_copy(deep=True)
+    disabled_cfg.autonomy.enabled = False
+    monkeypatch.setattr(
+        preflight_mod,
+        "get_dalton_settings",
+        create_autospec(preflight_mod.get_dalton_settings, return_value=disabled_cfg),
+    )
+    monkeypatch.setattr(
+        preflight_mod,
+        "verify_workspace_access",
+        create_autospec(
+            preflight_mod.verify_workspace_access,
+            return_value={"workspace_id": "ws-home-alice", "user_id": USER_ALICE},
+        ),
+    )
+    pf_disabled = await preflight_mod.preflight_check(
+        {
+            "automation_id": "auto-cal-1",
+            "user_id": USER_ALICE,
+            "workspace_id": "ws-home-alice",
+            "name": "dalton-earnings-calendar",
+            "trigger_type": "cron",
+        },
+        "exec-disabled-1",
+        persist=True,
+    )
+    assert pf_disabled.should_wake is True
+    assert pf_disabled.reason == "autonomy_disabled"
+    assert USER_ALICE in home_sync_calls
+
+
+@pytest.mark.asyncio
+async def test_two_users_mutual_isolation_service_and_router(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 2 Item 11: two users' coverage rosters and groups are mutually invisible and non-modifiable at both service and router layers."""
+    store = _InMemoryCoverageStore()
+    _wire_coverage_store(monkeypatch, store)
+    monkeypatch.setattr(
+        coverage_svc,
+        "sync_user_coverage_to_home",
+        create_autospec(coverage_svc.sync_user_coverage_to_home, return_value=True),
+    )
+    monkeypatch.setattr(
+        coverage_svc,
+        "ensure_user_earnings_calendar_automation",
+        create_autospec(
+            coverage_svc.ensure_user_earnings_calendar_automation,
+            return_value={"ok": True, "action": "exists", "automation_id": "auto-cal-1", "name": "dalton-earnings-calendar"},
+        ),
+    )
+    monkeypatch.setattr(
+        coverage_svc,
+        "_user_workspace_tickers",
+        create_autospec(coverage_svc._user_workspace_tickers, return_value={}),
+    )
+
+    async def _fake_validate(ticker: str) -> dict[str, Any] | None:
+        sym = ticker.strip().upper()
+        return {"ticker": sym, "name": f"{sym} Corp", "market": "US", "sector": "Technology", "industry": "Semiconductors"}
+
+    monkeypatch.setattr(
+        coverage_svc,
+        "validate_and_enrich_ticker",
+        create_autospec(coverage_svc.validate_and_enrich_ticker, side_effect=_fake_validate),
+    )
+    monkeypatch.setattr(
+        coverage_svc,
+        "_fetch_yf_screener_rows",
+        create_autospec(
+            coverage_svc._fetch_yf_screener_rows,
+            return_value=[{"symbol": "NVDA", "companyName": "NVIDIA Corp", "exchangeShortName": "NMS"}],
+        ),
+    )
+
+    # --- Service-layer mutual isolation ---
+    await coverage_svc.add_user_coverage_tickers(USER_ALICE, ["AAPL"], tier="core")
+    alice_grp = await coverage_svc.add_coverage_group(
+        USER_ALICE,
+        label="Alice Semis",
+        criteria={"country": "US", "industry": "Semiconductors"},
+        default_tier="watch",
+    )
+    alice_group_id = alice_grp["group"]["group_id"]
+
+    await coverage_svc.add_user_coverage_tickers(USER_BOB, ["MSFT"], tier="watch")
+
+    # Bob cannot see Alice's tickers or groups, and cannot modify or delete them via service calls
+    bob_list = await coverage_svc.list_user_coverage_summary(USER_BOB)
+    assert [c["ticker"] for c in bob_list["companies"]] == ["MSFT"]
+    assert bob_list["groups"] == []
+
+    bob_tier_attempt = await coverage_svc.set_user_coverage_tier(USER_BOB, ["AAPL"], tier="watch")
+    assert bob_tier_attempt["updated"] == []
+    assert bob_tier_attempt["missing_tickers"] == ["AAPL"]
+    assert (await coverage_pkg.get_user_tier(USER_ALICE, "AAPL")) == "core"
+
+    bob_rm_attempt = await coverage_svc.remove_user_coverage_tickers(USER_BOB, ["AAPL"])
+    assert bob_rm_attempt["removed"] == []
+    assert (await coverage_pkg.get_user_tier(USER_ALICE, "AAPL")) == "core"
+
+    bob_grp_rm_attempt = await coverage_svc.remove_coverage_group(USER_BOB, group_id=alice_group_id)
+    assert bob_grp_rm_attempt["deleted"] is False
+    assert bob_grp_rm_attempt["removed_tickers"] == []
+    assert len(await coverage_db.list_coverage_groups(USER_ALICE)) == 1
+
+    # --- Router-layer mutual isolation ---
+    app = FastAPI()
+    current_user = {"id": USER_BOB}
+    app.dependency_overrides[get_current_user_id] = lambda: current_user["id"]
+    app.include_router(dalton_router)
+    client = TestClient(app, raise_server_exceptions=False)
+
+    # Bob's GET /dalton/coverage only returns MSFT
+    r_bob_cov = client.get("/api/v1/dalton/coverage")
+    assert r_bob_cov.status_code == 200
+    assert [c["ticker"] for c in r_bob_cov.json()["companies"]] == ["MSFT"]
+
+    # Bob attempting PATCH / DELETE on Alice's AAPL or Alice's group_id returns 404 and leaves Alice's data intact
+    r_bob_patch_alice = client.patch("/api/v1/dalton/coverage/AAPL", json={"tier": "watch"})
+    assert r_bob_patch_alice.status_code == 404
+
+    r_bob_del_alice = client.delete("/api/v1/dalton/coverage/AAPL")
+    assert r_bob_del_alice.status_code == 404
+
+    r_bob_del_grp = client.delete(f"/api/v1/dalton/coverage/groups/{alice_group_id}")
+    assert r_bob_del_grp.status_code == 404
+
+    # Switch to Alice and verify her AAPL (core) and group are untouched
+    current_user["id"] = USER_ALICE
+    r_alice_cov = client.get("/api/v1/dalton/coverage")
+    assert r_alice_cov.status_code == 200
+    alice_tickers = {c["ticker"]: c["tier"] for c in r_alice_cov.json()["companies"]}
+    assert alice_tickers == {"AAPL": "core", "NVDA": "watch"}
+    assert len(r_alice_cov.json()["groups"]) == 1
+

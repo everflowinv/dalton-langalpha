@@ -57,24 +57,14 @@ def _parse_coverage_doc(doc: dict[str, Any]) -> tuple[str, dict[str, dict[str, A
 
 async def _load_user_coverage_doc(user_id: str) -> dict[str, Any]:
     from src.dalton.coverage import get_user_coverage
-    from src.dalton.database import coverage as coverage_db
     from src.server.database import pool as pool_mod
 
-    created_pool = None
-    is_patched = (
-        coverage_db.get_db_connection is not coverage_db._ORIG_GET_DB_CONNECTION
-        or getattr(pool_mod.get_db_connection, "__module__", "") != "src.server.database.pool"
-    )
-    if not is_patched and getattr(pool_mod, "_db_pool", None) is None:
-        try:
-            created_pool = await pool_mod.get_or_create_pool()
-        except Exception:
-            created_pool = None
+    pool = pool_mod.get_or_create_pool()
+    await pool.open()
     try:
         return await get_user_coverage(user_id)
     finally:
-        if created_pool is not None:
-            await pool_mod.close_db_pool()
+        await pool.close()
 
 
 def _load_coverage_map(

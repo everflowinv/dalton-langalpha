@@ -30,7 +30,6 @@ async def run_seed(
 ) -> dict[str, Any]:
     """Run dry-run or transactional seed of `dalton_coverage` for `user_id`."""
     from src.dalton.coverage.service import seed_user_coverage_from_yaml
-    from src.dalton.database import coverage as coverage_db
     from src.server.database import pool as pool_mod
 
     if not apply or conn is not None:
@@ -41,16 +40,8 @@ async def run_seed(
             conn=conn,
         )
 
-    # If neither coverage_db.get_db_connection nor pool_mod.get_db_connection was monkeypatched
-    # and the pool is not yet open in standalone CLI execution, initialize it for the run.
-    created_pool = None
-    is_patched = (
-        coverage_db.get_db_connection is not coverage_db._ORIG_GET_DB_CONNECTION
-        or getattr(pool_mod.get_db_connection, "__module__", "") != "src.server.database.pool"
-    )
-    if not is_patched and getattr(pool_mod, "_db_pool", None) is None:
-        created_pool = await pool_mod.get_or_create_pool()
-
+    pool = pool_mod.get_or_create_pool()
+    await pool.open()
     try:
         return await seed_user_coverage_from_yaml(
             user_id=user_id,
@@ -59,8 +50,7 @@ async def run_seed(
             conn=conn,
         )
     finally:
-        if created_pool is not None:
-            await pool_mod.close_db_pool()
+        await pool.close()
 
 
 def build_parser() -> argparse.ArgumentParser:

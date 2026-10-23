@@ -17,6 +17,7 @@ from src.dalton.coverage.models import (
     build_coverage_doc,
     company_to_row,
     dump_coverage_yaml,
+    extract_row_group_ids,
     infer_market,
     make_new_company_dict,
     normalize_source,
@@ -29,6 +30,54 @@ from src.dalton.database import coverage as coverage_db
 logger = logging.getLogger(__name__)
 
 GROUP_REFRESH_INTERVAL_DAYS = 85
+
+US_MAINBOARD_EXCHANGES: tuple[str, ...] = ("NMS", "NYQ", "NGM", "NCM", "ASE")
+MAINBOARD_EXCHANGES: frozenset[str] = frozenset(
+    {
+        *US_MAINBOARD_EXCHANGES,
+        "PCX",
+        "BTS",
+        "HKG",
+        "SHH",
+        "SHZ",
+        "NASDAQ",
+        "NYSE",
+        "AMEX",
+        "HKSE",
+        "HKEX",
+        "SSE",
+        "SZSE",
+    }
+)
+OTC_EXCHANGES: frozenset[str] = frozenset(
+    {"PNK", "OQB", "OQX", "OTC", "OTCMKTS", "YHD", "OEM", "NAE", "GREY"}
+)
+
+
+class CoverageDataSourceError(RuntimeError):
+    """Structured error raised when market data providers (yfinance / FMP) fail."""
+
+    def __init__(
+        self,
+        provider: str,
+        reason: str,
+        *,
+        status_code: int | None = None,
+    ) -> None:
+        self.provider = str(provider or "yfinance")
+        self.reason = str(reason or "upstream data source unavailable")
+        self.status_code = status_code
+        super().__init__(f"{self.provider} data source error: {self.reason}")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "ok": False,
+            "error": "data_source_unavailable",
+            "provider": self.provider,
+            "reason": self.reason,
+            "status_code": self.status_code,
+            "message": str(self),
+        }
 
 
 def _is_pool_not_open_error(exc: BaseException) -> bool:
@@ -400,9 +449,130 @@ def _map_exchange_or_country_to_market(
     return infer_market(sym)
 
 
+def _is_ticker_not_found_exception(exc: BaseException) -> bool:
+    if isinstance(exc, KeyError):
+        return True
+    msg = str(exc).lower()
+    return any(
+        token in msg
+        for token in (
+            "404",
+            "not found",
+            "quote not found",
+            "no data found",
+            "no fundamentals",
+            "delisted",
+            "no timezone",
+            "currenttradingperiod",
+            "may be delisted",
+        )
+    )
+
+
+def _extract_http_status(exc: BaseException) -> int | None:
+    resp = getattr(exc, "response", None)
+    status = getattr(resp, "status_code", None) or getattr(exc, "status_code", None)
+    if isinstance(status, int):
+        return status
+    msg = str(exc)
+    for code in (401, 402, 403, 404, 429, 500, 502, 503, 504):
+        if str(code) in msg:
+            return code
+    return None
+
+
+def _safe_fast_info_get(fi: Any, key: str) -> Any:
+    if fi is None:
+        return None
+    try:
+        if hasattr(fi, "get"):
+            return fi.get(key)
+        return getattr(fi, key, None)
+    except Exception:
+        return None
+
+
+def _lookup_via_yfinance_sync(ticker: str) -> dict[str, Any] | None:
+    """Synchronous ticker validation and enrichment via `yfinance.Ticker`."""
+    from market_protocol import display_spelling
+    from src.data_client.yfinance.yahoo import yahoo_ticker
+
+    sym = str(ticker or "").strip().upper()
+    if not sym:
+        return None
+
+    try:
+        tk = yahoo_ticker(sym)
+        info = tk.info or {}
+    except Exception as exc:
+        if _is_ticker_not_found_exception(exc):
+            return None
+        raise CoverageDataSourceError(
+            "yfinance",
+            f"{type(exc).__name__} while looking up {sym}",
+            status_code=_extract_http_status(exc),
+        ) from exc
+
+    fi = getattr(tk, "fast_info", None)
+    quote_type = str(info.get("quoteType") or "").strip().upper()
+    if quote_type == "NONE":
+        return None
+
+    exchange = str(
+        info.get("exchange")
+        or _safe_fast_info_get(fi, "exchange")
+        or ""
+    ).strip().upper()
+    name = str(
+        info.get("longName")
+        or info.get("shortName")
+        or info.get("displayName")
+        or ""
+    ).strip()
+    price = (
+        info.get("regularMarketPrice")
+        or info.get("currentPrice")
+        or info.get("previousClose")
+        or _safe_fast_info_get(fi, "lastPrice")
+        or _safe_fast_info_get(fi, "regularMarketPreviousClose")
+        or _safe_fast_info_get(fi, "previousClose")
+    )
+    market_cap = info.get("marketCap") or _safe_fast_info_get(fi, "marketCap")
+
+    has_identity = bool(name) or (
+        quote_type in ("EQUITY", "ETF", "INDEX", "MUTUALFUND")
+        and (price is not None or market_cap is not None or bool(exchange))
+    )
+    if not has_identity:
+        return None
+
+    canon_sym = display_spelling(str(info.get("symbol") or sym)).strip().upper() or sym
+    country = str(info.get("country") or "").strip()
+    sector = str(info.get("sector") or "").strip()
+    industry = str(info.get("industry") or "").strip()
+    market = _map_exchange_or_country_to_market(
+        canon_sym, exchange=exchange, country=country
+    )
+    return {
+        "ticker": sym,
+        "name": name or sym,
+        "market": market,
+        "sector": sector,
+        "industry": industry,
+        "exchange": exchange,
+        "market_cap": market_cap,
+        "source_provider": "yfinance",
+    }
+
+
+async def _lookup_via_yfinance(ticker: str) -> dict[str, Any] | None:
+    """Look up `ticker` via `yfinance.Ticker.info` / `fast_info`."""
+    return await asyncio.to_thread(_lookup_via_yfinance_sync, ticker)
+
+
 async def _lookup_via_fmp_profile(ticker: str) -> dict[str, Any] | None:
-    """Look up `ticker` via `FMPClient.get_profile`. Never logs or returns `FMP_API_KEY`."""
-    api_key = os.getenv("FMP_API_KEY")
+    """Optional FMP profile supplement when `FMP_API_KEY` is configured. Never logs or returns the key."""
+    api_key = (os.getenv("FMP_API_KEY") or "").strip()
     if not api_key:
         return None
     from src.data_client.fmp.fmp_client import FMPClient
@@ -434,10 +604,16 @@ async def _lookup_via_fmp_profile(ticker: str) -> dict[str, Any] | None:
                     "market": market,
                     "sector": sector,
                     "industry": industry,
+                    "exchange": exchange,
+                    "market_cap": first.get("mktCap") or first.get("marketCap"),
                     "source_provider": "fmp",
                 }
     except Exception as exc:
-        logger.debug("[DALTON_COVERAGE] FMP profile lookup failed for %s: %s", ticker, type(exc).__name__)
+        logger.debug(
+            "[DALTON_COVERAGE] FMP profile lookup unavailable for %s (%s)",
+            ticker,
+            type(exc).__name__,
+        )
     finally:
         try:
             await client.close()
@@ -446,64 +622,49 @@ async def _lookup_via_fmp_profile(ticker: str) -> dict[str, Any] | None:
     return None
 
 
-async def _lookup_via_researchdata_quote(ticker: str) -> dict[str, Any] | None:
-    """Look up `ticker` via researchdata quote (`finance` tool on researchdata MCP bridge)."""
-    try:
-        from src.dalton.data_map.health import call_researchdata_rpc
-
-        sym = str(ticker or "").strip().upper()
-        route = "cn-hk" if sym.endswith((".HK", ".SS", ".SZ", ".SH")) else "quote"
-        payload = await call_researchdata_rpc(
-            "finance",
-            {"route": route, "operation": "quote", "ticker": sym},
-            timeout_s=10.0,
-        )
-        if isinstance(payload, Mapping) and payload.get("ok") is not False:
-            data = payload.get("data") if isinstance(payload.get("data"), Mapping) else payload
-            rows = data.get("items") or data.get("rows") or data.get("quotes")
-            item: Mapping[str, Any] | None = None
-            if isinstance(rows, list) and rows and isinstance(rows[0], Mapping):
-                item = rows[0]
-            elif isinstance(data, Mapping) and (
-                data.get("name")
-                or data.get("company_name")
-                or data.get("companyName")
-                or data.get("price") is not None
-                or data.get("last_price") is not None
-                or data.get("close") is not None
-            ):
-                item = data
-            if item is not None:
-                name = str(
-                    item.get("name")
-                    or item.get("company_name")
-                    or item.get("companyName")
-                    or item.get("short_name")
-                    or sym
-                ).strip()
-                market = str(item.get("market") or "").strip() or infer_market(sym)
-                return {
-                    "ticker": sym,
-                    "name": name,
-                    "market": market,
-                    "source_provider": "researchdata",
-                }
-    except Exception as exc:
-        logger.debug("[DALTON_COVERAGE] researchdata quote lookup failed for %s: %s", ticker, type(exc).__name__)
-    return None
-
-
 async def validate_and_enrich_ticker(ticker: str) -> dict[str, Any] | None:
-    """Validate that `ticker` exists via FMP profile or researchdata quote and return enriched metadata."""
+    """Validate that `ticker` exists (yfinance primary, FMP optional supplement) and return enriched metadata.
+
+    Raises `CoverageDataSourceError` if market data sources fail due to provider/network errors,
+    rather than silently treating a broken data source as "ticker not found".
+    """
     sym = str(ticker or "").strip().upper()
     if not sym:
         return None
-    hit = await _lookup_via_fmp_profile(sym)
+
+    yf_error: CoverageDataSourceError | None = None
+    hit: dict[str, Any] | None = None
+    try:
+        hit = await _lookup_via_yfinance(sym)
+    except CoverageDataSourceError as exc:
+        yf_error = exc
+        logger.warning(
+            "[DALTON_COVERAGE] yfinance lookup failed for %s (%s), checking FMP fallback",
+            sym,
+            exc.reason,
+        )
+
     if hit is not None:
+        if (not hit.get("name") or hit.get("name") == sym or not hit.get("sector")) and (
+            os.getenv("FMP_API_KEY") or ""
+        ).strip():
+            fmp_supp = await _lookup_via_fmp_profile(sym)
+            if fmp_supp is not None:
+                if not hit.get("name") or hit.get("name") == sym:
+                    hit["name"] = fmp_supp.get("name") or hit["name"]
+                if not hit.get("sector") and fmp_supp.get("sector"):
+                    hit["sector"] = fmp_supp["sector"]
+                if not hit.get("industry") and fmp_supp.get("industry"):
+                    hit["industry"] = fmp_supp["industry"]
         return hit
-    hit = await _lookup_via_researchdata_quote(sym)
-    if hit is not None:
-        return hit
+
+    if (os.getenv("FMP_API_KEY") or "").strip():
+        fmp_hit = await _lookup_via_fmp_profile(sym)
+        if fmp_hit is not None:
+            return fmp_hit
+
+    if yf_error is not None:
+        raise yf_error
     return None
 
 
@@ -568,10 +729,12 @@ async def list_user_coverage_summary(user_id: str) -> dict[str, Any]:
 
     for r in rows:
         comp = row_to_company(r)
+        gids = extract_row_group_ids(r)
         comp_with_meta = {
             **comp,
             "source": r.get("source"),
-            "group_id": r.get("group_id"),
+            "group_id": r.get("group_id") or (gids[0] if gids else None),
+            "group_ids": gids,
             "group_stale": bool((r.get("extra") or {}).get("group_stale")),
         }
         companies.append(comp_with_meta)
@@ -632,6 +795,64 @@ async def list_user_coverage_summary(user_id: str) -> dict[str, Any]:
     }
 
 
+def _build_upsert_rows_from_existing(
+    *,
+    uid: str,
+    valid_items: Sequence[Mapping[str, Any]],
+    existing_rows: Mapping[str, Mapping[str, Any]],
+    ws_by_ticker: Mapping[str, str],
+    norm_tier: str,
+    norm_source: str,
+    group_id: str | None,
+) -> list[dict[str, Any]]:
+    rows_to_upsert: list[dict[str, Any]] = []
+    gid_clean = str(group_id).strip() if group_id else None
+    for item in valid_items:
+        sym = str(item["ticker"]).strip().upper()
+        existing = existing_rows.get(sym)
+        if existing is not None:
+            comp = row_to_company(existing)
+            prev_gids = extract_row_group_ids(existing)
+            merged_gids = list(prev_gids)
+            if gid_clean and gid_clean not in merged_gids:
+                merged_gids.append(gid_clean)
+            if norm_source == "group":
+                eff_source = str(existing.get("source") or "chat")
+                eff_group_id = existing.get("group_id") or (merged_gids[0] if merged_gids else gid_clean)
+            else:
+                comp["tier"] = norm_tier
+                eff_source = norm_source
+                eff_group_id = gid_clean or existing.get("group_id") or (merged_gids[0] if merged_gids else None)
+            if item.get("name") and (not comp.get("name") or comp.get("name") == sym):
+                comp["name"] = str(item["name"])
+            if item.get("market") and not comp.get("market"):
+                comp["market"] = str(item["market"])
+            comp.pop("group_stale", None)
+        else:
+            peer_grp = str(item.get("industry") or item.get("sector") or "").strip()
+            comp = make_new_company_dict(
+                sym,
+                name=str(item.get("name") or sym),
+                tier=norm_tier,
+                market=str(item.get("market") or infer_market(sym)),
+                peer_group=peer_grp,
+                has_active_workspace=sym in ws_by_ticker,
+            )
+            eff_source = norm_source
+            eff_group_id = gid_clean
+            merged_gids = [gid_clean] if gid_clean else []
+        rows_to_upsert.append(
+            company_to_row(
+                comp,
+                user_id=uid,
+                source=eff_source,
+                group_id=eff_group_id,
+                group_ids=merged_gids,
+            )
+        )
+    return rows_to_upsert
+
+
 async def add_user_coverage_tickers(
     user_id: str,
     tickers: Sequence[str],
@@ -640,12 +861,17 @@ async def add_user_coverage_tickers(
     source: str = "chat",
     group_id: str | None = None,
     prevalidated: Mapping[str, Mapping[str, Any]] | None = None,
+    conn: Any = None,
+    ensure_automation: bool = True,
+    sync_home: bool = True,
 ) -> dict[str, Any]:
     """Validate and add tickers to `user_id`'s coverage roster.
 
     Unresolvable tickers are returned in `not_found` and never written.
-    When the user's coverage becomes non-empty for the first time, idempotently
-    creates their `dalton-earnings-calendar` Home automation.
+    Reading existing rows and upserting happen inside the same transaction and
+    per-user advisory lock so manual tier/source cannot be overwritten by a group.
+    Whenever the user's coverage is mutated and non-empty, idempotently ensures
+    their `dalton-earnings-calendar` Home automation exists.
     """
     uid = str(user_id or "").strip()
     if not uid:
@@ -682,57 +908,36 @@ async def add_user_coverage_tickers(
         }
 
     ws_by_ticker = await _user_workspace_tickers(uid)
-    existing_rows = {
-        str(r["ticker"]).upper(): r
-        for r in await coverage_db.list_coverage_rows(uid)
-    }
 
-    rows_to_upsert: list[dict[str, Any]] = []
-    for item in valid_items:
-        sym = str(item["ticker"]).strip().upper()
-        existing = existing_rows.get(sym)
-        if existing is not None:
-            comp = row_to_company(existing)
-            if norm_source == "group":
-                eff_source = str(existing.get("source") or "chat")
-                eff_group_id = existing.get("group_id")
-            else:
-                comp["tier"] = norm_tier
-                eff_source = norm_source
-                eff_group_id = group_id
-            if item.get("name") and not comp.get("name"):
-                comp["name"] = str(item["name"])
-            if item.get("market") and not comp.get("market"):
-                comp["market"] = str(item["market"])
-            comp.pop("group_stale", None)
-        else:
-            peer_grp = str(item.get("industry") or item.get("sector") or "").strip()
-            comp = make_new_company_dict(
-                sym,
-                name=str(item.get("name") or sym),
-                tier=norm_tier,
-                market=str(item.get("market") or infer_market(sym)),
-                peer_group=peer_grp,
-                has_active_workspace=sym in ws_by_ticker,
-            )
-            eff_source = norm_source
-            eff_group_id = group_id
-        rows_to_upsert.append(
-            company_to_row(
-                comp,
-                user_id=uid,
-                source=eff_source,
-                group_id=eff_group_id,
-            )
+    async def _locked_read_and_upsert(c: Any) -> tuple[int, list[dict[str, Any]]]:
+        await coverage_db.acquire_coverage_advisory_lock(c, uid)
+        existing_rows = {
+            str(r["ticker"]).upper(): r
+            for r in await coverage_db.list_coverage_rows(uid, conn=c)
+        }
+        rows_to_upsert = _build_upsert_rows_from_existing(
+            uid=uid,
+            valid_items=valid_items,
+            existing_rows=existing_rows,
+            ws_by_ticker=ws_by_ticker,
+            norm_tier=norm_tier,
+            norm_source=norm_source,
+            group_id=group_id,
         )
+        return await coverage_db.upsert_coverage_rows(uid, rows_to_upsert, conn=c)
 
-    prev_count, upserted = await coverage_db.upsert_coverage_rows(uid, rows_to_upsert)
+    if conn is not None:
+        _prev_count, upserted = await _locked_read_and_upsert(conn)
+    else:
+        async with coverage_db.get_db_connection() as db_conn:
+            async with db_conn.transaction():
+                _prev_count, upserted = await _locked_read_and_upsert(db_conn)
 
     automation_res: dict[str, Any] = {}
-    if prev_count == 0 and len(upserted) > 0:
+    if ensure_automation and len(upserted) > 0:
         automation_res = await ensure_user_earnings_calendar_automation(uid)
 
-    home_synced = await sync_user_coverage_to_home(uid)
+    home_synced = await sync_user_coverage_to_home(uid) if sync_home else False
     added_companies = [row_to_company(r) for r in upserted]
 
     return {
@@ -775,6 +980,8 @@ async def remove_user_coverage_tickers(
     preserved_workspaces = [t for t in cleaned if t in ws_by_ticker]
 
     removed = await coverage_db.delete_coverage_tickers(uid, cleaned)
+    if removed and await coverage_db.count_coverage_rows(uid) > 0:
+        await ensure_user_earnings_calendar_automation(uid)
     home_synced = await sync_user_coverage_to_home(uid)
 
     notice: str | None = None
@@ -811,6 +1018,8 @@ async def set_user_coverage_tier(
     updated_rows = await coverage_db.update_coverage_tier(uid, cleaned, norm_tier)
     updated_tickers = [str(r["ticker"]) for r in updated_rows]
     missing_tickers = [t for t in cleaned if t not in set(updated_tickers)]
+    if updated_rows:
+        await ensure_user_earnings_calendar_automation(uid)
     home_synced = await sync_user_coverage_to_home(uid)
 
     return {
@@ -826,6 +1035,231 @@ async def set_user_coverage_tier(
 # ---------------------------------------------------------------------------
 # Item 4 & 5: Screener Rule Groups (preview, add, remove, quarterly resolve)
 # ---------------------------------------------------------------------------
+
+
+_EXCHANGE_TO_YF_CODES: dict[str, tuple[str, ...]] = {
+    "NASDAQ": ("NMS", "NGM", "NCM"),
+    "NYSE": ("NYQ",),
+    "AMEX": ("ASE",),
+    "US": US_MAINBOARD_EXCHANGES,
+    "HKEX": ("HKG",),
+    "HKSE": ("HKG",),
+    "HK": ("HKG",),
+    "SSE": ("SHH",),
+    "SZSE": ("SHZ",),
+}
+
+_COUNTRY_TO_YF_REGION: dict[str, str] = {
+    "US": "us",
+    "USA": "us",
+    "UNITED STATES": "us",
+    "HK": "hk",
+    "HKG": "hk",
+    "HONG KONG": "hk",
+    "CN": "cn",
+    "CHN": "cn",
+    "CHINA": "cn",
+}
+
+
+def _normalize_company_stem(name: str) -> str:
+    import re
+
+    lowered = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", " ", str(name or "").lower()).strip()
+    if not lowered:
+        return ""
+    stop = {
+        "inc",
+        "incorporated",
+        "corp",
+        "corporation",
+        "ltd",
+        "limited",
+        "plc",
+        "co",
+        "company",
+        "holdings",
+        "holding",
+        "group",
+        "adr",
+        "ads",
+        "ag",
+        "nv",
+        "sa",
+        "se",
+        "the",
+    }
+    tokens = [t for t in lowered.split() if t not in stop]
+    return " ".join(tokens)
+
+
+def _is_otc_or_non_mainboard_row(row: Mapping[str, Any]) -> bool:
+    ex = str(row.get("exchange") or row.get("exchangeShortName") or "").strip().upper()
+    if ex in OTC_EXCHANGES:
+        return True
+    if ex and ex not in MAINBOARD_EXCHANGES:
+        return True
+    qtype = str(row.get("quoteType") or "").strip().upper()
+    if qtype and qtype != "EQUITY":
+        return True
+    return False
+
+
+def _filter_mainboard_screener_rows(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Keep only mainboard equity listings and remove OTC / duplicate secondary tickers."""
+    from market_protocol import display_spelling
+
+    filtered: list[dict[str, Any]] = []
+    seen_symbols: set[str] = set()
+    seen_stems: set[str] = set()
+
+    for raw in rows:
+        if not isinstance(raw, Mapping):
+            continue
+        if _is_otc_or_non_mainboard_row(raw):
+            continue
+        raw_sym = str(raw.get("symbol") or raw.get("ticker") or "").strip()
+        if not raw_sym:
+            continue
+        sym = display_spelling(raw_sym).strip().upper()
+        if not sym or sym in seen_symbols:
+            continue
+        ex = str(raw.get("exchange") or raw.get("exchangeShortName") or "").strip().upper()
+        # Reject unlabelled 5-letter F/Y OTC tickers on US venues
+        if "." not in sym and len(sym) == 5 and sym.endswith(("F", "Y")) and not ex:
+            continue
+
+        name = str(
+            raw.get("companyName")
+            or raw.get("longName")
+            or raw.get("shortName")
+            or raw.get("name")
+            or sym
+        ).strip()
+        stem = _normalize_company_stem(name)
+        if stem and len(stem) >= 3 and stem in seen_stems:
+            continue
+
+        seen_symbols.add(sym)
+        if stem and len(stem) >= 3:
+            seen_stems.add(stem)
+
+        item = dict(raw)
+        item["symbol"] = sym
+        item["companyName"] = name
+        if ex:
+            item["exchange"] = ex
+        filtered.append(item)
+
+    return filtered
+
+
+def _build_yf_equity_query(criteria: Mapping[str, Any]) -> tuple[Any, int]:
+    """Build `(EquityQuery, limit)` from `criteria`, restricting to mainboard exchanges."""
+    from yfinance.screener.query import EquityQuery
+
+    nodes: list[Any] = []
+    country_raw = str(criteria.get("country") or criteria.get("market") or "US").strip().upper()
+    region = _COUNTRY_TO_YF_REGION.get(country_raw, country_raw.lower() or "us")
+    nodes.append(EquityQuery("EQ", ["region", region]))
+
+    exchange_raw = str(criteria.get("exchange") or "").strip().upper()
+    if exchange_raw:
+        mapped_ex = list(_EXCHANGE_TO_YF_CODES.get(exchange_raw, (exchange_raw,)))
+        ex_codes = [c for c in mapped_ex if c and c not in OTC_EXCHANGES]
+    elif region == "us":
+        ex_codes = list(US_MAINBOARD_EXCHANGES)
+    elif region == "hk":
+        ex_codes = ["HKG"]
+    elif region == "cn":
+        ex_codes = ["SHH", "SHZ"]
+    else:
+        ex_codes = []
+
+    if len(ex_codes) == 1:
+        nodes.append(EquityQuery("EQ", ["exchange", ex_codes[0]]))
+    elif len(ex_codes) > 1:
+        nodes.append(EquityQuery("IS-IN", ["exchange", *ex_codes]))
+
+    sector = str(criteria.get("sector") or "").strip()
+    if sector:
+        nodes.append(EquityQuery("EQ", ["sector", sector]))
+
+    industry = str(criteria.get("industry") or "").strip()
+    if industry:
+        nodes.append(EquityQuery("EQ", ["industry", industry]))
+
+    mc_min = (
+        criteria.get("market_cap_min")
+        if criteria.get("market_cap_min") is not None
+        else criteria.get("market_cap_more_than", criteria.get("marketCapMoreThan"))
+    )
+    if mc_min is not None:
+        nodes.append(EquityQuery("GT", ["intradaymarketcap", float(mc_min)]))
+
+    mc_max = (
+        criteria.get("market_cap_max")
+        if criteria.get("market_cap_max") is not None
+        else criteria.get("market_cap_lower_than", criteria.get("marketCapLowerThan"))
+    )
+    if mc_max is not None:
+        nodes.append(EquityQuery("LT", ["intradaymarketcap", float(mc_max)]))
+
+    limit_val = criteria.get("limit")
+    limit = min(max(int(limit_val) if limit_val is not None else 50, 1), 250)
+
+    query = nodes[0] if len(nodes) == 1 else EquityQuery("AND", nodes)
+    return query, limit
+
+
+def _fetch_yf_screener_rows_sync(criteria: Mapping[str, Any]) -> list[dict[str, Any]]:
+    from market_protocol import display_spelling
+    from yfinance.screener.screener import screen as yf_screen
+
+    try:
+        query, limit = _build_yf_equity_query(criteria)
+        result = yf_screen(
+            query,
+            size=limit,
+            sortField="intradaymarketcap",
+            sortAsc=False,
+        )
+    except Exception as exc:
+        raise CoverageDataSourceError(
+            "yfinance",
+            f"{type(exc).__name__} in yf.screen",
+            status_code=_extract_http_status(exc),
+        ) from exc
+
+    quotes = result.get("quotes", []) if isinstance(result, Mapping) else []
+    raw_rows: list[dict[str, Any]] = []
+    for q in quotes:
+        if not isinstance(q, Mapping):
+            continue
+        sym = display_spelling(str(q.get("symbol") or "")).strip().upper()
+        if not sym:
+            continue
+        raw_rows.append(
+            {
+                "symbol": sym,
+                "companyName": str(
+                    q.get("longName") or q.get("shortName") or q.get("displayName") or sym
+                ).strip(),
+                "exchange": str(q.get("exchange") or "").strip().upper(),
+                "exchangeShortName": str(q.get("exchange") or "").strip().upper(),
+                "quoteType": str(q.get("quoteType") or "EQUITY").strip().upper(),
+                "country": str(q.get("region") or criteria.get("country") or "").strip().upper(),
+                "sector": str(q.get("sector") or q.get("sectorDisp") or criteria.get("sector") or "").strip(),
+                "industry": str(q.get("industry") or q.get("industryDisp") or criteria.get("industry") or "").strip(),
+                "marketCap": q.get("marketCap") or q.get("intradaymarketcap"),
+            }
+        )
+    return _filter_mainboard_screener_rows(raw_rows)
+
+
+async def _fetch_yf_screener_rows(criteria: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Resolve `criteria` via `yf.screen(EquityQuery(...))` keeping only mainboard listings."""
+    return await asyncio.to_thread(_fetch_yf_screener_rows_sync, criteria)
 
 
 def _build_fmp_screener_filters(criteria: Mapping[str, Any]) -> dict[str, Any]:
@@ -868,17 +1302,25 @@ def _build_fmp_screener_filters(criteria: Mapping[str, Any]) -> dict[str, Any]:
 
 async def _fetch_fmp_screener_rows(filters: Mapping[str, Any]) -> list[dict[str, Any]]:
     """Invoke `FMPClient.get_company_screener` using `FMP_API_KEY` from environment."""
-    api_key = os.getenv("FMP_API_KEY")
+    api_key = (os.getenv("FMP_API_KEY") or "").strip()
     if not api_key:
-        raise ValueError("FMP_API_KEY environment variable is not configured")
+        raise CoverageDataSourceError("fmp", "FMP_API_KEY is not configured")
     from src.data_client.fmp.fmp_client import FMPClient
 
     client = FMPClient(api_key=api_key)
     try:
         raw_res = await client.get_company_screener(**dict(filters))
         if isinstance(raw_res, list):
-            return [dict(r) for r in raw_res if isinstance(r, Mapping)]
+            return _filter_mainboard_screener_rows(
+                [dict(r) for r in raw_res if isinstance(r, Mapping)]
+            )
         return []
+    except Exception as exc:
+        raise CoverageDataSourceError(
+            "fmp",
+            f"{type(exc).__name__} in company-screener",
+            status_code=_extract_http_status(exc),
+        ) from exc
     finally:
         try:
             await client.close()
@@ -886,11 +1328,29 @@ async def _fetch_fmp_screener_rows(filters: Mapping[str, Any]) -> list[dict[str,
             pass
 
 
+async def _fetch_screener_rows(criteria: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Resolve screener rows with `yfinance` (`yf.screen(EquityQuery)`) as primary and FMP as supplement."""
+    try:
+        rows = await _fetch_yf_screener_rows(criteria)
+        return _filter_mainboard_screener_rows(rows)
+    except CoverageDataSourceError as yf_exc:
+        if (os.getenv("FMP_API_KEY") or "").strip():
+            try:
+                filters = _build_fmp_screener_filters(criteria)
+                return await _fetch_fmp_screener_rows(filters)
+            except Exception as fmp_exc:
+                logger.warning(
+                    "[DALTON_COVERAGE] FMP screener fallback also failed (%s)",
+                    type(fmp_exc).__name__,
+                )
+        raise yf_exc
+
+
 async def preview_coverage_group(
     label: str,
     criteria: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Resolve `criteria` via `FMPClient.get_company_screener` without writing to DB."""
+    """Resolve `criteria` via `yf.screen(EquityQuery(...))` without writing to DB."""
     if not isinstance(criteria, Mapping):
         raise ValueError("criteria must be a JSON object")
 
@@ -921,10 +1381,10 @@ async def preview_coverage_group(
         )
     )
     if has_screener_filters or not include_tickers:
-        screener_rows = await _fetch_fmp_screener_rows(filters)
+        screener_rows = await _fetch_screener_rows(criteria)
 
     by_symbol: dict[str, dict[str, Any]] = {}
-    for row in screener_rows:
+    for row in _filter_mainboard_screener_rows(screener_rows):
         sym = str(row.get("symbol") or row.get("ticker") or "").strip().upper()
         if not sym or sym in exclude_set or sym in by_symbol:
             continue
@@ -941,21 +1401,15 @@ async def preview_coverage_group(
             "market_cap": row.get("marketCap"),
         }
 
+    rejected_tickers: list[str] = []
     for inc_sym in include_tickers:
         if inc_sym in exclude_set or inc_sym in by_symbol:
             continue
         enriched = await validate_and_enrich_ticker(inc_sym)
         if enriched is not None:
             by_symbol[inc_sym] = enriched
-        else:
-            by_symbol[inc_sym] = {
-                "ticker": inc_sym,
-                "name": inc_sym,
-                "market": infer_market(inc_sym),
-                "sector": str(criteria.get("sector") or ""),
-                "industry": str(criteria.get("industry") or ""),
-                "market_cap": None,
-            }
+        elif inc_sym not in rejected_tickers:
+            rejected_tickers.append(inc_sym)
 
     companies = list(by_symbol.values())
     return {
@@ -966,6 +1420,8 @@ async def preview_coverage_group(
         "count": len(companies),
         "tickers": [c["ticker"] for c in companies],
         "companies": companies,
+        "not_found": rejected_tickers,
+        "rejected": rejected_tickers,
     }
 
 
@@ -988,35 +1444,50 @@ async def add_coverage_group(
 
     preview = await preview_coverage_group(clean_label, criteria)
     resolved_companies = preview.get("companies") or []
+    rejected_tickers = list(preview.get("not_found") or [])
     prevalidated = {str(c["ticker"]).upper(): c for c in resolved_companies if c.get("ticker")}
 
     now_utc = datetime.now(timezone.utc)
-    group_row = await coverage_db.insert_coverage_group(
-        uid,
-        label=clean_label,
-        criteria=dict(criteria),
-        default_tier=norm_tier,
-        auto_refresh=bool(auto_refresh),
-        last_resolved_at=now_utc,
-    )
-    group_id = str(group_row["group_id"])
+    async with coverage_db.get_db_connection() as conn:
+        async with conn.transaction():
+            await coverage_db.acquire_coverage_advisory_lock(conn, uid)
+            group_row = await coverage_db.insert_coverage_group(
+                uid,
+                label=clean_label,
+                criteria=dict(criteria),
+                default_tier=norm_tier,
+                auto_refresh=bool(auto_refresh),
+                last_resolved_at=now_utc,
+                conn=conn,
+            )
+            group_id = str(group_row["group_id"])
+            add_res = await add_user_coverage_tickers(
+                uid,
+                list(prevalidated.keys()),
+                tier=norm_tier,
+                source="group",
+                group_id=group_id,
+                prevalidated=prevalidated,
+                conn=conn,
+                ensure_automation=False,
+                sync_home=False,
+            )
 
-    add_res = await add_user_coverage_tickers(
-        uid,
-        list(prevalidated.keys()),
-        tier=norm_tier,
-        source="group",
-        group_id=group_id,
-        prevalidated=prevalidated,
-    )
+    automation_res: dict[str, Any] = {}
+    if prevalidated:
+        automation_res = await ensure_user_earnings_calendar_automation(uid)
+    home_synced = await sync_user_coverage_to_home(uid)
 
     return {
         "ok": True,
         "group": group_row,
         "resolved_count": len(prevalidated),
         "added_tickers": add_res.get("added_tickers", []),
-        "automation_created": add_res.get("automation_created", False),
-        "home_synced": add_res.get("home_synced", False),
+        "not_found": rejected_tickers,
+        "rejected": rejected_tickers,
+        "automation": automation_res or None,
+        "automation_created": automation_res.get("action") == "created",
+        "home_synced": home_synced,
     }
 
 
@@ -1031,6 +1502,8 @@ async def remove_coverage_group(
         raise ValueError("user_id and group_id are required")
 
     res = await coverage_db.delete_coverage_group_and_exclusive_members(uid, gid)
+    if await coverage_db.count_coverage_rows(uid) > 0:
+        await ensure_user_earnings_calendar_automation(uid)
     home_synced = await sync_user_coverage_to_home(uid)
     return {
         "ok": True,
@@ -1046,9 +1519,10 @@ async def resolve_coverage_group(
     now: datetime | None = None,
     sync_home: bool = True,
 ) -> dict[str, Any]:
-    """Re-resolve an existing coverage group for `user_id`.
+    """Re-resolve an existing coverage group for `user_id` under a single advisory lock.
 
     - Newly matching tickers not yet in the user's coverage are added with `default_tier` and `source='group'`.
+    - Existing tickers that also match this group have `group_id` added to their `extra.group_ids` without overwriting manual tier/source.
     - Tickers in this group that no longer match are NOT deleted; instead `extra.group_stale = true` is set.
     - Tickers in this group that match again have `extra.group_stale` cleared.
     """
@@ -1067,63 +1541,80 @@ async def resolve_coverage_group(
 
     preview = await preview_coverage_group(label, criteria)
     resolved_companies = preview.get("companies") or []
+    rejected_tickers = list(preview.get("not_found") or [])
     matched_by_ticker = {
         str(c["ticker"]).upper(): c for c in resolved_companies if c.get("ticker")
     }
     matched_set = set(matched_by_ticker.keys())
-
-    existing_rows = await coverage_db.list_coverage_rows(uid)
-    existing_by_ticker = {str(r["ticker"]).upper(): r for r in existing_rows}
-
-    new_tickers = [t for t in matched_by_ticker if t not in existing_by_ticker]
-    stale_candidates = [
-        str(r["ticker"]).upper()
-        for r in existing_rows
-        if str(r.get("group_id") or "") == gid and str(r["ticker"]).upper() not in matched_set
-    ]
-    unstale_candidates = [
-        str(r["ticker"]).upper()
-        for r in existing_rows
-        if str(r.get("group_id") or "") == gid
-        and str(r["ticker"]).upper() in matched_set
-        and bool((r.get("extra") or {}).get("group_stale"))
-    ]
-
-    added_tickers: list[str] = []
-    if new_tickers:
-        add_res = await add_user_coverage_tickers(
-            uid,
-            new_tickers,
-            tier=default_tier,
-            source="group",
-            group_id=gid,
-            prevalidated={t: matched_by_ticker[t] for t in new_tickers},
-        )
-        added_tickers = list(add_res.get("added_tickers") or [])
-
-    marked_stale: list[str] = []
-    if stale_candidates:
-        marked_stale = await coverage_db.mark_coverage_rows_group_stale(
-            uid, stale_candidates, stale=True
-        )
-
-    if unstale_candidates:
-        await coverage_db.mark_coverage_rows_group_stale(
-            uid, unstale_candidates, stale=False
-        )
-
     resolved_ts = now or datetime.now(timezone.utc)
-    updated_group = await coverage_db.update_coverage_group_resolved(
-        uid, gid, last_resolved_at=resolved_ts
-    )
+
+    async with coverage_db.get_db_connection() as conn:
+        async with conn.transaction():
+            await coverage_db.acquire_coverage_advisory_lock(conn, uid)
+            existing_rows = await coverage_db.list_coverage_rows(uid, conn=conn)
+            existing_by_ticker = {str(r["ticker"]).upper(): r for r in existing_rows}
+
+            new_tickers = [t for t in matched_by_ticker if t not in existing_by_ticker]
+            tickers_needing_membership = [
+                t
+                for t in matched_by_ticker
+                if t not in existing_by_ticker
+                or gid not in extract_row_group_ids(existing_by_ticker[t])
+            ]
+            stale_candidates = [
+                str(r["ticker"]).upper()
+                for r in existing_rows
+                if gid in extract_row_group_ids(r)
+                and str(r["ticker"]).upper() not in matched_set
+            ]
+            unstale_candidates = [
+                str(r["ticker"]).upper()
+                for r in existing_rows
+                if gid in extract_row_group_ids(r)
+                and str(r["ticker"]).upper() in matched_set
+                and bool((r.get("extra") or {}).get("group_stale"))
+            ]
+
+            if tickers_needing_membership:
+                await add_user_coverage_tickers(
+                    uid,
+                    tickers_needing_membership,
+                    tier=default_tier,
+                    source="group",
+                    group_id=gid,
+                    prevalidated={t: matched_by_ticker[t] for t in tickers_needing_membership},
+                    conn=conn,
+                    ensure_automation=False,
+                    sync_home=False,
+                )
+
+            marked_stale: list[str] = []
+            if stale_candidates:
+                marked_stale = await coverage_db.mark_coverage_rows_group_stale(
+                    uid, stale_candidates, stale=True, conn=conn
+                )
+
+            if unstale_candidates:
+                await coverage_db.mark_coverage_rows_group_stale(
+                    uid, unstale_candidates, stale=False, conn=conn
+                )
+
+            updated_group = await coverage_db.update_coverage_group_resolved(
+                uid, gid, last_resolved_at=resolved_ts, conn=conn
+            )
+
+    if matched_by_ticker or existing_rows:
+        await ensure_user_earnings_calendar_automation(uid)
     home_synced = await sync_user_coverage_to_home(uid) if sync_home else False
 
     return {
         "ok": True,
         "group": updated_group or group_row,
         "matched_tickers": list(matched_by_ticker.keys()),
-        "added_tickers": added_tickers,
+        "added_tickers": new_tickers,
         "stale_tickers": marked_stale,
+        "not_found": rejected_tickers,
+        "rejected": rejected_tickers,
         "home_synced": home_synced,
     }
 
@@ -1417,11 +1908,25 @@ async def seed_user_coverage_from_yaml(
     if not isinstance(companies, list):
         raise ValueError(f"Invalid 'companies' list in {yaml_path}")
 
-    rows = [
-        company_to_row(comp, user_id=uid, source="seed")
-        for comp in companies
-        if isinstance(comp, Mapping) and comp.get("ticker")
-    ]
+    rows: list[dict[str, Any]] = []
+    seen_tickers: set[str] = set()
+    for idx, comp in enumerate(companies):
+        if not isinstance(comp, Mapping):
+            raise ValueError(
+                f"Invalid company entry at index {idx} in {yaml_path}: expected mapping"
+            )
+        raw_ticker = str(comp.get("ticker") or "").strip().upper()
+        if not raw_ticker:
+            raise ValueError(
+                f"Invalid company entry at index {idx} in {yaml_path}: missing ticker"
+            )
+        if raw_ticker in seen_tickers:
+            raise ValueError(
+                f"Duplicate ticker {raw_ticker!r} at index {idx} in {yaml_path}"
+            )
+        seen_tickers.add(raw_ticker)
+        rows.append(company_to_row(comp, user_id=uid, source="seed"))
+
     core_count = sum(1 for r in rows if r["tier"] == "core")
     watch_count = sum(1 for r in rows if r["tier"] == "watch")
 
@@ -1437,14 +1942,31 @@ async def seed_user_coverage_from_yaml(
             "written_count": 0,
         }
 
-    prev_count, upserted = await coverage_db.upsert_coverage_rows(uid, rows, conn=conn)
-    if len(upserted) != len(companies):
-        raise AssertionError(
-            f"Written row count ({len(upserted)}) does not match YAML company count ({len(companies)})"
+    expected_count = len(companies)
+
+    async def _seed_in_tx(tx_conn: Any) -> tuple[int, list[dict[str, Any]]]:
+        p_cnt, ups = await coverage_db.upsert_coverage_rows(
+            uid,
+            rows,
+            conn=tx_conn,
+            expected_unique_count=expected_count,
         )
+        if len(ups) != expected_count:
+            raise AssertionError(
+                f"Written row count ({len(ups)}) does not match YAML company count ({expected_count})"
+            )
+        return p_cnt, ups
+
+    if conn is not None:
+        async with conn.transaction():
+            _prev_count, upserted = await _seed_in_tx(conn)
+    else:
+        async with coverage_db.get_db_connection() as db_conn:
+            async with db_conn.transaction():
+                _prev_count, upserted = await _seed_in_tx(db_conn)
 
     automation_res: dict[str, Any] = {}
-    if prev_count == 0 and len(upserted) > 0:
+    if len(upserted) > 0:
         automation_res = await ensure_user_earnings_calendar_automation(uid)
 
     home_synced = await sync_user_coverage_to_home(uid)

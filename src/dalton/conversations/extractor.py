@@ -1006,20 +1006,6 @@ def _load_ticker_company_aliases(user_id: str | None = None) -> dict[str, tuple[
     return {k: tuple(v) for k, v in mapping.items()}
 
 
-def _clear_alias_caches() -> None:
-    try:
-        _chinese_company_aliases_for_stripping.cache_clear()
-    except Exception:
-        pass
-    try:
-        _build_entity_alias_groups.cache_clear()
-    except Exception:
-        pass
-
-
-_load_ticker_company_aliases.cache_clear = _clear_alias_caches  # type: ignore[attr-defined]
-
-
 def _call_load_ticker_company_aliases(user_id: str | None = None) -> dict[str, tuple[str, ...]]:
     """Invoke `_load_ticker_company_aliases`, tolerating zero-arg test doubles."""
     try:
@@ -1153,12 +1139,13 @@ def _parse_chinese_number(cn_text: str) -> Decimal | None:
     return Decimal(total + section + digit)
 
 
-@lru_cache(maxsize=1)
-def _chinese_company_aliases_for_stripping() -> tuple[str, ...]:
+def _chinese_company_aliases_for_stripping(
+    user_id: str | None = None,
+) -> tuple[str, ...]:
     """Return multi-character Chinese company aliases sorted longest-first so company names
     containing numeral characters (e.g. `百度`, `百融云创`, `爱德万测试`, `万事达`, `三花智控`) are not parsed as numbers.
     """
-    alias_map = _load_ticker_company_aliases()
+    alias_map = _call_load_ticker_company_aliases(user_id)
     cn_names: set[str] = set()
     for aliases in alias_map.values():
         for a in aliases:
@@ -1320,7 +1307,7 @@ _MA_WINDOW_CORE = (
 )
 
 
-def _strip_non_metric_tokens(text: str) -> str:
+def _strip_non_metric_tokens(text: str, *, user_id: str | None = None) -> str:
     """Remove URLs, stock tickers, dates/periods, technical indicator windows, and product/model codes
     before extracting metric numbers from `quote` or `claim`.
     """
@@ -1335,7 +1322,7 @@ def _strip_non_metric_tokens(text: str) -> str:
         s,
         flags=re.IGNORECASE,
     )
-    for cn_comp in _chinese_company_aliases_for_stripping():
+    for cn_comp in _chinese_company_aliases_for_stripping(user_id=user_id):
         if cn_comp in s:
             s = s.replace(cn_comp, " ")
     # Dates: YYYY-MM-DD, W2026-10-03, and unit-free YYYY-MM
@@ -1589,10 +1576,17 @@ _EN_NUM_MENTION_RE = re.compile(
 
 
 def _parse_number_mentions_detailed(
-    text: str, *, strip_non_metrics: bool = True
+    text: str,
+    *,
+    strip_non_metrics: bool = True,
+    user_id: str | None = None,
 ) -> list[tuple[str, set[str], bool]]:
     """Parse number mentions from `text` returning `(raw_canon, legal_forms, has_unit)` for each mention."""
-    cleaned = _strip_non_metric_tokens(text) if strip_non_metrics else str(text or "")
+    cleaned = (
+        _strip_non_metric_tokens(text, user_id=user_id)
+        if strip_non_metrics
+        else str(text or "")
+    )
     mentions: list[tuple[str, set[str], bool]] = []
     masked_chars = list(cleaned)
 
@@ -1703,7 +1697,12 @@ def _parse_number_mentions_detailed(
     return mentions
 
 
-def parse_number_mentions(text: str, *, strip_non_metrics: bool = True) -> list[tuple[str, set[str]]]:
+def parse_number_mentions(
+    text: str,
+    *,
+    strip_non_metrics: bool = True,
+    user_id: str | None = None,
+) -> list[tuple[str, set[str]]]:
     """Parse number mentions from `text` (used identically for `quote` and `claim`).
 
     Each mention yields `(raw_canon, legal_forms)` where `legal_forms` contains ONLY the raw value
@@ -1712,24 +1711,36 @@ def parse_number_mentions(text: str, *, strip_non_metrics: bool = True) -> list[
     return [
         (raw_canon, forms)
         for raw_canon, forms, _has_unit in _parse_number_mentions_detailed(
-            text, strip_non_metrics=strip_non_metrics
+            text, strip_non_metrics=strip_non_metrics, user_id=user_id
         )
     ]
 
 
-def extract_quote_supported_numbers(quote: str) -> set[str]:
+def extract_quote_supported_numbers(
+    quote: str,
+    *,
+    user_id: str | None = None,
+) -> set[str]:
     """Extract all legal normalized number forms (raw + unit-expanded) supported by `quote`."""
     supported: set[str] = set()
-    for _raw_canon, forms, _has_unit in _parse_number_mentions_detailed(quote, strip_non_metrics=True):
+    for _raw_canon, forms, _has_unit in _parse_number_mentions_detailed(
+        quote, strip_non_metrics=True, user_id=user_id
+    ):
         supported.update(forms)
     return supported
 
 
-def extract_claim_numbers(claim: str) -> list[str]:
+def extract_claim_numbers(
+    claim: str,
+    *,
+    user_id: str | None = None,
+) -> list[str]:
     """Extract normalized quantitative metric number tokens (attached to units) from `claim`."""
     return [
         raw_canon
-        for raw_canon, _forms, has_unit in _parse_number_mentions_detailed(claim, strip_non_metrics=True)
+        for raw_canon, _forms, has_unit in _parse_number_mentions_detailed(
+            claim, strip_non_metrics=True, user_id=user_id
+        )
         if has_unit
     ]
 
@@ -2033,6 +2044,7 @@ def is_period_supported_by_quote(
     *,
     value: Any = None,
     unit: str = "",
+    user_id: str | None = None,
 ) -> bool:
     """Return True if `period` is supported by `quote` and anchored in the same sentence as `value`."""
     p = str(period or "").strip()
@@ -2052,7 +2064,10 @@ def is_period_supported_by_quote(
             matching_sents = [
                 s
                 for s in sents
-                if all(not forms.isdisjoint(extract_quote_supported_numbers(s)) for _raw, forms in fig_mentions)
+                if all(
+                    not forms.isdisjoint(extract_quote_supported_numbers(s, user_id=user_id))
+                    for _raw, forms in fig_mentions
+                )
             ]
             if not matching_sents:
                 return False
@@ -2091,6 +2106,7 @@ def strip_unsupported_currency_from_unit(
     quote: str,
     *,
     period: str = "",
+    user_id: str | None = None,
 ) -> tuple[str, bool]:
     """If `unit` contains a currency (`美元`, `元`, `港元`, `USD`, `USD_bn`, `CNY_yi`, etc.)
     but the sentence in `quote` containing `value` lacks that currency token, strip the currency from `unit`.
@@ -2109,7 +2125,11 @@ def strip_unsupported_currency_from_unit(
     matching_sents = [
         s
         for s in sents
-        if fig_mentions and all(not forms.isdisjoint(extract_quote_supported_numbers(s)) for _raw, forms in fig_mentions)
+        if fig_mentions
+        and all(
+            not forms.isdisjoint(extract_quote_supported_numbers(s, user_id=user_id))
+            for _raw, forms in fig_mentions
+        )
     ]
     if period:
         period_sents = [s for s in matching_sents if _is_period_supported_in_text(period, s)]
@@ -3021,13 +3041,14 @@ def _is_non_proper_english_token(tok: str) -> bool:
     )
 
 
-@lru_cache(maxsize=1)
-def _build_entity_alias_groups() -> tuple[tuple[str, ...], ...]:
+def _build_entity_alias_groups(
+    user_id: str | None = None,
+) -> tuple[tuple[str, ...], ...]:
     """Group all aliases and ticker codes belonging to the same company/institution so that if any alias
     of the entity appears in `quote` (e.g. `SMIC`, `Sieyuan`, `Hynix`, `Tencent`, `澜起`), another alias
     of the same entity in `claim`/`topic_label` (e.g. `中芯国际`, `思源电气`, `SK海力士`, `腾讯`, `澜起科技`) is supported.
     """
-    alias_map = _load_ticker_company_aliases()
+    alias_map = _call_load_ticker_company_aliases(user_id)
     raw_groups: list[set[str]] = []
 
     for aliases in alias_map.values():
@@ -3086,6 +3107,8 @@ def _validate_proper_nouns_and_clean_topic(
     claim_text: str,
     topic_label: str,
     quote: str,
+    *,
+    user_id: str | None = None,
 ) -> tuple[list[str], str]:
     """Check company/institution names (from known alias tables) and uppercase/capitalized English proper nouns/codes
     in `claim_text` and `topic_label` against `quote`.
@@ -3098,7 +3121,7 @@ def _validate_proper_nouns_and_clean_topic(
     t_text = _normalize_trad_to_simp(str(topic_label or ""))
     raw_t_text = str(topic_label or "")
 
-    groups = _build_entity_alias_groups()
+    groups = _build_entity_alias_groups(user_id=user_id)
     unsupported_in_claim: list[str] = []
     unsupported_in_topic: list[str] = []
 
@@ -3249,7 +3272,7 @@ def validate_candidate_card(
     and keyword-based `type` corrections against `quote`.
     """
     eff_quote = str(quote if quote is not None else (card.get("quote") or ""))
-    q_numbers = extract_quote_supported_numbers(eff_quote)
+    q_numbers = extract_quote_supported_numbers(eff_quote, user_id=user_id)
 
     raw_figures = card.get("figures") if isinstance(card.get("figures"), list) else []
     kept_figures: list[dict[str, Any]] = []
@@ -3269,14 +3292,14 @@ def validate_candidate_card(
             continue
         raw_period = str(fig.get("period") or "").strip()
         if raw_period and not is_period_supported_by_quote(
-            raw_period, eff_quote, value=fig.get("value"), unit=fig_unit
+            raw_period, eff_quote, value=fig.get("value"), unit=fig_unit, user_id=user_id
         ):
             eff_period = ""
             periods_cleared += 1
         else:
             eff_period = raw_period
         eff_unit, was_cur_stripped = strip_unsupported_currency_from_unit(
-            fig_unit, fig.get("value"), eff_quote, period=eff_period
+            fig_unit, fig.get("value"), eff_quote, period=eff_period, user_id=user_id
         )
         if was_cur_stripped:
             currencies_stripped += 1
@@ -3292,7 +3315,7 @@ def validate_candidate_card(
     claim_text = str(card.get("claim") or "")
     raw_topic_label = str(card.get("topic_label") or "")
     unsupported_names, cleaned_topic_label = _validate_proper_nouns_and_clean_topic(
-        claim_text, raw_topic_label, eff_quote
+        claim_text, raw_topic_label, eff_quote, user_id=user_id
     )
     if "topic_label" in card:
         card["topic_label"] = cleaned_topic_label
@@ -3333,7 +3356,9 @@ def validate_candidate_card(
         )
         card["type"] = corrected_type
 
-    claim_mentions = _parse_number_mentions_detailed(claim_text, strip_non_metrics=True)
+    claim_mentions = _parse_number_mentions_detailed(
+        claim_text, strip_non_metrics=True, user_id=user_id
+    )
     unsupported_claim_nums: list[str] = []
     soft_unsupported_claim_nums: list[str] = []
     for raw_canon, forms, has_unit in claim_mentions:

@@ -490,6 +490,39 @@ async def _verify_automation_workspace_ownership(
     return _VerifiedAutomationOwnership(user_id=user_id, workspace_id=workspace_id)
 
 
+async def _sync_home_coverage_for_preflight(
+    *,
+    user_id: str,
+    kind: str,
+    ticker: Optional[str],
+    persist: bool = True,
+) -> Optional[str]:
+    """Render `coverage.yaml` into Home (and refresh due quarterly groups on `calendar`) before any allowed run branch."""
+    is_home_dalton = kind in ("calendar", "director_daily", "director_weekly") or not ticker
+    if not is_home_dalton or not persist:
+        return None
+
+    group_refresh_summary: Optional[str] = None
+    if kind == "calendar":
+        try:
+            refresh_res = await refresh_due_coverage_groups_for_preflight(
+                user_id,
+                sync_home=False,
+            )
+            if isinstance(refresh_res, dict) and refresh_res.get("summary_text"):
+                group_refresh_summary = str(refresh_res["summary_text"])
+        except Exception as e:
+            logger.warning("[DALTON_PREFLIGHT] refresh_due_coverage_groups_for_preflight failed: %s", e)
+
+    try:
+        yaml_text = await render_coverage_yaml(user_id)
+        await sync_user_coverage_to_home(user_id, yaml_text=yaml_text)
+    except Exception as e:
+        logger.warning("[DALTON_PREFLIGHT] sync_user_coverage_to_home failed: %s", e)
+
+    return group_refresh_summary
+
+
 async def _preflight_check_inner(
     automation: dict[str, Any],
     execution_id: str,
@@ -498,6 +531,8 @@ async def _preflight_check_inner(
     watch_state_override: Optional[dict[str, Any]] = None,
     agenda_doc_override: Optional[dict[str, Any]] = None,
     persist: bool = True,
+    home_synced_in_outer: bool = False,
+    precomputed_group_refresh_summary: Optional[str] = None,
 ) -> PreflightResult:
     """Inner implementation of `preflight_check` wrapped by `asyncio.wait_for` (A3)."""
     if not is_dalton_automation(automation):
@@ -564,6 +599,12 @@ async def _preflight_check_inner(
         )
 
     if not settings.autonomy.enabled:
+        await _sync_home_coverage_for_preflight(
+            user_id=user_id,
+            kind=kind,
+            ticker=ticker,
+            persist=persist,
+        )
         return PreflightResult(should_wake=True, decision="passthrough", reason="autonomy_disabled")
 
     try:
@@ -573,6 +614,12 @@ async def _preflight_check_inner(
 
     # Price triggers are already event-driven by upstream price monitor
     if automation.get("trigger_type") == "price" or kind == "price_move":
+        await _sync_home_coverage_for_preflight(
+            user_id=user_id,
+            kind=kind,
+            ticker=ticker,
+            persist=persist,
+        )
         sig = {
             "probe": "price",
             "signal_key": f"trigger:{execution_id[:8]}",
@@ -634,25 +681,14 @@ async def _preflight_check_inner(
             logger.warning("[DALTON_PREFLIGHT] get_watch_state failed: %s", e)
 
     emitted: list[ProbeSignal] = []
-    group_refresh_summary: Optional[str] = None
-    is_home_dalton = kind in ("calendar", "director_daily", "director_weekly") or not ticker
-
-    if is_home_dalton and persist:
-        if kind == "calendar":
-            try:
-                refresh_res = await refresh_due_coverage_groups_for_preflight(
-                    user_id,
-                    sync_home=False,
-                )
-                if isinstance(refresh_res, dict) and refresh_res.get("summary_text"):
-                    group_refresh_summary = str(refresh_res["summary_text"])
-            except Exception as e:
-                logger.warning("[DALTON_PREFLIGHT] refresh_due_coverage_groups_for_preflight failed: %s", e)
-        try:
-            yaml_text = await render_coverage_yaml(user_id)
-            await sync_user_coverage_to_home(user_id, yaml_text=yaml_text)
-        except Exception as e:
-            logger.warning("[DALTON_PREFLIGHT] sync_user_coverage_to_home failed: %s", e)
+    group_refresh_summary = precomputed_group_refresh_summary
+    if not home_synced_in_outer:
+        group_refresh_summary = await _sync_home_coverage_for_preflight(
+            user_id=user_id,
+            kind=kind,
+            ticker=ticker,
+            persist=persist,
+        )
 
     if kind == "calendar":
         sigs, state = await probe_calendar(watch_state=state)
@@ -1046,6 +1082,12 @@ async def preflight_check(
         )
 
     if kind != "data_health" and not settings.autonomy.enabled:
+        await _sync_home_coverage_for_preflight(
+            user_id=verified_ownership.user_id,
+            kind=kind,
+            ticker=_extract_ticker(automation),
+            persist=persist,
+        )
         return PreflightResult(should_wake=True, decision="passthrough", reason="autonomy_disabled")
 
     try:

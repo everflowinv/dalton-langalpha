@@ -1,49 +1,46 @@
 import React from 'react';
+import { useQuery } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
-import { api } from '@/api/client';
+import { useUser } from '@/hooks/useUser';
+import { queryKeys } from '@/lib/queryKeys';
+import { localDateStr } from '@/lib/utils';
+import {
+  type DaltonEarningsEntry,
+  type EarningsScope,
+  type UserEarningsCalendarResponse,
+  getEarningsCalendar,
+  getUserEarningsCalendar,
+} from '../../utils/api';
 
-export type EarningsScope = 'mine' | 'market';
+export type {
+  DaltonEarningsEntry,
+  EarningsScope,
+  UserEarningsCalendarResponse,
+};
 
-export interface DaltonEarningsEntry {
-  symbol: string;
-  ticker?: string;
-  companyName?: string;
-  date: string;
-  quarter?: string | null;
-  status?: 'confirmed' | 'pending' | 'reported' | string;
-  date_status?: 'confirmed' | 'estimated' | 'reported' | 'unannounced' | string;
-  tier?: 'Core' | 'Watch' | 'core' | 'watch' | string;
-  timing?: 'BMO' | 'AMC' | 'unknown' | string | null;
-  [key: string]: unknown;
-}
+export function useEarningsCalendarQuery(scope: EarningsScope, nowMs: number) {
+  const { user } = useUser();
+  const userId = user?.user_id ?? null;
+  const from = localDateStr(nowMs - 5 * 86400000);
+  const to =
+    scope === 'mine'
+      ? localDateStr(nowMs + 90 * 86400000)
+      : localDateStr(nowMs + 5 * 86400000);
 
-export interface UserEarningsCalendarResponse {
-  ok: boolean;
-  user_id?: string;
-  from?: string | null;
-  to?: string | null;
-  mirror_empty?: boolean;
-  published_at?: string | null;
-  count: number;
-  data: DaltonEarningsEntry[];
-}
-
-export async function getUserEarningsCalendar(params: {
-  from?: string;
-  to?: string;
-}): Promise<UserEarningsCalendarResponse> {
-  const { data } = await api.get<UserEarningsCalendarResponse>(
-    '/api/v1/dalton/earnings/calendar',
-    { params },
-  );
-  return (
-    data ?? {
-      ok: true,
-      count: 0,
-      data: [],
-      mirror_empty: true,
-    }
-  );
+  return useQuery({
+    queryKey: queryKeys.dalton.earningsCalendar(scope, userId, from, to),
+    queryFn: async (): Promise<DaltonEarningsEntry[]> => {
+      if (scope === 'mine') {
+        const result = await getUserEarningsCalendar({ from, to });
+        return (result?.data || []) as DaltonEarningsEntry[];
+      }
+      const result = await getEarningsCalendar({ from, to });
+      return ((result?.data || []) as DaltonEarningsEntry[]).filter(
+        (e) => e.symbol && !e.symbol.includes('.'),
+      );
+    },
+    staleTime: 60_000,
+  });
 }
 
 interface EarningsScopeTabsProps {
