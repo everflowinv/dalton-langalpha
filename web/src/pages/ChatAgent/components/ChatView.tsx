@@ -109,6 +109,8 @@ import {
   TeamReadOnlyComposer,
   useTeamReadOnly,
 } from './dalton/TeamSharing';
+// DALTON-HOOK(coverage-tracking): company workspace auto-tracking toggle in thread top bar
+import { WorkspaceTrackingToggle } from './dalton/WorkspaceTrackingToggle';
 
 
 // Clears the composer floating over the transcript's bottom edge (its height
@@ -1449,6 +1451,14 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
           </div>
 
           <div className="flex items-center gap-2">
+            {/* DALTON-HOOK(coverage-tracking): company workspace auto-tracking toggle in thread top bar */}
+            {!isHome && workspaceId && (
+              <WorkspaceTrackingToggle
+                workspaceId={workspaceId}
+                readOnly={teamReadOnly.isReadOnly}
+                compact
+              />
+            )}
             {/* DALTON-HOOK(team-sharing): hide ShareButton in read-only mode */}
             {currentThreadId && currentThreadId !== '__default__' && !teamReadOnly.isReadOnly && (
               <ShareButton threadId={currentThreadId} initialIsShared={threadIsShared} workspaceId={workspaceId} />

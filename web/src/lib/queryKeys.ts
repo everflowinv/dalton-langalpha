@@ -275,6 +275,9 @@ export const queryKeys = {
     autonomyReport:  (week?: string) => [...queryKeys.dalton.all, 'autonomy', 'report', week ?? 'current'],
     // DALTON-HOOK(team-credentials): team-shared credentials status query key scoped by user
     credentialsStatus: (userId?: string | null) => [...queryKeys.dalton.all, 'credentials', 'status', userId ?? 'current'],
+    // DALTON-HOOK(coverage-tracking): workspace auto-tracking and unified system jobs query keys
+    tracking:        (workspaceId: string) => [...queryKeys.dalton.all, 'tracking', workspaceId],
+    systemJobs:      () => [...queryKeys.dalton.all, 'system-jobs'],
   },
 };
 

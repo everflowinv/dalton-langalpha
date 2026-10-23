@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Mapping, Sequence
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from zoneinfo import ZoneInfo
 import json
 import logging
@@ -1039,17 +1039,132 @@ async def run_all_health_checks(
                 pass
 
 
+def _parse_iso_utc(raw: Any) -> datetime | None:
+    if isinstance(raw, datetime):
+        return raw.astimezone(UTC) if raw.tzinfo is not None else raw.replace(tzinfo=UTC)
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        dt = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+        return dt.astimezone(UTC) if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
+    except Exception:
+        return None
+
+
+async def _has_recent_health_check_within_24h(*, conn: Any = None) -> bool:
+    """Return True if a data-source health check or daily data map cache was recorded within the last 24 hours."""
+    now_utc = datetime.now(UTC)
+    cutoff = now_utc - timedelta(hours=24)
+    target_date = today_cache_date()
+
+    existing = await db_data_map.get_cached_data_map(target_date, conn=conn)
+    if existing and existing.get("rendered_markdown"):
+        updated_dt = _parse_iso_utc(existing.get("updated_at"))
+        if updated_dt is None or updated_dt >= cutoff:
+            return True
+
+    health_rows = await db_data_map.fetch_all_source_health(conn=conn)
+    for row in (health_rows or {}).values():
+        if not isinstance(row, Mapping):
+            continue
+        checked_dt = _parse_iso_utc(row.get("checked_at"))
+        if checked_dt is not None and checked_dt >= cutoff:
+            return True
+    return False
+
+
+async def _is_data_health_paused_by_user(*, conn: Any = None) -> bool:
+    """Return True if the Home ``dalton-data-health`` automation is paused or marked ``paused_by_user``."""
+    from src.dalton.autonomy.schedule import list_all_user_automations
+    from src.dalton.credentials import get_configured_pm_user_ids
+
+    pm_ids = list(get_configured_pm_user_ids() or ["local-dev-user"])
+    for uid in pm_ids:
+        rows = await list_all_user_automations(uid, name_prefix="dalton-data-health", conn=conn)
+        for r in rows:
+            if not isinstance(r, Mapping) or str(r.get("name") or "").strip() != "dalton-data-health":
+                continue
+            st = str(r.get("status") or "").strip().lower()
+            meta = r.get("metadata") if isinstance(r.get("metadata"), Mapping) else {}
+            if st == "paused" or bool(meta.get("paused_by_user")):
+                return True
+    return False
+
+
 async def run_startup_health_check_once(
     *,
     open_lock_connection: Callable[[], Any] | None = None,
 ) -> dict[str, Any] | None:
     """Run one background health check after backend startup.
 
-    First checks if today's (`Asia/Shanghai`) snapshot already exists in `dalton_data_map_cache`;
-    if not, acquires the advisory lock on a dedicated `open_session_connection()` (never holding a
-    pool connection during probes) and writes the health rows + daily data map snapshot.
+    Runs only when:
+    1) ``dalton-data-health`` has not been paused by the user; and
+    2) no health check record exists within the last 24 hours.
+    Subsequent daily runs are handled by the ``dalton-data-health`` automation.
     """
     try:
+        try:
+            is_paused = await _is_data_health_paused_by_user()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "[DaltonDataMap] Startup data source health check skipped (pause query failed: %s)",
+                type(exc).__name__,
+            )
+            return {
+                "ok": False,
+                "skipped": "pause_query_failed",
+                "checked_count": 0,
+                "available_count": 0,
+                "unavailable_count": 0,
+                "results": [],
+                "data_map": None,
+            }
+        if is_paused:
+            logger.info(
+                "[DaltonDataMap] Startup data source health check skipped (paused_by_user)"
+            )
+            return {
+                "ok": True,
+                "skipped": "paused_by_user",
+                "checked_count": 0,
+                "available_count": 0,
+                "unavailable_count": 0,
+                "results": [],
+                "data_map": None,
+            }
+        try:
+            has_recent = await _has_recent_health_check_within_24h()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "[DaltonDataMap] Startup data source health check skipped (cache query failed: %s)",
+                type(exc).__name__,
+            )
+            return {
+                "ok": False,
+                "skipped": "cache_query_failed",
+                "checked_count": 0,
+                "available_count": 0,
+                "unavailable_count": 0,
+                "results": [],
+                "data_map": None,
+            }
+        if has_recent:
+            logger.info(
+                "[DaltonDataMap] Startup data source health check skipped (already_cached)"
+            )
+            return {
+                "ok": True,
+                "skipped": "already_cached",
+                "checked_count": 0,
+                "available_count": 0,
+                "unavailable_count": 0,
+                "results": [],
+                "data_map": None,
+            }
         summary = await run_all_health_checks(
             persist=True,
             skip_if_cached=True,
@@ -1083,24 +1198,9 @@ async def run_startup_health_check_loop(
     interval_s: float = HEALTH_CHECK_LOOP_INTERVAL_S,
     open_lock_connection: Callable[[], Any] | None = None,
     sleep_fn: Callable[[float], Any] = asyncio.sleep,
-) -> None:
-    """Run the health check on startup and re-check every `interval_s` (60 min) across day rollovers.
-
-    Skips whenever today's (`Asia/Shanghai`) snapshot already exists in `dalton_data_map_cache`.
-    When `Asia/Shanghai` crosses midnight, the new day has no snapshot and a fresh health check
-    runs under the dedicated advisory lock. Any non-cancellation exception is logged as a warning
-    so the loop never exits prematurely; `asyncio.CancelledError` propagates immediately.
-    """
-    while True:
-        try:
-            await run_startup_health_check_once(
-                open_lock_connection=open_lock_connection,
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            logger.warning(
-                "[DaltonDataMap] Periodic data source health check loop error: %s",
-                type(exc).__name__,
-            )
-        await sleep_fn(interval_s)
+) -> dict[str, Any] | None:
+    """Run the one-shot startup health check (no periodic loop; daily checks run via ``dalton-data-health``)."""
+    _ = (interval_s, sleep_fn)
+    return await run_startup_health_check_once(
+        open_lock_connection=open_lock_connection,
+    )

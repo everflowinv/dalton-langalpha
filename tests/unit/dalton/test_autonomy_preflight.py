@@ -133,8 +133,34 @@ async def test_automation_naming_templates_and_schedule_helper(monkeypatch):
     assert earn_specs[0]["next_run_at"].tzinfo == ZoneInfo("Asia/Shanghai")
 
     # Test idempotent schedule_dalton_automation_helper (G4.5, A8) with create_autospec (L33)
+    from contextlib import asynccontextmanager
+    from psycopg import AsyncConnection
+    import src.dalton.autonomy.schedule as schedule_mod
     from src.server.database import automation as auto_db
     from src.server.database import workspace as ws_db
+
+    lock_conn = create_autospec(AsyncConnection, instance=True)
+
+    @asynccontextmanager
+    async def _fake_tx(*args: Any, **kwargs: Any):
+        yield lock_conn
+
+    lock_conn.transaction.side_effect = _fake_tx
+
+    @asynccontextmanager
+    async def _fake_get_db_conn():
+        yield lock_conn
+
+    monkeypatch.setattr(
+        schedule_mod,
+        "get_db_connection",
+        create_autospec(schedule_mod.get_db_connection, side_effect=_fake_get_db_conn),
+    )
+    monkeypatch.setattr(
+        auto_db,
+        "lock_user_automations",
+        create_autospec(auto_db.lock_user_automations, return_value=None),
+    )
 
     mock_get_workspace = create_autospec(
         ws_db.get_workspace,
@@ -145,6 +171,7 @@ async def test_automation_naming_templates_and_schedule_helper(monkeypatch):
     store: list[dict[str, Any]] = []
 
     mock_list = create_autospec(auto_db.list_automations)
+    mock_list_all = create_autospec(auto_db.list_all_automations)
     mock_create = create_autospec(auto_db.create_automation)
     mock_update = create_autospec(auto_db.update_automation)
 
@@ -157,6 +184,13 @@ async def test_automation_naming_templates_and_schedule_helper(monkeypatch):
         offset: int = 0,
     ):
         return [r for r in store if not workspace_id or r.get("workspace_id") == workspace_id], len(store)
+
+    async def _list_all_impl(
+        user_id: str,
+        *,
+        conn=None,
+    ):
+        return [r for r in store if r.get("user_id", user_id) == user_id]
 
     async def _create_impl(
         user_id: str,
@@ -233,10 +267,12 @@ async def test_automation_naming_templates_and_schedule_helper(monkeypatch):
         return None
 
     mock_list.side_effect = _list_impl
+    mock_list_all.side_effect = _list_all_impl
     mock_create.side_effect = _create_impl
     mock_update.side_effect = _update_impl
 
     monkeypatch.setattr(auto_db, "list_automations", mock_list)
+    monkeypatch.setattr(auto_db, "list_all_automations", mock_list_all)
     monkeypatch.setattr(auto_db, "create_automation", mock_create)
     monkeypatch.setattr(auto_db, "update_automation", mock_update)
 

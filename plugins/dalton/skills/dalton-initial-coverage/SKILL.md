@@ -84,10 +84,19 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
      - `trigger.kind`：PM 指派填 `"manual"`，研究总监排程填 `"director"`；
      - 附上 `next_validation`（what + due）与 `progress`。
 
-3. **汇报与可选发布**
+3. **开启公司自动跟踪 `dalton_coverage_tracking`**
+   - 知识层与首条结论落库后，必须调用 `dalton_coverage_tracking(action="enable", source="coverage_finish")` 开启该公司的四项标准自动跟踪任务（`watch`、`delta`、`move-up`、`move-down`）。
+   - 若用户之前曾手动关闭过跟踪（任务元数据含 `paused_by_user`），`source="coverage_finish"` 会自动跳过重新开启并保持关闭状态，不要强制覆盖用户选择。
+
+4. **汇报与可选发布**
    - 可调用 `check_draft(draft_path="drafts/<D>-initial-coverage.md")` 检查数字核验反馈。
-   - 向 PM 汇报核心判断（≤3 句）、12 问重点题结论、估值分解结果、初始倾向（关注 / 观察 / 暂不覆盖 / 建议推进完整覆盖）及研究议程。
+   - 向 PM 汇报核心判断（≤3 句）、12 问重点题结论、估值分解结果、初始倾向（关注 / 观察 / 暂不覆盖 / 建议推进完整覆盖）、研究议程及自动跟踪状态。
    - 初次覆盖默认保留为草稿；若 PM 明确要求正式发布，调用 `publish_report(draft_path="drafts/<D>-initial-coverage.md", title="...", kind="initial_coverage", slug="...")`。
+
+5. **完成判定（必查清单）**
+   - `drafts/<D>-initial-coverage.md` 已完成独立审稿与 P0 修订；
+   - `company`、`thesis`、`debate`、`drivers`、`management`、`agenda` 均已通过 `knowledge_update` 写入，且已记录首条 `NEW_THESIS` `knowledge_append_verdict`；
+   - 已调用 `dalton_coverage_tracking(action="enable", source="coverage_finish")` 并检查确认自动跟踪已开启（`status="enabled"`，或因 `paused_by_user=true` 保持用户手动关闭状态）。
 
 ---
 

@@ -79,6 +79,15 @@ class DaltonAutomationWriteRequest(BaseModel):
     spec: dict[str, Any] | None = None
 
 
+class WorkspaceTrackingUpdateRequest(BaseModel):
+    enabled: bool
+    tier: str | None = None
+
+
+class SystemJobToggleRequest(BaseModel):
+    enabled: bool
+
+
 def _require_dalton_enabled() -> None:
     if not get_dalton_settings().enabled:
         raise HTTPException(status_code=404, detail="Dalton mode disabled")
@@ -86,11 +95,12 @@ def _require_dalton_enabled() -> None:
 
 def _require_pm_user(user_id: str) -> None:
     _require_dalton_enabled()
-    settings = get_dalton_settings()
-    if user_id not in settings.pm_user_ids:
-        raise HTTPException(
-            status_code=403, detail="Only PM users may perform this action"
-        )
+    from src.dalton.autonomy.system_jobs import require_pm_user
+
+    try:
+        require_pm_user(user_id)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
 
 
 async def _verify_workspace_access(workspace_id: str, user_id: str) -> dict[str, Any]:
@@ -540,6 +550,7 @@ async def put_dalton_automation_endpoint(
 ) -> dict[str, Any]:
     _require_dalton_enabled()
     from src.dalton.auth import resolve_caller_home_workspace_id
+    from src.dalton.autonomy.schedule import AutomationLockError
     from src.dalton.tools.director_tools import schedule_dalton_automation_helper
 
     spec = body.entry or body.spec or body.model_dump(exclude={"workspace_id", "entry", "spec"}, exclude_none=True)
@@ -550,12 +561,15 @@ async def put_dalton_automation_endpoint(
     else:
         await _verify_workspace_access(ws_str, user_id)
         resolved_ws_id = ws_str
-    return await schedule_dalton_automation_helper(
-        user_id=user_id,
-        name=name,
-        spec=spec,
-        workspace_id=resolved_ws_id,
-    )
+    try:
+        return await schedule_dalton_automation_helper(
+            user_id=user_id,
+            name=name,
+            spec=spec,
+            workspace_id=resolved_ws_id,
+        )
+    except AutomationLockError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 @router.get("/coverage/board")
@@ -585,3 +599,199 @@ async def get_autonomy_report_endpoint(
     from src.dalton.autonomy.report import generate_weekly_autonomy_report
 
     return await generate_weekly_autonomy_report(user_id=user_id, week=week)
+
+
+async def _resolve_tracking_workspace_owner(
+    workspace_id: str,
+    user_id: str,
+    *,
+    require_write: bool,
+) -> tuple[str, bool]:
+    """Verify workspace access for tracking and return ``(owner_user_id, can_edit)``."""
+    _require_dalton_enabled()
+    from src.dalton.settings import is_dalton_supabase_auth_enabled
+    from src.dalton.sharing import require_workspace_reader
+    from src.server.database import workspace as ws_db
+
+    uid = str(user_id or "").strip()
+    is_pm = bool(uid and uid in get_dalton_settings().pm_user_ids)
+
+    if is_dalton_supabase_auth_enabled():
+        workspace = await require_workspace_reader(workspace_id, uid)
+        owner_id = str((workspace or {}).get("user_id") or uid).strip()
+        can_edit = (owner_id == uid) or is_pm
+        if require_write and not can_edit:
+            raise HTTPException(
+                status_code=403,
+                detail="Only workspace owner or PM may modify tracking",
+            )
+        return owner_id, can_edit
+
+    try:
+        workspace = await _verify_workspace_access(workspace_id, uid)
+        owner_id = str((workspace or {}).get("user_id") or uid).strip()
+        return owner_id, True
+    except HTTPException as exc:
+        if exc.status_code == 403 and is_pm:
+            ws = await ws_db.get_workspace(workspace_id)
+            if ws is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Workspace '{workspace_id}' not found",
+                ) from exc
+            owner_id = str(ws.get("user_id") or uid).strip()
+            return owner_id, True
+        raise
+
+
+@router.get("/tracking/{workspace_id}")
+@handle_api_exceptions("get workspace tracking status", logger)
+async def get_workspace_tracking_endpoint(
+    workspace_id: str,
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    from src.dalton.autonomy.schedule import AutomationLockError
+    from src.dalton.autonomy.tracking import get_tracking_status
+
+    owner_id, can_edit = await _resolve_tracking_workspace_owner(
+        workspace_id,
+        user_id,
+        require_write=False,
+    )
+    try:
+        res = await get_tracking_status(owner_id, workspace_id)
+    except AutomationLockError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {**res, "can_edit": can_edit}
+
+
+@router.post("/tracking/{workspace_id}")
+@handle_api_exceptions("update workspace tracking status", logger)
+async def update_workspace_tracking_endpoint(
+    workspace_id: str,
+    body: WorkspaceTrackingUpdateRequest,
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    from src.dalton.autonomy.schedule import AutomationLockError
+    from src.dalton.autonomy.tracking import disable_tracking, enable_tracking
+
+    owner_id, _ = await _resolve_tracking_workspace_owner(
+        workspace_id,
+        user_id,
+        require_write=True,
+    )
+    try:
+        if body.enabled:
+            res = await enable_tracking(
+                owner_id,
+                workspace_id,
+                tier=body.tier,
+                force=True,
+            )
+        else:
+            res = await disable_tracking(owner_id, workspace_id)
+    except AutomationLockError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {**res, "can_edit": True}
+
+
+# ---------------------------------------------------------------------------
+# Unified System Jobs (`/api/v1/dalton/system-jobs`)
+# ---------------------------------------------------------------------------
+
+
+async def _authorize_system_job_mutation(key: str, user_id: str) -> str:
+    """Resolve effective owner ``user_id`` for company jobs; Home/host/ops permissions are enforced in ``system_jobs``."""
+    _require_dalton_enabled()
+    from src.dalton.autonomy.system_jobs import (
+        _resolve_company_workspace_id,
+        classify_system_job_key,
+    )
+
+    try:
+        scope, target = classify_system_job_key(key)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if scope in ("ops", "home", "host"):
+        return str(user_id).strip()
+
+    ws_id = await _resolve_company_workspace_id(user_id, target)
+    owner_id, _ = await _resolve_tracking_workspace_owner(
+        ws_id,
+        user_id,
+        require_write=True,
+    )
+    return owner_id
+
+
+@router.get("/system-jobs")
+@handle_api_exceptions("list dalton system jobs", logger)
+async def list_system_jobs_endpoint(
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    _require_dalton_enabled()
+    from src.dalton.autonomy.schedule import AutomationLockError
+    from src.dalton.autonomy.system_jobs import list_system_jobs
+
+    try:
+        return await list_system_jobs(str(user_id).strip())
+    except AutomationLockError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@router.post("/system-jobs/{key}")
+@handle_api_exceptions("toggle dalton system job", logger)
+async def toggle_system_job_endpoint(
+    key: str,
+    body: SystemJobToggleRequest,
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    from src.dalton.autonomy.schedule import AutomationLockError
+    from src.dalton.autonomy.system_jobs import toggle_system_job
+
+    owner_id = await _authorize_system_job_mutation(key, user_id)
+    try:
+        return await toggle_system_job(
+            owner_id,
+            key,
+            enabled=body.enabled,
+            force=True,
+            respect_user_pause=False,
+        )
+    except AutomationLockError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.post("/system-jobs/{key}/run")
+@handle_api_exceptions("run dalton system job now", logger)
+async def run_system_job_now_endpoint(
+    key: str,
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    from src.dalton.autonomy.schedule import AutomationLockError
+    from src.dalton.autonomy.system_jobs import run_system_job_now
+
+    owner_id = await _authorize_system_job_mutation(key, user_id)
+    try:
+        return await run_system_job_now(owner_id, key)
+    except AutomationLockError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+

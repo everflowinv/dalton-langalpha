@@ -95,6 +95,7 @@ class DaltonAutonomyConfig(BaseModel):
     reserve_for_events_usd: float = Field(default=5.00, ge=0)
     event_reserve_ratio: float = Field(default=0.2, ge=0, le=1.0)
     preflight_timeout_s: float = Field(default=45.0, gt=0)
+    data_health_timeout_s: float = Field(default=600.0, gt=0)
     backoff: DaltonBackoffConfig = Field(default_factory=DaltonBackoffConfig)
     vendor_quota_alert_ratio: float = Field(default=0.8, gt=0, le=1.0)
     est_cost_by_kind: dict[str, float] = Field(
@@ -531,15 +532,66 @@ def get_dalton_web_search_bridge_queue_timeout_seconds(default: float = 30.0) ->
         return float(default)
 
 
+def _extract_bridge_origin_from_url(
+    raw_url: str,
+    *,
+    host_override: str | None = None,
+) -> str | None:
+    """Parse ``scheme://host[:port]`` origin from a researchdata URL supporting ``.../mcp`` and ``/mcp/...``."""
+    from urllib.parse import urlparse, urlunparse
+
+    cleaned = str(raw_url or "").strip()
+    if not cleaned:
+        return None
+    parsed = urlparse(cleaned)
+    if not parsed.scheme or not parsed.hostname:
+        return None
+    path = parsed.path or ""
+    if not (
+        path == "/mcp"
+        or path.startswith("/mcp/")
+        or path.endswith("/mcp")
+        or "/mcp/" in path
+    ):
+        return None
+    target_host = host_override or parsed.hostname
+    if parsed.port:
+        netloc = f"{target_host}:{parsed.port}"
+    elif host_override:
+        netloc = f"{target_host}:8960"
+    else:
+        netloc = target_host
+    return urlunparse((parsed.scheme, netloc, "", "", "", "")).rstrip("/")
+
+
 def get_dalton_bridge_token() -> str:
     """Return ``DALTON_BRIDGE_TOKEN`` from environment or parsed from ``DALTON_RESEARCHDATA_URL``."""
+    from urllib.parse import urlparse
+
     tok = os.getenv("DALTON_BRIDGE_TOKEN", "").strip()
     if tok:
         return tok
     rd_url = get_dalton_researchdata_url()
-    if "/mcp/" in rd_url:
-        return rd_url.split("/mcp/", 1)[1].strip("/")
+    if not rd_url:
+        return ""
+    parsed_path = urlparse(rd_url).path or ""
+    if "/mcp/" in parsed_path:
+        return parsed_path.split("/mcp/", 1)[1].strip("/")
     return ""
+
+
+def get_dalton_bridge_base_url(host: str | None = None) -> str:
+    """Return the host bridge base URL (e.g. ``http://127.0.0.1:8960``) for host job management."""
+    resolved_host = host or HOST_IP or "127.0.0.1"
+    explicit = os.getenv("DALTON_BRIDGE_URL", "").strip()
+    if explicit:
+        return explicit.replace("{HOST_IP}", resolved_host).rstrip("/")
+    rd_url = get_dalton_researchdata_url()
+    origin = _extract_bridge_origin_from_url(rd_url, host_override=host)
+    if origin:
+        return origin
+    port = os.getenv("DALTON_BRIDGE_PORT", "8960").strip() or "8960"
+    return f"http://{resolved_host}:{port}"
 
 
 def get_dalton_bridge_embed_url(host: str | None = None) -> str:
@@ -552,15 +604,9 @@ def get_dalton_bridge_embed_url(host: str | None = None) -> str:
             url = url.split("/embed/", 1)[0] + "/embed"
         return url
     rd_url = get_dalton_researchdata_url()
-    if rd_url and "/mcp/" in rd_url:
-        base, _ = rd_url.split("/mcp/", 1)
-        if host:
-            from urllib.parse import urlparse, urlunparse
-
-            parsed = urlparse(base)
-            port_suffix = f":{parsed.port}" if parsed.port else ":8960"
-            base = urlunparse((parsed.scheme or "http", f"{resolved_host}{port_suffix}", "", "", "", ""))
-        return f"{base.rstrip('/')}/embed"
+    origin = _extract_bridge_origin_from_url(rd_url, host_override=host)
+    if origin:
+        return f"{origin}/embed"
     port = os.getenv("DALTON_BRIDGE_PORT", "8960").strip() or "8960"
     return f"http://{resolved_host}:{port}/embed"
 

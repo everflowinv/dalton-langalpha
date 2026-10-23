@@ -22,9 +22,9 @@ def build_dalton_tools(
     """Return role-appropriate Dalton tools to bind onto the main agent (`DALTON-HOOK(dalton-tools)`).
 
     - `chief_of_staff` (Home / Research Director):
-      `dalton_coverage_board`, `dalton_record_plan`, `dalton_agenda_note`, `dalton_schedule_automation`, `conversation_search`
+      `dalton_coverage_board`, `dalton_record_plan`, `dalton_agenda_note`, `dalton_schedule_automation`, `dalton_coverage_tracking`, `dalton_system_jobs`, `conversation_search`
     - `analyst` (Company workspace):
-      `knowledge_update`, `knowledge_append_verdict`, `check_draft`, `publish_report`, `dalton_schedule_automation`, `conversation_search`
+      `knowledge_update`, `knowledge_append_verdict`, `check_draft`, `publish_report`, `dalton_schedule_automation`, `dalton_coverage_tracking`, `dalton_system_jobs`, `conversation_search`
     """
     settings = get_dalton_settings()
     is_enabled = enabled if enabled is not None else (

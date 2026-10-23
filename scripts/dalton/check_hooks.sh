@@ -79,6 +79,7 @@ ALLOWED_HOOKS=(
   "xai-oauth"
   "dalton-patch-tool-calls"
   "fake-ip-allow"
+  "coverage-tracking"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)
