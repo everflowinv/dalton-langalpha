@@ -5588,7 +5588,7 @@ async def test_card_fidelity_programmatic_validation_and_sample_regressions(
     from copy import deepcopy
     from src.dalton.settings import get_dalton_settings
 
-    assert get_dalton_settings().conversations.prompt_version == "conv_card_v2"
+    assert get_dalton_settings().conversations.prompt_version == "conv_card_v2_1"
     assert "证据覆盖" in extractor_mod.EXTRACTION_SYSTEM_INSTRUCTIONS
     assert "保留限定与归属" in extractor_mod.EXTRACTION_SYSTEM_INSTRUCTIONS
 
@@ -5780,7 +5780,7 @@ async def test_card_fidelity_programmatic_validation_and_sample_regressions(
     lanqi_out = by_quote[sample_by_id["cc_af0f4051d0d2a2ab831b3fa5"]["quote"]]
     assert lanqi_out["tickers"] == ["688008.SS"]
     assert lanqi_out["figures"] == sample_by_id["cc_af0f4051d0d2a2ab831b3fa5"]["figures"]
-    assert lanqi_out["prompt_version"] == "conv_card_v2"
+    assert lanqi_out["prompt_version"] == "conv_card_v2_1"
 
     atour_out = by_quote[sample_by_id["cc_22905e2fd37cc08e068703b4"]["quote"]]
     assert atour_out["tickers"] == []
@@ -6131,14 +6131,18 @@ async def test_card_fidelity_programmatic_validation_and_sample_regressions(
 def test_unmapped_ticker_is_kept_but_mapped_absent_one_is_dropped(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A ticker with no name mapping cannot be proven absent (海光 → 688041.SS), so it stays;
-    a ticker that has a name mapping but is absent from quote is dropped.
+    """An unmapped ticker is kept ONLY when the ticker code itself appears in `quote`;
+    both mapped and unmapped tickers absent from `quote` are dropped.
     """
     from src.dalton.conversations import extractor as ex
 
     quote = "海光自己二季度营收增长 65%，按招商的盈利预测，市盈率约 109 倍。"
-    kept, dropped = ex.validate_tickers_against_quote(["688999.SS", "NVDA"], quote)
-    assert kept == ["688999.SS"] and dropped == 1
+    kept, dropped = ex.validate_tickers_against_quote(["688041.SS", "688999.SS", "NVDA"], quote)
+    assert kept == ["688041.SS"] and dropped == 2
+
+    quote_with_code = "康師傅控股有限公司(0322.HK) 价格=12.86 RSI=69.7"
+    kept_code, dropped_absent = ex.validate_tickers_against_quote(["0322.HK", "0325.HK"], quote_with_code)
+    assert kept_code == ["0322.HK"] and dropped_absent == 1
 
     monkeypatch.setattr(
         ex,
@@ -6148,8 +6152,12 @@ def test_unmapped_ticker_is_kept_but_mapped_absent_one_is_dropped(
             return_value={"NVDA": ("NVDA", "Nvidia", "英伟达")},
         ),
     )
-    kept_unmapped, dropped_mapped = ex.validate_tickers_against_quote(["688041.SS", "NVDA"], quote)
-    assert kept_unmapped == ["688041.SS"] and dropped_mapped == 1
+    kept_unmapped_absent, dropped_both = ex.validate_tickers_against_quote(["688041.SS", "NVDA"], quote)
+    assert kept_unmapped_absent == [] and dropped_both == 2
+    kept_unmapped_present, dropped_one = ex.validate_tickers_against_quote(
+        ["688041.SS", "NVDA"], "688041.SS 二季度营收增长 65%"
+    )
+    assert kept_unmapped_present == ["688041.SS"] and dropped_one == 1
 
 
 def test_short_chinese_alias_matches_in_running_text_but_not_inside_common_words() -> None:
@@ -6593,3 +6601,117 @@ def test_yi_fen_masking_respects_multi_digit_numerals_only() -> None:
     assert flagged("周一一个月内完成交付") == []
     assert flagged("已签署十一份订单") == ["11"]
     assert flagged("已签署一百零一份订单") == ["101"]
+
+
+def test_conv_card_v2_1_audit_regressions_prompt_tickers_and_indicator_numbers() -> None:
+    """v2.1 regression suite driven by `fixtures/conv_cards_v2_audit_regressions.json`:
+    1. Prompt rules for evidence coverage, subject completion ban, interview speaker boundaries,
+       qualifying phrases (`尚无公开成果`), `fact` per-clause coverage, `estimate` for third-party
+       models & company guidance, `model_assumption` for original speaker's calculations (`原说话人的测算`),
+       `cited_sources` verbatim in `quote`, `tickers` subject-only & unmapped code rule, and `figures`
+       preserving `约/大约/左右/以上` and quote-scoped `同期/上期`.
+    2. `validate_tickers_against_quote`: unmapped tickers dropped unless the code itself appears in `quote`;
+       A+H dual-listing aliases (`300750.SZ`/`3750.HK`, `688008.SS`/`6809.HK`, `000333.SZ`/`0300.HK`,
+       `002050.SZ`/`2050.HK`, `600660.SS`/`3606.HK`) loaded and matched.
+    3. `validate_candidate_card`: indicator-prefixed numbers (`价格=`, `RSI=`, `收盘价`, `市盈率`, `PE`,
+       `EV/EBIT` in `METRIC_PREFIX_INDICATORS_TABLE`) treated as metric numbers and counted in
+       `unsupported_claim_numbers` (catching `66.3` and `85.6` on `v2_18e39ac4ab23`).
+    4. `prompt_version` updated to `conv_card_v2_1`.
+    """
+    from copy import deepcopy
+    from src.dalton.conversations import extractor as ex
+    from src.dalton.settings import DaltonConversationsConfig, get_dalton_settings
+
+    # --- Item 6: prompt_version == conv_card_v2_1 ---
+    get_dalton_settings.cache_clear()
+    assert DaltonConversationsConfig().prompt_version == "conv_card_v2_1"
+    assert get_dalton_settings().conversations.prompt_version == "conv_card_v2_1"
+
+    # --- Items 1-4: Prompt rule clauses ---
+    prompt = ex.EXTRACTION_SYSTEM_INSTRUCTIONS
+    # Item 1: Evidence coverage, no unquoted entities/speakers/conclusions, subject completion ban, interview segmentation, qualifiers
+    assert "不得出现 `quote` 里没有的公司、机构、产品、说话人" in prompt
+    assert "见顶" in prompt and "止跌" in prompt and "资金流" in prompt
+    assert "主体在 `quote` 里只是代词或省略时，扩大连续引用；扩大后仍然覆盖不到，就删掉这张卡或这一句，不得根据 `topic_label` 或相邻卡片补全" in prompt
+    assert "访谈体按“某某：”分段，上一段里的“我认为”不能并到下一位说话人" in prompt
+    assert "尚无公开成果" in prompt
+    # Item 2: Card types & cited_sources
+    assert "事实来源必须覆盖 `claim` 里每一句当作 `fact` 的数字句，只覆盖了其中一句就拆卡" in prompt
+    assert "第三方模型预测、公司经营指引" in prompt
+    assert "原说话人的测算" in prompt
+    assert "抽取者自己的" not in prompt
+    assert "“我算”“隐含”“按全价算”“粗算”" in prompt
+    assert "“引用某报告”只覆盖报告明确披露的那几句，不覆盖随后自行推导的结论" in prompt
+    assert "`cited_sources` 只填 `quote` 里实际出现的来源名称" in prompt
+    # Item 3: Tickers prompt rules
+    assert "股东、客户、被比较方如果不是本卡的主体，不放进 `tickers`" in prompt
+    assert "没有别名映射的代码，只有代码本身出现在 `quote` 里时才保留，否则删除" in prompt
+    # Item 4: Figures prompt rules
+    assert "“约、大约、左右、以上”保留在 `value` 字符串里" in prompt
+    assert '"约142"' in prompt
+    assert "“同期、上期”只能继承本卡 `quote` 里写明的期间" in prompt
+
+    # --- Load v2 audit regression fixture (never reading `.agy/`) ---
+    fixture_path = Path(__file__).resolve().parent / "fixtures" / "conv_cards_v2_audit_regressions.json"
+    cards = json.loads(fixture_path.read_text(encoding="utf-8"))
+    by_id = {c["card_id"]: c for c in cards}
+    assert len(by_id) >= 12
+
+    # --- Item 5 & Item 3 on v2_18e39ac4ab23: 66.3 and 85.6 flagged in unsupported_claim_numbers, 0325.HK dropped ---
+    c_18e = deepcopy(by_id["v2_18e39ac4ab23"])
+    res_18e = ex.validate_candidate_card(c_18e)
+    assert res_18e.ok is True
+    assert res_18e.confidence == 0.4
+    assert res_18e.tickers == ["0322.HK"]
+    assert res_18e.tickers_dropped == 1
+    assert res_18e.unsupported_claim_numbers == ["66.3", "85.6", "44.6", "1.6", "64.37"]
+    assert res_18e.figures[-1] == {
+        "metric": "_verification",
+        "value": "unsupported:66.3,85.6,44.6,1.6,64.37",
+        "unit": "",
+        "period": "",
+    }
+
+    # --- Item 5: Extensible METRIC_PREFIX_INDICATORS_TABLE coverage ---
+    for prefix_expr in ("价格=66.3", "RSI=85.6", "收盘价 557.64", "市盈率 25", "PE=30", "EV/EBIT 18.5"):
+        res_ind = ex.validate_candidate_card(
+            {"claim": f"某公司 {prefix_expr}。", "figures": [], "tickers": []},
+            quote="某公司近期表现平稳。",
+        )
+        assert res_ind.confidence == 0.4, f"Expected indicator prefix {prefix_expr!r} to be flagged"
+        assert len(res_ind.unsupported_claim_numbers) == 1
+
+    # --- Item 3 on v2_76651895b370 (3750.HK absent from quote), v2_114c2aa5ca39 (MKSI absent), v2_e91a4e64c02e & v2_ebcb67dd7bb2 (XNET absent) ---
+    for cid_drop in ("v2_76651895b370", "v2_114c2aa5ca39", "v2_e91a4e64c02e", "v2_ebcb67dd7bb2"):
+        c_item = deepcopy(by_id[cid_drop])
+        res_item = ex.validate_candidate_card(c_item)
+        assert res_item.tickers == [], f"Expected tickers to be dropped for {cid_drop}"
+        assert res_item.tickers_dropped == 1
+
+    # Unmapped ticker whose code DOES appear in quote (v2_bb4895823474: BOXX) is kept
+    c_boxx = deepcopy(by_id["v2_bb4895823474"])
+    res_boxx = ex.validate_candidate_card(c_boxx)
+    assert res_boxx.tickers == ["BOXX"]
+    assert res_boxx.tickers_dropped == 0
+
+    # A+H dual-listed mappings: CATL 300750.SZ / 3750.HK and peers match when company name is in quote
+    ex._load_ticker_company_aliases.cache_clear()
+    for ah_tickers, company_quote in [
+        (["300750.SZ", "3750.HK"], "宁德时代三季度电池出货量与单位净利超预期"),
+        (["688008.SS", "6809.HK"], "澜起科技互连类芯片毛利率创新高"),
+        (["000333.SZ", "0300.HK"], "美的集团海外空调出口同比增长21%"),
+        (["002050.SZ", "2050.HK"], "三花智控机器人执行器产线进展顺利"),
+        (["600660.SS", "3606.HK"], "福耀玻璃海外市占率持续提升"),
+    ]:
+        kept_ah, dropped_ah = ex.validate_tickers_against_quote(ah_tickers, company_quote)
+        assert kept_ah == ah_tickers and dropped_ah == 0
+
+    # Agent fact card without cited source in quote (v2_f6fafaac280d) downgrades to opinion
+    _spk, eff_type, _srcs = ex.enforce_speaker_and_agent_citation(
+        by_id["v2_f6fafaac280d"]["type"],
+        [],
+        {"message_role": "assistant", "text": by_id["v2_f6fafaac280d"]["quote"]},
+        quote=by_id["v2_f6fafaac280d"]["quote"],
+    )
+    assert eff_type == "opinion"
+

@@ -160,22 +160,24 @@ EXTRACTION_SYSTEM_INSTRUCTIONS = """你是 Dalton 投研团队的对话历史整
    - 若为 `"ops"` 或 `"private"`，`cards` 必须返回空数组 `[]`。
 2. **原文逐字引用 (`quote` & `quote_event_id`)、证据覆盖、保留限定与归属**：
    - 每张卡的 `quote` **必须逐字摘自输入事件 `text` 的原话子串**，绝不能改写、概括、拼接或编造！`quote_event_id` 必须填写该句原话所在事件的 `event_id`。
-   - **证据覆盖**：`claim` 的每个实质分句、`figures` 的每个指标，都必须由**本卡 `quote`** 直接支持；不能把同段对话里其他位置的信息写进本卡；覆盖不到的就拆卡或删掉；`cited_sources`、`topic_label` 不能替代证据。
-   - **保留限定与归属**：保留“应该、可能、怀疑、初步、约、以上、超过、一度、用途含”等限定词，不得改成确定值或“证实/已经/全部用于”；保留条件、时间范围和主体归属；指代不清时扩大连续引用，不要自行补全名称；一条 `quote` 里有多家公司时，不得张冠李戴。
+   - **证据覆盖**：`claim` 的每个实质分句、`figures` 的每个指标，都必须由**本卡 `quote`** 直接支持；不能把同段对话里其他位置的信息写进本卡；覆盖不到的就拆卡或删掉；`cited_sources`、`topic_label` 不能替代证据。`claim` 和 `topic_label` 不得出现 `quote` 里没有的公司、机构、产品、说话人；不得出现 `quote` 里没有的结论（如“见顶”“止跌”“资金流”“费率对比”）。
+   - **主体补全禁令**：主体在 `quote` 里只是代词或省略时，扩大连续引用；扩大后仍然覆盖不到，就删掉这张卡或这一句，不得根据 `topic_label` 或相邻卡片补全。
+   - **保留限定与归属**：保留“应该、可能、怀疑、初步、约、以上、超过、一度、用途含”等限定词，以及“尚无公开成果”“原文没打开”一类会影响证据强度的限制语，不得改成确定值或“证实/已经/全部用于”；保留条件、时间范围和主体归属；访谈体按“某某：”分段，上一段里的“我认为”不能并到下一位说话人；一条 `quote` 里有多家公司时，不得张冠李戴。
 3. **卡片类型 (`type`) 与说话人来源 (`cited_sources`)**（按优先级定义，内容混合时优先拆卡）：
-   - `"fact"`：已经发生、且本卡 `quote` 里有具体来源的实际数（若原话来自 `agent` 如 Eve，只有当本卡 `quote` 中明确给出了具体资料来源时才可标为 `"fact"` 并填入 `cited_sources`；无明确引用来源一律不得当作事实）。
-   - `"estimate"`：他人的预测、一致预期、指引、TAM（引用 Gartner 只说明“Gartner 这么估”，预测本身标为 `"estimate"` 而非 `"fact"`）。
-   - `"model_assumption"`：抽取者自己的倍数、倒算、情景测算（agent 自己的情景测算不要求外部来源，但数字必须由本卡 `quote` 支持）。
+   - `"fact"`：已经发生、且本卡 `quote` 里有具体来源的实际数（若原话来自 `agent` 如 Eve，只有当本卡 `quote` 中明确给出了具体资料来源时才可标为 `"fact"` 并填入 `cited_sources`；无明确引用来源一律不得当作事实）。事实来源必须覆盖 `claim` 里每一句当作 `fact` 的数字句，只覆盖了其中一句就拆卡；“引用某报告”只覆盖报告明确披露的那几句，不覆盖随后自行推导的结论。
+   - `"estimate"`：第三方模型预测、公司经营指引、他人的预测、一致预期、TAM 一律标 `"estimate"`（引用 Gartner 或卖方模型只说明来源，预测和指引本身标为 `"estimate"` 而非 `"fact"` 或 `"opinion"`）。
+   - `"model_assumption"`：原说话人的测算，即原说话人自己做的倍数、倒算、情景推演（“我算”“隐含”“按全价算”“粗算”）（agent 自己的情景测算不要求外部来源，但数字必须由本卡 `quote` 支持）。
    - `"opinion"`：判断、建议、技术信号。
    - `"todo"`：带验证条件和到期日的待办，证实或证伪的阈值要写进 `claim`。
+   - `cited_sources` 只填 `quote` 里实际出现的来源名称。
 4. **上市公司 (`tickers`) vs 未上市私企 (`entities`)**：
-   - `tickers` 只放本卡 `quote` 正文里作为讨论对象出现的上市公司股票代码（大写）；信源机构（如 Gartner 对应 `IT`）不放；写明“剔除/未采用”的不放；`quote` 没点名公司时留空 `[]`。
+   - `tickers` 只放本卡 `quote` 正文里作为讨论对象（本卡主体）出现的上市公司股票代码（大写）；股东、客户、被比较方如果不是本卡的主体，不放进 `tickers`；信源机构（如 Gartner 对应 `IT`）不放；写明“剔除/未采用”的不放；没有别名映射的代码，只有代码本身出现在 `quote` 里时才保留，否则删除；`quote` 没点名公司时留空 `[]`。
    - 未上市私企（如 `OpenAI`, `Anthropic`, `ByteDance`, `SpaceX`, `Stripe`, `Databricks`, `DeepSeek`, `Unitree`）放入 `entities`，**禁止**放入 `tickers`。
 5. **结构化指标 (`figures`)**：
    - 当原话包含明确数值指标时，提取 `{metric, value, unit, period}`。
-   - `value` 的数字必须出现在本卡 `quote` 里；区间和上下限原样保留（可以用字符串，如 `">35"`、`"25-35"`）。
-   - `quote` 没写期间时 `period` 留空 `""`，不得用消息日期或报告日期代替。
-   - 不得改写口径（年增速不是 CAGR，利润率不是营业利润率）。
+   - `value` 的数字必须出现在本卡 `quote` 里；“约、大约、左右、以上”保留在 `value` 字符串里（例如 `"约142"`、`"约95"`、`"10%左右"`、`"240以上"`），区间和上下限原样保留（可以用字符串，如 `">35"`、`"25-35"`）。
+   - `quote` 没写期间时 `period` 留空 `""`，不得用消息日期或报告日期代替；“同期、上期”只能继承本卡 `quote` 里写明的期间。
+   - 不得改写口径（年增速不是 CAGR，利润率不是营业利润率，自身增速不得改成某业务增速，未写同比/环比不得补写，仅写“亿”且本卡无法确定币种时不得补“美元”）。
    - 多家公司时 `metric` 要带上公司名，或者拆卡。
 """
 
@@ -368,19 +370,61 @@ def enforce_speaker_and_agent_citation(
 SUPPLEMENTAL_TICKER_ALIASES: dict[str, tuple[str, ...]] = {
     "688008.SS": ("澜起科技", "澜起", "Montage"),
     "688008.SH": ("澜起科技", "澜起", "Montage"),
+    "6809.HK": ("澜起科技", "澜起", "Montage"),
     "688041.SS": ("海光信息", "海光", "Hygon"),
     "688041.SH": ("海光信息", "海光", "Hygon"),
     "688775.SH": ("影石创新", "影石", "Insta360"),
     "688775.SS": ("影石创新", "影石", "Insta360"),
     "300750.SZ": ("宁德时代", "宁德", "CATL"),
+    "3750.HK": ("宁德时代", "宁德", "CATL"),
     "0700.HK": ("腾讯控股", "腾讯", "Tencent"),
     "3606.HK": ("福耀玻璃", "福耀", "Fuyao"),
     "600660.SS": ("福耀玻璃", "福耀", "Fuyao"),
+    "600660.SH": ("福耀玻璃", "福耀", "Fuyao"),
     "000333.SZ": ("美的集团", "美的", "Midea"),
+    "0300.HK": ("美的集团", "美的", "Midea"),
+    "000651.SZ": ("格力电器", "格力", "Gree"),
     "002714.SZ": ("牧原股份", "牧原食品", "牧原", "Muyuan"),
     "300413.SZ": ("芒果超媒",),
     "002028.SZ": ("思源电气", "思源", "Sieyuan"),
     "002050.SZ": ("三花智控", "三花", "Sanhua"),
+    "2050.HK": ("三花智控", "三花", "Sanhua"),
+    "600690.SS": ("海尔智家", "海尔", "Haier"),
+    "600690.SH": ("海尔智家", "海尔", "Haier"),
+    "6690.HK": ("海尔智家", "海尔", "Haier"),
+    "002594.SZ": ("比亚迪", "BYD"),
+    "1211.HK": ("比亚迪", "BYD"),
+    "601888.SS": ("中国中免", "中免"),
+    "601888.SH": ("中国中免", "中免"),
+    "1880.HK": ("中国中免", "中免"),
+    "600941.SS": ("中国移动", "中移动", "China Mobile"),
+    "600941.SH": ("中国移动", "中移动", "China Mobile"),
+    "0941.HK": ("中国移动", "中移动", "China Mobile"),
+    "002352.SZ": ("顺丰控股", "顺丰", "SF Holding"),
+    "6936.HK": ("顺丰控股", "顺丰", "SF Holding"),
+    "603259.SS": ("药明康德", "WuXi AppTec"),
+    "603259.SH": ("药明康德", "WuXi AppTec"),
+    "2359.HK": ("药明康德", "WuXi AppTec"),
+    "601899.SS": ("紫金矿业", "紫金", "Zijin"),
+    "601899.SH": ("紫金矿业", "紫金", "Zijin"),
+    "2899.HK": ("紫金矿业", "紫金", "Zijin"),
+    "688981.SS": ("中芯国际", "中芯", "SMIC"),
+    "688981.SH": ("中芯国际", "中芯", "SMIC"),
+    "0981.HK": ("中芯国际", "中芯", "SMIC"),
+    "3931.HK": ("中创新航",),
+    "300014.SZ": ("亿纬锂能", "亿纬"),
+    "300450.SZ": ("先导智能",),
+    "603659.SS": ("璞泰来",),
+    "603659.SH": ("璞泰来",),
+    "9880.HK": ("优必选", "UBTECH"),
+    "9988.HK": ("阿里巴巴", "Alibaba", "阿里"),
+    "9618.HK": ("京东", "JD.com", "JD"),
+    "9999.HK": ("网易", "NetEase"),
+    "9888.HK": ("百度", "Baidu"),
+    "9961.HK": ("携程", "Trip.com"),
+    "2423.HK": ("贝壳", "KE Holdings"),
+    "9626.HK": ("哔哩哔哩", "Bilibili"),
+    "1179.HK": ("华住", "H World"),
     "000719.SZ": ("中原传媒",),
     "5803.T": ("藤仓", "Fujikura"),
     "6857.T": ("爱德万", "爱德万测试", "Advantest"),
@@ -391,6 +435,10 @@ SUPPLEMENTAL_TICKER_ALIASES: dict[str, tuple[str, ...]] = {
     "TSM": ("Taiwan Semiconductor", "TSMC", "台积电"),
     "AMZN": ("Amazon", "亚马逊"),
     "BABA": ("阿里巴巴", "Alibaba", "阿里"),
+    "NOW": ("ServiceNow",),
+    "WDAY": ("Workday",),
+    "PANW": ("Palo Alto", "Palo Alto Networks"),
+    "BBY": ("Best Buy",),
     "IQ": ("iQIYI", "爱奇艺"),
     "HUBS": ("HubSpot",),
     "EFX": ("Equifax",),
@@ -531,12 +579,24 @@ def _load_ticker_company_aliases() -> dict[str, tuple[str, ...]]:
                 disp_name = str(entry.get("name") or "").strip()
                 if disp_name:
                     names.append(disp_name)
-                search_names = (entry.get("aliases") or {}).get("search_names") or []
+                aliases_obj = entry.get("aliases") or {}
+                search_names = aliases_obj.get("search_names") or []
+                secondary_tickers: list[str] = []
                 for sn in search_names:
                     sn_str = str(sn or "").strip()
                     if sn_str and sn_str not in names:
                         names.append(sn_str)
+                    if re.match(r"^(?:\d{1,6}\.(?:HK|SS|SH|SZ|T|TW)|[A-Z]{2,5}(?:[.-][A-Z])?)$", sn_str, re.IGNORECASE):
+                        secondary_tickers.append(sn_str.upper())
+                for extra_field in ("adr", "a_ticker", "h_ticker", "hk_ticker", "cn_ticker"):
+                    extra_t = str(aliases_obj.get(extra_field) or "").strip().upper()
+                    if extra_t:
+                        if extra_t not in names:
+                            names.append(extra_t)
+                        secondary_tickers.append(extra_t)
                 _register(ticker, names)
+                for sec_t in secondary_tickers:
+                    _register(sec_t, names)
         except Exception:
             pass
 
@@ -777,6 +837,43 @@ METRIC_UNITS_TABLE: tuple[str, ...] = (
     r"小时",
     r"分钟",
     r"秒",
+)
+
+# Extensible table of indicator names that qualify a following number as a metric value
+# even without a trailing `%` or currency unit (e.g. `价格=66.3`, `价格为66.3`, `RSI=85.6`, `PE 25`, `EV/EBIT 15`).
+METRIC_PREFIX_INDICATORS_TABLE: tuple[str, ...] = (
+    # Price & valuation levels
+    r"收盘价",
+    r"开盘价",
+    r"目标价",
+    r"行权价",
+    r"成本价",
+    r"成交价",
+    r"发行价",
+    r"转换价",
+    r"转股价",
+    r"赎回价",
+    r"现价",
+    r"股价",
+    r"价格",
+    r"均价",
+    r"收于",
+    # Technical indicators
+    r"(?<![A-Za-z0-9])RSI(?![A-Za-z0-9])",
+    r"量比",
+    # Valuation multiples & financial ratios
+    r"市盈率",
+    r"市净率",
+    r"市销率",
+    r"(?<![A-Za-z0-9])(?:EV\s*/\s*(?:EBITDA|EBIT|Sales|Revenue)|P\s*/\s*[EBS]|PE|PB|PS|PEG|ROE|ROIC|ROA|ETR|EPS|BPS|DPS|NAV)(?![A-Za-z0-9])",
+)
+
+_METRIC_INDICATOR_PREFIX_CORE = "(?:" + "|".join(METRIC_PREFIX_INDICATORS_TABLE) + ")"
+_METRIC_INDICATOR_PREFIX_TAIL_RE = re.compile(
+    rf"{_METRIC_INDICATOR_PREFIX_CORE}"
+    rf"(?:\s*(?:[=:：]|为|是|约|约为|大约|大概|达|达到|报|收于|跌至|升至|降至|回升至|回落至|高于|低于|突破|跌破|从|由|在|仅|只有|给|给到|维持))*"
+    rf"\s*[（(]?\s*[-−+~～≈><≥≤]?\s*$",
+    flags=re.IGNORECASE,
 )
 
 _CURRENCY_PREFIX_RE = (
@@ -1050,12 +1147,13 @@ def _parse_number_mentions_detailed(
             u2 = None
 
         eff_u1 = u1 if u1 is not None else u2
-        has_unit_1 = bool(eff_cur or eff_u1 or eff_post)
+        has_indicator_prefix = bool(_METRIC_INDICATOR_PREFIX_TAIL_RE.search(cleaned[: match.start()]))
+        has_unit_1 = bool(eff_cur or eff_u1 or eff_post or has_indicator_prefix)
         c1, f1 = _build_number_forms(n1, eff_u1)
         if c1 is not None:
             mentions.append((c1, f1, has_unit_1))
         if n2:
-            has_unit_2 = bool(eff_cur or u2 or eff_u1 or eff_post)
+            has_unit_2 = bool(eff_cur or u2 or eff_u1 or eff_post or has_indicator_prefix)
             c2, f2 = _build_number_forms(n2, u2 or eff_u1)
             if c2 is not None:
                 mentions.append((c2, f2, has_unit_2))
@@ -1482,10 +1580,10 @@ def validate_tickers_against_quote(
         target_q = q_no_generic_it if canon_t == "IT" else q_without_exclusions
         matched = any(_alias_matches_in_text(alias, target_q) for alias in cand_names)
 
-        if matched or canon_t not in alias_map:
-            # No name mapping means we cannot tell a missing mention from a name we do not know
-            # (e.g. 海光 for 688041.SS); keep it rather than lose a real subject. Exclusions and
-            # source institutions above still drop.
+        if matched:
+            # Mapped tickers match by code or company alias; unmapped tickers have only
+            # `ticker_code_variants(t)` in `cand_names`, so they are kept only when the code
+            # itself appears in `quote`.
             if t not in kept:
                 kept.append(t)
         else:

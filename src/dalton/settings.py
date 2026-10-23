@@ -119,7 +119,7 @@ class DaltonConversationsConfig(BaseModel):
 
     enabled: bool = True
     extractor_model: str = "gemini-4-argon-medium-oauth"
-    prompt_version: str = "conv_card_v2"
+    prompt_version: str = "conv_card_v2_1"
     embedding_model: str = "gemini-embedding-001"
     embedding_model_preferred: str = "gemini-embedding-2-preview"
     embedding_dimensions: int = Field(default=3072, gt=0)
