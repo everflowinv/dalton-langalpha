@@ -7,7 +7,6 @@ handoff_filtered_routes:
   - web-page
   - filings
   - agent-reach
-  - x-timeline
   - x-search
 
 catalog_routes:
@@ -96,6 +95,11 @@ catalog_routes:
     title: 跨平台社区情绪
     rules: "query+days≤30"
     description: "跨平台与StockTwits/Polymarket情绪。"
+  x-timeline:
+    category: community
+    title: X固定账号时间线
+    rules: "tweets/tweet/thread/search,count≤100;与x_search按原帖URL去重"
+    description: "固定账号建不漏底表；跨账号观点与媒体补充用x_search。"
 
 direct_tools:
   conversation_search:

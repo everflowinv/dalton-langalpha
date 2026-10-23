@@ -103,16 +103,18 @@ ROUTE_TIMEOUTS: dict[str, tuple[int, int]] = {
     "xueqiu": (60, 60),
     "employee": (120, 120),
     "last30days": (600, 600),
+    "x-timeline": (60, 60),
 }
 
 BRIDGE_COMMUNITY_ROUTES: frozenset[str] = frozenset(
-    {"xueqiu", "employee", "last30days"}
+    {"xueqiu", "employee", "last30days", "x-timeline"}
 )
 
 COMMUNITY_ROUTE_CONCURRENCY: dict[str, int] = {
     "xueqiu": 2,
     "employee": 2,
     "last30days": 1,
+    "x-timeline": 2,
 }
 
 COMMUNITY_SIGTERM_GRACE_S: float = 5.0
@@ -784,6 +786,12 @@ class BridgeConfig:
                 str(self.ocw_root / "scripts" / "xueqiu_posts.py"),
             )
         ).expanduser().resolve()
+        self.xreach_bin: Path = Path(
+            os.environ.get(
+                "DALTON_XREACH_BIN",
+                "~/.openclaw/tools/node/bin/xreach",
+            )
+        ).expanduser().resolve()
         self.employee_python: Path = Path(
             os.path.abspath(
                 os.path.expanduser(
@@ -989,7 +997,10 @@ COMMUNITY_DESCRIPTION_SUFFIX: str = (
     "- employee（员工评论 Blind / Indeed / Glassdoor）：operation ∈ {blind, summary, indeed, glassdoor}；"
     "参数：company、url（仅限 glassdoor.com）、pages（blind/indeed 1-3，summary 1-40）、allow_paid（bool，indeed/glassdoor 必须显式传 allow_paid=True）。\n"
     "- last30days（跨平台社区情绪 Reddit / X / StockTwits / Polymarket）："
-    "参数：query、days（1-30，默认 30）、quick（bool）、plan（可选对象，每个 subquery 须含 search_query 与 ranking_query）。"
+    "参数：query、days（1-30，默认 30）、quick（bool）、plan（可选对象，每个 subquery 须含 search_query 与 ranking_query）。\n"
+    "- x-timeline（X 固定账号时间线）：operation ∈ {tweets, tweet, thread, search}（默认 tweets）；"
+    "参数：handle（tweets 必填，接受 @user / user / x.com 主页 URL）、url 或 tweet_id（tweet/thread 必填，仅限 x.com / twitter.com）、"
+    "query（search 必填，时间窗用 since/until 写入 query）、since / until（YYYY-MM-DD）、count（1-100，默认 20）、include_replies（bool，仅 tweets）。\n"
 )
 
 COMMUNITY_CATALOG_ROUTE_SPECS: dict[str, dict[str, Any]] = {
@@ -1048,16 +1059,39 @@ COMMUNITY_CATALOG_ROUTE_SPECS: dict[str, dict[str, Any]] = {
             "Polymarket 仅算市场定价信号，不算事实证据",
         ],
     },
+    "x-timeline": {
+        "id": "x-timeline",
+        "category": "community",
+        "kind": "cli",
+        "title": "X 固定账号时间线 (xreach)",
+        "operations": ["tweets", "tweet", "thread", "search"],
+        "parameters": {
+            "operation": "tweets | tweet | thread | search（可选，默认 tweets）",
+            "handle": "X 账号（tweets 必填，接受 @user、user 或 x.com/twitter.com 主页 URL，规范化为 [A-Za-z0-9_]{1,15}）",
+            "url": "单帖 URL（tweet/thread 与 tweet_id 二选一，仅允许 x.com / twitter.com 域名）",
+            "tweet_id": "单帖 ID（tweet/thread 与 url 二选一，纯数字字符串）",
+            "query": "搜索词（search 必填，<=300 字符；时间窗以 since:/until: 拼入 query）",
+            "since": "窗口起点 YYYY-MM-DD（search 拼入 query；tweets 在结果里按日期过滤，含端点）",
+            "until": "窗口终点 YYYY-MM-DD（同 since）",
+            "count": "条数（1-100，默认 20；xreach 可能多返，bridge 按 count 截断）",
+            "include_replies": "含回复（bool，仅 tweets；xreach search 无此选项）",
+        },
+        "rules": [
+            "固定账号建\"不漏\"底表用它（按账号顺序全量拉取）；跨账号观点与媒体补充用 x_search",
+            "x-timeline 与 x_search 的结果按原帖 URL 去重，同帖只计一次",
+            "仅算情绪与线索；引用须带 @handle、日期与原帖 URL（source_attribution 已附）",
+        ],
+    },
 }
 
 _TICKER_RE = re.compile(r"^[A-Za-z0-9._\-]{1,32}$")
 _POST_ID_RE = re.compile(r"^[0-9]{1,32}$")
 _COMPANY_RE = re.compile(r"^[A-Za-z0-9 .,_\\-]{1,100}$")
-_ALLOWED_URL_DOMAINS: tuple[str, ...] = ("xueqiu.com", "glassdoor.com")
+_ALLOWED_URL_DOMAINS: tuple[str, ...] = ("xueqiu.com", "glassdoor.com", "x.com", "twitter.com")
 
 
 def _validate_community_url(url: Any, *, required_domain: str) -> str:
-    """Validate and canonicalize URL, then enforce strict domain allowlist (`xueqiu.com` / `glassdoor.com`)."""
+    """Validate and canonicalize URL, then enforce the strict domain allowlist (see `_ALLOWED_URL_DOMAINS`)."""
     if not isinstance(url, str):
         raise ValueError("url must be a string")
     if any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in url):
@@ -1108,7 +1142,7 @@ def _validate_community_url(url: Any, *, required_domain: str) -> str:
         for d in _ALLOWED_URL_DOMAINS
     ):
         raise ValueError(
-            f"url domain '{verified_host}' is not allowed (only xueqiu.com and glassdoor.com)"
+            f"url domain '{verified_host}' is not allowed (only {', '.join(_ALLOWED_URL_DOMAINS)})"
         )
     req_dom = required_domain.lower().rstrip(".")
     if not (verified_host == req_dom or verified_host.endswith(f".{req_dom}")):
@@ -1139,6 +1173,182 @@ def _validate_int_range(
     if val < min_val or val > max_val:
         raise ValueError(f"{field_name} must be between {min_val} and {max_val}")
     return val
+
+
+_X_HANDLE_RE = re.compile(r"^[A-Za-z0-9_]{1,15}$")
+_YMD_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
+_XREACH_CREATED_AT_FMT = "%a %b %d %H:%M:%S %z %Y"
+_X_QUOTED_ID_KEYS: tuple[str, ...] = (
+    "quotedTweetId",
+    "quoted_tweet_id",
+    "quotedId",
+    "quotedStatusId",
+    "quoted_status_id",
+)
+
+
+def _normalize_x_handle(raw: Any) -> str:
+    """Normalize a handle input (`@user`, `user`, or an x.com/twitter.com profile URL) to a bare screen name."""
+    if not isinstance(raw, str):
+        raise ValueError("handle must be a string")
+    cleaned = raw.strip()
+    if cleaned.startswith(("http://", "https://")):
+        canonical: str | None = None
+        for dom in ("x.com", "twitter.com"):
+            try:
+                canonical = _validate_community_url(cleaned, required_domain=dom)
+                break
+            except ValueError:
+                continue
+        if canonical is None:
+            raise ValueError("handle URL domain must be x.com or twitter.com")
+        path = (urllib.parse.urlsplit(canonical).path or "").strip("/")
+        cleaned = path.split("/", 1)[0] if path else ""
+    cleaned = cleaned.lstrip("@")
+    if not _X_HANDLE_RE.fullmatch(cleaned):
+        raise ValueError(
+            "handle must match [A-Za-z0-9_]{1,15} (accepts @user, user, or profile URL)"
+        )
+    return cleaned
+
+
+def _validate_x_date(val: Any, *, field_name: str) -> str:
+    if not isinstance(val, str):
+        raise ValueError(f"{field_name} must be a string")
+    cleaned = val.strip()
+    if not _YMD_RE.fullmatch(cleaned):
+        raise ValueError(f"{field_name} must be YYYY-MM-DD")
+    try:
+        datetime.strptime(cleaned, "%Y-%m-%d")
+    except ValueError as exc:
+        raise ValueError(f"{field_name} is not a valid calendar date") from exc
+    return cleaned
+
+
+def _extract_x_tweet_target(clean_args: dict[str, Any]) -> str:
+    """Return the tweet URL or numeric id targeting a single tweet/thread (exactly one of the two)."""
+    url = clean_args.get("url")
+    tweet_id = clean_args.get("tweet_id")
+    if (url is None) == (tweet_id is None):
+        raise ValueError("exactly one of url or tweet_id is required")
+    if url is not None:
+        canonical: str | None = None
+        for dom in ("x.com", "twitter.com"):
+            try:
+                canonical = _validate_community_url(url, required_domain=dom)
+                break
+            except ValueError:
+                continue
+        if canonical is None:
+            raise ValueError("url domain must be x.com or twitter.com")
+        return canonical
+    if not isinstance(tweet_id, str):
+        raise ValueError("tweet_id must be a string")
+    tid = tweet_id.strip()
+    if not _POST_ID_RE.fullmatch(tid):
+        raise ValueError("tweet_id must be a numeric string (1-32 digits)")
+    return tid
+
+
+def _parse_xreach_created_at(raw: Any) -> tuple[str, str]:
+    """Parse xreach `createdAt` (`Wed Oct 21 14:54:03 +0000 2026`) to `(ISO-8601, YYYY-MM-DD)`; falls back to raw text."""
+    text = str(raw or "").strip()
+    if not text:
+        return "", ""
+    for fmt in (_XREACH_CREATED_AT_FMT, "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        candidate = text[:-1] + "+0000" if fmt.endswith("%z") and text.endswith("Z") else text
+        try:
+            dt = datetime.strptime(candidate, fmt)
+        except ValueError:
+            continue
+        return dt.isoformat(timespec="seconds"), dt.strftime("%Y-%m-%d")
+    return text, text[:10] if _YMD_RE.fullmatch(text[:10]) else ""
+
+
+def _x_metric_int(val: Any) -> int:
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _normalize_xreach_item(item: Any) -> dict[str, Any] | None:
+    """Map one xreach tweet object to the bridge-normalized `{id, url, author_handle, ...}` shape."""
+    if not isinstance(item, dict):
+        return None
+    tid = str(item.get("id") or "").strip()
+    if not tid:
+        return None
+    user = item.get("user") if isinstance(item.get("user"), dict) else {}
+    handle = str(user.get("screenName") or "").strip() or "unknown"
+    name = str(user.get("name") or "").strip() or handle
+    iso_dt, day = _parse_xreach_created_at(item.get("createdAt"))
+    quoted_id = ""
+    for qk in _X_QUOTED_ID_KEYS:
+        qv = item.get(qk)
+        if qv is not None and str(qv).strip():
+            quoted_id = str(qv).strip()
+            break
+    metrics_raw = item.get("metrics") if isinstance(item.get("metrics"), dict) else {}
+    attribution_day = f" ({day}; status {tid})" if day else f" (status {tid})"
+    return {
+        "id": tid,
+        "url": f"https://x.com/{handle}/status/{tid}",
+        "author_handle": handle,
+        "author_name": name,
+        "created_at": iso_dt,
+        "text": str(item.get("text") or item.get("full_text") or "").strip(),
+        "lang": str(item.get("lang") or "").strip(),
+        "metrics": {
+            "likes": _x_metric_int(metrics_raw.get("likes", item.get("likeCount"))),
+            "reposts": _x_metric_int(metrics_raw.get("reposts", item.get("retweetCount"))),
+            "replies": _x_metric_int(metrics_raw.get("replies", item.get("replyCount"))),
+            "views": _x_metric_int(metrics_raw.get("views", item.get("viewCount"))),
+        },
+        "is_reply": bool(item.get("isReply")),
+        "is_repost": bool(item.get("isRetweet")),
+        "quoted_id": quoted_id or None,
+        "source_attribution": f"**X**, @{handle}{attribution_day}",
+        "_date": day,
+    }
+
+
+def _normalize_x_timeline_output(
+    parsed: Any, *, operation: str, count: int, since: str, until: str
+) -> dict[str, Any]:
+    """Normalize raw xreach JSON into `{items, returned, has_more}`.
+
+    xreach ignores an exact `-n` bound (observed: `-n 3` returned 15 items), so the bridge
+    truncates to `count` itself; `tweets` additionally filters items to the `since`/`until`
+    window (inclusive) before truncation.
+    """
+    if isinstance(parsed, dict):
+        raw_items = parsed.get("items") if isinstance(parsed.get("items"), list) else [parsed]
+        has_more = bool(parsed.get("hasMore"))
+    elif isinstance(parsed, list):
+        raw_items = parsed
+        has_more = False
+    else:
+        raw_items = []
+        has_more = False
+    items = [n for n in (_normalize_xreach_item(x) for x in raw_items) if n is not None]
+    if operation == "tweets" and (since or until):
+        items = [
+            it
+            for it in items
+            if (not since or it["_date"] >= since) and (not until or it["_date"] <= until)
+        ]
+    truncated = False
+    if operation in ("tweets", "search"):
+        truncated = len(items) > count
+        items = items[:count]
+    for it in items:
+        it.pop("_date", None)
+    return {
+        "items": items,
+        "returned": len(items),
+        "has_more": has_more or truncated,
+    }
 
 
 def _validate_last30days_plan(plan: Any) -> dict[str, Any]:
@@ -1249,6 +1459,11 @@ def _is_empty_community_output(route: str, operation: str, parsed: Any) -> bool:
             return False
         return _is_all_last30days_no_results(parsed.get("source_status"))
 
+    if route == "x-timeline":
+        if isinstance(parsed.get("items"), list):
+            return len(parsed["items"]) == 0
+        return True
+
     return False
 
 
@@ -1271,6 +1486,7 @@ class ResearchDataBridge:
         self._resolved_embed_model: str | None = None
         self._resolved_embed_dims: int | None = None
         self._file_cache: dict[str, tuple[int, int, Any]] = {}
+        self._xreach_version_cache: tuple[float, dict[str, Any]] | None = None
 
     def handoff_routes(self) -> set[str]:
         """Return route IDs whose `kind` is `agent_tool` or `skill` in `data_sources.json`, excluding bridge-executed community routes."""
@@ -1296,7 +1512,6 @@ class ResearchDataBridge:
                 "web-page",
                 "filings",
                 "agent-reach",
-                "x-timeline",
                 "x-search",
             }
 
@@ -1433,7 +1648,7 @@ class ResearchDataBridge:
             if isinstance(route_prop, dict) and isinstance(route_prop.get("enum"), list):
                 if tool_name == "community":
                     kept = [r for r in route_prop["enum"] if r not in handoff]
-                    for comm_r in ("xueqiu", "employee", "last30days"):
+                    for comm_r in ("xueqiu", "employee", "last30days", "x-timeline"):
                         if comm_r not in kept:
                             kept.append(comm_r)
                     route_prop["enum"] = kept
@@ -1459,7 +1674,7 @@ class ResearchDataBridge:
                         "operation",
                         {
                             "type": "string",
-                            "description": "xueqiu: posts|post|comments|search|user; employee: blind|summary|indeed|glassdoor; last30days: search (optional, default search)",
+                            "description": "xueqiu: posts|post|comments|search|user; employee: blind|summary|indeed|glassdoor; last30days: search (optional, default search); x-timeline: tweets|tweet|thread|search (optional, default tweets)",
                         },
                     )
                     props.setdefault(
@@ -1530,6 +1745,48 @@ class ResearchDataBridge:
                         {
                             "type": "object",
                             "description": "Optional query plan object for last30days (each subquery requires search_query and ranking_query).",
+                        },
+                    )
+                    props.setdefault(
+                        "handle",
+                        {
+                            "type": "string",
+                            "description": "X handle for x-timeline tweets (accepts @user, user, or x.com/twitter.com profile URL).",
+                        },
+                    )
+                    props.setdefault(
+                        "tweet_id",
+                        {
+                            "type": "string",
+                            "description": "Numeric tweet id for x-timeline tweet/thread (alternative to url).",
+                        },
+                    )
+                    props.setdefault(
+                        "since",
+                        {
+                            "type": "string",
+                            "description": "Window start YYYY-MM-DD for x-timeline (search: spliced into query as since:; tweets: filters results, inclusive).",
+                        },
+                    )
+                    props.setdefault(
+                        "until",
+                        {
+                            "type": "string",
+                            "description": "Window end YYYY-MM-DD for x-timeline (search: spliced into query as until:; tweets: filters results, inclusive).",
+                        },
+                    )
+                    props.setdefault(
+                        "count",
+                        {
+                            "type": "integer",
+                            "description": "Item count for x-timeline tweets/search (1-100, default 20; bridge truncates to count).",
+                        },
+                    )
+                    props.setdefault(
+                        "include_replies",
+                        {
+                            "type": "boolean",
+                            "description": "Include replies for x-timeline tweets only (xreach search has no --replies).",
                         },
                     )
             elif tool_copy.get("name") == "macro":
@@ -2368,6 +2625,32 @@ class ResearchDataBridge:
                 env["ALL_PROXY"] = proxy
         return env
 
+    def _xreach_proxy_args(self) -> list[str]:
+        """Return an explicit `--proxy <url>` argv suffix mirroring the bridge subprocess env.
+
+        xreach ignores proxy environment variables, so the proxy the other community
+        scripts inherit must be passed as a flag. A URL carrying userinfo never reaches
+        argv (it would leak credentials into the process list); the route then runs
+        without a proxy and a warning is logged (never the URL itself).
+        """
+        env = self._build_community_subprocess_env()
+        proxy = ""
+        for key in ("https_proxy", "HTTPS_PROXY", "http_proxy", "HTTP_PROXY"):
+            val = str(env.get(key) or "").strip()
+            if val:
+                proxy = val
+                break
+        if not proxy:
+            return []
+        parts = urllib.parse.urlsplit(proxy)
+        if parts.username or parts.password:
+            logger.warning(
+                "x-timeline: configured proxy URL carries credentials; "
+                "running xreach without --proxy"
+            )
+            return []
+        return ["--proxy", proxy]
+
     def _check_community_source_files(self, route: str) -> str | None:
         """Return an error description if required interpreter or script files are missing, without installing anything."""
         if route == "employee":
@@ -2388,7 +2671,66 @@ class ResearchDataBridge:
             if not self.cfg.last30days_script.is_file():
                 return f"last30days CLI script not found: {self.cfg.last30days_script}"
             return None
+        if route == "x-timeline":
+            if not self.cfg.xreach_bin.is_file():
+                return f"xreach binary not found: {self.cfg.xreach_bin}"
+            return None
         return None
+
+    async def probe_xreach_version(self) -> dict[str, Any]:
+        """Run offline `xreach --version` for `/healthz` (cached 60s); reports status only, never secrets."""
+        now = time.monotonic()
+        if self._xreach_version_cache is not None and now - self._xreach_version_cache[0] < 60.0:
+            return self._xreach_version_cache[1]
+        bin_path = self.cfg.xreach_bin
+        outcome: dict[str, Any]
+        if not bin_path.is_file():
+            outcome = {
+                "ok": False,
+                "status": "missing",
+                "error": f"xreach binary not found: {bin_path}",
+            }
+        else:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    str(bin_path),
+                    "--version",
+                    stdin=asyncio.subprocess.DEVNULL,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    start_new_session=True,
+                )
+                try:
+                    stdout_bytes, _stderr_bytes = await asyncio.wait_for(
+                        proc.communicate(), timeout=8.0
+                    )
+                except BaseException:
+                    await _terminate_and_reap_process(
+                        proc, term_timeout_s=COMMUNITY_SIGTERM_GRACE_S
+                    )
+                    raise
+                version_lines = (stdout_bytes or b"").decode(
+                    "utf-8", errors="replace"
+                ).splitlines()
+                version = sanitize_stderr_text(
+                    version_lines[0] if version_lines else "",
+                    max_len=120,
+                )
+                rc = proc.returncode if proc.returncode is not None else 0
+                if rc == 0 and version:
+                    outcome = {"ok": True, "status": "ok", "version": version}
+                else:
+                    outcome = {
+                        "ok": False,
+                        "status": "error",
+                        "error": f"xreach --version exited with code {rc}",
+                    }
+            except asyncio.TimeoutError:
+                outcome = {"ok": False, "status": "timeout", "error": "xreach --version timed out"}
+            except Exception as exc:
+                outcome = {"ok": False, "status": "error", "error": type(exc).__name__}
+        self._xreach_version_cache = (now, outcome)
+        return outcome
 
     def _validate_and_build_community_cmd(
         self,
@@ -2668,6 +3010,141 @@ class ResearchDataBridge:
             cmd.append("--emit=json")
             return cmd
 
+        if route == "x-timeline":
+            # `params`/`start`/`end` would be silently dropped by the generic-param strip,
+            # so reject them on the raw arguments with a pointer to the right knob.
+            for legacy in ("params", "start", "end"):
+                if arguments.get(legacy) is not None:
+                    raise ValueError(
+                        f"x-timeline does not support '{legacy}'; use since/until for the date window"
+                    )
+            allowed_keys = {
+                "route",
+                "operation",
+                "handle",
+                "url",
+                "tweet_id",
+                "query",
+                "since",
+                "until",
+                "count",
+                "include_replies",
+            }
+            extra = set(clean_args.keys()) - allowed_keys
+            if extra:
+                raise ValueError(f"Unsupported parameters for x-timeline: {sorted(extra)}")
+            raw_op = clean_args.get("operation")
+            if raw_op is None or (isinstance(raw_op, str) and not raw_op.strip()):
+                op = "tweets"
+            elif isinstance(raw_op, str) and raw_op.strip() in (
+                "tweets",
+                "tweet",
+                "thread",
+                "search",
+            ):
+                op = raw_op.strip()
+            else:
+                raise ValueError(
+                    "x-timeline operation must be one of: tweets, tweet, thread, search"
+                )
+            since = (
+                _validate_x_date(clean_args.get("since"), field_name="since")
+                if clean_args.get("since") is not None
+                else ""
+            )
+            until = (
+                _validate_x_date(clean_args.get("until"), field_name="until")
+                if clean_args.get("until") is not None
+                else ""
+            )
+            if since and until and since > until:
+                raise ValueError("x-timeline since must not be after until")
+            include_replies = clean_args.get("include_replies")
+            if include_replies is not None and not isinstance(include_replies, bool):
+                raise ValueError("include_replies must be a boolean")
+
+            if op == "tweets":
+                for forbidden in ("url", "tweet_id", "query"):
+                    if clean_args.get(forbidden) is not None:
+                        raise ValueError(
+                            f"Parameter '{forbidden}' is not allowed for x-timeline tweets"
+                        )
+                handle = _normalize_x_handle(clean_args.get("handle"))
+                count = _validate_int_range(
+                    clean_args.get("count"),
+                    field_name="count",
+                    min_val=1,
+                    max_val=100,
+                    default=20,
+                )
+                cmd = [
+                    str(self.cfg.xreach_bin),
+                    "tweets",
+                    f"@{handle}",
+                    "-n",
+                    str(count),
+                ]
+                if include_replies is True:
+                    cmd.append("--replies")
+                cmd.append("--json")
+                cmd.extend(self._xreach_proxy_args())
+                return cmd
+
+            if op == "search":
+                for forbidden in ("handle", "url", "tweet_id"):
+                    if clean_args.get(forbidden) is not None:
+                        raise ValueError(
+                            f"Parameter '{forbidden}' is not allowed for x-timeline search"
+                        )
+                # xreach's search subcommand has no --replies option.
+                if include_replies is not None:
+                    raise ValueError(
+                        "Parameter 'include_replies' is not allowed for x-timeline search"
+                    )
+                query = _validate_clean_text(
+                    clean_args.get("query"), field_name="query", max_len=300
+                )
+                windowed_query = query
+                if since:
+                    windowed_query += f" since:{since}"
+                if until:
+                    windowed_query += f" until:{until}"
+                count = _validate_int_range(
+                    clean_args.get("count"),
+                    field_name="count",
+                    min_val=1,
+                    max_val=100,
+                    default=20,
+                )
+                cmd = [
+                    str(self.cfg.xreach_bin),
+                    "search",
+                    windowed_query,
+                    "-n",
+                    str(count),
+                    "--json",
+                ]
+                cmd.extend(self._xreach_proxy_args())
+                return cmd
+
+            # op in ("tweet", "thread")
+            for forbidden in (
+                "handle",
+                "query",
+                "count",
+                "include_replies",
+                "since",
+                "until",
+            ):
+                if clean_args.get(forbidden) is not None:
+                    raise ValueError(
+                        f"Parameter '{forbidden}' is not allowed for x-timeline {op}"
+                    )
+            target = _extract_x_tweet_target(clean_args)
+            cmd = [str(self.cfg.xreach_bin), op, target, "--json"]
+            cmd.extend(self._xreach_proxy_args())
+            return cmd
+
         raise ValueError(f"Unsupported community route '{route}'")
 
     async def _handle_community_call(
@@ -2677,10 +3154,12 @@ class ResearchDataBridge:
         arguments: dict[str, Any],
         eff_timeout: int,
     ) -> dict[str, Any]:
-        """Execute `xueqiu`, `employee`, or `last30days` directly via subprocess without shell."""
+        """Execute a bridge community route (`xueqiu`/`employee`/`last30days`/`x-timeline`) directly via subprocess without shell."""
         operation = str(arguments.get("operation") or "").strip()
         if route == "last30days" and not operation:
             operation = "search"
+        if route == "x-timeline" and not operation:
+            operation = "tweets"
 
         # Paid source gate for employee indeed/glassdoor
         if route == "employee" and operation in ("indeed", "glassdoor"):
@@ -2956,6 +3435,21 @@ class ResearchDataBridge:
                 )
 
             parsed = _sanitize_community_payload_metadata(parsed)
+
+            if route == "x-timeline":
+                parsed = _normalize_x_timeline_output(
+                    parsed,
+                    operation=operation,
+                    count=_validate_int_range(
+                        arguments.get("count"),
+                        field_name="count",
+                        min_val=1,
+                        max_val=100,
+                        default=20,
+                    ),
+                    since=str(arguments.get("since") or "").strip(),
+                    until=str(arguments.get("until") or "").strip(),
+                )
 
             if isinstance(parsed, dict) and parsed.get("ok") is False:
                 err_msg = sanitize_stderr_text(
@@ -3880,7 +4374,7 @@ class ResearchDataBridge:
                             if "market-regime" not in existing_ids:
                                 kept_routes.append(dict(MARKET_REGIME_CATALOG_ENTRY))
                         if include_community:
-                            for comm_id in ("xueqiu", "employee", "last30days"):
+                            for comm_id in ("xueqiu", "employee", "last30days", "x-timeline"):
                                 if comm_id not in seen_comm and comm_id not in handoff:
                                     kept_routes.append(
                                         json.loads(
@@ -4245,6 +4739,7 @@ async def _handle_client(
                 "embed_max_bytes": bridge.cfg.embed_max_bytes,
                 "caller_budget_s": bridge.cfg.caller_budget_s,
                 "alphaengine_get_document_today": bridge._read_usage_today(),
+                "xreach": await bridge.probe_xreach_version(),
             }
             await _send_http(writer, 200, "OK", health_payload)
             return

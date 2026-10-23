@@ -362,12 +362,15 @@ def _make_bridge(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> rb.Research
     dummy_emp.write_text("# dummy\n", encoding="utf-8")
     dummy_l30 = tmp_path / "last30days.py"
     dummy_l30.write_text("# dummy\n", encoding="utf-8")
+    dummy_xreach = tmp_path / "xreach"
+    dummy_xreach.write_text("#!/bin/sh\n", encoding="utf-8")
     monkeypatch.setenv("DALTON_OCW_PYTHON", str(dummy_py))
     monkeypatch.setenv("DALTON_XUEQIU_SCRIPT", str(dummy_xq))
     monkeypatch.setenv("DALTON_EMPLOYEE_PYTHON", str(dummy_py))
     monkeypatch.setenv("DALTON_EMPLOYEE_CLI_SCRIPT", str(dummy_emp))
     monkeypatch.setenv("DALTON_LAST30DAYS_PYTHON", str(dummy_py))
     monkeypatch.setenv("DALTON_LAST30DAYS_SCRIPT", str(dummy_l30))
+    monkeypatch.setenv("DALTON_XREACH_BIN", str(dummy_xreach))
     cfg = rb.BridgeConfig()
     return rb.ResearchDataBridge(cfg)
 
@@ -1363,7 +1366,7 @@ async def test_bridge_accepts_header_token_rejects_bad_token_401_and_keeps_legac
 
 class TestCommunityExecutors:
     @pytest.mark.asyncio
-    async def test_handoff_only_releases_three_community_routes_and_keeps_others_filtered(
+    async def test_handoff_only_releases_four_community_routes_and_keeps_others_filtered(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         ds_file = tmp_path / "data_sources.json"
@@ -1374,8 +1377,8 @@ class TestCommunityExecutors:
                         {"id": "xueqiu", "kind": "skill"},
                         {"id": "employee", "kind": "skill"},
                         {"id": "last30days", "kind": "skill"},
-                        {"id": "agent-reach", "kind": "skill"},
                         {"id": "x-timeline", "kind": "skill"},
+                        {"id": "agent-reach", "kind": "skill"},
                         {"id": "web-news", "kind": "agent_tool"},
                         {"id": "web-page", "kind": "agent_tool"},
                         {"id": "filings", "kind": "agent_tool"},
@@ -1388,12 +1391,11 @@ class TestCommunityExecutors:
         bridge.cfg.data_sources_json = ds_file
 
         handoff = bridge.handoff_routes()
-        assert "xueqiu" not in handoff
-        assert "employee" not in handoff
-        assert "last30days" not in handoff
-        assert {"agent-reach", "x-timeline", "web-news", "web-page", "filings"} <= handoff
+        for released in ("xueqiu", "employee", "last30days", "x-timeline"):
+            assert released not in handoff
+        assert {"agent-reach", "web-news", "web-page", "filings"} <= handoff
 
-        for blocked in ("agent-reach", "x-timeline", "web-news", "web-page", "filings"):
+        for blocked in ("agent-reach", "web-news", "web-page", "filings"):
             resp = await bridge.handle_tools_call(
                 10,
                 {"name": "community", "arguments": {"route": blocked}},
@@ -1402,8 +1404,18 @@ class TestCommunityExecutors:
             assert body["ok"] is False
             assert body["status"] == "handoff_filtered"
 
+        # x-timeline is bridge-executed now: an invalid call is rejected as invalid_arguments,
+        # never as handoff_filtered.
+        resp_xtl = await bridge.handle_tools_call(
+            11,
+            {"name": "community", "arguments": {"route": "x-timeline", "operation": "auth"}},
+        )
+        body_xtl = json.loads(resp_xtl["result"]["content"][0]["text"])
+        assert body_xtl["ok"] is False
+        assert body_xtl["status"] == "invalid_arguments"
+
     @pytest.mark.asyncio
-    async def test_tools_list_and_catalog_expose_three_community_routes_and_schemas(
+    async def test_tools_list_and_catalog_expose_four_community_routes_and_schemas(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         bridge = _make_bridge(tmp_path, monkeypatch)
@@ -1482,12 +1494,15 @@ class TestCommunityExecutors:
         tools = await bridge.get_filtered_tools()
         comm_tool = next(t for t in tools if t["name"] == "community")
         enum_vals = comm_tool["inputSchema"]["properties"]["route"]["enum"]
-        assert enum_vals == ["xueqiu", "employee", "last30days"]
+        assert enum_vals == ["xueqiu", "employee", "last30days", "x-timeline"]
         assert "allow_paid" in comm_tool["inputSchema"]["properties"]
         assert "plan" in comm_tool["inputSchema"]["properties"]
+        assert "handle" in comm_tool["inputSchema"]["properties"]
+        assert "include_replies" in comm_tool["inputSchema"]["properties"]
         assert "xueqiu" in comm_tool["description"]
         assert "employee" in comm_tool["description"]
         assert "last30days" in comm_tool["description"]
+        assert "x-timeline" in comm_tool["description"]
 
         cat_resp = await bridge.handle_tools_call(20, {"name": "catalog", "arguments": {}})
         cat_body = json.loads(cat_resp["result"]["content"][0]["text"])
@@ -1499,6 +1514,11 @@ class TestCommunityExecutors:
         assert "allow_paid" in by_id["employee"]["parameters"]
         assert by_id["last30days"]["operations"] == ["search"]
         assert "plan" in by_id["last30days"]["parameters"]
+        assert by_id["x-timeline"]["operations"] == ["tweets", "tweet", "thread", "search"]
+        assert "handle" in by_id["x-timeline"]["parameters"]
+        xtl_rules = " ".join(by_id["x-timeline"]["rules"])
+        assert "x_search" in xtl_rules
+        assert "去重" in xtl_rules
 
     @pytest.mark.asyncio
     async def test_parameter_whitelist_and_injection_rejection(
