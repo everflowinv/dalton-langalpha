@@ -17,7 +17,7 @@ export interface TeamCredentialsStatus {
   can_disconnect: boolean;
 }
 
-export function useTeamCredentials(): { isShared: boolean; canDisconnect: boolean } {
+export function useTeamCredentials(): { isShared: boolean; canDisconnect: boolean; isPm: boolean } {
   const { userId } = useAuth();
 
   const { data, isError } = useQuery<TeamCredentialsStatus>({
@@ -33,10 +33,12 @@ export function useTeamCredentials(): { isShared: boolean; canDisconnect: boolea
   });
 
   if (!isDaltonAuth) {
-    return { isShared: false, canDisconnect: true };
+    // OSS local mode: the local dev user is the default PM.
+    return { isShared: false, canDisconnect: true, isPm: true };
   }
   return {
     isShared: Boolean(data?.enabled),
     canDisconnect: !isError && Boolean(data?.can_disconnect),
+    isPm: !isError && Boolean(data?.is_pm),
   };
 }

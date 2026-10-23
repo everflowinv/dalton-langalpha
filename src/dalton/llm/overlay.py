@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from src.dalton.llm.native_catalog import NATIVE_SYNC_OVERLAY_PATH
 from src.dalton.llm.openclaw_catalog import OVERLAY_PATH
 from src.dalton.settings import is_broker_models_enabled
 
@@ -17,8 +18,11 @@ logger = logging.getLogger(__name__)
 
 NATIVE_OVERLAY_PATH = Path(__file__).resolve().parent / "native_overlay.json"
 
+# Merge order: checked-in native overlay → runtime native-sync overlay
+# (var/dalton/catalog, written by the settings-page card) → OpenClaw overlay.
 OVERLAY_SOURCES: list[tuple[str, Path]] = [
     ("native", NATIVE_OVERLAY_PATH),
+    ("native_sync", NATIVE_SYNC_OVERLAY_PATH),
     ("openclaw", OVERLAY_PATH),
 ]
 
@@ -39,7 +43,7 @@ def _stat_part(path: Path) -> str:
 
 
 def current_overlay_stamp(path: Path | None = None, *, force: bool = False) -> str | None:
-    """Return combined stamp `'native:<mtime>:<size>|openclaw:<mtime>:<size>'` (throttled to 1 stat / 2s)."""
+    """Return combined stamp `'native:<mtime>:<size>|native_sync:<…>|openclaw:<…>'` (throttled to 1 stat / 2s)."""
     global _LAST_STAT_AT, _LAST_STAMP
     if path is not None:
         part = _stat_part(path)
@@ -189,7 +193,7 @@ def apply_model_overlay(
     manifest: dict[str, Any],
     path: Path | None = None,
 ) -> str | None:
-    """Merge Dalton overlays (`native_overlay.json` then `openclaw_overlay.json`) into `llm_config` and `manifest`.
+    """Merge Dalton overlays (`native_overlay.json` → native-sync runtime overlay → `openclaw_overlay.json`) into `llm_config` and `manifest`.
 
     Never overwrites existing upstream model keys or provider_config groups; logs an error and skips on collision.
     """
@@ -215,15 +219,20 @@ def apply_model_overlay(
 
 
 def load_dalton_meta() -> dict[str, dict[str, Any]]:
-    """Return merged `dalton_meta` across `native_overlay.json` and `openclaw_overlay.json` (P0N.1)."""
+    """Return merged `dalton_meta` across `native_overlay.json`, the native-sync runtime overlay, and `openclaw_overlay.json` (P0N.1)."""
     meta: dict[str, dict[str, Any]] = {}
-    native = load_overlay_data(NATIVE_OVERLAY_PATH)
-    if isinstance(native, dict):
-        raw_meta = native.get("dalton_meta") or {}
+
+    def _merge_meta_block(source: dict[str, Any] | None) -> None:
+        if not isinstance(source, dict):
+            return
+        raw_meta = source.get("dalton_meta") or {}
         if isinstance(raw_meta, dict):
             for k, v in raw_meta.items():
                 if isinstance(v, dict):
                     meta[str(k)] = copy.deepcopy(v)
+
+    _merge_meta_block(load_overlay_data(NATIVE_OVERLAY_PATH))
+    _merge_meta_block(load_overlay_data(NATIVE_SYNC_OVERLAY_PATH))
 
     if is_broker_models_enabled():
         oc = load_overlay_data(OVERLAY_PATH)

@@ -1,11 +1,14 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { queryKeys } from '@/lib/queryKeys';
 import {
+  checkNativeModels,
   deleteDaltonTaskCap,
   fetchDaltonBudget,
   fetchDaltonBudgetToday,
+  fetchNativeModelsStatus,
   fetchOpenClawHealth,
   fetchOpenClawStatus,
+  syncNativeModels,
   syncOpenClawModels,
   updateDaltonBudget,
   upsertDaltonTaskCap,
@@ -34,6 +37,40 @@ export function useOpenClawSync() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (params: { dry_run: boolean; force?: boolean }) => syncOpenClawModels(params),
+    onSuccess: (res) => {
+      void queryClient.invalidateQueries({ queryKey: queryKeys.dalton.all });
+      if (res.applied) {
+        void queryClient.invalidateQueries({ queryKey: queryKeys.models.all });
+      }
+    },
+  });
+}
+
+// Native-subscription model sync: status is a plain read of the last stored
+// check — opening the settings page never triggers a provider fetch.
+export function useNativeModelsStatus(enabled = true) {
+  return useQuery({
+    queryKey: queryKeys.dalton.nativeModelsStatus(),
+    queryFn: fetchNativeModelsStatus,
+    enabled,
+    staleTime: 30_000,
+  });
+}
+
+export function useNativeModelsCheck() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: checkNativeModels,
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: queryKeys.dalton.nativeModelsStatus() });
+    },
+  });
+}
+
+export function useNativeModelsSync() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (params: { models: string[] }) => syncNativeModels(params),
     onSuccess: (res) => {
       void queryClient.invalidateQueries({ queryKey: queryKeys.dalton.all });
       if (res.applied) {

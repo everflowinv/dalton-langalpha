@@ -311,6 +311,107 @@ export async function syncOpenClawModels(params: {
   return data;
 }
 
+export interface NativeModelAddedItem {
+  provider: string;
+  upstream_id: string;
+  display_name: string;
+  suggested_key: string;
+  conflict: boolean;
+  conflict_reason?: string | null;
+  duplicate_display_name?: boolean;
+  context?: number | null;
+  max_output?: number | null;
+  supports_reasoning_effort?: boolean | null;
+  reasoning_efforts?: string[] | null;
+  reasoning_default?: string | null;
+  visibility?: string | null;
+}
+
+export interface NativeModelDeprecatedItem {
+  provider: string;
+  key: string;
+  model_id?: string | null;
+  display_name?: string | null;
+  in_use_by?: string[];
+}
+
+export interface NativeProviderListingRow {
+  provider: string;
+  display_name: string;
+  status: 'ok' | 'unsupported' | 'error' | 'never';
+  model_count: number;
+  message?: string | null;
+  error_kind?: string | null;
+}
+
+export interface NativeModelsRunRecord {
+  run_id: string;
+  started_by: string;
+  dry_run: boolean;
+  forced?: boolean;
+  status: 'running' | 'succeeded' | 'failed' | 'blocked' | 'interrupted';
+  started_at: string;
+  finished_at?: string | null;
+  counts?: Record<string, number> | null;
+  diff?: Record<string, unknown> | null;
+  warnings?: string[] | null;
+  error?: string | null;
+}
+
+export interface NativeModelsStatusResponse {
+  providers: NativeProviderListingRow[];
+  last_check?: NativeModelsRunRecord | null;
+  last_succeeded_check?: NativeModelsRunRecord | null;
+  last_sync?: NativeModelsRunRecord | null;
+  diff: {
+    added: NativeModelAddedItem[];
+    deprecated: NativeModelDeprecatedItem[];
+    unchanged: number;
+  };
+  overlay: {
+    exists: boolean;
+    generated_at?: string | null;
+    model_count: number;
+    path: string;
+  };
+}
+
+export interface NativeModelsCheckResponse {
+  run_id: string;
+  checked_at: string;
+  providers: NativeProviderListingRow[];
+  diff: {
+    added: NativeModelAddedItem[];
+    deprecated: NativeModelDeprecatedItem[];
+    unchanged: number;
+  };
+  counts: Record<string, number>;
+  warnings: string[];
+}
+
+export interface NativeModelsSyncResponse {
+  run_id: string;
+  applied: boolean;
+  added_keys: string[];
+  skipped_keys: string[];
+  synced_at: string;
+}
+
+export async function fetchNativeModelsStatus(): Promise<NativeModelsStatusResponse> {
+  const { data } = await api.get<NativeModelsStatusResponse>('/api/v1/dalton/native-models/status');
+  return data;
+}
+
+export async function checkNativeModels(): Promise<NativeModelsCheckResponse> {
+  const { data } = await api.post<NativeModelsCheckResponse>('/api/v1/dalton/native-models/check');
+  return data;
+}
+
+export async function syncNativeModels(params: { models: string[] }): Promise<NativeModelsSyncResponse> {
+  const { data } = await api.post<NativeModelsSyncResponse>('/api/v1/dalton/native-models/sync', params);
+  return data;
+}
+
 export async function fetchDaltonProvidersStatus(): Promise<DaltonProvidersStatusResponse> {
   const { data } = await api.get<DaltonProvidersStatusResponse>('/api/v1/dalton/providers/status');
   return data;

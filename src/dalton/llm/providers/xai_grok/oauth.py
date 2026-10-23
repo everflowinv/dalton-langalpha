@@ -879,8 +879,8 @@ async def fetch_xai_models(
                 continue
             item = {
                 "id": row.get("id"),
+                "name": row.get("name"),
                 "context_window": row.get("context_window"),
-                "max_completion_tokens": row.get("max_completion_tokens"),
                 "supports_reasoning_effort": bool(row.get("supports_reasoning_effort")),
                 "reasoning_efforts": list(row.get("reasoning_efforts") or []),
             }

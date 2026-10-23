@@ -19,6 +19,11 @@ from src.dalton.budget.service import (
     remove_scoped_task_cap,
     save_budget_settings,
 )
+from src.dalton.services.native_admin import (
+    get_native_status,
+    run_native_check,
+    run_native_sync,
+)
 from src.dalton.services.openclaw_admin import (
     get_openclaw_status,
     probe_health,
@@ -40,6 +45,10 @@ router = APIRouter(prefix="/api/v1/dalton", tags=["Dalton"])
 class OpenClawSyncRequest(BaseModel):
     dry_run: bool = False
     force: bool = False
+
+
+class NativeModelSyncRequest(BaseModel):
+    models: list[str] = Field(min_length=1)
 
 
 class ProviderProbeRequest(BaseModel):
@@ -123,6 +132,39 @@ async def get_openclaw_health_endpoint(
 ) -> dict[str, Any]:
     _require_dalton_enabled()
     return await probe_health(user_id=user_id)
+
+
+# ---------------------------------------------------------------------------
+# Native-subscription model sync (check → confirm → add-only runtime overlay)
+# ---------------------------------------------------------------------------
+
+
+@router.get("/native-models/status")
+@handle_api_exceptions("get native models status", logger)
+async def get_native_models_status_endpoint(
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    _require_dalton_enabled()
+    return await get_native_status()
+
+
+@router.post("/native-models/check")
+@handle_api_exceptions("check native provider models", logger)
+async def check_native_models_endpoint(
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    _require_pm_user(user_id)
+    return await run_native_check(user_id=user_id)
+
+
+@router.post("/native-models/sync")
+@handle_api_exceptions("sync native provider models", logger)
+async def sync_native_models_endpoint(
+    body: NativeModelSyncRequest,
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    _require_pm_user(user_id)
+    return await run_native_sync(user_id=user_id, model_keys=body.models)
 
 
 # ---------------------------------------------------------------------------
