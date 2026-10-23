@@ -13,7 +13,10 @@ services:
         BUILD_GIT_SHA: ${BUILD_GIT_SHA:-}
         BUILD_GIT_DIRTY: ${BUILD_GIT_DIRTY:-}
     entrypoint: ["/usr/bin/tini", "-s", "--", "/app/scripts/dalton/docker_entrypoint_dalton.sh"]
-    command: ["uv", "run", "python", "server.py", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    # No --reload: src is bind-mounted, so with it a git pull on the deploy checkout restarts
+    # the backend and cancels every running turn. Code changes are applied by an explicit
+    # `docker restart dalton-langalpha-backend-1` once no turn is in progress.
+    command: ["uv", "run", "python", "server.py", "--host", "0.0.0.0", "--port", "8000"]
     mem_limit: 2g
     # Chromium (scrapling's browser tier) crashes pages ("Page crashed", then a dead
     # driver pipe) with Docker's default 64 MB /dev/shm, which hung the whole backend.

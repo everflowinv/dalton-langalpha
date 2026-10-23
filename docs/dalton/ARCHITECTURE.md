@@ -222,7 +222,7 @@ Docker（colima，数据盘在 EveSSD）
 - **基线**：
   - `scripts/dalton/pr_baseline.sh --pr N --baseline-only` 依次运行：钩子审计、Python 单测、broker 的 Node 测试、Web 类型检查和 vitest，以及 PR 描述核查（描述里用反引号标注的路径和标识符必须在仓库里存在）；
   - 结果会作为评论发到 PR 上。
-- **多 worker**：代码必须兼容多 worker 部署（当前 Dalton 的 compose 是单 worker、带 reload）。请求路径上不能有进程内的全局状态；状态以 Postgres 为准，Redis 只做协调。
+- **多 worker**：代码必须兼容多 worker 部署（当前 Dalton 的 compose 是单 worker，不带 reload：更新代码后要显式重启后端）。请求路径上不能有进程内的全局状态；状态以 Postgres 为准，Redis 只做协调。
 - **测试替身**：只用 `create_autospec`，或者 `patch(..., autospec=True)`。
 - **开发流程**：
   - 由 agy（或 GLM）在独立克隆里开发，grok 和 codex 分别独立审查，lead 汇总意见并负责合并、部署；
