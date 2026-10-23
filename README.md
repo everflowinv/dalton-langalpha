@@ -53,15 +53,16 @@ Dalton 和普通的 AI 问答有三点不同：
 <!-- DALTON-HOOK(docs-readme) -->
 ### 2. 连接 AI 模型（第一次使用，或者页面提示"请重新连接"时）
 
-进入 **设置 → 模型**，可以看到各个模型账号的状态。大多数模型走团队的**订阅账号**，不按次收费：
+进入 **设置 → 模型**，可以看到各个模型账号的状态。系统接入了下面这些模型，都走团队的**订阅账号**，不按次收费：
 
-| 账号 | 用途 |
-|---|---|
-| OpenAI GPT（ChatGPT 会员订阅，系统里叫 Codex） | 主分析师的默认模型 |
-| Claude、Google Gemini（订阅） | 后台任务、审稿等 |
-| xAI Grok（SuperGrok 订阅） | 备选（子代理和取证默认使用的 Grok 由管理员通过 OpenClaw 接入，不需要你连接） |
-| Meta Muse（订阅） | 备选 |
-| 智谱 GLM（Coding Plan 订阅） | 备选 |
+- Anthropic Claude（订阅）
+- OpenAI GPT（ChatGPT 会员订阅，系统里叫 Codex）
+- Google Gemini（订阅）
+- xAI Grok（SuperGrok 订阅）
+- Meta Muse（订阅）
+- 智谱 GLM（Coding Plan 订阅）
+
+另外还可以经 OpenClaw 使用更多模型（名字以 `ocb-` 开头），以及按量计费的 DeepSeek 等。
 
 看到"请重新连接"，点对应的连接按钮，按页面提示完成：多数是在弹出的网页里用该账号登录并确认授权（和"用微信或 Google 账号登录某个网站"是一回事），有的需要输入页面上显示的验证码。**PM 连一次，全队共用**，同事不需要各自连接。
 

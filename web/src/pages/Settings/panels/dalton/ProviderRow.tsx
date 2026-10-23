@@ -188,7 +188,7 @@ export function ProviderRow({ item }: { item: DaltonProviderStatusItem }) {
                   去连接 OAuth
                 </a>
               ) : item.provider === 'xai' ? (
-                '直连未启用：Grok 目前经 OpenClaw 代理使用（ocb-xai-*）'
+                '未配置 xAI API key；Grok 请用 SuperGrok 订阅接入'
               ) : item.provider === 'z-ai-cn-coding' || item.access_type === 'coding_plan' ? (
                 `在 .env 配置 ${item.credential?.env_key ?? 'ZAI_CN_CODING_API_KEY'} 后重建后端`
               ) : (

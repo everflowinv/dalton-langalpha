@@ -4,16 +4,18 @@
 # Applied over agent_config.yaml when APP_ENV=dalton.
 
 llm:
-  # Defaults for anyone without a saved model preference: the owner's own choices. Model
-  # credentials are team-shared (credentials.sharing: team, #66), so the owner's *-oauth
-  # connections serve every member; the OpenClaw broker model is the fallback if they lapse.
-  name: "gpt-6-astra-oauth"
+  # Defaults for anyone without a saved model preference: the owner's own choices, fallback
+  # chain included. Model credentials are team-shared (credentials.sharing: team, #66), so
+  # the owner's *-oauth connections serve every member.
+  name: "claude-opus-5-5-oauth"
   background: "gemini-4-argon-low-oauth"
   assist: "ocb-google-gemini-3.8-flash"
   compaction: ""
   fetch: ""
   fallback:
-    - "ocb-google-gemini-4-argon"
+    - "gemini-4-argon-high-oauth"
+    - "muse-wonder-1.0-oauth"
+    - "gpt-6.1-sol-oauth"
 
 sandbox:
   provider: "docker"
@@ -34,11 +36,11 @@ mcp:
 subagents:
   definitions:
     research:
-      model: "ocb-xai-grok-4.7"
+      model: "grok-4.7-oauth"
     data-prep:
-      model: "ocb-xai-grok-4.7"
+      model: "grok-4.7-oauth"
     general-purpose:
-      model: "ocb-xai-grok-4.7"
+      model: "grok-4.7-oauth"
 
 search_api: "openclaw"
 

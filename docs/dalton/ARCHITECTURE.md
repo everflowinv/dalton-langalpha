@@ -53,18 +53,7 @@ Docker（colima，数据盘在 EveSSD）
   | Chief of Staff | `dalton_coverage_board`、`dalton_record_plan`、`dalton_agenda_note`、`dalton_schedule_automation`、`conversation_search`，以及上游的 `delegate_to_analyst` |
   | 公司分析师 | `knowledge_update`、`knowledge_append_verdict`、`check_draft`、`publish_report`、`dalton_schedule_automation`、`conversation_search` |
 
-- **默认模型**由 `agent_config.dalton.yaml` 和 `src/dalton/dalton.yaml` 决定：
-
-  | 用途 | 模型 |
-  |---|---|
-  | 主模型 | `gpt-6-astra-oauth` |
-  | 后台 | `gemini-4-argon-low-oauth` |
-  | assist | `ocb-google-gemini-3.8-flash` |
-  | 子代理 research / data-prep / general-purpose | `ocb-xai-grok-4.7` |
-  | Dalton 子代理 `dalton-evidence` | `ocb-xai-grok-4.7` |
-  | Dalton 子代理 `dalton-reviewer` | `gpt-6.1-sol-oauth` |
-
-  assist 的模型在 `agent_config.dalton.yaml` 和 `dalton.yaml` 里各配了一个，前者优先，见 `src/dalton/llm/assist.py`。
+- **各角色用哪个模型**：在 `agent_config.dalton.yaml`、`src/dalton/dalton.yaml` 和代理定义（`plugins/dalton/agents/*.md`）里配置，接入了哪些模型见第 8 节。
 - **Skill**：共 22 个，在 `plugins/dalton/skills/`，通过 `dalton_registry.py` 合并进上游 registry。有斜杠命令的会出现在输入框的 `/` 菜单里。
 - **Workflow**：共 6 个，在 `workflows/<name>/workflow.js`：initial-coverage、full-coverage、bullbear-doc、earnings-deep-update、weekly-coverage-review、topic-research。它们没有自己的斜杠命令，由对应的 skill 通过 `RunWorkflow` 启动。
 
