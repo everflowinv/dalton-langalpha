@@ -849,6 +849,54 @@ def _declare_employee(
     return out[:MAX_SOURCES_PER_CALL]
 
 
+def _declare_x_timeline(
+    arguments: dict[str, Any],
+    payload: dict[str, Any],
+    inner: dict[str, Any],
+    fallback_as_of: str,
+) -> list[dict[str, Any]]:
+    raw_data = payload.get("data")
+    items: list[dict[str, Any]] = []
+    if isinstance(raw_data, dict) and isinstance(raw_data.get("items"), list):
+        items = [x for x in raw_data["items"] if isinstance(x, dict)]
+    elif isinstance(inner.get("items"), list):
+        items = [x for x in inner["items"] if isinstance(x, dict)]
+
+    out: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for item in items:
+        status_id = str(item.get("id") or "").strip()
+        if not status_id or status_id in seen_ids:
+            continue
+        seen_ids.add(status_id)
+        handle = str(item.get("author_handle") or "").strip().lstrip("@") or "unknown"
+        iso_date = str(item.get("created_at") or "").strip()
+        as_of = iso_date[:10] if len(iso_date) >= 10 and iso_date[:4].isdigit() else fallback_as_of
+        url = str(item.get("url") or "").strip() or f"https://x.com/{handle}/status/{status_id}"
+        title = str(item.get("text") or f"X post {status_id}").strip()
+        entry = _make_entry(
+            document_id=f"x-timeline:{status_id}",
+            route="x-timeline",
+            identity="news",
+            publisher="X",
+            title=title,
+            as_of=as_of,
+            as_of_basis="publish_time",
+            source_type="community_post",
+            url=url,
+            private=False,
+            independent=True,
+        )
+        entry["platform"] = "x"
+        entry["url"] = _trunc(url, MAX_URL_LEN)
+        entry["date"] = _trunc(iso_date or as_of, 64)
+        entry["author"] = _trunc(f"@{handle}", 120)
+        out.append(entry)
+        if len(out) >= MAX_SOURCES_PER_CALL:
+            break
+    return out[:MAX_SOURCES_PER_CALL]
+
+
 def _declare_last30days(
     arguments: dict[str, Any],
     payload: dict[str, Any],
@@ -977,5 +1025,7 @@ def declare(tool: str, arguments: dict[str, Any] | None, payload: dict[str, Any]
         return _declare_employee(args, payload, inner, fallback_as_of)
     if route == "last30days":
         return _declare_last30days(args, payload, inner, fallback_as_of)
+    if route == "x-timeline":
+        return _declare_x_timeline(args, payload, inner, fallback_as_of)
 
     return []

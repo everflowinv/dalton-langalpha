@@ -1,0 +1,459 @@
+{
+  "items": [
+    {
+      "id": "2112920354230296993",
+      "text": "Demand for compute is extraordinary. NVIDIA and our partners are building new capacity to meet it.\n\nWe’re working with Amkor, IBIDEN, KYEC, Samsung Mechanics, SPIL, and Unimicron to expand our supply around the world, from essential components to advanced packaging and testing.\n\nTogether, we’re building the capacity to put more NVIDIA infrastructure in the hands of businesses and developers.\n\nRead more: https://t.co/RNW2K98YiR",
+      "createdAt": "Wed Oct 21 14:54:03 +0000 2026",
+      "user": {
+        "id": "VXNlcjo2MTU1OTQzOQ==",
+        "restId": "61559439",
+        "name": "NVIDIA",
+        "screenName": "nvidia",
+        "profileImageUrl": "https://pbs.twimg.com/profile_images/1828904711124078593/SRvCZSfQ_normal.jpg",
+        "verified": false,
+        "isBlueVerified": true
+      },
+      "replyCount": 68,
+      "retweetCount": 59,
+      "likeCount": 434,
+      "quoteCount": 11,
+      "viewCount": 58212,
+      "bookmarkCount": 22,
+      "isRetweet": false,
+      "isQuote": false,
+      "isReply": false,
+      "conversationId": "2112920354230296993",
+      "lang": "en",
+      "media": [
+        {
+          "type": "photo",
+          "url": "https://pbs.twimg.com/media/HVKZ2_gWEAARj_t.jpg",
+          "width": 1920,
+          "height": 1080
+        }
+      ]
+    },
+    {
+      "id": "2112880434698973547",
+      "text": "RT @NVIDIAGTC: Your full Berlin keynote recap, Eurovision style. 🎤 https://t.co/97nJbHleB0",
+      "createdAt": "Wed Oct 21 12:15:25 +0000 2026",
+      "user": {
+        "id": "VXNlcjo2MTU1OTQzOQ==",
+        "restId": "61559439",
+        "name": "NVIDIA",
+        "screenName": "nvidia",
+        "profileImageUrl": "https://pbs.twimg.com/profile_images/1828904711124078593/SRvCZSfQ_normal.jpg",
+        "verified": false,
+        "isBlueVerified": true
+      },
+      "replyCount": 0,
+      "retweetCount": 37,
+      "likeCount": 0,
+      "quoteCount": 0,
+      "viewCount": 10350,
+      "bookmarkCount": 0,
+      "isRetweet": true,
+      "isQuote": false,
+      "isReply": false,
+      "conversationId": "2112880434698973547",
+      "lang": "en",
+      "media": [
+        {
+          "type": "video",
+          "url": "https://pbs.twimg.com/amplify_video_thumb/2112864563674636288/img/Vyc5yOGlTU3uDVbe.jpg",
+          "width": 3840,
+          "height": 2160
+        }
+      ]
+    },
+    {
+      "id": "2112856792342331528",
+      "text": "RT @nvidianewsroom: At #NVIDIAGTC Berlin, European mobility leaders showcased how NVIDIA Hyperion supports safe 4 autonomous driving and fu…",
+      "createdAt": "Wed Oct 21 10:41:28 +0000 2026",
+      "user": {
+        "id": "VXNlcjo2MTU1OTQzOQ==",
+        "restId": "61559439",
+        "name": "NVIDIA",
+        "screenName": "nvidia",
+        "profileImageUrl": "https://pbs.twimg.com/profile_images/1828904711124078593/SRvCZSfQ_normal.jpg",
+        "verified": false,
+        "isBlueVerified": true
+      },
+      "replyCount": 0,
+      "retweetCount": 13,
+      "likeCount": 0,
+      "quoteCount": 0,
+      "viewCount": 9981,
+      "bookmarkCount": 0,
+      "isRetweet": true,
+      "isQuote": false,
+      "isReply": false,
+      "conversationId": "2112856792342331528",
+      "lang": "en",
+      "media": []
+    },
+    {
+      "id": "2112856769567371772",
+      "text": "RT @nvidianewsroom: NVIDIA announces new Isaac tools for agents to help developers train, test and deploy robots as Agile Robots unveils Ag…",
+      "createdAt": "Wed Oct 21 10:41:23 +0000 2026",
+      "user": {
+        "id": "VXNlcjo2MTU1OTQzOQ==",
+        "restId": "61559439",
+        "name": "NVIDIA",
+        "screenName": "nvidia",
+        "profileImageUrl": "https://pbs.twimg.com/profile_images/1828904711124078593/SRvCZSfQ_normal.jpg",
+        "verified": false,
+        "isBlueVerified": true
+      },
+      "replyCount": 0,
+      "retweetCount": 7,
+      "likeCount": 0,
+      "quoteCount": 0,
+      "viewCount": 8388,
+      "bookmarkCount": 0,
+      "isRetweet": true,
+      "isQuote": false,
+      "isReply": false,
+      "conversationId": "2112856769567371772",
+      "lang": "en",
+      "media": []
+    },
+    {
+      "id": "2112856720741740719",
+      "text": "Even Microducks need a nap. 😴 https://t.co/mAdJeqacl8",
+      "createdAt": "Wed Oct 21 10:41:11 +0000 2026",
+      "user": {
+        "id": "VXNlcjo2MTU1OTQzOQ==",
+        "restId": "61559439",
+        "name": "NVIDIA",
+        "screenName": "nvidia",
+        "profileImageUrl": "https://pbs.twimg.com/profile_images/1828904711124078593/SRvCZSfQ_normal.jpg",
+        "verified": false,
+        "isBlueVerified": true
+      },
+      "replyCount": 139,
+      "retweetCount": 361,
+      "likeCount": 3632,
+      "quoteCount": 110,
+      "viewCount": 502193,
+      "bookmarkCount": 491,
+      "isRetweet": false,
+      "isQuote": false,
+      "isReply": false,
+      "conversationId": "2112856720741740719",
+      "lang": "en",
+      "media": [
+        {
+          "type": "video",
+          "url": "https://pbs.twimg.com/amplify_video_thumb/2112855833302167552/img/X7kV5ZQfQwbzJyJa.jpg",
+          "width": 3840,
+          "height": 2160
+        }
+      ]
+    },
+    {
+      "id": "2112854401207439553",
+      "text": "1 petaflop. https://t.co/ktgMjinqxF",
+      "createdAt": "Wed Oct 21 10:31:58 +0000 2026",
+      "user": {
+        "id": "VXNlcjo2MTU1OTQzOQ==",
+        "restId": "61559439",
+        "name": "NVIDIA",
+        "screenName": "nvidia",
+        "profileImageUrl": "https://pbs.twimg.com/profile_images/1828904711124078593/SRvCZSfQ_normal.jpg",
+        "verified": false,
+        "isBlueVerified": true
+      },
+      "replyCount": 328,
+      "retweetCount": 778,
+      "likeCount": 15306,
+      "quoteCount": 222,
+      "viewCount": 1841399,
+      "bookmarkCount": 2054,
+      "isRetweet": false,
+      "isQuote": false,
+      "isReply": false,
+      "conversationId": "2112854401207439553",
+      "lang": "cy",
+      "media": [
+        {
+          "type": "video",
+          "url": "https://pbs.twimg.com/amplify_video_thumb/2112854269455962112/img/wz29yyDYb3fY3Q-9.jpg",
+          "width": 3840,
+          "height": 2160
+        }
+      ]
+    },
+    {
+      "id": "2112850890642383262",
+      "text": "This is the magic behind the agents. https://t.co/20DoFjIkTa",
+      "createdAt": "Wed Oct 21 10:18:01 +0000 2026",
+      "user": {
+        "id": "VXNlcjo2MTU1OTQzOQ==",
+        "restId": "61559439",
+        "name": "NVIDIA",
+        "screenName": "nvidia",
+        "profileImageUrl": "https://pbs.twimg.com/profile_images/1828904711124078593/SRvCZSfQ_normal.jpg",
+        "verified": false,
+        "isBlueVerified": true
+      },
+      "replyCount": 24,
+      "retweetCount": 67,
+      "likeCount": 770,
+      "quoteCount": 9,
+      "viewCount": 86197,
+      "bookmarkCount": 106,
+      "isRetweet": false,
+      "isQuote": false,
+      "isReply": false,
+      "conversationId": "2112850890642383262",
+      "lang": "en",
+      "media": [
+        {
+          "type": "video",
+          "url": "https://pbs.twimg.com/amplify_video_thumb/2112850745636663297/img/47v3ljPksG-IZfaI.jpg",
+          "width": 3840,
+          "height": 2160
+        }
+      ]
+    },
+    {
+      "id": "2112850863513563379",
+      "text": "RT @nvidianewsroom: Leading telecom operators are adding NVIDIA computing across data centers and cell sites to bring AI services closer to…",
+      "createdAt": "Wed Oct 21 10:17:55 +0000 2026",
+      "user": {
+        "id": "VXNlcjo2MTU1OTQzOQ==",
+        "restId": "61559439",
+        "name": "NVIDIA",
+        "screenName": "nvidia",
+        "profileImageUrl": "https://pbs.twimg.com/profile_images/1828904711124078593/SRvCZSfQ_normal.jpg",
+        "verified": false,
+        "isBlueVerified": true
+      },
+      "replyCount": 0,
+      "retweetCount": 13,
+      "likeCount": 0,
+      "quoteCount": 0,
+      "viewCount": 8386,
+      "bookmarkCount": 0,
+      "isRetweet": true,
+      "isQuote": false,
+      "isReply": false,
+      "conversationId": "2112850863513563379",
+      "lang": "en",
+      "media": []
+    },
+    {
+      "id": "2112850838041354529",
+      "text": "RT @nvidianewsroom: NVIDIA introduces the OpenShell Reference Architecture to help businesses run AI agents under control.\n\nThe open design…",
+      "createdAt": "Wed Oct 21 10:17:49 +0000 2026",
+      "user": {
+        "id": "VXNlcjo2MTU1OTQzOQ==",
+        "restId": "61559439",
+        "name": "NVIDIA",
+        "screenName": "nvidia",
+        "profileImageUrl": "https://pbs.twimg.com/profile_images/1828904711124078593/SRvCZSfQ_normal.jpg",
+        "verified": false,
+        "isBlueVerified": true
+      },
+      "replyCount": 0,
+      "retweetCount": 25,
+      "likeCount": 0,
+      "quoteCount": 0,
+      "viewCount": 8538,
+      "bookmarkCount": 0,
+      "isRetweet": true,
+      "isQuote": false,
+      "isReply": false,
+      "conversationId": "2112850838041354529",
+      "lang": "en",
+      "media": []
+    },
+    {
+      "id": "2112850606545334359",
+      "text": "https://t.co/s8zoL1CAdh",
+      "createdAt": "Wed Oct 21 10:16:54 +0000 2026",
+      "user": {
+        "id": "VXNlcjo2MTU1OTQzOQ==",
+        "restId": "61559439",
+        "name": "NVIDIA",
+        "screenName": "nvidia",
+        "profileImageUrl": "https://pbs.twimg.com/profile_images/1828904711124078593/SRvCZSfQ_normal.jpg",
+        "verified": false,
+        "isBlueVerified": true
+      },
+      "replyCount": 51,
+      "retweetCount": 149,
+      "likeCount": 1667,
+      "quoteCount": 29,
+      "viewCount": 69316,
+      "bookmarkCount": 108,
+      "isRetweet": false,
+      "isQuote": false,
+      "isReply": false,
+      "conversationId": "2112850606545334359",
+      "lang": "zxx",
+      "media": [
+        {
+          "type": "video",
+          "url": "https://pbs.twimg.com/amplify_video_thumb/2112850589553926144/img/lfx4wz8R-6GZ9zOc.jpg",
+          "width": 1080,
+          "height": 1080
+        }
+      ]
+    },
+    {
+      "id": "2112847277282721888",
+      "text": "Jensen introduces the OpenShell Reference Architecture to help businesses set boundaries for AI agents and stop them when they step outside those boundaries.\n\nSecuring agents around the world. 🔒 https://t.co/5FaiFJTE8g",
+      "createdAt": "Wed Oct 21 10:03:40 +0000 2026",
+      "user": {
+        "id": "VXNlcjo2MTU1OTQzOQ==",
+        "restId": "61559439",
+        "name": "NVIDIA",
+        "screenName": "nvidia",
+        "profileImageUrl": "https://pbs.twimg.com/profile_images/1828904711124078593/SRvCZSfQ_normal.jpg",
+        "verified": false,
+        "isBlueVerified": true
+      },
+      "replyCount": 120,
+      "retweetCount": 100,
+      "likeCount": 883,
+      "quoteCount": 66,
+      "viewCount": 149322,
+      "bookmarkCount": 127,
+      "isRetweet": false,
+      "isQuote": false,
+      "isReply": false,
+      "conversationId": "2112847277282721888",
+      "lang": "en",
+      "media": [
+        {
+          "type": "video",
+          "url": "https://pbs.twimg.com/amplify_video_thumb/2112847115508412416/img/FarKxRi0vL150Mo-.jpg",
+          "width": 3840,
+          "height": 2160
+        }
+      ]
+    },
+    {
+      "id": "2112845981964243431",
+      "text": "RT @NVIDIAAI: 📈📈📈 https://t.co/yrZAi2L5ue",
+      "createdAt": "Wed Oct 21 09:58:31 +0000 2026",
+      "user": {
+        "id": "VXNlcjo2MTU1OTQzOQ==",
+        "restId": "61559439",
+        "name": "NVIDIA",
+        "screenName": "nvidia",
+        "profileImageUrl": "https://pbs.twimg.com/profile_images/1828904711124078593/SRvCZSfQ_normal.jpg",
+        "verified": false,
+        "isBlueVerified": true
+      },
+      "replyCount": 0,
+      "retweetCount": 23,
+      "likeCount": 0,
+      "quoteCount": 0,
+      "viewCount": 9164,
+      "bookmarkCount": 0,
+      "isRetweet": true,
+      "isQuote": false,
+      "isReply": false,
+      "conversationId": "2112845981964243431",
+      "lang": "qme",
+      "media": [
+        {
+          "type": "photo",
+          "url": "https://pbs.twimg.com/media/HVJWIMkWkAAPW9H.jpg",
+          "width": 1638,
+          "height": 2048
+        }
+      ]
+    },
+    {
+      "id": "2112843934137499740",
+      "text": "RT @nvidianewsroom: AI factory deployment at a prepared site: from six months down to 14 days. \n\nNVIDIA DSX POD brings Vera Rubin AI factor…",
+      "createdAt": "Wed Oct 21 09:50:23 +0000 2026",
+      "user": {
+        "id": "VXNlcjo2MTU1OTQzOQ==",
+        "restId": "61559439",
+        "name": "NVIDIA",
+        "screenName": "nvidia",
+        "profileImageUrl": "https://pbs.twimg.com/profile_images/1828904711124078593/SRvCZSfQ_normal.jpg",
+        "verified": false,
+        "isBlueVerified": true
+      },
+      "replyCount": 0,
+      "retweetCount": 33,
+      "likeCount": 0,
+      "quoteCount": 0,
+      "viewCount": 9725,
+      "bookmarkCount": 0,
+      "isRetweet": true,
+      "isQuote": false,
+      "isReply": false,
+      "conversationId": "2112843934137499740",
+      "lang": "en",
+      "media": []
+    },
+    {
+      "id": "2112843914080084377",
+      "text": "RT @nvidianewsroom: Europe’s AI infrastructure leaders are adopting NVIDIA DSX to deliver the same AI output with less power and reduce wat…",
+      "createdAt": "Wed Oct 21 09:50:18 +0000 2026",
+      "user": {
+        "id": "VXNlcjo2MTU1OTQzOQ==",
+        "restId": "61559439",
+        "name": "NVIDIA",
+        "screenName": "nvidia",
+        "profileImageUrl": "https://pbs.twimg.com/profile_images/1828904711124078593/SRvCZSfQ_normal.jpg",
+        "verified": false,
+        "isBlueVerified": true
+      },
+      "replyCount": 0,
+      "retweetCount": 17,
+      "likeCount": 0,
+      "quoteCount": 0,
+      "viewCount": 8699,
+      "bookmarkCount": 0,
+      "isRetweet": true,
+      "isQuote": false,
+      "isReply": false,
+      "conversationId": "2112843914080084377",
+      "lang": "en",
+      "media": []
+    },
+    {
+      "id": "2112843581287231650",
+      "text": "Doing what was previously unimaginable 🚀 https://t.co/glpQ1RbtXt",
+      "createdAt": "Wed Oct 21 09:48:59 +0000 2026",
+      "user": {
+        "id": "VXNlcjo2MTU1OTQzOQ==",
+        "restId": "61559439",
+        "name": "NVIDIA",
+        "screenName": "nvidia",
+        "profileImageUrl": "https://pbs.twimg.com/profile_images/1828904711124078593/SRvCZSfQ_normal.jpg",
+        "verified": false,
+        "isBlueVerified": true
+      },
+      "replyCount": 67,
+      "retweetCount": 232,
+      "likeCount": 3464,
+      "quoteCount": 32,
+      "viewCount": 157787,
+      "bookmarkCount": 302,
+      "isRetweet": false,
+      "isQuote": false,
+      "isReply": false,
+      "conversationId": "2112843581287231650",
+      "lang": "en",
+      "media": [
+        {
+          "type": "video",
+          "url": "https://pbs.twimg.com/amplify_video_thumb/2112843085403099136/img/IGsh-H3rd_Z9uBks.jpg",
+          "width": 3840,
+          "height": 2160
+        }
+      ]
+    }
+  ],
+  "cursor": "DAAHCgABHVTcQ_K__-4LAAIAAAATMjExMjg0MzU4MTI4NzIzMTY1MAgAAwAAAAIAAA",
+  "hasMore": true
+}
