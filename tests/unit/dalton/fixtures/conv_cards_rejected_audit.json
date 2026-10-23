@@ -1,0 +1,992 @@
+[
+  {
+    "index": 1,
+    "card_id": "cc_07dbe737b0545642007d00a6",
+    "type": "opinion",
+    "tickers": [],
+    "claim": "在十年期美债收益率破5%及加息前夕的宏观逆风下，半导体板块剧烈分化：多头认为市场过度解读了“放缓AI步伐”传闻，黄仁勋获川普致电背书算力基建是重要反转信号，当前半导体与存储杀跌提供了极佳盈亏比。",
+    "figures": [
+      {
+        "unit": "percent",
+        "value": 5,
+        "metric": "10Y US Treasury Yield",
+        "period": "2026-09-15"
+      }
+    ],
+    "quote": "虽然动量盘短期由硬件轮动至网络安全SaaS，但核心多头形成明确逆向共识：认为市场过度解读了“放缓AI步伐”传闻，黄仁勋在演讲现场获川普致电背书算力基建是重要反转信号，当前半导体与存储杀跌提供了极佳盈亏比",
+    "cited_sources": [],
+    "prev_unsupported_claim_numbers": [
+      "5"
+    ],
+    "grok_verdict": "correct_reject",
+    "codex_verdict": "correct_reject",
+    "consensus": "both_correct_reject"
+  },
+  {
+    "index": 2,
+    "card_id": "cc_61f1a56e1b7639e9f11a4965",
+    "type": "opinion",
+    "tickers": [],
+    "claim": "Eve认为测算OpenAI算力合同承载力和融资需求应用净额（比市场此前预期低27%-29%）；换成净额口径对比，OpenAI 9月底约500亿美元，而Anthropic 7月总额650亿美元（按一半收入经云厂商、费率16%估算净额约600亿美元），OpenAI仍然落后于Anthropic。",
+    "figures": [
+      {
+        "unit": "USD_bn",
+        "value": 50,
+        "metric": "arr_net",
+        "period": "2026-09"
+      },
+      {
+        "unit": "USD_bn",
+        "value": 65,
+        "metric": "anthropic_arr_gross",
+        "period": "2026-07"
+      },
+      {
+        "unit": "USD_bn",
+        "value": 60,
+        "metric": "anthropic_arr_net_est",
+        "period": "2026-07"
+      }
+    ],
+    "quote": "换成净额比：OpenAI 9 月底约 500 亿；Anthropic 7 月总额 650 亿，按路透说的\"一半收入经云厂商、费率 16%\"估，净额约 600 亿。所以 OpenAI 仍然落后，而且落后得比市场以为的多。",
+    "cited_sources": [],
+    "prev_unsupported_claim_numbers": [
+      "27",
+      "29"
+    ],
+    "grok_verdict": "correct_reject",
+    "codex_verdict": "correct_reject",
+    "consensus": "both_correct_reject"
+  },
+  {
+    "index": 3,
+    "card_id": "cc_4f0f08d9c1d7a81ec4bb84b3",
+    "type": "fact",
+    "tickers": [],
+    "claim": "MarketAxess 2026年Q2收入为2.184亿美元，EPS为1.93美元；组合交易日均交易量（ADV）创纪录达20亿美元（同比增长33%），美国信用组合交易份额升至20.6%（上年为17.5%），服务收入创纪录达3150万美元（同比增长14%）。",
+    "figures": [
+      {
+        "unit": "USD_m",
+        "value": 218.4,
+        "metric": "revenue",
+        "period": "Q2 2026"
+      },
+      {
+        "unit": "USD",
+        "value": 1.93,
+        "metric": "EPS",
+        "period": "Q2 2026"
+      },
+      {
+        "unit": "USD_bn",
+        "value": 2.0,
+        "metric": "portfolio_trading_ADV",
+        "period": "Q2 2026"
+      },
+      {
+        "unit": "percent",
+        "value": 33,
+        "metric": "portfolio_trading_ADV_yoy",
+        "period": "Q2 2026"
+      },
+      {
+        "unit": "percent",
+        "value": 20.6,
+        "metric": "us_credit_pt_market_share",
+        "period": "Q2 2026"
+      },
+      {
+        "unit": "percent",
+        "value": 14.9,
+        "metric": "us_hy_market_share",
+        "period": "Q2 2026"
+      },
+      {
+        "unit": "USD_m",
+        "value": 31.5,
+        "metric": "services_revenue",
+        "period": "Q2 2026"
+      },
+      {
+        "unit": "percent",
+        "value": 14,
+        "metric": "services_revenue_yoy",
+        "period": "Q2 2026"
+      }
+    ],
+    "quote": "Q2 26（8/7 发布）：收入 $218.4M，EPS $1.93；**组合交易 ADV 创纪录 $2.0B（+33%）**，其中美 HG PT $1.2B（+41%）、美 HY PT +93%、市政债 PT +154%；美国信用组合交易份额 20.6%（上年 17.5%），美 HY 份额 14.9%（+190bp），Mid-X ADV +151%；**services 收入创纪录 $31.5M（+14%）**，公司自己的归因就是“自动化与算法交易方案 + 可操作数据”。",
+    "cited_sources": [],
+    "prev_unsupported_claim_numbers": [
+      "2.184",
+      "20",
+      "3150"
+    ],
+    "grok_verdict": "false_reject",
+    "codex_verdict": "false_reject",
+    "consensus": "both_false_reject"
+  },
+  {
+    "index": 4,
+    "card_id": "cc_a0db6fb88eb8c01ca20c1903",
+    "type": "fact",
+    "tickers": [],
+    "claim": "欧洲议会通过文本（P10_TA(2026)0334）序言N条称中国的产业政策造成大规模过剩产能，可能构成对欧盟的生存性威胁；(h)条要求调查中国在稀土领域的胁迫行为并考虑使用反胁迫工具（范围仅限稀土）。",
+    "figures": [],
+    "quote": "原文在序言 N 条（\"鉴于\"条款），说的是中国的产业政策造成大规模过剩产能，正在掏空欧盟的工业核心，这\"可能构成\"对欧盟的生存性威胁。威胁指的是产业政策和过剩产能，原文用的是\"可能构成\"，而且这句只出现在序言部分。帖子写成\"把中国先进产业发展定性为生存性威胁\"，对象换了，语气也说死了。\n- **反胁迫工具。** 原文在 (h) 条，要求调查中国在稀土领域的胁迫行为，并\"考虑使用\"反胁迫工具，范围只限稀土。",
+    "cited_sources": [],
+    "prev_unsupported_claim_numbers": [
+      "334"
+    ],
+    "grok_verdict": "correct_reject",
+    "codex_verdict": "false_reject",
+    "consensus": "split"
+  },
+  {
+    "index": 5,
+    "card_id": "cc_be04f845d1dc552116212f98",
+    "type": "opinion",
+    "tickers": [],
+    "claim": "Eve 建议采取配对交易策略：多台积电、少配英特尔（现价不追，但不建议单边做空英特尔），若 10 月底三季报出现 14A/18A-P 具名外部客户产能承诺、EMIB-T 大客户量产订单或数据中心收入加速且份额企稳，则转为中性。",
+    "figures": [],
+    "quote": "做配对交易：多台积电、少配英特尔。赌的是两家的代工份额和估值差，不赌英特尔绝对涨跌。",
+    "cited_sources": [],
+    "prev_unsupported_claim_numbers": [
+      "14",
+      "18"
+    ],
+    "grok_verdict": "correct_reject",
+    "codex_verdict": "false_reject",
+    "consensus": "split"
+  },
+  {
+    "index": 6,
+    "card_id": "cc_31d6cfa335acb52f5f10c769",
+    "type": "opinion",
+    "tickers": [],
+    "claim": "MiniMax 与智谱可转债转股期及赎回条款对比：MiniMax 转股期分两段（发行日至 2026-09-21 及 2027-05-15 至到期前 10 天），发行后 20 个交易日即可触发 120% 赎回；智谱转股期仅一段（2027-07-01 至到期前 10 天），2027-02-18 起可触发约 130% 赎回，且两家均允许在收到赎回通知后转股。",
+    "figures": [
+      {
+        "unit": "percent",
+        "value": 120,
+        "metric": "call_trigger",
+        "period": "post_20_trading_days"
+      },
+      {
+        "unit": "percent",
+        "value": 130,
+        "metric": "call_trigger",
+        "period": "post_2027-02-18"
+      }
+    ],
+    "quote": "| 转股期 | 两段：发行日至 2026-09-21；2027-05-15 至到期前 10 天 | 一段：2027-07-01 至到期前 10 天 |\n| 赎回通知触发转股 | 允许，公告明文写了 | 允许，BofA 引 termsheet 确认 |\n| 公司赎回 | 发行后 20 个交易日即可。触发线是提前赎回金额的 120%，20 个交易日里 10 天达标 | 2027-02-18 起。触发线公告没写，彭博显示约 130% |",
+    "cited_sources": [],
+    "prev_unsupported_claim_numbers": [
+      "2"
+    ],
+    "grok_verdict": "false_reject",
+    "codex_verdict": "false_reject",
+    "consensus": "both_false_reject"
+  },
+  {
+    "index": 7,
+    "card_id": "cc_1096ac41eaf4432c11879741",
+    "type": "fact",
+    "tickers": [],
+    "claim": "FTC联合22州总检察长起诉亚马逊广告欺诈（FTC Act第5条），指控其自2019年起通过内部\"soft reserve price\"推高Sponsored Products广告清算价，使广告主付满出价的比例从2021年的30-40%升至2024年的约80%，大促日CPC被推高约50%，波及120万广告主，涉案金额超过200亿美元。",
+    "figures": [
+      {
+        "unit": "percent",
+        "value": "30-40",
+        "metric": "full_bid_payment_share",
+        "period": "2021"
+      },
+      {
+        "unit": "percent",
+        "value": 70,
+        "metric": "full_bid_payment_share",
+        "period": "2022"
+      },
+      {
+        "unit": "percent",
+        "value": 80,
+        "metric": "full_bid_payment_share",
+        "period": "2024"
+      },
+      {
+        "unit": "percent",
+        "value": 50,
+        "metric": "prime_day_cpc_inflation",
+        "period": "2019-2025"
+      },
+      {
+        "unit": "million",
+        "value": 1.2,
+        "metric": "affected_advertisers",
+        "period": "2019-2025"
+      },
+      {
+        "unit": "USD_bn",
+        "value": 20,
+        "metric": "alleged_overcharge",
+        "period": "2019-2025"
+      }
+    ],
+    "quote": "结果：Sponsored Products 广告主付满自己出价的比例，2021 年 30–40% → 2022 年 70% → 2024 年约 80%\n- 大促日（Prime Day、黑五）加价幅度更大，FTC 说 CPC 被推高约 50%\n- 波及 120 万广告主，其中 50 万+ 中小企业\n- 金额：新闻稿写\"数百亿美元\"（tens of billions），但高盛和绝大多数报道用的具体数字是**超过 200 亿美元**",
+    "cited_sources": [],
+    "prev_unsupported_claim_numbers": [
+      "22",
+      "5"
+    ],
+    "grok_verdict": "correct_reject",
+    "codex_verdict": "correct_reject",
+    "consensus": "both_correct_reject"
+  },
+  {
+    "index": 8,
+    "card_id": "cc_1746d752cff3ccc99b337b11",
+    "type": "fact",
+    "tickers": [],
+    "claim": "纽菲斯早期研发团队源自华为顶尖研发团队，现实验室负责人从中国台湾聘请（材料背景），且下游载板厂产线测试需占用产线2-3年具有排他性，因此具备技术、客户卡位与先发优势。",
+    "figures": [
+      {
+        "unit": "years",
+        "value": "2-3",
+        "metric": "testing_exclusivity_period",
+        "period": "per_qualification"
+      }
+    ],
+    "quote": "尤其是纽菲斯一开始这块的研发团队，就是刚才你也没有问到研发这块儿研发的这个团队背景其实是以前是华为这一块儿很顶尖的这个研发团队。",
+    "cited_sources": [],
+    "prev_unsupported_claim_numbers": [
+      "2",
+      "3"
+    ],
+    "grok_verdict": "correct_reject",
+    "codex_verdict": "correct_reject",
+    "consensus": "both_correct_reject"
+  },
+  {
+    "index": 9,
+    "card_id": "cc_692a8be3a359014862c9089d",
+    "type": "opinion",
+    "tickers": [],
+    "claim": "Datadog (DDOG) 盘中股价跌至 244.3（下跌 8.2%），跌破 50 日均线（247.0），RSI 为 41，趋势走坏。",
+    "figures": [
+      {
+        "unit": "USD",
+        "value": 244.3,
+        "metric": "price",
+        "period": "2026-10-16"
+      },
+      {
+        "unit": "%",
+        "value": -8.2,
+        "metric": "price_change_pct",
+        "period": "2026-10-16"
+      },
+      {
+        "unit": "USD",
+        "value": 247.0,
+        "metric": "50MA",
+        "period": "2026-10-16"
+      },
+      {
+        "unit": "index",
+        "value": 41,
+        "metric": "RSI",
+        "period": "2026-10-16"
+      }
+    ],
+    "quote": "🔴 **Datadog DDOG｜跌破 50MA，转为趋势走坏**\n244.3（−8.2%）· 50MA 247.0 · RSI 41",
+    "cited_sources": [],
+    "prev_unsupported_claim_numbers": [
+      "50"
+    ],
+    "grok_verdict": "false_reject",
+    "codex_verdict": "false_reject",
+    "consensus": "both_false_reject"
+  },
+  {
+    "index": 10,
+    "card_id": "cc_699606beb4d12b193c454e6b",
+    "type": "opinion",
+    "tickers": [],
+    "claim": "Meta 2027年Capex一致预期为1,950亿美元（VisibleAlpha）至2,016亿美元（美银Street），7家卖方中位数约2,250亿美元；买方预期更高，介于2,226亿至2,600亿美元以上。",
+    "figures": [
+      {
+        "unit": "USD_bn",
+        "value": 195,
+        "metric": "capex_consensus_VA",
+        "period": "FY2027E"
+      },
+      {
+        "unit": "USD_bn",
+        "value": 201.6,
+        "metric": "capex_consensus_Street",
+        "period": "FY2027E"
+      },
+      {
+        "unit": "USD_bn",
+        "value": 225,
+        "metric": "capex_sellside_median",
+        "period": "FY2027E"
+      },
+      {
+        "unit": "USD_bn",
+        "value": 222.6,
+        "metric": "capex_buyside_bogey_BofA",
+        "period": "FY2027E"
+      },
+      {
+        "unit": "USD_bn",
+        "value": 241.8,
+        "metric": "capex_buyside_survey_Guggenheim",
+        "period": "FY2027E"
+      }
+    ],
+    "quote": "一致预期是 VisibleAlpha 的 1,950 亿（汇丰引用），美银说 Street 是 2,016 亿。卖方中位数约 2,250 亿，已经高于一致预期。\n- 买方更高：\n  - 美银 10/19 收集的 bogey：2,226 亿\n  - Guggenheim 调查 97 家买方：2,418 亿\n  - 德银：2,300 亿到 2,400 亿\n  - TMTB 10/19：约 2,500 亿\n  - Jefferies 10/19：2,600 亿以上",
+    "cited_sources": [],
+    "prev_unsupported_claim_numbers": [
+      "7"
+    ],
+    "grok_verdict": "correct_reject",
+    "codex_verdict": "correct_reject",
+    "consensus": "both_correct_reject"
+  },
+  {
+    "index": 11,
+    "card_id": "cc_28549e03e5a40a3c8a441be4",
+    "type": "opinion",
+    "tickers": [],
+    "claim": "Affirm(AFRM)报76.65，单日上涨2.1%，突破50MA(76.5)并出现MACD金叉与底背离，Sell Put策略由禁卖调整为可卖，行权价参考低于200MA(66.4)。",
+    "figures": [
+      {
+        "unit": "USD",
+        "value": 76.65,
+        "metric": "price",
+        "period": "2026-08-21"
+      },
+      {
+        "unit": "percent",
+        "value": 2.1,
+        "metric": "daily_change",
+        "period": "2026-08-21"
+      },
+      {
+        "unit": "index",
+        "value": 51.6,
+        "metric": "RSI",
+        "period": "2026-08-21"
+      },
+      {
+        "unit": "USD",
+        "value": 76.5,
+        "metric": "50MA",
+        "period": "2026-08-21"
+      },
+      {
+        "unit": "USD",
+        "value": 66.4,
+        "metric": "200MA_strike_ref",
+        "period": "2026-08-21"
+      }
+    ],
+    "quote": "Affirm(AFRM) 🔴禁卖→✅可卖｜>50MA | MACD金叉 | 周线金叉 | RSI=52甜蜜区｜strike参考<200MA(66.4)",
+    "cited_sources": [],
+    "prev_unsupported_claim_numbers": [
+      "76.65",
+      "2.1",
+      "76.5"
+    ],
+    "grok_verdict": "correct_reject",
+    "codex_verdict": "correct_reject",
+    "consensus": "both_correct_reject"
+  },
+  {
+    "index": 12,
+    "card_id": "cc_72e4f14a3aaf6c04651b6523",
+    "type": "fact",
+    "tickers": [],
+    "claim": "据北交所三轮问询回复：腾信精密油服业务毛利率为54-56%（对比应流股份37-39%、迪威尔20-23%），2026年Q1综合毛利率为48.1%；2026年H1预计汇兑损失1700-1800万元；存货跌价准备约占存货10%；越南工厂年产124万件（占东莞产量2.8%）；募投项目达产后新增年产值7.1亿元（相当于2025年收入的94%），第3年起每年新增折旧5000万元，项目用地尚未取得。",
+    "figures": [
+      {
+        "unit": "percent",
+        "value": "54-56",
+        "metric": "oil_services_gross_margin",
+        "period": "historical"
+      },
+      {
+        "unit": "percent",
+        "value": 48.1,
+        "metric": "gross_margin",
+        "period": "2026Q1"
+      },
+      {
+        "unit": "CNY_mn",
+        "value": "17-18",
+        "metric": "expected_fx_loss",
+        "period": "2026H1"
+      },
+      {
+        "unit": "percent",
+        "value": 10,
+        "metric": "inventory_write_down_ratio",
+        "period": "recent"
+      },
+      {
+        "unit": "pieces_mn",
+        "value": 1.24,
+        "metric": "vietnam_plant_output",
+        "period": "annual"
+      },
+      {
+        "unit": "CNY_mn",
+        "value": 710,
+        "metric": "ipo_project_full_capacity_output",
+        "period": "annual"
+      },
+      {
+        "unit": "CNY_mn",
+        "value": 50,
+        "metric": "ipo_project_extra_depreciation",
+        "period": "annual_from_year_3"
+      }
+    ],
+    "quote": "2. Inquiry replies:** I pulled all three rounds from the BSE review system (they aren't on cninfo) and converted them to text.\n- **Margins:** oil-services margin is 54–56%, against 37–39% at 应流股份 and 20–23% at 迪威尔. The company credits precision machining over casting or forging, complex small parts, and concentrated overseas customers. Q1 2026 gross margin was 48.1%.\n- **Tariffs:** mostly the customer's problem, since sales are FOB/EXW and customers pay import duty. The Vietnam plant makes only 1.24m pieces a year (2.8% of Dongguan's output). Mexico is still in trial production.\n- **FX:** a bigger hit than tariffs. The company expects an FX loss of 17–18m yuan in H1 2026.\n- **Inventory:** write-down provisions are about 10% of inventory.\n- **IPO projects:** new output at full capacity would be 710m yuan a year, equal to 94% of 2025 revenue. The land for the project hasn't been acquired yet. From year 3, extra depreciation is 50m yuan a year.",
+    "cited_sources": [],
+    "prev_unsupported_claim_numbers": [
+      "1700",
+      "1800",
+      "124",
+      "7.1",
+      "5000"
+    ],
+    "grok_verdict": "false_reject",
+    "codex_verdict": "false_reject",
+    "consensus": "both_false_reject"
+  },
+  {
+    "index": 13,
+    "card_id": "cc_31895a1a9fb11cfa66204d3b",
+    "type": "opinion",
+    "tickers": [],
+    "claim": "专家Doron Tal估计在800G/1.6T光模块的一般BOM成本结构中，DSP占比约30%–40%，硅光PIC占比约20%–25%。",
+    "figures": [
+      {
+        "unit": "percent",
+        "value": "30-40",
+        "metric": "dsp_share_of_module_bom",
+        "period": "800G/1.6T generation"
+      },
+      {
+        "unit": "percent",
+        "value": "20-25",
+        "metric": "silicon_photonics_pic_share_of_module_bom",
+        "period": "800G/1.6T generation"
+      }
+    ],
+    "quote": "| 器件 | 占模块BOM成本的估计 |\n|---|---:|\n| DSP | **30%–40%** |\n| 硅光PIC | **20%–25%** |",
+    "cited_sources": [],
+    "prev_unsupported_claim_numbers": [
+      "800",
+      "1.6"
+    ],
+    "grok_verdict": "correct_reject",
+    "codex_verdict": "correct_reject",
+    "consensus": "both_correct_reject"
+  },
+  {
+    "index": 14,
+    "card_id": "cc_d39fd8443354844ae9b9d8b1",
+    "type": "opinion",
+    "tickers": [],
+    "claim": "腾讯控股(0700.HK)价格439.2（RSI 41.9，30D +1.1%）、美团(3690.HK)价格79.65（RSI 33.5，30D -8.1%）、网易(9999.HK)价格194.5（RSI 45.6，30D +3.6%）均触发周线金叉止跌信号。",
+    "figures": [
+      {
+        "unit": "HKD",
+        "value": 439.2,
+        "metric": "stock_price_0700.HK",
+        "period": "2026-08-24"
+      },
+      {
+        "unit": "HKD",
+        "value": 79.65,
+        "metric": "stock_price_3690.HK",
+        "period": "2026-08-24"
+      },
+      {
+        "unit": "HKD",
+        "value": 194.5,
+        "metric": "stock_price_9999.HK",
+        "period": "2026-08-24"
+      }
+    ],
+    "quote": "**騰訊控股有限公司(0700.HK)** 价格=439.2 RSI=41.9 30D=1.1% → 🌟 周线金叉",
+    "cited_sources": [],
+    "prev_unsupported_claim_numbers": [
+      "79.65",
+      "33.5",
+      "8.1",
+      "194.5",
+      "45.6",
+      "3.6"
+    ],
+    "grok_verdict": "correct_reject",
+    "codex_verdict": "correct_reject",
+    "consensus": "both_correct_reject"
+  },
+  {
+    "index": 15,
+    "card_id": "cc_7bd11975ac1c205753725a82",
+    "type": "opinion",
+    "tickers": [],
+    "claim": "转发关于Grok Bot的讨论附件（grok-bot-discussion-20260905.md），涵盖个人助手是否会成为新入口、Google/Meta/腾讯等的竞争位置，以及Grok Bot与当前Eve在记忆、云端电脑和实际使用场景上的区别。",
+    "figures": [],
+    "quote": "CY 请我把刚才关于 Grok Bot 的讨论转发给你。附件是两轮完整问答（含来源链接），内容包括：个人助手是否会成为新入口、Google/Meta/腾讯等的竞争位置，以及 Grok Bot 与当前 Eve 在记忆、云端电脑和实际使用场景上的区别。",
+    "cited_sources": [],
+    "prev_unsupported_claim_numbers": [
+      "20260905"
+    ],
+    "grok_verdict": "correct_reject",
+    "codex_verdict": "false_reject",
+    "consensus": "split"
+  },
+  {
+    "index": 16,
+    "card_id": "cc_92c88bc6f131a9edb130d680",
+    "type": "opinion",
+    "tickers": [],
+    "claim": "2026-10-09 16:05 HKT盘中，迅策(3317.HK)报86.7港元（+2.5%），RSI为33.0，低于50日均线115.6，成交量放量2.0倍。",
+    "figures": [
+      {
+        "unit": "HKD",
+        "value": 86.7,
+        "metric": "price",
+        "period": "2026-10-09"
+      },
+      {
+        "unit": "%",
+        "value": 2.5,
+        "metric": "price_change_pct",
+        "period": "2026-10-09"
+      },
+      {
+        "unit": "index",
+        "value": 33.0,
+        "metric": "RSI",
+        "period": "2026-10-09"
+      },
+      {
+        "unit": "HKD",
+        "value": 115.6,
+        "metric": "50MA",
+        "period": "2026-10-09"
+      },
+      {
+        "unit": "x",
+        "value": 2.0,
+        "metric": "volume_multiple",
+        "period": "2026-10-09"
+      }
+    ],
+    "quote": "**迅策(3317.HK)** 86.7 +2.5%｜RSI=33.0｜50MA=115.6❌\n　➡️ 新增 📊放量2.0x",
+    "cited_sources": [],
+    "prev_unsupported_claim_numbers": [
+      "50"
+    ],
+    "grok_verdict": "false_reject",
+    "codex_verdict": "false_reject",
+    "consensus": "both_false_reject"
+  },
+  {
+    "index": 17,
+    "card_id": "cc_31a6e507886bb4a5a3812d36",
+    "type": "opinion",
+    "tickers": [],
+    "claim": "第四范式 (6682.HK，27.48)、住友电工 (5802.T，2211.0) 与 The Trade Desk (TTD，12.63) 均处于空头趋势但出现底背离信号，列为左侧观察机会。",
+    "figures": [
+      {
+        "unit": "HKD",
+        "value": 27.48,
+        "metric": "price",
+        "period": "2026-09-26"
+      },
+      {
+        "unit": "JPY",
+        "value": 2211.0,
+        "metric": "price",
+        "period": "2026-09-26"
+      },
+      {
+        "unit": "USD",
+        "value": 12.63,
+        "metric": "price",
+        "period": "2026-09-26"
+      }
+    ],
+    "quote": "**The Trade Desk(TTD)** 📉空头[普通] 12.63 今日-0.4% 30日-4.8%｜RSI=33.4｜MACD日死叉周金叉｜50MA=15.24❌ 200MA=23.37❌\n　➡️ 🔄底背离｜正股机会 ⚠️左侧观察",
+    "cited_sources": [],
+    "prev_unsupported_claim_numbers": [
+      "27.48",
+      "2211"
+    ],
+    "grok_verdict": "correct_reject",
+    "codex_verdict": "correct_reject",
+    "consensus": "both_correct_reject"
+  },
+  {
+    "index": 18,
+    "card_id": "cc_d847c8609708dad51a8248f7",
+    "type": "question",
+    "tickers": [],
+    "claim": "询问市场对 Meta 2026-2028 年自由现金流（FCF）及融资需求的预期，以及市场认为 Meta 需要增发股票的原因。",
+    "figures": [],
+    "quote": "市场对于 Meta 26-28 年的 FCF 和融资需求怎么看？为什么都觉得 Meta 要发股票？",
+    "cited_sources": [],
+    "prev_unsupported_claim_numbers": [
+      "2026"
+    ],
+    "grok_verdict": "false_reject",
+    "codex_verdict": "false_reject",
+    "consensus": "both_false_reject"
+  },
+  {
+    "index": 19,
+    "card_id": "cc_aa58c48550d1cbda1d9fccdc",
+    "type": "opinion",
+    "tickers": [],
+    "claim": "按已识别合同换算的OpenAI算力支出在2026、2027、2028年分别为399亿、685亿、1035亿美元（v3模型分别为496亿、792亿、893亿美元）；同时将OpenAI 2027年底在运行算力预测下修至约8吉瓦（7-9吉瓦），2028年底为12-15吉瓦。",
+    "figures": [
+      {
+        "unit": "USD_bn",
+        "value": 39.9,
+        "metric": "identified contract compute spend",
+        "period": "FY2026E"
+      },
+      {
+        "unit": "USD_bn",
+        "value": 68.5,
+        "metric": "identified contract compute spend",
+        "period": "FY2027E"
+      },
+      {
+        "unit": "USD_bn",
+        "value": 103.5,
+        "metric": "identified contract compute spend",
+        "period": "FY2028E"
+      },
+      {
+        "unit": "GW",
+        "value": "7-9",
+        "metric": "revised active compute capacity",
+        "period": "4Q27E"
+      },
+      {
+        "unit": "GW",
+        "value": "12-15",
+        "metric": "revised active compute capacity",
+        "period": "4Q28E"
+      }
+    ],
+    "quote": "- 按每吉瓦年支出换算，已识别合同的支出：\n  - 2026 年 399 亿，v3 是 496 亿（和 Brockman 说的 500 亿一致），差约 100 亿，两成。可能的原因：Abilene 以外甲骨文还给 OpenAI 供了产能；谷歌云规模比想象的大；OpenAI 用了价格更高的短租 neocloud；也可能 v3 的总算力本身偏高。\n  - 2027 年 685 亿，v3 是 792 亿。\n  - 2028 年 1,035 亿，已经超过 v3 的 893 亿，和上一轮\"v3 2028 年偏低\"的判断一致。\n- 2028 年支出份额：微软 37%、甲骨文 31%、AWS 14%、自租 9%。\n- **吉瓦需要下修。** 按已签合同自下而上加，2027 年底约 7 吉瓦（含 UAE 为 7.4），低于我上一轮说的 9–11。要到 9 吉瓦以上，需要满足以下之一：\n  - 微软把 Abilene 扩建（Epoch 估 2027 年 11 月 0.67 吉瓦）和 Fairwater Wisconsin 的后续楼分给 OpenAI；\n  - 甲骨文 Shackelford 比 Epoch 估的早投运。\n- 我把 2027 年底下修到约 8 吉瓦（7–9），2028 年底 12–15。",
+    "cited_sources": [],
+    "prev_unsupported_claim_numbers": [
+      "2026",
+      "2027"
+    ],
+    "grok_verdict": "false_reject",
+    "codex_verdict": "false_reject",
+    "consensus": "both_false_reject"
+  },
+  {
+    "index": 20,
+    "card_id": "cc_c1bbeb5bf5f1010f656d217d",
+    "type": "fact",
+    "tickers": [],
+    "claim": "按年报口径，亿纬锂能动力电池单瓦时毛利2023-2026H1分别为0.123、0.090、0.080、0.078元/Wh；储能单瓦时毛利2023-2025分别为0.106、0.055、0.042元/Wh。",
+    "figures": [
+      {
+        "unit": "RMB_per_Wh",
+        "value": 0.123,
+        "metric": "动力电池单瓦时毛利",
+        "period": "FY2023"
+      },
+      {
+        "unit": "RMB_per_Wh",
+        "value": 0.09,
+        "metric": "动力电池单瓦时毛利",
+        "period": "FY2024"
+      },
+      {
+        "unit": "RMB_per_Wh",
+        "value": 0.08,
+        "metric": "动力电池单瓦时毛利",
+        "period": "FY2025"
+      },
+      {
+        "unit": "RMB_per_Wh",
+        "value": 0.078,
+        "metric": "动力电池单瓦时毛利",
+        "period": "2026H1"
+      },
+      {
+        "unit": "RMB_per_Wh",
+        "value": 0.106,
+        "metric": "储能电池单瓦时毛利",
+        "period": "FY2023"
+      },
+      {
+        "unit": "RMB_per_Wh",
+        "value": 0.055,
+        "metric": "储能电池单瓦时毛利",
+        "period": "FY2024"
+      },
+      {
+        "unit": "RMB_per_Wh",
+        "value": 0.042,
+        "metric": "储能电池单瓦时毛利",
+        "period": "FY2025"
+      }
+    ],
+    "quote": "亿纬动力：2022 前未拆（2022 动力+储能合计 276.83 亿×约 14.3%÷30+GWh ≈ 0.130）→ **0.123 (23)**（239.84 亿×14.37%÷28.08）→ **0.090 (24)**（192 亿×14.2%÷30.3）→ **0.080 (25)** → **0.078 (26H1)**（172.8 亿×16.19%÷35.76）；储能：**0.106 (23)**（163.4 亿×17.03%÷26.29）→ **0.055 (24)**（190 亿×14.7%÷50.5）→ **0.042 (25)**",
+    "cited_sources": [],
+    "prev_unsupported_claim_numbers": [
+      "2023",
+      "2023",
+      "2025"
+    ],
+    "grok_verdict": "false_reject",
+    "codex_verdict": "false_reject",
+    "consensus": "both_false_reject"
+  },
+  {
+    "index": 21,
+    "card_id": "cc_e52e477e4c233ee5ad06ad99",
+    "type": "question",
+    "tickers": [],
+    "claim": "需要确认三项持仓信息：1. 两融维保比例和融资余额；2. 最新持仓截图；3. 长鑫科技（688825）11500 股（成本 8.66 元）的来源。",
+    "figures": [
+      {
+        "unit": "shares",
+        "value": 11500,
+        "metric": "长鑫科技持仓股数",
+        "period": "2026-07-26"
+      }
+    ],
+    "quote": "**需要你回复的三件事**\n1. 两融维保比例和融资余额\n2. 最新持仓截图\n3. 长鑫那 11500 股是怎么来的",
+    "cited_sources": [],
+    "prev_unsupported_claim_numbers": [
+      "8.66"
+    ],
+    "grok_verdict": "correct_reject",
+    "codex_verdict": "correct_reject",
+    "consensus": "both_correct_reject"
+  },
+  {
+    "index": 22,
+    "card_id": "cc_a6ca10c7a2b13f3e7734be28",
+    "type": "fact",
+    "tickers": [],
+    "claim": "风华高科目前MLCC整体均价接近8-9元，电阻整体均价约3元左右，电感整体均价约20多元。",
+    "figures": [
+      {
+        "unit": "RMB",
+        "value": "8-9",
+        "metric": "asp_mlcc",
+        "period": "current"
+      },
+      {
+        "unit": "RMB",
+        "value": 3,
+        "metric": "asp_resistor",
+        "period": "current"
+      },
+      {
+        "unit": "RMB",
+        "value": "20+",
+        "metric": "asp_inductor",
+        "period": "current"
+      }
+    ],
+    "quote": "的话，像电阻的话，可能就整体均价的话应该是三块左右。\n整体的均价，对我们的整体均价，然后电感的话应该是应该是二十多这样子。",
+    "cited_sources": [],
+    "prev_unsupported_claim_numbers": [
+      "8",
+      "9",
+      "20"
+    ],
+    "grok_verdict": "correct_reject",
+    "codex_verdict": "correct_reject",
+    "consensus": "both_correct_reject"
+  },
+  {
+    "index": 23,
+    "card_id": "cc_eb33105142a0d79dae2e7403",
+    "type": "opinion",
+    "tickers": [],
+    "claim": "博通 CEO Hock Tan 在新加坡 DBS 大会上表示，当前算力基础设施需求超过供给，若模型能力继续进步且企业持续采用，该供需缺口可能延续至 2029 至 2030 年。",
+    "figures": [
+      {
+        "unit": "year",
+        "value": "2029-2030",
+        "metric": "compute_supply_deficit_duration",
+        "period": "2029-2030"
+      }
+    ],
+    "quote": "CNBC 引述他的原话：\n\n> “There is more demand for compute infrastructure than we can supply.”\n\n即：**算力基础设施的需求，超过了我们能提供的供给。**\n\n他判断这种供需缺口可能延续至 2029 年，甚至进入 2030 年。",
+    "cited_sources": [],
+    "prev_unsupported_claim_numbers": [
+      "2029"
+    ],
+    "grok_verdict": "false_reject",
+    "codex_verdict": "false_reject",
+    "consensus": "both_false_reject"
+  },
+  {
+    "index": 24,
+    "card_id": "cc_72a95f1a8bea55d3d92983db",
+    "type": "opinion",
+    "tickers": [],
+    "claim": "卖方对Alphabet全公司折旧的预测分歧很大：2027年预测从Piper的461亿美元到摩根士丹利的741亿美元不等；2028年预测从Piper的558亿美元到摩根士丹利的1,282亿美元不等。此外Wolfe按云收入15%估2025年云折旧为88亿美元（占全公司42%），Barclays对出租TPU按5年寿命、每吉瓦每年40-50亿美元折旧测算。",
+    "figures": [
+      {
+        "unit": "USD_bn",
+        "value": 8.8,
+        "metric": "cloud_depreciation_est_wolfe",
+        "period": "FY2025"
+      },
+      {
+        "unit": "USD_bn",
+        "value": "4.0-5.0",
+        "metric": "tpu_depreciation_per_gw_barclays",
+        "period": "annual"
+      },
+      {
+        "unit": "USD_bn",
+        "value": 46.1,
+        "metric": "depreciation_est_piper",
+        "period": "FY2027"
+      },
+      {
+        "unit": "USD_bn",
+        "value": 52.5,
+        "metric": "depreciation_est_td_cowen",
+        "period": "FY2027"
+      },
+      {
+        "unit": "USD_bn",
+        "value": 55.6,
+        "metric": "depreciation_est_barclays",
+        "period": "FY2027"
+      },
+      {
+        "unit": "USD_bn",
+        "value": 65.5,
+        "metric": "depreciation_est_jpm",
+        "period": "FY2027"
+      },
+      {
+        "unit": "USD_bn",
+        "value": 74.1,
+        "metric": "depreciation_est_ms",
+        "period": "FY2027"
+      },
+      {
+        "unit": "USD_bn",
+        "value": 55.8,
+        "metric": "depreciation_est_piper",
+        "period": "FY2028"
+      },
+      {
+        "unit": "USD_bn",
+        "value": 86.7,
+        "metric": "depreciation_est_td_cowen",
+        "period": "FY2028"
+      },
+      {
+        "unit": "USD_bn",
+        "value": 92.6,
+        "metric": "depreciation_est_barclays",
+        "period": "FY2028"
+      },
+      {
+        "unit": "USD_bn",
+        "value": 115.7,
+        "metric": "depreciation_est_jpm",
+        "period": "FY2028"
+      },
+      {
+        "unit": "USD_bn",
+        "value": 128.2,
+        "metric": "depreciation_est_ms",
+        "period": "FY2028"
+      }
+    ],
+    "quote": "- **全公司折旧的预测分歧很大**，会直接决定云 2027 和 2028 年的利润率：\n  - 2027 年：Piper 461 亿、TD Cowen 525 亿、Barclays 556 亿（含摊销）、摩根大通 655 亿、摩根士丹利 741 亿\n  - 2028 年：Piper 558 亿、TD Cowen 867 亿、Barclays 926 亿、摩根大通 1,157 亿、摩根士丹利 1,282 亿",
+    "cited_sources": [],
+    "prev_unsupported_claim_numbers": [
+      "15",
+      "88",
+      "42",
+      "5",
+      "40",
+      "50"
+    ],
+    "grok_verdict": "correct_reject",
+    "codex_verdict": "correct_reject",
+    "consensus": "both_correct_reject"
+  },
+  {
+    "index": 25,
+    "card_id": "cc_69f0d9736c9e2c9aa122cdaf",
+    "type": "opinion",
+    "tickers": [],
+    "claim": "亚马逊不扣股交税且不回购，2023-2025年股权激励新发股比例分别为1.38%、2.02%、1.30%；SBC占收入2.7%，过去12个月SBC为193亿美元（占市值0.72%）；授予股数从2023年2.18亿股降至2025年1.13亿股，未归属股数降至2.23亿股（占2.1%）。",
+    "figures": [
+      {
+        "unit": "percent",
+        "value": 1.3,
+        "metric": "sbc_share_dilution",
+        "period": "FY2025"
+      },
+      {
+        "unit": "percent",
+        "value": 2.7,
+        "metric": "sbc_to_revenue",
+        "period": "FY2025"
+      },
+      {
+        "unit": "USD_bn",
+        "value": 19.3,
+        "metric": "sbc",
+        "period": "LTM"
+      },
+      {
+        "unit": "percent",
+        "value": 0.72,
+        "metric": "sbc_to_market_cap",
+        "period": "LTM"
+      },
+      {
+        "unit": "mn_shares",
+        "value": 113,
+        "metric": "rsu_granted",
+        "period": "FY2025"
+      },
+      {
+        "unit": "mn_shares",
+        "value": 223,
+        "metric": "unvested_rsu",
+        "period": "FY2025"
+      }
+    ],
+    "quote": "- **亚马逊：** 不扣股交税，兑现多少就新发多少：2023 年 1.38%，2024 年 2.02%，2025 年 1.30%。它不回购，所以这就是股本每年的净增幅。\n  - SBC 占收入 2.7%；过去 12 个月 193 亿美元，占市值 0.72%。\n  - 授予在减：2023 年 2.18 亿股，2024 年 1.27 亿，2025 年 1.13 亿。未归属从 4.06 亿股降到 2.23 亿（2.1%）。",
+    "cited_sources": [],
+    "prev_unsupported_claim_numbers": [
+      "2023"
+    ],
+    "grok_verdict": "false_reject",
+    "codex_verdict": "false_reject",
+    "consensus": "both_false_reject"
+  }
+]

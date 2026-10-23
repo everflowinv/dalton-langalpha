@@ -1,0 +1,206 @@
+[
+  {
+    "card_id": "cc_07a818e64dd168360e63afa4",
+    "type": "opinion",
+    "tickers": [],
+    "claim": "劳氏情报数据显示，9月14日至20日当周，非伊朗关联的油轮和气体船通过霍尔木兹海峡82艘次（前一周79艘次），日均11-12艘；单看出湾方向所有船型为一周55艘次（日均约8艘），而战前日均约125艘商船。",
+    "figures": [
+      {
+        "unit": "vessels_per_week",
+        "value": 82,
+        "metric": "non_iran_tanker_gas_transits",
+        "period": "2026-09-14 to 2026-09-20"
+      },
+      {
+        "unit": "vessels_per_week",
+        "value": 79,
+        "metric": "non_iran_tanker_gas_transits",
+        "period": "2026-09-07 to 2026-09-13"
+      },
+      {
+        "unit": "vessels_per_week",
+        "value": 55,
+        "metric": "outbound_transits_all_vessels",
+        "period": "2026-09-14 to 2026-09-20"
+      },
+      {
+        "unit": "vessels_per_day",
+        "value": 125,
+        "metric": "pre_war_daily_merchant_transits",
+        "period": "pre-war"
+      }
+    ],
+    "quote": "劳氏情报的初步数据：9/14–20 这一周，非伊朗关联的油轮和气体船过峡 82 艘次，前一周 79 艘次，合每天 11–12 艘。",
+    "cited_sources": [
+      "Lloyd's List Intelligence",
+      "https://www.lloydslistintelligence.com/resources/blog/strait-of-hormuz-brief-24-september-2026"
+    ]
+  },
+  {
+    "card_id": "cc_e55f5248f685901e4fb349ea",
+    "type": "fact",
+    "tickers": ["688775.SH"],
+    "claim": "2026年上半年单体口径下，负责官方商城及电商的顺势电子营收31.9亿元，负责海外销售的香港影石营收29.5亿元（其中美国影石9.7亿元），负责国内经销商渠道的珠海影石营收9.8亿元，负责软件研发的前海影石营收1.5亿元、净利润0.42亿元。",
+    "figures": [
+      {
+        "unit": "CNY_yi",
+        "value": 31.9,
+        "metric": "revenue_shunshi",
+        "period": "2026H1"
+      },
+      {
+        "unit": "CNY_yi",
+        "value": 29.5,
+        "metric": "revenue_hk_insta360",
+        "period": "2026H1"
+      },
+      {
+        "unit": "CNY_yi",
+        "value": 9.7,
+        "metric": "revenue_us_insta360",
+        "period": "2026H1"
+      },
+      {
+        "unit": "CNY_yi",
+        "value": 9.8,
+        "metric": "revenue_zhuhai_insta360",
+        "period": "2026H1"
+      },
+      {
+        "unit": "CNY_yi",
+        "value": 1.5,
+        "metric": "revenue_qianhai_insta360",
+        "period": "2026H1"
+      },
+      {
+        "unit": "CNY_yi",
+        "value": 0.42,
+        "metric": "net_income_qianhai_insta360",
+        "period": "2026H1"
+      }
+    ],
+    "quote": "顺势电子：负责官方商城和第三方电商平台的销售，H1 营收 31.9 亿元。",
+    "cited_sources": ["2026 年半年报"]
+  },
+  {
+    "card_id": "cc_c602f34f600becc09bfff75a",
+    "type": "fact",
+    "tickers": ["IT"],
+    "claim": "Gartner估算到2030年AI数据中心累计需取得8.5万亿美元收入才能达到12%回报，但预测收入上限仅3.6万亿美元；SemiAnalysis预计明年全球（不含中国）数据中心IT容量净增约51 GW（今年的两倍左右），并提示2028年可能有约10 GW机房因缺芯片而空置。",
+    "figures": [
+      {
+        "unit": "USD_tn",
+        "value": 8.5,
+        "metric": "Cumulative AI DC revenue required for 12% return",
+        "period": "by 2030"
+      },
+      {
+        "unit": "USD_tn",
+        "value": 3.6,
+        "metric": "Gartner forecasted max cumulative AI DC revenue",
+        "period": "by 2030"
+      },
+      {
+        "unit": "GW",
+        "value": 51,
+        "metric": "Global ex-China DC IT capacity net addition",
+        "period": "FY2027E"
+      },
+      {
+        "unit": "GW",
+        "value": 10,
+        "metric": "Potential idle DC capacity due to chip shortage",
+        "period": "FY2028E"
+      }
+    ],
+    "quote": "Gartner 估算到 2030 年 AI 数据中心累计要收 8.5 万亿美元才有 12% 的回报，而它预测的收入上限只有 3.6 万亿。SemiAnalysis 预计明年全球（不含中国）数据中心 IT 容量净增约 51 GW，是今年的两倍左右，同时提示 2028 年可能有约 10 GW 机房因为缺芯片而空置。",
+    "cited_sources": ["Gartner", "SemiAnalysis"]
+  },
+  {
+    "card_id": "cc_112c70a292c9d5886db987ab",
+    "type": "opinion",
+    "tickers": ["INFY", "KD", "CTSH", "WIT"],
+    "claim": "2026-10-09至2026-10-16期间，IT服务主题（INFY、KD、CTSH）上涨12.4%，与算力硬件下跌形成分化，倾向于服务股轮动。",
+    "figures": [
+      {
+        "unit": "percent",
+        "value": 12.4,
+        "metric": "theme_weekly_return",
+        "period": "2026-10-09 to 2026-10-16"
+      }
+    ],
+    "quote": "**③ IT 服务　+12.4%**（3 只：INFY、KD、CTSH）\n- 催化：未见明确催化，按轮动处理\n- 判断：**新主题**，剔除财报周的 WIT 后仍有三家共振，与算力硬件下跌形成分化，当前倾向服务股轮动。",
+    "cited_sources": []
+  },
+  {
+    "card_id": "cc_af0f4051d0d2a2ab831b3fa5",
+    "type": "opinion",
+    "tickers": ["688008.SS"],
+    "claim": "澜起科技是全球三家内存接口芯片厂之一，2024年市场份额第一（36.8%），1H26互连类芯片毛利率为69.3%，2Q26收入达单季最高18.75亿元，但按1H26扣非净利润年化计算的A股扣非PE约95倍，当前股价已反映利好。",
+    "figures": [
+      {
+        "unit": "percent",
+        "value": 36.8,
+        "metric": "market_share",
+        "period": "FY2024"
+      },
+      {
+        "unit": "percent",
+        "value": 69.3,
+        "metric": "gross_margin_interconnect",
+        "period": "1H26"
+      },
+      {
+        "unit": "CNY_bn",
+        "value": 1.875,
+        "metric": "revenue",
+        "period": "2Q26"
+      },
+      {
+        "unit": "x",
+        "value": 95,
+        "metric": "non_gaap_pe_annualized",
+        "period": "1H26"
+      }
+    ],
+    "quote": "结论：澜起的生意很好，但现在的股价已经把好的部分算进去了。** 它是全球三家内存接口芯片厂之一，2024 年份额第一（36.8%）。1H26 互连类芯片毛利率 69.3%，2Q26 收入 18.75 亿元，是单季最高。不过按 1H26 扣非净利润年化，A 股扣非 PE 约 95 倍，现在的价格买的是 2027 年以后的新品。",
+    "cited_sources": []
+  },
+  {
+    "card_id": "cc_22905e2fd37cc08e068703b4",
+    "type": "fact",
+    "tickers": ["ATAT"],
+    "claim": "亚朵年初指引零售全年增长25-30%，2026年Q2单季零售收入达15.75亿元，同比增长63.2%，公司随即将全年零售增长指引上调至+40%。",
+    "figures": [
+      {
+        "unit": "percent",
+        "value": "25-30",
+        "metric": "retail_revenue_guidance_initial",
+        "period": "FY2026"
+      },
+      {
+        "unit": "CNY_bn",
+        "value": 1.575,
+        "metric": "retail_revenue",
+        "period": "2026Q2"
+      },
+      {
+        "unit": "percent",
+        "value": 63.2,
+        "metric": "retail_revenue_yoy",
+        "period": "2026Q2"
+      },
+      {
+        "unit": "percent",
+        "value": 40,
+        "metric": "retail_revenue_guidance_revised",
+        "period": "FY2026"
+      }
+    ],
+    "quote": "年初指引零售全年只有 +25-30%，结果 Q2 单季 15.75 亿、+63.2%，公司直接把全年指引上调到 +40%。",
+    "cited_sources": [
+      "https://www.stocktitan.net/news/ATAT/atour-lifestyle-holdings-limited-reports-second-quarter-2026-4x8ywbp6nmz3.html",
+      "4 月 BofA IR 交流纪要"
+    ]
+  }
+]

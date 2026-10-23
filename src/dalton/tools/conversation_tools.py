@@ -78,6 +78,15 @@ def create_conversation_tools() -> list[BaseTool]:
             speaker_role=speaker_role,
             limit=limit,
         )
+        for card in result.get("cards") or []:
+            if not isinstance(card, dict):
+                continue
+            figs = card.get("figures")
+            if isinstance(figs, list) and any(
+                isinstance(f, dict) and str(f.get("metric") or "").strip() == "_verification"
+                for f in figs
+            ):
+                card["verification"] = "unsupported_numbers"
         logger.info(
             "[dalton.conversations.audit] conversation_search caller_user_id=%s workspace_id=%s thread_id=%s run_id=%s count=%d",
             user_id,

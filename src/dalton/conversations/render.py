@@ -116,7 +116,12 @@ def render_conversation_digest_md(
         if meta_parts:
             lines.append("- **关联标的/实体**：" + " | ".join(meta_parts))
 
-        figs = [f for f in (card.get("figures") or []) if isinstance(f, dict)]
+        all_figs = [f for f in (card.get("figures") or []) if isinstance(f, dict)]
+        figs = [f for f in all_figs if f.get("metric") != "_verification"]
+        flags = [f for f in all_figs if f.get("metric") == "_verification"]
+        if flags:
+            nums = "；".join(str(f.get("value") or "").removeprefix("unsupported:") for f in flags)
+            lines.append(f"- **⚠ 核验**：卡片结论里有数字未被原话支持（{nums}），使用前回原话核对。")
         if figs:
             fig_strs = [
                 f"`{f.get('metric')}` = `{f.get('value')}` {f.get('unit') or ''} ({f.get('period') or ''})".strip()
