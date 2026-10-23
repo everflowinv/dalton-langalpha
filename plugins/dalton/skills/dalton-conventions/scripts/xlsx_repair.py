@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-# DALTON-HOOK(skills-registry): repair corrupted definedNames in uploaded xlsx workbooks
 """Repair an uploaded .xlsx workbook whose corrupt definedNames fail openpyxl loading.
 
 Usage:
-    python repair.py <file.xlsx> [--out <output.xlsx>]
+    python xlsx_repair.py <file.xlsx> [--out <output.xlsx>]
 
 First attempts `openpyxl.load_workbook(<file.xlsx>)`. If the workbook already loads,
 leaves everything untouched, prints "no repair needed", and exits 0.

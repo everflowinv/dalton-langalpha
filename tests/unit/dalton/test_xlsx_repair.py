@@ -5,19 +5,21 @@ import json
 import zipfile
 from pathlib import Path
 
-import openpyxl
-from openpyxl.workbook.defined_name import DefinedName
 import pytest
+
+# The script runs in the sandbox, which ships openpyxl; the server venv does not.
+openpyxl = pytest.importorskip("openpyxl")
+from openpyxl.workbook.defined_name import DefinedName  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 REPAIR_SCRIPT = (
     REPO_ROOT
     / "plugins"
-    / "langalpha_deliverables"
+    / "dalton"
     / "skills"
-    / "xlsx"
+    / "dalton-conventions"
     / "scripts"
-    / "repair.py"
+    / "xlsx_repair.py"
 )
 
 
