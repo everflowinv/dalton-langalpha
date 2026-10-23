@@ -6,7 +6,12 @@ import pytest
 
 from ptc_agent.agent.middleware.model_resilience import ModelResilienceMiddleware
 from src.dalton.llm import oauth_refresh
-from src.dalton.llm.oauth_refresh import OAuthRebuildSpec, oauth_rebuild_spec, tag_oauth_client
+from src.dalton.llm.oauth_refresh import (
+    OAuthRebuildSpec,
+    oauth_rebuild_spec,
+    tag_oauth_client,
+    token_digest,
+)
 from src.server.services.llm import clients as llm_clients
 
 
@@ -40,7 +45,12 @@ def _expired():
 
 
 def _oauth_model(name, token="t0", user="u1"):
-    return tag_oauth_client(_FakeModel(name, token), OAuthRebuildSpec(user_id=user, model_name=name))
+    return tag_oauth_client(
+        _FakeModel(name, token),
+        OAuthRebuildSpec(
+            user_id=user, model_name=name, provider="claude-oauth", token_digest=token_digest(token)
+        ),
+    )
 
 
 @pytest.fixture
@@ -206,3 +216,107 @@ def test_real_clients_carry_spec_without_serializing_it():
     tag_oauth_client(client, spec)
     assert oauth_rebuild_spec(client) == spec
     assert "u1" not in str(client.model_dump())
+
+
+@pytest.mark.asyncio
+async def test_same_token_back_forces_expiry_then_uses_refreshed(monkeypatch):
+    """The store still calls the refused token valid: expire it, resolve again."""
+    tokens = iter(["t0", "t1"])
+
+    async def _resolve(user_id, model_name, reasoning_effort=None, service_tier=None, cache_key=None):
+        return _oauth_model(model_name, token=next(tokens), user=user_id)
+
+    monkeypatch.setattr(
+        llm_clients,
+        "resolve_oauth_llm_client",
+        create_autospec(llm_clients.resolve_oauth_llm_client, side_effect=_resolve),
+    )
+    expire = create_autospec(oauth_refresh._expire_stored_token)
+    monkeypatch.setattr(oauth_refresh, "_expire_stored_token", expire)
+
+    fresh = await oauth_refresh.rebuild_oauth_client(_oauth_model("claude-opus-5-5-oauth", "t0"))
+    assert fresh.token == "t1"
+    expire.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_same_token_even_after_expiry_gives_up(monkeypatch):
+    async def _resolve(user_id, model_name, reasoning_effort=None, service_tier=None, cache_key=None):
+        return _oauth_model(model_name, token="t0", user=user_id)
+
+    monkeypatch.setattr(
+        llm_clients,
+        "resolve_oauth_llm_client",
+        create_autospec(llm_clients.resolve_oauth_llm_client, side_effect=_resolve),
+    )
+    monkeypatch.setattr(
+        oauth_refresh, "_expire_stored_token", create_autospec(oauth_refresh._expire_stored_token)
+    )
+    assert await oauth_refresh.rebuild_oauth_client(_oauth_model("claude-opus-5-5-oauth", "t0")) is None
+
+
+@pytest.mark.asyncio
+async def test_resolver_tags_clients_without_the_token(monkeypatch):
+    """The production resolver attaches the spec: provider and a digest, never the token."""
+    from src.server.services import claude_oauth
+
+    async def _token(user_id):
+        return {"access_token": "secret-access-token", "plan_type": None}
+
+    monkeypatch.setattr(claude_oauth, "get_valid_token", create_autospec(claude_oauth.get_valid_token, side_effect=_token))
+    client = await llm_clients.resolve_oauth_llm_client("u1", "claude-opus-5-5-oauth")
+    spec = oauth_rebuild_spec(client)
+    assert spec.provider == "claude-oauth" and spec.model_name == "claude-opus-5-5-oauth"
+    assert spec.token_digest == token_digest("secret-access-token")
+    assert "secret-access-token" not in repr(spec)
+
+
+@pytest.mark.asyncio
+async def test_refresh_does_not_eat_the_stalled_stream_retry(events, resolver):
+    """401 -> refresh -> stall still gets its one stall retry on the refreshed client."""
+    primary = _oauth_model("claude-opus-5-5-oauth", "t0")
+    mw = _mw(primary)
+    calls = []
+
+    async def handler(req):
+        calls.append(req.model.token)
+        if len(calls) == 1:
+            raise _expired()
+        if len(calls) == 2:
+            raise TimeoutError("stream stalled: no chunk within 120s (chunks_received=0)")
+        return "ok"
+
+    assert await mw.awrap_model_call(_FakeRequest(primary), handler) == "ok"
+    assert calls == ["t0", "t1", "t1"]
+
+
+@pytest.mark.asyncio
+async def test_subagent_narrowed_cache_key_survives_rebuild(monkeypatch):
+    """A narrowed subagent copy must not rejoin the parent session after a rebuild."""
+    from src.llms.llm import create_llm, narrow_prompt_cache_key
+
+    def _build(token):
+        c = create_llm("grok-4.7-oauth", api_key=token, cache_key="thread-1")
+        return tag_oauth_client(
+            c,
+            OAuthRebuildSpec(
+                user_id="u1",
+                model_name="grok-4.7-oauth",
+                provider="xai-oauth",
+                token_digest=token_digest(token),
+                cache_key="thread-1",
+            ),
+        )
+
+    async def _resolve(user_id, model_name, reasoning_effort=None, service_tier=None, cache_key=None):
+        return _build("t1")
+
+    monkeypatch.setattr(
+        llm_clients,
+        "resolve_oauth_llm_client",
+        create_autospec(llm_clients.resolve_oauth_llm_client, side_effect=_resolve),
+    )
+    sub = narrow_prompt_cache_key(_build("t0"), "research")
+    assert sub.model_kwargs["prompt_cache_key"] == "thread-1:research"
+    fresh = await oauth_refresh.rebuild_oauth_client(sub)
+    assert fresh.model_kwargs["prompt_cache_key"] == "thread-1:research"

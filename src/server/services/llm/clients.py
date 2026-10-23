@@ -504,13 +504,15 @@ async def resolve_oauth_llm_client(
     )
     # DALTON-HOOK(oauth-dispatch): remember how the client was built, so a 401 mid-turn
     # (token outlived by a long turn) can rebuild it with a fresh token
-    from src.dalton.llm.oauth_refresh import OAuthRebuildSpec, tag_oauth_client
+    from src.dalton.llm.oauth_refresh import OAuthRebuildSpec, tag_oauth_client, token_digest
 
     return tag_oauth_client(
         client,
         OAuthRebuildSpec(
             user_id=user_id,
             model_name=model_name,
+            provider=provider,
+            token_digest=token_digest(access_token),
             reasoning_effort=reasoning_effort,
             service_tier=service_tier,
             cache_key=cache_key,

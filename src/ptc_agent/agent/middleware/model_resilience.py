@@ -436,6 +436,9 @@ class ModelResilienceMiddleware(AgentMiddleware):
                         if fresh is not None:
                             self._emit_retry(name, attempts, exc, 401, 0.0)
                             req = req.override(model=fresh)
+                            # The refreshed client starts its own count, so the
+                            # one-retry rule for a stalled stream still applies.
+                            attempts = 0
                             continue
                     status, recovery = self._decide(
                         exc, attempts, req, escalated=escalated
