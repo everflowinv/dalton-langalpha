@@ -344,10 +344,15 @@ def get_xai_oauth_client_id() -> str:
     return os.getenv("DALTON_XAI_OAUTH_CLIENT_ID", XAI_OAUTH_CLIENT_ID).strip()
 
 
+# cli-chat-proxy rejects clients below its minimum with HTTP 426 (1.0.4 was refused on
+# 2026-10-23, minimum 1.0.13). Track the installed Grok CLI; override with the env var.
+DEFAULT_XAI_GROK_CLIENT_VERSION = "1.0.67"
+
+
 def get_xai_grok_client_version() -> str:
-    """Return configured xAI Grok CLI client version (default ``1.0.4``)."""
+    """Return the Grok CLI version sent as ``x-grok-client-version``."""
     raw = os.getenv("DALTON_XAI_GROK_CLIENT_VERSION", "").strip()
-    return raw or "1.0.4"
+    return raw or DEFAULT_XAI_GROK_CLIENT_VERSION
 
 
 def get_dalton_broker_url(host: str | None = None) -> str:

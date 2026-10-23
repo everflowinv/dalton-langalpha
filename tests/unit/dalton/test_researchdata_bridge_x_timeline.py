@@ -592,7 +592,8 @@ class TestHealthProbeWindows:
             _tool, args = health_mod.build_route_probe_spec(rid, "research")
             assert "start" in args, f"{rid} missing start"
             assert "end" in args, f"{rid} missing end"
-            assert args["start"] == (today - timedelta(days=30)).isoformat()
+            expected_days = 120 if rid == "transcript" else 30
+            assert args["start"] == (today - timedelta(days=expected_days)).isoformat()
             assert args["end"] == today.isoformat()
 
         _t, gp = health_mod.build_route_probe_spec("guidepoint", "research")

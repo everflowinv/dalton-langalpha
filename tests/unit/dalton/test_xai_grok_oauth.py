@@ -15,6 +15,8 @@ from unittest.mock import create_autospec, patch
 
 import httpx
 import pytest
+
+from src.dalton.settings import DEFAULT_XAI_GROK_CLIENT_VERSION
 import redis.asyncio
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
 from langchain_core.outputs import ChatGenerationChunk
@@ -474,7 +476,7 @@ def test_grok_client_headers_and_body_assembly() -> None:
     headers = client.default_headers or {}
     assert headers["Authorization"] == "Bearer fake-supergrok-jwt"
     assert headers["X-XAI-Token-Auth"] == "xai-grok-cli"
-    assert headers["x-grok-client-version"] == "1.0.4"
+    assert headers["x-grok-client-version"] == DEFAULT_XAI_GROK_CLIENT_VERSION
     assert headers["x-grok-model-override"] == "grok-4.7"
     assert headers["x-client-request-id"] == "thread-session-abc"
 
@@ -621,7 +623,7 @@ async def test_fetch_models_and_billing_and_error_classification() -> None:
     assert bill["subscription_tier"] == "supergrok"
     billing_headers = mock_http.get.call_args.kwargs["headers"]
     assert billing_headers["x-grok-client-mode"] == "cli"
-    assert billing_headers["x-grok-client-version"] == "1.0.4"
+    assert billing_headers["x-grok-client-version"] == DEFAULT_XAI_GROK_CLIENT_VERSION
 
     # Billing endpoint: 401/403 treated as token_expired
     mock_http.get.return_value = _make_response(401, text="Unauthorized")
@@ -1492,3 +1494,14 @@ async def test_chat_grok_non_streaming_ainvoke_aggregates_from_astream() -> None
     assert result.content == "Hello Grok!"
     assert len(observed_kwargs) == 1
     assert "run_manager" not in observed_kwargs[0]
+
+
+def test_http_426_outdated_client_is_a_clean_failure():
+    # cli-chat-proxy answers 426 to an outdated x-grok-client-version before doing any work.
+    from src.dalton.llm.complete import _classify_exception
+
+    class _Upgrade(Exception):
+        status_code = 426
+
+    exc = _Upgrade("Error code: 426 - {'error': 'Your Grok CLI version (1.0.4) is outdated.'}")
+    assert _classify_exception(exc, provider="xai-oauth", sdk="grok") == ("failed", "http_426")
