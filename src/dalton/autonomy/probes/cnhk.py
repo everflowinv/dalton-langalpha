@@ -1,4 +1,4 @@
-"""CN/HK filings probe: zero-token check for new A-share (including A+H) CNINFO filings via researchdata bridge."""
+"""CN/HK filings probe: zero-token check for new A-share and HKEX CNINFO filings via researchdata bridge."""
 
 from __future__ import annotations
 
@@ -26,20 +26,49 @@ CNHK_FILINGS_QUERY_LIMIT: int = 50
 MAX_SEEN_CNHK_FILINGS: int = 200
 _LAST_UNCONFIGURED_WARN_AT: float = 0.0
 
+_TRAD_TO_SIMP_TABLE: dict[int, int] = str.maketrans(
+    "業績預須購關連會議開報變辭資產組問詢監調減計劃終屆滿實財務佈",
+    "业绩预须购关连会议开报变辞资产组问询监调减计划终届满实财务布",
+)
+
 P1_KEYWORD_RULES: dict[str, tuple[str, ...]] = {
     "earnings": (
         "年度报告",
         "半年度报告",
         "季度报告",
         "业绩快报",
+        "年度业绩",
+        "中期业绩",
+        "季度业绩",
+        "末期业绩",
+        "业绩公告",
+        "业绩公布",
+        "全年业绩",
+        "财务业绩",
+        "年度業績",
+        "中期業績",
+        "季度業績",
+        "末期業績",
+        "業績公告",
     ),
     "forecast": (
         "业绩预告",
         "盈利警告",
         "盈警",
+        "盈利预告",
+        "正面盈利预告",
+        "盈利預告",
+        "正面盈利預告",
     ),
     "restructuring": (
         "重大资产重组",
+        "须予披露的交易",
+        "主要交易",
+        "非常重大的收购",
+        "关连交易",
+        "須予披露的交易",
+        "非常重大的收購",
+        "關連交易",
     ),
     "regulatory_inquiry": (
         "问询函",
@@ -50,6 +79,13 @@ P1_KEYWORD_RULES: dict[str, tuple[str, ...]] = {
     "shareholder_reduction": (
         "减持计划",
         "减持股份计划",
+    ),
+    # Board-meeting dates announce an upcoming results release. Next-day
+    # disclosure returns, appointments and generic "changes" are routine for
+    # large HK issuers (daily buyback filers) and stay P2.
+    "hk_corporate_actions": (
+        "董事会会议召开日期",
+        "董事會會議召開日期",
     ),
 }
 
@@ -66,6 +102,25 @@ P1_NEGATION_KEYWORDS: tuple[str, ...] = (
     "未实施",
     "不存在",
 )
+
+
+def normalize_cnhk_text(text: str) -> str:
+    """Normalize Traditional Chinese characters in CN/HK filing titles into Simplified Chinese for keyword matching."""
+    return (text or "").translate(_TRAD_TO_SIMP_TABLE)
+
+
+def normalize_hk_ticker(ticker: str) -> str:
+    """Normalize a Hong Kong ticker (``700``, ``0700.HK``, ``00700.HK``, ``HK700``) into 5-digit zero-padded form (``00700``)."""
+    t = (ticker or "").strip().upper()
+    m_suf = re.fullmatch(r"(\d{1,5})\.HK", t)
+    if m_suf:
+        return m_suf.group(1).zfill(5)
+    m_pref = re.fullmatch(r"HK(\d{1,5})", t)
+    if m_pref:
+        return m_pref.group(1).zfill(5)
+    if re.fullmatch(r"\d{1,5}", t):
+        return t.zfill(5)
+    return t
 
 
 def normalize_cn_ticker(ticker: str) -> str:
@@ -91,7 +146,7 @@ def normalize_cn_ticker(ticker: str) -> str:
 
 
 def classify_cnhk_ticker(ticker: str) -> tuple[str, Optional[str]]:
-    """Classify ``ticker`` as ``('cn', code6)``, ``('hk_only', None)``, or ``('other', None)``."""
+    """Classify ``ticker`` as ``('cn', code6)``, ``('hk', code5)``, or ``('other', None)``."""
     t = (ticker or "").strip().upper()
     if not t or t == "UNKNOWN":
         return "other", None
@@ -103,8 +158,8 @@ def classify_cnhk_ticker(ticker: str) -> tuple[str, Optional[str]]:
         return "cn", m_suf.group(1)
     if re.fullmatch(r"\d{6}", t):
         return "cn", t
-    if t.endswith(".HK") or re.fullmatch(r"HK\d{1,5}", t) or re.fullmatch(r"\d{1,5}", t):
-        return "hk_only", None
+    if re.fullmatch(r"(\d{1,5})\.HK", t) or re.fullmatch(r"HK(\d{1,5})", t) or re.fullmatch(r"\d{1,5}", t):
+        return "hk", normalize_hk_ticker(t)
     return "other", None
 
 
@@ -116,12 +171,12 @@ def compute_cnhk_filing_hash(f_date: str, title: str, pdf_link: str) -> str:
 
 def classify_cnhk_priority(title: str, category: str = "") -> str:
     """Classify announcement priority as P1 or P2 based on ``P1_KEYWORD_RULES`` and ``P1_NEGATION_KEYWORDS``."""
-    title_str = title or ""
-    if any(neg in title_str for neg in P1_NEGATION_KEYWORDS):
+    title_str = normalize_cnhk_text(title or "")
+    if any(normalize_cnhk_text(neg) in title_str for neg in P1_NEGATION_KEYWORDS):
         return "P2"
-    combined = f"{title_str} {category or ''}"
+    combined = f"{title_str} {normalize_cnhk_text(category or '')}"
     for kw in P1_KEYWORDS:
-        if kw in combined:
+        if normalize_cnhk_text(kw) in combined:
             return "P1"
     return "P2"
 
@@ -221,7 +276,7 @@ async def _query_bridge_cnhk_filings(
     limit: int = 50,
     allow_network: bool = True,
 ) -> dict[str, Any]:
-    """Query CNINFO filings for 6-digit A-share ``ticker`` via researchdata bridge in a worker thread."""
+    """Query CNINFO filings for A-share and HK ``ticker`` via researchdata bridge in a worker thread."""
     if not allow_network:
         return {"ok": True, "rows": []}
     bridge_url = _resolve_bridge_url()
@@ -403,17 +458,14 @@ async def probe_cnhk_filings(
     clock: Callable[[], float] = time.monotonic,
     total_budget_s: float = CNHK_PROBE_TOTAL_BUDGET_S,
 ) -> tuple[list[ProbeSignal], dict[str, Any]]:
-    """Check CNINFO filings via researchdata bridge (`cn-hk` / `filings`) for A-share tickers."""
+    """Check CNINFO filings via researchdata bridge (`cn-hk` / `filings`) for A-share and HK tickers."""
     state = dict(watch_state or {})
     kind, cn_code = classify_cnhk_ticker(ticker)
-    if kind == "hk_only":
-        state["cnhk_probe_unsupported"] = "hk_only"
-        return [], state
-    if kind != "cn" or not cn_code:
+    if kind not in ("cn", "hk") or not cn_code:
         return [], state
 
     state.pop("cnhk_probe_unsupported", None)
-    norm_ticker = normalize_cn_ticker(ticker)
+    norm_ticker = normalize_cn_ticker(ticker) if kind == "cn" else normalize_hk_ticker(ticker)
 
     if now is not None:
         et_today = now.astimezone(ET_TZ).date() if now.tzinfo is not None else now.date()
@@ -502,21 +554,24 @@ async def probe_cnhk_filings(
         new_hashes.append(f_hash)
 
         prio = classify_cnhk_priority(title, category)
+        payload: dict[str, Any] = {
+            "kind": "filing",
+            "source": "cninfo",
+            "ticker": cn_code,
+            "date": f_date,
+            "title": title,
+            "category": category,
+            "pdf_link": pdf_link,
+        }
+        if kind == "hk":
+            payload["market"] = "HK"
         signals.append(
             ProbeSignal(
                 probe="cnhk",
                 signal_key=f"filing:cninfo:{f_hash}",
                 priority=prio,
                 summary=f"{norm_ticker} 新巨潮公告（{prio}）（{f_date}）",
-                payload={
-                    "kind": "filing",
-                    "source": "cninfo",
-                    "ticker": cn_code,
-                    "date": f_date,
-                    "title": title,
-                    "category": category,
-                    "pdf_link": pdf_link,
-                },
+                payload=payload,
             )
         )
 

@@ -65,7 +65,7 @@ catalog_routes:
     category: finance
     title: 港A股财务公告
     rules: "operation=ask|filings"
-    description: "巨潮公告（`filings`）＋港 A 股财务、估值、资金面（`ask`）。"
+    description: "`filings` 覆盖 A 股和港股的法定公告（巨潮转载），港股约有 5% 的缺口，主要是仅英文版公告和股东大会投票结果，这类需要原文时，用 `web_search` 查 `site:hkexnews.hk`；港 A 股财务、估值、资金面（`ask`）。"
   fred:
     category: macro
     title: FRED宏观
@@ -130,9 +130,6 @@ direct_tools:
     description: "美股归一化XBRL财务事实(含重述)及报表原文，用于建模与核对。"
 
 unavailable_sources:
-  - id: hkexnews
-    title: 港交所披露易公告
-    note: "未接通，用 `web_search` 查 `site:hkexnews.hk`。"
   - id: futures_realtime
     title: 期货与大宗商品实时(非延迟)行情
     note: "yfinance期货延迟约15分钟，注明延迟。"

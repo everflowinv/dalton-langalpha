@@ -90,7 +90,7 @@ python3 .agents/skills/dalton-stock-move/scripts/move_quant.py analyze \
 - **在美上市外国私人发行人（ADR）**：额外包含 `6-K`、`20-F`。
 - 若有新 filing，用 `researchdata.finance(route="sec", ...)` 或 `get_sec_filing` 读取对应 Item / 附件正文（如 8-K EX-99.1），列出 filing 类型、提交日期、Item 号、accession 与链接。
 - **港股与 A 股公司（`route="cn-hk"`）**：
-  1. **法定公告检索（`operation="filings"`）**：在 PTC 中调用 `researchdata.finance(route="cn-hk", operation="filings", ticker=CODE_5_OR_6, start=SEARCH_START, end=min(SEARCH_END, TODAY), limit=20)`（`end` 不得晚于当天 `TODAY`，否则整次调用失败；港股传 5 位零填充纯数字如 `"00700"`，A 股传 6 位纯数字如 `"600519"`，不带 `.HK`/`.SS`/`.SZ` 后缀），调取巨潮资讯（cninfo）公告标题、日期、类别与 `pdf_link` 原文链接；若港股披露易（HKEXnews）公告（如业绩公告、内幕消息、翌日披露报表、股权变动）未被 `cn-hk` 的 `filings` 覆盖，必须使用 `web_search`（限定 `site:hkexnews.hk` 及检索窗口）查披露易并核对官方原文链接。
+  1. **法定公告检索（`operation="filings"`）**：在 PTC 中调用 `researchdata.finance(route="cn-hk", operation="filings", ticker=CODE_5_OR_6, start=SEARCH_START, end=min(SEARCH_END, TODAY), limit=20)`（`end` 不得晚于当天 `TODAY`，否则整次调用失败；港股传 5 位零填充纯数字如 `"00700"`，A 股传 6 位纯数字如 `"600519"`，不带 `.HK`/`.SS`/`.SZ` 后缀），调取巨潮资讯（cninfo）公告标题、日期、类别与 `pdf_link` 原文链接；查不到，或者需要仅英文版的公告时，再用 `web_search` 查 `site:hkexnews.hk`。
   2. **场内资金流、两融、龙虎榜、回购与 AH 溢价核查（`operation="ask"`）**：每次调用只查**单一意图**（严禁把多个意图拼成一条 query）：资金流类查询必须带上具体异动日/窗口日期（例如 `researchdata.finance(route="cn-hk", operation="ask", query="宁德时代 300750 2026-10-21 主力资金净流入和成交额", limit=20)`）；两融（`query=f"{code_or_name} {event_date} 两融"`）、龙虎榜（`query=f"{code_or_name} {event_date} 龙虎榜"`）、回购（`query=f"{code_or_name} 回购"`）、AH 溢价（`query="AH溢价"`）各自单独调用一条 `ask`。必须检查返回的 `summary` 与实际来源：若东财接口失败回退至同花顺当日即时口径，成稿必须标明口径，拿不到指定历史日数据则如实写明缺口，不得把即时/最新值当作窗口内历史日终数。若涉及财务数字，平台返回表仅作二手初值线索，核心财务数字必须回法定公告原文核实；回报计算须核对前/后复权、分红、拆股与交易/报表币种。
 - 若窗口内无新公告，明确写“窗口内无新 filing / 公告”。
 

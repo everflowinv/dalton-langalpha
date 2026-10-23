@@ -34,8 +34,10 @@ from src.dalton.autonomy.probes import COMPANY_PROBES
 from src.dalton.autonomy.probes.agenda import probe_agenda
 from src.dalton.autonomy.probes.cnhk import (
     classify_cnhk_priority,
+    classify_cnhk_ticker,
     compute_cnhk_filing_hash,
     normalize_cn_ticker,
+    normalize_hk_ticker,
     probe_cnhk_filings,
 )
 from src.dalton.autonomy.probes.director import probe_director
@@ -1111,21 +1113,21 @@ async def test_probe_cnhk_filings_full_contract(
 
     monkeypatch.setenv("DALTON_BRIDGE_MCP_URL", "http://127.0.0.1:8960/mcp/test-token")
 
-    # 1. Ticker normalization and pure HK skip
+    # 1. Ticker normalization (A-share and 5-digit zero-padded HK)
     assert normalize_cn_ticker("600519") == "600519.SS"
     assert normalize_cn_ticker("600519.SH") == "600519.SS"
     assert normalize_cn_ticker("SH600519") == "600519.SS"
     assert normalize_cn_ticker("SZ300750") == "300750.SZ"
     assert normalize_cn_ticker("BJ830799") == "830799.BJ"
 
+    for hk_raw in ("700", "0700.HK", "00700.HK", "00700", "HK00700", "HK700"):
+        assert normalize_hk_ticker(hk_raw) == "00700"
+        assert classify_cnhk_ticker(hk_raw) == ("hk", "00700")
+    assert normalize_hk_ticker("9988.HK") == "09988"
+    assert classify_cnhk_ticker("9988.HK") == ("hk", "09988")
+
     mock_bridge = create_autospec(cnhk_mod._fetch_bridge_route_sync)
     monkeypatch.setattr(cnhk_mod, "_fetch_bridge_route_sync", mock_bridge)
-
-    for hk_ticker in ("0700.HK", "00700", "HK00700", "9988.HK"):
-        hk_sigs, hk_state = await probe_cnhk_filings(ticker=hk_ticker, watch_state={})
-        assert hk_sigs == []
-        assert hk_state.get("cnhk_probe_unsupported") == "hk_only"
-    assert mock_bridge.call_count == 0
 
     # US ticker is ignored without setting cnhk_probe_unsupported
     us_sigs, us_state = await probe_cnhk_filings(ticker="NVDA", watch_state={})
@@ -1133,13 +1135,88 @@ async def test_probe_cnhk_filings_full_contract(
     assert "cnhk_probe_unsupported" not in us_state
     assert mock_bridge.call_count == 0
 
-    # 2. Direct unit check of P1/P2 keyword rules (tightened full phrases + negation filter)
+    # HK tickers (700, 0700.HK, 00700.HK, 00700) query bridge with 5-digit code "00700" and set market="HK"
+    hk_rows = [
+        {
+            "date": "2026-10-15",
+            "title": "董事會會議召開日期",
+            "category": "港股公告",
+            "pdf_link": "http://static.cninfo.com.cn/finalpage/2026-10-15/hk00700.pdf",
+        },
+        {
+            "date": "2026-10-14",
+            "title": "截至二零二六年九月三十日止之股份發行人的證券變動月報表",
+            "category": "月報表",
+            "pdf_link": "http://static.cninfo.com.cn/finalpage/2026-10-14/hk00700_m.pdf",
+        },
+    ]
+    mock_bridge.return_value = {"ok": True, "ticker": "00700", "rows": hk_rows}
+    for hk_input in ("700", "0700.HK", "00700.HK", "00700"):
+        mock_bridge.reset_mock()
+        hk_sigs, hk_state = await probe_cnhk_filings(
+            ticker=hk_input,
+            watch_state={"cnhk_probe_unsupported": "hk_only"},
+            today=date(2026, 10, 15),
+        )
+        assert mock_bridge.call_count == 1
+        assert mock_bridge.call_args.kwargs["ticker"] == "00700"
+        assert "cnhk_probe_unsupported" not in hk_state
+        assert len(hk_sigs) == 2
+        assert [s.priority for s in hk_sigs] == ["P1", "P2"]
+        assert hk_sigs[0].summary == "00700 新巨潮公告（P1）（2026-10-15）"
+        assert hk_sigs[0].payload["ticker"] == "00700"
+        assert hk_sigs[0].payload["market"] == "HK"
+        assert hk_sigs[0].payload["source"] == "cninfo"
+        hk_wake_xml = format_wake_directive(
+            automation_name="dalton-0700.hk-watch",
+            ticker="0700.HK",
+            signals=[hk_sigs[0].to_dict()],
+        )
+        assert (
+            "     data (untrusted): source=cninfo | market=HK | date=2026-10-15 | "
+            "title=董事會會議召開日期 | pdf_link=http://static.cninfo.com.cn/finalpage/2026-10-15/hk00700.pdf"
+        ) in hk_wake_xml
+    mock_bridge.reset_mock()
+
+    # 2. Direct unit check of P1/P2 keyword rules (tightened full phrases + negation filter + HK Trad/Simp)
     for pos_title in (
         "盈利警告",
         "2026年三季度报告",
         "关于收到问询函的公告",
         "2026年第三季度报告（未经审计）",
         "未来三年股东回报规划暨2026年半年度报告",
+        # HK Traditional & Simplified keywords
+        "截至二零二六年十二月三十一日止年度之年度業績公告",
+        "2026年年度业绩",
+        "中期業績公告",
+        "…中期业绩公告",
+        "2026年中期业绩",
+        "第三季度業績",
+        "季度业绩公告",
+        "…季度业绩公告",
+        "末期業績公告",
+        "末期业绩",
+        "業績公告",
+        "业绩公告",
+        "…全年业绩公告",
+        "截至二零二五年十二月三十一日止年度全年业绩公布",
+        "截至二零二五年十二月三十一日止年度全年業績公布",
+        "截至二零二六年六月三十日止三个月及六个月业绩公布",
+        "内幕消息截至2026年6月30日止季度的未经审计财务业绩",
+        "内幕消息截至2026年6月30日止季度的未經審計財務業績",
+        "盈利預告",
+        "盈利预告",
+        "正面盈利預告",
+        "正面盈利预告",
+        "須予披露的交易",
+        "须予披露的交易",
+        "主要交易",
+        "非常重大的收購",
+        "非常重大的收购",
+        "關連交易",
+        "关连交易",
+        "董事會會議召開日期",
+        "董事会会议召开日期",
     ):
         assert classify_cnhk_priority(pos_title) == "P1", f"Expected P1 for {pos_title}"
     for neg_title in (
@@ -1152,6 +1229,15 @@ async def test_probe_cnhk_filings_full_contract(
         "未减持股份公告",
         "关于减持计划未实施的公告",
         "关于不存在重大资产重组事项的说明",
+        "股份回購",
+        "股份回购",
+        "翌日披露報表",
+        "翌日披露报表",
+        "更換核數師及執行董事變更",
+        "执行董事变更",
+        "獨立非執行董事委任",
+        "执行董事辞任",
+        "執行董事辭任",
     ):
         assert classify_cnhk_priority(neg_title) == "P2", f"Expected P2 for {neg_title}"
     assert classify_cnhk_priority("独立董事述职报告", "公司治理") == "P2"

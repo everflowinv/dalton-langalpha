@@ -82,7 +82,7 @@
 
 ## 8. 数字底表原则（Primary Table Rule）
 
-- **目标公司的历史财务数字只取一手法定底表**（美股 SEC 10-K/10-Q/20-F、港股 HKEX 披露易业绩公告与年报/中报、A 股巨潮资讯法定定期报告与公告附注）：研报、新闻、摘要或 `researchdata.finance(route="cn-hk", operation="ask")` 平台财务表里引用的目标公司历史财务数据只能作初筛线索与初值，入表与成稿前美股必须用 `dalton_sec` 或 `researchdata.finance(route="sec")` 核对底表，港股与 A 股必须用 `researchdata.finance(route="cn-hk", operation="filings", ticker=..., start=..., end=..., limit=...)` 调取官方公告原文/PDF（港股若 `cn-hk filings` 未覆盖则用 `web_search` 查 HKEXnews `site:hkexnews.hk` 原文链接）核实。
+- **目标公司的历史财务数字只取一手法定底表**（美股 SEC 10-K/10-Q/20-F、港股 HKEX 披露易业绩公告与年报/中报、A 股巨潮资讯法定定期报告与公告附注）：研报、新闻、摘要或 `researchdata.finance(route="cn-hk", operation="ask")` 平台财务表里引用的目标公司历史财务数据只能作初筛线索与初值，入表与成稿前美股必须用 `dalton_sec` 或 `researchdata.finance(route="sec")` 核对底表，港股与 A 股必须用 `researchdata.finance(route="cn-hk", operation="filings", ticker=..., start=..., end=..., limit=...)` 调取官方公告原文/PDF（查不到，或者需要仅英文版的公告时，再用 `web_search` 查 `site:hkexnews.hk`）核实。
 - **拿不到就写"本轮未取得"**：如果某个细分指标底表未披露，直接写"未披露 / 本轮未取得"，**严禁用口径相近但不同的数字顶替**（例如不得用总 GMV 顶替自营 GMV，不得用含税收入顶替不含税收入）。
 
 ---
@@ -113,7 +113,7 @@
 1. **平台财务表属二手初值，核心数字必须回法定公告核实**：
    - `researchdata.finance(route="cn-hk", operation="ask", query=..., limit=...)` 返回的利润表、资产负债表、现金流量表、财务指标、估值与分红回购汇总（底层源自 AkShare、东方财富、同花顺、新浪、腾讯等公开聚合接口）均属于**二手数据，仅可作为初筛与初值线索**。
    - 凡进入数字底表（`facts.md`）、财务镜头、财报点评或正式报告的**核心财务数字**（营业收入、毛利、营业利润、归母净利润、Non-IFRS/经调整利润、现金及定期存款、受限资金、理财/FVPL、有息负债、总股本、分红与实际回购金额），必须调用 `researchdata.finance(route="cn-hk", operation="filings", ticker=..., start=..., end=..., limit=...)` 获取巨潮资讯（cninfo）法定公告 PDF（`pdf_link`）或原文核实。
-   - **港股披露易（HKEXnews）退路**：若港股某份业绩公告、翌日披露报表（Next Day Disclosure Return）或通函未被 `cn-hk` 的 `operation="filings"` 覆盖，必须使用 `web_search` 检索港交所披露易（`site:hkexnews.hk` 或公司 IR 官网）并核对公告原文链接与正文。
+   - **港股披露易（HKEXnews）退路**：查不到，或者需要仅英文版的公告时，再用 `web_search` 查 `site:hkexnews.hk`。
 2. **Bridge 参数 Schema 与代码格式约束**：
    - `cn-hk` 只用 `operation`（`"ask"` 或 `"filings"`）、`ticker`、`query`、`start`（`YYYY-MM-DD`）、`end`（`YYYY-MM-DD`）、`limit`（`1..100`）。
    - `operation="filings"` 必传 `ticker`、`start`、`end`：`filings` 的 `end` 不得晚于当天（`TODAY`），否则整次调用失败（返回 `ok: false`）；当检索窗口终点做跨日外推（如 `end_plus_1d`）时，必须取 `end=min(end_plus_1d, TODAY)`。`ticker` 必须传**纯数字代码**——港股传 **5 位零填充数字**（如 `"00700"`、`"03690"`、`"09988"`），A 股传 **6 位纯数字**（如 `"600519"`、`"300750"`、`"000858"`），**不得带 `.HK` / `.SS` / `.SZ` 后缀**。
