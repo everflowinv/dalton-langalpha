@@ -248,6 +248,9 @@ async def test_automation_naming_templates_and_schedule_helper(monkeypatch):
     )
     assert res_create["ok"] is True
     assert res_create["action"] == "created"
+    # A cron job must leave with next_run_at set, or the scheduler never claims it.
+    assert store[0]["next_run_at"] is not None
+    assert store[0]["next_run_at"].tzinfo is not None
 
     # A8: naive next_run_at gets ZoneInfo("Asia/Shanghai") attached
     res_once = await schedule_dalton_automation_helper(

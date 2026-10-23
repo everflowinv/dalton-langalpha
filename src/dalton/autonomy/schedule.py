@@ -452,6 +452,15 @@ async def schedule_dalton_automation_helper(
         except Exception:
             next_dt = next_dt.replace(tzinfo=timezone.utc)
 
+    cron_for_next = merged_spec.get("cron_expression") or merged_spec.get("cron")
+    trigger_for_next = str(merged_spec.get("trigger_type") or ("cron" if cron_for_next else "once"))
+    if next_dt is None and trigger_for_next == "cron" and cron_for_next:
+        # The scheduler only claims rows with a non-null next_run_at; a cron job created
+        # without one never fires. Compute it the same way the upstream API does.
+        from src.server.services.automation_scheduler import AutomationScheduler
+
+        next_dt = AutomationScheduler.calculate_first_run(str(cron_for_next), tz or "UTC")
+
     description = merged_spec.get("description")
     cron_expression = merged_spec.get("cron_expression") or merged_spec.get("cron")
     trigger_type = str(merged_spec.get("trigger_type") or ("cron" if cron_expression else "once"))
