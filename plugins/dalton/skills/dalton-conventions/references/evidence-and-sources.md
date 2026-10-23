@@ -4,12 +4,13 @@
 
 当不同来源对同一事实或数字存在冲突时，严格按以下 6 级权威度从高到低采信（高于 `research-conventions` 的默认排序）：
 
-1. **Level 1 — 监管法定披露（`filing`）**：SEC 10-K/10-Q/8-K/20-F、港交所披露易公告、巨潮资讯法定财报。
-2. **Level 2 — 公司官方材料（`company`）**：业绩新闻稿（Earnings Release）、投资者演示文稿（IR Deck）、业绩电话会管理层正式发言（Prepared Remarks & Confirmed Q&A）。
-3. **Level 3 — 具名机构研报与官方统计（`broker_report` / `official_data`）**：具名卖方深度/点评研报（AlphaEngine、Sales Notes 原件）、央行/FRED/财政部/行业协会官方统计。
-4. **Level 4 — 第三方独立产业数据与同行交叉验证**：上下游上市公司披露、供应链独立调研、行业监测数据库。
-5. **Level 5 — 专家访谈与渠道调研（`expert`）**：Guidepoint 专家纪要、基金 Wiki 与 AlphaEngine 中的专家访谈（必须标明专家身份、日期与验证状态，经营数字标"单一来源估计"）。
-6. **Level 6 — 财经新闻与社媒讨论（`news` / `derived`）**：新闻报道、TMTB、FUNDA AI 摘要等**仅作研究线索**，涉及财务或经营数字时必须回溯到 Level 1–5 原始出处。
+1. **Level 1 — 监管法定披露（`filing`，默认 tier 1）**：SEC 10-K/10-Q/8-K/20-F、港交所披露易公告、巨潮资讯法定财报。
+2. **Level 2 — 公司官方材料与电话会转写（`company` / 知识层 `company_release`、`transcript`，默认 tier 2）**：业绩新闻稿（Earnings Release）、投资者演示文稿（IR Deck）、业绩电话会/发布会转写（Prepared Remarks & Confirmed Q&A，包括 AlphaEngine ASR 稿；卖方回访转写记 tier 3）。
+3. **Level 3 — 具名机构研报与一致预期（`broker_report` / `consensus`，默认 tier 3）**：具名卖方深度/点评研报（AlphaEngine、Sales Notes 原件）、卖方一致预期（`consensus`，直接记 `consensus` 而不必硬塞进 `broker_report`）。
+4. **Level 4 — 官方/协会统计与第三方独立产业数据（`official_data`，默认 tier 4）**：央行/FRED/财政部/行业协会官方统计、上下游上市公司披露、供应链独立调研、行业监测数据库。
+5. **Level 5 — 专家访谈与团队内部纪要（`expert` / `internal_note`，默认 tier 5）**：Guidepoint 专家纪要、基金 Wiki 与 AlphaEngine 中的专家访谈（必须标明专家身份、日期与验证状态，经营数字标"单一来源估计"），以及团队内部对话或纪要（`internal_note`，默认 tier 5，视引述内容可标 3–5）。
+6. **Level 6 — 财经新闻与社媒讨论（`news` / `derived`，默认 tier 6）**：新闻报道、TMTB、FUNDA AI 摘要等**仅作研究线索**，涉及财务或经营数字时必须回溯到 Level 1–5 原始出处。
+7. **本方模型推导（知识层 `model`，默认 tier 2–3）**：引用工作区财务模型（必须指向 `kind="model_cell"` 的具体 `Sheet!Cell`，且**不能标 tier 1**）。
 
 **绝对禁用来源**：**百度百科**（任何情况下不得作为事实、历史沿革或行业数据的来源）。
 
@@ -25,14 +26,14 @@
 |---|---|---|---|---|
 | `alphaengine` (`search_library` / `get_document`) | `alphaengine:{doc_id}` | 研报 → `broker_report`；公告 → `company`；业绩/调研纪要 → `company`；专家纪要 → `expert`；新闻 → `news` | `sources[0]` 机构名 | `publish_time` |
 | `guidepoint` (`search_library`) | `guidepoint:{sha1}` | `expert` | `"Guidepoint · {title}, {company}"`（**不写姓名**） | `date` (`call_date`) |
-| `transcript` (`transcript`) | `alphaengine:{doc_id}` | 公司电话会 → `company`；卖方回访 → `broker_report` | `sources` | `publish_time` |
-| `company-wiki` (`search` / `read` / `list`) | `wiki:<id>` | 专家访谈 → `expert`；管理层纪要 → `company`；券商研报/卖方交流/Earnings Update → `broker_report`；微信文章 → `news`；内部笔记 → `internal_note` | frontmatter `source`（无则写`"基金 wiki"`） | `date` (`document_date`) |
+| `transcript` (`transcript`) | `alphaengine:{doc_id}` | 公司电话会 → `_sources` 标 `company`，知识层 `source.type` 记 `transcript`（tier 2，含 AlphaEngine ASR 稿）；卖方回访 → `broker_report` / `transcript`（tier 3） | `sources` | `publish_time` |
+| `company-wiki` (`search` / `read` / `list`) | `wiki:<id>` | 专家访谈 → `expert`；管理层纪要 → `company`（或知识层 `transcript`）；券商研报/卖方交流/Earnings Update → `broker_report`；微信文章 → `news`；内部笔记 → `internal_note`（默认 tier 5） | frontmatter `source`（无则写`"基金 wiki"`） | `date` (`document_date`) |
 | `sales-notes` (`search` / `read`) | `mail:<id>` / `digest:<id>` | 单封邮件 → `broker_report`；汇总层 `layer=digest` → `derived` (`independent=false`) | 发件人 `original_source` | `date` (`document_date`) |
 | `tmtb` (`search` / `read`) | `tmtb:<id>` | `news`（第三方通讯） | `"TMTB"` | `date` |
 | `funda-ai` (`search` / `read`) | `funda:<id>` | `derived` (`independent=false`) | `"FUNDA AI"` | `published_at` |
 | `all` (`search` 联搜：本地 4 库 + AlphaEngine + Guidepoint) | 保留各源 `document_id`，合并 `alternate_document_ids` | 按所属原始源规则映射 | 各源发布方 | 各源日期 |
 | `sec` (`researchdata` 或 `dalton_sec`) | `sec:{accession}` | `filing` | `"SEC EDGAR"` | `filing_date` (`filed`) |
-| `estimates` (`consensus`) | `estimates:yahoo:{ticker}:{fetched_at}` | `street_estimate` | `"Yahoo Finance via yfinance"` | `fetched_at` |
+| `estimates` (`consensus`) | `estimates:yahoo:{ticker}:{fetched_at}` | `_sources` 标 `street_estimate`；知识层 `source.type` 记 `consensus`（tier 3） | `"Yahoo Finance via yfinance"` | `fetched_at` |
 | `fred` / `treasury` | `fred:{series}` / `treasury:{dataset}` | `official_data` | `"FRED"` / `"US Treasury"` | `observation_date` |
 | `market-regime` (`snapshot` / `us_topbottom` / `crowding` / `cn_leverage`) | `regime:<op>:<date>` | `derived`（OpenClaw 监控二手读数） | `"OpenClaw"` | 数据日期（`date` / `trade_date` / `as_of`） |
 | `cn-hk` (`filings`) | `cn-hk:{ticker}:{date}:{index}` | `filing` | `"cninfo"`（巨潮资讯；港股未覆盖时补 HKEXnews 原文链接） | 公告日期 (`date`) |
@@ -60,7 +61,7 @@
 正文中引用任何预期、目标或门槛数字时，必须明确区分以下五类身份，**严禁混用或把分歧数字简单算术平均成所谓"市场共识"**：
 
 1. **公司指引（Company Guidance / Company Claim）**：管理层在财报或电话会给出的正式区间（注明日与口径，如 GAAP vs Non-GAAP）。
-2. **卖方一致预期（Street Consensus，`street_estimate`）**：如 Yahoo Finance / Visible Alpha / Bloomberg 汇总的均值与中位数（须写明取数时间 `fetched_at` 与样本分析师人数）。
+2. **卖方一致预期（Street Consensus，`_sources` 标 `street_estimate`，知识层 `source.type` 记 `consensus`，默认 tier 3）**：如 Yahoo Finance / Visible Alpha / Bloomberg 汇总的均值与中位数（须写明取数时间 `fetched_at` 与样本分析师人数；写入知识档案时直接用 `source.type="consensus"`，不要硬塞成 `broker_report`）。
 3. **具体机构预测（Named Broker Estimate，`broker_report`）**：如"Morgan Stanley（2026-10-12）预计 FY26 收入为……"。不同卖方存在明显分歧时，直接呈现分歧区间（如"多头卖方看 X，空头卖方看 Y"），**不得自行取平均数冒充共识**。
 4. **明确的买方门槛（Explicit Buy-Side Bar / Bogey）**：仅当研报或销售笔记（Sales Notes）明确写出买方预期（如"买方 bogey 在 +18% YoY"）时才可标为买方门槛，并注明来源机构与日期。
 5. **作者判断 / 模型推导（House View / `judgement` / `model-derived`）**：我们自己的预测或由 `implied_model` 倒推的数字，必须与外部预期严格分开。

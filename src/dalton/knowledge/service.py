@@ -77,7 +77,12 @@ def canonical_json(doc: dict[str, Any]) -> tuple[str, str]:
     return text, sha
 
 
-def _normalize_legacy_aliases(doc_key: str, doc: dict[str, Any]) -> None:
+def _normalize_legacy_aliases(
+    doc_key: str,
+    doc: dict[str, Any],
+    *,
+    old_doc: dict[str, Any] | None = None,
+) -> None:
     """Normalize common field aliases (e.g. model_ref{file,sheet,cell}) in-place before schema validation."""
     if doc_key == "thesis":
         if "evidence_log" in doc and "evidence" not in doc:
@@ -94,6 +99,29 @@ def _normalize_legacy_aliases(doc_key: str, doc: dict[str, Any]) -> None:
                     if sheet and cell and "!" not in str(cell):
                         mref["cell"] = f"{sheet}!{cell}"
                 mref.setdefault("kind", "model_cell")
+        old_ev_list = (old_doc or {}).get("evidence") or (old_doc or {}).get("evidence_log") or []
+        old_ev_ids = {
+            str(item.get("id"))
+            for item in (old_ev_list if isinstance(old_ev_list, list) else [])
+            if isinstance(item, dict) and item.get("id")
+        }
+        for ev in doc.get("evidence") or []:
+            if not isinstance(ev, dict):
+                continue
+            ev_id = str(ev.get("id") or "")
+            if ev_id and ev_id in old_ev_ids:
+                continue
+            src = ev.get("source")
+            if isinstance(src, dict) and src.get("type") == "model":
+                ref = src.get("ref")
+                if isinstance(ref, dict):
+                    if "file" in ref and "path" not in ref:
+                        ref["path"] = ref.pop("file")
+                    if "sheet" in ref:
+                        sheet = ref.pop("sheet")
+                        cell = ref.get("cell") or ""
+                        if sheet and cell and "!" not in str(cell):
+                            ref["cell"] = f"{sheet}!{cell}"
 
 
 def _resolve_container_at_path(doc: dict[str, Any], path: str) -> Any:
@@ -810,7 +838,7 @@ async def apply_update(
             "message": f"- {e.path}: {e.code} ({e.message})",
         }
 
-    _normalize_legacy_aliases(doc_key, new_doc)
+    _normalize_legacy_aliases(doc_key, new_doc, old_doc=base_doc)
     if doc_key == "models":
         await _populate_model_sha256(new_doc, backend)
 
@@ -835,7 +863,14 @@ async def apply_update(
         reason=reason,
     )
     has_hard_invariant_error = any(
-        err.get("code") in ("append_only_violation", "official_is_publish_only", "target_needs_model_cell")
+        err.get("code")
+        in (
+            "append_only_violation",
+            "official_is_publish_only",
+            "target_needs_model_cell",
+            "model_tier_1_forbidden",
+            "model_needs_model_cell",
+        )
         for err in val.errors
     )
     if not val.ok and not has_hard_invariant_error:
@@ -937,14 +972,20 @@ async def apply_update(
     new_no = version_row["version_no"]
     was_str = f" (was v{latest_no})" if latest_no is not None else " (initial)"
     ops_str = "; ".join(op_summaries[:5])
+    if len(op_summaries) > 5:
+        ops_str += f"; …等共 {len(op_summaries)} 条"
     md_file = rendered_path(doc_key)
     render_str = f" Rendered {md_file}." if md_file else ""
     warn_str = ""
     if val.warnings or extra_notes:
-        all_w = [
+        w_items = [
             f"{w['code']}: {w['message']}" for w in val.warnings[:5]
-        ] + extra_notes
-        warn_str = f" {len(all_w)} warning(s): " + "; ".join(all_w)
+        ]
+        if len(val.warnings) > 5:
+            w_items.append(f"…等共 {len(val.warnings)} 条")
+        all_w = w_items + extra_notes
+        total_w = len(val.warnings) + len(extra_notes)
+        warn_str = f" {total_w} warning(s): " + "; ".join(all_w)
 
     msg = f"Saved {doc_key} v{new_no}{was_str}: {ops_str}.{render_str}{warn_str}"
     return {
@@ -985,17 +1026,11 @@ async def append_verdict(
                 trig_obj = v_copy.get("trigger")
                 if isinstance(trig_obj, dict) and not trig_obj.get("ref"):
                     trig_obj["ref"] = sig_val.strip()
-    now_iso = (
-        datetime.now(timezone.utc)
-        .replace(microsecond=0)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
-    v_copy.setdefault("at", now_iso)
+    # Temporary placeholders for schema check; real timestamp & ID are generated once in insert_verdict
+    v_copy["at"] = "1970-01-01T00:00:00Z"
     had_id = bool(v_copy.get("id"))
     if not had_id:
-        # Temporary placeholder for schema check; real ID assigned in DB under advisory lock
-        v_copy["id"] = f"VD-{now_iso[:10].replace('-', '')}-01"
+        v_copy["id"] = "VD-19700101-01"
 
     thesis_row = await db_knowledge.latest_valid_version(workspace_id, "thesis")
     thesis_doc = thesis_row["content"] if thesis_row else None
@@ -1019,6 +1054,7 @@ async def append_verdict(
             "message": f"Invalid verdict payload (NOT SAVED):\n{val.format_problems()}{hint_suffix}",
         }
 
+    v_copy.pop("at", None)
     if not had_id:
         v_copy.pop("id", None)
 
@@ -1033,6 +1069,24 @@ async def append_verdict(
     )
     verdict_id = verdict_row["verdict_id"]
     word = verdict_row["word"]
+    raw_verdict_at = verdict_row.get("verdict_at")
+    verdict_dt: datetime | None = None
+    if isinstance(raw_verdict_at, datetime):
+        verdict_dt = (
+            raw_verdict_at.replace(tzinfo=timezone.utc)
+            if raw_verdict_at.tzinfo is None
+            else raw_verdict_at.astimezone(timezone.utc)
+        )
+        verdict_at_iso = verdict_dt.isoformat().replace("+00:00", "Z")
+    elif isinstance(raw_verdict_at, str) and raw_verdict_at:
+        verdict_at_iso = raw_verdict_at
+        try:
+            verdict_dt = datetime.fromisoformat(raw_verdict_at.replace("Z", "+00:00"))
+        except ValueError:
+            verdict_dt = None
+    else:
+        payload_at = (verdict_row.get("payload") or {}).get("at")
+        verdict_at_iso = str(payload_at or "")
 
     # Automatically update agenda if an agenda document exists or agenda_ops were passed
     agenda_row = await db_knowledge.latest_version(workspace_id, "agenda")
@@ -1045,7 +1099,7 @@ async def append_verdict(
                 "value": {
                     "verdict_id": verdict_id,
                     "word": word,
-                    "at": v_copy["at"],
+                    "at": verdict_at_iso,
                 },
             }
         ]
@@ -1075,7 +1129,7 @@ async def append_verdict(
                 for q in (agenda_content.get("open_questions") or [])
             ):
                 att: dict[str, Any] = {
-                    "at": v_copy["at"],
+                    "at": verdict_at_iso,
                     "method": f"verdict {verdict_id}",
                     "progress": v_copy["progress"],
                     "note": v_copy["event"],
@@ -1104,6 +1158,7 @@ async def append_verdict(
             thread_id=thread_id,
             run_id=run_id,
             tool_call_id=tool_call_id,
+            now=verdict_dt,
         )
         if ag_res.get("ok"):
             agenda_version_no = ag_res.get("version_no")

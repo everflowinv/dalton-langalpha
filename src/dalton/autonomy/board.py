@@ -185,7 +185,7 @@ async def build_coverage_board(
                            trigger_kind, trigger_ref, progress, next_due, payload,
                            conversation_thread_id, created_at
                     FROM dalton_verdicts
-                    ORDER BY workspace_id, verdict_at DESC
+                    ORDER BY workspace_id, verdict_at DESC, length(verdict_id) DESC, verdict_id DESC
                     """
                 )
                 verdict_rows = await cur.fetchall()

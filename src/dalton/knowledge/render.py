@@ -173,19 +173,21 @@ def render_agent_block(
 
     one_liner = _trunc(t.get("one_liner") or c.get("one_liner") or "待初始化", 110)
     hv = t.get("house_view") or {}
-    hv_stance = hv.get("stance", "no_view")
-    hv_conv = hv.get("conviction", "none")
+    hv_stance = hv.get("stance") or "no_view"
+    hv_conv = hv.get("conviction") or "none"
     v_str = f"v{thesis_version_no}" if thesis_version_no else "v1"
-    as_of_date = str(t.get("as_of") or "")[:10] or "—"
-    one_liner_line = f"{one_liner}；house view：{hv_stance} / {hv_conv}（{v_str}，{as_of_date}）。"
+    as_of_date = str(t.get("as_of") or "")[:10]
+    ver_meta = f"{v_str}，{as_of_date}" if as_of_date else v_str
+    one_liner_line = f"{one_liner}；house view：{hv_stance} / {hv_conv}（{ver_meta}）。"
 
     official = t.get("official")
     if isinstance(official, dict) and official.get("version_no"):
         off_date = str(official.get("approved_at") or "")[:10]
-        official_line = (
-            f"thesis v{official['version_no']}，{off_date} "
-            f"{official.get('approved_by', 'PM')} 批准（publication {official.get('publication_id', '')[:8]}）"
-        )
+        approved_by = official.get("approved_by") or "PM"
+        pub_id = str(official.get("publication_id") or "")[:8]
+        date_prefix = f"{off_date} " if off_date else ""
+        pub_suffix = f"（publication {pub_id}）" if pub_id else ""
+        official_line = f"thesis v{official['version_no']}，{date_prefix}{approved_by} 批准{pub_suffix}"
     else:
         official_line = "尚未发布正式版本（迁移观点或研究草稿，待复核）"
 
@@ -193,17 +195,23 @@ def render_agent_block(
     pillar_parts = [f"aggregate {agg_status}"]
     for p in (t.get("pillars") or [])[:5]:
         if isinstance(p, dict):
-            pillar_parts.append(f"{p.get('id', '?')} {p.get('status', '?')}")
+            p_tokens = [str(x) for x in (p.get("id") or "?", p.get("status")) if x]
+            if p_tokens:
+                pillar_parts.append(" ".join(p_tokens))
     thesis_status_line = "｜".join(pillar_parts)
 
     debate_parts: list[str] = []
     for db_item in (d.get("debates") or [])[:3]:
         if isinstance(db_item, dict):
             mv = db_item.get("my_view") or {}
-            debate_parts.append(
-                f"{db_item.get('id', 'D?')} {_trunc(db_item.get('variable'), 28)}"
-                f"（我方：{mv.get('side', '?')}/{mv.get('confidence', '?')}）"
+            d_head = " ".join(
+                str(x)
+                for x in (db_item.get("id") or "D?", _trunc(db_item.get("variable"), 28))
+                if x
             )
+            view_tokens = [str(x) for x in (mv.get("side"), mv.get("confidence")) if x]
+            view_suffix = f"（我方：{'/'.join(view_tokens)}）" if view_tokens else ""
+            debate_parts.append(f"{d_head}{view_suffix}")
     debates_line = "｜".join(debate_parts) if debate_parts else "暂无"
 
     pending_vals = [
@@ -211,22 +219,40 @@ def render_agent_block(
         for v in (a.get("next_validations") or [])
         if isinstance(v, dict) and v.get("status") == "pending"
     ]
+    next_validation: dict[str, str] | None = None
     if pending_vals:
         v0 = pending_vals[0]
-        next_validation_line = (
-            f"{v0.get('id', 'V?')} {v0.get('due', '')} {_trunc(v0.get('what'), 45)}"
-            f"：{_trunc(v0.get('expected'), 45)}"
-        )
+        v_id = str(v0.get("id") or "V?")
+        v_due = str(v0.get("due") or "").strip()
+        v_what = _trunc(v0.get("what"), 45)
+        v_exp = _trunc(v0.get("expected"), 45)
+        next_validation = {
+            "id": v_id,
+            "due": v_due,
+            "what": v_what,
+            "expected": v_exp,
+        }
+        head_parts = [x for x in (v_id, v_due, v_what) if x]
+        next_validation_line = " ".join(head_parts) + (f"：{v_exp}" if v_exp else "")
     else:
         next_validation_line = "暂无待验证项"
 
     lv = last_verdict or a.get("last_verdict")
+    last_verdict_item: dict[str, str] | None = None
     if isinstance(lv, dict) and (lv.get("verdict_id") or lv.get("id")):
-        vid = lv.get("verdict_id") or lv.get("id")
-        word = lv.get("word") or lv.get("verdict") or "NO_CHANGE"
-        w_zh = VERDICT_ZH.get(word, word)
+        vid = str(lv.get("verdict_id") or lv.get("id"))
+        word = str(lv.get("word") or lv.get("verdict") or "NO_CHANGE")
+        w_zh = VERDICT_ZH.get(word, word) or ""
         ev_text = _trunc(lv.get("event") or "", 45)
-        last_verdict_line = f"{vid} {w_zh}" + (f"（{ev_text}）" if ev_text else "")
+        last_verdict_item = {
+            "id": vid,
+            "word_zh": w_zh,
+            "event": ev_text,
+        }
+        last_verdict_line = (
+            " ".join(x for x in (vid, w_zh) if x)
+            + (f"（{ev_text}）" if ev_text else "")
+        )
     else:
         last_verdict_line = "暂无"
 
@@ -237,7 +263,7 @@ def render_agent_block(
     ]
     if waiting_handoffs:
         waiting_pm_line = "｜".join(
-            f"{h.get('id', 'H?')} {_trunc(h.get('what'), 40)}"
+            " ".join(x for x in (str(h.get("id") or "H?"), _trunc(h.get("what"), 40)) if x)
             for h in waiting_handoffs[:3]
         )
     else:
@@ -246,7 +272,7 @@ def render_agent_block(
     model_current = (
         f"当前 {m['current']}" if isinstance(m, dict) and m.get("current") else "暂无正式模型"
     )
-    alert_lines = "；".join(alerts[:3]) if alerts else ""
+    alert_lines = "；".join(str(x) for x in alerts[:3] if x) if alerts else ""
 
     tmpl = _jinja_env().get_template("agent_block.md.j2")
     rendered = tmpl.render(
@@ -255,7 +281,9 @@ def render_agent_block(
         official_line=official_line,
         thesis_status_line=thesis_status_line,
         debates_line=debates_line,
+        next_validation=next_validation,
         next_validation_line=next_validation_line,
+        last_verdict_item=last_verdict_item,
         last_verdict_line=last_verdict_line,
         waiting_pm_line=waiting_pm_line,
         model_current=model_current,

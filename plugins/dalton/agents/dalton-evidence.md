@@ -25,10 +25,10 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 
 1. **六级来源层级**（由高到低）：
    - Tier 1：`filing`（SEC 10-K/10-Q/8-K/20-F/6-K、交易所正式公告）
-   - Tier 2：`company_release`（公司 IR 新闻稿、业绩演示材料、官方电话会原文）
-   - Tier 3：`broker_report`（具名卖方深度报告、sales notes）
+   - Tier 2：`company_release`（公司 IR 新闻稿、业绩演示材料）、`transcript`（电话会/业绩会转写，包括 AlphaEngine ASR 稿；卖方回访记 tier 3）
+   - Tier 3：`broker_report`（具名卖方深度报告、sales notes）、`consensus`（卖方一致预期）
    - Tier 4：`official_data`（政府统计、监管机构、行业协会数据）
-   - Tier 5：`expert`（专家访谈、管理层小范围交流、Guidepoint 纪要，必须标明专家身份）
+   - Tier 5：`expert`（专家访谈、管理层小范围交流、Guidepoint 纪要，必须标明专家身份）、`internal_note`（团队内部对话或纪要，默认 tier 5，可标 3–5）
    - Tier 6：`news`（一般媒体与社区信号，只作线索，不能单独支撑核心数字）
    - **禁用来源**：百度百科等无溯源百科页面。
 2. **同源转述去重**：同一份研报或同一个数据点被邮件、TMTB、FUNDA AI、digest 或 X 转述时，只算**一条来源链**（记录最早或最完整的原始出处），不得拼凑成“多家机构共识”。只有单一来源时必须标明“单源观点”。

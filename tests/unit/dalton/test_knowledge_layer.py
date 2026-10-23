@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -152,7 +152,7 @@ def test_paths_and_headers() -> None:
     assert data_path("thesis") == "data/thesis.json"
     assert rendered_path("thesis") == "thesis.md"
     assert rendered_path("company") is None
-    dt = datetime(2026, 10, 18, 9, 30, 0, tzinfo=timezone.utc)
+    dt = datetime(2026, 10, 18, 9, 30, 0, tzinfo=UTC)
     assert history_path("thesis", 3, dt) == "history/thesis/20261018T093000Z-v0003.json"
     assert (
         history_edited_md_path("debate", 12, dt)
@@ -264,7 +264,7 @@ def test_hard_invariants_i1_i2_i3() -> None:
 
 
 def test_ops_apply_and_server_maintained_fields() -> None:
-    now = datetime(2026, 10, 18, 15, 0, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 10, 18, 15, 0, 0, tzinfo=UTC)
     base_thesis = _sample_thesis_doc()
 
     # 1. Test `set` on house_view.stance -> automatically appends house_view_history
@@ -503,6 +503,7 @@ def test_migrated_4_companies_pass_all_schemas_and_debate_coverage() -> None:
 @pytest.mark.asyncio
 async def test_service_apply_update_and_append_verdict(monkeypatch: pytest.MonkeyPatch) -> None:
     from unittest.mock import create_autospec
+
     from src.dalton.database import knowledge as db_knowledge
     from src.dalton.database import verdicts as db_verdicts
     from src.dalton.knowledge import service
@@ -574,7 +575,7 @@ async def test_service_apply_update_and_append_verdict(monkeypatch: pytest.Monke
             "schema_valid": schema_valid,
             "edited_path": edited_path,
             "files_written_at": None,
-            "created_at": datetime(2026, 10, 18, 12, 0, 0, tzinfo=timezone.utc),
+            "created_at": datetime(2026, 10, 18, 12, 0, 0, tzinfo=UTC),
         }
         rows.append(row)
         return row
@@ -585,7 +586,7 @@ async def test_service_apply_update_and_append_verdict(monkeypatch: pytest.Monke
         for rows in store.values():
             for r in rows:
                 if r["knowledge_version_id"] == kv_id:
-                    r["files_written_at"] = datetime.now(timezone.utc)
+                    r["files_written_at"] = datetime.now(UTC)
 
     mock_insert_verdict = create_autospec(db_verdicts.insert_verdict)
 
@@ -605,7 +606,7 @@ async def test_service_apply_update_and_append_verdict(monkeypatch: pytest.Monke
         row = {
             "verdict_id": vid,
             "workspace_id": workspace_id,
-            "verdict_at": datetime(2026, 10, 18, 12, 0, 0, tzinfo=timezone.utc),
+            "verdict_at": datetime(2026, 10, 18, 12, 0, 0, tzinfo=UTC),
             "word": v["verdict"],
             "payload": v,
         }
@@ -692,7 +693,7 @@ async def test_service_apply_update_and_append_verdict(monkeypatch: pytest.Monke
 
 
 def test_question_backoff_stalled_duration_and_new_evidence_reset() -> None:
-    now = datetime(2026, 10, 18, 12, 0, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 10, 18, 12, 0, 0, tzinfo=UTC)
     # 1. Stalled for 10 days (2026-10-01 to 2026-10-11 = 240h) -> 0.5 * 240h = 120h (5 days) -> 2026-10-16
     agenda_doc, _ = apply_ops(
         "agenda",
@@ -784,6 +785,7 @@ async def test_field_and_path_repair_with_warnings_and_assist_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from unittest.mock import create_autospec
+
     from src.dalton.database import knowledge as db_knowledge
     from src.dalton.knowledge import service
     from src.dalton.knowledge.ops import repair_knowledge_ops
@@ -845,7 +847,7 @@ async def test_field_and_path_repair_with_warnings_and_assist_fallback(
             "source": source,
             "warnings": warnings or [],
             "schema_valid": True,
-            "created_at": datetime(2026, 10, 18, 12, 0, 0, tzinfo=timezone.utc),
+            "created_at": datetime(2026, 10, 18, 12, 0, 0, tzinfo=UTC),
         }
         rows.append(row)
         return row
@@ -1023,6 +1025,7 @@ async def test_validation_failure_includes_expected_schema_structure_and_enum(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from unittest.mock import create_autospec
+
     from src.dalton.database import knowledge as db_knowledge
     from src.dalton.database import verdicts as db_verdicts
     from src.dalton.knowledge import service
@@ -1037,10 +1040,11 @@ async def test_validation_failure_includes_expected_schema_structure_and_enum(
             return_value={"workspace_id": "ws1", "user_id": "u1"},
         ),
     )
+    mock_latest = create_autospec(db_knowledge.latest_version, return_value=None)
     monkeypatch.setattr(
         db_knowledge,
         "latest_version",
-        create_autospec(db_knowledge.latest_version, return_value=None),
+        mock_latest,
     )
     monkeypatch.setattr(
         db_knowledge,
@@ -1161,5 +1165,742 @@ async def test_validation_failure_includes_expected_schema_structure_and_enum(
     assert truncated_struct.splitlines()[-1] == "…（其余字段省略）"
 
 
+def test_thesis_source_types_and_model_cell_tier_constraints() -> None:
+    """Verify expanded source.type enum (consensus, transcript, internal_note) and model cell/tier constraints."""
+    from src.dalton.knowledge.validate import _load_schemas_and_registry
+
+    schemas, _ = _load_schemas_and_registry()
+    common_enum = schemas["common"]["$defs"]["sourceType"]["enum"]
+    thesis_enum = schemas["thesis"]["$defs"]["evidence"]["properties"]["source"]["properties"]["type"]["enum"]
+    assert common_enum == thesis_enum
+    for required_type in ("consensus", "transcript", "internal_note", "legacy_thesis"):
+        assert required_type in thesis_enum
+
+    doc = _sample_thesis_doc()
+    doc["evidence"].extend(
+        [
+            {
+                "id": "E-20261023-02",
+                "at": "2026-10-23T10:00:00Z",
+                "period": "FY2026",
+                "source": {
+                    "type": "consensus",
+                    "identity": "Visible Alpha consensus",
+                    "tier": 3,
+                    "ref": {"kind": "url", "url": "https://example.com/va"},
+                },
+                "fact": "FY26 consensus revenue $215bn",
+                "pillar_ids": ["P1"],
+                "signal": "neutral",
+                "quality": "high",
+            },
+            {
+                "id": "E-20261023-03",
+                "at": "2026-10-23T11:00:00Z",
+                "period": "3Q26",
+                "source": {
+                    "type": "transcript",
+                    "identity": "META 3Q26 Earnings Call AlphaEngine ASR",
+                    "tier": 2,
+                    "ref": {"kind": "file", "path": "research/3q26-transcript.md"},
+                },
+                "fact": "Management noted AI ad ranking drove +4% conversions",
+                "pillar_ids": ["P1"],
+                "signal": "confirming",
+                "quality": "high",
+            },
+            {
+                "id": "E-20261023-04",
+                "at": "2026-10-23T12:00:00Z",
+                "period": "3Q26",
+                "source": {
+                    "type": "internal_note",
+                    "identity": "TMT group internal discussion",
+                    "tier": 5,
+                    "ref": {"kind": "file", "path": "research/internal-note.md"},
+                },
+                "fact": "Internal channel check notes steady CPMs",
+                "pillar_ids": ["P1"],
+                "signal": "mildly_confirming",
+                "quality": "medium",
+            },
+            {
+                "id": "E-20261023-05",
+                "at": "2026-10-23T13:00:00Z",
+                "period": "FY2026",
+                "source": {
+                    "type": "model",
+                    "identity": "META-model-v01",
+                    "tier": 2,
+                    "ref": {
+                        "kind": "model_cell",
+                        "path": "model/META-model-v01.xlsx",
+                        "cell": "Model!F42",
+                    },
+                },
+                "fact": "Implied FY26 FCF yield 4.8%",
+                "pillar_ids": ["P1"],
+                "signal": "confirming",
+                "quality": "high",
+            },
+        ]
+    )
+    res_ok = validate_update("thesis", None, doc, reason="Valid expanded source types")
+    assert res_ok.ok, res_ok.format_problems()
+    assert not any(w["code"] == "source_tier_mismatch" for w in res_ok.warnings)
+
+    # model with tier 1 must be rejected
+    bad_tier_doc = copy.deepcopy(doc)
+    bad_tier_doc["evidence"][-1]["source"]["tier"] = 1
+    res_bad_tier = validate_update("thesis", None, bad_tier_doc, reason="Model tier 1 invalid")
+    assert not res_bad_tier.ok
+    assert any(e["code"] == "model_tier_1_forbidden" for e in res_bad_tier.errors)
+
+    # model without model_cell ref must be rejected when newly added
+    bad_ref_doc = copy.deepcopy(doc)
+    bad_ref_doc["evidence"][-1]["source"]["ref"] = {"kind": "file", "path": "research/note.md"}
+    res_bad_ref = validate_update("thesis", None, bad_ref_doc, reason="Model without model_cell")
+    assert not res_bad_ref.ok
+    assert any(e["code"] == "model_needs_model_cell" for e in res_bad_ref.errors)
 
 
+@pytest.mark.asyncio
+async def test_legacy_model_evidence_preserved_while_new_invalid_model_evidence_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Existing legacy model evidence (tier 1, no model_cell) is allowed on update; new invalid model evidence is rejected."""
+    from unittest.mock import create_autospec
+
+    from src.dalton.database import knowledge as db_knowledge
+    from src.dalton.knowledge import service
+
+    legacy_doc = _sample_thesis_doc()
+    legacy_doc["evidence"].append(
+        {
+            "id": "E-20261001-01",
+            "at": "2026-10-01T00:00:00Z",
+            "period": "FY2026",
+            "source": {
+                "type": "model",
+                "identity": "Legacy DCF summary",
+                "tier": 1,
+                "ref": {"kind": "file", "path": "research/legacy-model-note.md"},
+            },
+            "fact": "Legacy model implied $600",
+            "pillar_ids": ["P1"],
+            "signal": "confirming",
+            "quality": "medium",
+        }
+    )
+
+    current_state: dict[str, Any] = {
+        "version_no": 1,
+        "content": copy.deepcopy(legacy_doc),
+        "schema_valid": True,
+    }
+
+    monkeypatch.setattr(
+        service,
+        "verify_workspace_access",
+        create_autospec(service.verify_workspace_access, return_value={"workspace_id": "ws1"}),
+    )
+    monkeypatch.setattr(
+        db_knowledge,
+        "latest_version",
+        create_autospec(db_knowledge.latest_version, side_effect=lambda ws, dk: copy.deepcopy(current_state)),
+    )
+    monkeypatch.setattr(
+        db_knowledge,
+        "latest_valid_version",
+        create_autospec(db_knowledge.latest_valid_version, return_value=None),
+    )
+
+    async def _fake_insert(**kwargs: Any) -> dict[str, Any]:
+        current_state["version_no"] = int(current_state["version_no"]) + 1
+        current_state["content"] = copy.deepcopy(kwargs["content"])
+        return {
+            "knowledge_version_id": "00000000-0000-0000-0000-000000000010",
+            "version_no": current_state["version_no"],
+            "doc_key": kwargs["doc_key"],
+            "content": kwargs["content"],
+            "created_at": datetime(2026, 10, 23, 12, 0, 0, tzinfo=UTC),
+        }
+
+    mock_insert = create_autospec(db_knowledge.insert_version)
+    mock_insert.side_effect = _fake_insert
+    monkeypatch.setattr(db_knowledge, "insert_version", mock_insert)
+
+    # 1. Appending a normal filing evidence entry to a doc with legacy tier-1 non-model_cell model evidence succeeds
+    res_normal = await service.apply_update(
+        user_id="u1",
+        workspace_id="ws1",
+        doc_key="thesis",
+        ops=[
+            {
+                "op": "append",
+                "path": "/evidence",
+                "value": {
+                    "id": "E-20261023-09",
+                    "at": "2026-10-23T10:00:00Z",
+                    "period": "3Q26",
+                    "source": {
+                        "type": "filing",
+                        "identity": "META 3Q26 10-Q",
+                        "tier": 1,
+                        "ref": {"kind": "filing", "accession": "0001326801-26-000055"},
+                    },
+                    "fact": "Ad impressions +10% YoY",
+                    "pillar_ids": ["P1"],
+                    "signal": "confirming",
+                    "quality": "high",
+                },
+            }
+        ],
+        reason="Append normal filing evidence alongside legacy model evidence",
+        base_version=1,
+    )
+    assert res_normal["ok"] is True, res_normal.get("message")
+
+    # 2. Appending a new non-compliant model evidence entry is rejected
+    res_bad_new = await service.apply_update(
+        user_id="u1",
+        workspace_id="ws1",
+        doc_key="thesis",
+        ops=[
+            {
+                "op": "append",
+                "path": "/evidence",
+                "value": {
+                    "id": "E-20261023-10",
+                    "at": "2026-10-23T11:00:00Z",
+                    "period": "FY2026",
+                    "source": {
+                        "type": "model",
+                        "identity": "New model note without cell",
+                        "tier": 1,
+                        "ref": {"kind": "file", "path": "research/new-model.md"},
+                    },
+                    "fact": "New unanchored model output",
+                    "pillar_ids": ["P1"],
+                    "signal": "confirming",
+                    "quality": "high",
+                },
+            }
+        ],
+        reason="Attempt to append non-compliant model evidence",
+        base_version=2,
+    )
+    assert res_bad_new["ok"] is False
+    err_codes = {e["code"] for e in res_bad_new["problems"]}
+    assert "model_tier_1_forbidden" in err_codes
+    assert "model_needs_model_cell" in err_codes
+
+
+@pytest.mark.asyncio
+async def test_apply_update_truncation_suffix_for_ops_and_warnings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify op_summaries and val.warnings > 5 append '…等共 N 条' in service.apply_update."""
+    from unittest.mock import create_autospec
+
+    from src.dalton.database import knowledge as db_knowledge
+    from src.dalton.knowledge import service
+
+    base_thesis = _sample_thesis_doc()
+    monkeypatch.setattr(
+        service,
+        "verify_workspace_access",
+        create_autospec(service.verify_workspace_access, return_value={"workspace_id": "ws1"}),
+    )
+    monkeypatch.setattr(
+        db_knowledge,
+        "latest_version",
+        create_autospec(
+            db_knowledge.latest_version,
+            return_value={"version_no": 1, "content": base_thesis, "schema_valid": True},
+        ),
+    )
+    monkeypatch.setattr(
+        db_knowledge,
+        "latest_valid_version",
+        create_autospec(db_knowledge.latest_valid_version, return_value=None),
+    )
+
+    async def _fake_insert(**kwargs: Any) -> dict[str, Any]:
+        return {
+            "knowledge_version_id": "00000000-0000-0000-0000-000000000002",
+            "version_no": 2,
+            "doc_key": kwargs["doc_key"],
+            "content": kwargs["content"],
+            "created_at": datetime.now(UTC),
+        }
+
+    mock_insert = create_autospec(db_knowledge.insert_version)
+    mock_insert.side_effect = _fake_insert
+    monkeypatch.setattr(db_knowledge, "insert_version", mock_insert)
+
+    ops: list[dict[str, Any]] = []
+    for i in range(1, 8):
+        ops.append(
+            {
+                "op": "append",
+                "path": "/evidence",
+                "value": {
+                    "id": f"E-20261023-1{i}",
+                    "at": "2026-10-23T10:00:00Z",
+                    "period": "3Q26",
+                    "source": {
+                        "type": "filing",
+                        "identity": f"META 10-Q note {i}",
+                        "tier": 3,  # triggers source_tier_mismatch warning on each of the 7 items
+                        "ref": {"kind": "file", "path": f"research/n{i}.md"},
+                    },
+                    "fact": f"Fact item {i}",
+                    "pillar_ids": ["P1"],
+                    "signal": "confirming",
+                    "quality": "high",
+                },
+            }
+        )
+
+    res = await service.apply_update(
+        user_id="u1",
+        workspace_id="ws1",
+        doc_key="thesis",
+        ops=ops,
+        reason="Batch append 7 evidence entries",
+        base_version=1,
+    )
+    assert res["ok"] is True
+    msg = res["message"]
+    assert "…等共 7 条." in msg
+    assert "7 warning(s):" in msg
+    assert msg.endswith("…等共 7 条")
+
+
+@pytest.mark.asyncio
+async def test_server_overwrites_write_timestamps_preserving_business_dates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify server overwrites verdict.at, house_view.updated_at, and market_view.updated_at with UTC now."""
+    from unittest.mock import create_autospec
+
+    from src.dalton.database import knowledge as db_knowledge
+    from src.dalton.database import verdicts as db_verdicts
+    from src.dalton.knowledge import service
+
+    fixed_now = datetime(2026, 10, 23, 18, 30, 0, tzinfo=UTC)
+    fixed_iso = "2026-10-23T18:30:00Z"
+
+    monkeypatch.setattr(
+        service,
+        "verify_workspace_access",
+        create_autospec(service.verify_workspace_access, return_value={"workspace_id": "ws1"}),
+    )
+    mock_latest = create_autospec(db_knowledge.latest_version, return_value=None)
+    monkeypatch.setattr(
+        db_knowledge,
+        "latest_version",
+        mock_latest,
+    )
+    monkeypatch.setattr(
+        db_knowledge,
+        "latest_valid_version",
+        create_autospec(db_knowledge.latest_valid_version, return_value=None),
+    )
+
+    saved_docs: list[dict[str, Any]] = []
+
+    async def _capture_insert(**kwargs: Any) -> dict[str, Any]:
+        saved_docs.append(copy.deepcopy(kwargs["content"]))
+        return {
+            "knowledge_version_id": "00000000-0000-0000-0000-000000000001",
+            "version_no": 1,
+            "doc_key": kwargs["doc_key"],
+            "content": kwargs["content"],
+            "created_at": fixed_now,
+        }
+
+    mock_insert = create_autospec(db_knowledge.insert_version)
+    mock_insert.side_effect = _capture_insert
+    monkeypatch.setattr(db_knowledge, "insert_version", mock_insert)
+
+    thesis_in = _sample_thesis_doc()
+    thesis_in["house_view"]["updated_at"] = "1999-01-01T00:00:00Z"
+    thesis_in["market_view"]["updated_at"] = "1999-01-01T00:00:00Z"
+    thesis_in["market_view"]["as_of"] = "2026-10-18T00:00:00Z"
+    thesis_in["evidence"][0]["at"] = "2026-10-15T20:00:00Z"
+    thesis_in["evidence"][0]["period"] = "3Q26"
+    thesis_in["pillars"][0]["baseline"]["as_of"] = "2026-09-30"
+
+    res_create = await service.apply_update(
+        user_id="u1",
+        workspace_id="ws1",
+        doc_key="thesis",
+        ops=[{"op": "create", "value": thesis_in}],
+        reason="Initial thesis with stale model timestamps",
+        base_version=None,
+        now=fixed_now,
+    )
+    assert res_create["ok"] is True
+    created_doc = saved_docs[-1]
+    assert created_doc["as_of"] == fixed_iso
+    assert created_doc["house_view"]["updated_at"] == fixed_iso
+    assert created_doc["market_view"]["updated_at"] == fixed_iso
+    # Business dates (including market_view.as_of) must remain untouched
+    assert created_doc["market_view"]["as_of"] == "2026-10-18T00:00:00Z"
+    assert created_doc["evidence"][0]["at"] == "2026-10-15T20:00:00Z"
+    assert created_doc["evidence"][0]["period"] == "3Q26"
+    assert created_doc["pillars"][0]["baseline"]["as_of"] == "2026-09-30"
+
+    # When an existing doc only appends an evidence item, market_view.as_of stays unchanged
+    mock_latest.return_value = {
+        "version_no": 1,
+        "content": copy.deepcopy(created_doc),
+        "schema_valid": True,
+    }
+    later_now = datetime(2026, 10, 24, 9, 15, 0, tzinfo=UTC)
+    res_append_ev = await service.apply_update(
+        user_id="u1",
+        workspace_id="ws1",
+        doc_key="thesis",
+        ops=[
+            {
+                "op": "append",
+                "path": "/evidence",
+                "value": {
+                    "id": "E-20261024-01",
+                    "at": "2026-10-24T08:00:00Z",
+                    "period": "3Q26",
+                    "source": {
+                        "type": "consensus",
+                        "identity": "Visible Alpha",
+                        "tier": 3,
+                        "ref": {"kind": "url", "url": "https://example.com/va"},
+                    },
+                    "fact": "Consensus FY26 EPS $26.10",
+                    "pillar_ids": ["P1"],
+                    "signal": "neutral",
+                    "quality": "high",
+                },
+            }
+        ],
+        reason="Append one evidence entry",
+        base_version=1,
+        now=later_now,
+    )
+    assert res_append_ev["ok"] is True
+    updated_doc = saved_docs[-1]
+    assert updated_doc["market_view"]["as_of"] == "2026-10-18T00:00:00Z"
+
+    # Also verify append_verdict uses the exact verdict_at (with microsecond precision) returned by insert_verdict
+    verdict_db_dt = datetime(2026, 10, 23, 18, 30, 0, 456789, tzinfo=UTC)
+    verdict_db_iso = "2026-10-23T18:30:00.456789Z"
+    agenda_base = {
+        "schema_version": 1,
+        "as_of": "2026-10-20T00:00:00Z",
+        "open_questions": [
+            {
+                "id": "Q-001",
+                "question": "What is 4Q26 ad impression growth?",
+                "why": "Key driver for P1",
+                "value": "high",
+                "urgency": "now",
+                "origin": "analyst",
+                "owner": "analyst",
+                "status": "open",
+                "attempts": [],
+                "created_at": "2026-10-20T00:00:00Z",
+            }
+        ],
+        "next_validations": [],
+        "watch": {},
+        "wake_conditions": [],
+    }
+    mock_latest.return_value = {
+        "version_no": 1,
+        "content": copy.deepcopy(agenda_base),
+        "schema_valid": True,
+    }
+
+    async def _capture_verdict(
+        *,
+        user_id: str,
+        workspace_id: str,
+        verdict: dict[str, Any],
+        thread_id: str | None = None,
+        run_id: str | None = None,
+        automation_execution_id: str | None = None,
+        origin_type: str | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "verdict_id": "VD-20261023-01",
+            "workspace_id": workspace_id,
+            "verdict_at": verdict_db_dt,
+            "word": verdict["verdict"],
+            "payload": {**verdict, "id": "VD-20261023-01", "at": verdict_db_iso},
+        }
+
+    mock_insert_v = create_autospec(db_verdicts.insert_verdict)
+    mock_insert_v.side_effect = _capture_verdict
+    monkeypatch.setattr(db_verdicts, "insert_verdict", mock_insert_v)
+
+    res_v = await service.append_verdict(
+        user_id="u1",
+        workspace_id="ws1",
+        verdict={
+            "at": "1999-01-01T00:00:00Z",
+            "trigger": {"kind": "manual"},
+            "event": "3Q26 earnings review",
+            "verdict": "NO_CHANGE",
+            "rationale": "In line with expectations",
+            "next_validation": {"what": "4Q26 ad revenue guidance", "due": "2027-01-28"},
+            "progress": "some",
+            "question_ids": ["Q-001"],
+        },
+    )
+    assert res_v["ok"] is True
+    saved_agenda = saved_docs[-1]
+    assert saved_agenda["last_verdict"]["at"] == verdict_db_iso
+    assert saved_agenda["open_questions"][0]["attempts"][-1]["at"] == verdict_db_iso
+
+
+@pytest.mark.asyncio
+async def test_verdicts_same_timestamp_tiebreak_returns_latest_inserted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two verdicts written at the exact same timestamp return the later one (VD-...-02) first when querying latest."""
+    from unittest.mock import create_autospec
+
+    from src.dalton.database import verdicts as verdicts_mod
+
+    same_ts = datetime(2026, 10, 23, 15, 4, 5, 123456, tzinfo=UTC)
+    monkeypatch.setattr(
+        verdicts_mod,
+        "_now_utc",
+        create_autospec(verdicts_mod._now_utc, return_value=same_ts),
+    )
+
+    inserted_rows: list[dict[str, Any]] = []
+    executed_sqls: list[str] = []
+    last_op: dict[str, Any] = {"kind": "", "rows": []}
+
+    class _CurSpec:
+        async def __aenter__(self) -> Any: ...
+        async def __aexit__(self, *args: object) -> None: ...
+        async def execute(self, sql: str, params: Any = None) -> None: ...
+        async def fetchall(self) -> list[dict[str, Any]]: ...
+        async def fetchone(self) -> dict[str, Any] | None: ...
+
+    class _TxSpec:
+        async def __aenter__(self) -> Any: ...
+        async def __aexit__(self, *args: object) -> None: ...
+
+    class _ConnSpec:
+        async def __aenter__(self) -> Any: ...
+        async def __aexit__(self, *args: object) -> None: ...
+        def cursor(self, *args: Any, **kwargs: Any) -> Any: ...
+        def transaction(self) -> Any: ...
+
+    cur = create_autospec(_CurSpec, instance=True)
+    cur.__aenter__.return_value = cur
+    cur.__aexit__.return_value = None
+
+    async def _exec(sql: str, params: Any = None) -> None:
+        s = " ".join(str(sql).split())
+        executed_sqls.append(s)
+        if "SELECT verdict_id FROM dalton_verdicts" in s:
+            last_op["kind"] = "select_ids"
+            prefix = str(params[0]).rstrip("%")
+            last_op["rows"] = [
+                {"verdict_id": r["verdict_id"]}
+                for r in inserted_rows
+                if str(r["verdict_id"]).startswith(prefix)
+            ]
+        elif "INSERT INTO dalton_verdicts" in s:
+            last_op["kind"] = "insert"
+            row = {
+                "verdict_id": str(params[0]),
+                "user_id": str(params[1]),
+                "workspace_id": str(params[2]),
+                "verdict_at": params[3],
+                "word": str(params[4]),
+                "payload": params[9].obj,
+            }
+            inserted_rows.append(row)
+            last_op["row"] = row
+        elif "FROM dalton_verdicts WHERE workspace_id = %s" in s:
+            last_op["kind"] = "list"
+            assert "ORDER BY verdict_at DESC, length(verdict_id) DESC, verdict_id DESC" in s
+            limit = int(params[-1])
+            ordered = sorted(
+                inserted_rows,
+                key=lambda r: (r["verdict_at"], r["verdict_id"]),
+                reverse=True,
+            )
+            last_op["rows"] = ordered[:limit]
+
+    async def _fetchall() -> list[dict[str, Any]]:
+        return list(last_op.get("rows", []))
+
+    async def _fetchone() -> dict[str, Any] | None:
+        return dict(last_op["row"]) if last_op.get("kind") == "insert" else None
+
+    cur.execute.side_effect = _exec
+    cur.fetchall.side_effect = _fetchall
+    cur.fetchone.side_effect = _fetchone
+
+    tx = create_autospec(_TxSpec, instance=True)
+    tx.__aenter__.return_value = tx
+    tx.__aexit__.return_value = None
+
+    conn = create_autospec(_ConnSpec, instance=True)
+    conn.__aenter__.return_value = conn
+    conn.__aexit__.return_value = None
+    conn.cursor.return_value = cur
+    conn.transaction.return_value = tx
+
+    monkeypatch.setattr(
+        verdicts_mod,
+        "get_db_connection",
+        create_autospec(verdicts_mod.get_db_connection, return_value=conn),
+    )
+
+    base_v = {
+        "trigger": {"kind": "manual"},
+        "event": "First verdict",
+        "verdict": "NO_CHANGE",
+        "rationale": "First",
+        "next_validation": {"what": "Next check", "due": "2026-11-01"},
+        "progress": "none",
+    }
+    r1 = await verdicts_mod.insert_verdict(user_id="u1", workspace_id="ws1", verdict=base_v)
+    r2 = await verdicts_mod.insert_verdict(
+        user_id="u1",
+        workspace_id="ws1",
+        verdict={**base_v, "event": "Second verdict", "verdict": "THESIS_STRENGTHENED"},
+    )
+    assert r1["verdict_id"] == "VD-20261023-01"
+    assert r2["verdict_id"] == "VD-20261023-02"
+    assert r1["verdict_at"] == same_ts
+    assert r2["verdict_at"] == same_ts
+    assert r2["payload"]["at"] == "2026-10-23T15:04:05.123456Z"
+
+    latest_list = await verdicts_mod.list_verdicts("ws1", limit=1)
+    assert len(latest_list) == 1
+    assert latest_list[0]["verdict_id"] == "VD-20261023-02"
+
+
+def test_render_agent_block_omits_none_fields() -> None:
+    """Verify agent_block.md.j2 and render_agent_block omit None fields instead of rendering 'None'."""
+    block = render_agent_block(
+        ticker="META",
+        company_doc={
+            "ticker": "META",
+            "name": "Meta Platforms, Inc.",
+            "coverage_tier": None,
+            "coverage_stage": None,
+        },
+        thesis_doc={
+            "as_of": None,
+            "one_liner": "AI 推荐拉动时长与转化",
+            "aggregate_status": "intact",
+            "house_view": {"stance": None, "conviction": None},
+            "official": {
+                "version_no": 1,
+                "approved_at": None,
+                "approved_by": None,
+                "publication_id": None,
+            },
+            "pillars": [{"id": "P1", "status": None}],
+        },
+        debate_doc={
+            "debates": [
+                {
+                    "id": "D1",
+                    "variable": "ROIC on AI Capex",
+                    "my_view": {"side": None, "confidence": None},
+                }
+            ]
+        },
+        agenda_doc={
+            "next_validations": [
+                {
+                    "id": "V-002",
+                    "due": None,
+                    "what": "4Q26 Capex 指引",
+                    "expected": None,
+                    "status": "pending",
+                }
+            ],
+            "pm_handoffs": [
+                {"id": "H1", "what": None, "status": "waiting"}
+            ],
+        },
+        last_verdict={"id": "VD-20261023-01", "verdict": "NO_CHANGE", "event": None},
+    )
+    assert "None" not in block
+    assert "**下一项验证**：V-002 4Q26 Capex 指引\n" in block
+
+    # Also test when both due and what/expected are None -> shows only '下一项验证：V-002'
+    block_minimal = render_agent_block(
+        ticker="META",
+        agenda_doc={
+            "next_validations": [
+                {
+                    "id": "V-002",
+                    "due": None,
+                    "what": None,
+                    "expected": None,
+                    "status": "pending",
+                }
+            ]
+        },
+    )
+    assert "None" not in block_minimal
+    assert "**下一项验证**：V-002\n" in block_minimal
+
+
+
+
+
+
+
+def test_new_model_evidence_cannot_borrow_a_legacy_id() -> None:
+    legacy_ev = {
+        "id": "E-20261001-01",
+        "at": "2026-10-01T00:00:00Z",
+        "period": "FY2026",
+        "source": {
+            "type": "model",
+            "identity": "Legacy DCF summary",
+            "tier": 1,
+            "ref": {"kind": "file", "path": "research/legacy-model-note.md"},
+        },
+        "fact": "Legacy model implied $600",
+        "pillar_ids": ["P1"],
+        "signal": "confirming",
+        "quality": "medium",
+    }
+    old_doc = _sample_thesis_doc()
+    old_doc["evidence"].append(copy.deepcopy(legacy_ev))
+    new_doc = copy.deepcopy(old_doc)
+    borrowed = copy.deepcopy(legacy_ev)
+    borrowed["fact"] = "New model claim reusing an old id"
+    new_doc["evidence"].append(borrowed)
+
+    codes = [e.get("code") for e in validate_update("thesis", old_doc, new_doc).errors]
+
+    assert "duplicate_evidence_id" in codes
+
+
+def test_duplicate_ids_already_stored_stay_writable() -> None:
+    old_doc = _sample_thesis_doc()
+    dup = copy.deepcopy(old_doc["evidence"][0])
+    old_doc["evidence"].append(dup)
+    new_doc = copy.deepcopy(old_doc)
+    new_doc["one_liner"] = "Edited one-liner only"
+
+    codes = [e.get("code") for e in validate_update("thesis", old_doc, new_doc).errors]
+
+    assert "duplicate_evidence_id" not in codes
