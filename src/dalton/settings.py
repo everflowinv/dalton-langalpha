@@ -6,6 +6,7 @@ so service/handler modules never call ``os.getenv`` directly (per ``src/server/A
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import os
 import uuid
@@ -160,6 +161,121 @@ class DaltonCredentialsConfig(BaseModel):
         return v
 
 
+# A fake-IP exemption may never reach these, whatever the config says: they are
+# the internal services and metadata endpoint the fetch guard exists to protect.
+NEVER_EXEMPT_NETWORKS: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...] = tuple(
+    ipaddress.ip_network(n)
+    for n in (
+        "0.0.0.0/8",
+        "10.0.0.0/8",
+        "127.0.0.0/8",
+        "169.254.0.0/16",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "::1/128",
+        "fc00::/7",
+        "fe80::/10",
+    )
+)
+
+
+# IPv6 ranges that carry an IPv4 address inside them (mapped, compatible, NAT64,
+# 6to4), with the bit offset of the embedded address. A range in one of them is
+# checked as the IPv4 range it embeds, so ``::ffff:10.0.0.0/104`` cannot exempt 10/8.
+_EMBEDDED_IPV4_PREFIXES: tuple[tuple[ipaddress.IPv6Network, int], ...] = (
+    (ipaddress.IPv6Network("::ffff:0:0/96"), 0),
+    (ipaddress.IPv6Network("::/96"), 0),
+    (ipaddress.IPv6Network("64:ff9b::/96"), 0),
+    (ipaddress.IPv6Network("2002::/16"), 80),
+)
+
+
+def embedded_ipv4_networks(net: ipaddress.IPv6Network) -> list[ipaddress.IPv4Network]:
+    """The IPv4 ranges an IPv6 range can reach through embedded-IPv4 encodings."""
+    found: list[ipaddress.IPv4Network] = []
+    for prefix, shift in _EMBEDDED_IPV4_PREFIXES:
+        if not net.overlaps(prefix):
+            continue
+        if net.prefixlen <= prefix.prefixlen:
+            found.append(ipaddress.IPv4Network("0.0.0.0/0"))
+            continue
+        bits = min(net.prefixlen - prefix.prefixlen, 32)
+        v4 = (int(net.network_address) >> shift) & 0xFFFFFFFF
+        found.append(ipaddress.IPv4Network((v4, bits), strict=False))
+    return found
+
+
+def _protected_clash(
+    net: ipaddress.IPv4Network | ipaddress.IPv6Network,
+) -> ipaddress.IPv4Network | ipaddress.IPv6Network | None:
+    candidates = [net]
+    if net.version == 6:
+        candidates.extend(embedded_ipv4_networks(net))
+    for cand in candidates:
+        for protected in NEVER_EXEMPT_NETWORKS:
+            if protected.version == cand.version and cand.overlaps(protected):
+                return protected
+    return None
+
+
+DEFAULT_FAKE_IP_REAL_RESOLVERS = ["https://1.1.1.1/dns-query", "https://dns.google/resolve"]
+
+
+class DaltonNetworkConfig(BaseModel):
+    """Network environment the backend container runs in."""
+
+    fake_ip_cidrs: list[str] = Field(default_factory=list)
+    # DNS-over-HTTPS JSON endpoints, tried in order, that give a fake-IP host's
+    # real addresses: the proxy connects to those, so they are what the guard checks.
+    fake_ip_real_resolver: list[str] = Field(
+        default_factory=lambda: list(DEFAULT_FAKE_IP_REAL_RESOLVERS)
+    )
+
+    @field_validator("fake_ip_real_resolver", mode="before")
+    @classmethod
+    def _validate_resolvers(cls, v: Any) -> list[str]:
+        if v is None:
+            return []
+        if isinstance(v, str):
+            v = [v]
+        kept: list[str] = []
+        for raw in v:
+            url = str(raw).strip()
+            if url.startswith("https://"):
+                kept.append(url)
+            else:
+                logger.error("network.fake_ip_real_resolver: dropping %r, not an https URL", raw)
+        return kept
+
+    @field_validator("fake_ip_cidrs", mode="before")
+    @classmethod
+    def _validate_fake_ip_cidrs(cls, v: Any) -> list[str]:
+        # A bad entry is dropped, not raised: failing validation would take the
+        # whole Dalton config down, and a dropped range only exempts nothing.
+        if v is None:
+            return []
+        if isinstance(v, str):
+            v = [v]
+        normalized: list[str] = []
+        for raw in v:
+            try:
+                net = ipaddress.ip_network(str(raw).strip(), strict=False)
+            except ValueError:
+                logger.error("network.fake_ip_cidrs: dropping %r, not a valid CIDR", raw)
+                continue
+            clash = _protected_clash(net)
+            if clash is not None:
+                logger.error(
+                    "network.fake_ip_cidrs: dropping %s, it overlaps protected range %s "
+                    "(internal or metadata addresses must stay blocked)",
+                    net,
+                    clash,
+                )
+                continue
+            normalized.append(str(net))
+        return normalized
+
+
 class DaltonConfig(BaseModel):
     """Root Dalton behavioral configuration loaded from ``src/dalton/dalton.yaml``."""
 
@@ -176,6 +292,7 @@ class DaltonConfig(BaseModel):
     conversations: DaltonConversationsConfig = Field(
         default_factory=DaltonConversationsConfig
     )
+    network: DaltonNetworkConfig = Field(default_factory=DaltonNetworkConfig)
 
 
 def _parse_env_pm_user_ids() -> list[str] | None:
@@ -306,6 +423,21 @@ def get_assist_fallback_models() -> list[str]:
     if isinstance(raw, list):
         return [str(m).strip() for m in raw if str(m).strip()]
     return []
+
+
+def get_fake_ip_networks() -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]:
+    """Return the configured fake-IP ranges the in-house fetch guard may let through.
+
+    Empty when Dalton is disabled, so the guard keeps upstream behaviour.
+    """
+    if not is_dalton_enabled():
+        return ()
+    return tuple(ipaddress.ip_network(c) for c in get_dalton_config().network.fake_ip_cidrs)
+
+
+def get_fake_ip_real_resolvers() -> list[str]:
+    """Return the DoH endpoints used to look up a fake-IP host's real addresses."""
+    return list(get_dalton_config().network.fake_ip_real_resolver)
 
 
 def log_dalton_startup_warnings() -> None:
