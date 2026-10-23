@@ -570,6 +570,12 @@ async def delete_coverage_group_and_exclusive_members(
 
     async def _run_in_tx(c: Any) -> dict[str, Any]:
         await acquire_coverage_advisory_lock(c, uid)
+        existing_groups = await list_coverage_groups(uid, conn=c)
+        valid_other_group_ids = {
+            str(g["group_id"]).strip()
+            for g in existing_groups
+            if g.get("group_id") and str(g["group_id"]).strip() != gid
+        }
         rows = await list_coverage_rows(uid, conn=c)
         to_delete_tickers: list[str] = []
         to_update_rows: list[tuple[str, str | None, str]] = []
@@ -578,7 +584,7 @@ async def delete_coverage_group_and_exclusive_members(
             gids = extract_row_group_ids(r)
             if gid not in gids and str(r.get("group_id") or "") != gid:
                 continue
-            remaining = [g for g in gids if g != gid]
+            remaining = [g for g in gids if g != gid and g in valid_other_group_ids]
             src = str(r.get("source") or "chat").strip().lower()
             sym = str(r["ticker"]).strip().upper()
             if src == "group" and not remaining:

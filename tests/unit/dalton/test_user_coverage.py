@@ -307,6 +307,9 @@ class _InMemoryCoverageStore:
         gid = str(group_id).strip()
         if (uid, gid) not in self.groups:
             return {"deleted": False, "group_id": gid, "removed_tickers": []}
+        valid_other_group_ids = {
+            g for (u, g) in self.groups.keys() if u == uid and g != gid
+        }
         label = self.groups[(uid, gid)].get("label")
         removed: list[str] = []
         kept_shared: list[str] = []
@@ -316,9 +319,9 @@ class _InMemoryCoverageStore:
                 continue
             row = self.rows[key]
             gids = extract_row_group_ids(row)
-            if gid not in gids:
+            if gid not in gids and str(row.get("group_id") or "") != gid:
                 continue
-            remaining = [g for g in gids if g != gid]
+            remaining = [g for g in gids if g != gid and g in valid_other_group_ids]
             src = str(row.get("source") or "chat").strip().lower()
             if src == "group" and not remaining:
                 removed.append(key[1])
@@ -1342,12 +1345,22 @@ async def test_two_users_mutual_isolation_service_and_router(
     assert r_bob_cov.status_code == 200
     assert [c["ticker"] for c in r_bob_cov.json()["companies"]] == ["MSFT"]
 
-    # Bob attempting PATCH / DELETE on Alice's AAPL or Alice's group_id returns 404 and leaves Alice's data intact
-    r_bob_patch_alice = client.patch("/api/v1/dalton/coverage/AAPL", json={"tier": "watch"})
-    assert r_bob_patch_alice.status_code == 404
+    # Bob attempting POST /dalton/coverage with action=set_tier and action=remove on Alice's AAPL mutates 0 rows and returns not_found
+    r_bob_set_tier_alice = client.post(
+        "/api/v1/dalton/coverage",
+        json={"action": "set_tier", "tickers": ["AAPL"], "tier": "watch"},
+    )
+    assert r_bob_set_tier_alice.status_code == 200
+    assert r_bob_set_tier_alice.json()["updated"] == []
+    assert r_bob_set_tier_alice.json()["not_found"] == ["AAPL"]
 
-    r_bob_del_alice = client.delete("/api/v1/dalton/coverage/AAPL")
-    assert r_bob_del_alice.status_code == 404
+    r_bob_rm_alice = client.post(
+        "/api/v1/dalton/coverage",
+        json={"action": "remove", "tickers": ["AAPL"]},
+    )
+    assert r_bob_rm_alice.status_code == 200
+    assert r_bob_rm_alice.json()["removed"] == []
+    assert r_bob_rm_alice.json()["not_found"] == ["AAPL"]
 
     r_bob_del_grp = client.delete(f"/api/v1/dalton/coverage/groups/{alice_group_id}")
     assert r_bob_del_grp.status_code == 404
@@ -1359,4 +1372,244 @@ async def test_two_users_mutual_isolation_service_and_router(
     alice_tickers = {c["ticker"]: c["tier"] for c in r_alice_cov.json()["companies"]}
     assert alice_tickers == {"AAPL": "core", "NVDA": "watch"}
     assert len(r_alice_cov.json()["groups"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_resolve_and_delete_group_race_interleaving(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 3 Item 1: interleaved resolve_coverage_group and remove_coverage_group aborts write with status='group_deleted', and group deletion only selects new primary group from still-existing groups."""
+    store = _InMemoryCoverageStore()
+    _wire_coverage_store(monkeypatch, store)
+    monkeypatch.setattr(
+        coverage_svc,
+        "sync_user_coverage_to_home",
+        create_autospec(coverage_svc.sync_user_coverage_to_home, return_value=True),
+    )
+    monkeypatch.setattr(
+        coverage_svc,
+        "ensure_user_earnings_calendar_automation",
+        create_autospec(
+            coverage_svc.ensure_user_earnings_calendar_automation,
+            return_value={"ok": True, "action": "exists", "automation_id": "auto-cal-1", "name": "dalton-earnings-calendar"},
+        ),
+    )
+    monkeypatch.setattr(
+        coverage_svc,
+        "_user_workspace_tickers",
+        create_autospec(coverage_svc._user_workspace_tickers, return_value={}),
+    )
+
+    screener_mock = create_autospec(
+        coverage_svc._fetch_yf_screener_rows,
+        return_value=[
+            {"symbol": "NVDA", "companyName": "NVIDIA Corp", "exchangeShortName": "NMS"},
+            {"symbol": "AVGO", "companyName": "Broadcom Inc", "exchangeShortName": "NMS"},
+        ],
+    )
+    monkeypatch.setattr(coverage_svc, "_fetch_yf_screener_rows", screener_mock)
+
+    grp = await coverage_svc.add_coverage_group(
+        USER_ALICE,
+        label="Semis Group",
+        criteria={"country": "US", "industry": "Semiconductors"},
+        default_tier="watch",
+    )
+    gid = grp["group"]["group_id"]
+    assert await store.count_coverage_rows(USER_ALICE) == 2
+
+    # Interleave: while preview_coverage_group is running inside resolve_coverage_group (before lock acquisition),
+    # another operation deletes the group and its exclusive members.
+    orig_preview = coverage_svc.preview_coverage_group
+
+    async def _interleaved_preview(label: str, criteria: Any) -> dict[str, Any]:
+        res = await orig_preview(label, criteria)
+        await coverage_svc.remove_coverage_group(USER_ALICE, gid)
+        return res
+
+    monkeypatch.setattr(
+        coverage_svc,
+        "preview_coverage_group",
+        create_autospec(orig_preview, side_effect=_interleaved_preview),
+    )
+
+    resolve_res = await coverage_svc.resolve_coverage_group(USER_ALICE, gid)
+    assert resolve_res["status"] == "group_deleted"
+    assert resolve_res["ok"] is False
+    # Deleted group and its exclusive tickers were NOT resurrected by the in-flight resolve
+    assert await store.get_coverage_group(USER_ALICE, gid) is None
+    assert await store.count_coverage_rows(USER_ALICE) == 0
+
+    # Restore preview_coverage_group and verify deleting a group only picks new primary group_id from still-existing groups
+    monkeypatch.setattr(coverage_svc, "preview_coverage_group", orig_preview)
+    g_active_1 = await coverage_svc.add_coverage_group(
+        USER_ALICE,
+        label="Active 1",
+        criteria={"country": "US", "industry": "Semiconductors"},
+        default_tier="watch",
+    )
+    g_active_2 = await coverage_svc.add_coverage_group(
+        USER_ALICE,
+        label="Active 2",
+        criteria={"country": "US", "industry": "Semiconductors"},
+        default_tier="watch",
+    )
+    g1_id = g_active_1["group"]["group_id"]
+    g2_id = g_active_2["group"]["group_id"]
+
+    # Inject a stale non-existent ghost group ID ahead of g2_id in extra["group_ids"]
+    nvda_row = store.rows[(USER_ALICE, "NVDA")]
+    nvda_row["extra"]["group_ids"] = [g1_id, "grp-ghost-deleted", g2_id]
+
+    await coverage_svc.remove_coverage_group(USER_ALICE, g1_id)
+    nvda_after = await store.get_coverage_row(USER_ALICE, "NVDA")
+    assert nvda_after is not None
+    assert nvda_after["group_id"] == g2_id
+    assert nvda_after["extra"]["group_ids"] == [g2_id]
+
+
+@pytest.mark.asyncio
+async def test_fast_info_standalone_fallback_and_market_data_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 3 Item 2: empty info with valid fast_info exchange + price validates ticker without quoteType; upstream errors raise MarketDataUnavailable instead of returning None."""
+    import yfinance as yf
+    import src.data_client.yfinance.yahoo as yahoo_mod
+
+    monkeypatch.delenv("FMP_API_KEY", raising=False)
+
+    # 1) info is empty ({}), no quoteType, but fast_info has valid exchange and price -> validates via fast_info alone
+    fake_ticker_ok = create_autospec(yf.Ticker, instance=True)
+    fake_ticker_ok.info = {}
+    fake_ticker_ok.fast_info = {"exchange": "NMS", "lastPrice": 185.25, "marketCap": 250_000_000_000}
+
+    yahoo_ticker_mock = create_autospec(yahoo_mod.yahoo_ticker, return_value=fake_ticker_ok)
+    monkeypatch.setattr(yahoo_mod, "yahoo_ticker", yahoo_ticker_mock)
+
+    hit = await coverage_svc.validate_and_enrich_ticker("AMD")
+    assert hit is not None
+    assert hit["ticker"] == "AMD"
+    assert hit["exchange"] == "NMS"
+    assert hit["market"] == "US"
+
+    # 2) info is empty ({}) and fast_info has no exchange / no price -> returns None (genuinely not found)
+    fake_ticker_none = create_autospec(yf.Ticker, instance=True)
+    fake_ticker_none.info = {}
+    fake_ticker_none.fast_info = {"exchange": "", "lastPrice": None}
+    yahoo_ticker_mock.return_value = fake_ticker_none
+
+    not_found_hit = await coverage_svc.validate_and_enrich_ticker("NOPE999")
+    assert not_found_hit is None
+
+    # 3) info is empty ({}) and fast_info raises a provider/network error -> raises MarketDataUnavailable (not swallowed as None)
+    class _BrokenFastInfo:
+        def get(self, key: str) -> Any:
+            raise RuntimeError(f"Yahoo chart 503 while reading {key}")
+
+    fake_ticker_err = create_autospec(yf.Ticker, instance=True)
+    fake_ticker_err.info = {}
+    fake_ticker_err.fast_info = create_autospec(_BrokenFastInfo(), instance=True, side_effect= None)
+    fake_ticker_err.fast_info.get.side_effect = RuntimeError("Yahoo chart 503 while reading exchange")
+    yahoo_ticker_mock.return_value = fake_ticker_err
+
+    with pytest.raises(coverage_svc.MarketDataUnavailable) as exc_info:
+        await coverage_svc.validate_and_enrich_ticker("AMD")
+    err_dict = exc_info.value.to_dict()
+    assert err_dict["error"] == "MarketDataUnavailable"
+    assert err_dict["provider"] == "yfinance"
+
+
+@pytest.mark.asyncio
+async def test_preflight_attempts_home_coverage_sync_before_timeout_steps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 3 Item 3: preflight attempts Home coverage.yaml sync before any step that can time out and pass through/wake, and bounds sync with its own short timeout."""
+    import asyncio
+
+    store = _InMemoryCoverageStore()
+    _wire_coverage_store(monkeypatch, store)
+
+    monkeypatch.setattr(
+        preflight_mod,
+        "verify_workspace_access",
+        create_autospec(
+            preflight_mod.verify_workspace_access,
+            return_value={"workspace_id": "ws-home-alice", "user_id": USER_ALICE},
+        ),
+    )
+
+    sync_attempts: list[str] = []
+
+    async def _fast_sync(
+        user_id: str,
+        *,
+        yaml_text: str | None = None,
+        backend: Any = None,
+        rel_path: str = "dalton/coverage.yaml",
+    ) -> bool:
+        _ = (yaml_text, backend, rel_path)
+        sync_attempts.append(user_id)
+        return True
+
+    sync_mock = create_autospec(preflight_mod.sync_user_coverage_to_home, side_effect=_fast_sync)
+    monkeypatch.setattr(
+        preflight_mod,
+        "sync_user_coverage_to_home",
+        sync_mock,
+    )
+
+    async def _slow_budget_check(*, user_id: str | None = None) -> tuple[bool, str | None]:
+        _ = user_id
+        await asyncio.sleep(0.25)
+        return True, None
+
+    monkeypatch.setattr(
+        preflight_mod,
+        "_check_budget_available",
+        create_autospec(preflight_mod._check_budget_available, side_effect=_slow_budget_check),
+    )
+
+    # _check_budget_available times out after 0.05s and preflight wakes conservatively,
+    # but Home coverage.yaml sync was ALREADY attempted before the timeout step!
+    res = await preflight_mod.preflight_check(
+        {
+            "automation_id": "auto-cal-timeout",
+            "user_id": USER_ALICE,
+            "workspace_id": "ws-home-alice",
+            "name": "dalton-earnings-calendar",
+            "trigger_type": "cron",
+        },
+        "exec-timeout-1",
+        persist=True,
+        timeout_s=0.05,
+    )
+    assert res.should_wake is True
+    assert res.reason == "preflight_timeout"
+    assert sync_attempts == [USER_ALICE]
+
+    # Also verify that if sync_user_coverage_to_home itself hangs beyond its dedicated short timeout,
+    # _sync_home_coverage_for_preflight logs a warning and continues without raising.
+    async def _hanging_sync(
+        user_id: str,
+        *,
+        yaml_text: str | None = None,
+        backend: Any = None,
+        rel_path: str = "dalton/coverage.yaml",
+    ) -> bool:
+        _ = (yaml_text, backend, rel_path)
+        sync_attempts.append(f"hang:{user_id}")
+        await asyncio.sleep(0.5)
+        return True
+
+    sync_mock.side_effect = _hanging_sync
+    summary = await preflight_mod._sync_home_coverage_for_preflight(
+        user_id=USER_ALICE,
+        kind="director_daily",
+        ticker=None,
+        persist=True,
+        sync_timeout_s=0.05,
+    )
+    assert summary is None
+    assert f"hang:{USER_ALICE}" in sync_attempts
+
 

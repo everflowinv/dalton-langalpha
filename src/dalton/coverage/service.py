@@ -54,7 +54,7 @@ OTC_EXCHANGES: frozenset[str] = frozenset(
 )
 
 
-class CoverageDataSourceError(RuntimeError):
+class MarketDataUnavailable(RuntimeError):
     """Structured error raised when market data providers (yfinance / FMP) fail."""
 
     def __init__(
@@ -72,12 +72,16 @@ class CoverageDataSourceError(RuntimeError):
     def to_dict(self) -> dict[str, Any]:
         return {
             "ok": False,
-            "error": "data_source_unavailable",
+            "error": "MarketDataUnavailable",
+            "code": "MarketDataUnavailable",
             "provider": self.provider,
             "reason": self.reason,
             "status_code": self.status_code,
             "message": str(self),
         }
+
+
+CoverageDataSourceError = MarketDataUnavailable
 
 
 def _is_pool_not_open_error(exc: BaseException) -> bool:
@@ -481,15 +485,33 @@ def _extract_http_status(exc: BaseException) -> int | None:
     return None
 
 
-def _safe_fast_info_get(fi: Any, key: str) -> Any:
+def _safe_fast_info_get(fi: Any, *keys: str) -> Any:
     if fi is None:
         return None
-    try:
-        if hasattr(fi, "get"):
-            return fi.get(key)
-        return getattr(fi, key, None)
-    except Exception:
-        return None
+    for key in keys:
+        try:
+            val: Any = None
+            if hasattr(fi, "get"):
+                val = fi.get(key)
+            elif hasattr(fi, "__getitem__"):
+                val = fi[key]
+            if val is None and not isinstance(fi, Mapping) and hasattr(fi, key):
+                val = getattr(fi, key)
+        except (KeyError, AttributeError):
+            continue
+        except MarketDataUnavailable:
+            raise
+        except Exception as exc:
+            if _is_ticker_not_found_exception(exc):
+                continue
+            raise MarketDataUnavailable(
+                "yfinance",
+                f"{type(exc).__name__} while reading fast_info.{key}",
+                status_code=_extract_http_status(exc),
+            ) from exc
+        if val is not None:
+            return val
+    return None
 
 
 def _lookup_via_yfinance_sync(ticker: str) -> dict[str, Any] | None:
@@ -503,17 +525,46 @@ def _lookup_via_yfinance_sync(ticker: str) -> dict[str, Any] | None:
 
     try:
         tk = yahoo_ticker(sym)
-        info = tk.info or {}
+    except MarketDataUnavailable:
+        raise
     except Exception as exc:
         if _is_ticker_not_found_exception(exc):
             return None
-        raise CoverageDataSourceError(
+        raise MarketDataUnavailable(
             "yfinance",
-            f"{type(exc).__name__} while looking up {sym}",
+            f"{type(exc).__name__} while initializing ticker {sym}",
             status_code=_extract_http_status(exc),
         ) from exc
 
-    fi = getattr(tk, "fast_info", None)
+    info: Mapping[str, Any] = {}
+    try:
+        raw_info = tk.info
+        if isinstance(raw_info, Mapping):
+            info = raw_info
+    except MarketDataUnavailable:
+        raise
+    except Exception as exc:
+        if not _is_ticker_not_found_exception(exc):
+            raise MarketDataUnavailable(
+                "yfinance",
+                f"{type(exc).__name__} while looking up {sym}",
+                status_code=_extract_http_status(exc),
+            ) from exc
+
+    try:
+        fi = getattr(tk, "fast_info", None)
+    except MarketDataUnavailable:
+        raise
+    except Exception as exc:
+        if _is_ticker_not_found_exception(exc):
+            fi = None
+        else:
+            raise MarketDataUnavailable(
+                "yfinance",
+                f"{type(exc).__name__} while reading fast_info for {sym}",
+                status_code=_extract_http_status(exc),
+            ) from exc
+
     quote_type = str(info.get("quoteType") or "").strip().upper()
     if quote_type == "NONE":
         return None
@@ -533,15 +584,34 @@ def _lookup_via_yfinance_sync(ticker: str) -> dict[str, Any] | None:
         info.get("regularMarketPrice")
         or info.get("currentPrice")
         or info.get("previousClose")
-        or _safe_fast_info_get(fi, "lastPrice")
-        or _safe_fast_info_get(fi, "regularMarketPreviousClose")
-        or _safe_fast_info_get(fi, "previousClose")
+        or _safe_fast_info_get(
+            fi,
+            "lastPrice",
+            "last_price",
+            "regularMarketPreviousClose",
+            "regular_market_previous_close",
+            "previousClose",
+            "previous_close",
+        )
     )
-    market_cap = info.get("marketCap") or _safe_fast_info_get(fi, "marketCap")
+    market_cap = info.get("marketCap") or _safe_fast_info_get(
+        fi, "marketCap", "market_cap"
+    )
 
-    has_identity = bool(name) or (
-        quote_type in ("EQUITY", "ETF", "INDEX", "MUTUALFUND")
-        and (price is not None or market_cap is not None or bool(exchange))
+    has_valid_fast_info = (
+        bool(exchange)
+        and exchange not in {"NONE", "N/A", "NULL"}
+        and isinstance(price, (int, float))
+        and not isinstance(price, bool)
+        and price > 0
+    )
+    has_identity = (
+        bool(name)
+        or has_valid_fast_info
+        or (
+            quote_type in ("EQUITY", "ETF", "INDEX", "MUTUALFUND")
+            and (price is not None or market_cap is not None or bool(exchange))
+        )
     )
     if not has_identity:
         return None
@@ -608,12 +678,16 @@ async def _lookup_via_fmp_profile(ticker: str) -> dict[str, Any] | None:
                     "market_cap": first.get("mktCap") or first.get("marketCap"),
                     "source_provider": "fmp",
                 }
+    except MarketDataUnavailable:
+        raise
     except Exception as exc:
-        logger.debug(
-            "[DALTON_COVERAGE] FMP profile lookup unavailable for %s (%s)",
-            ticker,
-            type(exc).__name__,
-        )
+        if _is_ticker_not_found_exception(exc):
+            return None
+        raise MarketDataUnavailable(
+            "fmp",
+            f"{type(exc).__name__} while looking up {ticker}",
+            status_code=_extract_http_status(exc),
+        ) from exc
     finally:
         try:
             await client.close()
@@ -625,18 +699,18 @@ async def _lookup_via_fmp_profile(ticker: str) -> dict[str, Any] | None:
 async def validate_and_enrich_ticker(ticker: str) -> dict[str, Any] | None:
     """Validate that `ticker` exists (yfinance primary, FMP optional supplement) and return enriched metadata.
 
-    Raises `CoverageDataSourceError` if market data sources fail due to provider/network errors,
-    rather than silently treating a broken data source as "ticker not found".
+    Raises `MarketDataUnavailable` (`CoverageDataSourceError`) if market data sources fail due to
+    provider/network errors, rather than silently treating a broken data source as "ticker not found".
     """
     sym = str(ticker or "").strip().upper()
     if not sym:
         return None
 
-    yf_error: CoverageDataSourceError | None = None
+    yf_error: MarketDataUnavailable | None = None
     hit: dict[str, Any] | None = None
     try:
         hit = await _lookup_via_yfinance(sym)
-    except CoverageDataSourceError as exc:
+    except MarketDataUnavailable as exc:
         yf_error = exc
         logger.warning(
             "[DALTON_COVERAGE] yfinance lookup failed for %s (%s), checking FMP fallback",
@@ -648,7 +722,15 @@ async def validate_and_enrich_ticker(ticker: str) -> dict[str, Any] | None:
         if (not hit.get("name") or hit.get("name") == sym or not hit.get("sector")) and (
             os.getenv("FMP_API_KEY") or ""
         ).strip():
-            fmp_supp = await _lookup_via_fmp_profile(sym)
+            try:
+                fmp_supp = await _lookup_via_fmp_profile(sym)
+            except MarketDataUnavailable as exc:
+                logger.debug(
+                    "[DALTON_COVERAGE] FMP supplement unavailable for %s (%s)",
+                    sym,
+                    exc.reason,
+                )
+                fmp_supp = None
             if fmp_supp is not None:
                 if not hit.get("name") or hit.get("name") == sym:
                     hit["name"] = fmp_supp.get("name") or hit["name"]
@@ -659,9 +741,21 @@ async def validate_and_enrich_ticker(ticker: str) -> dict[str, Any] | None:
         return hit
 
     if (os.getenv("FMP_API_KEY") or "").strip():
-        fmp_hit = await _lookup_via_fmp_profile(sym)
-        if fmp_hit is not None:
-            return fmp_hit
+        try:
+            fmp_hit = await _lookup_via_fmp_profile(sym)
+            if fmp_hit is not None:
+                return fmp_hit
+        except MarketDataUnavailable as fmp_exc:
+            if yf_error is not None:
+                raise yf_error from fmp_exc
+            if fmp_exc.status_code in (401, 402, 403, 429):
+                logger.debug(
+                    "[DALTON_COVERAGE] FMP fallback quota/tier limit (%s) after yfinance not-found for %s",
+                    fmp_exc.status_code,
+                    sym,
+                )
+                return None
+            raise
 
     if yf_error is not None:
         raise yf_error
@@ -804,6 +898,7 @@ def _build_upsert_rows_from_existing(
     norm_tier: str,
     norm_source: str,
     group_id: str | None,
+    valid_group_ids: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     rows_to_upsert: list[dict[str, Any]] = []
     gid_clean = str(group_id).strip() if group_id else None
@@ -812,17 +907,24 @@ def _build_upsert_rows_from_existing(
         existing = existing_rows.get(sym)
         if existing is not None:
             comp = row_to_company(existing)
-            prev_gids = extract_row_group_ids(existing)
+            prev_gids = [
+                g
+                for g in extract_row_group_ids(existing)
+                if valid_group_ids is None or g in valid_group_ids
+            ]
             merged_gids = list(prev_gids)
             if gid_clean and gid_clean not in merged_gids:
                 merged_gids.append(gid_clean)
+            existing_primary = str(existing.get("group_id") or "").strip() or None
+            if existing_primary and valid_group_ids is not None and existing_primary not in valid_group_ids:
+                existing_primary = None
             if norm_source == "group":
                 eff_source = str(existing.get("source") or "chat")
-                eff_group_id = existing.get("group_id") or (merged_gids[0] if merged_gids else gid_clean)
+                eff_group_id = existing_primary or (merged_gids[0] if merged_gids else gid_clean)
             else:
                 comp["tier"] = norm_tier
                 eff_source = norm_source
-                eff_group_id = gid_clean or existing.get("group_id") or (merged_gids[0] if merged_gids else None)
+                eff_group_id = gid_clean or existing_primary or (merged_gids[0] if merged_gids else None)
             if item.get("name") and (not comp.get("name") or comp.get("name") == sym):
                 comp["name"] = str(item["name"])
             if item.get("market") and not comp.get("market"):
@@ -911,6 +1013,14 @@ async def add_user_coverage_tickers(
 
     async def _locked_read_and_upsert(c: Any) -> tuple[int, list[dict[str, Any]]]:
         await coverage_db.acquire_coverage_advisory_lock(c, uid)
+        existing_groups = await coverage_db.list_coverage_groups(uid, conn=c)
+        valid_group_ids = {
+            str(g["group_id"]).strip()
+            for g in existing_groups
+            if g.get("group_id")
+        }
+        if group_id:
+            valid_group_ids.add(str(group_id).strip())
         existing_rows = {
             str(r["ticker"]).upper(): r
             for r in await coverage_db.list_coverage_rows(uid, conn=c)
@@ -923,6 +1033,7 @@ async def add_user_coverage_tickers(
             norm_tier=norm_tier,
             norm_source=norm_source,
             group_id=group_id,
+            valid_group_ids=valid_group_ids,
         )
         return await coverage_db.upsert_coverage_rows(uid, rows_to_upsert, conn=c)
 
@@ -970,6 +1081,7 @@ async def remove_user_coverage_tickers(
             "ok": True,
             "removed": [],
             "removed_tickers": [],
+            "not_found": [],
             "workspaces_preserved": [],
             "notice": None,
             "workspace_notice": None,
@@ -980,6 +1092,7 @@ async def remove_user_coverage_tickers(
     preserved_workspaces = [t for t in cleaned if t in ws_by_ticker]
 
     removed = await coverage_db.delete_coverage_tickers(uid, cleaned)
+    not_found = [t for t in cleaned if t not in set(removed)]
     if removed and await coverage_db.count_coverage_rows(uid) > 0:
         await ensure_user_earnings_calendar_automation(uid)
     home_synced = await sync_user_coverage_to_home(uid)
@@ -994,6 +1107,7 @@ async def remove_user_coverage_tickers(
         "ok": True,
         "removed": removed,
         "removed_tickers": removed,
+        "not_found": not_found,
         "workspaces_preserved": preserved_workspaces,
         "notice": notice,
         "workspace_notice": notice,
@@ -1013,7 +1127,7 @@ async def set_user_coverage_tier(
     norm_tier = normalize_tier(tier, default="watch")
     cleaned = [str(t or "").strip().upper() for t in tickers if str(t or "").strip()]
     if not cleaned:
-        return {"ok": True, "updated": [], "updated_tickers": [], "tier": norm_tier, "home_synced": False}
+        return {"ok": True, "updated": [], "updated_tickers": [], "not_found": [], "tier": norm_tier, "home_synced": False}
 
     updated_rows = await coverage_db.update_coverage_tier(uid, cleaned, norm_tier)
     updated_tickers = [str(r["ticker"]) for r in updated_rows]
@@ -1027,6 +1141,7 @@ async def set_user_coverage_tier(
         "updated": updated_tickers,
         "updated_tickers": updated_tickers,
         "missing_tickers": missing_tickers,
+        "not_found": missing_tickers,
         "tier": norm_tier,
         "home_synced": home_synced,
     }
@@ -1551,6 +1666,13 @@ async def resolve_coverage_group(
     async with coverage_db.get_db_connection() as conn:
         async with conn.transaction():
             await coverage_db.acquire_coverage_advisory_lock(conn, uid)
+            current_group = await coverage_db.get_coverage_group(uid, gid, conn=conn)
+            if current_group is None:
+                return {"status": "group_deleted", "ok": False, "group_id": gid}
+            default_tier = normalize_tier(
+                current_group.get("default_tier") or default_tier,
+                default="watch",
+            )
             existing_rows = await coverage_db.list_coverage_rows(uid, conn=conn)
             existing_by_ticker = {str(r["ticker"]).upper(): r for r in existing_rows}
 
@@ -1686,6 +1808,8 @@ async def refresh_due_coverage_groups_for_preflight(
         label = str(grp.get("label") or gid)
         try:
             res = await resolve_coverage_group(uid, gid, now=now_utc, sync_home=sync_home)
+            if res.get("status") == "group_deleted":
+                continue
             added = list(res.get("added_tickers") or [])
             stale = list(res.get("stale_tickers") or [])
             all_added.extend(added)

@@ -22,6 +22,7 @@ from src.dalton.coverage.models import (
 from src.dalton.coverage.service import (
     GROUP_REFRESH_INTERVAL_DAYS,
     CoverageDataSourceError,
+    MarketDataUnavailable,
     add_coverage_group,
     add_user_coverage_tickers,
     ensure_user_earnings_calendar_automation,
@@ -53,6 +54,7 @@ __all__ = [
     "DEDICATED_COMPANY_KEYS",
     "GROUP_REFRESH_INTERVAL_DAYS",
     "MAX_MIRROR_LEDGER_BYTES",
+    "MarketDataUnavailable",
     "VALID_SOURCES",
     "VALID_TIERS",
     "add_coverage_group",
