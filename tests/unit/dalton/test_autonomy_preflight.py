@@ -42,7 +42,6 @@ from src.dalton.autonomy.probes.cnhk import (
 )
 from src.dalton.autonomy.probes.director import probe_director
 from src.dalton.autonomy.probes.earnings import probe_earnings
-from src.dalton.autonomy.probes.internal import probe_internal
 from src.dalton.autonomy.probes.sec import probe_sec, resolve_company_cik
 from src.dalton.autonomy.schedule import (
     build_company_watch_specs,
@@ -63,10 +62,12 @@ from src.server.services.automation_settlement import _POLICIES, Outcome, _sched
 
 
 def test_five_company_probes_and_deleted_price_consensus():
-    """Verify price.py and consensus.py are removed and COMPANY_PROBES has exact 5 probes including cnhk (G4.1)."""
-    assert COMPANY_PROBES == ("sec", "cnhk", "internal", "agenda", "earnings")
+    """Verify price.py, consensus.py, and internal.py are removed and COMPANY_PROBES has exact 4 probes excluding internal."""
+    assert COMPANY_PROBES == ("sec", "cnhk", "agenda", "earnings")
+    assert "internal" not in COMPANY_PROBES
     assert importlib.util.find_spec("src.dalton.autonomy.probes.price") is None
     assert importlib.util.find_spec("src.dalton.autonomy.probes.consensus") is None
+    assert importlib.util.find_spec("src.dalton.autonomy.probes.internal") is None
 
 
 def test_backoff_is_purely_time_based():
@@ -115,9 +116,17 @@ async def test_automation_naming_templates_and_schedule_helper(monkeypatch):
     ]
     # A13: verify cron/threshold alignment with docs/dalton/dev-guide/automation-templates/
     assert specs[0]["cron_expression"] == "*/30 6-20 * * 1-5"
-    assert specs[1]["cron_expression"] == "30 21 * * 1-5"
+    assert specs[0]["timezone"] == "America/New_York"
+    assert specs[1]["cron_expression"] == "0 11 * * 2-6"
+    assert specs[1]["timezone"] == "Asia/Shanghai"
     assert specs[2]["trigger_config"]["conditions"][0]["value"] == 4.0
     assert specs[3]["trigger_config"]["conditions"][0]["value"] == 4.0
+
+    watch_specs = build_company_watch_specs(ticker="ECHO", workspace_id="ws-echo", tier="Watch")
+    assert watch_specs[0]["cron_expression"] == "30 7 * * 1-5"
+    assert watch_specs[0]["timezone"] == "America/New_York"
+    assert watch_specs[1]["cron_expression"] == "0 11 * * 6"
+    assert watch_specs[1]["timezone"] == "Asia/Shanghai"
 
     earn_specs = build_earnings_window_specs(
         ticker="META",
@@ -429,26 +438,6 @@ async def test_probes_detect_real_signals_and_resolve_cik():
     assert sec_sigs_2[0].payload["items"] == ["2.02", "9.01"]
     assert st2["last_sec_accession"] == "0001326801-26-000025"
 
-    # Internal probe: detects new docs and populates snippet & watermark (A6)
-    int_sigs, ist = await probe_internal(
-        ticker="META",
-        watch_state={},
-        docs_override=[
-            {
-                "doc_id": "gp-101",
-                "source": "guidepoint",
-                "title": "Meta Reels Ad Load Expert Call",
-                "snippet": "Expert noted +15% CPM lift in Q3.",
-                "published_at": "2026-10-18T10:00:00Z",
-            }
-        ],
-    )
-    assert len(int_sigs) == 1
-    assert int_sigs[0].signal_key == "doc:guidepoint:gp-101"
-    assert int_sigs[0].payload["snippet"] == "Expert noted +15% CPM lift in Q3."
-    assert ist["last_internal_doc_id"] == "gp-101"
-    assert "last_internal_check_at" in ist
-
     # Earnings probe T-3 reading watch.events
     earn_sigs, _ = await probe_earnings(
         ticker="META",
@@ -474,14 +463,14 @@ async def test_probes_detect_real_signals_and_resolve_cik():
 
 @pytest.mark.asyncio
 async def test_preflight_direct_wake_vs_llm_triage_and_fallback(monkeypatch):
-    """Test G4.3 + A2 + L33: 10-Q/10-K/20-F/8-K(2.02)/agenda/earnings wake directly; Form 4/internal go to assist_json(preflight.triage) verified via create_autospec."""
+    """Test G4.3 + A2 + L33: 10-Q/10-K/20-F/8-K(2.02)/agenda/earnings wake directly; Form 4/cnhk(P2) go to assist_json(preflight.triage) verified via create_autospec."""
     assert is_direct_wake_signal({"probe": "sec", "payload": {"form": "10-Q"}}) is True
     assert is_direct_wake_signal({"probe": "sec", "payload": {"form": "10-K"}}) is True
     assert is_direct_wake_signal({"probe": "sec", "payload": {"form": "20-F"}}) is True
     assert is_direct_wake_signal({"probe": "sec", "payload": {"form": "8-K", "items": ["2.02", "9.01"]}}) is True
     assert is_direct_wake_signal({"probe": "sec", "payload": {"form": "8-K", "items": ["5.02"]}}) is False
     assert is_direct_wake_signal({"probe": "sec", "payload": {"form": "4"}}) is False
-    assert is_direct_wake_signal({"probe": "internal", "payload": {"doc_id": "1"}}) is False
+    assert is_direct_wake_signal({"probe": "cnhk", "priority": "P2", "payload": {"priority": "P2"}}) is False
 
     auto = {
         "automation_id": "11111111-1111-1111-1111-111111111111",
@@ -536,7 +525,7 @@ async def test_preflight_direct_wake_vs_llm_triage_and_fallback(monkeypatch):
     res_form4 = await preflight_check(
         auto,
         "exec-form4",
-        watch_state_override=ws_form4,
+        watch_state_override=copy.deepcopy(ws_form4),
         agenda_doc_override={},
         persist=False,
     )
@@ -552,7 +541,7 @@ async def test_preflight_direct_wake_vs_llm_triage_and_fallback(monkeypatch):
     assert res_form4.decision == "skip"
     assert res_form4.reason == "routine_form4_tax_withholding"
 
-    # Case 2: Internal doc where assist_json returns ok=False -> conservative fallback MUST wake!
+    # Case 2: Non-direct SEC filing where assist_json returns ok=False -> conservative fallback MUST wake!
     mock_assist_fail = create_autospec(assist_json)
     mock_assist_fail.return_value = AssistResult(
         ok=False,
@@ -562,20 +551,10 @@ async def test_preflight_direct_wake_vs_llm_triage_and_fallback(monkeypatch):
     )
     monkeypatch.setattr("src.dalton.autonomy.preflight.assist_json", mock_assist_fail)
 
-    ws_internal = {
-        "pending_internal_docs": [
-            {
-                "doc_id": "ae-900",
-                "source": "alphaengine",
-                "title": "Meta AI CapEx Supply Chain Check",
-                "snippet": "H200 server orders revised up 20%.",
-            }
-        ]
-    }
     res_fallback = await preflight_check(
         auto,
         "exec-fallback",
-        watch_state_override=ws_internal,
+        watch_state_override=copy.deepcopy(ws_form4),
         agenda_doc_override={},
         persist=False,
     )
@@ -764,8 +743,6 @@ async def test_a1_budget_keys_a3_timeout_a5_agenda_note_a7_director_a9_once_defe
     mock_probe_sec.return_value = ([], {})
     mock_probe_cnhk = create_autospec(probe_cnhk_filings)
     mock_probe_cnhk.return_value = ([], {})
-    mock_probe_internal = create_autospec(probe_internal)
-    mock_probe_internal.return_value = ([], {})
 
     monkeypatch.setattr(watch_db, "upsert_signal", mock_upsert)
     monkeypatch.setattr(watch_db, "claim_signals_woken", mock_claim)
@@ -774,7 +751,6 @@ async def test_a1_budget_keys_a3_timeout_a5_agenda_note_a7_director_a9_once_defe
     monkeypatch.setattr(watch_db, "expire_old_signals", mock_expire)
     monkeypatch.setattr("src.dalton.autonomy.preflight.probe_sec", mock_probe_sec)
     monkeypatch.setattr("src.dalton.autonomy.preflight.probe_cnhk_filings", mock_probe_cnhk)
-    monkeypatch.setattr("src.dalton.autonomy.preflight.probe_internal", mock_probe_internal)
 
     today_iso = datetime.now(timezone.utc).date().isoformat()
     res_concurrent = await preflight_check(
@@ -949,7 +925,7 @@ async def test_p0i_i5_autonomy_low_risk_fixes(
     import importlib.util
     from pathlib import Path
     from src.dalton.autonomy import preflight as preflight_mod
-    from src.dalton.autonomy.probes import internal as internal_mod
+    from src.dalton.autonomy.probes import cnhk as cnhk_mod
     from src.dalton.autonomy.probes import sec as sec_mod
     from src.dalton.budget import service as budget_svc
     from src.dalton.tools import director_tools as dt_mod
@@ -977,41 +953,23 @@ async def test_p0i_i5_autonomy_low_risk_fixes(
     )
     mock_board.assert_awaited_once_with(user_id="pm-user-42")
 
-    # 2. internal.py logs warning once per hour when bridge is unconfigured
+    # 2. cnhk.py logs warning once per hour when bridge is unconfigured
     monkeypatch.delenv("DALTON_BRIDGE_MCP_URL", raising=False)
     monkeypatch.delenv("DALTON_RESEARCHDATA_URL", raising=False)
     monkeypatch.delenv("DALTON_BRIDGE_TOKEN", raising=False)
-    monkeypatch.setattr(internal_mod, "_LAST_UNCONFIGURED_WARN_AT", 0.0)
+    monkeypatch.setattr(cnhk_mod, "_LAST_UNCONFIGURED_WARN_AT", 0.0)
     with caplog.at_level("WARNING"):
-        res1 = await internal_mod._query_bridge_internal_docs(
-            ticker="META", workspace_id="ws-1", allow_network=True
+        res1 = cnhk_mod._fetch_bridge_route_sync(
+            bridge_url="", ticker="00700", start="2026-10-01", end="2026-10-19"
         )
-        res2 = await internal_mod._query_bridge_internal_docs(
-            ticker="META", workspace_id="ws-1", allow_network=True
+        res2 = cnhk_mod._fetch_bridge_route_sync(
+            bridge_url="", ticker="00700", start="2026-10-01", end="2026-10-19"
         )
-    assert res1 == [] and res2 == []
+    assert res1["ok"] is False and res2["ok"] is False
     unconf_warns = [
         r for r in caplog.records if "neither DALTON_BRIDGE_MCP_URL nor DALTON_BRIDGE_TOKEN" in r.message
     ]
     assert len(unconf_warns) == 1
-
-    # 3. internal.py runs 3 routes in parallel and enforces 10s step timeout
-    monkeypatch.setenv("DALTON_BRIDGE_MCP_URL", "http://127.0.0.1:8960/mcp/test")
-    monkeypatch.setattr(internal_mod, "INTERNAL_PROBE_STEP_TIMEOUT_S", 0.05)
-
-    def _slow_bridge(**kwargs: Any) -> list[dict[str, Any]]:
-        import time as _t
-
-        _t.sleep(0.2)
-        return []
-
-    monkeypatch.setattr(internal_mod, "_fetch_bridge_route_sync", _slow_bridge)
-    with caplog.at_level("WARNING"):
-        timed_out_docs = await internal_mod._query_bridge_internal_docs(
-            ticker="META", workspace_id="ws-1", allow_network=True
-        )
-    assert timed_out_docs == []
-    assert any("bridge parallel query timed out" in r.message for r in caplog.records)
 
     # 7. _check_budget_available fails open on DB error and logs at ERROR level
     monkeypatch.setattr(
@@ -1769,22 +1727,53 @@ def test_topic_research_validate_stale_unmarked() -> None:
 
 
 @pytest.mark.asyncio
-async def test_internal_probe_uses_researchdata_url_inside_container(monkeypatch):
-    """In the backend container 127.0.0.1 is not the host: the configured researchdata URL wins."""
-    from src.dalton.autonomy.probes import internal as internal_mod
+async def test_watch_preflight_probe_runners_exclude_internal(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify company_watch preflight runs only agenda, sec, cnhk, earnings and never runs internal probe."""
+    from src.dalton.autonomy import preflight as preflight_mod
+    from src.server.database import workspace as ws_db
 
-    monkeypatch.delenv("DALTON_BRIDGE_MCP_URL", raising=False)
-    monkeypatch.setenv("DALTON_BRIDGE_TOKEN", "tok")
-    monkeypatch.setenv("DALTON_RESEARCHDATA_URL", "http://host.docker.internal:8960/mcp/tok")
-    seen: list[str] = []
+    assert not hasattr(preflight_mod, "probe_internal")
+    monkeypatch.setattr(
+        ws_db,
+        "get_workspace",
+        create_autospec(
+            ws_db.get_workspace,
+            return_value={
+                "workspace_id": "22222222-2222-2222-2222-222222222222",
+                "user_id": "local-dev-user",
+            },
+        ),
+    )
 
-    def fake_fetch(*, bridge_url, route, ticker, since_ts=None, timeout_s=8.0):
-        seen.append(bridge_url)
-        return []
+    mock_agenda = create_autospec(probe_agenda, return_value=([], {}))
+    mock_sec = create_autospec(probe_sec, return_value=([], {}))
+    mock_cnhk = create_autospec(probe_cnhk_filings, return_value=([], {}))
+    mock_earnings = create_autospec(probe_earnings, return_value=([], {}))
 
-    monkeypatch.setattr(internal_mod, "_fetch_bridge_route_sync", fake_fetch)
-    await internal_mod._query_bridge_internal_docs(ticker="GOOGL", allow_network=True)
-    assert seen and all(u.startswith("http://host.docker.internal:8960/mcp/tok") for u in seen)
+    monkeypatch.setattr(preflight_mod, "probe_agenda", mock_agenda)
+    monkeypatch.setattr(preflight_mod, "probe_sec", mock_sec)
+    monkeypatch.setattr(preflight_mod, "probe_cnhk_filings", mock_cnhk)
+    monkeypatch.setattr(preflight_mod, "probe_earnings", mock_earnings)
+
+    res = await preflight_check(
+        {
+            "automation_id": "11111111-1111-1111-1111-111111111111",
+            "name": "dalton-meta-watch",
+            "trigger_type": "cron",
+            "user_id": "local-dev-user",
+            "workspace_id": "22222222-2222-2222-2222-222222222222",
+        },
+        "exec-watch-no-internal",
+        watch_state_override={},
+        agenda_doc_override={},
+        persist=False,
+    )
+    assert res.should_wake is False
+    assert res.reason == "no_new_signals"
+    assert mock_agenda.await_count == 1
+    assert mock_sec.await_count == 1
+    assert mock_cnhk.await_count == 1
+    assert mock_earnings.await_count == 1
 
 
 @pytest.mark.asyncio

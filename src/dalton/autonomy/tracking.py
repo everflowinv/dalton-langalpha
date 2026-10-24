@@ -13,6 +13,7 @@ import yaml
 from src.dalton.autonomy.schedule import (
     build_company_watch_specs,
     list_all_user_automations,
+    resolve_delta_schedule,
     schedule_dalton_automation_helper,
     user_automations_lock,
 )
@@ -23,7 +24,7 @@ from src.server.database.pool import get_db_connection
 
 logger = logging.getLogger(__name__)
 
-LABEL_ENABLED_ZH = "自动跟踪：开启（盯盘每 30 分钟 · 每日增量 21:30 · 涨跌 ±4% 触发）"
+LABEL_ENABLED_ZH = "自动跟踪：开启（盯盘每 30 分钟 · 内部资料北京时间 11:00 扫描，Core 每交易日、Watch 每周 · 涨跌 ±4% 触发）"
 LABEL_DISABLED_ZH = "自动跟踪：关闭"
 LABEL_INCOMPLETE_ZH = "自动跟踪：不完整"
 
@@ -428,12 +429,17 @@ async def enable_tracking(
             workspace_id=ws_id,
             tier=resolved_tier,
         )
+        delta_cron, delta_tz = resolve_delta_schedule(resolved_tier)
         expected_names = {str(s["name"]) for s in specs}
 
         for spec in specs:
             spec_copy = dict(spec)
             spec_meta = dict(spec_copy.get("metadata") or {})
             spec_meta["paused_by_user"] = None
+            spec_meta["tier"] = resolved_tier
+            if str(spec_copy.get("name") or "").endswith("-delta"):
+                spec_copy["cron_expression"] = delta_cron
+                spec_copy["timezone"] = delta_tz
             spec_copy["metadata"] = spec_meta
             spec_copy["status"] = "active"
             await schedule_dalton_automation_helper(
@@ -519,6 +525,7 @@ async def disable_tracking(user_id: str, workspace_id: str) -> dict[str, Any]:
             )
             paused_names.append(str(r.get("name") or auto_id))
 
+        delta_cron, delta_tz = resolve_delta_schedule(resolved_tier)
         for spec in specs:
             s_name = str(spec["name"])
             if s_name in by_name:
@@ -526,6 +533,10 @@ async def disable_tracking(user_id: str, workspace_id: str) -> dict[str, Any]:
             spec_copy = dict(spec)
             spec_meta = dict(spec_copy.get("metadata") or {})
             spec_meta["paused_by_user"] = True
+            spec_meta["tier"] = resolved_tier
+            if s_name.endswith("-delta"):
+                spec_copy["cron_expression"] = delta_cron
+                spec_copy["timezone"] = delta_tz
             spec_copy["metadata"] = spec_meta
             spec_copy["status"] = "paused"
             await schedule_dalton_automation_helper(
@@ -552,3 +563,136 @@ async def disable_tracking(user_id: str, workspace_id: str) -> dict[str, Any]:
         status_payload["paused_by_user"] = True
         status_payload["paused_count"] = len(paused_names)
         return status_payload
+
+
+def _iso_or_none(val: Any) -> str | None:
+    if val is None:
+        return None
+    if hasattr(val, "isoformat"):
+        return str(val.isoformat())
+    return str(val)
+
+
+async def resync_delta_schedule(
+    user_id: str,
+    ticker: str,
+    *,
+    tier: str | None = None,
+) -> dict[str, Any]:
+    """Rewrite a company's ``dalton-<t>-delta`` cron, timezone, and ``next_run_at`` for its current tier.
+
+    Does nothing when no delta task exists (tracking not enabled). Preserves task
+    ``status`` and ``metadata.paused_by_user`` when the task was paused by the user.
+    """
+    uid = str(user_id or "").strip()
+    t_upper = str(ticker or "").strip().upper()
+    if not uid:
+        raise ValueError("user_id is required")
+    if not t_upper:
+        raise ValueError("ticker is required")
+
+    delta_name = f"dalton-{t_upper.lower()}-delta"
+
+    async with user_automations_lock(uid) as conn:
+        resolved_tier = resolve_default_tier(t_upper, tier)
+        new_cron, new_tz = resolve_delta_schedule(resolved_tier)
+
+        rows = await list_all_user_automations(
+            uid,
+            name_prefix=delta_name,
+            conn=conn,
+        )
+        delta_rows = [
+            r
+            for r in rows
+            if isinstance(r, dict)
+            and str(r.get("name") or "").strip().lower() == delta_name
+            and r.get("automation_id")
+        ]
+        if not delta_rows:
+            return {
+                "ok": True,
+                "updated": False,
+                "reason": "no_delta_task",
+                "user_id": uid,
+                "ticker": t_upper,
+                "tier": resolved_tier,
+                "name": delta_name,
+            }
+
+        from src.server.services.automation_scheduler import AutomationScheduler
+
+        new_next_run_at = AutomationScheduler.calculate_first_run(new_cron, new_tz)
+        new_next_run_iso = _iso_or_none(new_next_run_at)
+        conn_kw = {"conn": conn} if conn is not None else {}
+
+        changes: list[dict[str, Any]] = []
+        for row in delta_rows:
+            auto_id = str(row["automation_id"])
+            old_cron = row.get("cron_expression")
+            old_tz = row.get("timezone")
+            old_next_run = _iso_or_none(row.get("next_run_at"))
+            old_meta = (
+                dict(row.get("metadata") or {})
+                if isinstance(row.get("metadata"), dict)
+                else {}
+            )
+            old_tier = old_meta.get("tier")
+            new_meta = dict(old_meta)
+            new_meta["ticker"] = t_upper
+            new_meta["tier"] = resolved_tier
+
+            updated_row = await auto_db.update_automation(
+                auto_id,
+                uid,
+                cron_expression=new_cron,
+                timezone=new_tz,
+                next_run_at=new_next_run_at,
+                metadata=new_meta,
+                **conn_kw,
+            )
+            effective_row = updated_row if isinstance(updated_row, dict) else row
+            effective_status = str(
+                effective_row.get("status") or row.get("status") or "active"
+            )
+            changes.append(
+                {
+                    "automation_id": auto_id,
+                    "name": delta_name,
+                    "status": effective_status,
+                    "paused_by_user": bool(new_meta.get("paused_by_user")),
+                    "old_tier": old_tier,
+                    "new_tier": resolved_tier,
+                    "old_cron_expression": old_cron,
+                    "new_cron_expression": new_cron,
+                    "old_timezone": old_tz,
+                    "new_timezone": new_tz,
+                    "old_next_run_at": old_next_run,
+                    "new_next_run_at": new_next_run_iso,
+                }
+            )
+
+        primary = changes[0]
+        return {
+            "ok": True,
+            "updated": True,
+            "user_id": uid,
+            "ticker": t_upper,
+            "tier": resolved_tier,
+            "automation_id": primary["automation_id"],
+            "name": primary["name"],
+            "status": primary["status"],
+            "paused_by_user": primary["paused_by_user"],
+            "old_tier": primary["old_tier"],
+            "new_tier": primary["new_tier"],
+            "old_cron_expression": primary["old_cron_expression"],
+            "new_cron_expression": primary["new_cron_expression"],
+            "cron_expression": primary["new_cron_expression"],
+            "old_timezone": primary["old_timezone"],
+            "new_timezone": primary["new_timezone"],
+            "timezone": primary["new_timezone"],
+            "old_next_run_at": primary["old_next_run_at"],
+            "new_next_run_at": primary["new_next_run_at"],
+            "next_run_at": primary["new_next_run_at"],
+            "changes": changes,
+        }

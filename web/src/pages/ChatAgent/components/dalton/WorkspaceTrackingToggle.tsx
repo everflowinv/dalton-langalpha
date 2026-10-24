@@ -18,7 +18,7 @@ export {
   type WorkspaceTrackingTask,
 };
 
-export const LABEL_ENABLED_ZH = '自动跟踪：开启（盯盘每 30 分钟 · 每日增量 21:30 · 涨跌 ±4% 触发）';
+export const LABEL_ENABLED_ZH = '自动跟踪：开启（盯盘每 30 分钟 · 内部资料北京时间 11:00 扫描，Core 每交易日、Watch 每周 · 涨跌 ±4% 触发）';
 export const LABEL_DISABLED_ZH = '自动跟踪：关闭';
 export const LABEL_INCOMPLETE_ZH = '自动跟踪：不完整';
 

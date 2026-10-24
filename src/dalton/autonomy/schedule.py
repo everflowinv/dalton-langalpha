@@ -23,6 +23,16 @@ logger = logging.getLogger(__name__)
 
 DALTON_NAME_RE = re.compile(r"^dalton-[a-z0-9][a-z0-9._-]{1,62}$")
 
+DELTA_TIMEZONE = "Asia/Shanghai"
+DELTA_CRON_CORE = "0 11 * * 2-6"
+DELTA_CRON_WATCH = "0 11 * * 6"
+
+
+def resolve_delta_schedule(tier: str) -> tuple[str, str]:
+    """Return ``(cron_expression, timezone)`` for a company's ``dalton-<t>-delta`` task."""
+    is_core = str(tier or "").strip().lower() == "core"
+    return (DELTA_CRON_CORE if is_core else DELTA_CRON_WATCH), DELTA_TIMEZONE
+
 _inproc_user_locks: dict[str, asyncio.Lock] = {}
 _held_user_locks: contextvars.ContextVar[frozenset[tuple[int, str]]] = contextvars.ContextVar(
     "_held_user_locks", default=frozenset()
@@ -129,6 +139,7 @@ def build_company_watch_specs(
     is_cnhk = t_upper.endswith((".HK", ".SS", ".SZ", ".SH"))
     tz = timezone_name or ("Asia/Shanghai" if is_cnhk else "America/New_York")
     watch_cron = "*/30 6-20 * * 1-5" if tier.lower() == "core" else "30 7 * * 1-5"
+    delta_cron, delta_tz = resolve_delta_schedule(tier)
 
     return [
         {
@@ -154,8 +165,8 @@ def build_company_watch_specs(
             "name": f"dalton-{t_lower}-delta",
             "description": f"{t_upper} 盘后 Thesis Delta 复盘",
             "trigger_type": "cron",
-            "cron_expression": "30 21 * * 1-5",
-            "timezone": tz,
+            "cron_expression": delta_cron,
+            "timezone": delta_tz,
             "workspace_id": workspace_id,
             "thread_strategy": "new",
             "instruction": (
