@@ -519,6 +519,17 @@ export function ModelTab() {
                     modelAccess={modelAccessMap}
                     metadata={modelMetadata}
                   />
+                  {/* DALTON-HOOK(settings-section): Dalton language-review model selector */}
+                  <ModelSelector
+                    label={t('settings.modelTuning.daltonLanguageModel')}
+                    description={`${t('settings.modelTuning.daltonLanguageModelDesc')} ${daltonDefaultHint(hookSystemDefaults?.dalton_language_model)}`}
+                    value={mPref.dalton_language_model ?? ''}
+                    onChange={(v) => write({ dalton_language_model: v || null })}
+                    models={daltonSystemModels}
+                    placeholder={daltonDefaultHint(hookSystemDefaults?.dalton_language_model)}
+                    modelAccess={modelAccessMap}
+                    metadata={modelMetadata}
+                  />
                   <FallbackModelsPicker
                     label={t('settings.modelTuning.daltonAuditFallbackModels')}
                     description={`${t('settings.modelTuning.daltonAuditFallbackModelsDesc')} ${daltonDefaultHint(hookSystemDefaults?.dalton_audit_fallback_models)}`}

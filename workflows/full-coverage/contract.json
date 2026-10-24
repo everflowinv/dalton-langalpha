@@ -145,6 +145,9 @@
     ],
     "check_draft": {
       "draft": "drafts/{as_of}-memo.md"
+    },
+    "language_review": {
+      "draft": "drafts/{as_of}-memo.md"
     }
   }
 }

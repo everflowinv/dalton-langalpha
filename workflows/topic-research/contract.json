@@ -105,6 +105,9 @@
       "THESIS_BROKEN",
       "NEW_THESIS"
     ],
-    "verdict_trigger": "agenda"
+    "verdict_trigger": "agenda",
+    "language_review": {
+      "draft": "drafts/{as_of}-topic-{slug}.md"
+    }
   }
 }

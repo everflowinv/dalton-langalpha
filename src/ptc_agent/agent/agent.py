@@ -648,6 +648,30 @@ class PTCAgent:
                 skill_registry=subagent_skill_registry,
                 scratchpad=scratchpad.folder if scratchpad is not None else None,
             )
+            # DALTON-HOOK(dalton-tools): Dalton workflows drive the two
+            # language-review rounds through general-purpose dispatches, and
+            # check_language is a server-side tool (LLMService + the configured
+            # review model) no sandbox tool set can host — so a backend-bound
+            # instance rides that one spec, picked by name (create_publish_tools
+            # reorders, an index would not survive it). Every other Dalton
+            # governance tool stays main-agent-only.
+            if role == "analyst":
+                try:
+                    from src.dalton.settings import get_dalton_settings
+                    from src.dalton.tools.publish_tools import create_publish_tools
+
+                    if get_dalton_settings().publish.enabled:
+                        check_language = next(
+                            tool
+                            for tool in create_publish_tools(filesystem_backend)
+                            if getattr(tool, "name", "") == "check_language"
+                        )
+                        for spec in subagents:
+                            if spec.get("name") == "general-purpose":
+                                spec.setdefault("tools", []).append(check_language)
+                                break
+                except Exception as e:
+                    logger.debug("[DALTON_TOOLS] check_language not bound to subagents: %s", e)
             subagents.extend(additional_subagents or [])
 
         background_middleware = BackgroundSubagentMiddleware(

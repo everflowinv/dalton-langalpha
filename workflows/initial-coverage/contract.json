@@ -91,6 +91,9 @@
     "check_draft": {
       "draft": "drafts/{as_of}-initial-coverage.md",
       "required": false
+    },
+    "language_review": {
+      "draft": "drafts/{as_of}-initial-coverage.md"
     }
   }
 }

@@ -17,6 +17,9 @@
       "absent_verdict_kinds_any": [
         "NO_CHANGE"
       ]
+    },
+    "language_review": {
+      "draft": "drafts/{as_of}-call-{ticker}.md"
     }
   }
 }

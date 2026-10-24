@@ -98,6 +98,9 @@
     "check_draft": {
       "draft": "drafts/{as_of}-bullbear.md",
       "required": false
+    },
+    "language_review": {
+      "draft": "drafts/{as_of}-bullbear.md"
     }
   }
 }

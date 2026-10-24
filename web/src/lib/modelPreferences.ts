@@ -62,6 +62,7 @@ export interface ModelPreferences extends ModelProfile {
   background_follows?: BackgroundFollows | null;
   // DALTON-HOOK(settings-section): Dalton model settings stored in model_preference
   dalton_audit_model?: string | null;
+  dalton_language_model?: string | null;
   dalton_audit_fallback_models?: string[] | null;
   dalton_audit_timeout_s?: number | null;
   dalton_assist_model?: string | null;
@@ -87,6 +88,7 @@ const daltonTimeoutOrNull = z.catch(
 
 export const DaltonModelPrefsSchema = z.object({
   dalton_audit_model: daltonStrOrNull,
+  dalton_language_model: daltonStrOrNull,
   dalton_audit_fallback_models: daltonStrListOrNull,
   dalton_audit_timeout_s: daltonTimeoutOrNull,
   dalton_assist_model: daltonStrOrNull,
@@ -140,6 +142,7 @@ export const MODEL_PREF_KEYS: ReadonlySet<string> = new Set<string>([
   'background_follows',
   // DALTON-HOOK(settings-section): route Dalton model settings to model_preference
   'dalton_audit_model',
+  'dalton_language_model',
   'dalton_audit_fallback_models',
   'dalton_audit_timeout_s',
   'dalton_assist_model',

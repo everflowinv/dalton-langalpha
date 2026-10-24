@@ -29,6 +29,7 @@ const h = vi.hoisted(() => ({
     background_model: 'deepseek-flash',
     fallback_models: [],
     dalton_audit_model: 'gemini-4-argon-medium-oauth',
+    dalton_language_model: 'gemini-4-argon-medium-oauth',
     dalton_audit_fallback_models: ['gpt-6.1-sol-oauth', 'claude-opus-5-5-oauth'],
     dalton_audit_timeout_s: 300,
     dalton_extract_model: 'deepseek-flash',
@@ -301,6 +302,7 @@ describe('Settings: Auto defaults', () => {
         background_model: 'deepseek-flash',
         fallback_models: [],
         dalton_audit_model: 'gemini-4-argon-medium-oauth',
+        dalton_language_model: 'gemini-4-argon-medium-oauth',
         dalton_audit_fallback_models: ['gpt-6.1-sol-oauth', 'claude-opus-5-5-oauth'],
         dalton_audit_timeout_s: 300,
         dalton_extract_model: 'deepseek-flash',
@@ -378,8 +380,7 @@ describe('Settings: Dalton routing controls', () => {
   });
 
   // DALTON-HOOK(settings-section): verify Dalton dropdowns exclude custom_models
-  it('excludes user custom_models from Dalton model selectors while keeping system catalog models', async () => {
-    localStorage.setItem('settings:modelMode', 'advanced');
+  it('excludes user custom_models from Dalton model selectors while keeping system catalog models', async () => {    localStorage.setItem('settings:modelMode', 'advanced');
     h.catalog = {
       openai: { models: ['gpt-sol', 'my-custom-model'] },
       anthropic: { models: ['claude-big'] },
@@ -403,6 +404,37 @@ describe('Settings: Dalton routing controls', () => {
         anthropic: { models: ['claude-big', 'claude-small'] },
         deepseek: { models: ['deepseek-flash'] },
       };
+    }
+  });
+
+  // DALTON-HOOK(settings-section): the language-review selector defaults from
+  // system_defaults (audit fallback) and writes its own key.
+  it('shows the language review default and saves the choice under dalton_language_model', async () => {
+    localStorage.setItem('settings:modelMode', 'advanced');
+    renderModelTab();
+
+    const langSelect = (await screen.findByRole('combobox', { name: 'Language review model' })) as HTMLSelectElement;
+    // The empty option carries the effective system default (audit fallback).
+    expect(langSelect.options[0].textContent).toContain('gemini-4-argon-medium-oauth');
+
+    fireEvent.change(langSelect, { target: { value: 'gpt-sol' } });
+    expect(h.mutate).toHaveBeenLastCalledWith({
+      model_preference: { dalton_language_model: 'gpt-sol' },
+    });
+  });
+
+  it('reads back a saved dalton_language_model preference', async () => {
+    localStorage.setItem('settings:modelMode', 'advanced');
+    h.preferences = {
+      model_preference: { dalton_language_model: 'claude-big' },
+      other_preference: {},
+    };
+    try {
+      renderModelTab();
+      const langSelect = (await screen.findByRole('combobox', { name: 'Language review model' })) as HTMLSelectElement;
+      expect(langSelect.value).toBe('claude-big');
+    } finally {
+      h.preferences = { model_preference: {}, other_preference: {} };
     }
   });
 });

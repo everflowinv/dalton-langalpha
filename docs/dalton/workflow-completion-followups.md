@@ -33,6 +33,21 @@ resume。7 个多步 skill 的契约由后续分支 `feat/skill-completion-contr
 
 - verdict 与知识版本判定一律绑定**本轮**（今天 UTC 起、真实列 `word`/`trigger_kind`），
   数据库查询失败记 missing；
+- 正式产物的完成契约带 `language_review` 关闭项（feat/language-review）：按
+  `is_reviewable_deliverable`（`src/dalton/publish/language.py`，唯一范围规则）认定本次的正式产物：
+  契约声明的可审产物（按 requires_param/requires_json/derive/glob 展开，不看 mtime）∪ run 的
+  journal 里各派发回报的文件 ∪ 时间窗内（run 开始时间；手动路径用 as_of 当日，as_of 缺失或为
+  latest 时用线程开始时间，再取不到用过去 24 小时；mtime 用 stat，同 modified_on）新写或修改过的
+  全部可审 .md，逐个要求
+  `<文件>.language.json` 含第 1、2 轮 `check_language` 记录，且最后一条第 2 轮的
+  `draft_sha256` 与当前文件一致（声明的终稿还接受与最后一次独立审稿通过的哈希一致）；
+  缺轮次、哈希对不上或读不到一律记 missing（dalton-call 门禁未过分支跳过）。复用的旧笔记
+  不要求重审：同一哈希已有两轮记录即通过。`published/` 归档稿不作为语言目标（发布横幅使
+  哈希不同且归档不可改，其审查以对应草稿为准）；`research/topics/conversations/` 为机器渲染，
+  同样不审。适用：initial-coverage、full-coverage、
+  earnings-deep-update、topic-research、bullbear-doc 五个 workflow（其 research/ 笔记
+  与 drafts/ 背景稿同查），dalton-earnings-preview、dalton-call（门禁通过分支）、
+  dalton-publish 的草稿。
 - 可选项（SKILL 原文写明可选的步骤）失败只进 warnings，且各失败方式一致。
 
 ## 未做（有意）

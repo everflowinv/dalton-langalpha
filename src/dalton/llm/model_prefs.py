@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 
 DALTON_SINGLE_MODEL_KEYS: tuple[str, ...] = (
     "dalton_audit_model",
+    "dalton_language_model",
     "dalton_assist_model",
     "dalton_extract_model",
 )
@@ -89,6 +90,14 @@ def dalton_model_default(key: str) -> Any:
     if key == "dalton_audit_model":
         val = (settings.publish.audit_model or "").strip()
         return val or None
+    if key == "dalton_language_model":
+        # publish.language_model left empty means "same chain as the number
+        # audit", so the fallback is resolved here and the Settings hint shows
+        # the effective model rather than a blank.
+        val = (settings.publish.language_model or "").strip()
+        if val:
+            return val
+        return dalton_model_default("dalton_audit_model")
     if key == "dalton_audit_fallback_models":
         items = _dedup_str_list(settings.publish.audit_fallback_models or [])
         return items or None
@@ -121,6 +130,7 @@ def get_dalton_system_defaults() -> dict[str, Any]:
     audit_timeout = dalton_model_default("dalton_audit_timeout_s")
     return {
         "dalton_audit_model": dalton_model_default("dalton_audit_model") or "",
+        "dalton_language_model": dalton_model_default("dalton_language_model") or "",
         "dalton_audit_fallback_models": list(
             dalton_model_default("dalton_audit_fallback_models") or []
         ),
@@ -259,6 +269,12 @@ async def resolve_dalton_audit_timeout_s(user_id: str | None = None) -> int | fl
     if isinstance(val, (int, float)) and not isinstance(val, bool) and val > 0:
         return val
     return 300.0
+
+
+async def resolve_dalton_language_model(user_id: str | None = None) -> str:
+    """Resolve the language-review model for ``user_id`` (empty string if unconfigured)."""
+    val = await dalton_model_pref(user_id, "dalton_language_model")
+    return str(val).strip() if isinstance(val, str) else ""
 
 
 async def resolve_dalton_assist_model(user_id: str | None = None) -> str:

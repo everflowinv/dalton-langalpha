@@ -448,6 +448,8 @@
       "daltonEmptyDefaultUnset": "Leave blank to inherit the team PM's setting, or the system default if the PM has none",
       "daltonAuditModel": "Figure audit model",
       "daltonAuditModelDesc": "Primary model for figure verification and source matching before report publication.",
+      "daltonLanguageModel": "Language review model",
+      "daltonLanguageModelDesc": "Model that reviews formal deliverables for language issues (flag-only); empty inherits the figure audit model.",
       "daltonAuditFallbackModels": "Figure audit fallback models",
       "daltonAuditFallbackModelsDesc": "Fallback models tried in order when the primary figure audit model fails or times out.",
       "daltonAuditTimeoutS": "Figure audit timeout (seconds)",

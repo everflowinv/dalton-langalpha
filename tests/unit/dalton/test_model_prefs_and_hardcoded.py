@@ -1024,3 +1024,82 @@ async def test_pm_only_custom_model_does_not_shadow_a_members_inherited_value(
         await mp_mod.dalton_model_pref("user-member", "dalton_audit_model")
         == "gpt-6.1-sol-oauth"
     )
+
+
+def test_language_model_default_falls_back_to_audit_model_when_unset() -> None:
+    """publish.language_model empty means "same chain as the number audit":
+    the system default the Settings page hints is the effective audit model,
+    never a blank."""
+    real_settings = settings_mod.get_dalton_settings()
+    assert real_settings.publish.language_model == ""  # yaml stays on the fallback
+    assert (
+        mp_mod.dalton_model_default("dalton_language_model")
+        == real_settings.publish.audit_model
+    )
+    sys_defaults = mp_mod.get_dalton_system_defaults()
+    assert sys_defaults["dalton_language_model"] == real_settings.publish.audit_model
+
+    # An explicit language_model wins over the fallback (model_prefs keeps its
+    # own import of get_dalton_settings, so that is the symbol to patch).
+    import copy
+
+    patched = copy.deepcopy(real_settings)
+    patched.publish.language_model = "  some-explicit-model  "
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(mp_mod, "get_dalton_settings", lambda: patched)
+    try:
+        assert mp_mod.dalton_model_default("dalton_language_model") == "some-explicit-model"
+    finally:
+        monkey.undo()
+
+
+@pytest.mark.asyncio
+async def test_dalton_language_model_resolves_user_pref_then_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A saved user preference wins; without one the audit-model chain
+    (user → PM holder → yaml) decides, exactly like dalton_audit_model."""
+    prefs_by_user: dict[str, dict[str, Any]] = {
+        "user-member": {"model_preference": {}},
+        "user-pm-holder": {
+            "model_preference": {
+                "dalton_audit_model": "claude-opus-5-5-oauth",
+                "dalton_language_model": "grok-4.7-oauth",
+            }
+        },
+        "user-solo": {
+            "model_preference": {"dalton_language_model": "gpt-6.1-sol-oauth"}
+        },
+    }
+
+    async def _fake_get_prefs(uid: str) -> dict[str, Any] | None:
+        return prefs_by_user.get(uid)
+
+    monkeypatch.setattr(
+        mp_mod,
+        "get_user_preferences",
+        create_autospec(mp_mod.get_user_preferences, side_effect=_fake_get_prefs),
+    )
+    monkeypatch.setattr(
+        mp_mod,
+        "get_team_credential_holder_id",
+        create_autospec(mp_mod.get_team_credential_holder_id, return_value="user-pm-holder"),
+    )
+
+    # 1. A member with no preference of their own inherits the PM holder's saved key.
+    assert (
+        await mp_mod.resolve_dalton_language_model("user-member") == "grok-4.7-oauth"
+    )
+    # 2. The member's own saved key wins over the holder's.
+    assert await mp_mod.resolve_dalton_language_model("user-solo") == "gpt-6.1-sol-oauth"
+    # 3. Nobody set the language key -> the YAML fallback (publish.audit_model)
+    # answers; the holder's own audit-model preference does not extend to it.
+    prefs_by_user["user-member"] = {"model_preference": {}}
+    prefs_by_user["user-pm-holder"] = {
+        "model_preference": {"dalton_audit_model": "claude-opus-5-5-oauth"}
+    }
+    assert (
+        await mp_mod.resolve_dalton_language_model("user-member")
+        == settings_mod.get_dalton_settings().publish.audit_model
+    )
+

@@ -122,6 +122,9 @@
           "lessons"
         ]
       }
-    ]
+    ],
+    "language_review": {
+      "draft": "drafts/{release_date}-deep-{quarter}.md"
+    }
   }
 }
