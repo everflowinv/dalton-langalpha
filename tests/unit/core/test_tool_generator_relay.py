@@ -141,7 +141,10 @@ class TestRelayBoundEmission:
         assert "x-relay-error" in code
         # Each tools/call send is budgeted above the relay's 55s wall.
         assert "_HTTP_CALL_BUDGET = 65.0" in code
-        assert "httpx.Client(timeout=_HTTP_CALL_BUDGET)" in code
+        # DALTON-HOOK(mcp-call-timeout): the send budget is per-server config
+        # (call_timeout_s, defaulting to _HTTP_CALL_BUDGET), so the client is
+        # constructed from the config field, not the raw constant.
+        assert "httpx.Client(timeout=cfg.call_timeout_s)" in code
 
     def test_builtin_only_config_has_no_relay_binding(self):
         # The runtime module always ships the relay/vault helpers (static
