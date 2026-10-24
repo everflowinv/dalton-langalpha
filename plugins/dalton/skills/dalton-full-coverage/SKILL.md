@@ -95,7 +95,7 @@ Workflow 返回后，主智能体按以下 6 步完成收尾（完成契约在�
 
 ### 第 2 步：展示并写入知识层修订（`knowledge_update` + `knowledge_append_verdict`）
 - 读取 `research/<D>-fc/knowledge-revision.json`，将核心认知改动（`旧值 → 新值 → 原因与证据编号`）展示给 PM（无人值守运行时直接写入工作版本），然后逐个 doc 调用 `knowledge_update`：
-  - **`thesis`**：更新支柱、确认/警告/证伪阈值、追加证据台账行（`source.type` 与 `source.tier` 对应）、更新 `house_view`（**硬约束**：若给出目标价，`house_view.target` 必须带 `model_ref.kind="model_cell"` 指向 Excel 模型单元格）；
+  - **`thesis`**：先写证据台账再定稿——更新支柱、确认/警告/证伪阈值、追加证据台账行（`source.type` 与 `source.tier` 对应；每条 `evidence` 必填 `figures` 数组，含 `metric`、`period`、`value`、`unit`、`label`，且 `source.ref` 指向一手文件或 `prov`，严禁指向本次草稿 `drafts/<D>-memo.md`）、更新 `house_view`（**硬约束**：若给出目标价，`house_view.target` 必须带 `model_ref.kind="model_cell"` 指向 Excel 模型单元格）；
   - **`debate`**：更新完整覆盖后的核心多空分歧、倾向、置信度与改判条件；
   - **`drivers`**：更新核心业务驱动树变量、模型敏感度与高频跟踪指标；
   - **`management`**：写入 C4 支线整理的 12 季指引兑现历史（`guidance_history`）与指引风格定性结论（`guidance_style`：保守/中性/激进、收入还是利润更保守、全年修正节奏）；
@@ -110,7 +110,7 @@ Workflow 返回后，主智能体按以下 6 步完成收尾（完成契约在�
 - 调用 `dalton_coverage_tracking(action="enable", source="coverage_finish")` 开启（或补齐）该公司的标准自动跟踪任务（`watch`、`delta`、`move-up`、`move-down`）。若用户之前手动关闭过（带 `paused_by_user` 标记），`source="coverage_finish"` 会自动保持关闭状态，不重新打开。
 
 ### 第 4 步：`check_draft` 预检与 `publish_report` 正式发布
-1. 先调用 `check_draft(draft_path="drafts/<D>-memo.md")` 查看数字核验反馈（生成 `drafts/<D>-memo.audit.md`），修复所有未匹配或无来源的数字。
+1. 确认报告末尾 `## 引用` 表存在且正文中每个 `[引用N]` 都能在表里找到（指向 `f:`、`evidence:`、`model:` 或 `prov:`），调用 `check_draft(draft_path="drafts/<D>-memo.md")` 查看数字核验反馈（生成 `drafts/<D>-memo.audit.md`），修复所有未匹配或无来源的数字。
 2. 调用 `publish_report` 发起正式发布：
    ```json
    {

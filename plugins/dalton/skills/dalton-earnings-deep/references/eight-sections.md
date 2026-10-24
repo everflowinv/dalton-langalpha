@@ -212,9 +212,9 @@
 
 ---
 
-### 资料来源
+## 引用
 
-完整列出本报告采用的每一份一手与二手材料：
+将资料来源与核验映射合并为文末单一 `## 引用` 节（每行一条：`[引用N]: <evidence:|model:|prov:|f:> （来源类型｜机构/作者｜标题｜日期｜文档 id / accession / 链接）`），完整覆盖本报告采用的每一份一手与二手材料：
 - **SEC / 港股与 A 股监管 Filings**：美股 10-Q / 10-K / 8-K / 6-K 链接与 accession 编号；港股与 A 股 `cn-hk` 法定公告 `document_id`（`cn-hk:{ticker}:{date}:{index}`）、巨潮资讯 `pdf_link` 或港交所披露易（HKEXnews）原文链接
 - **公司 IR 材料**：财报新闻稿、业绩会演示 PPT、Financial Supplement URL
 - **电话会纪要**：AlphaEngine `doc_id` 与标题、日期

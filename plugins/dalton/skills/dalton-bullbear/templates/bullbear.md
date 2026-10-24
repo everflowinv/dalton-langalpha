@@ -95,16 +95,14 @@
 
 ## 十、引用清单
 
-[引用1] 行情｜Yahoo Finance｜价格与一致预期快照｜{DATE}｜data/consensus/...
-[引用2] 公告｜SEC 10-K / 10-Q｜{标题或内容概述}｜{DATE}｜accession ...
-
 **信源覆盖**：
 - 内部研究库（sales-notes / tmtb / funda-ai / company-wiki）：{命中数与实际采用数，未覆盖原因}
 - AlphaEngine（foreign_report / sell_side_comment / meeting_minutes）：{命中数与采用数}
 - Guidepoint 专家纪要：{命中数与采用数}
 - 一手披露（SEC filing / 电话会）：{覆盖期次与 accession}
 
-<!-- 末尾必须附引用表 -->
 ## 引用
-[引用1]: evidence:E-20261023-01
-[引用2]: model:model/META-model-v01.xlsx!DCF!C12
+[引用1]: evidence:E-20261023-01 （行情｜Yahoo Finance｜价格与一致预期快照｜{DATE}｜data/consensus/...）
+[引用2]: evidence:E-20261023-02 （公告｜SEC 10-K / 10-Q｜{标题或内容概述}｜{DATE}｜accession ...）
+[引用3]: model:model/META-model-v01.xlsx!DCF!C12 （本方模型｜{模型单元格说明}｜{DATE}｜model/{TICKER}-model-v01.xlsx）
+[回报引用1]: evidence:E-20261023-04 （行情｜yfinance / anchors.json｜市值与汇率锚点｜{DATE}｜anchors.json）

@@ -99,7 +99,7 @@
 <!-- 完成 -->
 ```
 
-> **核对要求**：`return.md` 与 `return_appendix.md` 正文中出现的 `[回报引用N]` 集合，必须与 `**回报引用清单**` 下列出的 `[回报引用N]` 集合完全一致（`bb_check.py` 会强制校验）。末尾必须附引用表（在合并后报告末尾的 `## 引用` 一节逐行写出 `[回报引用1]: evidence:E-20261023-01`、`[引用1]: evidence:E-20261023-01` 或 `[引用3]: model:model/META-model-v01.xlsx!DCF!C12` 等核验来源对应关系）。
+> **核对要求**：`return.md` 与 `return_appendix.md` 正文中出现的 `[回报引用N]` 集合，必须与 `**回报引用清单**` 下列出的 `[回报引用N]` 集合完全一致（`bb_check.py` 会强制校验）。合并后在报告末尾的 `## 引用` 一节逐行写出核验目标与括号内来源说明（形如 `[回报引用1]: evidence:E-20261023-04 （行情｜yfinance / anchors.json｜市值与汇率锚点｜YYYY-MM-DD｜anchors.json）`、`[引用1]: evidence:E-20261023-01 （行情｜Yahoo Finance｜价格与一致预期快照｜YYYY-MM-DD｜data/consensus/...）`）。
 
 ---
 

@@ -260,15 +260,10 @@
 
 ---
 
-### 资料来源
-
-1. `[引用1]` {SEC 10-Q / 8-K EX-99.1 / 6-K 链接与 accession}
-2. `[引用2]` {公司 IR 新闻稿、业绩演示 PPT、Financial Supplement URL}
-3. `[引用3]` {电话会纪要 AlphaEngine doc_id 与日期}
-4. `[引用4]` {AlphaEngine 卖方报告 / FUNDA AI / TMTB / Sales Notes 引用清单（机构、标题、日期、ID）}
-5. `[引用5]` {一致预期快照 `data/consensus/...`、行情基准与模型版本 `model/<TICKER>-model-v<NN>.xlsx`}
-
-<!-- 末尾必须附引用表 -->
 ## 引用
-[引用1]: evidence:E-20261023-01
-[引用3]: model:model/META-model-v01.xlsx!DCF!C12
+
+[引用1]: evidence:E-20261023-01 （法定财报｜SEC 10-Q / 8-K EX-99.1 / 6-K｜{标题与期次}｜{日期}｜{accession 或公告链接}）
+[引用2]: evidence:E-20261023-02 （公司 IR｜财报新闻稿、业绩演示 PPT、Financial Supplement｜{标题}｜{日期}｜{URL}）
+[引用3]: evidence:E-20261023-03 （电话会纪要｜AlphaEngine｜{标题}｜{日期}｜{doc_id}）
+[引用4]: prov:3f6c9a12-0000-0000-0000-000000000001 （卖方与独立研究｜AlphaEngine / FUNDA AI / TMTB / Sales Notes｜{机构与标题}｜{日期}｜{doc_id / mail:ID}）
+[引用5]: model:model/META-model-v01.xlsx!DCF!C12 （行情与模型｜一致预期快照与模型单元格｜{日期}｜data/consensus/... 及 model/<TICKER>-model-v<NN>.xlsx）

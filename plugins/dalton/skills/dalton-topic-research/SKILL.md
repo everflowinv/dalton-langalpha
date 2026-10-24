@@ -127,7 +127,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 
 1. **Phase 5 数字核验表（产出 `research/<D>-topic-<slug>/number-audit.md`）**：将正文中所有核心财务/行业数字与 SEC 原始文件或行情源逐一核对，输出核验记录至 `research/<D>-topic-<slug>/number-audit.md`，并在报告末尾填写 `## 数字核验表`（指标｜报告数值｜原始来源｜核验状态 `PASS`/`FAIL`）。存在任何 `FAIL` 不得送审。
 2. **Phase 6 独立审稿（`dalton-reviewer`，产出 `research/<D>-topic-<slug>/review.json` 与 `knowledge-revision.json`）**：
-   - 将草稿、`validate_topic.py` 输出与 `number-audit.md` 交给 `dalton-reviewer` 审阅（手动路径下先计算草稿 `sha256` 写进审稿提示词，要求审稿人原样回填 `draft_sha256`，将返回的 JSON 保存到 `research/<D>-topic-<slug>/review.json`）。
+   - 将草稿、`validate_topic.py` 输出与 `number-audit.md` 交给 `dalton-reviewer` 审阅（含核查“`## 引用` 表存在且每个 `[引用N]` 都能在表里找到”；手动路径下先计算草稿 `sha256` 写进审稿提示词，要求审稿人原样回填 `draft_sha256`，将返回的 JSON 保存到 `research/<D>-topic-<slug>/review.json`）。
    - 审稿结论统一为 `pass` / `revise` / `block` 三值：返回 `revise` 时按 `must_fix` 补证据或修订后复审（最多 2 轮），直至获得 `pass`；返回 `block` 时停下并向 PM 汇报原因与缺口，不发起发布。
    - 审稿通过后，汇总对当前公司及关联覆盖公司的知识层更新建议，生成 `research/<D>-topic-<slug>/knowledge-revision.json`。
 

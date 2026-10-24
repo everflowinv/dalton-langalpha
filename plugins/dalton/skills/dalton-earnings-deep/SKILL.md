@@ -94,7 +94,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 
 ### 阶段 3：草稿期审稿与生成 `knowledge-revision.json`
 
-1. **草稿期审稿（`dalton-reviewer`）**：审阅 `drafts/<D>-deep-<quarter>.md` 及 `research/<D>-deep-<quarter>/` 下的对账与校准文件（核查 beat/miss 口径、“综合判断”是否有独立判断、thesis 信号是否被股价涨跌替代、对账是否诚实面对错判）。手动路径下先计算草稿 `sha256` 写进审稿提示词，要求审稿人原样回填 `draft_sha256`，将返回的 JSON 存为 `research/<D>-deep-<quarter>/review.json`。
+1. **草稿期审稿（`dalton-reviewer`）**：审阅 `drafts/<D>-deep-<quarter>.md` 及 `research/<D>-deep-<quarter>/` 下的对账与校准文件（核查 beat/miss 口径、“综合判断”是否有独立判断、thesis 信号是否被股价涨跌替代、对账是否诚实面对错判，以及“`## 引用` 表存在且每个 `[引用N]` 都能在表里找到”）。手动路径下先计算草稿 `sha256` 写进审稿提示词，要求审稿人原样回填 `draft_sha256`，将返回的 JSON 存为 `research/<D>-deep-<quarter>/review.json`。
 2. **生成知识层修订草案**：汇总全部产出与审稿意见，按 PK.2 Schema 生成 `research/<D>-deep-<quarter>/knowledge-revision.json`。
 
 ---
@@ -104,7 +104,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 Workflow 结束后（或独立模式完成后），由当前主智能体读取 `research/<D>-deep-<quarter>/knowledge-revision.json`，执行以下收尾动作（深度链通常在无人值守自动运行，**只修改知识层工作版本，不动 `thesis.official`**）：
 
 1. **调用 `knowledge_update` 逐项更新知识层**：
-   - `doc="thesis"`：更新各支柱信号、状态与新证据行（注意：若草稿期审稿缺席 `review_done == false`，非 `NO_CHANGE` 结论注明“待审”，暂不直接下调核心支柱状态）；
+   - `doc="thesis"`：先写证据台账再定稿——更新各支柱信号、状态与新证据行（每条 `evidence` 必填 `figures` 数组，含 `metric`、`period`、`value`、`unit`、`label`，且 `source.ref` 指向一手文件或 `prov`，严禁指向本次草稿；若草稿期审稿缺席 `review_done == false`，非 `NO_CHANGE` 结论注明“待审”，暂不直接下调核心支柱状态）；
    - `doc="debate"`：更新本次财报验证后的多空分歧状态；
    - `doc="drivers"`：追加当季核心财务与经营 KPI 最新实际读数；
    - `doc="management"`：补填 `guidance_history[].actual` 与 `outcome`；若连续两季同类指标同向偏差，更新 `guidance_style` / `credibility_notes`；
@@ -115,7 +115,7 @@ Workflow 结束后（或独立模式完成后），由当前主智能体读取 `
    - 在 `agenda_ops` 中写入下一季需要跟踪验证的事项；
    - **重大异常升级（PM Escalation）**：若终判为 `THESIS_BROKEN` 或任一核心支柱状态变为 `impaired` / `broken`，必须立即通过通知渠道推送 PM，并在 `agenda_ops` 中写入一条 `pm_handoffs`（PK.14）。
 3. **草稿核验（`check_draft`）**：
-   - 末尾必须附引用表：在报告末尾的 `## 引用` 一节按每行一条写出对应关系（形如 `[引用1]: evidence:E-20261023-01` 或 `[引用3]: model:model/META-model-v01.xlsx!DCF!C12`）；
+   - 末尾合并为单一 `## 引用` 节：确认报告末尾的 `## 引用` 表存在且每个 `[引用N]` 都能在表里找到（每行一条写出核验目标与括号内来源说明，形如 `[引用1]: evidence:E-20261023-01 （法定财报｜SEC 10-Q｜3Q26 季报｜2026-10-28｜accession ...）` 或 `[引用5]: model:model/META-model-v01.xlsx!DCF!C12 （本方模型｜DCF 估值页）`）；
    - 调用 `check_draft` 生成数字核验报告 `drafts/<D>-deep-<quarter>.audit.md`；
 4. **汇报完成前必须过完成契约（`dalton_check_done`）**：
    - 调用 `dalton_check_done(workflow="earnings-deep-update", run_id=<`research/<D>-deep-<quarter>/.progress.json` 里的 run_id>, params={"ticker": "<TICKER>", "quarter": "<quarter>", "workspace_dir": "<当前工作区路径>", "release_date": "<D>", "model_path": "<模型路径或 null>"})`（与启动时的参数一致）；

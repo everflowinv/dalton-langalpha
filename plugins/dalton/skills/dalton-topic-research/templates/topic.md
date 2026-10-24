@@ -98,3 +98,8 @@
 - [S1] <标题> | <机构/作者> | 发布日期 YYYY-MM-DD | <URL or doc_id>
 - [S2] <标题> | <机构/作者> | 发布日期 YYYY-MM-DD | <URL or doc_id>
 - [S3] <标题> | <机构/作者> | 发布日期 YYYY-MM-DD | <URL or doc_id>
+
+## 引用
+
+[引用1]: evidence:E-20261023-01 （<来源类型>｜<机构/作者>｜<标题>｜YYYY-MM-DD｜<URL or doc_id>）
+[引用2]: prov:3f6c9a12-0000-0000-0000-000000000001 （<来源类型>｜<机构/作者>｜<标题>｜YYYY-MM-DD｜<URL or doc_id>）

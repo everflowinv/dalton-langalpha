@@ -102,6 +102,11 @@
 - [S2] <来源 2>
 - [S3] <来源 3>
 
+## 引用
+
+[引用1]: evidence:E-20261023-01 （<来源类型>｜<机构/作者>｜<标题>｜YYYY-MM-DD｜<URL or doc_id>）
+[引用2]: model:model/<TICKER>-model-v01.xlsx!DCF!C12 （本方模型｜<模型版本与单元格说明>｜YYYY-MM-DD｜model/<TICKER>-model-v01.xlsx）
+
 ---
 ---
 
