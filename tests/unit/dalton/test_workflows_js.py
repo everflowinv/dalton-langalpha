@@ -616,7 +616,7 @@ async def test_full_two_model_revisions_end_on_v03(tmp_path: Path) -> None:
     value, the evidence list and the contract audit all pick v03."""
     host = _fc_host(
         tmp_path,
-        by_label={"独立审稿": REVISE, "复审 1": REVISE, "复审 2": PASS},
+        by_label={"独立审稿": REVISE, "复审 1": REVISE, "复审 2": PASS, "终稿审稿": PASS},
         revise_modes={"修订 1": "save", "修订 2": "save"},
     )
     result = await _run("full-coverage", FC_PARAMS, host)
@@ -667,7 +667,7 @@ async def test_full_memo_only_revision_keeps_the_existing_model(tmp_path: Path) 
     unchanged v01, which is accepted and carried to the end."""
     host = _fc_host(
         tmp_path,
-        by_label={"独立审稿": REVISE, "复审 1": PASS},
+        by_label={"独立审稿": REVISE, "复审 1": PASS, "终稿审稿": PASS},
         revise_modes={"修订 1": "keep"},
     )
     result = await _run("full-coverage", FC_PARAMS, host)
@@ -739,7 +739,7 @@ async def test_deep_two_model_revisions_and_prompts_name_the_model(tmp_path: Pat
     value, evidence list and contract audit all pick v04."""
     host = _deep_host(
         tmp_path,
-        {"审稿": REVISE, "复审 1": REVISE, "复审 2": PASS},
+        {"审稿": REVISE, "复审 1": REVISE, "复审 2": PASS, "终稿审稿": PASS},
         revise_modes={"修订 1": "save", "修订 2": "save"},
     )
     result = await _run("earnings-deep-update", DEEP_PARAMS, host)
@@ -781,7 +781,7 @@ async def test_deep_reported_v03_but_disk_v04_stops_before_rereview(tmp_path: Pa
 
 @pytest.mark.asyncio
 async def test_deep_report_only_revision_keeps_the_updated_model(tmp_path: Path) -> None:
-    host = _deep_host(tmp_path, {"审稿": REVISE, "复审 1": PASS}, revise_modes={"修订 1": "keep"})
+    host = _deep_host(tmp_path, {"审稿": REVISE, "复审 1": PASS, "终稿审稿": PASS}, revise_modes={"修订 1": "keep"})
     result = await _run("earnings-deep-update", DEEP_PARAMS, host)
 
     final = "model/META-model-v02.xlsx"
@@ -900,3 +900,140 @@ async def test_full_clean_run_enables_tracking(tmp_path: Path) -> None:
     assert result["ok"] is True, result["incomplete"]
     assert result["tracking"] == _ENABLE
     assert any("完整覆盖完成" in m for m in host.logs), host.logs
+
+
+# ------------------------------------------------- language review round order
+
+
+@pytest.mark.asyncio
+async def test_language_rounds_wrap_the_reviews_in_order() -> None:
+    """Round 1 lands after the draft and before the FIRST review; round 2
+    after the revise loop and before the FINAL review, and the final review
+    binds the post-language-edit hash (语言 → 修改 → 审稿)."""
+    host = ScriptedHost(
+        by_label={
+            "审稿": {"verdict": "pass", "summary": "ok", "must_fix": []},
+            "语言审查 1": {**OUT, "sha256": "b" * 64},
+            "语言审查 2": {**OUT, "sha256": "c" * 64},
+            "终稿审稿": {
+                "verdict": "pass",
+                "summary": "语言修改未动事实",
+                "must_fix": [],
+                "draft_sha256": "c" * 64,
+            },
+        }
+    )
+    result = await _run("initial-coverage", IC_PARAMS, host)
+
+    labels = host.labels()
+    assert labels.index("语言审查 1") > labels.index("初筛成稿")
+    assert labels.index("审稿") > labels.index("语言审查 1"), "review must follow round 1"
+    assert labels.index("语言审查 2") > labels.index("审稿")
+    assert labels.index("终稿审稿") > labels.index("语言审查 2"), "final review must follow round 2"
+    # Each dispatch drives the round through the server-side tool.
+    round1_prompt = host.prompts[labels.index("语言审查 1")]
+    round2_prompt = host.prompts[labels.index("语言审查 2")]
+    assert "check_language" in round1_prompt and "round=1" in round1_prompt
+    assert "check_language" in round2_prompt and "round=2" in round2_prompt
+    # The first review binds the round-1-edited hash; the final one the final hash.
+    assert "b" * 64 in host.prompts[labels.index("审稿")]
+    assert "c" * 64 in host.prompts[labels.index("终稿审稿")]
+    assert result["ok"] is True
+    assert result["review_verdict"] == "pass"
+    assert result["language_done"] is True
+
+
+@pytest.mark.asyncio
+async def test_language_round2_without_edits_skips_the_final_review() -> None:
+    """Round 2 finds nothing to change: the draft hash is unchanged, the
+    loop's pass record still binds the current draft, so no re-review runs."""
+    host = ScriptedHost(by_label={"审稿": {"verdict": "pass", "summary": "ok", "must_fix": []}})
+    result = await _run("initial-coverage", IC_PARAMS, host)
+
+    labels = host.labels()
+    assert "语言审查 1" in labels and "语言审查 2" in labels
+    assert "终稿审稿" not in labels
+    assert result["ok"] is True
+    assert result["language_done"] is True
+
+
+@pytest.mark.asyncio
+async def test_language_round2_failure_reports_incomplete() -> None:
+    host = ScriptedHost(
+        by_label={"审稿": {"verdict": "pass", "summary": "ok", "must_fix": []}},
+        fail_labels={"语言审查 2"},
+    )
+    result = await _run("initial-coverage", IC_PARAMS, host)
+
+    assert result["ok"] is False
+    assert any("语言审查第 2 轮失败" in item for item in result["incomplete"])
+    assert "终稿审稿" not in host.labels()
+
+
+@pytest.mark.asyncio
+async def test_first_review_pass_still_runs_round2_and_final_review() -> None:
+    """The "review passed on the first try" case: round 2 and the final
+    review still run, so the last review record binds the final hash."""
+    host = ScriptedHost(
+        by_label={
+            "独立审稿": {"verdict": "pass", "summary": "ok", "must_fix": []},
+            "终稿审稿": {
+                "verdict": "pass",
+                "summary": "ok",
+                "must_fix": [],
+                "draft_sha256": "c" * 64,
+            },
+            "语言审查 2": {**OUT, "sha256": "c" * 64},
+        }
+    )
+    result = await _run("topic-research", {"topic": "AI capex", "slug": "ai-capex", "workspace_dir": ".", "as_of": "2026-10-23"}, host)
+
+    labels = host.labels()
+    assert labels.index("语言审查 2") > labels.index("独立审稿")
+    assert labels.index("终稿审稿") > labels.index("语言审查 2")
+    assert result["ok"] is True, result["incomplete"]
+    assert result["language_done"] is True
+
+
+# ------------------------------------------------- notes two-round batch
+
+
+@pytest.mark.asyncio
+async def test_notes_get_two_rounds_after_the_loop_before_the_draft_round2() -> None:
+    """The write-once notes (background/lenses/branches/bullbear-quick) get
+    their own two-round batch after the revise loop and before the draft's
+    round 2; the batch names each note and excludes machine outputs."""
+    host = ScriptedHost(by_label={"审稿": {"verdict": "pass", "summary": "ok", "must_fix": []}})
+    result = await _run("initial-coverage", IC_PARAMS, host)
+
+    labels = host.labels()
+    idx = labels.index("笔记语言审查")
+    assert idx > labels.index("审稿")
+    assert idx < labels.index("语言审查 2"), "notes batch precedes the draft's round 2"
+    prompt = host.prompts[idx]
+    assert "check_language" in prompt and "round=1" in prompt and "round=2" in prompt
+    for note in (
+        "background.md",
+        "lenses.md",
+        "industry.md",
+        "valuation.md",
+        "bullbear-quick.md",
+    ):
+        assert note in prompt, note
+    # Machine outputs are not listed for review; the exclusion sentence stands.
+    assert "comps.xlsx" not in prompt and "knowledge-proposal.json" not in prompt
+    assert "不审" in prompt
+    assert result["ok"] is True
+    assert result["language_done"] is True
+
+
+@pytest.mark.asyncio
+async def test_notes_language_review_failure_reports_incomplete() -> None:
+    host = ScriptedHost(
+        by_label={"审稿": {"verdict": "pass", "summary": "ok", "must_fix": []}},
+        fail_labels={"笔记语言审查"},
+    )
+    result = await _run("initial-coverage", IC_PARAMS, host)
+
+    assert result["ok"] is False
+    assert any("笔记语言审查失败" in item for item in result["incomplete"])

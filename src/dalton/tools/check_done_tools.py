@@ -19,6 +19,7 @@ import json
 import posixpath
 import re
 import shlex
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Annotated, Any
@@ -27,6 +28,11 @@ import structlog
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool, tool
 
+from src.dalton.publish.language import (
+    _REVIEWABLE_ROOTS,
+    SIDECAR_SUFFIXES,
+    is_reviewable_deliverable,
+)
 from src.dalton.tools.knowledge_tools import _extract_run_identity
 from src.dalton.workflows.contracts import (
     ContractError,
@@ -315,6 +321,10 @@ async def _check_artifact(
         if matches is None:
             _report(f"当前环境无法执行 glob（{name}），无法核对，请重试。")
             return missing, warnings
+        # Sidecars ride beside each target by the tools' stem convention, and
+        # a ``cluster-*.md`` pattern matches ``cluster-a.md.language.md`` just
+        # as well — they never count toward a deliverable's own minimum.
+        matches = [m for m in matches if not m.endswith(SIDECAR_SUFFIXES)]
         need = artifact.get("min_count", 1)
         if len(matches) < need:
             _report(
@@ -498,16 +508,23 @@ async def _latest_run_dir(
     best_dir: str | None = None
     best_stamp = -1.0
     for path in matches:
-        # An unreadable status.json may be the newest run's; skipping it would
-        # fall back to an older pass, so it blocks the check instead.
+        # An unreadable, unparsable or empty status.json may be the newest
+        # run's; skipping it would fall back to an older pass, so it blocks
+        # the check. Only a readable file whose ``name`` names a DIFFERENT
+        # workflow is safely skipped.
         text = await _read_text(backend, path)
         try:
             doc = json.loads(text) if text else None
         except ValueError:
-            doc = None
+            raise _CannotVerify(f"运行状态文件无法读取或已损坏：{path}，请传 run_id")
         if not isinstance(doc, dict):
             raise _CannotVerify(f"运行状态文件无法读取或已损坏：{path}，请传 run_id")
-        if doc.get("name") != workflow:
+        name = doc.get("name")
+        if not isinstance(name, str):
+            raise _CannotVerify(
+                f"运行状态文件缺少 name，无法判断是否本次 workflow 的 run：{path}，请传 run_id"
+            )
+        if name != workflow:
             continue
         stamp = doc.get("updated_at")
         if isinstance(stamp, (int, float)) and stamp > best_stamp:
@@ -516,42 +533,12 @@ async def _latest_run_dir(
     return best_dir
 
 
-async def _find_run_review_pass(
-    backend: Any,
-    workflow: str,
-    run_id: str | None,
-    draft_path: str | None,
-    thread_id: str | None = None,
-) -> tuple[bool, str]:
-    """(passed, reason): the LAST review record of THIS run must be a pass,
-    and its recorded draft hash must equal the CURRENT draft's hash —
-    computed here from the file, never taken from the model's word.
-
-    ``run_id`` names the run; without it the newest run directory of the
-    same workflow stands in. Any scan failure raises ``_CannotVerify``."""
-    if not run_id and not thread_id:
-        return False, "缺少线程身份（thread_id 与 run_id 均未提供），无法定位本次 run"
-    prefix = _thread_prefix(thread_id)
-    if run_id:
-        journals = await _glob(backend, f"{prefix}{run_id}/journal/*.json")
-        if journals is None:
-            raise _CannotVerify("无法扫描本次 run 的运行日志（journal）")
-    else:
-        all_dirs, finished = await _thread_run_dirs(backend, thread_id)
-        if all_dirs - finished:
-            # An unfinished run may be the current one; falling back to an
-            # older finished run could accept a pass the new run has revised.
-            return False, "本线程有未结束的 workflow run，无法确定本次 run；请传 run_id（.progress.json 里的 run_id）"
-        run_dir = await _latest_run_dir(backend, workflow, thread_id)
-        if run_dir is None:
-            return False, "找不到本次 workflow 的 run 目录（无 run_id 且无 status.json），无法核对审稿"
-        journals = await _glob(backend, f"{run_dir}/journal/*.json")
-        if journals is None:
-            raise _CannotVerify("无法扫描运行日志（journal）")
-
-    # Collect EVERY review-labeled record — including failed ones — then
-    # judge only the last: a re-review that errored after an earlier pass is
-    # the run's final word on the draft.
+async def _review_records_from_journals(
+    backend: Any, journals: list[str]
+) -> list[dict[str, Any]]:
+    """Every review-labeled dispatch record across ``journals``, oldest first
+    (``recorded_at`` then ``seq``); raises ``_CannotVerify`` on any read or
+    parse failure."""
     records: list[tuple[float, int, dict[str, Any]]] = []
     for path in journals:
         status, text = await _read_text_diagnosed(backend, path)
@@ -574,10 +561,69 @@ async def _find_run_review_pass(
             records.append(
                 (float(entry.get("recorded_at") or 0), int(entry.get("seq") or 0), entry)
             )
+    records.sort(key=lambda item: (item[0], item[1]))
+    return [entry for _, _, entry in records]
+
+
+async def _collect_review_records(
+    backend: Any,
+    workflow: str,
+    run_id: str | None,
+    thread_id: str | None,
+) -> list[dict[str, Any]]:
+    """Every review-labeled dispatch record of THIS run, oldest first. Any
+    scan/parse failure raises ``_CannotVerify``; locating the run follows
+    ``_find_run_review_pass`` (including its unfinished-run refusal)."""
+    if not run_id and not thread_id:
+        raise _CannotVerify("缺少线程身份（thread_id 与 run_id 均未提供），无法定位本次 run")
+    prefix = _thread_prefix(thread_id)
+    if run_id:
+        journals = await _glob(backend, f"{prefix}{run_id}/journal/*.json")
+        if journals is None:
+            raise _CannotVerify("无法扫描本次 run 的运行日志（journal）")
+    else:
+        all_dirs, finished = await _thread_run_dirs(backend, thread_id)
+        if all_dirs - finished:
+            # An unfinished run may be the current one; falling back to an
+            # older finished run could accept a pass the new run has revised.
+            raise _CannotVerify(
+                "本线程有未结束的 workflow run，无法确定本次 run；请传 run_id（.progress.json 里的 run_id）"
+            )
+        run_dir = await _latest_run_dir(backend, workflow, thread_id)
+        if run_dir is None:
+            raise _CannotVerify("找不到本次 workflow 的 run 目录（无 run_id 且无 status.json）")
+        journals = await _glob(backend, f"{run_dir}/journal/*.json")
+        if journals is None:
+            raise _CannotVerify("无法扫描运行日志（journal）")
+    return await _review_records_from_journals(backend, journals)
+
+
+async def _find_run_review_pass(
+    backend: Any,
+    workflow: str,
+    run_id: str | None,
+    draft_path: str | None,
+    thread_id: str | None = None,
+) -> tuple[bool, str]:
+    """(passed, reason): the LAST review record of THIS run must be a pass,
+    and its recorded draft hash must equal the CURRENT draft's hash —
+    computed here from the file, never taken from the model's word."""
+    if not run_id and not thread_id:
+        return False, "缺少线程身份（thread_id 与 run_id 均未提供），无法定位本次 run"
+    if not run_id:
+        # The two unlocatable-run outcomes return False (the caller names the
+        # next step); every scan/parse failure below still raises, exactly as
+        # before the helper existed.
+        all_dirs, _finished = await _thread_run_dirs(backend, thread_id)
+        if all_dirs - _finished:
+            return False, "本线程有未结束的 workflow run，无法确定本次 run；请传 run_id（.progress.json 里的 run_id）"
+        run_dir = await _latest_run_dir(backend, workflow, thread_id)
+        if run_dir is None:
+            return False, "找不到本次 workflow 的 run 目录（无 run_id 且无 status.json），无法核对审稿"
+    records = await _collect_review_records(backend, workflow, run_id, thread_id)
     if not records:
         return False, "本次 run 的运行日志里没有任何审稿/复审记录"
-    records.sort(key=lambda item: (item[0], item[1]))
-    last = records[-1][2]
+    last = records[-1]
     if last.get("status") != "ok":
         return False, f"最后一次审稿派发未成功（status={last.get('status')!r}），需重跑"
     result = last.get("result")
@@ -840,6 +886,8 @@ async def _check_closing(
     backend: Any,
     workspace_id: str | None,
     user_id: str | None,
+    run_id: str | None = None,
+    thread_id: str | None = None,
 ) -> tuple[list[str], list[str], str]:
     missing: list[str] = []
     warnings: list[str] = []
@@ -945,7 +993,466 @@ async def _check_closing(
         if message:
             # SKILL-optional check_draft: every failure mode stays a warning.
             (missing if required else warnings).append(message)
+
+    lang_rule = closing.get("language_review")
+    if lang_rule:
+        required = lang_rule.get("required", True)
+        gaps = await _check_language_review(
+            backend, lang_rule, params, contract, run_id, thread_id
+        )
+        for gap in gaps:
+            (missing if required else warnings).append(gap)
     return missing, warnings, since_label
+
+
+async def _locate_run_journals(
+    backend: Any,
+    workflow: str,
+    run_id: str | None,
+    thread_id: str | None,
+) -> list[str] | None:
+    """This workflow's run journal files; ``None`` when no same-name run
+    exists (the manual path). Locating never consults the review check's
+    "any unfinished run on the thread" rule — only runs of the same workflow
+    count. Raises ``_CannotVerify`` when a located run cannot be scanned."""
+    if not run_id and not thread_id:
+        return None
+    prefix = _thread_prefix(thread_id)
+    if run_id:
+        journals = await _glob(backend, f"{prefix}{run_id}/journal/*.json")
+        if journals is None:
+            raise _CannotVerify("无法扫描本次 run 的运行日志（journal）")
+        return journals
+    run_dir = await _latest_run_dir(backend, workflow, thread_id)
+    if run_dir is None:
+        # No finished run of THIS workflow: manual semantics, whatever other
+        # (possibly crashed) run directories sit on the thread.
+        return None
+    journals = await _glob(backend, f"{run_dir}/journal/*.json")
+    if journals is None:
+        raise _CannotVerify("无法扫描运行日志（journal）")
+    return journals
+
+
+async def _collect_run_dispatch_files(
+    backend: Any,
+    workflow: str,
+    run_id: str | None,
+    thread_id: str | None,
+) -> tuple[list[str] | None, float | None]:
+    """(files, run_start): every file path this run's dispatches reported
+    writing, as the dispatches themselves spelled them (``files`` entries; the
+    evidence child's ``path|sha256`` strings included), plus the run's start
+    (the earliest journal ``recorded_at``). ``(None, None)`` when this
+    workflow has no run on the thread — the manual path."""
+    journals = await _locate_run_journals(backend, workflow, run_id, thread_id)
+    if not journals:
+        return None, None
+
+    files: set[str] = set()
+    started: float | None = None
+    for path in journals:
+        status, text = await _read_text_diagnosed(backend, path)
+        if status == "error":
+            raise _CannotVerify(f"运行日志读取失败（{path}），请重试")
+        if status == "missing" or text is None:
+            raise _CannotVerify(f"运行日志消失（{path}），请重试")
+        try:
+            doc = json.loads(text)
+        except ValueError:
+            raise _CannotVerify(f"运行日志不可解析（{path}），请重试")
+        if not isinstance(doc, dict):
+            raise _CannotVerify(f"运行日志结构异常（{path}），请重试")
+        for entry in doc.get("dispatches") or []:
+            if not isinstance(entry, dict):
+                continue
+            stamp = entry.get("recorded_at")
+            if isinstance(stamp, (int, float)) and not isinstance(stamp, bool):
+                started = stamp if started is None else min(started, float(stamp))
+            result = entry.get("result")
+            if not isinstance(result, dict):
+                continue
+            for item in result.get("files") or []:
+                if isinstance(item, str) and item.strip():
+                    files.add(item.split("|", 1)[0].strip())
+    return sorted(files), started
+
+
+async def _thread_start_epoch(thread_id: str | None) -> int | None:
+    """The thread's ``created_at`` as epoch seconds; None when it cannot be
+    read (no id, or the database is out of reach in this context)."""
+    if not thread_id:
+        return None
+    try:
+        async with get_db_connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT EXTRACT(EPOCH FROM created_at)::bigint "
+                    "FROM conversation_threads WHERE conversation_thread_id = %s",
+                    (thread_id,),
+                )
+                row = await cur.fetchone()
+    except Exception as error:
+        logger.warning(
+            "dalton_check_done thread start query failed", error=str(error)
+        )
+        return None
+    if not row or isinstance(row[0], bool) or not isinstance(row[0], (int, float)):
+        # Anything but a real epoch (a stub cursor's mock, a NULL) reads as
+        # "thread start unknown" — the caller falls back to the 24h window.
+        return None
+    return int(row[0])
+
+
+async def _manual_since_epoch(
+    params: dict[str, Any], thread_id: str | None
+) -> int:
+    """The manual path's window start: the run's ``as_of`` day at UTC midnight
+    (release_date/end are the aliases the contracts render); with ``as_of``
+    missing, ``latest``, or unparseable, the thread's start; and only when
+    even that is unreadable, the last 24 hours — a window ending at today's
+    midnight would drop notes written before a UTC-midnight crossing."""
+    day = str(
+        params.get("as_of") or params.get("release_date") or params.get("end") or ""
+    ).strip()
+    if day and day != "latest":
+        try:
+            base = datetime.fromisoformat(f"{day}T00:00:00+00:00")
+            return int(base.timestamp())
+        except ValueError:
+            pass
+    thread_start = await _thread_start_epoch(thread_id)
+    if thread_start is not None:
+        return thread_start
+    return int(time.time()) - 24 * 3600
+
+
+_SCAN_RC_RE = re.compile(r"^__DALTON_SCAN_RC__=(\d+)\s*$")
+
+
+async def _scan_reviewable_since(backend: Any, since_epoch: int) -> list[str] | None:
+    """Reviewable ``.md`` files under the existing scan roots modified at/after
+    ``since_epoch`` — mtime via the same ``stat -c %Y`` the ``modified_on``
+    checks use. ``None`` when the scan cannot run (fail-closed at the caller):
+    a dead executor or failed ``cd`` prints no rc marker, and a nonzero find
+    exit (say an unreadable directory) is a failed scan, not an empty one.
+    A root that does not exist is simply not scanned. A candidate whose mtime
+    cannot be read stays IN the list: the file sits under a reviewable root,
+    and unprovable age must not read as out-of-window."""
+    roots = []
+    for root in _REVIEWABLE_ROOTS:
+        # The probe answers one of two markers whenever the shell ran — a dead
+        # executor (or failed cd) prints neither, and that is a failed scan,
+        # not a missing root.
+        probe = await _run_command(
+            backend,
+            f"{{ test -d {root} && echo __DALTON_DIR_{root} "
+            f"|| echo __DALTON_DIR_NONE; }}",
+        )
+        if probe is None:
+            return None
+        if f"__DALTON_DIR_{root}" in probe[1]:
+            roots.append(root)
+        elif "__DALTON_DIR_NONE" not in probe[1]:
+            return None
+    if not roots:
+        return []
+    listing = await _run_command(
+        backend,
+        f"{{ find {' '.join(roots)} -type f -name '*.md' 2>/dev/null; "
+        f'echo "__DALTON_SCAN_RC__=$?"; }}',
+    )
+    if listing is None:
+        return None
+    output = listing[1]
+    rc: int | None = None
+    path_lines: list[str] = []
+    for line in output.splitlines():
+        match = _SCAN_RC_RE.match(line.strip())
+        if match:
+            rc = int(match.group(1))
+            continue
+        if line.strip():
+            path_lines.append(line.strip())
+    if rc != 0:
+        # find itself failed (unreadable directory, sandbox error): the
+        # listing is not trustworthy either way.
+        return None
+    kept: list[str] = []
+    for path in path_lines:
+        stat = await _run_command(backend, f"stat -c %Y {shlex.quote(path)}")
+        if stat is not None and stat[0] == 0:
+            try:
+                mtime = int(stat[1].strip().splitlines()[-1])
+            except (ValueError, IndexError):
+                mtime = None
+            if mtime is not None and mtime < since_epoch:
+                continue
+        kept.append(path)
+    return kept
+
+
+async def _last_review_pass_sha256(
+    backend: Any,
+    workflow: str,
+    run_id: str | None,
+    thread_id: str | None,
+) -> tuple[bool, str | None]:
+    """(found_run, sha): whether a same-name run exists, and its last PASSING
+    review record's ``draft_sha256`` (None when the run has no pass record).
+    Reads the located journals directly — never ``_collect_review_records``,
+    whose unfinished-run refusal would let a neighbour workflow's crashed run
+    fail this lookup. Raises ``_CannotVerify`` when a located run cannot be
+    scanned."""
+    journals = await _locate_run_journals(backend, workflow, run_id, thread_id)
+    if journals is None:
+        return False, None
+    for entry in reversed(await _review_records_from_journals(backend, journals)):
+        if entry.get("status") != "ok":
+            continue
+        result = entry.get("result")
+        sha = result.get("draft_sha256") if isinstance(result, dict) else None
+        if isinstance(result, dict) and result.get("verdict") == "pass":
+            return True, sha if isinstance(sha, str) and _SHA256_RE.match(sha) else None
+    return True, None
+
+
+async def _check_language_record(
+    backend: Any,
+    path: str,
+    *,
+    accept_review_sha: bool,
+    workflow: str,
+    run_id: str | None,
+    thread_id: str | None,
+) -> str:
+    """``''`` when ``path``'s ``<path>.language.json`` carries rounds 1 and 2
+    with the LAST round-2 hash equal to the CURRENT file's hash (or, when
+    ``accept_review_sha``, the last passing review's hash); else the gap."""
+    json_path = f"{path}.language.json"
+    status, text = await _read_text_diagnosed(backend, json_path)
+    if status == "error":
+        return f"语言审查记录读取出错（{json_path}），无法核对，请重试。"
+    if status == "missing" or text is None:
+        return (
+            f"缺少语言审查记录 {json_path}；下一步：对 {path} 调用 "
+            "check_language(round=1) 并按清单修改，内容定稿后再调用 check_language(round=2)。"
+        )
+    try:
+        doc = json.loads(text)
+    except ValueError:
+        return f"语言审查记录不可解析（{json_path}），请重跑 check_language。"
+    rounds = doc.get("rounds") if isinstance(doc, dict) else None
+    if not isinstance(rounds, list):
+        return f"语言审查记录结构异常（{json_path}，缺 rounds 数组），请重跑 check_language。"
+    round1 = next((r for r in rounds if isinstance(r, dict) and r.get("round") == 1), None)
+    round2 = next(
+        (r for r in reversed(rounds) if isinstance(r, dict) and r.get("round") == 2), None
+    )
+    if round1 is None or round2 is None:
+        return (
+            f"{path} 的语言审查记录 {json_path} 缺少第 {'1' if round1 is None else '2'} 轮；"
+            "下一步：初稿阶段调用 check_language(round=1) 并按清单修改，"
+            "内容定稿后调用 check_language(round=2)，改稿后再调用一次 round=2 复核。"
+        )
+    last2_sha = round2.get("draft_sha256")
+    if not isinstance(last2_sha, str) or not _SHA256_RE.match(last2_sha):
+        return (
+            f"{path} 的语言审查第 2 轮记录里没有 64 位十六进制的草稿哈希（{json_path}），"
+            "请重跑 check_language(round=2)。"
+        )
+
+    status, file_text = await _read_text_diagnosed(backend, path)
+    if status != "ok" or file_text is None:
+        return f"被审文件读取失败（{path}），无法核对语言审查哈希，请重试。"
+    current = hashlib.sha256(file_text.encode("utf-8")).hexdigest()
+    if last2_sha == current:
+        return ""
+    if accept_review_sha:
+        try:
+            found_run, review_sha = await _last_review_pass_sha256(
+                backend, workflow, run_id, thread_id
+            )
+        except _CannotVerify as error:
+            return (
+                f"{path} 的第 2 轮语言审查针对的可能不是终稿（记录哈希 {last2_sha[:12]}…，"
+                f"当前哈希 {current[:12]}…），且审稿哈希无法核对（{error}），请重试。"
+            )
+        if not found_run:
+            # A manual close (no same-name run): there is no review journal to
+            # reconcile against, so the only reading is that the draft changed
+            # after round 2 — the fix is another round 2, not a run_id hunt.
+            return (
+                f"{path} 的终稿在第 2 轮语言审查后被改过：{json_path} 最后一条第 2 轮记录哈希 "
+                f"{last2_sha[:12]}…，当前哈希 {current[:12]}…；"
+                "请对当前稿再跑 check_language(round=2)。"
+            )
+        if review_sha is not None and last2_sha == review_sha:
+            return ""
+    return (
+        f"第 2 轮语言审查针对的是旧草稿：{json_path} 最后一条第 2 轮记录哈希 "
+        f"{last2_sha[:12]}…，当前 {path} 哈希 {current[:12]}…；"
+        "下一步：对终稿再调用一次 check_language(round=2) 复核后再送审。"
+    )
+
+
+async def _contract_declared_paths(
+    backend: Any, contract: dict[str, Any], params: dict[str, Any]
+) -> list[str]:
+    """Concrete paths the contract's stage artifacts declare, expanded the way
+    ``_check_artifact`` gates them (requires_param, requires_json, derive,
+    glob). Declared notes join the language-review targets regardless of
+    mtime — a reused note owes its records too (the same-hash two-round pass
+    satisfies it; no re-review is demanded)."""
+    workspace_dir = getattr(backend, "workspace_dir", None)
+    if not isinstance(workspace_dir, str):
+        workspace_dir = None
+    paths: list[str] = []
+    for stage in contract.get("stages") or []:
+        if stage.get("requires_param") and not params.get(stage["requires_param"]):
+            continue
+        for artifact in stage.get("artifacts") or []:
+            if artifact.get("requires_param") and not params.get(
+                artifact["requires_param"]
+            ):
+                continue
+            condition = artifact.get("requires_json")
+            if condition:
+                state_path = render_template(condition["json"], params)
+                status, state_text = await _read_text_diagnosed(backend, state_path)
+                met = False
+                if status == "ok" and state_text is not None:
+                    try:
+                        state = json.loads(state_text)
+                    except ValueError:
+                        state = None
+                    value = state.get(condition["field"]) if isinstance(state, dict) else None
+                    met = isinstance(value, str) and value == condition["equals"]
+                if not met:
+                    # The artifact check itself reports unreadable conditions;
+                    # for target collection, not-met (or unreadable) is a skip.
+                    continue
+            if artifact.get("derive"):
+                derive = artifact["derive"]
+                doc_path = render_template(derive["json"], params)
+                status, text = await _read_text_diagnosed(backend, doc_path)
+                items = None
+                if status == "ok" and text is not None:
+                    try:
+                        doc = json.loads(text)
+                    except ValueError:
+                        doc = None
+                    items = doc.get(derive["pointer"]) if isinstance(doc, dict) else None
+                for item in items or []:
+                    value = item.get(derive["field"]) if isinstance(item, dict) else None
+                    if value is not None:
+                        paths.append(
+                            render_template(artifact["path"], {**params, derive["field"]: str(value)})
+                        )
+                continue
+            template = render_template(artifact["path"], params)
+            if artifact.get("glob"):
+                matches = await _glob(backend, template)
+                paths.extend(
+                    m for m in (matches or []) if not m.endswith(SIDECAR_SUFFIXES)
+                )
+            else:
+                paths.append(template)
+    return [
+        rel
+        for rel in (_workspace_relative(p, workspace_dir) for p in paths)
+        if is_reviewable_deliverable(rel, workspace_dir)
+    ]
+
+
+async def _check_language_review(
+    backend: Any,
+    rule: dict[str, Any],
+    params: dict[str, Any],
+    contract: dict[str, Any],
+    run_id: str | None,
+    thread_id: str | None,
+) -> list[str]:
+    """Every formal deliverable this run wrote owes two language-review rounds:
+    the contract's declared draft and notes (mtime-free — a reused note passes
+    on its existing same-hash records), plus each reviewable file the run's
+    dispatches reported, plus what the mtime window scan of the workspace
+    finds. Fail-closed throughout. ``published/`` archives are nobody's
+    language target (see is_reviewable_deliverable): their review is the
+    draft's."""
+    draft = render_template(rule["draft"], params)
+    if (contract.get("closing") or {}).get("gated_draft"):
+        # A gated contract (dalton-call) legitimately has no draft when the
+        # gate failed; that branch is judged by gated_draft itself.
+        status, _ = await _read_text_diagnosed(backend, draft)
+        if status == "missing":
+            return []
+    # An autospec'd backend answers `workspace_dir` with a Mock — only a real
+    # string root can anchor an absolute spelling of a file.
+    workspace_dir = getattr(backend, "workspace_dir", None)
+    if not isinstance(workspace_dir, str):
+        workspace_dir = None
+
+    draft_rel = _workspace_relative(draft, workspace_dir)
+    targets: list[str] = [draft]
+    seen = {draft_rel}
+
+    def _add(path: str) -> None:
+        rel = _workspace_relative(path, workspace_dir)
+        if rel in seen or not is_reviewable_deliverable(path, workspace_dir):
+            return
+        seen.add(rel)
+        targets.append(rel)
+
+    # 1. What the contract declares: unconditional, window-free. A declared
+    # path whose file is affirmatively absent is skipped — the artifact check
+    # reports the missing file itself, and a language record for nothing is
+    # noise.
+    for declared in await _contract_declared_paths(backend, contract, params):
+        status, _ = await _read_text_diagnosed(backend, declared)
+        if status == "missing":
+            continue
+        _add(declared)
+
+    # 2. What the dispatches reported writing.
+    try:
+        run_files, run_start = await _collect_run_dispatch_files(
+            backend, contract["name"], run_id, thread_id
+        )
+    except _CannotVerify as error:
+        return [f"本次运行写入的正式产物无法核对（{error}），请重试。"]
+    for path in run_files or []:
+        _add(path)
+
+    # 3. The deterministic mtime manifest: dispatch reports can miss files (a
+    # manual flow, a subagent that never echoed a path), so the workspace
+    # itself is scanned for reviewable files written inside the run's window —
+    # the run's start when there is one, else the manual window. A scan that
+    # cannot run is a gap, never a pass.
+    since_epoch = (
+        int(run_start)
+        if run_start is not None
+        else await _manual_since_epoch(params, thread_id)
+    )
+    scanned = await _scan_reviewable_since(backend, since_epoch)
+    if scanned is None:
+        return ["无法扫描工作区的正式产物（find/stat），无法核对，请重试。"]
+    for path in scanned:
+        _add(path)
+
+    gaps: list[str] = []
+    for target in targets:
+        gap = await _check_language_record(
+            backend,
+            target,
+            accept_review_sha=_workspace_relative(target, workspace_dir) == draft_rel,
+            workflow=contract["name"],
+            run_id=run_id,
+            thread_id=thread_id,
+        )
+        if gap:
+            gaps.append(gap)
+    return gaps
 
 
 async def _check_draft_sidecar(backend: Any, draft: str) -> str:
@@ -1207,7 +1714,7 @@ async def run_check_done(
         missing.extend(stage_missing)
         warnings.extend(stage_warnings)
         close_missing, close_warnings, since_label = await _check_closing(
-            contract, params, backend, workspace_id, user_id
+            contract, params, backend, workspace_id, user_id, run_id, thread_id
         )
         missing.extend(close_missing)
         warnings.extend(close_warnings)
@@ -1253,7 +1760,7 @@ def create_check_done_tools(
 
         传 workflow 名（initial-coverage、full-coverage、bullbear-doc、earnings-deep-update、weekly-coverage-review、topic-research 之一）或多步 skill 名（dalton-earnings-preview、dalton-earnings-flash、dalton-stock-move、dalton-filing-review、dalton-thesis-delta、dalton-call、dalton-publish 之一，params 按该 SKILL 收尾段所列），params 用启动时的同一组参数；run_id 传本次运行的 task id（.progress.json 的 run_id），不传则取本线程最近一次同名 workflow 的 run。
         workflow 关闭、按 SKILL 手动降级执行时，params 加 "manual": true，审稿改核对 SKILL 指定的 review.json。
-        只读不改：重查文件、哈希、校验脚本、知识层版本、verdict 与本次 run 的审稿 pass。不通过时先补齐 missing 再查；补不了的只能汇报"未完成"。
+        只读不改：重查文件、哈希、校验脚本、知识层版本、verdict、本次 run 的审稿 pass 与语言审查两轮记录。不通过时先补齐 missing 再查；补不了的只能汇报"未完成"。
         Returns: JSON {done, missing, warnings}，missing 为中文缺项与下一步。
         """
         if allowed is not None and workflow not in allowed:

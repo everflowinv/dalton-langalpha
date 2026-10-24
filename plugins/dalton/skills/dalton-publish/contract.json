@@ -31,6 +31,9 @@
     "published_or_awaiting_pm": {
       "draft": "{draft_path}",
       "published": "published/{as_of}-{slug}.md"
+    },
+    "language_review": {
+      "draft": "{draft_path}"
     }
   }
 }

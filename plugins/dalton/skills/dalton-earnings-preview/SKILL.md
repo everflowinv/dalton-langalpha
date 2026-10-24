@@ -119,7 +119,8 @@ python3 .agents/skills/dalton-earnings-preview/scripts/predictions.py validate \
 ### Step 8：成稿、自检与收尾三步
 
 1. **成稿落盘**：按 [`templates/preview.md`](templates/preview.md) 将中文前瞻写到 `drafts/<D>-preview-<季度>.md`。开头不超过 3 句话直接给核心判断（真实门槛、关键预期差、最需验证的判断）；每个数字首次出现带期间、单位/口径与来源身份（`（机构/身份 [引用N]）`）。
-2. **交付前自检清单**：
+2. **第 1 轮语言审查**：成稿后先调用 `check_language(draft_path="drafts/<D>-preview-<季度>.md", round=1)`（只标问题），读 `drafts/<D>-preview-<季度>.md.language.md` 清单并逐条修改草稿（只改语言表达，不动事实、数字、术语、引用编号与判断强度）。工具报错不算通过：重试或如实汇报未完成，不得跳过。
+3. **交付前自检清单**：
    - [ ] AlphaEngine、sales-notes、TMTB、FUNDA AI 四个内部入口及行业前瞻均已按公司名和 ticker 检索；
    - [ ] 关键引用均已读过正文全文（未仅凭搜索摘要引用）；
    - [ ] 图片表格中的数字已回原图核对正负号、小数点、单位和期间（`description_verified=false` 的自动识图描述未直接用作数字证据）；
@@ -129,7 +130,8 @@ python3 .agents/skills/dalton-earnings-preview/scripts/predictions.py validate \
    - [ ] “本轮未取得”与“通路/工具失败”分开写明；
    - [ ] `predictions.py validate --strict` 通过，正文第五节“核对清单”与 `predictions.json` 一一对应；
    - [ ] 末尾必须附引用表（在报告末尾 `## 引用` 一节按每行一条写出 `[引用1]: evidence:E-20261023-01` 或 `[引用3]: model:model/META-model-v01.xlsx!DCF!C12` 等核验来源对应关系）。
-3. **知识层写入与 `dalton-agenda` 收尾三步**：
+4. **第 2 轮语言审查（终稿）**：自检与内容修订全部完成后、调用 `check_draft` 之前，调用 `check_language(round=2)` 并按清单完成终稿语言修改；草稿有改动就再调用一次 `check_language(round=2)` 对终稿复核（记录追加在同一 `<草稿>.language.json`），使最后一条第 2 轮记录绑定终稿哈希。本次产出中其他给人读的 .md 笔记（research/ 检索与对账笔记等）同样各审两轮：第 1 轮审完按清单改，第 2 轮复核，改过就再跑一次 round=2 确认；json/xlsx 等机器文件、bg_data/、data/、lenses_work/、model_dump/、知识层渲染文件与 .audit/.annotated/.language 侧车不审。
+5. **知识层写入与 `dalton-agenda` 收尾三步**：
    - 调用 `knowledge_update(doc="drivers", ...)` 追加本轮取得的高频指标最新读数；
    - 调用 `knowledge_update(doc="debate", ...)` 标注本次财报可检验的 debate；
    - 调用 `knowledge_append_verdict` 记录事件五词结论（`trigger.kind="earnings"`，`trigger.ref` 填 `<dalton_wake>` 的 `tm3` 信号 id 或 `"manual"`；通常为 `NO_CHANGE`，若前瞻研究已改变判断则如实填写），并在同次调用的 `agenda_ops` 中加入“财报发布当天对照 `research/<D>-preview-<季度>/predictions.json` 逐条核对”的验证项；
@@ -137,5 +139,5 @@ python3 .agents/skills/dalton-earnings-preview/scripts/predictions.py validate \
 
 ### 收尾门禁：汇报完成前必须过完成契约（`dalton_check_done`）
 
-- 第 3 项全部做完后、向 PM 汇报“完成”前，必须调用 `dalton_check_done(workflow="dalton-earnings-preview", params={"ticker": ..., "quarter": ..., "as_of": "<本稿 D>"})`。
-- `done=false` 时按 `missing` 先补齐再查（缺草稿或 `predictions.json` 就补写、校验未过就按输出修到 `predictions.py validate --strict` 通过、`drivers`/`debate` 缺本轮 source=tool 新版本就 `knowledge_update`、verdict 未写或 `trigger.kind` 不是 `earnings` 就 `knowledge_append_verdict`、check_draft 用了旧草稿就对最终稿重跑 `check_draft`）；补不了的缺项只能汇报“未完成”并列出缺项与原因，不得汇报“完成”。
+- 第 5 项全部做完后、向 PM 汇报“完成”前，必须调用 `dalton_check_done(workflow="dalton-earnings-preview", params={"ticker": ..., "quarter": ..., "as_of": "<本稿 D>"})`。
+- `done=false` 时按 `missing` 先补齐再查（缺草稿或 `predictions.json` 就补写、校验未过就按输出修到 `predictions.py validate --strict` 通过、`drivers`/`debate` 缺本轮 source=tool 新版本就 `knowledge_update`、verdict 未写或 `trigger.kind` 不是 `earnings` 就 `knowledge_append_verdict`、check_draft 用了旧草稿就对最终稿重跑 `check_draft`、语言审查缺轮次或第 2 轮哈希对不上就补跑对应轮次的 `check_language`）；补不了的缺项只能汇报“未完成”并列出缺项与原因，不得汇报“完成”。

@@ -120,12 +120,26 @@ const merged =
 
 const mergedSha = merged === null ? null : shaOf(merged)
 const mergedOk = merged !== null && mergedSha !== null
+
+// 第 1 轮语言审查：合并成稿之后、第一次独立审稿之前（改稿会换哈希，必须先改再送审）。
+const draftPath = `${W}/drafts/${D}-bullbear.md`
+phase('语言审查')
+const lang1 =
+  !mergedOk
+    ? null
+    : await agent(
+        `对 ${draftPath} 做第 1 轮语言审查：调用工具 check_language(draft_path="${draftPath}", round=1)（只标问题），读 ${draftPath}.language.md 清单，按清单逐条修改 ${draftPath}（只改语言表达，不动事实、数字、术语、引用编号与判断强度，不改 <!-- INSERT:… --> 结构；工具报错就不改稿并在 summary 里原样汇报错误）。改完返回 ${draftPath} 的 sha256。`,
+        { agentType: 'general-purpose', label: '语言审查 1', phase: '语言审查', schema: FILES_DRAFT }
+      )
+const lang1Sha = lang1 === null ? null : shaOf(lang1)
+const lang1Failed = mergedOk && lang1Sha === null
+const reviewedSha = lang1Sha || mergedSha
 const review =
   !mergedOk
     ? null
     : await agent(
-        `审阅 ${W}/drafts/${D}-bullbear.md（被审草稿 sha256：${
-          shaOf(merged) || '未知'
+        `审阅 ${draftPath}（被审草稿 sha256：${
+          reviewedSha || '未知'
         }；支线材料在 ${runDir}/，只读不改任何文件）。重点：每个 Debate 的“我的判断”是否有明确立场、改判条件是否可观察；§2 是否把价格走势当共识；§4 修正分层是否能回指一致预期快照。按 dalton-reviewer 规范输出 JSON（verdict ∈ pass/revise/block；draft_sha256 填提示词里的被审草稿 sha256 原值）。`,
         { agentType: 'dalton-reviewer', label: `${T} 审稿`, phase: '合并与审稿', schema: VERDICT }
       )
@@ -147,7 +161,7 @@ phase('修订')
 let fixed = null
 let finalReview = review
 let rounds = 0
-let currentSha = mergedSha
+let currentSha = reviewedSha
 let reviewPassed = review !== null && verdictOf(review) === 'pass'
 while (finalReview && verdictOf(finalReview) === 'revise' && rounds < 2) {
   rounds += 1
@@ -181,24 +195,75 @@ while (finalReview && verdictOf(finalReview) === 'revise' && rounds < 2) {
 }
 reviewPassed = finalReview !== null && verdictOf(finalReview) === 'pass'
 
+// 笔记两轮：一次写完、不再改的准备/支线/主稿笔记同样审两轮——第 1 轮审完按清单改，
+// 第 2 轮复核（改动过的文件再补一次 round=2 确认，绑定终态哈希）。main.md 与
+// return*.md 的内容已并入正式稿，档案副本仍按规则各自两轮。
+const notesReview =
+  !mergedOk || !reviewPassed
+    ? null
+    : await agent(
+        `对本次运行产出、给人读的 .md 笔记逐一做两轮语言审查（规则见 .agents/skills/dalton-language/SKILL.md，只标问题）。每个文件依次：1) 调用工具 check_language(draft_path="<文件>", round=1)，读 <文件>.language.md 清单并按清单修改（只改语言表达，不动事实、数字、术语、引用编号与判断强度，不改 <!-- INSERT:… --> 结构；工具报错就不改稿并在 summary 里原样汇报错误）；2) 调用 check_language(draft_path="<文件>", round=2) 复核；若第 1 轮后改过稿，改完再调用一次 round=2 确认（记录追加在同一 json）。\n文件清单：\n- ${runDir}/fincheck.md\n- ${runDir}/consensus.md\n- ${runDir}/price.md\n- ${runDir}/return.md\n- ${runDir}/return_appendix.md\n- ${runDir}/return_summary.md\n- ${runDir}/main.md\n清单之外本次运行写的其他给人读的 .md 一并同法处理；json/xlsx 等机器文件、bg_data/、data/、lenses_work/、model_dump/ 下的文件、知识层渲染文件与 .audit/.annotated/.language 侧车不审。返回处理过的文件列表与摘要。`,
+        { agentType: 'general-purpose', label: '笔记语言审查', phase: '修订', schema: OUT }
+      )
+if (mergedOk && reviewPassed && notesReview === null) {
+  incomplete.push('笔记语言审查失败（准备/支线/主稿笔记未完成两轮语言审查）')
+}
+
+// 第 2 轮语言审查：终稿内容定稿（审稿修订循环结束）之后、提交最后一次审稿之前。
+// 改了稿就再跑一次 round=2 复核，使最后一条第 2 轮记录绑定终稿哈希；哈希有变
+// 则终稿审稿重新绑定独立审稿哈希——语言修改不能让已有 pass 记录失效却无人重审。
+const preLang2Sha = currentSha
+const lang2 =
+  !mergedOk || !reviewPassed
+    ? null
+    : await agent(
+        `对 ${draftPath} 做第 2 轮语言审查：调用工具 check_language(draft_path="${draftPath}", round=2)，读 ${draftPath}.language.md 清单，按清单逐条完成终稿语言修改（只改语言表达，不动事实、数字、术语、引用编号与判断强度，不改 <!-- INSERT:… --> 结构；工具报错就不改稿并在 summary 里原样汇报错误）。若草稿有改动，再调用一次 check_language(draft_path="${draftPath}", round=2) 对终稿复核（记录追加在同一 json），并重跑 python ${S}/scripts/bb_check.py ${draftPath} 确认 0 WARN。返回 ${draftPath} 最终 sha256。`,
+        { agentType: 'general-purpose', label: '语言审查 2', phase: '修订', schema: FIXED_SCHEMA }
+      )
+const lang2Sha = lang2 === null ? null : shaOf(lang2)
+if (mergedOk && reviewPassed && lang2Sha === null) {
+  incomplete.push('语言审查第 2 轮失败（结果或其 sha256 缺失/非法），未做终稿语言修改')
+} else if (mergedOk && reviewPassed && lang2Sha !== preLang2Sha) {
+  currentSha = lang2Sha
+  const finalCheck = await agent(
+    `终稿审稿（语言修改后）：审阅 ${draftPath}（被审草稿 sha256：${lang2Sha}；支线材料在 ${runDir}/，只读不改任何文件）。重点：语言修改未动事实与数字，bb_check 仍 0 WARN，上一轮 must_fix 仍全部解决。按 dalton-reviewer 规范输出 JSON（verdict ∈ pass/revise/block；draft_sha256 填提示词里的被审草稿 sha256 原值）。`,
+    { agentType: 'dalton-reviewer', label: '终稿审稿', phase: '修订', schema: VERDICT }
+  )
+  if (finalCheck === null) {
+    incomplete.push('终稿审稿失败')
+  } else {
+    finalReview = finalCheck
+  }
+}
+reviewPassed = finalReview !== null && verdictOf(finalReview) === 'pass'
+
 if (prep === null) incomplete.push('准备阶段失败')
 if (ret === null && prep !== null) incomplete.push('股东回报支线失败')
 if (main === null) incomplete.push('主稿失败')
 if (!mergedOk && main !== null) incomplete.push('合并失败（草稿或其 sha256 缺失/非法）')
 if (review === null && mergedOk) incomplete.push('审稿失败')
+if (lang1Failed) incomplete.push('语言审查第 1 轮失败（结果或其 sha256 缺失/非法），未按清单修改')
 if (!reviewPassed && !incomplete.length) incomplete.push('审稿未最终通过（无 pass 记录）')
 
 phase('产物核验')
 const deliverables = [
   `${runDir}/anchors.json`,
   `${runDir}/fincheck.md`,
+  `${runDir}/fincheck.md.language.json`,
   `${runDir}/consensus.md`,
+  `${runDir}/consensus.md.language.json`,
   `${runDir}/price.md`,
+  `${runDir}/price.md.language.json`,
   `${runDir}/return.md`,
+  `${runDir}/return.md.language.json`,
   `${runDir}/return_appendix.md`,
+  `${runDir}/return_appendix.md.language.json`,
   `${runDir}/return_summary.md`,
+  `${runDir}/return_summary.md.language.json`,
   `${runDir}/main.md`,
+  `${runDir}/main.md.language.json`,
   `${W}/drafts/${D}-bullbear.md`,
+  `${W}/drafts/${D}-bullbear.md.language.json`,
 ]
 const check =
   !mergedOk
@@ -232,6 +297,7 @@ return {
   draft: `${W}/drafts/${D}-bullbear.md`,
   review_verdict: finalReview ? verdictOf(finalReview) : null,
   review_summary: finalReview && finalReview.summary,
+  language_done: mergedOk && lang1Sha !== null && lang2Sha !== null,
   revise_rounds: rounds,
   fixed: fixed && fixed.summary,
   failed: [prep, ret, main, merged, review].map((x) => x === null),

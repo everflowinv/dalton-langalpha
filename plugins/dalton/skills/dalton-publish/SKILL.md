@@ -33,12 +33,19 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 - 引用块（`> ...`）中管理层原话里的数字自动豁免；
 - 显式带 `〔示意〕`、`[示意]`、`（示意）`、`〔假设〕`、`[假设]`、`（假设）`、`〔估计〕`、`[估计]`、`（估计）`、`〔举例〕`、`[举例]`、`（举例）` 标记的数字自动豁免。
 
-## 2. 草稿自检：`check_draft(draft_path)`
+## 2. 草稿自检：`check_draft(draft_path)` 与两轮语言审查
 
 写完 `drafts/<slug>.md` 后，先调用 `check_draft(draft_path="drafts/<slug>.md")`：
 - 生成侧车清单 `drafts/<slug>.audit.md`（按行号列出所有未匹配或冲突数字及原因：`unverified`、`source_conflict`、`period_mismatch`、`unit_mismatch`）；
 - 生成带标注副本 `drafts/<slug>.annotated.md`（未核实数字标为 `**27.10 美元**⟨未核实⟩`）；
 - 根据 `.audit.md` 补齐脚注或修正数字，直到 `unverified` 降为 0。
+
+正式发布的稿子必须完成两轮语言审查（`check_language`，只标问题；中间产物不审）：
+1. **第 1 轮（初稿）**：初稿写完、`check_draft` 通过初检后，调用 `check_language(draft_path="drafts/<slug>.md", round=1)`，读 `drafts/<slug>.md.language.md` 清单并逐条修改草稿（只改语言表达，不动事实、数字、术语、引用编号与判断强度）。
+2. **第 2 轮（终稿）**：内容修订（含审稿 `must_fix` 修改）全部完成后、最后一次提交 `publish_report` 之前，调用 `check_language(round=2)` 并按清单完成终稿语言修改；草稿有改动就再调用一次 `check_language(round=2)` 对终稿复核（记录追加在同一 `drafts/<slug>.md.language.json`），然后重跑 `check_draft` 并提交 `publish_report`——审稿与数字核验都绑定终稿哈希，语言修改不能发生在其后。
+3. 草稿来自已跑完两轮审查的 workflow（initial-coverage、full-coverage、earnings-deep-update、topic-research、bullbear-doc、dalton-earnings-preview、dalton-call）且未再改动时，`<草稿>.language.json` 已随草稿存在，不必重跑；改过稿就按上一条补第 2 轮复核。
+4. 发布稿之外的给人读的 .md 笔记（research/ 检索与对账笔记等）同样各审两轮：第 1 轮审完按清单改，第 2 轮复核，改过就再跑一次 round=2 确认；json/xlsx 等机器文件、bg_data/、data/、lenses_work/、model_dump/、知识层渲染文件与 .audit/.annotated/.language 侧车不审。
+5. `check_language` 返回错误（模型不可用、超时）时不写侧车、不算通过：重试或如实汇报未完成，不得跳过发布门禁。
 
 ## 3. 正式发布：`publish_report(...)`
 
@@ -53,5 +60,5 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 ## 4. 收尾门禁：汇报完成前必须过完成契约（`dalton_check_done`）
 
 - 汇报“发布完成”或“已提交、停在 `awaiting_pm`”之前，必须调用 `dalton_check_done(workflow="dalton-publish", params={"draft_path": "<本稿草稿路径，如 drafts/2026-10-23-call-META.md>", "slug": "<本稿 slug，如 call-META>", "as_of": "<发布日期 YYYY-MM-DD>"})`。`draft_path` 按草稿实际路径传（草稿名通常带日期前缀），`slug` 只用来拼归档路径 `published/<as_of>-<slug>.md`，两者不要混用。
-- 契约要求：`draft_path` 指向的草稿及 `check_draft` 生成的侧车（同目录同名，后缀换成 `.annotated.md`、`.audit.md`），且侧车记录的草稿哈希与当前稿一致；发布状态二选一——`published/<as_of>-<slug>.md` 已归档，或本工作区有该草稿（`draft_path`，相对/`./`/工作区内绝对路径均可）的 `awaiting_pm` 发布请求。
-- `done=false` 时按 `missing` 先补齐再查：侧车缺失就对当前稿重跑 `check_draft`；**侧车记录的草稿哈希与当前稿不一致（check_draft 用的是旧草稿）必须对最终稿重跑 `check_draft`**；既无归档也无 `awaiting_pm` 请求就按第 3 节调用 `publish_report` 并处理其返回（`audit_failed`、`review_revise` 修稿重提；`review_unavailable` 时草稿留在 `drafts/`，只能汇报“未完成”）；补不了的缺项只能汇报“未完成”并列出缺项与原因，不得汇报“完成”。
+- 契约要求：`draft_path` 指向的草稿及 `check_draft` 生成的侧车（同目录同名，后缀换成 `.annotated.md`、`.audit.md`），且侧车记录的草稿哈希与当前稿一致；`<draft_path>.language.json` 含第 1、2 轮语言审查且最后一条第 2 轮的哈希与当前稿一致；发布状态二选一——`published/<as_of>-<slug>.md` 已归档，或本工作区有该草稿（`draft_path`，相对/`./`/工作区内绝对路径均可）的 `awaiting_pm` 发布请求。
+- `done=false` 时按 `missing` 先补齐再查：侧车缺失就对当前稿重跑 `check_draft`；**侧车记录的草稿哈希与当前稿不一致（check_draft 用的是旧草稿）必须对最终稿重跑 `check_draft`**；语言审查缺轮次就按第 2 节补跑 `check_language`（第 2 轮哈希对不上就对终稿再跑一次 round=2 复核）；既无归档也无 `awaiting_pm` 请求就按第 3 节调用 `publish_report` 并处理其返回（`audit_failed`、`review_revise` 修稿重提；`review_unavailable` 时草稿留在 `drafts/`，只能汇报“未完成”）；补不了的缺项只能汇报“未完成”并列出缺项与原因，不得汇报“完成”。

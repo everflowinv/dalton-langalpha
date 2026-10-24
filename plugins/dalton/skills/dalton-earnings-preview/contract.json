@@ -50,6 +50,9 @@
     "verdict_trigger": "earnings",
     "check_draft": {
       "draft": "drafts/{as_of}-preview-{quarter}.md"
+    },
+    "language_review": {
+      "draft": "drafts/{as_of}-preview-{quarter}.md"
     }
   }
 }

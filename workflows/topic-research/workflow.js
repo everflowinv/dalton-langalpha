@@ -132,6 +132,19 @@ const draft = await agent(
   { agentType: 'general-purpose', label: '专题写作', phase: '写作与数字核验', schema: DRAFT_OUT }
 )
 
+// 第 1 轮语言审查：专题报告写完之后、数字核验与第一次独立审稿之前（改稿会换哈希，必须先改再送审）。
+const draftSha0 = draft === null ? null : shaOf(draft)
+phase('语言审查')
+const lang1 =
+  draftSha0 === null
+    ? null
+    : await agent(
+        `对 ${draftPath} 做第 1 轮语言审查：调用工具 check_language(draft_path="${draftPath}", round=1)（只标问题），读 ${draftPath}.language.md 清单，按清单逐条修改 ${draftPath}（只改语言表达，不动事实、数字、术语、引用编号与判断强度；工具报错就不改稿并在 summary 里原样汇报错误）。改完跑 python ${S}/scripts/validate_topic.py --input ${draftPath} --json 确认仍通过，返回 ${draftPath} 的 sha256。`,
+        { agentType: 'general-purpose', label: '语言审查 1', phase: '语言审查', schema: DRAFT_OUT }
+      )
+const lang1Sha = lang1 === null ? null : shaOf(lang1)
+const lang1Failed = draftSha0 !== null && lang1Sha === null
+
 const audit =
   draft === null
     ? null
@@ -141,7 +154,7 @@ const audit =
       )
 
 phase('独立审稿与修订')
-const draftSha = draft === null ? null : shaOf(draft)
+const draftSha = lang1Sha || draftSha0
 const draftOk = draft !== null && draftSha !== null
 const review =
   !draftOk
@@ -208,6 +221,49 @@ while (finalReview && verdictOf(finalReview) === 'revise' && rounds < 2) {
 }
 reviewPassed = finalReview !== null && verdictOf(finalReview) === 'pass'
 
+// 笔记两轮：一次写完、不再改的取证/核验笔记同样审两轮——第 1 轮审完按清单改，
+// 第 2 轮复核（改动过的文件再补一次 round=2 确认，绑定终态哈希）。
+const notesReview =
+  !draftOk || !reviewPassed
+    ? null
+    : await agent(
+        `对本次运行产出、给人读的 .md 笔记逐一做两轮语言审查（规则见 .agents/skills/dalton-language/SKILL.md，只标问题）。每个文件依次：1) 调用工具 check_language(draft_path="<文件>", round=1)，读 <文件>.language.md 清单并按清单修改（只改语言表达，不动事实、数字、术语、引用编号与判断强度；工具报错就不改稿并在 summary 里原样汇报错误）；2) 调用 check_language(draft_path="<文件>", round=2) 复核；若第 1 轮后改过稿，改完再调用一次 round=2 确认（记录追加在同一 json）。\n文件清单：\n- ${R}/plan.md\n- ${R}/primary.md\n- ${R}/internal-memory.md\n- ${R}/guidepoint.md\n- ${R}/cross-check.md\n- ${R}/number-audit.md\n清单之外本次运行写的其他给人读的 .md 一并同法处理；json/xlsx 等机器文件、bg_data/、data/、lenses_work/、model_dump/ 下的文件、知识层渲染文件与 .audit/.annotated/.language 侧车不审。返回处理过的文件列表与摘要。`,
+        { agentType: 'general-purpose', label: '笔记语言审查', phase: '独立审稿与修订', schema: OUT }
+      )
+if (draftOk && reviewPassed && notesReview === null) {
+  incomplete.push('笔记语言审查失败（取证/核验笔记未完成两轮语言审查）')
+}
+
+// 第 2 轮语言审查：终稿内容定稿（审稿修订循环结束）之后、提交最后一次审稿之前。
+// 改了稿就再跑一次 round=2 复核，使最后一条第 2 轮记录绑定终稿哈希；哈希有变
+// 则终稿审稿重新绑定独立审稿哈希——语言修改不能让已有 pass 记录失效却无人重审。
+const preLang2Sha = currentDraftSha
+const lang2 =
+  !draftOk || !reviewPassed
+    ? null
+    : await agent(
+        `对 ${draftPath} 做第 2 轮语言审查：调用工具 check_language(draft_path="${draftPath}", round=2)，读 ${draftPath}.language.md 清单，按清单逐条完成终稿语言修改（只改语言表达，不动事实、数字、术语、引用编号与判断强度；工具报错就不改稿并在 summary 里原样汇报错误）。若草稿有改动，再调用一次 check_language(draft_path="${draftPath}", round=2) 对终稿复核（记录追加在同一 json），并跑 python ${S}/scripts/validate_topic.py --input ${draftPath} --json 确认仍通过。返回 ${draftPath} 最终 sha256。`,
+        { agentType: 'general-purpose', label: '语言审查 2', phase: '独立审稿与修订', schema: DRAFT_OUT }
+      )
+const lang2Sha = lang2 === null ? null : shaOf(lang2)
+if (draftOk && reviewPassed && lang2Sha === null) {
+  incomplete.push('语言审查第 2 轮失败（结果或其 sha256 缺失/非法），未做终稿语言修改')
+  reviewPassed = false
+} else if (draftOk && reviewPassed && lang2Sha !== preLang2Sha) {
+  currentDraftSha = lang2Sha
+  const finalCheck = await agent(
+    `终稿审稿（语言修改后）：审阅 ${draftPath}（被审草稿 sha256：${lang2Sha}）及 ${R}/number-audit.md、${R}/cross-check.md（只读不改文件）。重点：语言修改未动事实与数字，上一轮 must_fix 仍全部解决。按 dalton-reviewer 规范输出 JSON（verdict ∈ pass/revise/block；draft_sha256 填提示词里的被审草稿 sha256 原值）。`,
+    { agentType: 'dalton-reviewer', label: '终稿审稿', phase: '独立审稿与修订', schema: VERDICT }
+  )
+  if (finalCheck === null) {
+    incomplete.push('终稿审稿失败')
+    reviewPassed = false
+  } else {
+    finalReview = finalCheck
+    reviewPassed = verdictOf(finalCheck) === 'pass'
+  }
+}
+
 // 知识提案只看最终审稿结论，与中间有没有修订完全无关；修订 prompt 不写这个文件。
 let kp = null
 if (reviewPassed) {
@@ -226,6 +282,7 @@ if (evResults[clusters.length] === null) incomplete.push('内部记忆检索失�
 if (evResults[clusters.length + 1] === null) incomplete.push('专家纪要检索失败')
 if (cross === null) incomplete.push('交叉验证与盲区失败')
 if (!draftOk) incomplete.push('专题写作失败（草稿或其 sha256 缺失/非法）')
+if (lang1Failed) incomplete.push('语言审查第 1 轮失败（结果或其 sha256 缺失/非法），未按清单修改')
 if (audit === null && draftOk) incomplete.push('数字核验失败')
 if (review === null && draftOk) incomplete.push('独立审稿失败')
 if (!reviewPassed && !incomplete.length) incomplete.push('审稿未最终通过（无 pass 记录）')
@@ -234,12 +291,19 @@ if (reviewPassed && kp === null) incomplete.push('知识层草案失败')
 phase('产物核验')
 const deliverables = [
   `${R}/plan.md`,
+  `${R}/plan.md.language.json`,
   `${R}/primary.md`,
+  `${R}/primary.md.language.json`,
   `${R}/internal-memory.md`,
+  `${R}/internal-memory.md.language.json`,
   `${R}/guidepoint.md`,
+  `${R}/guidepoint.md.language.json`,
   `${R}/cross-check.md`,
+  `${R}/cross-check.md.language.json`,
   draftPath,
+  `${draftPath}.language.json`,
   `${R}/number-audit.md`,
+  `${R}/number-audit.md.language.json`,
   `${R}/knowledge-revision.json`,
 ]
 const check =
@@ -275,6 +339,7 @@ return {
   number_audit: audit && `${R}/number-audit.md`,
   review_done: finalReview !== null,
   review_verdict: finalReview && verdictOf(finalReview),
+  language_done: draftOk && lang1Sha !== null && lang2Sha !== null,
   revise_rounds: rounds,
   knowledge_revision: kp && `${R}/knowledge-revision.json`,
   incomplete,

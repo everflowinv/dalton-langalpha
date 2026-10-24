@@ -51,7 +51,7 @@ Docker（colima，数据盘在 EveSSD）
   | 角色 | 工具 |
   |---|---|
   | Chief of Staff | `dalton_coverage_board`、`dalton_record_plan`、`dalton_agenda_note`、`dalton_schedule_automation`、`conversation_search`，以及上游的 `delegate_to_analyst` |
-  | 公司分析师 | `knowledge_update`、`knowledge_append_verdict`、`check_draft`、`publish_report`、`dalton_schedule_automation`、`conversation_search` |
+  | 公司分析师 | `knowledge_update`、`knowledge_append_verdict`、`check_draft`、`check_language`、`publish_report`、`dalton_schedule_automation`、`conversation_search` |
 
 - **各角色用哪个模型**：在 `agent_config.dalton.yaml`、`src/dalton/dalton.yaml` 和代理定义（`plugins/dalton/agents/*.md`）里配置，接入了哪些模型见第 8 节。
 - **Skill**：共 22 个，在 `plugins/dalton/skills/`，通过 `dalton_registry.py` 合并进上游 registry。有斜杠命令的会出现在输入框的 `/` 菜单里。
@@ -90,6 +90,8 @@ Docker（colima，数据盘在 EveSSD）
    - 如果设置了 `updates_thesis`，就写入 `thesis.official`。
 
 `check_draft` 只做核验、不拦截：在输入文件旁边生成 `.audit.md` 和 `.annotated.md`，原稿不动。
+
+`check_language` 是正式产物的语言审查（规则在 `plugins/dalton/skills/dalton-language/`；正式产物=留在工作区给人读的 .md：drafts/ 草稿、research/ 笔记，判断规则只在 `is_reviewable_deliverable`（`src/dalton/publish/language.py`）一处，机器文件、bg_data/、data/、lenses_work/、model_dump/、知识层渲染文件、research/topics/conversations/ 机器纪要与核验侧车除外；published/ 归档稿不作为语言目标——发布横幅使哈希不同且归档不可改，其审查以对应草稿为准，审查模型按用户偏好 `dalton_language_model` 解析，留空退回数字核验模型）：只标问题不改稿，长文按章节分段审查，每条 issue 的 quote 必须逐字命中草稿，写 `<draft>.language.json`（多轮记录的 rounds 数组）与 `<draft>.language.md` 清单；模型失败不写侧车、不算通过。每份两轮：过审稿的文档第 1 轮在初稿写完、第一次独立审稿之前，第 2 轮在终稿语言修改完成后、最后一次独立审稿之前（改稿后再跑一次 round=2 复核，使最后一条第 2 轮记录绑定终稿哈希）。一次写完的笔记写完后即做第 1 轮、改完即第 2 轮复核。workflow 里由 general-purpose 派发执行（主稿两轮各一次派发 + 一次写完笔记的批量两轮派发；`check_language` 同时绑定在该子代理上）；完成契约的 `language_review` 关闭项按同一规则认定本次的正式产物——契约声明的可审产物（不看 mtime）、run 的 journal 里各派发回报的文件、以及时间窗内（run 开始时间；手动路径用 as_of 当日，缺失或 latest 时用线程开始时间，再取不到用过去 24 小时）新写或修改过的全部可审 .md——三者取并集，逐个核对两轮记录与哈希，扫描失败记 missing；复用的旧笔记同一哈希已有两轮记录即通过，不要求重审。
 
 ## 6. 自主研究
 

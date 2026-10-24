@@ -71,6 +71,9 @@ class DaltonPublishConfig(BaseModel):
     # models, not the shared assist slot. Named in dalton.yaml only; empty here so a
     # missing config fails loudly instead of quietly picking a model.
     audit_model: str = ""
+    # Language review (check_language). Empty falls back to audit_model in
+    # dalton_model_default, so one yaml key moves both unless split deliberately.
+    language_model: str = ""
     audit_fallback_models: list[str] = Field(default_factory=list)
     audit_timeout_s: float = Field(default=300.0, gt=0)
     audit_concurrency: int = Field(default=4, ge=1, le=16)

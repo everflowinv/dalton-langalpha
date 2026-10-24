@@ -39,6 +39,46 @@ def _draft_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def _with_full_language_sidecars(files: dict[str, str]) -> dict[str, str]:
+    """Give every reviewable .md in a healthy-run fixture its two-round sidecar
+    — the deterministic workspace scan checks them all, not just the draft."""
+    from src.dalton.publish.language import is_reviewable_deliverable
+
+    for path, text in list(files.items()):
+        if is_reviewable_deliverable(path) and f"{path}.language.json" not in files:
+            files[f"{path}.language.json"] = _language_json(text)
+    return files
+
+
+def _language_json(draft_text: str, *, round2_sha: str | None = None) -> str:
+    """A healthy two-round check_language sidecar for ``draft_text``: round 2
+    reviewed the current text (round 1 an older one)."""
+    return json.dumps(
+        {
+            "draft": "drafts/x.md",
+            "rounds": [
+                {
+                    "round": 1,
+                    "draft_sha256": _draft_hash("初稿\n" + draft_text[:20]),
+                    "model": "test-review-model",
+                    "generated_at": "2026-10-23T00:00:00Z",
+                    "issues": [],
+                    "dropped_quotes": 0,
+                },
+                {
+                    "round": 2,
+                    "draft_sha256": round2_sha or _draft_hash(draft_text),
+                    "model": "test-review-model",
+                    "generated_at": "2026-10-23T01:00:00Z",
+                    "issues": [],
+                    "dropped_quotes": 0,
+                },
+            ],
+        },
+        ensure_ascii=False,
+    )
+
+
 def _make_backend(
     files: dict[str, str],
     *,
@@ -47,6 +87,7 @@ def _make_backend(
     read_error: bool = False,
     execute_error: bool = False,
     read_none_paths: frozenset[str] | set[str] = frozenset(),
+    scan_rc: int = 0,
 ) -> Any:
     """A spec'd sandbox backend serving ``files`` and scripted commands.
 
@@ -100,6 +141,25 @@ def _make_backend(
             if path not in files:
                 return _Response("", 1)
             return _Response(str(mtimes.get(path, now)), 0)
+        if body.startswith("{ test -d "):
+            # The scan-root existence probe: one of two markers whenever the
+            # shell ran, so a dead executor prints neither.
+            root = body.split("test -d ", 1)[1].split(" ", 1)[0]
+            present = any(p == root or p.startswith(root + "/") for p in files)
+            marker = f"__DALTON_DIR_{root}" if present else "__DALTON_DIR_NONE"
+            return _Response(marker, 0)
+        if body.startswith("{ find "):
+            # The language-review manifest scan over the roots the probe found
+            # (rc override simulates an unreadable directory).
+            roots = body.removeprefix("{ find ").split(" -type", 1)[0].split()
+            listed = sorted(
+                p
+                for p in files
+                if p.split("/")[0] in roots and p.endswith(".md")
+            )
+            return _Response(
+                "\n".join(listed) + f"\n__DALTON_SCAN_RC__={scan_rc}", 0
+            )
         if "test -e " in body:
             path = body.split("test -e ", 1)[1].split(" &&", 1)[0].strip().strip("'\"")
             found = check_done_tools._PROBE_PRESENT if path in files else check_done_tools._PROBE_ABSENT
@@ -221,6 +281,8 @@ def _full_files(
     files["drafts/2026-10-23-initial-coverage.audit.md"] = (
         "# 数字核验报告\n- **草稿哈希**：`" + digest[:16] + "…`\n"
     )
+    files[f"{DRAFT}.language.json"] = _language_json(draft)
+    _with_full_language_sidecars(files)
     if with_review_pass:
         # Run-scoped review evidence: the run's status.json names the
         # workflow, and its journal's LAST review record is a pass whose
@@ -1168,7 +1230,7 @@ async def test_unfinished_newer_run_blocks_falling_back_to_an_older_pass(
 async def test_corrupt_newer_status_blocks_falling_back_to_an_older_pass(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A newer run's status.json is truncated: it cannot be told apart from the
+    """A newer run's truncated status.json cannot be told apart from the
     newest run of this workflow, so the older pass must not stand in."""
     files = _full_files()
     files[".agents/threads/short-1/workflows/task-run-6/workflow.js"] = "return 1;"
@@ -1180,6 +1242,33 @@ async def test_corrupt_newer_status_blocks_falling_back_to_an_older_pass(
     )
     assert not result["done"]
     assert any("损坏" in item for item in result["missing"]), result["missing"]
+
+    # A readable status.json with no name: same undeterminable situation.
+    files[".agents/threads/short-1/workflows/task-run-6/status.json"] = '{"updated_at": 9.0}'
+    result = await run_check_done(
+        workflow="initial-coverage", params=PARAMS, backend=_make_backend(files), workspace_id=WS, thread_id="short-1"
+    )
+    assert not result["done"]
+    assert any("缺少 name" in item for item in result["missing"]), result["missing"]
+
+
+@pytest.mark.asyncio
+async def test_newer_status_of_another_workflow_is_skipped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A newer run's status.json that parses and names a DIFFERENT workflow is
+    safely skipped; the older same-name run decides."""
+    files = _full_files()
+    files[".agents/threads/short-1/workflows/task-run-6/workflow.js"] = "return 1;"
+    files[".agents/threads/short-1/workflows/task-run-6/status.json"] = json.dumps(
+        {"run_id": "task-run-6", "name": "full-coverage", "status": "completed", "updated_at": 9.0}
+    )
+    _patch_knowledge(monkeypatch, IC_DOCS)
+    _patch_verdicts(monkeypatch, [_verdict_row("NEW_THESIS")])
+    result = await run_check_done(
+        workflow="initial-coverage", params=PARAMS, backend=_make_backend(files), workspace_id=WS, thread_id="short-1"
+    )
+    assert result["done"], result["missing"]
 
 
 @pytest.mark.asyncio
@@ -1216,6 +1305,7 @@ def _preview_files(draft_text: str = "# 前瞻\n" + "判断" * 300) -> dict[str,
     return {
         PREVIEW_DRAFT: draft_text,
         "drafts/2026-10-23-preview-FY26Q3.audit.md": _sidecar_for(draft_text),
+        f"{PREVIEW_DRAFT}.language.json": _language_json(draft_text),
         PREVIEW_PRED: json.dumps({"predictions": [{"id": "P1", "metric": "revenue"}] * 3}),
     }
 
@@ -1481,7 +1571,11 @@ async def test_call_gate_passed_branch_needs_current_check_draft(
     draft = "# Conviction Call\n" + "论证" * 300
     # The gate-passed branch never consults verdicts (they come after PM approval).
     _patch_verdicts(monkeypatch, error=RuntimeError("must not be queried"))
-    files = {CALL_DRAFT: draft, "drafts/2026-10-23-call-META.audit.md": _sidecar_for(draft)}
+    files = {
+        CALL_DRAFT: draft,
+        "drafts/2026-10-23-call-META.audit.md": _sidecar_for(draft),
+        f"{CALL_DRAFT}.language.json": _language_json(draft),
+    }
     result = await run_check_done(
         workflow="dalton-call", params=CALL_PARAMS,
         backend=_make_backend(files), workspace_id=WS,
@@ -1595,11 +1689,13 @@ PUB_ANNOTATED = "drafts/2026-10-23-call-META.annotated.md"
 
 def _publish_files() -> dict[str, str]:
     draft = "# Conviction Call\n" + "论证" * 200
-    return {
+    files = {
         PUB_DRAFT: draft,
         "drafts/2026-10-23-call-META.audit.md": _sidecar_for(draft),
+        f"{PUB_DRAFT}.language.json": _language_json(draft),
         PUB_ANNOTATED: "标注" * 50,
     }
+    return _with_full_language_sidecars(files)
 
 
 def test_same_workspace_path_requires_full_match() -> None:
@@ -1629,7 +1725,22 @@ async def test_publish_done_when_published_or_awaiting_pm(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     files = _publish_files()
-    files["published/2026-10-23-call-META.md"] = "归档" * 100
+    # A real publish_report archive: the draft with the publication banner
+    # prepended (different hash), never edited again. It carries no language
+    # sidecar of its own — its review is the draft's.
+    from src.dalton.publish.files import prepend_publication_banner
+
+    files["published/2026-10-23-call-META.md"] = prepend_publication_banner(
+        files[PUB_DRAFT],
+        title="Conviction Call",
+        kind="conviction_call",
+        published_date="2026-10-23",
+        approver_user_id="user-1",
+        approved_at="2026-10-23T00:00:00Z",
+        reviewer_model="gpt-6.1-sol-oauth",
+        reviewer_family="openai",
+        publication_id="pr-1",
+    )
     _patch_pending(monkeypatch, error=RuntimeError("must not be queried"))
     published = await run_check_done(
         workflow="dalton-publish", params=PUB_PARAMS,
@@ -1735,3 +1846,540 @@ def _pending_row(draft_path: str, workspace_id: str = WS) -> dict[str, Any]:
         "draft_path": draft_path,
         "status": "awaiting_pm",
     }
+
+
+# ------------------------------------------------- language_review closing rule
+
+
+@pytest.mark.asyncio
+async def test_language_review_missing_round2_is_a_gap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    files = _full_files()
+    doc = json.loads(files[f"{DRAFT}.language.json"])
+    doc["rounds"] = [doc["rounds"][0]]  # round 1 only
+    files[f"{DRAFT}.language.json"] = json.dumps(doc, ensure_ascii=False)
+    _patch_knowledge(monkeypatch, IC_DOCS)
+    _patch_verdicts(monkeypatch, [_verdict_row("NEW_THESIS")])
+
+    result = await run_check_done(
+        workflow="initial-coverage",
+        params=PARAMS,
+        backend=_make_backend(files),
+        workspace_id=WS,
+        thread_id="short-1",
+    )
+    assert not result["done"]
+    assert any("缺少第 2 轮" in m and "check_language" in m for m in result["missing"])
+
+
+@pytest.mark.asyncio
+async def test_language_review_stale_round2_hash_is_a_gap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    files = _full_files()
+    doc = json.loads(files[f"{DRAFT}.language.json"])
+    # Round 2 reviewed an older draft: neither the current draft's hash nor
+    # the review-pass hash (which equals the current draft's here).
+    doc["rounds"][1]["draft_sha256"] = _draft_hash("旧得多的稿子")
+    files[f"{DRAFT}.language.json"] = json.dumps(doc, ensure_ascii=False)
+    _patch_knowledge(monkeypatch, IC_DOCS)
+    _patch_verdicts(monkeypatch, [_verdict_row("NEW_THESIS")])
+
+    result = await run_check_done(
+        workflow="initial-coverage",
+        params=PARAMS,
+        backend=_make_backend(files),
+        workspace_id=WS,
+        thread_id="short-1",
+    )
+    assert not result["done"]
+    assert any("第 2 轮语言审查针对的是旧草稿" in m for m in result["missing"])
+
+
+@pytest.mark.asyncio
+async def test_language_review_passes_when_round2_matches_the_review_pass_hash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The first disjunct: round 2 recorded the hash the review passed on —
+    here the file was edited after that pass, so the review check itself
+    fails, but the language review must not add its own gap."""
+    files = _full_files()
+    draft_text = files[DRAFT]
+    review_sha = _draft_hash(draft_text)
+    doc = json.loads(files[f"{DRAFT}.language.json"])
+    doc["rounds"][1]["draft_sha256"] = review_sha
+    files[f"{DRAFT}.language.json"] = json.dumps(doc, ensure_ascii=False)
+    # The draft changed after the pass: current hash differs from review_sha.
+    files[DRAFT] = draft_text + "\n事后改动。\n"
+    _patch_knowledge(monkeypatch, IC_DOCS)
+    _patch_verdicts(monkeypatch, [_verdict_row("NEW_THESIS")])
+
+    result = await run_check_done(
+        workflow="initial-coverage",
+        params=PARAMS,
+        backend=_make_backend(files),
+        workspace_id=WS,
+        thread_id="short-1",
+    )
+    assert not result["done"]
+    assert any("审稿针对的是旧草稿" in m for m in result["missing"])
+    assert not any("语言审查" in m for m in result["missing"])
+
+
+@pytest.mark.asyncio
+async def test_language_review_unreadable_sidecar_is_missing_not_pass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A sidecar the read layer answers None for (decode failure) while the
+    shell probe sees it present: 无法核对, never a pass."""
+    files = _full_files()
+    _patch_knowledge(monkeypatch, IC_DOCS)
+    _patch_verdicts(monkeypatch, [_verdict_row("NEW_THESIS")])
+
+    result = await run_check_done(
+        workflow="initial-coverage",
+        params=PARAMS,
+        backend=_make_backend(files, read_none_paths={f"{DRAFT}.language.json"}),
+        workspace_id=WS,
+        thread_id="short-1",
+    )
+    assert not result["done"]
+    assert any("无法核对" in m and "language.json" in m for m in result["missing"])
+
+
+@pytest.mark.asyncio
+async def test_language_review_enumerates_the_runs_reviewable_files(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Files the run's dispatches reported writing are checked through the
+    scope rule: research notes and drafts owe their own two rounds; json/xlsx
+    and scraped-data paths don't."""
+    files = _full_files()
+    # A writer dispatch in the same run's journal reporting its outputs.
+    files[".agents/threads/short-1/workflows/task-run-1/journal/取证.json"] = json.dumps(
+        {
+            "label": "行业支线",
+            "dispatches": [
+                {
+                    "label": "行业支线",
+                    "status": "ok",
+                    "seq": 3,
+                    "recorded_at": 1.0,
+                    "result": {
+                        "files": [
+                            "research/2026-10-23-ic/industry.md",
+                            "./research/2026-10-23-ic/lenses.json",
+                            "research/2026-10-23-ic/data/raw.md",
+                            "drafts/2026-10-23-background.md",
+                        ],
+                        "summary": "done",
+                    },
+                }
+            ],
+        },
+        ensure_ascii=False,
+    )
+    _patch_knowledge(monkeypatch, IC_DOCS)
+    _patch_verdicts(monkeypatch, [_verdict_row("NEW_THESIS")])
+
+    # industry.md has no language record at all; background.md's is stale.
+    files.pop("research/2026-10-23-ic/industry.md.language.json", None)
+    files["drafts/2026-10-23-background.md"] = "背景" * 200
+    doc = json.loads(_language_json("旧背景" * 200))
+    files["drafts/2026-10-23-background.md.language.json"] = json.dumps(doc, ensure_ascii=False)
+
+    result = await run_check_done(
+        workflow="initial-coverage",
+        params=PARAMS,
+        backend=_make_backend(files),
+        workspace_id=WS,
+        thread_id="short-1",
+    )
+    missing = result["missing"]
+    assert not result["done"]
+    assert any(
+        "industry.md.language.json" in m and "缺少语言审查记录" in m for m in missing
+    )
+    assert any(
+        "2026-10-23-background.md" in m and "旧草稿" in m for m in missing
+    )
+    # The machine files reported by the same dispatch are not checked.
+    assert not any("lenses.json" in m or "data/raw.md" in m for m in missing)
+
+
+@pytest.mark.asyncio
+async def test_language_review_enumerated_run_passes_when_every_file_carries_rounds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    files = _full_files()
+    files[".agents/threads/short-1/workflows/task-run-1/journal/取证.json"] = json.dumps(
+        {
+            "label": "行业支线",
+            "dispatches": [
+                {
+                    "label": "行业支线",
+                    "status": "ok",
+                    "seq": 3,
+                    "recorded_at": 1.0,
+                    "result": {
+                        "files": ["research/2026-10-23-ic/industry.md|" + "e" * 64],
+                        "summary": "done",
+                    },
+                }
+            ],
+        },
+        ensure_ascii=False,
+    )
+    files["research/2026-10-23-ic/industry.md.language.json"] = _language_json(
+        files["research/2026-10-23-ic/industry.md"]
+    )
+    _patch_knowledge(monkeypatch, IC_DOCS)
+    _patch_verdicts(monkeypatch, [_verdict_row("NEW_THESIS")])
+
+    result = await run_check_done(
+        workflow="initial-coverage",
+        params=PARAMS,
+        backend=_make_backend(files),
+        workspace_id=WS,
+        thread_id="short-1",
+    )
+    assert result["done"], result["missing"]
+
+
+# ------------------------------- round-4: same-name run, scan, glob counting
+
+
+@pytest.mark.asyncio
+async def test_unrelated_crashed_run_does_not_block_manual_language_review(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A leftover run directory from another (crashed, status-less) workflow
+    on the thread must not fail the language check of a skill closing without
+    run_id: with no run of THIS workflow, the manual path decides. Preview
+    carries no review stage, so the language check is what could block."""
+    files = _preview_files()
+    files[".agents/threads/short-1/workflows/task-crashed/workflow.js"] = "// other workflow"
+    _patch_knowledge(monkeypatch, ["drivers", "debate"])
+    _patch_verdicts(monkeypatch, [_verdict_row("NO_CHANGE", trigger_kind="earnings")])
+
+    result = await run_check_done(
+        workflow="dalton-earnings-preview",
+        params=PREVIEW_PARAMS,
+        backend=_make_backend(files),
+        workspace_id=WS,
+        thread_id="short-1",
+    )
+    assert result["done"], result["missing"]
+    assert not any("未结束的 workflow run" in m for m in result["missing"])
+
+
+@pytest.mark.asyncio
+async def test_same_name_run_is_enumerated_despite_a_crashed_neighbour(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With a finished same-name run present, its journal drives enumeration
+    even when a crashed neighbour directory also sits on the thread."""
+    files = _full_files()
+    files[".agents/threads/short-1/workflows/task-crashed/workflow.js"] = "// other workflow"
+    files[".agents/threads/short-1/workflows/task-run-1/journal/取证.json"] = json.dumps(
+        {
+            "label": "行业支线",
+            "dispatches": [
+                {
+                    "label": "行业支线",
+                    "status": "ok",
+                    "seq": 3,
+                    "recorded_at": 1.0,
+                    "result": {"files": ["research/2026-10-23-ic/industry.md"], "summary": "d"},
+                }
+            ],
+        },
+        ensure_ascii=False,
+    )
+    files.pop("research/2026-10-23-ic/industry.md.language.json", None)
+    _patch_knowledge(monkeypatch, IC_DOCS)
+    _patch_verdicts(monkeypatch, [_verdict_row("NEW_THESIS")])
+
+    result = await run_check_done(
+        workflow="initial-coverage",
+        params=PARAMS,
+        backend=_make_backend(files),
+        workspace_id=WS,
+        thread_id="short-1",
+    )
+    assert not result["done"]
+    # The journal layer ran (the gap names the unreviewed note); the crashed
+    # neighbour may still cost the REVIEW stage its own missing entry, which
+    # is that check's rule, not the language check's.
+    assert any("industry.md.language.json" in m for m in result["missing"])
+    assert any("industry.md" in m and "缺少语言审查记录" in m for m in result["missing"])
+
+
+@pytest.mark.asyncio
+async def test_window_scan_catches_files_the_dispatches_never_reported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A hand-written note the manual flow never echoed anywhere is still
+    caught by the deterministic mtime scan — and an out-of-window file is not."""
+    files = _manual_files()
+    fresh = "research/2026-10-23-ic/hand-note.md"
+    stale = "research/2026-10-23-ic/old-note.md"
+    files[fresh] = "手写笔记" * 50
+    files[stale] = "上周的笔记" * 50
+    _patch_knowledge(monkeypatch, IC_DOCS)
+    _patch_verdicts(monkeypatch, [_verdict_row("NEW_THESIS")])
+
+    # Manual window: the as_of day (2026-10-23) at UTC midnight. The fresh
+    # note keeps the backend's default mtime (now); the stale one is a day
+    # older than the window start.
+    result = await run_check_done(
+        workflow="initial-coverage",
+        params=MANUAL_PARAMS,
+        backend=_make_backend(files, mtimes={stale: 1774000000}),
+        workspace_id=WS,
+        thread_id="short-1",
+    )
+    assert not result["done"]
+    assert any(f"{fresh}.language.json" in m and "缺少语言审查记录" in m for m in result["missing"])
+    assert not any(stale in m for m in result["missing"])
+
+
+@pytest.mark.asyncio
+async def test_window_scan_failure_is_missing_not_pass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    files = _full_files()
+    _patch_knowledge(monkeypatch, IC_DOCS)
+    _patch_verdicts(monkeypatch, [_verdict_row("NEW_THESIS")])
+
+    result = await run_check_done(
+        workflow="initial-coverage",
+        params=PARAMS,
+        backend=_make_backend(files, execute_error=True),
+        workspace_id=WS,
+        thread_id="short-1",
+    )
+    assert not result["done"]
+    assert any("无法扫描工作区的正式产物" in m for m in result["missing"])
+
+
+@pytest.mark.asyncio
+async def test_glob_counting_excludes_language_sidecars(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two real cluster notes plus a sidecar must not satisfy a ≥3 glob: the
+    sidecar matches ``cluster-*.md`` but never counts."""
+    params = {"topic": "AI capex", "slug": "ai-capex", "workspace_dir": ".", "as_of": "2026-10-23"}
+    base = "research/2026-10-23-topic-ai-capex"
+    files = {
+        f"{base}/cluster-gpu.md": "GPU " * 100,
+        f"{base}/cluster-power.md": "电力 " * 100,
+        # The sidecar that used to pad the count.
+        f"{base}/cluster-gpu.md.language.md": "# 语言审查清单\n" + "条目" * 30,
+    }
+    result = await run_check_done(
+        workflow="topic-research",
+        params=params,
+        backend=_make_backend(files),
+        workspace_id=WS,
+    )
+    assert not result["done"]
+    assert any(
+        "cluster-*.md" in m and "需要 ≥3 个匹配，实际 2" in m for m in result["missing"]
+    )
+
+
+# ------------------------------------------ round-5: declared paths, window, scan
+
+
+@pytest.mark.asyncio
+async def test_published_archive_needs_no_language_record_of_its_own(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An earlier same-day archive (banner-prefixed, different hash, no
+    sidecar) must not block an unrelated manual close either."""
+    files = _preview_files()
+    files["published/2026-10-23-older-call-AAPL.md"] = "# Dalton 正式发布\n……\n" + "旧归档" * 80
+    _patch_knowledge(monkeypatch, ["drivers", "debate"])
+    _patch_verdicts(monkeypatch, [_verdict_row("NO_CHANGE", trigger_kind="earnings")])
+
+    result = await run_check_done(
+        workflow="dalton-earnings-preview",
+        params=PREVIEW_PARAMS,
+        backend=_make_backend(files),
+        workspace_id=WS,
+        thread_id="short-1",
+    )
+    assert result["done"], result["missing"]
+
+
+@pytest.mark.asyncio
+async def test_contract_declared_note_is_checked_regardless_of_mtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """industry.md is a declared artifact: outside the run's window it still
+    owes its two rounds — and a reused note with same-hash records passes
+    without any re-review."""
+    files = _full_files()
+    files.pop("research/2026-10-23-ic/industry.md.language.json", None)
+    ancient = 1_600_000_000  # well before the journal's recorded_at stamps
+    _patch_knowledge(monkeypatch, IC_DOCS)
+    _patch_verdicts(monkeypatch, [_verdict_row("NEW_THESIS")])
+
+    missing_sidecar = await run_check_done(
+        workflow="initial-coverage",
+        params=PARAMS,
+        backend=_make_backend(files, mtimes={"research/2026-10-23-ic/industry.md": ancient}),
+        workspace_id=WS,
+        thread_id="short-1",
+    )
+    assert not missing_sidecar["done"]
+    assert any(
+        "industry.md.language.json" in m and "缺少语言审查记录" in m
+        for m in missing_sidecar["missing"]
+    )
+
+    # The reused note: old mtime, records bound to its current hash -> pass.
+    files["research/2026-10-23-ic/industry.md.language.json"] = _language_json(
+        files["research/2026-10-23-ic/industry.md"]
+    )
+    reused = await run_check_done(
+        workflow="initial-coverage",
+        params=PARAMS,
+        backend=_make_backend(files, mtimes={"research/2026-10-23-ic/industry.md": ancient}),
+        workspace_id=WS,
+        thread_id="short-1",
+    )
+    assert reused["done"], reused["missing"]
+
+
+@pytest.mark.asyncio
+async def test_manual_stale_round2_with_no_run_asks_for_round2_not_run_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Manual close (no same-name run), declared draft's round-2 hash stale:
+    the message names the fix (another round 2), not a run hunt."""
+    files = _preview_files()
+    files[f"{PREVIEW_DRAFT}.language.json"] = _language_json(
+        files[PREVIEW_DRAFT], round2_sha=_draft_hash("被改过的旧终稿")
+    )
+    _patch_knowledge(monkeypatch, ["drivers", "debate"])
+    _patch_verdicts(monkeypatch, [_verdict_row("NO_CHANGE", trigger_kind="earnings")])
+
+    result = await run_check_done(
+        workflow="dalton-earnings-preview",
+        params=PREVIEW_PARAMS,
+        backend=_make_backend(files),
+        workspace_id=WS,
+        thread_id="short-1",
+    )
+    assert not result["done"]
+    gap = next(m for m in result["missing"] if "language.json" in m)
+    assert "在第 2 轮语言审查后被改过" in gap and "check_language(round=2)" in gap
+    assert "找不到" not in gap and "无法核对" not in gap
+
+
+@pytest.mark.asyncio
+async def test_scan_rc_nonzero_is_missing_and_missing_roots_are_not(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    files = _full_files()
+    _patch_knowledge(monkeypatch, IC_DOCS)
+    _patch_verdicts(monkeypatch, [_verdict_row("NEW_THESIS")])
+
+    # find exits nonzero (unreadable directory): the listing is untrustworthy.
+    unreadable = await run_check_done(
+        workflow="initial-coverage",
+        params=PARAMS,
+        backend=_make_backend(files, scan_rc=1),
+        workspace_id=WS,
+        thread_id="short-1",
+    )
+    assert not unreadable["done"]
+    assert any("无法扫描工作区的正式产物" in m for m in unreadable["missing"])
+
+
+@pytest.mark.asyncio
+async def test_scan_without_any_root_directories_is_empty_not_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No drafts/ and no research/ at all: the scan is empty, not failed."""
+    backend = _make_backend({"model/META-model-v01.xlsx": "x" * 1200})
+    assert await check_done_tools._scan_reviewable_since(backend, 0) == []
+
+
+@pytest.mark.asyncio
+async def test_manual_window_falls_back_to_last_24h_for_latest_as_of(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """as_of=latest and no thread start readable (no DB in unit tests): the
+    window is the past 24 hours — a note from an hour ago counts, one from 25
+    hours ago does not."""
+    params = {"ticker": "META", "quarter": "FY26Q3", "as_of": "latest"}
+    draft = "drafts/latest-preview-FY26Q3.md"
+    files = {
+        draft: "# 前瞻\n" + "判断" * 300,
+        f"{draft}.audit.md": _sidecar_for("# 前瞻\n" + "判断" * 300),
+        f"{draft}.language.json": _language_json("# 前瞻\n" + "判断" * 300),
+        "research/latest-preview-FY26Q3/predictions.json": json.dumps(
+            {"predictions": [{"id": "P1", "metric": "revenue"}] * 3}
+        ),
+        "research/notes/fresh.md": "一小时前的笔记" * 50,
+        "research/notes/old.md": "25 小时前的笔记" * 50,
+    }
+    _patch_knowledge(monkeypatch, ["drivers", "debate"])
+    _patch_verdicts(monkeypatch, [_verdict_row("NO_CHANGE", trigger_kind="earnings")])
+
+    now = int(time.time())
+    result = await run_check_done(
+        workflow="dalton-earnings-preview",
+        params=params,
+        backend=_make_backend(
+            files,
+            mtimes={
+                "research/notes/fresh.md": now - 3600,
+                "research/notes/old.md": now - 25 * 3600,
+            },
+        ),
+        workspace_id=WS,
+        thread_id="short-1",
+    )
+    assert not result["done"]
+    assert any("fresh.md.language.json" in m for m in result["missing"])
+    assert not any("old.md" in m for m in result["missing"])
+
+
+@pytest.mark.asyncio
+async def test_language_review_disjunct_ignores_neighbour_unfinished_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 2 recorded the review-pass hash and the draft changed after it:
+    the language check reconciles against the same-name run's journal
+    directly. A neighbouring (other-workflow, unfinished) run must not turn
+    that lookup into 无法核对 — that neighbour may still cost the REVIEW
+    check its own missing entry, which is that check's rule."""
+    files = _full_files()
+    # An unfinished run of ANOTHER workflow on the same thread.
+    files[".agents/threads/short-1/workflows/task-crashed/workflow.js"] = "// full-coverage"
+    # The draft changed after the review pass: current != review sha.
+    review_sha = _draft_hash(files[DRAFT])
+    files[DRAFT] = files[DRAFT] + "\n事后改动。\n"
+    doc = json.loads(files[f"{DRAFT}.language.json"])
+    doc["rounds"][1]["draft_sha256"] = review_sha
+    files[f"{DRAFT}.language.json"] = json.dumps(doc, ensure_ascii=False)
+    _patch_knowledge(monkeypatch, IC_DOCS)
+    _patch_verdicts(monkeypatch, [_verdict_row("NEW_THESIS")])
+
+    result = await run_check_done(
+        workflow="initial-coverage",
+        params=PARAMS,
+        backend=_make_backend(files),
+        workspace_id=WS,
+        thread_id="short-1",
+    )
+    assert not result["done"]
+    # The review check's own unfinished-run refusal stands (its rule, not
+    # the language check's); the language check itself adds no gap.
+    assert any("未结束的 workflow run" in m for m in result["missing"])
+    assert not any("语言审查" in m or "language.json" in m for m in result["missing"])

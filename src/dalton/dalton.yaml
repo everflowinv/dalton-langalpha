@@ -67,6 +67,9 @@ publish:
   # coverage draft (27 batches): argon-medium 139s with no failed batch and the
   # best agreement with the other two; the OpenClaw-relayed 3.8 flash failed 24.
   audit_model: "gemini-4-argon-medium-oauth"
+  # Language review (check_language). Empty = fall back to audit_model above, so
+  # the effective default stays argon-medium without repeating the key here.
+  language_model: ""
   audit_fallback_models:
     - "gpt-6.1-sol-oauth"
     - "claude-opus-5-5-oauth"

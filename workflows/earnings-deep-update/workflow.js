@@ -124,6 +124,22 @@ if (args.model_path && report !== null) {
   }
   modelFile = updated.path
 }
+// 第 1 轮语言审查：八节点评写完之后、校准与第一次独立审稿之前（改稿会换哈希，必须先改再送审）。
+const reportPath = `${W}/drafts/${D}-deep-${Q}.md`
+phase('语言审查')
+const reportSha0 = report === null ? null : shaOf(report)
+const lang1 =
+  reportSha0 === null
+    ? null
+    : await agent(
+        `对 ${reportPath} 做第 1 轮语言审查：调用工具 check_language(draft_path="${reportPath}", round=1)（只标问题），读 ${reportPath}.language.md 清单，按清单逐条修改 ${reportPath}（只改语言表达，不动事实、数字、术语、引用编号与判断强度；工具报错就不改稿并在 summary 里原样汇报错误）。改完返回 ${reportPath} 的 sha256。`,
+        { agentType: 'general-purpose', label: '语言审查 1', phase: '语言审查', schema: DRAFT_OUT }
+      )
+const lang1Sha = lang1 === null ? null : shaOf(lang1)
+const lang1Failed = reportSha0 !== null && lang1Sha === null
+const reportSha = lang1Sha || reportSha0
+const reportOk = report !== null && reportSha !== null
+
 phase('校准与对账')
 const calib =
   report === null
@@ -144,19 +160,16 @@ const calib =
       )
 
 phase('审稿')
-const reportSha = report === null ? null : shaOf(report)
-const reportOk = report !== null && reportSha !== null
 const review =
   calib === null
     ? null
     : await agent(
-        `审阅 ${W}/drafts/${D}-deep-${Q}.md（被审草稿 sha256：${
+        `审阅 ${reportPath}（被审草稿 sha256：${
           reportSha || '未知'
         }）及 ${R}/ 下的对账与校准文件${modelFile ? `、最终模型 ${modelFile}` : ''}（只读不改任何文件）。重点：beat/miss 口径；“综合判断”是否有判断；thesis 信号是否被价格走势替代；对账是否回避了错判。按 dalton-reviewer 规范输出 JSON（verdict ∈ pass/revise/block；draft_sha256 填提示词里的被审草稿 sha256 原值）。`,
         { agentType: 'dalton-reviewer', label: '审稿', phase: '审稿', schema: VERDICT }
       )
 
-const reportPath = `${W}/drafts/${D}-deep-${Q}.md`
 const incomplete = []
 let finalReview = review
 let rounds = 0
@@ -249,7 +262,52 @@ while (finalReview && verdictOf(finalReview) === 'revise' && rounds < 2) {
   }
   finalReview = reReview
 }
-const reviewPassed = finalReview !== null && verdictOf(finalReview) === 'pass'
+let reviewPassed = finalReview !== null && verdictOf(finalReview) === 'pass'
+
+// 笔记两轮：一次写完、不再改的校准/对账笔记同样审两轮——第 1 轮审完按清单改，
+// 第 2 轮复核（改动过的文件再补一次 round=2 确认，绑定终态哈希）。
+const notesReview =
+  !reportOk || !reviewPassed
+    ? null
+    : await agent(
+        `对本次运行产出、给人读的 .md 笔记逐一做两轮语言审查（规则见 .agents/skills/dalton-language/SKILL.md，只标问题）。每个文件依次：1) 调用工具 check_language(draft_path="<文件>", round=1)，读 <文件>.language.md 清单并按清单修改（只改语言表达，不动事实、数字、术语、引用编号与判断强度；工具报错就不改稿并在 summary 里原样汇报错误）；2) 调用 check_language(draft_path="<文件>", round=2) 复核；若第 1 轮后改过稿，改完再调用一次 round=2 确认（记录追加在同一 json）。\n文件清单：\n- ${R}/reconcile.md\n- ${R}/thesis-calibration.md\n- ${R}/management-delta.md${
+          args.model_path ? `\n- ${R}/mapping.md\n- ${R}/model-delta.md` : ''
+        }\n清单之外本次运行写的其他给人读的 .md 一并同法处理；json/xlsx 等机器文件、bg_data/、data/、lenses_work/、model_dump/ 下的文件、知识层渲染文件与 .audit/.annotated/.language 侧车不审。返回处理过的文件列表与摘要。`,
+        { agentType: 'general-purpose', label: '笔记语言审查', phase: '审稿', schema: OUT }
+      )
+if (reportOk && reviewPassed && notesReview === null) {
+  incomplete.push('笔记语言审查失败（校准/对账笔记未完成两轮语言审查）')
+}
+
+// 第 2 轮语言审查：终稿内容定稿（审稿修订循环结束）之后、提交最后一次审稿之前。
+// 改了稿就再跑一次 round=2 复核，使最后一条第 2 轮记录绑定终稿哈希；哈希有变
+// 则终稿审稿重新绑定独立审稿哈希——语言修改不能让已有 pass 记录失效却无人重审。
+const preLang2Sha = currentSha
+const lang2 =
+  !reportOk || !reviewPassed
+    ? null
+    : await agent(
+        `对 ${reportPath} 做第 2 轮语言审查：调用工具 check_language(draft_path="${reportPath}", round=2)，读 ${reportPath}.language.md 清单，按清单逐条完成终稿语言修改（只改语言表达，不动事实、数字、术语、引用编号与判断强度；工具报错就不改稿并在 summary 里原样汇报错误）。若草稿有改动，再调用一次 check_language(draft_path="${reportPath}", round=2) 对终稿复核（记录追加在同一 json）。返回 ${reportPath} 最终 sha256。`,
+        { agentType: 'general-purpose', label: '语言审查 2', phase: '审稿', schema: DRAFT_OUT }
+      )
+const lang2Sha = lang2 === null ? null : shaOf(lang2)
+if (reportOk && reviewPassed && lang2Sha === null) {
+  incomplete.push('语言审查第 2 轮失败（结果或其 sha256 缺失/非法），未做终稿语言修改')
+  reviewPassed = false
+} else if (reportOk && reviewPassed && lang2Sha !== preLang2Sha) {
+  currentSha = lang2Sha
+  const finalCheck = await agent(
+    `终稿审稿（语言修改后）：审阅 ${reportPath}（被审草稿 sha256：${lang2Sha}）及 ${R}/ 下的对账与校准文件${modelFile ? `、最终模型 ${modelFile}` : ''}（只读不改任何文件）。重点：语言修改未动事实与数字，上一轮 must_fix 仍全部解决。按 dalton-reviewer 规范输出 JSON（verdict ∈ pass/revise/block；draft_sha256 填提示词里的被审草稿 sha256 原值）。`,
+    { agentType: 'dalton-reviewer', label: '终稿审稿', phase: '审稿', schema: VERDICT }
+  )
+  if (finalCheck === null) {
+    incomplete.push('终稿审稿失败')
+    reviewPassed = false
+  } else {
+    finalReview = finalCheck
+    reviewPassed = verdictOf(finalCheck) === 'pass'
+  }
+}
 
 // 循环结束后再确认一次：磁盘最大版本必须就是循环里最后确认的 modelPath。
 // 之后的知识草案、核验清单、返回值都只用 finalModel.path。
@@ -280,6 +338,7 @@ const kp = await agent(
 )
 
 if (!reportOk) incomplete.push('八节点评失败（草稿或其 sha256 缺失/非法）')
+if (lang1Failed) incomplete.push('语言审查第 1 轮失败（结果或其 sha256 缺失/非法），未按清单修改')
 if (args.model_path && model === null) incomplete.push('模型更新失败（须人工跟进）')
 if (calib === null && reportOk) incomplete.push('校准与对账失败')
 if (review === null && calib !== null) incomplete.push('审稿失败')
@@ -289,13 +348,19 @@ if (kp === null) incomplete.push('知识层修订草案失败')
 phase('产物核验')
 const deliverables = [
   `${W}/drafts/${D}-deep-${Q}.md`,
+  `${W}/drafts/${D}-deep-${Q}.md.language.json`,
   `${R}/reconcile.md`,
+  `${R}/reconcile.md.language.json`,
   `${R}/reconcile.json`,
   `${R}/thesis-calibration.md`,
+  `${R}/thesis-calibration.md.language.json`,
   `${R}/management-delta.md`,
+  `${R}/management-delta.md.language.json`,
   `${R}/knowledge-revision.json`,
 ]
-if (args.model_path) deliverables.push(`${R}/mapping.md`, `${R}/model-delta.md`)
+if (args.model_path) {
+  deliverables.push(`${R}/mapping.md`, `${R}/mapping.md.language.json`, `${R}/model-delta.md`, `${R}/model-delta.md.language.json`)
+}
 if (finalModel) deliverables.push(finalModel.path)
 const check =
   !reportOk
@@ -330,6 +395,7 @@ return {
   reconcile: calib && `${R}/reconcile.md`,
   review_done: finalReview !== null,
   review_verdict: finalReview && verdictOf(finalReview),
+  language_done: reportOk && lang1Sha !== null && lang2Sha !== null,
   revise_rounds: rounds,
   knowledge_revision: kp && `${R}/knowledge-revision.json`,
   incomplete,

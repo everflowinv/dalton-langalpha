@@ -1,4 +1,4 @@
-"""Direct LangChain tools for Dalton publication governance: check_draft and publish_report (PK.9, PK.11)."""
+"""Direct LangChain tools for Dalton publication governance: check_draft, check_language and publish_report (PK.9, PK.11)."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool, tool
 
 from src.dalton.database.publications import resolve_thread_author_model
+from src.dalton.publish.language import run_check_language
 from src.dalton.publish.service import run_check_draft, run_publish
 from src.dalton.tools.knowledge_tools import (
     _extract_run_identity,
@@ -29,7 +30,7 @@ PublishKindLiteral = Literal[
 
 
 def create_publish_tools(filesystem_backend: Any = None) -> list[BaseTool]:
-    """Build ``[check_draft, publish_report]`` bound to ``filesystem_backend``."""
+    """Build ``[check_draft, check_language, publish_report]`` bound to ``filesystem_backend``."""
 
     @tool("check_draft")
     async def _check_draft(
@@ -53,6 +54,32 @@ def create_publish_tools(filesystem_backend: Any = None) -> list[BaseTool]:
             facts_path=facts_path,
             backend=filesystem_backend,
             use_llm_judge=True,
+            user_id=user_id,
+            thread_id=thread_id,
+        )
+        return str(res["message"])
+
+    @tool("check_language")
+    async def _check_language(
+        draft_path: str,
+        round: int,
+        *,
+        config: RunnableConfig,
+        tool_call_id: Annotated[str, InjectedToolCallId] = "",
+    ) -> str:
+        """审查正式产物草稿的语言问题，只标问题、不改稿，逐条给原句引用与修改方向。
+
+        审查对象是给人读的 .md 正式产物（drafts/、research/ 下的笔记与草稿）；json/xlsx 等机器文件、bg_data/、data/、lenses_work/、model_dump/ 下的抓取原文、知识层渲染文件（thesis.md 等）、research/topics/conversations/ 机器纪要、published/ 归档稿（其审查以对应草稿为准）与 .audit/.annotated/.language 侧车不审。round=1 在初稿写完、第一次独立审稿之前；round=2 在内容定稿后（一次写完的笔记即第 1 轮改完后），且要求已做过第 1 轮。每条 issue 的 quote 逐字摘自草稿，找不到的会被丢弃并计数。审查模型在 设置 → 模型 → 高级 → 语言审查 配置。改稿由你按清单自己做；本工具失败（模型不可用、超时）时不写侧车、不算通过。
+        Returns: 一行摘要：轮次、问题数、丢弃的引用数与清单路径 <draft>.language.md。
+        """
+        user_id, workspace_id, thread_id, _ = _extract_run_identity(config)
+        if not user_id or not workspace_id:
+            return "ERROR: user_id and workspace_id are required in RunnableConfig."
+        res = await run_check_language(
+            workspace_id=workspace_id,
+            draft_path=draft_path,
+            round=round,
+            backend=filesystem_backend,
             user_id=user_id,
             thread_id=thread_id,
         )
@@ -114,7 +141,7 @@ def create_publish_tools(filesystem_backend: Any = None) -> list[BaseTool]:
         )
         return str(res["message"])
 
-    return [_check_draft, _publish_report]
+    return [_check_draft, _check_language, _publish_report]
 
 
 def publish_tools(filesystem_backend: Any = None) -> list[BaseTool]:
@@ -124,4 +151,5 @@ def publish_tools(filesystem_backend: Any = None) -> list[BaseTool]:
 
 _DEFAULT_PUBLISH_TOOLS = create_publish_tools(None)
 check_draft = _DEFAULT_PUBLISH_TOOLS[0]
-publish_report = _DEFAULT_PUBLISH_TOOLS[1]
+check_language = _DEFAULT_PUBLISH_TOOLS[1]
+publish_report = _DEFAULT_PUBLISH_TOOLS[2]

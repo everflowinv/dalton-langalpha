@@ -325,6 +325,26 @@
             }
           }
         },
+        "language_review": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "draft"
+          ],
+          "properties": {
+            "draft": {
+              "type": "string",
+              "minLength": 1,
+              "description": "终稿路径模板；核对 <draft>.language.json。"
+            },
+            "required": {
+              "type": "boolean",
+              "default": true,
+              "description": "false 时缺项只记 warning。"
+            }
+          },
+          "description": "语言审查：终稿的 <draft>.language.json 存在且含第 1、2 轮记录，最后一条第 2 轮的 draft_sha256 与最后一次独立审稿通过时的哈希一致或与当前终稿一致；读不到、缺轮次或哈希对不上记 missing。契约同时声明 gated_draft 且其草稿不存在（门禁未过分支）时跳过本检查。"
+        },
         "knowledge_docs_requires_param": {
           "type": "object",
           "additionalProperties": {

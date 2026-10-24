@@ -19,6 +19,7 @@ interface SystemDefaults {
   prompt_guidance?: string | null;
   // DALTON-HOOK(settings-section): Dalton model defaults returned by GET /api/v1/models
   dalton_audit_model?: string;
+  dalton_language_model?: string;
   dalton_audit_fallback_models?: string[];
   dalton_audit_timeout_s?: number;
   dalton_assist_model?: string;
