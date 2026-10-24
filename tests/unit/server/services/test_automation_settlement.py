@@ -74,6 +74,9 @@ EXPECTED = {
     Outcome.INTERRUPTED: ("failed", ("pending", "running"), None, REARMS, "automation.failed", None, "interrupted", "interrupted"),
     Outcome.STOPPED: ("skipped", ("running",), None, CLOSES, "automation.failed", "user", None, "stopped"),
     Outcome.SKIPPED: ("skipped", ("waiting",), None, CLOSES, None, None, None, "skipped"),
+    # DALTON-HOOK(precheck-outcome): zero-token preflight skip settles from
+    # pending, no strike, no webhook, and counts as the schedule's run.
+    Outcome.PRECHECK_SKIPPED: ("skipped", ("pending",), None, CLOSES, None, None, None, "precheck_skipped"),
 }
 
 

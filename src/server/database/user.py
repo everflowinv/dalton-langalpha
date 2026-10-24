@@ -21,6 +21,16 @@ from src.dalton.credentials import credential_user_id  # DALTON-HOOK(team-creden
 
 logger = logging.getLogger(__name__)
 
+# DALTON-HOOK(user-defaults): where a user created without a timezone lands,
+# and the one approval a fresh account already carries. Written on the INSERT
+# only, so an existing row is never revisited by a later upsert.
+DEFAULT_USER_TIMEZONE = "Asia/Hong_Kong"
+DEFAULT_OTHER_PREFERENCE = {"auto_approve_handoffs": True}
+# The timezone slot of ``create_user_from_auth``'s statement: the INSERT falls
+# back to the default, the conflict-update refreshes with the raw value only.
+_TZ_INSERT = "COALESCE(NULLIF(%s, ''), %s)"
+_TZ_REFRESH = "COALESCE(NULLIF(%s, ''), users.timezone)"
+
 # Computed columns appended to user SELECT queries for gate logic.
 def _gate_cols(alias: str = "users") -> str:
     """Return the has_api_key + has_oauth_token EXISTS subqueries for a given table alias."""
@@ -75,6 +85,10 @@ async def create_user(
                 raise ValueError(f"User {user_id} already exists")
 
             # Insert new user
+            # DALTON-HOOK(user-defaults): a first account without a timezone
+            # lands in the home office zone; the login flow's browser timezone
+            # arrives non-empty and is kept as-is.
+            timezone = (timezone or "").strip() or DEFAULT_USER_TIMEZONE
             cred_user_id = credential_user_id(user_id)  # DALTON-HOOK(team-credentials): resolve credential status from holder only
             if cred_user_id != user_id:
                 await cur.execute("""
@@ -113,11 +127,14 @@ async def create_user(
 
             # Ensure a preferences row exists so the user can configure
             # models/BYOK without completing onboarding first.
+            # DALTON-HOOK(user-defaults): seed the defaults a new account
+            # starts with; DO NOTHING leaves an existing row's explicit
+            # choices (including a later false) standing.
             await cur.execute("""
-                INSERT INTO user_preferences (user_preference_id, user_id, created_at, updated_at)
-                VALUES (gen_random_uuid(), %s, NOW(), NOW())
+                INSERT INTO user_preferences (user_preference_id, user_id, other_preference, created_at, updated_at)
+                VALUES (gen_random_uuid(), %s, %s::jsonb, NOW(), NOW())
                 ON CONFLICT (user_id) DO NOTHING
-            """, (user_id,))
+            """, (user_id, Json(DEFAULT_OTHER_PREFERENCE)))
 
             logger.info(f"[user_db] create_user user_id={user_id}")
             return dict(result)
@@ -186,70 +203,100 @@ async def create_user_from_auth(
     ``timezone``, and ``locale`` are only written when the existing value
     is NULL (lazy backfill on next login).
     """
+    # DALTON-HOOK(user-defaults): the timezone default feeds the INSERT only —
+    # the conflict-update keeps reading the raw value, so a login never writes
+    # the default over an existing row, not even one still holding NULL.
+    timezone = (timezone or "").strip() or None
     cred_user_id = credential_user_id(user_id)  # DALTON-HOOK(team-credentials): resolve credential status from holder only
     async with get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
-            if cred_user_id != user_id:
-                await cur.execute("""
-                    INSERT INTO users (
-                        user_id, email, name, avatar_url, auth_provider,
-                        timezone, locale,
-                        onboarding_completed, created_at, updated_at
-                    )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, FALSE, NOW(), NOW())
-                    ON CONFLICT (user_id) DO UPDATE
-                    SET
-                        email = COALESCE(EXCLUDED.email, users.email),
-                        name = COALESCE(EXCLUDED.name, users.name),
-                        avatar_url = COALESCE(EXCLUDED.avatar_url, users.avatar_url),
-                        auth_provider = COALESCE(users.auth_provider, EXCLUDED.auth_provider),
-                        timezone = COALESCE(EXCLUDED.timezone, users.timezone),
-                        locale = COALESCE(EXCLUDED.locale, users.locale),
-                        updated_at = NOW()
-                    RETURNING
-                        user_id, email, name, avatar_url, timezone, locale,
-                        onboarding_completed,
-                        COALESCE(personalization_completed, FALSE) AS personalization_completed,
-                        auth_provider,
-                        created_at, updated_at, last_login_at,
-                        """ + _HAS_API_KEY_CRED + """,
-                        """ + _HAS_OAUTH_CRED + """
-                """, (user_id, email, name, avatar_url, auth_provider, timezone, locale, cred_user_id, cred_user_id))
-            else:
-                await cur.execute("""
-                    INSERT INTO users (
-                        user_id, email, name, avatar_url, auth_provider,
-                        timezone, locale,
-                        onboarding_completed, created_at, updated_at
-                    )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, FALSE, NOW(), NOW())
-                    ON CONFLICT (user_id) DO UPDATE
-                    SET
-                        email = COALESCE(EXCLUDED.email, users.email),
-                        name = COALESCE(EXCLUDED.name, users.name),
-                        avatar_url = COALESCE(EXCLUDED.avatar_url, users.avatar_url),
-                        auth_provider = COALESCE(users.auth_provider, EXCLUDED.auth_provider),
-                        timezone = COALESCE(EXCLUDED.timezone, users.timezone),
-                        locale = COALESCE(EXCLUDED.locale, users.locale),
-                        updated_at = NOW()
-                    RETURNING
-                        user_id, email, name, avatar_url, timezone, locale,
-                        onboarding_completed,
-                        COALESCE(personalization_completed, FALSE) AS personalization_completed,
-                        auth_provider,
-                        created_at, updated_at, last_login_at,
-                        """ + _HAS_API_KEY + """,
-                        """ + _HAS_OAUTH + """
-                """, (user_id, email, name, avatar_url, auth_provider, timezone, locale))
-            result = await cur.fetchone()
+            # DALTON-HOOK(user-defaults): the user row and its seeded
+            # preference commit together, and the seed merges rather than
+            # yields. Each statement commits on its own otherwise, so on
+            # concurrent first logins the request that loses the insert race
+            # may write its blank preference row first; the winner — the only
+            # one whose upsert inserted (xmax = 0) — must still land the
+            # default, while a user who already existed keeps every explicit
+            # value: the conflict update fires only for a fresh insert.
+            async with conn.transaction():
+                if cred_user_id != user_id:
+                    await cur.execute("""
+                        INSERT INTO users (
+                            user_id, email, name, avatar_url, auth_provider,
+                            timezone, locale,
+                            onboarding_completed, created_at, updated_at
+                        )
+                        VALUES (%s, %s, %s, %s, %s, """ + _TZ_INSERT + """, %s, FALSE, NOW(), NOW())
+                        ON CONFLICT (user_id) DO UPDATE
+                        SET
+                            email = COALESCE(EXCLUDED.email, users.email),
+                            name = COALESCE(EXCLUDED.name, users.name),
+                            avatar_url = COALESCE(EXCLUDED.avatar_url, users.avatar_url),
+                            auth_provider = COALESCE(users.auth_provider, EXCLUDED.auth_provider),
+                            timezone = """ + _TZ_REFRESH + """,
+                            locale = COALESCE(EXCLUDED.locale, users.locale),
+                            updated_at = NOW()
+                        RETURNING
+                            user_id, email, name, avatar_url, timezone, locale,
+                            onboarding_completed,
+                            COALESCE(personalization_completed, FALSE) AS personalization_completed,
+                            auth_provider,
+                            created_at, updated_at, last_login_at,
+                            (xmax = 0) AS inserted_now,
+                            """ + _HAS_API_KEY_CRED + """,
+                            """ + _HAS_OAUTH_CRED + """
+                    """, (user_id, email, name, avatar_url, auth_provider, timezone, DEFAULT_USER_TIMEZONE, locale, timezone, cred_user_id, cred_user_id))
+                else:
+                    await cur.execute("""
+                        INSERT INTO users (
+                            user_id, email, name, avatar_url, auth_provider,
+                            timezone, locale,
+                            onboarding_completed, created_at, updated_at
+                        )
+                        VALUES (%s, %s, %s, %s, %s, """ + _TZ_INSERT + """, %s, FALSE, NOW(), NOW())
+                        ON CONFLICT (user_id) DO UPDATE
+                        SET
+                            email = COALESCE(EXCLUDED.email, users.email),
+                            name = COALESCE(EXCLUDED.name, users.name),
+                            avatar_url = COALESCE(EXCLUDED.avatar_url, users.avatar_url),
+                            auth_provider = COALESCE(users.auth_provider, EXCLUDED.auth_provider),
+                            timezone = """ + _TZ_REFRESH + """,
+                            locale = COALESCE(EXCLUDED.locale, users.locale),
+                            updated_at = NOW()
+                        RETURNING
+                            user_id, email, name, avatar_url, timezone, locale,
+                            onboarding_completed,
+                            COALESCE(personalization_completed, FALSE) AS personalization_completed,
+                            auth_provider,
+                            created_at, updated_at, last_login_at,
+                            (xmax = 0) AS inserted_now,
+                            """ + _HAS_API_KEY + """,
+                            """ + _HAS_OAUTH + """
+                    """, (user_id, email, name, avatar_url, auth_provider, timezone, DEFAULT_USER_TIMEZONE, locale, timezone))
+                result = await cur.fetchone()
 
-            # Ensure a preferences row exists so the user can configure
-            # models/BYOK without completing onboarding first.
-            await cur.execute("""
-                INSERT INTO user_preferences (user_preference_id, user_id, created_at, updated_at)
-                VALUES (gen_random_uuid(), %s, NOW(), NOW())
-                ON CONFLICT (user_id) DO NOTHING
-            """, (user_id,))
+                # Ensure a preferences row exists so the user can configure
+                # models/BYOK without completing onboarding first. The merge
+                # only runs for a row this call inserted; a losing racer's
+                # blank row gets the default folded in, an existing user's
+                # explicit values stay theirs.
+                inserted_now = bool(result.get("inserted_now"))
+                await cur.execute("""
+                    INSERT INTO user_preferences (
+                        user_preference_id, user_id, other_preference, created_at, updated_at
+                    )
+                    VALUES (gen_random_uuid(), %s, %s::jsonb, NOW(), NOW())
+                    ON CONFLICT (user_id) DO UPDATE
+                    SET other_preference =
+                            COALESCE(user_preferences.other_preference, '{}'::jsonb) || %s::jsonb,
+                        updated_at = NOW()
+                    WHERE %s
+                """, (
+                    user_id,
+                    Json(DEFAULT_OTHER_PREFERENCE if inserted_now else {}),
+                    Json(DEFAULT_OTHER_PREFERENCE),
+                    inserted_now,
+                ))
 
             logger.info(f"[user_db] create_user_from_auth user_id={user_id}")
             return dict(result)

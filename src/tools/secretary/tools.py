@@ -12,6 +12,8 @@ from langgraph.types import Command
 
 from ptc_agent.agent.limits import pending_read
 from src.server.contracts.status import is_live
+# DALTON-HOOK(workspace-duplicate-guard): the duplicate read behind the create card
+from src.tools.secretary.approvals import duplicate_workspace
 from src.tools.secretary._commands import (
     decline_command,
     decline_routing_command,
@@ -97,6 +99,10 @@ async def workspaces_list(user_id: str, tool_call_id: str) -> Command:
     )
 
 
+# DALTON-HOOK(workspace-duplicate-guard): a create that would duplicate a
+# workspace the user already holds never rides the standing approval — the
+# middleware withholds it when the model proposes the call, and the duplicate
+# is named on the card, so the user can just reuse it.
 async def workspaces_create(
     user_id: str,
     name: str | None,
@@ -104,22 +110,42 @@ async def workspaces_create(
     tool_call_id: str,
     preapproved: bool = False,
 ) -> Command:
-    """Create a new workspace, once the user confirms unless ``preapproved``."""
+    """Create a new workspace, once the user confirms unless ``preapproved``.
+
+    ``preapproved`` is the record frozen when the model proposed the call, so
+    on resume the user's answer to the card is what runs. The duplicate read
+    below only writes the card's copy: whether to ask was already decided.
+    """
     if not name:
         return error_command(
             "name is required for create action", tool_call_id
         )
 
     if not preapproved:
-        approved, response = hitl_confirm(
-            "create_workspace",
-            {"workspace_name": name, "workspace_description": description or ""},
-        )
+        holder, confirmed = await duplicate_workspace(user_id, name)
+        payload = {
+            "workspace_name": name,
+            "workspace_description": description or "",
+        }
+        if holder is not None:
+            payload["duplicate_workspace_name"] = holder.get("name")
+            payload["duplicate_workspace_id"] = str(holder.get("workspace_id"))
+        elif not confirmed:
+            payload["duplicate_check_unavailable"] = True
+        approved, response = hitl_confirm("create_workspace", payload)
 
         if not approved:
-            return decline_routing_command(
-                "workspace creation", response, tool_call_id
-            )
+            # DALTON-HOOK(workspace-duplicate-guard): the decline names the
+            # workspace to reuse instead.
+            declined = "workspace creation"
+            if holder is not None:
+                declined = (
+                    "workspace creation — they already have "
+                    f"\"{holder.get('name')}\" (workspace_id "
+                    f"{holder.get('workspace_id')}); use that workspace "
+                    "instead of creating a duplicate"
+                )
+            return decline_routing_command(declined, response, tool_call_id)
 
     from src.server.database.workspace_names import (
         WorkspaceNameInvalid,

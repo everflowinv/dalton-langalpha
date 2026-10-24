@@ -164,7 +164,7 @@ async def sync_user(
     # 3. Brand-new user. `locale` is left NULL — only set when the user
     # explicitly picks a language in Settings. The frontend detector handles
     # browser-locale and English-fallback at render time.
-    user = await create_user_from_auth(
+    await create_user_from_auth(
         user_id=user_id,
         email=sync_email,
         name=body.name,
@@ -173,8 +173,17 @@ async def sync_user(
         timezone=body.timezone,
         locale=None,
     )
-    user_resp = UserResponse.model_validate(user)
-    return UserWithPreferencesResponse(user=user_resp, preferences=None)
+    # DALTON-HOOK(user-defaults): return the seeded preferences row (the
+    # hand-off default) instead of None, so the client's first sync does not
+    # cache "no preferences" over it.
+    result = await get_user_with_preferences(user_id)
+    if not result:
+        raise_not_found("User")
+    user_resp = UserResponse.model_validate(result["user"])
+    pref_resp = None
+    if result.get("preferences"):
+        pref_resp = UserPreferencesResponse.model_validate(result["preferences"])
+    return UserWithPreferencesResponse(user=user_resp, preferences=pref_resp)
 
 
 # ==================== User CRUD ====================

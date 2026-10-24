@@ -176,8 +176,10 @@ function SupabaseAuthProvider({ children }: { children: React.ReactNode }) {
           // access_tier, and seeding would overwrite the correct value
           // from the GET /users/me fetch already in-flight (triggered
           // by invalidateQueries in the getSession() handler).
-          if (data.preferences !== undefined) {
-            queryClient.setQueryData(queryKeys.user.preferences(), data.preferences ?? null);
+          // DALTON-HOOK(user-defaults): null means "no row reported", not
+          // "no preferences" — seeding it would blank what the cache holds.
+          if (data.preferences != null) {
+            queryClient.setQueryData(queryKeys.user.preferences(), data.preferences);
           }
         }
       } catch (err) {

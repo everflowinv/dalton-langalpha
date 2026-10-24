@@ -1979,7 +1979,9 @@
       "created": "Workspace created: {{name}}",
       "declined": "Workspace creation declined",
       "alwaysApprove": "Always allow",
-      "alwaysApproveHint": "Create this and later workspaces without asking. Turn it off in Settings."
+      "alwaysApproveHint": "Create this and later workspaces without asking. Turn it off in Settings.",
+      "duplicateExists": "You already have a similar workspace: {{duplicate}}. You can use it instead of creating a duplicate.",
+      "duplicateUnknown": "Could not confirm whether you already have a workspace with this name or ticker."
     }
   },
   "context": {

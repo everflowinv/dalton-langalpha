@@ -366,6 +366,10 @@ export interface WorkspaceProposalState {
   question?: string;
   workspace_name?: string;
   workspace_description?: string;
+  // DALTON-HOOK(workspace-duplicate-guard): the existing workspace this create would duplicate
+  duplicate_workspace_id?: string;
+  duplicate_workspace_name?: string;
+  duplicate_check_unavailable?: boolean;
   interruptId?: string;
 }
 

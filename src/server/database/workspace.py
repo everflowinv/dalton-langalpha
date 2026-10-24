@@ -393,6 +393,25 @@ async def get_workspace_name_keys(user_id: str) -> set[str]:
         return {row["name_key"] for row in await cur.fetchall()}
 
 
+# DALTON-HOOK(workspace-duplicate-guard): names of every live workspace, for the
+# agent-side check that turns a duplicate create into an ask.
+async def get_live_workspace_names(user_id: str) -> List[Dict[str, Any]]:
+    """``(workspace_id, name)`` of every live workspace the user holds.
+
+    The same fence as the name-key lookups, so what counts as a duplicate
+    here is exactly what would collide there.
+    """
+    async with _ws_cursor() as cur:
+        await cur.execute(
+            f"""
+            SELECT workspace_id, name FROM workspaces
+            WHERE user_id = %s AND {FENCE_LIVE_WORKSPACE}
+            """,
+            (user_id,),
+        )
+        return [dict(row) for row in await cur.fetchall()]
+
+
 class WorkspaceDirNameTaken(Exception):
     """Only the caller can choose a replacement dir_name because it knows why that name was picked."""
 
