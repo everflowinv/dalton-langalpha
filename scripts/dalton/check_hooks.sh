@@ -93,6 +93,7 @@ ALLOWED_HOOKS=(
   "bridge-admin-token"
   "hide-trading"
   "dalton-notify"
+  "glob-brace-expansion"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

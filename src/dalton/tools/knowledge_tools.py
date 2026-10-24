@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Annotated, Any, Literal
 
@@ -178,6 +179,7 @@ def create_knowledge_tools(filesystem_backend: Any = None) -> list[BaseTool]:
         reason: str,
         base_version: int | None = None,
         evidence_refs: list[dict[str, Any]] | None = None,
+        dry_run: bool = False,
         *,
         config: RunnableConfig,
         tool_call_id: Annotated[str, InjectedToolCallId] = "",
@@ -187,15 +189,17 @@ def create_knowledge_tools(filesystem_backend: Any = None) -> list[BaseTool]:
         Read data/<doc>.json first and pass its version as base_version (null only to create the document).
         Ops address list items by id, e.g. {"op":"append","path":"/evidence","value":{...}},
         {"op":"set","path":"/pillars/P2/status","value":"watch"}. reason says why, in one or two sentences.
+        Pass dry_run=True to validate a draft and preview the diff and expected schema structure without saving a DB version or rendering files; once dry_run passes, submit with dry_run=False.
         On validation failure, the returned message includes the expected schema structure (失败时返回的信息里带有期望结构，照着补齐再提交).
-        Returns: the new version and the rendered file, or the list of problems to fix.
+        Returns: the new version and the rendered file (or dry-run preview/diff), or the list of problems to fix.
         """
         user_id, workspace_id, thread_id, run_id = _extract_run_identity(config)
         if not user_id or not workspace_id:
             return "ERROR: user_id and workspace_id are required in RunnableConfig."
 
         await verify_workspace_access(workspace_id, user_id)
-        await _maybe_reconcile(workspace_id, user_id)
+        if not dry_run:
+            await _maybe_reconcile(workspace_id, user_id)
         res = await apply_update(
             user_id=user_id,
             workspace_id=workspace_id,
@@ -209,8 +213,26 @@ def create_knowledge_tools(filesystem_backend: Any = None) -> list[BaseTool]:
             thread_id=thread_id,
             run_id=run_id,
             tool_call_id=tool_call_id or None,
+            dry_run=dry_run,
         )
-        return str(res["message"])
+        msg = str(res["message"])
+        if dry_run:
+            parts = [msg]
+            diff_val = res.get("diff")
+            if diff_val is not None:
+                diff_json = json.dumps(diff_val, ensure_ascii=False, indent=2)
+                parts.append(f"Diff (before/after):\n```json\n{diff_json}\n```")
+            preview_doc = res.get("preview_doc")
+            if preview_doc is not None:
+                preview_json = json.dumps(preview_doc, ensure_ascii=False, indent=2)
+                total_len = len(preview_json)
+                if total_len > 8000:
+                    preview_json = (
+                        f"{preview_json[:8000]}\n... (truncated at 8000 chars, total {total_len} chars)"
+                    )
+                parts.append(f"Preview document (preview_doc):\n```json\n{preview_json}\n```")
+            return "\n\n".join(parts)
+        return msg
 
     @tool("knowledge_append_verdict")
     async def _knowledge_append_verdict(

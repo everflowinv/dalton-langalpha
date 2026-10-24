@@ -8,17 +8,40 @@ from uuid import UUID
 
 from psycopg.rows import dict_row
 
+from src.dalton.autonomy.tracking import (
+    _extract_ticker_from_text,
+    _resolve_workspace_ticker,
+)
 from src.server.database.pool import get_db_connection
 from src.server.utils.pg_sanitize import SafeJson, strip_pg_nul_str
 
 logger = logging.getLogger(__name__)
 
 _KV_COLS = """
-    knowledge_version_id, user_id, workspace_id, doc_key, version_no, source,
+    knowledge_version_id, user_id, workspace_id, ticker, doc_key, version_no, source,
     content, content_sha256, ops, reason, evidence_refs, warnings,
     schema_valid, edited_path, conversation_thread_id, run_id, tool_call_id,
     files_written_at, created_at
 """
+
+
+async def _resolve_version_ticker(
+    workspace_id: str | None,
+    content: dict[str, Any] | None = None,
+    ticker: str | None = None,
+) -> str | None:
+    """Resolve ticker from explicit arg, content.ticker, or workspace metadata."""
+    for candidate in (
+        ticker,
+        content.get("ticker") if isinstance(content, dict) else None,
+    ):
+        if isinstance(candidate, str) and candidate.strip():
+            extracted = _extract_ticker_from_text(candidate.strip())
+            return extracted or candidate.strip().upper()[:24]
+    try:
+        return await _resolve_workspace_ticker(workspace_id)
+    except Exception:
+        return None
 
 
 class VersionConflict(Exception):
@@ -108,6 +131,7 @@ async def insert_version(
     run_id: str | None = None,
     tool_call_id: str | None = None,
     enforce_base: bool = False,
+    ticker: str | None = None,
 ) -> dict[str, Any]:
     """Insert a new immutable version row under an advisory transaction lock.
 
@@ -116,6 +140,9 @@ async def insert_version(
     When ``source == 'import'`` and a version already exists, raises ``VersionConflict``.
     When ``source in ('direct_edit', 'publish', 'server')``, appends after the latest version.
     """
+    resolved_ticker = await _resolve_version_ticker(
+        workspace_id, content=content, ticker=ticker
+    )
     lock_key = f"dalton:kv:{workspace_id}:{doc_key}"
     async with get_db_connection() as conn, conn.transaction():
         async with conn.cursor(row_factory=dict_row) as cur:
@@ -143,6 +170,9 @@ async def insert_version(
                 if latest is not None:
                     raise VersionConflict(doc_key, base_version_no, latest)
 
+            if not resolved_ticker and latest and latest.get("ticker"):
+                resolved_ticker = str(latest["ticker"])
+
             next_no = (latest_no or 0) + 1
             await cur.execute(
                 f"""
@@ -150,12 +180,12 @@ async def insert_version(
                     user_id, workspace_id, doc_key, version_no, source,
                     content, content_sha256, ops, reason, evidence_refs,
                     warnings, schema_valid, edited_path,
-                    conversation_thread_id, run_id, tool_call_id
+                    conversation_thread_id, run_id, tool_call_id, ticker
                 ) VALUES (
                     %s, %s, %s, %s, %s,
                     %s, %s, %s, %s, %s,
                     %s, %s, %s,
-                    %s, %s, %s
+                    %s, %s, %s, %s
                 )
                 RETURNING {_KV_COLS}
                 """,
@@ -176,6 +206,7 @@ async def insert_version(
                     thread_id,
                     run_id,
                     strip_pg_nul_str(tool_call_id) if tool_call_id else None,
+                    strip_pg_nul_str(resolved_ticker) if resolved_ticker else None,
                 ),
             )
             row = await cur.fetchone()

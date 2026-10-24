@@ -9,15 +9,38 @@ from uuid import UUID
 
 from psycopg.rows import dict_row
 
+from src.dalton.autonomy.tracking import (
+    _extract_ticker_from_text,
+    _resolve_workspace_ticker,
+)
 from src.server.database.pool import get_db_connection
 from src.server.utils.pg_sanitize import SafeJson, strip_pg_nul_str
 
 _VERDICT_COLS = """
-    verdict_id, user_id, workspace_id, verdict_at, word,
+    verdict_id, user_id, workspace_id, ticker, verdict_at, word,
     trigger_kind, trigger_ref, progress, next_due, payload,
     conversation_thread_id, run_id, automation_execution_id,
     origin_type, created_at
 """
+
+
+async def _resolve_verdict_ticker(
+    workspace_id: str | None,
+    verdict: dict[str, Any] | None = None,
+    ticker: str | None = None,
+) -> str | None:
+    """Resolve ticker from explicit arg, verdict.ticker, or workspace metadata."""
+    for candidate in (
+        ticker,
+        verdict.get("ticker") if isinstance(verdict, dict) else None,
+    ):
+        if isinstance(candidate, str) and candidate.strip():
+            extracted = _extract_ticker_from_text(candidate.strip())
+            return extracted or candidate.strip().upper()[:24]
+    try:
+        return await _resolve_workspace_ticker(workspace_id)
+    except Exception:
+        return None
 
 
 def _serialize_row(row: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -93,12 +116,16 @@ async def insert_verdict(
     run_id: str | None = None,
     automation_execution_id: str | None = None,
     origin_type: str | None = None,
+    ticker: str | None = None,
 ) -> dict[str, Any]:
     """Assign a ``VD-YYYYMMDD-NN`` ID under an advisory lock and insert into ``dalton_verdicts``."""
     verdict_at = _now_utc().astimezone(timezone.utc)
     now_iso = verdict_at.isoformat().replace("+00:00", "Z")
     day_stamp = _day_str(verdict_at)
     lock_key = f"dalton:verdict:{day_stamp}"
+    resolved_ticker = await _resolve_verdict_ticker(
+        workspace_id, verdict=verdict, ticker=ticker
+    )
 
     trigger = verdict.get("trigger") or {}
     trigger_kind = str(trigger.get("kind") or "manual")
@@ -127,12 +154,12 @@ async def insert_verdict(
                     verdict_id, user_id, workspace_id, verdict_at, word,
                     trigger_kind, trigger_ref, progress, next_due, payload,
                     conversation_thread_id, run_id, automation_execution_id,
-                    origin_type
+                    origin_type, ticker
                 ) VALUES (
                     %s, %s, %s, %s, %s,
                     %s, %s, %s, %s, %s,
                     %s, %s, %s,
-                    %s
+                    %s, %s
                 )
                 RETURNING {_VERDICT_COLS}
                 """,
@@ -152,6 +179,7 @@ async def insert_verdict(
                     automation_execution_id
                     or trigger.get("automation_execution_id"),
                     strip_pg_nul_str(origin_type) if origin_type else None,
+                    strip_pg_nul_str(resolved_ticker) if resolved_ticker else None,
                 ),
             )
             row = await cur.fetchone()

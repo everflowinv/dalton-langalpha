@@ -912,7 +912,8 @@ class TestGlobInsideARoute:
             ("*/*.md", ["notes/q3.md"]),
             ("notes/*", ["notes/q3.md"]),
             ("n*", []),
-            ("*.{md,json}", []),
+            # DALTON-HOOK(glob-brace-expansion): *.{md,json} expands to *.md and *.json (which agent_glob_pattern turns into **/*.md and **/*.json)
+            ("*.{md,json}", ["memory.md", "notes/q3.md"]),
         ],
     )
     async def test_a_star_stays_within_one_name(self, files, nested, pattern, found):
@@ -2040,3 +2041,99 @@ class TestGrepFilterMatchesRgOnDisk:
                 differences[path] = (sorted(found - expected), sorted(expected - found))
 
         assert differences == {}
+
+
+# DALTON-HOOK(glob-brace-expansion): verify brace expansion across DiskGlob and sandbox find
+@pytest.mark.asyncio
+async def test_glob_brace_expansion_nested_and_commas(tmp_path):
+    import os
+    from ptc_agent.agent.backends.search_match import DiskGlob
+    from ptc_agent.core.sandbox.glob_runtime import expand_braces, find
+
+    assert expand_braces("**/{debate,thesis,drivers,agenda}.json") == [
+        "**/debate.json",
+        "**/thesis.json",
+        "**/drivers.json",
+        "**/agenda.json",
+    ]
+    assert expand_braces("data/{a,{b,c},}.json") == [
+        "data/a.json",
+        "data/b.json",
+        "data/c.json",
+        "data/.json",
+    ]
+    assert expand_braces("data/{[a,b],c}.json") == [
+        "data/[a,b].json",
+        "data/c.json",
+    ]
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    names = ["debate.json", "thesis.json", "drivers.json", "agenda.json", "company.json"]
+    for idx, name in enumerate(names, start=1):
+        p = data_dir / name
+        p.write_text("{}")
+        ts = 1_700_000_000 + idx * 10
+        os.utime(p, (ts, ts))
+
+    found = find(
+        "**/{debate,thesis,drivers,agenda,thesis,*s}.json",
+        str(tmp_path),
+        [],
+        {},
+        "/mnt/livefs",
+    )
+    assert found == [
+        str(data_dir / "agenda.json"),
+        str(data_dir / "drivers.json"),
+        str(data_dir / "thesis.json"),
+        str(data_dir / "debate.json"),
+    ]
+
+    dg = DiskGlob("**/{debate,thesis,drivers,agenda}.json", "/workspace")
+    assert dg.finds("/workspace/data/drivers.json") is True
+    assert dg.finds("/workspace/data/company.json") is False
+
+
+# DALTON-HOOK(glob-brace-expansion): parametrized parity test between sandbox aglob_files and DiskGlob
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "pattern",
+    [
+        "{*.json,notes/*.json}",
+        "{thesis.schema.json,unused/path.json}",
+        "**/{debate,thesis}.json",
+        "*.{md,json}",
+        "data/{a,b}.json",
+    ],
+)
+async def test_glob_sandbox_and_diskglob_parity(tmp_path, pattern):
+    from ptc_agent.agent.backends.search_match import DiskGlob, agent_glob_pattern
+    from ptc_agent.core.sandbox.glob_runtime import find
+
+    files = [
+        tmp_path / "root.json",
+        tmp_path / "readme.md",
+        tmp_path / "thesis.schema.json",
+        tmp_path / "notes" / "n1.json",
+        tmp_path / "notes" / "n2.md",
+        tmp_path / "sub" / "thesis.schema.json",
+        tmp_path / "data" / "debate.json",
+        tmp_path / "data" / "thesis.json",
+        tmp_path / "data" / "a.json",
+        tmp_path / "data" / "b.json",
+        tmp_path / "data" / "c.json",
+    ]
+    for f in files:
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text("{}")
+
+    sandbox_found = set(
+        find(agent_glob_pattern(pattern), str(tmp_path), [], {}, "/mnt/livefs")
+    )
+    dg = DiskGlob(pattern, str(tmp_path))
+    diskglob_found = {str(f) for f in files if dg.finds(str(f))}
+
+    assert sandbox_found == diskglob_found
+
+

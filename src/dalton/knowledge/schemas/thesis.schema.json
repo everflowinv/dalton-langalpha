@@ -15,7 +15,7 @@
                      "updated_at": {"$ref": "common#/$defs/isoTime"},
                      "figures": {"type": "array", "items": {"$ref": "common#/$defs/figure"}},
                      "evidence_refs": {"type": "array", "items": {"$ref": "common#/$defs/evidenceRef"}}}},
-    "pillars": {"type": "array", "minItems": 1, "maxItems": 7, "items": {"$ref": "#/$defs/pillar"}},
+    "pillars": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/pillar"}},
     "evidence": {"type": "array", "items": {"$ref": "#/$defs/evidence"}, "description": "证据台账，只追加；更正用 supersedes 新增一条"},
     "official": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/official"}], "description": "只能由 publish_report 写"}
   },
