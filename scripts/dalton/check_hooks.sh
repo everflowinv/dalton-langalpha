@@ -83,6 +83,7 @@ ALLOWED_HOOKS=(
   "workflow-resume"
   "workflow-journal"
   "subagent-model-pin"
+  "html-md-canonical"
   "hermetic-prebuilt-workflows"
   "market-data-fallback"
   "yfinance-cache"
