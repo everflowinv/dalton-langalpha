@@ -12,7 +12,7 @@
 | **`THESIS_BROKEN`** | **证伪** | 触发预设的硬性证伪条件（Falsifier / Kill Criteria），核心投资逻辑不复存在。立即启动零基审视、建议退出（`exit`）并写入复盘教训（`lessons.md`）。 |
 | **`NEW_THESIS`** | **新论点** | 公司发生重大业务转型、并购重组、新产品周期或管理层更迭，原有框架不再适用，需要新建 Thesis 支柱或 Debate。 |
 
-- **词形硬性规定**：在 JSON（如 `data/verdicts.jsonl`、`knowledge_append_verdict` 参数）与数据库中**一律使用Playbook正式词形**（`NO_CHANGE`、`THESIS_STRENGTHENED`、`THESIS_WEAKENED`、`THESIS_BROKEN`、`NEW_THESIS`），**严禁使用 `STRENGTHENED`、`WEAKENED`、`BROKEN` 等旧简写**；在渲染出的 Markdown 与用户界面中统一显示对应的**中文短标签**（无变化、强化、削弱、证伪、新论点）。
+- **词形硬性规定**：在 JSON（如 `knowledge_append_verdict` 参数）与数据库 `dalton_verdicts`（渲染为 `verdicts.md`）中**一律使用Playbook正式词形**（`NO_CHANGE`、`THESIS_STRENGTHENED`、`THESIS_WEAKENED`、`THESIS_BROKEN`、`NEW_THESIS`），**严禁使用 `STRENGTHENED`、`WEAKENED`、`BROKEN` 等旧简写**；在渲染出的 Markdown 与用户界面中统一显示对应的**中文短标签**（无变化、强化、削弱、证伪、新论点）。
 
 ---
 

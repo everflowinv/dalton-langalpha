@@ -383,9 +383,9 @@ def build_global_director_specs(
             "thread_strategy": "pinned",
             "instruction": (
                 "请按 `.agents/skills/dalton-research-director/SKILL.md` 执行每日晨会：\n"
-                "1. 调用 `dalton_coverage_board` 获取全覆盖公司状态与今日剩余额度；\n"
+                "1. 调用 `dalton_coverage_board` 获取全覆盖公司状态、候选任务评分（`candidates`）与今日剩余额度；\n"
                 "2. 对需要深挖或复盘的工作区通过 `delegate_to_analyst(question=..., workspace_id=..., report_back=True)` 派单；\n"
-                "3. 调用 `dalton_record_plan` 记录今日计划并刷新 `dalton/coverage.html`。"
+                "3. 调用 `dalton_record_plan` 记录今日计划（写入 `dalton/plans/<date>.md`），并将看板 JSON 写入 `dalton/board.json` 后运行 `python3 .agents/skills/dalton-research-director/scripts/render_coverage.py --in dalton/board.json --out dalton/coverage.html` 刷新 `dalton/coverage.html`。"
             ),
             "metadata": {
                 "dalton_managed": True,

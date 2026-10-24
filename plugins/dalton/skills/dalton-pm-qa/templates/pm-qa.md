@@ -26,7 +26,7 @@
 - **改判触发条件（What Would Change Our Mind）**：若在 `<YYYYQ# / 具体事件窗口>` 观察到 `<具体指标>` `<高于/低于>` `<量化阈值>`（来源：`<10-Q / 行业高频数据>`），我们将把判断从 `<当前立场>` 修正为 `<改判后立场>`。
 
 ### 5. 下一步
-- **知识层与议程动作**：<例如：仅引用既有 `thesis v13`，无新证据不记 verdict；或已调用 `knowledge_append_verdict(trigger="pm_question")` 并将“<待跟踪问题>”记入 `agenda.md`（`origin="pm"`）>。
+- **知识层与议程动作**：<例如：仅引用既有 `thesis v13`，无新证据不记 verdict；或已调用 `knowledge_append_verdict(verdict={"trigger": {"kind": "pm_question"}, ...})` 并将“<待跟踪问题>”记入 `agenda.md`（`origin="pm"`）>。
 - **后续深挖建议**（如适用）：<例如：建议启动 `/topic-research` 专项拆解 `<议题>`；或在 Home 已通过 `delegate_to_analyst` 交办 `<TICKER>` 分析师更新模型>。
 
 ---

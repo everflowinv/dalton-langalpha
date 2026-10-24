@@ -14,7 +14,7 @@ Shared research layer: .agents/skills/research-conventions/SKILL.md.
 
 - **本脚本只建骨架，不写 `data/*.json` 知识文档**：
   - 4 家存量迁移公司（`META`、`AMZN`、`GOOGL`、`MSFT`）的知识文档由 P1.4 经 PK.7 导入 API 创建；
-  - 新覆盖公司的知识文档（`data/{company,thesis,debate,drivers,management,lessons,agenda}.json`）由分析师在首次产出认知时调用 `knowledge_update(op="create", ...)` 创建，从而保证所有结构化文档均经过 Schema 校验与版本记录。
+  - 新覆盖公司的知识文档（`data/{company,thesis,debate,drivers,management,lessons,agenda}.json`）由分析师在首次产出认知时调用 `knowledge_update(doc="...", ops=[{"op": "create", "value": {...}}], reason="...", base_version=None)` 创建，从而保证所有结构化文档均经过 Schema 校验与版本记录。
 
 ## 2. 生成的工作区骨架
 

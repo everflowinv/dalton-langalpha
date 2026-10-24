@@ -136,7 +136,7 @@ researchdata.finance(route="estimates", ticker="<TICKER>")
 
 1. **默认开启图片检索**：`sales-notes`、`tmtb`、`funda-ai` 检索统一带 `params={"media": "all"}`。若正文未命中但关键表格可能在图片里，补查 `params={"media": "images"}`。
 2. **回读父文档与原图核验**：
-   - 调用 `read(document="image:<id>")` 获取原图及 `parent_document_id`，必须回读父文档确认发布日期、作者身份与上下文；
+   - 调用 `researchdata.research(route=..., operation="read", document="image:<id>")` 获取原图及 `parent_document_id`，必须回读父文档确认发布日期、作者身份与上下文；
    - **所有来自图片表格的数字，必须查看原图逐项核对：正负号、小数点、单位（百万/十亿/bps/%）、期间标签（FY/CY、Q/YTD）**；
    - **严禁直接采信 `description_verified=false` 的自动识图文字描述作为数字证据**；若原图模糊或附件缺失，必须标注缺口，不得盲信文本摘要中的二手数字。
 3. **正文完整分页读取**：

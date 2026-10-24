@@ -3,8 +3,8 @@
 screen_movers.py — 周会全覆盖名单（Core + Watch）同组异动筛选脚本（PS.13）
 
 功能：
-1. 优先从 coverage.yaml（--coverage）读取全覆盖名单、层级（Core/Watch）、同组（peer_group/peers）、额外 ETF（etfs）与持仓标记；
-   若未提供或文件不存在，自动回退到内置完整基准名单（TICKERS + EXTRA_PEERS）。
+1. 从 coverage.yaml（--coverage）读取全覆盖名单、层级（Core/Watch）、同组（peer_group/peers）、额外 ETF（etfs）与持仓标记；
+   若找不到 coverage.yaml，直接报错退出并提示“先同步覆盖名单”，绝不静默回退到内置名单。
 2. 自动跳过非上市私有公司（如 SPCX, OpenAI, Anthropic）。
 3. 对每家覆盖公司计算：
    - 窗口复权收益（window_ret）
@@ -177,74 +177,66 @@ def load_universe_from_coverage(coverage_path: str | None) -> tuple[list[dict[st
         Path("config/dalton/coverage.yaml"),
     ]
     cov_file = next((p for p in candidates if p.exists()), None)
+    if cov_file is None:
+        searched = ", ".join(str(p) for p in candidates)
+        raise FileNotFoundError(
+            f"未找到覆盖名单 coverage.yaml（已查找：{searched}），请先同步覆盖名单（运行 scripts/dalton/build_coverage.py --sync）。"
+        )
+
     entries: list[dict[str, Any]] = []
     groups: dict[str, set[str]] = {}
     skipped_private: list[str] = []
 
-    if cov_file:
-        text = cov_file.read_text(encoding="utf-8")
-        data = None
+    text = cov_file.read_text(encoding="utf-8")
+    data = None
+    try:
+        import yaml  # type: ignore
+        data = yaml.safe_load(text)
+    except Exception:
         try:
-            import yaml  # type: ignore
-            data = yaml.safe_load(text)
+            data = json.loads(text)
         except Exception:
-            try:
-                data = json.loads(text)
-            except Exception:
-                data = None
+            data = None
 
-        if isinstance(data, dict) and isinstance(data.get("companies"), list):
-            for c in data["companies"]:
-                t = str(c.get("ticker") or "").strip().upper()
-                name = str(c.get("name") or t).strip()
-                if not t or t in PRIVATE_TICKERS or name in PRIVATE_NAMES:
-                    skipped_private.append(f"{name} ({t})")
-                    continue
-                raw_tier = str(c.get("tier") or "").strip().capitalize()
-                tier = raw_tier if raw_tier in ("Core", "Watch") else ""
-                group = str(c.get("peer_group") or "default").strip()
-                sec = str(c.get("sheet_section") or "").strip()
-                held = bool(c.get("held") or sec == "Live Position")
-                ws_name = (c.get("workspace") or {}).get("name") if isinstance(c.get("workspace"), dict) else t
-                ws_dir = f"../{ws_name or t}"
-                peers_list = [str(p).upper() for p in (c.get("peers") or []) if str(p).upper() not in PRIVATE_TICKERS]
-                etfs_list = [str(e).upper() for e in (c.get("etfs") or [])]
-
-                groups.setdefault(group, set()).add(t)
-                for p in peers_list:
-                    groups[group].add(p)
-                for e in etfs_list:
-                    groups[group].add(e)
-
-                entries.append({
-                    "name": name,
-                    "ticker": t,
-                    "group": group,
-                    "section": sec,
-                    "tier": tier,
-                    "held": held,
-                    "workspace_dir": ws_dir,
-                    "explicit_peers": peers_list,
-                    "etfs": etfs_list,
-                })
-
-    if not entries:
-        for name, (t, g, sec, tier) in BUILTIN_TICKERS.items():
-            if t in PRIVATE_TICKERS or name in PRIVATE_NAMES:
+    if isinstance(data, dict) and isinstance(data.get("companies"), list):
+        for c in data["companies"]:
+            t = str(c.get("ticker") or "").strip().upper()
+            name = str(c.get("name") or t).strip()
+            if not t or t in PRIVATE_TICKERS or name in PRIVATE_NAMES:
                 skipped_private.append(f"{name} ({t})")
                 continue
-            groups.setdefault(g, set()).add(t)
+            raw_tier = str(c.get("tier") or "").strip().capitalize()
+            tier = raw_tier if raw_tier in ("Core", "Watch") else ""
+            group = str(c.get("peer_group") or "default").strip()
+            sec = str(c.get("sheet_section") or "").strip()
+            held = bool(c.get("held") or sec == "Live Position")
+            ws_name = (c.get("workspace") or {}).get("name") if isinstance(c.get("workspace"), dict) else t
+            ws_dir = f"../{ws_name or t}"
+            peers_list = [str(p).upper() for p in (c.get("peers") or []) if str(p).upper() not in PRIVATE_TICKERS]
+            etfs_list = [str(e).upper() for e in (c.get("etfs") or [])]
+
+            groups.setdefault(group, set()).add(t)
+            for p in peers_list:
+                groups[group].add(p)
+            for e in etfs_list:
+                groups[group].add(e)
+
             entries.append({
                 "name": name,
                 "ticker": t,
-                "group": g,
+                "group": group,
                 "section": sec,
                 "tier": tier,
-                "held": sec == "Live Position",
-                "workspace_dir": f"../{t}",
-                "explicit_peers": [],
-                "etfs": EXTRA_PEERS.get(g, []),
+                "held": held,
+                "workspace_dir": ws_dir,
+                "explicit_peers": peers_list,
+                "etfs": etfs_list,
             })
+
+    if not entries:
+        raise ValueError(
+            f"覆盖名单 {cov_file} 为空或格式无效，请先同步覆盖名单（运行 scripts/dalton/build_coverage.py --sync）。"
+        )
 
     for g, extra in EXTRA_PEERS.items():
         if g in groups:
@@ -397,7 +389,8 @@ def run_self_test() -> dict[str, Any]:
     import numpy as np
     import pandas as pd
 
-    entries, groups, skipped = load_universe_from_coverage(None)
+    repo_cov = Path(__file__).resolve().parents[5] / "config" / "dalton" / "coverage.yaml"
+    entries, groups, skipped = load_universe_from_coverage(str(repo_cov) if repo_cov.exists() else None)
     dates = pd.bdate_range("2026-07-01", periods=70)
     rng = np.random.default_rng(7)
     syms = ["META", "GOOGL", "AMZN", "MSFT", "ECHO", "UFO", "SPY", "QQQ"]
@@ -447,7 +440,22 @@ def main() -> int:
     base_str = args.base or (date.fromisoformat(end_str) - timedelta(days=7)).isoformat()
     hist_start = (date.fromisoformat(base_str) - timedelta(days=140)).isoformat()
 
-    entries, groups, skipped_private = load_universe_from_coverage(args.coverage)
+    try:
+        entries, groups, skipped_private = load_universe_from_coverage(args.coverage)
+    except (FileNotFoundError, ValueError) as e:
+        err_payload = {
+            "ok": False,
+            "error": "coverage_not_found",
+            "message": str(e),
+            "base": base_str,
+            "end": end_str,
+            "core": [],
+            "flagged": [],
+            "warnings": [str(e)],
+        }
+        print(json.dumps(err_payload, ensure_ascii=False, indent=2))
+        print(str(e), file=sys.stderr)
+        return 1
     all_tickers = sorted({t for s in groups.values() for t in s if t not in PRIVATE_TICKERS} | set(BENCH))
 
     try:

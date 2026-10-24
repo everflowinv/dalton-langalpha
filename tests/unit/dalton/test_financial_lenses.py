@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -123,6 +124,8 @@ class TestSkillAndAgentConventions:
         assert "agenda_ops" in text
         assert "next_validation" in text
         assert "progress" in text
+        assert "details?" not in text
+        assert "不能为 `null`" in text
         assert ".agents/user/automations/dalton-" in text
 
     def test_dalton_research_director_scoring_and_routing(self) -> None:
@@ -130,12 +133,64 @@ class TestSkillAndAgentConventions:
             encoding="utf-8"
         )
         assert "dalton_coverage_board" in text
+        assert "candidates" in text
+        for field in (
+            "company_name",
+            "open_questions",
+            "open_signals",
+            "next_events",
+            "last_verdict",
+            "last_research_at",
+            "open_question",
+            "validation_check",
+            "event_note",
+        ):
+            assert field in text
         assert "delegate_to_analyst" in text
-        assert "dalton_record_plan" in text
+        assert "dalton_record_plan(dispatches=" in text
+        assert "dalton/plans/<date>.md" in text
         assert "dalton_schedule_automation" in text
-        assert "dalton_agenda_note" in text
+        assert "dalton_agenda_note(workspace_id=" in text
         assert "render_coverage.py" in text
-        assert "days_since_last_verdict" in text
+        pa_match = re.search(r"`pending_approvals`（([^）]+)）", text)
+        assert pa_match is not None
+        pa_desc = pa_match.group(1)
+        assert "ticker" not in pa_desc
+        for pa_key in (
+            "request_id",
+            "publish_request_id",
+            "workspace_id",
+            "thread_id",
+            "kind",
+            "title",
+            "draft_path",
+            "review",
+            "created_at",
+        ):
+            assert pa_key in pa_desc
+
+    def test_screen_movers_fails_when_coverage_yaml_missing(self, tmp_path: Path) -> None:
+        script_path = (
+            DALTON_PLUGIN_DIR / "skills" / "dalton-weekly-review" / "scripts" / "screen_movers.py"
+        )
+        missing_cov = tmp_path / "nonexistent_coverage.yaml"
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(script_path),
+                "screen",
+                "--coverage",
+                str(missing_cov),
+            ],
+            cwd=str(tmp_path),
+            capture_output=True,
+            text=True,
+        )
+        assert proc.returncode != 0
+        assert "先同步覆盖名单" in proc.stdout or "先同步覆盖名单" in proc.stderr
+        payload = json.loads(proc.stdout)
+        assert payload["ok"] is False
+        assert "先同步覆盖名单" in payload["message"]
 
     def test_company_background_nine_sections(self) -> None:
         text = (DALTON_PLUGIN_DIR / "skills" / "dalton-company-background" / "SKILL.md").read_text(

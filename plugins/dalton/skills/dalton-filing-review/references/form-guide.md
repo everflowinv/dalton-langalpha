@@ -9,7 +9,7 @@
 季报与年报是最权威的一手财务披露（来源层级 Tier 1），审阅必须覆盖以下七项：
 
 1. **核心财务与驱动指标更新（XBRL 事实提取）**：
-   - 调用 `dalton_sec.get_company_facts(ticker=..., concepts=..., periods=..., forms=["10-Q", "10-K"])` 提取最新期数据；
+   - 调用 `dalton_sec.get_company_facts(ticker=..., concepts=..., period=...)` 提取最新期数据；
    - **期间纪律**：单季指标只配约 90 天的 3 个月口径（`3M`）；Q4 单季由全年减前九个月（`FY - 9M`）推导并标 `derived_filing_actual`；
    - 核对与此前 8-K 业绩快报（EX-99.1）是否存在修正或重分类；
    - 将最新读数更新至知识层 `drivers`。

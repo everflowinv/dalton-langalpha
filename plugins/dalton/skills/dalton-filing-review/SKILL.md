@@ -81,9 +81,10 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 1. **追加事件结论（必做）**：调用 `knowledge_append_verdict`：
    - `verdict.verdict`：五词正式词形；
    - `verdict.trigger.kind`：`"filing"`（手动无信号时填 `"manual"`）；
-   - `verdict.trigger.ref`：**必须与 `<dalton_wake>` 里的信号 `id` 严格一致**（用于 PK 验收与防重核对）；
-   - `verdict.evidence`：美股 SEC 公告必须包含本次公告的 `accession` 号、表单类型与提交日期；`source=cninfo` 的公告改用 `date`、`title`、`pdf_link`，不要求 SEC accession；
-   - `verdict.next_validation`：下一项验证的内容与截止日期；
+   - `verdict.trigger.ref`：**自动唤醒时必须与 `<dalton_wake>` 里的信号 `id` 严格一致**（用于 PK 验收与防重核对）；手动审阅美股 SEC 公告时可填本次公告的 `accession` 号；
+   - `verdict.event` / `verdict.rationale`：美股 SEC 公告必须在 `event` 或 `rationale` 中写明本次公告的表单类型、提交日期与 `accession` 号；`source=cninfo` 的公告写明 `date`、`title`、`pdf_link`（注意：`verdict.schema.json` 不允许 `verdict.evidence` 字段，引用知识层证据条目用 `verdict.evidence_ids: ["E-..."]`）；
+   - `verdict.next_validation`：下一项验证的 `{what, due}`；
+   - `verdict.progress`：`"none"` | `"some"` | `"resolved"`；
    - `agenda_ops`：把后续跟进事项（如“10-Q 发布后更新模型 vN”）写入议程。
 2. **更新知识层**：
    - 当结论非 `NO_CHANGE`（或有新季度财务读数）时，调用 `knowledge_update` 更新 `thesis`、`debate` 或 `drivers`（写入 10-Q/10-K 最新季度读数或融资后严格净现金）；

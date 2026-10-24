@@ -30,7 +30,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
    - 实时前瞻：取自动任务触发时刻（或当前会话开始时刻）为唯一 `as-of`；
    - 历史回测前瞻：严格以指定的历史截止时点（如财报发布前 3 天）为 `as-of`，**所有检索必须显式带上截止日期（`end` / `to_date` / `date_before`），截止时间之后的信息一律禁止使用**。
 3. **确认发布日期与窗口**：
-   - 从 `Home/dalton/earnings-calendar.json` 或 `agenda.watch.events` 读取官方发布日期、BMO/AMC 及官方来源链接；未经官方确认的写“未确认”，绝不自行编造。
+   - 从 `../Home/dalton/earnings-calendar.json` 或 `agenda.watch.events` 读取官方发布日期、BMO/AMC 及官方来源链接；未经官方确认的写“未确认”，绝不自行编造。
    - **检索时间窗**：预期材料取近 **30 天**（材料不足时可扩展至上一次财报后）；核心 debate 取近 **90 天**。
 4. **基线快照**：
    - 读取工作区 `thesis.md`、`debate.md`、`drivers.md`、`management.md`；

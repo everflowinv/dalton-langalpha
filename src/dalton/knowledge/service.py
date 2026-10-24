@@ -801,27 +801,29 @@ async def apply_update(
         else None
     )
 
-    repaired_ops, repair_warnings = repair_knowledge_ops(doc_key, base_doc, ops)
-    repaired_ops, assist_path_warnings = await _repair_ops_paths_with_assist(
-        doc_key,
-        base_doc,
-        repaired_ops,
-        user_id=user_id,
-        workspace_id=workspace_id,
-    )
-    if assist_path_warnings:
-        repair_warnings.extend(assist_path_warnings)
-        repaired_ops, post_alias_warnings = repair_knowledge_ops(doc_key, base_doc, repaired_ops)
-        repair_warnings.extend(post_alias_warnings)
-
-    ev_ids = [
-        str(r.get("evidence_id") or r.get("id"))
-        for r in (evidence_refs or [])
-        if isinstance(r, dict) and (r.get("evidence_id") or r.get("id"))
-    ]
-
-    # Step 3: Apply ops -> server fields -> validate schema & 3 hard invariants
+    # Step 3: Repair & apply ops -> server fields -> validate schema & 3 hard invariants
     try:
+        repaired_ops, repair_warnings = repair_knowledge_ops(doc_key, base_doc, ops)
+        repaired_ops, assist_path_warnings = await _repair_ops_paths_with_assist(
+            doc_key,
+            base_doc,
+            repaired_ops,
+            user_id=user_id,
+            workspace_id=workspace_id,
+        )
+        if assist_path_warnings:
+            repair_warnings.extend(assist_path_warnings)
+            repaired_ops, post_alias_warnings = repair_knowledge_ops(
+                doc_key, base_doc, repaired_ops
+            )
+            repair_warnings.extend(post_alias_warnings)
+
+        ev_ids = [
+            str(r.get("evidence_id") or r.get("id"))
+            for r in (evidence_refs or [])
+            if isinstance(r, dict) and (r.get("evidence_id") or r.get("id"))
+        ]
+
         new_doc, op_summaries = apply_ops(
             doc_key,
             base_doc,
@@ -831,11 +833,14 @@ async def apply_update(
             evidence_ids=ev_ids or None,
         )
     except OpError as e:
+        problems = [{"code": e.code, "path": e.path, "message": e.message}]
+        schema_hint = _format_expected_structures(doc_key, problems)
+        hint_suffix = f"\n\n{schema_hint}" if schema_hint else ""
         return {
             "ok": False,
             "error": e.code,
-            "problems": [{"code": e.code, "path": e.path, "message": e.message}],
-            "message": f"- {e.path}: {e.code} ({e.message})",
+            "problems": problems,
+            "message": f"- {e.path}: {e.code} ({e.message}){hint_suffix}",
         }
 
     _normalize_legacy_aliases(doc_key, new_doc, old_doc=base_doc)
@@ -1091,56 +1096,60 @@ async def append_verdict(
     # Automatically update agenda if an agenda document exists or agenda_ops were passed
     agenda_row = await db_knowledge.latest_version(workspace_id, "agenda")
     agenda_version_no: int | None = None
-    if agenda_row is not None:
-        combined_ops: list[dict[str, Any]] = [
-            {
-                "op": "set",
-                "path": "/last_verdict",
-                "value": {
-                    "verdict_id": verdict_id,
-                    "word": word,
-                    "at": verdict_at_iso,
-                },
-            }
-        ]
-        agenda_content = agenda_row.get("content") or {}
-        # Mark matching validation as done only when trigger.ref equals its validation id
-        val_id = (v_copy.get("trigger") or {}).get("ref")
-        if val_id and any(
-            isinstance(x, dict) and x.get("id") == val_id
-            for x in (agenda_content.get("next_validations") or [])
-        ):
-            combined_ops.append(
-                {"op": "set", "path": f"/next_validations/{val_id}/status", "value": "done"}
-            )
+    agenda_error: str | None = None
+    agenda_problems: list[dict[str, Any]] = []
+    if agenda_row is not None or agenda_ops:
+        combined_ops: list[dict[str, Any]] = []
+        if agenda_row is not None:
             combined_ops.append(
                 {
                     "op": "set",
-                    "path": f"/next_validations/{val_id}/result_verdict_id",
-                    "value": verdict_id,
+                    "path": "/last_verdict",
+                    "value": {
+                        "verdict_id": verdict_id,
+                        "word": word,
+                        "at": verdict_at_iso,
+                    },
                 }
             )
-        # Append attempt to referenced question_ids
-        for qid in v_copy.get("question_ids") or []:
-            if any(
-                isinstance(q, dict) and q.get("id") == qid
-                for q in (agenda_content.get("open_questions") or [])
+            agenda_content = agenda_row.get("content") or {}
+            # Mark matching validation as done only when trigger.ref equals its validation id
+            val_id = (v_copy.get("trigger") or {}).get("ref")
+            if val_id and any(
+                isinstance(x, dict) and x.get("id") == val_id
+                for x in (agenda_content.get("next_validations") or [])
             ):
-                att: dict[str, Any] = {
-                    "at": verdict_at_iso,
-                    "method": f"verdict {verdict_id}",
-                    "progress": v_copy["progress"],
-                    "note": v_copy["event"],
-                }
-                if thread_id:
-                    att["thread_id"] = str(thread_id)
+                combined_ops.append(
+                    {"op": "set", "path": f"/next_validations/{val_id}/status", "value": "done"}
+                )
                 combined_ops.append(
                     {
-                        "op": "append",
-                        "path": f"/open_questions/{qid}/attempts",
-                        "value": att,
+                        "op": "set",
+                        "path": f"/next_validations/{val_id}/result_verdict_id",
+                        "value": verdict_id,
                     }
                 )
+            # Append attempt to referenced question_ids
+            for qid in v_copy.get("question_ids") or []:
+                if any(
+                    isinstance(q, dict) and q.get("id") == qid
+                    for q in (agenda_content.get("open_questions") or [])
+                ):
+                    att: dict[str, Any] = {
+                        "at": verdict_at_iso,
+                        "method": f"verdict {verdict_id}",
+                        "progress": v_copy["progress"],
+                        "note": v_copy["event"],
+                    }
+                    if thread_id:
+                        att["thread_id"] = str(thread_id)
+                    combined_ops.append(
+                        {
+                            "op": "append",
+                            "path": f"/open_questions/{qid}/attempts",
+                            "value": att,
+                        }
+                    )
         if agenda_ops:
             combined_ops.extend(agenda_ops)
 
@@ -1150,7 +1159,7 @@ async def append_verdict(
             doc_key="agenda",
             ops=combined_ops,
             reason=f"verdict {verdict_id}: {v_copy['event'][:80]}",
-            base_version=agenda_row["version_no"],
+            base_version=agenda_row["version_no"] if agenda_row is not None else None,
             source="tool",
             backend=backend,
             thread_id=thread_id,
@@ -1160,6 +1169,17 @@ async def append_verdict(
         )
         if ag_res.get("ok"):
             agenda_version_no = ag_res.get("version_no")
+        else:
+            agenda_problems = list(ag_res.get("problems") or [])
+            raw_ag_msg = str(ag_res.get("message") or ag_res.get("error") or "unknown error")
+            if "Expected structure for " not in raw_ag_msg:
+                ag_hint = _format_expected_structures(
+                    "agenda",
+                    agenda_problems or [{"path": "/", "code": "schema_error", "message": raw_ag_msg}],
+                )
+                if ag_hint:
+                    raw_ag_msg = f"{raw_ag_msg}\n\n{ag_hint}"
+            agenda_error = raw_ag_msg
 
     # Render verdicts.md in sandbox if backend is present
     if backend is not None:
@@ -1178,9 +1198,17 @@ async def append_verdict(
 
     zh = VERDICT_ZH.get(word, word)
     warn_note = f" Warnings: {val.format_warnings()}" if val.warnings else ""
-    ag_note = f"; updated agenda v{agenda_version_no}" if agenda_version_no else ""
+    if agenda_version_no:
+        ag_note = f"; updated agenda v{agenda_version_no}"
+    elif agenda_error:
+        ag_note = (
+            "; agenda_update: failed (verdict saved, but agenda was NOT updated — "
+            f"please retry with knowledge_update(doc=\"agenda\", ...)):\n{agenda_error}"
+        )
+    else:
+        ag_note = ""
     msg = f"Recorded verdict {verdict_id} ({word} / {zh}){ag_note}. Rendered {VERDICTS_MD}.{warn_note}"
-    return {
+    result: dict[str, Any] = {
         "ok": True,
         "verdict_id": verdict_id,
         "word": word,
@@ -1188,6 +1216,13 @@ async def append_verdict(
         "warnings": val.warnings,
         "message": msg,
     }
+    if agenda_error:
+        result["agenda_update"] = "failed"
+        result["agenda_error"] = agenda_error
+        result["agenda_problems"] = agenda_problems
+    elif agenda_version_no is not None:
+        result["agenda_update"] = "updated"
+    return result
 
 
 async def import_knowledge_doc(

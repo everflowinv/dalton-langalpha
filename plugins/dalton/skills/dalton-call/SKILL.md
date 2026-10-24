@@ -19,7 +19,7 @@ Conviction Call 是 Dalton 研究体系的最高级别输出，直接服务于 P
 ### Step 1：通读知识层与近期底稿
 按顺序读取公司工作区：
 1. `agent.md`（受管区块）、`thesis.md`、`debate.md`、`drivers.md`、`management.md`、近 30 天 `verdicts.md`。
-2. `models/` 下最新财务模型（重点读 `Street vs House`、`Drivers`、`DCF` / `Valuation` 表）。
+2. `model/` 下最新财务模型（重点读 `Street vs House`、`Drivers`、`DCF` / `Valuation` 表）。
 3. `published/` 下最近一次首次覆盖报告、多空辩论（Bull/Bear）及最新季报复盘（Earnings Review）。
 
 ### Step 2：六条证据门禁硬检（6 Hard Evidence Gates）
