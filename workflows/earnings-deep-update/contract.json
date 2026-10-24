@@ -125,6 +125,9 @@
     ],
     "language_review": {
       "draft": "drafts/{release_date}-deep-{quarter}.md"
+    },
+    "push_draft": {
+      "path": "research/push/{release_date}-earnings-deep-{quarter}.md"
     }
   }
 }

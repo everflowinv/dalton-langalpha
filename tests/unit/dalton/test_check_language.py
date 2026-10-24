@@ -459,3 +459,81 @@ async def test_invalid_issue_type_dropped_through_real_assist_json(
         "translationese",
     ]
     assert res["dropped_issue_types"] == 1
+
+
+@pytest.mark.asyncio
+async def test_check_language_tool_resolves_home_workspace_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from fastapi import HTTPException
+
+    from src.dalton.auth import (
+        resolve_caller_home_workspace_id as _real_resolve,
+        verify_workspace_access as _real_verify,
+    )
+    from src.dalton.tools import publish_tools as publish_tools_mod
+    from src.dalton.tools.publish_tools import create_language_tools, create_publish_tools
+
+    push_draft = "research/push/2026-10-23-director-weekly.md"
+    files = {push_draft: "## 结论\n本周核心覆盖无重大证伪。\n"}
+    stub_assist = create_autospec(assist_json, return_value=_ok_result([]))
+    monkeypatch.setattr(language_mod, "assist_json", stub_assist)
+
+    stub_resolve = create_autospec(_real_resolve, return_value="ws-home-1")
+    monkeypatch.setattr(publish_tools_mod, "resolve_caller_home_workspace_id", stub_resolve)
+
+    seen_ws: list[str] = []
+
+    async def _verify(workspace_id: str, user_id: str) -> dict[str, Any]:
+        seen_ws.append(workspace_id)
+        return {}
+
+    monkeypatch.setattr(
+        language_mod,
+        "verify_workspace_access",
+        create_autospec(_real_verify, side_effect=_verify),
+    )
+
+    call_payload = {
+        "name": "check_language",
+        "args": {"draft_path": push_draft, "round": 1},
+        "id": "call-home-1",
+        "type": "tool_call",
+    }
+
+    # Analyst check_language must NOT resolve Home when workspace_id is missing.
+    analyst_lang = next(
+        t for t in create_publish_tools(_backend(files)) if t.name == "check_language"
+    )
+    analyst_msg = await analyst_lang.ainvoke(
+        call_payload,
+        config={"configurable": {"user_id": "user-1"}},
+    )
+    assert analyst_msg.content.startswith("ERROR:")
+    stub_resolve.assert_not_awaited()
+    assert f"{push_draft}.language.json" not in files
+
+    # Chief of Staff check_language resolves Home when workspace_id is missing.
+    cos_tool = create_language_tools(_backend(files))[0]
+    msg = await cos_tool.ainvoke(
+        call_payload,
+        config={"configurable": {"user_id": "user-1"}},
+    )
+    assert "语言审查第 1 轮完成" in msg.content
+    stub_resolve.assert_awaited_once_with("user-1")
+    assert seen_ws == ["ws-home-1"]
+    assert f"{push_draft}.language.json" in files
+
+    # Exception from resolve_caller_home_workspace_id is caught and returned as ERROR string.
+    stub_resolve_err = create_autospec(
+        _real_resolve,
+        side_effect=HTTPException(status_code=503, detail="Database unavailable"),
+    )
+    monkeypatch.setattr(
+        publish_tools_mod, "resolve_caller_home_workspace_id", stub_resolve_err
+    )
+    err_msg = await cos_tool.ainvoke(
+        call_payload,
+        config={"configurable": {"user_id": "user-1"}},
+    )
+    assert err_msg.content == "ERROR: Database unavailable"

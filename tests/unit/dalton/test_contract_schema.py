@@ -9,6 +9,7 @@ from src.dalton.workflows.contracts import (
     ContractError,
     list_skill_contracts,
     list_workflow_contracts,
+    load_contract,
     load_skill_contract,
     load_workflow_contract,
     missing_params,
@@ -33,7 +34,69 @@ SKILL_CONTRACTS = [
     "dalton-thesis-delta",
     "dalton-call",
     "dalton-publish",
+    "dalton-earnings-calendar",
 ]
+
+PUSH_CONTRACTS = [
+    ("dalton-earnings-preview", "research/push/{as_of}-earnings-preview-{quarter}.md", False, "drafts/{as_of}-preview-{quarter}.md"),
+    ("dalton-earnings-flash", "research/push/{as_of}-earnings-flash-{quarter}.md", False, None),
+    ("earnings-deep-update", "research/push/{release_date}-earnings-deep-{quarter}.md", False, "drafts/{release_date}-deep-{quarter}.md"),
+    ("dalton-stock-move", "research/push/{as_of}-stock-move.md", True, None),
+    ("weekly-coverage-review", "research/push/{end}-director-weekly.md", False, None),
+    ("dalton-earnings-calendar", "research/push/{as_of}-earnings-calendar.md", False, None),
+]
+
+
+@pytest.mark.parametrize(
+    ("name", "expected_push_path", "expected_skip_no_change", "expected_lang_draft"),
+    PUSH_CONTRACTS,
+)
+def test_push_contracts_declare_push_draft_and_language_review_scope(
+    name: str,
+    expected_push_path: str,
+    expected_skip_no_change: bool,
+    expected_lang_draft: str | None,
+) -> None:
+    contract = load_contract(name)
+    assert not validate_contract(contract)
+    closing = contract.get("closing") or {}
+    push_draft = closing.get("push_draft")
+    assert isinstance(push_draft, dict)
+    assert push_draft.get("path") == expected_push_path
+    assert bool(push_draft.get("skip_when_no_change", False)) is expected_skip_no_change
+    lang_review = closing.get("language_review")
+    if expected_lang_draft is None:
+        assert lang_review is None
+    else:
+        assert isinstance(lang_review, dict)
+        assert lang_review.get("draft") == expected_lang_draft
+
+
+def test_push_draft_rejects_unknown_fields_and_undeclared_params() -> None:
+    unknown_field = {
+        "name": "x",
+        "params_required": ["as_of"],
+        "stages": [{"name": "s"}],
+        "closing": {
+            "push_draft": {
+                "path": "research/push/{as_of}-x.md",
+                "unknown_key": True,
+            }
+        },
+    }
+    assert validate_contract(unknown_field)
+
+    undeclared_param = {
+        "name": "x",
+        "params_required": ["as_of"],
+        "stages": [{"name": "s"}],
+        "closing": {
+            "push_draft": {
+                "path": "research/push/{as_of}-{automation_name}.md",
+            }
+        },
+    }
+    assert validate_contract(undeclared_param)
 
 
 @pytest.mark.parametrize("name", WORKFLOW_CONTRACTS)

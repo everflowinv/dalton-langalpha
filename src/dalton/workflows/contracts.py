@@ -44,10 +44,23 @@ def load_schema() -> dict[str, Any]:
 def validate_contract(doc: Any) -> list[str]:
     """Schema-validate one contract document; empty list means valid."""
     validator = Draft202012Validator(load_schema())
-    return [
+    errors = [
         f"{'/'.join(str(p) for p in error.absolute_path)}: {error.message}"
         for error in sorted(validator.iter_errors(doc), key=lambda e: list(e.absolute_path))
     ]
+    if isinstance(doc, dict):
+        closing = doc.get("closing")
+        push_draft = closing.get("push_draft") if isinstance(closing, dict) else None
+        path_tmpl = push_draft.get("path") if isinstance(push_draft, dict) else None
+        required = doc.get("params_required")
+        if isinstance(path_tmpl, str) and isinstance(required, list):
+            allowed = {str(p) for p in required if isinstance(p, str)}
+            for key in _PLACEHOLDER_RE.findall(path_tmpl):
+                if key not in allowed:
+                    errors.append(
+                        f"closing/push_draft/path: placeholder '{{{key}}}' is not in params_required"
+                    )
+    return errors
 
 
 def workflow_contract_path(name: str) -> Path:

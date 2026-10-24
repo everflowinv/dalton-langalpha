@@ -105,8 +105,9 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 
 ### 收尾门禁：汇报完成前必须过完成契约（`dalton_check_done`）
 
-- 快讯落盘 `research/<D>-flash-<季度>.md`、写完 verdict 之后、推送 PM 之前，调用 `dalton_check_done(workflow="dalton-earnings-flash", params={"ticker": ..., "quarter": ..., "as_of": "<本稿 D>"})`。
-- `done=false` 时按 `missing` 先补齐再查（快讯文件缺失或过小就补齐、verdict 未写或 `trigger.kind` 不是 `earnings` 就 `knowledge_append_verdict`）；补不了的缺项只能汇报“未完成”并列出缺项与原因，不得汇报“完成”。
+- **推送稿两轮语言审查与原样回复**：按 `.agents/skills/dalton-conventions/SKILL.md` §8 将推送正文写入 `research/push/<D>-earnings-flash-<季度>.md` 并完成两轮 `check_language`，最后回复与该推送稿逐字相同。
+- 快讯落盘 `research/<D>-flash-<季度>.md`、写完 verdict 与推送稿两轮语言审查之后、推送 PM 之前，调用 `dalton_check_done(workflow="dalton-earnings-flash", params={"ticker": ..., "quarter": ..., "as_of": "<本稿 D>"})`。
+- `done=false` 时按 `missing` 先补齐再查（快讯文件缺失或过小就补齐、verdict 未写或 `trigger.kind` 不是 `earnings` 就 `knowledge_append_verdict`、推送稿语言审查缺轮次或第 2 轮哈希对不上就补跑 `check_language`）；补不了的缺项只能汇报“未完成”并列出缺项与原因，不得汇报“完成”。
 
 ---
 

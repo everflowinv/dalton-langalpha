@@ -24,7 +24,10 @@ import pytest
 
 from ptc_agent.agent.backends.sandbox import SandboxBackend
 from src.dalton.database.publications import list_pending as _REAL_LIST_PENDING
-from src.dalton.database.verdicts import list_verdicts as _REAL_LIST_VERDICTS
+from src.dalton.database.verdicts import (
+    get_verdict_for_execution as _REAL_GET_VERDICT_FOR_EXECUTION,
+    list_verdicts as _REAL_LIST_VERDICTS,
+)
 from src.dalton.tools import check_done_tools
 from src.dalton.tools.check_done_tools import run_check_done
 
@@ -173,22 +176,52 @@ def _make_backend(
     return backend
 
 
-def _patch_knowledge(monkeypatch: pytest.MonkeyPatch, docs: list[str]) -> None:
+DEFAULT_START_EPOCH = int(datetime(2026, 10, 23, 14, 0, tzinfo=timezone.utc).timestamp())
+
+
+def _patch_knowledge(
+    monkeypatch: pytest.MonkeyPatch,
+    docs: list[str],
+    *,
+    start_epochs: dict[str, int | None] | None = None,
+    thread_start_epoch: int | None = DEFAULT_START_EPOCH,
+) -> None:
     """Patch the version query: ``docs`` are the ones with a tool version.
 
     The connection and cursor are spec'd against psycopg's real async types;
-    the rows are (doc_key,) tuples, the shape the query fetches."""
+    the rows are (doc_key,) tuples, the shape the query fetches. Single-row
+    start-epoch lookups answer strictly by the bound ``run_id`` / ``thread_id``
+    parameter value (never by SQL text)."""
+    epochs_by_id: dict[str, int | None] = {"short-1": thread_start_epoch}
+    if start_epochs is not None:
+        epochs_by_id.update(start_epochs)
 
     cursor = create_autospec(psycopg.AsyncCursor, instance=True)
+    last_id: dict[str, str | None] = {"value": None}
 
-    async def _execute(*_args: Any, **_kwargs: Any) -> None:
-        pass
+    async def _execute(_query: Any = "", params: Any = None, **_kwargs: Any) -> None:
+        if (
+            isinstance(params, (tuple, list))
+            and len(params) == 1
+            and isinstance(params[0], str)
+        ):
+            last_id["value"] = params[0]
+        else:
+            last_id["value"] = None
 
     async def _fetchall() -> list[tuple[str]]:
         return [(doc,) for doc in docs]
 
+    async def _fetchone() -> tuple[int] | None:
+        key = last_id["value"]
+        if key is None:
+            return None
+        epoch = epochs_by_id.get(key)
+        return (epoch,) if epoch is not None else None
+
     cursor.execute.side_effect = _execute
     cursor.fetchall.side_effect = _fetchall
+    cursor.fetchone.side_effect = _fetchone
 
     # The tool enters the cursor as an async context manager, exactly as it
     # would a real one; the autospec instance carries the dunder mocks.
@@ -242,7 +275,12 @@ def _patch_knowledge_capture(
     return captured
 
 
-def _verdict_row(word: str, trigger_kind: str = "manual") -> dict[str, Any]:
+def _verdict_row(
+    word: str,
+    trigger_kind: str = "manual",
+    *,
+    run_id: str | None = None,
+) -> dict[str, Any]:
     """One row exactly as ``verdicts._serialize_row`` emits it (real columns)."""
     return {
         "verdict_id": "VD-20261023-01",
@@ -256,7 +294,7 @@ def _verdict_row(word: str, trigger_kind: str = "manual") -> dict[str, Any]:
         "next_due": None,
         "payload": {},
         "conversation_thread_id": None,
-        "run_id": None,
+        "run_id": run_id,
         "automation_execution_id": None,
         "origin_type": None,
         "created_at": "2026-10-23T10:00:00+00:00",
@@ -282,6 +320,26 @@ def _patch_verdicts(
 
     listed.side_effect = _rows
     monkeypatch.setattr(verdicts_db, "list_verdicts", listed)
+
+    by_execution = create_autospec(_REAL_GET_VERDICT_FOR_EXECUTION)
+
+    async def _for_execution(
+        *,
+        automation_execution_id: str | None = None,
+        thread_id: str | None = None,
+        run_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        if error is not None:
+            raise error
+        if not run_id:
+            return None
+        for row in rows or []:
+            if row.get("run_id") == run_id:
+                return row
+        return None
+
+    by_execution.side_effect = _for_execution
+    monkeypatch.setattr(verdicts_db, "get_verdict_for_execution", by_execution)
 
 
 IC_DOCS = ["company", "thesis", "debate", "drivers", "management", "agenda"]
@@ -1352,7 +1410,15 @@ async def test_manual_with_existing_run_dir_still_uses_the_journal(
 def _tool_call(workflow: str) -> dict[str, Any]:
     return {
         "name": "dalton_check_done",
-        "args": {"workflow": workflow, "params": {"home_dir": ".", "end": "2026-10-23", "coverage_path": "c.json"}},
+        "args": {
+            "workflow": workflow,
+            "params": {
+                "home_dir": ".",
+                "end": "2026-10-23",
+                "as_of": "2026-10-23",
+                "coverage_path": "c.json",
+            },
+        },
         "id": "call-1",
         "type": "tool_call",
     }
@@ -1364,17 +1430,28 @@ async def test_chief_of_staff_check_done_only_accepts_weekly_review() -> None:
 
     tools = {t.name: t for t in build_dalton_tools("chief_of_staff", enabled=True)}
     assert "dalton_check_done" in tools
+    assert "check_language" in tools
+    assert "publish_report" not in tools
+    assert "check_draft" not in tools
+
+    analyst_tools = {t.name: t for t in build_dalton_tools("analyst", enabled=True)}
+    assert {"check_draft", "check_language", "publish_report"}.issubset(analyst_tools)
+
     tool = tools["dalton_check_done"]
 
-    refused = json.loads((await tool.ainvoke(_tool_call("initial-coverage"))).content)
-    assert refused["done"] is False
-    assert refused["missing"] == ["该角色只能核对 weekly-coverage-review"]
+    for company_wf in ("initial-coverage", "dalton-earnings-flash", "dalton-stock-move"):
+        refused = json.loads((await tool.ainvoke(_tool_call(company_wf))).content)
+        assert refused["done"] is False
+        assert refused["missing"] == [
+            "该角色只能核对 dalton-earnings-calendar、weekly-coverage-review"
+        ]
 
-    # weekly-coverage-review passes the role gate and reaches the real check
-    # (no backend bound here → the no-backend missing, not the role refusal).
-    weekly = json.loads((await tool.ainvoke(_tool_call("weekly-coverage-review"))).content)
-    assert weekly["done"] is False
-    assert weekly["missing"] == ["当前没有可用的文件后端，无法核对工作区产物。"]
+    # weekly-coverage-review and dalton-earnings-calendar pass the role gate and
+    # reach the real check (no backend bound here → the no-backend missing, not the role refusal).
+    for home_wf in ("weekly-coverage-review", "dalton-earnings-calendar"):
+        allowed_res = json.loads((await tool.ainvoke(_tool_call(home_wf))).content)
+        assert allowed_res["done"] is False
+        assert allowed_res["missing"] == ["当前没有可用的文件后端，无法核对工作区产物。"]
 
 
 @pytest.mark.asyncio
@@ -1502,14 +1579,18 @@ def _sidecar_for(draft_text: str) -> str:
 
 PREVIEW_PARAMS = {"ticker": "META", "quarter": "FY26Q3", "as_of": "2026-10-23"}
 PREVIEW_DRAFT = "drafts/2026-10-23-preview-FY26Q3.md"
+PREVIEW_PUSH = "research/push/2026-10-23-earnings-preview-FY26Q3.md"
 PREVIEW_PRED = "research/2026-10-23-preview-FY26Q3/predictions.json"
 
 
 def _preview_files(draft_text: str = "# 前瞻\n" + "判断" * 300) -> dict[str, str]:
+    push_text = "## 结论\n维持。\n"
     return {
         PREVIEW_DRAFT: draft_text,
         "drafts/2026-10-23-preview-FY26Q3.audit.md": _sidecar_for(draft_text),
         f"{PREVIEW_DRAFT}.language.json": _language_json(draft_text),
+        PREVIEW_PUSH: push_text,
+        f"{PREVIEW_PUSH}.language.json": _language_json(push_text),
         PREVIEW_PRED: json.dumps({"predictions": [{"id": "P1", "metric": "revenue"}] * 3}),
     }
 
@@ -1526,6 +1607,7 @@ async def test_earnings_preview_complete_reports_done(
         params=PREVIEW_PARAMS,
         backend=backend,
         workspace_id=WS,
+        thread_id="short-1",
     )
     assert result["done"] is True, result["missing"]
     # The strict predictions validator really re-ran.
@@ -1550,6 +1632,7 @@ async def test_earnings_preview_reports_each_gap(
         params=PREVIEW_PARAMS,
         backend=_make_backend(files, validator_exit=1),
         workspace_id=WS,
+        thread_id="short-1",
     )
     missing = result["missing"]
     assert result["done"] is False
@@ -1559,24 +1642,61 @@ async def test_earnings_preview_reports_each_gap(
     assert any("trigger_kind=earnings" in m for m in missing)
 
 
+FLASH_PUSH = "research/push/2026-10-23-earnings-flash-FY26Q3.md"
+MOVE_PUSH = "research/push/2026-10-23-stock-move.md"
+
+
+def _round1_only_language_json(draft_text: str) -> str:
+    doc = json.loads(_language_json(draft_text))
+    doc["rounds"] = [doc["rounds"][0]]
+    return json.dumps(doc, ensure_ascii=False)
+
+
 @pytest.mark.asyncio
 async def test_earnings_flash_needs_research_note_and_earnings_verdict(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     params = {"ticker": "META", "quarter": "FY26Q3", "as_of": "2026-10-23"}
-    note = {"research/2026-10-23-flash-FY26Q3.md": "快讯" * 200}
+    push_text = "## 结论\n强化。\n"
+    note = {
+        "research/2026-10-23-flash-FY26Q3.md": "快讯" * 200,
+        FLASH_PUSH: push_text,
+        f"{FLASH_PUSH}.language.json": _language_json(push_text),
+    }
+    _patch_knowledge(monkeypatch, [])
     _patch_verdicts(monkeypatch, [_verdict_row("THESIS_STRENGTHENED", trigger_kind="earnings")])
     done = await run_check_done(
         workflow="dalton-earnings-flash", params=params,
-        backend=_make_backend(note), workspace_id=WS,
+        backend=_make_backend(note), workspace_id=WS, thread_id="short-1",
     )
     assert done["done"] is True, done["missing"]
 
+    round1_only = dict(note)
+    round1_only[f"{FLASH_PUSH}.language.json"] = _round1_only_language_json(push_text)
+    missing_r2 = await run_check_done(
+        workflow="dalton-earnings-flash", params=params,
+        backend=_make_backend(round1_only), workspace_id=WS, thread_id="short-1",
+    )
+    assert missing_r2["done"] is False
+    assert any("缺少第 2 轮" in m and FLASH_PUSH in m for m in missing_r2["missing"])
+
+    # Stale push draft (mtime earlier than this run's start) fails.
+    stale_res = await run_check_done(
+        workflow="dalton-earnings-flash",
+        params=params,
+        backend=_make_backend(note, mtimes={FLASH_PUSH: 1_700_000_000}),
+        workspace_id=WS,
+        thread_id="short-1",
+    )
+    assert stale_res["done"] is False
+    assert any("早于本轮运行开始时间" in m and FLASH_PUSH in m for m in stale_res["missing"])
+
     gap = await run_check_done(
         workflow="dalton-earnings-flash", params=params,
-        backend=_make_backend({}), workspace_id=WS,
+        backend=_make_backend({}), workspace_id=WS, thread_id="short-1",
     )
     assert any("research/2026-10-23-flash-FY26Q3.md" in m for m in gap["missing"])
+    assert any("缺少推送稿" in m and FLASH_PUSH in m for m in gap["missing"])
 
 
 MOVE_PARAMS = {"ticker": "META", "as_of": "2026-10-23"}
@@ -1588,33 +1708,459 @@ async def test_stock_move_no_change_needs_no_knowledge_update(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _patch_knowledge(monkeypatch, [])
-    _patch_verdicts(monkeypatch, [_verdict_row("NO_CHANGE", trigger_kind="price_move")])
+    _patch_verdicts(
+        monkeypatch,
+        [_verdict_row("NO_CHANGE", trigger_kind="price_move", run_id="run-nc")],
+    )
     result = await run_check_done(
-        workflow="dalton-stock-move", params=MOVE_PARAMS,
-        backend=_make_backend(MOVE_FILES), workspace_id=WS,
+        workflow="dalton-stock-move",
+        params=MOVE_PARAMS,
+        backend=_make_backend(MOVE_FILES),
+        workspace_id=WS,
+        thread_id="short-1",
+        conversation_run_id="run-nc",
     )
     assert result["done"] is True, result["missing"]
+
+    # An older push draft sitting at MOVE_PUSH from a prior run is also skipped when NO_CHANGE.
+    old_push = "## 结论\n旧推送稿。\n"
+    with_stale_push = {
+        **MOVE_FILES,
+        MOVE_PUSH: old_push,
+        f"{MOVE_PUSH}.language.json": _language_json(old_push),
+    }
+    stale_no_change = await run_check_done(
+        workflow="dalton-stock-move",
+        params=MOVE_PARAMS,
+        backend=_make_backend(with_stale_push, mtimes={MOVE_PUSH: 1_700_000_000}),
+        workspace_id=WS,
+        thread_id="short-1",
+        conversation_run_id="run-nc",
+    )
+    assert stale_no_change["done"] is True, stale_no_change["missing"]
+
+    # NO_CHANGE with a fresh push draft written in this round and reviewed for 2 rounds also passes.
+    fresh_no_change = await run_check_done(
+        workflow="dalton-stock-move",
+        params=MOVE_PARAMS,
+        backend=_make_backend(with_stale_push),
+        workspace_id=WS,
+        thread_id="short-1",
+        conversation_run_id="run-nc",
+    )
+    assert fresh_no_change["done"] is True, fresh_no_change["missing"]
+
+    # Same-day morning run had THESIS_STRENGTHENED (and updated debate), while the
+    # current afternoon run has NO_CHANGE and no push draft of its own -> passes.
+    _patch_knowledge(monkeypatch, ["debate"])
+    _patch_verdicts(
+        monkeypatch,
+        [
+            _verdict_row("THESIS_STRENGTHENED", trigger_kind="price_move", run_id="run-morning"),
+            _verdict_row("NO_CHANGE", trigger_kind="price_move", run_id="run-afternoon"),
+        ],
+    )
+    afternoon_no_change = await run_check_done(
+        workflow="dalton-stock-move",
+        params=MOVE_PARAMS,
+        backend=_make_backend(MOVE_FILES),
+        workspace_id=WS,
+        thread_id="short-1",
+        conversation_run_id="run-afternoon",
+    )
+    assert afternoon_no_change["done"] is True, afternoon_no_change["missing"]
+
+    # When the current run's verdict cannot be fetched (run_id has no verdict row)
+    # and there is no push draft -> does NOT skip, reports missing push draft.
+    missing_exec_verdict = await run_check_done(
+        workflow="dalton-stock-move",
+        params=MOVE_PARAMS,
+        backend=_make_backend(MOVE_FILES),
+        workspace_id=WS,
+        thread_id="short-1",
+        conversation_run_id="run-unrecorded",
+    )
+    assert missing_exec_verdict["done"] is False
+    assert any("缺少推送稿" in m and MOVE_PUSH in m for m in missing_exec_verdict["missing"])
 
 
 @pytest.mark.asyncio
 async def test_stock_move_changed_verdict_requires_a_knowledge_update(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    push_up_text = "## 结论\n单日大涨 6%，论点强化。\n"
     _patch_knowledge(monkeypatch, [])
-    _patch_verdicts(monkeypatch, [_verdict_row("THESIS_WEAKENED", trigger_kind="price_move")])
+    _patch_verdicts(
+        monkeypatch,
+        [_verdict_row("THESIS_WEAKENED", trigger_kind="price_move", run_id="conv-run-14pm")],
+    )
     result = await run_check_done(
         workflow="dalton-stock-move", params=MOVE_PARAMS,
-        backend=_make_backend(MOVE_FILES), workspace_id=WS,
+        backend=_make_backend(MOVE_FILES), workspace_id=WS, thread_id="short-1",
     )
     assert result["done"] is False
     assert any("THESIS_WEAKENED" in m and "非 NO_CHANGE" in m for m in result["missing"])
+    assert any("缺少推送稿" in m and MOVE_PUSH in m for m in result["missing"])
 
     _patch_knowledge(monkeypatch, ["debate"])
+    move_round1 = {
+        **MOVE_FILES,
+        MOVE_PUSH: push_up_text,
+        f"{MOVE_PUSH}.language.json": _round1_only_language_json(push_up_text),
+    }
+    r1_res = await run_check_done(
+        workflow="dalton-stock-move", params=MOVE_PARAMS,
+        backend=_make_backend(move_round1), workspace_id=WS, thread_id="short-1",
+    )
+    assert r1_res["done"] is False
+    assert any("缺少第 2 轮" in m and MOVE_PUSH in m for m in r1_res["missing"])
+
+    move_up_done = {
+        **MOVE_FILES,
+        MOVE_PUSH: push_up_text,
+        f"{MOVE_PUSH}.language.json": _language_json(push_up_text),
+    }
     result = await run_check_done(
         workflow="dalton-stock-move", params=MOVE_PARAMS,
-        backend=_make_backend(MOVE_FILES), workspace_id=WS,
+        backend=_make_backend(move_up_done), workspace_id=WS, thread_id="short-1",
     )
     assert result["done"] is True, result["missing"]
+
+    # Same-thread two-round regression THROUGH THE TOOL ENTRYPOINT (`dalton_check_done`
+    # tool itself, `config` carries `run_id="conv-run-14pm"`, tool args omit `run_id`):
+    # Thread created at 09:00 UTC; morning run wrote MOVE_PUSH at 10:00 UTC and
+    # completed 2 rounds; afternoon run created at 14:00 UTC without rewriting -> fails.
+    morning_9am = int(datetime(2026, 10, 23, 9, 0, tzinfo=timezone.utc).timestamp())
+    morning_10am = int(datetime(2026, 10, 23, 10, 0, tzinfo=timezone.utc).timestamp())
+    afternoon_14pm = int(datetime(2026, 10, 23, 14, 0, tzinfo=timezone.utc).timestamp())
+    _patch_knowledge(
+        monkeypatch,
+        ["debate"],
+        start_epochs={
+            "short-1": morning_9am,
+            "conv-run-14pm": afternoon_14pm,
+        },
+    )
+    tool_cfg = {
+        "configurable": {
+            "user_id": "user-1",
+            "workspace_id": WS,
+            "thread_id": "short-1",
+            "run_id": "conv-run-14pm",
+        }
+    }
+    stale_tool = check_done_tools.create_check_done_tools(
+        _make_backend(move_up_done, mtimes={MOVE_PUSH: morning_10am})
+    )[0]
+    stale_msg = await stale_tool.ainvoke(
+        {
+            "name": "dalton_check_done",
+            "args": {"workflow": "dalton-stock-move", "params": MOVE_PARAMS},
+            "id": "call-move-stale",
+            "type": "tool_call",
+        },
+        config=tool_cfg,
+    )
+    stale_same_day = json.loads(stale_msg.content)
+    assert stale_same_day["done"] is False
+    assert any("早于本轮运行开始时间" in m and MOVE_PUSH in m for m in stale_same_day["missing"])
+
+    # Once the afternoon run rewrites MOVE_PUSH at/after 14:00 UTC and reviews 2 rounds,
+    # calling `dalton_check_done` through the tool entrypoint passes.
+    push_down_text = "## 结论\n盘中回落下跌 5%，核心支柱削弱。\n"
+    move_down_done = {
+        **MOVE_FILES,
+        MOVE_PUSH: push_down_text,
+        f"{MOVE_PUSH}.language.json": _language_json(push_down_text),
+    }
+    fresh_tool = check_done_tools.create_check_done_tools(
+        _make_backend(move_down_done, mtimes={MOVE_PUSH: afternoon_14pm})
+    )[0]
+    fresh_msg = await fresh_tool.ainvoke(
+        {
+            "name": "dalton_check_done",
+            "args": {"workflow": "dalton-stock-move", "params": MOVE_PARAMS},
+            "id": "call-move-fresh",
+            "type": "tool_call",
+        },
+        config=tool_cfg,
+    )
+    down_ok = json.loads(fresh_msg.content)
+    assert down_ok["done"] is True, down_ok["missing"]
+
+
+@pytest.mark.asyncio
+async def test_preview_and_deep_require_push_draft_even_when_main_draft_reviewed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    push_text = "## 结论\n维持。\n"
+    _patch_knowledge(monkeypatch, ["drivers", "debate"])
+    _patch_verdicts(monkeypatch, [_verdict_row("NO_CHANGE", trigger_kind="earnings")])
+
+    # 1. dalton-earnings-preview: main draft has 2 rounds of language review, but push draft is missing.
+    preview_no_push = _preview_files()
+    preview_no_push.pop(PREVIEW_PUSH)
+    preview_no_push.pop(f"{PREVIEW_PUSH}.language.json")
+    missing_push = await run_check_done(
+        workflow="dalton-earnings-preview",
+        params=PREVIEW_PARAMS,
+        backend=_make_backend(preview_no_push),
+        workspace_id=WS,
+        thread_id="short-1",
+    )
+    assert missing_push["done"] is False
+    assert any("缺少推送稿" in m and PREVIEW_PUSH in m for m in missing_push["missing"])
+
+    # Push draft with round 1 only -> reports missing round 2.
+    preview_r1 = dict(preview_no_push)
+    preview_r1[PREVIEW_PUSH] = push_text
+    preview_r1[f"{PREVIEW_PUSH}.language.json"] = _round1_only_language_json(push_text)
+    r1_res = await run_check_done(
+        workflow="dalton-earnings-preview",
+        params=PREVIEW_PARAMS,
+        backend=_make_backend(preview_r1),
+        workspace_id=WS,
+        thread_id="short-1",
+    )
+    assert r1_res["done"] is False
+    assert any("缺少第 2 轮" in m and PREVIEW_PUSH in m for m in r1_res["missing"])
+
+    # Push draft written in this round + 2 rounds complete -> passes.
+    preview_ok = dict(preview_no_push)
+    preview_ok[PREVIEW_PUSH] = push_text
+    preview_ok[f"{PREVIEW_PUSH}.language.json"] = _language_json(push_text)
+    ok_res = await run_check_done(
+        workflow="dalton-earnings-preview",
+        params=PREVIEW_PARAMS,
+        backend=_make_backend(preview_ok),
+        workspace_id=WS,
+        thread_id="short-1",
+    )
+    assert ok_res["done"] is True, ok_res["missing"]
+
+    # 2. earnings-deep-update: main draft has 2 rounds of language review, but push draft is missing.
+    deep_params = {
+        "ticker": "META",
+        "quarter": "FY26Q3",
+        "workspace_dir": ".",
+        "release_date": "2026-10-23",
+        "manual": True,
+    }
+    deep_draft = "drafts/2026-10-23-deep-FY26Q3.md"
+    deep_text = "# 深度点评\n" + "内容" * 300
+    deep_push = "research/push/2026-10-23-earnings-deep-FY26Q3.md"
+    deep_files = _with_full_language_sidecars(
+        {
+            deep_draft: deep_text,
+            "drafts/2026-10-23-deep-FY26Q3.audit.md": _sidecar_for(deep_text),
+            "research/2026-10-23-deep-FY26Q3/thesis-calibration.md": "校准" * 100,
+            "research/2026-10-23-deep-FY26Q3/management-delta.md": "指引" * 50,
+            "research/2026-10-23-deep-FY26Q3/reconcile.md": "对账" * 50,
+            "research/2026-10-23-deep-FY26Q3/reconcile.json": '{"wrong": 0, "partial": 0}',
+            "research/2026-10-23-deep-FY26Q3/review.json": json.dumps(
+                {
+                    "verdict": "pass",
+                    "summary": "ok",
+                    "must_fix": [],
+                    "draft_sha256": _draft_hash(deep_text),
+                }
+            ),
+            "research/2026-10-23-deep-FY26Q3/knowledge-revision.json": json.dumps(
+                {"thesis": {"ops": [{"op": "set", "value": "x" * 40}]}}
+            ),
+        }
+    )
+    _patch_knowledge(monkeypatch, ["thesis", "debate", "drivers", "management"])
+
+    deep_missing_push = await run_check_done(
+        workflow="earnings-deep-update",
+        params=deep_params,
+        backend=_make_backend(deep_files),
+        workspace_id=WS,
+        thread_id="short-1",
+    )
+    assert deep_missing_push["done"] is False
+    assert any("缺少推送稿" in m and deep_push in m for m in deep_missing_push["missing"])
+
+    deep_r1 = dict(deep_files)
+    deep_r1[deep_push] = push_text
+    deep_r1[f"{deep_push}.language.json"] = _round1_only_language_json(push_text)
+    deep_r1_res = await run_check_done(
+        workflow="earnings-deep-update",
+        params=deep_params,
+        backend=_make_backend(deep_r1),
+        workspace_id=WS,
+        thread_id="short-1",
+    )
+    assert deep_r1_res["done"] is False
+    assert any("缺少第 2 轮" in m and deep_push in m for m in deep_r1_res["missing"])
+
+    deep_files[deep_push] = push_text
+    deep_files[f"{deep_push}.language.json"] = _language_json(push_text)
+    deep_reviewed = await run_check_done(
+        workflow="earnings-deep-update",
+        params=deep_params,
+        backend=_make_backend(deep_files),
+        workspace_id=WS,
+        thread_id="short-1",
+    )
+    assert deep_reviewed["done"] is True, deep_reviewed["missing"]
+
+
+@pytest.mark.asyncio
+async def test_weekly_and_earnings_calendar_push_draft_and_unreadable_start_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_knowledge(monkeypatch, [])
+    push_text = "## 结论\n本周确认 3 家。\n"
+
+    # 1. weekly-coverage-review
+    weekly_params = {
+        "home_dir": "dalton",
+        "end": "2026-10-23",
+        "coverage_path": "dalton/coverage.yaml",
+    }
+    weekly_push = "research/push/2026-10-23-director-weekly.md"
+    weekly_base = {
+        "dalton/research/weekly-2026-10-23/screen.json": json.dumps(
+            {"core": [{"ticker": "META", "workspace": "Meta"}], "flagged": []}
+        ),
+        "dalton/research/weekly-2026-10-23/attribution.json": json.dumps({"rows": ["x" * 60]}),
+        "dalton/research/weekly-2026-10-23/core-META.md": "META " * 50,
+        "dalton/drafts/2026-10-23-weekly.md": "周会" * 300,
+    }
+    weekly_missing = await run_check_done(
+        workflow="weekly-coverage-review",
+        params=weekly_params,
+        backend=_make_backend(weekly_base),
+        workspace_id=None,
+        thread_id="short-1",
+    )
+    assert weekly_missing["done"] is False
+    assert any("缺少推送稿" in m and weekly_push in m for m in weekly_missing["missing"])
+
+    weekly_r1 = {
+        **weekly_base,
+        weekly_push: push_text,
+        f"{weekly_push}.language.json": _round1_only_language_json(push_text),
+    }
+    weekly_r1_res = await run_check_done(
+        workflow="weekly-coverage-review",
+        params=weekly_params,
+        backend=_make_backend(weekly_r1),
+        workspace_id=None,
+        thread_id="short-1",
+    )
+    assert weekly_r1_res["done"] is False
+    assert any("缺少第 2 轮" in m and weekly_push in m for m in weekly_r1_res["missing"])
+
+    weekly_ok = {
+        **weekly_base,
+        weekly_push: push_text,
+        f"{weekly_push}.language.json": _language_json(push_text),
+    }
+    weekly_ok_res = await run_check_done(
+        workflow="weekly-coverage-review",
+        params=weekly_params,
+        backend=_make_backend(weekly_ok),
+        workspace_id=None,
+        thread_id="short-1",
+    )
+    assert weekly_ok_res["done"] is True, weekly_ok_res["missing"]
+
+    # 2. dalton-earnings-calendar
+    cal_path = "research/push/2026-10-23-earnings-calendar.md"
+    cal_params = {"as_of": "2026-10-23"}
+
+    cal_missing = await run_check_done(
+        workflow="dalton-earnings-calendar",
+        params=cal_params,
+        backend=_make_backend({}),
+        workspace_id=None,
+        thread_id="short-1",
+    )
+    assert cal_missing["done"] is False
+    assert any("缺少推送稿" in m and cal_path in m for m in cal_missing["missing"])
+
+    cal_r1 = await run_check_done(
+        workflow="dalton-earnings-calendar",
+        params=cal_params,
+        backend=_make_backend(
+            {
+                cal_path: push_text,
+                f"{cal_path}.language.json": _round1_only_language_json(push_text),
+            }
+        ),
+        workspace_id=None,
+        thread_id="short-1",
+    )
+    assert cal_r1["done"] is False
+    assert any("缺少第 2 轮" in m and cal_path in m for m in cal_r1["missing"])
+
+    cal_ok_files = {
+        cal_path: push_text,
+        f"{cal_path}.language.json": _language_json(push_text),
+    }
+    cal_ok = await run_check_done(
+        workflow="dalton-earnings-calendar",
+        params=cal_params,
+        backend=_make_backend(cal_ok_files),
+        workspace_id=None,
+        thread_id="short-1",
+    )
+    assert cal_ok["done"] is True, cal_ok["missing"]
+
+    # 3. Run start time unreadable, thread start time readable -> uses thread start time.
+    # Also verify the 5s tolerance: mtime = start - 3s counts as current round,
+    # while mtime = start - 10s is rejected as earlier than current round.
+    _patch_knowledge(
+        monkeypatch,
+        [],
+        start_epochs={"conv-run-unknown": None, "short-1": DEFAULT_START_EPOCH},
+    )
+    within_tolerance = await run_check_done(
+        workflow="dalton-earnings-calendar",
+        params=cal_params,
+        backend=_make_backend(cal_ok_files, mtimes={cal_path: DEFAULT_START_EPOCH - 3}),
+        workspace_id=None,
+        thread_id="short-1",
+        conversation_run_id="conv-run-unknown",
+    )
+    assert within_tolerance["done"] is True, within_tolerance["missing"]
+
+    outside_tolerance = await run_check_done(
+        workflow="dalton-earnings-calendar",
+        params=cal_params,
+        backend=_make_backend(cal_ok_files, mtimes={cal_path: DEFAULT_START_EPOCH - 10}),
+        workspace_id=None,
+        thread_id="short-1",
+        conversation_run_id="conv-run-unknown",
+    )
+    assert outside_tolerance["done"] is False
+    assert any(
+        "早于本轮运行开始时间" in m and cal_path in m
+        for m in outside_tolerance["missing"]
+    )
+
+    # 4. Both run and thread start times unreadable -> fail-closed (reports missing).
+    _patch_knowledge(
+        monkeypatch,
+        [],
+        start_epochs={"conv-run-unknown": None, "short-1": None},
+    )
+    unreadable_start = await run_check_done(
+        workflow="dalton-earnings-calendar",
+        params=cal_params,
+        backend=_make_backend(cal_ok_files),
+        workspace_id=None,
+        thread_id="short-1",
+        conversation_run_id="conv-run-unknown",
+    )
+    assert unreadable_start["done"] is False
+    assert any(
+        "无法读取本轮运行开始时间" in m and cal_path in m
+        for m in unreadable_start["missing"]
+    )
 
 
 @pytest.mark.asyncio
@@ -2532,7 +3078,7 @@ async def test_manual_window_falls_back_to_last_24h_for_latest_as_of(
         "research/notes/fresh.md": "一小时前的笔记" * 50,
         "research/notes/old.md": "25 小时前的笔记" * 50,
     }
-    _patch_knowledge(monkeypatch, ["drivers", "debate"])
+    _patch_knowledge(monkeypatch, ["drivers", "debate"], thread_start_epoch=None)
     _patch_verdicts(monkeypatch, [_verdict_row("NO_CHANGE", trigger_kind="earnings")])
 
     now = int(time.time())

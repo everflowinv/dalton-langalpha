@@ -978,6 +978,8 @@ async def _check_closing(
     user_id: str | None,
     run_id: str | None = None,
     thread_id: str | None = None,
+    *,
+    conversation_run_id: str | None = None,
 ) -> tuple[list[str], list[str], str]:
     missing: list[str] = []
     warnings: list[str] = []
@@ -1091,10 +1093,29 @@ async def _check_closing(
     if lang_rule:
         required = lang_rule.get("required", True)
         gaps = await _check_language_review(
-            backend, lang_rule, params, contract, run_id, thread_id
+            backend,
+            lang_rule,
+            params,
+            contract,
+            run_id,
+            thread_id,
         )
         for gap in gaps:
             (missing if required else warnings).append(gap)
+
+    push_rule = closing.get("push_draft")
+    if push_rule:
+        missing.extend(
+            await _check_push_draft(
+                backend,
+                push_rule,
+                params,
+                contract,
+                run_id,
+                thread_id,
+                conversation_run_id=conversation_run_id,
+            )
+        )
     return missing, warnings, since_label
 
 
@@ -1171,6 +1192,31 @@ async def _collect_run_dispatch_files(
     return sorted(files), started
 
 
+async def _run_start_epoch(run_id: str | None) -> int | None:
+    """The run's ``created_at`` as epoch seconds from ``conversation_responses``;
+    None when it cannot be read (no id, or the database is out of reach in this
+    context)."""
+    if not run_id:
+        return None
+    try:
+        async with get_db_connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT EXTRACT(EPOCH FROM created_at)::bigint "
+                    "FROM conversation_responses WHERE conversation_response_id = %s",
+                    (run_id,),
+                )
+                row = await cur.fetchone()
+    except Exception as error:
+        logger.warning(
+            "dalton_check_done run start query failed", error=str(error)
+        )
+        return None
+    if not row or isinstance(row[0], bool) or not isinstance(row[0], (int, float)):
+        return None
+    return int(row[0])
+
+
 async def _thread_start_epoch(thread_id: str | None) -> int | None:
     """The thread's ``created_at`` as epoch seconds; None when it cannot be
     read (no id, or the database is out of reach in this context)."""
@@ -1192,9 +1238,25 @@ async def _thread_start_epoch(thread_id: str | None) -> int | None:
         return None
     if not row or isinstance(row[0], bool) or not isinstance(row[0], (int, float)):
         # Anything but a real epoch (a stub cursor's mock, a NULL) reads as
-        # "thread start unknown" — the caller falls back to the 24h window.
+        # "thread start unknown": the manual window then falls back to 24h,
+        # the push-draft check fails closed.
         return None
     return int(row[0])
+
+
+async def _push_draft_since_epoch(
+    conversation_run_id: str | None,
+    thread_id: str | None,
+) -> int | None:
+    """Start epoch of the current conversation turn for push-draft freshness:
+    1. ``_run_start_epoch(conversation_run_id)`` from ``conversation_responses``,
+    2. ``_thread_start_epoch(thread_id)`` from ``conversation_threads``.
+    Never consults workflow journals or ``as_of`` midnight; returns ``None``
+    when neither can be read so the caller fails closed."""
+    started = await _run_start_epoch(conversation_run_id)
+    if started is not None:
+        return started
+    return await _thread_start_epoch(thread_id)
 
 
 async def _manual_since_epoch(
@@ -1546,6 +1608,85 @@ async def _check_language_review(
     return gaps
 
 
+# 5s tolerance absorbs Postgres `::bigint` rounding, 1s `stat -c %Y` granularity, and minor host/sandbox clock skew.
+_PUSH_DRAFT_MTIME_TOLERANCE_SECONDS = 5
+
+
+async def _is_current_run_no_change(conversation_run_id: str | None) -> bool:
+    """True only when the current conversation run recorded a ``NO_CHANGE``
+    verdict via ``get_verdict_for_execution(run_id=conversation_run_id)``."""
+    try:
+        from src.dalton.database.verdicts import get_verdict_for_execution
+
+        row = await get_verdict_for_execution(run_id=conversation_run_id)
+    except Exception as error:
+        logger.warning(
+            "dalton_check_done execution verdict query failed", error=str(error)
+        )
+        return False
+    return isinstance(row, dict) and row.get("word") == "NO_CHANGE"
+
+
+async def _check_push_draft(
+    backend: Any,
+    rule: dict[str, Any],
+    params: dict[str, Any],
+    contract: dict[str, Any],
+    run_id: str | None,
+    thread_id: str | None,
+    *,
+    conversation_run_id: str | None = None,
+) -> list[str]:
+    """Check ``closing.push_draft``: file existence, written in the current
+    round (mtime >= run/thread start epoch - 5s tolerance, fail-closed when
+    unreadable), and two-round language review matching current file sha256."""
+    path = render_template(rule["path"], params)
+    skip_no_change = (
+        await _is_current_run_no_change(conversation_run_id)
+        if rule.get("skip_when_no_change")
+        else False
+    )
+    status, _ = await _read_text_diagnosed(backend, path)
+    if status == "error":
+        return [f"推送稿读取出错（{path}），无法核对，请重试。"]
+    if status == "missing":
+        if skip_no_change:
+            return []
+        return [
+            f"缺少推送稿 {path}（文件不存在）；"
+            f"下一步：写入本轮推送稿 {path}，调用 check_language(round=1) 并按清单修改，"
+            "内容定稿后再调用 check_language(round=2)。"
+        ]
+
+    since_epoch = await _push_draft_since_epoch(conversation_run_id, thread_id)
+    if since_epoch is None:
+        return [
+            f"无法读取本轮运行开始时间（run_id 与 thread_id 均未读到开始时间），"
+            f"无法核对推送稿 {path} 是否为本轮写入，请重试。"
+        ]
+
+    info = await _file_info(backend, path)
+    if info.mtime_epoch is None:
+        return [f"无法读取推送稿修改时间（{path}），无法核对是否为本轮写入，请重试。"]
+    if info.mtime_epoch < since_epoch - _PUSH_DRAFT_MTIME_TOLERANCE_SECONDS:
+        if skip_no_change:
+            return []
+        return [
+            f"推送稿 {path} 修改时间（{info.mtime_epoch}）早于本轮运行开始时间（{since_epoch}），"
+            f"非本轮新写；下一步：用本轮内容重写 {path}，并重新完成 check_language(round=1) 与 check_language(round=2)。"
+        ]
+
+    gap = await _check_language_record(
+        backend,
+        path,
+        accept_review_sha=False,
+        workflow=contract["name"],
+        run_id=run_id,
+        thread_id=thread_id,
+    )
+    return [gap] if gap else []
+
+
 async def _check_draft_sidecar(backend: Any, draft: str) -> str:
     """"" when ``draft``'s check_draft sidecar records the CURRENT draft's
     hash, else the gap."""
@@ -1766,6 +1907,7 @@ async def run_check_done(
     user_id: str | None = None,
     run_id: str | None = None,
     thread_id: str | None = None,
+    conversation_run_id: str | None = None,
 ) -> dict[str, Any]:
     """The whole read-only check; returns ``{done, missing, warnings, checked}``.
 
@@ -1820,7 +1962,14 @@ async def run_check_done(
         missing.extend(stage_missing)
         warnings.extend(stage_warnings)
         close_missing, close_warnings, since_label = await _check_closing(
-            contract, params, backend, workspace_id, user_id, run_id, thread_id
+            contract,
+            params,
+            backend,
+            workspace_id,
+            user_id,
+            run_id,
+            thread_id,
+            conversation_run_id=conversation_run_id,
         )
         missing.extend(close_missing)
         warnings.extend(close_warnings)
@@ -1839,10 +1988,11 @@ async def run_check_done(
     }
 
 
-# Home (Chief of Staff) runs only the weekly review; the company workflows'
-# contracts need a workspace's knowledge layer, so that role may not check them.
+# Home (Chief of Staff) runs only the weekly review and earnings calendar; the
+# company workflows' contracts need a workspace's knowledge layer, so that role
+# may not check them.
 _ROLE_WORKFLOWS: dict[str, frozenset[str]] = {
-    "chief_of_staff": frozenset({"weekly-coverage-review"}),
+    "chief_of_staff": frozenset({"weekly-coverage-review", "dalton-earnings-calendar"}),
 }
 
 
@@ -1864,7 +2014,7 @@ def create_check_done_tools(
     ) -> str:
         """对照完成契约核对一次 workflow/多步 skill 是否真的做完，汇报完成前必须调用。
 
-        传 workflow 名（initial-coverage、full-coverage、bullbear-doc、earnings-deep-update、weekly-coverage-review、topic-research 之一）或多步 skill 名（dalton-earnings-preview、dalton-earnings-flash、dalton-stock-move、dalton-filing-review、dalton-thesis-delta、dalton-call、dalton-publish 之一，params 按该 SKILL 收尾段所列），params 用启动时的同一组参数；run_id 传本次运行的 task id（.progress.json 的 run_id），不传则取本线程最近一次同名 workflow 的 run。
+        传 workflow 名（initial-coverage、full-coverage、bullbear-doc、earnings-deep-update、weekly-coverage-review、topic-research 之一）或多步 skill 名（dalton-earnings-preview、dalton-earnings-flash、dalton-stock-move、dalton-filing-review、dalton-thesis-delta、dalton-call、dalton-publish、dalton-earnings-calendar 之一，params 按该 SKILL 收尾段所列），params 用启动时的同一组参数；run_id 传本次运行的 task id（.progress.json 的 run_id），不传则取本线程最近一次同名 workflow 的 run。
         workflow 关闭、按 SKILL 手动降级执行时，params 加 "manual": true，审稿改核对 SKILL 指定的 review.json。
         只读不改：重查文件、哈希、校验脚本、知识层版本、verdict、本次 run 的审稿 pass 与语言审查两轮记录。不通过时先补齐 missing 再查；补不了的只能汇报"未完成"。
         Returns: JSON {done, missing, warnings}，missing 为中文缺项与下一步。
@@ -1880,7 +2030,9 @@ def create_check_done_tools(
                 ensure_ascii=False,
                 indent=2,
             )
-        user_id, workspace_id, thread_id, _ = _extract_run_identity(config)
+        user_id, workspace_id, thread_id, conversation_run_id = _extract_run_identity(
+            config
+        )
         if not isinstance(params, dict):
             params = {"as_of": params}
         try:
@@ -1892,6 +2044,7 @@ def create_check_done_tools(
                 user_id=user_id,
                 run_id=run_id,
                 thread_id=thread_id,
+                conversation_run_id=conversation_run_id,
             )
         except Exception as error:
             result = {

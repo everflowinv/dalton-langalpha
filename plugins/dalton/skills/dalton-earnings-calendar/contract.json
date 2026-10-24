@@ -1,0 +1,16 @@
+{
+  "name": "dalton-earnings-calendar",
+  "params_required": [
+    "as_of"
+  ],
+  "stages": [
+    {
+      "name": "财报日历周报"
+    }
+  ],
+  "closing": {
+    "push_draft": {
+      "path": "research/push/{as_of}-earnings-calendar.md"
+    }
+  }
+}

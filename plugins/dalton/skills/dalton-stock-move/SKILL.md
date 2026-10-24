@@ -199,15 +199,16 @@ python3 .agents/skills/dalton-stock-move/scripts/move_quant.py analyze \
    - `agenda_ops`：把下一项验证写入议程（或更新已有验证项）。
 2. **更新知识层**：
    - 若某条 debate 的倾向或证据因本次事件发生证实/证伪，或某个驱动变量有新读数，调用 `knowledge_update(doc="debate", ops=OPS, reason=REASON)`（`doc` 可为 `"debate"` | `"drivers"` | `"thesis"`）更新。
-3. **价格触发推送纪律**：
-   - **若判定为 `sector_beta` 且第 1–6 步确认无个股基本面事件**：只执行 `knowledge_append_verdict`（记 `NO_CHANGE`、`progress="none"`），**不向 PM 推送消息**。
-   - **若为 `stock_specific`、`mixed`，或虽为板块波动但伴随本公司特定事件/影响 thesis**：推送归因摘要给 PM。
+3. **价格触发推送纪律（只看最终 verdict，归因分类不影响）**：
+   - 先确定第 1 步写入的最终五词 `verdict`：
+   - **若最终 `verdict` 为 `NO_CHANGE`**：**不向 PM 推送消息**，也不写推送稿、不跑语言审查（无论归因分类是 `sector_beta`、`stock_specific` 还是 `mixed`）。
+   - **若最终 `verdict` 不是 `NO_CHANGE`**：按 `.agents/skills/dalton-conventions/SKILL.md` §8 将本轮推送正文写入 `research/push/<异动日 YYYY-MM-DD>-stock-move.md`（同日上涨、下跌各跑一次时，后一次重写该文件并重新审两轮）并完成两轮 `check_language`，最后回复与该推送稿逐字相同。
 
 ### 收尾门禁：汇报完成前必须过完成契约（`dalton_check_done`）
 
 - 向 PM 汇报“完成”（或静默 beta 轮次记 `NO_CHANGE` 收尾）前，必须调用 `dalton_check_done(workflow="dalton-stock-move", params={"ticker": ..., "as_of": "<异动日 YYYY-MM-DD>"})`（`as_of` 传本次异动发生的那一天，与归因笔记 `research/<异动日 YYYY-MM-DD>-stock-move.md` 的日期一致）。
-- 契约要求：`research/<异动日>-stock-move.md` 归因笔记、本轮 `trigger.kind="price_move"` 的 verdict；verdict 不是 `NO_CHANGE` 时，`thesis`/`debate`/`drivers`/`management` 至少一份须有本轮 `knowledge_update` 写入的新版本。
-- `done=false` 时按 `missing` 先补齐再查（归因笔记缺失就补写、verdict 未写就 `knowledge_append_verdict`、非 `NO_CHANGE` 却没有知识更新就对受影响的文档 `knowledge_update`）；补不了的缺项只能汇报“未完成”并列出缺项与原因，不得汇报“完成”。
+- 契约要求：`research/<异动日>-stock-move.md` 归因笔记、本轮 `trigger.kind="price_move"` 的 verdict；verdict 不是 `NO_CHANGE` 时，`thesis`/`debate`/`drivers`/`management` 至少一份须有本轮 `knowledge_update` 写入的新版本，且本轮写入的 `research/push/<异动日>-stock-move.md` 须完成两轮 `check_language`。
+- `done=false` 时按 `missing` 先补齐再查（归因笔记缺失就补写、verdict 未写就 `knowledge_append_verdict`、非 `NO_CHANGE` 却没有知识更新就对受影响的文档 `knowledge_update`、非 `NO_CHANGE` 且推送稿未在本轮重写或缺语言审查轮次就补写并跑 `check_language`）；补不了的缺项只能汇报“未完成”并列出缺项与原因，不得汇报“完成”。
 
 ---
 

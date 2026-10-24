@@ -81,8 +81,9 @@ Workflow 完成后，研究总监在 Home 执行收尾动作：
 2. **追加重点议程备注**：
    - 对本周出现重大异动、证据缺口或需要下周重点跟踪的问题，调用研究总监工具 `dalton_agenda_note` 追加到对应公司的 `agenda` 中。
 3. **汇报完成前必须过完成契约（`dalton_check_done`）**：
-   - 在 Home 调用 `dalton_check_done(workflow="weekly-coverage-review", run_id=<`dalton/research/weekly-<end>/.progress.json` 里的 run_id>, params={"home_dir": "dalton", "end": "<YYYY-MM-DD>", "coverage_path": "dalton/coverage.yaml"})`（研究总监角色只能核对 `weekly-coverage-review`；`workflow.enabled` 已关闭、手动执行时不传 `run_id`，在 `params` 中加 `"manual": true`）；
-   - `done=false` 时按 `missing` 先补齐再查（`screen.json`、`attribution.json`、`core-*.md`、周会稿均须存在且非占位）；补不了的只能汇报"未完成"并列出缺项，不得汇报"完成"。
+   - **推送稿两轮语言审查与原样回复**：按 `.agents/skills/dalton-conventions/SKILL.md` §8 在调 `dalton_check_done` 前将推送正文写入 Home 工作区下的 `research/push/<end>-director-weekly.md` 并完成两轮 `check_language`，最后回复与该推送稿逐字相同；
+   - 在 Home 调用 `dalton_check_done(workflow="weekly-coverage-review", run_id=<`dalton/research/weekly-<end>/.progress.json` 里的 run_id>, params={"home_dir": "dalton", "end": "<YYYY-MM-DD>", "coverage_path": "dalton/coverage.yaml"})`（研究总监角色可核对 `weekly-coverage-review` 与 `dalton-earnings-calendar`；`workflow.enabled` 已关闭、手动执行时不传 `run_id`，在 `params` 中加 `"manual": true`）；
+   - `done=false` 时按 `missing` 先补齐再查（`screen.json`、`attribution.json`、`core-*.md`、周会稿与推送稿两轮语言审查均须通过）；补不了的只能汇报"未完成"并列出缺项，不得汇报"完成"。
 4. **统计与推送 PM**（完成契约通过后）：
    - 统计全覆盖公司本周事件五词（`NO_CHANGE` / `THESIS_STRENGTHENED` / `THESIS_WEAKENED` / `THESIS_BROKEN` / `NEW_THESIS`）分布；
    - 将周会稿中的**“本周判断（3–6 条）”**与**“Conviction call（或本周暂无高 conviction）”**推送给 PM；

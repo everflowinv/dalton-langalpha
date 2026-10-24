@@ -78,3 +78,10 @@ Dalton 继承 `.agents/skills/research-conventions/SKILL.md` 的通用投研纪�
 - **受控写入**：修改认知必须调用 `knowledge_update` 或 `knowledge_append_verdict`（PK.4），不得直接手改渲染出的 `.md`（直接改会被记录为 `direct_edit` 并提示合入）；`agent.md` 中的 `<!-- dalton:summary:start (由 knowledge_update 维护，勿手改) -->` 至 `<!-- dalton:summary:end -->` 托管块（PK.6）由工具自动重写，切勿手动编辑。
 - **基金 Wiki 只读**：`company-wiki` 仅作只读检索源，不回写；所有新增研究发现、论点演进与正式报告均写入本公司工作区知识层及 `published/` 目录。
 - **覆盖名单位置**：覆盖名单由系统按用户维护，通过 Chief of Staff 修改，自动渲染到用户 Home 下的 `../Home/dalton/coverage.yaml`（Home 工作区内为 `dalton/coverage.yaml`）。
+
+## 8. 自动化推送稿与两轮语言审查约定
+
+每次会向 PM 推送的运行（`earnings_tm3`、`earnings_t0`、`earnings_tp1`、非 `NO_CHANGE` 的 `price_move`、`director_weekly`、`earnings_calendar`），在结束与调用 `dalton_check_done` 前必须执行推送稿两轮语言审查：
+
+1. **推送稿落盘（路径由各 skill 给定，不要自己拼自动化名）**：把最后一条回复要发送的正文写入该 skill 收尾步骤指定的固定路径（`dalton-earnings-preview` 写 `research/push/{as_of}-earnings-preview-{quarter}.md`，`dalton-earnings-flash` 写 `research/push/{as_of}-earnings-flash-{quarter}.md`，`dalton-earnings-deep` 写 `research/push/{release_date}-earnings-deep-{quarter}.md`，`dalton-stock-move` 写 `research/push/{as_of}-stock-move.md`〔同日多次触发时直接重写该文件并重新审两轮〕，`dalton-weekly-review` 写 Home 下的 `research/push/{end}-director-weekly.md`，`dalton-earnings-calendar` 写 Home 下的 `research/push/{as_of}-earnings-calendar.md`）。内容按通知卡片支持的 `## 结论`、`## 要点`、`## 下一步验证`、`## 来源` 四节组织，**`## 结论` 段必须放在最前**（卡片空间受限时只取首段）。`price_move`（`dalton-stock-move`）只看最终五词 verdict：verdict 为 `NO_CHANGE` 时不推送，也不写推送稿、不跑语言审查。
+2. **两轮语言审查后原样回复**：对本轮写入的推送稿依次调用 `check_language(draft_path=..., round=1)`、按 `.language.md` 清单修改、再调用 `check_language(draft_path=..., round=2)`（若第 2 轮后仍有改动，再跑一次 `round=2` 使记录绑定终稿哈希）；**最后一条回复的正文必须与定稿后的推送稿文件内容逐字相同**。`dalton_check_done` 会检查推送稿是本轮写的、且审完两轮语言审查。

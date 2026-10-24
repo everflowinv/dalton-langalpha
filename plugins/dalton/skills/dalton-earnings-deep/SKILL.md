@@ -114,9 +114,10 @@ Workflow 结束后（或独立模式完成后），由当前主智能体读取 `
    - 写入财报终判（`NO_CHANGE` / `THESIS_STRENGTHENED` / `THESIS_WEAKENED` / `THESIS_BROKEN` / `NEW_THESIS`，`trigger.kind="earnings"`，`trigger.ref` 填 `tp1` 信号 id 或 `"manual"`）；
    - 在 `agenda_ops` 中写入下一季需要跟踪验证的事项；
    - **重大异常升级（PM Escalation）**：若终判为 `THESIS_BROKEN` 或任一核心支柱状态变为 `impaired` / `broken`，必须立即通过通知渠道推送 PM，并在 `agenda_ops` 中写入一条 `pm_handoffs`（PK.14）。
-3. **草稿核验（`check_draft`）**：
+3. **草稿核验（`check_draft`）与推送稿审查**：
    - 末尾合并为单一 `## 引用` 节：确认报告末尾的 `## 引用` 表存在且每个 `[引用N]` 都能在表里找到（每行一条写出核验目标与括号内来源说明，形如 `[引用1]: evidence:E-20261023-01 （法定财报｜SEC 10-Q｜3Q26 季报｜2026-10-28｜accession ...）` 或 `[引用5]: model:model/META-model-v01.xlsx!DCF!C12 （本方模型｜DCF 估值页）`）；
    - 调用 `check_draft` 生成数字核验报告 `drafts/<D>-deep-<quarter>.audit.md`；
+   - **推送稿两轮语言审查与原样回复**：按 `.agents/skills/dalton-conventions/SKILL.md` §8 将推送正文写入 `research/push/<D>-earnings-deep-<quarter>.md` 并完成两轮 `check_language`，最后回复与该推送稿逐字相同。
 4. **汇报完成前必须过完成契约（`dalton_check_done`）**：
    - 调用 `dalton_check_done(workflow="earnings-deep-update", run_id=<`research/<D>-deep-<quarter>/.progress.json` 里的 run_id>, params={"ticker": "<TICKER>", "quarter": "<quarter>", "workspace_dir": "<当前工作区路径>", "release_date": "<D>", "model_path": "<模型路径或 null>"})`（与启动时的参数一致；有模型时 `model_path` 传实际路径如 `"model/META-model-v01.xlsx"`，没有模型时传 `null`）；
    - 走手动降级路径（`workflow.enabled` 已关闭、没有 run）时不传 `run_id`，调用 `dalton_check_done(workflow="earnings-deep-update", params={"ticker": "<TICKER>", "quarter": "<quarter>", "workspace_dir": "<当前工作区路径>", "release_date": "<D>", "model_path": "<模型路径或 null>", "manual": true})`（有模型时 `model_path` 传实际路径，没有模型时传 `null`），审稿结论按 `research/<D>-deep-<quarter>/review.json` 核对；

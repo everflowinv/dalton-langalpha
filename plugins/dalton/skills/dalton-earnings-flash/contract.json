@@ -25,6 +25,9 @@
       "THESIS_BROKEN",
       "NEW_THESIS"
     ],
-    "verdict_trigger": "earnings"
+    "verdict_trigger": "earnings",
+    "push_draft": {
+      "path": "research/push/{as_of}-earnings-flash-{quarter}.md"
+    }
   }
 }

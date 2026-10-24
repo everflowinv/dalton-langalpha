@@ -30,6 +30,10 @@
       "debate",
       "drivers",
       "management"
-    ]
+    ],
+    "push_draft": {
+      "path": "research/push/{as_of}-stock-move.md",
+      "skip_when_no_change": true
+    }
   }
 }

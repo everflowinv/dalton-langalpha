@@ -135,7 +135,8 @@ python3 .agents/skills/dalton-earnings-preview/scripts/predictions.py validate \
    - 调用 `knowledge_update(doc="drivers", ...)` 追加本轮取得的高频指标最新读数；
    - 调用 `knowledge_update(doc="debate", ...)` 标注本次财报可检验的 debate；
    - 调用 `knowledge_append_verdict` 记录事件五词结论（`trigger.kind="earnings"`，`trigger.ref` 填 `<dalton_wake>` 的 `tm3` 信号 id 或 `"manual"`；通常为 `NO_CHANGE`，若前瞻研究已改变判断则如实填写），并在同次调用的 `agenda_ops` 中加入“财报发布当天对照 `research/<D>-preview-<季度>/predictions.json` 逐条核对”的验证项；
-   - 调用 `check_draft(draft_path="drafts/<D>-preview-<季度>.md")` 生成数字核验反馈；PM 要求正式发布时调用 `publish_report(draft_path="drafts/<D>-preview-<季度>.md", title="<公司名>（<TICKER>）<季度> 财报前瞻", kind="earnings_preview", slug="<ticker-lower>-preview-<季度小写>-<D>")`；在回复中将开头“核心判断”三句话与草稿路径呈现给 PM（外部通知由 Dalton 通知模块按用户的飞书开关统一处理）。
+   - 调用 `check_draft(draft_path="drafts/<D>-preview-<季度>.md")` 生成数字核验反馈；PM 要求正式发布时调用 `publish_report(draft_path="drafts/<D>-preview-<季度>.md", title="<公司名>（<TICKER>）<季度> 财报前瞻", kind="earnings_preview", slug="<ticker-lower>-preview-<季度小写>-<D>")`；
+   - **推送稿两轮语言审查与原样回复**：按 `.agents/skills/dalton-conventions/SKILL.md` §8 将推送正文写入 `research/push/<D>-earnings-preview-<季度>.md`，完成两轮 `check_language` 后以该文件全文逐字作为最后回复（外部通知由 Dalton 通知模块按用户的飞书开关统一处理）。
 
 ### 收尾门禁：汇报完成前必须过完成契约（`dalton_check_done`）
 
