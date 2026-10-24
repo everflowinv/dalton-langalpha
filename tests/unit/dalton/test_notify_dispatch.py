@@ -1142,6 +1142,17 @@ def test_format_notify_message_and_frontend_url_resolution(
         assert line.endswith("。")
         assert "半句话内容" not in line
 
+    # Decimals, domains and link targets are not sentence ends.
+    assert extract_summary_lines("净利润同比增长 10.5%。详见 [报告](https://example.com/report)。") == [
+        "净利润同比增长 10.5%。",
+        "详见 [报告](https://example.com/report)。",
+    ]
+    assert extract_summary_lines("营收增长。\n- 净利润同比增长 10.5%") == [
+        "营收增长。",
+        "- 净利润同比增长 10.5%",
+    ]
+    assert extract_summary_lines("营收超预期？！利润增长。") == ["营收超预期？！", "利润增长。"]
+
     msg_with_link = format_notify_message(
         classification,
         verdict_word="THESIS_STRENGTHENED",
@@ -1189,9 +1200,10 @@ def test_feishu_card_schema_2_0_real_sentences_truncation_and_behaviors_button()
     assert c_earn is not None
 
     long_sec = "这是一句超过限制的详细财务分析结论。" * 30  # > 500 chars
+    long_bullets = "\n".join(["- 这是一句超过限制的详细财务分析结论。"] * 30)
     structured_md = (
         f"## 结论\n{long_sec}\n\n"
-        f"## 要点\n- {long_sec}\n\n"
+        f"## 要点\n{long_bullets}\n\n"
         f"## 下一步验证\n{long_sec}\n\n"
         "## 来源\nAlphabet 2026Q1 10-Q 原始披露。"
     )
@@ -1236,12 +1248,14 @@ def test_feishu_card_schema_2_0_real_sentences_truncation_and_behaviors_button()
     assert "跟踪" not in str(one_sent_sections)
     assert "Dalton 自动任务" not in str(one_sent_sections)
 
-    # Unstructured text with 2 sentences: only "结论" and "要点" appear; no fabricated "下一步验证" or "来源"
+    # Unstructured text without headings: kept as a single "结论" section; no fabricated sections
     two_sent_sections = extract_card_sections(
         "本季核心广告营收增速超市场一致预期。云业务营业利润率创历史新高。",
         classification=c_earn,
     )
-    assert [s[0] for s in two_sent_sections] == ["结论", "要点"]
+    assert two_sent_sections == [
+        ("结论", "本季核心广告营收增速超市场一致预期。云业务营业利润率创历史新高。")
+    ]
 
     # Empty text with frontend URL -> card has ONLY header and button (no markdown body elements)
     card_only_header_and_btn = build_feishu_notify_card(
@@ -1459,12 +1473,30 @@ def test_notify_preview_loads_real_result_excerpt_and_fails_without_sample(
     monkeypatch.setattr(pool_mod, "get_db_connection", get_db_conn_spy)
 
     import src.dalton.database.verdicts as verdicts_mod
+    from src.server.app import setup as setup_mod
+    from src.server.services.automation_excerpt import RunAnswer, read_run_answer
+    import src.server.utils.checkpointer as cp_mod
 
     verdict_spy = create_autospec(
         verdicts_mod.get_verdict_for_execution,
         return_value={"word": "THESIS_STRENGTHENED"},
     )
     monkeypatch.setattr(verdicts_mod, "get_verdict_for_execution", verdict_spy)
+
+    fake_checkpointer = object()
+    seen_checkpointers: list[Any] = []
+    get_cp_spy = create_autospec(
+        cp_mod.get_checkpointer, return_value=fake_checkpointer
+    )
+    open_cp_spy = create_autospec(
+        cp_mod.open_checkpointer_pool, return_value=None
+    )
+    close_cp_spy = create_autospec(
+        cp_mod.close_checkpointer_pool, return_value=None
+    )
+    monkeypatch.setattr(notify_preview, "get_checkpointer", get_cp_spy)
+    monkeypatch.setattr(notify_preview, "open_checkpointer_pool", open_cp_spy)
+    monkeypatch.setattr(notify_preview, "close_checkpointer_pool", close_cp_spy)
 
     # 1. Real DB execution record
     rc_ok = notify_preview.main(
@@ -1511,6 +1543,500 @@ def test_notify_preview_loads_real_result_excerpt_and_fails_without_sample(
     )
     assert rc_sample == 0
     assert "--dry-run" in recorded_cmd
+    capsys.readouterr()
+
+    # 4. Initializes checkpointer via get_checkpointer + open_checkpointer_pool, prefers full run answer
+    #    via read_run_answer, closes checkpointer via close_checkpointer_pool, and on fallback prints
+    #    "使用的是截断摘要，正文可能不完整" at the top of output.
+    get_cp_spy.reset_mock()
+    open_cp_spy.reset_mock()
+    close_cp_spy.reset_mock()
+
+    db_row = {
+        "conversation_thread_id": "th-db-full",
+        "conversation_response_id": "run-db-full",
+        "result_excerpt": "## 结论\n截断摘要句。\n\n## 下一步验证\n1. 新确认（均为盘后发布",
+    }
+    full_reply_md = (
+        "## 结论\n"
+        "下周共有 6 家持仓公司发布财报，重点关注云与 AI 资本开支指引。\n\n"
+        "## 下一步验证\n"
+        "1. 新确认（均为盘后发布；盘后立即核对 8-K 与电话会纪要）。"
+    )
+
+    async def _fake_read_answer_ok(thread_id: str, run_id: str) -> RunAnswer:
+        _ = (thread_id, run_id)
+        seen_checkpointers.append(setup_mod.checkpointer)
+        return RunAnswer(text=full_reply_md, sent=None)
+
+    read_answer_ok = create_autospec(
+        read_run_answer,
+        side_effect=_fake_read_answer_ok,
+    )
+    monkeypatch.setattr(notify_preview, "read_run_answer", read_answer_ok)
+
+    rc_full = notify_preview.main(
+        [
+            "--automation",
+            "dalton-earnings-calendar",
+            "--execution",
+            "657975ef-full",
+            "--frontend-url",
+            "https://dalton.example.com",
+        ]
+    )
+    assert rc_full == 0
+    get_cp_spy.assert_called_once()
+    open_cp_spy.assert_awaited_once_with(fake_checkpointer)
+    close_cp_spy.assert_awaited_once_with(fake_checkpointer)
+    assert seen_checkpointers == [fake_checkpointer]
+    read_answer_ok.assert_awaited_once_with("th-db-full", "run-db-full")
+    captured_full = capsys.readouterr()
+    assert "盘后立即核对 8-K 与电话会纪要" in captured_full.out
+    assert "截断摘要句" not in captured_full.out
+    assert "使用的是截断摘要" not in captured_full.out
+    assert "使用的是截断摘要" not in captured_full.err
+
+    # Fallback to result_excerpt when read_run_answer returns empty RunAnswer
+    read_answer_empty = create_autospec(
+        read_run_answer,
+        return_value=RunAnswer(text=None, sent=None),
+    )
+    monkeypatch.setattr(notify_preview, "read_run_answer", read_answer_empty)
+
+    rc_fallback = notify_preview.main(
+        [
+            "--automation",
+            "dalton-earnings-calendar",
+            "--execution",
+            "657975ef-fallback",
+            "--frontend-url",
+            "https://dalton.example.com",
+        ]
+    )
+    assert rc_fallback == 0
+    read_answer_empty.assert_awaited_once_with("th-db-full", "run-db-full")
+    captured_fallback = capsys.readouterr()
+    assert "截断摘要句。" in captured_fallback.out
+    assert "新确认（均为盘后发布" not in captured_fallback.out
+    assert captured_fallback.out.splitlines()[0] == "使用的是截断摘要，正文可能不完整"
+
+    # When conversation_response_id is empty, read_run_answer is NOT called and it falls back to result_excerpt
+    read_answer_not_called = create_autospec(
+        read_run_answer,
+        return_value=RunAnswer(text=full_reply_md, sent=None),
+    )
+    monkeypatch.setattr(notify_preview, "read_run_answer", read_answer_not_called)
+    db_row = {
+        "conversation_thread_id": "th-db-no-run-id",
+        "conversation_response_id": "",
+        "result_excerpt": "## 结论\n无 run_id 的截断摘要句。\n\n## 下一步验证\n1. 未完待续",
+    }
+    rc_no_run_id = notify_preview.main(
+        [
+            "--automation",
+            "dalton-earnings-calendar",
+            "--execution",
+            "657975ef-no-run-id",
+            "--frontend-url",
+            "https://dalton.example.com",
+        ]
+    )
+    assert rc_no_run_id == 0
+    read_answer_not_called.assert_not_called()
+    captured_no_run_id = capsys.readouterr()
+    assert "无 run_id 的截断摘要句。" in captured_no_run_id.out
+    assert "未完待续" not in captured_no_run_id.out
+    assert captured_no_run_id.out.splitlines()[0] == "使用的是截断摘要，正文可能不完整"
+
+
+def test_card_section_sentence_boundary_truncation_and_half_sentence_omission() -> None:
+    """Verify the simplified 5-rule line-based card extraction logic and all regression cases:
+    1. Line-based: preserves headings, ordered/unordered lists, plain paragraphs, and inline bold (**...**).
+    2. Section-based: splits by `## 结论` / `## 要点` / `## 下一步`(/`## 下一步验证`) / `## 来源`;
+       when no headings exist, the entire text becomes the `结论` section.
+    3. Length cap: adds lines in order; when a line does not fit, truncates that line at the last
+       sentence-end punctuation (`。！？；.!?;`) within budget and appends `…`; if nothing remains after
+       truncation, omits that line and ends the section.
+    4. Truncated excerpt (`is_excerpt=True`): only drops the very last line unless it ends with
+       sentence-end punctuation, right bracket, right quote, or `**`. Full reply (`is_excerpt=False`)
+       always keeps the last line.
+    5. Link handling: converts local/relative links to plain text and preserves `http(s)` links.
+    """
+    c_cal = classify_automation_for_notify({"name": "dalton-earnings-calendar"})
+    assert c_cal is not None
+
+    # Regression 1: `**营收增长。**`, `- **利润率**改善。`, `**营收增长。利润率改善。**` all preserved
+    for line_case in ("**营收增长。**", "- **利润率**改善。", "**营收增长。利润率改善。**"):
+        assert extract_card_sections(line_case, is_excerpt=False) == [("结论", line_case)]
+        assert extract_card_sections(line_case, is_excerpt=True) == [("结论", line_case)]
+
+    bold_md = (
+        "## 结论\n"
+        "**营收增长。**\n"
+        "**营收增长。利润率改善。**\n\n"
+        "## 要点\n"
+        "- **利润率**改善。"
+    )
+    assert dict(extract_card_sections(bold_md, classification=c_cal, is_excerpt=False)) == {
+        "结论": "**营收增长。**\n**营收增长。利润率改善。**",
+        "要点": "- **利润率**改善。",
+    }
+
+    # Regression 2: Full reply containing only `- 净利润同比增长 10%` -> preserved
+    assert extract_card_sections("- 净利润同比增长 10%", is_excerpt=False) == [
+        ("结论", "- 净利润同比增长 10%")
+    ]
+    assert extract_card_sections("## 要点\n- 净利润同比增长 10%", is_excerpt=False) == [
+        ("要点", "- 净利润同比增长 10%")
+    ]
+
+    # Regression 3: Full reply ending with `- 净利润同比增长 10%` -> preserved
+    full_reply_trailing_lists_md = (
+        "## 结论\n"
+        "公司业绩稳健增长。\n\n"
+        "## 要点\n"
+        "1. 营业收入同比增长 15%\n"
+        "- 净利润同比增长 10%"
+    )
+    assert dict(
+        extract_card_sections(
+            full_reply_trailing_lists_md,
+            classification=c_cal,
+            is_excerpt=False,
+        )
+    ) == {
+        "结论": "公司业绩稳健增长。",
+        "要点": "1. 营业收入同比增长 15%\n- 净利润同比增长 10%",
+    }
+
+    # Regression 4: `1. 营收增长。` -> preserved as ordered list item
+    assert extract_card_sections("1. 营收增长。", is_excerpt=False) == [
+        ("结论", "1. 营收增长。")
+    ]
+    assert extract_card_sections("## 要点\n1. 营收增长。", is_excerpt=False) == [
+        ("要点", "1. 营收增长。")
+    ]
+
+    # Regression 5: Truncated excerpt ending with `- 广告变现效率环比改善，但二线平台单次点击成本仍在` -> dropped
+    truncated_excerpt_md = (
+        "## 结论\n"
+        "下周重点跟踪科技股财报季表现。\n\n"
+        "## 要点\n"
+        "- 大型云厂商资本开支维持高景气度\n"
+        "- 广告变现效率环比改善，但二线平台单次点击成本仍在"
+    )
+    assert dict(
+        extract_card_sections(
+            truncated_excerpt_md,
+            classification=c_cal,
+            is_excerpt=True,
+        )
+    ) == {
+        "结论": "下周重点跟踪科技股财报季表现。",
+        "要点": "- 大型云厂商资本开支维持高景气度",
+    }
+    assert (
+        extract_card_sections(
+            "- 广告变现效率环比改善，但二线平台单次点击成本仍在",
+            is_excerpt=True,
+        )
+        == []
+    )
+
+    # Regression 6: Truncated excerpt `营收增长。**利润率仍在`:
+    # - When it IS the last line: dropped as a whole line by Rule 4
+    # - When it is NOT the last line: preserved verbatim
+    assert extract_card_sections("营收增长。**利润率仍在", is_excerpt=True) == []
+    assert extract_card_sections(
+        "第一行完整结论。\n营收增长。**利润率仍在",
+        is_excerpt=True,
+    ) == [("结论", "第一行完整结论。")]
+    assert extract_card_sections(
+        "营收增长。**利润率仍在\n最后一行完整结论。",
+        is_excerpt=True,
+    ) == [("结论", "营收增长。**利润率仍在\n最后一行完整结论。")]
+    assert extract_card_sections(
+        "营收增长。**利润率仍在",
+        is_excerpt=False,
+    ) == [("结论", "营收增长。**利润率仍在")]
+
+    # Regression 7: Real fixture from lead — both bullet points in `## 要点` MUST be preserved
+    lead_real_fixture = (
+        "## 结论\n"
+        "财报日历周度刷新（2026-W43）已完成。\n\n"
+        "## 要点\n"
+        "- **GOOGL、MSFT 的前瞻改为周六补跑。** 标准的 T-3 时点是 10/23 08:00，排期时已经过了，周六跑完周一开盘前就能拿到前瞻。\n"
+        "- **MSFT 快讯推迟到 20:00。** 默认是发布后 2.5 小时（18:30），会落在 17:30 开始的电话会中途，所以在 coverage.yaml 里把这个间隔改成 4 小时。"
+    )
+    assert dict(
+        extract_card_sections(
+            lead_real_fixture,
+            classification=c_cal,
+            is_excerpt=False,
+        )
+    ) == {
+        "结论": "财报日历周度刷新（2026-W43）已完成。",
+        "要点": (
+            "- **GOOGL、MSFT 的前瞻改为周六补跑。** 标准的 T-3 时点是 10/23 08:00，排期时已经过了，周六跑完周一开盘前就能拿到前瞻。\n"
+            "- **MSFT 快讯推迟到 20:00。** 默认是发布后 2.5 小时（18:30），会落在 17:30 开始的电话会中途，所以在 coverage.yaml 里把这个间隔改成 4 小时。"
+        ),
+    }
+
+    # Regression 8: Over-length line truncated at the last sentence-end punctuation (`。！？；.!?;`) + `…`;
+    # if nothing remains after truncation, the line is omitted and the section ends.
+    overlong_md = (
+        "## 结论\n"
+        "第一句核心结论非常明确。第二句提出关键问题？第三句表达强烈确认！第四句补充并列分句说明；"
+        "第五句是专门用来超过五十个字符上限的超长尾部完整句子内容所以一定会被截断在第四句分号之后。\n\n"
+        "## 要点\n"
+        "- 第一条完整的列表项内容（含括号说明）\n"
+        "- 第二条完整的列表项内容（同比 +25%）\n"
+        "- 第三条超长列表项内容会导致整节超出字数限制从而在上一条完整列表项边界处结束。\n\n"
+        "## 下一步验证\n"
+        "这是一整段没有任何标点符号而且长度超过五十个字符上限的超长行因为截完一个字都不剩所以整行都不放进卡片里"
+    )
+    sections = extract_card_sections(
+        overlong_md,
+        classification=c_cal,
+        max_summary_chars=50,
+    )
+    sec_map = dict(sections)
+    assert list(sec_map.keys()) == ["结论", "要点"]
+    assert "下一步验证" not in sec_map
+
+    concl = sec_map["结论"]
+    assert len(concl) <= 50
+    assert concl == (
+        "第一句核心结论非常明确。第二句提出关键问题？第三句表达强烈确认！第四句补充并列分句说明；…"
+    )
+    assert "第五句" not in concl
+
+    pts = sec_map["要点"]
+    assert len(pts) <= 50
+    assert pts == (
+        "- 第一条完整的列表项内容（含括号说明）\n"
+        "- 第二条完整的列表项内容（同比 +25%）"
+    )
+    assert "第三条超长列表项" not in pts
+
+    # Regression 9: Real answer fixture from production execution 657975ef (inline constant, never read from .agy/)
+    real_answer_w43_fixture = (
+        "**财报日历周度刷新（2026-W43）已完成。** 覆盖池 4 家 Core 公司里，有 3 家会在未来 21 天内发布财报，日期都已由公司官方确认，9 条 T-3 / T0 / T+1 任务全部排好。日历在 [earnings_calendar.md](/home/workspace/Home/dalton/earnings_calendar.md)，台账在 [earnings-calendar.json](/home/workspace/Home/dalton/earnings-calendar.json)。\n"
+        "\n"
+        "**1. 新确认**（均为盘后发布；新闻稿没写到分钟的发布时点，按规则默认 16:00 ET）\n"
+        "\n"
+        "| 公司 | 财季 | 发布日 | 电话会 (ET) | 官方来源 |\n"
+        "|---|---|---|---|---|\n"
+        "| GOOGL | FY26Q3 | 10/28（周三） | 16:30 | [abc.xyz](https://abc.xyz/investor/news/news-details/2026/Alphabet-Announces-Date-of-Third-Quarter-2026-Financial-Results-Conference-Call-2026-8tpGZsLS6v/default.aspx) |\n"
+        "| MSFT | FY27Q1 | 10/28（周三） | 17:30* | [microsoft.com](https://www.microsoft.com/en-us/investor/events/fy-2027/earnings-fy-2027-q1) |\n"
+        "| AMZN | FY26Q3 | 10/29（周四） | 17:00 | [businesswire.com](https://www.businesswire.com/news/home/20261015676873/en/Amazon.com-to-Webcast-Third-Quarter-2026-Financial-Results-Conference-Call) |\n"
+        "\n"
+        '\\* 微软官方页面只写了日期。"盘后发布、17:30 电话会"来自检索摘要，与微软惯例一致。\n'
+        "\n"
+        "**任务时间表（美东时间，都在各公司工作区里运行）**\n"
+        "\n"
+        "| 任务 | GOOGL | MSFT | AMZN |\n"
+        "|---|---|---|---|\n"
+        "| T-3 前瞻 | 10/24（周六）10:00 | 10/24（周六）10:30 | 10/26（周一）08:00 |\n"
+        "| T0 快讯 | 10/28 18:30 | 10/28 20:00 | 10/29 18:30 |\n"
+        "| T+1 深度 | 10/29 20:00 | 10/29 20:00 | 10/30 20:00 |\n"
+        "\n"
+        "有两处没按默认规则排：\n"
+        "- **GOOGL、MSFT 的前瞻改为周六补跑。** 标准的 T-3 时点是 10/23 08:00，排期时已经过了，周六跑完周一开盘前就能拿到前瞻。\n"
+        "- **MSFT 快讯推迟到 20:00。** 默认是发布后 2.5 小时（18:30），会落在 17:30 开始的电话会中途，所以在 [coverage.yaml](/home/workspace/Home/dalton/coverage.yaml) 里把这个间隔改成 4 小时。\n"
+        "\n"
+        "**2. 未落库：无。** 扫描结果和台账一致，没有遗漏或日期不符。9 个任务文件逐个读回核对：都是一次性任务、状态正常、归属正确的公司工作区，换算成美东时间后的日期和时点也都对得上。\n"
+        "\n"
+        "**3. 解析失败行：无。**\n"
+        "\n"
+        '**4. 改期：无。** 不过 GOOGL、MSFT、AMZN 的议程原来写的是 Yahoo/MarketBeat 给的"待确认"日期，这次已按官方来源改为已确认。\n'
+        "\n"
+        "**5. 本周已发布、仍待官宣与缺工作区**\n"
+        "- **本周已发布：** META FY26Q3 已于 10/21 盘后发布，台账已归档。\n"
+        "- **仍待官宣：** 1 家，META FY26Q4，官方没有公布日期，也没有第三方给出的候选日期，所以不建任务、不按往年外推。\n"
+        "- **缺工作区：** 无。\n"
+        "\n"
+        "**6. 扫描失败：无。**\n"
+        "\n"
+        "**运行中的假设和缺口**\n"
+        "- **覆盖名单是重建的。** 原来的覆盖名单和台账文件都不存在，这次用覆盖看板（剔除 HOME 这个非公司条目）重建了 [coverage.yaml](/home/workspace/Home/dalton/coverage.yaml)，并新建了台账。\n"
+        '- **议程同步方式和要求不一样。** 议程同步工具只能把事件追加为待验证问题，没法直接写进各公司议程的"财报事件"栏（watch.events）。\n'
+        "- **五词结论没能记录。** Home 里没有 `knowledge_append_verdict` 工具，所以本轮的五词结论没写，信号 `weekly:2026-W43` 还没闭环。要么在 Home 开通这个工具，要么由公司工作区代为记录，才能关闭信号。\n"
+        "\n"
+        "下次刷新是 10/31 09:00（上海时间），届时会归档这三家的已发布财季，并复查 META FY26Q4 有没有官宣。\n"
+    )
+    w43_sections = extract_card_sections(
+        real_answer_w43_fixture,
+        classification=c_cal,
+        is_excerpt=False,
+    )
+    expected_w43_first_para = (
+        "**财报日历周度刷新（2026-W43）已完成。** 覆盖池 4 家 Core 公司里，有 3 家会在未来 21 天内发布财报，"
+        "日期都已由公司官方确认，9 条 T-3 / T0 / T+1 任务全部排好。日历在 earnings_calendar.md，台账在 earnings-calendar.json。"
+    )
+    assert w43_sections == [("结论", expected_w43_first_para)]
+    assert "|" not in w43_sections[0][1]
+    assert "**1. 新确认**" not in w43_sections[0][1]
+
+    # Regression 10: Lead-in line (`有两处没按默认规则排：`) + 2 list items:
+    # - When all 3 fit: all 3 lines are present
+    # - When budget only fits the lead-in line: all 3 lines are absent
+    lead_in_and_list_md = (
+        "有两处没按默认规则排：\n"
+        "- 第一条调整说明。\n"
+        "- 第二条调整说明。"
+    )
+    assert extract_card_sections(lead_in_and_list_md, max_summary_chars=100) == [
+        ("结论", "有两处没按默认规则排：\n- 第一条调整说明。\n- 第二条调整说明。")
+    ]
+    assert extract_card_sections(lead_in_and_list_md, max_summary_chars=12) == []
+
+    # Regression 11: Table block that does not fit -> NO `|` lines appear in the section
+    table_over_budget_md = (
+        "首段简短结论。\n\n"
+        "| 公司 | 财季 | 发布日 | 电话会 (ET) |\n"
+        "|---|---|---|---|\n"
+        "| GOOGL | FY26Q3 | 10/28（周三） | 16:30 |"
+    )
+    table_sec = extract_card_sections(table_over_budget_md, max_summary_chars=40)
+    assert table_sec == [("结论", "首段简短结论。")]
+    assert "|" not in table_sec[0][1]
+
+    # Regression 12: `abc.xyz`, `2.5 小时`, `[x](https://a.b/c.d)` are NOT treated as sentence-end
+    # truncation points, while `。` in `增长。后面` IS a truncation point.
+    punct_edge_md = (
+        "增长。后面包含域名 abc.xyz 以及耗时 2.5 小时和链接 [x](https://a.b/c.d) 但直到超长结尾都没有句号"
+    )
+    assert extract_card_sections(punct_edge_md, max_summary_chars=55) == [
+        ("结论", "增长。…")
+    ]
+    no_cjk_punct_md = (
+        "这段文字只有域名 abc.xyz 以及耗时 2.5 小时和链接 [x](https://a.b/c.d) 没有任何句末标点符号所以超长时不会截在点上"
+    )
+    assert extract_card_sections(no_cjk_punct_md, max_summary_chars=55) == []
+
+    # Regression 13 (Round 7 Item 1): Standalone bold subheading detection & never popping truncated blocks
+    assert dispatch_mod._is_standalone_bold_subheading(
+        "**1. 新确认**（均为盘后发布；…默认 16:00 ET）"
+    ) is True
+    assert dispatch_mod._is_standalone_bold_subheading(
+        "**任务时间表（美东时间，都在各公司工作区里运行）**"
+    ) is True
+    assert dispatch_mod._is_standalone_bold_subheading(
+        "**营收增长。** **利润率改善。**"
+    ) is False
+    assert dispatch_mod._is_standalone_bold_subheading(
+        "**结论** 营收增长。"
+    ) is False
+
+    truncated_bold_lead_1 = extract_card_sections(
+        "**核心结论。** " + "后续内容很长。" * 60
+    )
+    assert len(truncated_bold_lead_1) == 1
+    assert truncated_bold_lead_1[0][1].startswith("**核心结论。** 后续内容很长。")
+    assert truncated_bold_lead_1[0][1].endswith("…")
+
+    assert extract_card_sections("**结论** 营收增长。" + "后续说明" * 100) == [
+        ("结论", "**结论** 营收增长。…")
+    ]
+    assert extract_card_sections("**营收增长。** **利润率改善。**") == [
+        ("结论", "**营收增长。** **利润率改善。**")
+    ]
+
+    # Regression 14 (Round 7 Item 2): Unclosed bold after truncation closes `**` before `…`
+    long_bold_wrapped = "**" + "营收增长。" * 80 + "**"
+    bold_trunc_sections = extract_card_sections(long_bold_wrapped)
+    assert len(bold_trunc_sections) == 1
+    bold_trunc_body = bold_trunc_sections[0][1]
+    assert len(bold_trunc_body) <= 320
+    assert bold_trunc_body.startswith("**营收增长。")
+    assert bold_trunc_body.endswith("营收增长。**…")
+    assert bold_trunc_body.count("**") == 2
+
+    # Regression 15 (Round 7 Item 3): Nested brackets inside markdown link label
+    assert extract_card_sections("详见 [报告[修订版]](/home/x.md)。") == [
+        ("结论", "详见 报告[修订版]。")
+    ]
+    nested_link_overlong = (
+        "前缀说明。[报告[修订版]。完整内容](https://example.com) " + "后续无标点超长文字" * 20
+    )
+    assert extract_card_sections(nested_link_overlong, max_summary_chars=30) == [
+        ("结论", "前缀说明。…")
+    ]
+    assert extract_card_sections(
+        "[报告[修订版]。完整内容](https://example.com) " + "后续无标点超长文字" * 20,
+        max_summary_chars=30,
+    ) == []
+
+
+def test_calendar_excerpt_fixture_and_local_markdown_link_stripping() -> None:
+    """Verify:
+    - Sandbox paths (`/home/workspace/...`) and relative/local Markdown links are converted to plain text
+      (keeping only link text), while `http(s)` links are preserved.
+    - Unstructured excerpt without headings is placed in the `结论` section and respects Rule 3 & Rule 4.
+    """
+    c_cal = classify_automation_for_notify({"name": "dalton-earnings-calendar"})
+    assert c_cal is not None
+
+    calendar_excerpt = (
+        "财报日历周度刷新（2026-W43）已完成。 "
+        "覆盖池 4 家 Core 公司里，有 3 家会在未来 21 天内发布财报，日期都已由公司官方确认，"
+        "9 条 T-3 / T0 / T+1 任务全部排好。"
+        "日历在 [earnings_calendar.md](/home/workspace/Home/dalton/earnings_calendar.md)，"
+        "台账在 [earnings-calendar.json](/home/workspace/Home/dalton/earnings-calendar.json)。\n"
+        "1. 新确认（均为盘后发布；新闻稿没写到分钟的发布时点"
+    )
+
+    card = build_feishu_notify_card(
+        c_cal,
+        verdict_word="THESIS_INTACT",
+        final_text=calendar_excerpt,
+        thread_id="51c74434-70b9-4e11-885b-4bd6866a7852",
+        frontend_base_url="https://dalton.example.com",
+        is_excerpt=True,
+    )
+    md_elements = [
+        el["content"]
+        for el in card["body"]["elements"]
+        if el.get("tag") == "markdown"
+    ]
+    assert len(md_elements) == 1
+    assert md_elements[0].startswith("**结论**\n")
+    assert "/home/workspace/" not in md_elements[0]
+    assert "earnings_calendar.md" in md_elements[0]
+    assert "earnings-calendar.json" in md_elements[0]
+    assert "新确认（均为盘后发布" not in md_elements[0]
+
+    # Verify full-answer text containing local and http(s) links
+    answer_with_links_and_footnote = (
+        "## 结论\n"
+        "下周四家公司均在 [2026-04-29](/home/workspace/Home/dalton/2026-04-29.md) 盘后至 04-30 盘后集中披露，"
+        "已写入 [earnings_calendar.md](/home/workspace/Home/dalton/earnings_calendar.md) 与 [本地相对路径](./notes/cal.md)。\n\n"
+        "## 要点\n"
+        "- 微软与 Meta 同日盘后披露，详见 [SEC 8-K](https://www.sec.gov/edgar/searchedgar/companysearch) 及 [IR 页面](http://ir.example.com/msft)。\n"
+        '\\* 微软官方页面只写了日期。"盘后发布、17:30 电话会"来自检索摘要，与微软惯例一致。\n'
+    )
+    card_links = build_feishu_notify_card(
+        c_cal,
+        verdict_word="THESIS_INTACT",
+        final_text=answer_with_links_and_footnote,
+        thread_id="51c74434-70b9-4e11-885b-4bd6866a7852",
+        frontend_base_url="https://dalton.example.com",
+    )
+    links_md = "\n".join(
+        el["content"]
+        for el in card_links["body"]["elements"]
+        if el.get("tag") == "markdown"
+    )
+    assert "/home/workspace/" not in links_md
+    assert "./notes/cal.md" not in links_md
+    assert "earnings_calendar.md" in links_md
+    assert "2026-04-29" in links_md
+    assert "本地相对路径" in links_md
+    assert "[SEC 8-K](https://www.sec.gov/edgar/searchedgar/companysearch)" in links_md
+    assert "[IR 页面](http://ir.example.com/msft)" in links_md
+    assert '\\* 微软官方页面只写了日期。"盘后发布、17:30 电话会"来自检索摘要，与微软惯例一致。' in links_md
 
 
 @pytest.mark.asyncio

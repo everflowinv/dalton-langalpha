@@ -30,6 +30,19 @@ from src.dalton.settings import (  # noqa: E402
     FEISHU_SEND_CARD_TIMEOUT_S,
     get_dalton_frontend_url,
 )
+from src.server.app import setup  # noqa: E402
+import src.server.services.automation_excerpt as _excerpt_mod  # noqa: E402
+from src.server.services.automation_excerpt import read_run_answer  # noqa: E402
+from src.server.services.history.reader import CheckpointHistoryReader  # noqa: E402
+from src.server.utils.checkpointer import (  # noqa: E402
+    close_checkpointer_pool,
+    get_checkpointer,
+    open_checkpointer_pool,
+)
+
+_ORIG_READ_RUN_ANSWER = read_run_answer
+_last_load_used_excerpt: bool = False
+TRUNCATED_EXCERPT_WARNING = "使用的是截断摘要，正文可能不完整"
 
 DEFAULT_FEISHU_SCRIPT = Path(
     os.path.expanduser("~/.openclaw/workspace/scripts/feishu_send_card.py")
@@ -48,14 +61,35 @@ DEFAULT_SAMPLE_TEXT = (
 )
 
 
+async def _try_read_run_answer(
+    thread_id: str,
+    run_id: str | None,
+) -> Any:
+    read_fn = (
+        read_run_answer
+        if read_run_answer is not _ORIG_READ_RUN_ANSWER
+        else _excerpt_mod.read_run_answer
+    )
+    try:
+        return await read_fn(thread_id, run_id)
+    except Exception:
+        return None
+
+
 async def _load_from_db(
     execution_id: str,
 ) -> tuple[str | None, str | None, str | None]:
-    """Load ``(verdict_word, result_excerpt, thread_id)`` for ``execution_id`` from Postgres.
+    """Load ``(verdict_word, final_text_or_excerpt, thread_id)`` for ``execution_id`` from Postgres.
 
-    Opens the backend connection pool via ``get_or_create_pool()`` + ``await pool.open()``
-    and closes it on exit. Raises ``LookupError`` if the execution row is not found.
+    Initializes the LangGraph checkpointer in the same way as ``src/server/app/setup.py``
+    (``get_checkpointer`` + ``await open_checkpointer_pool(checkpointer)`` + ``setup.checkpointer``)
+    so ``CheckpointHistoryReader.get_instance()`` used by ``read_run_answer(thread_id, run_id)``
+    is ready, and closes both the checkpointer pool and app DB pool on exit.
+    Raises ``LookupError`` if the execution row is not found.
     """
+    global _last_load_used_excerpt
+    _last_load_used_excerpt = False
+
     cleaned_id = (execution_id or "").strip()
     if not cleaned_id:
         raise ValueError("execution_id must be non-empty")
@@ -66,12 +100,26 @@ async def _load_from_db(
 
     pool = get_or_create_pool()
     await pool.open()
+    prev_checkpointer = setup.checkpointer
+    checkpointer: Any = None
     try:
+        checkpointer = get_checkpointer(
+            memory_type=os.getenv("MEMORY_DB_TYPE", "postgres"),
+            db_host=os.getenv("DB_HOST", "localhost"),
+            db_port=os.getenv("DB_PORT", "5432"),
+            db_name=os.getenv("DB_NAME", "postgres"),
+            db_user=os.getenv("DB_USER", "postgres"),
+            db_password=os.getenv("DB_PASSWORD", "postgres"),
+        )
+        await open_checkpointer_pool(checkpointer)
+        setup.checkpointer = checkpointer
+        CheckpointHistoryReader.reset_instance()
+
         async with get_db_connection() as conn:
             async with conn.cursor(row_factory=dict_row) as cur:
                 await cur.execute(
                     """
-                    SELECT conversation_thread_id, result_excerpt
+                    SELECT conversation_thread_id, conversation_response_id, result_excerpt
                     FROM automation_executions
                     WHERE automation_execution_id::text = %s
                     LIMIT 1
@@ -87,6 +135,31 @@ async def _load_from_db(
         thread_id = (
             str(row.get("conversation_thread_id") or "").strip() or None
         )
+        run_id = (
+            str(row.get("conversation_response_id") or "").strip() or None
+        )
+
+        full_text: str | None = None
+        if thread_id and run_id:
+            answer = await _try_read_run_answer(thread_id, run_id)
+            if answer is not None:
+                candidate = str(
+                    getattr(answer, "sent", None)
+                    or getattr(answer, "text", None)
+                    or ""
+                ).strip()
+                if candidate:
+                    full_text = candidate
+
+        if full_text is not None:
+            resolved_text: str | None = full_text
+        elif result_excerpt is not None:
+            resolved_text = result_excerpt
+            _last_load_used_excerpt = True
+            print(TRUNCATED_EXCERPT_WARNING, file=sys.stderr)
+        else:
+            resolved_text = None
+
         verdict_row = await get_verdict_for_execution(
             automation_execution_id=cleaned_id
         )
@@ -95,8 +168,12 @@ async def _load_from_db(
             if isinstance(verdict_row, dict)
             else None
         )
-        return verdict_word, result_excerpt, thread_id
+        return verdict_word, resolved_text, thread_id
     finally:
+        CheckpointHistoryReader.reset_instance()
+        setup.checkpointer = prev_checkpointer
+        if checkpointer is not None:
+            await close_checkpointer_pool(checkpointer)
         await pool.close()
 
 
@@ -119,6 +196,7 @@ def run_preview(
             f"Automation {automation_name!r} is not in the 4 pushable notification categories"
         )
 
+    used_excerpt = False
     if sample:
         eff_verdict = verdict_word if verdict_word is not None else "THESIS_STRENGTHENED"
         eff_text = final_text if final_text is not None else DEFAULT_SAMPLE_TEXT
@@ -128,11 +206,15 @@ def run_preview(
             else f"preview-{execution_id or 'sample'}"
         )
     else:
-        db_verdict, db_result_excerpt, db_thread_id = asyncio.run(
+        db_verdict, db_text, db_thread_id = asyncio.run(
             _load_from_db(execution_id)
         )
         eff_verdict = verdict_word if verdict_word is not None else db_verdict
-        eff_text = final_text if final_text is not None else db_result_excerpt
+        if final_text is not None:
+            eff_text = final_text
+        else:
+            eff_text = db_text
+            used_excerpt = _last_load_used_excerpt
         if eff_text is None:
             raise LookupError(
                 f"Execution {execution_id!r} has no result_excerpt (pass --sample to preview sample content)"
@@ -149,6 +231,7 @@ def run_preview(
         final_text=eff_text,
         thread_id=eff_thread_id,
         frontend_base_url=eff_frontend_url,
+        is_excerpt=used_excerpt,
     )
 
     tmp_path: Path | None = None
@@ -187,8 +270,12 @@ def run_preview(
                 f"feishu_send_card.py --dry-run exited with code {proc.returncode}"
             )
         if proc.stdout and proc.stdout.strip():
-            return json.loads(proc.stdout)
-        return card
+            rendered = json.loads(proc.stdout)
+        else:
+            rendered = dict(card)
+        if used_excerpt and isinstance(rendered, dict):
+            rendered = {"warning": TRUNCATED_EXCERPT_WARNING, **rendered}
+        return rendered
     finally:
         if tmp_path is not None:
             try:
@@ -258,6 +345,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"notify_preview error: {exc}", file=sys.stderr)
         return 1
 
+    if not args.sample and args.text is None and _last_load_used_excerpt:
+        print(TRUNCATED_EXCERPT_WARNING)
     print(json.dumps(rendered, ensure_ascii=False, indent=2))
     return 0
 

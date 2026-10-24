@@ -50,12 +50,16 @@ _EXCLUDED_AUTO_RE = re.compile(
     re.IGNORECASE,
 )
 
-_SENTENCE_SPLIT_RE = re.compile(
-    r"[^。！？!?；;\n]+(?:[。！？!?；;]+|\.(?=\s|$)|$)"
-)
-_MD_HEADING_RE = re.compile(r"^\s*#{1,6}\s*")
-_MD_BULLET_RE = re.compile(r"^\s*(?:[-*+]|\d+\.)\s+")
 _SECTION_HEADING_RE = re.compile(r"^\s*#{2,4}\s+(.+?)\s*$")
+_LIST_ITEM_RE = re.compile(r"^\s*(?:[-*+]|\d+\.)\s+")
+_MD_LINK_RE = re.compile(
+    r"(!?)\[((?:[^\[\]]|\[[^\[\]]*\])+)\]\(([^()\s]*(?:\([^()]*\)[^()\s]*)*)(?:\s+[\"'][^\"']*[\"'])?\)"
+)
+_CJK_SENTENCE_END_PUNCT = frozenset("。！？；")
+_ASCII_SENTENCE_END_PUNCT = frozenset(".!?;")
+_EXCERPT_VALID_CLOSERS = frozenset(
+    {")", "）", "]", "】", "》", "}", '"', "'", "”", "’", "」", "』"}
+)
 
 VERDICT_TEMPLATE_MAP: dict[str, str] = {
     "THESIS_STRENGTHENED": "green",
@@ -247,18 +251,236 @@ async def populate_automation_notify_state(
         setattr(resp, "dalton_notify_source", src)
 
 
-def _clean_plain_line(raw: str) -> str:
-    line = _MD_HEADING_RE.sub("", raw.strip())
-    line = _MD_BULLET_RE.sub("", line)
-    line = line.replace("**", "").replace("__", "").replace("`", "")
-    return re.sub(r"\s+", " ", line).strip()
+def _strip_non_http_markdown_links(text: str) -> str:
+    """Replace markdown links pointing to sandbox/local/relative paths with their plain link text, keeping http(s) links."""
+
+    def _replace(match: re.Match[str]) -> str:
+        bang, label, target = (
+            match.group(1),
+            match.group(2),
+            match.group(3).strip(),
+        )
+        if not bang and re.match(r"^https?://", target, re.IGNORECASE):
+            return match.group(0)
+        return label
+
+    return _MD_LINK_RE.sub(_replace, text)
 
 
-def _ends_with_sentence_punct(text: str) -> bool:
-    stripped = text.rstrip()
+def _link_spans_in_line(line: str) -> list[tuple[int, int]]:
+    return [(m.start(), m.end()) for m in _MD_LINK_RE.finditer(line)]
+
+
+def _is_sentence_end_punct(
+    line: str,
+    idx: int,
+    link_spans: Sequence[tuple[int, int]] | None = None,
+) -> bool:
+    if idx < 0 or idx >= len(line):
+        return False
+    spans = _link_spans_in_line(line) if link_spans is None else link_spans
+    if any(start <= idx < end for start, end in spans):
+        return False
+    ch = line[idx]
+    if ch in _CJK_SENTENCE_END_PUNCT:
+        return True
+    if ch in _ASCII_SENTENCE_END_PUNCT:
+        if ch == "." and (
+            (idx > 0 and line[idx - 1] == ".")
+            or (idx + 1 < len(line) and line[idx + 1] == ".")
+            or bool(re.fullmatch(r"\d+", line[:idx].strip()))
+        ):
+            return False
+        return idx + 1 == len(line) or line[idx + 1].isspace()
+    return False
+
+
+def _keep_excerpt_last_line(line: str) -> bool:
+    stripped = line.rstrip()
     if not stripped:
         return False
-    return stripped[-1] in ("。", "！", "？", "!", "?", "；", ";", ".")
+    if stripped.endswith("**"):
+        return True
+    if _is_sentence_end_punct(stripped, len(stripped) - 1):
+        return True
+    return stripped[-1] in _EXCERPT_VALID_CLOSERS
+
+
+def _is_standalone_bold_subheading(line: str) -> bool:
+    stripped = line.strip()
+    if "\n" in stripped or not stripped.startswith("**") or stripped.endswith("…"):
+        return False
+    close_idx = stripped.find("**", 2)
+    if close_idx == -1:
+        return False
+    inner = stripped[2:close_idx].strip()
+    if not inner or _is_sentence_end_punct(inner, len(inner) - 1):
+        return False
+    rest = stripped[close_idx + 2 :].rstrip()
+    while rest.endswith("**"):
+        rest = rest[:-2].rstrip()
+    rest = rest.strip()
+    if not rest:
+        return True
+    return not _is_sentence_end_punct(rest, len(rest) - 1)
+
+
+def _has_odd_bold_outside_links(text: str) -> bool:
+    without_links = _MD_LINK_RE.sub("", text)
+    return without_links.count("**") % 2 == 1
+
+
+def _truncate_line_at_punct(line: str, max_chars: int) -> str:
+    if max_chars <= 1:
+        return ""
+    spans = _link_spans_in_line(line)
+    limit = min(len(line), max_chars - 1)
+    for idx in range(limit - 1, -1, -1):
+        if _is_sentence_end_punct(line, idx, spans):
+            prefix = line[: idx + 1]
+            suffix = "**…" if _has_odd_bold_outside_links(prefix) else "…"
+            if len(prefix) + len(suffix) <= max_chars:
+                return f"{prefix}{suffix}"
+    return ""
+
+
+def _parse_section_blocks(raw_lines: Sequence[str]) -> list[tuple[str, list[str]]]:
+    blocks: list[tuple[str, list[str]]] = []
+    current_kind: str | None = None
+    current_items: list[str] = []
+
+    def _flush() -> None:
+        nonlocal current_kind, current_items
+        if current_kind is not None and current_items:
+            blocks.append((current_kind, current_items))
+        current_kind = None
+        current_items = []
+
+    for raw_line in raw_lines:
+        stripped = raw_line.strip()
+        if not stripped:
+            _flush()
+            continue
+        if stripped.startswith("|"):
+            if current_kind != "table":
+                _flush()
+                current_kind = "table"
+            current_items.append(stripped)
+        elif _LIST_ITEM_RE.match(raw_line):
+            if current_kind != "list":
+                _flush()
+                current_kind = "list"
+            current_items.append(stripped)
+        elif current_kind == "list" and raw_line[:1].isspace():
+            current_items[-1] = f"{current_items[-1]}\n{stripped}"
+        else:
+            if current_kind != "other":
+                _flush()
+                current_kind = "other"
+            current_items.append(stripped)
+
+    _flush()
+    return blocks
+
+
+def _truncate_section_body(
+    raw_body: str | Sequence[str],
+    *,
+    max_chars: int = MAX_CARD_SECTION_CHARS,
+) -> str:
+    """Truncate a section body block-by-block up to ``max_chars``."""
+    if max_chars <= 0:
+        return ""
+    if isinstance(raw_body, str):
+        raw_lines = raw_body.splitlines()
+    else:
+        raw_lines = [str(ln) for ln in raw_body]
+    blocks = _parse_section_blocks(raw_lines)
+    if not blocks:
+        return ""
+
+    kept_blocks: list[list[str]] = []
+    used = 0
+    idx = 0
+    while idx < len(blocks):
+        kind, items = blocks[idx]
+        sep = 1 if kept_blocks else 0
+
+        if (
+            kind == "other"
+            and len(items) == 1
+            and items[0].endswith(("：", ":"))
+            and idx + 1 < len(blocks)
+            and blocks[idx + 1][0] == "list"
+            and blocks[idx + 1][1]
+        ):
+            lead_line = items[0]
+            list_items = blocks[idx + 1][1]
+            first_item = list_items[0]
+            pair_len = len(lead_line) + 1 + len(first_item)
+            if used + sep + pair_len > max_chars:
+                break
+            kept_blocks.append([lead_line])
+            kept_blocks.append([first_item])
+            used += sep + pair_len
+            stopped = False
+            for item in list_items[1:]:
+                if used + 1 + len(item) <= max_chars:
+                    kept_blocks.append([item])
+                    used += 1 + len(item)
+                else:
+                    stopped = True
+                    break
+            if stopped:
+                break
+            idx += 2
+            continue
+
+        if kind == "table":
+            block_text = "\n".join(items)
+            if used + sep + len(block_text) <= max_chars:
+                kept_blocks.append([block_text])
+                used += sep + len(block_text)
+                idx += 1
+                continue
+            break
+
+        if kind == "list":
+            stopped = False
+            for item in items:
+                item_sep = 1 if kept_blocks else 0
+                if used + item_sep + len(item) <= max_chars:
+                    kept_blocks.append([item])
+                    used += item_sep + len(item)
+                else:
+                    stopped = True
+                    break
+            if stopped:
+                break
+            idx += 1
+            continue
+
+        block_text = "\n".join(items)
+        if used + sep + len(block_text) <= max_chars:
+            kept_blocks.append(list(items))
+            used += sep + len(block_text)
+            idx += 1
+            continue
+        if not kept_blocks:
+            truncated = _truncate_line_at_punct(block_text, max_chars)
+            if truncated:
+                kept_blocks.append([truncated])
+        break
+
+    while (
+        kept_blocks
+        and len(kept_blocks[-1]) == 1
+        and not kept_blocks[-1][0].rstrip().endswith("…")
+        and _is_standalone_bold_subheading(kept_blocks[-1][0])
+    ):
+        kept_blocks.pop()
+
+    return "\n".join(line for block in kept_blocks for line in block)
 
 
 def extract_summary_lines(
@@ -268,87 +490,40 @@ def extract_summary_lines(
     max_lines: int = 6,
     max_chars: int = MAX_CARD_SECTION_CHARS,
 ) -> list[str]:
-    """Extract 3-6 summary lines from the start of ``text``, truncated at sentence boundaries."""
+    """Extract 3-6 summary lines from the start of ``text``."""
     _ = min_lines
-    if not text or not str(text).strip():
+    if not text or not str(text).strip() or max_chars <= 0:
         return []
 
-    raw_lines = str(text).splitlines()
-    sentences: list[str] = []
-    for raw_line in raw_lines:
-        stripped = raw_line.strip()
-        if not stripped or stripped.startswith("```") or re.match(r"^\|?[-:\s|]+\|?$", stripped):
+    cleaned = _strip_non_http_markdown_links(str(text).strip())
+    candidates: list[str] = []
+    for line in cleaned.splitlines():
+        spans = _link_spans_in_line(line)
+        start = 0
+        if not any(_is_sentence_end_punct(line, i, spans) for i in range(len(line))):
+            # A line with no sentence end (a list item, a heading) is a whole unit.
+            if line.strip():
+                candidates.append(line.strip())
             continue
-        cleaned_line = _clean_plain_line(stripped)
-        if not cleaned_line:
-            continue
-        parts = [p.strip() for p in _SENTENCE_SPLIT_RE.findall(cleaned_line) if p.strip()]
-        if not parts:
-            continue
-        for idx, part in enumerate(parts):
-            is_last_in_line = idx == len(parts) - 1
-            if is_last_in_line and not _ends_with_sentence_punct(part) and len(parts) > 1:
-                continue
-            sentences.append(part)
-
-    if not sentences:
-        return []
+        for idx in range(len(line)):
+            if _is_sentence_end_punct(line, idx, spans) and not (
+                idx + 1 < len(line) and _is_sentence_end_punct(line, idx + 1, spans)
+            ):
+                piece = line[start : idx + 1].strip()
+                if piece:
+                    candidates.append(piece)
+                start = idx + 1
 
     selected: list[str] = []
     total_chars = 0
-    for sent in sentences:
+    for item in candidates:
         if len(selected) >= max_lines:
             break
-        if selected and total_chars + len(sent) > max_chars:
+        if total_chars + len(item) > max_chars:
             break
-        selected.append(sent)
-        total_chars += len(sent)
-
-    return selected[:max_lines]
-
-
-def _truncate_section_body(
-    raw_body: str,
-    *,
-    max_chars: int = MAX_CARD_SECTION_CHARS,
-) -> str:
-    """Truncate a structured ``##`` section body to ``max_chars`` at sentence/line boundaries."""
-    body = raw_body.strip()
-    if not body or max_chars <= 0:
-        return ""
-    if len(body) <= max_chars:
-        return body
-
-    kept_lines: list[str] = []
-    used = 0
-    for raw_line in body.splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        sep = 1 if kept_lines else 0
-        if used + sep + len(line) <= max_chars:
-            kept_lines.append(line)
-            used += sep + len(line)
-            continue
-
-        # Truncate within this line at sentence boundaries
-        parts = [p.strip() for p in _SENTENCE_SPLIT_RE.findall(line) if p.strip()]
-        line_chunks: list[str] = []
-        for part in parts:
-            candidate = "".join(line_chunks) + part
-            if used + sep + len(candidate) <= max_chars:
-                line_chunks.append(part)
-            else:
-                break
-        if line_chunks:
-            joined = "".join(line_chunks)
-            kept_lines.append(joined)
-            used += sep + len(joined)
-        elif not kept_lines:
-            kept_lines.append(line[:max_chars].rstrip())
-        break
-
-    return "\n".join(kept_lines).strip()
+        selected.append(item)
+        total_chars += len(item)
+    return selected
 
 
 def format_notify_message(
@@ -406,7 +581,7 @@ def _normalize_card_section_name(raw_heading: str) -> str | None:
         return "结论"
     if cleaned in ("要点", "核心要点", "关键变化"):
         return "要点"
-    if cleaned in ("下一步验证", "后续验证", "待验证", "下一步观察"):
+    if cleaned in ("下一步", "下一步验证", "后续验证", "待验证", "下一步观察"):
         return "下一步验证"
     if cleaned in ("来源", "信源", "数据源", "信源与数据口径"):
         return "来源"
@@ -419,88 +594,70 @@ def extract_card_sections(
     classification: NotifyClassification | None = None,
     max_summary_chars: int = MAX_CARD_SECTION_CHARS,
     max_total_chars: int = MAX_CARD_TOTAL_BODY_CHARS,
+    is_excerpt: bool = False,
 ) -> list[tuple[str, str]]:
-    """Extract structured ``(section_title, section_body)`` pairs for Feishu Card 2.0 body.
-
-    Only uses sentences that actually appear in ``final_text``—never fabricates
-    fallback sentences or rewrites sources. Each section is capped at ``max_summary_chars``
-    (default 320) and total body text across the card is capped at ``max_total_chars``
-    (default 3000).
-    """
+    """Extract structured ``(section_title, section_body)`` pairs for Feishu Card 2.0 body."""
     _ = classification
-    if not final_text or not str(final_text).strip():
+    if (
+        not final_text
+        or not str(final_text).strip()
+        or max_summary_chars <= 0
+        or max_total_chars <= 0
+    ):
         return []
 
-    raw_lines = str(final_text).strip().splitlines()
+    cleaned_text = _strip_non_http_markdown_links(str(final_text).strip())
+    raw_lines = cleaned_text.splitlines()
+    while raw_lines and not raw_lines[-1].strip():
+        raw_lines.pop()
+    if is_excerpt and raw_lines and not _keep_excerpt_last_line(raw_lines[-1].strip()):
+        raw_lines.pop()
+        while raw_lines and not raw_lines[-1].strip():
+            raw_lines.pop()
+    if not raw_lines:
+        return []
+
     buckets: dict[str, list[str]] = {}
+    pre_heading_lines: list[str] = []
     current_key: str | None = None
-    for line in raw_lines:
-        m = _SECTION_HEADING_RE.match(line)
+    for raw_line in raw_lines:
+        m = _SECTION_HEADING_RE.match(raw_line)
         if m:
             norm = _normalize_card_section_name(m.group(1))
-            current_key = norm
-            if norm and norm not in buckets:
-                buckets[norm] = []
-            continue
+            if norm is not None:
+                current_key = norm
+                if norm not in buckets:
+                    buckets[norm] = []
+                continue
         if current_key is not None:
-            buckets[current_key].append(line)
+            buckets[current_key].append(raw_line)
+        else:
+            pre_heading_lines.append(raw_line)
 
     canonical_order = ("结论", "要点", "下一步验证", "来源")
-    if any(buckets.get(k) for k in canonical_order):
-        result: list[tuple[str, str]] = []
-        total_used = 0
-        for key in canonical_order:
-            remaining = max_total_chars - total_used
-            if remaining <= 0:
-                break
-            raw_sec = "\n".join(buckets.get(key) or []).strip()
-            if not raw_sec:
-                continue
-            sec_cap = min(max_summary_chars, remaining)
-            truncated = _truncate_section_body(raw_sec, max_chars=sec_cap)
-            if truncated:
-                result.append((key, truncated))
-                total_used += len(truncated)
-        return result
+    if buckets:
+        if any(ln.strip() for ln in pre_heading_lines):
+            buckets["结论"] = [*pre_heading_lines, "", *buckets.get("结论", [])]
+        section_pairs = [
+            (key, buckets[key])
+            for key in canonical_order
+            if any(ln.strip() for ln in (buckets.get(key) or []))
+        ]
+    else:
+        section_pairs = [("结论", raw_lines)]
 
-    summary_lines = extract_summary_lines(
-        final_text,
-        min_lines=3,
-        max_lines=6,
-        max_chars=min(max_summary_chars, max_total_chars),
-    )
-    if not summary_lines:
-        return []
-
-    unstructured: list[tuple[str, str]] = [
-        ("结论", _truncate_section_body(summary_lines[0], max_chars=max_summary_chars))
-    ]
-    if len(summary_lines) == 2:
-        pts = _truncate_section_body(f"- {summary_lines[1]}", max_chars=max_summary_chars)
-        if pts:
-            unstructured.append(("要点", pts))
-    elif len(summary_lines) >= 3:
-        pts_raw = "\n".join(f"- {pt}" for pt in summary_lines[1:-1])
-        pts = _truncate_section_body(pts_raw, max_chars=max_summary_chars)
-        if pts:
-            unstructured.append(("要点", pts))
-        nxt = _truncate_section_body(summary_lines[-1], max_chars=max_summary_chars)
-        if nxt:
-            unstructured.append(("下一步验证", nxt))
-
-    bounded: list[tuple[str, str]] = []
+    result: list[tuple[str, str]] = []
     total_used = 0
-    for key, body in unstructured:
-        if not body:
-            continue
+    for key, sec_lines in section_pairs:
         remaining = max_total_chars - total_used
         if remaining <= 0:
             break
-        trimmed = body if len(body) <= remaining else _truncate_section_body(body, max_chars=remaining)
-        if trimmed:
-            bounded.append((key, trimmed))
-            total_used += len(trimmed)
-    return bounded
+        sec_cap = min(max_summary_chars, remaining)
+        truncated = _truncate_section_body(sec_lines, max_chars=sec_cap)
+        if truncated:
+            result.append((key, truncated))
+            total_used += len(truncated)
+    return result
 
 
 def build_feishu_notify_card(
@@ -513,6 +670,7 @@ def build_feishu_notify_card(
     timestamp_str: str | None = None,
     max_summary_chars: int = MAX_CARD_SECTION_CHARS,
     max_total_chars: int = MAX_CARD_TOTAL_BODY_CHARS,
+    is_excerpt: bool = False,
 ) -> dict[str, Any]:
     """Build Feishu Card Schema 2.0 dictionary for a Dalton automation notification."""
     cleaned_word = (verdict_word or "").strip()
@@ -549,6 +707,7 @@ def build_feishu_notify_card(
         classification=classification,
         max_summary_chars=max_summary_chars,
         max_total_chars=max_total_chars,
+        is_excerpt=is_excerpt,
     )
     elements: list[dict[str, Any]] = []
     for sec_title, sec_body in sections:
