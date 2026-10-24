@@ -41,7 +41,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
    - **Sales color 专项规则**：按公司名和代码分别搜，邮件按 `message_id`、研报按 `doc_id` 去重后用 `read` 读正文（多票日报按 `next_offset` 翻页摘出本公司段落）。按正文里的 sales/trading 身份声明归类，不按数据库分类（如 `Sector Specialist Commentary`、`TECH SKETCH` 可能归在 `foreign_report` 下）。
 
 4. **AlphaEngine 卖方研报检索**
-   - 中英文 query 各搜一次（`researchdata.research(route="alphaengine", operation="search_library", ...)`），必须传 `sort="relevance"` 并同时给 `date_from`、`date_to`（默认 92 天）。
+   - 中英文 query 各搜一次（`researchdata.research(route="alphaengine", operation="search_library", query=..., start=..., end=..., params={"sort": "relevance"})`；若按文档类别过滤，先调 `operation="list_filters"` 取 `type_ids` 一并放入 `params`；时间窗默认近 92 天）。
    - 挑 3–6 篇高相关报告调 `operation="get_document"` 读正文，优先外资行（MS、GS、UBS、JPM、Citi、BofA、Jefferies、Bernstein 等）的财报前瞻与预测调整报告。
    - 若涉及 AI 收入占比、大单 TCV/RPO 或 AI 降本提效，遵循 `references/ai-revenue-rules.md` 核对口径。
 
@@ -72,7 +72,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 ### 开始前：检查未完成的 run（中断续跑）
 
 - 读 `research/<as_of>-bullbear/.progress.json`（及 `research/` 下其他 `*/.progress.json`），看是否有本 workflow 的 `status` 不是终态（`completed`/`failed`/`cancelled`）的 run。
-- 有未完成的 run 时不要新开 run：用**原参数**调用 `RunWorkflow(workflow="bullbear-doc", params={...原参数..., "progress_path": "research/<as_of>-bullbear/.progress.json"}, resume="<.progress.json 里的 run_id>")` 续跑；label、prompt 哈希与产物哈希都一致的已完派发会直接复用，不重复派子任务。
+- 有未完成的 run 时不要新开 run：用**原参数**调用 `RunWorkflow(workflow="bullbear-doc", params={...原参数..., "progress_path": "research/<as_of>-bullbear/.progress.json"}, resume="<.progress.json 里的 run_id>")` 续跑；label、prompt 哈希与产物哈希都一致的已完派发会直接复用，不重复派子任务。若前一次 run 因审稿 `block` 等原因提前停止，补齐问题后同样用**原参数**加 `resume` 重跑（workflow 返回值里已提供 `resume_hint`）。
 - 全新启动时也在 `params` 里带上 `"progress_path": "research/<as_of>-bullbear/.progress.json"`，让中断后的 run 可被发现与续跑。
 
 1. **加载 workflow 工具**
@@ -80,6 +80,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
    - 读 `.agents/skills/dalton-bullbear/references/v42-structure.md` 与 `references/return-branch.md` 了解产物标准。
 
 2. **启动 `bullbear-doc`**
+   - 参数说明：`as_of`（基准日期，`YYYY-MM-DD`）可不传或传 `"latest"`（`RunWorkflow` 会自动取最近一个美股交易日，`resume` 续跑时自动沿用上一 run 的值）。
    - 调用 `RunWorkflow`：
      ```json
      {
@@ -89,7 +90,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
          "company": "<公司名>",
          "market": "US",
          "workspace_dir": "<当前工作区路径>",
-         "as_of": "<YYYY-MM-DD>",
+         "as_of": "<YYYY-MM-DD 或 latest，可不传>",
          "research_days": 92,
          "prior_draft": "<可选：上一版 bullbear 草稿或发布稿路径>",
          "progress_path": "research/<as_of>-bullbear/.progress.json"
@@ -100,17 +101,17 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
      - **阶段 1（准备）**：跑 `.agents/skills/dalton-financial-lenses/scripts/anchors.py` 锁定市值与汇率（`anchors.json`）；跑 `.agents/skills/dalton-bullbear/scripts/fincheck.py` 生成资产负债表触发项与 Capex 体检（`fincheck.md`）；存一致预期快照并跑 `implied_model.py`（`consensus.md`）；锁定价格锚（`price.md`）。
      - **阶段 2（股东回报支线）**：按 `references/return-branch.md` 与 `return_score.py` 产出第一节（`return.md`，≤40 行）、第九节附录（`return_appendix.md`，≤30 行）与 5 条摘要（`return_summary.md`）。
      - **阶段 3（主稿）**：按 `references/v42-structure.md` 和 `templates/bullbear.md` 撰写 `main.md`，跑 `scripts/bb_check.py` 修到 0 WARN。
-     - **阶段 4（合并与审稿）**：把 `return.md` 插入 `<!-- INSERT:return -->`、`return_appendix.md` 插入 `<!-- INSERT:return_appendix -->`，生成 `drafts/<as_of>-bullbear.md`，复跑 `bb_check.py` 到 0 WARN，并派 `dalton-reviewer` 独立审稿。
+     - **阶段 4（合并与审稿）**：把 `return.md` 插入 `<!-- INSERT:return -->`、`return_appendix.md` 插入 `<!-- INSERT:return_appendix -->`，生成 `drafts/<as_of>-bullbear.md`，复跑 `bb_check.py` 到 0 WARN，并派 `dalton-reviewer` 独立审稿（含核查“`## 引用` 表存在且每个 `[引用N]` / `[回报引用N]` 都能在表里找到”）。
      - **阶段 5（修订）**：按审稿意见处理全部 P0 与可改 P1，复跑 `bb_check.py` 确认 0 WARN。
    - **Workflow 不可用时的降级路径**：
-     - **`workflow.enabled` 已关闭**（工具列表本来就不会有 `RunWorkflow`）：主智能体按上述阶段 1→5 的顺序手动执行脚本与支线写作，最终输出到 `drafts/<as_of>-bullbear.md`，并逐阶段核对产物。阶段 4 派 `dalton-reviewer` 审最终稿后，把它返回的 JSON（含 `verdict` 与 `draft_sha256`）原样保存到 `research/<as_of>-bullbear/review.json`（多轮复审时保存最后一轮；改稿后必须重审并覆盖）；收尾调用 `dalton_check_done` 时在 `params` 里加 `"manual": true`、不传 `run_id`，审稿据此文件核对。语言审查两轮（顺序不可颠倒，与 workflow 相同）：成稿后先调用 `check_language(draft_path=<草稿>, round=1)` 并按 `<草稿>.language.md` 清单修改（只改语言，不动事实、数字、术语、引用编号与判断强度），再派 `dalton-reviewer` 首次审稿；修订循环结束、终稿内容定稿后调用 `check_language(round=2)` 按清单完成终稿语言修改，草稿有改动就再调用一次 `check_language(round=2)` 对终稿复核，然后做最后一次审稿（pass 的 JSON 存 review.json）与 `check_draft`；第一次审稿就 pass 时：第 2 轮照常执行；改了稿就补一次终稿审稿（pass 的 JSON 覆盖存 review.json），哈希未变则无需重审。本次产出中其他给人读的 .md 笔记（research/ 支线、背景、快讯、异动、公告点评、专题章节等）同样各审两轮：第 1 轮审完按清单改，第 2 轮复核，改过就再跑一次 round=2 确认；json/xlsx 等机器文件、bg_data/、data/、lenses_work/、model_dump/、知识层渲染文件与 .audit/.annotated/.language 侧车不审。
+     - **`workflow.enabled` 已关闭**（工具列表本来就不会有 `RunWorkflow`）：主智能体按上述阶段 1→5 的顺序手动执行脚本与支线写作，最终输出到 `drafts/<as_of>-bullbear.md`，并逐阶段核对产物。阶段 4 派 `dalton-reviewer` 审稿按三步执行：（1）主智能体先计算草稿的 sha256（`sha256sum drafts/<as_of>-bullbear.md` 或等价的 Python `hashlib.sha256`）；（2）把该哈希写进派给 `dalton-reviewer` 的提示词；（3）要求审稿人在返回的 JSON 里原样回填 `draft_sha256`，并将返回的 JSON（含 `verdict` 与 `draft_sha256`）原样保存到 `research/<as_of>-bullbear/review.json`（多轮复审时保存最后一轮；改稿后重新计算哈希、重审并覆盖）。收尾调用 `dalton_check_done(workflow="bullbear-doc", params={"ticker": "<TICKER>", "workspace_dir": "<当前工作区路径>", "as_of": "<as_of>", "manual": true})`（不传 `run_id`），审稿据此文件核对。语言审查两轮（顺序不可颠倒，与 workflow 相同）：成稿后先调用 `check_language(draft_path=<草稿>, round=1)` 并按 `<草稿>.language.md` 清单修改（只改语言，不动事实、数字、术语、引用编号与判断强度），再派 `dalton-reviewer` 首次审稿；修订循环结束、终稿内容定稿后调用 `check_language(round=2)` 按清单完成终稿语言修改，草稿有改动就再调用一次 `check_language(round=2)` 对终稿复核，然后做最后一次审稿（pass 的 JSON 存 review.json）与 `check_draft`；第一次审稿就 pass 时：第 2 轮照常执行；改了稿就补一次终稿审稿（pass 的 JSON 覆盖存 review.json），哈希未变则无需重审。本次产出中其他给人读的 .md 笔记（research/ 支线、背景、快讯、异动、公告点评、专题章节等）同样各审两轮：第 1 轮审完按清单改，第 2 轮复核，改过就再跑一次 round=2 确认；json/xlsx 等机器文件、bg_data/、data/、lenses_work/、model_dump/、知识层渲染文件与 .audit/.annotated/.language 侧车不审。
      - **否则**（`workflow.enabled` 未关闭）：`RunWorkflow` 不在工具列表时，先用 **Read 工具**（不要用 Bash `cat`）读 `.agents/skills/run-workflow/SKILL.md` 后重试；仍没有就停下，告诉 PM「RunWorkflow 不可用」，不要自行手动派发 Task 子智能体代跑。
 
 3. **主智能体核查与收尾**
-   - 检查 `drafts/<as_of>-bullbear.md` 是否存在，运行 `python .agents/skills/dalton-bullbear/scripts/bb_check.py drafts/<as_of>-bullbear.md` 确认 0 WARN。末尾必须附引用表（在报告末尾 `## 引用` 一节逐行写出 `[引用1]: evidence:E-20261023-01` 或 `[引用3]: model:model/META-model-v01.xlsx!DCF!C12` 等对应关系）。
+   - 检查 `drafts/<as_of>-bullbear.md` 是否存在，运行 `python .agents/skills/dalton-bullbear/scripts/bb_check.py drafts/<as_of>-bullbear.md` 确认 0 WARN。确认文末 `## 引用` 表存在且每个 `[引用N]` / `[回报引用N]` 都能在表里找到（每行合并写出核验目标与括号内来源说明，形如 `[引用1]: evidence:E-20261023-01 （行情｜Yahoo Finance｜价格与一致预期快照｜{DATE}｜data/consensus/...）`）。
    - 可选调用 `check_draft(draft_path="drafts/<as_of>-bullbear.md")` 查看数字核验反馈（草稿期不阻断）。
    - 执行下方知识层写入（第三节第 1–3 步）。
-   - **汇报完成前必须过完成契约**：调用 `dalton_check_done(workflow="bullbear-doc", run_id=<`research/<as_of>-bullbear/.progress.json` 里的 run_id>, params={<启动时的同一组参数，含 as_of>})`（走手动降级路径、没有 run 时不传 `run_id`，`params` 里加 `"manual": true`，审稿结论按 `research/<as_of>-bullbear/review.json` 核对）；`done=false` 时按 `missing` 先补齐再查（缺文件补文件、`bb_check` 修到 0 WARN、知识层缺 source=tool 新版本就 `knowledge_update`、check_draft 用了旧草稿就对最终稿重跑），补不了的缺项只能汇报"未完成"并列出缺项，不得汇报"完成"。
+   - **汇报完成前必须过完成契约**：调用 `dalton_check_done(workflow="bullbear-doc", run_id=<`research/<as_of>-bullbear/.progress.json` 里的 run_id>, params={"ticker": "<TICKER>", "workspace_dir": "<当前工作区路径>", "as_of": "<as_of>"})`（走手动降级路径、没有 run 时不传 `run_id`，调用 `dalton_check_done(workflow="bullbear-doc", params={"ticker": "<TICKER>", "workspace_dir": "<当前工作区路径>", "as_of": "<as_of>", "manual": true})`，审稿结论按 `research/<as_of>-bullbear/review.json` 核对）；`done=false` 时按 `missing` 先补齐再查（缺文件补文件、`bb_check` 修到 0 WARN、知识层缺 source=tool 新版本就 `knowledge_update`、check_draft 用了旧草稿就对最终稿重跑），补不了的缺项只能汇报"未完成"并列出缺项，不得汇报"完成"。
    - 完成契约通过后，向 PM 汇报核心判断、各 Debate 倾向变化及审稿结论；如需正式发布，按第三节第 4 步执行。
 
 ---

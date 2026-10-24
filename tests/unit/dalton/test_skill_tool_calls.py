@@ -31,21 +31,8 @@ BATCH2_SKILL_DIRS: frozenset[str] = frozenset(
     }
 )
 
-# Explicit known exceptions in Batch 2 skills (out of scope for Batch 1).
-KNOWN_BATCH2_EXCEPTIONS: dict[tuple[str, int, str], dict[str, str]] = {
-    ("dalton-full-coverage/references/branch-b-sellside-expert.md", 10, "list_filters"): {
-        "reason": "待第 2 批修复",
-        "detail": "将 operation 误写为独立函数调用 list_filters(filter_type=..., query=...)",
-    },
-    ("dalton-earnings-calendar/references/reconciliation.md", 36, "trading_days"): {
-        "reason": "待第 2 批修复",
-        "detail": "伪代码函数调用 trading_days(date, minus=3) 非真实注册工具",
-    },
-    ("dalton-earnings-calendar/references/reconciliation.md", 38, "trading_days"): {
-        "reason": "待第 2 批修复",
-        "detail": "伪代码函数调用 trading_days(date, plus=1) 非真实注册工具",
-    },
-}
+# Explicit known exceptions in Batch 2 skills (all resolved in Batch 2).
+KNOWN_BATCH2_EXCEPTIONS: dict[tuple[str, int, str], dict[str, str]] = {}
 
 _CALL_START_RE = re.compile(r"\b([a-zA-Z_][a-zA-Z0-9_.]*)\s*\(")
 _KWARG_NAME_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\s*=(?!=)")
@@ -201,6 +188,40 @@ def _split_top_level_args(arg_str: str) -> list[str]:
     return parts
 
 
+def _extract_dict_literal_keys(expr: str) -> list[str] | None:
+    """If `expr` is a `{...}` dict literal, return its top-level keys; otherwise return None."""
+    s = expr.strip()
+    if not (s.startswith("{") and s.endswith("}")):
+        return None
+    inner = s[1:-1].strip()
+    if not inner:
+        return []
+    keys: list[str] = []
+    for entry in _split_top_level_args(inner):
+        if not entry or entry in ("...", "…") or entry.startswith("**"):
+            continue
+        m_key = re.match(
+            r'^[\s]*(?:"([^"]+)"|\'([^\']+)\'|([A-Za-z_][A-Za-z0-9_]*))\s*:',
+            entry,
+        )
+        if m_key:
+            key = m_key.group(1) or m_key.group(2) or m_key.group(3)
+            if key:
+                keys.append(key)
+    return keys
+
+
+def _extract_quoted_literals(expr: str) -> list[str]:
+    """Return non-placeholder string literals from an argument value expression (e.g. `\"a\"|\"b\"`)."""
+    vals: list[str] = []
+    for m in re.finditer(r'"([^"\n]*)"|\'([^\'\n]*)\'', expr):
+        v = (m.group(1) if m.group(1) is not None else m.group(2)).strip()
+        if not v or "<" in v or ">" in v or "..." in v or "…" in v:
+            continue
+        vals.append(v)
+    return vals
+
+
 def extract_tool_calls_from_markdown(
     text: str,
     registry: dict[str, set[str]],
@@ -234,12 +255,15 @@ def extract_tool_calls_from_markdown(
         arg_str = text[start : pos - 1]
         parts = _split_top_level_args(arg_str)
         kwargs: list[str] = []
+        kwarg_values: dict[str, str] = {}
         for part in parts:
             if not part or part in ("...", "…") or part.startswith("**"):
                 continue
             km = _KWARG_NAME_RE.match(part)
             if km:
-                kwargs.append(km.group(1))
+                k_name = km.group(1)
+                kwargs.append(k_name)
+                kwarg_values[k_name] = part[km.end() :].strip()
 
         # "name (…)" with a space reads as prose unless the name itself is a tool:
         # only a tight "name(" counts as a call on the strength of its kwargs.
@@ -257,11 +281,126 @@ def extract_tool_calls_from_markdown(
             {
                 "tool_name": name,
                 "kwargs": kwargs,
+                "kwarg_values": kwarg_values,
                 "line_no": line_no,
                 "raw": f"{name}({arg_str.strip()})",
             }
         )
     return calls
+
+
+def _validate_researchdata_bridge_call(
+    rel_path: str,
+    call: dict[str, Any],
+) -> list[tuple[str, int, str, str]]:
+    """Validate `researchdata.*` calls (including nested `params`) via `researchdata_bridge`."""
+    if str(BRIDGE_DIR) not in sys.path:
+        sys.path.insert(0, str(BRIDGE_DIR))
+    import researchdata_bridge as rb
+
+    name = call["tool_name"]
+    line_no = call["line_no"]
+    tool_short = name.split(".", 1)[1] if name.startswith("researchdata.") else name
+    if tool_short not in ("research", "finance", "macro", "community"):
+        return []
+
+    kwarg_values: dict[str, str] = call.get("kwarg_values") or {}
+    route_expr = (
+        kwarg_values.get("route")
+        or kwarg_values.get("source")
+        or kwarg_values.get("channel")
+        or kwarg_values.get("provider")
+        or ""
+    )
+    routes = _extract_quoted_literals(route_expr)
+    if not routes:
+        return []
+
+    op_expr = kwarg_values.get("operation") or kwarg_values.get("action") or ""
+    ops = _extract_quoted_literals(op_expr)
+
+    nested_keys: list[str] | None = None
+    if "params" in kwarg_values:
+        nested_keys = _extract_dict_literal_keys(kwarg_values["params"])
+
+    errors: list[tuple[str, int, str, str]] = []
+    for route in routes:
+        spec = rb.ROUTE_CONTRACT_SPECS.get(route)
+        if spec is None:
+            errors.append(
+                (
+                    rel_path,
+                    line_no,
+                    name,
+                    f"Unknown researchdata route {route!r} in {call['raw']}",
+                )
+            )
+            continue
+        if spec.get("tool") != tool_short:
+            errors.append(
+                (
+                    rel_path,
+                    line_no,
+                    name,
+                    f"Route {route!r} belongs to tool {spec.get('tool')!r}, not {tool_short!r}, in {call['raw']}",
+                )
+            )
+            continue
+
+        if nested_keys is not None:
+            accepted_nested = set(spec.get("accepted_nested_params") or [])
+            bad_nested = sorted(k for k in nested_keys if k not in accepted_nested)
+            if bad_nested:
+                errors.append(
+                    (
+                        rel_path,
+                        line_no,
+                        name,
+                        f"Unknown nested params {bad_nested} for route={route!r} "
+                        f"(accepted_nested_params: {sorted(accepted_nested)}) in {call['raw']}",
+                    )
+                )
+
+        eff_ops = ops or [str(spec.get("default_operation") or "")]
+        for op in eff_ops:
+            synth_args: dict[str, Any] = {"route": route}
+            if op:
+                synth_args["operation"] = op
+            for k in call["kwargs"]:
+                if k in ("route", "source", "channel", "provider", "operation", "action", "params"):
+                    continue
+                lits = _extract_quoted_literals(kwarg_values.get(k, ""))
+                synth_args[k] = lits[0] if lits else ("2026-01-01" if k in ("start", "end", "since", "until") else "META")
+            if nested_keys is not None:
+                synth_args["params"] = {k: "1" for k in nested_keys}
+            # Populate route-level required fields when omitted in prose shorthand so
+            # `_normalize_and_validate_call_args` reaches top-level, operation, and nested `params` checks.
+            canon_present = {rb.PARAM_ALIAS_TABLE.get(k, k) for k in synth_args}
+            for req_k in ("ticker", "query", "start", "end", "concept", "item", "series", "dataset"):
+                if req_k in (spec.get("accepted_params") or []) and req_k not in canon_present:
+                    synth_args[req_k] = "2026-01-01" if req_k in ("start", "end") else "META"
+
+            _, _, bridge_err = rb._normalize_and_validate_call_args(tool_short, synth_args)
+            if bridge_err is not None:
+                errors.append(
+                    (
+                        rel_path,
+                        line_no,
+                        name,
+                        f"Bridge rejected call for route={route!r}, operation={op!r}: "
+                        f"{bridge_err.get('error')} in {call['raw']}",
+                    )
+                )
+            elif op == "list_filters" and route == "alphaengine" and "params" in kwarg_values:
+                errors.append(
+                    (
+                        rel_path,
+                        line_no,
+                        name,
+                        f"alphaengine operation='list_filters' takes no params, got params={kwarg_values['params']} in {call['raw']}",
+                    )
+                )
+    return errors
 
 
 def validate_extracted_calls(
@@ -292,6 +431,8 @@ def validate_extracted_calls(
                     f"(allowed: {sorted(allowed)}) in {call['raw']}",
                 )
             )
+            continue
+        errors.extend(_validate_researchdata_bridge_call(rel_path, call))
     return errors
 
 
@@ -490,3 +631,18 @@ def test_researchdata_schema_aliases_are_legal():
     registry = build_tool_signature_registry()
     calls = extract_tool_calls_from_markdown('`finance(source="sec", symbol="META")`', registry)
     assert validate_extracted_calls("x.md", calls, registry) == []
+
+
+def test_scanner_rejects_invalid_nested_bridge_params():
+    registry = build_tool_signature_registry()
+    sample = """
+    1. `researchdata.research(route="alphaengine", operation="list_filters", params={"filter_type": "document_types", "query": "专家"})`
+    2. `researchdata.research(route="guidepoint", operation="search_library", query="META", params={"bad_nested": 1})`
+    3. `researchdata.research(route="alphaengine", operation="search_library", query="META", params={"type_ids": [1], "sort": "relevance"})`
+    """
+    calls = extract_tool_calls_from_markdown(sample, registry)
+    errors = validate_extracted_calls("synthetic/SKILL.md", calls, registry)
+    assert any(e[1] == 2 and "filter_type" in e[3] for e in errors)
+    assert any(e[1] == 3 and "bad_nested" in e[3] for e in errors)
+    assert not any(e[1] == 4 for e in errors)
+

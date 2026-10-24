@@ -33,9 +33,9 @@ python3 .agents/skills/dalton-earnings-calendar/scripts/calendar_state.py --json
    - `workspace_id` 等于该公司工作区 ID（严禁误写为 `"home"`）；
    - `trigger_type == "once"`。
 3. **触发时间（`state.next_run_at` 或 `next_run_at`）**：
-   - `tm3` 转换到市场时区后，日期等于 `trading_days(date, minus=3)`，时间为 `08:00`；
+   - `tm3` 转换到市场时区后，日期等于 `trading_days.py --date <date> --minus 3` 算出的前 3 个交易日，时间为 `08:00`；
    - `t0` 转换到市场时区后，日期等于 `date`，时间符合 `release_time + N`（AMC 默认 +2.5h，BMO 默认 +2.0h，unknown 默认 20:00）；
-   - `tp1` 转换到市场时区后，日期等于 `trading_days(date, plus=1)`，时间为 `20:00`。
+   - `tp1` 转换到市场时区后，日期等于 `trading_days.py --date <date> --plus 1` 算出的后 1 个交易日，时间为 `20:00`。
 
 > **硬性披露要求**：若因环境或权限无法读回自动任务文件，总结中只能写“**本地台账已记录，自动任务文件未能读回核验**”，严禁报告“对账通过”。
 
@@ -59,6 +59,6 @@ python3 .agents/skills/dalton-earnings-calendar/scripts/calendar_state.py --json
 
 发现 `missing`、`date_mismatch` 或自动任务回读不符时：
 
-1. **先定性原因**：区分是（a）自动任务已建但台账漏 `mark`、（b）UTC 与市场时区的显示差异、（c）改期时未原地更新 `next_run_at`、还是（d）REST helper 调用失败未落盘。
-2. **最小范围修复**：仅对确认存在缺口的公司重新执行 Step 5（`PUT /api/v1/dalton/automations/{name}` + `calendar_state.py mark` + `dalton_watch_event`）。严禁因时区显示差异盲目删除已有自动任务。
+1. **先定性原因**：区分是（a）自动任务已建但台账漏 `mark`、（b）UTC 与市场时区的显示差异、（c）改期时未原地更新 `next_run_at`、还是（d）`dalton_schedule_automation` 调用失败未落盘。
+2. **最小范围修复**：仅对确认存在缺口的公司重新执行 Step 5（`dalton_schedule_automation(action="upsert", ...)` + `calendar_state.py mark` + `dalton_watch_event`）。不要因时区显示差异删除已有自动任务。
 3. **如实汇总未落库项**：修复后再次运行 `diff` 与读回核验；仍未通过的公司逐一写入 Step 7 总结的第 2 项“**未落库**”，附上具体失败原因。

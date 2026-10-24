@@ -4,15 +4,15 @@
 移植自 OpenClaw bullbear-discussion/scripts/render.py check()，剥离飞书分块、落盘标记与 $/~ 字符禁令。
 
 检查项：
-1. 正文引用编号集合 [引用N] == 引用清单集合 [引用N]
-2. 股东回报引用编号集合 [回报引用N]（第一节 + 附录正文）== 附录清单集合 [回报引用N]
+1. 正文引用编号集合 [引用N] == 文末 `## 引用` 集合 [引用N]
+2. 股东回报引用编号集合 [回报引用N]（第一节 + 附录正文）== 文末 `## 引用`（及附录清单）集合 [回报引用N]
 3. 股东回报第一节非空非注释行 <= 48 行（目标 <= 40 行），且无 > 120 字的长自然段
 4. §2 市场共识：三个父 bullet（看多的人默认成立 / 看空的人默认成立 / 两边都不争的），父行冒号后无文字，子 bullet 数分别为 2–4 / 2–4 / 1–3
 5. §3 Top debates：每个 ### Debate 含 5 个一级 bullet 块（分歧 / Bull 怎么看 / Bear 怎么看 / 双方最强反驳 / 我的判断）
 6. §4 Earnings revision map：含“→”的行必须写“→ Debate N”
 7. §6 财务体检：非空非注释行 <= 12 行；全文不出现“占净利润”（应写“相当于净利润的”）
 8. §8 一句话：不出现“Debate N 和/与/或/同时/成立/兑现”这类裸 debate 编号写法
-9. 引用清单（## 十、引用清单 或顺延章节）之后不能再有正文章节；若有 <!-- INSERT:return_appendix --> 须在引用清单之前
+9. 文末 `## 引用` 之后不能再有其他章节；若有 <!-- INSERT:return_appendix --> 须在 `## 引用` 之前
 10. 全文不出现“你的判断”（应为“我的判断”）
 
 用法：
@@ -29,7 +29,7 @@ import pathlib
 import re
 import sys
 
-REF_HEAD_RE = re.compile(r"^##\s+(?:十|十一|十二|十三)、引用清单\b", re.M)
+REF_HEAD_RE = re.compile(r"^##\s+(?:(?:十|十一|十二|十三)、)?引用(?:清单)?\b", re.M)
 RET_SEC_RE = re.compile(r"^##\s+一、股东回报\b", re.M)
 APP_SEC_RE = re.compile(r"^##\s+(?:九|十|十一|十二)、股东回报附录\b", re.M)
 DEBATE_BLOCKS = ["分歧", "Bull 怎么看", "Bear 怎么看", "双方最强反驳", "我的判断"]
@@ -78,21 +78,21 @@ def check(
 
     ref_m = REF_HEAD_RE.search(body)
     if not ref_m:
-        problems.append(f"{slug}: 主稿缺 `## 十、引用清单`（或顺延的十一/十二/十三节引用清单）标题")
+        problems.append(f"{slug}: 主稿缺 `## 引用` 标题")
 
     before_ref = body[:ref_m.start()] if ref_m else body
     if ref_m:
         after_ref = body[ref_m.end():]
-        extra_sec = re.findall(r"^##\s+([一二三四五六七八九十]+、.*)", after_ref, flags=re.M)
+        extra_sec = re.findall(r"^##\s+(.+)", after_ref, flags=re.M)
         if extra_sec:
             problems.append(
-                f"{slug}: 引用清单之后不应再有其他章节 {extra_sec}，附加专题须放在第八节后、股东回报附录与引用清单之前"
+                f"{slug}: `## 引用` 之后不应再有其他章节 {extra_sec}，附加专题须放在第八节后、股东回报附录与 `## 引用` 之前"
             )
         if "<!-- INSERT:return_appendix -->" in body:
             app_pos = body.find("<!-- INSERT:return_appendix -->")
             if app_pos > ref_m.start():
                 problems.append(
-                    f"{slug}: <!-- INSERT:return_appendix --> 必须位于引用清单之前，确保附录与引用清单在文末收尾"
+                    f"{slug}: <!-- INSERT:return_appendix --> 必须位于 `## 引用` 之前，确保附录与 `## 引用` 在文末收尾"
                 )
 
     # 1. 正文引用闭环（支持行首 [引用N] 或 - [引用N]）
@@ -107,12 +107,21 @@ def check(
         app_text = app or ""
         if "**回报引用清单**" in app_text:
             app_before_list, app_list_part = app_text.split("**回报引用清单**", 1)
+        elif "**回报引用**" in app_text:
+            app_before_list, app_list_part = app_text.split("**回报引用**", 1)
         else:
             app_before_list, app_list_part = app_text, app_text
         rtxt = ret + "\n" + app_before_list
         rused = sorted({int(x) for x in re.findall(r"\[回报引用(\d+)\]", rtxt)})
         rlisted = sorted(
-            {int(x) for x in re.findall(r"^\s*(?:[-*]\s*)?\[回报引用(\d+)\]", app_list_part, flags=re.M)}
+            {
+                int(x)
+                for x in re.findall(
+                    r"^\s*(?:[-*]\s*)?\[回报引用(\d+)\]",
+                    app_list_part + "\n" + after_ref_body,
+                    flags=re.M,
+                )
+            }
         )
         if rused != rlisted:
             problems.append(f"{slug}: 回报正文引用 {rused} 与附录清单 {rlisted} 不一致")

@@ -1,13 +1,13 @@
 # 财报后前瞻对账与 Thesis 校准规则（`calibration.md`）
 
-本文件定义 `dalton-earnings-deep`（PS.9 阶段 2）的三项必做任务：**① 前瞻预测逐条对账（`reconcile.md`）、② Thesis 支柱财报后校准与反漂移检查（`thesis-calibration.md`）、③ 管理层指引兑现记录更新（`management-delta.md`）**，以及最终汇总生成的 **`knowledge-revision.json`** 规范。
+本文件定义 `dalton-earnings-deep`（PS.9 阶段 2）的三项必做任务：**① 前瞻预测逐条对账（`reconcile.md` 与 `reconcile.json`）、② Thesis 支柱财报后校准与反漂移检查（`thesis-calibration.md`）、③ 管理层指引兑现记录更新（`management-delta.md`）**，以及最终汇总生成的 **`knowledge-revision.json`** 规范。
 
 ---
 
-## 一、前瞻预测逐条对账规则（`reconcile.py` → `reconcile.md`）
+## 一、前瞻预测逐条对账规则（`reconcile.py` → `reconcile.md` + `reconcile.json`）
 
 ### 1. 逐条核对与三档判定
-读取财报前 T-3 生成的 `predictions.json`，使用 `scripts/reconcile.py` 将每条预测与当季一手披露实际值（或最新官方指引）逐一比对，输出固定列对账表：
+读取财报前 T-3 生成的 `predictions.json`，使用 `scripts/reconcile.py` 将每条预测与当季一手披露实际值（或最新官方指引）逐一比对，输出固定列对账表至 `research/<D>-deep-<quarter>/reconcile.md`，同时将错判与部分命中的条数写入 `research/<D>-deep-<quarter>/reconcile.json`（格式为 `{"wrong": <错的条数>, "partial": <部分的条数>}`；若本次财报前无 `predictions.json`，`reconcile.json` 写 `{"wrong": 0, "partial": 0}`）：
 `指标（ID｜期间｜口径）｜我们的预期｜一致预期｜实际｜对/错/部分｜错因`
 
 每条预测必须明确给出以下三档判定之一，**严禁模棱两可或跳过错判条目**：
@@ -105,26 +105,35 @@
   "review_done": true,
   "escalate_to_pm": false,
   "verdict": {
-    "conclusion": "THESIS_STRENGTHENED",
+    "verdict": "THESIS_STRENGTHENED",
     "trigger": { "kind": "earnings", "ref": "FY26Q3:tp1" },
-    "summary": "FY26Q3 广告展示量与均价双升带动收入超预期，AI 推荐提升转化率验证核心支柱 P1；2026 全年 Capex 上修但 OCF 充裕。",
-    "progress": "substantive",
+    "event": "META FY26Q3 广告展示量与均价双升带动收入超预期，2026 全年 Capex 上修但经营现金流充裕",
+    "rationale": "AI 推荐提升转化率带动广告单价同比增长 11%，验证核心支柱 P1 变现效率持续超预期。",
+    "progress": "some",
     "next_validation": {
       "what": "核查 FY26Q4 假日季广告 CPM 增速与 2027 年 Capex/总费用初步指引区间",
-      "due": "2027-01-29"
+      "due": "2027-01-29",
+      "validation_id": "V-001"
     }
   },
   "agenda_ops": [
     {
-      "op": "complete_validation",
-      "match": "predictions.json"
+      "op": "set",
+      "path": "/next_validations/V-001/status",
+      "value": "done"
     },
     {
-      "op": "add_validation",
-      "item": {
+      "op": "append_item",
+      "path": "/next_validations",
+      "value": {
         "what": "跟踪 FY26Q4 广告均价增速与 2027 费用指引兑现",
         "due": "2027-01-29",
-        "linked_pillar": "P1"
+        "expected": "FY26Q4 广告收入同比增速 >=18%，2027 总费用指引符合预期区间",
+        "status": "pending",
+        "source": "analyst",
+        "linked": {
+          "pillars": ["P1"]
+        }
       }
     }
   ],

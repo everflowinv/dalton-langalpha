@@ -77,8 +77,8 @@ Conviction Call 是 Dalton 研究体系的最高级别输出，直接服务于 P
 1. 按 [templates/call.md](templates/call.md) 写入 `drafts/<YYYY-MM-DD>-call-<TICKER>.md`。
 2. **第 1 轮语言审查**：调用 `check_language(draft_path="drafts/<YYYY-MM-DD>-call-<TICKER>.md", round=1)`（只标问题），读 `<草稿>.language.md` 清单并逐条修改草稿（只改语言表达，不动事实、数字、术语、引用编号与判断强度）。工具报错不算通过，不得跳过。
 3. **第 2 轮语言审查（终稿）**：内容定稿后、`check_draft` 之前，调用 `check_language(round=2)` 并按清单完成终稿语言修改；草稿有改动就再调用一次 `check_language(round=2)` 对终稿复核（记录追加在同一 json），使最后一条第 2 轮记录绑定终稿哈希。本次产出中其他给人读的 .md 笔记（research/ 检索与对账笔记等）同样各审两轮：第 1 轮审完按清单改，第 2 轮复核，改过就再跑一次 round=2 确认；json/xlsx 等机器文件、bg_data/、data/、lenses_work/、model_dump/、知识层渲染文件与 .audit/.annotated/.language 侧车不审。
-4. 调用 `check_draft` 检查格式与禁用词。
-5. 调用 `publish_report(draft_path="drafts/<YYYY-MM-DD>-call-<TICKER>.md", kind="conviction_call", slug="call-<TICKER>", updates_thesis=False)` 提交 PM 审批。
+4. 确认报告末尾 `## 引用` 表存在且每个 `[引用N]` 都能在表里找到（指向 `evidence:`、`model:`、`prov:` 或 `f:`），调用 `check_draft` 检查格式与禁用词。
+5. 调用 `publish_report(draft_path="drafts/<YYYY-MM-DD>-call-<TICKER>.md", title="<公司名>（<TICKER>）Conviction Call", kind="conviction_call", slug="call-<TICKER>", updates_thesis=False)` 提交 PM 审批。
 6. **PM 批准后**：调用 `knowledge_update` 更新 `thesis`、`drivers`、`agenda`，并调用 `knowledge_append_verdict`（`verdict="NEW_THESIS"` 或 `"THESIS_STRENGTHENED"`）。
 
 ### 收尾门禁：汇报完成前必须过完成契约（`dalton_check_done`）

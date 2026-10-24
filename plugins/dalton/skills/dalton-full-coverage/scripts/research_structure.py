@@ -25,7 +25,7 @@ CHAPTERS = (
     "风险收益", "管理层与股权", "市场预期", "估值", "后续跟踪",
 )
 CN_NUM = ("零", "一", "二", "三", "四", "五", "六", "七", "八", "九", "十")
-CITE = re.compile(r"\[[ABCD]-\d+\]")
+CITE = re.compile(r"\[(?:引用\d+|[ABCD]-\d+)\]")
 Q_TITLE = re.compile(r"Q(\d+)[.．、]\s*(.+)$")
 SECTION = re.compile(r"([零一二三四五六七八九十]+)[、.．]\s*(.+)$")
 

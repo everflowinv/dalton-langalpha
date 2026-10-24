@@ -25,7 +25,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 - `company`：公司名称
 - `market`：市场（支持 `US`、`HK`、`CN`；港股与 A 股的一手公告与财务初值通过 `researchdata.finance(route="cn-hk", operation="filings"|"ask", ...)` 获取，平台财务表仅作二手初值线索，核心财务数字必须回法定公告原文核实，港股披露易未覆盖时用 `web_search` 查 `site:hkexnews.hk` 原文链接；回报与估值核对复权、分红、拆股与币种）
 - `workspace_dir`：当前公司工作区路径
-- `as_of`：基准日期（`YYYY-MM-DD`）
+- `as_of`：基准日期（`YYYY-MM-DD`；可不传或传 `"latest"`，`RunWorkflow` 会自动取最近一个美股交易日，`resume` 续跑时自动沿用上一 run 的值）
 - `profile`：`"tob"`（面向企业）或 `"toc"`（面向消费者），决定 D 支线做从业者信号表还是多平台产品体验表
 - `form`：`"10-K"`（美国本土发行人）、`"20-F"`（外国私人发行人）或 `"annual_report"`（港股/A 股年度报告）
 - `pm_brief`（可选）：PM 的具体研究指示或假设
@@ -34,7 +34,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 ### 开始前：检查未完成的 run（中断续跑）
 
 - 读 `research/<D>-fc/.progress.json`（及 `research/` 下其他 `*/.progress.json`），看是否有本 workflow 的 `status` 不是终态（`completed`/`failed`/`cancelled`）的 run。
-- 有未完成的 run 时不要新开 run：用**原参数**调用 `RunWorkflow(workflow="full-coverage", params={...原参数..., "progress_path": "research/<D>-fc/.progress.json"}, resume="<.progress.json 里的 run_id>")` 续跑；label、prompt 哈希与产物哈希都一致的已完派发会直接复用，不重复派子任务。
+- 有未完成的 run 时不要新开 run：用**原参数**调用 `RunWorkflow(workflow="full-coverage", params={...原参数..., "progress_path": "research/<D>-fc/.progress.json"}, resume="<.progress.json 里的 run_id>")` 续跑；label、prompt 哈希与产物哈希都一致的已完派发会直接复用，不重复派子任务。若前一次 run 因审稿 `block` 等原因提前停止，补齐问题后同样用**原参数**加 `resume` 重跑（workflow 返回值里已提供 `resume_hint`）。
 - 全新启动时也在 `params` 里带上 `"progress_path": "research/<D>-fc/.progress.json"`，让中断后的 run 可被发现与续跑。
 
 ---
@@ -54,7 +54,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
        "company": "<公司名>",
        "market": "US",
        "workspace_dir": "<workspace_dir>",
-       "as_of": "<YYYY-MM-DD>",
+       "as_of": "<YYYY-MM-DD 或 latest，可不传>",
        "profile": "tob",
        "form": "10-K",
        "pm_brief": "<可选>",
@@ -75,12 +75,12 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
      - **建模**：按 `references/model-spec.md` 构建 `model/<TICKER>-model-v01.xlsx`（`recalc.py` 与 `audit.py --strict` 通过，Checks 全 OK），与 memo 第一段并行；
      - **memo 第一段**（基本信息、核心判断、零、一、二）→ 跑 `validate_memo.py --part 1` 到 0 FAIL；
      - **memo 第二段**（三至六，引用模型三情景与敏感度）→ 跑 `validate_memo.py --part 2` 到 0 FAIL；
-     - **memo 第三段**（七至十、附录、引用清单，第七章含 C4 指引可信度表，第九章估值与模型一致）→ 跑 `validate_memo.py --mode full` 到 0 FAIL。
+     - **memo 第三段**（七至十、附录、`## 引用`，第七章含 C4 指引可信度表，第九章估值与模型一致）→ 跑 `validate_memo.py --mode full` 到 0 FAIL。
    - **阶段 4（审模型与独立审稿并行）**：`check-model` 审模型输出 `research/<D>-fc/model-check.md`（只出报告不改模型）∥ `dalton-reviewer` 审 memo。
    - **阶段 5（修订与知识层修订草案）**：按审稿意见与 `model-check.md` 修订 memo 和模型（若改模型，按 `.agents/skills/model-update/SKILL.md` 另存 `v02`，绝不覆盖 `v01`），并生成 `research/<D>-fc/knowledge-revision.json`。
 
 3. **Workflow 不可用时的手动降级路径**
-   - **`workflow.enabled` 已关闭**（工具列表本来就不会有 `RunWorkflow`）：主智能体按阶段 0 → 0.8 → 1 → 2/3 → 4 → 5 的顺序手动完成（依次调用子智能体或亲自执行）各阶段产物与脚本校验，并逐阶段核对产物。独立审稿阶段派 `dalton-reviewer` 审最终稿后，把它返回的 JSON（含 `verdict` 与 `draft_sha256`）原样保存到 `research/<D>-fc/review.json`（多轮复审时保存最后一轮；改稿后必须重审并覆盖）；收尾调用 `dalton_check_done` 时在 `params` 里加 `"manual": true`、不传 `run_id`，审稿据此文件核对。语言审查两轮（顺序不可颠倒，与 workflow 相同）：成稿后先调用 `check_language(draft_path=<草稿>, round=1)` 并按 `<草稿>.language.md` 清单修改（只改语言，不动事实、数字、术语、引用编号与判断强度），再派 `dalton-reviewer` 首次审稿；修订循环结束、终稿内容定稿后调用 `check_language(round=2)` 按清单完成终稿语言修改，草稿有改动就再调用一次 `check_language(round=2)` 对终稿复核，然后做最后一次审稿（pass 的 JSON 存 review.json）与 `check_draft`；第一次审稿就 pass 时：第 2 轮照常执行；改了稿就补一次终稿审稿（pass 的 JSON 覆盖存 review.json），哈希未变则无需重审。本次产出中其他给人读的 .md 笔记（research/ 支线、背景、快讯、异动、公告点评、专题章节等）同样各审两轮：第 1 轮审完按清单改，第 2 轮复核，改过就再跑一次 round=2 确认；json/xlsx 等机器文件、bg_data/、data/、lenses_work/、model_dump/、知识层渲染文件与 .audit/.annotated/.language 侧车不审。
+   - **`workflow.enabled` 已关闭**（工具列表本来就不会有 `RunWorkflow`）：主智能体按阶段 0 → 0.8 → 1 → 2/3 → 4 → 5 的顺序手动完成（依次调用子智能体或亲自执行）各阶段产物与脚本校验，并逐阶段核对产物。独立审稿阶段派 `dalton-reviewer` 审稿按三步执行：（1）主智能体先计算草稿的 sha256（`sha256sum drafts/<D>-memo.md` 或等价的 Python `hashlib.sha256`）；（2）把该哈希写进派给 `dalton-reviewer` 的提示词；（3）要求审稿人在返回的 JSON 里原样回填 `draft_sha256`，并将返回的 JSON（含 `verdict` 与 `draft_sha256`）原样保存到 `research/<D>-fc/review.json`（多轮复审时保存最后一轮；改稿后重新计算哈希、重审并覆盖）。收尾调用 `dalton_check_done(workflow="full-coverage", params={"ticker": "<TICKER>", "workspace_dir": "<当前工作区路径>", "as_of": "<D>", "manual": true})`（不传 `run_id`），审稿据此文件核对。语言审查两轮（顺序不可颠倒，与 workflow 相同）：成稿后先调用 `check_language(draft_path=<草稿>, round=1)` 并按 `<草稿>.language.md` 清单修改（只改语言，不动事实、数字、术语、引用编号与判断强度），再派 `dalton-reviewer` 首次审稿；修订循环结束、终稿内容定稿后调用 `check_language(round=2)` 按清单完成终稿语言修改，草稿有改动就再调用一次 `check_language(round=2)` 对终稿复核，然后做最后一次审稿（pass 的 JSON 存 review.json）与 `check_draft`；第一次审稿就 pass 时：第 2 轮照常执行；改了稿就补一次终稿审稿（pass 的 JSON 覆盖存 review.json），哈希未变则无需重审。本次产出中其他给人读的 .md 笔记（research/ 支线、背景、快讯、异动、公告点评、专题章节等）同样各审两轮：第 1 轮审完按清单改，第 2 轮复核，改过就再跑一次 round=2 确认；json/xlsx 等机器文件、bg_data/、data/、lenses_work/、model_dump/、知识层渲染文件与 .audit/.annotated/.language 侧车不审。
    - **否则**（`workflow.enabled` 未关闭）：`RunWorkflow` 不在工具列表时，先用 **Read 工具**（不要用 Bash `cat`）读 `.agents/skills/run-workflow/SKILL.md` 后重试；仍没有就停下，告诉 PM「RunWorkflow 不可用」，不要自行手动派发 Task 子智能体代跑。
 
 ---
@@ -95,7 +95,7 @@ Workflow 返回后，主智能体按以下 6 步完成收尾（完成契约在�
 
 ### 第 2 步：展示并写入知识层修订（`knowledge_update` + `knowledge_append_verdict`）
 - 读取 `research/<D>-fc/knowledge-revision.json`，将核心认知改动（`旧值 → 新值 → 原因与证据编号`）展示给 PM（无人值守运行时直接写入工作版本），然后逐个 doc 调用 `knowledge_update`：
-  - **`thesis`**：更新支柱、确认/警告/证伪阈值、追加证据台账行（`source.type` 与 `source.tier` 对应）、更新 `house_view`（**硬约束**：若给出目标价，`house_view.target` 必须带 `model_ref.kind="model_cell"` 指向 Excel 模型单元格）；
+  - **`thesis`**：先写证据台账再定稿——更新支柱、确认/警告/证伪阈值、追加证据台账行（`source.type` 与 `source.tier` 对应；每条 `evidence` 必填 `figures` 数组，每项含 `metric`〔中文或英文指标名〕、`value`、`unit`〔枚举值 `"USD"` / `"USD_mn"` / `"USD_bn"` / `"HKD"` / `"HKD_mn"` / `"HKD_bn"` / `"CNY"` / `"CNY_mn"` / `"CNY_bn"` / `"CNY_100mn"` / `"pct"` / `"bp"` / `"x"` / `"count"` / `"count_mn"` / `"per_share"` / `"other"`，百分比用 `"pct"`〕、`period`、`label`〔仅限 `"reported"` / `"company_guidance"` / `"consensus"` / `"estimate"` / `"assumption"` / `"research_judgement"`〕，且 `source.ref` 指向一手文件或 `prov`，严禁指向本次草稿 `drafts/<D>-memo.md`）、更新 `house_view`（**硬约束**：若给出目标价，`house_view.target` 必须带 `model_ref.kind="model_cell"` 指向 Excel 模型单元格）；
   - **`debate`**：更新完整覆盖后的核心多空分歧、倾向、置信度与改判条件；
   - **`drivers`**：更新核心业务驱动树变量、模型敏感度与高频跟踪指标；
   - **`management`**：写入 C4 支线整理的 12 季指引兑现历史（`guidance_history`）与指引风格定性结论（`guidance_style`：保守/中性/激进、收入还是利润更保守、全年修正节奏）；
@@ -110,7 +110,7 @@ Workflow 返回后，主智能体按以下 6 步完成收尾（完成契约在�
 - 调用 `dalton_coverage_tracking(action="enable", source="coverage_finish")` 开启（或补齐）该公司的标准自动跟踪任务（`watch`、`delta`、`move-up`、`move-down`）。若用户之前手动关闭过（带 `paused_by_user` 标记），`source="coverage_finish"` 会自动保持关闭状态，不重新打开。
 
 ### 第 4 步：`check_draft` 预检与 `publish_report` 正式发布
-1. 先调用 `check_draft(draft_path="drafts/<D>-memo.md")` 查看数字核验反馈（生成 `drafts/<D>-memo.audit.md`），修复所有未匹配或无来源的数字。
+1. 确认报告末尾 `## 引用` 表存在且正文中每个 `[引用N]` 都能在表里找到（指向 `f:`、`evidence:`、`model:` 或 `prov:`），调用 `check_draft(draft_path="drafts/<D>-memo.md")` 查看数字核验反馈（生成 `drafts/<D>-memo.audit.md`），修复所有未匹配或无来源的数字。
 2. 调用 `publish_report` 发起正式发布：
    ```json
    {
@@ -130,8 +130,8 @@ Workflow 返回后，主智能体按以下 6 步完成收尾（完成契约在�
 
 ### 第 5 步：汇报完成前必须过完成契约（`dalton_check_done`）
 
-- 向 PM 汇报"完成"前，必须调用 `dalton_check_done(workflow="full-coverage", run_id=<`research/<D>-fc/.progress.json` 里的 run_id>, params={<启动 RunWorkflow 时的同一组参数，含 as_of>})`。
-- 走手动降级路径（`workflow.enabled` 已关闭、没有 run）时不传 `run_id`，`params` 里加 `"manual": true`，审稿结论按 `research/<D>-fc/review.json` 核对。
+- 向 PM 汇报"完成"前，必须调用 `dalton_check_done(workflow="full-coverage", run_id=<`research/<D>-fc/.progress.json` 里的 run_id>, params={"ticker": "<TICKER>", "workspace_dir": "<当前工作区路径>", "as_of": "<D>"})`（与启动 `RunWorkflow` 时的参数一致）。
+- 走手动降级路径（`workflow.enabled` 已关闭、没有 run）时不传 `run_id`，调用 `dalton_check_done(workflow="full-coverage", params={"ticker": "<TICKER>", "workspace_dir": "<当前工作区路径>", "as_of": "<D>", "manual": true})`，审稿结论按 `research/<D>-fc/review.json` 核对。
 - `done=false` 时按 `missing` 逐条补齐（缺文件补文件、`facts.py check`/`validate_memo`/`audit.py` 未过修到过、知识层缺 source=tool 新版本就 `knowledge_update`、check_draft 用了旧草稿就对最终稿重跑 `check_draft`），补完再查一次。
 - 补不了的缺项只能汇报"未完成"，列出缺项与原因；没有 `dalton_check_done` 通过，不得汇报"完成"。
 

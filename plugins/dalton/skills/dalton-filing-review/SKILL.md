@@ -74,7 +74,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 `research/<YYYY-MM-DD>-filing-<form>-<accession短号>.md`
 （美股 SEC 公告：`<accession短号>` 取 accession 末尾 6 位数字或去横线后的短标识，`<form>` 如 `10-Q`、`8-K`、`424B2`；`source=cninfo` 的巨潮公告不要求 SEC accession，改用 `date`、`title`、`pdf_link`，笔记文件名写为 `research/<date>-filing-cninfo-<title简称>.md` 并在笔记中附上 `date`、`title`、`pdf_link`）。
 - 必须包含：一句话结论（含事件五词）、关键变化（逐条标明页码、小节名或 Item 号）、风险因素 diff 结论（10-Q/10-K 必填）、对 thesis/debate 的影响、需要跟进的事项。
-- 若属重大融资、重组或会计重述等需正式归档的事项，可额外写入 `drafts/` 并调用 `publish_report(kind="event_note")` 提交审批。
+- 若属重大融资、重组或会计重述等需正式归档的事项，可额外写入 `drafts/` 并调用 `publish_report(draft_path="drafts/<YYYY-MM-DD>-filing-<form>-<accession短号>.md", title="<公司名>（<TICKER>）<form> 公告点评", kind="event_note", slug="<ticker-lower>-filing-<form-lower>-<YYYY-MM-DD>")` 提交审批。
 
 ### 第 5 步：收尾三步（知识层写入与 PM 推送）
 

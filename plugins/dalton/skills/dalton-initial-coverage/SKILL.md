@@ -20,7 +20,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 - `company`：公司名称
 - `market`：市场（支持 `US`、`HK`、`CN`；港股与 A 股通过 `researchdata.finance(route="cn-hk", operation="filings"|"ask", ...)` 获取法定公告、财务表初值、行情、资金流、两融、股东与 AH 溢价——平台财务表仅作二手初值线索，核心财务数字必须回法定公告原文核实，港股披露易未覆盖时用 `web_search` 查 `site:hkexnews.hk` 原文链接，回报与估值核对复权、分红、拆股与交易/报表币种）
 - `workspace_dir`：当前公司工作区根目录（如 `.` 或工作区路径）
-- `as_of`：基准日期（`YYYY-MM-DD`，默认今天）
+- `as_of`：基准日期（`YYYY-MM-DD`；可不传或传 `"latest"`，`RunWorkflow` 会自动取最近一个美股交易日，`resume` 续跑时自动沿用上一 run 的值）
 - `peers`（可选）：可比同业代码列表；不提供时由行业支线与估值支线自行选定 5–8 家竞争对手及 ≥3 家一档可比公司，并写明选取理由
 - `sector`（可选）：所属行业名称
 - `pm_question`（可选）：PM 特别指定的关注问题或假设
@@ -28,7 +28,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 ### 开始前：检查未完成的 run（中断续跑）
 
 - 读 `research/<D>-ic/.progress.json`（及 `research/` 下其他 `*/.progress.json`），看是否有本 workflow 的 `status` 不是终态（`completed`/`failed`/`cancelled`）的 run。
-- 有未完成的 run 时不要新开 run：用**原参数**调用 `RunWorkflow(workflow="initial-coverage", params={...原参数..., "progress_path": "research/<D>-ic/.progress.json"}, resume="<.progress.json 里的 run_id>")` 续跑；label、prompt 哈希与产物哈希都一致的已完派发会直接复用，不重复派子任务。
+- 有未完成的 run 时不要新开 run：用**原参数**调用 `RunWorkflow(workflow="initial-coverage", params={...原参数..., "progress_path": "research/<D>-ic/.progress.json"}, resume="<.progress.json 里的 run_id>")` 续跑；label、prompt 哈希与产物哈希都一致的已完派发会直接复用，不重复派子任务。若前一次 run 因审稿 `block` 等原因提前停止，补齐问题后同样用**原参数**加 `resume` 重跑（workflow 返回值里已提供 `resume_hint`）。
 - 全新启动时也在 `params` 里带上 `"progress_path": "research/<D>-ic/.progress.json"`，让中断后的 run 可被发现与续跑。
 
 ---
@@ -48,7 +48,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
        "company": "<公司名>",
        "market": "US",
        "workspace_dir": "<workspace_dir>",
-       "as_of": "<YYYY-MM-DD>",
+       "as_of": "<YYYY-MM-DD 或 latest，可不传>",
        "peers": ["<可选同业>"],
        "sector": "<可选行业>",
        "pm_question": "<可选PM问题>",
@@ -56,19 +56,20 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
      }
    }
    ```
-   `initial-coverage` workflow 会自动分 5 个阶段（共 9 次子智能体派发）执行：
-   - **阶段 1（并行 4 支线取证）**：
+   `initial-coverage` workflow 按以下阶段自动推进（估值支线拆分为取数与写稿两步，取证结束后额外执行一次支线产物核验派发，并包含语言审查、审稿修订与终态产物核验等多次子智能体派发）：
+   - **阶段 1（并行 4 支线取证 + 支线核验）**：
      - **A 公司背景**：按 `.agents/skills/dalton-company-background/SKILL.md` 输出 `drafts/<D>-background.md`；
      - **B 行业支线**：按 `references/branch-industry.md` 输出 `research/<D>-ic/industry.md`；
      - **C 财务镜头**：按 `.agents/skills/dalton-financial-lenses/SKILL.md` 输出 `research/<D>-ic/lenses.json` 与 `drafts/<D>-lenses.md`；
-     - **D 估值历史与可比**：按 `references/branch-valuation-history.md` 与 `.agents/skills/comps-analysis/SKILL.md` 输出 `research/<D>-ic/valuation.md` 与 `research/<D>-ic/comps.xlsx`。
+     - **D 估值历史与可比（拆成取数 + 写稿两步派发）**：先按 `.agents/skills/comps-analysis/SKILL.md` 取数并生成可比表 `research/<D>-ic/comps.xlsx`，再按 `references/branch-valuation-history.md` 撰写估值历史与对数分解稿 `research/<D>-ic/valuation.md`；
+     - **支线核验**：四条支线取证完成后，多一次支线核验派发，核对各支线产物是否存在并计算哈希。
    - **阶段 2（bull/bear 快速版）**：综合 A–D 支线产物与内部库/AlphaEngine 检索，按 `.agents/skills/dalton-bullbear/SKILL.md` 快速版方法输出 `research/<D>-ic/bullbear-quick.md`。
-   - **阶段 3（12 问初筛成稿）**：按 `references/screen-12q.md` 与 `templates/initial-coverage.md` 撰写 `drafts/<D>-initial-coverage.md`。
-   - **阶段 4（知识层初始化草案）**：从初筛成稿抽取结构化知识层操作草案 `research/<D>-ic/knowledge-proposal.json`（只抽取不新增判断）。
-   - **阶段 5（独立审稿与修订）**：由 `dalton-reviewer` 审阅重点题（Q1–Q5、Q7、Q8、Q12）、壁垒判断与估值分解表，再由修订子智能体完成 P0 修改并同步更新 `knowledge-proposal.json`。
+   - **阶段 3（12 问初筛成稿）**：按 `references/screen-12q.md` 与 `templates/initial-coverage.md` 撰写 `drafts/<D>-initial-coverage.md`（先锁定证据台账编号再定稿，文末合并为单一 `## 引用` 节）。
+   - **阶段 4（知识层初始化草案）**：从初筛成稿与支线一手材料抽取结构化知识层操作草案 `research/<D>-ic/knowledge-proposal.json`（只抽取不新增判断；每条 `thesis.evidence` 必填结构化 `figures` 数组，且 `source.ref` 指向一手文件或 `prov`）。
+   - **阶段 5（独立审稿与修订）**：由 `dalton-reviewer` 审阅重点题（Q1–Q5、Q7、Q8、Q12）、壁垒判断、估值分解表及“`## 引用` 表存在且每个 `[引用N]` 都能在表里找到”，再由修订子智能体完成 P0 修改并同步更新 `knowledge-proposal.json`。
 
 3. **Workflow 不可用时的手动降级路径**
-   - **`workflow.enabled` 已关闭**（工具列表本来就不会有 `RunWorkflow`）：主智能体按上述阶段 1→5 的顺序手动执行（依次派发 `dalton-evidence` / `general-purpose` 子智能体或亲自执行），生成全部产物文件，并逐阶段核对产物。阶段 5 派 `dalton-reviewer` 审最终稿后，把它返回的 JSON（含 `verdict` 与 `draft_sha256`）原样保存到 `research/<D>-ic/review.json`（多轮复审时保存最后一轮；改稿后必须重审并覆盖）；收尾调用 `dalton_check_done` 时在 `params` 里加 `"manual": true`、不传 `run_id`，审稿据此文件核对。语言审查两轮（顺序不可颠倒，与 workflow 相同）：成稿后先调用 `check_language(draft_path=<草稿>, round=1)` 并按 `<草稿>.language.md` 清单修改（只改语言，不动事实、数字、术语、引用编号与判断强度），再派 `dalton-reviewer` 首次审稿；修订循环结束、终稿内容定稿后调用 `check_language(round=2)` 按清单完成终稿语言修改，草稿有改动就再调用一次 `check_language(round=2)` 对终稿复核，然后做最后一次审稿（pass 的 JSON 存 review.json）与 `check_draft`；第一次审稿就 pass 时：第 2 轮照常执行；改了稿就补一次终稿审稿（pass 的 JSON 覆盖存 review.json），哈希未变则无需重审。本次产出中其他给人读的 .md 笔记（research/ 支线、背景、快讯、异动、公告点评、专题章节等）同样各审两轮：第 1 轮审完按清单改，第 2 轮复核，改过就再跑一次 round=2 确认；json/xlsx 等机器文件、bg_data/、data/、lenses_work/、model_dump/、知识层渲染文件与 .audit/.annotated/.language 侧车不审。
+   - **`workflow.enabled` 已关闭**（工具列表本来就不会有 `RunWorkflow`）：主智能体按上述阶段 1→5 的顺序手动执行（依次派发 `dalton-evidence` / `general-purpose` 子智能体或亲自执行），生成全部产物文件，并逐阶段核对产物。阶段 5 派 `dalton-reviewer` 审稿按三步执行：（1）主智能体先计算草稿的 sha256（`sha256sum drafts/<D>-initial-coverage.md` 或等价的 Python `hashlib.sha256`）；（2）把该哈希写进派给 `dalton-reviewer` 的提示词；（3）要求审稿人在返回的 JSON 里原样回填 `draft_sha256`，并将返回的 JSON（含 `verdict` 与 `draft_sha256`）原样保存到 `research/<D>-ic/review.json`（多轮复审时保存最后一轮；改稿后重新计算哈希、重审并覆盖）。收尾调用 `dalton_check_done(workflow="initial-coverage", params={"ticker": "<TICKER>", "workspace_dir": "<当前工作区路径>", "as_of": "<D>", "manual": true})`（不传 `run_id`），审稿据此文件核对。语言审查两轮（顺序不可颠倒，与 workflow 相同）：成稿后先调用 `check_language(draft_path=<草稿>, round=1)` 并按 `<草稿>.language.md` 清单修改（只改语言，不动事实、数字、术语、引用编号与判断强度），再派 `dalton-reviewer` 首次审稿；修订循环结束、终稿内容定稿后调用 `check_language(round=2)` 按清单完成终稿语言修改，草稿有改动就再调用一次 `check_language(round=2)` 对终稿复核，然后做最后一次审稿（pass 的 JSON 存 review.json）与 `check_draft`；第一次审稿就 pass 时：第 2 轮照常执行；改了稿就补一次终稿审稿（pass 的 JSON 覆盖存 review.json），哈希未变则无需重审。本次产出中其他给人读的 .md 笔记（research/ 支线、背景、快讯、异动、公告点评、专题章节等）同样各审两轮：第 1 轮审完按清单改，第 2 轮复核，改过就再跑一次 round=2 确认；json/xlsx 等机器文件、bg_data/、data/、lenses_work/、model_dump/、知识层渲染文件与 .audit/.annotated/.language 侧车不审。
    - **否则**（`workflow.enabled` 未关闭）：`RunWorkflow` 不在工具列表时，先用 **Read 工具**（不要用 Bash `cat`）读 `.agents/skills/run-workflow/SKILL.md` 后重试；仍没有就停下，告诉 PM「RunWorkflow 不可用」，不要自行手动派发 Task 子智能体代跑。
 
 ---
@@ -80,7 +81,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 1. **逐个文档调用 `knowledge_update`**
    - 新工作区文档尚不存在时传 `base_version=null` 并使用 `create` 操作；已有文档时使用 `insert` / `append` / `set`：
      - **`company`**：写入一句话业务判断、所属行业、是否周期股，并将 `coverage_stage` 设为 `"initial"`（自动同步工作区描述）。
-     - **`thesis`**：写入报告第七节的 3–5 条初始 thesis 支柱（每条含主张、当前证据，以及 `confirm` / `warn` / `break` 可观测阈值）；首批证据台账条目来自初筛报告引用（确保 `source.type` 与默认 `source.tier` 对应：filing=1、company_release=2、transcript=2、broker_report=3、consensus=3、official_data=4、expert=5、internal_note=5(3–5)、news=6、model=2–3 且须引用 `model_cell` 并禁标 tier 1）；写入 `house_view` 初值（`reason` ≥30 字）。
+     - **`thesis`**：先写证据台账再定稿——写入报告第七节的 3–5 条初始 thesis 支柱（每条含主张、当前证据，以及 `confirm` / `warn` / `break` 可观测阈值）；写入首批 `evidence` 台账条目，**每条 `evidence` 必填 `figures` 数组**（每个事实数字一项，必填 `metric`〔中文或英文指标名〕、`value`、`unit`〔枚举值 `"USD"` / `"USD_mn"` / `"USD_bn"` / `"HKD"` / `"HKD_mn"` / `"HKD_bn"` / `"CNY"` / `"CNY_mn"` / `"CNY_bn"` / `"CNY_100mn"` / `"pct"` / `"bp"` / `"x"` / `"count"` / `"count_mn"` / `"per_share"` / `"other"`，百分比用 `"pct"`〕、`period`、`label`〔仅限 `"reported"` / `"company_guidance"` / `"consensus"` / `"estimate"` / `"assumption"` / `"research_judgement"`〕），且 **`source.ref` 必须指向一手文件或 `prov` 记录**（`kind="filing"` / `"provenance"` / `"model_cell"` / `"url"` 或 `research/` 下的支线原始文件，严禁指向本次初筛草稿 `drafts/<D>-initial-coverage.md`）；确保 `source.type` 与默认 `source.tier` 对应（filing=1、company_release=2、transcript=2、broker_report=3、consensus=3、official_data=4、expert=5、internal_note=5(3–5)、news=6、model=2–3 且须引用 `model_cell` 并禁标 tier 1）；写入 `house_view` 初值（`reason` ≥30 字）。证据台账落库后，用实际分配的 `evidence:E-YYYYMMDD-NN` 校验并补齐草稿末尾的 `## 引用` 表，再定稿运行 `check_draft`。
      - **`debate`**：写入报告第四节的 2–4 个核心多空分歧（分歧变量、Bull、Bear、最强反驳、我的判断、改判条件、来源）。
      - **`drivers`**：写入行业支线识别的长短期驱动变量、2–3 个可跟踪高频指标、宏观敏感度，以及估值支线的“历史上是 EPS 驱动还是倍数驱动”分解结论。
      - **`management`**：写入管理层背景、资本配置与指引风格的初步记录（显式标注“初筛记录，待完整覆盖 C4 12 季表核实”）。
@@ -96,19 +97,20 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
    - 若用户之前曾手动关闭过跟踪（任务元数据含 `paused_by_user`），`source="coverage_finish"` 会自动跳过重新开启并保持关闭状态，不要强制覆盖用户选择。
 
 4. **汇报完成前必须过完成契约（`dalton_check_done`）**
-   - 向 PM 汇报"完成"前，必须调用 `dalton_check_done(workflow="initial-coverage", run_id=<`research/<D>-ic/.progress.json` 里的 run_id>, params={<启动 RunWorkflow 时的同一组参数，含 as_of>})`。
-   - 走手动降级路径（`workflow.enabled` 已关闭、没有 run）时不传 `run_id`，`params` 里加 `"manual": true`，审稿结论按 `research/<D>-ic/review.json` 核对。
+   - 向 PM 汇报"完成"前，必须调用 `dalton_check_done(workflow="initial-coverage", run_id=<`research/<D>-ic/.progress.json` 里的 run_id>, params={"ticker": "<TICKER>", "workspace_dir": "<当前工作区路径>", "as_of": "<D>"})`（与启动 `RunWorkflow` 时的参数一致）。
+   - 走手动降级路径（`workflow.enabled` 已关闭、没有 run）时不传 `run_id`，调用 `dalton_check_done(workflow="initial-coverage", params={"ticker": "<TICKER>", "workspace_dir": "<当前工作区路径>", "as_of": "<D>", "manual": true})`，审稿结论按 `research/<D>-ic/review.json` 核对。
    - `done=false` 时按 `missing` 逐条补齐（缺文件补文件、校验未过修到过、知识层缺 source=tool 新版本就 `knowledge_update`、check_draft 用了旧草稿就对最终稿重跑 `check_draft`），补完再查一次。
    - 补不了的缺项只能汇报"未完成"，列出缺项与原因；没有 `dalton_check_done` 通过，不得汇报"完成"。
 
 5. **完成判定（必查清单）**
    - `drafts/<D>-initial-coverage.md` 已完成独立审稿与 P0 修订；
-   - `company`、`thesis`、`debate`、`drivers`、`management`、`agenda` 均已通过 `knowledge_update` 写入，且已记录首条 `NEW_THESIS` `knowledge_append_verdict`；
+   - `## 引用` 表存在且每个 `[引用N]` 都能在表里找到（每行同时含 `evidence:` / `model:` / `prov:` / `f:` 核验前缀与括号内来源说明）；
+   - `company`、`thesis`（含带完整 `figures` 且 `source.ref` 指向一手文件或 `prov` 的 `evidence` 台账）、`debate`、`drivers`、`management`、`agenda` 均已通过 `knowledge_update` 写入，且已记录首条 `NEW_THESIS` `knowledge_append_verdict`；
    - 已调用 `dalton_coverage_tracking(action="enable", source="coverage_finish")` 并检查确认自动跟踪已开启（`status="enabled"`，或因 `paused_by_user=true` 保持用户手动关闭状态）。
 
 6. **汇报与可选发布**
-   - 末尾必须附引用表：确认报告末尾的 `## 引用` 一节已按每行一条写出对应关系（形如 `[引用1]: evidence:E-20261023-01` 或 `[引用3]: model:model/META-model-v01.xlsx!DCF!C12`）。
-   - 可调用 `check_draft(draft_path="drafts/<D>-initial-coverage.md")` 检查数字核验反馈。
+   - 末尾合并为单一 `## 引用` 节：先完成 `thesis.evidence` 台账写入再最终定稿，确认报告末尾的 `## 引用` 表存在且每个 `[引用N]` 都能在表里找到（形如 `[引用1]: evidence:E-20261023-01 （法定财报｜Meta Platforms｜FY2025 10-K｜2026-02-01｜accession 0001326801-26-000012）` 或 `[引用3]: model:model/META-model-v01.xlsx!DCF!C12 （本方模型｜DCF 估值页核心假设）`）。
+   - 调用 `check_draft(draft_path="drafts/<D>-initial-coverage.md")` 检查数字核验反馈。
    - 向 PM 汇报核心判断（≤3 句）、12 问重点题结论、估值分解结果、初始倾向（关注 / 观察 / 暂不覆盖 / 建议推进完整覆盖）、研究议程及自动跟踪状态。
    - 初次覆盖默认保留为草稿；若 PM 明确要求正式发布，调用 `publish_report(draft_path="drafts/<D>-initial-coverage.md", title="...", kind="initial_coverage", slug="...")`。
 

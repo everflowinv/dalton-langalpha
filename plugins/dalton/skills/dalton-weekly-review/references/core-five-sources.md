@@ -14,12 +14,12 @@
 ## 二、五类必查来源（Core Five Sources）
 
 ### 1. AlphaEngine（卖方研报、卖方点评、会议纪要、新闻公告）
-通过 PTC 调用 `researchdata.research(route="alphaengine", operation="search_library", ...)`，每家公司执行 **2 次检索**：
+通过 PTC 先调用 `researchdata.research(route="alphaengine", operation="list_filters")` 查询文档分类对应的 `type_ids`，再调用 `researchdata.research(route="alphaengine", operation="search_library", query=..., start=base_minus_1d, end=end_plus_1d, params={"type_ids": [...], "sort": "relevance"})`，每家公司执行 **2 次检索**：
 1. **研报与纪要类**：
-   - `document_categories: ["sell_side_report", "sell_side_comment", "meeting_minutes"]`
-   - `sort: "relevance"`，`start: base - 1d`，`end: end + 1d`，`query`: 公司主名（美股用英文名/ticker，中概用中文名）。
+   - `params={"type_ids": <研报、点评、会议纪要对应的 type_ids>, "sort": "relevance"}`
+   - `start: base - 1d`，`end: end + 1d`，`query`: 公司主名（美股用英文名/ticker，中概用中文名）。
 2. **新闻与公告类**：
-   - `document_categories: ["news", "announcement"]`
+   - `params={"type_ids": <新闻、公告对应的 type_ids>, "sort": "relevance"}`
    - 参数同上。
 3. **跨语言补查与配额纪律**：
    - 当某类相关结果少于 3 条时，换用另一种语言的公司名补查 1 次；
@@ -35,7 +35,7 @@
    - 列出窗口内新入库（`indexed_since = base`）的文档：归在本公司目录（`params.company=TICKER`）下的全部读取；行业级文档中命中本公司别名 ≥ 2 次的读取。
 
 ### 3. 公开新闻与法定公告（`web_search` / `sec` / `cn-hk`）
-1. 执行 1 次带显式日期范围（`date_after = base - 1d`、`date_before = end + 1d`）的常规新闻检索；
+1. 执行 1 次带显式日期范围（`start_date = base - 1d`、`end_date = end + 1d`）的常规新闻检索；
 2. 对 `screen.json` 中该公司出现**放量（量比 ≥ 2.0x）或单日明显偏离同组（|日超额| ≥ 3pp 或 |z| ≥ 2）**的每个异常交易日，额外执行 1 次定向检索：`"{公司名/TICKER} stock {YYYY-MM-DD} why"`。
 3. **港股与 A 股必加 `cn-hk` 深度检索（公告 + 资金面/交易结构）**：
    - **一手公告核查（`operation="filings"`）**：调用 `researchdata.finance(route="cn-hk", operation="filings", ticker=code_5_or_6, start=base_minus_1d, end=min(end_plus_1d, TODAY), limit=20)`（`filings` 的 `end` 不得晚于当天 `TODAY`，否则整次调用失败；港股传 5 位零填充纯数字如 `"00700"`，A 股传 6 位纯数字如 `"600519"`，不带 `.HK`/`.SS`/`.SZ` 后缀），检索窗口内巨潮资讯（cninfo）发布的业绩、回购、股东增减持、重大合同或监管公告及 `pdf_link`；查不到，或者需要仅英文版的公告时，再用 `web_search` 查 `site:hkexnews.hk`。

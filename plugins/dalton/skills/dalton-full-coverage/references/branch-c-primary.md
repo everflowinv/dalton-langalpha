@@ -1,6 +1,6 @@
 # 支线 C：一手文件精读与三年指引可信度（`branch-c-primary.md`）
 
-本支线输出 `research/<D>-fc/ec.md`，引用前缀为 `[C-1]`…`[C-n]`。重点服务 **Q1、Q2、Q3、Q4、Q5、Q9、Q10、Q12**（具体以 `research/<D>-fc/questions.md` 分工为准）。动手前必读 `references/branch-common.md` 与 `research/<D>-fc/facts.md`。
+本支线输出 `research/<D>-fc/ec.md`，正文引用统一使用 `[引用1]`…`[引用N]`，与文末 `## 引用` 节一一对应。重点服务 **Q1、Q2、Q3、Q4、Q5、Q9、Q10、Q12**（具体以 `research/<D>-fc/questions.md` 分工为准）。动手前必读 `references/branch-common.md` 与 `research/<D>-fc/facts.md`。
 
 > **核心定位**：本支线的价值在于精读公司自己写下的法律文本与说过的原话，捕捉**措辞漂移、会计政策变化、风险因素异动与过去三年（12 个季度）管理层指引兑现记录**，而不是简单复述利润表数字（财务数字一律引用 `facts.md`）。
 
@@ -56,6 +56,6 @@
 ### C6. 逐题证据小结与缺口
 - 按 `references/branch-common.md` 第四节格式，汇总 Q1–Q5、Q9、Q10、Q12 的一手证据、最强反证与未决缺口。
 
-### C7. 引用清单与完成标记
-- 按 `[C-1]`…`[C-n]` 顺序列出全部引用（filing 必须写明 `form + period + accession + item`，电话会写明 `期次 + 发言人 + Prepared/Q&A`），末行写 `<!-- 完成 -->`。
+### C7. 引用与完成标记
+- 在文末 `## 引用` 节按 `[引用1]`…`[引用N]` 顺序列出全部引用（filing 必须写明 `form + period + accession + item`，电话会写明 `期次 + 发言人 + Prepared/Q&A`，与正文一一对应），末行写 `<!-- 完成 -->`。
 - **铁律**：永远不把 `yfinance` 当作一手财务披露来源。
