@@ -67,6 +67,6 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 
 ## 5. 知识层与交付动作
 
-1. 若当前工作空间尚未初始化 `company.md`，可用本次核实的事实字段调用 `knowledge_update(doc="company", ...)` 补齐公司基础档案（不捏造 thesis）。
+1. 若当前工作空间尚未初始化 `data/company.json`（渲染进 `agent.md` 托管摘要块，`company` 不单独渲染 `company.md`），可用本次核实的事实字段调用 `knowledge_update(doc="company", ...)` 补齐公司基础档案（不捏造 thesis）。
 2. 将完整稿件写入 `drafts/<YYYY-MM-DD>-background.md`。
 3. 如用户要求正式发布，调用 `check_draft` 通过后调用 `publish_report`。

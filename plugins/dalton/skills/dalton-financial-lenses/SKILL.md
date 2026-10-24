@@ -35,7 +35,7 @@ python3 .agents/skills/dalton-financial-lenses/scripts/anchors.py \
 ### 第 3 步：获取一手 Filing 财务与附注数据
 
 #### 3.1 美股（含美股上市 ADR）
-1. 用 `dalton_sec.get_company_facts(ticker=..., concepts=..., periods=...)` 获取最新 10-Q/10-K/20-F 资产负债表、利润表、现金流量表科目（严格遵守 R1–R10 规则，带单位、期间与 accession）。
+1. 用 `dalton_sec.get_company_facts(ticker=..., concepts=..., period=...)` 获取最新 10-Q/10-K/20-F 资产负债表、利润表、现金流量表科目（严格遵守 R1–R10 规则，带单位、期间与 accession）。
 2. 用 `researchdata.finance(route="sec", ...)` 的 `read-item` / `search-text`（或自带 `get_sec_filing`）读取资产负债表附注（现金及短期投资构成、受限资金、有息债务明细、合同负债/递延收入、联营合营与股权投资、回购授权与执行 `share repurchase program`）。
 
 #### 3.2 港股与 A 股（`route="cn-hk"`：平台初值 + 法定公告核实）

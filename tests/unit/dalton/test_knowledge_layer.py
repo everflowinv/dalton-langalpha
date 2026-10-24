@@ -2174,3 +2174,205 @@ async def test_append_verdict_trigger_signals_emits_signal_fields_consumed_and_r
     assert mock_resolve.call_args.args[0] == ["filing:0001045810-26-000012"]
     assert mock_resolve.call_args.kwargs["resolved_by"] == "VD-20261024-03"
 
+
+@pytest.mark.asyncio
+async def test_append_verdict_reports_agenda_update_failed_with_expected_structure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When agenda_ops fail validation or op execution, append_verdict still saves the verdict and explicitly reports agenda_update: failed with error and expected structure."""
+    from src.dalton.knowledge import service
+
+    saved_agendas = _setup_verdict_agenda_mocks(
+        monkeypatch, _sample_agenda_with_validations(), verdict_id="VD-20261024-04"
+    )
+    verdict_payload = {
+        "trigger": {"kind": "earnings", "ref": "V-001"},
+        "event": "META 3Q26 财报超预期",
+        "verdict": "THESIS_STRENGTHENED",
+        "rationale": "广告收入同比 +21% 超买方 bogey。",
+        "evidence_ids": ["E-20261023-01"],
+        "next_validation": {
+            "what": "4Q26 财报指引兑现",
+            "due": "2027-01-29",
+        },
+        "progress": "some",
+    }
+
+    # Case 1: Invalid op (e.g. non-existent 'close_question')
+    res_bad_op = await service.append_verdict(
+        user_id="user-1",
+        workspace_id="ws-1",
+        verdict=verdict_payload,
+        agenda_ops=[{"op": "close_question", "path": "/open_questions"}],
+    )
+    assert res_bad_op["ok"] is True
+    assert res_bad_op["verdict_id"] == "VD-20261024-04"
+    assert res_bad_op["agenda_version_no"] is None
+    assert res_bad_op["agenda_update"] == "failed"
+    assert "agenda_update: failed" in res_bad_op["message"]
+    assert "unknown_op" in res_bad_op["message"]
+    assert "Expected structure for " in res_bad_op["message"]
+    assert "knowledge_update(doc=\"agenda\"" in res_bad_op["message"]
+    assert len(saved_agendas) == 1
+
+    # Case 2: Schema error in agenda_ops (e.g. invalid fields priority / due_date / verify_how)
+    res_bad_schema = await service.append_verdict(
+        user_id="user-1",
+        workspace_id="ws-1",
+        verdict=verdict_payload,
+        agenda_ops=[
+            {
+                "op": "append_item",
+                "path": "/open_questions",
+                "value": {
+                    "question": "Bad schema question",
+                    "priority": "P0",
+                    "due_date": "2027-01-01",
+                    "verify_how": "10-Q",
+                },
+            }
+        ],
+    )
+    assert res_bad_schema["ok"] is True
+    assert res_bad_schema["verdict_id"] == "VD-20261024-04"
+    assert res_bad_schema["agenda_version_no"] is None
+    assert res_bad_schema["agenda_update"] == "failed"
+    assert "agenda_update: failed" in res_bad_schema["message"]
+    assert "Expected structure for /open_questions/0" in res_bad_schema["message"]
+    assert len(saved_agendas) == 1
+
+    # Case 3: Missing leading '/' in agenda_ops path (previously raised OpError in repair_knowledge_ops before try/except)
+    from unittest.mock import create_autospec
+
+    from src.dalton.database import verdicts as db_verdicts
+
+    monkeypatch.setattr(
+        db_verdicts,
+        "list_verdicts",
+        create_autospec(
+            db_verdicts.list_verdicts,
+            return_value=[
+                {
+                    "verdict_id": "VD-20261024-04",
+                    "workspace_id": "ws-1",
+                    "verdict_at": datetime(2026, 10, 24, 12, 0, 0, tzinfo=UTC),
+                    "word": "THESIS_STRENGTHENED",
+                    "payload": {
+                        **verdict_payload,
+                        "id": "VD-20261024-04",
+                        "at": "2026-10-24T12:00:00Z",
+                    },
+                }
+            ],
+        ),
+    )
+
+    class _BackendSpec:
+        async def aread_text(self, path: str) -> str | None:
+            return None
+
+        async def awrite_text(self, path: str, content: str) -> None:
+            return None
+
+    written_files: dict[str, str] = {}
+    mock_backend = create_autospec(_BackendSpec, instance=True)
+
+    async def _awrite_text(path: str, content: str) -> None:
+        written_files[path] = content
+
+    mock_backend.awrite_text.side_effect = _awrite_text
+
+    res_no_slash = await service.append_verdict(
+        user_id="user-1",
+        workspace_id="ws-1",
+        verdict=verdict_payload,
+        agenda_ops=[
+            {
+                "op": "set",
+                "path": "open_questions/Q-001/status",
+                "value": "resolved",
+            }
+        ],
+        backend=mock_backend,
+    )
+    assert res_no_slash["ok"] is True
+    assert res_no_slash["verdict_id"] == "VD-20261024-04"
+    assert res_no_slash["agenda_version_no"] is None
+    assert res_no_slash["agenda_update"] == "failed"
+    assert "agenda_update: failed" in res_no_slash["message"]
+    assert "invalid_path" in res_no_slash["message"]
+    assert "path must start with '/'" in res_no_slash["message"]
+    assert "verdicts.md" in written_files
+    assert "VD-20261024-04" in written_files["verdicts.md"]
+    assert len(saved_agendas) == 1
+
+
+def test_dalton_agenda_skill_verdict_and_agenda_ops_examples_validate() -> None:
+    """Extract the verdict and agenda_ops JSON examples from dalton-agenda/SKILL.md and verify they pass schema validation."""
+    import re
+
+    from src.dalton.knowledge.validate import validate_verdict
+
+    skill_path = (
+        Path(__file__).resolve().parents[3]
+        / "plugins"
+        / "dalton"
+        / "skills"
+        / "dalton-agenda"
+        / "SKILL.md"
+    )
+    skill_text = skill_path.read_text(encoding="utf-8")
+    json_blocks = [
+        json.loads(match.group(1))
+        for match in re.finditer(r"```json\s*\n(.*?)\n\s*```", skill_text, flags=re.DOTALL)
+    ]
+    verdict_examples = [
+        b for b in json_blocks if isinstance(b, dict) and "verdict" in b and "next_validation" in b
+    ]
+    assert len(verdict_examples) == 1, "Expected a complete verdict JSON example in dalton-agenda/SKILL.md"
+    verdict_example = verdict_examples[0]
+    val = validate_verdict(verdict_example)
+    assert val.ok, val.format_problems()
+    assert val.warnings == []
+
+    agenda_ops_examples = [b for b in json_blocks if isinstance(b, list)]
+    assert len(agenda_ops_examples) == 1, "Expected a complete agenda_ops JSON example in dalton-agenda/SKILL.md"
+    base_agenda = {
+        "schema_version": 1,
+        "as_of": "2026-10-23T00:00:00Z",
+        "open_questions": [
+            {
+                "id": "Q-001",
+                "question": "Reels 变现效率能否带动广告单价转正？",
+                "why": "核心增长支柱 P1 验证",
+                "value": "high",
+                "urgency": "this_quarter",
+                "origin": "analyst",
+                "owner": "analyst",
+                "status": "open",
+                "attempts": [],
+                "created_at": "2026-10-01T00:00:00Z",
+            }
+        ],
+        "next_validations": [
+            {
+                "id": "V-001",
+                "what": "3Q26 财报广告单价增速",
+                "due": "2026-10-23",
+                "expected": "同比增速 >= 8%",
+                "status": "pending",
+            }
+        ],
+        "watch": {},
+        "wake_conditions": [],
+    }
+    now = datetime(2026, 10, 23, 21, 0, 0, tzinfo=UTC)
+    updated_agenda, _ = apply_ops("agenda", base_agenda, agenda_ops_examples[0], now=now)
+    ag_val = validate_update("agenda", base_agenda, updated_agenda, reason="Apply SKILL.md agenda_ops example")
+    assert ag_val.ok, ag_val.format_problems()
+    assert updated_agenda["open_questions"][0]["status"] == "resolved"
+    assert updated_agenda["open_questions"][1]["id"] == "Q-002"
+    assert updated_agenda["next_validations"][0]["status"] == "done"
+    assert updated_agenda["next_validations"][1]["id"] == "V-002"
+
+

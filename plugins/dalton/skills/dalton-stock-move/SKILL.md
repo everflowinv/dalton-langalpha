@@ -33,8 +33,8 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 3. **排查同组大公司前一晚盘后财报与公告**：
    - 盘前或开盘异动高频源于**同组龙头前一晚盘后（AMC）或当日盘前（BMO）发布的财报、指引或资本开支口径**（例如 META 盘后财报影响 GOOGL/SNAP/PINS 次日盘前）。必须核查同组核心公司前晚至当日的 8-K / 财报新闻稿与盘后股价表现。
 4. **完整精读当天的收盘总结与交易台评论（TMTB / Sales Notes）**：
-   - 先用 `research(route="tmtb", operation="search_library", query=..., start=..., end=...)` 与 `research(route="sales-notes", operation="search_library", ...)` 搜索当日与前一日的科技/宏观收盘总结及交易台晨报/晚报；
-   - **命中后必须调用 `research(route="tmtb"|"sales-notes", operation="read", document=...)`（或 `get_document`）读取全文**，绝不能只看搜索列表的标题或片段摘要。
+   - 先用 `research(route="tmtb", operation="search", query=..., start=..., end=...)` 与 `research(route="sales-notes", operation="search", ...)` 搜索当日与前一日的科技/宏观收盘总结及交易台晨报/晚报；
+   - **命中后必须调用 `research(route="tmtb"|"sales-notes", operation="read", document=...)` 读取全文**，绝不能只看搜索列表的标题或片段摘要。
 5. **去 Beta 与持续性检验方法（参照中国消费周报口径）**：
    - **先除各自市场基准再取同组中位数**：当同组包含跨市场标的（或需剥离大盘指数影响）时，先用每只股票收益除以各自所属市场基准（`(1 + r_stock) / (1 + r_MarketBench) - 1`，如美股对 `SPY`/`QQQ`、港股对恒指/恒科、A 股对沪深 300）得到去市场 beta 后的相对收益，再取同组中位数；
    - **检查是否单一驱动**：对比去 beta 前后的同组离散度与方向一致性，判断异动是由单一宏观/行业因子统一下杀，还是由公司个体事件驱动；
@@ -86,8 +86,8 @@ python3 .agents/skills/dalton-stock-move/scripts/move_quant.py analyze \
 ### 第 3 步：Filing / 公司公告排查
 
 在定性检索窗口（量化起点前推 2–3 天至终点）内排查一手公告与交易所披露：
-- **美股本土公司**：调用 `dalton_sec.list_filings(ticker=TICKER, forms=["8-K", "10-Q", "10-K", "S-3ASR", "424B2", "424B5", "Form 4", "SC 13D", "SC 13G"], since=SEARCH_START, until=SEARCH_END, limit=10)`。
-- **在美上市外国私人发行人（ADR）**：额外包含 `6-K`、`20-F`。
+- **美股本土公司**：调用 `dalton_sec.list_filings(ticker=TICKER, forms="8-K,10-Q,10-K,S-3ASR,424B2,424B5,4,SC 13D,SC 13G", limit=10, as_of=SEARCH_END)`（`forms` 为逗号分隔字符串，无 `since`/`until` 参数，用 `as_of` 指定截止日，返回后按 `filing_date` 过滤 `[SEARCH_START, SEARCH_END]` 窗口内的公告）。
+- **在美上市外国私人发行人（ADR）**：`forms` 额外包含 `,6-K,20-F`。
 - 若有新 filing，用 `researchdata.finance(route="sec", ...)` 或 `get_sec_filing` 读取对应 Item / 附件正文（如 8-K EX-99.1），列出 filing 类型、提交日期、Item 号、accession 与链接。
 - **港股与 A 股公司（`route="cn-hk"`）**：
   1. **法定公告检索（`operation="filings"`）**：在 PTC 中调用 `researchdata.finance(route="cn-hk", operation="filings", ticker=CODE_5_OR_6, start=SEARCH_START, end=min(SEARCH_END, TODAY), limit=20)`（`end` 不得晚于当天 `TODAY`，否则整次调用失败；港股传 5 位零填充纯数字如 `"00700"`，A 股传 6 位纯数字如 `"600519"`，不带 `.HK`/`.SS`/`.SZ` 后缀），调取巨潮资讯（cninfo）公告标题、日期、类别与 `pdf_link` 原文链接；查不到，或者需要仅英文版的公告时，再用 `web_search` 查 `site:hkexnews.hk`。
@@ -96,7 +96,7 @@ python3 .agents/skills/dalton-stock-move/scripts/move_quant.py analyze \
 
 ### 第 4 步：新闻检索
 
-使用 `web_search` 带显式日期范围（`date_after=SEARCH_START`、`date_before=SEARCH_END`）检索公司与行业催化剂：
+使用 `web_search(query=..., start_date=SEARCH_START, end_date=SEARCH_END)` 带显式日期范围检索公司与行业催化剂：
 - 逐条核对结果的实际发布日期是否在定性窗口内，剔除窗口外的旧闻。
 - 每条保留的新闻必须附上标题、来源媒体、发布日期、原始链接，并标明是**一手报道**（公司新闻稿、路透/彭博首发、监管原文）还是**二手转载**。
 
@@ -104,7 +104,9 @@ python3 .agents/skills/dalton-stock-move/scripts/move_quant.py analyze \
 
 通过 PTC（在沙箱代码中调用 `researchdata`）：
 1. **AlphaEngine 卖方研报与点评**：
+   如需按文档类别过滤，先调用 `research(route="alphaengine", operation="list_filters")` 获取合法的 `type_ids`，再传入 `params={"type_ids": [...], "sort": "relevance"}`（`alphaengine` 不支持 `document_categories` 参数）：
    ```python
+   filters = research(route="alphaengine", operation="list_filters")
    research(
        route="alphaengine",
        operation="search_library",
@@ -112,12 +114,12 @@ python3 .agents/skills/dalton-stock-move/scripts/move_quant.py analyze \
        start=search_start,
        end=search_end,
        limit=20,
-       params={"document_categories": ["sell_side_report", "sell_side_comment"], "sort": "relevance"},
+       params={"type_ids": sell_side_type_ids, "sort": "relevance"},
    )
    ```
-   对解释本次异动最相关的研报调用 `get_document(params={"doc_id": ...})` 读取正文。
+   对解释本次异动最相关的研报调用 `research(route="alphaengine", operation="get_document", params={"doc_id": ...})` 读取正文。
 2. **卖方销售邮件与 TMTB**：
-   同一时间窗口检索 `research(route="sales-notes", ...)` 与 `research(route="tmtb", ...)`，提取买方持仓、whisper、资金流或大行 desk 点评；**搜索命中后必须用 `research(route="tmtb"|"sales-notes", operation="read", document=...)`（或 `get_document`）完整读取正文**，不得只凭标题或摘要下判断。
+   同一时间窗口检索 `research(route="sales-notes", ...)` 与 `research(route="tmtb", ...)`，提取买方持仓、whisper、资金流或大行 desk 点评；**搜索命中后必须用 `research(route="tmtb"|"sales-notes", operation="read", document=...)` 完整读取正文**，不得只凭标题或摘要下判断。
 3. **Guidepoint 专家访谈与一线反馈**：
    同一时间窗口检索 `research(route="guidepoint", operation="search_library", query=f"{company_name} {ticker}", start=search_start, end=search_end, limit=10)`（或用 `route="all"` 一次联搜本地库、AlphaEngine 与 Guidepoint），核查供应链、渠道、客户或竞品的一线变化；引用时写访谈日期与专家身份（不写姓名），原文引用不超过 20 词，专家给出的经营数字标为“单一来源估计”。
 4. **身份与状态纪律**：
@@ -158,7 +160,7 @@ python3 .agents/skills/dalton-stock-move/scripts/move_quant.py analyze \
    - `verdict.verdict`：五词正式枚举（如 `"NO_CHANGE"`、`"THESIS_STRENGTHENED"` 等）；
    - `verdict.trigger.kind`：`"price_move"`（若由价格触发唤醒，`trigger.ref` 填入触发任务名或信号 id）；
    - `verdict.next_validation`：必填 `what` 与 `due`；
-   - `verdict.progress`：有新实质证据填 `"material"` 或 `"incremental"`，纯板块 beta 无新事件填 `"none"`。
+   - `verdict.progress`：有新实质证据或进展填 `"some"`（若彻底解答待验证问题填 `"resolved"`），纯板块 beta 无新事件填 `"none"`。
    - `agenda_ops`：把下一项验证写入议程（或更新已有验证项）。
 2. **更新知识层**：
    - 若某条 debate 的倾向或证据因本次事件发生证实/证伪，或某个驱动变量有新读数，调用 `knowledge_update(doc="debate" | "drivers" | "thesis", ...)` 更新。
@@ -174,9 +176,11 @@ python3 .agents/skills/dalton-stock-move/scripts/move_quant.py analyze \
 
 ---
 
-## 附：批量生成 Core 价格触发自动任务
+## 附：开启与管理 Core 价格触发及跨工作区自动任务
 
-上线或更新覆盖名单时，可用 `make_price_triggers.py` 为全部 Core 标的生成涨跌两条价格触发文件（`dalton-<t>-move-up.json` 与 `dalton-<t>-move-down.json`；包含港股/A 股标的时加 `--include-non-us`）：
+- **开启标准价格触发与跟踪套件**：研究总监从 Home 为覆盖公司启用价格异动触发（`dalton-<t>-move-up` / `dalton-<t>-move-down`）及持续跟踪任务时，直接调用 `dalton_coverage_tracking(action="enable", workspace_id=..., ticker=...)`。
+- **研究总监从 Home 跨工作区调度自定义自动任务**：调用 `dalton_schedule_automation(action="upsert", workspace_id=..., name=..., instruction=..., trigger_type=..., ...)`（严禁从沙箱直接调需要用户登录态的后端 REST 接口，也不跨工作区直接写文件）。
+- **分析师在本公司工作区内生成或修改自动任务**：可直接运行 `make_price_triggers.py` 或写 `.agents/user/automations/`（常设授权，写入后检查工具返回不含 `NOT SAVED`）：
 
 ```bash
 python3 .agents/skills/dalton-stock-move/scripts/make_price_triggers.py \
@@ -184,6 +188,3 @@ python3 .agents/skills/dalton-stock-move/scripts/make_price_triggers.py \
   --tier Core \
   --out-dir .agents/user/automations
 ```
-
-- 分析师在本工作区直接写进 `.agents/user/automations/`（常设授权，写入后检查工具返回不含 `NOT SAVED`）；
-- 研究总监从 Home 批量上线时，读取生成好的 JSON 并调用后端 REST helper `PUT /api/v1/dalton/automations/{name}`，不跨工作区直接写文件。

@@ -11,7 +11,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 ## 目标与唤醒机制
 
 每晚对覆盖公司收一次“增量包”（一致预期快照与修正、新卖方研报与 sales note、TMTB、FUNDA AI、新入库 wiki、新 SEC filing、新闻与 X），判断相对现有知识层是否存在**重要变化（material change）**：
-- **零成本预检与 `<dalton_wake>`**：每晚 cron（`dalton-<t>-delta.json`）先由后端运行 `consensus`、`sec`、`internal`、`price` 四个零 LLM 探针。无任何信号的夜晚记 `PRECHECK_SKIPPED`、花费为 0、不建线程（后端仍把当晚一致预期快照存档到 `data/consensus/`）。只有至少命中一个探针信号时才唤醒智能体，线程首条上下文包含 `<dalton_wake>`（内含信号 `id`、`kind` 及命中的阈值）。
+- **零成本预检与 `<dalton_wake>`**：定时任务先由后端零 LLM 预检运行探针（公司日常监控探针 `agenda`、`sec`、`cnhk`、`earnings`、`internal`，计划唤醒探针 `schedule`，价格异动探针 `price`）。无任何信号的轮次记 `skip`、花费为 0、不建线程。只有至少命中一个探针信号时才唤醒智能体，线程首条上下文包含 `<dalton_wake>`（内含信号 `id`、`probe` 及命中的摘要）。
 - **无重要变化不打扰 PM**：被唤醒后，若经判定不属于重要变化（`material=no`），只记一条 `NO_CHANGE` 结论并调用 `commit --material no` 更新 `seen.json`，**绝不向 PM 推送消息**。
 
 ---
@@ -20,7 +20,21 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 
 ### 第 1 步：读取 `<dalton_wake>` 并运行 `collect.py` 补齐增量包
 
-1. 解析线程首条 `<dalton_wake>` 中的唤醒信号（记录 `signal_id`、`kind` 与命中详情，后续写入 `verdict.trigger.ref` 与 `verdict.trigger.kind`；手动调用时 `trigger.kind="manual"`）。
+1. 解析线程首条 `<dalton_wake>` 中的唤醒信号（记录信号 `id`、探针名 `probe` 与信号 `key`——唤醒块每行形如 `[P1][agenda] 摘要 (key=validation:V-001:2026-10-28, signal_id=…)`，后续将信号 `id` 写入 `verdict.trigger.ref`，并将探针名按下方对照表映射为 `verdict.schema.json` 允许的 `verdict.trigger.kind` 枚举值）：
+
+| `<dalton_wake>` 探针名（`probe`）与信号子类型 | `verdict.trigger.kind`（必填枚举值） |
+|---|---|
+| `agenda`，key 以 `validation:` 开头（到期验证项） | `due_validation` |
+| `agenda`，key 以 `pm_question:` 开头（PM 问题） | `pm_question` |
+| `agenda`，key 以 `catalyst:`、`question:`、`action:` 开头（催化剂、开放问题、行动项） | `agenda` |
+| `schedule`（定时唤醒） | `agenda` |
+| `sec` | `filing` |
+| `cnhk` | `filing` |
+| `earnings` | `earnings` |
+| `internal` | `internal_material` |
+| `price` | `price_move` |
+| 手动触发（无 `<dalton_wake>`） | `manual` |
+
 2. 运行采集脚本生成完整增量包（同时把本轮一致预期快照写入工作区 `data/consensus/<YYYY-MM-DD_HHMM>.json`）：
 
 ```bash
@@ -39,7 +53,7 @@ python3 .agents/skills/dalton-thesis-delta/scripts/collect.py collect \
           --material no \
           --summary "无新增"
         ```
-     2. 调用 `knowledge_append_verdict` 写入一条 `NO_CHANGE`（`progress="none"`，`trigger.kind` 按 `<dalton_wake>` 唤醒信号类型，`trigger.ref` 填信号 id，`next_validation` 沿用当前最近待验证项）；
+     2. 调用 `knowledge_append_verdict` 写入一条 `NO_CHANGE`（`progress="none"`，`trigger.kind` 按上方对照表将 `<dalton_wake>` 探针名映射为合法枚举值，`trigger.ref` 填信号 id，`next_validation` 沿用当前最近待验证项）；
      3. **立即结束本轮任务，不读取任何文档全文，也不推送 PM**。
 
 ### 第 2 步：对照知识层与 `materiality.md` 判断是否重要
@@ -48,7 +62,7 @@ python3 .agents/skills/dalton-thesis-delta/scripts/collect.py collect \
 1. 按 `.agents/skills/dalton-knowledge/SKILL.md` 读序先读本工作区 `agent.md` 托管块、`thesis.md`、`debate.md`、`drivers.md`、`agenda.md` 及最近 `verdicts.md`。
 2. 读取 `research/tracker/<run_id>/packet.md` 及关联的新文档摘段/原文：
    - 内部库新文档（`sales-notes`、`tmtb`、`funda-ai`、`company-wiki`）：先读摘段，必要时通过 PTC `researchdata.research(..., operation="read", document=...)` 读全文；
-   - AlphaEngine 新研报：先看摘要，挑带新数字（盈利预测修正、capex/费用、目标价/评级变化、核心 KPI 调查）的研报调 `get_document` 读全文（每轮最多 3 篇；遇配额或未登录即停并记录状态）；
+   - AlphaEngine 新研报：先看摘要，挑带新数字（盈利预测修正、capex/费用、目标价/评级变化、核心 KPI 调查）的研报调用 `researchdata.research(route="alphaengine", operation="get_document", params={"doc_id": ...})` 读全文（每轮最多 3 篇；遇配额或未登录即停并记录状态）；
    - SEC / 港股与 A 股新公告：若当日 `dalton-filing-review` 或 `dalton-earnings-flash` 已经在 `verdicts.md` 写过同一份公告的结论，直接引用，不重复拆解；否则美股读取对应 SEC Item 或附件，港股与 A 股调用 `researchdata.finance(route="cn-hk", operation="filings", ticker=CODE_5_OR_6, start=..., end=..., limit=20)` 读取巨潮法定公告原文（港股未覆盖时用 `web_search` 查披露易 `site:hkexnews.hk` 原文链接），并可调用 `researchdata.finance(route="cn-hk", operation="ask", query=..., limit=20)` 辅助核查资金流、两融、回购或股东变动（平台财务表仅作初值，核心数字回公告核实）。
 3. 严格按 `.agents/skills/dalton-thesis-delta/references/materiality.md` 的十条标准判定本轮是否为**重要变化（`material=yes`）**：
    - **重要（任一命中即 `material=yes`）**：
@@ -69,11 +83,11 @@ python3 .agents/skills/dalton-thesis-delta/scripts/collect.py collect \
 #### 分支 A：存在重要变化（`material=yes`）
 1. **撰写增量笔记**：按 `.agents/skills/dalton-thesis-delta/templates/delta.md` 写入 `research/<YYYY-MM-DD>-delta.md`（写清变化是什么、一手与卖方证据、影响哪个 thesis 支柱或 debate、事件五词结论、下一项验证）。
 2. **更新知识层**：调用 `knowledge_update` 更新受影响的文档（`thesis` / `debate` / `drivers` / `management`）。
-3. **追加事件结论**：调用 `knowledge_append_verdict` 写入五词结论（`THESIS_STRENGTHENED` / `THESIS_WEAKENED` / `THESIS_BROKEN` / `NEW_THESIS` 或有实质新证据但维持原判的 `NO_CHANGE` + `progress="material"`；`trigger.kind` 按变化主要来源填 `internal_material`、`filing`、`indicator`、`price_move` 等，`trigger.ref` 填 `<dalton_wake>` 信号 id）。
+3. **追加事件结论**：调用 `knowledge_append_verdict` 写入五词结论（`THESIS_STRENGTHENED` / `THESIS_WEAKENED` / `THESIS_BROKEN` / `NEW_THESIS` 或有实质新证据但维持原判的 `NO_CHANGE` + `progress="some"`（彻底解答问题时填 `"resolved"`）；`trigger.kind` 按第 1 步对照表与变化主要来源填 `consensus_change`、`internal_material`、`filing`、`earnings`、`indicator`、`price_move`、`due_validation`、`pm_question`、`agenda` 或 `manual`，`trigger.ref` 填 `<dalton_wake>` 信号 id）。
 4. **推送 PM**：输出不超过 10 行的精炼中文摘要推送给 PM（判断先行：五词结论 + 变化核心事实与带期间数字 + 受影响的支柱/Debate + 下一项验证）。
 
 #### 分支 B：无重要变化（`material=no`）
-1. **只记结论**：调用 `knowledge_append_verdict` 写入一条 `NO_CHANGE`（`progress="none"`，`trigger.kind` 与 `trigger.ref` 对应唤醒信号）。
+1. **只记结论**：调用 `knowledge_append_verdict` 写入一条 `NO_CHANGE`（`progress="none"`，`trigger.kind` 按第 1 步对照表映射，`trigger.ref` 填唤醒信号 id）。
 2. **不写增量笔记，不推送 PM**。
 
 ### 第 4 步：提交状态（`commit`）与关闭到期验证项
