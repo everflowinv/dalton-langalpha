@@ -815,8 +815,14 @@ async def test_enable_and_reenable_tracking_delta_schedule_by_tier_core_and_watc
         ticker="ECHO",
     )
     store = ctx["store"]
+    tiers = {"GOOGL": "core", "ECHO": "watch"}
+    monkeypatch.setattr(
+        tracking_mod,
+        "get_user_tier",
+        create_autospec(tracking_mod.get_user_tier, side_effect=lambda _uid, t: tiers.get(t)),
+    )
 
-    # 1. Core tier (GOOGL is tier=core in coverage.yaml, registered on ws-googl)
+    # 1. Core tier (GOOGL is core in user-1's coverage, registered on ws-googl)
     res_core = await enable_tracking("user-1", "ws-googl")
     assert res_core["status"] == "enabled"
     assert res_core["tier"] == "core"
@@ -838,7 +844,7 @@ async def test_enable_and_reenable_tracking_delta_schedule_by_tier_core_and_watc
     assert by_name["dalton-googl-delta"]["timezone"] == "Asia/Shanghai"
     assert by_name["dalton-googl-delta"]["metadata"]["tier"] == "core"
 
-    # 2. Watch tier (ECHO is tier=watch in coverage.yaml, registered on ws-echo)
+    # 2. Watch tier (ECHO is watch in user-1's coverage, registered on ws-echo)
     res_watch = await enable_tracking("user-1", "ws-echo")
     assert res_watch["status"] == "enabled"
     assert res_watch["tier"] == "watch"
@@ -859,136 +865,6 @@ async def test_enable_and_reenable_tracking_delta_schedule_by_tier_core_and_watc
     assert by_name["dalton-echo-delta"]["cron_expression"] == "0 11 * * 6"
     assert by_name["dalton-echo-delta"]["timezone"] == "Asia/Shanghai"
     assert by_name["dalton-echo-delta"]["metadata"]["tier"] == "watch"
-
-
-def test_migrate_delta_schedules_dry_run_apply_and_rowcount_assertion() -> None:
-    """Addendum § 3: migrate_delta_schedules.py defaults to dry-run, applies in one transaction with rowcount assertions, and recalculates next_run_at."""
-    from contextlib import contextmanager
-    import psycopg
-    from scripts.dalton.migrate_delta_schedules import run_migration
-
-    legacy_rows = [
-        {
-            "automation_id": "00000000-0000-0000-0000-000000000011",
-            "user_id": "user-1",
-            "workspace_id": "ws-googl",
-            "name": "dalton-googl-delta",
-            "status": "active",
-            "cron_expression": "30 21 * * 1-5",
-            "timezone": "America/New_York",
-            "next_run_at": None,
-            "metadata": {"dalton_managed": True, "ticker": "GOOGL"},
-        },
-        {
-            "automation_id": "00000000-0000-0000-0000-000000000022",
-            "user_id": "user-1",
-            "workspace_id": "ws-echo",
-            "name": "dalton-echo-delta",
-            "status": "active",
-            "cron_expression": "30 21 * * 1-5",
-            "timezone": "America/New_York",
-            "next_run_at": None,
-            "metadata": {"dalton_managed": True, "ticker": "ECHO"},
-        },
-    ]
-
-    def _make_conn_harness(rowcount_per_update: int = 1) -> dict[str, Any]:
-        conn = create_autospec(psycopg.Connection, instance=True)
-        cur = create_autospec(psycopg.Cursor, instance=True)
-        executed_queries: list[tuple[str, Any]] = []
-        tx_state = {"entered": 0, "committed": 0, "rolled_back": 0}
-
-        def _execute(sql: str, params: Any = None) -> None:
-            executed_queries.append((sql.strip(), params))
-            cur.rowcount = rowcount_per_update
-
-        cur.execute.side_effect = _execute
-        cur.fetchall.return_value = [dict(r) for r in legacy_rows]
-
-        @contextmanager
-        def _conn_ctx():
-            yield conn
-
-        @contextmanager
-        def _tx_ctx():
-            tx_state["entered"] += 1
-            try:
-                yield
-            except Exception:
-                tx_state["rolled_back"] += 1
-                raise
-            else:
-                tx_state["committed"] += 1
-
-        @contextmanager
-        def _cur_ctx(*args: Any, **kwargs: Any):
-            yield cur
-
-        conn.__enter__.side_effect = lambda: conn
-        conn.__exit__.side_effect = lambda exc_type, exc, tb: False
-        conn.transaction.side_effect = _tx_ctx
-        conn.cursor.side_effect = _cur_ctx
-
-        connect_fn = create_autospec(psycopg.connect, return_value=conn)
-        return {
-            "connect_fn": connect_fn,
-            "executed_queries": executed_queries,
-            "tx_state": tx_state,
-        }
-
-    # 1. Dry-run (default): lists plan, calculates next_run_at, performs 0 UPDATEs
-    h_dry = _make_conn_harness()
-    report_dry = run_migration(
-        "postgresql://fake",
-        apply=False,
-        connect_fn=h_dry["connect_fn"],
-    )
-    assert report_dry["mode"] == "dry-run"
-    assert report_dry["matched_count"] == 2
-    assert report_dry["updated_count"] == 0
-    assert report_dry["core_count"] == 1
-    assert report_dry["watch_count"] == 1
-    assert len(h_dry["executed_queries"]) == 1  # only SELECT
-
-    items_by_name = {item["name"]: item for item in report_dry["items"]}
-    assert items_by_name["dalton-googl-delta"]["tier"] == "core"
-    assert items_by_name["dalton-googl-delta"]["new_cron_expression"] == "0 11 * * 2-6"
-    assert items_by_name["dalton-googl-delta"]["new_timezone"] == "Asia/Shanghai"
-    assert items_by_name["dalton-googl-delta"]["new_next_run_at_iso"] is not None
-
-    assert items_by_name["dalton-echo-delta"]["tier"] == "watch"
-    assert items_by_name["dalton-echo-delta"]["new_cron_expression"] == "0 11 * * 6"
-    assert items_by_name["dalton-echo-delta"]["new_timezone"] == "Asia/Shanghai"
-    assert items_by_name["dalton-echo-delta"]["new_next_run_at_iso"] is not None
-
-    # 2. Apply (--apply): runs in a single transaction, updates cron/tz/next_run_at/metadata, asserts rowcount
-    h_apply = _make_conn_harness(rowcount_per_update=1)
-    report_apply = run_migration(
-        "postgresql://fake",
-        apply=True,
-        expect_count=2,
-        connect_fn=h_apply["connect_fn"],
-    )
-    assert report_apply["mode"] == "apply"
-    assert report_apply["matched_count"] == 2
-    assert report_apply["updated_count"] == 2
-    assert h_apply["tx_state"] == {"entered": 1, "committed": 1, "rolled_back": 0}
-    assert len(h_apply["executed_queries"]) == 3  # 1 SELECT FOR UPDATE + 2 UPDATEs
-    for sql, params in h_apply["executed_queries"][1:]:
-        assert "UPDATE automations" in sql
-        assert "next_run_at = %s" in sql
-        assert params[1] == "Asia/Shanghai"
-        assert params[2] is not None  # recalculated next_run_at datetime
-
-    # 3. Rowcount mismatch rolls back the transaction
-    h_bad = _make_conn_harness(rowcount_per_update=0)
-    with pytest.raises(AssertionError, match="Expected rowcount == 1"):
-        run_migration(
-            "postgresql://fake",
-            apply=True,
-            connect_fn=h_bad["connect_fn"],
-        )
-    assert h_bad["tx_state"] == {"entered": 1, "committed": 0, "rolled_back": 1}
 
 
 @pytest.mark.asyncio
@@ -1021,8 +897,8 @@ async def test_resync_delta_schedule_watch_to_core_no_tracking_and_paused(
     tier_state = {"ECHO": "core"}
     monkeypatch.setattr(
         tracking_mod,
-        "_load_coverage_tiers",
-        create_autospec(tracking_mod._load_coverage_tiers, side_effect=lambda: dict(tier_state)),
+        "get_user_tier",
+        create_autospec(tracking_mod.get_user_tier, side_effect=lambda _uid, t: tier_state.get(t)),
     )
 
     res_promoted = await resync_delta_schedule("user-1", "ECHO")

@@ -9,6 +9,7 @@ execution settles immediately as `Outcome.PRECHECK_SKIPPED` (`status='skipped'`,
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -30,6 +31,11 @@ from src.dalton.autonomy.probes.cnhk import probe_cnhk_filings
 from src.dalton.autonomy.probes.director import probe_director
 from src.dalton.autonomy.probes.earnings import probe_earnings
 from src.dalton.autonomy.probes.sec import probe_sec
+from src.dalton.coverage import (
+    refresh_due_coverage_groups_for_preflight,
+    render_coverage_yaml,
+    sync_user_coverage_to_home,
+)
 from src.dalton.database import watch as watch_db
 from src.dalton.llm.assist import assist_json
 from src.dalton.settings import get_dalton_settings
@@ -480,6 +486,62 @@ async def _verify_automation_workspace_ownership(
     return _VerifiedAutomationOwnership(user_id=user_id, workspace_id=workspace_id)
 
 
+HOME_COVERAGE_SYNC_TIMEOUT_S = 5.0
+
+
+async def _sync_home_coverage_for_preflight(
+    *,
+    user_id: str,
+    kind: str,
+    ticker: Optional[str],
+    persist: bool = True,
+    sync_timeout_s: float = HOME_COVERAGE_SYNC_TIMEOUT_S,
+) -> Optional[str]:
+    """Render `coverage.yaml` into Home (and refresh due quarterly groups on `calendar`) with a dedicated short timeout before any step that could time out and wake."""
+    is_home_dalton = kind in ("calendar", "director_daily", "director_weekly") or not ticker
+    if not is_home_dalton or not persist:
+        return None
+
+    eff_sync_timeout = max(0.05, float(sync_timeout_s or HOME_COVERAGE_SYNC_TIMEOUT_S))
+    group_refresh_summary: Optional[str] = None
+    if kind == "calendar":
+        try:
+            refresh_res = await asyncio.wait_for(
+                refresh_due_coverage_groups_for_preflight(
+                    user_id,
+                    sync_home=False,
+                ),
+                timeout=eff_sync_timeout,
+            )
+            if isinstance(refresh_res, dict) and refresh_res.get("summary_text"):
+                group_refresh_summary = str(refresh_res["summary_text"])
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[DALTON_PREFLIGHT] refresh_due_coverage_groups_for_preflight timed out after %.2fs for user=%s",
+                eff_sync_timeout,
+                user_id,
+            )
+        except Exception as e:
+            logger.warning("[DALTON_PREFLIGHT] refresh_due_coverage_groups_for_preflight failed: %s", e)
+
+    async def _render_and_sync() -> None:
+        yaml_text = await render_coverage_yaml(user_id)
+        await sync_user_coverage_to_home(user_id, yaml_text=yaml_text)
+
+    try:
+        await asyncio.wait_for(_render_and_sync(), timeout=eff_sync_timeout)
+    except asyncio.TimeoutError:
+        logger.warning(
+            "[DALTON_PREFLIGHT] sync_user_coverage_to_home timed out after %.2fs for user=%s",
+            eff_sync_timeout,
+            user_id,
+        )
+    except Exception as e:
+        logger.warning("[DALTON_PREFLIGHT] sync_user_coverage_to_home failed: %s", e)
+
+    return group_refresh_summary
+
+
 async def _preflight_check_inner(
     automation: dict[str, Any],
     execution_id: str,
@@ -488,6 +550,8 @@ async def _preflight_check_inner(
     watch_state_override: Optional[dict[str, Any]] = None,
     agenda_doc_override: Optional[dict[str, Any]] = None,
     persist: bool = True,
+    home_synced_in_outer: bool = False,
+    precomputed_group_refresh_summary: Optional[str] = None,
 ) -> PreflightResult:
     """Inner implementation of `preflight_check` wrapped by `asyncio.wait_for` (A3)."""
     if not is_dalton_automation(automation):
@@ -551,6 +615,15 @@ async def _preflight_check_inner(
             reason=health_summary_text,
             signals=[],
             wake_context=None,
+        )
+
+    group_refresh_summary = precomputed_group_refresh_summary
+    if not home_synced_in_outer:
+        group_refresh_summary = await _sync_home_coverage_for_preflight(
+            user_id=user_id,
+            kind=kind,
+            ticker=ticker,
+            persist=persist,
         )
 
     if not settings.autonomy.enabled:
@@ -627,6 +700,22 @@ async def _preflight_check_inner(
 
     if kind == "calendar":
         sigs, state = await probe_calendar(watch_state=state)
+        if group_refresh_summary:
+            if sigs:
+                for sig in sigs:
+                    sig_pl = dict(sig.payload or {})
+                    sig_pl["group_refresh_summary"] = group_refresh_summary
+                    sig.payload = sig_pl
+            else:
+                sigs = [
+                    ProbeSignal(
+                        probe="calendar",
+                        signal_key=f"group_refresh:{datetime.now(tz).date().isoformat()}",
+                        priority="P1",
+                        summary=_sanitize_untrusted_wake_field(group_refresh_summary, max_len=180),
+                        payload={"group_refresh_summary": group_refresh_summary},
+                    )
+                ]
         emitted.extend(sigs)
     elif kind in ("director_daily", "director_weekly"):
         sigs, state = await probe_director(
@@ -651,6 +740,7 @@ async def _preflight_check_inner(
         # Standard company_watch: run the 4 company probes (agenda, sec, cnhk, earnings) with time-based backoff
         t_sym = ticker or "UNKNOWN"
         eff_ws_id = workspace_id if persist else None
+        sec_supports_user_id = "user_id" in inspect.signature(probe_sec).parameters
         probe_runners = [
             (
                 "agenda",
@@ -663,11 +753,21 @@ async def _preflight_check_inner(
             ),
             (
                 "sec",
-                lambda st: probe_sec(
-                    ticker=t_sym,
-                    watch_state=st,
-                    workspace_id=eff_ws_id,
-                    allow_network=persist,
+                lambda st: (
+                    probe_sec(
+                        ticker=t_sym,
+                        watch_state=st,
+                        workspace_id=eff_ws_id,
+                        allow_network=persist,
+                        user_id=user_id,
+                    )
+                    if sec_supports_user_id
+                    else probe_sec(
+                        ticker=t_sym,
+                        watch_state=st,
+                        workspace_id=eff_ws_id,
+                        allow_network=persist,
+                    )
                 ),
             ),
             (
@@ -924,6 +1024,9 @@ async def _preflight_check_inner(
         ticker=ticker,
         signals=woke_signals,
     )
+    if group_refresh_summary:
+        safe_refresh = _sanitize_untrusted_wake_field(group_refresh_summary, max_len=1500)
+        wake_ctx = f"{wake_ctx}\n<coverage_group_refresh>\n{safe_refresh}\n</coverage_group_refresh>"
     return PreflightResult(
         should_wake=True,
         decision="wake",
@@ -977,6 +1080,18 @@ async def preflight_check(
             wake_context=None,
         )
 
+    ticker = _extract_ticker(automation)
+    precomputed_group_refresh_summary: Optional[str] = None
+    home_synced_in_outer = False
+    if kind != "data_health":
+        precomputed_group_refresh_summary = await _sync_home_coverage_for_preflight(
+            user_id=verified_ownership.user_id,
+            kind=kind,
+            ticker=ticker,
+            persist=persist,
+        )
+        home_synced_in_outer = True
+
     if kind != "data_health" and not settings.autonomy.enabled:
         return PreflightResult(should_wake=True, decision="passthrough", reason="autonomy_disabled")
 
@@ -989,6 +1104,8 @@ async def preflight_check(
                 watch_state_override=watch_state_override,
                 agenda_doc_override=agenda_doc_override,
                 persist=persist,
+                home_synced_in_outer=home_synced_in_outer,
+                precomputed_group_refresh_summary=precomputed_group_refresh_summary,
             ),
             timeout=eff_timeout,
         )

@@ -8,7 +8,7 @@
 
 ## 2. 覆盖名单 `coverage.yaml`（默认权威来源）
 
-默认读取基金统一覆盖名单（公司工作区内相对路径为 `../Home/dalton/coverage.yaml`，Home 工作区内为 `dalton/coverage.yaml`，仓库规范路径为 `config/dalton/coverage.yaml`）：
+默认读取当前用户的覆盖名单（覆盖名单由系统按用户维护，通过 Chief of Staff 修改；公司工作区内相对路径为 `../Home/dalton/coverage.yaml`，Home 工作区内为 `dalton/coverage.yaml`）：
 
 1. 在 `companies` 列表中找到目标 `ticker` 的条目。
 2. **同组列表（Peers）**：

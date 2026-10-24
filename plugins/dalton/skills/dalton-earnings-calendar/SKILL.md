@@ -184,7 +184,13 @@ python3 .agents/skills/dalton-earnings-calendar/scripts/calendar_state.py --json
    - 若读回不可用，只能报告“本地已记录”，严禁报告“对账通过”；
    - 对账未通过的公司及原因逐条进入总结第 2 项“**未落库**”。
 
-### Step 7：按固定顺序输出总结并关闭唤醒信号
+### Step 7：发布台账镜像、按固定顺序输出总结并关闭唤醒信号
+
+在台账写完并通过对账后，运行 `publish` 子命令将 `Home/dalton/earnings-calendar.json` 发布到服务端镜像（`PUT /api/v1/dalton/earnings/calendar/mirror`，认证方式与 `PUT /api/v1/dalton/automations/{name}` 一致，最大 1 MB）：
+
+```bash
+python3 .agents/skills/dalton-earnings-calendar/scripts/calendar_state.py --json publish
+```
 
 总结必须严格按以下 6 项顺序输出（第 2、3 项永远出现；仅当第 2、3 项均为“无”且其余无异常时可简短收尾）：
 

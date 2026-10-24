@@ -4,14 +4,13 @@ from __future__ import annotations
 
 import logging
 from datetime import date, datetime, timezone
-from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-import yaml
 from psycopg.rows import dict_row
 
 from src.dalton.budget.service import get_budget_today
+from src.dalton.coverage import get_user_coverage
 from src.dalton.settings import get_dalton_settings
 from src.server.database.pool import get_db_connection
 
@@ -40,12 +39,9 @@ URGENCY_WEIGHT = {
 }
 
 
-def _load_coverage_yaml() -> dict[str, dict[str, Any]]:
-    path = Path(__file__).resolve().parents[3] / "config" / "dalton" / "coverage.yaml"
-    if not path.exists():
-        return {}
+async def _load_user_coverage_map(user_id: str | None) -> dict[str, dict[str, Any]]:
     try:
-        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        raw = await get_user_coverage(user_id)
         entries = raw.get("companies") or raw.get("coverage") or []
         out: dict[str, dict[str, Any]] = {}
         if isinstance(entries, list):
@@ -54,7 +50,7 @@ def _load_coverage_yaml() -> dict[str, dict[str, Any]]:
                     out[str(item["ticker"]).upper()] = item
         return out
     except Exception as e:
-        logger.warning("[DALTON_BOARD] failed to load coverage.yaml: %s", e)
+        logger.warning("[DALTON_BOARD] failed to load user coverage for %s: %s", user_id, e)
         return {}
 
 
@@ -99,7 +95,7 @@ async def build_coverage_board(
         tz = timezone.utc
     now_dt = datetime.now(tz)
     today = now_dt.date()
-    cov_map = _load_coverage_yaml()
+    cov_map = await _load_user_coverage_map(user_id)
 
     budget_raw: dict[str, Any] = {}
     try:

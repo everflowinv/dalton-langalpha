@@ -8,6 +8,7 @@ from typing import Any
 from langchain_core.tools import BaseTool
 
 from src.dalton.settings import get_dalton_settings
+from src.dalton.tools.coverage_tools import build_coverage_tools
 from src.dalton.tools.director_tools import build_director_tools
 
 logger = logging.getLogger(__name__)
@@ -22,7 +23,7 @@ def build_dalton_tools(
     """Return role-appropriate Dalton tools to bind onto the main agent (`DALTON-HOOK(dalton-tools)`).
 
     - `chief_of_staff` (Home / Research Director):
-      `dalton_coverage_board`, `dalton_record_plan`, `dalton_agenda_note`, `dalton_watch_event`, `dalton_resolve_signals`, `dalton_schedule_automation`, `dalton_coverage_tracking`, `dalton_system_jobs`, `conversation_search`, `dalton_check_done` (weekly-coverage-review only)
+      `dalton_coverage_board`, `dalton_record_plan`, `dalton_agenda_note`, `dalton_watch_event`, `dalton_resolve_signals`, `dalton_schedule_automation`, `dalton_coverage_tracking`, `dalton_system_jobs`, `dalton_coverage`, `conversation_search`, `dalton_check_done` (weekly-coverage-review only)
     - `analyst` (Company workspace):
       `knowledge_update`, `knowledge_append_verdict`, `dalton_check_done`, `check_draft`, `check_language`, `publish_report`, `dalton_schedule_automation`, `dalton_coverage_tracking`, `dalton_system_jobs`, `conversation_search`
     """
@@ -41,6 +42,7 @@ def build_dalton_tools(
     if role == "chief_of_staff":
         if settings.autonomy.enabled:
             tools.extend(build_director_tools(role=role, filesystem_backend=filesystem_backend))
+            tools.extend(build_coverage_tools(role=role))
         if settings.conversations.enabled:
             try:
                 from src.dalton.tools.conversation_tools import create_conversation_tools

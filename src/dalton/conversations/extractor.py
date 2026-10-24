@@ -13,10 +13,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from functools import lru_cache
-from pathlib import Path
 from typing import Any
-
-import yaml
 
 from src.config.env import LOCAL_DEV_USER_ID
 from src.dalton.database.conversations import build_card_search_text
@@ -316,7 +313,7 @@ def verify_verbatim_quote(
     return False, None
 
 
-def _is_private_company_ticker(raw_ticker: str) -> bool:
+def _is_private_company_ticker(raw_ticker: str, *, user_id: str | None = None) -> bool:
     """Return True if `raw_ticker` or any of its mapped aliases resolves to `PRIVATE_COMPANIES`."""
     ts = str(raw_ticker or "").strip()
     if not ts:
@@ -327,21 +324,26 @@ def _is_private_company_ticker(raw_ticker: str) -> bool:
     canon_t = canonicalize_ticker_key(upper_t)
     if canon_t in PRIVATE_COMPANIES:
         return True
-    alias_map = _load_ticker_company_aliases()
+    alias_map = _call_load_ticker_company_aliases(user_id)
     for a in alias_map.get(canon_t, ()):
         if a in PRIVATE_COMPANIES or a.upper() in PRIVATE_COMPANIES:
             return True
     return False
 
 
-def _is_trading_channel_discussed_in_claim(canon_ticker: str, claim: str | None) -> bool:
+def _is_trading_channel_discussed_in_claim(
+    canon_ticker: str,
+    claim: str | None,
+    *,
+    user_id: str | None = None,
+) -> bool:
     """Return True if `canon_ticker` (in `TRADING_CHANNEL_TICKERS`) appears in `claim` and the sentence
     containing it does NOT include `'买'`, `'下单'`, `'开户'`, `'可买'`, or `'渠道'`.
     """
     c_text = str(claim or "").strip()
     if not c_text:
         return False
-    alias_map = _load_ticker_company_aliases()
+    alias_map = _call_load_ticker_company_aliases(user_id)
     names: list[str] = list(TRADING_CHANNEL_TICKERS.get(canon_ticker, ()))
     for a in alias_map.get(canon_ticker, ()):
         if a not in names:
@@ -363,6 +365,8 @@ def _is_trading_channel_discussed_in_claim(canon_ticker: str, claim: str | None)
 def normalize_tickers_and_entities(
     raw_tickers: list[Any] | None,
     raw_entities: list[Any] | None,
+    *,
+    user_id: str | None = None,
 ) -> tuple[list[str], list[str]]:
     """Route known private companies (OpenAI, Anthropic, SpaceX/SPCX, etc.) into `entities[]` and normalize tickers."""
     tickers: list[str] = []
@@ -373,13 +377,13 @@ def normalize_tickers_and_entities(
         if es and es not in entities:
             entities.append(es)
 
-    alias_map = _load_ticker_company_aliases()
+    alias_map = _call_load_ticker_company_aliases(user_id)
     for t in raw_tickers or []:
         ts = str(t or "").strip()
         if not ts:
             continue
         upper_t = ts.upper()
-        if _is_private_company_ticker(ts):
+        if _is_private_company_ticker(ts, user_id=user_id):
             canon_t = canonicalize_ticker_key(upper_t)
             entity_label = ts
             if upper_t == "SPCX":
@@ -471,7 +475,108 @@ SUPPLEMENTAL_TICKER_ALIASES: dict[str, tuple[str, ...]] = {
     "688775.SS": ("影石创新", "影石", "Insta360"),
     "300750.SZ": ("宁德时代", "宁德", "CATL"),
     "3750.HK": ("宁德时代", "宁德", "CATL"),
-    "0700.HK": ("腾讯控股", "腾讯", "Tencent"),
+    "0700.HK": ("腾讯控股", "腾讯", "Tencent", "Tencent 腾讯"),
+    "2513.HK": ("智谱", "智谱华章", "Zhipu", "Z.ai", "Zhipu 智谱 (Z.ai)"),
+    "3696.HK": ("英矽智能", "英矽", "Insilico", "Insilico Medicine 英矽智能"),
+    "GOOGL": ("Alphabet (Google)", "Alphabet", "Google", "谷歌"),
+    "DASH": ("DoorDash",),
+    "AFRM": ("Affirm", "Affirm Holdings"),
+    "ECHO": ("EchoStar",),
+    "DHI": ("D.R. Horton",),
+    "VIPS": ("唯品会", "Vipshop"),
+    "ATAT": ("亚朵", "Atour"),
+    "BZ": ("Boss直聘", "BOSS直聘", "Kanzhun"),
+    "AAPL": ("Apple",),
+    "MSFT": ("Microsoft", "微软"),
+    "SPCX": ("SpaceX",),
+    "META": ("Meta Platforms", "Meta"),
+    "TSLA": ("Tesla",),
+    "0100.HK": ("Minimax", "MiniMax"),
+    "NFLX": ("Netflix",),
+    "SPOT": ("Spotify",),
+    "MELI": ("MercadoLibre",),
+    "SE": ("Sea",),
+    "CPNG": ("Coupang",),
+    "UBER": ("Uber",),
+    "BKNG": ("Booking",),
+    "ABNB": ("Airbnb",),
+    "EXPE": ("Expedia",),
+    "RBLX": ("Roblox",),
+    "DUOL": ("Duolingo",),
+    "APP": ("AppLovin",),
+    "U": ("Unity Software", "Unity"),
+    "RDDT": ("Reddit",),
+    "MTCH": ("Match Group", "Match"),
+    "JPM": ("JPMorgan",),
+    "BAC": ("Bank of America", "BofA"),
+    "V": ("Visa",),
+    "MA": ("Mastercard", "万事达"),
+    "SHOP": ("Shopify",),
+    "PYPL": ("PayPal",),
+    "XYZ": ("Block",),
+    "CHYM": ("Chime",),
+    "SOFI": ("SoFi",),
+    "KLAR": ("Klarna",),
+    "SEZL": ("Sezzle",),
+    "UPST": ("Upstart",),
+    "HOOD": ("Robinhood",),
+    "RKT": ("Rocket Companies", "Rocket"),
+    "FIGR": ("Figure",),
+    "IBKR": ("Interactive Brokers", "盈透"),
+    "BX": ("Blackstone",),
+    "APO": ("Apollo",),
+    "SPGI": ("S&P Global", "标普全球"),
+    "MCO": ("Moody's", "穆迪"),
+    "BRK-B": ("Berkshire Hathaway", "Berkshire", "BRK.B"),
+    "PGR": ("Progressive",),
+    "MRSH": ("Marsh McLennan", "Marsh"),
+    "AON": ("Aon",),
+    "AJG": ("Arthur J. Gallagher", "Gallagher"),
+    "CME": ("CME Group",),
+    "ICE": ("Intercontinental Exchange",),
+    "CBOE": ("Cboe Global Markets", "Cboe"),
+    "NDAQ": ("Nasdaq Inc", "纳斯达克", "Nasdaq"),
+    "PLTR": ("Palantir",),
+    "CRM": ("Salesforce",),
+    "NET": ("Cloudflare",),
+    "HURN": ("Huron Consulting", "Huron"),
+    "PM": ("Philip Morris",),
+    "WMT": ("Walmart",),
+    "MAR": ("Marriott",),
+    "HLT": ("Hilton",),
+    "RKLB": ("Rocket Lab",),
+    "PL": ("Planet Labs",),
+    "PWR": ("Quanta Services", "Quanta"),
+    "FIX": ("Comfort Systems",),
+    "STRL": ("Sterling Infra", "Sterling"),
+    "PHM": ("PulteGroup", "Pulte"),
+    "TOL": ("Toll Brothers",),
+    "PDD": ("拼多多", "PDD Holdings"),
+    "NTES": ("网易", "NetEase", "NetEase 网易"),
+    "3690.HK": ("美团", "Meituan", "MPNGY"),
+    "JD": ("京东", "JD.com"),
+    "BIDU": ("百度", "Baidu 百度"),
+    "TCOM": ("携程", "Trip.com"),
+    "BEKE": ("贝壳", "KE Holdings"),
+    "0625.HK": ("希音", "Shein 希音"),
+    "1024.HK": ("快手", "Kuaishou 快手"),
+    "DIDIY": ("滴滴", "DiDi Global 滴滴"),
+    "FUTU": ("富途", "Futu"),
+    "ZTO": ("中通", "ZTO Express"),
+    "6618.HK": ("京东健康", "JD Health 京东健康"),
+    "TME": ("腾讯音乐", "Tencent Music 腾讯音乐"),
+    "1519.HK": ("极兔速递", "J&T Global Express 极兔速递"),
+    "YMM": ("满帮", "Full Truck Alliance 满帮"),
+    "BILI": ("哔哩哔哩", "Bilibili 哔哩哔哩"),
+    "JOYY": ("欢聚", "JOYY 欢聚"),
+    "1860.HK": ("汇量科技", "Mobvista 汇量科技"),
+    "2400.HK": ("心动", "XD Inc 心动"),
+    "2556.HK": ("迈富时", "Marketingforce 迈富时"),
+    "9992.HK": ("泡泡玛特", "Pop Mart 泡泡玛特"),
+    "HTHT": ("华住", "H World", "H World Group"),
+    "6181.HK": ("老铺黄金", "Laopu Gold 老铺黄金"),
+    "0388.HK": ("港交所", "HKEX 港交所"),
+    "601100.SS": ("恒立液压", "Hengli Hydraulic", "601100.SH"),
     "3606.HK": ("福耀玻璃", "福耀", "Fuyao"),
     "600660.SS": ("福耀玻璃", "福耀", "Fuyao"),
     "600660.SH": ("福耀玻璃", "福耀", "Fuyao"),
@@ -531,8 +636,6 @@ SUPPLEMENTAL_TICKER_ALIASES: dict[str, tuple[str, ...]] = {
     "000719.SZ": ("中原传媒",),
     "300033.SZ": ("同花顺",),
     "1357.HK": ("美图公司", "美图", "Meitu"),
-    "2513.HK": ("智谱", "智谱华章", "Zhipu"),
-    "3696.HK": ("英矽智能", "英矽", "Insilico"),
     "3317.HK": ("迅策", "Xunce"),
     "002230.SZ": ("科大讯飞", "讯飞"),
     "300058.SZ": ("蓝色光标",),
@@ -846,11 +949,12 @@ def ticker_code_variants(code: str) -> tuple[str, ...]:
     return tuple(out)
 
 
-@lru_cache(maxsize=1)
-def _load_ticker_company_aliases() -> dict[str, tuple[str, ...]]:
-    """Load ticker -> company name aliases from `config/dalton/coverage.yaml` plus `SUPPLEMENTAL_TICKER_ALIASES`,
+def _load_ticker_company_aliases(user_id: str | None = None) -> dict[str, tuple[str, ...]]:
+    """Load ticker -> company name aliases from `get_user_aliases(user_id)` plus `SUPPLEMENTAL_TICKER_ALIASES`,
     keyed by `canonicalize_ticker_key`.
     """
+    from src.dalton.coverage import get_user_aliases_sync
+
     mapping: dict[str, list[str]] = {}
 
     def _register(raw_ticker: str, aliases: list[str]) -> None:
@@ -866,47 +970,48 @@ def _load_ticker_company_aliases() -> dict[str, tuple[str, ...]]:
             if a_str and a_str not in cur:
                 cur.append(a_str)
 
-    cov_path = Path(__file__).resolve().parents[3] / "config" / "dalton" / "coverage.yaml"
-    if cov_path.is_file():
-        try:
-            doc = yaml.safe_load(cov_path.read_text(encoding="utf-8")) or {}
-            for entry in doc.get("companies") or []:
-                if not isinstance(entry, dict):
-                    continue
-                ticker = str(entry.get("ticker") or "").strip().upper()
-                if not ticker:
-                    continue
-                names = [ticker]
-                disp_name = str(entry.get("name") or "").strip()
-                if disp_name:
-                    names.append(disp_name)
-                aliases_obj = entry.get("aliases") or {}
-                search_names = aliases_obj.get("search_names") or []
-                secondary_tickers: list[str] = []
-                for sn in search_names:
-                    sn_str = str(sn or "").strip()
-                    if sn_str and sn_str not in names:
-                        names.append(sn_str)
-                    if re.match(r"^(?:\d{1,6}\.(?:HK|SS|SH|SZ|T|TW|KS)|[A-Z]{2,5}(?:[.-][A-Z])?)$", sn_str):
-                        secondary_tickers.append(sn_str.upper())
-                for extra_field in ("adr", "a_ticker", "h_ticker", "hk_ticker", "cn_ticker"):
-                    extra_t = str(aliases_obj.get(extra_field) or "").strip().upper()
-                    if extra_t:
-                        if extra_t not in names:
-                            names.append(extra_t)
-                        secondary_tickers.append(extra_t)
-                _register(ticker, names)
-                for sec_t in secondary_tickers:
-                    _register(sec_t, names)
-        except Exception:
-            pass
+    try:
+        db_aliases = get_user_aliases_sync(user_id, include_supplemental=False)
+        for raw_ticker, alias_tuple in (db_aliases or {}).items():
+            ticker = str(raw_ticker or "").strip().upper()
+            if not ticker:
+                continue
+            names = [ticker]
+            secondary_tickers: list[str] = []
+            for sn in alias_tuple or ():
+                sn_str = str(sn or "").strip()
+                if sn_str and sn_str not in names:
+                    names.append(sn_str)
+                if re.match(r"^(?:\d{1,6}\.(?:HK|SS|SH|SZ|T|TW|KS)|[A-Z]{2,5}(?:[.-][A-Z])?)$", sn_str):
+                    secondary_tickers.append(sn_str.upper())
+            _register(ticker, names)
+            for sec_t in secondary_tickers:
+                _register(sec_t, names)
+    except Exception:
+        pass
 
     for ticker, extra_names in SUPPLEMENTAL_TICKER_ALIASES.items():
-        _register(ticker, list(extra_names))
+        names = [ticker, *list(extra_names)]
+        secondary_tickers = [
+            str(sn).strip().upper()
+            for sn in extra_names
+            if re.match(r"^(?:\d{1,6}\.(?:HK|SS|SH|SZ|T|TW|KS)|[A-Z]{2,5}(?:[.-][A-Z])?)$", str(sn).strip())
+        ]
+        _register(ticker, names)
+        for sec_t in secondary_tickers:
+            _register(sec_t, names)
     for ticker, inst_names in SOURCE_INSTITUTION_TICKERS.items():
         _register(ticker, list(inst_names))
 
     return {k: tuple(v) for k, v in mapping.items()}
+
+
+def _call_load_ticker_company_aliases(user_id: str | None = None) -> dict[str, tuple[str, ...]]:
+    """Invoke `_load_ticker_company_aliases`, tolerating zero-arg test doubles."""
+    try:
+        return _load_ticker_company_aliases(user_id)
+    except TypeError:
+        return _load_ticker_company_aliases()
 
 
 def normalize_number_token(raw_token: str) -> str | None:
@@ -1034,12 +1139,13 @@ def _parse_chinese_number(cn_text: str) -> Decimal | None:
     return Decimal(total + section + digit)
 
 
-@lru_cache(maxsize=1)
-def _chinese_company_aliases_for_stripping() -> tuple[str, ...]:
+def _chinese_company_aliases_for_stripping(
+    user_id: str | None = None,
+) -> tuple[str, ...]:
     """Return multi-character Chinese company aliases sorted longest-first so company names
     containing numeral characters (e.g. `百度`, `百融云创`, `爱德万测试`, `万事达`, `三花智控`) are not parsed as numbers.
     """
-    alias_map = _load_ticker_company_aliases()
+    alias_map = _call_load_ticker_company_aliases(user_id)
     cn_names: set[str] = set()
     for aliases in alias_map.values():
         for a in aliases:
@@ -1201,7 +1307,7 @@ _MA_WINDOW_CORE = (
 )
 
 
-def _strip_non_metric_tokens(text: str) -> str:
+def _strip_non_metric_tokens(text: str, *, user_id: str | None = None) -> str:
     """Remove URLs, stock tickers, dates/periods, technical indicator windows, and product/model codes
     before extracting metric numbers from `quote` or `claim`.
     """
@@ -1216,7 +1322,7 @@ def _strip_non_metric_tokens(text: str) -> str:
         s,
         flags=re.IGNORECASE,
     )
-    for cn_comp in _chinese_company_aliases_for_stripping():
+    for cn_comp in _chinese_company_aliases_for_stripping(user_id=user_id):
         if cn_comp in s:
             s = s.replace(cn_comp, " ")
     # Dates: YYYY-MM-DD, W2026-10-03, and unit-free YYYY-MM
@@ -1470,10 +1576,17 @@ _EN_NUM_MENTION_RE = re.compile(
 
 
 def _parse_number_mentions_detailed(
-    text: str, *, strip_non_metrics: bool = True
+    text: str,
+    *,
+    strip_non_metrics: bool = True,
+    user_id: str | None = None,
 ) -> list[tuple[str, set[str], bool]]:
     """Parse number mentions from `text` returning `(raw_canon, legal_forms, has_unit)` for each mention."""
-    cleaned = _strip_non_metric_tokens(text) if strip_non_metrics else str(text or "")
+    cleaned = (
+        _strip_non_metric_tokens(text, user_id=user_id)
+        if strip_non_metrics
+        else str(text or "")
+    )
     mentions: list[tuple[str, set[str], bool]] = []
     masked_chars = list(cleaned)
 
@@ -1584,7 +1697,12 @@ def _parse_number_mentions_detailed(
     return mentions
 
 
-def parse_number_mentions(text: str, *, strip_non_metrics: bool = True) -> list[tuple[str, set[str]]]:
+def parse_number_mentions(
+    text: str,
+    *,
+    strip_non_metrics: bool = True,
+    user_id: str | None = None,
+) -> list[tuple[str, set[str]]]:
     """Parse number mentions from `text` (used identically for `quote` and `claim`).
 
     Each mention yields `(raw_canon, legal_forms)` where `legal_forms` contains ONLY the raw value
@@ -1593,24 +1711,36 @@ def parse_number_mentions(text: str, *, strip_non_metrics: bool = True) -> list[
     return [
         (raw_canon, forms)
         for raw_canon, forms, _has_unit in _parse_number_mentions_detailed(
-            text, strip_non_metrics=strip_non_metrics
+            text, strip_non_metrics=strip_non_metrics, user_id=user_id
         )
     ]
 
 
-def extract_quote_supported_numbers(quote: str) -> set[str]:
+def extract_quote_supported_numbers(
+    quote: str,
+    *,
+    user_id: str | None = None,
+) -> set[str]:
     """Extract all legal normalized number forms (raw + unit-expanded) supported by `quote`."""
     supported: set[str] = set()
-    for _raw_canon, forms, _has_unit in _parse_number_mentions_detailed(quote, strip_non_metrics=True):
+    for _raw_canon, forms, _has_unit in _parse_number_mentions_detailed(
+        quote, strip_non_metrics=True, user_id=user_id
+    ):
         supported.update(forms)
     return supported
 
 
-def extract_claim_numbers(claim: str) -> list[str]:
+def extract_claim_numbers(
+    claim: str,
+    *,
+    user_id: str | None = None,
+) -> list[str]:
     """Extract normalized quantitative metric number tokens (attached to units) from `claim`."""
     return [
         raw_canon
-        for raw_canon, _forms, has_unit in _parse_number_mentions_detailed(claim, strip_non_metrics=True)
+        for raw_canon, _forms, has_unit in _parse_number_mentions_detailed(
+            claim, strip_non_metrics=True, user_id=user_id
+        )
         if has_unit
     ]
 
@@ -1914,6 +2044,7 @@ def is_period_supported_by_quote(
     *,
     value: Any = None,
     unit: str = "",
+    user_id: str | None = None,
 ) -> bool:
     """Return True if `period` is supported by `quote` and anchored in the same sentence as `value`."""
     p = str(period or "").strip()
@@ -1933,7 +2064,10 @@ def is_period_supported_by_quote(
             matching_sents = [
                 s
                 for s in sents
-                if all(not forms.isdisjoint(extract_quote_supported_numbers(s)) for _raw, forms in fig_mentions)
+                if all(
+                    not forms.isdisjoint(extract_quote_supported_numbers(s, user_id=user_id))
+                    for _raw, forms in fig_mentions
+                )
             ]
             if not matching_sents:
                 return False
@@ -1972,6 +2106,7 @@ def strip_unsupported_currency_from_unit(
     quote: str,
     *,
     period: str = "",
+    user_id: str | None = None,
 ) -> tuple[str, bool]:
     """If `unit` contains a currency (`美元`, `元`, `港元`, `USD`, `USD_bn`, `CNY_yi`, etc.)
     but the sentence in `quote` containing `value` lacks that currency token, strip the currency from `unit`.
@@ -1990,7 +2125,11 @@ def strip_unsupported_currency_from_unit(
     matching_sents = [
         s
         for s in sents
-        if fig_mentions and all(not forms.isdisjoint(extract_quote_supported_numbers(s)) for _raw, forms in fig_mentions)
+        if fig_mentions
+        and all(
+            not forms.isdisjoint(extract_quote_supported_numbers(s, user_id=user_id))
+            for _raw, forms in fig_mentions
+        )
     ]
     if period:
         period_sents = [s for s in matching_sents if _is_period_supported_in_text(period, s)]
@@ -2229,6 +2368,7 @@ def _validate_tickers_against_quote_detailed(
     *,
     cited_sources: list[str] | None = None,
     claim: str | None = None,
+    user_id: str | None = None,
 ) -> tuple[list[str], int, int, int]:
     """Filter `tickers` against `quote`, dropping private companies (`tickers_dropped_private`),
     trading channels not discussed as subjects in `claim` (`tickers_dropped_channel`),
@@ -2245,7 +2385,7 @@ def _validate_tickers_against_quote_detailed(
         flags=re.IGNORECASE,
     )
     srcs = [str(s or "") for s in (cited_sources or [])]
-    alias_map = _load_ticker_company_aliases()
+    alias_map = _call_load_ticker_company_aliases(user_id)
 
     kept: list[str] = []
     dropped = 0
@@ -2258,7 +2398,7 @@ def _validate_tickers_against_quote_detailed(
             continue
         canon_t = canonicalize_ticker_key(t)
 
-        if _is_private_company_ticker(t):
+        if _is_private_company_ticker(t, user_id=user_id):
             if canon_t not in seen_priv:
                 seen_priv.add(canon_t)
                 dropped += 1
@@ -2267,7 +2407,7 @@ def _validate_tickers_against_quote_detailed(
 
         if canon_t in TRADING_CHANNEL_TICKERS:
             check_text = claim if claim is not None else q
-            if not _is_trading_channel_discussed_in_claim(canon_t, check_text):
+            if not _is_trading_channel_discussed_in_claim(canon_t, check_text, user_id=user_id):
                 dropped += 1
                 dropped_channel += 1
                 continue
@@ -2312,8 +2452,9 @@ def validate_tickers_against_quote(
     *,
     cited_sources: list[str] | None = None,
     claim: str | None = None,
+    user_id: str | None = None,
 ) -> tuple[list[str], int]:
-    """Filter `tickers` so only symbols or mapped company names (`coverage.yaml` + `SUPPLEMENTAL_TICKER_ALIASES`)
+    """Filter `tickers` so only symbols or mapped company names (`get_user_aliases` + `SUPPLEMENTAL_TICKER_ALIASES`)
     present as discussed subjects in `quote` remain. Returns `(kept_tickers, tickers_dropped)`.
     """
     kept, dropped, _priv, _chan = _validate_tickers_against_quote_detailed(
@@ -2321,6 +2462,7 @@ def validate_tickers_against_quote(
         quote,
         cited_sources=cited_sources,
         claim=claim,
+        user_id=user_id,
     )
     return kept, dropped
 
@@ -2354,8 +2496,9 @@ def backfill_tickers_from_quote(
     cited_sources: list[str] | None = None,
     claim: str | None = None,
     topic_label: str | None = None,
+    user_id: str | None = None,
 ) -> tuple[list[str], int]:
-    """Backfill ticker code(s) when a known company name (`coverage.yaml` + `SUPPLEMENTAL_TICKER_ALIASES`)
+    """Backfill ticker code(s) when a known company name (`get_user_aliases` + `SUPPLEMENTAL_TICKER_ALIASES`)
     appears as the card subject in `claim` or `topic_label` (and in `quote`) and its ticker is missing from `kept_tickers`.
     - Dual-listed A+H companies (`DUAL_LISTED_TICKER_GROUPS`) get both A and H tickers backfilled.
     - Private companies (`PRIVATE_COMPANIES`) and trading channels (`TRADING_CHANNEL_TICKERS`, unless discussed as a subject in `claim`) are never backfilled.
@@ -2375,7 +2518,7 @@ def backfill_tickers_from_quote(
     _, subject_text = _extract_excluded_spans_and_clean_quote(raw_subject_text)
 
     srcs = [str(s or "") for s in (cited_sources or [])]
-    alias_map = _load_ticker_company_aliases()
+    alias_map = _call_load_ticker_company_aliases(user_id)
 
     dual_pair_by_canon: dict[str, tuple[str, str]] = {}
     for a_code, h_code in DUAL_LISTED_TICKER_GROUPS:
@@ -2898,13 +3041,14 @@ def _is_non_proper_english_token(tok: str) -> bool:
     )
 
 
-@lru_cache(maxsize=1)
-def _build_entity_alias_groups() -> tuple[tuple[str, ...], ...]:
+def _build_entity_alias_groups(
+    user_id: str | None = None,
+) -> tuple[tuple[str, ...], ...]:
     """Group all aliases and ticker codes belonging to the same company/institution so that if any alias
     of the entity appears in `quote` (e.g. `SMIC`, `Sieyuan`, `Hynix`, `Tencent`, `澜起`), another alias
     of the same entity in `claim`/`topic_label` (e.g. `中芯国际`, `思源电气`, `SK海力士`, `腾讯`, `澜起科技`) is supported.
     """
-    alias_map = _load_ticker_company_aliases()
+    alias_map = _call_load_ticker_company_aliases(user_id)
     raw_groups: list[set[str]] = []
 
     for aliases in alias_map.values():
@@ -2963,6 +3107,8 @@ def _validate_proper_nouns_and_clean_topic(
     claim_text: str,
     topic_label: str,
     quote: str,
+    *,
+    user_id: str | None = None,
 ) -> tuple[list[str], str]:
     """Check company/institution names (from known alias tables) and uppercase/capitalized English proper nouns/codes
     in `claim_text` and `topic_label` against `quote`.
@@ -2975,7 +3121,7 @@ def _validate_proper_nouns_and_clean_topic(
     t_text = _normalize_trad_to_simp(str(topic_label or ""))
     raw_t_text = str(topic_label or "")
 
-    groups = _build_entity_alias_groups()
+    groups = _build_entity_alias_groups(user_id=user_id)
     unsupported_in_claim: list[str] = []
     unsupported_in_topic: list[str] = []
 
@@ -3118,13 +3264,15 @@ class CardValidationResult:
 def validate_candidate_card(
     card: dict[str, Any],
     quote: str | None = None,
+    *,
+    user_id: str | None = None,
 ) -> CardValidationResult:
     """Validate candidate card's numbers (`claim` & `figures.value`), `figures.period`, `figures.unit` currency,
     `tickers` (validation + alias backfill), proper nouns (`claim` & `topic_label`), forbidden conclusions,
     and keyword-based `type` corrections against `quote`.
     """
     eff_quote = str(quote if quote is not None else (card.get("quote") or ""))
-    q_numbers = extract_quote_supported_numbers(eff_quote)
+    q_numbers = extract_quote_supported_numbers(eff_quote, user_id=user_id)
 
     raw_figures = card.get("figures") if isinstance(card.get("figures"), list) else []
     kept_figures: list[dict[str, Any]] = []
@@ -3144,14 +3292,14 @@ def validate_candidate_card(
             continue
         raw_period = str(fig.get("period") or "").strip()
         if raw_period and not is_period_supported_by_quote(
-            raw_period, eff_quote, value=fig.get("value"), unit=fig_unit
+            raw_period, eff_quote, value=fig.get("value"), unit=fig_unit, user_id=user_id
         ):
             eff_period = ""
             periods_cleared += 1
         else:
             eff_period = raw_period
         eff_unit, was_cur_stripped = strip_unsupported_currency_from_unit(
-            fig_unit, fig.get("value"), eff_quote, period=eff_period
+            fig_unit, fig.get("value"), eff_quote, period=eff_period, user_id=user_id
         )
         if was_cur_stripped:
             currencies_stripped += 1
@@ -3167,7 +3315,7 @@ def validate_candidate_card(
     claim_text = str(card.get("claim") or "")
     raw_topic_label = str(card.get("topic_label") or "")
     unsupported_names, cleaned_topic_label = _validate_proper_nouns_and_clean_topic(
-        claim_text, raw_topic_label, eff_quote
+        claim_text, raw_topic_label, eff_quote, user_id=user_id
     )
     if "topic_label" in card:
         card["topic_label"] = cleaned_topic_label
@@ -3185,6 +3333,7 @@ def validate_candidate_card(
         eff_quote,
         cited_sources=clean_sources,
         claim=claim_text,
+        user_id=user_id,
     )
     kept_tickers, tickers_backfilled = backfill_tickers_from_quote(
         kept_tickers,
@@ -3192,6 +3341,7 @@ def validate_candidate_card(
         cited_sources=clean_sources,
         claim=claim_text,
         topic_label=cleaned_topic_label,
+        user_id=user_id,
     )
 
     unsupported_conclusions: list[str] = []
@@ -3206,7 +3356,9 @@ def validate_candidate_card(
         )
         card["type"] = corrected_type
 
-    claim_mentions = _parse_number_mentions_detailed(claim_text, strip_non_metrics=True)
+    claim_mentions = _parse_number_mentions_detailed(
+        claim_text, strip_non_metrics=True, user_id=user_id
+    )
     unsupported_claim_nums: list[str] = []
     soft_unsupported_claim_nums: list[str] = []
     for raw_canon, forms, has_unit in claim_mentions:
@@ -4090,12 +4242,13 @@ async def extract_segment_cards(
             if not rt_str:
                 continue
             rt_canon = canonicalize_ticker_key(rt_str.upper())
-            if rt_canon not in seen_priv_norm and _is_private_company_ticker(rt_str):
+            if rt_canon not in seen_priv_norm and _is_private_company_ticker(rt_str, user_id=user_id):
                 seen_priv_norm.add(rt_canon)
                 private_dropped_in_norm += 1
         tickers, entities = normalize_tickers_and_entities(
             raw_tickers_list,
             raw_c.get("entities") if isinstance(raw_c.get("entities"), list) else [],
+            user_id=user_id,
         )
         sectors = [
             str(s).strip()
@@ -4136,7 +4289,11 @@ async def extract_segment_cards(
             "cited_sources": cited_sources,
             "confidence": conf,
         }
-        val_res = validate_candidate_card(candidate_for_validation, quote=raw_quote)
+        val_res = validate_candidate_card(
+            candidate_for_validation,
+            quote=raw_quote,
+            user_id=user_id,
+        )
         figures_dropped += val_res.figures_dropped
         periods_cleared += val_res.periods_cleared
         currencies_stripped += val_res.currencies_stripped

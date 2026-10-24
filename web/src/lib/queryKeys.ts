@@ -278,6 +278,20 @@ export const queryKeys = {
     // DALTON-HOOK(coverage-tracking): workspace auto-tracking and unified system jobs query keys
     tracking:        (workspaceId: string) => [...queryKeys.dalton.all, 'tracking', workspaceId],
     systemJobs:      () => [...queryKeys.dalton.all, 'system-jobs'],
+    // DALTON-HOOK(user-coverage): Dashboard earnings calendar query key scoped by tab ('mine' | 'market') and user
+    earningsCalendar: (
+      scope: 'mine' | 'market',
+      userId?: string | null,
+      from?: string,
+      to?: string,
+    ) => [
+      ...queryKeys.dalton.all,
+      'earnings-calendar',
+      scope,
+      userId ?? 'current',
+      from ?? '',
+      to ?? '',
+    ],
   },
 };
 

@@ -559,7 +559,7 @@ async def schedule_dalton_automation_helper(
             }
         from src.dalton.autonomy.system_jobs import is_pm_user
 
-        if not is_pm_user(user_id):
+        if resolved_name != "dalton-earnings-calendar" and not is_pm_user(user_id):
             return {
                 "ok": False,
                 "error": "forbidden_pm",
@@ -636,7 +636,10 @@ async def schedule_dalton_automation_helper(
                     }
                 from src.dalton.autonomy.system_jobs import is_pm_user
 
-                if not is_pm_user(user_id):
+                if (
+                    str(existing.get("name") or "") != "dalton-earnings-calendar"
+                    and not is_pm_user(user_id)
+                ):
                     return {
                         "ok": False,
                         "error": "forbidden_pm",

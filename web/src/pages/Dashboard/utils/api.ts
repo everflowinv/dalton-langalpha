@@ -556,3 +556,44 @@ export async function getEarningsCalendar({ from, to }: EarningsParams = {}): Pr
     return { data: [], count: 0 };
   }
 }
+
+// DALTON-HOOK(user-coverage): per-user Dalton earnings calendar API and types
+export type EarningsScope = 'mine' | 'market';
+
+export interface DaltonEarningsEntry {
+  symbol: string;
+  ticker?: string;
+  companyName?: string;
+  date: string;
+  quarter?: string | null;
+  status?: 'confirmed' | 'pending' | 'reported' | string;
+  date_status?: 'confirmed' | 'estimated' | 'reported' | 'unannounced' | string;
+  tier?: 'Core' | 'Watch' | 'core' | 'watch' | string;
+  timing?: 'BMO' | 'AMC' | 'unknown' | string | null;
+  [key: string]: unknown;
+}
+
+export interface UserEarningsCalendarResponse {
+  ok?: boolean;
+  user_id?: string;
+  from?: string | null;
+  to?: string | null;
+  mirror_empty?: boolean;
+  published_at?: string | null;
+  count: number;
+  data: DaltonEarningsEntry[];
+}
+
+export async function getUserEarningsCalendar({ from, to }: EarningsParams = {}): Promise<UserEarningsCalendarResponse> {
+  try {
+    const params: Record<string, string> = {};
+    if (from) params.from = from;
+    if (to) params.to = to;
+    const { data } = await api.get<UserEarningsCalendarResponse>('/api/v1/dalton/earnings/calendar', { params });
+    return data ?? { ok: true, count: 0, data: [], mirror_empty: true };
+  } catch (e: unknown) {
+    const err = e as { message?: string };
+    console.error('[API] getUserEarningsCalendar failed:', err?.message);
+    return { ok: false, count: 0, data: [], mirror_empty: true };
+  }
+}
