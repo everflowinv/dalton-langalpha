@@ -80,6 +80,8 @@ ALLOWED_HOOKS=(
   "dalton-patch-tool-calls"
   "fake-ip-allow"
   "coverage-tracking"
+  "workflow-resume"
+  "workflow-journal"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

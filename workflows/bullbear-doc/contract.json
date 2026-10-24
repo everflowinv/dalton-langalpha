@@ -1,0 +1,103 @@
+{
+  "name": "bullbear-doc",
+  "description": "bull/bear v4.2 完整成稿的完成契约：准备 + 股东回报支线 + 主稿 + 合并 + 独立审稿 + 修订（对应 dalton-bullbear SKILL 的交付物）。",
+  "draft": "drafts/{as_of}-bullbear.md",
+  "params_required": [
+    "ticker",
+    "workspace_dir",
+    "as_of"
+  ],
+  "stages": [
+    {
+      "name": "准备",
+      "artifacts": [
+        {
+          "path": "research/{as_of}-bullbear/anchors.json",
+          "min_bytes": 50
+        },
+        {
+          "path": "research/{as_of}-bullbear/fincheck.md",
+          "min_bytes": 100
+        },
+        {
+          "path": "research/{as_of}-bullbear/consensus.md",
+          "min_bytes": 100
+        },
+        {
+          "path": "research/{as_of}-bullbear/price.md",
+          "min_bytes": 50
+        }
+      ]
+    },
+    {
+      "name": "股东回报支线",
+      "artifacts": [
+        {
+          "path": "research/{as_of}-bullbear/return.md",
+          "min_bytes": 100
+        },
+        {
+          "path": "research/{as_of}-bullbear/return_appendix.md",
+          "min_bytes": 50
+        },
+        {
+          "path": "research/{as_of}-bullbear/return_summary.md",
+          "min_bytes": 50
+        }
+      ]
+    },
+    {
+      "name": "主稿",
+      "artifacts": [
+        {
+          "path": "research/{as_of}-bullbear/main.md",
+          "min_bytes": 500
+        }
+      ]
+    },
+    {
+      "name": "合并成稿",
+      "artifacts": [
+        {
+          "path": "drafts/{as_of}-bullbear.md",
+          "min_bytes": 500
+        }
+      ],
+      "validators": [
+        {
+          "command": "python .agents/skills/dalton-bullbear/scripts/bb_check.py drafts/{as_of}-bullbear.md",
+          "pass_when": "exit_zero",
+          "description": "v4.2 格式检查 0 WARN"
+        }
+      ]
+    },
+    {
+      "name": "独立审稿与修订",
+      "review": {
+        "agent": "dalton-reviewer",
+        "verdicts": [
+          "pass"
+        ],
+        "manual_sidecar": "research/{as_of}-bullbear/review.json"
+      }
+    }
+  ],
+  "closing": {
+    "knowledge_docs": [
+      "debate",
+      "drivers"
+    ],
+    "knowledge_source": "tool",
+    "verdict_kinds_any": [
+      "NO_CHANGE",
+      "THESIS_STRENGTHENED",
+      "THESIS_WEAKENED",
+      "THESIS_BROKEN",
+      "NEW_THESIS"
+    ],
+    "check_draft": {
+      "draft": "drafts/{as_of}-bullbear.md",
+      "required": false
+    }
+  }
+}

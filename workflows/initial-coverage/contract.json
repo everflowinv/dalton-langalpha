@@ -1,0 +1,96 @@
+{
+  "name": "initial-coverage",
+  "description": "初次覆盖的完成契约：四支线 + bull/bear 快速版 + 12 问初筛 + 知识层初始化 + 审稿修订（对应 dalton-initial-coverage SKILL 的交付物）。",
+  "draft": "drafts/{as_of}-initial-coverage.md",
+  "params_required": [
+    "ticker",
+    "workspace_dir",
+    "as_of"
+  ],
+  "stages": [
+    {
+      "name": "取证（四支线并行）",
+      "artifacts": [
+        {
+          "path": "drafts/{as_of}-background.md",
+          "min_bytes": 200
+        },
+        {
+          "path": "research/{as_of}-ic/industry.md",
+          "min_bytes": 200
+        },
+        {
+          "path": "research/{as_of}-ic/lenses.json",
+          "min_bytes": 50
+        },
+        {
+          "path": "drafts/{as_of}-lenses.md",
+          "min_bytes": 200
+        },
+        {
+          "path": "research/{as_of}-ic/valuation.md",
+          "min_bytes": 200
+        },
+        {
+          "path": "research/{as_of}-ic/comps.xlsx",
+          "min_bytes": 1000
+        }
+      ]
+    },
+    {
+      "name": "bull/bear 快速版",
+      "artifacts": [
+        {
+          "path": "research/{as_of}-ic/bullbear-quick.md",
+          "min_bytes": 200
+        }
+      ]
+    },
+    {
+      "name": "12 问初筛成稿",
+      "artifacts": [
+        {
+          "path": "drafts/{as_of}-initial-coverage.md",
+          "min_bytes": 500
+        }
+      ]
+    },
+    {
+      "name": "知识层初始化草案",
+      "artifacts": [
+        {
+          "path": "research/{as_of}-ic/knowledge-proposal.json",
+          "min_bytes": 50
+        }
+      ]
+    },
+    {
+      "name": "独立审稿与修订",
+      "review": {
+        "agent": "dalton-reviewer",
+        "verdicts": [
+          "pass"
+        ],
+        "manual_sidecar": "research/{as_of}-ic/review.json"
+      }
+    }
+  ],
+  "closing": {
+    "knowledge_docs": [
+      "company",
+      "thesis",
+      "debate",
+      "drivers",
+      "management",
+      "agenda"
+    ],
+    "knowledge_source": "tool",
+    "verdict_kinds_any": [
+      "NEW_THESIS"
+    ],
+    "check_draft": {
+      "draft": "drafts/{as_of}-initial-coverage.md",
+      "required": false
+    }
+  }
+}

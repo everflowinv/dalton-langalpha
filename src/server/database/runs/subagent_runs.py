@@ -284,6 +284,14 @@ async def _enqueue_report_back_job(conn, run_row: Dict[str, Any]) -> None:
             "style": "pointer",
             "final_status": str(run_row["status"]),
             "final_checkpoint_id": str(final_pin) if final_pin else None,
+            # DALTON-HOOK(workflow-resume): the failure text rides the payload
+            # so the notification can tell a lost-worker workflow run (which
+            # is resumable) from an ordinary script error (which is not).
+            "failure_error": (
+                run_row["failure"].get("error")
+                if isinstance(run_row.get("failure"), dict)
+                else None
+            ),
         },
         ordering_key=str(run_row["thread_id"]),
         idempotency_key=(

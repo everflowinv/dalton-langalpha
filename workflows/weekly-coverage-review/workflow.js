@@ -38,17 +38,30 @@ const CO = {
   required: ['ticker', 'file'],
 }
 
+const HASH = {
+  type: 'object',
+  properties: {
+    files: { type: 'array', items: { type: 'string', minLength: 1 } },
+  },
+  required: ['files'],
+}
+
 phase('筛选与归因')
 const scr = await agent(
   `${base} 用覆盖名单 ${L}，窗口终点 ${E}：跑 python ${S}/scripts/screen_movers.py 与 python ${S}/scripts/attribution.py，结果写 ${R}/screen.json、${R}/attribution.json。返回 JSON：ok（boolean）、base（窗口起点日期）、core（数组，每项含 ticker, workspace_dir, held）、flagged（Watch 命中数组，每项含 ticker, event_hint, workspace_dir）、warnings（字符串数组）。`,
   { agentType: 'general-purpose', label: '筛选', phase: '筛选与归因', schema: SCREEN }
 )
 if (scr === null || !scr.ok) {
-  return { ok: false, reason: '筛选失败或数据未更新，不下结论', warnings: scr && scr.warnings }
+  return {
+    ok: false,
+    reason: '筛选失败或数据未更新，不下结论',
+    warnings: scr && scr.warnings,
+    incomplete: ['筛选失败或数据未更新（screen.json 未就绪），本周无法核验产物'],
+  }
 }
 const core = [...scr.core].sort((a, b) => (b.held ? 1 : 0) - (a.held ? 1 : 0))
-// 平台上限：每次运行最多派 64 个子智能体（config.yaml 的 workflow 段）；扣掉筛选 1、call 3、周会稿 1
-const room = Math.max(0, 64 - 5 - core.length)
+// 平台上限：每次运行最多派 64 个子智能体（config.yaml 的 workflow 段）；扣掉筛选 1、call 3、周会稿 1、产物核验 1
+const room = Math.max(0, 64 - 6 - core.length)
 const watch = scr.flagged.slice(0, room)
 if (scr.flagged.length > room) {
   log(
@@ -106,12 +119,56 @@ const doc = await agent(
   { agentType: 'general-purpose', label: '周会稿', phase: '汇总与 call', schema: CO }
 )
 
+const incomplete = []
+if (doc === null) incomplete.push('周会稿失败')
+const failedCore = core.filter((_, i) => coreRes[i] === null).map((c) => c.ticker)
+if (failedCore.length) incomplete.push(`Core 逐家失败：${failedCore.join('、')}`)
+const failedWatch = watch.filter((_, i) => watchRes[i] === null).map((w) => w.ticker)
+if (failedWatch.length) incomplete.push(`Watch 命中检索失败：${failedWatch.join('、')}`)
+const failedCalls = cands
+  .slice(0, 3)
+  .filter((t) => !calls.some((x) => x && x.ticker === t))
+if (failedCalls.length) incomplete.push(`conviction call 失败：${failedCalls.join('、')}`)
+
+phase('产物核验')
+const deliverables = [
+  `${R}/screen.json`,
+  `${R}/attribution.json`,
+  `${K}/drafts/${E}-weekly.md`,
+  ...core.map((c) => `${R}/core-${c.ticker}.md`),
+  ...watch.map((w) => `${R}/watch-${w.ticker}.md`),
+]
+const check = await agent(
+  `只读核对以下文件是否存在并计算 sha256（用 bash 的 test -e 与 sha256sum，不写任何文件）：\n${deliverables
+    .map((p) => '- ' + p)
+    .join('\n')}\n返回 files 字符串数组：存在的文件写 “<路径>|<sha256>”，不存在的只写 “<路径>”（不带竖线）。`,
+  { agentType: 'dalton-evidence', label: '产物核验', phase: '产物核验', schema: HASH }
+)
+const SHA_RE = /^[0-9a-f]{64}$/
+const expected = new Set(deliverables)
+const reported = new Set()
+for (const entry of check && Array.isArray(check.files) ? check.files : []) {
+  const bar = entry.indexOf('|')
+  const path = bar > 0 ? entry.slice(0, bar) : ''
+  const sha = bar > 0 ? entry.slice(bar + 1) : ''
+  if (!path || !SHA_RE.test(sha) || !expected.has(path)) {
+    incomplete.push(`产物核验返回无效条目：${entry}`)
+    continue
+  }
+  reported.add(path)
+}
+for (const path of deliverables) {
+  if (!reported.has(path)) incomplete.push(`产物缺失或未报哈希：${path}`)
+}
+if (check === null) incomplete.push('产物核验子任务失败')
+
 return {
-  ok: doc !== null,
+  ok: doc !== null && incomplete.length === 0,
   draft: `${K}/drafts/${E}-weekly.md`,
   core_done: okCore.length,
   core_total: core.length,
   watch_done: watchRes.filter((x) => x !== null).length,
   calls: calls.filter((x) => x !== null).map((x) => x.ticker),
   proposals_dir: `${R}/proposals`,
+  incomplete,
 }

@@ -1,0 +1,127 @@
+{
+  "name": "earnings-deep-update",
+  "description": "财报深度链的完成契约：八节点评 + 模型更新 + 对账校准 + 审稿 + 知识层修订草案（对应 dalton-earnings-deep SKILL 的交付物）。",
+  "draft": "drafts/{release_date}-deep-{quarter}.md",
+  "params_required": [
+    "ticker",
+    "quarter",
+    "workspace_dir",
+    "release_date"
+  ],
+  "stages": [
+    {
+      "name": "八节深度点评",
+      "artifacts": [
+        {
+          "path": "drafts/{release_date}-deep-{quarter}.md",
+          "min_bytes": 500
+        }
+      ]
+    },
+    {
+      "name": "模型更新",
+      "requires_param": "model_path",
+      "artifacts": [
+        {
+          "path": "research/{release_date}-deep-{quarter}/mapping.md",
+          "min_bytes": 50
+        },
+        {
+          "path": "research/{release_date}-deep-{quarter}/model-delta.md",
+          "min_bytes": 50
+        },
+        {
+          "path": "model/{ticker}-model-v*.xlsx",
+          "glob": true,
+          "min_count": 1,
+          "min_bytes": 1000,
+          "modified_on": "today"
+        }
+      ],
+      "validators": [
+        {
+          "command": "python .agents/skills/xlsx/scripts/audit.py \"$(ls model/{ticker}-model-v*.xlsx | sort -V | tail -1)\" --strict",
+          "pass_when": "exit_zero",
+          "description": "对新版本模型做严格审计（audit --strict）"
+        }
+      ]
+    },
+    {
+      "name": "校准与对账",
+      "artifacts": [
+        {
+          "path": "research/{release_date}-deep-{quarter}/thesis-calibration.md",
+          "min_bytes": 100
+        },
+        {
+          "path": "research/{release_date}-deep-{quarter}/management-delta.md",
+          "min_bytes": 50
+        },
+        {
+          "path": "research/{release_date}-deep-{quarter}/reconcile.md",
+          "min_bytes": 50
+        },
+        {
+          "path": "research/{release_date}-deep-{quarter}/reconcile.json",
+          "min_bytes": 10
+        }
+      ]
+    },
+    {
+      "name": "审稿",
+      "review": {
+        "agent": "dalton-reviewer",
+        "verdicts": [
+          "pass"
+        ],
+        "manual_sidecar": "research/{release_date}-deep-{quarter}/review.json"
+      }
+    },
+    {
+      "name": "知识层修订草案",
+      "artifacts": [
+        {
+          "path": "research/{release_date}-deep-{quarter}/knowledge-revision.json",
+          "min_bytes": 50
+        }
+      ]
+    }
+  ],
+  "closing": {
+    "knowledge_docs": [
+      "thesis",
+      "debate",
+      "drivers",
+      "management"
+    ],
+    "knowledge_source": "tool",
+    "verdict_kinds_any": [
+      "NO_CHANGE",
+      "THESIS_STRENGTHENED",
+      "THESIS_WEAKENED",
+      "THESIS_BROKEN",
+      "NEW_THESIS"
+    ],
+    "verdict_trigger": "earnings",
+    "check_draft": {
+      "draft": "drafts/{release_date}-deep-{quarter}.md"
+    },
+    "knowledge_docs_requires_param": {
+      "models": "model_path"
+    },
+    "knowledge_docs_if_json": [
+      {
+        "json": "research/{release_date}-deep-{quarter}/reconcile.json",
+        "when": {
+          "any_gt": [
+            "wrong",
+            "partial"
+          ]
+        },
+        "docs": [
+          "lessons"
+        ]
+      }
+    ]
+  }
+}

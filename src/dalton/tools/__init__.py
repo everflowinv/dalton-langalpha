@@ -22,9 +22,9 @@ def build_dalton_tools(
     """Return role-appropriate Dalton tools to bind onto the main agent (`DALTON-HOOK(dalton-tools)`).
 
     - `chief_of_staff` (Home / Research Director):
-      `dalton_coverage_board`, `dalton_record_plan`, `dalton_agenda_note`, `dalton_schedule_automation`, `dalton_coverage_tracking`, `dalton_system_jobs`, `conversation_search`
+      `dalton_coverage_board`, `dalton_record_plan`, `dalton_agenda_note`, `dalton_schedule_automation`, `dalton_coverage_tracking`, `dalton_system_jobs`, `conversation_search`, `dalton_check_done` (weekly-coverage-review only)
     - `analyst` (Company workspace):
-      `knowledge_update`, `knowledge_append_verdict`, `check_draft`, `publish_report`, `dalton_schedule_automation`, `dalton_coverage_tracking`, `dalton_system_jobs`, `conversation_search`
+      `knowledge_update`, `knowledge_append_verdict`, `dalton_check_done`, `check_draft`, `publish_report`, `dalton_schedule_automation`, `dalton_coverage_tracking`, `dalton_system_jobs`, `conversation_search`
     """
     settings = get_dalton_settings()
     is_enabled = enabled if enabled is not None else (
@@ -48,6 +48,19 @@ def build_dalton_tools(
                 tools.extend(create_conversation_tools())
             except Exception as e:
                 logger.debug("[DALTON_TOOLS] conversation_tools not loaded: %s", e)
+        if settings.knowledge.enabled or settings.autonomy.enabled:
+            try:
+                # The weekly review closes in Home: only its contract is
+                # checkable here (the role restriction lives in the tool).
+                from src.dalton.tools.check_done_tools import create_check_done_tools
+
+                tools.extend(
+                    create_check_done_tools(
+                        filesystem_backend=filesystem_backend, role="chief_of_staff"
+                    )
+                )
+            except Exception as e:
+                logger.debug("[DALTON_TOOLS] check_done_tools not loaded: %s", e)
         return tools
 
     # Analyst workspace tools
@@ -58,6 +71,17 @@ def build_dalton_tools(
             tools.extend(create_knowledge_tools(filesystem_backend=filesystem_backend))
         except Exception as e:
             logger.debug("[DALTON_TOOLS] knowledge_tools not loaded: %s", e)
+
+        try:
+            # dalton_check_done rides the knowledge gate: its closing checks
+            # read the knowledge version table and verdicts.
+            from src.dalton.tools.check_done_tools import create_check_done_tools
+
+            tools.extend(
+                create_check_done_tools(filesystem_backend=filesystem_backend)
+            )
+        except Exception as e:
+            logger.debug("[DALTON_TOOLS] check_done_tools not loaded: %s", e)
 
     if settings.publish.enabled:
         try:

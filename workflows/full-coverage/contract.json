@@ -1,0 +1,150 @@
+{
+  "name": "full-coverage",
+  "description": "完整覆盖的完成契约：数字底表 + 问题清单 + 四支线 + 模型 + memo 三段 + 审稿修订 + 知识层修订草案（对应 dalton-full-coverage SKILL 的交付物）。",
+  "draft": "drafts/{as_of}-memo.md",
+  "params_required": [
+    "ticker",
+    "workspace_dir",
+    "as_of"
+  ],
+  "stages": [
+    {
+      "name": "一手材料与数字底表",
+      "artifacts": [
+        {
+          "path": "research/{as_of}-fc/facts.md",
+          "min_bytes": 500,
+          "end_marker": "<!-- FACTS-LEDGER"
+        }
+      ],
+      "validators": [
+        {
+          "command": "python .agents/skills/dalton-full-coverage/scripts/facts.py check research/{as_of}-fc/facts.md",
+          "pass_when": "exit_zero",
+          "description": "底表必填键齐全"
+        }
+      ]
+    },
+    {
+      "name": "问题清单",
+      "artifacts": [
+        {
+          "path": "research/{as_of}-fc/questions.md",
+          "min_bytes": 200
+        }
+      ],
+      "validators": [
+        {
+          "command": "python .agents/skills/dalton-full-coverage/scripts/research_structure.py validate-agenda research/{as_of}-fc/questions.md",
+          "pass_when": "exit_zero",
+          "description": "问题清单校验通过"
+        }
+      ]
+    },
+    {
+      "name": "取证（A/B/C/D 支线）",
+      "artifacts": [
+        {
+          "path": "research/{as_of}-fc/ea.md",
+          "min_bytes": 200,
+          "end_marker": "<!-- 完成 -->"
+        },
+        {
+          "path": "research/{as_of}-fc/eb.md",
+          "min_bytes": 200,
+          "end_marker": "<!-- 完成 -->"
+        },
+        {
+          "path": "research/{as_of}-fc/ec.md",
+          "min_bytes": 200,
+          "end_marker": "<!-- 完成 -->"
+        },
+        {
+          "path": "research/{as_of}-fc/ed.md",
+          "min_bytes": 200,
+          "end_marker": "<!-- 完成 -->"
+        }
+      ]
+    },
+    {
+      "name": "建模与 memo 第一段",
+      "artifacts": [
+        {
+          "path": "model/{ticker}-model-v*.xlsx",
+          "glob": true,
+          "min_count": 1,
+          "min_bytes": 1000
+        }
+      ],
+      "validators": [
+        {
+          "command": "python .agents/skills/xlsx/scripts/audit.py \"$(ls model/{ticker}-model-v*.xlsx | sort -V | tail -1)\" --strict",
+          "pass_when": "exit_zero",
+          "description": "对最终版模型（修订后为 v02）做静态审计（audit --strict）"
+        }
+      ]
+    },
+    {
+      "name": "memo 三段成稿",
+      "artifacts": [
+        {
+          "path": "drafts/{as_of}-memo.md",
+          "min_bytes": 500
+        }
+      ],
+      "validators": [
+        {
+          "command": "python .agents/skills/dalton-full-coverage/scripts/validate_memo.py --mode full drafts/{as_of}-memo.md",
+          "pass_when": "exit_zero",
+          "description": "备忘录全量机械校验 0 FAIL"
+        }
+      ]
+    },
+    {
+      "name": "审模型与独立审稿",
+      "artifacts": [
+        {
+          "path": "research/{as_of}-fc/model-check.md",
+          "min_bytes": 100
+        }
+      ],
+      "review": {
+        "agent": "dalton-reviewer",
+        "verdicts": [
+          "pass"
+        ],
+        "manual_sidecar": "research/{as_of}-fc/review.json"
+      }
+    },
+    {
+      "name": "修订与知识层修订草案",
+      "artifacts": [
+        {
+          "path": "research/{as_of}-fc/knowledge-revision.json",
+          "min_bytes": 50
+        }
+      ]
+    }
+  ],
+  "closing": {
+    "knowledge_docs": [
+      "thesis",
+      "debate",
+      "drivers",
+      "management",
+      "models",
+      "company"
+    ],
+    "knowledge_source": "tool",
+    "verdict_kinds_any": [
+      "THESIS_STRENGTHENED",
+      "THESIS_WEAKENED",
+      "NEW_THESIS",
+      "THESIS_BROKEN",
+      "NO_CHANGE"
+    ],
+    "check_draft": {
+      "draft": "drafts/{as_of}-memo.md"
+    }
+  }
+}

@@ -1,0 +1,61 @@
+{
+  "name": "weekly-coverage-review",
+  "description": "覆盖周报的完成契约：筛选归因 + Core 逐家 + Watch 命中 + 周会稿（对应 dalton-weekly-review SKILL 的交付物；在 Home 运行，知识层走提案，不要求本工作区知识版本或 verdict）。",
+  "draft": "dalton/drafts/{end}-weekly.md",
+  "params_required": [
+    "home_dir",
+    "end",
+    "coverage_path"
+  ],
+  "stages": [
+    {
+      "name": "筛选与归因",
+      "artifacts": [
+        {
+          "path": "dalton/research/weekly-{end}/screen.json",
+          "min_bytes": 50
+        },
+        {
+          "path": "dalton/research/weekly-{end}/attribution.json",
+          "min_bytes": 50
+        }
+      ]
+    },
+    {
+      "name": "Core 逐家",
+      "artifacts": [
+        {
+          "path": "dalton/research/weekly-{end}/core-{ticker}.md",
+          "derive": {
+            "json": "dalton/research/weekly-{end}/screen.json",
+            "pointer": "core",
+            "field": "ticker"
+          },
+          "min_bytes": 100
+        }
+      ]
+    },
+    {
+      "name": "Watch 命中",
+      "artifacts": [
+        {
+          "path": "dalton/research/weekly-{end}/watch-*.md",
+          "glob": true,
+          "min_count": 1,
+          "min_bytes": 100,
+          "optional": true
+        }
+      ]
+    },
+    {
+      "name": "汇总周会稿",
+      "artifacts": [
+        {
+          "path": "dalton/drafts/{end}-weekly.md",
+          "min_bytes": 500
+        }
+      ]
+    }
+  ],
+  "closing": {}
+}

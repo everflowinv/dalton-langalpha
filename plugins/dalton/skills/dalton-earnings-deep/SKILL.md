@@ -22,10 +22,16 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 2. **深度链 workflow**：
    - **默认（`earnings-deep-update` workflow）**：当由 PS.7 创建的 `tp1` 自动任务触发（T+1 交易日 20:00，此时卖方财报后报告已基本到齐）或用户要求完整财报后更新时，调用 `RunWorkflow(workflow="earnings-deep-update", params={...})`。
    - **Workflow 不可用时**：
-     - **`workflow.enabled` 已关闭**（工具列表本来就不会有 `RunWorkflow`）：主智能体按本 skill 下述四个阶段的顺序手动执行，并逐阶段核对产物。
+     - **`workflow.enabled` 已关闭**（工具列表本来就不会有 `RunWorkflow`）：主智能体按本 skill 下述四个阶段的顺序手动执行，并逐阶段核对产物。阶段 3 派 `dalton-reviewer` 审最终稿后，把它返回的 JSON（含 `verdict` 与 `draft_sha256`）原样保存到 `research/<D>-deep-<quarter>/review.json`（多轮复审时保存最后一轮；改稿后必须重审并覆盖）；收尾调用 `dalton_check_done` 时在 `params` 里加 `"manual": true`、不传 `run_id`，审稿据此文件核对。
      - **否则**（`workflow.enabled` 未关闭）：`RunWorkflow` 不在工具列表时，先用 **Read 工具**（不要用 Bash `cat`）读 `.agents/skills/run-workflow/SKILL.md` 后重试；仍没有就停下，告诉 PM「RunWorkflow 不可用」，不要自行手动派发 Task 子智能体代跑。
 
 ---
+
+## 开始前：检查未完成的 run（中断续跑）
+
+- 读 `research/<D>-deep-<quarter>/.progress.json`（及 `research/` 下其他 `*/.progress.json`），看是否有本 workflow 的 `status` 不是终态（`completed`/`failed`/`cancelled`）的 run。
+- 有未完成的 run 时不要新开 run：用**原参数**调用 `RunWorkflow(workflow="earnings-deep-update", params={...原参数..., "progress_path": "research/<D>-deep-<quarter>/.progress.json"}, resume="<.progress.json 里的 run_id>")` 续跑；label、prompt 哈希与产物哈希都一致的已完派发会直接复用，不重复派子任务。
+- 全新启动时也在 `params` 里带上 `"progress_path": "research/<D>-deep-<quarter>/.progress.json"`，让中断后的 run 可被发现与续跑。
 
 ## Step 1：组装参数并启动 `earnings-deep-update` Workflow
 
@@ -40,6 +46,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 | `release_date` | 官方财报发布日期 `YYYY-MM-DD`（如 `"2026-10-28"`） |
 | `model_path` | 从 `data/models.json` 读取当前登记的最新 Excel 模型路径（如 `"model/META-model-v01.xlsx"`）；**若该公司尚无模型，传 `null`**（workflow 会自动跳过模型更新支线，仅执行点评、对账与校准） |
 | `preview_predictions` | 前瞻预测文件路径（如 `"research/2026-10-23-preview-FY26Q3/predictions.json"`）；若本次财报前无前瞻预测文件，传 `null` |
+| `progress_path` | 固定传 `"research/<D>-deep-<quarter>/.progress.json"`（`<D>` 即 `release_date`），让中断后的 run 可被发现与续跑 |
 | `sector_overlay` | 若标的属于半导体/硬件行业（NVDA、AVGO、AMD、MRVL、TSM、ASML、MU、QCOM、ARM、INTC、TXN、LRCX、AMAT、KLAC、ADI、ON、MCHP、SMCI、ANET、CRDO、ALAB 等），传 `"hardware"` 以叠加 [`references/hardware-overlay.md`](references/hardware-overlay.md)；其他行业传 `null` |
 
 ---
@@ -107,8 +114,13 @@ Workflow 结束后（或独立模式完成后），由当前主智能体读取 `
    - 写入财报终判（`NO_CHANGE` / `THESIS_STRENGTHENED` / `THESIS_WEAKENED` / `THESIS_BROKEN` / `NEW_THESIS`，`trigger.kind="earnings"`，`trigger.ref` 填 `tp1` 信号 id 或 `"manual"`）；
    - 在 `agenda_ops` 中写入下一季需要跟踪验证的事项；
    - **重大异常升级（PM Escalation）**：若终判为 `THESIS_BROKEN` 或任一核心支柱状态变为 `impaired` / `broken`，必须立即通过通知渠道推送 PM，并在 `agenda_ops` 中写入一条 `pm_handoffs`（PK.14）。
-3. **草稿核验与发布/推送**：
+3. **草稿核验（`check_draft`）**：
    - 末尾必须附引用表：在报告末尾的 `## 引用` 一节按每行一条写出对应关系（形如 `[引用1]: evidence:E-20261023-01` 或 `[引用3]: model:model/META-model-v01.xlsx!DCF!C12`）；
    - 调用 `check_draft` 生成数字核验报告 `drafts/<D>-deep-<quarter>.audit.md`；
+4. **汇报完成前必须过完成契约（`dalton_check_done`）**：
+   - 调用 `dalton_check_done(workflow="earnings-deep-update", run_id=<`research/<D>-deep-<quarter>/.progress.json` 里的 run_id>, params={<启动时的同一组参数，release_date 即 <D>，含 quarter>})`；
+   - 走手动降级路径（`workflow.enabled` 已关闭、没有 run）时不传 `run_id`，`params` 里加 `"manual": true`，审稿结论按 `research/<D>-deep-<quarter>/review.json` 核对；
+   - `done=false` 时按 `missing` 先补齐再查（缺文件补文件、知识层缺 source=tool 新版本就 `knowledge_update`、check_draft 用了旧草稿就对最终稿重跑），补不了的缺项只能汇报"未完成"并列出缺项与原因，不得汇报"完成"。
+5. **发布/推送（完成契约通过后）**：
    - 当 PM 要求正式发布时，调用 `publish_report(draft_path="drafts/<D>-deep-<quarter>.md", kind="earnings_review", attachments=[新模型路径])`；
    - 将深度报告核心结论、前瞻对账得分、模型变动及 thesis 校准摘要推送给 PM。

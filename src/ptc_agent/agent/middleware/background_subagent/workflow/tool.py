@@ -192,13 +192,22 @@ def _run_started_reply(
     description: str,
     base_rel: str,
     tool_call_id: str,
+    resumed_from: str | None = None,
 ) -> str | ToolMessage:
     """The launch reply, plus the artifact binding the card to the run."""
+    # DALTON-HOOK(workflow-resume): the reply names the resumed run so the
+    # agent knows which journal its replayed dispatches came from.
+    resume_note = (
+        f"\n- Resuming run: {resumed_from} (replayed dispatches are logged "
+        "`[resume]` and journaled under `resumed_from`)"
+        if resumed_from
+        else ""
+    )
     result_text = (
         f"Workflow run started: **{run_task.display_id}**\n"
         f"- Workflow: {workflow_name}\n"
         "- Status: Running in background\n"
-        f"- Run files: {base_rel}/\n\n"
+        f"- Run files: {base_rel}/{resume_note}\n\n"
         "You will be notified when it finishes. "
         f"Per-child records are in {base_rel}/children/."
     )
@@ -397,6 +406,28 @@ def create_run_workflow_tool(
                 ) from refusal
             run_task.task_run_id = admitted or None
 
+    async def _resolve_resume(resume: str, script: str, claimant: str) -> str:
+        """Validate the run being resumed; raises ``_Refused`` for anything
+        that cannot be resumed. The checks themselves live in the Dalton-owned
+        journal module."""
+        # DALTON-HOOK(workflow-resume): terminal-state (run ledger / registry)
+        # and script-snapshot verification live in src/dalton/workflows/journal.py;
+        # this wrapper only maps a refusal to this tool's reply vocabulary.
+        from src.dalton.workflows.journal import ResumeRefused, resolve_resume_source
+
+        try:
+            return await resolve_resume_source(
+                backend,
+                registry,
+                source_dir=run_dir(short_thread_id, resume),
+                resume=resume,
+                script=script,
+                run_dir_for=lambda task_id: run_dir(short_thread_id, task_id),
+                claimant=claimant,
+            )
+        except ResumeRefused as error:
+            raise _Refused(str(error)) from error
+
     async def _launch(
         script: str | None,
         script_path: str | None,
@@ -404,6 +435,7 @@ def create_run_workflow_tool(
         params: Any,
         description: str | None,
         tool_call_id: str,
+        resume: str | None = None,
     ) -> str | ToolMessage:
         """Every path that starts a run, raising ``_Refused`` for those that
         do not — so the caller turns a refusal into a reply exactly once. A
@@ -450,6 +482,50 @@ def create_run_workflow_tool(
                 f"'{meta.name}'. Rename one so they agree, then run it again."
             )
 
+        # DALTON-HOOK(workflow-resume): a checkpoint re-execution of the SAME
+        # call (same tool_call_id) reconnects to the run it already started —
+        # checked before the resume exclusivity below, which would otherwise
+        # see that very run as "another resumer" and refuse. Same liveness
+        # rule as registry.register's TaskWriterLive.
+        if tool_call_id:
+            existing = registry.get_by_tool_call_id(tool_call_id)
+            if existing is not None and (
+                not existing.completed or existing.live_writers
+            ):
+                return _reply_with_artifact(
+                    existing,
+                    f"Workflow run already active: **{existing.display_id}** "
+                    f"({meta.name}). You will be notified when it finishes.",
+                    workflow_name=meta.name,
+                    description=(description or meta.description)[:MAX_DESCRIPTION_CHARS],
+                    tool_call_id=tool_call_id,
+                )
+
+        # DALTON-HOOK(workflow-resume): resolve and validate the run being
+        # resumed before anything is registered — a refusal must leave no
+        # run, no card and no artifacts behind. Only a genuinely new start
+        # reaches here; the claimant identity lets a cross-worker replay of
+        # the same call recognise its own claim.
+        launch_tool_call_id = tool_call_id or f"wfrun-{uuid.uuid4().hex[:12]}"
+        journal_source = None
+        if resume is not None:
+            if not isinstance(resume, str) or not resume.strip():
+                raise _Refused("'resume' must be the previous run's task id.")
+            resume = resume.strip()
+            if script_path is not None:
+                raise _Refused(
+                    "resuming requires 'workflow' (a named workflow) rather "
+                    "than an inline script or script_path, so the old run's "
+                    "journal can be matched against the same script."
+                )
+            journal_source = await _resolve_resume(resume, script, launch_tool_call_id)
+        # DALTON-HOOK(workflow-resume): the progress marker the driver keeps
+        # current; the launching skill passes it in params so the runtime
+        # stays workflow-agnostic about where Dalton keeps its research dirs.
+        progress_path = None
+        if isinstance(params, dict) and isinstance(params.get("progress_path"), str):
+            progress_path = params["progress_path"] or None
+
         # One bounded launch description for every sink. `meta.description`
         # is capped at extraction precisely because it is copied into the
         # registry, the run ledger, the launch stream and the task artifact —
@@ -468,7 +544,6 @@ def create_run_workflow_tool(
 
         # A checkpoint re-execution of an already-spawned call raises
         # TaskWriterLive — answer idempotently with the live run.
-        launch_tool_call_id = tool_call_id or f"wfrun-{uuid.uuid4().hex[:12]}"
         try:
             run_task = await registry.register(
                 tool_call_id=launch_tool_call_id,
@@ -496,6 +571,8 @@ def create_run_workflow_tool(
         # collector claiming and evicting it. Same asymmetry the direct-dispatch
         # path handles, and the same guard: `discard_unstarted` refuses anything
         # that settled some other way, so a stop mid-admission keeps its entry.
+        base_rel = run_dir(short_thread_id, run_task.task_id)
+        admitted = False
         try:
             await _admit_run(
                 run_task,
@@ -503,11 +580,37 @@ def create_run_workflow_tool(
                 description=launch_description,
                 launch_tool_call_id=launch_tool_call_id,
             )
-        except BaseException:
-            await registry.discard_unstarted(launch_tool_call_id)
+            admitted = True
+            # DALTON-HOOK(workflow-resume): claim the resume the moment
+            # admission accepts — marker written under one advisory lock, so
+            # two workers can never both resume the same old run even when
+            # neither has replayed a dispatch yet.
+            if journal_source is not None:
+                from src.dalton.workflows.journal import ResumeRefused, claim_resume
+
+                try:
+                    await claim_resume(
+                        backend,
+                        registry,
+                        source_dir=journal_source,
+                        resume=resume,
+                        marker_path=f"{base_rel}/resume.json",
+                        run_dir_for=lambda task_id: run_dir(short_thread_id, task_id),
+                        claimant=launch_tool_call_id,
+                        task_id=run_task.task_id,
+                    )
+                except ResumeRefused as error:
+                    raise _Refused(str(error)) from error
+        except BaseException as launch_error:
+            if admitted:
+                # The row is in the ledger and the namespace fence is held —
+                # the post-INSERT arm settles it as a terminal error and
+                # releases both; discard_unstarted refuses settled runs.
+                await mw._abort_admitted_run(run_task, launch_error)
+            else:
+                await registry.discard_unstarted(launch_tool_call_id)
             raise
 
-        base_rel = run_dir(short_thread_id, run_task.task_id)
         artifacts = {
             "workflow.js": script,
             "args.json": json.dumps(params, ensure_ascii=False, default=str),
@@ -537,6 +640,10 @@ def create_run_workflow_tool(
             base_configurable=configurable,
             caps=caps,
             project=current_project(),
+            # DALTON-HOOK(workflow-journal): the resume source dir and the
+            # progress marker path the driver's journal keeps current.
+            journal_source=journal_source,
+            progress_path=progress_path,
         )
         driver = WorkflowDriver(spec)
         try:
@@ -568,8 +675,12 @@ def create_run_workflow_tool(
             description=launch_description,
             base_rel=base_rel,
             tool_call_id=tool_call_id,
+            # DALTON-HOOK(workflow-resume): name the resumed run in the reply.
+            resumed_from=resume,
         )
 
+    # DALTON-HOOK(workflow-resume): the ``resume`` parameter continues an
+    # interrupted run; matching journal dispatches are replayed, not re-run.
     @tool("RunWorkflow")
     async def run_workflow(
         script: str | None = None,
@@ -577,6 +688,7 @@ def create_run_workflow_tool(
         workflow: str | None = None,
         params: Any = None,
         description: str | None = None,
+        resume: str | None = None,
         tool_call_id: Annotated[str, InjectedToolCallId] = "",
     ) -> str | ToolMessage:
         """Run a JavaScript workflow script server-side to orchestrate subagents.
@@ -585,15 +697,25 @@ def create_run_workflow_tool(
         Provide a script with a ``meta`` literal that uses ``agent()``,
         ``parallel()``, ``pipeline()``, ``phase()`` and ``log()``; or run a
         saved or pre-built workflow by name. ``params`` is exposed to the
-        script as its ``args`` global.
+        script as its ``args`` global. Pass ``resume="<previous run's task
+        id>"`` to continue an interrupted run: dispatches whose label, prompt
+        hash and declared-artifact hashes still match are replayed from that
+        run's journal instead of re-dispatched.
         """
         # The one place a refusal becomes a reply. A launch that is turned away
         # never starts a run, so nothing binds its card and no channel closes —
         # the reply text is the card's only settle signal, and routing every
         # refusal through `_Refused` is what keeps that text one shape.
         try:
+            # DALTON-HOOK(workflow-resume): ``resume`` rides the launch call.
             return await _launch(
-                script, script_path, workflow, params, description, tool_call_id
+                script,
+                script_path,
+                workflow,
+                params,
+                description,
+                tool_call_id,
+                resume,
             )
         except _Refused as refused:
             return refused.as_reply(tool_call_id)

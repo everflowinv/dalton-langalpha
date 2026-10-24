@@ -31,6 +31,12 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 - `pm_brief`（可选）：PM 的具体研究指示或假设
 - `focus_questions`（可选）：PM 要求重点深挖的问题列表
 
+### 开始前：检查未完成的 run（中断续跑）
+
+- 读 `research/<D>-fc/.progress.json`（及 `research/` 下其他 `*/.progress.json`），看是否有本 workflow 的 `status` 不是终态（`completed`/`failed`/`cancelled`）的 run。
+- 有未完成的 run 时不要新开 run：用**原参数**调用 `RunWorkflow(workflow="full-coverage", params={...原参数..., "progress_path": "research/<D>-fc/.progress.json"}, resume="<.progress.json 里的 run_id>")` 续跑；label、prompt 哈希与产物哈希都一致的已完派发会直接复用，不重复派子任务。
+- 全新启动时也在 `params` 里带上 `"progress_path": "research/<D>-fc/.progress.json"`，让中断后的 run 可被发现与续跑。
+
 ---
 
 ## 二、执行流程（启动 `full-coverage` workflow）
@@ -52,7 +58,8 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
        "profile": "tob",
        "form": "10-K",
        "pm_brief": "<可选>",
-       "focus_questions": []
+       "focus_questions": [],
+       "progress_path": "research/<D>-fc/.progress.json"
      }
    }
    ```
@@ -73,14 +80,14 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
    - **阶段 5（修订与知识层修订草案）**：按审稿意见与 `model-check.md` 修订 memo 和模型（若改模型，按 `.agents/skills/model-update/SKILL.md` 另存 `v02`，绝不覆盖 `v01`），并生成 `research/<D>-fc/knowledge-revision.json`。
 
 3. **Workflow 不可用时的手动降级路径**
-   - **`workflow.enabled` 已关闭**（工具列表本来就不会有 `RunWorkflow`）：主智能体按阶段 0 → 0.8 → 1 → 2/3 → 4 → 5 的顺序手动完成（依次调用子智能体或亲自执行）各阶段产物与脚本校验，并逐阶段核对产物。
+   - **`workflow.enabled` 已关闭**（工具列表本来就不会有 `RunWorkflow`）：主智能体按阶段 0 → 0.8 → 1 → 2/3 → 4 → 5 的顺序手动完成（依次调用子智能体或亲自执行）各阶段产物与脚本校验，并逐阶段核对产物。独立审稿阶段派 `dalton-reviewer` 审最终稿后，把它返回的 JSON（含 `verdict` 与 `draft_sha256`）原样保存到 `research/<D>-fc/review.json`（多轮复审时保存最后一轮；改稿后必须重审并覆盖）；收尾调用 `dalton_check_done` 时在 `params` 里加 `"manual": true`、不传 `run_id`，审稿据此文件核对。
    - **否则**（`workflow.enabled` 未关闭）：`RunWorkflow` 不在工具列表时，先用 **Read 工具**（不要用 Bash `cat`）读 `.agents/skills/run-workflow/SKILL.md` 后重试；仍没有就停下，告诉 PM「RunWorkflow 不可用」，不要自行手动派发 Task 子智能体代跑。
 
 ---
 
 ## 三、主智能体收尾：知识层更新、数字核验与正式发布
 
-Workflow 返回后，主智能体按以下 4 步完成收尾：
+Workflow 返回后，主智能体按以下 6 步完成收尾（完成契约在完成判定与向 PM 汇报"完成"之前）：
 
 ### 第 1 步：检查审稿结论与机械门禁
 - 读取 workflow 返回状态、审稿意见与 `validate_memo.py --mode full` 结果。
@@ -99,7 +106,10 @@ Workflow 返回后，主智能体按以下 4 步完成收尾：
   - 对照初次覆盖的 thesis 给出正式五词结论（通常为 `THESIS_STRENGTHENED` / `THESIS_WEAKENED` / `NEW_THESIS` / `THESIS_BROKEN` / `NO_CHANGE`）；
   - 在 `agenda_ops` 中写入完整覆盖后的持续跟踪议程（第十章的监控清单、高频指标与催化剂日历）。
 
-### 第 3 步：`check_draft` 预检与 `publish_report` 正式发布
+### 第 3 步：开启自动跟踪（`dalton_coverage_tracking`）
+- 调用 `dalton_coverage_tracking(action="enable", source="coverage_finish")` 开启（或补齐）该公司的标准自动跟踪任务（`watch`、`delta`、`move-up`、`move-down`）。若用户之前手动关闭过（带 `paused_by_user` 标记），`source="coverage_finish"` 会自动保持关闭状态，不重新打开。
+
+### 第 4 步：`check_draft` 预检与 `publish_report` 正式发布
 1. 先调用 `check_draft(draft_path="drafts/<D>-memo.md")` 查看数字核验反馈（生成 `drafts/<D>-memo.audit.md`），修复所有未匹配或无来源的数字。
 2. 调用 `publish_report` 发起正式发布：
    ```json
@@ -118,13 +128,18 @@ Workflow 返回后，主智能体按以下 4 步完成收尾：
    - **注意**：`attachments` 必须同时附带模型文件（`role: "model"`）和数字底表 `research/<D>-fc/facts.md`（`role: "facts"`，作为发布核验的对账基准）；其余支线文件与草稿审稿意见留在 `research/`，不进发布包。
    - 若核验退回或服务端独立审稿返回 `revise`，逐条修订后再调 `publish_report`，直至进入 PM 审批卡（`awaiting_pm`）。
 
-### 第 4 步：开启自动跟踪与完成判定
-1. 调用 `dalton_coverage_tracking(action="enable", source="coverage_finish")` 开启（或补齐）该公司的标准自动跟踪任务（`watch`、`delta`、`move-up`、`move-down`）。若用户之前手动关闭过（带 `paused_by_user` 标记），`source="coverage_finish"` 会自动保持关闭状态，不重新打开。
-2. **完成判定**：
-   - `drafts/<D>-memo.md`、`model/<TICKER>-model-v01.xlsx` 及 `research/<D>-fc/facts.md` 均已通过校验；
-   - 知识层（含 `company.coverage_stage="full"`）与 `knowledge_append_verdict` 已落库；
-   - 已调用 `dalton_coverage_tracking(action="enable", source="coverage_finish")` 并检查确认自动跟踪已开启（`status="enabled"`，或因 `paused_by_user=true` 保持关闭）；
-   - `publish_report` 已提交进入 PM 审批卡（`awaiting_pm`），PM 在审批卡片上批准后，发布管线自动将 `thesis.official`（含正式 house view）写入知识层，并在 `published/` 下生成不可变正式副本。
+### 第 5 步：汇报完成前必须过完成契约（`dalton_check_done`）
+
+- 向 PM 汇报"完成"前，必须调用 `dalton_check_done(workflow="full-coverage", run_id=<`research/<D>-fc/.progress.json` 里的 run_id>, params={<启动 RunWorkflow 时的同一组参数，含 as_of>})`。
+- 走手动降级路径（`workflow.enabled` 已关闭、没有 run）时不传 `run_id`，`params` 里加 `"manual": true`，审稿结论按 `research/<D>-fc/review.json` 核对。
+- `done=false` 时按 `missing` 逐条补齐（缺文件补文件、`facts.py check`/`validate_memo`/`audit.py` 未过修到过、知识层缺 source=tool 新版本就 `knowledge_update`、check_draft 用了旧草稿就对最终稿重跑 `check_draft`），补完再查一次。
+- 补不了的缺项只能汇报"未完成"，列出缺项与原因；没有 `dalton_check_done` 通过，不得汇报"完成"。
+
+### 第 6 步：完成判定（必查清单）
+- `drafts/<D>-memo.md`、`model/<TICKER>-model-v01.xlsx` 及 `research/<D>-fc/facts.md` 均已通过校验；
+- 知识层（含 `company.coverage_stage="full"`）与 `knowledge_append_verdict` 已落库；
+- 已调用 `dalton_coverage_tracking(action="enable", source="coverage_finish")` 并检查确认自动跟踪已开启（`status="enabled"`，或因 `paused_by_user=true` 保持关闭）；
+- `publish_report` 已提交进入 PM 审批卡（`awaiting_pm`），PM 在审批卡片上批准后，发布管线自动将 `thesis.official`（含正式 house view）写入知识层，并在 `published/` 下生成不可变正式副本。
 
 ---
 

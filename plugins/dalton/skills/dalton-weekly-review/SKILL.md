@@ -21,6 +21,12 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 
 ## 执行流程
 
+### 第 1 步之前：检查未完成的 run（中断续跑）
+
+- 读 `dalton/research/weekly-<end>/.progress.json`（及 `dalton/research/` 下其他 `*/.progress.json`），看是否有本 workflow 的 `status` 不是终态（`completed`/`failed`/`cancelled`）的 run。
+- 有未完成的 run 时不要新开 run：用**原参数**调用 `RunWorkflow(workflow="weekly-coverage-review", params={...原参数..., "progress_path": "dalton/research/weekly-<end>/.progress.json"}, resume="<.progress.json 里的 run_id>")` 续跑；label、prompt 哈希与产物哈希都一致的已完派发会直接复用，不重复派子任务。
+- 全新启动时也在 `params` 里带上 `"progress_path": "dalton/research/weekly-<end>/.progress.json"`，让中断后的 run 可被发现与续跑。
+
 ### 第 1 步：确定窗口终点与路径
 
 1. **窗口定义**：
@@ -39,7 +45,8 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
   "params": {
     "home_dir": "dalton",
     "end": "YYYY-MM-DD",
-    "coverage_path": "dalton/coverage.yaml"
+    "coverage_path": "dalton/coverage.yaml",
+    "progress_path": "dalton/research/weekly-<end>/.progress.json"
   }
 }
 ```
@@ -73,7 +80,10 @@ Workflow 完成后，研究总监在 Home 执行收尾动作：
    - 对每家有提案的公司，调用 `delegate_to_analyst(question=..., workspace_id=..., report_back=True)` 派单给该公司工作区分析师（无人值守运行已开启 `auto_approve_handoffs`，不会卡在确认卡上），指令分析师审阅提案并调用 `knowledge_update` / `knowledge_append_verdict` 落库。
 2. **追加重点议程备注**：
    - 对本周出现重大异动、证据缺口或需要下周重点跟踪的问题，调用研究总监工具 `dalton_agenda_note` 追加到对应公司的 `agenda` 中。
-3. **统计与推送 PM**：
+3. **汇报完成前必须过完成契约（`dalton_check_done`）**：
+   - 在 Home 调用 `dalton_check_done(workflow="weekly-coverage-review", run_id=<`dalton/research/weekly-<end>/.progress.json` 里的 run_id>, params={<启动时的同一组参数，含 end>})`（研究总监角色只能核对 `weekly-coverage-review`；`workflow.enabled` 已关闭、手动执行时不传 `run_id`）；
+   - `done=false` 时按 `missing` 先补齐再查（`screen.json`、`attribution.json`、`core-*.md`、周会稿均须存在且非占位）；补不了的只能汇报"未完成"并列出缺项，不得汇报"完成"。
+4. **统计与推送 PM**（完成契约通过后）：
    - 统计全覆盖公司本周事件五词（`NO_CHANGE` / `THESIS_STRENGTHENED` / `THESIS_WEAKENED` / `THESIS_BROKEN` / `NEW_THESIS`）分布；
    - 将周会稿中的**“本周判断（3–6 条）”**与**“Conviction call（或本周暂无高 conviction）”**推送给 PM；
    - 周会稿保留在 `Home/dalton/drafts/<end>-weekly.md` 供 PM 周会阅读（Home 不调 `publish_report`；若某条 conviction call 需作为正式报告发布，由对应公司分析师在公司工作区走 `dalton-call` 的 `publish_report(kind="conviction_call")`）。
