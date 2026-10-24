@@ -519,6 +519,18 @@ def create_run_workflow_tool(
                     "journal can be matched against the same script."
                 )
             journal_source = await _resolve_resume(resume, script, launch_tool_call_id)
+        # DALTON-HOOK(workflow-as-of-default): the US coverage workflows'
+        # as_of defaults to the last completed US trading day (exchange
+        # calendar, America/New_York), not the caller's local today. A resumed
+        # run adopts the previous run's recorded as_of when the caller did not
+        # restate one, and falls back to the default when that record cannot
+        # be read — a resume must never run on an undefined date. Applied
+        # here, before the args.json snapshot, so the run record carries the
+        # effective params.
+        if isinstance(params, dict):
+            from src.dalton.workflows.as_of import resolve_launch_as_of
+
+            params = await resolve_launch_as_of(backend, meta.name, params, journal_source)
         # DALTON-HOOK(workflow-resume): the progress marker the driver keeps
         # current; the launching skill passes it in params so the runtime
         # stays workflow-agnostic about where Dalton keeps its research dirs.

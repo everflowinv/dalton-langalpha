@@ -162,17 +162,31 @@ async def digest_paths(backend: Any, paths: list[str]) -> dict[str, str | None]:
     return digests
 
 
+def declares_artifact_field(result: Any) -> bool:
+    """Whether the result carries a ``files``/``file`` field at all.
+
+    Distinguishes a child that never declares artifacts (a reviewer's
+    verdict — its record verifies on label+prompt alone) from one that
+    DECLARES the field yet wrote nothing (the timed-out branch's
+    schema-valid ``{files: [], summary: "未落盘"}`` ok answer).
+    """
+    if not isinstance(result, dict):
+        return False
+    return "files" in result or "file" in result
+
+
 async def artifact_records(
     backend: Any, result: Any
 ) -> list[dict[str, Any]] | None:
     """``[{path, sha256}]`` for the artifacts a child declared it wrote, or
-    ``None`` when a declared artifact cannot be hashed.
+    ``None`` when the record must never be replayed.
 
-    ``None`` is the "this record must never be replayed" verdict: a file the
-    child says it wrote but whose digest cannot be computed (binary through a
-    text-only backend, a file already moved) means a later resume cannot
-    verify the dispatch's outputs, so the entry is journaled as
-    non-replayable rather than replaying on a partial pin.
+    ``None`` is that verdict in both of its cases: a file the child says it
+    wrote but whose digest cannot be computed (binary through a text-only
+    backend, a file already moved), and a ``files``/``file`` field that
+    parses to no path at all — the child reported writing nothing, and
+    replaying it would keep that branch "successfully empty" through every
+    resume, so the dispatch has to run again.
     """
     if (
         isinstance(result, dict)
@@ -186,7 +200,7 @@ async def artifact_records(
         return None
     paths = declared_artifact_paths(result)
     if not paths:
-        return []
+        return None if declares_artifact_field(result) else []
     digests = await digest_paths(backend, paths)
     if any(digest is None for digest in digests.values()):
         return None
@@ -278,6 +292,15 @@ class WorkflowJournal:
                 entry.get("prompt_sha256") != prompt_digest(prompt)
                 or entry.get("status") != "ok"
                 or entry.get("replayable") is not True
+            ):
+                continue
+            # The same empty-artifact guard as ``artifact_records``, applied
+            # at read time: journals written before that guard carry
+            # ``replayable: true`` with no artifacts for a child that
+            # declared a files/file field and wrote nothing.
+            result = entry.get("result")
+            if declares_artifact_field(result) and not declared_artifact_paths(
+                result
             ):
                 continue
             artifacts = entry.get("artifacts") or []

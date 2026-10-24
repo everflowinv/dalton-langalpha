@@ -82,6 +82,7 @@ ALLOWED_HOOKS=(
   "coverage-tracking"
   "workflow-resume"
   "workflow-journal"
+  "workflow-as-of-default"
   "subagent-model-pin"
   "html-md-canonical"
   "hermetic-prebuilt-workflows"

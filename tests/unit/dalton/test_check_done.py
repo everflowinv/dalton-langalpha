@@ -14,6 +14,7 @@ import hashlib
 import json
 import time
 from contextlib import asynccontextmanager
+from datetime import date, datetime, timedelta, timezone
 from fnmatch import fnmatch
 from typing import Any
 from unittest.mock import create_autospec
@@ -210,6 +211,35 @@ def _patch_knowledge_error(monkeypatch: pytest.MonkeyPatch) -> None:
         yield  # pragma: no cover
 
     monkeypatch.setattr(check_done_tools, "get_db_connection", _get_db_connection)
+
+
+def _patch_knowledge_capture(
+    monkeypatch: pytest.MonkeyPatch, docs: list[str]
+) -> dict[str, Any]:
+    """``_patch_knowledge`` that records the args the version query ran with —
+    ``(workspace_id, docs, since)`` — so a test can pin the freshness window
+    itself (audit #20's whole point)."""
+    captured: dict[str, Any] = {}
+    cursor = create_autospec(psycopg.AsyncCursor, instance=True)
+
+    async def _execute(_query: Any, args: Any = None, **_kwargs: Any) -> None:
+        captured["args"] = args
+
+    async def _fetchall() -> list[tuple[str]]:
+        return [(doc,) for doc in docs]
+
+    cursor.execute.side_effect = _execute
+    cursor.fetchall.side_effect = _fetchall
+    cursor.__aenter__.return_value = cursor
+    conn = create_autospec(psycopg.AsyncConnection, instance=True)
+    conn.cursor.return_value = cursor
+
+    @asynccontextmanager
+    async def _get_db_connection() -> Any:
+        yield conn
+
+    monkeypatch.setattr(check_done_tools, "get_db_connection", _get_db_connection)
+    return captured
 
 
 def _verdict_row(word: str, trigger_kind: str = "manual") -> dict[str, Any]:
@@ -421,6 +451,175 @@ async def test_knowledge_query_failure_is_missing_not_a_pass(
     assert any("知识层版本无法核对" in item and "请重试" in item for item in result["missing"])
 
 
+# ------------------------------------------------- audit #20: the closing window
+# The freshness window opens at the run's start (or the as_of day's start in
+# America/New_York on the manual path) — never at UTC midnight, which dropped
+# every version written before an Asia-morning UTC crossing.
+
+
+@pytest.mark.asyncio
+async def test_manual_as_of_window_is_eastern_day_and_keeps_evening_versions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """as_of=2026-10-23, checked at 08:30 UTC+8 (00:30 UTC on 10-24, so UTC
+    "today" is already 10-24): the window opens at 2026-10-23 00:00
+    America/New_York (04:00 UTC), and a version written on 10-23 evening
+    (22:00 UTC+8 = 14:00 UTC) is still inside it."""
+    captured = _patch_knowledge_capture(monkeypatch, IC_DOCS)
+    _patch_verdicts(monkeypatch, [_verdict_row("NEW_THESIS")])
+
+    await run_check_done(
+        workflow="initial-coverage",
+        params=PARAMS,
+        backend=_make_backend(_full_files()),
+        workspace_id=WS,
+    )
+    since = captured["args"][2]
+    assert since == datetime(2026, 10, 23, 4, 0, tzinfo=timezone.utc)
+    # The old floor — UTC midnight of the check's own day — would have been
+    # 2026-10-24T00:00Z and dropped this version.
+    evening_version = datetime(2026, 10, 23, 14, 0, tzinfo=timezone.utc)
+    assert since <= evening_version
+
+
+# ------------------------------------------------- as_of inherited from the run
+# The launch path resolves as_of to a concrete trading day before the script
+# runs; the closing check inherits that date from the run's args.json so the
+# caller's original params (omitted as_of, or "latest") still find the run's
+# artifacts.
+
+
+def _with_run_args(files: dict[str, str], as_of: str = "2026-10-23") -> dict[str, str]:
+    files[f".agents/threads/short-1/workflows/task-run-1/args.json"] = json.dumps(
+        {"ticker": "META", "as_of": as_of}
+    )
+    return files
+
+
+@pytest.mark.asyncio
+async def test_check_done_inherits_the_runs_effective_as_of(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Omitted as_of at closing time: the run's args.json supplies the date
+    the artifacts are keyed on — by run_id here, by the thread's latest
+    same-name run without one."""
+    _patch_knowledge(monkeypatch, IC_DOCS)
+    _patch_verdicts(monkeypatch, [_verdict_row("NEW_THESIS")])
+
+    params = {"ticker": "META", "workspace_dir": "."}
+    result = await run_check_done(
+        workflow="initial-coverage",
+        params=params,
+        backend=_make_backend(_with_run_args(_full_files())),
+        workspace_id=WS,
+        run_id="task-run-1",
+        thread_id="short-1",
+    )
+    assert not any("缺少必需参数" in item for item in result["missing"]), result["missing"]
+    assert not any("产物文件不存在" in item for item in result["missing"]), result["missing"]
+    assert result["done"], result["missing"]
+
+    # Same inheritance through the thread's latest run when run_id is absent.
+    result = await run_check_done(
+        workflow="initial-coverage",
+        params=params,
+        backend=_make_backend(_with_run_args(_full_files())),
+        workspace_id=WS,
+        thread_id="short-1",
+    )
+    assert result["done"], result["missing"]
+
+
+@pytest.mark.asyncio
+async def test_check_done_replaces_latest_with_the_runs_effective_as_of(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """params say as_of="latest" while the run ran on a concrete date: the
+    check must look where the artifacts are, not under latest/."""
+    _patch_knowledge(monkeypatch, IC_DOCS)
+    _patch_verdicts(monkeypatch, [_verdict_row("NEW_THESIS")])
+
+    result = await run_check_done(
+        workflow="initial-coverage",
+        params={"ticker": "META", "workspace_dir": ".", "as_of": "latest"},
+        backend=_make_backend(_with_run_args(_full_files())),
+        workspace_id=WS,
+        run_id="task-run-1",
+        thread_id="short-1",
+    )
+    assert result["done"], result["missing"]
+    assert not any("latest" in item for item in result["missing"]), result["missing"]
+
+
+@pytest.mark.asyncio
+async def test_check_done_does_not_invent_a_date_without_a_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No run, no args.json: the missing-parameter report stays honest — the
+    inheritance never recomputes a date, it only reads the run's record."""
+    _patch_knowledge(monkeypatch, IC_DOCS)
+    _patch_verdicts(monkeypatch, [_verdict_row("NEW_THESIS")])
+
+    result = await run_check_done(
+        workflow="initial-coverage",
+        params={"ticker": "META", "workspace_dir": "."},
+        backend=_make_backend(_full_files()),
+        workspace_id=WS,
+        thread_id="short-1",
+    )
+    assert not result["done"]
+    assert any("缺少必需参数 'as_of'" in item for item in result["missing"])
+
+
+@pytest.mark.asyncio
+async def test_closing_window_starts_at_the_run_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A run on the thread anchors the window at its first dispatch (the
+    earliest journal recorded_at): versions written mid-run, after a
+    UTC-midnight crossing, stay valid."""
+    captured = _patch_knowledge_capture(monkeypatch, IC_DOCS)
+    _patch_verdicts(monkeypatch, [_verdict_row("NEW_THESIS")])
+    files = _full_files()
+    first_dispatch = datetime(2026, 10, 24, 2, 35, tzinfo=timezone.utc).timestamp()
+    files[JOURNAL_PASS] = json.dumps(
+        {
+            "label": "审稿",
+            "dispatches": [
+                {
+                    "label": "公司背景",
+                    "status": "ok",
+                    "seq": 1,
+                    "recorded_at": first_dispatch,
+                    "result": {"files": ["drafts/2026-10-23-background.md"]},
+                },
+                {
+                    "label": "审稿",
+                    "status": "ok",
+                    "seq": 7,
+                    "recorded_at": first_dispatch + 3600,
+                    "result": {
+                        "verdict": "pass",
+                        "summary": "通过",
+                        "draft_sha256": _draft_hash(files[DRAFT]),
+                    },
+                },
+            ],
+        },
+        ensure_ascii=False,
+    )
+
+    await run_check_done(
+        workflow="initial-coverage",
+        params=PARAMS,
+        backend=_make_backend(files),
+        workspace_id=WS,
+        thread_id="short-1",
+    )
+    since = captured["args"][2]
+    assert since == datetime(2026, 10, 24, 2, 35, tzinfo=timezone.utc)
+
+
 @pytest.mark.asyncio
 async def test_verdict_query_failure_is_missing_not_a_pass(
     monkeypatch: pytest.MonkeyPatch,
@@ -526,7 +725,8 @@ async def test_latest_anchor_uses_today_and_does_not_crash(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """``as_of="latest"`` (a topic run without a date) must not raise: paths
-    render to the ``latest`` directory and the since-floor is today UTC."""
+    render to the ``latest`` directory and the since-floor is the manual
+    window's (no run, no thread start readable → the last 24 hours)."""
     files = {
         "research/latest-topic-ai-capex/plan.md": "规划" * 100,
         "research/latest-topic-ai-capex/primary.md": "一手" * 100,
@@ -548,7 +748,11 @@ async def test_latest_anchor_uses_today_and_does_not_crash(
         workspace_id=None,
     )
     assert result["done"] is False  # knowledge unverified (no workspace) but no crash
-    assert result["checked"]["since"] == time.strftime("%Y-%m-%d", time.gmtime())
+    # The 24h fallback window starts exactly a day back, so its UTC date is
+    # today's or yesterday's — never older.
+    since_date = date.fromisoformat(result["checked"]["since"])
+    today = date(*time.gmtime()[:3])
+    assert today - timedelta(days=1) <= since_date <= today
 
 
 @pytest.mark.asyncio

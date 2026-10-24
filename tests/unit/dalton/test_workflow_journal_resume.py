@@ -12,8 +12,11 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
 from fnmatch import fnmatch
+from inspect import isawaitable
+from pathlib import Path
 from typing import Any
 from unittest.mock import create_autospec
 
@@ -230,31 +233,22 @@ def _journal_entry(
 @pytest.mark.asyncio
 async def test_workflow_journal_records_pending_then_outcome() -> None:
     """A dispatch writes its intent before the child runs and its outcome —
-    with declared artifact digests — after."""
+    with declared artifact digests — after. Extraction is the real
+    ``extract_result_content`` (the Command/ToolMessage shape the writer
+    produces is exactly what it unwraps)."""
     payload = {"files": ["research/note.md"], "summary": "written"}
     driver, _, backend = await _make_driver(
         make_fs_backend({"research/note.md": "证据" * 100}),
         behaviors=[Immediate({"success": True, "result": json.dumps(payload)})],
     )
-    # The schema-less path journals the child's text; give the dispatch a
-    # schema so the parsed dict (with `files`) is what gets recorded.
+    # A schema makes the parsed dict (with `files`) what gets recorded.
     schema = {
         "type": "object",
         "properties": {"files": {"type": "array", "items": {"type": "string"}}},
         "required": ["files"],
     }
 
-    def fake_extract(result: Any) -> tuple[bool, str]:
-        return True, json.dumps(payload)
-
-    import ptc_agent.agent.middleware.background_subagent.workflow.driver as driver_mod
-
-    original = driver_mod.extract_result_content
-    driver_mod.extract_result_content = fake_extract
-    try:
-        value = await driver.agent("do the work", {"label": "支线", "schema": schema})
-    finally:
-        driver_mod.extract_result_content = original
+    value = await driver.agent("do the work", {"label": "支线", "schema": schema})
 
     assert value == payload
     journal = json.loads(
@@ -386,6 +380,172 @@ async def test_workflow_resume_replay_ignores_non_ok_entries() -> None:
     value = await driver.agent(prompt, {"label": "支线"})
     assert value == "ran for real"
     assert len(dispatcher.calls) == 1
+
+
+# ------------------------------------------------- empty-artifact ok answers
+# A child whose schema-valid ok answer declares a files/file field but parses
+# to no path (the timed-out valuation branch's `{files: [], summary: "未落盘"}`)
+# reported writing nothing: the record is never replayable, at write time or
+# against a legacy journal, so the branch re-dispatches after the gap is
+# filled on disk.
+
+_SCHEMA_FILES = {
+    "type": "object",
+    "properties": {
+        "files": {"type": "array", "items": {"type": "string"}},
+        "summary": {"type": "string"},
+    },
+    "required": ["files"],
+}
+
+
+@pytest.mark.asyncio
+async def test_ok_result_with_empty_files_is_never_replayable() -> None:
+    """The journal record for an empty-files ok answer carries
+    ``replayable: false`` — there is nothing to pin, so a resume must run
+    the dispatch again rather than resurrect the emptiness."""
+    empty = {"files": [], "summary": "未落盘，本轮超时"}
+    driver, _, backend = await _make_driver(
+        make_fs_backend(),
+        behaviors=[Immediate({"success": True, "result": json.dumps(empty)})],
+    )
+
+    value = await driver.agent("fetch it", {"label": "支线", "schema": _SCHEMA_FILES})
+
+    assert value == empty
+    journal = json.loads(
+        backend.writes[f".agents/threads/short-1/workflows/{driver.wf_task_id}/journal/支线.json"]
+    )
+    outcome = journal["dispatches"][-1]
+    assert outcome["status"] == "ok"
+    assert outcome["replayable"] is False
+    assert outcome["artifacts"] == []
+
+
+@pytest.mark.asyncio
+async def test_legacy_empty_files_entry_re_dispatches_on_resume() -> None:
+    """A journal written before the guard (``replayable: true``, no
+    artifacts) is still not replayed: the empty claim is judged at read
+    time too."""
+    prompt = "fetch it again"
+    old_run = "task-old-4"
+    backend = make_fs_backend(
+        {
+            f".agents/threads/short-1/workflows/{old_run}/journal/支线.json": json.dumps(
+                {
+                    "label": "支线",
+                    "dispatches": [
+                        _journal_entry(
+                            label="支线",
+                            prompt=prompt,
+                            result={"files": [], "summary": "未落盘"},
+                            artifacts=[],
+                        )
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+        }
+    )
+    driver, dispatcher, _ = await _make_driver(
+        backend,
+        behaviors=[Immediate({"success": True, "result": "ran again"})],
+        journal_source=f".agents/threads/short-1/workflows/{old_run}",
+    )
+
+    value = await driver.agent(prompt, {"label": "支线"})
+    assert value == "ran again"
+    assert len(dispatcher.calls) == 1, "an empty-files ok record must re-dispatch"
+
+
+@pytest.mark.asyncio
+async def test_block_fill_resume_chain_reads_the_new_content() -> None:
+    """The complete round-2 repair chain, through the real driver, journal
+    and ``extract_result_content`` (no substitution):
+
+    1. run 1's branch answers ok with NO files — journaled non-replayable,
+       the record a workflow block leaves behind;
+    2. the main thread fills the file; a resume re-dispatches the branch and
+       the fresh answer pins the NEW content's digest;
+    3. later steps read that new content — the bytes on disk, the journal's
+       pinned digest and the replayed answer all agree, and content changed
+       after the pin refuses the replay.
+    """
+    prompt = "write the valuation branch"
+    schema = _SCHEMA_FILES
+    path = "research/valuation.md"
+    new_content = "主线程补齐后的估值稿：ln(P1/P0) 分解与可比表 v2"
+    filled = {"files": [path], "summary": "written"}
+
+    # Step 1: ok with empty files — the block-shaped record.
+    empty = {"files": [], "summary": "未落盘"}
+    driver1, dispatcher1, backend1 = await _make_driver(
+        make_fs_backend({"research/valuation.md": "占位"}),
+        behaviors=[Immediate({"success": True, "result": json.dumps(empty)})],
+    )
+    value1 = await driver1.agent(prompt, {"label": "估值历史与可比", "schema": schema})
+    assert value1 == empty
+    assert len(dispatcher1.calls) == 1
+    journal1_path = (
+        f".agents/threads/short-1/workflows/{driver1.wf_task_id}/journal/估值历史与可比.json"
+    )
+    assert json.loads(backend1.writes[journal1_path])["dispatches"][-1]["replayable"] is False
+
+    # Step 2: the gap is filled; resume re-dispatches and pins the NEW content.
+    source1 = f".agents/threads/short-1/workflows/{driver1.wf_task_id}"
+    driver2, dispatcher2, backend2 = await _make_driver(
+        make_fs_backend(
+            {
+                path: new_content,
+                f"{source1}/journal/估值历史与可比.json": backend1.writes[journal1_path],
+            }
+        ),
+        behaviors=[Immediate({"success": True, "result": json.dumps(filled)})],
+        journal_source=source1,
+    )
+    value2 = await driver2.agent(prompt, {"label": "估值历史与可比", "schema": schema})
+    assert value2["files"] == [path]
+    assert len(dispatcher2.calls) == 1, "the empty record must not have replayed"
+    journal2_path = (
+        f".agents/threads/short-1/workflows/{driver2.wf_task_id}/journal/估值历史与可比.json"
+    )
+    outcome2 = json.loads(backend2.writes[journal2_path])["dispatches"][-1]
+    assert outcome2["artifacts"] == [
+        {"path": path, "sha256": hashlib.sha256(new_content.encode("utf-8")).hexdigest()}
+    ], "the pin is the digest of the NEW content, not just its path"
+
+    # Step 3: later steps read the new content — disk, digest and replay agree.
+    assert await backend2.aread_text(path) == new_content
+    source2 = f".agents/threads/short-1/workflows/{driver2.wf_task_id}"
+    driver3, dispatcher3, backend3 = await _make_driver(
+        make_fs_backend(
+            {
+                path: new_content,
+                f"{source2}/journal/估值历史与可比.json": backend2.writes[journal2_path],
+            }
+        ),
+        journal_source=source2,
+    )
+    value3 = await driver3.agent(prompt, {"label": "估值历史与可比", "schema": schema})
+    assert dispatcher3.calls == [], "the pinned, unchanged content replays"
+    assert value3 == engine_safe(filled)
+
+    # And the content binding cuts both ways: changed after the pin, the
+    # replay is refused and the dispatch runs again.
+    mutated = new_content + "\n事后改动"
+    driver4, dispatcher4, _ = await _make_driver(
+        make_fs_backend(
+            {
+                path: mutated,
+                f"{source2}/journal/估值历史与可比.json": backend2.writes[journal2_path],
+            }
+        ),
+        behaviors=[Immediate({"success": True, "result": json.dumps(filled)})],
+        journal_source=source2,
+    )
+    value4 = await driver4.agent(prompt, {"label": "估值历史与可比", "schema": schema})
+    assert len(dispatcher4.calls) == 1, "changed content must re-dispatch"
+    assert value4["files"] == [path]
 
 
 @pytest.mark.asyncio
@@ -1513,3 +1673,318 @@ async def test_claim_by_same_claimant_is_not_a_conflict(
             task_id="task-new-3",
             **common,
         )
+
+
+# ------------------------------------------------- round 4: the real workflow.js
+# The complete repair chain with the shipped script: the engine runs
+# workflows/initial-coverage/workflow.js with the real driver as host —
+# journal, replay admission and dispatch all live — and a spec'd dispatcher
+# answers children BY LABEL (the test_workflows_js.py CapturingHost shape,
+# one level down, where the child also writes what it declares).
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+
+_GENERIC_OUT = {
+    "files": ["research/generic.md"],
+    "summary": "done",
+    "sha256": "a" * 64,
+}
+
+
+@dataclass
+class Writes:
+    """A child answer that also writes files into the store first — what a
+    real evidence child does before returning its JSON."""
+
+    result: dict[str, Any]
+    writes: dict[str, str] = field(default_factory=dict)
+
+
+def _ok(payload: Any) -> dict[str, Any]:
+    return {"success": True, "result": json.dumps(payload, ensure_ascii=False)}
+
+
+def _probe_answer(prompt: str, backend: Any = None) -> Immediate:
+    """The 支线核验 child: every probed file is on disk, one ``path|ok`` per
+    ``- path（至少 N 字节）`` prompt line."""
+    paths = [
+        line[2:].split("（")[0].strip()
+        for line in prompt.splitlines()
+        if line.startswith("- ") and "|" not in line
+    ]
+    return Immediate(_ok({"files": [f"{path}|ok" for path in paths]}))
+
+
+def make_label_dispatcher(
+    registry: RecordingRegistry,
+    backend: Any,
+    by_label: dict[str, Any],
+    *,
+    default: Any,
+) -> Any:
+    """A spec'd ``SubagentDispatcher`` answering by the dispatch's label;
+    callable behaviors receive ``(prompt, backend)`` — sync or async — and
+    ``Writes`` behaviors write into the backend before answering."""
+    from ptc_agent.agent.middleware.background_subagent.dispatch import (
+        SubagentDispatcher,
+    )
+    from ptc_agent.agent.middleware.background_subagent.middleware import (
+        BackgroundSubagentMiddleware,
+    )
+
+    dispatcher = create_autospec(SubagentDispatcher, instance=True)
+    middleware = create_autospec(BackgroundSubagentMiddleware, instance=True)
+    middleware.registry = registry
+    dispatcher.middleware = middleware
+    dispatcher.registry = registry
+    dispatcher.subagent_types = ["general-purpose", "dalton-evidence", "dalton-reviewer"]
+    calls: list[dict[str, Any]] = []
+
+    async def _dispatch(**kwargs: Any) -> Any:
+        label = str(kwargs.get("description") or "")
+        calls.append(kwargs)
+        behavior = by_label.get(label, default)
+        if callable(behavior) and not isinstance(behavior, Immediate):
+            called = behavior(str(kwargs["prompt"]), backend)
+            if isawaitable(called):
+                called = await called
+            behavior = called
+        assert behavior is not None, f"unexpected dispatch label: {label}"
+        payload = behavior.result
+        if isinstance(behavior, Writes):
+            for path, content in behavior.writes.items():
+                await backend.awrite_text(path, content)
+        task = await registry.register(
+            tool_call_id=f"child-{len(calls)}",
+            description=label,
+            prompt=kwargs["prompt"],
+            subagent_type=kwargs["subagent_type"],
+            run_id=kwargs["run_id"],
+        )
+        task.per_call_records = []
+
+        async def _finish() -> Any:
+            return _as_writer_result(payload)
+
+        task.asyncio_task = asyncio.create_task(_finish())
+        return task
+
+    dispatcher.dispatch.side_effect = _dispatch
+    dispatcher.calls = calls
+    return dispatcher
+
+
+async def _drive_workflow(
+    store: dict[str, str],
+    by_label: dict[str, Any],
+    *,
+    default: Any,
+    journal_source: str | None = None,
+) -> tuple[Any, WorkflowDriver, Any, Any]:
+    """Run the shipped initial-coverage script through the real engine with
+    the real driver as host; children are answered by ``by_label``."""
+    from ptc_agent.agent.middleware.background_subagent.workflow.engine import (
+        WorkflowHost,
+        WorkflowLimits,
+        run_workflow_script,
+    )
+
+    registry = RecordingRegistry()
+    run_task = await registry.register(
+        tool_call_id="workflow-run",
+        description="chain test",
+        prompt="script",
+        subagent_type="workflow",
+        run_id="launch-1",
+    )
+    backend = make_fs_backend(store)
+    script = (REPO_ROOT / "workflows" / "initial-coverage" / "workflow.js").read_text(
+        encoding="utf-8"
+    )
+    dispatcher = make_label_dispatcher(registry, backend, by_label, default=default)
+    spec = WorkflowRunSpec(
+        run_task=run_task,
+        registry=registry,
+        dispatcher=dispatcher,
+        backend=backend,
+        thread_id="thread-1",
+        short_thread_id="short-1",
+        script=script,
+        meta=compile_check(script),
+        source="inline",
+        caps=_caps(),
+        journal_source=journal_source,
+    )
+    driver = WorkflowDriver(spec)
+    driver._sem = asyncio.Semaphore(8)
+    spec_host = create_autospec(WorkflowHost, instance=True)
+    spec_host.agent.side_effect = driver.agent
+    spec_host.phase.side_effect = driver.phase
+    spec_host.log.side_effect = driver.log
+    outcome = await run_workflow_script(
+        script,
+        {
+            "ticker": "META",
+            "company": "Meta",
+            "workspace_dir": ".",
+            "as_of": "2026-10-23",
+        },
+        spec_host,
+        WorkflowLimits(memory_limit_mb=64, cpu_budget_s=60.0),
+    )
+    return outcome, driver, dispatcher, backend
+
+
+def _journal_entry_of(backend: Any, driver: WorkflowDriver, label: str) -> dict[str, Any]:
+    doc = json.loads(
+        backend.writes[f".agents/threads/short-1/workflows/{driver.wf_task_id}/journal/{label}.json"]
+    )
+    return doc["dispatches"][-1]
+
+
+@pytest.mark.asyncio
+async def test_real_script_block_fill_resume_chain() -> None:
+    """Four steps against the real workflow.js, journal and driver:
+
+    1. the valuation fetch branch answers ok with EMPTY files → the workflow
+       blocks before the draft;
+    2. the main thread fills valuation-data.json;
+    3. the same params with resume re-dispatch exactly the failed branch —
+       its re-run writes NEW content (v2), different from the manual fill;
+    4. the write stage downstream reads the RE-DISPATCHED content — it parses
+       its input path off the prompt the workflow sends and reads that file
+       through the run's backend, quoting what it actually read (a wrong
+       path in the prompt fails the chain), never the manual fill.
+    """
+    store: dict[str, str] = {}
+    bg_path = "./drafts/2026-10-23-background.md"
+    ind_path = "./research/2026-10-23-ic/industry.md"
+    lens_json = "./research/2026-10-23-ic/lenses.json"
+    lens_md = "./drafts/2026-10-23-lenses.md"
+    data_path = "./research/2026-10-23-ic/valuation-data.json"
+
+    # Step 1: healthy branches write their deliverables; the fetch branch is
+    # the timed-out shape — ok with no files.
+    outcome1, driver1, dispatcher1, backend1 = await _drive_workflow(
+        store,
+        {
+            "公司背景": Writes(
+                _ok({"files": [bg_path], "summary": "背景 v1"}),
+                {bg_path: "背景产物 v1"},
+            ),
+            "行业支线": Writes(
+                _ok({"files": [ind_path], "summary": "行业 v1"}),
+                {ind_path: "行业产物 v1"},
+            ),
+            "财务镜头": Writes(
+                _ok({"files": [lens_json, lens_md], "summary": "镜头 v1"}),
+                {lens_json: json.dumps({"lenses": [1, 2, 3]}), lens_md: "镜头产物 v1"},
+            ),
+            "估值取数": Immediate(_ok({"files": [], "summary": "未落盘，本轮超时"})),
+            "支线核验": _probe_answer,
+        },
+        default=Immediate(_ok(_GENERIC_OUT)),
+    )
+    assert outcome1.status == "completed", outcome1.error
+    result1 = outcome1.result
+    assert result1["ok"] is False
+    assert result1["missing"] == ["val"]
+    assert "估值历史与可比" in result1["blocked"]
+    dispatched1 = {str(c["description"]) for c in dispatcher1.calls}
+    assert "估值历史与可比" not in dispatched1, "no write stage off an empty fetch"
+    assert "初筛成稿" not in dispatched1
+    fetch1 = _journal_entry_of(backend1, driver1, "估值取数")
+    assert fetch1["status"] == "ok" and fetch1["replayable"] is False
+
+    # Step 2: the main thread fills the data file in the workspace (run 1's
+    # store — make_fs_backend copies its argument, so the fill goes here).
+    backend1.writes[data_path] = "主线程手填的取数稿（等待重派覆盖）"
+
+    # Step 3: same params + resume. The healthy branches replay from run 1's
+    # journal; only the failed fetch re-dispatches, writing v2 content.
+    source1 = f".agents/threads/short-1/workflows/{driver1.wf_task_id}"
+    v2_data = "重派取数稿 v2：ln(P1/P0)=ln(EPS1/EPS0)+ln(PE1/PE0) 分解原始数据"
+    valuation_v2 = "估值成稿 v2（基于重派取数）：\n" + "ln(P1/P0) 分解与可比表行\n" * 40
+    comps_v2 = "x" * 1200
+    store2 = dict(backend1.writes)  # run 1's files + journals, incl. the fill
+
+    async def _write_stage(prompt: str, backend: Any) -> Writes:
+        """The write child: take the input path the workflow's PROMPT names
+        (“以 <path> 为底”), read that file through the run's own backend, and
+        quote what was actually read — a wrong path in the prompt fails here."""
+        match = re.search(r"以 (\S+) 为底", prompt)
+        assert match, "the write prompt must name its input data file"
+        source_file = match.group(1)
+        data_text = await backend.aread_text(source_file)
+        assert data_text is not None, f"write stage input {source_file!r} not on disk"
+        return Writes(
+            _ok(
+                {
+                    "files": [
+                        "./research/2026-10-23-ic/valuation.md",
+                        "./research/2026-10-23-ic/comps.xlsx",
+                    ],
+                    "summary": f"写稿基于取数稿：{data_text}",
+                }
+            ),
+            {
+                "./research/2026-10-23-ic/valuation.md": valuation_v2,
+                "./research/2026-10-23-ic/comps.xlsx": comps_v2,
+            },
+        )
+
+    outcome2, driver2, dispatcher2, backend2 = await _drive_workflow(
+        store2,
+        {
+            "估值取数": Writes(
+                _ok({"files": [data_path], "summary": "重派取数完成 v2"}),
+                {data_path: v2_data},
+            ),
+            "支线核验": _probe_answer,
+            "估值历史与可比": _write_stage,
+            "审稿": Immediate(
+                _ok(
+                    {
+                        "verdict": "block",
+                        "summary": "测试收尾 block",
+                        "must_fix": [],
+                        "draft_sha256": "a" * 64,
+                    }
+                )
+            ),
+        },
+        default=Immediate(_ok(_GENERIC_OUT)),
+        journal_source=source1,
+    )
+    assert outcome2.status == "completed", outcome2.error
+    # The reviewer was scripted to block; the run ends at that verdict, past
+    # the branch gate that stopped run 1.
+    assert outcome2.result["ok"] is False
+    assert outcome2.result["blocked"] == "测试收尾 block"
+    assert any(item.startswith("审稿 block") for item in outcome2.result["incomplete"])
+
+    dispatched2 = [str(c["description"]) for c in dispatcher2.calls]
+    assert "估值取数" in dispatched2, "the failed branch re-dispatches"
+    for healthy in ("公司背景", "行业支线", "财务镜头"):
+        assert healthy not in dispatched2, f"{healthy} must replay, not re-dispatch"
+    assert "估值历史与可比" in dispatched2, "the write stage runs off the re-dispatched data"
+
+    # Step 4: the write stage READ the re-dispatched content — its journaled
+    # answer quotes v2, never the main thread's manual fill.
+    write_entry = _journal_entry_of(backend2, driver2, "估值历史与可比")
+    assert "重派取数稿 v2" in write_entry["result"]["summary"]
+    assert "手填" not in write_entry["result"]["summary"]
+    assert backend2.writes[data_path] == v2_data, "the re-dispatch overwrote the manual fill"
+    assert write_entry["artifacts"] == [
+        {
+            "path": "./research/2026-10-23-ic/valuation.md",
+            "sha256": hashlib.sha256(valuation_v2.encode("utf-8")).hexdigest(),
+        },
+        {
+            "path": "./research/2026-10-23-ic/comps.xlsx",
+            "sha256": hashlib.sha256(comps_v2.encode("utf-8")).hexdigest(),
+        },
+    ]
+    # And the replayed healthy branches carry their origin, unchanged.
+    replayed = _journal_entry_of(backend2, driver2, "公司背景")
+    assert replayed["resumed_from"] == source1

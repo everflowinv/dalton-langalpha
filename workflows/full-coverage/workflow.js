@@ -7,7 +7,16 @@ export const meta = {
 const { ticker: T, company: C, workspace_dir: W, as_of: D } = args
 const R = `${W}/research/${D}-fc`
 const S = '.agents/skills/dalton-full-coverage'
-const base = `先读 .agents/skills/dalton-conventions/SKILL.md 与 ${S}/SKILL.md；公司 ${C || T}（${T}），截至 ${D}；数字底表 ${R}/facts.md（只引用底表，缺了写“底表缺 X”）。`
+// A1 同类：SKILL 声明的 market/pm_brief/focus_questions（与可选的 revision_brief
+// 文件路径）随 base 进每个子任务，不只给 frame——取证支线与写作同样要按 PM 的
+// 要求做。
+const pmAsks = []
+if (args.pm_brief) pmAsks.push(String(args.pm_brief))
+if (Array.isArray(args.focus_questions) && args.focus_questions.length)
+  pmAsks.push(`重点问题：${args.focus_questions.join('；')}`)
+if (args.revision_brief) pmAsks.push(`本轮必须修正的事项见 ${args.revision_brief}（先读该文件）`)
+const pmSection = pmAsks.length ? ` PM 的问题 / 本轮必须修正的事项：${pmAsks.join('；')}。` : ''
+const base = `先读 .agents/skills/dalton-conventions/SKILL.md 与 ${S}/SKILL.md；公司 ${C || T}（${T}），市场 ${args.market || 'US'}，截至 ${D}；数字底表 ${R}/facts.md（只引用底表，缺了写“底表缺 X”）。${pmSection}`
 const OUT = {
   type: 'object',
   properties: {
@@ -59,24 +68,134 @@ const shaOf = (r) =>
     ? r.sha256
     : null
 
+// B1：支线产物缺失判定（各 workflow 同一实现；workflow 之间没有共用 js 模块的
+// 机制，改动需同步全部 workflow.js）。子任务返回 null、files/file 为空、或（经
+// 只读核验子任务确认）声明的产物文件不存在/为空（0 字节或只有空白），都算缺失；
+// workflow 自己碰不到文件系统，最后一项由支线核验子任务在盘上确认。
+const branchArtifacts = (v) => {
+  if (v === null || typeof v !== 'object') return []
+  const out = []
+  if (typeof v.file === 'string' && v.file.trim()) out.push(v.file.split('|', 1)[0].trim())
+  for (const f of Array.isArray(v.files) ? v.files : []) {
+    if (typeof f === 'string' && f.trim()) out.push(f.split('|', 1)[0].trim())
+  }
+  return out.filter(Boolean)
+}
+const PROBE_OUT = {
+  type: 'object',
+  properties: {
+    files: { type: 'array', items: { type: 'string', minLength: 1 } },
+  },
+  required: ['files'],
+}
+// 返回每个路径的 "<路径>|ok" / "<路径>|missing"；结果不完整（漏路径、格式不对）
+// 一律算核验失败（fail-closed），返回 null。paths 的每一项可以是路径或
+// [路径, 最小字节数]（契约 min_bytes；缺省 1，即非空白即可）。
+const probeBranchFiles = async (paths, phaseName) => {
+  const entries = paths.map((p) => (Array.isArray(p) ? p : [p, 1]))
+  const r = await agent(
+    `只读核验以下支线产物文件是否存在、非空白且达到字节数下限（不写任何文件）。逐个执行 bash：f='<路径>'；n=<字节数下限>；test -e "$f" && [ "$(wc -c < "$f")" -ge "$n" ] && [ -n "$(tr -d '[:space:]' < "$f")" ] && echo "$f|ok" || echo "$f|missing"。返回 files 数组：每项为上述一行的原样输出（<路径>|ok 或 <路径>|missing）：\n${entries
+      .map(([p, min]) => `- ${p}（至少 ${min} 字节）`)
+      .join('\n')}`,
+    { agentType: 'dalton-evidence', label: '支线核验', phase: phaseName, schema: PROBE_OUT }
+  )
+  if (r === null || typeof r !== 'object' || !Array.isArray(r.files)) return null
+  const answered = new Set()
+  for (const entry of r.files) {
+    if (typeof entry !== 'string') return null
+    const bar = entry.lastIndexOf('|')
+    const path = bar > 0 ? entry.slice(0, bar) : ''
+    const verdict = bar > 0 ? entry.slice(bar + 1) : ''
+    if (!path || (verdict !== 'ok' && verdict !== 'missing')) return null
+    answered.add(path)
+  }
+  if (entries.some(([p]) => !answered.has(p))) return null
+  return r.files
+}
+// B1 共用出口：缺失（含全部缺失）与核验失败都停在当前阶段之前，文案与审稿
+// block 一致，主线程补数后用原参数 resume 重跑（已完派发按 journal 复用）。
+const RESUME_HINT = '用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑：label、prompt 哈希与产物哈希一致的已完派发会直接复用，缺失项重新派发'
+const gateBlock = (blocked, incomplete) => ({
+  ok: false,
+  blocked,
+  incomplete: [incomplete],
+  resume_hint: RESUME_HINT,
+})
+
 phase('一手材料与数字底表')
 const facts = await agent(
-  `${base} 按 ${S}/references/facts-ledger.md 建 ${R}/facts.md：读最近 4 份定期报告（${args.form || '10-K'}/10-Q）、4 次电话会、招股书（如有）、内部人交易；按 .agents/skills/dalton-financial-lenses/SKILL.md 做三把镜头；用 .agents/skills/dalton-financial-lenses/scripts/earnings_quality.py 算盈利质量（Sloan 比率、CFO/NI、现金转换周期）；所有必填键用 python ${S}/scripts/facts.py set 写入。`,
+  `${base} 按 ${S}/references/facts-ledger.md 建 ${R}/facts.md：读最近 4 份定期报告（${args.form || '10-K'}/10-Q）、4 次电话会、招股书（如有）、内部人交易；按 .agents/skills/dalton-financial-lenses/SKILL.md 做三把镜头；用 .agents/skills/dalton-financial-lenses/scripts/earnings_quality.py 算盈利质量（Sloan 比率、CFO/NI、现金转换周期）；所有必填键用 python ${S}/scripts/facts.py set 写入。若目标文件已存在，先读并核对，缺什么补什么，不必推倒重写。`,
   { agentType: 'dalton-evidence', label: '数字底表', phase: '一手材料与数字底表', schema: OUT }
 )
-if (facts === null) {
-  return { ok: false, reason: '数字底表失败，后续阶段不启动', incomplete: ['数字底表失败，后续阶段不启动'] }
+// B1 共用判定：底表 null/空回报、在盘缺失/不足契约下限（facts.md ≥500 字节）、
+// 核验子任务失败三种情形分开报，都停在问题清单之前。核验只看本步询问的路径
+// （回应里可能混有其他派发的条目）。
+{
+  const factsDeclared = branchArtifacts(facts).length > 0
+  const factsProbe = factsDeclared
+    ? await probeBranchFiles([[`${R}/facts.md`, 500]], '一手材料与数字底表')
+    : null
+  if (!factsDeclared) {
+    return gateBlock(
+      '关键支线缺失：数字底表（数字底表子任务未产出或未声明产物）',
+      '关键支线缺失：数字底表，已停在问题清单之前；补齐后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑，label、prompt 哈希与产物哈希一致的已完派发会直接复用'
+    )
+  }
+  if (factsProbe === null) {
+    return gateBlock(
+      '支线核验子任务失败，无法确认数字底表在盘',
+      '支线核验子任务失败（无法确认 facts.md 存在且足 500 字节），已停在问题清单之前；请重试或补数后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑'
+    )
+  }
+  const factsVerdict = factsProbe.find((e) => e.startsWith(`${R}/facts.md|`))
+  if (factsVerdict === undefined || !factsVerdict.endsWith('|ok')) {
+    return gateBlock(
+      `关键支线缺失：数字底表（${R}/facts.md 不存在、为空或不足 500 字节）`,
+      '关键支线缺失：数字底表，已停在问题清单之前；补齐后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑，label、prompt 哈希与产物哈希一致的已完派发会直接复用'
+    )
+  }
 }
 
 phase('问题清单')
 const frame = await agent(
   `${base} 按 ${S}/references/frame.md 写 ${R}/questions.md。PM 要求：${args.pm_brief || '无'}；重点问题：${
     (args.focus_questions || []).join('；') || '默认'
-  }。写完跑 python ${S}/scripts/research_structure.py validate-agenda ${R}/questions.md 到通过。初次覆盖稿与知识层在 ${W}/drafts/ 与 ${W} 根目录。`,
+  }。写完跑 python ${S}/scripts/research_structure.py validate-agenda ${R}/questions.md 到通过。初次覆盖稿与知识层在 ${W}/drafts/ 与 ${W} 根目录。若目标文件已存在，先读并核对，缺什么补什么，不必推倒重写。`,
   { agentType: 'general-purpose', label: 'frame', phase: '问题清单', schema: OUT }
 )
+// B1 共用判定：问题清单 null/空回报、在盘缺失/过小（契约 questions.md ≥200
+// 字节）、核验子任务失败三种情形分开报，都停在取证之前。核验只看本步询问的
+// 路径（回应里可能混有其他派发的条目）。
+{
+  const frameDeclared = branchArtifacts(frame).length > 0
+  const frameProbe = frameDeclared
+    ? await probeBranchFiles([[`${R}/questions.md`, 200]], '问题清单')
+    : null
+  if (!frameDeclared) {
+    return gateBlock(
+      '关键支线缺失：问题清单 frame（frame 子任务未产出或未声明产物）',
+      '关键支线缺失：问题清单 frame，已停在取证之前；补齐后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑，label、prompt 哈希与产物哈希一致的已完派发会直接复用'
+    )
+  }
+  if (frameProbe === null) {
+    return gateBlock(
+      '支线核验子任务失败，无法确认问题清单在盘',
+      '支线核验子任务失败（无法确认 questions.md 存在且足 200 字节），已停在取证之前；请重试或补数后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑'
+    )
+  }
+  const frameVerdict = frameProbe.find((e) => e.startsWith(`${R}/questions.md|`))
+  if (frameVerdict === undefined || !frameVerdict.endsWith('|ok')) {
+    return gateBlock(
+      `关键支线缺失：问题清单 frame（${R}/questions.md 不存在、为空或不足 200 字节）`,
+      '关键支线缺失：问题清单 frame，已停在取证之前；补齐后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑，label、prompt 哈希与产物哈希一致的已完派发会直接复用'
+    )
+  }
+}
 
 phase('取证')
+// resume 提示：block 后主线程补数再用原参数 resume，失败支线的子任务会在已补
+// 文件的基础上核对完善，所以每条支线都写明“已存在先核对、缺什么补什么”。
+const RETRY_HINT = '若目标文件已存在，先读并核对，缺什么补什么，不必推倒重写。'
 const branches = [
   ['a', 'branch-a-industry'],
   ['b', 'branch-b-sellside-expert'],
@@ -88,12 +207,41 @@ const ev = await parallel(
     agent(
       `${base} 问题清单 ${R}/questions.md。按 ${S}/references/branch-common.md 与 ${S}/references/${f}.md 取证，写 ${R}/e${k}.md，文件末尾带 <!-- 完成 -->。profile=${
         args.profile || 'toc'
-      }。`,
+      }。${RETRY_HINT}`,
       { agentType: 'dalton-evidence', label: `支线 ${k.toUpperCase()}`, phase: '取证', schema: OUT }
     )
   )
 )
-const evMissing = branches.filter((_, i) => ev[i] === null).map(([k]) => k.toUpperCase())
+// B1：contract 把 e{a,b,c,d}.md 都列为必交（全为关键支线）。任一缺失（null、files
+// 为空、或核验发现文件不存在/为空）就停在建模之前，出口与上面共用 gateBlock。
+const evMissing = branches.filter((_, i) => branchArtifacts(ev[i]).length === 0).map(([k]) => k.toUpperCase())
+if (evMissing.length < branches.length) {
+  const toProbe = branches
+    .filter(([k]) => !evMissing.includes(k.toUpperCase()))
+    .map(([k]) => [`${R}/e${k}.md`, 200])
+  const byPath = new Map(branches.map(([k]) => [`${R}/e${k}.md`, k.toUpperCase()]))
+  const probe = toProbe.length ? await probeBranchFiles(toProbe, '取证') : []
+  if (probe === null) {
+    return gateBlock(
+      '支线核验子任务失败，无法确认支线产物在盘',
+      '支线核验子任务失败（无法确认产物文件存在且非空），已停在建模之前；请重试或补数后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑'
+    )
+  }
+  for (const entry of probe) {
+    if (!entry.endsWith('|missing')) continue
+    const key = byPath.get(entry.slice(0, -'|missing'.length))
+    if (key && !evMissing.includes(key)) evMissing.push(key)
+  }
+}
+if (evMissing.length) {
+  return {
+    ...gateBlock(
+      `关键支线缺失：${evMissing.join('、')}（${evMissing.map((k) => `${R}/e${k.toLowerCase()}.md`).join('、')} 不存在或为空）`,
+      `关键支线缺失：${evMissing.join('、')}，已停在建模之前；补齐缺失产物后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑，label、prompt 哈希与产物哈希一致的已完派发会直接复用`
+    ),
+    evidence_missing: evMissing,
+  }
+}
 
 phase('建模与 memo 第一段')
 const [model, memo1] = await parallel([
@@ -213,7 +361,11 @@ const finish = (resolved, extra = {}) => ({
 
 if (review && verdictOf(review) === 'block') {
   incomplete.push(`审稿 block：${review.summary || '存在不可修订级问题'}`)
-  return finish(await resolveOnExit(), { blocked: review.summary || '审稿 block' })
+  return finish(await resolveOnExit(), {
+    blocked: review.summary || '审稿 block',
+    resume_hint:
+      '修订 memo/模型后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑：label、prompt 哈希与产物哈希一致的已完派发（支线、底表等）会直接复用，成稿及之后的阶段重新派发',
+  })
 }
 
 phase('修订')
@@ -274,7 +426,10 @@ while (finalReview && verdictOf(finalReview) === 'revise' && rounds < 2) {
   }
   if (verdictOf(reReview) === 'block') {
     incomplete.push(`复审 block：${reReview.summary || '存在不可修订级问题'}，流程终止`)
-    return finish(resolved, { blocked: reReview.summary || '复审 block' })
+    return finish(resolved, {
+      blocked: reReview.summary || '复审 block',
+      resume_hint: RESUME_HINT,
+    })
   }
   finalReview = reReview
 }

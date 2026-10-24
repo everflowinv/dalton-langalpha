@@ -61,6 +61,55 @@ const shaOf = (r) =>
     ? r.sha256
     : null
 
+// B1：支线产物缺失判定（各 workflow 同一实现；workflow 之间没有共用 js 模块的
+// 机制，改动需同步全部 workflow.js）。子任务返回 null、files/file 为空、或（经
+// 只读核验子任务确认）声明的产物文件不存在/为空（0 字节或只有空白），都算缺失；
+// workflow 自己碰不到文件系统，最后一项由支线核验子任务在盘上确认。
+const branchArtifacts = (v) => {
+  if (v === null || typeof v !== 'object') return []
+  const out = []
+  if (typeof v.file === 'string' && v.file.trim()) out.push(v.file.split('|', 1)[0].trim())
+  for (const f of Array.isArray(v.files) ? v.files : []) {
+    if (typeof f === 'string' && f.trim()) out.push(f.split('|', 1)[0].trim())
+  }
+  return out.filter(Boolean)
+}
+const PROBE_OUT = {
+  type: 'object',
+  properties: {
+    files: { type: 'array', items: { type: 'string', minLength: 1 } },
+  },
+  required: ['files'],
+}
+// 返回每个路径的 "<路径>|ok" / "<路径>|missing"；结果不完整（漏路径、格式不对）
+// 一律算核验失败（fail-closed），返回 null。paths 的每一项可以是路径或
+// [路径, 最小字节数]（契约 min_bytes；缺省 1，即非空白即可）。
+const probeBranchFiles = async (paths) => {
+  const entries = paths.map((p) => (Array.isArray(p) ? p : [p, 1]))
+  const r = await agent(
+    `只读核验以下支线产物文件是否存在、非空白且达到字节数下限（不写任何文件）。逐个执行 bash：f='<路径>'；n=<字节数下限>；test -e "$f" && [ "$(wc -c < "$f")" -ge "$n" ] && [ -n "$(tr -d '[:space:]' < "$f")" ] && echo "$f|ok" || echo "$f|missing"。返回 files 数组：每项为上述一行的原样输出（<路径>|ok 或 <路径>|missing）：\n${entries
+      .map(([p, min]) => `- ${p}（至少 ${min} 字节）`)
+      .join('\n')}`,
+    { agentType: 'dalton-evidence', label: '支线核验', phase: '分簇取证', schema: PROBE_OUT }
+  )
+  if (r === null || typeof r !== 'object' || !Array.isArray(r.files)) return null
+  const answered = new Set()
+  for (const entry of r.files) {
+    if (typeof entry !== 'string') return null
+    const bar = entry.lastIndexOf('|')
+    const path = bar > 0 ? entry.slice(0, bar) : ''
+    const verdict = bar > 0 ? entry.slice(bar + 1) : ''
+    if (!path || (verdict !== 'ok' && verdict !== 'missing')) return null
+    answered.add(path)
+  }
+  if (entries.some(([p]) => !answered.has(p))) return null
+  return r.files
+}
+// B1 共用出口：缺口凑不满契约底线（含全部缺失）与核验失败都停在交叉验证之前，
+// 文案与审稿 block 一致，主线程补数后用原参数 resume 重跑（已完派发按 journal
+// 复用）。
+const RESUME_HINT = '用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑：label、prompt 哈希与产物哈希一致的已完派发会直接复用，缺失支线重新派发（其提示词已写明“若目标文件已存在，先读并核对，缺什么补什么”）'
+
 phase('规划')
 const plan = await agent(
   `${base} 阶段 0 规划：参考 ${S}/references/clusters-investment.md 设计 3–6 个检索簇（每簇含 id, name, queries（5–8 条中英文检索词）、预期信息类型、关键来源、盲区），锁定报告框架与 5–8 个核心问题（${
@@ -76,7 +125,7 @@ phase('一手材料')
 const primary = await agent(
   `${base} 阶段 0.5 一手材料：规划见 ${R}/plan.md。涉及上市公司（${
     related.join(', ') || '按规划'
-  }）时读最近定期报告与 8-K 附件、1–2 次电话会、近 6 个月卖方报告；行业/宏观题读 AlphaEngine 行业检索与内部库，写 ${R}/primary.md。`,
+  }）时读最近定期报告与 8-K 附件、1–2 次电话会、近 6 个月卖方报告；行业/宏观题读 AlphaEngine 行业检索与内部库，写 ${R}/primary.md。若目标文件已存在，先读并核对，缺什么补什么，不必推倒重写。`,
   { agentType: 'dalton-evidence', label: '一手材料', phase: '一手材料', schema: OUT }
 )
 
@@ -105,6 +154,85 @@ const evTasks = [
 ]
 const evResults = await parallel(evTasks)
 
+// B1：contract 要求 primary.md（≥100 字节）、cluster-* ≥3 个（各 ≥100 字节）、
+// internal-memory.md 与 guidepoint.md（各 ≥50 字节）必交。取证子任务返回
+// null/files 为空、或核验发现在盘缺失/过小，都算缺失；凑不满底线（含全部缺失）
+// 停在交叉验证之前，出口与审稿 block 同一段文案。个别簇缺失但底线仍够时不
+// block：缺失簇写进 incomplete、传给写作提示词并在返回值里列出。
+const clusterFiles = clusters.map((c, idx) => `${R}/cluster-${c.id || `c${idx + 1}`}.md`)
+const clusterNames = clusters.map((c, idx) => c.name || `簇 ${idx + 1}`)
+const internalFile = `${R}/internal-memory.md`
+const guidepointFile = `${R}/guidepoint.md`
+const primaryFile = `${R}/primary.md`
+const clusterOnDisk = clusters.map((_, i) => branchArtifacts(evResults[i]).length > 0)
+let internalOnDisk = branchArtifacts(evResults[clusters.length]).length > 0
+let guidepointOnDisk = branchArtifacts(evResults[clusters.length + 1]).length > 0
+let primaryOnDisk = branchArtifacts(primary).length > 0
+// 缺失簇在核验前先按子任务回报算一遍（核验失败的出口要用），核验后再按在盘
+// 结果重算；此后所有出口（取证缺失 block、审稿 block、最终返回）都带上。
+let missingClusters = clusters
+  .map((_, i) => (clusterOnDisk[i] ? null : clusterNames[i]))
+  .filter(Boolean)
+let missingClusterIds = clusters
+  .map((c, i) => (clusterOnDisk[i] ? null : c.id || `c${i + 1}`))
+  .filter(Boolean)
+const toProbe = [
+  ...(primaryOnDisk ? [[primaryFile, 100]] : []),
+  ...clusterFiles.filter((_, i) => clusterOnDisk[i]).map((p) => [p, 100]),
+  ...(internalOnDisk ? [[internalFile, 50]] : []),
+  ...(guidepointOnDisk ? [[guidepointFile, 50]] : []),
+]
+if (toProbe.length) {
+  const probe = await probeBranchFiles(toProbe)
+  if (probe === null) {
+    return {
+      ok: false,
+      blocked: '支线核验子任务失败，无法确认取证产物在盘',
+      incomplete: [
+        `支线核验子任务失败（无法确认产物文件存在且非空；按子任务回报缺失的簇：${
+          missingClusters.join('、') || '无'
+        }），已停在交叉验证之前；请重试或补数后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑`,
+      ],
+      missing_clusters: missingClusterIds,
+      resume_hint: '用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑：label、prompt 哈希与产物哈希一致的已完派发会直接复用，失败支线重新派发',
+    }
+  }
+  for (const entry of probe) {
+    if (!entry.endsWith('|missing')) continue
+    const path = entry.slice(0, -'|missing'.length)
+    const idx = clusterFiles.indexOf(path)
+    if (idx >= 0) clusterOnDisk[idx] = false
+    else if (path === internalFile) internalOnDisk = false
+    else if (path === guidepointFile) guidepointOnDisk = false
+    else if (path === primaryFile) primaryOnDisk = false
+  }
+  missingClusters = clusters
+    .map((_, i) => (clusterOnDisk[i] ? null : clusterNames[i]))
+    .filter(Boolean)
+  missingClusterIds = clusters
+    .map((c, i) => (clusterOnDisk[i] ? null : c.id || `c${i + 1}`))
+    .filter(Boolean)
+}
+// 底线之外的个别簇缺失：不 block，随报告与返回值交代。
+const presentClusters = clusterOnDisk.filter(Boolean).length
+const topicMissing = []
+if (!primaryOnDisk) topicMissing.push('一手材料')
+if (presentClusters < 3)
+  topicMissing.push(`cluster-*.md 完整产物不足 3 个（现 ${presentClusters} 个）`)
+if (!internalOnDisk) topicMissing.push('内部记忆检索')
+if (!guidepointOnDisk) topicMissing.push('专家纪要检索')
+if (topicMissing.length) {
+  return {
+    ok: false,
+    blocked: `取证支线缺失：${topicMissing.join('、')}`,
+    incomplete: [
+      `取证支线缺失：${topicMissing.join('、')}，已停在交叉验证之前；补齐缺失产物后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑，label、prompt 哈希与产物哈希一致的已完派发会直接复用`,
+    ],
+    missing_clusters: missingClusterIds,
+    resume_hint: RESUME_HINT,
+  }
+}
+
 phase('交叉验证与盲区')
 const cross = await agent(
   `${base} 阶段 3 交叉验证 + 阶段 3.5 盲区检查：读 ${R}/ 下全部取证文件（primary.md、cluster-*.md、internal-memory.md、guidepoint.md），跨簇互证升级置信度（【高】≥3 独立源、【中】2 源、【低】单源）；矛盾保留各方原话（【冲突】），不折中合并；检查盲区并写 ${R}/cross-check.md，结尾写“盲区检查完成”。若仍有必须补查的盲区，放入返回 JSON 的 gaps 数组（最多 2 项）。`,
@@ -128,7 +256,9 @@ if (cross && Array.isArray(cross.gaps) && cross.gaps.length > 0) {
 phase('写作与数字核验')
 const draftPath = `${W}/drafts/${dateTag}-topic-${topicSlug}.md`
 const draft = await agent(
-  `${base} 阶段 4 写作：按 ${S}/templates/topic.md 综合 ${R}/ 下全部材料写专题报告到 ${draftPath}（含逐条置信度标签、“对覆盖公司的含义”表、情景推演、信息缺口与局限、数字核验表占位、Sources），跑 python ${S}/scripts/validate_topic.py --input ${draftPath} --json 到通过，返回成稿路径与 sha256。`,
+  `${base} 阶段 4 写作：按 ${S}/templates/topic.md 综合 ${R}/ 下全部材料写专题报告到 ${draftPath}（含逐条置信度标签、“对覆盖公司的含义”表、情景推演、信息缺口与局限、数字核验表占位、Sources）${
+    missingClusters.length ? `。缺失簇：${missingClusters.join('、')}，对应内容在“信息缺口与局限”写明缺什么与已尝试路径` : ''
+  }。跑 python ${S}/scripts/validate_topic.py --input ${draftPath} --json 到通过，返回成稿路径与 sha256。`,
   { agentType: 'general-purpose', label: '专题写作', phase: '写作与数字核验', schema: DRAFT_OUT }
 )
 
@@ -167,6 +297,9 @@ const review =
       )
 
 const incomplete = []
+// 缺失簇信息在取证门就初始化（见 missingClusters/missingClusterIds），所有出口都带上。
+if (missingClusters.length)
+  incomplete.push(`分簇取证失败（${missingClusters.join('、')}），缺口已传给写作并在报告中交代`)
 if (review && verdictOf(review) === 'block') {
   incomplete.push(`审稿 block：${review.summary || '存在不可修订级问题'}`)
   return {
@@ -174,7 +307,10 @@ if (review && verdictOf(review) === 'block') {
     blocked: review.summary || '审稿 block',
     draft: draftPath,
     number_audit: audit && `${R}/number-audit.md`,
+    missing_clusters: missingClusterIds,
     incomplete,
+    resume_hint:
+      '修订报告后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑：label、prompt 哈希与产物哈希一致的已完派发（取证支线等）会直接复用，成稿及之后的阶段重新派发',
   }
 }
 
@@ -275,11 +411,9 @@ if (reviewPassed) {
   )
 }
 
-if (primary === null) incomplete.push('一手材料失败')
-const failedClusters = clusters.filter((_, i) => evResults[i] === null).length
-if (failedClusters) incomplete.push(`分簇取证失败 ${failedClusters} 个`)
-if (evResults[clusters.length] === null) incomplete.push('内部记忆检索失败')
-if (evResults[clusters.length + 1] === null) incomplete.push('专家纪要检索失败')
+if (!primaryOnDisk) incomplete.push('一手材料失败')
+if (!internalOnDisk) incomplete.push('内部记忆检索失败')
+if (!guidepointOnDisk) incomplete.push('专家纪要检索失败')
 if (cross === null) incomplete.push('交叉验证与盲区失败')
 if (!draftOk) incomplete.push('专题写作失败（草稿或其 sha256 缺失/非法）')
 if (lang1Failed) incomplete.push('语言审查第 1 轮失败（结果或其 sha256 缺失/非法），未按清单修改')
@@ -342,5 +476,6 @@ return {
   language_done: draftOk && lang1Sha !== null && lang2Sha !== null,
   revise_rounds: rounds,
   knowledge_revision: kp && `${R}/knowledge-revision.json`,
+  missing_clusters: missingClusterIds,
   incomplete,
 }

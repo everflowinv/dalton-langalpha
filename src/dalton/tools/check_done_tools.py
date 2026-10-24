@@ -23,6 +23,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Annotated, Any
+from zoneinfo import ZoneInfo
 
 import structlog
 from langchain_core.runnables import RunnableConfig
@@ -87,6 +88,24 @@ def _today_start_utc() -> datetime:
     against today's check would be a silent pass."""
     now = datetime.now(timezone.utc)
     return datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
+
+
+# US research anchors its freshness window in America/New_York: the covered
+# markets' own clock, independent of the caller's timezone (audit #20 — a
+# UTC-midnight window drops every version written before an Asia-morning
+# crossing).
+_US_EASTERN = ZoneInfo("America/New_York")
+
+
+def _day_start_eastern(day: str) -> datetime | None:
+    """Midnight of ``day`` (``YYYY-MM-DD``) in US/Eastern, or None when ``day``
+    is not a parseable date. The window's day boundary is the market's, not
+    UTC's and not the viewer's."""
+    try:
+        base = datetime.fromisoformat(f"{day}T00:00:00")
+    except ValueError:
+        return None
+    return base.replace(tzinfo=_US_EASTERN)
 
 
 async def _read_text(backend: Any, path: str) -> str | None:
@@ -533,6 +552,44 @@ async def _latest_run_dir(
     return best_dir
 
 
+async def _run_args_as_of(
+    backend: Any, workflow: str, run_id: str | None, thread_id: str | None
+) -> str | None:
+    """The effective ``as_of`` recorded in this run's ``args.json``.
+
+    Resolution mirrors the run checks: the named run when ``run_id`` was
+    passed, else the thread's latest run of the same workflow. The date is
+    read, never recomputed — the launch path's trading-day default is what
+    the run's artifacts are keyed on. An unreadable record inherits nothing;
+    the missing-parameter check then names the gap honestly.
+    """
+    dirs: list[str]
+    if run_id:
+        dirs = [f"{_thread_prefix(thread_id)}{run_id}"]
+    else:
+        if not thread_id:
+            return None
+        try:
+            latest = await _latest_run_dir(backend, workflow, thread_id)
+        except _CannotVerify:
+            return None
+        dirs = [latest] if latest else []
+    for run_dir in dirs:
+        text = await _read_text(backend, f"{run_dir}/args.json")
+        if not text:
+            continue
+        try:
+            doc = json.loads(text)
+        except ValueError:
+            continue
+        if not isinstance(doc, dict):
+            continue
+        as_of = doc.get("as_of")
+        if isinstance(as_of, str) and as_of.strip() and as_of.strip() != "latest":
+            return as_of.strip()
+    return None
+
+
 async def _review_records_from_journals(
     backend: Any, journals: list[str]
 ) -> list[dict[str, Any]]:
@@ -880,6 +937,39 @@ async def _conditional_knowledge_docs(
     return docs_all, docs_any, problems
 
 
+async def _closing_since(
+    backend: Any,
+    workflow: str,
+    params: dict[str, Any],
+    run_id: str | None,
+    thread_id: str | None,
+) -> tuple[datetime, list[str]]:
+    """The closing checks' freshness window and any gap from fixing it.
+
+    Audit #20: the window starts at THIS run's first dispatch (the earliest
+    journal ``recorded_at``), so versions written during the run always count,
+    whatever timezone it crossed; the manual path (no run) falls back to the
+    ``as_of`` day's start in America/New_York. A journal that exists but
+    cannot be read is a gap (fail-closed), with the manual window as the
+    best-effort floor the remaining checks still run against.
+    """
+    try:
+        _files, run_start = await _collect_run_dispatch_files(
+            backend, workflow, run_id, thread_id
+        )
+    except _CannotVerify as error:
+        since = datetime.fromtimestamp(
+            await _manual_since_epoch(params, thread_id), tz=timezone.utc
+        )
+        return since, [f"知识层时间窗口无法核对（{error}），请重试。"]
+    if run_start is not None:
+        return datetime.fromtimestamp(run_start, tz=timezone.utc), []
+    since = datetime.fromtimestamp(
+        await _manual_since_epoch(params, thread_id), tz=timezone.utc
+    )
+    return since, []
+
+
 async def _check_closing(
     contract: dict[str, Any],
     params: dict[str, Any],
@@ -892,7 +982,10 @@ async def _check_closing(
     missing: list[str] = []
     warnings: list[str] = []
     closing = contract.get("closing") or {}
-    since = _today_start_utc()
+    since, since_gaps = await _closing_since(
+        backend, contract["name"], params, run_id, thread_id
+    )
+    missing.extend(since_gaps)
     since_label = since.date().isoformat()
 
     docs_all = list(closing.get("knowledge_docs", []))
@@ -1107,20 +1200,18 @@ async def _thread_start_epoch(thread_id: str | None) -> int | None:
 async def _manual_since_epoch(
     params: dict[str, Any], thread_id: str | None
 ) -> int:
-    """The manual path's window start: the run's ``as_of`` day at UTC midnight
-    (release_date/end are the aliases the contracts render); with ``as_of``
-    missing, ``latest``, or unparseable, the thread's start; and only when
-    even that is unreadable, the last 24 hours — a window ending at today's
-    midnight would drop notes written before a UTC-midnight crossing."""
+    """The manual path's window start: the run's ``as_of`` day at midnight
+    America/New_York (release_date/end are the aliases the contracts render);
+    with ``as_of`` missing, ``latest``, or unparseable, the thread's start;
+    and only when even that is unreadable, the last 24 hours — a window ending
+    at today's midnight would drop notes written before a midnight crossing."""
     day = str(
         params.get("as_of") or params.get("release_date") or params.get("end") or ""
     ).strip()
     if day and day != "latest":
-        try:
-            base = datetime.fromisoformat(f"{day}T00:00:00+00:00")
+        base = _day_start_eastern(day)
+        if base is not None:
             return int(base.timestamp())
-        except ValueError:
-            pass
     thread_start = await _thread_start_epoch(thread_id)
     if thread_start is not None:
         return thread_start
@@ -1690,6 +1781,21 @@ async def run_check_done(
 
     try:
         contract = load_contract(workflow)
+        # The launch path resolves ``as_of`` to a concrete trading day before
+        # the script runs; the closing check inherits that effective date from
+        # the run's own ``args.json`` so the caller's original params (which
+        # may omit as_of or say "latest") still find the run's artifacts —
+        # never recomputed here, the run's record is the truth.
+        if backend is not None and isinstance(params, dict):
+            current = params.get("as_of")
+            if not (
+                isinstance(current, str)
+                and current.strip()
+                and current.strip() != "latest"
+            ):
+                inherited = await _run_args_as_of(backend, workflow, run_id, thread_id)
+                if inherited:
+                    params = {**params, "as_of": inherited}
         gap_params = missing_params(contract, params)
         if gap_params:
             return {

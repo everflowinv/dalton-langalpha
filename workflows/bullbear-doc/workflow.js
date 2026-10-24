@@ -10,7 +10,13 @@ const D = args.as_of
 const days = args.research_days || 92
 const runDir = `${W}/research/${D}-bullbear`
 const S = '.agents/skills/dalton-bullbear'
-const conv = `先读 .agents/skills/dalton-conventions/SKILL.md 与 ${S}/SKILL.md、${S}/references/v42-structure.md。`
+// A1 同类：SKILL 声明的 market（与可选的 revision_brief 文件路径）随 conv 进
+// 每个子任务。
+const pmAsks = []
+if (args.pm_question) pmAsks.push(String(args.pm_question))
+if (args.revision_brief) pmAsks.push(`本轮必须修正的事项见 ${args.revision_brief}（先读该文件）`)
+const pmSection = pmAsks.length ? ` PM 的问题 / 本轮必须修正的事项：${pmAsks.join('；')}。` : ''
+const conv = `先读 .agents/skills/dalton-conventions/SKILL.md 与 ${S}/SKILL.md、${S}/references/v42-structure.md；市场 ${args.market || 'US'}。${pmSection}`
 
 const PREP_SCHEMA = {
   type: 'object',
@@ -74,6 +80,54 @@ const shaOf = (r) =>
     ? r.sha256
     : null
 
+// B1：支线产物缺失判定（各 workflow 同一实现；workflow 之间没有共用 js 模块的
+// 机制，改动需同步全部 workflow.js）。子任务返回 null、files/file 为空、或（经
+// 只读核验子任务确认）声明的产物文件不存在/为空（0 字节或只有空白），都算缺失；
+// workflow 自己碰不到文件系统，最后一项由支线核验子任务在盘上确认。
+const branchArtifacts = (v) => {
+  if (v === null || typeof v !== 'object') return []
+  const out = []
+  if (typeof v.file === 'string' && v.file.trim()) out.push(v.file.split('|', 1)[0].trim())
+  for (const f of Array.isArray(v.files) ? v.files : []) {
+    if (typeof f === 'string' && f.trim()) out.push(f.split('|', 1)[0].trim())
+  }
+  return out.filter(Boolean)
+}
+const PROBE_OUT = {
+  type: 'object',
+  properties: {
+    files: { type: 'array', items: { type: 'string', minLength: 1 } },
+  },
+  required: ['files'],
+}
+// 返回每个路径的 "<路径>|ok" / "<路径>|missing"；结果不完整（漏路径、格式不对）
+// 一律算核验失败（fail-closed），返回 null。paths 的每一项可以是路径或
+// [路径, 最小字节数]（契约 min_bytes；缺省 1，即非空白即可）。
+const probeBranchFiles = async (paths) => {
+  const entries = paths.map((p) => (Array.isArray(p) ? p : [p, 1]))
+  const r = await agent(
+    `只读核验以下支线产物文件是否存在、非空白且达到字节数下限（不写任何文件）。逐个执行 bash：f='<路径>'；n=<字节数下限>；test -e "$f" && [ "$(wc -c < "$f")" -ge "$n" ] && [ -n "$(tr -d '[:space:]' < "$f")" ] && echo "$f|ok" || echo "$f|missing"。返回 files 数组：每项为上述一行的原样输出（<路径>|ok 或 <路径>|missing）：\n${entries
+      .map(([p, min]) => `- ${p}（至少 ${min} 字节）`)
+      .join('\n')}`,
+    { agentType: 'dalton-evidence', label: '支线核验', phase: '股东回报支线', schema: PROBE_OUT }
+  )
+  if (r === null || typeof r !== 'object' || !Array.isArray(r.files)) return null
+  const answered = new Set()
+  for (const entry of r.files) {
+    if (typeof entry !== 'string') return null
+    const bar = entry.lastIndexOf('|')
+    const path = bar > 0 ? entry.slice(0, bar) : ''
+    const verdict = bar > 0 ? entry.slice(bar + 1) : ''
+    if (!path || (verdict !== 'ok' && verdict !== 'missing')) return null
+    answered.add(path)
+  }
+  if (entries.some(([p]) => !answered.has(p))) return null
+  return r.files
+}
+// B1 共用出口：缺失（含全部缺失）与核验失败都停在主稿之前，文案与审稿 block
+// 一致，主线程补数后用原参数 resume 重跑（已完派发按 journal 复用）。
+const RESUME_HINT = '用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑：label、prompt 哈希与产物哈希一致的已完派发会直接复用，缺失支线重新派发（其提示词已写明“若目标文件已存在，先读并核对，缺什么补什么”）'
+
 phase('准备')
 const prep = await agent(
   `${conv}
@@ -94,9 +148,67 @@ const ret =
         `${conv}
 按 ${S}/references/return-branch.md 与 .agents/skills/dalton-financial-lenses/references/shareholder-return.md 写股东回报第一节（≤40 行）、附录（≤30 行）和 5 条摘要，
 分母统一用 ${runDir}/anchors.json，评分必须用 .agents/skills/dalton-financial-lenses/scripts/return_score.py 计算。
-输出 ${runDir}/return.md、${runDir}/return_appendix.md、${runDir}/return_summary.md。`,
+输出 ${runDir}/return.md、${runDir}/return_appendix.md、${runDir}/return_summary.md。若目标文件已存在，先读并核对，缺什么补什么，不必推倒重写。`,
         { agentType: 'dalton-evidence', label: `${T} 股东回报`, phase: '股东回报支线', schema: FILES_SCHEMA }
       )
+
+// B1：contract 把准备四件与股东回报三件都列为必交（min_bytes 见各项）。任一缺失
+// （null、files 为空、或核验发现在盘缺失/过小，含全部缺失）都停在主稿之前，
+// 出口与审稿 block 同一段文案。
+const prepPaths = [
+  [`${runDir}/anchors.json`, 50],
+  [`${runDir}/fincheck.md`, 100],
+  [`${runDir}/consensus.md`, 100],
+  [`${runDir}/price.md`, 50],
+]
+const retPaths = [
+  [`${runDir}/return.md`, 100],
+  [`${runDir}/return_appendix.md`, 50],
+  [`${runDir}/return_summary.md`, 50],
+]
+const gateBranches = [
+  ['准备', prep, prepPaths],
+  ['股东回报', ret, retPaths],
+]
+const gateMissing = gateBranches
+  .filter(([, v]) => branchArtifacts(v).length === 0)
+  .map(([name]) => name)
+const toProbe = gateBranches
+  .filter(([name]) => !gateMissing.includes(name))
+  .flatMap(([, , ps]) => ps)
+if (toProbe.length) {
+  const byPath = new Map(gateBranches.flatMap(([name, , ps]) => ps.map(([p]) => [p, name])))
+  const probe = await probeBranchFiles(toProbe)
+  if (probe === null) {
+    return {
+      ok: false,
+      blocked: '支线核验子任务失败，无法确认支线产物在盘',
+      incomplete: [
+        '支线核验子任务失败（无法确认产物文件存在且非空），已停在主稿之前；请重试或补数后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑',
+      ],
+      resume_hint: '用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑：label、prompt 哈希与产物哈希一致的已完派发会直接复用，失败支线重新派发',
+    }
+  }
+  for (const entry of probe) {
+    if (!entry.endsWith('|missing')) continue
+    const name = byPath.get(entry.slice(0, -'|missing'.length))
+    if (name && !gateMissing.includes(name)) gateMissing.push(name)
+  }
+}
+if (gateMissing.length) {
+  const absent = gateBranches
+    .filter(([name]) => gateMissing.includes(name))
+    .flatMap(([, , ps]) => ps.map(([p]) => p))
+    .join('、')
+  return {
+    ok: false,
+    blocked: `关键支线缺失：${gateMissing.join('、')}（${absent} 不存在、为空或过小）`,
+    incomplete: [
+      `关键支线缺失：${gateMissing.join('、')}，已停在主稿之前；补齐缺失产物后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑，label、prompt 哈希与产物哈希一致的已完派发会直接复用`,
+    ],
+    resume_hint: RESUME_HINT,
+  }
+}
 
 phase('主稿')
 const main = await agent(
@@ -153,6 +265,8 @@ if (review && verdictOf(review) === 'block') {
     draft: `${W}/drafts/${D}-bullbear.md`,
     failed: [prep, ret, main, merged, review].map((x) => x === null),
     incomplete,
+    resume_hint:
+      '修订成稿后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑：label、prompt 哈希与产物哈希一致的已完派发（准备、股东回报支线等）会直接复用，主稿及之后的阶段重新派发',
   }
 }
 
@@ -203,7 +317,7 @@ const notesReview =
     ? null
     : await agent(
         `对本次运行产出、给人读的 .md 笔记逐一做两轮语言审查（规则见 .agents/skills/dalton-language/SKILL.md，只标问题）。每个文件依次：1) 调用工具 check_language(draft_path="<文件>", round=1)，读 <文件>.language.md 清单并按清单修改（只改语言表达，不动事实、数字、术语、引用编号与判断强度，不改 <!-- INSERT:… --> 结构；工具报错就不改稿并在 summary 里原样汇报错误）；2) 调用 check_language(draft_path="<文件>", round=2) 复核；若第 1 轮后改过稿，改完再调用一次 round=2 确认（记录追加在同一 json）。\n文件清单：\n- ${runDir}/fincheck.md\n- ${runDir}/consensus.md\n- ${runDir}/price.md\n- ${runDir}/return.md\n- ${runDir}/return_appendix.md\n- ${runDir}/return_summary.md\n- ${runDir}/main.md\n清单之外本次运行写的其他给人读的 .md 一并同法处理；json/xlsx 等机器文件、bg_data/、data/、lenses_work/、model_dump/ 下的文件、知识层渲染文件与 .audit/.annotated/.language 侧车不审。返回处理过的文件列表与摘要。`,
-        { agentType: 'general-purpose', label: '笔记语言审查', phase: '修订', schema: OUT }
+        { agentType: 'general-purpose', label: '笔记语言审查', phase: '修订', schema: PREP_SCHEMA }
       )
 if (mergedOk && reviewPassed && notesReview === null) {
   incomplete.push('笔记语言审查失败（准备/支线/主稿笔记未完成两轮语言审查）')
