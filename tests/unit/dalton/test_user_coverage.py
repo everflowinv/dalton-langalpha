@@ -1161,6 +1161,38 @@ async def test_extractor_per_owner_aliases_for_stripping_and_proper_nouns(
     assert any("泽塔99科技" in grp for grp in alice_groups)
     assert not any("泽塔99科技" in grp for grp in bob_groups)
 
+    # Roster mutations actively invalidate the per-user alias cache so changes are visible immediately
+    monkeypatch.setattr(
+        coverage_svc,
+        "sync_user_coverage_to_home",
+        create_autospec(coverage_svc.sync_user_coverage_to_home, return_value=True),
+    )
+    await coverage_svc.remove_user_coverage_tickers(USER_ALICE, ["ZETA"])
+    assert "泽塔99科技" not in extractor_mod._chinese_company_aliases_for_stripping(USER_ALICE)
+    assert not any("泽塔99科技" in grp for grp in extractor_mod._build_entity_alias_groups(USER_ALICE))
+
+    # Direct store writes followed by cache_clear() also refresh immediately
+    await store.upsert_coverage_rows(
+        USER_BOB,
+        [
+            company_to_row(
+                {
+                    "ticker": "OMEGA",
+                    "name": "Omega 88 Holdings",
+                    "tier": "watch",
+                    "market": "US",
+                    "aliases": {"search_names": ["欧米伽88控股"]},
+                },
+                user_id=USER_BOB,
+                source="chat",
+            )
+        ],
+    )
+    extractor_mod._load_ticker_company_aliases.cache_clear()
+    assert "欧米伽88控股" in extractor_mod._chinese_company_aliases_for_stripping(USER_BOB)
+    await coverage_svc.set_user_coverage_tier(USER_BOB, ["OMEGA"], tier="core")
+    assert "欧米伽88控股" in extractor_mod._chinese_company_aliases_for_stripping(USER_BOB)
+
 
 @pytest.mark.asyncio
 async def test_multi_group_membership_include_validation_and_preflight_autonomy_disabled(

@@ -27,8 +27,16 @@ from src.dalton.coverage.models import (
     validate_earnings_calendar_ledger,
 )
 from src.dalton.database import coverage as coverage_db
+from src.server.database import pool as _db_pool_mod
 
 logger = logging.getLogger(__name__)
+
+_ORIG_LIST_COVERAGE_ROWS = coverage_db.list_coverage_rows
+_ORIG_LIST_ALL_COVERAGE_ROWS = coverage_db.list_all_coverage_rows
+_ORIG_GET_COVERAGE_ROW = coverage_db.get_coverage_row
+_ORIG_COVERAGE_GET_DB_CONN = coverage_db.get_db_connection
+_ORIG_POOL_GET_OR_CREATE = _db_pool_mod.get_or_create_pool
+_ORIG_POOL_GET_DB_CONN = _db_pool_mod.get_db_connection
 
 GROUP_REFRESH_INTERVAL_DAYS = 85
 
@@ -95,6 +103,35 @@ def _is_pool_not_open_error(exc: BaseException) -> bool:
     )
 
 
+def _can_reach_coverage_db(conn: Any = None) -> bool:
+    """Return True when a DB connection/pool is open or a test monkeypatched coverage DB hooks."""
+    if conn is not None:
+        return True
+    if (
+        coverage_db.list_coverage_rows is not _ORIG_LIST_COVERAGE_ROWS
+        or coverage_db.list_all_coverage_rows is not _ORIG_LIST_ALL_COVERAGE_ROWS
+        or coverage_db.get_coverage_row is not _ORIG_GET_COVERAGE_ROW
+        or coverage_db.get_db_connection is not _ORIG_COVERAGE_GET_DB_CONN
+        or _db_pool_mod.get_or_create_pool is not _ORIG_POOL_GET_OR_CREATE
+        or _db_pool_mod.get_db_connection is not _ORIG_POOL_GET_DB_CONN
+    ):
+        return True
+    return any(
+        not getattr(p, "closed", True)
+        for p in _db_pool_mod._conversation_db_pool_cache.values()
+    )
+
+
+def invalidate_user_aliases_cache(user_id: str | None = None) -> None:
+    """Invalidate cached ticker/company alias tables after coverage roster mutations."""
+    try:
+        from src.dalton.conversations.extractor import invalidate_ticker_company_aliases_cache
+
+        invalidate_ticker_company_aliases_cache(user_id)
+    except Exception:
+        pass
+
+
 def _run_coro_sync(coro: Any) -> Any:
     """Run an async coroutine from a synchronous caller, handling active event loops safely."""
     try:
@@ -119,7 +156,7 @@ async def get_user_coverage(
 ) -> dict[str, Any]:
     """Return the user's coverage document in the exact structure of `coverage.yaml`."""
     uid = str(user_id or "").strip()
-    if not uid:
+    if not uid or not _can_reach_coverage_db(conn):
         return build_coverage_doc([])
     try:
         rows = await coverage_db.list_coverage_rows(uid, conn=conn)
@@ -154,7 +191,7 @@ async def get_user_tier(
     """Return `'core'` or `'watch'` if `ticker` is in `user_id`'s coverage, else `None`."""
     uid = str(user_id or "").strip()
     sym = str(ticker or "").strip().upper()
-    if not uid or not sym:
+    if not uid or not sym or not _can_reach_coverage_db(conn):
         return None
     try:
         row = await coverage_db.get_coverage_row(uid, sym, conn=conn)
@@ -219,6 +256,9 @@ async def get_user_aliases(
         except Exception:
             base = {}
 
+    if not _can_reach_coverage_db(conn):
+        return base
+
     uid = str(user_id or "").strip()
     try:
         if uid:
@@ -236,6 +276,8 @@ async def get_user_aliases(
 
 def get_user_coverage_sync(user_id: str | None) -> dict[str, Any]:
     """Synchronous wrapper around `get_user_coverage`."""
+    if not str(user_id or "").strip() or not _can_reach_coverage_db():
+        return build_coverage_doc([])
     try:
         return _run_coro_sync(get_user_coverage(user_id))
     except Exception as exc:
@@ -246,6 +288,8 @@ def get_user_coverage_sync(user_id: str | None) -> dict[str, Any]:
 
 def get_user_tier_sync(user_id: str | None, ticker: str) -> str | None:
     """Synchronous wrapper around `get_user_tier`."""
+    if not str(user_id or "").strip() or not str(ticker or "").strip() or not _can_reach_coverage_db():
+        return None
     try:
         return _run_coro_sync(get_user_tier(user_id, ticker))
     except Exception as exc:
@@ -260,6 +304,15 @@ def get_user_aliases_sync(
     include_supplemental: bool = True,
 ) -> dict[str, tuple[str, ...]]:
     """Synchronous wrapper around `get_user_aliases`."""
+    if not _can_reach_coverage_db():
+        if include_supplemental:
+            try:
+                from src.dalton.conversations.extractor import SUPPLEMENTAL_TICKER_ALIASES
+
+                return dict(SUPPLEMENTAL_TICKER_ALIASES)
+            except Exception:
+                return {}
+        return {}
     try:
         return _run_coro_sync(
             get_user_aliases(user_id, include_supplemental=include_supplemental)
@@ -1086,6 +1139,7 @@ async def add_user_coverage_tickers(
             async with db_conn.transaction():
                 _prev_count, upserted = await _locked_read_and_upsert(db_conn)
 
+    invalidate_user_aliases_cache(uid)
     automation_res: dict[str, Any] = {}
     if ensure_automation and len(upserted) > 0:
         automation_res = await ensure_user_earnings_calendar_automation(uid)
@@ -1134,6 +1188,7 @@ async def remove_user_coverage_tickers(
     preserved_workspaces = [t for t in cleaned if t in ws_by_ticker]
 
     removed = await coverage_db.delete_coverage_tickers(uid, cleaned)
+    invalidate_user_aliases_cache(uid)
     not_found = [t for t in cleaned if t not in set(removed)]
     if removed and await coverage_db.count_coverage_rows(uid) > 0:
         await ensure_user_earnings_calendar_automation(uid)
@@ -1172,6 +1227,7 @@ async def set_user_coverage_tier(
         return {"ok": True, "updated": [], "updated_tickers": [], "not_found": [], "tier": norm_tier, "home_synced": False}
 
     updated_rows = await coverage_db.update_coverage_tier(uid, cleaned, norm_tier)
+    invalidate_user_aliases_cache(uid)
     updated_tickers = [str(r["ticker"]) for r in updated_rows]
     missing_tickers = [t for t in cleaned if t not in set(updated_tickers)]
     if updated_rows:
@@ -1653,6 +1709,7 @@ async def add_coverage_group(
                 sync_home=False,
             )
 
+    invalidate_user_aliases_cache(uid)
     automation_res: dict[str, Any] = {}
     if prevalidated:
         automation_res = await ensure_user_earnings_calendar_automation(uid)
@@ -1682,6 +1739,7 @@ async def remove_coverage_group(
         raise ValueError("user_id and group_id are required")
 
     res = await coverage_db.delete_coverage_group_and_exclusive_members(uid, gid)
+    invalidate_user_aliases_cache(uid)
     if await coverage_db.count_coverage_rows(uid) > 0:
         await ensure_user_earnings_calendar_automation(uid)
     home_synced = await sync_user_coverage_to_home(uid)
@@ -1789,6 +1847,8 @@ async def resolve_coverage_group(
             updated_group = await coverage_db.update_coverage_group_resolved(
                 uid, gid, last_resolved_at=resolved_ts, conn=conn
             )
+
+    invalidate_user_aliases_cache(uid)
 
     if matched_by_ticker or existing_rows:
         await ensure_user_earnings_calendar_automation(uid)
@@ -2168,6 +2228,7 @@ async def seed_user_coverage_from_yaml(
             async with db_conn.transaction():
                 _prev_count, upserted = await _seed_in_tx(db_conn)
 
+    invalidate_user_aliases_cache(uid)
     automation_res: dict[str, Any] = {}
     if len(upserted) > 0:
         automation_res = await ensure_user_earnings_calendar_automation(uid)
