@@ -723,6 +723,16 @@ async def test_cos_coverage_tool_binding_actions_and_quarterly_preflight(
     assert (await coverage_pkg.get_user_tier(USER_ALICE, "NVDA")) == "watch"
     resync.assert_awaited_once_with(USER_ALICE, "NVDA", tier="watch")
     assert tier_out["delta_schedule"] == [{"ticker": "NVDA", "updated": True}]
+    # A ticker outside the roster is reported not_found and its tasks are left alone.
+    resync.reset_mock()
+    miss_out = json.loads(
+        await tool.ainvoke(
+            {"action": "set_tier", "tickers": ["NVDA", "ZZZZ"], "tier": "watch"},
+            config=cfg,
+        )
+    )
+    assert "ZZZZ" in miss_out["not_found"]
+    resync.assert_awaited_once_with(USER_ALICE, "NVDA", tier="watch")
     # Set back to core so we verify group sync preserves user's manual tier
     await tool.ainvoke({"action": "set_tier", "tickers": ["NVDA"], "tier": "core"}, config=cfg)
 
@@ -1391,6 +1401,24 @@ async def test_two_users_mutual_isolation_service_and_router(
     assert r_bob_set_tier_alice.status_code == 200
     assert r_bob_set_tier_alice.json()["updated"] == []
     assert r_bob_set_tier_alice.json()["not_found"] == ["AAPL"]
+
+    # The REST route moves the delta schedule like Chief of Staff's tool does,
+    # only for tickers it actually updated.
+    import src.dalton.autonomy.tracking as tracking_mod
+
+    rest_resync = create_autospec(
+        tracking_mod.resync_delta_schedule,
+        return_value={"ticker": "MSFT", "updated": True},
+    )
+    monkeypatch.setattr(tracking_mod, "resync_delta_schedule", rest_resync)
+    r_bob_core = client.post(
+        "/api/v1/dalton/coverage",
+        json={"action": "set_tier", "tickers": ["MSFT", "AAPL"], "tier": "core"},
+    )
+    assert r_bob_core.status_code == 200
+    assert r_bob_core.json()["updated"] == ["MSFT"]
+    rest_resync.assert_awaited_once_with(USER_BOB, "MSFT", tier="core")
+    assert r_bob_core.json()["delta_schedule"] == [{"ticker": "MSFT", "updated": True}]
 
     r_bob_rm_alice = client.post(
         "/api/v1/dalton/coverage",

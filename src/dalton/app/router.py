@@ -887,7 +887,6 @@ async def mutate_user_coverage_endpoint(
         CoverageDataSourceError,
         add_user_coverage_tickers,
         remove_user_coverage_tickers,
-        set_user_coverage_tier,
     )
 
     uid = str(user_id).strip()
@@ -907,11 +906,9 @@ async def mutate_user_coverage_endpoint(
         if act == "remove":
             return await remove_user_coverage_tickers(uid, tickers)
         if act == "set_tier":
-            return await set_user_coverage_tier(
-                uid,
-                tickers,
-                tier=body.tier or "watch",
-            )
+            from src.dalton.autonomy.tracking import set_tier_and_resync
+
+            return await set_tier_and_resync(uid, tickers, tier=body.tier or "watch")
     except CoverageDataSourceError as exc:
         raise HTTPException(status_code=503, detail=exc.to_dict()) from exc
     except ValueError as exc:

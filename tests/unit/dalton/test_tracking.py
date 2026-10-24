@@ -16,6 +16,7 @@ from psycopg import AsyncConnection
 
 import src.dalton.autonomy.schedule as schedule_mod
 import src.dalton.autonomy.tracking as tracking_mod
+from src.dalton.coverage import get_user_tier as _real_get_user_tier
 from src.dalton.app import dalton_router
 from src.dalton.autonomy.schedule import schedule_dalton_automation_helper
 from src.dalton.autonomy.tracking import (
@@ -75,6 +76,13 @@ def _install_fake_automation_store(
         side_effect=_fake_get_db_conn,
     )
     monkeypatch.setattr(schedule_mod, "get_db_connection", mock_get_db_conn)
+    # The fake lock connection is not a coverage store: tickers default to an
+    # empty roster (watch) unless a test patches its own tiers.
+    monkeypatch.setattr(
+        tracking_mod,
+        "get_user_tier",
+        create_autospec(_real_get_user_tier, return_value=None),
+    )
 
     async def _fake_lock_user_automations(uid: str, *, conn: Any = None) -> None:
         observed_conns["lock"].append(conn)
@@ -819,7 +827,7 @@ async def test_enable_and_reenable_tracking_delta_schedule_by_tier_core_and_watc
     monkeypatch.setattr(
         tracking_mod,
         "get_user_tier",
-        create_autospec(tracking_mod.get_user_tier, side_effect=lambda _uid, t: tiers.get(t)),
+        create_autospec(_real_get_user_tier, side_effect=lambda _uid, t, conn=None: tiers.get(t)),
     )
 
     # 1. Core tier (GOOGL is core in user-1's coverage, registered on ws-googl)
@@ -898,7 +906,7 @@ async def test_resync_delta_schedule_watch_to_core_no_tracking_and_paused(
     monkeypatch.setattr(
         tracking_mod,
         "get_user_tier",
-        create_autospec(tracking_mod.get_user_tier, side_effect=lambda _uid, t: tier_state.get(t)),
+        create_autospec(_real_get_user_tier, side_effect=lambda _uid, t, conn=None: tier_state.get(t)),
     )
 
     res_promoted = await resync_delta_schedule("user-1", "ECHO")

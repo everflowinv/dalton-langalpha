@@ -18,7 +18,6 @@ from src.dalton.coverage import (
     preview_coverage_group,
     remove_coverage_group,
     remove_user_coverage_tickers,
-    set_user_coverage_tier,
 )
 from src.dalton.database import coverage as coverage_db
 
@@ -155,31 +154,11 @@ def build_coverage_tools(*, role: str = "chief_of_staff") -> list[BaseTool]:
                         },
                         ensure_ascii=False,
                     )
-                res = await set_user_coverage_tier(
-                    user_id,
-                    norm_tickers,
-                    tier=tier or "watch",
-                )
-                # The daily internal-source scan runs per tier (Core every
-                # trading day, Watch weekly), so a tier change moves the
-                # company's existing delta task to the new schedule.
-                if isinstance(res, dict) and res.get("ok", True):
-                    from src.dalton.autonomy.tracking import resync_delta_schedule
+                from src.dalton.autonomy.tracking import set_tier_and_resync
 
-                    resynced = []
-                    for t in norm_tickers:
-                        try:
-                            resynced.append(
-                                await resync_delta_schedule(user_id, t, tier=tier or "watch")
-                            )
-                        except Exception as exc:
-                            logger.warning(
-                                "coverage.set_tier.resync_failed | ticker=%s error=%s",
-                                t,
-                                type(exc).__name__,
-                            )
-                            resynced.append({"ticker": t, "updated": False, "reason": "resync_failed"})
-                    res["delta_schedule"] = resynced
+                # A tier change also moves the company's daily internal-source
+                # scan to that tier's schedule (Core every trading day, Watch weekly).
+                res = await set_tier_and_resync(user_id, norm_tickers, tier=tier or "watch")
                 return json.dumps(res, ensure_ascii=False, default=str)
 
             if act == "preview_group":
