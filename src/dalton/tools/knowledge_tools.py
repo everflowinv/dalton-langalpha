@@ -222,6 +222,7 @@ def create_knowledge_tools(filesystem_backend: Any = None) -> list[BaseTool]:
     ) -> str:
         """Record an event verdict (NO_CHANGE/THESIS_STRENGTHENED/THESIS_WEAKENED/THESIS_BROKEN/NEW_THESIS) and its next validation; every research session that looked at new evidence ends with one.
 
+        验证完 agenda 里的某一项，要在 agenda_ops 里显式关掉它，或者把 trigger.ref 设成该 validation id；next_validation 写的是下一项要看什么，不会关闭任何项。
         On validation failure, the returned message includes the expected schema structure (失败时返回的信息里带有期望结构，照着补齐再提交).
         Returns: the verdict id and the agenda version it updated.
         """

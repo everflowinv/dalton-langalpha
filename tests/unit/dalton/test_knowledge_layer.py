@@ -1904,3 +1904,273 @@ def test_duplicate_ids_already_stored_stay_writable() -> None:
     codes = [e.get("code") for e in validate_update("thesis", old_doc, new_doc).errors]
 
     assert "duplicate_evidence_id" not in codes
+
+
+def _setup_verdict_agenda_mocks(
+    monkeypatch: pytest.MonkeyPatch,
+    initial_agenda: dict[str, Any],
+    *,
+    verdict_id: str = "VD-20261024-01",
+) -> list[dict[str, Any]]:
+    from unittest.mock import create_autospec
+
+    from src.dalton.database import knowledge as db_knowledge
+    from src.dalton.database import verdicts as db_verdicts
+    from src.server.database import workspace as ws_db
+
+    monkeypatch.setattr(
+        ws_db,
+        "get_workspace",
+        create_autospec(
+            ws_db.get_workspace,
+            return_value={"workspace_id": "ws-1", "user_id": "user-1"},
+        ),
+    )
+    monkeypatch.setattr(
+        db_knowledge,
+        "latest_valid_version",
+        create_autospec(db_knowledge.latest_valid_version, return_value=None),
+    )
+
+    saved_agendas: list[dict[str, Any]] = [copy.deepcopy(initial_agenda)]
+
+    async def _latest_version(workspace_id: str, doc_key: str) -> dict[str, Any] | None:
+        if doc_key != "agenda":
+            return None
+        return {
+            "version_no": len(saved_agendas),
+            "content": copy.deepcopy(saved_agendas[-1]),
+            "schema_valid": True,
+        }
+
+    async def _insert_version(
+        *,
+        user_id: str,
+        workspace_id: str,
+        doc_key: str,
+        base_version_no: int | None,
+        content: dict[str, Any],
+        content_sha256: str,
+        ops: list[dict[str, Any]] | None,
+        reason: str,
+        evidence_refs: list[dict[str, Any]] | None = None,
+        source: str = "tool",
+        warnings: list[dict[str, Any]] | None = None,
+        schema_valid: bool = True,
+        edited_path: str | None = None,
+        thread_id: str | None = None,
+        run_id: str | None = None,
+        tool_call_id: str | None = None,
+    ) -> dict[str, Any]:
+        saved_agendas.append(copy.deepcopy(content))
+        v_no = len(saved_agendas)
+        return {
+            "knowledge_version_id": f"kv-agenda-{v_no}",
+            "workspace_id": workspace_id,
+            "doc_key": doc_key,
+            "version_no": v_no,
+            "base_version_no": base_version_no,
+            "content": copy.deepcopy(content),
+            "content_sha256": content_sha256,
+            "ops": ops,
+            "reason": reason,
+            "source": source,
+            "warnings": warnings or [],
+            "schema_valid": schema_valid,
+            "edited_path": edited_path,
+            "files_written_at": None,
+            "created_at": datetime(2026, 10, 24, 12, 0, 0, tzinfo=UTC),
+        }
+
+    async def _insert_verdict(
+        *,
+        user_id: str,
+        workspace_id: str,
+        verdict: dict[str, Any],
+        thread_id: str | None = None,
+        run_id: str | None = None,
+        automation_execution_id: str | None = None,
+        origin_type: str | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "verdict_id": verdict_id,
+            "workspace_id": workspace_id,
+            "verdict_at": datetime(2026, 10, 24, 12, 0, 0, tzinfo=UTC),
+            "word": verdict["verdict"],
+            "payload": {**verdict, "id": verdict_id, "at": "2026-10-24T12:00:00Z"},
+        }
+
+    monkeypatch.setattr(
+        db_knowledge,
+        "latest_version",
+        create_autospec(db_knowledge.latest_version, side_effect=_latest_version),
+    )
+    monkeypatch.setattr(
+        db_knowledge,
+        "insert_version",
+        create_autospec(db_knowledge.insert_version, side_effect=_insert_version),
+    )
+    monkeypatch.setattr(
+        db_verdicts,
+        "insert_verdict",
+        create_autospec(db_verdicts.insert_verdict, side_effect=_insert_verdict),
+    )
+    return saved_agendas
+
+
+def _sample_agenda_with_validations() -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "as_of": "2026-10-23T00:00:00Z",
+        "open_questions": [],
+        "next_validations": [
+            {
+                "id": "V-001",
+                "what": "10/28 盘后的 3Q26 财报",
+                "due": "2026-10-28",
+                "expected": "Search & YouTube 广告增速维持 >10%",
+                "status": "pending",
+            },
+            {
+                "id": "V-002",
+                "what": "3Q26 预览重取一致预期",
+                "due": "2026-10-24",
+                "expected": "买方与卖方一致预期差距收敛",
+                "status": "pending",
+            },
+        ],
+        "watch": {},
+        "wake_conditions": [],
+    }
+
+
+@pytest.mark.asyncio
+async def test_append_verdict_next_validation_id_keeps_agenda_item_pending(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.dalton.knowledge import service
+
+    saved_agendas = _setup_verdict_agenda_mocks(
+        monkeypatch, _sample_agenda_with_validations(), verdict_id="VD-20261024-01"
+    )
+    res = await service.append_verdict(
+        user_id="user-1",
+        workspace_id="ws-1",
+        verdict={
+            "trigger": {"kind": "manual"},
+            "event": "盘前常规检查",
+            "verdict": "NO_CHANGE",
+            "rationale": "基本面无新增变化，等待 3Q26 财报验证。",
+            "next_validation": {
+                "what": "10/28 盘后的 3Q26 财报",
+                "due": "2026-10-28",
+                "validation_id": "V-001",
+            },
+            "progress": "none",
+        },
+    )
+    assert res["ok"] is True, res.get("message")
+    latest_agenda = saved_agendas[-1]
+    v001 = next(x for x in latest_agenda["next_validations"] if x["id"] == "V-001")
+    assert v001["status"] == "pending"
+    assert "result_verdict_id" not in v001
+
+
+@pytest.mark.asyncio
+async def test_append_verdict_trigger_ref_marks_matching_validation_done(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.dalton.knowledge import service
+
+    saved_agendas = _setup_verdict_agenda_mocks(
+        monkeypatch, _sample_agenda_with_validations(), verdict_id="VD-20261024-02"
+    )
+    res = await service.append_verdict(
+        user_id="user-1",
+        workspace_id="ws-1",
+        verdict={
+            "trigger": {"kind": "due_validation", "ref": "V-002"},
+            "event": "完成 V-002 一致预期核对",
+            "verdict": "NO_CHANGE",
+            "rationale": "一致预期无显著偏移，接下来看 V-001。",
+            "next_validation": {
+                "what": "10/28 盘后的 3Q26 财报",
+                "due": "2026-10-28",
+                "validation_id": "V-001",
+            },
+            "progress": "some",
+        },
+    )
+    assert res["ok"] is True, res.get("message")
+    latest_agenda = saved_agendas[-1]
+    v001 = next(x for x in latest_agenda["next_validations"] if x["id"] == "V-001")
+    v002 = next(x for x in latest_agenda["next_validations"] if x["id"] == "V-002")
+    assert v002["status"] == "done"
+    assert v002["result_verdict_id"] == "VD-20261024-02"
+    assert v001["status"] == "pending"
+    assert "result_verdict_id" not in v001
+
+
+@pytest.mark.asyncio
+async def test_append_verdict_trigger_signals_emits_signal_fields_consumed_and_resolves_signals(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import create_autospec
+
+    from src.dalton.database import watch as watch_db
+    from src.dalton.knowledge import service
+    from src.dalton.tools.knowledge_tools import (
+        knowledge_append_verdict,
+        resolve_verdict_signals,
+    )
+
+    assert "next_validation 写的是下一项要看什么，不会关闭任何项" in (
+        knowledge_append_verdict.description or ""
+    )
+
+    _setup_verdict_agenda_mocks(
+        monkeypatch, _sample_agenda_with_validations(), verdict_id="VD-20261024-03"
+    )
+    mock_resolve = create_autospec(watch_db.resolve_signals)
+    mock_resolve.side_effect = (
+        lambda signal_ids=None, *, signal_refs=None, workspace_id=None, ticker=None, resolved_by=None, execution_id=None: len(
+            signal_ids or []
+        )
+    )
+    monkeypatch.setattr(watch_db, "resolve_signals", mock_resolve)
+
+    verdict_payload = {
+        "trigger": {"kind": "filing"},
+        "trigger_signals": ["filing:0001045810-26-000012"],
+        "event": "8-K 审阅完成",
+        "verdict": "NO_CHANGE",
+        "rationale": "常规定期披露，不影响核心假设。",
+        "next_validation": {
+            "what": "10/28 盘后的 3Q26 财报",
+            "due": "2026-10-28",
+            "validation_id": "V-001",
+        },
+        "progress": "some",
+    }
+    res = await service.append_verdict(
+        user_id="user-1",
+        workspace_id="ws-1",
+        verdict=verdict_payload,
+    )
+    assert res["ok"] is True, res.get("message")
+    consumed_warnings = [
+        w for w in res["warnings"] if w.get("code") == "signal_fields_consumed"
+    ]
+    assert len(consumed_warnings) == 1
+    assert consumed_warnings[0]["dropped_fields"] == ["trigger_signals"]
+    assert "这些字段已用于关闭信号，不存进结论" in consumed_warnings[0]["message"]
+
+    count = await resolve_verdict_signals(
+        workspace_id="ws-1",
+        verdict=verdict_payload,
+        verdict_id=res["verdict_id"],
+    )
+    assert count == 1
+    assert mock_resolve.call_args.args[0] == ["filing:0001045810-26-000012"]
+    assert mock_resolve.call_args.kwargs["resolved_by"] == "VD-20261024-03"
+

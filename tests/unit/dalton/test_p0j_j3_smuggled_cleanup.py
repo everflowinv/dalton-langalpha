@@ -430,9 +430,10 @@ async def test_append_verdict_records_dropped_fields_in_warnings(monkeypatch: py
         },
     )
     assert res["ok"] is True, res
-    dropped_warnings = [w for w in res["warnings"] if w.get("code") == "dropped_extra_fields"]
-    assert len(dropped_warnings) == 1
-    assert set(dropped_warnings[0]["dropped_fields"]) == {"trigger_signal", "signal_ids"}
+    consumed_warnings = [w for w in res["warnings"] if w.get("code") == "signal_fields_consumed"]
+    assert len(consumed_warnings) == 1
+    assert set(consumed_warnings[0]["dropped_fields"]) == {"trigger_signal", "signal_ids"}
+    assert "这些字段已用于关闭信号，不存进结论" in consumed_warnings[0]["message"]
 
 
 def test_antigravity_sanitize_gemini_schema_flattening_and_deref_debug_log(
