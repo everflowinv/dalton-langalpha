@@ -152,6 +152,9 @@ dalton_prefixes = [
 
 # Exempt pure lock/locale/test-contract files that do not use inline DALTON-HOOK comments
 AUDIT_EXEMPT_FILES = {
+    # The fork replaces the whole README (marked once at its top, DALTON-HOOK(docs-readme)),
+    # so every edit is Dalton's and a per-hunk marker would only be noise.
+    "README.md",
     "tests/unit/mcp_servers/agent_docstring_lock.json",
     "tests/unit/mcp_servers/test_agent_contract.py",
     "tests/unit/mcp_servers/test_entrypoint_imports.py",
