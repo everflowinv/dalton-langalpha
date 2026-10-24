@@ -91,3 +91,9 @@ python3 .agents/skills/dalton-thesis-delta/scripts/collect.py commit \
 > **强约束**：`seen.json` 只在 `commit` 成功时更新；若 `collect` 或中途分析失败，绝不能提前把未审阅的文档标为已见，确保下一轮自动重取。
 
 2. **议程验证项闭环**：检查 `agenda.md` 中已到期或本轮已获解答的验证项（`V-...`），在第 3 步同一次 `knowledge_append_verdict` 调用的 `agenda_ops` 参数中将其关闭（`{"op":"set","path":"/next_validations/V-xxx/status","value":"done"}`），并把新的待验证事项入列。注意：verdict 的 `next_validation` 只写下一项要看什么，不会关闭任何验证项。
+
+### 收尾门禁：汇报完成前必须过完成契约（`dalton_check_done`）
+
+- 第 4 步 `commit` 成功后（无论 `material=yes` 还是 `no`，含第 1 步的快速短路分支），结束本轮前调用 `dalton_check_done(workflow="dalton-thesis-delta", params={"ticker": ..., "as_of": "<本轮日期 YYYY-MM-DD，与增量笔记文件名一致>"})`。
+- 契约按 `research/tracker/last_run.json` 判定：它须为本轮 `commit` 写入；`material=yes` 时还要求 `research/<本轮日期>-delta.md` 增量笔记，以及 `thesis`/`debate`/`drivers`/`management` 至少一份本轮 `knowledge_update` 新版本；`material=no` 时没有增量笔记是合法结果。两种情况都要求本轮 verdict 已写。
+- `done=false` 时按 `missing` 先补齐再查（`commit` 未落盘就重跑 `commit`、增量笔记缺失就补写、verdict 未写就 `knowledge_append_verdict`、知识层缺本轮更新就 `knowledge_update`）；补不了的缺项只能汇报“未完成”并列出缺项与原因，不得汇报“完成”。

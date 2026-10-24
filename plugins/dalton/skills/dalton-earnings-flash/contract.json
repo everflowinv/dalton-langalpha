@@ -1,0 +1,30 @@
+{
+  "name": "dalton-earnings-flash",
+  "description": "财报快讯的完成契约：快讯落盘 research/（不进 drafts/、不发布、无 check_draft）+ 事件五词初判 verdict（对应 dalton-earnings-flash SKILL Step 10、12 与输出模板）。",
+  "params_required": [
+    "ticker",
+    "quarter",
+    "as_of"
+  ],
+  "stages": [
+    {
+      "name": "快讯落盘",
+      "artifacts": [
+        {
+          "path": "research/{as_of}-flash-{quarter}.md",
+          "min_bytes": 300
+        }
+      ]
+    }
+  ],
+  "closing": {
+    "verdict_kinds_any": [
+      "NO_CHANGE",
+      "THESIS_STRENGTHENED",
+      "THESIS_WEAKENED",
+      "THESIS_BROKEN",
+      "NEW_THESIS"
+    ],
+    "verdict_trigger": "earnings"
+  }
+}

@@ -49,3 +49,9 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
    - 在交互线程中弹出审批卡（`ToolApprovalCard`）；
    - 在自动任务（unattended）运行中不弹 interrupt，状态停在 `awaiting_pm` 并写入 `agenda.pm_handoffs`，待 PM 在交互线程中指示批准时传入 `request_id` 完成发布。
 4. **不可变归档**：批准后写入 `published/<YYYY-MM-DD>-<slug>.md`（及 `.xlsx`）、写入 `dalton_publications` 与 `dalton_publication_files`，并在 `updates_thesis=True` 时更新 `thesis.official` 与 `published/INDEX.md`。`published/` 下的文件一旦生成绝不改写。
+
+## 4. 收尾门禁：汇报完成前必须过完成契约（`dalton_check_done`）
+
+- 汇报“发布完成”或“已提交、停在 `awaiting_pm`”之前，必须调用 `dalton_check_done(workflow="dalton-publish", params={"draft_path": "<本稿草稿路径，如 drafts/2026-10-23-call-META.md>", "slug": "<本稿 slug，如 call-META>", "as_of": "<发布日期 YYYY-MM-DD>"})`。`draft_path` 按草稿实际路径传（草稿名通常带日期前缀），`slug` 只用来拼归档路径 `published/<as_of>-<slug>.md`，两者不要混用。
+- 契约要求：`draft_path` 指向的草稿及 `check_draft` 生成的侧车（同目录同名，后缀换成 `.annotated.md`、`.audit.md`），且侧车记录的草稿哈希与当前稿一致；发布状态二选一——`published/<as_of>-<slug>.md` 已归档，或本工作区有该草稿（`draft_path`，相对/`./`/工作区内绝对路径均可）的 `awaiting_pm` 发布请求。
+- `done=false` 时按 `missing` 先补齐再查：侧车缺失就对当前稿重跑 `check_draft`；**侧车记录的草稿哈希与当前稿不一致（check_draft 用的是旧草稿）必须对最终稿重跑 `check_draft`**；既无归档也无 `awaiting_pm` 请求就按第 3 节调用 `publish_report` 并处理其返回（`audit_failed`、`review_revise` 修稿重提；`review_unavailable` 时草稿留在 `drafts/`，只能汇报“未完成”）；补不了的缺项只能汇报“未完成”并列出缺项与原因，不得汇报“完成”。

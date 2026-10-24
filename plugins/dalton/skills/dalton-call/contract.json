@@ -1,0 +1,22 @@
+{
+  "name": "dalton-call",
+  "description": "Conviction call 的完成契约（门禁两分支）：正式草稿存在＝六条门禁全过，要求草稿足量且 check_draft 侧车哈希与当前稿一致；草稿不存在＝门禁未过，要求本轮有 word=NO_CHANGE 的 verdict；两个签名都读不到＝无法判定门禁结果，记 missing（对应 dalton-call SKILL Step 2 与 Step 9.1–9.2）。",
+  "params_required": [
+    "ticker",
+    "as_of"
+  ],
+  "stages": [
+    {
+      "name": "六条证据门禁与成稿（两分支在 closing.gated_draft 核对）"
+    }
+  ],
+  "closing": {
+    "gated_draft": {
+      "draft": "drafts/{as_of}-call-{ticker}.md",
+      "min_bytes": 300,
+      "absent_verdict_kinds_any": [
+        "NO_CHANGE"
+      ]
+    }
+  }
+}

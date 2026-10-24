@@ -134,3 +134,8 @@ python3 .agents/skills/dalton-earnings-preview/scripts/predictions.py validate \
    - 调用 `knowledge_update(doc="debate", ...)` 标注本次财报可检验的 debate；
    - 调用 `knowledge_append_verdict` 记录事件五词结论（`trigger.kind="earnings"`，`trigger.ref` 填 `<dalton_wake>` 的 `tm3` 信号 id 或 `"manual"`；通常为 `NO_CHANGE`，若前瞻研究已改变判断则如实填写），并在同次调用的 `agenda_ops` 中加入“财报发布当天对照 `research/<D>-preview-<季度>/predictions.json` 逐条核对”的验证项；
    - 调用 `check_draft` 生成数字核验反馈；PM 要求正式发布时调用 `publish_report(kind="earnings_preview")`；通过自动任务 `delivery` 将开头“核心判断”三句话与草稿路径推送给 PM。
+
+### 收尾门禁：汇报完成前必须过完成契约（`dalton_check_done`）
+
+- 第 3 项全部做完后、向 PM 汇报“完成”前，必须调用 `dalton_check_done(workflow="dalton-earnings-preview", params={"ticker": ..., "quarter": ..., "as_of": "<本稿 D>"})`。
+- `done=false` 时按 `missing` 先补齐再查（缺草稿或 `predictions.json` 就补写、校验未过就按输出修到 `predictions.py validate --strict` 通过、`drivers`/`debate` 缺本轮 source=tool 新版本就 `knowledge_update`、verdict 未写或 `trigger.kind` 不是 `earnings` 就 `knowledge_append_verdict`、check_draft 用了旧草稿就对最终稿重跑 `check_draft`）；补不了的缺项只能汇报“未完成”并列出缺项与原因，不得汇报“完成”。

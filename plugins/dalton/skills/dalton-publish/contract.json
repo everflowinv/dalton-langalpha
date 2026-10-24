@@ -1,0 +1,36 @@
+{
+  "name": "dalton-publish",
+  "description": "发布治理的完成契约：draft_path 指向的草稿存在且足量、check_draft 生成的 .annotated.md 侧车存在、.audit.md 侧车记录的草稿哈希与当前稿一致；发布状态二选一——published/<as_of>-<slug>.md 不可变副本已存在，或本工作区有该草稿（draft_path）的 awaiting_pm 发布请求（对应 dalton-publish SKILL 第 2–3 节）。草稿文件名与 slug 解耦：draft_path 按实际草稿传（如 drafts/2026-10-23-call-META.md），slug 只用于拼归档路径。",
+  "draft": "{draft_path}",
+  "params_required": [
+    "draft_path",
+    "slug",
+    "as_of"
+  ],
+  "stages": [
+    {
+      "name": "草稿自检（check_draft）",
+      "artifacts": [
+        {
+          "path": "{draft_path}",
+          "min_bytes": 100,
+          "sidecars": [
+            {
+              "suffix": ".annotated.md",
+              "min_bytes": 50
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "closing": {
+    "check_draft": {
+      "draft": "{draft_path}"
+    },
+    "published_or_awaiting_pm": {
+      "draft": "{draft_path}",
+      "published": "published/{as_of}-{slug}.md"
+    }
+  }
+}

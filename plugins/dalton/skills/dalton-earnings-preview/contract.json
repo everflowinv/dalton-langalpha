@@ -1,0 +1,55 @@
+{
+  "name": "dalton-earnings-preview",
+  "description": "财报前瞻的完成契约：前瞻草稿 + 可对账的结构化预测清单（predictions.py validate --strict）+ drivers/debate 知识写入 + 事件五词结论 + check_draft 侧车（对应 dalton-earnings-preview SKILL Step 7–8）。",
+  "draft": "drafts/{as_of}-preview-{quarter}.md",
+  "params_required": [
+    "ticker",
+    "quarter",
+    "as_of"
+  ],
+  "stages": [
+    {
+      "name": "成稿落盘",
+      "artifacts": [
+        {
+          "path": "drafts/{as_of}-preview-{quarter}.md",
+          "min_bytes": 300
+        }
+      ]
+    },
+    {
+      "name": "结构化预测",
+      "artifacts": [
+        {
+          "path": "research/{as_of}-preview-{quarter}/predictions.json",
+          "min_bytes": 50
+        }
+      ],
+      "validators": [
+        {
+          "command": "python .agents/skills/dalton-earnings-preview/scripts/predictions.py validate --file research/{as_of}-preview-{quarter}/predictions.json --strict",
+          "pass_when": "exit_zero",
+          "description": "predictions.json 严格校验通过（11 个必填字段 + 最低覆盖）"
+        }
+      ]
+    }
+  ],
+  "closing": {
+    "knowledge_docs": [
+      "drivers",
+      "debate"
+    ],
+    "knowledge_source": "tool",
+    "verdict_kinds_any": [
+      "NO_CHANGE",
+      "THESIS_STRENGTHENED",
+      "THESIS_WEAKENED",
+      "THESIS_BROKEN",
+      "NEW_THESIS"
+    ],
+    "verdict_trigger": "earnings",
+    "check_draft": {
+      "draft": "drafts/{as_of}-preview-{quarter}.md"
+    }
+  }
+}
