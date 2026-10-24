@@ -2537,7 +2537,11 @@ def _normalize_and_validate_call_args(
     if is_comm:
         return normalized, norm_view, None
 
-    if tool_name in ("finance", "macro", "research") and spec is not None:
+    if (
+        tool_name in ("finance", "macro", "research")
+        and spec is not None
+        and spec.get("tool") == tool_name
+    ):
         valid_ops: list[str] = list(spec.get("operations") or [])
         accepted_top: list[str] = sorted({"route", "operation", *spec.get("accepted_params", [])})
         if op_str and valid_ops and op_str not in valid_ops:
@@ -6651,6 +6655,51 @@ class ResearchDataBridge:
                         "isError": True,
                     },
                 }
+            # Upstream rejects a route it doesn't know (or one registered under
+            # another category tool) with a message the classifier can't tell
+            # from an outage; every non-community route the bridge serves has a
+            # spec naming its tool, so an unknown or misrouted one is the
+            # caller's mistake.
+            route_spec = ROUTE_CONTRACT_SPECS.get(route)
+            owner_tool = route_spec.get("tool") if route_spec else None
+            if (
+                route
+                and tool_name != "community"
+                and route not in BRIDGE_COMMUNITY_ROUTES
+                and owner_tool != tool_name
+            ):
+                tool_routes = sorted(
+                    rid
+                    for rid, r_spec in ROUTE_CONTRACT_SPECS.items()
+                    if r_spec.get("tool") == tool_name
+                )
+                if owner_tool:
+                    hint = (
+                        f"route='{route}' 属于 {owner_tool}，请用 {owner_tool}(route='{route}', ...) 调用；"
+                        f"{tool_name} 的可选路由: {tool_routes}（也可调用 catalog(route='{route}') 查看参数契约）。"
+                    )
+                else:
+                    hint = (
+                        f"请将 route 改为 {tool_routes} 之一；不确定时先调用 catalog() 查看全部路由，"
+                        "或 catalog(route=...) 查看单个路由的参数契约。"
+                    )
+                err_route: dict[str, Any] = {
+                    "_declared_sources": [],
+                    "_sources": [],
+                    "ok": False,
+                    "status": "invalid_arguments",
+                    "error_code": "invalid_route",
+                    "error_category": "参数错误",
+                    "accepted_routes": tool_routes,
+                    "error": (
+                        f"[参数错误] {tool_name} 不支持 route='{route}'。可选路由: {tool_routes}。"
+                    ),
+                    "hint": hint,
+                }
+                _apply_error_and_empty_contract(
+                    tool_name, route, operation, err_route, norm_params_view
+                )
+                return self._make_tool_result_response(req_id, err_route, is_error=True)
 
         eff_timeout = self.compute_timeout(tool_name, arguments)
         if tool_name != "catalog" and (

@@ -844,6 +844,14 @@ async def _resolve_role_clients(
         for role in pending:
             client = at_effort[role.reasoning_effort]
             if client is not None:
+                # DALTON-HOOK(subagent-model-pin): log when a pinned model with a set effort falls back to main_model.
+                logger.warning(
+                    "[CHAT] Subagent %r pins %r, which got no client; running main model %r at effort=%r instead",
+                    role.key.removeprefix("subagent:"),
+                    role.model,
+                    main_model,
+                    role.reasoning_effort,
+                )
                 config.subsidiary_llm_clients[role.key] = client
                 if config.prompt_guidance:
                     config.role_prompt_guidance[role.key] = config.prompt_guidance

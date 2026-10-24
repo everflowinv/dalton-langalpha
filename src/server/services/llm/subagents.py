@@ -253,6 +253,10 @@ def subagent_roles(
                 f"subagent:{defn.name}", runs,
                 reasoning_effort=effort or resolve_tuning(model_pref, runs).reasoning_effort,
                 effort_follows=bool(effort), own_client=True,
+                # DALTON-HOOK(subagent-model-pin): a pinned model with no client
+                # must not run on a silent copy of the main client;
+                # demote_clientless turns it into Inherit and says so.
+                fallback_to_main=not defn.model,
             ))
     return roles
 
@@ -276,6 +280,11 @@ def demote_clientless(config: Any) -> None:
         key = f"subagent:{name}"
         if not defn.model or key in config.subsidiary_llm_clients:
             continue
+        # DALTON-HOOK(subagent-model-pin): the demotion is visible in the logs.
+        logger.warning(
+            f"[CHAT] Subagent {name!r} pins {defn.model!r}, which got no client; "
+            "it runs on this turn's model instead"
+        )
         config.role_prompt_guidance.pop(key, None)
         definitions[name] = replace(defn, model=None)
         changed = True

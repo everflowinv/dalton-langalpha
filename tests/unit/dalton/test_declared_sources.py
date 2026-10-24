@@ -3481,6 +3481,83 @@ class TestBridgeResearchParamsAndTranscriptGuards:
         assert exec_mock.await_count == 0
 
     @pytest.mark.asyncio
+    async def test_unknown_route_is_parameter_error_and_never_forwarded_upstream(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Upstream answers an unknown route with "route 不在当前分类的可选值中",
+        # which used to be classified as 上游不可用.
+        bridge = _make_bridge(tmp_path, monkeypatch)
+        exec_mock = create_autospec(asyncio.create_subprocess_exec)
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", exec_mock)
+
+        resp = await bridge.handle_tools_call(
+            "bad-route",
+            {
+                "name": "research",
+                "arguments": {"route": "nonexistent-route", "query": "x"},
+            },
+        )
+        assert resp["result"]["isError"] is True
+        body = json.loads(resp["result"]["content"][0]["text"])
+        assert body["ok"] is False
+        assert body["status"] == "invalid_arguments"
+        assert body["error_code"] == "invalid_route"
+        assert body["error_category"] == "参数错误"
+        assert "nonexistent-route" in body["error"]
+        assert "catalog()" in body["hint"]
+        assert "transcript" in body["accepted_routes"]
+        assert "sec" not in body["accepted_routes"]
+        assert "normalized_params" in body
+
+        assert exec_mock.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_route_under_wrong_tool_is_parameter_error_and_community_combo_unchanged(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bridge = _make_bridge(tmp_path, monkeypatch)
+        exec_mock = create_autospec(asyncio.create_subprocess_exec)
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", exec_mock)
+
+        for call_id, args in (
+            ("wrong-tool-no-ticker", {"route": "sec"}),
+            ("wrong-tool-with-ticker", {"route": "sec", "ticker": "META"}),
+        ):
+            resp = await bridge.handle_tools_call(
+                call_id,
+                {"name": "research", "arguments": args},
+            )
+            assert resp["result"]["isError"] is True
+            body = json.loads(resp["result"]["content"][0]["text"])
+            assert body["ok"] is False
+            assert body["status"] == "invalid_arguments"
+            assert body["error_code"] == "invalid_route"
+            assert body["error_category"] == "参数错误"
+            assert "sec" in body["error"]
+            assert "finance" in body["hint"]
+            assert "finance(route='sec'" in body["hint"]
+            assert "transcript" in body["accepted_routes"]
+            assert "sec" not in body["accepted_routes"]
+
+        # Existing community tool/route combination check stays unchanged for research(route="xueqiu")
+        resp_comm = await bridge.handle_tools_call(
+            "comm-combo",
+            {"name": "research", "arguments": {"route": "xueqiu"}},
+        )
+        assert resp_comm["result"]["isError"] is True
+        body_comm = json.loads(resp_comm["result"]["content"][0]["text"])
+        assert body_comm["ok"] is False
+        assert body_comm["status"] == "invalid_arguments"
+        assert body_comm["error_code"] == "invalid_arguments"
+        assert (
+            "Invalid community tool/route combination: tool='research', route='xueqiu'."
+            in body_comm["error"]
+        )
+        assert body_comm["data"] is None
+
+        assert exec_mock.await_count == 0
+
+    @pytest.mark.asyncio
     async def test_ok_false_error_categories_with_hint_and_ok_true_empty_reason_and_catalog_route(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
