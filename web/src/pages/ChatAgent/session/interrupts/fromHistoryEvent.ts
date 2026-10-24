@@ -180,6 +180,10 @@ export function projectHistoryInterrupt(
               [proposalId]: {
                 workspace_name: proposalData.workspace_name,
                 workspace_description: proposalData.workspace_description,
+                // DALTON-HOOK(workspace-duplicate-guard): name the workspace this create would duplicate
+                duplicate_workspace_id: proposalData.duplicate_workspace_id,
+                duplicate_workspace_name: proposalData.duplicate_workspace_name,
+                duplicate_check_unavailable: proposalData.duplicate_check_unavailable,
                 interruptId: event.interrupt_id,
                 status: 'pending',
               },

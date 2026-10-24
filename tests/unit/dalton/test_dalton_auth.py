@@ -702,10 +702,17 @@ class TestSwitchOnDaltonSupabaseAuth:
             users_app.create_user_from_auth,
             return_value=created_row,
         )
+        # DALTON-HOOK(user-defaults): sync reads the seeded preferences back
+        # for a brand-new user; stand in for that read.
+        mock_get_with_prefs = create_autospec(
+            users_app.get_user_with_preferences,
+            return_value={"user": created_row, "preferences": None},
+        )
         monkeypatch.setattr(users_app, "db_get_user", mock_get_user)
         monkeypatch.setattr(users_app, "find_user_by_email", mock_find_by_email)
         monkeypatch.setattr(users_app, "migrate_user_id", mock_migrate)
         monkeypatch.setattr(users_app, "create_user_from_auth", mock_create_user)
+        monkeypatch.setattr(users_app, "get_user_with_preferences", mock_get_with_prefs)
 
         # 1. Body submits another user's email -> 400, no migration, no DB modification
         with pytest.raises(HTTPException) as exc_info:

@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { motion, AnimatePresence } from '@/lib/framer';
-import { FolderPlus, Check, X, ChevronRight } from 'lucide-react';
+import { FolderPlus, Check, X, ChevronRight, AlertTriangle } from 'lucide-react';
 import { Loader } from '@/components/ui/loader';
 import { AUTO_APPROVE, useApproveAlways } from '@/hooks/useAutoApprove';
 
@@ -9,6 +9,10 @@ interface ProposalData {
   workspace_name: string;
   workspace_description?: string;
   status: 'pending' | 'approved' | 'rejected';
+  // DALTON-HOOK(workspace-duplicate-guard): set when a live workspace already covers this name
+  duplicate_workspace_id?: string;
+  duplicate_workspace_name?: string;
+  duplicate_check_unavailable?: boolean;
 }
 
 interface CreateWorkspaceCardProps {
@@ -33,6 +37,13 @@ function CreateWorkspaceCard({ proposalData, onApprove, onReject }: CreateWorksp
   if (!proposalData) return null;
 
   const { workspace_name, workspace_description, status } = proposalData;
+  // DALTON-HOOK(workspace-duplicate-guard): warn the user a workspace covering
+  // this name exists, or that the check could not run
+  const duplicate = proposalData.duplicate_workspace_name
+    ? `${proposalData.duplicate_workspace_name} (${proposalData.duplicate_workspace_id ?? ''})`
+    : null;
+  const duplicateUnknown =
+    !duplicate && proposalData.duplicate_check_unavailable === true;
   const isApproved = status === 'approved';
   const isRejected = status === 'rejected';
 
@@ -134,6 +145,16 @@ function CreateWorkspaceCard({ proposalData, onApprove, onReject }: CreateWorksp
         {workspace_description && (
           <div className="text-sm mt-1" style={{ color: 'var(--color-text-tertiary)' }}>
             {workspace_description}
+          </div>
+        )}
+        {(duplicate || duplicateUnknown) && (
+          <div className="text-sm mt-2 flex items-start gap-1.5" style={{ color: 'var(--color-text-secondary)' }}>
+            <AlertTriangle className="h-3.5 w-3.5 shrink-0 mt-0.5" style={{ color: 'var(--color-warning, #d97706)' }} />
+            <span>
+              {duplicate
+                ? t('chat.createWorkspaceCard.duplicateExists', { duplicate })
+                : t('chat.createWorkspaceCard.duplicateUnknown')}
+            </span>
           </div>
         )}
       </div>

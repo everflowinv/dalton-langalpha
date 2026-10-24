@@ -408,6 +408,12 @@ export interface ActionRequest {
   order?: OrderProposal | null;
   /** credit_pause: the quota service's denial copy, relayed verbatim. */
   message?: string;
+  // DALTON-HOOK(workspace-duplicate-guard): create_workspace — the live
+  // workspace this create would duplicate, or the flag that says the check
+  // could not run.
+  duplicate_workspace_id?: string;
+  duplicate_workspace_name?: string;
+  duplicate_check_unavailable?: boolean;
 }
 
 export interface InterruptEvent extends BaseSSEEvent {

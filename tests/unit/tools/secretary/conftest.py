@@ -6,9 +6,12 @@ workspace manager and for the background dispatch POST.
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, create_autospec, patch
 
 import pytest
+
+from src.server.database.workspace import get_live_workspace_names
+from src.server.services.history.committed import committed_texts
 
 
 @pytest.fixture(autouse=True)
@@ -17,7 +20,19 @@ def _no_committed_texts():
     committed text to read unless a test patches one in."""
     with patch(
         "src.server.services.history.committed.committed_texts",
-        AsyncMock(return_value={}),
+        create_autospec(committed_texts, return_value={}),
+    ):
+        yield
+
+
+@pytest.fixture(autouse=True)
+def _no_live_workspaces():
+    # DALTON-HOOK(workspace-duplicate-guard): a create finds no duplicate
+    # unless a test names the workspaces the user already holds.
+    """No workspace exists to duplicate: every create starts from a clean list."""
+    with patch(
+        "src.server.database.workspace.get_live_workspace_names",
+        create_autospec(get_live_workspace_names, return_value=[]),
     ):
         yield
 

@@ -87,6 +87,8 @@ ALLOWED_HOOKS=(
   "hermetic-prebuilt-workflows"
   "market-data-fallback"
   "yfinance-cache"
+  "user-defaults"
+  "workspace-duplicate-guard"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

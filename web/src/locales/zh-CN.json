@@ -1975,7 +1975,9 @@
       "created": "已创建工作区：{{name}}",
       "declined": "已拒绝创建工作区",
       "alwaysApprove": "始终允许",
-      "alwaysApproveHint": "这次及以后创建工作区都不再询问，可在设置中关闭。"
+      "alwaysApproveHint": "这次及以后创建工作区都不再询问，可在设置中关闭。",
+      "duplicateExists": "已有相似的工作区：{{duplicate}}，可直接使用它，不必重复创建。",
+      "duplicateUnknown": "无法确认是否已有同名或同 ticker 的工作区。"
     }
   },
   "context": {
