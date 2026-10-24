@@ -90,4 +90,4 @@ python3 .agents/skills/dalton-thesis-delta/scripts/collect.py commit \
 
 > **强约束**：`seen.json` 只在 `commit` 成功时更新；若 `collect` 或中途分析失败，绝不能提前把未审阅的文档标为已见，确保下一轮自动重取。
 
-2. **议程验证项闭环**：检查 `agenda.md` 中已到期或本轮已获解答的验证项（`V-...`），在第 3 步同一次 `knowledge_append_verdict` 调用的 `agenda_ops` 参数中将其关闭（`close_validation`），并把新的待验证事项入列。
+2. **议程验证项闭环**：检查 `agenda.md` 中已到期或本轮已获解答的验证项（`V-...`），在第 3 步同一次 `knowledge_append_verdict` 调用的 `agenda_ops` 参数中将其关闭（`{"op":"set","path":"/next_validations/V-xxx/status","value":"done"}`），并把新的待验证事项入列。注意：verdict 的 `next_validation` 只写下一项要看什么，不会关闭任何验证项。

@@ -1017,11 +1017,11 @@ async def append_verdict(
     """Validate and record an event verdict, update agenda, and render ``verdicts.md`` (PK.4)."""
     await verify_workspace_access(workspace_id, user_id)
     v_copy = copy.deepcopy(verdict)
-    dropped_fields: list[str] = []
+    consumed_signal_fields: list[str] = []
     for extra_sig_key in ("trigger_signal", "trigger_signals", "signal_id", "signal_ids", "signal_key", "signals"):
         if extra_sig_key in v_copy:
             sig_val = v_copy.pop(extra_sig_key, None)
-            dropped_fields.append(extra_sig_key)
+            consumed_signal_fields.append(extra_sig_key)
             if extra_sig_key == "trigger_signal" and isinstance(sig_val, str) and sig_val.strip():
                 trig_obj = v_copy.get("trigger")
                 if isinstance(trig_obj, dict) and not trig_obj.get("ref"):
@@ -1035,13 +1035,13 @@ async def append_verdict(
     thesis_row = await db_knowledge.latest_valid_version(workspace_id, "thesis")
     thesis_doc = thesis_row["content"] if thesis_row else None
     val = validate_verdict(v_copy, thesis_doc=thesis_doc)
-    if dropped_fields:
+    if consumed_signal_fields:
         val.warnings.append(
             {
-                "code": "dropped_extra_fields",
+                "code": "signal_fields_consumed",
                 "path": "/",
-                "dropped_fields": dropped_fields,
-                "message": f"dropped non-schema verdict fields: {', '.join(dropped_fields)}",
+                "dropped_fields": consumed_signal_fields,
+                "message": f"这些字段已用于关闭信号，不存进结论: {', '.join(consumed_signal_fields)}",
             }
         )
     if not val.ok:
@@ -1104,10 +1104,8 @@ async def append_verdict(
             }
         ]
         agenda_content = agenda_row.get("content") or {}
-        # Mark matching validation as done if referenced
-        val_id = (v_copy.get("next_validation") or {}).get("validation_id") or (
-            v_copy.get("trigger") or {}
-        ).get("ref")
+        # Mark matching validation as done only when trigger.ref equals its validation id
+        val_id = (v_copy.get("trigger") or {}).get("ref")
         if val_id and any(
             isinstance(x, dict) and x.get("id") == val_id
             for x in (agenda_content.get("next_validations") or [])
