@@ -204,6 +204,12 @@ python3 .agents/skills/dalton-earnings-calendar/scripts/calendar_state.py --json
 **收尾关闭唤醒信号（`dalton_resolve_signals`）**：
 若本次刷新由 `<dalton_wake>` 信号唤醒（例如 `probe="calendar"`、`signal_key="weekly:<ISO 周>"` 如 `"weekly:2026-W43"`），在完成对账与总结后调用 `dalton_resolve_signals(signal_keys=["weekly:<ISO 周>"], probe="calendar", note="完成本周财报日历核查与议程同步")` 关闭自己 Home 工作区的日历唤醒信号，确认返回的 `resolved_count >= 1`。
 
+### 收尾门禁：汇报完成前必须过完成契约（`dalton_check_done`）
+
+- **推送稿两轮语言审查与原样回复**：按 `.agents/skills/dalton-conventions/SKILL.md` §8 将总结推送正文写入 Home 工作区下的 `research/push/<YYYY-MM-DD>-earnings-calendar.md` 并完成两轮 `check_language`，最后回复与该推送稿逐字相同。
+- 向 PM 汇报“完成”前，必须在 Home 调用 `dalton_check_done(workflow="dalton-earnings-calendar", params={"as_of": "<YYYY-MM-DD>"})`。
+- `done=false` 时按 `missing` 先补齐再查（推送稿缺失或语言审查缺轮次、第 2 轮哈希对不上就补跑 `check_language`）；补不了的缺项只能汇报“未完成”并列出缺项与原因，不得汇报“完成”。
+
 ---
 
 ## 自动任务 JSON 模板（遵守 PK.15）

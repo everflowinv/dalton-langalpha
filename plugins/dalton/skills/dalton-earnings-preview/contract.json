@@ -53,6 +53,9 @@
     },
     "language_review": {
       "draft": "drafts/{as_of}-preview-{quarter}.md"
+    },
+    "push_draft": {
+      "path": "research/push/{as_of}-earnings-preview-{quarter}.md"
     }
   }
 }

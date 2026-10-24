@@ -345,6 +345,26 @@
           },
           "description": "语言审查：终稿的 <draft>.language.json 存在且含第 1、2 轮记录，最后一条第 2 轮的 draft_sha256 与最后一次独立审稿通过时的哈希一致或与当前终稿一致；读不到、缺轮次或哈希对不上记 missing。契约同时声明 gated_draft 且其草稿不存在（门禁未过分支）时跳过本检查。"
         },
+        "push_draft": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path"
+          ],
+          "properties": {
+            "path": {
+              "type": "string",
+              "minLength": 1,
+              "description": "推送稿路径模板（只用契约 params_required 里的参数渲染）。"
+            },
+            "skip_when_no_change": {
+              "type": "boolean",
+              "default": false,
+              "description": "为 true 时，本轮 verdict 为 NO_CHANGE 且推送稿不存在（或不是本轮写的）就跳过本规则。"
+            }
+          },
+          "description": "推送稿审查：要求推送稿文件存在、修改时间不早于本轮运行开始时间，且完成两轮语言审查（最后一条第 2 轮 draft_sha256 等于当前文件哈希）。"
+        },
         "knowledge_docs_requires_param": {
           "type": "object",
           "additionalProperties": {

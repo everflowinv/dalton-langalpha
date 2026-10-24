@@ -57,5 +57,9 @@
       ]
     }
   ],
-  "closing": {}
+  "closing": {
+    "push_draft": {
+      "path": "research/push/{end}-director-weekly.md"
+    }
+  }
 }
