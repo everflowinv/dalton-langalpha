@@ -931,7 +931,6 @@ class FMPClient:
         sym_data, name_data = await asyncio.gather(
             sym_task, name_task, return_exceptions=True
         )
-
         merged: Dict[str, Dict] = {}
         for data in (sym_data, name_data):
             if isinstance(data, Exception) or not isinstance(data, list):
@@ -940,6 +939,19 @@ class FMPClient:
                 sym = row.get("symbol")
                 if sym and sym not in merged:
                     merged[sym] = row
+
+        # DALTON-HOOK(market-data-fallback): an empty merge when either half
+        # hit a fallback-worthy FMP failure (or both halves failed) is not
+        # "no match"; raise it so a caller falls back instead of caching [].
+        if not merged:
+            from src.dalton.market_data_fallback import fmp_cannot_answer
+
+            for data in (sym_data, name_data):
+                if isinstance(data, Exception) and fmp_cannot_answer(data):
+                    raise data
+            if isinstance(sym_data, Exception) and isinstance(name_data, Exception):
+                raise sym_data
+
         return list(merged.values())[:limit]
 
     # =====================================================================

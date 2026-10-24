@@ -427,6 +427,13 @@ async def get_financial_data_provider() -> FinancialDataProvider:
             logger.debug(
                 "financial_data.source.registered | name=fmp (FinancialDataSource)"
             )
+            # DALTON-HOOK(market-data-fallback): FMP stays primary; a quota,
+            # plan, auth, outage or timeout failure is answered by yfinance.
+            if _yfinance_available():
+                from src.dalton.market_data_fallback import FallbackFinancialSource
+                from .yfinance.financial_source import YFinanceFinancialSource
+
+                financial = FallbackFinancialSource(financial, YFinanceFinancialSource())
         elif _yfinance_available():
             from .yfinance.financial_source import YFinanceFinancialSource
 
