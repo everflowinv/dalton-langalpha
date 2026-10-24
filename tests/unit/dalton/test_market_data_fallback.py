@@ -1,19 +1,52 @@
-"""FMP stays primary; yfinance answers only when FMP cannot."""
+"""yfinance answers first; FMP backs it up and alone serves the rest.
+
+Quota-marker mechanics (write on 429 / "Limit Reach", read in
+``FMPClient._make_request``) live in ``tests/unit/data_client/test_fmp_client.py``.
+"""
 
 from __future__ import annotations
 
 import inspect
+from datetime import datetime, timezone
+from typing import Any
 from unittest.mock import create_autospec, patch
 
 import pytest
 
-from src.dalton.market_data_fallback import FallbackFinancialSource, fmp_cannot_answer
+from src.dalton import market_data_fallback as mdf
+from src.dalton.market_data_fallback import (
+    FallbackFinancialSource,
+    fmp_cannot_answer,
+)
 from src.data_client.base import FinancialDataSource
 from src.data_client.fmp.financial_source import FMPFinancialSource
-from src.data_client.fmp.fmp_client import FMPRequestError
+from src.data_client.fmp.fmp_client import FMPRequestError, FmpQuotaExhausted
 from src.data_client.yfinance.financial_source import YFinanceFinancialSource
 
 YF_ROW = [{"symbol": "AAPL", "name": "Apple Inc."}]
+# A quote method's answer must carry a usable price (see _answered).
+YF_QUOTE_ROW = [{"symbol": "AAPL", "name": "Apple Inc.", "price": 189.5}]
+FMP_ROW = [{"symbol": "AAPL", "price": 190.0}]
+
+# 2026-10-24 19:00 UTC = 15:00 US/Eastern (EDT) that day: FMP's documented reset.
+RESET = datetime(2026, 10, 24, 19, 0, tzinfo=timezone.utc)
+
+# (method, args) for every yfinance-first protocol method. autospec enforces
+# signatures, so each call shape has to be a legal one.
+YF_METHOD_CALLS = [
+    ("get_company_profile", ("AAPL",)),
+    ("get_realtime_quote", ("AAPL",)),
+    ("get_income_statements", ("AAPL",)),
+    ("get_cash_flows", ("AAPL",)),
+    ("get_key_metrics", ("AAPL",)),
+    ("get_financial_ratios", ("AAPL",)),
+    ("get_price_performance", ("AAPL",)),
+    ("get_analyst_price_targets", ("AAPL",)),
+    ("get_analyst_ratings", ("AAPL",)),
+    ("get_earnings_history", ("AAPL",)),
+    ("screen_stocks", ()),
+    ("search_stocks", ("apple",)),
+]
 
 
 def _sources():
@@ -22,35 +55,188 @@ def _sources():
     return fmp, yf, FallbackFinancialSource(fmp, yf)
 
 
-@pytest.mark.parametrize("status", [401, 402, 403, 429, 500, 503, None])
+def _call(method: str, args: tuple, source: FallbackFinancialSource) -> Any:
+    kwargs = {"marketCapMoreThan": 1e12} if method == "screen_stocks" else {}
+    return getattr(source, method)(*args, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Per-method primary/secondary
+# ---------------------------------------------------------------------------
+
+
+def test_the_call_table_covers_every_yfinance_first_method():
+    assert {m for m, _ in YF_METHOD_CALLS} == mdf._YFINANCE_FIRST
+
+
+@pytest.mark.parametrize("method,args", YF_METHOD_CALLS)
 @pytest.mark.asyncio
-async def test_a_failure_fmp_cannot_answer_goes_to_yfinance(status):
+async def test_every_yfinance_method_answers_yfinance_first(method, args):
     fmp, yf, source = _sources()
-    fmp.search_stocks.side_effect = FMPRequestError("nope", status_code=status)
+    row = YF_QUOTE_ROW if method in mdf._QUOTE_METHODS else YF_ROW
+    getattr(yf, method).return_value = row
+
+    assert await _call(method, args, source) == row
+    getattr(fmp, method).assert_not_awaited()
+    getattr(yf, method).assert_awaited_once()
+
+
+@pytest.mark.parametrize("method,args", YF_METHOD_CALLS)
+@pytest.mark.asyncio
+async def test_a_yfinance_failure_falls_back_to_fmp(method, args):
+    fmp, yf, source = _sources()
+    getattr(yf, method).side_effect = ValueError("yahoo down")
+    getattr(fmp, method).return_value = FMP_ROW
+
+    assert await _call(method, args, source) == FMP_ROW
+    getattr(fmp, method).assert_awaited_once()
+
+
+@pytest.mark.parametrize("method,args", YF_METHOD_CALLS)
+@pytest.mark.asyncio
+async def test_an_empty_yfinance_answer_falls_back_to_fmp(method, args):
+    fmp, yf, source = _sources()
+    getattr(yf, method).return_value = []
+    getattr(fmp, method).return_value = FMP_ROW
+
+    assert await _call(method, args, source) == FMP_ROW
+    getattr(fmp, method).assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_fmp_empty_or_failed_returns_yfinances_original_empty_result():
+    fmp, yf, source = _sources()
+    yf.get_realtime_quote.return_value = []
+    fmp.get_realtime_quote.return_value = []
+    assert await source.get_realtime_quote("AAPL") == []
+
+    fmp.get_realtime_quote.side_effect = FMPRequestError("upstream down")
+    assert await source.get_realtime_quote("AAPL") == []
+
+
+@pytest.mark.asyncio
+async def test_fmp_quota_marker_returns_the_empty_yfinance_result():
+    fmp, yf, source = _sources()
+    yf.get_realtime_quote.return_value = []
+    fmp.get_realtime_quote.side_effect = FmpQuotaExhausted(RESET)
+
+    assert await source.get_realtime_quote("AAPL") == []
+
+
+@pytest.mark.asyncio
+async def test_fmp_quota_marker_surfaces_the_yfinance_failure():
+    fmp, yf, source = _sources()
+    yf.search_stocks.side_effect = ValueError("yahoo down")
+    fmp.search_stocks.side_effect = FmpQuotaExhausted(RESET)
+
+    with pytest.raises(ValueError, match="yahoo down"):
+        await source.search_stocks("apple", limit=5)
+
+
+@pytest.mark.parametrize("price", [None, 0, -1])
+@pytest.mark.asyncio
+async def test_a_zero_priced_quote_row_counts_as_empty(price):
+    fmp, yf, source = _sources()
+    yf.get_realtime_quote.return_value = [{"symbol": "AAPL", "price": price}]
+    fmp.get_realtime_quote.return_value = FMP_ROW
+
+    assert await source.get_realtime_quote("AAPL") == FMP_ROW
+    fmp.get_realtime_quote.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_quote_row_without_a_price_key_is_not_an_answer():
+    fmp, yf, source = _sources()
+    yf.get_realtime_quote.return_value = [{"symbol": "AAPL"}]
+    fmp.get_realtime_quote.return_value = FMP_ROW
+
+    assert await source.get_realtime_quote("AAPL") == FMP_ROW
+    fmp.get_realtime_quote.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_profile_with_a_name_stands_even_with_price_none():
+    fmp, yf, source = _sources()
+    row = [{"symbol": "AAPL", "companyName": "Apple Inc.", "price": None}]
+    yf.get_company_profile.return_value = row
+
+    assert await source.get_company_profile("AAPL") == row
+    fmp.get_company_profile.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_screener_row_with_an_empty_price_is_an_answer():
+    fmp, yf, source = _sources()
+    row = [{"symbol": "AAPL", "price": None}]
+    yf.screen_stocks.return_value = row
+
+    assert await source.screen_stocks(marketCapMoreThan=1e12) == row
+    fmp.screen_stocks.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_single_row_without_a_price_key_is_an_answer():
+    fmp, yf, source = _sources()
     yf.search_stocks.return_value = YF_ROW
 
     assert await source.search_stocks("apple", limit=5) == YF_ROW
-    yf.search_stocks.assert_awaited_once_with("apple", limit=5)
-
-
-@pytest.mark.parametrize("status", [400, 404])
-@pytest.mark.asyncio
-async def test_a_bad_request_stays_fmps_error(status):
-    fmp, yf, source = _sources()
-    fmp.get_company_profile.side_effect = FMPRequestError("bad", status_code=status)
-
-    with pytest.raises(FMPRequestError):
-        await source.get_company_profile("AAPL")
-    yf.get_company_profile.assert_not_awaited()
+    fmp.search_stocks.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_a_healthy_fmp_answers_even_when_empty():
-    fmp, yf, source = _sources()
-    fmp.get_realtime_quote.return_value = []
+async def test_real_yfinance_empty_profile_falls_back_to_fmp(monkeypatch):
+    """The real adapter's [] on an empty Yahoo info reaches FMP."""
+    import yfinance as yf_mod
 
-    assert await source.get_realtime_quote("ZZZZ") == []
-    yf.get_realtime_quote.assert_not_awaited()
+    import src.data_client.yfinance.financial_source as yf_fin
+
+    ticker = create_autospec(yf_mod.Ticker, instance=True)
+    ticker.info = {}  # _get_profile returns [] the moment info is empty
+    monkeypatch.setattr(
+        yf_fin,
+        "yahoo_ticker",
+        create_autospec(yf_fin.yahoo_ticker, return_value=ticker),
+    )
+
+    fmp = create_autospec(FMPFinancialSource, instance=True)
+    fmp.get_company_profile.return_value = FMP_ROW
+    source = FallbackFinancialSource(fmp, YFinanceFinancialSource())
+
+    assert await source.get_company_profile("AAPL") == FMP_ROW
+    fmp.get_company_profile.assert_awaited_once_with("AAPL")
+
+
+@pytest.mark.asyncio
+async def test_revenue_segments_go_straight_to_fmp():
+    fmp, yf, source = _sources()
+    fmp.get_revenue_by_segment.return_value = FMP_ROW
+
+    assert await source.get_revenue_by_segment("AAPL") == FMP_ROW
+    yf.get_revenue_by_segment.assert_not_awaited()
+    fmp.get_revenue_by_segment.assert_awaited_once_with("AAPL")
+
+
+@pytest.mark.asyncio
+async def test_sector_performance_with_target_date_stays_fmp():
+    fmp, yf, source = _sources()
+    fmp.get_sector_performance.return_value = FMP_ROW
+
+    assert await source.get_sector_performance(target_date="2025-01-15") == FMP_ROW
+    fmp.get_sector_performance.assert_awaited_once_with(target_date="2025-01-15")
+    yf.get_sector_performance.assert_not_awaited()
+
+    with pytest.raises(ValueError, match="2025-01-15"):
+        await YFinanceFinancialSource().get_sector_performance(target_date="2025-01-15")
+
+
+@pytest.mark.asyncio
+async def test_sector_performance_without_target_date_is_yfinance_first():
+    fmp, yf, source = _sources()
+    yf.get_sector_performance.return_value = YF_ROW
+
+    assert await source.get_sector_performance() == YF_ROW
+    fmp.get_sector_performance.assert_not_awaited()
+    yf.get_sector_performance.assert_awaited_once_with(target_date=None)
 
 
 def test_only_fmp_errors_count_as_unavailable():
@@ -58,7 +244,7 @@ def test_only_fmp_errors_count_as_unavailable():
     assert fmp_cannot_answer(FMPRequestError("timed out"))
 
 
-def test_every_protocol_method_falls_back():
+def test_every_protocol_method_is_routed():
     methods = {
         name
         for name, member in inspect.getmembers(FinancialDataSource)
@@ -67,26 +253,38 @@ def test_every_protocol_method_falls_back():
     assert methods <= set(vars(FallbackFinancialSource))
 
 
+# ---------------------------------------------------------------------------
+# Registry wiring and endpoint behaviour
+# ---------------------------------------------------------------------------
+
+
 @pytest.mark.asyncio
-async def test_the_registry_puts_yfinance_behind_fmp():
+async def test_the_registry_builds_yfinance_first_behind_fmp():
     import src.data_client.registry as registry
 
     registry._financial_data_provider = None
     try:
         with (
-            patch.object(registry, "_fmp_available", return_value=True),
-            patch.object(registry, "_yfinance_available", return_value=True),
-            patch.object(registry, "_ginlix_data_available", return_value=False),
+            patch.object(registry, "_fmp_available", return_value=True, autospec=True),
+            patch.object(
+                registry, "_yfinance_available", return_value=True, autospec=True
+            ),
+            patch.object(
+                registry, "_ginlix_data_available", return_value=False, autospec=True
+            ),
             patch("src.data_client.fmp.get_fmp_client", autospec=True),
         ):
             provider = await registry.get_financial_data_provider()
-        assert isinstance(provider.financial, FallbackFinancialSource)
+        source = provider.financial
+        assert isinstance(source, FallbackFinancialSource)
+        assert isinstance(source._yfinance, YFinanceFinancialSource)
+        assert isinstance(source._fmp, FMPFinancialSource)
     finally:
         registry._financial_data_provider = None
 
 
 @pytest.mark.asyncio
-async def test_search_endpoint_errors_without_caching_when_fmp_429_and_yfinance_fails(
+async def test_search_endpoint_errors_without_caching_when_yfinance_and_fmp_fail(
     monkeypatch,
 ):
     import httpx
@@ -128,6 +326,8 @@ async def test_search_endpoint_errors_without_caching_when_fmp_429_and_yfinance_
         )
 
     assert exc_info.value.status_code == 500
+    # No search result is cached as "no match" (the autospec FMP source
+    # bypasses FMPClient, so no quota marker is written here either).
     cache.set.assert_not_awaited()
 
     empty_resp = httpx.Response(200, json={"quotes": []})
@@ -136,7 +336,7 @@ async def test_search_endpoint_errors_without_caching_when_fmp_429_and_yfinance_
 
 
 @pytest.mark.asyncio
-async def test_fmp_search_falls_back_when_symbol_is_empty_and_name_is_429(monkeypatch):
+async def test_fmp_search_raises_when_symbol_is_empty_and_name_is_429(monkeypatch):
     from src.data_client.fmp.fmp_client import FMPClient
 
     client = FMPClient(api_key="test")
@@ -151,11 +351,11 @@ async def test_fmp_search_falls_back_when_symbol_is_empty_and_name_is_429(monkey
     monkeypatch.setattr(client, "_make_request", make_request)
 
     yf = create_autospec(YFinanceFinancialSource, instance=True)
-    yf.search_stocks.return_value = YF_ROW
+    yf.search_stocks.side_effect = ValueError("yahoo down")
     source = FallbackFinancialSource(FMPFinancialSource(client), yf)
 
-    assert await source.search_stocks("apple", limit=5) == YF_ROW
-    yf.search_stocks.assert_awaited_once_with("apple", limit=5)
+    with pytest.raises(FMPRequestError):
+        await source.search_stocks("apple", limit=5)
 
 
 @pytest.mark.asyncio
@@ -175,10 +375,10 @@ async def test_fmp_search_keeps_symbol_rows_when_name_is_429(monkeypatch):
     monkeypatch.setattr(client, "_make_request", make_request)
 
     yf = create_autospec(YFinanceFinancialSource, instance=True)
+    yf.search_stocks.side_effect = ValueError("yahoo down")
     source = FallbackFinancialSource(FMPFinancialSource(client), yf)
 
     assert await source.search_stocks("AAPL", limit=5) == sym_rows
-    yf.search_stocks.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -212,27 +412,3 @@ async def test_yfinance_analyst_price_targets_maps_consensus_to_mean(monkeypatch
             "targetConsensus": 215.5,
         }
     ]
-
-
-@pytest.mark.asyncio
-async def test_sector_performance_with_target_date_does_not_fall_back():
-    fmp, yf, source = _sources()
-    fmp.get_sector_performance.side_effect = FMPRequestError("plan", status_code=402)
-
-    with pytest.raises(FMPRequestError):
-        await source.get_sector_performance(target_date="2025-01-15")
-    yf.get_sector_performance.assert_not_awaited()
-
-    with pytest.raises(ValueError, match="2025-01-15"):
-        await YFinanceFinancialSource().get_sector_performance(target_date="2025-01-15")
-
-
-@pytest.mark.asyncio
-async def test_sector_performance_without_target_date_falls_back_to_yfinance():
-    fmp, yf, source = _sources()
-    sector_rows = [{"sector": "Technology", "changePctStr": "+1.20%"}]
-    fmp.get_sector_performance.side_effect = FMPRequestError("quota", status_code=429)
-    yf.get_sector_performance.return_value = sector_rows
-
-    assert await source.get_sector_performance() == sector_rows
-    yf.get_sector_performance.assert_awaited_once_with(target_date=None)

@@ -1,8 +1,10 @@
 """FinancialDataSource implementation backed by yfinance.
 
-Free fallback provider — used when FMP is unavailable. Some protocol
-methods that have no yfinance equivalent return empty results; callers
-already handle this gracefully.
+Free provider — asked first for every method it implements (the composite in
+``src/dalton/market_data_fallback.py`` holds FMP as its backup), and the only
+financial source when FMP is unavailable. Some protocol methods that have no
+yfinance equivalent return empty results or refuse the call; callers already
+handle this gracefully.
 """
 
 from __future__ import annotations

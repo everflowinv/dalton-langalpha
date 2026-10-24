@@ -1,0 +1,24 @@
+# DALTON MARKET-DATA CHAIN OVERLAY (APP_ENV=dalton)
+# Applied over config.yaml when APP_ENV=dalton (src/ptc_agent/config/file_utils.py:
+# lists replace outright, so this is the complete market_data.providers table).
+# User decision 2026-10-24: free yfinance answers ahead of FMP wherever both can
+# serve, so FMP's ~250 calls/day free quota survives for what only FMP has.
+# Everything except the yfinance/fmp ordering matches upstream config.yaml.
+market_data:
+  providers:
+    - name: ginlix-data
+      markets: [us]          # US equities only
+    - name: tushare
+      markets: [cn]          # A-share daily bars (qfq-adjusted), served by ginlix-data
+      intraday_markets: []   # ginlix-data's minute history is short, so intraday
+                             # stays on the fallbacks; the probe ruleset
+                             # (data_routing.yaml) can override this
+      snapshot_markets: [cn] # realtime A-share quotes (equities; indices/ETFs
+                             # fall through)
+    - name: yfinance
+      markets: []                 # priority slot: non-US intraday only —
+      intraday_markets: [non-us]  # native session anchors incl. lunch gaps
+    - name: yfinance
+      markets: [all]         # Free fallback — no API key, ahead of FMP
+    - name: fmp
+      markets: [all]         # FMP — global coverage, catch-all fallback

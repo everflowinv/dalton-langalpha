@@ -13,6 +13,7 @@ tests/fixtures/dalton/
 tests/unit/mcp_servers/fixtures/dalton_sec/
 tests/unit/mcp_servers/test_dalton_sec_periods.py
 agent_config.dalton.yaml
+config.dalton.yaml
 docker-compose.dalton.yml
 src/ptc_agent/agent/middleware/skills/dalton_registry.py
 web/src/pages/Settings/panels/dalton/
