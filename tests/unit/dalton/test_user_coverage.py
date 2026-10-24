@@ -1971,6 +1971,7 @@ async def test_quarterly_refresh_failure_reports_summary_and_keeps_last_resolved
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Round 5 Item 3: when quarterly refresh fails, refresh_due_coverage_groups_for_preflight appends failure notice to summary_lines, returns failed_groups, and leaves last_resolved_at untouched so next run retries."""
+    monkeypatch.delenv("FMP_API_KEY", raising=False)
     store = _InMemoryCoverageStore()
     _wire_coverage_store(monkeypatch, store)
     monkeypatch.setattr(
