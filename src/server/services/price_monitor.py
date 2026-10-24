@@ -268,12 +268,14 @@ class ConditionEvaluator:
             markets = symbol_markets or {}
             index_syms = [s for s in symbols if markets.get(s) == MarketType.INDEX]
             stock_syms = [s for s in symbols if markets.get(s) != MarketType.INDEX]
+            from src.dalton.autonomy.price_trigger import refresh_dalton_reference_if_needed  # DALTON-HOOK(stock-move-upgrade)
             for sym, snap in await _fetch_snapshots(provider, stock_syms, index_syms):
                 self.set_reference(
                     sym,
                     previous_close=snap.get("previous_close"),
                     day_open=snap.get("open"),
                 )
+                refresh_dalton_reference_if_needed(self, sym, snap, markets.get(sym), _now_utc())  # DALTON-HOOK(stock-move-upgrade)
         except Exception:
             logger.warning("Failed to refresh reference prices", exc_info=True)
 
@@ -300,6 +302,8 @@ class PriceMonitorService:
         self._index_handle = None
 
         self._evaluator = ConditionEvaluator()
+        self._evaluator._service = self  # DALTON-HOOK(stock-move-upgrade)
+        self._dalton_move_refs: Dict[str, Dict[str, Any]] = {}  # DALTON-HOOK(stock-move-upgrade)
 
         # bare symbol → [automation dicts]  (keyed by user-entered symbol)
         self._symbol_automations: Dict[str, List[Dict[str, Any]]] = {}
@@ -422,6 +426,10 @@ class PriceMonitorService:
                 return
 
         symbol = config.symbol.upper()
+        from src.dalton.autonomy.price_trigger import is_dalton_price_move_automation, evaluate_and_trigger_dalton_move  # DALTON-HOOK(stock-move-upgrade)
+        if is_dalton_price_move_automation(automation):  # DALTON-HOOK(stock-move-upgrade)
+            await evaluate_and_trigger_dalton_move(self, automation, config, current_price, _now_utc())  # DALTON-HOOK(stock-move-upgrade)
+            return  # DALTON-HOOK(stock-move-upgrade)
 
         # All conditions must be met (AND logic)
         for condition in config.conditions:
@@ -620,15 +628,14 @@ class PriceMonitorService:
         old_bare = set(self._symbol_automations.keys())
         new_bare = set(new_symbol_map.keys())
         added_bare = new_bare - old_bare
+        self._symbol_automations = new_symbol_map  # DALTON-HOOK(stock-move-upgrade)
+        self._symbol_markets = new_symbol_markets
+        self._stock_ws_symbols = new_stock_ws
+        self._index_ws_symbols = new_index_ws
         if added_bare:
             await self._evaluator.refresh_references(
                 list(added_bare), symbol_markets=new_symbol_markets
             )
-
-        self._symbol_automations = new_symbol_map
-        self._symbol_markets = new_symbol_markets
-        self._stock_ws_symbols = new_stock_ws
-        self._index_ws_symbols = new_index_ws
 
         total_added = len(stock_added) + len(index_added)
         total_removed = len(stock_removed) + len(index_removed)
@@ -680,6 +687,9 @@ class PriceMonitorService:
             if _is_us_symbol(bare, market):
                 if not (poll_index if market == MarketType.INDEX else poll_stock):
                     continue
+                from src.dalton.autonomy.price_trigger import should_poll_us_symbol  # DALTON-HOOK(stock-move-upgrade)
+                if not should_poll_us_symbol(bare, market, self._symbol_automations.get(bare, ()), now):  # DALTON-HOOK(stock-move-upgrade)
+                    continue  # DALTON-HOOK(stock-move-upgrade)
             else:
                 day_start = _session_day_start_ms(bare, market, now)
                 if day_start is None:
@@ -693,6 +703,10 @@ class PriceMonitorService:
 
         provider = await get_market_data_provider()
         for bare_symbol, snapshot in await _fetch_snapshots(provider, stock_syms, index_syms):
+            from src.dalton.autonomy.price_trigger import process_polled_snapshot  # DALTON-HOOK(stock-move-upgrade)
+            normal_automations = await process_polled_snapshot(self, bare_symbol, snapshot, now)  # DALTON-HOOK(stock-move-upgrade)
+            if normal_automations is None:  # DALTON-HOOK(stock-move-upgrade)
+                continue  # DALTON-HOOK(stock-move-upgrade)
             current_price = _positive(snapshot.get("price"))
             if current_price is None:
                 continue
@@ -714,7 +728,7 @@ class PriceMonitorService:
                     day_open=snapshot.get("open"),
                 )
 
-            for automation in self._symbol_automations.get(bare_symbol, []):
+            for automation in normal_automations:  # DALTON-HOOK(stock-move-upgrade)
                 try:
                     await self._evaluate_and_trigger(automation, current_price)
                 except Exception:
