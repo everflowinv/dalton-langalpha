@@ -29,6 +29,21 @@ from src.dalton.app import dalton_router
 from src.dalton.tools.director_tools import build_director_tools
 from src.server.utils.api import get_current_user_id
 
+
+
+@pytest.fixture(autouse=True)
+def _empty_coverage_roster(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Tier lookups read the per-user coverage roster; these tests' fake
+    connections are not a coverage store, so every ticker resolves as not on
+    the roster (watch) unless a test patches its own tiers."""
+    from src.dalton.coverage import get_user_tier as real_get_user_tier
+
+    monkeypatch.setattr(
+        tracking_mod,
+        "get_user_tier",
+        create_autospec(real_get_user_tier, return_value=None),
+    )
+
 USER_ID = "local-dev-user"
 WS_NVDA = "11111111-1111-1111-1111-111111111111"
 WS_HOME = "99999999-9999-9999-9999-999999999999"
