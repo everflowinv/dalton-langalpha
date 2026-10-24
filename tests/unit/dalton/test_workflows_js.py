@@ -26,6 +26,8 @@ from ptc_agent.agent.middleware.background_subagent.workflow.engine import (
     run_workflow_script,
 )
 
+pytestmark = pytest.mark.xdist_group("serial")
+
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
 OUT = {"files": ["research/2026-10-23-ic/industry.md"], "summary": "done", "sha256": "a" * 64}

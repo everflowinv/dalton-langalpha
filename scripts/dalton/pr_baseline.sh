@@ -85,8 +85,8 @@ else
   mkdir -p "$(dirname "$OUTPUT_FILE")"
 fi
 
-BODY_SECTIONS_FILE="$(mktemp "/tmp/pr_baseline_sections_${HEAD_SHORT}_XXXXXX.md")"
-trap 'rm -f "$BODY_SECTIONS_FILE"; git checkout -- README.md 2>/dev/null || true' EXIT
+BODY_SECTIONS_FILE="$(mktemp "/tmp/pr_baseline_sections_${HEAD_SHORT}_XXXXXX")"
+trap 'rm -f "$BODY_SECTIONS_FILE" "${CURRENT_TMP_OUT:-}"; git checkout -- README.md 2>/dev/null || true' EXIT; trap 'exit 130' INT; trap 'exit 143' TERM
 
 OVERALL_FAILURES=0
 FAILED_TITLES=()
@@ -112,7 +112,7 @@ run_and_record() {
 
   cmd_start_utc="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
   cmd_head="$(git rev-parse HEAD)"
-  tmp_out="$(mktemp)"
+  tmp_out="$(mktemp)"; CURRENT_TMP_OUT="$tmp_out"
 
   echo "[pr_baseline] Running ($STEP_INDEX): $title" >&2
   set +e
@@ -188,7 +188,7 @@ run_and_record \
 
 run_and_record \
   "Baseline 2/4: Python Unit Tests" \
-  "uv run pytest tests/unit/dalton tests/unit/llms tests/unit/middleware/skills tests/unit/mcp_servers -q"
+  "uv run --with pytest-xdist pytest tests/unit/dalton tests/unit/llms tests/unit/middleware/skills tests/unit/mcp_servers -q -n ${DALTON_BASELINE_WORKERS:-4} --dist loadgroup --durations=25"
 
 run_and_record \
   "Baseline 3/4: OpenClaw Broker Node Tests" \
@@ -240,7 +240,7 @@ fi
 if [[ -n "$PR_NUMBER" ]]; then
   run_and_record \
     "PR Description Claim Check (check_report_claims.py --strict on PR #${PR_NUMBER})" \
-    "tmp_pr_md=\$(mktemp /tmp/pr_${PR_NUMBER}_body_XXXXXX.md) && trap 'rm -f \"\$tmp_pr_md\"' EXIT && gh pr view ${PR_NUMBER} --json body --jq .body > \"\$tmp_pr_md\" && uv run python scripts/dalton/check_report_claims.py --strict \"\$tmp_pr_md\""
+    "tmp_pr_md=\$(mktemp /tmp/pr_${PR_NUMBER}_body_XXXXXX) && trap 'rm -f \"\$tmp_pr_md\"' EXIT && gh pr view ${PR_NUMBER} --json body --jq .body > \"\$tmp_pr_md\" && uv run python scripts/dalton/check_report_claims.py --strict \"\$tmp_pr_md\""
 fi
 
 SUITE_END_UTC="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
