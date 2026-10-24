@@ -4945,6 +4945,7 @@ async def test_committed_segment_raw_events_released_via_weakref_and_optional_tr
        sites (`file:line` and size) every 20 segments.
     """
     import gc
+    import tracemalloc
     import weakref
 
     class _TrackableEvent(dict):  # type: ignore[type-arg]
@@ -5034,42 +5035,45 @@ async def test_committed_segment_raw_events_released_via_weakref_and_optional_tr
     monkeypatch.setenv("DALTON_ARCHIVE_MEM_TRACE", "1")
     monkeypatch.setattr(archive_cli, "MEM_TRACE_SEGMENT_INTERVAL", 2)
 
-    batch_task = asyncio.create_task(
-        archive_cli.process_weekly_batch(
-            batch_events,
-            mode="backfill",
-            window_start=date(2026, 10, 20),
-            window_end=date(2026, 10, 20),
-            limiter=archive_cli.HourlyTokenBudgetLimiter(1_500_000),
-            extractor_model="gemini-4-argon-medium-oauth",
-            prompt_version="conv_card_v1",
-            concurrency=2,
-            extract_fn=create_autospec(
-                extractor_mod.extract_segment_cards,
-                side_effect=_extract_gc,
-            ),
+    try:
+        batch_task = asyncio.create_task(
+            archive_cli.process_weekly_batch(
+                batch_events,
+                mode="backfill",
+                window_start=date(2026, 10, 20),
+                window_end=date(2026, 10, 20),
+                limiter=archive_cli.HourlyTokenBudgetLimiter(1_500_000),
+                extractor_model="gemini-4-argon-medium-oauth",
+                prompt_version="conv_card_v1",
+                concurrency=2,
+                extract_fn=create_autospec(
+                    extractor_mod.extract_segment_cards,
+                    side_effect=_extract_gc,
+                ),
+            )
         )
-    )
 
-    await asyncio.wait_for(seg0_committed.wait(), timeout=2.0)
-    for _ in range(5):
-        await asyncio.sleep(0)
+        await asyncio.wait_for(seg0_committed.wait(), timeout=2.0)
+        for _ in range(5):
+            await asyncio.sleep(0)
 
-    # `batch_events` was cleared right after segmentation, and `ev-gc-0` was released on prefix commit
-    # while `ev-gc-1` is still in flight!
-    assert batch_events == []
-    gc.collect()
-    assert ref_ev0() is None
-    assert ref_ev1() is not None
+        # `batch_events` was cleared right after segmentation, and `ev-gc-0` was released on prefix commit
+        # while `ev-gc-1` is still in flight!
+        assert batch_events == []
+        gc.collect()
+        assert ref_ev0() is None
+        assert ref_ev1() is not None
 
-    release_seg1.set()
-    await asyncio.wait_for(batch_task, timeout=2.0)
-    gc.collect()
-    assert ref_ev1() is None
+        release_seg1.set()
+        await asyncio.wait_for(batch_task, timeout=2.0)
+        gc.collect()
+        assert ref_ev1() is None
 
-    stderr_out = capsys.readouterr().err
-    assert "[MEM_TRACE segments=2" in stderr_out
-    assert "size=" in stderr_out
+        stderr_out = capsys.readouterr().err
+        assert "[MEM_TRACE segments=2" in stderr_out
+        assert "size=" in stderr_out
+    finally:
+        tracemalloc.stop()
 
 
 @pytest.mark.asyncio

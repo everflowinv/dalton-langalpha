@@ -989,7 +989,7 @@ async def test_glm_coding_models_overlay_provider_and_httpx_mock_transport(
     from langchain_anthropic import ChatAnthropic
     from src.llms.llm import create_llm
 
-    LLM._model_config = None
+    monkeypatch.setattr(LLM, "_model_config", None)
     mc = ModelConfig()
     dalton_meta = load_dalton_meta()
 
@@ -1162,7 +1162,7 @@ async def test_glm_coding_plan_only_accepts_own_key(
         resolve_model_client,
     )
 
-    LLM._model_config = None
+    monkeypatch.setattr(LLM, "_model_config", None)
     mc = LLM.get_model_config()
 
     # Candidate walk for coding_plan variant is strictly isolated to its own slug
