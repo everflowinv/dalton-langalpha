@@ -404,7 +404,15 @@ class _InMemoryCoverageStore:
         return dict(row)
 
 
+@pytest.fixture(autouse=True)
+def _reset_extractor_alias_cache() -> Any:
+    extractor_mod.invalidate_ticker_company_aliases_cache()
+    yield
+    extractor_mod.invalidate_ticker_company_aliases_cache()
+
+
 def _wire_coverage_store(monkeypatch: pytest.MonkeyPatch, store: _InMemoryCoverageStore) -> AsyncConnectionPool:
+    extractor_mod.invalidate_ticker_company_aliases_cache()
     fake_tx = create_autospec(AsyncTransaction, instance=True)
     fake_tx.__aenter__.return_value = fake_tx
     fake_tx.__aexit__.return_value = False
@@ -2116,6 +2124,165 @@ async def test_quarterly_refresh_failure_reports_summary_and_keeps_last_resolved
     assert len(retry_out["refreshed_groups"]) == 1
     assert retry_out["added_tickers"] == ["AMD"]
     assert store.groups[(USER_ALICE, gid)]["last_resolved_at"] == now_t2
+
+
+@pytest.mark.asyncio
+async def test_extractor_derived_alias_caches_ttl_refresh_and_user_isolation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Derived caches (`cn_strip_aliases` and `entity_alias_groups`) live on the same `(user_id, time_bucket)`
+    cache entry as `alias_map`, refresh together on TTL expiry, and never cross-contaminate between users.
+    """
+    store = _InMemoryCoverageStore()
+    _wire_coverage_store(monkeypatch, store)
+
+    clock = {"now": 1200.0}
+    monkeypatch.setattr(
+        extractor_mod.time,
+        "monotonic",
+        create_autospec(extractor_mod.time.monotonic, side_effect=lambda: clock["now"]),
+    )
+
+    await store.upsert_coverage_rows(
+        USER_ALICE,
+        [
+            company_to_row(
+                {
+                    "ticker": "ALFA",
+                    "name": "Alfa 66 Tech",
+                    "tier": "core",
+                    "market": "US",
+                    "aliases": {"search_names": ["阿尔法66科技", "Alfa66Tech"]},
+                },
+                user_id=USER_ALICE,
+                source="chat",
+            )
+        ],
+    )
+    await store.upsert_coverage_rows(
+        USER_BOB,
+        [
+            company_to_row(
+                {
+                    "ticker": "BETA",
+                    "name": "Beta 88 Group",
+                    "tier": "watch",
+                    "market": "US",
+                    "aliases": {"search_names": ["贝塔88集团", "Beta88Group"]},
+                },
+                user_id=USER_BOB,
+                source="chat",
+            )
+        ],
+    )
+
+    # 1) Two users with different aliases never cross-contaminate derived results
+    alice_strip = extractor_mod._chinese_company_aliases_for_stripping(USER_ALICE)
+    bob_strip = extractor_mod._chinese_company_aliases_for_stripping(USER_BOB)
+    assert "阿尔法66科技" in alice_strip and "贝塔88集团" not in alice_strip
+    assert "贝塔88集团" in bob_strip and "阿尔法66科技" not in bob_strip
+
+    alice_nums = [
+        n[0]
+        for n in extractor_mod.parse_number_mentions(
+            "阿尔法66科技与贝塔88集团今年营收增长25%", user_id=USER_ALICE
+        )
+    ]
+    bob_nums = [
+        n[0]
+        for n in extractor_mod.parse_number_mentions(
+            "阿尔法66科技与贝塔88集团今年营收增长25%", user_id=USER_BOB
+        )
+    ]
+    assert alice_nums == ["88", "25"]
+    assert bob_nums == ["66", "25"]
+
+    # Quote has Chinese name "阿尔法66科技", claim uses English alias "Alfa66Tech":
+    # supported for Alice (via her entity alias group), unsupported for Bob
+    alice_unsup_alfa, _ = extractor_mod._validate_proper_nouns_and_clean_topic(
+        "Alfa66Tech 今年签署合作",
+        "Alfa66Tech",
+        "阿尔法66科技今年签署合作",
+        user_id=USER_ALICE,
+    )
+    bob_unsup_alfa, _ = extractor_mod._validate_proper_nouns_and_clean_topic(
+        "Alfa66Tech 今年签署合作",
+        "Alfa66Tech",
+        "阿尔法66科技今年签署合作",
+        user_id=USER_BOB,
+    )
+    assert alice_unsup_alfa == []
+    assert bob_unsup_alfa == ["Alfa66Tech"]
+
+    # Conversely, quote has "贝塔88集团" and claim uses "Beta88Group":
+    # supported for Bob, unsupported for Alice
+    alice_unsup_beta, _ = extractor_mod._validate_proper_nouns_and_clean_topic(
+        "Beta88Group 今年签署合作",
+        "Beta88Group",
+        "贝塔88集团今年签署合作",
+        user_id=USER_ALICE,
+    )
+    bob_unsup_beta, _ = extractor_mod._validate_proper_nouns_and_clean_topic(
+        "Beta88Group 今年签署合作",
+        "Beta88Group",
+        "贝塔88集团今年签署合作",
+        user_id=USER_BOB,
+    )
+    assert alice_unsup_beta == ["Beta88Group"]
+    assert bob_unsup_beta == []
+
+    # Both derived results are attached to the exact same cache entry object as `alias_map` keyed by `(user_id, time_bucket)`
+    bucket_0 = int(clock["now"] // extractor_mod._ALIAS_CACHE_TTL_SECONDS)
+    alice_entry = extractor_mod._TICKER_ALIASES_CACHE[(USER_ALICE, bucket_0)]
+    bob_entry = extractor_mod._TICKER_ALIASES_CACHE[(USER_BOB, bucket_0)]
+    assert alice_entry.cn_strip_aliases is alice_strip
+    assert bob_entry.cn_strip_aliases is bob_strip
+    assert alice_entry.entity_alias_groups is not None
+    assert bob_entry.entity_alias_groups is not None
+
+    # 2) Simulate a DB update for Alice without local invalidation (e.g. from another worker):
+    # replace ALFA ("阿尔法66科技") with GAMMA ("伽马77半导体")
+    await store.delete_coverage_tickers(USER_ALICE, ["ALFA"])
+    await store.upsert_coverage_rows(
+        USER_ALICE,
+        [
+            company_to_row(
+                {
+                    "ticker": "GAMMA",
+                    "name": "Gamma 77 Semi",
+                    "tier": "core",
+                    "market": "US",
+                    "aliases": {"search_names": ["伽马77半导体", "Gamma77Semi"]},
+                },
+                user_id=USER_ALICE,
+                source="chat",
+            )
+        ],
+    )
+
+    # Within the same 5-minute TTL bucket, cached derived results remain in effect
+    clock["now"] = 1260.0
+    assert "阿尔法66科技" in extractor_mod._chinese_company_aliases_for_stripping(USER_ALICE)
+    assert "伽马77半导体" not in extractor_mod._chinese_company_aliases_for_stripping(USER_ALICE)
+
+    # After the 5-minute TTL expires (next time bucket), both `alias_map` and derived results refresh together
+    clock["now"] = 1200.0 + extractor_mod._ALIAS_CACHE_TTL_SECONDS + 1.0
+    bucket_1 = int(clock["now"] // extractor_mod._ALIAS_CACHE_TTL_SECONDS)
+    alice_strip_refreshed = extractor_mod._chinese_company_aliases_for_stripping(USER_ALICE)
+    alice_groups_refreshed = extractor_mod._build_entity_alias_groups(USER_ALICE)
+    assert "伽马77半导体" in alice_strip_refreshed
+    assert "阿尔法66科技" not in alice_strip_refreshed
+    assert any("伽马77半导体" in grp for grp in alice_groups_refreshed)
+    assert not any("阿尔法66科技" in grp for grp in alice_groups_refreshed)
+    assert (USER_ALICE, bucket_0) not in extractor_mod._TICKER_ALIASES_CACHE
+    assert extractor_mod._TICKER_ALIASES_CACHE[(USER_ALICE, bucket_1)].cn_strip_aliases is alice_strip_refreshed
+    assert extractor_mod._TICKER_ALIASES_CACHE[(USER_ALICE, bucket_1)].entity_alias_groups is alice_groups_refreshed
+
+    # Bob's aliases remain isolated from Alice's refreshed aliases
+    bob_strip_refreshed = extractor_mod._chinese_company_aliases_for_stripping(USER_BOB)
+    assert "贝塔88集团" in bob_strip_refreshed
+    assert "伽马77半导体" not in bob_strip_refreshed
+
 
 
 

@@ -901,16 +901,22 @@ _SECONDARY_TICKER_ALIAS_RE = re.compile(
 )
 
 _ALIAS_CACHE_TTL_SECONDS: float = 300.0
-_TICKER_ALIASES_CACHE: dict[
-    tuple[str, int, int, int], tuple[float, dict[str, tuple[str, ...]]]
-] = {}
+
+
+@dataclass
+class _TickerAliasesCacheEntry:
+    """Cached per-user alias table and its lazily computed derived structures for one TTL bucket."""
+
+    user_id: str
+    time_bucket: int
+    expires_at: float
+    alias_map: dict[str, tuple[str, ...]]
+    cn_strip_aliases: tuple[str, ...] | None = None
+    entity_alias_groups: tuple[tuple[str, ...], ...] | None = None
+
+
+_TICKER_ALIASES_CACHE: dict[tuple[str, int], _TickerAliasesCacheEntry] = {}
 _STATIC_TICKER_ALIASES_BASE: dict[str, tuple[str, ...]] | None = None
-_CN_STRIP_CACHE: dict[
-    int, tuple[dict[str, tuple[str, ...]], tuple[str, ...]]
-] = {}
-_ENTITY_GROUPS_CACHE: dict[
-    int, tuple[dict[str, tuple[str, ...]], tuple[tuple[str, ...], ...]]
-] = {}
 
 
 @lru_cache(maxsize=4096)
@@ -1019,8 +1025,13 @@ def _get_static_ticker_aliases_base() -> dict[str, tuple[str, ...]]:
     return _STATIC_TICKER_ALIASES_BASE
 
 
+def _current_alias_cache_bucket(now_mono: float | None = None) -> tuple[float, int]:
+    now = time.monotonic() if now_mono is None else now_mono
+    return now, int(now // _ALIAS_CACHE_TTL_SECONDS)
+
+
 def invalidate_ticker_company_aliases_cache(user_id: str | None = None) -> None:
-    """Clear cached ticker/company alias tables (for `user_id` + union fallback, or all users when `None`)."""
+    """Clear cached ticker/company alias tables and derived structures (for `user_id` + union fallback, or all users when `None`)."""
     global _STATIC_TICKER_ALIASES_BASE
     if user_id is None:
         _TICKER_ALIASES_CACHE.clear()
@@ -1032,28 +1043,21 @@ def invalidate_ticker_company_aliases_cache(user_id: str | None = None) -> None:
         ]
         for k in stale_keys:
             _TICKER_ALIASES_CACHE.pop(k, None)
-    _CN_STRIP_CACHE.clear()
-    _ENTITY_GROUPS_CACHE.clear()
 
 
-def _load_ticker_company_aliases(user_id: str | None = None) -> dict[str, tuple[str, ...]]:
-    """Load ticker -> company name aliases from `get_user_aliases(user_id)` plus `SUPPLEMENTAL_TICKER_ALIASES`,
-    keyed by `canonicalize_ticker_key`.
-    """
+def _load_ticker_aliases_cache_entry(user_id: str | None = None) -> _TickerAliasesCacheEntry:
+    """Return the cached `_TickerAliasesCacheEntry` for `(user_id, time_bucket)`, loading from DB on miss/expiry."""
     from src.dalton.coverage import get_user_aliases_sync
-    from src.dalton.database import coverage as coverage_db
 
     norm_uid = str(user_id or "").strip()
-    cache_key = (
-        norm_uid,
-        id(get_user_aliases_sync),
-        id(coverage_db.list_coverage_rows),
-        id(coverage_db.list_all_coverage_rows),
-    )
-    now_mono = time.monotonic()
+    now_mono, time_bucket = _current_alias_cache_bucket()
+    cache_key = (norm_uid, time_bucket)
     cached_entry = _TICKER_ALIASES_CACHE.get(cache_key)
-    if cached_entry is not None and now_mono < cached_entry[0]:
-        return cached_entry[1]
+    if cached_entry is not None and now_mono < cached_entry.expires_at:
+        return cached_entry
+
+    for stale_key in [k for k in _TICKER_ALIASES_CACHE if k[0] == norm_uid and k != cache_key]:
+        _TICKER_ALIASES_CACHE.pop(stale_key, None)
 
     db_aliases: dict[str, tuple[str, ...]] = {}
     try:
@@ -1064,55 +1068,75 @@ def _load_ticker_company_aliases(user_id: str | None = None) -> dict[str, tuple[
     static_base = _get_static_ticker_aliases_base()
     if not db_aliases:
         result = dict(static_base)
-        _TICKER_ALIASES_CACHE[cache_key] = (now_mono + _ALIAS_CACHE_TTL_SECONDS, result)
-        return result
+    else:
+        mapping: dict[str, list[str]] = {}
 
-    mapping: dict[str, list[str]] = {}
+        def _register(raw_ticker: str, aliases: list[str]) -> None:
+            canon_key = canonicalize_ticker_key(raw_ticker)
+            if not canon_key:
+                return
+            cur = mapping.setdefault(canon_key, [])
+            for v in ticker_code_variants(raw_ticker):
+                if v not in cur:
+                    cur.append(v)
+            for a in aliases:
+                a_str = str(a or "").strip()
+                if a_str and a_str not in cur:
+                    cur.append(a_str)
 
-    def _register(raw_ticker: str, aliases: list[str]) -> None:
-        canon_key = canonicalize_ticker_key(raw_ticker)
-        if not canon_key:
-            return
-        cur = mapping.setdefault(canon_key, [])
-        for v in ticker_code_variants(raw_ticker):
-            if v not in cur:
-                cur.append(v)
-        for a in aliases:
-            a_str = str(a or "").strip()
-            if a_str and a_str not in cur:
-                cur.append(a_str)
+        for raw_ticker, alias_tuple in db_aliases.items():
+            ticker = str(raw_ticker or "").strip().upper()
+            if not ticker:
+                continue
+            names = [ticker]
+            secondary_tickers: list[str] = []
+            for sn in alias_tuple or ():
+                sn_str = str(sn or "").strip()
+                if sn_str and sn_str not in names:
+                    names.append(sn_str)
+                if _SECONDARY_TICKER_ALIAS_RE.match(sn_str):
+                    secondary_tickers.append(sn_str.upper())
+            _register(ticker, names)
+            for sec_t in secondary_tickers:
+                _register(sec_t, names)
 
-    for raw_ticker, alias_tuple in db_aliases.items():
-        ticker = str(raw_ticker or "").strip().upper()
-        if not ticker:
-            continue
-        names = [ticker]
-        secondary_tickers: list[str] = []
-        for sn in alias_tuple or ():
-            sn_str = str(sn or "").strip()
-            if sn_str and sn_str not in names:
-                names.append(sn_str)
-            if _SECONDARY_TICKER_ALIAS_RE.match(sn_str):
-                secondary_tickers.append(sn_str.upper())
-        _register(ticker, names)
-        for sec_t in secondary_tickers:
-            _register(sec_t, names)
+        for canon_key, static_vals in static_base.items():
+            cur = mapping.get(canon_key)
+            if cur is None:
+                mapping[canon_key] = list(static_vals)
+            else:
+                for sv in static_vals:
+                    if sv not in cur:
+                        cur.append(sv)
 
-    for canon_key, static_vals in static_base.items():
-        cur = mapping.get(canon_key)
-        if cur is None:
-            mapping[canon_key] = list(static_vals)
-        else:
-            for sv in static_vals:
-                if sv not in cur:
-                    cur.append(sv)
+        result = {k: tuple(v) for k, v in mapping.items()}
 
-    result = {k: tuple(v) for k, v in mapping.items()}
-    _TICKER_ALIASES_CACHE[cache_key] = (now_mono + _ALIAS_CACHE_TTL_SECONDS, result)
-    return result
+    entry = _TickerAliasesCacheEntry(
+        user_id=norm_uid,
+        time_bucket=time_bucket,
+        expires_at=now_mono + _ALIAS_CACHE_TTL_SECONDS,
+        alias_map=result,
+    )
+    _TICKER_ALIASES_CACHE[cache_key] = entry
+    return entry
+
+
+def _load_ticker_company_aliases(user_id: str | None = None) -> dict[str, tuple[str, ...]]:
+    """Load ticker -> company name aliases from `get_user_aliases(user_id)` plus `SUPPLEMENTAL_TICKER_ALIASES`,
+    keyed by `canonicalize_ticker_key`.
+
+    Cached per `(user_id, time_bucket)` with a 5-minute TTL (`_ALIAS_CACHE_TTL_SECONDS = 300.0`) in the same
+    cache entry (`_TickerAliasesCacheEntry`) as its lazily computed derived results (`cn_strip_aliases` and
+    `entity_alias_groups`), so the alias map and derived results expire together without any `id()`-keyed cache.
+    Coverage roster edits actively invalidate the current worker's cache via `invalidate_ticker_company_aliases_cache`;
+    cross-worker active invalidation is intentionally not performed (名单修改后，其他 worker 最多 5 分钟后看到新别名，
+    这是可以接受的).
+    """
+    return _load_ticker_aliases_cache_entry(user_id).alias_map
 
 
 _load_ticker_company_aliases.cache_clear = invalidate_ticker_company_aliases_cache  # type: ignore[attr-defined]
+_ORIG_LOAD_TICKER_COMPANY_ALIASES = _load_ticker_company_aliases
 
 
 def _call_load_ticker_company_aliases(user_id: str | None = None) -> dict[str, tuple[str, ...]]:
@@ -1121,6 +1145,32 @@ def _call_load_ticker_company_aliases(user_id: str | None = None) -> dict[str, t
         return _load_ticker_company_aliases(user_id)
     except TypeError:
         return _load_ticker_company_aliases()
+
+
+def _resolve_alias_cache_entry_or_map(
+    user_id: str | None = None,
+    alias_map: dict[str, tuple[str, ...]] | None = None,
+) -> tuple[_TickerAliasesCacheEntry | None, dict[str, tuple[str, ...]]]:
+    """Return `(cache_entry, alias_map)` when backed by `_TICKER_ALIASES_CACHE`, or `(None, eff_alias_map)`
+    when an explicit custom `alias_map` or monkeypatched `_load_ticker_company_aliases` is used.
+    """
+    if alias_map is not None:
+        norm_uid = str(user_id or "").strip()
+        now_mono, time_bucket = _current_alias_cache_bucket()
+        cached_entry = _TICKER_ALIASES_CACHE.get((norm_uid, time_bucket))
+        if (
+            cached_entry is not None
+            and now_mono < cached_entry.expires_at
+            and cached_entry.alias_map is alias_map
+        ):
+            return cached_entry, alias_map
+        return None, alias_map
+
+    if _load_ticker_company_aliases is _ORIG_LOAD_TICKER_COMPANY_ALIASES:
+        entry = _load_ticker_aliases_cache_entry(user_id)
+        return entry, entry.alias_map
+
+    return None, _call_load_ticker_company_aliases(user_id)
 
 
 def normalize_number_token(raw_token: str) -> str | None:
@@ -1256,11 +1306,9 @@ def _chinese_company_aliases_for_stripping(
     """Return multi-character Chinese company aliases sorted longest-first so company names
     containing numeral characters (e.g. `百度`, `百融云创`, `爱德万测试`, `万事达`, `三花智控`) are not parsed as numbers.
     """
-    eff_alias_map = alias_map if alias_map is not None else _call_load_ticker_company_aliases(user_id)
-    cache_id = id(eff_alias_map)
-    cached = _CN_STRIP_CACHE.get(cache_id)
-    if cached is not None:
-        return cached
+    cache_entry, eff_alias_map = _resolve_alias_cache_entry_or_map(user_id, alias_map)
+    if cache_entry is not None and cache_entry.cn_strip_aliases is not None:
+        return cache_entry.cn_strip_aliases
     cn_names: set[str] = set()
     for aliases in eff_alias_map.values():
         for a in aliases:
@@ -1268,7 +1316,8 @@ def _chinese_company_aliases_for_stripping(
                 cn_names.add(a)
     cn_names.update({"百融云创", "百济神州", "百胜中国", "五粮液", "三六零", "一汽"})
     res = tuple(sorted(cn_names, key=len, reverse=True))
-    _CN_STRIP_CACHE[cache_id] = res
+    if cache_entry is not None:
+        cache_entry.cn_strip_aliases = res
     return res
 
 
@@ -3190,11 +3239,9 @@ def _build_entity_alias_groups(
     of the entity appears in `quote` (e.g. `SMIC`, `Sieyuan`, `Hynix`, `Tencent`, `澜起`), another alias
     of the same entity in `claim`/`topic_label` (e.g. `中芯国际`, `思源电气`, `SK海力士`, `腾讯`, `澜起科技`) is supported.
     """
-    eff_alias_map = alias_map if alias_map is not None else _call_load_ticker_company_aliases(user_id)
-    cache_id = id(eff_alias_map)
-    cached = _ENTITY_GROUPS_CACHE.get(cache_id)
-    if cached is not None:
-        return cached
+    cache_entry, eff_alias_map = _resolve_alias_cache_entry_or_map(user_id, alias_map)
+    if cache_entry is not None and cache_entry.entity_alias_groups is not None:
+        return cache_entry.entity_alias_groups
     raw_groups: list[set[str]] = []
 
     for aliases in eff_alias_map.values():
@@ -3224,7 +3271,8 @@ def _build_entity_alias_groups(
             merged.append(set(g))
 
     res = tuple(tuple(sorted(mg, key=lambda x: (-len(x), x))) for mg in merged)
-    _ENTITY_GROUPS_CACHE[cache_id] = res
+    if cache_entry is not None:
+        cache_entry.entity_alias_groups = res
     return res
 
 
