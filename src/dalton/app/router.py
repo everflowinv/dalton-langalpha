@@ -94,6 +94,33 @@ class SystemJobToggleRequest(BaseModel):
     enabled: bool
 
 
+class CoverageMutateRequest(BaseModel):
+    action: str
+    tickers: list[str] | str
+    tier: str = "watch"
+
+
+class CoverageGroupPreviewRequest(BaseModel):
+    label: str = "未命名规则组"
+    criteria: dict[str, Any] = Field(default_factory=dict)
+
+
+class CoverageGroupCreateRequest(BaseModel):
+    label: str
+    criteria: dict[str, Any] = Field(default_factory=dict)
+    default_tier: str = "watch"
+    auto_refresh: bool = True
+
+
+class EarningsCalendarMirrorRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    ledger: dict[str, Any] | None = None
+    updated: str | None = None
+    entries: dict[str, Any] | None = None
+    reported: list[Any] | None = None
+
+
 def _require_dalton_enabled() -> None:
     if not get_dalton_settings().enabled:
         raise HTTPException(status_code=404, detail="Dalton mode disabled")
@@ -819,5 +846,218 @@ async def run_system_job_now_endpoint(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+# ---------------------------------------------------------------------------
+# Per-User Coverage & Earnings Calendar (`/api/v1/dalton/coverage*`, `/api/v1/dalton/earnings/calendar*`)
+# ---------------------------------------------------------------------------
+
+
+def _parse_tickers_payload(tickers: list[str] | str) -> list[str]:
+    if isinstance(tickers, str):
+        return [part.strip() for part in tickers.replace(";", ",").split(",") if part.strip()]
+    out: list[str] = []
+    for item in tickers or []:
+        if isinstance(item, str):
+            for sub in item.replace(";", ",").split(","):
+                if sub.strip():
+                    out.append(sub.strip())
+    return out
+
+
+@router.get("/coverage")
+@handle_api_exceptions("get user coverage", logger)
+async def get_user_coverage_endpoint(
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    _require_dalton_enabled()
+    from src.dalton.coverage import list_user_coverage_summary
+
+    return await list_user_coverage_summary(str(user_id).strip())
+
+
+@router.post("/coverage")
+@handle_api_exceptions("mutate user coverage", logger)
+async def mutate_user_coverage_endpoint(
+    body: CoverageMutateRequest,
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    _require_dalton_enabled()
+    from src.dalton.coverage import (
+        CoverageDataSourceError,
+        add_user_coverage_tickers,
+        remove_user_coverage_tickers,
+    )
+
+    uid = str(user_id).strip()
+    act = str(body.action or "").strip().lower()
+    tickers = _parse_tickers_payload(body.tickers)
+    if not tickers:
+        raise HTTPException(status_code=400, detail="tickers is required")
+
+    try:
+        if act == "add":
+            return await add_user_coverage_tickers(
+                uid,
+                tickers,
+                tier=body.tier or "watch",
+                source="ui",
+            )
+        if act == "remove":
+            return await remove_user_coverage_tickers(uid, tickers)
+        if act == "set_tier":
+            from src.dalton.autonomy.tracking import set_tier_and_resync
+
+            return await set_tier_and_resync(uid, tickers, tier=body.tier or "watch")
+    except CoverageDataSourceError as exc:
+        raise HTTPException(status_code=503, detail=exc.to_dict()) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    raise HTTPException(
+        status_code=400,
+        detail=f"Unsupported action {body.action!r}; must be 'add', 'remove', or 'set_tier'",
+    )
+
+
+@router.get("/coverage/groups")
+@handle_api_exceptions("list user coverage groups", logger)
+async def list_user_coverage_groups_endpoint(
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    _require_dalton_enabled()
+    from src.dalton.coverage import list_user_coverage_summary
+
+    summary = await list_user_coverage_summary(str(user_id).strip())
+    return {
+        "ok": True,
+        "user_id": str(user_id).strip(),
+        "groups": summary.get("groups") or [],
+    }
+
+
+@router.post("/coverage/groups/preview")
+@handle_api_exceptions("preview user coverage group", logger)
+async def preview_user_coverage_group_endpoint(
+    body: CoverageGroupPreviewRequest,
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    _require_dalton_enabled()
+    from src.dalton.coverage import CoverageDataSourceError, preview_coverage_group
+
+    _ = user_id
+    try:
+        return await preview_coverage_group(
+            label=body.label,
+            criteria=body.criteria,
+        )
+    except CoverageDataSourceError as exc:
+        raise HTTPException(status_code=503, detail=exc.to_dict()) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/coverage/groups")
+@handle_api_exceptions("create user coverage group", logger)
+async def create_user_coverage_group_endpoint(
+    body: CoverageGroupCreateRequest,
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    _require_dalton_enabled()
+    from src.dalton.coverage import CoverageDataSourceError, add_coverage_group
+
+    try:
+        return await add_coverage_group(
+            str(user_id).strip(),
+            label=body.label,
+            criteria=body.criteria,
+            default_tier=body.default_tier,
+            auto_refresh=body.auto_refresh,
+        )
+    except CoverageDataSourceError as exc:
+        raise HTTPException(status_code=503, detail=exc.to_dict()) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.delete("/coverage/groups/{group_id}")
+@handle_api_exceptions("delete user coverage group", logger)
+async def delete_user_coverage_group_endpoint(
+    group_id: str,
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    _require_dalton_enabled()
+    from src.dalton.coverage import remove_coverage_group
+
+    res = await remove_coverage_group(str(user_id).strip(), group_id)
+    if not res.get("ok") or res.get("deleted") is False:
+        raise HTTPException(status_code=404, detail=str(res.get("error") or "Group not found"))
+    return res
+
+
+@router.post("/coverage/groups/{group_id}/resolve")
+@handle_api_exceptions("resolve user coverage group", logger)
+async def resolve_user_coverage_group_endpoint(
+    group_id: str,
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    _require_dalton_enabled()
+    from src.dalton.coverage import CoverageDataSourceError, resolve_coverage_group
+
+    try:
+        res = await resolve_coverage_group(str(user_id).strip(), group_id)
+    except CoverageDataSourceError as exc:
+        raise HTTPException(status_code=503, detail=exc.to_dict()) from exc
+    except ValueError as exc:
+        msg = str(exc)
+        status = 404 if "not found" in msg.lower() else 400
+        raise HTTPException(status_code=status, detail=msg) from exc
+    if not res.get("ok"):
+        raise HTTPException(status_code=404, detail=str(res.get("error") or "Group not found"))
+    return res
+
+
+@router.get("/earnings/calendar")
+@handle_api_exceptions("get user earnings calendar", logger)
+async def get_user_earnings_calendar_endpoint(
+    user_id: CurrentUserId,
+    from_date: str | None = Query(default=None, alias="from"),
+    to_date: str | None = Query(default=None, alias="to"),
+) -> dict[str, Any]:
+    _require_dalton_enabled()
+    from src.dalton.coverage import query_user_earnings_calendar
+
+    return await query_user_earnings_calendar(
+        str(user_id).strip(),
+        from_date=from_date,
+        to_date=to_date,
+    )
+
+
+@router.put("/earnings/calendar/mirror")
+@handle_api_exceptions("publish user earnings calendar mirror", logger)
+async def put_user_earnings_calendar_mirror_endpoint(
+    body: EarningsCalendarMirrorRequest,
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    _require_dalton_enabled()
+    from src.dalton.coverage import publish_user_earnings_calendar_mirror
+
+    if isinstance(body.ledger, dict):
+        ledger_payload = body.ledger
+    else:
+        dumped = body.model_dump(exclude={"ledger"}, exclude_none=True)
+        ledger_payload = dumped
+
+    try:
+        return await publish_user_earnings_calendar_mirror(
+            str(user_id).strip(),
+            ledger_payload,
+        )
+    except ValueError as exc:
+        msg = str(exc)
+        if "1 MB" in msg or "exceeds" in msg:
+            raise HTTPException(status_code=413, detail=msg) from exc
+        raise HTTPException(status_code=400, detail=msg) from exc
 
 

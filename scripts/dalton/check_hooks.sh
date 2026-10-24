@@ -94,6 +94,7 @@ ALLOWED_HOOKS=(
   "hide-trading"
   "dalton-notify"
   "glob-brace-expansion"
+  "user-coverage"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

@@ -12,6 +12,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import asyncio
 import importlib.util
 import json
 import sys
@@ -25,6 +26,8 @@ from typing import Any
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 INIT_COMPANY_SCRIPT = (
     REPO_ROOT / "plugins" / "dalton" / "skills" / "dalton-init-company" / "scripts" / "init_company.py"
 )
@@ -40,10 +43,7 @@ def _load_init_company_module():
     return mod
 
 
-def _load_coverage_map(coverage_yaml: Path) -> tuple[str, dict[str, dict[str, Any]]]:
-    if not coverage_yaml.is_file():
-        return "2026-10-09", {}
-    doc = yaml.safe_load(coverage_yaml.read_text(encoding="utf-8")) or {}
+def _parse_coverage_doc(doc: dict[str, Any]) -> tuple[str, dict[str, dict[str, Any]]]:
     as_of = str(doc.get("as_of") or "2026-10-09")
     by_ticker: dict[str, dict[str, Any]] = {}
     for comp in doc.get("companies") or []:
@@ -53,6 +53,32 @@ def _load_coverage_map(coverage_yaml: Path) -> tuple[str, dict[str, dict[str, An
             entry["as_of"] = as_of
             by_ticker[t] = entry
     return as_of, by_ticker
+
+
+async def _load_user_coverage_doc(user_id: str) -> dict[str, Any]:
+    from src.dalton.coverage import get_user_coverage
+    from src.server.database import pool as pool_mod
+
+    pool = pool_mod.get_or_create_pool()
+    await pool.open()
+    try:
+        return await get_user_coverage(user_id)
+    finally:
+        await pool.close()
+
+
+def _load_coverage_map(
+    coverage_yaml: Path,
+    *,
+    user_id: str | None = None,
+) -> tuple[str, dict[str, dict[str, Any]]]:
+    if user_id and str(user_id).strip():
+        doc = asyncio.run(_load_user_coverage_doc(str(user_id).strip()))
+        return _parse_coverage_doc(doc)
+    if not coverage_yaml.is_file():
+        return "2026-10-09", {}
+    doc = yaml.safe_load(coverage_yaml.read_text(encoding="utf-8")) or {}
+    return _parse_coverage_doc(doc)
 
 
 def _api_request(
@@ -245,6 +271,7 @@ def main(argv: list[str] | None = None) -> int:
         help="Comma-separated list of canonical tickers (e.g. META,AMZN,GOOGL,MSFT)",
     )
     parser.add_argument("--api", default="http://localhost:8000", help="LangAlpha REST API base URL")
+    parser.add_argument("--user", default=None, help="User ID whose DB coverage roster to read")
     parser.add_argument("--coverage", type=Path, default=DEFAULT_COVERAGE_YAML, help="Path to coverage.yaml")
     parser.add_argument(
         "--local-root",
@@ -257,7 +284,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     init_mod = _load_init_company_module()
-    as_of, coverage_map = _load_coverage_map(args.coverage)
+    as_of, coverage_map = _load_coverage_map(args.coverage, user_id=args.user)
 
     tickers = [t.strip().upper() for t in args.tickers.split(",") if t.strip()]
     results: list[dict[str, Any]] = []

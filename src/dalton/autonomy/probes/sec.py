@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import logging
 import os
-from pathlib import Path
 from typing import Any, Optional
 
 import httpx
 
 from src.dalton.autonomy.probes import ProbeSignal
+from src.dalton.coverage import get_user_coverage
 
 logger = logging.getLogger(__name__)
 
@@ -57,24 +57,36 @@ def _normalize_cik(val: Any) -> Optional[str]:
     return digits.lstrip("0").zfill(10)
 
 
-def _lookup_local_cik(ticker: str) -> Optional[str]:
+async def _lookup_local_cik(
+    ticker: str,
+    *,
+    user_id: Optional[str] = None,
+    workspace_id: Optional[str] = None,
+) -> Optional[str]:
     sym = (ticker or "").strip().upper()
     if not sym:
         return None
     if sym in BUILTIN_TICKER_CIKS:
         return BUILTIN_TICKER_CIKS[sym]
-    try:
-        import yaml
+    eff_user_id = str(user_id or "").strip() or None
+    if not eff_user_id and workspace_id:
+        try:
+            from src.server.database import workspace as ws_db
 
-        repo_root = Path(__file__).resolve().parents[4]
-        cov_path = repo_root / "config" / "dalton" / "coverage.yaml"
-        if cov_path.exists():
-            data = yaml.safe_load(cov_path.read_text(encoding="utf-8")) or {}
-            for entry in data.get("companies") or data.get("coverage") or []:
-                if isinstance(entry, dict) and str(entry.get("ticker") or "").upper() == sym:
-                    resolved = _normalize_cik(entry.get("cik"))
-                    if resolved:
-                        return resolved
+            ws = await ws_db.get_workspace(str(workspace_id))
+            if isinstance(ws, dict) and ws.get("user_id"):
+                eff_user_id = str(ws["user_id"]).strip() or None
+        except Exception:
+            eff_user_id = None
+    if not eff_user_id:
+        return None
+    try:
+        data = await get_user_coverage(eff_user_id)
+        for entry in data.get("companies") or data.get("coverage") or []:
+            if isinstance(entry, dict) and str(entry.get("ticker") or "").upper() == sym:
+                resolved = _normalize_cik(entry.get("cik"))
+                if resolved:
+                    return resolved
     except Exception:
         pass
     return None
@@ -85,9 +97,10 @@ async def resolve_company_cik(
     *,
     watch_state: Optional[dict[str, Any]] = None,
     workspace_id: Optional[str] = None,
+    user_id: Optional[str] = None,
     allow_network: bool = True,
 ) -> Optional[str]:
-    """Resolve 10-digit SEC CIK for ``ticker`` via watch_state -> company doc -> builtin/coverage -> SEC JSON."""
+    """Resolve 10-digit SEC CIK for ``ticker`` via watch_state -> company doc -> builtin/user coverage -> SEC JSON."""
     state = watch_state or {}
     from_state = _normalize_cik(state.get("cik"))
     if from_state:
@@ -108,7 +121,7 @@ async def resolve_company_cik(
         except Exception as e:
             logger.debug("[DALTON_SEC_PROBE] company doc CIK lookup skipped: %s", e)
 
-    local_cik = _lookup_local_cik(ticker)
+    local_cik = await _lookup_local_cik(ticker, user_id=user_id, workspace_id=workspace_id)
     if local_cik:
         return local_cik
 
@@ -157,6 +170,7 @@ async def probe_sec(
     ticker: str,
     watch_state: dict[str, Any],
     workspace_id: Optional[str] = None,
+    user_id: Optional[str] = None,
     submissions_override: Optional[dict[str, Any]] = None,
     allow_network: bool = True,
 ) -> tuple[list[ProbeSignal], dict[str, Any]]:
@@ -168,6 +182,7 @@ async def probe_sec(
         ticker,
         watch_state=state,
         workspace_id=workspace_id if allow_network else None,
+        user_id=user_id,
         allow_network=(data is None and allow_network),
     )
     if cik:

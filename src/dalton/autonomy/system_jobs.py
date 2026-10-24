@@ -540,7 +540,11 @@ def classify_system_job_key(key: str) -> tuple[str, str]:
 
 def _apply_caller_visibility(job: dict[str, Any], *, is_pm: bool) -> dict[str, Any]:
     """Adjust ``can_toggle``, ``can_run_now``, and ``log_tail`` visibility for non-PM callers."""
-    if not is_pm and job.get("scope") in ("home", "host"):
+    is_self_earnings_cal = (
+        job.get("scope") == "home"
+        and str(job.get("key") or "").strip().lower() == "dalton-earnings-calendar"
+    )
+    if not is_pm and job.get("scope") in ("home", "host") and not is_self_earnings_cal:
         job["can_toggle"] = False
         job["can_run_now"] = False
     if not is_pm and job.get("scope") == "host":
@@ -757,7 +761,7 @@ async def toggle_system_job(
     if scope == "ops":
         raise PermissionError("运维任务为只读，不支持在系统内开关")
 
-    if scope in ("home", "host"):
+    if scope == "host" or (scope == "home" and target != "dalton-earnings-calendar"):
         require_pm_user(uid)
 
     if scope == "host":
@@ -877,7 +881,7 @@ async def run_system_job_now(user_id: str, key: str) -> dict[str, Any]:
     if scope == "ops":
         raise PermissionError("运维任务为只读，不支持立即运行")
 
-    if scope in ("home", "host"):
+    if scope == "host" or (scope == "home" and target != "dalton-earnings-calendar"):
         require_pm_user(uid)
 
     if scope == "host":

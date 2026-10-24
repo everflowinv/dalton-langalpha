@@ -5,10 +5,8 @@ from __future__ import annotations
 
 import logging
 import re
-from pathlib import Path
+from collections.abc import Sequence
 from typing import Any
-
-import yaml
 
 from src.dalton.autonomy.schedule import (
     build_company_watch_specs,
@@ -17,6 +15,7 @@ from src.dalton.autonomy.schedule import (
     schedule_dalton_automation_helper,
     user_automations_lock,
 )
+from src.dalton.coverage import get_user_tier, set_user_coverage_tier
 from src.server.database import automation as auto_db
 from src.server.database import workspace as ws_db
 from src.server.database.home_workspace import is_home_row
@@ -34,35 +33,28 @@ _TICKER_FROM_AUTO_NAME_RE = re.compile(
 _CLEAN_TICKER_RE = re.compile(r"^([A-Za-z0-9]{1,10}(?:\.[A-Za-z]{1,4})?)")
 
 
-def _load_coverage_tiers() -> dict[str, str]:
-    """Load ticker -> tier mapping from ``config/dalton/coverage.yaml``."""
-    repo_root = Path(__file__).resolve().parents[3]
-    cov_path = repo_root / "config" / "dalton" / "coverage.yaml"
-    if not cov_path.exists():
-        return {}
-    try:
-        raw = yaml.safe_load(cov_path.read_text(encoding="utf-8")) or {}
-        entries = raw.get("companies") or raw.get("coverage") or []
-        out: dict[str, str] = {}
-        for item in entries:
-            if isinstance(item, dict) and item.get("ticker"):
-                t_key = str(item["ticker"]).strip().upper()
-                tier_val = str(item.get("tier") or "").strip().lower()
-                if t_key and tier_val:
-                    out[t_key] = tier_val
-        return out
-    except Exception as exc:
-        logger.warning("[DALTON_TRACKING] Failed to read coverage.yaml: %s", exc)
-        return {}
+async def resolve_default_tier(
+    ticker: str,
+    explicit_tier: str | None = None,
+    *,
+    user_id: str | None = None,
+    conn: Any = None,
+) -> str:
+    """Resolve tier for ``ticker`` from ``user_id``'s coverage roster or default to ``'watch'``.
 
-
-def resolve_default_tier(ticker: str, explicit_tier: str | None = None) -> str:
-    """Resolve tier for ``ticker``; defaults to ``coverage.yaml`` entry or ``'watch'``."""
+    Only a ticker absent from the roster defaults to ``'watch'``. A failed lookup
+    raises, because writing Watch's weekly schedule for a Core company is worse
+    than failing the call. Pass ``conn`` when already holding a connection (the
+    automations lock) so the lookup does not wait on a second one.
+    """
     if explicit_tier and str(explicit_tier).strip():
         return str(explicit_tier).strip().lower()
-    tiers = _load_coverage_tiers()
     t_upper = str(ticker or "").strip().upper()
-    return tiers.get(t_upper, "watch")
+    if user_id and t_upper:
+        user_tier = await get_user_tier(user_id, t_upper, conn=conn)
+        if user_tier:
+            return user_tier
+    return "watch"
 
 
 def _extract_ticker_from_text(raw: str | None) -> str | None:
@@ -378,7 +370,7 @@ async def get_tracking_status(user_id: str, workspace_id: str) -> dict[str, Any]
         raise ValueError("workspace_id is required")
 
     ticker, company_rows = await _load_company_automations(uid, ws_id)
-    tier = resolve_default_tier(ticker)
+    tier = await resolve_default_tier(ticker, user_id=uid)
     return _derive_status_and_details(
         workspace_id=ws_id,
         ticker=ticker,
@@ -409,7 +401,7 @@ async def enable_tracking(
 
     async with user_automations_lock(uid) as conn:
         ticker, company_rows = await _load_company_automations(uid, ws_id, conn=conn)
-        resolved_tier = resolve_default_tier(ticker, tier)
+        resolved_tier = await resolve_default_tier(ticker, tier, user_id=uid, conn=conn)
 
         current = _derive_status_and_details(
             workspace_id=ws_id,
@@ -496,7 +488,7 @@ async def disable_tracking(user_id: str, workspace_id: str) -> dict[str, Any]:
 
     async with user_automations_lock(uid) as conn:
         ticker, company_rows = await _load_company_automations(uid, ws_id, conn=conn)
-        resolved_tier = resolve_default_tier(ticker)
+        resolved_tier = await resolve_default_tier(ticker, user_id=uid, conn=conn)
         specs = build_company_watch_specs(
             ticker=ticker,
             workspace_id=ws_id,
@@ -594,7 +586,7 @@ async def resync_delta_schedule(
     delta_name = f"dalton-{t_upper.lower()}-delta"
 
     async with user_automations_lock(uid) as conn:
-        resolved_tier = resolve_default_tier(t_upper, tier)
+        resolved_tier = await resolve_default_tier(t_upper, tier, user_id=uid, conn=conn)
         new_cron, new_tz = resolve_delta_schedule(resolved_tier)
 
         rows = await list_all_user_automations(
@@ -696,3 +688,31 @@ async def resync_delta_schedule(
             "next_run_at": primary["new_next_run_at"],
             "changes": changes,
         }
+
+
+async def set_tier_and_resync(
+    user_id: str,
+    tickers: Sequence[str],
+    tier: str,
+) -> dict[str, Any]:
+    """Change tickers' coverage tier and move each changed company's delta task to the new schedule.
+
+    The one entry point for a tier change (Chief of Staff's tool and the REST
+    route), so both keep the daily internal-source scan on its tier's cadence.
+    Only tickers the roster actually updated are resynced; a failed resync is
+    reported per ticker and leaves the tier change in place.
+    """
+    res = await set_user_coverage_tier(user_id, tickers, tier=tier)
+    resynced: list[dict[str, Any]] = []
+    for t in res.get("updated_tickers") or []:
+        try:
+            resynced.append(await resync_delta_schedule(user_id, t, tier=res.get("tier")))
+        except Exception as exc:
+            logger.warning(
+                "[DALTON_TRACKING] set_tier resync failed | ticker=%s error=%s",
+                t,
+                type(exc).__name__,
+            )
+            resynced.append({"ticker": t, "updated": False, "reason": "resync_failed"})
+    res["delta_schedule"] = resynced
+    return res

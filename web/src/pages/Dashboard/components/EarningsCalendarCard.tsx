@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback, useMemo } from 'react';
+import React, { useEffect, useState, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 import { createPortal } from 'react-dom';
 import { ChevronRight, X, Calendar } from 'lucide-react';
@@ -8,9 +8,16 @@ import { useLocale } from '@/hooks/useLocale';
 import { useNow } from '@/hooks/useNow';
 import { createDateFormatter, shortMonthDay, shortWeekday } from '@/lib/format';
 import { localDateStr } from '@/lib/utils';
-import { getEarningsCalendar } from '../utils/api';
+// DALTON-HOOK(user-coverage): per-user coverage earnings calendar tab, badges, and 90-day modal view
+import {
+  type DaltonEarningsEntry,
+  type EarningsScope,
+  EarningsScopeTabs,
+  UserEarningsBadges,
+  useEarningsCalendarQuery,
+} from './dalton/UserEarningsCalendar';
 
-interface EarningsEntry {
+interface EarningsEntry extends DaltonEarningsEntry {
   symbol: string;
   date: string;
   companyName?: string;
@@ -100,6 +107,8 @@ function EarningsItem({ item, index: _index, isPast }: EarningsItemProps) {
           <div className="text-xs" style={{ color: 'var(--color-text-secondary)' }}>
             {item.companyName || item.symbol}
           </div>
+          {/* DALTON-HOOK(user-coverage): render tier/status/timing badges for user coverage items */}
+          <UserEarningsBadges item={item} />
         </div>
       </div>
 
@@ -159,14 +168,27 @@ function EarningsModal({ earnings, onClose }: EarningsModalProps) {
     return dateGroups[dateGroups.length - 1]?.date || '';
   }, [dateGroups, todayStr]);
 
-  const [activeDate, setActiveDate] = useState(defaultDate);
+  const [activeDate, setActiveDate] = useState(defaultDate || 'next90');
 
-  const activeItems = useMemo(
-    () => dateGroups.find((g) => g.date === activeDate)?.items || [],
-    [dateGroups, activeDate]
+  // DALTON-HOOK(user-coverage): 90-day upcoming view in modal
+  const next90LimitStr = useMemo(() => localDateStr(now + 90 * 86400000), [now]);
+  const next90Items = useMemo(
+    () =>
+      earnings
+        .filter((e) => e.date && e.date >= todayStr && e.date <= next90LimitStr)
+        .sort((a, b) => a.date.localeCompare(b.date)),
+    [earnings, todayStr, next90LimitStr]
   );
 
-  const isPastDate = activeDate < todayStr;
+  const activeItems = useMemo(
+    () =>
+      activeDate === 'next90'
+        ? next90Items
+        : dateGroups.find((g) => g.date === activeDate)?.items || [],
+    [dateGroups, activeDate, next90Items]
+  );
+
+  const isPastDate = activeDate !== 'next90' && activeDate < todayStr;
 
   useEffect(() => {
     const handleEsc = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
@@ -216,6 +238,24 @@ function EarningsModal({ earnings, onClose }: EarningsModalProps) {
           className="flex gap-1 px-6 pb-4 overflow-x-auto shrink-0"
           style={{ scrollbarWidth: 'none' }}
         >
+          {/* DALTON-HOOK(user-coverage): Next 90 Days view tab in modal */}
+          <button
+            key="next90"
+            onClick={() => setActiveDate('next90')}
+            className="flex flex-col items-center justify-center px-4 py-2 rounded-xl text-xs font-medium transition-all shrink-0 min-w-[88px] border"
+            style={{
+              backgroundColor:
+                activeDate === 'next90' ? 'var(--color-accent-primary)' : 'var(--color-bg-tag)',
+              color: activeDate === 'next90' ? '#fff' : 'var(--color-text-primary)',
+              borderColor:
+                activeDate === 'next90' ? 'var(--color-accent-primary)' : 'transparent',
+            }}
+          >
+            <span className="font-bold">{t('dashboard.earningsCalendarCard.next90Days')}</span>
+            <span className="text-[0.625rem] mt-0.5" style={{ opacity: 0.7 }}>
+              {t('dashboard.earningsCalendarCard.stockCount', { count: next90Items.length })}
+            </span>
+          </button>
           {dateGroups.map((group) => {
             const isActive = group.date === activeDate;
             const isToday = group.date === todayStr;
@@ -306,13 +346,22 @@ function EarningsModal({ earnings, onClose }: EarningsModalProps) {
                     >
                       <LogoFallback symbol={item.symbol} />
                     </div>
-                    <div className="min-w-0">
-                      <div className="font-bold text-sm truncate" style={{ color: 'var(--color-text-primary)' }}>
-                        {item.symbol}
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="font-bold text-sm truncate" style={{ color: 'var(--color-text-primary)' }}>
+                          {item.symbol}
+                        </div>
+                        {/* DALTON-HOOK(user-coverage): show date in 90-day modal view */}
+                        {activeDate === 'next90' && item.date && (
+                          <div className="text-xs font-medium shrink-0" style={{ color: 'var(--color-text-secondary)' }}>
+                            {formatDate(item.date, locale)}
+                          </div>
+                        )}
                       </div>
                       <div className="text-xs truncate" style={{ color: 'var(--color-text-secondary)' }}>
                         {item.companyName || item.symbol}
                       </div>
+                      <UserEarningsBadges item={item} />
                     </div>
                   </div>
                 ))}
@@ -327,34 +376,15 @@ function EarningsModal({ earnings, onClose }: EarningsModalProps) {
 
 function EarningsCalendarCard() {
   const { t } = useTranslation();
-  const [allEarnings, setAllEarnings] = useState<EarningsEntry[]>([]);
-  const [loading, setLoading] = useState(true);
+  // DALTON-HOOK(user-coverage): default to "mine" ("我的") tab; React Query keys by scope + user so switching tabs never races
+  const [scope, setScope] = useState<EarningsScope>('mine');
   const [modalOpen, setModalOpen] = useState(false);
-
-  const fetchEarnings = useCallback(async () => {
-    setLoading(true);
-    try {
-      const today = Date.now();
-      const from = localDateStr(today - 5 * 86400000);
-      const to = localDateStr(today + 5 * 86400000);
-      const result = await getEarningsCalendar({ from, to });
-      // Filter to US-market symbols only (no dot-suffix like .BK, .TW, .L, .TO, etc.)
-      const usOnly = ((result?.data || []) as EarningsEntry[]).filter((e) => e.symbol && !e.symbol.includes('.'));
-      setAllEarnings(usOnly);
-    } catch (err: unknown) {
-      console.error('[EarningsCalendarCard] fetch failed:', (err as Error)?.message);
-      setAllEarnings([]);
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    fetchEarnings();
-  }, [fetchEarnings]);
 
   const now = useNow();
   const todayStr = localDateStr(now);
+  const { data: queryEarnings, isLoading: loading } = useEarningsCalendarQuery(scope, now);
+  // DALTON-HOOK(user-coverage): bind earnings rows from scoped React Query cache
+  const allEarnings = (queryEarnings ?? []) as EarningsEntry[];
 
   const { recent, upcoming } = useMemo(() => {
     const r = allEarnings.filter((e) => e.date < todayStr).sort((a, b) => b.date.localeCompare(a.date));
@@ -376,13 +406,17 @@ function EarningsCalendarCard() {
   return (
     <>
       <div className="dashboard-glass-card p-6 flex flex-col">
-        <div className="flex items-center justify-between mb-4">
-          <h2 className="text-xl font-bold" style={{ color: 'var(--color-text-primary)' }}>
-            {t('dashboard.widgets.earningsCalendar.title')}
-          </h2>
+        {/* DALTON-HOOK(user-coverage): scope tabs ("我的" / "全市场") and empty state without CoS onboarding prompt */}
+        <div className="flex items-center justify-between gap-2 mb-4">
+          <div className="flex items-center gap-3 flex-wrap">
+            <h2 className="text-xl font-bold" style={{ color: 'var(--color-text-primary)' }}>
+              {t('dashboard.widgets.earningsCalendar.title')}
+            </h2>
+            <EarningsScopeTabs scope={scope} onScopeChange={setScope} />
+          </div>
           <button
             onClick={() => setModalOpen(true)}
-            className="text-xs flex items-center gap-1 transition-colors"
+            className="text-xs flex items-center gap-1 transition-colors shrink-0"
             style={{ color: 'var(--color-text-secondary)' }}
             onMouseEnter={(e) => (e.currentTarget.style.color = 'var(--color-text-primary)')}
             onMouseLeave={(e) => (e.currentTarget.style.color = 'var(--color-text-secondary)')}
@@ -412,8 +446,11 @@ function EarningsCalendarCard() {
               </div>
             ))
           ) : previewItems.length === 0 ? (
+            /* DALTON-HOOK(user-coverage): per-scope empty state copy ("暂无财报数据" vs market empty period) */
             <p className="text-sm py-4 text-center" style={{ color: 'var(--color-text-secondary)' }}>
-              {t('dashboard.earningsCalendarCard.emptyPeriod')}
+              {scope === 'mine'
+                ? t('dashboard.earningsCalendarCard.emptyData')
+                : t('dashboard.earningsCalendarCard.emptyPeriod')}
             </p>
           ) : (
             <>
