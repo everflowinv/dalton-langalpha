@@ -390,7 +390,7 @@ class TestExtendedHoursAndPrevCloseWording:
             "tier": "delayed_15m",
         }
         line = format_quote_line(snap, at=self._REG_ET)
-        assert "GOOG  $330.95  -1.62% today  vol 19.2M" in line
+        assert "GOOG  $330.95 -1.62% today  vol 19.2M" in line
 
     def test_previous_trading_day_without_extended_price_writes_prev_close(self):
         # DALTON-HOOK(extended-hours-quotes)
@@ -404,7 +404,8 @@ class TestExtendedHoursAndPrevCloseWording:
             "tier": "delayed_15m",
         }
         line = format_quote_line(snap, at=self._PRE_ET)
-        assert "-1.62% prev close" in line
+        assert "GOOG  last close $330.95 -1.62% vs prev close  vol 19.2M" in line
+        assert "10-21" not in line
         assert "today" not in line
         assert "(pre" in line
 
@@ -432,7 +433,10 @@ class TestExtendedHoursAndPrevCloseWording:
             "tier": "delayed_15m",
         }
         pre_line = format_quote_line(pre_snap, at=self._PRE_ET)
-        assert "GOOG  $330.95  -1.62% prev close  pre-market $328.50 -0.74%  vol 19.2M" in pre_line
+        assert (
+            "GOOG  last close 10-21 $330.95 -1.62% vs prev close $336.40  "
+            "pre-market $328.50 -0.74% vs last close @ 08:04 ET  vol 19.2M"
+        ) in pre_line
 
         # 2) yfinance after-hours snapshot (regular_as_of from today 10/22 16:00 ET, as_of from today 17:15 ET)
         post_snap = {
@@ -456,7 +460,10 @@ class TestExtendedHoursAndPrevCloseWording:
             "tier": "delayed_15m",
         }
         post_line = format_quote_line(post_snap, at=self._POST_ET)
-        assert "GOOG  $330.95  -1.62% today  after-hours $333.76 +0.85%  vol 19.2M" in post_line
+        assert (
+            "GOOG  close 10-22 $330.95 -1.62% vs prev close $336.40  "
+            "after-hours $333.76 +0.85% vs close @ 17:15 ET  vol 19.2M"
+        ) in post_line
 
         # 3) ginlix-data AMD after-hours sample (change_percent=1.025 is blended; regular_trading_change_percent=1.104)
         amd_at = _ET.localize(datetime(2026, 8, 31, 17, 31, 25))
@@ -481,7 +488,10 @@ class TestExtendedHoursAndPrevCloseWording:
             "tier": "realtime",
         }
         amd_line = format_quote_line(amd_snap, at=amd_at)
-        assert "AMD  $470.72  +1.10% today  after-hours $470.35 -0.08%  vol 12.4M (post)" == amd_line
+        assert (
+            "AMD  close $470.72 +1.10% vs prev close $465.58  "
+            "after-hours $470.35 -0.08% vs close  vol 12.4M (post)"
+        ) == amd_line
 
     def test_missing_regular_timestamp_uses_neutral_last_close_label(self):
         # DALTON-HOOK(extended-hours-quotes): When _print_time_ms and regularMarketTime are both absent,
@@ -505,13 +515,17 @@ class TestExtendedHoursAndPrevCloseWording:
             "tier": "delayed_15m",
         }
         line = format_quote_line(no_reg_ts_post, at=self._POST_ET)
-        assert "GOOG  $330.95  -1.62% last close  after-hours $333.76 +0.85%  vol 19.2M" in line
+        assert (
+            "GOOG  last close $330.95 -1.62% vs prev close $336.40  "
+            "after-hours $333.76 +0.85% vs last close  vol 19.2M"
+        ) in line
         assert "today" not in line
-        assert "prev close" not in line
+        assert "10-22" not in line
+        assert "@ 17:15 ET" not in line
 
     def test_overnight_and_weekend_use_last_close_not_today(self):
         # DALTON-HOOK(extended-hours-quotes): 'today' requires regular session date == venue calendar date.
-        # 1) Same day 17:15 ET (2026-10-22): regular_trading_date == 2026-10-22 -> 'today'
+        # 1) Same day 17:15 ET (2026-10-22): regular_trading_date == 2026-10-22 -> 'close 10-22'
         base_post = {
             "symbol": "GOOG",
             "price": 330.95,
@@ -531,15 +545,21 @@ class TestExtendedHoursAndPrevCloseWording:
             "tier": "delayed_15m",
         }
         same_day_line = format_quote_line(base_post, at=self._POST_ET)
-        assert "GOOG  $330.95  -1.62% today  after-hours $333.76 +0.85%  vol 19.2M" in same_day_line
+        assert (
+            "GOOG  close 10-22 $330.95 -1.62% vs prev close $336.40  "
+            "after-hours $333.76 +0.85% vs close @ 17:15 ET  vol 19.2M"
+        ) in same_day_line
 
-        # 2) Next day 02:00 ET (2026-10-23): regular_trading_date is 2026-10-22 -> 'last close'
+        # 2) Next day 02:00 ET (2026-10-23): regular_trading_date is 2026-10-22 -> 'last close 10-22'
         overnight_et = _ET.localize(datetime(2026, 10, 23, 2, 0, 0))
         overnight_line = format_quote_line(dict(base_post), at=overnight_et)
-        assert "GOOG  $330.95  -1.62% last close  after-hours $333.76 +0.85%  vol 19.2M" in overnight_line
+        assert (
+            "GOOG  last close 10-22 $330.95 -1.62% vs prev close $336.40  "
+            "after-hours $333.76 +0.85% vs last close @ 17:15 ET  vol 19.2M"
+        ) in overnight_line
         assert "today" not in overnight_line
 
-        # 3) Saturday 12:00 ET (2026-10-24) reading Friday 2026-10-23 snapshot -> 'last close'
+        # 3) Saturday 12:00 ET (2026-10-24) reading Friday 2026-10-23 snapshot -> 'last close 10-23'
         sat_et = _ET.localize(datetime(2026, 10, 24, 12, 0, 0))
         fri_close_ms = int(_ET.localize(datetime(2026, 10, 23, 16, 0, 0)).timestamp() * 1000)
         fri_post_ms = int(_ET.localize(datetime(2026, 10, 23, 18, 30, 0)).timestamp() * 1000)
@@ -550,7 +570,10 @@ class TestExtendedHoursAndPrevCloseWording:
             "regular_trading_date": "2026-10-23",
         }
         sat_line = format_quote_line(sat_snap, at=sat_et)
-        assert "GOOG  $330.95  -1.62% last close  after-hours $333.76 +0.85%  vol 19.2M" in sat_line
+        assert (
+            "GOOG  last close 10-23 $330.95 -1.62% vs prev close $336.40  "
+            "after-hours $333.76 +0.85% vs last close @ 18:30 ET  vol 19.2M"
+        ) in sat_line
         assert "today" not in sat_line
 
     def test_missing_regular_change_percent_computes_or_omits_never_falls_back_to_blended(self):
@@ -577,10 +600,235 @@ class TestExtendedHoursAndPrevCloseWording:
             "tier": "realtime",
         }
         computable_line = format_quote_line(computable_snap, at=amd_at)
-        assert "AMD  $470.72  +1.10% today  after-hours $470.35 -0.08%  vol 12.4M (post)" == computable_line
+        assert (
+            "AMD  close $470.72 +1.10% vs prev close $465.58  "
+            "after-hours $470.35 -0.08% vs close  vol 12.4M (post)"
+        ) == computable_line
 
         # 2) ginlix shape where regular move cannot be computed (previous_close is None): omits main pct.
         uncomputable_snap = {**computable_snap, "previous_close": None}
         uncomputable_line = format_quote_line(uncomputable_snap, at=amd_at)
-        assert "AMD  $470.72  after-hours $470.35 -0.08%  vol 12.4M (post)" == uncomputable_line
+        assert (
+            "AMD  close $470.72  "
+            "after-hours $470.35 -0.08% vs close  vol 12.4M (post)"
+        ) == uncomputable_line
         assert "-9.99%" not in uncomputable_line
+
+    def test_ginlix_trade_timestamp_and_post_midnight_close_date_omission(self):
+        # DALTON-HOOK(extended-hours-quotes):
+        # 1) ginlix snapshot with trade time 17:00 ET and feed/quote as_of 17:15 ET:
+        #    stamps @ 17:00 ET when last_trade_at is present, or omits @ HH:MM ET when absent.
+        trade_1700_ms = int(_ET.localize(datetime(2026, 10, 23, 17, 0, 0)).timestamp() * 1000)
+        quote_1715_ms = int(_ET.localize(datetime(2026, 10, 23, 17, 15, 0)).timestamp() * 1000)
+        at_1715 = _ET.localize(datetime(2026, 10, 23, 17, 15, 5))
+        ginlix_post_with_trade_at = {
+            "symbol": "GOOG",
+            "price": 317.28,
+            "regular_close": 317.28,
+            "previous_close": 320.76,
+            "last_trade_price": 318.10,
+            "last_trade_at": trade_1700_ms,
+            "change": -2.66,
+            "change_percent": -0.8293,
+            "regular_trading_change": -3.48,
+            "regular_trading_change_percent": -1.0849,
+            "late_trading_change": 0.82,
+            "late_trading_change_percent": 0.2584,
+            "volume": 10_800_000,
+            "market_status": "late_trading",
+            "as_of": quote_1715_ms,
+            "source": "ginlix-data",
+            "tier": "realtime",
+        }
+        with_trade_line = format_quote_line(ginlix_post_with_trade_at, at=at_1715)
+        assert with_trade_line == (
+            "GOOG  close $317.28 -1.08% vs prev close $320.76  "
+            "after-hours $318.10 +0.26% vs close @ 17:00 ET  vol 10.8M (post)"
+        )
+        assert "@ 17:15 ET" not in with_trade_line
+
+        ginlix_post_without_trade_at = {
+            k: v for k, v in ginlix_post_with_trade_at.items() if k != "last_trade_at"
+        }
+        without_trade_line = format_quote_line(ginlix_post_without_trade_at, at=at_1715)
+        assert without_trade_line == (
+            "GOOG  close $317.28 -1.08% vs prev close $320.76  "
+            "after-hours $318.10 +0.26% vs close  vol 10.8M (post)"
+        )
+        assert "@" not in without_trade_line
+
+        # 2) ginlix after-close snapshot where as_of has rolled past midnight and regular_trading_date is absent:
+        #    never infers the close date from as_of.
+        past_midnight_ms = int(_ET.localize(datetime(2026, 10, 24, 0, 30, 0)).timestamp() * 1000)
+        at_past_midnight = _ET.localize(datetime(2026, 10, 24, 0, 35, 0))
+        ginlix_past_midnight = {
+            **ginlix_post_without_trade_at,
+            "market_status": "closed",
+            "as_of": past_midnight_ms,
+        }
+        past_midnight_line = format_quote_line(ginlix_past_midnight, at=at_past_midnight)
+        assert past_midnight_line == (
+            "GOOG  last close $317.28 -1.08% vs prev close $320.76  "
+            "after-hours $318.10 +0.26% vs last close  vol 10.8M (closed)"
+        )
+        assert "10-24" not in past_midnight_line
+        assert "10-23" not in past_midnight_line
+
+    def test_prior_day_as_of_without_regular_date_when_venue_open_writes_last_close(self):
+        # DALTON-HOOK(extended-hours-quotes): When regular_trading_date / regular_as_of are absent
+        # and as_of is from a previous trading day, even if market_status='open' during regular hours,
+        # the move basis must be 'last close', never falling back to 'today'.
+        stale_open_snap = {
+            "symbol": "GOOG",
+            "price": 330.95,
+            "previous_close": 336.40,
+            "change_percent": -1.62,
+            "volume": 19_200_000,
+            "market_status": "open",
+            "as_of": self._PREV_CLOSE_MS,
+            "tier": "delayed_15m",
+        }
+        line = format_quote_line(stale_open_snap, at=self._REG_ET)
+        assert "GOOG  $330.95 -1.62% last close vs prev close $336.40  vol 19.2M" in line
+        assert "today" not in line
+
+    def test_goog_four_sessions_and_hk_quote_identities(self):
+        # DALTON-HOOK(extended-hours-quotes): Lock pre-market, regular, after-hours, closed regular-only, and HK lines.
+        # 1) After-hours (盤後)
+        post_print_ms = int(_ET.localize(datetime(2026, 10, 23, 19, 59, 0)).timestamp() * 1000)
+        close_23_ms = int(_ET.localize(datetime(2026, 10, 23, 16, 0, 0)).timestamp() * 1000)
+        after_close_at = _ET.localize(datetime(2026, 10, 23, 20, 5, 0))
+        goog_post = {
+            "symbol": "GOOG",
+            "price": 317.28,
+            "regular_close": 317.28,
+            "previous_close": 320.76,
+            "last_trade_price": 318.10,
+            "change": -2.66,
+            "change_percent": -0.8293,
+            "regular_trading_change": -3.48,
+            "regular_trading_change_percent": -1.0849,
+            "late_trading_change": 0.82,
+            "late_trading_change_percent": 0.2584,
+            "volume": 10_800_000,
+            "market_status": "late_trading",
+            "as_of": post_print_ms,
+            "regular_as_of": close_23_ms,
+            "regular_trading_date": "2026-10-23",
+            "regular_only": False,
+            "tier": "realtime",
+        }
+        post_line = format_quote_line(goog_post, at=after_close_at)
+        assert post_line == (
+            "GOOG  close 10-23 $317.28 -1.08% vs prev close $320.76  "
+            "after-hours $318.10 +0.26% vs close @ 19:59 ET  vol 10.8M (closed)"
+        )
+
+        # 2) Pre-market (盤前): previous_close was overwritten to 320.76; derives 324.22 via regular_close - regular_trading_change.
+        pre_print_ms = int(_ET.localize(datetime(2026, 10, 26, 8, 15, 0)).timestamp() * 1000)
+        pre_at = _ET.localize(datetime(2026, 10, 26, 8, 15, 5))
+        goog_pre = {
+            "symbol": "GOOG",
+            "price": 320.76,
+            "regular_close": 320.76,
+            "previous_close": 320.76,
+            "last_trade_price": 322.26,
+            "change": 1.50,
+            "change_percent": 0.4676,
+            "regular_trading_change": -3.46,
+            "regular_trading_change_percent": -1.0672,
+            "early_trading_change": 1.50,
+            "early_trading_change_percent": 0.4676,
+            "volume": 10_800_000,
+            "market_status": "early_trading",
+            "as_of": pre_print_ms,
+            "regular_as_of": close_23_ms,
+            "regular_trading_date": "2026-10-23",
+            "regular_only": False,
+            "tier": "realtime",
+        }
+        pre_line = format_quote_line(goog_pre, at=pre_at)
+        assert pre_line == (
+            "GOOG  last close 10-23 $320.76 -1.07% vs prev close $324.22  "
+            "pre-market $322.26 +0.47% vs last close @ 08:15 ET  vol 10.8M (pre)"
+        )
+        # When regular_trading_change is unavailable in pre-market, omit the derived anchor price.
+        pre_no_change = format_quote_line(
+            {**goog_pre, "regular_trading_change": None}, at=pre_at
+        )
+        assert (
+            "GOOG  last close 10-23 $320.76 -1.07% vs prev close  "
+            "pre-market $322.26 +0.47% vs last close @ 08:15 ET  vol 10.8M (pre)"
+        ) == pre_no_change
+
+        # 3) Regular hours (盤中)
+        reg_at = _ET.localize(datetime(2026, 10, 23, 14, 30, 5))
+        reg_print_ms = int(_ET.localize(datetime(2026, 10, 23, 14, 30, 0)).timestamp() * 1000)
+        goog_open = {
+            "symbol": "GOOG",
+            "price": 317.50,
+            "last_trade_price": 317.50,
+            "previous_close": 317.28,
+            "change": 0.22,
+            "change_percent": 0.0693,
+            "volume": 10_800_000,
+            "market_status": "open",
+            "as_of": reg_print_ms,
+            "tier": "realtime",
+        }
+        open_line = format_quote_line(goog_open, at=reg_at)
+        assert open_line == "GOOG  $317.50 +0.07% today vs prev close $317.28  vol 10.8M"
+
+        # 4) Closed without after-hours data (收盤後，沒有盤後數據)
+        goog_closed_regular_only = {
+            "symbol": "GOOG",
+            "price": 317.28,
+            "regular_close": 317.28,
+            "previous_close": 320.76,
+            "change": -3.48,
+            "change_percent": -1.0849,
+            "regular_trading_change": -3.48,
+            "regular_trading_change_percent": -1.0849,
+            "volume": 10_800_000,
+            "as_of": close_23_ms,
+            "regular_as_of": close_23_ms,
+            "regular_trading_date": "2026-10-23",
+            "regular_only": True,
+            "tier": "realtime",
+        }
+        closed_line = format_quote_line(goog_closed_regular_only, at=after_close_at)
+        assert closed_line == (
+            "GOOG  close 10-23 $317.28 -1.08% vs prev close $320.76  vol 10.8M (closed)"
+        )
+
+        # 5) HK stock (港股): preserves existing layout and only appends "vs prev close HK$X".
+        hk_at = datetime(2026, 7, 2, 2, 30, tzinfo=timezone.utc)  # 10:30 HKT
+        hk_snap = {
+            "symbol": "0700.HK",
+            "price": 318.20,
+            "last_trade_price": 318.20,
+            "previous_close": 319.80,
+            "change_percent": -0.50,
+            "volume": 12_000_000,
+            "as_of": int(hk_at.timestamp() * 1000),
+            "tier": "realtime",
+        }
+        hk_line = format_quote_line(hk_snap, at=hk_at)
+        assert hk_line == (
+            "0700.HK  HK$318.20  -0.50% today vs prev close HK$319.80  "
+            "vol 12.0M (2026-07-02 10:30:00 HKT)"
+        )
+
+
+# DALTON-HOOK(extended-hours-quotes): a same-day non-US quote whose regular
+# fields are present but empty still reads "today", not "last close".
+def test_same_day_hk_quote_with_empty_regular_fields_reads_today():
+    from src.dalton.extended_hours import _regular_move_basis
+    from src.tools.market_data.quote_format import resolve_ref
+    at = datetime(2026, 10, 23, 3, 0, tzinfo=timezone.utc)  # 11:00 HKT, regular session
+    as_of_s = int(datetime(2026, 10, 23, 2, 55, tzinfo=timezone.utc).timestamp())
+    snap = {"symbol": "0700.HK", "price": 318.2, "as_of": as_of_s,
+            "regular_as_of": None, "regular_trading_date": None}
+    ref = resolve_ref("0700.HK")
+    assert ref is not None
+    assert _regular_move_basis(snap, ref, at, MarketPhase.REGULAR, has_ext=False) == "today"
