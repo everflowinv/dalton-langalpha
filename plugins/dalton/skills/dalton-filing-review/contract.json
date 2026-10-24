@@ -1,0 +1,40 @@
+{
+  "name": "dalton-filing-review",
+  "description": "公告审阅的完成契约：审阅笔记落盘 research/（cninfo 公告传 form=cninfo、accession=标题简称）+ 事件五词 verdict（trigger_kind=filing，手动无信号时 manual）；本轮 verdict 非 NO_CHANGE 时至少一份 thesis/debate/drivers/management 有本轮 source=tool 新版本（对应 dalton-filing-review SKILL 第 4–5 步）。",
+  "params_required": [
+    "ticker",
+    "as_of",
+    "form",
+    "accession"
+  ],
+  "stages": [
+    {
+      "name": "审阅笔记",
+      "artifacts": [
+        {
+          "path": "research/{as_of}-filing-{form}-{accession}.md",
+          "min_bytes": 200
+        }
+      ]
+    }
+  ],
+  "closing": {
+    "verdict_kinds_any": [
+      "NO_CHANGE",
+      "THESIS_STRENGTHENED",
+      "THESIS_WEAKENED",
+      "THESIS_BROKEN",
+      "NEW_THESIS"
+    ],
+    "verdict_trigger": [
+      "filing",
+      "manual"
+    ],
+    "knowledge_docs_any_unless_no_change": [
+      "thesis",
+      "debate",
+      "drivers",
+      "management"
+    ]
+  }
+}

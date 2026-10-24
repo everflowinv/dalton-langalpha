@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import posixpath
 import re
 import shlex
 from dataclasses import dataclass
@@ -89,26 +90,43 @@ async def _read_text(backend: Any, path: str) -> str | None:
         return None
 
 
+# The existence probe prints exactly one of these; an output with neither
+# (an error string, or nothing) means the probe could not run.
+_PROBE_PRESENT = "__DALTON_EXISTS__"
+_PROBE_ABSENT = "__DALTON_ABSENT__"
+
+
 async def _read_text_diagnosed(backend: Any, path: str) -> tuple[str, str | None]:
-    """("ok", text) | ("missing", None) | ("error", None) — a read failure on
-    a file the sandbox says exists is a transport error, not an absent file,
-    and the two must not share an outcome."""
-    text = None
-    transport_error = False
+    """("ok", text) | ("missing", None) | ("error", None).
+
+    ``missing`` demands an affirmative absence: the shell probe RAN and
+    printed its ABSENT marker — nothing else qualifies. A None read proves
+    nothing either way: the read layer answers None for an empty file and a
+    UTF-8 decode failure just as for a missing one (``sandbox files.py``).
+    No marker in the probe output — ``SandboxBackend.aexecute`` turns a dead
+    sandbox into exit code 1 with an error string — leaves existence
+    unknown, and unknown must never read as absent."""
     try:
         text = await backend.aread_text(path)
+        if text is not None:
+            return "ok", text
     except Exception:
-        transport_error = True
-    if text is not None:
-        return "ok", text
-    exists = await _run_command(backend, f"test -e {shlex.quote(path)}")
-    if exists is not None and exists[0] == 0:
-        return "error", None  # present but unreadable
-    if exists is not None and exists[0] != 0:
-        return "missing", None
-    if transport_error:
-        return "error", None
-    return "missing", None
+        pass
+    probe = await _run_command(
+        backend,
+        # Grouped so a failed `cd <workspace>` prints no marker at all
+        # instead of falling into the ABSENT arm of `||`.
+        f"{{ test -e {shlex.quote(path)} && echo {_PROBE_PRESENT} "
+        f"|| echo {_PROBE_ABSENT}; }}",
+    )
+    if probe is not None:
+        if _PROBE_PRESENT in probe[1]:
+            return "error", None  # present but unreadable
+        if _PROBE_ABSENT in probe[1]:
+            return "missing", None
+    # No marker (or no command runner at all): the probe never answered, so
+    # existence stays unknown no matter how the read came back None.
+    return "error", None
 
 
 def _workspace_cd(backend: Any) -> str:
@@ -240,6 +258,47 @@ async def _check_artifact(
     if artifact.get("requires_param") and not params.get(artifact["requires_param"]):
         return missing, warnings
 
+    condition = artifact.get("requires_json")
+    if condition:
+        # An unreadable state file is 无法核对, never "condition not met":
+        # skipping would let a lost material=yes pass without its note.
+        state_path = render_template(condition["json"], params)
+        status, state_text = await _read_text_diagnosed(backend, state_path)
+        if status == "missing":
+            _report(f"条件文件不存在（{state_path}），无法判定是否要求 {name}；下一步：重跑写它的步骤。")
+            return missing, warnings
+        if status != "ok" or state_text is None:
+            _report(f"条件文件读取出错（{state_path}），无法核对 {name}，请重试。")
+            return missing, warnings
+        try:
+            state = json.loads(state_text)
+        except ValueError:
+            _report(f"条件文件不可解析（{state_path}），无法核对 {name}，请重试。")
+            return missing, warnings
+        if not isinstance(state, dict):
+            _report(f"条件文件结构异常（{state_path}），无法核对 {name}，请重试。")
+            return missing, warnings
+        # A missing or non-string field is 无法核对, never "condition not met":
+        # {"run_id": ...} without material would otherwise skip the note and
+        # still read as done.
+        field = condition["field"]
+        value = state.get(field)
+        if not isinstance(value, str):
+            _report(
+                f"条件文件缺少字符串字段 {field}（{state_path}），"
+                f"无法判定是否要求 {name}；下一步：重跑写它的步骤。"
+            )
+            return missing, warnings
+        allowed = condition.get("allowed_values")
+        if allowed and value not in allowed:
+            _report(
+                f"条件文件字段 {field}={value!r} 不在允许值 {'/'.join(allowed)}"
+                f"（{state_path}），无法判定是否要求 {name}；下一步：重跑写它的步骤。"
+            )
+            return missing, warnings
+        if value != condition["equals"]:
+            return missing, warnings
+
     concrete: list[str] | None
     problems: list[str] = []
     if artifact.get("derive"):
@@ -321,6 +380,18 @@ async def _check_artifact(
             if text is None or marker not in text:
                 _report(
                     f"产物文件缺少完成标记 {marker}：{path}。下一步：补齐内容并写上标记。"
+                )
+        # Sidecars live beside each target the way check_draft writes them
+        # (draft stem + suffix), so a contract names only the draft path.
+        for sidecar in artifact.get("sidecars") or []:
+            sidecar_path = _derived_sidecar(path, sidecar["suffix"])
+            sidecar_info = await _file_info(backend, sidecar_path)
+            if not sidecar_info.exists:
+                _report(f"产物文件不存在：{sidecar_path}。下一步：补齐该阶段交付物后重查。")
+            elif sidecar_info.size < sidecar.get("min_bytes", 1):
+                _report(
+                    f"产物文件过小（{sidecar_path}，{sidecar_info.size} 字节 "
+                    f"< {sidecar['min_bytes']}），疑似占位。下一步：写满该交付物。"
                 )
     return missing, warnings
 
@@ -617,11 +688,15 @@ async def _review_pass(
     )
 
 
+def _derived_sidecar(path: str, suffix: str) -> str:
+    # Same stem convention as `src.dalton.publish.service._derive_sidecar_paths`.
+    if path.endswith(".md"):
+        return f"{path[:-3]}{suffix}"
+    return f"{path}{suffix}"
+
+
 def _sidecar_path(draft: str) -> str:
-    # Same derivation as `src.dalton.publish.service._derive_sidecar_paths`.
-    if draft.endswith(".md"):
-        return f"{draft[:-3]}.audit.md"
-    return f"{draft}.audit.md"
+    return _derived_sidecar(draft, ".audit.md")
 
 
 async def _check_stages(
@@ -728,7 +803,23 @@ async def _conditional_knowledge_docs(
         when = rule.get("when") or {}
         triggered = False
         if "field" in when and "equals" in when:
-            triggered = isinstance(doc, dict) and doc.get(when["field"]) == when["equals"]
+            field = when["field"]
+            value = doc.get(field) if isinstance(doc, dict) else None
+            # Same fail-closed rule as a requires_json artifact condition: a
+            # missing or out-of-domain value cannot stand in for "not met".
+            if not isinstance(value, str):
+                problems.append(
+                    f"条件文件缺少字符串字段 {field}（{path}），无法核对条件，请重跑该步骤。"
+                )
+                continue
+            allowed = when.get("allowed_values")
+            if allowed and value not in allowed:
+                problems.append(
+                    f"条件文件字段 {field}={value!r} 不在允许值 {'/'.join(allowed)}"
+                    f"（{path}），无法核对条件，请重跑该步骤。"
+                )
+                continue
+            triggered = value == when["equals"]
         elif when.get("any_gt"):
             total = 0
             if isinstance(doc, dict):
@@ -822,40 +913,250 @@ async def _check_closing(
             logger.warning("dalton_check_done verdict query failed", error=str(error))
             missing.append("verdict 无法核对（数据库查询失败），请重试。")
 
+    conditional_docs = closing.get("knowledge_docs_any_unless_no_change") or []
+    if conditional_docs and verdict_rows:
+        # Only reachable once this round's verdicts were read: a failed or
+        # empty verdict query is already its own missing entry above.
+        missing.extend(
+            await _check_knowledge_unless_no_change(
+                workspace_id, conditional_docs, verdict_rows, since
+            )
+        )
+
+    gate = closing.get("gated_draft")
+    if gate:
+        missing.extend(
+            await _check_gated_draft(backend, gate, params, workspace_id, since)
+        )
+
+    publication = closing.get("published_or_awaiting_pm")
+    if publication:
+        missing.extend(
+            await _check_published_or_awaiting(
+                backend, publication, params, workspace_id, user_id
+            )
+        )
+
     rule = closing.get("check_draft")
     if rule:
         draft = render_template(rule.get("draft") or contract.get("draft", ""), params)
         required = rule.get("required", True)
-        draft_text = await _read_text(backend, draft)
-        audit_text = await _read_text(backend, _sidecar_path(draft))
-        if draft_text is None:
-            message = f"check_draft 目标草稿不存在：{draft}。"
-        elif audit_text is None:
-            message = (
-                f"缺少数字核验侧车 {_sidecar_path(draft)}；"
-                f"下一步：对 {draft} 调用 check_draft。"
-            )
-        else:
-            match = _DRAFT_HASH_RE.search(audit_text)
-            if match is None:
-                message = (
-                    f"{_sidecar_path(draft)} 里读不到草稿哈希；"
-                    f"重新调用 check_draft(draft_path='{draft}')。"
-                )
-            else:
-                current = hashlib.sha256(draft_text.encode("utf-8")).hexdigest()
-                if not current.startswith(match.group(1)):
-                    message = (
-                        f"check_draft 核验的是旧草稿：侧车 {_sidecar_path(draft)} 记录哈希 "
-                        f"{match.group(1)[:12]}…，当前 {draft} 的哈希 "
-                        f"{current[:12]}…。下一步：对最终稿重新调用 check_draft。"
-                    )
-                else:
-                    message = ""
+        message = await _check_draft_sidecar(backend, draft)
         if message:
             # SKILL-optional check_draft: every failure mode stays a warning.
             (missing if required else warnings).append(message)
     return missing, warnings, since_label
+
+
+async def _check_draft_sidecar(backend: Any, draft: str) -> str:
+    """"" when ``draft``'s check_draft sidecar records the CURRENT draft's
+    hash, else the gap."""
+    draft_text = await _read_text(backend, draft)
+    audit_text = await _read_text(backend, _sidecar_path(draft))
+    if draft_text is None:
+        return f"check_draft 目标草稿不存在：{draft}。"
+    if audit_text is None:
+        return (
+            f"缺少数字核验侧车 {_sidecar_path(draft)}；"
+            f"下一步：对 {draft} 调用 check_draft。"
+        )
+    match = _DRAFT_HASH_RE.search(audit_text)
+    if match is None:
+        return (
+            f"{_sidecar_path(draft)} 里读不到草稿哈希；"
+            f"重新调用 check_draft(draft_path='{draft}')。"
+        )
+    current = hashlib.sha256(draft_text.encode("utf-8")).hexdigest()
+    if not current.startswith(match.group(1)):
+        return (
+            f"check_draft 核验的是旧草稿：侧车 {_sidecar_path(draft)} 记录哈希 "
+            f"{match.group(1)[:12]}…，当前 {draft} 的哈希 "
+            f"{current[:12]}…。下一步：对最终稿重新调用 check_draft。"
+        )
+    return ""
+
+
+async def _check_knowledge_unless_no_change(
+    workspace_id: str | None,
+    docs: list[str],
+    verdict_rows: list[dict[str, Any]],
+    since: datetime,
+) -> list[str]:
+    """A non-NO_CHANGE word among this round's verdicts pulls at least one
+    knowledge update behind it. Any such row counts — the stricter reading
+    when one day carries several rounds."""
+    changed = sorted(
+        {str(row.get("word")) for row in verdict_rows if row.get("word") != "NO_CHANGE"}
+    )
+    if not changed:
+        return []
+    if not workspace_id:
+        return ["无 workspace_id，条件知识更新无法核对（需在公司工作区线程调用），请重试。"]
+    try:
+        found = await _check_knowledge_versions(workspace_id, docs, since)
+    except Exception as error:
+        logger.warning(
+            "dalton_check_done conditional knowledge query failed", error=str(error)
+        )
+        return [
+            (
+                "条件知识更新无法核对（数据库查询失败），请重试；"
+                f"待核对：{'、'.join(docs)}。"
+            )
+        ]
+    if any(found.get(doc) for doc in docs):
+        return []
+    return [
+        (
+            f"本轮 verdict 为 {'/'.join(changed)}（非 NO_CHANGE），但知识层 {'、'.join(docs)} "
+            f"自 {since.date().isoformat()} 起均无 source=tool 新版本（至少需要其一）；"
+            "下一步：用 knowledge_update 写入受影响的文档。"
+        )
+    ]
+
+
+async def _check_gated_draft(
+    backend: Any,
+    gate: dict[str, Any],
+    params: dict[str, Any],
+    workspace_id: str | None,
+    since: datetime,
+) -> list[str]:
+    """The two gate branches, each with its own signature: a formal draft
+    (gate passed) owes size + a current check_draft sidecar; no draft (gate
+    failed) owes this round's verdict word. Neither signature readable is
+    无法判定, never a pass."""
+    draft = render_template(gate["draft"], params)
+    status, text = await _read_text_diagnosed(backend, draft)
+    if status == "error" or (status == "ok" and text is None):
+        return [f"正式草稿读取出错（{draft}），无法判定门禁结果，请重试。"]
+    if status == "ok":
+        gaps: list[str] = []
+        need = gate.get("min_bytes")
+        size = len((text or "").encode("utf-8"))
+        if need and size < need:
+            gaps.append(
+                f"正式草稿过小（{draft}，{size} 字节 < {need}），疑似占位。下一步：写满该交付物。"
+            )
+        message = await _check_draft_sidecar(backend, draft)
+        if message:
+            gaps.append(message)
+        return gaps
+
+    kinds = list(gate["absent_verdict_kinds_any"])
+    if not workspace_id:
+        return [
+            (
+                f"没有正式草稿 {draft}，且无 workspace_id 无法核对门禁未过分支的 verdict；"
+                "无法判定门禁结果，请在公司工作区线程重试。"
+            )
+        ]
+    try:
+        rows = await _check_verdicts(workspace_id, kinds=kinds, since=since)
+    except Exception as error:
+        logger.warning("dalton_check_done gate verdict query failed", error=str(error))
+        return [
+            (
+                f"没有正式草稿 {draft}，门禁未过分支的 verdict 无法核对（数据库查询失败），"
+                "无法判定门禁结果，请重试。"
+            )
+        ]
+    if rows:
+        return []
+    return [
+        (
+            f"无法判定门禁结果：既没有正式草稿 {draft}（门禁通过分支），"
+            f"自 {since.date().isoformat()} 起也没有 word ∈ {'/'.join(kinds)} 的 verdict"
+            "（门禁未过分支）；下一步：门禁全过就写草稿并 check_draft，"
+            "门禁未过就用 knowledge_append_verdict 写 NO_CHANGE。"
+        )
+    ]
+
+
+def _workspace_relative(path: str, workspace_dir: str | None) -> str:
+    """One canonical form for a path as its writer spelled it. With a root,
+    both spellings FIRST resolve to an absolute path — a relative one joins
+    onto the workspace root — and only THEN ``posixpath.normpath`` collapses
+    ``..``, so ``/root/../root/drafts/x.md`` and ``drafts/x.md`` meet as the
+    same file; the root is compared away last. Without a root only the
+    relative form is canonicalizable, so absolute spellings never match."""
+    cleaned = path.strip()
+    root = str(workspace_dir).rstrip("/") if workspace_dir else ""
+    if not root:
+        cleaned = posixpath.normpath(cleaned)
+        while cleaned.startswith("./"):
+            cleaned = cleaned[2:]
+        return cleaned
+    absolute = cleaned if cleaned.startswith("/") else posixpath.join(root, cleaned)
+    normalized = posixpath.normpath(absolute)
+    if normalized == root or normalized.startswith(root + "/"):
+        return normalized[len(root) :].lstrip("/") or "."
+    return normalized  # resolves outside the workspace: a different file
+
+
+def _same_workspace_path(
+    recorded: Any, expected: str, workspace_dir: str | None = None
+) -> bool:
+    """``publish_report`` keeps the draft_path as the caller spelled it —
+    relative, ``./``-prefixed, or absolute inside the workspace. Both sides
+    normalize to workspace-relative and must match in full: a path merely
+    ENDING in the draft (``archive/drafts/x.md``) or escaping it
+    (``../Other/drafts/x.md``) is a different file."""
+    if not isinstance(recorded, str):
+        return False
+    return _workspace_relative(recorded, workspace_dir) == _workspace_relative(
+        expected, workspace_dir
+    )
+
+
+async def _check_published_or_awaiting(
+    backend: Any,
+    rule: dict[str, Any],
+    params: dict[str, Any],
+    workspace_id: str | None,
+    user_id: str | None,
+) -> list[str]:
+    """One of the two publication states must exist: the immutable
+    ``published/`` copy, or this workspace's ``awaiting_pm`` request for the
+    draft. A query that cannot run is 无法核对, never a warning."""
+    draft = render_template(rule["draft"], params)
+    published = render_template(rule["published"], params)
+    info = await _file_info(backend, published)
+    if info.exists and info.size > 0:
+        return []
+    if not user_id or not workspace_id:
+        return [
+            (
+                f"没有 published/ 副本 {published}，且缺少 user_id/workspace_id 无法查询本工作区的 "
+                "awaiting_pm 发布请求；发布状态无法核对，请在公司工作区线程重试。"
+            )
+        ]
+    try:
+        from src.dalton.database.publications import list_pending
+
+        requests = await list_pending(user_id, "awaiting_pm")
+    except Exception as error:
+        logger.warning("dalton_check_done awaiting_pm query failed", error=str(error))
+        return ["发布状态无法核对（awaiting_pm 查询失败），请重试。"]
+    # An autospec'd backend answers `workspace_dir` with a Mock — only a real
+    # string root can anchor an absolute spelling of the draft.
+    workspace_dir = getattr(backend, "workspace_dir", None)
+    if not isinstance(workspace_dir, str):
+        workspace_dir = None
+    for request in requests:
+        if not isinstance(request, dict):
+            continue
+        if str(request.get("workspace_id") or "") != str(workspace_id):
+            continue
+        if _same_workspace_path(request.get("draft_path"), draft, workspace_dir):
+            return []
+    return [
+        (
+            f"既没有 published/ 副本 {published}，也没有本工作区 draft_path={draft} 的 "
+            "awaiting_pm 发布请求；下一步：调用 publish_report 提交发布，或按其返回处理"
+            "（audit_failed / review_revise 修稿重提），不得汇报发布完成。"
+        )
+    ]
 
 
 async def run_check_done(
@@ -950,7 +1251,7 @@ def create_check_done_tools(
     ) -> str:
         """对照完成契约核对一次 workflow/多步 skill 是否真的做完，汇报完成前必须调用。
 
-        传 workflow 名（initial-coverage、full-coverage、bullbear-doc、earnings-deep-update、weekly-coverage-review、topic-research 之一），params 用启动时的同一组参数；run_id 传本次运行的 task id（.progress.json 的 run_id），不传则取本线程最近一次同名 workflow 的 run。
+        传 workflow 名（initial-coverage、full-coverage、bullbear-doc、earnings-deep-update、weekly-coverage-review、topic-research 之一）或多步 skill 名（dalton-earnings-preview、dalton-earnings-flash、dalton-stock-move、dalton-filing-review、dalton-thesis-delta、dalton-call、dalton-publish 之一，params 按该 SKILL 收尾段所列），params 用启动时的同一组参数；run_id 传本次运行的 task id（.progress.json 的 run_id），不传则取本线程最近一次同名 workflow 的 run。
         workflow 关闭、按 SKILL 手动降级执行时，params 加 "manual": true，审稿改核对 SKILL 指定的 review.json。
         只读不改：重查文件、哈希、校验脚本、知识层版本、verdict 与本次 run 的审稿 pass。不通过时先补齐 missing 再查；补不了的只能汇报"未完成"。
         Returns: JSON {done, missing, warnings}，missing 为中文缺项与下一步。

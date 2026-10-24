@@ -103,6 +103,11 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 13. [ ] **缺失数据显式标注**：未披露或尚未入库的数据均已显式注明（如“未提供”、“卖方修正未出，次日深度点评补”），零脑补推断；
 14. [ ] **来源可一定位**：`Sources` 包含全部采用材料的直接 URL、SEC accession 或内部库 `doc_id` / `mail:ID`。
 
+### 收尾门禁：汇报完成前必须过完成契约（`dalton_check_done`）
+
+- 快讯落盘 `research/<D>-flash-<季度>.md`、写完 verdict 之后、推送 PM 之前，调用 `dalton_check_done(workflow="dalton-earnings-flash", params={"ticker": ..., "quarter": ..., "as_of": "<本稿 D>"})`。
+- `done=false` 时按 `missing` 先补齐再查（快讯文件缺失或过小就补齐、verdict 未写或 `trigger.kind` 不是 `earnings` 就 `knowledge_append_verdict`）；补不了的缺项只能汇报“未完成”并列出缺项与原因，不得汇报“完成”。
+
 ---
 
 ## 输出模板

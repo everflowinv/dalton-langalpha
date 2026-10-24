@@ -166,6 +166,12 @@ python3 .agents/skills/dalton-stock-move/scripts/move_quant.py analyze \
    - **若判定为 `sector_beta` 且第 3–6 步确认无个股基本面事件**：只执行 `knowledge_append_verdict`（记 `NO_CHANGE`、`progress="none"`），**不向 PM 推送消息**。
    - **若为 `stock_specific`、`mixed`，或虽为板块波动但伴随本公司特定事件/影响 thesis**：推送归因摘要给 PM。
 
+### 收尾门禁：汇报完成前必须过完成契约（`dalton_check_done`）
+
+- 向 PM 汇报“完成”（或静默 beta 轮次记 `NO_CHANGE` 收尾）前，必须调用 `dalton_check_done(workflow="dalton-stock-move", params={"ticker": ..., "as_of": "<异动日 YYYY-MM-DD>"})`。
+- 契约要求：`research/<异动日>-stock-move.md` 归因笔记、本轮 `trigger.kind="price_move"` 的 verdict；verdict 不是 `NO_CHANGE` 时，`thesis`/`debate`/`drivers`/`management` 至少一份须有本轮 `knowledge_update` 写入的新版本。
+- `done=false` 时按 `missing` 先补齐再查（归因笔记缺失就补写、verdict 未写就 `knowledge_append_verdict`、非 `NO_CHANGE` 却没有知识更新就对受影响的文档 `knowledge_update`）；补不了的缺项只能汇报“未完成”并列出缺项与原因，不得汇报“完成”。
+
 ---
 
 ## 附：批量生成 Core 价格触发自动任务

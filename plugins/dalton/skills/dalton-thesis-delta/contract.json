@@ -1,0 +1,71 @@
+{
+  "name": "dalton-thesis-delta",
+  "description": "每晚 thesis 增量跟踪的完成契约：本轮 collect.py commit 已落盘（last_run.json 今天写入、updates.log）+ 事件五词 verdict；last_run.json 的 material=yes 时还要求增量笔记与至少一份受影响知识文档的本轮更新，material=no 时无笔记是合法结果（对应 dalton-thesis-delta SKILL 第 3–4 步）。",
+  "params_required": [
+    "ticker",
+    "as_of"
+  ],
+  "stages": [
+    {
+      "name": "提交状态（commit）",
+      "artifacts": [
+        {
+          "path": "research/tracker/last_run.json",
+          "min_bytes": 10,
+          "modified_on": "today"
+        },
+        {
+          "path": "research/tracker/updates.log",
+          "min_bytes": 1,
+          "modified_on": "today"
+        }
+      ]
+    },
+    {
+      "name": "增量笔记（仅 material=yes）",
+      "artifacts": [
+        {
+          "path": "research/{as_of}-delta.md",
+          "min_bytes": 100,
+          "requires_json": {
+            "json": "research/tracker/last_run.json",
+            "field": "material",
+            "equals": "yes",
+            "allowed_values": [
+              "yes",
+              "no"
+            ]
+          }
+        }
+      ]
+    }
+  ],
+  "closing": {
+    "verdict_kinds_any": [
+      "NO_CHANGE",
+      "THESIS_STRENGTHENED",
+      "THESIS_WEAKENED",
+      "THESIS_BROKEN",
+      "NEW_THESIS"
+    ],
+    "knowledge_docs_if_json": [
+      {
+        "json": "research/tracker/last_run.json",
+        "when": {
+          "field": "material",
+          "equals": "yes",
+          "allowed_values": [
+            "yes",
+            "no"
+          ]
+        },
+        "docs_any": [
+          "thesis",
+          "debate",
+          "drivers",
+          "management"
+        ]
+      }
+    ]
+  }
+}

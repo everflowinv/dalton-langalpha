@@ -22,10 +22,10 @@ import psycopg
 import pytest
 
 from ptc_agent.agent.backends.sandbox import SandboxBackend
+from src.dalton.database.publications import list_pending as _REAL_LIST_PENDING
+from src.dalton.database.verdicts import list_verdicts as _REAL_LIST_VERDICTS
 from src.dalton.tools import check_done_tools
 from src.dalton.tools.check_done_tools import run_check_done
-
-from src.dalton.database.verdicts import list_verdicts as _REAL_LIST_VERDICTS
 
 WS = "ws-1"
 PARAMS = {"ticker": "META", "workspace_dir": ".", "as_of": "2026-10-23"}
@@ -44,19 +44,33 @@ def _make_backend(
     *,
     validator_exit: int = 0,
     mtimes: dict[str, int] | None = None,
+    read_error: bool = False,
+    execute_error: bool = False,
+    read_none_paths: frozenset[str] | set[str] = frozenset(),
 ) -> Any:
     """A spec'd sandbox backend serving ``files`` and scripted commands.
 
     ``wc -c`` answers sizes from the file table, ``stat -c %Y`` mtimes from
-    ``mtimes`` (defaulting to now); every other command carries the validator
+    ``mtimes`` (defaulting to now), the existence probe prints the tool's
+    PRESENT/ABSENT marker; every other command carries the validator
     verdict, so a contract command's exit code is the one knob a test needs.
+    ``read_error``/``execute_error`` model a dead sandbox: reads raise and
+    commands fail without the probe marker (the real backend converts both
+    to exit code 1 with an error string, never a marker). Reads answer None
+    for paths in ``read_none_paths`` and for EMPTY files, exactly as the
+    real read layer does (empty file and UTF-8 decode failure both read as
+    None, not as an exception).
     """
     backend = create_autospec(SandboxBackend, instance=True)
     now = int(time.time())
     mtimes = mtimes or {}
 
     async def _aread_text(path: str) -> str | None:
-        return files.get(path)
+        if read_error:
+            raise RuntimeError("sandbox unreachable")
+        if path in read_none_paths:
+            return None  # decode failure: the real read layer answers None
+        return files.get(path) or None
 
     async def _aglob_paths(pattern: str, path: str = ".") -> list[str]:
         return [key for key in files if fnmatch(key, pattern)]
@@ -67,6 +81,8 @@ def _make_backend(
                 self.output = output
                 self.exit_code = exit_code
 
+        if execute_error:
+            raise RuntimeError("sandbox unreachable")
         # Real commands may carry the cd-into-workspace prefix; a fake that
         # ignored it would mis-answer every probe (the round-4 lesson).
         body = command
@@ -84,9 +100,10 @@ def _make_backend(
             if path not in files:
                 return _Response("", 1)
             return _Response(str(mtimes.get(path, now)), 0)
-        if body.startswith("test -e"):
-            path = body.removeprefix("test -e ").strip().strip("'\"")
-            return _Response("", 0 if path in files else 1)
+        if "test -e " in body:
+            path = body.split("test -e ", 1)[1].split(" &&", 1)[0].strip().strip("'\"")
+            found = check_done_tools._PROBE_PRESENT if path in files else check_done_tools._PROBE_ABSENT
+            return _Response(found, 0)
         return _Response("stub validator output", validator_exit)
 
     backend.aread_text.side_effect = _aread_text
@@ -788,17 +805,17 @@ async def test_review_scan_stays_inside_the_calling_thread(
 @pytest.mark.asyncio
 async def test_unknown_name_reports_undefined_contract() -> None:
     result = await run_check_done(
-        workflow="dalton-earnings-preview",
-        params={"ticker": "META", "quarter": "FY26Q3", "as_of": "2026-10-23"},
+        workflow="dalton-agenda",
+        params={"ticker": "META", "as_of": "2026-10-23"},
         backend=_make_backend({}),
         workspace_id=WS,
     )
     assert result == {
         "done": False,
-        "missing": ["dalton-earnings-preview 尚未定义完成契约"],
+        "missing": ["dalton-agenda 尚未定义完成契约"],
         "warnings": [],
         "checked": {
-            "workflow": "dalton-earnings-preview",
+            "workflow": "dalton-agenda",
             "since": result["checked"]["since"],
             "run_id": None,
         },
@@ -852,7 +869,8 @@ async def test_modified_on_today_ignores_report_dates(
     _patch_verdicts(monkeypatch, [_verdict_row("NO_CHANGE", trigger_kind="earnings")])
     _freeze_execution_day(monkeypatch, "2026-10-23")
 
-    from datetime import datetime as _dt, timezone as _tz
+    from datetime import datetime as _dt
+    from datetime import timezone as _tz
 
     # Explicitly between the release day (10-20) and the execution day (10-23).
     stale = int(_dt(2026, 10, 20, 12, tzinfo=_tz.utc).timestamp())
@@ -884,7 +902,8 @@ async def test_one_final_model_version_across_checks(
     """A higher version on disk is THE final model everywhere: mtime and
     size speak only about it — an old-mtime v01 does not fail freshness,
     and a stale v02 does."""
-    from datetime import datetime as _dt, timezone as _tz
+    from datetime import datetime as _dt
+    from datetime import timezone as _tz
 
     params = {
         "ticker": "META",
@@ -1177,3 +1196,542 @@ async def test_manual_sidecar_refused_when_only_a_journal_marks_the_run(
     )
     result = await _manual_check(monkeypatch, files, MANUAL_PARAMS)
     assert not result["done"], result
+
+
+# ------------------------------------------------- multi-step skill contracts
+
+
+def _sidecar_for(draft_text: str) -> str:
+    return (
+        "# 数字核验报告\n- **草稿哈希**：`" + _draft_hash(draft_text)[:16] + "…`\n"
+    )
+
+
+PREVIEW_PARAMS = {"ticker": "META", "quarter": "FY26Q3", "as_of": "2026-10-23"}
+PREVIEW_DRAFT = "drafts/2026-10-23-preview-FY26Q3.md"
+PREVIEW_PRED = "research/2026-10-23-preview-FY26Q3/predictions.json"
+
+
+def _preview_files(draft_text: str = "# 前瞻\n" + "判断" * 300) -> dict[str, str]:
+    return {
+        PREVIEW_DRAFT: draft_text,
+        "drafts/2026-10-23-preview-FY26Q3.audit.md": _sidecar_for(draft_text),
+        PREVIEW_PRED: json.dumps({"predictions": [{"id": "P1", "metric": "revenue"}] * 3}),
+    }
+
+
+@pytest.mark.asyncio
+async def test_earnings_preview_complete_reports_done(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_knowledge(monkeypatch, ["drivers", "debate"])
+    _patch_verdicts(monkeypatch, [_verdict_row("NO_CHANGE", trigger_kind="earnings")])
+    backend = _make_backend(_preview_files())
+    result = await run_check_done(
+        workflow="dalton-earnings-preview",
+        params=PREVIEW_PARAMS,
+        backend=backend,
+        workspace_id=WS,
+    )
+    assert result["done"] is True, result["missing"]
+    # The strict predictions validator really re-ran.
+    assert any(
+        "predictions.py validate" in call.args[0] and "--strict" in call.args[0]
+        for call in backend.aexecute.call_args_list
+    )
+
+
+@pytest.mark.asyncio
+async def test_earnings_preview_reports_each_gap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Failed strict validation, a sidecar of an older draft, a missing debate
+    version and a verdict on the wrong trigger are four separate gaps."""
+    files = _preview_files()
+    files[PREVIEW_DRAFT] = files[PREVIEW_DRAFT] + "\n改稿后新增一段。"
+    _patch_knowledge(monkeypatch, ["drivers"])
+    _patch_verdicts(monkeypatch, [_verdict_row("NO_CHANGE", trigger_kind="manual")])
+    result = await run_check_done(
+        workflow="dalton-earnings-preview",
+        params=PREVIEW_PARAMS,
+        backend=_make_backend(files, validator_exit=1),
+        workspace_id=WS,
+    )
+    missing = result["missing"]
+    assert result["done"] is False
+    assert any("校验未通过" in m and "predictions.py" in m for m in missing)
+    assert any("旧草稿" in m for m in missing)
+    assert any("知识层 debate" in m for m in missing)
+    assert any("trigger_kind=earnings" in m for m in missing)
+
+
+@pytest.mark.asyncio
+async def test_earnings_flash_needs_research_note_and_earnings_verdict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    params = {"ticker": "META", "quarter": "FY26Q3", "as_of": "2026-10-23"}
+    note = {"research/2026-10-23-flash-FY26Q3.md": "快讯" * 200}
+    _patch_verdicts(monkeypatch, [_verdict_row("THESIS_STRENGTHENED", trigger_kind="earnings")])
+    done = await run_check_done(
+        workflow="dalton-earnings-flash", params=params,
+        backend=_make_backend(note), workspace_id=WS,
+    )
+    assert done["done"] is True, done["missing"]
+
+    gap = await run_check_done(
+        workflow="dalton-earnings-flash", params=params,
+        backend=_make_backend({}), workspace_id=WS,
+    )
+    assert any("research/2026-10-23-flash-FY26Q3.md" in m for m in gap["missing"])
+
+
+MOVE_PARAMS = {"ticker": "META", "as_of": "2026-10-23"}
+MOVE_FILES = {"research/2026-10-23-stock-move.md": "归因" * 200}
+
+
+@pytest.mark.asyncio
+async def test_stock_move_no_change_needs_no_knowledge_update(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_knowledge(monkeypatch, [])
+    _patch_verdicts(monkeypatch, [_verdict_row("NO_CHANGE", trigger_kind="price_move")])
+    result = await run_check_done(
+        workflow="dalton-stock-move", params=MOVE_PARAMS,
+        backend=_make_backend(MOVE_FILES), workspace_id=WS,
+    )
+    assert result["done"] is True, result["missing"]
+
+
+@pytest.mark.asyncio
+async def test_stock_move_changed_verdict_requires_a_knowledge_update(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_knowledge(monkeypatch, [])
+    _patch_verdicts(monkeypatch, [_verdict_row("THESIS_WEAKENED", trigger_kind="price_move")])
+    result = await run_check_done(
+        workflow="dalton-stock-move", params=MOVE_PARAMS,
+        backend=_make_backend(MOVE_FILES), workspace_id=WS,
+    )
+    assert result["done"] is False
+    assert any("THESIS_WEAKENED" in m and "非 NO_CHANGE" in m for m in result["missing"])
+
+    _patch_knowledge(monkeypatch, ["debate"])
+    result = await run_check_done(
+        workflow="dalton-stock-move", params=MOVE_PARAMS,
+        backend=_make_backend(MOVE_FILES), workspace_id=WS,
+    )
+    assert result["done"] is True, result["missing"]
+
+
+@pytest.mark.asyncio
+async def test_stock_move_conditional_knowledge_query_failure_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_knowledge_error(monkeypatch)
+    _patch_verdicts(monkeypatch, [_verdict_row("NEW_THESIS", trigger_kind="price_move")])
+    result = await run_check_done(
+        workflow="dalton-stock-move", params=MOVE_PARAMS,
+        backend=_make_backend(MOVE_FILES), workspace_id=WS,
+    )
+    assert result["done"] is False
+    assert any("条件知识更新无法核对" in m for m in result["missing"])
+
+
+@pytest.mark.asyncio
+async def test_filing_review_accepts_filing_or_manual_trigger_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    params = {"ticker": "META", "as_of": "2026-10-23", "form": "8-K", "accession": "123456"}
+    files = {"research/2026-10-23-filing-8-K-123456.md": "审阅" * 200}
+    for trigger, expect_done in (("filing", True), ("manual", True), ("earnings", False)):
+        _patch_verdicts(monkeypatch, [_verdict_row("NO_CHANGE", trigger_kind=trigger)])
+        result = await run_check_done(
+            workflow="dalton-filing-review", params=params,
+            backend=_make_backend(files), workspace_id=WS,
+        )
+        assert result["done"] is expect_done, (trigger, result["missing"])
+
+
+DELTA_PARAMS = {"ticker": "META", "as_of": "2026-10-23"}
+LAST_RUN = "research/tracker/last_run.json"
+
+
+def _delta_files(material: str, *, with_note: bool) -> dict[str, str]:
+    files = {
+        LAST_RUN: json.dumps({"run_id": "20261023-2000", "material": material}),
+        "research/tracker/updates.log": "2026-10-23 20:00 | 20261023-2000 | material=no | 无新增\n",
+    }
+    if with_note:
+        files["research/2026-10-23-delta.md"] = "增量" * 100
+    return files
+
+
+@pytest.mark.asyncio
+async def test_thesis_delta_material_no_without_note_is_done(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_knowledge(monkeypatch, [])
+    _patch_verdicts(monkeypatch, [_verdict_row("NO_CHANGE", trigger_kind="indicator")])
+    result = await run_check_done(
+        workflow="dalton-thesis-delta", params=DELTA_PARAMS,
+        backend=_make_backend(_delta_files("no", with_note=False)), workspace_id=WS,
+    )
+    assert result["done"] is True, result["missing"]
+
+
+@pytest.mark.asyncio
+async def test_thesis_delta_material_yes_needs_note_and_knowledge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_knowledge(monkeypatch, [])
+    _patch_verdicts(monkeypatch, [_verdict_row("THESIS_STRENGTHENED", trigger_kind="filing")])
+    result = await run_check_done(
+        workflow="dalton-thesis-delta", params=DELTA_PARAMS,
+        backend=_make_backend(_delta_files("yes", with_note=False)), workspace_id=WS,
+    )
+    missing = result["missing"]
+    assert result["done"] is False
+    assert any("research/2026-10-23-delta.md" in m for m in missing)
+    assert any("至少需要其一" in m for m in missing)
+
+    _patch_knowledge(monkeypatch, ["drivers"])
+    result = await run_check_done(
+        workflow="dalton-thesis-delta", params=DELTA_PARAMS,
+        backend=_make_backend(_delta_files("yes", with_note=True)), workspace_id=WS,
+    )
+    assert result["done"] is True, result["missing"]
+
+
+@pytest.mark.asyncio
+async def test_thesis_delta_stale_or_unreadable_last_run_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _freeze_execution_day(monkeypatch, "2026-10-23")
+    _patch_knowledge(monkeypatch, [])
+    _patch_verdicts(monkeypatch, [_verdict_row("NO_CHANGE")])
+    from datetime import datetime as _dt
+
+    yesterday = int(_dt.fromisoformat("2026-10-22T12:00:00+00:00").timestamp())
+    stale = await run_check_done(
+        workflow="dalton-thesis-delta", params=DELTA_PARAMS,
+        backend=_make_backend(
+            _delta_files("no", with_note=False), mtimes={LAST_RUN: yesterday}
+        ),
+        workspace_id=WS,
+    )
+    assert any("不是本轮写的" in m and LAST_RUN in m for m in stale["missing"])
+
+    files = _delta_files("no", with_note=False)
+    files[LAST_RUN] = "{not json"
+    broken = await run_check_done(
+        workflow="dalton-thesis-delta", params=DELTA_PARAMS,
+        backend=_make_backend(files), workspace_id=WS,
+    )
+    assert broken["done"] is False
+    assert any("条件文件不可解析" in m for m in broken["missing"])
+
+
+@pytest.mark.asyncio
+async def test_thesis_delta_missing_material_field_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A same-day last_run.json WITHOUT the declared material field is 无法
+    核对: reading it as "condition not met" would skip the delta note and the
+    knowledge check while everything else passes."""
+    _patch_knowledge(monkeypatch, [])
+    _patch_verdicts(monkeypatch, [_verdict_row("NO_CHANGE", trigger_kind="indicator")])
+    files = _delta_files("no", with_note=False)
+    files[LAST_RUN] = json.dumps({"run_id": "20261023-2000"})
+    result = await run_check_done(
+        workflow="dalton-thesis-delta", params=DELTA_PARAMS,
+        backend=_make_backend(files), workspace_id=WS,
+    )
+    missing = result["missing"]
+    assert result["done"] is False
+    assert any("缺少字符串字段 material" in m for m in missing)
+    assert any(m.startswith("条件文件缺少字符串字段 material") for m in missing)
+    assert sum("缺少字符串字段 material" in m for m in missing) == 2  # artifact + knowledge
+
+
+@pytest.mark.asyncio
+async def test_thesis_delta_material_out_of_domain_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """material must be yes or no — any other value is unverifiable, not a
+    no-requirements round; yes/no keep their two existing paths."""
+    _patch_knowledge(monkeypatch, [])
+    _patch_verdicts(monkeypatch, [_verdict_row("NO_CHANGE", trigger_kind="indicator")])
+    files = _delta_files("maybe", with_note=False)
+    result = await run_check_done(
+        workflow="dalton-thesis-delta", params=DELTA_PARAMS,
+        backend=_make_backend(files), workspace_id=WS,
+    )
+    assert result["done"] is False
+    assert sum("不在允许值" in m and "material" in m for m in result["missing"]) == 2
+
+
+CALL_PARAMS = {"ticker": "META", "as_of": "2026-10-23"}
+CALL_DRAFT = "drafts/2026-10-23-call-META.md"
+
+
+@pytest.mark.asyncio
+async def test_call_gate_passed_branch_needs_current_check_draft(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    draft = "# Conviction Call\n" + "论证" * 300
+    # The gate-passed branch never consults verdicts (they come after PM approval).
+    _patch_verdicts(monkeypatch, error=RuntimeError("must not be queried"))
+    files = {CALL_DRAFT: draft, "drafts/2026-10-23-call-META.audit.md": _sidecar_for(draft)}
+    result = await run_check_done(
+        workflow="dalton-call", params=CALL_PARAMS,
+        backend=_make_backend(files), workspace_id=WS,
+    )
+    assert result["done"] is True, result["missing"]
+
+    files["drafts/2026-10-23-call-META.audit.md"] = _sidecar_for("旧稿")
+    stale = await run_check_done(
+        workflow="dalton-call", params=CALL_PARAMS,
+        backend=_make_backend(files), workspace_id=WS,
+    )
+    assert any("旧草稿" in m for m in stale["missing"])
+
+
+@pytest.mark.asyncio
+async def test_call_gate_failed_branch_needs_no_change_verdict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_verdicts(monkeypatch, [_verdict_row("NO_CHANGE")])
+    done = await run_check_done(
+        workflow="dalton-call", params=CALL_PARAMS,
+        backend=_make_backend({}), workspace_id=WS,
+    )
+    assert done["done"] is True, done["missing"]
+
+    # Neither signature: no draft and no NO_CHANGE word this round.
+    _patch_verdicts(monkeypatch, [_verdict_row("THESIS_WEAKENED")])
+    undecided = await run_check_done(
+        workflow="dalton-call", params=CALL_PARAMS,
+        backend=_make_backend({}), workspace_id=WS,
+    )
+    assert undecided["done"] is False
+    assert any("无法判定门禁结果" in m for m in undecided["missing"])
+
+    _patch_verdicts(monkeypatch, error=RuntimeError("db down"))
+    dead = await run_check_done(
+        workflow="dalton-call", params=CALL_PARAMS,
+        backend=_make_backend({}), workspace_id=WS,
+    )
+    assert dead["done"] is False
+    assert any("数据库查询失败" in m for m in dead["missing"])
+
+
+@pytest.mark.asyncio
+async def test_call_probe_failure_is_not_confirmed_absence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dead sandbox (reads raise, commands fail with no probe marker) must
+    not read as "no draft": the gate's absent branch would then clear on a
+    same-day NO_CHANGE verdict and report done."""
+    _patch_verdicts(monkeypatch, [_verdict_row("NO_CHANGE")])
+    result = await run_check_done(
+        workflow="dalton-call", params=CALL_PARAMS,
+        backend=_make_backend({}, read_error=True, execute_error=True),
+        workspace_id=WS,
+    )
+    assert result["done"] is False
+    assert any("正式草稿读取出错" in m and "无法判定门禁结果" in m for m in result["missing"])
+
+
+@pytest.mark.asyncio
+async def test_call_empty_file_with_dead_probe_is_not_absence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An EMPTY draft reads as None without raising (the read layer answers
+    None for empty files, files.py): a None read is not proof of absence,
+    so with the probe dead (exit 1, no marker) the gate cannot be decided
+    and a same-day NO_CHANGE must not clear it."""
+    _patch_verdicts(monkeypatch, [_verdict_row("NO_CHANGE")])
+    result = await run_check_done(
+        workflow="dalton-call", params=CALL_PARAMS,
+        backend=_make_backend({CALL_DRAFT: ""}, execute_error=True),
+        workspace_id=WS,
+    )
+    assert result["done"] is False
+    assert any("正式草稿读取出错" in m and "无法判定门禁结果" in m for m in result["missing"])
+
+
+@pytest.mark.asyncio
+async def test_call_decode_failure_with_dead_probe_is_not_absence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A UTF-8 decode failure reads as None the same way — existence stays
+    unknown, never the absent branch."""
+    _patch_verdicts(monkeypatch, [_verdict_row("NO_CHANGE")])
+    backend = _make_backend(
+        {CALL_DRAFT: "# Conviction Call\n" + "论证" * 300},
+        execute_error=True,
+        read_none_paths={CALL_DRAFT},
+    )
+    result = await run_check_done(
+        workflow="dalton-call", params=CALL_PARAMS,
+        backend=backend,
+        workspace_id=WS,
+    )
+    assert result["done"] is False
+    assert any("正式草稿读取出错" in m and "无法判定门禁结果" in m for m in result["missing"])
+
+
+# dalton-call's real publish naming: the DRAFT carries the date, the slug
+# does not — the contract's draft_path (not the slug) names draft + sidecars,
+# and the slug only builds the archive path.
+PUB_PARAMS = {
+    "draft_path": "drafts/2026-10-23-call-META.md",
+    "slug": "call-META",
+    "as_of": "2026-10-23",
+}
+PUB_DRAFT = PUB_PARAMS["draft_path"]
+PUB_ANNOTATED = "drafts/2026-10-23-call-META.annotated.md"
+
+
+def _publish_files() -> dict[str, str]:
+    draft = "# Conviction Call\n" + "论证" * 200
+    return {
+        PUB_DRAFT: draft,
+        "drafts/2026-10-23-call-META.audit.md": _sidecar_for(draft),
+        PUB_ANNOTATED: "标注" * 50,
+    }
+
+
+def test_same_workspace_path_requires_full_match() -> None:
+    """The awaiting_pm draft match joins both spellings onto the workspace
+    root FIRST and normpath's after, so /root/../root/drafts/x.md is the
+    same file as drafts/x.md — while a path that merely ends the same, or
+    escapes the workspace, stays a different file (the old suffix compare
+    let archive/drafts/x.md stand in for drafts/x.md)."""
+    same = check_done_tools._same_workspace_path
+    root = "/workspaces/META"
+    # Every spelling of THE file matches…
+    assert same("drafts/x.md", "drafts/x.md", root)
+    assert same("./drafts/x.md", "drafts/x.md", root)
+    assert same(f"{root}/drafts/x.md", "drafts/x.md", root)
+    assert same(f"{root}/../META/drafts/x.md", "drafts/x.md", root)
+    assert same("./drafts/x.md", f"{root}/drafts/x.md", root)
+    assert same("drafts/../drafts/x.md", "drafts/x.md", root)
+    # …and a path that merely ends the same, or escapes the workspace, does not.
+    assert not same("archive/drafts/x.md", "drafts/x.md", root)
+    assert not same("../Other/drafts/x.md", "drafts/x.md", root)
+    assert not same("/elsewhere/drafts/x.md", "drafts/x.md", root)
+    assert not same(None, "drafts/x.md", root)
+
+
+@pytest.mark.asyncio
+async def test_publish_done_when_published_or_awaiting_pm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    files = _publish_files()
+    files["published/2026-10-23-call-META.md"] = "归档" * 100
+    _patch_pending(monkeypatch, error=RuntimeError("must not be queried"))
+    published = await run_check_done(
+        workflow="dalton-publish", params=PUB_PARAMS,
+        backend=_make_backend(files), workspace_id=WS, user_id="user-1",
+    )
+    assert published["done"] is True, published["missing"]
+
+    _patch_pending(monkeypatch, [_pending_row("./drafts/2026-10-23-call-META.md")])
+    awaiting = await run_check_done(
+        workflow="dalton-publish", params=PUB_PARAMS,
+        backend=_make_backend(_publish_files()), workspace_id=WS, user_id="user-1",
+    )
+    assert awaiting["done"] is True, awaiting["missing"]
+
+    # The same request spelled absolutely inside the workspace still matches.
+    backend = _make_backend(_publish_files())
+    backend.workspace_dir = "/workspaces/ws-1"
+    _patch_pending(monkeypatch, [_pending_row("/workspaces/ws-1/drafts/2026-10-23-call-META.md")])
+    absolute = await run_check_done(
+        workflow="dalton-publish", params=PUB_PARAMS,
+        backend=backend, workspace_id=WS, user_id="user-1",
+    )
+    assert absolute["done"] is True, absolute["missing"]
+
+
+@pytest.mark.asyncio
+async def test_publish_gaps_fail_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Another workspace's request for the same path does not count.
+    _patch_pending(monkeypatch, [_pending_row(PUB_DRAFT, workspace_id="ws-other")])
+    foreign = await run_check_done(
+        workflow="dalton-publish", params=PUB_PARAMS,
+        backend=_make_backend(_publish_files()), workspace_id=WS, user_id="user-1",
+    )
+    assert any("awaiting_pm 发布请求" in m for m in foreign["missing"])
+
+    # A request whose draft_path merely ENDS the same (the old suffix match)
+    # is a different file.
+    _patch_pending(monkeypatch, [_pending_row("archive/drafts/2026-10-23-call-META.md")])
+    suffixed = await run_check_done(
+        workflow="dalton-publish", params=PUB_PARAMS,
+        backend=_make_backend(_publish_files()), workspace_id=WS, user_id="user-1",
+    )
+    assert any("awaiting_pm 发布请求" in m for m in suffixed["missing"])
+
+    _patch_pending(monkeypatch, error=RuntimeError("db down"))
+    dead = await run_check_done(
+        workflow="dalton-publish", params=PUB_PARAMS,
+        backend=_make_backend(_publish_files()), workspace_id=WS, user_id="user-1",
+    )
+    assert any("awaiting_pm 查询失败" in m for m in dead["missing"])
+
+    files = _publish_files()
+    del files[PUB_ANNOTATED]
+    _patch_pending(monkeypatch, [_pending_row(PUB_DRAFT)])
+    no_annotated = await run_check_done(
+        workflow="dalton-publish", params=PUB_PARAMS,
+        backend=_make_backend(files), workspace_id=WS, user_id="user-1",
+    )
+    assert any("2026-10-23-call-META.annotated.md" in m for m in no_annotated["missing"])
+
+
+@pytest.mark.asyncio
+async def test_publish_without_draft_path_param_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """slug no longer names the draft: a caller passing only slug+as_of has
+    not said which draft it published — a required param gap, fail-closed."""
+    _patch_pending(monkeypatch, error=RuntimeError("must not be queried"))
+    result = await run_check_done(
+        workflow="dalton-publish",
+        params={"slug": "call-META", "as_of": "2026-10-23"},
+        backend=_make_backend(_publish_files()), workspace_id=WS, user_id="user-1",
+    )
+    assert result["done"] is False
+    assert any("缺少必需参数 'draft_path'" in m for m in result["missing"])
+
+
+def _patch_pending(
+    monkeypatch: pytest.MonkeyPatch,
+    rows: list[dict[str, Any]] | None = None,
+    error: Exception | None = None,
+) -> None:
+    from src.dalton.database import publications as publications_db
+
+    listed = create_autospec(_REAL_LIST_PENDING)
+
+    async def _rows(user_id: str, status: str = "awaiting_pm") -> list[dict[str, Any]]:
+        if error is not None:
+            raise error
+        assert status == "awaiting_pm"
+        return rows or []
+
+    listed.side_effect = _rows
+    monkeypatch.setattr(publications_db, "list_pending", listed)
+
+
+def _pending_row(draft_path: str, workspace_id: str = WS) -> dict[str, Any]:
+    return {
+        "publish_request_id": "pr-1",
+        "user_id": "user-1",
+        "workspace_id": workspace_id,
+        "slug": "call-META",
+        "draft_path": draft_path,
+        "status": "awaiting_pm",
+    }

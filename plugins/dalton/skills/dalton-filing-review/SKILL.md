@@ -90,3 +90,9 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
    - 若公告中出现管理层表述变化（如风险因素新增实质条目、指引口径或薪酬考核指标调整），调用 `knowledge_update(doc="management", ...)` 记录。
 3. **推送 PM**：
    - 非 `NO_CHANGE`（或虽维持原判但 10-Q/10-K 提供了重要新季度细节）时，向 PM 推送精炼摘要；纯例行无变化文件不打扰 PM。
+
+### 收尾门禁：汇报完成前必须过完成契约（`dalton_check_done`）
+
+- 向 PM 汇报“完成”（或例行文件记 `NO_CHANGE` 收尾）前，必须调用 `dalton_check_done(workflow="dalton-filing-review", params={"ticker": ..., "as_of": "<笔记日期>", "form": "<表单，巨潮公告填 cninfo>", "accession": "<accession 短号；巨潮公告填 title 简称>"})`，参数与第 4 步笔记文件名一致。
+- 契约要求：第 4 步审阅笔记、本轮 `trigger.kind` 为 `filing` 或 `manual` 的 verdict；verdict 不是 `NO_CHANGE` 时，`thesis`/`debate`/`drivers`/`management` 至少一份须有本轮 `knowledge_update` 写入的新版本。
+- `done=false` 时按 `missing` 先补齐再查（审阅笔记缺失就补写、verdict 未写就 `knowledge_append_verdict`、非 `NO_CHANGE` 却没有知识更新就按第 5 步第 2 项 `knowledge_update`）；补不了的缺项只能汇报“未完成”并列出缺项与原因，不得汇报“完成”。

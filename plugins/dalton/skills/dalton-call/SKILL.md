@@ -78,3 +78,9 @@ Conviction Call 是 Dalton 研究体系的最高级别输出，直接服务于 P
 2. 调用 `check_draft` 检查格式与禁用词。
 3. 调用 `publish_report(draft_path="drafts/<YYYY-MM-DD>-call-<TICKER>.md", kind="conviction_call", slug="call-<TICKER>", updates_thesis=False)` 提交 PM 审批。
 4. **PM 批准后**：调用 `knowledge_update` 更新 `thesis`、`drivers`、`agenda`，并调用 `knowledge_append_verdict`（`verdict="NEW_THESIS"` 或 `"THESIS_STRENGTHENED"`）。
+
+### 收尾门禁：汇报完成前必须过完成契约（`dalton_check_done`）
+
+- 向 PM 汇报“完成”前（两个分支都要），必须调用 `dalton_check_done(workflow="dalton-call", params={"ticker": ..., "as_of": "<本稿日期 YYYY-MM-DD，与草稿文件名一致>"})`。
+- 契约按门禁两分支核对：存在 `drafts/<日期>-call-<TICKER>.md`＝门禁全过分支，要求草稿写满且 `check_draft` 侧车哈希与当前稿一致；不存在＝门禁未过分支，要求本轮已写 `NO_CHANGE` verdict（Step 2 第 2 项）。两者都没有＝无法判定门禁结果，记 missing。
+- `done=false` 时按 `missing` 先补齐再查（有草稿但 check_draft 用了旧草稿就对最终稿重跑 `check_draft`；门禁未过却没写 verdict 就 `knowledge_append_verdict(verdict="NO_CHANGE")`）；补不了的缺项只能汇报“未完成”并列出缺项与原因，不得汇报“完成”。

@@ -65,7 +65,9 @@ def load_workflow_contract(name: str) -> dict[str, Any]:
 
 
 def load_skill_contract(name: str) -> dict[str, Any]:
-    return _load_contract_at(skill_contract_path(name), expected_name=name)
+    # The contract names its skill by directory, whichever spelling the caller used.
+    path = skill_contract_path(name)
+    return _load_contract_at(path, expected_name=path.parent.name)
 
 
 def load_contract(name: str) -> dict[str, Any]:

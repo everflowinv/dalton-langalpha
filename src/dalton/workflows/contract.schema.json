@@ -14,7 +14,7 @@
     "name": {
       "type": "string",
       "minLength": 1,
-      "description": "workflow 名（如 initial-coverage）。"
+      "description": "workflow 名（如 initial-coverage）或 skill 目录名（如 dalton-earnings-preview）。"
     },
     "description": {
       "type": "string"
@@ -77,7 +77,7 @@
         "optional": {
           "type": "boolean",
           "default": false,
-          "description": "缺文件记 warning 而不是 missing（这 6 个 workflow 里的合法缺项，如 weekly-coverage-review 某周无 Watch 命中时的 watch-*.md）。"
+          "description": "缺文件记 warning 而不是 missing（SKILL 原文写明可选的合法缺项，如 weekly-coverage-review 某周无 Watch 命中时的 watch-*.md）。"
         },
         "requires_param": {
           "type": "string",
@@ -113,6 +113,63 @@
             "today"
           ],
           "description": "要求文件 mtime 不早于该日 00:00 UTC（核对状态文件是本轮写的）。"
+        },
+        "requires_json": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "json",
+            "field",
+            "equals"
+          ],
+          "properties": {
+            "json": {
+              "type": "string",
+              "minLength": 1,
+              "description": "JSON 状态文件路径模板。"
+            },
+            "field": {
+              "type": "string",
+              "minLength": 1
+            },
+            "equals": {
+              "type": "string"
+            },
+            "allowed_values": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": {
+                "type": "string"
+              },
+              "description": "该字段的全部合法取值（如 [yes, no]）；字段缺失、非字符串或取值不在其中记 missing，不当成条件不成立。"
+            }
+          },
+          "description": "仅当 JSON 状态文件的该字段（必须为字符串，且在 allowed_values 内若声明）等于 equals 时才要求本产物（如 thesis-delta 的 last_run.json material=yes）；状态文件读不到/解析失败/字段缺失或非法记 missing。"
+        },
+        "sidecars": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "suffix",
+              "min_bytes"
+            ],
+            "properties": {
+              "suffix": {
+                "type": "string",
+                "minLength": 1,
+                "description": "替换草稿 .md 后缀得到的侧车后缀（如 .annotated.md，check_draft 的落盘约定）。"
+              },
+              "min_bytes": {
+                "type": "integer",
+                "minimum": 1
+              }
+            }
+          },
+          "description": "从本产物路径推导的侧车文件（draft stem + suffix），同样要求存在且达到 min_bytes。"
         }
       }
     },
@@ -303,31 +360,102 @@
                   "type": "string"
                 }
               },
-              "when": {
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {
-                  "field": {
-                    "type": "string"
-                  },
-                  "equals": {
-                    "type": "string",
-                    "description": "字段值相等时生效。"
-                  },
-                  "any_gt": {
-                    "type": "array",
-                    "minItems": 1,
-                    "items": {
-                      "type": "string"
-                    },
-                    "description": "这些数值字段之和 > 0 时生效。"
+                  "when": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                      "field": {
+                        "type": "string"
+                      },
+                      "equals": {
+                        "type": "string",
+                        "description": "字段值相等时生效。"
+                      },
+                      "allowed_values": {
+                        "type": "array",
+                        "minItems": 1,
+                        "uniqueItems": true,
+                        "items": {
+                          "type": "string"
+                        },
+                        "description": "该字段的全部合法取值（如 [yes, no]）；字段缺失、非字符串或取值不在其中记 missing，不当成条件不成立。"
+                      },
+                      "any_gt": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {
+                          "type": "string"
+                        },
+                        "description": "这些数值字段之和 > 0 时生效。"
+                      }
+                    }
                   }
-                }
-              }
             }
           },
           "description": "按 JSON 状态文件的条件要求知识文档新版本；读不到/解析失败记 missing。"
+        },
+        "knowledge_docs_any_unless_no_change": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string"
+          },
+          "description": "本轮命中 verdict_kinds_any/verdict_trigger 的 verdict 里有 word 不是 NO_CHANGE 时，至少其一须有 source=tool 新版本（stock-move / filing-review 的条件知识更新）。"
+        },
+        "published_or_awaiting_pm": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "draft",
+            "published"
+          ],
+          "properties": {
+            "draft": {
+              "type": "string",
+              "minLength": 1,
+              "description": "草稿路径模板，匹配本工作区 awaiting_pm 发布请求的 draft_path。"
+            },
+            "published": {
+              "type": "string",
+              "minLength": 1,
+              "description": "published/ 不可变副本路径模板（如 published/{as_of}-{slug}.md）。"
+            }
+          },
+          "description": "发布状态二选一：published/ 副本已存在，或本工作区有 draft_path 匹配的 awaiting_pm 请求；都没有（或查询失败）记 missing。"
+        },
+        "gated_draft": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "draft",
+            "absent_verdict_kinds_any"
+          ],
+          "properties": {
+            "draft": {
+              "type": "string",
+              "minLength": 1,
+              "description": "门禁通过分支的正式草稿路径模板。"
+            },
+            "min_bytes": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "absent_verdict_kinds_any": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "string"
+              },
+              "description": "草稿不存在（门禁未过分支）时本轮须有的 verdict word（如 NO_CHANGE）。"
+            }
+          },
+          "description": "门禁两分支（dalton-call）：草稿存在＝门禁通过，要求草稿足量且 check_draft 侧车哈希一致；草稿不存在＝门禁未过，要求本轮有 absent_verdict_kinds_any 的 verdict；两者都没有或读取出错＝无法判定，记 missing。"
         }
+      },
+      "dependentRequired": {
+        "knowledge_docs_any_unless_no_change": [
+          "verdict_kinds_any"
+        ]
       }
     }
   }
