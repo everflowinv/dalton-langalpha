@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
-from datetime import date, datetime, timezone
+from datetime import date
 from pathlib import Path
 from typing import Any
 

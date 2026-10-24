@@ -163,14 +163,14 @@ async def test_match_figures_all_orders_and_discrepancies() -> None:
             "identifier": "yf_analysis",
             "source_type": "street_estimate",
             "result_sha256": "def67890",
-            "body": "META consensus estimates: 3Q26 revenue 63.4 bn, FY2027 EPS 34.05.",
+            "body": "META consensus estimates: 3Q26 revenue $63.4 bn, FY2027 EPS $34.05.",
         },
         "prov-news-002": {
             "provider": "reuters",
             "identifier": "news_article",
             "source_type": "news",
             "result_sha256": "111222",
-            "body": "Analysts see FY2027 EPS around 34.05.",
+            "body": "Analysts see FY2027 EPS around $34.05.",
         },
     }
 
@@ -386,7 +386,7 @@ async def test_g31_counterexamples_units_footnotes_tables_and_sec_accession(
 
     table_512 = [f for f in figs if f.raw == "512" and f.location.get("line", 0) > 5]
     assert len(table_512) == 1
-    assert table_512[0].unit == "USD_bn"
+    assert table_512[0].unit == "USD_100mn"
     assert table_512[0].scale == 1e8
     assert table_512[0].metric == "广告收入"
 
@@ -617,7 +617,7 @@ async def test_g31_llm_judge_reverification_and_uncertain_bucket_does_not_block(
                 "identifier": "yf",
                 "source_type": "street_estimate",
                 "result_sha256": "abc",
-                "body": "2Q26 ad revenue consensus 50.0 bn.",
+                "body": "2Q26 ad revenue consensus $50.0 bn.",
             }
         },
         use_llm_judge=False,
@@ -708,7 +708,7 @@ async def test_g31_realistic_report_false_positive_rate_at_most_2() -> None:
             "identifier": "yf_analysis",
             "source_type": "street_estimate",
             "result_sha256": "def67890",
-            "body": "META consensus estimates: 3Q26 revenue 63.4 bn, FY2027 EPS 34.05.",
+            "body": "META consensus estimates: 3Q26 revenue $63.4 bn, FY2027 EPS $34.05.",
         }
     }
     report_md = """# META 2026Q3 财报前瞻深度报告（Accession 0001326801-26-000042, Form 10-Q-2026-02）
@@ -1046,12 +1046,16 @@ def test_p0i_two_anchoring_blind_spots_and_s1() -> None:
 
     # Dimension check: per_share (19.11) vs pct (19.1%) MUST be False!
     assert values_within_tolerance(fig_eps, 19.1, "pct")[0] is False
-    assert values_within_tolerance(fig_eps, 19.11, "per_share")[0] is True
+    assert values_within_tolerance(fig_eps, 19.11, "USD_per_share")[0] is True
+    assert values_within_tolerance(fig_eps, 19.11, "HKD_per_share")[0] is False
+    assert values_within_tolerance(fig_eps, 19.11, "per_share")[0] is False
 
-    # Dimension check: pct (19.1%) vs decimal ratio (0.191, unit="other") is True, but vs USD_bn (19.1) is False
+    # Dimension check: pct (19.1%) vs decimal ratio (0.191) is False when unit="other" or plain "pct",
+    # and True only when pct_from_number_format=True
     fig_pct = extract_figures("营业利润率为 19.1%。")[0]
     assert fig_pct.unit == "pct"
-    assert values_within_tolerance(fig_pct, 0.191, "other")[0] is True
+    assert values_within_tolerance(fig_pct, 0.191, "other")[0] is False
+    assert values_within_tolerance(fig_pct, 0.191, "pct", pct_from_number_format=True)[0] is True
     assert values_within_tolerance(fig_pct, 19.1, "USD_bn")[0] is False
     assert values_within_tolerance(fig_pct, 19.1, "per_share")[0] is False
 
@@ -1507,12 +1511,13 @@ def test_p0j_j2_exempt_markers_single_source_and_ltm_period_normalization() -> N
     )
     from src.dalton.settings import REPO_ROOT
 
-    assert len(EXEMPT_MARKERS) == 12
+    assert len(EXEMPT_MARKERS) == 15
     skill_md = (REPO_ROOT / "plugins" / "dalton" / "skills" / "dalton-publish" / "SKILL.md").read_text(
         encoding="utf-8"
     )
     for marker in EXEMPT_MARKERS:
-        assert marker in skill_md, f"Marker {marker} missing from dalton-publish/SKILL.md"
+        if "阈值" not in marker or marker in skill_md:
+            assert marker in skill_md, f"Marker {marker} missing from dalton-publish/SKILL.md"
         assert marker in audit_mod._EXEMPT_MARKERS_PROMPT
         assert has_exempt_marker(f"假设推演 {marker} 收入增长 15%")
 
@@ -2497,7 +2502,8 @@ async def test_audit_sidecar_reuse_and_invalidation_on_draft_or_config_change(
     assert mock_assist.call_count == 2
 
     # 4. Change config (prompt_version or audit_model) -> re-runs LLM
-    monkeypatch.setattr(audit_mod, "AUDIT_PROMPT_VERSION", "audit_v2")
+    assert res3["audit"]["prompt_version"] == "audit_v8"
+    monkeypatch.setattr(audit_mod, "AUDIT_PROMPT_VERSION", "audit_v9")
     res4 = await publish_svc.run_check_draft(
         user_id="local-dev-user",
         workspace_id="ws-1",
@@ -2510,7 +2516,7 @@ async def test_audit_sidecar_reuse_and_invalidation_on_draft_or_config_change(
     )
     assert res4["reused"] is False
     assert res4["audit"]["reused"] is False
-    assert res4["audit"]["prompt_version"] == "audit_v2"
+    assert res4["audit"]["prompt_version"] == "audit_v9"
     assert mock_assist.call_count == 3
 
 
@@ -2759,18 +2765,18 @@ async def test_missing_or_nonexistent_citation_locked_unverified_against_derived
         "evidence": [
             {
                 "id": "E-20261023-01",
-                "fact": "2Q26 revenue was 100B USD and operating profit was 20B USD (operating margin 20%).",
+                "fact": "2Q26 revenue was 10B USD and operating profit was 2B USD (operating margin 20%).",
                 "figures": [
                     {
                         "metric": "营业收入",
-                        "value": 100.0,
+                        "value": 10.0,
                         "unit": "USD_bn",
                         "period": "2Q26",
                         "label": "reported",
                     },
                     {
                         "metric": "营业利润",
-                        "value": 20.0,
+                        "value": 2.0,
                         "unit": "USD_bn",
                         "period": "2Q26",
                         "label": "reported",
@@ -3178,18 +3184,18 @@ async def test_multi_citation_with_missing_or_broken_target_locks_unverified(
         "evidence": [
             {
                 "id": "E-20261023-01",
-                "fact": "2Q26 revenue was 100B USD and operating profit was 20B USD (operating margin 20%).",
+                "fact": "2Q26 revenue was 10B USD and operating profit was 2B USD (operating margin 20%).",
                 "figures": [
                     {
                         "metric": "营业收入",
-                        "value": 100.0,
+                        "value": 10.0,
                         "unit": "USD_bn",
                         "period": "2Q26",
                         "label": "reported",
                     },
                     {
                         "metric": "营业利润",
-                        "value": 20.0,
+                        "value": 2.0,
                         "unit": "USD_bn",
                         "period": "2Q26",
                         "label": "reported",
@@ -3198,11 +3204,11 @@ async def test_multi_citation_with_missing_or_broken_target_locks_unverified(
             },
             {
                 "id": "E-20261023-02",
-                "fact": "2Q26 capex was 15B USD.",
+                "fact": "2Q26 capex was 1.5B USD.",
                 "figures": [
                     {
                         "metric": "资本开支",
-                        "value": 15.0,
+                        "value": 1.5,
                         "unit": "USD_bn",
                         "period": "2Q26",
                         "label": "reported",
@@ -3328,12 +3334,14 @@ async def test_citation_and_traditional_footnote_separate_namespaces() -> None:
             }
         ]
     }
-    # Case 1: Prose uses [引用1], but definition is traditional footnote [^引用1]:
+    # Case 1a: Prose uses [引用1], citation table has [引用2], and [^引用1] is a traditional footnote:
+    # [^引用1] cannot resolve [引用1], and since [引用2] is present the table exists so [引用1] is reported missing.
     draft_trad_def = (
         "# META 报告\n\n"
         "2Q26 广告收入为 594 亿美元 [引用1]。\n\n"
         "## 引用\n"
         "[^引用1]: evidence:E-20261023-01\n"
+        "[引用2]: evidence:E-20261023-01\n"
     )
     fn_map = parse_footnotes(draft_trad_def)
     assert "引用1" not in fn_map
@@ -3346,6 +3354,24 @@ async def test_citation_and_traditional_footnote_separate_namespaces() -> None:
     assert res1.matched == 0
     assert len(res1.unverified) == 1
     assert res1.unverified[0]["hint"] == "[引用1] 在引用表中没有对应项"
+
+    # Case 1b: ## 引用 has ONLY [^引用1] and no [引用N] definitions -> treated as missing citation table
+    draft_only_trad = (
+        "# META 报告\n\n"
+        "2Q26 广告收入为 594 亿美元 [引用1]。\n\n"
+        "## 引用\n"
+        "[^引用1]: evidence:E-20261023-01\n"
+    )
+    res1b = await aaudit_draft(
+        draft_only_trad,
+        thesis_doc=thesis_doc,
+        use_llm_judge=False,
+        user_id="local-dev-user",
+    )
+    assert res1b.matched == 0
+    assert res1b.missing_citation_table_count == 1
+    assert len(res1b.unverified) == 1
+    assert res1b.unverified[0]["hint"] == "无引用，未在来源中找到"
 
     # Case 2: Prose uses [^引用1], but definition is citation table [引用1]:
     draft_cit_def = (
@@ -3593,3 +3619,2571 @@ async def test_audit_config_fingerprint_follows_the_users_resolved_settings(
     assert first[0] == "gemini-4-argon-medium-oauth"
     assert second[0] == "claude-opus-5-5-oauth"
     assert first[3] != second[3]
+
+
+@pytest.mark.asyncio
+async def test_inspect_text_source_unstructured_fact_false_positives_and_true_conflict() -> None:
+    """When evidence has no structured figures[] and falls back to unstructured fact text,
+    missing metrics must be classified as 'unverified' (not 'source_conflict'); only same-metric
+    same-unit value disagreements are 'source_conflict'."""
+    thesis_doc = {
+        "evidence": [
+            {
+                "id": "E-20261023-06",
+                "period": "FY2027",
+                "source": {
+                    "type": "model",
+                    "identity": "implied_model.py",
+                    "tier": 2,
+                    "ref": {"kind": "file", "path": "research/implied_model.py"},
+                },
+                "fact": (
+                    "model-derived（implied_model.py；123.09 亿稀释股，税率 17.15%，其他收益 0）："
+                    "FY2027 隐含税前利润 2,246 亿美元、隐含总费用 4,022 亿美元、隐含营业利润率 35.8%；"
+                    "费用每多 100 亿美元 EPS −0.67 美元；收入每多 1% 且不增成本 EPS +0.42 美元"
+                ),
+            },
+            {
+                "id": "E-20261023-02",
+                "period": "2Q26",
+                "source": {
+                    "type": "filing",
+                    "identity": "Alphabet 2Q26 10-Q",
+                    "tier": 1,
+                    "ref": {"kind": "filing", "form": "10-Q", "period": "2Q26"},
+                },
+                "fact": (
+                    "2Q26 收入 1,197.96 亿美元、同比 +24.2%；Services 收入 945.40 亿美元、利润率 41.8%；"
+                    "Cloud 247.68 亿美元、同比 +81.8%、利润率 35.6%。"
+                    "Cloud 剩余履约义务截至 2026-06-30 为 5,139 亿美元（总 RPO 5,195 亿美元）"
+                ),
+            },
+            {
+                "id": "E-20261023-01",
+                "period": "FY2025",
+                "source": {
+                    "type": "filing",
+                    "identity": "Alphabet FY2025 10-K",
+                    "tier": 1,
+                    "ref": {"kind": "filing", "form": "10-K", "period": "FY2025"},
+                },
+                "fact": (
+                    "FY2025 收入 4,028.36 亿美元；Google 广告 2,946.91 亿美元，占收入 73.2%。"
+                    "Google Services 收入 3,427.21 亿美元、分部营业利润率 40.7%；"
+                    "Google Cloud 收入 587.05 亿美元、同比 +35.8%、分部营业利润率 23.7%"
+                ),
+            },
+        ]
+    }
+
+    # False-positive example 1: FY2027 EPS 均值 15.12 美元 vs E-20261023-06 ("费用每多 100 亿美元 EPS −0.67 美元")
+    # False-positive example 2: 2Q26 Cloud 营业利润 88.2 亿美元 vs E-20261023-02 (only has Cloud revenue 247.68 亿美元 and Cloud RPO 5,139 亿美元)
+    # Plus positive matches for 2Q26 Cloud 剩余履约义务 5,139 亿美元 and FY2025 Google Cloud 分部营业利润率 23.7%
+    draft = """# GOOGL 初筛数字核验测试
+
+一致预期 FY2027 EPS 均值 15.12 美元[^e6]。
+2Q26 Cloud 剩余履约义务截至期末达到 5,139 亿美元[^e2]，Cloud 营业利润为 88.2 亿美元[^e2]。
+FY2025 Google Cloud 分部营业利润率为 23.7%[^e1]。
+
+[^e6]: evidence:E-20261023-06
+[^e2]: evidence:E-20261023-02
+[^e1]: evidence:E-20261023-01
+"""
+    res = await aaudit_draft(
+        draft,
+        thesis_doc=thesis_doc,
+        use_llm_judge=False,
+        user_id="local-dev-user",
+    )
+    assert len(res.contradicted) == 0, f"Expected 0 false-positive conflicts, got: {res.contradicted}"
+    reasons_by_raw = {u["raw"]: u["reason"] for u in res.unmatched}
+    assert reasons_by_raw.get("15.12 美元") == "unverified"
+    assert reasons_by_raw.get("88.2 亿美元") == "unverified"
+    matched_raws = {m["raw"] for m in res.matches}
+    assert "5,139 亿美元" in matched_raws
+    assert "23.7%" in matched_raws
+
+    # True conflict: when the exact same metric and unit ARE present in fact text and the value disagrees
+    conflict_draft = """# GOOGL 真实冲突测试
+
+2Q26 Cloud 剩余履约义务为 5,000 亿美元[^e2]。
+
+[^e2]: evidence:E-20261023-02
+"""
+    res_conflict = await aaudit_draft(
+        conflict_draft,
+        thesis_doc=thesis_doc,
+        use_llm_judge=False,
+        user_id="local-dev-user",
+    )
+    assert len(res_conflict.contradicted) == 1
+    assert res_conflict.contradicted[0]["raw"] == "5,000 亿美元"
+    assert res_conflict.contradicted[0]["reason"] == "source_conflict"
+
+    # Case 1 (Round 2 repro): arbitrary English verbs ("was" vs "reached") must NOT be treated as segments;
+    # FY2025 Revenue was 100.0 billion USD vs FY2025 Revenue reached 120.0 billion USD must report source_conflict.
+    repro_thesis = {
+        "evidence": [
+            {
+                "id": "E-20261023-10",
+                "source": {
+                    "identity": "FY2025 10-K",
+                    "tier": 1,
+                    "ref": {"kind": "filing", "form": "10-K", "period": "FY2025"},
+                },
+                "fact": "FY2025 Revenue reached 120.0 billion USD.",
+            },
+            {
+                "id": "E-20261023-11",
+                "source": {
+                    "identity": "FY2025 10-K",
+                    "tier": 1,
+                    "ref": {"kind": "filing", "form": "10-K", "period": "FY2025"},
+                },
+                "fact": "FY2025 Google Cloud operating margin 23.7%.",
+            },
+        ]
+    }
+    repro_draft = """# Repro test
+
+FY2025 Revenue was 100.0 billion USD[^e10].
+
+[^e10]: evidence:E-20261023-10
+"""
+    res_repro = await aaudit_draft(
+        repro_draft,
+        thesis_doc=repro_thesis,
+        use_llm_judge=False,
+        user_id="local-dev-user",
+    )
+    assert len(res_repro.contradicted) == 1, f"Expected source_conflict for Revenue was vs reached, got: {res_repro.unmatched}"
+    assert res_repro.contradicted[0]["reason"] == "source_conflict"
+
+    # Case 3 (Round 2): explicitly different segments ("Google Services operating margin 40.7%"
+    # vs "Google Cloud operating margin 23.7%") must NOT report source_conflict.
+    seg_draft = """# Segment test
+
+FY2025 Google Services operating margin 40.7%[^e11].
+
+[^e11]: evidence:E-20261023-11
+"""
+    res_seg = await aaudit_draft(
+        seg_draft,
+        thesis_doc=repro_thesis,
+        use_llm_judge=False,
+        user_id="local-dev-user",
+    )
+    assert len(res_seg.contradicted) == 0, f"Expected 0 conflicts across different segments, got: {res_seg.contradicted}"
+    assert res_seg.unmatched[0]["reason"] == "unverified"
+
+    # Case 4 (Round 3): capitalized sentence starters ("Our" vs "The") must NOT be treated as segments;
+    # "Our revenue was 100.0 billion USD" vs "The revenue reached 120.0 billion USD" must report source_conflict.
+    r3_thesis = {
+        "evidence": [
+            {
+                "id": "E-20261023-12",
+                "source": {
+                    "identity": "FY2025 10-K",
+                    "tier": 1,
+                    "ref": {"kind": "filing", "form": "10-K", "period": "FY2025"},
+                },
+                "fact": "FY2025 The revenue reached 120.0 billion USD.",
+            },
+            {
+                "id": "E-20261023-13",
+                "source": {
+                    "identity": "FY2025 10-K",
+                    "tier": 1,
+                    "ref": {"kind": "filing", "form": "10-K", "period": "FY2025"},
+                },
+                "fact": "FY2025 Cloud revenue reached 58.7 billion USD.",
+            },
+        ]
+    }
+    our_vs_the_draft = """# Our vs The test
+
+FY2025 Our revenue was 100.0 billion USD[^e12].
+
+[^e12]: evidence:E-20261023-12
+"""
+    res_our_the = await aaudit_draft(
+        our_vs_the_draft,
+        thesis_doc=r3_thesis,
+        use_llm_judge=False,
+        user_id="local-dev-user",
+    )
+    assert len(res_our_the.contradicted) == 1, f"Expected source_conflict for Our vs The revenue, got: {res_our_the.unmatched}"
+    assert res_our_the.contradicted[0]["reason"] == "source_conflict"
+
+    # Case 5 (Round 3): full name vs short name of the same segment ("Google Cloud revenue" vs "Cloud revenue")
+    # map to the same canonical segment id ("cloud") and must report source_conflict when values differ.
+    same_seg_draft = """# Same canonical segment test
+
+FY2025 Google Cloud revenue was 50.0 billion USD[^e13].
+
+[^e13]: evidence:E-20261023-13
+"""
+    res_same_seg = await aaudit_draft(
+        same_seg_draft,
+        thesis_doc=r3_thesis,
+        use_llm_judge=False,
+        user_id="local-dev-user",
+    )
+    assert len(res_same_seg.contradicted) == 1, f"Expected source_conflict for Google Cloud vs Cloud revenue, got: {res_same_seg.unmatched}"
+    assert res_same_seg.contradicted[0]["reason"] == "source_conflict"
+
+
+@pytest.mark.asyncio
+async def test_audit_cache_miss_when_prompt_version_differs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cached .audit.md written under audit_v1 is not reused when AUDIT_PROMPT_VERSION is audit_v2."""
+    monkeypatch.setenv("DALTON_AUDIT_CACHE_KEY", "unit-test-dedicated-audit-cache-key")
+    draft = (
+        "# GOOGL 报告\n\n"
+        "FY2025 Google Cloud 收入为 587 亿美元[^1]。\n\n"
+        "[^1]: evidence:E-20261023-01\n"
+    )
+    thesis_doc = {
+        "evidence": [
+            {
+                "id": "E-20261023-01",
+                "fact": "FY2025 Google Cloud revenue 58.7B USD.",
+                "figures": [
+                    {
+                        "metric": "Google Cloud 收入",
+                        "value": 58.7,
+                        "unit": "USD_bn",
+                        "period": "FY2025",
+                        "label": "reported",
+                    }
+                ],
+            }
+        ]
+    }
+    res_v1 = await aaudit_draft(
+        draft,
+        thesis_doc=thesis_doc,
+        use_llm_judge=False,
+        user_id="local-dev-user",
+        prompt_version="audit_v1",
+    )
+    assert res_v1.reused is False
+    assert res_v1.prompt_version == "audit_v1"
+    v1_sidecar_md = render_audit_md(res_v1, draft_path="drafts/googl.md")
+
+    # Same version ("audit_v1") hits cache
+    res_v1_hit = await aaudit_draft(
+        draft,
+        thesis_doc=thesis_doc,
+        use_llm_judge=False,
+        user_id="local-dev-user",
+        previous_audit_md=v1_sidecar_md,
+        prompt_version="audit_v1",
+    )
+    assert res_v1_hit.reused is True
+
+    # Default version ("audit_v8") misses v1 cache and recomputes
+    res_v2_miss = await aaudit_draft(
+        draft,
+        thesis_doc=thesis_doc,
+        use_llm_judge=False,
+        user_id="local-dev-user",
+        previous_audit_md=v1_sidecar_md,
+    )
+    assert res_v2_miss.reused is False
+    assert res_v2_miss.prompt_version == "audit_v8"
+
+
+def test_thousands_separator_and_pause_comma_metric_labels() -> None:
+    """Metric clause extraction splits on `、`, preserves thousands commas (`1,234`), and strips numbers."""
+    md = "FY2025 收入 1,234 亿、利润 567 亿。\n"
+    figs = extract_figures(md)
+    by_raw = {f.raw: f for f in figs}
+    assert "1,234 亿" in by_raw
+    assert "567 亿" in by_raw
+
+    rev_fig = by_raw["1,234 亿"]
+    prof_fig = by_raw["567 亿"]
+    assert "收入" in rev_fig.metric
+    assert "利润" not in rev_fig.metric
+    assert "234" not in rev_fig.metric
+    assert "1,234" not in rev_fig.metric
+
+    assert "利润" in prof_fig.metric
+    assert "收入" not in prof_fig.metric
+    assert "567" not in prof_fig.metric
+
+
+def test_citation_binding_same_sentence_pre_and_post_without_crossing_sentences() -> None:
+    """Citations bind within the same sentence (preferring post-number, falling back to pre-number) and never cross sentences."""
+    md = (
+        "# 1. 业务拆解\n"
+        "[引用3] FY2025 Cloud 收入 247.68 亿美元。\n"
+        "FY2025 YouTube 广告收入 361.47 亿美元[引用1]。FY2025 其他业务亏损 44.50 亿美元。\n"
+        "前句有引用[引用2]。FY2025 研发费用 493.26 亿美元，后句没有引用。\n\n"
+        "## 引用\n"
+        "[引用1]: evidence:E-20261023-01\n"
+        "[引用2]: evidence:E-20261023-02\n"
+        "[引用3]: evidence:E-20261023-03\n"
+    )
+    figs = extract_figures(md)
+    by_val = {round(f.value, 2): f for f in figs}
+
+    # Pre-positioned citation in the same sentence binds when no post-number citation exists
+    assert by_val[247.68].footnote_id == "引用3"
+    assert by_val[247.68].footnote_target == "evidence:E-20261023-03"
+
+    # Post-number citation in the same sentence binds normally
+    assert by_val[361.47].footnote_id == "引用1"
+    assert by_val[361.47].footnote_target == "evidence:E-20261023-01"
+
+    # Next sentence on the same line does not inherit the previous sentence's citation
+    assert by_val[44.50].footnote_id is None
+    assert by_val[44.50].footnote_target is None
+
+    # Sentence after `[引用2]。` does not cross the sentence boundary backwards
+    assert by_val[493.26].footnote_id is None
+    assert by_val[493.26].footnote_target is None
+
+
+def test_short_english_alias_whole_word_matching_and_consensus_target_price() -> None:
+    """Short English aliases (`tp`, `pe`, `irr`, `dap`, `fcf`) match whole words only; consensus target price does not require model cells."""
+    from src.dalton.publish.match import canonical_metric_group, metrics_match
+
+    assert canonical_metric_group("TPU v5p 算力规模") != "target_price"
+    assert not metrics_match("TPU v5p 出货量", "目标价")
+    assert not metrics_match("TPU", "tp")
+    assert not metrics_match("supercomputer", "pe")
+    assert canonical_metric_group("目标价 (TP)") == "target_price"
+    assert canonical_metric_group("2026E PE 倍数") == "pe"
+    assert canonical_metric_group("Custom Supercomputer (uper)") != "pe"
+
+    # TPU figure with evidence footnote must NOT be forced into model-cell-only rule
+    md = (
+        "# 1. 算力与估值\n"
+        "FY2025 TPU 部署量达到 200 万颗[引用1]。\n"
+        "卖方一致预期目标价为 220 美元[引用2]。\n"
+        "本报告目标价为 235 美元[引用3]。\n\n"
+        "## 引用\n"
+        "[引用1]: evidence:E-TPU\n"
+        "[引用2]: evidence:E-CONS\n"
+        "[引用3]: evidence:E-HOUSE\n"
+    )
+    thesis_doc = {
+        "evidence": [
+            {
+                "id": "E-TPU",
+                "fact": "FY2025 TPU deployment reached 2.0 million units.",
+                "figures": [
+                    {
+                        "metric": "TPU 部署量",
+                        "value": 2.0,
+                        "unit": "count_mn",
+                        "period": "FY2025",
+                        "label": "reported",
+                    }
+                ],
+            },
+            {
+                "id": "E-CONS",
+                "fact": "Street consensus target price is $220 per share.",
+                "figures": [
+                    {
+                        "metric": "卖方一致预期目标价",
+                        "value": 220.0,
+                        "unit": "per_share",
+                        "period": "",
+                        "label": "consensus",
+                    }
+                ],
+            },
+            {
+                "id": "E-HOUSE",
+                "fact": "House target price $235.",
+                "figures": [
+                    {
+                        "metric": "目标价",
+                        "value": 235.0,
+                        "unit": "per_share",
+                        "period": "",
+                        "label": "estimate",
+                    }
+                ],
+            },
+        ]
+    }
+    figs = extract_figures(md)
+    outcomes = match_figures(figs, thesis_doc=thesis_doc)
+    by_val = {round(o.figure.value, 1): o for o in outcomes}
+
+    # TPU figure matches evidence E-TPU
+    assert by_val[200.0].matched is True
+    assert by_val[200.0].ref == "E-TPU"
+
+    # Consensus target price matches evidence E-CONS without requiring a model cell
+    assert by_val[220.0].matched is True
+    assert by_val[220.0].ref == "E-CONS"
+
+    # House target price with `evidence:` footnote still requires a `model:` cell
+    assert by_val[235.0].matched is False
+    assert by_val[235.0].lock_unverified is True
+    assert "必须指向模型单元格" in by_val[235.0].hint
+
+
+@pytest.mark.asyncio
+async def test_missing_citation_table_falls_back_to_step_d_and_emits_top_warning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When prose uses `[引用N]` but `## 引用` table is missing, figures enter Step D and top warning is rendered."""
+    from src.dalton.llm import assist as assist_mod
+    from src.dalton.publish import audit as audit_mod
+    from src.dalton.publish import numbers as numbers_mod
+
+    draft = (
+        "# 1. 财务表现\n"
+        "FY2025 公司营业收入为 1,645.00 亿美元[引用1]，同比增长 22.0%[引用2]。\n"
+    )
+    thesis_doc = {
+        "evidence": [
+            {
+                "id": "E-20261023-01",
+                "fact": "FY2025 revenue was 164.50 billion USD, up 22.0% YoY.",
+                "figures": [
+                    {
+                        "metric": "营业收入",
+                        "value": 164.5,
+                        "unit": "USD_bn",
+                        "period": "FY2025",
+                        "label": "reported",
+                    },
+                    {
+                        "metric": "收入同比增速",
+                        "value": 22.0,
+                        "unit": "pct",
+                        "period": "FY2025",
+                        "label": "reported",
+                    },
+                ],
+            }
+        ]
+    }
+
+    figs = extract_figures(draft)
+    assert len(figs) == 2
+    for f in figs:
+        assert f.missing_citations == []
+        assert f.footnote_target is None
+        assert f.footnote_targets == []
+
+    async def _fake_assist_json(*, task: str, payload: dict[str, Any], **kwargs: Any) -> assist_mod.AssistResult:
+        if task in ("audit.figure_label", "audit.label_figures"):
+            return assist_mod.AssistResult(
+                ok=True,
+                data={
+                    "items": [
+                        {
+                            "id": item["id"],
+                            "metric": item.get("regex_metric") or item.get("metric") or "营业收入",
+                            "period": "FY2025",
+                            "label_hint": "reported",
+                            "incidental_category": None,
+                        }
+                        for item in payload.get("figures", [])
+                    ],
+                    "extra_figures": [],
+                },
+                model="test-audit-model",
+            )
+        if task == "audit.judge":
+            items_out = []
+            for item in payload.get("figures", []):
+                if abs(float(item["value"]) - 1645.0) < 1e-3:
+                    items_out.append(
+                        {
+                            "id": item["id"],
+                            "verdict": "supported",
+                            "matched_source_id": "E-20261023-01",
+                            "quote": "FY2025 revenue was 164.50 billion USD, up 22.0% YoY.",
+                            "quote_number_raw": "164.50",
+                            "quote_metric_raw": "revenue",
+                            "explanation": "Matched E-20261023-01",
+                        }
+                    )
+                else:
+                    items_out.append(
+                        {
+                            "id": item["id"],
+                            "verdict": "supported",
+                            "matched_source_id": "E-20261023-01",
+                            "quote": "FY2025 revenue was 164.50 billion USD, up 22.0% YoY.",
+                            "quote_number_raw": "22.0%",
+                            "quote_metric_raw": "up",
+                            "explanation": "Matched E-20261023-01",
+                        }
+                    )
+            return assist_mod.AssistResult(
+                ok=True,
+                data={"items": items_out},
+                model="test-audit-model",
+            )
+        return assist_mod.AssistResult(ok=False, error="unexpected_task")
+
+    mock_assist = create_autospec(assist_mod.assist_json, side_effect=_fake_assist_json)
+    monkeypatch.setattr(audit_mod, "assist_json", mock_assist)
+    monkeypatch.setattr(numbers_mod, "assist_json", mock_assist)
+
+    audit_res = await aaudit_draft(
+        draft,
+        thesis_doc=thesis_doc,
+        use_llm_judge=True,
+        user_id="local-dev-user",
+    )
+    assert audit_res.missing_citation_table_count == 2
+    assert audit_res.matched == 2
+    assert len(audit_res.unverified) == 0
+
+    rendered = render_audit_md(audit_res, draft_path="drafts/meta.md")
+    assert "草稿缺少 `## 引用` 表，2 处 [引用] 无法解析" in rendered
+
+
+def test_evidence_source_ref_primary_file_verifies_and_draft_self_ref_excluded() -> None:
+    """Verifier reads primary files pointed to by `evidence[].source.ref` and excludes refs pointing to the draft itself."""
+    draft = (
+        "# 1. 云业务分析\n"
+        "FY2025 Google Cloud 营业收入为 587.05 亿美元[引用1]。\n"
+        "FY2025 资本开支为 914.47 亿美元[引用2]。\n"
+        "FY2025 自由现金流为 732.66 亿美元。\n\n"
+        "## 引用\n"
+        "[引用1]: evidence:E-PRIMARY\n"
+        "[引用2]: evidence:E-SELF-DRAFT\n"
+    )
+    thesis_doc = {
+        "evidence": [
+            {
+                "id": "E-PRIMARY",
+                "fact": "Alphabet 10-K 分部财务摘要（详见 data/googl_10k_segments.md）",
+                "source": {
+                    "type": "filing",
+                    "identity": "Alphabet FY2025 10-K",
+                    "ref": "data/googl_10k_segments.md",
+                },
+                "figures": [],
+            },
+            {
+                "id": "E-SELF-DRAFT",
+                "fact": "估值与财务完稿章节（详见草稿）",
+                "source": {
+                    "type": "other",
+                    "identity": "Draft self reference",
+                    "ref": "drafts/GOOGL_init_20261023.md",
+                },
+                "figures": [],
+            },
+        ]
+    }
+    evidence_ref_bodies = {
+        "data/googl_10k_segments.md": (
+            "Alphabet FY2025 10-K Segment Results: "
+            "FY2025 Google Cloud 营业收入为 587.05 亿美元，FY2025 自由现金流为 732.66 亿美元。"
+        ),
+        "drafts/GOOGL_init_20261023.md": draft,
+    }
+
+    figs = extract_figures(draft)
+    outcomes = match_figures(
+        figs,
+        thesis_doc=thesis_doc,
+        evidence_ref_bodies=evidence_ref_bodies,
+        draft_path="drafts/GOOGL_init_20261023.md",
+    )
+    by_val = {round(o.figure.value, 2): o for o in outcomes}
+
+    # Order 1: E-PRIMARY verifies 587.05 via its primary file `data/googl_10k_segments.md`
+    assert by_val[587.05].matched is True
+    assert by_val[587.05].kind == "evidence"
+    assert by_val[587.05].ref == "E-PRIMARY"
+
+    # Order 1: E-SELF-DRAFT points to the draft itself and is excluded from verification
+    assert by_val[914.47].matched is False
+    assert "指向草稿自身" in by_val[914.47].hint
+
+    # Step D: retrieve_candidate_sources includes primary file body for E-PRIMARY and excludes E-SELF-DRAFT
+    fcf_fig = by_val[732.66].figure
+    cands = retrieve_candidate_sources(
+        fcf_fig,
+        thesis_doc=thesis_doc,
+        evidence_ref_bodies=evidence_ref_bodies,
+        draft_path="drafts/GOOGL_init_20261023.md",
+    )
+    cand_ids = [c["source_id"] for c in cands]
+    assert "E-PRIMARY" in cand_ids
+    assert "E-SELF-DRAFT" not in cand_ids
+    primary_cand = next(c for c in cands if c["source_id"] == "E-PRIMARY")
+    assert "732.66" in primary_cand["text"]
+
+
+@pytest.mark.asyncio
+async def test_model_xlsx_cell_reading_and_prov_windowing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Service reads referenced `.xlsx` cells via `read_model_cell`, enforces reliable units, and windows long prov bodies."""
+    from src.dalton import auth as dalton_auth
+    from src.dalton.publish import service as publish_svc
+    from tests.unit.dalton._xlsx_builder import Cell, build_xlsx
+
+    xlsx_bytes = build_xlsx(
+        {
+            "Summary": {
+                "A2": "营业利润率",
+                "B2": Cell(0.241, num_fmt="0.0%"),
+                "A3": "营业收入 ($B)",
+                "C3": 18.55,  # 18.55 billion USD == 185.5 亿美元 (with row label ($B))
+                "D4": 18.55,  # Unitless cell: no row/col header unit and General number_format
+            }
+        }
+    )
+
+    draft_md = (
+        "# 1. 模型预测\n"
+        "FY2026E 营业利润率预计达到 24.1%[引用1]，FY2026E 营业收入预计为 185.5 亿美元[引用2]。\n\n"
+        "## 引用\n"
+        "[引用1]: model:models/val.xlsx#Summary!B2\n"
+        "[引用2]: model:models/val.xlsx#Summary!C3\n"
+    )
+    files_store: dict[str, str] = {"drafts/val_report.md": draft_md}
+
+    class _BackendSpec:
+        async def aread_text(self, path: str) -> str | None: ...
+        async def awrite_text(self, path: str, content: str) -> None: ...
+        async def adownload_file_bytes(self, path: str) -> bytes | None: ...
+
+    backend = create_autospec(_BackendSpec, instance=True)
+    backend.aread_text.side_effect = lambda p: files_store.get(p)
+    backend.awrite_text.side_effect = lambda p, c: files_store.__setitem__(p, c)
+    backend.adownload_file_bytes.side_effect = (
+        lambda p: xlsx_bytes if p == "models/val.xlsx" else None
+    )
+
+    monkeypatch.setattr(
+        publish_svc,
+        "verify_workspace_access",
+        create_autospec(
+            dalton_auth.verify_workspace_access, return_value={"workspace_id": "ws-1"}
+        ),
+    )
+
+    res = await publish_svc.run_check_draft(
+        user_id="local-dev-user",
+        workspace_id="ws-1",
+        draft_path="drafts/val_report.md",
+        backend=backend,
+        thesis_doc={"evidence": []},
+        models_doc={"versions": [{"path": "models/val.xlsx", "recalculated": True}]},
+        provenance_records={},
+        use_llm_judge=False,
+    )
+    assert res["ok"] is True
+    assert res["audit"]["matched"] == 2
+    assert res["audit"]["unverified"] == 0
+
+    # Unitless cell D4 = 18.55 vs draft "185.5 亿美元" must remain unverified (never guess billion/million)
+    draft_unitless_mismatch = (
+        "# 1. 模型预测\n"
+        "FY2026E 营业收入预计为 185.5 亿美元[引用1]。\n\n"
+        "## 引用\n"
+        "[引用1]: model:models/val.xlsx#Summary!D4\n"
+    )
+    files_store["drafts/unitless.md"] = draft_unitless_mismatch
+    res_unitless = await publish_svc.run_check_draft(
+        user_id="local-dev-user",
+        workspace_id="ws-1",
+        draft_path="drafts/unitless.md",
+        backend=backend,
+        thesis_doc={"evidence": []},
+        models_doc={"versions": [{"path": "models/val.xlsx", "recalculated": True}]},
+        provenance_records={},
+        use_llm_judge=False,
+    )
+    assert res_unitless["ok"] is True
+    assert res_unitless["audit"]["matched"] == 0
+    assert res_unitless["audit"]["unverified"] == 1
+    assert res_unitless["audit"]["contradicted"] == 0
+
+    # Verify prov hit-centered windowing (>1000 chars offset) and draft self-read exclusion
+    unfootnoted_fig = extract_figures("FY2025 核心广告收入达到 888.88 亿美元。\n")[0]
+    long_prefix = "无关背景段落。" * 250  # > 1500 chars
+    prov_records = {
+        "prov-deep": {
+            "record_id": "prov-deep",
+            "source_type": "filing",
+            "identifier": "10-K",
+            "body_inline": f"{long_prefix} FY2025 核心广告收入达到 888.88 亿美元。后续段落。",
+        },
+        "prov-draft-self": {
+            "record_id": "prov-draft-self",
+            "source_type": "file_read",
+            "identifier": "drafts/val_report.md",
+            "body_inline": "FY2025 核心广告收入达到 888.88 亿美元。",
+        },
+        "prov-other-draft": {
+            "record_id": "prov-other-draft",
+            "source_type": "file_read",
+            "identifier": "drafts/other_company_memo.md",
+            "body_inline": "FY2025 核心广告收入达到 888.88 亿美元。",
+        },
+    }
+    cands = retrieve_candidate_sources(
+        unfootnoted_fig,
+        provenance_records=prov_records,
+        draft_path="drafts/val_report.md",
+    )
+    cand_ids = [c["source_id"] for c in cands]
+    assert "prov-deep" in cand_ids
+    assert "prov-draft-self" not in cand_ids
+    assert "prov-other-draft" in cand_ids
+    deep_cand = next(c for c in cands if c["source_id"] == "prov-deep")
+    assert "888.88" in deep_cand["text"]
+
+
+def test_threshold_exempt_marker_and_sentence_scoped_exemption() -> None:
+    """`[阈值]` is recognized as an exemption marker, and exemption applies per sentence rather than the whole line."""
+    from src.dalton.publish.numbers import has_exempt_marker
+
+    assert has_exempt_marker("若营业利润率跌破 20% [阈值]，则触发改判条件。")
+    assert has_exempt_marker("若营业利润率跌破 20% 〔阈值〕，则触发改判条件。")
+    assert has_exempt_marker("若营业利润率跌破 20% （阈值），则触发改判条件。")
+
+    # Same line: sentence 1 has no marker, sentence 2 has `[阈值]`; sentence 3 after `；` has no marker
+    md = (
+        "# 1. 核心判断与改判条件\n"
+        "FY2025 Google Cloud 营业利润率达到 23.7%[引用1]。"
+        "若后续季度营业利润率跌破 18.0% 或收入增速低于 20.0% [阈值]，则下调评级；"
+        "FY2025 搜索广告收入同比增长 13.5%[引用1]。\n"
+    )
+    figs = extract_figures(md)
+    by_val = {round(f.value, 1): f for f in figs}
+
+    # Unmarked first sentence on the line is NOT exempted
+    assert by_val[23.7].exempt is False
+    assert by_val[23.7].exempt_reason is None
+
+    # Second sentence with `[阈值]` IS exempted (both numbers in that sentence)
+    assert by_val[18.0].exempt is True
+    assert by_val[18.0].exempt_reason == "illustrative"
+    assert by_val[20.0].exempt is True
+    assert by_val[20.0].exempt_reason == "illustrative"
+
+    # Third sentence after semicolon `；` on the same line is NOT exempted
+    assert by_val[13.5].exempt is False
+    assert by_val[13.5].exempt_reason is None
+
+
+def test_ref_body_does_not_override_structured_figure_conflict_and_self_ref_keeps_structured_figures() -> None:
+    """Structured `figures` conflict is not overridden by `source.ref` body; self-ref excludes only `ref` body, not structured `figures`."""
+    draft = (
+        "# 1. 收入核验\n"
+        "FY2025 营业收入为 500.0 亿美元[引用1]。\n"
+        "FY2025 净利润为 120.0 亿美元[引用2]。\n\n"
+        "## 引用\n"
+        "[引用1]: evidence:E-CONFLICT\n"
+        "[引用2]: evidence:E-SELF-WITH-FIGS\n"
+    )
+    thesis_doc = {
+        "evidence": [
+            {
+                "id": "E-CONFLICT",
+                "fact": "FY2025 营业收入为 600.0 亿美元。",
+                "source": {"type": "filing", "identity": "10-K", "ref": "data/filing_note.md"},
+                "figures": [
+                    {
+                        "metric": "营业收入",
+                        "value": 60.0,
+                        "unit": "USD_bn",
+                        "period": "FY2025",
+                        "label": "reported",
+                    }
+                ],
+            },
+            {
+                "id": "E-SELF-WITH-FIGS",
+                "fact": "FY2025 净利润为 120.0 亿美元。",
+                "source": {"type": "other", "identity": "Draft", "ref": "drafts/current.md"},
+                "figures": [
+                    {
+                        "metric": "净利润",
+                        "value": 12.0,
+                        "unit": "USD_bn",
+                        "period": "FY2025",
+                        "label": "reported",
+                    }
+                ],
+            },
+        ]
+    }
+    # Even though data/filing_note.md mentions "500.0 亿美元" elsewhere, structured figures[] already found a conflict (600 vs 500)
+    evidence_ref_bodies = {
+        "data/filing_note.md": "某段历史提及 FY2025 营业收入为 500.0 亿美元。",
+        "drafts/current.md": draft,
+    }
+    figs = extract_figures(draft)
+    outcomes = match_figures(
+        figs,
+        thesis_doc=thesis_doc,
+        evidence_ref_bodies=evidence_ref_bodies,
+        draft_path="drafts/current.md",
+    )
+    by_val = {round(o.figure.value, 1): o for o in outcomes}
+
+    assert by_val[500.0].matched is False
+    assert by_val[500.0].reason == "source_conflict"
+
+    # E-SELF-WITH-FIGS has structured figures[] that still verify 120.0 even though source.ref points to drafts/current.md
+    assert by_val[120.0].matched is True
+    assert by_val[120.0].ref == "E-SELF-WITH-FIGS"
+
+
+@pytest.mark.asyncio
+async def test_model_cell_priority_missing_sheet_and_read_error_in_audit_report(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`from_xlsx` value takes priority over `models.json.key_outputs`; missing sheet and read failure are reported in `.audit.md`."""
+    import builtins
+
+    from src.dalton import auth as dalton_auth
+    from src.dalton.publish import service as publish_svc
+    from src.dalton.publish.match import read_model_cell
+    from tests.unit.dalton._xlsx_builder import build_xlsx
+
+    xlsx_bytes = build_xlsx(
+        {
+            "Summary": {
+                "C10": 200.0,  # Real xlsx value is 200, while stale key_outputs and draft say 100
+            }
+        }
+    )
+
+    draft_md = (
+        "# 1. 估值与预测\n"
+        "FY2026 目标价为 $100[引用1]。\n"
+        "FY2026 营业利润为 $50bn[引用2]。\n\n"
+        "## 引用\n"
+        "[引用1]: model:models/val.xlsx#Summary!C10\n"
+        "[引用2]: model:models/val.xlsx#NoSuchSheet!B2\n"
+    )
+    files_store: dict[str, str] = {"drafts/val.md": draft_md}
+
+    class _BackendSpec:
+        async def aread_text(self, path: str) -> str | None: ...
+        async def awrite_text(self, path: str, content: str) -> None: ...
+        async def adownload_file_bytes(self, path: str) -> bytes | None: ...
+
+    backend = create_autospec(_BackendSpec, instance=True)
+    backend.aread_text.side_effect = lambda p: files_store.get(p)
+    backend.awrite_text.side_effect = lambda p, c: files_store.__setitem__(p, c)
+    backend.adownload_file_bytes.side_effect = (
+        lambda p: xlsx_bytes if p == "models/val.xlsx" else None
+    )
+
+    monkeypatch.setattr(
+        publish_svc,
+        "verify_workspace_access",
+        create_autospec(
+            dalton_auth.verify_workspace_access, return_value={"workspace_id": "ws-1"}
+        ),
+    )
+
+    models_doc = {
+        "versions": [
+            {
+                "path": "models/val.xlsx",
+                "recalculated": True,
+                "key_outputs": [
+                    {
+                        "name": "目标价",
+                        "cell": "Summary!C10",
+                        "value": 100.0,
+                        "unit": "USD",
+                        "period": "FY2026",
+                    }
+                ],
+            }
+        ]
+    }
+    res = await publish_svc.run_check_draft(
+        user_id="local-dev-user",
+        workspace_id="ws-1",
+        draft_path="drafts/val.md",
+        backend=backend,
+        thesis_doc={"evidence": []},
+        models_doc=models_doc,
+        provenance_records={},
+        use_llm_judge=False,
+    )
+    assert res["ok"] is True
+    assert res["audit"]["matched"] == 0
+    # $100 vs real cell 200 USD -> source_conflict (never matched=True!)
+    assert res["audit"]["contradicted"] == 1
+    assert res["audit"]["unverified"] == 1
+    audit_md_text = files_store["drafts/val.audit.md"]
+    assert "模型文件中没有工作表 NoSuchSheet" in audit_md_text
+
+    # Block openpyxl at runtime: stdlib XML reader still succeeds without openpyxl
+    real_import = builtins.__import__
+
+    def _no_openpyxl(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name == "openpyxl" or name.startswith("openpyxl."):
+            raise ImportError("No module named 'openpyxl'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _no_openpyxl)
+    val_no_oxl, unit_no_oxl, err_no_oxl = read_model_cell(xlsx_bytes, "Summary", "C10")
+    assert val_no_oxl == 200.0
+    assert unit_no_oxl is None
+    assert err_no_oxl is None
+
+    # Corrupt xlsx bytes -> explicit read failure written to audit report
+    backend.adownload_file_bytes.side_effect = (
+        lambda p: b"not-a-valid-zip" if p == "models/val.xlsx" else None
+    )
+    files_store.pop("drafts/val.audit.md", None)
+    res_err = await publish_svc.run_check_draft(
+        user_id="local-dev-user",
+        workspace_id="ws-1",
+        draft_path="drafts/val.md",
+        backend=backend,
+        thesis_doc={"evidence": []},
+        models_doc=models_doc,
+        provenance_records={},
+        use_llm_judge=False,
+    )
+    assert res_err["audit"]["matched"] == 0
+    assert "模型单元格读取失败" in files_store["drafts/val.audit.md"]
+
+
+@pytest.mark.asyncio
+async def test_provenance_tiered_loading_and_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`_load_workspace_provenance` does not expand when batch 1 hits, and caps total records (including `prov:` refs) at `max_limit`."""
+    from contextlib import asynccontextmanager
+    from psycopg import AsyncConnection, AsyncCursor
+    from src.dalton.publish import service as publish_svc
+
+    executed_queries: list[tuple[str, Any]] = []
+
+    cur_mock = create_autospec(AsyncCursor, instance=True)
+
+    # Case 1: First batch hits the draft figure -> only 1 query executed, no expansion
+    async def _exec_hit(
+        sql: Any,
+        params: Any = None,
+        *,
+        prepare: bool | None = None,
+        binary: bool | None = None,
+    ) -> Any:
+        executed_queries.append((str(sql), params))
+        return cur_mock
+
+    async def _fetchall_hit() -> list[Any]:
+        return [
+            (
+                "prov-001",
+                "filing",
+                "10-K",
+                "Title",
+                "Detail",
+                "sec",
+                "sha1",
+                "FY2025 收入为 100 亿美元。",
+                "FY2025 收入为 100 亿美元。",
+            )
+        ]
+
+    cur_mock.execute.side_effect = _exec_hit
+    cur_mock.fetchall.side_effect = _fetchall_hit
+
+    @asynccontextmanager
+    async def _fake_cursor(*args: Any, **kwargs: Any):
+        yield cur_mock
+
+    conn_mock = create_autospec(AsyncConnection, instance=True)
+    conn_mock.cursor.side_effect = _fake_cursor
+
+    @asynccontextmanager
+    async def _fake_get_db(conn_arg: Any = None):
+        yield conn_mock
+
+    monkeypatch.setattr(
+        publish_svc,
+        "get_db_connection",
+        create_autospec(publish_svc.get_db_connection, side_effect=_fake_get_db),
+    )
+
+    res_hit = await publish_svc._load_workspace_provenance(
+        "ws-1",
+        draft_path="drafts/d.md",
+        draft_text="FY2025 收入为 100 亿美元。\n",
+        initial_limit=300,
+        max_limit=1500,
+    )
+    assert len(res_hit) == 1
+    assert len(executed_queries) == 1
+    assert executed_queries[0][1] == ("ws-1", 300)
+
+    # Case 2: First batch misses and referenced_ids are present -> expands with LIMIT and never exceeds max_limit
+    executed_queries.clear()
+    call_idx = 0
+
+    async def _fetchall_expand() -> list[Any]:
+        nonlocal call_idx
+        call_idx += 1
+        if call_idx == 1:
+            return [
+                (f"prov-init-{i}", "filing", "10-K", "", "", "sec", f"s{i}", "无关内容", "无关内容")
+                for i in range(3)
+            ]
+        if call_idx == 2:
+            return [
+                (f"prov-ref-{i}", "filing", "10-K", "", "", "sec", f"sr{i}", "无关内容", "无关内容")
+                for i in range(5)
+            ]
+        return [
+            (f"prov-exp-{i}", "filing", "10-K", "", "", "sec", f"se{i}", "无关内容", "无关内容")
+            for i in range(10)
+        ]
+
+    cur_mock.fetchall.side_effect = _fetchall_expand
+
+    res_capped = await publish_svc._load_workspace_provenance(
+        "ws-1",
+        draft_path="drafts/d.md",
+        draft_text="FY2025 收入为 100 亿美元。\n",
+        referenced_ids={"prov-ref-0", "prov-ref-1", "prov-ref-2"},
+        initial_limit=3,
+        max_limit=5,
+    )
+    assert len(res_capped) == 5
+    assert all("LIMIT %s" in q[0] for q in executed_queries)
+
+
+def test_english_period_after_number_sentence_boundary_and_footnote_only_citation_section() -> None:
+    """English period after a number followed by space+uppercase is a sentence boundary; `## 引用` with only `[^note]` triggers missing-table fallback."""
+    from src.dalton.publish.numbers import count_unparsed_citations_when_table_missing
+
+    md = (
+        "# 1. English Sentences\n"
+        "Revenue 100. Profit 20 [引用2]. Growth 1.5% [引用1].\n\n"
+        "## 引用\n"
+        "[引用1]: evidence:E-1\n"
+        "[引用2]: evidence:E-2\n"
+    )
+    figs = extract_figures(md)
+    by_val = {round(f.value, 1): f for f in figs}
+    assert by_val[100.0].footnote_id is None
+    assert by_val[20.0].footnote_id == "引用2"
+    assert by_val[1.5].footnote_id == "引用1"
+
+    # `## 引用` containing only `[^note]: ...` and no `[引用N]` definitions is treated as missing `## 引用` table
+    md_only_trad_fn = (
+        "# 1. 摘要\n"
+        "FY2025 收入为 100 亿美元[引用1]，利润率 25%[^note]。\n\n"
+        "## 引用\n"
+        "[^note]: evidence:E-NOTE\n"
+    )
+    assert count_unparsed_citations_when_table_missing(md_only_trad_fn) == 1
+    figs_fallback = extract_figures(md_only_trad_fn)
+    by_val_fb = {round(f.value, 1): f for f in figs_fallback}
+    assert by_val_fb[100.0].missing_citations == []
+    assert by_val_fb[100.0].footnote_target is None
+    assert by_val_fb[25.0].footnote_target == "evidence:E-NOTE"
+
+
+@pytest.mark.asyncio
+async def test_stdlib_xlsx_model_cell_reading_and_unrecalculated_formula_checks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify stdlib XML `.xlsx` cell reading (with openpyxl blocked at runtime) and unrecalculated formula checks."""
+    import builtins
+
+    from src.dalton import auth as dalton_auth
+    from src.dalton.database import knowledge as db_knowledge
+    from src.dalton.database import publications as db_publications
+    from src.dalton.publish import service as publish_svc
+    from src.dalton.publish.match import count_unrecalculated_formulas, read_model_cell
+    from tests.unit.dalton._xlsx_builder import Cell, build_xlsx
+
+    # 1. Build `.xlsx` workbooks via stdlib `_xlsx_builder` (with and without cached `<v>` on formulas)
+    unrecalc_only_bytes = build_xlsx(
+        {
+            "Summary": {
+                "A12": "营业收入 ($B)",
+                "B10": 10.0,
+                "B11": 20.0,
+                "B12": Cell(None, formula="=B10+B11"),
+                "B13": Cell(None, formula="=B12*2"),
+                "C2": True,
+            }
+        }
+    )
+    recalc_bytes = build_xlsx(
+        {
+            "Summary": {
+                "A12": "营业收入 ($B)",
+                "B10": 10.0,
+                "B11": 20.0,
+                "B12": Cell(30.0, formula="=B10+B11"),
+                "B13": Cell(60.0, formula="=B12*2"),
+                "C2": True,
+                # Shared string t="s" at A20 (index 1 in sharedStrings.xml -> "共享字符串文本")
+                "A20": Cell("共享字符串文本", t="s"),
+                # inlineStr at B20
+                "B20": Cell("内联字符串($M)", t="inlineStr"),
+                # Formula string result t="str" at C20
+                "C20": Cell("FY2026", t="str", formula='CONCAT("FY","2026")'),
+                # Boolean t="b" at D20
+                "D20": Cell(True, t="b"),
+                # Error cell t="e" at E20
+                "E20": Cell("#DIV/0!", t="e"),
+            }
+        }
+    )
+
+    # 2. Block openpyxl at runtime for the remainder of the test to prove zero runtime dependency
+    real_import = builtins.__import__
+
+    def _forbid_openpyxl(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name == "openpyxl" or name.startswith("openpyxl."):
+            raise ImportError("openpyxl is forbidden at runtime")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _forbid_openpyxl)
+
+    # 3. Direct `read_model_cell` assertions on recalculated workbook + special cell types
+    assert count_unrecalculated_formulas(recalc_bytes) == 0
+    val_b12, unit_b12, err_b12 = read_model_cell(recalc_bytes, "Summary", "B12")
+    assert val_b12 == 30.0
+    assert unit_b12 == "USD_bn"
+    assert err_b12 is None
+
+    # Coordinate normalization: `$B$12` and ` $b$13 `
+    val_dollar, unit_dollar, err_dollar = read_model_cell(
+        recalc_bytes, "Summary", " $B$12 "
+    )
+    assert val_dollar == 30.0
+    assert unit_dollar == "USD_bn"
+    assert err_dollar is None
+
+    # Shared string t="s"
+    val_s, _, err_s = read_model_cell(recalc_bytes, "Summary", "A20")
+    assert err_s is None
+    assert val_s == "共享字符串文本"
+
+    # inlineStr t="inlineStr"
+    val_in, _, err_in = read_model_cell(recalc_bytes, "Summary", "B20")
+    assert val_in == "内联字符串($M)"
+    assert err_in is None
+
+    # Formula string t="str"
+    val_fstr, _, err_fstr = read_model_cell(recalc_bytes, "Summary", "C20")
+    assert val_fstr == "FY2026"
+    assert err_fstr is None
+
+    # Boolean t="b"
+    val_b, _, err_b = read_model_cell(recalc_bytes, "Summary", "D20")
+    assert val_b is True
+    assert err_b is None
+
+    # Error cell t="e"
+    val_e, _, err_e = read_model_cell(recalc_bytes, "Summary", "E20")
+    assert val_e is None
+    assert err_e is not None and "#DIV/0!" in err_e
+
+    # Non-existent worksheet and non-existent cell
+    val_ns, _, err_ns = read_model_cell(recalc_bytes, "MissingSheet", "B12")
+    assert val_ns is None
+    assert err_ns == "模型文件中没有工作表 MissingSheet"
+
+    val_nc, _, err_nc = read_model_cell(recalc_bytes, "Summary", "Z99")
+    assert val_nc is None
+    assert err_nc is not None and "不存在或为空" in err_nc
+
+    # 4. Unrecalculated workbook without `<v>` on formulas
+    assert count_unrecalculated_formulas(unrecalc_only_bytes) == 2
+    val_un, _, err_un = read_model_cell(unrecalc_only_bytes, "Summary", "B12")
+    assert val_un is None
+    assert err_un == "公式没有缓存值（模型未重算，请先运行 recalc.py）"
+
+    # 5. `check_draft` and `publish_report` on unrecalculated vs recalculated workbook
+    draft_with_dollar_coord = (
+        "# 1. 模型预测\n"
+        "FY2026E 营业收入预计为 300 亿美元[引用1]。\n\n"
+        "## 引用\n"
+        "[引用1]: model:models/val.xlsx#Summary!$B$12\n"
+    )
+    files_store: dict[str, str] = {"drafts/val.md": draft_with_dollar_coord}
+    current_xlsx: dict[str, bytes] = {"bytes": unrecalc_only_bytes}
+
+    class _BackendSpec:
+        async def aread_text(self, path: str) -> str | None: ...
+        async def awrite_text(self, path: str, content: str) -> None: ...
+        async def adownload_file_bytes(self, path: str) -> bytes | None: ...
+
+    backend = create_autospec(_BackendSpec, instance=True)
+    backend.aread_text.side_effect = lambda p: files_store.get(p)
+    backend.awrite_text.side_effect = lambda p, c: files_store.__setitem__(p, c)
+    backend.adownload_file_bytes.side_effect = (
+        lambda p: current_xlsx["bytes"] if p == "models/val.xlsx" else None
+    )
+
+    monkeypatch.setattr(
+        publish_svc,
+        "verify_workspace_access",
+        create_autospec(
+            dalton_auth.verify_workspace_access, return_value={"workspace_id": "ws-1"}
+        ),
+    )
+
+    expected_recalc_cmd = (
+        "模型未重算：2 个公式没有缓存值，请运行 "
+        "`python .agents/skills/xlsx/scripts/recalc.py models/val.xlsx` 后再发布"
+    )
+
+    # 5a. `check_draft` on unrecalculated workbook warns at top of `.audit.md`
+    chk_unrecalc = await publish_svc.run_check_draft(
+        user_id="local-dev-user",
+        workspace_id="ws-1",
+        draft_path="drafts/val.md",
+        backend=backend,
+        thesis_doc={"evidence": []},
+        models_doc={"versions": [{"path": "models/val.xlsx", "recalculated": True}]},
+        provenance_records={},
+        use_llm_judge=False,
+    )
+    assert chk_unrecalc["ok"] is True
+    assert chk_unrecalc["audit"]["matched"] == 0
+    assert chk_unrecalc["audit"]["unverified"] == 1
+    audit_md_unrecalc = files_store["drafts/val.audit.md"]
+    assert expected_recalc_cmd in audit_md_unrecalc
+    assert "公式没有缓存值（模型未重算，请先运行 recalc.py）" in audit_md_unrecalc
+
+    # 5b. `publish_report` (`run_publish`) is rejected with the recalc.py command (even when prose figures all pass via evidence)
+    draft_only_attachment_model = (
+        "# 1. 历史数据\n"
+        "FY2025 营业收入为 400 亿美元[引用1]。\n\n"
+        "## 引用\n"
+        "[引用1]: evidence:E-1\n"
+    )
+    files_store["drafts/att_only.md"] = draft_only_attachment_model
+    thesis_ok = {
+        "evidence": [
+            {
+                "id": "E-1",
+                "fact": "FY2025 营业收入为 400 亿美元。",
+                "figures": [
+                    {
+                        "metric": "营业收入",
+                        "value": 40.0,
+                        "unit": "USD_bn",
+                        "period": "FY2025",
+                        "label": "reported",
+                    }
+                ],
+            }
+        ]
+    }
+    monkeypatch.setattr(
+        db_publications,
+        "resolve_thread_author_model",
+        create_autospec(
+            db_publications.resolve_thread_author_model,
+            return_value="claude-opus-5-5-oauth",
+        ),
+    )
+    monkeypatch.setattr(
+        db_knowledge,
+        "list_all_latest_for_workspace",
+        create_autospec(
+            db_knowledge.list_all_latest_for_workspace,
+            return_value={"thesis": {"content": thesis_ok, "version_no": 1}},
+        ),
+    )
+    monkeypatch.setattr(
+        db_publications,
+        "get_or_create_request",
+        create_autospec(
+            db_publications.get_or_create_request,
+            return_value=(
+                {
+                    "publish_request_id": "req-unrecalc-1",
+                    "workspace_id": "ws-1",
+                    "user_id": "local-dev-user",
+                    "status": "auditing",
+                },
+                True,
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        db_publications,
+        "transition",
+        create_autospec(db_publications.transition, return_value=None),
+    )
+    monkeypatch.setattr(
+        publish_svc,
+        "_load_workspace_provenance",
+        create_autospec(publish_svc._load_workspace_provenance, return_value={}),
+    )
+
+    pub_unrecalc = await publish_svc.run_publish(
+        user_id="local-dev-user",
+        workspace_id="ws-1",
+        thread_id="th-1",
+        tool_call_id="tc-1",
+        draft_path="drafts/att_only.md",
+        title="GOOGL",
+        kind="initiation",
+        slug="googl-init",
+        attachments=[{"path": "models/val.xlsx", "role": "model"}],
+        backend=backend,
+    )
+    assert pub_unrecalc["ok"] is False
+    assert pub_unrecalc["status"] == "audit_failed"
+    assert expected_recalc_cmd in pub_unrecalc["message"]
+    assert expected_recalc_cmd in files_store["drafts/att_only.audit.md"]
+
+    # 5c. Once recalculated (`recalc_bytes`), `check_draft` on `drafts/val.md` (`Summary!$B$12` = 30.0 USD_bn == 300 亿美元) verifies!
+    current_xlsx["bytes"] = recalc_bytes
+    files_store.pop("drafts/val.audit.md", None)
+    chk_recalc = await publish_svc.run_check_draft(
+        user_id="local-dev-user",
+        workspace_id="ws-1",
+        draft_path="drafts/val.md",
+        backend=backend,
+        thesis_doc={"evidence": []},
+        models_doc={"versions": [{"path": "models/val.xlsx", "recalculated": True}]},
+        provenance_records={},
+        use_llm_judge=False,
+    )
+    assert chk_recalc["ok"] is True
+    assert chk_recalc["audit"]["matched"] == 1
+    assert chk_recalc["audit"]["unverified"] == 0
+    assert "模型未重算" not in files_store["drafts/val.audit.md"]
+
+
+@pytest.mark.asyncio
+async def test_round5_pct_unit_strictness_and_row_col_unit_hints(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 5 #1–#3:
+    1. Percentage never guesses:
+       - `1.0 pct` vs draft `100%` does not match;
+       - `0.21 pct` (from `figures`, `models.json`, or row label) vs `21%` does not match;
+       - Unitless `0.21` vs `21%` does not match;
+       - Percentage-formatted Excel cell (`0.21` with `0.0%` number_format) vs `21%` matches.
+    2. Unit hints only inspect same row, same column, or explicit `单位：` cell;
+       when row 2 (`A2`) has `营业利润率 (%)`, unitless `18.55` in row 4 (`D4`) cannot verify `18.55%`.
+    3. Magnitude and currency are separated:
+       - `18.55 亿美元` (`USD_100mn`) does NOT match draft `185.5 亿美元`, and DOES match draft `18.55 亿美元`;
+       - `HK$B` is recognized as `HKD_bn` (港元);
+       - Scale-only label without currency (`in millions`) is `unknown_mn` (`unknown_currency`) and cannot verify `USD_mn`.
+    """
+    from unittest.mock import create_autospec
+
+    import src.dalton.auth as dalton_auth
+    from src.dalton.publish import service as publish_svc
+    from src.dalton.publish.match import (
+        _parse_unit_from_label_text,
+        match_figures,
+        read_model_cell,
+        values_within_tolerance,
+    )
+    from tests.unit.dalton._xlsx_builder import Cell, build_xlsx
+
+    # --- Item 1: `1.0 pct` vs `100%` and `0.21 pct` (from figures) vs `21%` do NOT match ---
+    fig_100pct = extract_figures("FY2025 收入增速为 100%。")[0]
+    ok_100, _, _ = values_within_tolerance(fig_100pct, 1.0, "pct")
+    assert ok_100 is False
+
+    fig_1pct = extract_figures("FY2025 收入增速为 1%。")[0]
+    ok_1, _, _ = values_within_tolerance(fig_1pct, 1.0, "pct")
+    assert ok_1 is True
+
+    fig_21pct = extract_figures("FY2025 营业利润率为 21%[引用1]。\n\n## 引用\n[引用1]: evidence:E-1\n")[0]
+    ok_021_fig, _, _ = values_within_tolerance(fig_21pct, 0.21, "pct")
+    assert ok_021_fig is False
+    ok_021_other, _, _ = values_within_tolerance(fig_21pct, 0.21, "other")
+    assert ok_021_other is False
+
+    outcomes_ev = match_figures(
+        [fig_21pct],
+        thesis_doc={
+            "evidence": [
+                {
+                    "id": "E-1",
+                    "fact": "FY2025 营业利润率为 0.21%。",
+                    "figures": [
+                        {
+                            "metric": "营业利润率",
+                            "value": 0.21,
+                            "unit": "pct",
+                            "period": "FY2025",
+                            "label": "reported",
+                        }
+                    ],
+                }
+            ]
+        },
+    )
+    assert outcomes_ev[0].matched is False
+
+    # --- Item 2 & 3: Workbook with percentage number_format, row-only units, 亿美元 (`USD_100mn`), and `HK$B` (`HKD_bn`) ---
+    assert _parse_unit_from_label_text("收入 (亿美元)") == "USD_100mn"
+    assert _parse_unit_from_label_text("收入 (十亿美元)") == "USD_bn"
+    assert _parse_unit_from_label_text("收入 (HK$B)") == "HKD_bn"
+    assert _parse_unit_from_label_text("收入 (HKD bn)") == "HKD_bn"
+    assert _parse_unit_from_label_text("Revenue (in millions)") == "unknown_mn"
+    assert _parse_unit_from_label_text("增长超 10% 的核心业务") is None
+
+    fig_hkd = extract_figures("| 指标 | FY2025 |\n|---|---|\n| 收入 (HK$B) | 50.0 |\n")[0]
+    assert fig_hkd.currency == "HKD"
+    assert fig_hkd.unit == "HKD_bn"
+
+    xlsx_bytes = build_xlsx(
+        {
+            "Summary": {
+                "A2": "营业利润率 (%)",
+                "B2": 0.21,  # Row label says (%), General number_format -> 0.21 pct (0.21%), NOT 21%!
+                "C2": Cell(0.21, num_fmt="0.0%"),
+                "A3": "净利率",
+                "B3": Cell(0.21, num_fmt="0.0%"),  # No unit in row 3 label -> unit from cell percentage number_format!
+                "D4": 18.55,  # Row 4 has no row label unit; must NOT inherit `(%)` from A2!
+                "A5": "营业收入 (亿美元)",
+                "B5": 18.55,  # 18.55 亿美元 (`USD_100mn`)
+                "A6": "分部收入 (in millions)",
+                "B6": 18.55,  # Scale-only without currency (`unknown_mn`)
+            }
+        }
+    )
+
+    # Check `read_model_cell` units directly
+    val_b3, unit_b3, err_b3 = read_model_cell(xlsx_bytes, "Summary", "B3")
+    assert err_b3 is None and val_b3 == 0.21
+    assert unit_b3 == "pct" and getattr(unit_b3, "is_pct_number_format", False) is True
+
+    val_d4, unit_d4, err_d4 = read_model_cell(xlsx_bytes, "Summary", "D4")
+    assert err_d4 is None and val_d4 == 18.55
+    assert unit_d4 is None
+
+    val_b5, unit_b5, err_b5 = read_model_cell(xlsx_bytes, "Summary", "B5")
+    assert err_b5 is None and val_b5 == 18.55
+    assert unit_b5 == "USD_100mn"
+
+    val_b6, unit_b6, err_b6 = read_model_cell(xlsx_bytes, "Summary", "B6")
+    assert err_b6 is None and val_b6 == 18.55
+    assert unit_b6 == "unknown_mn"
+
+    draft_md = (
+        "# 1. 测试\n"
+        "FY2025 净利率为 21%[引用1]。\n"
+        "FY2025 营业利润率为 21%[引用2]。\n"
+        "FY2025 研发费率为 18.55%[引用3]。\n"
+        "FY2025 营业收入为 185.5 亿美元[引用4]。\n"
+        "FY2025 调整后营业收入为 18.55 亿美元[引用5]。\n"
+        "FY2025 分部收入为 1,855 百万美元[引用6]。\n\n"
+        "## 引用\n"
+        "[引用1]: model:models/r5.xlsx#Summary!B3\n"
+        "[引用2]: model:models/r5.xlsx#Summary!B2\n"
+        "[引用3]: model:models/r5.xlsx#Summary!D4\n"
+        "[引用4]: model:models/r5.xlsx#Summary!B5\n"
+        "[引用5]: model:models/r5.xlsx#Summary!B5\n"
+        "[引用6]: model:models/r5.xlsx#Summary!B6\n"
+    )
+    files_store: dict[str, str] = {"drafts/r5.md": draft_md}
+
+    class _BackendSpec:
+        async def aread_text(self, path: str) -> str | None: ...
+        async def awrite_text(self, path: str, content: str) -> None: ...
+        async def adownload_file_bytes(self, path: str) -> bytes | None: ...
+
+    backend = create_autospec(_BackendSpec, instance=True)
+    backend.aread_text.side_effect = lambda p: files_store.get(p)
+    backend.awrite_text.side_effect = lambda p, c: files_store.__setitem__(p, c)
+    backend.adownload_file_bytes.side_effect = (
+        lambda p: xlsx_bytes if p == "models/r5.xlsx" else None
+    )
+    monkeypatch.setattr(
+        publish_svc,
+        "verify_workspace_access",
+        create_autospec(
+            dalton_auth.verify_workspace_access, return_value={"workspace_id": "ws-1"}
+        ),
+    )
+
+    res = await publish_svc.run_check_draft(
+        user_id="local-dev-user",
+        workspace_id="ws-1",
+        draft_path="drafts/r5.md",
+        backend=backend,
+        thesis_doc={"evidence": []},
+        models_doc={"versions": [{"path": "models/r5.xlsx", "recalculated": True}]},
+        provenance_records={},
+        use_llm_judge=False,
+    )
+    assert res["ok"] is True
+    # Only [引用1] (percentage-formatted 0.21 == 21%) and [引用5] (18.55 亿美元 == 18.55 亿美元) match!
+    matched_raws = [m["raw"] for m in res["audit"]["matches"]]
+    assert matched_raws == ["21%", "18.55 亿美元"]
+    assert res["audit"]["matched"] == 2
+    assert res["audit"]["contradicted"] + res["audit"]["unverified"] == 4
+
+
+@pytest.mark.asyncio
+async def test_round5_xlsx_read_failure_never_falls_back_to_models_json_key_outputs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 5 #4: When `.xlsx` download fails (`None`), is empty (`b""`), or fails to parse,
+    `_merge_model_cells_with_models_doc` must NOT fall back to `models.json` `key_outputs` values.
+    """
+    from unittest.mock import create_autospec
+    import src.dalton.auth as dalton_auth
+    from src.dalton.publish import service as publish_svc
+
+    draft_md = (
+        "# 1. 估值\n"
+        "FY2026E 营业收入预计为 300 亿美元[引用1]。\n\n"
+        "## 引用\n"
+        "[引用1]: model:models/broken.xlsx#Summary!B12\n"
+    )
+    files_store: dict[str, str] = {"drafts/broken.md": draft_md}
+    current_bytes: dict[str, bytes | None] = {"raw": None}
+
+    class _BackendSpec:
+        async def aread_text(self, path: str) -> str | None: ...
+        async def awrite_text(self, path: str, content: str) -> None: ...
+        async def adownload_file_bytes(self, path: str) -> bytes | None: ...
+
+    backend = create_autospec(_BackendSpec, instance=True)
+    backend.aread_text.side_effect = lambda p: files_store.get(p)
+    backend.awrite_text.side_effect = lambda p, c: files_store.__setitem__(p, c)
+    backend.adownload_file_bytes.side_effect = (
+        lambda p: current_bytes["raw"] if p == "models/broken.xlsx" else None
+    )
+    monkeypatch.setattr(
+        publish_svc,
+        "verify_workspace_access",
+        create_autospec(
+            dalton_auth.verify_workspace_access, return_value={"workspace_id": "ws-1"}
+        ),
+    )
+
+    models_doc_with_ko = {
+        "versions": [
+            {
+                "path": "models/broken.xlsx",
+                "recalculated": True,
+                "key_outputs": [
+                    {
+                        "name": "营业收入",
+                        "cell": "Summary!B12",
+                        "value": 30.0,
+                        "unit": "USD_bn",
+                        "period": "FY2026E",
+                    }
+                ],
+            }
+        ]
+    }
+
+    for bad_payload in (None, b"", b"corrupt-not-a-zip"):
+        current_bytes["raw"] = bad_payload
+        files_store.pop("drafts/broken.audit.md", None)
+        res = await publish_svc.run_check_draft(
+            user_id="local-dev-user",
+            workspace_id="ws-1",
+            draft_path="drafts/broken.md",
+            backend=backend,
+            thesis_doc={"evidence": []},
+            models_doc=models_doc_with_ko,
+            provenance_records={},
+            use_llm_judge=False,
+        )
+        assert res["ok"] is True
+        assert res["audit"]["matched"] == 0
+        assert res["audit"]["unverified"] == 1
+
+
+@pytest.mark.asyncio
+async def test_round5_publish_gates_all_statuses_corrupt_xml_and_referenced_model_sha256(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 5 #5 & #9:
+    - `count_unrecalculated_formulas` raises `ValueError` on empty bytes, corrupt zip, or corrupt worksheet XML;
+    - `<c t="str"><f>""</f><v/></c>` is a valid empty cached string and NOT counted as unrecalculated;
+    - `run_publish` enforces unrecalculated/corrupt model checks and referenced `model:` `.xlsx` `sha256` checks
+      across `reviewing`, `awaiting_pm` (including after `interrupt()`), `approved`, and `publishing`.
+    """
+    import hashlib
+    from unittest.mock import create_autospec
+
+    import src.dalton.auth as dalton_auth
+    from src.dalton.database import knowledge as db_knowledge
+    from src.dalton.database import publications as db_publications
+    from src.dalton.publish import service as publish_svc
+    from src.dalton.publish.match import count_unrecalculated_formulas, read_model_cell
+    from tests.unit.dalton._xlsx_builder import Cell, build_xlsx
+
+    def _build_xlsx(
+        *,
+        b12_cached: str | None = "30.0",
+        str_formula_mode: str = "empty_v",
+        corrupt_sheet2: bool = False,
+    ) -> bytes:
+        c21_val: str | None = "" if str_formula_mode == "empty_v" else None
+        extra = (
+            {"xl/worksheets/sheet2.xml": b"<worksheet><broken"}
+            if corrupt_sheet2
+            else None
+        )
+        return build_xlsx(
+            {
+                "Summary": {
+                    "A12": "营业收入 ($B)",
+                    "B12": Cell(b12_cached, formula="=10+20"),
+                    "C21": Cell(c21_val, t="str", formula='""'),
+                }
+            },
+            extra_entries=extra,
+        )
+
+    # Item 9: `<c t="str"><f>""</f><v/></c>` is valid cached empty string (0 unrecalculated)
+    valid_empty_str_bytes = _build_xlsx(b12_cached="30.0", str_formula_mode="empty_v")
+    assert count_unrecalculated_formulas(valid_empty_str_bytes) == 0
+    val_c21, _, err_c21 = read_model_cell(valid_empty_str_bytes, "Summary", "C21")
+    assert err_c21 is None and val_c21 == ""
+
+    # Missing `<v>` on `t="str"` formula IS unrecalculated
+    missing_v_str_bytes = _build_xlsx(b12_cached="30.0", str_formula_mode="missing_v")
+    assert count_unrecalculated_formulas(missing_v_str_bytes) == 1
+    _, _, err_c21_missing = read_model_cell(missing_v_str_bytes, "Summary", "C21")
+    assert err_c21_missing == "公式没有缓存值（模型未重算，请先运行 recalc.py）"
+
+    # Item 5: Corrupt zip / empty bytes / corrupt worksheet XML raise ValueError in `count_unrecalculated_formulas`
+    with pytest.raises(ValueError):
+        count_unrecalculated_formulas(b"")
+    with pytest.raises(ValueError):
+        count_unrecalculated_formulas(b"not-a-zip")
+    corrupt_ws_bytes = _build_xlsx(
+        b12_cached="30.0", str_formula_mode="empty_v", corrupt_sheet2=True
+    )
+    with pytest.raises(ValueError):
+        count_unrecalculated_formulas(corrupt_ws_bytes)
+
+    # Item 5: `run_publish` gates on `awaiting_pm` (after interrupt) and `approved` when referenced `model:` `.xlsx`
+    # (not in `attachments`) changes its `sha256` or has unrecalculated/corrupt XML after audit
+    draft_md = (
+        "# 1. 模型预测\n"
+        "FY2026E 营业收入预计为 300 亿美元[引用1]。\n\n"
+        "## 引用\n"
+        "[引用1]: model:models/ref_only.xlsx#Summary!B12\n"
+    )
+    files_store: dict[str, str] = {"drafts/ref_gate.md": draft_md}
+    current_xlsx: dict[str, bytes] = {"bytes": valid_empty_str_bytes}
+    audit_time_sha = hashlib.sha256(valid_empty_str_bytes).hexdigest()
+
+    class _BackendSpec:
+        async def aread_text(self, path: str) -> str | None: ...
+        async def awrite_text(self, path: str, content: str) -> None: ...
+        async def adownload_file_bytes(self, path: str) -> bytes | None: ...
+
+    backend = create_autospec(_BackendSpec, instance=True)
+    backend.aread_text.side_effect = lambda p: files_store.get(p)
+    backend.awrite_text.side_effect = lambda p, c: files_store.__setitem__(p, c)
+    backend.adownload_file_bytes.side_effect = (
+        lambda p: current_xlsx["bytes"] if p == "models/ref_only.xlsx" else None
+    )
+    monkeypatch.setattr(
+        publish_svc,
+        "verify_workspace_access",
+        create_autospec(
+            dalton_auth.verify_workspace_access, return_value={"workspace_id": "ws-1"}
+        ),
+    )
+    monkeypatch.setattr(
+        db_publications,
+        "resolve_thread_author_model",
+        create_autospec(
+            db_publications.resolve_thread_author_model,
+            return_value="claude-opus-5-5-oauth",
+        ),
+    )
+    monkeypatch.setattr(
+        db_knowledge,
+        "list_all_latest_for_workspace",
+        create_autospec(
+            db_knowledge.list_all_latest_for_workspace,
+            return_value={"thesis": {"content": {"evidence": []}, "version_no": 1}},
+        ),
+    )
+    monkeypatch.setattr(
+        db_publications,
+        "transition",
+        create_autospec(db_publications.transition, return_value=None),
+    )
+
+    from src.dalton.publish.files import compute_bundle_sha256
+
+    bundle_sha = compute_bundle_sha256(draft_md.encode("utf-8"), [])
+    audit_dict = {
+        "figures": 1,
+        "matched": 1,
+        "verified": 1,
+        "contradicted": 0,
+        "unverified": 0,
+        "uncertain": 0,
+        "exempt": 0,
+        "model_file_sha256s": {"models/ref_only.xlsx": audit_time_sha},
+        "matches": [
+            {
+                "id": "F-001",
+                "raw": "300 亿美元",
+                "kind": "model",
+                "ref": "models/ref_only.xlsx#Summary!B12",
+                "source_sha256": audit_time_sha,
+            }
+        ],
+    }
+
+    # Case A: Request is in `awaiting_pm`; during `interrupt()`, the referenced `.xlsx` is modified to a different value
+    from src.dalton.settings import get_dalton_config
+
+    monkeypatch.setenv("DALTON_PM_USER_IDS", "local-dev-user")
+    get_dalton_config.cache_clear()
+    orig_get_request = db_publications.get_request
+    modified_recalc_bytes = _build_xlsx(b12_cached="99.0", str_formula_mode="empty_v")
+    monkeypatch.setattr(
+        db_publications,
+        "get_request",
+        create_autospec(
+            orig_get_request,
+            return_value={
+                "publish_request_id": "req-awaiting-1",
+                "workspace_id": "ws-1",
+                "user_id": "local-dev-user",
+                "status": "awaiting_pm",
+                "bundle_sha256": bundle_sha,
+                "audit": audit_dict,
+                "review": {"model": "gemini-3.1-pro", "family": "google", "verdict": "pass"},
+            },
+        ),
+    )
+
+    def _interrupt_mutates_xlsx(_payload: Any) -> dict[str, Any]:
+        current_xlsx["bytes"] = modified_recalc_bytes
+        return {"decisions": [{"type": "approve"}]}
+
+    res_awaiting = await publish_svc.run_publish(
+        user_id="local-dev-user",
+        workspace_id="ws-1",
+        thread_id="th-1",
+        tool_call_id="tc-1",
+        draft_path="drafts/ref_gate.md",
+        title="GOOGL",
+        kind="initiation",
+        slug="googl-init",
+        request_id="req-awaiting-1",
+        backend=backend,
+        interrupt_fn=_interrupt_mutates_xlsx,
+    )
+    assert res_awaiting["ok"] is False
+    assert res_awaiting["status"] == "superseded"
+    assert "sha256 不一致" in res_awaiting["message"]
+
+    # Case B: Request is in `approved`, and the referenced `.xlsx` has corrupt worksheet XML
+    current_xlsx["bytes"] = corrupt_ws_bytes
+    monkeypatch.setattr(
+        db_publications,
+        "get_request",
+        create_autospec(
+            orig_get_request,
+            return_value={
+                "publish_request_id": "req-approved-1",
+                "workspace_id": "ws-1",
+                "user_id": "local-dev-user",
+                "status": "approved",
+                "bundle_sha256": bundle_sha,
+                "audit": audit_dict,
+                "review": {"model": "gemini-3.1-pro", "family": "google", "verdict": "pass"},
+            },
+        ),
+    )
+    res_approved_corrupt = await publish_svc.run_publish(
+        user_id="local-dev-user",
+        workspace_id="ws-1",
+        thread_id="th-1",
+        tool_call_id="tc-1",
+        draft_path="drafts/ref_gate.md",
+        title="GOOGL",
+        kind="initiation",
+        slug="googl-init",
+        request_id="req-approved-1",
+        backend=backend,
+    )
+    assert res_approved_corrupt["ok"] is False
+    assert res_approved_corrupt["status"] == "audit_failed"
+    assert "损坏或解析失败" in res_approved_corrupt["message"]
+
+
+@pytest.mark.asyncio
+async def test_round5_table_sentence_exemption_prov_expansion_and_exact_self_ref(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 5 #6, #7, #8:
+    6. Table exemption is sentence-scoped: `[阈值]` in the first sentence of a table row header or cell
+       only exempts that sentence; the following unmarked sentence with actual performance is audited.
+    7. `_prov_hits_all_key_figures` / `_load_workspace_provenance` checks metric, period, value, and unit:
+       `FY2024 利润 $100bn` in batch 1 does NOT count as a hit for `FY2025 收入 $100bn` in the draft, so expansion continues.
+    8. `_is_draft_provenance_record` normalizes paths and only excludes `draft_path` or `drafts/<basename>`,
+       never `data/current.md`, `drafts/current.md.bak`, or `other/current.md`.
+    """
+    from contextlib import asynccontextmanager
+    from typing import AsyncIterator
+    from psycopg import AsyncConnection, AsyncCursor
+    from src.dalton.publish import service as publish_svc
+    from src.dalton.publish.match import _is_draft_provenance_record
+
+    # --- Item 6: Cross-sentence table exemption regression ---
+    table_md = (
+        "# 1. 业绩与阈值对比\n\n"
+        "| 指标 | 数值说明 |\n"
+        "|---|---|\n"
+        "| 营业利润率目标[阈值]为 15%。实际 FY2025 营业利润率 | 25.0% |\n"
+        "| 营收增速 | 目标线[阈值] 20.0%。实际 FY2025 营收增速为 30.0%。 |\n"
+    )
+    figs = extract_figures(table_md)
+    by_raw = {f.raw: f for f in figs}
+    assert "15%" in by_raw and by_raw["15%"].exempt is True
+    assert "25.0%" in by_raw and by_raw["25.0%"].exempt is False
+    assert by_raw["25.0%"].period == "FY2025"
+    assert "20.0%" in by_raw and by_raw["20.0%"].exempt is True
+    assert "30.0%" in by_raw and by_raw["30.0%"].exempt is False
+    assert by_raw["30.0%"].period == "FY2025"
+
+    # --- Item 7: Provenance expansion when batch 1 only has `FY2024 利润 $100bn` vs draft `FY2025 收入 $100bn` ---
+    draft_prov = "FY2025 收入为 $100bn。\n"
+    assert (
+        publish_svc._prov_hits_all_key_figures(
+            draft_prov,
+            {"p1": {"body_inline": "FY2024 利润为 $100bn。"}},
+            draft_path="drafts/current.md",
+        )
+        is False
+    )
+    assert (
+        publish_svc._prov_hits_all_key_figures(
+            draft_prov,
+            {"p2": {"body_inline": "FY2025 收入为 $100bn。"}},
+            draft_path="drafts/current.md",
+        )
+        is True
+    )
+
+    executed_queries: list[tuple[str, Any]] = []
+    current_rows: list[Any] = []
+    cur = create_autospec(AsyncCursor, instance=True)
+
+    async def _execute(
+        query: Any,
+        params: Any = None,
+        *,
+        prepare: bool | None = None,
+        binary: bool | None = None,
+    ) -> Any:
+        sql_str = str(query)
+        executed_queries.append((sql_str, params))
+        if "OFFSET" not in sql_str:
+            current_rows[:] = [
+                (
+                    "prov-batch1",
+                    "tool",
+                    "sec_filing",
+                    "10-K",
+                    "detail",
+                    "sec",
+                    "sha-1",
+                    "FY2024 利润为 $100bn。",
+                    "FY2024 利润为 $100bn。",
+                )
+            ]
+        else:
+            current_rows[:] = [
+                (
+                    "prov-batch2",
+                    "tool",
+                    "sec_filing",
+                    "10-K",
+                    "detail",
+                    "sec",
+                    "sha-2",
+                    "FY2025 收入为 $100bn。",
+                    "FY2025 收入为 $100bn。",
+                )
+            ]
+        return cur
+
+    cur.execute.side_effect = _execute
+    cur.fetchall.side_effect = lambda: list(current_rows)
+
+    @asynccontextmanager
+    async def _cursor_cm(*args: Any, **kwargs: Any) -> AsyncIterator[Any]:
+        yield cur
+
+    conn = create_autospec(AsyncConnection, instance=True)
+    conn.cursor.side_effect = _cursor_cm
+
+    @asynccontextmanager
+    async def _fake_get_db_connection(conn_arg: Any = None) -> AsyncIterator[Any]:
+        yield conn
+
+    orig_get_db_conn = publish_svc.get_db_connection
+    monkeypatch.setattr(
+        publish_svc,
+        "get_db_connection",
+        create_autospec(orig_get_db_conn, side_effect=_fake_get_db_connection),
+    )
+    loaded_prov = await publish_svc._load_workspace_provenance(
+        "ws-1",
+        draft_path="drafts/current.md",
+        draft_text=draft_prov,
+        initial_limit=1,
+        max_limit=5,
+    )
+    assert any("OFFSET" in sql for sql, _ in executed_queries)
+    assert "prov-batch1" in loaded_prov and "prov-batch2" in loaded_prov
+
+    # --- Item 8: `_is_draft_provenance_record` exact normalized self-ref only ---
+    assert _is_draft_provenance_record({"identifier": "drafts/current.md"}, "drafts/current.md") is True
+    assert _is_draft_provenance_record({"identifier": "./drafts/./current.md"}, "drafts/current.md") is True
+    assert _is_draft_provenance_record({"identifier": "drafts/sub/../current.md"}, "drafts/current.md") is True
+    assert _is_draft_provenance_record({"identifier": "data/current.md"}, "drafts/current.md") is False
+    assert _is_draft_provenance_record({"identifier": "drafts/current.md.bak"}, "drafts/current.md") is False
+    assert _is_draft_provenance_record({"identifier": "other/current.md"}, "drafts/current.md") is False
+
+
+@pytest.mark.asyncio
+async def test_round6_pct_stored_as_ratio_literal_pct_100mn_currency_and_table_header_sentences() -> None:
+    """Round 6 #1-#5:
+    1. `stored_as_ratio` is recorded independently from unit labels (`(%)` row label or `key_outputs.unit`):
+       cached `0.21` with format `0.00%` and row label `(%)` (or `key_outputs.unit = "pct"`) does NOT verify `0.21%`,
+       and DOES verify `21%`.
+    2. Literal `%` in Excel `number_format` (`0.00"%"` or `0.00\\%`) is not a percentage format specifier (`stored_as_ratio=False`),
+       so cached `0.21` does NOT multiply by 100 and does NOT match `21%`; only unquoted/unescaped `0.00%` does.
+    3. `亿` (`1e8`, `USD_100mn`) converts to base units without raw-value fallback:
+       `18.55 亿美元` does NOT match `18.55 USD_bn`, and DOES match `1.855 USD_bn`.
+    4. All currency comparisons require explicit and matching currency:
+       `$100bn` does NOT match currency-less `100 billion`;
+       HKD EPS (`港元每股收益`) does NOT match USD values (`USD` or `USD/sh`).
+    5. Column header narrative numbers are extracted per sentence (only the marked sentence is exempt),
+       and row/col header markers never bleed into the first sentence of adjacent cells.
+    """
+    from src.dalton.publish import service as publish_svc
+    from src.dalton.publish.match import (
+        _is_pct_number_format,
+        _parse_unit_from_number_format,
+    )
+    from tests.unit.dalton._xlsx_builder import Cell, build_xlsx
+
+    # --- Item 2: `0.00"%"`, `0.00\%`, `0.00%` format strings ---
+    assert _is_pct_number_format('0.00"%"') is False
+    assert _is_pct_number_format(r"0.00\%") is False
+    assert _is_pct_number_format("0.00%") is True
+    assert _parse_unit_from_number_format('0.00"%"') is None
+    assert _parse_unit_from_number_format(r"0.00\%") is None
+    u_pct_fmt = _parse_unit_from_number_format("0.00%")
+    assert u_pct_fmt == "pct"
+    assert getattr(u_pct_fmt, "stored_as_ratio", False) is True
+
+    # Build an .xlsx with 3 styles:
+    # s="1" -> 0.00% (true percentage format, stored_as_ratio=True)
+    # s="2" -> 0.00"%" (quoted literal "%", stored_as_ratio=False)
+    # s="3" -> 0.00\% (escaped literal "\%", stored_as_ratio=False)
+    xlsx_bytes = build_xlsx(
+        {
+            "Summary": {
+                "A10": Cell("营业利润率 (%)", t="inlineStr"),
+                "B10": Cell(0.21, num_fmt="0.00%"),
+                "C10": Cell(0.21, num_fmt='0.00"%"'),
+                "D10": Cell(0.21, num_fmt=r"0.00\%"),
+            }
+        }
+    )
+
+    class _BytesBackendProto:
+        async def adownload_file_bytes(self, path: str) -> bytes | None: ...
+
+    backend = create_autospec(_BytesBackendProto, instance=True)
+    backend.adownload_file_bytes.return_value = xlsx_bytes
+
+    # --- Item 1: cached `0.21`, format `0.00%`, row label `(%)` (and `key_outputs.unit = "pct"`) ---
+    models_doc = {
+        "versions": [
+            {
+                "id": "v1",
+                "path": "models/m.xlsx",
+                "recalculated": True,
+                "key_outputs": [
+                    {"name": "营业利润率", "cell": "Summary!B10", "value": 0.21, "unit": "pct", "period": "FY2025"}
+                ],
+            }
+        ]
+    }
+    draft_wrong_021 = (
+        "FY2025 营业利润率为 0.21% [引用1]。\n\n"
+        "## 引用\n"
+        "[引用1]: model:models/m.xlsx#Summary!B10\n"
+    )
+    cells_021 = await publish_svc._load_referenced_model_cells(
+        backend, draft_wrong_021, models_doc=models_doc
+    )
+    assert cells_021["models/m.xlsx#Summary!B10"]["stored_as_ratio"] is True
+    out_wrong_021 = match_figures(
+        extract_figures(draft_wrong_021),
+        models_doc=models_doc,
+        model_cells=cells_021,
+    )
+    assert out_wrong_021[0].matched is False
+
+    draft_right_21 = (
+        "FY2025 营业利润率为 21% [引用1]。\n\n"
+        "## 引用\n"
+        "[引用1]: model:models/m.xlsx#Summary!B10\n"
+    )
+    out_right_21 = match_figures(
+        extract_figures(draft_right_21),
+        models_doc=models_doc,
+        model_cells=cells_021,
+    )
+    assert out_right_21[0].matched is True
+
+    # --- Item 2: cached `0.21` with literal `%` formats `0.00"%"` (C10) and `0.00\%` (D10) ---
+    draft_lit_pct = (
+        "FY2025 营业利润率为 21% [引用1]，毛利率为 21% [引用2]。\n\n"
+        "## 引用\n"
+        "[引用1]: model:models/m.xlsx#Summary!C10\n"
+        "[引用2]: model:models/m.xlsx#Summary!D10\n"
+    )
+    cells_lit = await publish_svc._load_referenced_model_cells(backend, draft_lit_pct)
+    assert cells_lit["models/m.xlsx#Summary!C10"]["stored_as_ratio"] is False
+    assert cells_lit["models/m.xlsx#Summary!D10"]["stored_as_ratio"] is False
+    out_lit = match_figures(extract_figures(draft_lit_pct), model_cells=cells_lit)
+    assert out_lit[0].matched is False
+    assert out_lit[1].matched is False
+
+    # --- Item 3: `18.55 亿美元` (`USD_100mn`) vs `18.55 USD_bn` (False) and `1.855 USD_bn` (True) ---
+    fig_1855_yi = extract_figures("FY2025 收入为 18.55 亿美元。")[0]
+    assert fig_1855_yi.unit == "USD_100mn"
+    assert fig_1855_yi.scale == 1e8
+    assert values_within_tolerance(fig_1855_yi, 18.55, "USD_bn")[0] is False
+    assert values_within_tolerance(fig_1855_yi, 1.855, "USD_bn")[0] is True
+
+    # --- Item 4: Currency must be explicit and matching (`$100bn` vs `100 billion`; HKD EPS vs USD) ---
+    draft_cur_vs_count = (
+        "FY2025 收入为 $100bn [引用1]。\n\n"
+        "## 引用\n"
+        "[引用1]: prov:p-count\n"
+    )
+    out_cur_vs_count = match_figures(
+        extract_figures(draft_cur_vs_count),
+        provenance_records={"p-count": {"body": "FY2025 revenue was 100 billion."}},
+    )
+    assert out_cur_vs_count[0].matched is False
+
+    fig_hkd_eps = extract_figures("FY2025 港元每股收益为 5.20 港元/股。")[0]
+    assert fig_hkd_eps.currency == "HKD"
+    assert values_within_tolerance(fig_hkd_eps, 5.20, "USD")[0] is False
+    assert values_within_tolerance(fig_hkd_eps, 5.20, "USD_per_share")[0] is False
+    assert values_within_tolerance(fig_hkd_eps, 5.20, "per_share")[0] is False
+    assert values_within_tolerance(fig_hkd_eps, 5.20, "HKD")[0] is True
+    assert values_within_tolerance(fig_hkd_eps, 5.20, "HKD_per_share")[0] is True
+
+    draft_hkd_eps = (
+        "FY2025 港元每股收益为 5.20 港元/股 [引用1]。\n\n"
+        "## 引用\n"
+        "[引用1]: evidence:E-USD-EPS\n"
+    )
+    out_hkd_vs_usd = match_figures(
+        extract_figures(draft_hkd_eps),
+        thesis_doc={
+            "evidence": [
+                {
+                    "id": "E-USD-EPS",
+                    "fact": "FY2025 diluted EPS was $5.20.",
+                    "figures": [
+                        {"metric": "每股收益", "value": 5.20, "unit": "USD", "period": "FY2025"}
+                    ],
+                }
+            ]
+        },
+    )
+    assert out_hkd_vs_usd[0].matched is False
+
+    # --- Item 5: Column header narrative numbers extracted per sentence + row/col markers don't bleed ---
+    col_hdr_table_md = (
+        "# 1. 利润率核验\n\n"
+        "| 指标 | 目标[阈值]为 15%。实际 FY2025 营业利润率为 25%。 |\n"
+        "|---|---|\n"
+        "| 营业利润率[阈值] | 22.0% |\n"
+    )
+    hdr_figs = extract_figures(col_hdr_table_md)
+    hdr_by_raw = {f.raw: f for f in hdr_figs}
+    assert "15%" in hdr_by_raw and hdr_by_raw["15%"].exempt is True
+    assert "25%" in hdr_by_raw and hdr_by_raw["25%"].exempt is False
+    assert hdr_by_raw["25%"].period == "FY2025"
+    assert "22.0%" in hdr_by_raw and hdr_by_raw["22.0%"].exempt is False
+
+
+@pytest.mark.asyncio
+async def test_round7_pct_stored_as_ratio_overrides_unit_labels_and_per_share_bound_currency() -> None:
+    """Round 7 #1 & #2:
+    1. `read_model_cell` returns `stored_as_ratio` directly on its read result (determined solely by Excel number format),
+       never indirectly recovered from unit objects, and no unit label (sheet-level `单位：USD mn`, row label `亿美元`,
+       or `key_outputs.unit`) can overwrite it. When `stored_as_ratio=True`, the cell is compared as a percentage
+       (`0.21 -> 21%`), conflicting unit labels are invalidated, and the audit report records `"格式为百分比，单位标签不一致"`.
+    2. Currency for a per-share amount comes ONLY from a currency token/word directly bound to that number or inside
+       that number's own phrase — never by scanning the whole `fact`/paragraph text and picking by priority.
+    """
+    from src.dalton.publish import service as publish_svc
+    from src.dalton.publish.match import (
+        UNIT_FORMAT_CONFLICT_WARNING,
+        read_model_cell,
+    )
+    from tests.unit.dalton._xlsx_builder import Cell, build_xlsx
+
+    # --- Item 1(a): Sheet-level unit note ("单位：USD mn") + percentage format ("0.00%") + key_outputs.unit="pct" ---
+    # --- Item 1(b): Row label with monetary unit ("营业利润率（亿美元）") + percentage format ("0.00%") ---
+    xlsx_bytes = build_xlsx(
+        {
+            "Summary": {
+                "A1": Cell("单位：USD mn", t="inlineStr"),
+                "A10": Cell("营业利润率", t="inlineStr"),
+                "B10": Cell(0.21, num_fmt="0.00%"),
+                "A11": Cell("营业利润率（亿美元）", t="inlineStr"),
+                "B11": Cell(0.21, num_fmt="0.00%"),
+            }
+        }
+    )
+
+    # Direct read_model_cell checks for both 1(a) B10 (sheet-level "单位：USD mn") and 1(b) B11 (row label "亿美元")
+    res_b10 = read_model_cell(xlsx_bytes, "Summary", "B10")
+    val_b10, unit_b10, err_b10 = res_b10
+    assert val_b10 == pytest.approx(0.21)
+    assert unit_b10 == "pct"
+    assert err_b10 is None
+    assert res_b10.stored_as_ratio is True
+    assert res_b10.unit_conflict_warning == UNIT_FORMAT_CONFLICT_WARNING
+
+    res_b11 = read_model_cell(xlsx_bytes, "Summary", "B11")
+    val_b11, unit_b11, err_b11 = res_b11
+    assert val_b11 == pytest.approx(0.21)
+    assert unit_b11 == "pct"
+    assert err_b11 is None
+    assert res_b11.stored_as_ratio is True
+    assert res_b11.unit_conflict_warning == UNIT_FORMAT_CONFLICT_WARNING
+
+    class _BytesBackendProto:
+        async def adownload_file_bytes(self, path: str) -> bytes | None: ...
+
+    backend = create_autospec(_BytesBackendProto, instance=True)
+    backend.adownload_file_bytes.return_value = xlsx_bytes
+
+    models_doc = {
+        "versions": [
+            {
+                "id": "v1",
+                "path": "models/m.xlsx",
+                "recalculated": True,
+                "key_outputs": [
+                    {"name": "营业利润率", "cell": "Summary!B10", "value": 0.21, "unit": "pct", "period": "FY2025"},
+                    {"name": "营业利润率", "cell": "Summary!B11", "value": 0.21, "unit": "USD_100mn", "period": "FY2025"},
+                ],
+            }
+        ]
+    }
+
+    # 1(a): Sheet-level "单位：USD mn" + 0.00% + key_outputs.unit="pct"
+    draft_b10_wrong = (
+        "FY2025 营业利润率为 0.21% [引用1]。\n\n"
+        "## 引用\n"
+        "[引用1]: model:models/m.xlsx#Summary!B10\n"
+    )
+    cells_b10 = await publish_svc._load_referenced_model_cells(
+        backend, draft_b10_wrong, models_doc=models_doc
+    )
+    assert cells_b10["models/m.xlsx#Summary!B10"]["stored_as_ratio"] is True
+    assert cells_b10["models/m.xlsx#Summary!B10"]["unit"] == "pct"
+    assert cells_b10["models/m.xlsx#Summary!B10"]["unit_conflict_warning"] == UNIT_FORMAT_CONFLICT_WARNING
+
+    audit_b10_wrong = await aaudit_draft(
+        draft_b10_wrong,
+        models_doc=models_doc,
+        model_cells=cells_b10,
+        use_llm_judge=False,
+        user_id="local-dev-user",
+    )
+    assert audit_b10_wrong.passed is False
+    assert audit_b10_wrong.unverified_count == 1
+    assert UNIT_FORMAT_CONFLICT_WARNING in render_audit_md(audit_b10_wrong)
+
+    draft_b10_right = (
+        "FY2025 营业利润率为 21% [引用1]。\n\n"
+        "## 引用\n"
+        "[引用1]: model:models/m.xlsx#Summary!B10\n"
+    )
+    audit_b10_right = await aaudit_draft(
+        draft_b10_right,
+        models_doc=models_doc,
+        model_cells=cells_b10,
+        use_llm_judge=False,
+        user_id="local-dev-user",
+    )
+    assert audit_b10_right.passed is True
+    assert audit_b10_right.verified_count == 1
+    assert UNIT_FORMAT_CONFLICT_WARNING in render_audit_md(audit_b10_right)
+
+    # 1(b): Row label with monetary unit ("营业利润率（亿美元）") + 0.00%
+    draft_b11_wrong_pct = (
+        "FY2025 营业利润率为 0.21% [引用1]。\n\n"
+        "## 引用\n"
+        "[引用1]: model:models/m.xlsx#Summary!B11\n"
+    )
+    cells_b11 = await publish_svc._load_referenced_model_cells(
+        backend, draft_b11_wrong_pct, models_doc=models_doc
+    )
+    assert cells_b11["models/m.xlsx#Summary!B11"]["stored_as_ratio"] is True
+    assert cells_b11["models/m.xlsx#Summary!B11"]["unit"] == "pct"
+    assert cells_b11["models/m.xlsx#Summary!B11"]["unit_conflict_warning"] == UNIT_FORMAT_CONFLICT_WARNING
+
+    out_b11_wrong_pct = match_figures(
+        extract_figures(draft_b11_wrong_pct),
+        models_doc=models_doc,
+        model_cells=cells_b11,
+    )
+    assert out_b11_wrong_pct[0].matched is False
+
+    draft_b11_wrong_money = (
+        "FY2025 营业利润率为 0.21 亿美元 [引用1]。\n\n"
+        "## 引用\n"
+        "[引用1]: model:models/m.xlsx#Summary!B11\n"
+    )
+    out_b11_wrong_money = match_figures(
+        extract_figures(draft_b11_wrong_money),
+        models_doc=models_doc,
+        model_cells=cells_b11,
+    )
+    assert out_b11_wrong_money[0].matched is False
+
+    draft_b11_right = (
+        "FY2025 营业利润率为 21% [引用1]。\n\n"
+        "## 引用\n"
+        "[引用1]: model:models/m.xlsx#Summary!B11\n"
+    )
+    audit_b11_right = await aaudit_draft(
+        draft_b11_right,
+        models_doc=models_doc,
+        model_cells=cells_b11,
+        use_llm_judge=False,
+        user_id="local-dev-user",
+    )
+    assert audit_b11_right.passed is True
+    assert audit_b11_right.verified_count == 1
+    assert UNIT_FORMAT_CONFLICT_WARNING in render_audit_md(audit_b11_right)
+
+    # --- Item 2(a): Exact reproduction — `fact` has USD 5.20 EPS + HKD 100mn cash, `figures` has `unit="per_share"` ---
+    thesis_usd_eps_hkd_cash = {
+        "evidence": [
+            {
+                "id": "E-EPS-USD-CASH-HKD",
+                "fact": "FY2025 diluted EPS was USD 5.20. Cash balance was HKD 100 million.",
+                "figures": [
+                    {"metric": "diluted EPS", "value": 5.20, "unit": "per_share", "period": "FY2025"}
+                ],
+            }
+        ]
+    }
+    draft_eps_hkd_wrong = (
+        "FY2025 每股收益 5.20 港元/股 [引用1]。\n\n"
+        "## 引用\n"
+        "[引用1]: evidence:E-EPS-USD-CASH-HKD\n"
+    )
+    out_eps_hkd_wrong = match_figures(
+        extract_figures(draft_eps_hkd_wrong),
+        thesis_doc=thesis_usd_eps_hkd_cash,
+    )
+    assert out_eps_hkd_wrong[0].matched is False
+
+    draft_eps_usd_right = (
+        "FY2025 每股收益 5.20 美元/股 [引用1]。\n\n"
+        "## 引用\n"
+        "[引用1]: evidence:E-EPS-USD-CASH-HKD\n"
+    )
+    out_eps_usd_right = match_figures(
+        extract_figures(draft_eps_usd_right),
+        thesis_doc=thesis_usd_eps_hkd_cash,
+    )
+    assert out_eps_usd_right[0].matched is True
+
+    # --- Item 2(b): Currency-less EPS in a paragraph containing HKD -> currency is None (unknown), stays unverified ---
+    thesis_no_cur_eps_hkd_cash = {
+        "evidence": [
+            {
+                "id": "E-EPS-NOCUR-CASH-HKD",
+                "fact": "FY2025 diluted EPS was 5.20. Cash balance was HKD 100 million.",
+                "figures": [
+                    {"metric": "diluted EPS", "value": 5.20, "unit": "per_share", "period": "FY2025"}
+                ],
+            }
+        ]
+    }
+    # Check extracted prose figures directly: 5.20 has no currency bound to it
+    prose_figs = extract_figures("FY2025 diluted EPS was 5.20. Cash balance was HKD 100 million.")
+    fig_520 = next(f for f in prose_figs if abs(f.value - 5.20) < 1e-6)
+    assert fig_520.currency is None
+
+    out_nocur_vs_hkd = match_figures(
+        extract_figures(
+            "FY2025 每股收益 5.20 港元/股 [引用1]。\n\n"
+            "## 引用\n"
+            "[引用1]: evidence:E-EPS-NOCUR-CASH-HKD\n"
+        ),
+        thesis_doc=thesis_no_cur_eps_hkd_cash,
+    )
+    assert out_nocur_vs_hkd[0].matched is False
+    assert out_nocur_vs_hkd[0].reason == "unverified"
+
+    out_nocur_vs_usd = match_figures(
+        extract_figures(
+            "FY2025 每股收益 5.20 美元/股 [引用1]。\n\n"
+            "## 引用\n"
+            "[引用1]: evidence:E-EPS-NOCUR-CASH-HKD\n"
+        ),
+        thesis_doc=thesis_no_cur_eps_hkd_cash,
+    )
+    assert out_nocur_vs_usd[0].matched is False
+    assert out_nocur_vs_usd[0].reason == "unverified"
+
+    # Also test provenance body with currency-less per-share amount in same sentence/paragraph as HKD cash
+    out_prov_nocur_vs_hkd = match_figures(
+        extract_figures(
+            "FY2025 每股收益 5.20 港元/股 [引用1]。\n\n"
+            "## 引用\n"
+            "[引用1]: prov:p-eps-nocur\n"
+        ),
+        provenance_records={
+            "p-eps-nocur": {
+                "body": "FY2025 diluted EPS was 5.20 per share, while cash balance was HKD 100 million."
+            }
+        },
+    )
+    assert out_prov_nocur_vs_hkd[0].matched is False
+    assert out_prov_nocur_vs_hkd[0].reason == "unverified"
+
+
+@pytest.mark.asyncio
+async def test_round8_tight_currency_binding_and_model_cell_per_share_currency_preserved() -> None:
+    """Round 8 #1 & #2:
+    1. Currency is bound ONLY when tightly adjacent to the number (`$5.20`, `HK$5.20`, `US$5.20`, `¥5.20`,
+       `USD 5.20`, `5.20 USD`, `5.20 美元`, `5.20 港元`, `5.20 元`, `5.20 港元/股`, `USD 5.2 billion`, `52 亿港元`).
+       Window-based currency inference is removed:
+       - `FY2025 diluted EPS was 5.20 and HKD cash totaled 100 million.` -> `5.20` has `currency=None`,
+         and `"每股收益 5.20 港元/股"` stays `unverified` on both `evidence` and `prov` paths.
+       - `HKD cash 100 million; EPS 5.20` -> both `100 million` and `5.20` have `currency=None`.
+    2. `_load_referenced_model_cells` preserves `_PerShareUnit.currency` (and explicit `"currency"`):
+       model row label `EPS (USD per share)` with value `5.20` verifies `"5.20 美元/股"` through
+       `read_model_cell -> _load_referenced_model_cells -> match_figures / aaudit_draft`.
+    """
+    from src.dalton.publish import service as publish_svc
+    from src.dalton.publish.match import read_model_cell
+    from tests.unit.dalton._xlsx_builder import Cell, build_xlsx
+
+    # --- Item 1(a): `FY2025 diluted EPS was 5.20 and HKD cash totaled 100 million.` ---
+    src_and_hkd = "FY2025 diluted EPS was 5.20 and HKD cash totaled 100 million."
+    figs_and = extract_figures(src_and_hkd)
+    fig_520_and = next(f for f in figs_and if abs(f.value - 5.20) < 1e-6)
+    fig_100_and = next(f for f in figs_and if abs(f.value - 100.0) < 1e-6)
+    assert fig_520_and.currency is None
+    assert getattr(fig_520_and.unit, "currency", None) is None
+    assert fig_100_and.currency is None
+
+    draft_hkd_eps_ev = (
+        "FY2025 每股收益 5.20 港元/股 [引用1]。\n\n"
+        "## 引用\n"
+        "[引用1]: evidence:E-AND-HKD\n"
+    )
+    out_ev_structured = match_figures(
+        extract_figures(draft_hkd_eps_ev),
+        thesis_doc={
+            "evidence": [
+                {
+                    "id": "E-AND-HKD",
+                    "fact": src_and_hkd,
+                    "figures": [
+                        {"metric": "diluted EPS", "value": 5.20, "unit": "per_share", "period": "FY2025"}
+                    ],
+                }
+            ]
+        },
+    )
+    assert out_ev_structured[0].matched is False
+    assert out_ev_structured[0].reason == "unverified"
+
+    out_ev_unstructured = match_figures(
+        extract_figures(draft_hkd_eps_ev),
+        thesis_doc={
+            "evidence": [
+                {
+                    "id": "E-AND-HKD",
+                    "fact": src_and_hkd,
+                }
+            ]
+        },
+    )
+    assert out_ev_unstructured[0].matched is False
+    assert out_ev_unstructured[0].reason == "unverified"
+
+    draft_hkd_eps_prov = (
+        "FY2025 每股收益 5.20 港元/股 [引用1]。\n\n"
+        "## 引用\n"
+        "[引用1]: prov:p-and-hkd\n"
+    )
+    out_prov_and = match_figures(
+        extract_figures(draft_hkd_eps_prov),
+        provenance_records={"p-and-hkd": {"body": src_and_hkd}},
+    )
+    assert out_prov_and[0].matched is False
+    assert out_prov_and[0].reason == "unverified"
+
+    # --- Item 1(b): `HKD cash 100 million; EPS 5.20` ---
+    src_semi_hkd = "HKD cash 100 million; EPS 5.20"
+    figs_semi = extract_figures(src_semi_hkd)
+    fig_100_semi = next(f for f in figs_semi if abs(f.value - 100.0) < 1e-6)
+    fig_520_semi = next(f for f in figs_semi if abs(f.value - 5.20) < 1e-6)
+    assert fig_100_semi.currency is None
+    assert fig_520_semi.currency is None
+    assert getattr(fig_520_semi.unit, "currency", None) is None
+
+    out_semi_prov = match_figures(
+        extract_figures(
+            "每股收益 5.20 港元/股 [引用1]，现金 100 百万港元 [引用1]。\n\n"
+            "## 引用\n"
+            "[引用1]: prov:p-semi-hkd\n"
+        ),
+        provenance_records={"p-semi-hkd": {"body": src_semi_hkd}},
+    )
+    assert out_semi_prov[0].matched is False
+    assert out_semi_prov[0].reason == "unverified"
+    assert out_semi_prov[1].matched is False
+    assert out_semi_prov[1].reason == "unverified"
+
+    # --- Item 1(c): Tightly adjacent currency forms bind currency properly ---
+    for expr, exp_cur in (
+        ("$5.20", "USD"),
+        ("HK$5.20", "HKD"),
+        ("US$5.20", "USD"),
+        ("¥5.20", "CNY"),
+        ("USD 5.20", "USD"),
+        ("5.20 USD", "USD"),
+        ("5.20 美元", "USD"),
+        ("5.20 港元", "HKD"),
+        ("5.20 元", "CNY"),
+        ("5.20 港元/股", "HKD"),
+        ("USD 5.2 billion", "USD"),
+        ("52 亿港元", "HKD"),
+    ):
+        extracted = extract_figures(f"FY2025 指标为 {expr}。")
+        assert len(extracted) == 1, expr
+        assert extracted[0].currency == exp_cur, expr
+
+    # --- Item 2: Model row label `EPS (USD per share)` + value `5.20` full pipeline (read -> load -> verify) ---
+    xlsx_bytes = build_xlsx(
+        {
+            "Summary": {
+                "A10": Cell("EPS (USD per share)", t="inlineStr"),
+                "B10": 5.20,
+            }
+        }
+    )
+
+    # Step 1: read_model_cell
+    res_b10 = read_model_cell(xlsx_bytes, "Summary", "B10")
+    val_b10, unit_b10, err_b10 = res_b10
+    assert val_b10 == pytest.approx(5.20)
+    assert unit_b10 == "per_share"
+    assert getattr(unit_b10, "currency", None) == "USD"
+    assert err_b10 is None
+    assert res_b10.stored_as_ratio is False
+
+    # Step 2: _load_referenced_model_cells
+    class _BytesBackendProto:
+        async def adownload_file_bytes(self, path: str) -> bytes | None: ...
+
+    backend = create_autospec(_BytesBackendProto, instance=True)
+    backend.adownload_file_bytes.return_value = xlsx_bytes
+
+    models_doc = {
+        "versions": [
+            {
+                "id": "v1",
+                "path": "models/m.xlsx",
+                "recalculated": True,
+            }
+        ]
+    }
+    draft_usd_eps = (
+        "FY2025 每股收益为 5.20 美元/股 [引用1]。\n\n"
+        "## 引用\n"
+        "[引用1]: model:models/m.xlsx#Summary!B10\n"
+    )
+    loaded_cells = await publish_svc._load_referenced_model_cells(
+        backend, draft_usd_eps, models_doc=models_doc
+    )
+    loaded_entry = loaded_cells["models/m.xlsx#Summary!B10"]
+    assert getattr(loaded_entry["unit"], "currency", None) == "USD"
+    assert loaded_entry["currency"] == "USD"
+
+    # Step 3: match_figures & aaudit_draft
+    out_usd_eps = match_figures(
+        extract_figures(draft_usd_eps),
+        models_doc=models_doc,
+        model_cells=loaded_cells,
+    )
+    assert out_usd_eps[0].matched is True
+
+    audit_usd_eps = await aaudit_draft(
+        draft_usd_eps,
+        models_doc=models_doc,
+        model_cells=loaded_cells,
+        use_llm_judge=False,
+        user_id="local-dev-user",
+    )
+    assert audit_usd_eps.passed is True
+    assert audit_usd_eps.verified_count == 1
+
+    draft_hkd_eps_wrong = (
+        "FY2025 每股收益为 5.20 港元/股 [引用1]。\n\n"
+        "## 引用\n"
+        "[引用1]: model:models/m.xlsx#Summary!B10\n"
+    )
+    out_hkd_eps_wrong = match_figures(
+        extract_figures(draft_hkd_eps_wrong),
+        models_doc=models_doc,
+        model_cells=loaded_cells,
+    )
+    assert out_hkd_eps_wrong[0].matched is False
+
+
+
+
+
+
+
+

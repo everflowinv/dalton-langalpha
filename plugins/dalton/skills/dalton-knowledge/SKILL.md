@@ -39,7 +39,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 
 ## 4. `knowledge_update` 操作语言（Ops）示例
 
-调用前先读 `data/<doc>.json`（或查看 `agent.md` / 历史版本）获取当前版本号 `base_version`（首次创建传 `null`）。所有列表元素按 `id` 寻址；新增元素省略 `id` 时由服务端自动分配（如 `P1`、`E-20261018-01`、`D1`、`K1`、`G-001`、`L-001`、`Q-001`、`V-001`）。
+调用前先读 `data/<doc>.json`（或查看 `agent.md` / 历史版本）获取当前版本号 `base_version`（首次创建传 `null`）。对于批量更新或知识层草案（如初次覆盖/深度覆盖的 `knowledge-proposal.json`），**先传 `dry_run=True` 做校验与 diff 预览**（不写版本、不渲染文件，返回会写成什么、哪些地方不通过及期望结构），确认无误后再以 `dry_run=False` 正式提交。所有列表元素按 `id` 寻址；新增元素省略 `id` 时由服务端自动分配（如 `P1`、`E-20261018-01`、`D1`、`K1`、`G-001`、`L-001`、`Q-001`、`V-001`）。
 
 ```json
 [

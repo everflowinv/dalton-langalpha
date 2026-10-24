@@ -6,6 +6,7 @@ import asyncio
 import copy
 import hashlib
 import logging
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -33,11 +34,37 @@ from src.dalton.publish.files import (
     prepend_publication_banner,
     write_published_bundle,
 )
+from src.dalton.publish.match import (
+    SourceParseCache,
+    _extract_evidence_ref_path,
+    _extract_segment_qualifier,
+    _is_draft_provenance_record,
+    _is_draft_self_ref,
+    _is_legacy_thesis_evidence,
+    _normalize_cell_coord,
+    _normalize_model_spec,
+    count_unrecalculated_formulas,
+    metrics_match,
+    read_model_cell,
+    values_within_tolerance,
+)
+from src.dalton.publish.numbers import (
+    extract_figures,
+    normalize_period,
+    parse_facts_ledger,
+    parse_footnotes,
+)
 from src.dalton.publish.review import ReviewBundle, run_review
 from src.dalton.settings import get_dalton_config
 from src.server.database.pool import get_db_connection
 
 logger = logging.getLogger(__name__)
+
+_PROV_REF_RE = re.compile(r"\bprov:([0-9a-fA-F-]+)\b")
+_MODEL_REF_RE = re.compile(
+    r"\bmodel:([^\s,;)}\]>#!]+\.xlsx[#!]![^\s,;)}\]>]+|[^\s,;)}\]>#!]+\.xlsx[#!][^\s,;)}\]>]+!\$?[A-Za-z]{1,3}\$?\d+)\b",
+    re.IGNORECASE,
+)
 
 
 def _derive_sidecar_paths(draft_path: str) -> tuple[str, str]:
@@ -50,61 +77,557 @@ def _derive_sidecar_paths(draft_path: str) -> tuple[str, str]:
 async def _read_optional_text(backend: Any, path: str) -> str | None:
     if hasattr(backend, "aread_text"):
         try:
-            return await backend.aread_text(path)
+            val = await backend.aread_text(path)
+            return val if isinstance(val, str) else None
         except Exception:
             return None
     if hasattr(backend, "adownload_file_bytes"):
         try:
             raw = await backend.adownload_file_bytes(path)
-            return raw.decode("utf-8") if raw is not None else None
+            return raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else None
         except Exception:
             return None
     return None
 
 
+async def _read_optional_bytes(backend: Any, path: str) -> bytes | None:
+    if hasattr(backend, "adownload_file_bytes"):
+        try:
+            raw = await backend.adownload_file_bytes(path)
+            if isinstance(raw, (bytes, bytearray)):
+                return bytes(raw)
+        except Exception:
+            pass
+    if hasattr(backend, "aread_bytes"):
+        try:
+            raw = await backend.aread_bytes(path)
+            if isinstance(raw, (bytes, bytearray)):
+                return bytes(raw)
+        except Exception:
+            pass
+    return None
+
+
+def _extract_referenced_prov_ids(
+    draft_text: str, facts_text: str | None = None
+) -> set[str]:
+    refs: set[str] = set()
+    for text in (draft_text, facts_text or ""):
+        if not text:
+            continue
+        for m in _PROV_REF_RE.finditer(text):
+            pid = m.group(1).strip()
+            if pid:
+                refs.add(pid)
+    return refs
+
+
+def _extract_referenced_model_specs(
+    draft_text: str, facts_text: str | None = None
+) -> list[str]:
+    specs: list[str] = []
+    seen: set[str] = set()
+
+    def _add_spec(raw_target: str) -> None:
+        t = raw_target.strip()
+        if not t.startswith("model:"):
+            return
+        m_spec = t.split(":", 1)[1].strip()
+        if m_spec and m_spec not in seen:
+            seen.add(m_spec)
+            specs.append(m_spec)
+
+    if draft_text:
+        for raw_bundle in parse_footnotes(draft_text).values():
+            for t in raw_bundle.split(";"):
+                _add_spec(t)
+        for m in _MODEL_REF_RE.finditer(draft_text):
+            _add_spec(f"model:{m.group(1)}")
+
+    if facts_text:
+        for row in parse_facts_ledger(facts_text).values():
+            for t in str(row.get("ref") or "").split(";"):
+                _add_spec(t)
+        for m in _MODEL_REF_RE.finditer(facts_text):
+            _add_spec(f"model:{m.group(1)}")
+
+    return specs
+
+
+async def _load_referenced_model_cells(
+    backend: Any,
+    draft_text: str,
+    facts_text: str | None = None,
+    models_doc: dict[str, Any] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Read `.xlsx` cells explicitly referenced by `model:<path>#<Sheet>!<Cell>` in the draft or facts ledger."""
+    specs = _extract_referenced_model_specs(draft_text, facts_text)
+    if not specs or backend is None:
+        return {}
+
+    version_meta: dict[str, tuple[bool, str]] = {}
+    for ver in (models_doc or {}).get("versions") or []:
+        if isinstance(ver, dict) and ver.get("path"):
+            vpath = str(ver["path"]).strip()
+            version_meta[vpath] = (
+                bool(ver.get("recalculated", True)),
+                str(ver.get("sha256") or ""),
+            )
+
+    xlsx_cache: dict[str, bytes | None] = {}
+    cells_out: dict[str, dict[str, Any]] = {}
+
+    for m_spec in specs:
+        if "#" in m_spec:
+            xlsx_path, sheet_cell = m_spec.split("#", 1)
+        elif "!" in m_spec:
+            xlsx_path, sheet_cell = m_spec.split("!", 1)
+        else:
+            continue
+        xlsx_path = xlsx_path.strip()
+        sheet_cell = sheet_cell.strip()
+        if not xlsx_path or not sheet_cell:
+            continue
+        if "!" in sheet_cell:
+            sheet_name, cell_coord = sheet_cell.split("!", 1)
+        else:
+            sheet_name, cell_coord = "", sheet_cell
+        norm_coord = _normalize_cell_coord(cell_coord)
+        norm_sheet_cell = (
+            f"{sheet_name.strip()}!{norm_coord}" if sheet_name.strip() else norm_coord
+        )
+        if xlsx_path not in xlsx_cache:
+            xlsx_cache[xlsx_path] = await _read_optional_bytes(backend, xlsx_path)
+        xlsx_bytes = xlsx_cache[xlsx_path]
+        recalc, _sha256_meta = version_meta.get(xlsx_path, (True, ""))
+        if not xlsx_bytes:
+            dl_err: dict[str, Any] = {
+                "value": None,
+                "unit": "",
+                "period": "",
+                "metric": "",
+                "recalculated": recalc,
+                "sha256": "",
+                "file_sha256": "",
+                "from_xlsx": True,
+                "error": f"模型文件 {xlsx_path} 读取失败或内容为空",
+            }
+            cells_out[f"{xlsx_path}#{sheet_cell}"] = dl_err
+            cells_out[f"{xlsx_path}#{norm_sheet_cell}"] = dl_err
+            cells_out[m_spec] = dl_err
+            cells_out[_normalize_model_spec(m_spec)] = dl_err
+            cells_out[xlsx_path] = dl_err
+            continue
+        cell_read = await asyncio.to_thread(
+            read_model_cell, xlsx_bytes, sheet_name, cell_coord
+        )
+        val, unit_hint, err = cell_read
+        file_sha = hashlib.sha256(xlsx_bytes).hexdigest()
+        if (
+            err is not None
+            or val is None
+            or isinstance(val, bool)
+            or not isinstance(val, (int, float))
+        ):
+            if err is not None:
+                err_msg = err
+            elif val is None:
+                err_msg = f"模型单元格 {m_spec} 读取失败"
+            else:
+                err_msg = f"模型单元格 {norm_sheet_cell} 非数值 ({val!r})"
+            err_entry: dict[str, Any] = {
+                "value": None,
+                "unit": "",
+                "period": "",
+                "metric": "",
+                "recalculated": recalc,
+                "sha256": file_sha,
+                "file_sha256": file_sha,
+                "from_xlsx": True,
+                "error": err_msg,
+            }
+            cells_out[f"{xlsx_path}#{sheet_cell}"] = err_entry
+            cells_out[f"{xlsx_path}#{norm_sheet_cell}"] = err_entry
+            cells_out[m_spec] = err_entry
+            cells_out[_normalize_model_spec(m_spec)] = err_entry
+            if "读取失败" in err_msg or "没有可用工作表" in err_msg or "模型文件为空" in err_msg:
+                cells_out[xlsx_path] = err_entry
+            continue
+        stored_as_ratio = bool(
+            getattr(cell_read, "stored_as_ratio", False)
+            or getattr(unit_hint, "stored_as_ratio", False)
+            or getattr(unit_hint, "is_pct_number_format", False)
+        )
+        unit_conflict_warning = getattr(cell_read, "unit_conflict_warning", None)
+        eff_unit = "pct" if stored_as_ratio else (unit_hint if unit_hint else "")
+        cell_currency = None if stored_as_ratio else getattr(unit_hint, "currency", None)
+        entry = {
+            "value": float(val),
+            "unit": eff_unit,
+            "currency": cell_currency,
+            "stored_as_ratio": stored_as_ratio,
+            "pct_from_number_format": stored_as_ratio,
+            "unit_conflict_warning": unit_conflict_warning,
+            "period": "",
+            "metric": "",
+            "recalculated": recalc,
+            "sha256": file_sha,
+            "file_sha256": file_sha,
+            "from_xlsx": True,
+        }
+        cells_out[f"{xlsx_path}#{sheet_cell}"] = entry
+        cells_out[f"{xlsx_path}#{norm_sheet_cell}"] = entry
+        cells_out[m_spec] = entry
+        cells_out[_normalize_model_spec(m_spec)] = entry
+
+    return cells_out
+
+
+def _collect_referenced_xlsx_paths(
+    draft_text: str,
+    facts_text: str | None = None,
+    attachments: list[dict[str, Any]] | None = None,
+    *,
+    include_attachments: bool = True,
+) -> list[str]:
+    xlsx_paths: list[str] = []
+    seen_paths: set[str] = set()
+
+    def _add_path(raw_path: str) -> None:
+        p = raw_path.strip()
+        if p and p.lower().endswith(".xlsx") and p not in seen_paths:
+            seen_paths.add(p)
+            xlsx_paths.append(p)
+
+    for m_spec in _extract_referenced_model_specs(draft_text, facts_text):
+        if "#" in m_spec:
+            _add_path(m_spec.split("#", 1)[0])
+        elif "!" in m_spec:
+            _add_path(m_spec.split("!", 1)[0])
+        else:
+            _add_path(m_spec)
+
+    if include_attachments:
+        for att in attachments or []:
+            if isinstance(att, dict) and str(att.get("role") or "") == "model":
+                _add_path(str(att.get("path") or ""))
+    return xlsx_paths
+
+
+async def _check_unrecalculated_models(
+    backend: Any,
+    draft_text: str,
+    facts_text: str | None = None,
+    attachments: list[dict[str, Any]] | None = None,
+    att_blobs: list[tuple[str, str, bytes]] | None = None,
+) -> list[str]:
+    """Check referenced ``model:`` ``.xlsx`` files and ``role="model"`` ``.xlsx`` attachments for unrecalculated formulas or parse errors."""
+    if backend is None:
+        return []
+    xlsx_paths = _collect_referenced_xlsx_paths(
+        draft_text, facts_text, attachments, include_attachments=True
+    )
+
+    blob_map: dict[str, bytes] = {
+        apath: raw for _arole, apath, raw in (att_blobs or []) if apath and raw
+    }
+    warnings_out: list[str] = []
+    for xp in xlsx_paths:
+        raw_bytes = blob_map.get(xp)
+        if raw_bytes is None:
+            raw_bytes = await _read_optional_bytes(backend, xp)
+        if not raw_bytes:
+            warnings_out.append(
+                f"模型文件无法读取或为空：{xp}，请检查模型文件并运行 `python .agents/skills/xlsx/scripts/recalc.py {xp}` 后再发布"
+            )
+            continue
+        try:
+            missing_cnt = await asyncio.to_thread(
+                count_unrecalculated_formulas, raw_bytes
+            )
+        except Exception as e:
+            warnings_out.append(
+                f"模型文件损坏或解析失败（{xp}：{e}），请修复并运行 `python .agents/skills/xlsx/scripts/recalc.py {xp}` 后再发布"
+            )
+            continue
+        if missing_cnt > 0:
+            warnings_out.append(
+                f"模型未重算：{missing_cnt} 个公式没有缓存值，请运行 `python .agents/skills/xlsx/scripts/recalc.py {xp}` 后再发布"
+            )
+    return warnings_out
+
+
+async def _verify_referenced_model_sha256s(
+    backend: Any,
+    draft_text: str,
+    facts_text: str | None,
+    audit_dict: dict[str, Any] | None,
+) -> str | None:
+    """Verify that every ``model:`` ``.xlsx`` file referenced in the draft/facts still matches its audit-time ``sha256``."""
+    if backend is None:
+        return None
+    ref_paths = _collect_referenced_xlsx_paths(
+        draft_text, facts_text, attachments=None, include_attachments=False
+    )
+    audit_info = audit_dict if isinstance(audit_dict, dict) else {}
+    recorded_map: dict[str, str] = {}
+    for k, v in (audit_info.get("model_file_sha256s") or {}).items():
+        if k and v:
+            recorded_map[str(k).strip().lstrip("./")] = str(v).strip()
+    for m in audit_info.get("matches") or []:
+        if not isinstance(m, dict) or m.get("kind") != "model":
+            continue
+        m_sha = str(m.get("source_sha256") or "").strip()
+        m_ref = str(m.get("ref") or "").strip()
+        if m_sha and m_ref:
+            base_p = (
+                m_ref.split("#", 1)[0]
+                if "#" in m_ref
+                else (m_ref.split("!", 1)[0] if "!" in m_ref else m_ref)
+            ).strip().lstrip("./")
+            if base_p and base_p.lower().endswith(".xlsx"):
+                recorded_map.setdefault(base_p, m_sha)
+                if base_p not in ref_paths:
+                    ref_paths.append(base_p)
+
+    for xp in ref_paths:
+        norm_xp = xp.strip().lstrip("./")
+        expected_sha = recorded_map.get(norm_xp) or recorded_map.get(xp)
+        raw_bytes = await _read_optional_bytes(backend, xp)
+        if not raw_bytes:
+            return f"引用的模型文件 {xp} 无法读取或已被删除，请重新运行数字核验后再发布。"
+        curr_sha = hashlib.sha256(raw_bytes).hexdigest()
+        if not expected_sha or curr_sha != expected_sha:
+            return f"引用的模型文件 {xp} 在核验后已被修改（sha256 不一致），请重新核验后再发布。"
+    return None
+
+
+async def _load_evidence_ref_bodies(
+    backend: Any,
+    thesis_doc: dict[str, Any] | None,
+    draft_path: str = "",
+) -> dict[str, str]:
+    """Load workspace file bodies referenced by `thesis.json` `evidence[].source.ref`, excluding the draft itself."""
+    if backend is None or not isinstance(thesis_doc, dict):
+        return {}
+    out: dict[str, str] = {}
+    for ev in thesis_doc.get("evidence") or []:
+        if not isinstance(ev, dict) or _is_legacy_thesis_evidence(ev):
+            continue
+        ref_path = _extract_evidence_ref_path(ev)
+        if not ref_path or _is_draft_self_ref(ref_path, draft_path):
+            continue
+        if ref_path in out:
+            continue
+        text = await _read_optional_text(backend, ref_path)
+        if isinstance(text, str) and text.strip():
+            out[ref_path] = text
+    return out
+
+
+def _prov_hits_all_key_figures(
+    draft_text: str,
+    prov_map: dict[str, dict[str, Any]],
+    *,
+    draft_path: str = "",
+) -> bool:
+    """Return True if every non-exempt figure in ``draft_text`` (not already pointing to ``evidence:``/``model:``) hits in ``prov_map`` with matching metric, period, value, and unit."""
+    if not draft_text or not draft_text.strip():
+        return True
+    figs = [
+        f
+        for f in extract_figures(draft_text)
+        if not f.exempt
+        and f.label_hint != "incidental"
+        and not (f.footnote_target or "").startswith(("evidence:", "model:"))
+    ]
+    if not figs:
+        return True
+    if not prov_map:
+        return False
+    cache = SourceParseCache()
+    for fig in figs:
+        fn_t = (fig.footnote_target or "").strip()
+        target_pid = ""
+        if fn_t.startswith("prov:"):
+            target_pid = fn_t.split(":", 1)[1].strip()
+            if target_pid not in prov_map and not any(
+                k.startswith(target_pid) for k in prov_map
+            ):
+                return False
+        fig_p = normalize_period(fig.period)
+        hit_this_fig = False
+        for pid, prec in prov_map.items():
+            if target_pid and pid != target_pid and not pid.startswith(target_pid):
+                continue
+            if _is_draft_provenance_record(prec, draft_path):
+                continue
+            body = str(
+                prec.get("body")
+                or prec.get("body_inline")
+                or prec.get("result_snippet")
+                or ""
+            )
+            if not body:
+                continue
+            all_body_periods = cache.periods(body)
+            for sf in cache.figures(body):
+                if sf.exempt:
+                    continue
+                if fig.metric:
+                    if not sf.metric or not metrics_match(fig.metric, sf.metric):
+                        continue
+                    seg1 = _extract_segment_qualifier(fig.metric)
+                    seg2 = _extract_segment_qualifier(sf.metric)
+                    if seg1 and seg2 and seg1 != seg2:
+                        continue
+                sf_p = normalize_period(sf.period)
+                if fig_p:
+                    if sf_p and sf_p != fig_p:
+                        continue
+                    if not sf_p and (
+                        not all_body_periods or fig_p not in all_body_periods
+                    ):
+                        continue
+                ok_v, _, _ = values_within_tolerance(fig, sf.value, sf.unit, sf.scale)
+                if ok_v:
+                    hit_this_fig = True
+                    break
+            if hit_this_fig:
+                break
+        if not hit_this_fig:
+            return False
+    return True
+
+
 async def _load_workspace_provenance(
     workspace_id: str,
+    *,
+    draft_path: str = "",
+    draft_text: str = "",
+    referenced_ids: set[str] | None = None,
+    initial_limit: int = 300,
+    max_limit: int = 1500,
 ) -> dict[str, dict[str, Any]]:
-    """Load recent provenance records and inline bodies for threads in ``workspace_id``."""
+    """Load provenance records and inline bodies for threads in ``workspace_id`` using tiered + on-demand retrieval."""
     out: dict[str, dict[str, Any]] = {}
+
+    def _add_row(row: Any) -> None:
+        if len(out) >= max_limit:
+            return
+        rid = str(row[0])
+        if rid in out:
+            return
+        rec = {
+            "record_id": rid,
+            "source_type": row[1],
+            "identifier": row[2],
+            "title": row[3],
+            "detail": row[4],
+            "provider": row[5],
+            "result_sha256": row[6],
+            "result_snippet": row[7],
+            "body_inline": row[8],
+        }
+        if _is_draft_provenance_record(rec, draft_path):
+            return
+        out[rid] = rec
+
     try:
+        first_limit = max(0, min(initial_limit, max_limit))
         async with get_db_connection() as conn:
             async with conn.cursor() as cur:
-                await cur.execute(
-                    """
-                    SELECT pr.provenance_record_id::text,
-                           pr.source_type,
-                           pr.identifier,
-                           pr.title,
-                           pr.detail,
-                           pr.provider,
-                           pr.result_sha256,
-                           pr.result_snippet,
-                           pb.body_inline
-                    FROM provenance_records pr
-                    JOIN conversation_threads ct
-                      ON ct.conversation_thread_id = pr.conversation_thread_id
-                    LEFT JOIN provenance_result_bodies pb
-                      ON pb.result_sha256 = pr.result_sha256
-                    WHERE ct.workspace_id = %s
-                    ORDER BY pr.emitted_at DESC NULLS LAST
-                    LIMIT 300
-                    """,
-                    (workspace_id,),
-                )
-                for row in await cur.fetchall():
-                    rid = str(row[0])
-                    out[rid] = {
-                        "record_id": rid,
-                        "source_type": row[1],
-                        "identifier": row[2],
-                        "title": row[3],
-                        "detail": row[4],
-                        "provider": row[5],
-                        "result_sha256": row[6],
-                        "result_snippet": row[7],
-                        "body_inline": row[8],
-                    }
+                if first_limit > 0:
+                    await cur.execute(
+                        """
+                        SELECT pr.provenance_record_id::text,
+                               pr.source_type,
+                               pr.identifier,
+                               pr.title,
+                               pr.detail,
+                               pr.provider,
+                               pr.result_sha256,
+                               pr.result_snippet,
+                               pb.body_inline
+                        FROM provenance_records pr
+                        JOIN conversation_threads ct
+                          ON ct.conversation_thread_id = pr.conversation_thread_id
+                        LEFT JOIN provenance_result_bodies pb
+                          ON pb.result_sha256 = pr.result_sha256
+                        WHERE ct.workspace_id = %s
+                        ORDER BY pr.emitted_at DESC NULLS LAST
+                        LIMIT %s
+                        """,
+                        (workspace_id, first_limit),
+                    )
+                    for row in await cur.fetchall():
+                        _add_row(row)
+
+                missing_refs = [
+                    r
+                    for r in sorted(referenced_ids or set())
+                    if r not in out and not any(k.startswith(r) for k in out)
+                ]
+                remaining_for_refs = max(0, max_limit - len(out))
+                if missing_refs and remaining_for_refs > 0:
+                    await cur.execute(
+                        """
+                        SELECT pr.provenance_record_id::text,
+                               pr.source_type,
+                               pr.identifier,
+                               pr.title,
+                               pr.detail,
+                               pr.provider,
+                               pr.result_sha256,
+                               pr.result_snippet,
+                               pb.body_inline
+                        FROM provenance_records pr
+                        JOIN conversation_threads ct
+                          ON ct.conversation_thread_id = pr.conversation_thread_id
+                        LEFT JOIN provenance_result_bodies pb
+                          ON pb.result_sha256 = pr.result_sha256
+                        WHERE ct.workspace_id = %s
+                          AND pr.provenance_record_id::text = ANY(%s)
+                        LIMIT %s
+                        """,
+                        (workspace_id, missing_refs[:remaining_for_refs], remaining_for_refs),
+                    )
+                    for row in await cur.fetchall():
+                        _add_row(row)
+
+                remaining_for_expand = max(0, max_limit - len(out))
+                if (
+                    remaining_for_expand > 0
+                    and max_limit > first_limit
+                    and bool(draft_text and draft_text.strip())
+                    and not _prov_hits_all_key_figures(
+                        draft_text, out, draft_path=draft_path
+                    )
+                ):
+                    await cur.execute(
+                        """
+                        SELECT pr.provenance_record_id::text,
+                               pr.source_type,
+                               pr.identifier,
+                               pr.title,
+                               pr.detail,
+                               pr.provider,
+                               pr.result_sha256,
+                               pr.result_snippet,
+                               pb.body_inline
+                        FROM provenance_records pr
+                        JOIN conversation_threads ct
+                          ON ct.conversation_thread_id = pr.conversation_thread_id
+                        LEFT JOIN provenance_result_bodies pb
+                          ON pb.result_sha256 = pr.result_sha256
+                        WHERE ct.workspace_id = %s
+                        ORDER BY pr.emitted_at DESC NULLS LAST
+                        LIMIT %s OFFSET %s
+                        """,
+                        (workspace_id, remaining_for_expand, first_limit),
+                    )
+                    for row in await cur.fetchall():
+                        _add_row(row)
     except Exception as e:
         logger.debug("Could not load provenance records for workspace %s: %s", workspace_id, e)
     return out
@@ -118,7 +641,9 @@ async def run_check_draft(
     backend: Any,
     thesis_doc: dict[str, Any] | None = None,
     models_doc: dict[str, Any] | None = None,
+    model_cells: dict[str, dict[str, Any]] | None = None,
     provenance_records: dict[str, dict[str, Any]] | None = None,
+    evidence_ref_bodies: dict[str, str] | None = None,
     use_llm_judge: bool = True,
     user_id: str,
     thread_id: str | None = None,
@@ -149,8 +674,24 @@ async def run_check_draft(
         m_row = await db_knowledge.latest_valid_version(workspace_id, "models")
         models_doc = m_row["content"] if m_row else None
     if provenance_records is None:
-        provenance_records = await _load_workspace_provenance(workspace_id)
+        provenance_records = await _load_workspace_provenance(
+            workspace_id,
+            draft_path=draft_path,
+            draft_text=draft_text,
+            referenced_ids=_extract_referenced_prov_ids(draft_text, facts_text),
+        )
+    if model_cells is None:
+        model_cells = await _load_referenced_model_cells(
+            backend, draft_text, facts_text, models_doc
+        )
+    if evidence_ref_bodies is None:
+        evidence_ref_bodies = await _load_evidence_ref_bodies(
+            backend, thesis_doc, draft_path=draft_path
+        )
 
+    unrecalc_warnings = await _check_unrecalculated_models(
+        backend, draft_text, facts_text
+    )
     audit_path, annotated_path = _derive_sidecar_paths(draft_path)
     existing_audit_md = await _read_optional_text(backend, audit_path)
     cached_audit = try_load_reusable_audit_from_md(
@@ -158,47 +699,65 @@ async def run_check_draft(
         draft_markdown=draft_text,
         thesis_doc=thesis_doc,
         models_doc=models_doc,
+        model_cells=model_cells,
         provenance_records=provenance_records,
         facts_markdown=facts_text,
+        evidence_ref_bodies=evidence_ref_bodies,
         use_llm_judge=use_llm_judge,
         config_fingerprint=await resolve_audit_config_fingerprint(
             user_id, use_llm_judge=use_llm_judge
         ),
     )
     if cached_audit is not None:
+        cached_audit.unrecalculated_model_warnings = unrecalc_warnings
+        if unrecalc_warnings and any(
+            w not in (existing_audit_md or "") for w in unrecalc_warnings
+        ):
+            await backend.awrite_text(
+                audit_path,
+                await asyncio.to_thread(
+                    render_audit_md, cached_audit, draft_path=draft_path
+                ),
+            )
+        warn_lead = f"{'；'.join(unrecalc_warnings)}。" if unrecalc_warnings else ""
         return {
             "ok": True,
             "reused": True,
             "audit": cached_audit.to_dict(),
             "audit_path": audit_path,
             "annotated_path": annotated_path,
-            "message": cached_audit.summary_line(audit_path),
+            "message": f"{warn_lead}{cached_audit.summary_line(audit_path)}",
         }
 
     audit = await aaudit_draft(
         draft_text,
         thesis_doc=thesis_doc,
         models_doc=models_doc,
+        model_cells=model_cells,
         provenance_records=provenance_records,
         facts_markdown=facts_text,
+        evidence_ref_bodies=evidence_ref_bodies,
+        draft_path=draft_path,
         use_llm_judge=use_llm_judge,
         user_id=user_id,
         workspace_id=workspace_id,
         thread_id=thread_id,
     )
+    audit.unrecalculated_model_warnings = unrecalc_warnings
 
     audit_md = await asyncio.to_thread(render_audit_md, audit, draft_path=draft_path)
     annotated_md = await asyncio.to_thread(render_annotated_draft, draft_text, audit)
     await backend.awrite_text(audit_path, audit_md)
     await backend.awrite_text(annotated_path, annotated_md)
 
+    warn_lead = f"{'；'.join(unrecalc_warnings)}。" if unrecalc_warnings else ""
     return {
         "ok": True,
         "reused": False,
         "audit": audit.to_dict(),
         "audit_path": audit_path,
         "annotated_path": annotated_path,
-        "message": audit.summary_line(audit_path),
+        "message": f"{warn_lead}{audit.summary_line(audit_path)}",
     }
 
 
@@ -399,34 +958,59 @@ async def run_publish(
             ),
         }
 
+    unrecalc_warnings = await _check_unrecalculated_models(
+        backend,
+        draft_text,
+        facts_text,
+        attachments=attachments,
+        att_blobs=att_blobs,
+    )
     prov_records: dict[str, dict[str, Any]] | None = None
+    model_cells: dict[str, dict[str, Any]] | None = None
+    evidence_ref_bodies: dict[str, str] | None = None
     if status in ("audit_failed", "review_revise", "review_unavailable") and not created:
-        prov_records = await _load_workspace_provenance(workspace_id)
+        prov_records = await _load_workspace_provenance(
+            workspace_id,
+            draft_path=draft_path,
+            draft_text=draft_text,
+            referenced_ids=_extract_referenced_prov_ids(draft_text, facts_text),
+        )
+        model_cells = await _load_referenced_model_cells(
+            backend, draft_text, facts_text, models_doc
+        )
+        evidence_ref_bodies = await _load_evidence_ref_bodies(
+            backend, thesis_doc, draft_path=draft_path
+        )
         current_inputs_sha = await asyncio.to_thread(
             compute_audit_inputs_sha256,
             draft_markdown=draft_text,
             facts_markdown=facts_text,
             thesis_doc=thesis_doc,
             models_doc=models_doc,
+            model_cells=model_cells,
             provenance_records=prov_records,
+            evidence_ref_bodies=evidence_ref_bodies,
         )
         _, _, _, current_cfg_sha = await resolve_audit_config_fingerprint(user_id, use_llm_judge=True)
         prev_audit = row.get("audit") if isinstance(row.get("audit"), dict) else {}
         prev_inputs_sha = str(prev_audit.get("inputs_sha256") or "")
         prev_cfg_sha = str(prev_audit.get("config_sha256") or "")
+        prev_unrecalc = list(prev_audit.get("unrecalculated_model_warnings") or [])
         if (
             row.get("bundle_sha256") == bundle_sha256
             and bool(prev_inputs_sha)
             and prev_inputs_sha == current_inputs_sha
             and bool(prev_cfg_sha)
             and prev_cfg_sha == current_cfg_sha
+            and prev_unrecalc == unrecalc_warnings
         ):
             audit_path, annotated_path = _derive_sidecar_paths(draft_path)
             audit_summary = format_audit_summary_from_dict(
                 prev_audit,
                 audit_path=audit_path if status == "audit_failed" else None,
             )
-            msg_prefix = f"{audit_summary}。" if audit_summary else ""
+            unrecalc_lead = f"{'；'.join(unrecalc_warnings)}。" if unrecalc_warnings else ""
+            msg_prefix = f"{unrecalc_lead}{audit_summary}。" if audit_summary else unrecalc_lead
             return {
                 "ok": False,
                 "status": status,
@@ -452,7 +1036,20 @@ async def run_publish(
     # Step 2: Figure Audit (when status == 'auditing')
     if status == "auditing":
         if prov_records is None:
-            prov_records = await _load_workspace_provenance(workspace_id)
+            prov_records = await _load_workspace_provenance(
+                workspace_id,
+                draft_path=draft_path,
+                draft_text=draft_text,
+                referenced_ids=_extract_referenced_prov_ids(draft_text, facts_text),
+            )
+        if model_cells is None:
+            model_cells = await _load_referenced_model_cells(
+                backend, draft_text, facts_text, models_doc
+            )
+        if evidence_ref_bodies is None:
+            evidence_ref_bodies = await _load_evidence_ref_bodies(
+                backend, thesis_doc, draft_path=draft_path
+            )
         audit_path, annotated_path = _derive_sidecar_paths(draft_path)
         existing_audit_md = await _read_optional_text(backend, audit_path)
         audit = try_load_reusable_audit_from_md(
@@ -460,8 +1057,10 @@ async def run_publish(
             draft_markdown=draft_text,
             thesis_doc=thesis_doc,
             models_doc=models_doc,
+            model_cells=model_cells,
             provenance_records=prov_records,
             facts_markdown=facts_text,
+            evidence_ref_bodies=evidence_ref_bodies,
             use_llm_judge=True,
             config_fingerprint=await resolve_audit_config_fingerprint(
                 user_id, use_llm_judge=True
@@ -472,26 +1071,41 @@ async def run_publish(
                 draft_text,
                 thesis_doc=thesis_doc,
                 models_doc=models_doc,
+                model_cells=model_cells,
                 provenance_records=prov_records,
                 facts_markdown=facts_text,
+                evidence_ref_bodies=evidence_ref_bodies,
+                draft_path=draft_path,
                 use_llm_judge=True,
                 user_id=user_id,
                 workspace_id=workspace_id,
                 thread_id=thread_id,
             )
+            audit.unrecalculated_model_warnings = unrecalc_warnings
             await backend.awrite_text(
                 audit_path, await asyncio.to_thread(render_audit_md, audit, draft_path=draft_path)
             )
             await backend.awrite_text(
                 annotated_path, await asyncio.to_thread(render_annotated_draft, draft_text, audit)
             )
+        else:
+            audit.unrecalculated_model_warnings = unrecalc_warnings
+            if unrecalc_warnings and any(
+                w not in (existing_audit_md or "") for w in unrecalc_warnings
+            ):
+                await backend.awrite_text(
+                    audit_path,
+                    await asyncio.to_thread(render_audit_md, audit, draft_path=draft_path),
+                )
 
-        if not audit.passed:
+        if not audit.passed or unrecalc_warnings:
+            unrecalc_lead = f"{'；'.join(unrecalc_warnings)}。" if unrecalc_warnings else ""
             await db_publications.transition(
                 req_id,
                 ("auditing",),
                 "audit_failed",
                 audit=audit.to_dict(),
+                error="；".join(unrecalc_warnings) if unrecalc_warnings else None,
             )
             return {
                 "ok": False,
@@ -501,7 +1115,7 @@ async def run_publish(
                 "audit_path": audit_path,
                 "annotated_path": annotated_path,
                 "message": (
-                    f"{audit.summary_line(audit_path)}。"
+                    f"{unrecalc_lead}{audit.summary_line(audit_path)}。"
                     f"请根据 {audit_path} 修复冲突与未核实数字后重新调用 publish_report。"
                 ),
             }
@@ -519,6 +1133,36 @@ async def run_publish(
 
     # Step 3: Independent Cross-Family Review (when status == 'reviewing')
     if status == "reviewing":
+        if unrecalc_warnings:
+            err_msg = "；".join(unrecalc_warnings)
+            await db_publications.transition(
+                req_id,
+                ("reviewing",),
+                "audit_failed",
+                error=err_msg,
+            )
+            return {
+                "ok": False,
+                "status": "audit_failed",
+                "audit": row.get("audit"),
+                "message": _prefix_with_audit_summary(row, err_msg),
+            }
+        model_sha_err = await _verify_referenced_model_sha256s(
+            backend, draft_text, facts_text, row.get("audit")
+        )
+        if model_sha_err:
+            await db_publications.transition(
+                req_id,
+                ("reviewing",),
+                "superseded",
+                error=model_sha_err,
+            )
+            return {
+                "ok": False,
+                "status": "superseded",
+                "audit": row.get("audit"),
+                "message": _prefix_with_audit_summary(row, model_sha_err),
+            }
         thesis_md = await backend.aread_text(RENDERED["thesis"]) or ""
         debate_md = await backend.aread_text(RENDERED["debate"]) or ""
         mgmt_md = await backend.aread_text(RENDERED["management"]) or ""
@@ -612,6 +1256,36 @@ async def run_publish(
                     row,
                     "草稿在审批前已被修改（superseded），请重新调用 publish_report。",
                 ),
+            }
+        if unrecalc_warnings:
+            err_msg = "；".join(unrecalc_warnings)
+            await db_publications.transition(
+                req_id,
+                ("awaiting_pm",),
+                "audit_failed",
+                error=err_msg,
+            )
+            return {
+                "ok": False,
+                "status": "audit_failed",
+                "audit": row.get("audit"),
+                "message": _prefix_with_audit_summary(row, err_msg),
+            }
+        model_sha_err = await _verify_referenced_model_sha256s(
+            backend, draft_text, facts_text, row.get("audit")
+        )
+        if model_sha_err:
+            await db_publications.transition(
+                req_id,
+                ("awaiting_pm",),
+                "superseded",
+                error=model_sha_err,
+            )
+            return {
+                "ok": False,
+                "status": "superseded",
+                "audit": row.get("audit"),
+                "message": _prefix_with_audit_summary(row, model_sha_err),
             }
 
         # 4a. Unattended run -> do NOT emit interrupt(); record pm_handoff and stop at awaiting_pm
@@ -805,6 +1479,40 @@ async def run_publish(
                 ),
             }
 
+        post_pm_unrecalc = await _check_unrecalculated_models(
+            backend, draft_text, facts_text, attachments=attachments, att_blobs=None
+        )
+        if post_pm_unrecalc:
+            err_msg = "；".join(post_pm_unrecalc)
+            await db_publications.transition(
+                req_id,
+                ("awaiting_pm",),
+                "audit_failed",
+                error=err_msg,
+            )
+            return {
+                "ok": False,
+                "status": "audit_failed",
+                "audit": row.get("audit"),
+                "message": _prefix_with_audit_summary(row, err_msg),
+            }
+        post_pm_sha_err = await _verify_referenced_model_sha256s(
+            backend, draft_text, facts_text, row.get("audit")
+        )
+        if post_pm_sha_err:
+            await db_publications.transition(
+                req_id,
+                ("awaiting_pm",),
+                "superseded",
+                error=post_pm_sha_err,
+            )
+            return {
+                "ok": False,
+                "status": "superseded",
+                "audit": row.get("audit"),
+                "message": _prefix_with_audit_summary(row, post_pm_sha_err),
+            }
+
         row = (
             await db_publications.transition(
                 req_id,
@@ -820,6 +1528,39 @@ async def run_publish(
 
     # Step 6: Consume approval (approve-once, execute-once)
     if status == "approved":
+        app_unrecalc = await _check_unrecalculated_models(
+            backend, draft_text, facts_text, attachments=attachments, att_blobs=None
+        )
+        if app_unrecalc:
+            err_msg = "；".join(app_unrecalc)
+            await db_publications.transition(
+                req_id,
+                ("approved",),
+                "audit_failed",
+                error=err_msg,
+            )
+            return {
+                "ok": False,
+                "status": "audit_failed",
+                "audit": row.get("audit"),
+                "message": _prefix_with_audit_summary(row, err_msg),
+            }
+        app_sha_err = await _verify_referenced_model_sha256s(
+            backend, draft_text, facts_text, row.get("audit")
+        )
+        if app_sha_err:
+            await db_publications.transition(
+                req_id,
+                ("approved",),
+                "superseded",
+                error=app_sha_err,
+            )
+            return {
+                "ok": False,
+                "status": "superseded",
+                "audit": row.get("audit"),
+                "message": _prefix_with_audit_summary(row, app_sha_err),
+            }
         claimed = await db_publications.consume_approval(req_id, bundle_sha256)
         if claimed is None:
             await db_publications.transition(
@@ -842,6 +1583,39 @@ async def run_publish(
 
     # Step 7, 8, 9: Write immutable files, insert publication rows, update thesis.official
     if status == "publishing":
+        pub_unrecalc = await _check_unrecalculated_models(
+            backend, draft_text, facts_text, attachments=attachments, att_blobs=None
+        )
+        if pub_unrecalc:
+            err_msg = "；".join(pub_unrecalc)
+            await db_publications.transition(
+                req_id,
+                ("publishing",),
+                "audit_failed",
+                error=err_msg,
+            )
+            return {
+                "ok": False,
+                "status": "audit_failed",
+                "audit": row.get("audit"),
+                "message": _prefix_with_audit_summary(row, err_msg),
+            }
+        pub_sha_err = await _verify_referenced_model_sha256s(
+            backend, draft_text, facts_text, row.get("audit")
+        )
+        if pub_sha_err:
+            await db_publications.transition(
+                req_id,
+                ("publishing",),
+                "superseded",
+                error=pub_sha_err,
+            )
+            return {
+                "ok": False,
+                "status": "superseded",
+                "audit": row.get("audit"),
+                "message": _prefix_with_audit_summary(row, pub_sha_err),
+            }
         now_dt = datetime.now(timezone.utc)
         pub_date_str = now_dt.strftime("%Y-%m-%d")
         approved_at_iso = (

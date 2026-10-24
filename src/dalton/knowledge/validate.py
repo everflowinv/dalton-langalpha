@@ -122,6 +122,25 @@ def validate_schema(schema_name: str, instance: Any) -> list[dict[str, Any]]:
                 "message": err.message,
             }
         )
+    if schema_name == "thesis" and isinstance(instance, dict):
+        pillars = instance.get("pillars")
+        if isinstance(pillars, list):
+            active_pillars = [
+                p
+                for p in pillars
+                if isinstance(p, dict) and p.get("status") != "retired"
+            ]
+            if len(active_pillars) > 7:
+                errors.append(
+                    {
+                        "code": "max_active_pillars_exceeded",
+                        "path": "/pillars",
+                        "message": (
+                            f"非 retired 的支柱不超过 7 条（当前非 retired 支柱 {len(active_pillars)} 条，"
+                            f"总支柱 {len(pillars)} 条）；请先 retire 旧支柱"
+                        ),
+                    }
+                )
     return errors
 
 

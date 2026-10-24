@@ -30,6 +30,7 @@ from src.dalton.publish.numbers import (
     _FILING_FORM_RE,
     _PERIOD_TOKEN_RE,
     _incidental_guard_reject_reasons,
+    count_unparsed_citations_when_table_missing,
     extract_figures,
     has_exempt_marker,
     label_figures_with_status,
@@ -64,7 +65,7 @@ REASON_ZH: dict[str, str] = {
 
 CONTRADICTED_REASONS = frozenset({"source_conflict"})
 
-AUDIT_PROMPT_VERSION = "audit_v1"
+AUDIT_PROMPT_VERSION = "audit_v8"
 _AUDIT_CACHE_TAG_RE = re.compile(r"<!--\s*dalton:audit-cache\b")
 _AUDIT_CACHE_RE = re.compile(
     r"<!--\s*dalton:audit-cache\s*\n(.*?)\n-->",
@@ -273,9 +274,10 @@ def compute_audit_inputs_sha256(
     model_cells: dict[str, dict[str, Any]] | None = None,
     provenance_records: dict[str, dict[str, Any]] | None = None,
     metric_aliases: dict[str, list[str]] | None = None,
+    evidence_ref_bodies: dict[str, str] | None = None,
 ) -> str:
     """Compute a deterministic SHA-256 over citation table and facts/ledger/knowledge inputs."""
-    payload = {
+    payload: dict[str, Any] = {
         "footnotes": parse_footnotes(draft_markdown) if draft_markdown else {},
         "facts_markdown": facts_markdown or "",
         "facts_ledger": parse_facts_ledger(facts_markdown or ""),
@@ -285,6 +287,8 @@ def compute_audit_inputs_sha256(
         "provenance_records": provenance_records or {},
         "metric_aliases": metric_aliases or {},
     }
+    if evidence_ref_bodies:
+        payload["evidence_ref_bodies"] = evidence_ref_bodies
     encoded = json.dumps(
         payload, sort_keys=True, ensure_ascii=False, default=str
     ).encode("utf-8")
@@ -420,6 +424,10 @@ class AuditResult:
     config_sha256: str = ""
     audit_model: str = ""
     prompt_version: str = ""
+    missing_citation_table_count: int = 0
+    unrecalculated_model_warnings: list[str] = dataclasses.field(default_factory=list)
+    model_unit_warnings: list[str] = dataclasses.field(default_factory=list)
+    model_file_sha256s: dict[str, str] = dataclasses.field(default_factory=dict)
 
     @property
     def passed(self) -> bool:
@@ -484,6 +492,10 @@ class AuditResult:
             "config_sha256": self.config_sha256,
             "audit_model": self.audit_model,
             "prompt_version": self.prompt_version,
+            "missing_citation_table_count": self.missing_citation_table_count,
+            "unrecalculated_model_warnings": list(self.unrecalculated_model_warnings),
+            "model_unit_warnings": list(self.model_unit_warnings),
+            "model_file_sha256s": dict(self.model_file_sha256s),
             "labeling_incomplete": self.labeling_incomplete,
             "labeling": self.labeling,
             "verified_by_counts": {
@@ -776,7 +788,7 @@ async def judge_figures_batch_with_llm(
                 "period": fig.period,
                 "kind": fig.label_hint,
                 "sentence": fig.location.get("sentence") or "",
-                "candidate_sources": cands[:4],
+                "candidate_sources": cands[:8],
             }
         )
 
@@ -930,22 +942,23 @@ def _build_audit_result(
                 verified_by = "derived"
             elif not fig.footnote_target:
                 verified_by = "llm_judge"
-            matched_list.append(
-                {
-                    "id": fig.id,
-                    "raw": fig.raw,
-                    "line": fig.location.get("line", 0),
-                    "metric": fig.metric,
-                    "period": fig.period,
-                    "kind": out.kind,
-                    "ref": out.ref,
-                    "excerpt": out.excerpt,
-                    "quote": out.excerpt if verified_by == "llm_judge" else "",
-                    "sentence": fig.location.get("sentence", ""),
-                    "verified_by": verified_by,
-                    "source_sha256": out.source_sha256,
-                }
-            )
+            matched_item: dict[str, Any] = {
+                "id": fig.id,
+                "raw": fig.raw,
+                "line": fig.location.get("line", 0),
+                "metric": fig.metric,
+                "period": fig.period,
+                "kind": out.kind,
+                "ref": out.ref,
+                "excerpt": out.excerpt,
+                "quote": out.excerpt if verified_by == "llm_judge" else "",
+                "sentence": fig.location.get("sentence", ""),
+                "verified_by": verified_by,
+                "source_sha256": out.source_sha256,
+            }
+            if out.hint:
+                matched_item["hint"] = out.hint
+            matched_list.append(matched_item)
         elif out.reason == "uncertain" or (
             fig.incidental_category in _DECIMAL_UNCERTAIN_CATEGORIES
             and _incidental_guard_reject_reasons(fig) == ["decimals"]
@@ -1001,6 +1014,10 @@ def _build_audit_result(
     eff_labeling["incidental_excluded"] = len(incidental_list)
     eff_labeling.setdefault("llm_period_overrides", 0)
 
+    unit_warns = _extract_model_unit_warnings(
+        None, matched_list, unmatched_blocking
+    )
+
     return AuditResult(
         draft_sha256=draft_sha,
         figures=len(extracted),
@@ -1015,7 +1032,67 @@ def _build_audit_result(
         outcomes=outcomes,
         labeling_incomplete=labeling_incomplete,
         labeling=eff_labeling,
+        model_unit_warnings=unit_warns,
     )
+
+
+def _extract_model_unit_warnings(
+    model_cells: dict[str, dict[str, Any]] | None,
+    matches: list[dict[str, Any]] | None = None,
+    unmatched: list[dict[str, Any]] | None = None,
+) -> list[str]:
+    warnings: list[str] = []
+    seen: set[str] = set()
+    for k, v in (model_cells or {}).items():
+        if not isinstance(v, dict):
+            continue
+        w = str(v.get("unit_conflict_warning") or "").strip()
+        if not w and v.get("stored_as_ratio"):
+            raw_u = str(v.get("unit") or "").strip()
+            if raw_u and raw_u.lower() not in ("pct", "%", "other", "none"):
+                w = "格式为百分比，单位标签不一致"
+        if w:
+            norm_k = k.replace("!", "#", 1) if ("!" in k and "#" not in k) else k
+            msg = f"模型单元格 {norm_k}：{w}"
+            if msg not in seen:
+                seen.add(msg)
+                warnings.append(msg)
+    for item in list(matches or []) + list(unmatched or []):
+        if not isinstance(item, dict):
+            continue
+        h = str(item.get("hint") or "")
+        ex = str(item.get("excerpt") or "")
+        if "格式为百分比，单位标签不一致" in h or "格式为百分比，单位标签不一致" in ex:
+            ref = str(item.get("ref") or "").strip()
+            msg = (
+                f"模型单元格 {ref}：格式为百分比，单位标签不一致"
+                if ref
+                else "格式为百分比，单位标签不一致"
+            )
+            if msg not in seen:
+                seen.add(msg)
+                warnings.append(msg)
+    return warnings
+
+
+def _extract_model_file_sha256s(
+    model_cells: dict[str, dict[str, Any]] | None,
+) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for k, v in (model_cells or {}).items():
+        if not isinstance(v, dict):
+            continue
+        sha = str(v.get("file_sha256") or v.get("sha256") or "").strip()
+        if not sha:
+            continue
+        base_p = (
+            k.split("#", 1)[0]
+            if "#" in k
+            else (k.split("!", 1)[0] if "!" in k else k)
+        ).strip()
+        if base_p and base_p.lower().endswith(".xlsx"):
+            out[base_p] = sha
+    return out
 
 
 async def aaudit_draft(
@@ -1027,6 +1104,8 @@ async def aaudit_draft(
     provenance_records: dict[str, dict[str, Any]] | None = None,
     facts_markdown: str | None = None,
     metric_aliases: dict[str, list[str]] | None = None,
+    evidence_ref_bodies: dict[str, str] | None = None,
+    draft_path: str = "",
     use_llm_judge: bool = True,
     user_id: str,
     workspace_id: str | None = None,
@@ -1051,6 +1130,7 @@ async def aaudit_draft(
             provenance_records=provenance_records,
             facts_markdown=facts_markdown,
             metric_aliases=metric_aliases,
+            evidence_ref_bodies=evidence_ref_bodies,
             use_llm_judge=use_llm_judge,
             prompt_version=prompt_version,
             config_fingerprint=config_fp,
@@ -1070,6 +1150,7 @@ async def aaudit_draft(
         model_cells=model_cells,
         provenance_records=provenance_records,
         metric_aliases=metric_aliases,
+        evidence_ref_bodies=evidence_ref_bodies,
     )
     # One budget for the whole audit, from here on: extraction, labelling, matching and
     # judging. Model calls past it send nothing new (journalled results still replay),
@@ -1110,6 +1191,8 @@ async def aaudit_draft(
         facts_ledger=facts_ledger,
         metric_aliases=metric_aliases,
         source_cache=source_cache,
+        evidence_ref_bodies=evidence_ref_bodies,
+        draft_path=draft_path,
     )
 
     # Step D: Section-batched concurrent LLM judge (`Semaphore(4)`, <=10 figs/batch) + code anchoring (P0I §1.5–§1.6)
@@ -1125,6 +1208,8 @@ async def aaudit_draft(
             facts_ledger=facts_ledger,
             metric_aliases=metric_aliases,
             source_cache=source_cache,
+            evidence_ref_bodies=evidence_ref_bodies,
+            draft_path=draft_path,
         )
 
         section_batches: list[tuple[str, list[tuple[int, ExtractedFigure, list[dict[str, Any]]]]]] = []
@@ -1271,6 +1356,13 @@ async def aaudit_draft(
     built.config_sha256 = cfg_sha
     built.audit_model = eff_model
     built.prompt_version = eff_prompt_ver
+    built.missing_citation_table_count = count_unparsed_citations_when_table_missing(
+        draft_markdown
+    )
+    built.model_unit_warnings = _extract_model_unit_warnings(
+        model_cells, built.matches, built.unmatched
+    )
+    built.model_file_sha256s = _extract_model_file_sha256s(model_cells)
     return built
 
 
@@ -1284,6 +1376,8 @@ def _collect_judge_candidates(
     facts_ledger: dict[str, dict[str, Any]],
     metric_aliases: dict[str, list[str]] | None,
     source_cache: SourceParseCache | None = None,
+    evidence_ref_bodies: dict[str, str] | None = None,
+    draft_path: str = "",
 ) -> tuple[
     dict[str, list[tuple[int, ExtractedFigure, list[dict[str, Any]]]]],
     dict[int, list[dict[str, Any]]],
@@ -1315,6 +1409,8 @@ def _collect_judge_candidates(
             facts_ledger=facts_ledger,
             metric_aliases=metric_aliases,
             source_cache=source_cache,
+            evidence_ref_bodies=evidence_ref_bodies,
+            draft_path=draft_path,
         )
         if not cand_sources:
             continue
@@ -1342,6 +1438,30 @@ def render_audit_md(audit: AuditResult, *, draft_path: str = "") -> str:
         f"# 数字核验报告（Draft Audit）：`{draft_path or 'draft'}`",
         "",
     ]
+    for warn_msg in audit.unrecalculated_model_warnings:
+        lines.extend(
+            [
+                f"> ⚠️ **{warn_msg}**",
+                "",
+            ]
+        )
+    unit_warns = list(audit.model_unit_warnings) or _extract_model_unit_warnings(
+        None, audit.matches, audit.unmatched
+    )
+    for unit_warn in unit_warns:
+        lines.extend(
+            [
+                f"> ⚠️ **{unit_warn}**",
+                "",
+            ]
+        )
+    if audit.missing_citation_table_count > 0:
+        lines.extend(
+            [
+                f"> ⚠️ **草稿缺少 `## 引用` 表，{audit.missing_citation_table_count} 处 [引用] 无法解析**",
+                "",
+            ]
+        )
     conflict_lead = audit.conflict_lead_sentence()
     if conflict_lead:
         lines.extend([f"> ⚠️ **{conflict_lead}**", ""])
@@ -1398,9 +1518,15 @@ def render_audit_md(audit: AuditResult, *, draft_path: str = "") -> str:
         lines.append("| ID | 行号 | 原文数字 | 指标 | 期间 | 来源类型 | 来源引用 |")
         lines.append("|---|---|---|---|---|---|---|")
         for m in sorted(audit.matches, key=lambda x: int(x.get("line") or 0)):
+            m_hint = str(m.get("hint") or "")
+            ref_cell = (
+                f"`{m.get('ref')}`（{m_hint}）"
+                if m_hint
+                else f"`{m.get('ref')}`"
+            )
             lines.append(
                 f"| {m['id']} | L{m['line']} | `{m['raw']}` | {m.get('metric') or '—'} "
-                f"| {m.get('period') or '—'} | `{m.get('kind')}` | `{m.get('ref')}` |"
+                f"| {m.get('period') or '—'} | `{m.get('kind')}` | {ref_cell} |"
             )
         lines.append("")
 
@@ -1448,6 +1574,7 @@ def try_load_reusable_audit_from_md(
     provenance_records: dict[str, dict[str, Any]] | None = None,
     facts_markdown: str | None = None,
     metric_aliases: dict[str, list[str]] | None = None,
+    evidence_ref_bodies: dict[str, str] | None = None,
     use_llm_judge: bool = True,
     prompt_version: str | None = None,
     audit_model: str | None = None,
@@ -1485,6 +1612,7 @@ def try_load_reusable_audit_from_md(
             model_cells=model_cells,
             provenance_records=provenance_records,
             metric_aliases=metric_aliases,
+            evidence_ref_bodies=evidence_ref_bodies,
         )
         if not cached["inputs_sha256"] or cached["inputs_sha256"] != inputs_sha:
             return None
@@ -1503,13 +1631,14 @@ def try_load_reusable_audit_from_md(
         contradicted_list = list(cached["contradicted"])
         unverified_list = list(cached["unverified"])
         unmatched_list = list(cached["unmatched"])
+        matches_list = list(cached["matches"])
         return AuditResult(
             draft_sha256=draft_sha,
             figures=int(cached["figures"]),
             matched=int(cached["matched"]),
             exempt=int(cached["exempt"]),
             unmatched=unmatched_list,
-            matches=list(cached["matches"]),
+            matches=matches_list,
             contradicted=contradicted_list,
             unverified=unverified_list,
             uncertain=list(cached["uncertain"]),
@@ -1522,6 +1651,13 @@ def try_load_reusable_audit_from_md(
             config_sha256=cfg_sha,
             audit_model=eff_model,
             prompt_version=eff_prompt_ver,
+            missing_citation_table_count=count_unparsed_citations_when_table_missing(
+                draft_markdown
+            ),
+            model_unit_warnings=_extract_model_unit_warnings(
+                model_cells, matches_list, unmatched_list
+            ),
+            model_file_sha256s=_extract_model_file_sha256s(model_cells),
         )
     except Exception:
         return None

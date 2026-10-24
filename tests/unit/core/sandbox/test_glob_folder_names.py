@@ -3,11 +3,13 @@
 import subprocess
 import sys
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+# DALTON-HOOK(glob-brace-expansion): use create_autospec for PTCSandbox test double
+from unittest.mock import create_autospec
 
 import pytest
 
 from ptc_agent.core.sandbox.files import aglob_files
+from ptc_agent.core.sandbox.ptc_sandbox import PTCSandbox
 
 
 class _LocalRuntime:
@@ -25,8 +27,9 @@ def _sandbox() -> SimpleNamespace:
     async def _call(fn, *args, retry_policy=None, **kwargs):
         return await fn(*args, **kwargs)
 
+    # DALTON-HOOK(glob-brace-expansion): replace bare AsyncMock with create_autospec(PTCSandbox, instance=True)
     return SimpleNamespace(
-        _wait_ready=AsyncMock(),
+        _wait_ready=create_autospec(PTCSandbox, instance=True)._wait_ready,
         config=SimpleNamespace(
             filesystem=SimpleNamespace(enable_path_validation=False)
         ),
@@ -134,3 +137,116 @@ async def test_a_link_reaching_the_mount_another_way_is_still_the_mount(
     found = await aglob_files(_sandbox(), "*/*.csv", str(workspace))
 
     assert found == [str(workspace / "data" / "a.csv")]
+
+
+# DALTON-HOOK(glob-brace-expansion): unit tests for brace expansion, nesting, commas, dedup, and mtime sort
+def test_expand_braces_nested_and_commas():
+    from ptc_agent.core.sandbox.glob_runtime import expand_braces
+
+    assert expand_braces("**/{debate,thesis,drivers,agenda}.json") == [
+        "**/debate.json",
+        "**/thesis.json",
+        "**/drivers.json",
+        "**/agenda.json",
+    ]
+    # Nested braces and empty alternatives
+    assert expand_braces("data/{a,{b,c},}.json") == [
+        "data/a.json",
+        "data/b.json",
+        "data/c.json",
+        "data/.json",
+    ]
+    # Multiple brace groups in one pattern
+    assert expand_braces("{data,notes}/{thesis,drivers}.{json,md}") == [
+        "data/thesis.json",
+        "data/thesis.md",
+        "data/drivers.json",
+        "data/drivers.md",
+        "notes/thesis.json",
+        "notes/thesis.md",
+        "notes/drivers.json",
+        "notes/drivers.md",
+    ]
+    # Single item without comma or unclosed brace is left untouched
+    assert expand_braces("**/{thesis}.json") == ["**/{thesis}.json"]
+    assert expand_braces("**/{thesis,drivers.json") == ["**/{thesis,drivers.json"]
+    # Commas inside character classes [...] do not trigger brace expansion
+    assert expand_braces("data/[a,b]{1,2}.json") == [
+        "data/[a,b]1.json",
+        "data/[a,b]2.json",
+    ]
+    assert expand_braces("data/{[a,b],c}.json") == [
+        "data/[a,b].json",
+        "data/c.json",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_glob_brace_expansion_deduplicates_and_preserves_mtime_sort(tmp_path):
+    import os
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    f_debate = data_dir / "debate.json"
+    f_thesis = data_dir / "thesis.json"
+    f_drivers = data_dir / "drivers.json"
+    f_agenda = data_dir / "agenda.json"
+    f_other = data_dir / "company.json"
+
+    for idx, f in enumerate([f_debate, f_thesis, f_drivers, f_agenda, f_other], start=1):
+        f.write_text("{}")
+        ts = 1_700_000_000 + idx * 10
+        os.utime(f, (ts, ts))
+
+    found = await aglob_files(
+        _sandbox(),
+        "**/{debate,thesis,drivers,agenda,thesis,*s}.json",
+        str(tmp_path),
+    )
+
+    assert found == [
+        str(f_agenda),
+        str(f_drivers),
+        str(f_thesis),
+        str(f_debate),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "pattern",
+    [
+        "{*.json,notes/*.json}",
+        "{thesis.schema.json,unused/path.json}",
+        "**/{debate,thesis}.json",
+        "*.{md,json}",
+        "data/{a,b}.json",
+    ],
+)
+async def test_glob_sandbox_and_diskglob_parity(tmp_path, pattern):
+    from ptc_agent.agent.backends.search_match import DiskGlob
+
+    files = [
+        tmp_path / "root.json",
+        tmp_path / "readme.md",
+        tmp_path / "thesis.schema.json",
+        tmp_path / "notes" / "n1.json",
+        tmp_path / "notes" / "n2.md",
+        tmp_path / "sub" / "thesis.schema.json",
+        tmp_path / "data" / "debate.json",
+        tmp_path / "data" / "thesis.json",
+        tmp_path / "data" / "a.json",
+        tmp_path / "data" / "b.json",
+        tmp_path / "data" / "c.json",
+    ]
+    for f in files:
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text("{}")
+
+    sandbox_found = set(await aglob_files(_sandbox(), pattern, str(tmp_path)))
+    dg = DiskGlob(pattern, str(tmp_path))
+    diskglob_found = {str(f) for f in files if dg.finds(str(f))}
+
+    assert sandbox_found == diskglob_found
+
+

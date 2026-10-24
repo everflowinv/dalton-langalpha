@@ -233,6 +233,36 @@ def next_item_id(
     return f"ID-{len(existing_items) + 1}"
 
 
+def _clamp_iso_as_of(val: Any, now_dt: datetime, now_str: str) -> Any:
+    """If ``val`` is a pre-filled ISO timestamp later than ``now_dt``, clamp it to ``now_str``."""
+    if not isinstance(val, str) or not val.strip():
+        return val
+    s = val.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return val
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    if dt > now_dt:
+        return now_str
+    return val
+
+
+def _clamp_iso_date_as_of(val: Any, now_dt: datetime) -> Any:
+    """If ``val`` is a pre-filled YYYY-MM-DD date later than ``now_dt``'s UTC date, clamp it."""
+    if not isinstance(val, str) or len(val) != 10:
+        return val
+    now_date = now_dt.strftime("%Y-%m-%d")
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", val) and val > now_date:
+        return now_date
+    return val
+
+
 def _ensure_nested_ids_and_defaults(
     doc_key: str,
     doc: dict[str, Any],
@@ -242,8 +272,27 @@ def _ensure_nested_ids_and_defaults(
     evidence_ids: list[str] | None = None,
 ) -> None:
     """Assign missing IDs and server timestamps across the document."""
-    now_str = _now_iso(now)
+    now_dt = now or datetime.now(timezone.utc)
+    if now_dt.tzinfo is None:
+        now_dt = now_dt.replace(tzinfo=timezone.utc)
+    else:
+        now_dt = now_dt.astimezone(timezone.utc)
+    now_str = _now_iso(now_dt)
     doc["schema_version"] = 1
+    if "updated_at" in doc:
+        if doc_key in (
+            "company",
+            "thesis",
+            "debate",
+            "drivers",
+            "management",
+            "lessons",
+            "agenda",
+            "models",
+        ):
+            doc.pop("updated_at", None)
+        else:
+            doc["updated_at"] = now_str
     if doc_key in _AS_OF_DOCS:
         doc["as_of"] = now_str
 
@@ -262,6 +311,8 @@ def _ensure_nested_ids_and_defaults(
             old_mv = (old_doc or {}).get("market_view") if isinstance(old_doc, dict) else None
             if old_doc is None or old_mv != mv or not mv.get("updated_at"):
                 mv["updated_at"] = now_str
+            if "as_of" in mv:
+                mv["as_of"] = _clamp_iso_as_of(mv.get("as_of"), now_dt, now_str)
         pillars = doc.get("pillars")
         if isinstance(pillars, list):
             for idx, pillar in enumerate(pillars):
@@ -273,6 +324,11 @@ def _ensure_nested_ids_and_defaults(
                     )
                 pillar.setdefault("created_at", now_str)
                 pillar.setdefault("provenance", "draft")
+                baseline = pillar.get("baseline")
+                if isinstance(baseline, dict) and "as_of" in baseline:
+                    baseline["as_of"] = _clamp_iso_date_as_of(
+                        baseline.get("as_of"), now_dt
+                    )
                 th = pillar.get("thresholds")
                 if isinstance(th, dict):
                     for bucket in ("confirm", "warn", "break"):
@@ -306,13 +362,20 @@ def _ensure_nested_ids_and_defaults(
 
     elif doc_key == "drivers":
         drivers = doc.get("drivers")
+        old_drivers_by_id = {
+            str(d.get("id")): d
+            for d in ((old_doc or {}).get("drivers") or [])
+            if isinstance(d, dict) and d.get("id")
+        }
         if isinstance(drivers, list):
             for idx, drv in enumerate(drivers):
                 if not isinstance(drv, dict):
                     continue
                 if not drv.get("id"):
                     drv["id"] = next_item_id("drivers", drivers[:idx], now=now)
-                drv.setdefault("updated_at", now_str)
+                old_drv = old_drivers_by_id.get(str(drv["id"]))
+                if old_doc is None or old_drv is None or old_drv != drv or not drv.get("updated_at"):
+                    drv["updated_at"] = now_str
                 drv.setdefault("leading_indicators", [])
                 inds = drv["leading_indicators"]
                 if isinstance(inds, list):
@@ -326,9 +389,20 @@ def _ensure_nested_ids_and_defaults(
                                 parent_id=drv["id"],
                                 now=now,
                             )
+                        latest_r = ind.get("latest")
+                        if isinstance(latest_r, dict) and "as_of" in latest_r:
+                            latest_r["as_of"] = _clamp_iso_as_of(
+                                latest_r.get("as_of"), now_dt, now_str
+                            )
                         readings = ind.get("readings")
-                        if isinstance(readings, list) and len(readings) > 200:
-                            ind["readings"] = readings[-200:]
+                        if isinstance(readings, list):
+                            for r in readings:
+                                if isinstance(r, dict) and "as_of" in r:
+                                    r["as_of"] = _clamp_iso_as_of(
+                                        r.get("as_of"), now_dt, now_str
+                                    )
+                            if len(readings) > 200:
+                                ind["readings"] = readings[-200:]
 
     elif doc_key == "management":
         gh = doc.get("guidance_history")

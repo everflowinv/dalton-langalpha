@@ -2376,3 +2376,361 @@ def test_dalton_agenda_skill_verdict_and_agenda_ops_examples_validate() -> None:
     assert updated_agenda["next_validations"][1]["id"] == "V-002"
 
 
+def test_thesis_pillar_cap_excludes_retired_pillars() -> None:
+    """5 retired + 3 active pillars (8 total) must pass validation; 8 active pillars must fail with '请先 retire 旧支柱'."""
+    from src.dalton.knowledge.validate import validate_schema
+
+    thesis_doc = _sample_thesis_doc()
+    base_pillar = copy.deepcopy(thesis_doc["pillars"][0])
+    pillars: list[dict[str, Any]] = []
+    for idx in range(1, 9):
+        p = copy.deepcopy(base_pillar)
+        p["id"] = f"P{idx}"
+        if idx <= 5:
+            p["status"] = "retired"
+            p["retired_at"] = "2026-10-20T00:00:00Z"
+            p["status_reason"] = "Migrated legacy pillar retired"
+        else:
+            p["status"] = "intact"
+        pillars.append(p)
+    thesis_doc["pillars"] = pillars
+
+    # 5 retired + 3 active = 3 non-retired pillars <= 7 -> passes
+    errors_ok = validate_schema("thesis", thesis_doc)
+    assert errors_ok == []
+
+    # 8 active pillars -> rejected with explicit message
+    for p in thesis_doc["pillars"]:
+        p["status"] = "intact"
+        p.pop("retired_at", None)
+    errors_exceeded = validate_schema("thesis", thesis_doc)
+    assert len(errors_exceeded) == 1
+    assert errors_exceeded[0]["code"] == "max_active_pillars_exceeded"
+    assert "非 retired 的支柱不超过 7 条" in errors_exceeded[0]["message"]
+    assert "请先 retire 旧支柱" in errors_exceeded[0]["message"]
+
+
+@pytest.mark.asyncio
+async def test_knowledge_update_dry_run_previews_diff_without_saving(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """dry_run=True validates and previews diff/expected structure without writing DB versions or sandbox files."""
+    from unittest.mock import create_autospec
+
+    from src.dalton.database import knowledge as db_knowledge
+    from src.dalton.knowledge import service
+    from src.dalton.tools.knowledge_tools import create_knowledge_tools
+
+    monkeypatch.setattr(
+        service,
+        "verify_workspace_access",
+        create_autospec(service.verify_workspace_access, return_value={"workspace_id": "ws-1"}),
+    )
+    import src.dalton.tools.knowledge_tools as kt_mod
+
+    monkeypatch.setattr(
+        kt_mod,
+        "verify_workspace_access",
+        create_autospec(kt_mod.verify_workspace_access, return_value={"workspace_id": "ws-1"}),
+    )
+    monkeypatch.setattr(
+        db_knowledge,
+        "latest_version",
+        create_autospec(db_knowledge.latest_version, return_value=None),
+    )
+    monkeypatch.setattr(
+        db_knowledge,
+        "latest_valid_version",
+        create_autospec(db_knowledge.latest_valid_version, return_value=None),
+    )
+    mock_insert = create_autospec(db_knowledge.insert_version)
+    monkeypatch.setattr(db_knowledge, "insert_version", mock_insert)
+
+    tools = create_knowledge_tools(None)
+    k_update = tools[0]
+    cfg = {"configurable": {"user_id": "u-1", "workspace_id": "ws-1"}}
+
+    # 1. Invalid draft in dry_run=True returns problems + expected structure without calling insert_version
+    bad_res = await k_update.ainvoke(
+        {
+            "name": "knowledge_update",
+            "id": "tc-dry-1",
+            "type": "tool_call",
+            "args": {
+                "doc": "company",
+                "ops": [{"op": "create", "value": {"ticker": "GOOGL"}}],
+                "reason": "Dry-run invalid company draft",
+                "base_version": None,
+                "dry_run": True,
+            },
+        },
+        config=cfg,
+    )
+    bad_msg = bad_res.content if hasattr(bad_res, "content") else str(bad_res)
+    assert "Validation failed for company (NOT SAVED)" in bad_msg
+    assert "one_liner: string [required]" in bad_msg
+    assert mock_insert.call_count == 0
+
+    # 2. Valid draft in dry_run=True returns preview_doc, diff, and expected_structures without calling insert_version
+    valid_company = {
+        "ticker": "GOOGL",
+        "exchange": "NASDAQ",
+        "name": "Alphabet Inc.",
+        "coverage_tier": "core",
+        "coverage_stage": "initial",
+        "one_liner": "Global search, cloud, and AI leader.",
+    }
+    res_dry = await service.apply_update(
+        user_id="u-1",
+        workspace_id="ws-1",
+        doc_key="company",
+        ops=[{"op": "create", "value": valid_company}],
+        reason="Dry-run valid company draft",
+        base_version=None,
+        dry_run=True,
+    )
+    assert res_dry["ok"] is True
+    assert res_dry["dry_run"] is True
+    assert res_dry["would_be_version_no"] == 1
+    assert res_dry["preview_doc"]["ticker"] == "GOOGL"
+    assert any(d["path"] == "/ticker" for d in res_dry["diff"])
+    assert "one_liner: string [required]" in res_dry["expected_structures"]
+    assert mock_insert.call_count == 0
+
+    # 3. Real tool entry point (ainvoke) returns message + before/after diff + processed preview_doc JSON
+    ok_tool_res = await k_update.ainvoke(
+        {
+            "name": "knowledge_update",
+            "id": "tc-dry-2",
+            "type": "tool_call",
+            "args": {
+                "doc": "company",
+                "ops": [{"op": "create", "value": valid_company}],
+                "reason": "Dry-run valid company draft via tool",
+                "base_version": None,
+                "dry_run": True,
+            },
+        },
+        config=cfg,
+    )
+    ok_msg = ok_tool_res.content if hasattr(ok_tool_res, "content") else str(ok_tool_res)
+    assert "Dry-run passed for company (would save v1)" in ok_msg
+    assert "Diff (before/after):" in ok_msg
+    assert "Preview document (preview_doc):" in ok_msg
+    assert '"name": "Alphabet Inc."' in ok_msg
+    assert '"schema_version": 1' in ok_msg
+    assert mock_insert.call_count == 0
+
+    # 4. Preview document exceeding 8000 chars is truncated at 8000 chars with total length noted
+    large_company = {
+        **valid_company,
+        "one_liner": "A" * 8500,
+    }
+    large_tool_res = await k_update.ainvoke(
+        {
+            "name": "knowledge_update",
+            "id": "tc-dry-3",
+            "type": "tool_call",
+            "args": {
+                "doc": "company",
+                "ops": [{"op": "create", "value": large_company}],
+                "reason": "Dry-run large company draft via tool",
+                "base_version": None,
+                "dry_run": True,
+            },
+        },
+        config=cfg,
+    )
+    large_msg = large_tool_res.content if hasattr(large_tool_res, "content") else str(large_tool_res)
+    assert "... (truncated at 8000 chars, total " in large_msg
+    assert mock_insert.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_insert_version_and_insert_verdict_populate_workspace_ticker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """insert_version and insert_verdict resolve ticker from workspace and write it into the INSERT statement."""
+    from unittest.mock import create_autospec
+
+    from src.dalton.database import knowledge as db_knowledge
+    from src.dalton.database import verdicts as db_verdicts
+
+    class _CurSpec:
+        async def __aenter__(self) -> Any: ...
+        async def __aexit__(self, *args: object) -> None: ...
+        async def execute(self, sql: str, params: Any = None) -> None: ...
+        async def fetchall(self) -> list[dict[str, Any]]: ...
+        async def fetchone(self) -> dict[str, Any] | None: ...
+
+    class _TxSpec:
+        async def __aenter__(self) -> Any: ...
+        async def __aexit__(self, *args: object) -> None: ...
+
+    class _ConnSpec:
+        async def __aenter__(self) -> Any: ...
+        async def __aexit__(self, *args: object) -> None: ...
+        def cursor(self, *args: Any, **kwargs: Any) -> Any: ...
+        def transaction(self) -> Any: ...
+
+    captured_kv_params: list[Any] = []
+    captured_verdict_params: list[Any] = []
+    last_op: dict[str, Any] = {}
+
+    cur = create_autospec(_CurSpec, instance=True)
+    cur.__aenter__.return_value = cur
+    cur.__aexit__.return_value = None
+
+    async def _exec(sql: str, params: Any = None) -> None:
+        s = " ".join(str(sql).split())
+        if "FROM dalton_knowledge_versions WHERE workspace_id = %s" in s:
+            last_op["row"] = None
+        elif "INSERT INTO dalton_knowledge_versions" in s:
+            captured_kv_params.append(params)
+            last_op["row"] = {
+                "knowledge_version_id": "00000000-0000-0000-0000-000000000010",
+                "version_no": 1,
+                "ticker": params[-1],
+            }
+        elif "SELECT verdict_id FROM dalton_verdicts" in s:
+            last_op["rows"] = []
+        elif "INSERT INTO dalton_verdicts" in s:
+            captured_verdict_params.append(params)
+            last_op["row"] = {
+                "verdict_id": params[0],
+                "ticker": params[-1],
+            }
+
+    cur.execute.side_effect = _exec
+    cur.fetchall.side_effect = lambda: list(last_op.get("rows", []))
+    cur.fetchone.side_effect = lambda: last_op.get("row")
+
+    tx = create_autospec(_TxSpec, instance=True)
+    tx.__aenter__.return_value = tx
+    tx.__aexit__.return_value = None
+
+    conn = create_autospec(_ConnSpec, instance=True)
+    conn.__aenter__.return_value = conn
+    conn.__aexit__.return_value = None
+    conn.cursor.return_value = cur
+    conn.transaction.return_value = tx
+
+    monkeypatch.setattr(
+        db_knowledge,
+        "get_db_connection",
+        create_autospec(db_knowledge.get_db_connection, return_value=conn),
+    )
+    monkeypatch.setattr(
+        db_verdicts,
+        "get_db_connection",
+        create_autospec(db_verdicts.get_db_connection, return_value=conn),
+    )
+    monkeypatch.setattr(
+        db_knowledge,
+        "_resolve_workspace_ticker",
+        create_autospec(db_knowledge._resolve_workspace_ticker, return_value="GOOGL"),
+    )
+    monkeypatch.setattr(
+        db_verdicts,
+        "_resolve_workspace_ticker",
+        create_autospec(db_verdicts._resolve_workspace_ticker, return_value="GOOGL"),
+    )
+
+    kv_row = await db_knowledge.insert_version(
+        user_id="u-1",
+        workspace_id="ws-googl",
+        doc_key="debate",
+        base_version_no=None,
+        content={"schema_version": 1, "as_of": "2026-10-23T05:00:00Z", "debates": []},
+        content_sha256="abc",
+        ops=[],
+        reason="init debate",
+    )
+    assert kv_row["ticker"] == "GOOGL"
+    assert captured_kv_params[-1][-1] == "GOOGL"
+
+    vd_row = await db_verdicts.insert_verdict(
+        user_id="u-1",
+        workspace_id="ws-googl",
+        verdict={
+            "trigger": {"kind": "manual"},
+            "event": "Initial coverage",
+            "verdict": "NEW_THESIS",
+            "rationale": "Initial coverage completed",
+            "next_validation": {"what": "3Q26 earnings", "due": "2026-10-29"},
+            "progress": "some",
+        },
+    )
+    assert vd_row["ticker"] == "GOOGL"
+    assert captured_verdict_params[-1][-1] == "GOOGL"
+
+
+def test_apply_update_enforces_server_timestamps_and_clamps_future_as_of() -> None:
+    """Server fills updated_at (including drivers[].updated_at) with write time and clamps pre-filled future as_of to write time."""
+    write_now = datetime(2026, 10, 23, 5, 0, 0, tzinfo=UTC)
+    write_iso = "2026-10-23T05:00:00Z"
+
+    drivers_draft = {
+        "as_of": "2026-10-23T04:15:00Z",
+        "drivers": [
+            {
+                "id": "K1",
+                "name": "Search AI Overviews monetization",
+                "kind": "price",
+                "description": "Search RPM resilience under AI Overviews",
+                "updated_at": "2026-10-23T04:15:00Z",
+                "leading_indicators": [
+                    {
+                        "id": "K1.1",
+                        "name": "Search YoY growth",
+                        "source": "10-Q",
+                        "frequency": "quarterly",
+                        "good_direction": "up",
+                        "latest": {
+                            "value": 14.0,
+                            "unit": "pct",
+                            "period": "2Q26",
+                            "as_of": "2026-10-23T06:30:00Z",
+                            "ref": {"kind": "filing", "form": "10-Q", "period": "2Q26"},
+                            "label": "reported",
+                        },
+                        "readings": [
+                            {
+                                "value": 14.0,
+                                "unit": "pct",
+                                "period": "2Q26",
+                                "as_of": "2026-10-23T04:15:00Z",
+                                "ref": {"kind": "filing", "form": "10-Q", "period": "2Q26"},
+                                "label": "reported",
+                            },
+                            {
+                                "value": 15.0,
+                                "unit": "pct",
+                                "period": "3Q26",
+                                "as_of": "2026-10-23T08:00:00Z",
+                                "ref": {"kind": "filing", "form": "10-Q", "period": "3Q26"},
+                                "label": "reported",
+                            },
+                        ],
+                    }
+                ],
+            }
+        ],
+    }
+    created_drivers, _ = apply_ops(
+        "drivers",
+        None,
+        [{"op": "create", "value": drivers_draft}],
+        reason="Init drivers",
+        now=write_now,
+    )
+    # Top-level as_of and drivers[].updated_at are filled with server write time (05:00, not 04:15)
+    assert created_drivers["as_of"] == write_iso
+    assert created_drivers["drivers"][0]["updated_at"] == write_iso
+    # Pre-filled as_of later than write time (06:30, 08:00) is clamped to write time (05:00); earlier as_of (04:15) is preserved
+    ind = created_drivers["drivers"][0]["leading_indicators"][0]
+    assert ind["latest"]["as_of"] == write_iso
+    assert ind["readings"][0]["as_of"] == "2026-10-23T04:15:00Z"
+    assert ind["readings"][1]["as_of"] == write_iso
+
+

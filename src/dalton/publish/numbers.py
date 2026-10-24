@@ -101,8 +101,8 @@ _STRUCTURAL_COUNT_RE = re.compile(
     r"\b\d+\s*(?:个支柱|条支柱|条分歧|个分歧|个问题|条问题|个驱动|条经验|家公司|个工作区|页|行))"
 )
 
-# Single authoritative exemption marker table (P0J J2 §6): 4 words × 3 bracket styles
-EXEMPT_MARKER_WORDS: tuple[str, ...] = ("示意", "假设", "估计", "举例")
+# Single authoritative exemption marker table (P0J J2 §6): 5 words × 3 bracket styles
+EXEMPT_MARKER_WORDS: tuple[str, ...] = ("示意", "假设", "估计", "举例", "阈值")
 EXEMPT_MARKER_BRACKETS: tuple[tuple[str, str], ...] = (("〔", "〕"), ("[", "]"), ("（", "）"))
 EXEMPT_MARKERS: tuple[str, ...] = tuple(
     f"{ob}{w}{cb}" for w in EXEMPT_MARKER_WORDS for ob, cb in EXEMPT_MARKER_BRACKETS
@@ -187,19 +187,16 @@ def _expand_colloquial_raw_with_qualifier(
 
 
 # Core financial number regex:
-# Captures optional sign/parens, optional currency prefix, number with commas/decimals,
-# optional scale (k/mn/m/bn/b/billion/million/万/亿/千亿/百亿/百万), optional unit (%/pp/bp/bps/x/倍/美元/港元/元)
+# Captures optional sign/parens, optional tight currency prefix (at most one space),
+# number with commas/decimals, optional scale (at most one space), and optional tight unit/currency suffix (at most one space).
 _NUMBER_RE = re.compile(
     r"(?P<full>"
     r"(?P<open_paren>\()?"
     r"(?P<sign>[+\-−])?\s*"
-    r"(?P<currency>US\$|HK\$|RMB|CNY|USD|HKD|\$|¥)?"
-    r"\s*"
+    r"(?:(?P<currency>(?<![A-Za-z])(?:US\$|HK\$|RMB|CNY|USD|HKD)|\$|¥|￥) ?)?"
     r"(?P<num>\d{1,3}(?:,\d{3})+|\d+)(?P<dec>\.\d+)?"
-    r"\s*"
-    r"(?P<scale>千亿|百亿|百万|万亿|亿|万|billion|million|bn|mn|(?:k|m|b)(?![a-zA-Z]))?"
-    r"\s*"
-    r"(?P<unit>bps|bp|pp|pts|%|倍|x(?![a-zA-Z])|美元|港元|人民币|元)?"
+    r"(?: ?(?P<scale>千亿|百亿|百万|万亿|亿|万|billion|million|bn|mn|(?:k|m|b)(?![a-zA-Z])))?"
+    r"(?: ?(?P<unit>bps|bp|pp|pts|%|倍|x(?![a-zA-Z])|(?:USD|HKD|CNY|RMB)(?![a-zA-Z])|美元|港元|港币|人民币|元(?![素年旦气件])))?"
     r"(?P<close_paren>\))?"
     r")",
     re.IGNORECASE,
@@ -229,12 +226,25 @@ CURRENCY_MAP: dict[str, str] = {
     "hk$": "HKD",
     "hkd": "HKD",
     "港元": "HKD",
+    "港币": "HKD",
     "¥": "CNY",
+    "￥": "CNY",
     "rmb": "CNY",
     "cny": "CNY",
     "人民币": "CNY",
     "元": "CNY",
 }
+
+
+class _PerShareUnit(str):
+    """Canonical ``"per_share"`` unit string that preserves its explicit currency (``"USD"``, ``"HKD"``, ``"CNY"``, or ``None``)."""
+
+    currency: str | None = None
+
+    def __new__(cls, value: str = "per_share", currency: str | None = None) -> "_PerShareUnit":
+        obj = super().__new__(cls, value)
+        obj.currency = currency
+        return obj
 
 
 class FigureLabelItem(BaseModel):
@@ -433,6 +443,34 @@ def _infer_scale_from_header(header_text: str) -> float:
     return 1.0
 
 
+def _infer_currency_from_table_header(header_text: str) -> str | None:
+    """Extract currency from a Markdown table row/column/caption unit header when unambiguous."""
+    s = (header_text or "").strip()
+    if not s:
+        return None
+    low = s.lower()
+    found: set[str] = set()
+    if re.search(
+        r"(?:[（(][^）)]*(?:港元|港币|\bhkd\b|hk\$)[^）)]*[）)]|(?:亿|百万|万)(?:港元|港币)|(?:港元|港币)/股|\bhkd\s*(?:bn|mn|b|m|k|per\s+share|/sh)\b|hk\$\s*[bmk]\b|单位\s*[：:]\s*[^\n,，;；]*(?:港元|港币|\bhkd\b|hk\$))",
+        low,
+    ):
+        found.add("HKD")
+    low_no_hk = re.sub(r"hk\$", " ", low)
+    if re.search(
+        r"(?:[（(][^）)]*(?:美元|\busd\b|us\$|\$)[^）)]*[）)]|(?:万亿|千亿|百亿|亿|百万|万)美元|美元/股|\busd\s*(?:bn|mn|b|m|k|per\s+share|/sh)\b|(?:us\$|\$)\s*[bmk]\b|单位\s*[：:]\s*[^\n,，;；]*(?:美元|\busd\b|us\$|\$))",
+        low_no_hk,
+    ):
+        found.add("USD")
+    if re.search(
+        r"(?:[（(][^）)]*(?:人民币|亿元|百万元|万元|元/股|\bcny\b|\brmb\b|[¥￥])[^）)]*[）)]|(?:万亿|千亿|百亿|亿|百万|万)(?:人民币|元)|(?:人民币|元)/股|\b(?:cny|rmb)\s*(?:bn|mn|b|m|k|per\s+share|/sh)\b|单位\s*[：:]\s*[^\n,，;；]*(?:人民币|亿元|百万元|万元|\bcny\b|\brmb\b|[¥￥]))",
+        low,
+    ):
+        found.add("CNY")
+    if len(found) == 1:
+        return next(iter(found))
+    return None
+
+
 def _determine_unit_and_scale(
     currency_tok: str | None,
     scale_tok: str | None,
@@ -440,7 +478,12 @@ def _determine_unit_and_scale(
     context_text: str = "",
     header_context: str = "",
 ) -> tuple[str | None, str, float]:
-    """Return ``(currency, canonical_unit, scale_multiplier)``."""
+    """Return ``(currency, canonical_unit, scale_multiplier)``.
+
+    Currency is bound ONLY when a currency symbol/code/word is tightly adjacent to the number itself
+    (captured in ``currency_tok`` or ``unit_tok``), or specified by a table unit header in ``header_context``
+    for non-per-share table cells. Never infer currency from a surrounding prose character window.
+    """
     cur_raw = (currency_tok or "").strip().lower()
     unit_raw = (unit_tok or "").strip().lower()
     scale_raw = (scale_tok or "").strip().lower()
@@ -463,44 +506,28 @@ def _determine_unit_and_scale(
             return None, "x", 1.0
 
     combined_ctx = f"{header_context} {context_text}".strip()
-    currency = CURRENCY_MAP.get(cur_raw) or CURRENCY_MAP.get(unit_raw)
-    if not currency and combined_ctx:
-        low_ctx = combined_ctx.lower()
-        if "美元" in combined_ctx or "usd" in low_ctx or "us$" in low_ctx or "$" in combined_ctx:
-            currency = "USD"
-        elif "港元" in combined_ctx or "hkd" in low_ctx or "hk$" in low_ctx:
-            currency = "HKD"
-        elif (
-            "人民币" in combined_ctx
-            or "亿元" in combined_ctx
-            or "百万元" in combined_ctx
-            or "万元" in combined_ctx
-            or "cny" in low_ctx
-            or "rmb" in low_ctx
-            or "¥" in combined_ctx
-        ):
-            currency = "CNY"
+    token_currency = CURRENCY_MAP.get(cur_raw) or CURRENCY_MAP.get(unit_raw)
+    header_currency = _infer_currency_from_table_header(header_context) if header_context else None
+    currency = token_currency or header_currency
 
     scale = SCALE_MULTIPLIERS.get(scale_raw, 1.0)
     if scale == 1.0 and header_context:
         scale = _infer_scale_from_header(header_context)
 
     if scale == 1.0 and combined_ctx and re.search(
-        r"(?:[美港]元/股|人民币/股|元/股|每股|\beps\b|per\s+share|/share\b|/sh\b)",
+        r"(?:[美港]元/股|港币/股|人民币/股|元/股|每股|\beps\b|per\s+share|/share\b|/sh\b)",
         combined_ctx,
         re.IGNORECASE,
     ):
-        return currency or "USD", "per_share", 1.0
+        return token_currency, _PerShareUnit("per_share", currency=token_currency), 1.0
 
     if currency:
         if scale == 1e9:
             return currency, f"{currency}_bn", scale
         if scale == 1e6:
             return currency, f"{currency}_mn", scale
-        if scale == 1e8 and currency == "CNY":
-            return currency, "CNY_100mn", scale
         if scale == 1e8:
-            return currency, f"{currency}_bn", 1e8
+            return currency, f"{currency}_100mn", scale
         return currency, currency, scale
 
     if scale == 1e6:
@@ -537,24 +564,85 @@ _GENERIC_MODIFIER_WORDS = frozenset(
 )
 
 
+_NUMBER_WITH_SHARE_SUFFIX_RE = re.compile(
+    _NUMBER_RE.pattern + r"(?:\s*/\s*(?:股|share|sh)\b)?",
+    re.IGNORECASE,
+)
+
+
+def _strip_numbers_from_metric_clause(text: str) -> str:
+    """Remove numbers and attached scale/unit suffixes from a metric label."""
+    s = _NUMBER_WITH_SHARE_SUFFIX_RE.sub(" ", text)
+    s = re.sub(
+        r"(?:(?<![A-Za-z\u4e00-\u9fff])(?:万亿|千亿|百亿|百万|亿|万|美元|港元|人民币|%|％|bp|bps|pp|pts|倍)(?![A-Za-z\u4e00-\u9fff]))",
+        " ",
+        s,
+        flags=re.IGNORECASE,
+    )
+    return " ".join(s.split()).strip(" +-−~～/")
+
+
 def _extract_metric_from_context(
     sentence: str, match_start: int, match_end: int
 ) -> str:
     """Heuristically extract the metric phrase preceding or surrounding a number in prose."""
     before = sentence[:match_start]
-    # Remove period tokens and footnote markers from 'before'
+    # Remove period tokens, dates, and footnote markers from 'before' before splitting on '-'
     cleaned = _PERIOD_TOKEN_RE.sub(" ", before)
-    cleaned = _FOOTNOTE_REF_RE.sub(" ", cleaned)
-    # Split on clause punctuation and take the nearest segment before the number
-    clauses = re.split(r"[，,；;：:。！？!?\(\)（）—\-]", cleaned)
+    cleaned = _ISO_DATE_RE.sub(" ", cleaned)
+    cleaned = _CN_DATE_RE.sub(" ", cleaned)
+    cleaned = _ANY_FOOTNOTE_REF_RE.sub(" ", cleaned)
+    # Split on clause punctuation (including 、, ；, 。) without splitting thousands commas inside numbers (e.g. 1,234)
+    clauses = re.split(
+        r"[，；;：:。！？!?\(\)（）—]|(?<!\d),(?!\d)|(?<![A-Za-z0-9])-(?![A-Za-z0-9])",
+        cleaned,
+    )
     non_empty_cands: list[str] = []
     for clause in reversed(clauses):
-        cand = clause.strip()
+        if "、" in clause:
+            sub_parts = [
+                _strip_numbers_from_metric_clause(p)
+                for p in clause.split("、")
+                if p.strip()
+            ]
+            sub_parts = [
+                re.sub(
+                    r"^(?:其中|以及|而|且|但|约|达到|为|至|录得|实现|高于|低于|维持|预计|我们的|公司)\s*",
+                    "",
+                    p,
+                ).strip()
+                for p in sub_parts
+            ]
+            sub_parts = [
+                re.sub(r"(?:截至|约为|达到|为|至|约)\s*$", "", p).strip()
+                for p in sub_parts
+            ]
+            sub_parts = [p for p in sub_parts if len(p) >= 2]
+            if len(sub_parts) >= 2:
+                last_sub = sub_parts[-1]
+                first_no_num = sub_parts[0]
+                if last_sub.lower() in _GENERIC_MODIFIER_WORDS and first_no_num:
+                    non_empty_cands.append(f"{first_no_num} {last_sub}"[-36:])
+                    continue
+                m_seg = re.match(r"^([A-Za-z][A-Za-z0-9 &/\-]*)", first_no_num)
+                if (
+                    m_seg
+                    and not re.match(r"^[A-Za-z]", last_sub)
+                    and m_seg.group(1).strip().lower() not in last_sub.lower()
+                ):
+                    non_empty_cands.append(f"{m_seg.group(1).strip()} {last_sub}"[-36:])
+                    continue
+            for sp in reversed(sub_parts):
+                non_empty_cands.append(sp)
+            continue
+
+        cand = _strip_numbers_from_metric_clause(clause)
         cand = re.sub(
             r"^(?:其中|以及|而|且|但|约|达到|为|至|录得|实现|高于|低于|维持|预计|我们的|公司)\s*",
             "",
             cand,
         ).strip()
+        cand = re.sub(r"(?:截至|约为|达到|为|至|约)\s*$", "", cand).strip()
         if len(cand) >= 2:
             non_empty_cands.append(cand)
 
@@ -563,28 +651,33 @@ def _extract_metric_from_context(
         # If the nearest clause is just a generic growth/change modifier (e.g. "同比"),
         # combine it with the preceding subject clause (e.g. "广告收入 512 亿美元") so metric matches "广告收入增速".
         if nearest.lower() in _GENERIC_MODIFIER_WORDS and len(non_empty_cands) >= 2:
-            prev_clause = _NUMBER_RE.sub(" ", non_empty_cands[1]).strip()
-            prev_clause = " ".join(prev_clause.split())
+            prev_clause = _strip_numbers_from_metric_clause(non_empty_cands[1])
             if prev_clause:
                 return f"{prev_clause} {nearest}"[-36:]
         return nearest[-32:]
 
     after = sentence[match_end : match_end + 24]
-    after_clauses = re.split(r"[，,；;：:。！？!?\(\)（）]", after)
+    after_clauses = re.split(r"[、，；;：:。！？!?\(\)（）]|(?<!\d),(?!\d)", after)
     if after_clauses and after_clauses[0].strip():
-        return after_clauses[0].strip()[:24]
-    return sentence.strip()[:32]
+        cleaned_after = _strip_numbers_from_metric_clause(after_clauses[0])
+        if cleaned_after:
+            return cleaned_after[:24]
+    return _strip_numbers_from_metric_clause(sentence)[:32]
 
 
 _DUPLICATE_CITATION_TARGET = "__DUPLICATE_CITATION__"
 _CITATION_SECTION_HEADING_RE = re.compile(r"^##\s+引用\s*$")
+_CITATION_ANY_HEADING_RE = re.compile(r"^##\s+引用")
 _TOP_HEADING_RE = re.compile(r"^#{1,2}\s+")
 
 
-def _parse_footnote_namespaces(
+def _parse_footnote_namespaces_with_status(
     markdown_text: str,
-) -> tuple[dict[str, str], dict[str, str]]:
-    """Parse traditional footnotes ``[^id]: target`` and ``## 引用`` entries ``[引用N]: target`` into separate namespaces."""
+) -> tuple[dict[str, str], dict[str, str], bool]:
+    """Parse traditional footnotes ``[^id]: target`` and ``## 引用`` entries ``[引用N]: target`` into separate namespaces.
+
+    Also returns ``has_parseable_citation_table`` indicating whether a valid ``## 引用`` mapping section exists.
+    """
     traditional_footnotes: dict[str, str] = {}
     citation_table: dict[str, str] = {}
     in_code_block = False
@@ -639,7 +732,62 @@ def _parse_footnote_namespaces(
                 ns[fn_id] = _DUPLICATE_CITATION_TARGET
             continue
         ns[fn_id] = target_tok
+    has_parseable_citation_table = bool(citation_table)
+    return traditional_footnotes, citation_table, has_parseable_citation_table
+
+
+def _parse_footnote_namespaces(
+    markdown_text: str,
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Parse traditional footnotes ``[^id]: target`` and ``## 引用`` entries ``[引用N]: target`` into separate namespaces."""
+    traditional_footnotes, citation_table, _ = _parse_footnote_namespaces_with_status(
+        markdown_text
+    )
     return traditional_footnotes, citation_table
+
+
+def count_unparsed_citations_when_table_missing(markdown_text: str) -> int:
+    """Return the number of ``[引用N]`` citations in the draft body when the ``## 引用`` table is missing."""
+    if not markdown_text:
+        return 0
+    _, _, has_parseable_citation_table = _parse_footnote_namespaces_with_status(
+        markdown_text
+    )
+    if has_parseable_citation_table:
+        return 0
+
+    in_code_block = False
+    in_html_comment = False
+    in_citation_like_section = False
+    count = 0
+    for raw_line in markdown_text.splitlines():
+        stripped = raw_line.strip()
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            in_code_block = not in_code_block
+            continue
+        if in_code_block:
+            continue
+        if "<!--" in stripped:
+            if "-->" not in stripped:
+                in_html_comment = True
+            continue
+        if in_html_comment:
+            if "-->" in stripped:
+                in_html_comment = False
+            continue
+        if stripped.startswith("#"):
+            if _CITATION_ANY_HEADING_RE.match(stripped):
+                in_citation_like_section = True
+            elif _TOP_HEADING_RE.match(stripped):
+                in_citation_like_section = False
+            continue
+        if in_citation_like_section:
+            continue
+        if _FOOTNOTE_DEF_RE.match(raw_line) or _CITATION_DEF_RE.match(raw_line):
+            continue
+        masked = _INLINE_CODE_RE.sub(" ", raw_line)
+        count += len(_CITATION_REF_RE.findall(masked))
+    return count
 
 
 def parse_footnotes(markdown_text: str) -> dict[str, str]:
@@ -754,46 +902,95 @@ def _find_all_footnotes(text: str) -> list[str]:
     ]
 
 
-def _find_footnotes_for_span(line_text: str, end_pos: int) -> list[str]:
-    """Find the footnote/citation cluster at or after ``end_pos`` on ``line_text``."""
+_SENTENCE_BOUNDARY_RE = re.compile(
+    r"[。！？!?；;]|(?<!\d)\.(?=\s|$)|(?<=\d)\.(?=\s+[A-Z\u4e00-\u9fff\[]|\s*$)"
+)
+
+
+def _sentence_bounds_for_span(
+    line_text: str, start_pos: int, end_pos: int
+) -> tuple[int, int]:
+    """Return ``(sent_start, sent_end)`` character offsets for the sentence containing ``[start_pos, end_pos)``."""
+    sent_start = 0
+    sent_end = len(line_text)
+    for bm in _SENTENCE_BOUNDARY_RE.finditer(line_text):
+        if bm.end() <= start_pos:
+            sent_start = max(sent_start, bm.end())
+        elif bm.start() >= end_pos:
+            sent_end = min(sent_end, bm.start())
+            break
+    return sent_start, sent_end
+
+
+def _sentence_for_span(line_text: str, start_pos: int, end_pos: int) -> str:
+    """Return the sentence substring within ``line_text`` containing ``[start_pos, end_pos)``."""
+    sent_start, sent_end = _sentence_bounds_for_span(line_text, start_pos, end_pos)
+    return line_text[sent_start:sent_end]
+
+
+def _trailing_header_clause(header: str) -> str:
+    """Return the trailing non-empty sentence of ``header`` for table row/column context."""
+    s = (header or "").strip()
+    if not s or not _SENTENCE_BOUNDARY_RE.search(s):
+        return s
+    non_empty = [p.strip() for p in _SENTENCE_BOUNDARY_RE.split(s) if p.strip()]
+    return non_empty[-1] if non_empty else s
+
+
+def _find_footnotes_for_span(
+    line_text: str, end_pos: int, start_pos: int | None = None
+) -> list[str]:
+    """Find the footnote/citation cluster for a number span within the same sentence only.
+
+    Prefers the first citation cluster at or after ``end_pos`` in the same sentence;
+    falls back to the nearest citation cluster before ``start_pos`` in the same sentence.
+    Never crosses sentence boundaries.
+    """
+    eff_start = end_pos if start_pos is None else start_pos
+    sent_start, sent_end = _sentence_bounds_for_span(line_text, eff_start, end_pos)
+
     matches = [
         (m.start(), m.end(), _format_extracted_ref_id(m))
         for m in _ANY_FOOTNOTE_REF_RE.finditer(line_text)
+        if m.start() >= sent_start and m.end() <= sent_end
     ]
     if not matches:
         return []
-    first_idx: int | None = None
-    for idx, (start, _end, _fid) in enumerate(matches):
-        if start >= end_pos - 1:
-            first_idx = idx
-            break
-    if first_idx is not None:
-        cluster = [matches[first_idx][2]]
-        k = first_idx + 1
+
+    clusters: list[tuple[int, int, list[str]]] = []
+    idx = 0
+    while idx < len(matches):
+        c_start = matches[idx][0]
+        c_end = matches[idx][1]
+        c_ids = [matches[idx][2]]
+        k = idx + 1
         while k < len(matches):
             between = line_text[matches[k - 1][1] : matches[k][0]]
-            if re.fullmatch(r"[\s,，、/；;]*", between):
-                cluster.append(matches[k][2])
+            if re.fullmatch(r"[\s,，、/]*", between):
+                c_end = matches[k][1]
+                c_ids.append(matches[k][2])
                 k += 1
             else:
                 break
-        return cluster
-    # Fallback: last cluster on the line
-    last_idx = len(matches) - 1
-    start_idx = last_idx
-    while start_idx > 0:
-        between = line_text[matches[start_idx - 1][1] : matches[start_idx][0]]
-        if re.fullmatch(r"[\s,，、/；;]*", between):
-            start_idx -= 1
-        else:
-            break
-    return [matches[k][2] for k in range(start_idx, last_idx + 1)]
+        clusters.append((c_start, c_end, c_ids))
+        idx = k
+
+    for c_start, _c_end, c_ids in clusters:
+        if c_start >= end_pos - 1:
+            return c_ids
+
+    preceding = [c_ids for _c_start, c_end, c_ids in clusters if c_end <= eff_start + 1]
+    if preceding:
+        return preceding[-1]
+    return []
 
 
 def _resolve_footnote_bundle(
     fn_ids: list[str],
     traditional_footnotes: dict[str, str],
     citation_table: dict[str, str] | None = None,
+    *,
+    citation_table_missing: bool = False,
 ) -> tuple[str | None, str | None, list[str], list[str], list[str], list[str]]:
     """Resolve a list of footnote/citation IDs into primary ID/target, all targets, missing citations, and duplicate citations."""
     cits = (
@@ -801,12 +998,17 @@ def _resolve_footnote_bundle(
         if citation_table is not None
         else {k: v for k, v in traditional_footnotes.items() if _is_citation_id(k)}
     )
-    fn_id = fn_ids[0] if fn_ids else None
+    kept_fn_ids: list[str] = []
     targets: list[str] = []
     missing_citations: list[str] = []
     duplicate_citations: list[str] = []
     for fid in fn_ids:
         if _is_citation_id(fid):
+            if citation_table_missing:
+                # When the entire ## 引用 table is missing from the draft, treat [引用N] as unreferenced
+                # so the figure enters Step D retrieval instead of being locked unverified.
+                continue
+            kept_fn_ids.append(fid)
             s = re.sub(r"\s+", "", fid.strip())
             raw_entry = cits.get(s) or cits.get(fid.strip())
             if raw_entry == _DUPLICATE_CITATION_TARGET:
@@ -823,6 +1025,7 @@ def _resolve_footnote_bundle(
                 if label not in missing_citations:
                     missing_citations.append(label)
         else:
+            kept_fn_ids.append(fid)
             trad_key = fid.strip()[1:] if fid.strip().startswith("^") else fid.strip()
             raw_entry = (
                 traditional_footnotes.get(f"^{trad_key}")
@@ -837,11 +1040,12 @@ def _resolve_footnote_bundle(
             target = _resolve_footnote_target(fid, traditional_footnotes, cits)
             if target is not None and target not in targets:
                 targets.append(target)
+    fn_id = kept_fn_ids[0] if kept_fn_ids else None
     fn_target = targets[0] if targets else None
     return (
         fn_id,
         fn_target,
-        list(fn_ids),
+        kept_fn_ids,
         targets,
         missing_citations,
         duplicate_citations,
@@ -895,7 +1099,12 @@ def _mask_excluded_spans(line: str) -> str:
 
 def extract_figures(markdown_text: str) -> list[ExtractedFigure]:
     """Extract all figures (including exempt ones marked ``exempt=True``) from Markdown text (PK.9)."""
-    traditional_footnotes, citation_table = _parse_footnote_namespaces(markdown_text)
+    (
+        traditional_footnotes,
+        citation_table,
+        has_parseable_citation_table,
+    ) = _parse_footnote_namespaces_with_status(markdown_text)
+    citation_table_missing = not has_parseable_citation_table
     lines = markdown_text.splitlines()
 
     figures: list[ExtractedFigure] = []
@@ -987,6 +1196,102 @@ def extract_figures(markdown_text: str) -> list[ExtractedFigure]:
                 hdr_fns = _find_all_footnotes(stripped)
                 if hdr_fns:
                     table_shared_footnotes = hdr_fns
+                for hdr_cell in cells:
+                    if not _SENTENCE_BOUNDARY_RE.search(hdr_cell) and not has_exempt_marker(hdr_cell):
+                        continue
+                    masked_hdr = _mask_excluded_spans(hdr_cell)
+                    for nm in _NUMBER_RE.finditer(masked_hdr):
+                        num_str = nm.group("num").replace(",", "")
+                        dec_str = nm.group("dec") or ""
+                        if not dec_str and _STANDALONE_YEAR_RE.match(num_str):
+                            continue
+                        if any(
+                            sm.start() <= nm.start() and nm.end() <= sm.end()
+                            for sm in _STRUCTURAL_COUNT_RE.finditer(hdr_cell)
+                        ):
+                            continue
+                        val = float(num_str + dec_str)
+                        decimals = len(dec_str) - 1 if dec_str else 0
+                        is_neg = bool(
+                            nm.group("sign") in ("-", "−")
+                            or (nm.group("open_paren") and nm.group("close_paren"))
+                        )
+                        if is_neg:
+                            val = -val
+                        raw_hdr_end = nm.start() + len(nm.group("full").rstrip())
+                        sent_start, sent_end = _sentence_bounds_for_span(
+                            hdr_cell, nm.start(), raw_hdr_end
+                        )
+                        hdr_sentence = hdr_cell[sent_start:sent_end]
+                        hdr_cell_fns = _find_footnotes_for_span(
+                            hdr_cell, raw_hdr_end, start_pos=nm.start()
+                        )
+                        (
+                            fn_id,
+                            fn_target,
+                            fn_ids,
+                            fn_targets,
+                            missing_cits,
+                            dup_cits,
+                        ) = _resolve_footnote_bundle(
+                            hdr_cell_fns,
+                            traditional_footnotes,
+                            citation_table,
+                            citation_table_missing=citation_table_missing,
+                        )
+                        p_hdr = _PERIOD_TOKEN_RE.search(hdr_sentence)
+                        eff_period = (
+                            normalize_period(p_hdr.group(1))
+                            if p_hdr
+                            else current_section_period
+                        )
+                        eff_metric = (
+                            _extract_metric_from_context(
+                                hdr_sentence,
+                                nm.start() - sent_start,
+                                nm.end() - sent_start,
+                            )
+                            or _clean_metric_header(hdr_sentence)
+                        )
+                        currency, unit, scale = _determine_unit_and_scale(
+                            nm.group("currency"),
+                            nm.group("scale"),
+                            nm.group("unit"),
+                            context_text=hdr_sentence,
+                            header_context="",
+                        )
+                        is_exempt = has_exempt_marker(hdr_sentence)
+                        fig_counter += 1
+                        figures.append(
+                            ExtractedFigure(
+                                id=f"F-{fig_counter:03d}",
+                                raw=nm.group("full").strip(),
+                                value=val,
+                                decimals=decimals,
+                                unit=unit,
+                                scale=scale,
+                                currency=currency,
+                                metric=eff_metric,
+                                period=eff_period,
+                                label_hint="reported",
+                                footnote_id=fn_id,
+                                footnote_target=fn_target,
+                                footnote_ids=fn_ids,
+                                footnote_targets=fn_targets,
+                                missing_citations=missing_cits,
+                                duplicate_citations=dup_cits,
+                                location={
+                                    "line": line_no,
+                                    "table": True,
+                                    "row": "",
+                                    "col": _ANY_FOOTNOTE_REF_RE.sub("", hdr_cell).strip(" *"),
+                                    "sentence": stripped,
+                                    "section": current_section_title,
+                                },
+                                exempt=is_exempt,
+                                exempt_reason="illustrative" if is_exempt else None,
+                            )
+                        )
                 i += 2
                 continue
             if _is_separator_row(cells):
@@ -1009,13 +1314,19 @@ def extract_figures(markdown_text: str) -> list[ExtractedFigure]:
                     else ""
                 )
 
-                # Support 1-column numeric tables or tables where col 0 is itself a data column
+                # Support 1-column numeric tables or tables where col 0 is itself a data column or multi-sentence prose
                 start_col = 1
                 if len(cells) == 1 or (
                     _NUMBER_RE.search(_mask_excluded_spans(cells[0]))
                     and not _PERIOD_TOKEN_RE.fullmatch(row_header)
-                    and table_header_0
-                    and table_header_0.lower() not in ("指标", "项目", "metric", "item", "期间", "period")
+                    and (
+                        _SENTENCE_BOUNDARY_RE.search(cells[0])
+                        or (
+                            table_header_0
+                            and table_header_0.lower()
+                            not in ("指标", "项目", "metric", "item", "期间", "period")
+                        )
+                    )
                 ):
                     start_col = 0
 
@@ -1033,12 +1344,14 @@ def extract_figures(markdown_text: str) -> list[ExtractedFigure]:
                     )
 
                     eff_row_header = "" if col_idx == 0 else row_header
-                    clean_row = _clean_metric_header(eff_row_header)
-                    clean_col = _clean_metric_header(col_header)
+                    row_clause = _trailing_header_clause(eff_row_header)
+                    col_clause = _trailing_header_clause(col_header)
+                    clean_row = _clean_metric_header(row_clause)
+                    clean_col = _clean_metric_header(col_clause)
 
                     # Determine period and metric from row_header / col_header
-                    p_col = _PERIOD_TOKEN_RE.search(col_header)
-                    p_row = _PERIOD_TOKEN_RE.search(eff_row_header)
+                    p_col = _PERIOD_TOKEN_RE.search(col_clause)
+                    p_row = _PERIOD_TOKEN_RE.search(row_clause)
                     if p_col:
                         period = normalize_period(p_col.group(1))
                         col_without_period = _PERIOD_TOKEN_RE.sub("", clean_col).strip(" ()（）-")
@@ -1071,7 +1384,7 @@ def extract_figures(markdown_text: str) -> list[ExtractedFigure]:
                         )
                         else ""
                     )
-                    header_ctx = f"{eff_row_header} {col_header} {table_header_0} {caption_unit_ctx}".strip()
+                    header_ctx = f"{row_clause} {col_clause} {table_header_0} {caption_unit_ctx}".strip()
                     masked_cell = _mask_excluded_spans(cell_text)
                     for nm in _NUMBER_RE.finditer(masked_cell):
                         num_str = nm.group("num").replace(",", "")
@@ -1088,7 +1401,9 @@ def extract_figures(markdown_text: str) -> list[ExtractedFigure]:
                             val = -val
 
                         raw_cell_end = nm.start() + len(nm.group("full").rstrip())
-                        cell_fns = _find_footnotes_for_span(cell_text, raw_cell_end)
+                        cell_fns = _find_footnotes_for_span(
+                            cell_text, raw_cell_end, start_pos=nm.start()
+                        )
                         eff_fns = cell_fns or row_fns or col_fns or table_shared_footnotes
                         (
                             fn_id,
@@ -1098,22 +1413,40 @@ def extract_figures(markdown_text: str) -> list[ExtractedFigure]:
                             missing_cits,
                             dup_cits,
                         ) = _resolve_footnote_bundle(
-                            eff_fns, traditional_footnotes, citation_table
+                            eff_fns,
+                            traditional_footnotes,
+                            citation_table,
+                            citation_table_missing=citation_table_missing,
                         )
+
+                        sent_start, sent_end = _sentence_bounds_for_span(
+                            cell_text, nm.start(), raw_cell_end
+                        )
+                        cell_sentence = cell_text[sent_start:sent_end]
+                        is_first_cell_sentence = sent_start == 0
+                        eff_period = period
+                        eff_metric = metric
+                        p_cell = _PERIOD_TOKEN_RE.search(cell_sentence)
+                        if p_cell and (not eff_period or not is_first_cell_sentence):
+                            eff_period = normalize_period(p_cell.group(1))
+                        if not is_first_cell_sentence or col_idx == 0:
+                            sent_metric = _extract_metric_from_context(
+                                cell_sentence,
+                                nm.start() - sent_start,
+                                nm.end() - sent_start,
+                            )
+                            if sent_metric:
+                                eff_metric = sent_metric
 
                         currency, unit, scale = _determine_unit_and_scale(
                             nm.group("currency"),
                             nm.group("scale"),
                             nm.group("unit"),
-                            context_text=f"{eff_row_header} {col_header}",
+                            context_text=f"{cell_sentence} {row_clause} {col_clause}".strip(),
                             header_context=header_ctx,
                         )
                         label_hint = "reported"
-                        is_exempt = (
-                            has_exempt_marker(cell_text)
-                            or has_exempt_marker(eff_row_header)
-                            or has_exempt_marker(col_header)
-                        )
+                        is_exempt = has_exempt_marker(cell_sentence)
                         fig_counter += 1
                         figures.append(
                             ExtractedFigure(
@@ -1124,8 +1457,8 @@ def extract_figures(markdown_text: str) -> list[ExtractedFigure]:
                                 unit=unit,
                                 scale=scale,
                                 currency=currency,
-                                metric=metric,
-                                period=period,
+                                metric=eff_metric,
+                                period=eff_period,
                                 label_hint=label_hint,
                                 footnote_id=fn_id,
                                 footnote_target=fn_target,
@@ -1177,14 +1510,8 @@ def extract_figures(markdown_text: str) -> list[ExtractedFigure]:
             + [(pos, "LTM") for pos in match_ltm_periods(period_scan_line)]
         )
 
-        is_exempt = is_blockquote or has_exempt_marker(raw_line)
-        exempt_reason = (
-            "blockquote_quote"
-            if is_blockquote
-            else ("illustrative" if is_exempt else None)
-        )
-
-        for nm in _NUMBER_RE.finditer(masked_line):
+        line_num_matches = list(_NUMBER_RE.finditer(masked_line))
+        for nm_idx, nm in enumerate(line_num_matches):
             num_str = nm.group("num").replace(",", "")
             dec_str = nm.group("dec") or ""
             if not dec_str and _STANDALONE_YEAR_RE.match(num_str):
@@ -1198,6 +1525,13 @@ def extract_figures(markdown_text: str) -> list[ExtractedFigure]:
                     nm.group("unit"),
                     nm.group("dec"),
                     nm.group("sign"),
+                    bool(
+                        re.match(
+                            r"^\s*(?:USD|HKD|CNY|RMB|港币|per\s+share|/share\b|/sh\b)",
+                            scan_line[nm.end() : nm.end() + 15],
+                            re.IGNORECASE,
+                        )
+                    ),
                 ]
             )
             if not has_qualifier and int(num_str) < 10:
@@ -1229,9 +1563,18 @@ def extract_figures(markdown_text: str) -> list[ExtractedFigure]:
                     if following_same_clause:
                         period = following_same_clause[0]
 
-            # Nearest footnote/citation cluster at or after this number on the same line
+            # Nearest footnote/citation cluster for this number within the same sentence
             raw_tok_end = nm.start() + len(nm.group("full").rstrip())
-            fn_cluster = _find_footnotes_for_span(raw_line, raw_tok_end)
+            sent_text = _sentence_for_span(raw_line, nm.start(), raw_tok_end)
+            is_exempt = is_blockquote or has_exempt_marker(sent_text)
+            exempt_reason = (
+                "blockquote_quote"
+                if is_blockquote
+                else ("illustrative" if is_exempt else None)
+            )
+            fn_cluster = _find_footnotes_for_span(
+                raw_line, raw_tok_end, start_pos=nm.start()
+            )
             (
                 fn_id,
                 fn_target,
@@ -1240,16 +1583,32 @@ def extract_figures(markdown_text: str) -> list[ExtractedFigure]:
                 missing_cits,
                 dup_cits,
             ) = _resolve_footnote_bundle(
-                fn_cluster, traditional_footnotes, citation_table
+                fn_cluster,
+                traditional_footnotes,
+                citation_table,
+                citation_table_missing=citation_table_missing,
             )
 
             metric = _extract_metric_from_context(scan_line, nm.start(), nm.end())
-            ctx_left = scan_line[max(0, nm.start() - 25) : nm.start()]
-            for sep in ("。", "；", ";", "，", ",", "（", "）", "(", ")"):
+            sent_start, sent_end = _sentence_bounds_for_span(
+                scan_line, nm.start(), raw_tok_end
+            )
+            prev_nm_end = (
+                line_num_matches[nm_idx - 1].end() if nm_idx > 0 else 0
+            )
+            next_nm_start = (
+                line_num_matches[nm_idx + 1].start()
+                if nm_idx + 1 < len(line_num_matches)
+                else len(scan_line)
+            )
+            left_bound = max(sent_start, prev_nm_end, nm.start() - 25)
+            right_bound = min(sent_end, next_nm_start, nm.end() + 15)
+            ctx_left = scan_line[left_bound : nm.start()]
+            for sep in ("。", "；", ";", "，", ",", "（", "("):
                 if sep in ctx_left:
                     ctx_left = ctx_left.rsplit(sep, 1)[-1]
-            ctx_right = scan_line[nm.end() : nm.end() + 15]
-            for sep in ("。", "；", ";", "，", ",", "（", "）", "(", ")"):
+            ctx_right = scan_line[nm.end() : right_bound]
+            for sep in ("。", "；", ";", "，", ",", "）", ")"):
                 if sep in ctx_right:
                     ctx_right = ctx_right.split(sep, 1)[0]
             clause_ctx = f"{ctx_left}{scan_line[nm.start() : nm.end()]}{ctx_right}"
@@ -1258,7 +1617,7 @@ def extract_figures(markdown_text: str) -> list[ExtractedFigure]:
                 nm.group("scale"),
                 nm.group("unit"),
                 context_text=clause_ctx,
-                header_context=last_caption_line if "单位" in last_caption_line else "",
+                header_context="",
             )
 
             fig_counter += 1
@@ -1502,7 +1861,12 @@ async def label_figures_with_status(
             )
         return figures, False
 
-    traditional_footnotes, citation_table = _parse_footnote_namespaces(markdown_text)
+    (
+        traditional_footnotes,
+        citation_table,
+        has_parseable_citation_table,
+    ) = _parse_footnote_namespaces_with_status(markdown_text)
+    citation_table_missing = not has_parseable_citation_table
     lines = markdown_text.splitlines()
     outline, chunks = _split_markdown_sections_and_chunks(markdown_text, max_chunk_chars=6000)
 
@@ -1736,7 +2100,12 @@ async def label_figures_with_status(
                 if item.unit and item.unit.strip():
                     u_clean = item.unit.strip()
                     if target.label_hint != "incidental" or u_clean in ("other", "count"):
-                        target.unit = u_clean
+                        if target.scale == 1e8 and u_clean in ("USD_bn", "HKD_bn", "CNY_bn"):
+                            u_clean = f"{u_clean[:-3]}_100mn"
+                        if u_clean == "per_share":
+                            target.unit = _PerShareUnit("per_share", currency=target.currency)
+                        else:
+                            target.unit = u_clean
 
             for extra in parsed.extra_figures:
                 raw_sub = (extra.raw or "").strip()
@@ -1781,7 +2150,7 @@ async def label_figures_with_status(
                     continue
                 raw_sub = selected_raw
                 fn_cluster = _find_footnotes_for_span(
-                    matched_line_text, raw_pos + len(raw_sub)
+                    matched_line_text, raw_pos + len(raw_sub), start_pos=raw_pos
                 )
                 (
                     fn_id,
@@ -1791,9 +2160,17 @@ async def label_figures_with_status(
                     missing_cits,
                     dup_cits,
                 ) = _resolve_footnote_bundle(
-                    fn_cluster, traditional_footnotes, citation_table
+                    fn_cluster,
+                    traditional_footnotes,
+                    citation_table,
+                    citation_table_missing=citation_table_missing,
                 )
-                is_exempt = matched_line_text.strip().startswith(">") or has_exempt_marker(matched_line_text)
+                extra_sent_text = _sentence_for_span(
+                    matched_line_text, raw_pos, raw_pos + len(raw_sub)
+                )
+                is_exempt = matched_line_text.strip().startswith(">") or has_exempt_marker(
+                    extra_sent_text
+                )
                 kind_val = (
                     extra.kind.lower()
                     if extra.kind and extra.kind.lower() in _VALID_LABEL_KINDS

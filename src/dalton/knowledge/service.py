@@ -720,6 +720,7 @@ async def apply_update(
     run_id: str | None = None,
     tool_call_id: str | None = None,
     now: datetime | None = None,
+    dry_run: bool = False,
 ) -> dict[str, Any]:
     """Execute the full PK.4 knowledge update pipeline: validate -> DB version -> write files."""
     await verify_workspace_access(workspace_id, user_id)
@@ -742,21 +743,28 @@ async def apply_update(
                     doc_key, None, parsed, source="direct_edit", reason="initial file"
                 )
                 _, sha = canonical_json(parsed)
-                latest = await db_knowledge.insert_version(
-                    user_id=user_id,
-                    workspace_id=workspace_id,
-                    doc_key=doc_key,
-                    base_version_no=None,
-                    content=parsed,
-                    content_sha256=sha,
-                    ops=None,
-                    reason="检测到工作区已有的初始文件（direct_edit）",
-                    evidence_refs=[],
-                    source="direct_edit",
-                    warnings=[*val_existing.errors, *val_existing.warnings],
-                    schema_valid=val_existing.ok,
-                    edited_path=data_path(doc_key),
-                )
+                if dry_run:
+                    latest = {
+                        "version_no": 1,
+                        "content": parsed,
+                        "schema_valid": val_existing.ok,
+                    }
+                else:
+                    latest = await db_knowledge.insert_version(
+                        user_id=user_id,
+                        workspace_id=workspace_id,
+                        doc_key=doc_key,
+                        base_version_no=None,
+                        content=parsed,
+                        content_sha256=sha,
+                        ops=None,
+                        reason="检测到工作区已有的初始文件（direct_edit）",
+                        evidence_refs=[],
+                        source="direct_edit",
+                        warnings=[*val_existing.errors, *val_existing.warnings],
+                        schema_valid=val_existing.ok,
+                        edited_path=data_path(doc_key),
+                    )
             except Exception as e:
                 logger.warning("Could not import existing %s as direct_edit: %s", doc_key, e)
 
@@ -833,13 +841,16 @@ async def apply_update(
             evidence_ids=ev_ids or None,
         )
     except OpError as e:
-        problems = [{"code": e.code, "path": e.path, "message": e.message}]
-        schema_hint = _format_expected_structures(doc_key, problems)
+        op_problems = [{"code": e.code, "path": e.path, "message": e.message}]
+        schema_hint = _format_expected_structures(doc_key, op_problems)
         hint_suffix = f"\n\n{schema_hint}" if schema_hint else ""
         return {
             "ok": False,
+            "dry_run": dry_run,
+            "doc": doc_key,
             "error": e.code,
-            "problems": problems,
+            "problems": op_problems,
+            "expected_structures": schema_hint,
             "message": f"- {e.path}: {e.code} ({e.message}){hint_suffix}",
         }
 
@@ -875,6 +886,7 @@ async def apply_update(
             "target_needs_model_cell",
             "model_tier_1_forbidden",
             "model_needs_model_cell",
+            "max_active_pillars_exceeded",
         )
         for err in val.errors
     )
@@ -914,14 +926,47 @@ async def apply_update(
         hint_suffix = f"\n\n{schema_hint}" if schema_hint else ""
         return {
             "ok": False,
+            "dry_run": dry_run,
+            "doc": doc_key,
             "error": val.errors[0]["code"],
             "problems": val.errors,
             "warnings": val.warnings,
+            "expected_structures": schema_hint,
+            "preview_doc": new_doc,
+            "diff": diff_documents(base_doc or {}, new_doc),
             "message": f"Validation failed for {doc_key} (NOT SAVED):\n{val.format_problems()}{hint_suffix}",
         }
 
-    # Step 4: Insert version into DB
+    # Step 4: Insert version into DB (or return preview when dry_run=True)
     _, content_sha = canonical_json(new_doc)
+    if dry_run:
+        diff_list = diff_documents(base_doc or {}, new_doc)
+        expected_struct = _format_expected_structures(doc_key, [{"path": "/"}])
+        ops_str = "; ".join(op_summaries[:5])
+        if len(op_summaries) > 5:
+            ops_str += f"; …等共 {len(op_summaries)} 条"
+        diff_lines = [f"- {d['op']} {d['path']}" for d in diff_list[:20]]
+        if len(diff_list) > 20:
+            diff_lines.append(f"- ... and {len(diff_list) - 20} more diff(s)")
+        diff_preview_str = "\n".join(diff_lines) if diff_lines else "(no changes)"
+        return {
+            "ok": True,
+            "dry_run": True,
+            "doc": doc_key,
+            "base_version_no": latest_no,
+            "would_be_version_no": (latest_no or 0) + 1,
+            "preview_doc": new_doc,
+            "content_sha256": content_sha,
+            "diff": diff_list,
+            "problems": [],
+            "warnings": val.warnings,
+            "expected_structures": expected_struct,
+            "message": (
+                f"Dry-run passed for {doc_key} (would save v{(latest_no or 0) + 1}): {ops_str}. "
+                f"{len(diff_list)} diff change(s); no DB version or files written.\n"
+                f"Diff preview:\n{diff_preview_str}\n\n{expected_struct}"
+            ),
+        }
     try:
         version_row = await db_knowledge.insert_version(
             user_id=user_id,

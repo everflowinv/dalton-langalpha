@@ -78,8 +78,8 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 
 > 子智能体没有 `knowledge_update` 与 `knowledge_append_verdict` 工具。Workflow 跑完后，必须由主智能体审读 `drafts/<D>-initial-coverage.md` 与 `research/<D>-ic/knowledge-proposal.json` 并落库（有 PM 在场时先向 PM 展示核心判断与草案摘要，无人值守自动运行时直接写入工作版本）。
 
-1. **逐个文档调用 `knowledge_update`**
-   - 新工作区文档尚不存在时传 `base_version=null` 并使用 `create` 操作；已有文档时使用 `insert` / `append` / `set`：
+1. **逐个文档调用 `knowledge_update`（草案先 `dry_run=True` 通过再正式提交）**
+   - 对 `knowledge-proposal.json` 里的每个文档，先调用 `knowledge_update(..., dry_run=True)` 校验并预览 diff 与期望结构，全部通过后再以 `dry_run=False` 正式写入；新工作区文档尚不存在时传 `base_version=null` 并使用 `create` 操作；已有文档时使用 `insert` / `append` / `set`：
      - **`company`**：写入一句话业务判断、所属行业、是否周期股，并将 `coverage_stage` 设为 `"initial"`（自动同步工作区描述）。
      - **`thesis`**：先写证据台账再定稿——写入报告第七节的 3–5 条初始 thesis 支柱（每条含主张、当前证据，以及 `confirm` / `warn` / `break` 可观测阈值）；写入首批 `evidence` 台账条目，**每条 `evidence` 必填 `figures` 数组**（每个事实数字一项，必填 `metric`〔中文或英文指标名〕、`value`、`unit`〔枚举值 `"USD"` / `"USD_mn"` / `"USD_bn"` / `"HKD"` / `"HKD_mn"` / `"HKD_bn"` / `"CNY"` / `"CNY_mn"` / `"CNY_bn"` / `"CNY_100mn"` / `"pct"` / `"bp"` / `"x"` / `"count"` / `"count_mn"` / `"per_share"` / `"other"`，百分比用 `"pct"`〕、`period`、`label`〔仅限 `"reported"` / `"company_guidance"` / `"consensus"` / `"estimate"` / `"assumption"` / `"research_judgement"`〕），且 **`source.ref` 必须指向一手文件或 `prov` 记录**（`kind="filing"` / `"provenance"` / `"model_cell"` / `"url"` 或 `research/` 下的支线原始文件，严禁指向本次初筛草稿 `drafts/<D>-initial-coverage.md`）；确保 `source.type` 与默认 `source.tier` 对应（filing=1、company_release=2、transcript=2、broker_report=3、consensus=3、official_data=4、expert=5、internal_note=5(3–5)、news=6、model=2–3 且须引用 `model_cell` 并禁标 tier 1）；写入 `house_view` 初值（`reason` ≥30 字）。证据台账落库后，用实际分配的 `evidence:E-YYYYMMDD-NN` 校验并补齐草稿末尾的 `## 引用` 表，再定稿运行 `check_draft`。
      - **`debate`**：写入报告第四节的 2–4 个核心多空分歧（分歧变量、Bull、Bear、最强反驳、我的判断、改判条件、来源）。

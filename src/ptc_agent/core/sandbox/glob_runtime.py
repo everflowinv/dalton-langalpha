@@ -31,6 +31,88 @@ def agent_glob_pattern(pattern: str) -> str:
     return pattern
 
 
+# DALTON-HOOK(glob-brace-expansion): support bash-style {a,b} brace expansion in Glob
+def _class_end(pattern: str, start: int, closes: list[int]) -> int:
+    """Index past a ``[...]`` character class starting at ``start`` (or -1 if unclosed)."""
+    n = len(pattern)
+    i = start + 1
+    if i < n and pattern[i] in "!^":
+        i += 1
+    if i < n and pattern[i] == "]":
+        i += 1
+    close = closes[i] if i <= n else n
+    return close + 1 if close < n else -1
+
+
+def _expand_once(pattern: str) -> list[str] | None:
+    """Expand the first top-level ``{a,b}`` group containing a top-level comma."""
+    if "{" not in pattern or "}" not in pattern or "," not in pattern:
+        return None
+    n = len(pattern)
+    closes = [n] * (n + 1)
+    for at in range(n - 1, -1, -1):
+        closes[at] = at if pattern[at] == "]" else closes[at + 1]
+    i = 0
+    while i < n:
+        ch = pattern[i]
+        if ch == "[":
+            end = _class_end(pattern, i, closes)
+            if end != -1:
+                i = end
+                continue
+        elif ch == "{":
+            depth = 1
+            j = i + 1
+            commas: list[int] = []
+            while j < n and depth > 0:
+                c = pattern[j]
+                if c == "[":
+                    end = _class_end(pattern, j, closes)
+                    if end != -1:
+                        j = end
+                        continue
+                elif c == "{":
+                    depth += 1
+                elif c == "}":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                elif c == "," and depth == 1:
+                    commas.append(j)
+                j += 1
+            if depth == 0 and commas:
+                prefix = pattern[:i]
+                suffix = pattern[j + 1 :]
+                parts: list[str] = []
+                last = i + 1
+                for comma_idx in commas:
+                    parts.append(pattern[last:comma_idx])
+                    last = comma_idx + 1
+                parts.append(pattern[last:j])
+                return [f"{prefix}{part}{suffix}" for part in parts]
+        i += 1
+    return None
+
+
+def expand_braces(pattern: str) -> list[str]:
+    """Expand bash-style ``{a,b}`` brace alternations in ``pattern``, preserving order and deduplicating."""
+    if "{" not in pattern or "}" not in pattern or "," not in pattern:
+        return [pattern]
+    queue = [pattern]
+    expanded: list[str] = []
+    seen: set[str] = set()
+    while queue:
+        current = queue.pop(0)
+        step = _expand_once(current)
+        if step is None:
+            if current not in seen:
+                seen.add(current)
+                expanded.append(current)
+        else:
+            queue = step + queue
+    return expanded
+
+
 def find(
     pattern: str,
     search_path: str,
@@ -47,6 +129,20 @@ def find(
     so a walk skips them unread (a readlink is local). A literal prefix that
     names one is still followed.
     """
+    # DALTON-HOOK(glob-brace-expansion): expand {a,b} alternatives, deduplicating while preserving newest-first sort
+    expanded = expand_braces(pattern)
+    if expanded != [pattern]:
+        seen: set[str] = set()
+        merged: list[str] = []
+        for sub in expanded:
+            for p in find(sub, search_path, excluded_dirs, history_children, mount):
+                if p not in seen:
+                    seen.add(p)
+                    merged.append(p)
+        try:
+            return sorted(merged, key=os.path.getmtime, reverse=True)
+        except OSError:
+            return merged
     excluded = set(excluded_dirs)
     history = {parent: set(names) for parent, names in history_children.items()}
     # ``mount`` is itself a link to the live mount under its hidden sibling,
