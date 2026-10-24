@@ -16,7 +16,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 
 - **只认公司官方来源**：仅公司 IR 新闻稿、IR Events 页面、美股 SEC 8-K/6-K 或港股/A 股交易所法定排期公告（通过 `researchdata.finance(route="cn-hk", operation="filings", ...)` 或披露易 HKEXnews 原文核实的董事会会议召期通告、定期报告预约披露时间表）明确披露未来发布日期时，才标为 `confirmed`（`date_status: confirmed`）并创建财报链自动任务。
 - **聚合日历一律标“待确认”**：FMP、yfinance、Nasdaq、Zacks、Earnings Whispers、WSJ、MarketWatch、`get_earnings_calendar` 等给出的日期只记为 `pending`（附 `tentative_date`、`tentative_sources`），`date_status: estimated`，界面与总结显示“待确认”，**在官方公布前绝不建 `tm3/t0/tp1` 自动任务**（若 `tentative_date` 在 10 天内，只建一条 T-5 的 `once` 日期复查任务，仅复查日期不做研究）。详见 [`references/classification.md`](references/classification.md)。
-- **跨工作区建任务统一调用 `dalton_schedule_automation`**：Home 的研究总监调用 `dalton_schedule_automation(action="upsert", name=..., trigger_type="once", next_run_at=..., instruction=..., description=..., timezone_name=..., workspace_id=..., ticker=...)` 创建或原地改期；分析师在本公司工作区补建时可直接写文件或调用该工具（常设授权）。标准四项自动跟踪（含 `move-up` / `move-down` 价格触发）统一通过 `dalton_coverage_tracking(action="enable", ticker=..., workspace_id=...)` 开启与恢复。
+- **跨工作区建任务统一调用 `dalton_schedule_automation`**：Home 的研究总监调用 `dalton_schedule_automation(action="upsert", name=..., trigger_type="once", next_run_at=..., instruction=..., description=..., timezone_name=..., workspace_id=..., ticker=...)` 创建或原地改期；分析师在本公司工作区补建时可直接写文件或调用该工具（常设授权）。标准四项自动跟踪（含 `move-up` / `move-down` 价格触发）在自动维护路径统一调用 `dalton_coverage_tracking(action="enable", source="coverage_finish", ticker=..., workspace_id=...)` 开启与补建（`source="coverage_finish"` 会尊重 `paused_by_user` 标记，不会重新打开用户主动暂停的跟踪和财报任务；仅当用户明确要求恢复跟踪时才传 `source="user"`）。
 - **无工作区不建链**：只为 `workspace.status=active` 的公司创建自动任务链；没有工作区的 Core 公司列入总结“缺工作区”，严禁在 Home 工作区跑出无知识层支撑的前瞻。
 
 ---
@@ -202,7 +202,7 @@ python3 .agents/skills/dalton-earnings-calendar/scripts/calendar_state.py --json
 
 ## 自动任务 JSON 模板（遵守 PK.15）
 
-> 推送由 Dalton 通知模块按用户的飞书开关统一处理，自动任务模板中不写 `"delivery"` 字段；公司价格触发任务统一由 `dalton_coverage_tracking(action="enable", ticker=..., workspace_id=...)` 管理。
+> 推送由 Dalton 通知模块按用户的飞书开关统一处理，自动任务模板中不写 `"delivery"` 字段；公司价格触发任务在自动维护时统一由 `dalton_coverage_tracking(action="enable", source="coverage_finish", ticker=..., workspace_id=...)` 管理（仅在用户明确要求恢复跟踪时传 `source="user"`）。
 
 ### 1. 每周日历维护（`dalton-earnings-calendar.json`，Home 工作区）
 

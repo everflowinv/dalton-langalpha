@@ -81,7 +81,7 @@ Workflow 完成后，研究总监在 Home 执行收尾动作：
 2. **追加重点议程备注**：
    - 对本周出现重大异动、证据缺口或需要下周重点跟踪的问题，调用研究总监工具 `dalton_agenda_note` 追加到对应公司的 `agenda` 中。
 3. **汇报完成前必须过完成契约（`dalton_check_done`）**：
-   - 在 Home 调用 `dalton_check_done(workflow="weekly-coverage-review", run_id=<`dalton/research/weekly-<end>/.progress.json` 里的 run_id>, params={<启动时的同一组参数，含 end>})`（研究总监角色只能核对 `weekly-coverage-review`；`workflow.enabled` 已关闭、手动执行时不传 `run_id`）；
+   - 在 Home 调用 `dalton_check_done(workflow="weekly-coverage-review", run_id=<`dalton/research/weekly-<end>/.progress.json` 里的 run_id>, params={"home_dir": "dalton", "end": "<YYYY-MM-DD>", "coverage_path": "dalton/coverage.yaml"})`（研究总监角色只能核对 `weekly-coverage-review`；`workflow.enabled` 已关闭、手动执行时不传 `run_id`，在 `params` 中加 `"manual": true`）；
    - `done=false` 时按 `missing` 先补齐再查（`screen.json`、`attribution.json`、`core-*.md`、周会稿均须存在且非占位）；补不了的只能汇报"未完成"并列出缺项，不得汇报"完成"。
 4. **统计与推送 PM**（完成契约通过后）：
    - 统计全覆盖公司本周事件五词（`NO_CHANGE` / `THESIS_STRENGTHENED` / `THESIS_WEAKENED` / `THESIS_BROKEN` / `NEW_THESIS`）分布；
