@@ -122,19 +122,7 @@ COMMUNITY_SIGTERM_GRACE_S: float = 5.0
 UPSTREAM_GENERIC_COMMUNITY_PARAMS: frozenset[str] = frozenset(
     {
         "mode",
-        "limit",
         "timeout",
-        "series",
-        "concept",
-        "item",
-        "document",
-        "form",
-        "dataset",
-        "start",
-        "end",
-        "as_of",
-        "vintage",
-        "params",
     }
 )
 
@@ -1051,20 +1039,24 @@ class BridgeConfig:
 
 
 RESEARCH_EVIDENCE_AND_ROUTE_GUIDE: str = (
-    '各来源提供什么证据：事实 → filings/公司公告（dalton_sec / finance(route="sec") / get_sec_filing）；'
-    "解读 → alphaengine 卖方研报与会议纪要；一线视角 → guidepoint 专家访谈；"
-    "管理层原话 → transcript 业绩会转写稿；日常信息流 → sales-notes / tmtb / funda-ai；"
-    "市场在反应什么 → X（x-api 技能）与网页新闻（WebSearch）；"
-    "all 覆盖本地四库（company-wiki + sales-notes + tmtb + funda-ai）外加并行的 AlphaEngine 与 Guidepoint 检索（不含 transcript）。\n"
+    '各来源提供什么证据：事实 → filings（finance(route="sec")）；'
+    "解读 → alphaengine；一线 → guidepoint；管理层原话 → transcript；日常信息流 → sales-notes/tmtb/funda-ai；"
+    "市场反应 → X/WebSearch。\n"
     "何时选用哪个路由（按研究情境，基于 catalog）：\n"
-    "- 需要卖方观点、研报、会议纪要、目标价与预测变化 → alphaengine：卖方研报与会议纪要（来源：AlphaEngine，先 search_library 再 get_document）；\n"
-    "- 需要行业一线的专业判断与经营反馈（供应链、渠道、客户、竞品、技术路线） → guidepoint：专家访谈与一线经营反馈（来源：Guidepoint）；\n"
-    "- 需要管理层原话与业绩会口径 → transcript：业绩电话会转写稿（来源：AlphaEngine 业绩会 ASR 稿（主）/ roic.ai（兜底））；\n"
-    "- 需要已入库的公司与行业历史沉淀资料 → company-wiki：已入库公司与行业资料（来源：本地 company-wiki，只读，params.company=TICKER）；\n"
-    "- 需要交易台反馈、买方预期（bogey/whisper）、卖方销售邮件与市场摘要 → sales-notes：卖方销售邮件与市场摘要（来源：本地 market-digest 私有库）；\n"
-    "- 需要 TMT 行业每日焦点与科技股卖方观点汇编 → tmtb：TMT Breakout 本地原文缓存（来源：AlphaEngine TMTB 已入库副本）；\n"
-    "- 需要独立研究机构 FUNDA AI 的深度邮件与图表 → funda-ai：FUNDA AI 原邮件与图表（来源：fundaai@substack.com，MBOX 历史及 Gmail 增量，独立本地库）；\n"
-    "- 不确定资料在哪个库，或需一次全面初筛 → all：内部研究资料跨库检索（本地库 company-wiki + sales-notes + tmtb + funda-ai，外加并行的 AlphaEngine 与 Guidepoint 检索；不含 transcript 电话会转写稿，需查电话会时单独调用 transcript）。"
+    "- 卖方观点与研报 → alphaengine（先 search_library 再 get_document）；\n"
+    "- 行业一线反馈 → guidepoint；\n"
+    "- 管理层口径 → transcript（AlphaEngine 业绩会转写；无匹配时用 | 分隔中英文公司名重试或扩大 start/end）；\n"
+    "- 历史沉淀 → company-wiki（只读，params.company=TICKER）；\n"
+    "- 交易台与买方预期 → sales-notes；\n"
+    "- TMT 焦点 → tmtb；\n"
+    "- 独立研究 → funda-ai；\n"
+    "- 跨库初筛 → all（company-wiki + sales-notes + tmtb + funda-ai，并行检索 AlphaEngine 与 Guidepoint；不含 transcript）。"
+)
+
+ERROR_HANDLING_CONTRACT_NOTE: str = (
+    "错误处理契约：`ok: false` 不等于“没有数据”，表示调用失败（`error` 标明“参数错误 / 上游不可用 / 权限或额度 / 没有匹配”四类之一），"
+    "必须按 `hint` 处理（换参数、换 operation、换数据源重试）；处理不了必须在报告里写明该数据源取数失败，禁止写成“没有相关信息”。"
+    "真正的“没有匹配”返回 `ok: true` 加空结果与 `empty_reason`。不确定参数时先查 `catalog(route=...)`。"
 )
 
 
@@ -1075,21 +1067,23 @@ def build_researchdata_plugin_instruction() -> str:
     """
     return (
         "Fund-internal sources; call from execute_code only (no direct path). "
-        "Start with `catalog()` once per thread to see routes. "
+        "Start with `catalog()` or `catalog(route=...)` when unsure about route parameters. "
         "Research: `research(route=..., operation=..., query=..., start=YYYY-MM-DD, end=..., limit=...)`. "
         f"{RESEARCH_EVIDENCE_AND_ROUTE_GUIDE.replace(chr(10), ' ')} "
         'Finance: `finance(route="sec"|"estimates"|"cn-hk")`. '
-        'Macro: `macro(route="fred"|"treasury")`. '
+        'Macro: `macro(route="fred"|"treasury"|"market-regime")`. '
         "Read only ids that search returned (`wiki:`, `mail:`, `tmtb:`, `funda:`, `alphaengine` doc_id). "
         "Page long text with params.offset/max_chars (offset >= 0, max_chars 1-30000). "
         "Leave `timeout` unset: the bridge sets per-route limits and long reads may take minutes. "
         "AlphaEngine 检索可以放开，全文阅读（get_document）计配额，读最相关的几篇。"
-        "Every result has `_sources` (identity, document_id, as_of, url). "
+        "Every result has `_sources` (identity, document_id, as_of, url) and `normalized_params`. "
         "Cite with identity, publisher and date. Expert calls: identity, not name. "
         "Guidepoint verbatim <=20 words. "
         "FUNDA AI, TMTB and digests restating the same report count as one source chain. "
         "Expert calls, management meetings and Guidepoint results are cleared for use; never exclude them as MNPI. "
         "The fund wiki is read-only; never try to write to it. "
+        "`ok: false` is NEVER 'no data': follow `hint` to retry/switch route or report the source failure explicitly. "
+        "True no-match returns `ok: true` with empty results and `empty_reason`. "
         '`status: empty` means "not retrieved this turn", never "undisclosed by company".'
     )
 
@@ -1103,11 +1097,12 @@ MAX_CHARS_CEILING: int = 30000
 TRANSCRIPT_QUERY_IGNORED_NOTE: str = (
     "transcript 的 query 只用来传公司名，主题检索请在拿到 doc_id 后读正文。"
 )
-TRANSCRIPT_ROIC_403_ERROR: str = "AlphaEngine 无匹配，roic 回退已不可用。"
-TRANSCRIPT_ROIC_403_HINT: str = "用公司名（| 分隔中英文）重试，或者扩大 start/end。"
+TRANSCRIPT_NO_MATCH_HINT: str = (
+    "业绩会转写仅来自 AlphaEngine，当前无匹配记录；请换公司名（中英文用 | 分隔，如 query='腾讯|Tencent'）重试，或者扩大 start/end 时间范围。"
+)
 TRANSCRIPT_CATALOG_RULE: str = (
-    "transcript 的 query 只用来传公司名（可用 | 分隔中英文，给了 ticker 时勿传主题词查询），"
-    "主题检索请在拿到 doc_id 后读正文；roic 回退已不可用（403），无匹配时用公司名（| 分隔中英文）重试或扩大 start/end。"
+    "业绩会转写仅来自 AlphaEngine；ticker 必填，query 只用来传公司名补充（中英文用 | 分隔，勿传主题词），"
+    "主题检索请在拿到 doc_id 后读正文；没有匹配时，换公司名（中英文用 | 分隔）重试，或者扩大 start/end 时间范围。"
 )
 INTERNAL_LIBRARY_PAGINATION_RULE: str = (
     "正文分页参数范围：params.offset >= 0，params.max_chars 为 1–30000（超出 30000 自动截断为 30000）；"
@@ -1129,10 +1124,6 @@ _TRANSCRIPT_TOPIC_ZH_KEYWORDS: tuple[str, ...] = (
     "资本开支",
     "营收",
     "利润率",
-)
-_ROIC_403_TEXT_RE = re.compile(
-    r"403(?:\s*:?\s*|\s+client\s+error:\s*)forbidden",
-    re.IGNORECASE,
 )
 
 
@@ -1162,62 +1153,42 @@ def _is_topic_query_for_transcript(query: str) -> bool:
     return any(kw in q for kw in _TRANSCRIPT_TOPIC_ZH_KEYWORDS)
 
 
-def _rewrite_transcript_roic_403(payload: dict[str, Any]) -> None:
-    """Rewrite error and hint when structured fallback/source is `roic` and status is 403 / `403 Forbidden`."""
-    if payload.get("ok") is not False:
-        return
-    data_dict = payload.get("data") if isinstance(payload.get("data"), dict) else {}
-    fallback_obj = (
-        payload.get("fallback") if "fallback" in payload else data_dict.get("fallback")
-    )
-    fallback_dict = fallback_obj if isinstance(fallback_obj, dict) else {}
+CATALOG_DESCRIPTION_SUFFIX: str = (
+    "\n\nNote: 何时使用：不确定任何工具或路由的必填/可选参数、日期与股票代码格式、返回结构或调用示例时，"
+    "先调用 `catalog(route=...)` 或 `catalog(category=...)` 查询完整参数表。"
+    "`ok: false` 不等于“没有数据”，表示调用失败，须按 `hint` 处理。"
+)
 
-    role_candidates: list[str] = []
-    if isinstance(fallback_obj, str):
-        role_candidates.append(fallback_obj)
-    for d in (payload, data_dict, fallback_dict):
-        for k in ("fallback", "argv_role", "source"):
-            val = d.get(k)
-            if isinstance(val, str):
-                role_candidates.append(val)
+FINANCE_DESCRIPTION_SUFFIX: str = (
+    "\n\nNote: 何时使用：查美股 SEC 公告与 XBRL 财务（route=\"sec\"）、卖方一致预期（route=\"estimates\"）、"
+    "港股与 A 股公告及财务问答（route=\"cn-hk\"，港股代码 5 位如 \"00700\"）。"
+    "不确定各操作必填参数或格式时先查 `catalog(route=...)`。"
+    "`ok: false` 不等于“没有数据”，必须按 `hint` 修正参数或换数据源重试；真无匹配返回 `ok: true` + `empty_reason`。"
+)
 
-    is_roic = any(
-        c.strip().lower() in ("roic", "roic.ai", "fallback_roic")
-        for c in role_candidates
-    )
-    if not is_roic:
-        return
+MACRO_DESCRIPTION_SUFFIX: str = (
+    "\n\nNote: 何时使用：查 FRED 宏观经济序列（route=\"fred\"）、美国财政部 TGA/国债数据（route=\"treasury\"）、"
+    "大盘温度/顶底信号/拥挤度/两融杠杆（route=\"market-regime\"）。"
+    "不确定必填参数（如 fred/treasury 必填 start/end）时先查 `catalog(route=...)`。"
+    "`ok: false` 不等于“没有数据”，必须按 `hint` 处理；真无匹配返回 `ok: true` + `empty_reason`。"
+)
 
-    has_403_status = any(
-        (isinstance(d.get(k), int) and not isinstance(d.get(k), bool) and d.get(k) == 403)
-        or (isinstance(d.get(k), str) and d.get(k).strip() == "403")
-        for d in (payload, data_dict, fallback_dict)
-        for k in ("status_code", "http_status", "code")
-    )
-    has_403_error_text = any(
-        isinstance(d.get(k), str) and bool(_ROIC_403_TEXT_RE.search(d[k]))
-        for d in (payload, data_dict, fallback_dict)
-        for k in ("error", "stderr", "message")
-    )
-    if has_403_status or has_403_error_text:
-        payload["error"] = TRANSCRIPT_ROIC_403_ERROR
-        payload["hint"] = TRANSCRIPT_ROIC_403_HINT
-        if isinstance(payload.get("data"), dict):
-            payload["data"]["error"] = TRANSCRIPT_ROIC_403_ERROR
-            payload["data"]["hint"] = TRANSCRIPT_ROIC_403_HINT
-
+RESEARCH_ROUTE_PARAM_CONTRACT_SUFFIX: str = (
+    "\n不确定参数时先查 `catalog(route=...)`（全文分页 params.offset >= 0，params.max_chars 为 1–30000）。"
+    "`ok: false` 不等于“没有数据”，必须按 `hint` 处理；真无匹配返回 `ok: true` + `empty_reason`。"
+)
 
 COMMUNITY_DESCRIPTION_SUFFIX: str = (
-    "\n\n社区与另类数据路由（由 bridge 执行）：\n"
-    "- xueqiu（雪球讨论与个股情绪）：operation ∈ {posts, post, comments, search, user}；"
-    "参数：ticker（如 00700、06181、SH600519、SZ300750）、url（仅限 xueqiu.com）、post_id、query、pages（1-3）。\n"
-    "- employee（员工评论 Blind / Indeed / Glassdoor）：operation ∈ {blind, summary, indeed, glassdoor}；"
-    "参数：company、url（仅限 glassdoor.com）、pages（blind/indeed 1-3，summary 1-40）、allow_paid（bool，indeed/glassdoor 必须显式传 allow_paid=True）。\n"
-    "- last30days（跨平台社区情绪 Reddit / X / StockTwits / Polymarket）："
-    "参数：query、days（1-30，默认 30）、quick（bool）、plan（可选对象，每个 subquery 须含 search_query 与 ranking_query）。\n"
-    "- x-timeline（X 固定账号时间线）：operation ∈ {tweets, tweet, thread, search}（默认 tweets）；"
-    "参数：handle（tweets 必填，接受 @user / user / x.com 主页 URL）、url 或 tweet_id（tweet/thread 必填，仅限 x.com / twitter.com）、"
-    "query（search 必填，时间窗用 since/until 写入 query）、since / until（YYYY-MM-DD）、count（1-100，默认 20）、include_replies（bool，仅 tweets）。\n"
+    "\n\nNote: 何时使用：查雪球讨论与个股情绪（route=\"xueqiu\"）、员工评价 Blind/Indeed/Glassdoor（route=\"employee\"）、"
+    "近30天跨平台社区情绪（route=\"last30days\"）、X 账号时间线与检索（route=\"x-timeline\"）。"
+    "不确定参数时先查 `catalog(route=...)`。"
+    "`ok: false` 不等于“没有数据”，必须按 `hint` 处理；真无匹配返回 `ok: true` + `empty_reason`。"
+)
+
+NEWS_DESCRIPTION_SUFFIX: str = (
+    "\n\nNote: 何时使用：web-news/web-page/x-search 在 LangAlpha 中已禁用（返回 handoff_filtered）；"
+    "网页新闻请改用内置 WebSearch/WebFetch，X 检索请改用 `community(route=\"x-timeline\")`。"
+    "不确定参数时先查 `catalog(route=...)`；`ok: false` 不等于“没有数据”，须按 `hint` 切换工具。"
 )
 
 COMMUNITY_CATALOG_ROUTE_SPECS: dict[str, dict[str, Any]] = {
@@ -1300,6 +1271,2123 @@ COMMUNITY_CATALOG_ROUTE_SPECS: dict[str, dict[str, Any]] = {
         ],
     },
 }
+
+# Canonical parameter alias mapping table at the bridge entry point.
+# Maps common caller aliases to the interface's real canonical parameter names.
+PARAM_ALIAS_TABLE: dict[str, str] = {
+    # Stock / security code aliases -> canonical `ticker`
+    "symbol": "ticker",
+    "code": "ticker",
+    "stock": "ticker",
+    "stock_code": "ticker",
+    "sec_code": "ticker",
+    "security": "ticker",
+    # Date window aliases -> canonical `start` / `end`
+    "from": "start",
+    "from_": "start",
+    "from_date": "start",
+    "date_from": "start",
+    "start_date": "start",
+    "begin": "start",
+    "begin_date": "start",
+    "since": "start",
+    "to": "end",
+    "to_date": "end",
+    "date_to": "end",
+    "end_date": "end",
+    "until": "end",
+    # Search query aliases -> canonical `query`
+    "q": "query",
+    "keyword": "query",
+    "keywords": "query",
+    "search_query": "query",
+    "term": "query",
+    "question": "query",
+    "topic": "query",
+    # Operation aliases -> canonical `operation`
+    "op": "operation",
+    "action": "operation",
+    "method": "operation",
+    "subcommand": "operation",
+    "cmd": "operation",
+    # Route aliases -> canonical `route`
+    "source": "route",
+    "channel": "route",
+    "provider": "route",
+    # Document ID aliases -> canonical `document`
+    "doc_id": "document",
+    "document_id": "document",
+    "doc": "document",
+    "id": "document",
+    "accession": "document",
+    "accession_number": "document",
+    "file_id": "document",
+    # Result limit aliases -> canonical `limit`
+    "max_results": "limit",
+    "size": "limit",
+    "n": "limit",
+    "top_k": "limit",
+    "num_results": "limit",
+    "per_page": "limit",
+    "count": "limit",
+    # SEC / finance parameter aliases
+    "form_type": "form",
+    "filing_type": "form",
+    "report_type": "form",
+    "section": "item",
+    "item_no": "item",
+    "part_item": "item",
+    "xbrl_tag": "concept",
+    "metric": "concept",
+    "account": "concept",
+    "as_of_date": "as_of",
+    "point_in_time": "as_of",
+    # Macro parameter aliases
+    "series_id": "series",
+    "indicator": "series",
+    "fred_series": "series",
+    "vintage_date": "vintage",
+    "realtime_start": "vintage",
+    "table": "dataset",
+    "dataset_name": "dataset",
+    # Community parameter aliases
+    "user": "handle",
+    "username": "handle",
+    "screen_name": "handle",
+    "author": "handle",
+    "status_id": "post_id",
+    "discussion_id": "post_id",
+    "lookback_days": "days",
+    "window_days": "days",
+    "page_count": "pages",
+    "page": "pages",
+    "firm": "company",
+    "employer": "company",
+}
+
+
+def _alias_prop(prop_type: str, target_desc: str) -> dict[str, Any]:
+    return {"type": prop_type, "description": f"Alias for {target_desc}."}
+
+
+_COMMON_ROUTE_ALIAS_PROPS: dict[str, dict[str, Any]] = {
+    k: _alias_prop("string", "'route'") for k in ("source", "channel", "provider")
+}
+_COMMON_OP_ALIAS_PROPS: dict[str, dict[str, Any]] = {
+    k: _alias_prop("string", "'operation'")
+    for k in ("op", "action", "method", "subcommand", "cmd")
+}
+_COMMON_TICKER_ALIAS_PROPS: dict[str, dict[str, Any]] = {
+    k: _alias_prop("string", "'ticker'")
+    for k in ("symbol", "code", "stock", "stock_code", "sec_code", "security")
+}
+_COMMON_DATE_ALIAS_PROPS: dict[str, dict[str, Any]] = {
+    **{
+        k: _alias_prop("string", "'start' (or 'since' on x-timeline), YYYY-MM-DD")
+        for k in ("from", "from_date", "date_from", "start_date", "begin", "begin_date", "since")
+    },
+    **{
+        k: _alias_prop("string", "'end' (or 'until' on x-timeline), YYYY-MM-DD")
+        for k in ("to", "to_date", "date_to", "end_date", "until")
+    },
+}
+_COMMON_QUERY_ALIAS_PROPS: dict[str, dict[str, Any]] = {
+    k: _alias_prop("string", "'query'")
+    for k in ("q", "keyword", "keywords", "search_query", "term", "question", "topic")
+}
+_COMMON_LIMIT_ALIAS_PROPS: dict[str, dict[str, Any]] = {
+    k: _alias_prop("integer", "'limit' (or 'count' on x-timeline, 'top' on market-regime)")
+    for k in ("max_results", "size", "n", "top_k", "num_results", "per_page", "count")
+}
+_COMMON_DOC_ALIAS_PROPS: dict[str, dict[str, Any]] = {
+    k: _alias_prop("string", "'document' (or 'params.doc_id' on alphaengine)")
+    for k in ("doc_id", "document_id", "doc", "id", "accession", "accession_number", "file_id")
+}
+
+TOOL_SCHEMA_ALIAS_PROPERTIES: dict[str, dict[str, dict[str, Any]]] = {
+    "catalog": {
+        **_COMMON_ROUTE_ALIAS_PROPS,
+    },
+    "finance": {
+        **_COMMON_ROUTE_ALIAS_PROPS,
+        **_COMMON_OP_ALIAS_PROPS,
+        **_COMMON_TICKER_ALIAS_PROPS,
+        **_COMMON_DATE_ALIAS_PROPS,
+        **_COMMON_QUERY_ALIAS_PROPS,
+        **_COMMON_LIMIT_ALIAS_PROPS,
+        **_COMMON_DOC_ALIAS_PROPS,
+        **{k: _alias_prop("string", "'form'") for k in ("form_type", "filing_type", "report_type")},
+        **{k: _alias_prop("string", "'item'") for k in ("section", "item_no", "part_item")},
+        **{k: _alias_prop("string", "'concept'") for k in ("xbrl_tag", "metric", "account")},
+        **{k: _alias_prop("string", "'as_of'") for k in ("as_of_date", "point_in_time")},
+    },
+    "macro": {
+        **_COMMON_ROUTE_ALIAS_PROPS,
+        **_COMMON_OP_ALIAS_PROPS,
+        **_COMMON_DATE_ALIAS_PROPS,
+        **_COMMON_QUERY_ALIAS_PROPS,
+        **_COMMON_LIMIT_ALIAS_PROPS,
+        **_COMMON_TICKER_ALIAS_PROPS,
+        **{k: _alias_prop("string", "'series'") for k in ("series_id", "indicator", "fred_series")},
+        **{k: _alias_prop("string", "'vintage'") for k in ("vintage_date", "realtime_start")},
+        **{k: _alias_prop("string", "'dataset'") for k in ("table", "dataset_name")},
+    },
+    "research": {
+        **_COMMON_ROUTE_ALIAS_PROPS,
+        **_COMMON_OP_ALIAS_PROPS,
+        **_COMMON_TICKER_ALIAS_PROPS,
+        **_COMMON_DATE_ALIAS_PROPS,
+        **_COMMON_QUERY_ALIAS_PROPS,
+        **_COMMON_LIMIT_ALIAS_PROPS,
+        **_COMMON_DOC_ALIAS_PROPS,
+    },
+    "community": {
+        **_COMMON_ROUTE_ALIAS_PROPS,
+        **_COMMON_OP_ALIAS_PROPS,
+        **_COMMON_TICKER_ALIAS_PROPS,
+        **_COMMON_DATE_ALIAS_PROPS,
+        **_COMMON_QUERY_ALIAS_PROPS,
+        **_COMMON_LIMIT_ALIAS_PROPS,
+        **_COMMON_DOC_ALIAS_PROPS,
+        **{k: _alias_prop("string", "'company' on employee") for k in ("firm", "employer")},
+        **{
+            k: _alias_prop("string", "'handle' on x-timeline")
+            for k in ("user", "username", "screen_name", "author", "account")
+        },
+        **{
+            k: _alias_prop("string", "'post_id' on xueqiu or 'tweet_id' on x-timeline")
+            for k in ("status_id", "discussion_id")
+        },
+        **{k: _alias_prop("integer", "'days' on last30days") for k in ("lookback_days", "window_days")},
+        **{k: _alias_prop("integer", "'pages' on xueqiu/employee") for k in ("page_count", "page")},
+    },
+}
+
+KNOWN_SCHEMA_TOP_LEVEL_KEYS: frozenset[str] = frozenset(
+    {
+        "route",
+        "operation",
+        "ticker",
+        "query",
+        "series",
+        "concept",
+        "item",
+        "document",
+        "form",
+        "dataset",
+        "start",
+        "end",
+        "as_of",
+        "vintage",
+        "limit",
+        "timeout",
+        "mode",
+        "params",
+        "top",
+        "order",
+        "category",
+        "url",
+        "post_id",
+        "company",
+        "pages",
+        "allow_paid",
+        "days",
+        "quick",
+        "plan",
+        "handle",
+        "tweet_id",
+        "since",
+        "until",
+        "count",
+        "include_replies",
+    }
+)
+
+ROUTE_CONTRACT_SPECS: dict[str, dict[str, Any]] = {
+    "sec": {
+        "tool": "finance",
+        "category": "finance",
+        "operations": [
+            "list-filings",
+            "financials",
+            "ratios",
+            "facts",
+            "smart-facts",
+            "search-concepts",
+            "search-text",
+            "read-item",
+            "attachments",
+            "eight-k",
+            "insider",
+        ],
+        "default_operation": "list-filings",
+        "operation_aliases": {
+            "list_filings": "list-filings",
+            "filings": "list-filings",
+            "list": "list-filings",
+            "smart_facts": "smart-facts",
+            "smartfacts": "smart-facts",
+            "search_concepts": "search-concepts",
+            "search_text": "search-text",
+            "search": "search-text",
+            "read_item": "read-item",
+            "read": "read-item",
+            "eight_k": "eight-k",
+            "8-k": "eight-k",
+            "8k": "eight-k",
+        },
+        "accepted_params": [
+            "ticker",
+            "query",
+            "concept",
+            "item",
+            "document",
+            "as_of",
+            "form",
+            "limit",
+        ],
+        "accepted_nested_params": [],
+        "required_params": {
+            "list-filings": ["ticker"],
+            "financials": ["ticker"],
+            "ratios": ["ticker"],
+            "facts": ["ticker", "concept"],
+            "smart-facts": ["ticker", "query"],
+            "search-concepts": ["ticker", "query"],
+            "search-text": ["ticker", "query"],
+            "read-item": ["ticker", "item"],
+            "attachments": ["ticker"],
+            "eight-k": ["ticker"],
+            "insider": ["ticker"],
+        },
+        "optional_params": ["form", "document", "as_of", "limit"],
+        "param_formats": {
+            "ticker": "美股代码（如 'META'、'NVDA'）",
+            "query": "检索关键词（smart-facts / search-concepts / search-text 必填）",
+            "as_of": "YYYY-MM-DD",
+            "form": "10-K | 10-Q | 8-K | 20-F | 4",
+            "item": "SEC 章节号（如 '1A'、'7'、'2.02'）",
+        },
+        "return_shape": "{\"ok\": true, \"status\": \"ok\", \"ticker\": \"META\", \"rows\"|\"data\": ..., \"_sources\": [...], \"normalized_params\": {...}}",
+        "examples": [
+            "finance(route=\"sec\", operation=\"financials\", ticker=\"META\", form=\"10-K\", limit=5)",
+            "finance(route=\"sec\", operation=\"smart-facts\", ticker=\"META\", query=\"revenue advertising\", limit=10)",
+            "finance(route=\"sec\", operation=\"read-item\", ticker=\"META\", form=\"10-K\", item=\"7\")",
+        ],
+    },
+    "estimates": {
+        "tool": "finance",
+        "category": "finance",
+        "operations": ["consensus"],
+        "default_operation": "consensus",
+        "operation_aliases": {
+            "estimates": "consensus",
+            "estimate": "consensus",
+            "get": "consensus",
+        },
+        "accepted_params": ["ticker", "limit"],
+        "accepted_nested_params": [],
+        "required_params": {"consensus": ["ticker"]},
+        "optional_params": ["operation", "limit"],
+        "param_formats": {
+            "ticker": "美股代码（如 'META'、'NVDA'）",
+        },
+        "return_shape": "{\"ok\": true, \"status\": \"ok\", \"ticker\": \"META\", \"data\": {\"consensus\": ...}, \"_sources\": [...], \"normalized_params\": {...}}",
+        "examples": [
+            "finance(route=\"estimates\", operation=\"consensus\", ticker=\"META\")",
+        ],
+    },
+    "cn-hk": {
+        "tool": "finance",
+        "category": "finance",
+        "operations": ["ask", "filings"],
+        "default_operation": "filings",
+        "operation_aliases": {
+            "list-filings": "filings",
+            "list_filings": "filings",
+            "list": "filings",
+            "qa": "ask",
+            "query": "ask",
+            "search": "ask",
+        },
+        "accepted_params": ["ticker", "query", "start", "end", "limit"],
+        "accepted_nested_params": [],
+        "required_params": {
+            "filings": ["ticker", "start", "end"],
+            "ask": ["query"],
+        },
+        "optional_params": ["operation", "ticker", "start", "end", "limit"],
+        "param_formats": {
+            "ticker": "港股用 5 位数字 '00700'（勿写 '0700.HK'，桥接层自动转为 '00700'）；A 股用 6 位数字 '600519'/'300750'",
+            "start": "YYYY-MM-DD（filings 必填）",
+            "end": "YYYY-MM-DD（filings 必填）",
+        },
+        "return_shape": "{\"ok\": true, \"status\": \"ok\", \"ticker\": \"00700\", \"rows\"|\"data\": ..., \"_sources\": [...], \"normalized_params\": {...}}",
+        "examples": [
+            "finance(route=\"cn-hk\", operation=\"filings\", ticker=\"00700\", start=\"2026-01-01\", end=\"2026-10-23\", limit=10)",
+            "finance(route=\"cn-hk\", operation=\"ask\", ticker=\"00700\", query=\"2026Q2 游戏收入与毛利率\")",
+        ],
+    },
+    "fred": {
+        "tool": "macro",
+        "category": "macro",
+        "operations": ["macro"],
+        "default_operation": "macro",
+        "operation_aliases": {
+            "fred": "macro",
+            "series": "macro",
+            "get": "macro",
+        },
+        "accepted_params": ["series", "start", "end", "vintage", "limit"],
+        "accepted_nested_params": [],
+        "required_params": {"macro": ["series", "start", "end"]},
+        "optional_params": ["operation", "vintage", "limit"],
+        "param_formats": {
+            "series": "FRED 序列 ID（如 'DGS10'、'SOFR'、'CPIAUCSL'）",
+            "start": "YYYY-MM-DD（必填）",
+            "end": "YYYY-MM-DD（必填）",
+            "vintage": "YYYY-MM-DD（可选）",
+        },
+        "return_shape": "{\"ok\": true, \"status\": \"ok\", \"series\": \"DGS10\", \"rows\": [{\"observation_date\": \"YYYY-MM-DD\", \"value\": ...}], \"_sources\": [...]}",
+        "examples": [
+            "macro(route=\"fred\", operation=\"macro\", series=\"DGS10\", start=\"2026-01-01\", end=\"2026-10-23\")",
+        ],
+    },
+    "treasury": {
+        "tool": "macro",
+        "category": "macro",
+        "operations": ["treasury"],
+        "default_operation": "treasury",
+        "operation_aliases": {
+            "get": "treasury",
+            "query": "treasury",
+        },
+        "accepted_params": ["dataset", "start", "end", "limit"],
+        "accepted_nested_params": [],
+        "required_params": {"treasury": ["dataset", "start", "end"]},
+        "optional_params": ["operation", "limit"],
+        "param_formats": {
+            "dataset": "美国财政部数据集名：'tga' | 'debt'",
+            "start": "YYYY-MM-DD（必填）",
+            "end": "YYYY-MM-DD（必填）",
+        },
+        "return_shape": "{\"ok\": true, \"status\": \"ok\", \"dataset\": \"tga\", \"rows\": [...], \"_sources\": [...]}",
+        "examples": [
+            "macro(route=\"treasury\", operation=\"treasury\", dataset=\"tga\", start=\"2026-01-01\", end=\"2026-10-23\", limit=20)",
+        ],
+    },
+    "market-regime": {
+        "tool": "macro",
+        "category": "macro",
+        "operations": ["snapshot", "us_topbottom", "crowding", "cn_leverage"],
+        "default_operation": "snapshot",
+        "operation_aliases": {
+            "us-topbottom": "us_topbottom",
+            "topbottom": "us_topbottom",
+            "cn-leverage": "cn_leverage",
+            "leverage": "cn_leverage",
+        },
+        "accepted_params": ["top", "order", "category", "query", "limit", "params"],
+        "accepted_nested_params": [
+            "top",
+            "order",
+            "category",
+            "query",
+            "limit",
+            "operation",
+        ],
+        "required_params": {
+            "snapshot": [],
+            "us_topbottom": [],
+            "crowding": [],
+            "cn_leverage": [],
+        },
+        "optional_params": ["operation", "top", "order", "category", "query"],
+        "param_formats": {
+            "top": "整数 1-30（默认 10，仅 crowding）",
+            "order": "'high' | 'low'（默认 'high'，仅 crowding）",
+        },
+        "return_shape": "{\"ok\": true, \"status\": \"ok\", \"route\": \"market-regime\", \"operation\": \"snapshot\", \"date\": \"YYYY-MM-DD\", \"stale\": false, \"warnings\": [...], \"_sources\": [...]}",
+        "examples": [
+            "macro(route=\"market-regime\", operation=\"snapshot\")",
+            "macro(route=\"market-regime\", operation=\"crowding\", top=10, order=\"high\")",
+        ],
+    },
+    "all": {
+        "tool": "research",
+        "category": "research",
+        "operations": ["search", "read", "list", "get_document"],
+        "default_operation": "search",
+        "operation_aliases": {
+            "query": "search",
+            "get": "read",
+            "read_document": "read",
+        },
+        "accepted_params": [
+            "query",
+            "ticker",
+            "start",
+            "end",
+            "document",
+            "limit",
+            "params",
+        ],
+        "accepted_nested_params": [
+            "company",
+            "sector",
+            "tag",
+            "sender",
+            "layer",
+            "sources",
+            "search_mode",
+            "no_decay",
+            "offset",
+            "max_chars",
+            "media",
+            "indexed_since",
+            "keywords",
+            "recency_bias",
+        ],
+        "required_params": {
+            "search": ["query 或 ticker"],
+            "read": ["document"],
+            "list": [],
+        },
+        "optional_params": ["start", "end", "limit", "params"],
+        "param_formats": {
+            "ticker": "股票代码（如 'META'、'0700.HK'、'300750.SZ'）",
+            "start": "YYYY-MM-DD",
+            "end": "YYYY-MM-DD",
+            "document": "带库前缀的文档 ID（如 'wiki:123'、'mail:456'、'tmtb:789'、'funda:10'）",
+            "params": "{\"offset\": >=0, \"max_chars\": 1..30000, \"sources\": [...], \"layer\": \"raw\"|\"digest\"}",
+        },
+        "return_shape": "{\"ok\": true, \"status\": \"ok\", \"results\": [...], \"result_count\": int, \"alphaengine\": {...}, \"guidepoint\": {...}, \"source_status\": {...}, \"_sources\": [...]}",
+        "examples": [
+            "research(route=\"all\", operation=\"search\", query=\"META Reels AI\", ticker=\"META\", start=\"2026-01-01\", end=\"2026-10-23\", limit=10)",
+            "research(route=\"all\", operation=\"read\", document=\"mail:111154\", params={\"offset\": 0, \"max_chars\": 30000})",
+        ],
+    },
+    "alphaengine": {
+        "tool": "research",
+        "category": "research",
+        "operations": ["search_library", "get_document", "auth_status", "list_filters"],
+        "default_operation": "search_library",
+        "operation_aliases": {
+            "search": "search_library",
+            "query": "search_library",
+            "read": "get_document",
+            "read_document": "get_document",
+            "get": "get_document",
+        },
+        "accepted_params": ["query", "start", "end", "limit", "params", "document", "ticker"],
+        "accepted_nested_params": [
+            "doc_id",
+            "query",
+            "sort",
+            "limit",
+            "date_from",
+            "date_to",
+            "type_ids",
+            "source_names",
+            "companies",
+            "industries",
+            "include_snippets",
+            "page",
+            "pages",
+            "offset",
+            "max_chars",
+        ],
+        "required_params": {
+            "search_library": ["query"],
+            "get_document": ["params.doc_id（或顶层 document）"],
+            "auth_status": [],
+            "list_filters": [],
+        },
+        "optional_params": ["start", "end", "limit", "params"],
+        "param_formats": {
+            "query": "检索关键词（公司代码如 'META' 直接拼入 query）",
+            "start": "YYYY-MM-DD（传入 start 时需与 end 成对传入）",
+            "end": "YYYY-MM-DD",
+            "params.doc_id": "纯数字字符串文档 ID（如 '99001122'；顶层传 document 时自动映射为 params.doc_id 并移除顶层 document）",
+        },
+        "return_shape": "{\"ok\": true, \"status\": \"ok\", \"data\": {\"structuredContent\": {\"results\": [...]}}, \"_sources\": [...]}",
+        "examples": [
+            "research(route=\"alphaengine\", operation=\"search_library\", query=\"META AI capex\", start=\"2026-01-01\", end=\"2026-10-23\", limit=10)",
+            "research(route=\"alphaengine\", operation=\"get_document\", params={\"doc_id\": \"99001122\", \"offset\": 0, \"max_chars\": 30000})",
+        ],
+    },
+    "guidepoint": {
+        "tool": "research",
+        "category": "research",
+        "operations": ["search_library"],
+        "default_operation": "search_library",
+        "operation_aliases": {
+            "search": "search_library",
+            "query": "search_library",
+        },
+        "accepted_params": ["query", "start", "end", "limit", "params", "ticker"],
+        "accepted_nested_params": [
+            "query",
+            "start_date",
+            "end_date",
+            "size",
+            "keywords",
+            "recency_bias",
+        ],
+        "required_params": {"search_library": ["query"]},
+        "optional_params": ["operation", "start", "end", "limit", "params"],
+        "param_formats": {
+            "query": "专家访谈检索词（如 'Meta Reels advertising'）",
+            "start": "YYYY-MM-DD",
+            "end": "YYYY-MM-DD",
+            "limit": "整数 1-40",
+        },
+        "return_shape": "{\"ok\": true, \"status\": \"ok\", \"data\": {\"structuredContent\": {\"data\": [...]}}, \"_sources\": [...]}",
+        "examples": [
+            "research(route=\"guidepoint\", operation=\"search_library\", query=\"Meta advertising Reels\", start=\"2026-01-01\", end=\"2026-10-23\", limit=10)",
+        ],
+    },
+    "transcript": {
+        "tool": "research",
+        "category": "research",
+        "operations": ["transcript"],
+        "default_operation": "transcript",
+        "operation_aliases": {
+            "search": "transcript",
+            "list": "transcript",
+            "read": "transcript",
+            "get": "transcript",
+        },
+        "accepted_params": ["ticker", "query", "start", "end", "limit"],
+        "accepted_nested_params": [],
+        "required_params": {"transcript": ["ticker"]},
+        "optional_params": ["operation", "query", "start", "end", "limit"],
+        "param_formats": {
+            "ticker": "股票代码（必填，如 'META'、'GOOGL'、'00700'）",
+            "query": "可选补充公司名，中英文用 | 分隔（如 '腾讯|Tencent'）；不能只传 query 不传 ticker，勿传主题词",
+            "start": "YYYY-MM-DD",
+            "end": "YYYY-MM-DD",
+        },
+        "return_shape": "{\"ok\": true, \"status\": \"ok\", \"data\": {\"transcripts\": [...]}, \"_sources\": [...]}（无匹配返回 ok: true, empty_reason: \"no_matching_transcripts\"）",
+        "examples": [
+            "research(route=\"transcript\", operation=\"transcript\", ticker=\"META\", start=\"2026-01-01\", end=\"2026-10-23\", limit=4)",
+            "research(route=\"transcript\", operation=\"transcript\", ticker=\"00700\", query=\"腾讯|Tencent\", start=\"2026-01-01\", end=\"2026-10-23\", limit=4)",
+        ],
+    },
+    "company-wiki": {
+        "tool": "research",
+        "category": "research",
+        "operations": ["search", "read", "list", "topic"],
+        "default_operation": "search",
+        "operation_aliases": {
+            "query": "search",
+            "get": "read",
+            "get_document": "read",
+            "read_document": "read",
+        },
+        "accepted_params": [
+            "query",
+            "start",
+            "end",
+            "document",
+            "limit",
+            "params",
+            "ticker",
+        ],
+        "accepted_nested_params": [
+            "company",
+            "sector",
+            "tag",
+            "search_mode",
+            "no_decay",
+            "offset",
+            "max_chars",
+            "media",
+            "indexed_since",
+        ],
+        "required_params": {
+            "search": ["query 或 params.company"],
+            "read": ["document"],
+            "list": [],
+            "topic": ["query"],
+        },
+        "optional_params": ["start", "end", "limit", "params"],
+        "param_formats": {
+            "params.company": "股票代码（如 'META'、'0700.HK'、'300750.SZ'）",
+            "document": "'wiki:<id>'",
+            "start": "YYYY-MM-DD",
+            "end": "YYYY-MM-DD",
+        },
+        "return_shape": "{\"ok\": true, \"status\": \"ok\", \"results\": [...], \"result_count\": int, \"_sources\": [...]}",
+        "examples": [
+            "research(route=\"company-wiki\", operation=\"search\", query=\"META advertising\", params={\"company\": \"META\"}, limit=10)",
+            "research(route=\"company-wiki\", operation=\"read\", document=\"wiki:1632\", params={\"offset\": 0, \"max_chars\": 30000})",
+        ],
+    },
+    "sales-notes": {
+        "tool": "research",
+        "category": "research",
+        "operations": ["search", "read", "list"],
+        "default_operation": "search",
+        "operation_aliases": {
+            "query": "search",
+            "get": "read",
+            "get_document": "read",
+            "read_document": "read",
+        },
+        "accepted_params": [
+            "query",
+            "start",
+            "end",
+            "document",
+            "limit",
+            "params",
+            "ticker",
+        ],
+        "accepted_nested_params": [
+            "sender",
+            "layer",
+            "search_mode",
+            "offset",
+            "max_chars",
+            "media",
+        ],
+        "required_params": {
+            "search": ["query"],
+            "read": ["document"],
+            "list": [],
+        },
+        "optional_params": ["start", "end", "limit", "params"],
+        "param_formats": {
+            "document": "'mail:<id>' 或 'digest:<date>'",
+            "start": "YYYY-MM-DD",
+            "end": "YYYY-MM-DD",
+        },
+        "return_shape": "{\"ok\": true, \"status\": \"ok\", \"results\": [...], \"result_count\": int, \"_sources\": [...]}",
+        "examples": [
+            "research(route=\"sales-notes\", operation=\"search\", query=\"META bogey whisper\", start=\"2026-01-01\", end=\"2026-10-23\", limit=10)",
+            "research(route=\"sales-notes\", operation=\"read\", document=\"mail:111154\", params={\"offset\": 0, \"max_chars\": 30000})",
+        ],
+    },
+    "sales-mail": {
+        "tool": "research",
+        "category": "research",
+        "operations": ["search", "read", "list"],
+        "default_operation": "search",
+        "operation_aliases": {
+            "query": "search",
+            "get": "read",
+            "get_document": "read",
+            "read_document": "read",
+        },
+        "accepted_params": [
+            "query",
+            "start",
+            "end",
+            "document",
+            "limit",
+            "params",
+            "ticker",
+        ],
+        "accepted_nested_params": [
+            "sender",
+            "layer",
+            "search_mode",
+            "offset",
+            "max_chars",
+            "media",
+        ],
+        "required_params": {
+            "search": ["query"],
+            "read": ["document"],
+            "list": [],
+        },
+        "optional_params": ["start", "end", "limit", "params"],
+        "param_formats": {
+            "document": "'mail:<id>' 或 'digest:<date>'",
+            "start": "YYYY-MM-DD",
+            "end": "YYYY-MM-DD",
+        },
+        "return_shape": "{\"ok\": true, \"status\": \"ok\", \"results\": [...], \"result_count\": int, \"_sources\": [...]}",
+        "examples": [
+            "research(route=\"sales-mail\", operation=\"search\", query=\"META bogey\", start=\"2026-01-01\", end=\"2026-10-23\", limit=10)",
+        ],
+    },
+    "tmtb": {
+        "tool": "research",
+        "category": "research",
+        "operations": ["search", "read", "list"],
+        "default_operation": "search",
+        "operation_aliases": {
+            "query": "search",
+            "get": "read",
+            "get_document": "read",
+            "read_document": "read",
+        },
+        "accepted_params": [
+            "query",
+            "start",
+            "end",
+            "document",
+            "limit",
+            "params",
+            "ticker",
+        ],
+        "accepted_nested_params": [
+            "sender",
+            "layer",
+            "search_mode",
+            "offset",
+            "max_chars",
+            "media",
+        ],
+        "required_params": {
+            "search": ["query"],
+            "read": ["document"],
+            "list": [],
+        },
+        "optional_params": ["start", "end", "limit", "params"],
+        "param_formats": {
+            "document": "'tmtb:<id>'",
+            "start": "YYYY-MM-DD",
+            "end": "YYYY-MM-DD",
+        },
+        "return_shape": "{\"ok\": true, \"status\": \"ok\", \"results\": [...], \"result_count\": int, \"_sources\": [...]}",
+        "examples": [
+            "research(route=\"tmtb\", operation=\"search\", query=\"META AI\", start=\"2026-01-01\", end=\"2026-10-23\", limit=10)",
+            "research(route=\"tmtb\", operation=\"read\", document=\"tmtb:190000041634994\", params={\"offset\": 0, \"max_chars\": 30000})",
+        ],
+    },
+    "funda-ai": {
+        "tool": "research",
+        "category": "research",
+        "operations": ["search", "read", "list"],
+        "default_operation": "search",
+        "operation_aliases": {
+            "query": "search",
+            "get": "read",
+            "get_document": "read",
+            "read_document": "read",
+        },
+        "accepted_params": [
+            "query",
+            "start",
+            "end",
+            "document",
+            "limit",
+            "params",
+            "ticker",
+        ],
+        "accepted_nested_params": [
+            "sender",
+            "layer",
+            "search_mode",
+            "offset",
+            "max_chars",
+            "media",
+        ],
+        "required_params": {
+            "search": ["query"],
+            "read": ["document"],
+            "list": [],
+        },
+        "optional_params": ["start", "end", "limit", "params"],
+        "param_formats": {
+            "document": "'funda:<id>'",
+            "start": "YYYY-MM-DD",
+            "end": "YYYY-MM-DD",
+        },
+        "return_shape": "{\"ok\": true, \"status\": \"ok\", \"results\": [...], \"result_count\": int, \"_sources\": [...]}",
+        "examples": [
+            "research(route=\"funda-ai\", operation=\"search\", query=\"META GPU\", start=\"2026-01-01\", end=\"2026-10-23\", limit=10)",
+            "research(route=\"funda-ai\", operation=\"read\", document=\"funda:26\", params={\"offset\": 0, \"max_chars\": 30000})",
+        ],
+    },
+    "xueqiu": {
+        "tool": "community",
+        "category": "community",
+        "operations": ["posts", "post", "comments", "search", "user"],
+        "default_operation": "posts",
+        "operation_aliases": {},
+        "accepted_params": ["ticker", "url", "post_id", "query", "pages"],
+        "accepted_nested_params": [],
+        "required_params": {
+            "posts": ["ticker"],
+            "post": ["url"],
+            "comments": ["post_id"],
+            "search": ["query"],
+            "user": ["url"],
+        },
+        "optional_params": ["pages"],
+        "param_formats": {
+            "ticker": "港股 5 位数字如 '00700'/'06181'（勿写 '0700.HK'）；A 股带前缀如 'SH600519'/'SZ300750'；美股如 'META'",
+            "url": "仅允许 xueqiu.com 域名 URL",
+            "post_id": "纯数字字符串",
+            "pages": "整数 1-3（默认 1）",
+        },
+        "return_shape": "{\"ok\": true, \"status\": \"ok\", \"data\": {\"posts\"|\"comments\"|\"results\": [...]}, \"_sources\": [...]}",
+        "examples": [
+            "community(route=\"xueqiu\", operation=\"posts\", ticker=\"00700\", pages=1)",
+            "community(route=\"xueqiu\", operation=\"search\", query=\"腾讯 游戏\", pages=1)",
+        ],
+    },
+    "employee": {
+        "tool": "community",
+        "category": "community",
+        "operations": ["blind", "summary", "indeed", "glassdoor"],
+        "default_operation": "blind",
+        "operation_aliases": {},
+        "accepted_params": ["company", "url", "pages", "allow_paid"],
+        "accepted_nested_params": [],
+        "required_params": {
+            "blind": ["company"],
+            "summary": ["company"],
+            "indeed": ["company", "allow_paid=True"],
+            "glassdoor": ["url", "allow_paid=True"],
+        },
+        "optional_params": ["pages", "allow_paid"],
+        "param_formats": {
+            "company": "公司英文名或 slug（如 'Meta'、'NVIDIA'）",
+            "url": "仅允许 glassdoor.com 域名 URL",
+            "pages": "blind/indeed 为 1-3，summary 为 1-40",
+            "allow_paid": "布尔值（indeed/glassdoor 必须显式传 True）",
+        },
+        "return_shape": "{\"ok\": true, \"status\": \"ok\", \"data\": {\"reviews\": [...]}, \"_sources\": [...]}",
+        "examples": [
+            "community(route=\"employee\", operation=\"blind\", company=\"Meta\", pages=1)",
+            "community(route=\"employee\", operation=\"summary\", company=\"NVIDIA\", pages=40)",
+        ],
+    },
+    "last30days": {
+        "tool": "community",
+        "category": "community",
+        "operations": ["search"],
+        "default_operation": "search",
+        "operation_aliases": {},
+        "accepted_params": ["query", "days", "quick", "plan"],
+        "accepted_nested_params": [],
+        "required_params": {"search": ["query"]},
+        "optional_params": ["operation", "days", "quick", "plan"],
+        "param_formats": {
+            "query": "检索主题字符串（1-300 字符）",
+            "days": "整数 1-30（默认 30）",
+            "quick": "布尔值",
+        },
+        "return_shape": "{\"ok\": true, \"status\": \"ok\", \"data\": {\"items\": [...], \"source_status\": {...}}, \"_sources\": [...]}",
+        "examples": [
+            "community(route=\"last30days\", operation=\"search\", query=\"Meta Ray-Ban glasses\", days=30, quick=True)",
+        ],
+    },
+    "x-timeline": {
+        "tool": "community",
+        "category": "community",
+        "operations": ["tweets", "tweet", "thread", "search"],
+        "default_operation": "tweets",
+        "operation_aliases": {},
+        "accepted_params": [
+            "handle",
+            "url",
+            "tweet_id",
+            "query",
+            "since",
+            "until",
+            "count",
+            "include_replies",
+        ],
+        "accepted_nested_params": [],
+        "required_params": {
+            "tweets": ["handle"],
+            "tweet": ["url 或 tweet_id"],
+            "thread": ["url 或 tweet_id"],
+            "search": ["query"],
+        },
+        "optional_params": ["operation", "since", "until", "count", "include_replies"],
+        "param_formats": {
+            "handle": "@user、user 或 x.com/twitter.com 主页 URL",
+            "since": "YYYY-MM-DD（start/from/start_date 自动映射为 since；禁用 params）",
+            "until": "YYYY-MM-DD（end/to/end_date 自动映射为 until；禁用 params）",
+            "count": "整数 1-100（默认 20；limit/max_results 自动映射为 count）",
+        },
+        "return_shape": "{\"ok\": true, \"status\": \"ok\", \"data\": {\"items\": [{\"id\": ..., \"text\": ..., \"created_at\": ..., \"url\": ...}]}, \"_sources\": [...]}",
+        "examples": [
+            "community(route=\"x-timeline\", operation=\"tweets\", handle=\"@AIatMeta\", since=\"2026-10-01\", until=\"2026-10-23\", count=20)",
+            "community(route=\"x-timeline\", operation=\"search\", query=\"Meta Llama\", since=\"2026-10-01\", until=\"2026-10-23\", count=20)",
+        ],
+    },
+}
+
+TOOL_VALID_ROUTES: dict[str, tuple[str, ...]] = {
+    "finance": ("sec", "estimates", "cn-hk"),
+    "macro": ("fred", "treasury", "market-regime"),
+    "research": (
+        "all",
+        "alphaengine",
+        "guidepoint",
+        "transcript",
+        "company-wiki",
+        "sales-notes",
+        "sales-mail",
+        "tmtb",
+        "funda-ai",
+    ),
+    "community": ("xueqiu", "employee", "last30days", "x-timeline"),
+}
+
+_HK_DOT_RE = re.compile(r"^0*(\d{1,5})\.HK$", re.IGNORECASE)
+_CN_DOT_RE = re.compile(r"^(\d{6})\.(SH|SZ|SS)$", re.IGNORECASE)
+_US_DOT_RE = re.compile(r"^([A-Za-z][A-Za-z0-9.\-]{0,15})\.US$", re.IGNORECASE)
+
+
+def _normalize_ticker_for_route(route: str, ticker: str) -> str:
+    """Normalize stock code format to match the target route's expected representation."""
+    s = ticker.strip()
+    if not s:
+        return s
+    if route == "cn-hk":
+        m_hk = _HK_DOT_RE.fullmatch(s)
+        if m_hk:
+            return f"{int(m_hk.group(1)):05d}"
+        m_cn = _CN_DOT_RE.fullmatch(s)
+        if m_cn:
+            return m_cn.group(1)
+        return s
+    if route == "xueqiu":
+        m_hk = _HK_DOT_RE.fullmatch(s)
+        if m_hk:
+            return f"{int(m_hk.group(1)):05d}"
+        m_cn = _CN_DOT_RE.fullmatch(s)
+        if m_cn:
+            prefix = "SH" if m_cn.group(2).upper() in ("SH", "SS") else "SZ"
+            return f"{prefix}{m_cn.group(1)}"
+        return s
+    if route in ("sec", "estimates", "transcript"):
+        m_us = _US_DOT_RE.fullmatch(s)
+        if m_us:
+            return m_us.group(1).upper()
+    return s
+
+
+def _values_equal_for_alias(v1: Any, v2: Any) -> bool:
+    if isinstance(v1, str) and isinstance(v2, str):
+        return v1.strip() == v2.strip()
+    return v1 == v2
+
+
+def _build_normalized_params_view(args: dict[str, Any], *, is_community: bool = False) -> dict[str, Any]:
+    """Build clean `normalized_params` dict showing the canonical parameters actually used."""
+    out: dict[str, Any] = {}
+    for k, v in args.items():
+        if v is None:
+            continue
+        if k == "timeout":
+            continue
+        if is_community and k in UPSTREAM_GENERIC_COMMUNITY_PARAMS:
+            continue
+        if isinstance(v, dict):
+            out[k] = {pk: pv for pk, pv in v.items() if pv is not None}
+        else:
+            out[k] = v
+    return out
+
+
+_NESTED_ALIAS_CONFLICT_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("doc_id", ("doc_id", "document", "id", "document_id", "doc", "file_id")),
+    ("start_date", ("start_date", "date_from", "from", "from_", "from_date", "start", "since")),
+    ("end_date", ("end_date", "date_to", "to", "to_date", "end", "until")),
+    ("limit", ("limit", "size", "max_results", "count", "top_k", "n")),
+    ("offset", ("offset", "start_offset", "char_offset")),
+    ("max_chars", ("max_chars", "max_length", "chars")),
+)
+
+
+def _normalize_and_validate_call_args(
+    tool_name: str,
+    raw_args: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any] | None]:
+    """Normalize parameter aliases, detect alias conflicts, and reject unknown/missing parameters at the bridge entry point.
+
+    Returns `(normalized_args, normalized_params_view, error_payload_or_none)`.
+    """
+    route_keys = ("route", "source", "channel", "provider")
+    route_entries = [(k, raw_args[k]) for k in route_keys if k in raw_args and raw_args[k] is not None]
+    if len(route_entries) > 1 and not all(
+        _values_equal_for_alias(v, route_entries[0][1]) for _, v in route_entries[1:]
+    ):
+        conflict_desc = ", ".join(f"{k}={v!r}" for k, v in route_entries)
+        norm_view = _build_normalized_params_view(raw_args)
+        err: dict[str, Any] = {
+            "_declared_sources": [],
+            "_sources": [],
+            "ok": False,
+            "status": "invalid_arguments",
+            "error_code": "parameter_conflict",
+            "error_category": "参数错误",
+            "error": (
+                f"[参数错误] 参数冲突：同一个参数 'route' 同时传入了不一致的值 ({conflict_desc})。"
+                "请只传正名参数 'route'。"
+            ),
+            "hint": f"参数 'route' 同时收到别名与正名且值不一致（{conflict_desc}）；请统一使用标准参数名 'route' 重试。",
+            "normalized_params": norm_view,
+        }
+        return dict(raw_args), norm_view, err
+
+    route = str(route_entries[0][1]).strip() if route_entries else ""
+    is_comm = tool_name == "community" or (tool_name != "catalog" and route in BRIDGE_COMMUNITY_ROUTES)
+
+    eff_alias = dict(PARAM_ALIAS_TABLE)
+    if route == "x-timeline":
+        eff_alias.pop("since", None)
+        eff_alias.pop("until", None)
+        eff_alias.pop("count", None)
+        for k in ("start", "from", "from_", "from_date", "date_from", "start_date", "begin", "begin_date"):
+            eff_alias[k] = "since"
+        for k in ("end", "to", "to_date", "date_to", "end_date"):
+            eff_alias[k] = "until"
+        for k in ("limit", "max_results", "size", "n", "top_k", "num_results", "per_page"):
+            eff_alias[k] = "count"
+        for k in ("id", "post_id", "status_id", "discussion_id", "doc_id", "document", "document_id"):
+            eff_alias[k] = "tweet_id"
+        for k in ("user", "username", "account", "screen_name", "author"):
+            eff_alias[k] = "handle"
+    elif route == "xueqiu":
+        for k in ("id", "status_id", "discussion_id", "tweet_id", "doc_id"):
+            eff_alias[k] = "post_id"
+    elif route == "employee":
+        for k in ("ticker", "symbol", "code", "stock", "stock_code", "firm", "employer"):
+            eff_alias[k] = "company"
+    elif route == "market-regime":
+        for k in ("top_k", "n"):
+            eff_alias[k] = "top"
+
+    grouped: dict[str, list[tuple[str, Any]]] = {}
+    none_keys: set[str] = set()
+    for raw_k, raw_v in raw_args.items():
+        if is_comm and raw_k in UPSTREAM_GENERIC_COMMUNITY_PARAMS:
+            canon_k = raw_k
+        else:
+            canon_k = eff_alias.get(raw_k, raw_k)
+        if raw_v is None:
+            none_keys.add(canon_k)
+            continue
+        grouped.setdefault(canon_k, []).append((raw_k, raw_v))
+
+    normalized: dict[str, Any] = {}
+    for canon_k in none_keys:
+        if canon_k not in grouped:
+            normalized[canon_k] = None
+
+    for canon_k, entries in grouped.items():
+        if len(entries) > 1:
+            first_val = entries[0][1]
+            if not all(_values_equal_for_alias(v, first_val) for _, v in entries[1:]):
+                conflict_desc = ", ".join(f"{k}={v!r}" for k, v in entries)
+                partial_view = _build_normalized_params_view(normalized, is_community=is_comm)
+                err = {
+                    "_declared_sources": [],
+                    "_sources": [],
+                    "ok": False,
+                    "status": "invalid_arguments",
+                    "error_code": "parameter_conflict",
+                    "error_category": "参数错误",
+                    "error": (
+                        f"[参数错误] 参数冲突：同一个参数 '{canon_k}' 同时传入了不一致的值 ({conflict_desc})。"
+                        f"请只保留标准参数名 '{canon_k}'。"
+                    ),
+                    "hint": (
+                        f"参数 '{canon_k}' 存在正名与别名冲突（{conflict_desc}）；"
+                        f"请统一使用标准参数名 '{canon_k}' 并只传一个值后重试。"
+                    ),
+                    "normalized_params": partial_view,
+                }
+                return dict(raw_args), partial_view, err
+        chosen_val = next((v for k, v in entries if k == canon_k), entries[0][1])
+        normalized[canon_k] = chosen_val
+
+    spec = ROUTE_CONTRACT_SPECS.get(route)
+    raw_op_val = normalized.get("operation")
+    op_str = str(raw_op_val or "").strip()
+    if spec and op_str:
+        op_aliases = spec.get("operation_aliases") or {}
+        if op_str in op_aliases:
+            op_str = op_aliases[op_str]
+            normalized["operation"] = op_str
+        elif op_str.lower() in op_aliases:
+            op_str = op_aliases[op_str.lower()]
+            normalized["operation"] = op_str
+
+    if isinstance(normalized.get("ticker"), str):
+        normalized["ticker"] = _normalize_ticker_for_route(route, normalized["ticker"])
+
+    # Validate nested `params` conflicts, top-level vs nested document conflicts, and alphaengine doc_id mapping
+    if isinstance(normalized.get("params"), dict):
+        p_dict = dict(normalized["params"])
+        for group_label, group_keys in _NESTED_ALIAS_CONFLICT_GROUPS:
+            present = [(k, p_dict[k]) for k in group_keys if k in p_dict and p_dict[k] is not None]
+            if len(present) > 1 and not all(
+                _values_equal_for_alias(v, present[0][1]) for _, v in present[1:]
+            ):
+                conflict_desc = ", ".join(f"params.{k}={v!r}" for k, v in present)
+                norm_view = _build_normalized_params_view(normalized, is_community=is_comm)
+                err = {
+                    "_declared_sources": [],
+                    "_sources": [],
+                    "ok": False,
+                    "status": "invalid_arguments",
+                    "error_code": "parameter_conflict",
+                    "error_category": "参数错误",
+                    "error": (
+                        f"[参数错误] 嵌套参数冲突：params 内同一语义参数 '{group_label}' 同时传入了不一致的值 ({conflict_desc})。"
+                    ),
+                    "hint": f"params 内存在别名冲突（{conflict_desc}）；请只保留一个标准字段后重试。",
+                    "normalized_params": norm_view,
+                }
+                return normalized, norm_view, err
+
+        top_doc = normalized.get("document")
+        if top_doc is not None and str(top_doc).strip():
+            top_doc_str = str(top_doc).strip()
+            for doc_k in ("document", "doc_id", "id", "document_id", "doc", "file_id"):
+                if doc_k in p_dict and p_dict[doc_k] is not None and str(p_dict[doc_k]).strip():
+                    if not _values_equal_for_alias(str(p_dict[doc_k]).strip(), top_doc_str):
+                        conflict_desc = f"document={top_doc!r}, params.{doc_k}={p_dict[doc_k]!r}"
+                        norm_view = _build_normalized_params_view(normalized, is_community=is_comm)
+                        err = {
+                            "_declared_sources": [],
+                            "_sources": [],
+                            "ok": False,
+                            "status": "invalid_arguments",
+                            "error_code": "parameter_conflict",
+                            "error_category": "参数错误",
+                            "error": (
+                                f"[参数错误] 参数冲突：顶层 document 与 params.{doc_k} 值不一致 ({conflict_desc})。"
+                            ),
+                            "hint": "请统一只传顶层 document（内部资料库）或 params.doc_id（AlphaEngine），不要同时传两个不同的值。",
+                            "normalized_params": norm_view,
+                        }
+                        return normalized, norm_view, err
+
+        if route == "alphaengine":
+            for alias_doc_k in ("document", "id", "document_id", "doc", "file_id"):
+                if alias_doc_k in p_dict:
+                    alias_val = p_dict.pop(alias_doc_k)
+                    if alias_val is not None and str(alias_val).strip() and not p_dict.get("doc_id"):
+                        p_dict["doc_id"] = str(alias_val).strip()
+            if top_doc is not None and str(top_doc).strip():
+                if not p_dict.get("doc_id"):
+                    p_dict["doc_id"] = str(top_doc).strip()
+                normalized.pop("document", None)
+            normalized["params"] = p_dict
+    elif route == "alphaengine" and normalized.get("document") is not None:
+        top_doc_str = str(normalized.pop("document")).strip()
+        if top_doc_str:
+            normalized["params"] = {"doc_id": top_doc_str}
+
+    norm_view = _build_normalized_params_view(normalized, is_community=is_comm)
+
+    # Validate unknown parameters and operations for catalog / finance / macro / research
+    if tool_name == "catalog":
+        allowed_cat = {"category", "route", "timeout"}
+        extra_cat = sorted(k for k, v in normalized.items() if v is not None and k not in allowed_cat)
+        if extra_cat:
+            accepted_list = ["category", "route"]
+            err = {
+                "_declared_sources": [],
+                "_sources": [],
+                "ok": False,
+                "status": "invalid_arguments",
+                "error_code": "unknown_parameters",
+                "error_category": "参数错误",
+                "accepted_parameters": accepted_list,
+                "error": (
+                    f"[参数错误] catalog 收到未知参数: {extra_cat}。"
+                    f"该操作接受的参数: {accepted_list}。"
+                ),
+                "hint": "catalog 仅接受可选参数 category（finance|macro|research|community|news）或 route（如 'sec'、'transcript'）。",
+                "normalized_params": norm_view,
+            }
+            return normalized, norm_view, err
+        return normalized, norm_view, None
+
+    if tool_name in ("finance", "macro", "research", "community", "news") and not route:
+        tool_routes = sorted(
+            rid
+            for rid, r_spec in ROUTE_CONTRACT_SPECS.items()
+            if r_spec.get("tool") == tool_name
+        )
+        err = {
+            "_declared_sources": [],
+            "_sources": [],
+            "ok": False,
+            "status": "invalid_arguments",
+            "error_code": "missing_required_parameters",
+            "error_category": "参数错误",
+            "missing_parameters": ["route"],
+            "accepted_routes": tool_routes,
+            "error": (
+                f"[参数错误] {tool_name} 缺少必填参数 'route'（或其别名 'source'/'channel'/'provider'）。"
+                f"可选路由: {tool_routes}。"
+            ),
+            "hint": (
+                f"请传入必填参数 route（支持的值: {tool_routes}；也接受别名 source/channel/provider）后重试。"
+            ),
+            "normalized_params": norm_view,
+        }
+        return normalized, norm_view, err
+
+    if is_comm:
+        return normalized, norm_view, None
+
+    if tool_name in ("finance", "macro", "research") and spec is not None:
+        valid_ops: list[str] = list(spec.get("operations") or [])
+        accepted_top: list[str] = sorted({"route", "operation", *spec.get("accepted_params", [])})
+        if op_str and valid_ops and op_str not in valid_ops:
+            err = {
+                "_declared_sources": [],
+                "_sources": [],
+                "ok": False,
+                "status": "invalid_arguments",
+                "error_code": "invalid_operation",
+                "error_category": "参数错误",
+                "accepted_operations": valid_ops,
+                "accepted_parameters": accepted_top,
+                "error": (
+                    f"[参数错误] 路由 '{route}' 不支持 operation='{op_str}'。"
+                    f"支持的操作: {valid_ops}；接受的参数: {accepted_top}。"
+                ),
+                "hint": (
+                    f"请将 operation 改为 {valid_ops} 之一（可调用 catalog(route='{route}') 查看完整参数说明与示例）。"
+                ),
+                "normalized_params": norm_view,
+            }
+            return normalized, norm_view, err
+
+        allowed_set = set(accepted_top) | {"timeout", "mode"}
+        unknown_top = sorted(
+            k for k, v in normalized.items() if v is not None and k not in allowed_set
+        )
+        if unknown_top:
+            err = {
+                "_declared_sources": [],
+                "_sources": [],
+                "ok": False,
+                "status": "invalid_arguments",
+                "error_code": "unknown_parameters",
+                "error_category": "参数错误",
+                "accepted_parameters": accepted_top,
+                "error": (
+                    f"[参数错误] 路由 '{route}'（operation='{op_str or spec.get('default_operation', '')}'）"
+                    f"收到不认识的参数: {unknown_top}。该操作接受的参数: {accepted_top}。"
+                ),
+                "hint": (
+                    f"请移除或修正未知参数 {unknown_top}，仅使用 {accepted_top} 中的参数"
+                    f"（不确定参数时先查 catalog(route='{route}')）。"
+                ),
+                "normalized_params": norm_view,
+            }
+            return normalized, norm_view, err
+
+        # Validate unknown nested keys inside `params`
+        if isinstance(normalized.get("params"), dict) and "params" in allowed_set:
+            accepted_nested: list[str] = list(spec.get("accepted_nested_params") or [])
+            allowed_nested_set = set(accepted_nested)
+            if route in INTERNAL_LIBRARY_ROUTES:
+                allowed_nested_set |= {"document", "doc_id", "id", "document_id"}
+            unknown_nested = sorted(
+                k
+                for k, v in normalized["params"].items()
+                if v is not None and k not in allowed_nested_set
+            )
+            if unknown_nested:
+                err = {
+                    "_declared_sources": [],
+                    "_sources": [],
+                    "ok": False,
+                    "status": "invalid_arguments",
+                    "error_code": "unknown_parameters",
+                    "error_category": "参数错误",
+                    "accepted_parameters": accepted_top,
+                    "accepted_nested_parameters": accepted_nested,
+                    "error": (
+                        f"[参数错误] 路由 '{route}' 的 params 收到未知嵌套参数: {unknown_nested}。"
+                        f"params 接受的字段: {accepted_nested}。"
+                    ),
+                    "hint": (
+                        f"请从 params 中移除未知字段 {unknown_nested}，仅使用 {accepted_nested}"
+                        f"（不确定时先查 catalog(route='{route}')）。"
+                    ),
+                    "normalized_params": norm_view,
+                }
+                return normalized, norm_view, err
+
+        # Validate required parameters aligned with upstream data_gateway.py
+        eff_op = op_str or str(spec.get("default_operation") or "").strip()
+        missing_req: list[str] = []
+        if route == "fred":
+            for req_k in ("series", "start", "end"):
+                if not str(normalized.get(req_k) or "").strip():
+                    missing_req.append(req_k)
+        elif route == "treasury":
+            for req_k in ("dataset", "start", "end"):
+                if not str(normalized.get(req_k) or "").strip():
+                    missing_req.append(req_k)
+        elif route == "cn-hk":
+            if eff_op == "filings":
+                for req_k in ("ticker", "start", "end"):
+                    if not str(normalized.get(req_k) or "").strip():
+                        missing_req.append(req_k)
+            elif eff_op == "ask":
+                if not str(normalized.get("query") or "").strip():
+                    missing_req.append("query")
+        elif route == "sec":
+            raw_op_orig = str(raw_args.get("operation") or "").strip().lower()
+            if raw_op_orig != "search" and not str(normalized.get("ticker") or "").strip():
+                missing_req.append("ticker")
+            if eff_op == "facts" and not str(normalized.get("concept") or "").strip():
+                missing_req.append("concept")
+            elif eff_op in ("smart-facts", "search-concepts", "search-text") and not str(
+                normalized.get("query") or ""
+            ).strip():
+                missing_req.append("query")
+            elif eff_op == "read-item" and not str(normalized.get("item") or "").strip():
+                missing_req.append("item")
+        elif route == "estimates":
+            if not str(normalized.get("ticker") or "").strip():
+                missing_req.append("ticker")
+        elif route == "transcript":
+            if not str(normalized.get("ticker") or "").strip():
+                missing_req.append("ticker")
+
+        if missing_req:
+            err = {
+                "_declared_sources": [],
+                "_sources": [],
+                "ok": False,
+                "status": "invalid_arguments",
+                "error_code": "missing_required_parameters",
+                "error_category": "参数错误",
+                "missing_parameters": missing_req,
+                "accepted_parameters": accepted_top,
+                "error": (
+                    f"[参数错误] 路由 '{route}'（operation='{eff_op}'）缺少必填参数: {missing_req}。"
+                    f"该操作接受的参数: {accepted_top}。"
+                ),
+                "hint": (
+                    f"请补齐必填参数 {missing_req} 后重试（可调用 catalog(route='{route}') 查看完整参数格式与示例）。"
+                ),
+                "normalized_params": norm_view,
+            }
+            return normalized, norm_view, err
+
+    return normalized, norm_view, None
+
+
+_BUSINESS_NO_MATCH_REASONS: frozenset[str] = frozenset(
+    {
+        "alphaengine_no_match",
+        "no_match",
+        "no_results",
+        "empty",
+        "no_matching_transcripts",
+        "no_matching_records",
+        "no_matching_items",
+    }
+)
+
+
+def _is_business_no_match_reason(reason: Any) -> bool:
+    """Return True when `reason` is an explicit business no-match code rather than an error."""
+    return str(reason or "").strip().lower() in _BUSINESS_NO_MATCH_REASONS
+
+
+_FAILURE_STATUSES: frozenset[str] = frozenset(
+    {
+        "error",
+        "failed",
+        "forbidden",
+        "unauthorized",
+        "rate_limited",
+        "timeout",
+        "quota_exceeded",
+        "script_error",
+        "degraded",
+        "canceled",
+        "auth_expired",
+        "invalid_output",
+        "source_missing",
+        "invalid_arguments",
+        "not_found",
+        "partial_error",
+        "paid_source_not_allowed",
+        "handoff_filtered",
+    }
+)
+_GENERIC_FAILURE_STATUSES: frozenset[str] = frozenset({"error", "failed", "partial_error"})
+_SPECIFIC_FAILURE_STATUSES: frozenset[str] = _FAILURE_STATUSES - _GENERIC_FAILURE_STATUSES
+
+
+_NON_FAILURE_STATUS_WORDS = frozenset({"", "ok", "success", "succeeded", "empty", "no_match", "no-results", "no_results"})
+
+
+def _pick_failure_status(*statuses: str) -> str:
+    """Return the most specific failure status across layers; specific statuses (`forbidden`, `rate_limited`, `timeout`, ...) beat generic `error`/`failed`, and non-failure statuses (`ok`, `empty`, ...) are ignored."""
+    generic_hit = ""
+    for raw in statuses:
+        st = str(raw or "").strip().lower()
+        if not st or st not in _FAILURE_STATUSES:
+            continue
+        if st in _SPECIFIC_FAILURE_STATUSES:
+            return st
+        if not generic_hit:
+            generic_hit = st
+    return generic_hit
+
+
+def _unwrap_upstream_error_info(payload: dict[str, Any]) -> dict[str, Any]:
+    """Unwrap nested error details and compute `failed: bool` across top-level, `data`, `data.structuredContent`, `data.content`, and `source_status`."""
+    data_obj = payload.get("data")
+    data_dict = data_obj if isinstance(data_obj, dict) else {}
+    fb_obj = payload.get("fallback") if "fallback" in payload else data_dict.get("fallback")
+    fb_dict = fb_obj if isinstance(fb_obj, dict) else {}
+    fb_source = str(fb_dict.get("source") or "").strip().lower()
+    fb_reason = str(fb_dict.get("reason") or "").strip().lower()
+    data_reason = str(data_dict.get("reason") or "").strip().lower()
+    raw_top_reason = str(payload.get("reason") or "").strip()
+    top_reason = "" if _is_business_no_match_reason(raw_top_reason) else raw_top_reason
+    top_status = str(payload.get("status") or "").strip()
+    d_status = str(data_dict.get("status") or "").strip()
+    top_code = str(payload.get("error_code") or "").strip()
+    top_err = str(payload.get("error") or "").strip()
+    d_err_raw = str(data_dict.get("error") or "").strip()
+    ae_err = str(data_dict.get("alphaengine_error") or "").strip()
+
+    is_alphaengine_no_match = (
+        "alphaengine_no_match" in (fb_reason, data_reason, raw_top_reason.lower())
+        and top_status.lower() not in _FAILURE_STATUSES
+        and d_status.lower() not in _FAILURE_STATUSES
+        and not top_err
+        and not d_err_raw
+        and not ae_err
+        and payload.get("isError") is not True
+        and data_dict.get("isError") is not True
+    )
+
+    is_top_err = (
+        (payload.get("ok") is False and not is_alphaengine_no_match)
+        or payload.get("isError") is True
+        or bool(top_err)
+        or top_status.lower() in _FAILURE_STATUSES
+        or (fb_source == "roic" and not is_alphaengine_no_match)
+    )
+    if is_top_err and not top_err:
+        top_msg = str(payload.get("message") or "").strip()
+        if top_msg:
+            top_err = top_msg
+
+    unwrapped_err = ""
+    status_candidates: list[str] = []
+    if top_status.lower() in _FAILURE_STATUSES:
+        status_candidates.append(top_status)
+    unwrapped_code = ""
+    is_data_err = False
+    is_sc_err = False
+    has_content_err = False
+
+    if isinstance(data_obj, dict):
+        d_reason = str(data_obj.get("reason") or "").strip()
+        is_data_err = (
+            is_top_err
+            or (data_obj.get("ok") is False and not is_alphaengine_no_match)
+            or data_obj.get("isError") is True
+            or bool(d_err_raw)
+            or bool(ae_err)
+            or d_reason.lower() == "alphaengine_error"
+            or d_status.lower() in _FAILURE_STATUSES
+        )
+        if ae_err:
+            unwrapped_err = ae_err
+        d_err = str(
+            d_err_raw
+            or (data_obj.get("message") if is_data_err else "")
+            or ""
+        ).strip()
+        if d_err and not unwrapped_err:
+            unwrapped_err = d_err
+        if (
+            d_reason
+            and d_reason != "alphaengine_error"
+            and not _is_business_no_match_reason(d_reason)
+            and is_data_err
+            and not unwrapped_err
+        ):
+            unwrapped_err = d_reason
+        if d_status.lower() in _FAILURE_STATUSES:
+            status_candidates.append(d_status)
+        d_code = str(data_obj.get("error_code") or "").strip()
+        if d_code:
+            unwrapped_code = d_code
+
+        sc = data_obj.get("structuredContent")
+        if isinstance(sc, dict):
+            sc_status = str(sc.get("status") or "").strip()
+            sc_reason = str(sc.get("reason") or "").strip()
+            sc_err_raw = str(sc.get("alphaengine_error") or sc.get("error") or "").strip()
+            is_sc_err = (
+                sc.get("ok") is False
+                or sc.get("isError") is True
+                or bool(sc_err_raw)
+                or sc_reason.lower() == "alphaengine_error"
+                or sc_status.lower() in _FAILURE_STATUSES
+            )
+            sc_err = str(
+                sc_err_raw
+                or (sc.get("message") if (is_sc_err or is_data_err) else "")
+                or (
+                    sc_reason
+                    if (is_sc_err or is_data_err)
+                    and sc_reason != "alphaengine_error"
+                    and not _is_business_no_match_reason(sc_reason)
+                    else ""
+                )
+                or ""
+            ).strip()
+            if sc_err and not unwrapped_err:
+                unwrapped_err = sc_err
+            if sc_status.lower() in _FAILURE_STATUSES:
+                status_candidates.append(sc_status)
+            sc_code = str(sc.get("error_code") or "").strip()
+            if sc_code and not unwrapped_code:
+                unwrapped_code = sc_code
+
+        content_list = data_obj.get("content")
+        if isinstance(content_list, list):
+            for block in content_list:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("isError") is True:
+                    has_content_err = True
+                txt = str(block.get("text") or "").strip()
+                if not txt:
+                    continue
+                try:
+                    parsed_txt = json.loads(txt)
+                except Exception:
+                    parsed_txt = None
+                if isinstance(parsed_txt, dict):
+                    p_status = str(parsed_txt.get("status") or "").strip()
+                    p_reason = str(parsed_txt.get("reason") or "").strip()
+                    p_err_raw = str(parsed_txt.get("alphaengine_error") or parsed_txt.get("error") or "").strip()
+                    is_pt_err = (
+                        parsed_txt.get("ok") is False
+                        or parsed_txt.get("isError") is True
+                        or bool(p_err_raw)
+                        or p_reason.lower() == "alphaengine_error"
+                        or p_status.lower() in _FAILURE_STATUSES
+                    )
+                    if is_pt_err:
+                        has_content_err = True
+                    p_err = str(
+                        p_err_raw
+                        or (parsed_txt.get("message") if (is_pt_err or is_data_err) else "")
+                        or (
+                            p_reason
+                            if (is_pt_err or is_data_err)
+                            and p_reason != "alphaengine_error"
+                            and not _is_business_no_match_reason(p_reason)
+                            else ""
+                        )
+                        or ""
+                    ).strip()
+                    if p_err and not unwrapped_err:
+                        unwrapped_err = p_err
+                    if p_status.lower() in _FAILURE_STATUSES:
+                        status_candidates.append(p_status)
+                    p_code = str(parsed_txt.get("error_code") or "").strip()
+                    if p_code and not unwrapped_code:
+                        unwrapped_code = p_code
+                elif (
+                    block.get("isError") is True
+                    or data_obj.get("isError") is True
+                    or payload.get("ok") is False
+                ) and not unwrapped_err:
+                    unwrapped_err = txt
+
+    sub_errors: list[str] = []
+    for sub_key in ("alphaengine", "guidepoint"):
+        sub_obj = (
+            payload.get(sub_key)
+            if isinstance(payload.get(sub_key), dict)
+            else (data_dict.get(sub_key) if isinstance(data_dict.get(sub_key), dict) else None)
+        )
+        if isinstance(sub_obj, dict):
+            sub_st = str(sub_obj.get("status") or sub_obj.get("state") or "").strip()
+            if (
+                sub_obj.get("ok") is False
+                or sub_obj.get("isError") is True
+                or bool(sub_obj.get("error"))
+                or sub_st.lower() in _FAILURE_STATUSES
+            ):
+                sub_r = str(sub_obj.get("error") or sub_obj.get("reason") or sub_st or "failed").strip()
+                sub_errors.append(f"{sub_key}: {sub_r}")
+                if sub_st.lower() in _FAILURE_STATUSES:
+                    status_candidates.append(sub_st)
+
+    sc_dict = data_dict.get("structuredContent") if isinstance(data_dict.get("structuredContent"), dict) else {}
+    for src_status in (
+        payload.get("source_status"),
+        data_dict.get("source_status"),
+        sc_dict.get("source_status"),
+    ):
+        if not isinstance(src_status, dict):
+            continue
+        for s_name, s_val in src_status.items():
+            if any(x.startswith(f"{s_name}:") for x in sub_errors):
+                continue
+            if isinstance(s_val, dict):
+                s_st = str(s_val.get("status") or s_val.get("state") or "").strip()
+                if (
+                    s_val.get("ok") is False
+                    or s_val.get("isError") is True
+                    or bool(s_val.get("error"))
+                    or s_st.lower() in _FAILURE_STATUSES
+                ):
+                    s_r = str(s_val.get("error") or s_val.get("reason") or s_st or "failed").strip()
+                    sub_errors.append(f"{s_name}: {s_r}")
+                    if s_st.lower() in _FAILURE_STATUSES:
+                        status_candidates.append(s_st)
+            elif isinstance(s_val, str):
+                s_st = s_val.strip()
+                if s_st.lower() in _FAILURE_STATUSES:
+                    sub_errors.append(f"{s_name}: {s_st}")
+                    status_candidates.append(s_st)
+
+    eff_err = top_err
+    if not eff_err or eff_err in ("调用失败", "alphaengine_error", "error", "failed"):
+        if unwrapped_err:
+            eff_err = unwrapped_err
+        elif top_reason and top_reason != "alphaengine_error":
+            eff_err = top_reason
+        elif sub_errors:
+            eff_err = f"部分数据源调用失败 ({'; '.join(sub_errors)})"
+        elif top_reason:
+            eff_err = top_reason
+    elif unwrapped_err and unwrapped_err not in eff_err:
+        eff_err = f"{eff_err} ({unwrapped_err})"
+
+    failed = bool(
+        is_top_err
+        or is_data_err
+        or is_sc_err
+        or has_content_err
+        or sub_errors
+        or unwrapped_err
+    )
+    picked_failure_status = _pick_failure_status(*status_candidates)
+    if failed:
+        # A route's own failure status (e.g. market-regime's ``invalid_source``)
+        # is more useful than a generic ``error``; only a success/empty status
+        # is overwritten, since it contradicts the failure.
+        keep_top = top_status if top_status.strip().lower() not in _NON_FAILURE_STATUS_WORDS else ""
+        eff_status = picked_failure_status or keep_top or "error"
+    else:
+        eff_status = picked_failure_status or top_status
+    eff_code = top_code or unwrapped_code
+    return {
+        "failed": failed,
+        "error": eff_err,
+        "status": eff_status,
+        "error_code": eff_code,
+        "combined_text": " ".join(filter(None, [top_err, top_reason, unwrapped_err, " ".join(sub_errors)])),
+    }
+
+
+def _hint_conflicts_with_category(category: str, hint: str) -> bool:
+    """Return True when an upstream `hint` contradicts the classified `error_category`."""
+    h_lower = hint.lower()
+    if "roic" in h_lower:
+        return True
+    no_match_markers = ("无匹配", "未找到", "no match", "补充公司名重试", "没有匹配")
+    if category != "没有匹配" and any(m in h_lower for m in no_match_markers):
+        return True
+    if category == "权限或额度" and any(m in h_lower for m in ("参数错误", "未知参数")):
+        return True
+    if category == "参数错误" and any(m in h_lower for m in ("暂不可用", "执行超时")):
+        return True
+    return False
+
+
+def _classify_error_category_and_hint(
+    tool_name: str,
+    route: str,
+    operation: str,
+    payload: dict[str, Any],
+) -> tuple[str, str]:
+    """Unwrap real upstream error structures, classify into one of the 4 error categories, and build a consistent hint.
+
+    Categories: `参数错误` | `上游不可用` | `权限或额度` | `没有匹配`.
+    """
+    unwrapped = _unwrap_upstream_error_info(payload)
+    if unwrapped["error"] and (
+        not payload.get("error")
+        or str(payload.get("error")).strip() in ("调用失败", "alphaengine_error", "error", "failed")
+    ):
+        payload["error"] = unwrapped["error"]
+
+    existing_cat = str(payload.get("error_category") or "").strip()
+    status = str(unwrapped["status"] or payload.get("status") or "").strip().lower()
+    err_code = str(unwrapped["error_code"] or payload.get("error_code") or "").strip().lower()
+    err_text = str(unwrapped["combined_text"] or payload.get("error") or payload.get("reason") or "").strip()
+    err_lower = err_text.lower()
+    spec = ROUTE_CONTRACT_SPECS.get(route, {})
+    accepted_params = spec.get("accepted_params") or []
+    accepted_ops = spec.get("operations") or []
+
+    if existing_cat in ("参数错误", "上游不可用", "权限或额度", "没有匹配"):
+        category = existing_cat
+    elif (
+        status in ("invalid_arguments",)
+        or err_code
+        in (
+            "invalid_arguments",
+            "unknown_parameters",
+            "parameter_conflict",
+            "invalid_operation",
+            "invalid_route",
+            "missing_required_parameters",
+        )
+        or "参数" in err_text
+        or "未知" in err_text
+        or "alphaengine 文档" in err_lower
+        or "unsupported" in err_lower
+        or "is required" in err_lower
+        or "缺少必填" in err_text
+        or "不接受参数" in err_text
+        or "不支持参数" in err_text
+        or "must be" in err_lower
+        or "format is invalid" in err_lower
+        or "does not support" in err_lower
+        or ("not allowed" in err_lower and status != "paid_source_not_allowed")
+    ):
+        category = "参数错误"
+    elif (
+        status
+        in (
+            "paid_source_not_allowed",
+            "handoff_filtered",
+            "auth_expired",
+            "unauthorized",
+            "forbidden",
+            "quota_exceeded",
+            "rate_limited",
+        )
+        or err_code in ("paid_source_not_allowed", "handoff_filtered")
+        or bool(re.search(r"\b(?:401|403|429)\b", err_lower))
+        or any(
+            tok in err_lower
+            for tok in (
+                "unauthorized",
+                "forbidden",
+                "quota",
+                "rate limit",
+                "rate_limit",
+                "too many requests",
+                "auth_expired",
+                "session expired",
+                "login required",
+                "paid source",
+                "handoff route",
+                "permission denied",
+                "access denied",
+            )
+        )
+    ):
+        category = "权限或额度"
+    elif status in ("empty", "no_match") and not payload.get("error"):
+        category = "没有匹配"
+    else:
+        category = "上游不可用"
+
+    existing_hint = str(payload.get("hint") or "").strip()
+    if existing_hint and not _hint_conflicts_with_category(category, existing_hint):
+        return category, existing_hint
+
+    if category == "参数错误":
+        if route and accepted_params:
+            hint = (
+                f"请核对路由 '{route}' 的参数名与格式（支持的操作: {accepted_ops}，接受的参数: {accepted_params}），"
+                f"或先调用 catalog(route='{route}') 查看完整参数契约与调用示例后重试。"
+            )
+        else:
+            hint = "请先调用 catalog() 查看目标路由支持的 operation 与参数列表，修正参数后重试。"
+    elif category == "权限或额度":
+        if status == "paid_source_not_allowed":
+            hint = "employee 的 indeed/glassdoor 属于付费源，请改用免费操作 operation='blind' 或 'summary'，或在确认授权时显式传 allow_paid=True。"
+        elif status == "handoff_filtered":
+            hint = "该路由在 LangAlpha 中已禁用；网页新闻请改用内置 WebSearch/WebFetch 工具，X 检索请改用 community(route='x-timeline', operation='search', ...)。"
+        else:
+            hint = (
+                f"路由 '{route or tool_name}' 出现权限、登录态或配额限制；请切换替代数据源（如内部库 company-wiki/sales-notes/tmtb 或 SEC 公告），"
+                "若无替代源必须在报告中如实写明该数据源因权限/配额取数失败，禁止写成“没有相关信息”。"
+            )
+    elif category == "没有匹配":
+        if route == "transcript":
+            hint = TRANSCRIPT_NO_MATCH_HINT
+        elif tool_name == "community":
+            hint = (
+                f"社区路由 '{route}' 未检索到匹配内容；可放宽关键词 query、调整时间窗或换用其他社区路由（xueqiu / employee / last30days / x-timeline）重试。"
+            )
+        else:
+            hint = (
+                f"路由 '{route or tool_name}' 未检索到匹配记录；请放宽关键词 query、扩大时间范围 start/end 或换用其他路由重试。"
+            )
+    else:
+        hint = (
+            f"路由 '{route or tool_name}' 上游服务暂不可用或执行超时；可缩小查询范围重试一次或切换备用路由，"
+            "若仍失败必须在报告中如实披露该数据源取数失败，不得当成“没有数据”或“没有相关信息”。"
+        )
+    return category, hint
+
+
+_FAILURE_SOURCE_STATES: frozenset[str] = _FAILURE_STATUSES
+
+
+def _collect_multi_source_health(payload: dict[str, Any]) -> tuple[list[str], list[tuple[str, str]]]:
+    """Return `(succeeded_sources, failed_sources_with_reason)` from `source_status`, `alphaengine`, and `guidepoint`."""
+    succeeded: list[str] = []
+    failed: list[tuple[str, str]] = []
+    seen: set[str] = set()
+
+    src_status = payload.get("source_status")
+    if isinstance(src_status, dict):
+        for s_name, s_val in src_status.items():
+            name = str(s_name)
+            seen.add(name)
+            if isinstance(s_val, dict):
+                st = str(s_val.get("status") or s_val.get("state") or "").strip().lower()
+                if s_val.get("ok") is False or s_val.get("isError") is True or bool(s_val.get("error")) or st in _FAILURE_SOURCE_STATES:
+                    reason = str(s_val.get("error") or s_val.get("reason") or st or "failed").strip()
+                    failed.append((name, reason))
+                elif s_val.get("ok") is True or st in ("ok", "empty", "no_match", "no_results"):
+                    succeeded.append(name)
+            elif isinstance(s_val, str):
+                st = s_val.strip().lower()
+                if st in _FAILURE_SOURCE_STATES:
+                    failed.append((name, st))
+                elif st in ("ok", "empty", "no_match", "no_results"):
+                    succeeded.append(name)
+
+    for sub_key in ("alphaengine", "guidepoint"):
+        if sub_key in seen:
+            continue
+        sub_obj = payload.get(sub_key)
+        if isinstance(sub_obj, dict):
+            st = str(sub_obj.get("status") or "").strip().lower()
+            if sub_obj.get("ok") is False or sub_obj.get("isError") is True or bool(sub_obj.get("error")) or st in _FAILURE_SOURCE_STATES:
+                reason = str(sub_obj.get("error") or sub_obj.get("reason") or st or "failed").strip()
+                failed.append((sub_key, reason))
+            elif sub_obj.get("ok") is True or st in ("ok", "empty", "no_match"):
+                succeeded.append(sub_key)
+
+    return succeeded, failed
+
+
+def _has_disqualifying_error_signals(payload: dict[str, Any]) -> bool:
+    """Return True if `payload` carries any upstream error, failed sub-source, HTTP error status, or non-business failure."""
+    unwrapped = _unwrap_upstream_error_info(payload)
+    if unwrapped["failed"] or unwrapped["error"]:
+        return True
+    _succ, failed_sources = _collect_multi_source_health(payload)
+    if failed_sources:
+        return True
+    return False
+
+
+def _is_transcript_no_match_payload(payload: dict[str, Any]) -> bool:
+    """Return True ONLY when a `transcript` response is a confirmed empty result (`ok: True`) or explicit `alphaengine_no_match`."""
+    if _has_disqualifying_error_signals(payload):
+        return False
+    data_dict = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    fb_obj = payload.get("fallback") if "fallback" in payload else data_dict.get("fallback")
+    fb_dict = fb_obj if isinstance(fb_obj, dict) else {}
+    fb_reason = str(fb_dict.get("reason") or "").strip().lower()
+    data_reason = str(data_dict.get("reason") or payload.get("reason") or "").strip().lower()
+    status = str(payload.get("status") or "").strip().lower()
+
+    # Explicit business no-match from AlphaEngine transcript lookup (`alphaengine_no_match`)
+    if fb_reason == "alphaengine_no_match" or data_reason == "alphaengine_no_match":
+        transcripts_val = data_dict.get("transcripts") if "transcripts" in data_dict else payload.get("transcripts")
+        if transcripts_val is None or (isinstance(transcripts_val, list) and len(transcripts_val) == 0):
+            return True
+        return False
+
+    if status == "no_match" and payload.get("ok") is not False and data_dict.get("ok") is not False:
+        return True
+
+    # Any other `ok: False` or `status: "error"` (e.g. `{ok: False, status: "error", data: {transcripts: []}}`) must stay `ok: False`
+    if payload.get("ok") is not True or data_dict.get("ok") is False or status == "error":
+        return False
+
+    if status == "empty":
+        return True
+
+    transcripts_val = data_dict.get("transcripts") if "transcripts" in data_dict else payload.get("transcripts")
+    if isinstance(transcripts_val, list):
+        return len(transcripts_val) == 0
+
+    for container in (payload, data_dict):
+        for key in ("results", "items"):
+            val = container.get(key)
+            if isinstance(val, list):
+                return len(val) == 0
+    return False
+
+
+def _is_empty_non_community_payload(
+    tool_name: str, route: str, operation: str, payload: dict[str, Any]
+) -> bool:
+    """Return True ONLY when a `finance`/`macro`/`research` payload succeeded with 0 records and no sub-source failures."""
+    if tool_name not in ("finance", "macro", "research"):
+        return False
+    if route == "market-regime":
+        return False
+    if route == "transcript":
+        return _is_transcript_no_match_payload(payload)
+    if _has_disqualifying_error_signals(payload):
+        return False
+    if payload.get("ok") is not True:
+        return False
+    if operation in ("read", "get_document", "auth_status", "list_filters"):
+        return False
+    status = str(payload.get("status") or "").strip().lower()
+    if status in ("no_match", "empty"):
+        return True
+    data_dict = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    sc_dict = (
+        source_identity._unwrap_mcp_proxy_payload(data_dict)
+        if isinstance(data_dict, dict) and data_dict
+        else {}
+    )
+    for container in (payload, data_dict, sc_dict if isinstance(sc_dict, dict) else {}):
+        if not isinstance(container, dict):
+            continue
+        for list_key in ("results", "rows", "transcripts", "filings", "observations", "data"):
+            val = container.get(list_key)
+            if isinstance(val, list):
+                return len(val) == 0
+    return False
+
+
+def _apply_error_and_empty_contract(
+    tool_name: str,
+    route: str,
+    operation: str,
+    payload: dict[str, Any],
+    normalized_params: dict[str, Any],
+) -> None:
+    """Mutate `payload` in-place to enforce `normalized_params`, `ok: False` error categories + `hint` when `failed=True` (failure takes priority over empty results), and `ok: True` + `empty_reason` on confirmed no-match."""
+    payload["normalized_params"] = normalized_params
+
+    unwrapped_check = _unwrap_upstream_error_info(payload)
+    if tool_name != "community":
+        succeeded_srcs, failed_srcs = _collect_multi_source_health(payload)
+        if failed_srcs:
+            payload["ok"] = False
+            if route == "all" or succeeded_srcs:
+                payload["partial"] = succeeded_srcs
+            if str(payload.get("status") or "").strip().lower() in ("", "ok", "empty"):
+                payload["status"] = "partial_error" if succeeded_srcs else "error"
+            if not payload.get("error"):
+                failed_desc = "; ".join(f"{name}: {reason}" for name, reason in failed_srcs)
+                payload["error"] = f"部分数据源调用失败 ({failed_desc})"
+
+    failed = bool(unwrapped_check["failed"] or payload.get("error"))
+    if failed:
+        data_dict = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        fb_obj = payload.get("fallback") if "fallback" in payload else data_dict.get("fallback")
+        fb_dict = fb_obj if isinstance(fb_obj, dict) else {}
+        fb_source = str(fb_dict.get("source") or "").strip().lower()
+        fb_reason = str(fb_dict.get("reason") or "").strip().lower()
+        data_reason = str(data_dict.get("reason") or payload.get("reason") or "").strip().lower()
+        has_roic_failure = fb_source == "roic" and "alphaengine_no_match" not in (fb_reason, data_reason)
+
+        payload["ok"] = False
+        payload.pop("empty_reason", None)
+        cur_st = str(payload.get("status") or "").strip().lower()
+        unwrapped_st = str(unwrapped_check.get("status") or "").strip().lower()
+        if cur_st in ("script_error", "degraded", "partial_error"):
+            payload["status"] = cur_st
+        elif unwrapped_st in _SPECIFIC_FAILURE_STATUSES:
+            payload["status"] = unwrapped_st
+        elif cur_st in _SPECIFIC_FAILURE_STATUSES:
+            payload["status"] = cur_st
+        elif unwrapped_st in _FAILURE_STATUSES:
+            payload["status"] = unwrapped_st
+        elif cur_st in _FAILURE_STATUSES:
+            payload["status"] = cur_st
+        elif cur_st not in _NON_FAILURE_STATUS_WORDS:
+            # A route-specific failure word (market-regime's invalid_source,
+            # source_missing) says more than a generic "error".
+            payload["status"] = cur_st
+        elif unwrapped_st not in _NON_FAILURE_STATUS_WORDS:
+            payload["status"] = unwrapped_st
+        else:
+            payload["status"] = "error"
+        if not payload.get("error"):
+            if unwrapped_check["error"]:
+                payload["error"] = unwrapped_check["error"]
+            elif has_roic_failure:
+                payload["error"] = str(
+                    fb_dict.get("reason")
+                    or data_dict.get("reason")
+                    or "AlphaEngine 检索失败（roic 兜底已停用）"
+                )
+            elif payload["status"] not in ("error", "failed"):
+                payload["error"] = f"调用失败 ({payload['status']})"
+            else:
+                payload["error"] = "调用失败"
+
+        category, hint = _classify_error_category_and_hint(
+            tool_name, route, operation, payload
+        )
+        payload["error_category"] = category
+        unwrapped_err = _unwrap_upstream_error_info(payload)["error"]
+        raw_err = str(
+            payload.get("error")
+            or payload.get("reason")
+            or unwrapped_err
+            or "调用失败"
+        ).strip()
+        if category not in raw_err:
+            payload["error"] = f"[{category}] {raw_err}"
+        else:
+            payload["error"] = raw_err
+        payload["hint"] = hint
+        return
+
+    # True no-match on non-community routes (`research`, `finance`, `macro`) -> `ok: True` + `empty_reason`
+    if tool_name in ("finance", "macro", "research") and _is_empty_non_community_payload(
+        tool_name, route, operation, payload
+    ):
+        payload["ok"] = True
+        if str(payload.get("status") or "").strip().lower() in ("error", "no_match", ""):
+            payload["status"] = "empty"
+        payload.pop("fallback", None)
+        if route == "transcript":
+            payload["empty_reason"] = str(payload.get("empty_reason") or "no_matching_transcripts")
+            payload.setdefault("results", [])
+            if isinstance(payload.get("data"), dict):
+                payload["data"]["ok"] = True
+                payload["data"].pop("fallback", None)
+                payload["data"].setdefault("transcripts", [])
+            payload["hint"] = TRANSCRIPT_NO_MATCH_HINT
+        else:
+            payload["empty_reason"] = str(payload.get("empty_reason") or "no_matching_records")
+            if "results" not in payload and "rows" not in payload and not isinstance(payload.get("data"), (dict, list)):
+                payload["results"] = []
+            if not payload.get("hint"):
+                payload["hint"] = (
+                    f"路由 '{route}' 查询成功但无匹配记录；可调整 query 关键词、扩大 start/end 时间范围或换路由重试。"
+                )
+        return
 
 _TICKER_RE = re.compile(r"^[A-Za-z0-9._\-]{1,32}$")
 _POST_ID_RE = re.compile(r"^[0-9]{1,32}$")
@@ -1629,11 +3717,23 @@ def _has_last30days_items(parsed: Any) -> bool:
     return False
 
 
+def _is_last30days_source_entry_failed(entry: Any) -> bool:
+    if isinstance(entry, dict) and (
+        entry.get("ok") is False
+        or entry.get("isError") is True
+        or bool(entry.get("error"))
+    ):
+        return True
+    return _extract_last30days_source_state(entry) in _FAILURE_STATUSES
+
+
 def _is_all_last30days_no_results(raw_src_status: Any) -> bool:
-    """Return True only when `source_status` is a non-empty dict where every source state is `no-results`."""
+    """Return True only when `source_status` is a non-empty dict where every source state is `no-results` and none flagged an error."""
     if not isinstance(raw_src_status, dict) or not raw_src_status:
         return False
     for src_val in raw_src_status.values():
+        if _is_last30days_source_entry_failed(src_val):
+            return False
         if _extract_last30days_source_state(src_val) != "no-results":
             return False
     return True
@@ -1691,12 +3791,16 @@ class ResearchDataBridge:
     document IDs vs numeric AlphaEngine IDs, and prevents topic queries from derailing `transcript`.
     """
 
+    CATALOG_DESCRIPTION_SUFFIX: str = CATALOG_DESCRIPTION_SUFFIX
+    FINANCE_DESCRIPTION_SUFFIX: str = FINANCE_DESCRIPTION_SUFFIX
+    MACRO_DESCRIPTION_SUFFIX: str = MACRO_DESCRIPTION_SUFFIX
     RESEARCH_DESCRIPTION_SUFFIX: str = (
-        "\n\n"
+        "\n\nNote: "
         + RESEARCH_EVIDENCE_AND_ROUTE_GUIDE
-        + "\n分页参数范围：params.offset >= 0，params.max_chars 为 1–30000（超出 30000 自动截断为 30000）。"
+        + RESEARCH_ROUTE_PARAM_CONTRACT_SUFFIX
     )
     COMMUNITY_DESCRIPTION_SUFFIX: str = COMMUNITY_DESCRIPTION_SUFFIX
+    NEWS_DESCRIPTION_SUFFIX: str = NEWS_DESCRIPTION_SUFFIX
 
     def __init__(self, cfg: BridgeConfig) -> None:
         self.cfg = cfg
@@ -2077,9 +4181,48 @@ class ResearchDataBridge:
                     )
                 m_desc = str(tool_copy.get("description") or "").rstrip()
                 if "market-regime" not in m_desc:
-                    tool_copy["description"] = (
+                    m_desc = (
                         f"{m_desc} Market regime & crowding: route='market-regime' (operations: snapshot, us_topbottom, crowding, cn_leverage)."
                     ).strip()
+                if self.MACRO_DESCRIPTION_SUFFIX.strip() not in m_desc:
+                    m_desc = m_desc + self.MACRO_DESCRIPTION_SUFFIX
+                tool_copy["description"] = m_desc
+            elif tool_name == "finance":
+                f_desc = str(tool_copy.get("description") or "").rstrip()
+                if self.FINANCE_DESCRIPTION_SUFFIX.strip() not in f_desc:
+                    tool_copy["description"] = f_desc + self.FINANCE_DESCRIPTION_SUFFIX
+            elif tool_name == "catalog":
+                c_desc = str(tool_copy.get("description") or "").rstrip()
+                if self.CATALOG_DESCRIPTION_SUFFIX.strip() not in c_desc:
+                    tool_copy["description"] = c_desc + self.CATALOG_DESCRIPTION_SUFFIX
+                if isinstance(props, dict):
+                    props.setdefault(
+                        "route",
+                        {
+                            "type": "string",
+                            "description": "按单个 route 查询详细参数契约（必填/可选参数、日期与股票代码格式、返回结构、调用示例），如 'sec'、'cn-hk'、'alphaengine'、'transcript'、'xueqiu'、'x-timeline'。",
+                        },
+                    )
+            elif tool_name == "news":
+                n_desc = str(tool_copy.get("description") or "").rstrip()
+                if self.NEWS_DESCRIPTION_SUFFIX.strip() not in n_desc:
+                    tool_copy["description"] = n_desc + self.NEWS_DESCRIPTION_SUFFIX
+            if isinstance(props, dict):
+                schema_obj = tool_copy.get("inputSchema")
+                if isinstance(schema_obj, dict) and isinstance(schema_obj.get("required"), list):
+                    schema_obj["required"] = [
+                        r_k for r_k in schema_obj["required"] if r_k != "route"
+                    ]
+                req_set = set(
+                    (tool_copy.get("inputSchema") or {}).get("required") or []
+                )
+                for p_name, p_schema in props.items():
+                    if p_name not in req_set and isinstance(p_schema, dict):
+                        p_schema.pop("default", None)
+                for alias_k, alias_schema in (
+                    TOOL_SCHEMA_ALIAS_PROPERTIES.get(tool_name) or {}
+                ).items():
+                    props.setdefault(alias_k, dict(alias_schema))
             filtered.append(tool_copy)
 
         self._cached_tools = filtered
@@ -2323,14 +4466,17 @@ class ResearchDataBridge:
             }
 
         inner = ae_payload.get("data") if isinstance(ae_payload.get("data"), dict) else ae_payload
+        ae_unwrapped = _unwrap_upstream_error_info(ae_payload)
         is_err = (
             bool(isinstance(res_obj, dict) and res_obj.get("isError"))
+            or bool(ae_unwrapped["failed"])
             or ae_payload.get("ok") is False
             or bool(isinstance(inner, dict) and inner.get("isError"))
         )
         if is_err:
             err_text = str(
-                ae_payload.get("error")
+                ae_unwrapped["error"]
+                or ae_payload.get("error")
                 or ae_payload.get("reason")
                 or ""
             ).strip()
@@ -2338,13 +4484,18 @@ class ResearchDataBridge:
                 c_blocks = inner["content"]
                 if c_blocks and isinstance(c_blocks[0], dict):
                     err_text = str(c_blocks[0].get("text") or "").strip()
-            reason = (err_text or "alphaengine call returned error")[:200]
-            raw_status = str(ae_payload.get("status") or "").strip().lower()
-            status = (
-                "timeout"
-                if raw_status == "timeout" or "timeout" in reason.lower() or "timed out" in reason.lower()
-                else "failed"
-            )
+            raw_status = str(ae_unwrapped["status"] or ae_payload.get("status") or "").strip().lower()
+            if raw_status == "timeout" or "timeout" in err_text.lower() or "timed out" in err_text.lower():
+                status = "timeout"
+            elif raw_status in _SPECIFIC_FAILURE_STATUSES:
+                status = raw_status
+            else:
+                status = "failed"
+            reason = (
+                err_text
+                or (f"alphaengine status={status}" if status not in ("failed", "error") else "")
+                or "alphaengine call returned error"
+            )[:200]
             return {
                 "ok": False,
                 "status": status,
@@ -2511,14 +4662,17 @@ class ResearchDataBridge:
             }
 
         inner = gp_payload.get("data") if isinstance(gp_payload.get("data"), dict) else gp_payload
+        gp_unwrapped = _unwrap_upstream_error_info(gp_payload)
         is_err = (
             bool(isinstance(res_obj, dict) and res_obj.get("isError"))
+            or bool(gp_unwrapped["failed"])
             or gp_payload.get("ok") is False
             or bool(isinstance(inner, dict) and inner.get("isError"))
         )
         if is_err:
             err_text = str(
-                gp_payload.get("error")
+                gp_unwrapped["error"]
+                or gp_payload.get("error")
                 or gp_payload.get("reason")
                 or ""
             ).strip()
@@ -2526,13 +4680,18 @@ class ResearchDataBridge:
                 c_blocks = inner["content"]
                 if c_blocks and isinstance(c_blocks[0], dict):
                     err_text = str(c_blocks[0].get("text") or "").strip()
-            reason = (err_text or "guidepoint call returned error")[:200]
-            raw_status = str(gp_payload.get("status") or "").strip().lower()
-            status = (
-                "timeout"
-                if raw_status == "timeout" or "timeout" in reason.lower() or "timed out" in reason.lower()
-                else "failed"
-            )
+            raw_status = str(gp_unwrapped["status"] or gp_payload.get("status") or "").strip().lower()
+            if raw_status == "timeout" or "timeout" in err_text.lower() or "timed out" in err_text.lower():
+                status = "timeout"
+            elif raw_status in _SPECIFIC_FAILURE_STATUSES:
+                status = raw_status
+            else:
+                status = "failed"
+            reason = (
+                err_text
+                or (f"guidepoint status={status}" if status not in ("failed", "error") else "")
+                or "guidepoint call returned error"
+            )[:200]
             return {
                 "ok": False,
                 "status": status,
@@ -2607,7 +4766,14 @@ class ResearchDataBridge:
         ae_args: dict[str, Any],
     ) -> list[dict[str, Any]]:
         """Merge AlphaEngine fanout results/status into `route='all'` payload and declared sources."""
-        if ae_outcome.get("ok"):
+        raw_ae_check = ae_outcome.get("raw_payload")
+        ae_raw_unwrapped = (
+            _unwrap_upstream_error_info(raw_ae_check)
+            if isinstance(raw_ae_check, dict)
+            else {"failed": False, "error": "", "status": ""}
+        )
+        ae_ok = bool(ae_outcome.get("ok")) and not bool(ae_raw_unwrapped["failed"])
+        if ae_ok:
             ae_items = list(ae_outcome.get("results") or [])
             ae_section: dict[str, Any] = {
                 "ok": True,
@@ -2617,8 +4783,9 @@ class ResearchDataBridge:
                 "results": ae_items,
             }
         else:
-            st = str(ae_outcome.get("status") or "failed")
-            reason = str(ae_outcome.get("reason") or st)
+            st_cand = str(ae_outcome.get("status") or ae_raw_unwrapped.get("status") or "").strip().lower()
+            st = st_cand if st_cand in _FAILURE_STATUSES else "failed"
+            reason = str(ae_outcome.get("reason") or ae_raw_unwrapped.get("error") or st)
             ae_items = []
             ae_section = {
                 "ok": False,
@@ -2630,11 +4797,40 @@ class ResearchDataBridge:
                 "results": [],
             }
 
-        payload["alphaengine"] = ae_section
-        if isinstance(payload.get("source_status"), dict):
-            payload["source_status"]["alphaengine"] = {
-                k: v for k, v in ae_section.items() if k != "results"
+        if not isinstance(payload.get("source_status"), dict):
+            local_probe = {
+                k: v
+                for k, v in payload.items()
+                if k not in ("alphaengine", "guidepoint", "source_status")
             }
+            local_unwrapped = _unwrap_upstream_error_info(local_probe)
+            local_ok = bool(payload.get("ok")) and not bool(local_unwrapped["failed"])
+            if local_ok:
+                local_entry: dict[str, Any] = {
+                    "ok": True,
+                    "status": str(payload.get("status") or "ok"),
+                    "count": (
+                        len(payload.get("results") or [])
+                        if isinstance(payload.get("results"), list)
+                        else 0
+                    ),
+                }
+            else:
+                l_st_raw = str(local_unwrapped.get("status") or payload.get("status") or "").strip().lower()
+                l_st = l_st_raw if l_st_raw in _FAILURE_STATUSES else "failed"
+                l_reason = str(local_unwrapped.get("error") or payload.get("error") or l_st)
+                local_entry = {
+                    "ok": False,
+                    "status": l_st,
+                    "reason": l_reason,
+                    "error": l_reason,
+                    "count": 0,
+                }
+            payload["source_status"] = {"local_all": local_entry}
+        payload["alphaengine"] = ae_section
+        payload["source_status"]["alphaengine"] = {
+            k: v for k, v in ae_section.items() if k != "results"
+        }
 
         if ae_items and isinstance(payload.get("results"), list):
             existing_ids = {
@@ -2692,7 +4888,14 @@ class ResearchDataBridge:
         gp_args: dict[str, Any],
     ) -> list[dict[str, Any]]:
         """Merge Guidepoint fanout results/status into `route='all'` payload and declared sources."""
-        if gp_outcome.get("ok"):
+        raw_gp_check = gp_outcome.get("raw_payload")
+        gp_raw_unwrapped = (
+            _unwrap_upstream_error_info(raw_gp_check)
+            if isinstance(raw_gp_check, dict)
+            else {"failed": False, "error": "", "status": ""}
+        )
+        gp_ok = bool(gp_outcome.get("ok")) and not bool(gp_raw_unwrapped["failed"])
+        if gp_ok:
             gp_items = list(gp_outcome.get("results") or [])
             gp_section: dict[str, Any] = {
                 "ok": True,
@@ -2702,8 +4905,9 @@ class ResearchDataBridge:
                 "results": gp_items,
             }
         else:
-            st = str(gp_outcome.get("status") or "failed")
-            reason = str(gp_outcome.get("reason") or st)
+            st_cand = str(gp_outcome.get("status") or gp_raw_unwrapped.get("status") or "").strip().lower()
+            st = st_cand if st_cand in _FAILURE_STATUSES else "failed"
+            reason = str(gp_outcome.get("reason") or gp_raw_unwrapped.get("error") or st)
             gp_items = []
             gp_section = {
                 "ok": False,
@@ -2715,11 +4919,40 @@ class ResearchDataBridge:
                 "results": [],
             }
 
-        payload["guidepoint"] = gp_section
-        if isinstance(payload.get("source_status"), dict):
-            payload["source_status"]["guidepoint"] = {
-                k: v for k, v in gp_section.items() if k != "results"
+        if not isinstance(payload.get("source_status"), dict):
+            local_probe = {
+                k: v
+                for k, v in payload.items()
+                if k not in ("alphaengine", "guidepoint", "source_status")
             }
+            local_unwrapped = _unwrap_upstream_error_info(local_probe)
+            local_ok = bool(payload.get("ok")) and not bool(local_unwrapped["failed"])
+            if local_ok:
+                local_entry: dict[str, Any] = {
+                    "ok": True,
+                    "status": str(payload.get("status") or "ok"),
+                    "count": (
+                        len(payload.get("results") or [])
+                        if isinstance(payload.get("results"), list)
+                        else 0
+                    ),
+                }
+            else:
+                l_st_raw = str(local_unwrapped.get("status") or payload.get("status") or "").strip().lower()
+                l_st = l_st_raw if l_st_raw in _FAILURE_STATUSES else "failed"
+                l_reason = str(local_unwrapped.get("error") or payload.get("error") or l_st)
+                local_entry = {
+                    "ok": False,
+                    "status": l_st,
+                    "reason": l_reason,
+                    "error": l_reason,
+                    "count": 0,
+                }
+            payload["source_status"] = {"local_all": local_entry}
+        payload["guidepoint"] = gp_section
+        payload["source_status"]["guidepoint"] = {
+            k: v for k, v in gp_section.items() if k != "results"
+        }
 
         if gp_items and isinstance(payload.get("results"), list):
             existing_ids = {
@@ -2815,6 +5048,11 @@ class ResearchDataBridge:
     def _make_tool_result_response(
         req_id: Any, payload: dict[str, Any], *, is_error: bool
     ) -> dict[str, Any]:
+        effective_is_error = (
+            not bool(payload.get("ok"))
+            if isinstance(payload, dict) and "ok" in payload
+            else bool(is_error)
+        )
         return {
             "jsonrpc": "2.0",
             "id": req_id,
@@ -2826,7 +5064,7 @@ class ResearchDataBridge:
                     }
                 ],
                 "structuredContent": dict(payload),
-                "isError": is_error,
+                "isError": effective_is_error,
             },
         }
 
@@ -2979,7 +5217,7 @@ class ResearchDataBridge:
         clean_args = {
             k: v
             for k, v in arguments.items()
-            if k not in UPSTREAM_GENERIC_COMMUNITY_PARAMS
+            if k not in UPSTREAM_GENERIC_COMMUNITY_PARAMS and v is not None
         }
         if route == "xueqiu":
             allowed_keys = {
@@ -2993,7 +5231,9 @@ class ResearchDataBridge:
             }
             extra = set(clean_args.keys()) - allowed_keys
             if extra:
-                raise ValueError(f"Unsupported parameters for xueqiu: {sorted(extra)}")
+                raise ValueError(
+                    f"Unsupported parameters for xueqiu: {sorted(extra)}. Accepted parameters: {sorted(allowed_keys)}"
+                )
             op = clean_args.get("operation")
             if not isinstance(op, str) or op not in (
                 "posts",
@@ -3003,12 +5243,14 @@ class ResearchDataBridge:
                 "user",
             ):
                 raise ValueError(
-                    "xueqiu operation must be one of: posts, post, comments, search, user"
+                    f"xueqiu operation must be one of: posts, post, comments, search, user. Accepted parameters: {sorted(allowed_keys)}"
                 )
             if op == "posts":
                 for forbidden in ("url", "post_id", "query"):
                     if clean_args.get(forbidden) is not None:
-                        raise ValueError(f"Parameter '{forbidden}' is not allowed for xueqiu posts")
+                        raise ValueError(
+                            f"Parameter '{forbidden}' is not allowed for xueqiu posts. Accepted parameters for xueqiu posts: ['operation', 'pages', 'route', 'ticker']"
+                        )
                 raw_ticker = clean_args.get("ticker")
                 if not isinstance(raw_ticker, str):
                     raise ValueError("ticker is required and must be a string")
@@ -3034,7 +5276,9 @@ class ResearchDataBridge:
             if op == "post":
                 for forbidden in ("ticker", "post_id", "query", "pages"):
                     if clean_args.get(forbidden) is not None:
-                        raise ValueError(f"Parameter '{forbidden}' is not allowed for xueqiu post")
+                        raise ValueError(
+                            f"Parameter '{forbidden}' is not allowed for xueqiu post. Accepted parameters for xueqiu post: ['operation', 'route', 'url']"
+                        )
                 url = _validate_community_url(
                     clean_args.get("url"), required_domain="xueqiu.com"
                 )
@@ -3049,7 +5293,7 @@ class ResearchDataBridge:
                 for forbidden in ("ticker", "url", "query"):
                     if clean_args.get(forbidden) is not None:
                         raise ValueError(
-                            f"Parameter '{forbidden}' is not allowed for xueqiu comments"
+                            f"Parameter '{forbidden}' is not allowed for xueqiu comments. Accepted parameters for xueqiu comments: ['operation', 'pages', 'post_id', 'route']"
                         )
                 raw_post_id = clean_args.get("post_id")
                 if not isinstance(raw_post_id, str):
@@ -3077,7 +5321,7 @@ class ResearchDataBridge:
                 for forbidden in ("ticker", "url", "post_id"):
                     if clean_args.get(forbidden) is not None:
                         raise ValueError(
-                            f"Parameter '{forbidden}' is not allowed for xueqiu search"
+                            f"Parameter '{forbidden}' is not allowed for xueqiu search. Accepted parameters for xueqiu search: ['operation', 'pages', 'query', 'route']"
                         )
                 query = _validate_clean_text(
                     clean_args.get("query"), field_name="query", max_len=200
@@ -3101,7 +5345,9 @@ class ResearchDataBridge:
             # op == "user"
             for forbidden in ("ticker", "post_id", "query"):
                 if clean_args.get(forbidden) is not None:
-                    raise ValueError(f"Parameter '{forbidden}' is not allowed for xueqiu user")
+                    raise ValueError(
+                        f"Parameter '{forbidden}' is not allowed for xueqiu user. Accepted parameters for xueqiu user: ['operation', 'pages', 'route', 'url']"
+                    )
             url = _validate_community_url(
                 clean_args.get("url"), required_domain="xueqiu.com"
             )
@@ -3133,7 +5379,9 @@ class ResearchDataBridge:
             }
             extra = set(clean_args.keys()) - allowed_keys
             if extra:
-                raise ValueError(f"Unsupported parameters for employee: {sorted(extra)}")
+                raise ValueError(
+                    f"Unsupported parameters for employee: {sorted(extra)}. Accepted parameters: {sorted(allowed_keys)}"
+                )
             op = clean_args.get("operation")
             if not isinstance(op, str) or op not in (
                 "blind",
@@ -3142,14 +5390,16 @@ class ResearchDataBridge:
                 "glassdoor",
             ):
                 raise ValueError(
-                    "employee operation must be one of: blind, summary, indeed, glassdoor"
+                    f"employee operation must be one of: blind, summary, indeed, glassdoor. Accepted parameters: {sorted(allowed_keys)}"
                 )
             allow_paid = clean_args.get("allow_paid")
             if allow_paid is not None and not isinstance(allow_paid, bool):
                 raise ValueError("allow_paid must be a boolean")
             if op in ("blind", "summary", "indeed"):
                 if clean_args.get("url") is not None:
-                    raise ValueError(f"Parameter 'url' is not allowed for employee {op}")
+                    raise ValueError(
+                        f"Parameter 'url' is not allowed for employee {op}. Accepted parameters for employee {op}: ['allow_paid', 'company', 'operation', 'pages', 'route']"
+                    )
                 raw_company = clean_args.get("company")
                 if not isinstance(raw_company, str):
                     raise ValueError("company is required and must be a string")
@@ -3183,7 +5433,7 @@ class ResearchDataBridge:
             for forbidden in ("company", "pages"):
                 if clean_args.get(forbidden) is not None:
                     raise ValueError(
-                        f"Parameter '{forbidden}' is not allowed for employee glassdoor"
+                        f"Parameter '{forbidden}' is not allowed for employee glassdoor. Accepted parameters for employee glassdoor: ['allow_paid', 'operation', 'route', 'url']"
                     )
             url = _validate_community_url(
                 clean_args.get("url"), required_domain="glassdoor.com"
@@ -3201,11 +5451,15 @@ class ResearchDataBridge:
             allowed_keys = {"route", "operation", "query", "days", "quick", "plan"}
             extra = set(clean_args.keys()) - allowed_keys
             if extra:
-                raise ValueError(f"Unsupported parameters for last30days: {sorted(extra)}")
+                raise ValueError(
+                    f"Unsupported parameters for last30days: {sorted(extra)}. Accepted parameters: {sorted(allowed_keys)}"
+                )
             raw_op = clean_args.get("operation")
             if raw_op is not None:
                 if not isinstance(raw_op, str) or raw_op.strip() not in ("", "search"):
-                    raise ValueError("last30days operation must be 'search' or omitted")
+                    raise ValueError(
+                        f"last30days operation must be 'search' or omitted. Accepted parameters: {sorted(allowed_keys)}"
+                    )
             query = _validate_clean_text(
                 clean_args.get("query"), field_name="query", max_len=300
             )
@@ -3248,13 +5502,11 @@ class ResearchDataBridge:
             return cmd
 
         if route == "x-timeline":
-            # `params`/`start`/`end` would be silently dropped by the generic-param strip,
-            # so reject them on the raw arguments with a pointer to the right knob.
-            for legacy in ("params", "start", "end"):
-                if arguments.get(legacy) is not None:
-                    raise ValueError(
-                        f"x-timeline does not support '{legacy}'; use since/until for the date window"
-                    )
+            # `params` is not supported on x-timeline; `start`/`end`/`limit` are normalized to `since`/`until`/`count`.
+            if arguments.get("params") is not None:
+                raise ValueError(
+                    "x-timeline does not support 'params'; pass top-level since/until/count. Accepted parameters: ['count', 'handle', 'include_replies', 'operation', 'query', 'route', 'since', 'tweet_id', 'until', 'url']"
+                )
             allowed_keys = {
                 "route",
                 "operation",
@@ -3269,7 +5521,9 @@ class ResearchDataBridge:
             }
             extra = set(clean_args.keys()) - allowed_keys
             if extra:
-                raise ValueError(f"Unsupported parameters for x-timeline: {sorted(extra)}")
+                raise ValueError(
+                    f"Unsupported parameters for x-timeline: {sorted(extra)}. Accepted parameters: {sorted(allowed_keys)}"
+                )
             raw_op = clean_args.get("operation")
             if raw_op is None or (isinstance(raw_op, str) and not raw_op.strip()):
                 op = "tweets"
@@ -3282,7 +5536,7 @@ class ResearchDataBridge:
                 op = raw_op.strip()
             else:
                 raise ValueError(
-                    "x-timeline operation must be one of: tweets, tweet, thread, search"
+                    f"x-timeline operation must be one of: tweets, tweet, thread, search. Accepted parameters: {sorted(allowed_keys)}"
                 )
             since = (
                 _validate_x_date(clean_args.get("since"), field_name="since")
@@ -3304,7 +5558,7 @@ class ResearchDataBridge:
                 for forbidden in ("url", "tweet_id", "query"):
                     if clean_args.get(forbidden) is not None:
                         raise ValueError(
-                            f"Parameter '{forbidden}' is not allowed for x-timeline tweets"
+                            f"Parameter '{forbidden}' is not allowed for x-timeline tweets. Accepted parameters for x-timeline tweets: ['count', 'handle', 'include_replies', 'operation', 'route', 'since', 'until']"
                         )
                 handle = _normalize_x_handle(clean_args.get("handle"))
                 count = _validate_int_range(
@@ -3331,12 +5585,12 @@ class ResearchDataBridge:
                 for forbidden in ("handle", "url", "tweet_id"):
                     if clean_args.get(forbidden) is not None:
                         raise ValueError(
-                            f"Parameter '{forbidden}' is not allowed for x-timeline search"
+                            f"Parameter '{forbidden}' is not allowed for x-timeline search. Accepted parameters for x-timeline search: ['count', 'operation', 'query', 'route', 'since', 'until']"
                         )
                 # xreach's search subcommand has no --replies option.
                 if include_replies is not None:
                     raise ValueError(
-                        "Parameter 'include_replies' is not allowed for x-timeline search"
+                        "Parameter 'include_replies' is not allowed for x-timeline search. Accepted parameters for x-timeline search: ['count', 'operation', 'query', 'route', 'since', 'until']"
                     )
                 query = _validate_clean_text(
                     clean_args.get("query"), field_name="query", max_len=300
@@ -3375,7 +5629,7 @@ class ResearchDataBridge:
             ):
                 if clean_args.get(forbidden) is not None:
                     raise ValueError(
-                        f"Parameter '{forbidden}' is not allowed for x-timeline {op}"
+                        f"Parameter '{forbidden}' is not allowed for x-timeline {op}. Accepted parameters for x-timeline {op}: ['operation', 'route', 'tweet_id', 'url']"
                     )
             target = _extract_x_tweet_target(clean_args)
             cmd = [str(self.cfg.xreach_bin), op, target, "--json"]
@@ -3397,6 +5651,20 @@ class ResearchDataBridge:
             operation = "search"
         if route == "x-timeline" and not operation:
             operation = "tweets"
+        norm_params = _build_normalized_params_view(arguments, is_community=True)
+
+        def _finish_comm(payload: dict[str, Any], *, is_error: bool = False) -> dict[str, Any]:
+            _apply_error_and_empty_contract(
+                "community", route, operation, payload, norm_params
+            )
+            final_is_error = (
+                not bool(payload.get("ok"))
+                if isinstance(payload, dict) and "ok" in payload
+                else bool(is_error)
+            )
+            return self._make_tool_result_response(
+                req_id, payload, is_error=final_is_error
+            )
 
         # Paid source gate for employee indeed/glassdoor
         if route == "employee" and operation in ("indeed", "glassdoor"):
@@ -3420,7 +5688,7 @@ class ResearchDataBridge:
                         error=paid_err_msg,
                     ),
                 }
-                return self._make_tool_result_response(req_id, paid_err, is_error=True)
+                return _finish_comm(paid_err, is_error=True)
 
         plan_obj: dict[str, Any] | None = None
         if route == "last30days" and arguments.get("plan") is not None:
@@ -3442,7 +5710,7 @@ class ResearchDataBridge:
                         error=str(exc),
                     ),
                 }
-                return self._make_tool_result_response(req_id, err_payload, is_error=True)
+                return _finish_comm(err_payload, is_error=True)
 
         plan_file: Path | None = None
         try:
@@ -3465,9 +5733,7 @@ class ResearchDataBridge:
                             error=err_msg,
                         ),
                     }
-                    return self._make_tool_result_response(
-                        req_id, err_payload, is_error=True
-                    )
+                    return _finish_comm(err_payload, is_error=True)
                 cache_root.mkdir(parents=True, exist_ok=True)
                 plan_file = cache_root / f"last30days-plan-{uuid.uuid4().hex}.json"
                 plan_file.write_text(
@@ -3479,22 +5745,34 @@ class ResearchDataBridge:
                     route, arguments, plan_file=plan_file
                 )
             except ValueError as exc:
+                exc_msg = str(exc)
+                err_code = (
+                    "unknown_parameters"
+                    if (
+                        "Unsupported parameters" in exc_msg
+                        or "does not support" in exc_msg
+                        or ("Parameter '" in exc_msg and "is not allowed for" in exc_msg)
+                    )
+                    else "invalid_arguments"
+                )
+                spec_comm = ROUTE_CONTRACT_SPECS.get(route) or {}
                 err_payload = {
                     "_declared_sources": [],
                     "_sources": [],
                     "ok": False,
                     "status": "invalid_arguments",
-                    "error_code": "invalid_arguments",
-                    "error": str(exc),
+                    "error_code": err_code,
+                    "accepted_parameters": list(spec_comm.get("accepted_params") or []),
+                    "error": exc_msg,
                     "data": sanitize_error_data_summary(
                         None,
                         route=route,
                         operation=operation,
                         status="invalid_arguments",
-                        error=str(exc),
+                        error=exc_msg,
                     ),
                 }
-                return self._make_tool_result_response(req_id, err_payload, is_error=True)
+                return _finish_comm(err_payload, is_error=True)
 
             missing_err = self._check_community_source_files(route)
             if missing_err is not None:
@@ -3513,9 +5791,7 @@ class ResearchDataBridge:
                         error=missing_err,
                     ),
                 }
-                return self._make_tool_result_response(
-                    req_id, missing_payload, is_error=True
-                )
+                return _finish_comm(missing_payload, is_error=True)
 
             route_sem = self.community_sems.get(route) or self.sem
             t0 = time.monotonic()
@@ -3585,9 +5861,7 @@ class ResearchDataBridge:
                     ),
                     "error": timeout_msg,
                 }
-                return self._make_tool_result_response(
-                    req_id, timeout_payload, is_error=True
-                )
+                return _finish_comm(timeout_payload, is_error=True)
 
             elapsed_ms = int((time.monotonic() - t0) * 1000)
             stderr_tail = sanitize_stderr_text(stderr_bytes, max_len=500)
@@ -3618,9 +5892,7 @@ class ResearchDataBridge:
                     rc,
                     elapsed_ms,
                 )
-                return self._make_tool_result_response(
-                    req_id, err_payload, is_error=True
-                )
+                return _finish_comm(err_payload, is_error=True)
 
             stdout_text = stdout_bytes.decode("utf-8", errors="replace").strip()
             parsed: Any = None
@@ -3667,30 +5939,46 @@ class ResearchDataBridge:
                     operation or "-",
                     elapsed_ms,
                 )
-                return self._make_tool_result_response(
-                    req_id, err_payload, is_error=True
-                )
+                return _finish_comm(err_payload, is_error=True)
 
             parsed = _sanitize_community_payload_metadata(parsed)
 
-            if route == "x-timeline":
-                parsed = _normalize_x_timeline_output(
-                    parsed,
-                    operation=operation,
-                    count=_validate_int_range(
-                        arguments.get("count"),
-                        field_name="count",
-                        min_val=1,
-                        max_val=100,
-                        default=20,
-                    ),
-                    since=str(arguments.get("since") or "").strip(),
-                    until=str(arguments.get("until") or "").strip(),
-                )
-
-            if isinstance(parsed, dict) and parsed.get("ok") is False:
+            raw_p_status = (
+                str(parsed.get("status") or "").strip().lower()
+                if isinstance(parsed, dict)
+                else ""
+            )
+            comm_probe = (
+                {k: v for k, v in parsed.items() if k != "source_status"}
+                if isinstance(parsed, dict) and route == "last30days"
+                else parsed
+            )
+            comm_unwrapped = (
+                _unwrap_upstream_error_info(comm_probe)
+                if isinstance(comm_probe, dict)
+                else {"failed": False, "error": "", "status": ""}
+            )
+            if isinstance(parsed, dict) and (
+                parsed.get("ok") is False
+                or parsed.get("isError") is True
+                or bool(parsed.get("error"))
+                or raw_p_status in _FAILURE_STATUSES
+                or bool(comm_unwrapped["failed"])
+            ):
+                eff_status_tok = raw_p_status or str(comm_unwrapped.get("status") or "").strip().lower()
                 err_msg = sanitize_stderr_text(
-                    str(parsed.get("error") or stderr_tail or "Script reported ok=false"),
+                    str(
+                        parsed.get("error")
+                        or comm_unwrapped.get("error")
+                        or parsed.get("message")
+                        or stderr_tail
+                        or (
+                            f"Script reported status={eff_status_tok}"
+                            if eff_status_tok in _FAILURE_STATUSES
+                            else ""
+                        )
+                        or "Script reported ok=false"
+                    ),
                     max_len=500,
                 )
                 err_payload = {
@@ -3708,8 +5996,21 @@ class ResearchDataBridge:
                     "error": err_msg,
                     "stderr": stderr_tail,
                 }
-                return self._make_tool_result_response(
-                    req_id, err_payload, is_error=True
+                return _finish_comm(err_payload, is_error=True)
+
+            if route == "x-timeline":
+                parsed = _normalize_x_timeline_output(
+                    parsed,
+                    operation=operation,
+                    count=_validate_int_range(
+                        arguments.get("count"),
+                        field_name="count",
+                        min_val=1,
+                        max_val=100,
+                        default=20,
+                    ),
+                    since=str(arguments.get("since") or "").strip(),
+                    until=str(arguments.get("until") or "").strip(),
                 )
 
             if route == "last30days":
@@ -3723,29 +6024,33 @@ class ResearchDataBridge:
                 if isinstance(raw_src_status, dict):
                     for src_name, src_val in raw_src_status.items():
                         state = _extract_last30days_source_state(src_val) or "unknown"
-                        if state not in _LAST30DAYS_HEALTHY_STATES:
-                            non_healthy_sources[str(src_name)] = state
+                        if state not in _LAST30DAYS_HEALTHY_STATES or _is_last30days_source_entry_failed(src_val):
+                            if isinstance(src_val, dict) and (
+                                src_val.get("ok") is False
+                                or src_val.get("isError") is True
+                                or bool(src_val.get("error"))
+                            ):
+                                non_healthy_sources[str(src_name)] = str(
+                                    src_val.get("error")
+                                    or (state if state not in _LAST30DAYS_HEALTHY_STATES else "error")
+                                )
+                            else:
+                                non_healthy_sources[str(src_name)] = state
                 has_items = _has_last30days_items(parsed)
                 if not has_items:
                     if _is_all_last30days_no_results(raw_src_status):
-                        empty_msg = (
-                            stderr_tail or f"No results returned from community/{route}"
-                        )
                         empty_payload: dict[str, Any] = {
                             "_declared_sources": [],
                             "_sources": [],
-                            "ok": False,
+                            "ok": True,
                             "status": "empty",
+                            "empty_reason": "no_matching_items",
                             "source_status": sanitized_src_status,
-                            "data": sanitize_error_data_summary(
-                                parsed,
-                                route=route,
-                                operation=operation,
-                                status="empty",
-                                error=empty_msg,
-                            ),
-                            "error": empty_msg,
+                            "data": parsed,
                             "stderr": stderr_tail,
+                            "hint": (
+                                f"社区路由 '{route}' 查询成功但未检索到匹配结果；可放宽 query 关键词、增大 days 或换用其他社区路由重试。"
+                            ),
                         }
                         logger.info(
                             "community empty route=%s op=%s elapsed_ms=%d",
@@ -3753,9 +6058,7 @@ class ResearchDataBridge:
                             operation or "-",
                             elapsed_ms,
                         )
-                        return self._make_tool_result_response(
-                            req_id, empty_payload, is_error=True
-                        )
+                        return _finish_comm(empty_payload, is_error=False)
                     if non_healthy_sources:
                         deg_msg = (
                             stderr_tail
@@ -3786,9 +6089,7 @@ class ResearchDataBridge:
                         "error": deg_msg,
                         "stderr": stderr_tail,
                     }
-                    return self._make_tool_result_response(
-                        req_id, degraded_payload, is_error=True
-                    )
+                    return _finish_comm(degraded_payload, is_error=True)
                 if isinstance(parsed, dict) and non_healthy_sources:
                     existing_warnings = (
                         list(parsed.get("warnings"))
@@ -3805,21 +6106,17 @@ class ResearchDataBridge:
                     ]
 
             if _is_empty_community_output(route, operation, parsed):
-                empty_msg = stderr_tail or f"No results returned from community/{route}"
                 empty_payload = {
                     "_declared_sources": [],
                     "_sources": [],
-                    "ok": False,
+                    "ok": True,
                     "status": "empty",
-                    "data": sanitize_error_data_summary(
-                        parsed,
-                        route=route,
-                        operation=operation,
-                        status="empty",
-                        error=empty_msg,
-                    ),
-                    "error": empty_msg,
+                    "empty_reason": "no_matching_items",
+                    "data": parsed,
                     "stderr": stderr_tail,
+                    "hint": (
+                        f"社区路由 '{route}' 查询成功但未检索到匹配结果；可放宽检索词、调整时间范围或换用其他社区路由重试。"
+                    ),
                 }
                 logger.info(
                     "community empty route=%s op=%s elapsed_ms=%d",
@@ -3827,9 +6124,7 @@ class ResearchDataBridge:
                     operation or "-",
                     elapsed_ms,
                 )
-                return self._make_tool_result_response(
-                    req_id, empty_payload, is_error=True
-                )
+                return _finish_comm(empty_payload, is_error=False)
 
             base_envelope: dict[str, Any] = {
                 "ok": True,
@@ -3843,6 +6138,7 @@ class ResearchDataBridge:
                 "ok": True,
                 "status": "ok",
                 "data": parsed,
+                "normalized_params": norm_params,
             }
             if (
                 route == "last30days"
@@ -4297,37 +6593,69 @@ class ResearchDataBridge:
     ) -> dict[str, Any]:
         tool_name = str(params.get("name") or "").strip()
         raw_args = params.get("arguments")
-        arguments: dict[str, Any] = (
+        raw_arguments: dict[str, Any] = (
             dict(raw_args) if isinstance(raw_args, dict) else {}
+        )
+        arguments, norm_params_view, validation_err = _normalize_and_validate_call_args(
+            tool_name, raw_arguments
         )
         route = str(arguments.get("route") or "").strip()
         operation = str(arguments.get("operation") or "").strip()
 
         handoff = self.handoff_routes()
-        if route and route in handoff:
-            err_payload = {
-                "_declared_sources": [],
-                "_sources": [],
-                "ok": False,
-                "status": "handoff_filtered",
-                "error": f"Route '{route}' is an OpenClaw handoff route and is disabled in LangAlpha.",
-            }
-            return {
-                "jsonrpc": "2.0",
-                "id": req_id,
-                "result": {
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": json.dumps(err_payload, ensure_ascii=False),
-                        }
-                    ],
-                    "isError": True,
-                },
-            }
+        if validation_err is not None:
+            return self._make_tool_result_response(req_id, validation_err, is_error=True)
+
+        # Route `catalog` first so `catalog(route=...)` works for all routes (including community and market-regime)
+        if tool_name == "catalog":
+            if route and route not in ROUTE_CONTRACT_SPECS:
+                err_cat: dict[str, Any] = {
+                    "_declared_sources": [],
+                    "_sources": [],
+                    "ok": False,
+                    "status": "invalid_arguments",
+                    "error_code": "invalid_route",
+                    "accepted_routes": sorted(ROUTE_CONTRACT_SPECS.keys()),
+                    "error": (
+                        f"未知路由 '{route}'；可查询的路由列表: {sorted(ROUTE_CONTRACT_SPECS.keys())}。"
+                    ),
+                }
+                _apply_error_and_empty_contract(
+                    tool_name, route, "", err_cat, norm_params_view
+                )
+                return self._make_tool_result_response(
+                    req_id, err_cat, is_error=True
+                )
+        else:
+            if route and route in handoff:
+                err_payload: dict[str, Any] = {
+                    "_declared_sources": [],
+                    "_sources": [],
+                    "ok": False,
+                    "status": "handoff_filtered",
+                    "error": f"Route '{route}' is an OpenClaw handoff route and is disabled in LangAlpha.",
+                }
+                _apply_error_and_empty_contract(
+                    tool_name, route, operation, err_payload, norm_params_view
+                )
+                return {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "result": {
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": json.dumps(err_payload, ensure_ascii=False),
+                            }
+                        ],
+                        "isError": True,
+                    },
+                }
 
         eff_timeout = self.compute_timeout(tool_name, arguments)
-        if tool_name == "community" or route in BRIDGE_COMMUNITY_ROUTES:
+        if tool_name != "catalog" and (
+            tool_name == "community" or route in BRIDGE_COMMUNITY_ROUTES
+        ):
             if tool_name not in ("community", "") or route not in BRIDGE_COMMUNITY_ROUTES:
                 err_payload = {
                     "_declared_sources": [],
@@ -4340,12 +6668,17 @@ class ResearchDataBridge:
                     ),
                     "data": None,
                 }
+                _apply_error_and_empty_contract(
+                    tool_name, route, operation, err_payload, norm_params_view
+                )
                 return self._make_tool_result_response(req_id, err_payload, is_error=True)
             return await self._handle_community_call(
                 req_id, route, arguments, eff_timeout
             )
         call_args = dict(arguments)
-        if tool_name != "catalog":
+        if tool_name == "catalog":
+            call_args.pop("route", None)
+        else:
             call_args["timeout"] = eff_timeout
 
         params_clamped: dict[str, list[Any]] = {}
@@ -4411,7 +6744,7 @@ class ResearchDataBridge:
                         # operation 为空时保持原样，只在结果里返回一条"应该怎么传"的提示
                         params_mapped_hint = how_to_pass_msg
                     else:
-                        err_payload: dict[str, Any] = {
+                        err_payload = {
                             "_declared_sources": [],
                             "_sources": [],
                             "ok": False,
@@ -4421,6 +6754,9 @@ class ResearchDataBridge:
                         }
                         if params_clamped:
                             err_payload["params_clamped"] = params_clamped
+                        _apply_error_and_empty_contract(
+                            tool_name, route, operation, err_payload, norm_params_view
+                        )
                         return self._make_tool_result_response(
                             req_id, err_payload, is_error=True
                         )
@@ -4443,6 +6779,9 @@ class ResearchDataBridge:
                 }
                 if params_clamped:
                     err_payload["params_clamped"] = params_clamped
+                _apply_error_and_empty_contract(
+                    tool_name, route, operation, err_payload, norm_params_view
+                )
                 return self._make_tool_result_response(req_id, err_payload, is_error=True)
 
         transcript_query_ignored: str | None = None
@@ -4452,6 +6791,10 @@ class ResearchDataBridge:
             if t_ticker and t_query and _is_topic_query_for_transcript(t_query):
                 transcript_query_ignored = t_query
                 call_args.pop("query", None)
+
+        norm_params_view = _build_normalized_params_view(call_args, is_community=False)
+        if tool_name == "catalog" and route:
+            norm_params_view["route"] = route
 
         do_fanout = self._should_fanout_alphaengine(tool_name, arguments)
         ae_args: dict[str, Any] | None = (
@@ -4482,7 +6825,7 @@ class ResearchDataBridge:
                     "method": "tools/call",
                     "params": {"name": tool_name, "arguments": call_args},
                 }
-                if route == "market-regime":
+                if tool_name != "catalog" and route == "market-regime":
                     mr_payload = await asyncio.wait_for(
                         self._handle_market_regime(arguments),
                         timeout=remaining_budget_s,
@@ -4576,12 +6919,9 @@ class ResearchDataBridge:
                                     "raw_payload": None,
                                 }
                             )
-                            any_online_ok = bool(
-                                ae_outcome.get("ok") or gp_outcome.get("ok")
-                            )
                             fallback_payload: dict[str, Any] = {
-                                "ok": any_online_ok,
-                                "status": "ok" if any_online_ok else local_st,
+                                "ok": False,
+                                "status": local_st,
                                 "error": local_reason,
                                 "results": [],
                                 "result_count": 0,
@@ -4610,7 +6950,7 @@ class ResearchDataBridge:
                                             }
                                         ],
                                         "structuredContent": dict(fallback_payload),
-                                        "isError": not any_online_ok,
+                                        "isError": True,
                                     },
                                 }
                             ]
@@ -4641,13 +6981,16 @@ class ResearchDataBridge:
                     eff_timeout,
                     elapsed_ms,
                 )
-                timeout_payload = {
+                timeout_payload: dict[str, Any] = {
                     "_declared_sources": [],
                     "_sources": [],
                     "ok": False,
                     "status": "timeout",
                     "error": f"researchdata_bridge timed out after {eff_timeout}s on {tool_name}/{route}",
                 }
+                _apply_error_and_empty_contract(
+                    tool_name, route, operation, timeout_payload, norm_params_view
+                )
                 return {
                     "jsonrpc": "2.0",
                     "id": req_id,
@@ -4684,6 +7027,25 @@ class ResearchDataBridge:
                     # Filter handoff routes from catalog() output and include market-regime + community routes
                     if tool_name == "catalog" and isinstance(payload.get("routes"), list):
                         req_category = str(arguments.get("category") or "").strip().lower()
+                        req_route = str(arguments.get("route") or "").strip()
+                        if req_route and req_route not in ROUTE_CONTRACT_SPECS:
+                            err_cat: dict[str, Any] = {
+                                "_declared_sources": [],
+                                "_sources": [],
+                                "ok": False,
+                                "status": "invalid_arguments",
+                                "error_code": "invalid_route",
+                                "accepted_routes": sorted(ROUTE_CONTRACT_SPECS.keys()),
+                                "error": (
+                                    f"未知路由 '{req_route}'；可查询的路由列表: {sorted(ROUTE_CONTRACT_SPECS.keys())}。"
+                                ),
+                            }
+                            _apply_error_and_empty_contract(
+                                tool_name, req_route, "", err_cat, norm_params_view
+                            )
+                            return self._make_tool_result_response(
+                                req_id, err_cat, is_error=True
+                            )
                         include_community = not req_category or req_category == "community"
                         include_macro = not req_category or req_category == "macro"
                         kept_routes: list[dict[str, Any]] = []
@@ -4733,11 +7095,40 @@ class ResearchDataBridge:
                                             json.dumps(COMMUNITY_CATALOG_ROUTE_SPECS[comm_id])
                                         )
                                     )
+                        if req_route:
+                            kept_routes = [
+                                r for r in kept_routes if str(r.get("id") or "") == req_route
+                            ]
+                            if not kept_routes and req_route in ROUTE_CONTRACT_SPECS:
+                                spec_entry = ROUTE_CONTRACT_SPECS[req_route]
+                                synth: dict[str, Any] = {
+                                    "id": req_route,
+                                    "tool": spec_entry["tool"],
+                                    "category": spec_entry["category"],
+                                    "operations": list(spec_entry["operations"]),
+                                }
+                                if req_route == "transcript":
+                                    synth["rules"] = [TRANSCRIPT_CATALOG_RULE]
+                                elif req_route in INTERNAL_LIBRARY_ROUTES:
+                                    synth["rules"] = [INTERNAL_LIBRARY_PAGINATION_RULE]
+                                kept_routes.append(synth)
+                        for r_item in kept_routes:
+                            rid = str(r_item.get("id") or "").strip()
+                            c_spec = ROUTE_CONTRACT_SPECS.get(rid)
+                            if c_spec is not None:
+                                r_item.setdefault("tool", c_spec["tool"])
+                                if not r_item.get("operations"):
+                                    r_item["operations"] = list(c_spec["operations"])
+                                r_item["required_params"] = dict(c_spec["required_params"])
+                                r_item["optional_params"] = list(c_spec["optional_params"])
+                                r_item["accepted_params"] = list(c_spec["accepted_params"])
+                                r_item["param_formats"] = dict(c_spec["param_formats"])
+                                r_item["return_shape"] = c_spec["return_shape"]
+                                r_item["examples"] = list(c_spec["examples"])
                         payload["routes"] = kept_routes
                         payload["route_count"] = len(payload["routes"])
 
                     if tool_name == "research" and route == "transcript":
-                        _rewrite_transcript_roic_403(payload)
                         if transcript_query_ignored is not None:
                             payload["query_ignored"] = transcript_query_ignored
                             payload["query_ignored_note"] = TRANSCRIPT_QUERY_IGNORED_NOTE
@@ -4777,7 +7168,6 @@ class ResearchDataBridge:
                             payload, declared, gp_outcome, gp_args
                         )
                     declared_count = len(declared)
-                    status_str = str(payload.get("status") or ("ok" if payload.get("ok") else "error"))
 
                     # Track AlphaEngine get_document quota usage
                     if route == "alphaengine" and operation == "get_document":
@@ -4788,13 +7178,31 @@ class ResearchDataBridge:
                             chars = int(sc.get("returned_chars") or len(str(sc.get("text") or "")))
                         await self._record_alphaengine_get_doc(chars)
 
+                    _apply_error_and_empty_contract(
+                        tool_name, route, operation, payload, norm_params_view
+                    )
+                    if params_mapped_hint:
+                        cur_hint = str(payload.get("hint") or "").strip()
+                        if params_mapped_hint not in cur_hint:
+                            payload["hint"] = (
+                                f"{cur_hint} {params_mapped_hint}".strip()
+                                if cur_hint
+                                else params_mapped_hint
+                            )
+                    status_str = str(payload.get("status") or ("ok" if payload.get("ok") else "error"))
+                    result_obj["isError"] = not bool(payload.get("ok"))
+
                     # Place _declared_sources and _sources first so 64 KiB truncation preserves them
                     enriched = {
                         "_declared_sources": declared,
                         "_sources": declared,
                         **payload,
                     }
-                    blocks[0]["text"] = json.dumps(enriched, ensure_ascii=False)
+                    blocks[0]["text"] = json.dumps(
+                        enriched,
+                        ensure_ascii=False,
+                        separators=(",", ":") if route == "market-regime" else None,
+                    )
                     if isinstance(result_obj.get("structuredContent"), dict):
                         result_obj["structuredContent"] = dict(enriched)
 

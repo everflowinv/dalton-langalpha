@@ -708,10 +708,18 @@ class TestResearchAllAlphaEngineAndGuidepointFanout:
                 "arguments": {"route": "all", "operation": "search", "query": "CATL"},
             },
         )
-        assert not resp["result"].get("isError")
+        assert resp["result"]["isError"] is True
         body = json.loads(resp["result"]["content"][0]["text"])
-        assert body["ok"] is True
-        assert body["status"] == "ok"
+        assert body["ok"] is False
+        assert body["status"] == "partial_error"
+        assert set(body["partial"]) == {
+            "company-wiki",
+            "sales-notes",
+            "tmtb",
+            "funda-ai",
+            "guidepoint",
+        }
+        assert body["error"]
         assert len(body["results"]) == 2
         assert body["results"][0]["document_id"] == "mail:8801"
         assert body["results"][1]["document_id"] == "guidepoint:gp-778899"
@@ -751,9 +759,16 @@ class TestResearchAllAlphaEngineAndGuidepointFanout:
                 "arguments": {"route": "all", "operation": "search", "query": "CATL"},
             },
         )
-        assert not resp["result"].get("isError")
+        assert resp["result"]["isError"] is True
         body = json.loads(resp["result"]["content"][0]["text"])
-        assert body["ok"] is True
+        assert body["ok"] is False
+        assert set(body["partial"]) == {
+            "company-wiki",
+            "sales-notes",
+            "tmtb",
+            "funda-ai",
+            "guidepoint",
+        }
         assert len(body["results"]) == 2
         assert body["alphaengine"]["ok"] is False
         assert body["alphaengine"]["status"] == "timeout"
@@ -788,10 +803,17 @@ class TestResearchAllAlphaEngineAndGuidepointFanout:
                 "arguments": {"route": "all", "operation": "search", "query": "CATL"},
             },
         )
-        assert not resp["result"].get("isError")
+        assert resp["result"]["isError"] is True
         body = json.loads(resp["result"]["content"][0]["text"])
-        assert body["ok"] is True
-        assert body["status"] == "ok"
+        assert body["ok"] is False
+        assert body["status"] == "partial_error"
+        assert set(body["partial"]) == {
+            "company-wiki",
+            "sales-notes",
+            "tmtb",
+            "funda-ai",
+            "alphaengine",
+        }
         assert len(body["results"]) == 2
         assert {r["document_id"] for r in body["results"]} == {
             "mail:8801",
@@ -831,9 +853,16 @@ class TestResearchAllAlphaEngineAndGuidepointFanout:
                 "arguments": {"route": "all", "operation": "search", "query": "CATL"},
             },
         )
-        assert not resp["result"].get("isError")
+        assert resp["result"]["isError"] is True
         body = json.loads(resp["result"]["content"][0]["text"])
-        assert body["ok"] is True
+        assert body["ok"] is False
+        assert set(body["partial"]) == {
+            "company-wiki",
+            "sales-notes",
+            "tmtb",
+            "funda-ai",
+            "alphaengine",
+        }
         assert len(body["results"]) == 2
         assert body["alphaengine"]["ok"] is True
         assert body["guidepoint"]["ok"] is False
@@ -921,11 +950,12 @@ class TestResearchAllAlphaEngineAndGuidepointFanout:
                 "arguments": {"route": "all", "operation": "search", "query": "CATL"},
             },
         )
-        assert not resp["result"].get("isError")
+        assert resp["result"]["isError"] is True
         body = json.loads(resp["result"]["content"][0]["text"])
         assert resp["result"]["structuredContent"] == body
-        assert body["ok"] is True
-        assert body["status"] == "ok"
+        assert body["ok"] is False
+        assert body["partial"] == ["alphaengine"]
+        assert body["error"]
         assert [r["document_id"] for r in body["results"]] == ["alphaengine:99001122"]
         assert body["alphaengine"]["ok"] is True
         assert body["alphaengine"]["status"] == "ok"
@@ -968,10 +998,12 @@ class TestResearchAllAlphaEngineAndGuidepointFanout:
                 "arguments": {"route": "all", "operation": "search", "query": "CATL"},
             },
         )
-        assert not resp["result"].get("isError")
+        assert resp["result"]["isError"] is True
         body = json.loads(resp["result"]["content"][0]["text"])
         assert resp["result"]["structuredContent"] == body
-        assert body["ok"] is True
+        assert body["ok"] is False
+        assert body["partial"] == ["alphaengine", "guidepoint"]
+        assert body["error"]
         assert {r["document_id"] for r in body["results"]} == {
             "alphaengine:99001122",
             "guidepoint:gp-778899",
@@ -1139,17 +1171,20 @@ class TestToolsListResearchDescription:
         assert "Internal research library" in desc
         assert "各来源提供什么证据：" in desc
         assert "何时选用哪个路由（按研究情境，基于 catalog）：" in desc
-        assert "→ alphaengine：卖方研报与会议纪要（来源：AlphaEngine，先 search_library 再 get_document）" in desc
-        assert "→ guidepoint：专家访谈与一线经营反馈（来源：Guidepoint）" in desc
-        assert "→ transcript：业绩电话会转写稿（来源：AlphaEngine 业绩会 ASR 稿（主）/ roic.ai（兜底））" in desc
-        assert "→ company-wiki：已入库公司与行业资料（来源：本地 company-wiki，只读，params.company=TICKER）" in desc
-        assert "→ sales-notes：卖方销售邮件与市场摘要（来源：本地 market-digest 私有库）" in desc
-        assert "→ tmtb：TMT Breakout 本地原文缓存（来源：AlphaEngine TMTB 已入库副本）" in desc
-        assert "→ funda-ai：FUNDA AI 原邮件与图表（来源：fundaai@substack.com" in desc
-        assert "→ all：内部研究资料跨库检索（本地库 company-wiki + sales-notes + tmtb + funda-ai，外加并行的 AlphaEngine 与 Guidepoint 检索；不含 transcript 电话会转写稿" in desc
+        assert "→ alphaengine（先 search_library 再 get_document）" in desc
+        assert "→ guidepoint；" in desc
+        assert "→ transcript（AlphaEngine 业绩会转写；无匹配时用 | 分隔中英文公司名重试或扩大 start/end）" in desc
+        assert "roic" not in desc.lower()
+        assert "→ company-wiki（只读，params.company=TICKER）" in desc
+        assert "→ sales-notes；" in desc
+        assert "→ tmtb；" in desc
+        assert "→ funda-ai；" in desc
+        assert "→ all（company-wiki + sales-notes + tmtb + funda-ai，并行检索 AlphaEngine 与 Guidepoint；不含 transcript）" in desc
+        assert "ok: false` 不等于“没有数据”" in desc
 
         assert "employee" not in research_tool["inputSchema"]["properties"]["route"]["enum"]
-        assert catalog_tool["description"] == "List routes."
+        assert catalog_tool["description"].startswith("List routes.")
+        assert "route" in catalog_tool["inputSchema"]["properties"]
 
     def test_plugin_json_instruction_shares_single_source_with_bridge(self) -> None:
         plugin_path = (
@@ -1705,7 +1740,13 @@ class TestCommunityExecutors:
                 },
             )
             body = json.loads(resp["result"]["content"][0]["text"])
-            assert body["ok"] is False
+            if expected_status == "empty":
+                assert body["ok"] is True
+                assert body["empty_reason"] == "no_matching_items"
+                assert resp["result"]["isError"] is False
+            else:
+                assert body["ok"] is False
+                assert resp["result"]["isError"] is True
             assert body["status"] == expected_status
             assert body["_sources"] == []
             assert body["_declared_sources"] == []
@@ -1889,19 +1930,7 @@ class TestCommunityExecutors:
 
         upstream_defaults = {
             "mode": "fetch",
-            "limit": 3,
             "timeout": 180,
-            "series": "DGS10",
-            "concept": "Revenues",
-            "item": "Item 7",
-            "document": "doc-1",
-            "form": "10-K",
-            "dataset": "edgar",
-            "start": "2026-01-01",
-            "end": "2026-10-22",
-            "as_of": "2026-10-22",
-            "vintage": "2026-10-22",
-            "params": {"offset": 0},
         }
 
         # Verify timeout is determined solely by executor route config, ignoring timeout=180
@@ -2270,7 +2299,7 @@ class TestCommunityExecutors:
         assert body_deg["source_status"]["x"]["state"] == "auth-failed"
         assert body_deg["source_status"]["stocktwits"]["state"] == "timeout"
 
-        # 2. Empty: all sources are no-results and 0 items -> ok=False, status="empty"
+        # 2. Empty: all sources are no-results and 0 items -> ok=True, status="empty", empty_reason="no_matching_items"
         payload_queue.append(
             {
                 "query": "ObscureTopicXYZ",
@@ -2290,8 +2319,10 @@ class TestCommunityExecutors:
             },
         )
         body_emp = json.loads(resp_emp["result"]["content"][0]["text"])
-        assert body_emp["ok"] is False
+        assert body_emp["ok"] is True
         assert body_emp["status"] == "empty"
+        assert body_emp["empty_reason"] == "no_matching_items"
+        assert resp_emp["result"]["isError"] is False
 
         # 3. Partial items + failed sources -> ok=True, status="ok", failed sources in warnings
         payload_queue.append(
@@ -3084,7 +3115,7 @@ class TestBridgeResearchParamsAndTranscriptGuards:
         assert 'document="mail:888"' in body_empty_op["hint"]
 
     @pytest.mark.asyncio
-    async def test_transcript_drops_topic_query_and_rewrites_roic_403(
+    async def test_transcript_drops_topic_query_and_no_match_returns_empty_reason_without_roic(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         bridge = _make_bridge(tmp_path, monkeypatch)
@@ -3140,16 +3171,15 @@ class TestBridgeResearchParamsAndTranscriptGuards:
                         },
                     )
                 ], 0
-            # Simulate roic fallback 403
+            # Simulate AlphaEngine no-match (even if legacy upstream payload still had fallback metadata)
             return [
                 _mcp_tool_response(
                     req["id"],
                     {
                         "ok": False,
-                        "status": "error",
-                        "data": {"ok": False, "error": "HTTP Error 403: Forbidden"},
+                        "status": "no_match",
+                        "data": {"ok": False, "transcripts": []},
                         "fallback": {"source": "roic", "reason": "alphaengine_no_match"},
-                        "hint": "old hint",
                     },
                 )
             ], 0
@@ -3172,6 +3202,8 @@ class TestBridgeResearchParamsAndTranscriptGuards:
         )
         assert "query" not in forwarded_args[-1]
         body_topic = json.loads(resp_topic["result"]["content"][0]["text"])
+        assert body_topic["ok"] is True
+        assert body_topic["empty_reason"] == "no_matching_transcripts"
         assert body_topic["query_ignored"] == "Q2 2026 earnings call capital expenditures"
         assert "transcript 的 query 只用来传公司名，主题检索请在拿到 doc_id 后读正文" in body_topic["note"]
 
@@ -3199,8 +3231,8 @@ class TestBridgeResearchParamsAndTranscriptGuards:
             )
             assert forwarded_args[-1].get("query") == company_q
 
-        # 2. roic 403 fallback rewrites error and hint ONLY on structured roic + 403/403 Forbidden
-        resp_403 = await bridge.handle_tools_call(
+        # 2. No-match on transcript returns ok=True with empty_reason and AlphaEngine-only hint (no roic mention)
+        resp_no_match = await bridge.handle_tools_call(
             "tr-3",
             {
                 "name": "research",
@@ -3210,9 +3242,13 @@ class TestBridgeResearchParamsAndTranscriptGuards:
                 },
             },
         )
-        body_403 = json.loads(resp_403["result"]["content"][0]["text"])
-        assert body_403["error"] == "AlphaEngine 无匹配，roic 回退已不可用。"
-        assert body_403["hint"] == "用公司名（| 分隔中英文）重试，或者扩大 start/end。"
+        body_no_match = json.loads(resp_no_match["result"]["content"][0]["text"])
+        assert body_no_match["ok"] is True
+        assert body_no_match["empty_reason"] == "no_matching_transcripts"
+        assert "fallback" not in body_no_match
+        assert "roic" not in json.dumps(body_no_match, ensure_ascii=False).lower()
+        assert "|" in body_no_match["hint"]
+        assert "start/end" in body_no_match["hint"]
 
         resp_non_roic = await bridge.handle_tools_call(
             "tr-non-roic",
@@ -3225,10 +3261,12 @@ class TestBridgeResearchParamsAndTranscriptGuards:
             },
         )
         body_non_roic = json.loads(resp_non_roic["result"]["content"][0]["text"])
-        assert body_non_roic["error"] == "upstream timeout discussing roic metric 403bps"
+        assert body_non_roic["ok"] is False
+        assert body_non_roic["error_category"] == "上游不可用"
+        assert "upstream timeout discussing roic metric 403bps" in body_non_roic["error"]
         assert body_non_roic["hint"] == "keep original hint"
 
-        # 3. catalog includes transcript and pagination rules
+        # 3. catalog includes transcript and pagination rules (and no roic mention)
         resp_cat = await bridge.handle_tools_call(
             "cat-1", {"name": "catalog", "arguments": {}}
         )
@@ -3236,5 +3274,1384 @@ class TestBridgeResearchParamsAndTranscriptGuards:
         tr_route = next(r for r in cat_body["routes"] if r["id"] == "transcript")
         wiki_route = next(r for r in cat_body["routes"] if r["id"] == "company-wiki")
         assert any("只用来传公司名" in rl for rl in tr_route["rules"])
+        assert not any("roic" in rl.lower() for rl in tr_route["rules"])
         assert any("1–30000" in rl for rl in wiki_route["rules"])
+
+    @pytest.mark.asyncio
+    async def test_parameter_alias_mapping_and_normalized_params(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bridge = _make_bridge(tmp_path, monkeypatch)
+        forwarded_args: list[dict[str, Any]] = []
+
+        async def _responder(reqs: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+            req = reqs[0]
+            args = req["params"].get("arguments") or {}
+            forwarded_args.append(args)
+            return [
+                _mcp_tool_response(
+                    req["id"],
+                    {
+                        "ok": True,
+                        "status": "ok",
+                        "rows": [{"date": "2026-10-01", "form": "6-K"}],
+                    },
+                )
+            ], 0
+
+        monkeypatch.setattr(
+            asyncio, "create_subprocess_exec", _make_subprocess_double(_responder)
+        )
+
+        # symbol -> ticker (with 0700.HK -> 00700 normalization on cn-hk), from/to -> start/end, op -> operation
+        resp = await bridge.handle_tools_call(
+            "alias-1",
+            {
+                "name": "finance",
+                "arguments": {
+                    "source": "cn-hk",
+                    "op": "list_filings",
+                    "symbol": "0700.HK",
+                    "from": "2026-01-01",
+                    "to": "2026-10-23",
+                    "max_results": 5,
+                },
+            },
+        )
+        assert not resp["result"].get("isError")
+        body = json.loads(resp["result"]["content"][0]["text"])
+        assert body["ok"] is True
+        assert forwarded_args[-1]["route"] == "cn-hk"
+        assert forwarded_args[-1]["operation"] == "filings"
+        assert forwarded_args[-1]["ticker"] == "00700"
+        assert forwarded_args[-1]["start"] == "2026-01-01"
+        assert forwarded_args[-1]["end"] == "2026-10-23"
+        assert forwarded_args[-1]["limit"] == 5
+        assert body["normalized_params"] == {
+            "route": "cn-hk",
+            "operation": "filings",
+            "ticker": "00700",
+            "start": "2026-01-01",
+            "end": "2026-10-23",
+            "limit": 5,
+        }
+
+        # q/keyword -> query and start_date/end_date -> start/end on research
+        resp_res = await bridge.handle_tools_call(
+            "alias-2",
+            {
+                "name": "research",
+                "arguments": {
+                    "route": "sales-notes",
+                    "action": "query",
+                    "q": "META Reels",
+                    "start_date": "2026-05-01",
+                    "end_date": "2026-10-23",
+                },
+            },
+        )
+        body_res = json.loads(resp_res["result"]["content"][0]["text"])
+        assert body_res["ok"] is True
+        assert forwarded_args[-1]["operation"] == "search"
+        assert forwarded_args[-1]["query"] == "META Reels"
+        assert forwarded_args[-1]["start"] == "2026-05-01"
+        assert forwarded_args[-1]["end"] == "2026-10-23"
+        assert body_res["normalized_params"]["query"] == "META Reels"
+        assert body_res["normalized_params"]["operation"] == "search"
+
+    @pytest.mark.asyncio
+    async def test_parameter_alias_conflict_returns_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bridge = _make_bridge(tmp_path, monkeypatch)
+        exec_mock = create_autospec(asyncio.create_subprocess_exec)
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", exec_mock)
+
+        conflict_cases = [
+            (
+                "finance",
+                {"route": "sec", "operation": "financials", "ticker": "META", "symbol": "GOOGL"},
+                "ticker",
+            ),
+            (
+                "research",
+                {
+                    "route": "sales-notes",
+                    "operation": "search",
+                    "query": "META",
+                    "start": "2026-01-01",
+                    "from": "2026-06-01",
+                },
+                "start",
+            ),
+            (
+                "research",
+                {"route": "tmtb", "operation": "search", "query": "META", "keyword": "NVDA"},
+                "query",
+            ),
+        ]
+        for idx, (tool_name, args, canon_key) in enumerate(conflict_cases):
+            resp = await bridge.handle_tools_call(
+                f"conflict-{idx}",
+                {"name": tool_name, "arguments": args},
+            )
+            assert resp["result"]["isError"] is True
+            body = json.loads(resp["result"]["content"][0]["text"])
+            assert body["ok"] is False
+            assert body["error_code"] == "parameter_conflict"
+            assert body["error_category"] == "参数错误"
+            assert "参数错误" in body["error"]
+            assert canon_key in body["error"]
+            assert body["hint"]
+            assert "normalized_params" in body
+
+        assert exec_mock.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_unknown_parameter_and_invalid_operation_return_error_with_accepted_list(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bridge = _make_bridge(tmp_path, monkeypatch)
+        exec_mock = create_autospec(asyncio.create_subprocess_exec)
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", exec_mock)
+
+        # 1. Unknown parameter on finance(route="sec")
+        resp_unk = await bridge.handle_tools_call(
+            "unk-1",
+            {
+                "name": "finance",
+                "arguments": {
+                    "route": "sec",
+                    "operation": "financials",
+                    "ticker": "META",
+                    "unknown_knob": "foo",
+                },
+            },
+        )
+        assert resp_unk["result"]["isError"] is True
+        body_unk = json.loads(resp_unk["result"]["content"][0]["text"])
+        assert body_unk["ok"] is False
+        assert body_unk["error_code"] == "unknown_parameters"
+        assert body_unk["error_category"] == "参数错误"
+        assert "unknown_knob" in body_unk["error"]
+        assert "ticker" in body_unk["accepted_parameters"]
+        assert "form" in body_unk["accepted_parameters"]
+        assert "catalog" in body_unk["hint"]
+
+        # 2. Invalid/misspelled operation on research(route="alphaengine")
+        resp_op = await bridge.handle_tools_call(
+            "unk-op",
+            {
+                "name": "research",
+                "arguments": {
+                    "route": "alphaengine",
+                    "operation": "search_libary_typo",
+                    "query": "META",
+                },
+            },
+        )
+        assert resp_op["result"]["isError"] is True
+        body_op = json.loads(resp_op["result"]["content"][0]["text"])
+        assert body_op["ok"] is False
+        assert body_op["error_code"] == "invalid_operation"
+        assert body_op["error_category"] == "参数错误"
+        assert "search_library" in body_op["accepted_operations"]
+        assert "get_document" in body_op["accepted_operations"]
+        assert "hint" in body_op and body_op["hint"]
+
+        # 3. Unknown parameter on community(route="xueqiu")
+        resp_comm = await bridge.handle_tools_call(
+            "unk-comm",
+            {
+                "name": "community",
+                "arguments": {
+                    "route": "xueqiu",
+                    "operation": "posts",
+                    "ticker": "00700",
+                    "bad_extra": 1,
+                },
+            },
+        )
+        body_comm = json.loads(resp_comm["result"]["content"][0]["text"])
+        assert body_comm["ok"] is False
+        assert body_comm["error_category"] == "参数错误"
+        assert "Accepted parameters" in body_comm["error"]
+        assert body_comm["hint"]
+
+        assert exec_mock.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_ok_false_error_categories_with_hint_and_ok_true_empty_reason_and_catalog_route(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bridge = _make_bridge(tmp_path, monkeypatch)
+
+        async def _responder(reqs: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+            req = reqs[0]
+            name = req["params"]["name"]
+            args = req["params"].get("arguments") or {}
+            if name == "catalog":
+                return [
+                    _mcp_tool_response(
+                        req["id"],
+                        {
+                            "ok": True,
+                            "status": "ok",
+                            "routes": [{"id": "sec", "category": "finance", "operations": ["financials"]}],
+                        },
+                    )
+                ], 0
+            if args.get("query") == "QUOTA_ERR":
+                return [
+                    _mcp_tool_response(
+                        req["id"],
+                        {
+                            "ok": False,
+                            "status": "quota_exceeded",
+                            "error": "AlphaEngine daily quota exceeded (429)",
+                        },
+                        is_error=True,
+                    )
+                ], 0
+            if args.get("query") == "UPSTREAM_ERR":
+                return [
+                    _mcp_tool_response(
+                        req["id"],
+                        {
+                            "ok": False,
+                            "status": "error",
+                            "error": "Connection reset by upstream gateway",
+                        },
+                        is_error=True,
+                    )
+                ], 0
+            # True no-match: 0 results
+            return [
+                _mcp_tool_response(
+                    req["id"],
+                    {
+                        "ok": True,
+                        "status": "ok",
+                        "results": [],
+                        "result_count": 0,
+                    },
+                )
+            ], 0
+
+        monkeypatch.setattr(
+            asyncio, "create_subprocess_exec", _make_subprocess_double(_responder)
+        )
+
+        # 1. Quota / permission error -> error_category == "权限或额度" + actionable hint
+        resp_quota = await bridge.handle_tools_call(
+            "err-quota",
+            {
+                "name": "research",
+                "arguments": {
+                    "route": "alphaengine",
+                    "operation": "search_library",
+                    "query": "QUOTA_ERR",
+                },
+            },
+        )
+        body_quota = json.loads(resp_quota["result"]["content"][0]["text"])
+        assert body_quota["ok"] is False
+        assert body_quota["error_category"] == "权限或额度"
+        assert "[权限或额度]" in body_quota["error"]
+        assert "禁止写成“没有相关信息”" in body_quota["hint"]
+        assert body_quota["normalized_params"]["route"] == "alphaengine"
+
+        # 2. Upstream failure -> error_category == "上游不可用" + actionable hint
+        resp_up = await bridge.handle_tools_call(
+            "err-up",
+            {
+                "name": "research",
+                "arguments": {
+                    "route": "sales-notes",
+                    "operation": "search",
+                    "query": "UPSTREAM_ERR",
+                },
+            },
+        )
+        body_up = json.loads(resp_up["result"]["content"][0]["text"])
+        assert body_up["ok"] is False
+        assert body_up["error_category"] == "上游不可用"
+        assert "[上游不可用]" in body_up["error"]
+        assert "不得当成“没有数据”" in body_up["hint"]
+
+        # 3. True no-match -> ok=True + empty results + empty_reason
+        resp_empty = await bridge.handle_tools_call(
+            "ok-empty",
+            {
+                "name": "research",
+                "arguments": {
+                    "route": "sales-notes",
+                    "operation": "search",
+                    "query": "NONEXISTENT_TOPIC_XYZ",
+                },
+            },
+        )
+        body_empty = json.loads(resp_empty["result"]["content"][0]["text"])
+        assert body_empty["ok"] is True
+        assert body_empty["results"] == []
+        assert body_empty["empty_reason"] == "no_matching_records"
+        assert body_empty["hint"]
+
+        # 4. catalog(route="cn-hk") returns the route's contract (required_params, param_formats, examples)
+        resp_cat_route = await bridge.handle_tools_call(
+            "cat-route",
+            {"name": "catalog", "arguments": {"route": "cn-hk"}},
+        )
+        body_cat_route = json.loads(resp_cat_route["result"]["content"][0]["text"])
+        assert body_cat_route["ok"] is True
+        assert body_cat_route["route_count"] == 1
+        cnhk_entry = body_cat_route["routes"][0]
+        assert cnhk_entry["id"] == "cn-hk"
+        assert "filings" in cnhk_entry["required_params"]
+        assert "00700" in cnhk_entry["param_formats"]["ticker"]
+        assert cnhk_entry["examples"]
+        assert body_cat_route["normalized_params"] == {"route": "cn-hk"}
+
+    @pytest.mark.asyncio
+    async def test_empty_result_contract_strict_disqualifiers_and_never_deletes_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bridge = _make_bridge(tmp_path, monkeypatch)
+        payload_queue: list[tuple[dict[str, Any], bool]] = []
+
+        async def _responder(reqs: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+            req = reqs[0]
+            payload, is_err = payload_queue.pop(0)
+            return [_mcp_tool_response(req["id"], payload, is_error=is_err)], 0
+
+        monkeypatch.setattr(
+            asyncio, "create_subprocess_exec", _make_subprocess_double(_responder)
+        )
+
+        # Disqualifying payloads: must ALL stay ok=False, never delete error, and carry error_category + hint
+        disqualifying_cases = [
+            # 1. ok: False with empty results
+            (
+                "research",
+                {"route": "sales-notes", "operation": "search", "query": "META"},
+                {"ok": False, "status": "error", "results": [], "error": "Database query failed"},
+                "上游不可用",
+                "Database query failed",
+            ),
+            # 2. Top-level error even if ok was True and results was []
+            (
+                "research",
+                {"route": "tmtb", "operation": "search", "query": "META"},
+                {"ok": True, "status": "ok", "results": [], "error": "Index file not found on disk"},
+                "上游不可用",
+                "Index file not found on disk",
+            ),
+            # 3. Failed source in source_status
+            (
+                "research",
+                {"route": "company-wiki", "operation": "search", "query": "META"},
+                {
+                    "ok": True,
+                    "status": "ok",
+                    "results": [],
+                    "source_status": {"company-wiki": {"ok": False, "status": "failed", "error": "sqlite locked"}},
+                },
+                "上游不可用",
+                "sqlite locked",
+            ),
+            # 4. 401/403/404/429/5xx HTTP errors and 'not found' error text (not business no-match)
+            (
+                "finance",
+                {"route": "sec", "operation": "financials", "ticker": "META"},
+                {"ok": False, "status": "error", "rows": [], "error": "HTTP 404 Not Found: SEC upstream endpoint not found"},
+                "上游不可用",
+                "404 Not Found",
+            ),
+            (
+                "research",
+                {"route": "alphaengine", "operation": "search_library", "query": "META"},
+                {"ok": False, "status": "error", "results": [], "error": "HTTP 403 Forbidden"},
+                "权限或额度",
+                "403 Forbidden",
+            ),
+            # 5. Transcript with ONLY fallback.source == "roic" (without alphaengine_no_match)
+            (
+                "research",
+                {"route": "transcript", "ticker": "META"},
+                {"ok": False, "status": "error", "fallback": {"source": "roic"}},
+                "上游不可用",
+                "roic",
+            ),
+            # 6. Transcript with error text containing "not found" and transcripts=[]
+            (
+                "research",
+                {"route": "transcript", "ticker": "META"},
+                {
+                    "ok": False,
+                    "status": "error",
+                    "error": "Transcript index file not found",
+                    "data": {"transcripts": []},
+                },
+                "上游不可用",
+                "Transcript index file not found",
+            ),
+            # 7. Transcript with ok=False, status="error", data={"transcripts": []} and NO business no-match reason
+            (
+                "research",
+                {"route": "transcript", "ticker": "META"},
+                {
+                    "ok": False,
+                    "status": "error",
+                    "data": {"transcripts": []},
+                },
+                "上游不可用",
+                "调用失败",
+            ),
+        ]
+
+        for idx, (tool_name, args, upstream_payload, expected_cat, expected_err_substr) in enumerate(
+            disqualifying_cases
+        ):
+            payload_queue.append((upstream_payload, True))
+            resp = await bridge.handle_tools_call(
+                f"disq-{idx}", {"name": tool_name, "arguments": args}
+            )
+            assert resp["result"]["isError"] is True, f"Case {idx} should have isError=True"
+            body = json.loads(resp["result"]["content"][0]["text"])
+            assert body["ok"] is False, f"Case {idx} must stay ok=False: {body}"
+            assert "empty_reason" not in body, f"Case {idx} must not be marked empty_reason: {body}"
+            assert body["error_category"] == expected_cat
+            assert expected_err_substr in body["error"]
+            assert body["hint"]
+
+    @pytest.mark.asyncio
+    async def test_unwrap_nested_mcp_and_alphaengine_errors_and_override_conflicting_hint(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bridge = _make_bridge(tmp_path, monkeypatch)
+        payload_queue: list[tuple[dict[str, Any], bool]] = []
+
+        async def _responder(reqs: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+            req = reqs[0]
+            payload, is_err = payload_queue.pop(0)
+            return [_mcp_tool_response(req["id"], payload, is_error=is_err)], 0
+
+        monkeypatch.setattr(
+            asyncio, "create_subprocess_exec", _make_subprocess_double(_responder)
+        )
+
+        # 1. Real data_gateway.py transcript error shape: data.alphaengine_error="403 Forbidden" + conflicting "无匹配" hint
+        payload_queue.append(
+            (
+                {
+                    "ok": False,
+                    "status": "error",
+                    "route": "transcript",
+                    "operation": "list",
+                    "data": {
+                        "ok": False,
+                        "ticker": "META",
+                        "transcripts": [],
+                        "reason": "alphaengine_error",
+                        "alphaengine_error": "HTTP 403 Forbidden: AlphaEngine session expired",
+                    },
+                    "fallback": {
+                        "source": "roic",
+                        "reason": "alphaengine_error",
+                        "ticker": "META",
+                    },
+                    "hint": "AlphaEngine 无匹配：尝试用公司名（query='腾讯|Tencent'）重新检索，或检查 start/end 窗口。",
+                },
+                True,
+            )
+        )
+        resp_tr = await bridge.handle_tools_call(
+            "unwrap-tr",
+            {"name": "research", "arguments": {"route": "transcript", "ticker": "META"}},
+        )
+        body_tr = json.loads(resp_tr["result"]["content"][0]["text"])
+        assert body_tr["ok"] is False
+        assert body_tr["error_category"] == "权限或额度"
+        assert "403 Forbidden" in body_tr["error"]
+        assert "无匹配" not in body_tr["hint"]
+        assert "禁止写成“没有相关信息”" in body_tr["hint"]
+
+        # 2. Real data_gateway.py MCP proxy error shape: error inside data.content[0].text & data.structuredContent
+        payload_queue.append(
+            (
+                {
+                    "ok": False,
+                    "status": "error",
+                    "route": "alphaengine",
+                    "operation": "search_library",
+                    "data": {
+                        "isError": True,
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": json.dumps(
+                                    {"error": "429 Too Many Requests: rate limit exceeded"}
+                                ),
+                            }
+                        ],
+                        "structuredContent": {
+                            "error": "429 Too Many Requests: rate limit exceeded",
+                            "status": "rate_limited",
+                        },
+                    },
+                },
+                True,
+            )
+        )
+        resp_mcp = await bridge.handle_tools_call(
+            "unwrap-mcp",
+            {
+                "name": "research",
+                "arguments": {
+                    "route": "alphaengine",
+                    "operation": "search_library",
+                    "query": "META",
+                },
+            },
+        )
+        body_mcp = json.loads(resp_mcp["result"]["content"][0]["text"])
+        assert body_mcp["ok"] is False
+        assert body_mcp["error_category"] == "权限或额度"
+        assert "429 Too Many Requests" in body_mcp["error"]
+        assert "禁止写成“没有相关信息”" in body_mcp["hint"]
+
+        # 3. Real data_gateway.py:268 business no-match shape (status="no_match", data.reason="alphaengine_no_match",
+        # data.alphaengine_error=None, names_tried=[...], without transcripts)
+        # must return ok=True and empty_reason="no_matching_transcripts", NOT be treated as an error.
+        nomatch_upstream = {
+            "ok": False,
+            "status": "no_match",
+            "route": "transcript",
+            "operation": "list",
+            "data": {
+                "ok": False,
+                "ticker": "00700",
+                "reason": "alphaengine_no_match",
+                "alphaengine_error": None,
+                "names_tried": ["00700", "腾讯", "Tencent"],
+            },
+            "fallback": {
+                "source": "roic",
+                "reason": "alphaengine_no_match",
+                "ticker": "00700",
+            },
+            "hint": "AlphaEngine 无匹配：尝试用公司名（query='腾讯|Tencent'）重新检索，或检查 start/end 窗口。",
+        }
+        assert rb._unwrap_upstream_error_info(nomatch_upstream)["failed"] is False
+        payload_queue.append((nomatch_upstream, True))
+        resp_nomatch = await bridge.handle_tools_call(
+            "unwrap-nomatch",
+            {"name": "research", "arguments": {"route": "transcript", "ticker": "0700.HK"}},
+        )
+        assert resp_nomatch["result"]["isError"] is False
+        body_nomatch = json.loads(resp_nomatch["result"]["content"][0]["text"])
+        assert body_nomatch["ok"] is True
+        assert body_nomatch["empty_reason"] == "no_matching_transcripts"
+        assert "error" not in body_nomatch
+        assert "error_category" not in body_nomatch
+
+        # 4. Top-level ok=True with nested data.structuredContent.error="HTTP 403 Forbidden"
+        # must force ok=False, isError=True, error_category="权限或额度", and populate error/hint.
+        payload_queue.append(
+            (
+                {
+                    "ok": True,
+                    "status": "ok",
+                    "route": "alphaengine",
+                    "operation": "search_library",
+                    "data": {
+                        "structuredContent": {
+                            "error": "HTTP 403 Forbidden",
+                        },
+                    },
+                },
+                False,
+            )
+        )
+        resp_nested_err = await bridge.handle_tools_call(
+            "unwrap-nested-err",
+            {
+                "name": "research",
+                "arguments": {
+                    "route": "alphaengine",
+                    "operation": "search_library",
+                    "query": "META",
+                },
+            },
+        )
+        assert resp_nested_err["result"]["isError"] is True
+        body_nested_err = json.loads(resp_nested_err["result"]["content"][0]["text"])
+        assert body_nested_err["ok"] is False
+        assert "empty_reason" not in body_nested_err
+        assert body_nested_err["error_category"] == "权限或额度"
+        assert "HTTP 403 Forbidden" in body_nested_err["error"]
+        assert body_nested_err["hint"]
+        assert "禁止写成“没有相关信息”" in body_nested_err["hint"]
+
+        # 5. Top-level ok=True with data.structuredContent={"ok": False, "results": []}
+        # must return failed=True, ok=False, isError=True, and never set empty_reason.
+        sc_ok_false = {
+            "ok": True,
+            "status": "ok",
+            "route": "alphaengine",
+            "operation": "search_library",
+            "data": {
+                "structuredContent": {
+                    "ok": False,
+                    "results": [],
+                },
+            },
+        }
+        assert rb._unwrap_upstream_error_info(sc_ok_false)["failed"] is True
+        payload_queue.append((sc_ok_false, False))
+        resp_sc_ok_false = await bridge.handle_tools_call(
+            "unwrap-sc-ok-false",
+            {
+                "name": "research",
+                "arguments": {
+                    "route": "alphaengine",
+                    "operation": "search_library",
+                    "query": "META",
+                },
+            },
+        )
+        assert resp_sc_ok_false["result"]["isError"] is True
+        body_sc_ok_false = json.loads(resp_sc_ok_false["result"]["content"][0]["text"])
+        assert body_sc_ok_false["ok"] is False
+        assert body_sc_ok_false["status"] == "error"
+        assert "empty_reason" not in body_sc_ok_false
+        assert body_sc_ok_false["error_category"] == "上游不可用"
+        assert body_sc_ok_false["hint"]
+
+        # 6. Top-level ok=True, status="empty" with data.structuredContent={"isError": True, "status": "ok"}
+        # must return failed=True, ok=False, status="error" (never "ok"/"empty"), isError=True, and never set empty_reason.
+        sc_is_error = {
+            "ok": True,
+            "status": "empty",
+            "route": "alphaengine",
+            "operation": "search_library",
+            "data": {
+                "structuredContent": {
+                    "isError": True,
+                    "status": "ok",
+                    "results": [],
+                },
+            },
+        }
+        assert rb._unwrap_upstream_error_info(sc_is_error)["failed"] is True
+        assert rb._unwrap_upstream_error_info(sc_is_error)["status"] == "error"
+        payload_queue.append((sc_is_error, False))
+        resp_sc_is_error = await bridge.handle_tools_call(
+            "unwrap-sc-is-error",
+            {
+                "name": "research",
+                "arguments": {
+                    "route": "alphaengine",
+                    "operation": "search_library",
+                    "query": "META",
+                },
+            },
+        )
+        assert resp_sc_is_error["result"]["isError"] is True
+        body_sc_is_error = json.loads(resp_sc_is_error["result"]["content"][0]["text"])
+        assert body_sc_is_error["ok"] is False
+        assert body_sc_is_error["status"] == "error"
+        assert "empty_reason" not in body_sc_is_error
+        assert body_sc_is_error["error_category"] == "上游不可用"
+        assert body_sc_is_error["hint"]
+
+        # 7. Top-level ok=True with data={"status": "forbidden", "message": "HTTP 403 Forbidden", "results": []}
+        # must return failed=True, ok=False, status="forbidden", isError=True, error_category="权限或额度", and never set empty_reason.
+        data_forbidden = {
+            "ok": True,
+            "status": "ok",
+            "route": "alphaengine",
+            "operation": "search_library",
+            "data": {
+                "status": "forbidden",
+                "message": "HTTP 403 Forbidden",
+                "results": [],
+            },
+        }
+        assert rb._unwrap_upstream_error_info(data_forbidden)["failed"] is True
+        assert rb._unwrap_upstream_error_info(data_forbidden)["status"] == "forbidden"
+        payload_queue.append((data_forbidden, False))
+        resp_data_forbidden = await bridge.handle_tools_call(
+            "unwrap-data-forbidden",
+            {
+                "name": "research",
+                "arguments": {
+                    "route": "alphaengine",
+                    "operation": "search_library",
+                    "query": "META",
+                },
+            },
+        )
+        assert resp_data_forbidden["result"]["isError"] is True
+        body_data_forbidden = json.loads(resp_data_forbidden["result"]["content"][0]["text"])
+        assert body_data_forbidden["ok"] is False
+        assert body_data_forbidden["status"] == "forbidden"
+        assert "empty_reason" not in body_data_forbidden
+        assert body_data_forbidden["error_category"] == "权限或额度"
+        assert "HTTP 403 Forbidden" in body_data_forbidden["error"]
+        assert body_data_forbidden["hint"]
+
+        # 8. Specific failure status (`forbidden`) in `data.structuredContent.status` beats generic `data.status="error"`
+        data_err_sc_forbidden = {
+            "ok": True,
+            "status": "ok",
+            "route": "alphaengine",
+            "operation": "search_library",
+            "data": {
+                "status": "error",
+                "structuredContent": {
+                    "status": "forbidden",
+                    "results": [],
+                },
+            },
+        }
+        assert rb._unwrap_upstream_error_info(data_err_sc_forbidden)["failed"] is True
+        assert rb._unwrap_upstream_error_info(data_err_sc_forbidden)["status"] == "forbidden"
+        payload_queue.append((data_err_sc_forbidden, False))
+        resp_sc_forb = await bridge.handle_tools_call(
+            "unwrap-sc-forb",
+            {
+                "name": "research",
+                "arguments": {
+                    "route": "alphaengine",
+                    "operation": "search_library",
+                    "query": "META",
+                },
+            },
+        )
+        assert resp_sc_forb["result"]["isError"] is True
+        body_sc_forb = json.loads(resp_sc_forb["result"]["content"][0]["text"])
+        assert body_sc_forb["ok"] is False
+        assert body_sc_forb["status"] == "forbidden"
+        assert "empty_reason" not in body_sc_forb
+        assert body_sc_forb["error_category"] == "权限或额度"
+        assert body_sc_forb["hint"]
+
+    @pytest.mark.asyncio
+    async def test_ptc_tool_function_generator_wrapper_accepts_aliases_and_returns_normalized_params(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from ptc_agent.core.tool_generator import ToolFunctionGenerator
+
+        bridge = _make_bridge(tmp_path, monkeypatch)
+        forwarded_args: list[dict[str, Any]] = []
+
+        async def _responder(reqs: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+            req = reqs[0]
+            if req["method"] == "initialize":
+                return [
+                    {
+                        "jsonrpc": "2.0",
+                        "id": req["id"],
+                        "result": {
+                            "protocolVersion": "2024-11-05",
+                            "serverInfo": {"name": "researchdata", "version": "1.0.0"},
+                        },
+                    }
+                ], 0
+            if req["method"] == "tools/list":
+                return [
+                    {
+                        "jsonrpc": "2.0",
+                        "id": req["id"],
+                        "result": {
+                            "tools": [
+                                {
+                                    "name": "finance",
+                                    "description": "Financial filings and statements.",
+                                    "inputSchema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "route": {"type": "string", "enum": ["sec", "cn-hk"]},
+                                            "operation": {"type": "string"},
+                                            "ticker": {"type": "string"},
+                                            "start": {"type": "string"},
+                                            "end": {"type": "string"},
+                                            "limit": {"type": "integer", "default": 3},
+                                            "timeout": {"type": "integer", "default": 180},
+                                        },
+                                        "required": ["route"],
+                                    },
+                                },
+                                {
+                                    "name": "research",
+                                    "description": "Internal research library.",
+                                    "inputSchema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "route": {
+                                                "type": "string",
+                                                "enum": [
+                                                    "all",
+                                                    "alphaengine",
+                                                    "guidepoint",
+                                                    "transcript",
+                                                    "company-wiki",
+                                                    "sales-notes",
+                                                    "tmtb",
+                                                    "funda-ai",
+                                                ],
+                                            },
+                                            "operation": {"type": "string"},
+                                            "query": {"type": "string"},
+                                            "limit": {"type": "integer", "default": 3},
+                                            "timeout": {"type": "integer", "default": 180},
+                                        },
+                                        "required": ["route"],
+                                    },
+                                },
+                                {
+                                    "name": "community",
+                                    "description": "Community sources.",
+                                    "inputSchema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "route": {
+                                                "type": "string",
+                                                "enum": ["xueqiu", "employee", "last30days", "x-timeline"],
+                                            },
+                                            "mode": {"type": "string", "default": "fetch"},
+                                            "limit": {"type": "integer", "default": 3},
+                                            "timeout": {"type": "integer", "default": 180},
+                                        },
+                                        "required": ["route"],
+                                    },
+                                },
+                                {
+                                    "name": "macro",
+                                    "description": "Macro series.",
+                                    "inputSchema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "route": {"type": "string", "enum": ["fred", "treasury", "market-regime"]},
+                                            "series": {"type": "string"},
+                                            "start": {"type": "string"},
+                                            "end": {"type": "string"},
+                                        },
+                                        "required": ["route"],
+                                    },
+                                },
+                                {
+                                    "name": "catalog",
+                                    "description": "List routes.",
+                                    "inputSchema": {
+                                        "type": "object",
+                                        "properties": {"category": {"type": "string"}},
+                                    },
+                                },
+                                {
+                                    "name": "news",
+                                    "description": "News sources.",
+                                    "inputSchema": {
+                                        "type": "object",
+                                        "properties": {"route": {"type": "string"}},
+                                    },
+                                },
+                            ]
+                        },
+                    }
+                ], 0
+            args = req["params"].get("arguments") or {}
+            forwarded_args.append(args)
+            return [
+                _mcp_tool_response(
+                    req["id"],
+                    {"ok": True, "status": "ok", "rows": [{"form": "10-K"}]},
+                )
+            ], 0
+
+        monkeypatch.setattr(
+            asyncio, "create_subprocess_exec", _make_subprocess_double(_responder)
+        )
+
+        filtered_tools = await bridge.get_filtered_tools()
+        gen = ToolFunctionGenerator()
+
+        # Verify all 6 tool descriptions are concise (< 800 chars), appended after upstream text,
+        # contain the 3 required points, and are not swallowed into `Returns:` by _extract_return_info.
+        for t in filtered_tools:
+            desc = t["description"]
+            assert len(desc) < 800, f"{t['name']} description too long ({len(desc)} chars): {desc}"
+            assert "catalog(" in desc, f"{t['name']} missing catalog pointer"
+            assert "ok: false" in desc and "hint" in desc, f"{t['name']} missing ok:false hint rule"
+            assert gen._extract_return_info(desc) == (
+                "Any",
+                "Tool execution result",
+            ), f"{t['name']} suffix swallowed into Returns"
+
+        # Generate Python wrapper module via ToolFunctionGenerator and execute it with aliases
+        from ptc_agent.core.mcp_registry import MCPToolInfo
+
+        tool_infos = [
+            MCPToolInfo(
+                name=t["name"],
+                description=t["description"],
+                input_schema=t["inputSchema"],
+                server_name="researchdata",
+            )
+            for t in filtered_tools
+        ]
+
+        sent_to_bridge: list[dict[str, Any]] = []
+
+        def _call_mcp_tool_proto(server_name: str, tool_name: str, arguments: dict[str, Any]) -> Any:
+            return None
+
+        call_mcp_mock = create_autospec(_call_mcp_tool_proto)
+
+        def _sync_bridge_caller(
+            server_name: str, tool_name: str, arguments: dict[str, Any]
+        ) -> dict[str, Any]:
+            assert server_name == "researchdata"
+            sent_to_bridge.append({"name": tool_name, "arguments": dict(arguments)})
+            return {"ok": True, "captured": dict(arguments)}
+
+        call_mcp_mock.side_effect = _sync_bridge_caller
+
+        module_code = gen.generate_tool_module("researchdata", tool_infos)
+        ns: dict[str, Any] = {}
+        exec(module_code, ns)
+        ns["_call_mcp_tool"] = call_mcp_mock
+
+        # Call generated `finance` wrapper using aliases: symbol, op, from_date, to_date
+        ns["finance"](
+            route="cn-hk",
+            op="list-filings",
+            symbol="0700.HK",
+            from_date="2025-01-01",
+            to_date="2026-10-23",
+        )
+        # Verify unset optional parameters (like limit/timeout) are NOT injected by wrapper
+        assert sent_to_bridge[-1]["arguments"] == {
+            "route": "cn-hk",
+            "op": "list-filings",
+            "symbol": "0700.HK",
+            "from_date": "2025-01-01",
+            "to_date": "2026-10-23",
+        }
+        resp_fin = await bridge.handle_tools_call("ptc-fin", sent_to_bridge[-1])
+        body_fin = json.loads(resp_fin["result"]["content"][0]["text"])
+        assert body_fin["ok"] is True
+        assert body_fin["normalized_params"] == {
+            "route": "cn-hk",
+            "operation": "filings",
+            "ticker": "00700",
+            "start": "2025-01-01",
+            "end": "2026-10-23",
+        }
+
+        # Call generated `research` wrapper using aliases: q, max_results
+        ns["research"](route="sales-notes", operation="search", q="META Reels", max_results=5)
+        resp_res = await bridge.handle_tools_call("ptc-res", sent_to_bridge[-1])
+        body_res = json.loads(resp_res["result"]["content"][0]["text"])
+        assert body_res["ok"] is True
+        assert body_res["normalized_params"] == {
+            "route": "sales-notes",
+            "operation": "search",
+            "query": "META Reels",
+            "limit": 5,
+        }
+
+        # Call generated `community` wrapper on xueqiu without unset defaults leaking in
+        ns["community"](route="xueqiu", operation="posts", symbol="00700")
+        assert sent_to_bridge[-1]["arguments"] == {
+            "route": "xueqiu",
+            "operation": "posts",
+            "symbol": "00700",
+        }
+
+        # Call generated `finance` wrapper passing ONLY route alias `source="sec"` (without `route=`)
+        ns["finance"](source="sec", symbol="META")
+        assert sent_to_bridge[-1]["arguments"] == {
+            "source": "sec",
+            "symbol": "META",
+        }
+        resp_route_alias = await bridge.handle_tools_call("ptc-route-alias", sent_to_bridge[-1])
+        body_route_alias = json.loads(resp_route_alias["result"]["content"][0]["text"])
+        assert body_route_alias["ok"] is True
+        assert body_route_alias["normalized_params"] == {
+            "route": "sec",
+            "ticker": "META",
+        }
+
+        # Omitting both `route` and all route aliases (`source`/`channel`/`provider`) is rejected by bridge
+        resp_no_route = await bridge.handle_tools_call(
+            "ptc-no-route",
+            {"name": "finance", "arguments": {"symbol": "META"}},
+        )
+        assert resp_no_route["result"]["isError"] is True
+        body_no_route = json.loads(resp_no_route["result"]["content"][0]["text"])
+        assert body_no_route["ok"] is False
+        assert body_no_route["error_code"] == "missing_required_parameters"
+        assert body_no_route["error_category"] == "参数错误"
+        assert "route" in body_no_route["missing_parameters"]
+
+    @pytest.mark.asyncio
+    async def test_alias_mapped_to_unaccepted_route_param_rejected_and_nested_params_validated(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bridge = _make_bridge(tmp_path, monkeypatch)
+        forwarded_args: list[dict[str, Any]] = []
+
+        async def _responder(reqs: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+            req = reqs[0]
+            args = req["params"].get("arguments") or {}
+            forwarded_args.append(args)
+            return [
+                _mcp_tool_response(
+                    req["id"],
+                    {
+                        "ok": True,
+                        "status": "ok",
+                        "data": {"structuredContent": {"returned_chars": 120, "text": "doc body"}},
+                    },
+                )
+            ], 0
+
+        monkeypatch.setattr(
+            asyncio, "create_subprocess_exec", _make_subprocess_double(_responder)
+        )
+
+        # 1. Alias mapped to a canonical parameter NOT accepted by that route/operation -> rejected
+        unaccepted_alias_cases = [
+            # series_id -> series, which is not accepted on finance(route="sec")
+            ("finance", {"route": "sec", "operation": "financials", "ticker": "META", "series_id": "SOFR"}),
+            # symbol -> ticker, which is not accepted on macro(route="treasury")
+            ("macro", {"route": "treasury", "dataset": "tga", "start": "2026-01-01", "end": "2026-10-23", "symbol": "AAPL"}),
+            # from -> start, which is not accepted on community(route="xueqiu")
+            ("community", {"route": "xueqiu", "operation": "posts", "ticker": "00700", "from": "2026-01-01"}),
+        ]
+        for idx, (tool_name, args) in enumerate(unaccepted_alias_cases):
+            resp = await bridge.handle_tools_call(
+                f"unacc-alias-{idx}", {"name": tool_name, "arguments": args}
+            )
+            body = json.loads(resp["result"]["content"][0]["text"])
+            assert body["ok"] is False, f"Expected rejection for {args}: {body}"
+            assert body["error_code"] == "unknown_parameters"
+            assert body["error_category"] == "参数错误"
+            assert body["accepted_parameters"]
+
+        # 2. Nested `params` conflict (params.document vs params.doc_id; top-level document vs params.doc_id)
+        for idx, bad_params_args in enumerate(
+            [
+                {
+                    "route": "alphaengine",
+                    "operation": "get_document",
+                    "params": {"document": "111", "doc_id": "222"},
+                },
+                {
+                    "route": "sales-notes",
+                    "operation": "read",
+                    "document": "mail:111",
+                    "params": {"doc_id": "mail:222"},
+                },
+                {
+                    "route": "sales-notes",
+                    "operation": "read",
+                    "document": "mail:111",
+                    "params": {"offset": 0, "start_offset": 500},
+                },
+            ]
+        ):
+            resp_c = await bridge.handle_tools_call(
+                f"nested-conflict-{idx}",
+                {"name": "research", "arguments": bad_params_args},
+            )
+            body_c = json.loads(resp_c["result"]["content"][0]["text"])
+            assert body_c["ok"] is False
+            assert body_c["error_code"] == "parameter_conflict"
+            assert body_c["error_category"] == "参数错误"
+
+        # 3. Unknown key inside `params` -> rejected with accepted_nested_parameters
+        resp_unk_p = await bridge.handle_tools_call(
+            "nested-unk",
+            {
+                "name": "research",
+                "arguments": {
+                    "route": "sales-notes",
+                    "operation": "search",
+                    "query": "META",
+                    "params": {"layer": "raw", "unexpected_nested_key": True},
+                },
+            },
+        )
+        body_unk_p = json.loads(resp_unk_p["result"]["content"][0]["text"])
+        assert body_unk_p["ok"] is False
+        assert body_unk_p["error_code"] == "unknown_parameters"
+        assert "unexpected_nested_key" in body_unk_p["error"]
+        assert "layer" in body_unk_p["accepted_nested_parameters"]
+
+        assert len(forwarded_args) == 0
+
+        # 4. AlphaEngine top-level `document` (or alias `doc_id`) maps to `params.doc_id` and deletes top-level `document`
+        resp_ae_doc = await bridge.handle_tools_call(
+            "ae-top-doc",
+            {
+                "name": "research",
+                "arguments": {
+                    "route": "alphaengine",
+                    "operation": "get_document",
+                    "document": "190000041634994",
+                },
+            },
+        )
+        body_ae_doc = json.loads(resp_ae_doc["result"]["content"][0]["text"])
+        assert body_ae_doc["ok"] is True
+        assert len(forwarded_args) == 1
+        assert "document" not in forwarded_args[-1]
+        assert forwarded_args[-1]["params"] == {"doc_id": "190000041634994"}
+        assert body_ae_doc["normalized_params"] == {
+            "route": "alphaengine",
+            "operation": "get_document",
+            "params": {"doc_id": "190000041634994"},
+        }
+
+    @pytest.mark.asyncio
+    async def test_catalog_first_routing_all_routes_and_required_params_and_examples_valid(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import ast
+
+        bridge = _make_bridge(tmp_path, monkeypatch)
+
+        async def _responder(reqs: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+            req = reqs[0]
+            assert req["params"]["name"] == "catalog"
+            return [
+                _mcp_tool_response(
+                    req["id"],
+                    {
+                        "ok": True,
+                        "status": "ok",
+                        "routes": [
+                            {"id": rid, "category": spec["category"], "operations": list(spec["operations"])}
+                            for rid, spec in rb.ROUTE_CONTRACT_SPECS.items()
+                            if rid not in rb.BRIDGE_COMMUNITY_ROUTES and rid != "market-regime"
+                        ],
+                    },
+                )
+            ], 0
+
+        monkeypatch.setattr(
+            asyncio, "create_subprocess_exec", _make_subprocess_double(_responder)
+        )
+
+        # 1. Every route in ROUTE_CONTRACT_SPECS (including xueqiu, employee, last30days, x-timeline, market-regime)
+        # must succeed via catalog(route=rid) without triggering community or market-regime execution.
+        for rid, spec in rb.ROUTE_CONTRACT_SPECS.items():
+            resp = await bridge.handle_tools_call(
+                f"cat-{rid}",
+                {"name": "catalog", "arguments": {"route": rid}},
+            )
+            assert not resp["result"].get("isError"), f"catalog(route={rid!r}) failed: {resp}"
+            body = json.loads(resp["result"]["content"][0]["text"])
+            assert body["ok"] is True
+            assert body["route_count"] == 1
+            entry = body["routes"][0]
+            assert entry["id"] == rid
+            assert entry["required_params"] == spec["required_params"]
+            assert entry["accepted_params"] == spec["accepted_params"]
+
+        # 2. Required parameters aligned with data_gateway.py (fred/treasury/cn-hk filings start+end, sec smart-facts query, transcript ticker)
+        missing_required_cases = [
+            ("macro", {"route": "fred", "series": "SOFR"}, "start"),
+            ("macro", {"route": "treasury", "dataset": "tga", "start": "2026-01-01"}, "end"),
+            ("finance", {"route": "cn-hk", "operation": "filings", "ticker": "00700"}, "start"),
+            ("finance", {"route": "sec", "operation": "smart-facts", "ticker": "META"}, "query"),
+            ("research", {"route": "transcript", "query": "Meta Platforms"}, "ticker"),
+        ]
+        for idx, (tool_name, bad_args, missing_field) in enumerate(missing_required_cases):
+            _norm, _view, val_err = rb._normalize_and_validate_call_args(tool_name, bad_args)
+            assert val_err is not None, f"Expected missing_required_parameters for {bad_args}"
+            assert val_err["error_code"] == "missing_required_parameters"
+            assert missing_field in val_err["missing_parameters"]
+
+        # treasury does not accept vintage
+        _norm_tr, _view_tr, err_tr = rb._normalize_and_validate_call_args(
+            "macro",
+            {"route": "treasury", "dataset": "tga", "start": "2026-01-01", "end": "2026-10-23", "vintage": "2026-10-23"},
+        )
+        assert err_tr is not None and err_tr["error_code"] == "unknown_parameters"
+
+        # 3. Every example in ROUTE_CONTRACT_SPECS passes bridge parameter validation (and sales-mail example uses route="sales-mail")
+        assert any('route="sales-mail"' in ex for ex in rb.ROUTE_CONTRACT_SPECS["sales-mail"]["examples"])
+        for rid, spec in rb.ROUTE_CONTRACT_SPECS.items():
+            for ex in spec["examples"]:
+                tree = ast.parse(ex, mode="eval")
+                assert isinstance(tree.body, ast.Call)
+                fn_name = tree.body.func.id if isinstance(tree.body.func, ast.Name) else ""
+                kwargs = {kw.arg: ast.literal_eval(kw.value) for kw in tree.body.keywords if kw.arg}
+                assert kwargs.get("route") == rid, f"Example {ex!r} route mismatch for {rid}"
+                _norm, _view, val_err = rb._normalize_and_validate_call_args(fn_name, kwargs)
+                assert val_err is None, f"Example {ex!r} failed validation: {val_err}"
+
+    @pytest.mark.asyncio
+    async def test_route_all_fanout_unwraps_nested_failures_and_sets_partial(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bridge = _make_bridge(tmp_path, monkeypatch)
+        scenario = ["ae_sc_ok_false"]
+
+        async def _responder(reqs: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+            req = reqs[0]
+            r_arg = (req["params"].get("arguments") or {}).get("route")
+            if r_arg == "all":
+                return [
+                    _mcp_tool_response(
+                        req["id"],
+                        {
+                            "ok": True,
+                            "status": "ok",
+                            "results": [
+                                {
+                                    "route": "company-wiki",
+                                    "document_id": "wiki:meta",
+                                    "title": "META Wiki",
+                                }
+                            ],
+                        },
+                    )
+                ], 0
+            if r_arg == "alphaengine":
+                if scenario[0] == "ae_sc_ok_false":
+                    return [
+                        _mcp_tool_response(
+                            req["id"],
+                            {
+                                "ok": True,
+                                "status": "ok",
+                                "data": {
+                                    "structuredContent": {
+                                        "ok": False,
+                                        "results": [],
+                                    }
+                                },
+                            },
+                        )
+                    ], 0
+                return [
+                    _mcp_tool_response(
+                        req["id"],
+                        {
+                            "ok": True,
+                            "status": "ok",
+                            "data": {
+                                "structuredContent": {
+                                    "results": [{"doc_id": "12345", "title": "AE Doc"}]
+                                }
+                            },
+                        },
+                    )
+                ], 0
+            if r_arg == "guidepoint":
+                if scenario[0] == "gp_data_forbidden":
+                    return [
+                        _mcp_tool_response(
+                            req["id"],
+                            {
+                                "ok": True,
+                                "status": "ok",
+                                "data": {
+                                    "status": "forbidden",
+                                    "message": "HTTP 403 Forbidden",
+                                    "results": [],
+                                },
+                            },
+                        )
+                    ], 0
+                return [
+                    _mcp_tool_response(
+                        req["id"],
+                        {
+                            "ok": True,
+                            "status": "ok",
+                            "data": {
+                                "structuredContent": {
+                                    "results": [{"id": "gp_1", "title": "GP Transcript"}]
+                                }
+                            },
+                        },
+                    )
+                ], 0
+            return [_mcp_tool_response(req["id"], {"ok": True, "status": "ok", "results": []})], 0
+
+        monkeypatch.setattr(
+            asyncio, "create_subprocess_exec", _make_subprocess_double(_responder)
+        )
+
+        # Case 1: AlphaEngine returns {ok: True, data: {structuredContent: {ok: False, results: []}}}
+        resp1 = await bridge.handle_tools_call(
+            "fanout-nested-1",
+            {"name": "research", "arguments": {"route": "all", "query": "META"}},
+        )
+        assert resp1["result"]["isError"] is True
+        body1 = json.loads(resp1["result"]["content"][0]["text"])
+        assert body1["ok"] is False
+        assert body1["status"] == "partial_error"
+        assert "empty_reason" not in body1
+        assert body1["source_status"]["alphaengine"]["ok"] is False
+        assert body1["source_status"]["alphaengine"]["status"] == "failed"
+        assert body1["partial"] == ["local_all", "guidepoint"]
+
+        # Case 2: Guidepoint returns {ok: True, data: {status: "forbidden", message: "HTTP 403 Forbidden", results: []}}
+        scenario[0] = "gp_data_forbidden"
+        resp2 = await bridge.handle_tools_call(
+            "fanout-nested-2",
+            {"name": "research", "arguments": {"route": "all", "query": "META"}},
+        )
+        assert resp2["result"]["isError"] is True
+        body2 = json.loads(resp2["result"]["content"][0]["text"])
+        assert body2["ok"] is False
+        assert body2["status"] == "partial_error"
+        assert "empty_reason" not in body2
+        assert body2["source_status"]["guidepoint"]["ok"] is False
+        assert body2["source_status"]["guidepoint"]["status"] == "forbidden"
+        assert body2["partial"] == ["local_all", "alphaengine"]
+        assert body2["error_category"] == "权限或额度"
+
+    @pytest.mark.asyncio
+    async def test_last30days_and_mcp_is_error_recomputed_from_final_payload_ok(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bridge = _make_bridge(tmp_path, monkeypatch)
+        exec_mock = create_autospec(asyncio.create_subprocess_exec)
+
+        async def _fake_exec(*cmd: Any, **kwargs: Any) -> asyncio.subprocess.Process:
+            proc = create_autospec(asyncio.subprocess.Process, instance=True)
+            proc.returncode = 0
+            out = {
+                "query": "META",
+                "results": [],
+                "source_status": {
+                    "x": {"state": "no-results", "isError": True},
+                },
+            }
+            proc.communicate.return_value = (json.dumps(out).encode("utf-8"), b"")
+            return proc
+
+        exec_mock.side_effect = _fake_exec
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", exec_mock)
+
+        resp = await bridge.handle_tools_call(
+            "l30-iserror-sync",
+            {"name": "community", "arguments": {"route": "last30days", "query": "META"}},
+        )
+        body = json.loads(resp["result"]["content"][0]["text"])
+        assert body["ok"] is False
+        assert resp["result"]["isError"] is True
+        assert body["status"] in rb._FAILURE_STATUSES
+        assert "empty_reason" not in body
+        assert body["error_category"] == "上游不可用"
+        assert body["hint"]
+
 
