@@ -68,12 +68,19 @@ def build_trigger_pair(
         "timezone": timezone,
         "instruction": (
             f"/dalton-stock-move {t} 今天 —— 价格触发：较昨收跌超 {thr_str}%。"
-            f"先量化同组与板块，再找原因；若判定为板块 beta 且无个股事件，"
+            f"第一步先用 web_search 与 x_search 搜当天和前一天的最新新闻与 X 拿到今天发生了什么，再查基本面、卖方与同行；"
+            f"若判定为板块 beta 且无个股事件，"
             f"只用 knowledge_append_verdict 写一条 NO_CHANGE，不推送。"
         ),
         "workspace_id": ws_id,
         "thread": "new",
         "delivery": deliv,
+        "metadata": {
+            "dalton_managed": True,
+            "dalton_kind": "price_move",
+            "ticker": t,
+            "direction": "down",
+        },
     }
 
     up_obj = {
@@ -98,12 +105,19 @@ def build_trigger_pair(
         "timezone": timezone,
         "instruction": (
             f"/dalton-stock-move {t} 今天 —— 价格触发：较昨收涨超 {thr_str}%。"
-            f"先量化同组与板块，再找原因；若判定为板块 beta 且无个股事件，"
+            f"第一步先用 web_search 与 x_search 搜当天和前一天的最新新闻与 X 拿到今天发生了什么，再查基本面、卖方与同行；"
+            f"若判定为板块 beta 且无个股事件，"
             f"只用 knowledge_append_verdict 写一条 NO_CHANGE，不推送。"
         ),
         "workspace_id": ws_id,
         "thread": "new",
         "delivery": deliv,
+        "metadata": {
+            "dalton_managed": True,
+            "dalton_kind": "price_move",
+            "ticker": t,
+            "direction": "up",
+        },
     }
 
     return {
