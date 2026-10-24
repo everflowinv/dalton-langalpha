@@ -239,9 +239,17 @@ def test_connectors_switch(value, expected):
     assert apply_override(BUILTIN_SUBAGENTS["research"], {"connectors": value}).connectors is expected
 
 
-@pytest.mark.parametrize(("value", "expected"), [("off", "off"), ("bogus", "on")])
+# DALTON-HOOK(hide-trading): builtin and deployment subagent brokerages default is off in Dalton
+@pytest.mark.parametrize(("value", "expected"), [("off", "off"), ("on", "on"), ("bogus", "off")])
 def test_brokerages_take_only_a_known_level(value, expected):
     assert apply_override(BUILTIN_SUBAGENTS["research"], {"brokerages": value}).brokerages == expected
+
+
+def test_subagent_config_without_brokerages_defaults_to_off():
+    cfg = SubagentConfig(description="custom deployment subagent")
+    assert cfg.brokerages == "off"
+    bases = _bases(macro=cfg)
+    assert bases["macro"].definition.brokerages == "off"
 
 
 def test_an_override_reaches_only_the_fields_a_user_may_edit():

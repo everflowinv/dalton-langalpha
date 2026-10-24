@@ -1,5 +1,4 @@
-import { useBrokerages } from '@/hooks/useMcpServers';
-import { brokerageForUrl, type Brokerage } from '../brokerages';
+import type { Brokerage } from '../brokerages';
 
 /**
  * Which shipped brokerage an address belongs to, as every surface reads it:
@@ -15,6 +14,6 @@ import { brokerageForUrl, type Brokerage } from '../brokerages';
  * query would bring the whole MCP client onto the first load.
  */
 export function useVendorOf(): (url?: string | null) => Brokerage | null | undefined {
-  const { data: brokerages } = useBrokerages();
-  return (url) => (brokerages ? brokerageForUrl(url, brokerages) : undefined);
+  // DALTON-HOOK(hide-trading): never query /api/v1/mcp/brokerages; all servers resolve as non-brokerage (null)
+  return () => null;
 }

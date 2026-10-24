@@ -70,7 +70,13 @@ from src.server.services.mcp_catalog_view import (
 from src.server.services.mcp_import import catalog_import_scope, run_mcp_import
 from src.server.services.mcp_oauth.discovery import schedule_catalog_discovery
 from src.server.services.mcp_probe import probe_configured, probe_result
-from src.server.services.mcp_saves import CatalogAdd, ServerEdit, parse_server
+# DALTON-HOOK(hide-trading): import refuse_brokerage_url for single-entry import refusal
+from src.server.services.mcp_saves import (
+    CatalogAdd,
+    ServerEdit,
+    parse_server,
+    refuse_brokerage_url,
+)
 from src.server.services.mcp_validation import check_servers
 from src.server.services.vault_invalidation import after_secrets_changed
 from src.server.utils.api import CurrentUserId, handle_api_exceptions
@@ -310,6 +316,10 @@ async def import_servers(
             detail='No MCP servers found. Expected a JSON object like '
             '{"mcpServers": { "<name>": { ... } }}.',
         )
+    # DALTON-HOOK(hide-trading): refuse single-entry brokerage URL import before any DB access
+    if len(parsed) == 1 and isinstance(parsed[0].config.get("url"), str):
+        # A non-string url is left to the per-entry validation below.
+        refuse_brokerage_url(parsed[0].config["url"])
 
     landed_enabled: set[str] = set()
 

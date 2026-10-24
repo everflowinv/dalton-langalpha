@@ -3,7 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { AnimatePresence } from '@/lib/framer';
 import { toast } from '@/components/ui/use-toast';
 import {
-  useBrokerages,
+  // DALTON-HOOK(hide-trading): do not query brokerages in McpServers
   useMcpCatalog,
   useBuiltinMcpServers,
   useToggleBuiltinMcpServer,
@@ -92,11 +92,10 @@ export function McpServers() {
   const { openDetail } = useSectionNav();
   // One observer for the whole list. The registry is static and identical for
   // every row, so asking per row bought nothing and cost an observer per server.
-  const {
-    data: brokerages,
-    error: brokeragesError,
-    refetch: refetchBrokerages,
-  } = useBrokerages();
+  // DALTON-HOOK(hide-trading): do not query brokerages in McpServers
+  const brokerages: never[] = [];
+  const brokeragesError = null;
+  const refetchBrokerages = () => Promise.resolve();
   // Resolved off the address rather than the row's identity: a brokerage row
   // is the user's to edit once it exists, so the vendor's constraints follow
   // wherever the URL still points.

@@ -1,4 +1,5 @@
-import { useBrokerages, useBuiltinMcpServers, useMcpCatalog } from '@/hooks/useMcpServers';
+// DALTON-HOOK(hide-trading): do not query brokerages in useMcpFormFacts
+import { useBuiltinMcpServers, useMcpCatalog } from '@/hooks/useMcpServers';
 import {
   useCreateUserVaultSecret,
   useUpdateUserVaultSecret,
@@ -27,10 +28,9 @@ export type NameOwner = 'yours' | 'reserved';
 export function useTakenNames(): ReadonlyMap<string, NameOwner> {
   const { data: catalog } = useMcpCatalog();
   const { data: builtins } = useBuiltinMcpServers();
-  const { data: brokerages } = useBrokerages();
+  // DALTON-HOOK(hide-trading): do not call useBrokerages() in useTakenNames
   const taken = new Map<string, NameOwner>();
   for (const b of builtins?.servers ?? []) taken.set(b.name, 'reserved');
-  for (const b of brokerages ?? []) taken.set(b.name, 'reserved');
   for (const s of catalog?.servers ?? []) taken.set(s.name, 'yours');
   return taken;
 }

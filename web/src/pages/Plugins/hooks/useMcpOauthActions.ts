@@ -1,11 +1,9 @@
 import { createElement, useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { useQueryClient } from '@tanstack/react-query';
 import { ToastAction } from '@/components/ui/toast';
 import { toast } from '@/components/ui/use-toast';
 import { useBfcacheRestore } from '@/hooks/useBfcacheRestore';
 import {
-  brokeragesQuery,
   useDisconnectMcpOauth,
   useRefreshMcpOauthSchemas,
 } from '@/hooks/useMcpServers';
@@ -27,7 +25,8 @@ import {
   rememberConnect,
   type ConnectRetry,
 } from '../connectReturn';
-import { brokerageForUrl, connectAsks, type Brokerage } from '../brokerages';
+// DALTON-HOOK(hide-trading): do not import brokeragesQuery or brokerageForUrl
+import { connectAsks, type Brokerage } from '../brokerages';
 import {
   preloadConnectConsent,
   readConnectQuestion,
@@ -284,7 +283,6 @@ export function useMcpOauthActions({
   returnTo?: string;
 } = {}) {
   const { t } = useTranslation();
-  const queryClient = useQueryClient();
   const disconnectMutation = useDisconnectMcpOauth();
   const refreshMutation = useRefreshMcpOauthSchemas();
   const vendorOf = useVendorOf();
@@ -338,14 +336,8 @@ export function useMcpOauthActions({
    * it.
    */
   async function connectOnceResolved(request: ConnectRequest) {
-    let vendor: Brokerage | null;
-    try {
-      vendor = brokerageForUrl(request.url, await queryClient.fetchQuery(brokeragesQuery));
-    } catch (err) {
-      reportNotStarted(request, err, formatApiErrorDetail(err));
-      return;
-    }
-    proceed({ ...request, vendor });
+    // DALTON-HOOK(hide-trading): never fetch brokeragesQuery; treat as non-brokerage (null)
+    proceed({ ...request, vendor: null });
   }
 
   function proceed(request: ResolvedConnect) {

@@ -205,4 +205,14 @@ describe('Settings — Output format', () => {
     // dedicated control replaces it, so that raw row must not appear.
     expect(screen.queryByText('Output Format:')).not.toBeInTheDocument();
   });
+
+  // DALTON-HOOK(hide-trading): TradingPermissionSection is hidden while AutoApproveSettings stays
+  it('hides TradingPermissionSection in Preferences while keeping Approvals (AutoApproveSettings)', async () => {
+    setupAndRender({});
+
+    await screen.findByRole('button', { name: 'Default' });
+    expect(screen.getByText('Approvals')).toBeInTheDocument();
+    expect(screen.queryByText('Trading permissions')).not.toBeInTheDocument();
+    expect(screen.queryByRole('radiogroup', { name: 'Trading permissions' })).not.toBeInTheDocument();
+  });
 });

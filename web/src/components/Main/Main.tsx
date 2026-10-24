@@ -32,7 +32,7 @@ const MarketView = lazyWithMotion(routeChunks.market);
 // Animates nothing, so it skips the framer download (see lib/lazyWithMotion).
 const NewsDetailPage = React.lazy(routeChunks.news);
 const Automations = lazyWithMotion(routeChunks.automations);
-const Orders = lazyWithMotion(routeChunks.orders);
+// DALTON-HOOK(hide-trading): do not mount Orders page
 const Plugins = lazyWithMotion(routeChunks.plugins);
 const Settings = lazyWithMotion(routeChunks.settings);
 
@@ -91,7 +91,7 @@ function Main() {
           <Route path="/chat/:workspaceId" element={<ChatAgent />} />
           <Route path="/market" element={<MarketView />} />
           <Route path="/automations" element={<Automations />} />
-          <Route path="/orders" element={<Orders />} />
+          <Route path="/orders" element={<Navigate to={import.meta.env.VITE_DALTON_MODE ? '/chat' : '/dashboard'} replace />} /> {/* DALTON-HOOK(hide-trading) */}
           <Route path="/plugins" element={<Plugins />} />
           <Route path="/connectors" element={<LegacyConnectorsRedirect />} />
           <Route path="/settings" element={<Settings />} />

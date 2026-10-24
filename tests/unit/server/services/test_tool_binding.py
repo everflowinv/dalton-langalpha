@@ -671,3 +671,71 @@ class TestOnlyHttpRowsReachTheRelay:
     def test_a_stored_direct_entry_leaves_an_sse_row_on_its_next_write(self):
         relayable = inputs_from_row({"transport": "sse"}).relayable
         assert strip_disallowed_overrides(None, {"desk_quote": "direct"}, relayable) == {}
+
+
+# DALTON-HOOK(hide-trading): _ORDER_TOOLS are identified by is_order_tool and excluded from direct tool binding
+class TestOrderToolsAreNeverBound:
+    def test_every_shipped_order_tool_is_detected(self):
+        from src.server.services.brokerage_capabilities import _ORDER_TOOLS
+        from src.server.services.tool_binding import ALL_ORDER_TOOL_NAMES, is_order_tool
+
+        for vendor, tools in _ORDER_TOOLS.items():
+            for tool_name in tools:
+                assert tool_name in ALL_ORDER_TOOL_NAMES
+                assert is_order_tool(vendor, tool_name) is True
+                assert is_order_tool(None, tool_name) is True
+        assert is_order_tool("moomoo", "quote_stock_quote") is False
+        assert is_order_tool(None, "quote_stock_quote") is False
+
+    @pytest.mark.asyncio
+    async def test_prepare_direct_mcp_tools_drops_order_tools_even_when_in_snapshot(self):
+        from unittest.mock import patch
+
+        from src.server.services.egress.direct_tools import prepare_direct_mcp_tools
+        from src.server.services.mcp_tool_split import DirectServerTools, DirectTool
+        from src.server.services.tool_binding import BindingInputs, resolve_tool
+
+        inputs = BindingInputs(overrides={"quote_stock_quote": "direct"})
+        by_server = {
+            "moomoo": DirectServerTools(
+                vendor="moomoo",
+                tools=(
+                    DirectTool(
+                        schema={"name": "trading_order_place", "description": "place order", "input_schema": {}},
+                        resolved=resolve_tool("moomoo", "trading_order_place", inputs),
+                    ),
+                    DirectTool(
+                        schema={"name": "sim_trade_input_order", "description": "paper order", "input_schema": {}},
+                        resolved=resolve_tool("moomoo", "sim_trade_input_order", inputs),
+                    ),
+                    DirectTool(
+                        schema={"name": "quote_stock_quote", "description": "get quote", "input_schema": {}},
+                        resolved=resolve_tool("moomoo", "quote_stock_quote", inputs),
+                    ),
+                ),
+            )
+        }
+
+        with patch("src.server.services.egress.direct_tools.EGRESS_RELAY_SECRET", "test-secret-key-32-bytes-long-00"):
+            binding = await prepare_direct_mcp_tools(
+                user_id="u-1",
+                workspace_id="ws-1",
+                grants={"moomoo": "grant-token"},
+                by_server=by_server,
+            )
+        assert [t.name for t in binding.tools] == ["mcp__moomoo__quote_stock_quote"]
+
+    def test_split_server_tools_strips_order_tools_from_stdio_sandbox_wrappers(self):
+        # DALTON-HOOK(hide-trading): stdio brokerage MCP with place_equity_order is excluded from sandbox wrappers
+        from src.server.services.mcp_tool_split import split_server_tools
+
+        stdio_tools = [
+            {"name": "get_positions", "description": "positions", "input_schema": {}},
+            {"name": "place_equity_order", "description": "order", "input_schema": {}},
+            {"name": "cancel_equity_order", "description": "cancel", "input_schema": {}},
+        ]
+        sandbox_tools, direct = split_server_tools(
+            stdio_tools, denied=None, plan=None, vendor=None
+        )
+        assert [t["name"] for t in sandbox_tools] == ["get_positions"]
+        assert direct is None

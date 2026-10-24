@@ -233,7 +233,8 @@ class TestToolGuide:
         assert "srv_broker" not in roster
 
     def test_an_unrestricted_subagent_lists_every_server(self):
-        _, roster = _guide(_Registry(SERVERS))
+        # DALTON-HOOK(hide-trading): brokerages defaults to "off" in Dalton; pass "on" for unrestricted case
+        _, roster = _guide(_Registry(SERVERS), brokerages="on")
         assert all(name in roster for name in SERVERS)
 
     def test_the_prompt_names_no_server(self):
@@ -264,6 +265,7 @@ class TestToolGuide:
         assert "<mcp-servers>" not in baseline
 
     def test_preferred_servers_lead_and_never_limit(self):
-        _, roster = _guide(_Registry(SERVERS), preferred_connectors=["srv_notes"])
+        # DALTON-HOOK(hide-trading): brokerages defaults to "off" in Dalton; pass "on" to include srv_broker
+        _, roster = _guide(_Registry(SERVERS), brokerages="on", preferred_connectors=["srv_notes"])
         headers = [roster.index(f"\n{name}:") for name in ("srv_notes", "srv_market", "srv_broker")]
         assert headers == sorted(headers)

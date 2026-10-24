@@ -24,7 +24,7 @@ import {
 } from './DetailPage';
 import { BrokerFacts } from './BrokerageDetailParts';
 import { ConnectButton } from './OauthRowParts';
-import { OrderCapabilityBadges } from './OrderCapabilityBadges';
+// DALTON-HOOK(hide-trading): do not import or render OrderCapabilityBadges
 import { PluginSuppressedBadge } from './PluginBadges';
 import { ScopeControl } from './ScopeControl';
 import { scopeOff } from '../utils/scopeOff';
@@ -336,11 +336,7 @@ export function ServerDetail({
                 </Fragment>
               ))}
               <PluginSuppressedBadge row={catalog ?? builtin} variant="prose" />
-              {/* The one thing a broker is asked first, in the same words the
-                  consent toggle uses for it. */}
-              {origin === 'brokerage' && (
-                <OrderCapabilityBadges vendor={vendor} granted={granted} />
-              )}
+              {/* DALTON-HOOK(hide-trading): do not render <OrderCapabilityBadges> */}
             </>
           }
           controls={

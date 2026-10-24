@@ -128,6 +128,11 @@ vi.mock('@/hooks/useMcpServers', async (importOriginal) => {
   };
 });
 
+// DALTON-HOOK(hide-trading): useVendorOf returns () => null in Dalton; mock here to exercise brokerage tool bulk selection
+vi.mock('../hooks/useVendorOf', () => ({
+  useVendorOf: () => (url?: string | null) => (url === VENDOR.url ? VENDOR : null),
+}));
+
 async function renderDetail() {
   const { ServerDetail } = await import('../components/ServerDetail');
   const { DetailPageProvider } = await import('../components/DetailPage');

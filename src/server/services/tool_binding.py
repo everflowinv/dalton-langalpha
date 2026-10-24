@@ -45,6 +45,7 @@ from typing import Literal
 from src.server.services.brokerage_capabilities import (
     ALL_BINDINGS,
     BINDINGS,
+    _ORDER_TOOLS,  # DALTON-HOOK(hide-trading)
     Binding,
     CapabilityGroup,
     OrderMode,
@@ -215,6 +216,20 @@ def inputs_from_row(row: Mapping[str, object] | None) -> BindingInputs:
 #: The modes the user's trading permission speaks for. Paper spends nothing,
 #: so its switch is the connection's alone at every level.
 REAL_MONEY_MODES = tuple(m.value for m in OrderMode if m is not OrderMode.PAPER)
+
+# DALTON-HOOK(hide-trading): all order/cancel tool names across shipped brokerages (_ORDER_TOOLS)
+ALL_ORDER_TOOL_NAMES: frozenset[str] = frozenset(
+    fold_tool_name(t) for tools in _ORDER_TOOLS.values() for t in tools
+)
+
+
+def is_order_tool(vendor: str | None, tool: str) -> bool:
+    """Return True if ``tool`` is an order/cancel tool in ``_ORDER_TOOLS``."""
+    # DALTON-HOOK(hide-trading): identify any brokerage order/cancel tool so it is never bound
+    return (
+        order_tool(vendor, tool) is not None
+        or fold_tool_name(tool) in ALL_ORDER_TOOL_NAMES
+    )
 
 
 def order_approval_map(

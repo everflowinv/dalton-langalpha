@@ -202,6 +202,47 @@ class DirectMcpPolicyMiddleware(AgentMiddleware):
         return _stamped(result, stamp)
 
 
+# DALTON-HOOK(hide-trading): default set of brokerage order/cancel tool names never bound to the agent
+_DEFAULT_ORDER_TOOL_NAMES: frozenset[str] = frozenset(
+    {
+        "trading_order_place",
+        "trading_order_replace",
+        "trading_order_cancel",
+        "trading_order_confirm",
+        "sim_trade_input_order",
+        "sim_trade_modify_order",
+        "sim_trade_cancel_order",
+        "place_equity_order",
+        "place_option_order",
+        "place_crypto_order",
+        "cancel_equity_order",
+        "cancel_option_order",
+        "cancel_crypto_order",
+        "exercise_option",
+        "cancel_option_exercise",
+        "create_order_instruction",
+        "delete_order_instruction",
+    }
+)
+
+
+def bindable_direct_tools(
+    toolset: DirectToolSet | None,
+    order_tool_names: frozenset[str] = _DEFAULT_ORDER_TOOL_NAMES,
+) -> list[BaseTool]:
+    """Return only non-order direct MCP tools to bind onto the agent."""
+    if toolset is None:
+        return []
+    result: list[BaseTool] = []
+    for tool in toolset.tools:
+        stamp = (getattr(tool, "metadata", None) or {}).get(METADATA_KEY) or {}
+        raw_name = str(stamp.get("tool") or getattr(tool, "name", "") or "").strip().lower()
+        if stamp.get("order") is not None or raw_name in order_tool_names:
+            continue
+        result.append(tool)
+    return result
+
+
 def direct_tool_middleware(
     toolset: DirectToolSet | None, ledger: Any | None
 ) -> list[AgentMiddleware]:

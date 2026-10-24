@@ -40,59 +40,47 @@ const mutateAsync = {
 
 let catalogData: CatalogServerList | undefined;
 let catalogError: Error | null = null;
-// `undefined` is the query with no answer at all -- in flight, or asked and
-// failed -- which React Query reports alongside an error only until one lands.
-// An array with an error beside it is the third state and a real one: a refetch
-// that failed over an answer the query still holds.
-let brokerages: unknown[] | undefined = [];
-let brokeragesError: Error | null = null;
-const refetchBrokerages = vi.fn();
 const refetchBuiltins = vi.fn();
 const refetchCatalog = vi.fn();
 let builtinError: Error | null = null;
 let catalogLoading = false;
 let deletePending = false;
 
-vi.mock('@/hooks/useMcpServers', () => ({
-  useMcpCatalog: () => ({
-    data: catalogData,
-    isLoading: catalogLoading,
-    error: catalogError,
-    refetch: refetchCatalog,
-  }),
-  useCreateMcpCatalogServer: () => ({ mutateAsync: mutateAsync.create, isPending: false }),
-  useUpdateMcpCatalogServer: () => ({ mutateAsync: mutateAsync.update, isPending: false }),
-  useDeleteMcpCatalogServer: () => ({ mutateAsync: mutateAsync.del, isPending: deletePending }),
-  useToggleMcpCatalogServer: () => ({ mutateAsync: mutateAsync.toggle, isPending: false }),
-  useImportMcpCatalogServers: () => ({ mutateAsync: mutateAsync.import, isPending: false }),
-  useDisconnectMcpOauth: () => ({ mutateAsync: mutateAsync.disconnect, isPending: false }),
-  useRefreshMcpOauthSchemas: () => ({ mutateAsync: mutateAsync.refresh, isPending: false }),
-  // The nested BuiltinMcpSection renders nothing while its list is empty —
-  // these tests exercise the user-tier list only.
-  useBuiltinMcpServers: () => ({
-    data: builtinError ? undefined : { servers: [] },
-    isLoading: false,
-    error: builtinError,
-    refetch: refetchBuiltins,
-  }),
-  useToggleBuiltinMcpServer: () => ({ mutateAsync: vi.fn(), isPending: false }),
-  useSetMcpServerEnabledInWorkspace: () => ({ mutateAsync: mutateAsync.wsEnable, isPending: false }),
-  useSetMcpServerNewWorkspaces: () => ({ mutateAsync: mutateAsync.newWorkspaces, isPending: false }),
-  // What a connector's own page reads beside its row, which no test here is about.
-  useMcpCatalogServerTools: () => ({ data: undefined, isLoading: false, error: null }),
-  useBuiltinMcpServerTools: () => ({ data: undefined, isLoading: false, error: null }),
-  useSetMcpServerBinding: () => ({ mutateAsync: vi.fn(), isPending: false }),
-  // The registry the list joins every row against before it will let a connect
-  // start. Most rows here are ordinary servers, so what matters is that the
-  // query has *answered* -- an unanswered one deliberately holds the button,
-  // which is its own test elsewhere. It is only stocked by the tests about a
-  // row that turns out to be a broker.
-  useBrokerages: () => ({
-    data: brokerages,
-    error: brokeragesError,
-    refetch: refetchBrokerages,
-  }),
-}));
+// DALTON-HOOK(hide-trading): do not mock useBrokerages; keep real query so fetchSpy catches any /api/v1/mcp/brokerages request
+vi.mock('@/hooks/useMcpServers', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/hooks/useMcpServers')>();
+  return {
+    ...actual,
+    useMcpCatalog: () => ({
+      data: catalogData,
+      isLoading: catalogLoading,
+      error: catalogError,
+      refetch: refetchCatalog,
+    }),
+    useCreateMcpCatalogServer: () => ({ mutateAsync: mutateAsync.create, isPending: false }),
+    useUpdateMcpCatalogServer: () => ({ mutateAsync: mutateAsync.update, isPending: false }),
+    useDeleteMcpCatalogServer: () => ({ mutateAsync: mutateAsync.del, isPending: deletePending }),
+    useToggleMcpCatalogServer: () => ({ mutateAsync: mutateAsync.toggle, isPending: false }),
+    useImportMcpCatalogServers: () => ({ mutateAsync: mutateAsync.import, isPending: false }),
+    useDisconnectMcpOauth: () => ({ mutateAsync: mutateAsync.disconnect, isPending: false }),
+    useRefreshMcpOauthSchemas: () => ({ mutateAsync: mutateAsync.refresh, isPending: false }),
+    // The nested BuiltinMcpSection renders nothing while its list is empty —
+    // these tests exercise the user-tier list only.
+    useBuiltinMcpServers: () => ({
+      data: builtinError ? undefined : { servers: [] },
+      isLoading: false,
+      error: builtinError,
+      refetch: refetchBuiltins,
+    }),
+    useToggleBuiltinMcpServer: () => ({ mutateAsync: vi.fn(), isPending: false }),
+    useSetMcpServerEnabledInWorkspace: () => ({ mutateAsync: mutateAsync.wsEnable, isPending: false }),
+    useSetMcpServerNewWorkspaces: () => ({ mutateAsync: mutateAsync.newWorkspaces, isPending: false }),
+    // What a connector's own page reads beside its row, which no test here is about.
+    useMcpCatalogServerTools: () => ({ data: undefined, isLoading: false, error: null }),
+    useBuiltinMcpServerTools: () => ({ data: undefined, isLoading: false, error: null }),
+    useSetMcpServerBinding: () => ({ mutateAsync: vi.fn(), isPending: false }),
+  };
+});
 
 // No workspaces → the per-workspace checklist stays out of these tests: a
 // builtin's scope control renders as a plain badge, and a catalog row's menu
@@ -274,8 +262,6 @@ beforeEach(() => {
   catalogError = null;
   catalogLoading = false;
   deletePending = false;
-  brokerages = [];
-  brokeragesError = null;
   builtinError = null;
   catalogConfigured = true;
 });
@@ -605,59 +591,47 @@ describe('McpServers — OAuth connect affordance', () => {
     );
   });
 
-  // The row a brokerage leaves behind lives in this list too, and this list is
-  // the other way to reach its Connect button. The question the vendor's terms
-  // raise used to be asked only on the Brokerages tab, so the same click here
-  // went straight to the consent screen and took the account's one AI
-  // connection from wherever it was.
-  it('asks before a connect that costs the account its other AI connection', async () => {
-    brokerages = [EXCLUSIVE_VENDOR];
-    catalogData = makeCatalog([
-      makeOauthServer({ name: 'ibkr', url: EXCLUSIVE_VENDOR.url, oauth_status: null }),
-    ]);
-    renderList();
+  // DALTON-HOOK(hide-trading): useVendorOf uniformly returns null (confirmed non-brokerage) without fetching /api/v1/mcp/brokerages
+  it('never fetches /api/v1/mcp/brokerages on render or when clicking Connect', async () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
+    try {
+      catalogData = makeCatalog([
+        makeOauthServer({ name: 'ibkr', url: EXCLUSIVE_VENDOR.url, oauth_status: null }),
+      ]);
+      mockStartMcpOauth.mockResolvedValue({ authorize_url: 'https://vendor.example.test/a' });
+      renderList();
 
-    fireEvent.click(screen.getByRole('button', { name: /^connect$/i }));
+      const brokerageCallsOnRender = fetchSpy.mock.calls.filter(([input]) =>
+        String(input).includes('/api/v1/mcp/brokerages'),
+      );
+      expect(brokerageCallsOnRender).toHaveLength(0);
 
-    expect(screen.getByText(/replaces whichever one is connected now/i)).toBeInTheDocument();
-    expect(mockStartMcpOauth).not.toHaveBeenCalled();
+      const connect = screen.getByRole('button', { name: /^connect$/i });
+      expect(connect).not.toHaveAttribute('aria-disabled');
+      fireEvent.click(connect);
+
+      await waitFor(() =>
+        expect(mockStartMcpOauth).toHaveBeenCalledWith(
+          'ibkr',
+          '/plugins?tab=mcp',
+          {
+            vendorRefusesHostedCallback: false,
+            expectedUrl: EXCLUSIVE_VENDOR.url,
+            stillWanted: expect.any(Function),
+          },
+        ),
+      );
+      const brokerageCallsAfterClick = fetchSpy.mock.calls.filter(([input]) =>
+        String(input).includes('/api/v1/mcp/brokerages'),
+      );
+      expect(brokerageCallsAfterClick).toHaveLength(0);
+    } finally {
+      fetchSpy.mockRestore();
+    }
   });
 
-  it('goes on to the vendor once that question is answered', async () => {
-    brokerages = [EXCLUSIVE_VENDOR];
-    catalogData = makeCatalog([
-      makeOauthServer({ name: 'ibkr', url: EXCLUSIVE_VENDOR.url, oauth_status: null }),
-    ]);
-    mockStartMcpOauth.mockResolvedValue({ authorize_url: 'https://vendor.example.test/a' });
-    renderList();
-
-    fireEvent.click(screen.getByRole('button', { name: /^connect$/i }));
-    fireEvent.click(
-      within(screen.getByRole('dialog')).getByRole('button', { name: /^connect$/i }),
-    );
-
-    await waitFor(() =>
-      expect(mockStartMcpOauth).toHaveBeenCalledWith(
-        'ibkr',
-        '/plugins?tab=mcp',
-        {
-          vendorRefusesHostedCallback: false,
-          expectedUrl: EXCLUSIVE_VENDOR.url,
-          stillWanted: expect.any(Function),
-          // Reached from the Connectors list, the consent is the same consent:
-          // a brokerage connected from here must not carry more than one
-          // connected from the tab that is about brokerages.
-          grantedCapabilities: EXCLUSIVE_DEFAULT,
-        },
-      ),
-    );
-  });
-
-  // The same row reached from the other tab, and the two seed the dialog
-  // independently. A repair opened from here has to start from the user's last
-  // answer for the same reason it does over there.
-  it('reopens a repair on the groups the user last chose', async () => {
-    brokerages = [EXCLUSIVE_VENDOR];
+  // DALTON-HOOK(hide-trading): ConnectButton and oauth.connect both see vendor === null (confirmed non-brokerage)
+  it('treats all rows consistently as non-brokerage between ConnectButton and oauth.connect', async () => {
     catalogData = makeCatalog([
       makeOauthServer({
         name: 'ibkr',
@@ -670,93 +644,23 @@ describe('McpServers — OAuth connect affordance', () => {
     mockStartMcpOauth.mockResolvedValue({ authorize_url: 'https://vendor.example.test/a' });
     renderList();
 
-    fireEvent.click(screen.getByRole('button', { name: /^reconnect$/i }));
-    fireEvent.click(
-      within(screen.getByRole('dialog')).getByRole('button', { name: /^connect$/i }),
-    );
+    expect(screen.queryByText(/broker requirements could not be checked/i)).toBeNull();
+    const reconnect = screen.getByRole('button', { name: /^reconnect$/i });
+    expect(reconnect).not.toHaveAttribute('aria-disabled');
+    fireEvent.click(reconnect);
 
+    expect(screen.queryByRole('dialog')).toBeNull();
     await waitFor(() =>
       expect(mockStartMcpOauth).toHaveBeenCalledWith(
         'ibkr',
         '/plugins?tab=mcp',
-        expect.objectContaining({ grantedCapabilities: ['market_data'] }),
+        {
+          vendorRefusesHostedCallback: false,
+          expectedUrl: EXCLUSIVE_VENDOR.url,
+          stillWanted: expect.any(Function),
+        },
       ),
     );
-  });
-
-  it('starts nothing when the user backs out of it', async () => {
-    brokerages = [EXCLUSIVE_VENDOR];
-    catalogData = makeCatalog([
-      makeOauthServer({ name: 'ibkr', url: EXCLUSIVE_VENDOR.url, oauth_status: null }),
-    ]);
-    renderList();
-
-    fireEvent.click(screen.getByRole('button', { name: /^connect$/i }));
-    fireEvent.click(
-      within(screen.getByRole('dialog')).getByRole('button', { name: /cancel/i }),
-    );
-
-    // The dialog leaves after its exit animation.
-    await waitFor(() =>
-      expect(screen.queryByText(/replaces whichever one is connected now/i)).toBeNull(),
-    );
-    expect(mockStartMcpOauth).not.toHaveBeenCalled();
-  });
-
-  // A registry that failed is not a registry that answered "no brokers". Read
-  // as the latter, a broker row loses the terms its address carries -- and the
-  // warning is suppressed on exactly the rows that still need it, because it
-  // only renders on one believed unconnected.
-  it('holds the click when the registry could not be read at all', () => {
-    brokerages = undefined;
-    brokeragesError = new Error('offline');
-    catalogData = makeCatalog([
-      makeOauthServer({ name: 'ibkr', url: EXCLUSIVE_VENDOR.url, oauth_status: null }),
-    ]);
-    renderList();
-
-    const connect = screen.getByRole('button', { name: /^connect$/i });
-    fireEvent.click(connect);
-    expect(connect).toHaveAttribute('aria-disabled', 'true');
-    expect(mockStartMcpOauth).not.toHaveBeenCalled();
-  });
-
-  // Held is right; silent is not. The button is the same one every OAuth row on
-  // this page uses, brokerage or not, so an outage in an optional listing takes
-  // the whole list with it -- and a disabled control with nothing beside it is
-  // the user's own page appearing to have broken for no reason.
-  it('says why, and offers another go, when the registry is the thing that failed', () => {
-    brokerages = undefined;
-    brokeragesError = new Error('offline');
-    catalogData = makeCatalog([makeOauthServer({ oauth_status: null })]);
-    renderList();
-
-    const note = screen.getByText(/broker requirements could not be checked/i);
-    expect(screen.getByRole('button', { name: /^connect$/i })).toHaveAttribute(
-      'aria-describedby',
-      note.closest('[id]')!.id,
-    );
-
-    fireEvent.click(screen.getByRole('button', { name: /retry/i }));
-    expect(refetchBrokerages).toHaveBeenCalledTimes(1);
-  });
-
-  // A refetch that failed is not the same as never having been answered. The
-  // registry is what this build ships, so the answer already in hand is as good
-  // as it was -- and throwing it away holds every connect on the page over a
-  // background request the user never made.
-  it('keeps the terms it already has when a later refetch fails', () => {
-    brokerages = [EXCLUSIVE_VENDOR];
-    brokeragesError = new Error('offline');
-    catalogData = makeCatalog([
-      makeOauthServer({ name: 'ibkr', url: EXCLUSIVE_VENDOR.url, oauth_status: null }),
-    ]);
-    renderList();
-
-    expect(screen.queryByText(/broker requirements could not be checked/i)).toBeNull();
-    fireEvent.click(screen.getByRole('button', { name: /^connect$/i }));
-    // Still the vendor's own terms, asked before anything is spent.
-    expect(screen.getByText(/replaces whichever one is connected now/i)).toBeInTheDocument();
   });
 
   it('offers Reconnect — not Connect — once a connection exists but is broken', () => {

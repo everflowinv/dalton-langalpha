@@ -25,7 +25,7 @@ import {
   NAME_PATTERN,
   RESERVED_NAMES,
   audienceFacts,
-  brokerageText,
+  // DALTON-HOOK(hide-trading): brokerage summary hidden on SubagentNew
   copiedModel,
   countCustom,
   effortOrSetting,
@@ -354,10 +354,7 @@ function CopyFacts({
             t('plugins.subagents.connectors'),
             !source || source.connectors ? t('plugins.subagents.connectorsAll') : t('plugins.subagents.connectorsNone'),
           ],
-          [
-            t('plugins.subagents.brokerages'),
-            !source || source.brokerages !== 'off' ? brokerageText(t, 'on') : null,
-          ],
+          // DALTON-HOOK(hide-trading): do not display brokerages summary in SubagentNew
           // A blank one reads memory, as every subagent of the user's own starts.
           [t('plugins.subagents.memory'), memoryText(t, source ? source.memory : true)],
           [t('plugins.subagents.availableTo'), audienceFacts(t, audiences)],

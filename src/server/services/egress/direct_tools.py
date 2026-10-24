@@ -50,6 +50,7 @@ from src.server.services.egress.relay_jwt import (
 from src.server.services.mcp_tool_split import DirectServerTools, DirectTool
 from src.server.services.tool_binding import (
     inputs_from_row,
+    is_order_tool,  # DALTON-HOOK(hide-trading)
     order_payload,
     order_policy,
     resolve_plan,
@@ -417,7 +418,20 @@ async def prepare_direct_mcp_tools(
     # the budget: one that lost its grant would otherwise displace tools from a
     # healthy connection and then be skipped anyway, leaving the capacity spent
     # on nothing.
-    grantable = {name: entry for name, entry in by_server.items() if grants.get(name)}
+    # DALTON-HOOK(hide-trading): never bind order/cancel tools (_ORDER_TOOLS) to the agent
+    grantable: dict[str, DirectServerTools] = {}
+    for name, entry in by_server.items():
+        if not grants.get(name):
+            continue
+        non_order_tools = tuple(
+            t
+            for t in entry.tools
+            if t.resolved.order is None and not is_order_tool(entry.vendor, t.name)
+        )
+        if non_order_tools:
+            grantable[name] = DirectServerTools(
+                tools=non_order_tools, vendor=entry.vendor
+            )
     affordable, dropped = admit_within_budget(grantable)
     if dropped:
         logger.warning(

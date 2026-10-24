@@ -64,6 +64,7 @@ from ptc_agent.agent.middleware.compaction.notes import (
 from ptc_agent.agent.middleware.compaction.window import WindowCoverage
 from ptc_agent.agent.middleware.direct_mcp import (
     DirectToolSet,
+    bindable_direct_tools,  # DALTON-HOOK(hide-trading)
     direct_tool_middleware,
     direct_tool_summary,
 )
@@ -613,7 +614,8 @@ class PTCAgent:
 
         # Consent is re-read per call and an order is put to the user against
         # a durable attempt, which is what execution then reads.
-        direct_tools = list(direct_mcp.tools) if direct_mcp is not None else []
+        # DALTON-HOOK(hide-trading): filter out any order tools before binding to the agent
+        direct_tools = bindable_direct_tools(direct_mcp)
         main_only_middleware.extend(direct_tool_middleware(direct_mcp, order_ledger))
 
         # Recursion gate: no subagents compiled, none advertised in the

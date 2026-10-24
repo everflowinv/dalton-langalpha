@@ -380,11 +380,10 @@ describe('McpTab: a sign-in that saves the server', () => {
     expect(screen.getByTestId('mcp-submit')).toBeDisabled();
   });
 
-  // A brokerage's consent comes before its vendor's page. With the registry
-  // still unanswered the connect read the address as no vendor at all, sent no
-  // capability selection, and the start was refused for want of one.
+  // DALTON-HOOK(hide-trading): useVendorOf always returns null (non-brokerage), so no brokerage consent dialog is shown, the ordinary OAuth flow runs, and /api/v1/mcp/brokerages is never requested
   it("asks a brokerage's consent even when the registry had not answered yet", async () => {
-    registry = async () => [
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
+    const registrySpy = vi.fn(async () => [
       {
         name: 'ibkr',
         label: 'Interactive Brokers',
@@ -398,33 +397,51 @@ describe('McpTab: a sign-in that saves the server', () => {
           { key: 'staged_orders', tone: 'caution', rung: true },
         ],
       },
-    ];
-    signInNeeded();
-    startPendingMcpOauth.mockResolvedValueOnce(started);
-    renderTab();
-    fillAndSubmit();
+    ]);
+    registry = registrySpy;
+    try {
+      signInNeeded();
+      startPendingMcpOauth.mockResolvedValueOnce(started);
+      renderTab();
+      fillAndSubmit();
 
-    const consent = await screen.findByRole('dialog', { name: /Connect “/ });
-    expect(startPendingMcpOauth).not.toHaveBeenCalled();
-    fireEvent.click(within(consent).getByRole('button', { name: 'Connect' }));
-
-    await waitFor(() => expect(startPendingMcpOauth).toHaveBeenCalledTimes(1));
-    expect(startPendingMcpOauth.mock.calls[0][2]).toMatchObject({
-      grantedCapabilities: ['market_data', 'staged_orders'],
-    });
+      await continueToVendor();
+      expect(screen.queryByRole('dialog', { name: /Connect “/ })).toBeNull();
+      await waitFor(() => expect(startPendingMcpOauth).toHaveBeenCalledTimes(1));
+      expect(startPendingMcpOauth.mock.calls[0][2]?.grantedCapabilities).toBeUndefined();
+      expect(registrySpy).not.toHaveBeenCalled();
+      expect(
+        fetchSpy.mock.calls.filter(([input]) => String(input).includes('/api/v1/mcp/brokerages')),
+      ).toHaveLength(0);
+    } finally {
+      fetchSpy.mockRestore();
+    }
   });
 
+  // DALTON-HOOK(hide-trading): useVendorOf always returns null without querying /api/v1/mcp/brokerages, so an unreadable brokerage registry never blocks the ordinary OAuth flow
   it('says so in the form when the registry cannot be read', async () => {
-    registry = async () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
+    const registrySpy = vi.fn(async () => {
       throw new Error('Brokerage registry unavailable');
-    };
-    signInNeeded();
-    renderTab();
-    fillAndSubmit();
+    });
+    registry = registrySpy;
+    try {
+      signInNeeded();
+      startPendingMcpOauth.mockResolvedValueOnce(started);
+      renderTab();
+      fillAndSubmit();
 
-    expect(await screen.findByText('Brokerage registry unavailable')).toBeInTheDocument();
-    expect(startPendingMcpOauth).not.toHaveBeenCalled();
-    expect(screen.getByTestId('mcp-submit')).toBeEnabled();
+      await continueToVendor();
+      expect(screen.queryByRole('dialog', { name: /Connect “/ })).toBeNull();
+      expect(screen.queryByText('Brokerage registry unavailable')).toBeNull();
+      await waitFor(() => expect(startPendingMcpOauth).toHaveBeenCalledTimes(1));
+      expect(registrySpy).not.toHaveBeenCalled();
+      expect(
+        fetchSpy.mock.calls.filter(([input]) => String(input).includes('/api/v1/mcp/brokerages')),
+      ).toHaveLength(0);
+    } finally {
+      fetchSpy.mockRestore();
+    }
   });
 });
 

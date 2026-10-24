@@ -449,6 +449,8 @@ export function BrokeragesBlock({ view, write }: Pick<AsideProps, 'view' | 'writ
   const codeOn = view.tools.includes('code');
   const access = view.brokerages !== 'off';
   const base = view.base;
+  // DALTON-HOOK(hide-trading): do not render subagent brokerage access block in Dalton
+  if (Boolean(view)) return null;
   return (
     <DetailAsideBlock
       title={t('plugins.subagents.brokerages')}

@@ -165,7 +165,8 @@ class SubagentConfig(BaseModel):
     search_provider: str | None = None
     search_depth: str | None = None
     connectors: bool = True
-    brokerages: Literal["off", "on"] = "on"
+    # DALTON-HOOK(hide-trading): default subagent brokerages to off in Dalton
+    brokerages: Literal["off", "on"] = "off"
     preferred_connectors: list[str] = Field(default_factory=list)
     # Unset is on for a subagent of the deployment's own.
     memory: bool | None = None

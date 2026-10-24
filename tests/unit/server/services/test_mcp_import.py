@@ -302,3 +302,52 @@ async def test_headers_that_are_not_an_object_are_one_invalid_entry():
     assert [r["status"] for r in report.results] == ["created", "invalid"]
     assert "headers" in report.results[1]["error"]
     assert landed == ["good"]
+
+
+# DALTON-HOOK(hide-trading): batch import marks brokerage URL entry failed without aborting remaining entries
+async def test_brokerage_url_in_batch_is_marked_failed_and_other_entries_succeed():
+    from unittest.mock import create_autospec
+
+    from src.server.services.mcp_validation import Passed
+
+    landed: list[str] = []
+    created_secrets: list[str] = []
+
+    async def create_secret(conn, secret):
+        created_secrets.append(secret.name)
+
+    async def persist(conn, server, entry):
+        landed.append(server.name)
+        return True
+
+    async def _check_spec(items):
+        return []
+
+    def answer(items):
+        return [Passed(server.name) for server, _extras in items]
+
+    check = create_autospec(_check_spec, side_effect=answer)
+    report = await run_mcp_import(
+        [
+            _remote("srv_one", "sk-live-1111111111111111"),
+            _entry(
+                "my_custom_moomoo",
+                "my_custom_moomoo",
+                transport="http",
+                url="https://mcp.moomoo.com/mcp",
+                headers={"Authorization": "Bearer secret-token-123456"},
+            ),
+            _remote("srv_two", "sk-live-2222222222222222"),
+        ],
+        scope=_scope(persist, create_secret=create_secret, check=check),
+    )
+
+    assert report.created == 2
+    assert [r["status"] for r in report.results] == ["created", "error", "created"]
+    assert "券商服务已禁用" in report.results[1]["reason"]
+    assert "券商服务已禁用" in report.results[1]["error"]
+    assert landed == ["srv_one", "srv_two"]
+    assert created_secrets == ["SRV_ONE_X_API_KEY", "SRV_TWO_X_API_KEY"]
+    (checked_items,) = check.await_args.args
+    assert [server.name for server, _extras in checked_items] == ["srv_one", "srv_two"]
+

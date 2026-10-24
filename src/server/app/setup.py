@@ -613,13 +613,7 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Failed to start NewsRefreshService: {e}")
 
-    # Start OrderReconciler (asks each brokerage what became of an open order)
-    try:
-        from src.server.services.orders import OrderReconciler
-
-        OrderReconciler.get_instance().start()
-    except Exception as e:
-        logger.warning(f"Failed to start OrderReconciler: {e}")
+    # DALTON-HOOK(hide-trading): do not start OrderReconciler background task since trading is disabled in Dalton
 
     # Start ProvenanceGCService (daily mark-sweep of orphaned result bodies)
     try:

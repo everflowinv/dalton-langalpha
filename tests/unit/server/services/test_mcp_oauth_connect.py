@@ -26,7 +26,7 @@ import json
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, create_autospec  # DALTON-HOOK(hide-trading)
 from urllib.parse import parse_qs, urlsplit
 
 import httpx2
@@ -1525,6 +1525,12 @@ class TestExclusiveVendorScope:
 
         monkeypatch.setattr(connect, "_discover", _discover)
         monkeypatch.setattr(connect, "get_catalog_server", _get_catalog_server)
+        # DALTON-HOOK(hide-trading): allow underlying vendor-scope mechanics to be unit-tested
+        monkeypatch.setattr(
+            connect.mcp_saves,
+            "refuse_brokerage_server",
+            create_autospec(connect.mcp_saves.refuse_brokerage_server),
+        )
         return phase1
 
     @pytest.fixture
@@ -2607,6 +2613,12 @@ class TestConsentIsSettledFirst:
 
         monkeypatch.setattr(connect, "_discover", _discover)
         monkeypatch.setattr(connect, "_register_client", _register_client)
+        # DALTON-HOOK(hide-trading): allow underlying consent settlement mechanics to be unit-tested
+        monkeypatch.setattr(
+            connect.mcp_saves,
+            "refuse_brokerage_server",
+            create_autospec(connect.mcp_saves.refuse_brokerage_server),
+        )
         return touched
 
     @pytest.mark.asyncio
@@ -2695,6 +2707,12 @@ class TestOlderShapedStateAtABrokerage:
             return None, phase1.as_metadata, ISSUER, None
 
         monkeypatch.setattr(connect, "_discover", _discover)
+        # DALTON-HOOK(hide-trading): allow legacy state-shape check to be unit-tested
+        monkeypatch.setattr(
+            connect.mcp_saves,
+            "refuse_brokerage_server",
+            create_autospec(connect.mcp_saves.refuse_brokerage_server),
+        )
         started = await start_connect(
             USER_ID, "ibkr", granted_capabilities=["market_data"]
         )

@@ -12,7 +12,8 @@ import asyncio
 from contextlib import ExitStack, asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
-from unittest.mock import ANY, AsyncMock, MagicMock, call, patch
+# DALTON-HOOK(hide-trading): use create_autospec for test doubles in brokerage/trading tests
+from unittest.mock import ANY, AsyncMock, MagicMock, call, create_autospec, patch
 
 import pytest
 import pytest_asyncio
@@ -732,26 +733,34 @@ async def test_update_revokes_when_consent_moves(client, edit, revokes):
 
     from src.server.database.mcp_oauth import ConnectionStatus
 
+    # DALTON-HOOK(hide-trading): use create_autospec for test doubles
+    from src.server.database import mcp_oauth as db_mcp_oauth
+    from src.server.services import mcp_catalog as svc_mcp_catalog
+    from src.server.services.mcp_oauth import lifecycle as svc_lifecycle
+
     connection = SimpleNamespace(
         connection_id="c-1",
         server_url="https://api.example.com/mcp",
         status=ConnectionStatus.CONNECTED,
     )
-    disconnect = AsyncMock(return_value=True)
+    disconnect = create_autospec(svc_lifecycle.disconnect_server, return_value=True)
     body = {"name": "remote_server", "transport": "http", **edit}
     with (
         patch(
             "src.server.services.mcp_catalog.update_catalog_server",
-            new=AsyncMock(return_value=_row()),
+            new=create_autospec(svc_mcp_catalog.update_catalog_server, return_value=_row()),
         ),
         # Pre-update read, then the committed read the consent check runs on.
         patch(
             "src.server.services.mcp_catalog.get_catalog_server",
-            new=AsyncMock(side_effect=[_row(), _row(**edit)]),
+            new=create_autospec(
+                svc_mcp_catalog.get_catalog_server,
+                side_effect=[_row(), _row(**edit)],
+            ),
         ),
         patch(
             "src.server.database.mcp_oauth.get_connection",
-            new=AsyncMock(return_value=connection),
+            new=create_autospec(db_mcp_oauth.get_connection, return_value=connection),
         ),
         patch(
             "src.server.services.mcp_oauth.lifecycle.disconnect_server",
@@ -772,22 +781,37 @@ async def test_update_consent_check_reads_the_committed_row(client):
     committed the consented URL back before this consent check — a separate
     transaction — ran. Reading the row rather than trusting this request's own
     values is what keeps the survivor's connection alive."""
-    disconnect = AsyncMock(return_value=True)
-    scheduled = MagicMock()
+    # DALTON-HOOK(hide-trading): use create_autospec for test doubles
+    from src.server.database import mcp_oauth as db_mcp_oauth
+    from src.server.services import mcp_catalog as svc_mcp_catalog
+    from src.server.services.mcp_oauth import (
+        discovery as svc_discovery,
+        lifecycle as svc_lifecycle,
+    )
+
+    disconnect = create_autospec(svc_lifecycle.disconnect_server, return_value=True)
+    scheduled = create_autospec(svc_discovery.schedule_post_edit_rediscovery)
     moved = "https://moved.example.com/mcp"
     with (
         patch(
             "src.server.services.mcp_catalog.update_catalog_server",
-            new=AsyncMock(return_value=_row(url=moved)),
+            new=create_autospec(
+                svc_mcp_catalog.update_catalog_server,
+                return_value=_row(url=moved),
+            ),
         ),
         # Pre-update read, then the restored row the racing PUT committed.
         patch(
             "src.server.services.mcp_catalog.get_catalog_server",
-            new=AsyncMock(side_effect=[_row(), _row()]),
+            new=create_autospec(
+                svc_mcp_catalog.get_catalog_server,
+                side_effect=[_row(), _row()],
+            ),
         ),
+        # DALTON-HOOK(hide-trading): use create_autospec for OAuth connection test doubles
         patch(
             "src.server.database.mcp_oauth.get_connection",
-            new=AsyncMock(return_value=_connected()),
+            new=create_autospec(db_mcp_oauth.get_connection, return_value=_connected()),
         ),
         patch(
             "src.server.services.mcp_oauth.lifecycle.disconnect_server",
@@ -840,23 +864,30 @@ async def test_update_warns_when_headers_meet_oauth(client, status, warned):
         "url": "https://api.example.com/mcp",
         "headers": {"X-Tenant": "acme"},
     }
+    # DALTON-HOOK(hide-trading): use create_autospec for test doubles
+    from src.server.database import mcp_oauth as db_mcp_oauth
+    from src.server.services import (
+        mcp_catalog as svc_mcp_catalog,
+        mcp_catalog_view as svc_mcp_catalog_view,
+    )
+
     with (
         patch(
             "src.server.services.mcp_catalog.update_catalog_server",
-            new=AsyncMock(return_value=_row()),
+            new=create_autospec(svc_mcp_catalog.update_catalog_server, return_value=_row()),
         ),
         patch(
             "src.server.services.mcp_catalog.get_catalog_server",
-            new=AsyncMock(return_value=_row()),
+            new=create_autospec(svc_mcp_catalog.get_catalog_server, return_value=_row()),
         ),
         patch(
             "src.server.services.mcp_catalog_view.get_connection",
-            new=AsyncMock(return_value=connection),
+            new=create_autospec(svc_mcp_catalog_view.get_connection, return_value=connection),
         ),
         # The consent-move check reads through its own late import.
         patch(
             "src.server.database.mcp_oauth.get_connection",
-            new=AsyncMock(return_value=connection),
+            new=create_autospec(db_mcp_oauth.get_connection, return_value=connection),
         ),
     ):
         resp = await client.put("/api/v1/mcp/servers/remote_server", json=body)
@@ -1354,21 +1385,16 @@ async def test_a_switch_on_a_server_that_is_gone_is_a_404(client, checks):
 
 @pytest.mark.asyncio
 async def test_a_configured_brokerage_without_its_connection_asks_for_one(client, checks):
-    """A row whose connection is gone answers the same 409 as one never made,
-    naming the row's own address."""
-    stored = _row(name="robinhood", url="https://agent.robinhood.com/mcp/trading", enabled=False)
-    checks.sign_in.return_value = SignInNeeded(server="robinhood", url=stored["url"])
-    toggled = AsyncMock()
-    with (
-        patch("src.server.app.mcp_brokerages.get_catalog_server", new=AsyncMock(return_value=stored)),
-        patch("src.server.services.mcp_catalog.get_catalog_server", new=AsyncMock(return_value=stored)),
-        patch("src.server.services.mcp_catalog.set_catalog_server_enabled", new=toggled),
-    ):
+    # DALTON-HOOK(hide-trading): brokerage toggle endpoint is disabled with 403 in Dalton
+    from src.server.services import mcp_catalog as svc_mcp_catalog
+
+    toggled = create_autospec(svc_mcp_catalog.set_catalog_server_enabled)
+    with patch("src.server.services.mcp_catalog.set_catalog_server_enabled", new=toggled):
         resp = await client.patch(
             "/api/v1/mcp/brokerages/robinhood/enabled", json={"enabled": True}
         )
-    assert resp.status_code == 409
-    assert resp.json()["detail"]["servers"] == [{"server": "robinhood", "url": stored["url"]}]
+    assert resp.status_code == 403
+    assert "disabled in Dalton" in resp.json()["detail"]
     toggled.assert_not_awaited()
 
 
@@ -2260,154 +2286,80 @@ async def test_probe_ignores_the_workspace_an_earlier_form_sends(client):
 # ---------------------------------------------------------------------------
 
 
+# DALTON-HOOK(hide-trading): brokerage endpoints return empty list on GET and 403 on PATCH/OAuth
 @pytest.mark.asyncio
 async def test_brokerages_are_offered_without_touching_the_database(client):
-    """The list is what this build ships, so it is the same for everybody.
-
-    Nothing per-user belongs in it: whether one is configured is the catalog's
-    answer, and mixing the two would give the page two places to disagree with
-    itself about the same row.
-    """
+    """GET /api/v1/mcp/brokerages returns an empty list in Dalton so legacy callers do not crash."""
     resp = await client.get("/api/v1/mcp/brokerages")
     assert resp.status_code == 200
-    by_name = {b["name"]: b for b in resp.json()["brokerages"]}
-    assert set(by_name) == {"robinhood", "ibkr", "moomoo", "webull"}
-    assert by_name["robinhood"]["native_callback_only"] is True
-    assert by_name["ibkr"]["exclusive_connection"] is True
-    assert by_name["ibkr"]["label"] == "Interactive Brokers"
-    # The two quirks are independent, and Robinhood carries both. Asserted
-    # because it is the one row where a reader could take the first flag as the
-    # whole story, and because dropping this one silently costs the confirm
-    # that stands between a connect here and the user's other AI platform.
-    assert by_name["robinhood"]["exclusive_connection"] is True
-    # A vendor whose authorization server takes the spec as written needs
-    # neither quirk, so the flags stay off and every surface treats it as the
-    # ordinary case. Asserted rather than left implicit: both defaults are
-    # False, so a flag set here by mistake would otherwise read as intent.
-    assert by_name["moomoo"]["native_callback_only"] is False
-    assert by_name["moomoo"]["exclusive_connection"] is False
+    assert resp.json() == {"brokerages": []}
 
 
 @pytest.mark.asyncio
 async def test_enabling_an_unconfigured_brokerage_asks_for_its_sign_in(client):
-    """A brokerage is saved by its sign-in, never by the switch.
+    # DALTON-HOOK(hide-trading): enabling a brokerage returns 403
+    from src.server.services import mcp_catalog as svc_mcp_catalog
 
-    Every shipped brokerage signs in with OAuth, and a row written before that
-    sign-in is one nothing has shown to work. So the switch writes nothing and
-    answers with the address to sign in to; the callback creates the row.
-    """
-    created = AsyncMock()
-    with (
-        patch(
-            "src.server.app.mcp_brokerages.get_catalog_server",
-            new=AsyncMock(return_value=None),
-        ),
-        patch("src.server.services.mcp_catalog.create_catalog_server", new=created),
-    ):
+    created = create_autospec(svc_mcp_catalog.create_catalog_server)
+    with patch("src.server.services.mcp_catalog.create_catalog_server", new=created):
         resp = await client.patch(
             "/api/v1/mcp/brokerages/robinhood/enabled", json={"enabled": True}
         )
-    assert resp.status_code == 409
-    assert resp.json()["detail"] == {
-        "code": "mcp_sign_in_required",
-        "message": "Sign in to the server to add it.",
-        "servers": [
-            {"server": "robinhood", "url": "https://agent.robinhood.com/mcp/trading"}
-        ],
-    }
+    assert resp.status_code == 403
+    assert "disabled in Dalton" in resp.json()["detail"]
     created.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_enabling_a_configured_brokerage_never_rewrites_it(client):
-    """An existing row is toggled and left alone.
+    # DALTON-HOOK(hide-trading): toggling a brokerage returns 403
+    from src.server.services import mcp_catalog as svc_mcp_catalog
 
-    Once it is the user's, its URL is theirs to edit — including a row they
-    built themselves under this name. Restoring our address on every enable
-    would undo a deliberate edit at the moment they were only reaching for the
-    switch.
-    """
-    stored = _row(name="robinhood", url="https://edited.example.com/mcp")
-    toggled = AsyncMock(return_value={**stored, "enabled": True})
-    created = AsyncMock()
+    toggled = create_autospec(svc_mcp_catalog.set_catalog_server_enabled)
+    created = create_autospec(svc_mcp_catalog.create_catalog_server)
     with (
-        patch(
-            "src.server.app.mcp_brokerages.get_catalog_server",
-            new=AsyncMock(return_value=stored),
-        ),
-        patch(
-            "src.server.services.mcp_catalog.get_catalog_server",
-            new=AsyncMock(return_value=stored),
-        ),
         patch("src.server.services.mcp_catalog.set_catalog_server_enabled", new=toggled),
         patch("src.server.services.mcp_catalog.create_catalog_server", new=created),
     ):
         resp = await client.patch(
             "/api/v1/mcp/brokerages/robinhood/enabled", json={"enabled": True}
         )
-    assert resp.status_code == 200
-    assert resp.json()["url"] == "https://edited.example.com/mcp"
+    assert resp.status_code == 403
     created.assert_not_awaited()
-    assert toggled.await_args.args[1:] == ("robinhood", True)
+    toggled.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_disabling_a_configured_brokerage_goes_through_the_same_route(client):
-    """One route for both directions, so the page never has to know which."""
-    stored = _row(name="ibkr")
-    async with _toggle_patches(connection=None, row={**stored, "enabled": False}):
-        with patch(
-            "src.server.app.mcp_brokerages.get_catalog_server",
-            new=AsyncMock(return_value=stored),
-        ):
-            resp = await client.patch(
-                "/api/v1/mcp/brokerages/ibkr/enabled", json={"enabled": False}
-            )
-    assert resp.status_code == 200
-    assert resp.json()["enabled"] is False
+    # DALTON-HOOK(hide-trading): disabling a brokerage returns 403
+    resp = await client.patch(
+        "/api/v1/mcp/brokerages/ibkr/enabled", json={"enabled": False}
+    )
+    assert resp.status_code == 403
+    assert "disabled in Dalton" in resp.json()["detail"]
 
 
 @pytest.mark.asyncio
 async def test_disabling_a_brokerage_revokes_its_grants(client):
-    """The same bite as every other switch, and here it is the only one there is.
-
-    A brokerage is listed under its own header and so never appears among the
-    servers the user added — this route is the whole of how one gets turned
-    off. A disable that only flipped the row would leave an idle sandbox
-    trading through a relay JWT for hours, on the rows that can place orders.
-    """
-    stored = _row(name="robinhood")
-    connection = MagicMock(connection_id="c-1")
-    async with _toggle_patches(
-        connection=connection, row={**stored, "enabled": False}
-    ) as revoke:
-        with patch(
-            "src.server.app.mcp_brokerages.get_catalog_server",
-            new=AsyncMock(return_value=stored),
-        ):
-            resp = await client.patch(
-                "/api/v1/mcp/brokerages/robinhood/enabled", json={"enabled": False}
-            )
-    assert resp.status_code == 200
-    revoke.assert_awaited_once_with("c-1")
+    # DALTON-HOOK(hide-trading): disabling a brokerage returns 403
+    resp = await client.patch(
+        "/api/v1/mcp/brokerages/robinhood/enabled", json={"enabled": False}
+    )
+    assert resp.status_code == 403
+    assert "disabled in Dalton" in resp.json()["detail"]
 
 
 @pytest.mark.asyncio
 async def test_disabling_one_that_was_never_configured_creates_nothing(client):
-    """There is nothing to turn off, and inventing a row to turn off would
-    consume a catalog slot to reach the state it already had."""
-    created = AsyncMock()
-    with (
-        patch(
-            "src.server.app.mcp_brokerages.get_catalog_server",
-            new=AsyncMock(return_value=None),
-        ),
-        patch("src.server.services.mcp_catalog.create_catalog_server", new=created),
-    ):
+    # DALTON-HOOK(hide-trading): disabling an unconfigured brokerage returns 403
+    from src.server.services import mcp_catalog as svc_mcp_catalog
+
+    created = create_autospec(svc_mcp_catalog.create_catalog_server)
+    with patch("src.server.services.mcp_catalog.create_catalog_server", new=created):
         resp = await client.patch(
             "/api/v1/mcp/brokerages/ibkr/enabled", json={"enabled": False}
         )
-    assert resp.status_code == 404
+    assert resp.status_code == 403
     created.assert_not_awaited()
 
 
@@ -2420,7 +2372,9 @@ async def test_a_brokerage_name_cannot_be_claimed_by_a_hand_written_row(client):
     warnings. Whoever owns the row owns where Connect sends the user, so leaving
     the name free let anything at all be presented as Robinhood.
     """
-    created = AsyncMock()
+    from src.server.services import mcp_saves as svc_mcp_saves
+
+    created = create_autospec(svc_mcp_saves.create_catalog_server)
     with patch("src.server.services.mcp_saves.create_catalog_server", new=created):
         resp = await client.post(
             "/api/v1/mcp/servers",
@@ -2471,35 +2425,366 @@ async def test_a_brokerage_name_cannot_be_claimed_through_import_either(client, 
 
 @pytest.mark.asyncio
 async def test_a_plugins_row_is_not_adopted_as_a_brokerage(client):
-    """A plugin's row under a brokerage name is not the user's own edit.
+    # DALTON-HOOK(hide-trading): brokerage toggle endpoint is disabled with 403 in Dalton
+    from src.server.services import mcp_catalog as svc_mcp_catalog
 
-    New installs cannot claim these names any more, but one installed before
-    they were reserved still holds it, and adopting it here would hand it the
-    vendor's identity while Connect went to whatever address the plugin chose.
-    """
-    stored = _row(name="robinhood", url="https://plugin-chose-this.example.com/mcp")
-    stored["plugin_id"] = "user-plugin-7"
-    toggled = AsyncMock()
-    with (
-        patch(
-            "src.server.app.mcp_brokerages.get_catalog_server",
-            new=AsyncMock(return_value=stored),
-        ),
-        patch("src.server.services.mcp_catalog.set_catalog_server_enabled", new=toggled),
-    ):
+    toggled = create_autospec(svc_mcp_catalog.set_catalog_server_enabled)
+    with patch("src.server.services.mcp_catalog.set_catalog_server_enabled", new=toggled):
         resp = await client.patch(
             "/api/v1/mcp/brokerages/robinhood/enabled", json={"enabled": True}
         )
-    assert resp.status_code == 409
-    assert "plugin" in resp.json()["detail"]
+    assert resp.status_code == 403
+    assert "disabled in Dalton" in resp.json()["detail"]
     toggled.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_catalog_list_filters_out_brokerage_rows(client):
+    """Catalog listing excludes robinhood, ibkr, webull, moomoo and rows pointing at brokerage URLs."""
+    # DALTON-HOOK(hide-trading): connector catalog filters out shipped brokerages
+    from src.server.app import mcp_catalog as app_mcp_catalog
+    from src.server.services import mcp_catalog_view as svc_mcp_catalog_view
+
+    rows = [
+        _row(name="robinhood", url="https://agent.robinhood.com/mcp/trading"),
+        _row(name="ibkr", url="https://api.ibkr.com/mcp"),
+        _row(name="webull", url="https://api.webull.com/mcp"),
+        _row(name="moomoo", url="https://mcp.moomoo.com/mcp"),
+        _row(name="custom_broker_url", url="https://mcp.moomoo.com/mcp"),
+        _row(name="research_server", url="https://api.example.com/mcp"),
+    ]
+    with (
+        patch(
+            "src.server.app.mcp_catalog.list_catalog_servers",
+            new=create_autospec(app_mcp_catalog.list_catalog_servers, return_value=rows),
+        ),
+        patch(
+            "src.server.services.mcp_catalog_view._oauth_by_server",
+            new=create_autospec(svc_mcp_catalog_view._oauth_by_server, return_value={}),
+        ),
+        patch(
+            "src.server.services.mcp_catalog_view._snapshots_by_server",
+            new=create_autospec(svc_mcp_catalog_view._snapshots_by_server, return_value={}),
+        ),
+    ):
+        resp = await client.get("/api/v1/mcp/servers")
+    assert resp.status_code == 200
+    names = [s["name"] for s in resp.json()["servers"]]
+    assert names == ["research_server"]
+
+
+@pytest.mark.asyncio
+async def test_brokerage_oauth_start_and_callback_are_refused():
+    """Brokerage OAuth initiation and callback are rejected with 403 before token exchange or DB write."""
+    # DALTON-HOOK(hide-trading): brokerage OAuth start and callback return 403 before DB write and clear nonce cookie
+    from src.server.app.mcp_oauth import router as oauth_router
+    from src.server.services.mcp_oauth import connect as svc_connect
+
+    app = create_test_app(oauth_router)
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as oauth_client:
+        for name in ("robinhood", "ibkr", "webull", "moomoo"):
+            resp = await oauth_client.post(f"/api/v1/mcp/servers/{name}/oauth/start")
+            assert resp.status_code == 403
+            assert "disabled in Dalton" in resp.json()["detail"]
+
+            pending_resp = await oauth_client.post(
+                "/api/v1/mcp/oauth/start-pending",
+                json={"kind": "brokerage", "name": name},
+            )
+            assert pending_resp.status_code == 403
+            assert "disabled in Dalton" in pending_resp.json()["detail"]
+
+        # Re-auth on a custom-named server whose stored row points at a brokerage URL
+        with patch(
+            "src.server.services.mcp_oauth.connect.get_catalog_server",
+            new=create_autospec(
+                svc_connect.get_catalog_server,
+                return_value=_row(name="custom_broker", url="https://mcp.moomoo.com/mcp"),
+            ),
+        ):
+            reauth_resp = await oauth_client.post(
+                "/api/v1/mcp/servers/custom_broker/oauth/start"
+            )
+        assert reauth_resp.status_code == 403
+        assert "disabled in Dalton" in reauth_resp.json()["detail"]
+
+        # Callback exercises the real complete_callback path: claims state with a brokerage
+        # server_url, refuses with 403 BEFORE exchange_token or upsert_connection, and clears cookie.
+        claimed_state = svc_connect.ConnectState(
+            user_id="test-user-123",
+            server_name="custom_broker",
+            server_url="https://mcp.moomoo.com/mcp",
+            code_verifier="verifier-1",
+            redirect_uri="http://test/api/v1/mcp/oauth/callback",
+            token_endpoint="https://auth.moomoo.com/token",
+            issuer="https://auth.moomoo.com",
+            client_info={"client_id": "cid-1"},
+            as_metadata={
+                "issuer": "https://auth.moomoo.com",
+                "authorization_endpoint": "https://auth.moomoo.com/authorize",
+                "token_endpoint": "https://auth.moomoo.com/token",
+            },
+            browser_nonce="nonce-1",
+        )
+        claim_mock = create_autospec(
+            svc_connect._claim_state, return_value=claimed_state
+        )
+        exchange_mock = create_autospec(svc_connect.exchange_token)
+        upsert_mock = create_autospec(svc_connect.upsert_connection)
+        with (
+            patch("src.server.services.mcp_oauth.connect._claim_state", new=claim_mock),
+            patch(
+                "src.server.services.mcp_oauth.connect.exchange_token",
+                new=exchange_mock,
+            ),
+            patch(
+                "src.server.services.mcp_oauth.connect.upsert_connection",
+                new=upsert_mock,
+            ),
+        ):
+            oauth_client.cookies.set("mcp_oauth_cb_st-1", "nonce-1")
+            cb_resp = await oauth_client.get(
+                "/api/v1/mcp/oauth/callback?state=st-1&code=cd-1",
+            )
+        assert cb_resp.status_code == 403
+        assert "disabled in Dalton" in cb_resp.json()["detail"]
+        claim_mock.assert_awaited_once_with("st-1")
+        exchange_mock.assert_not_awaited()
+        upsert_mock.assert_not_awaited()
+        set_cookies = cb_resp.headers.get_list("set-cookie")
+        assert any(
+            c.startswith("mcp_oauth_cb_st-1=")
+            and ("max-age=0" in c.lower() or "expires=" in c.lower())
+            for c in set_cookies
+        )
+
+
+@pytest.mark.asyncio
+async def test_custom_server_with_brokerage_url_is_refused(client, _import_txn):
+    """Adding, editing, or importing a custom-named server with a brokerage host URL is refused with 403."""
+    # DALTON-HOOK(hide-trading): custom server names pointing at brokerage URLs are rejected
+    from src.server.app import (
+        mcp_catalog as app_mcp_catalog,
+        mcp_servers as app_mcp_servers,
+    )
+    from src.server.app.mcp_oauth import router as oauth_router
+    from src.server.services import (
+        mcp_catalog as svc_mcp_catalog,
+        mcp_import as svc_mcp_import,
+        mcp_saves as svc_mcp_saves,
+    )
+
+    created = create_autospec(svc_mcp_saves.create_catalog_server)
+    updated = create_autospec(svc_mcp_catalog.update_catalog_server)
+    with (
+        patch("src.server.services.mcp_saves.create_catalog_server", new=created),
+        patch("src.server.services.mcp_catalog.update_catalog_server", new=updated),
+    ):
+        post_resp = await client.post(
+            "/api/v1/mcp/servers",
+            json={
+                "name": "my_custom_moomoo",
+                "transport": "http",
+                "url": "https://mcp.moomoo.com/mcp",
+            },
+        )
+        assert post_resp.status_code == 403
+        assert "disabled in Dalton" in post_resp.json()["detail"]
+        created.assert_not_awaited()
+
+        put_resp = await client.put(
+            "/api/v1/mcp/servers/my_custom_moomoo",
+            json={
+                "name": "my_custom_moomoo",
+                "transport": "http",
+                "url": "https://agent.robinhood.com/mcp/trading",
+            },
+        )
+        assert put_resp.status_code == 403
+        assert "disabled in Dalton" in put_resp.json()["detail"]
+        updated.assert_not_awaited()
+
+    cat_list = create_autospec(app_mcp_catalog.list_catalog_servers, return_value=[])
+    cat_created = create_autospec(app_mcp_catalog.create_catalog_server)
+    async with _import_patches(
+        list_catalog_servers=cat_list,
+        get_user_secret_names=create_autospec(
+            svc_mcp_import.get_user_secret_names, return_value=set()
+        ),
+        create_user_secret=create_autospec(svc_mcp_import.create_user_secret),
+        create_catalog_server=cat_created,
+    ):
+        cat_import = await client.post(
+            "/api/v1/mcp/servers/import",
+            json={
+                "mcpServers": {
+                    "my_custom_moomoo": {
+                        "type": "http",
+                        "url": "https://mcp.moomoo.com/mcp",
+                        "headers": {"Authorization": "Bearer secret-token-123456"},
+                    }
+                }
+            },
+        )
+        assert cat_import.status_code == 403
+        assert "disabled in Dalton" in cat_import.json()["detail"]
+        cat_list.assert_not_awaited()
+        cat_created.assert_not_awaited()
+
+        # A non-string url skips the early brokerage check and reaches the
+        # usual per-entry validation instead of a 500.
+        for bad_url in (123, {"x": 1}, ["https://mcp.moomoo.com/mcp"]):
+            bad_import = await client.post(
+                "/api/v1/mcp/servers/import",
+                json={"mcpServers": {"x": {"type": "http", "url": bad_url}}},
+            )
+            assert bad_import.status_code != 500, bad_url
+            assert bad_import.status_code != 403, bad_url
+
+    ws_created = create_autospec(app_mcp_servers.create_workspace_catalog_server)
+    ws_require = create_autospec(app_mcp_servers._require_owned_workspace, return_value={"workspace_id": "ws-1"})
+    ws_list = create_autospec(app_mcp_servers.list_catalog_servers, return_value=[])
+    ws_app = create_test_app(app_mcp_servers.router)
+    async with (
+        _import_patches(
+            list_catalog_servers=cat_list,
+            get_user_secret_names=create_autospec(
+                svc_mcp_import.get_user_secret_names, return_value=set()
+            ),
+            create_user_secret=create_autospec(svc_mcp_import.create_user_secret),
+            create_catalog_server=cat_created,
+        ),
+        AsyncClient(
+            transport=ASGITransport(app=ws_app), base_url="http://test"
+        ) as ws_client,
+    ):
+        with (
+            patch("src.server.app.mcp_servers._require_owned_workspace", new=ws_require),
+            patch("src.server.app.mcp_servers.list_catalog_servers", new=ws_list),
+            patch("src.server.app.mcp_servers.create_workspace_catalog_server", new=ws_created),
+        ):
+            ws_import = await ws_client.post(
+                "/api/v1/workspaces/ws-1/mcp/servers/import",
+                json={
+                    "mcpServers": {
+                        "my_custom_moomoo": {
+                            "type": "http",
+                            "url": "https://mcp.moomoo.com/mcp",
+                            "headers": {"Authorization": "Bearer secret-token-123456"},
+                        }
+                    }
+                },
+            )
+            assert ws_import.status_code == 403
+            assert "disabled in Dalton" in ws_import.json()["detail"]
+            ws_require.assert_not_awaited()
+            ws_list.assert_not_awaited()
+            ws_created.assert_not_awaited()
+
+    app = create_test_app(oauth_router)
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as oauth_client:
+        add_pending = await oauth_client.post(
+            "/api/v1/mcp/oauth/start-pending",
+            json={
+                "kind": "server",
+                "server": {
+                    "name": "my_custom_moomoo",
+                    "transport": "http",
+                    "url": "https://mcp.moomoo.com/mcp",
+                },
+            },
+        )
+        assert add_pending.status_code == 403
+        assert "disabled in Dalton" in add_pending.json()["detail"]
+
+        edit_pending = await oauth_client.post(
+            "/api/v1/mcp/oauth/start-pending",
+            json={
+                "kind": "server_edit",
+                "name": "my_custom_moomoo",
+                "server": {
+                    "name": "my_custom_moomoo",
+                    "transport": "http",
+                    "url": "https://api.webull.com/mcp",
+                },
+            },
+        )
+        assert edit_pending.status_code == 403
+        assert "disabled in Dalton" in edit_pending.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_mcp_import_batch_with_brokerage_url_continues_and_marks_failure(
+    client, _import_txn
+):
+    """A 3-server batch with a brokerage URL in the middle creates the other two and marks the brokerage failed."""
+    # DALTON-HOOK(hide-trading): batch import does not abort on brokerage entry; surrounding entries succeed
+    from src.server.app import mcp_catalog as app_mcp_catalog
+    from src.server.services import mcp_import as svc_mcp_import
+
+    cat_created = create_autospec(
+        app_mcp_catalog.create_catalog_server,
+        side_effect=lambda user_id, name, **kw: _row(name=name),
+    )
+    after_secrets = create_autospec(app_mcp_catalog.after_secrets_changed)
+    async with _import_patches(
+        list_catalog_servers=create_autospec(
+            app_mcp_catalog.list_catalog_servers, return_value=[]
+        ),
+        get_user_secret_names=create_autospec(
+            svc_mcp_import.get_user_secret_names, return_value=set()
+        ),
+        create_user_secret=create_autospec(svc_mcp_import.create_user_secret),
+        create_catalog_server=cat_created,
+        after_secrets_changed=after_secrets,
+    ):
+        resp = await client.post(
+            "/api/v1/mcp/servers/import",
+            json={
+                "mcpServers": {
+                    "srv_one": {
+                        "type": "http",
+                        "url": "https://api.example.com/one",
+                        "headers": {"Authorization": "Bearer secret-token-111111"},
+                    },
+                    "my_custom_moomoo": {
+                        "type": "http",
+                        "url": "https://mcp.moomoo.com/mcp",
+                        "headers": {"Authorization": "Bearer secret-token-222222"},
+                    },
+                    "srv_two": {
+                        "type": "http",
+                        "url": "https://api.example.com/two",
+                        "headers": {"Authorization": "Bearer secret-token-333333"},
+                    },
+                }
+            },
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["created"] == 2
+    assert [r["status"] for r in body["results"]] == ["created", "error", "created"]
+    assert "券商服务已禁用" in body["results"][1]["reason"]
+    assert "券商服务已禁用" in body["results"][1]["error"]
+    assert [c.args[1] for c in cat_created.await_args_list] == ["srv_one", "srv_two"]
+    after_secrets.assert_awaited_once_with(
+        "test-user-123", ["SRV_ONE_AUTHORIZATION", "SRV_TWO_AUTHORIZATION"]
+    )
 
 
 @pytest.mark.asyncio
 async def test_unknown_brokerage_is_not_a_way_to_create_a_row(client):
     """The name is looked up in the shipped registry before anything else, so
     the route cannot be used to write an arbitrary server."""
-    created = AsyncMock()
+    # DALTON-HOOK(hide-trading): use create_autospec for catalog creation mock
+    from src.server.services import mcp_catalog as svc_mcp_catalog
+
+    created = create_autospec(svc_mcp_catalog.create_catalog_server)
     with patch("src.server.services.mcp_catalog.create_catalog_server", new=created):
         resp = await client.patch(
             "/api/v1/mcp/brokerages/not_a_broker/enabled", json={"enabled": True}

@@ -27,11 +27,13 @@ vi.mock('@/hooks/useSubagents', () => ({
   }),
 }));
 vi.mock('@/pages/ChatAgent/components/mcp/BrandMark', () => ({ BrandMark: () => null }));
-vi.mock('../SubagentAside', () => {
+vi.mock('../SubagentAside', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../SubagentAside')>();
   const none = () => null;
   return {
     AvailableBlock: none,
-    BrokeragesBlock: none,
+    // DALTON-HOOK(hide-trading): exercise real BrokeragesBlock to verify it renders nothing
+    BrokeragesBlock: actual.BrokeragesBlock,
     EffortBlock: none,
     MemoryBlock: none,
     ModelBlock: none,
@@ -102,5 +104,28 @@ describe('SubagentDetail save', () => {
     expect(description).toHaveValue('Screens stocks fast and well.');
     expect(instructions).toHaveValue('Screen them.');
     expect(screen.getByRole('button', { name: 'Save' })).toBeEnabled();
+  });
+
+  // DALTON-HOOK(hide-trading): subagent detail and BrokeragesBlock never render brokerage controls
+  it('does not render brokerage controls even when brokerages are connected or on', async () => {
+    const { BrokeragesBlock } = await import('../SubagentAside');
+    const activeView = { ...VIEW, tools: ['code'], brokerages: 'on' } as unknown as SubagentView;
+    const connectedData = { ...DATA, brokerages: { connected: true } } as unknown as SubagentsResponse;
+    render(
+      <MemoryRouter>
+        <DetailPageProvider value={{ section: 'Plugins' }}>
+          <SubagentDetail
+            view={activeView}
+            data={connectedData}
+            models={{ models: {}, metadata: {} } as unknown as SubagentModels}
+            onClose={() => {}}
+            onDuplicate={() => {}}
+            onOpenPlugin={() => {}}
+          />
+          <BrokeragesBlock view={activeView} write={() => {}} />
+        </DetailPageProvider>
+      </MemoryRouter>,
+    );
+    expect(screen.queryByText('Brokerages')).not.toBeInTheDocument();
   });
 });

@@ -31,7 +31,7 @@ import { MetaLine, OnOffControl, PageButton } from '../pluginsPage/parts';
 import { SkillDocument } from '../pluginsPage/SkillDocument';
 import {
   AvailableBlock,
-  BrokeragesBlock,
+  // DALTON-HOOK(hide-trading): BrokeragesBlock is hidden in Dalton
   EffortBlock,
   MemoryBlock,
   ModelBlock,
@@ -160,7 +160,7 @@ export function SubagentDetail({
             <ModelBlock {...aside} />
             <EffortBlock {...aside} />
             <ToolsBlock {...aside} />
-            {(data.brokerages.connected || view.brokerages !== 'off') && <BrokeragesBlock {...aside} />}
+            {/* DALTON-HOOK(hide-trading): do not render BrokeragesBlock on subagent detail */}
             <MemoryBlock view={view} write={write} />
             <PreferredBlock {...aside} />
             {custom && <AvailableBlock view={view} write={write} />}
