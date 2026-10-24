@@ -1859,4 +1859,193 @@ async def test_market_data_unavailable_on_all_error_codes_and_incomplete_structu
     assert await coverage_svc.validate_and_enrich_ticker("INVALID999") is None
 
 
+@pytest.mark.asyncio
+async def test_screener_malformed_response_raises_and_valid_empty_marks_stale(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 5 Item 2: non-mapping yf.screen or non-list FMP screener response raises MarketDataUnavailable without updating last_resolved_at or marking stale; valid empty results ({'quotes': []} or []) mark stale and update last_resolved_at."""
+    import yfinance.screener.screener as yf_screener_mod
+    from src.data_client.fmp.fmp_client import FMPClient
+
+    store = _InMemoryCoverageStore()
+    _wire_coverage_store(monkeypatch, store)
+    monkeypatch.delenv("FMP_API_KEY", raising=False)
+    monkeypatch.setattr(
+        coverage_svc,
+        "sync_user_coverage_to_home",
+        create_autospec(coverage_svc.sync_user_coverage_to_home, return_value=True),
+    )
+    monkeypatch.setattr(
+        coverage_svc,
+        "ensure_user_earnings_calendar_automation",
+        create_autospec(
+            coverage_svc.ensure_user_earnings_calendar_automation,
+            return_value={"ok": True, "action": "exists", "automation_id": "auto-cal-1", "name": "dalton-earnings-calendar"},
+        ),
+    )
+    monkeypatch.setattr(
+        coverage_svc,
+        "_user_workspace_tickers",
+        create_autospec(coverage_svc._user_workspace_tickers, return_value={}),
+    )
+
+    yf_screen_mock = create_autospec(
+        yf_screener_mod.screen,
+        return_value={
+            "quotes": [
+                {"symbol": "NVDA", "longName": "NVIDIA Corp", "exchange": "NMS", "quoteType": "EQUITY", "marketCap": 3_000_000_000_000},
+                {"symbol": "AVGO", "longName": "Broadcom Inc", "exchange": "NMS", "quoteType": "EQUITY", "marketCap": 800_000_000_000},
+            ]
+        },
+    )
+    monkeypatch.setattr(yf_screener_mod, "screen", yf_screen_mock)
+
+    grp_res = await coverage_svc.add_coverage_group(
+        USER_ALICE,
+        label="US Semis",
+        criteria={"country": "US", "industry": "Semiconductors"},
+        default_tier="watch",
+    )
+    gid = grp_res["group"]["group_id"]
+    initial_ts = datetime.now(timezone.utc) - timedelta(days=90)
+    store.groups[(USER_ALICE, gid)]["last_resolved_at"] = initial_ts
+
+    # 1) Malformed yf.screen response (not a mapping, e.g. None or list, or non-list quotes) -> raises MarketDataUnavailable
+    for bad_payload in (None, ["unexpected"], {"quotes": None}):
+        yf_screen_mock.return_value = bad_payload
+        with pytest.raises(coverage_svc.MarketDataUnavailable) as exc_yf:
+            await coverage_svc.resolve_coverage_group(
+                USER_ALICE,
+                gid,
+                now=datetime.now(timezone.utc),
+            )
+        assert exc_yf.value.provider == "yfinance"
+        assert store.groups[(USER_ALICE, gid)]["last_resolved_at"] == initial_ts
+        nvda_row = await store.get_coverage_row(USER_ALICE, "NVDA")
+        assert nvda_row is not None
+        assert "group_stale_ids" not in nvda_row["extra"]
+
+    # 2) Malformed FMP screener response (not a list, e.g. dict error payload) -> raises MarketDataUnavailable
+    monkeypatch.setenv("FMP_API_KEY", "test-fmp-key")
+    fmp_screener_mock = create_autospec(
+        FMPClient.get_company_screener,
+        return_value={"Error Message": "Invalid response shape"},  # type: ignore[arg-type]
+    )
+    monkeypatch.setattr(FMPClient, "get_company_screener", fmp_screener_mock)
+    with pytest.raises(coverage_svc.MarketDataUnavailable) as exc_fmp:
+        await coverage_svc.resolve_coverage_group(
+            USER_ALICE,
+            gid,
+            now=datetime.now(timezone.utc),
+        )
+    assert exc_fmp.value.provider == "fmp"
+    assert store.groups[(USER_ALICE, gid)]["last_resolved_at"] == initial_ts
+    nvda_row_after_fmp_err = await store.get_coverage_row(USER_ALICE, "NVDA")
+    assert nvda_row_after_fmp_err is not None
+    assert "group_stale_ids" not in nvda_row_after_fmp_err["extra"]
+
+    # 3) Valid empty FMP screener response ([] when yf.screen fails) -> treated as valid empty result
+    fmp_screener_mock.return_value = []
+    empty_fmp_rows = await coverage_svc._fetch_screener_rows({"country": "US", "industry": "Semiconductors"})
+    assert empty_fmp_rows == []
+
+    # 4) Valid empty yf.screen response (mapping with quotes=[]) -> marks members stale and updates last_resolved_at
+    monkeypatch.delenv("FMP_API_KEY", raising=False)
+    yf_screen_mock.return_value = {"quotes": []}
+    refresh_ts = datetime.now(timezone.utc)
+    res_empty = await coverage_svc.resolve_coverage_group(
+        USER_ALICE,
+        gid,
+        now=refresh_ts,
+    )
+    assert res_empty["matched_tickers"] == []
+    assert set(res_empty["stale_tickers"]) == {"NVDA", "AVGO"}
+    assert store.groups[(USER_ALICE, gid)]["last_resolved_at"] == refresh_ts
+    nvda_stale = await store.get_coverage_row(USER_ALICE, "NVDA")
+    assert nvda_stale is not None
+    assert nvda_stale["extra"]["group_stale_ids"] == [gid]
+
+
+@pytest.mark.asyncio
+async def test_quarterly_refresh_failure_reports_summary_and_keeps_last_resolved_at(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 5 Item 3: when quarterly refresh fails, refresh_due_coverage_groups_for_preflight appends failure notice to summary_lines, returns failed_groups, and leaves last_resolved_at untouched so next run retries."""
+    store = _InMemoryCoverageStore()
+    _wire_coverage_store(monkeypatch, store)
+    monkeypatch.setattr(
+        coverage_svc,
+        "sync_user_coverage_to_home",
+        create_autospec(coverage_svc.sync_user_coverage_to_home, return_value=True),
+    )
+    monkeypatch.setattr(
+        coverage_svc,
+        "ensure_user_earnings_calendar_automation",
+        create_autospec(
+            coverage_svc.ensure_user_earnings_calendar_automation,
+            return_value={"ok": True, "action": "exists", "automation_id": "auto-cal-1", "name": "dalton-earnings-calendar"},
+        ),
+    )
+    monkeypatch.setattr(
+        coverage_svc,
+        "_user_workspace_tickers",
+        create_autospec(coverage_svc._user_workspace_tickers, return_value={}),
+    )
+
+    screener_mock = create_autospec(
+        coverage_svc._fetch_yf_screener_rows,
+        return_value=[
+            {"symbol": "NVDA", "companyName": "NVIDIA Corp", "exchangeShortName": "NMS"},
+        ],
+    )
+    monkeypatch.setattr(coverage_svc, "_fetch_yf_screener_rows", screener_mock)
+
+    grp_res = await coverage_svc.add_coverage_group(
+        USER_ALICE,
+        label="美股半导体大票",
+        criteria={"country": "US", "industry": "Semiconductors"},
+        default_tier="watch",
+    )
+    gid = grp_res["group"]["group_id"]
+    stale_resolved_at = datetime.now(timezone.utc) - timedelta(days=90)
+    store.groups[(USER_ALICE, gid)]["last_resolved_at"] = stale_resolved_at
+
+    # Simulate data source failure during quarterly refresh
+    screener_mock.side_effect = coverage_svc.MarketDataUnavailable("yfinance", "Yahoo screener 503")
+    now_t1 = datetime.now(timezone.utc)
+    fail_out = await coverage_svc.refresh_due_coverage_groups_for_preflight(
+        USER_ALICE,
+        now=now_t1,
+    )
+    assert fail_out["refreshed_groups"] == []
+    assert len(fail_out["failed_groups"]) == 1
+    assert fail_out["failed_groups"][0]["group_id"] == gid
+    assert fail_out["failed_groups"][0]["label"] == "美股半导体大票"
+    assert "Yahoo screener 503" in fail_out["failed_groups"][0]["error"]
+    expected_line = "规则组「美股半导体大票」季度重解析失败（数据源暂不可用），下次自动重试"
+    assert fail_out["summary_lines"] == [expected_line]
+    assert fail_out["summary_text"] == expected_line
+
+    # Confirm last_resolved_at was NOT written, so the group remains due for retry on the next run
+    assert store.groups[(USER_ALICE, gid)]["last_resolved_at"] == stale_resolved_at
+    assert coverage_svc._is_group_due_for_refresh(store.groups[(USER_ALICE, gid)], now=now_t1) is True
+
+    # Next run succeeds once the data source recovers
+    screener_mock.side_effect = None
+    screener_mock.return_value = [
+        {"symbol": "NVDA", "companyName": "NVIDIA Corp", "exchangeShortName": "NMS"},
+        {"symbol": "AMD", "companyName": "Advanced Micro Devices", "exchangeShortName": "NMS"},
+    ]
+    now_t2 = now_t1 + timedelta(minutes=5)
+    retry_out = await coverage_svc.refresh_due_coverage_groups_for_preflight(
+        USER_ALICE,
+        now=now_t2,
+    )
+    assert retry_out["failed_groups"] == []
+    assert len(retry_out["refreshed_groups"]) == 1
+    assert retry_out["added_tickers"] == ["AMD"]
+    assert store.groups[(USER_ALICE, gid)]["last_resolved_at"] == now_t2
+
+
+
 

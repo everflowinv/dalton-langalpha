@@ -486,6 +486,9 @@ def _extract_http_status(exc: BaseException) -> int | None:
     return None
 
 
+# Do NOT treat KeyError or 404 text inside fast_info access as MarketDataUnavailable:
+# live yfinance returns HTTP 404 and raises KeyError('currentTradingPeriod') on fast_info.exchange
+# for non-existent symbols (e.g. ZZZQQX), which is the genuine "ticker not found" signal.
 def _safe_fast_info_get(fi: Any, *keys: str) -> Any:
     if fi is None:
         return None
@@ -1378,14 +1381,26 @@ def _fetch_yf_screener_rows_sync(criteria: Mapping[str, Any]) -> list[dict[str, 
             sortField="intradaymarketcap",
             sortAsc=False,
         )
+    except MarketDataUnavailable:
+        raise
     except Exception as exc:
-        raise CoverageDataSourceError(
+        raise MarketDataUnavailable(
             "yfinance",
             f"{type(exc).__name__} in yf.screen",
             status_code=_extract_http_status(exc),
         ) from exc
 
-    quotes = result.get("quotes", []) if isinstance(result, Mapping) else []
+    if not isinstance(result, Mapping):
+        raise MarketDataUnavailable(
+            "yfinance",
+            f"Malformed yf.screen response (expected mapping, got {type(result).__name__})",
+        )
+    quotes = result.get("quotes")
+    if not isinstance(quotes, list):
+        raise MarketDataUnavailable(
+            "yfinance",
+            f"Malformed yf.screen quotes payload (expected list, got {type(quotes).__name__})",
+        )
     raw_rows: list[dict[str, Any]] = []
     for q in quotes:
         if not isinstance(q, Mapping):
@@ -1458,19 +1473,24 @@ async def _fetch_fmp_screener_rows(filters: Mapping[str, Any]) -> list[dict[str,
     """Invoke `FMPClient.get_company_screener` using `FMP_API_KEY` from environment."""
     api_key = (os.getenv("FMP_API_KEY") or "").strip()
     if not api_key:
-        raise CoverageDataSourceError("fmp", "FMP_API_KEY is not configured")
+        raise MarketDataUnavailable("fmp", "FMP_API_KEY is not configured")
     from src.data_client.fmp.fmp_client import FMPClient
 
     client = FMPClient(api_key=api_key)
     try:
         raw_res = await client.get_company_screener(**dict(filters))
-        if isinstance(raw_res, list):
-            return _filter_mainboard_screener_rows(
-                [dict(r) for r in raw_res if isinstance(r, Mapping)]
+        if not isinstance(raw_res, list):
+            raise MarketDataUnavailable(
+                "fmp",
+                f"Malformed FMP company-screener response (expected list, got {type(raw_res).__name__})",
             )
-        return []
+        return _filter_mainboard_screener_rows(
+            [dict(r) for r in raw_res if isinstance(r, Mapping)]
+        )
+    except MarketDataUnavailable:
+        raise
     except Exception as exc:
-        raise CoverageDataSourceError(
+        raise MarketDataUnavailable(
             "fmp",
             f"{type(exc).__name__} in company-screener",
             status_code=_extract_http_status(exc),
@@ -1487,11 +1507,17 @@ async def _fetch_screener_rows(criteria: Mapping[str, Any]) -> list[dict[str, An
     try:
         rows = await _fetch_yf_screener_rows(criteria)
         return _filter_mainboard_screener_rows(rows)
-    except CoverageDataSourceError as yf_exc:
+    except MarketDataUnavailable as yf_exc:
         if (os.getenv("FMP_API_KEY") or "").strip():
             try:
                 filters = _build_fmp_screener_filters(criteria)
                 return await _fetch_fmp_screener_rows(filters)
+            except MarketDataUnavailable as fmp_exc:
+                logger.warning(
+                    "[DALTON_COVERAGE] FMP screener fallback also failed (%s)",
+                    type(fmp_exc).__name__,
+                )
+                raise fmp_exc from yf_exc
             except Exception as fmp_exc:
                 logger.warning(
                     "[DALTON_COVERAGE] FMP screener fallback also failed (%s)",
@@ -1677,8 +1703,8 @@ async def resolve_coverage_group(
 
     - Newly matching tickers not yet in the user's coverage are added with `default_tier` and `source='group'`.
     - Existing tickers that also match this group have `group_id` added to their `extra.group_ids` without overwriting manual tier/source.
-    - Tickers in this group that no longer match are NOT deleted; instead `extra.group_stale = true` is set.
-    - Tickers in this group that match again have `extra.group_stale` cleared.
+    - Tickers in this group that no longer match are NOT deleted; instead `group_id` is added to their `extra.group_stale_ids` (tracked per group).
+    - Tickers in this group that match again have `group_id` removed from their `extra.group_stale_ids`.
     """
     uid = str(user_id or "").strip()
     gid = str(group_id or "").strip()
@@ -1815,6 +1841,7 @@ async def refresh_due_coverage_groups_for_preflight(
     if not uid:
         return {
             "refreshed_groups": [],
+            "failed_groups": [],
             "added_tickers": [],
             "stale_tickers": [],
             "summary_lines": [],
@@ -1829,6 +1856,7 @@ async def refresh_due_coverage_groups_for_preflight(
             logger.warning("[DALTON_COVERAGE] failed listing groups in preflight for %s: %s", uid, exc)
         return {
             "refreshed_groups": [],
+            "failed_groups": [],
             "added_tickers": [],
             "stale_tickers": [],
             "summary_lines": [],
@@ -1836,6 +1864,7 @@ async def refresh_due_coverage_groups_for_preflight(
         }
 
     refreshed_groups: list[dict[str, Any]] = []
+    failed_groups: list[dict[str, Any]] = []
     all_added: list[str] = []
     all_stale: list[str] = []
     summary_lines: list[str] = []
@@ -1876,9 +1905,20 @@ async def refresh_due_coverage_groups_for_preflight(
                 gid,
                 exc,
             )
+            failed_groups.append(
+                {
+                    "group_id": gid,
+                    "label": label,
+                    "error": str(exc),
+                }
+            )
+            summary_lines.append(
+                f"规则组「{label}」季度重解析失败（数据源暂不可用），下次自动重试"
+            )
 
     return {
         "refreshed_groups": refreshed_groups,
+        "failed_groups": failed_groups,
         "added_tickers": all_added,
         "stale_tickers": all_stale,
         "summary_lines": summary_lines,
