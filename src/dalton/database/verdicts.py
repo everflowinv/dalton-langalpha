@@ -231,3 +231,45 @@ async def list_user_verdicts(
             )
             rows = await cur.fetchall()
             return [_serialize_row(r) for r in rows if r is not None]  # type: ignore[misc]
+
+
+async def get_verdict_for_execution(
+    *,
+    automation_execution_id: str | None = None,
+    thread_id: str | None = None,
+    run_id: str | None = None,
+) -> dict[str, Any] | None:
+    """Return the verdict row matching this run's ``automation_execution_id`` or ``run_id``.
+
+    Never falls back to ``conversation_thread_id`` because recurring automations
+    on a fixed thread (e.g. ``dalton-director-weekly``) would return a stale
+    verdict from an earlier run.
+    """
+    _ = thread_id
+    exec_id = (automation_execution_id or "").strip()
+    rid = (run_id or "").strip()
+    if not (exec_id or rid):
+        return None
+
+    async with get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            for col, val in (
+                ("automation_execution_id", exec_id),
+                ("run_id", rid),
+            ):
+                if not val:
+                    continue
+                await cur.execute(
+                    f"""
+                    SELECT {_VERDICT_COLS}
+                    FROM dalton_verdicts
+                    WHERE {col} = %s
+                    ORDER BY verdict_at DESC, created_at DESC, length(verdict_id) DESC, verdict_id DESC
+                    LIMIT 1
+                    """,
+                    (val,),
+                )
+                row = await cur.fetchone()
+                if row is not None:
+                    return _serialize_row(row)
+    return None

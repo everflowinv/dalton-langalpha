@@ -765,6 +765,39 @@ def get_dalton_bridge_base_url(host: str | None = None) -> str:
     return f"http://{resolved_host}:{port}"
 
 
+FEISHU_SEND_CARD_TIMEOUT_S: float = 15.0
+
+
+def get_feishu_send_card_timeout_s() -> float:
+    """Return the Feishu card subprocess timeout in seconds from ``FEISHU_SEND_CARD_TIMEOUT_S`` (default 15s)."""
+    raw = os.getenv("FEISHU_SEND_CARD_TIMEOUT_S", "").strip()
+    if raw:
+        try:
+            return max(1.0, float(raw))
+        except ValueError:
+            pass
+    return max(1.0, float(FEISHU_SEND_CARD_TIMEOUT_S))
+
+
+def get_notify_http_timeout_s() -> float:
+    """Return the dispatch-to-bridge HTTP timeout (``FEISHU_SEND_CARD_TIMEOUT_S + 5``)."""
+    return get_feishu_send_card_timeout_s() + 5.0
+
+
+def get_dalton_frontend_url() -> str:
+    """Return configured public frontend URL (``PUBLIC_APP_URL`` / ``DALTON_FRONTEND_URL``), or empty string if unconfigured.
+
+    Never falls back to ``SERVER_BASE_URL`` (the backend API origin), and ignores
+    any value that merely duplicates ``SERVER_BASE_URL``.
+    """
+    server_base = os.getenv("SERVER_BASE_URL", "").strip().rstrip("/")
+    for key in ("DALTON_FRONTEND_URL", "PUBLIC_APP_URL", "FRONTEND_URL"):
+        val = os.getenv(key, "").strip().rstrip("/")
+        if val and (not server_base or val != server_base):
+            return val
+    return ""
+
+
 def get_dalton_bridge_embed_url(host: str | None = None) -> str:
     """Return the host bridge `/embed` URL for container-to-host embedding calls."""
     resolved_host = host or HOST_IP or "host.docker.internal"

@@ -21,9 +21,13 @@ import logging
 import os
 import re
 import signal
+import subprocess
 import sys
+import tempfile
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -50,6 +54,7 @@ DEFAULT_ROUTE_TIMEOUT_S = 240
 LONG_READ_TIMEOUT_S = 600
 FANOUT_ALPHAENGINE_TIMEOUT_S = 60
 FANOUT_GUIDEPOINT_TIMEOUT_S = 90
+FEISHU_SEND_CARD_TIMEOUT_S: float = 15.0
 
 LONG_READ_OPERATIONS: frozenset[str] = frozenset(
     {
@@ -1013,6 +1018,33 @@ class BridgeConfig:
                 os.path.expanduser("~/.cache/dalton/ops-jobs-status.json"),
             )
         ).expanduser()
+        self.openclaw_gateway_url: str = (
+            os.environ.get("OPENCLAW_GATEWAY_URL", "http://127.0.0.1:18789")
+            .strip()
+            .rstrip("/")
+        )
+        self.openclaw_gateway_token: str = os.environ.get(
+            "OPENCLAW_GATEWAY_TOKEN", ""
+        ).strip()
+        self.feishu_send_card_script: Path = Path(
+            os.environ.get(
+                "FEISHU_SEND_CARD_SCRIPT",
+                os.path.expanduser("~/.openclaw/workspace/scripts/feishu_send_card.py"),
+            )
+        ).expanduser()
+        try:
+            self.feishu_send_card_timeout_s: float = max(
+                1.0,
+                float(
+                    os.environ.get(
+                        "FEISHU_SEND_CARD_TIMEOUT_S",
+                        str(FEISHU_SEND_CARD_TIMEOUT_S),
+                    )
+                    or FEISHU_SEND_CARD_TIMEOUT_S
+                ),
+            )
+        except ValueError:
+            self.feishu_send_card_timeout_s = FEISHU_SEND_CARD_TIMEOUT_S
         self.test_mode: bool = os.environ.get("DALTON_BRIDGE_TEST_MODE", "0").strip().lower() in (
             "1",
             "true",
@@ -8171,6 +8203,351 @@ class ResearchDataBridge:
         except Exception:
             return 200, {"ok": True, "jobs": default_ops}
 
+    def _invoke_openclaw_gateway(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """POST ``payload`` to OpenClaw ``/tools/invoke`` bypassing proxies and never logging tokens."""
+        return _post_openclaw_tools_invoke(
+            gateway_url=self.cfg.openclaw_gateway_url,
+            gateway_token=self.cfg.openclaw_gateway_token,
+            payload=payload,
+            timeout_s=self.cfg.feishu_send_card_timeout_s,
+        )
+
+    async def handle_notify(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        """Handle ``POST /notify`` by sending Feishu Card 2.0 via ``feishu_send_card.py`` or Discord DM via OpenClaw."""
+        raw_targets = body.get("targets")
+        raw_text = body.get("text")
+        raw_card = body.get("card")
+        card_dict = raw_card if isinstance(raw_card, dict) else None
+        if not isinstance(raw_targets, list) or not raw_targets:
+            return 400, {"ok": False, "error": "targets must be a non-empty list"}
+        if (not isinstance(raw_text, str) or not raw_text.strip()) and card_dict is None:
+            return 400, {"ok": False, "error": "text must be a non-empty string"}
+
+        text = str(raw_text or "").strip()
+        token = self.cfg.openclaw_gateway_token
+        results: list[dict[str, Any]] = []
+
+        for raw_target in raw_targets:
+            target_str = str(raw_target).strip() if isinstance(raw_target, str) else ""
+            if not target_str:
+                results.append(
+                    {"target": str(raw_target), "ok": False, "error": "empty_target"}
+                )
+                continue
+            try:
+                channel, target_arg = parse_notify_target(target_str)
+            except ValueError:
+                results.append(
+                    {"target": target_str, "ok": False, "error": "invalid_target_format"}
+                )
+                continue
+
+            if channel == "feishu" and card_dict is not None:
+                open_id = (
+                    target_arg.split(":", 1)[1]
+                    if ":" in target_arg
+                    else target_arg
+                )
+                try:
+                    card_res = await asyncio.to_thread(
+                        _run_feishu_send_card,
+                        script_path=self.cfg.feishu_send_card_script,
+                        open_id=open_id,
+                        card=card_dict,
+                        timeout_s=self.cfg.feishu_send_card_timeout_s,
+                    )
+                    ok = card_res.get("ok") is True
+                    exit_code = card_res.get("exit_code")
+                    if ok:
+                        logger.info(
+                            "notify target=%s channel=feishu mode=card status=ok exit_code=%s",
+                            target_str,
+                            exit_code,
+                        )
+                        results.append(
+                            {"target": target_str, "channel": "feishu", "ok": True}
+                        )
+                    else:
+                        err_code = str(
+                            card_res.get("error") or f"exit_code={exit_code}"
+                        )
+                        logger.warning(
+                            "notify target=%s channel=feishu mode=card status=error exit_code=%s",
+                            target_str,
+                            exit_code,
+                        )
+                        results.append(
+                            {
+                                "target": target_str,
+                                "channel": "feishu",
+                                "ok": False,
+                                "error": err_code,
+                            }
+                        )
+                except Exception as card_exc:
+                    logger.warning(
+                        "notify target=%s channel=feishu mode=card status=error error_type=%s",
+                        target_str,
+                        type(card_exc).__name__,
+                    )
+                    results.append(
+                        {
+                            "target": target_str,
+                            "channel": "feishu",
+                            "ok": False,
+                            "error": type(card_exc).__name__,
+                        }
+                    )
+                continue
+
+            if not token:
+                logger.warning(
+                    "notify target=%s channel=%s status=error error_code=missing_openclaw_gateway_token",
+                    target_str,
+                    channel,
+                )
+                results.append(
+                    {
+                        "target": target_str,
+                        "channel": channel,
+                        "ok": False,
+                        "error": "missing_openclaw_gateway_token",
+                    }
+                )
+                continue
+
+            invoke_payload = build_openclaw_message_invoke_body(
+                channel=channel,
+                target=target_arg,
+                text=text,
+            )
+            try:
+                resp_data = await asyncio.to_thread(
+                    self._invoke_openclaw_gateway, invoke_payload
+                )
+                is_err = bool(
+                    resp_data.get("ok") is False
+                    or resp_data.get("isError")
+                    or (
+                        isinstance(resp_data.get("result"), Mapping)
+                        and resp_data["result"].get("isError")
+                    )
+                )
+                if is_err:
+                    status_code = (
+                        resp_data.get("status_code")
+                        if isinstance(resp_data.get("status_code"), int)
+                        else None
+                    )
+                    err_code = (
+                        f"http_{status_code}"
+                        if status_code is not None
+                        else "openclaw_invoke_error"
+                    )
+                    logger.warning(
+                        "notify target=%s channel=%s status=error error_code=%s status_code=%s",
+                        target_str,
+                        channel,
+                        err_code,
+                        status_code,
+                    )
+                    results.append(
+                        {
+                            "target": target_str,
+                            "channel": channel,
+                            "ok": False,
+                            "error": err_code,
+                        }
+                    )
+                else:
+                    logger.info(
+                        "notify target=%s channel=%s status=ok",
+                        target_str,
+                        channel,
+                    )
+                    results.append(
+                        {"target": target_str, "channel": channel, "ok": True}
+                    )
+            except Exception as exc:
+                status_code = getattr(exc, "code", None) or getattr(
+                    getattr(exc, "response", None), "status_code", None
+                )
+                if not isinstance(status_code, int):
+                    status_code = None
+                err_code = (
+                    f"http_{status_code}"
+                    if status_code is not None
+                    else type(exc).__name__
+                )
+                logger.warning(
+                    "notify target=%s channel=%s status=error error_type=%s status_code=%s",
+                    target_str,
+                    channel,
+                    type(exc).__name__,
+                    status_code,
+                )
+                results.append(
+                    {
+                        "target": target_str,
+                        "channel": channel,
+                        "ok": False,
+                        "error": err_code,
+                    }
+                )
+
+        all_ok = bool(results) and all(bool(item.get("ok")) for item in results)
+        return 200, {"ok": all_ok, "results": results}
+
+
+_FEISHU_TARGET_RE = re.compile(r"^feishu:(user:ou_[A-Za-z0-9_-]+)$")
+_DISCORD_TARGET_RE = re.compile(r"^discord:(user:[0-9]+)$")
+
+
+def parse_notify_target(raw: str) -> tuple[str, str]:
+    """Split ``<channel>:user:<id>`` into ``(channel, 'user:<id>')``."""
+    if not isinstance(raw, str):
+        raise ValueError("Target must be a string")
+    cleaned = raw.strip()
+    m_feishu = _FEISHU_TARGET_RE.match(cleaned)
+    if m_feishu:
+        return "feishu", m_feishu.group(1)
+    m_discord = _DISCORD_TARGET_RE.match(cleaned)
+    if m_discord:
+        return "discord", m_discord.group(1)
+    raise ValueError(f"Unsupported notify target format: {cleaned!r}")
+
+
+def build_openclaw_message_invoke_body(
+    channel: str, target: str, text: str
+) -> dict[str, Any]:
+    """Build the OpenClaw ``/tools/invoke`` payload for sending a direct message."""
+    return {
+        "tool": "message",
+        "args": {
+            "action": "send",
+            "channel": channel,
+            "target": target,
+            "message": text,
+        },
+    }
+
+
+def build_feishu_send_card_cmd(
+    *,
+    script_path: Path | str,
+    open_id: str,
+    card_json_file: Path | str,
+    dry_run: bool = False,
+) -> list[str]:
+    """Build subprocess argv for ``feishu_send_card.py``."""
+    cmd = [
+        "python3",
+        str(script_path),
+        "--chat-id",
+        str(open_id),
+        "--receive-id-type",
+        "open_id",
+        "--card-json-file",
+        str(card_json_file),
+        "--json",
+    ]
+    if dry_run:
+        cmd.append("--dry-run")
+    return cmd
+
+
+def _run_feishu_send_card(
+    *,
+    script_path: Path,
+    open_id: str,
+    card: dict[str, Any],
+    timeout_s: float = FEISHU_SEND_CARD_TIMEOUT_S,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Invoke ``feishu_send_card.py`` with a temporary ``--card-json-file``.
+
+    Never logs or returns subprocess stdout/stderr (which could contain credentials).
+    Only reports ``ok`` and ``exit_code``.
+    """
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            suffix=".json",
+            prefix="dalton_feishu_card_",
+            encoding="utf-8",
+            delete=False,
+        ) as fh:
+            json.dump(card, fh, ensure_ascii=False)
+            tmp_path = Path(fh.name)
+
+        cmd = build_feishu_send_card_cmd(
+            script_path=script_path,
+            open_id=open_id,
+            card_json_file=tmp_path,
+            dry_run=dry_run,
+        )
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+            check=False,
+        )
+        if proc.returncode != 0:
+            return {
+                "ok": False,
+                "exit_code": proc.returncode,
+                "error": f"exit_code={proc.returncode}",
+            }
+        if not dry_run and proc.stdout and proc.stdout.strip():
+            try:
+                parsed = json.loads(proc.stdout)
+                if isinstance(parsed, dict) and parsed.get("status") == "error":
+                    return {
+                        "ok": False,
+                        "exit_code": proc.returncode,
+                        "error": "feishu_api_error",
+                    }
+            except ValueError:
+                pass
+        return {"ok": True, "exit_code": proc.returncode}
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "exit_code": -1, "error": "timeout"}
+    finally:
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _post_openclaw_tools_invoke(
+    *,
+    gateway_url: str,
+    gateway_token: str,
+    payload: dict[str, Any],
+    timeout_s: float = FEISHU_SEND_CARD_TIMEOUT_S,
+) -> dict[str, Any]:
+    """Send ``POST {gateway_url}/tools/invoke`` bypassing HTTP proxies (``NO_PROXY``)."""
+    url = f"{gateway_url.rstrip('/')}/tools/invoke"
+    data_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data_bytes,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {gateway_token}",
+        },
+    )
+    # Bypass all proxies explicitly (NO_PROXY for local OpenClaw gateway)
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(req, timeout=timeout_s) as resp:
+        raw_resp = resp.read().decode("utf-8", errors="replace")
+        parsed = json.loads(raw_resp) if raw_resp.strip() else {"ok": True}
+        return parsed if isinstance(parsed, dict) else {"ok": True, "result": parsed}
+
 
 async def _send_http(
     writer: asyncio.StreamWriter,
@@ -8506,6 +8883,27 @@ async def _handle_client(
                 return
 
             await _send_http(writer, 404, "Not Found", {"error": "Not Found"})
+            return
+
+        # Route 5: POST /notify (behind the admin token gate above: only the
+        # backend may push messages; a sandbox holds the MCP token only).
+        # DALTON-HOOK(bridge-admin-token)
+        if path == "/notify":
+            if method != "POST":
+                await _send_http(
+                    writer, 405, "Method Not Allowed", {"error": "Method Not Allowed"}
+                )
+                return
+            try:
+                notify_body = json.loads(body_bytes.decode("utf-8"))
+                if not isinstance(notify_body, dict):
+                    raise ValueError("Expected JSON object")
+            except Exception:
+                await _send_http(writer, 400, "Bad Request", {"ok": False, "error": "Parse error"})
+                return
+            code, payload = await bridge.handle_notify(notify_body)
+            status_label = "OK" if code == 200 else "Bad Request"
+            await _send_http(writer, code, status_label, payload)
             return
 
         await _send_http(writer, 404, "Not Found", {"error": "Not Found"})

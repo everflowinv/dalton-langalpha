@@ -69,12 +69,20 @@ export interface ModelPreferences extends ModelProfile {
   dalton_assist_fallback_models?: string[] | null;
   dalton_reviewer_models?: string[] | null;
   dalton_extract_model?: string | null;
+  dalton_notify_enabled?: boolean | null;
+  dalton_notify_targets?: string[] | null;
+  dalton_notify_overrides?: Record<string, boolean> | null;
 }
 
 // DALTON-HOOK(settings-section): Zod boundary schema for Dalton model_preference keys
 const daltonStrOrNull = z.catch(z.nullable(z.optional(z.string())), undefined);
 const daltonStrListOrNull = z.catch(
   z.nullable(z.optional(z.array(z.string()))),
+  undefined,
+);
+const daltonBoolOrNull = z.catch(z.nullable(z.optional(z.boolean())), undefined);
+const daltonBoolMapOrNull = z.catch(
+  z.nullable(z.optional(z.record(z.string(), z.boolean()))),
   undefined,
 );
 const daltonTimeoutOrNull = z.catch(
@@ -95,6 +103,9 @@ export const DaltonModelPrefsSchema = z.object({
   dalton_assist_fallback_models: daltonStrListOrNull,
   dalton_reviewer_models: daltonStrListOrNull,
   dalton_extract_model: daltonStrOrNull,
+  dalton_notify_enabled: daltonBoolOrNull,
+  dalton_notify_targets: daltonStrListOrNull,
+  dalton_notify_overrides: daltonBoolMapOrNull,
 });
 
 /**
@@ -149,6 +160,9 @@ export const MODEL_PREF_KEYS: ReadonlySet<string> = new Set<string>([
   'dalton_assist_fallback_models',
   'dalton_reviewer_models',
   'dalton_extract_model',
+  'dalton_notify_enabled',
+  'dalton_notify_targets',
+  'dalton_notify_overrides',
 ]);
 
 /**
@@ -294,4 +308,51 @@ export function threadsMoved(result: unknown): number | undefined {
 export function readDefaultModelScope(prefs: unknown): DefaultModelScope {
   const scope = modelPrefs(prefs).default_model_scope;
   return scope === 'new_threads' || scope === 'existing_threads' ? scope : 'ask';
+}
+
+// DALTON-HOOK(settings-section): resolve per-task notify state from backend effective value or unified override precedence
+export function resolveDaltonAutomationNotifyState(
+  automation: {
+    name: string;
+    dalton_notify_category?: string | null;
+    dalton_notify_effective?: boolean | null;
+    dalton_notify_source?: string | null;
+  },
+  overrides?: Record<string, boolean> | null,
+): { enabled: boolean; source: string | null } {
+  const category = automation.dalton_notify_category;
+  if (!category) return { enabled: false, source: null };
+  if (overrides) {
+    const trimmedName = automation.name.trim();
+    const candidates: Array<[string, string]> = [
+      [trimmedName, 'task'],
+      [trimmedName.toLowerCase(), 'task'],
+      [`category:${category}`, 'category'],
+      [category, 'category'],
+    ];
+    for (const [key, src] of candidates) {
+      if (key && typeof overrides[key] === 'boolean') {
+        return { enabled: overrides[key], source: src };
+      }
+    }
+  }
+  if (typeof automation.dalton_notify_effective === 'boolean') {
+    return {
+      enabled: automation.dalton_notify_effective,
+      source: automation.dalton_notify_source ?? 'default',
+    };
+  }
+  return { enabled: true, source: 'default' };
+}
+
+export function isDaltonAutomationNotifyEnabled(
+  automation: {
+    name: string;
+    dalton_notify_category?: string | null;
+    dalton_notify_effective?: boolean | null;
+    dalton_notify_source?: string | null;
+  },
+  overrides?: Record<string, boolean> | null,
+): boolean {
+  return resolveDaltonAutomationNotifyState(automation, overrides).enabled;
 }

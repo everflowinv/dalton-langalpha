@@ -1,11 +1,52 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { act, screen, waitFor, within } from '@testing-library/react';
+import { act, fireEvent, screen, waitFor, within } from '@testing-library/react';
 import i18n from '@/i18n';
 import { renderWithProviders } from '@/test/utils';
 import type { Automation, AutomationExecution, AutomationRun, DeliveryAttempt, DeliveryOptions } from '@/types/automation';
 import * as api from '../utils/api';
 import { LIVE_POLL_MS } from '../utils/polling';
 import Automations from '../Automations';
+
+// DALTON-HOOK(dalton-notify): mock user preferences for per-task notify toggle tests
+const prefMocks = vi.hoisted(() => ({
+  preferences: {
+    model_preference: {} as Record<string, unknown>,
+    other_preference: {} as Record<string, unknown>,
+  },
+  mutateAsync: vi.fn(async (patch: Record<string, unknown>) => {
+    const mp = (patch.model_preference ?? {}) as Record<string, unknown>;
+    const existingOverrides =
+      (prefMocks.preferences.model_preference.dalton_notify_overrides as Record<string, unknown> | undefined) ?? {};
+    const patchOverrides = mp.dalton_notify_overrides as Record<string, unknown> | undefined;
+    prefMocks.preferences = {
+      ...prefMocks.preferences,
+      model_preference: {
+        ...prefMocks.preferences.model_preference,
+        ...mp,
+        ...(patchOverrides
+          ? { dalton_notify_overrides: { ...existingOverrides, ...patchOverrides } }
+          : {}),
+      },
+    };
+    return prefMocks.preferences;
+  }),
+}));
+
+vi.mock('@/hooks/usePreferences', () => ({
+  usePreferences: () => ({
+    preferences: prefMocks.preferences,
+    isLoading: false,
+    isLoaded: true,
+  }),
+}));
+
+vi.mock('@/hooks/useUpdatePreferences', () => ({
+  PREFERENCE_MUTATION_KEY: ['user-preferences'],
+  useUpdatePreferences: () => ({
+    mutate: vi.fn(),
+    mutateAsync: prefMocks.mutateAsync,
+  }),
+}));
 
 vi.mock('@/hooks/useHomeTimezone', () => ({ useHomeTimezone: () => 'America/New_York' }));
 vi.mock('@/hooks/useWorkspaces', () => ({
@@ -23,6 +64,8 @@ vi.mock('../utils/api', async (importOriginal) => ({
 afterEach(() => {
   vi.clearAllMocks();
   localStorage.clear();
+  // DALTON-HOOK(dalton-notify): reset preference mock bag between tests
+  prefMocks.preferences = { model_preference: {}, other_preference: {} };
 });
 
 const label = (key: string, opts?: Record<string, unknown>) => i18n.t(key, opts);
@@ -257,5 +300,99 @@ describe('a delivery record that lands after the run ends', () => {
     land();
     await nextLivePoll();
     await waitFor(() => expect(screen.getByText('Report run-new').closest('article')).toHaveTextContent(sent));
+  });
+});
+
+// DALTON-HOOK(dalton-notify): per-task Feishu/Discord notify switches on Automations page
+describe('per-task Feishu/Discord notify switches on Automations page', () => {
+  const PUSHABLE_EARN: Automation = {
+    ...AUTOMATION,
+    automation_id: 'auto-earn-t0',
+    name: 'dalton-googl-earn-2026q1-t0',
+    dalton_notify_category: 'earnings_t0',
+    dalton_notify_effective: true,
+    dalton_notify_source: 'default',
+  };
+  const NON_PUSHABLE_WATCH: Automation = {
+    ...AUTOMATION,
+    automation_id: 'auto-watch',
+    name: 'dalton-googl-watch',
+    dalton_notify_category: null,
+    dalton_notify_effective: null,
+    dalton_notify_source: null,
+  };
+
+  function renderManageWithNotifyTasks() {
+    vi.mocked(api.listAutomations).mockResolvedValue({
+      data: { automations: [PUSHABLE_EARN, NON_PUSHABLE_WATCH], total: 2 },
+    } as never);
+    vi.mocked(api.listExecutions).mockResolvedValue({ data: { executions: [], has_more: false } } as never);
+    vi.mocked(api.listRecentRuns).mockResolvedValue({ data: { executions: [], has_more: false } } as never);
+    vi.mocked(api.getDeliveryOptions).mockResolvedValue({ data: OPTIONS } as never);
+    return renderWithProviders(<Automations />, { route: '/automations?view=manage' });
+  }
+
+  it('shows 推送 switch (default on) only for pushable tasks and grays it out with hint when master switch is off', async () => {
+    renderManageWithNotifyTasks();
+
+    const earnSwitch = await screen.findByRole('switch', {
+      name: '推送 dalton-googl-earn-2026q1-t0',
+    });
+    expect(earnSwitch).toHaveAttribute('aria-checked', 'true');
+    expect(earnSwitch).toBeDisabled();
+    expect(screen.getByText('在设置里打开飞书提醒')).toBeInTheDocument();
+
+    // Non-pushable watch task does not render a switch
+    expect(
+      screen.queryByRole('switch', { name: '推送 dalton-googl-watch' }),
+    ).not.toBeInTheDocument();
+
+    fireEvent.click(earnSwitch);
+    expect(prefMocks.mutateAsync).not.toHaveBeenCalled();
+  });
+
+  // DALTON-HOOK(dalton-notify): verify toggling per-task switch submits only changed key and reads back override
+  it('saves only the single changed task key and reads back per-task override when master switch 飞书提醒 is enabled', async () => {
+    prefMocks.preferences = {
+      model_preference: {
+        dalton_notify_enabled: true,
+        dalton_notify_overrides: {
+          'dalton-nvda-earn-2026q1-tp1': false,
+        },
+      },
+      other_preference: {},
+    };
+    const { unmount } = renderManageWithNotifyTasks();
+
+    const earnSwitch = await screen.findByRole('switch', {
+      name: '推送 dalton-googl-earn-2026q1-t0',
+    });
+    expect(earnSwitch).not.toBeDisabled();
+    expect(earnSwitch).toHaveAttribute('aria-checked', 'true');
+    expect(screen.queryByText('在设置里打开飞书提醒')).not.toBeInTheDocument();
+
+    fireEvent.click(earnSwitch);
+    await waitFor(() => {
+      // Only the changed key is submitted in the patch
+      expect(prefMocks.mutateAsync).toHaveBeenCalledWith({
+        model_preference: {
+          dalton_notify_overrides: {
+            'dalton-googl-earn-2026q1-t0': false,
+          },
+        },
+      });
+    });
+
+    unmount();
+    renderManageWithNotifyTasks();
+    const remountedSwitch = await screen.findByRole('switch', {
+      name: '推送 dalton-googl-earn-2026q1-t0',
+    });
+    expect(remountedSwitch).toHaveAttribute('aria-checked', 'false');
+    // Sibling override remains intact after deep merge
+    expect(prefMocks.preferences.model_preference.dalton_notify_overrides).toEqual({
+      'dalton-nvda-earn-2026q1-tp1': false,
+      'dalton-googl-earn-2026q1-t0': false,
+    });
   });
 });

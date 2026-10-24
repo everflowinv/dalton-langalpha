@@ -1,0 +1,43 @@
+"""Dalton personal notification package (Feishu Card 2.0 / Discord DM via OpenClaw)."""
+
+from src.dalton.notify.dispatch import (
+    NotifyClassification,
+    build_feishu_notify_card,
+    claim_execution_notify,
+    claim_target_delivery,
+    classify_automation_for_notify,
+    evaluate_user_notify_eligibility,
+    extract_card_sections,
+    extract_summary_lines,
+    format_notify_message,
+    is_automation_notify_enabled,
+    map_category_to_business_tag,
+    map_verdict_to_header_template,
+    mark_target_delivery,
+    on_automation_settled,
+    populate_automation_notify_state,
+    post_bridge_notify,
+    resolve_automation_notify_state,
+    retry_failed_notify_deliveries,
+)
+
+__all__ = [
+    "NotifyClassification",
+    "build_feishu_notify_card",
+    "claim_execution_notify",
+    "claim_target_delivery",
+    "classify_automation_for_notify",
+    "evaluate_user_notify_eligibility",
+    "extract_card_sections",
+    "extract_summary_lines",
+    "format_notify_message",
+    "is_automation_notify_enabled",
+    "map_category_to_business_tag",
+    "map_verdict_to_header_template",
+    "mark_target_delivery",
+    "on_automation_settled",
+    "populate_automation_notify_state",
+    "post_bridge_notify",
+    "resolve_automation_notify_state",
+    "retry_failed_notify_deliveries",
+]

@@ -1057,6 +1057,15 @@ async def decide(
     try:
         if not is_dalton_automation(automation):
             return None
+        try:
+            from src.dalton.notify.dispatch import retry_failed_notify_deliveries
+
+            await asyncio.wait_for(
+                retry_failed_notify_deliveries(limit=5, max_duration_s=30.0),
+                timeout=30.0,
+            )
+        except Exception:
+            pass
         raw_user_id = automation.get("user_id")
         if not raw_user_id or not str(raw_user_id).strip():
             logger.warning(
