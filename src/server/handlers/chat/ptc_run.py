@@ -335,6 +335,10 @@ async def astream_ptc_workflow(
         request, inherits_rules = await retried_on_its_surface(request)
         disk_free_mb, disk_known = await read_disk_notice(workspace_id)
         user_profile = await get_user_profile_for_prompt(user_id) if user_id else None
+        # DALTON-HOOK(i18n): a user with no saved users.locale gets the Dalton default (zh-CN), matching the web UI
+        from src.dalton.user_locale import with_default_locale
+
+        user_profile = with_default_locale(user_profile)
         turn_context = build_turn_context(
             request,
             prior_thread,
