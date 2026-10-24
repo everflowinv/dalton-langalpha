@@ -4228,24 +4228,21 @@ async def test_model_xlsx_cell_reading_and_prov_windowing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Service reads referenced `.xlsx` cells via `read_model_cell`, enforces reliable units, and windows long prov bodies."""
-    import io
-    import openpyxl
     from src.dalton import auth as dalton_auth
     from src.dalton.publish import service as publish_svc
+    from tests.unit.dalton._xlsx_builder import Cell, build_xlsx
 
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    assert ws is not None
-    ws.title = "Summary"
-    ws["A2"] = "营业利润率"
-    ws["B2"] = 0.241
-    ws["B2"].number_format = "0.0%"
-    ws["A3"] = "营业收入 ($B)"
-    ws["C3"] = 18.55  # 18.55 billion USD == 185.5 亿美元 (with row label ($B))
-    ws["D4"] = 18.55  # Unitless cell: no row/col header unit and General number_format
-    buf = io.BytesIO()
-    wb.save(buf)
-    xlsx_bytes = buf.getvalue()
+    xlsx_bytes = build_xlsx(
+        {
+            "Summary": {
+                "A2": "营业利润率",
+                "B2": Cell(0.241, num_fmt="0.0%"),
+                "A3": "营业收入 ($B)",
+                "C3": 18.55,  # 18.55 billion USD == 185.5 亿美元 (with row label ($B))
+                "D4": 18.55,  # Unitless cell: no row/col header unit and General number_format
+            }
+        }
+    )
 
     draft_md = (
         "# 1. 模型预测\n"
@@ -4452,20 +4449,19 @@ async def test_model_cell_priority_missing_sheet_and_read_error_in_audit_report(
 ) -> None:
     """`from_xlsx` value takes priority over `models.json.key_outputs`; missing sheet and read failure are reported in `.audit.md`."""
     import builtins
-    import io
-    import openpyxl
+
     from src.dalton import auth as dalton_auth
     from src.dalton.publish import service as publish_svc
     from src.dalton.publish.match import read_model_cell
+    from tests.unit.dalton._xlsx_builder import build_xlsx
 
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    assert ws is not None
-    ws.title = "Summary"
-    ws["C10"] = 200.0  # Real xlsx value is 200, while stale key_outputs and draft say 100
-    buf = io.BytesIO()
-    wb.save(buf)
-    xlsx_bytes = buf.getvalue()
+    xlsx_bytes = build_xlsx(
+        {
+            "Summary": {
+                "C10": 200.0,  # Real xlsx value is 200, while stale key_outputs and draft say 100
+            }
+        }
+    )
 
     draft_md = (
         "# 1. 估值与预测\n"
@@ -4532,7 +4528,7 @@ async def test_model_cell_priority_missing_sheet_and_read_error_in_audit_report(
     audit_md_text = files_store["drafts/val.audit.md"]
     assert "模型文件中没有工作表 NoSuchSheet" in audit_md_text
 
-    # Block `import openpyxl` at runtime: stdlib XML reader still succeeds without openpyxl
+    # Block openpyxl at runtime: stdlib XML reader still succeeds without openpyxl
     real_import = builtins.__import__
 
     def _no_openpyxl(name: str, *args: Any, **kwargs: Any) -> Any:
@@ -4707,112 +4703,53 @@ def test_english_period_after_number_sentence_boundary_and_footnote_only_citatio
 async def test_stdlib_xlsx_model_cell_reading_and_unrecalculated_formula_checks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Verify stdlib XML `.xlsx` cell reading (with `import openpyxl` blocked at runtime) and unrecalculated formula checks."""
+    """Verify stdlib XML `.xlsx` cell reading (with openpyxl blocked at runtime) and unrecalculated formula checks."""
     import builtins
-    import io
-    import xml.etree.ElementTree as ET
-    import zipfile
-    import openpyxl
+
     from src.dalton import auth as dalton_auth
     from src.dalton.database import knowledge as db_knowledge
     from src.dalton.database import publications as db_publications
     from src.dalton.publish import service as publish_svc
     from src.dalton.publish.match import count_unrecalculated_formulas, read_model_cell
+    from tests.unit.dalton._xlsx_builder import Cell, build_xlsx
 
-    # 1. Build an `.xlsx` workbook with formulas via openpyxl (no cached `<v>` on formulas)
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    assert ws is not None
-    ws.title = "Summary"
-    ws["A12"] = "营业收入 ($B)"
-    ws["B10"] = 10.0
-    ws["B11"] = 20.0
-    ws["B12"] = "=B10+B11"
-    ws["B13"] = "=B12*2"
-    ws["C2"] = True
-    buf = io.BytesIO()
-    wb.save(buf)
-    unrecalc_bytes = buf.getvalue()
-
-    def _mutate_xlsx_xml(
-        raw_bytes: bytes,
-        cached_formula_values: dict[str, str] | None = None,
-        add_special_cells: bool = False,
-    ) -> bytes:
-        in_zf = zipfile.ZipFile(io.BytesIO(raw_bytes), "r")
-        out_buf = io.BytesIO()
-        ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
-        ET.register_namespace("", ns)
-        with zipfile.ZipFile(out_buf, "w", zipfile.ZIP_DEFLATED) as out_zf:
-            for item in in_zf.infolist():
-                if add_special_cells and item.filename == "xl/sharedStrings.xml":
-                    continue
-                data = in_zf.read(item.filename)
-                if item.filename == "xl/worksheets/sheet1.xml":
-                    root = ET.fromstring(data)
-                    if cached_formula_values:
-                        for c_elem in root.iter(f"{{{ns}}}c"):
-                            coord = c_elem.attrib.get("r", "")
-                            if coord in cached_formula_values:
-                                v_el = c_elem.find(f"{{{ns}}}v")
-                                if v_el is None:
-                                    v_el = ET.SubElement(c_elem, f"{{{ns}}}v")
-                                v_el.text = cached_formula_values[coord]
-                    if add_special_cells:
-                        sheet_data = root.find(f"{{{ns}}}sheetData")
-                        assert sheet_data is not None
-                        row20 = ET.SubElement(sheet_data, f"{{{ns}}}row", {"r": "20"})
-                        # Shared string t="s" at A20 (index 1 in sharedStrings.xml -> "共享字符串文本")
-                        c_s = ET.SubElement(row20, f"{{{ns}}}c", {"r": "A20", "t": "s"})
-                        v_s = ET.SubElement(c_s, f"{{{ns}}}v")
-                        v_s.text = "1"
-                        # inlineStr at B20
-                        c_in = ET.SubElement(
-                            row20, f"{{{ns}}}c", {"r": "B20", "t": "inlineStr"}
-                        )
-                        is_el = ET.SubElement(c_in, f"{{{ns}}}is")
-                        t_el = ET.SubElement(is_el, f"{{{ns}}}t")
-                        t_el.text = "内联字符串($M)"
-                        # Formula string result t="str" at C20
-                        c_str = ET.SubElement(
-                            row20, f"{{{ns}}}c", {"r": "C20", "t": "str"}
-                        )
-                        f_str = ET.SubElement(c_str, f"{{{ns}}}f")
-                        f_str.text = 'CONCAT("FY","2026")'
-                        v_str = ET.SubElement(c_str, f"{{{ns}}}v")
-                        v_str.text = "FY2026"
-                        # Boolean t="b" at D20
-                        c_b = ET.SubElement(row20, f"{{{ns}}}c", {"r": "D20", "t": "b"})
-                        v_b = ET.SubElement(c_b, f"{{{ns}}}v")
-                        v_b.text = "1"
-                        # Error cell t="e" at E20
-                        c_e = ET.SubElement(row20, f"{{{ns}}}c", {"r": "E20", "t": "e"})
-                        v_e = ET.SubElement(c_e, f"{{{ns}}}v")
-                        v_e.text = "#DIV/0!"
-                    data = ET.tostring(root, encoding="utf-8", xml_declaration=True)
-                out_zf.writestr(item, data)
-            if add_special_cells:
-                sst_xml = (
-                    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-                    f'<sst xmlns="{ns}" count="2" uniqueCount="2">'
-                    "<si><t>营业收入 ($B)</t></si>"
-                    "<si><t>共享字符串文本</t></si>"
-                    "</sst>"
-                )
-                out_zf.writestr("xl/sharedStrings.xml", sst_xml.encode("utf-8"))
-        in_zf.close()
-        return out_buf.getvalue()
-
-    recalc_bytes = _mutate_xlsx_xml(
-        unrecalc_bytes,
-        cached_formula_values={"B12": "30.0", "B13": "60.0"},
-        add_special_cells=True,
+    # 1. Build `.xlsx` workbooks via stdlib `_xlsx_builder` (with and without cached `<v>` on formulas)
+    unrecalc_only_bytes = build_xlsx(
+        {
+            "Summary": {
+                "A12": "营业收入 ($B)",
+                "B10": 10.0,
+                "B11": 20.0,
+                "B12": Cell(None, formula="=B10+B11"),
+                "B13": Cell(None, formula="=B12*2"),
+                "C2": True,
+            }
+        }
     )
-    unrecalc_only_bytes = _mutate_xlsx_xml(
-        unrecalc_bytes, cached_formula_values=None, add_special_cells=False
+    recalc_bytes = build_xlsx(
+        {
+            "Summary": {
+                "A12": "营业收入 ($B)",
+                "B10": 10.0,
+                "B11": 20.0,
+                "B12": Cell(30.0, formula="=B10+B11"),
+                "B13": Cell(60.0, formula="=B12*2"),
+                "C2": True,
+                # Shared string t="s" at A20 (index 1 in sharedStrings.xml -> "共享字符串文本")
+                "A20": Cell("共享字符串文本", t="s"),
+                # inlineStr at B20
+                "B20": Cell("内联字符串($M)", t="inlineStr"),
+                # Formula string result t="str" at C20
+                "C20": Cell("FY2026", t="str", formula='CONCAT("FY","2026")'),
+                # Boolean t="b" at D20
+                "D20": Cell(True, t="b"),
+                # Error cell t="e" at E20
+                "E20": Cell("#DIV/0!", t="e"),
+            }
+        }
     )
 
-    # 2. Block `import openpyxl` for the remainder of the test to prove zero runtime dependency
+    # 2. Block openpyxl at runtime for the remainder of the test to prove zero runtime dependency
     real_import = builtins.__import__
 
     def _forbid_openpyxl(name: str, *args: Any, **kwargs: Any) -> Any:
@@ -5051,9 +4988,8 @@ async def test_round5_pct_unit_strictness_and_row_col_unit_hints(
        - `HK$B` is recognized as `HKD_bn` (港元);
        - Scale-only label without currency (`in millions`) is `unknown_mn` (`unknown_currency`) and cannot verify `USD_mn`.
     """
-    import io
-    import openpyxl
     from unittest.mock import create_autospec
+
     import src.dalton.auth as dalton_auth
     from src.dalton.publish import service as publish_svc
     from src.dalton.publish.match import (
@@ -5062,6 +4998,7 @@ async def test_round5_pct_unit_strictness_and_row_col_unit_hints(
         read_model_cell,
         values_within_tolerance,
     )
+    from tests.unit.dalton._xlsx_builder import Cell, build_xlsx
 
     # --- Item 1: `1.0 pct` vs `100%` and `0.21 pct` (from figures) vs `21%` do NOT match ---
     fig_100pct = extract_figures("FY2025 收入增速为 100%。")[0]
@@ -5112,25 +5049,22 @@ async def test_round5_pct_unit_strictness_and_row_col_unit_hints(
     assert fig_hkd.currency == "HKD"
     assert fig_hkd.unit == "HKD_bn"
 
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    assert ws is not None
-    ws.title = "Summary"
-    ws["A2"] = "营业利润率 (%)"
-    ws["B2"] = 0.21  # Row label says (%), General number_format -> 0.21 pct (0.21%), NOT 21%!
-    ws["C2"] = 0.21
-    ws["C2"].number_format = "0.0%"  # Wait: A2 in same row has `(%)` so row label takes priority over number_format
-    ws["A3"] = "净利率"
-    ws["B3"] = 0.21
-    ws["B3"].number_format = "0.0%"  # No unit in row 3 label -> unit from cell percentage number_format!
-    ws["D4"] = 18.55  # Row 4 has no row label unit; must NOT inherit `(%)` from A2!
-    ws["A5"] = "营业收入 (亿美元)"
-    ws["B5"] = 18.55  # 18.55 亿美元 (`USD_100mn`)
-    ws["A6"] = "分部收入 (in millions)"
-    ws["B6"] = 18.55  # Scale-only without currency (`unknown_mn`)
-    buf = io.BytesIO()
-    wb.save(buf)
-    xlsx_bytes = buf.getvalue()
+    xlsx_bytes = build_xlsx(
+        {
+            "Summary": {
+                "A2": "营业利润率 (%)",
+                "B2": 0.21,  # Row label says (%), General number_format -> 0.21 pct (0.21%), NOT 21%!
+                "C2": Cell(0.21, num_fmt="0.0%"),
+                "A3": "净利率",
+                "B3": Cell(0.21, num_fmt="0.0%"),  # No unit in row 3 label -> unit from cell percentage number_format!
+                "D4": 18.55,  # Row 4 has no row label unit; must NOT inherit `(%)` from A2!
+                "A5": "营业收入 (亿美元)",
+                "B5": 18.55,  # 18.55 亿美元 (`USD_100mn`)
+                "A6": "分部收入 (in millions)",
+                "B6": 18.55,  # Scale-only without currency (`unknown_mn`)
+            }
+        }
+    )
 
     # Check `read_model_cell` units directly
     val_b3, unit_b3, err_b3 = read_model_cell(xlsx_bytes, "Summary", "B3")
@@ -5290,29 +5224,14 @@ async def test_round5_publish_gates_all_statuses_corrupt_xml_and_referenced_mode
       across `reviewing`, `awaiting_pm` (including after `interrupt()`), `approved`, and `publishing`.
     """
     import hashlib
-    import io
-    import zipfile
-    import xml.etree.ElementTree as ET
-    import openpyxl
     from unittest.mock import create_autospec
+
     import src.dalton.auth as dalton_auth
     from src.dalton.database import knowledge as db_knowledge
     from src.dalton.database import publications as db_publications
     from src.dalton.publish import service as publish_svc
     from src.dalton.publish.match import count_unrecalculated_formulas, read_model_cell
-
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    assert ws is not None
-    ws.title = "Summary"
-    ws["A12"] = "营业收入 ($B)"
-    ws["B12"] = "=10+20"
-    buf = io.BytesIO()
-    wb.save(buf)
-    base_bytes = buf.getvalue()
-
-    ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
-    ET.register_namespace("", ns)
+    from tests.unit.dalton._xlsx_builder import Cell, build_xlsx
 
     def _build_xlsx(
         *,
@@ -5320,37 +5239,22 @@ async def test_round5_publish_gates_all_statuses_corrupt_xml_and_referenced_mode
         str_formula_mode: str = "empty_v",
         corrupt_sheet2: bool = False,
     ) -> bytes:
-        in_zf = zipfile.ZipFile(io.BytesIO(base_bytes), "r")
-        out_buf = io.BytesIO()
-        with zipfile.ZipFile(out_buf, "w", zipfile.ZIP_DEFLATED) as out_zf:
-            for item in in_zf.infolist():
-                data = in_zf.read(item.filename)
-                if item.filename == "xl/worksheets/sheet1.xml":
-                    root = ET.fromstring(data)
-                    for c_elem in root.iter(f"{{{ns}}}c"):
-                        if c_elem.attrib.get("r") == "B12" and b12_cached is not None:
-                            v_el = c_elem.find(f"{{{ns}}}v")
-                            if v_el is None:
-                                v_el = ET.SubElement(c_elem, f"{{{ns}}}v")
-                            v_el.text = b12_cached
-                    sheet_data = root.find(f"{{{ns}}}sheetData")
-                    assert sheet_data is not None
-                    row21 = ET.SubElement(sheet_data, f"{{{ns}}}row", {"r": "21"})
-                    c_str = ET.SubElement(
-                        row21, f"{{{ns}}}c", {"r": "C21", "t": "str"}
-                    )
-                    f_str = ET.SubElement(c_str, f"{{{ns}}}f")
-                    f_str.text = '""'
-                    if str_formula_mode == "empty_v":
-                        ET.SubElement(c_str, f"{{{ns}}}v")
-                    elif str_formula_mode == "missing_v":
-                        pass
-                    data = ET.tostring(root, encoding="utf-8", xml_declaration=True)
-                out_zf.writestr(item, data)
-            if corrupt_sheet2:
-                out_zf.writestr("xl/worksheets/sheet2.xml", b"<worksheet><broken")
-        in_zf.close()
-        return out_buf.getvalue()
+        c21_val: str | None = "" if str_formula_mode == "empty_v" else None
+        extra = (
+            {"xl/worksheets/sheet2.xml": b"<worksheet><broken"}
+            if corrupt_sheet2
+            else None
+        )
+        return build_xlsx(
+            {
+                "Summary": {
+                    "A12": "营业收入 ($B)",
+                    "B12": Cell(b12_cached, formula="=10+20"),
+                    "C21": Cell(c21_val, t="str", formula='""'),
+                }
+            },
+            extra_entries=extra,
+        )
 
     # Item 9: `<c t="str"><f>""</f><v/></c>` is valid cached empty string (0 unrecalculated)
     valid_empty_str_bytes = _build_xlsx(b12_cached="30.0", str_formula_mode="empty_v")
@@ -5682,13 +5586,12 @@ async def test_round6_pct_stored_as_ratio_literal_pct_100mn_currency_and_table_h
     5. Column header narrative numbers are extracted per sentence (only the marked sentence is exempt),
        and row/col header markers never bleed into the first sentence of adjacent cells.
     """
-    import io
-    import zipfile
     from src.dalton.publish import service as publish_svc
     from src.dalton.publish.match import (
         _is_pct_number_format,
         _parse_unit_from_number_format,
     )
+    from tests.unit.dalton._xlsx_builder import Cell, build_xlsx
 
     # --- Item 2: `0.00"%"`, `0.00\%`, `0.00%` format strings ---
     assert _is_pct_number_format('0.00"%"') is False
@@ -5704,55 +5607,16 @@ async def test_round6_pct_stored_as_ratio_literal_pct_100mn_currency_and_table_h
     # s="1" -> 0.00% (true percentage format, stored_as_ratio=True)
     # s="2" -> 0.00"%" (quoted literal "%", stored_as_ratio=False)
     # s="3" -> 0.00\% (escaped literal "\%", stored_as_ratio=False)
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w") as zf:
-        zf.writestr(
-            "xl/workbook.xml",
-            '<?xml version="1.0" encoding="UTF-8"?>'
-            '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
-            'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
-            '<sheets><sheet name="Summary" sheetId="1" r:id="rId1"/></sheets>'
-            "</workbook>",
-        )
-        zf.writestr(
-            "xl/_rels/workbook.xml.rels",
-            '<?xml version="1.0" encoding="UTF-8"?>'
-            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>'
-            "</Relationships>",
-        )
-        zf.writestr(
-            "xl/styles.xml",
-            '<?xml version="1.0" encoding="UTF-8"?>'
-            '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
-            '<numFmts count="3">'
-            '<numFmt numFmtId="164" formatCode="0.00%"/>'
-            '<numFmt numFmtId="165" formatCode="0.00&quot;%&quot;"/>'
-            r'<numFmt numFmtId="166" formatCode="0.00\%"/>'
-            "</numFmts>"
-            '<cellXfs count="4">'
-            '<xf numFmtId="0" fontId="0" fillId="0" borderId="0"/>'
-            '<xf numFmtId="164" fontId="0" fillId="0" fill="0" applyNumberFormat="1"/>'
-            '<xf numFmtId="165" fontId="0" fillId="0" fill="0" applyNumberFormat="1"/>'
-            '<xf numFmtId="166" fontId="0" fillId="0" fill="0" applyNumberFormat="1"/>'
-            "</cellXfs>"
-            "</styleSheet>",
-        )
-        zf.writestr(
-            "xl/worksheets/sheet1.xml",
-            '<?xml version="1.0" encoding="UTF-8"?>'
-            '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
-            "<sheetData>"
-            '<row r="10">'
-            '<c r="A10" t="inlineStr"><is><t>营业利润率 (%)</t></is></c>'
-            '<c r="B10" s="1"><v>0.21</v></c>'
-            '<c r="C10" s="2"><v>0.21</v></c>'
-            '<c r="D10" s="3"><v>0.21</v></c>'
-            "</row>"
-            "</sheetData>"
-            "</worksheet>",
-        )
-    xlsx_bytes = buf.getvalue()
+    xlsx_bytes = build_xlsx(
+        {
+            "Summary": {
+                "A10": Cell("营业利润率 (%)", t="inlineStr"),
+                "B10": Cell(0.21, num_fmt="0.00%"),
+                "C10": Cell(0.21, num_fmt='0.00"%"'),
+                "D10": Cell(0.21, num_fmt=r"0.00\%"),
+            }
+        }
+    )
 
     class _BytesBackendProto:
         async def adownload_file_bytes(self, path: str) -> bytes | None: ...
@@ -5888,66 +5752,26 @@ async def test_round7_pct_stored_as_ratio_overrides_unit_labels_and_per_share_bo
     2. Currency for a per-share amount comes ONLY from a currency token/word directly bound to that number or inside
        that number's own phrase — never by scanning the whole `fact`/paragraph text and picking by priority.
     """
-    import io
-    import zipfile
     from src.dalton.publish import service as publish_svc
     from src.dalton.publish.match import (
         UNIT_FORMAT_CONFLICT_WARNING,
         read_model_cell,
     )
+    from tests.unit.dalton._xlsx_builder import Cell, build_xlsx
 
     # --- Item 1(a): Sheet-level unit note ("单位：USD mn") + percentage format ("0.00%") + key_outputs.unit="pct" ---
     # --- Item 1(b): Row label with monetary unit ("营业利润率（亿美元）") + percentage format ("0.00%") ---
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w") as zf:
-        zf.writestr(
-            "xl/workbook.xml",
-            '<?xml version="1.0" encoding="UTF-8"?>'
-            '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
-            'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
-            '<sheets><sheet name="Summary" sheetId="1" r:id="rId1"/></sheets>'
-            "</workbook>",
-        )
-        zf.writestr(
-            "xl/_rels/workbook.xml.rels",
-            '<?xml version="1.0" encoding="UTF-8"?>'
-            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>'
-            "</Relationships>",
-        )
-        zf.writestr(
-            "xl/styles.xml",
-            '<?xml version="1.0" encoding="UTF-8"?>'
-            '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
-            '<numFmts count="1">'
-            '<numFmt numFmtId="164" formatCode="0.00%"/>'
-            "</numFmts>"
-            '<cellXfs count="2">'
-            '<xf numFmtId="0" fontId="0" fillId="0" borderId="0"/>'
-            '<xf numFmtId="164" fontId="0" fillId="0" fill="0" applyNumberFormat="1"/>'
-            "</cellXfs>"
-            "</styleSheet>",
-        )
-        zf.writestr(
-            "xl/worksheets/sheet1.xml",
-            '<?xml version="1.0" encoding="UTF-8"?>'
-            '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
-            "<sheetData>"
-            '<row r="1">'
-            '<c r="A1" t="inlineStr"><is><t>单位：USD mn</t></is></c>'
-            "</row>"
-            '<row r="10">'
-            '<c r="A10" t="inlineStr"><is><t>营业利润率</t></is></c>'
-            '<c r="B10" s="1"><v>0.21</v></c>'
-            "</row>"
-            '<row r="11">'
-            '<c r="A11" t="inlineStr"><is><t>营业利润率（亿美元）</t></is></c>'
-            '<c r="B11" s="1"><v>0.21</v></c>'
-            "</row>"
-            "</sheetData>"
-            "</worksheet>",
-        )
-    xlsx_bytes = buf.getvalue()
+    xlsx_bytes = build_xlsx(
+        {
+            "Summary": {
+                "A1": Cell("单位：USD mn", t="inlineStr"),
+                "A10": Cell("营业利润率", t="inlineStr"),
+                "B10": Cell(0.21, num_fmt="0.00%"),
+                "A11": Cell("营业利润率（亿美元）", t="inlineStr"),
+                "B11": Cell(0.21, num_fmt="0.00%"),
+            }
+        }
+    )
 
     # Direct read_model_cell checks for both 1(a) B10 (sheet-level "单位：USD mn") and 1(b) B11 (row label "亿美元")
     res_b10 = read_model_cell(xlsx_bytes, "Summary", "B10")
@@ -6177,10 +6001,9 @@ async def test_round8_tight_currency_binding_and_model_cell_per_share_currency_p
        model row label `EPS (USD per share)` with value `5.20` verifies `"5.20 美元/股"` through
        `read_model_cell -> _load_referenced_model_cells -> match_figures / aaudit_draft`.
     """
-    import io
-    import zipfile
     from src.dalton.publish import service as publish_svc
     from src.dalton.publish.match import read_model_cell
+    from tests.unit.dalton._xlsx_builder import Cell, build_xlsx
 
     # --- Item 1(a): `FY2025 diluted EPS was 5.20 and HKD cash totaled 100 million.` ---
     src_and_hkd = "FY2025 diluted EPS was 5.20 and HKD cash totaled 100 million."
@@ -6281,36 +6104,14 @@ async def test_round8_tight_currency_binding_and_model_cell_per_share_currency_p
         assert extracted[0].currency == exp_cur, expr
 
     # --- Item 2: Model row label `EPS (USD per share)` + value `5.20` full pipeline (read -> load -> verify) ---
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w") as zf:
-        zf.writestr(
-            "xl/workbook.xml",
-            '<?xml version="1.0" encoding="UTF-8"?>'
-            '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
-            'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
-            '<sheets><sheet name="Summary" sheetId="1" r:id="rId1"/></sheets>'
-            "</workbook>",
-        )
-        zf.writestr(
-            "xl/_rels/workbook.xml.rels",
-            '<?xml version="1.0" encoding="UTF-8"?>'
-            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>'
-            "</Relationships>",
-        )
-        zf.writestr(
-            "xl/worksheets/sheet1.xml",
-            '<?xml version="1.0" encoding="UTF-8"?>'
-            '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
-            "<sheetData>"
-            '<row r="10">'
-            '<c r="A10" t="inlineStr"><is><t>EPS (USD per share)</t></is></c>'
-            '<c r="B10"><v>5.20</v></c>'
-            "</row>"
-            "</sheetData>"
-            "</worksheet>",
-        )
-    xlsx_bytes = buf.getvalue()
+    xlsx_bytes = build_xlsx(
+        {
+            "Summary": {
+                "A10": Cell("EPS (USD per share)", t="inlineStr"),
+                "B10": 5.20,
+            }
+        }
+    )
 
     # Step 1: read_model_cell
     res_b10 = read_model_cell(xlsx_bytes, "Summary", "B10")
