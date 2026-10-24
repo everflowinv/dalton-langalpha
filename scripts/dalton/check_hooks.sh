@@ -82,6 +82,7 @@ ALLOWED_HOOKS=(
   "coverage-tracking"
   "workflow-resume"
   "workflow-journal"
+  "subagent-model-pin"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)
