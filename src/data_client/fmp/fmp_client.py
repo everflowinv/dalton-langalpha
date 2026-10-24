@@ -6,15 +6,20 @@ see :func:`_format_sector_change_pct`.
 
 import asyncio
 import json
+import logging
 import os
+import time  # DALTON-HOOK(market-data-fallback): epoch for the quota-reset header
 from collections import OrderedDict
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Union
+from zoneinfo import ZoneInfo
 
 import httpx
 from market_protocol import display_spelling, vendor_spelling
 
 _CACHE_MAX_SIZE = 512
+
+logger = logging.getLogger(__name__)
 
 
 def _vendor_symbol_params(params: Dict[str, Any]) -> Dict[str, Any]:
@@ -60,14 +65,159 @@ class FMPRequestError(Exception):
     request URL or headers; the key travels in the ``apikey`` header.
     """
 
-    def __init__(self, message: str, *, status_code: Optional[int] = None):
+    # DALTON-HOOK(market-data-fallback): reset_epoch is the quota-reset
+    # moment FMP's rate-limit headers named, as epoch seconds, so the quota
+    # breaker can TTL its Redis marker to the real reset.
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: Optional[int] = None,
+        reset_epoch: Optional[float] = None,
+    ):
         super().__init__(message)
         self.status_code = status_code
+        self.reset_epoch = reset_epoch
 
 
 def _today_utc() -> date:
     """UTC equivalent of ``date.today()`` — the server runs in UTC; local-clock dates drift."""
     return datetime.now(timezone.utc).date()
+
+
+# DALTON-HOOK(market-data-fallback): the epoch a 429/402 response names as the
+# quota reset, from whichever rate-limit header carries one.
+def _quota_reset_epoch(response: httpx.Response) -> Optional[float]:
+    reset = response.headers.get("x-ratelimit-reset")
+    if reset:
+        try:
+            return float(reset)
+        except ValueError:
+            return None
+    retry_after = response.headers.get("retry-after")
+    if retry_after and retry_after.isdigit():
+        # Seconds from now; whether that is the daily reset or a per-minute
+        # throttle is decided by the caller that owns the reset rule.
+        return time.time() + float(retry_after)
+    return None
+
+
+# ── Shared quota breaker ──────────────────────────────────────────────────
+# DALTON-HOOK(market-data-fallback): every FMP request — financial, news, the
+# market-data chain, the sandbox MCP servers — spends one shared ~250/day
+# free quota, so the "quota gone for the day" marker is read and written
+# here, at the one entry point they all share (_make_request).
+
+_QUOTA_KEY = "fmp:quota_exhausted"
+_ET = ZoneInfo("America/New_York")
+
+
+def _quota_store() -> Any:
+    """The backend's Redis cache client, or ``None`` where none can be reached.
+
+    The sandbox ships ``data_client`` without ``src.utils``, so the import
+    failing there means fail-open: request as if no marker existed, exactly
+    as before the breaker.
+    """
+    try:
+        from src.utils.cache import redis_cache
+
+        return redis_cache.get_cache_client()
+    except Exception:  # noqa: BLE001 — sandbox, or an unconfigured backend
+        return None
+
+
+def next_quota_reset(now: Optional[datetime] = None) -> datetime:
+    """When FMP's daily quota next resets: 3 PM US/Eastern.
+
+    FMP's FAQ fixes the free tier at 250 calls/day resetting daily at 3 PM
+    EST; America/New_York tracks the DST shift so the wall clock stays 15:00.
+    """
+    now = now or datetime.now(timezone.utc)
+    now_et = now.astimezone(_ET)
+    reset = now_et.replace(hour=15, minute=0, second=0, microsecond=0)
+    if reset <= now_et:
+        reset += timedelta(days=1)
+    return reset.astimezone(timezone.utc)
+
+
+class FmpQuotaExhausted(FMPRequestError):
+    """FMP's daily quota is gone; raised without a request while the marker holds.
+
+    Carries 429 so status-mapping callers (the MCP envelope, HTTP endpoints)
+    report rate limiting with the reset time instead of a generic failure.
+    """
+
+    def __init__(self, reset_at: Optional[datetime] = None) -> None:
+        when = (
+            reset_at.astimezone(_ET).strftime("%Y-%m-%d %H:%M US/Eastern")
+            if reset_at
+            else "the next 3 PM US/Eastern"
+        )
+        super().__init__(
+            f"FMP daily quota is exhausted; only FMP serves this data, "
+            f"and its quota resets at {when}",
+            status_code=429,
+        )
+        self.reset_at = reset_at
+
+
+async def quota_marker_reset() -> Optional[datetime]:
+    """The marker's recorded reset time, or ``None`` when no marker holds."""
+    store = _quota_store()
+    if store is None:
+        return None
+    try:
+        value = await store.get(_QUOTA_KEY)
+    except Exception:  # noqa: BLE101 — fail open, see the breaker note above
+        return None
+    if value is None:
+        return None
+    try:
+        return datetime.fromisoformat(str(value["reset_at"]))
+    except (KeyError, TypeError, ValueError):
+        # A marker that will not parse still means tripped; the documented
+        # reset is the best remaining answer for the error message.
+        return next_quota_reset()
+
+
+async def trip_quota_marker(status: int, reset_epoch: Optional[float] = None) -> None:
+    """Write the shared marker with a TTL ending at the quota reset.
+
+    The marker covers every FMP request, not just the endpoint that tripped
+    it, because the quota is one counter. *status* rides along for the log.
+    """
+    now = datetime.now(timezone.utc)
+    reset = next_quota_reset(now)
+    if reset_epoch is not None:
+        from_header = datetime.fromtimestamp(reset_epoch, tz=timezone.utc)
+        # Any reset the headers place within the coming two days is the real
+        # one; a value in the past or further out cannot name today's window.
+        if timedelta(0) < from_header - now < timedelta(hours=48):
+            reset = from_header
+    store = _quota_store()
+    if store is None:
+        return
+    try:
+        await store.set(
+            _QUOTA_KEY,
+            {"status": status, "reset_at": reset.isoformat()},
+            # 1s floor: a header reset seconds away is still honored to the
+            # second rather than rounded up to a minute of skipped FMP.
+            ttl=max(1, int((reset - now).total_seconds())),
+        )
+        logger.warning(
+            "fmp.quota_exhausted | status=%s reset_at=%s", status, reset.isoformat()
+        )
+    except Exception:  # noqa: BLE101 — fail open; the next 429 retries the trip
+        logger.warning("fmp.quota_marker_failed", exc_info=True)
+
+
+def _limit_reached(data: Any) -> bool:
+    """Whether a 200 body is FMP's "Limit Reach" quota notice, not data."""
+    return isinstance(data, dict) and "Limit Reach" in str(
+        data.get("Error Message") or ""
+    )
 
 
 def _format_sector_change_pct(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -156,6 +306,14 @@ class FMPClient:
             self._cache.move_to_end(cache_key)
             return self._cache[cache_key]
 
+        # DALTON-HOOK(market-data-fallback): the shared quota marker gates
+        # every request here — a tripped marker fails fast instead of paying
+        # for a call doomed to 429. A still-valid cached answer needs no
+        # request, so it was served above before this check.
+        reset_at = await quota_marker_reset()
+        if reset_at is not None:
+            raise FmpQuotaExhausted(reset_at)
+
         url = self._build_url(endpoint, version)
         client = await self._get_client()
 
@@ -163,8 +321,25 @@ class FMPClient:
             response = await client.get(
                 url, params=params, headers={"apikey": self.api_key}
             )
+            # DALTON-HOOK(market-data-fallback): the quota-exhausted notice can
+            # arrive inside any status's body, so look before
+            # raise_for_status(); 402 is exempt (that one is about the plan,
+            # not the shared counter). A body that is not JSON cannot be the
+            # notice — leave it to raise_for_status / the normal parse.
+            try:
+                data = _own_symbol_rows(response.json())
+            except ValueError:
+                data = None
+            if (
+                data is not None
+                and response.status_code != 402
+                and _limit_reached(data)
+            ):
+                await trip_quota_marker(429, _quota_reset_epoch(response))
+                raise FMPRequestError("FMP API limit reached", status_code=429)
             response.raise_for_status()
-            data = _own_symbol_rows(response.json())
+            if data is None:
+                data = _own_symbol_rows(response.json())
 
             if use_cache and data:
                 self._cache[cache_key] = data
@@ -178,9 +353,16 @@ class FMPClient:
         except httpx.HTTPStatusError as e:
             # Defense in depth: never stringify the httpx error. Its message
             # embeds the request URL; auth must never depend on URL hygiene.
+            # DALTON-HOOK(market-data-fallback): a 429 exhausts the one
+            # shared quota, so it trips the marker for every worker; a 402
+            # may only mean this endpoint sits outside the plan, so it fails
+            # this call alone.
+            if e.response.status_code == 429:
+                await trip_quota_marker(429, _quota_reset_epoch(e.response))
             raise FMPRequestError(
                 f"FMP API request failed ({e.response.status_code})",
                 status_code=e.response.status_code,
+                reset_epoch=_quota_reset_epoch(e.response),
             )
         except httpx.TimeoutException:
             raise FMPRequestError("FMP API request timed out")

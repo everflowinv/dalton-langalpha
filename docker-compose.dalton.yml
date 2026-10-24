@@ -35,6 +35,7 @@ services:
       DALTON_WEB_SEARCH_BRIDGE_URL: "${DALTON_WEB_SEARCH_BRIDGE_URL:-http://host.docker.internal:8961}"
     volumes:
       - ./agent_config.dalton.yaml:/app/agent_config.dalton.yaml:ro
+      - ./config.dalton.yaml:/app/config.dalton.yaml:ro
       - ./workflows:/app/workflows:ro
       - ./config/dalton:/app/config/dalton:ro
       - ./var/dalton:/app/var/dalton

@@ -366,6 +366,21 @@ class MarketDataProvider:
         last_exc: Exception | None = None
         first_empty: tuple[list[dict[str, Any]], str, bool] | None = None
         for entry in candidates:
+            # DALTON-HOOK(market-data-fallback): the shared quota marker means
+            # every FMP request fails without a network call, so skip the fmp
+            # entry up front; a later provider may still answer.
+            if entry.name == "fmp":
+                from .fmp.fmp_client import FmpQuotaExhausted, quota_marker_reset
+
+                reset_at = await quota_marker_reset()
+                if reset_at is not None:
+                    logger.warning(
+                        "market_data.fmp.quota_exhausted | symbol=%s reset_at=%s",
+                        symbol,
+                        reset_at.isoformat(),
+                    )
+                    last_exc = FmpQuotaExhausted(reset_at)
+                    continue
             try:
                 result = await getattr(entry.source, method)(symbol=symbol, **kwargs)
                 if isinstance(result, FetchResult):

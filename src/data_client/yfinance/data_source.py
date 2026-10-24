@@ -1,7 +1,9 @@
 """MarketDataSource implementation backed by yfinance.
 
-Free fallback provider — requires no API key. Used when both ginlix-data
-and FMP are unavailable (e.g. OSS / self-hosted deployments).
+Free provider requiring no API key. In the market-data chain it is the
+fallback ahead of FMP wherever both can serve
+(DALTON-HOOK(market-data-fallback)), and the only source in deployments
+without ginlix-data or an FMP key.
 """
 
 from __future__ import annotations

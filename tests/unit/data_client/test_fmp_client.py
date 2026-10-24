@@ -181,3 +181,288 @@ class TestFmpVendorSpelling:
 
         assert [s["symbol"] for s in snaps] == ["AAPL", "MSFT"]
         assert asked == [["AAPL", "MSFT"]]
+
+
+# ---------------------------------------------------------------------------
+# Shared quota breaker (DALTON-HOOK(market-data-fallback))
+# ---------------------------------------------------------------------------
+
+from datetime import timedelta  # noqa: E402
+from typing import Any  # noqa: E402
+from unittest.mock import create_autospec  # noqa: E402
+
+from src.data_client.fmp import fmp_client as fmp_mod  # noqa: E402
+from src.data_client.fmp.fmp_client import (  # noqa: E402
+    FmpQuotaExhausted,
+    next_quota_reset,
+    quota_marker_reset,
+    trip_quota_marker,
+)
+
+
+class _MarkerRedis:
+    """The breaker's Redis surface: a dict holding (value, ttl) per key."""
+
+    def __init__(self, monkeypatch):
+        from src.utils.cache import redis_cache
+        from src.utils.cache.redis_cache import RedisCacheClient
+
+        self.store: dict[str, tuple[Any, Any]] = {}
+        cache = create_autospec(RedisCacheClient, instance=True)
+        cache.get.side_effect = self._get
+        cache.set.side_effect = self._set
+        monkeypatch.setattr(
+            redis_cache,
+            "get_cache_client",
+            create_autospec(redis_cache.get_cache_client, return_value=cache),
+        )
+
+    async def _get(self, key):
+        item = self.store.get(key)
+        return item[0] if item else None
+
+    async def _set(self, key, value, ttl=None):
+        self.store[key] = (value, ttl)
+        return True
+
+
+class _FrozenDatetime(fmp_mod.datetime):
+    """datetime subclass whose now() is pinned, for deterministic TTLs."""
+
+    frozen = fmp_mod.datetime(2026, 10, 24, 12, 0, tzinfo=fmp_mod.timezone.utc)
+
+    @classmethod
+    def now(cls, tz=None):
+        return cls.frozen if tz is not None else cls.frozen.replace(tzinfo=None)
+
+
+@pytest.fixture
+def marker_redis(monkeypatch):
+    return _MarkerRedis(monkeypatch)
+
+
+@pytest.fixture
+def frozen_now(monkeypatch):
+    monkeypatch.setattr(fmp_mod, "datetime", _FrozenDatetime)
+    return _FrozenDatetime.frozen
+
+
+def _http_mock(response: httpx.Response) -> Any:
+    http = create_autospec(httpx.AsyncClient, instance=True)
+    http.is_closed = False  # else _get_client rebuilds a real client
+    http.get.return_value = response
+    return http
+
+
+def _response(status: int, *, headers: dict[str, str] | None = None, json=None):
+    return httpx.Response(
+        status,
+        headers=headers or {},
+        json=json,
+        request=httpx.Request("GET", "https://financialmodelingprep.com/stable/quote"),
+    )
+
+
+class TestQuotaBreaker:
+    @pytest.mark.asyncio
+    async def test_marker_present_fails_fast_without_a_request(self, marker_redis):
+        marker_redis.store["fmp:quota_exhausted"] = (
+            {"status": 429, "reset_at": "2026-10-24T19:00:00+00:00"},
+            3600,
+        )
+        client = FMPClient(api_key=_SECRET)
+        client._client = _http_mock(_response(200, json=[{"symbol": "AAPL"}]))
+        try:
+            with pytest.raises(FmpQuotaExhausted) as exc:
+                await client.get_quote("AAPL")
+        finally:
+            await client.close()
+
+        client._client.get.assert_not_awaited()
+        assert exc.value.status_code == 429
+        assert "resets at 2026-10-24 15:00 US/Eastern" in str(exc.value)
+
+    @pytest.mark.asyncio
+    async def test_http_429_trips_the_shared_marker(self, marker_redis, frozen_now):
+        reset_epoch = (_FrozenDatetime.frozen + timedelta(hours=3)).timestamp()
+        client = FMPClient(api_key=_SECRET)
+        client._client = _http_mock(
+            _response(429, headers={"X-RateLimit-Reset": str(reset_epoch)})
+        )
+        try:
+            with pytest.raises(FMPRequestError) as exc:
+                await client.get_quote("AAPL")
+        finally:
+            await client.close()
+
+        assert exc.value.status_code == 429
+        value, ttl = marker_redis.store["fmp:quota_exhausted"]
+        assert value["status"] == 429
+        assert ttl == 3 * 3600
+
+    @pytest.mark.asyncio
+    async def test_a_header_reset_under_two_hours_is_still_honored(
+        self, marker_redis, frozen_now
+    ):
+        # A 90-minute window is a valid reset: only past or >48h values are not.
+        reset_epoch = (_FrozenDatetime.frozen + timedelta(minutes=90)).timestamp()
+        await trip_quota_marker(429, reset_epoch)
+        _, ttl = marker_redis.store["fmp:quota_exhausted"]
+        assert ttl == 90 * 60
+
+    @pytest.mark.asyncio
+    async def test_http_402_fails_the_call_without_tripping(self, marker_redis):
+        client = FMPClient(api_key=_SECRET)
+        client._client = _http_mock(_response(402))
+        try:
+            with pytest.raises(FMPRequestError) as exc:
+                await client.get_quote("AAPL")
+        finally:
+            await client.close()
+
+        assert exc.value.status_code == 402
+        assert marker_redis.store == {}
+
+    @pytest.mark.asyncio
+    async def test_limit_reach_body_trips_the_marker(self, marker_redis):
+        client = FMPClient(api_key=_SECRET)
+        client._client = _http_mock(
+            _response(
+                200,
+                json={"Error Message": "Limit Reach. Please upgrade your plan."},
+            )
+        )
+        try:
+            with pytest.raises(FMPRequestError) as exc:
+                await client.get_quote("AAPL")
+        finally:
+            await client.close()
+
+        assert exc.value.status_code == 429
+        assert marker_redis.store["fmp:quota_exhausted"][0]["status"] == 429
+
+    @pytest.mark.asyncio
+    async def test_default_ttl_runs_to_the_documented_reset(
+        self, marker_redis, frozen_now
+    ):
+        await trip_quota_marker(429)
+        value, ttl = marker_redis.store["fmp:quota_exhausted"]
+        # 12:00 UTC → 19:00 UTC (15:00 ET) the same day.
+        assert ttl == 7 * 3600
+        assert await quota_marker_reset() == next_quota_reset(frozen_now)
+
+        _FrozenDatetime.frozen = frozen_now + timedelta(hours=8)  # 16:00 ET
+        try:
+            await trip_quota_marker(429)
+            _, ttl = marker_redis.store["fmp:quota_exhausted"]
+            # The 3 PM slot has passed; the marker runs to tomorrow's.
+            assert ttl == 23 * 3600
+        finally:
+            _FrozenDatetime.frozen = frozen_now  # the class is shared; unpollute
+
+    def test_next_quota_reset_crosses_the_3pm_slot(self):
+        from datetime import datetime, timezone
+
+        reset = datetime(2026, 10, 24, 19, 0, tzinfo=timezone.utc)
+        before = datetime(2026, 10, 24, 18, 59, tzinfo=timezone.utc)  # 14:59 ET
+        assert next_quota_reset(before) == reset
+        after = datetime(2026, 10, 24, 19, 1, tzinfo=timezone.utc)  # 15:01 ET
+        assert next_quota_reset(after) == reset + timedelta(days=1)
+
+    @pytest.mark.asyncio
+    async def test_marker_reset_at_defaults_a_malformed_marker(
+        self, marker_redis, frozen_now
+    ):
+        assert await quota_marker_reset() is None  # no marker yet
+        marker_redis.store["fmp:quota_exhausted"] = ("garbage", 60)
+        assert await quota_marker_reset() == next_quota_reset(frozen_now)
+
+    @pytest.mark.asyncio
+    async def test_no_redis_fails_open(self, monkeypatch):
+        """Sandbox: no Redis import, no marker — the request proceeds as before."""
+        monkeypatch.setattr(
+            fmp_mod,
+            "_quota_store",
+            create_autospec(fmp_mod._quota_store, return_value=None),
+        )
+        client = FMPClient(api_key=_SECRET)
+        client._client = _http_mock(_response(200, json=[{"symbol": "AAPL"}]))
+        try:
+            assert await client.get_quote("AAPL") == [{"symbol": "AAPL"}]
+        finally:
+            await client.close()
+        client._client.get.assert_awaited_once()
+
+        # A 429 with nowhere to write the marker still fails its own call.
+        client2 = FMPClient(api_key=_SECRET)
+        client2._client = _http_mock(_response(429))
+        try:
+            with pytest.raises(FMPRequestError) as exc:
+                await client2.get_quote("AAPL")
+        finally:
+            await client2.close()
+        assert exc.value.status_code == 429
+
+    @pytest.mark.asyncio
+    async def test_limit_reach_in_a_403_body_trips_the_marker(self, marker_redis):
+        client = FMPClient(api_key=_SECRET)
+        client._client = _http_mock(
+            _response(
+                403,
+                json={"Error Message": "Limit Reach. Please upgrade your plan."},
+            )
+        )
+        try:
+            with pytest.raises(FMPRequestError) as exc:
+                await client.get_quote("AAPL")
+        finally:
+            await client.close()
+
+        assert exc.value.status_code == 429
+        assert marker_redis.store["fmp:quota_exhausted"][0]["status"] == 429
+
+    @pytest.mark.asyncio
+    async def test_limit_reach_in_a_402_body_does_not_trip(self, marker_redis):
+        client = FMPClient(api_key=_SECRET)
+        client._client = _http_mock(
+            _response(
+                402,
+                json={"Error Message": "Limit Reach. Please upgrade your plan."},
+            )
+        )
+        try:
+            with pytest.raises(FMPRequestError):
+                await client.get_quote("AAPL")
+        finally:
+            await client.close()
+
+        assert marker_redis.store == {}
+
+    @pytest.mark.asyncio
+    async def test_a_30_second_reset_header_sets_a_30_second_ttl(
+        self, marker_redis, frozen_now
+    ):
+        reset_epoch = (_FrozenDatetime.frozen + timedelta(seconds=30)).timestamp()
+        await trip_quota_marker(429, reset_epoch)
+        _, ttl = marker_redis.store["fmp:quota_exhausted"]
+        assert ttl == 30
+
+    @pytest.mark.asyncio
+    async def test_limit_reach_carries_the_header_reset(self, marker_redis, frozen_now):
+        reset_epoch = (_FrozenDatetime.frozen + timedelta(minutes=90)).timestamp()
+        client = FMPClient(api_key=_SECRET)
+        client._client = _http_mock(
+            _response(
+                200,
+                headers={"X-RateLimit-Reset": str(reset_epoch)},
+                json={"Error Message": "Limit Reach. Please upgrade your plan."},
+            )
+        )
+        try:
+            with pytest.raises(FMPRequestError):
+                await client.get_quote("AAPL")
+        finally:
+            await client.close()
+
+        _, ttl = marker_redis.store["fmp:quota_exhausted"]
+        assert ttl == 90 * 60

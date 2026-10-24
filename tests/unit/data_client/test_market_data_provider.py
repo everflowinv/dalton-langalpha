@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from unittest.mock import create_autospec  # DALTON-HOOK(market-data-fallback)
+
 import pytest
 
 from src.data_client.ginlix_data.directory import fill_quote_names
@@ -719,13 +721,19 @@ class TestCapabilityRouting:
 
     def _chain(self):
         ginlix = FakeSource("ginlix")
+        ts = FakeSource("tushare")
         yf = FakeSource("yf")
         fmp = FakeSource("fmp")
+        # Mirrors config.yaml's market_data.providers order.
+        # DALTON-HOOK(market-data-fallback)
         provider = MarketDataProvider([
             ProviderEntry("ginlix-data", ginlix, {"us"}),
+            ProviderEntry(
+                "tushare", ts, {"cn"}, intraday_markets=set(), snapshot_markets={"cn"}
+            ),
             ProviderEntry("yfinance", yf, set(), intraday_markets={"non-us"}),
-            ProviderEntry("fmp", fmp, {"all"}),
             ProviderEntry("yfinance", yf, {"all"}),
+            ProviderEntry("fmp", fmp, {"all"}),
         ])
         return provider, ginlix, yf, fmp
 
@@ -744,12 +752,13 @@ class TestCapabilityRouting:
         assert not yf.calls and not fmp.calls
 
     @pytest.mark.asyncio
-    async def test_non_us_daily_still_fmp_first(self):
-        """The empty base `markets` keeps the priority slot out of daily routing."""
-        provider, _, yf, _ = self._chain()
+    async def test_non_us_daily_is_yfinance_first(self):
+        # DALTON-HOOK(market-data-fallback)
+        """The catch-all yfinance entry answers non-US daily ahead of FMP."""
+        provider, _, yf, fmp = self._chain()
         _, source, _ = await provider.get_daily_with_source("0700.HK")
-        assert source == "fmp"
-        assert not yf.calls
+        assert source == "yfinance"
+        assert not fmp.calls
 
     @pytest.mark.asyncio
     async def test_non_us_intraday_falls_back_to_fmp(self):
@@ -757,8 +766,8 @@ class TestCapabilityRouting:
         fmp = FakeSource("fmp")
         provider = MarketDataProvider([
             ProviderEntry("yfinance", yf, set(), intraday_markets={"non-us"}),
-            ProviderEntry("fmp", fmp, {"all"}),
             ProviderEntry("yfinance", yf, {"all"}),
+            ProviderEntry("fmp", fmp, {"all"}),
         ])
         _, source, _ = await provider.get_intraday_with_source("0700.HK", interval="1hour")
         assert source == "fmp"
@@ -776,20 +785,115 @@ class TestCapabilityRouting:
 
     def test_source_names_deduplicated_in_order(self):
         provider, *_ = self._chain()
-        assert provider.source_names == ["ginlix-data", "yfinance", "fmp"]
+        assert provider.source_names == ["ginlix-data", "tushare", "yfinance", "fmp"]
 
     def test_source_names_for_intraday_prefers_yfinance_over_catch_all(self):
         """Non-US intraday: the priority slot puts yfinance ahead of fmp."""
         provider, *_ = self._chain()
         assert provider.source_names_for("0700.HK", "intraday") == ["yfinance", "fmp"]
 
-    def test_source_names_for_snapshot_excludes_empty_coverage_slot(self):
-        """US snapshot: the empty-coverage priority slot is skipped, so yfinance
-        appears once in its catch-all position (last), not ahead of fmp."""
+    def test_source_names_for_snapshot_puts_yfinance_ahead_of_fmp(self):
+        # DALTON-HOOK(market-data-fallback)
+        """US snapshot: the empty-coverage priority slot is skipped, and the
+        catch-all yfinance entry answers before fmp."""
         provider, *_ = self._chain()
         names = provider.source_names_for("AAPL", "snapshot")
-        assert names == ["ginlix-data", "fmp", "yfinance"]
+        assert names == ["ginlix-data", "yfinance", "fmp"]
         assert names.count("yfinance") == 1
+
+    @staticmethod
+    def _real_config_entries():
+        """Provider entries built from whatever config the environment layers."""
+        from src.config.settings import get_market_data_providers
+
+        entries: list[ProviderEntry] = []
+        sources: dict[str, FakeSource] = {}
+        for cfg in get_market_data_providers():
+            name = cfg["name"]
+            if name not in sources:
+                sources[name] = FakeSource(name)
+            entries.append(ProviderEntry(
+                name=name,
+                source=sources[name],
+                markets=set(cfg.get("markets", ["all"])),
+                intraday_markets=(
+                    set(cfg["intraday_markets"])
+                    if cfg.get("intraday_markets") is not None else None
+                ),
+                daily_markets=(
+                    set(cfg["daily_markets"])
+                    if cfg.get("daily_markets") is not None else None
+                ),
+                snapshot_markets=(
+                    set(cfg["snapshot_markets"])
+                    if cfg.get("snapshot_markets") is not None else None
+                ),
+            ))
+        return MarketDataProvider(entries)
+
+    def test_real_config_puts_yfinance_before_fmp_for_us(self, monkeypatch):
+        # DALTON-HOOK(market-data-fallback)
+        """config.dalton.yaml (APP_ENV=dalton): US snapshot and daily try free
+        yfinance ahead of FMP."""
+        from src.config.core import clear_config_cache
+
+        monkeypatch.setenv("APP_ENV", "dalton")
+        clear_config_cache()
+        try:
+            provider = self._real_config_entries()
+            for capability in ("snapshot", "daily"):
+                names = provider.source_names_for("AAPL", capability)
+                assert names.index("yfinance") < names.index("fmp"), capability
+        finally:
+            clear_config_cache()
+
+    def test_real_config_without_app_env_keeps_upstream_order(self, monkeypatch):
+        # DALTON-HOOK(market-data-fallback)
+        """No APP_ENV: config.yaml alone, FMP catches all before yfinance."""
+        from src.config.core import clear_config_cache
+
+        monkeypatch.delenv("APP_ENV", raising=False)
+        clear_config_cache()
+        try:
+            provider = self._real_config_entries()
+            for capability in ("snapshot", "daily"):
+                names = provider.source_names_for("AAPL", capability)
+                assert names.index("fmp") < names.index("yfinance"), capability
+        finally:
+            clear_config_cache()
+
+    @pytest.mark.asyncio
+    async def test_quota_marker_skips_the_fmp_entry(self, monkeypatch):
+        """A tripped FMP quota marker routes around the fmp entry: a healthy
+        earlier provider answers without FMP, and a failing one surfaces the
+        marker error instead of a doomed FMP request."""
+        from src.data_client.fmp import fmp_client as fmp_mod
+        from src.data_client.fmp.fmp_client import FmpQuotaExhausted
+
+        from datetime import datetime, timezone
+
+        marker = create_autospec(
+            fmp_mod.quota_marker_reset,
+            return_value=datetime(2026, 10, 24, 19, 0, tzinfo=timezone.utc),
+        )
+        monkeypatch.setattr(fmp_mod, "quota_marker_reset", marker)
+
+        yf = FakeSource("yf")
+        fmp = FakeSource("fmp")
+        provider = MarketDataProvider([
+            ProviderEntry("yfinance", yf, {"all"}),
+            ProviderEntry("fmp", fmp, {"all"}),
+        ])
+        _, source, _ = await provider.get_daily_with_source("0700.HK")
+        assert source == "yfinance"
+        assert not fmp.calls
+
+        failing = MarketDataProvider([
+            ProviderEntry("yfinance", FakeSource("yf", fail=True), {"all"}),
+            ProviderEntry("fmp", FakeSource("fmp"), {"all"}),
+        ])
+        with pytest.raises(FmpQuotaExhausted):
+            await failing.get_daily("0700.HK")
 
     def test_non_us_token_never_matches_us(self):
         from src.data_client.market_data_provider import _market_matches
