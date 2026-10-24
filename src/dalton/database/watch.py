@@ -289,7 +289,9 @@ async def resolve_signals(
     signal_refs: Optional[list[str]] = None,
     workspace_id: Optional[str] = None,
     ticker: Optional[str] = None,
+    probe: Optional[str] = None,
     resolved_by: Optional[str] = None,
+    resolution_note: Optional[str] = None,
     execution_id: Optional[str] = None,
 ) -> int:
     """Mark signals as resolved by UUID, signal_key / ref suffix, or woken_execution_id (G4.2)."""
@@ -312,6 +314,8 @@ async def resolve_signals(
     patch_obj: dict[str, Any] = {"status": "resolved"}
     if resolved_by:
         patch_obj["resolved_by"] = str(resolved_by)
+    if resolution_note and str(resolution_note).strip():
+        patch_obj["resolution_note"] = str(resolution_note).strip()
 
     total_updated = 0
     async with get_db_connection() as conn:
@@ -359,6 +363,9 @@ async def resolve_signals(
                 if ticker:
                     scope_clauses.append("ticker = %s")
                     params.append(ticker.upper())
+                if probe and str(probe).strip():
+                    scope_clauses.append("probe = %s")
+                    params.append(str(probe).strip())
                 scope_clauses.append(
                     "(signal_key = %s OR signal_key LIKE %s OR signal_key LIKE %s "
                     "OR payload->>'id' = %s OR payload->>'accession_number' = %s OR payload->>'doc_id' = %s)"
