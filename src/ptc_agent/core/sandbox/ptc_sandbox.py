@@ -382,13 +382,15 @@ class PTCSandbox:
         # Built-ins ONLY: a user server's env must never be injected into the
         # sandbox os.environ — its ${vault:NAME} refs resolve vault-only at
         # call time, so injecting host values here would leak platform creds.
-        for server in self._builtin_servers():
+        builtin_servers = self._builtin_servers()
+        for server in builtin_servers:
             if not server.enabled:
                 continue
             if hasattr(server, "env") and server.env:
                 for key, value in server.env.items():
-                    if key == "INTERNAL_SERVICE_TOKEN":
-                        continue  # Never inject platform token into sandbox
+                    # DALTON-HOOK(bridge-admin-token)
+                    if key in ("INTERNAL_SERVICE_TOKEN", "DALTON_BRIDGE_ADMIN_TOKEN"):
+                        continue  # Never inject platform or bridge admin token into sandbox
                     if key in platform_secret_bindings:
                         # Daytona injects an opaque placeholder for managed
                         # platform Secrets. Never put the real host value in
@@ -396,6 +398,8 @@ class PTCSandbox:
                         continue
                     if value.startswith("${") and value.endswith("}"):
                         var_name = value[2:-1]
+                        if var_name in ("INTERNAL_SERVICE_TOKEN", "DALTON_BRIDGE_ADMIN_TOKEN"):
+                            continue
                         resolved_value = os.getenv(var_name)
                         if resolved_value:
                             env_vars[key] = resolved_value
@@ -417,7 +421,9 @@ class PTCSandbox:
                 env_vars["GIT_COMMITTER_NAME"] = bot_name
                 env_vars["GIT_COMMITTER_EMAIL"] = bot_email
 
-        return env_vars
+        from src.dalton.settings import sanitize_sandbox_env_vars  # DALTON-HOOK(bridge-admin-token)
+
+        return sanitize_sandbox_env_vars(env_vars, builtin_servers)
 
     async def setup_sandbox_workspace(
         self,

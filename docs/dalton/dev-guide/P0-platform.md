@@ -1879,6 +1879,7 @@ async def get_run_charge_usd(run_ref: str) -> Decimal | None
 | market-data-fallback | `src/data_client/registry.py`、`src/data_client/fmp/fmp_client.py`、`src/data_client/market_data_provider.py`、`tests/unit/dalton/test_market_data_fallback.py` | 财务数据槽位改为 `src/dalton/market_data_fallback.FallbackFinancialSource`：yfinance 优先，yfinance 抛错或答空（空列表/字典、无价或零价报价行）时转 FMP，FMP 也失败或为空则返回 yfinance 的原结果不抛错；只有 FMP 能给的（收入分部、带日期板块表现）仍走 FMP。共享熔断在 `FMPClient._make_request`：HTTP 429 或（除 402 外任意状态的）响应体含 "Limit Reach" 时写 Redis 标记（TTL 到重置点——响应头给出的未来 48h 内即采用，否则美东 15:00，最低 1 秒），402 只失败本次不熔断；标记存在时 FMP 请求直接抛 `FmpQuotaExhausted` 不发请求，行情链跳过 fmp 条目；沙箱无 Redis 时 fail-open | 各 2–7 |
 | yfinance-cache | `src/data_client/yfinance/__init__.py` | 导入时调用 `src/dalton/yfinance_cache.configure_process_cache`：每个进程的 yfinance sqlite 缓存（tz/cookie/ISIN）放到 `<tmp>/langalpha-yfinance/<pid>`，`--workers N` 并发打开同一库时 `PRAGMA journal_mode=wal` 报 `database is locked` 的根因消除 | 约 5 |
 | hermetic-prebuilt-workflows | `tests/unit/ptc_agent/agent/backends/test_composite_folder_search.py` | 测试把内置工作流层置空（仓库 `workflows/` 里有 Dalton 的预置工作流），断言只看用户层的 `brief.js` | 约 8 |
+| bridge-admin-token | `src/ptc_agent/core/sandbox/ptc_sandbox.py`、`src/ptc_agent/core/tool_generator.py` | 沙箱输出边界（`_build_sandbox_env_vars` 与 `generate_client_config`）统一按值拦截 `DALTON_BRIDGE_ADMIN_TOKEN`（含环境变量、URL、headers、args），移除命中项、仅记录项名告警并将对应 MCP 服务配置标记为不可用 | 各 2–6 |
 
 细节见 P0D 的 P0-D.2（超时）、P0-D.3（来源显示降级版）和 P1.1（skill 注册）。PK 篇的钩子列在 PK §5；`check_hooks.sh` 比对的是"本附录 + PK §5"的并集。P3 的来源定位改动（P0-D.3b）落地时再并入本表。
 

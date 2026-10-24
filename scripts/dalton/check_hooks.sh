@@ -90,6 +90,7 @@ ALLOWED_HOOKS=(
   "yfinance-cache"
   "user-defaults"
   "workspace-duplicate-guard"
+  "bridge-admin-token"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

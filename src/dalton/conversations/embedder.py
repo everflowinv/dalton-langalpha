@@ -16,8 +16,8 @@ import urllib.request
 from typing import Any
 
 from src.dalton.settings import (
+    get_dalton_bridge_admin_token,
     get_dalton_bridge_embed_url,
-    get_dalton_bridge_token,
     get_dalton_settings,
 )
 
@@ -60,7 +60,7 @@ async def embed_texts_via_bridge(
         return [], default_model
 
     url = embed_url or get_dalton_bridge_embed_url()
-    token = bridge_token if bridge_token is not None else get_dalton_bridge_token()
+    token = bridge_token if bridge_token is not None else get_dalton_bridge_admin_token()
     model_used = get_dalton_settings().conversations.embedding_model_preferred
     all_vecs: list[list[float]] = []
 

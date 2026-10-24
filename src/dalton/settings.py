@@ -589,6 +589,168 @@ def get_dalton_bridge_token() -> str:
     return ""
 
 
+def get_dalton_bridge_admin_token() -> str:
+    """Return ``DALTON_BRIDGE_ADMIN_TOKEN`` from environment (empty string if unset)."""
+    return os.getenv("DALTON_BRIDGE_ADMIN_TOKEN", "").strip()
+
+
+def sanitize_sandbox_env_vars(
+    env_vars: dict[str, str],
+    servers: Any = None,
+) -> dict[str, str]:
+    """Strip any sandbox environment variable whose key or value contains ``DALTON_BRIDGE_ADMIN_TOKEN``
+    and mark any MCP server carrying the admin token as unavailable (``enabled = False``).
+    Skipped when ``DALTON_BRIDGE_ADMIN_TOKEN`` is empty.
+    """
+    admin_token = get_dalton_bridge_admin_token()
+    if not admin_token:
+        return env_vars
+
+    if servers:
+        for server in servers:
+            srv_name = getattr(server, "name", None) or "<unknown>"
+            leaked = False
+            srv_url = getattr(server, "url", None)
+            if isinstance(srv_url, str) and admin_token in srv_url:
+                leaked = True
+            srv_cmd = getattr(server, "command", None)
+            if isinstance(srv_cmd, str) and admin_token in srv_cmd:
+                leaked = True
+            for arg_val in getattr(server, "args", None) or ():
+                if admin_token in str(arg_val):
+                    leaked = True
+            for hk, hv in (getattr(server, "headers", None) or {}).items():
+                if admin_token in str(hk) or admin_token in str(hv):
+                    leaked = True
+            for ek, ev in (getattr(server, "env", None) or {}).items():
+                if admin_token in str(ek) or admin_token in str(ev):
+                    leaked = True
+                    env_vars.pop(str(ek), None)
+                    logger.warning(
+                        "Removed sandbox env var containing bridge admin token and marked server unavailable: server=%s item=env.%s",
+                        srv_name,
+                        ek,
+                    )
+            if leaked:
+                try:
+                    server.enabled = False
+                except Exception:
+                    pass
+
+    for k, v in list(env_vars.items()):
+        if admin_token in str(k) or admin_token in str(v):
+            env_vars.pop(k, None)
+            logger.warning(
+                "Removed sandbox env var containing bridge admin token: item=%s",
+                k,
+            )
+
+    return env_vars
+
+
+def sanitize_mcp_client_config_server(
+    server: Any,
+    entry: dict[str, Any],
+) -> dict[str, Any]:
+    """Strip any MCP client config field (``url``, ``headers``, ``command``, ``args``, ``env``)
+    whose string content contains ``DALTON_BRIDGE_ADMIN_TOKEN`` and mark the server unavailable
+    so it cannot start with the admin token. Skipped when ``DALTON_BRIDGE_ADMIN_TOKEN`` is empty.
+    """
+    admin_token = get_dalton_bridge_admin_token()
+    if not admin_token:
+        return entry
+
+    srv_name = getattr(server, "name", None) or "<unknown>"
+    leaked_items: list[str] = []
+
+    raw_url = getattr(server, "url", None)
+    ent_url = entry.get("url")
+    if (isinstance(raw_url, str) and admin_token in raw_url) or (
+        isinstance(ent_url, str) and admin_token in ent_url
+    ):
+        entry.pop("url", None)
+        leaked_items.append("url")
+
+    raw_headers = dict(getattr(server, "headers", None) or {})
+    ent_headers = entry.get("headers") if isinstance(entry.get("headers"), dict) else {}
+    for hk in list(dict.fromkeys([*raw_headers.keys(), *ent_headers.keys()])):
+        hv_raw = raw_headers.get(hk, "")
+        hv_ent = ent_headers.get(hk, "")
+        if (
+            admin_token in str(hk)
+            or admin_token in str(hv_raw)
+            or admin_token in str(hv_ent)
+        ):
+            if isinstance(entry.get("headers"), dict):
+                entry["headers"].pop(hk, None)
+            leaked_items.append(f"headers.{hk}")
+
+    raw_cmd = getattr(server, "command", None)
+    ent_cmd = entry.get("command")
+    if (isinstance(raw_cmd, str) and admin_token in raw_cmd) or (
+        isinstance(ent_cmd, str) and admin_token in ent_cmd
+    ):
+        entry.pop("command", None)
+        leaked_items.append("command")
+
+    raw_args = list(getattr(server, "args", None) or [])
+    for idx, arg_val in enumerate(raw_args):
+        if admin_token in str(arg_val):
+            leaked_items.append(f"args[{idx}]")
+    if isinstance(entry.get("args"), list):
+        for idx, arg_val in enumerate(entry["args"]):
+            if admin_token in str(arg_val) and f"args[{idx}]" not in leaked_items:
+                leaked_items.append(f"args[{idx}]")
+        entry["args"] = [a for a in entry["args"] if admin_token not in str(a)]
+
+    raw_env = dict(getattr(server, "env", None) or {})
+    ent_env = entry.get("env") if isinstance(entry.get("env"), dict) else {}
+    for ek in list(dict.fromkeys([*raw_env.keys(), *ent_env.keys()])):
+        ev_raw = raw_env.get(ek, "")
+        ev_ent = ent_env.get(ek, "")
+        if (
+            admin_token in str(ek)
+            or admin_token in str(ev_raw)
+            or admin_token in str(ev_ent)
+        ):
+            if isinstance(entry.get("env"), dict):
+                entry["env"].pop(ek, None)
+            if isinstance(entry.get("env_keys"), list):
+                entry["env_keys"] = [
+                    k
+                    for k in entry["env_keys"]
+                    if k != ek and admin_token not in str(k)
+                ]
+            leaked_items.append(f"env.{ek}")
+    if isinstance(entry.get("env_keys"), list):
+        for ek in list(entry["env_keys"]):
+            if admin_token in str(ek):
+                entry["env_keys"].remove(ek)
+                if f"env.{ek}" not in leaked_items:
+                    leaked_items.append(f"env.{ek}")
+
+    if leaked_items:
+        for item_name in leaked_items:
+            logger.warning(
+                "Removed MCP client config item containing bridge admin token and marked server unavailable: server=%s item=%s",
+                srv_name,
+                item_name,
+            )
+        try:
+            server.enabled = False
+        except Exception:
+            pass
+        entry["enabled"] = False
+        entry["available"] = False
+        entry.pop("url", None)
+        if "command" in entry:
+            entry["command"] = ""
+        if "args" in entry:
+            entry["args"] = []
+
+    return entry
+
+
 def get_dalton_bridge_base_url(host: str | None = None) -> str:
     """Return the host bridge base URL (e.g. ``http://127.0.0.1:8960``) for host job management."""
     resolved_host = host or HOST_IP or "127.0.0.1"
