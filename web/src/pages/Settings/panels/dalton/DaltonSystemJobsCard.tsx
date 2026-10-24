@@ -26,7 +26,7 @@ import {
 const SCOPE_LABELS: Record<DaltonSystemJobScope, { title: string; subtitle: string }> = {
   company: {
     title: '公司自动跟踪',
-    subtitle: '每家覆盖公司的四项标准自主跟踪任务（盯盘 / 每日增量 / 涨跌 ±4% 触发）',
+    subtitle: '每家覆盖公司的四项标准自主跟踪任务（盯盘 / 内部资料增量 / 涨跌 ±4% 触发）',
   },
   home: {
     title: '全局任务（Home）',

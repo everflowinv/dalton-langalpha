@@ -467,7 +467,7 @@ async def _build_company_job_entry(
         "scope": "company",
         "title": f"{ticker} 自动跟踪",
         "description": str(tracking.get("label") or ""),
-        "schedule": "盯盘每 30 分钟 · 每日增量 21:30 · 涨跌 ±4% 触发",
+        "schedule": "盯盘每 30 分钟 · 内部资料北京时间 11:00 扫描，Core 每交易日、Watch 每周 · 涨跌 ±4% 触发",
         "workspace_id": str(workspace_id),
         "ticker": ticker,
         "tier": tracking.get("tier"),

@@ -8,7 +8,7 @@ collect.py — 每晚 thesis 增量包采集与状态提交脚本（PS.11）
      - 读取覆盖阈值（优先 <workspace_dir>/research/tracker/thresholds.json，回退 config/default-thresholds.json）
      - 拉取一致预期快照并写入 <workspace_dir>/data/consensus/<YYYY-MM-DD_HHMM>.json
      - 与上一份一致预期快照比对（若 fetched_at 相同则跳过对比），生成 deltas 与 auto_flags
-     - 检索未在 seen.json 中的内部库文档（sales-notes, tmtb, funda-ai, company-wiki）、AlphaEngine（前推3天）、SEC filing（前推2天）
+     - 检索未在 seen.json 中的六个内部来源（company-wiki, guidepoint, funda-ai, sales-notes, tmtb, alphaengine）与 SEC filing（前推2天）
      - 写入 <workspace_dir>/research/tracker/<run_id>/packet.json 与 packet.md
      - 注意：collect 阶段绝不修改 seen.json
 
@@ -29,7 +29,6 @@ import json
 import math
 import os
 import re
-import subprocess
 import sys
 import urllib.request
 from datetime import date, datetime, timedelta
@@ -56,7 +55,9 @@ DEFAULT_SEC_FORMS = [
     "SC 13G",
 ]
 
-INTERNAL_ROUTES = ["sales-notes", "tmtb", "funda-ai", "company-wiki"]
+INTERNAL_ROUTES = ["company-wiki", "guidepoint", "funda-ai", "sales-notes", "tmtb"]
+ALL_INTERNAL_SOURCES = [*INTERNAL_ROUTES, "alphaengine"]
+_GP_LIBRARY_TS_RE = re.compile(r"library_ts:([A-Za-z0-9-]+)")
 
 
 def now_et() -> datetime:
@@ -341,7 +342,7 @@ def call_bridge_jsonrpc(tool_name: str, arguments: dict[str, Any], timeout: int 
     """若环境配置了 DALTON_RESEARCHDATA_URL，直接经 HTTP 桥调用 researchdata 工具。"""
     bridge_url = os.environ.get("DALTON_RESEARCHDATA_URL", "").strip()
     if not bridge_url:
-        return {"ok": False, "status": "bridge_url_not_configured"}
+        return {"ok": False, "status": "bridge_url_not_configured", "error": "bridge_url_not_configured"}
 
     payload = {
         "jsonrpc": "2.0",
@@ -361,14 +362,239 @@ def call_bridge_jsonrpc(tool_name: str, arguments: dict[str, Any], timeout: int 
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = json.loads(resp.read().decode("utf-8", "replace"))
+        if isinstance(raw, dict) and raw.get("error"):
+            return {"ok": False, "status": "rpc_error", "error": str(raw.get("error"))}
         res = raw.get("result") or {}
         content = res.get("content") or []
         if content and isinstance(content[0], dict) and content[0].get("text"):
             data = json.loads(content[0]["text"])
-            return {"ok": not res.get("isError", False), "data": data}
-        return {"ok": False, "error": raw.get("error") or "empty_bridge_content"}
+            if isinstance(data, dict):
+                payload_ok = data.get("ok")
+                status_str = str(data.get("status") or "")
+                is_ok = (
+                    not bool(res.get("isError", False))
+                    and payload_ok is not False
+                    and status_str not in ("error", "failed")
+                )
+                err_msg = (
+                    None
+                    if is_ok
+                    else str(data.get("error") or data.get("reason") or data.get("message") or status_str or "bridge_call_failed")
+                )
+                return {
+                    "ok": is_ok,
+                    "status": status_str or ("ok" if is_ok else "error"),
+                    "error": err_msg,
+                    "data": data,
+                }
+            return {"ok": not bool(res.get("isError", False)), "data": data}
+        return {"ok": False, "status": "empty_bridge_content", "error": str(raw.get("error") or "empty_bridge_content")}
     except Exception as e:
-        return {"ok": False, "error": str(e)[:300]}
+        return {"ok": False, "status": "exception", "error": str(e)[:300]}
+
+
+def build_guidepoint_query(meta: dict[str, Any]) -> str:
+    """构造 Guidepoint 检索词：合并公司名与 ticker（去重）。"""
+    ticker = str(meta.get("ticker") or "").strip()
+    name = str(meta.get("name") or "").strip()
+    parts = [p for p in dict.fromkeys([ticker, name]) if p]
+    return " ".join(parts) or ticker
+
+
+def build_internal_route_request(
+    route: str,
+    meta: dict[str, Any],
+    since: str,
+    until: str,
+) -> tuple[str, dict[str, Any]]:
+    """构造六个内部研究来源（company-wiki, guidepoint, funda-ai, sales-notes, tmtb, alphaengine）的请求参数。"""
+    aliases = meta.get("aliases") or [meta.get("ticker") or "", meta.get("name") or ""]
+    query_str = " ".join(str(a) for a in aliases if a).strip() or str(meta.get("ticker") or "")
+
+    if route == "company-wiki":
+        return (
+            "research",
+            {
+                "route": "company-wiki",
+                "operation": "list",
+                "limit": 50,
+                "params": {"indexed_since": since, "media": "text"},
+            },
+        )
+    if route == "guidepoint":
+        return (
+            "research",
+            {
+                "route": "guidepoint",
+                "operation": "search_library",
+                "query": build_guidepoint_query(meta),
+                "start": since,
+                "end": until,
+                "limit": 20,
+            },
+        )
+    if route == "alphaengine":
+        ae_start = (date.fromisoformat(since) - timedelta(days=3)).isoformat()
+        return (
+            "research",
+            {
+                "route": "alphaengine",
+                "operation": "search_library",
+                "query": str(meta.get("name") or meta.get("ticker") or ""),
+                "start": ae_start,
+                "end": until,
+                "limit": 20,
+                "params": {"sort": "relevance"},
+            },
+        )
+    if route in ("sales-notes", "tmtb", "funda-ai"):
+        return (
+            "research",
+            {
+                "route": route,
+                "operation": "search",
+                "query": query_str,
+                "start": since,
+                "end": until,
+                "limit": 40,
+                "params": {"media": "text", "search_mode": "keyword"},
+            },
+        )
+    raise ValueError(f"Unsupported internal route: {route}")
+
+
+def build_sec_filing_request(ticker: str, form: str, limit: int = 5) -> tuple[str, dict[str, Any]]:
+    """构造 SEC list-filings 请求的 (tool_name, arguments)。"""
+    return (
+        "finance",
+        {
+            "route": "sec",
+            "operation": "list-filings",
+            "ticker": ticker,
+            "form": form,
+            "limit": limit,
+        },
+    )
+
+
+def _extract_route_items(data: Any) -> list[dict[str, Any]]:
+    """从 bridge 响应（含 MCP 代理 structuredContent / data 嵌套层）提取条目列表。"""
+    if isinstance(data, list):
+        return [x for x in data if isinstance(x, dict)]
+    if not isinstance(data, dict):
+        return []
+    for key in ("results", "items", "documents", "rows"):
+        val = data.get(key)
+        if isinstance(val, list):
+            return [x for x in val if isinstance(x, dict)]
+    sc = data.get("structuredContent")
+    if isinstance(sc, dict):
+        for key in ("results", "data", "items", "documents"):
+            val = sc.get(key)
+            if isinstance(val, list):
+                return [x for x in val if isinstance(x, dict)]
+    inner = data.get("data")
+    if isinstance(inner, list):
+        return [x for x in inner if isinstance(x, dict)]
+    if isinstance(inner, dict):
+        items = _extract_route_items(inner)
+        if items:
+            return items
+        content = inner.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and isinstance(block.get("text"), str):
+                    try:
+                        parsed = json.loads(block["text"])
+                        nested = _extract_route_items(parsed)
+                        if nested:
+                            return nested
+                    except Exception:
+                        continue
+    return []
+
+
+def _normalize_guidepoint_doc_id(r: dict[str, Any]) -> str | None:
+    """将 Guidepoint 文档 ID 规范化为与 seen.json 一致的 `guidepoint:<id>`。"""
+    raw = str(
+        r.get("document_id")
+        or r.get("id")
+        or r.get("transcript_id")
+        or r.get("doc_id")
+        or ""
+    ).strip()
+    if not raw:
+        for field in ("snippet", "summary", "title", "transcript_name"):
+            m = _GP_LIBRARY_TS_RE.search(str(r.get(field) or ""))
+            if m:
+                raw = m.group(1)
+                break
+    if not raw:
+        return None
+    m = _GP_LIBRARY_TS_RE.search(raw)
+    if m:
+        raw = m.group(1)
+    if raw.startswith("guidepoint:"):
+        return raw
+    return f"guidepoint:{raw}"
+
+
+def summarize_source_failures(
+    internal_data: dict[str, Any],
+    ae_data: dict[str, Any] | None = None,
+    sec_data: dict[str, Any] | None = None,
+) -> list[dict[str, str]]:
+    """汇总所有 ok=False 的取数来源及原因，供短路门禁与 packet/汇总输出使用。"""
+    failures: list[dict[str, str]] = []
+    seen_sources: set[str] = set()
+    int_status = (internal_data or {}).get("status") or {}
+    if isinstance(int_status, dict):
+        for route, st in int_status.items():
+            if isinstance(st, dict) and not st.get("ok", False):
+                reason = str(st.get("error") or st.get("status") or "unknown_error")
+                failures.append({"source": str(route), "error": reason})
+                seen_sources.add(str(route))
+
+    ae_status = (ae_data or {}).get("status") or []
+    if isinstance(ae_status, list) and "alphaengine" not in seen_sources:
+        for st in ae_status:
+            if isinstance(st, dict) and not st.get("skipped") and not st.get("ok", False):
+                reason = str(st.get("error") or st.get("status") or "unknown_error")
+                failures.append({"source": "alphaengine", "error": reason})
+                seen_sources.add("alphaengine")
+                break
+
+    sec_status = (sec_data or {}).get("status") or []
+    if isinstance(sec_status, list):
+        failed_forms = [
+            f"{st.get('form')}:{st.get('error') or st.get('status') or 'failed'}"
+            for st in sec_status
+            if isinstance(st, dict) and not st.get("ok", False)
+        ]
+        if failed_forms:
+            failures.append({"source": "sec", "error": "; ".join(failed_forms)})
+
+    return failures
+
+
+def can_short_circuit(
+    *,
+    auto_flags: list[str],
+    internal_data: dict[str, Any],
+    ae_data: dict[str, Any],
+    sec_data: dict[str, Any],
+) -> bool:
+    """短路判断：要求所有来源都 ok:true，且 auto_flags 为空，且所有来源都是 0 新增。"""
+    if summarize_source_failures(internal_data, ae_data, sec_data):
+        return False
+    if auto_flags:
+        return False
+    total_new = (
+        len((internal_data or {}).get("new") or {})
+        + len((ae_data or {}).get("new") or {})
+        + len((sec_data or {}).get("new") or {})
+    )
+    return total_new == 0
 
 
 def collect_internal_and_ae(
@@ -378,24 +604,30 @@ def collect_internal_and_ae(
     seen: set[str],
     skip_ae: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """采集内部库（sales-notes, tmtb, funda-ai, company-wiki）与 AlphaEngine 新增文档。"""
+    """采集六个内部研究来源（company-wiki, guidepoint, funda-ai, sales-notes, tmtb, alphaengine）新增文档。"""
     internal_new: dict[str, Any] = {}
     internal_status: dict[str, Any] = {}
     ae_new: dict[str, Any] = {}
     ae_status: list[dict[str, Any]] = []
 
-    query_str = " ".join(meta["aliases"])
     pat = re.compile("|".join(re.escape(a) for a in meta["aliases"] if a), re.IGNORECASE)
 
     for route in INTERNAL_ROUTES:
+        tool_name, req_args = build_internal_route_request(route, meta, since, until)
+        res = call_bridge_jsonrpc(tool_name, req_args)
+        data = res.get("data") if isinstance(res.get("data"), dict) else {}
+        items = _extract_route_items(data)
+        ok = bool(res.get("ok", False))
+        err_msg = res.get("error") or data.get("error")
+        status_val = data.get("status") or res.get("status")
+
         if route == "company-wiki":
-            res = call_bridge_jsonrpc(
-                "research",
-                {"route": "company-wiki", "operation": "list", "limit": 50, "params": {"indexed_since": since, "media": "text"}},
-            )
-            data = res.get("data") or {}
-            items = data.get("results") or []
-            internal_status[route] = {"ok": res.get("ok", False), "listed": len(items), "status": data.get("status")}
+            internal_status[route] = {
+                "ok": ok,
+                "listed": len(items),
+                "status": status_val,
+                **({"error": err_msg} if err_msg else {}),
+            }
             for r in items:
                 did = r.get("document_id")
                 if not did or did in seen:
@@ -412,22 +644,42 @@ def collect_internal_and_ae(
                         "from": r.get("original_source"),
                         "location": r.get("location"),
                     }
+        elif route == "guidepoint":
+            internal_status[route] = {
+                "ok": ok,
+                "returned": len(items),
+                "status": status_val,
+                **({"error": err_msg} if err_msg else {}),
+            }
+            for r in items:
+                did = _normalize_guidepoint_doc_id(r)
+                if not did or did in seen:
+                    continue
+                item_date = str(
+                    r.get("date")
+                    or r.get("published_at")
+                    or r.get("publish_date")
+                    or r.get("created_at")
+                    or ""
+                ).strip()
+                date_prefix = item_date[:10]
+                if re.match(r"^\d{4}-\d{2}-\d{2}$", date_prefix):
+                    if date_prefix < since or date_prefix > until:
+                        continue
+                internal_new[did] = {
+                    "route": "guidepoint",
+                    "title": r.get("transcript_name") or r.get("title") or r.get("headline"),
+                    "date": date_prefix or item_date or None,
+                    "from": r.get("original_source") or r.get("source") or "Guidepoint",
+                    "snippet": str(r.get("snippet") or r.get("summary") or "")[:600],
+                }
         else:
-            res = call_bridge_jsonrpc(
-                "research",
-                {
-                    "route": route,
-                    "operation": "search",
-                    "query": query_str,
-                    "start": since,
-                    "end": until,
-                    "limit": 40,
-                    "params": {"media": "text", "search_mode": "keyword"},
-                },
-            )
-            data = res.get("data") or {}
-            items = data.get("results") or []
-            internal_status[route] = {"ok": res.get("ok", False), "returned": len(items), "status": data.get("status")}
+            internal_status[route] = {
+                "ok": ok,
+                "returned": len(items),
+                "status": status_val,
+                **({"error": err_msg} if err_msg else {}),
+            }
             for r in items:
                 did = r.get("document_id")
                 if not did or str(did).startswith("image:") or did in seen:
@@ -441,26 +693,31 @@ def collect_internal_and_ae(
                 }
 
     if skip_ae:
-        ae_status.append({"skipped": "--no-ae"})
+        ae_status.append({"skipped": "--no-ae", "ok": True})
+        internal_status["alphaengine"] = {"ok": True, "skipped": "--no-ae", "status": "skipped"}
     else:
-        ae_start = (date.fromisoformat(since) - timedelta(days=3)).isoformat()
-        res = call_bridge_jsonrpc(
-            "research",
-            {
-                "route": "alphaengine",
-                "operation": "search_library",
-                "query": meta["name"],
-                "start": ae_start,
-                "end": until,
-                "limit": 20,
-                "params": {"sort": "relevance", "document_categories": ["sell_side_report", "sell_side_comment"]},
-            },
-        )
-        data = res.get("data") or {}
-        items = data.get("results") or []
-        ae_status.append({"query": meta["name"], "ok": res.get("ok", False), "returned": len(items), "error": res.get("error")})
+        tool_name, req_args = build_internal_route_request("alphaengine", meta, since, until)
+        res = call_bridge_jsonrpc(tool_name, req_args)
+        data = res.get("data") if isinstance(res.get("data"), dict) else {}
+        items = _extract_route_items(data)
+        ok = bool(res.get("ok", False))
+        err_msg = res.get("error") or data.get("error")
+        status_val = data.get("status") or res.get("status")
+        ae_status.append({
+            "query": meta["name"],
+            "ok": ok,
+            "returned": len(items),
+            "status": status_val,
+            "error": err_msg,
+        })
+        internal_status["alphaengine"] = {
+            "ok": ok,
+            "returned": len(items),
+            "status": status_val,
+            **({"error": err_msg} if err_msg else {}),
+        }
         for r in items:
-            doc_id = r.get("doc_id") or r.get("document_id")
+            doc_id = r.get("doc_id") or r.get("document_id") or r.get("id")
             if not doc_id:
                 continue
             did = f"alphaengine:{doc_id}" if not str(doc_id).startswith("alphaengine:") else str(doc_id)
@@ -483,13 +740,18 @@ def collect_sec_filings(meta: dict[str, Any], since: str, seen: set[str]) -> dic
     found: dict[str, Any] = {}
     status: list[dict[str, Any]] = []
     for form in meta["sec_forms"]:
-        res = call_bridge_jsonrpc(
-            "finance",
-            {"route": "sec", "operation": "list-filings", "ticker": meta["ticker"], "form": form, "limit": 5},
-        )
-        data = res.get("data") or {}
+        tool_name, req_args = build_sec_filing_request(meta["ticker"], form, limit=5)
+        res = call_bridge_jsonrpc(tool_name, req_args)
+        data = res.get("data") if isinstance(res.get("data"), dict) else {}
         rows = data.get("rows") or []
-        status.append({"form": form, "ok": res.get("ok", False), "count": len(rows)})
+        ok = bool(res.get("ok", False))
+        err_msg = res.get("error") or data.get("error")
+        status.append({
+            "form": form,
+            "ok": ok,
+            "count": len(rows),
+            **({"error": err_msg} if err_msg else {}),
+        })
         for r in rows:
             acc_raw = r.get("accession_no") or r.get("accession")
             if not acc_raw:
@@ -508,15 +770,31 @@ def collect_sec_filings(meta: dict[str, Any], since: str, seen: set[str]) -> dic
 
 def render_packet_md(pk: dict[str, Any]) -> str:
     """将 packet.json 渲染为结构化 packet.md 供分析师审阅。"""
+    internal_obj = pk.get("internal") or {}
+    ae_obj = pk.get("alphaengine") or {}
+    sec_obj = pk.get("sec") or {}
+    failures = pk.get("failed_sources")
+    if not isinstance(failures, list):
+        failures = summarize_source_failures(internal_obj, ae_obj, sec_obj)
+    all_ok = len(failures) == 0
+
     lines = [
         f"# {pk['ticker']} 每晚增量数据包（{pk['run_id']}）",
         "",
         f"- **窗口**：{pk['since']} 至 {pk['until']}（美东）",
         f"- **上次成功提交**：{pk.get('last_committed_at') or '首次运行'}",
         f"- **一致预期快照文件**：`{pk.get('snapshot_file')}`",
+        f"- **全量来源取数状态（`all_sources_ok`）**：`{str(all_ok).lower()}`",
+        f"- **是否允许短路结束（`short_circuit_eligible`）**：`{str(bool(pk.get('short_circuit_eligible', False))).lower()}`",
+    ]
+    if failures:
+        lines.append("- **取数失败来源（严禁当成“本轮无新文档”，严禁走短路分支）**：")
+        for f_item in failures:
+            lines.append(f"  - ⚠️ `{f_item.get('source')}` 本轮取数失败（{f_item.get('error')}）")
+    lines.extend([
         "",
         "## 一、自动触发提示（`auto_flags`，是否重要需按 `materiality.md` 判断）",
-    ]
+    ])
     if pk.get("auto_flags"):
         for f in pk["auto_flags"]:
             lines.append(f"- {f}")
@@ -559,31 +837,54 @@ def render_packet_md(pk: dict[str, Any]) -> str:
         lines.append(f"- **目标价**：均值 {pt.get('mean')}｜中位数 {pt.get('median')}｜区间 {pt.get('low')} 至 {pt.get('high')}")
     lines.append(f"- **修正差值（deltas）**：`{json.dumps(pk.get('deltas') or {}, ensure_ascii=False)}`")
 
-    lines.extend(["", "## 三、内部库新文档（sales-notes / tmtb / funda-ai / company-wiki）"])
-    int_new = (pk.get("internal") or {}).get("new") or {}
+    lines.extend(["", "## 三、内部库新文档（company-wiki / guidepoint / funda-ai / sales-notes / tmtb）"])
+    int_status = internal_obj.get("status") if isinstance(internal_obj.get("status"), dict) else {}
+    if int_status:
+        lines.append(f"- **内部来源状态（`internal_status`）**：`{json.dumps(int_status, ensure_ascii=False)}`")
+        for r_name in INTERNAL_ROUTES:
+            st = int_status.get(r_name)
+            if isinstance(st, dict) and not st.get("ok", False):
+                lines.append(f"- ⚠️ **{r_name} 本轮取数失败（{st.get('error') or st.get('status') or 'unknown_error'}）**")
+    int_new = internal_obj.get("new") or {}
     if int_new:
         for did, info in int_new.items():
             lines.append(f"- `{did}`｜{info.get('date')}｜{info.get('route')}｜{info.get('title')}｜{info.get('from') or ''}")
             if info.get("snippet"):
                 lines.append(f"  - 摘要：{info['snippet']}")
+    elif any(
+        isinstance(int_status.get(r_name), dict) and not int_status[r_name].get("ok", False)
+        for r_name in INTERNAL_ROUTES
+    ):
+        lines.append("- 本节存在取数失败来源（见上方告警），不可视为“本轮无新文档”")
     else:
         lines.append("- 无")
 
     lines.extend(["", "## 四、AlphaEngine 新研报与点评"])
-    ae_new = (pk.get("alphaengine") or {}).get("new") or {}
+    ae_st_entry = int_status.get("alphaengine")
+    if isinstance(ae_st_entry, dict) and not ae_st_entry.get("ok", False):
+        lines.append(f"- ⚠️ **alphaengine 本轮取数失败（{ae_st_entry.get('error') or ae_st_entry.get('status') or 'unknown_error'}）**")
+    ae_new = ae_obj.get("new") or {}
     if ae_new:
         for did, info in ae_new.items():
             lines.append(f"- `{did}`｜{info.get('publish_time')}｜{info.get('title')}")
             if info.get("snippet"):
                 lines.append(f"  - 摘要：{info['snippet']}")
+    elif isinstance(ae_st_entry, dict) and not ae_st_entry.get("ok", False):
+        lines.append("- alphaengine 本轮取数失败，不可视为“本轮无新文档”")
     else:
         lines.append("- 无")
 
     lines.extend(["", "## 五、SEC 新公告"])
-    sec_new = (pk.get("sec") or {}).get("new") or {}
+    sec_status = sec_obj.get("status") if isinstance(sec_obj.get("status"), list) else []
+    failed_sec = [st for st in sec_status if isinstance(st, dict) and not st.get("ok", False)]
+    for st in failed_sec:
+        lines.append(f"- ⚠️ **sec ({st.get('form')}) 本轮取数失败（{st.get('error') or 'failed'}）**")
+    sec_new = sec_obj.get("new") or {}
     if sec_new:
         for acc, info in sec_new.items():
             lines.append(f"- `{acc}`｜{info.get('form')}｜提交日 {info.get('filing_date')}｜报告期 {info.get('report_date') or ''}")
+    elif failed_sec:
+        lines.append("- SEC 本轮取数失败，不可视为“本轮无新公告”")
     else:
         lines.append("- 无")
 
@@ -646,6 +947,15 @@ def cmd_collect(args: argparse.Namespace) -> int:
         sec_new_count=len(sec_data["new"]),
     )
 
+    failed_sources = summarize_source_failures(internal_data, ae_data, sec_data)
+    all_sources_ok = len(failed_sources) == 0
+    short_circuit_eligible = can_short_circuit(
+        auto_flags=auto_flags,
+        internal_data=internal_data,
+        ae_data=ae_data,
+        sec_data=sec_data,
+    )
+
     rel_snap = str(snap_path.relative_to(ws_dir))
     packet = {
         "ticker": ticker,
@@ -658,6 +968,10 @@ def cmd_collect(args: argparse.Namespace) -> int:
         "consensus": cons,
         "deltas": deltas,
         "auto_flags": auto_flags,
+        "all_sources_ok": all_sources_ok,
+        "failed_sources": failed_sources,
+        "short_circuit_eligible": short_circuit_eligible,
+        "internal_status": internal_data["status"],
         "internal": internal_data,
         "alphaengine": ae_data,
         "sec": sec_data,
@@ -670,7 +984,10 @@ def cmd_collect(args: argparse.Namespace) -> int:
     pkt_md_path.write_text(render_packet_md(packet), encoding="utf-8")
 
     summary = {
-        "ok": True,
+        "ok": all_sources_ok,
+        "all_sources_ok": all_sources_ok,
+        "failed_sources": failed_sources,
+        "short_circuit_eligible": short_circuit_eligible,
         "ticker": ticker,
         "run_id": run_id,
         "since": since,
@@ -679,6 +996,9 @@ def cmd_collect(args: argparse.Namespace) -> int:
         "packet_md": str(pkt_md_path.relative_to(ws_dir)),
         "snapshot_file": rel_snap,
         "auto_flags": auto_flags,
+        "internal_status": internal_data["status"],
+        "alphaengine_status": ae_data["status"],
+        "sec_status": sec_data["status"],
         "counts": {
             "internal": len(internal_data["new"]),
             "alphaengine": len(ae_data["new"]),

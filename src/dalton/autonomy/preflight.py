@@ -29,7 +29,6 @@ from src.dalton.autonomy.probes.calendar import probe_calendar
 from src.dalton.autonomy.probes.cnhk import probe_cnhk_filings
 from src.dalton.autonomy.probes.director import probe_director
 from src.dalton.autonomy.probes.earnings import probe_earnings
-from src.dalton.autonomy.probes.internal import probe_internal
 from src.dalton.autonomy.probes.sec import probe_sec
 from src.dalton.database import watch as watch_db
 from src.dalton.llm.assist import assist_json
@@ -75,7 +74,7 @@ def is_direct_wake_signal(sig: dict[str, Any] | ProbeSignal) -> bool:
     - Agenda due items (catalyst / validation / open_question / pm_question / next_action) -> direct wake
     - Earnings window (T-3 / T0 / T+1 / release) -> direct wake
     - Director / calendar / schedule / price triggers -> direct wake
-    All other SEC forms (8-K without 2.02, Form 4, 13D/G, 6-K, DEF 14A), cnhk P2 filings, and internal docs go to LLM triage.
+    All other SEC forms (8-K without 2.02, Form 4, 13D/G, 6-K, DEF 14A) and cnhk P2 filings go to LLM triage.
     """
     if isinstance(sig, ProbeSignal):
         probe = sig.probe
@@ -106,9 +105,6 @@ def is_direct_wake_signal(sig: dict[str, Any] | ProbeSignal) -> bool:
     if probe == "cnhk":
         prio = str(priority or payload.get("priority") or "").strip().upper()
         return prio == "P1"
-
-    if probe == "internal":
-        return False
 
     return True
 
@@ -175,7 +171,7 @@ async def _triage_signals_with_llm(
 
     system_prompt = (
         "你是 Dalton 投研系统的零噪音预检分诊器（preflight.triage）。"
-        "请判断给定的 SEC 披露（非 2.02 的 8-K、Form 4、13D/G、6-K、DEF 14A）或内部研究文献是否具有实质投研价值、"
+        "请判断给定的 SEC 披露（非 2.02 的 8-K、Form 4、13D/G、6-K、DEF 14A）或港股/A 股公告是否具有实质投研价值、"
         "值得唤醒分析师沙箱开展深度取证。例行无实质内容的小额高管减持或纯行政公告应返回 wake=false；"
         "涉及业绩指引、重大合同、并购、核心高管变动、大股东增减持或与核心论点/待查问题相关的信号应返回 wake=true。"
     )
@@ -652,7 +648,7 @@ async def _preflight_check_inner(
             )
         )
     else:
-        # Standard company_watch: run the 5 company probes (agenda, sec, cnhk, earnings, internal) with time-based backoff
+        # Standard company_watch: run the 4 company probes (agenda, sec, cnhk, earnings) with time-based backoff
         t_sym = ticker or "UNKNOWN"
         eff_ws_id = workspace_id if persist else None
         probe_runners = [
@@ -690,15 +686,6 @@ async def _preflight_check_inner(
                     watch_state=st,
                     workspace_id=eff_ws_id,
                     agenda_doc=agenda_doc_override,
-                ),
-            ),
-            (
-                "internal",
-                lambda st: probe_internal(
-                    ticker=t_sym,
-                    watch_state=st,
-                    workspace_id=eff_ws_id,
-                    allow_network=persist,
                 ),
             ),
         ]

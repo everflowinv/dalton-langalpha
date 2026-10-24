@@ -191,6 +191,26 @@ def _resolve_bridge_url() -> str:
     return bridge_url
 
 
+def build_cnhk_filings_request(
+    ticker: str,
+    start: str,
+    end: str,
+    limit: int = 50,
+) -> tuple[str, dict[str, Any]]:
+    """Build the bridge tool name and arguments for CN/HK CNINFO filings probe."""
+    return (
+        "finance",
+        {
+            "route": "cn-hk",
+            "operation": "filings",
+            "ticker": ticker,
+            "start": start,
+            "end": end,
+            "limit": limit,
+        },
+    )
+
+
 def _fetch_bridge_route_sync(
     *,
     bridge_url: str,
@@ -213,20 +233,19 @@ def _fetch_bridge_route_sync(
             )
         return {"ok": False, "error": "bridge_unconfigured"}
 
+    tool_name, arguments = build_cnhk_filings_request(
+        ticker=ticker,
+        start=start,
+        end=end,
+        limit=limit,
+    )
     payload = {
         "jsonrpc": "2.0",
         "id": f"probe-cnhk-filings-{ticker}",
         "method": "tools/call",
         "params": {
-            "name": "finance",
-            "arguments": {
-                "route": "cn-hk",
-                "operation": "filings",
-                "ticker": ticker,
-                "start": start,
-                "end": end,
-                "limit": limit,
-            },
+            "name": tool_name,
+            "arguments": arguments,
         },
     }
     data_bytes = json.dumps(payload).encode("utf-8")

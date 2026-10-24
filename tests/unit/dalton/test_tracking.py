@@ -15,6 +15,7 @@ from fastapi.testclient import TestClient
 from psycopg import AsyncConnection
 
 import src.dalton.autonomy.schedule as schedule_mod
+import src.dalton.autonomy.tracking as tracking_mod
 from src.dalton.app import dalton_router
 from src.dalton.autonomy.schedule import schedule_dalton_automation_helper
 from src.dalton.autonomy.tracking import (
@@ -24,6 +25,7 @@ from src.dalton.autonomy.tracking import (
     disable_tracking,
     enable_tracking,
     get_tracking_status,
+    resync_delta_schedule,
 )
 from src.dalton.tools.director_tools import build_director_tools
 from src.server.database import automation as auto_db
@@ -799,3 +801,271 @@ def test_tracking_router_permissions_owner_pm_and_intruder(
     assert r_post_pm.status_code == 200
     assert r_post_pm.json()["status"] == "disabled"
     assert r_post_pm.json()["paused_by_user"] is True
+
+
+@pytest.mark.asyncio
+async def test_enable_and_reenable_tracking_delta_schedule_by_tier_core_and_watch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Addendum §§ 1-2 & 5: enable_tracking and re-enable set delta timezone=Asia/Shanghai and tier-based cron (Core: 0 11 * * 2-6, Watch: 0 11 * * 6) while watch tasks stay unchanged."""
+    ctx = _install_fake_automation_store(
+        monkeypatch,
+        workspace_id="ws-echo",
+        user_id="user-1",
+        ticker="ECHO",
+    )
+    store = ctx["store"]
+
+    # 1. Core tier (GOOGL is tier=core in coverage.yaml, registered on ws-googl)
+    res_core = await enable_tracking("user-1", "ws-googl")
+    assert res_core["status"] == "enabled"
+    assert res_core["tier"] == "core"
+    by_name = {r["name"]: r for r in store}
+    assert by_name["dalton-googl-watch"]["cron_expression"] == "*/30 6-20 * * 1-5"
+    assert by_name["dalton-googl-watch"]["timezone"] == "America/New_York"
+    assert by_name["dalton-googl-delta"]["cron_expression"] == "0 11 * * 2-6"
+    assert by_name["dalton-googl-delta"]["timezone"] == "Asia/Shanghai"
+    assert by_name["dalton-googl-delta"]["metadata"]["tier"] == "core"
+
+    # Simulate legacy/paused row with old 30 21 * * 1-5 (America/New_York) and re-enable
+    by_name["dalton-googl-delta"]["cron_expression"] = "30 21 * * 1-5"
+    by_name["dalton-googl-delta"]["timezone"] = "America/New_York"
+    by_name["dalton-googl-delta"]["status"] = "paused"
+    await enable_tracking("user-1", "ws-googl", force=True)
+    by_name = {r["name"]: r for r in store}
+    assert by_name["dalton-googl-delta"]["status"] == "active"
+    assert by_name["dalton-googl-delta"]["cron_expression"] == "0 11 * * 2-6"
+    assert by_name["dalton-googl-delta"]["timezone"] == "Asia/Shanghai"
+    assert by_name["dalton-googl-delta"]["metadata"]["tier"] == "core"
+
+    # 2. Watch tier (ECHO is tier=watch in coverage.yaml, registered on ws-echo)
+    res_watch = await enable_tracking("user-1", "ws-echo")
+    assert res_watch["status"] == "enabled"
+    assert res_watch["tier"] == "watch"
+    by_name = {r["name"]: r for r in store}
+    assert by_name["dalton-echo-watch"]["cron_expression"] == "30 7 * * 1-5"
+    assert by_name["dalton-echo-watch"]["timezone"] == "America/New_York"
+    assert by_name["dalton-echo-delta"]["cron_expression"] == "0 11 * * 6"
+    assert by_name["dalton-echo-delta"]["timezone"] == "Asia/Shanghai"
+    assert by_name["dalton-echo-delta"]["metadata"]["tier"] == "watch"
+
+    # Simulate legacy/paused row with old 30 21 * * 1-5 (America/New_York) and re-enable
+    by_name["dalton-echo-delta"]["cron_expression"] = "30 21 * * 1-5"
+    by_name["dalton-echo-delta"]["timezone"] = "America/New_York"
+    by_name["dalton-echo-delta"]["status"] = "paused"
+    await enable_tracking("user-1", "ws-echo", force=True)
+    by_name = {r["name"]: r for r in store}
+    assert by_name["dalton-echo-delta"]["status"] == "active"
+    assert by_name["dalton-echo-delta"]["cron_expression"] == "0 11 * * 6"
+    assert by_name["dalton-echo-delta"]["timezone"] == "Asia/Shanghai"
+    assert by_name["dalton-echo-delta"]["metadata"]["tier"] == "watch"
+
+
+def test_migrate_delta_schedules_dry_run_apply_and_rowcount_assertion() -> None:
+    """Addendum § 3: migrate_delta_schedules.py defaults to dry-run, applies in one transaction with rowcount assertions, and recalculates next_run_at."""
+    from contextlib import contextmanager
+    import psycopg
+    from scripts.dalton.migrate_delta_schedules import run_migration
+
+    legacy_rows = [
+        {
+            "automation_id": "00000000-0000-0000-0000-000000000011",
+            "user_id": "user-1",
+            "workspace_id": "ws-googl",
+            "name": "dalton-googl-delta",
+            "status": "active",
+            "cron_expression": "30 21 * * 1-5",
+            "timezone": "America/New_York",
+            "next_run_at": None,
+            "metadata": {"dalton_managed": True, "ticker": "GOOGL"},
+        },
+        {
+            "automation_id": "00000000-0000-0000-0000-000000000022",
+            "user_id": "user-1",
+            "workspace_id": "ws-echo",
+            "name": "dalton-echo-delta",
+            "status": "active",
+            "cron_expression": "30 21 * * 1-5",
+            "timezone": "America/New_York",
+            "next_run_at": None,
+            "metadata": {"dalton_managed": True, "ticker": "ECHO"},
+        },
+    ]
+
+    def _make_conn_harness(rowcount_per_update: int = 1) -> dict[str, Any]:
+        conn = create_autospec(psycopg.Connection, instance=True)
+        cur = create_autospec(psycopg.Cursor, instance=True)
+        executed_queries: list[tuple[str, Any]] = []
+        tx_state = {"entered": 0, "committed": 0, "rolled_back": 0}
+
+        def _execute(sql: str, params: Any = None) -> None:
+            executed_queries.append((sql.strip(), params))
+            cur.rowcount = rowcount_per_update
+
+        cur.execute.side_effect = _execute
+        cur.fetchall.return_value = [dict(r) for r in legacy_rows]
+
+        @contextmanager
+        def _conn_ctx():
+            yield conn
+
+        @contextmanager
+        def _tx_ctx():
+            tx_state["entered"] += 1
+            try:
+                yield
+            except Exception:
+                tx_state["rolled_back"] += 1
+                raise
+            else:
+                tx_state["committed"] += 1
+
+        @contextmanager
+        def _cur_ctx(*args: Any, **kwargs: Any):
+            yield cur
+
+        conn.__enter__.side_effect = lambda: conn
+        conn.__exit__.side_effect = lambda exc_type, exc, tb: False
+        conn.transaction.side_effect = _tx_ctx
+        conn.cursor.side_effect = _cur_ctx
+
+        connect_fn = create_autospec(psycopg.connect, return_value=conn)
+        return {
+            "connect_fn": connect_fn,
+            "executed_queries": executed_queries,
+            "tx_state": tx_state,
+        }
+
+    # 1. Dry-run (default): lists plan, calculates next_run_at, performs 0 UPDATEs
+    h_dry = _make_conn_harness()
+    report_dry = run_migration(
+        "postgresql://fake",
+        apply=False,
+        connect_fn=h_dry["connect_fn"],
+    )
+    assert report_dry["mode"] == "dry-run"
+    assert report_dry["matched_count"] == 2
+    assert report_dry["updated_count"] == 0
+    assert report_dry["core_count"] == 1
+    assert report_dry["watch_count"] == 1
+    assert len(h_dry["executed_queries"]) == 1  # only SELECT
+
+    items_by_name = {item["name"]: item for item in report_dry["items"]}
+    assert items_by_name["dalton-googl-delta"]["tier"] == "core"
+    assert items_by_name["dalton-googl-delta"]["new_cron_expression"] == "0 11 * * 2-6"
+    assert items_by_name["dalton-googl-delta"]["new_timezone"] == "Asia/Shanghai"
+    assert items_by_name["dalton-googl-delta"]["new_next_run_at_iso"] is not None
+
+    assert items_by_name["dalton-echo-delta"]["tier"] == "watch"
+    assert items_by_name["dalton-echo-delta"]["new_cron_expression"] == "0 11 * * 6"
+    assert items_by_name["dalton-echo-delta"]["new_timezone"] == "Asia/Shanghai"
+    assert items_by_name["dalton-echo-delta"]["new_next_run_at_iso"] is not None
+
+    # 2. Apply (--apply): runs in a single transaction, updates cron/tz/next_run_at/metadata, asserts rowcount
+    h_apply = _make_conn_harness(rowcount_per_update=1)
+    report_apply = run_migration(
+        "postgresql://fake",
+        apply=True,
+        expect_count=2,
+        connect_fn=h_apply["connect_fn"],
+    )
+    assert report_apply["mode"] == "apply"
+    assert report_apply["matched_count"] == 2
+    assert report_apply["updated_count"] == 2
+    assert h_apply["tx_state"] == {"entered": 1, "committed": 1, "rolled_back": 0}
+    assert len(h_apply["executed_queries"]) == 3  # 1 SELECT FOR UPDATE + 2 UPDATEs
+    for sql, params in h_apply["executed_queries"][1:]:
+        assert "UPDATE automations" in sql
+        assert "next_run_at = %s" in sql
+        assert params[1] == "Asia/Shanghai"
+        assert params[2] is not None  # recalculated next_run_at datetime
+
+    # 3. Rowcount mismatch rolls back the transaction
+    h_bad = _make_conn_harness(rowcount_per_update=0)
+    with pytest.raises(AssertionError, match="Expected rowcount == 1"):
+        run_migration(
+            "postgresql://fake",
+            apply=True,
+            connect_fn=h_bad["connect_fn"],
+        )
+    assert h_bad["tx_state"] == {"entered": 1, "committed": 0, "rolled_back": 1}
+
+
+@pytest.mark.asyncio
+async def test_resync_delta_schedule_watch_to_core_no_tracking_and_paused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Addendum § 6: resync_delta_schedule does nothing when not tracked, updates Watch->Core schedule, and preserves paused status/paused_by_user."""
+    ctx = _install_fake_automation_store(
+        monkeypatch,
+        workspace_id="ws-echo",
+        user_id="user-1",
+        ticker="ECHO",
+    )
+    store = ctx["store"]
+
+    # 1. Not tracked (no delta task) -> does nothing
+    res_none = await resync_delta_schedule("user-1", "ECHO")
+    assert res_none["ok"] is True
+    assert res_none["updated"] is False
+    assert res_none["reason"] == "no_delta_task"
+    assert len(store) == 0
+
+    # 2. Enable tracking as Watch (0 11 * * 6, Asia/Shanghai), then promote Watch -> Core
+    await enable_tracking("user-1", "ws-echo")
+    by_name = {r["name"]: r for r in store}
+    assert by_name["dalton-echo-delta"]["cron_expression"] == "0 11 * * 6"
+    assert by_name["dalton-echo-delta"]["timezone"] == "Asia/Shanghai"
+    assert by_name["dalton-echo-delta"]["status"] == "active"
+
+    tier_state = {"ECHO": "core"}
+    monkeypatch.setattr(
+        tracking_mod,
+        "_load_coverage_tiers",
+        create_autospec(tracking_mod._load_coverage_tiers, side_effect=lambda: dict(tier_state)),
+    )
+
+    res_promoted = await resync_delta_schedule("user-1", "ECHO")
+    assert res_promoted["ok"] is True
+    assert res_promoted["updated"] is True
+    assert res_promoted["tier"] == "core"
+    assert res_promoted["old_cron_expression"] == "0 11 * * 6"
+    assert res_promoted["new_cron_expression"] == "0 11 * * 2-6"
+    assert res_promoted["new_timezone"] == "Asia/Shanghai"
+    assert res_promoted["new_next_run_at"] is not None
+    assert res_promoted["status"] == "active"
+
+    by_name = {r["name"]: r for r in store}
+    assert by_name["dalton-echo-delta"]["cron_expression"] == "0 11 * * 2-6"
+    assert by_name["dalton-echo-delta"]["timezone"] == "Asia/Shanghai"
+    assert by_name["dalton-echo-delta"]["next_run_at"] is not None
+    assert by_name["dalton-echo-delta"]["metadata"]["tier"] == "core"
+    assert by_name["dalton-echo-delta"]["status"] == "active"
+
+    # 3. User manually pauses tracking (paused_by_user=True), then tier changes -> only schedule changes, status stays paused
+    await disable_tracking("user-1", "ws-echo")
+    by_name = {r["name"]: r for r in store}
+    assert by_name["dalton-echo-delta"]["status"] == "paused"
+    assert by_name["dalton-echo-delta"]["metadata"]["paused_by_user"] is True
+
+    tier_state["ECHO"] = "watch"
+    res_demoted_paused = await resync_delta_schedule("user-1", "ECHO")
+    assert res_demoted_paused["ok"] is True
+    assert res_demoted_paused["updated"] is True
+    assert res_demoted_paused["tier"] == "watch"
+    assert res_demoted_paused["old_cron_expression"] == "0 11 * * 2-6"
+    assert res_demoted_paused["new_cron_expression"] == "0 11 * * 6"
+    assert res_demoted_paused["new_timezone"] == "Asia/Shanghai"
+    assert res_demoted_paused["new_next_run_at"] is not None
+    assert res_demoted_paused["status"] == "paused"
+    assert res_demoted_paused["paused_by_user"] is True
+
+    by_name = {r["name"]: r for r in store}
+    assert by_name["dalton-echo-delta"]["status"] == "paused"
+    assert by_name["dalton-echo-delta"]["metadata"]["paused_by_user"] is True
+    assert by_name["dalton-echo-delta"]["cron_expression"] == "0 11 * * 6"
+    assert by_name["dalton-echo-delta"]["timezone"] == "Asia/Shanghai"
+    assert by_name["dalton-echo-delta"]["next_run_at"] is not None
+    assert by_name["dalton-echo-delta"]["metadata"]["tier"] == "watch"
+
+

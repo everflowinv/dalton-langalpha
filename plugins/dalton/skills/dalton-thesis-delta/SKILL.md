@@ -10,9 +10,9 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 
 ## 目标与唤醒机制
 
-每晚对覆盖公司收一次“增量包”（一致预期快照与修正、新卖方研报与 sales note、TMTB、FUNDA AI、新入库 wiki、新 SEC filing、新闻与 X），判断相对现有知识层是否存在**重要变化（material change）**：
-- **零成本预检与 `<dalton_wake>`**：定时任务先由后端零 LLM 预检运行探针（公司日常监控探针 `agenda`、`sec`、`cnhk`、`earnings`、`internal`，计划唤醒探针 `schedule`，价格异动探针 `price`）。无任何信号的轮次记 `skip`、花费为 0、不建线程。只有至少命中一个探针信号时才唤醒智能体，线程首条上下文包含 `<dalton_wake>`（内含信号 `id`、`probe` 及命中的摘要）。
-- **无重要变化不打扰 PM**：被唤醒后，若经判定不属于重要变化（`material=no`），只记一条 `NO_CHANGE` 结论并调用 `commit --material no` 更新 `seen.json`，**绝不向 PM 推送消息**。
+每晚对覆盖公司收一次“增量包”（一致预期快照与修正、六个内部研究来源 `company-wiki` / `guidepoint` / `funda-ai` / `sales-notes` / `tmtb` / `alphaengine`、新 SEC filing、新闻与 X），判断相对现有知识层是否存在**重要变化（material change）**：
+- **零成本预检与 `<dalton_wake>`**：盘中 `watch` 自动任务不再查内部研究库（只查 `sec`、`cnhk`、`agenda`、`earnings` 四个需要及时发现的探针）；六个内部研究来源全部由每晚的 `dalton-thesis-delta`（`collect.py`）统一扫一次。预检另有计划唤醒探针 `schedule` 与价格异动探针 `price`；无任何信号的轮次记 `skip`、花费为 0、不建线程。每晚 cron（`dalton-<t>-delta.json`）唤醒后线程首条上下文包含 `<dalton_wake>`（内含信号 `id`、`kind` 及详情）。
+- **无重要变化不打扰 PM**：被唤醒后，若所有来源均取数成功（`ok: true`）且经判定不属于重要变化（`material=no`），只记一条 `NO_CHANGE` 结论并调用 `commit --material no` 更新 `seen.json`，**绝不向 PM 推送消息**。
 
 ---
 
@@ -44,7 +44,9 @@ python3 .agents/skills/dalton-thesis-delta/scripts/collect.py collect \
 ```
 
 3. **快速短路分支（不读任何文档全文）**：
-   - 检查 `collect.py` 返回的汇总 JSON：若 `auto_flags` 为空，且新内部文档（`counts.internal` + `counts.alphaengine`）与新公告（`counts.sec`）均为 `0`（即预检信号在完整增量包复核中不成立）：
+   - 检查 `collect.py` 返回的汇总 JSON 中的 `internal_status`、`failed_sources`、`all_sources_ok` 与 `short_circuit_eligible`：
+   - **任何来源 `ok: false` 都不能当成“没有新文档”**：当某个来源 `ok: false`（`all_sources_ok == false` 或 `failed_sources` 非空）时，**严禁走“所有来源 0 新增 → 短路结束”的分支**；在本轮结论（`verdict` 与 `commit --summary`）和汇报里必须如实写明“`<来源> 本轮取数失败（原因）`”，**绝不能写成“本轮无新文档”或“无新增”**。
+   - **短路判断要求所有来源都 `ok: true` 而且都是 `0` 新增**：仅当 `all_sources_ok == true`（所有来源 `ok: true`，`failed_sources` 为空）、`auto_flags` 为空，且新内部文档（`counts.internal` + `counts.alphaengine`）与新公告（`counts.sec`）均为 `0`（即 `short_circuit_eligible == true`）时：
      1. 直接执行提交：
         ```bash
         python3 .agents/skills/dalton-thesis-delta/scripts/collect.py commit \
@@ -60,8 +62,8 @@ python3 .agents/skills/dalton-thesis-delta/scripts/collect.py collect \
 
 当第 1 步未短路时：
 1. 按 `.agents/skills/dalton-knowledge/SKILL.md` 读序先读本工作区 `agent.md` 托管块、`thesis.md`、`debate.md`、`drivers.md`、`agenda.md` 及最近 `verdicts.md`。
-2. 读取 `research/tracker/<run_id>/packet.md` 及关联的新文档摘段/原文：
-   - 内部库新文档（`sales-notes`、`tmtb`、`funda-ai`、`company-wiki`）：先读摘段，必要时通过 PTC `researchdata.research(..., operation="read", document=...)` 读全文；
+2. 读取 `research/tracker/<run_id>/packet.md` 及关联的新文档摘段/原文（若存在 `ok: false` 的来源，同步核实 `packet.md` / `internal_status` 中的失败原因并在本轮结论与汇报中如实写明“`<来源> 本轮取数失败（原因）`”）：
+   - 内部库新文档（`company-wiki`、`guidepoint`、`funda-ai`、`sales-notes`、`tmtb`）：先读摘段，必要时通过 PTC `researchdata.research(..., operation="read", document=...)`（或 Guidepoint 对应详情）读全文；
    - AlphaEngine 新研报：先看摘要，挑带新数字（盈利预测修正、capex/费用、目标价/评级变化、核心 KPI 调查）的研报调用 `researchdata.research(route="alphaengine", operation="get_document", params={"doc_id": ...})` 读全文（每轮最多 3 篇；遇配额或未登录即停并记录状态）；
    - SEC / 港股与 A 股新公告：若当日 `dalton-filing-review` 或 `dalton-earnings-flash` 已经在 `verdicts.md` 写过同一份公告的结论，直接引用，不重复拆解；否则美股读取对应 SEC Item 或附件，港股与 A 股调用 `researchdata.finance(route="cn-hk", operation="filings", ticker=CODE_5_OR_6, start=..., end=..., limit=20)` 读取巨潮法定公告原文（港股未覆盖时用 `web_search` 查披露易 `site:hkexnews.hk` 原文链接），并可调用 `researchdata.finance(route="cn-hk", operation="ask", query=..., limit=20)` 辅助核查资金流、两融、回购或股东变动（平台财务表仅作初值，核心数字回公告核实）。
 3. 严格按 `.agents/skills/dalton-thesis-delta/references/materiality.md` 的十条标准判定本轮是否为**重要变化（`material=yes`）**：
