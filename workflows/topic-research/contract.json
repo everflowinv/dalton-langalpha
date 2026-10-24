@@ -1,0 +1,110 @@
+{
+  "name": "topic-research",
+  "description": "专题研究的完成契约：规划 + 一手 + 分簇取证 + 交叉验证 + 成稿 + 数字核验 + 独立审稿 + 修订（对应 dalton-topic-research SKILL 的交付物）。",
+  "draft": "drafts/{as_of}-topic-{slug}.md",
+  "params_required": [
+    "topic",
+    "slug",
+    "workspace_dir"
+  ],
+  "stages": [
+    {
+      "name": "规划",
+      "artifacts": [
+        {
+          "path": "research/{as_of}-topic-{slug}/plan.md",
+          "min_bytes": 100
+        }
+      ]
+    },
+    {
+      "name": "一手材料",
+      "artifacts": [
+        {
+          "path": "research/{as_of}-topic-{slug}/primary.md",
+          "min_bytes": 100
+        }
+      ]
+    },
+    {
+      "name": "分簇取证",
+      "artifacts": [
+        {
+          "path": "research/{as_of}-topic-{slug}/cluster-*.md",
+          "glob": true,
+          "min_count": 3,
+          "min_bytes": 100
+        },
+        {
+          "path": "research/{as_of}-topic-{slug}/internal-memory.md",
+          "min_bytes": 50
+        },
+        {
+          "path": "research/{as_of}-topic-{slug}/guidepoint.md",
+          "min_bytes": 50
+        }
+      ]
+    },
+    {
+      "name": "交叉验证与盲区",
+      "artifacts": [
+        {
+          "path": "research/{as_of}-topic-{slug}/cross-check.md",
+          "min_bytes": 100,
+          "end_marker": "盲区检查完成"
+        }
+      ]
+    },
+    {
+      "name": "写作与数字核验",
+      "artifacts": [
+        {
+          "path": "drafts/{as_of}-topic-{slug}.md",
+          "min_bytes": 500
+        },
+        {
+          "path": "research/{as_of}-topic-{slug}/number-audit.md",
+          "min_bytes": 50
+        }
+      ],
+      "validators": [
+        {
+          "command": "python .agents/skills/dalton-topic-research/scripts/validate_topic.py --input drafts/{as_of}-topic-{slug}.md --json",
+          "pass_when": "exit_zero",
+          "description": "置信度与引用闭环校验通过"
+        }
+      ]
+    },
+    {
+      "name": "独立审稿与修订",
+      "review": {
+        "agent": "dalton-reviewer",
+        "verdicts": [
+          "pass"
+        ],
+        "manual_sidecar": "research/{as_of}-topic-{slug}/review.json"
+      },
+      "artifacts": [
+        {
+          "path": "research/{as_of}-topic-{slug}/knowledge-revision.json",
+          "min_bytes": 50
+        }
+      ]
+    }
+  ],
+  "closing": {
+    "knowledge_docs_any": [
+      "drivers",
+      "debate"
+    ],
+    "knowledge_source": "tool",
+    "verdict_kinds_any": [
+      "NO_CHANGE",
+      "THESIS_STRENGTHENED",
+      "THESIS_WEAKENED",
+      "THESIS_BROKEN",
+      "NEW_THESIS"
+    ],
+    "verdict_trigger": "agenda"
+  }
+}

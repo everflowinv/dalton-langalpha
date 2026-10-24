@@ -197,7 +197,11 @@ def task_report(payload: dict) -> "TaskReport":
 
 
 def task_report_message(
-    report: "TaskReport", subagent_type: str | None, *, steered: bool = False
+    report: "TaskReport",
+    subagent_type: str | None,
+    *,
+    steered: bool = False,
+    failure_error: str | None = None,
 ) -> str:
     """The report's content, as its own turn or as a steer into a live one.
 
@@ -210,12 +214,27 @@ def task_report_message(
     # call, so "after your previous turn ended" can be false.
     when = " while you were working" if steered else ""
     outcome = "FAILED" if report.failed else "finished"
+    # DALTON-HOOK(workflow-resume): a lost-worker workflow run is resumable —
+    # say so, with the task id the resume call needs, or the agent reads the
+    # failure as lost work and starts over from scratch.
+    resume_hint = ""
+    lost_worker = bool(failure_error) and (
+        "worker_lost" in str(failure_error) or "RESUMABLE" in str(failure_error)
+    )
+    if report.failed and subagent_type == "workflow" and lost_worker:
+        resume_hint = (
+            f"\nTask id: {report.task_id}. This workflow run was interrupted "
+            "by a lost worker and can be resumed: "
+            "RunWorkflow(workflow=<name>, params=<same as before>, "
+            f"resume='{report.task_id}') replays completed dispatches from "
+            "its journal."
+        )
     # DALTON-HOOK(i18n): Prevent language drift after English subagent completion notices
     return (
         "<system>\n"
         f"Background subagent {report.display_id} ({subagent_type or 'subagent'}) "
         f"{outcome}{when}.\n"
-        f"Task description: {report.description or ''}\n"
+        f"Task description: {report.description or ''}{resume_hint}\n"
         "This notice is from the system, not the user. Keep writing to the user in the language of their request.\n"
         "</system>"
     )
@@ -252,14 +271,23 @@ def _stop_already_covered(parent: dict | None, run_row: dict) -> bool:
 
 @dataclass(frozen=True)
 class OwedTaskReport:
-    """A task report still owed: what the reader is shown, and the subagent
-    type the model is told about."""
+    """A task report still owed: what the reader is shown, the subagent
+    type the model is told about, and the run's failure text."""
 
     report: "TaskReport"
     subagent_type: str | None
+    failure_error: str | None = None
 
     def message(self, *, steered: bool) -> str:
-        return task_report_message(self.report, self.subagent_type, steered=steered)
+        # DALTON-HOOK(workflow-resume): the resume hint is reserved for the
+        # worker_lost wording a recovered workflow run carries — a script
+        # error, a cap or a usage error is not resumable work.
+        return task_report_message(
+            self.report,
+            self.subagent_type,
+            steered=steered,
+            failure_error=self.failure_error,
+        )
 
 
 async def task_report_verdict(job: dict) -> OwedTaskReport | NotOwed:
@@ -285,7 +313,14 @@ async def task_report_verdict(job: dict) -> OwedTaskReport | NotOwed:
             await tl_db.get_run(str(parent_run_id)), run_row
         ):
             return NotOwed("its turn was stopped after it settled")
-    return OwedTaskReport(task_report(payload), payload.get("subagent_type"))
+    # DALTON-HOOK(workflow-resume): failure_error rides the owed report so
+    # the message can tell a resumable worker_lost workflow apart from an
+    # ordinary failure.
+    return OwedTaskReport(
+        task_report(payload),
+        payload.get("subagent_type"),
+        payload.get("failure_error"),
+    )
 
 
 async def execute_task_report_back(job: dict) -> None:

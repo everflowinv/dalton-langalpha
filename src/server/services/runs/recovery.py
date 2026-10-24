@@ -330,20 +330,22 @@ class RecoveryScanner:
                 status = (
                     "cancelled" if run.get("cancel_requested_at") else "error"
                 )
+                failure = None
+                if status == "error":
+                    # DALTON-HOOK(workflow-resume): a workflow run whose worker
+                    # died is not lost work — its per-dispatch journal lets a
+                    # follow-up RunWorkflow(resume=...) replay every completed
+                    # dispatch. The failure text (the resume hint the thread's
+                    # report-back notification carries) and the task-type read
+                    # live in the Dalton-owned module.
+                    from src.dalton.workflows.journal import worker_lost_failure
+
+                    failure = await worker_lost_failure(thread_id, task_id)
                 result = await SubagentRunCoordinator(thread_id).finalize_task_run(
                     task_run_id,
                     status,
                     task_id=task_id,
-                    failure=(
-                        None
-                        if status == "cancelled"
-                        else {
-                            "error": (
-                                "worker_lost: no live executor holds this "
-                                "task's namespace fence"
-                            )
-                        }
-                    ),
+                    failure=failure,
                 )
                 if result["applied"]:
                     recovered += 1

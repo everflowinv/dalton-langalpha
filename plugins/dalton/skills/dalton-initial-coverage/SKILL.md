@@ -25,6 +25,12 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 - `sector`（可选）：所属行业名称
 - `pm_question`（可选）：PM 特别指定的关注问题或假设
 
+### 开始前：检查未完成的 run（中断续跑）
+
+- 读 `research/<D>-ic/.progress.json`（及 `research/` 下其他 `*/.progress.json`），看是否有本 workflow 的 `status` 不是终态（`completed`/`failed`/`cancelled`）的 run。
+- 有未完成的 run 时不要新开 run：用**原参数**调用 `RunWorkflow(workflow="initial-coverage", params={...原参数..., "progress_path": "research/<D>-ic/.progress.json"}, resume="<.progress.json 里的 run_id>")` 续跑；label、prompt 哈希与产物哈希都一致的已完派发会直接复用，不重复派子任务。
+- 全新启动时也在 `params` 里带上 `"progress_path": "research/<D>-ic/.progress.json"`，让中断后的 run 可被发现与续跑。
+
 ---
 
 ## 二、执行流程（启动 `initial-coverage` workflow）
@@ -45,7 +51,8 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
        "as_of": "<YYYY-MM-DD>",
        "peers": ["<可选同业>"],
        "sector": "<可选行业>",
-       "pm_question": "<可选PM问题>"
+       "pm_question": "<可选PM问题>",
+       "progress_path": "research/<D>-ic/.progress.json"
      }
    }
    ```
@@ -61,7 +68,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
    - **阶段 5（独立审稿与修订）**：由 `dalton-reviewer` 审阅重点题（Q1–Q5、Q7、Q8、Q12）、壁垒判断与估值分解表，再由修订子智能体完成 P0 修改并同步更新 `knowledge-proposal.json`。
 
 3. **Workflow 不可用时的手动降级路径**
-   - **`workflow.enabled` 已关闭**（工具列表本来就不会有 `RunWorkflow`）：主智能体按上述阶段 1→5 的顺序手动执行（依次派发 `dalton-evidence` / `general-purpose` 子智能体或亲自执行），生成全部产物文件，并逐阶段核对产物。
+   - **`workflow.enabled` 已关闭**（工具列表本来就不会有 `RunWorkflow`）：主智能体按上述阶段 1→5 的顺序手动执行（依次派发 `dalton-evidence` / `general-purpose` 子智能体或亲自执行），生成全部产物文件，并逐阶段核对产物。阶段 5 派 `dalton-reviewer` 审最终稿后，把它返回的 JSON（含 `verdict` 与 `draft_sha256`）原样保存到 `research/<D>-ic/review.json`（多轮复审时保存最后一轮；改稿后必须重审并覆盖）；收尾调用 `dalton_check_done` 时在 `params` 里加 `"manual": true`、不传 `run_id`，审稿据此文件核对。
    - **否则**（`workflow.enabled` 未关闭）：`RunWorkflow` 不在工具列表时，先用 **Read 工具**（不要用 Bash `cat`）读 `.agents/skills/run-workflow/SKILL.md` 后重试；仍没有就停下，告诉 PM「RunWorkflow 不可用」，不要自行手动派发 Task 子智能体代跑。
 
 ---
@@ -88,16 +95,22 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
    - 知识层与首条结论落库后，必须调用 `dalton_coverage_tracking(action="enable", source="coverage_finish")` 开启该公司的四项标准自动跟踪任务（`watch`、`delta`、`move-up`、`move-down`）。
    - 若用户之前曾手动关闭过跟踪（任务元数据含 `paused_by_user`），`source="coverage_finish"` 会自动跳过重新开启并保持关闭状态，不要强制覆盖用户选择。
 
-4. **汇报与可选发布**
-   - 末尾必须附引用表：确认报告末尾的 `## 引用` 一节已按每行一条写出对应关系（形如 `[引用1]: evidence:E-20261023-01` 或 `[引用3]: model:model/META-model-v01.xlsx!DCF!C12`）。
-   - 可调用 `check_draft(draft_path="drafts/<D>-initial-coverage.md")` 检查数字核验反馈。
-   - 向 PM 汇报核心判断（≤3 句）、12 问重点题结论、估值分解结果、初始倾向（关注 / 观察 / 暂不覆盖 / 建议推进完整覆盖）、研究议程及自动跟踪状态。
-   - 初次覆盖默认保留为草稿；若 PM 明确要求正式发布，调用 `publish_report(draft_path="drafts/<D>-initial-coverage.md", title="...", kind="initial_coverage", slug="...")`。
+4. **汇报完成前必须过完成契约（`dalton_check_done`）**
+   - 向 PM 汇报"完成"前，必须调用 `dalton_check_done(workflow="initial-coverage", run_id=<`research/<D>-ic/.progress.json` 里的 run_id>, params={<启动 RunWorkflow 时的同一组参数，含 as_of>})`。
+   - 走手动降级路径（`workflow.enabled` 已关闭、没有 run）时不传 `run_id`，`params` 里加 `"manual": true`，审稿结论按 `research/<D>-ic/review.json` 核对。
+   - `done=false` 时按 `missing` 逐条补齐（缺文件补文件、校验未过修到过、知识层缺 source=tool 新版本就 `knowledge_update`、check_draft 用了旧草稿就对最终稿重跑 `check_draft`），补完再查一次。
+   - 补不了的缺项只能汇报"未完成"，列出缺项与原因；没有 `dalton_check_done` 通过，不得汇报"完成"。
 
 5. **完成判定（必查清单）**
    - `drafts/<D>-initial-coverage.md` 已完成独立审稿与 P0 修订；
    - `company`、`thesis`、`debate`、`drivers`、`management`、`agenda` 均已通过 `knowledge_update` 写入，且已记录首条 `NEW_THESIS` `knowledge_append_verdict`；
    - 已调用 `dalton_coverage_tracking(action="enable", source="coverage_finish")` 并检查确认自动跟踪已开启（`status="enabled"`，或因 `paused_by_user=true` 保持用户手动关闭状态）。
+
+6. **汇报与可选发布**
+   - 末尾必须附引用表：确认报告末尾的 `## 引用` 一节已按每行一条写出对应关系（形如 `[引用1]: evidence:E-20261023-01` 或 `[引用3]: model:model/META-model-v01.xlsx!DCF!C12`）。
+   - 可调用 `check_draft(draft_path="drafts/<D>-initial-coverage.md")` 检查数字核验反馈。
+   - 向 PM 汇报核心判断（≤3 句）、12 问重点题结论、估值分解结果、初始倾向（关注 / 观察 / 暂不覆盖 / 建议推进完整覆盖）、研究议程及自动跟踪状态。
+   - 初次覆盖默认保留为草稿；若 PM 明确要求正式发布，调用 `publish_report(draft_path="drafts/<D>-initial-coverage.md", title="...", kind="initial_coverage", slug="...")`。
 
 ---
 

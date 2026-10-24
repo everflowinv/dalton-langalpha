@@ -1,0 +1,334 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Dalton workflow/skill completion contract",
+  "description": "完成契约：一个 workflow 或多步 skill 的交付物清单。dalton_check_done 按它在工作区核对文件、哈希与校验脚本；路径与命令里的 {key} 占位符用运行参数渲染。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "name",
+    "params_required",
+    "stages",
+    "closing"
+  ],
+  "properties": {
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "description": "workflow 名（如 initial-coverage）。"
+    },
+    "description": {
+      "type": "string"
+    },
+    "draft": {
+      "type": "string",
+      "description": "主交付草稿的路径模板；closing.check_draft 未写 draft 时用它。"
+    },
+    "params_required": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "渲染模板必须提供的参数名（workflow 的 RunWorkflow params / skill 的输入参数）。"
+    },
+    "stages": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/stage"
+      }
+    },
+    "closing": {
+      "$ref": "#/$defs/closing"
+    }
+  },
+  "$defs": {
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "description": "产物路径模板，相对工作区根；glob=true 时为通配模式。"
+        },
+        "min_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "文件最小字节数，防占位空文件。"
+        },
+        "end_marker": {
+          "type": "string",
+          "minLength": 1,
+          "description": "文件内容必须包含的完成标记，如 <!-- 完成 -->。"
+        },
+        "glob": {
+          "type": "boolean",
+          "default": false,
+          "description": "path 按通配模式解释，匹配数须 >= min_count。"
+        },
+        "min_count": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "glob 模式的最少匹配数，默认 1。"
+        },
+        "optional": {
+          "type": "boolean",
+          "default": false,
+          "description": "缺文件记 warning 而不是 missing（这 6 个 workflow 里的合法缺项，如 weekly-coverage-review 某周无 Watch 命中时的 watch-*.md）。"
+        },
+        "requires_param": {
+          "type": "string",
+          "description": "仅当该参数为真值时才要求本产物（如 model_path）。"
+        },
+        "derive": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "json",
+            "pointer",
+            "field"
+          ],
+          "properties": {
+            "json": {
+              "type": "string",
+              "description": "JSON 文件路径模板，从中取条目列表。"
+            },
+            "pointer": {
+              "type": "string",
+              "description": "顶层键名（如 core / flagged）。"
+            },
+            "field": {
+              "type": "string",
+              "description": "每项里取路径参数的字段（如 ticker）。"
+            }
+          },
+          "description": "按 JSON 清单展开本产物模板：每个条目用其 field 值渲染 path。"
+        },
+        "modified_on": {
+          "enum": [
+            "as_of",
+            "today"
+          ],
+          "description": "要求文件 mtime 不早于该日 00:00 UTC（核对状态文件是本轮写的）。"
+        }
+      }
+    },
+    "validator": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "command"
+      ],
+      "properties": {
+        "command": {
+          "type": "string",
+          "minLength": 1,
+          "description": "在工作区根重跑的校验命令，沿用 SKILL 里的现有命令。"
+        },
+        "pass_when": {
+          "enum": [
+            "exit_zero",
+            "output_contains",
+            "output_not_contains"
+          ],
+          "default": "exit_zero",
+          "description": "通过判据：退出码 0（默认），或输出包含/不包含 expect。"
+        },
+        "expect": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        }
+      }
+    },
+    "review": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "agent",
+        "verdicts"
+      ],
+      "properties": {
+        "agent": {
+          "const": "dalton-reviewer"
+        },
+        "verdicts": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "enum": [
+              "pass",
+              "revise",
+              "block"
+            ]
+          },
+          "description": "可接受的结构化结论；revise 必须已走完修订→复审。"
+        },
+        "manual_sidecar": {
+          "type": "string",
+          "minLength": 1,
+          "description": "手动降级路径（workflow.enabled=false，本线程无 workflow run 目录）时由主智能体保存的审稿 JSON 路径模板，内容为 {verdict, draft_sha256}（或其数组，取最后一条）；dalton_check_done 传 params.manual=true 时据此核对审稿。"
+        }
+      }
+    },
+    "stage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "requires_param": {
+          "type": "string",
+          "description": "仅当该参数为真值时才检查本阶段。"
+        },
+        "artifacts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/artifact"
+          }
+        },
+        "validators": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/validator"
+          }
+        },
+        "review": {
+          "$ref": "#/$defs/review"
+        }
+      }
+    },
+    "closing": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "knowledge_docs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "每一个都必须有 source=tool 的新版本（自 since 日期零点起）。"
+        },
+        "knowledge_docs_any": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "至少其中一个有 source=tool 的新版本。"
+        },
+        "knowledge_source": {
+          "const": "tool"
+        },
+        "verdict_kinds_any": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "必须写入的 verdict 类型（如 NEW_THESIS），任一命中即可。"
+        },
+        "verdict_trigger": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "minItems": 1
+            }
+          ],
+          "description": "verdict 的 trigger_kind 须等于该值或命中数组任一值（如 filing/manual）。"
+        },
+        "check_draft": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "draft"
+          ],
+          "properties": {
+            "draft": {
+              "type": "string",
+              "description": "草稿路径模板。"
+            },
+            "required": {
+              "type": "boolean",
+              "default": true,
+              "description": "false 时草稿缺席只记 warning（如 bullbear-doc 的 check_draft 为可选步骤）。"
+            }
+          }
+        },
+        "knowledge_docs_requires_param": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "doc → 参数名：仅当该参数为真值时才要求该 doc 的 source=tool 新版本。"
+        },
+        "knowledge_docs_if_json": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "json",
+              "when"
+            ],
+            "properties": {
+              "json": {
+                "type": "string",
+                "description": "JSON 文件路径模板。"
+              },
+              "docs": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "string"
+                }
+              },
+              "docs_any": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "string"
+                }
+              },
+              "when": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "field": {
+                    "type": "string"
+                  },
+                  "equals": {
+                    "type": "string",
+                    "description": "字段值相等时生效。"
+                  },
+                  "any_gt": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                      "type": "string"
+                    },
+                    "description": "这些数值字段之和 > 0 时生效。"
+                  }
+                }
+              }
+            }
+          },
+          "description": "按 JSON 状态文件的条件要求知识文档新版本；读不到/解析失败记 missing。"
+        }
+      }
+    }
+  }
+}

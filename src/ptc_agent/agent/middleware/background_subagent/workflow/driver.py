@@ -46,6 +46,17 @@ from ptc_agent.agent.middleware.background_subagent.workflow.validation import (
 from src.config.models import WorkflowOrchestrationConfig
 from src.server.utils.error_sanitization import sanitize_error_text
 
+# DALTON-HOOK(workflow-journal): the run journal, resume replay and progress
+# marker live in the Dalton-owned module; the driver only records around its
+# own dispatches. `engine_safe` normalizes empty strings at the QuickJS
+# boundary (see its docstring for the marshal deadlock it prevents).
+from src.dalton.workflows.journal import (
+    WorkflowJournal,
+    artifact_records,
+    engine_safe,
+    prompt_digest,
+)
+
 logger = structlog.get_logger(__name__)
 
 # The per-child record is a workspace file rather than a UI frame, so it keeps
@@ -91,6 +102,16 @@ class WorkflowRunSpec:
     # the driver's task may be created before the project is bound, and a task
     # only inherits the context that existed when it was created.
     project: ProjectContext | None = None
+    # DALTON-HOOK(workflow-resume): the artifact directory of a previous run
+    # whose per-dispatch journal this run replays from — a dispatch whose
+    # label, prompt hash and declared-artifact hashes all still match returns
+    # the recorded result instead of dispatching a child again.
+    journal_source: str | None = None
+    # DALTON-HOOK(workflow-resume): workspace-relative progress marker the
+    # driver keeps current (``{workflow, run_id, phases, status}``), so the
+    # launching skill can find an interrupted run and resume it. Resolved
+    # from ``params.progress_path`` at launch.
+    progress_path: str | None = None
 
 
 class WorkflowRunError(RuntimeError):
@@ -222,6 +243,18 @@ class WorkflowDriver:
         # Set once the run starts tearing down, so a child unwinding afterwards
         # is read as part of that teardown rather than as a child-alone stop.
         self._stopping = False
+        # DALTON-HOOK(workflow-journal): this run's dispatch journal, resume
+        # replay index and progress marker. All truth lives in workspace
+        # files (see src/dalton/workflows/journal.py) — the driver holds only
+        # this execution-context handle.
+        self._journal = WorkflowJournal(
+            spec.backend,
+            base_rel=self.base_rel,
+            run_id=self.wf_task_id,
+            workflow=spec.meta.name,
+            journal_source=spec.journal_source,
+            progress_path=spec.progress_path,
+        )
 
     async def run(self, _request: Any = None) -> str:
         """Drive the run to a terminal state.
@@ -378,6 +411,10 @@ class WorkflowDriver:
 
     def phase(self, title: str) -> None:
         self._emitter.phase(title)
+        # DALTON-HOOK(workflow-journal): remembered in memory here (``phase``
+        # runs on the QuickJS worker thread) and persisted by the journal at
+        # the next async boundary.
+        self._journal.note_phase(str(title))
 
     def log(self, message: str) -> None:
         self._emitter.log(message)
@@ -406,11 +443,35 @@ class WorkflowDriver:
             # both depend on how the run unfolded, not on the call's shape.
             raise WorkflowUsageError(str(error)) from error
 
-        self._dispatched += 1
         seq = self._next_seq()
         phase = rec["phase"] or self._emitter.current_phase
         label = rec["label"] or prompt[:60]
         schema = rec["schema"]
+
+        # DALTON-HOOK(workflow-resume): a dispatch this run is resuming from
+        # the previous run's journal never reaches the dispatcher — the cap
+        # below counts real children only, so a replayed run keeps its budget.
+        replay_entry = await self._journal.find_replayable(label, rec["prompt"])
+        if replay_entry is not None:
+            self._emitter.log(
+                f"[resume] 复用派发记录：{label}（产物哈希一致，未重新派发）"
+            )
+            await self._journal.record_replay(
+                replay_entry, seq=seq, label=label, phase=phase
+            )
+            return engine_safe(replay_entry.get("result"))
+
+        # DALTON-HOOK(workflow-journal): the replay lookup above awaits, so
+        # the admission-time cap check may be stale by the time it returns —
+        # re-check and increment with no await in between, or concurrent
+        # agent() calls would each admit themselves against the same count.
+        if self._cap_reached():
+            raise WorkflowHostError(
+                "Run dispatch cap max_dispatches_per_run="
+                f"{self.spec.caps.max_dispatches_per_run} has been reached"
+            )
+        self._dispatched += 1
+        self._journal.dispatched = self._dispatched
 
         child = await self._dispatch_child(
             seq=seq,
@@ -421,9 +482,14 @@ class WorkflowDriver:
             schema=schema,
         )
         if schema is None:
-            return child.content if child.status == "ok" else None
+            # DALTON-HOOK(workflow-journal): `engine_safe` guards the engine
+            # boundary — an empty string in a child's answer would deadlock
+            # the QuickJS marshal (see its docstring), "" becomes None.
+            if child.status == "ok":
+                return engine_safe(child.content)
+            return None
         if child.schema_valid:
-            return child.parsed
+            return engine_safe(child.parsed)
         if child.status != "invalid_schema":
             return None
 
@@ -440,6 +506,7 @@ class WorkflowDriver:
         except DispatchValidationError as error:
             raise WorkflowHostError(str(error)) from error
         self._dispatched += 1
+        self._journal.dispatched = self._dispatched
         retry = await self._dispatch_child(
             seq=self._next_seq(),
             rec=rec,
@@ -448,7 +515,7 @@ class WorkflowDriver:
             phase=phase,
             schema=schema,
         )
-        return retry.parsed if retry.schema_valid else None
+        return engine_safe(retry.parsed) if retry.schema_valid else None
 
     async def _dispatch_child(
         self,
@@ -469,6 +536,19 @@ class WorkflowDriver:
             phase=phase,
             subagent_type=rec["subagent_type"],
             started_at=time.time(),
+        )
+        # DALTON-HOOK(workflow-journal): the pending record lands BEFORE the
+        # dispatch — a worker dying mid-child leaves an un-replayable marker
+        # rather than nothing, and the rewrite below is what makes it usable.
+        await self._journal.append(
+            {
+                "seq": seq,
+                "label": label,
+                "phase": phase,
+                "prompt_sha256": prompt_digest(rec["prompt"]),
+                "status": "pending",
+                "recorded_at": time.time(),
+            }
         )
 
         async with sem:
@@ -537,6 +617,40 @@ class WorkflowDriver:
             tokens_spent=self._tokens_spent,
         )
         await self._write_json(f"children/{seq:03d}.json", run.to_record())
+        # DALTON-HOOK(workflow-journal): the outcome record replaces the
+        # pending one, keyed by the logical call's prompt (rec["prompt"]), not a
+        # schema-retry prompt, so resume finds a retried success too; only an ``ok`` entry with artifact digests is ever
+        # replayable, so a failed or in-flight child never comes back as work.
+        if run.status == "ok":
+            result_value = run.parsed if schema is not None else run.content
+            result_value = engine_safe(result_value)
+            records = await artifact_records(self.spec.backend, result_value)
+            await self._journal.append(
+                {
+                    "seq": seq,
+                    "label": label,
+                    "phase": phase,
+                    "prompt_sha256": prompt_digest(rec["prompt"]),
+                    "status": "ok",
+                    "result": result_value,
+                    "result_kind": "parsed" if schema is not None else "text",
+                    "artifacts": records or [],
+                    "replayable": records is not None,
+                    "recorded_at": time.time(),
+                }
+            )
+        else:
+            await self._journal.append(
+                {
+                    "seq": seq,
+                    "label": label,
+                    "phase": phase,
+                    "prompt_sha256": prompt_digest(rec["prompt"]),
+                    "status": run.status,
+                    "error": run.to_record()["error"],
+                    "recorded_at": time.time(),
+                }
+            )
         return run
 
     def _child_time_limit(self) -> float:
@@ -726,6 +840,9 @@ class WorkflowDriver:
             "updated_at": time.time(),
         }
         await self._write_json("status.json", payload)
+        # DALTON-HOOK(workflow-journal): the terminal progress write is what
+        # retires the marker the launching skill resumes from.
+        await self._journal.write_progress(status)
         await self._emitter.persist_snapshot()
 
     async def _write_json(self, path: str, value: Any) -> bool:

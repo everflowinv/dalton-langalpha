@@ -10,6 +10,12 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 
 ## 0. 启动工作流（第一步必读）
 
+### 开始前：检查未完成的 run（中断续跑）
+
+- 读 `research/<D>-topic-<slug>/.progress.json`（及 `research/` 下其他 `*/.progress.json`；`<D>` 未定时目录用 `latest`），看是否有本 workflow 的 `status` 不是终态（`completed`/`failed`/`cancelled`）的 run。
+- 有未完成的 run 时不要新开 run：用**原参数**调用 `RunWorkflow(workflow="topic-research", params={...原参数..., "progress_path": "research/<D>-topic-<slug>/.progress.json"}, resume="<.progress.json 里的 run_id>")` 续跑；label、prompt 哈希与产物哈希都一致的已完派发会直接复用，不重复派子任务。
+- 全新启动时也在 `params` 里带上 `"progress_path": "research/<D>-topic-<slug>/.progress.json"`，让中断后的 run 可被发现与续跑。
+
 1. **先用 Read 工具读 `.agents/skills/run-workflow/SKILL.md`**，了解 workflow 规范（workflow 启用时，加载本 skill 会自动解锁 `RunWorkflow`）。
 2. **范围确认与锁定**：
    - 在与 PM 对话时，先用 **≤3 个问题**确认并锁定 5 项范围：
@@ -29,12 +35,13 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
            "horizon": "<时间范围，如 2026Q1-2026Q3 或 近30天>",
            "workspace_dir": "<当前工作区路径>",
            "related_tickers": ["<TICKER1>", "<TICKER2>"],
-           "core_questions": ["<Q1>", "<Q2>", "..."]
+           "core_questions": ["<Q1>", "<Q2>", "..."],
+           "progress_path": "research/<D>-topic-<slug>/.progress.json"
        }
    )
    ```
    Workflow 不可用时：
-   - **`workflow.enabled` 已关闭**（工具列表本来就不会有 `RunWorkflow`）：主智能体按下述 Phase 的顺序手动执行，并逐阶段核对产物。
+   - **`workflow.enabled` 已关闭**（工具列表本来就不会有 `RunWorkflow`）：主智能体按下述 Phase 的顺序手动执行，并逐阶段核对产物。Phase 6 派 `dalton-reviewer` 审最终稿后，把它返回的 JSON（含 `verdict` 与 `draft_sha256`）原样保存到 `research/<D>-topic-<slug>/review.json`（多轮复审时保存最后一轮；改稿后必须重审并覆盖）；收尾调用 `dalton_check_done` 时在 `params` 里加 `"manual": true`、不传 `run_id`，审稿据此文件核对。
    - **否则**（`workflow.enabled` 未关闭）：`RunWorkflow` 不在工具列表时，先用 **Read 工具**（不要用 Bash `cat`）读 `.agents/skills/run-workflow/SKILL.md` 后重试；仍没有就停下，告诉 PM「RunWorkflow 不可用」，不要自行手动派发 Task 子智能体代跑。
 
 ---
@@ -129,4 +136,8 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 2. **跨公司更新走提案机制**：
    - 若专题结论涉及其他覆盖公司（或当前在 Home 工作区），**不得直接跨目录修改其他公司的 `data/*.json`**，应生成知识层修改提案，在 Home 通过 `delegate_to_analyst` 交办给对应公司分析师，或在公司工作区通过 `pm_handoffs` 提请同步。
 3. **严禁写回基金 Wiki**：`wiki/` 目录由基金统一维护，分析师只读不写。
-4. **发布归档**：当 `dalton-reviewer` 通过且 PM 要求正式发布时，先运行 `check_draft`，再调用 `publish_report(draft_path=..., kind="topic", slug="<slug>", updates_thesis=False)`。
+4. **汇报完成前必须过完成契约（`dalton_check_done`）**：
+   - 调用 `dalton_check_done(workflow="topic-research", run_id=<`research/<D>-topic-<slug>/.progress.json` 里的 run_id>, params={<启动时的同一组参数，slug 一致；未传 as_of 时用 as_of="latest">})`；
+   - 走手动降级路径（`workflow.enabled` 已关闭、没有 run）时不传 `run_id`，`params` 里加 `"manual": true`，审稿结论按 `research/<D>-topic-<slug>/review.json` 核对；
+   - `done=false` 时按 `missing` 先补齐再查（缺文件补文件、`validate_topic.py` 修到通过、知识层缺 source=tool 新版本就 `knowledge_update`），补不了的缺项只能汇报"未完成"并列出缺项与原因，不得汇报"完成"。
+5. **发布归档**（完成契约通过后）：当 `dalton-reviewer` 通过且 PM 要求正式发布时，先运行 `check_draft`，再调用 `publish_report(draft_path=..., kind="topic", slug="<slug>", updates_thesis=False)`。

@@ -69,6 +69,12 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 
 当 PM 要求完整文档、深度多空成稿，或议程自动任务触发完整成稿时：
 
+### 开始前：检查未完成的 run（中断续跑）
+
+- 读 `research/<as_of>-bullbear/.progress.json`（及 `research/` 下其他 `*/.progress.json`），看是否有本 workflow 的 `status` 不是终态（`completed`/`failed`/`cancelled`）的 run。
+- 有未完成的 run 时不要新开 run：用**原参数**调用 `RunWorkflow(workflow="bullbear-doc", params={...原参数..., "progress_path": "research/<as_of>-bullbear/.progress.json"}, resume="<.progress.json 里的 run_id>")` 续跑；label、prompt 哈希与产物哈希都一致的已完派发会直接复用，不重复派子任务。
+- 全新启动时也在 `params` 里带上 `"progress_path": "research/<as_of>-bullbear/.progress.json"`，让中断后的 run 可被发现与续跑。
+
 1. **加载 workflow 工具**
    - 用 Read 工具读 `.agents/skills/run-workflow/SKILL.md` 了解 workflow 规范（workflow 启用时，加载本 skill 会自动解锁 `RunWorkflow`）。
    - 读 `.agents/skills/dalton-bullbear/references/v42-structure.md` 与 `references/return-branch.md` 了解产物标准。
@@ -85,7 +91,8 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
          "workspace_dir": "<当前工作区路径>",
          "as_of": "<YYYY-MM-DD>",
          "research_days": 92,
-         "prior_draft": "<可选：上一版 bullbear 草稿或发布稿路径>"
+         "prior_draft": "<可选：上一版 bullbear 草稿或发布稿路径>",
+         "progress_path": "research/<as_of>-bullbear/.progress.json"
        }
      }
      ```
@@ -96,13 +103,15 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
      - **阶段 4（合并与审稿）**：把 `return.md` 插入 `<!-- INSERT:return -->`、`return_appendix.md` 插入 `<!-- INSERT:return_appendix -->`，生成 `drafts/<as_of>-bullbear.md`，复跑 `bb_check.py` 到 0 WARN，并派 `dalton-reviewer` 独立审稿。
      - **阶段 5（修订）**：按审稿意见处理全部 P0 与可改 P1，复跑 `bb_check.py` 确认 0 WARN。
    - **Workflow 不可用时的降级路径**：
-     - **`workflow.enabled` 已关闭**（工具列表本来就不会有 `RunWorkflow`）：主智能体按上述阶段 1→5 的顺序手动执行脚本与支线写作，最终输出到 `drafts/<as_of>-bullbear.md`，并逐阶段核对产物。
+     - **`workflow.enabled` 已关闭**（工具列表本来就不会有 `RunWorkflow`）：主智能体按上述阶段 1→5 的顺序手动执行脚本与支线写作，最终输出到 `drafts/<as_of>-bullbear.md`，并逐阶段核对产物。阶段 4 派 `dalton-reviewer` 审最终稿后，把它返回的 JSON（含 `verdict` 与 `draft_sha256`）原样保存到 `research/<as_of>-bullbear/review.json`（多轮复审时保存最后一轮；改稿后必须重审并覆盖）；收尾调用 `dalton_check_done` 时在 `params` 里加 `"manual": true`、不传 `run_id`，审稿据此文件核对。
      - **否则**（`workflow.enabled` 未关闭）：`RunWorkflow` 不在工具列表时，先用 **Read 工具**（不要用 Bash `cat`）读 `.agents/skills/run-workflow/SKILL.md` 后重试；仍没有就停下，告诉 PM「RunWorkflow 不可用」，不要自行手动派发 Task 子智能体代跑。
 
 3. **主智能体核查与收尾**
    - 检查 `drafts/<as_of>-bullbear.md` 是否存在，运行 `python .agents/skills/dalton-bullbear/scripts/bb_check.py drafts/<as_of>-bullbear.md` 确认 0 WARN。末尾必须附引用表（在报告末尾 `## 引用` 一节逐行写出 `[引用1]: evidence:E-20261023-01` 或 `[引用3]: model:model/META-model-v01.xlsx!DCF!C12` 等对应关系）。
    - 可选调用 `check_draft(draft_path="drafts/<as_of>-bullbear.md")` 查看数字核验反馈（草稿期不阻断）。
-   - 执行下方知识层写入，向 PM 汇报核心判断、各 Debate 倾向变化及审稿结论。
+   - 执行下方知识层写入（第三节第 1–3 步）。
+   - **汇报完成前必须过完成契约**：调用 `dalton_check_done(workflow="bullbear-doc", run_id=<`research/<as_of>-bullbear/.progress.json` 里的 run_id>, params={<启动时的同一组参数，含 as_of>})`（走手动降级路径、没有 run 时不传 `run_id`，`params` 里加 `"manual": true`，审稿结论按 `research/<as_of>-bullbear/review.json` 核对）；`done=false` 时按 `missing` 先补齐再查（缺文件补文件、`bb_check` 修到 0 WARN、知识层缺 source=tool 新版本就 `knowledge_update`、check_draft 用了旧草稿就对最终稿重跑），补不了的缺项只能汇报"未完成"并列出缺项，不得汇报"完成"。
+   - 完成契约通过后，向 PM 汇报核心判断、各 Debate 倾向变化及审稿结论；如需正式发布，按第三节第 4 步执行。
 
 ---
 

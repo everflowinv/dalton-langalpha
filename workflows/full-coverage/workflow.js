@@ -11,13 +11,53 @@ const base = `先读 .agents/skills/dalton-conventions/SKILL.md 与 ${S}/SKILL.m
 const OUT = {
   type: 'object',
   properties: {
-    files: { type: 'array', items: { type: 'string' } },
-    summary: { type: 'string' },
-    sha256: { type: 'string' },
+    files: { type: 'array', items: { type: 'string', minLength: 1 } },
+    summary: { type: 'string', minLength: 1 },
+    sha256: { type: 'string', minLength: 64 },
     gaps: { type: 'array', items: { type: 'string' } },
   },
   required: ['files', 'summary'],
 }
+const VERDICT = {
+  type: 'object',
+  properties: {
+    verdict: { type: 'string', enum: ['pass', 'revise', 'block'] },
+    summary: { type: 'string', minLength: 1 },
+    must_fix: { type: 'array', items: { type: 'string', minLength: 1 } },
+    draft_sha256: { type: 'string', minLength: 64 },
+  },
+  required: ['verdict', 'summary', 'draft_sha256'],
+}
+const HASH = {
+  type: 'object',
+  properties: {
+    files: { type: 'array', items: { type: 'string', minLength: 1 } },
+  },
+  required: ['files'],
+}
+const FINAL_MODEL = {
+  type: 'object',
+  properties: {
+    path: { type: 'string', minLength: 1 },
+    sha256: { type: 'string', minLength: 64 },
+  },
+  required: ['path', 'sha256'],
+}
+// Compare model paths relative to the workspace: callers pass workspace_dir
+// either as '.' or as an absolute folder, while the resolver reports model/….
+const normPath = (p) => {
+  if (typeof p !== 'string') return p
+  let s = p.replace(/^\.\//, '')
+  const w = typeof W === 'string' ? W.replace(/\/+$/, '').replace(/^\.\//, '') : ''
+  if (w && w !== '.' && s.startsWith(w + '/')) s = s.slice(w.length + 1)
+  return s.replace(/^\.\//, '')
+}
+const verdictOf = (r) => (r && typeof r === 'object' ? r.verdict : null)
+const DRAFT_OUT = { ...OUT, required: ['files', 'summary', 'sha256'] }
+const shaOf = (r) =>
+  r && typeof r === 'object' && typeof r.sha256 === 'string' && /^[0-9a-f]{64}$/.test(r.sha256)
+    ? r.sha256
+    : null
 
 phase('一手材料与数字底表')
 const facts = await agent(
@@ -25,14 +65,14 @@ const facts = await agent(
   { agentType: 'dalton-evidence', label: '数字底表', phase: '一手材料与数字底表', schema: OUT }
 )
 if (facts === null) {
-  return { ok: false, reason: '数字底表失败，后续阶段不启动' }
+  return { ok: false, reason: '数字底表失败，后续阶段不启动', incomplete: ['数字底表失败，后续阶段不启动'] }
 }
 
 phase('问题清单')
 const frame = await agent(
   `${base} 按 ${S}/references/frame.md 写 ${R}/questions.md。PM 要求：${args.pm_brief || '无'}；重点问题：${
     (args.focus_questions || []).join('；') || '默认'
-  }。写完跑 python ${S}/scripts/research_structure.py validate-agenda ${R}/questions.md 到通过。初次覆盖稿与知识层在 ${W}/drafts/ 与 ${W}/ 根目录。`,
+  }。写完跑 python ${S}/scripts/research_structure.py validate-agenda ${R}/questions.md 到通过。初次覆盖稿与知识层在 ${W}/drafts/ 与 ${W} 根目录。`,
   { agentType: 'general-purpose', label: 'frame', phase: '问题清单', schema: OUT }
 )
 
@@ -86,8 +126,11 @@ const memo3 =
     ? null
     : await agent(
         `${base} 续写 ${W}/drafts/${D}-memo.md 第三段（七至十、附录、引用清单），先通读前两段保持文风与引用编号连贯；第七章用 C4 指引可信度表，第九章估值与模型一致。跑 python ${S}/scripts/validate_memo.py --mode full ${W}/drafts/${D}-memo.md 到 0 FAIL，并返回 ${W}/drafts/${D}-memo.md 的 sha256。`,
-        { agentType: 'general-purpose', label: 'memo 第三段', phase: '建模与 memo 第一段', schema: OUT }
+        { agentType: 'general-purpose', label: 'memo 第三段', phase: '建模与 memo 第一段', schema: DRAFT_OUT }
       )
+
+const memoSha = memo3 === null ? null : shaOf(memo3)
+const memoOk = memo3 !== null && memoSha !== null
 
 phase('审模型与审稿')
 const [mcheck, review] = await parallel([
@@ -102,54 +145,241 @@ const [mcheck, review] = await parallel([
     memo3 === null
       ? Promise.resolve(null)
       : agent(
-          `审阅 ${W}/drafts/${D}-memo.md，支线 ${R}/e*.md，底表 ${R}/facts.md，模型 ${W}/model/${T}-model-v01.xlsx（全部只读，不修改任何文件）。先只凭核心判断和零章复述投资论点，再逐题检查，重点 Q1–Q5、Q7、Q8、Q12。`,
-          { agentType: 'dalton-reviewer', label: '独立审稿', phase: '审模型与审稿' }
+          `审阅 ${W}/drafts/${D}-memo.md（被审草稿 sha256：${
+            memoSha || '未知'
+          }；支线 ${R}/e*.md，底表 ${R}/facts.md，模型 ${W}/model/${T}-model-v01.xlsx，全部只读，不修改任何文件）。先只凭核心判断和零章复述投资论点，再逐题检查，重点 Q1–Q5、Q7、Q8、Q12。按 dalton-reviewer 规范输出 JSON（verdict ∈ pass/revise/block；draft_sha256 填提示词里的被审草稿 sha256 原值）。`,
+          { agentType: 'dalton-reviewer', label: '独立审稿', phase: '审模型与审稿', schema: VERDICT }
         ),
 ])
 
+// 修订循环与收尾只认 resolveFinalModel()（确定性子任务：ls … | sort -V | tail -1）
+// 解析出的磁盘路径；每轮修订后、复审前都解析一次，并与修订回报的路径比对。
+const memoPath = `${W}/drafts/${D}-memo.md`
+const modelFileIn = (files) => {
+  const found = (Array.isArray(files) ? files : [])
+    .map((f) => {
+      const m = typeof f === 'string' ? f.match(/-model-v(\d+)\.xlsx$/) : null
+      return m ? { path: f, version: Number(m[1]) } : null
+    })
+    .filter(Boolean)
+  return found.length ? found.reduce((a, b) => (b.version > a.version ? b : a)).path : null
+}
+const nextVersion = (p) =>
+  p.replace(/-model-v(\d+)\.xlsx$/, (_, v) => `-model-v${String(Number(v) + 1).padStart(v.length, '0')}.xlsx`)
+const resolveFinalModel = async (label) => {
+  const r = await agent(
+    `在 workspace 里执行：ls model/${T}-model-v*.xlsx 2>/dev/null | sort -V | tail -1，对输出文件计算 sha256sum。只返回 JSON：path（ls 的原样输出）与 sha256（64 位十六进制）。不写任何文件。`,
+    { agentType: 'dalton-evidence', label, phase: '解析最终模型', schema: FINAL_MODEL }
+  )
+  return r && typeof r.path === 'string' && r.path && shaOf(r) ? { path: normPath(r.path), sha256: r.sha256 } : null
+}
+
+let modelPath = `${W}/model/${T}-model-v01.xlsx`
+const incomplete = []
+let fix = null
+let finalReview = review
+let rounds = 0
+let currentMemoSha = memoSha
+// 提前结束时解析一次磁盘上的模型，作为返回值里的 model；建模失败则没有模型。
+const resolveOnExit = async () => {
+  if (model === null) return null
+  const r = await resolveFinalModel('解析模型（终止）')
+  if (r === null) incomplete.push('解析最终模型的子任务失败')
+  return r
+}
+// 所有提前返回的出口都经过 finish：返回值里的 model 只取传进来的解析结果。
+const finish = (resolved, extra = {}) => ({
+  ok: false,
+  memo: memoPath,
+  model: resolved ? resolved.path : null,
+  model_check: mcheck && `${R}/model-check.md`,
+  revise_rounds: rounds,
+  incomplete,
+  ...extra,
+})
+
+if (review && verdictOf(review) === 'block') {
+  incomplete.push(`审稿 block：${review.summary || '存在不可修订级问题'}`)
+  return finish(await resolveOnExit(), { blocked: review.summary || '审稿 block' })
+}
+
 phase('修订')
-const fix =
-  review === null
-    ? null
-    : await agent(
-        `${base} 先核对 ${W}/drafts/${D}-memo.md 的 sha256 是否与审稿前（${
-          memo3 && memo3.sha256 ? memo3.sha256 : '第三段记录值'
-        }）一致；按审稿意见与 ${R}/model-check.md 修订 memo 和模型（模型若有改动走 .agents/skills/model-update/SKILL.md，另存 ${W}/model/${T}-model-v02.xlsx，不覆盖 v01）。P0 全改，跑 python ${S}/scripts/validate_memo.py --mode full ${W}/drafts/${D}-memo.md 到 0 FAIL。审稿意见：\n${review}`,
-        { agentType: 'general-purpose', label: '修订', phase: '修订', schema: OUT }
+// revise → 修订 → 解析模型 → 复审，最多 2 轮；每个失败出口都写进 incomplete 并停下
+let resolved = null
+while (finalReview && verdictOf(finalReview) === 'revise' && rounds < 2) {
+  rounds += 1
+  const target = nextVersion(modelPath)
+  const modelClause =
+    model === null
+      ? '建模失败，本轮只改 memo'
+      : `模型若有改动走 .agents/skills/model-update/SKILL.md，另存为 ${target}，不覆盖旧版本；模型没改就原样沿用 ${modelPath}。不管改没改，都必须在 files 里回报当前模型的路径（另存则报 ${target}，未改则报 ${modelPath}）`
+  fix = await agent(
+    `${base} 先核对 ${memoPath} 的 sha256 是否与审稿前（${
+      currentMemoSha || '当前记录值'
+    }）一致；按审稿意见与 ${R}/model-check.md 做第 ${rounds} 轮修订（memo 与模型；${modelClause}）。P0 全改，跑 python ${S}/scripts/validate_memo.py --mode full ${memoPath} 到 0 FAIL。审稿意见：\n${JSON.stringify(
+      finalReview
+    )}`,
+    { agentType: 'general-purpose', label: `修订 ${rounds}`, phase: '修订', schema: DRAFT_OUT }
+  )
+  const fixedMemoSha = shaOf(fix)
+  if (fixedMemoSha === null) {
+    incomplete.push(`第 ${rounds} 轮修订失败（修订结果或其 sha256 缺失/非法），未复审，流程终止`)
+    return finish(await resolveOnExit())
+  }
+  if (model !== null) {
+    const reportedPath = modelFileIn(fix.files)
+    if (!reportedPath) {
+      incomplete.push(`第 ${rounds} 轮修订未回报模型路径（模型未改也须回报 ${modelPath}），未复审，流程终止`)
+      return finish(await resolveOnExit())
+    }
+    const disk = await resolveFinalModel(`解析模型（修订 ${rounds}）`)
+    if (disk === null) {
+      incomplete.push(`第 ${rounds} 轮修订后解析模型的子任务失败，未复审，流程终止`)
+      return finish(null)
+    }
+    if (normPath(reportedPath) !== disk.path) {
+      incomplete.push(
+        `第 ${rounds} 轮修订后模型版本不一致：回报 ${reportedPath}，磁盘最大版本 ${disk.path}，最终模型不确定，未复审，流程终止`
       )
+      return finish(disk)
+    }
+    modelPath = disk.path
+    resolved = disk
+  }
+  currentMemoSha = fixedMemoSha
+  const reReview = await agent(
+    `复审（第 ${rounds} 轮修订后）：审阅 ${memoPath}（被审草稿 sha256：${
+      currentMemoSha
+    }；模型 ${model === null ? '建模失败，无模型' : modelPath}；${W}/model/*.xlsx 只读不改）。重点核对上一轮 must_fix 是否全部解决。按 dalton-reviewer 规范输出 JSON（verdict ∈ pass/revise/block；draft_sha256 填提示词里的被审草稿 sha256 原值）。上一轮审稿意见：\n${JSON.stringify(
+      finalReview
+    )}`,
+    { agentType: 'dalton-reviewer', label: `复审 ${rounds}`, phase: '修订', schema: VERDICT }
+  )
+  if (reReview === null) {
+    incomplete.push(`第 ${rounds} 轮复审失败，流程终止`)
+    return finish(resolved)
+  }
+  if (verdictOf(reReview) === 'block') {
+    incomplete.push(`复审 block：${reReview.summary || '存在不可修订级问题'}，流程终止`)
+    return finish(resolved, { blocked: reReview.summary || '复审 block' })
+  }
+  finalReview = reReview
+}
+const reviewPassed = finalReview !== null && verdictOf(finalReview) === 'pass'
+
+// 循环结束后再确认一次：磁盘最大版本必须就是循环里最后确认的 modelPath。
+// 之后的知识草案、核验清单、返回值都只用 finalModel.path。
+phase('解析最终模型')
+let finalModel = null
+if (model !== null) {
+  finalModel = await resolveFinalModel('解析最终模型')
+  if (finalModel === null) {
+    incomplete.push('解析最终模型的子任务失败，流程终止')
+    return finish(null)
+  }
+  if (finalModel.path !== normPath(modelPath)) {
+    incomplete.push(
+      `最终模型与修订确认的版本（${modelPath}）不一致：磁盘最大版本 ${finalModel.path}，最终模型不确定，流程终止`
+    )
+    return finish(finalModel)
+  }
+  modelPath = finalModel.path
+}
 
 const kp =
   memo3 === null
     ? null
     : await agent(
-        `${base} 对比 ${W}/ 根目录现有知识层与修订后的 ${W}/drafts/${D}-memo.md，按 PK.2 的 JSON Schema 写知识层修订草案 ${R}/knowledge-revision.json（结构为 {doc: {ops, reason, evidence_refs}}）：每处改动给旧值、新值、原因、证据（引用编号）。管理层指引风格与 C4 历史写入 management 部分；不直接修改 ${W}/data/。`,
+        `${base} 先核对 ${memoPath} 的 sha256 是否为修订后哈希（${currentMemoSha || '修订后记录值'}）；最终模型为 ${finalModel ? finalModel.path : '无（建模失败）'}；再对比 ${W} 根目录现有知识层，按 PK.2 的 JSON Schema 写知识层修订草案 ${R}/knowledge-revision.json（结构为 {doc: {ops, reason, evidence_refs}}）：每处改动给旧值、新值、原因、证据（引用编号）。管理层指引风格与 C4 历史写入 management 部分；不直接修改 ${W}/data/。`,
         { agentType: 'general-purpose', label: '知识层修订草案', phase: '修订', schema: OUT }
       )
 
+if (frame === null) incomplete.push('问题清单 frame 失败')
+if (evMissing.length) incomplete.push(`支线失败：${evMissing.join('、')}`)
+if (model === null) incomplete.push('建模失败')
+if (memo1 === null || memo2 === null || !memoOk) incomplete.push('memo 三段写作失败（末段草稿或其 sha256 缺失/非法）')
+if (mcheck === null && model !== null) incomplete.push('check-model 失败')
+if (review === null && memoOk) incomplete.push('独立审稿失败')
+if (!reviewPassed && !incomplete.length) incomplete.push('审稿未最终通过（无 pass 记录）')
+if (kp === null && memoOk) incomplete.push('知识层修订草案失败')
+
+phase('产物核验')
+const deliverables = [
+  `${R}/facts.md`,
+  `${R}/questions.md`,
+  `${R}/ea.md`,
+  `${R}/eb.md`,
+  `${R}/ec.md`,
+  `${R}/ed.md`,
+  // No model when the build failed: never list an assumed v01 (the run is
+  // already incomplete for it).
+  ...(finalModel ? [finalModel.path] : []),
+  memoPath,
+  `${R}/model-check.md`,
+  `${R}/knowledge-revision.json`,
+]
+const check =
+  !memoOk
+    ? null
+    : await agent(
+        `只读核对以下文件是否存在并计算 sha256（用 bash 的 test -e 与 sha256sum，不写任何文件）。只返回下面列出的文件，一个不能少、不能多、不能夹带其他条目：\n${deliverables
+          .map((p) => '- ' + p)
+          .join('\n')}\n返回 files 字符串数组：存在的文件写 “<路径>|<sha256>”，不存在的只写 “<路径>”（不带竖线）。`,
+        { agentType: 'dalton-evidence', label: '产物核验', phase: '产物核验', schema: HASH }
+      )
+const SHA_RE = /^[0-9a-f]{64}$/
+const expected = new Set(deliverables)
+const reported = new Set()
+for (const entry of check && Array.isArray(check.files) ? check.files : []) {
+  const bar = entry.indexOf('|')
+  const path = bar > 0 ? entry.slice(0, bar) : ''
+  const sha = bar > 0 ? entry.slice(bar + 1) : ''
+  if (!path || !SHA_RE.test(sha) || !expected.has(path)) {
+    incomplete.push(`产物核验返回无效条目：${entry}`)
+    continue
+  }
+  reported.add(path)
+}
+for (const path of deliverables) {
+  if (!reported.has(path)) incomplete.push(`产物缺失或未报哈希：${path}`)
+}
+
 phase('自动跟踪')
-const tracking =
-  memo3 === null
-    ? { ok: false, skipped: true, reason: 'memo 未完成' }
-    : {
-        action: 'enable',
-        source: 'coverage_finish',
-        tool: 'dalton_coverage_tracking',
-        call: 'dalton_coverage_tracking(action="enable", source="coverage_finish")',
-        respect_user_pause: true,
-      }
-if (memo3 !== null) {
+// The tracking hint follows the run's own completion verdict exactly: an
+// unfinished run must not tell the analyst to switch tracking on.
+const runOk = memoOk && reviewPassed && incomplete.length === 0
+const tracking = runOk
+  ? {
+      action: 'enable',
+      source: 'coverage_finish',
+      tool: 'dalton_coverage_tracking',
+      call: 'dalton_coverage_tracking(action="enable", source="coverage_finish")',
+      respect_user_pause: true,
+    }
+  : {
+      ok: false,
+      skipped: true,
+      reason: !memoOk ? 'memo 未完成' : !reviewPassed ? '审稿未最终通过' : `流程未完成：${incomplete[0]}`,
+    }
+if (runOk) {
   log(
     `完整覆盖完成，收尾需调用 dalton_coverage_tracking(action="enable", source="coverage_finish") 开启 ${T} 自动跟踪（若 paused_by_user 则保持关闭）`
   )
+} else {
+  log(`不开启自动跟踪：${tracking.reason}`)
 }
 
 return {
-  ok: memo3 !== null,
+  ok: runOk,
   memo: `${W}/drafts/${D}-memo.md`,
-  model: model && `${W}/model/${T}-model-v01.xlsx`,
-  review_done: review !== null,
+  model: finalModel ? finalModel.path : null,
+  review_done: finalReview !== null,
+  review_verdict: finalReview && verdictOf(finalReview),
+  revise_rounds: rounds,
+  fix_summary: fix && fix.summary,
   model_check: mcheck && `${R}/model-check.md`,
   knowledge_revision: kp && `${R}/knowledge-revision.json`,
   evidence_missing: evMissing,
   tracking,
+  incomplete,
 }
