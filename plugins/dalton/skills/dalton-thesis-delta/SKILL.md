@@ -3,15 +3,15 @@ name: dalton-thesis-delta
 description: "采集覆盖公司最新一致预期变化、新公告、内部研究库与卖方增量，对照现有知识层判断是否构成实质性变化，仅在有重要变化时写增量笔记并更新知识层。用于覆盖公司的日常增量跟踪或检查近期基本面有无边际变化；无实质变化时快速短路完成，有变化时需几分钟。"
 ---
 
-# Dalton 每晚 Thesis 增量跟踪（`dalton-thesis-delta`）
+# Dalton 每日 Thesis 增量跟踪（`dalton-thesis-delta`）
 
 Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the first deliverable.
 公司认知按 `.agents/skills/dalton-knowledge/SKILL.md` 的读序读（`agent.md` 托管块 → `thesis.md` → `debate.md` → 按需 `drivers.md`、`management.md`、`verdicts.md`、`agenda.md`）；收尾按 `.agents/skills/dalton-agenda/SKILL.md` 的三步。
 
 ## 目标与唤醒机制
 
-每晚对覆盖公司收一次“增量包”（一致预期快照与修正、六个内部研究来源 `company-wiki` / `guidepoint` / `funda-ai` / `sales-notes` / `tmtb` / `alphaengine`、新 SEC filing、新闻与 X），判断相对现有知识层是否存在**重要变化（material change）**：
-- **零成本预检与 `<dalton_wake>`**：盘中 `watch` 自动任务不再查内部研究库（只查 `sec`、`cnhk`、`agenda`、`earnings` 四个需要及时发现的探针）；六个内部研究来源全部由每晚的 `dalton-thesis-delta`（`collect.py`）统一扫一次。预检另有计划唤醒探针 `schedule` 与价格异动探针 `price`；无任何信号的轮次记 `skip`、花费为 0、不建线程。每晚 cron（`dalton-<t>-delta.json`）唤醒后线程首条上下文包含 `<dalton_wake>`（内含信号 `id`、`kind` 及详情）。
+每日对覆盖公司收一次“增量包”（一致预期快照与修正、六个内部研究来源 `company-wiki` / `guidepoint` / `funda-ai` / `sales-notes` / `tmtb` / `alphaengine`、新 SEC filing、新闻与 X），判断相对现有知识层是否存在**重要变化（material change）**：
+- **零成本预检与 `<dalton_wake>`**：盘中 `watch` 自动任务不再查内部研究库（只查 `sec`、`cnhk`、`agenda`、`earnings` 四个需要及时发现的探针）；六个内部研究来源全部由每日的 `dalton-thesis-delta`（`collect.py`）统一扫一次。预检另有计划唤醒探针 `schedule` 与价格异动探针 `price`；无任何信号的轮次记 `skip`、花费为 0、不建线程。每日 cron（`dalton-<t>-delta.json`，北京时间 11:00；Core 周二至周六，Watch 周六）唤醒后线程首条上下文包含 `<dalton_wake>`（内含信号 `id`、`kind` 及详情）。
 - **无重要变化不打扰 PM**：被唤醒后，若所有来源均取数成功（`ok: true`）且经判定不属于重要变化（`material=no`），只记一条 `NO_CHANGE` 结论并调用 `commit --material no` 更新 `seen.json`，**绝不向 PM 推送消息**。
 
 ---
@@ -86,7 +86,7 @@ python3 .agents/skills/dalton-thesis-delta/scripts/collect.py collect \
 1. **撰写增量笔记**：按 `.agents/skills/dalton-thesis-delta/templates/delta.md` 写入 `research/<YYYY-MM-DD>-delta.md`（写清变化是什么、一手与卖方证据、影响哪个 thesis 支柱或 debate、事件五词结论、下一项验证）。
 2. **更新知识层**：调用 `knowledge_update` 更新受影响的文档（`thesis` / `debate` / `drivers` / `management`）。
 3. **追加事件结论**：调用 `knowledge_append_verdict` 写入五词结论（`THESIS_STRENGTHENED` / `THESIS_WEAKENED` / `THESIS_BROKEN` / `NEW_THESIS` 或有实质新证据但维持原判的 `NO_CHANGE` + `progress="some"`（彻底解答问题时填 `"resolved"`）；`trigger.kind` 按第 1 步对照表与变化主要来源填 `consensus_change`、`internal_material`、`filing`、`earnings`、`indicator`、`price_move`、`due_validation`、`pm_question`、`agenda` 或 `manual`，`trigger.ref` 填 `<dalton_wake>` 信号 id）。
-4. **推送 PM**：输出不超过 10 行的精炼中文摘要推送给 PM（判断先行：五词结论 + 变化核心事实与带期间数字 + 受影响的支柱/Debate + 下一项验证）。
+4. **回复摘要**：最后一条回复写不超过 10 行的精炼中文摘要（delta 任务不发私信推送，PM 在对话里看到它；判断先行：五词结论 + 变化核心事实与带期间数字 + 受影响的支柱/Debate + 下一项验证）。
 
 #### 分支 B：无重要变化（`material=no`）
 1. **只记结论**：调用 `knowledge_append_verdict` 写入一条 `NO_CHANGE`（`progress="none"`，`trigger.kind` 按第 1 步对照表映射，`trigger.ref` 填唤醒信号 id）。
