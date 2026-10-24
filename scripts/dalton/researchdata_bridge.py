@@ -795,6 +795,7 @@ class BridgeConfig:
         self.host: str = os.environ.get("DALTON_BRIDGE_HOST", "127.0.0.1")
         self.port: int = int(os.environ.get("DALTON_BRIDGE_PORT", "8960"))
         self.token: str = os.environ.get("DALTON_BRIDGE_TOKEN", "").strip()
+        self.admin_token: str = os.environ.get("DALTON_BRIDGE_ADMIN_TOKEN", "").strip()
         self.ocw_root: Path = Path(
             os.environ.get(
                 "DALTON_OCW_ROOT",
@@ -3826,6 +3827,11 @@ class ResearchDataBridge:
         self._archive_proc: Any = None
         self._archive_watch_task: asyncio.Task[Any] | None = None
         self._archive_last_status: dict[str, Any] = {}
+        if not getattr(cfg, "admin_token", ""):
+            logger.warning(
+                "DALTON_BRIDGE_ADMIN_TOKEN is not set (checked env and ~/.config/dalton/researchdata-bridge.env); "
+                "all admin endpoints (/embed, /jobs/*) will reject requests (fail closed)"
+            )
 
     def handoff_routes(self) -> set[str]:
         """Return route IDs whose `kind` is `agent_tool` or `skill` in `data_sources.json`, excluding bridge-executed community routes."""
@@ -8209,6 +8215,49 @@ def _extract_supplied_token(headers: Mapping[str, str]) -> str:
     return ""
 
 
+def _is_valid_mcp_token(bridge: ResearchDataBridge, supplied_token: str) -> bool:
+    """Return True if ``supplied_token`` matches ``DALTON_BRIDGE_TOKEN`` or ``DALTON_BRIDGE_ADMIN_TOKEN``."""
+    if not supplied_token:
+        return False
+    supplied_bytes = supplied_token.encode("utf-8")
+    mcp_token = (getattr(bridge.cfg, "token", "") or "").strip()
+    admin_token = (getattr(bridge.cfg, "admin_token", "") or "").strip()
+    matched = False
+    if mcp_token and hmac.compare_digest(supplied_bytes, mcp_token.encode("utf-8")):
+        matched = True
+    if admin_token and hmac.compare_digest(supplied_bytes, admin_token.encode("utf-8")):
+        matched = True
+    return matched
+
+
+async def _require_admin_token(
+    bridge: ResearchDataBridge,
+    headers: Mapping[str, str],
+    writer: asyncio.StreamWriter,
+) -> bool:
+    """Verify ``DALTON_BRIDGE_ADMIN_TOKEN`` for all non-MCP routes (fail closed when unset)."""
+    supplied_token = _extract_supplied_token(headers)
+    expected_admin = (getattr(bridge.cfg, "admin_token", "") or "").strip()
+    if not expected_admin or not supplied_token:
+        await _send_http(
+            writer, 401, "Unauthorized", {"ok": False, "error": "Unauthorized"}
+        )
+        return False
+    supplied_bytes = supplied_token.encode("utf-8")
+    if hmac.compare_digest(supplied_bytes, expected_admin.encode("utf-8")):
+        return True
+    mcp_token = (getattr(bridge.cfg, "token", "") or "").strip()
+    if mcp_token and hmac.compare_digest(supplied_bytes, mcp_token.encode("utf-8")):
+        await _send_http(
+            writer, 403, "Forbidden", {"ok": False, "error": "Forbidden"}
+        )
+        return False
+    await _send_http(
+        writer, 401, "Unauthorized", {"ok": False, "error": "Unauthorized"}
+    )
+    return False
+
+
 async def _handle_client(
     bridge: ResearchDataBridge,
     reader: asyncio.StreamReader,
@@ -8280,15 +8329,130 @@ async def _handle_client(
             await _send_http(writer, 200, "OK", health_payload)
             return
 
-        # Route 2: POST /embed (header token only; path tokens rejected)
-        if path == "/embed":
-            supplied_token = _extract_supplied_token(headers)
-            expected_token = bridge.cfg.token
-            if not expected_token or not supplied_token or not hmac.compare_digest(
-                supplied_token.encode("utf-8"), expected_token.encode("utf-8")
-            ):
-                await _send_http(writer, 404, "Not Found", {"error": "Not Found"})
+        # Route 2: /mcp (header token) or legacy /mcp/<token> (path token, deprecated)
+        if path in ("/mcp", "/mcp/") or path.startswith("/mcp/"):
+            if path in ("/mcp", "/mcp/"):
+                supplied_token = _extract_supplied_token(headers)
+            else:
+                supplied_token = path[len("/mcp/") :].strip("/") or _extract_supplied_token(headers)
+
+            if not _is_valid_mcp_token(bridge, supplied_token):
+                # Constant-time rejection; NEVER log supplied_token or path
+                await _send_http(writer, 401, "Unauthorized", {"error": "Unauthorized"})
                 return
+
+            if method in ("GET", "DELETE"):
+                await _send_http(
+                    writer, 405, "Method Not Allowed", {"error": "Method Not Allowed"}
+                )
+                return
+
+            if method != "POST":
+                await _send_http(
+                    writer, 405, "Method Not Allowed", {"error": "Method Not Allowed"}
+                )
+                return
+
+            try:
+                rpc_msg = json.loads(body_bytes.decode("utf-8"))
+            except Exception:
+                await _send_http(
+                    writer,
+                    400,
+                    "Bad Request",
+                    {
+                        "jsonrpc": "2.0",
+                        "id": None,
+                        "error": {"code": -32700, "message": "Parse error"},
+                    },
+                )
+                return
+
+            if not isinstance(rpc_msg, dict):
+                await _send_http(
+                    writer,
+                    400,
+                    "Bad Request",
+                    {
+                        "jsonrpc": "2.0",
+                        "id": None,
+                        "error": {"code": -32600, "message": "Invalid Request"},
+                    },
+                )
+                return
+
+            req_id = rpc_msg.get("id")
+            rpc_method = str(rpc_msg.get("method") or "")
+            rpc_params = rpc_msg.get("params") if isinstance(rpc_msg.get("params"), dict) else {}
+
+            # JSON-RPC notifications (no id, e.g., notifications/initialized) -> 202 Accepted
+            if "id" not in rpc_msg or req_id is None:
+                await _send_http(writer, 202, "Accepted", None)
+                return
+
+            if rpc_method == "initialize":
+                init_res = await bridge.ensure_initialized()
+                offered_proto = str(rpc_params.get("protocolVersion") or "2024-11-05")
+                adopted_proto = (
+                    offered_proto
+                    if offered_proto in ("2024-11-05", "2025-03-26", "2025-11-25")
+                    else str(init_res.get("protocolVersion") or "2024-11-05")
+                )
+                reply = {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "result": {
+                        "protocolVersion": adopted_proto,
+                        "capabilities": {"tools": {}},
+                        "serverInfo": {
+                            "name": "researchdata",
+                            "version": bridge.server_version,
+                        },
+                    },
+                }
+                await _send_http(writer, 200, "OK", reply)
+                return
+
+            if rpc_method == "ping":
+                await _send_http(
+                    writer, 200, "OK", {"jsonrpc": "2.0", "id": req_id, "result": {}}
+                )
+                return
+
+            if rpc_method == "tools/list":
+                tools = await bridge.get_filtered_tools()
+                await _send_http(
+                    writer,
+                    200,
+                    "OK",
+                    {"jsonrpc": "2.0", "id": req_id, "result": {"tools": tools}},
+                )
+                return
+
+            if rpc_method == "tools/call":
+                reply = await bridge.handle_tools_call(req_id, rpc_params)
+                await _send_http(writer, 200, "OK", reply)
+                return
+
+            # Unsupported method (e.g. server/discover probe -> -32601 so client falls back to legacy initialize)
+            await _send_http(
+                writer,
+                200,
+                "OK",
+                {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "error": {"code": -32601, "message": f"Method not found: {rpc_method}"},
+                },
+            )
+            return
+
+        # Unified admin token gate for all non-MCP routes (/embed, /jobs/*, and future routes)
+        if not await _require_admin_token(bridge, headers, writer):
+            return
+
+        # Route 3: POST /embed (admin token required; path tokens rejected)
+        if path == "/embed":
             if method != "POST":
                 await _send_http(
                     writer, 405, "Method Not Allowed", {"error": "Method Not Allowed"}
@@ -8306,16 +8470,8 @@ async def _handle_client(
             await _send_http(writer, code, status_label, payload)
             return
 
-        # Route 2b: /jobs/conversation-archive* and /jobs/ops (header token auth)
+        # Route 4: /jobs/conversation-archive* and /jobs/ops (admin token required)
         if path == "/jobs/ops" or path.startswith("/jobs/conversation-archive"):
-            supplied_token = _extract_supplied_token(headers)
-            expected_token = bridge.cfg.token
-            if not expected_token or not supplied_token or not hmac.compare_digest(
-                supplied_token.encode("utf-8"), expected_token.encode("utf-8")
-            ):
-                await _send_http(writer, 401, "Unauthorized", {"ok": False, "error": "Unauthorized"})
-                return
-
             if path == "/jobs/conversation-archive":
                 if method != "GET":
                     await _send_http(writer, 405, "Method Not Allowed", {"error": "Method Not Allowed"})
@@ -8352,127 +8508,7 @@ async def _handle_client(
             await _send_http(writer, 404, "Not Found", {"error": "Not Found"})
             return
 
-        # Route 3: /mcp (header token) or legacy /mcp/<token> (path token, deprecated)
-        if path in ("/mcp", "/mcp/"):
-            supplied_token = _extract_supplied_token(headers)
-        elif path.startswith("/mcp/"):
-            supplied_token = path[len("/mcp/") :].strip("/") or _extract_supplied_token(headers)
-        else:
-            await _send_http(writer, 404, "Not Found", {"error": "Not Found"})
-            return
-
-        expected_token = bridge.cfg.token
-        if not expected_token or not supplied_token or not hmac.compare_digest(
-            supplied_token.encode("utf-8"), expected_token.encode("utf-8")
-        ):
-            # Constant-time rejection; NEVER log supplied_token or path
-            await _send_http(writer, 401, "Unauthorized", {"error": "Unauthorized"})
-            return
-
-        if method in ("GET", "DELETE"):
-            await _send_http(
-                writer, 405, "Method Not Allowed", {"error": "Method Not Allowed"}
-            )
-            return
-
-        if method != "POST":
-            await _send_http(
-                writer, 405, "Method Not Allowed", {"error": "Method Not Allowed"}
-            )
-            return
-
-        try:
-            rpc_msg = json.loads(body_bytes.decode("utf-8"))
-        except Exception:
-            await _send_http(
-                writer,
-                400,
-                "Bad Request",
-                {
-                    "jsonrpc": "2.0",
-                    "id": None,
-                    "error": {"code": -32700, "message": "Parse error"},
-                },
-            )
-            return
-
-        if not isinstance(rpc_msg, dict):
-            await _send_http(
-                writer,
-                400,
-                "Bad Request",
-                {
-                    "jsonrpc": "2.0",
-                    "id": None,
-                    "error": {"code": -32600, "message": "Invalid Request"},
-                },
-            )
-            return
-
-        req_id = rpc_msg.get("id")
-        rpc_method = str(rpc_msg.get("method") or "")
-        rpc_params = rpc_msg.get("params") if isinstance(rpc_msg.get("params"), dict) else {}
-
-        # JSON-RPC notifications (no id, e.g., notifications/initialized) -> 202 Accepted
-        if "id" not in rpc_msg or req_id is None:
-            await _send_http(writer, 202, "Accepted", None)
-            return
-
-        if rpc_method == "initialize":
-            init_res = await bridge.ensure_initialized()
-            offered_proto = str(rpc_params.get("protocolVersion") or "2024-11-05")
-            adopted_proto = (
-                offered_proto
-                if offered_proto in ("2024-11-05", "2025-03-26", "2025-11-25")
-                else str(init_res.get("protocolVersion") or "2024-11-05")
-            )
-            reply = {
-                "jsonrpc": "2.0",
-                "id": req_id,
-                "result": {
-                    "protocolVersion": adopted_proto,
-                    "capabilities": {"tools": {}},
-                    "serverInfo": {
-                        "name": "researchdata",
-                        "version": bridge.server_version,
-                    },
-                },
-            }
-            await _send_http(writer, 200, "OK", reply)
-            return
-
-        if rpc_method == "ping":
-            await _send_http(
-                writer, 200, "OK", {"jsonrpc": "2.0", "id": req_id, "result": {}}
-            )
-            return
-
-        if rpc_method == "tools/list":
-            tools = await bridge.get_filtered_tools()
-            await _send_http(
-                writer,
-                200,
-                "OK",
-                {"jsonrpc": "2.0", "id": req_id, "result": {"tools": tools}},
-            )
-            return
-
-        if rpc_method == "tools/call":
-            reply = await bridge.handle_tools_call(req_id, rpc_params)
-            await _send_http(writer, 200, "OK", reply)
-            return
-
-        # Unsupported method (e.g. server/discover probe -> -32601 so client falls back to legacy initialize)
-        await _send_http(
-            writer,
-            200,
-            "OK",
-            {
-                "jsonrpc": "2.0",
-                "id": req_id,
-                "error": {"code": -32601, "message": f"Method not found: {rpc_method}"},
-            },
-        )
+        await _send_http(writer, 404, "Not Found", {"error": "Not Found"})
     except Exception as exc:
         logger.error("Unhandled bridge error: %s", type(exc).__name__)
         try:
@@ -8497,6 +8533,11 @@ async def main() -> None:
             "DALTON_BRIDGE_TOKEN is not set (checked env and ~/.config/dalton/researchdata-bridge.env)"
         )
         sys.exit(1)
+    if not cfg.admin_token:
+        logger.warning(
+            "DALTON_BRIDGE_ADMIN_TOKEN is not set (checked env and ~/.config/dalton/researchdata-bridge.env); "
+            "all admin endpoints (/embed, /jobs/*) will reject requests (fail closed)"
+        )
 
     bridge = ResearchDataBridge(cfg)
     try:

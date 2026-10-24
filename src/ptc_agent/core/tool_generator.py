@@ -657,6 +657,8 @@ except ImportError:
         """
         layout = SandboxLayout(working_dir)
         servers: dict[str, dict[str, Any]] = {}
+        from src.dalton.settings import sanitize_mcp_client_config_server  # DALTON-HOOK(bridge-admin-token)
+
         for server in server_configs:
             untrusted = is_untrusted_server(server)
             entry: dict[str, Any]
@@ -668,7 +670,7 @@ except ImportError:
                 }
             else:
                 entry = self._client_entry(server, untrusted, layout)
-            servers[server.name] = entry
+            servers[server.name] = sanitize_mcp_client_config_server(server, entry)  # DALTON-HOOK(bridge-admin-token)
 
         return {
             "working_dir": working_dir,

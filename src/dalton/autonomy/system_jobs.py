@@ -24,8 +24,8 @@ from src.dalton.autonomy.tracking import (
     resolve_workspace_id_by_ticker,
 )
 from src.dalton.settings import (
+    get_dalton_bridge_admin_token,
     get_dalton_bridge_base_url,
-    get_dalton_bridge_token,
     get_dalton_config,
 )
 from src.server.database import automation as auto_db
@@ -180,7 +180,7 @@ async def _call_host_bridge(
 ) -> tuple[int, dict[str, Any] | None]:
     """Call the host-side researchdata bridge with token authentication."""
     base_url = get_dalton_bridge_base_url().rstrip("/")
-    token = get_dalton_bridge_token()
+    token = get_dalton_bridge_admin_token()
     url = f"{base_url}{path}"
     headers: dict[str, str] = {}
     if token:

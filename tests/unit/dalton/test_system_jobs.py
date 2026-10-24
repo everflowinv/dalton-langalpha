@@ -436,7 +436,10 @@ async def test_bridge_conversation_archive_auth_lock_sanitization_and_shell_exit
     status_file = tmp_path / "conversation-archive-status.json"
     log_file = tmp_path / "conversation-archive.log"
     env_file = tmp_path / "bridge.env"
-    env_file.write_text("DALTON_BRIDGE_TOKEN=bridge-secret-token\n", encoding="utf-8")
+    env_file.write_text(
+        "DALTON_BRIDGE_TOKEN=bridge-secret-token\nDALTON_BRIDGE_ADMIN_TOKEN=bridge-admin-secret-token\n",
+        encoding="utf-8",
+    )
     log_file.write_text(
         "Running archive with Bearer secret-token-1234567890 and /Users/alice/secret/path\n"
         "Cookie: a=1; b=2; sid=super-secret-cookie\n"
@@ -447,8 +450,11 @@ async def test_bridge_conversation_archive_auth_lock_sanitization_and_shell_exit
     )
 
     monkeypatch.setenv("DALTON_BRIDGE_ENV_FILE", str(env_file))
+    monkeypatch.delenv("DALTON_BRIDGE_TOKEN", raising=False)
+    monkeypatch.delenv("DALTON_BRIDGE_ADMIN_TOKEN", raising=False)
     cfg = bridge_mod.BridgeConfig()
     cfg.token = "bridge-secret-token"
+    cfg.admin_token = "bridge-admin-secret-token"
     cfg.archive_state_file = state_file
     cfg.archive_status_file = status_file
     cfg.archive_log_file = log_file
@@ -479,7 +485,15 @@ async def test_bridge_conversation_archive_auth_lock_sanitization_and_shell_exit
     code_unauth, _ = await _send_raw_http("GET", "/jobs/conversation-archive")
     assert code_unauth == 401
 
-    auth_headers = {"Authorization": "Bearer bridge-secret-token"}
+    # MCP token is rejected on admin endpoints -> 403
+    code_mcp_tok, _ = await _send_raw_http(
+        "GET",
+        "/jobs/conversation-archive",
+        {"Authorization": "Bearer bridge-secret-token"},
+    )
+    assert code_mcp_tok in (401, 403)
+
+    auth_headers = {"Authorization": "Bearer bridge-admin-secret-token"}
 
     # Authorized GET -> returns sanitized log_tail (multi-cookie, Bearer, paths, 40+ char hex/b64 all redacted)
     code_get, data = await _send_raw_http("GET", "/jobs/conversation-archive", auth_headers)
@@ -1557,4 +1571,354 @@ async def test_bridge_state_write_oserror_returns_500_and_ok_false_and_cookie_ov
     assert "from './useWorkspaceTracking'" in toggle_src
     assert "export function useWorkspaceTracking" not in toggle_src
     assert "export function useUpdateWorkspaceTracking" not in toggle_src
+
+
+@pytest.mark.asyncio
+async def test_bridge_admin_token_separation_and_backend_callers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Verify bridge separates MCP token (`DALTON_BRIDGE_TOKEN`) from admin token (`DALTON_BRIDGE_ADMIN_TOKEN`),
+    fails closed when admin token is unset, and backend callers (`embedder.py`, `system_jobs.py`) use `get_dalton_bridge_admin_token()`.
+    """
+    import httpx
+    import src.dalton.conversations.embedder as embedder_mod
+    import src.dalton.settings as settings_mod
+
+    state_file = tmp_path / "archive-state.json"
+    status_file = tmp_path / "archive-status.json"
+    log_file = tmp_path / "archive.log"
+    env_file = tmp_path / "researchdata-bridge.env"
+    env_file.write_text(
+        "DALTON_BRIDGE_TOKEN=mcp-sandbox-token-111\n"
+        "DALTON_BRIDGE_ADMIN_TOKEN=admin-host-token-222\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("DALTON_BRIDGE_ENV_FILE", str(env_file))
+    monkeypatch.delenv("DALTON_BRIDGE_TOKEN", raising=False)
+    monkeypatch.delenv("DALTON_BRIDGE_ADMIN_TOKEN", raising=False)
+
+    cfg = bridge_mod.BridgeConfig()
+    assert cfg.token == "mcp-sandbox-token-111"
+    assert cfg.admin_token == "admin-host-token-222"
+    cfg.archive_state_file = state_file
+    cfg.archive_status_file = status_file
+    cfg.archive_log_file = log_file
+    cfg.repo_root = Path(__file__).resolve().parents[3]
+    bridge = bridge_mod.ResearchDataBridge(cfg)
+
+    monkeypatch.setattr(
+        bridge,
+        "handle_embed",
+        create_autospec(
+            bridge.handle_embed,
+            return_value=(200, {"ok": True, "embeddings": [[0.1, 0.2]], "model": "gemini-embedding-001"}),
+        ),
+    )
+    monkeypatch.setattr(
+        bridge,
+        "handle_get_ops_jobs",
+        create_autospec(
+            bridge.handle_get_ops_jobs,
+            return_value=(200, {"ok": True, "jobs": [{"key": "ops-db-backup"}]}),
+        ),
+    )
+
+    async def _send_http_req(
+        target_bridge: bridge_mod.ResearchDataBridge,
+        method: str,
+        path: str,
+        headers: dict[str, str] | None = None,
+        body_obj: dict[str, Any] | None = None,
+    ) -> tuple[int, dict[str, Any]]:
+        reader = asyncio.StreamReader()
+        body_bytes = json.dumps(body_obj).encode("utf-8") if body_obj is not None else b""
+        hdr_lines = [f"{method} {path} HTTP/1.1", "Host: 127.0.0.1:8960"]
+        if body_bytes:
+            hdr_lines.append("Content-Type: application/json")
+            hdr_lines.append(f"Content-Length: {len(body_bytes)}")
+        for hk, hv in (headers or {}).items():
+            hdr_lines.append(f"{hk}: {hv}")
+        raw_req = ("\r\n".join(hdr_lines) + "\r\n\r\n").encode("utf-8") + body_bytes
+        reader.feed_data(raw_req)
+        reader.feed_eof()
+        buf = bytearray()
+        writer = create_autospec(asyncio.StreamWriter, instance=True)
+        writer.write.side_effect = buf.extend
+        writer.drain.return_value = None
+        writer.close.return_value = None
+        writer.wait_closed.return_value = None
+        await bridge_mod._handle_client(target_bridge, reader, writer)
+        resp_text = buf.decode("utf-8", errors="replace")
+        head, body_str = resp_text.split("\r\n\r\n", 1)
+        status_code = int(head.splitlines()[0].split(" ")[1])
+        return status_code, (json.loads(body_str) if body_str.strip() else {})
+
+    mcp_headers = {"Authorization": "Bearer mcp-sandbox-token-111"}
+    admin_headers = {"Authorization": "Bearer admin-host-token-222"}
+
+    # 1. Calling /embed, /jobs/conversation-archive/disable, /jobs/ops with MCP token returns 401/403
+    code_embed_mcp, _ = await _send_http_req(
+        bridge, "POST", "/embed", headers=mcp_headers, body_obj={"texts": ["hello"]}
+    )
+    assert code_embed_mcp in (401, 403)
+
+    code_disable_mcp, _ = await _send_http_req(
+        bridge, "POST", "/jobs/conversation-archive/disable", headers=mcp_headers
+    )
+    assert code_disable_mcp in (401, 403)
+
+    code_ops_mcp, _ = await _send_http_req(
+        bridge, "GET", "/jobs/ops", headers=mcp_headers
+    )
+    assert code_ops_mcp in (401, 403)
+
+    # Future non-MCP routes (e.g. /notify) also go through _require_admin_token before routing
+    code_future_mcp, _ = await _send_http_req(
+        bridge, "POST", "/notify", headers=mcp_headers, body_obj={"msg": "hi"}
+    )
+    assert code_future_mcp in (401, 403)
+
+    # 2. Calling /embed, /jobs/conversation-archive/disable, /jobs/ops with admin token succeeds (200)
+    code_embed_admin, body_embed_admin = await _send_http_req(
+        bridge, "POST", "/embed", headers=admin_headers, body_obj={"texts": ["hello"]}
+    )
+    assert code_embed_admin == 200
+    assert body_embed_admin["ok"] is True
+
+    code_disable_admin, body_disable_admin = await _send_http_req(
+        bridge, "POST", "/jobs/conversation-archive/disable", headers=admin_headers
+    )
+    assert code_disable_admin == 200
+    assert body_disable_admin["ok"] is True
+    assert body_disable_admin["enabled"] is False
+
+    code_ops_admin, body_ops_admin = await _send_http_req(
+        bridge, "GET", "/jobs/ops", headers=admin_headers
+    )
+    assert code_ops_admin == 200
+    assert body_ops_admin["ok"] is True
+
+    # 3. MCP endpoint (/mcp) accepts both MCP token and admin token
+    ping_rpc = {"jsonrpc": "2.0", "id": 1, "method": "ping"}
+    code_mcp_tok, body_mcp_tok = await _send_http_req(
+        bridge, "POST", "/mcp", headers=mcp_headers, body_obj=ping_rpc
+    )
+    assert code_mcp_tok == 200
+    assert body_mcp_tok == {"jsonrpc": "2.0", "id": 1, "result": {}}
+
+    code_mcp_admin, body_mcp_admin = await _send_http_req(
+        bridge, "POST", "/mcp", headers=admin_headers, body_obj=ping_rpc
+    )
+    assert code_mcp_admin == 200
+    assert body_mcp_admin == {"jsonrpc": "2.0", "id": 1, "result": {}}
+
+    # 4. When DALTON_BRIDGE_ADMIN_TOKEN is NOT configured, all admin endpoints fail closed (401/403) and startup logs warning
+    env_no_admin = tmp_path / "no-admin.env"
+    env_no_admin.write_text("DALTON_BRIDGE_TOKEN=mcp-sandbox-token-111\n", encoding="utf-8")
+    monkeypatch.setenv("DALTON_BRIDGE_ENV_FILE", str(env_no_admin))
+    monkeypatch.delenv("DALTON_BRIDGE_TOKEN", raising=False)
+    monkeypatch.delenv("DALTON_BRIDGE_ADMIN_TOKEN", raising=False)
+
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        cfg_no_admin = bridge_mod.BridgeConfig()
+        assert cfg_no_admin.admin_token == ""
+        bridge_no_admin = bridge_mod.ResearchDataBridge(cfg_no_admin)
+    assert any("DALTON_BRIDGE_ADMIN_TOKEN" in rec.message for rec in caplog.records)
+
+    for method, path, body in (
+        ("POST", "/embed", {"texts": ["hello"]}),
+        ("POST", "/jobs/conversation-archive/disable", None),
+        ("GET", "/jobs/ops", None),
+    ):
+        code_fail_closed, _ = await _send_http_req(
+            bridge_no_admin, method, path, headers=mcp_headers, body_obj=body
+        )
+        assert code_fail_closed in (401, 403)
+
+    # MCP still works when admin token is unset
+    code_mcp_still_ok, _ = await _send_http_req(
+        bridge_no_admin, "POST", "/mcp", headers=mcp_headers, body_obj=ping_rpc
+    )
+    assert code_mcp_still_ok == 200
+
+    # 5. Backend callers (`embedder.py` and `system_jobs.py`) use `get_dalton_bridge_admin_token()`, while `data_map/health.py` uses `get_dalton_bridge_token()`
+    monkeypatch.setenv("DALTON_BRIDGE_TOKEN", "mcp-token-val")
+    monkeypatch.setenv("DALTON_BRIDGE_ADMIN_TOKEN", "admin-token-val")
+    assert settings_mod.get_dalton_bridge_token() == "mcp-token-val"
+    assert settings_mod.get_dalton_bridge_admin_token() == "admin-token-val"
+
+    mock_post_embed = create_autospec(
+        embedder_mod._post_embed_sync,
+        return_value={"ok": True, "embeddings": [[0.5, 0.25]], "model": "gemini-embedding-001"},
+    )
+    monkeypatch.setattr(embedder_mod, "_post_embed_sync", mock_post_embed)
+    vecs, _ = await embedder_mod.embed_texts_via_bridge(["doc text"])
+    assert vecs == [[0.5, 0.25]]
+    assert mock_post_embed.call_args.args[1] == "admin-token-val"
+
+    captured_headers: dict[str, str] = {}
+    mock_resp = create_autospec(httpx.Response, instance=True)
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = {"ok": True}
+
+    async def _fake_request(method: str, url: str, headers: dict[str, str] | None = None) -> Any:
+        captured_headers.update(headers or {})
+        return mock_resp
+
+    mock_client = create_autospec(httpx.AsyncClient, instance=True)
+    mock_client.__aenter__.return_value = mock_client
+    mock_client.__aexit__.return_value = None
+    mock_client.request.side_effect = _fake_request
+    monkeypatch.setattr(
+        system_jobs_mod.httpx,
+        "AsyncClient",
+        create_autospec(system_jobs_mod.httpx.AsyncClient, return_value=mock_client),
+    )
+
+    st_code, payload = await system_jobs_mod._call_host_bridge("GET", "/jobs/ops")
+    assert st_code == 200
+    assert payload == {"ok": True}
+    assert captured_headers.get("Authorization") == "Bearer admin-token-val"
+    assert captured_headers.get("X-Dalton-Bridge-Token") == "admin-token-val"
+
+    _, health_tok, _ = health_mod.resolve_researchdata_endpoint_and_token()
+    assert health_tok == "mcp-token-val"
+
+
+def test_plugins_config_and_sandbox_env_exclude_bridge_admin_token(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Verify sandbox output boundaries (`PTCSandbox._build_sandbox_env_vars` and
+    `ToolFunctionGenerator.generate_client_config`) scrub `DALTON_BRIDGE_ADMIN_TOKEN`
+    by actual value after `src/ptc_agent/config/plugins.py` expands `${VAR}` placeholders:
+    1) referencing admin token via another env variable name;
+    2) carrying admin token in URL (and headers);
+    3) carrying admin token in startup args.
+    """
+    import src.ptc_agent.config.plugins as plugins_mod
+    from src.ptc_agent.core.sandbox.ptc_sandbox import PTCSandbox
+    from src.ptc_agent.core.tool_generator import ToolFunctionGenerator
+
+    admin_secret = "super-secret-bridge-admin-token-do-not-leak"
+    mcp_secret = "sandbox-mcp-token-allowed"
+    monkeypatch.setenv("DALTON_BRIDGE_ADMIN_TOKEN", admin_secret)
+    monkeypatch.setenv("DALTON_BRIDGE_TOKEN", mcp_secret)
+    monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", "internal-platform-secret")
+
+    # Build a synthetic built-in plugins directory loaded through the real plugins.py loader
+    test_plugins_dir = tmp_path / "plugins"
+    bundle_dir = test_plugins_dir / "test_admin_token_guard"
+    bundle_dir.mkdir(parents=True)
+    (bundle_dir / "plugin.json").write_text(
+        json.dumps(
+            {
+                "name": "test_admin_token_guard",
+                "version": "1.0.0",
+                "description": "Test bundle for bridge admin token boundary scrubbing",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (bundle_dir / "mcp.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "leak_env_srv": {
+                        "type": "stdio",
+                        "command": "python3",
+                        "args": ["env_server.py"],
+                        "env": {
+                            "CUSTOM_ADMIN_ENV_KEY": "${DALTON_BRIDGE_ADMIN_TOKEN}",
+                            "SAFE_VAR": "safe-value",
+                        },
+                    },
+                    "leak_url_srv": {
+                        "type": "streamable-http",
+                        "url": "http://host.docker.internal:8960/mcp/${DALTON_BRIDGE_ADMIN_TOKEN}",
+                        "headers": {
+                            "X-Custom-Admin": "Bearer ${DALTON_BRIDGE_ADMIN_TOKEN}",
+                        },
+                    },
+                    "leak_args_srv": {
+                        "type": "stdio",
+                        "command": "python3",
+                        "args": [
+                            "args_server.py",
+                            "--admin-token=${DALTON_BRIDGE_ADMIN_TOKEN}",
+                            "--normal-flag=1",
+                        ],
+                    },
+                    "clean_mcp_srv": {
+                        "type": "streamable-http",
+                        "url": "http://host.docker.internal:8960/mcp/${DALTON_BRIDGE_TOKEN}",
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(plugins_mod, "BUNDLES_DIR", test_plugins_dir)
+
+    # Load through the real plugins.py loader (which expands ${DALTON_BRIDGE_ADMIN_TOKEN} into plaintext)
+    loaded_servers = plugins_mod.bundled_mcp_servers()
+    by_name = {s.name: s for s in loaded_servers}
+    assert by_name["leak_env_srv"].env["CUSTOM_ADMIN_ENV_KEY"] == admin_secret
+    assert admin_secret in (by_name["leak_url_srv"].url or "")
+    assert any(admin_secret in str(a) for a in by_name["leak_args_srv"].args)
+
+    sandbox_stub = create_autospec(PTCSandbox, instance=True)
+    sandbox_stub._token_file_path = "/home/workspace/.ginlix_token"
+    sandbox_stub._builtin_servers.return_value = loaded_servers
+
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        env_vars = PTCSandbox._build_sandbox_env_vars(sandbox_stub, {})
+        gen = ToolFunctionGenerator()
+        mcp_client_cfg = gen.generate_client_config(loaded_servers)
+
+    # 1. Final sandbox env_vars and generated MCP client config never contain the admin token value
+    serialized_env = json.dumps(env_vars)
+    serialized_cfg = json.dumps(mcp_client_cfg)
+    assert admin_secret not in serialized_env
+    assert admin_secret not in serialized_cfg
+    assert "CUSTOM_ADMIN_ENV_KEY" not in env_vars
+    assert env_vars.get("SAFE_VAR") == "safe-value"
+
+    # 2. All three leaking servers are marked unavailable (enabled=False) and cannot start with the token
+    for srv_name in ("leak_env_srv", "leak_url_srv", "leak_args_srv"):
+        assert by_name[srv_name].enabled is False
+        srv_entry = mcp_client_cfg["servers"][srv_name]
+        assert srv_entry.get("enabled") is False
+        assert srv_entry.get("available") is False
+        assert not srv_entry.get("url")
+        assert not srv_entry.get("command")
+        assert not srv_entry.get("args")
+
+    # Clean server using DALTON_BRIDGE_TOKEN remains enabled and intact
+    assert by_name["clean_mcp_srv"].enabled is True
+    assert mcp_client_cfg["servers"]["clean_mcp_srv"]["url"].endswith(mcp_secret)
+
+    # 3. Warnings logged item names (`CUSTOM_ADMIN_ENV_KEY`, `url`, `args[1]`) and never logged the secret value
+    assert admin_secret not in caplog.text
+    assert "CUSTOM_ADMIN_ENV_KEY" in caplog.text
+    assert "url" in caplog.text
+    assert "args[1]" in caplog.text
+
+    # 4. When DALTON_BRIDGE_ADMIN_TOKEN is empty, the check is skipped
+    monkeypatch.setenv("DALTON_BRIDGE_ADMIN_TOKEN", "")
+    clean_loaded = plugins_mod.bundled_mcp_servers()
+    sandbox_stub._builtin_servers.return_value = clean_loaded
+    env_when_unset = PTCSandbox._build_sandbox_env_vars(sandbox_stub, {})
+    cfg_when_unset = gen.generate_client_config(clean_loaded)
+    assert env_when_unset.get("SAFE_VAR") == "safe-value"
+    assert all(s.enabled is True for s in clean_loaded)
+    assert "enabled" not in cfg_when_unset["servers"]["clean_mcp_srv"]
+
+
 
