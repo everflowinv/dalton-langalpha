@@ -1785,3 +1785,490 @@ async def test_internal_probe_uses_researchdata_url_inside_container(monkeypatch
     monkeypatch.setattr(internal_mod, "_fetch_bridge_route_sync", fake_fetch)
     await internal_mod._query_bridge_internal_docs(ticker="GOOGL", allow_network=True)
     assert seen and all(u.startswith("http://host.docker.internal:8960/mcp/tok") for u in seen)
+
+
+@pytest.mark.asyncio
+async def test_dalton_watch_event_create_update_by_id_quarter_reschedule_and_schema_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify dalton_watch_event create, partial update, update by event_id/quarter, reschedule token matching, missing event_id, and schema validation."""
+    import copy
+    from src.dalton.database import knowledge as db_knowledge
+    from src.dalton.tools import director_tools as dt_mod
+    from src.dalton.tools.director_tools import build_director_tools
+
+    ws_id = "22222222-2222-2222-2222-222222222222"
+    user_id = "user-alice"
+    cfg = {"configurable": {"user_id": user_id, "workspace_id": "home", "thread_id": "thread-cos-1"}}
+
+    mock_verify_access = create_autospec(dt_mod.verify_workspace_access, return_value={"workspace_id": ws_id})
+    monkeypatch.setattr(dt_mod, "verify_workspace_access", mock_verify_access)
+    monkeypatch.setattr("src.dalton.knowledge.service.verify_workspace_access", mock_verify_access)
+
+    current_state: dict[str, Any] = {
+        "version_no": 1,
+        "content": {
+            "schema_version": 1,
+            "as_of": "2026-10-18T00:00:00Z",
+            "open_questions": [],
+            "next_validations": [],
+            "watch": {"events": []},
+            "wake_conditions": [],
+        },
+        "schema_valid": True,
+    }
+
+    async def _fake_latest_version(workspace_id: str, doc_key: str) -> dict[str, Any] | None:
+        return copy.deepcopy(current_state)
+
+    async def _fake_insert_version(**kwargs: Any) -> dict[str, Any]:
+        current_state["version_no"] = int(current_state["version_no"]) + 1
+        current_state["content"] = copy.deepcopy(kwargs["content"])
+        return {
+            "knowledge_version_id": f"kv-{current_state['version_no']}",
+            "doc_key": kwargs["doc_key"],
+            "version_no": current_state["version_no"],
+            "content": copy.deepcopy(kwargs["content"]),
+            "content_sha256": kwargs["content_sha256"],
+            "schema_valid": kwargs.get("schema_valid", True),
+        }
+
+    mock_latest_ver = create_autospec(db_knowledge.latest_version, side_effect=_fake_latest_version)
+    mock_latest_valid = create_autospec(db_knowledge.latest_valid_version, side_effect=_fake_latest_version)
+    mock_insert_ver = create_autospec(db_knowledge.insert_version, side_effect=_fake_insert_version)
+    monkeypatch.setattr(db_knowledge, "latest_version", mock_latest_ver)
+    monkeypatch.setattr(db_knowledge, "latest_valid_version", mock_latest_valid)
+    monkeypatch.setattr(db_knowledge, "insert_version", mock_insert_ver)
+
+    tools = {t.name: t for t in build_director_tools(role="chief_of_staff")}
+    watch_tool = tools["dalton_watch_event"]
+
+    # 0. Creating a new event without date_status returns an explicit error
+    out_missing_status = json.loads(
+        await watch_tool.ainvoke(
+            {
+                "workspace_id": ws_id,
+                "type": "earnings",
+                "date": "2026-10-27",
+                "note": "FY26Q3 财报 · 待确认",
+            },
+            config=cfg,
+        )
+    )
+    assert out_missing_status["ok"] is False
+    assert out_missing_status["error"] == "missing_date_status"
+    assert mock_insert_ver.await_count == 0
+
+    # 1. Create / append a new estimated earnings event -> W1
+    out1 = json.loads(
+        await watch_tool.ainvoke(
+            {
+                "workspace_id": ws_id,
+                "type": "earnings",
+                "date": "2026-10-27",
+                "date_status": "estimated",
+                "note": "FY26Q3 财报 · 待确认",
+                "source": "Nasdaq 日历候选",
+            },
+            config=cfg,
+        )
+    )
+    assert out1["ok"] is True
+    assert out1["action"] == "created"
+    assert out1["event_id"] == "W1"
+    events = current_state["content"]["watch"]["events"]
+    assert len(events) == 1
+    assert events[0] == {
+        "id": "W1",
+        "type": "earnings",
+        "date": "2026-10-27",
+        "date_status": "estimated",
+        "note": "FY26Q3 财报 · 待确认",
+        "source": "Nasdaq 日历候选",
+    }
+
+    # 1b. Partial update: only pass note on an estimated event -> date and date_status stay unchanged
+    out1_partial = json.loads(
+        await watch_tool.ainvoke(
+            {
+                "workspace_id": ws_id,
+                "note": "FY26Q3 财报 · 待确认（FMP 与 Nasdaq 一致）",
+            },
+            config=cfg,
+        )
+    )
+    assert out1_partial["ok"] is True
+    assert out1_partial["action"] == "updated"
+    assert out1_partial["event_id"] == "W1"
+    events = current_state["content"]["watch"]["events"]
+    assert events[0]["date"] == "2026-10-27"
+    assert events[0]["date_status"] == "estimated"
+    assert events[0]["note"] == "FY26Q3 财报 · 待确认（FMP 与 Nasdaq 一致）"
+    assert events[0]["source"] == "Nasdaq 日历候选"
+
+    # 2. Match by same type + leading fiscal quarter ("FY26Q3") when event_id is omitted
+    out2 = json.loads(
+        await watch_tool.ainvoke(
+            {
+                "workspace_id": ws_id,
+                "type": "earnings",
+                "date": "2026-10-27",
+                "date_status": "confirmed",
+                "note": "FY26Q3 财报 · 盘后 16:00 ET · 电话会 16:30",
+                "source": "https://abc.xyz/investor/fy26q3",
+                "plan": "T-3 dalton-googl-earn-fy26q3-tm3 / T0 dalton-googl-earn-fy26q3-t0 / T+1 dalton-googl-earn-fy26q3-tp1",
+            },
+            config=cfg,
+        )
+    )
+    assert out2["ok"] is True
+    assert out2["action"] == "updated"
+    assert out2["event_id"] == "W1"
+    events = current_state["content"]["watch"]["events"]
+    assert len(events) == 1
+    assert events[0]["date_status"] == "confirmed"
+    assert events[0]["source"] == "https://abc.xyz/investor/fy26q3"
+    assert "dalton-googl-earn-fy26q3-tm3" in events[0]["plan"]
+
+    # 3. Reschedule preserves old date in note ("原 10/27，改期")
+    out3 = json.loads(
+        await watch_tool.ainvoke(
+            {
+                "workspace_id": ws_id,
+                "type": "earnings",
+                "date": "2026-10-29",
+                "date_status": "confirmed",
+                "note": "FY26Q3 财报 · 盘后 16:05 ET · 电话会 16:30",
+            },
+            config=cfg,
+        )
+    )
+    assert out3["ok"] is True
+    assert out3["action"] == "updated"
+    assert out3["event_id"] == "W1"
+    events = current_state["content"]["watch"]["events"]
+    assert events[0]["date"] == "2026-10-29"
+    assert "原 10/27，改期" in events[0]["note"]
+    assert "2026-10-27" in events[0]["note"]
+
+    # 3b. Full-date token check: old_date 2026-10-01 ("10/1") does not false-match "10/15" in note
+    out4_create = json.loads(
+        await watch_tool.ainvoke(
+            {
+                "workspace_id": ws_id,
+                "type": "earnings",
+                "date": "2026-10-01",
+                "date_status": "estimated",
+                "note": "FY26Q4 财报 · 待确认",
+            },
+            config=cfg,
+        )
+    )
+    assert out4_create["ok"] is True
+    assert out4_create["event_id"] == "W2"
+    assert len(current_state["content"]["watch"]["events"]) == 2
+
+    out4_update = json.loads(
+        await watch_tool.ainvoke(
+            {
+                "workspace_id": ws_id,
+                "event_id": "W2",
+                "type": "earnings",
+                "date": "2026-10-15",
+                "date_status": "confirmed",
+                "note": "Q4 财报 10/15 正式确认 · 盘后 16:00 ET",
+                "source": "https://abc.xyz/investor/fy26q4",
+                "plan": "T-3 dalton-googl-earn-fy26q4-tm3 / T0 dalton-googl-earn-fy26q4-t0 / T+1 dalton-googl-earn-fy26q4-tp1",
+            },
+            config=cfg,
+        )
+    )
+    assert out4_update["ok"] is True
+    assert out4_update["action"] == "updated"
+    assert out4_update["event_id"] == "W2"
+    ev_w2 = current_state["content"]["watch"]["events"][1]
+    assert ev_w2["id"] == "W2"
+    assert ev_w2["date"] == "2026-10-15"
+    assert "原 10/1，改期" in ev_w2["note"]
+
+    # 4b. Passing a non-existent event_id returns an explicit error instead of appending
+    insert_before_not_found = mock_insert_ver.await_count
+    out_not_found = json.loads(
+        await watch_tool.ainvoke(
+            {
+                "workspace_id": ws_id,
+                "event_id": "W99",
+                "date": "2027-01-28",
+                "date_status": "confirmed",
+                "note": "不存在的事件 ID",
+            },
+            config=cfg,
+        )
+    )
+    assert out_not_found["ok"] is False
+    assert out_not_found["error"] == "event_not_found"
+    assert len(current_state["content"]["watch"]["events"]) == 2
+    assert mock_insert_ver.await_count == insert_before_not_found
+
+    # 5. Schema validation failure returns expected schema structure without saving
+    insert_calls_before = mock_insert_ver.await_count
+    out5_invalid = json.loads(
+        await watch_tool.ainvoke(
+            {
+                "workspace_id": ws_id,
+                "type": "not_in_enum",
+                "date": "2027-04-25",
+                "date_status": "confirmed",
+                "note": "FY27Q1 财报",
+            },
+            config=cfg,
+        )
+    )
+    assert out5_invalid["ok"] is False
+    assert "Expected structure for /watch/events/" in out5_invalid["message"]
+    assert "date_status" in out5_invalid["message"]
+    assert mock_insert_ver.await_count == insert_calls_before
+
+
+@pytest.mark.asyncio
+async def test_dalton_resolve_signals_home_only_foreign_workspace_and_missing_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify dalton_resolve_signals scopes by probe + Home workspace, saves resolution_note, blocks foreign UUID, and reports 0 on missing key."""
+    import uuid
+    from contextlib import asynccontextmanager
+    from fastapi import HTTPException
+    from psycopg import AsyncConnection, AsyncCursor
+    from src.dalton.database import watch as watch_db
+    from src.dalton.tools import director_tools as dt_mod
+    from src.dalton.tools.director_tools import build_director_tools
+
+    home_ws_alice = "00000000-0000-0000-0000-000000000001"
+    home_ws_uuid = uuid.UUID(home_ws_alice)
+    company_ws_uuid = uuid.UUID("22222222-2222-2222-2222-222222222222")
+    cal_sig_uuid = uuid.UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+    dir_sig_uuid = uuid.UUID("cccccccc-cccc-cccc-cccc-cccccccccccc")
+    foreign_sig_uuid = uuid.UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+
+    mock_resolve_home = create_autospec(
+        dt_mod.resolve_caller_home_workspace_id,
+        return_value=home_ws_alice,
+    )
+    monkeypatch.setattr(dt_mod, "resolve_caller_home_workspace_id", mock_resolve_home)
+
+    db_signals: list[dict[str, Any]] = [
+        {
+            "signal_id": cal_sig_uuid,
+            "workspace_id": home_ws_uuid,
+            "probe": "calendar",
+            "signal_key": "weekly:2026-W43",
+            "payload": {},
+            "resolved_at": None,
+            "resolved_by": None,
+        },
+        {
+            "signal_id": dir_sig_uuid,
+            "workspace_id": home_ws_uuid,
+            "probe": "director",
+            "signal_key": "weekly:2026-W43",
+            "payload": {},
+            "resolved_at": None,
+            "resolved_by": None,
+        },
+        {
+            "signal_id": foreign_sig_uuid,
+            "workspace_id": company_ws_uuid,
+            "probe": "sec",
+            "signal_key": "sec:0001652044-26-000042",
+            "payload": {},
+            "resolved_at": None,
+            "resolved_by": None,
+        },
+    ]
+
+    mock_cur = create_autospec(AsyncCursor, instance=True)
+    last_fetchall: list[dict[str, Any]] = []
+
+    async def _exec_side_effect(query: str, params: Any = None) -> None:
+        nonlocal last_fetchall
+        if "SELECT signal_id, workspace_id" in query:
+            uuids: set[uuid.UUID] = set(params[0]) if params else set()
+            last_fetchall = [
+                {"signal_id": row["signal_id"], "workspace_id": row["workspace_id"]}
+                for row in db_signals
+                if row["signal_id"] in uuids
+            ]
+            mock_cur.rowcount = len(last_fetchall)
+            return
+        if "UPDATE dalton_signals" in query:
+            patch_obj = dict(getattr(params[0], "obj", {}) or {})
+            if "WHERE signal_id = ANY(%s)" in query:
+                target_uuids: set[uuid.UUID] = set(params[1])
+                ws_param: uuid.UUID = params[2]
+                matched = 0
+                for row in db_signals:
+                    if row["resolved_at"] is not None or row["workspace_id"] != ws_param:
+                        continue
+                    if row["signal_id"] in target_uuids:
+                        row["resolved_at"] = "2026-10-23T12:00:00Z"
+                        row["resolved_by"] = patch_obj.get("resolved_by")
+                        row["payload"] = {**row["payload"], **patch_obj}
+                        matched += 1
+                mock_cur.rowcount = matched
+                return
+
+            ws_param = params[1]
+            idx = 2
+            probe_param: str | None = None
+            if "probe = %s" in query:
+                probe_param = params[idx]
+                idx += 1
+            key_params = list(params[idx:])
+            matched = 0
+            for row in db_signals:
+                if row["resolved_at"] is not None or row["workspace_id"] != ws_param:
+                    continue
+                if probe_param is not None and row["probe"] != probe_param:
+                    continue
+                if row["signal_key"] in key_params:
+                    row["resolved_at"] = "2026-10-23T12:00:00Z"
+                    row["resolved_by"] = patch_obj.get("resolved_by")
+                    row["payload"] = {**row["payload"], **patch_obj}
+                    matched += 1
+            mock_cur.rowcount = matched
+
+    mock_cur.execute.side_effect = _exec_side_effect
+    mock_cur.fetchall.side_effect = lambda: list(last_fetchall)
+
+    @asynccontextmanager
+    async def _cursor_ctx(*args: Any, **kwargs: Any):
+        yield mock_cur
+
+    mock_conn = create_autospec(AsyncConnection, instance=True)
+    mock_conn.cursor.side_effect = _cursor_ctx
+
+    @asynccontextmanager
+    async def _conn_ctx():
+        yield mock_conn
+
+    monkeypatch.setattr(
+        watch_db,
+        "get_db_connection",
+        create_autospec(watch_db.get_db_connection, side_effect=_conn_ctx),
+    )
+
+    tools = {t.name: t for t in build_director_tools(role="chief_of_staff")}
+    resolve_tool = tools["dalton_resolve_signals"]
+    cfg = {"configurable": {"user_id": "user-alice", "workspace_id": "home", "thread_id": "thread-43"}}
+
+    # 0. Resolving by signal_keys without probe returns missing_probe error
+    res_no_probe = json.loads(
+        await resolve_tool.ainvoke(
+            {"signal_keys": ["weekly:2026-W43"], "note": "缺少 probe"},
+            config=cfg,
+        )
+    )
+    assert res_no_probe["ok"] is False
+    assert res_no_probe["error"] == "missing_probe"
+
+    # 1. Same week has both calendar and director signals; probe="calendar" only closes calendar signal and records resolution_note
+    res1 = json.loads(
+        await resolve_tool.ainvoke(
+            {
+                "signal_keys": ["weekly:2026-W43"],
+                "probe": "calendar",
+                "note": "本周财报日历刷新已完成",
+            },
+            config=cfg,
+        )
+    )
+    assert res1["ok"] is True
+    assert res1["resolved_count"] == 1
+    assert res1["workspace_id"] == home_ws_alice
+    assert res1["probe"] == "calendar"
+    assert res1["resolved_by"] == "cos:thread-43"
+    assert db_signals[0]["resolved_by"] == "cos:thread-43"
+    assert db_signals[0]["payload"]["resolution_note"] == "本周财报日历刷新已完成"
+    # Director signal for the same ISO week remains open!
+    assert db_signals[1]["resolved_at"] is None
+
+    # 1b. Resolving by signal_id (UUID) works without probe and records resolution_note
+    res_by_uuid = json.loads(
+        await resolve_tool.ainvoke(
+            {"signal_id": str(dir_sig_uuid), "note": "周度复盘按 UUID 关闭"},
+            config=cfg,
+        )
+    )
+    assert res_by_uuid["ok"] is True
+    assert res_by_uuid["resolved_count"] == 1
+    assert db_signals[1]["resolved_by"] == "cos:thread-43"
+    assert db_signals[1]["payload"]["resolution_note"] == "周度复盘按 UUID 关闭"
+
+    # 2. Foreign workspace signal cannot be resolved (by signal_key -> 0; by signal_id UUID -> 403 on found_ws[u] != ws_uuid)
+    res_foreign_key = json.loads(
+        await resolve_tool.ainvoke(
+            {
+                "signal_keys": ["sec:0001652044-26-000042"],
+                "probe": "sec",
+                "note": "试图关闭公司工作区信号",
+            },
+            config=cfg,
+        )
+    )
+    assert res_foreign_key["ok"] is False
+    assert res_foreign_key["resolved_count"] == 0
+    assert db_signals[2]["resolved_at"] is None
+
+    with pytest.raises(HTTPException) as exc_info:
+        await resolve_tool.ainvoke(
+            {"signal_keys": [str(foreign_sig_uuid)], "note": "试图按 UUID 关闭公司工作区信号"},
+            config=cfg,
+        )
+    assert exc_info.value.status_code == 403
+    assert len(last_fetchall) == 1
+    assert last_fetchall[0]["workspace_id"] == company_ws_uuid
+    assert db_signals[2]["resolved_at"] is None
+
+    # 3. Non-existent signal_key returns resolved_count=0 with explicit explanation
+    res_missing = json.loads(
+        await resolve_tool.ainvoke(
+            {
+                "signal_keys": ["weekly:2099-W99"],
+                "probe": "calendar",
+                "note": "关闭不存在的周信号",
+            },
+            config=cfg,
+        )
+    )
+    assert res_missing["ok"] is False
+    assert res_missing["resolved_count"] == 0
+    assert "未关闭任何信号" in res_missing["message"]
+
+
+def test_director_tools_role_gating_analyst_excludes_watch_event_and_resolve_signals() -> None:
+    """Verify chief_of_staff gets dalton_watch_event and dalton_resolve_signals while analyst does not."""
+    from src.dalton.tools import build_dalton_tools
+    from src.dalton.tools.director_tools import build_director_tools
+
+    cos_director_names = {t.name for t in build_director_tools(role="chief_of_staff")}
+    analyst_director_names = {t.name for t in build_director_tools(role="analyst")}
+    assert "dalton_watch_event" in cos_director_names
+    assert "dalton_resolve_signals" in cos_director_names
+    assert "dalton_watch_event" not in analyst_director_names
+    assert "dalton_resolve_signals" not in analyst_director_names
+
+    cos_all_names = {t.name for t in build_dalton_tools("chief_of_staff", enabled=True)}
+    analyst_all_names = {t.name for t in build_dalton_tools("analyst", enabled=True)}
+    assert "dalton_watch_event" in cos_all_names
+    assert "dalton_resolve_signals" in cos_all_names
+    assert "dalton_watch_event" not in analyst_all_names
+    assert "dalton_resolve_signals" not in analyst_all_names
+
+    skill_md = (
+        Path(__file__).resolve().parents[3]
+        / "plugins/dalton/skills/dalton-earnings-calendar/SKILL.md"
+    ).read_text(encoding="utf-8")
+    assert "dalton_watch_event" in skill_md
+    assert "dalton_resolve_signals" in skill_md
+    assert 'probe="calendar"' in skill_md
+    assert "dalton_agenda_note" not in skill_md

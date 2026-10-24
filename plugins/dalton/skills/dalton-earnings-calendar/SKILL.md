@@ -6,7 +6,7 @@ description: "逐家核实覆盖名单下一次财报的公司官方披露日期
 # Dalton 财报日历维护（`dalton-earnings-calendar`）
 
 Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the first deliverable.
-公司认知按 `.agents/skills/dalton-knowledge/SKILL.md` 的读序读；本 skill 在 Home 运行（研究总监），通过 `dalton_agenda_note` 将财报事件同步至各公司 `agenda.watch.events`。
+公司认知按 `.agents/skills/dalton-knowledge/SKILL.md` 的读序读；本 skill 在 Home 运行（研究总监），通过 `dalton_watch_event` 将财报事件同步至各公司 `agenda.watch.events`，收尾通过 `dalton_resolve_signals` 关闭唤醒信号。
 
 ---
 
@@ -161,11 +161,11 @@ python3 .agents/skills/dalton-earnings-calendar/scripts/calendar_state.py --json
      --t0 dalton-meta-earn-fy26q3-t0.json \
      --tp1 dalton-meta-earn-fy26q3-tp1.json
    ```
-6. **同步公司议程（`dalton_agenda_note`）**：
-   调用 `dalton_agenda_note` 将事件写入该公司 `agenda.watch.events`：
-   - 官方确认：写 `date`、`timing`、`date_status="confirmed"`、`source_url`、三条自动任务文件名；
-   - 候选待确认：写 `tentative_date`、`date_status="estimated"`（显示“待确认”），不带自动任务文件名；
-   - 改期：更新同一事件并保留改期原因。
+6. **同步公司议程（`dalton_watch_event`）**：
+   调用 `dalton_watch_event` 将事件 upsert 至该公司 `agenda.watch.events`（字段严格对齐 `agenda.schema.json`，不传 `timing`、`source_url`、`tentative_date` 等非 schema 字段）：
+   - **官方确认**：传 `workspace_id`、`type="earnings"`、`date="<YYYY-MM-DD>"`、`date_status="confirmed"`、`source="<官方来源 URL>"`、`plan="T-3 dalton-<t>-earn-<period>-tm3 / T0 dalton-<t>-earn-<period>-t0 / T+1 dalton-<t>-earn-<period>-tp1"`（Watch 公司仅写 `T0`），把财季、发布时点与电话会时间写进 `note`（例如 `"FY26Q3 财报 · 盘后 16:05 ET · 电话会 16:30"`）；
+   - **候选待确认**：传 `workspace_id`、`type="earnings"`、`date="<候选 YYYY-MM-DD>"`、`date_status="estimated"`（显示“待确认”）、`source="<候选来源说明>"`、`note="FY26Q3 财报 · 待确认"`，**不写 `plan`**；
+   - **改期**：传 `event_id`（或不传 `event_id`，由工具按同 `type="earnings"` 且 `note` 开头的财季标识如 `FY26Q3` 自动匹配已有事件更新），更新为新 `date`，并在 `note` 中保留旧日期与改期说明（例如 `"FY26Q3 财报 · 盘后 16:05 ET · 电话会 16:30（原 10/27，改期）"`）。
 
 ### Step 6：强制对账（Reconciliation，不过不算完成）
 
@@ -184,7 +184,7 @@ python3 .agents/skills/dalton-earnings-calendar/scripts/calendar_state.py --json
    - 若读回不可用，只能报告“本地已记录”，严禁报告“对账通过”；
    - 对账未通过的公司及原因逐条进入总结第 2 项“**未落库**”。
 
-### Step 7：按固定顺序输出总结
+### Step 7：按固定顺序输出总结并关闭唤醒信号
 
 总结必须严格按以下 6 项顺序输出（第 2、3 项永远出现；仅当第 2、3 项均为“无”且其余无异常时可简短收尾）：
 
@@ -194,6 +194,9 @@ python3 .agents/skills/dalton-earnings-calendar/scripts/calendar_state.py --json
 4. **改期**：公司 / 旧日期 → 新日期 / 改期原因 / 自动任务原地更新状态
 5. **本周已发布、仍待官宣与缺工作区**：本轮 `roll` 移入 `reported` 的公司、仍处于 `pending` 的数量（附带 `date_status: estimated`“待确认”候选日期的公司列表）、缺工作区的 Core 公司
 6. **扫描失败的公司**：`status: "scan_failed"` 的公司及失败原因（没有写“无”）
+
+**收尾关闭唤醒信号（`dalton_resolve_signals`）**：
+若本次刷新由 `<dalton_wake>` 信号唤醒（例如 `probe="calendar"`、`signal_key="weekly:<ISO 周>"` 如 `"weekly:2026-W43"`），在完成对账与总结后调用 `dalton_resolve_signals(signal_keys=["weekly:<ISO 周>"], probe="calendar", note="完成本周财报日历核查与议程同步")` 关闭自己 Home 工作区的日历唤醒信号，确认返回的 `resolved_count >= 1`。
 
 ---
 
@@ -208,7 +211,7 @@ python3 .agents/skills/dalton-earnings-calendar/scripts/calendar_state.py --json
   "trigger_type": "cron",
   "cron_expression": "0 9 * * 6",
   "timezone": "Asia/Shanghai",
-  "instruction": "/dalton-earnings-calendar 全名单 —— 按 skill 流程滚动、扫描（只认官方来源，候选日期标待确认）、经 PUT /api/v1/dalton/automations/{name} 建/改 tm3/t0/tp1 自动任务、用 dalton_agenda_note 同步各公司 watch.events、对账，最后按固定顺序总结。",
+  "instruction": "/dalton-earnings-calendar 全名单 —— 按 skill 流程滚动、扫描（只认官方来源，候选日期标待确认）、经 PUT /api/v1/dalton/automations/{name} 建/改 tm3/t0/tp1 自动任务、用 dalton_watch_event 同步各公司 watch.events、对账，按固定顺序总结后调用 dalton_resolve_signals(probe=\"calendar\", ...) 关闭本周唤醒信号。",
   "workspace_id": "home",
   "thread": "new"
 }

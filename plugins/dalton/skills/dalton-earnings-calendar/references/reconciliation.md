@@ -60,5 +60,5 @@ python3 .agents/skills/dalton-earnings-calendar/scripts/calendar_state.py --json
 发现 `missing`、`date_mismatch` 或自动任务回读不符时：
 
 1. **先定性原因**：区分是（a）自动任务已建但台账漏 `mark`、（b）UTC 与市场时区的显示差异、（c）改期时未原地更新 `next_run_at`、还是（d）REST helper 调用失败未落盘。
-2. **最小范围修复**：仅对确认存在缺口的公司重新执行 Step 5（`PUT /api/v1/dalton/automations/{name}` + `calendar_state.py mark`）。严禁因时区显示差异盲目删除已有自动任务。
+2. **最小范围修复**：仅对确认存在缺口的公司重新执行 Step 5（`PUT /api/v1/dalton/automations/{name}` + `calendar_state.py mark` + `dalton_watch_event`）。严禁因时区显示差异盲目删除已有自动任务。
 3. **如实汇总未落库项**：修复后再次运行 `diff` 与读回核验；仍未通过的公司逐一写入 Step 7 总结的第 2 项“**未落库**”，附上具体失败原因。

@@ -36,8 +36,8 @@
 - 财经聚合站：Nasdaq Earnings Calendar、Zacks、Earnings Whispers、Wall Street Journal (WSJ)、MarketWatch、Yahoo Finance Calendar、Seeking Alpha、Investing.com
 
 **处理规则**：
-- 台账 `status` 保持 `"pending"`，写入 `"tentative_date": "YYYY-MM-DD"`、`"tentative_sources": ["..."]`、`"date_status": "estimated"`、`"confidence": "low"`（或多家聚合一致时 `"medium"`）。
-- 在 `agenda.watch.events` 与周度总结中统一显示为“**待确认**”。
+- 台账（`earnings-calendar.json`）`status` 保持 `"pending"`，写入 `"tentative_date": "YYYY-MM-DD"`、`"tentative_sources": ["..."]`、`"date_status": "estimated"`、`"confidence": "low"`（或多家聚合一致时 `"medium"`）。
+- 同步公司议程 `agenda.watch.events` 时，调用 `dalton_watch_event` 写入 `date`（候选日期）、`date_status="estimated"`、`source`（候选来源说明）与 `note`（如 `"FY26Q3 财报 · 待确认"`），**不写 `plan`**，也不传入 `tentative_date`、`timing`、`source_url` 等非 schema 字段；在议程与周度总结中统一显示为“**待确认**”。
 - **严禁为 `estimated` 日期创建 `tm3`、`t0`、`tp1` 自动任务**。
 - **10 天内候选复查**：若 `0 <= (tentative_date - today).days <= 10`，创建一条 T-5（或当距今不足 5 天时设为次日 09:00）的 `once` 自动任务 `dalton-<t>-earn-<period>-recheck.json`，instruction 仅执行单公司官方日期复查，一旦官宣再转正并补建财报链任务。
 
@@ -45,12 +45,12 @@
 
 ## 三、发布时段（`timing`）与具体时间规则
 
-1. **`timing` 枚举**：
+1. **`timing` 枚举（本地台账 `earnings-calendar.json`）**：
    - `BMO`（Before Market Open，美股盘前，通常 06:00–09:00 ET 发布）
    - `AMC`（After Market Close，美股盘后，通常 16:00–16:30 ET 发布）
    - `unknown`（官方公告仅给出日期，未指明盘前或盘后）
 2. **业绩发布时间 vs 电话会时间**：
-   - 台账分别记录 `release_time_et`（财报新闻稿发布时间，如 `"16:05"`）与 `call_time_et`（业绩电话会开始时间，如 `"16:30"`）。
+   - 本地台账分别记录 `release_time_et`（财报新闻稿发布时间，如 `"16:05"`）与 `call_time_et`（业绩电话会开始时间，如 `"16:30"`）；同步至 `agenda.watch.events` 时，将财季、发布时点与电话会时间合并写入 `note`（如 `"FY26Q3 财报 · 盘后 16:05 ET · 电话会 16:30"`），官方链接写入 `source`，任务名写入 `plan`。
    - 若官方通告仅写出 *"after market close, followed by a conference call at 4:30 p.m. ET"* 而未精确到分钟的发布时间，`release_time_et` 取 `"16:00"`（AMC 默认盘后整点）或 `"07:00"`（BMO 默认盘前），并在 `notes` 说明。
    - **日期以业绩发布日（`earnings_date`）为准**，不以次日亚洲时区电话会日期为准。
 3. **非财报事件排除**：

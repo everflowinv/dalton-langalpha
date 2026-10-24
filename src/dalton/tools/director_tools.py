@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import date
 from typing import Any
 
@@ -12,7 +13,10 @@ from fastapi import HTTPException
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool, tool
 
-from src.dalton.auth import verify_workspace_access
+from src.dalton.auth import (
+    resolve_caller_home_workspace_id,
+    verify_workspace_access,
+)
 from src.dalton.autonomy.board import build_coverage_board
 from src.dalton.autonomy.schedule import (
     schedule_dalton_automation_helper,
@@ -25,9 +29,61 @@ from src.dalton.autonomy.tracking import (
     resolve_workspace_id_by_ticker,
 )
 from src.dalton.database import plans as plans_db
+from src.dalton.database import watch as watch_db
 from src.dalton.settings import get_dalton_settings
 
 logger = logging.getLogger(__name__)
+
+_QUARTER_PREFIX_RE = re.compile(
+    r"^\s*(FY\d{2,4}[\s-]*(?:Q[1-4]|H[12]|FY)|[1-4]Q\d{2,4}|[12]H\d{2,4}|\d{4}[\s-]*(?:Q[1-4]|H[12])|F?Q[1-4][\s-]*\d{2,4}|FY\d{2,4})(?![A-Za-z0-9])",
+    re.IGNORECASE,
+)
+
+
+def _extract_quarter_prefix(note: str | None) -> str | None:
+    """Extract normalized leading fiscal quarter token (e.g. ``FY26Q3``) from ``note``."""
+    raw = str(note or "").strip()
+    if not raw:
+        return None
+    m = _QUARTER_PREFIX_RE.match(raw)
+    if not m:
+        return None
+    return re.sub(r"[\s-]+", "", m.group(1)).upper()
+
+
+def _contains_date_token(text: str, token: str) -> bool:
+    """Return True iff ``token`` appears in ``text`` as a complete date token (so ``10/1`` does not match ``10/15``)."""
+    if not text or not token:
+        return False
+    pattern = rf"(?<![0-9/\-]){re.escape(token)}(?![0-9/\-])"
+    return bool(re.search(pattern, text))
+
+
+def _format_rescheduled_note(base_note: str | None, old_date: str, new_date: str) -> str:
+    """Preserve ``old_date`` in ``note`` when an event is rescheduled (e.g. ``原 10/27，改期``)."""
+    clean_old = str(old_date or "").strip()
+    clean_new = str(new_date or "").strip()
+    note_str = str(base_note or "").strip()
+    if not clean_old or not clean_new or clean_old == clean_new:
+        return note_str
+
+    mm_dd = clean_old
+    mm_dd_padded = clean_old
+    parts = clean_old.split("-")
+    if len(parts) == 3 and parts[1].isdigit() and parts[2].isdigit():
+        mm_dd = f"{int(parts[1])}/{int(parts[2])}"
+        mm_dd_padded = f"{int(parts[1]):02d}/{int(parts[2]):02d}"
+
+    if any(_contains_date_token(note_str, tok) for tok in (clean_old, mm_dd, mm_dd_padded)):
+        if "改期" not in note_str:
+            return f"{note_str}（改期）"
+        return note_str
+
+    tag = f"原 {mm_dd}，改期" if mm_dd == clean_old else f"原 {mm_dd}，改期（{clean_old}）"
+    return f"{note_str}（{tag}）" if note_str else tag
+
+
+_UNSET_DATE = "__UNSET__"
 
 
 def _render_daily_plan_markdown(
@@ -294,6 +350,316 @@ def build_director_tools(
                 {"ok": False, "error": str(e)},
                 ensure_ascii=False,
             )
+
+    @tool("dalton_watch_event")
+    async def dalton_watch_event(
+        workspace_id: str,
+        type: str | None = None,
+        date: str | None = _UNSET_DATE,
+        date_status: str | None = None,
+        note: str | None = None,
+        source: str | None = None,
+        plan: str | None = None,
+        event_id: str | None = None,
+        config: RunnableConfig = None,
+    ) -> str:
+        """Upsert a watch/catalyst event into a company's `agenda` document (`/watch/events`).
+
+        Updates the item matching `event_id` when passed (returning an error if `event_id` does not
+        exist); otherwise matches an existing event with the same `type` and leading fiscal quarter
+        identifier in `note` (e.g. `FY26Q3`), or appends a new `W<N>` item. On update, any omitted
+        fields keep their existing values; on create, `date_status` must be explicitly provided.
+        Preserves the previous date in `note` when rescheduling (e.g. `原 10/27，改期`).
+        On validation failure, the returned message includes the expected schema structure
+        (失败时返回的信息里带有期望结构，照着补齐再提交).
+        Does not wake the company's sandbox.
+
+        Args:
+            workspace_id: Target company's workspace UUID.
+            type: "earnings" | "filing" | "guidance_update" | "investor_day" | "regulatory" | "product" | "macro" | "other".
+            date: Event ISO date (`YYYY-MM-DD`) or null; omit on update to keep existing date.
+            date_status: "confirmed" | "estimated" | "unknown" (required when creating a new event).
+            note: Event summary starting with fiscal quarter for earnings (e.g. "FY26Q3 财报 · 盘后 16:00 ET · 电话会 16:30").
+            source: Official source URL or description.
+            plan: Planned automation task names (e.g. "T-3 dalton-googl-earn-fy26q3-tm3 / T0 … / T+1 …").
+            event_id: Optional existing event ID (`W1`, `W2`, ...).
+        """
+        configurable = (config or {}).get("configurable") or {}
+        user_id = str(configurable.get("user_id") or "").strip()
+        if not user_id:
+            raise ValueError("user_id is required")
+        await verify_workspace_access(workspace_id, user_id)
+        try:
+            from src.dalton.database import knowledge as db_knowledge
+            from src.dalton.knowledge import service as knowledge_service
+            from src.dalton.knowledge.ops import next_item_id
+
+            latest = await db_knowledge.latest_version(workspace_id, "agenda")
+            base_ver = int(latest["version_no"]) if latest else None
+            content = (latest.get("content") or {}) if isinstance(latest, dict) else {}
+            watch_block = content.get("watch") if isinstance(content.get("watch"), dict) else {}
+            existing_events = [
+                ev for ev in (watch_block.get("events") or []) if isinstance(ev, dict)
+            ]
+
+            clean_event_id = str(event_id or "").strip()
+            matched_ev: dict[str, Any] | None = None
+            match_type = str(type).strip() if (type is not None and str(type).strip()) else "earnings"
+            if clean_event_id:
+                matched_ev = next(
+                    (ev for ev in existing_events if str(ev.get("id") or "") == clean_event_id),
+                    None,
+                )
+                if matched_ev is None:
+                    return json.dumps(
+                        {
+                            "ok": False,
+                            "error": "event_not_found",
+                            "event_id": clean_event_id,
+                            "message": f"agenda.watch.events 中不存在 event_id={clean_event_id!r} 的事件，无法按该 ID 更新。",
+                        },
+                        ensure_ascii=False,
+                    )
+                target_id = clean_event_id
+            else:
+                q_prefix = _extract_quarter_prefix(note)
+                if q_prefix:
+                    matched_ev = next(
+                        (
+                            ev
+                            for ev in existing_events
+                            if str(ev.get("type") or "") == match_type
+                            and _extract_quarter_prefix(ev.get("note")) == q_prefix
+                        ),
+                        None,
+                    )
+                if matched_ev is not None and matched_ev.get("id"):
+                    target_id = str(matched_ev["id"])
+                else:
+                    target_id = next_item_id("events", existing_events)
+
+            date_status_provided = date_status is not None and str(date_status).strip() != ""
+            if matched_ev is None and not date_status_provided:
+                return json.dumps(
+                    {
+                        "ok": False,
+                        "error": "missing_date_status",
+                        "message": "新增监控事件时必须显式传入 date_status（'confirmed' | 'estimated' | 'unknown'）。",
+                    },
+                    ensure_ascii=False,
+                )
+
+            if date == _UNSET_DATE:
+                clean_date = matched_ev.get("date") if matched_ev is not None else None
+            else:
+                clean_date = str(date).strip() if (date is not None and str(date).strip()) else None
+
+            eff_type = (
+                str(type).strip()
+                if (type is not None and str(type).strip())
+                else (str(matched_ev.get("type") or "earnings") if matched_ev is not None else "earnings")
+            )
+            eff_date_status = (
+                str(date_status).strip()
+                if date_status_provided
+                else str(matched_ev.get("date_status") or "confirmed")
+            )
+
+            eff_note = note if note is not None else (matched_ev.get("note") if matched_ev else None)
+            if matched_ev is not None:
+                old_date = str(matched_ev.get("date") or "").strip()
+                if old_date and clean_date and old_date != clean_date:
+                    eff_note = _format_rescheduled_note(eff_note, old_date, clean_date)
+
+            event_obj: dict[str, Any] = {
+                "id": target_id,
+                "type": eff_type,
+                "date": clean_date,
+                "date_status": eff_date_status,
+            }
+            if eff_note is not None or (matched_ev is not None and "note" in matched_ev):
+                event_obj["note"] = eff_note
+
+            if source is not None and str(source).strip():
+                event_obj["source"] = str(source).strip()
+            elif source is None and matched_ev is not None and matched_ev.get("source"):
+                event_obj["source"] = str(matched_ev["source"])
+
+            if plan is not None and str(plan).strip():
+                event_obj["plan"] = str(plan).strip()
+            elif (
+                plan is None
+                and matched_ev is not None
+                and matched_ev.get("plan")
+                and event_obj["date_status"] != "estimated"
+            ):
+                event_obj["plan"] = str(matched_ev["plan"])
+
+            ops: list[dict[str, Any]] = [
+                {
+                    "op": "upsert_item",
+                    "path": "/watch/events",
+                    "value": event_obj,
+                }
+            ]
+            if matched_ev is not None and "plan" in matched_ev and "plan" not in event_obj:
+                ops.append({"op": "remove", "path": f"/watch/events/{target_id}/plan"})
+
+            reason_str = (
+                f"更新议程监控事件 {target_id}"
+                if matched_ev is not None
+                else f"新增议程监控事件 {target_id}"
+            )
+            res = await knowledge_service.apply_update(
+                user_id=user_id,
+                workspace_id=workspace_id,
+                doc_key="agenda",
+                ops=ops,
+                reason=reason_str,
+                base_version=base_ver,
+                source="tool",
+                backend=None,
+                thread_id=str(configurable.get("thread_id")) if configurable.get("thread_id") else None,
+            )
+            if isinstance(res, dict):
+                if res.get("ok"):
+                    res["event_id"] = target_id
+                    res["action"] = "updated" if matched_ev is not None else "created"
+                    res["event"] = event_obj
+                else:
+                    problems = res.get("problems") or [{"path": "/watch/events/0"}]
+                    expected = knowledge_service._format_expected_structures("agenda", problems)
+                    if expected:
+                        res.setdefault("expected_structure", expected)
+                        msg = str(res.get("message") or "")
+                        if "Expected structure" not in msg:
+                            res["message"] = f"{msg}\n\n{expected}".strip()
+            return json.dumps(res, ensure_ascii=False, default=str)
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.warning("[DALTON_DIRECTOR] dalton_watch_event fallback: %s", e)
+            return json.dumps(
+                {"ok": False, "error": str(e)},
+                ensure_ascii=False,
+            )
+
+    @tool("dalton_resolve_signals")
+    async def dalton_resolve_signals(
+        signal_keys: list[str] | str | None = None,
+        probe: str | None = None,
+        note: str = "",
+        signal_id: str | list[str] | None = None,
+        config: RunnableConfig = None,
+    ) -> str:
+        """Resolve wake signals in the caller's own Home workspace (`dalton_signals`).
+
+        Only resolves signals belonging to the caller's own Home workspace (`resolved_by='cos:<thread_id>'`).
+        When resolving by `signal_keys`, `probe` (e.g. `"calendar"`, `"director"`) is required so only
+        signals matching both `probe` and `signal_key` are closed; `probe` may be omitted when resolving
+        solely by `signal_id` (UUID). Merges `note` as `resolution_note` into the signal's payload.
+
+        Args:
+            signal_keys: List of signal keys (e.g. `["weekly:2026-W43"]`) or signal UUIDs to close.
+            probe: Signal probe source (e.g. `"calendar"`, `"director"`). Required when resolving by `signal_keys`.
+            note: One-sentence summary of how the wake signal was handled (saved to `payload.resolution_note`).
+            signal_id: Optional single signal UUID or list of signal UUIDs.
+        """
+        configurable = (config or {}).get("configurable") or {}
+        user_id = str(configurable.get("user_id") or "").strip()
+        if not user_id:
+            raise ValueError("user_id is required")
+
+        refs: list[str] = []
+        for raw in (signal_keys, signal_id):
+            if isinstance(raw, str):
+                if raw.strip() and raw.strip() not in refs:
+                    refs.append(raw.strip())
+            elif isinstance(raw, (list, tuple, set)):
+                for item in raw:
+                    s = str(item or "").strip()
+                    if s and s not in refs:
+                        refs.append(s)
+
+        clean_note = str(note or "").strip()
+        clean_probe = str(probe or "").strip() or None
+        if not refs:
+            return json.dumps(
+                {
+                    "ok": False,
+                    "resolved_count": 0,
+                    "error": "empty_signal_keys",
+                    "message": "未关闭任何信号（resolved_count=0）：请提供非空的 signal_keys 或 signal_id。",
+                },
+                ensure_ascii=False,
+            )
+
+        has_key_refs = any(watch_db._try_uuid(r) is None for r in refs)
+        if has_key_refs and not clean_probe:
+            return json.dumps(
+                {
+                    "ok": False,
+                    "resolved_count": 0,
+                    "error": "missing_probe",
+                    "message": "按 signal_keys 关闭信号时必须传入 probe（例如 'calendar' 或 'director'）；仅按 signal_id (UUID) 关闭时可省略 probe。",
+                },
+                ensure_ascii=False,
+            )
+
+        home_ws_id = await resolve_caller_home_workspace_id(user_id)
+        thread_id = str(configurable.get("thread_id") or "").strip()
+        resolved_by = f"cos:{thread_id}" if thread_id else f"cos:{user_id}"
+
+        try:
+            resolved_count = int(
+                await watch_db.resolve_signals(
+                    refs,
+                    workspace_id=home_ws_id,
+                    probe=clean_probe,
+                    resolved_by=resolved_by,
+                    resolution_note=clean_note or None,
+                )
+            )
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.warning("[DALTON_DIRECTOR] dalton_resolve_signals fallback: %s", e)
+            return json.dumps(
+                {"ok": False, "resolved_count": 0, "error": str(e)},
+                ensure_ascii=False,
+            )
+
+        if resolved_count <= 0:
+            return json.dumps(
+                {
+                    "ok": False,
+                    "resolved_count": 0,
+                    "workspace_id": home_ws_id,
+                    "probe": clean_probe,
+                    "resolved_by": resolved_by,
+                    "signal_keys": refs,
+                    "note": clean_note,
+                    "message": (
+                        f"未关闭任何信号（resolved_count=0）：probe={clean_probe!r}, signal_keys={refs} 在当前用户的 Home 工作区中未匹配到未关闭信号，"
+                        "请检查 probe 或 signal_key 是否拼写错误、信号是否已关闭，或该信号是否属于其他工作区。"
+                    ),
+                },
+                ensure_ascii=False,
+            )
+
+        return json.dumps(
+            {
+                "ok": True,
+                "resolved_count": resolved_count,
+                "workspace_id": home_ws_id,
+                "probe": clean_probe,
+                "resolved_by": resolved_by,
+                "signal_keys": refs,
+                "note": clean_note,
+                "message": f"已关闭 {resolved_count} 条 Home 工作区信号（probe={clean_probe}, resolved_by={resolved_by}）：{clean_note}",
+            },
+            ensure_ascii=False,
+        )
 
     @tool("dalton_schedule_automation")
     async def dalton_schedule_automation(
@@ -699,6 +1065,8 @@ def build_director_tools(
             dalton_coverage_board,
             dalton_record_plan,
             dalton_agenda_note,
+            dalton_watch_event,
+            dalton_resolve_signals,
             dalton_schedule_automation,
             dalton_coverage_tracking,
             dalton_system_jobs,
