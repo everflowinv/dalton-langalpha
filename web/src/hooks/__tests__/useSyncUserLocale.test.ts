@@ -76,14 +76,60 @@ describe('useSyncUserLocale', () => {
     expect(getLocaleCookie()).toBe('zh-CN');
   });
 
-  it('an existing cookie wins — the DB value does not override it', () => {
+  // DALTON-HOOK(i18n): Dalton inverts upstream's "cookie wins" — the account value follows the user across browsers
+  it('the account value outranks an existing cookie', async () => {
     setLocaleCookie('en-US');
     mockUseUser.mockReturnValue({ user: { locale: 'zh-CN' } });
 
     renderHook(() => useSyncUserLocale());
 
+    await waitFor(() => expect(mockI18n.changeLanguage).toHaveBeenCalledWith('zh-CN'));
+    expect(getLocaleCookie()).toBe('zh-CN');
+  });
+
+  // DALTON-HOOK(i18n): no saved users.locale → zh-CN, even over an English cookie/browser
+  it('a user with no saved locale gets zh-CN', async () => {
+    setLocaleCookie('en-US');
+    mockUseUser.mockReturnValue({ user: { user_id: 'u1', locale: null } });
+
+    renderHook(() => useSyncUserLocale());
+
+    await waitFor(() => expect(mockI18n.changeLanguage).toHaveBeenCalledWith('zh-CN'));
+    expect(getLocaleCookie()).toBe('zh-CN');
+  });
+
+  // DALTON-HOOK(i18n): unsupported stored values fall back to the Dalton default
+  it('an unsupported saved locale falls back to zh-CN', async () => {
+    mockUseUser.mockReturnValue({ user: { user_id: 'u1', locale: 'fr-FR' } });
+
+    renderHook(() => useSyncUserLocale());
+
+    await waitFor(() => expect(mockI18n.changeLanguage).toHaveBeenCalledWith('zh-CN'));
+    expect(getLocaleCookie()).toBe('zh-CN');
+  });
+
+  // DALTON-HOOK(i18n): nothing happens until /users/me has answered
+  it('waits for the user before syncing', () => {
+    setLocaleCookie('en-US');
+    mockUseUser.mockReturnValue({ user: null });
+
+    renderHook(() => useSyncUserLocale());
+
     expect(mockI18n.changeLanguage).not.toHaveBeenCalled();
     expect(getLocaleCookie()).toBe('en-US');
+  });
+
+  // DALTON-HOOK(i18n): the latch is per user, so signing in as another account re-syncs
+  it('re-syncs when a different user signs in', async () => {
+    mockUseUser.mockReturnValue({ user: { user_id: 'a', locale: 'en-US' } });
+    const { rerender } = renderHook(() => useSyncUserLocale());
+    expect(getLocaleCookie()).toBe('en-US');
+
+    mockUseUser.mockReturnValue({ user: { user_id: 'b', locale: 'zh-CN' } });
+    rerender();
+
+    await waitFor(() => expect(mockI18n.changeLanguage).toHaveBeenCalledWith('zh-CN'));
+    expect(getLocaleCookie()).toBe('zh-CN');
   });
 
   it('seeds the cookie even when i18n already matches (no changeLanguage needed), and latches', () => {
