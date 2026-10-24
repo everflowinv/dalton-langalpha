@@ -131,9 +131,19 @@ def enrich_yfinance_snapshot_extended_hours(
 
         reg_as_of = _epoch_sec_to_ms(base_snap.get("as_of"))
         reg_trading_date = _regular_date_iso(reg_as_of, sym)
+        reg_change = _finite(base_snap.get("regular_trading_change"))
+        if reg_change is None:
+            reg_change = _finite(base_snap.get("change"))
+        reg_change_pct = _finite(base_snap.get("regular_trading_change_percent"))
+        if reg_change_pct is None:
+            reg_change_pct = _finite(base_snap.get("change_percent"))
+        if reg_change_pct is None:
+            prev_c = _finite(base_snap.get("previous_close"))
+            if reg_change is not None and prev_c is not None and prev_c > 0:
+                reg_change_pct = round((reg_change / prev_c) * 100.0, 4)
         base_snap["regular_close"] = round(price, 4)
-        base_snap["regular_trading_change"] = base_snap.get("change")
-        base_snap["regular_trading_change_percent"] = base_snap.get("change_percent")
+        base_snap["regular_trading_change"] = reg_change
+        base_snap["regular_trading_change_percent"] = reg_change_pct
         base_snap["regular_as_of"] = reg_as_of
         base_snap["regular_trading_date"] = reg_trading_date
 
@@ -188,8 +198,8 @@ def enrich_yfinance_snapshot_extended_hours(
                     "last_trade_price": round(pre_price, 4),
                     "change": round(early_change, 4),
                     "change_percent": round(early_pct, 4),
-                    "regular_trading_change": base_snap.get("change"),
-                    "regular_trading_change_percent": base_snap.get("change_percent"),
+                    "regular_trading_change": reg_change,
+                    "regular_trading_change_percent": reg_change_pct,
                     "early_trading_change": round(early_change, 4),
                     "early_trading_change_percent": round(early_pct, 4),
                     "late_trading_change": None,
@@ -231,8 +241,8 @@ def enrich_yfinance_snapshot_extended_hours(
                     "last_trade_price": round(post_price, 4),
                     "change": round(total_change, 4),
                     "change_percent": round(total_pct, 4),
-                    "regular_trading_change": base_snap.get("change"),
-                    "regular_trading_change_percent": base_snap.get("change_percent"),
+                    "regular_trading_change": reg_change,
+                    "regular_trading_change_percent": reg_change_pct,
                     "early_trading_change": None,
                     "early_trading_change_percent": None,
                     "late_trading_change": round(late_change, 4),

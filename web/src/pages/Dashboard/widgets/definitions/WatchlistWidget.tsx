@@ -12,6 +12,7 @@ import {
 } from '../framework/snapshotSerializers';
 import { RowAttachButton } from '../../components/RowAttachButton';
 import type { WidgetRenderProps } from '../types';
+import { formatSignedPct2 } from '@/lib/quotes'; // DALTON-HOOK(extended-hours-quotes)
 import { watchlistQuoteRow } from '../../hooks/useWatchlistData';
 import {
   HoldingsAddButton,
@@ -29,7 +30,8 @@ function WatchlistWidget({ instance }: WidgetRenderProps<WatchlistConfig>) {
   // Register snapshot exporters: full table + per-row.
   useWidgetContextExport(instance.id, {
     full: () => {
-      const rows = watchlist.rows.map(watchlistQuoteRow);
+      // DALTON-HOOK(extended-hours-quotes): Pass marketStatus so full watchlist export includes extended-hours quotes.
+      const rows = watchlist.rows.map((r) => watchlistQuoteRow(r, dashboard.marketStatus));
       const body = serializeQuoteRowsToMarkdown(rows);
       const text = wrapWidgetContext('watchlist.list', { count: rows.length }, body);
       return {
@@ -45,22 +47,19 @@ function WatchlistWidget({ instance }: WidgetRenderProps<WatchlistConfig>) {
     rows: (rowId: string) => {
       const row = watchlist.rows.find((r) => (r.watchlist_item_id ?? r.symbol) === rowId);
       if (!row) return null;
-      // Note: pre/post-market price is intentionally omitted. The QuoteRow
-      // contract treats preMarket/postMarket as *prices*, but the row data
-      // here only carries previousClose + a change-percent — passing
-      // previousClose under the preMarket key would label yesterday's close
-      // as the pre-market price in the agent's view. Adding correct ext-
-      // hours info would need marketStatus + getExtendedHoursInfo here.
-      const cleaned = watchlistQuoteRow(row);
+      // DALTON-HOOK(extended-hours-quotes): Pass dashboard.marketStatus so watchlistQuoteRow exports
+      // the settled close and regular change alongside the pre/post-market price and move from getExtendedHoursInfo.
+      const cleaned = watchlistQuoteRow(row, dashboard.marketStatus);
       const body = serializeQuoteRowToMarkdown(cleaned);
       const text = wrapWidgetContext('watchlist.list/row', { symbol: row.symbol }, body);
+      const labelPct = cleaned.changePercent;
       return {
         widget_type: 'watchlist.list/row',
         widget_id: `${instance.id}/${rowId}`,
         label:
           row.symbol +
-          (row.quoteAvailable !== false && row.changePercent !== undefined
-            ? ` · ${row.changePercent >= 0 ? '+' : ''}${row.changePercent.toFixed(2)}%`
+          (row.quoteAvailable !== false && labelPct !== undefined
+            ? ` · ${formatSignedPct2(labelPct)}`
             : ''),
         description: t('dashboard.widgets.watchlist.title'),
         captured_at: new Date().toISOString(),

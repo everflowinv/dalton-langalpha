@@ -7,6 +7,9 @@
  */
 
 
+// DALTON-HOOK(extended-hours-quotes): Share roundQuote2 and formatSignedPct2 from deriveQuoteDisplay so exports match screen formatting.
+import { formatSignedPct2, roundQuote2 } from '@/lib/dalton/quotes/deriveQuoteDisplay';
+
 /** Wrap a body in a <widget-context> envelope with type and arbitrary key/value attributes. */
 export function wrapWidgetContext(
   type: string,
@@ -166,36 +169,99 @@ export interface QuoteRow {
   price?: number;
   change?: number;
   changePercent?: number;
+  // DALTON-HOOK(extended-hours-quotes): Session identity and extended-hours change fields for agent context.
+  session?: 'regular' | 'pre' | 'post';
   preMarket?: number;
+  preMarketChange?: number;
+  preMarketChangePercent?: number;
   postMarket?: number;
+  postMarketChange?: number;
+  postMarketChangePercent?: number;
   volume?: number;
   shares?: number;
   marketValue?: number | null;
+  unrealizedPlPercent?: number;
   /** ISO code the row is quoted in. Null quotes a level in points (an index),
    *  printed bare; absent is a row from before currencies, in dollars. */
   currency?: string | null;
 }
 
+// DALTON-HOOK(extended-hours-quotes): Format exported quote amounts using shared roundQuote2.
 function formatQuoteAmount(value: number, currency?: string | null): string {
-  if (currency === null) return value.toFixed(2);
-  return currency ? `${currency} ${value.toFixed(2)}` : `$${value.toFixed(2)}`;
+  const formatted = roundQuote2(value).toFixed(2);
+  if (currency === null) return formatted;
+  return currency ? `${currency} ${formatted}` : `$${formatted}`;
 }
 
 export function serializeQuoteRowToMarkdown(row: QuoteRow): string {
   const lines: string[] = [`**${row.symbol}**`];
   const bits: string[] = [];
-  if (row.price !== undefined) bits.push(formatQuoteAmount(row.price, row.currency));
+  // DALTON-HOOK(extended-hours-quotes): Label price identity (regular close / prev close) and extended-hours anchor.
+  const isPost = row.session === 'post' || row.postMarket !== undefined;
+  const isPre = !isPost && (row.session === 'pre' || row.preMarket !== undefined);
+  if (row.price !== undefined) {
+    const amt = formatQuoteAmount(row.price, row.currency);
+    bits.push(isPost ? `regular close ${amt}` : isPre ? `prev close ${amt}` : amt);
+  }
   if (row.change !== undefined && row.changePercent !== undefined) {
-    const sign = row.change >= 0 ? '+' : '';
-    bits.push(`${sign}${row.change.toFixed(2)} (${sign}${row.changePercent.toFixed(2)}%)`);
+    const chgRounded = roundQuote2(row.change);
+    const sign = chgRounded >= 0 ? '+' : '';
+    const chgStr = `${sign}${chgRounded.toFixed(2)}`;
+    const pctStr = formatSignedPct2(row.changePercent);
+    const move = `${chgStr} (${pctStr})`;
+    // DALTON-HOOK(extended-hours-quotes): Annotate prior-session basis in pre-market and prev-close basis in after-hours.
+    bits.push(
+      isPost
+        ? `${move} vs prev close`
+        : row.session === 'pre'
+          ? `${chgStr} (${pctStr} prior session)`
+          : isPre
+            ? `${move} prior session`
+            : move,
+    );
+  } else if (row.changePercent !== undefined) {
+    const pctStr = formatSignedPct2(row.changePercent);
+    bits.push(
+      isPost
+        ? `(${pctStr}) vs prev close`
+        : isPre
+          ? `(${pctStr} prior session)`
+          : `(${pctStr})`,
+    );
   }
   if (bits.length) lines.push(bits.join(' '));
-  if (row.preMarket !== undefined) lines.push(`pre-market ${formatQuoteAmount(row.preMarket, row.currency)}`);
-  if (row.postMarket !== undefined) lines.push(`post-market ${formatQuoteAmount(row.postMarket, row.currency)}`);
+  if (row.preMarket !== undefined) {
+    // DALTON-HOOK(extended-hours-quotes): Format pre-market price and move vs previous close.
+    const extBits = [`pre-market ${formatQuoteAmount(row.preMarket, row.currency)}`];
+    if (row.preMarketChange !== undefined && row.preMarketChangePercent !== undefined) {
+      const chgRounded = roundQuote2(row.preMarketChange);
+      const sign = chgRounded >= 0 ? '+' : '';
+      extBits.push(`${sign}${chgRounded.toFixed(2)} (${formatSignedPct2(row.preMarketChangePercent)} vs prev close)`);
+    } else if (row.preMarketChangePercent !== undefined) {
+      extBits.push(`(${formatSignedPct2(row.preMarketChangePercent)} vs prev close)`);
+    }
+    lines.push(extBits.join(' '));
+  }
+  if (row.postMarket !== undefined) {
+    // DALTON-HOOK(extended-hours-quotes): Format post-market price and move vs regular close.
+    const extBits = [`post-market ${formatQuoteAmount(row.postMarket, row.currency)}`];
+    if (row.postMarketChange !== undefined && row.postMarketChangePercent !== undefined) {
+      const chgRounded = roundQuote2(row.postMarketChange);
+      const sign = chgRounded >= 0 ? '+' : '';
+      extBits.push(`${sign}${chgRounded.toFixed(2)} (${formatSignedPct2(row.postMarketChangePercent)} vs regular close)`);
+    } else if (row.postMarketChangePercent !== undefined) {
+      extBits.push(`(${formatSignedPct2(row.postMarketChangePercent)} vs regular close)`);
+    }
+    lines.push(extBits.join(' '));
+  }
   if (row.volume !== undefined) lines.push(`vol ${row.volume}`);
   if (row.shares !== undefined) lines.push(`shares ${row.shares}`);
   if (row.marketValue != null) {
     lines.push(`mkt val ${formatQuoteAmount(row.marketValue, row.currency)}`);
+  }
+  // DALTON-HOOK(extended-hours-quotes): Render holding unrealized P/L separately from daily session move.
+  if (row.unrealizedPlPercent !== undefined) {
+    lines.push(`持仓浮盈 ${formatSignedPct2(row.unrealizedPlPercent)}`);
   }
   return lines.join('\n');
 }
@@ -204,22 +270,64 @@ export function serializeQuoteRowsToMarkdown(rows: QuoteRow[]): string {
   if (!rows.length) return '_no symbols_';
   const includeVol = rows.some((r) => r.volume !== undefined);
   const includeCurrency = rows.some((r) => r.currency != null);
+  // DALTON-HOOK(extended-hours-quotes): Include session, extended-hours, and holding unrealized P/L columns when present.
+  const includePre = rows.some((r) => r.preMarket !== undefined);
+  const includePost = rows.some((r) => r.postMarket !== undefined);
+  const includePl = rows.some((r) => r.unrealizedPlPercent !== undefined);
+  const includeSession =
+    includePre ||
+    includePost ||
+    rows.some((r) => r.session !== undefined && r.session !== 'regular');
   const headers = ['symbol'];
   if (includeCurrency) headers.push('currency');
+  if (includeSession) headers.push('session');
   headers.push('price', 'change', 'change%');
+  if (includePre) headers.push('pre-market', 'pre-market%');
+  if (includePost) headers.push('post-market', 'post-market%');
+  if (includePl) headers.push('持仓浮盈');
   if (includeVol) headers.push('volume');
   const lines: string[] = [`| ${headers.join(' | ')} |`, `| ${headers.map(() => '---').join(' | ')} |`];
+  // DALTON-HOOK(extended-hours-quotes): Render session, pre/post-market, and holding unrealized P/L cells in markdown table.
   rows.forEach((r) => {
+    const rowIsPost = r.session === 'post' || r.postMarket !== undefined;
+    const rowIsPre = !rowIsPost && (r.session === 'pre' || r.preMarket !== undefined);
     const cells = [
       r.symbol,
       ...(includeCurrency ? [r.currency ?? ''] : []),
-      r.price !== undefined ? r.price.toFixed(2) : '',
-      r.change !== undefined ? r.change.toFixed(2) : '',
-      r.changePercent !== undefined ? `${r.changePercent.toFixed(2)}%` : '',
+      ...(includeSession
+        ? [rowIsPost ? 'regular close' : rowIsPre ? 'prev close' : 'regular']
+        : []),
+      r.price !== undefined ? roundQuote2(r.price).toFixed(2) : '',
+      r.change !== undefined ? roundQuote2(r.change).toFixed(2) : '',
+      r.changePercent !== undefined ? formatSignedPct2(r.changePercent) : '',
+      ...(includePre
+        ? [
+            r.preMarket !== undefined ? roundQuote2(r.preMarket).toFixed(2) : '',
+            r.preMarketChangePercent !== undefined ? formatSignedPct2(r.preMarketChangePercent) : '',
+          ]
+        : []),
+      ...(includePost
+        ? [
+            r.postMarket !== undefined ? roundQuote2(r.postMarket).toFixed(2) : '',
+            r.postMarketChangePercent !== undefined ? formatSignedPct2(r.postMarketChangePercent) : '',
+          ]
+        : []),
+      ...(includePl
+        ? [r.unrealizedPlPercent !== undefined ? formatSignedPct2(r.unrealizedPlPercent) : '']
+        : []),
     ];
     if (includeVol) cells.push(r.volume !== undefined ? String(r.volume) : '');
     lines.push(`| ${cells.join(' | ')} |`);
   });
+  // DALTON-HOOK(extended-hours-quotes): Append basis note explaining change%, pre-market%, and post-market% anchors.
+  if (includeSession) {
+    const basisParts = [
+      'change% vs prev close (for prev close rows, prior session move)',
+    ];
+    if (includePre) basisParts.push('pre-market% vs prev close');
+    if (includePost) basisParts.push('post-market% vs regular close');
+    lines.push(`_Basis: ${basisParts.join('; ')}._`);
+  }
   return lines.join('\n');
 }
 

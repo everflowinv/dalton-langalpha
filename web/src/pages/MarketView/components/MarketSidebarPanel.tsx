@@ -9,6 +9,7 @@ import AddWatchlistItemDialog from '../../Dashboard/components/AddWatchlistItemD
 import AddPortfolioHoldingDialog from '../../Dashboard/components/AddPortfolioHoldingDialog';
 import ConfirmDialog from '../../Dashboard/components/ConfirmDialog';
 import { getExtendedHoursInfo } from '@/lib/marketUtils';
+import { deriveQuoteDisplay, formatSignedPct2, roundQuote2 } from '@/lib/quotes'; // DALTON-HOOK(extended-hours-quotes)
 import { grouped2 } from '@/lib/format';
 import { useLocale } from '@/hooks/useLocale';
 import { EXT_COLOR_PRE, EXT_COLOR_POST } from '../utils/chartConstants';
@@ -19,6 +20,15 @@ interface SidebarRow {
   symbol: string;
   price: number;
   previousClose?: number | null;
+  // DALTON-HOOK(extended-hours-quotes): Extended-hours and regular-session fields for accurate sidebar quotes.
+  regularClose?: number | null;
+  regularTradingChange?: number | null;
+  regularTradingChangePercent?: number | null;
+  earlyTradingChange?: number | null;
+  lateTradingChange?: number | null;
+  lastMinuteClose?: number | null;
+  lastTradePrice?: number | null;
+  liveTickAt?: number | null;
   isPositive: boolean;
   changePercent?: number;
   unrealizedPlPercent?: number;
@@ -93,15 +103,15 @@ function MarketSidebarPanel({ activeSymbol, onSymbolClick, marketStatus }: Marke
     setDeleteConfirm((p) => ({ ...p, open: false }));
   }, [deleteConfirm.onConfirm]);
 
+  // DALTON-HOOK(extended-hours-quotes): Round sidebar prices and percentages with shared roundQuote2 / formatSignedPct2.
   const formatPrice = (price: number | null | undefined): string => {
     if (price == null || price === 0) return '--';
-    return grouped2(Number(price), locale);
+    return grouped2(roundQuote2(Number(price)), locale);
   };
 
   const formatChange = (val: number | null | undefined): string => {
     if (val == null) return '--';
-    const sign = val >= 0 ? '+' : '';
-    return `${sign}${val.toFixed(2)}%`;
+    return formatSignedPct2(val, locale);
   };
 
   const changeClass = (isPositive: boolean, val: number | null | undefined): string => {
@@ -109,14 +119,32 @@ function MarketSidebarPanel({ activeSymbol, onSymbolClick, marketStatus }: Marke
     return isPositive ? 'market-sidebar-row-change--positive' : 'market-sidebar-row-change--negative';
   };
 
-  const getExtendedHours = (row: SidebarRow) => getExtendedHoursInfo(marketStatus as Record<string, unknown> & { market?: string; afterHours?: boolean; earlyHours?: boolean }, row, { shortLabels: true });
-
   const renderRows = (items: SidebarRow[], keyField: string, changeField: string, onDelete: (id: string) => void) => {
     return items.map((row) => {
       const isActive = activeSymbol && row.symbol === activeSymbol.toUpperCase();
-      const { extPct, extType } = getExtendedHours(row);
-      // During extended hours, show close price as main; live price goes in ext line
-      const mainPrice = extType && row.previousClose != null ? row.previousClose : row.price;
+      // DALTON-HOOK(extended-hours-quotes): Derive main quote and extended-hours figures from shared deriveQuoteDisplay.
+      const wsTick = wsPrices.get(row.symbol) ?? null;
+      const quoteDisplay = deriveQuoteDisplay(
+        row,
+        marketStatus as Parameters<typeof getExtendedHoursInfo>[0],
+        wsTick,
+      );
+      const extType = quoteDisplay.session === 'regular' ? null : quoteDisplay.session;
+      const mainPrice = quoteDisplay.mainPrice;
+      const isWatchlistRow = changeField === 'changePercent';
+      const displayChangePct = isWatchlistRow
+        ? quoteDisplay.mainChangePct
+        : (row[changeField] as number | null | undefined);
+      const displayIsPositive =
+        isWatchlistRow && extType
+          ? (quoteDisplay.mainChange != null
+              ? quoteDisplay.mainChange >= 0
+              : displayChangePct != null
+                ? displayChangePct >= 0
+                : row.isPositive)
+          : row.isPositive;
+      const extDisplayPrice = quoteDisplay.extPrice;
+      const extPct = quoteDisplay.extChangePct;
       return (
         <div
           key={row[keyField] as string}
@@ -124,13 +152,14 @@ function MarketSidebarPanel({ activeSymbol, onSymbolClick, marketStatus }: Marke
           onClick={() => onSymbolClick?.(row.symbol)}
         >
           <span className="market-sidebar-row-symbol">{row.symbol}</span>
+          {/* DALTON-HOOK(extended-hours-quotes): Render mainPrice, regular changePercent, and extDisplayPrice. */}
           <span className="market-sidebar-row-price">{formatPrice(mainPrice)}</span>
-          <span className={`market-sidebar-row-change ${changeClass(row.isPositive, row[changeField] as number | null | undefined)}`}>
-            {formatChange(row[changeField] as number | null | undefined)}
-            {extType && extPct != null && (
+          <span className={`market-sidebar-row-change ${changeClass(displayIsPositive, displayChangePct)}`}>
+            {formatChange(displayChangePct)}
+            {extType && extDisplayPrice != null && extPct != null && (
               <span className="market-sidebar-row-ext" style={{ display: 'inline-flex', alignItems: 'center', gap: 2, color: extType === 'pre' ? EXT_COLOR_PRE : EXT_COLOR_POST }}>
                 {extType === 'pre' ? <Sunrise size={10} /> : <Sunset size={10} />}
-                {formatPrice(row.price)} {extPct >= 0 ? '+' : ''}{extPct.toFixed(2)}%
+                {formatPrice(extDisplayPrice)} {formatSignedPct2(extPct, locale)}
               </span>
             )}
           </span>
@@ -166,12 +195,15 @@ function MarketSidebarPanel({ activeSymbol, onSymbolClick, marketStatus }: Marke
     return rows.map((row) => {
       const ws = wsPrices.get(row.symbol);
       if (!ws) return row;
+      // DALTON-HOOK(extended-hours-quotes): Stamp liveTickAt from WS PriceUpdate when overlaying sidebar rows.
       if (isWatchlist) {
         return {
           ...row,
           price: ws.price,
+          change: ws.change,
           changePercent: ws.changePercent ?? row.changePercent,
           isPositive: ws.change >= 0,
+          liveTickAt: ws.timestamp ?? row.liveTickAt ?? null,
         };
       }
       // Portfolio: only overlay price and direction — preserve unrealizedPlPercent
@@ -179,6 +211,7 @@ function MarketSidebarPanel({ activeSymbol, onSymbolClick, marketStatus }: Marke
         ...row,
         price: ws.price,
         isPositive: ws.change >= 0,
+        liveTickAt: ws.timestamp ?? row.liveTickAt ?? null,
       };
     });
   }, [isWatchlist, watchlist.rows, portfolio.rows, wsPrices]);

@@ -40,13 +40,22 @@ export function snapshotToStockPrice(symbol: string, snap: QuoteRow | undefined 
       symbol,
       currency: snap.currency ?? null,
       price: roundQuote(snap.price, dp),
-      change: roundQuote(change, dp),
-      changePercent: Math.round(changePct * 100) / 100,
+      // DALTON-HOOK(extended-hours-quotes): Preserve raw change and changePercent plus extended-hours fields so rounding only happens at display/export time.
+      change,
+      changePercent: changePct,
       isPositive: change >= 0,
       quoteAvailable: true,
       previousClose: snap.previous_close ?? null,
+      regularClose: snap.regular_close ?? null,
+      regularTradingChange: snap.regular_trading_change ?? null,
+      regularTradingChangePercent: snap.regular_trading_change_percent ?? null,
+      earlyTradingChange: snap.early_trading_change ?? null,
       earlyTradingChangePercent: snap.early_trading_change_percent ?? null,
+      lateTradingChange: snap.late_trading_change ?? null,
       lateTradingChangePercent: snap.late_trading_change_percent ?? null,
+      lastMinuteClose: snap.last_minute_close ?? null,
+      lastTradePrice: snap.last_trade_price ?? null,
+      liveTickAt: snap.live_tick_at ?? null,
     };
   }
   return { symbol, price: 0, change: 0, changePercent: 0, isPositive: true, quoteAvailable: false };

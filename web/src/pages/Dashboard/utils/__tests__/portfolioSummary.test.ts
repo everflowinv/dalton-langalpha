@@ -123,6 +123,7 @@ describe('portfolioSummary', () => {
     expect(formatPortfolioMoney(800, 'HKD', 'en-US')).toBe('HK$800.00');
   });
 
+  // DALTON-HOOK(extended-hours-quotes): Table change% uses shared formatSignedPct2.
   it('includes currency in serialized quote markdown rows', () => {
     expect(
       serializeQuoteRowsToMarkdown([
@@ -132,7 +133,7 @@ describe('portfolioSummary', () => {
       [
         '| symbol | currency | price | change | change% |',
         '| --- | --- | --- | --- | --- |',
-        '| 0700.HK | HKD | 800.00 |  | 1.20% |',
+        '| 0700.HK | HKD | 800.00 |  | +1.20% |',
       ].join('\n'),
     );
   });

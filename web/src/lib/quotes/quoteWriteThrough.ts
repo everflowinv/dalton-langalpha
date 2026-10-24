@@ -20,6 +20,8 @@ export interface WsQuoteFields {
   price: number;
   change: number;
   changePercent: number;
+  // DALTON-HOOK(extended-hours-quotes): Optional WS frame timestamp so live_tick_at reflects the tick time.
+  timestamp?: number;
 }
 
 /**
@@ -39,12 +41,14 @@ export function writeQuoteFromWs(
     // Neither may be seeded into a partial, previous_close-less row.
     if (prev == null) return prev;
     const base: QuoteRow = prev;
+    // DALTON-HOOK(extended-hours-quotes): Stamp live_tick_at so deriveQuoteDisplay detects WS write-through even when price === settledClose.
     return {
       ...base,
       symbol: base.symbol ?? key,
       price: fields.price,
       change: fields.change,
       change_percent: fields.changePercent,
+      live_tick_at: fields.timestamp ?? Date.now(),
     };
   });
 }

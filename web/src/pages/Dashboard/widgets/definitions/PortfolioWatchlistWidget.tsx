@@ -15,6 +15,7 @@ import { PortfolioWatchlistConfigSchema } from '../framework/configSchemas';
 import { RowAttachButton } from '../../components/RowAttachButton';
 import type { WidgetRenderProps } from '../types';
 import type { PortfolioRow } from '../../hooks/usePortfolioData';
+import { deriveQuoteDisplay, formatSignedPct2, roundQuote2, type MarketStatusInput } from '@/lib/quotes'; // DALTON-HOOK(extended-hours-quotes)
 import { watchlistQuoteRow } from '../../hooks/useWatchlistData';
 import {
   HoldingsAddButton,
@@ -33,14 +34,52 @@ type PortfolioWatchlistConfig = {
   valuesHidden?: boolean;
 };
 
-function portfolioRowToQuote(r: PortfolioRow) {
+// DALTON-HOOK(extended-hours-quotes): Derive price, change, session, and pre/post-market fields from shared deriveQuoteDisplay.
+export function portfolioRowToQuote(r: PortfolioRow, marketStatus?: MarketStatusInput) {
   const hasQuote = r.quoteAvailable !== false;
+  if (!hasQuote) {
+    return {
+      symbol: r.symbol,
+      price: undefined,
+      shares: r.quantity ?? undefined,
+      marketValue: undefined,
+      changePercent: undefined,
+      currency: normalizePortfolioCurrency(r.currency),
+    };
+  }
+  const d = deriveQuoteDisplay(r, marketStatus);
+  const price = d.mainPrice != null ? roundQuote2(d.mainPrice) : undefined;
+  const change = d.mainChange != null ? roundQuote2(d.mainChange) : undefined;
+  const changePercent = d.mainChangePct != null ? roundQuote2(d.mainChangePct) : undefined;
+  const unrealizedPlPercent =
+    r.unrealizedPlPercent != null ? roundQuote2(r.unrealizedPlPercent) : undefined;
+  const extPrice = d.extPrice != null ? roundQuote2(d.extPrice) : undefined;
+  const extChange = d.extChange != null ? roundQuote2(d.extChange) : undefined;
+  const extPct = d.extChangePct != null ? roundQuote2(d.extChangePct) : undefined;
+  // DALTON-HOOK(extended-hours-quotes): Keep quote change/changePercent separate from holding unrealizedPlPercent.
   return {
     symbol: r.symbol,
-    price: hasQuote ? r.price : undefined,
+    ...(d.session !== 'regular' ? { session: d.session } : {}),
+    price,
+    ...(change !== undefined ? { change } : {}),
+    ...(changePercent !== undefined ? { changePercent } : {}),
     shares: r.quantity ?? undefined,
-    marketValue: hasQuote ? r.marketValue ?? undefined : undefined,
-    changePercent: hasQuote ? r.unrealizedPlPercent ?? undefined : undefined,
+    marketValue: r.marketValue ?? undefined,
+    ...(unrealizedPlPercent !== undefined ? { unrealizedPlPercent } : {}),
+    ...(d.session === 'pre' && extPrice !== undefined
+      ? {
+          preMarket: extPrice,
+          ...(extChange !== undefined ? { preMarketChange: extChange } : {}),
+          ...(extPct !== undefined ? { preMarketChangePercent: extPct } : {}),
+        }
+      : {}),
+    ...(d.session === 'post' && extPrice !== undefined
+      ? {
+          postMarket: extPrice,
+          ...(extChange !== undefined ? { postMarketChange: extChange } : {}),
+          ...(extPct !== undefined ? { postMarketChangePercent: extPct } : {}),
+        }
+      : {}),
     currency: normalizePortfolioCurrency(r.currency),
   };
 }
@@ -68,7 +107,8 @@ function PortfolioWatchlistWidget({
   useWidgetContextExport(instance.id, {
     full: () => {
       if (activeTab === 'watchlist') {
-        const rows = watchlist.rows.map(watchlistQuoteRow);
+        // DALTON-HOOK(extended-hours-quotes): Pass marketStatus so full watchlist export includes extended-hours quotes.
+        const rows = watchlist.rows.map((r) => watchlistQuoteRow(r, dashboard.marketStatus));
         const body = serializeQuoteRowsToMarkdown(rows);
         const text = wrapWidgetContext(
           'personal.portfolioWatchlist',
@@ -85,7 +125,8 @@ function PortfolioWatchlistWidget({
           data: { tab: 'watchlist', rows },
         };
       }
-      const rows = portfolio.rows.map(portfolioRowToQuote);
+      // DALTON-HOOK(extended-hours-quotes): Pass dashboard.marketStatus so portfolio export includes session and extended-hours quotes.
+      const rows = portfolio.rows.map((r) => portfolioRowToQuote(r, dashboard.marketStatus));
       const summary = portfolioSummary(portfolio.rows);
       const navLine = formatPortfolioNavMarkdownLine(summary, locale);
       const lines: string[] = [];
@@ -110,20 +151,22 @@ function PortfolioWatchlistWidget({
       if (activeTab === 'watchlist') {
         const row = watchlist.rows.find((r) => (r.watchlist_item_id ?? r.symbol) === rowId);
         if (!row) return null;
-        const quote = watchlistQuoteRow(row);
+        // DALTON-HOOK(extended-hours-quotes): Pass marketStatus so row export and label match screen session rules.
+        const quote = watchlistQuoteRow(row, dashboard.marketStatus);
         const body = serializeQuoteRowToMarkdown(quote);
         const text = wrapWidgetContext(
           'personal.portfolioWatchlist/row',
           { tab: 'watchlist', symbol: row.symbol },
           body,
         );
+        const labelPct = quote.changePercent;
         return {
           widget_type: 'personal.portfolioWatchlist/row',
           widget_id: `${instance.id}/${rowId}`,
           label:
             row.symbol +
-            (row.quoteAvailable !== false && row.changePercent !== undefined
-              ? ` · ${row.changePercent >= 0 ? '+' : ''}${row.changePercent.toFixed(2)}%`
+            (row.quoteAvailable !== false && labelPct !== undefined
+              ? ` · ${formatSignedPct2(labelPct)}`
               : ''),
           description: t('dashboard.widgets.portfolioWatchlist.headerWatchlist'),
           captured_at: new Date().toISOString(),
@@ -133,7 +176,8 @@ function PortfolioWatchlistWidget({
       }
       const row = portfolio.rows.find((r) => (r.user_portfolio_id ?? r.symbol) === rowId);
       if (!row) return null;
-      const quote = portfolioRowToQuote(row);
+      // DALTON-HOOK(extended-hours-quotes): Pass dashboard.marketStatus to portfolioRowToQuote and format label via formatSignedPct2.
+      const quote = portfolioRowToQuote(row, dashboard.marketStatus);
       const body = serializeQuoteRowToMarkdown(quote);
       const text = wrapWidgetContext(
         'personal.portfolioWatchlist/row',
@@ -146,7 +190,7 @@ function PortfolioWatchlistWidget({
         label:
           row.symbol +
           (row.quoteAvailable !== false && row.unrealizedPlPercent != null
-            ? ` · ${row.unrealizedPlPercent >= 0 ? '+' : ''}${row.unrealizedPlPercent.toFixed(2)}%`
+            ? ` · ${formatSignedPct2(row.unrealizedPlPercent)}`
             : ''),
         description: t('dashboard.widgets.portfolioWatchlist.headerHoldings'),
         captured_at: new Date().toISOString(),

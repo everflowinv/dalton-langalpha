@@ -57,3 +57,24 @@ class TestCurrencyFields:
             None,
             None,
         )
+
+
+# DALTON-HOOK(extended-hours-quotes): Verify SnapshotData preserves last_trade_price and regular_trading_change_percent.
+def test_snapshot_preserves_extended_hours_fields():
+    snap = SnapshotData(
+        symbol="GOOG",
+        price=317.28,
+        regular_close=317.28,
+        previous_close=320.76,
+        regular_trading_change=-3.48,
+        regular_trading_change_percent=-1.0849,
+        last_trade_price=318.10,
+        late_trading_change=0.82,
+        late_trading_change_percent=0.2584,
+        market_status="late_trading",
+    )
+    assert snap.last_trade_price == 318.10
+    assert snap.regular_trading_change_percent == -1.0849
+    dumped = snap.model_dump()
+    assert dumped["last_trade_price"] == 318.10
+    assert dumped["regular_trading_change_percent"] == -1.0849

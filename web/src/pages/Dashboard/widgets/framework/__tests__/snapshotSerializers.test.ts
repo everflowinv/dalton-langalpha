@@ -153,6 +153,182 @@ describe('quote row serializers', () => {
   it('handles empty rows', () => {
     expect(serializeQuoteRowsToMarkdown([])).toBe('_no symbols_');
   });
+
+  // DALTON-HOOK(extended-hours-quotes): Verify explicit price identity labels in pre-market and after-hours markdown.
+  it('labels regular close vs prev close and post-market vs regular close in after-hours', () => {
+    const row = {
+      symbol: 'GOOG',
+      session: 'post' as const,
+      price: 317.28,
+      change: -3.48,
+      changePercent: -1.08,
+      postMarket: 318.1,
+      postMarketChange: 0.82,
+      postMarketChangePercent: 0.26,
+      currency: 'USD',
+    };
+    const out = serializeQuoteRowToMarkdown(row);
+    expect(out).toBe(
+      [
+        '**GOOG**',
+        'regular close USD 317.28 -3.48 (-1.08%) vs prev close',
+        'post-market USD 318.10 +0.82 (+0.26% vs regular close)',
+      ].join('\n'),
+    );
+    const table = serializeQuoteRowsToMarkdown([row]);
+    expect(table).toContain(
+      '| symbol | currency | session | price | change | change% | post-market | post-market% |',
+    );
+    expect(table).toContain('| GOOG | USD | regular close | 317.28 | -3.48 | -1.08% | 318.10 | +0.26% |');
+    expect(table).toContain(
+      '_Basis: change% vs prev close (for prev close rows, prior session move); post-market% vs regular close._',
+    );
+  });
+
+  // DALTON-HOOK(extended-hours-quotes): Verify prev close (with prior session basis) and pre-market vs prev close labels in pre-market.
+  it('labels prev close and pre-market vs prev close in pre-market', () => {
+    const row = {
+      symbol: 'GOOG',
+      session: 'pre' as const,
+      price: 320.76,
+      change: -3.46,
+      changePercent: -1.07,
+      preMarket: 322.26,
+      preMarketChange: 1.5,
+      preMarketChangePercent: 0.47,
+      currency: 'USD',
+    };
+    const out = serializeQuoteRowToMarkdown(row);
+    expect(out).toBe(
+      [
+        '**GOOG**',
+        'prev close USD 320.76 -3.46 (-1.07% prior session)',
+        'pre-market USD 322.26 +1.50 (+0.47% vs prev close)',
+      ].join('\n'),
+    );
+    const table = serializeQuoteRowsToMarkdown([row]);
+    expect(table).toContain(
+      '| symbol | currency | session | price | change | change% | pre-market | pre-market% |',
+    );
+    expect(table).toContain('| GOOG | USD | prev close | 320.76 | -3.46 | -1.07% | 322.26 | +0.47% |');
+    expect(table).toContain(
+      '_Basis: change% vs prev close (for prev close rows, prior session move); pre-market% vs prev close._',
+    );
+  });
+
+  // DALTON-HOOK(extended-hours-quotes): Verify mixed-session table renders session labels and basis note clearly.
+  it('renders mixed-session rows with session labels and basis note', () => {
+    const table = serializeQuoteRowsToMarkdown([
+      {
+        symbol: 'GOOG',
+        session: 'pre',
+        price: 320.76,
+        change: -3.46,
+        changePercent: -1.07,
+        preMarket: 322.26,
+        preMarketChangePercent: 0.47,
+        currency: 'USD',
+      },
+      {
+        symbol: '0700.HK',
+        session: 'regular',
+        price: 400.0,
+        change: 5.0,
+        changePercent: 1.27,
+        currency: 'HKD',
+      },
+      {
+        symbol: 'AAPL',
+        session: 'post',
+        price: 180.0,
+        change: -1.0,
+        changePercent: -0.55,
+        postMarket: 181.8,
+        postMarketChangePercent: 1.0,
+        currency: 'USD',
+      },
+    ]);
+    expect(table).toContain('| GOOG | USD | prev close | 320.76 | -3.46 | -1.07% | 322.26 | +0.47% |  |  |');
+    expect(table).toContain('| 0700.HK | HKD | regular | 400.00 | 5.00 | +1.27% |  |  |  |  |');
+    expect(table).toContain('| AAPL | USD | regular close | 180.00 | -1.00 | -0.55% |  |  | 181.80 | +1.00% |');
+    expect(table).toContain(
+      '_Basis: change% vs prev close (for prev close rows, prior session move); pre-market% vs prev close; post-market% vs regular close._',
+    );
+  });
+
+  // DALTON-HOOK(extended-hours-quotes): Verify shared formatSignedPct2 / roundQuote2 (thousand separators, non-finite values) and separate holding unrealized P/L.
+  it('formats thousand-grouped and non-finite percentages via shared deriveQuoteDisplay helpers and separates holding unrealized P/L', () => {
+    const out = serializeQuoteRowToMarkdown({
+      symbol: 'GOOG',
+      session: 'post',
+      price: 317.28,
+      change: -3.48,
+      changePercent: -1.0849,
+      postMarket: 318.1,
+      postMarketChange: 0.82,
+      postMarketChangePercent: 1234.565,
+      shares: 10,
+      marketValue: 3172.8,
+      unrealizedPlPercent: 5.76,
+      currency: 'USD',
+    });
+    expect(out).toBe(
+      [
+        '**GOOG**',
+        'regular close USD 317.28 -3.48 (-1.08%) vs prev close',
+        'post-market USD 318.10 +0.82 (+1,234.57% vs regular close)',
+        'shares 10',
+        'mkt val USD 3172.80',
+        '持仓浮盈 +5.76%',
+      ].join('\n'),
+    );
+
+    const tableOut = serializeQuoteRowsToMarkdown([
+      {
+        symbol: 'GOOG',
+        session: 'post',
+        price: 317.28,
+        change: -3.48,
+        changePercent: 1234.565,
+        postMarket: 318.1,
+        postMarketChangePercent: 1234.565,
+        unrealizedPlPercent: 5.76,
+        currency: 'USD',
+      },
+    ]);
+    expect(tableOut).toContain(
+      '| GOOG | USD | regular close | 317.28 | -3.48 | +1,234.57% | 318.10 | +1,234.57% | +5.76% |',
+    );
+
+    const pctOnlyHoldingOut = serializeQuoteRowToMarkdown({
+      symbol: 'GOOG',
+      session: 'post',
+      price: 317.28,
+      changePercent: -1.0849,
+      shares: 10,
+      marketValue: 3172.8,
+      unrealizedPlPercent: 5.76,
+      currency: 'USD',
+    });
+    expect(pctOnlyHoldingOut).toBe(
+      [
+        '**GOOG**',
+        'regular close USD 317.28 (-1.08%) vs prev close',
+        'shares 10',
+        'mkt val USD 3172.80',
+        '持仓浮盈 +5.76%',
+      ].join('\n'),
+    );
+
+    const nonFiniteOut = serializeQuoteRowToMarkdown({
+      symbol: 'NAN',
+      price: Number.NaN,
+      change: Number.NaN,
+      changePercent: Number.NaN,
+      currency: 'USD',
+    });
+    expect(nonFiniteOut).toBe(['**NAN**', 'USD 0.00 +0.00 (+0.00%)'].join('\n'));
+  });
 });
 
 describe('serializeRowsToMarkdown (generic)', () => {
