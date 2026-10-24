@@ -31,21 +31,8 @@ BATCH2_SKILL_DIRS: frozenset[str] = frozenset(
     }
 )
 
-# Explicit known exceptions in Batch 2 skills (out of scope for Batch 1).
-KNOWN_BATCH2_EXCEPTIONS: dict[tuple[str, int, str], dict[str, str]] = {
-    ("dalton-full-coverage/references/branch-b-sellside-expert.md", 10, "list_filters"): {
-        "reason": "待第 2 批修复",
-        "detail": "将 operation 误写为独立函数调用 list_filters(filter_type=..., query=...)",
-    },
-    ("dalton-earnings-calendar/references/reconciliation.md", 36, "trading_days"): {
-        "reason": "待第 2 批修复",
-        "detail": "伪代码函数调用 trading_days(date, minus=3) 非真实注册工具",
-    },
-    ("dalton-earnings-calendar/references/reconciliation.md", 38, "trading_days"): {
-        "reason": "待第 2 批修复",
-        "detail": "伪代码函数调用 trading_days(date, plus=1) 非真实注册工具",
-    },
-}
+# Explicit known exceptions in Batch 2 skills (all resolved in Batch 2).
+KNOWN_BATCH2_EXCEPTIONS: dict[tuple[str, int, str], dict[str, str]] = {}
 
 _CALL_START_RE = re.compile(r"\b([a-zA-Z_][a-zA-Z0-9_.]*)\s*\(")
 _KWARG_NAME_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\s*=(?!=)")

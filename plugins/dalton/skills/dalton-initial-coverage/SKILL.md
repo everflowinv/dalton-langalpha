@@ -68,7 +68,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
    - **阶段 5（独立审稿与修订）**：由 `dalton-reviewer` 审阅重点题（Q1–Q5、Q7、Q8、Q12）、壁垒判断与估值分解表，再由修订子智能体完成 P0 修改并同步更新 `knowledge-proposal.json`。
 
 3. **Workflow 不可用时的手动降级路径**
-   - **`workflow.enabled` 已关闭**（工具列表本来就不会有 `RunWorkflow`）：主智能体按上述阶段 1→5 的顺序手动执行（依次派发 `dalton-evidence` / `general-purpose` 子智能体或亲自执行），生成全部产物文件，并逐阶段核对产物。阶段 5 派 `dalton-reviewer` 审最终稿后，把它返回的 JSON（含 `verdict` 与 `draft_sha256`）原样保存到 `research/<D>-ic/review.json`（多轮复审时保存最后一轮；改稿后必须重审并覆盖）；收尾调用 `dalton_check_done` 时在 `params` 里加 `"manual": true`、不传 `run_id`，审稿据此文件核对。语言审查两轮（顺序不可颠倒，与 workflow 相同）：成稿后先调用 `check_language(draft_path=<草稿>, round=1)` 并按 `<草稿>.language.md` 清单修改（只改语言，不动事实、数字、术语、引用编号与判断强度），再派 `dalton-reviewer` 首次审稿；修订循环结束、终稿内容定稿后调用 `check_language(round=2)` 按清单完成终稿语言修改，草稿有改动就再调用一次 `check_language(round=2)` 对终稿复核，然后做最后一次审稿（pass 的 JSON 存 review.json）与 `check_draft`；第一次审稿就 pass 时：第 2 轮照常执行；改了稿就补一次终稿审稿（pass 的 JSON 覆盖存 review.json），哈希未变则无需重审。本次产出中其他给人读的 .md 笔记（research/ 支线、背景、快讯、异动、公告点评、专题章节等）同样各审两轮：第 1 轮审完按清单改，第 2 轮复核，改过就再跑一次 round=2 确认；json/xlsx 等机器文件、bg_data/、data/、lenses_work/、model_dump/、知识层渲染文件与 .audit/.annotated/.language 侧车不审。
+   - **`workflow.enabled` 已关闭**（工具列表本来就不会有 `RunWorkflow`）：主智能体按上述阶段 1→5 的顺序手动执行（依次派发 `dalton-evidence` / `general-purpose` 子智能体或亲自执行），生成全部产物文件，并逐阶段核对产物。阶段 5 派 `dalton-reviewer` 审稿按三步执行：（1）主智能体先计算草稿的 sha256（`sha256sum drafts/<D>-initial-coverage.md` 或等价的 Python `hashlib.sha256`）；（2）把该哈希写进派给 `dalton-reviewer` 的提示词；（3）要求审稿人在返回的 JSON 里原样回填 `draft_sha256`，并将返回的 JSON（含 `verdict` 与 `draft_sha256`）原样保存到 `research/<D>-ic/review.json`（多轮复审时保存最后一轮；改稿后重新计算哈希、重审并覆盖）。收尾调用 `dalton_check_done(workflow="initial-coverage", params={"ticker": "<TICKER>", "workspace_dir": "<当前工作区路径>", "as_of": "<D>", "manual": true})`（不传 `run_id`），审稿据此文件核对。语言审查两轮（顺序不可颠倒，与 workflow 相同）：成稿后先调用 `check_language(draft_path=<草稿>, round=1)` 并按 `<草稿>.language.md` 清单修改（只改语言，不动事实、数字、术语、引用编号与判断强度），再派 `dalton-reviewer` 首次审稿；修订循环结束、终稿内容定稿后调用 `check_language(round=2)` 按清单完成终稿语言修改，草稿有改动就再调用一次 `check_language(round=2)` 对终稿复核，然后做最后一次审稿（pass 的 JSON 存 review.json）与 `check_draft`；第一次审稿就 pass 时：第 2 轮照常执行；改了稿就补一次终稿审稿（pass 的 JSON 覆盖存 review.json），哈希未变则无需重审。本次产出中其他给人读的 .md 笔记（research/ 支线、背景、快讯、异动、公告点评、专题章节等）同样各审两轮：第 1 轮审完按清单改，第 2 轮复核，改过就再跑一次 round=2 确认；json/xlsx 等机器文件、bg_data/、data/、lenses_work/、model_dump/、知识层渲染文件与 .audit/.annotated/.language 侧车不审。
    - **否则**（`workflow.enabled` 未关闭）：`RunWorkflow` 不在工具列表时，先用 **Read 工具**（不要用 Bash `cat`）读 `.agents/skills/run-workflow/SKILL.md` 后重试；仍没有就停下，告诉 PM「RunWorkflow 不可用」，不要自行手动派发 Task 子智能体代跑。
 
 ---
@@ -96,8 +96,8 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
    - 若用户之前曾手动关闭过跟踪（任务元数据含 `paused_by_user`），`source="coverage_finish"` 会自动跳过重新开启并保持关闭状态，不要强制覆盖用户选择。
 
 4. **汇报完成前必须过完成契约（`dalton_check_done`）**
-   - 向 PM 汇报"完成"前，必须调用 `dalton_check_done(workflow="initial-coverage", run_id=<`research/<D>-ic/.progress.json` 里的 run_id>, params={<启动 RunWorkflow 时的同一组参数，含 as_of>})`。
-   - 走手动降级路径（`workflow.enabled` 已关闭、没有 run）时不传 `run_id`，`params` 里加 `"manual": true`，审稿结论按 `research/<D>-ic/review.json` 核对。
+   - 向 PM 汇报"完成"前，必须调用 `dalton_check_done(workflow="initial-coverage", run_id=<`research/<D>-ic/.progress.json` 里的 run_id>, params={"ticker": "<TICKER>", "workspace_dir": "<当前工作区路径>", "as_of": "<D>"})`（与启动 `RunWorkflow` 时的参数一致）。
+   - 走手动降级路径（`workflow.enabled` 已关闭、没有 run）时不传 `run_id`，调用 `dalton_check_done(workflow="initial-coverage", params={"ticker": "<TICKER>", "workspace_dir": "<当前工作区路径>", "as_of": "<D>", "manual": true})`，审稿结论按 `research/<D>-ic/review.json` 核对。
    - `done=false` 时按 `missing` 逐条补齐（缺文件补文件、校验未过修到过、知识层缺 source=tool 新版本就 `knowledge_update`、check_draft 用了旧草稿就对最终稿重跑 `check_draft`），补完再查一次。
    - 补不了的缺项只能汇报"未完成"，列出缺项与原因；没有 `dalton_check_done` 通过，不得汇报"完成"。
 

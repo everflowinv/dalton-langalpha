@@ -7,8 +7,8 @@
 ## 产出章节结构（B1–B7，按顺序撰写）
 
 ### B1. AlphaEngine 卖方研报与纪要精读
-1. **先查分类过滤器**：调用 `researchdata.research(route="alphaengine", operation="list_filters", ...)` 获取当前有效的行业名与文档分类（如要查专家纪要，先 `list_filters(filter_type="document_types", query="专家")` 获取对应的 `type_ids`），**严禁凭记忆硬猜分类名**。
-2. **按类别分次检索**：每次只查一个类别（外资深度报告 `foreign_report`、卖方点评 `sell_side_comment`、会议/调研纪要 `meeting_minutes` 分开检索），**硬规则：`sort` 必须设为 `"relevance"`（严禁 `"newest"`）**，同时传入 `date_from` 与 `date_to`（默认覆盖过去 12 个月）。
+1. **先查分类过滤器**：调用 `researchdata.research(route="alphaengine", operation="list_filters", params={"filter_type": "document_types", "query": "专家"})` 获取当前有效的行业名与文档分类 `type_ids`，直接使用接口返回的 `type_ids`。
+2. **按类别分次检索**：每次只查一个类别（外资深度报告、卖方点评、会议/调研纪要分开检索），调用 `researchdata.research(route="alphaengine", operation="search_library", query=..., start=..., end=..., params={"type_ids": [...], "sort": "relevance"})`（时间范围通过顶层 `start` 与 `end` 传入，默认覆盖过去 12 个月；`sort` 与 `type_ids` 放在 `params` 内）。
 3. **核心结论必须 `get_document` 读全文**：`search_library` 仅用于召回，严禁只看标题或 snippet 下结论。挑出 6–10 篇代表性多空研报与纪要读取正文。
 4. **逐篇结构化记录**：机构名称、署名分析师、发布日期、标题、`doc_id`、核心论点与关键假设、评级与目标价（如有）。
 

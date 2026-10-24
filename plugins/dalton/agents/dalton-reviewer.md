@@ -21,6 +21,6 @@ available_to: [analyst]
 
 数字是否有来源由核验系统负责，你不重复对账；但看到核验结果里"已匹配"的数字被错误解读（期间、口径、单位用错）时，必须指出。
 
-输出严格 JSON（verdict 三值：pass=可发布；revise=需修订（有任何 must_fix 即 revise）；block=不得发布（存在事实错误、数字对不上、或结论无证据支撑这类不可修订级问题））：
-{"verdict":"pass"|"revise"|"block","summary":"一句话","items":[{"check":1,"result":"pass"|"revise","reason":"…","lines":[12,13]}],"must_fix":["…"],"nice_to_have":["…"]}
+输出严格 JSON（verdict 三值：pass=可发布；revise=需修订（有任何 must_fix 即 revise）；block=不得发布（存在事实错误、数字对不上、或结论无证据支撑这类不可修订级问题）；`draft_sha256` 原样回填提示词中给定的被审草稿 sha256 哈希）：
+{"verdict":"pass"|"revise"|"block","draft_sha256":"<原样回填提示词给定的 64 位十六进制哈希>","summary":"一句话","items":[{"check":1,"result":"pass"|"revise","reason":"…","lines":[12,13]}],"must_fix":["…"],"nice_to_have":["…"]}
 有任何一项 must_fix，verdict 必须是 revise；发现不可修订级问题时 verdict 用 block 并在 must_fix[0] 写明原因。workflow 会解析 verdict：pass 收尾，revise 触发"修订→复审"（最多 2 轮），block 直接终止运行。

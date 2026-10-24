@@ -17,7 +17,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 - 对照前瞻预测文件 `predictions.json` 给出 3–5 条初步核对结论；
 - 给出事件五词结论**初判**（写入 `verdicts.md`），并确保次日 T+1 深度链自动任务（`tp1`）就绪。
 
-> **注意**：快讯写入 `research/<D>-flash-<季度>.md` 并通过对话/`delivery` 推送，**不进 `drafts/`**，也不调 `publish_report`。多公司同日发布时，每家公司独立输出完整一块。
+> **注意**：快讯写入 `research/<D>-flash-<季度>.md` 并在对话中直接输出（外部通知由 Dalton 通知模块按用户的飞书开关统一处理），**不进 `drafts/`**，也不调 `publish_report`。多公司同日发布时，每家公司独立输出完整一块。
 
 ---
 
@@ -112,4 +112,4 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 
 ## 输出模板
 
-按 [`templates/flash.md`](templates/flash.md) 写入 `research/<D>-flash-<季度>.md`，并在当前对话及自动任务 `delivery` 推送相同正文。
+按 [`templates/flash.md`](templates/flash.md) 写入 `research/<D>-flash-<季度>.md`，并在当前对话输出相同正文（外部通知由 Dalton 通知模块按用户的飞书开关统一处理）。

@@ -28,7 +28,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 1. **确认基础身份**：公司名称、股票代码（ticker）、业务别名、目标财季（严格区分 `FY` 与 `CY`，沿用公司自身财季命名如 `FY26Q3`）。
 2. **冻结研究截止时间（`as-of`）**：
    - 实时前瞻：取自动任务触发时刻（或当前会话开始时刻）为唯一 `as-of`；
-   - 历史回测前瞻：严格以指定的历史截止时点（如财报发布前 3 天）为 `as-of`，**所有检索必须显式带上截止日期（`end` / `to_date` / `date_before`），截止时间之后的信息一律禁止使用**。
+   - 历史回测前瞻：严格以指定的历史截止时点（如财报发布前 3 天）为 `as-of`，**所有检索必须显式带上截止日期（`end` / `to_date` / `end_date`），截止时间之后的信息一律禁止使用**。
 3. **确认发布日期与窗口**：
    - 从 `../Home/dalton/earnings-calendar.json` 或 `agenda.watch.events` 读取官方发布日期、BMO/AMC 及官方来源链接；未经官方确认的写“未确认”，绝不自行编造。
    - **检索时间窗**：预期材料取近 **30 天**（材料不足时可扩展至上一次财报后）；核心 debate 取近 **90 天**。
@@ -135,7 +135,7 @@ python3 .agents/skills/dalton-earnings-preview/scripts/predictions.py validate \
    - 调用 `knowledge_update(doc="drivers", ...)` 追加本轮取得的高频指标最新读数；
    - 调用 `knowledge_update(doc="debate", ...)` 标注本次财报可检验的 debate；
    - 调用 `knowledge_append_verdict` 记录事件五词结论（`trigger.kind="earnings"`，`trigger.ref` 填 `<dalton_wake>` 的 `tm3` 信号 id 或 `"manual"`；通常为 `NO_CHANGE`，若前瞻研究已改变判断则如实填写），并在同次调用的 `agenda_ops` 中加入“财报发布当天对照 `research/<D>-preview-<季度>/predictions.json` 逐条核对”的验证项；
-   - 调用 `check_draft` 生成数字核验反馈；PM 要求正式发布时调用 `publish_report(kind="earnings_preview")`；通过自动任务 `delivery` 将开头“核心判断”三句话与草稿路径推送给 PM。
+   - 调用 `check_draft(draft_path="drafts/<D>-preview-<季度>.md")` 生成数字核验反馈；PM 要求正式发布时调用 `publish_report(draft_path="drafts/<D>-preview-<季度>.md", title="<公司名>（<TICKER>）<季度> 财报前瞻", kind="earnings_preview", slug="<ticker-lower>-preview-<季度小写>-<D>")`；在回复中将开头“核心判断”三句话与草稿路径呈现给 PM（外部通知由 Dalton 通知模块按用户的飞书开关统一处理）。
 
 ### 收尾门禁：汇报完成前必须过完成契约（`dalton_check_done`）
 
