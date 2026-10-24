@@ -5,7 +5,15 @@ export const meta = {
 
 const { ticker: T, company: C, workspace_dir: W, as_of: D } = args
 const R = `${W}/research/${D}-ic`
-const base = `先读 .agents/skills/dalton-conventions/SKILL.md；公司 ${C || T}（${T}），市场 ${args.market || 'US'}，截至 ${D}。`
+// A1：SKILL 声明的 pm_question/sector（与可选的 revision_brief 文件路径）必须随
+// base 进每个子任务，否则 PM 的问题与上一轮审稿的修正要求到不了任何支线。
+const pmAsks = []
+if (args.pm_question) pmAsks.push(String(args.pm_question))
+if (args.revision_brief) pmAsks.push(`本轮必须修正的事项见 ${args.revision_brief}（先读该文件）`)
+const pmSection = pmAsks.length ? ` PM 的问题 / 本轮必须修正的事项：${pmAsks.join('；')}。` : ''
+const base = `先读 .agents/skills/dalton-conventions/SKILL.md；公司 ${C || T}（${T}），市场 ${args.market || 'US'}${
+  args.sector ? `，所属行业 ${args.sector}` : ''
+}，截至 ${D}。${pmSection}`
 const OUT = {
   type: 'object',
   properties: {
@@ -40,40 +48,163 @@ const shaOf = (r) =>
     ? r.sha256
     : null
 
+// B1：支线产物缺失判定（各 workflow 同一实现；workflow 之间没有共用 js 模块的
+// 机制，改动需同步全部 workflow.js）。子任务返回 null、files/file 为空、或（经
+// 只读核验子任务确认）声明的产物文件不存在/为空（0 字节或只有空白），都算缺失；
+// workflow 自己碰不到文件系统，最后一项由支线核验子任务在盘上确认。
+const branchArtifacts = (v) => {
+  if (v === null || typeof v !== 'object') return []
+  const out = []
+  if (typeof v.file === 'string' && v.file.trim()) out.push(v.file.split('|', 1)[0].trim())
+  for (const f of Array.isArray(v.files) ? v.files : []) {
+    if (typeof f === 'string' && f.trim()) out.push(f.split('|', 1)[0].trim())
+  }
+  return out.filter(Boolean)
+}
+const PROBE_OUT = {
+  type: 'object',
+  properties: {
+    files: { type: 'array', items: { type: 'string', minLength: 1 } },
+  },
+  required: ['files'],
+}
+// 返回每个路径的 "<路径>|ok" / "<路径>|missing"；结果不完整（漏路径、格式不对）
+// 一律算核验失败（fail-closed），返回 null。paths 的每一项可以是路径或
+// [路径, 最小字节数]（契约 min_bytes；缺省 1，即非空白即可）。
+const probeBranchFiles = async (paths) => {
+  const entries = paths.map((p) => (Array.isArray(p) ? p : [p, 1]))
+  const r = await agent(
+    `只读核验以下支线产物文件是否存在、非空白且达到字节数下限（不写任何文件）。逐个执行 bash：f='<路径>'；n=<字节数下限>；test -e "$f" && [ "$(wc -c < "$f")" -ge "$n" ] && [ -n "$(tr -d '[:space:]' < "$f")" ] && echo "$f|ok" || echo "$f|missing"。返回 files 数组：每项为上述一行的原样输出（<路径>|ok 或 <路径>|missing）：\n${entries
+      .map(([p, min]) => `- ${p}（至少 ${min} 字节）`)
+      .join('\n')}`,
+    { agentType: 'dalton-evidence', label: '支线核验', phase: '取证', schema: PROBE_OUT }
+  )
+  if (r === null || typeof r !== 'object' || !Array.isArray(r.files)) return null
+  const answered = new Set()
+  for (const entry of r.files) {
+    if (typeof entry !== 'string') return null
+    const bar = entry.lastIndexOf('|')
+    const path = bar > 0 ? entry.slice(0, bar) : ''
+    const verdict = bar > 0 ? entry.slice(bar + 1) : ''
+    if (!path || (verdict !== 'ok' && verdict !== 'missing')) return null
+    answered.add(path)
+  }
+  if (entries.some(([p]) => !answered.has(p))) return null
+  return r.files
+}
+// entries: [[key, 中文名, 产物路径数组], ...]；路径可以是字符串或 [路径, 契约
+// min_bytes]；resultOf 由调用方给出 key→子任务结果。
+const missingBranchesOf = async (entries, resultOf) => {
+  const missing = entries.filter(([k]) => branchArtifacts(resultOf(k)).length === 0).map(([k]) => k)
+  const byPath = new Map(
+    entries.flatMap(([k, , ps]) => ps.map((p) => [(Array.isArray(p) ? p[0] : p), k]))
+  )
+  const toProbe = entries.filter(([k]) => !missing.includes(k)).flatMap(([, , ps]) => ps)
+  if (!toProbe.length) return { missing, probeFailed: false }
+  const probe = await probeBranchFiles(toProbe)
+  if (probe === null) return { missing, probeFailed: true }
+  for (const entry of probe) {
+    if (!entry.endsWith('|missing')) continue
+    const key = byPath.get(entry.slice(0, -'|missing'.length))
+    if (key && !missing.includes(key)) missing.push(key)
+  }
+  return { missing, probeFailed: false }
+}
+
 phase('取证')
+// resume 提示：block 后主线程补数再用原参数 resume，失败支线的子任务会在已补
+// 文件的基础上核对完善，所以每条支线都写明“已存在先核对、缺什么补什么”。
+const RETRY_HINT = '若目标文件已存在，先读并核对，缺什么补什么，不必推倒重写。'
 const [bg, ind, lens, val] = await parallel([
   () =>
     agent(
-      `${base} 按 .agents/skills/dalton-company-background/SKILL.md 写 9 段背景稿到 ${W}/drafts/${D}-background.md。`,
+      `${base} 按 .agents/skills/dalton-company-background/SKILL.md 写 9 段背景稿到 ${W}/drafts/${D}-background.md。${RETRY_HINT}`,
       { agentType: 'dalton-evidence', label: '公司背景', phase: '取证', schema: OUT }
     ),
   () =>
     agent(
       `${base} 按 .agents/skills/dalton-initial-coverage/references/branch-industry.md 写行业支线到 ${R}/industry.md。${
         args.peers && args.peers.length ? '同业候选：' + args.peers.join(',') : ''
-      }`,
+      }${RETRY_HINT}`,
       { agentType: 'dalton-evidence', label: '行业支线', phase: '取证', schema: OUT }
     ),
   () =>
     agent(
-      `${base} 按 .agents/skills/dalton-financial-lenses/SKILL.md 做三把镜头，JSON 到 ${R}/lenses.json，草稿到 ${W}/drafts/${D}-lenses.md。`,
+      `${base} 按 .agents/skills/dalton-financial-lenses/SKILL.md 做三把镜头，JSON 到 ${R}/lenses.json，草稿到 ${W}/drafts/${D}-lenses.md。${RETRY_HINT}`,
       { agentType: 'dalton-evidence', label: '财务镜头', phase: '取证', schema: OUT }
     ),
+  // B1 补充：child_timeout 不能按派发覆盖（validate_dispatch 只认
+  // agentType/label/phase/schema，driver 统一用 caps.child_timeout），估值支线
+  // 拆成“取数”“写稿”两次派发，各得一个完整的 child_timeout 窗口；取数产物
+  // 落盘后，resume 时写稿可单独重派。
   () =>
-    agent(
-      `${base} 按 .agents/skills/dalton-initial-coverage/references/branch-valuation-history.md 写估值历史与可比（含 ln(P1/P0)=ln(EPS1/EPS0)+ln(PE1/PE0) 分解表）到 ${R}/valuation.md，可比表 ${R}/comps.xlsx。`,
-      { agentType: 'dalton-evidence', label: '估值历史与可比', phase: '取证', schema: OUT }
-    ),
+    (async () => {
+      const data = await agent(
+        `${base} 按 .agents/skills/dalton-initial-coverage/references/branch-valuation-history.md 只做取数阶段：拉取估值历史分解（股价、EPS、PE）与可比公司财务所需的全部原始数据，连同选定的可比清单与选取理由存 ${R}/valuation-data.json（不写正式稿、不建 xlsx）；已取到的写明来源，取不到的逐条记进 gaps。${RETRY_HINT}`,
+        { agentType: 'dalton-evidence', label: '估值取数', phase: '取证', schema: OUT }
+      )
+      // B1 共用判定：取数返回 null 或没有声明任何产物（空 files）都不派写稿；
+      // 声明了产物还要在盘核验 valuation-data.json 存在且非空（派发本身失败同
+      // 路）。任一失败都返回 null，由统一的支线 block 出口停下。核验只看本步
+      // 询问的那个路径（回应里可能混有其他派发的条目）。
+      if (branchArtifacts(data).length === 0) return null
+      const dataProbe = await probeBranchFiles([[`${R}/valuation-data.json`, 1]])
+      const dataVerdict =
+        dataProbe !== null
+          ? dataProbe.find((e) => e.startsWith(`${R}/valuation-data.json|`))
+          : null
+      if (dataVerdict === null || !dataVerdict.endsWith('|ok')) return null
+      return await agent(
+        `${base} 按 .agents/skills/dalton-initial-coverage/references/branch-valuation-history.md 做写稿阶段：以 ${R}/valuation-data.json 为底（缺的自行补取），写估值历史与可比（含 ln(P1/P0)=ln(EPS1/EPS0)+ln(PE1/PE0) 分解表）到 ${R}/valuation.md，可比表 ${R}/comps.xlsx。${RETRY_HINT}`,
+        { agentType: 'dalton-evidence', label: '估值历史与可比', phase: '取证', schema: OUT }
+      )
+    })(),
 ])
 
+// 契约 min_bytes：核验下限按 contract.json 的取证阶段逐项取。
+const BRANCHES = [
+  ['bg', '公司背景', [[`${W}/drafts/${D}-background.md`, 200]]],
+  ['ind', '行业支线', [[`${R}/industry.md`, 200]]],
+  ['lens', '财务镜头', [[`${R}/lenses.json`, 50], [`${W}/drafts/${D}-lenses.md`, 200]]],
+  ['val', '估值历史与可比', [[`${R}/valuation.md`, 200], [`${R}/comps.xlsx`, 1000]]],
+]
 const got = { bg, ind, lens, val }
-const missing = Object.entries(got)
-  .filter(([, v]) => v === null)
-  .map(([k]) => k)
-if (missing.length === 4) {
-  return { ok: false, reason: '四条支线全部失败', missing, incomplete: ['四条支线全部失败，无产物可核验'] }
+const { missing, probeFailed } = await missingBranchesOf(BRANCHES, (k) => got[k])
+const BRANCH_NAME = Object.fromEntries(BRANCHES.map(([k, name]) => [k, name]))
+const BRANCH_PATHS = Object.fromEntries(
+  BRANCHES.map(([k, , ps]) => [k, ps.map((p) => (Array.isArray(p) ? p[0] : p))])
+)
+log(`支线完成 ${BRANCHES.length - missing.length}/4，缺：${missing.join(',') || '无'}`)
+// B1：contract 把四条支线产物都列为必交（全为关键支线，估值在内）。任一缺失
+// （含全部缺失）都停在成稿之前，出口与审稿 block 同一段文案：主线程补数后用
+// 原参数 resume 重跑——已完派发按 journal 复用（label、prompt 哈希与产物哈希
+// 一致才复用，见 RunWorkflow 的 resume 机制）。
+if (probeFailed) {
+  return {
+    ok: false,
+    blocked: '支线核验子任务失败，无法确认支线产物在盘',
+    missing,
+    incomplete: [
+      '支线核验子任务失败（无法确认产物文件存在且非空），已停在成稿之前；请重试或补数后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑',
+    ],
+    resume_hint:
+      '用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑：label、prompt 哈希与产物哈希一致的已完派发会直接复用，失败支线重新派发',
+  }
 }
-log(`支线完成 ${4 - missing.length}/4，缺：${missing.join(',') || '无'}`)
+if (missing.length) {
+  const names = missing.map((k) => BRANCH_NAME[k]).join('、')
+  const absent = missing.flatMap((k) => BRANCH_PATHS[k]).join('、')
+  return {
+    ok: false,
+    blocked: `关键支线缺失：${names}（${absent} 不存在或为空）`,
+    missing,
+    incomplete: [
+      `关键支线缺失：${names}，已停在成稿之前；补齐缺失产物后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑，label、prompt 哈希与产物哈希一致的已完派发会直接复用`,
+    ],
+    resume_hint:
+      '补齐缺失支线产物后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑：label、prompt 哈希与产物哈希一致的已完派发会直接复用，缺失支线重新派发（其提示词已写明“若目标文件已存在，先读并核对，缺什么补什么”）',
+  }
+}
 
 phase('bull/bear 快速版')
 const bb = await agent(
@@ -135,6 +266,8 @@ if (review && verdictOf(review) === 'block') {
     draft: `${W}/drafts/${D}-initial-coverage.md`,
     missing,
     incomplete,
+    resume_hint:
+      '修订草稿后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑：label、prompt 哈希与产物哈希一致的已完派发（四条支线等只读产物）会直接复用，成稿及之后的阶段重新派发',
   }
 }
 

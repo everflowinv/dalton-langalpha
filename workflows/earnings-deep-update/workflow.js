@@ -196,7 +196,11 @@ const finish = (resolved, extra = {}) => ({
 
 if (review && verdictOf(review) === 'block') {
   incomplete.push(`审稿 block：${review.summary || '存在不可修订级问题'}`)
-  return finish(await resolveOnExit(), { blocked: review.summary || '审稿 block' })
+  return finish(await resolveOnExit(), {
+    blocked: review.summary || '审稿 block',
+    resume_hint:
+      '修订报告后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑：label、prompt 哈希与产物哈希一致的已完派发会直接复用，修订之后的阶段重新派发',
+  })
 }
 
 // revise → 修订 → 解析模型 → 复审，最多 2 轮；每个失败出口都写进 incomplete 并停下
@@ -258,7 +262,11 @@ while (finalReview && verdictOf(finalReview) === 'revise' && rounds < 2) {
   }
   if (verdictOf(reReview) === 'block') {
     incomplete.push(`复审 block：${reReview.summary || '存在不可修订级问题'}，流程终止`)
-    return finish(resolved, { blocked: reReview.summary || '复审 block' })
+    return finish(resolved, {
+      blocked: reReview.summary || '复审 block',
+      resume_hint:
+        '修订报告后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑：label、prompt 哈希与产物哈希一致的已完派发会直接复用，修订之后的阶段重新派发',
+    })
   }
   finalReview = reReview
 }

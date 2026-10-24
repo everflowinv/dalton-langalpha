@@ -52,13 +52,38 @@ class ScriptedHost:
         ]
         return {"files": [f"{p}|{'e' * 64}" for p in paths]}
 
+    def branch_probe_default(self, prompt: str) -> Any:
+        """The branch probe's answer when every probed file is on disk and
+        non-empty: one ``path|ok`` entry per ``- path（至少 N 字节）`` line."""
+        paths = [
+            line[2:].split("（")[0].strip()
+            for line in prompt.splitlines()
+            if line.startswith("- ") and "|" not in line
+        ]
+        return {"files": [f"{p}|ok" for p in paths]}
+
     def outcome_for(self, label: str, prompt: str) -> Any:
         if label in self.fail_labels:
             return None
         if label in self.by_label:
             return self.by_label[label]
+        if label == "规划":
+            # Three clusters keep the topic run past the ≥3-cluster floor the
+            # workflow gates on before cross-checking.
+            return {
+                "file": "research/2026-10-23-topic-ai-capex/plan.md",
+                "clusters": [
+                    {"id": "a", "name": "簇 A", "queries": ["q1", "q2"]},
+                    {"id": "b", "name": "簇 B", "queries": ["q1", "q2"]},
+                    {"id": "c", "name": "簇 C", "queries": ["q1", "q2"]},
+                ],
+                "questions": ["Q1"],
+                "summary": "plan",
+            }
         if label == "产物核验":
             return self.evidence_default(prompt)
+        if label == "支线核验":
+            return self.branch_probe_default(prompt)
         return dict(OUT)
 
     async def agent(self, prompt: str, opts: dict[str, Any]) -> Any:
@@ -170,22 +195,88 @@ async def test_block_verdict_stops_the_run_with_the_reason() -> None:
 
 
 @pytest.mark.asyncio
-async def test_missing_branch_and_evidence_gap_surface_as_incomplete() -> None:
+async def test_missing_branch_blocks_before_the_draft() -> None:
+    """B1: a null branch is not success. The run stops before the draft phase
+    with a block naming the branch, so the main thread can fill the gap and
+    resume (finished dispatches replay from the journal)."""
     host = ScriptedHost(fail_labels={"行业支线"})
-    host.by_label["产物核验"] = {
-        "files": [
-            "research/2026-10-23-ic/lenses.json|" + "b" * 64,
-            # Bare path, no pipe: the evidence child did not find/hash it.
-            "./research/2026-10-23-ic/comps.xlsx",
-        ],
-        "summary": "1 missing",
-    }
     result = await _run("initial-coverage", IC_PARAMS, host)
 
     assert result["ok"] is False
-    assert "ind" in result["missing"], "the null branch is reported by its key"
-    assert any("支线失败" in item for item in result["incomplete"])
-    assert any("comps.xlsx" in item and "产物缺失" in item for item in result["incomplete"])
+    assert result["missing"] == ["ind"]
+    assert "行业支线" in result["blocked"]
+    assert any("关键支线缺失" in item and "resume" in item for item in result["incomplete"])
+    assert "resume_hint" in result and "resume=" in result["resume_hint"]
+    labels = host.labels()
+    assert "bull/bear 快速版" not in labels and "初筛成稿" not in labels
+    assert "产物核验" not in labels, "a blocked run must not run the closing checks"
+
+
+@pytest.mark.asyncio
+async def test_all_branches_missing_uses_the_same_block_exit() -> None:
+    """The all-missing exit shares the partial-missing block shape: it names
+    every branch and carries the resume hint."""
+    host = ScriptedHost(
+        fail_labels={"公司背景", "行业支线", "财务镜头", "估值取数"}
+    )
+    result = await _run("initial-coverage", IC_PARAMS, host)
+
+    assert result["ok"] is False
+    assert result["missing"] == ["bg", "ind", "lens", "val"]
+    assert result["blocked"].startswith("关键支线缺失：")
+    assert "公司背景" in result["blocked"] and "估值历史与可比" in result["blocked"]
+    assert "resume_hint" in result
+    assert "初筛成稿" not in host.labels()
+
+
+@pytest.mark.asyncio
+async def test_branch_with_empty_files_blocks_before_the_draft() -> None:
+    """B1: a child that answers ok with no declared files (the timed-out
+    valuation branch's shape) is missing, not success."""
+    host = ScriptedHost(by_label={"估值历史与可比": {"files": [], "summary": "未落盘，本轮超时"}})
+    result = await _run("initial-coverage", IC_PARAMS, host)
+
+    assert result["ok"] is False
+    assert result["missing"] == ["val"]
+    assert "估值历史与可比" in result["blocked"]
+    assert "初筛成稿" not in host.labels()
+
+
+@pytest.mark.asyncio
+async def test_probe_reported_missing_file_blocks_the_branch() -> None:
+    """B1: the branch answered with files, but the on-disk probe says a
+    declared artifact is missing/empty — the branch is missing anyway."""
+    host = ScriptedHost(
+        by_label={
+            "支线核验": {
+                "files": [
+                    "./research/2026-10-23-ic/valuation-data.json|ok",
+                    "./drafts/2026-10-23-background.md|ok",
+                    "./research/2026-10-23-ic/industry.md|missing",
+                    "./research/2026-10-23-ic/lenses.json|ok",
+                    "./drafts/2026-10-23-lenses.md|ok",
+                    "./research/2026-10-23-ic/valuation.md|ok",
+                    "./research/2026-10-23-ic/comps.xlsx|ok",
+                ]
+            }
+        }
+    )
+    result = await _run("initial-coverage", IC_PARAMS, host)
+
+    assert result["missing"] == ["ind"]
+    assert "初筛成稿" not in host.labels()
+
+
+@pytest.mark.asyncio
+async def test_probe_failure_blocks_fail_closed() -> None:
+    """The probe child itself failed: existence cannot be confirmed, so the
+    run blocks instead of drafting on unverified evidence."""
+    host = ScriptedHost(fail_labels={"支线核验"})
+    result = await _run("initial-coverage", IC_PARAMS, host)
+
+    assert result["ok"] is False
+    assert "支线核验" in result["blocked"]
+    assert "初筛成稿" not in host.labels()
 
 
 @pytest.mark.asyncio
@@ -282,8 +373,29 @@ class CapturingHost:
     async def agent(self, prompt: str, opts: dict[str, Any]) -> Any:
         self.calls.append((prompt, dict(opts)))
         await asyncio.sleep(0.02)
-        if str(opts.get("label") or "").startswith("解析"):
+        label = str(opts.get("label") or "")
+        if label.startswith("解析"):
             return {"path": "model/META-model-v01.xlsx", "sha256": "a" * 64}
+        if label == "规划":
+            return {
+                "file": "research/2026-10-23-topic-ai-capex/plan.md",
+                "clusters": [
+                    {"id": "a", "name": "簇 A", "queries": ["q1", "q2"]},
+                    {"id": "b", "name": "簇 B", "queries": ["q1", "q2"]},
+                    {"id": "c", "name": "簇 C", "queries": ["q1", "q2"]},
+                ],
+                "questions": ["Q1"],
+                "summary": "plan",
+            }
+        if label == "支线核验":
+            # Every probed file on disk: one ``path|ok`` per
+            # ``- path（至少 N 字节）`` line.
+            paths = [
+                line[2:].split("（")[0].strip()
+                for line in prompt.splitlines()
+                if line.startswith("- ") and "|" not in line
+            ]
+            return {"files": [f"{p}|ok" for p in paths]}
         # A generic non-null answer keeps every script running to its last
         # dispatch, so the whole schema surface is captured.
         return {"files": ["x"], "summary": "s", "sha256": "a" * 64}
@@ -1037,3 +1149,448 @@ async def test_notes_language_review_failure_reports_incomplete() -> None:
 
     assert result["ok"] is False
     assert any("笔记语言审查失败" in item for item in result["incomplete"])
+
+
+# ------------------------------------------------- A1: SKILL params reach the children
+
+
+@pytest.mark.asyncio
+async def test_pm_question_sector_and_revision_brief_reach_every_child() -> None:
+    """A1: the SKILL declares pm_question/sector and an optional revision_brief
+    path; every subtask prompt (evidence branches included) must carry them —
+    round 2's must_fix list rides pm_question, and losing it made the agent
+    re-derive requirements from a chance Glob hit."""
+    params = {
+        **IC_PARAMS,
+        "pm_question": "云资本开支的回报周期怎么量化",
+        "sector": "互联网服务",
+        "revision_brief": "research/review-must-fix.json",
+    }
+    host = ScriptedHost(by_label={"审稿": {"verdict": "pass", "summary": "ok", "must_fix": []}})
+    result = await _run("initial-coverage", params, host)
+
+    assert result["ok"] is True, result["incomplete"]
+    # base-carrying children are identifiable by the conventions prefix; the
+    # mechanical verifiers (probe, evidence, language, review) never took base.
+    directed = [
+        (label, prompt)
+        for label, prompt in zip(host.labels(), host.prompts)
+        if "先读 .agents/skills/dalton-conventions" in prompt
+    ]
+    assert directed
+    for label, prompt in directed:
+        assert "云资本开支的回报周期怎么量化" in prompt, label
+        assert "互联网服务" in prompt, label
+        assert "research/review-must-fix.json" in prompt, label
+
+
+@pytest.mark.asyncio
+async def test_pm_sections_absent_when_params_missing() -> None:
+    host = ScriptedHost(by_label={"审稿": {"verdict": "pass", "summary": "ok", "must_fix": []}})
+    await _run("initial-coverage", IC_PARAMS, host)
+
+    assert all("PM 的问题" not in p for p in host.prompts)
+
+
+# ------------------------------------------------- B1 supplement: valuation split
+
+
+@pytest.mark.asyncio
+async def test_valuation_branch_dispatches_fetch_then_write() -> None:
+    """child_timeout cannot be overridden per dispatch, so the valuation
+    branch splits into two children — each with its own full timeout window —
+    and a failed fetch stage never dispatches the write stage."""
+    labels_expected = ["估值取数", "估值历史与可比"]
+    host = ScriptedHost()
+    await _run("initial-coverage", IC_PARAMS, host)
+    labels = host.labels()
+    assert labels_expected[0] in labels and labels_expected[1] in labels
+    assert labels.index(labels_expected[1]) > labels.index(labels_expected[0])
+
+    failed = ScriptedHost(fail_labels={"估值取数"})
+    result = await _run("initial-coverage", IC_PARAMS, failed)
+    assert result["missing"] == ["val"]
+    assert "估值历史与可比" not in failed.labels(), "a failed fetch must not dispatch the write"
+
+    # The B1 shared judgment: a fetch that answers ok with NO declared
+    # artifacts (the timeout shape) is just as missing.
+    empty = ScriptedHost(by_label={"估值取数": {"files": [], "summary": "未落盘"}})
+    result = await _run("initial-coverage", IC_PARAMS, empty)
+    assert result["missing"] == ["val"]
+    assert "估值历史与可比" not in empty.labels(), "an empty-artifact fetch must not dispatch the write"
+    assert "估值历史与可比" in result["blocked"]
+
+
+@pytest.mark.asyncio
+async def test_valuation_fetch_data_file_is_an_intermediate_not_a_deliverable() -> None:
+    """valuation-data.json feeds the write stage; the evidence check and the
+    deliverables list stay keyed on the contract's artifacts."""
+    host = ScriptedHost(by_label={"审稿": {"verdict": "pass", "summary": "ok", "must_fix": []}})
+    result = await _run("initial-coverage", IC_PARAMS, host)
+
+    assert result["ok"] is True, result["incomplete"]
+    evidence_prompt = host.prompts[host.labels().index("产物核验")]
+    assert "valuation-data.json" not in evidence_prompt
+    assert "./research/2026-10-23-ic/valuation.md" in evidence_prompt
+
+
+# ------------------------------------------------- audit #12: weekly call children
+# The call children are general-purpose subagents with no Dalton direct tools;
+# the prompt must scope them to writing call-<T>.md only.
+
+
+@pytest.mark.asyncio
+async def test_weekly_call_children_are_scoped_off_dalton_tools() -> None:
+    params = {
+        "home_dir": "dalton",
+        "end": "2026-10-23",
+        "coverage_path": "dalton/coverage.yaml",
+    }
+
+    class _CallHost(_ScreeningHost):
+        async def agent(self, prompt: str, opts: dict[str, Any]) -> Any:
+            if str(opts.get("label") or "") == "META":
+                return {
+                    "ticker": "META",
+                    "file": "research/weekly-2026-10-23/core-META.md",
+                    "call_candidate": True,
+                }
+            return await super().agent(prompt, opts)
+
+    host = _CallHost()
+    await _run("weekly-coverage-review", params, host)
+
+    call_prompts = [
+        prompt
+        for prompt, opts in host.calls
+        if str(opts.get("label") or "").startswith("call ")
+    ]
+    assert call_prompts, "the call child must have dispatched"
+    prompt = call_prompts[0]
+    assert "不调用 knowledge_append_verdict" in prompt
+    assert "check_draft" in prompt and "publish_report" in prompt
+    assert "Step 2.2" in prompt and "Step 9" in prompt
+    assert "call-META.md" in prompt
+
+
+# ------------------------------------------------- round 2: unified branch gates
+
+
+@pytest.mark.asyncio
+async def test_full_facts_failure_blocks_before_frame() -> None:
+    """The facts ledger is contract-mandatory (≥500 bytes): null answers, an
+    on-disk miss, and a failed probe each stop the run before the frame
+    phase, with the three causes reported separately."""
+    params = _WORKFLOW_PARAMS["full-coverage"]
+
+    host = ScriptedHost(fail_labels={"数字底表"})
+    result = await _run("full-coverage", params, host)
+    assert result["ok"] is False
+    assert "数字底表" in result["blocked"] and "未产出" in result["blocked"]
+    assert "resume_hint" in result
+    assert "frame" not in host.labels()
+
+    # ok answer whose declared file is not on disk: the probe catches it
+    # (fixture path spelled exactly as the script probes it, './'-prefixed).
+    host = ScriptedHost(
+        by_label={
+            "数字底表": {"files": ["./research/2026-10-23-fc/facts.md"], "summary": "written"},
+            "支线核验": {"files": ["./research/2026-10-23-fc/facts.md|missing"]},
+        }
+    )
+    result = await _run("full-coverage", params, host)
+    assert result["ok"] is False
+    assert "数字底表" in result["blocked"] and "500" in result["blocked"]
+    assert "核验子任务失败" not in result["blocked"]
+    assert "frame" not in host.labels()
+
+    # the probe child itself failing is its own message, not "file missing".
+    host = ScriptedHost(
+        by_label={"数字底表": {"files": ["./research/2026-10-23-fc/facts.md"], "summary": "written"}},
+        fail_labels={"支线核验"},
+    )
+    result = await _run("full-coverage", params, host)
+    assert result["ok"] is False
+    assert "支线核验子任务失败" in result["blocked"] and "数字底表" in result["blocked"]
+    assert "不存在" not in result["blocked"]
+    assert "frame" not in host.labels()
+
+
+@pytest.mark.asyncio
+async def test_full_frame_failure_blocks_before_evidence() -> None:
+    """questions.md is contract-mandatory (≥200 bytes): a null frame stops
+    the run before the evidence branches."""
+    params = _WORKFLOW_PARAMS["full-coverage"]
+    host = ScriptedHost(
+        fail_labels={"frame"},
+        by_label={
+            "支线核验": {"files": ["./research/2026-10-23-fc/facts.md|ok"]},
+        },
+    )
+    result = await _run("full-coverage", params, host)
+
+    assert result["ok"] is False
+    assert "问题清单 frame" in result["blocked"] and "未产出" in result["blocked"]
+    assert "resume_hint" in result
+    labels = host.labels()
+    assert not any(label.startswith("支线 ") for label in labels), "no evidence branch may run"
+
+
+TOPIC_PARAMS: dict[str, Any] = {
+    "topic": "AI capex",
+    "slug": "ai-capex",
+    "workspace_dir": ".",
+    "as_of": "2026-10-23",
+}
+
+_PLAN_4 = {
+    "file": "research/2026-10-23-topic-ai-capex/plan.md",
+    "clusters": [
+        {"id": "a", "name": "簇 A", "queries": ["q"]},
+        {"id": "b", "name": "簇 B", "queries": ["q"]},
+        {"id": "c", "name": "簇 C", "queries": ["q"]},
+        {"id": "d", "name": "簇 D", "queries": ["q"]},
+    ],
+    "questions": ["Q1"],
+    "summary": "plan",
+}
+
+
+@pytest.mark.asyncio
+async def test_topic_primary_failure_blocks_before_cross_check() -> None:
+    """primary.md is contract-mandatory: missing, the run stops before the
+    cross-check phase."""
+    host = ScriptedHost(fail_labels={"一手材料"})
+    result = await _run("topic-research", TOPIC_PARAMS, host)
+
+    assert result["ok"] is False
+    assert "一手材料" in result["blocked"]
+    assert "resume_hint" in result
+    assert "交叉验证与盲区" not in host.labels()
+
+
+@pytest.mark.asyncio
+async def test_topic_cluster_gap_above_floor_surfaces_but_does_not_block() -> None:
+    """Four clusters planned, one fails: the ≥3 floor still holds, the run
+    proceeds, and the gap rides the writing prompt, incomplete and the return
+    value."""
+    host = ScriptedHost(
+        by_label={
+            "规划": _PLAN_4,
+            "独立审稿": {"verdict": "pass", "summary": "ok", "must_fix": [], "draft_sha256": "b" * 64},
+            "复审 1": {"verdict": "pass", "summary": "ok", "must_fix": [], "draft_sha256": "b" * 64},
+        },
+        fail_labels={"取证 簇 B"},
+    )
+    result = await _run("topic-research", TOPIC_PARAMS, host)
+
+    labels = host.labels()
+    assert "交叉验证与盲区" in labels and "专题写作" in labels, "the floor held; the run proceeded"
+    write_prompt = host.prompts[labels.index("专题写作")]
+    assert "缺失簇：簇 B" in write_prompt and "信息缺口与局限" in write_prompt
+    assert result["missing_clusters"] == ["b"]
+    assert any("分簇取证失败（簇 B）" in item for item in result["incomplete"])
+    assert result["ok"] is False, "the named gap keeps the run incomplete"
+
+
+WEEKLY_PARAMS: dict[str, Any] = {
+    "home_dir": "dalton",
+    "end": "2026-10-23",
+    "coverage_path": "dalton/coverage.yaml",
+}
+
+
+class _WeeklyLabels:
+    """Label view over a CapturingHost's (prompt, opts) call log."""
+
+    def __init__(self, host: Any) -> None:
+        self._host = host
+
+    def labels(self) -> list[str]:
+        return [str(opts.get("label") or "") for _p, opts in self._host.calls]
+
+    def prompt_of(self, label: str) -> str:
+        for prompt, opts in self._host.calls:
+            if str(opts.get("label") or "") == label:
+                return prompt
+        raise AssertionError(f"no dispatch labeled {label!r}")
+
+
+@pytest.mark.asyncio
+async def test_weekly_off_disk_core_counts_failed_and_gets_no_call() -> None:
+    """A core whose file the on-disk probe reports missing (or undersized)
+    counts as failed: no conviction call for it, and the weekly doc names it."""
+
+    class _ProbeHost(_ScreeningHost):
+        async def agent(self, prompt: str, opts: dict[str, Any]) -> Any:
+            if str(opts.get("label") or "") == "支线核验":
+                return {
+                    "files": [
+                        "dalton/research/weekly-2026-10-23/core-META.md|missing",
+                        "dalton/research/weekly-2026-10-23/watch-NFLX.md|ok",
+                    ]
+                }
+            return await super().agent(prompt, opts)
+
+    host = _ProbeHost()
+    result = await _run("weekly-coverage-review", WEEKLY_PARAMS, host)
+
+    view = _WeeklyLabels(host)
+    labels = view.labels()
+    assert not any(label.startswith("call ") for label in labels), "a failed core gets no call"
+    assert "周会稿" in labels, "a single failed company does not block the whole sweep"
+    assert "Core 失败的公司：META" in view.prompt_of("周会稿")
+    assert any("Core 逐家失败：META" in item for item in result["incomplete"])
+    assert result["core_done"] == 0 and result["watch_done"] == 1
+
+
+# ------------------------------------------------- round 3: fetch-data gate, budget
+
+
+@pytest.mark.asyncio
+async def test_valuation_fetch_data_must_be_on_disk_before_write() -> None:
+    """The fetch stage answered ok with files, but valuation-data.json is
+    not on disk (or the probe child failed): the write stage never
+    dispatches and the run stops through the unified branch block."""
+    host = ScriptedHost(
+        by_label={
+            "估值取数": {
+                "files": ["./research/2026-10-23-ic/valuation-data.json"],
+                "summary": "fetched",
+            },
+            "支线核验": {
+                "files": ["./research/2026-10-23-ic/valuation-data.json|missing"]
+            },
+        }
+    )
+    result = await _run("initial-coverage", IC_PARAMS, host)
+
+    assert result["ok"] is False
+    assert result["missing"] == ["val"]
+    assert "估值历史与可比" not in host.labels(), "no write without on-disk data"
+    assert "初筛成稿" not in host.labels()
+
+    # The probe child failing takes the same unified exit.
+    dead = ScriptedHost(
+        by_label={
+            "估值取数": {
+                "files": ["./research/2026-10-23-ic/valuation-data.json"],
+                "summary": "fetched",
+            }
+        },
+        fail_labels={"支线核验"},
+    )
+    result = await _run("initial-coverage", IC_PARAMS, dead)
+    assert result["missing"] == ["val"]
+    assert "估值历史与可比" not in dead.labels()
+
+    # The fetch prompt carries the same resume hint as every branch.
+    healthy = ScriptedHost()
+    await _run("initial-coverage", IC_PARAMS, healthy)
+    fetch_prompt = healthy.prompts[healthy.labels().index("估值取数")]
+    assert "先读并核对" in fetch_prompt, "a resumed fetch must not clobber the filled file"
+
+
+@pytest.mark.asyncio
+async def test_weekly_full_budget_run_completes_with_three_calls() -> None:
+    """27 core companies, 37 watch hits sliced to the 30-slot room, and 3
+    conviction calls: exactly the 64-dispatch platform cap, and the run
+    still completes normally (no script error from the last dispatches)."""
+
+    class _FullHouse(_ScreeningHost):
+        async def agent(self, prompt: str, opts: dict[str, Any]) -> Any:
+            label = str(opts.get("label") or "")
+            if label == "筛选":
+                self.calls.append((prompt, dict(opts)))
+                return {
+                    "ok": True,
+                    "base": "2026-10-16",
+                    "core": [
+                        {"ticker": f"C{i:02d}", "workspace_dir": ".", "held": False}
+                        for i in range(27)
+                    ],
+                    "flagged": [
+                        {"ticker": f"W{i:02d}", "event_hint": "异动", "workspace_dir": "."}
+                        for i in range(37)
+                    ],
+                    "warnings": [],
+                }
+            if label in ("C00", "C01", "C02"):
+                self.calls.append((prompt, dict(opts)))
+                return {
+                    "ticker": label,
+                    "file": f"research/weekly-2026-10-23/core-{label}.md",
+                    "call_candidate": True,
+                }
+            if label.startswith("call "):
+                self.calls.append((prompt, dict(opts)))
+                return {
+                    "ticker": label.removeprefix("call "),
+                    "file": f"research/weekly-2026-10-23/call-{label.removeprefix('call ')}.md",
+                }
+            return await super().agent(prompt, opts)
+
+    host = _FullHouse()
+    result = await _run("weekly-coverage-review", WEEKLY_PARAMS, host)
+
+    # 1 screening + 27 core + 30 watch (sliced) + 1 probe + 3 calls + 1 doc
+    # + 1 evidence = exactly the cap; the room math is what keeps it there.
+    assert len(host.calls) == 64, len(host.calls)
+    assert result["watch_done"] == 30
+    assert result["calls"] == ["C00", "C01", "C02"]
+    assert result["core_total"] == 27 and result["core_done"] == 27
+
+
+@pytest.mark.asyncio
+async def test_weekly_probe_failure_blocks_calls_and_marks_unverified() -> None:
+    """With the probe child failed, the companies still count into the sweep
+    by their reported artifacts, but none is verified on disk: no calls go
+    out and the return names the unverified companies. META IS a call
+    candidate here, so deleting the probeFailed short-circuit would dispatch
+    its call and fail this test."""
+
+    class _DeadProbeHost(_ScreeningHost):
+        async def agent(self, prompt: str, opts: dict[str, Any]) -> Any:
+            label = str(opts.get("label") or "")
+            if label == "支线核验":
+                await asyncio.sleep(0.02)
+                return None
+            if label == "META":
+                self.calls.append((prompt, dict(opts)))
+                return {
+                    "ticker": "META",
+                    "file": "research/weekly-2026-10-23/core-META.md",
+                    "call_candidate": True,
+                }
+            return await super().agent(prompt, opts)
+
+    host = _DeadProbeHost()
+    result = await _run("weekly-coverage-review", WEEKLY_PARAMS, host)
+
+    labels = _WeeklyLabels(host).labels()
+    assert "周会稿" in labels, "the sweep continues without the probe"
+    assert not any(label.startswith("call ") for label in labels), "unverified companies get no call"
+    assert any("支线核验子任务失败" in item and "不派 call" in item for item in result["incomplete"])
+    assert result["unverified_by_probe"] == ["META", "NFLX"]
+    assert result["core_done"] == 1 and result["watch_done"] == 1
+
+
+@pytest.mark.asyncio
+async def test_topic_probe_failure_exit_carries_missing_clusters() -> None:
+    """The probe-failure exit runs after the clusters: it carries the
+    reported-missing clusters, and its copy does not claim the gap was
+    passed to the writing stage (we never got there)."""
+    host = ScriptedHost(
+        by_label={"规划": _PLAN_4},
+        fail_labels={"取证 簇 B", "支线核验"},
+    )
+    result = await _run("topic-research", TOPIC_PARAMS, host)
+
+    assert result["ok"] is False
+    assert "支线核验子任务失败" in result["blocked"]
+    assert result["missing_clusters"] == ["b"]
+    assert any(
+        "支线核验子任务失败" in item and "簇 B" in item for item in result["incomplete"]
+    )
+    assert not any("已传给写作" in item for item in result["incomplete"])
+    assert "交叉验证与盲区" not in host.labels()
