@@ -96,6 +96,34 @@ def extract_row_group_ids(row: Mapping[str, Any]) -> list[str]:
     return out
 
 
+def extract_row_stale_group_ids(row: Mapping[str, Any]) -> list[str]:
+    """Return deduplicated list of group UUIDs for which `row` is marked stale.
+
+    Reads `extra.group_stale_ids` when present. For legacy rows that only have boolean
+    `extra.group_stale = true`, interprets that flag as the row's primary group (`group_id`
+    or first entry of `group_ids`) no longer matching criteria.
+    """
+    out: list[str] = []
+    extra = _ensure_json_obj(row.get("extra"), {})
+    if not isinstance(extra, Mapping):
+        return out
+    raw_stale = extra.get("group_stale_ids")
+    if isinstance(raw_stale, (list, tuple)):
+        for item in raw_stale:
+            gid = str(item or "").strip()
+            if gid and gid not in out:
+                out.append(gid)
+        return out
+    if bool(extra.get("group_stale")):
+        primary = str(row.get("group_id") or "").strip()
+        if not primary:
+            gids = extract_row_group_ids(row)
+            primary = gids[0] if gids else ""
+        if primary and primary not in out:
+            out.append(primary)
+    return out
+
+
 def company_to_row(
     company: Mapping[str, Any],
     *,
@@ -103,6 +131,7 @@ def company_to_row(
     source: str = "seed",
     group_id: str | None = None,
     group_ids: list[str] | tuple[str, ...] | None = None,
+    group_stale_ids: list[str] | tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
     """Convert a `coverage.yaml` company dict into a `dalton_coverage` row dict losslessly."""
     uid = str(user_id or "").strip()
@@ -154,6 +183,28 @@ def company_to_row(
         extra.pop("group_ids", None)
         eff_group_id = None
 
+    merged_stale_gids: list[str] = []
+    if group_stale_ids is not None:
+        for g in group_stale_ids:
+            gs = str(g or "").strip()
+            if gs and gs not in merged_stale_gids and (not merged_gids or gs in merged_gids):
+                merged_stale_gids.append(gs)
+    elif isinstance(extra.get("group_stale_ids"), (list, tuple)):
+        for g in extra["group_stale_ids"]:
+            gs = str(g or "").strip()
+            if gs and gs not in merged_stale_gids and (not merged_gids or gs in merged_gids):
+                merged_stale_gids.append(gs)
+    elif bool(extra.get("group_stale")) and eff_group_id:
+        merged_stale_gids.append(eff_group_id)
+
+    extra.pop("group_stale", None)
+    if merged_stale_gids and merged_gids:
+        extra["group_stale_ids"] = [g for g in merged_stale_gids if g in merged_gids]
+        if not extra["group_stale_ids"]:
+            extra.pop("group_stale_ids", None)
+    else:
+        extra.pop("group_stale_ids", None)
+
     return {
         "user_id": uid,
         "ticker": raw_ticker,
@@ -204,7 +255,7 @@ def row_to_company(row: Mapping[str, Any]) -> dict[str, Any]:
         if (
             key not in result
             and key not in dedicated_map
-            and key != "group_ids"
+            and key not in ("group_ids", "group_stale_ids", "group_stale")
             and not key.startswith("_")
         ):
             result[key] = val

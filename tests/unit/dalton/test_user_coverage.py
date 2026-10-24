@@ -30,6 +30,7 @@ from src.dalton.coverage.models import (
     company_to_row,
     dump_coverage_yaml,
     extract_row_group_ids,
+    extract_row_stale_group_ids,
     row_to_company,
     validate_earnings_calendar_ledger,
 )
@@ -215,21 +216,39 @@ class _InMemoryCoverageStore:
         user_id: str,
         tickers: list[str],
         *,
+        group_id: str | None = None,
         stale: bool = True,
         conn: Any = None,
     ) -> list[str]:
         _ = conn
         uid = str(user_id).strip()
+        gid_clean = str(group_id).strip() if group_id else ""
         changed: list[str] = []
         for t in tickers:
             sym = str(t).strip().upper()
             row = self.rows.get((uid, sym))
             if row is not None:
-                extra = dict(row.get("extra") or {})
+                row_gids = extract_row_group_ids(row)
+                stale_gids = [
+                    g for g in extract_row_stale_group_ids(row) if not row_gids or g in row_gids
+                ]
+                target_gid = gid_clean or str(row.get("group_id") or "").strip() or (
+                    row_gids[0] if row_gids else ""
+                )
                 if stale:
-                    extra["group_stale"] = True
+                    if target_gid and target_gid not in stale_gids:
+                        stale_gids.append(target_gid)
                 else:
-                    extra.pop("group_stale", None)
+                    if target_gid:
+                        stale_gids = [g for g in stale_gids if g != target_gid]
+                    else:
+                        stale_gids = []
+                extra = dict(row.get("extra") or {})
+                extra.pop("group_stale", None)
+                if stale_gids:
+                    extra["group_stale_ids"] = stale_gids
+                else:
+                    extra.pop("group_stale_ids", None)
                 row["extra"] = extra
                 row["updated_at"] = self._next_ts()
                 changed.append(sym)
@@ -328,6 +347,14 @@ class _InMemoryCoverageStore:
                 del self.rows[key]
             else:
                 extra = dict(row.get("extra") or {})
+                stale_gids = [
+                    g for g in extract_row_stale_group_ids(row) if g != gid and g in remaining
+                ]
+                extra.pop("group_stale", None)
+                if stale_gids:
+                    extra["group_stale_ids"] = stale_gids
+                else:
+                    extra.pop("group_stale_ids", None)
                 if remaining:
                     extra["group_ids"] = remaining
                 else:
@@ -798,7 +825,8 @@ async def test_cos_coverage_tool_binding_actions_and_quarterly_preflight(
     assert "AMD" in (pf_res.wake_context or "")
     amd_row = await store.get_coverage_row(USER_ALICE, "AMD")
     assert amd_row is not None
-    assert amd_row["extra"].get("group_stale") is True
+    assert group_id in (amd_row["extra"].get("group_stale_ids") or [])
+    assert "group_stale" not in amd_row["extra"]
 
     # 6) list shows stale_tickers
     list_out = json.loads(await tool.ainvoke({"action": "list"}, config=cfg))
@@ -1611,5 +1639,224 @@ async def test_preflight_attempts_home_coverage_sync_before_timeout_steps(
     )
     assert summary is None
     assert f"hang:{USER_ALICE}" in sync_attempts
+
+
+@pytest.mark.asyncio
+async def test_group_stale_per_group_and_legacy_bool_compat(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 4 Item 1: group_stale is tracked per group in extra.group_stale_ids, refreshing Group B preserves Group A's stale mark, and legacy extra.group_stale is read as primary group stale and migrated on write."""
+    store = _InMemoryCoverageStore()
+    _wire_coverage_store(monkeypatch, store)
+    monkeypatch.setattr(
+        coverage_svc,
+        "sync_user_coverage_to_home",
+        create_autospec(coverage_svc.sync_user_coverage_to_home, return_value=True),
+    )
+    monkeypatch.setattr(
+        coverage_svc,
+        "ensure_user_earnings_calendar_automation",
+        create_autospec(
+            coverage_svc.ensure_user_earnings_calendar_automation,
+            return_value={"ok": True, "action": "exists", "automation_id": "auto-cal-1", "name": "dalton-earnings-calendar"},
+        ),
+    )
+    monkeypatch.setattr(
+        coverage_svc,
+        "_user_workspace_tickers",
+        create_autospec(coverage_svc._user_workspace_tickers, return_value={}),
+    )
+
+    screener_mock = create_autospec(
+        coverage_svc._fetch_yf_screener_rows,
+        return_value=[
+            {"symbol": "NVDA", "companyName": "NVIDIA Corp", "exchangeShortName": "NMS"},
+            {"symbol": "AVGO", "companyName": "Broadcom Inc", "exchangeShortName": "NMS"},
+        ],
+    )
+    monkeypatch.setattr(coverage_svc, "_fetch_yf_screener_rows", screener_mock)
+
+    # Create Group A and Group B; both initially match NVDA and AVGO
+    grp_a = await coverage_svc.add_coverage_group(
+        USER_ALICE,
+        label="AI Semis A",
+        criteria={"country": "US", "industry": "Semiconductors"},
+        default_tier="watch",
+    )
+    grp_b = await coverage_svc.add_coverage_group(
+        USER_ALICE,
+        label="Networking B",
+        criteria={"country": "US", "industry": "Communication Equipment"},
+        default_tier="watch",
+    )
+    group_a_id = grp_a["group"]["group_id"]
+    group_b_id = grp_b["group"]["group_id"]
+
+    avgo_initial = await store.get_coverage_row(USER_ALICE, "AVGO")
+    assert avgo_initial is not None
+    assert avgo_initial["extra"]["group_ids"] == [group_a_id, group_b_id]
+    assert "group_stale_ids" not in avgo_initial["extra"]
+    assert "group_stale" not in avgo_initial["extra"]
+
+    # 1) Group A refreshes and no longer matches AVGO -> AVGO is marked stale for Group A
+    screener_mock.return_value = [
+        {"symbol": "NVDA", "companyName": "NVIDIA Corp", "exchangeShortName": "NMS"},
+    ]
+    res_a = await coverage_svc.resolve_coverage_group(USER_ALICE, group_a_id)
+    assert res_a["stale_tickers"] == ["AVGO"]
+
+    avgo_after_a = await store.get_coverage_row(USER_ALICE, "AVGO")
+    assert avgo_after_a is not None
+    assert avgo_after_a["extra"]["group_stale_ids"] == [group_a_id]
+    assert "group_stale" not in avgo_after_a["extra"]
+
+    # 2) Group B refreshes and STILL matches AVGO -> Group A's stale mark on AVGO must remain!
+    screener_mock.return_value = [
+        {"symbol": "NVDA", "companyName": "NVIDIA Corp", "exchangeShortName": "NMS"},
+        {"symbol": "AVGO", "companyName": "Broadcom Inc", "exchangeShortName": "NMS"},
+    ]
+    res_b = await coverage_svc.resolve_coverage_group(USER_ALICE, group_b_id)
+    assert "AVGO" in res_b["matched_tickers"]
+    assert res_b["stale_tickers"] == []
+
+    avgo_after_b = await store.get_coverage_row(USER_ALICE, "AVGO")
+    assert avgo_after_b is not None
+    assert avgo_after_b["extra"]["group_stale_ids"] == [group_a_id]
+    assert "group_stale" not in avgo_after_b["extra"]
+
+    # 3) Adding a new Group C that also matches AVGO (upserting & rebuilding extra) preserves Group A's stale ID
+    grp_c = await coverage_svc.add_coverage_group(
+        USER_ALICE,
+        label="Custom Silicon C",
+        criteria={"country": "US", "industry": "Semiconductors"},
+        default_tier="watch",
+    )
+    group_c_id = grp_c["group"]["group_id"]
+    avgo_after_c = await store.get_coverage_row(USER_ALICE, "AVGO")
+    assert avgo_after_c is not None
+    assert avgo_after_c["extra"]["group_ids"] == [group_a_id, group_b_id, group_c_id]
+    assert avgo_after_c["extra"]["group_stale_ids"] == [group_a_id]
+
+    # 4) Reading and displaying derives group_stale from non-empty group_stale_ids and lists stale groups
+    summary = await coverage_svc.list_user_coverage_summary(USER_ALICE)
+    assert summary["stale_tickers"] == ["AVGO"]
+    avgo_summary = next(c for c in summary["companies"] if c["ticker"] == "AVGO")
+    assert avgo_summary["group_stale"] is True
+    assert avgo_summary["group_stale_ids"] == [group_a_id]
+    assert avgo_summary["stale_group_labels"] == ["AI Semis A"]
+    assert avgo_summary["stale_groups"] == [{"group_id": group_a_id, "label": "AI Semis A"}]
+
+    # 5) When Group A refreshes again and matches AVGO again, Group A is removed from group_stale_ids
+    res_a_recover = await coverage_svc.resolve_coverage_group(USER_ALICE, group_a_id)
+    assert "AVGO" in res_a_recover["matched_tickers"]
+    avgo_recovered = await store.get_coverage_row(USER_ALICE, "AVGO")
+    assert avgo_recovered is not None
+    assert "group_stale_ids" not in avgo_recovered["extra"]
+    summary_recovered = await coverage_svc.list_user_coverage_summary(USER_ALICE)
+    assert summary_recovered["stale_tickers"] == []
+
+    # 6) Legacy boolean `extra.group_stale = True` compatibility:
+    # Reading interprets it as primary group stale; writing migrates to `group_stale_ids` and drops `group_stale`.
+    nvda_row = store.rows[(USER_ALICE, "NVDA")]
+    nvda_row["group_id"] = group_a_id
+    nvda_row["extra"] = {"group_ids": [group_a_id, group_b_id], "group_stale": True}
+
+    assert extract_row_stale_group_ids(nvda_row) == [group_a_id]
+    legacy_summary = await coverage_svc.list_user_coverage_summary(USER_ALICE)
+    nvda_summary = next(c for c in legacy_summary["companies"] if c["ticker"] == "NVDA")
+    assert nvda_summary["group_stale"] is True
+    assert nvda_summary["group_stale_ids"] == [group_a_id]
+    assert nvda_summary["stale_group_labels"] == ["AI Semis A"]
+
+    # Refreshing Group B (which still matches NVDA) preserves Group A's stale mark and migrates storage on write
+    await store.mark_coverage_rows_group_stale(USER_ALICE, ["NVDA"], group_id=group_b_id, stale=False)
+    nvda_migrated = await store.get_coverage_row(USER_ALICE, "NVDA")
+    assert nvda_migrated is not None
+    assert nvda_migrated["extra"]["group_stale_ids"] == [group_a_id]
+    assert "group_stale" not in nvda_migrated["extra"]
+
+
+@pytest.mark.asyncio
+async def test_market_data_unavailable_on_all_error_codes_and_incomplete_structures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 4 Item 2: yfinance exception, yfinance incomplete structure, FMP 401/402/403/429/5xx, and timeout all raise MarketDataUnavailable; only explicit not-found returns None."""
+    import yfinance as yf
+    import src.data_client.yfinance.yahoo as yahoo_mod
+    from src.data_client.fmp.fmp_client import FMPClient, FMPRequestError
+
+    monkeypatch.delenv("FMP_API_KEY", raising=False)
+
+    # 1) yfinance raises an exception (including timeout) -> raises MarketDataUnavailable
+    yahoo_ticker_mock = create_autospec(
+        yahoo_mod.yahoo_ticker,
+        side_effect=TimeoutError("yfinance request timed out"),
+    )
+    monkeypatch.setattr(yahoo_mod, "yahoo_ticker", yahoo_ticker_mock)
+    with pytest.raises(coverage_svc.MarketDataUnavailable) as exc_yf_timeout:
+        await coverage_svc.validate_and_enrich_ticker("AAPL")
+    assert exc_yf_timeout.value.provider == "yfinance"
+
+    # 2) yfinance returns incomplete structure -> raises MarketDataUnavailable
+    # 2a) info is None
+    tk_none_info = create_autospec(yf.Ticker, instance=True)
+    tk_none_info.info = None
+    tk_none_info.fast_info = {}
+    yahoo_ticker_mock.side_effect = None
+    yahoo_ticker_mock.return_value = tk_none_info
+    with pytest.raises(coverage_svc.MarketDataUnavailable) as exc_yf_none_info:
+        await coverage_svc.validate_and_enrich_ticker("AAPL")
+    assert exc_yf_none_info.value.provider == "yfinance"
+
+    # 2b) info has quoteType='EQUITY' but no exchange, name, or price
+    tk_partial_equity = create_autospec(yf.Ticker, instance=True)
+    tk_partial_equity.info = {"quoteType": "EQUITY"}
+    tk_partial_equity.fast_info = {}
+    yahoo_ticker_mock.return_value = tk_partial_equity
+    with pytest.raises(coverage_svc.MarketDataUnavailable) as exc_yf_partial_eq:
+        await coverage_svc.validate_and_enrich_ticker("AAPL")
+    assert exc_yf_partial_eq.value.provider == "yfinance"
+
+    # 2c) fast_info has exchange='NMS' but missing/None price and empty info
+    tk_partial_fi = create_autospec(yf.Ticker, instance=True)
+    tk_partial_fi.info = {}
+    tk_partial_fi.fast_info = {"exchange": "NMS", "lastPrice": None}
+    yahoo_ticker_mock.return_value = tk_partial_fi
+    with pytest.raises(coverage_svc.MarketDataUnavailable) as exc_yf_partial_fi:
+        await coverage_svc.validate_and_enrich_ticker("AAPL")
+    assert exc_yf_partial_fi.value.provider == "yfinance"
+
+    # 3) Explicit yfinance not-found (empty quoteType and no exchange in fast_info) -> returns None
+    tk_explicit_empty = create_autospec(yf.Ticker, instance=True)
+    tk_explicit_empty.info = {"quoteType": "NONE"}
+    tk_explicit_empty.fast_info = {"exchange": "", "lastPrice": None}
+    yahoo_ticker_mock.return_value = tk_explicit_empty
+    assert await coverage_svc.validate_and_enrich_ticker("INVALID999") is None
+
+    # 4) FMP status codes: 401, 402, 403, 429, 500, 502, 503, 504 -> each raises MarketDataUnavailable
+    monkeypatch.setenv("FMP_API_KEY", "test-fmp-key")
+    get_profile_mock = create_autospec(FMPClient.get_profile)
+    monkeypatch.setattr(FMPClient, "get_profile", get_profile_mock)
+    for status_code in (401, 402, 403, 429, 500, 502, 503, 504):
+        get_profile_mock.side_effect = FMPRequestError(
+            f"FMP API request failed ({status_code})",
+            status_code=status_code,
+        )
+        with pytest.raises(coverage_svc.MarketDataUnavailable) as exc_fmp_code:
+            await coverage_svc.validate_and_enrich_ticker("AAPL")
+        assert exc_fmp_code.value.provider == "fmp"
+        assert exc_fmp_code.value.status_code == status_code
+
+    # 5) FMP timeout -> raises MarketDataUnavailable
+    get_profile_mock.side_effect = FMPRequestError("FMP API request timed out")
+    with pytest.raises(coverage_svc.MarketDataUnavailable) as exc_fmp_timeout:
+        await coverage_svc.validate_and_enrich_ticker("AAPL")
+    assert exc_fmp_timeout.value.provider == "fmp"
+
+    # 6) Explicit FMP not-found: HTTP 200 with empty list [] (after yfinance explicit empty) -> returns None
+    get_profile_mock.side_effect = None
+    get_profile_mock.return_value = []
+    assert await coverage_svc.validate_and_enrich_ticker("INVALID999") is None
+
 
 

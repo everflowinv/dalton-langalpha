@@ -18,6 +18,7 @@ from src.dalton.coverage.models import (
     company_to_row,
     dump_coverage_yaml,
     extract_row_group_ids,
+    extract_row_stale_group_ids,
     infer_market,
     make_new_company_dict,
     normalize_source,
@@ -528,52 +529,52 @@ def _lookup_via_yfinance_sync(ticker: str) -> dict[str, Any] | None:
     except MarketDataUnavailable:
         raise
     except Exception as exc:
-        if _is_ticker_not_found_exception(exc):
-            return None
         raise MarketDataUnavailable(
             "yfinance",
             f"{type(exc).__name__} while initializing ticker {sym}",
             status_code=_extract_http_status(exc),
         ) from exc
 
-    info: Mapping[str, Any] = {}
     try:
         raw_info = tk.info
-        if isinstance(raw_info, Mapping):
-            info = raw_info
     except MarketDataUnavailable:
         raise
     except Exception as exc:
-        if not _is_ticker_not_found_exception(exc):
-            raise MarketDataUnavailable(
-                "yfinance",
-                f"{type(exc).__name__} while looking up {sym}",
-                status_code=_extract_http_status(exc),
-            ) from exc
+        raise MarketDataUnavailable(
+            "yfinance",
+            f"{type(exc).__name__} while looking up {sym}",
+            status_code=_extract_http_status(exc),
+        ) from exc
+
+    if not isinstance(raw_info, Mapping):
+        raise MarketDataUnavailable(
+            "yfinance",
+            f"Incomplete yfinance info payload for {sym}",
+        )
+    info: Mapping[str, Any] = raw_info
 
     try:
         fi = getattr(tk, "fast_info", None)
     except MarketDataUnavailable:
         raise
     except Exception as exc:
-        if _is_ticker_not_found_exception(exc):
-            fi = None
-        else:
-            raise MarketDataUnavailable(
-                "yfinance",
-                f"{type(exc).__name__} while reading fast_info for {sym}",
-                status_code=_extract_http_status(exc),
-            ) from exc
+        raise MarketDataUnavailable(
+            "yfinance",
+            f"{type(exc).__name__} while reading fast_info for {sym}",
+            status_code=_extract_http_status(exc),
+        ) from exc
 
     quote_type = str(info.get("quoteType") or "").strip().upper()
-    if quote_type == "NONE":
-        return None
-
-    exchange = str(
+    raw_exchange = str(
         info.get("exchange")
         or _safe_fast_info_get(fi, "exchange")
         or ""
     ).strip().upper()
+    exchange = "" if raw_exchange in {"NONE", "N/A", "NULL"} else raw_exchange
+
+    if quote_type == "NONE" and not exchange:
+        return None
+
     name = str(
         info.get("longName")
         or info.get("shortName")
@@ -598,23 +599,37 @@ def _lookup_via_yfinance_sync(ticker: str) -> dict[str, Any] | None:
         fi, "marketCap", "market_cap"
     )
 
-    has_valid_fast_info = (
-        bool(exchange)
-        and exchange not in {"NONE", "N/A", "NULL"}
-        and isinstance(price, (int, float))
+    has_valid_price = (
+        isinstance(price, (int, float))
         and not isinstance(price, bool)
         and price > 0
     )
+    has_valid_market_cap = (
+        isinstance(market_cap, (int, float))
+        and not isinstance(market_cap, bool)
+        and market_cap > 0
+    )
+    has_valid_fast_info = bool(exchange) and has_valid_price
     has_identity = (
-        bool(name)
-        or has_valid_fast_info
+        has_valid_fast_info
         or (
             quote_type in ("EQUITY", "ETF", "INDEX", "MUTUALFUND")
-            and (price is not None or market_cap is not None or bool(exchange))
+            and (bool(name) or has_valid_price or has_valid_market_cap)
+            and (bool(exchange) or bool(name))
         )
+        or (bool(name) and (bool(exchange) or has_valid_price or has_valid_market_cap))
     )
     if not has_identity:
-        return None
+        has_nonempty_info = any(
+            k != "quoteType" and v is not None and str(v).strip() != ""
+            for k, v in info.items()
+        )
+        if quote_type in ("", "NONE") and not exchange and not has_nonempty_info:
+            return None
+        raise MarketDataUnavailable(
+            "yfinance",
+            f"Incomplete yfinance structure for {sym}",
+        )
 
     canon_sym = display_spelling(str(info.get("symbol") or sym)).strip().upper() or sym
     country = str(info.get("country") or "").strip()
@@ -650,7 +665,9 @@ async def _lookup_via_fmp_profile(ticker: str) -> dict[str, Any] | None:
     client = FMPClient(api_key=api_key)
     try:
         rows = await client.get_profile(ticker)
-        if isinstance(rows, list) and rows:
+        if isinstance(rows, list):
+            if not rows:
+                return None
             first = rows[0]
             if isinstance(first, Mapping) and (
                 first.get("symbol") or first.get("companyName") or first.get("name")
@@ -678,11 +695,13 @@ async def _lookup_via_fmp_profile(ticker: str) -> dict[str, Any] | None:
                     "market_cap": first.get("mktCap") or first.get("marketCap"),
                     "source_provider": "fmp",
                 }
+        raise MarketDataUnavailable(
+            "fmp",
+            f"Incomplete FMP profile response for {ticker}",
+        )
     except MarketDataUnavailable:
         raise
     except Exception as exc:
-        if _is_ticker_not_found_exception(exc):
-            return None
         raise MarketDataUnavailable(
             "fmp",
             f"{type(exc).__name__} while looking up {ticker}",
@@ -693,7 +712,6 @@ async def _lookup_via_fmp_profile(ticker: str) -> dict[str, Any] | None:
             await client.close()
         except Exception:
             pass
-    return None
 
 
 async def validate_and_enrich_ticker(ticker: str) -> dict[str, Any] | None:
@@ -747,14 +765,7 @@ async def validate_and_enrich_ticker(ticker: str) -> dict[str, Any] | None:
                 return fmp_hit
         except MarketDataUnavailable as fmp_exc:
             if yf_error is not None:
-                raise yf_error from fmp_exc
-            if fmp_exc.status_code in (401, 402, 403, 429):
-                logger.debug(
-                    "[DALTON_COVERAGE] FMP fallback quota/tier limit (%s) after yfinance not-found for %s",
-                    fmp_exc.status_code,
-                    sym,
-                )
-                return None
+                raise fmp_exc from yf_error
             raise
 
     if yf_error is not None:
@@ -816,6 +827,11 @@ async def list_user_coverage_summary(user_id: str) -> dict[str, Any]:
     groups = await coverage_db.list_coverage_groups(uid)
     mirror_row = await coverage_db.get_earnings_calendar_mirror(uid)
 
+    group_label_by_id = {
+        str(g["group_id"]): str(g.get("label") or g["group_id"])
+        for g in groups
+        if g.get("group_id")
+    }
     companies: list[dict[str, Any]] = []
     core_list: list[dict[str, Any]] = []
     watch_list: list[dict[str, Any]] = []
@@ -824,12 +840,23 @@ async def list_user_coverage_summary(user_id: str) -> dict[str, Any]:
     for r in rows:
         comp = row_to_company(r)
         gids = extract_row_group_ids(r)
+        stale_gids = [
+            g for g in extract_row_stale_group_ids(r) if not gids or g in gids
+        ]
+        stale_groups = [
+            {"group_id": g, "label": group_label_by_id.get(g, g)}
+            for g in stale_gids
+        ]
+        stale_group_labels = [sg["label"] for sg in stale_groups]
         comp_with_meta = {
             **comp,
             "source": r.get("source"),
             "group_id": r.get("group_id") or (gids[0] if gids else None),
             "group_ids": gids,
-            "group_stale": bool((r.get("extra") or {}).get("group_stale")),
+            "group_stale_ids": stale_gids,
+            "stale_groups": stale_groups,
+            "stale_group_labels": stale_group_labels,
+            "group_stale": len(stale_gids) > 0,
         }
         companies.append(comp_with_meta)
         if comp_with_meta["tier"] == "core":
@@ -915,6 +942,15 @@ def _build_upsert_rows_from_existing(
             merged_gids = list(prev_gids)
             if gid_clean and gid_clean not in merged_gids:
                 merged_gids.append(gid_clean)
+            prev_stale_gids = [
+                g
+                for g in extract_row_stale_group_ids(existing)
+                if (valid_group_ids is None or g in valid_group_ids) and g in merged_gids
+            ]
+            if norm_source == "group" and gid_clean:
+                merged_stale_gids = [g for g in prev_stale_gids if g != gid_clean]
+            else:
+                merged_stale_gids = list(prev_stale_gids)
             existing_primary = str(existing.get("group_id") or "").strip() or None
             if existing_primary and valid_group_ids is not None and existing_primary not in valid_group_ids:
                 existing_primary = None
@@ -930,6 +966,7 @@ def _build_upsert_rows_from_existing(
             if item.get("market") and not comp.get("market"):
                 comp["market"] = str(item["market"])
             comp.pop("group_stale", None)
+            comp.pop("group_stale_ids", None)
         else:
             peer_grp = str(item.get("industry") or item.get("sector") or "").strip()
             comp = make_new_company_dict(
@@ -943,6 +980,7 @@ def _build_upsert_rows_from_existing(
             eff_source = norm_source
             eff_group_id = gid_clean
             merged_gids = [gid_clean] if gid_clean else []
+            merged_stale_gids = []
         rows_to_upsert.append(
             company_to_row(
                 comp,
@@ -950,6 +988,7 @@ def _build_upsert_rows_from_existing(
                 source=eff_source,
                 group_id=eff_group_id,
                 group_ids=merged_gids,
+                group_stale_ids=merged_stale_gids,
             )
         )
     return rows_to_upsert
@@ -1694,7 +1733,7 @@ async def resolve_coverage_group(
                 for r in existing_rows
                 if gid in extract_row_group_ids(r)
                 and str(r["ticker"]).upper() in matched_set
-                and bool((r.get("extra") or {}).get("group_stale"))
+                and gid in extract_row_stale_group_ids(r)
             ]
 
             if tickers_needing_membership:
@@ -1713,12 +1752,12 @@ async def resolve_coverage_group(
             marked_stale: list[str] = []
             if stale_candidates:
                 marked_stale = await coverage_db.mark_coverage_rows_group_stale(
-                    uid, stale_candidates, stale=True, conn=conn
+                    uid, stale_candidates, group_id=gid, stale=True, conn=conn
                 )
 
             if unstale_candidates:
                 await coverage_db.mark_coverage_rows_group_stale(
-                    uid, unstale_candidates, stale=False, conn=conn
+                    uid, unstale_candidates, group_id=gid, stale=False, conn=conn
                 )
 
             updated_group = await coverage_db.update_coverage_group_resolved(

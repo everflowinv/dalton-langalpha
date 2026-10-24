@@ -10,7 +10,10 @@ from typing import Any, Mapping
 
 from psycopg.rows import dict_row
 
-from src.dalton.coverage.models import extract_row_group_ids
+from src.dalton.coverage.models import (
+    extract_row_group_ids,
+    extract_row_stale_group_ids,
+)
 from src.server.database.pool import get_db_connection
 
 logger = logging.getLogger(__name__)
@@ -350,42 +353,65 @@ async def mark_coverage_rows_group_stale(
     user_id: str,
     tickers: list[str],
     *,
+    group_id: str | None = None,
     stale: bool = True,
     conn: Any = None,
 ) -> list[str]:
-    """Set or clear `extra.group_stale` on specified tickers for `user_id` under advisory lock."""
+    """Set or clear per-group `extra.group_stale_ids` on specified tickers for `user_id` under advisory lock."""
     uid = str(user_id or "").strip()
     cleaned = [str(t).strip().upper() for t in tickers if str(t).strip()]
     if not uid or not cleaned:
         return []
+    gid_clean = str(group_id).strip() if group_id else ""
+    cleaned_set = set(cleaned)
 
     async def _run_in_tx(c: Any) -> list[str]:
         await acquire_coverage_advisory_lock(c, uid)
+        rows = await list_coverage_rows(uid, conn=c)
+        by_ticker = {str(r["ticker"]).strip().upper(): r for r in rows if r.get("ticker")}
+        updated_tickers: list[str] = []
         async with c.cursor(row_factory=dict_row) as cur:
-            if stale:
+            for sym in cleaned:
+                if sym not in cleaned_set:
+                    continue
+                r = by_ticker.get(sym)
+                if r is None:
+                    continue
+                row_gids = extract_row_group_ids(r)
+                stale_gids = [
+                    g for g in extract_row_stale_group_ids(r) if not row_gids or g in row_gids
+                ]
+                target_gid = gid_clean or str(r.get("group_id") or "").strip() or (
+                    row_gids[0] if row_gids else ""
+                )
+                if stale:
+                    if target_gid and target_gid not in stale_gids:
+                        stale_gids.append(target_gid)
+                else:
+                    if target_gid:
+                        stale_gids = [g for g in stale_gids if g != target_gid]
+                    else:
+                        stale_gids = []
+                new_extra = dict(r.get("extra") or {})
+                new_extra.pop("group_stale", None)
+                if stale_gids:
+                    new_extra["group_stale_ids"] = stale_gids
+                else:
+                    new_extra.pop("group_stale_ids", None)
                 await cur.execute(
                     """
                     UPDATE dalton_coverage
-                    SET extra = COALESCE(extra, '{}'::jsonb) || '{"group_stale": true}'::jsonb,
+                    SET extra = %s::jsonb,
                         updated_at = NOW()
-                    WHERE user_id = %s AND ticker = ANY(%s)
+                    WHERE user_id = %s AND ticker = %s
                     RETURNING ticker
                     """,
-                    (uid, cleaned),
+                    (json.dumps(new_extra, ensure_ascii=False), uid, sym),
                 )
-            else:
-                await cur.execute(
-                    """
-                    UPDATE dalton_coverage
-                    SET extra = COALESCE(extra, '{}'::jsonb) - 'group_stale',
-                        updated_at = NOW()
-                    WHERE user_id = %s AND ticker = ANY(%s)
-                    RETURNING ticker
-                    """,
-                    (uid, cleaned),
-                )
-            rows = await cur.fetchall()
-            return [str(r["ticker"]) for r in rows if r and r.get("ticker")]
+                upd = await cur.fetchone()
+                if upd and upd.get("ticker"):
+                    updated_tickers.append(str(upd["ticker"]))
+        return updated_tickers
 
     if conn is not None:
         return await _run_in_tx(conn)
@@ -591,6 +617,14 @@ async def delete_coverage_group_and_exclusive_members(
                 to_delete_tickers.append(sym)
             else:
                 new_extra = dict(r.get("extra") or {})
+                stale_gids = [
+                    g for g in extract_row_stale_group_ids(r) if g != gid and g in remaining
+                ]
+                new_extra.pop("group_stale", None)
+                if stale_gids:
+                    new_extra["group_stale_ids"] = stale_gids
+                else:
+                    new_extra.pop("group_stale_ids", None)
                 if remaining:
                     new_extra["group_ids"] = remaining
                     new_primary: str | None = remaining[0]
