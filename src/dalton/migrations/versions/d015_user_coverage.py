@@ -1,7 +1,7 @@
-"""d013: per-user coverage roster, coverage groups, and earnings calendar mirror.
+"""d015: per-user coverage roster, coverage groups, and earnings calendar mirror.
 
-Revision ID: d013
-Revises: d012
+Revision ID: d015
+Revises: d014
 Create Date: 2026-10-23
 """
 
@@ -9,8 +9,8 @@ from typing import Sequence, Union
 
 from alembic import op
 
-revision: str = "d013"
-down_revision: Union[str, None] = "d012"
+revision: str = "d015"
+down_revision: Union[str, None] = "d014"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
