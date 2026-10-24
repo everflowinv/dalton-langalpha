@@ -15,7 +15,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 ### 开始前：检查未完成的 run（中断续跑）
 
 - 读 `research/<D>-topic-<slug>/.progress.json`（及 `research/` 下其他 `*/.progress.json`；`<D>` 未定时目录用 `latest`），看是否有本 workflow 的 `status` 不是终态（`completed`/`failed`/`cancelled`）的 run。
-- 有未完成的 run 时不要新开 run：用**原参数**调用 `RunWorkflow(workflow="topic-research", params={...原参数..., "progress_path": "research/<D>-topic-<slug>/.progress.json"}, resume="<.progress.json 里的 run_id>")` 续跑；label、prompt 哈希与产物哈希都一致的已完派发会直接复用，不重复派子任务。
+- 有未完成的 run 时不要新开 run：用**原参数**调用 `RunWorkflow(workflow="topic-research", params={...原参数..., "progress_path": "research/<D>-topic-<slug>/.progress.json"}, resume="<.progress.json 里的 run_id>")` 续跑；label、prompt 哈希与产物哈希都一致的已完派发会直接复用，不重复派子任务。若前一次 run 因审稿 `block` 等原因提前停止，补齐问题后同样用**原参数**加 `resume` 重跑（workflow 返回值里已提供 `resume_hint`）。
 - 全新启动时也在 `params` 里带上 `"progress_path": "research/<D>-topic-<slug>/.progress.json"`，让中断后的 run 可被发现与续跑。
 
 1. **先用 Read 工具读 `.agents/skills/run-workflow/SKILL.md`**，了解 workflow 规范（workflow 启用时，加载本 skill 会自动解锁 `RunWorkflow`）。
@@ -27,14 +27,14 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
      4. **输出粒度与涉猎公司**（涉及哪些覆盖公司或可比公司 `related_tickers`）
      5. **对比基准**（当前市场主流叙事 vs 我们的假设）
    - 若 PM 不在场（如由 `agenda.md` 自主研究议程触发），从 `agenda.md` 对应条目直接锁定范围，并在报告头部注明假设。
-3. **调用 `RunWorkflow`**：
+3. **调用 `RunWorkflow`**（`as_of` 可不传或传 `"latest"`，`RunWorkflow` 会自动取最近一个美股交易日，`resume` 续跑时自动沿用上一 run 的值）：
    ```python
    RunWorkflow(
        workflow="topic-research",
        params={
            "topic": "<专题名称>",
            "slug": "<kebab-case-slug>",
-           "as_of": "<YYYY-MM-DD>",
+           "as_of": "<YYYY-MM-DD 或 latest，可不传>",
            "horizon": "<时间范围，如 2026Q1-2026Q3 或 近30天>",
            "workspace_dir": "<当前工作区路径>",
            "related_tickers": ["<TICKER1>", "<TICKER2>"],

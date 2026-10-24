@@ -20,7 +20,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 - `company`：公司名称
 - `market`：市场（支持 `US`、`HK`、`CN`；港股与 A 股通过 `researchdata.finance(route="cn-hk", operation="filings"|"ask", ...)` 获取法定公告、财务表初值、行情、资金流、两融、股东与 AH 溢价——平台财务表仅作二手初值线索，核心财务数字必须回法定公告原文核实，港股披露易未覆盖时用 `web_search` 查 `site:hkexnews.hk` 原文链接，回报与估值核对复权、分红、拆股与交易/报表币种）
 - `workspace_dir`：当前公司工作区根目录（如 `.` 或工作区路径）
-- `as_of`：基准日期（`YYYY-MM-DD`，默认今天）
+- `as_of`：基准日期（`YYYY-MM-DD`；可不传或传 `"latest"`，`RunWorkflow` 会自动取最近一个美股交易日，`resume` 续跑时自动沿用上一 run 的值）
 - `peers`（可选）：可比同业代码列表；不提供时由行业支线与估值支线自行选定 5–8 家竞争对手及 ≥3 家一档可比公司，并写明选取理由
 - `sector`（可选）：所属行业名称
 - `pm_question`（可选）：PM 特别指定的关注问题或假设
@@ -28,7 +28,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 ### 开始前：检查未完成的 run（中断续跑）
 
 - 读 `research/<D>-ic/.progress.json`（及 `research/` 下其他 `*/.progress.json`），看是否有本 workflow 的 `status` 不是终态（`completed`/`failed`/`cancelled`）的 run。
-- 有未完成的 run 时不要新开 run：用**原参数**调用 `RunWorkflow(workflow="initial-coverage", params={...原参数..., "progress_path": "research/<D>-ic/.progress.json"}, resume="<.progress.json 里的 run_id>")` 续跑；label、prompt 哈希与产物哈希都一致的已完派发会直接复用，不重复派子任务。
+- 有未完成的 run 时不要新开 run：用**原参数**调用 `RunWorkflow(workflow="initial-coverage", params={...原参数..., "progress_path": "research/<D>-ic/.progress.json"}, resume="<.progress.json 里的 run_id>")` 续跑；label、prompt 哈希与产物哈希都一致的已完派发会直接复用，不重复派子任务。若前一次 run 因审稿 `block` 等原因提前停止，补齐问题后同样用**原参数**加 `resume` 重跑（workflow 返回值里已提供 `resume_hint`）。
 - 全新启动时也在 `params` 里带上 `"progress_path": "research/<D>-ic/.progress.json"`，让中断后的 run 可被发现与续跑。
 
 ---
@@ -48,7 +48,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
        "company": "<公司名>",
        "market": "US",
        "workspace_dir": "<workspace_dir>",
-       "as_of": "<YYYY-MM-DD>",
+       "as_of": "<YYYY-MM-DD 或 latest，可不传>",
        "peers": ["<可选同业>"],
        "sector": "<可选行业>",
        "pm_question": "<可选PM问题>",
@@ -56,12 +56,13 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
      }
    }
    ```
-   `initial-coverage` workflow 会自动分 5 个阶段（共 9 次子智能体派发）执行：
-   - **阶段 1（并行 4 支线取证）**：
+   `initial-coverage` workflow 按以下阶段自动推进（估值支线拆分为取数与写稿两步，取证结束后额外执行一次支线产物核验派发，并包含语言审查、审稿修订与终态产物核验等多次子智能体派发）：
+   - **阶段 1（并行 4 支线取证 + 支线核验）**：
      - **A 公司背景**：按 `.agents/skills/dalton-company-background/SKILL.md` 输出 `drafts/<D>-background.md`；
      - **B 行业支线**：按 `references/branch-industry.md` 输出 `research/<D>-ic/industry.md`；
      - **C 财务镜头**：按 `.agents/skills/dalton-financial-lenses/SKILL.md` 输出 `research/<D>-ic/lenses.json` 与 `drafts/<D>-lenses.md`；
-     - **D 估值历史与可比**：按 `references/branch-valuation-history.md` 与 `.agents/skills/comps-analysis/SKILL.md` 输出 `research/<D>-ic/valuation.md` 与 `research/<D>-ic/comps.xlsx`。
+     - **D 估值历史与可比（拆成取数 + 写稿两步派发）**：先按 `.agents/skills/comps-analysis/SKILL.md` 取数并生成可比表 `research/<D>-ic/comps.xlsx`，再按 `references/branch-valuation-history.md` 撰写估值历史与对数分解稿 `research/<D>-ic/valuation.md`；
+     - **支线核验**：四条支线取证完成后，多一次支线核验派发，核对各支线产物是否存在并计算哈希。
    - **阶段 2（bull/bear 快速版）**：综合 A–D 支线产物与内部库/AlphaEngine 检索，按 `.agents/skills/dalton-bullbear/SKILL.md` 快速版方法输出 `research/<D>-ic/bullbear-quick.md`。
    - **阶段 3（12 问初筛成稿）**：按 `references/screen-12q.md` 与 `templates/initial-coverage.md` 撰写 `drafts/<D>-initial-coverage.md`（先锁定证据台账编号再定稿，文末合并为单一 `## 引用` 节）。
    - **阶段 4（知识层初始化草案）**：从初筛成稿与支线一手材料抽取结构化知识层操作草案 `research/<D>-ic/knowledge-proposal.json`（只抽取不新增判断；每条 `thesis.evidence` 必填结构化 `figures` 数组，且 `source.ref` 指向一手文件或 `prov`）。

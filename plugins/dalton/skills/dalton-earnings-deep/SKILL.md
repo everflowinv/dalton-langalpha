@@ -30,7 +30,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 ## 开始前：检查未完成的 run（中断续跑）
 
 - 读 `research/<D>-deep-<quarter>/.progress.json`（及 `research/` 下其他 `*/.progress.json`），看是否有本 workflow 的 `status` 不是终态（`completed`/`failed`/`cancelled`）的 run。
-- 有未完成的 run 时不要新开 run：用**原参数**调用 `RunWorkflow(workflow="earnings-deep-update", params={...原参数..., "progress_path": "research/<D>-deep-<quarter>/.progress.json"}, resume="<.progress.json 里的 run_id>")` 续跑；label、prompt 哈希与产物哈希都一致的已完派发会直接复用，不重复派子任务。
+- 有未完成的 run 时不要新开 run：用**原参数**调用 `RunWorkflow(workflow="earnings-deep-update", params={...原参数..., "progress_path": "research/<D>-deep-<quarter>/.progress.json"}, resume="<.progress.json 里的 run_id>")` 续跑；label、prompt 哈希与产物哈希都一致的已完派发会直接复用，不重复派子任务。若前一次 run 因审稿 `block` 等原因提前停止，补齐问题后同样用**原参数**加 `resume` 重跑（workflow 返回值里已提供 `resume_hint`）。
 - 全新启动时也在 `params` 里带上 `"progress_path": "research/<D>-deep-<quarter>/.progress.json"`，让中断后的 run 可被发现与续跑。
 
 ## Step 1：组装参数并启动 `earnings-deep-update` Workflow

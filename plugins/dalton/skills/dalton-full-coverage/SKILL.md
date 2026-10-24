@@ -25,7 +25,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 - `company`：公司名称
 - `market`：市场（支持 `US`、`HK`、`CN`；港股与 A 股的一手公告与财务初值通过 `researchdata.finance(route="cn-hk", operation="filings"|"ask", ...)` 获取，平台财务表仅作二手初值线索，核心财务数字必须回法定公告原文核实，港股披露易未覆盖时用 `web_search` 查 `site:hkexnews.hk` 原文链接；回报与估值核对复权、分红、拆股与币种）
 - `workspace_dir`：当前公司工作区路径
-- `as_of`：基准日期（`YYYY-MM-DD`）
+- `as_of`：基准日期（`YYYY-MM-DD`；可不传或传 `"latest"`，`RunWorkflow` 会自动取最近一个美股交易日，`resume` 续跑时自动沿用上一 run 的值）
 - `profile`：`"tob"`（面向企业）或 `"toc"`（面向消费者），决定 D 支线做从业者信号表还是多平台产品体验表
 - `form`：`"10-K"`（美国本土发行人）、`"20-F"`（外国私人发行人）或 `"annual_report"`（港股/A 股年度报告）
 - `pm_brief`（可选）：PM 的具体研究指示或假设
@@ -34,7 +34,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 ### 开始前：检查未完成的 run（中断续跑）
 
 - 读 `research/<D>-fc/.progress.json`（及 `research/` 下其他 `*/.progress.json`），看是否有本 workflow 的 `status` 不是终态（`completed`/`failed`/`cancelled`）的 run。
-- 有未完成的 run 时不要新开 run：用**原参数**调用 `RunWorkflow(workflow="full-coverage", params={...原参数..., "progress_path": "research/<D>-fc/.progress.json"}, resume="<.progress.json 里的 run_id>")` 续跑；label、prompt 哈希与产物哈希都一致的已完派发会直接复用，不重复派子任务。
+- 有未完成的 run 时不要新开 run：用**原参数**调用 `RunWorkflow(workflow="full-coverage", params={...原参数..., "progress_path": "research/<D>-fc/.progress.json"}, resume="<.progress.json 里的 run_id>")` 续跑；label、prompt 哈希与产物哈希都一致的已完派发会直接复用，不重复派子任务。若前一次 run 因审稿 `block` 等原因提前停止，补齐问题后同样用**原参数**加 `resume` 重跑（workflow 返回值里已提供 `resume_hint`）。
 - 全新启动时也在 `params` 里带上 `"progress_path": "research/<D>-fc/.progress.json"`，让中断后的 run 可被发现与续跑。
 
 ---
@@ -54,7 +54,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
        "company": "<公司名>",
        "market": "US",
        "workspace_dir": "<workspace_dir>",
-       "as_of": "<YYYY-MM-DD>",
+       "as_of": "<YYYY-MM-DD 或 latest，可不传>",
        "profile": "tob",
        "form": "10-K",
        "pm_brief": "<可选>",

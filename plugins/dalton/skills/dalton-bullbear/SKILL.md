@@ -72,7 +72,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 ### 开始前：检查未完成的 run（中断续跑）
 
 - 读 `research/<as_of>-bullbear/.progress.json`（及 `research/` 下其他 `*/.progress.json`），看是否有本 workflow 的 `status` 不是终态（`completed`/`failed`/`cancelled`）的 run。
-- 有未完成的 run 时不要新开 run：用**原参数**调用 `RunWorkflow(workflow="bullbear-doc", params={...原参数..., "progress_path": "research/<as_of>-bullbear/.progress.json"}, resume="<.progress.json 里的 run_id>")` 续跑；label、prompt 哈希与产物哈希都一致的已完派发会直接复用，不重复派子任务。
+- 有未完成的 run 时不要新开 run：用**原参数**调用 `RunWorkflow(workflow="bullbear-doc", params={...原参数..., "progress_path": "research/<as_of>-bullbear/.progress.json"}, resume="<.progress.json 里的 run_id>")` 续跑；label、prompt 哈希与产物哈希都一致的已完派发会直接复用，不重复派子任务。若前一次 run 因审稿 `block` 等原因提前停止，补齐问题后同样用**原参数**加 `resume` 重跑（workflow 返回值里已提供 `resume_hint`）。
 - 全新启动时也在 `params` 里带上 `"progress_path": "research/<as_of>-bullbear/.progress.json"`，让中断后的 run 可被发现与续跑。
 
 1. **加载 workflow 工具**
@@ -80,6 +80,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
    - 读 `.agents/skills/dalton-bullbear/references/v42-structure.md` 与 `references/return-branch.md` 了解产物标准。
 
 2. **启动 `bullbear-doc`**
+   - 参数说明：`as_of`（基准日期，`YYYY-MM-DD`）可不传或传 `"latest"`（`RunWorkflow` 会自动取最近一个美股交易日，`resume` 续跑时自动沿用上一 run 的值）。
    - 调用 `RunWorkflow`：
      ```json
      {
@@ -89,7 +90,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
          "company": "<公司名>",
          "market": "US",
          "workspace_dir": "<当前工作区路径>",
-         "as_of": "<YYYY-MM-DD>",
+         "as_of": "<YYYY-MM-DD 或 latest，可不传>",
          "research_days": 92,
          "prior_draft": "<可选：上一版 bullbear 草稿或发布稿路径>",
          "progress_path": "research/<as_of>-bullbear/.progress.json"

@@ -3,18 +3,18 @@
 
 Checks:
 1. Per-claim confidence tag citation counts:
-   - Lines tagged with 【高】 must contain >= 3 unique [S#] citations (else INFLATED_HIGH).
-   - Lines tagged with 【中】 must contain >= 2 unique [S#] citations (else INFLATED_MEDIUM).
+   - Lines tagged with 【高】 must contain >= 3 unique [引用N] citations (else INFLATED_HIGH).
+   - Lines tagged with 【中】 must contain >= 2 unique [引用N] citations (else INFLATED_MEDIUM).
 2. Low-confidence ratio check:
    - Among all lines tagged with 【高】 / 【中】 / 【低...】, if the share of 【低...】
      is < 15%, emit LOW_RATIO_WARNING ("可能存在置信度注水").
 3. Citation closure:
-   - Every [S#] referenced in the body must be defined in the `## Sources` section.
-   - Any [S#] defined in `## Sources` but never referenced in the body is flagged as UNUSED_SOURCE.
+   - Every [引用N] referenced in the body must be defined in the `## 引用` section.
+   - Any [引用N] defined in `## 引用` but never referenced in the body is flagged as UNUSED_SOURCE.
 4. Blind-spot gate check:
    - Checks whether "盲区检查完成" appears in the document.
 5. Required sections check:
-   - 执行摘要, 对覆盖公司的含义, 情景推演, 风险与触发条件, 信息缺口与局限, 数字核验表, Sources
+   - 执行摘要, 对覆盖公司的含义, 情景推演, 风险与触发条件, 信息缺口与局限, 数字核验表, 引用
 """
 
 from __future__ import annotations
@@ -202,8 +202,8 @@ def validate_markdown(text: str, *, as_of: Optional[str | date] = None) -> Dict[
                     {
                         "code": "INFLATED_HIGH",
                         "line": line_no,
-                        "citations_found": sorted(f"S{c}" for c in cites_in_line),
-                        "message": f"第 {line_no} 行标注【高】但仅包含 {len(cites_in_line)} 个独立引用（需 >=3 个 [S#]）。",
+                        "citations_found": sorted(f"[引用{c}]" for c in cites_in_line),
+                        "message": f"第 {line_no} 行标注【高】但仅包含 {len(cites_in_line)} 个独立引用（需 >=3 个 [引用N]）。",
                         "excerpt": line[:120],
                     }
                 )
@@ -215,8 +215,8 @@ def validate_markdown(text: str, *, as_of: Optional[str | date] = None) -> Dict[
                     {
                         "code": "INFLATED_MEDIUM",
                         "line": line_no,
-                        "citations_found": sorted(f"S{c}" for c in cites_in_line),
-                        "message": f"第 {line_no} 行标注【中】但仅包含 {len(cites_in_line)} 个引用（需 >=2 个 [S#]）。",
+                        "citations_found": sorted(f"[引用{c}]" for c in cites_in_line),
+                        "message": f"第 {line_no} 行标注【中】但仅包含 {len(cites_in_line)} 个引用（需 >=2 个 [引用N]）。",
                         "excerpt": line[:120],
                     }
                 )
@@ -228,7 +228,7 @@ def validate_markdown(text: str, *, as_of: Optional[str | date] = None) -> Dict[
                     {
                         "code": "LOW_WITHOUT_CITATION",
                         "line": line_no,
-                        "message": f"第 {line_no} 行标注【低】但未附任何 [S#] 来源编号。",
+                        "message": f"第 {line_no} 行标注【低】但未附任何 [引用N] 来源编号。",
                         "excerpt": line[:120],
                     }
                 )
@@ -240,7 +240,7 @@ def validate_markdown(text: str, *, as_of: Optional[str | date] = None) -> Dict[
                     {
                         "code": "CONFLICT_MISSING_SIDES",
                         "line": line_no,
-                        "citations_found": sorted(f"S{c}" for c in cites_in_line),
+                        "citations_found": sorted(f"[引用{c}]" for c in cites_in_line),
                         "message": f"第 {line_no} 行标注【冲突】但引用少于 2 个（必须分别列出冲突双方来源）。",
                         "excerpt": line[:120],
                     }
@@ -285,8 +285,8 @@ def validate_markdown(text: str, *, as_of: Optional[str | date] = None) -> Dict[
                         {
                             "code": "DUPLICATE_SOURCE_DEF",
                             "line": line_no,
-                            "source_id": f"S{cid}",
-                            "message": f"Sources 中重复定义了 [S{cid}]（第 {defined_citations[cid]} 行与第 {line_no} 行）。",
+                            "source_id": f"[引用{cid}]",
+                            "message": f"## 引用 中重复定义了 [引用{cid}]（第 {defined_citations[cid]} 行与第 {line_no} 行）。",
                         }
                     )
                 defined_citations[cid] = line_no
@@ -299,7 +299,7 @@ def validate_markdown(text: str, *, as_of: Optional[str | date] = None) -> Dict[
                         if age_days > STALE_THRESHOLD_DAYS:
                             entry = {
                                 "line": line_no,
-                                "source_id": f"S{cid}",
+                                "source_id": f"[引用{cid}]",
                                 "date": matched_date_str,
                                 "resolved_date": parsed_dt.isoformat(),
                                 "as_of": report_date.isoformat(),
@@ -311,11 +311,11 @@ def validate_markdown(text: str, *, as_of: Optional[str | date] = None) -> Dict[
                                 {
                                     "code": "STALE_UNMARKED",
                                     "line": line_no,
-                                    "source_id": f"S{cid}",
+                                    "source_id": f"[引用{cid}]",
                                     "date": matched_date_str,
                                     "age_days": age_days,
                                     "message": (
-                                        f"第 {line_no} 行来源 [S{cid}] 发布日期 {matched_date_str} 距报告日期（{report_date.isoformat()}）"
+                                        f"第 {line_no} 行来源 [引用{cid}] 发布日期 {matched_date_str} 距报告日期（{report_date.isoformat()}）"
                                         f"已达 {age_days} 天（>{STALE_THRESHOLD_DAYS} 天），且条目未标注【陈旧】。"
                                     ),
                                     "excerpt": raw_line.strip()[:120],
@@ -327,8 +327,8 @@ def validate_markdown(text: str, *, as_of: Optional[str | date] = None) -> Dict[
         errors.append(
             {
                 "code": "UNDEFINED_CITATION",
-                "source_id": f"S{cid}",
-                "message": f"正文引用了 [S{cid}]，但在 ## Sources 中未找到定义。",
+                "source_id": f"[引用{cid}]",
+                "message": f"正文引用了 [引用{cid}]，但在 ## 引用 中未找到定义。",
             }
         )
 
@@ -338,8 +338,8 @@ def validate_markdown(text: str, *, as_of: Optional[str | date] = None) -> Dict[
             {
                 "code": "UNUSED_SOURCE",
                 "line": defined_citations[str(cid)],
-                "source_id": f"S{cid}",
-                "message": f"## Sources 定义了 [S{cid}]，但正文中从未引用。",
+                "source_id": f"[引用{cid}]",
+                "message": f"## 引用 定义了 [引用{cid}]，但正文中从未引用。",
             }
         )
 
@@ -406,19 +406,19 @@ def run_self_test() -> int:
 > **报告日期**：2026-10-22
 
 ## 执行摘要
-- 2026Q4 台积电 CoWoS 月产能将达 7.5 万片【高】[S1][S2][S3]。
-- B200 封装良率已在 2026Q2 爬升至 92% 以上【中】[S1][S2]。
-- 二供日月光 2026 下半年外溢订单占比预计约 15%【低：单一供应链访谈推断】[S4]。
-- 【冲突】来源 A 称某云厂 2027 ASIC 订单为“数万颗”[S2]，来源 B 称“十万颗以上”[S3]。
+- 2026Q4 台积电 CoWoS 月产能将达 7.5 万片【高】[引用1][引用2][引用3]。
+- B200 封装良率已在 2026Q2 爬升至 92% 以上【中】[引用1][引用2]。
+- 二供日月光 2026 下半年外溢订单占比预计约 15%【低：单一供应链访谈推断】[引用4]。
+- 【冲突】来源 A 称某云厂 2027 ASIC 订单为“数万颗”[引用2]，来源 B 称“十万颗以上”[引用3]。
 
 ## 对覆盖公司的含义
-- 对 NVDA 与 AVGO 的出货节奏分析【中】[S1][S3]。
+- 对 NVDA 与 AVGO 的出货节奏分析【中】[引用1][引用3]。
 
 ## 情景推演
-- 基准、乐观与悲观三档产能情景【中】[S1][S2]。
+- 基准、乐观与悲观三档产能情景【中】[引用1][引用2]。
 
 ## 风险与触发条件
-- 基板供应瓶颈与良率波动【中】[S2][S3]。
+- 基板供应瓶颈与良率波动【中】[引用2][引用3]。
 
 ## 信息缺口与局限
 - 目前缺乏数据：非台系二线封测厂 2027 年具体扩产 CapEx。
@@ -427,13 +427,13 @@ def run_self_test() -> int:
 ## 数字核验表
 | 指标 | 报告数值 | 原始来源 | 核验状态 |
 |---|---|---|---|
-| 2026Q4 CoWoS 月产能 | 7.5 万片 | 台积电 2026Q2 法说会 [S1] | PASS |
+| 2026Q4 CoWoS 月产能 | 7.5 万片 | 台积电 2026Q2 法说会 [引用1] | PASS |
 
-## Sources
-- [S1] TSMC 2026Q2 Earnings Call Transcript, 2026-07-18
-- [S2] Morgan Stanley Asia Semiconductor Deep Dive, 2026-08-05
-- [S3] Goldman Sachs AI Supply Chain Tracker, 2026-08-12
-- [S4] Supply Chain Channel Check Note, 2026-08-15
+## 引用
+[引用1]: evidence:E-20261022-01 （电话会纪要｜TSMC｜2026Q2 Earnings Call Transcript｜发布日期 2026-07-18）
+[引用2]: prov:3f6c9a12-0000-0000-0000-000000000001 （卖方研报｜Morgan Stanley｜Asia Semiconductor Deep Dive｜发布日期 2026-08-05）
+[引用3]: prov:3f6c9a12-0000-0000-0000-000000000002 （卖方研报｜Goldman Sachs｜AI Supply Chain Tracker｜发布日期 2026-08-12）
+[引用4]: prov:3f6c9a12-0000-0000-0000-000000000003 （行业渠道｜Supply Chain Channel Check Note｜发布日期 2026-08-15）
 """
     res_valid = validate_markdown(sample_valid)
     assert res_valid["passed"] is True, f"Expected sample_valid to pass, got: {res_valid}"
@@ -444,17 +444,17 @@ def run_self_test() -> int:
 > **时间范围**：近 30 天（截至 2020-01-01）
 
 ## 执行摘要
-- 2025Q4 行业渠道库存天数为 14 周，2025年12月 DRAM 现货价见底回升【高】[S1][S2][S3]。
-- 2025Q3 合约价环比持平【低：单一渠道样本】[S4]。
+- 2025Q4 行业渠道库存天数为 14 周，2025年12月 DRAM 现货价见底回升【高】[引用1][引用2][引用3]。
+- 2025Q3 合约价环比持平【低：单一渠道样本】[引用4]。
 
 ## 对覆盖公司的含义
-- 影响评估【中】[S1][S2]。
+- 影响评估【中】[引用1][引用2]。
 
 ## 情景推演
-- 三档推演【中】[S1][S2]。
+- 三档推演【中】[引用1][引用2]。
 
 ## 风险与触发条件
-- 风险监控【中】[S1][S2]。
+- 风险监控【中】[引用1][引用2]。
 
 ## 信息缺口与局限
 - 盲区检查完成。
@@ -462,13 +462,13 @@ def run_self_test() -> int:
 ## 数字核验表
 | 指标 | 报告数值 | 原始来源 | 核验状态 |
 |---|---|---|---|
-| 库存 | 14 周 | [S1] | PASS |
+| 库存 | 14 周 | [引用1] | PASS |
 
-## Sources
-- [S1] 某报告, 2025-01-01（访问日期：2026-10-22）
-- [S2] 2025年12月行业回顾（检索日期：2025-01-01, accessed: 2025-01-01, https://example.com/2025-01-01/doc）
-- [S3] 标题 | 机构 | 发布日期 2025-01-01 | URL
-- [S4] 历史底部品类统计 | 机构 | 发布日期 2025-06-01 | URL【陈旧】
+## 引用
+- [引用1] 某报告, 2025-01-01（访问日期：2026-10-22）
+- [引用2] 2025年12月行业回顾（检索日期：2025-01-01, accessed: 2025-01-01, https://example.com/2025-01-01/doc）
+- [引用3] 标题 | 机构 | 发布日期 2025-01-01 | URL
+- [引用4] 历史底部品类统计 | 机构 | 发布日期 2025-06-01 | URL【陈旧】
 """
     res_stale = validate_markdown(sample_stale, as_of="2026-10-22")
     assert res_stale["as_of"] == "2026-10-22", (
@@ -476,7 +476,7 @@ def run_self_test() -> int:
     )
     assert res_stale["passed"] is True, f"Stale unmarked should emit warning, not error: {res_stale['errors']}"
     stale_sources = [(item["source_id"], item["date"]) for item in res_stale["stale_unmarked"]]
-    assert stale_sources == [("S3", "2025-01-01")], (
+    assert stale_sources == [("[引用3]", "2025-01-01")], (
         f"Unexpected stale_unmarked sources: {stale_sources}"
     )
     warn_codes = {w["code"] for w in res_stale["warnings"]}
@@ -484,13 +484,13 @@ def run_self_test() -> int:
 
     sample_invalid = """# 专题草稿
 ## 执行摘要
-- 只有两个引用却标高【高】[S1][S2]。
-- 只有一个引用却标中【中】[S1]。
-- 引用了未定义的来源【中】[S1][S99]。
+- 只有两个引用却标高【高】[引用1][引用2]。
+- 只有一个引用却标中【中】[引用1]。
+- 引用了未定义的来源【中】[引用1][引用99]。
 
-## Sources
-- [S1] Source 1
-- [S2] Source 2
+## 引用
+- [引用1] Source 1
+- [引用2] Source 2
 """
     res_invalid = validate_markdown(sample_invalid)
     assert res_invalid["passed"] is False, "Expected sample_invalid to fail"
