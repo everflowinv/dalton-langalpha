@@ -16,7 +16,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 
 - **只认公司官方来源**：仅公司 IR 新闻稿、IR Events 页面、美股 SEC 8-K/6-K 或港股/A 股交易所法定排期公告（通过 `researchdata.finance(route="cn-hk", operation="filings", ...)` 或披露易 HKEXnews 原文核实的董事会会议召期通告、定期报告预约披露时间表）明确披露未来发布日期时，才标为 `confirmed`（`date_status: confirmed`）并创建财报链自动任务。
 - **聚合日历一律标“待确认”**：FMP、yfinance、Nasdaq、Zacks、Earnings Whispers、WSJ、MarketWatch、`get_earnings_calendar` 等给出的日期只记为 `pending`（附 `tentative_date`、`tentative_sources`），`date_status: estimated`，界面与总结显示“待确认”，**在官方公布前绝不建 `tm3/t0/tp1` 自动任务**（若 `tentative_date` 在 10 天内，只建一条 T-5 的 `once` 日期复查任务，仅复查日期不做研究）。详见 [`references/classification.md`](references/classification.md)。
-- **跨工作区建任务走 REST helper**：Home 的研究总监不跨工作区直接写自动任务文件，统一调用后端 REST helper `PUT /api/v1/dalton/automations/{name}` 创建或原地改期；分析师在本公司工作区补建时可直接写文件（常设授权）。
+- **跨工作区建任务统一调用 `dalton_schedule_automation`**：Home 的研究总监调用 `dalton_schedule_automation(action="upsert", name=..., trigger_type="once", next_run_at=..., instruction=..., description=..., timezone_name=..., workspace_id=..., ticker=...)` 创建或原地改期；分析师在本公司工作区补建时可直接写文件或调用该工具（常设授权）。标准四项自动跟踪（含 `move-up` / `move-down` 价格触发）在自动维护路径统一调用 `dalton_coverage_tracking(action="enable", source="coverage_finish", ticker=..., workspace_id=...)` 开启与补建（`source="coverage_finish"` 会尊重 `paused_by_user` 标记，不会重新打开用户主动暂停的跟踪和财报任务；仅当用户明确要求恢复跟踪时才传 `source="user"`）。
 - **无工作区不建链**：只为 `workspace.status=active` 的公司创建自动任务链；没有工作区的 Core 公司列入总结“缺工作区”，严禁在 Home 工作区跑出无知识层支撑的前瞻。
 
 ---
@@ -127,7 +127,7 @@ python3 .agents/skills/dalton-earnings-calendar/scripts/calendar_state.py --json
    ```
    - `recorded: true` 且日期未变 → 跳过建任务，仅确认议程已同步。
    - `date_changed: true`（已确认日期发生变更）：
-     - 若三条 `once` 自动任务尚未执行，调 `PUT /api/v1/dalton/automations/{name}` **原地修改**它们的 `next_run_at`（严禁先删后建导致空窗），并在台账 `history` 记一条改期原因；
+     - 若三条 `once` 自动任务尚未执行，调用 `dalton_schedule_automation(action="upsert", name=..., trigger_type="once", next_run_at=..., workspace_id=..., ticker=...)` **原地修改**它们的 `next_run_at`（保持连续生效），并在台账 `history` 记一条改期原因；
      - 若某条 `once` 已经执行完毕（`file.py` 禁止修改已完成的 `once` 任务），只为尚未执行的剩余窗口写入新自动任务文件。
 2. **计算触发时间（官方 `confirmed` 且 `workspace.status=active`）**：
    - **前瞻（`tm3`）**：用 `trading_days.py` 计算发布日前 3 个交易日，设为当天市场时区 `08:00`（带 UTC 偏移）：
@@ -146,11 +146,11 @@ python3 .agents/skills/dalton-earnings-calendar/scripts/calendar_state.py --json
    - **按 Tier 建链**：
      - `Core`（`workspace.status=active`）：建 `["tm3", "t0", "tp1"]` 三条；若无工作区，不建任务，记入“缺工作区”。
      - `Watch`（`workspace.status=active`）：默认只建 `["t0"]` 快讯一条（`chain_by_tier: {"core": ["tm3","t0","tp1"], "watch": ["t0"]}`）。
-3. **调用 REST Helper 写入自动任务**：
-   向 `PUT /api/v1/dalton/automations/{name}` 发送 JSON 请求体（模板见下节；`<t>` 为小写 ticker、`.` 换 `-`，`<period>` 为小写财季如 `fy26q3`）。
+3. **调用 `dalton_schedule_automation` 写入自动任务**：
+   调用 `dalton_schedule_automation(action="upsert", name="dalton-<t>-earn-<period>-<tm3|t0|tp1>", trigger_type="once", next_run_at=..., instruction=..., description=..., timezone_name=..., workspace_id=..., ticker=...)` 创建或更新自动任务（模板见下节；`<t>` 为小写 ticker、`.` 换 `-`，`<period>` 为小写财季如 `fy26q3`）。
 4. **候选日期（`pending` + `tentative_date`）处理**：
    - 不建 `tm3/t0/tp1`；
-   - 若 `tentative_date` 距今天 ≤ 10 天，经 REST helper 建一条 T-5 的 `once` 复查任务 `dalton-<t>-earn-<period>-recheck.json`（仅复查官方是否公布日期，不做前瞻研究）。
+   - 若 `tentative_date` 距今天 ≤ 10 天，调用 `dalton_schedule_automation(action="upsert", name="dalton-<t>-earn-<period>-recheck", trigger_type="once", ...)` 建一条 T-5 的 `once` 复查任务 `dalton-<t>-earn-<period>-recheck.json`（仅复查官方是否公布日期，不做前瞻研究）。
 5. **更新台账（Mark）**：
    ```bash
    python3 .agents/skills/dalton-earnings-calendar/scripts/calendar_state.py --json mark \
@@ -202,6 +202,8 @@ python3 .agents/skills/dalton-earnings-calendar/scripts/calendar_state.py --json
 
 ## 自动任务 JSON 模板（遵守 PK.15）
 
+> 推送由 Dalton 通知模块按用户的飞书开关统一处理，自动任务模板中不写 `"delivery"` 字段；公司价格触发任务在自动维护时统一由 `dalton_coverage_tracking(action="enable", source="coverage_finish", ticker=..., workspace_id=...)` 管理（仅在用户明确要求恢复跟踪时传 `source="user"`）。
+
 ### 1. 每周日历维护（`dalton-earnings-calendar.json`，Home 工作区）
 
 ```json
@@ -211,7 +213,7 @@ python3 .agents/skills/dalton-earnings-calendar/scripts/calendar_state.py --json
   "trigger_type": "cron",
   "cron_expression": "0 9 * * 6",
   "timezone": "Asia/Shanghai",
-  "instruction": "/dalton-earnings-calendar 全名单 —— 按 skill 流程滚动、扫描（只认官方来源，候选日期标待确认）、经 PUT /api/v1/dalton/automations/{name} 建/改 tm3/t0/tp1 自动任务、用 dalton_watch_event 同步各公司 watch.events、对账，按固定顺序总结后调用 dalton_resolve_signals(probe=\"calendar\", ...) 关闭本周唤醒信号。",
+  "instruction": "/dalton-earnings-calendar 全名单 —— 按 skill 流程滚动、扫描（只认官方来源，候选日期标待确认）、用 dalton_schedule_automation(action=\"upsert\", ...) 建/改 tm3/t0/tp1 自动任务、用 dalton_watch_event 同步各公司 watch.events、对账，按固定顺序总结后调用 dalton_resolve_signals(probe=\"calendar\", ...) 关闭本周唤醒信号。",
   "workspace_id": "home",
   "thread": "new"
 }
@@ -243,8 +245,7 @@ python3 .agents/skills/dalton-earnings-calendar/scripts/calendar_state.py --json
   "timezone": "America/New_York",
   "instruction": "/dalton-earnings-flash META FY26Q3 发布时间 2026-10-28 16:05 ET。先读 .agents/skills/dalton-earnings-flash/SKILL.md。前瞻稿与 predictions.json 在 drafts/、research/ 下最新的 preview-FY26Q3。",
   "workspace_id": "<META 工作区 id>",
-  "thread": "new",
-  "delivery": ["<PM 的通知渠道，按工作区配置>"]
+  "thread": "new"
 }
 ```
 
@@ -259,7 +260,6 @@ python3 .agents/skills/dalton-earnings-calendar/scripts/calendar_state.py --json
   "timezone": "America/New_York",
   "instruction": "/dalton-earnings-deep META FY26Q3 发布日 2026-10-28。跑 earnings-deep-update workflow（模型：data/models.json 登记的当前版本；前瞻预测：research/ 下 preview-FY26Q3/predictions.json），结束后按 knowledge-revision.json 写知识层。",
   "workspace_id": "<META 工作区 id>",
-  "thread": "new",
-  "delivery": ["<PM 的通知渠道>"]
+  "thread": "new"
 }
 ```

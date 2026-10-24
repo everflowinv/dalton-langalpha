@@ -1,6 +1,6 @@
 # 支线 A：行业与竞争（`branch-a-industry.md`）
 
-本支线输出 `research/<D>-fc/ea.md`，引用前缀为 `[A-1]`…`[A-n]`。重点服务 **Q1、Q2、Q6、Q8、Q11、Q12**（具体以 `research/<D>-fc/questions.md` 分工为准）。动手前必读 `references/branch-common.md`。
+本支线输出 `research/<D>-fc/ea.md`，正文引用统一使用 `[引用1]`…`[引用N]`，与文末 `## 引用` 节一一对应。重点服务 **Q1、Q2、Q6、Q8、Q11、Q12**（具体以 `research/<D>-fc/questions.md` 分工为准）。动手前必读 `references/branch-common.md`。
 
 ---
 
@@ -50,5 +50,5 @@
 ### A7. 逐题证据小结与缺口
 - 按 `references/branch-common.md` 第四节格式，汇总 Q1、Q2、Q6、Q8、Q11、Q12 的支持证据、最强反证与未决缺口。
 
-### A8. 引用清单与完成标记
-- 按 `[A-1]`…`[A-n]` 顺序列出全部引用，末行写 `<!-- 完成 -->`。
+### A8. 引用与完成标记
+- 在文末 `## 引用` 节按 `[引用1]`…`[引用N]` 顺序列出全部引用（与正文一一对应），末行写 `<!-- 完成 -->`。

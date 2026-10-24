@@ -22,7 +22,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 2. **深度链 workflow**：
    - **默认（`earnings-deep-update` workflow）**：当由 PS.7 创建的 `tp1` 自动任务触发（T+1 交易日 20:00，此时卖方财报后报告已基本到齐）或用户要求完整财报后更新时，调用 `RunWorkflow(workflow="earnings-deep-update", params={...})`。
    - **Workflow 不可用时**：
-     - **`workflow.enabled` 已关闭**（工具列表本来就不会有 `RunWorkflow`）：主智能体按本 skill 下述四个阶段的顺序手动执行，并逐阶段核对产物。阶段 3 派 `dalton-reviewer` 审最终稿后，把它返回的 JSON（含 `verdict` 与 `draft_sha256`）原样保存到 `research/<D>-deep-<quarter>/review.json`（多轮复审时保存最后一轮；改稿后必须重审并覆盖）；收尾调用 `dalton_check_done` 时在 `params` 里加 `"manual": true`、不传 `run_id`，审稿据此文件核对。语言审查两轮（顺序不可颠倒，与 workflow 相同）：成稿后先调用 `check_language(draft_path=<草稿>, round=1)` 并按 `<草稿>.language.md` 清单修改（只改语言，不动事实、数字、术语、引用编号与判断强度），再派 `dalton-reviewer` 首次审稿；修订循环结束、终稿内容定稿后调用 `check_language(round=2)` 按清单完成终稿语言修改，草稿有改动就再调用一次 `check_language(round=2)` 对终稿复核，然后做最后一次审稿（pass 的 JSON 存 review.json）与 `check_draft`；第一次审稿就 pass 时：第 2 轮照常执行；改了稿就补一次终稿审稿（pass 的 JSON 覆盖存 review.json），哈希未变则无需重审。本次产出中其他给人读的 .md 笔记（research/ 支线、背景、快讯、异动、公告点评、专题章节等）同样各审两轮：第 1 轮审完按清单改，第 2 轮复核，改过就再跑一次 round=2 确认；json/xlsx 等机器文件、bg_data/、data/、lenses_work/、model_dump/、知识层渲染文件与 .audit/.annotated/.language 侧车不审。
+     - **`workflow.enabled` 已关闭**（工具列表本来就不会有 `RunWorkflow`）：主智能体按本 skill 下述四个阶段的顺序手动执行，并逐阶段核对产物。阶段 3 派 `dalton-reviewer` 审稿按三步执行：（1）主智能体先计算草稿的 sha256（`sha256sum drafts/<D>-deep-<quarter>.md` 或等价的 Python `hashlib.sha256`）；（2）把该哈希写进派给 `dalton-reviewer` 的提示词；（3）要求审稿人在返回的 JSON 里原样回填 `draft_sha256`，并将返回的 JSON（含 `verdict` 与 `draft_sha256`）原样保存到 `research/<D>-deep-<quarter>/review.json`（多轮复审时保存最后一轮；改稿后重新计算哈希、重审并覆盖）。收尾调用 `dalton_check_done(workflow="earnings-deep-update", params={"ticker": "<TICKER>", "quarter": "<quarter>", "workspace_dir": "<当前工作区路径>", "release_date": "<D>", "model_path": "<模型路径或 null>", "manual": true})`（不传 `run_id`；有模型时 `model_path` 传实际路径如 `"model/META-model-v01.xlsx"`，没有模型时传 `null`），审稿据此文件核对。语言审查两轮（顺序不可颠倒，与 workflow 相同）：成稿后先调用 `check_language(draft_path=<草稿>, round=1)` 并按 `<草稿>.language.md` 清单修改（只改语言，不动事实、数字、术语、引用编号与判断强度），再派 `dalton-reviewer` 首次审稿；修订循环结束、终稿内容定稿后调用 `check_language(round=2)` 按清单完成终稿语言修改，草稿有改动就再调用一次 `check_language(round=2)` 对终稿复核，然后做最后一次审稿（pass 的 JSON 存 review.json）与 `check_draft`；第一次审稿就 pass 时：第 2 轮照常执行；改了稿就补一次终稿审稿（pass 的 JSON 覆盖存 review.json），哈希未变则无需重审。本次产出中其他给人读的 .md 笔记（research/ 支线、背景、快讯、异动、公告点评、专题章节等）同样各审两轮：第 1 轮审完按清单改，第 2 轮复核，改过就再跑一次 round=2 确认；json/xlsx 等机器文件、bg_data/、data/、lenses_work/、model_dump/、知识层渲染文件与 .audit/.annotated/.language 侧车不审。
      - **否则**（`workflow.enabled` 未关闭）：`RunWorkflow` 不在工具列表时，先用 **Read 工具**（不要用 Bash `cat`）读 `.agents/skills/run-workflow/SKILL.md` 后重试；仍没有就停下，告诉 PM「RunWorkflow 不可用」，不要自行手动派发 Task 子智能体代跑。
 
 ---
@@ -30,7 +30,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 ## 开始前：检查未完成的 run（中断续跑）
 
 - 读 `research/<D>-deep-<quarter>/.progress.json`（及 `research/` 下其他 `*/.progress.json`），看是否有本 workflow 的 `status` 不是终态（`completed`/`failed`/`cancelled`）的 run。
-- 有未完成的 run 时不要新开 run：用**原参数**调用 `RunWorkflow(workflow="earnings-deep-update", params={...原参数..., "progress_path": "research/<D>-deep-<quarter>/.progress.json"}, resume="<.progress.json 里的 run_id>")` 续跑；label、prompt 哈希与产物哈希都一致的已完派发会直接复用，不重复派子任务。
+- 有未完成的 run 时不要新开 run：用**原参数**调用 `RunWorkflow(workflow="earnings-deep-update", params={...原参数..., "progress_path": "research/<D>-deep-<quarter>/.progress.json"}, resume="<.progress.json 里的 run_id>")` 续跑；label、prompt 哈希与产物哈希都一致的已完派发会直接复用，不重复派子任务。若前一次 run 因审稿 `block` 等原因提前停止，补齐问题后同样用**原参数**加 `resume` 重跑（workflow 返回值里已提供 `resume_hint`）。
 - 全新启动时也在 `params` 里带上 `"progress_path": "research/<D>-deep-<quarter>/.progress.json"`，让中断后的 run 可被发现与续跑。
 
 ## Step 1：组装参数并启动 `earnings-deep-update` Workflow
@@ -76,9 +76,9 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 
 ### 阶段 2：前瞻对账与 Thesis 财报后校准
 
-严格按 [`references/calibration.md`](references/calibration.md) 产出三份校准文件，并将核心表格合入 `drafts/<D>-deep-<quarter>.md` 末尾的“前瞻对账”与“thesis 校准”章节：
+严格按 [`references/calibration.md`](references/calibration.md) 产出校准文件，并将核心表格合入 `drafts/<D>-deep-<quarter>.md` 末尾的“前瞻对账”与“thesis 校准”章节：
 
-1. **前瞻逐条对账（`reconcile.md`）**：
+1. **前瞻逐条对账（`reconcile.md` 与 `reconcile.json`）**：
    - 运行 `scripts/reconcile.py` 对 `predictions.json` 的全部条目逐条比对实际结果：
      ```bash
      python3 .agents/skills/dalton-earnings-deep/scripts/reconcile.py \
@@ -86,7 +86,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
        --actuals research/<D>-deep-<quarter>/actuals.json \
        --output research/<D>-deep-<quarter>/reconcile.md
      ```
-   - 每条预测明确判定 **`对` / `错` / `部分`**，凡判为“错”或“部分”的必须写明具体错因（`数据错` / `模型错` / `判断错` / `意外事件`）并生成 `lessons` 候选；若无前瞻预测文件，在 `reconcile.md` 与报告中明确说明“本次财报前无 predictions.json，跳过前瞻对账”。
+   - 每条预测明确判定 **`对` / `错` / `部分`**，凡判为“错”或“部分”的写明具体错因（`数据错` / `模型错` / `判断错` / `意外事件`）并生成 `lessons` 候选；同时将错判与部分命中的计数写入 `research/<D>-deep-<quarter>/reconcile.json`（格式为 `{"wrong": <错的条数>, "partial": <部分的条数>}`）。若本次财报前无 `predictions.json`，在 `reconcile.md` 与报告中说明“本次财报前无 predictions.json，跳过前瞻对账”，并将 `research/<D>-deep-<quarter>/reconcile.json` 写为 `{"wrong": 0, "partial": 0}`。
 2. **Thesis 财报后校准（`thesis-calibration.md`）**：
    - 先读 `.agents/skills/thesis-tracker/SKILL.md`（`post-earnings` 模式），先拆解盈利质量（税率/回购带来的 EPS beat 不得将经营支柱判为 confirming），再对 `thesis.md` 每个支柱给出信号词（`strongly confirming` … `invalidating` / `untested`）与状态词（`strengthening` / `intact` / `watch` / `impaired` / `broken` / `changed` / `untested` / `retired`），并逐一排查五种漂移模式（有/无）。
 3. **管理层指引兑现记录更新（`management-delta.md`）**：
@@ -94,7 +94,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 
 ### 阶段 3：草稿期审稿与生成 `knowledge-revision.json`
 
-1. **草稿期审稿（`dalton-reviewer`）**：审阅 `drafts/<D>-deep-<quarter>.md` 及 `research/<D>-deep-<quarter>/` 下的对账与校准文件（核查 beat/miss 口径、“综合判断”是否有独立判断、thesis 信号是否被股价涨跌替代、对账是否诚实面对错判）。
+1. **草稿期审稿（`dalton-reviewer`）**：审阅 `drafts/<D>-deep-<quarter>.md` 及 `research/<D>-deep-<quarter>/` 下的对账与校准文件（核查 beat/miss 口径、“综合判断”是否有独立判断、thesis 信号是否被股价涨跌替代、对账是否诚实面对错判，以及“`## 引用` 表存在且每个 `[引用N]` 都能在表里找到”）。手动路径下先计算草稿 `sha256` 写进审稿提示词，要求审稿人原样回填 `draft_sha256`，将返回的 JSON 存为 `research/<D>-deep-<quarter>/review.json`。
 2. **生成知识层修订草案**：汇总全部产出与审稿意见，按 PK.2 Schema 生成 `research/<D>-deep-<quarter>/knowledge-revision.json`。
 
 ---
@@ -104,7 +104,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 Workflow 结束后（或独立模式完成后），由当前主智能体读取 `research/<D>-deep-<quarter>/knowledge-revision.json`，执行以下收尾动作（深度链通常在无人值守自动运行，**只修改知识层工作版本，不动 `thesis.official`**）：
 
 1. **调用 `knowledge_update` 逐项更新知识层**：
-   - `doc="thesis"`：更新各支柱信号、状态与新证据行（注意：若草稿期审稿缺席 `review_done == false`，非 `NO_CHANGE` 结论注明“待审”，暂不直接下调核心支柱状态）；
+   - `doc="thesis"`：先写证据台账再定稿——更新各支柱信号、状态与新证据行（每条 `evidence` 必填 `figures` 数组，每项含 `metric`〔中文或英文指标名〕、`value`、`unit`〔枚举值 `"USD"` / `"USD_mn"` / `"USD_bn"` / `"HKD"` / `"HKD_mn"` / `"HKD_bn"` / `"CNY"` / `"CNY_mn"` / `"CNY_bn"` / `"CNY_100mn"` / `"pct"` / `"bp"` / `"x"` / `"count"` / `"count_mn"` / `"per_share"` / `"other"`，百分比用 `"pct"`〕、`period`、`label`〔仅限 `"reported"` / `"company_guidance"` / `"consensus"` / `"estimate"` / `"assumption"` / `"research_judgement"`〕，且 `source.ref` 指向一手文件或 `prov`，严禁指向本次草稿；若草稿期审稿缺席 `review_done == false`，非 `NO_CHANGE` 结论注明“待审”，暂不直接下调核心支柱状态）；
    - `doc="debate"`：更新本次财报验证后的多空分歧状态；
    - `doc="drivers"`：追加当季核心财务与经营 KPI 最新实际读数；
    - `doc="management"`：补填 `guidance_history[].actual` 与 `outcome`；若连续两季同类指标同向偏差，更新 `guidance_style` / `credibility_notes`；
@@ -115,12 +115,12 @@ Workflow 结束后（或独立模式完成后），由当前主智能体读取 `
    - 在 `agenda_ops` 中写入下一季需要跟踪验证的事项；
    - **重大异常升级（PM Escalation）**：若终判为 `THESIS_BROKEN` 或任一核心支柱状态变为 `impaired` / `broken`，必须立即通过通知渠道推送 PM，并在 `agenda_ops` 中写入一条 `pm_handoffs`（PK.14）。
 3. **草稿核验（`check_draft`）**：
-   - 末尾必须附引用表：在报告末尾的 `## 引用` 一节按每行一条写出对应关系（形如 `[引用1]: evidence:E-20261023-01` 或 `[引用3]: model:model/META-model-v01.xlsx!DCF!C12`）；
+   - 末尾合并为单一 `## 引用` 节：确认报告末尾的 `## 引用` 表存在且每个 `[引用N]` 都能在表里找到（每行一条写出核验目标与括号内来源说明，形如 `[引用1]: evidence:E-20261023-01 （法定财报｜SEC 10-Q｜3Q26 季报｜2026-10-28｜accession ...）` 或 `[引用5]: model:model/META-model-v01.xlsx!DCF!C12 （本方模型｜DCF 估值页）`）；
    - 调用 `check_draft` 生成数字核验报告 `drafts/<D>-deep-<quarter>.audit.md`；
 4. **汇报完成前必须过完成契约（`dalton_check_done`）**：
-   - 调用 `dalton_check_done(workflow="earnings-deep-update", run_id=<`research/<D>-deep-<quarter>/.progress.json` 里的 run_id>, params={<启动时的同一组参数，release_date 即 <D>，含 quarter>})`；
-   - 走手动降级路径（`workflow.enabled` 已关闭、没有 run）时不传 `run_id`，`params` 里加 `"manual": true`，审稿结论按 `research/<D>-deep-<quarter>/review.json` 核对；
+   - 调用 `dalton_check_done(workflow="earnings-deep-update", run_id=<`research/<D>-deep-<quarter>/.progress.json` 里的 run_id>, params={"ticker": "<TICKER>", "quarter": "<quarter>", "workspace_dir": "<当前工作区路径>", "release_date": "<D>", "model_path": "<模型路径或 null>"})`（与启动时的参数一致；有模型时 `model_path` 传实际路径如 `"model/META-model-v01.xlsx"`，没有模型时传 `null`）；
+   - 走手动降级路径（`workflow.enabled` 已关闭、没有 run）时不传 `run_id`，调用 `dalton_check_done(workflow="earnings-deep-update", params={"ticker": "<TICKER>", "quarter": "<quarter>", "workspace_dir": "<当前工作区路径>", "release_date": "<D>", "model_path": "<模型路径或 null>", "manual": true})`（有模型时 `model_path` 传实际路径，没有模型时传 `null`），审稿结论按 `research/<D>-deep-<quarter>/review.json` 核对；
    - `done=false` 时按 `missing` 先补齐再查（缺文件补文件、知识层缺 source=tool 新版本就 `knowledge_update`、check_draft 用了旧草稿就对最终稿重跑），补不了的缺项只能汇报"未完成"并列出缺项与原因，不得汇报"完成"。
 5. **发布/推送（完成契约通过后）**：
-   - 当 PM 要求正式发布时，调用 `publish_report(draft_path="drafts/<D>-deep-<quarter>.md", kind="earnings_review", attachments=[新模型路径])`；
+   - 当 PM 要求正式发布时，调用 `publish_report(draft_path="drafts/<D>-deep-<quarter>.md", title="<公司名>（<TICKER>）<quarter> 财报深度点评", kind="earnings_review", slug="<ticker-lower>-deep-<quarter-lower>-<D>", attachments=[{"path": "model/<TICKER>-model-v<NN>.xlsx", "role": "model"}])`（无模型时 `attachments` 传 `[]`）；
    - 将深度报告核心结论、前瞻对账得分、模型变动及 thesis 校准摘要推送给 PM。

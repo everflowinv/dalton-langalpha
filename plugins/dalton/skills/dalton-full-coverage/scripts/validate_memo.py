@@ -19,8 +19,14 @@ PERIOD_HINT = re.compile(
     r"(FY\d{2,4}|\d{4}\s*年|[1-4]Q\d{2}|Q[1-4]\s*\d{2,4}|\d{4}Q[1-4]|1H\d{2}|2H\d{2}|"
     r"\d{4}-\d{2}|截至|过去 ?12 ?个月|TTM|最近一个季度)"
 )
-CITE = re.compile(r"\[([ABCD])-(\d+)\]")
+CITE = re.compile(r"\[(引用\d+|[ABCD]-\d+)\]")
 KINDS = ("a", "b", "c", "d")
+
+
+def _cite_sort_key(cid: str) -> tuple[int, int | str]:
+    if cid.startswith("引用") and cid[2:].isdigit():
+        return (0, int(cid[2:]))
+    return (1, cid)
 
 
 def check_thesis_and_risk_citations(text: str) -> list:
@@ -46,33 +52,33 @@ def check_thesis_and_risk_citations(text: str) -> list:
         if not body:
             fails.append(f"{label} 章节无实质列表或表格数据行")
         elif len(bad) > len(body) * 0.3:
-            fails.append(f"{label} 有 {len(bad)}/{len(body)} 行（>30%）没有 [A-n]..[D-n] 引用标记，例：{bad[0]}")
+            fails.append(f"{label} 有 {len(bad)}/{len(body)} 行（>30%）没有 [引用N] 引用标记，例：{bad[0]}")
     return fails
 
 
 def check_citation_closure(text: str) -> tuple[set, list, list]:
     fails, warns = [], []
     listed = set()
-    mlist = re.search(r"^#{2,6}\s*.*引用清单.*$", text, flags=re.M)
-    used = {f"{a}-{b}" for a, b in CITE.findall(text[:mlist.start()] if mlist else text)}
+    mlist = re.search(r"^#{2,6}\s*(?:引用|.*引用清单.*)\s*$", text, flags=re.M)
+    used = set(CITE.findall(text[:mlist.start()] if mlist else text))
     if not mlist:
-        fails.append("没有 `## 引用清单` 章节")
+        fails.append("没有 `## 引用` 章节")
     else:
         tail = text[mlist.end():]
-        for a, b in CITE.findall(tail):
-            listed.add(f"{a}-{b}")
+        for cid in CITE.findall(tail):
+            listed.add(cid)
         for line in tail.splitlines():
-            m2 = re.match(r"^\s*[-*]?\s*\[?([ABCD])-(\d+)\]?[.．、:：\s]", line)
+            m2 = re.match(r"^\s*[-*]?\s*\[?(引用\d+|[ABCD]-\d+)\]?[.．、:：\s]", line)
             if m2:
-                listed.add(f"{m2.group(1)}-{m2.group(2)}")
-        orphan = sorted(used - listed)
-        unused = sorted(listed - used)
+                listed.add(m2.group(1))
+        orphan = sorted(used - listed, key=_cite_sort_key)
+        unused = sorted(listed - used, key=_cite_sort_key)
         if orphan:
-            fails.append(f"正文引用在引用清单里找不到：{', '.join(orphan[:12])}")
+            fails.append(f"正文引用在 `## 引用` 里找不到：{', '.join(orphan[:12])}")
         if unused:
-            warns.append(f"引用清单里有未被正文引用的条目：{', '.join(unused[:12])}")
+            warns.append(f"`## 引用` 里有未被正文引用的条目：{', '.join(unused[:12])}")
     if not used:
-        fails.append("正文没有任何 [A-n]/[B-n]/[C-n]/[D-n] 引用标记")
+        fails.append("正文没有任何 [引用N] 引用标记")
     return used, fails, warns
 
 
@@ -108,8 +114,8 @@ def validate_memo_text(
     if effective_part >= 2:
         fails.extend(check_thesis_and_risk_citations(text))
 
-    # 4. 第三段 / 完整模式：检查附录、引用清单闭环、底表覆盖与支线完成标记
-    used_cites = {f"{a}-{b}" for a, b in CITE.findall(text)}
+    # 4. 第三段 / 完整模式：检查附录、`## 引用` 闭环、底表覆盖与支线完成标记
+    used_cites = set(CITE.findall(text))
     ledger_count = 0
     if effective_part == 3:
         if not any(t.startswith("附录") for t in h2_titles):
@@ -119,7 +125,7 @@ def validate_memo_text(
         warns.extend(c_warns)
     else:
         if not used_cites:
-            fails.append("当前段落没有任何 [A-n]/[B-n]/[C-n]/[D-n] 引用标记")
+            fails.append("当前段落没有任何 [引用N] 引用标记")
 
     if facts_path is not None and facts_path.exists():
         ledger = parse_ledger(facts_path.read_text(encoding="utf-8"))
