@@ -186,8 +186,8 @@ async def fetch_sector_performance(
 
 """
 
-        # Protocol path — passes date through to FMP's date-aware endpoint;
-        # yfinance ignores `target_date` and always returns today's snapshot.
+        # DALTON-HOOK(market-data-fallback): passes date through to FMP's
+        # date-aware endpoint; calls with target_date do not fall back to yfinance.
         if provider.financial is not None:
             try:
                 results = await provider.financial.get_sector_performance(

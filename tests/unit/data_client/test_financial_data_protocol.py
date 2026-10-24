@@ -377,6 +377,8 @@ class TestGetFinancialDataProviderFactory:
 
         with (
             patch("src.data_client.registry._fmp_available", return_value=True),
+            # DALTON-HOOK(market-data-fallback): without yfinance FMP is the bare default.
+            patch("src.data_client.registry._yfinance_available", return_value=False),
             patch("src.data_client.registry._ginlix_data_available", return_value=True),
             patch("src.data_client.fmp.get_fmp_client", return_value=mock_fmp_client),
             patch("src.data_client.fmp.financial_source.FMPFinancialSource") as MockFMP,
@@ -444,6 +446,8 @@ class TestGetFinancialDataProviderFactory:
 
         with (
             patch("src.data_client.registry._fmp_available", return_value=True),
+            # DALTON-HOOK(market-data-fallback): without yfinance FMP is the bare default.
+            patch("src.data_client.registry._yfinance_available", return_value=False),
             patch("src.data_client.registry._ginlix_data_available", return_value=True),
             patch("src.data_client.fmp.get_fmp_client", return_value=mock_fmp_client),
             patch("src.data_client.fmp.financial_source.FMPFinancialSource") as MockFMP,

@@ -391,7 +391,9 @@ def _get_analyst_price_targets(symbol: str) -> list[dict[str, Any]]:
                 "targetLow": _clean_value(targets.get("low")),
                 "targetMean": _clean_value(targets.get("mean")),
                 "targetMedian": _clean_value(targets.get("median")),
-                "targetConsensus": _clean_value(targets.get("current")),
+                # DALTON-HOOK(market-data-fallback): FMP's targetConsensus is the
+                # average price target (Yahoo's "mean"), not the current stock price.
+                "targetConsensus": _clean_value(targets.get("mean")),
             }
         ]
     return []
@@ -535,11 +537,16 @@ def _screen_stocks_sync(**filters: Any) -> list[dict[str, Any]]:
 
 
 def _search_stocks(query: str, limit: int) -> list[dict[str, Any]]:
-    try:
-        results = yf.Search(query, max_results=limit)
-        quotes = results.quotes if hasattr(results, "quotes") else []
-    except Exception:
-        return []
+    # DALTON-HOOK(market-data-fallback): let a Yahoo failure raise so the
+    # search endpoint returns an error instead of caching [] as "no match".
+    # yfinance 1.7.0 swallows JSONDecodeError into response={} when
+    # hide_exceptions is True, so require a dict response carrying "quotes".
+    results = yf.Search(query, max_results=limit)
+    quotes = results.quotes if hasattr(results, "quotes") else []
+    if not quotes:
+        response = getattr(results, "response", None)
+        if not isinstance(response, dict) or "quotes" not in response:
+            raise ValueError("Yahoo Finance search returned an invalid response")
     out: list[dict[str, Any]] = []
     for q in quotes[:limit]:
         out.append({
@@ -599,8 +606,12 @@ class YFinanceFinancialSource:
     async def get_sector_performance(
         self, target_date: str | None = None
     ) -> list[dict[str, Any]]:
-        # yfinance has no date-aware sector endpoint; we always return today's snapshot.
-        del target_date
+        # DALTON-HOOK(market-data-fallback): yfinance has no date-aware sector
+        # endpoint; refuse a dated query rather than serving today's snapshot.
+        if target_date:
+            raise ValueError(
+                f"Historical sector performance for {target_date} is not available via yfinance"
+            )
         tasks = [
             asyncio.to_thread(_get_single_sector_perf, name, etf)
             for name, etf in _SECTOR_ETFS.items()

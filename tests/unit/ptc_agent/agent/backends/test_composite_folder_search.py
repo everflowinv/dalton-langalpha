@@ -184,6 +184,17 @@ def store() -> InMemoryStore:
     return InMemoryStore()
 
 
+# DALTON-HOOK(hermetic-prebuilt-workflows): the shipped tier is read from the
+# repo's ``workflows/`` at cwd, which the fork fills; these tests pin the
+# user tier's ``brief.js`` as the folder's only workflow, so ship none.
+@pytest.fixture(autouse=True)
+def _no_shipped_workflows(monkeypatch):
+    monkeypatch.setattr(
+        "ptc_agent.agent.filesystem_routes.get_prebuilt_workflows",
+        lambda: SimpleNamespace(files=dict),
+    )
+
+
 def _composite(sandbox, store, folder_name: str | None, root: str = ROOT):
     """Every route mounted over ``sandbox``, the turn's folder being
     ``folder_name`` under the computer root, or the root itself for None."""
