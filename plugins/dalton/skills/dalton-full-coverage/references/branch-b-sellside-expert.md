@@ -1,6 +1,6 @@
 # 支线 B：卖方、内部认知与专家访谈（`branch-b-sellside-expert.md`）
 
-本支线输出 `research/<D>-fc/eb.md`，引用前缀为 `[B-1]`…`[B-n]`。重点服务 **Q3、Q4、Q5、Q7、Q8、Q9、Q10、Q12**（具体以 `research/<D>-fc/questions.md` 分工为准）。动手前必读 `references/branch-common.md`。
+本支线输出 `research/<D>-fc/eb.md`，正文引用统一使用 `[引用1]`…`[引用N]`，与文末 `## 引用` 节一一对应。重点服务 **Q3、Q4、Q5、Q7、Q8、Q9、Q10、Q12**（具体以 `research/<D>-fc/questions.md` 分工为准）。动手前必读 `references/branch-common.md`。
 
 ---
 
@@ -43,5 +43,5 @@
 ### B6. 逐题证据小结与缺口
 - 按 `references/branch-common.md` 第四节格式，汇总 Q3、Q4、Q5、Q7、Q8、Q9、Q10、Q12 的支持证据、最强反证与未决缺口。
 
-### B7. 引用清单与完成标记
-- 按 `[B-1]`…`[B-n]` 顺序列出全部引用（研报带 `doc_id`，专家访谈带 transcript ID 与身份，内部库带 `document_id`），末行写 `<!-- 完成 -->`。
+### B7. 引用与完成标记
+- 在文末 `## 引用` 节按 `[引用1]`…`[引用N]` 顺序列出全部引用（研报带 `doc_id`，专家访谈带 transcript ID 与身份，内部库带 `document_id`，与正文一一对应），末行写 `<!-- 完成 -->`。

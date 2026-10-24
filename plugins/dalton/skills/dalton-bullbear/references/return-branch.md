@@ -91,15 +91,15 @@
 - **评分拆解**：R1 = x.xx%；R2 = x.xx%；R3 = x.xx% × 可信度 p% = x.xx%（可信度档位理由一句）；R = max(R1, R2, R3) = x.xx%；基础分 x.xx；持续性调整 ±x.x 分（加减项理由一句，不重复计）；最终得分 **x.x / 20**。
 - **口径与未核实项**：外推假设、50% 混合拆分、现金流量表与逐季加总差异、卖方口径与公司口径差异。
 
-**回报引用清单**
-[回报引用1] 行情｜yfinance / anchors.json｜市值与汇率锚点｜YYYY-MM-DD｜anchors.json
-[回报引用2] 公告｜SEC 10-K｜FY2025 年报现金流量表与股本附注｜YYYY-MM-DD｜accession ...
-[回报引用3] 公告｜SEC 10-Q｜最近季度回购与股息披露｜YYYY-MM-DD｜accession ...
-[回报引用4] 电话会｜管理层业绩会纪要｜资本配置与股东回报政策表态｜YYYY-MM-DD｜doc_id ...
+**回报引用**
+[回报引用1]: evidence:E-20261023-04 （行情｜yfinance / anchors.json｜市值与汇率锚点｜YYYY-MM-DD｜anchors.json）
+[回报引用2]: evidence:E-20261023-05 （公告｜SEC 10-K｜FY2025 年报现金流量表与股本附注｜YYYY-MM-DD｜accession ...）
+[回报引用3]: evidence:E-20261023-06 （公告｜SEC 10-Q｜最近季度回购与股息披露｜YYYY-MM-DD｜accession ...）
+[回报引用4]: evidence:E-20261023-07 （电话会｜管理层业绩会纪要｜资本配置与股东回报政策表态｜YYYY-MM-DD｜doc_id ...）
 <!-- 完成 -->
 ```
 
-> **核对要求**：`return.md` 与 `return_appendix.md` 正文中出现的 `[回报引用N]` 集合，必须与 `**回报引用清单**` 下列出的 `[回报引用N]` 集合完全一致（`bb_check.py` 会强制校验）。合并后在报告末尾的 `## 引用` 一节逐行写出核验目标与括号内来源说明（形如 `[回报引用1]: evidence:E-20261023-04 （行情｜yfinance / anchors.json｜市值与汇率锚点｜YYYY-MM-DD｜anchors.json）`、`[引用1]: evidence:E-20261023-01 （行情｜Yahoo Finance｜价格与一致预期快照｜YYYY-MM-DD｜data/consensus/...）`）。
+> **核对要求**：`return.md` 与 `return_appendix.md` 正文中出现的 `[回报引用N]` 集合，必须与 `**回报引用**` 下列出的 `[回报引用N]` 集合完全一致（`bb_check.py` 会强制校验）。合并后在报告末尾的 `## 引用` 一节逐行写出核验目标与括号内来源说明（形如 `[回报引用1]: evidence:E-20261023-04 （行情｜yfinance / anchors.json｜市值与汇率锚点｜YYYY-MM-DD｜anchors.json）`、`[引用1]: evidence:E-20261023-01 （行情｜Yahoo Finance｜价格与一致预期快照｜YYYY-MM-DD｜data/consensus/...）`）。
 
 ---
 

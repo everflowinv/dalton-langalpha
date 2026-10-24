@@ -107,6 +107,8 @@ def check(
         app_text = app or ""
         if "**回报引用清单**" in app_text:
             app_before_list, app_list_part = app_text.split("**回报引用清单**", 1)
+        elif "**回报引用**" in app_text:
+            app_before_list, app_list_part = app_text.split("**回报引用**", 1)
         else:
             app_before_list, app_list_part = app_text, app_text
         rtxt = ret + "\n" + app_before_list
