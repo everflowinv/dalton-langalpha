@@ -85,7 +85,8 @@ class TestClaudeCodeImport:
         }
         assert plan.instructions == "You review code."
         definition = plugin_definition(plan.row)
-        assert (definition.model, definition.brokerages, definition.connectors) == (None, "on", True)
+        # DALTON-HOOK(hide-trading): subagent brokerages default is off in Dalton
+        assert (definition.model, definition.brokerages, definition.connectors) == (None, "off", True)
         assert definition.roles == ALL_ROLES
         assert _codes(plan) == {"name_ignored", "model_alias", "keys_ignored"}
 

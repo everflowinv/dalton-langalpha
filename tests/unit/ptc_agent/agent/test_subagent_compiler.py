@@ -132,6 +132,7 @@ def _base_path_defn(tools: list[str] | None = None) -> SubagentDefinition:
         description="test subagent",
         role_prompt="Do research.",
         tools=list(tools) if tools is not None else ["execute_code", "finance", "web_search"],
+        brokerages="on",  # DALTON-HOOK(hide-trading): keep unrestricted for bare-compiler tool_guide tests
     )
 
 

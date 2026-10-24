@@ -16,7 +16,7 @@ import ConfirmDialog from '@/pages/Dashboard/components/ConfirmDialog';
 import { useOnboarding, useStartOnboarding } from '@/pages/Onboarding';
 import type { Preferences } from './types';
 import { AutoApproveSettings } from './AutoApproveSettings';
-import { TradingPermissionSection } from './TradingPermissionSection';
+// DALTON-HOOK(hide-trading): remove TradingPermissionSection from PreferencesTab
 
 /** Preferences tab: investment-preference summary, output format, the
  * subagents default that every thread without a value of its own follows,
@@ -275,7 +275,7 @@ export function PreferencesTab() {
         </p>
       </div>
       <AutoApproveSettings />
-      <TradingPermissionSection />
+      {/* DALTON-HOOK(hide-trading): hide <TradingPermissionSection /> while keeping <AutoApproveSettings /> */}
 
       {/* Column until there is room for a row. The two actions are a fixed
           ~259px whatever the viewport, so side-by-side on a phone leaves the

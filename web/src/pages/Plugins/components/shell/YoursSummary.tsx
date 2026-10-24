@@ -171,16 +171,8 @@ function summaryParts(t: TFunction, section: Section, data: ShellData): SummaryL
       };
     }
     case 'brokerages': {
-      const b = data.brokerages;
-      if (!b) return null;
-      return {
-        lead:
-          b.connected > 0
-            ? t('plugins.shell.summary.connected', { count: b.connected })
-            : t('plugins.shell.summary.noneConnected'),
-        attention:
-          b.signIn > 0 ? [{ text: t('plugins.shell.summary.needSignIn', { count: b.signIn }) }] : [],
-      };
+      // DALTON-HOOK(hide-trading): do not display brokerage summary
+      return null;
     }
     case 'secrets': {
       if (data.secrets === null) return null;

@@ -83,7 +83,8 @@ class SubagentDefinition:
     connectors: bool = True
     """Whether its code may call connectors other than brokerage connections."""
 
-    brokerages: BrokerageAccess = "on"
+    # DALTON-HOOK(hide-trading): subagent brokerage access defaults to off in Dalton
+    brokerages: BrokerageAccess = "off"
     """Brokerage connections: none, or general access."""
 
     memory: bool = False

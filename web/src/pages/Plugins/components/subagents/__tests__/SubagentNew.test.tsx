@@ -96,7 +96,8 @@ describe('SubagentNew', () => {
   it('shows the access Blank grants, as a copy shows its own', () => {
     renderForm(null);
     expect(fact('Connectors')).toBe('All');
-    expect(fact('Brokerages')).toBe('Access');
+    // DALTON-HOOK(hide-trading): brokerages summary fact is hidden in Dalton
+    expect(fact('Brokerages')).toBeNull();
   });
 
   it('shows a copy without connectors or brokerages as it is', () => {

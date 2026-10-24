@@ -18,37 +18,31 @@ import logging
 
 from fastapi import APIRouter, HTTPException, Response
 
-from src.server.database.mcp_servers import get_catalog_server
 from src.server.models.mcp_server import (
     BrokerageList,
     CatalogServer,
     EnabledInput,
-    brokerage_to_response,
 )
 from src.server.services.brand_icons import icon_response
-from src.server.services.brokerages import BROKERAGES, brokerage_by_name
-from src.server.services.mcp_catalog import apply_catalog_enabled
-from src.server.services.mcp_catalog_view import decorated, oauth_for_server
-from src.server.services.mcp_validation import SignInNeeded, check_http_error
+from src.server.services.brokerages import brokerage_by_name
 from src.server.utils.api import CurrentUserId, handle_api_exceptions
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/mcp", tags=["MCP Catalog"])
 
+# DALTON-HOOK(hide-trading): disable brokerage connectors and return empty list
+_BROKERAGE_DISABLED_DETAIL = (
+    "Brokerage connections are disabled in Dalton (Dalton 已禁用券商连接)"
+)
+
 
 @router.get("/brokerages")
 @handle_api_exceptions("list brokerage connectors", logger)
 async def list_brokerages(user_id: CurrentUserId) -> BrokerageList:
-    """The brokerage connectors this build ships.
-
-    Static and user-independent: whether one is configured is answered by the
-    catalog list, which the page already holds and joins on ``name``. Behind
-    the same auth as the rest of the router regardless: its only reader is the
-    page, which is holding a token already, so there is nothing an exception
-    here would buy.
-    """
-    return BrokerageList(brokerages=[brokerage_to_response(b) for b in BROKERAGES])
+    """Return an empty brokerage list in Dalton so legacy callers do not crash."""
+    # DALTON-HOOK(hide-trading): always return empty list
+    return BrokerageList(brokerages=[])
 
 
 @router.patch("/brokerages/{name}/enabled")
@@ -56,64 +50,11 @@ async def list_brokerages(user_id: CurrentUserId) -> BrokerageList:
 async def set_brokerage_enabled(
     name: str, body: EnabledInput, user_id: CurrentUserId
 ) -> CatalogServer:
-    """Turn a configured brokerage on or off.
-
-    A brokerage with no row has never been connected, and its row is saved
-    only by its sign-in: enabling one answers 409 naming the shipped address,
-    and the client starts that sign-in, whose callback creates the row. A row
-    whose connection is gone (disconnected, or never repaired) answers the
-    same 409 from the switch below, naming the row's own address.
-
-    An existing row is toggled and never rewritten. Once it is the user's, its
-    URL is theirs to edit, and a row they built themselves under this name is
-    still theirs; silently restoring our address on every enable would undo a
-    deliberate edit at the moment they were only reaching for the switch.
-    """
-    brokerage = brokerage_by_name(name)
-    if brokerage is None:
+    """Refuse enabling or toggling brokerage connectors in Dalton."""
+    # DALTON-HOOK(hide-trading): reject brokerage toggle with 403
+    if brokerage_by_name(name) is None:
         raise HTTPException(status_code=404, detail="Unknown brokerage")
-
-    existing = await get_catalog_server(user_id, name)
-    # A plugin-owned row under a brokerage name is not the user's own edit, and
-    # this route would adopt it and hand it the vendor's identity: the tab joins
-    # by name, so it would be presented as this broker while Connect went to
-    # whatever address the plugin chose. New installs cannot claim these names
-    # any more; one installed before they were reserved still can, so refuse it
-    # here rather than trusting that no such row exists. The row stays usable
-    # on the Connectors tab, under the plugin that owns it.
-    if existing and existing.get("plugin_id"):
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"{name!r} is a server installed by a plugin, so it cannot be "
-                "managed as a brokerage connector. Open it on the Connectors tab."
-            ),
-        )
-
-    if existing is None:
-        if not body.enabled:
-            raise HTTPException(
-                status_code=404,
-                detail=f"{name!r} is not configured, so there is nothing to disable",
-            )
-        raise check_http_error(SignInNeeded(server=brokerage.name, url=brokerage.url))
-
-    # The same apply every other switch on this page goes through. These are the
-    # rows that can place orders, so a weaker disable than the server beside them
-    # is the last thing they should have.
-    row, warning = await apply_catalog_enabled(user_id, name, body.enabled)
-    if row is None:
-        # Deleted between the read and the write.
-        raise HTTPException(status_code=404, detail="MCP server not found")
-
-    # A row whose OAuth connection outlived an earlier row of the same name is
-    # already connected, so read the status rather than assuming none. One row,
-    # so one lookup: listing every connection to decorate a single response is
-    # a second round trip that answers the same question.
-    response = decorated(row, await oauth_for_server(user_id, name))
-    if warning:
-        response.warnings = [warning]
-    return response
+    raise HTTPException(status_code=403, detail=_BROKERAGE_DISABLED_DETAIL)
 
 
 @router.get("/brokerages/{name}/icon")

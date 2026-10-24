@@ -37,7 +37,10 @@ from src.server.database.mcp_servers import (
 )
 from src.server.database.workspace import get_workspace
 from src.server.models.mcp_server import McpServerInput
-from src.server.services.brokerages import brokerage_by_name, brokerage_names
+from src.server.services.brokerages import (  # DALTON-HOOK(hide-trading)
+    brokerage_for_url,
+    brokerage_names,
+)
 from src.server.services.mcp_apply import schedule_proactive_apply
 from src.server.services.mcp_catalog import (
     CatalogEdit,
@@ -86,6 +89,23 @@ from src.server.utils.error_sanitization import validation_error_text
 logger = logging.getLogger(__name__)
 
 NOT_FOUND = "MCP server not found"
+
+# DALTON-HOOK(hide-trading): shared service-layer refusal for brokerage names and host URLs
+BROKERAGE_DISABLED_DETAIL = (
+    "Brokerage connections are disabled in Dalton (Dalton 已禁用券商连接)"
+)
+
+
+def refuse_brokerage_url(url: str | None) -> None:
+    """Refuse any server URL pointing at a brokerage host."""
+    if brokerage_for_url(url) is not None:
+        raise HTTPException(status_code=403, detail=BROKERAGE_DISABLED_DETAIL)
+
+
+def refuse_brokerage_server(name: str | None = None, url: str | None = None) -> None:
+    """Refuse any server whose name is a reserved brokerage or whose URL is a brokerage host."""
+    if (name is not None and name in brokerage_names()) or brokerage_for_url(url) is not None:
+        raise HTTPException(status_code=403, detail=BROKERAGE_DISABLED_DETAIL)
 
 
 class PendingKind(StrEnum):
@@ -140,6 +160,8 @@ class _Add:
 
     async def refuse(self) -> None:
         reject_reserved_catalog_name(self.server.name)
+        # DALTON-HOOK(hide-trading): refuse custom servers whose URL points at a brokerage host
+        refuse_brokerage_url(self.server.url)
         await refuse_unplaceable(
             self.user_id, self.server.name, taken=name_taken(self.server.name)
         )
@@ -243,13 +265,8 @@ class BrokerageAdd(_Add):
         super().__init__(user_id, brokerage_server(name))
 
     async def refuse(self) -> None:
-        brokerage = brokerage_by_name(self.server.name)
-        label = brokerage.label if brokerage is not None else self.server.name
-        await refuse_unplaceable(
-            self.user_id,
-            self.server.name,
-            taken=f"{label} is already set up; connect it from its row.",
-        )
+        # DALTON-HOOK(hide-trading): refuse brokerage OAuth connect in Dalton
+        refuse_brokerage_server(self.server.name, self.server.url)
 
     async def _insert(self) -> dict[str, Any]:
         return await create_brokerage_row(self.user_id, self.server.name, enabled=True)
@@ -298,6 +315,8 @@ class ServerEdit:
             raise HTTPException(
                 status_code=409, detail="name in body must match the path name"
             )
+        # DALTON-HOOK(hide-trading): refuse editing a server to point at a brokerage host
+        refuse_brokerage_url(self.server.url)
         if self.workspace_id is None:
             return None
         ref = await classify_server_name(self.workspace_id, self.user_id, self.name)
@@ -373,6 +392,7 @@ async def start_brokerage(save: BrokerageAdd) -> PreparedSignIn:
     """A brokerage's check may pass or ask for a sign-in, and either way its
     row is saved by the sign-in: a broker's tools are reached through the
     user's own account."""
+    # DALTON-HOOK(hide-trading): reject brokerage OAuth initiation
     await save.refuse()
     result = await check_server(save.user_id, save.server)
     if isinstance(result, CheckFailure):
@@ -421,6 +441,8 @@ async def start_edit(
 
 def start_plugin(pending: PendingPluginInstall) -> PreparedSignIn:
     """A plugin install prepared by ``plugins.prepare_pending_install``."""
+    # DALTON-HOOK(hide-trading): refuse plugin sign-in pointing at a brokerage host
+    refuse_brokerage_server(pending.sign_in.server, pending.sign_in.url)
     return PreparedSignIn(
         PendingKind.PLUGIN,
         pending.sign_in.server,
@@ -540,6 +562,8 @@ class _EditFinish:
         return self.edit.name
 
     async def before_exchange(self) -> None:
+        # DALTON-HOOK(hide-trading): refuse editing a server to a brokerage host before code exchange
+        await _refused(self.edit.refuse())
         row = await get_catalog_server(self._user_id, self._name)
         if row is None or dial_of(row) != self.prior:
             raise CallbackFailed(CallbackError.SERVER_CHANGED)

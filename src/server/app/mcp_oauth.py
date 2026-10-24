@@ -28,7 +28,7 @@ from fastapi import (
     Response,
     UploadFile,
 )
-from fastapi.responses import RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 from src.config.env import SERVER_BASE_URL
@@ -53,6 +53,7 @@ from src.server.services.mcp_saves import (
     ServerEdit,
     WorkspaceAdd,
     parse_server,
+    refuse_brokerage_server,  # DALTON-HOOK(hide-trading)
     start_add,
     start_brokerage,
     start_edit,
@@ -101,6 +102,8 @@ async def oauth_start(
     response: Response,
     body: dict | None = Body(default=None),
 ) -> dict:
+    # DALTON-HOOK(hide-trading): reject brokerage OAuth initiation
+    refuse_brokerage_server(name, (body or {}).get("expected_url"))
     return_to = (body or {}).get("return_to")
     # Coerced here rather than in the service: the body is an unvalidated dict,
     # and anything that is not a list of keys is not a consent decision. A
@@ -410,6 +413,14 @@ async def oauth_callback(
                 request.cookies.get(cookie_name) if cookie_name else None
             ),
         )
+    except HTTPException as exc:
+        # DALTON-HOOK(hide-trading): reject brokerage OAuth callback before DB write and clear nonce cookie
+        err_resp = JSONResponse(
+            status_code=exc.status_code, content={"detail": exc.detail}
+        )
+        if cookie_name:
+            err_resp.delete_cookie(cookie_name, path=_OAUTH_COOKIE_PATH)
+        return err_resp  # type: ignore[return-value]
     except Exception:
         logger.exception("[mcp_oauth] callback crashed")
         target = f"{DEFAULT_RETURN_TO}?mcp_error={CallbackError.INTERNAL}"

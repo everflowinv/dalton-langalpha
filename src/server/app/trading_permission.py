@@ -12,10 +12,7 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from src.server.database.trading_permission import (
-    get_trading_permission_row,
-    set_trading_permission,
-)
+# DALTON-HOOK(hide-trading): database trading_permission helpers unused since endpoint is locked to NO_TRADING
 from src.server.services.trading_permission import (
     DEFAULT_TRADING_PERMISSION,
     TRADING_AGREEMENT_VERSION,
@@ -61,7 +58,8 @@ def _response(row: dict | None) -> TradingPermissionResponse:
 )
 @handle_api_exceptions("get trading permission", logger)
 async def get_trading_permission(user_id: CurrentUserId):
-    return _response(await get_trading_permission_row(user_id))
+    # DALTON-HOOK(hide-trading): always return strictest permission level (no_trading)
+    return TradingPermissionResponse(level=TradingPermission.NO_TRADING)
 
 
 @router.put(
@@ -71,17 +69,8 @@ async def get_trading_permission(user_id: CurrentUserId):
 async def update_trading_permission(
     body: TradingPermissionUpdate, user_id: CurrentUserId
 ):
-    if (
-        body.level.needs_agreement
-        and body.agreement_version != TRADING_AGREEMENT_VERSION
-    ):
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                "this level lets orders skip your approval, so it needs the "
-                f"current agreement (version {TRADING_AGREEMENT_VERSION}) accepted"
-            ),
-        )
-    return _response(
-        await set_trading_permission(user_id, body.level, body.agreement_version)
+    # DALTON-HOOK(hide-trading): forbid changing trading permission in Dalton
+    raise HTTPException(
+        status_code=403,
+        detail="Trading permissions are disabled in Dalton (Dalton 已禁用交易权限设置)",
     )

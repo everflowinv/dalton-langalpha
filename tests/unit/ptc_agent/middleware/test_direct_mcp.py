@@ -300,3 +300,31 @@ class TestRefusedMessage:
         )
         assert out.artifact["order_attempt"] == {"id": "900001"}
         assert out.artifact[METADATA_KEY]["server"] == "moomoo"
+
+
+# DALTON-HOOK(hide-trading): bindable_direct_tools strips order/cancel tools before binding to the agent
+def test_bindable_direct_tools_strips_order_tools():
+    from ptc_agent.agent.middleware.direct_mcp import bindable_direct_tools
+
+    quote = _tool(
+        "mcp__moomoo__quote_stock_quote",
+        stamp={"server": "moomoo", "tool": "quote_stock_quote"},
+    )
+    untagged_order = _tool(
+        "mcp__robinhood__place_equity_order",
+        stamp={"server": "robinhood", "tool": "place_equity_order"},
+    )
+    bound = bindable_direct_tools(_ToolSet([DIRECT, GATED, untagged_order, quote]))
+    assert [t.name for t in bound] == ["mcp__moomoo__quote_stock_quote"]
+    assert bindable_direct_tools(None) == []
+
+
+def test_default_order_tool_names_matches_brokerage_capabilities_order_tools():
+    # DALTON-HOOK(hide-trading): ensure _DEFAULT_ORDER_TOOL_NAMES stays in sync with brokerage_capabilities._ORDER_TOOLS
+    from ptc_agent.agent.middleware.direct_mcp import _DEFAULT_ORDER_TOOL_NAMES
+    from src.server.services.brokerage_capabilities import _ORDER_TOOLS
+    from src.server.services.tool_binding import ALL_ORDER_TOOL_NAMES
+
+    expected = frozenset(t.strip().lower() for tools in _ORDER_TOOLS.values() for t in tools)
+    assert _DEFAULT_ORDER_TOOL_NAMES == expected
+    assert _DEFAULT_ORDER_TOOL_NAMES == ALL_ORDER_TOOL_NAMES

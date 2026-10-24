@@ -48,6 +48,7 @@ from src.server.database.user_vault_secrets import (
     create_user_secret,
     get_user_secret_names,
 )
+from src.server.services.brokerages import brokerage_for_url
 from src.server.services.mcp_config import reserved_catalog_names
 from src.server.services.mcp_validation import (
     CheckFailure,
@@ -61,6 +62,10 @@ if TYPE_CHECKING:
     from src.server.models.mcp_server import McpServerInput, ParsedMcpServer
 
 CAP_MESSAGE = f"Plugins server cap ({MAX_CATALOG_SERVERS_PER_USER}) reached"
+# DALTON-HOOK(hide-trading): per-entry refusal message for brokerage URLs during MCP import
+BROKERAGE_IMPORT_REFUSAL = (
+    "Brokerage connections are disabled in Dalton (券商服务已禁用)"
+)
 
 
 def vault_secret_name(server_name: str, key: str, used: set[str]) -> str:
@@ -323,6 +328,14 @@ async def run_mcp_import(
                 )
             except ValidationError as e:
                 outcome = {"status": "invalid", "error": validation_error_text(e)}
+            else:
+                # DALTON-HOOK(hide-trading): refuse brokerage URLs before check or DB write without aborting batch
+                if brokerage_for_url(server.url) is not None:
+                    outcome = {
+                        "status": "error",
+                        "reason": BROKERAGE_IMPORT_REFUSAL,
+                        "error": BROKERAGE_IMPORT_REFUSAL,
+                    }
         if outcome is not None:
             refused[index] = outcome
             continue
@@ -392,6 +405,10 @@ async def _commit_entry(
     replaced it.
     """
     from src.server.models.vault import validate_secret_value
+
+    # DALTON-HOOK(hide-trading): refuse brokerage URLs before DB write
+    if brokerage_for_url(getattr(server, "url", None)) is not None:
+        raise ValueError(BROKERAGE_IMPORT_REFUSAL)
 
     for secret in secrets:
         try:

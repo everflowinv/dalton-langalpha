@@ -20,8 +20,11 @@ vi.mock('../OnboardingProvider', () => ({
   }),
 }));
 
+// DALTON-HOOK(hide-trading): preserve ONBOARDING_PARAM/ONBOARDING_CONNECT constants on mock
 const startOnboarding = vi.fn();
 vi.mock('../connect/useStartOnboarding', () => ({
+  ONBOARDING_PARAM: 'onboarding',
+  ONBOARDING_CONNECT: 'connect',
   useStartOnboarding: () => ({ start: startOnboarding }),
 }));
 
@@ -129,5 +132,17 @@ describe('GettingStartedCard', () => {
     renderCard();
     fireEvent.click(screen.getByRole('button', { name: 'Hide guide' }));
     expect(dismiss).toHaveBeenCalledTimes(1);
+  });
+
+  // DALTON-HOOK(hide-trading): OnboardingConnectHost never renders the brokerage connect sheet
+  it('OnboardingConnectHost skips the brokerage sheet and redirects ?onboarding=connect via start()', async () => {
+    const { OnboardingConnectHost } = await import('../connect/OnboardingConnectHost');
+    render(
+      <MemoryRouter initialEntries={['/dashboard?onboarding=connect']}>
+        <OnboardingConnectHost />
+      </MemoryRouter>
+    );
+    expect(startOnboarding).toHaveBeenCalledWith({ replace: true });
+    expect(screen.queryByText(/Connect your brokerage/i)).toBeNull();
   });
 });

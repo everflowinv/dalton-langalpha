@@ -73,11 +73,13 @@ from src.server.services.mcp_oauth.discovery import (
 )
 from src.server.services.mcp_oauth.lifecycle import TokenUnavailable
 from src.server.services.mcp_import import catalog_import_scope, run_mcp_import
+# DALTON-HOOK(hide-trading): import refuse_brokerage_url for single-entry import refusal
 from src.server.services.mcp_saves import (
     NOT_FOUND,
     ServerEdit,
     WorkspaceAdd,
     parse_server,
+    refuse_brokerage_url,
 )
 from src.server.services.mcp_validation import check_servers
 from src.server.services.vault_invalidation import (
@@ -376,9 +378,14 @@ async def import_servers(
     and one that fails or needs a sign-in is reported rather than created.
     Per-server outcomes are reported so a partial import is legible.
     """
+    parsed = parse_mcp_servers_payload(body)
+    # DALTON-HOOK(hide-trading): refuse single-entry brokerage URL import before any DB access
+    if len(parsed) == 1 and isinstance(parsed[0].config.get("url"), str):
+        # A non-string url is left to the per-entry validation below.
+        refuse_brokerage_url(parsed[0].config["url"])
+
     await _require_owned_workspace(workspace_id, user_id)
 
-    parsed = parse_mcp_servers_payload(body)
     if not parsed:
         raise HTTPException(
             status_code=422,

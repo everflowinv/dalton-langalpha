@@ -16,7 +16,11 @@ from typing import Any
 from src.server.services.brokerage_capabilities import vendor_for_url
 from src.server.services.brokerage_tool_overlays import overlay_tool_schemas
 from src.server.services.egress import fold_tool_name, folded_contains
-from src.server.services.tool_binding import BindingPlan, Resolved
+from src.server.services.tool_binding import (  # DALTON-HOOK(hide-trading)
+    BindingPlan,
+    Resolved,
+    is_order_tool,
+)
 
 
 @dataclass(frozen=True)
@@ -73,6 +77,10 @@ def split_server_tools(
     """
     if denied:
         tools = [t for t in tools if not folded_contains(denied, t.get("name"))]
+    # DALTON-HOOK(hide-trading): strip order tools before splitting into sandbox wrappers and direct tools
+    tools = [
+        t for t in tools if not is_order_tool(vendor, str(t.get("name") or ""))
+    ]
     if plan is None or not plan.direct:
         return tools, None
     # Folded, because the plan is keyed by the curated or stored spelling while

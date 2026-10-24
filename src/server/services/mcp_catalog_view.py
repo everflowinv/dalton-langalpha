@@ -278,6 +278,17 @@ async def decorate_rows(user_id: str, rows: list[dict]) -> list[CatalogServer]:
     (stamping ``probe_kicked_at``), throttled per row, so a listing is what
     heals a row whose probe was lost.
     """
+    # DALTON-HOOK(hide-trading): filter out shipped brokerages (robinhood, ibkr, webull, moomoo) from connector catalog
+    from src.server.services.brokerages import brokerage_for_url, brokerage_names
+
+    rows = [
+        r
+        for r in rows
+        if r.get("name") not in brokerage_names()
+        and brokerage_for_url(r.get("url")) is None
+    ]
+    if not rows:
+        return []
     oauth = await _oauth_by_server(user_id)
     snapshots = await _snapshots_by_server(user_id, rows)
     _kick_unprobed(user_id, rows, snapshots)

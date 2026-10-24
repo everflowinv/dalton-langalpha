@@ -65,7 +65,11 @@ from src.server.services.brokerage_capabilities import (
     vendor_for_url,
 )
 from src.server.services import mcp_saves
-from src.server.services.brokerages import Brokerage, brokerage_for_url
+from src.server.services.brokerages import (  # DALTON-HOOK(hide-trading)
+    Brokerage,
+    brokerage_for_url,
+    brokerage_names,
+)
 from src.server.services.mcp_apply import schedule_proactive_apply
 from src.server.services.mcp_config import same_consented_url
 from src.server.services.mcp_probe import _scrub_url
@@ -934,10 +938,14 @@ async def start_connect(
     is refused if the row has moved off it since. Optional because a caller that
     does not name one has nothing to be wrong about; see ``McpServerMoved``.
     """
+    # DALTON-HOOK(hide-trading): refuse reserved brokerage names and brokerage row URLs before starting OAuth
+    mcp_saves.refuse_brokerage_server(server_name)
     row = await get_catalog_server(user_id, server_name)
     if row is None:
+        mcp_saves.refuse_brokerage_url(expected_url)
         raise McpServerNotFound("MCP server not found")
     server_url = row.get("url")
+    mcp_saves.refuse_brokerage_server(server_name, server_url)
     # http only: the generated sandbox client rejects legacy `sse` transport
     # (it never implemented the real GET→endpoint-event→POST flow), so an
     # sse-bound OAuth connection could never be used through the relay.
@@ -1002,6 +1010,8 @@ async def _start(
     granted_capabilities: Sequence[str] | None,
     pending: PreparedSignIn | None = None,
 ) -> StartedConnect:
+    # DALTON-HOOK(hide-trading): refuse any OAuth flow whose target server name or actual URL is a brokerage
+    mcp_saves.refuse_brokerage_server(server_name, server_url)
     # Before the first packet leaves, not at the end beside the record it
     # feeds. This raises for a caller that named no selection, and raising it
     # after ``_register_client`` meant an older page or a script posting
@@ -1315,6 +1325,15 @@ async def complete_callback(
         await discard(state)
         # Unknown, expired, or already used — uniform answer, no oracle.
         return redirect_to(mcp_error=CallbackError.INVALID_STATE)
+
+    # DALTON-HOOK(hide-trading): refuse brokerage OAuth callback before exchanging code or writing to DB
+    if (
+        record.server_name in brokerage_names()
+        or brokerage_for_url(record.server_url) is not None
+    ):
+        if record.pending:
+            await discard(state)
+        mcp_saves.refuse_brokerage_server(record.server_name, record.server_url)
 
     server_name = record.server_name
     finish: CallbackFinish = _ReconnectFinish(record)

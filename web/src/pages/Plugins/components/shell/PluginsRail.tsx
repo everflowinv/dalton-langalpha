@@ -63,7 +63,8 @@ export function PluginsRail({
     mcp: data.connectors?.total ?? null,
     skills: data.skills?.total ?? null,
     subagents: data.subagents?.total ?? null,
-    brokerages: data.brokerages?.connected ?? null,
+    // DALTON-HOOK(hide-trading): do not count brokerages in rail badges
+    brokerages: null,
     secrets: data.secrets,
   };
   const attention: Record<Section, boolean> = {
@@ -72,7 +73,8 @@ export function PluginsRail({
     mcp: !!data.connectors && connectorAttention(data.connectors) > 0,
     skills: false,
     subagents: !!data.subagents && data.subagents.attention > 0,
-    brokerages: !!data.brokerages && data.brokerages.signIn > 0,
+    // DALTON-HOOK(hide-trading): do not show brokerage attention dot
+    brokerages: false,
     secrets: false,
   };
 

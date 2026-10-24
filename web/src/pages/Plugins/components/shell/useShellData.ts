@@ -1,9 +1,9 @@
-import { useBrokerages, useBuiltinMcpServers, useMcpCatalog } from '@/hooks/useMcpServers';
+// DALTON-HOOK(hide-trading): do not import or call useBrokerages in useShellData
+import { useBuiltinMcpServers, useMcpCatalog } from '@/hooks/useMcpServers';
 import { usePlugins } from '@/hooks/usePlugins';
 import { useSkills } from '@/hooks/useSkills';
 import { useSubagents } from '@/hooks/useSubagents';
 import { useUserVaultSecrets } from '@/hooks/useUserVault';
-import { needsOauthConnect } from '@/pages/ChatAgent/components/mcp/mcpState';
 import type { CatalogServer, PluginInfo, SubagentsResponse } from '@/pages/ChatAgent/utils/api';
 import { connectorState, failureBucket, type PluginProblem } from '../../utils/connectorState';
 import { hasLifecycle } from '../../utils/pluginSurface';
@@ -70,7 +70,7 @@ export function useShellData(): ShellData {
   const { data: builtinData } = useBuiltinMcpServers();
   // SkillsList's exact arguments: one cache entry for the list and the count.
   const { data: skills } = useSkills({ includeDisabled: true, allScopes: true });
-  const { data: shipped } = useBrokerages();
+  // DALTON-HOOK(hide-trading): do not fetch brokerages in useShellData
   const { data: vault } = useUserVaultSecrets();
   const { data: subagentData } = useSubagents();
 
@@ -128,21 +128,8 @@ export function useShellData(): ShellData {
     connectors = tally;
   }
 
-  let brokerages: ShellData['brokerages'] = null;
-  if (shipped && servers) {
-    const byName = new Map(servers.map((s) => [s.name, s]));
-    let connected = 0;
-    let signIn = 0;
-    for (const b of shipped) {
-      const row = byName.get(b.name);
-      if (!row) continue;
-      // The card's rule: only an http row can sign in, and the user may have
-      // edited theirs to something else.
-      if (row.transport === 'http' && needsOauthConnect(row.oauth_status ?? null)) signIn += 1;
-      else connected += 1;
-    }
-    brokerages = { connected, signIn };
-  }
+  // DALTON-HOOK(hide-trading): do not compute brokerage summary counts
+  const brokerages: ShellData['brokerages'] = null;
 
   return {
     plugins,

@@ -94,7 +94,8 @@ async def test_resetting_a_base_hidden_since_the_read_is_a_conflict(world):
          {"model": "model-a", "tools": ["web", "code"]}),
         # Nothing left that differs from the base: the row goes.
         ("research", {"model": "model-a"}, {"model": None}, None),
-        ("research", None, {"tools": ["web"], "brokerages": "on"}, None),
+        # DALTON-HOOK(hide-trading): SubagentDefinition.brokerages defaults to off in Dalton
+        ("research", None, {"tools": ["web"], "brokerages": "off"}, None),
         ("research", {"enabled": False}, {"enabled": True}, None),
         ("research", None, {"memory": True}, {"memory": True}),
         ("research", {"memory": True}, {"memory": "off"}, None),

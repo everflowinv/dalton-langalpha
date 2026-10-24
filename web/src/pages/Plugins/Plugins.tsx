@@ -3,7 +3,7 @@ import { Navigate, useSearchParams } from 'react-router';
 import { useTranslation } from 'react-i18next';
 import { useScrollMemory } from '@/lib/scrollMemory';
 import { ListSkeleton } from '@/components/mcp/McpPrimitives';
-import { Brokerages } from './components/Brokerages';
+// DALTON-HOOK(hide-trading): do not import or render <Brokerages />
 import { DetailPageProvider } from './components/DetailPage';
 import { McpServers } from './components/McpServers';
 import { SkillsList } from './components/SkillsList';
@@ -90,7 +90,8 @@ function SectionBody({ section, view }: { section: Section; view: SectionView })
     case 'subagents':
       return <SubagentsList />;
     case 'brokerages':
-      return <Brokerages />;
+      // DALTON-HOOK(hide-trading): never render <Brokerages />
+      return null;
     case 'secrets':
       return <PluginSecrets />;
   }

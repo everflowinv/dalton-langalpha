@@ -1,25 +1,25 @@
-import { Suspense, useState } from 'react';
+import { useEffect, useRef } from 'react';
 import { useSearchParams } from 'react-router';
-import { lazyWithMotion } from '@/lib/lazyWithMotion';
-import { ONBOARDING_CONNECT, ONBOARDING_PARAM } from './useStartOnboarding';
-
-// Lazy so the connect flow (the Plugins page's brokerage and OAuth graph)
-// stays off the first load; most sessions never open it.
-const OnboardingConnectLayer = lazyWithMotion(() => import('./OnboardingConnectSheet'));
+import { ONBOARDING_CONNECT, ONBOARDING_PARAM, useStartOnboarding } from './useStartOnboarding';
 
 /**
- * Opens the onboarding connect sheet over any page in the app shell while the
- * URL carries `?onboarding=connect`. Latched once opened, so closing animates
- * out rather than unmounting.
+ * DALTON-HOOK(hide-trading): never render the brokerage connect sheet. If a URL
+ * carries `?onboarding=connect`, strip the param and jump straight to the
+ * personalization interview.
  */
 export function OnboardingConnectHost() {
   const [searchParams, setSearchParams] = useSearchParams();
+  const { start } = useStartOnboarding();
   const open = searchParams.get(ONBOARDING_PARAM) === ONBOARDING_CONNECT;
-  const [needed, setNeeded] = useState(false);
-  if (open && !needed) setNeeded(true);
-  if (!needed) return null;
+  const startedRef = useRef(false);
 
-  function close() {
+  useEffect(() => {
+    if (!open) {
+      startedRef.current = false;
+      return;
+    }
+    if (startedRef.current) return;
+    startedRef.current = true;
     setSearchParams(
       (prev) => {
         const next = new URLSearchParams(prev);
@@ -28,11 +28,9 @@ export function OnboardingConnectHost() {
       },
       { replace: true },
     );
-  }
+    void start({ replace: true });
+  }, [open, setSearchParams, start]);
 
-  return (
-    <Suspense fallback={null}>
-      <OnboardingConnectLayer open={open} onClose={close} />
-    </Suspense>
-  );
+  // DALTON-HOOK(hide-trading): render nothing and guard against duplicate start() calls
+  return null;
 }

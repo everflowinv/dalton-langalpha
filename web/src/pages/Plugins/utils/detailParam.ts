@@ -16,7 +16,8 @@ export interface DetailRef {
   workspaceId: string | null;
 }
 
-const KINDS: ReadonlySet<string> = new Set(['server', 'brokerage', 'skill', 'plugin', 'catalog', 'subagent']);
+// DALTON-HOOK(hide-trading): remove 'brokerage' from KINDS so ?detail=brokerage:NAME is rejected and falls back to default section
+const KINDS: ReadonlySet<string> = new Set(['server', 'skill', 'plugin', 'catalog', 'subagent']);
 
 /**
  * The tab that renders each kind. A `?detail=` link that names no tab is

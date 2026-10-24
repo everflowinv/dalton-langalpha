@@ -136,7 +136,8 @@ async def test_a_file_the_frontmatter_rules_refuse(world, content, error_type, f
         ("research", "available_to", "[analyst]", set(), 1),
         ("alpha", "description", "Mine now.", {"description"}, 0),
         ("research", "model", "model-flat", {"model"}, 0),
-        ("research", "brokerages", "off", {"brokerages"}, 0),
+        # DALTON-HOOK(hide-trading): SubagentDefinition.brokerages defaults to off in Dalton
+        ("research", "brokerages", "on", {"brokerages"}, 0),
         # Memory is editable on a base, as on one of the user's own.
         ("research", "memory", "on", {"memory"}, 0),
         ("alpha", "memory", "off", {"memory"}, 0),

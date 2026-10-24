@@ -12,7 +12,8 @@ import { DETAIL_KIND_TAB, parseDetail, readView, type SectionView } from '../../
 export type Section = 'plugins' | 'mcp' | 'skills' | 'subagents' | 'brokerages' | 'secrets';
 
 export const CUSTOMIZE: readonly Section[] = ['plugins', 'mcp', 'skills', 'subagents'];
-export const ACCOUNTS: readonly Section[] = ['brokerages', 'secrets'];
+// DALTON-HOOK(hide-trading): remove 'brokerages' from ACCOUNTS so the Brokerages section is hidden and ?tab=brokerages falls back to 'plugins'
+export const ACCOUNTS: readonly Section[] = ['secrets'];
 const ALL: readonly Section[] = [...CUSTOMIZE, ...ACCOUNTS];
 
 // Bare literals (not a template) so the locale parity test sees every label.
@@ -89,7 +90,8 @@ export const ADD_ROUTES: Record<AddSection, AddRoute[]> = {
 };
 
 /** Sections whose rows carry a per-workspace scope. */
-export const SCOPED: ReadonlySet<Section> = new Set<Section>(['brokerages', 'mcp', 'skills']);
+// DALTON-HOOK(hide-trading): remove 'brokerages' from SCOPED
+export const SCOPED: ReadonlySet<Section> = new Set<Section>(['mcp', 'skills']);
 
 /** A section with a Yours and a Discover view, the catalog on the other side. */
 export function hasDiscover(section: Section): section is InstallSection {

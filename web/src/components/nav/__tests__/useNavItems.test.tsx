@@ -83,11 +83,10 @@ describe('the primary nav', () => {
     }
   });
 
-  it('shows Orders once a shipped brokerage is connected', () => {
+  // DALTON-HOOK(hide-trading): Orders nav item is unconditionally hidden and never queries brokerage/order state
+  it('hides Orders even when a shipped brokerage is connected', () => {
     servers = [httpCatalogServer({ name: 'moomoo', url: MOOMOO.url, oauth_status: 'connected' })];
-    expect(keys()).toContain('/orders');
-    // In its declared place, not appended: the gate filters the list, it does
-    // not rebuild it.
+    expect(keys()).not.toContain('/orders');
     expect(keys()).toEqual(NAV_ITEMS.map((item) => item.key));
   });
 
@@ -103,19 +102,18 @@ describe('the primary nav', () => {
     expect(keys()).not.toContain('/orders');
   });
 
-  it('shows Orders for a ledger with history and no broker left', () => {
+  it('hides Orders even for a ledger with history and no broker left', () => {
     ledgerRows = 1;
-    expect(keys()).toContain('/orders');
-    // The broker answer is not even needed once the ledger has said yes.
+    expect(keys()).not.toContain('/orders');
     servers = undefined;
     shipped = undefined;
-    expect(keys()).toContain('/orders');
+    expect(keys()).not.toContain('/orders');
   });
 
-  it('shows Orders for a connected broker before the ledger has answered', () => {
+  it('hides Orders for a connected broker before the ledger has answered', () => {
     ledgerRows = undefined;
     servers = [httpCatalogServer({ url: MOOMOO.url, oauth_status: 'connected' })];
-    expect(keys()).toContain('/orders');
+    expect(keys()).not.toContain('/orders');
   });
 
   it('hides Orders while only the ledger is still in flight and no broker is connected', () => {
@@ -151,10 +149,8 @@ describe('the primary nav', () => {
     expect(keys()).not.toContain('/orders');
   });
 
-  it('leaves the gated route itself alone', () => {
-    // Hiding an entry is not a route guard: /orders stays in the shared config
-    // that the active-state matcher reads, so the page is reachable by URL and
-    // lights the nav up if the user is standing on it.
-    expect(NAV_ITEMS.map((item) => item.key)).toContain('/orders');
+  // DALTON-HOOK(hide-trading): /orders is removed from NAV_ITEMS
+  it('omits /orders from NAV_ITEMS altogether', () => {
+    expect(NAV_ITEMS.map((item) => item.key)).not.toContain('/orders');
   });
 });

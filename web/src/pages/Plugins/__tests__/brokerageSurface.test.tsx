@@ -113,6 +113,12 @@ vi.mock('@/hooks/useMcpServers', async (importOriginal) => {
   };
 });
 
+// DALTON-HOOK(hide-trading): useVendorOf returns () => null in Dalton; mock here so upstream Brokerages component tests still exercise vendor resolution
+vi.mock('../hooks/useVendorOf', () => ({
+  useVendorOf: () => (url?: string | null) =>
+    registryAnswered ? brokerageForUrl(url, shipped) : undefined,
+}));
+
 vi.mock('../hooks/useWorkspaceOptions', () => ({
   useWorkspaceOptions: () => ({ workspaces: [], nameById: new Map() }),
   useHomeOption: () => undefined,
