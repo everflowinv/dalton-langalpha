@@ -37,6 +37,7 @@ from .quote_format import (
 )
 from .segments import SegmentBreakdown, fetch_segments, segment_lines
 from .utils import finite_or_none, format_percentage, get_market_session
+from src.dalton.extended_hours import snapshot_quote_time_labels  # DALTON-HOOK(extended-hours-quotes)
 from src.data_client import get_financial_data_provider, get_market_data_provider
 from src.data_client.freshness import FreshnessLabel
 from src.data_client.ginlix_data.directory import display_names
@@ -428,12 +429,17 @@ def _company_artifact(inp: CompanyInputs) -> Dict[str, Any]:
 def _quote_detail_rows(
     cur: DisplaySpec, open_: Any, prev_close: Any, low: Any, high: Any,
     year_low: Any, year_high: Any, volume: Any, avg_volume: Any,
+    prev_close_date: Optional[str] = None,  # DALTON-HOOK(extended-hours-quotes)
 ) -> List[Tuple[str, str]]:
     rows = []
     if open_:
         rows.append(("Open", fmt_price(open_, cur)))
     if prev_close:
-        rows.append(("Previous Close", fmt_price(prev_close, cur)))
+        prev_str = fmt_price(prev_close, cur)
+        rows.append((
+            "Previous Close",
+            f"{prev_str} ({prev_close_date} close)" if prev_close_date else prev_str,
+        ))
     if low and high:
         rows.append(("Day Range", f"{fmt_price(low, cur)} - {fmt_price(high, cur)}"))
     if year_low and year_high:
@@ -444,7 +450,12 @@ def _quote_detail_rows(
     return rows
 
 
-def _snapshot_price_lines(snap: Dict[str, Any], status: str, cur: DisplaySpec) -> List[str]:
+def _snapshot_price_lines(
+    snap: Dict[str, Any],
+    status: str,
+    cur: DisplaySpec,
+    ref: Optional[InstrumentRef] = None,
+) -> List[str]:
     """Regular close, the extended-hours print off it, and the day's move."""
     out = []
     # DALTON-HOOK(extended-hours-quotes): Compare against regular_close and require late_trading_change when closed.
@@ -452,14 +463,16 @@ def _snapshot_price_lines(snap: Dict[str, Any], status: str, cur: DisplaySpec) -
     last_price = snap.get("last_trade_price")  # actual current price
     reg_change = snap.get("regular_trading_change")
     reg_change_pct = snap.get("regular_trading_change_percent")
+    reg_date_mmdd, ext_time_str, _ = snapshot_quote_time_labels(snap, status, ref)
+    reg_label = f"Regular Close ({reg_date_mmdd})" if reg_date_mmdd else "Regular Close"
     if reg_close is not None:
         if reg_change is not None and reg_change_pct is not None:
             sign = _plus(reg_change)
             out.append(
-                f"**Regular Close:** {fmt_price(reg_close, cur)} ({sign}{reg_change:.2f} / {sign}{reg_change_pct:.3f}%)"
+                f"**{reg_label}:** {fmt_price(reg_close, cur)} ({sign}{reg_change:.2f} / {sign}{reg_change_pct:.3f}%)"
             )
         else:
-            out.append(f"**Regular Close:** {fmt_price(reg_close, cur)}")
+            out.append(f"**{reg_label}:** {fmt_price(reg_close, cur)}")
 
     is_extended = status in ("early_trading", "late_trading") or (
         status == "closed" and snap.get("late_trading_change") is not None
@@ -469,17 +482,19 @@ def _snapshot_price_lines(snap: Dict[str, Any], status: str, cur: DisplaySpec) -
         ext_label = "Pre-Market" if status == "early_trading" else "After-Hours"
         ext_change = snap.get(f"{ext_key}_change")
         ext_change_pct = snap.get(f"{ext_key}_change_percent")
+        # DALTON-HOOK(extended-hours-quotes): Append exchange-local print time to pre-market/after-hours price.
+        time_suffix = f" @ {ext_time_str}" if ext_time_str else ""
         if ext_change is not None and ext_change_pct is not None:
             sign = _plus(ext_change)
             out.append(
-                f"**{ext_label} Price:** {fmt_price(last_price, cur)} ({sign}{ext_change:.2f} / {sign}{ext_change_pct:.3f}% from close)"
+                f"**{ext_label} Price:** {fmt_price(last_price, cur)} ({sign}{ext_change:.2f} / {sign}{ext_change_pct:.3f}% from close{time_suffix})"
             )
         else:
             diff = last_price - reg_close
             diff_pct = (diff / reg_close * 100) if reg_close else 0
             sign = _plus(diff)
             out.append(
-                f"**{ext_label} Price:** {fmt_price(last_price, cur)} ({sign}{diff:.2f} / {sign}{diff_pct:.2f}% from close)"
+                f"**{ext_label} Price:** {fmt_price(last_price, cur)} ({sign}{diff:.2f} / {sign}{diff_pct:.2f}% from close{time_suffix})"
             )
 
     total_change = snap.get("change")
@@ -552,12 +567,15 @@ def _quote_lines(inp: CompanyInputs) -> List[str]:
     out.append("")
 
     if snap is not None:
-        out += _snapshot_price_lines(snap, status, cur)
+        # DALTON-HOOK(extended-hours-quotes): Include regular close date, extended print time, and prev close date.
+        _, _, prev_close_date = snapshot_quote_time_labels(snap, status, inp.ref)
+        out += _snapshot_price_lines(snap, status, cur, inp.ref)
         # The snapshot has no 52-week range or average volume; the provider quote does.
         fmp = fmp or {}
         rows = _quote_detail_rows(
             cur, snap.get("open"), snap.get("previous_close"), snap.get("low"), snap.get("high"),
             fmp.get("yearLow"), fmp.get("yearHigh"), snap.get("volume"), fmp.get("avgVolume"),
+            prev_close_date=prev_close_date,
         )
     else:
         price_line = _provider_price_line(fmp, cur)

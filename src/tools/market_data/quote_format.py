@@ -308,7 +308,9 @@ def _line(row: _Row, prev_price: Optional[float], at: Optional[datetime]) -> str
         snap, row.ref, at, phase, fallback_price=price, fmt_price=_fmt_price
     )
     if main_price is not None:
-        parts.append(_fmt_price(main_price, row.ref))
+        parts.append(
+            main_price if isinstance(main_price, str) else _fmt_price(main_price, row.ref)
+        )
     parts.extend(change_parts)
     vol = finite_or_none(snap.get("volume"))
     if vol:

@@ -2133,28 +2133,40 @@ class TestFetchQuote:
     async def test_a_closed_listing_no_provider_quotes_reads_its_daily_close(self):
         # Beijing has no realtime provider: while its venue is closed the row
         # comes from the daily bars, as on the REST quote routes, and is named.
-        snaps = [{"symbol": "600519.SH", "price": 1255.79, "change_percent": -0.22,
-                  "volume": 2_500_000, "last_trade_price": 1255.79, "tier": "realtime"}]
-        daily = {"symbol": "920395.BJ", "price": 6.68, "change": 0.06,
-                 "change_percent": 0.91, "previous_close": 6.62, "volume": 307_600,
-                 "market_status": "closed", "source": "daily", "tier": "eod",
-                 "as_of": int(datetime(2026, 9, 30, 7, tzinfo=timezone.utc).timestamp() * 1000),
-                 "regular_only": True}
-        provider = _make_fake_snapshot_provider(snaps)
-        names = AsyncMock()
-        with patch(f"{_QUOTES_MOD}.get_market_data_provider", return_value=provider), \
-                patch(f"{_DAILY_MOD}.daily_fallback_snapshot", new=AsyncMock(return_value=daily)), \
-                patch(f"{_DAILY_MOD}.clock_for_ref") as clock, \
-                patch(f"{_QUOTES_MOD}.fill_quote_names", new=names):
-            clock.return_value.is_closed.return_value = True
-            content, artifact = await fetch_quote(["600519.SH", "920395.BJ"])
+        # DALTON-HOOK(extended-hours-quotes): Patch the clock to both a Beijing regular
+        # session and a closed session; a prior-day daily close must read 'last close' in both.
+        bj_tz = ZoneInfo("Asia/Shanghai")
+        bj_regular_now = datetime(2026, 10, 23, 10, 30, 0, tzinfo=bj_tz)
+        bj_closed_now = datetime(2026, 10, 23, 20, 0, 0, tzinfo=bj_tz)
 
-        # DALTON-HOOK(extended-hours-quotes): A closed prior-day daily close labels its move 'last close', not 'today'.
-        assert "920395.BJ  CN¥6.68  +0.91% last close" in content
-        assert "no data" not in content
-        bj = artifact["quotes"][1]
-        assert (bj["source"], bj["tier"], bj["currency"]) == ("daily", "eod", "CNY")
-        assert [r["symbol"] for r in names.await_args.args[0]] == ["600519.SH", "920395.BJ"]
+        for fixed_now in (bj_regular_now, bj_closed_now):
+            class _FixedClock(datetime):
+                @classmethod
+                def now(cls, tz=None):
+                    return fixed_now.astimezone(tz) if tz else fixed_now
+
+            snaps = [{"symbol": "600519.SH", "price": 1255.79, "change_percent": -0.22,
+                      "volume": 2_500_000, "last_trade_price": 1255.79, "tier": "realtime"}]
+            daily = {"symbol": "920395.BJ", "price": 6.68, "change": 0.06,
+                     "change_percent": 0.91, "previous_close": 6.62, "volume": 307_600,
+                     "market_status": "closed", "source": "daily", "tier": "eod",
+                     "as_of": int(datetime(2026, 9, 30, 7, tzinfo=timezone.utc).timestamp() * 1000),
+                     "regular_only": True}
+            provider = _make_fake_snapshot_provider(snaps)
+            names = AsyncMock()
+            with patch(f"{_QUOTES_MOD}.get_market_data_provider", return_value=provider), \
+                    patch(f"{_DAILY_MOD}.daily_fallback_snapshot", new=AsyncMock(return_value=daily)), \
+                    patch(f"{_DAILY_MOD}.clock_for_ref") as clock, \
+                    patch(f"{_QUOTES_MOD}.fill_quote_names", new=names), \
+                    patch(f"{_QUOTES_MOD}.datetime", _FixedClock):
+                clock.return_value.is_closed.return_value = True
+                content, artifact = await fetch_quote(["600519.SH", "920395.BJ"])
+
+            assert "920395.BJ  CN¥6.68  +0.91% last close" in content
+            assert "no data" not in content
+            bj = artifact["quotes"][1]
+            assert (bj["source"], bj["tier"], bj["currency"]) == ("daily", "eod", "CNY")
+            assert [r["symbol"] for r in names.await_args.args[0]] == ["600519.SH", "920395.BJ"]
 
     @pytest.mark.asyncio
     async def test_extended_hours_quote_splits_regular_close_and_after_hours_segments(self):
@@ -2162,10 +2174,18 @@ class TestFetchQuote:
         from unittest.mock import create_autospec
         from src.data_client import get_market_data_provider
         from src.data_client.market_data_provider import MarketDataProvider
-        from src.tools.market_data.company import _snapshot_price_lines
+        from src.tools.market_data.company import _quote_detail_rows, _snapshot_price_lines
 
         pre_et = datetime(2026, 10, 22, 8, 4, 0, tzinfo=ZoneInfo("America/New_York"))
         post_et = datetime(2026, 10, 22, 17, 15, 0, tzinfo=ZoneInfo("America/New_York"))
+        prev_close_ms = int(
+            datetime(2026, 10, 21, 16, 0, 0, tzinfo=ZoneInfo("America/New_York")).timestamp()
+            * 1000
+        )
+        today_close_ms = int(
+            datetime(2026, 10, 22, 16, 0, 0, tzinfo=ZoneInfo("America/New_York")).timestamp()
+            * 1000
+        )
 
         class _PreClock(datetime):
             @classmethod
@@ -2193,6 +2213,7 @@ class TestFetchQuote:
                 "volume": 19_200_000,
                 "market_status": "early_trading",
                 "as_of": int(pre_et.timestamp() * 1000),
+                "regular_as_of": prev_close_ms,
                 "regular_trading_date": "2026-10-21",
                 "regular_only": False,
                 "tier": "delayed_15m",
@@ -2206,7 +2227,10 @@ class TestFetchQuote:
             patch(f"{_QUOTES_MOD}.datetime", _PreClock),
         ):
             pre_content, _ = await fetch_quote(["GOOG"])
-        assert "GOOG  $330.95  -1.62% prev close  pre-market $328.50 -0.74%  vol 19.2M" in pre_content
+        assert (
+            "GOOG  last close 10-21 $330.95 -1.62% vs prev close $336.40  "
+            "pre-market $328.50 -0.74% vs last close @ 08:04 ET  vol 19.2M"
+        ) in pre_content
 
         post_snaps = [
             {
@@ -2224,6 +2248,7 @@ class TestFetchQuote:
                 "volume": 19_200_000,
                 "market_status": "late_trading",
                 "as_of": int(post_et.timestamp() * 1000),
+                "regular_as_of": today_close_ms,
                 "regular_trading_date": "2026-10-22",
                 "regular_only": False,
                 "tier": "delayed_15m",
@@ -2237,12 +2262,26 @@ class TestFetchQuote:
             patch(f"{_QUOTES_MOD}.datetime", _PostClock),
         ):
             post_content, _ = await fetch_quote(["GOOG"])
-        assert "GOOG  $330.95  -1.62% today  after-hours $333.76 +0.85%  vol 19.2M" in post_content
+        assert (
+            "GOOG  close 10-22 $330.95 -1.62% vs prev close $336.40  "
+            "after-hours $333.76 +0.85% vs close @ 17:15 ET  vol 19.2M"
+        ) in post_content
 
         closed_with_late = _snapshot_price_lines(
             {**post_snaps[0], "price": 999.0, "regular_close": 330.95}, "closed", "USD"
         )
-        assert any("**After-Hours Price:** $333.76" in ln for ln in closed_with_late)
+        assert any("**Regular Close (10-22):** $330.95" in ln for ln in closed_with_late)
+        assert any(
+            "**After-Hours Price:** $333.76 (+2.81 / +0.849% from close @ 17:15 ET)" in ln
+            for ln in closed_with_late
+        )
+        detail_rows = dict(
+            _quote_detail_rows(
+                "USD", None, 336.40, None, None, None, None, None, None,
+                prev_close_date="10-21",
+            )
+        )
+        assert detail_rows["Previous Close"] == "$336.40 (10-21 close)"
         closed_odd_lot = _snapshot_price_lines(
             {**post_snaps[0], "late_trading_change": None, "late_trading_change_percent": None},
             "closed",

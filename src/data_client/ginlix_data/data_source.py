@@ -230,6 +230,9 @@ class GinlixDataSource:
             "volume": int(session["volume"]) if session.get("volume") is not None else None,
             "market_status": raw.get("market_status"),
             "last_trade_price": last_trade.get("price") if last_trade else None,
+            # DALTON-HOOK(extended-hours-quotes): Preserve last_trade.last_updated separately
+            # from the composite feed as_of so extended-hours quotes only stamp the trade print time.
+            "last_trade_at": _epoch_ms((last_trade or {}).get("last_updated")),
             # The feed's newest stamp, not the last trade's alone: a thin name on a
             # realtime feed can go minutes without a print while its quote keeps
             # moving, and that is not a delay. An index has only its own stamp.

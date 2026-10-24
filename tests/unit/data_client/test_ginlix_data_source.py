@@ -70,13 +70,23 @@ def test_normalize_snapshot_tolerates_missing_session_fields():
 
 
 def test_the_print_time_is_the_last_trade_in_ms():
+    # DALTON-HOOK(extended-hours-quotes): Preserve last_trade_at separately from composite as_of.
     # Massive stamps trades in nanoseconds. Without an as_of the quote is never
     # measured, and a declared realtime tier then reads live on a weekend.
     raw = _raw_snapshot()
     raw["last_trade"]["last_updated"] = 1_789_000_000_123_456_789
-    assert GinlixDataSource._normalize_snapshot(raw)["as_of"] == 1_789_000_000_123
+    normalized = GinlixDataSource._normalize_snapshot(raw)
+    assert normalized["as_of"] == 1_789_000_000_123
+    assert normalized["last_trade_at"] == 1_789_000_000_123
+
+    raw["last_quote"] = {"last_updated": 1_789_000_900_000_000_000}
+    quote_ahead = GinlixDataSource._normalize_snapshot(raw)
+    assert quote_ahead["as_of"] == 1_789_000_900_000
+    assert quote_ahead["last_trade_at"] == 1_789_000_000_123
 
     index = {"ticker": "I:TST", "session": {"close": 1.0}, "last_updated": 1_789_000_000_000_000_000}
     assert GinlixDataSource._normalize_snapshot(index, "indices")["as_of"] == 1_789_000_000_000
 
-    assert GinlixDataSource._normalize_snapshot({"ticker": "TST", "session": {}})["as_of"] is None
+    empty_row = GinlixDataSource._normalize_snapshot({"ticker": "TST", "session": {}})
+    assert empty_row["as_of"] is None
+    assert empty_row["last_trade_at"] is None
