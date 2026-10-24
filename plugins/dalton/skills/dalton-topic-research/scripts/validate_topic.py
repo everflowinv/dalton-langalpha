@@ -28,8 +28,8 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-CITATION_RE = re.compile(r"\[S(\d+)\]")
-SOURCE_DEF_RE = re.compile(r"^\s*(?:[-*]\s+|\d+\.\s+)?\[S(\d+)\]\s+(.+)$")
+CITATION_RE = re.compile(r"\[(?:引用|S)(\d+)\]")
+SOURCE_DEF_RE = re.compile(r"^\s*(?:[-*]\s+|\d+\.\s+)?\[(?:引用|S)(\d+)\]:?\s+(.+)$")
 
 HIGH_TAG_RE = re.compile(r"【高(?:[：:][^】]*)?】")
 MED_TAG_RE = re.compile(r"【中(?:[：:][^】]*)?】")
@@ -70,8 +70,8 @@ REQUIRED_SECTIONS = [
     "风险与触发条件",
     "信息缺口与局限",
     "数字核验表",
-    "Sources",
 ]
+REQUIRED_CITATION_SECTIONS = ("引用", "Sources", "参考来源", "信息来源")
 
 
 def split_body_and_sources(text: str) -> Tuple[str, str, int]:
@@ -79,7 +79,7 @@ def split_body_and_sources(text: str) -> Tuple[str, str, int]:
     lines = text.splitlines()
     sources_idx = None
     for idx, line in enumerate(lines):
-        if re.match(r"^#{1,3}\s+(?:Sources|参考来源|信息来源)\b", line.strip(), re.IGNORECASE):
+        if re.match(r"^#{1,3}\s+(?:引用|Sources|参考来源|信息来源)\b", line.strip(), re.IGNORECASE):
             sources_idx = idx
             break
     if sources_idx is None:
@@ -355,6 +355,19 @@ def validate_markdown(text: str, *, as_of: Optional[str | date] = None) -> Dict[
                     "message": f"缺少必填章节标题：{sec}",
                 }
             )
+    cit_sec_pattern = re.compile(
+        r"^#{1,3}\s+.*(?:" + "|".join(re.escape(s) for s in REQUIRED_CITATION_SECTIONS) + r")\b",
+        re.MULTILINE | re.IGNORECASE,
+    )
+    if not cit_sec_pattern.search(text):
+        missing_sections.append("引用")
+        errors.append(
+            {
+                "code": "MISSING_SECTION",
+                "section": "引用",
+                "message": "缺少必填章节标题：引用",
+            }
+        )
 
     blind_spot_checked = "盲区检查完成" in text
     if not blind_spot_checked:

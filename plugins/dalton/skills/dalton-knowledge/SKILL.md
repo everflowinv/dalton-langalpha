@@ -35,7 +35,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 1. **证据台账只追加（`append_only_violation`）**：`thesis.evidence` 的已有条目必须原样保留在原位置；更正旧证据时，用 `append` 新增一条并填 `supersedes: "E-YYYYMMDD-NN"`。
 2. **正式版本只经发布写入（`official_is_publish_only`）**：`thesis.official` 代表 PM 批准的正式 House View 快照，只能由 `publish_report(..., updates_thesis=True)` 写入，工具路径一律禁止修改。
 3. **目标价与模型证据必须指向模型单元格（`target_needs_model_cell` / `model_needs_model_cell` / `model_tier_1_forbidden`）**：`house_view.target` 必须包含 `model_ref: {"kind": "model_cell", "path": "model/<TICKER>-model-v<NN>.xlsx", "cell": "Model!F42"}`，且该模型文件已登记在 `data/models.json` 的 `versions` 中；`source.type="model"` 的证据同样必须引用 `kind="model_cell"`（含 `path` 与 `Sheet!Cell`），且默认 tier 为 2–3，**禁止标 tier 1**。
-4. **写证据必填 `figures`，且 `source.ref` 指向一手文件或 `prov`**：写入 `thesis.evidence` 的每条证据都必须填写 `figures` 数组——将该条证据 `fact` 中的每个事实数字逐项拆出，每项含 `metric`、`period`、`value`、`unit`、`label`（供 `check_draft` / `publish_report` 通过 `evidence:E-YYYYMMDD-NN` 做结构化数值核验）；`source.ref` 必须指向一手文件或 `prov` 记录（如 `kind="filing"`、`"provenance"`、`"model_cell"`、`"url"` 或 `research/` 下的支线取证笔记），严禁指向本次的报告初稿或草稿（`drafts/...`）。
+4. **写证据必填 `figures`，且 `source.ref` 指向一手文件或 `prov`**：写入 `thesis.evidence` 的每条证据都必须填写 `figures` 数组——将该条证据 `fact` 中的每个事实数字逐项拆出，每项必填 `metric`（中英文指标名称，如 `"广告收入"`、`"Family DAP 同比增速"`）、`value`（数值）、`unit`（仅限枚举值 `"USD"` / `"USD_mn"` / `"USD_bn"` / `"HKD"` / `"HKD_mn"` / `"HKD_bn"` / `"CNY"` / `"CNY_mn"` / `"CNY_bn"` / `"CNY_100mn"` / `"pct"` / `"bp"` / `"x"` / `"count"` / `"count_mn"` / `"per_share"` / `"other"`，百分比填 `"pct"` 而非 `"%"`）、`period`（如 `"3Q26"`、`"FY2026"`、`"1H26"`、`"LTM"`、`"NTM"`、`"spot"`）、`label`（仅限六值枚举 `"reported"` / `"company_guidance"` / `"consensus"` / `"estimate"` / `"assumption"` / `"research_judgement"`，中文指标名放进 `metric`），供 `check_draft` / `publish_report` 通过 `evidence:E-YYYYMMDD-NN` 做结构化数值核验；`source.ref` 必须指向一手文件或 `prov` 记录（如 `kind="filing"`、`"provenance"`、`"model_cell"`、`"url"` 或 `research/` 下的支线取证笔记），严禁指向本次的报告初稿或草稿（`drafts/...`）。
 
 ## 4. `knowledge_update` 操作语言（Ops）示例
 
@@ -54,11 +54,12 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
         "tier": 1,
         "ref": {"kind": "filing", "form": "10-Q", "accession": "0001326801-26-000045"}
       },
-      "fact": "Family DAP 同比增长 6%，广告展示量 +10%，平均单价 +11%",
+      "fact": "3Q26 广告收入达 594 亿美元，Family DAP 同比增长 6%，广告展示量 +10%，平均单价 +11%",
       "figures": [
-        {"metric": "family_dap_yoy", "label": "Family DAP 同比增速", "period": "3Q26", "value": 6.0, "unit": "%"},
-        {"metric": "ad_impressions_yoy", "label": "广告展示量同比增速", "period": "3Q26", "value": 10.0, "unit": "%"},
-        {"metric": "avg_price_per_ad_yoy", "label": "广告平均单价同比增速", "period": "3Q26", "value": 11.0, "unit": "%"}
+        {"metric": "广告收入", "value": 59.4, "unit": "USD_bn", "period": "3Q26", "label": "reported"},
+        {"metric": "Family DAP 同比增速", "value": 6.0, "unit": "pct", "period": "3Q26", "label": "reported"},
+        {"metric": "广告展示量同比增速", "value": 10.0, "unit": "pct", "period": "3Q26", "label": "reported"},
+        {"metric": "广告平均单价同比增速", "value": 11.0, "unit": "pct", "period": "3Q26", "label": "reported"}
       ],
       "pillar_ids": ["P1"],
       "signal": "confirming",

@@ -11,8 +11,8 @@ from research_structure import QUESTIONS, CHAPTERS, CN_NUM, make_agenda, validat
 def specimen():
     parts = ["# 结构验收用虚拟公司", "## 核心判断", "当前观察，等待续费兑现。", "## 零、12 个核心问题与投资判断"]
     for i, (title, branches, chapters) in enumerate(QUESTIONS, 1):
-        parts += [f"### Q{i}. {title}", f"本题判断取决于续费与获客投入的传导，证据和反方详见对应章节。 [C-{i}]",
-                  f"来源：一手 —— [C-{i}]", "详见：" + "、".join(f"第{n}章" for n in chapters)]
+        parts += [f"### Q{i}. {title}", f"本题判断取决于续费与获客投入的传导，证据和反方详见对应章节。 [引用{i}]",
+                  f"来源：一手 —— [引用{i}]", "详见：" + "、".join(f"第{n}章" for n in chapters)]
     for i, title in enumerate(CHAPTERS, 1):
         parts += [f"## {CN_NUM[i]}、{title}", "本章提供论证。"]
     return "\n\n".join(parts) + "\n"
@@ -37,12 +37,12 @@ class ReportCases(unittest.TestCase):
                 self.assertTrue(validate_report_structure(changed))
 
     def test_last_question_cannot_borrow_next_chapter_source(self):
-        changed = self.text.replace("来源：一手 —— [C-12]", "")
-        changed = changed.replace("## 一、公司与业务", "## 一、公司与业务\n来源：一手 —— [C-12]")
+        changed = self.text.replace("来源：一手 —— [引用12]", "")
+        changed = changed.replace("## 一、公司与业务", "## 一、公司与业务\n来源：一手 —— [引用12]")
         self.assertTrue(any("Q12 缺来源" in x for x in validate_report_structure(changed)))
 
     def test_empty_source_cannot_read_next_line(self):
-        changed = self.text.replace("来源：一手 —— [C-1]", "来源：")
+        changed = self.text.replace("来源：一手 —— [引用1]", "来源：")
         self.assertTrue(any("Q1 缺来源" in x for x in validate_report_structure(changed)))
 
     def test_missing_chapter_target(self):
@@ -52,7 +52,7 @@ class ReportCases(unittest.TestCase):
     def test_hollow_answer_with_source_and_pointer(self):
         start = self.text.index("### Q1.")
         end = self.text.index("### Q2.")
-        changed = self.text[:start] + "### Q1. 业务是什么？\n来源：一手 —— [C-1]\n详见：第1章\n" + self.text[end:]
+        changed = self.text[:start] + "### Q1. 业务是什么？\n来源：一手 —— [引用1]\n详见：第1章\n" + self.text[end:]
         self.assertTrue(any("Q1 缺实质回答" in x for x in validate_report_structure(changed)))
 
     def test_fake_fenced_questions_not_counted(self):
@@ -63,7 +63,7 @@ class ReportCases(unittest.TestCase):
         self.assertTrue(validate_report_structure(changed))
 
     def test_disclosed_material_gap_allowed(self):
-        changed = self.text.replace("来源：一手 —— [C-1]", "来源：缺口 —— 需要分部利润表，已查年度报告未取得")
+        changed = self.text.replace("来源：一手 —— [引用1]", "来源：缺口 —— 需要分部利润表，已查年度报告未取得")
         self.assertEqual(validate_report_structure(changed), [])
 
     def test_reordered_detail_chapters_rejected(self):

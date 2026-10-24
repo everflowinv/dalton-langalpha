@@ -75,7 +75,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
      - **建模**：按 `references/model-spec.md` 构建 `model/<TICKER>-model-v01.xlsx`（`recalc.py` 与 `audit.py --strict` 通过，Checks 全 OK），与 memo 第一段并行；
      - **memo 第一段**（基本信息、核心判断、零、一、二）→ 跑 `validate_memo.py --part 1` 到 0 FAIL；
      - **memo 第二段**（三至六，引用模型三情景与敏感度）→ 跑 `validate_memo.py --part 2` 到 0 FAIL；
-     - **memo 第三段**（七至十、附录、引用清单，第七章含 C4 指引可信度表，第九章估值与模型一致）→ 跑 `validate_memo.py --mode full` 到 0 FAIL。
+     - **memo 第三段**（七至十、附录、`## 引用`，第七章含 C4 指引可信度表，第九章估值与模型一致）→ 跑 `validate_memo.py --mode full` 到 0 FAIL。
    - **阶段 4（审模型与独立审稿并行）**：`check-model` 审模型输出 `research/<D>-fc/model-check.md`（只出报告不改模型）∥ `dalton-reviewer` 审 memo。
    - **阶段 5（修订与知识层修订草案）**：按审稿意见与 `model-check.md` 修订 memo 和模型（若改模型，按 `.agents/skills/model-update/SKILL.md` 另存 `v02`，绝不覆盖 `v01`），并生成 `research/<D>-fc/knowledge-revision.json`。
 
@@ -95,7 +95,7 @@ Workflow 返回后，主智能体按以下 6 步完成收尾（完成契约在�
 
 ### 第 2 步：展示并写入知识层修订（`knowledge_update` + `knowledge_append_verdict`）
 - 读取 `research/<D>-fc/knowledge-revision.json`，将核心认知改动（`旧值 → 新值 → 原因与证据编号`）展示给 PM（无人值守运行时直接写入工作版本），然后逐个 doc 调用 `knowledge_update`：
-  - **`thesis`**：先写证据台账再定稿——更新支柱、确认/警告/证伪阈值、追加证据台账行（`source.type` 与 `source.tier` 对应；每条 `evidence` 必填 `figures` 数组，含 `metric`、`period`、`value`、`unit`、`label`，且 `source.ref` 指向一手文件或 `prov`，严禁指向本次草稿 `drafts/<D>-memo.md`）、更新 `house_view`（**硬约束**：若给出目标价，`house_view.target` 必须带 `model_ref.kind="model_cell"` 指向 Excel 模型单元格）；
+  - **`thesis`**：先写证据台账再定稿——更新支柱、确认/警告/证伪阈值、追加证据台账行（`source.type` 与 `source.tier` 对应；每条 `evidence` 必填 `figures` 数组，每项含 `metric`〔中文或英文指标名〕、`value`、`unit`〔枚举值 `"USD"` / `"USD_mn"` / `"USD_bn"` / `"HKD"` / `"HKD_mn"` / `"HKD_bn"` / `"CNY"` / `"CNY_mn"` / `"CNY_bn"` / `"CNY_100mn"` / `"pct"` / `"bp"` / `"x"` / `"count"` / `"count_mn"` / `"per_share"` / `"other"`，百分比用 `"pct"`〕、`period`、`label`〔仅限 `"reported"` / `"company_guidance"` / `"consensus"` / `"estimate"` / `"assumption"` / `"research_judgement"`〕，且 `source.ref` 指向一手文件或 `prov`，严禁指向本次草稿 `drafts/<D>-memo.md`）、更新 `house_view`（**硬约束**：若给出目标价，`house_view.target` 必须带 `model_ref.kind="model_cell"` 指向 Excel 模型单元格）；
   - **`debate`**：更新完整覆盖后的核心多空分歧、倾向、置信度与改判条件；
   - **`drivers`**：更新核心业务驱动树变量、模型敏感度与高频跟踪指标；
   - **`management`**：写入 C4 支线整理的 12 季指引兑现历史（`guidance_history`）与指引风格定性结论（`guidance_style`：保守/中性/激进、收入还是利润更保守、全年修正节奏）；

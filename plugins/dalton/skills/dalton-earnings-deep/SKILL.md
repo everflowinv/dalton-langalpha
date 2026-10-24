@@ -104,7 +104,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 Workflow 结束后（或独立模式完成后），由当前主智能体读取 `research/<D>-deep-<quarter>/knowledge-revision.json`，执行以下收尾动作（深度链通常在无人值守自动运行，**只修改知识层工作版本，不动 `thesis.official`**）：
 
 1. **调用 `knowledge_update` 逐项更新知识层**：
-   - `doc="thesis"`：先写证据台账再定稿——更新各支柱信号、状态与新证据行（每条 `evidence` 必填 `figures` 数组，含 `metric`、`period`、`value`、`unit`、`label`，且 `source.ref` 指向一手文件或 `prov`，严禁指向本次草稿；若草稿期审稿缺席 `review_done == false`，非 `NO_CHANGE` 结论注明“待审”，暂不直接下调核心支柱状态）；
+   - `doc="thesis"`：先写证据台账再定稿——更新各支柱信号、状态与新证据行（每条 `evidence` 必填 `figures` 数组，每项含 `metric`〔中文或英文指标名〕、`value`、`unit`〔枚举值 `"USD"` / `"USD_mn"` / `"USD_bn"` / `"HKD"` / `"HKD_mn"` / `"HKD_bn"` / `"CNY"` / `"CNY_mn"` / `"CNY_bn"` / `"CNY_100mn"` / `"pct"` / `"bp"` / `"x"` / `"count"` / `"count_mn"` / `"per_share"` / `"other"`，百分比用 `"pct"`〕、`period`、`label`〔仅限 `"reported"` / `"company_guidance"` / `"consensus"` / `"estimate"` / `"assumption"` / `"research_judgement"`〕，且 `source.ref` 指向一手文件或 `prov`，严禁指向本次草稿；若草稿期审稿缺席 `review_done == false`，非 `NO_CHANGE` 结论注明“待审”，暂不直接下调核心支柱状态）；
    - `doc="debate"`：更新本次财报验证后的多空分歧状态；
    - `doc="drivers"`：追加当季核心财务与经营 KPI 最新实际读数；
    - `doc="management"`：补填 `guidance_history[].actual` 与 `outcome`；若连续两季同类指标同向偏差，更新 `guidance_style` / `credibility_notes`；
