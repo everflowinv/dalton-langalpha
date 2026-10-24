@@ -482,6 +482,18 @@ async def _after_settling(
                 delivery_result = automation_delivery.unsent(delivery) or None
             if delivery_result is not None:
                 await _record_delivery(execution_id, delivery_result)
+    # DALTON-HOOK(dalton-notify): push completed Dalton automation results to analyst via OpenClaw
+    if outcome is Outcome.COMPLETED:
+        from src.dalton.notify.dispatch import on_automation_settled
+
+        await on_automation_settled(
+            automation=automation,
+            execution_id=execution_id,
+            thread_id=thread_id,
+            run_id=run_id,
+            workspace_id=workspace_id,
+            final_text=final_text or (row.get("result_excerpt") if isinstance(row, dict) else None),
+        )
     if row["settled_from"] == "waiting" and thread_id:
         await publish_automation_wait(
             user_id=automation["user_id"],

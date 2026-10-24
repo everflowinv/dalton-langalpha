@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 import logging
+import re
 from typing import Any
 
 from src.dalton.credentials import get_team_credential_holder_id
@@ -35,15 +36,35 @@ DALTON_MODEL_LIST_KEYS: tuple[str, ...] = (
 )
 
 DALTON_TIMEOUT_KEY = "dalton_audit_timeout_s"
+DALTON_NOTIFY_ENABLED_KEY = "dalton_notify_enabled"
+DALTON_NOTIFY_TARGETS_KEY = "dalton_notify_targets"
+DALTON_NOTIFY_OVERRIDES_KEY = "dalton_notify_overrides"
 
 DALTON_MODEL_PREF_KEYS: tuple[str, ...] = (
     *DALTON_SINGLE_MODEL_KEYS,
     *DALTON_MODEL_LIST_KEYS,
     DALTON_TIMEOUT_KEY,
+    DALTON_NOTIFY_ENABLED_KEY,
+    DALTON_NOTIFY_TARGETS_KEY,
+    DALTON_NOTIFY_OVERRIDES_KEY,
 )
 
 DALTON_AUDIT_TIMEOUT_MIN = 60
 DALTON_AUDIT_TIMEOUT_MAX = 1800
+
+_FEISHU_NOTIFY_TARGET_RE = re.compile(r"^feishu:user:ou_[A-Za-z0-9_-]+$")
+_DISCORD_NOTIFY_TARGET_RE = re.compile(r"^discord:user:[0-9]+$")
+
+
+def is_valid_dalton_notify_target(target: str) -> bool:
+    """Return True when ``target`` matches ``feishu:user:ou_<id>`` or ``discord:user:<digits>``."""
+    if not isinstance(target, str):
+        return False
+    cleaned = target.strip()
+    return bool(
+        _FEISHU_NOTIFY_TARGET_RE.match(cleaned)
+        or _DISCORD_NOTIFY_TARGET_RE.match(cleaned)
+    )
 
 
 def _dedup_str_list(items: Iterable[Any]) -> list[str]:
@@ -80,6 +101,22 @@ def _normalize_stored_value(key: str, raw: Any) -> Any:
             return None
         if isinstance(raw, int) and DALTON_AUDIT_TIMEOUT_MIN <= raw <= DALTON_AUDIT_TIMEOUT_MAX:
             return raw
+        return None
+    if key == DALTON_NOTIFY_ENABLED_KEY:
+        return raw if isinstance(raw, bool) else None
+    if key == DALTON_NOTIFY_TARGETS_KEY:
+        if isinstance(raw, list):
+            return [t for t in _dedup_str_list(raw) if is_valid_dalton_notify_target(t)]
+        if isinstance(raw, str) and is_valid_dalton_notify_target(raw.strip()):
+            return [raw.strip()]
+        return None
+    if key == DALTON_NOTIFY_OVERRIDES_KEY:
+        if isinstance(raw, Mapping):
+            out_map: dict[str, bool] = {}
+            for k, v in raw.items():
+                if isinstance(k, str) and k.strip() and isinstance(v, bool):
+                    out_map[k.strip()] = v
+            return out_map
         return None
     return raw
 
@@ -220,6 +257,12 @@ async def dalton_model_pref(user_id: str | None, key: str) -> Any:
     caller's (`user_id`) `custom_models` so a caller's custom model never shadows
     a system model in `LLMService`.
     """
+    if key == DALTON_NOTIFY_ENABLED_KEY:
+        return await resolve_dalton_notify_enabled(user_id)
+    if key == DALTON_NOTIFY_TARGETS_KEY:
+        return await resolve_dalton_notify_targets(user_id)
+    if key == DALTON_NOTIFY_OVERRIDES_KEY:
+        return await resolve_dalton_notify_overrides(user_id)
     uid = (user_id or "").strip()
     caller_custom_set: set[str] = set()
     if uid:
@@ -301,11 +344,83 @@ async def resolve_dalton_extract_model(user_id: str | None = None) -> str:
     return str(val).strip() if isinstance(val, str) else ""
 
 
+async def resolve_dalton_notify_enabled(user_id: str | None = None) -> bool:
+    """Resolve per-user Feishu/Discord notification master switch (default ``False``, isolated per user)."""
+    uid = (user_id or "").strip()
+    if not uid:
+        return False
+    try:
+        row = await get_user_preferences(uid)
+    except RuntimeError as exc:
+        if "pool is not open" in str(exc):
+            return False
+        raise
+    if not isinstance(row, Mapping):
+        return False
+    for bag_key in ("model_preference", "other_preference"):
+        bag = row.get(bag_key)
+        if isinstance(bag, Mapping) and DALTON_NOTIFY_ENABLED_KEY in bag:
+            normalized = _normalize_stored_value(
+                DALTON_NOTIFY_ENABLED_KEY, bag.get(DALTON_NOTIFY_ENABLED_KEY)
+            )
+            return bool(normalized) if isinstance(normalized, bool) else False
+    return False
+
+
+async def resolve_dalton_notify_targets(user_id: str | None = None) -> list[str]:
+    """Resolve per-user notification targets for ``user_id`` (isolated per user, never inherited)."""
+    uid = (user_id or "").strip()
+    if not uid:
+        return []
+    try:
+        row = await get_user_preferences(uid)
+    except RuntimeError as exc:
+        if "pool is not open" in str(exc):
+            return []
+        raise
+    if not isinstance(row, Mapping):
+        return []
+    for bag_key in ("model_preference", "other_preference"):
+        bag = row.get(bag_key)
+        if isinstance(bag, Mapping) and DALTON_NOTIFY_TARGETS_KEY in bag:
+            normalized = _normalize_stored_value(
+                DALTON_NOTIFY_TARGETS_KEY, bag.get(DALTON_NOTIFY_TARGETS_KEY)
+            )
+            return list(normalized) if isinstance(normalized, list) else []
+    return []
+
+
+async def resolve_dalton_notify_overrides(user_id: str | None = None) -> dict[str, bool]:
+    """Resolve per-user automation notification overrides ``{automation_name_or_category: bool}``."""
+    uid = (user_id or "").strip()
+    if not uid:
+        return {}
+    try:
+        row = await get_user_preferences(uid)
+    except RuntimeError as exc:
+        if "pool is not open" in str(exc):
+            return {}
+        raise
+    if not isinstance(row, Mapping):
+        return {}
+    for bag_key in ("model_preference", "other_preference"):
+        bag = row.get(bag_key)
+        if isinstance(bag, Mapping) and DALTON_NOTIFY_OVERRIDES_KEY in bag:
+            normalized = _normalize_stored_value(
+                DALTON_NOTIFY_OVERRIDES_KEY, bag.get(DALTON_NOTIFY_OVERRIDES_KEY)
+            )
+            return dict(normalized) if isinstance(normalized, Mapping) else {}
+    return {}
+
+
 resolve_audit_model = resolve_dalton_audit_model
 resolve_audit_fallback_models = resolve_dalton_audit_fallback_models
 resolve_audit_timeout_s = resolve_dalton_audit_timeout_s
 resolve_reviewer_models = resolve_dalton_reviewer_models
 resolve_extract_model = resolve_dalton_extract_model
+resolve_notify_enabled = resolve_dalton_notify_enabled
+resolve_notify_targets = resolve_dalton_notify_targets
+resolve_notify_overrides = resolve_dalton_notify_overrides
 
 
 def _build_catalog_model_set(
@@ -363,8 +478,12 @@ def validate_dalton_model_preferences(
 
     from src.dalton.llm.role_policy import is_forbidden_for_roles
 
-    catalog_set = _build_catalog_model_set(catalog_models)
-    custom_set = _extract_custom_model_set(effective_bag)
+    has_model_keys = any(
+        k in model_preference
+        for k in (*DALTON_SINGLE_MODEL_KEYS, *DALTON_MODEL_LIST_KEYS)
+    )
+    catalog_set = _build_catalog_model_set(catalog_models) if has_model_keys else set()
+    custom_set = _extract_custom_model_set(effective_bag) if has_model_keys else set()
 
     def _check_system_model(field_key: str, model_name: str) -> None:
         if model_name in custom_set or model_name not in catalog_set:
@@ -434,3 +553,58 @@ def validate_dalton_model_preferences(
                 DALTON_TIMEOUT_KEY,
                 f"{DALTON_TIMEOUT_KEY} 必须在 {DALTON_AUDIT_TIMEOUT_MIN}–{DALTON_AUDIT_TIMEOUT_MAX} 秒之间",
             )
+
+    if DALTON_NOTIFY_ENABLED_KEY in model_preference:
+        raw_enabled = model_preference[DALTON_NOTIFY_ENABLED_KEY]
+        if raw_enabled is None:
+            model_preference[DALTON_NOTIFY_ENABLED_KEY] = None
+        elif not isinstance(raw_enabled, bool):
+            raise TuningError(
+                DALTON_NOTIFY_ENABLED_KEY,
+                f"{DALTON_NOTIFY_ENABLED_KEY} 必须为布尔值（true/false）",
+            )
+
+    if DALTON_NOTIFY_TARGETS_KEY in model_preference:
+        raw_targets = model_preference[DALTON_NOTIFY_TARGETS_KEY]
+        if raw_targets is None:
+            model_preference[DALTON_NOTIFY_TARGETS_KEY] = None
+        elif not isinstance(raw_targets, list):
+            raise TuningError(
+                DALTON_NOTIFY_TARGETS_KEY,
+                f"{DALTON_NOTIFY_TARGETS_KEY} 必须为字符串列表（如 feishu:user:ou_xxx 或 discord:user:123）",
+            )
+        else:
+            deduped_targets: list[str] = []
+            seen_targets: set[str] = set()
+            for item in raw_targets:
+                if not isinstance(item, str) or not is_valid_dalton_notify_target(item):
+                    raise TuningError(
+                        DALTON_NOTIFY_TARGETS_KEY,
+                        f"{DALTON_NOTIFY_TARGETS_KEY}: 目标格式无效 {item!r}，仅支持 feishu:user:<open_id> 或 discord:user:<数字id>",
+                    )
+                cleaned_target = item.strip()
+                if cleaned_target not in seen_targets:
+                    seen_targets.add(cleaned_target)
+                    deduped_targets.append(cleaned_target)
+            model_preference[DALTON_NOTIFY_TARGETS_KEY] = deduped_targets
+
+    if DALTON_NOTIFY_OVERRIDES_KEY in model_preference:
+        raw_overrides = model_preference[DALTON_NOTIFY_OVERRIDES_KEY]
+        if raw_overrides is None:
+            model_preference[DALTON_NOTIFY_OVERRIDES_KEY] = None
+        elif not isinstance(raw_overrides, Mapping):
+            raise TuningError(
+                DALTON_NOTIFY_OVERRIDES_KEY,
+                f"{DALTON_NOTIFY_OVERRIDES_KEY} 必须为任务名或类别到布尔值的映射对象",
+            )
+        else:
+            normalized_overrides: dict[str, bool | None] = {}
+            for k, v in raw_overrides.items():
+                if not isinstance(k, str) or not k.strip() or (v is not None and not isinstance(v, bool)):
+                    raise TuningError(
+                        DALTON_NOTIFY_OVERRIDES_KEY,
+                        f"{DALTON_NOTIFY_OVERRIDES_KEY}: 键必须为非空字符串且值必须为布尔值或 null",
+                    )
+                normalized_overrides[k.strip()] = v
+            model_preference[DALTON_NOTIFY_OVERRIDES_KEY] = normalized_overrides
+

@@ -16,6 +16,8 @@ import { usePrefetchExecutions } from '../hooks/useExecutions';
 import type { OrderedGroup } from '../hooks/useOrderedGroups';
 import { INSTANT, SELECTION_SPRING } from '../utils/motion';
 import { StatusGlyph } from './StatusMark';
+// DALTON-HOOK(dalton-notify): per-task Feishu/Discord notify toggle
+import { AutomationNotifyToggle } from '@/pages/Settings/panels/dalton/AutomationNotifyToggle';
 import './AutomationList.css';
 
 /** A finished group longer than this starts folded when anything else is on
@@ -151,38 +153,41 @@ export function AutomationList({ groups, readings, selectedId, onSelect, keyboar
                 const ui = automationStatusUi(a);
                 const selected = a.automation_id === selectedId;
                 return (
-                  <button
-                    key={a.automation_id}
-                    type="button"
-                    className="automations-list-row"
-                    data-id={a.automation_id}
-                    aria-current={selected ? 'true' : undefined}
-                    tabIndex={keyboardNav && a.automation_id !== tabStop ? -1 : undefined}
-                    onClick={() => {
-                      setViaKeys(false);
-                      onSelect(a.automation_id);
-                    }}
-                    onPointerEnter={() => prefetch(a.automation_id)}
-                  >
-                    {selected && (
-                      <motion.span
-                        layoutId="automations-list-selection"
-                        layoutCrossfade={false}
-                        className="automations-list-highlight"
-                        style={{ borderRadius: 8, opacity: viaKeys ? 1 : 0 }}
-                        transition={viaKeys ? SELECTION_SPRING : INSTANT}
-                        aria-hidden="true"
-                      />
-                    )}
-                    <span className="automations-list-glyph">
-                      <StatusGlyph ui={ui} label={t(ui.labelKey)} size={14} />
-                    </span>
-                    <span className="min-w-0 flex-1">
-                      <span className="automations-list-name">{a.name}</span>
-                      <span className="automation-mono automations-list-sub">{scheduleLine(a, t, homeZone, locale)}</span>
-                    </span>
-                    <span className="automation-mono automations-list-trailing">{trailing(a, group)}</span>
-                  </button>
+                  <div key={a.automation_id} className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      className="automations-list-row flex-1"
+                      data-id={a.automation_id}
+                      aria-current={selected ? 'true' : undefined}
+                      tabIndex={keyboardNav && a.automation_id !== tabStop ? -1 : undefined}
+                      onClick={() => {
+                        setViaKeys(false);
+                        onSelect(a.automation_id);
+                      }}
+                      onPointerEnter={() => prefetch(a.automation_id)}
+                    >
+                      {selected && (
+                        <motion.span
+                          layoutId="automations-list-selection"
+                          layoutCrossfade={false}
+                          className="automations-list-highlight"
+                          style={{ borderRadius: 8, opacity: viaKeys ? 1 : 0 }}
+                          transition={viaKeys ? SELECTION_SPRING : INSTANT}
+                          aria-hidden="true"
+                        />
+                      )}
+                      <span className="automations-list-glyph">
+                        <StatusGlyph ui={ui} label={t(ui.labelKey)} size={14} />
+                      </span>
+                      <span className="min-w-0 flex-1">
+                        <span className="automations-list-name">{a.name}</span>
+                        <span className="automation-mono automations-list-sub">{scheduleLine(a, t, homeZone, locale)}</span>
+                      </span>
+                      <span className="automation-mono automations-list-trailing">{trailing(a, group)}</span>
+                    </button>
+                    {/* DALTON-HOOK(dalton-notify): per-task Feishu/Discord notify switch */}
+                    <AutomationNotifyToggle automation={a} />
+                  </div>
                 );
               })}
           </div>

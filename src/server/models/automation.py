@@ -660,6 +660,26 @@ class AutomationResponse(BaseModel):
     updated_at: datetime
 
     last_execution: Optional[AutomationExecutionResponse] = None
+    # DALTON-HOOK(dalton-notify): expose pushable category, effective toggle state, and source
+    dalton_notify_category: Optional[str] = None
+    dalton_notify_effective: Optional[bool] = None
+    dalton_notify_source: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _populate_dalton_notify_category(self) -> "AutomationResponse":
+        if self.dalton_notify_category is None:
+            from src.dalton.notify.dispatch import resolve_automation_notify_state
+
+            cat, eff, src = resolve_automation_notify_state(
+                {"name": self.name, "metadata": self.metadata}
+            )
+            if cat is not None:
+                self.dalton_notify_category = cat
+                if self.dalton_notify_effective is None:
+                    self.dalton_notify_effective = eff
+                if self.dalton_notify_source is None:
+                    self.dalton_notify_source = src
+        return self
 
     model_config = {"from_attributes": True}
 

@@ -75,7 +75,12 @@ async def create_automation(
         automation = await handler.create_automation(user_id=user_id, data=request)
     except handler.DeliveryRefused as e:
         return _delivery_refused(e)
-    return AutomationResponse.model_validate(automation)
+    resp = AutomationResponse.model_validate(automation)
+    # DALTON-HOOK(dalton-notify): populate user-specific notify effective value and source
+    from src.dalton.notify.dispatch import populate_automation_notify_state
+
+    await populate_automation_notify_state(user_id, [resp])
+    return resp
 
 
 @router.get("/automations", response_model=AutomationsListResponse)
@@ -90,8 +95,13 @@ async def list_automations(
     automations, total = await auto_db.list_automations(
         user_id, status=status, limit=limit, offset=offset,
     )
+    items = [AutomationResponse.model_validate(a) for a in automations]
+    # DALTON-HOOK(dalton-notify): populate user-specific notify effective value and source
+    from src.dalton.notify.dispatch import populate_automation_notify_state
+
+    await populate_automation_notify_state(user_id, items)
     return AutomationsListResponse(
-        automations=[AutomationResponse.model_validate(a) for a in automations],
+        automations=items,
         total=total,
     )
 
@@ -207,7 +217,12 @@ async def get_automation(
     automation = await auto_db.get_automation(str(automation_id), user_id)
     if not automation:
         raise_not_found("Automation")
-    return AutomationResponse.model_validate(automation)
+    resp = AutomationResponse.model_validate(automation)
+    # DALTON-HOOK(dalton-notify): populate user-specific notify effective value and source
+    from src.dalton.notify.dispatch import populate_automation_notify_state
+
+    await populate_automation_notify_state(user_id, [resp])
+    return resp
 
 
 @router.patch("/automations/{automation_id}", response_model=AutomationResponse)
@@ -235,7 +250,12 @@ async def update_automation(
         )
     if not automation:
         raise_not_found("Automation")
-    return AutomationResponse.model_validate(automation)
+    resp = AutomationResponse.model_validate(automation)
+    # DALTON-HOOK(dalton-notify): populate user-specific notify effective value and source
+    from src.dalton.notify.dispatch import populate_automation_notify_state
+
+    await populate_automation_notify_state(user_id, [resp])
+    return resp
 
 
 @router.delete("/automations/{automation_id}", status_code=204)
@@ -277,7 +297,12 @@ async def pause_automation(
     automation = await handler.pause_automation(str(automation_id), user_id)
     if not automation:
         raise_not_found("Automation")
-    return AutomationResponse.model_validate(automation)
+    resp = AutomationResponse.model_validate(automation)
+    # DALTON-HOOK(dalton-notify): populate user-specific notify effective value and source
+    from src.dalton.notify.dispatch import populate_automation_notify_state
+
+    await populate_automation_notify_state(user_id, [resp])
+    return resp
 
 
 @router.post("/automations/{automation_id}/resume", response_model=AutomationResponse)
@@ -290,7 +315,12 @@ async def resume_automation(
     automation = await handler.resume_automation(str(automation_id), user_id)
     if not automation:
         raise_not_found("Automation")
-    return AutomationResponse.model_validate(automation)
+    resp = AutomationResponse.model_validate(automation)
+    # DALTON-HOOK(dalton-notify): populate user-specific notify effective value and source
+    from src.dalton.notify.dispatch import populate_automation_notify_state
+
+    await populate_automation_notify_state(user_id, [resp])
+    return resp
 
 
 @router.post("/automations/{automation_id}/executions/{execution_id}/skip")
@@ -325,7 +355,12 @@ async def dismiss_execution(
     )
     if not automation:
         raise_not_found("Automation")
-    return AutomationResponse.model_validate(automation)
+    resp = AutomationResponse.model_validate(automation)
+    # DALTON-HOOK(dalton-notify): populate user-specific notify effective value and source
+    from src.dalton.notify.dispatch import populate_automation_notify_state
+
+    await populate_automation_notify_state(user_id, [resp])
+    return resp
 
 
 # =============================================================================

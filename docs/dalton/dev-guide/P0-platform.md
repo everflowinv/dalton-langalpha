@@ -1881,6 +1881,7 @@ async def get_run_charge_usd(run_ref: str) -> Decimal | None
 | yfinance-cache | `src/data_client/yfinance/__init__.py` | 导入时调用 `src/dalton/yfinance_cache.configure_process_cache`：每个进程的 yfinance sqlite 缓存（tz/cookie/ISIN）放到 `<tmp>/langalpha-yfinance/<pid>`，`--workers N` 并发打开同一库时 `PRAGMA journal_mode=wal` 报 `database is locked` 的根因消除 | 约 5 |
 | hermetic-prebuilt-workflows | `tests/unit/ptc_agent/agent/backends/test_composite_folder_search.py` | 测试把内置工作流层置空（仓库 `workflows/` 里有 Dalton 的预置工作流），断言只看用户层的 `brief.js` | 约 8 |
 | bridge-admin-token | `src/ptc_agent/core/sandbox/ptc_sandbox.py`、`src/ptc_agent/core/tool_generator.py` | 沙箱输出边界（`_build_sandbox_env_vars` 与 `generate_client_config`）统一按值拦截 `DALTON_BRIDGE_ADMIN_TOKEN`（含环境变量、URL、headers、args），移除命中项、仅记录项名告警并将对应 MCP 服务配置标记为不可用 | 各 2–6 |
+| dalton-notify | `src/server/services/automation_settlement.py`、`src/server/models/automation.py`、`src/server/app/automations.py`、`web/src/types/automation.ts`、`web/src/pages/Automations/components/AutomationList.tsx`、`web/src/pages/Automations/__tests__/Automations.delivery.test.tsx` | 自动任务完成后经 OpenClaw 推送分析师本人飞书卡片 / Discord 私信，及任务页逐项推送开关与后端生效值返回 | 各 2–15 |
 
 细节见 P0D 的 P0-D.2（超时）、P0-D.3（来源显示降级版）和 P1.1（skill 注册）。PK 篇的钩子列在 PK §5；`check_hooks.sh` 比对的是"本附录 + PK §5"的并集。P3 的来源定位改动（P0-D.3b）落地时再并入本表。
 
