@@ -9,7 +9,7 @@
 import { useMemo } from 'react';
 import type { TFunction } from 'i18next';
 import { fixed2 } from '@/lib/format';
-import { getExtendedHoursInfo } from '@/lib/marketUtils';
+import { deriveQuoteDisplay } from '@/lib/quotes'; // DALTON-HOOK(extended-hours-quotes)
 import { quoteCurrency } from '@/lib/bars';
 import { resolveDualName, type SymbolDisplayOverride } from '@/lib/displayName';
 import { providerLabel } from '@/lib/providerLabels';
@@ -121,26 +121,34 @@ export function deriveStockQuote({
   // with a coherent change pair against the previous close; the extended move
   // renders on its own against its declared anchor. A live tick (has a
   // timestamp; quote rows don't) overrides the derived ext price.
-  const { extPct, extType, extPrice, extChange, extAnchor, regularClose } = getExtendedHoursInfo(marketStatus, snapshot);
+  // DALTON-HOOK(extended-hours-quotes): Delegate headline and extended-hours derivation to shared deriveQuoteDisplay; company page only treats realTimePrice.timestamp as a live tick.
   const tickAt = (realTimePrice as PriceUpdate | null)?.timestamp ?? null;
-  const tickPrice = tickAt != null ? (realTimePrice?.price ?? null) : null;
-  const extDisplayPrice = tickPrice ?? extPrice;
-  const extDisplayChange = tickPrice != null && extAnchor != null ? tickPrice - extAnchor : extChange;
-  const extDisplayPct = tickPrice != null && extAnchor ? ((tickPrice - extAnchor) / extAnchor) * 100 : extPct;
-  const settledClose = (extType === 'post' ? regularClose : previousClose) ?? null;
-  const settledChange = extType === 'post' && regularClose != null && previousClose != null ? regularClose - previousClose : null;
-  const settledChangePct = settledChange != null && previousClose ? (settledChange / previousClose) * 100 : null;
+  const quoteRow = snapshot
+    ? {
+        ...snapshot,
+        live_tick_at: null,
+        liveTickAt: null,
+        ...(quoteData?.previousClose != null ? { fallbackPreviousClose: quoteData.previousClose } : {}),
+      }
+    : null;
+  const liveTick =
+    tickAt != null
+      ? { price: realTimePrice?.price ?? null, change: realTimePrice?.change ?? null, changePercent: realTimePrice?.changePercent ?? null, timestamp: tickAt }
+      : null;
+  const display = deriveQuoteDisplay(quoteRow, marketStatus, liveTick);
+  const extType = display.session === 'regular' ? null : display.session;
+  const settledClose = extType ? display.mainPrice : null;
 
-  const ext = extType && settledClose != null && extDisplayPrice != null && extDisplayPct != null
+  const ext = extType && settledClose != null && display.extPrice != null && display.extChangePct != null
     ? {
         type: extType,
-        price: extDisplayPrice,
-        change: extDisplayChange ?? null,
-        pct: extDisplayPct,
+        price: display.extPrice,
+        change: display.extChange,
+        pct: display.extChangePct,
         settledClose,
-        settledChange,
-        settledChangePct,
-        settledTone: toneOf(settledChange),
+        settledChange: display.mainChange,
+        settledChangePct: display.mainChangePct,
+        settledTone: toneOf(display.mainChange ?? display.mainChangePct),
       }
     : null;
 

@@ -200,10 +200,12 @@ export default function useMarketDataWS(): UseMarketDataWSReturn {
     // Write-through into the shared quote cache so REST and WS agree. Only the
     // live fields (price/change) are merged; name/previous_close/day-OHLC from
     // the REST snapshot are preserved, and an unwatched symbol is never seeded.
+    // DALTON-HOOK(extended-hours-quotes): Include tick timestamp when writing through to quote cache.
     writeQuoteFromWs(queryClient, symbol, {
       price: priceUpdate.price,
       change: priceUpdate.change,
       changePercent: priceUpdate.changePercent,
+      timestamp: priceUpdate.timestamp,
     });
   }, [resetStaleTimer, queryClient]);
 

@@ -19,13 +19,24 @@ export interface PortfolioRow {
   currency: string;
   notes?: string;
   price: number;
+  change?: number | null;
+  changePercent?: number | null;
   marketValue?: number | null;
   unrealizedPlPercent?: number | null;
   isPositive?: boolean;
   quoteAvailable?: boolean;
   previousClose?: number | null;
+  // DALTON-HOOK(extended-hours-quotes): Extended-hours and regular-session fields for accurate card display.
+  regularClose?: number | null;
+  regularTradingChange?: number | null;
+  regularTradingChangePercent?: number | null;
+  earlyTradingChange?: number | null;
   earlyTradingChangePercent?: number | null;
+  lateTradingChange?: number | null;
   lateTradingChangePercent?: number | null;
+  lastMinuteClose?: number | null;
+  lastTradePrice?: number | null;
+  liveTickAt?: number | null;
   [key: string]: unknown;
 }
 
@@ -123,13 +134,24 @@ export function usePortfolioData() {
         currency: h.currency ?? 'USD',
         notes: h.notes ?? '',
         price,
+        change: quoteAvailable ? p.change ?? null : null,
+        changePercent: quoteAvailable ? p.changePercent ?? null : null,
         marketValue,
         quoteAvailable,
         unrealizedPlPercent: plPct,
         isPositive: quoteAvailable && plPct != null ? plPct >= 0 : true,
         previousClose: p.previousClose ?? null,
+        // DALTON-HOOK(extended-hours-quotes): Forward extended-hours and regular-close fields from StockPrice.
+        regularClose: p.regularClose ?? null,
+        regularTradingChange: p.regularTradingChange ?? null,
+        regularTradingChangePercent: p.regularTradingChangePercent ?? null,
+        earlyTradingChange: p.earlyTradingChange ?? null,
         earlyTradingChangePercent: p.earlyTradingChangePercent ?? null,
+        lateTradingChange: p.lateTradingChange ?? null,
         lateTradingChangePercent: p.lateTradingChangePercent ?? null,
+        lastMinuteClose: p.lastMinuteClose ?? null,
+        lastTradePrice: p.lastTradePrice ?? null,
+        liveTickAt: p.liveTickAt ?? null,
       };
     });
   }, [holdings, symbols, quotes]);

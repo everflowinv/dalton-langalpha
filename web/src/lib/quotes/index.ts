@@ -8,3 +8,6 @@ export type { QuoteRow } from './quoteBatcher';
 export { snapshotToStockPrice } from './quoteAdapters';
 export { writeQuoteFromWs } from './quoteWriteThrough';
 export type { WsQuoteFields } from './quoteWriteThrough';
+// DALTON-HOOK(extended-hours-quotes): Export shared deriveQuoteDisplay helper, formatters, and types from dalton quotes dir.
+export { deriveQuoteDisplay, roundQuote2, formatSignedPct2 } from '@/lib/dalton/quotes/deriveQuoteDisplay';
+export type { QuoteDisplayInput, LiveTickInput, QuoteDisplayResult, MarketStatusInput } from '@/lib/dalton/quotes/deriveQuoteDisplay';

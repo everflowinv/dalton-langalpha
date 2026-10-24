@@ -83,8 +83,10 @@ export interface SnapshotData {
   low?: number | null;
   volume?: number | null;
   last_minute_close?: number | null;
+  last_trade_price?: number | null; // DALTON-HOOK(extended-hours-quotes)
   regular_close?: number | null;
   regular_trading_change?: number | null;
+  regular_trading_change_percent?: number | null; // DALTON-HOOK(extended-hours-quotes)
   early_trading_change?: number | null;
   early_trading_change_percent?: number | null;
   late_trading_change?: number | null;
@@ -94,6 +96,8 @@ export interface SnapshotData {
   tier?: QuoteTier | null;
   /** Time of the quoted print (Unix ms) when the provider reports one. */
   as_of?: number | null;
+  /** Timestamp (Unix ms) stamped by writeQuoteFromWs when a live WS tick merges into this row. */
+  live_tick_at?: number | null; // DALTON-HOOK(extended-hours-quotes)
   /** Freshness measured for this quote at response time. */
   freshness?: Freshness | null;
   [key: string]: unknown;
@@ -118,8 +122,17 @@ export interface StockPrice {
   isPositive: boolean;
   quoteAvailable?: boolean;
   previousClose?: number | null;
+  // DALTON-HOOK(extended-hours-quotes): Extended-hours and regular-session fields for accurate card display.
+  regularClose?: number | null;
+  regularTradingChange?: number | null;
+  regularTradingChangePercent?: number | null;
+  earlyTradingChange?: number | null;
   earlyTradingChangePercent?: number | null;
+  lateTradingChange?: number | null;
   lateTradingChangePercent?: number | null;
+  lastMinuteClose?: number | null;
+  lastTradePrice?: number | null;
+  liveTickAt?: number | null;
 }
 
 // --- Chart Data ---

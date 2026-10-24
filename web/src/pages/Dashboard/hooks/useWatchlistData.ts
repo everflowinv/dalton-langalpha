@@ -9,9 +9,16 @@ import {
 } from '../utils/api';
 import { useQuotes, snapshotToStockPrice } from '@/lib/quotes';
 import { quoteCurrency } from '@/lib/bars/exchanges';
+import {
+  deriveQuoteDisplay,
+  roundQuote2,
+  type MarketStatusInput,
+} from '@/lib/dalton/quotes/deriveQuoteDisplay'; // DALTON-HOOK(extended-hours-quotes)
 import type { QuoteRow } from '../widgets/framework/snapshotSerializers';
 import { registerAuthReset } from '@/lib/authResets';
 import type { StockPrice } from '@/types/market';
+
+type MarketStatusData = MarketStatusInput;
 
 export interface WatchlistRow {
   watchlist_item_id: string;
@@ -22,8 +29,21 @@ export interface WatchlistRow {
   isPositive: boolean;
   quoteAvailable?: boolean;
   previousClose: number | null;
+  // DALTON-HOOK(extended-hours-quotes): Extended-hours and regular-session fields for accurate card display.
+  regularClose?: number | null;
+  regularTradingChange?: number | null;
+  regularTradingChangePercent?: number | null;
+  earlyTradingChange?: number | null;
   earlyTradingChangePercent: number | null;
+  lateTradingChange?: number | null;
   lateTradingChangePercent: number | null;
+  lastMinuteClose?: number | null;
+  lastTradePrice?: number | null;
+  liveTickAt?: number | null;
+  extType?: 'pre' | 'post' | null;
+  extPrice?: number | null;
+  extChange?: number | null;
+  extPct?: number | null;
   /** ISO code the snapshot was quoted in; null on a payload that predates it. */
   currency: string | null;
   /** The snapshot's asset class: an `index` row prints a level, not a price. */
@@ -33,14 +53,58 @@ export interface WatchlistRow {
 
 /** A row as the agent reads it: the figures the user sees, in the currency
  *  the user sees them in, so a CN¥ price never reaches the agent as dollars. */
-export function watchlistQuoteRow(r: WatchlistRow): QuoteRow {
+export function watchlistQuoteRow(r: WatchlistRow, marketStatus?: MarketStatusData): QuoteRow {
   const hasQuote = r.quoteAvailable !== false;
+  const currency = quoteCurrency(r.currency, r.symbol, r.assetClass);
+  if (!hasQuote) {
+    return { symbol: r.symbol, currency };
+  }
+
+  // DALTON-HOOK(extended-hours-quotes): Delegate all session, headline, and extended-hours derivation to deriveQuoteDisplay.
+  const d = deriveQuoteDisplay(r, marketStatus);
+  const mainPrice = d.mainPrice != null ? roundQuote2(d.mainPrice) : undefined;
+  const mainChange = d.mainChange != null ? roundQuote2(d.mainChange) : undefined;
+  const mainChangePct = d.mainChangePct != null ? roundQuote2(d.mainChangePct) : undefined;
+
+  if (d.session === 'regular') {
+    return {
+      symbol: r.symbol,
+      price: mainPrice,
+      change: mainChange,
+      changePercent: mainChangePct,
+      currency,
+    };
+  }
+
+  const extPrice = d.extPrice != null ? roundQuote2(d.extPrice) : undefined;
+  const extChange = d.extChange != null ? roundQuote2(d.extChange) : undefined;
+  const extChangePct = d.extChangePct != null ? roundQuote2(d.extChangePct) : undefined;
+
+  if (d.session === 'post') {
+    return {
+      symbol: r.symbol,
+      session: 'post',
+      price: mainPrice,
+      change: mainChange,
+      changePercent: mainChangePct,
+      postMarket: extPrice,
+      postMarketChange: extChange,
+      postMarketChangePercent: extChangePct,
+      currency,
+    };
+  }
+
+  // DALTON-HOOK(extended-hours-quotes): Return pre-market quote row with settled prevClose and preMarket fields.
   return {
     symbol: r.symbol,
-    price: hasQuote ? r.price : undefined,
-    change: hasQuote ? r.change : undefined,
-    changePercent: hasQuote ? r.changePercent : undefined,
-    currency: quoteCurrency(r.currency, r.symbol, r.assetClass),
+    session: 'pre',
+    price: mainPrice,
+    change: mainChange,
+    changePercent: mainChangePct,
+    preMarket: extPrice,
+    preMarketChange: extChange,
+    preMarketChangePercent: extChangePct,
+    currency,
   };
 }
 
@@ -176,8 +240,17 @@ export function useWatchlistData() {
         isPositive: quoteAvailable ? p.isPositive ?? true : true,
         quoteAvailable,
         previousClose: p.previousClose ?? null,
+        // DALTON-HOOK(extended-hours-quotes): Forward extended-hours and regular-close fields from StockPrice.
+        regularClose: p.regularClose ?? null,
+        regularTradingChange: p.regularTradingChange ?? null,
+        regularTradingChangePercent: p.regularTradingChangePercent ?? null,
+        earlyTradingChange: p.earlyTradingChange ?? null,
         earlyTradingChangePercent: p.earlyTradingChangePercent ?? null,
+        lateTradingChange: p.lateTradingChange ?? null,
         lateTradingChangePercent: p.lateTradingChangePercent ?? null,
+        lastMinuteClose: p.lastMinuteClose ?? null,
+        lastTradePrice: p.lastTradePrice ?? null,
+        liveTickAt: p.liveTickAt ?? null,
         currency: p.currency ?? null,
         assetClass: quotes[sym]?.asset_class ?? null,
       };

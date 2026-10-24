@@ -355,7 +355,7 @@ describe('StockHeader price section (market convention)', () => {
       <Header inputs={{ symbol: 'GOOG', marketStatus: preStatus, snapshot: yfPreSnap, realTimePrice: { ...quoteRow, price: 330.95, change: -2.45, changePercent: -0.74 } }} />,
     );
     expect(headlineFigure(container)).toBe('330.95');
-    expect(container.querySelector('.stock-change')).toBeNull();
+    expect(screen.getByText('-5.45 -1.62%')).toBeInTheDocument();
     const ext = container.querySelector('.stock-extended-hours');
     expect(ext?.textContent).toContain('328.50');
     expect(ext?.textContent).toContain('-2.45');

@@ -14,6 +14,7 @@ import {
   EyeOff,
 } from 'lucide-react';
 import { getExtendedHoursInfo } from '@/lib/marketUtils';
+import { deriveQuoteDisplay, formatSignedPct2, roundQuote2 } from '@/lib/quotes'; // DALTON-HOOK(extended-hours-quotes)
 import { createFormatter, grouped2, integer } from '@/lib/format';
 import { useLocale } from '@/hooks/useLocale';
 import { formatMoney, quoteCurrency } from '@/lib/bars';
@@ -47,16 +48,34 @@ export function WatchlistRowItem({ item, index, marketStatus, onDelete }: Watchl
   const locale = useLocale();
   const navigate = useNavigate();
   const hasQuote = item.quoteAvailable !== false;
-  const pos = hasQuote ? item.isPositive ?? true : true;
-  const pctStr = hasQuote ? (pos ? '+' : '') + grouped2(Number(item.changePercent), locale) + '%' : 'N/A';
   const hasId = !!item.watchlist_item_id;
   // A watchlist mixes venues: prefer the currency the snapshot was quoted in,
   // with the row's own listing suffix as the fallback for older payloads. An
   // index level prints bare.
   const code = quoteCurrency(item.currency, item.symbol, item.assetClass);
 
-  const { extPct, extType } = getExtendedHoursInfo(marketStatus, item, { shortLabels: true });
+  // DALTON-HOOK(extended-hours-quotes): Derive main quote and extended-hours figures from shared deriveQuoteDisplay.
+  const quoteDisplay = deriveQuoteDisplay(item, marketStatus);
+  const extType = quoteDisplay.session === 'regular' ? null : quoteDisplay.session;
   const extColor = extType === 'pre' ? '#fbbf24' : '#3b82f6';
+  const mainPrice = quoteDisplay.mainPrice;
+  const mainChange = quoteDisplay.mainChange;
+  const mainChangePct = quoteDisplay.mainChangePct;
+  const pos = hasQuote
+    ? (extType
+        ? (mainChange != null
+            ? mainChange >= 0
+            : mainChangePct != null
+              ? Number(mainChangePct) >= 0
+              : (item.isPositive ?? true))
+        : (item.isPositive ?? true))
+    : true;
+  const pctStr =
+    hasQuote && mainChangePct != null
+      ? formatSignedPct2(Number(mainChangePct), locale)
+      : 'N/A';
+  const extDisplayPrice = quoteDisplay.extPrice;
+  const extPct = quoteDisplay.extChangePct;
 
   const row = (
     <motion.div
@@ -92,43 +111,46 @@ export function WatchlistRowItem({ item, index, marketStatus, onDelete }: Watchl
             className="text-sm font-medium dashboard-mono"
             style={{ color: 'var(--color-text-primary)' }}
           >
-            {hasQuote
-              ? formatMoney(Number(extType && item.previousClose != null ? item.previousClose : item.price), code, locale)
+            {/* DALTON-HOOK(extended-hours-quotes): Regular close as main price; extPrice on extended line. */}
+            {hasQuote && mainPrice != null
+              ? formatMoney(roundQuote2(Number(mainPrice)), code, locale)
               : 'N/A'}
           </div>
           <div
             className="text-xs font-medium dashboard-mono"
             style={{
-              color: hasQuote
+              color: hasQuote && mainChange != null
                 ? pos ? 'var(--color-profit)' : 'var(--color-loss)'
                 : 'var(--color-text-secondary)',
             }}
           >
-            {hasQuote ? formatMoney(Number(item.change), code, locale, { signed: true }) : 'N/A'}
+            {hasQuote && mainChange != null
+              ? formatMoney(roundQuote2(Number(mainChange)), code, locale, { signed: true })
+              : 'N/A'}
           </div>
         </div>
         <div className="text-right shrink-0">
           <div
             className="min-w-16 px-2 py-1 rounded-lg text-center text-xs font-bold whitespace-nowrap"
             style={{
-              backgroundColor: hasQuote
+              backgroundColor: hasQuote && mainChangePct != null
                 ? pos ? 'var(--color-profit-soft)' : 'var(--color-loss-soft)'
                 : 'var(--color-bg-subtle)',
-              color: hasQuote
+              color: hasQuote && mainChangePct != null
                 ? pos ? 'var(--color-profit)' : 'var(--color-loss)'
                 : 'var(--color-text-secondary)',
             }}
           >
             {pctStr}
           </div>
-          {hasQuote && extType && extPct != null && (
+          {hasQuote && extType && extDisplayPrice != null && extPct != null && (
             <div
               className="text-[0.625rem] mt-0.5 text-center flex items-center justify-center gap-0.5 whitespace-nowrap"
               style={{ color: extColor }}
             >
+              {/* DALTON-HOOK(extended-hours-quotes): Render extPrice on watchlist extended-hours line. */}
               {extType === 'pre' ? <Sunrise size={10} /> : <Sunset size={10} />}
-              {formatMoney(Number(item.price), code, locale)} {extPct >= 0 ? '+' : ''}
-              {grouped2(extPct, locale)}%
+              {formatMoney(roundQuote2(Number(extDisplayPrice)), code, locale)} {formatSignedPct2(extPct, locale)}
             </div>
           )}
         </div>
@@ -175,22 +197,27 @@ export function PortfolioRowItem({
   const hasQuote = item.quoteAvailable !== false;
   const pos = hasQuote ? item.isPositive ?? true : true;
   const currency = normalizePortfolioCurrency(item.currency);
+  // DALTON-HOOK(extended-hours-quotes): Derive main price and extended-hours figures from shared deriveQuoteDisplay.
   const plStr =
     hasQuote && item.unrealizedPlPercent != null
-      ? (pos ? '+' : '') + grouped2(Number(item.unrealizedPlPercent), locale) + '%'
+      ? formatSignedPct2(Number(item.unrealizedPlPercent), locale)
       : 'N/A';
   const hasId = !!item.user_portfolio_id;
 
-  const { extPct, extType } = getExtendedHoursInfo(marketStatus, item, { shortLabels: true });
+  const quoteDisplay = deriveQuoteDisplay(item, marketStatus);
+  const extType = quoteDisplay.session === 'regular' ? null : quoteDisplay.session;
   const extColor = extType === 'pre' ? '#fbbf24' : '#3b82f6';
+  const mainPrice = quoteDisplay.mainPrice;
+  const extDisplayPrice = quoteDisplay.extPrice;
+  const extPct = quoteDisplay.extChangePct;
   const displayMarketValue =
     hasQuote && item.marketValue != null
       ? formatPortfolioMoney(item.marketValue, currency, locale)
       : 'N/A';
   const displayPrice =
-    hasQuote
+    hasQuote && mainPrice != null
       ? formatPortfolioMoney(
-          Number(extType && item.previousClose != null ? item.previousClose : item.price),
+          roundQuote2(Number(mainPrice)),
           currency,
           locale,
         )
@@ -254,14 +281,14 @@ export function PortfolioRowItem({
           >
             {plStr}
           </div>
-          {hasQuote && extType && extPct != null && (
+          {hasQuote && extType && extDisplayPrice != null && extPct != null && (
             <div
               className="text-[0.625rem] mt-0.5 text-center flex items-center justify-center gap-0.5 whitespace-nowrap"
               style={{ color: extColor }}
             >
+              {/* DALTON-HOOK(extended-hours-quotes): Render extPrice on portfolio extended-hours line. */}
               {extType === 'pre' ? <Sunrise size={10} /> : <Sunset size={10} />}
-              {formatPortfolioMoney(item.price, currency, locale)} {extPct >= 0 ? '+' : ''}
-              {grouped2(extPct, locale)}%
+              {formatPortfolioMoney(roundQuote2(Number(extDisplayPrice)), currency, locale)} {formatSignedPct2(extPct, locale)}
             </div>
           )}
         </div>
