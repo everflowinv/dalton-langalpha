@@ -159,6 +159,7 @@ HARDCODED_LITERAL_ALLOWLIST: dict[tuple[str, str], str] = {
     ("budget/service.py", "muse-spark-1.3-oauth"): "Fallback nominal rate in _notional_price_index when models.json price card is unavailable",
     # Default model field on ChatAntigravity LangChain wrapper
     ("llm/providers/antigravity/client.py", "gemini-4-argon-medium"): "Default model attribute on ChatAntigravity LangChain wrapper",
+    ("settings.py", "gemini-4-argon-medium-oauth"): "Default extractor_fallback_model on DaltonConversationsConfig",
 }
 
 

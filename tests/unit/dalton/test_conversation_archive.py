@@ -26,6 +26,7 @@ Covers:
 from __future__ import annotations
 
 import asyncio
+import threading
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timezone
 import json
@@ -4138,9 +4139,9 @@ async def test_in_flight_deferred_still_failing_marks_incomplete_holds_prefix_cu
         clock_fn=mock_clock,
     )
 
-    # Deferred retry slept intervals in [30, 60]s up to stale_after_s (900) + 60 = 960s total
+    # Deferred retry slept intervals in [30, 60]s up to min(seg_deadline=600, stale_after_s+60=960)
     assert all(30.0 <= s <= 60.0 for s in slept_intervals)
-    assert sum(slept_intervals) == 960.0
+    assert sum(slept_intervals) == 600.0
 
     # Week 1 cursor stopped at seg 1 (only `ev-w1-0` committed; `ev-w1-1` failed and `ev-w1-2` blocked),
     # and Week 2 continued and committed `ev-w2-0`!
@@ -4166,7 +4167,7 @@ async def test_in_flight_deferred_still_failing_marks_incomplete_holds_prefix_cu
     assert inc_failed["segment_index"] == 1
     assert inc_failed["first_event_id"] == "ev-w1-1"
     assert inc_failed["status"] == "failed"
-    assert inc_failed["reason"] == "in_flight_timeout"
+    assert inc_failed["reason"] == "extraction_error:segment_deadline_exceeded"
     inc_blocked = summary["incomplete_segments"][1]
     assert inc_blocked["segment_index"] == 2
     assert inc_blocked["first_event_id"] == "ev-w1-2"
@@ -4843,9 +4844,15 @@ async def test_deferred_in_flight_window_uses_monotonic_deadline_including_budge
     assert summary["incomplete_segments_count"] == 3
     inc_by_id = {item["first_event_id"]: item for item in summary["incomplete_segments"]}
     assert inc_by_id["ev-d0"]["status"] == "failed"
-    assert inc_by_id["ev-d0"]["reason"] == "in_flight_timeout"
+    assert inc_by_id["ev-d0"]["reason"] in (
+        "in_flight_timeout",
+        "extraction_error:segment_deadline_exceeded",
+    )
     assert inc_by_id["ev-d1"]["status"] == "failed"
-    assert inc_by_id["ev-d1"]["reason"] == "in_flight_timeout"
+    assert inc_by_id["ev-d1"]["reason"] in (
+        "in_flight_timeout",
+        "extraction_error:segment_deadline_exceeded",
+    )
     assert inc_by_id["ev-d2"]["status"] == "blocked"
     assert inc_by_id["ev-d2"]["reason"] == "blocked_by_incomplete_prefix"
     # Blocked segment `ev-d2`'s 150 tokens are counted in batch summary and `update_run_finish`
@@ -4857,7 +4864,7 @@ async def test_deferred_in_flight_window_uses_monotonic_deadline_including_budge
 
     # Also verify: when budget wait (`wait_for_budget`) or retry backoff advances `now >= deadline`
     # before sending/resending, `extract_fn` is NOT called after `deadline`, the reservation is released,
-    # and the segment is marked `status="failed"`, `reason="in_flight_timeout"`.
+    # and the segment is marked `status="failed"`.
     budget_wait_calls = 0
 
     async def _extract_inflight_once(
@@ -4923,13 +4930,16 @@ async def test_deferred_in_flight_window_uses_monotonic_deadline_including_budge
         sleep_fn=mock_sleep,
         clock_fn=mock_clock,
     )
-    # Initial attempt ran (`budget_wait_calls == 1`); on deferred retry, `wait_for_budget` slept 3600s
-    # pushing `now >= deadline`, so `extract_fn` was NOT called a 2nd time and reservation was released!
+    # Initial attempt ran (`budget_wait_calls == 1`); on deferred retry, `wait_for_budget` needed 3600s
+    # (exceeding remaining deadline), so `extract_fn` was NOT called a 2nd time and reservation was released!
     assert budget_wait_calls == 1
     assert len(tight_limiter._reservations) == 0
     assert budget_deadline_summary["incomplete_segments_count"] == 1
     assert budget_deadline_summary["incomplete_segments"][0]["status"] == "failed"
-    assert budget_deadline_summary["incomplete_segments"][0]["reason"] == "in_flight_timeout"
+    assert budget_deadline_summary["incomplete_segments"][0]["reason"] in (
+        "in_flight_timeout",
+        "extraction_error:segment_deadline_exceeded",
+    )
 
 
 @pytest.mark.asyncio
@@ -8394,4 +8404,2087 @@ async def test_conversation_archive_extract_with_glm_5_3_coding_anthropic_transp
     assert req_body["model"] == "glm-5.3"
     assert req_body["thinking"] == {"type": "enabled"}
     assert "response_format" not in req_body
+
+
+@pytest.mark.asyncio
+async def test_primary_deepseek_flash_timeout_falls_back_once_and_records_fallback_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify:
+    1. When primary model `deepseek-flash` fails with timeout (`indeterminate`), it is NOT resent on
+       `deepseek-flash` (no 5-time rejected retry loop), and instead retries once on fallback model
+       `gemini-4-argon-medium-oauth` with `resend_indeterminate=True` and `deadline` forwarded to `assist_json`.
+    2. When the fallback model succeeds, the segment completes and the persisted card's `extractor_model`
+       is `"gemini-4-argon-medium-oauth"`.
+    """
+    seen_calls: list[dict[str, Any]] = []
+    inserted_batches: list[list[dict[str, Any]]] = []
+    finish_calls: list[dict[str, Any]] = []
+
+    async def _fake_assist_json(*args: Any, **kwargs: Any) -> assist_mod.AssistResult:
+        model_arg = str(kwargs.get("model") or "")
+        seen_calls.append(
+            {
+                "model": model_arg,
+                "resend_indeterminate": kwargs.get("resend_indeterminate"),
+                "deadline": kwargs.get("deadline"),
+            }
+        )
+        if model_arg == "deepseek-flash":
+            return assist_mod.AssistResult(
+                ok=False,
+                status="indeterminate",
+                error_kind="timeout",
+                error="TimeoutError: timed out after 180s",
+                model="deepseek-flash",
+                usage={"input_tokens": 600, "output_tokens": 0, "total_tokens": 600},
+            )
+        return assist_mod.AssistResult(
+            ok=True,
+            status="done",
+            data={
+                "category": "research",
+                "topic_label": "NVDA Blackwell",
+                "cards": [
+                    {
+                        "type": "estimate",
+                        "topic_label": "NVDA 机柜出货",
+                        "claim": "NVDA 四季度 Blackwell 机柜出货量预计 1.2 万柜",
+                        "tickers": ["NVDA"],
+                        "entities": [],
+                        "sectors": ["Semiconductors"],
+                        "figures": [],
+                        "quote": "NVDA 四季度 Blackwell 机柜出货量预计 1.2 万柜。",
+                        "quote_event_id": "ev-fb-1",
+                        "cited_sources": [],
+                        "confidence": 0.9,
+                    }
+                ],
+            },
+            model=model_arg,
+            usage={"input_tokens": 550, "output_tokens": 150, "total_tokens": 700},
+        )
+
+    mock_assist = create_autospec(extractor_mod.assist_json, side_effect=_fake_assist_json)
+    monkeypatch.setattr(extractor_mod, "assist_json", mock_assist)
+
+    _patch_autospec_db_connection(monkeypatch)
+    monkeypatch.setattr(
+        db_conv,
+        "insert_run_start",
+        create_autospec(db_conv.insert_run_start, return_value={"status": "running"}),
+    )
+    monkeypatch.setattr(
+        db_conv,
+        "find_existing_content_hashes",
+        create_autospec(db_conv.find_existing_content_hashes, return_value=set()),
+    )
+
+    async def _capture_insert_cards(
+        cards: list[dict[str, Any]],
+        embeddings: list[list[float]] | None = None,
+        *,
+        conn: Any = None,
+    ) -> tuple[int, int, list[dict[str, Any]]]:
+        inserted_batches.append([dict(c) for c in cards])
+        return len(cards), 0, list(cards)
+
+    monkeypatch.setattr(
+        db_conv,
+        "insert_cards_batch",
+        create_autospec(db_conv.insert_cards_batch, side_effect=_capture_insert_cards),
+    )
+    monkeypatch.setattr(
+        db_conv,
+        "record_processed_event_chunks",
+        create_autospec(db_conv.record_processed_event_chunks, return_value=1),
+    )
+    monkeypatch.setattr(
+        db_conv,
+        "update_run_progress",
+        create_autospec(db_conv.update_run_progress, return_value=None),
+    )
+
+    async def _capture_finish(run_id: str, **kwargs: Any) -> dict[str, Any]:
+        finish_calls.append({"run_id": run_id, **kwargs})
+        return {"run_id": run_id, **kwargs}
+
+    monkeypatch.setattr(
+        db_conv,
+        "update_run_finish",
+        create_autospec(db_conv.update_run_finish, side_effect=_capture_finish),
+    )
+    monkeypatch.setattr(
+        db_conv,
+        "list_cards_for_dates",
+        create_autospec(db_conv.list_cards_for_dates, return_value=[]),
+    )
+    monkeypatch.setattr(
+        db_conv,
+        "mark_dates_rendered",
+        create_autospec(db_conv.mark_dates_rendered, return_value=1),
+    )
+    monkeypatch.setattr(
+        archive_cli,
+        "render_and_write_conversation_digests",
+        create_autospec(
+            archive_cli.render_and_write_conversation_digests,
+            return_value={"rendered_dates": ["2026-10-24"], "card_locations": {}},
+        ),
+    )
+
+    mock_embed = create_autospec(
+        embedder_mod.embed_texts_via_bridge,
+        return_value=([[0.1, 0.2, 0.3]], "gemini-embedding-2-preview"),
+    )
+    mock_sleep = create_autospec(asyncio.sleep, return_value=None)
+
+    events = [
+        {
+            "agent": "main",
+            "session_id": "sess-fb-ok",
+            "event_id": "ev-fb-1",
+            "seq": 1,
+            "generation": "gen-1",
+            "created_at_ms": 1761300000000,
+            "ts": "2026-10-24T12:00:00+00:00",
+            "date_et": "2026-10-24",
+            "speaker": {"sender_id_hash": "h1", "name": "Owner", "is_owner": True, "role": "owner"},
+            "text": "NVDA 四季度 Blackwell 机柜出货量预计 1.2 万柜。",
+        }
+    ]
+
+    summary = await archive_cli.process_weekly_batch(
+        [dict(e) for e in events],
+        mode="run",
+        window_start=date(2026, 10, 20),
+        window_end=date(2026, 10, 26),
+        limiter=archive_cli.HourlyTokenBudgetLimiter(120_000, sleep_fn=mock_sleep),
+        extractor_model="deepseek-flash",
+        prompt_version="conv_card_v2_3",
+        embed_fn=mock_embed,
+        sleep_fn=mock_sleep,
+    )
+
+    assert len(seen_calls) == 2
+    assert seen_calls[0]["model"] == "deepseek-flash"
+    assert seen_calls[0]["resend_indeterminate"] is False
+    assert isinstance(seen_calls[0]["deadline"], float)
+    assert seen_calls[1]["model"] == "gemini-4-argon-medium-oauth"
+    assert seen_calls[1]["resend_indeterminate"] is True
+    assert isinstance(seen_calls[1]["deadline"], float)
+    assert mock_sleep.await_count == 0
+
+    assert summary["incomplete_segments_count"] == 0
+    assert summary["segments_processed"] == 1
+    assert summary["cards_inserted"] == 1
+    assert summary["total_tokens"] == 1300
+    assert len(inserted_batches) == 1
+    assert len(inserted_batches[0]) == 1
+    assert inserted_batches[0][0]["extractor_model"] == "gemini-4-argon-medium-oauth"
+    assert finish_calls[-1]["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_primary_and_fallback_both_fail_marks_segment_incomplete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify when both `deepseek-flash` and fallback `gemini-4-argon-medium-oauth` fail with
+    timeout/indeterminate, the segment is marked incomplete and the batch run status is `failed`.
+    """
+    seen_models: list[str] = []
+    finish_calls: list[dict[str, Any]] = []
+
+    async def _both_fail_extract(
+        segment: list[dict[str, Any]], **kwargs: Any
+    ) -> extractor_mod.SegmentExtractionOutcome:
+        model_used = str(kwargs.get("extractor_model") or "")
+        seen_models.append(model_used)
+        return extractor_mod.SegmentExtractionOutcome(
+            model_used=model_used,
+            ok=False,
+            status="indeterminate",
+            error_kind="timeout",
+            transient_error=True,
+            input_tokens=400,
+            output_tokens=0,
+            total_tokens=400,
+            error="TimeoutError: request timed out after 180s",
+        )
+
+    _patch_autospec_db_connection(monkeypatch)
+    monkeypatch.setattr(
+        db_conv,
+        "insert_run_start",
+        create_autospec(db_conv.insert_run_start, return_value={"status": "running"}),
+    )
+    monkeypatch.setattr(
+        db_conv,
+        "update_run_progress",
+        create_autospec(db_conv.update_run_progress, return_value=None),
+    )
+
+    async def _capture_finish(run_id: str, **kwargs: Any) -> dict[str, Any]:
+        finish_calls.append({"run_id": run_id, **kwargs})
+        return {"run_id": run_id, **kwargs}
+
+    monkeypatch.setattr(
+        db_conv,
+        "update_run_finish",
+        create_autospec(db_conv.update_run_finish, side_effect=_capture_finish),
+    )
+    monkeypatch.setattr(
+        db_conv,
+        "list_unrendered_dates",
+        create_autospec(db_conv.list_unrendered_dates, return_value=[]),
+    )
+
+    mock_sleep = create_autospec(asyncio.sleep, return_value=None)
+    mock_extract = create_autospec(
+        extractor_mod.extract_segment_cards,
+        side_effect=_both_fail_extract,
+    )
+
+    batch_summary = await archive_cli.process_weekly_batch(
+        [
+            {
+                "agent": "main",
+                "session_id": "sess-fb-fail",
+                "event_id": "ev-fb-fail-1",
+                "seq": 1,
+                "generation": "gen-1",
+                "created_at_ms": 1761300000000,
+                "ts": "2026-10-24T12:00:00+00:00",
+                "date_et": "2026-10-24",
+                "text": "NVDA 超时双败测试。",
+            }
+        ],
+        mode="run",
+        window_start=date(2026, 10, 20),
+        window_end=date(2026, 10, 26),
+        limiter=archive_cli.HourlyTokenBudgetLimiter(120_000, sleep_fn=mock_sleep),
+        extractor_model="deepseek-flash",
+        prompt_version="conv_card_v2_3",
+        extract_fn=mock_extract,
+        sleep_fn=mock_sleep,
+    )
+
+    assert seen_models == ["deepseek-flash", "gemini-4-argon-medium-oauth"]
+    assert mock_sleep.await_count == 0
+    assert batch_summary["segments_processed"] == 0
+    assert batch_summary["incomplete_segments_count"] == 1
+    assert batch_summary["incomplete_segments"][0]["first_event_id"] == "ev-fb-fail-1"
+    assert batch_summary["incomplete_segments"][0]["status"] == "failed"
+    assert batch_summary["total_tokens"] == 800
+    assert len(finish_calls) == 1
+    assert finish_calls[0]["status"] == "failed"
+    assert finish_calls[0]["error_text"] == "incomplete_segments=1"
+
+
+@pytest.mark.asyncio
+async def test_oauth_primary_model_preserves_original_retry_behavior() -> None:
+    """Verify when the primary model is OAuth (`gemini-4-argon-medium-oauth`), transient/indeterminate
+    failures keep the original 5-retry exponential backoff behavior on the primary OAuth model.
+    """
+    slept_delays: list[float] = []
+    seen_calls: list[tuple[str, bool]] = []
+
+    async def _fake_sleep(seconds: float) -> None:
+        slept_delays.append(seconds)
+
+    async def _oauth_extract(
+        segment: list[dict[str, Any]], **kwargs: Any
+    ) -> extractor_mod.SegmentExtractionOutcome:
+        model_used = str(kwargs.get("extractor_model") or "")
+        seen_calls.append((model_used, bool(kwargs.get("resend_indeterminate"))))
+        if len(seen_calls) <= 2:
+            return extractor_mod.SegmentExtractionOutcome(
+                model_used=model_used,
+                ok=False,
+                status="indeterminate",
+                error_kind="timeout",
+                transient_error=True,
+                error="TimeoutError: stream timed out",
+            )
+        return extractor_mod.SegmentExtractionOutcome(
+            ok=True,
+            category="research",
+            cards=[],
+            model_used=model_used,
+            input_tokens=100,
+            output_tokens=50,
+            total_tokens=150,
+        )
+
+    mock_sleep = create_autospec(asyncio.sleep, side_effect=_fake_sleep)
+    mock_extract = create_autospec(
+        extractor_mod.extract_segment_cards,
+        side_effect=_oauth_extract,
+    )
+
+    outcome, retries = await archive_cli.extract_segment_with_infinite_backoff(
+        [{"event_id": "ev-oauth-1", "seq": 1, "text": "OAuth 主模型重试保持不变"}],
+        extractor_model="gemini-4-argon-medium-oauth",
+        prompt_version="conv_card_v2_3",
+        extract_fn=mock_extract,
+        sleep_fn=mock_sleep,
+    )
+
+    assert outcome.ok is True
+    assert retries == 2
+    assert slept_delays == [2.0, 4.0]
+    assert seen_calls == [
+        ("gemini-4-argon-medium-oauth", True),
+        ("gemini-4-argon-medium-oauth", True),
+        ("gemini-4-argon-medium-oauth", True),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_segment_exceeding_segment_deadline_s_marked_incomplete_and_continues_next_segment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify when a single segment exceeds `segment_deadline_s`, it is cancelled and marked incomplete
+    (`segment_deadline_exceeded`), and `process_weekly_batch` continues to the next segment without hanging.
+    """
+    visited_segments: list[str] = []
+    finish_calls: list[dict[str, Any]] = []
+
+    async def _slow_then_fast_extract(
+        segment: list[dict[str, Any]], **kwargs: Any
+    ) -> extractor_mod.SegmentExtractionOutcome:
+        ev_id = str(segment[0]["event_id"])
+        visited_segments.append(ev_id)
+        if ev_id == "ev-hang-0":
+            await asyncio.sleep(10.0)
+        return extractor_mod.SegmentExtractionOutcome(
+            ok=True,
+            category="research",
+            cards=[],
+            cards_raw_count=0,
+            model_used=str(kwargs.get("extractor_model") or "deepseek-flash"),
+            input_tokens=120,
+            output_tokens=40,
+            total_tokens=160,
+        )
+
+    _patch_autospec_db_connection(monkeypatch)
+    monkeypatch.setattr(
+        db_conv,
+        "insert_run_start",
+        create_autospec(db_conv.insert_run_start, return_value={"status": "running"}),
+    )
+    monkeypatch.setattr(
+        db_conv,
+        "update_run_progress",
+        create_autospec(db_conv.update_run_progress, return_value=None),
+    )
+
+    async def _capture_finish(run_id: str, **kwargs: Any) -> dict[str, Any]:
+        finish_calls.append({"run_id": run_id, **kwargs})
+        return {"run_id": run_id, **kwargs}
+
+    monkeypatch.setattr(
+        db_conv,
+        "update_run_finish",
+        create_autospec(db_conv.update_run_finish, side_effect=_capture_finish),
+    )
+    monkeypatch.setattr(
+        db_conv,
+        "list_unrendered_dates",
+        create_autospec(db_conv.list_unrendered_dates, return_value=[]),
+    )
+
+    mock_extract = create_autospec(
+        extractor_mod.extract_segment_cards,
+        side_effect=_slow_then_fast_extract,
+    )
+
+    events = [
+        {
+            "agent": "main",
+            "session_id": "sess-hang-0",
+            "event_id": "ev-hang-0",
+            "seq": 1,
+            "generation": "gen-1",
+            "created_at_ms": 1761300000000,
+            "ts": "2026-10-24T12:00:00+00:00",
+            "date_et": "2026-10-24",
+            "text": "第一段模拟挂起超时。",
+        },
+        {
+            "agent": "main",
+            "session_id": "sess-fast-1",
+            "event_id": "ev-fast-1",
+            "seq": 1,
+            "generation": "gen-1",
+            "created_at_ms": 1761300060000,
+            "ts": "2026-10-24T12:01:00+00:00",
+            "date_et": "2026-10-24",
+            "text": "第二段正常快速完成。",
+        },
+    ]
+
+    t_start = archive_cli.time.monotonic()
+    batch_summary = await asyncio.wait_for(
+        archive_cli.process_weekly_batch(
+            events,
+            mode="run",
+            window_start=date(2026, 10, 20),
+            window_end=date(2026, 10, 26),
+            limiter=archive_cli.HourlyTokenBudgetLimiter(120_000),
+            extractor_model="deepseek-flash",
+            prompt_version="conv_card_v2_3",
+            segment_deadline_s=0.05,
+            concurrency=1,
+            extract_fn=mock_extract,
+        ),
+        timeout=2.0,
+    )
+    elapsed = archive_cli.time.monotonic() - t_start
+
+    assert elapsed < 1.5
+    assert visited_segments == ["ev-hang-0", "ev-fast-1"]
+    assert batch_summary["incomplete_segments_count"] == 2
+    inc_by_ev = {item["first_event_id"]: item for item in batch_summary["incomplete_segments"]}
+    assert inc_by_ev["ev-hang-0"]["status"] == "failed"
+    assert "segment_deadline_exceeded" in inc_by_ev["ev-hang-0"]["reason"]
+    assert inc_by_ev["ev-fast-1"]["status"] == "blocked"
+    assert inc_by_ev["ev-fast-1"]["reason"] == "blocked_by_incomplete_prefix"
+    assert finish_calls[-1]["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_round2_budget_wait_and_backoff_bounded_by_segment_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Budget wait exceeding remaining segment deadline aborts immediately without waiting 3600s, releases reservation, and continues to next segment; backoff sleep is clamped to min(backoff, remaining)."""
+    fake_now = 1000.0
+    sleep_History: list[float] = []
+
+    def _clock() -> float:
+        return fake_now
+
+    async def _sleep(seconds: float) -> None:
+        nonlocal fake_now
+        sleep_History.append(float(seconds))
+        fake_now += max(0.0, float(seconds))
+
+    limiter = archive_cli.HourlyTokenBudgetLimiter(
+        10_000,
+        clock_fn=_clock,
+        sleep_fn=_sleep,
+    )
+    # Consume 9,500 of 10,000 tokens at t=1000.0 so the next ~1,200-token segment would need to wait 3600s.
+    limiter.record_tokens(9_500)
+
+    visited_segments: list[str] = []
+
+    async def _extract_stub(
+        segment: list[dict[str, Any]],
+        **kwargs: Any,
+    ) -> extractor_mod.SegmentExtractionOutcome:
+        ev_id = str(segment[0].get("event_id") or "")
+        visited_segments.append(ev_id)
+        return extractor_mod.SegmentExtractionOutcome(
+            ok=True,
+            category="research",
+            cards=[],
+            cards_raw_count=0,
+            model_used="deepseek-flash",
+            input_tokens=100,
+            output_tokens=50,
+            total_tokens=150,
+        )
+
+    # When segment 0 aborts on budget wait, free budget before segment 1 runs so segment 1 can proceed.
+    orig_wait = limiter.wait_for_budget
+    wait_attempt = 0
+
+    async def _wait_with_seg1_release(
+        estimated_tokens: int = 1000,
+        *,
+        deadline: float | None = None,
+    ) -> archive_cli.BudgetReservation:
+        nonlocal wait_attempt
+        wait_attempt += 1
+        if wait_attempt == 2:
+            limiter._history.clear()
+        return await orig_wait(estimated_tokens, deadline=deadline)
+
+    monkeypatch.setattr(
+        limiter,
+        "wait_for_budget",
+        create_autospec(limiter.wait_for_budget, side_effect=_wait_with_seg1_release),
+    )
+
+    _patch_autospec_db_connection(monkeypatch)
+    monkeypatch.setattr(
+        db_conv,
+        "insert_run_start",
+        create_autospec(db_conv.insert_run_start, return_value={"status": "running"}),
+    )
+    monkeypatch.setattr(
+        db_conv,
+        "update_run_progress",
+        create_autospec(db_conv.update_run_progress, return_value=None),
+    )
+    monkeypatch.setattr(
+        db_conv,
+        "update_run_finish",
+        create_autospec(db_conv.update_run_finish, return_value={"status": "failed"}),
+    )
+    monkeypatch.setattr(
+        db_conv,
+        "list_unrendered_dates",
+        create_autospec(db_conv.list_unrendered_dates, return_value=[]),
+    )
+
+    events = [
+        {
+            "agent": "main",
+            "session_id": "sess-bw-0",
+            "event_id": "ev-bw-0",
+            "seq": 1,
+            "generation": "gen-1",
+            "created_at_ms": 1761300000000,
+            "ts": "2026-10-24T12:00:00+00:00",
+            "date_et": "2026-10-24",
+            "text": "Segment 0 hits exhausted hourly budget.",
+        },
+        {
+            "agent": "main",
+            "session_id": "sess-bw-1",
+            "event_id": "ev-bw-1",
+            "seq": 1,
+            "generation": "gen-1",
+            "created_at_ms": 1761300060000,
+            "ts": "2026-10-24T12:01:00+00:00",
+            "date_et": "2026-10-24",
+            "text": "Segment 1 runs immediately after Segment 0 aborts.",
+        },
+    ]
+
+    summary = await archive_cli.process_weekly_batch(
+        [dict(e) for e in events],
+        mode="run",
+        window_start=date(2026, 10, 20),
+        window_end=date(2026, 10, 26),
+        limiter=limiter,
+        extractor_model="deepseek-flash",
+        prompt_version="conv_card_v2_3",
+        segment_deadline_s=600.0,
+        concurrency=1,
+        extract_fn=create_autospec(
+            extractor_mod.extract_segment_cards,
+            side_effect=_extract_stub,
+        ),
+        clock_fn=_clock,
+        sleep_fn=_sleep,
+    )
+
+    # Segment 0 did NOT sleep 3600s waiting for budget recovery; it aborted immediately and Segment 1 ran.
+    assert sleep_History == []
+    assert visited_segments == ["ev-bw-1"]
+    assert len(limiter._reservations) == 0
+    inc_by_ev = {item["first_event_id"]: item for item in summary["incomplete_segments"]}
+    assert inc_by_ev["ev-bw-0"]["status"] == "failed"
+    assert inc_by_ev["ev-bw-0"]["reason"] == "extraction_error:segment_deadline_exceeded"
+    assert inc_by_ev["ev-bw-1"]["status"] == "blocked"
+
+    # Also verify 429 backoff sleep is clamped to min(backoff, remaining_s) and marks incomplete at deadline.
+    backoff_sleeps: list[float] = []
+
+    async def _sleep_rec(seconds: float) -> None:
+        nonlocal fake_now
+        backoff_sleeps.append(round(float(seconds), 4))
+        fake_now += max(0.0, float(seconds))
+
+    async def _always_429(
+        segment: list[dict[str, Any]],
+        **kwargs: Any,
+    ) -> extractor_mod.SegmentExtractionOutcome:
+        return extractor_mod.SegmentExtractionOutcome(
+            ok=False,
+            model_used="deepseek-flash",
+            rate_limited=True,
+            error="RateLimitError",
+        )
+
+    outcome_429, retries_429 = await archive_cli.extract_segment_with_infinite_backoff(
+        [events[0]],
+        extractor_model="deepseek-flash",
+        prompt_version="conv_card_v2_3",
+        segment_deadline_s=45.0,
+        initial_backoff_s=30.0,
+        max_backoff_s=900.0,
+        extract_fn=create_autospec(
+            extractor_mod.extract_segment_cards,
+            side_effect=_always_429,
+        ),
+        clock_fn=_clock,
+        sleep_fn=_sleep_rec,
+    )
+    # First 429 sleeps 30s; second 429 wants 60s but only 15s remain before 45s deadline -> sleeps min(60, 15) = 15s and fails!
+    assert backoff_sleeps == [30.0, 15.0]
+    assert not outcome_429.ok
+    assert outcome_429.error_kind == "segment_deadline_exceeded"
+    assert retries_429 == 2
+
+
+@pytest.mark.asyncio
+async def test_round2_deferred_retry_default_deadline_interrupts_hanging_extraction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Deferred retry path using production default parameters (no explicit segment_deadline_s) interrupts an extraction that never returns within the segment deadline."""
+    fake_now = 5000.0
+    sleep_calls: list[float] = []
+
+    def _clock() -> float:
+        return fake_now
+
+    async def _sleep(seconds: float) -> None:
+        nonlocal fake_now
+        sleep_calls.append(float(seconds))
+        fake_now += max(0.0, float(seconds))
+
+    call_count = 0
+    never_event = asyncio.Event()
+
+    async def _inflight_then_hang(
+        segment: list[dict[str, Any]],
+        **kwargs: Any,
+    ) -> extractor_mod.SegmentExtractionOutcome:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return extractor_mod.SegmentExtractionOutcome(
+                ok=False,
+                model_used="deepseek-flash",
+                status="in_flight",
+                error_kind="in_flight",
+                in_flight=True,
+                error="该请求正在由另一个进程执行中，请稍候。",
+            )
+        # On deferred retry, hang forever until cancelled by outer timeout.
+        await never_event.wait()
+        return extractor_mod.SegmentExtractionOutcome(ok=True)
+
+    _patch_autospec_db_connection(monkeypatch)
+    monkeypatch.setattr(
+        db_conv,
+        "insert_run_start",
+        create_autospec(db_conv.insert_run_start, return_value={"status": "running"}),
+    )
+    monkeypatch.setattr(
+        db_conv,
+        "update_run_progress",
+        create_autospec(db_conv.update_run_progress, return_value=None),
+    )
+    monkeypatch.setattr(
+        db_conv,
+        "update_run_finish",
+        create_autospec(db_conv.update_run_finish, return_value={"status": "failed"}),
+    )
+    monkeypatch.setattr(
+        db_conv,
+        "list_unrendered_dates",
+        create_autospec(db_conv.list_unrendered_dates, return_value=[]),
+    )
+
+    limiter = archive_cli.HourlyTokenBudgetLimiter(
+        1_500_000,
+        clock_fn=_clock,
+        sleep_fn=_sleep,
+    )
+    # Note: `segment_deadline_s` is intentionally NOT passed so production default (600s) is used.
+    summary = await archive_cli.process_weekly_batch(
+        [
+            {
+                "agent": "main",
+                "session_id": "sess-def-hang",
+                "event_id": "ev-def-hang",
+                "seq": 1,
+                "generation": "gen-1",
+                "created_at_ms": 1761300000000,
+                "ts": "2026-10-24T12:00:00+00:00",
+                "date_et": "2026-10-24",
+                "text": "Deferred retry hangs forever; must be bounded by default 600s seg_deadline.",
+            }
+        ],
+        mode="run",
+        window_start=date(2026, 10, 20),
+        window_end=date(2026, 10, 26),
+        limiter=limiter,
+        extractor_model="deepseek-flash",
+        prompt_version="conv_card_v2_3",
+        extract_fn=create_autospec(
+            extractor_mod.extract_segment_cards,
+            side_effect=_inflight_then_hang,
+        ),
+        clock_fn=_clock,
+        sleep_fn=_sleep,
+    )
+
+    assert call_count == 2
+    # Total virtual time advanced equals the 600s segment deadline (30s defer sleep + 570s remaining timeout)
+    assert round(fake_now - 5000.0, 2) == 600.0
+    assert summary["incomplete_segments_count"] == 1
+    inc = summary["incomplete_segments"][0]
+    assert inc["status"] == "failed"
+    assert inc["reason"] == "extraction_error:segment_deadline_exceeded"
+
+
+@pytest.mark.asyncio
+async def test_round2_extraction_swallowing_cancelled_error_abandoned_after_5s_grace(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """When an extraction coroutine swallows CancelledError and never exits, it is abandoned after 5s grace with a warning naming the segment ID, marked incomplete, and the next segment proceeds."""
+    fake_now = 2000.0
+    sleep_calls: list[float] = []
+
+    def _clock() -> float:
+        return fake_now
+
+    async def _sleep(seconds: float) -> None:
+        nonlocal fake_now
+        sleep_calls.append(round(float(seconds), 2))
+        fake_now += max(0.0, float(seconds))
+
+    release_zombie = asyncio.Event()
+    visited: list[str] = []
+
+    async def _swallow_cancel_extract(
+        segment: list[dict[str, Any]],
+        **kwargs: Any,
+    ) -> extractor_mod.SegmentExtractionOutcome:
+        ev_id = str(segment[0].get("event_id") or "")
+        visited.append(ev_id)
+        if ev_id == "ev-uncancellable-0":
+            while not release_zombie.is_set():
+                try:
+                    await release_zombie.wait()
+                except asyncio.CancelledError:
+                    # Intentionally swallow CancelledError to simulate a stuck C/network wait
+                    continue
+        return extractor_mod.SegmentExtractionOutcome(
+            ok=True,
+            category="research",
+            cards=[],
+            cards_raw_count=0,
+            model_used="gemini-4-argon-medium-oauth",
+            input_tokens=100,
+            output_tokens=40,
+            total_tokens=140,
+        )
+
+    _patch_autospec_db_connection(monkeypatch)
+    monkeypatch.setattr(
+        db_conv,
+        "insert_run_start",
+        create_autospec(db_conv.insert_run_start, return_value={"status": "running"}),
+    )
+    monkeypatch.setattr(
+        db_conv,
+        "update_run_progress",
+        create_autospec(db_conv.update_run_progress, return_value=None),
+    )
+    monkeypatch.setattr(
+        db_conv,
+        "update_run_finish",
+        create_autospec(db_conv.update_run_finish, return_value={"status": "failed"}),
+    )
+    monkeypatch.setattr(
+        db_conv,
+        "list_unrendered_dates",
+        create_autospec(db_conv.list_unrendered_dates, return_value=[]),
+    )
+
+    limiter = archive_cli.HourlyTokenBudgetLimiter(
+        1_500_000,
+        clock_fn=_clock,
+        sleep_fn=_sleep,
+    )
+    events = [
+        {
+            "agent": "main",
+            "session_id": "sess-zombie",
+            "event_id": "ev-uncancellable-0",
+            "seq": 1,
+            "generation": "gen-1",
+            "created_at_ms": 1761300000000,
+            "ts": "2026-10-24T12:00:00+00:00",
+            "date_et": "2026-10-24",
+            "text": "Segment 0 swallows CancelledError.",
+        },
+        {
+            "agent": "main",
+            "session_id": "sess-next",
+            "event_id": "ev-next-1",
+            "seq": 1,
+            "generation": "gen-1",
+            "created_at_ms": 1761300060000,
+            "ts": "2026-10-24T12:01:00+00:00",
+            "date_et": "2026-10-24",
+            "text": "Segment 1 runs after Segment 0 is abandoned.",
+        },
+    ]
+
+    try:
+        with caplog.at_level("WARNING"):
+            summary = await archive_cli.process_weekly_batch(
+                events,
+                mode="run",
+                window_start=date(2026, 10, 20),
+                window_end=date(2026, 10, 26),
+                limiter=limiter,
+                extractor_model="gemini-4-argon-medium-oauth",
+                prompt_version="conv_card_v2_3",
+                segment_deadline_s=120.0,
+                concurrency=1,
+                extract_fn=create_autospec(
+                    extractor_mod.extract_segment_cards,
+                    side_effect=_swallow_cancel_extract,
+                ),
+                clock_fn=_clock,
+                sleep_fn=_sleep,
+            )
+    finally:
+        release_zombie.set()
+        await asyncio.sleep(0)
+
+    # Waited 120s for deadline + 5.0s cancel grace period, then abandoned task and ran ev-next-1
+    assert 5.0 in sleep_calls
+    assert visited == ["ev-uncancellable-0", "ev-next-1"]
+    assert any(
+        "ev-uncancellable-0" in rec.message and "abandoning task" in rec.message
+        for rec in caplog.records
+    )
+    inc_by_ev = {item["first_event_id"]: item for item in summary["incomplete_segments"]}
+    assert inc_by_ev["ev-uncancellable-0"]["status"] == "failed"
+    assert inc_by_ev["ev-uncancellable-0"]["reason"] == "extraction_error:segment_deadline_exceeded"
+    assert inc_by_ev["ev-next-1"]["status"] == "blocked"
+
+
+@pytest.mark.asyncio
+async def test_round2_timed_out_segment_token_settlement_three_cases(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify token settlement across hourly budget and run summary for all 3 timeout cases: (1) unsent -> release reservation (+0), (2) sent without usage -> estimated_tokens, (3) result with usage -> actual tokens."""
+    _patch_autospec_db_connection(monkeypatch)
+    monkeypatch.setattr(
+        db_conv,
+        "insert_run_start",
+        create_autospec(db_conv.insert_run_start, return_value={"status": "running"}),
+    )
+    monkeypatch.setattr(
+        db_conv,
+        "update_run_progress",
+        create_autospec(db_conv.update_run_progress, return_value=None),
+    )
+    finish_records: list[dict[str, Any]] = []
+
+    async def _capture_finish(run_id: str, **kwargs: Any) -> dict[str, Any]:
+        finish_records.append({"run_id": run_id, **kwargs})
+        return {"run_id": run_id, **kwargs}
+
+    monkeypatch.setattr(
+        db_conv,
+        "update_run_finish",
+        create_autospec(db_conv.update_run_finish, side_effect=_capture_finish),
+    )
+    monkeypatch.setattr(
+        db_conv,
+        "list_unrendered_dates",
+        create_autospec(db_conv.list_unrendered_dates, return_value=[]),
+    )
+
+    sample_event = {
+        "agent": "main",
+        "session_id": "sess-tok",
+        "event_id": "ev-tok-0",
+        "seq": 1,
+        "generation": "gen-1",
+        "created_at_ms": 1761300000000,
+        "ts": "2026-10-24T12:00:00+00:00",
+        "date_et": "2026-10-24",
+        "text": "Token settlement verification segment.",
+    }
+    est_tokens = archive_cli.estimate_segment_tokens([sample_event], hourly_budget=100_000)
+
+    # --- Case 1: Request not sent (pre-send deadline reached) -> release reservation, 0 tokens ---
+    clock_c1 = 3000.0
+
+    def _clock_1() -> float:
+        return clock_c1
+
+    async def _sleep_1(s: float) -> None:
+        nonlocal clock_c1
+        clock_c1 += max(0.0, float(s))
+
+    limiter_c1 = archive_cli.HourlyTokenBudgetLimiter(
+        100_000, clock_fn=_clock_1, sleep_fn=_sleep_1
+    )
+    orig_wait_c1 = limiter_c1.wait_for_budget
+
+    async def _wait_advancing_to_deadline(
+        estimated_tokens: int = 1000,
+    ) -> archive_cli.BudgetReservation:
+        nonlocal clock_c1
+        res = await orig_wait_c1(estimated_tokens)
+        clock_c1 += 600.0
+        return res
+
+    monkeypatch.setattr(
+        limiter_c1,
+        "wait_for_budget",
+        create_autospec(limiter_c1.wait_for_budget, side_effect=_wait_advancing_to_deadline),
+    )
+    extract_c1 = create_autospec(extractor_mod.extract_segment_cards)
+    summary_c1 = await archive_cli.process_weekly_batch(
+        [dict(sample_event)],
+        mode="run",
+        window_start=date(2026, 10, 20),
+        window_end=date(2026, 10, 26),
+        limiter=limiter_c1,
+        extractor_model="deepseek-flash",
+        prompt_version="conv_card_v2_3",
+        segment_deadline_s=600.0,
+        extract_fn=extract_c1,
+        clock_fn=_clock_1,
+        sleep_fn=_sleep_1,
+    )
+    assert extract_c1.call_count == 0
+    assert len(limiter_c1._reservations) == 0
+    assert limiter_c1.current_window_tokens() == 0
+    assert summary_c1["total_tokens"] == 0
+    assert finish_records[-1]["total_tokens"] == 0
+
+    # --- Case 2: Request sent, timed out without usage -> settle estimated_tokens in both ---
+    clock_c2 = 4000.0
+
+    def _clock_2() -> float:
+        return clock_c2
+
+    async def _sleep_2(s: float) -> None:
+        nonlocal clock_c2
+        clock_c2 += max(0.0, float(s))
+
+    limiter_c2 = archive_cli.HourlyTokenBudgetLimiter(
+        100_000, clock_fn=_clock_2, sleep_fn=_sleep_2
+    )
+    never_done = asyncio.Event()
+
+    async def _hang_without_usage(
+        segment: list[dict[str, Any]],
+        **kwargs: Any,
+    ) -> extractor_mod.SegmentExtractionOutcome:
+        await never_done.wait()
+        return extractor_mod.SegmentExtractionOutcome(ok=False)
+
+    summary_c2 = await archive_cli.process_weekly_batch(
+        [dict(sample_event)],
+        mode="run",
+        window_start=date(2026, 10, 20),
+        window_end=date(2026, 10, 26),
+        limiter=limiter_c2,
+        extractor_model="deepseek-flash",
+        prompt_version="conv_card_v2_3",
+        segment_deadline_s=600.0,
+        extract_fn=create_autospec(
+            extractor_mod.extract_segment_cards,
+            side_effect=_hang_without_usage,
+        ),
+        clock_fn=_clock_2,
+        sleep_fn=_sleep_2,
+    )
+    assert len(limiter_c2._reservations) == 0
+    assert limiter_c2.current_window_tokens() == est_tokens
+    assert summary_c2["total_tokens"] == est_tokens
+    assert finish_records[-1]["total_tokens"] == est_tokens
+
+    # --- Case 3: Result with actual usage returned at/after deadline -> settle actual tokens in both ---
+    clock_c3 = 5000.0
+
+    def _clock_3() -> float:
+        return clock_c3
+
+    async def _sleep_3(s: float) -> None:
+        nonlocal clock_c3
+        clock_c3 += max(0.0, float(s))
+
+    limiter_c3 = archive_cli.HourlyTokenBudgetLimiter(
+        100_000, clock_fn=_clock_3, sleep_fn=_sleep_3
+    )
+
+    async def _return_usage_at_deadline(
+        segment: list[dict[str, Any]],
+        **kwargs: Any,
+    ) -> extractor_mod.SegmentExtractionOutcome:
+        nonlocal clock_c3
+        clock_c3 += 605.0
+        return extractor_mod.SegmentExtractionOutcome(
+            ok=False,
+            model_used="deepseek-flash",
+            status="error",
+            error_kind="ValidationError",
+            input_tokens=320,
+            output_tokens=180,
+            total_tokens=500,
+            error="ValidationError: schema mismatch after long call",
+        )
+
+    summary_c3 = await archive_cli.process_weekly_batch(
+        [dict(sample_event)],
+        mode="run",
+        window_start=date(2026, 10, 20),
+        window_end=date(2026, 10, 26),
+        limiter=limiter_c3,
+        extractor_model="deepseek-flash",
+        prompt_version="conv_card_v2_3",
+        segment_deadline_s=600.0,
+        extract_fn=create_autospec(
+            extractor_mod.extract_segment_cards,
+            side_effect=_return_usage_at_deadline,
+        ),
+        clock_fn=_clock_3,
+        sleep_fn=_sleep_3,
+    )
+    assert len(limiter_c3._reservations) == 0
+    assert limiter_c3.current_window_tokens() == 500
+    assert summary_c3["input_tokens"] == 320
+    assert summary_c3["output_tokens"] == 180
+    assert summary_c3["total_tokens"] == 500
+    assert finish_records[-1]["input_tokens"] == 320
+    assert finish_records[-1]["output_tokens"] == 180
+    assert finish_records[-1]["total_tokens"] == 500
+
+
+@pytest.mark.asyncio
+async def test_round2_incomplete_segments_not_marked_processed_and_retried_next_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Segments that fail via segment deadline timeout or fallback failure are never written to dalton_conversation_processed and are re-processed on the next run."""
+    fake_now = 6000.0
+
+    def _clock() -> float:
+        return fake_now
+
+    async def _sleep(seconds: float) -> None:
+        nonlocal fake_now
+        fake_now += max(0.0, float(seconds))
+
+    processed_db: dict[tuple[str, str, str, int], dict[str, Any]] = {}
+
+    async def _record_processed(
+        rows: list[dict[str, Any]],
+        conn: Any = None,
+    ) -> int:
+        for r in rows:
+            key = (
+                str(r["agent"]),
+                str(r["session_id"]),
+                str(r["event_id"]),
+                int(r["chunk_idx"]),
+            )
+            processed_db[key] = dict(r)
+        return len(rows)
+
+    _patch_autospec_db_connection(monkeypatch)
+    monkeypatch.setattr(
+        db_conv,
+        "insert_run_start",
+        create_autospec(db_conv.insert_run_start, return_value={"status": "running"}),
+    )
+    monkeypatch.setattr(
+        db_conv,
+        "update_run_progress",
+        create_autospec(db_conv.update_run_progress, return_value=None),
+    )
+    monkeypatch.setattr(
+        db_conv,
+        "update_run_finish",
+        create_autospec(db_conv.update_run_finish, return_value={"status": "completed"}),
+    )
+    monkeypatch.setattr(
+        db_conv,
+        "list_unrendered_dates",
+        create_autospec(db_conv.list_unrendered_dates, return_value=[]),
+    )
+    monkeypatch.setattr(
+        db_conv,
+        "record_processed_event_chunks",
+        create_autospec(db_conv.record_processed_event_chunks, side_effect=_record_processed),
+    )
+
+    raw_events = [
+        {
+            "agent": "main",
+            "session_id": "sess-inc-0",
+            "event_id": "ev-timeout-0",
+            "seq": 1,
+            "generation": "gen-1",
+            "created_at_ms": 1761300000000,
+            "ts": "2026-10-24T12:00:00+00:00",
+            "date_et": "2026-10-24",
+            "text": "Segment 0 times out on Run 1.",
+        },
+        {
+            "agent": "main",
+            "session_id": "sess-inc-1",
+            "event_id": "ev-fbfail-1",
+            "seq": 1,
+            "generation": "gen-1",
+            "created_at_ms": 1761300060000,
+            "ts": "2026-10-24T12:01:00+00:00",
+            "date_et": "2026-10-24",
+            "text": "Segment 1 fails on both primary and fallback on Run 1.",
+        },
+    ]
+
+    run_number = 1
+    hang_evt = asyncio.Event()
+
+    async def _extract_run1_fail_run2_ok(
+        segment: list[dict[str, Any]],
+        **kwargs: Any,
+    ) -> extractor_mod.SegmentExtractionOutcome:
+        ev_id = str(segment[0].get("event_id") or "")
+        model = str(kwargs.get("extractor_model") or "deepseek-flash")
+        if run_number == 1:
+            if ev_id == "ev-timeout-0":
+                await hang_evt.wait()
+            return extractor_mod.SegmentExtractionOutcome(
+                ok=False,
+                model_used=model,
+                status="indeterminate",
+                error_kind="timeout",
+                transient_error=True,
+                error="TimeoutError: timed out after 180s",
+            )
+        return extractor_mod.SegmentExtractionOutcome(
+            ok=True,
+            category="ops",
+            cards=[],
+            cards_raw_count=0,
+            discarded_segment=True,
+            model_used=model,
+            input_tokens=100,
+            output_tokens=20,
+            total_tokens=120,
+        )
+
+    limiter = archive_cli.HourlyTokenBudgetLimiter(
+        1_500_000,
+        clock_fn=_clock,
+        sleep_fn=_sleep,
+    )
+    mock_extract = create_autospec(
+        extractor_mod.extract_segment_cards,
+        side_effect=_extract_run1_fail_run2_ok,
+    )
+
+    # Run 1: Segment 0 times out (`segment_deadline_exceeded`), Segment 1 fails primary + fallback.
+    summary_run1 = await archive_cli.process_weekly_batch(
+        [dict(e) for e in raw_events],
+        mode="run",
+        window_start=date(2026, 10, 20),
+        window_end=date(2026, 10, 26),
+        limiter=limiter,
+        extractor_model="deepseek-flash",
+        extractor_fallback_model="gemini-4-argon-medium-oauth",
+        prompt_version="conv_card_v2_3",
+        segment_deadline_s=600.0,
+        concurrency=1,
+        extract_fn=mock_extract,
+        clock_fn=_clock,
+        sleep_fn=_sleep,
+    )
+    assert summary_run1["incomplete_segments_count"] == 2
+    assert summary_run1["segments_processed"] == 0
+    assert processed_db == {}
+
+    # Run 2: Incremental filter must keep both unprocessed segments, and Run 2 processes both to completion.
+    run_number = 2
+    unprocessed_for_run2 = [
+        dict(e)
+        for e in raw_events
+        if archive_cli._chunk_key(e) not in processed_db
+    ]
+    assert len(unprocessed_for_run2) == 2
+
+    summary_run2 = await archive_cli.process_weekly_batch(
+        unprocessed_for_run2,
+        mode="run",
+        window_start=date(2026, 10, 20),
+        window_end=date(2026, 10, 26),
+        limiter=limiter,
+        extractor_model="deepseek-flash",
+        extractor_fallback_model="gemini-4-argon-medium-oauth",
+        prompt_version="conv_card_v2_3",
+        segment_deadline_s=600.0,
+        concurrency=1,
+        extract_fn=mock_extract,
+        clock_fn=_clock,
+        sleep_fn=_sleep,
+    )
+    assert summary_run2["incomplete_segments_count"] == 0
+    assert summary_run2["segments_processed"] == 2
+    assert ("main", "sess-inc-0", "ev-timeout-0", 0) in processed_db
+    assert ("main", "sess-inc-1", "ev-fbfail-1", 0) in processed_db
+
+
+@pytest.mark.asyncio
+async def test_round3_deferred_retry_normal_2s_call_succeeds_under_production_default_clock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Under the production default monotonic clock and asyncio.sleep, a normal deferred retry call taking 2 seconds succeeds without premature cancellation."""
+    _patch_autospec_db_connection(monkeypatch)
+    monkeypatch.setattr(
+        db_conv,
+        "insert_run_start",
+        create_autospec(db_conv.insert_run_start, return_value={"status": "running"}),
+    )
+    monkeypatch.setattr(
+        db_conv,
+        "update_run_progress",
+        create_autospec(db_conv.update_run_progress, return_value=None),
+    )
+    monkeypatch.setattr(
+        db_conv,
+        "update_run_finish",
+        create_autospec(db_conv.update_run_finish, return_value={"status": "completed"}),
+    )
+    monkeypatch.setattr(
+        db_conv,
+        "list_unrendered_dates",
+        create_autospec(db_conv.list_unrendered_dates, return_value=[]),
+    )
+    monkeypatch.setattr(
+        db_conv,
+        "record_processed_event_chunks",
+        create_autospec(db_conv.record_processed_event_chunks, return_value=1),
+    )
+
+    attempt_count = 0
+
+    async def _inflight_then_2s_success(
+        segment: list[dict[str, Any]],
+        **kwargs: Any,
+    ) -> extractor_mod.SegmentExtractionOutcome:
+        nonlocal attempt_count
+        attempt_count += 1
+        if attempt_count == 1:
+            return extractor_mod.SegmentExtractionOutcome(
+                ok=False,
+                model_used="deepseek-flash",
+                status="in_flight",
+                error_kind="in_flight",
+                in_flight=True,
+                error="该请求正在由另一个进程执行中，请稍候。",
+            )
+        await asyncio.sleep(2.0)
+        return extractor_mod.SegmentExtractionOutcome(
+            ok=True,
+            category="ops",
+            cards=[],
+            cards_raw_count=0,
+            discarded_segment=True,
+            model_used="deepseek-flash",
+            input_tokens=110,
+            output_tokens=30,
+            total_tokens=140,
+        )
+
+    limiter = archive_cli.HourlyTokenBudgetLimiter(1_500_000)
+    t_start = archive_cli.time.monotonic()
+    summary = await archive_cli.process_weekly_batch(
+        [
+            {
+                "agent": "main",
+                "session_id": "sess-def-2s",
+                "event_id": "ev-def-2s",
+                "seq": 1,
+                "generation": "gen-1",
+                "created_at_ms": 1761300000000,
+                "ts": "2026-10-24T12:00:00+00:00",
+                "date_et": "2026-10-24",
+                "text": "Deferred retry taking 2s under production default clock.",
+            }
+        ],
+        mode="run",
+        window_start=date(2026, 10, 20),
+        window_end=date(2026, 10, 26),
+        limiter=limiter,
+        extractor_model="deepseek-flash",
+        prompt_version="conv_card_v2_3",
+        defer_retry_min_s=0.01,
+        defer_retry_max_s=0.02,
+        extract_fn=create_autospec(
+            extractor_mod.extract_segment_cards,
+            side_effect=_inflight_then_2s_success,
+        ),
+    )
+    elapsed = archive_cli.time.monotonic() - t_start
+
+    assert attempt_count == 2
+    assert elapsed >= 1.9
+    assert summary["status"] == "completed"
+    assert summary["incomplete_segments_count"] == 0
+    assert summary["segments_processed"] == 1
+    assert summary["total_tokens"] == 140
+
+
+@pytest.mark.asyncio
+async def test_round3_concurrent_segments_different_deadlines_budget_wait_outside_lock() -> None:
+    """When two segments with different deadlines wait concurrently on HourlyTokenBudgetLimiter, the earlier-expiring segment is not blocked past its own deadline by the later-expiring waiter."""
+    fake_now = 1000.0
+    later_sleep_started = asyncio.Event()
+    release_later_sleep = asyncio.Event()
+    earlier_sleep_durations: list[float] = []
+
+    def _clock() -> float:
+        return fake_now
+
+    async def _sleep(seconds: float) -> None:
+        nonlocal fake_now
+        dur = round(float(seconds), 2)
+        if dur >= 200.0:
+            later_sleep_started.set()
+            await release_later_sleep.wait()
+            fake_now = max(fake_now, 1300.0)
+        else:
+            earlier_sleep_durations.append(dur)
+            fake_now = max(fake_now, 1040.0)
+
+    limiter = archive_cli.HourlyTokenBudgetLimiter(
+        10_000,
+        clock_fn=_clock,
+        sleep_fn=create_autospec(asyncio.sleep, side_effect=_sleep),
+    )
+    # Record 9,500 settled tokens at t = 1000 - 3300 = -2300 so budget frees in 300s (at t = 1300).
+    limiter._history.append((1000.0 - 3300.0, 9_500))
+
+    # Segment A has a 600s deadline (t=1600) and needs 300s budget wait -> enters sleep(300.0) outside lock.
+    task_later = asyncio.create_task(
+        limiter.wait_for_budget(1_000, deadline=1600.0)
+    )
+    await asyncio.wait_for(later_sleep_started.wait(), timeout=1.0)
+
+    # While Segment A sleeps 300s outside `_lock`, Segment B (40s remaining deadline, t=1040) acquires `_lock`.
+    # Rule: when required budget wait (300s) exceeds remaining segment deadline (40s), fail immediately
+    # with `_SegmentDeadlineExceededError` without sleeping to the deadline first (`fake_now` stays 1000.0).
+    with pytest.raises(archive_cli._SegmentDeadlineExceededError):
+        await asyncio.wait_for(
+            limiter.wait_for_budget(1_000, deadline=1040.0),
+            timeout=1.0,
+        )
+    assert not task_later.done()
+    assert fake_now == 1000.0
+
+    # Also verify shared 429 rate-limit pause sleeps outside lock for min(wait_needed, remaining_segment_time):
+    limiter.notify_rate_limit_backoff(300.0)
+    with pytest.raises(archive_cli._SegmentDeadlineExceededError):
+        await asyncio.wait_for(
+            limiter.wait_for_rate_limit_pause(deadline=1040.0),
+            timeout=1.0,
+        )
+    assert earlier_sleep_durations == [40.0]
+    assert fake_now == 1040.0
+
+    release_later_sleep.set()
+    res_later = await asyncio.wait_for(task_later, timeout=1.0)
+    assert isinstance(res_later, archive_cli.BudgetReservation)
+    limiter.release_reservation(res_later)
+
+
+def test_round3_cli_main_exits_bounded_without_releasing_zombie_task(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    """When an abandoned extraction task swallows CancelledError and never exits (not released in finally), CLI main() logs a warning with the segment ID, closes the DB pool within 10s, and invokes exit_fn with the run exit code without hanging."""
+    monkeypatch.setattr(archive_cli, "CANCEL_GRACE_TIMEOUT_S", 0.05)
+
+    inbox_dir = tmp_path / "inbox"
+    inbox_dir.mkdir(parents=True, exist_ok=True)
+    inbox_file = inbox_dir / "zombie_cli.jsonl"
+    inbox_file.write_text(
+        json.dumps(
+            {
+                "agent": "main",
+                "session_id": "sess-cli-zombie",
+                "event_id": "ev-cli-zombie-0",
+                "seq": 1,
+                "generation": "gen-1",
+                "created_at_ms": 1761300000000,
+                "ts": "2026-10-24T12:00:00+00:00",
+                "date_et": "2026-10-24",
+                "text": "CLI zombie segment that swallows CancelledError forever.",
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    mock_pool = create_autospec(AsyncConnectionPool, instance=True)
+    mock_pool.open.return_value = None
+    mock_pool.close.return_value = None
+    monkeypatch.setattr(
+        archive_cli,
+        "get_or_create_pool",
+        create_autospec(archive_cli.get_or_create_pool, return_value=mock_pool),
+    )
+    _patch_autospec_db_connection(monkeypatch)
+    monkeypatch.setattr(
+        db_conv,
+        "try_acquire_archive_run_lock",
+        create_autospec(db_conv.try_acquire_archive_run_lock, return_value=True),
+    )
+    monkeypatch.setattr(
+        db_conv,
+        "release_archive_run_lock",
+        create_autospec(db_conv.release_archive_run_lock, return_value=None),
+    )
+    monkeypatch.setattr(
+        db_conv,
+        "fetch_processed_event_chunks",
+        create_autospec(db_conv.fetch_processed_event_chunks, return_value=set()),
+    )
+    monkeypatch.setattr(
+        db_conv,
+        "insert_run_start",
+        create_autospec(db_conv.insert_run_start, return_value={"status": "running"}),
+    )
+    monkeypatch.setattr(
+        db_conv,
+        "update_run_progress",
+        create_autospec(db_conv.update_run_progress, return_value=None),
+    )
+    monkeypatch.setattr(
+        db_conv,
+        "update_run_finish",
+        create_autospec(db_conv.update_run_finish, return_value={"status": "failed"}),
+    )
+    monkeypatch.setattr(
+        db_conv,
+        "list_unrendered_dates",
+        create_autospec(db_conv.list_unrendered_dates, return_value=[]),
+    )
+
+    cfg = archive_cli.get_dalton_settings().conversations
+    monkeypatch.setattr(cfg, "segment_deadline_s", 0.05)
+    zombie_released = threading.Event()
+
+    async def _forever_uncancellable_assist(
+        *args: Any,
+        **kwargs: Any,
+    ) -> assist_mod.AssistResult:
+        never_evt = asyncio.Event()
+        while not zombie_released.is_set():
+            try:
+                await never_evt.wait()
+            except asyncio.CancelledError:
+                # Swallow cancellation so main() has to abandon the task. Only
+                # CancelledError: catching GeneratorExit too would spin forever
+                # once the abandoned task's loop is closed and it is destroyed.
+                continue
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(
+        extractor_mod,
+        "assist_json",
+        create_autospec(
+            extractor_mod.assist_json,
+            side_effect=_forever_uncancellable_assist,
+        ),
+    )
+
+    exit_codes: list[int] = []
+    mock_exit = create_autospec(os._exit, side_effect=lambda code: exit_codes.append(int(code)))
+
+    t0 = archive_cli.time.monotonic()
+    ret_code = archive_cli.main(
+        [
+            "run",
+            "--skip-host-export",
+            "--inbox-file",
+            str(inbox_file),
+            "--since",
+            "2026-10-20",
+            "--until",
+            "2026-10-26",
+        ],
+        exit_fn=mock_exit,
+    )
+    elapsed = archive_cli.time.monotonic() - t0
+    captured = capsys.readouterr()
+
+    assert elapsed < 3.0
+    assert ret_code == archive_cli.EXIT_CODE_INCOMPLETE
+    assert exit_codes == [archive_cli.EXIT_CODE_INCOMPLETE]
+    assert mock_pool.close.await_count == 1
+    assert "sess-cli-zombie:ev-cli-zombie-0" in captured.err
+    assert "forcing immediate exit" in captured.err
+    # Asserted before release: main() did not wait for the zombie.
+    zombie_released.set()
+
+
+@pytest.mark.asyncio
+async def test_round3_per_attempt_conservative_token_settlement_both_timeout_and_429_backoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify:
+    1. Primary model timeout (no usage) + fallback model timeout (no usage) settles 2 * estimated_tokens in both hourly budget and run summary.
+    2. 429 (no usage) followed by backoff hitting segment deadline settles 1 * estimated_tokens in both hourly budget and run summary.
+    """
+    _patch_autospec_db_connection(monkeypatch)
+    monkeypatch.setattr(
+        db_conv,
+        "insert_run_start",
+        create_autospec(db_conv.insert_run_start, return_value={"status": "running"}),
+    )
+    monkeypatch.setattr(
+        db_conv,
+        "update_run_progress",
+        create_autospec(db_conv.update_run_progress, return_value=None),
+    )
+    finish_records: list[dict[str, Any]] = []
+
+    async def _capture_finish(run_id: str, **kwargs: Any) -> dict[str, Any]:
+        finish_records.append({"run_id": run_id, **kwargs})
+        return {"run_id": run_id, **kwargs}
+
+    monkeypatch.setattr(
+        db_conv,
+        "update_run_finish",
+        create_autospec(db_conv.update_run_finish, side_effect=_capture_finish),
+    )
+    monkeypatch.setattr(
+        db_conv,
+        "list_unrendered_dates",
+        create_autospec(db_conv.list_unrendered_dates, return_value=[]),
+    )
+
+    sample_event = {
+        "agent": "main",
+        "session_id": "sess-r3-tok",
+        "event_id": "ev-r3-tok-0",
+        "seq": 1,
+        "generation": "gen-1",
+        "created_at_ms": 1761300000000,
+        "ts": "2026-10-24T12:00:00+00:00",
+        "date_et": "2026-10-24",
+        "text": "Conservative per-attempt token settlement test segment.",
+    }
+    est_tokens = archive_cli.estimate_segment_tokens([sample_event], hourly_budget=100_000)
+
+    # --- Subcase 1: Primary times out (no usage) + Fallback times out (no usage) -> 2 * est_tokens in both ---
+    clock_1 = 1000.0
+
+    def _clock_1() -> float:
+        return clock_1
+
+    async def _sleep_1(s: float) -> None:
+        nonlocal clock_1
+        clock_1 += max(0.0, float(s))
+
+    limiter_1 = archive_cli.HourlyTokenBudgetLimiter(
+        100_000, clock_fn=_clock_1, sleep_fn=_sleep_1
+    )
+    never_evt = asyncio.Event()
+
+    async def _primary_timeout_fallback_hang(
+        segment: list[dict[str, Any]],
+        **kwargs: Any,
+    ) -> extractor_mod.SegmentExtractionOutcome:
+        nonlocal clock_1
+        model = str(kwargs.get("extractor_model") or "")
+        if model == "deepseek-flash":
+            clock_1 += 180.0
+            return extractor_mod.SegmentExtractionOutcome(
+                ok=False,
+                model_used=model,
+                status="indeterminate",
+                error_kind="timeout",
+                transient_error=True,
+                input_tokens=0,
+                output_tokens=0,
+                total_tokens=0,
+                error="TimeoutError: primary model timed out after 180s",
+            )
+        # Fallback model hangs until segment deadline (remaining 420s) with no usage
+        await never_evt.wait()
+        return extractor_mod.SegmentExtractionOutcome(ok=False)
+
+    summary_1 = await archive_cli.process_weekly_batch(
+        [dict(sample_event)],
+        mode="run",
+        window_start=date(2026, 10, 20),
+        window_end=date(2026, 10, 26),
+        limiter=limiter_1,
+        extractor_model="deepseek-flash",
+        extractor_fallback_model="gemini-4-argon-medium-oauth",
+        prompt_version="conv_card_v2_3",
+        segment_deadline_s=600.0,
+        extract_fn=create_autospec(
+            extractor_mod.extract_segment_cards,
+            side_effect=_primary_timeout_fallback_hang,
+        ),
+        clock_fn=_clock_1,
+        sleep_fn=_sleep_1,
+    )
+
+    assert len(limiter_1._reservations) == 0
+    assert limiter_1.current_window_tokens() == 2 * est_tokens
+    assert summary_1["total_tokens"] == 2 * est_tokens
+    assert finish_records[-1]["total_tokens"] == 2 * est_tokens
+
+    # --- Subcase 2: 429 (no usage) followed by backoff hitting segment deadline -> 1 * est_tokens in both ---
+    clock_2 = 2000.0
+
+    def _clock_2() -> float:
+        return clock_2
+
+    async def _sleep_2(s: float) -> None:
+        nonlocal clock_2
+        clock_2 += max(0.0, float(s))
+
+    limiter_2 = archive_cli.HourlyTokenBudgetLimiter(
+        100_000, clock_fn=_clock_2, sleep_fn=_sleep_2
+    )
+
+    async def _rate_limit_no_usage(
+        segment: list[dict[str, Any]],
+        **kwargs: Any,
+    ) -> extractor_mod.SegmentExtractionOutcome:
+        return extractor_mod.SegmentExtractionOutcome(
+            ok=False,
+            model_used="deepseek-flash",
+            rate_limited=True,
+            input_tokens=0,
+            output_tokens=0,
+            total_tokens=0,
+            error="RateLimitError",
+        )
+
+    summary_2 = await archive_cli.process_weekly_batch(
+        [dict(sample_event)],
+        mode="run",
+        window_start=date(2026, 10, 20),
+        window_end=date(2026, 10, 26),
+        limiter=limiter_2,
+        extractor_model="deepseek-flash",
+        prompt_version="conv_card_v2_3",
+        segment_deadline_s=20.0,
+        initial_backoff_s=30.0,
+        max_backoff_s=900.0,
+        extract_fn=create_autospec(
+            extractor_mod.extract_segment_cards,
+            side_effect=_rate_limit_no_usage,
+        ),
+        clock_fn=_clock_2,
+        sleep_fn=_sleep_2,
+    )
+
+    assert len(limiter_2._reservations) == 0
+    assert limiter_2.current_window_tokens() == est_tokens
+    assert summary_2["total_tokens"] == est_tokens
+    assert finish_records[-1]["total_tokens"] == est_tokens
+
+
+@pytest.mark.asyncio
+async def test_round4_single_settled_value_ok_zero_usage_and_deadline_error_kind(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify:
+    1. An extraction attempt that succeeds (`ok=True`) with empty/0 token usage settles at `estimated_tokens`
+       in both `HourlyTokenBudgetLimiter` and the run summary (`total_tokens`), while cached/replayed
+       short-circuits still count 0.
+    2. An already-started attempt returning `error_kind="deadline"` settles at `estimated_tokens` in both
+       `HourlyTokenBudgetLimiter` and the run summary (does not take the unsent/0-token branch).
+    """
+    _patch_autospec_db_connection(monkeypatch)
+    monkeypatch.setattr(
+        db_conv,
+        "insert_run_start",
+        create_autospec(db_conv.insert_run_start, return_value={"status": "running"}),
+    )
+    monkeypatch.setattr(
+        db_conv,
+        "update_run_progress",
+        create_autospec(db_conv.update_run_progress, return_value=None),
+    )
+    monkeypatch.setattr(
+        db_conv,
+        "record_processed_event_chunks",
+        create_autospec(db_conv.record_processed_event_chunks, return_value=1),
+    )
+    monkeypatch.setattr(
+        db_conv,
+        "list_unrendered_dates",
+        create_autospec(db_conv.list_unrendered_dates, return_value=[]),
+    )
+    finish_records: list[dict[str, Any]] = []
+
+    async def _capture_finish(run_id: str, **kwargs: Any) -> dict[str, Any]:
+        finish_records.append({"run_id": run_id, **kwargs})
+        return {"run_id": run_id, **kwargs}
+
+    monkeypatch.setattr(
+        db_conv,
+        "update_run_finish",
+        create_autospec(db_conv.update_run_finish, side_effect=_capture_finish),
+    )
+
+    sample_event = {
+        "agent": "main",
+        "session_id": "sess-r4-settle",
+        "event_id": "ev-r4-settle-0",
+        "seq": 1,
+        "generation": "gen-1",
+        "created_at_ms": 1761300000000,
+        "ts": "2026-10-24T12:00:00+00:00",
+        "date_et": "2026-10-24",
+        "text": "Round 4 single settled token value test segment.",
+    }
+    est_tokens = archive_cli.estimate_segment_tokens([sample_event], hourly_budget=100_000)
+
+    # --- Subcase 1: `ok=True` with 0 usage -> settles `est_tokens` in both hourly budget and run summary ---
+    limiter_ok0 = archive_cli.HourlyTokenBudgetLimiter(100_000)
+
+    async def _ok_with_zero_usage(
+        segment: list[dict[str, Any]],
+        **kwargs: Any,
+    ) -> extractor_mod.SegmentExtractionOutcome:
+        return extractor_mod.SegmentExtractionOutcome(
+            ok=True,
+            category="ops",
+            cards=[],
+            cards_raw_count=0,
+            discarded_segment=True,
+            model_used="deepseek-flash",
+            input_tokens=0,
+            output_tokens=0,
+            total_tokens=0,
+        )
+
+    summary_ok0 = await archive_cli.process_weekly_batch(
+        [dict(sample_event)],
+        mode="run",
+        window_start=date(2026, 10, 20),
+        window_end=date(2026, 10, 26),
+        limiter=limiter_ok0,
+        extractor_model="deepseek-flash",
+        prompt_version="conv_card_v2_3",
+        extract_fn=create_autospec(
+            extractor_mod.extract_segment_cards,
+            side_effect=_ok_with_zero_usage,
+        ),
+    )
+    assert len(limiter_ok0._reservations) == 0
+    assert limiter_ok0.current_window_tokens() == est_tokens
+    assert summary_ok0["total_tokens"] == est_tokens
+    assert finish_records[-1]["total_tokens"] == est_tokens
+
+    # Cached replay (`cached=True`) still counts 0 in both
+    limiter_cached = archive_cli.HourlyTokenBudgetLimiter(100_000)
+
+    async def _ok_cached_replay(
+        segment: list[dict[str, Any]],
+        **kwargs: Any,
+    ) -> extractor_mod.SegmentExtractionOutcome:
+        return extractor_mod.SegmentExtractionOutcome(
+            ok=True,
+            category="ops",
+            cards=[],
+            cards_raw_count=0,
+            discarded_segment=True,
+            cached=True,
+            replayed=True,
+            model_used="deepseek-flash",
+            input_tokens=0,
+            output_tokens=0,
+            total_tokens=0,
+        )
+
+    summary_cached = await archive_cli.process_weekly_batch(
+        [dict(sample_event)],
+        mode="run",
+        window_start=date(2026, 10, 20),
+        window_end=date(2026, 10, 26),
+        limiter=limiter_cached,
+        extractor_model="deepseek-flash",
+        prompt_version="conv_card_v2_3",
+        extract_fn=create_autospec(
+            extractor_mod.extract_segment_cards,
+            side_effect=_ok_cached_replay,
+        ),
+    )
+    assert limiter_cached.current_window_tokens() == 0
+    assert summary_cached["total_tokens"] == 0
+    assert finish_records[-1]["total_tokens"] == 0
+
+    # --- Subcase 2: Attempt returning `error_kind="deadline"` -> settles `est_tokens` in both ---
+    limiter_dl = archive_cli.HourlyTokenBudgetLimiter(100_000)
+
+    async def _deadline_error_kind_attempt(
+        segment: list[dict[str, Any]],
+        **kwargs: Any,
+    ) -> extractor_mod.SegmentExtractionOutcome:
+        return extractor_mod.SegmentExtractionOutcome(
+            ok=False,
+            model_used="deepseek-flash",
+            status="failed",
+            error_kind="deadline",
+            input_tokens=0,
+            output_tokens=0,
+            total_tokens=0,
+            error="DeadlineBeforeSendError: deadline reached before the request was sent",
+        )
+
+    summary_dl = await archive_cli.process_weekly_batch(
+        [dict(sample_event)],
+        mode="run",
+        window_start=date(2026, 10, 20),
+        window_end=date(2026, 10, 26),
+        limiter=limiter_dl,
+        extractor_model="deepseek-flash",
+        prompt_version="conv_card_v2_3",
+        extract_fn=create_autospec(
+            extractor_mod.extract_segment_cards,
+            side_effect=_deadline_error_kind_attempt,
+        ),
+    )
+    assert len(limiter_dl._reservations) == 0
+    assert limiter_dl.current_window_tokens() == est_tokens
+    assert summary_dl["total_tokens"] == est_tokens
+    assert finish_records[-1]["total_tokens"] == est_tokens
+
+
+@pytest.mark.asyncio
+async def test_round4_concurrent_segment_cancellation_settles_estimated_tokens_in_failed_run_and_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When concurrent Segment B is cancelled (`CancelledError`) because Segment A raises a fatal `PermanentQuotaError`, Segment B settles its in-flight attempt at `estimated_tokens` into both `HourlyTokenBudgetLimiter` and the failed run's `update_run_finish` summary."""
+    _patch_autospec_db_connection(monkeypatch)
+    monkeypatch.setattr(
+        db_conv,
+        "insert_run_start",
+        create_autospec(db_conv.insert_run_start, return_value={"status": "running"}),
+    )
+    monkeypatch.setattr(
+        db_conv,
+        "update_run_progress",
+        create_autospec(db_conv.update_run_progress, return_value=None),
+    )
+    monkeypatch.setattr(
+        db_conv,
+        "list_unrendered_dates",
+        create_autospec(db_conv.list_unrendered_dates, return_value=[]),
+    )
+    finish_records: list[dict[str, Any]] = []
+
+    async def _capture_finish(run_id: str, **kwargs: Any) -> dict[str, Any]:
+        finish_records.append({"run_id": run_id, **kwargs})
+        return {"run_id": run_id, **kwargs}
+
+    monkeypatch.setattr(
+        db_conv,
+        "update_run_finish",
+        create_autospec(db_conv.update_run_finish, side_effect=_capture_finish),
+    )
+
+    ev_fatal = {
+        "agent": "main",
+        "session_id": "sess-r4-fatal-a",
+        "event_id": "ev-r4-fatal-0",
+        "seq": 1,
+        "generation": "gen-1",
+        "created_at_ms": 1761300000000,
+        "ts": "2026-10-24T12:00:00+00:00",
+        "date_et": "2026-10-24",
+        "text": "Segment A triggers a fatal PermanentQuotaError.",
+    }
+    ev_cancelled = {
+        "agent": "main",
+        "session_id": "sess-r4-cancel-b",
+        "event_id": "ev-r4-cancel-1",
+        "seq": 1,
+        "generation": "gen-1",
+        "created_at_ms": 1761300060000,
+        "ts": "2026-10-24T12:01:00+00:00",
+        "date_et": "2026-10-24",
+        "text": "Segment B is in flight when Segment A fails and gets cancelled.",
+    }
+    est_b = archive_cli.estimate_segment_tokens([ev_cancelled], hourly_budget=100_000)
+
+    seg_b_started = asyncio.Event()
+    never_evt = asyncio.Event()
+
+    async def _concurrent_extract(
+        segment: list[dict[str, Any]],
+        **kwargs: Any,
+    ) -> extractor_mod.SegmentExtractionOutcome:
+        ev_id = str(segment[0].get("event_id") or "")
+        if ev_id == "ev-r4-cancel-1":
+            seg_b_started.set()
+            await never_evt.wait()
+            return extractor_mod.SegmentExtractionOutcome(ok=True)
+        await asyncio.wait_for(seg_b_started.wait(), timeout=2.0)
+        raise archive_cli.PermanentQuotaError("http_402: permanent quota exhausted", status_code=402)
+
+    limiter = archive_cli.HourlyTokenBudgetLimiter(100_000)
+
+    with pytest.raises(archive_cli.PermanentQuotaError):
+        await archive_cli.process_weekly_batch(
+            [dict(ev_fatal), dict(ev_cancelled)],
+            mode="run",
+            window_start=date(2026, 10, 20),
+            window_end=date(2026, 10, 26),
+            limiter=limiter,
+            extractor_model="deepseek-flash",
+            prompt_version="conv_card_v2_3",
+            concurrency=2,
+            extract_fn=create_autospec(
+                extractor_mod.extract_segment_cards,
+                side_effect=_concurrent_extract,
+            ),
+        )
+
+    assert len(limiter._reservations) == 0
+    assert limiter.current_window_tokens() == est_b
+    assert len(finish_records) == 1
+    assert finish_records[-1]["status"] == "failed"
+    assert finish_records[-1]["total_tokens"] == est_b
+
+
+def test_round4_cli_main_sigint_executes_finally_and_exits_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """When `main()` receives SIGINT while the main task is running, the main task is cancelled, executes its `finally` block (verified via injectable `on_finally` flag, run status update, and DB pool close), and returns an exit code within bounded time."""
+    inbox_dir = tmp_path / "inbox"
+    inbox_dir.mkdir(parents=True, exist_ok=True)
+    inbox_file = inbox_dir / "sigint_cli.jsonl"
+    inbox_file.write_text(
+        json.dumps(
+            {
+                "agent": "main",
+                "session_id": "sess-cli-sigint",
+                "event_id": "ev-cli-sigint-0",
+                "seq": 1,
+                "generation": "gen-1",
+                "created_at_ms": 1761300000000,
+                "ts": "2026-10-24T12:00:00+00:00",
+                "date_et": "2026-10-24",
+                "text": "Segment interrupted by SIGINT during CLI main().",
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    mock_pool = create_autospec(AsyncConnectionPool, instance=True)
+    mock_pool.open.return_value = None
+    mock_pool.close.return_value = None
+    monkeypatch.setattr(
+        archive_cli,
+        "get_or_create_pool",
+        create_autospec(archive_cli.get_or_create_pool, return_value=mock_pool),
+    )
+    _patch_autospec_db_connection(monkeypatch)
+    monkeypatch.setattr(
+        db_conv,
+        "try_acquire_archive_run_lock",
+        create_autospec(db_conv.try_acquire_archive_run_lock, return_value=True),
+    )
+    mock_release_lock = create_autospec(db_conv.release_archive_run_lock, return_value=None)
+    monkeypatch.setattr(db_conv, "release_archive_run_lock", mock_release_lock)
+    monkeypatch.setattr(
+        db_conv,
+        "fetch_processed_event_chunks",
+        create_autospec(db_conv.fetch_processed_event_chunks, return_value=set()),
+    )
+    monkeypatch.setattr(
+        db_conv,
+        "insert_run_start",
+        create_autospec(db_conv.insert_run_start, return_value={"status": "running"}),
+    )
+    monkeypatch.setattr(
+        db_conv,
+        "update_run_progress",
+        create_autospec(db_conv.update_run_progress, return_value=None),
+    )
+    finish_records: list[dict[str, Any]] = []
+
+    async def _capture_finish(run_id: str, **kwargs: Any) -> dict[str, Any]:
+        finish_records.append({"run_id": run_id, **kwargs})
+        return {"run_id": run_id, **kwargs}
+
+    monkeypatch.setattr(
+        db_conv,
+        "update_run_finish",
+        create_autospec(db_conv.update_run_finish, side_effect=_capture_finish),
+    )
+    monkeypatch.setattr(
+        db_conv,
+        "list_unrendered_dates",
+        create_autospec(db_conv.list_unrendered_dates, return_value=[]),
+    )
+
+    async def _send_sigint_while_in_flight(
+        *args: Any,
+        **kwargs: Any,
+    ) -> assist_mod.AssistResult:
+        os.kill(os.getpid(), archive_cli.signal.SIGINT)
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(
+        extractor_mod,
+        "assist_json",
+        create_autospec(
+            extractor_mod.assist_json,
+            side_effect=_send_sigint_while_in_flight,
+        ),
+    )
+
+    finally_executed = False
+
+    def _mark_finally() -> None:
+        nonlocal finally_executed
+        finally_executed = True
+
+    t0 = archive_cli.time.monotonic()
+    ret_code = archive_cli.main(
+        [
+            "run",
+            "--skip-host-export",
+            "--inbox-file",
+            str(inbox_file),
+            "--since",
+            "2026-10-20",
+            "--until",
+            "2026-10-26",
+        ],
+        on_finally=_mark_finally,
+    )
+    elapsed = archive_cli.time.monotonic() - t0
+
+    assert elapsed < 3.0
+    assert ret_code == archive_cli.EXIT_CODE_FATAL
+    assert finally_executed is True
+    assert mock_pool.close.await_count == 1
+    assert mock_release_lock.await_count == 1
+    assert len(finish_records) == 1
+    assert finish_records[-1]["status"] == "interrupted"
+    assert finish_records[-1]["total_tokens"] > 0
+
+
+
+
 
