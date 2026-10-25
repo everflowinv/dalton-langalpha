@@ -130,6 +130,8 @@ class DaltonConversationsConfig(BaseModel):
 
     enabled: bool = True
     extractor_model: str = ""
+    extractor_fallback_model: str = "gemini-4-argon-medium-oauth"
+    segment_deadline_s: float = Field(default=600.0, gt=0)
     prompt_version: str = "conv_card_v2_3"
     embedding_model: str = ""
     embedding_model_preferred: str = ""

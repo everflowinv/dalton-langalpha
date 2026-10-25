@@ -40,6 +40,7 @@ VALID_CARD_TYPES: frozenset[str] = frozenset(
 )
 
 DEFAULT_PROMPT_VERSION: str = "conv_card_v2_3"
+DEFAULT_SEGMENT_DEADLINE_S: float = 600.0
 
 # Private / unlisted companies must stay in `entities[]` rather than `tickers[]`
 PRIVATE_COMPANIES: frozenset[str] = frozenset(
@@ -4276,6 +4277,25 @@ def is_rate_limit_or_quota_error(res: AssistResult | BaseException | str) -> boo
     return False
 
 
+def is_fallback_eligible(outcome: SegmentExtractionOutcome) -> bool:
+    """Return True when a failed segment extraction outcome is eligible for a single fallback-model retry."""
+    if outcome.ok or outcome.permanent_quota_error or is_permanent_quota_error(outcome):
+        return False
+    if outcome.rate_limited or is_rate_limit_or_quota_error(outcome):
+        return False
+    if is_in_flight_error(outcome):
+        return False
+    if (
+        str(outcome.status or "").strip().lower() == "indeterminate"
+        or str(outcome.error_kind or "").strip().lower() in ("indeterminate", "timeout")
+        or is_transient_network_error(outcome)
+        or bool(outcome.transient_error)
+    ):
+        return True
+    kind = f"{outcome.error_kind or ''} {outcome.error or ''}".lower()
+    return "timeout" in kind or "timed out" in kind or "上次调用在返回前中断" in kind
+
+
 async def extract_segment_cards(
     segment: list[dict[str, Any]],
     *,
@@ -4286,6 +4306,7 @@ async def extract_segment_cards(
     resend_indeterminate: bool = False,
     persist_raw: bool = False,
     skip_journal: bool = False,
+    deadline: float | None = None,
 ) -> SegmentExtractionOutcome:
     """Extract and validate knowledge cards from one conversation segment via `assist_json`."""
     cfg = get_dalton_settings().conversations
@@ -4344,6 +4365,7 @@ async def extract_segment_cards(
         role="extract",
         scope_ref=scope_ref,
         timeout_s=180.0,
+        deadline=deadline,
         model=eff_model or None,
         llm_service=llm_service,
         resend_indeterminate=eff_resend_indeterminate,

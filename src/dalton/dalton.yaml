@@ -97,6 +97,8 @@ conversations:
   enabled: true
   # 2026-10-23 盲评中忠实度和覆盖度最高
   extractor_model: "deepseek-flash"
+  extractor_fallback_model: "gemini-4-argon-medium-oauth"
+  segment_deadline_s: 600
   prompt_version: "conv_card_v2_3"
   embedding_model: "gemini-embedding-001"
   embedding_model_preferred: "gemini-embedding-2-preview"

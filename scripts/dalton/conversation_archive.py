@@ -22,13 +22,16 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextvars
 import inspect
 import json
 import logging
 import os
 import re
 import resource
+import signal
 import sys
+import threading
 import time
 import tracemalloc
 import uuid
@@ -56,10 +59,12 @@ from scripts.dalton.conversations.export_openclaw import (  # noqa: E402
 from src.config.env import LOCAL_DEV_USER_ID  # noqa: E402
 from src.dalton.conversations.embedder import embed_texts_via_bridge  # noqa: E402
 from src.dalton.conversations.extractor import (  # noqa: E402
+    DEFAULT_SEGMENT_DEADLINE_S,
     SegmentExtractionOutcome,
     deduplicate_candidate_cards,
     expand_event_chunks,
     extract_segment_cards,
+    is_fallback_eligible,
     is_in_flight_error,
     is_permanent_quota_error,
     is_rate_limit_or_quota_error,
@@ -83,13 +88,42 @@ _orig_open_session_connection = open_session_connection
 logger = logging.getLogger("dalton.conversation_archive")
 
 ET_TZ = ZoneInfo("America/New_York")
+DEFAULT_FALLBACK_MODEL = "gemini-4-argon-medium-oauth"
 DEFAULT_RESERVED_OUTPUT_TOKENS = 1024
 DEFAULT_STALE_AFTER_S = 900
 TRANSIENT_BACKOFF_DELAYS_S: tuple[float, ...] = (2.0, 4.0, 8.0, 16.0, 32.0)
 DEFAULT_DEFER_RETRY_MIN_S = 30.0
 DEFAULT_DEFER_RETRY_MAX_S = 60.0
 DEFAULT_DEFER_EXTRA_AFTER_STALE_S = 60.0
+CANCEL_GRACE_TIMEOUT_S = 5.0
+POOL_CLOSE_TIMEOUT_S = 10.0
+SHUTDOWN_GRACE_TIMEOUT_S = 30.0
 EXIT_CODE_OK = 0
+EXIT_CODE_FATAL = 1
+
+_ACTIVE_SEGMENT_DEADLINE: contextvars.ContextVar[float | None] = contextvars.ContextVar(
+    "_ACTIVE_SEGMENT_DEADLINE", default=None
+)
+_ABANDONED_EXTRACTION_TASKS: dict[asyncio.Task[Any], str] = {}
+
+
+def _register_abandoned_task(task: asyncio.Task[Any], segment_id: str) -> None:
+    _ABANDONED_EXTRACTION_TASKS[task] = segment_id
+
+    def _on_done(t: asyncio.Task[Any]) -> None:
+        _ABANDONED_EXTRACTION_TASKS.pop(t, None)
+        if not t.cancelled():
+            _ = t.exception()
+
+    task.add_done_callback(_on_done)
+
+
+def _get_live_abandoned_segment_ids() -> list[str]:
+    for t in [task for task in list(_ABANDONED_EXTRACTION_TASKS) if task.done()]:
+        _ABANDONED_EXTRACTION_TASKS.pop(t, None)
+    return list(_ABANDONED_EXTRACTION_TASKS.values())
+
+
 EXIT_CODE_LOCK_HELD = 2
 EXIT_CODE_INCOMPLETE = 3
 MEM_TRACE_ENV_VAR = "DALTON_ARCHIVE_MEM_TRACE"
@@ -239,7 +273,15 @@ def estimate_segment_tokens(
 class BudgetReservation:
     """Handle for an in-flight token budget reservation, settled at most once by ID."""
 
-    __slots__ = ("reservation_id", "estimated_tokens", "waited_seconds", "settled")
+    __slots__ = (
+        "reservation_id",
+        "estimated_tokens",
+        "waited_seconds",
+        "settled",
+        "settled_input_tokens",
+        "settled_output_tokens",
+        "settled_total_tokens",
+    )
 
     def __init__(
         self,
@@ -251,6 +293,9 @@ class BudgetReservation:
         self.estimated_tokens = int(estimated_tokens)
         self.waited_seconds = float(waited_seconds)
         self.settled = False
+        self.settled_input_tokens = 0
+        self.settled_output_tokens = 0
+        self.settled_total_tokens = 0
 
     def rebind(self, other: "BudgetReservation | Any") -> None:
         """Adopt a replacement reservation when re-reserving before a 429 retry attempt."""
@@ -340,19 +385,33 @@ class HourlyTokenBudgetLimiter:
             return True
         return False
 
-    async def wait_for_rate_limit_pause(self) -> float:
+    async def wait_for_rate_limit_pause(self, *, deadline: float | None = None) -> float:
         """Wait if another coroutine is currently in a 429 rate-limit backoff window."""
+        if self._rate_limit_pause_until <= 0.0:
+            return 0.0
+        eff_dl = deadline if deadline is not None else _ACTIVE_SEGMENT_DEADLINE.get()
         slept = 0.0
         while True:
-            now = self._now()
-            target_until = self._rate_limit_pause_until
-            if target_until <= now + 1e-6:
-                if self._rate_limit_pause_until > 0.0:
-                    self._rate_limit_pause_until = 0.0
-                    self._rate_limit_clear_event.set()
-                break
-            wait_s = max(0.01, target_until - now)
-            t1 = self._clock()
+            async with self._lock:
+                now = self._now()
+                target_until = self._rate_limit_pause_until
+                if target_until <= now + 1e-6:
+                    if self._rate_limit_pause_until > 0.0:
+                        self._rate_limit_pause_until = 0.0
+                        self._rate_limit_clear_event.set()
+                    break
+                raw_wait_s = max(0.01, target_until - now)
+                if eff_dl is not None:
+                    rem_s = eff_dl - now
+                    if rem_s <= 0:
+                        raise _SegmentDeadlineExceededError()
+                    wait_s = min(raw_wait_s, rem_s)
+                    clamped_to_dl = raw_wait_s >= rem_s - 1e-9
+                else:
+                    wait_s = raw_wait_s
+                    clamped_to_dl = False
+                t1 = self._clock()
+
             sleep_task = asyncio.create_task(self._sleep(wait_s))
             clear_task = asyncio.create_task(self._rate_limit_clear_event.wait())
             try:
@@ -368,33 +427,54 @@ class HourlyTokenBudgetLimiter:
                 for t in (sleep_task, clear_task):
                     if not t.done():
                         t.cancel()
-            t2 = self._clock()
-            actual_elapsed = max(0.0, t2 - t1)
-            if sleep_task in done:
-                if not self._uses_custom_clock and actual_elapsed < wait_s * 0.5:
-                    self._virtual_time_offset += wait_s - actual_elapsed
-                slept += wait_s
-                self.total_slept_seconds += wait_s
-            else:
-                slept += actual_elapsed
-                self.total_slept_seconds += actual_elapsed
+
+            async with self._lock:
+                t2 = self._clock()
+                actual_elapsed = max(0.0, t2 - t1)
+                if sleep_task in done:
+                    if not self._uses_custom_clock and actual_elapsed < wait_s * 0.5:
+                        self._virtual_time_offset += wait_s - actual_elapsed
+                    slept += wait_s
+                    self.total_slept_seconds += wait_s
+                else:
+                    slept += actual_elapsed
+                    self.total_slept_seconds += actual_elapsed
+                if eff_dl is not None and (
+                    self._now() >= eff_dl or (clamped_to_dl and sleep_task in done)
+                ):
+                    raise _SegmentDeadlineExceededError()
         return slept
 
-    async def wait_for_budget(self, estimated_tokens: int = 1000) -> BudgetReservation:
+    async def wait_for_budget(
+        self,
+        estimated_tokens: int = 1000,
+        *,
+        deadline: float | None = None,
+    ) -> BudgetReservation:
         """Wait until the sliding 1-hour window has capacity for `estimated_tokens` and pre-reserve it by ID.
 
+        Computes required wait inside `self._lock` and sleeps outside `self._lock` for at most
+        `min(wait_needed, remaining_segment_time)`.
         Raises `PermanentQuotaError` if a single request's `estimated_tokens` exceeds `hourly_budget`.
+        When the required budget wait (`raw_wait_s`) exceeds the segment's remaining deadline (`rem_s`),
+        immediately raises `_SegmentDeadlineExceededError` to mark the segment incomplete without
+        sleeping until the deadline first.
         """
+        eff_dl = deadline if deadline is not None else _ACTIVE_SEGMENT_DEADLINE.get()
         slept = 0.0
         est = max(1, int(estimated_tokens))
         if est > self.hourly_budget:
             raise PermanentQuotaError(
                 f"Estimated request tokens ({est}) exceed hourly_budget ({self.hourly_budget})"
             )
-        async with self._lock:
-            while True:
-                slept += await self.wait_for_rate_limit_pause()
+        while True:
+            slept += await self.wait_for_rate_limit_pause(deadline=eff_dl)
+            async with self._lock:
                 now = self._now()
+                if eff_dl is not None and now >= eff_dl:
+                    raise _SegmentDeadlineExceededError()
+                if self._rate_limit_pause_until > now + 1e-6:
+                    continue
                 self._prune(now)
                 used_settled = sum(tok for _, tok in self._history)
                 used_reserved = sum(tok for _, _, tok in self._reservations)
@@ -421,7 +501,29 @@ class HourlyTokenBudgetLimiter:
                     target_ts = ts
                     if freed >= needed_to_free:
                         break
-                wait_s = max(0.05, (target_ts + self.window_seconds) - now)
+                raw_wait_s = max(0.05, (target_ts + self.window_seconds) - now)
+                wait_on_reservation = bool(
+                    self._reservations and used_settled + est <= self.hourly_budget
+                )
+                if eff_dl is not None:
+                    rem_s = eff_dl - now
+                    # Fail fast when the required budget recovery wait exceeds the segment's remaining
+                    # deadline: mark the segment incomplete immediately rather than sleeping to `eff_dl`.
+                    if rem_s <= 0 or (not wait_on_reservation and raw_wait_s > rem_s):
+                        logger.warning(
+                            "Hourly token budget wait (%.1fs) exceeds remaining segment deadline (%.1fs); aborting segment",
+                            raw_wait_s,
+                            max(0.0, rem_s),
+                        )
+                        _flush_log_handlers()
+                        raise _SegmentDeadlineExceededError()
+                    wait_s = min(raw_wait_s, rem_s)
+                    clamped_to_dl = raw_wait_s >= rem_s - 1e-9
+                else:
+                    wait_s = raw_wait_s
+                    clamped_to_dl = False
+                if wait_on_reservation:
+                    self._reservation_event.clear()
                 logger.info(
                     "Hourly token budget reached (used=%d, reserved=%d, est=%d, budget=%d); sleeping %.1fs",
                     used_settled,
@@ -430,42 +532,45 @@ class HourlyTokenBudgetLimiter:
                     self.hourly_budget,
                     wait_s,
                 )
+                _flush_log_handlers()
                 t1 = self._clock()
-                if self._reservations and used_settled + est <= self.hourly_budget:
-                    self._reservation_event.clear()
-                    sleep_task = asyncio.create_task(self._sleep(wait_s))
-                    event_task = asyncio.create_task(self._reservation_event.wait())
-                    try:
-                        done, pending = await asyncio.wait(
-                            {sleep_task, event_task},
-                            return_when=asyncio.FIRST_COMPLETED,
-                        )
-                        for p in pending:
-                            p.cancel()
-                        if pending:
-                            await asyncio.gather(*pending, return_exceptions=True)
-                    finally:
-                        for t in (sleep_task, event_task):
-                            if not t.done():
-                                t.cancel()
-                    t2 = self._clock()
-                    actual_elapsed = max(0.0, t2 - t1)
-                    if sleep_task in done:
-                        if not self._uses_custom_clock and actual_elapsed < wait_s * 0.5:
-                            self._virtual_time_offset += wait_s - actual_elapsed
-                        slept += wait_s
-                        self.total_slept_seconds += wait_s
-                    else:
-                        slept += actual_elapsed
-                        self.total_slept_seconds += actual_elapsed
-                else:
-                    await self._sleep(wait_s)
-                    t2 = self._clock()
-                    actual_elapsed = max(0.0, t2 - t1)
+
+            if wait_on_reservation:
+                sleep_task = asyncio.create_task(self._sleep(wait_s))
+                event_task = asyncio.create_task(self._reservation_event.wait())
+                try:
+                    done, pending = await asyncio.wait(
+                        {sleep_task, event_task},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    for p in pending:
+                        p.cancel()
+                    if pending:
+                        await asyncio.gather(*pending, return_exceptions=True)
+                finally:
+                    for t in (sleep_task, event_task):
+                        if not t.done():
+                            t.cancel()
+                sleep_completed = sleep_task in done
+            else:
+                await self._sleep(wait_s)
+                sleep_completed = True
+
+            async with self._lock:
+                t2 = self._clock()
+                actual_elapsed = max(0.0, t2 - t1)
+                if sleep_completed:
                     if not self._uses_custom_clock and actual_elapsed < wait_s * 0.5:
                         self._virtual_time_offset += wait_s - actual_elapsed
                     slept += wait_s
                     self.total_slept_seconds += wait_s
+                else:
+                    slept += actual_elapsed
+                    self.total_slept_seconds += actual_elapsed
+                if eff_dl is not None and (
+                    self._now() >= eff_dl or (clamped_to_dl and sleep_completed)
+                ):
+                    raise _SegmentDeadlineExceededError()
 
     def release_reservation(self, reservation: BudgetReservation | int | None = None) -> int:
         """Release a pre-reserved token estimate by reservation ID without recording actual usage."""
@@ -579,10 +684,12 @@ def _did_journal_short_circuit_without_send(outcome: SegmentExtractionOutcome) -
         return True
     if outcome.total_tokens > 0 or outcome.input_tokens > 0 or outcome.output_tokens > 0:
         return False
+    ek = str(outcome.error_kind or "").strip().lower()
+    if ek in ("deadline", "deadline_exceeded"):
+        return False
     if is_in_flight_error(outcome):
         return True
     status = str(outcome.status or "").lower()
-    ek = str(outcome.error_kind or "").lower()
     err = str(outcome.error or "")
     if status in ("in_flight", "conflict", "budget_exhausted") or ek in (
         "in_flight",
@@ -598,6 +705,8 @@ def _did_journal_short_circuit_without_send(outcome: SegmentExtractionOutcome) -
         or "上次调用在返回前中断" in err
         or "Journal state is " in err
         or "collided with mismatched request_hash" in err
+        or "before the request was sent" in err
+        or "未发起实际请求" in err
     ):
         return True
     return False
@@ -620,11 +729,45 @@ def _extraction_error_reason(outcome: SegmentExtractionOutcome) -> str:
     return f"extraction_error:{exc_type}"
 
 
+class _SegmentDeadlineExceededError(Exception):
+    """Internal sentinel raised when a segment extraction exceeds `segment_deadline_s`."""
+
+    def __init__(
+        self,
+        *,
+        short_circuit: bool = False,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        total_tokens: int = 0,
+    ) -> None:
+        super().__init__("segment_deadline_exceeded")
+        self.short_circuit = bool(short_circuit)
+        self.input_tokens = int(input_tokens)
+        self.output_tokens = int(output_tokens)
+        self.total_tokens = int(total_tokens)
+
+
+def _format_segment_id(segment: list[dict[str, Any]]) -> str:
+    """Format a compact human-readable segment identifier (`<session_id>:<first_event_id>[..<last_event_id>]`)."""
+    if not segment:
+        return "empty_segment"
+    first_ev = segment[0] if isinstance(segment[0], dict) else {}
+    last_ev = segment[-1] if isinstance(segment[-1], dict) else {}
+    first_id = str(first_ev.get("event_id") or f"seq:{first_ev.get('seq', 0)}")
+    last_id = str(last_ev.get("event_id") or f"seq:{last_ev.get('seq', 0)}")
+    sid = str(first_ev.get("session_id") or "")
+    base = first_id if first_id == last_id else f"{first_id}..{last_id}"
+    return f"{sid}:{base}" if sid else base
+
+
 async def extract_segment_with_infinite_backoff(
     segment: list[dict[str, Any]],
     *,
     extractor_model: str,
     prompt_version: str,
+    extractor_fallback_model: str | None = None,
+    segment_deadline_s: float | None = None,
+    seg_deadline: float | None = None,
     user_id: str = LOCAL_DEV_USER_ID,
     llm_service: Any = None,
     initial_backoff_s: float = 30.0,
@@ -638,12 +781,15 @@ async def extract_segment_with_infinite_backoff(
     extract_fn: Callable[..., Coroutine[Any, Any, SegmentExtractionOutcome]] = extract_segment_cards,
     sleep_fn: Callable[[float], Coroutine[Any, Any, None]] = asyncio.sleep,
 ) -> tuple[SegmentExtractionOutcome, int]:
-    """Extract cards from `segment`, backing off indefinitely on 429 and retrying transient network/5xx errors up to 5 times (2->4->8->16->32s).
+    """Extract cards from `segment`, backing off indefinitely on 429, retrying once with `extractor_fallback_model`
+    when a platform-key model fails with timeout/indeterminate/transient error, and retrying transient network/5xx
+    errors up to 5 times (2->4->8->16->32s) when the primary model is OAuth.
 
-    Re-checks the hourly token budget before every 429 or transient retry and stops immediately on permanent quota errors.
-    Only passes `resend_indeterminate=True` when `billing_type == "oauth"`.
-    Accumulates per-segment token usage (`input_tokens`, `output_tokens`, `total_tokens`) across all non-replayed attempts,
-    kept separate from per-attempt limiter reservation settlement.
+    Enforces a single absolute deadline (`min(seg_deadline, deadline)`) across primary calls, fallback calls,
+    budget waits, 429/transient backoff sleeps, and deferred retries.
+    Only passes `resend_indeterminate=True` when the active model's `billing_type == "oauth"`.
+    Settles each non-short-circuit attempt independently once, recording the exact same token count into both
+    `limiter` and the segment/run token totals (`actual` if returned, otherwise `estimated_tokens`).
     Returns `(outcome, retries)`.
     """
     rl_attempt = 0
@@ -656,9 +802,30 @@ async def extract_segment_with_infinite_backoff(
     cap_s = max(init_s, float(max_backoff_s))
     billing_type, _ = resolve_model_billing_and_provider(extractor_model)
     eff_resend_indeterminate = billing_type == "oauth"
+    reextract_delegated_fallback = extractor_fallback_model is None and dry_run
+    cfg_conv = get_dalton_settings().conversations
+    if extractor_fallback_model is None:
+        eff_fallback_model = (
+            ""
+            if reextract_delegated_fallback
+            else str(
+                getattr(
+                    cfg_conv,
+                    "extractor_fallback_model",
+                    DEFAULT_FALLBACK_MODEL,
+                )
+                or ""
+            ).strip()
+        )
+    else:
+        eff_fallback_model = str(extractor_fallback_model).strip()
     sig = inspect.signature(extract_fn)
     supports_persist_raw = "persist_raw" in sig.parameters
     supports_skip_journal = "skip_journal" in sig.parameters
+    supports_deadline = "deadline" in sig.parameters
+    orig_reservation: BudgetReservation | None = (
+        reservation if isinstance(reservation, BudgetReservation) else None
+    )
     current_reservation: BudgetReservation | Any = (
         reservation
         if isinstance(reservation, BudgetReservation)
@@ -666,17 +833,61 @@ async def extract_segment_with_infinite_backoff(
     )
 
     def _now_mono() -> float:
-        return clock_fn() if clock_fn is not None else time.monotonic()
+        if clock_fn is not None:
+            return clock_fn()
+        if type(limiter) is HourlyTokenBudgetLimiter:
+            return limiter._now()
+        return time.monotonic()
 
-    def _settle_attempt_reservation(short_circuit: bool, attempt_tok: int) -> None:
+    if segment_deadline_s is not None and float(segment_deadline_s) > 0:
+        eff_seg_deadline_s = float(segment_deadline_s)
+    else:
+        eff_seg_deadline_s = float(
+            getattr(cfg_conv, "segment_deadline_s", DEFAULT_SEGMENT_DEADLINE_S)
+            or DEFAULT_SEGMENT_DEADLINE_S
+        )
+    if seg_deadline is None:
+        seg_deadline = _now_mono() + eff_seg_deadline_s
+    eff_deadline: float = (
+        min(seg_deadline, deadline) if deadline is not None else seg_deadline
+    )
+
+    def _release_current_reservation() -> None:
+        nonlocal current_reservation
         if limiter is not None and current_reservation is not None:
-            if short_circuit:
-                limiter.release_reservation(current_reservation)
+            limiter.release_reservation(current_reservation)
+        current_reservation = None
+
+    def _settle_attempt(
+        short_circuit: bool,
+        in_tok: int = 0,
+        out_tok: int = 0,
+        tot_tok: int = 0,
+    ) -> None:
+        nonlocal acc_input_tokens, acc_output_tokens, acc_total_tokens, current_reservation
+        if short_circuit:
+            _release_current_reservation()
+            return
+        eff_in = max(0, int(in_tok))
+        eff_out = max(0, int(out_tok))
+        actual_tot = max(0, int(tot_tok or (eff_in + eff_out)))
+        settled = actual_tot if actual_tot > 0 else max(0, int(estimated_tokens))
+        if actual_tot <= 0:
+            eff_in = 0
+            eff_out = 0
+        acc_input_tokens += eff_in
+        acc_output_tokens += eff_out
+        acc_total_tokens += settled
+        if orig_reservation is not None:
+            orig_reservation.settled_input_tokens = acc_input_tokens
+            orig_reservation.settled_output_tokens = acc_output_tokens
+            orig_reservation.settled_total_tokens = acc_total_tokens
+        if limiter is not None:
+            if current_reservation is not None:
+                limiter.record_tokens(settled, reservation=current_reservation)
             else:
-                limiter.record_tokens(
-                    attempt_tok or estimated_tokens,
-                    reservation=current_reservation,
-                )
+                limiter.record_tokens(settled)
+        current_reservation = None
 
     def _with_accumulated_usage(out: SegmentExtractionOutcome) -> SegmentExtractionOutcome:
         out.input_tokens = acc_input_tokens
@@ -684,70 +895,152 @@ async def extract_segment_with_infinite_backoff(
         out.total_tokens = acc_total_tokens
         return out
 
-    while True:
-        if limiter is not None:
-            if needs_budget_recheck:
-                new_res = await limiter.wait_for_budget(estimated_tokens)
-                needs_budget_recheck = False
-                if current_reservation is not None:
-                    current_reservation.rebind(new_res)
-                else:
-                    current_reservation = (
-                        new_res
-                        if isinstance(new_res, BudgetReservation)
-                        else BudgetReservation(
-                            int(new_res) if type(new_res) is int else 0,
-                            estimated_tokens,
-                        )
-                    )
-            else:
-                await limiter.wait_for_rate_limit_pause()
-
-        if deadline is not None and _now_mono() >= deadline:
-            if limiter is not None and current_reservation is not None:
-                limiter.release_reservation(current_reservation)
-            return (
-                _with_accumulated_usage(
-                    SegmentExtractionOutcome(
-                        model_used=extractor_model,
-                        ok=False,
-                        status="in_flight",
-                        error_kind="in_flight_timeout",
-                        in_flight=True,
-                        error="in_flight_timeout",
-                    )
-                ),
-                rl_attempt + transient_attempt,
+    def _segment_deadline_outcome(model_name: str) -> SegmentExtractionOutcome:
+        return _with_accumulated_usage(
+            SegmentExtractionOutcome(
+                model_used=model_name,
+                ok=False,
+                status="failed",
+                error_kind="segment_deadline_exceeded",
+                in_flight=False,
+                error=f"segment_deadline_exceeded ({eff_seg_deadline_s or 0.0:.1f}s)",
             )
+        )
 
+    async def _wait_task_or_timeout(
+        task: asyncio.Task[Any],
+        timeout_s: float,
+    ) -> bool:
+        """Wait for `task` to finish or `timeout_s` to elapse via `sleep_fn`. Returns True if `task` finished."""
+        if task.done():
+            return True
+        eff_timeout = max(0.0, float(timeout_s))
+        if sleep_fn is asyncio.sleep:
+            done, _ = await asyncio.wait({task}, timeout=eff_timeout)
+            return bool(done)
+
+        async def _timeout_sleeper() -> None:
+            for _ in range(5):
+                if task.done():
+                    return
+                await asyncio.sleep(0)
+            await sleep_fn(eff_timeout)
+
+        timer_task = asyncio.create_task(_timeout_sleeper())
+        try:
+            done, _ = await asyncio.wait(
+                {task, timer_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if task in done:
+                return True
+            for _ in range(5):
+                if task.done():
+                    return True
+                await asyncio.sleep(0)
+            return task.done()
+        finally:
+            if not timer_task.done():
+                timer_task.cancel()
+                timer_task.add_done_callback(
+                    lambda t: None if t.cancelled() else t.exception()
+                )
+
+    async def _invoke_extract_and_classify(
+        active_model: str,
+        resend_flag: bool,
+    ) -> SegmentExtractionOutcome:
         extra_kwargs: dict[str, Any] = {}
         if supports_persist_raw:
             # Strip card `quote` and raw event text before writing `dalton_llm_journal` (`replayable=False`)
             extra_kwargs["persist_raw"] = False
         if supports_skip_journal:
             extra_kwargs["skip_journal"] = dry_run
-
-        try:
-            outcome = await extract_fn(
-                segment,
-                extractor_model=extractor_model,
-                prompt_version=prompt_version,
-                user_id=user_id,
-                llm_service=llm_service,
-                resend_indeterminate=eff_resend_indeterminate,
-                **extra_kwargs,
+        if supports_deadline:
+            extra_kwargs["deadline"] = (
+                eff_deadline
+                if clock_fn is None
+                else (time.monotonic() + max(0.0, eff_deadline - _now_mono()))
             )
+
+        rem_s = eff_deadline - _now_mono()
+        if rem_s <= 0:
+            raise _SegmentDeadlineExceededError(short_circuit=False)
+
+        extract_coro = extract_fn(
+            segment,
+            extractor_model=active_model,
+            prompt_version=prompt_version,
+            user_id=user_id,
+            llm_service=llm_service,
+            resend_indeterminate=resend_flag,
+            **extra_kwargs,
+        )
+        extract_task: asyncio.Task[SegmentExtractionOutcome] = asyncio.create_task(
+            extract_coro
+        )
+        try:
+            finished = await _wait_task_or_timeout(extract_task, rem_s)
+            if not finished:
+                extract_task.cancel()
+                exited = await _wait_task_or_timeout(
+                    extract_task, CANCEL_GRACE_TIMEOUT_S
+                )
+                if not exited:
+                    seg_log_id = _format_segment_id(segment)
+                    logger.warning(
+                        "Segment %s extraction task (model=%s) did not exit within %.1fs after cancellation; abandoning task",
+                        seg_log_id,
+                        active_model,
+                        CANCEL_GRACE_TIMEOUT_S,
+                    )
+                    _flush_log_handlers()
+                    _register_abandoned_task(extract_task, seg_log_id)
+                    raise _SegmentDeadlineExceededError()
+
+                if extract_task.cancelled():
+                    raise _SegmentDeadlineExceededError()
+                exc_after_cancel = extract_task.exception()
+                if exc_after_cancel is not None:
+                    raise _SegmentDeadlineExceededError() from exc_after_cancel
+                out = extract_task.result()
+            else:
+                out = await extract_task
+        except _SegmentDeadlineExceededError:
+            raise
+        except asyncio.CancelledError:
+            in_tok = 0
+            out_tok = 0
+            tot_tok = 0
+            short_circuit = False
+            if not extract_task.done():
+                # Registered so the exit path sees it: if it is still cleaning
+                # up (or swallowed the cancel) when the run ends, the process
+                # exits through the abandoned-task path instead of closing the
+                # loop under it.
+                extract_task.cancel()
+                _register_abandoned_task(extract_task, _format_segment_id(segment))
+            elif not extract_task.cancelled() and extract_task.exception() is None:
+                done_out = extract_task.result()
+                short_circuit = _did_journal_short_circuit_without_send(done_out)
+                if not short_circuit:
+                    in_tok = int(done_out.input_tokens or 0)
+                    out_tok = int(done_out.output_tokens or 0)
+                    tot_tok = int(done_out.total_tokens or (in_tok + out_tok))
+            _settle_attempt(short_circuit, in_tok, out_tok, tot_tok)
+            raise
         except Exception as exc:
+            if _now_mono() >= eff_deadline:
+                raise _SegmentDeadlineExceededError() from exc
             if isinstance(exc, PermanentQuotaError) or is_permanent_quota_error(exc):
-                if limiter is not None and current_reservation is not None:
-                    limiter.release_reservation(current_reservation)
+                _release_current_reservation()
                 raise PermanentQuotaError(
                     type(exc).__name__,
                     status_code=getattr(exc, "status_code", None),
                 ) from exc
             if is_in_flight_error(exc):
-                outcome = SegmentExtractionOutcome(
-                    model_used=extractor_model,
+                out = SegmentExtractionOutcome(
+                    model_used=active_model,
                     ok=False,
                     status="in_flight",
                     error_kind="in_flight",
@@ -755,8 +1048,8 @@ async def extract_segment_with_infinite_backoff(
                     error=f"{type(exc).__name__}: {exc}",
                 )
             elif is_rate_limit_or_quota_error(exc):
-                outcome = SegmentExtractionOutcome(
-                    model_used=extractor_model,
+                out = SegmentExtractionOutcome(
+                    model_used=active_model,
                     ok=False,
                     rate_limited=True,
                     error=type(exc).__name__,
@@ -770,8 +1063,8 @@ async def extract_segment_with_infinite_backoff(
                     if isinstance(status_code, int) and status_code in (502, 503, 504)
                     else ("timeout" if "timeout" in type(exc).__name__.lower() else "stream_cut")
                 )
-                outcome = SegmentExtractionOutcome(
-                    model_used=extractor_model,
+                out = SegmentExtractionOutcome(
+                    model_used=active_model,
                     ok=False,
                     status="indeterminate",
                     error_kind=err_kind,
@@ -779,48 +1072,51 @@ async def extract_segment_with_infinite_backoff(
                     error=f"{type(exc).__name__}: {exc}",
                 )
             else:
-                outcome = SegmentExtractionOutcome(
-                    model_used=extractor_model,
+                out = SegmentExtractionOutcome(
+                    model_used=active_model,
                     ok=False,
                     status="error",
                     error_kind=type(exc).__name__,
                     error=f"{type(exc).__name__}: {exc}",
                 )
 
-        if outcome.permanent_quota_error:
-            if limiter is not None and current_reservation is not None:
-                limiter.release_reservation(current_reservation)
-            raise PermanentQuotaError(outcome.error or "permanent_quota_error")
+        out_ek = str(out.error_kind or "").strip().lower()
+        if _now_mono() >= eff_deadline or out_ek in ("deadline", "deadline_exceeded"):
+            short_circuit = _did_journal_short_circuit_without_send(out)
+            in_tok = 0 if short_circuit else int(out.input_tokens or 0)
+            out_tok = 0 if short_circuit else int(out.output_tokens or 0)
+            tot_tok = (
+                0
+                if short_circuit
+                else int(out.total_tokens or (in_tok + out_tok))
+            )
+            raise _SegmentDeadlineExceededError(
+                short_circuit=short_circuit,
+                input_tokens=in_tok,
+                output_tokens=out_tok,
+                total_tokens=tot_tok,
+            )
+        return out
 
-        attempt_short_circuit = _did_journal_short_circuit_without_send(outcome)
-        attempt_in_tok = 0 if attempt_short_circuit else int(outcome.input_tokens or 0)
-        attempt_out_tok = 0 if attempt_short_circuit else int(outcome.output_tokens or 0)
-        attempt_tot_tok = (
-            0
-            if attempt_short_circuit
-            else int(outcome.total_tokens or (attempt_in_tok + attempt_out_tok))
-        )
-        acc_input_tokens += attempt_in_tok
-        acc_output_tokens += attempt_out_tok
-        acc_total_tokens += attempt_tot_tok
+    async def _sleep_bounded_by_seg_deadline(delay_s: float) -> None:
+        rem_s = eff_deadline - _now_mono()
+        if rem_s <= 0:
+            raise _SegmentDeadlineExceededError()
+        sleep_s = min(float(delay_s), rem_s)
+        clamped = float(delay_s) >= rem_s - 1e-9
+        await sleep_fn(sleep_s)
+        if clamped or _now_mono() >= eff_deadline:
+            raise _SegmentDeadlineExceededError()
 
-        if outcome.ok:
-            _settle_attempt_reservation(attempt_short_circuit, attempt_tot_tok)
-            return _with_accumulated_usage(outcome), rl_attempt + transient_attempt
-
-        if is_in_flight_error(outcome):
-            outcome.in_flight = True
-            outcome.status = outcome.status or "in_flight"
-            outcome.error_kind = outcome.error_kind or "in_flight"
-            _settle_attempt_reservation(attempt_short_circuit, attempt_tot_tok)
-            return _with_accumulated_usage(outcome), rl_attempt + transient_attempt
-
-        if outcome.rate_limited or is_rate_limit_or_quota_error(outcome):
-            if limiter is not None:
-                _settle_attempt_reservation(attempt_short_circuit, attempt_tot_tok)
-                needs_budget_recheck = True
+    dl_token = _ACTIVE_SEGMENT_DEADLINE.set(eff_deadline)
+    try:
+        while True:
+            if _now_mono() >= seg_deadline:
+                _release_current_reservation()
+                return _segment_deadline_outcome(extractor_model), rl_attempt + transient_attempt
 
             if deadline is not None and _now_mono() >= deadline:
+                _release_current_reservation()
                 return (
                     _with_accumulated_usage(
                         SegmentExtractionOutcome(
@@ -835,37 +1131,90 @@ async def extract_segment_with_infinite_backoff(
                     rl_attempt + transient_attempt,
                 )
 
-            delay = min(cap_s, init_s * (2 ** min(rl_attempt, 8)))
-            rl_attempt += 1
-            pause_until: float | None = None
             if limiter is not None:
-                pause_until = limiter.notify_rate_limit_backoff(delay)
-            logger.warning(
-                "Rate limit / quota exhaustion on segment (attempt=%d); backing off for %.1fs before retry",
-                rl_attempt,
-                delay,
-            )
-            uses_custom_clock = (
-                getattr(limiter, "_uses_custom_clock", True) if limiter is not None else True
-            )
-            t_sleep0 = limiter._clock() if (limiter is not None and not uses_custom_clock) else 0.0
-            try:
-                await sleep_fn(delay)
-                if limiter is not None and not uses_custom_clock:
-                    elapsed_sleep = max(0.0, limiter._clock() - t_sleep0)
-                    if elapsed_sleep < delay * 0.5:
-                        limiter._virtual_time_offset += delay - elapsed_sleep
-            finally:
-                if limiter is not None:
-                    limiter.clear_rate_limit_backoff(pause_until)
-            continue
+                try:
+                    if needs_budget_recheck:
+                        new_res = await limiter.wait_for_budget(estimated_tokens)
+                        needs_budget_recheck = False
+                        if current_reservation is not None:
+                            current_reservation.rebind(new_res)
+                        else:
+                            current_reservation = (
+                                new_res
+                                if isinstance(new_res, BudgetReservation)
+                                else BudgetReservation(
+                                    int(new_res) if type(new_res) is int else 0,
+                                    estimated_tokens,
+                                )
+                            )
+                    else:
+                        await limiter.wait_for_rate_limit_pause()
+                except _SegmentDeadlineExceededError:
+                    _release_current_reservation()
+                    return _segment_deadline_outcome(extractor_model), rl_attempt + transient_attempt
 
-        if is_transient_network_error(outcome):
-            outcome.transient_error = True
-            if transient_attempt < len(TRANSIENT_BACKOFF_DELAYS_S):
+            if _now_mono() >= seg_deadline:
+                _release_current_reservation()
+                return _segment_deadline_outcome(extractor_model), rl_attempt + transient_attempt
+
+            if deadline is not None and _now_mono() >= deadline:
+                _release_current_reservation()
+                return (
+                    _with_accumulated_usage(
+                        SegmentExtractionOutcome(
+                            model_used=extractor_model,
+                            ok=False,
+                            status="in_flight",
+                            error_kind="in_flight_timeout",
+                            in_flight=True,
+                            error="in_flight_timeout",
+                        )
+                    ),
+                    rl_attempt + transient_attempt,
+                )
+
+            try:
+                outcome = await _invoke_extract_and_classify(
+                    extractor_model,
+                    eff_resend_indeterminate,
+                )
+            except _SegmentDeadlineExceededError as dl_exc:
+                _settle_attempt(
+                    dl_exc.short_circuit,
+                    dl_exc.input_tokens,
+                    dl_exc.output_tokens,
+                    dl_exc.total_tokens,
+                )
+                return _segment_deadline_outcome(extractor_model), rl_attempt + transient_attempt
+
+            if outcome.permanent_quota_error:
+                _release_current_reservation()
+                raise PermanentQuotaError(outcome.error or "permanent_quota_error")
+
+            attempt_short_circuit = _did_journal_short_circuit_without_send(outcome)
+            _settle_attempt(
+                attempt_short_circuit,
+                int(outcome.input_tokens or 0),
+                int(outcome.output_tokens or 0),
+                int(outcome.total_tokens or 0),
+            )
+
+            if outcome.ok:
+                return _with_accumulated_usage(outcome), rl_attempt + transient_attempt
+
+            if is_in_flight_error(outcome):
+                outcome.in_flight = True
+                outcome.status = outcome.status or "in_flight"
+                outcome.error_kind = outcome.error_kind or "in_flight"
+                return _with_accumulated_usage(outcome), rl_attempt + transient_attempt
+
+            if outcome.rate_limited or is_rate_limit_or_quota_error(outcome):
                 if limiter is not None:
-                    _settle_attempt_reservation(attempt_short_circuit, attempt_tot_tok)
                     needs_budget_recheck = True
+
+                if _now_mono() >= seg_deadline:
+                    return _segment_deadline_outcome(extractor_model), rl_attempt + transient_attempt
+
                 if deadline is not None and _now_mono() >= deadline:
                     return (
                         _with_accumulated_usage(
@@ -880,22 +1229,183 @@ async def extract_segment_with_infinite_backoff(
                         ),
                         rl_attempt + transient_attempt,
                     )
-                delay = TRANSIENT_BACKOFF_DELAYS_S[transient_attempt]
-                transient_attempt += 1
-                logger.warning(
-                    "Transient network/upstream error on segment (retry=%d/%d, backoff=%.1fs): %s",
-                    transient_attempt,
-                    len(TRANSIENT_BACKOFF_DELAYS_S),
-                    delay,
-                    outcome.error,
-                )
-                await sleep_fn(delay)
-                continue
-            _settle_attempt_reservation(attempt_short_circuit, attempt_tot_tok)
-            return _with_accumulated_usage(outcome), rl_attempt + transient_attempt
 
-        _settle_attempt_reservation(attempt_short_circuit, attempt_tot_tok)
-        return _with_accumulated_usage(outcome), rl_attempt + transient_attempt
+                delay = min(cap_s, init_s * (2 ** min(rl_attempt, 8)))
+                rl_attempt += 1
+                rem_for_rl = max(0.0, eff_deadline - _now_mono())
+                eff_rl_delay = min(delay, rem_for_rl)
+                pause_until: float | None = None
+                if limiter is not None and eff_rl_delay > 0:
+                    pause_until = limiter.notify_rate_limit_backoff(eff_rl_delay)
+                logger.warning(
+                    "Rate limit / quota exhaustion on segment (attempt=%d); backing off for %.1fs before retry",
+                    rl_attempt,
+                    eff_rl_delay,
+                )
+                _flush_log_handlers()
+                uses_custom_clock = (
+                    getattr(limiter, "_uses_custom_clock", True) if limiter is not None else True
+                )
+                t_sleep0 = limiter._clock() if (limiter is not None and not uses_custom_clock) else 0.0
+                try:
+                    await _sleep_bounded_by_seg_deadline(delay)
+                    if limiter is not None and not uses_custom_clock:
+                        elapsed_sleep = max(0.0, limiter._clock() - t_sleep0)
+                        if elapsed_sleep < eff_rl_delay * 0.5:
+                            limiter._virtual_time_offset += eff_rl_delay - elapsed_sleep
+                except _SegmentDeadlineExceededError:
+                    return _segment_deadline_outcome(extractor_model), rl_attempt + transient_attempt
+                finally:
+                    if limiter is not None:
+                        limiter.clear_rate_limit_backoff(pause_until)
+                continue
+
+            if (
+                billing_type != "oauth"
+                and not reextract_delegated_fallback
+                and is_fallback_eligible(outcome)
+            ):
+                if not eff_fallback_model or eff_fallback_model == extractor_model:
+                    return _with_accumulated_usage(outcome), rl_attempt + transient_attempt
+                if _now_mono() >= seg_deadline:
+                    return _segment_deadline_outcome(extractor_model), rl_attempt + transient_attempt
+                if deadline is not None and _now_mono() >= deadline:
+                    return (
+                        _with_accumulated_usage(
+                            SegmentExtractionOutcome(
+                                model_used=extractor_model,
+                                ok=False,
+                                status="in_flight",
+                                error_kind="in_flight_timeout",
+                                in_flight=True,
+                                error="in_flight_timeout",
+                            )
+                        ),
+                        rl_attempt + transient_attempt,
+                    )
+
+                if limiter is not None:
+                    try:
+                        new_res = await limiter.wait_for_budget(estimated_tokens)
+                    except _SegmentDeadlineExceededError:
+                        return _segment_deadline_outcome(eff_fallback_model), rl_attempt + transient_attempt
+                    current_reservation = (
+                        new_res
+                        if isinstance(new_res, BudgetReservation)
+                        else BudgetReservation(
+                            int(new_res) if type(new_res) is int else 0,
+                            estimated_tokens,
+                        )
+                    )
+                    if _now_mono() >= seg_deadline:
+                        _release_current_reservation()
+                        return _segment_deadline_outcome(eff_fallback_model), rl_attempt + transient_attempt
+                    if deadline is not None and _now_mono() >= deadline:
+                        _release_current_reservation()
+                        return (
+                            _with_accumulated_usage(
+                                SegmentExtractionOutcome(
+                                    model_used=eff_fallback_model,
+                                    ok=False,
+                                    status="in_flight",
+                                    error_kind="in_flight_timeout",
+                                    in_flight=True,
+                                    error="in_flight_timeout",
+                                )
+                            ),
+                            rl_attempt + transient_attempt,
+                        )
+
+                fb_billing_type, _ = resolve_model_billing_and_provider(eff_fallback_model)
+                fb_resend_indeterminate = fb_billing_type == "oauth"
+                logger.warning(
+                    "Primary model %s failed on segment (%s: %s); retrying once with fallback model %s",
+                    extractor_model,
+                    outcome.error_kind or outcome.status or "transient_error",
+                    outcome.error,
+                    eff_fallback_model,
+                )
+                _flush_log_handlers()
+                transient_attempt += 1
+                try:
+                    fb_outcome = await _invoke_extract_and_classify(
+                        eff_fallback_model,
+                        fb_resend_indeterminate,
+                    )
+                except _SegmentDeadlineExceededError as dl_exc:
+                    _settle_attempt(
+                        dl_exc.short_circuit,
+                        dl_exc.input_tokens,
+                        dl_exc.output_tokens,
+                        dl_exc.total_tokens,
+                    )
+                    return _segment_deadline_outcome(eff_fallback_model), rl_attempt + transient_attempt
+
+                if fb_outcome.permanent_quota_error:
+                    _release_current_reservation()
+                    raise PermanentQuotaError(fb_outcome.error or "permanent_quota_error")
+
+                fb_short_circuit = _did_journal_short_circuit_without_send(fb_outcome)
+                _settle_attempt(
+                    fb_short_circuit,
+                    int(fb_outcome.input_tokens or 0),
+                    int(fb_outcome.output_tokens or 0),
+                    int(fb_outcome.total_tokens or 0),
+                )
+
+                if fb_outcome.ok:
+                    fb_outcome.model_used = str(fb_outcome.model_used or eff_fallback_model)
+                    for card in fb_outcome.cards:
+                        if isinstance(card, dict):
+                            card["extractor_model"] = fb_outcome.model_used
+                elif is_in_flight_error(fb_outcome):
+                    fb_outcome.in_flight = True
+                    fb_outcome.status = fb_outcome.status or "in_flight"
+                    fb_outcome.error_kind = fb_outcome.error_kind or "in_flight"
+
+                return _with_accumulated_usage(fb_outcome), rl_attempt + transient_attempt
+
+            if is_transient_network_error(outcome):
+                outcome.transient_error = True
+                if transient_attempt < len(TRANSIENT_BACKOFF_DELAYS_S):
+                    if limiter is not None:
+                        needs_budget_recheck = True
+                    if _now_mono() >= seg_deadline:
+                        return _segment_deadline_outcome(extractor_model), rl_attempt + transient_attempt
+                    if deadline is not None and _now_mono() >= deadline:
+                        return (
+                            _with_accumulated_usage(
+                                SegmentExtractionOutcome(
+                                    model_used=extractor_model,
+                                    ok=False,
+                                    status="in_flight",
+                                    error_kind="in_flight_timeout",
+                                    in_flight=True,
+                                    error="in_flight_timeout",
+                                )
+                            ),
+                            rl_attempt + transient_attempt,
+                        )
+                    delay = TRANSIENT_BACKOFF_DELAYS_S[transient_attempt]
+                    transient_attempt += 1
+                    logger.warning(
+                        "Transient network/upstream error on segment (retry=%d/%d, backoff=%.1fs): %s",
+                        transient_attempt,
+                        len(TRANSIENT_BACKOFF_DELAYS_S),
+                        delay,
+                        outcome.error,
+                    )
+                    _flush_log_handlers()
+                    try:
+                        await _sleep_bounded_by_seg_deadline(delay)
+                    except _SegmentDeadlineExceededError:
+                        return _segment_deadline_outcome(extractor_model), rl_attempt + transient_attempt
+                    continue
+                return _with_accumulated_usage(outcome), rl_attempt + transient_attempt
+
+            return _with_accumulated_usage(outcome), rl_attempt + transient_attempt
+    finally:
+        _ACTIVE_SEGMENT_DEADLINE.reset(dl_token)
 
 
 def read_inbox_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -1003,6 +1513,8 @@ async def process_weekly_batch(
     limiter: HourlyTokenBudgetLimiter,
     extractor_model: str,
     prompt_version: str,
+    extractor_fallback_model: str | None = None,
+    segment_deadline_s: float | None = None,
     dry_run: bool = False,
     initial_backoff_s: float = 30.0,
     max_backoff_s: float = 900.0,
@@ -1025,6 +1537,16 @@ async def process_weekly_batch(
     eff_concurrency = max(
         1,
         int(concurrency or extract_concurrency or getattr(cfg, "extract_concurrency", 1) or 1),
+    )
+    eff_fallback_model = (
+        str(getattr(cfg, "extractor_fallback_model", DEFAULT_FALLBACK_MODEL) or "")
+        if extractor_fallback_model is None
+        else str(extractor_fallback_model)
+    ).strip()
+    eff_segment_deadline_s = float(
+        segment_deadline_s
+        if segment_deadline_s is not None
+        else getattr(cfg, "segment_deadline_s", DEFAULT_SEGMENT_DEADLINE_S)
     )
     run_id = f"{mode}_{window_start.isoformat()}_{window_end.isoformat()}_{uuid.uuid4().hex[:8]}"
     embedding_model_used = cfg.embedding_model_preferred
@@ -1051,6 +1573,17 @@ async def process_weekly_batch(
     batch_events.clear()
     batch_events = []
     total_segments = len(segments)
+    logger.info(
+        "Weekly batch started: run_id=%s window=%s..%s events=%d segments=%d model=%s fallback=%s",
+        run_id,
+        window_start.isoformat(),
+        window_end.isoformat(),
+        total_events_read,
+        total_segments,
+        extractor_model,
+        eff_fallback_model or "none",
+    )
+    _flush_log_handlers()
     _maybe_start_tracemalloc()
     segments_trace_counter = 0
 
@@ -1078,6 +1611,9 @@ async def process_weekly_batch(
     input_tokens = 0
     output_tokens = 0
     total_tokens = 0
+    aborted_in_tokens = 0
+    aborted_out_tokens = 0
+    aborted_tot_tokens = 0
     rate_limit_retries = 0
     cards_inserted = 0
     deduped_count = 0
@@ -1086,11 +1622,22 @@ async def process_weekly_batch(
     completed_by_idx: dict[int, tuple[list[dict[str, Any]], SegmentExtractionOutcome, int]] = {}
     deferred_by_idx: dict[int, tuple[list[dict[str, Any]], SegmentExtractionOutcome, int]] = {}
     incomplete_by_idx: dict[int, dict[str, Any]] = {}
+    # Set once the incomplete segments' usage is in the run totals, so a later
+    # failure (rendering, run finish) does not add it again.
+    incomplete_usage_rolled = False
+    seg_deadline_by_idx: dict[int, float] = {}
     next_to_flush = 0
     flush_failed = False
     flush_lock = asyncio.Lock()
     sem = asyncio.Semaphore(eff_concurrency)
     abort_flag = False
+
+    def _seg_now() -> float:
+        if clock_fn is not None:
+            return clock_fn()
+        if type(limiter) is HourlyTokenBudgetLimiter:
+            return limiter._now()
+        return time.monotonic()
 
     def _make_incomplete_record(
         seg_idx: int,
@@ -1455,15 +2002,61 @@ async def process_weekly_batch(
     async def _run_segment_attempt(
         seg: list[dict[str, Any]],
         *,
+        seg_deadline: float | None = None,
         deadline: float | None = None,
-        clock_override: Callable[[], float] | None = None,
     ) -> tuple[SegmentExtractionOutcome, int, float]:
-        nonlocal segments_trace_counter
-        active_clock = clock_override or clock_fn
-        now_fn = active_clock if active_clock is not None else time.monotonic
+        nonlocal segments_trace_counter, aborted_in_tokens, aborted_out_tokens, aborted_tot_tokens
+
+        def now_fn() -> float:
+            if clock_fn is not None:
+                return clock_fn()
+            if type(limiter) is HourlyTokenBudgetLimiter:
+                return limiter._now()
+            return time.monotonic()
+
         est_tokens = estimate_segment_tokens(seg, hourly_budget=limiter.hourly_budget)
         t0 = now_fn()
-        reservation = await limiter.wait_for_budget(est_tokens)
+        eff_seg_dl = (
+            seg_deadline
+            if seg_deadline is not None
+            else (t0 + eff_segment_deadline_s)
+        )
+        eff_attempt_dl = (
+            min(eff_seg_dl, deadline) if deadline is not None else eff_seg_dl
+        )
+        dl_token = _ACTIVE_SEGMENT_DEADLINE.set(eff_attempt_dl)
+        try:
+            reservation = await limiter.wait_for_budget(est_tokens)
+        except _SegmentDeadlineExceededError:
+            return (
+                SegmentExtractionOutcome(
+                    model_used=extractor_model,
+                    ok=False,
+                    status="failed",
+                    error_kind="segment_deadline_exceeded",
+                    in_flight=False,
+                    error=f"segment_deadline_exceeded ({eff_segment_deadline_s:.1f}s)",
+                ),
+                0,
+                max(0.0, now_fn() - t0),
+            )
+        finally:
+            _ACTIVE_SEGMENT_DEADLINE.reset(dl_token)
+
+        if now_fn() >= eff_seg_dl:
+            limiter.release_reservation(reservation)
+            return (
+                SegmentExtractionOutcome(
+                    model_used=extractor_model,
+                    ok=False,
+                    status="failed",
+                    error_kind="segment_deadline_exceeded",
+                    in_flight=False,
+                    error=f"segment_deadline_exceeded ({eff_segment_deadline_s:.1f}s)",
+                ),
+                0,
+                max(0.0, now_fn() - t0),
+            )
         if deadline is not None and now_fn() >= deadline:
             limiter.release_reservation(reservation)
             return (
@@ -1483,6 +2076,9 @@ async def process_weekly_batch(
                 seg,
                 extractor_model=extractor_model,
                 prompt_version=prompt_version,
+                extractor_fallback_model=eff_fallback_model,
+                segment_deadline_s=eff_segment_deadline_s,
+                seg_deadline=eff_seg_dl,
                 user_id=archive_billing_user_id(),
                 llm_service=llm_service,
                 initial_backoff_s=initial_backoff_s,
@@ -1490,14 +2086,17 @@ async def process_weekly_batch(
                 limiter=limiter,
                 estimated_tokens=est_tokens,
                 reservation=reservation,
-                deadline=deadline,
-                clock_fn=active_clock,
+                deadline=eff_attempt_dl if deadline is not None else None,
+                clock_fn=clock_fn,
                 dry_run=dry_run,
                 extract_fn=extract_fn,
                 sleep_fn=sleep_fn,
             )
         except BaseException:
             limiter.release_reservation(reservation)
+            aborted_in_tokens += int(getattr(reservation, "settled_input_tokens", 0))
+            aborted_out_tokens += int(getattr(reservation, "settled_output_tokens", 0))
+            aborted_tot_tokens += int(getattr(reservation, "settled_total_tokens", 0))
             raise
         elapsed_s = max(0.0, now_fn() - t0)
         segments_trace_counter += 1
@@ -1507,31 +2106,45 @@ async def process_weekly_batch(
         return outcome, rl_retries, elapsed_s
 
     async def _extract_one_segment(seg_idx: int) -> None:
-        nonlocal abort_flag
+        nonlocal abort_flag, aborted_in_tokens, aborted_out_tokens, aborted_tot_tokens
 
         async with sem:
             if abort_flag:
                 return
             seg = segments[seg_idx] if 0 <= seg_idx < len(segments) else []
+            seg_deadline = _seg_now() + eff_segment_deadline_s
+            seg_deadline_by_idx[seg_idx] = seg_deadline
             try:
-                outcome, rl_retries, elapsed_s = await _run_segment_attempt(seg)
+                outcome, rl_retries, elapsed_s = await _run_segment_attempt(
+                    seg,
+                    seg_deadline=seg_deadline,
+                )
             except BaseException:
                 abort_flag = True
                 raise
 
             if outcome.permanent_quota_error:
                 abort_flag = True
+                aborted_in_tokens += int(outcome.input_tokens or 0)
+                aborted_out_tokens += int(outcome.output_tokens or 0)
+                aborted_tot_tokens += int(outcome.total_tokens or 0)
                 raise PermanentQuotaError(outcome.error or "permanent_quota_error")
             if is_in_flight_error(outcome):
-                deferred_by_idx[seg_idx] = (seg, outcome, rl_retries)
-                seg = []
-                logger.warning(
-                    "Segment %d/%d is in_flight in journal; queued for deferred retry after weekly batch",
-                    seg_idx + 1,
-                    total_segments,
-                )
-                _flush_log_handlers()
-                return
+                if _seg_now() >= seg_deadline:
+                    outcome.in_flight = False
+                    outcome.status = "failed"
+                    outcome.error_kind = "segment_deadline_exceeded"
+                    outcome.error = f"segment_deadline_exceeded ({eff_segment_deadline_s:.1f}s)"
+                else:
+                    deferred_by_idx[seg_idx] = (seg, outcome, rl_retries)
+                    seg = []
+                    logger.warning(
+                        "Segment %d/%d is in_flight in journal; queued for deferred retry after weekly batch",
+                        seg_idx + 1,
+                        total_segments,
+                    )
+                    _flush_log_handlers()
+                    return
             if not outcome.ok:
                 fail_reason = (
                     (outcome.error_kind or "transient_error")
@@ -1615,6 +2228,8 @@ async def process_weekly_batch(
                 def _defer_now() -> float:
                     if clock_fn is not None:
                         return clock_fn()
+                    if type(limiter) is HourlyTokenBudgetLimiter:
+                        return limiter._now()
                     return time.monotonic()
 
                 defer_start_mono = _defer_now()
@@ -1622,11 +2237,48 @@ async def process_weekly_batch(
                 defer_pass = 0
 
                 while deferred_by_idx and _defer_now() < deadline:
+                    for exp_idx in [
+                        idx
+                        for idx in list(deferred_by_idx)
+                        if _defer_now()
+                        >= seg_deadline_by_idx.get(
+                            idx, defer_start_mono + eff_segment_deadline_s
+                        )
+                    ]:
+                        exp_seg, exp_out, exp_retries = deferred_by_idx.pop(exp_idx)
+                        exp_out.in_flight = False
+                        exp_out.status = "failed"
+                        exp_out.error_kind = "segment_deadline_exceeded"
+                        exp_out.error = (
+                            f"segment_deadline_exceeded ({eff_segment_deadline_s:.1f}s)"
+                        )
+                        incomplete_by_idx[exp_idx] = _make_incomplete_record(
+                            exp_idx,
+                            exp_seg,
+                            exp_out,
+                            exp_retries,
+                            status="failed",
+                            reason=_extraction_error_reason(exp_out),
+                        )
+                        exp_seg.clear()
+                        if 0 <= exp_idx < len(segments):
+                            segments[exp_idx] = []
+                    if not deferred_by_idx:
+                        break
+
                     raw_interval = min(
                         max_interval_s, min_interval_s * (2 ** min(defer_pass, 1))
                     )
-                    remaining_s = deadline - _defer_now()
+                    earliest_seg_dl = min(
+                        seg_deadline_by_idx.get(
+                            idx, defer_start_mono + eff_segment_deadline_s
+                        )
+                        for idx in deferred_by_idx
+                    )
+                    remaining_s = min(deadline, earliest_seg_dl) - _defer_now()
                     if remaining_s <= 0.0:
+                        if _defer_now() >= earliest_seg_dl:
+                            continue
                         break
                     sleep_interval = min(raw_interval, remaining_s)
                     waited_s = max(0.0, _defer_now() - defer_start_mono)
@@ -1648,13 +2300,59 @@ async def process_weekly_batch(
                     ):
                         if _defer_now() >= deadline:
                             break
+                        seg_dl = seg_deadline_by_idx.get(
+                            seg_idx, defer_start_mono + eff_segment_deadline_s
+                        )
+                        if _defer_now() >= seg_dl:
+                            deferred_by_idx.pop(seg_idx, None)
+                            prev_outcome.in_flight = False
+                            prev_outcome.status = "failed"
+                            prev_outcome.error_kind = "segment_deadline_exceeded"
+                            prev_outcome.error = (
+                                f"segment_deadline_exceeded ({eff_segment_deadline_s:.1f}s)"
+                            )
+                            incomplete_by_idx[seg_idx] = _make_incomplete_record(
+                                seg_idx,
+                                seg,
+                                prev_outcome,
+                                prev_retries,
+                                status="failed",
+                                reason=_extraction_error_reason(prev_outcome),
+                            )
+                            seg.clear()
+                            if 0 <= seg_idx < len(segments):
+                                segments[seg_idx] = []
+                            seg = []
+                            continue
+                        eff_defer_dl = min(seg_dl, deadline)
                         async with sem:
                             if _defer_now() >= deadline:
                                 break
+                            if _defer_now() >= seg_dl:
+                                deferred_by_idx.pop(seg_idx, None)
+                                prev_outcome.in_flight = False
+                                prev_outcome.status = "failed"
+                                prev_outcome.error_kind = "segment_deadline_exceeded"
+                                prev_outcome.error = (
+                                    f"segment_deadline_exceeded ({eff_segment_deadline_s:.1f}s)"
+                                )
+                                incomplete_by_idx[seg_idx] = _make_incomplete_record(
+                                    seg_idx,
+                                    seg,
+                                    prev_outcome,
+                                    prev_retries,
+                                    status="failed",
+                                    reason=_extraction_error_reason(prev_outcome),
+                                )
+                                seg.clear()
+                                if 0 <= seg_idx < len(segments):
+                                    segments[seg_idx] = []
+                                seg = []
+                                continue
                             outcome, rl_retries, elapsed_s = await _run_segment_attempt(
                                 seg,
-                                deadline=deadline,
-                                clock_override=_defer_now,
+                                seg_deadline=seg_dl,
+                                deadline=eff_defer_dl,
                             )
 
                         outcome.input_tokens += prev_outcome.input_tokens
@@ -1663,6 +2361,9 @@ async def process_weekly_batch(
                         total_seg_retries = prev_retries + rl_retries
                         if outcome.permanent_quota_error:
                             abort_flag = True
+                            aborted_in_tokens += int(outcome.input_tokens or 0)
+                            aborted_out_tokens += int(outcome.output_tokens or 0)
+                            aborted_tot_tokens += int(outcome.total_tokens or 0)
                             raise PermanentQuotaError(
                                 outcome.error or "permanent_quota_error"
                             )
@@ -1685,11 +2386,18 @@ async def process_weekly_batch(
                             completed_by_idx[seg_idx] = (seg, outcome, total_seg_retries)
                             seg = []
                             await asyncio.shield(_flush_ready_prefix())
-                        elif is_in_flight_error(outcome):
+                        elif is_in_flight_error(outcome) and _defer_now() < seg_dl:
                             deferred_by_idx[seg_idx] = (seg, outcome, total_seg_retries)
                             seg = []
                         else:
                             deferred_by_idx.pop(seg_idx, None)
+                            if is_in_flight_error(outcome) and _defer_now() >= seg_dl:
+                                outcome.in_flight = False
+                                outcome.status = "failed"
+                                outcome.error_kind = "segment_deadline_exceeded"
+                                outcome.error = (
+                                    f"segment_deadline_exceeded ({eff_segment_deadline_s:.1f}s)"
+                                )
                             fail_reason = (
                                 (outcome.error_kind or "transient_error")
                                 if is_transient_network_error(outcome)
@@ -1713,13 +2421,26 @@ async def process_weekly_batch(
                     for seg_idx, (seg, last_outcome, total_seg_retries) in sorted(
                         deferred_by_idx.items()
                     ):
+                        seg_dl = seg_deadline_by_idx.get(
+                            seg_idx, defer_start_mono + eff_segment_deadline_s
+                        )
+                        if _defer_now() >= seg_dl and seg_dl <= deadline:
+                            last_outcome.in_flight = False
+                            last_outcome.status = "failed"
+                            last_outcome.error_kind = "segment_deadline_exceeded"
+                            last_outcome.error = (
+                                f"segment_deadline_exceeded ({eff_segment_deadline_s:.1f}s)"
+                            )
+                            rem_reason = _extraction_error_reason(last_outcome)
+                        else:
+                            rem_reason = "in_flight_timeout"
                         incomplete_by_idx[seg_idx] = _make_incomplete_record(
                             seg_idx,
                             seg,
                             last_outcome,
                             total_seg_retries,
                             status="failed",
-                            reason="in_flight_timeout",
+                            reason=rem_reason,
                         )
                         seg.clear()
                         if 0 <= seg_idx < len(segments):
@@ -1773,6 +2494,7 @@ async def process_weekly_batch(
             output_tokens += int(inc_rec.get("output_tokens", 0))
             total_tokens += int(inc_rec.get("total_tokens", 0))
             rate_limit_retries += int(inc_rec.get("retries", 0))
+        incomplete_usage_rolled = True
 
         tasks.clear()
         completed_by_idx.clear()
@@ -1953,6 +2675,26 @@ async def process_weekly_batch(
             tickers_backfilled += int(getattr(rem_outcome, "tickers_backfilled", 0))
             types_corrected += int(getattr(rem_outcome, "types_corrected", 0))
 
+        # Cancelled attempts were settled into the hourly budget whether or not
+        # the flush failed, so the failed run's summary carries them too.
+        input_tokens += aborted_in_tokens
+        output_tokens += aborted_out_tokens
+        total_tokens += aborted_tot_tokens
+        if not flush_failed:
+            for _seg, rem_outcome, _rl_retries in completed_by_idx.values():
+                input_tokens += int(getattr(rem_outcome, "input_tokens", 0))
+                output_tokens += int(getattr(rem_outcome, "output_tokens", 0))
+                total_tokens += int(getattr(rem_outcome, "total_tokens", 0))
+            for _seg, def_outcome, _def_retries in deferred_by_idx.values():
+                input_tokens += int(getattr(def_outcome, "input_tokens", 0))
+                output_tokens += int(getattr(def_outcome, "output_tokens", 0))
+                total_tokens += int(getattr(def_outcome, "total_tokens", 0))
+        if not incomplete_usage_rolled:
+            for inc_rec in incomplete_by_idx.values():
+                input_tokens += int(inc_rec.get("input_tokens", 0))
+                output_tokens += int(inc_rec.get("output_tokens", 0))
+                total_tokens += int(inc_rec.get("total_tokens", 0))
+
         if not dry_run:
             is_interrupt = isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt))
             run_status = "interrupted" if is_interrupt else "failed"
@@ -2011,6 +2753,8 @@ async def run_archive_pipeline(
     ocw_agents_root: Path = DEFAULT_OCW_AGENTS_ROOT,
     agents: list[str] | tuple[str, ...] = DEFAULT_AGENTS,
     extractor_model: str | None = None,
+    extractor_fallback_model: str | None = None,
+    segment_deadline_s: float | None = None,
     hourly_token_budget: int | None = None,
     extract_concurrency: int | None = None,
     concurrency: int | None = None,
@@ -2210,6 +2954,8 @@ async def run_archive_pipeline(
                     limiter=limiter,
                     extractor_model=eff_model,
                     prompt_version=cfg.prompt_version,
+                    extractor_fallback_model=extractor_fallback_model,
+                    segment_deadline_s=segment_deadline_s,
                     dry_run=dry_run,
                     initial_backoff_s=cfg.rate_limit_initial_backoff_seconds,
                     max_backoff_s=cfg.rate_limit_max_backoff_seconds,
@@ -2387,7 +3133,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
-async def _async_main(args: argparse.Namespace) -> dict[str, Any]:
+async def _async_main(
+    args: argparse.Namespace,
+    *,
+    on_finally: Callable[[], Any] | None = None,
+) -> dict[str, Any]:
     mode = args.subcommand or "run"
     today_et = datetime.now(ET_TZ).date()
     cfg = get_dalton_settings().conversations
@@ -2431,29 +3181,161 @@ async def _async_main(args: argparse.Namespace) -> dict[str, Any]:
 
             wm = WorkspaceManager.current()
             if wm is not None:
-                await wm.shutdown()
+                await asyncio.wait_for(wm.shutdown(), timeout=POOL_CLOSE_TIMEOUT_S)
         except Exception:
             pass
         if db_pool is not None:
-            await db_pool.close()
+            try:
+                await asyncio.wait_for(db_pool.close(), timeout=POOL_CLOSE_TIMEOUT_S)
+            except Exception:
+                logger.warning(
+                    "Database connection pool did not close within %.1fs during shutdown; continuing exit",
+                    POOL_CLOSE_TIMEOUT_S,
+                )
+                _flush_log_handlers()
+        if on_finally is not None:
+            res = on_finally()
+            if inspect.isawaitable(res):
+                await res
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(
+    argv: list[str] | None = None,
+    *,
+    exit_fn: Callable[[int], Any] | None = None,
+    on_finally: Callable[[], Any] | None = None,
+) -> int:
     configure_archive_logging()
     parser = build_arg_parser()
     args = parser.parse_args(argv)
+    _ABANDONED_EXTRACTION_TASKS.clear()
+    loop = asyncio.new_event_loop()
+    exit_code: int = EXIT_CODE_OK
+    caught_exc: BaseException | None = None
+    has_live_abandoned = False
+    interrupted = False
+    main_task: asyncio.Task[dict[str, Any]] = loop.create_task(
+        _async_main(args, on_finally=on_finally)
+    )
+    prev_sigint_handler: Any = None
+    sigint_installed = False
+
+    grace_deadline: float | None = None
+
+    def _cancel_once() -> None:
+        nonlocal grace_deadline
+        # One cancel only: a second one would interrupt the task's own cleanup
+        # (run status, pool close). Its finally gets the grace period, then the
+        # loop stops and the task is abandoned.
+        if not main_task.done():
+            main_task.cancel()
+            grace_deadline = time.monotonic() + SHUTDOWN_GRACE_TIMEOUT_S
+            loop.call_later(SHUTDOWN_GRACE_TIMEOUT_S, loop.stop)
+
+    def _on_sigint(signum: int, frame: Any) -> None:
+        nonlocal interrupted
+        if not interrupted:
+            interrupted = True
+            loop.call_soon_threadsafe(_cancel_once)
+
+    if threading.current_thread() is threading.main_thread():
+        try:
+            prev_sigint_handler = signal.getsignal(signal.SIGINT)
+            signal.signal(signal.SIGINT, _on_sigint)
+            sigint_installed = True
+        except ValueError:
+            sigint_installed = False
+
     try:
-        summary = asyncio.run(_async_main(args))
-    except ArchiveAlreadyRunningError as exc:
-        return int(exc.code if isinstance(exc.code, int) else EXIT_CODE_LOCK_HELD)
-    print(json.dumps(summary, ensure_ascii=False, default=str))
-    if (
-        int(summary.get("incomplete_segments_total") or 0) > 0
-        or bool(summary.get("incomplete_segments"))
-        or summary.get("exit_code") == EXIT_CODE_INCOMPLETE
-    ):
-        return EXIT_CODE_INCOMPLETE
-    return EXIT_CODE_OK
+        try:
+            summary = loop.run_until_complete(main_task)
+        except ArchiveAlreadyRunningError as exc:
+            exit_code = int(exc.code if isinstance(exc.code, int) else EXIT_CODE_LOCK_HELD)
+        except KeyboardInterrupt:
+            interrupted = True
+            exit_code = EXIT_CODE_FATAL
+        except asyncio.CancelledError:
+            interrupted = True
+            exit_code = EXIT_CODE_FATAL
+        except RuntimeError as exc:
+            if interrupted and "Event loop stopped before Future completed" in str(exc):
+                exit_code = EXIT_CODE_FATAL
+            else:
+                caught_exc = exc
+                exit_code = EXIT_CODE_FATAL
+        except BaseException as exc:
+            caught_exc = exc
+            exit_code = EXIT_CODE_FATAL
+        else:
+            if interrupted:
+                exit_code = EXIT_CODE_FATAL
+            else:
+                print(json.dumps(summary, ensure_ascii=False, default=str), flush=True)
+                if (
+                    int(summary.get("incomplete_segments_total") or 0) > 0
+                    or bool(summary.get("incomplete_segments"))
+                    or summary.get("exit_code") == EXIT_CODE_INCOMPLETE
+                ):
+                    exit_code = EXIT_CODE_INCOMPLETE
+                else:
+                    exit_code = EXIT_CODE_OK
+
+        if interrupted:
+            # One grace period in total: what the stop timer already spent is
+            # not granted again here.
+            remaining = (
+                SHUTDOWN_GRACE_TIMEOUT_S
+                if grace_deadline is None
+                else max(0.0, grace_deadline - time.monotonic())
+            )
+            if not main_task.done() and remaining > 0:
+                try:
+                    loop.run_until_complete(asyncio.wait({main_task}, timeout=remaining))
+                except BaseException:
+                    pass
+            if not main_task.done():
+                logger.warning(
+                    "Main archive task did not finish cleanup within %.1fs after interrupt; abandoning task",
+                    SHUTDOWN_GRACE_TIMEOUT_S,
+                )
+                _flush_log_handlers()
+                _register_abandoned_task(main_task, "main_task")
+            elif not main_task.cancelled():
+                _ = main_task.exception()
+
+        live_abandoned = _get_live_abandoned_segment_ids()
+        if live_abandoned:
+            has_live_abandoned = True
+            logger.warning(
+                "Archive run finished with %d abandoned extraction task(s) still alive (%s); forcing immediate exit with code %d",
+                len(live_abandoned),
+                ", ".join(live_abandoned),
+                exit_code,
+            )
+            _flush_log_handlers()
+            try:
+                sys.stdout.flush()
+                sys.stderr.flush()
+            except Exception:
+                pass
+            eff_exit = exit_fn or os._exit
+            eff_exit(exit_code)
+            return exit_code
+        if caught_exc is not None:
+            raise caught_exc
+        return exit_code
+    finally:
+        if sigint_installed and prev_sigint_handler is not None:
+            try:
+                signal.signal(signal.SIGINT, prev_sigint_handler)
+            except Exception:
+                pass
+        if not has_live_abandoned:
+            try:
+                loop.run_until_complete(loop.shutdown_asyncgens())
+            except Exception:
+                pass
+            loop.close()
 
 
 if __name__ == "__main__":
