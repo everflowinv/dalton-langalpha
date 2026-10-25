@@ -8858,7 +8858,7 @@ async def test_segment_exceeding_segment_deadline_s_marked_incomplete_and_contin
 async def test_round2_budget_wait_and_backoff_bounded_by_segment_deadline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Budget wait exceeding remaining segment deadline aborts immediately without waiting 3600s, releases reservation, and continues to next segment; backoff sleep is clamped to min(backoff, remaining)."""
+    """A budget wait is throttling, not a stall: segment 0 waits the full 3600s for the hourly window (not cut by the 600s segment deadline) and then both segments run; backoff sleep is clamped to min(backoff, remaining)."""
     fake_now = 1000.0
     sleep_History: list[float] = []
 
@@ -8983,14 +8983,12 @@ async def test_round2_budget_wait_and_backoff_bounded_by_segment_deadline(
         sleep_fn=_sleep,
     )
 
-    # Segment 0 did NOT sleep 3600s waiting for budget recovery; it aborted immediately and Segment 1 ran.
-    assert sleep_History == []
-    assert visited_segments == ["ev-bw-1"]
+    # Segment 0 waited out the hourly window (longer than its 600s deadline) and
+    # then extracted; the wait did not count against the deadline.
+    assert sleep_History == [3600.0]
+    assert visited_segments == ["ev-bw-0", "ev-bw-1"]
     assert len(limiter._reservations) == 0
-    inc_by_ev = {item["first_event_id"]: item for item in summary["incomplete_segments"]}
-    assert inc_by_ev["ev-bw-0"]["status"] == "failed"
-    assert inc_by_ev["ev-bw-0"]["reason"] == "extraction_error:segment_deadline_exceeded"
-    assert inc_by_ev["ev-bw-1"]["status"] == "blocked"
+    assert not summary["incomplete_segments"]
 
     # Also verify 429 backoff sleep is clamped to min(backoff, remaining_s) and marks incomplete at deadline.
     backoff_sleeps: list[float] = []
@@ -9313,7 +9311,8 @@ async def test_round2_timed_out_segment_token_settlement_three_cases(
     }
     est_tokens = archive_cli.estimate_segment_tokens([sample_event], hourly_budget=100_000)
 
-    # --- Case 1: Request not sent (pre-send deadline reached) -> release reservation, 0 tokens ---
+    # --- Case 1: 600s spent waiting for budget does not use up the segment deadline:
+    # the request is still sent and settles its actual usage ---
     clock_c1 = 3000.0
 
     def _clock_1() -> float:
@@ -9341,7 +9340,19 @@ async def test_round2_timed_out_segment_token_settlement_three_cases(
         "wait_for_budget",
         create_autospec(limiter_c1.wait_for_budget, side_effect=_wait_advancing_to_deadline),
     )
-    extract_c1 = create_autospec(extractor_mod.extract_segment_cards)
+    extract_c1 = create_autospec(
+        extractor_mod.extract_segment_cards,
+        return_value=extractor_mod.SegmentExtractionOutcome(
+            ok=True,
+            category="research",
+            cards=[],
+            cards_raw_count=0,
+            model_used="deepseek-flash",
+            input_tokens=100,
+            output_tokens=50,
+            total_tokens=150,
+        ),
+    )
     summary_c1 = await archive_cli.process_weekly_batch(
         [dict(sample_event)],
         mode="run",
@@ -9355,11 +9366,10 @@ async def test_round2_timed_out_segment_token_settlement_three_cases(
         clock_fn=_clock_1,
         sleep_fn=_sleep_1,
     )
-    assert extract_c1.call_count == 0
+    assert extract_c1.call_count == 1
     assert len(limiter_c1._reservations) == 0
-    assert limiter_c1.current_window_tokens() == 0
-    assert summary_c1["total_tokens"] == 0
-    assert finish_records[-1]["total_tokens"] == 0
+    assert limiter_c1.current_window_tokens() == 150
+    assert summary_c1["total_tokens"] == 150
 
     # --- Case 2: Request sent, timed out without usage -> settle estimated_tokens in both ---
     clock_c2 = 4000.0
@@ -10488,3 +10498,304 @@ def test_round4_cli_main_sigint_executes_finally_and_exits_bounded(
 
 
 
+
+
+@pytest.mark.asyncio
+async def test_budget_wait_before_fallback_in_deferred_attempt_moves_segment_deadline() -> None:
+    """In a deferred attempt (defer window later than the segment deadline), a budget
+    wait before the fallback that crosses the old segment deadline still sends the
+    fallback: the wait moves the segment deadline instead of ending the segment."""
+    now = 50_000.0
+
+    def _clock() -> float:
+        return now
+
+    async def _sleep(seconds: float) -> None:
+        nonlocal now
+        now += max(0.0, float(seconds))
+
+    limiter = archive_cli.HourlyTokenBudgetLimiter(1_000_000, clock_fn=_clock, sleep_fn=_sleep)
+    first_reservation = await limiter.wait_for_budget(1000)
+    real_wait = limiter.wait_for_budget
+
+    async def _slow_budget_wait(
+        estimated_tokens: int = 1000,
+        *,
+        deadline: float | None = None,
+    ) -> archive_cli.BudgetReservation:
+        nonlocal now
+        now += 900.0  # crosses the old 600s segment deadline, not the defer window
+        return await real_wait(estimated_tokens, deadline=deadline)
+
+    limiter.wait_for_budget = create_autospec(real_wait, side_effect=_slow_budget_wait)  # type: ignore[method-assign]
+
+    async def _extract(
+        segment: list[dict[str, Any]],
+        **kwargs: Any,
+    ) -> extractor_mod.SegmentExtractionOutcome:
+        model = str(kwargs.get("extractor_model") or "")
+        if model == "deepseek-flash":
+            return extractor_mod.SegmentExtractionOutcome(
+                ok=False,
+                model_used=model,
+                status="indeterminate",
+                error_kind="timeout",
+                transient_error=True,
+                error="TimeoutError: timed out after 180s",
+            )
+        return extractor_mod.SegmentExtractionOutcome(
+            ok=True,
+            category="research",
+            cards=[],
+            cards_raw_count=0,
+            model_used=model,
+            input_tokens=100,
+            output_tokens=50,
+            total_tokens=150,
+        )
+
+    mock_extract = create_autospec(extractor_mod.extract_segment_cards, side_effect=_extract)
+    extended: list[float] = []
+    segment = [
+        {
+            "agent": "main",
+            "session_id": "sess-dfb",
+            "event_id": "ev-dfb-0",
+            "seq": 1,
+            "generation": "gen-1",
+            "created_at_ms": 1761300000000,
+            "ts": "2026-10-24T12:00:00+00:00",
+            "date_et": "2026-10-24",
+            "text": "Deferred segment whose fallback waits for budget.",
+        }
+    ]
+
+    outcome, _retries = await archive_cli.extract_segment_with_infinite_backoff(
+        segment,
+        extractor_model="deepseek-flash",
+        prompt_version="conv_card_v2_3",
+        extractor_fallback_model="gemini-4-argon-medium-oauth",
+        segment_deadline_s=600.0,
+        seg_deadline=now + 600.0,
+        deadline=now + 5_000.0,
+        limiter=limiter,
+        estimated_tokens=1000,
+        reservation=first_reservation,
+        clock_fn=_clock,
+        extract_fn=mock_extract,
+        sleep_fn=_sleep,
+        on_deadline_extended=extended.append,
+    )
+
+    assert mock_extract.call_count == 2
+    assert outcome.ok is True
+    assert outcome.model_used == "gemini-4-argon-medium-oauth"
+    assert outcome.error_kind != "segment_deadline_exceeded"
+    assert extended and extended[0] >= 900.0
+
+
+@pytest.mark.asyncio
+async def test_deferred_fallback_after_long_budget_wait_runs_through_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Through process_weekly_batch: a segment first comes back in_flight, its deferred
+    attempt times out on deepseek, and the budget wait before the fallback takes 900s,
+    past the segment's original 600s deadline but inside the deferred window. The
+    fallback must still be sent and the segment completes."""
+    fake_mono = 20_000.0
+
+    def _monotonic() -> float:
+        return fake_mono
+
+    async def _advancing_sleep(seconds: float) -> None:
+        nonlocal fake_mono
+        fake_mono += max(0.0, float(seconds))
+
+    mock_clock = create_autospec(archive_cli.time.monotonic, side_effect=_monotonic)
+    mock_sleep = create_autospec(asyncio.sleep, side_effect=_advancing_sleep)
+
+    calls: list[str] = []
+
+    async def _extract(segment: list[dict[str, Any]], **kwargs: Any) -> extractor_mod.SegmentExtractionOutcome:
+        model = str(kwargs.get("extractor_model") or "")
+        calls.append(model)
+        if len(calls) == 1:
+            return extractor_mod.SegmentExtractionOutcome(
+                model_used=model,
+                ok=False,
+                status="in_flight",
+                error_kind="in_flight",
+                in_flight=True,
+                error="该请求正在由另一个进程执行中，请稍候。",
+            )
+        if model == "deepseek-flash":
+            return extractor_mod.SegmentExtractionOutcome(
+                ok=False,
+                model_used=model,
+                status="indeterminate",
+                error_kind="timeout",
+                transient_error=True,
+                error="TimeoutError: timed out after 180s",
+            )
+        return extractor_mod.SegmentExtractionOutcome(
+            ok=True,
+            category="research",
+            cards=[],
+            cards_raw_count=0,
+            model_used=model,
+            input_tokens=100,
+            output_tokens=50,
+            total_tokens=150,
+        )
+
+    limiter = archive_cli.HourlyTokenBudgetLimiter(1_500_000, clock_fn=mock_clock, sleep_fn=mock_sleep)
+    real_wait = limiter.wait_for_budget
+    wait_calls = 0
+
+    async def _wait(estimated_tokens: int = 1000, *, deadline: float | None = None) -> archive_cli.BudgetReservation:
+        nonlocal wait_calls, fake_mono
+        wait_calls += 1
+        if wait_calls == 3:  # the wait before the fallback in the deferred attempt
+            fake_mono += 900.0
+        return await real_wait(estimated_tokens, deadline=deadline)
+
+    limiter.wait_for_budget = create_autospec(real_wait, side_effect=_wait)  # type: ignore[method-assign]
+
+    _patch_autospec_db_connection(monkeypatch)
+    monkeypatch.setattr(db_conv, "insert_run_start", create_autospec(db_conv.insert_run_start, return_value={"status": "running"}))
+    monkeypatch.setattr(db_conv, "update_run_progress", create_autospec(db_conv.update_run_progress, return_value=None))
+    monkeypatch.setattr(db_conv, "update_run_finish", create_autospec(db_conv.update_run_finish, return_value={"status": "completed"}))
+    monkeypatch.setattr(db_conv, "list_unrendered_dates", create_autospec(db_conv.list_unrendered_dates, return_value=[]))
+
+    events = [
+        {
+            "agent": "main",
+            "session_id": "sess-dfb2",
+            "event_id": "ev-dfb2-0",
+            "seq": 1,
+            "generation": "gen-1",
+            "created_at_ms": 1760950000000,
+            "ts": "2026-10-20T10:00:00+00:00",
+            "date_et": "2026-10-20",
+            "text": "Deferred segment whose fallback waits 900s for budget.",
+        }
+    ]
+    summary = await archive_cli.process_weekly_batch(
+        events,
+        mode="backfill",
+        window_start=date(2026, 10, 20),
+        window_end=date(2026, 10, 20),
+        limiter=limiter,
+        extractor_model="deepseek-flash",
+        extractor_fallback_model="gemini-4-argon-medium-oauth",
+        prompt_version="conv_card_v2_3",
+        segment_deadline_s=600.0,
+        stale_after_s=3000,
+        concurrency=1,
+        extract_fn=create_autospec(extractor_mod.extract_segment_cards, side_effect=_extract),
+        sleep_fn=mock_sleep,
+        clock_fn=mock_clock,
+    )
+
+    assert calls == ["deepseek-flash", "deepseek-flash", "gemini-4-argon-medium-oauth"]
+    assert wait_calls == 3
+    assert not summary["incomplete_segments"]
+
+
+@pytest.mark.asyncio
+async def test_deferred_fallback_budget_wait_longer_than_window_ends_segment_now(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Through process_weekly_batch: when the budget wait before the deferred fallback
+    would outlast the deferred window, the segment ends at once (incomplete, no
+    fallback sent) instead of sleeping the full hour."""
+    fake_mono = 30_000.0
+
+    def _monotonic() -> float:
+        return fake_mono
+
+    async def _advancing_sleep(seconds: float) -> None:
+        nonlocal fake_mono
+        fake_mono += max(0.0, float(seconds))
+
+    mock_clock = create_autospec(archive_cli.time.monotonic, side_effect=_monotonic)
+    mock_sleep = create_autospec(asyncio.sleep, side_effect=_advancing_sleep)
+
+    calls: list[str] = []
+
+    async def _extract(segment: list[dict[str, Any]], **kwargs: Any) -> extractor_mod.SegmentExtractionOutcome:
+        model = str(kwargs.get("extractor_model") or "")
+        calls.append(model)
+        if len(calls) == 1:
+            return extractor_mod.SegmentExtractionOutcome(
+                model_used=model,
+                ok=False,
+                status="in_flight",
+                error_kind="in_flight",
+                in_flight=True,
+                error="该请求正在由另一个进程执行中，请稍候。",
+            )
+        return extractor_mod.SegmentExtractionOutcome(
+            ok=False,
+            model_used=model,
+            status="indeterminate",
+            error_kind="timeout",
+            transient_error=True,
+            error="TimeoutError: timed out after 180s",
+        )
+
+    limiter = archive_cli.HourlyTokenBudgetLimiter(10_000, clock_fn=mock_clock, sleep_fn=mock_sleep)
+    real_wait = limiter.wait_for_budget
+    wait_calls = 0
+    clock_at_third_wait: list[float] = []
+
+    async def _wait(estimated_tokens: int = 1000, *, deadline: float | None = None) -> archive_cli.BudgetReservation:
+        nonlocal wait_calls
+        wait_calls += 1
+        if wait_calls == 3:  # before the deferred fallback: exhaust the hour
+            limiter.record_tokens(10_000 - 1)
+            clock_at_third_wait.append(fake_mono)
+        return await real_wait(estimated_tokens, deadline=deadline)
+
+    limiter.wait_for_budget = create_autospec(real_wait, side_effect=_wait)  # type: ignore[method-assign]
+
+    _patch_autospec_db_connection(monkeypatch)
+    monkeypatch.setattr(db_conv, "insert_run_start", create_autospec(db_conv.insert_run_start, return_value={"status": "running"}))
+    monkeypatch.setattr(db_conv, "update_run_progress", create_autospec(db_conv.update_run_progress, return_value=None))
+    monkeypatch.setattr(db_conv, "update_run_finish", create_autospec(db_conv.update_run_finish, return_value={"status": "failed"}))
+    monkeypatch.setattr(db_conv, "list_unrendered_dates", create_autospec(db_conv.list_unrendered_dates, return_value=[]))
+
+    events = [
+        {
+            "agent": "main",
+            "session_id": "sess-dfb3",
+            "event_id": "ev-dfb3-0",
+            "seq": 1,
+            "generation": "gen-1",
+            "created_at_ms": 1760950000000,
+            "ts": "2026-10-20T10:00:00+00:00",
+            "date_et": "2026-10-20",
+            "text": "Deferred segment whose fallback cannot get budget inside the window.",
+        }
+    ]
+    summary = await archive_cli.process_weekly_batch(
+        events,
+        mode="backfill",
+        window_start=date(2026, 10, 20),
+        window_end=date(2026, 10, 20),
+        limiter=limiter,
+        extractor_model="deepseek-flash",
+        extractor_fallback_model="gemini-4-argon-medium-oauth",
+        prompt_version="conv_card_v2_3",
+        segment_deadline_s=600.0,
+        stale_after_s=100,
+        concurrency=1,
+        extract_fn=create_autospec(extractor_mod.extract_segment_cards, side_effect=_extract),
+        sleep_fn=mock_sleep,
+        clock_fn=mock_clock,
+    )
+
+    assert calls == ["deepseek-flash", "deepseek-flash"]  # fallback never sent
+    assert wait_calls == 3
+    assert fake_mono == clock_at_third_wait[0]  # ended at once: no sleep after the third wait
+    assert summary["incomplete_segments"]

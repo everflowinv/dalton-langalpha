@@ -780,6 +780,7 @@ async def extract_segment_with_infinite_backoff(
     dry_run: bool = False,
     extract_fn: Callable[..., Coroutine[Any, Any, SegmentExtractionOutcome]] = extract_segment_cards,
     sleep_fn: Callable[[float], Coroutine[Any, Any, None]] = asyncio.sleep,
+    on_deadline_extended: Callable[[float], None] | None = None,
 ) -> tuple[SegmentExtractionOutcome, int]:
     """Extract cards from `segment`, backing off indefinitely on 429, retrying once with `extractor_fallback_model`
     when a platform-key model fails with timeout/indeterminate/transient error, and retrying transient network/5xx
@@ -851,6 +852,31 @@ async def extract_segment_with_infinite_backoff(
     eff_deadline: float = (
         min(seg_deadline, deadline) if deadline is not None else seg_deadline
     )
+
+    async def _budget_wait_excluded() -> Any:
+        # Budget waits are deliberate throttling, not a stall: they run with no
+        # segment deadline, and the deadline moves forward by the time waited.
+        nonlocal seg_deadline, eff_deadline
+        assert limiter is not None
+        # Exempt from the segment deadline only; a deferred attempt's window
+        # (`deadline`) still bounds the wait, so it ends as soon as the window
+        # cannot be met instead of sleeping past it.
+        no_dl_token = _ACTIVE_SEGMENT_DEADLINE.set(deadline)
+        wait_t0 = _now_mono()
+        try:
+            res = await limiter.wait_for_budget(estimated_tokens)
+        finally:
+            _ACTIVE_SEGMENT_DEADLINE.reset(no_dl_token)
+        waited_s = max(0.0, _now_mono() - wait_t0)
+        if waited_s > 0:
+            # Only the segment's own deadline moves; the deferred in-flight
+            # window (`deadline`) deliberately includes budget and call time.
+            seg_deadline += waited_s
+            eff_deadline = min(seg_deadline, deadline) if deadline is not None else seg_deadline
+            _ACTIVE_SEGMENT_DEADLINE.set(eff_deadline)
+            if on_deadline_extended is not None:
+                on_deadline_extended(waited_s)
+        return res
 
     def _release_current_reservation() -> None:
         nonlocal current_reservation
@@ -1134,7 +1160,7 @@ async def extract_segment_with_infinite_backoff(
             if limiter is not None:
                 try:
                     if needs_budget_recheck:
-                        new_res = await limiter.wait_for_budget(estimated_tokens)
+                        new_res = await _budget_wait_excluded()
                         needs_budget_recheck = False
                         if current_reservation is not None:
                             current_reservation.rebind(new_res)
@@ -1286,7 +1312,7 @@ async def extract_segment_with_infinite_backoff(
 
                 if limiter is not None:
                     try:
-                        new_res = await limiter.wait_for_budget(estimated_tokens)
+                        new_res = await _budget_wait_excluded()
                     except _SegmentDeadlineExceededError:
                         return _segment_deadline_outcome(eff_fallback_model), rl_attempt + transient_attempt
                     current_reservation = (
@@ -2004,6 +2030,7 @@ async def process_weekly_batch(
         *,
         seg_deadline: float | None = None,
         deadline: float | None = None,
+        seg_idx: int | None = None,
     ) -> tuple[SegmentExtractionOutcome, int, float]:
         nonlocal segments_trace_counter, aborted_in_tokens, aborted_out_tokens, aborted_tot_tokens
 
@@ -2015,18 +2042,31 @@ async def process_weekly_batch(
             return time.monotonic()
 
         est_tokens = estimate_segment_tokens(seg, hourly_budget=limiter.hourly_budget)
+
+        def _extend_seg_deadline(waited_s: float) -> None:
+            # The stored deadline is what the in_flight and deferred checks
+            # read, so every budget wait moves it, not just this attempt's copy.
+            if seg_idx is not None and seg_idx in seg_deadline_by_idx:
+                seg_deadline_by_idx[seg_idx] += waited_s
+
         t0 = now_fn()
         eff_seg_dl = (
             seg_deadline
             if seg_deadline is not None
             else (t0 + eff_segment_deadline_s)
         )
-        eff_attempt_dl = (
-            min(eff_seg_dl, deadline) if deadline is not None else eff_seg_dl
-        )
-        dl_token = _ACTIVE_SEGMENT_DEADLINE.set(eff_attempt_dl)
+        # Waiting for hourly budget is deliberate throttling, bounded by the
+        # window, not a stall: it runs with no segment deadline, and the
+        # segment's work clock (and the stored deadline a deferred retry reads)
+        # moves forward by the time spent waiting.
+        dl_token = _ACTIVE_SEGMENT_DEADLINE.set(deadline)
+        wait_t0 = now_fn()
         try:
             reservation = await limiter.wait_for_budget(est_tokens)
+            waited_s = max(0.0, now_fn() - wait_t0)
+            if waited_s > 0:
+                eff_seg_dl += waited_s
+                _extend_seg_deadline(waited_s)
         except _SegmentDeadlineExceededError:
             return (
                 SegmentExtractionOutcome(
@@ -2086,11 +2126,14 @@ async def process_weekly_batch(
                 limiter=limiter,
                 estimated_tokens=est_tokens,
                 reservation=reservation,
-                deadline=eff_attempt_dl if deadline is not None else None,
+                # The raw deferred window: the inner function takes the min with
+                # the segment deadline it keeps moving on budget waits.
+                deadline=deadline,
                 clock_fn=clock_fn,
                 dry_run=dry_run,
                 extract_fn=extract_fn,
                 sleep_fn=sleep_fn,
+                on_deadline_extended=_extend_seg_deadline,
             )
         except BaseException:
             limiter.release_reservation(reservation)
@@ -2118,6 +2161,7 @@ async def process_weekly_batch(
                 outcome, rl_retries, elapsed_s = await _run_segment_attempt(
                     seg,
                     seg_deadline=seg_deadline,
+                    seg_idx=seg_idx,
                 )
             except BaseException:
                 abort_flag = True
@@ -2130,7 +2174,7 @@ async def process_weekly_batch(
                 aborted_tot_tokens += int(outcome.total_tokens or 0)
                 raise PermanentQuotaError(outcome.error or "permanent_quota_error")
             if is_in_flight_error(outcome):
-                if _seg_now() >= seg_deadline:
+                if _seg_now() >= seg_deadline_by_idx.get(seg_idx, seg_deadline):
                     outcome.in_flight = False
                     outcome.status = "failed"
                     outcome.error_kind = "segment_deadline_exceeded"
@@ -2324,7 +2368,6 @@ async def process_weekly_batch(
                                 segments[seg_idx] = []
                             seg = []
                             continue
-                        eff_defer_dl = min(seg_dl, deadline)
                         async with sem:
                             if _defer_now() >= deadline:
                                 break
@@ -2352,8 +2395,10 @@ async def process_weekly_batch(
                             outcome, rl_retries, elapsed_s = await _run_segment_attempt(
                                 seg,
                                 seg_deadline=seg_dl,
-                                deadline=eff_defer_dl,
+                                deadline=deadline,
+                                seg_idx=seg_idx,
                             )
+                            seg_dl = seg_deadline_by_idx.get(seg_idx, seg_dl)
 
                         outcome.input_tokens += prev_outcome.input_tokens
                         outcome.output_tokens += prev_outcome.output_tokens
