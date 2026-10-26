@@ -1,7 +1,7 @@
 import React, { Suspense, lazy, useCallback, useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router';
 import { useTranslation } from 'react-i18next';
-import { ArrowLeft, ArrowRight, LayoutGrid, PanelLeftClose, PanelLeftOpen, Plus, SquarePen } from 'lucide-react';
+import { ArrowLeft, ArrowRight, LayoutGrid, PanelLeftClose, PanelLeftOpen, Plus, Search, SquarePen } from 'lucide-react'; // DALTON-HOOK(global-search)
 import logoLight from '../../assets/img/logo.svg';
 import logoDark from '../../assets/img/logo-dark.svg';
 import { BrandMark } from '@/components/brand/BrandMark'; // DALTON-HOOK(brand-name)
@@ -67,6 +67,8 @@ function HistoryButtons() {
 
 // Off the entry chunk: the modal is only needed once the button is pressed.
 const CreateWorkspaceModal = lazy(() => import('@/pages/ChatAgent/components/CreateWorkspaceModal'));
+// DALTON-HOOK(global-search): global search trigger
+import { openGlobalSearch } from '@/components/dalton/globalSearchHost';
 
 interface AppSidebarProps {
   collapsed: boolean;
@@ -185,6 +187,13 @@ function AppSidebar({ collapsed, onToggleCollapse, width, onWidthChange }: AppSi
     navigate(`/chat/${ws.workspace_id}`, { state: { workspaceName: ws.name, workspaceStatus: null } });
   }, [navigate]);
 
+  // DALTON-HOOK(global-search): global search shortcut label
+  const shortcutLabel =
+    typeof navigator !== 'undefined' && /Win|Linux/i.test(navigator.platform || navigator.userAgent || '')
+      ? 'Ctrl+K'
+      : '⌘K';
+  const searchLabel = t('sidebar.search', { shortcut: shortcutLabel });
+
   // One persistent <aside> so the width transition runs across mode flips;
   // the keyed fragments force each mode's content to cleanly remount (React
   // would otherwise morph rail nodes into panel nodes in place), which lets
@@ -210,6 +219,25 @@ function AppSidebar({ collapsed, onToggleCollapse, width, onWidthChange }: AppSi
         >
           <PanelLeftOpen className="h-4 w-4" />
         </button>
+        {/* DALTON-HOOK(global-search): search button with tooltip below expand button in collapsed rail */}
+        <TooltipProvider delayDuration={300}>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                className="sidebar-rail-toggle"
+                onClick={openGlobalSearch}
+                aria-label={searchLabel}
+                title={searchLabel}
+              >
+                <Search className="h-4 w-4" />
+              </button>
+            </TooltipTrigger>
+            <TooltipContent side="right" sideOffset={8}>
+              {searchLabel}
+            </TooltipContent>
+          </Tooltip>
+        </TooltipProvider>
         <nav className="sidebar-nav">
           <TooltipProvider delayDuration={300}>
             {navItems.map((item) => {
@@ -259,6 +287,16 @@ function AppSidebar({ collapsed, onToggleCollapse, width, onWidthChange }: AppSi
         >
           {BRAND_MARK === 'everflow' ? <BrandMark className="h-7 w-7 shrink-0" /> : <img src={logo} alt="" style={{ width: '28px', height: '28px', objectFit: 'contain' }} />} {/* DALTON-HOOK(brand-name) */}
           <span className="sidebar-wordmark title-font">{BRAND_NAME}</span> {/* DALTON-HOOK(brand-name) */}
+        </button>
+        {/* DALTON-HOOK(global-search): search icon button between brand and collapse button */}
+        <button
+          type="button"
+          className="sidebar-collapse-btn"
+          onClick={openGlobalSearch}
+          aria-label={searchLabel}
+          title={searchLabel}
+        >
+          <Search className="h-4 w-4" />
         </button>
         <button
           className="sidebar-collapse-btn"

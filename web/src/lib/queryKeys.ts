@@ -300,6 +300,8 @@ export const queryKeys = {
     // DALTON-HOOK(feishu-docs): Feishu wiki read-scope whitelist and bot-visible spaces
     feishuReadScopes: () => [...queryKeys.dalton.all, 'feishu', 'read-scopes'],
     feishuSpaces: () => [...queryKeys.dalton.all, 'feishu', 'spaces'],
+    // DALTON-HOOK(query-keys): global keyword search query key
+    search: (q: string, limit = 20) => [...queryKeys.dalton.all, 'search', q, limit],
   },
 };
 

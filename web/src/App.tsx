@@ -41,6 +41,8 @@ const Legal = React.lazy(() => import('./pages/Legal/Legal'));
 const ResetPassword = React.lazy(() => import('./pages/Login/ResetPassword'));
 // DALTON-HOOK(invite-signup): public invite redemption page (/invite#<token>)
 const InviteRedeemPage = React.lazy(() => import('./lib/dalton/InviteRedeemPage'));
+// DALTON-HOOK(global-search): persistent global search modal host and ⌘K listener across desktop and mobile
+import { GlobalSearchHost } from './components/dalton/globalSearchHost';
 
 /** How long a callback may sit holding neither a session nor a stated reason
  *  before it is called a failure. What it waits on is the `?code=` exchange the
@@ -313,6 +315,8 @@ function AuthenticatedShell() {
       {/* After the onboarding sheet, so a connect it starts asks above it. */}
       <ConnectConsentHost />
       <ConnectLandingHost />
+      {/* DALTON-HOOK(global-search): mount global search host at authenticated app shell */}
+      <GlobalSearchHost />
     </OnboardingProvider>
   );
 }

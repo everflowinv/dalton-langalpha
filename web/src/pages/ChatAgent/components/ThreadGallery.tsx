@@ -251,7 +251,7 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
   }, [workspaceId, setPanelOverride]);
 
   const navigate = useNavigate();
-  const { threadId: currentThreadId } = useParams();
+  const { workspaceId: urlWorkspaceId, threadId: currentThreadId } = useParams();
 
   // Redirect to workspace gallery when workspace is not found or access is denied
   useEffect(() => {
@@ -259,6 +259,43 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
       navigate('/chat', { replace: true });
     }
   }, [wsNotFound, accessDenied, navigate]);
+
+  const clampPanelWidth = useCallback(
+    (desired: number) => clampPanelWidthUtil(desired, containerWidthRef.current),
+    [],
+  );
+
+  // DALTON-HOOK(global-search): open file or memo in ThreadGallery's FilePanel when visible and workspace matches.
+  // Once per navigation (location.key): the effect's callbacks are not all stable,
+  // and reopening on every re-render would loop until the state is cleared.
+  const handledOpenFileKeyRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (currentThreadId || !workspaceId) return;
+    if (handledOpenFileKeyRef.current === location.key) return;
+    if (urlWorkspaceId && urlWorkspaceId !== workspaceId) return;
+    const navState = location.state as { openFilePath?: string; workspaceId?: string; [key: string]: unknown } | null;
+    const openFilePath = navState?.openFilePath;
+    if (!openFilePath) return;
+    if (navState?.workspaceId && navState.workspaceId !== workspaceId) return;
+    handledOpenFileKeyRef.current = location.key;
+    handleOpenFile(openFilePath, workspaceId);
+    setFilePanelWidth(clampPanelWidth(850));
+    setShowFilePanel(true);
+    navigate(location.pathname, {
+      replace: true,
+      state: { ...navState, openFilePath: undefined },
+    });
+  }, [
+    currentThreadId,
+    workspaceId,
+    urlWorkspaceId,
+    location.key,
+    location.state,
+    location.pathname,
+    handleOpenFile,
+    clampPanelWidth,
+    navigate,
+  ]);
 
   // Sort helper for file list display
   const sortFiles = useCallback((fileList: string[]) => {
@@ -276,11 +313,6 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
       return a.localeCompare(b);
     });
   }, []);
-
-  const clampPanelWidth = useCallback(
-    (desired: number) => clampPanelWidthUtil(desired, containerWidthRef.current),
-    [],
-  );
 
   // Track container width via ResizeObserver
   useEffect(() => {

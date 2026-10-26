@@ -1,5 +1,7 @@
 import { useLocation, useNavigate } from 'react-router';
 import { useTranslation } from 'react-i18next';
+import { Search } from 'lucide-react'; // DALTON-HOOK(global-search)
+import { openGlobalSearch } from '@/components/dalton/globalSearchHost'; // DALTON-HOOK(global-search)
 import { SETTINGS_ITEM } from '../nav/navItems';
 import { useNavActive } from '../nav/useNavActive';
 import { useNavItems } from '../nav/useNavItems';
@@ -37,6 +39,16 @@ export default function BottomTabBar() {
             </button>
           );
         })}
+        {/* DALTON-HOOK(global-search): mobile global search button in bottom tab bar */}
+        <button
+          type="button"
+          className="bottom-tab-item"
+          onClick={openGlobalSearch}
+          aria-label={t('common.search')}
+          title={t('common.search')}
+        >
+          <Search className="bottom-tab-item-icon" />
+        </button>
       </div>
     </div>
   );

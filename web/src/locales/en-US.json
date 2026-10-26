@@ -175,7 +175,19 @@
     "resize": "Resize sidebar",
     "plugins": "Plugins",
     "orders": "Orders",
-    "menu": "Menu"
+    "menu": "Menu",
+    "search": "Search ({{shortcut}})",
+    "globalSearch": {
+      "title": "Search",
+      "placeholder": "Search conversations and documents…",
+      "clear": "Clear search",
+      "conversations": "Conversations",
+      "documents": "Documents",
+      "memoTag": "Memo",
+      "idleHint": "Enter at least 2 characters to search your workspaces and memos.",
+      "noResults": "No matching conversations or documents found.",
+      "error": "Failed to load search results. Please try again."
+    }
   },
   "account": {
     "menuLabel": "Account menu"
