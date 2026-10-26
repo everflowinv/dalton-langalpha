@@ -82,6 +82,9 @@ another endpoint while keeping its provider key. Config can only turn a channel
   worse than a 400). An id the host's rule cannot place fails closed onto the
   user-message fallback.
 
+DALTON-HOOK(upstream-backport-596): this paragraph and the bridge's placement
+check are upstream 86ce2f02c, backported ahead of the next upstream sync.
+
 The Anthropic wire form also carries placement rules: a mid-conversation system
 message has to follow a user message (or an assistant message ending in
 server-tool use) and must be either the last entry in ``messages`` or be
@@ -452,6 +455,7 @@ def _splice_operator_entries(original: Callable[..., Any], messages: Any) -> Any
     if not cuts:
         return original(msgs)
 
+    # DALTON-HOOK(upstream-backport-596): upstream 86ce2f02c, placement rule for mid-turn system entries.
     system: Any = None
     formatted: list[dict[str, Any]] = []
     spliced: list[int] = []
@@ -478,6 +482,7 @@ def _splice_operator_entries(original: Callable[..., Any], messages: Any) -> Any
     return system, formatted
 
 
+# DALTON-HOOK(upstream-backport-596): upstream 86ce2f02c.
 def _placeable(formatted: list[dict[str, Any]], index: int) -> bool:
     """Whether Anthropic accepts the system entry at *index* where it stands."""
     after_user = index > 0 and formatted[index - 1].get("role") == "user"

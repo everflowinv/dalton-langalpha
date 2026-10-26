@@ -102,6 +102,7 @@ ALLOWED_HOOKS=(
   "fallback-reason-log"
   "sandbox-pip-system"
   "subagent-workspace-root"
+  "upstream-backport-596"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

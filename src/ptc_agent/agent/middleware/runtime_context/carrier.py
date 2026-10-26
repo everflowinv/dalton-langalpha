@@ -9,6 +9,8 @@ per model:
   Consecutive parts (several rows, or rows followed by the envelope) are
   coalesced into one message with a text block each, because two adjacent
   operator entries have not been proven on the Anthropic wire form.
+DALTON-HOOK(upstream-backport-596): upstream 86ce2f02c wording below.
+
 - ``reminder``: a ``<system-reminder>`` block appended inside the message it
   belongs to, which is the shape Claude Code uses: one message, the user's own
   text first, the harness blocks after it. The wrapper is added here, and
