@@ -95,7 +95,11 @@ class NewsRefreshService:
 
         feeds, dropped = [], []
         for feed in cfg.feeds:
-            ok = feed.provider is None or news_source_available(feed.provider)
+            # DALTON-HOOK(market-data-fallback): background polling runs every
+            # 60s (1440 calls/day), which burns FMP's ~250/day free quota.
+            ok = feed.provider is None or (
+                feed.provider != "fmp" and news_source_available(feed.provider)
+            )
             (feeds if ok else dropped).append(feed)
         if dropped:
             logger.info(
@@ -170,6 +174,13 @@ class NewsRefreshService:
             return
 
         source = await self._resolve_source(provider)
+        # DALTON-HOOK(market-data-fallback): skip the feed when stripping FMP leaves no provider.
+        if source is None:
+            logger.info(
+                "[NewsRefresh] %s: skipped (no non-FMP news provider available)",
+                provider or "chain",
+            )
+            return
         data = await source.get_news(
             tickers=None, limit=limit, user_id=_SERVICE_USER_ID
         )
@@ -207,5 +218,18 @@ class NewsRefreshService:
 
             return await get_news_source(provider)
         from src.data_client import get_news_data_provider
+        from src.data_client.news_data_provider import NewsDataProvider
 
-        return await get_news_data_provider()
+        # DALTON-HOOK(market-data-fallback): exclude FMP from the background
+        # poller's provider chain so 60s polling never consumes FMP's daily
+        # quota; user-initiated news queries still use the full chain. When
+        # stripping FMP leaves an empty chain, return None so _refresh_feed
+        # logs and skips the feed instead of falling back to FMP.
+        chain = await get_news_data_provider()
+        sources = getattr(chain, "_sources", None)
+        if isinstance(sources, list):
+            non_fmp = [(name, src) for name, src in sources if name != "fmp"]
+            if non_fmp:
+                return NewsDataProvider(non_fmp)
+            return None
+        return chain

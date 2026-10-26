@@ -166,7 +166,7 @@ export interface WorkspaceTrackingResponse {
   ticker: string;
   tier: string;
   timezone: string;
-  status: 'enabled' | 'disabled' | 'incomplete';
+  status: 'enabled' | 'disabled' | 'incomplete' | 'not_applicable';
   enabled: boolean;
   paused_by_user: boolean;
   label: string;

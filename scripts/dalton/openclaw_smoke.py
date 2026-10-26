@@ -11,7 +11,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
 import sys
 import time
 import uuid
@@ -28,8 +27,7 @@ if str(REPO_ROOT) not in sys.path:
 
 load_dotenv(REPO_ROOT / ".env")
 
-from src.dalton.llm.openclaw_catalog import OVERLAY_PATH, assert_no_credentials  # noqa: E402
-from src.dalton.llm.overlay import load_overlay_data  # noqa: E402
+from src.dalton.llm.openclaw_catalog import assert_no_credentials  # noqa: E402
 from src.dalton.settings import get_dalton_broker_token, get_dalton_broker_url  # noqa: E402
 
 DEFAULT_MODELS = [

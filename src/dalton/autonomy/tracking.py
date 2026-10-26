@@ -59,7 +59,7 @@ async def resolve_default_tier(
 
 def _extract_ticker_from_text(raw: str | None) -> str | None:
     cleaned = str(raw or "").strip()
-    if not cleaned or cleaned.lower() == "home":
+    if not cleaned or cleaned.lower() == "home" or "_" in cleaned:
         return None
     m = _CLEAN_TICKER_RE.match(cleaned)
     if m:
@@ -361,7 +361,7 @@ async def _load_company_automations(
 
 
 async def get_tracking_status(user_id: str, workspace_id: str) -> dict[str, Any]:
-    """Derive the company workspace tracking status (`enabled` | `disabled` | `incomplete`) from `automations`."""
+    """Derive the company workspace tracking status (`enabled` | `disabled` | `incomplete` | `not_applicable`) from `automations`."""
     uid = str(user_id or "").strip()
     ws_id = str(workspace_id or "").strip()
     if not uid:
@@ -369,7 +369,25 @@ async def get_tracking_status(user_id: str, workspace_id: str) -> dict[str, Any]
     if not ws_id:
         raise ValueError("workspace_id is required")
 
-    ticker, company_rows = await _load_company_automations(uid, ws_id)
+    try:
+        ticker, company_rows = await _load_company_automations(uid, ws_id)
+    except ValueError:
+        return {
+            "ok": True,
+            "workspace_id": ws_id,
+            "ticker": "",
+            "tier": "",
+            "timezone": "America/New_York",
+            "status": "not_applicable",
+            "enabled": False,
+            "paused_by_user": False,
+            "label": "",
+            "missing_tasks": [],
+            "paused_tasks": [],
+            "active_tasks": [],
+            "tasks": [],
+            "automations": [],
+        }
     tier = await resolve_default_tier(ticker, user_id=uid)
     return _derive_status_and_details(
         workspace_id=ws_id,

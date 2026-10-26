@@ -265,46 +265,52 @@ class SubagentCompiler:
         preloaded = self._load_preloaded_skills(defn)
 
         # 1. Raw custom prompt — bypass all rendering
+        # DALTON-HOOK(subagent-workspace-root): route all three prompt branches to a shared exit.
         if defn.custom_prompt is not None:
-            return _with_preloaded(defn.custom_prompt, preloaded)
-
-        # Shared template variables
-        template_kwargs = subagent_template_vars(
-            defn,
-            guidance=self._guidance(defn),
-            current_time=self._current_time,
-            thread_id=self._thread_id,
-            files_mounted=self._files_mounted,
-            market_watch=(
-                self._config is not None and self._config.feature_enabled("market_watch")
-            ),
-            todo=bool(self._tool_sets.get("todo")),
-        )
-        # Resolve the turn's own folder so workspace_paths renders it
-        if self._sandbox is not None and hasattr(self._sandbox, "config"):
-            template_kwargs.update(
-                workspace_path_vars(
-                    self._sandbox.workspace(self._project),
-                    root=self._sandbox.config.filesystem.working_directory,
+            body = defn.custom_prompt
+        else:
+            # Shared template variables
+            template_kwargs = subagent_template_vars(
+                defn,
+                guidance=self._guidance(defn),
+                current_time=self._current_time,
+                thread_id=self._thread_id,
+                files_mounted=self._files_mounted,
+                market_watch=(
+                    self._config is not None and self._config.feature_enabled("market_watch")
+                ),
+                todo=bool(self._tool_sets.get("todo")),
+            )
+            # Resolve the turn's own folder so workspace_paths renders it
+            if self._sandbox is not None and hasattr(self._sandbox, "config"):
+                template_kwargs.update(
+                    workspace_path_vars(
+                        self._sandbox.workspace(self._project),
+                        root=self._sandbox.config.filesystem.working_directory,
+                    )
                 )
-            )
 
-        # 2. Standalone custom template — render it directly
-        if defn.custom_prompt_template is not None:
-            return _with_preloaded(
-                loader.render(defn.custom_prompt_template, **template_kwargs), preloaded
-            )
+            # 2. Standalone custom template — render it directly
+            if defn.custom_prompt_template is not None:
+                body = loader.render(defn.custom_prompt_template, **template_kwargs)
+            else:
+                # 3. Base template + role prompt (default path)
+                body = loader.get_subagent_base_prompt(
+                    identity_line=self._identity_line(defn),
+                    role_prompt_template=defn.role_prompt_template,
+                    role_prompt=defn.role_prompt,
+                    preloaded_skills_content="",
+                    sections=sections,
+                    tools_narrowed=defn.tools_narrowed,
+                    **template_kwargs,
+                )
 
-        # 3. Base template + role prompt (default path)
-        return loader.get_subagent_base_prompt(
-            identity_line=self._identity_line(defn),
-            role_prompt_template=defn.role_prompt_template,
-            role_prompt=defn.role_prompt,
-            preloaded_skills_content=preloaded,
-            sections=sections,
-            tools_narrowed=defn.tools_narrowed,
-            **template_kwargs,
-        )
+        # DALTON-HOOK(subagent-workspace-root): inject workspace absolute root
+        # and skills path prefix at the shared exit of all three prompt paths
+        # (custom_prompt, custom_prompt_template, and default base template).
+        ws_line = self._workspace_root_line()
+        body = f"{body.rstrip()}\n\n{ws_line}" if body.strip() else ws_line
+        return _with_preloaded(body, preloaded)
 
     def _guidance(self, defn: SubagentDefinition) -> str:
         """Scaffolding level for the model this subagent runs.
@@ -321,6 +327,45 @@ class SubagentCompiler:
             f"subagent:{defn.name}"
         ) or resolve_prompt_guidance(
             defn.model or (config.llm.name if config.llm else None)
+        )
+
+    def _workspace_root_vars(self) -> dict[str, Any]:
+        """Resolve workspace path template vars for this compiler's sandbox/project."""
+        from ptc_agent.core.paths import DEFAULT_SANDBOX_ROOT, WorkspaceLayout
+
+        if self._sandbox is not None and hasattr(self._sandbox, "config"):
+            root = self._sandbox.config.filesystem.working_directory
+            ws = self._sandbox.workspace(self._project)
+            return workspace_path_vars(ws, root=root)
+        root = (
+            self._config.filesystem.working_directory
+            if self._config is not None and hasattr(self._config, "filesystem")
+            else DEFAULT_SANDBOX_ROOT
+        )
+        dir_name = (
+            getattr(self._project, "dir_name", None)
+            if self._project is not None
+            else None
+        )
+        ws = WorkspaceLayout(root, dir_name or "")
+        return workspace_path_vars(ws, root=root)
+
+    def _workspace_root_line(self) -> str:
+        """Build the workspace absolute root and skills path prefix instruction."""
+        # DALTON-HOOK(subagent-workspace-root): always state the workspace
+        # absolute root directory and skills absolute path prefix in the
+        # subagent prompt (including read-only subagents like dalton-reviewer
+        # and research that omit the full <workspace_paths> section, as well as
+        # custom_prompt / custom_prompt_template definitions) so models never
+        # invent host paths such as /Users/<name>/...
+        ws_vars = self._workspace_root_vars()
+        working_dir = ws_vars["working_directory"]
+        skills_rel = ws_vars["workspace_paths"]["skills"]
+        skills_abs = f"{working_dir.rstrip('/')}/{skills_rel.lstrip('/')}"
+        return (
+            f"Workspace root directory (absolute): `{working_dir}` "
+            f"(skills path prefix: `{skills_abs}/<skill_name>/SKILL.md`, or relative `{skills_rel}/<skill_name>/SKILL.md`). "
+            f"All workspace files live under `{working_dir}`; never invent host paths such as `/Users/...`."
         )
 
     def _identity_line(self, defn: SubagentDefinition) -> str:

@@ -822,7 +822,11 @@ async def worker_lost_failure(thread_id: str, task_id: str) -> dict[str, Any]:
                 "worker_lost: no live executor holds this task's namespace "
                 "fence. The run was interrupted and is RESUMABLE — re-launch "
                 f"it with RunWorkflow(workflow=..., resume='{task_id}') to "
-                "replay completed dispatches from its journal."
+                "replay completed dispatches from its journal. When continuing "
+                "(or when the user asks to continue / '继续'), you MUST call "
+                f"RunWorkflow(workflow=<same workflow>, resume='{task_id}') "
+                "and MUST NOT manually re-dispatch Task subagents (such as "
+                "data-prep or dalton-evidence)."
             )
         }
     return {

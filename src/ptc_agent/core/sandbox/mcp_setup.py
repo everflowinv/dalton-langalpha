@@ -37,9 +37,11 @@ async def _install_dependencies(sandbox: "PTCSandbox") -> None:
 
     # yfinance pins curl_cffi<0.14 but scrapling[all] requires >=0.14.
     # Override resolves the conflict (tested, yfinance works with 0.14+).
+    # DALTON-HOOK(sandbox-pip-system): pass --system to match Dockerfile.sandbox
+    # when UV_SYSTEM_PYTHON / VIRTUAL_ENV is not set in the container.
     install_cmd = (
         "echo 'curl_cffi>=0.14' > /tmp/_overrides.txt && "
-            f"uv pip install -q --override /tmp/_overrides.txt {' '.join(DEFAULT_DEPENDENCIES)} && "
+            f"uv pip install --system -q --override /tmp/_overrides.txt {' '.join(DEFAULT_DEPENDENCIES)} && "
             "rm -f /tmp/_overrides.txt"
     )
 
@@ -485,6 +487,104 @@ async def _start_internal_mcp_servers(sandbox: "PTCSandbox") -> bool | None:
 
 
 
+def _known_local_names(sandbox: "PTCSandbox | None") -> set[str]:
+    """Names of the workspace directory itself and sandbox layout tiers."""
+    # DALTON-HOOK(sandbox-pip-system): skip workspace directory names (e.g.
+    # ai_strategy_lp) and sandbox layout folders when auto-installing imports.
+    names: set[str] = {"tools", "_internal", "mcp_servers"}
+    if sandbox is None:
+        return names
+    ws_fn = getattr(sandbox, "workspace", None)
+    if callable(ws_fn):
+        try:
+            ws = ws_fn()
+            for candidate in (
+                getattr(ws, "dir_name", None),
+                posixpath.basename((getattr(ws, "workspace", "") or "").rstrip("/")),
+            ):
+                if isinstance(candidate, str) and candidate:
+                    names.add(candidate)
+        except Exception:
+            pass
+    for attr in ("workspace_dir_name", "working_dir"):
+        val = getattr(sandbox, attr, None)
+        if isinstance(val, str) and val:
+            names.add(posixpath.basename(val.rstrip("/")))
+    return names
+
+
+async def _filter_local_packages(
+    sandbox: "PTCSandbox", packages: list[str]
+) -> list[str]:
+    """Filter out package names that match a workspace directory or local module."""
+    # DALTON-HOOK(sandbox-pip-system): avoid running `uv pip install` on local
+    # directories or `.py` modules inside the workspace or computer root.
+    known_local = _known_local_names(sandbox)
+    remaining = [pkg for pkg in packages if pkg not in known_local]
+    if not remaining or getattr(sandbox, "runtime", None) is None:
+        return remaining
+
+    search_dirs: list[str] = []
+    ws_fn = getattr(sandbox, "workspace", None)
+    if callable(ws_fn):
+        try:
+            ws = ws_fn()
+            ws_dir = getattr(ws, "workspace", None)
+            if isinstance(ws_dir, str) and ws_dir:
+                search_dirs.append(ws_dir)
+        except Exception:
+            pass
+    layout = getattr(sandbox, "layout", None)
+    root_dir = getattr(layout, "root", None)
+    if isinstance(root_dir, str) and root_dir and root_dir not in search_dirs:
+        search_dirs.append(root_dir)
+
+    if not search_dirs:
+        return remaining
+
+    checks: list[str] = []
+    for pkg in remaining:
+        q_pkg = shlex.quote(pkg)
+        conds = " || ".join(
+            f"[ -d {shlex.quote(d)}/{q_pkg} ] || [ -f {shlex.quote(d)}/{q_pkg}.py ]"
+            for d in search_dirs
+        )
+        checks.append(f"if {conds}; then printf '%s\\n' {q_pkg}; fi")
+
+    try:
+        res = await sandbox._runtime_call(
+            sandbox.runtime.exec,
+            "; ".join(checks),
+            retry_policy=RetryPolicy.SAFE,
+        )
+        if getattr(res, "exit_code", 0) != 0:
+            logger.warning(
+                "Local workspace module probe failed; skipping auto-install",
+                packages=remaining,
+                exit_code=getattr(res, "exit_code", None),
+                stderr=getattr(res, "stderr", "") or "",
+            )
+            return []
+        stdout = getattr(res, "stdout", "") or ""
+        found_local = {
+            line.strip() for line in stdout.splitlines() if line.strip()
+        }
+        if found_local:
+            logger.info(
+                "Skipping auto-install for local workspace directory/module",
+                skipped=sorted(found_local),
+            )
+            return [pkg for pkg in remaining if pkg not in found_local]
+    except Exception:
+        logger.warning(
+            "Local workspace module probe raised an error; skipping auto-install",
+            packages=remaining,
+            exc_info=True,
+        )
+        return []
+    return remaining
+
+
 def _detect_missing_imports(sandbox: "PTCSandbox", stderr: str) -> list[str]:
     """Extract missing module names from the executed script's own traceback.
 
@@ -528,8 +628,11 @@ def _detect_missing_imports(sandbox: "PTCSandbox", stderr: str) -> list[str]:
         matches.extend(re.findall(pattern, final_tb))
 
     # Handle submodule imports (e.g., "foo.bar" -> "foo")
-    # Also deduplicate
-    base_packages = list({m.split(".")[0] for m in matches})
+    # DALTON-HOOK(sandbox-pip-system): also deduplicate and filter known workspace/layout folder names
+    known_local = _known_local_names(sandbox) if sandbox is not None else set()
+    base_packages = [
+        pkg for pkg in {m.split(".")[0] for m in matches} if pkg not in known_local
+    ]
 
     if base_packages:
         logger.info(
@@ -557,7 +660,8 @@ async def _install_package(sandbox: "PTCSandbox", package: str) -> bool:
             # Quoted at the sink as well as filtered at the parser: this is the
             # only place a caller-supplied name becomes shell text, so it should
             # be safe for callers that don't come through _detect_missing_imports.
-            f"uv pip install -q {shlex.quote(package)}",
+            # DALTON-HOOK(sandbox-pip-system): pass --system to uv pip install.
+            f"uv pip install --system -q {shlex.quote(package)}",
             retry_policy=RetryPolicy.SAFE,
         )
         exit_code = getattr(result, "exit_code", 1)

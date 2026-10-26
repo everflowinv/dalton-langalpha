@@ -154,9 +154,13 @@ class FmpQuotaExhausted(FMPRequestError):
             if reset_at
             else "the next 3 PM US/Eastern"
         )
+        # DALTON-HOOK(market-data-fallback): FmpQuotaExhausted is raised before
+        # any FMP request while the quota marker holds — including calls in a
+        # multi-provider chain (e.g. news_data falling back to yfinance), so do
+        # not claim that only FMP serves the data.
         super().__init__(
-            f"FMP daily quota is exhausted; only FMP serves this data, "
-            f"and its quota resets at {when}",
+            f"FMP daily quota is exhausted (quota resets at {when}); "
+            f"alternative providers such as yfinance will be used where available",
             status_code=429,
         )
         self.reset_at = reset_at

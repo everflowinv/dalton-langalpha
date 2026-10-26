@@ -227,7 +227,11 @@ def task_report_message(
             "by a lost worker and can be resumed: "
             "RunWorkflow(workflow=<name>, params=<same as before>, "
             f"resume='{report.task_id}') replays completed dispatches from "
-            "its journal."
+            "its journal. When continuing (or when the user asks to continue "
+            f"/ '继续'), you MUST call RunWorkflow(workflow=<same name>, "
+            f"params=<same as before>, resume='{report.task_id}') — do NOT "
+            "manually re-dispatch Task subagents (such as data-prep or "
+            "dalton-evidence)."
         )
     # DALTON-HOOK(i18n): Prevent language drift after English subagent completion notices
     return (

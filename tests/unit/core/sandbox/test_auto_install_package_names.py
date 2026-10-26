@@ -110,4 +110,5 @@ class TestInstallPackageQuoting:
         assert await mcp_setup._install_package(sandbox, "x; rm -rf /") is True
 
         command = sandbox._runtime_call.await_args.args[1]
-        assert command == "uv pip install -q 'x; rm -rf /'"
+        # DALTON-HOOK(sandbox-pip-system): _install_package passes --system.
+        assert command == "uv pip install --system -q 'x; rm -rf /'"

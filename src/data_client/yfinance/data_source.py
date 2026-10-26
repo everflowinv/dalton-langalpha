@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -194,25 +194,149 @@ def _print_time_ms(ticker: Any) -> int | None:
     return None
 
 
+# DALTON-HOOK(yfinance-prev-close): fallback to 5d daily history when fast_info raises KeyError (e.g. 'currentTradingPeriod').
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _bar_date_str(idx: Any) -> str | None:
+    if hasattr(idx, "strftime"):
+        try:
+            return idx.strftime("%Y-%m-%d")
+        except Exception:
+            return None
+    return None
+
+
+def _session_close_ms_for_bar(sym: str, bar_date: str | None) -> int | None:
+    if not bar_date:
+        return None
+    try:
+        ref = to_canonical(sym, asset_class=AssetClass.EQUITY)
+        cal = get_calendar(ref.calendar_id)
+        close_ms = cal.session_close_ms(date.fromisoformat(bar_date))
+        if close_ms is not None and close_ms > 0:
+            return close_ms
+    except Exception:
+        pass
+    try:
+        dt_close = datetime.combine(
+            date.fromisoformat(bar_date),
+            datetime.min.time().replace(hour=16),
+            tzinfo=_ET,
+        )
+        return int(dt_close.timestamp() * 1000)
+    except Exception:
+        return None
+
+
+def _snapshot_from_history(sym: str, ticker: Any) -> dict[str, Any] | None:
+    """Build a closing snapshot from ``ticker.history(period="5d", auto_adjust=False)`` when ``fast_info`` fails."""
+    df = ticker.history(period="5d", auto_adjust=False)
+    if df is None or getattr(df, "empty", True):
+        return None
+    df = df.copy().dropna(subset=["Close"])
+    if df.empty:
+        return None
+    rows = list(df.iterrows())
+    now_utc = _now_utc()
+    now_ms = int(now_utc.timestamp() * 1000)
+
+    # Drop bars whose session has not closed yet. The close comes from the
+    # exchange calendar (early closes, non-US hours), 16:00 ET if unknown.
+    while rows:
+        cand_idx, _ = rows[-1]
+        cand_close_ms = _session_close_ms_for_bar(sym, _bar_date_str(cand_idx))
+        if cand_close_ms is not None and cand_close_ms > now_ms:
+            rows.pop()
+            continue
+        break
+
+    if not rows:
+        return None
+
+    last_idx, last_row = rows[-1]
+    get_last = last_row.get if hasattr(last_row, "get") else lambda k: last_row[k]
+    price = _finite(get_last("Close"))
+    if price is None or price <= 0:
+        return None
+    prev: float | None = None
+    if len(rows) >= 2:
+        _, prev_row = rows[-2]
+        get_prev = prev_row.get if hasattr(prev_row, "get") else lambda k: prev_row[k]
+        prev = _finite(get_prev("Close"))
+    change = price - prev if prev else 0.0
+    change_pct = (change / prev * 100) if prev else 0.0
+    open_ = _finite(get_last("Open"))
+    high = _finite(get_last("High"))
+    low = _finite(get_last("Low"))
+    volume = _finite(get_last("Volume"))
+    bar_date = _bar_date_str(last_idx)
+    as_of_ms = _session_close_ms_for_bar(sym, bar_date)
+    if as_of_ms is None and hasattr(last_idx, "timestamp"):
+        try:
+            ts = int(last_idx.timestamp() * 1000)
+            if ts > 0:
+                as_of_ms = ts
+        except Exception:
+            as_of_ms = None
+    if as_of_ms is not None and as_of_ms > now_ms:
+        as_of_ms = now_ms
+    snap = {
+        "symbol": sym,
+        "name": None,
+        "price": round(price, 4),
+        "regular_close": round(price, 4),
+        "change": round(change, 4),
+        "change_percent": round(change_pct, 4),
+        "regular_trading_change": round(change, 4),
+        "regular_trading_change_percent": round(change_pct, 4),
+        "previous_close": round(prev, 4) if prev is not None else None,
+        "open": round(open_, 4) if open_ is not None else None,
+        "high": round(high, 4) if high is not None else None,
+        "low": round(low, 4) if low is not None else None,
+        "volume": int(volume) if volume is not None else 0,
+        "market_status": "closed",
+        "early_trading_change_percent": None,
+        "late_trading_change_percent": None,
+        "as_of": as_of_ms,
+        "regular_as_of": as_of_ms,
+        "regular_trading_date": bar_date,
+        "regular_only": True,
+    }
+    return enrich_yfinance_snapshot_extended_hours(snap, sym, ticker)  # DALTON-HOOK(extended-hours-quotes)
+
+
 def _fetch_single_snapshot(sym: str) -> dict[str, Any] | None:
     """Fetch snapshot for a single symbol. Returns None on failure."""
     try:
         ticker = yahoo_ticker(sym)
-        fi = ticker.fast_info
-        # NaN is truthy, so `nan or 0` stays NaN — route every numeric field
-        # through _finite() so a snapshot can never carry non-finite floats.
-        # No finite last price means no quote: a None snapshot beats a $0.00
-        # phantom; missing optional fields stay None rather than becoming 0.
-        price = _finite(fi.get("lastPrice"))
-        if price is None:
-            return None
-        prev = regular_previous_close(fi)  # DALTON-HOOK(yfinance-prev-close)
-        change = price - prev if prev else 0.0
-        change_pct = (change / prev * 100) if prev else 0.0
-        open_ = _finite(fi.get("open"))
-        high = _finite(fi.get("dayHigh"))
-        low = _finite(fi.get("dayLow"))
-        volume = _finite(fi.get("lastVolume"))
+        try:
+            fi = ticker.fast_info
+            # NaN is truthy, so `nan or 0` stays NaN — route every numeric field
+            # through _finite() so a snapshot can never carry non-finite floats.
+            # No finite last price means no quote: a None snapshot beats a $0.00
+            # phantom; missing optional fields stay None rather than becoming 0.
+            raw_last = fi.get("lastPrice")
+            if raw_last is None and hasattr(fi, "last_price"):
+                raw_last = fi.last_price
+            price = _finite(raw_last)
+            if price is None:
+                return None
+            prev = regular_previous_close(fi)  # DALTON-HOOK(yfinance-prev-close)
+            change = price - prev if prev else 0.0
+            change_pct = (change / prev * 100) if prev else 0.0
+            open_ = _finite(fi.get("open"))
+            high = _finite(fi.get("dayHigh"))
+            low = _finite(fi.get("dayLow"))
+            volume = _finite(fi.get("lastVolume"))
+        except KeyError as key_err:  # DALTON-HOOK(yfinance-prev-close)
+            logger.info(
+                "yfinance.snapshot.fast_info_key_error | symbol=%s key=%s; falling back to 5d history close",
+                sym,
+                key_err,
+            )
+            return _snapshot_from_history(sym, ticker)
         snap = {
             "symbol": sym,
             "name": None,

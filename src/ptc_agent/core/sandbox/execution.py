@@ -310,6 +310,14 @@ async def execute(
         # Auto-install missing packages and retry if enabled
         if not success and auto_install and max_retries > 0:
             missing_packages = sandbox._detect_missing_imports(stderr)
+            # DALTON-HOOK(sandbox-pip-system): skip names matching local
+            # workspace directories or modules before calling uv pip install.
+            if missing_packages:
+                from ptc_agent.core.sandbox import mcp_setup as _mcp_setup
+
+                missing_packages = await _mcp_setup._filter_local_packages(
+                    sandbox, missing_packages
+                )
             if missing_packages:
                 logger.info(
                     "Attempting auto-install and retry",

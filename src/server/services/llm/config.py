@@ -428,6 +428,8 @@ async def resolve_llm_config(
         fast_mode=fast_mode,
         user_defined=user_defined,
     )
-    demote_clientless(config)
+    # DALTON-HOOK(subagent-model-pin): only inspect subagents compiled for this
+    # turn's role on the primary slot.
+    demote_clientless(config, role=role, slot=slot)
 
     return config

@@ -67,6 +67,9 @@ export function WorkspaceTrackingToggle({
   }
 
   const status = data?.status ?? 'disabled';
+  if (status === 'not_applicable') {
+    return null;
+  }
   const isEnabled = status === 'enabled';
   const isIncomplete = status === 'incomplete';
   const canEdit = data?.can_edit ?? !readOnly;
