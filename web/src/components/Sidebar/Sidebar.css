@@ -331,6 +331,10 @@ html.desktop-mac .sidebar-history {
   min-height: 0;
   display: flex;
   flex-direction: column;
+  /* DALTON-HOOK(team-sharing): make .sidebar-tree the single vertical scroll
+     container so NavigationPanel and TeamWorkspacesSection scroll together */
+  overflow-y: auto;
+  overflow-x: hidden;
 }
 
 /* NavigationPanel doubles as the overlay drawer on mobile chat; embedded in
@@ -338,6 +342,25 @@ html.desktop-mac .sidebar-history {
 .sidebar--panel .nav-panel {
   background: transparent;
   border-right: none;
+  /* DALTON-HOOK(team-sharing): size to content instead of clamping to 100% of
+     .sidebar-tree so TeamWorkspacesSection stays reachable right below */
+  height: auto;
+  flex-shrink: 0;
+}
+
+/* DALTON-HOOK(team-sharing): release NavigationPanel's internal ScrollArea in
+   the desktop panel so .sidebar-tree owns scrolling (MobileNavDrawer has no
+   .sidebar--panel ancestor and keeps its internal ScrollArea). */
+.sidebar--panel .nav-panel > .overflow-hidden,
+.sidebar--panel .nav-panel > .overflow-hidden > .overflow-auto {
+  overflow: visible;
+  height: auto;
+  flex: none;
+}
+
+/* DALTON-HOOK(team-sharing): prevent TeamWorkspacesSection from shrinking inside .sidebar-tree */
+.sidebar-team-section {
+  flex-shrink: 0;
 }
 
 .sidebar-panel-bottom {

@@ -8,6 +8,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 // (rebuilt in beforeEach) keep Settings' prefs-sync effect from looping.
 const h = vi.hoisted(() => ({
   platformMode: false,
+  daltonAuth: false, // DALTON-HOOK(hide-experiments)
   mutateAsync: vi.fn(async (_payload: unknown) => ({})),
   user: null as Record<string, unknown> | null,
   preferences: null as Record<string, unknown> | null,
@@ -18,6 +19,19 @@ vi.mock('@/config/hostMode', () => ({
   get isPlatformMode() {
     return h.platformMode;
   },
+}));
+
+// DALTON-HOOK(hide-experiments): allow toggling Dalton auth mode in Settings tests
+vi.mock('@/config/daltonAuth', () => ({
+  get isDaltonAuth() {
+    return h.daltonAuth;
+  },
+}));
+
+// DALTON-HOOK(hide-experiments): stub useFeatures so ExperimentsTab renders without network
+vi.mock('@/hooks/useFeatures', () => ({
+  useFeatures: () => ({ data: [], isLoading: false }),
+  useSetFeatureOverride: () => ({ mutateAsync: vi.fn() }),
 }));
 
 vi.mock('@/contexts/AuthContext', () => ({
@@ -122,6 +136,7 @@ function renderPreferencesTab() {
 
 beforeEach(() => {
   h.platformMode = false;
+  h.daltonAuth = false; // DALTON-HOOK(hide-experiments)
   h.validModelNames = new Set<string>();
   h.mutateAsync.mockClear();
   h.mutateAsync.mockResolvedValue({});
@@ -214,5 +229,34 @@ describe('Settings — Output format', () => {
     expect(screen.getByText('Approvals')).toBeInTheDocument();
     expect(screen.queryByText('Trading permissions')).not.toBeInTheDocument();
     expect(screen.queryByRole('radiogroup', { name: 'Trading permissions' })).not.toBeInTheDocument();
+  });
+
+  // DALTON-HOOK(hide-experiments): Experiments tab is hidden in Dalton mode and falls back to default tab
+  it('hides Experiments tab button and ExperimentsTab in Dalton mode and falls back to userInfo on ?tab=experiments', async () => {
+    h.daltonAuth = true;
+    h.user = {
+      id: 'u-1',
+      email: 'tester@example.com',
+      name: 'Tester',
+      onboarding_completed: true,
+    };
+    h.preferences = { agent_preference: {} };
+
+    // 1. Direct URL ?tab=experiments falls back to default 'userInfo' tab
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    });
+    const { unmount } = render(
+      <QueryClientProvider client={queryClient}>
+        <MemoryRouter initialEntries={['/settings?tab=experiments']}>
+          <Settings />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    expect(screen.queryByRole('button', { name: /Experiments|实验功能/i })).not.toBeInTheDocument();
+    expect(screen.queryByText(/Early-access features still in development/i)).not.toBeInTheDocument();
+    expect(await screen.findByDisplayValue('Tester')).toBeInTheDocument();
+    unmount();
   });
 });
