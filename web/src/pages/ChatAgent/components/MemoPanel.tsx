@@ -27,11 +27,13 @@ import {
   HoverCardTrigger,
 } from '@/components/ui/hover-card';
 import { Loader } from '@/components/ui/loader';
+// DALTON-HOOK(multi-file-upload): uploads bypass useUploadUserMemo — its
+// per-call list invalidation would refetch once per file; this panel uploads
+// serially and invalidates once per batch (see doUpload).
 import {
   useDeleteUserMemo,
   useReadUserMemo,
   useRegenerateUserMemo,
-  useUploadUserMemo,
   useUserMemoList,
   useWriteUserMemo,
 } from '../hooks/useMemo';
@@ -45,10 +47,12 @@ import {
   deleteUserMemo,
   triggerUserMemoDownload,
   downloadUserMemoBlobUrl,
+  uploadUserMemo,
   type MemoEntry,
   type MemoMetadataStatus,
 } from '../utils/api';
 import Markdown from './Markdown';
+import type { UploadBatchStatus } from './filePanel/useFileUpload';
 import { MEMO_USER_DIR } from '../utils/agentPaths';
 import type { FileLocation, OpenFileHandler } from '../utils/fileLocation';
 import './FilePanel.css';
@@ -323,7 +327,8 @@ export default function MemoPanel({ targetKey, onTargetHandled, onOpenFile }: Me
   );
 
   const list = useUserMemoList(true);
-  const uploadMutation = useUploadUserMemo();
+  // DALTON-HOOK(multi-file-upload): useUploadUserMemo is gone from here —
+  // doUpload's queue owns uploads and invalidates the list once per batch.
   const deleteMutation = useDeleteUserMemo();
   const writeMutation = useWriteUserMemo();
   const regenerateMutation = useRegenerateUserMemo();
@@ -445,6 +450,29 @@ export default function MemoPanel({ targetKey, onTargetHandled, onOpenFile }: Me
   const [isDragOver, setIsDragOver] = useState(false);
   const dragCounterRef = useRef(0);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  // DALTON-HOOK(multi-file-upload): position of the serial upload batch
+  const [uploadBatch, setUploadBatch] = useState<UploadBatchStatus | null>(null);
+  // DALTON-HOOK(multi-file-upload): one serial queue serves picks and drops
+  // alike — files arriving mid-run join the back of the line instead of
+  // racing a second loop — plus a run guard the unmount effect bumps so a
+  // run that outlives the panel writes neither state nor a list refresh.
+  const uploadQueueRef = useRef<File[]>([]);
+  const uploadProcessingRef = useRef(false);
+  const uploadRunGuardRef = useRef(0);
+  // Files finished by the current loop (uploaded + failed), kept in a ref so
+  // an enqueue mid-run can recompute the announced total without the loop's
+  // locals.
+  const uploadDoneRef = useRef(0);
+
+  // Cleanup on unmount drops everything not started and strands the in-flight
+  // upload — it finishes on the wire, but its late result reaches no state
+  // and triggers no list invalidation.
+  useEffect(() => () => {
+    uploadRunGuardRef.current += 1;
+    uploadQueueRef.current = [];
+    setUploadBatch(null);
+    setUploadError(null);
+  }, []);
 
   const sortedEntries = useMemo(
     () => sortByCreatedAsc(list.data?.entries ?? []),
@@ -511,33 +539,93 @@ export default function MemoPanel({ targetKey, onTargetHandled, onOpenFile }: Me
 
   // --- Upload handlers -----------------------------------------------------
 
+  // DALTON-HOOK(multi-file-upload): files go up one at a time so concurrent
+  // uploads never contend for the backend; each failure is recorded per file
+  // and the rest continue. Mid-run arrivals share this loop — and its
+  // failures list, so the closing summary covers the whole queue — and the
+  // list invalidates once after the entire batch.
   const doUpload = useCallback(
-    async (file: File) => {
+    async (files: File[]) => {
+      if (files.length === 0) return;
       setUploadError(null);
-      if (!isAcceptedFile(file)) {
-        setUploadError(t('memoPanel.errors.unsupportedType'));
+      uploadQueueRef.current.push(...files);
+      if (uploadProcessingRef.current) {
+        // The running loop drains the queue; rewrite the announced total now
+        // (done so far + the file in flight + the queue behind it) instead of
+        // only when the loop reaches the newly queued files.
+        setUploadBatch((b) => (b
+          ? { ...b, total: uploadDoneRef.current + 1 + uploadQueueRef.current.length }
+          : b));
         return;
       }
-      if (file.size > MAX_UPLOAD_BYTES) {
-        const mb = (file.size / (1024 * 1024)).toFixed(1);
-        setUploadError(t('memoPanel.errors.fileTooLarge', { size: mb }));
-        return;
-      }
+      uploadProcessingRef.current = true;
+      uploadDoneRef.current = 0;
+      const guard = uploadRunGuardRef.current;
+      const failures: { name: string; reason: string }[] = [];
+      let uploaded = 0;
+      let abandoned = false;
       try {
-        await uploadMutation.mutateAsync(file);
-      } catch (err) {
-        setUploadError(
-          errToString(err) || t('memoPanel.errors.uploadFailed'),
-        );
+        while (uploadQueueRef.current.length > 0) {
+          const file = uploadQueueRef.current.shift()!;
+          // current counts finished files plus the one now starting; total
+          // adds what is still queued, so a mid-run drop grows the total.
+          const done = uploaded + failures.length;
+          uploadDoneRef.current = done;
+          setUploadBatch({
+            current: done + 1,
+            total: done + uploadQueueRef.current.length + 1,
+            fileName: file.name,
+            percent: 0,
+          });
+          if (!isAcceptedFile(file)) {
+            failures.push({ name: file.name, reason: t('memoPanel.errors.unsupportedType') });
+            continue;
+          }
+          if (file.size > MAX_UPLOAD_BYTES) {
+            const mb = (file.size / (1024 * 1024)).toFixed(1);
+            failures.push({ name: file.name, reason: t('memoPanel.errors.fileTooLarge', { size: mb }) });
+            continue;
+          }
+          try {
+            await uploadUserMemo(file, (pct) => {
+              if (uploadRunGuardRef.current !== guard) return;
+              setUploadBatch((b) => (b ? { ...b, percent: pct } : b));
+            });
+            uploaded++;
+          } catch (err) {
+            if (uploadRunGuardRef.current === guard) {
+              failures.push({ name: file.name, reason: errToString(err) || t('memoPanel.errors.uploadFailed') });
+            }
+          }
+          if (uploadRunGuardRef.current !== guard) {
+            abandoned = true;
+            break;
+          }
+        }
+      } finally {
+        uploadProcessingRef.current = false;
+        if (!abandoned) {
+          setUploadBatch(null);
+          if (uploaded > 0) {
+            queryClient.invalidateQueries({ queryKey: queryKeys.memo.all });
+          }
+          if (failures.length > 0) {
+            setUploadError(t('memoPanel.errors.uploadFailedSummary', {
+              count: failures.length,
+              details: failures.map((f) => `${f.name} (${f.reason})`).join('; '),
+            }));
+          }
+        }
       }
     },
-    [uploadMutation, t],
+    [t, queryClient],
   );
 
   const handleFileInputChange = useCallback(
     (e: React.ChangeEvent<HTMLInputElement>) => {
-      const file = e.target.files?.[0];
-      if (file) void doUpload(file);
+      // DALTON-HOOK(multi-file-upload): the picker is multi-select; take every file
+      const files = Array.from(e.target.files ?? []);
+      if (files.length > 0) void doUpload(files);
       if (fileInputRef.current) fileInputRef.current.value = '';
     },
     [doUpload],
@@ -570,8 +658,9 @@ export default function MemoPanel({ targetKey, onTargetHandled, onOpenFile }: Me
       e.stopPropagation();
       dragCounterRef.current = 0;
       setIsDragOver(false);
-      const file = e.dataTransfer.files?.[0];
-      if (file) void doUpload(file);
+      // DALTON-HOOK(multi-file-upload): a drop can carry many files
+      const files = Array.from(e.dataTransfer.files ?? []);
+      if (files.length > 0) void doUpload(files);
     },
     [doUpload],
   );
@@ -1084,6 +1173,8 @@ export default function MemoPanel({ targetKey, onTargetHandled, onOpenFile }: Me
               >
                 <CheckSquare className="h-4 w-4" />
               </button>
+              {/* DALTON-HOOK(multi-file-upload): disabled across the whole
+                  serial batch, not per mutation */}
               <button
                 onClick={() => fileInputRef.current?.click()}
                 className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded text-xs font-medium"
@@ -1091,22 +1182,24 @@ export default function MemoPanel({ targetKey, onTargetHandled, onOpenFile }: Me
                   backgroundColor: 'var(--color-btn-primary-bg)',
                   color: 'var(--color-btn-primary-text)',
                 }}
-                disabled={uploadMutation.isPending}
+                disabled={uploadBatch !== null}
               >
-                {uploadMutation.isPending ? (
+                {uploadBatch !== null ? (
                   <span aria-hidden="true" className="shrink-0">
                     <Loader size={14} className="text-current" />
                   </span>
                 ) : (
                   <Upload className="h-3.5 w-3.5" />
                 )}
-                {uploadMutation.isPending
+                {uploadBatch !== null
                   ? t('memoPanel.uploading')
                   : t('memoPanel.uploadButton')}
               </button>
+              {/* DALTON-HOOK(multi-file-upload): multi-select picker */}
               <input
                 ref={fileInputRef}
                 type="file"
+                multiple
                 className="hidden"
                 accept={ACCEPT_ATTR}
                 onChange={handleFileInputChange}
@@ -1115,6 +1208,21 @@ export default function MemoPanel({ targetKey, onTargetHandled, onOpenFile }: Me
           )}
         </div>
       </div>
+
+      {uploadBatch && (
+        // DALTON-HOOK(multi-file-upload): which file of the batch is up now
+        <div
+          className="px-3 py-2 text-xs"
+          style={{ color: 'var(--color-text-secondary)' }}
+        >
+          {t('memoPanel.uploadingNth', {
+            current: uploadBatch.current,
+            total: uploadBatch.total,
+            name: uploadBatch.fileName,
+            percent: uploadBatch.percent,
+          })}
+        </div>
+      )}
 
       {uploadError && (
         <div

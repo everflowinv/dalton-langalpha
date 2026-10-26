@@ -3,23 +3,30 @@ import type { Mock } from 'vitest';
 import { screen, waitFor, fireEvent } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import '@testing-library/jest-dom';
-import { renderWithProviders } from '@/test/utils';
+// DALTON-HOOK(multi-file-upload): multi-upload tests assert the batch
+// invalidates the memo list exactly once, via the injected query client.
+import { renderWithProviders, createTestQueryClient } from '@/test/utils';
 
 // ---------------------------------------------------------------------------
 // Mocks — keep MemoPanel mountable in jsdom by stubbing heavy deps.
 // ---------------------------------------------------------------------------
 
+// DALTON-HOOK(multi-file-upload): passthrough stand-in, but with the real
+// summary template baked in for the key whose interpolated content the
+// multi-upload tests lock (count, file names, reasons). Keys without an entry
+// come through unchanged, as before.
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({ t: (key: string, opts?: Record<string, unknown>) => {
-    if (opts && typeof opts === 'object') {
-      // Substitute simple {{var}} interpolations so we can find rendered text.
-      let out = key;
-      for (const [k, v] of Object.entries(opts)) {
-        out = out.replace(new RegExp(`{{\\s*${k}\\s*}}`, 'g'), String(v));
-      }
-      return out;
+    const templates: Record<string, string> = {
+      'memoPanel.errors.uploadFailedSummary': '{{count}} 个文件上传失败：{{details}}',
+    };
+    const template = templates[key] ?? key;
+    if (!opts) return template;
+    let out = template;
+    for (const [k, v] of Object.entries(opts)) {
+      out = out.replace(new RegExp(`{{\\s*${k}\\s*}}`, 'g'), String(v));
     }
-    return key;
+    return out;
   } }),
 }));
 
@@ -81,12 +88,17 @@ import {
   regenerateUserMemo,
   triggerUserMemoDownload,
   downloadUserMemoBlobUrl,
+  type MemoUploadResponse,
 } from '@/pages/ChatAgent/utils/api';
 import MemoPanel from '../MemoPanel';
 
 const mockList = listUserMemos as Mock;
 const mockRead = readUserMemo as Mock;
-const mockUpload = uploadUserMemo as Mock;
+// DALTON-HOOK(multi-file-upload): typed mock — implementations return a
+// MemoUploadResponse, matching the real uploadUserMemo signature.
+const mockUpload = vi.mocked(uploadUserMemo);
+const uploadResponse = (name: string): MemoUploadResponse =>
+  ({ key: name, original_filename: name, metadata_status: 'pending' });
 const mockWrite = writeUserMemo as Mock;
 const mockDelete = deleteUserMemo as Mock;
 const mockRegen = regenerateUserMemo as Mock;
@@ -501,9 +513,9 @@ describe('MemoPanel — drag-and-drop upload', () => {
     });
 
     await waitFor(() => expect(mockUpload).toHaveBeenCalledTimes(1));
-    // doUpload calls uploadMutation.mutateAsync(file). The hook routes a bare
-    // File into uploadUserMemo(file) (no extra args).
-    expect(mockUpload).toHaveBeenCalledWith(file);
+    // DALTON-HOOK(multi-file-upload): doUpload calls uploadUserMemo directly
+    // (file, onProgress) so the batch can invalidate the list once at the end.
+    expect(mockUpload).toHaveBeenCalledWith(file, expect.anything());
   });
 
   it('rejects unsupported file types with an inline error', async () => {
@@ -524,8 +536,165 @@ describe('MemoPanel — drag-and-drop upload', () => {
       dataTransfer: { types: ['Files'], files: [badFile] },
     });
 
-    expect(await screen.findByText('memoPanel.errors.unsupportedType')).toBeInTheDocument();
+    // DALTON-HOOK(multi-file-upload): rejections are collected per file and
+    // surface as one summary strip naming the file and its reason.
+    expect(
+      await screen.findByText('1 个文件上传失败：image.png (memoPanel.errors.unsupportedType)'),
+    ).toBeInTheDocument();
     expect(mockUpload).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// DALTON-HOOK(multi-file-upload): serial multi-file upload — per-file
+// failures, one list refresh per batch.
+// ---------------------------------------------------------------------------
+
+describe('MemoPanel — multi-file upload', () => {
+  it('drops several files → uploads each serially and refreshes the memo list once', async () => {
+    mockList.mockResolvedValue({ entries: [], truncated: false });
+    mockUpload.mockImplementation(async () => uploadResponse('queued.md'));
+
+    const client = createTestQueryClient();
+    const invalidateSpy = vi.spyOn(client, 'invalidateQueries');
+    const { container } = renderWithProviders(<MemoPanel />, { queryClient: client });
+
+    await waitFor(() =>
+      expect(screen.getByText('memoPanel.empty.title')).toBeInTheDocument(),
+    );
+
+    const dropTarget = container.firstChild as HTMLElement;
+    const files = [
+      new File(['a'], 'a.md', { type: 'text/markdown' }),
+      new File(['b'], 'b.md', { type: 'text/markdown' }),
+      new File(['c'], 'c.md', { type: 'text/markdown' }),
+    ];
+
+    fireEvent.drop(dropTarget, {
+      dataTransfer: { types: ['Files'], files },
+    });
+
+    await waitFor(() => expect(mockUpload).toHaveBeenCalledTimes(3));
+    // The invalidate fires once after the whole batch settles — waiting for it
+    // here also guarantees the batch has finished before the count is read.
+    await waitFor(() => expect(invalidateSpy).toHaveBeenCalledTimes(1));
+    // No failure summary when everything went up.
+    expect(screen.queryByText('memoPanel.errors.uploadFailedSummary')).not.toBeInTheDocument();
+  });
+
+  it('a rejected file does not stop the batch; failures are summarised per file', async () => {
+    mockList.mockResolvedValue({ entries: [], truncated: false });
+    mockUpload.mockImplementation(async (file: File) => {
+      if (file.name === 'broken.md') throw new Error('boom');
+      return uploadResponse(file.name);
+    });
+
+    const client = createTestQueryClient();
+    const invalidateSpy = vi.spyOn(client, 'invalidateQueries');
+    const { container } = renderWithProviders(<MemoPanel />, { queryClient: client });
+
+    await waitFor(() =>
+      expect(screen.getByText('memoPanel.empty.title')).toBeInTheDocument(),
+    );
+
+    const dropTarget = container.firstChild as HTMLElement;
+    fireEvent.drop(dropTarget, {
+      dataTransfer: {
+        types: ['Files'],
+        files: [
+          new File(['1'], 'first.md', { type: 'text/markdown' }),
+          new File(['2'], 'broken.md', { type: 'text/markdown' }),
+          new File(['3'], 'last.md', { type: 'text/markdown' }),
+        ],
+      },
+    });
+
+    // The failed file is not the end of the batch.
+    await waitFor(() => expect(mockUpload).toHaveBeenCalledTimes(3));
+    // The summary locks its content: count, file name, and the raw error.
+    expect(
+      await screen.findByText('1 个文件上传失败：broken.md (boom)'),
+    ).toBeInTheDocument();
+    // The summary only renders after the loop, so the batch's single list
+    // invalidation has already happened by now.
+    expect(invalidateSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('uploads stay serial: the second file only starts after the first resolves', async () => {
+    mockList.mockResolvedValue({ entries: [], truncated: false });
+    let active = 0;
+    let maxConcurrent = 0;
+    mockUpload.mockImplementation(async () => {
+      active++;
+      maxConcurrent = Math.max(maxConcurrent, active);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      active--;
+      return uploadResponse('queued.md');
+    });
+
+    const client = createTestQueryClient();
+    const invalidateSpy = vi.spyOn(client, 'invalidateQueries');
+    const { container } = renderWithProviders(<MemoPanel />, { queryClient: client });
+
+    await waitFor(() =>
+      expect(screen.getByText('memoPanel.empty.title')).toBeInTheDocument(),
+    );
+
+    const dropTarget = container.firstChild as HTMLElement;
+    fireEvent.drop(dropTarget, {
+      dataTransfer: {
+        types: ['Files'],
+        files: [
+          new File(['1'], 'one.md', { type: 'text/markdown' }),
+          new File(['2'], 'two.md', { type: 'text/markdown' }),
+        ],
+      },
+    });
+
+    // Both files went up, and the batch's single invalidation (which only
+    // fires after the loop) means the concurrency peak is final.
+    await waitFor(() => expect(mockUpload).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(invalidateSpy).toHaveBeenCalledTimes(1));
+    expect(maxConcurrent).toBe(1);
+  });
+
+  // DALTON-HOOK(multi-file-upload): unmount drops queued files; the in-flight
+  // upload finishes on the wire but writes no state and invalidates nothing.
+  it('unmounting mid-upload drops queued files and never invalidates the list', async () => {
+    mockList.mockResolvedValue({ entries: [], truncated: false });
+    let release: () => void = () => {};
+    mockUpload.mockImplementation(() => new Promise<MemoUploadResponse>((resolve) => {
+      release = () => resolve(uploadResponse('one.md'));
+    }));
+
+    const client = createTestQueryClient();
+    const invalidateSpy = vi.spyOn(client, 'invalidateQueries');
+    const { container, unmount } = renderWithProviders(<MemoPanel />, { queryClient: client });
+
+    await waitFor(() =>
+      expect(screen.getByText('memoPanel.empty.title')).toBeInTheDocument(),
+    );
+
+    const dropTarget = container.firstChild as HTMLElement;
+    fireEvent.drop(dropTarget, {
+      dataTransfer: {
+        types: ['Files'],
+        files: [
+          new File(['1'], 'one.md', { type: 'text/markdown' }),
+          new File(['2'], 'two.md', { type: 'text/markdown' }),
+        ],
+      },
+    });
+    await waitFor(() => expect(mockUpload).toHaveBeenCalledTimes(1));
+
+    unmount();
+    release();
+    // Let the in-flight upload's resolution reach the now-guarded loop.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    // two.md never started; one.md's late success invalidated nothing.
+    expect(mockUpload).toHaveBeenCalledTimes(1);
+    expect(invalidateSpy).not.toHaveBeenCalled();
   });
 });
 
