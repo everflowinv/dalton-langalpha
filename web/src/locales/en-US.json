@@ -5669,6 +5669,7 @@
       "levelRo": "Read Only",
       "levelHidden": "Hidden",
       "homeNote": "Home workspace is never open to others",
+      "externalOwnerNote": "External members' workspaces are visible to admins only; sharing settings do not apply",
       "nextPhaseNotice": "Available in the next phase"
     }
   }

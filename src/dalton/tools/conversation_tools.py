@@ -9,9 +9,14 @@ from typing import Any, Optional
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool, tool
 
+from src.dalton.access_tiers import get_user_tier
 from src.dalton.conversations.search import hybrid_search_conversations
 
 logger = logging.getLogger(__name__)
+
+EXTERNAL_CONVERSATION_SEARCH_FORBIDDEN_MESSAGE = (
+    "外部成员不能检索团队对话归档；搜索自己的对话请用全局搜索。"
+)
 
 
 def _extract_caller_identity(
@@ -41,6 +46,7 @@ def create_conversation_tools() -> list[BaseTool]:
         config: RunnableConfig,
     ) -> str:
         """Use when asked about any company, topic, or sector to check the team's prior views, model assumptions, decisions, and open todos first, or when verbatim quotes and OpenClaw provenance are needed.
+        Admins and internal members only: external members are refused outright (tell the user to use global search on their own conversations instead of retrying).
         Covers `source_type=conversation` discussion cards only, not external filings or research documents; `limit` is capped at 50.
 
         Args:
@@ -66,6 +72,24 @@ def create_conversation_tools() -> list[BaseTool]:
                     "ok": False,
                     "error": "unauthenticated",
                     "message": "conversation_search requires an authenticated user turn (missing user_id in RunnableConfig).",
+                },
+                ensure_ascii=False,
+            )
+
+        # The archive is the whole team's conversation history; external
+        # members cannot search it, their own threads stay reachable via the
+        # global search UI.
+        if await get_user_tier(user_id) == "external":
+            logger.info(
+                "[dalton.conversations.audit] rejected external conversation_search call (user_id=%s workspace_id=%s)",
+                user_id,
+                workspace_id or "-",
+            )
+            return json.dumps(
+                {
+                    "ok": False,
+                    "error": "external_member_forbidden",
+                    "message": EXTERNAL_CONVERSATION_SEARCH_FORBIDDEN_MESSAGE,
                 },
                 ensure_ascii=False,
             )

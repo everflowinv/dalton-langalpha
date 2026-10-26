@@ -1368,6 +1368,14 @@ async def test_hybrid_search_rrf_fusion_and_conversation_search_tool(
     monkeypatch.setattr(search_mod, "embed_query_via_bridge", mock_embed_q)
     monkeypatch.setattr(db_conv, "search_cards_dense", mock_dense_db)
     monkeypatch.setattr(db_conv, "search_cards_keyword", mock_kw_db)
+    # Authenticated callers in this suite are internal team members.
+    from src.dalton.tools import conversation_tools as conv_tools_mod
+
+    monkeypatch.setattr(
+        conv_tools_mod,
+        "get_user_tier",
+        create_autospec(conv_tools_mod.get_user_tier, return_value="internal"),
+    )
 
     analyst_tools = {t.name: t for t in build_dalton_tools("analyst")}
     cos_tools = {t.name: t for t in build_dalton_tools("chief_of_staff")}
@@ -6475,6 +6483,11 @@ async def test_round5_flag_instead_of_reject_parsing_fixes_and_enumeration_count
         },
     )
     monkeypatch.setattr(conv_tools_mod, "hybrid_search_conversations", mock_hybrid)
+    monkeypatch.setattr(
+        conv_tools_mod,
+        "get_user_tier",
+        create_autospec(conv_tools_mod.get_user_tier, return_value="internal"),
+    )
     tool_fn = conv_tools_mod.create_conversation_tools()[0]
     raw_json = await tool_fn.ainvoke(
         {"query": "石头科技"},

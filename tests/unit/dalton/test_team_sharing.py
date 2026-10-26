@@ -189,11 +189,11 @@ class TestPermissionPrimitives:
             await require_workspace_reader(ws, "u-outsider")
         assert exc_outsider.value.status_code == 403
 
-        # Resource owner must also be in DALTON_ALLOWED_EMAILS
+        # Off-allowlist owners classify as external-owned: hidden (404), not 403
         outsider_ws = _sample_workspace(user_id="u-outsider")
         with pytest.raises(HTTPException) as exc_outsider_owner:
             await require_workspace_reader(outsider_ws, "u-chao")
-        assert exc_outsider_owner.value.status_code == 403
+        assert exc_outsider_owner.value.status_code == 404
 
         token = _verified_token_identity.set(("u-outsider", "outsider@other.com"))
         try:
@@ -239,7 +239,8 @@ class TestPermissionPrimitives:
             await require_thread_reader(thread_id, "u-chao")
         assert exc_del_th.value.status_code == 403
 
-        # 3. Colleague reading a thread owned by a non-allowlisted user -> 403
+        # 3. Colleague reading a thread owned by a non-allowlisted user -> 404
+        #    (external-owned: hidden, no existence leak)
         outsider_ws = _sample_workspace(user_id="u-outsider", status="running")
         auth_meta_mock.return_value = {
             "user_id": "u-outsider",
@@ -251,7 +252,7 @@ class TestPermissionPrimitives:
         get_ws_mock.return_value = outsider_ws
         with pytest.raises(HTTPException) as exc_out_th:
             await require_thread_reader(thread_id, "u-chao")
-        assert exc_out_th.value.status_code == 403
+        assert exc_out_th.value.status_code == 404
 
     @pytest.mark.asyncio
     async def test_switch_off_enforces_strict_owner_only(

@@ -1482,7 +1482,7 @@ async def test_verify_dalton_token_and_list_team_workspaces_with_db_members(
         create_autospec(dalton_sharing.get_db_connection, return_value=mock_conn),
     )
 
+    # Round-2 external-member isolation: an invite-signup (external) member
+    # sees no colleague workspace at all, whatever the DB rows say.
     team_list = await dalton_sharing.list_team_workspaces("u-alice")
-    assert len(team_list) == 1
-    assert team_list[0]["user_id"] == "u-bob"
-    assert team_list[0]["workspaces"][0]["workspace_id"] == "ws-bob-1"
+    assert team_list == []
