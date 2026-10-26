@@ -32,6 +32,8 @@ export interface LocationState {
   workspaceName?: string;
   fromThreadId?: string;
   fromWorkspaceId?: string;
+  // DALTON-HOOK(global-search): file or memo path to open in the right panel after navigation
+  openFilePath?: string;
   /**
    * Widget context snapshots forwarded from the dashboard's send. Re-seeds
    * the chat input's deck rail on mount so the user sees the same chips they

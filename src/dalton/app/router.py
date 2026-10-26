@@ -1379,5 +1379,28 @@ async def list_feishu_spaces_endpoint(
         raise HTTPException(status_code=502, detail=detail)
     return {"spaces": res.get("spaces") or []}
 
+@router.get("/search")
+@handle_api_exceptions("global search", logger)
+async def global_search_endpoint(
+    user_id: CurrentUserId,
+    q: str = Query(default=""),
+    limit: int = Query(default=20, ge=1, le=50),
+) -> dict[str, Any]:
+    # Known limitation: when object storage is enabled for workspace_files,
+    # file content is stored in external blobs rather than workspace_files.content_text
+    # (which is NULL in Postgres). In that case workspace_files are matched by
+    # file_name and file_path only.
+    _require_dalton_enabled()
+    cleaned_q = (q or "").strip()
+    if len(cleaned_q) < 2:
+        raise HTTPException(
+            status_code=422,
+            detail="Search query 'q' must be at least 2 characters after trimming whitespace.",
+        )
+    from src.dalton.database.search import global_search
+
+    return await global_search(user_id, cleaned_q, limit=limit)
+
+
 
 

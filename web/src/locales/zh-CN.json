@@ -175,7 +175,19 @@
     "resize": "调整侧边栏宽度",
     "plugins": "插件",
     "orders": "订单",
-    "menu": "菜单"
+    "menu": "菜单",
+    "search": "搜索 ({{shortcut}})",
+    "globalSearch": {
+      "title": "全局搜索",
+      "placeholder": "搜索历史对话与文档…",
+      "clear": "清空搜索",
+      "conversations": "对话",
+      "documents": "文档",
+      "memoTag": "备忘录",
+      "idleHint": "输入至少 2 个字符，搜索你拥有的工作区与备忘录。",
+      "noResults": "未找到匹配的对话或文档。",
+      "error": "搜索失败，请稍后重试。"
+    }
   },
   "account": {
     "menuLabel": "账号菜单"
