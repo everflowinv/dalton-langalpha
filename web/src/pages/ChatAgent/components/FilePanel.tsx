@@ -263,7 +263,9 @@ function FilePanel({
   const [exportModalOpen, setExportModalOpen] = useState(false);
   const [pageCounts, setPageCounts] = useState<Record<string, number>>({});
 
-  const { uploadProgress, uploadError, setUploadError, fileInputRef, isDragOver, handleFileInputChange, handleDragEnter, handleDragLeave, handleDragOver, handleDrop } =
+  // DALTON-HOOK(multi-file-upload): uploadStatus carries the batch position
+  // ("第 i / 共 n 个") shown above the bar while a serial multi-file upload runs
+  const { uploadProgress, uploadStatus, uploadError, setUploadError, fileInputRef, isDragOver, handleFileInputChange, handleDragEnter, handleDragLeave, handleDragOver, handleDrop } =
     useFileUpload({ workspaceId, onRefreshFiles });
 
   const setFileContent = useCallback((next: React.SetStateAction<string | null>) => {
@@ -700,6 +702,17 @@ function FilePanel({
         />
       )}
 
+      {uploadStatus && (
+        // DALTON-HOOK(multi-file-upload): which file of the batch is up now
+        <p className="px-3 pt-2 pb-1.5 text-xs" style={{ color: 'var(--color-text-secondary)' }}>
+          {t('filePanel.uploadingNth', {
+            current: uploadStatus.current,
+            total: uploadStatus.total,
+            name: uploadStatus.fileName,
+            percent: uploadStatus.percent,
+          })}
+        </p>
+      )}
       <PanelNotices
         uploadProgress={uploadProgress}
         error={uploadError || selection.deleteError}
@@ -862,7 +875,8 @@ function FilePanel({
           )}
         </div>
 
-      <input ref={fileInputRef} type="file" className="hidden" onChange={handleFileInputChange} />
+      {/* DALTON-HOOK(multi-file-upload): multi-select picker */}
+      <input ref={fileInputRef} type="file" multiple className="hidden" onChange={handleFileInputChange} />
 
       {contextMenu && (
         <FileContextMenu
