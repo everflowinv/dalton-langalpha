@@ -139,6 +139,7 @@ def _stub_feishu_client(bridge: rb.ResearchDataBridge, **overrides: Any) -> rb.F
         "list_nodes": [{"node_token": "n1", "obj_token": "doccnA", "obj_type": "docx",
                         "title": "Node A", "parent_node_token": "", "has_child": False}],
         "root_children_count": 3,
+        "grant_chat_full_access": None,
     }
     # Capture the real bound methods before any stubbing so overrides on a key
     # that defaults also stubs still spec the original, not another mock.
@@ -635,3 +636,78 @@ async def test_wiki_node_handler_reverse_looks_up_bare_docx_token(
     bridge._feishu_client_instance = _plain_client(get_node={})
     code2, payload2 = await bridge.handle_feishu_wiki_node({"token": "orphan1"})
     assert code2 == 200 and payload2["node"] is None and payload2["reason"] == "not_in_wiki"
+
+
+# ---------------------------------------------------------------------------
+# Team-group share on create (mirrors OpenClaw's 飞书文档权限规则)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_doc_create_shares_with_team_group(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.delenv("FEISHU_DEFAULT_GRANT_CHAT_ID", raising=False)
+    bridge = _make_bridge(monkeypatch, tmp_path)
+    client = _stub_feishu_client(bridge)
+
+    code, payload = await bridge.handle_feishu_doc_create({"title": "T", "markdown": "# hi"})
+
+    assert code == 200
+    assert "warning" not in payload
+    client.grant_chat_full_access.assert_called_once_with(
+        "doccnCreated1", rb.FEISHU_DEFAULT_GRANT_CHAT_ID
+    )
+
+
+@pytest.mark.asyncio
+async def test_doc_create_team_group_failure_is_a_warning(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.delenv("FEISHU_DEFAULT_GRANT_CHAT_ID", raising=False)
+    bridge = _make_bridge(monkeypatch, tmp_path)
+
+    def _fail(token, chat_id):
+        raise rb.FeishuApiError("feishu_http_403", "code=1063002 no permission")
+
+    def _email_fail(token, email):
+        raise rb.FeishuApiError("feishu_http_403", "code=1063002 no permission")
+
+    _stub_feishu_client(bridge, grant_chat_full_access=_fail, grant_full_access=_email_fail)
+
+    code, payload = await bridge.handle_feishu_doc_create(
+        {"title": "T", "markdown": "# hi", "grant_email": "user@corp.com"}
+    )
+
+    assert code == 200
+    assert payload["ok"] is True
+    assert "team group" in payload["warning"]
+    assert "user@corp.com" in payload["warning"]
+
+
+@pytest.mark.asyncio
+async def test_doc_create_team_group_share_can_be_disabled(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("FEISHU_DEFAULT_GRANT_CHAT_ID", "")
+    bridge = _make_bridge(monkeypatch, tmp_path)
+    client = _stub_feishu_client(bridge)
+
+    code, _payload = await bridge.handle_feishu_doc_create({"title": "T", "markdown": "# hi"})
+
+    assert code == 200
+    client.grant_chat_full_access.assert_not_called()
+
+
+def test_grant_chat_full_access_request_shape() -> None:
+    client = rb.FeishuClient("fake-app-id", "fake-app-secret", timeout_s=1.0)
+    client._request = create_autospec(client._request, return_value={})
+
+    client.grant_chat_full_access("doccnX", "oc_team")
+
+    client._request.assert_called_once_with(
+        "POST",
+        "/open-apis/drive/v1/permissions/doccnX/members",
+        query={"type": "docx", "need_notification": "false"},
+        json_body={"member_type": "openchat", "member_id": "oc_team", "perm": "full_access"},
+    )

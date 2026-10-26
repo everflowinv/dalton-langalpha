@@ -1123,6 +1123,12 @@ class BridgeConfig:
             )
         except ValueError:
             self.feishu_http_timeout_s = 30.0
+        # Same rule as OpenClaw's workspace AGENTS.md (飞书文档权限规则): every doc the
+        # bot creates is shared full_access with the Eve tracking group, which holds
+        # the internal team. Empty disables it.
+        self.feishu_default_grant_chat_id: str = os.environ.get(
+            "FEISHU_DEFAULT_GRANT_CHAT_ID", FEISHU_DEFAULT_GRANT_CHAT_ID
+        ).strip()
         self.test_mode: bool = os.environ.get("DALTON_BRIDGE_TEST_MODE", "0").strip().lower() in (
             "1",
             "true",
@@ -10018,14 +10024,26 @@ class ResearchDataBridge:
             if node_token:
                 payload["node_token"] = node_token
 
+            warnings: list[str] = []
+            grant_chat_id = getattr(self.cfg, "feishu_default_grant_chat_id", "")
+            if grant_chat_id:
+                try:
+                    client.grant_chat_full_access(document_id, grant_chat_id)
+                except FeishuApiError as exc:
+                    warnings.append(
+                        f"grant_failed: document created, but sharing it with the team "
+                        f"group failed ({exc.error_code}); share it manually."
+                    )
             if grant_email:
                 try:
                     client.grant_full_access(document_id, grant_email)
                 except FeishuApiError as exc:
-                    payload["warning"] = (
+                    warnings.append(
                         f"grant_failed: document created, but granting {grant_email} "
                         f"full access failed ({exc.error_code}); share it manually."
                     )
+            if warnings:
+                payload["warning"] = " ".join(warnings)
             return payload
 
         code, result = await self._run_feishu(_create)
@@ -10451,6 +10469,11 @@ class FeishuApiError(RuntimeError):
         self.error_code = error_code
 
 
+#: OpenClaw's Eve tracking group (internal team), the default share target for
+#: docs the bot creates; override with FEISHU_DEFAULT_GRANT_CHAT_ID.
+FEISHU_DEFAULT_GRANT_CHAT_ID = "oc_397207208fb52a0b09969794ef3cd421"
+
+
 def _read_openclaw_feishu_credentials() -> tuple[str, str]:
     """Return ``(appId, appSecret)`` from ``~/.openclaw/openclaw.json`` (read-only, empty on any failure).
 
@@ -10871,6 +10894,18 @@ class FeishuClient:
         return data.get("node") if isinstance(data.get("node"), dict) else {}
 
     # -- drive permissions --
+
+    def grant_chat_full_access(self, token: str, chat_id: str) -> None:
+        self._request(
+            "POST",
+            f"/open-apis/drive/v1/permissions/{token}/members",
+            query={"type": "docx", "need_notification": "false"},
+            json_body={
+                "member_type": "openchat",
+                "member_id": chat_id,
+                "perm": "full_access",
+            },
+        )
 
     def grant_full_access(self, token: str, email: str) -> None:
         self._request(

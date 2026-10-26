@@ -254,7 +254,8 @@ def create_feishu_tools() -> list[BaseTool]:
         *,
         config: RunnableConfig,
     ) -> str:
-        """Create a new Feishu docx from markdown when the user wants a deliverable in Feishu; admin and internal members only.
+        """Create a new Feishu docx from markdown, only when the user explicitly asks to put this content in Feishu; admin and internal members only.
+        Deliverables stay in the workspace by default — never write to Feishu unasked.
         Creating inside a wiki space requires `space_id` (find one with `feishu_list_wiki`); without any target the doc lands in the app's drive root.
 
         Args:
@@ -265,7 +266,7 @@ def create_feishu_tools() -> list[BaseTool]:
             folder_token: Drive folder token, used only when not creating in a wiki space.
 
         Returns:
-            JSON with the new `document_id` (plus `space_id`/`node_token` when in a wiki) and a `warning` when the auto-grant to the caller failed.
+            JSON with the new `document_id` (plus `space_id`/`node_token` when in a wiki) and a `warning` when sharing with the team group or the caller failed (the doc still exists; relay the warning).
         """
         user_id, err = await _require_authenticated_user(config)
         if err is not None:
@@ -290,7 +291,7 @@ def create_feishu_tools() -> list[BaseTool]:
             return res
         payload = {"ok": True, "tier": tier, **{k: v for k, v in res.items() if k != "ok"}}
         if payload.get("warning"):
-            payload["message"] = "文档已创建，但给调用者自动授权失败，请手动分享。"
+            payload["message"] = "文档已创建，但部分自动分享失败（详见 warning），请手动分享。"
         return _dump(payload)
 
     @tool("feishu_append")
@@ -300,7 +301,7 @@ def create_feishu_tools() -> list[BaseTool]:
         *,
         config: RunnableConfig,
     ) -> str:
-        """Append markdown to the end of an existing Feishu doc (docx or wiki link, or raw token); admin and internal members only.
+        """Append markdown to the end of an existing Feishu doc (docx or wiki link, or raw token), only when the user explicitly asks; admin and internal members only.
         It only appends at the end — it never edits, rewrites, or deletes existing content.
 
         Args:
