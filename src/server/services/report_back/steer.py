@@ -402,9 +402,12 @@ async def _task_offer(job: dict) -> SteeredReport | NotOwed | None:
 
 
 async def _analyst_offer(job: dict, thread_id: str) -> SteeredReport | None:
+    # DALTON-HOOK(handoff-keep-on-resumable): import resumable-interruption check and pointer
+    from src.server.services.report_back.handoff import pointer
     from src.server.services.report_back.handoff.executor import (
         analyst_report_verdict,
         analyst_request_key,
+        is_resumable_analyst_failure,
         overtaking_run,
         report_message,
         summary_started,
@@ -432,8 +435,41 @@ async def _analyst_offer(job: dict, thread_id: str) -> SteeredReport | None:
 
     if await outbox_db.has_live_hand_off(owed.ptc_thread_id, owed.dispatcher_thread_id):
         return None
+    # DALTON-HOOK(handoff-keep-on-resumable): stamp awaiting_resume on the
+    # handoff pair's ptc_origin before offering a resumable failure steer, or
+    # revoke any prior awaiting_resume marker before offering a subsequent terminal report.
+    payload = job.get("payload") or {}
+    analyst_run_id = str(job["run_id"]) if job.get("run_id") else None
+    dispatch_gen = payload.get("dispatch_gen") or owed.origin.get("dispatch_gen")
+    resumable = owed.final_status == "error" and await is_resumable_analyst_failure(
+        analyst_run_id
+    )
+    if resumable:
+        if not await pointer.mark_awaiting_resume(
+            cache,
+            owed.ptc_thread_id,
+            analyst_run_id=str(analyst_run_id or ""),
+            expected_gen=dispatch_gen,
+        ):
+            return None
+    elif (
+        isinstance(owed.origin, dict)
+        and owed.origin.get(pointer.AWAITING_RESUME_FIELD)
+    ):
+        await pointer.clear_awaiting_resume(
+            cache,
+            owed.ptc_thread_id,
+            expected_gen=dispatch_gen,
+        )
+        owed.origin.pop(pointer.AWAITING_RESUME_FIELD, None)
+    # DALTON-HOOK(handoff-keep-on-resumable): pass resumable interruption flag to steered message
     content, report_source = await report_message(
-        owed.ptc_thread_id, owed.origin, owed.final_status, steered=True
+        owed.ptc_thread_id,
+        owed.origin,
+        owed.final_status,
+        steered=True,
+        run_id=analyst_run_id,
+        resumable=resumable,
     )
     return SteeredReport(
         job_id=job_id,

@@ -36,7 +36,8 @@ import uuid
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from src.server.services.report_back.notify_turn import NotOwed
+# DALTON-HOOK(handoff-keep-on-resumable): reuse shared resumable-interruption predicate
+from src.server.services.report_back.notify_turn import NotOwed, is_resumable_failure
 
 if TYPE_CHECKING:
     from src.server.models.chat import TaskReport
@@ -217,10 +218,9 @@ def task_report_message(
     # DALTON-HOOK(workflow-resume): a lost-worker workflow run is resumable —
     # say so, with the task id the resume call needs, or the agent reads the
     # failure as lost work and starts over from scratch.
+    # DALTON-HOOK(handoff-keep-on-resumable): shared resumable-interruption check
     resume_hint = ""
-    lost_worker = bool(failure_error) and (
-        "worker_lost" in str(failure_error) or "RESUMABLE" in str(failure_error)
-    )
+    lost_worker = is_resumable_failure(failure_error)
     if report.failed and subagent_type == "workflow" and lost_worker:
         resume_hint = (
             f"\nTask id: {report.task_id}. This workflow run was interrupted "

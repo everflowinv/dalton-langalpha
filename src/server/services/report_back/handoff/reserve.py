@@ -73,11 +73,21 @@ RESERVE_LUA = """
 local prev = redis.call('get', KEYS[3])
 local prev_gen = nil
 local owner_gen = nil
+local keep_ar = nil
 if prev then
   local ok, t = pcall(cjson.decode, prev)
   if ok and type(t) == 'table' then
     if t[ORIGIN_THREAD_FIELD] and t[ORIGIN_THREAD_FIELD] ~= ARGV[2] then
       return {'cross', 0, 0, ''}
+    end
+    -- DALTON-HOOK(handoff-keep-on-resumable): preserve non-expired awaiting_resume
+    -- across a new reservation so the marker is never overwritten.
+    local ar = t['awaiting_resume']
+    if type(ar) == 'table' and type(ar['marked_at']) == 'number' then
+      local now = tonumber(redis.call('time')[1])
+      if (now - ar['marked_at']) < 86400 then
+        keep_ar = ar
+      end
     end
     if type(t['dispatch_gen']) == 'string' then
       prev_gen = t['dispatch_gen']
@@ -108,6 +118,8 @@ og['owns_watch'] = (in_watch == 0)
 og['owns_user'] = (in_user == 0)
 if prev_gen then og['prev_gen'] = prev_gen end
 if owner_gen then og['owner_gen'] = owner_gen end
+-- DALTON-HOOK(handoff-keep-on-resumable): carry forward active awaiting_resume
+if keep_ar then og['awaiting_resume'] = keep_ar end
 redis.call('set', KEYS[3], cjson.encode(og), 'EX', ARGV[5])
 return {'ok', 1 - in_watch, 1 - in_user, prev or ''}
 """.replace("ORIGIN_THREAD_FIELD", f"'{ORIGIN_THREAD_FIELD}'")
@@ -139,15 +151,35 @@ local ok, t = pcall(cjson.decode, cur)
 if not (ok and type(t) == 'table' and t['dispatch_gen'] == ARGV[2]) then
   return 0
 end
+-- DALTON-HOOK(handoff-keep-on-resumable): check awaiting_resume inside rollback
+-- before deleting the pair on a tombstone.
+local now = tonumber(redis.call('time')[1])
+local cur_ar = t['awaiting_resume']
+local has_valid_ar = (
+  type(cur_ar) == 'table'
+  and type(cur_ar['marked_at']) == 'number'
+  and (now - cur_ar['marked_at']) < 86400
+)
 if ARGV[3] ~= '' then
   local pok, pt = pcall(cjson.decode, ARGV[3])
+  if pok and type(pt) == 'table' then
+    local prev_ar = pt['awaiting_resume']
+    if type(prev_ar) == 'table'
+       and type(prev_ar['marked_at']) == 'number'
+       and (now - prev_ar['marked_at']) < 86400 then
+      has_valid_ar = true
+    elseif has_valid_ar then
+      pt['awaiting_resume'] = cur_ar
+    end
+  end
   local dead
   if pok and type(pt) == 'table' and type(pt['dispatch_gen']) == 'string' then
     dead = redis.call('sismember', KEYS[4], pt['dispatch_gen']) == 1
   else
     dead = redis.call('scard', KEYS[4]) > 0
   end
-  if dead then
+  -- DALTON-HOOK(handoff-keep-on-resumable): keep pair if valid awaiting_resume is present
+  if dead and not has_valid_ar then
     local ptr = ''
     if KEYS[5] ~= '' then
       local pv = redis.call('get', KEYS[5])
@@ -160,12 +192,20 @@ if ARGV[3] ~= '' then
     redis.call('srem', KEYS[2], ARGV[1])
     return {2, ptr}
   end
-  redis.call('set', KEYS[3], ARGV[3], 'EX', ARGV[6])
+  if dead and has_valid_ar then
+    redis.call('del', KEYS[4])
+  end
+  local restored = (pok and type(pt) == 'table') and cjson.encode(pt) or ARGV[3]
+  redis.call('set', KEYS[3], restored, 'EX', ARGV[6])
 else
-  redis.call('del', KEYS[3])
+  if not has_valid_ar then
+    redis.call('del', KEYS[3])
+  end
 end
-if ARGV[4] == '1' then redis.call('srem', KEYS[1], ARGV[1]) end
-if ARGV[5] == '1' then redis.call('srem', KEYS[2], ARGV[1]) end
+if not has_valid_ar then
+  if ARGV[4] == '1' then redis.call('srem', KEYS[1], ARGV[1]) end
+  if ARGV[5] == '1' then redis.call('srem', KEYS[2], ARGV[1]) end
+end
 return 1
 """
 
@@ -410,6 +450,22 @@ if type(origin['pending_runs']) == 'table'
    and next(origin['pending_runs']) ~= nil then
   return {0, 'admitted'}
 end
+-- DALTON-HOOK(handoff-keep-on-resumable): check awaiting_resume atomically
+-- inside orphan resolution against Redis TIME (24h = 86400s).
+local ar = origin['awaiting_resume']
+if type(ar) == 'table' and type(ar['marked_at']) == 'number' then
+  local mgen = ar['dispatch_gen']
+  if type(mgen) ~= 'string'
+     or mgen == origin['dispatch_gen']
+     or mgen == origin['prev_gen']
+     or mgen == origin['owner_gen']
+     or (ARGV[6] ~= '' and mgen == ARGV[6]) then
+    local now = tonumber(redis.call('time')[1])
+    if (now - ar['marked_at']) < 86400 then
+      return {0, 'awaiting_resume', ar['analyst_run_id'] or ''}
+    end
+  end
+end
 local surrogate = (ARGV[6] ~= ''
   and (origin['prev_gen'] == ARGV[6] or origin['owner_gen'] == ARGV[6]))
 redis.call('sadd', KEYS[5], ARGV[2])
@@ -503,8 +559,11 @@ async def resolve_orphaned_watch(
             f"{'admitted' if admitted else 'live run'} (ledger)"
         )
         return False, None
-
-    res = await cache.client.eval(
+    # DALTON-HOOK(handoff-keep-on-resumable): ORPHAN_RESOLVE_LUA checks
+    # awaiting_resume atomically in Redis and returns {0, 'awaiting_resume', run_id};
+    # only if Postgres says the run is no longer resumable do we conditionally
+    # revoke the marker and re-run the script.
+    resolve_args = (
         ORPHAN_RESOLVE_LUA,
         6,
         ptc_origin_key(ptc_thread_id),
@@ -522,6 +581,28 @@ async def resolve_orphaned_watch(
         RB_DONE_TTL,
         job_gen or "",
     )
+    res = await cache.client.eval(*resolve_args)
+    if (
+        isinstance(res, (list, tuple))
+        and len(res) > 1
+        and not int(res[0])
+        and decode(res[1]) == "awaiting_resume"
+    ):
+        analyst_run_id = (
+            decode(res[2]) if len(res) > 2 and res[2] else None
+        )
+        if await pointer.still_resumable_or_revoke(
+            cache,
+            ptc_thread_id,
+            analyst_run_id,
+            expected_gen=fencer_gen,
+        ):
+            logger.info(
+                f"[HANDOFF_REPORT_BACK] Phantom-fence resolution for "
+                f"{ptc_thread_id} (gen {fencer_gen}) suppressed: awaiting resume"
+            )
+            return False, None
+        res = await cache.client.eval(*resolve_args)
     if not (isinstance(res, (list, tuple)) and res and int(res[0])):
         reason = (
             decode(res[1])

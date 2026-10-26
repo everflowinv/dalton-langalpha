@@ -6,7 +6,9 @@ outbox executor's dispatch/clear flow is exercised for real.
 
 from __future__ import annotations
 
+import copy
 import json
+import time  # DALTON-HOOK(handoff-keep-on-resumable)
 
 from src.server.services.report_back.handoff import keys, pointer, reserve
 
@@ -326,6 +328,21 @@ class FakeClient:
             pending = origin_blob.get("pending_runs")
             if isinstance(pending, dict) and pending:
                 return [0, "admitted"]
+            # DALTON-HOOK(handoff-keep-on-resumable): emulate ORPHAN_RESOLVE_LUA awaiting_resume check
+            ar = origin_blob.get("awaiting_resume")
+            if isinstance(ar, dict) and isinstance(ar.get("marked_at"), (int, float)):
+                mgen = ar.get("dispatch_gen")
+                if (
+                    not isinstance(mgen, str)
+                    or mgen in (
+                        origin_blob.get("dispatch_gen"),
+                        origin_blob.get("prev_gen"),
+                        origin_blob.get("owner_gen"),
+                    )
+                    or (job_gen != "" and mgen == job_gen)
+                ):
+                    if (time.time() - float(ar["marked_at"])) < 86400:
+                        return [0, "awaiting_resume", ar.get("analyst_run_id") or ""]
             surrogate = job_gen != "" and job_gen in (
                 origin_blob.get("prev_gen"),
                 origin_blob.get("owner_gen"),
@@ -374,7 +391,8 @@ class FakeClient:
             return [1, ptr, watch_removed, user_removed]
         if script is pointer.GATED_TEARDOWN_LUA:
             origin_key, run_key, watch_key, user_key, tomb_key = keys
-            expected_gen, ptc_id, tomb_ttl, refuse_if_pointer = argv
+            expected_gen, ptc_id, tomb_ttl, refuse_if_pointer, *rest = argv
+            honor_ar = rest[0] if rest else "1"
             # Off-chain caller + live run pointer: refuse everything — only
             # that admission's serialized lifecycle may drain the pair.
             if refuse_if_pointer == "1" and run_key and run_key in self.kv:
@@ -394,6 +412,18 @@ class FakeClient:
                     )
                     self.ttls[tomb_key] = int(tomb_ttl)
                     return [0, current["dispatch_gen"]]
+            # DALTON-HOOK(handoff-keep-on-resumable): emulate GATED_TEARDOWN_LUA awaiting_resume check
+            if honor_ar != "0" and isinstance(current, dict):
+                ar = current.get("awaiting_resume")
+                if isinstance(ar, dict) and isinstance(ar.get("marked_at"), (int, float)):
+                    mgen = ar.get("dispatch_gen")
+                    if not isinstance(mgen, str) or mgen in (
+                        current.get("dispatch_gen"),
+                        current.get("prev_gen"),
+                        current.get("owner_gen"),
+                    ):
+                        if (time.time() - float(ar["marked_at"])) < 86400:
+                            return [2, ar.get("analyst_run_id") or ""]
             self.kv.pop(origin_key, None)
             self.sets.pop(tomb_key, None)
             if run_key:
@@ -421,6 +451,16 @@ class FakeClient:
                 dispatcher_id,
             ):
                 return ["cross", 0, 0, ""]
+            # DALTON-HOOK(handoff-keep-on-resumable): check non-expired awaiting_resume on prev
+            keep_ar = None
+            if isinstance(prev, dict):
+                ar = prev.get("awaiting_resume")
+                if (
+                    isinstance(ar, dict)
+                    and isinstance(ar.get("marked_at"), (int, float))
+                    and (time.time() - float(ar["marked_at"])) < 86400
+                ):
+                    keep_ar = dict(ar)
             in_watch = ptc_id in self.sets.get(watch_key, set())
             in_user = ptc_id in self.sets.get(user_key, set())
             if not in_watch and len(self.sets.get(watch_key, set())) >= int(max_thread):
@@ -449,6 +489,9 @@ class FakeClient:
                     og["owner_gen"] = prev["dispatch_gen"]
                 elif isinstance(prev.get("owner_gen"), str):
                     og["owner_gen"] = prev["owner_gen"]
+            # DALTON-HOOK(handoff-keep-on-resumable): preserve awaiting_resume across reserve
+            if keep_ar is not None:
+                og["awaiting_resume"] = keep_ar
             self.kv[origin_key] = og
             self.ttls[origin_key] = int(ttl)
             prev_raw = json.dumps(prev) if isinstance(prev, dict) else ""
@@ -462,9 +505,27 @@ class FakeClient:
                 and current.get("dispatch_gen") == minted_gen
             ):
                 return 0
+            # DALTON-HOOK(handoff-keep-on-resumable): emulate ROLLBACK_RESERVE_LUA awaiting_resume check
+            now = time.time()
+            cur_ar = current.get("awaiting_resume")
+            has_valid_ar = (
+                isinstance(cur_ar, dict)
+                and isinstance(cur_ar.get("marked_at"), (int, float))
+                and (now - float(cur_ar["marked_at"])) < 86400
+            )
             if prev_json:
                 tombs = self.sets.get(tomb_key, set())
                 prev = json.loads(prev_json)
+                if isinstance(prev, dict):
+                    prev_ar = prev.get("awaiting_resume")
+                    if (
+                        isinstance(prev_ar, dict)
+                        and isinstance(prev_ar.get("marked_at"), (int, float))
+                        and (now - float(prev_ar["marked_at"])) < 86400
+                    ):
+                        has_valid_ar = True
+                    elif has_valid_ar:
+                        prev["awaiting_resume"] = dict(cur_ar)
                 if isinstance(prev, dict) and isinstance(
                     prev.get("dispatch_gen"), str
                 ):
@@ -473,7 +534,8 @@ class FakeClient:
                     # Legacy predecessor: ANY fenced clear would have been
                     # authorized against a gen-less origin.
                     dead = bool(tombs)
-                if dead:
+                # DALTON-HOOK(handoff-keep-on-resumable): skip tombstone delete when awaiting_resume is valid
+                if dead and not has_valid_ar:
                     # The stashed predecessor's teardown was fenced out while
                     # our provisional gen held the origin — honor it: clear
                     # the whole pair instead of resurrecting torn-down state,
@@ -488,14 +550,51 @@ class FakeClient:
                     self.sets.get(watch_key, set()).discard(ptc_id)
                     self.sets.get(user_key, set()).discard(ptc_id)
                     return [2, ptr]
+                if dead and has_valid_ar:
+                    self.sets.pop(tomb_key, None)
                 self.kv[origin_key] = prev
                 self.ttls[origin_key] = int(ttl)
-            else:
+            elif not has_valid_ar:
                 self.kv.pop(origin_key, None)
-            if added_watch == "1":
-                self.sets.get(watch_key, set()).discard(ptc_id)
-            if added_user == "1":
-                self.sets.get(user_key, set()).discard(ptc_id)
+            if not has_valid_ar:
+                if added_watch == "1":
+                    self.sets.get(watch_key, set()).discard(ptc_id)
+                if added_user == "1":
+                    self.sets.get(user_key, set()).discard(ptc_id)
+            return 1
+        # DALTON-HOOK(handoff-keep-on-resumable): emulate AWAITING_RESUME_LUA on ptc_origin
+        if script is pointer.AWAITING_RESUME_LUA:
+            (origin_key,) = keys
+            expected_gen, mode, analyst_run_id, marked_at, ttl = argv
+            origin_blob = self._decoded(origin_key)
+            if not isinstance(origin_blob, dict):
+                return 0
+            if mode == "set":
+                if isinstance(origin_blob.get("dispatch_gen"), str):
+                    if expected_gen == "" or origin_blob["dispatch_gen"] != expected_gen:
+                        return 0
+                origin_blob["awaiting_resume"] = {
+                    "analyst_run_id": analyst_run_id,
+                    "marked_at": float(marked_at),
+                    "dispatch_gen": origin_blob.get("dispatch_gen"),
+                }
+                self.kv[origin_key] = origin_blob
+                self.ttls[origin_key] = int(ttl)
+                return 1
+            ar = origin_blob.get("awaiting_resume")
+            if not isinstance(ar, dict):
+                return 0
+            if isinstance(origin_blob.get("dispatch_gen"), str):
+                mgen = ar.get("dispatch_gen")
+                if expected_gen == "" or (
+                    origin_blob["dispatch_gen"] != expected_gen
+                    and mgen != expected_gen
+                ):
+                    return 0
+            if analyst_run_id != "" and ar.get("analyst_run_id") != analyst_run_id:
+                return 0
+            origin_blob.pop("awaiting_resume", None)
+            self.kv[origin_key] = origin_blob
             return 1
         raise AssertionError(f"unknown Lua script: {script[:60]!r}")
 
@@ -511,11 +610,14 @@ class FakeCache:
         self.kv: dict[str, object] = self.client.kv
 
     async def get(self, key):
-        return self.kv.get(key)
+        # DALTON-HOOK(handoff-keep-on-resumable): a copy, as a real GET returns
+        # a snapshot: a later write by another worker (or a Lua script mutating
+        # the stored dict) must not show up in a value read earlier.
+        return copy.deepcopy(self.kv.get(key))
 
     async def get_strict(self, key):
         # Fake transport never fails, so strict == plain get here.
-        return self.kv.get(key)
+        return copy.deepcopy(self.kv.get(key))  # DALTON-HOOK(handoff-keep-on-resumable)
 
     async def set(self, key, value, ttl=None) -> bool:
         # Mirror RedisCache.set's True-on-success: reserve()'s fail-closed

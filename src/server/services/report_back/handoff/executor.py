@@ -26,7 +26,8 @@ from src.server.services.report_back.handoff.keys import (
     rb_run_key,
     watch_key,
 )
-from src.server.services.report_back.notify_turn import NotOwed
+# DALTON-HOOK(handoff-keep-on-resumable): shared resumable-interruption check
+from src.server.services.report_back.notify_turn import NotOwed, is_resumable_failure
 
 if TYPE_CHECKING:
     from src.server.models.chat import AnalystReport
@@ -67,6 +68,59 @@ class OwedAnalystReport:
         )
 
 
+# DALTON-HOOK(handoff-keep-on-resumable): log NotOwed exits and detect
+# resumable worker-lost interruptions on the analyst thread.
+_RESUMABLE_INTERRUPT_NOTICE = "运行被中断，系统会续跑，完成后会再回报。"
+
+
+def _not_owed(
+    reason: str,
+    *,
+    dispatcher_thread_id: str | None,
+    ptc_thread_id: str | None,
+    dispatch_gen: str | None,
+) -> NotOwed:
+    logger.info(
+        "[HANDOFF_REPORT_BACK] NotOwed (%s): dispatcher_thread=%s "
+        "ptc_thread=%s dispatch_gen=%s",
+        reason,
+        dispatcher_thread_id,
+        ptc_thread_id,
+        dispatch_gen,
+    )
+    return NotOwed(reason, wake=False)
+
+
+async def is_resumable_analyst_failure(run_id: str | None) -> bool:
+    """Whether the analyst run ``run_id`` ended with a resumable worker-lost
+    interruption (and was not cancelled by the user)."""
+    if not run_id:
+        return False
+    from src.server.database.runs import lifecycle as tl_db
+
+    row = await tl_db.get_run(str(run_id))
+    if not isinstance(row, dict) or row.get("status") != "error":
+        return False
+    metadata = row.get("metadata")
+    if row.get("cancel_requested_at") or (
+        isinstance(metadata, dict) and metadata.get("cancelled_by_user")
+    ):
+        return False
+    replay_facts = row.get("replay_facts")
+    error_frame = (
+        replay_facts.get("error_frame") if isinstance(replay_facts, dict) else None
+    )
+    return any(
+        is_resumable_failure(candidate)
+        for candidate in (
+            row.get("errors"),
+            row.get("error"),
+            row.get("failure_error"),
+            error_frame,
+        )
+    )
+
+
 async def analyst_report_verdict(cache, job: dict) -> OwedAnalystReport | NotOwed:
     """Whether the pair a ``report_back`` job names still reports back to a
     thread: the one eligibility its executor and a live turn decide by.
@@ -77,22 +131,51 @@ async def analyst_report_verdict(cache, job: dict) -> OwedAnalystReport | NotOwe
     """
     payload = job.get("payload") or {}
     ptc_thread_id = payload.get("ptc_thread_id")
+    dispatch_gen = payload.get("dispatch_gen")
+    # DALTON-HOOK(handoff-keep-on-resumable): log NotOwed exits at INFO
     if not ptc_thread_id:
-        return NotOwed("it names no analyst thread", wake=False)
+        return _not_owed(
+            "it names no analyst thread",
+            dispatcher_thread_id=job.get("ordering_key"),
+            ptc_thread_id=ptc_thread_id,
+            dispatch_gen=dispatch_gen,
+        )
     origin = await cache.get_strict(ptc_origin_key(ptc_thread_id))
     if (
         not isinstance(origin, dict)
         or origin.get("origin") != ORIGIN_KIND
         or not origin.get("report_back")
     ):
-        return NotOwed("its analyst reports to no thread", wake=False)
+        return _not_owed(
+            "its analyst reports to no thread",
+            dispatcher_thread_id=(
+                origin.get(ORIGIN_THREAD_FIELD)
+                if isinstance(origin, dict)
+                else job.get("ordering_key")
+            ),
+            ptc_thread_id=ptc_thread_id,
+            dispatch_gen=dispatch_gen
+            or (origin.get("dispatch_gen") if isinstance(origin, dict) else None),
+        )
     dispatcher_thread_id = origin.get(ORIGIN_THREAD_FIELD)
+    effective_gen = dispatch_gen or origin.get("dispatch_gen")
+    # DALTON-HOOK(handoff-keep-on-resumable): log NotOwed exits at INFO
     if not dispatcher_thread_id or not origin.get("user_id"):
-        return NotOwed("its origin names no thread or owner", wake=False)
+        return _not_owed(
+            "its origin names no thread or owner",
+            dispatcher_thread_id=dispatcher_thread_id or job.get("ordering_key"),
+            ptc_thread_id=ptc_thread_id,
+            dispatch_gen=effective_gen,
+        )
     # Already terminal-cleared (duplicate completion event, or a reclaimed job
     # whose summary turn already finished and watch-cleared): nothing to do.
     if not await cache.client.sismember(watch_key(dispatcher_thread_id), ptc_thread_id):
-        return NotOwed("its pair was already cleared", wake=False)
+        return _not_owed(
+            "its pair was already cleared",
+            dispatcher_thread_id=dispatcher_thread_id,
+            ptc_thread_id=ptc_thread_id,
+            dispatch_gen=effective_gen,
+        )
     return OwedAnalystReport(
         origin=origin,
         dispatcher_thread_id=dispatcher_thread_id,
@@ -155,6 +238,22 @@ async def execute_report_back(job: dict) -> None:
     ):
         dispatch_gen = origin_gen
     user_id = origin.get("user_id")
+    # DALTON-HOOK(handoff-keep-on-resumable): stamp awaiting_resume on the
+    # handoff pair's authoritative ptc_origin state BEFORE any requeue, park,
+    # or POST when the analyst run ended in a resumable failure; revoke any
+    # prior awaiting_resume marker before delivering a subsequent terminal run.
+    analyst_run_id = str(job["run_id"]) if job.get("run_id") else None
+    resumable = final_status == "error" and await is_resumable_analyst_failure(
+        analyst_run_id
+    )
+    if resumable:
+        if not await pointer.mark_awaiting_resume(
+            cache,
+            ptc_thread_id,
+            analyst_run_id=str(analyst_run_id or ""),
+            expected_gen=dispatch_gen,
+        ):
+            return
     # Claimed under a stale ordering key (pre-deploy row that finalized
     # unstamped, keyed on its own PTC thread): requeue onto the dispatching
     # thread's chain instead of executing here — N such jobs would busy-wait their
@@ -164,6 +263,18 @@ async def execute_report_back(job: dict) -> None:
     if job.get("ordering_key") != dispatcher_thread_id:
         from src.server.services.hook_outbox import MAX_ATTEMPTS
 
+        # DALTON-HOOK(handoff-keep-on-resumable): if this non-resumable terminal
+        # job is about to exhaust attempts into dead_clear, revoke awaiting_resume first.
+        if (
+            not resumable
+            and attempts >= MAX_ATTEMPTS
+            and isinstance(origin, dict)
+            and origin.get(pointer.AWAITING_RESUME_FIELD)
+        ):
+            await pointer.clear_awaiting_resume(
+                cache, ptc_thread_id, expected_gen=dispatch_gen
+            )
+            origin.pop(pointer.AWAITING_RESUME_FIELD, None)
         requeued = await outbox_db.requeue_job_with_key(
             job_id,
             attempts=attempts,
@@ -179,6 +290,17 @@ async def execute_report_back(job: dict) -> None:
 
     rb_run_id = payload.get("dispatched_run_id")
     if rb_run_id:
+        # DALTON-HOOK(handoff-keep-on-resumable): ensure awaiting_resume is
+        # revoked when resuming terminal wait for a subsequent non-resumable run.
+        if (
+            not resumable
+            and isinstance(origin, dict)
+            and origin.get(pointer.AWAITING_RESUME_FIELD)
+        ):
+            await pointer.clear_awaiting_resume(
+                cache, ptc_thread_id, expected_gen=dispatch_gen
+            )
+            origin.pop(pointer.AWAITING_RESUME_FIELD, None)
         logger.info(
             f"[HANDOFF_REPORT_BACK] Resuming in-flight report-back run {rb_run_id} "
             f"for {ptc_thread_id} on thread {dispatcher_thread_id} (no re-dispatch)"
@@ -187,10 +309,23 @@ async def execute_report_back(job: dict) -> None:
         # A live turn on the thread takes the report in as a steer before its
         # next model call (``report_back.steer``), as a task's report-back
         # does.
+        from src.server.services.hook_outbox import MAX_ATTEMPTS
         from src.server.services.report_back.notify_turn import (
             park_while_thread_busy,
         )
 
+        # DALTON-HOOK(handoff-keep-on-resumable): if parking at ceiling will
+        # dead-letter this subsequent run, revoke awaiting_resume beforehand.
+        if (
+            not resumable
+            and attempts >= MAX_ATTEMPTS
+            and isinstance(origin, dict)
+            and origin.get(pointer.AWAITING_RESUME_FIELD)
+        ):
+            await pointer.clear_awaiting_resume(
+                cache, ptc_thread_id, expected_gen=dispatch_gen
+            )
+            origin.pop(pointer.AWAITING_RESUME_FIELD, None)
         if await park_while_thread_busy(
             job_id,
             attempts,
@@ -211,6 +346,17 @@ async def execute_report_back(job: dict) -> None:
         ):
             return  # lease lost: the reclaiming owner carries on
 
+        # DALTON-HOOK(handoff-keep-on-resumable): revoke awaiting_resume before
+        # delivering a subsequent terminal report so its watch_clear takes effect.
+        if (
+            not resumable
+            and isinstance(origin, dict)
+            and origin.get(pointer.AWAITING_RESUME_FIELD)
+        ):
+            await pointer.clear_awaiting_resume(
+                cache, ptc_thread_id, expected_gen=dispatch_gen
+            )
+            origin.pop(pointer.AWAITING_RESUME_FIELD, None)
         outcome, rb_run_id = await _post_report_back(
             cache,
             dispatcher_thread_id,
@@ -221,6 +367,8 @@ async def execute_report_back(job: dict) -> None:
             dispatch_gen=dispatch_gen,
             final_status=final_status,
             still_due=_still_due,
+            run_id=analyst_run_id,
+            resumable=resumable,
         )
 
         if outcome == "lost":
@@ -261,11 +409,18 @@ async def execute_report_back(job: dict) -> None:
                     # clear lands); on refusal we nack, and the retry adopts
                     # the claim's run row, takes over its corpse, or finds
                     # the claim released.
+                    # DALTON-HOOK(handoff-keep-on-resumable): clear_handoff_report_back
+                    # skips teardown and sets awaiting_resume=True when the pair
+                    # is awaiting resume of a resumable analyst interruption.
                     cleared = await pointer.clear_handoff_report_back(
                         cache, ptc_thread_id, dispatcher_thread_id, user_id=user_id,
                         expected_gen=dispatch_gen, refuse_if_pointer=True,
                     )
-                    if not cleared and cleared.fencer_gen is None:
+                    if (
+                        not cleared
+                        and not cleared.awaiting_resume
+                        and cleared.fencer_gen is None
+                    ):
                         raise RuntimeError(
                             f"report-back drop for {ptc_thread_id} refused: a "
                             f"live run pointer on thread {dispatcher_thread_id} "
@@ -303,6 +458,9 @@ async def execute_report_back(job: dict) -> None:
         # is therefore tolerable — log, don't nack, the effect already ran.
         try:
             await outbox_db.merge_job_payload(job_id, {"dispatched_run_id": rb_run_id})
+            # DALTON-HOOK(handoff-keep-on-resumable): mirror dispatched_run_id in-memory for retry tests
+            if isinstance(job.get("payload"), dict):
+                job["payload"]["dispatched_run_id"] = rb_run_id
         except Exception:
             logger.warning(
                 f"[HANDOFF_REPORT_BACK] Failed persisting dispatched_run_id "
@@ -389,9 +547,16 @@ async def _await_run_terminal(
     async with outbox_db.fenced_job_guard(job_id, attempts) as owned:
         if not owned:
             return
+        # DALTON-HOOK(handoff-keep-on-resumable): the teardown Lua refuses a
+        # pair still awaiting resume, and then the unfinished summary turn's
+        # pointer stays too; an unmarked pair clears as upstream does.
         cleared = await pointer.clear_handoff_report_back(
-            cache, ptc_thread_id, dispatcher_thread_id, user_id=user_id,
+            cache,
+            ptc_thread_id,
+            dispatcher_thread_id,
+            user_id=user_id,
             expected_gen=dispatch_gen,
+            release_pointer_when_kept=False,
         )
         if cleared:
             await wake.publish_wake(cache, dispatcher_thread_id, cleared=True)
@@ -436,7 +601,13 @@ _OUTCOME_INSTRUCTIONS = {
 
 
 async def report_message(
-    ptc_thread_id: str, origin: dict, final_status: str, *, steered: bool = False
+    ptc_thread_id: str,
+    origin: dict,
+    final_status: str,
+    *,
+    steered: bool = False,
+    run_id: str | None = None,
+    resumable: bool | None = None,
 ) -> tuple[str, "AnalystReport"]:
     """What the report says to the agent, as its own turn or as a steer, and
     the source history labels it with: the message is model-facing and
@@ -447,11 +618,24 @@ async def report_message(
     ptc_workspace_id = origin.get("ptc_workspace_id")
     ws_name = await _workspace_name(ptc_workspace_id)
     ws_label = f'the "{ws_name}" workspace' if ws_name else "a workspace"
+    outcome_line = (
+        f"The analysis you dispatched (thread {ptc_thread_id} in {ws_label}) "
+        f"{_OUTCOME_INSTRUCTIONS[final_status]}"
+    )
+    # DALTON-HOOK(handoff-keep-on-resumable): tell Home when a failed analyst
+    # run was a resumable interruption that will report back again on finish.
+    if final_status == "error":
+        is_resumable = (
+            await is_resumable_analyst_failure(run_id)
+            if resumable is None
+            else resumable
+        )
+        if is_resumable:
+            outcome_line += f"\n{_RESUMABLE_INTERRUPT_NOTICE}"
     # DALTON-HOOK(i18n): Prevent language drift after English analyst report-back notices
     message = (
         "<system>\n"
-        f"The analysis you dispatched (thread {ptc_thread_id} in {ws_label}) "
-        f"{_OUTCOME_INSTRUCTIONS[final_status]}\n"
+        f"{outcome_line}\n"
         "This notice is from the system, not the user. Keep writing to the user in the language of their request.\n"
         "</system>"
     )
@@ -481,6 +665,8 @@ async def _post_report_back(
     dispatch_gen: str | None = None,
     final_status: str,
     still_due=None,
+    run_id: str | None = None,
+    resumable: bool | None = None,
 ) -> tuple[str, str | None]:
     """POST the synthetic report-back message to the Chief of Staff thread.
 
@@ -494,7 +680,19 @@ async def _post_report_back(
     """
     from src.server.services.report_back.notify_turn import post_notification_turn
 
-    message, report_source = await report_message(ptc_thread_id, origin, final_status)
+    # DALTON-HOOK(handoff-keep-on-resumable): use the resumable verdict already
+    # computed by execute_report_back, or evaluate it when called directly.
+    if resumable is None:
+        resumable = final_status == "error" and await is_resumable_analyst_failure(
+            run_id
+        )
+    message, report_source = await report_message(
+        ptc_thread_id,
+        origin,
+        final_status,
+        run_id=run_id,
+        resumable=resumable,
+    )
     body = {
         "messages": [{"role": "user", "content": message}],
         # The dispatching thread's workspace, which is Home.
@@ -524,6 +722,8 @@ async def _post_report_back(
         ]
     if request_key:
         body["request_key"] = request_key
+    # DALTON-HOOK(handoff-keep-on-resumable): dispatch summary turn after
+    # awaiting_resume has been atomically stamped on ptc_origin.
     return await post_notification_turn(
         thread_id=dispatcher_thread_id,
         body=body,
@@ -656,12 +856,15 @@ async def _discard_dispatcher_thread(cache, dispatcher_thread_id: str) -> None:
         )
         # No drained-run record: the thread is gone, so nothing can
         # ever render these turns.
+        # DALTON-HOOK(handoff-keep-on-resumable): deleted dispatcher thread
+        # discards unconditionally (ignore_awaiting_resume=True).
         cleared = await pointer.clear_handoff_report_back(
             cache,
             ptc_tid,
             dispatcher_thread_id,
             record_drained=False,
             expected_gen=observed_gen,
+            ignore_awaiting_resume=True,
         )
         if not cleared:
             # The origin's generation moved between our read and the CAS.

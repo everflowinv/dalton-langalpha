@@ -41,6 +41,20 @@ class NotOwed:
     wake: bool = True
 
 
+# DALTON-HOOK(handoff-keep-on-resumable): shared resumable-interruption
+# predicate (same check as workflow-resume in subagent.py).
+def is_resumable_failure(failure_error: object) -> bool:
+    """Whether an error value marks a resumable worker-lost interruption."""
+    if not failure_error:
+        return False
+    if isinstance(failure_error, (list, tuple, set)):
+        return any(is_resumable_failure(item) for item in failure_error)
+    if isinstance(failure_error, dict):
+        return any(is_resumable_failure(v) for v in failure_error.values())
+    text = str(failure_error)
+    return "worker_lost" in text or "RESUMABLE" in text
+
+
 async def park_while_thread_busy(
     job_id: str, attempts: int, thread_id: str, *, log_prefix: str, subject: str
 ) -> bool:
