@@ -63,6 +63,7 @@ vi.mock('@/api/client', () => ({
   },
 }));
 
+const mockGrantRefetch = vi.hoisted(() => vi.fn());
 const mockGrantResult = vi.hoisted(() => ({
   data: undefined as { prefix: string; expiresAt: number } | undefined,
 }));
@@ -70,7 +71,7 @@ const mockGrant = vi.hoisted(() => vi.fn());
 vi.mock('@/hooks/useWorkspaceFileGrant', () => ({
   useWorkspaceFileGrant: (wsId: string | null | undefined) => {
     mockGrant(wsId);
-    return { data: wsId ? mockGrantResult.data : undefined, error: null, refetch: vi.fn() };
+    return { data: wsId ? mockGrantResult.data : undefined, error: null, refetch: mockGrantRefetch };
   },
 }));
 
@@ -85,8 +86,13 @@ vi.mock('@/hooks/useShareLink', () => ({
   },
 }));
 
+const STABLE_THEME = vi.hoisted(() => ({
+  theme: 'dark' as const,
+  setTheme: vi.fn(),
+  toggleTheme: vi.fn(),
+}));
 vi.mock('@/contexts/ThemeContext', () => ({
-  useTheme: () => ({ theme: 'dark', setTheme: vi.fn(), toggleTheme: vi.fn() }),
+  useTheme: () => STABLE_THEME,
 }));
 
 const mockSendMessage = vi.hoisted(() => vi.fn());
@@ -96,73 +102,111 @@ const mockAnswerQuestion = vi.hoisted(() => vi.fn());
 const mockMessages = vi.hoisted(() => ({ current: [] as ChatMessage[] }));
 const capturedWorkflowOnStop = vi.hoisted(() => ({ current: undefined as (() => void) | undefined }));
 
+const STABLE_CHAT_HELPERS = vi.hoisted(() => ({
+  liveMessages: {
+    get: () => mockMessages.current,
+    subscribe: () => () => {},
+  },
+  olderHistory: { status: 'idle' as const, load: vi.fn(() => Promise.resolve()) },
+  threadModels: [] as string[],
+  stopWorkflow: vi.fn(() => Promise.resolve()),
+  stopCompaction: vi.fn(() => Promise.resolve()),
+  handleEditMessage: vi.fn(() => Promise.resolve()),
+  handleRegenerate: vi.fn(() => Promise.resolve()),
+  handleRetry: vi.fn(() => Promise.resolve()),
+  clearReturnedSteering: vi.fn(),
+  clearReturnedEdit: vi.fn(),
+  handleRejectCreateWorkspace: vi.fn(() => Promise.resolve()),
+  handleApproveStartQuestion: vi.fn(() => Promise.resolve()),
+  handleRejectStartQuestion: vi.fn(() => Promise.resolve()),
+  handleRejectPTCAgent: vi.fn(() => Promise.resolve()),
+  handleApproveSecretaryAction: vi.fn(() => Promise.resolve()),
+  handleRejectSecretaryAction: vi.fn(() => Promise.resolve()),
+  handleResumeCreditPause: vi.fn(() => Promise.resolve()),
+  handleApproveToolCall: vi.fn(() => Promise.resolve()),
+  handleRejectToolCall: vi.fn(() => Promise.resolve()),
+  handleSkipQuestion: vi.fn(() => Promise.resolve()),
+  feedbackByTurn: {},
+  handleThumbUp: vi.fn(() => Promise.resolve(null)),
+  handleThumbDown: vi.fn(() => Promise.resolve(null)),
+  clearFallbackSuggestion: vi.fn(),
+  setIsCompacting: vi.fn(),
+  reportBackOwedThreads: [] as import('@/pages/ChatAgent/utils/api/messages').ReportBackOwedThread[],
+  isOwnRun: () => false,
+  reconnectIfStaleRun: vi.fn(),
+  insertNotification: vi.fn(),
+  getSubagentHistory: () => null,
+  subagentHistoryEntries: {},
+  resolveSubagentIdToAgentId: (id: string) => id,
+  hydrateTaskTranscript: vi.fn(() => Promise.resolve(null)),
+  sendSubagentInstruction: vi.fn(() => Promise.resolve()),
+}));
+const STABLE_EDIT_DRAFTS = createEditDraftStore(() => 'th-1');
+
 vi.mock('@/pages/ChatAgent/hooks/useChatMessages', () => ({
   useChatMessages: (): ReturnType<typeof useChatMessagesType> => ({
     messages: mockMessages.current,
-    liveMessages: {
-      get: () => mockMessages.current,
-      subscribe: () => () => {},
-    },
+    liveMessages: STABLE_CHAT_HELPERS.liveMessages,
     isLoading: false,
     hasActiveSubagents: false,
     isLoadingHistory: false,
     historyLoadFailed: false,
     isLoadingThread: false,
-    olderHistory: { status: 'idle', load: vi.fn(() => Promise.resolve()) },
+    olderHistory: STABLE_CHAT_HELPERS.olderHistory,
     isReconnecting: false,
     messageError: null,
     threadId: 'th-1',
     isShared: true,
-    threadModels: [],
+    threadModels: STABLE_CHAT_HELPERS.threadModels,
     marketWatch: null,
     handleSendMessage: mockSendMessage,
-    stopWorkflow: vi.fn(() => Promise.resolve()),
-    stopCompaction: vi.fn(() => Promise.resolve()),
-    handleEditMessage: vi.fn(() => Promise.resolve()),
-    handleRegenerate: vi.fn(() => Promise.resolve()),
-    handleRetry: vi.fn(() => Promise.resolve()),
+    stopWorkflow: STABLE_CHAT_HELPERS.stopWorkflow,
+    stopCompaction: STABLE_CHAT_HELPERS.stopCompaction,
+    handleEditMessage: STABLE_CHAT_HELPERS.handleEditMessage,
+    handleRegenerate: STABLE_CHAT_HELPERS.handleRegenerate,
+    handleRetry: STABLE_CHAT_HELPERS.handleRetry,
     returnedSteering: null,
-    clearReturnedSteering: vi.fn(),
+    clearReturnedSteering: STABLE_CHAT_HELPERS.clearReturnedSteering,
     returnedEdit: null,
-    clearReturnedEdit: vi.fn(),
-    editDrafts: createEditDraftStore(() => 'th-1'),
+    clearReturnedEdit: STABLE_CHAT_HELPERS.clearReturnedEdit,
+    editDrafts: STABLE_EDIT_DRAFTS,
     pendingInterrupt: null,
     handleApproveCreateWorkspace: mockApproveCreateWorkspace,
-    handleRejectCreateWorkspace: vi.fn(() => Promise.resolve()),
-    handleApproveStartQuestion: vi.fn(() => Promise.resolve()),
-    handleRejectStartQuestion: vi.fn(() => Promise.resolve()),
+    handleRejectCreateWorkspace: STABLE_CHAT_HELPERS.handleRejectCreateWorkspace,
+    handleApproveStartQuestion: STABLE_CHAT_HELPERS.handleApproveStartQuestion,
+    handleRejectStartQuestion: STABLE_CHAT_HELPERS.handleRejectStartQuestion,
     handleApprovePTCAgent: mockApprovePTCAgent,
-    handleRejectPTCAgent: vi.fn(() => Promise.resolve()),
-    handleApproveSecretaryAction: vi.fn(() => Promise.resolve()),
-    handleRejectSecretaryAction: vi.fn(() => Promise.resolve()),
-    handleResumeCreditPause: vi.fn(() => Promise.resolve()),
-    handleApproveToolCall: vi.fn(() => Promise.resolve()),
-    handleRejectToolCall: vi.fn(() => Promise.resolve()),
+    handleRejectPTCAgent: STABLE_CHAT_HELPERS.handleRejectPTCAgent,
+    handleApproveSecretaryAction: STABLE_CHAT_HELPERS.handleApproveSecretaryAction,
+    handleRejectSecretaryAction: STABLE_CHAT_HELPERS.handleRejectSecretaryAction,
+    handleResumeCreditPause: STABLE_CHAT_HELPERS.handleResumeCreditPause,
+    handleApproveToolCall: STABLE_CHAT_HELPERS.handleApproveToolCall,
+    handleRejectToolCall: STABLE_CHAT_HELPERS.handleRejectToolCall,
     handleAnswerQuestion: mockAnswerQuestion,
-    handleSkipQuestion: vi.fn(() => Promise.resolve()),
-    feedbackByTurn: {},
-    handleThumbUp: vi.fn(() => Promise.resolve(null)),
-    handleThumbDown: vi.fn(() => Promise.resolve(null)),
+    handleSkipQuestion: STABLE_CHAT_HELPERS.handleSkipQuestion,
+    feedbackByTurn: STABLE_CHAT_HELPERS.feedbackByTurn,
+    handleThumbUp: STABLE_CHAT_HELPERS.handleThumbUp,
+    handleThumbDown: STABLE_CHAT_HELPERS.handleThumbDown,
     workspaceStarting: false,
     fallbackSuggestion: null,
-    clearFallbackSuggestion: vi.fn(),
+    clearFallbackSuggestion: STABLE_CHAT_HELPERS.clearFallbackSuggestion,
     modelStatus: null,
     isCompacting: false,
     compactionTokens: null,
-    setIsCompacting: vi.fn(),
+    setIsCompacting: STABLE_CHAT_HELPERS.setIsCompacting,
     queuedSend: false,
     awaitingReportBack: false,
     reportBackOwed: false,
-    reportBackOwedThreads: [],
-    isOwnRun: () => false,
-    reconnectIfStaleRun: vi.fn(),
+    reportBackOwedThreads: STABLE_CHAT_HELPERS.reportBackOwedThreads,
+    isOwnRun: STABLE_CHAT_HELPERS.isOwnRun,
+    reconnectIfStaleRun: STABLE_CHAT_HELPERS.reconnectIfStaleRun,
     tokenUsage: null,
-    insertNotification: vi.fn(),
-    getSubagentHistory: () => null,
-    subagentHistoryEntries: {},
-    resolveSubagentIdToAgentId: (id: string) => id,
-    hydrateTaskTranscript: vi.fn(() => Promise.resolve(null)),
-    sendSubagentInstruction: vi.fn(() => Promise.resolve()),
+    insertNotification: STABLE_CHAT_HELPERS.insertNotification,
+    getSubagentHistory: STABLE_CHAT_HELPERS.getSubagentHistory,
+    subagentHistoryEntries: STABLE_CHAT_HELPERS.subagentHistoryEntries,
+    resolveSubagentIdToAgentId: STABLE_CHAT_HELPERS.resolveSubagentIdToAgentId,
+    hydrateTaskTranscript: STABLE_CHAT_HELPERS.hydrateTaskTranscript,
+    sendSubagentInstruction: STABLE_CHAT_HELPERS.sendSubagentInstruction,
   }),
 }));
 
@@ -177,25 +221,27 @@ vi.mock('@/pages/ChatAgent/components/WorkflowRunDetail', () => ({
   },
 }));
 
-vi.mock('@/pages/ChatAgent/hooks/useCardState', () => ({
-  useCardState: () => ({
-    cards: {
-      'subagent-task:wf-1': {
-        subagentData: {
-          id: 'task:wf-1',
-          taskId: 'wf-1',
-          type: 'workflow',
-          status: 'running',
-          title: 'Workflow Run',
-          messages: [],
-        },
+const STABLE_CARD_STATE = vi.hoisted(() => ({
+  cards: {
+    'subagent-task:wf-1': {
+      subagentData: {
+        id: 'task:wf-1',
+        taskId: 'wf-1',
+        type: 'workflow',
+        status: 'running',
+        title: 'Workflow Run',
+        messages: [],
       },
     },
-    updateTodoListCard: vi.fn(),
-    updateSubagentCard: vi.fn(),
-    finalizePendingTodos: vi.fn(),
-    clearSubagentCards: vi.fn(),
-  }),
+  },
+  updateTodoListCard: vi.fn(),
+  updateSubagentCard: vi.fn(),
+  finalizePendingTodos: vi.fn(),
+  clearSubagentCards: vi.fn(),
+}));
+
+vi.mock('@/pages/ChatAgent/hooks/useCardState', () => ({
+  useCardState: () => STABLE_CARD_STATE,
 }));
 
 import {
@@ -219,13 +265,15 @@ import ChatView from '@/pages/ChatAgent/components/ChatView';
 import { useActiveThreadPublisher } from '@/lib/threadLifecycle/useActiveThreadPublisher';
 import { applySnapshot, resetThreadLifecycle } from '@/lib/threadLifecycle/store';
 
+const STABLE_WORKSPACE_FILES = vi.hoisted(() => ({
+  files: ['results/nvda_memo.md', 'data/revenue.csv'],
+  loading: false,
+  error: null,
+  refresh: vi.fn(),
+}));
+
 vi.mock('@/pages/ChatAgent/hooks/useWorkspaceFiles', () => ({
-  useWorkspaceFiles: () => ({
-    files: ['results/nvda_memo.md', 'data/revenue.csv'],
-    loading: false,
-    error: null,
-    refresh: vi.fn(),
-  }),
+  useWorkspaceFiles: () => STABLE_WORKSPACE_FILES,
 }));
 
 const SAMPLE_TEAM_RESPONSE: TeamWorkspacesResponse = {
@@ -1054,15 +1102,16 @@ describe('Dalton Team Sharing', () => {
     expect(screen.getByTestId('team-workspace-access-ws-rw-1')).toHaveTextContent('可读写');
   });
 
-  it('renders WorkspaceSharingModal with two 3-option radio groups and saves sharing settings', async () => {
+  it('renders WorkspaceSharingModal via portal under document.body with token overlay, supports Esc/backdrop dismiss, and saves sharing settings', async () => {
     const { default: i18n } = await import('@/i18n');
     await i18n.changeLanguage('zh-CN');
     onTestFinished(async () => {
       await i18n.changeLanguage('en-US');
     });
+    const wsId = '11111111-1111-4111-8111-111111111111';
     const queryClient = createTestQueryClient();
-    queryClient.setQueryData(queryKeys.dalton.sharing('ws-own-1'), {
-      workspace_id: 'ws-own-1',
+    queryClient.setQueryData(queryKeys.dalton.sharing(wsId), {
+      workspace_id: wsId,
       cos_access: 'ro',
       web_access: 'hidden',
       is_home: false,
@@ -1072,7 +1121,7 @@ describe('Dalton Team Sharing', () => {
     });
     mockApiPut.mockResolvedValueOnce({
       data: {
-        workspace_id: 'ws-own-1',
+        workspace_id: wsId,
         cos_access: 'rw',
         web_access: 'ro',
         is_home: false,
@@ -1082,23 +1131,51 @@ describe('Dalton Team Sharing', () => {
       },
     });
 
-    renderWithProviders(<WorkspaceSharingModal workspaceId="ws-own-1" />, {
-      queryClient,
-    });
+    renderWithProviders(
+      <div className="enter-fade-up" data-testid="transformed-header-wrapper">
+        <WorkspaceSharingModal workspaceId={wsId} />
+      </div>,
+      { queryClient },
+    );
 
+    const control = screen.getByTestId('workspace-sharing-control');
     const trigger = screen.getByTestId('workspace-sharing-button');
     expect(trigger).toHaveTextContent('共享设置');
     fireEvent.click(trigger);
 
+    // 1. Portaled directly under document.body, outside the transformed parent
+    const roleDialog = screen.getByRole('dialog');
     const dialog = screen.getByTestId('workspace-sharing-modal');
     expect(dialog).toBeInTheDocument();
+    expect(control.contains(roleDialog)).toBe(false);
+    const backdrop = roleDialog.parentElement as HTMLElement;
+    expect(backdrop).not.toBeNull();
+    expect(backdrop.parentElement).toBe(document.body);
+
+    // 2. Backdrop uses the design token (--color-bg-overlay-strong) instead of hardcoded bg-black/50
+    expect(backdrop.style.backgroundColor).toBe('var(--color-bg-overlay-strong)');
+    expect(backdrop.className).not.toContain('bg-black/50');
+
+    // 3. Escape closes the dialog
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(screen.queryByRole('dialog')).toBeNull();
+
+    // 4. Backdrop click closes the dialog
+    fireEvent.click(trigger);
+    const reopenedBackdrop = screen.getByRole('dialog').parentElement as HTMLElement;
+    fireEvent.mouseDown(reopenedBackdrop, { button: 0, clientX: 12, clientY: 12 });
+    fireEvent.mouseUp(reopenedBackdrop, { button: 0, clientX: 12, clientY: 12 });
+    fireEvent.click(reopenedBackdrop, { button: 0, clientX: 12, clientY: 12 });
+    expect(screen.queryByRole('dialog')).toBeNull();
+
+    // 5. Re-open, verify all two 3-option radio groups reflect initial state, edit, and save
+    fireEvent.click(trigger);
     expect(screen.getByText('别人的 Chief of Staff')).toBeInTheDocument();
     expect(screen.getByText('别人的网页界面')).toBeInTheDocument();
     expect(screen.getByTestId('sharing-home-note')).toHaveTextContent(
       'Home 工作区始终不对他人开放',
     );
 
-    // Verify all two 3-option radio groups exist and reflect initial state
     const cosRw = screen.getByTestId('sharing-cos-rw') as HTMLInputElement;
     const cosRo = screen.getByTestId('sharing-cos-ro') as HTMLInputElement;
     const cosHidden = screen.getByTestId('sharing-cos-hidden') as HTMLInputElement;
@@ -1113,7 +1190,6 @@ describe('Dalton Team Sharing', () => {
     expect(webRw.checked).toBe(false);
     expect(webRo.checked).toBe(false);
 
-    // Change cos_access to rw and web_access to ro, then save
     fireEvent.click(cosRw);
     fireEvent.click(webRo);
     expect(cosRw.checked).toBe(true);
@@ -1122,7 +1198,7 @@ describe('Dalton Team Sharing', () => {
 
     await waitFor(() => {
       expect(mockApiPut).toHaveBeenCalledWith(
-        '/api/v1/dalton/workspaces/ws-own-1/sharing',
+        `/api/v1/dalton/workspaces/${wsId}/sharing`,
         { cos_access: 'rw', web_access: 'ro' },
       );
     });

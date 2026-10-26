@@ -1,8 +1,10 @@
 /* eslint-disable react-refresh/only-export-components */
-import React, { useState } from 'react';
+import React, { useId, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
-import { Share2, X } from 'lucide-react';
+import { Share2 } from 'lucide-react';
+import { ModalShell } from '@/components/ui/ModalShell';
 import { queryKeys } from '@/lib/queryKeys';
 import {
   fetchWorkspaceSharing,
@@ -72,6 +74,7 @@ export function WorkspaceSharingModal({
   compact?: boolean;
 }): React.ReactElement | null {
   const { t } = useTranslation();
+  const titleId = useId();
   const [open, setOpen] = useState(false);
   const { data, isLoading, isError } = useWorkspaceSharing(workspaceId);
   const mutation = useUpdateWorkspaceSharing(workspaceId);
@@ -91,6 +94,11 @@ export function WorkspaceSharingModal({
     setDraftCos(cosAccess);
     setDraftWeb(webAccess);
     setOpen(true);
+  };
+
+  const handleClose = () => {
+    if (mutation.isPending) return;
+    setOpen(false);
   };
 
   const handleSave = () => {
@@ -119,7 +127,7 @@ export function WorkspaceSharingModal({
         }`}
         style={{
           borderColor: 'var(--color-border-muted)',
-          backgroundColor: 'var(--color-bg-elevated, transparent)',
+          backgroundColor: 'var(--color-bg-elevated)',
           color: 'var(--color-text-secondary)',
         }}
         title={t('dalton.sharing.title', '共享设置')}
@@ -128,137 +136,132 @@ export function WorkspaceSharingModal({
         <span>{t('dalton.sharing.title', '共享设置')}</span>
       </button>
 
-      {open && (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
-          data-testid="workspace-sharing-modal-backdrop"
-          onClick={() => setOpen(false)}
-        >
-          <div
-            role="dialog"
-            aria-modal="true"
-            aria-label={t('dalton.sharing.title', '共享设置')}
-            data-testid="workspace-sharing-modal"
-            onClick={(e) => e.stopPropagation()}
-            className="w-full max-w-md rounded-xl border p-5 shadow-xl flex flex-col gap-4"
-            style={{
-              borderColor: 'var(--color-border-muted)',
-              backgroundColor: 'var(--color-bg-page)',
-              color: 'var(--color-text-primary)',
-            }}
+      {open &&
+        typeof document !== 'undefined' &&
+        createPortal(
+          <ModalShell
+            labelId={titleId}
+            title={t('dalton.sharing.title', '共享设置')}
+            onClose={handleClose}
+            closeDisabled={mutation.isPending}
+            width="narrow"
+            density="form"
+            footer={
+              <div className="flex items-center justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={handleClose}
+                  disabled={mutation.isPending}
+                  data-testid="sharing-cancel-btn"
+                  className="px-3 py-1.5 rounded-md text-xs border transition-colors hover:bg-foreground/5 disabled:opacity-50"
+                  style={{
+                    borderColor: 'var(--color-border-muted)',
+                    color: 'var(--color-text-secondary)',
+                  }}
+                >
+                  {t('common.cancel', '取消')}
+                </button>
+                <button
+                  type="button"
+                  disabled={!canEdit || mutation.isPending}
+                  onClick={handleSave}
+                  data-testid="sharing-save-btn"
+                  className="px-3 py-1.5 rounded-md text-xs font-medium transition-opacity hover:opacity-90 disabled:opacity-50 disabled:cursor-not-allowed"
+                  style={{
+                    backgroundColor: 'var(--color-btn-primary-bg)',
+                    color: 'var(--color-btn-primary-text)',
+                  }}
+                >
+                  {t('common.save', '保存')}
+                </button>
+              </div>
+            }
           >
-            <div className="flex items-center justify-between">
-              <h2 className="text-sm font-semibold">
-                {t('dalton.sharing.title', '共享设置')}
-              </h2>
-              <button
-                type="button"
-                aria-label={t('common.close', '关闭')}
-                data-testid="sharing-close-btn"
-                onClick={() => setOpen(false)}
-                className="p-1 rounded-md hover:bg-foreground/10 transition-colors"
-              >
-                <X className="h-4 w-4" />
-              </button>
-            </div>
-
-            <fieldset
-              className="flex flex-col gap-2"
-              disabled={!canEdit || mutation.isPending}
-              data-testid="sharing-cos-fieldset"
+            <div
+              data-testid="workspace-sharing-modal"
+              className="flex flex-col gap-4"
+              style={{ color: 'var(--color-text-primary)' }}
             >
-              <legend className="text-xs font-medium mb-1" style={{ color: 'var(--color-text-secondary)' }}>
-                {t('dalton.sharing.cosLabel', '别人的 Chief of Staff')}
-              </legend>
-              <div className="flex items-center gap-4">
-                {ACCESS_OPTIONS.map((opt) => (
-                  <label
-                    key={`cos-${opt.value}`}
-                    className={`inline-flex items-center gap-1.5 text-xs ${
-                      canEdit ? 'cursor-pointer' : 'cursor-not-allowed opacity-60'
-                    }`}
-                  >
-                    <input
-                      type="radio"
-                      name="cos_access"
-                      value={opt.value}
-                      checked={draftCos === opt.value}
-                      disabled={!canEdit || mutation.isPending}
-                      onChange={() => setDraftCos(opt.value)}
-                      data-testid={`sharing-cos-${opt.value}`}
-                    />
-                    <span>{t(opt.labelKey, opt.labelZh)}</span>
-                  </label>
-                ))}
-              </div>
-            </fieldset>
-
-            <fieldset
-              className="flex flex-col gap-2"
-              disabled={!canEdit || mutation.isPending}
-              data-testid="sharing-web-fieldset"
-            >
-              <legend className="text-xs font-medium mb-1" style={{ color: 'var(--color-text-secondary)' }}>
-                {t('dalton.sharing.webLabel', '别人的网页界面')}
-              </legend>
-              <div className="flex items-center gap-4">
-                {ACCESS_OPTIONS.map((opt) => (
-                  <label
-                    key={`web-${opt.value}`}
-                    className={`inline-flex items-center gap-1.5 text-xs ${
-                      canEdit ? 'cursor-pointer' : 'cursor-not-allowed opacity-60'
-                    }`}
-                  >
-                    <input
-                      type="radio"
-                      name="web_access"
-                      value={opt.value}
-                      checked={draftWeb === opt.value}
-                      disabled={!canEdit || mutation.isPending}
-                      onChange={() => setDraftWeb(opt.value)}
-                      data-testid={`sharing-web-${opt.value}`}
-                    />
-                    <span>{t(opt.labelKey, opt.labelZh)}</span>
-                  </label>
-                ))}
-              </div>
-            </fieldset>
-
-            <p
-              className="text-xs"
-              style={{ color: 'var(--color-text-tertiary)' }}
-              data-testid="sharing-home-note"
-            >
-              {t('dalton.sharing.homeNote', 'Home 工作区始终不对他人开放')}
-            </p>
-
-            <div className="flex items-center justify-end gap-2 pt-1">
-              <button
-                type="button"
-                onClick={() => setOpen(false)}
-                data-testid="sharing-cancel-btn"
-                className="px-3 py-1.5 rounded-md text-xs border transition-colors hover:bg-foreground/5"
-                style={{ borderColor: 'var(--color-border-muted)' }}
-              >
-                {t('common.cancel', '取消')}
-              </button>
-              <button
-                type="button"
+              <fieldset
+                className="flex flex-col gap-2"
                 disabled={!canEdit || mutation.isPending}
-                onClick={handleSave}
-                data-testid="sharing-save-btn"
-                className="px-3 py-1.5 rounded-md text-xs font-medium transition-opacity hover:opacity-90 disabled:opacity-50 disabled:cursor-not-allowed"
-                style={{
-                  backgroundColor: 'var(--color-btn-primary-bg, #10b981)',
-                  color: 'var(--color-btn-primary-text, #ffffff)',
-                }}
+                data-testid="sharing-cos-fieldset"
               >
-                {t('common.save', '保存')}
-              </button>
+                <legend
+                  className="text-xs font-medium mb-1"
+                  style={{ color: 'var(--color-text-secondary)' }}
+                >
+                  {t('dalton.sharing.cosLabel', '别人的 Chief of Staff')}
+                </legend>
+                <div className="flex items-center gap-4">
+                  {ACCESS_OPTIONS.map((opt) => (
+                    <label
+                      key={`cos-${opt.value}`}
+                      className={`inline-flex items-center gap-1.5 text-xs ${
+                        canEdit ? 'cursor-pointer' : 'cursor-not-allowed opacity-60'
+                      }`}
+                    >
+                      <input
+                        type="radio"
+                        name="cos_access"
+                        value={opt.value}
+                        checked={draftCos === opt.value}
+                        disabled={!canEdit || mutation.isPending}
+                        onChange={() => setDraftCos(opt.value)}
+                        data-testid={`sharing-cos-${opt.value}`}
+                      />
+                      <span>{t(opt.labelKey, opt.labelZh)}</span>
+                    </label>
+                  ))}
+                </div>
+              </fieldset>
+
+              <fieldset
+                className="flex flex-col gap-2"
+                disabled={!canEdit || mutation.isPending}
+                data-testid="sharing-web-fieldset"
+              >
+                <legend
+                  className="text-xs font-medium mb-1"
+                  style={{ color: 'var(--color-text-secondary)' }}
+                >
+                  {t('dalton.sharing.webLabel', '别人的网页界面')}
+                </legend>
+                <div className="flex items-center gap-4">
+                  {ACCESS_OPTIONS.map((opt) => (
+                    <label
+                      key={`web-${opt.value}`}
+                      className={`inline-flex items-center gap-1.5 text-xs ${
+                        canEdit ? 'cursor-pointer' : 'cursor-not-allowed opacity-60'
+                      }`}
+                    >
+                      <input
+                        type="radio"
+                        name="web_access"
+                        value={opt.value}
+                        checked={draftWeb === opt.value}
+                        disabled={!canEdit || mutation.isPending}
+                        onChange={() => setDraftWeb(opt.value)}
+                        data-testid={`sharing-web-${opt.value}`}
+                      />
+                      <span>{t(opt.labelKey, opt.labelZh)}</span>
+                    </label>
+                  ))}
+                </div>
+              </fieldset>
+
+              <p
+                className="text-xs"
+                style={{ color: 'var(--color-text-tertiary)' }}
+                data-testid="sharing-home-note"
+              >
+                {t('dalton.sharing.homeNote', 'Home 工作区始终不对他人开放')}
+              </p>
+
             </div>
-          </div>
-        </div>
-      )}
+          </ModalShell>,
+          document.body,
+        )}
     </div>
   );
 }
