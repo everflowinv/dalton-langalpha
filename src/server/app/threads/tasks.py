@@ -34,16 +34,18 @@ async def get_subagent_task_status(
     ``{status, error}`` on demand so the view can hydrate without a full
     thread reload — the same ledger truth replay stamps at load time.
     """
-    # --- DALTON-HOOK(team-sharing): begin ---
+    # --- DALTON-HOOK(workspace-sharing-settings): begin ---
     from src.dalton.settings import is_dalton_supabase_auth_enabled
 
     if is_dalton_supabase_auth_enabled():
-        from src.dalton.sharing import require_thread_reader
+        from src.dalton.sharing import require_thread_access
 
-        await require_thread_reader(thread_id, x_user_id)
+        await require_thread_access(
+            thread_id, x_user_id, channel="web", need="read"
+        )
     else:
         await auth_api.require_thread_owner(thread_id, x_user_id)
-    # --- DALTON-HOOK(team-sharing): end ---
+    # --- DALTON-HOOK(workspace-sharing-settings): end ---
     from src.server.services.history.task_status import resolve_task_details
 
     details = await resolve_task_details(thread_id, [task_id])
@@ -73,16 +75,18 @@ async def get_subagent_task_history(
     items replay emits (empty for an unknown or still-running task, whose
     transcript belongs to its live stream).
     """
-    # --- DALTON-HOOK(team-sharing): begin ---
+    # --- DALTON-HOOK(workspace-sharing-settings): begin ---
     from src.dalton.settings import is_dalton_supabase_auth_enabled
 
     if is_dalton_supabase_auth_enabled():
-        from src.dalton.sharing import require_thread_reader
+        from src.dalton.sharing import require_thread_access
 
-        await require_thread_reader(thread_id, x_user_id)
+        await require_thread_access(
+            thread_id, x_user_id, channel="web", need="read"
+        )
     else:
         await auth_api.require_thread_owner(thread_id, x_user_id)
-    # --- DALTON-HOOK(team-sharing): end ---
+    # --- DALTON-HOOK(workspace-sharing-settings): end ---
     from src.server.services.history.replay.run_lane import (
         project_task_transcript,
     )

@@ -119,29 +119,110 @@ def error_command(error: str, tool_call_id: str) -> Command:
 
 
 async def verify_workspace_owner(
-    workspace_id: str, user_id: str, tool_call_id: str
+    workspace_id: str,
+    user_id: str,
+    tool_call_id: str,
+    *,
+    need: str = "read",
+    owner_only: bool = False,
 ) -> Command | None:
-    """Return error Command if user doesn't own workspace, else None."""
+    """Return error Command if user cannot access workspace, else None."""
     from src.server.database.workspace import get_workspace
 
     ws = await get_workspace(workspace_id)
-    if not ws or str(ws.get("user_id")) != user_id:
+    if not ws:
         return error_command("workspace not found", tool_call_id)
-    return None
+    if str(ws.get("user_id")) == user_id:
+        return None
+    # --- DALTON-HOOK(workspace-sharing-settings): begin ---
+    if not owner_only:
+        from fastapi import HTTPException
+        from src.dalton.settings import is_dalton_supabase_auth_enabled
+
+        if is_dalton_supabase_auth_enabled():
+            from src.dalton.sharing import require_workspace_access
+
+            try:
+                await require_workspace_access(
+                    ws,
+                    user_id,
+                    channel="cos",
+                    need=need,
+                    workspace=ws,
+                )
+                return None
+            except HTTPException as exc:
+                if exc.status_code == 403 and need == "write":
+                    try:
+                        await require_workspace_access(
+                            ws,
+                            user_id,
+                            channel="cos",
+                            need="read",
+                            workspace=ws,
+                        )
+                    except HTTPException:
+                        return error_command("workspace not found", tool_call_id)
+                    return error_command("该工作区对你只读", tool_call_id)
+                return error_command("workspace not found", tool_call_id)
+    # --- DALTON-HOOK(workspace-sharing-settings): end ---
+    return error_command("workspace not found", tool_call_id)
 
 
 async def verify_thread_owner(
-    thread_id: str, user_id: str, tool_call_id: str
+    thread_id: str,
+    user_id: str,
+    tool_call_id: str,
+    *,
+    need: str = "read",
+    owner_only: bool = False,
 ) -> Command | None:
-    """Return error Command if user doesn't own thread, else None."""
+    """Return error Command if user cannot access thread, else None."""
     from src.server.database.conversation.threads_read import get_thread_owner_id
 
     try:
         owner_id = await get_thread_owner_id(thread_id)
-        if owner_id != user_id:
-            return error_command(
-                "thread not found or not owned by user", tool_call_id
-            )
+        if owner_id == user_id:
+            return None
+        # --- DALTON-HOOK(workspace-sharing-settings): begin ---
+        if not owner_only and owner_id is not None:
+            from fastapi import HTTPException
+            from src.dalton.settings import is_dalton_supabase_auth_enabled
+
+            if is_dalton_supabase_auth_enabled():
+                from src.dalton.sharing import require_thread_access
+
+                try:
+                    await require_thread_access(
+                        thread_id,
+                        user_id,
+                        channel="cos",
+                        need=need,
+                        owner_id=str(owner_id),
+                    )
+                    return None
+                except HTTPException as exc:
+                    if exc.status_code == 403 and need == "write":
+                        try:
+                            await require_thread_access(
+                                thread_id,
+                                user_id,
+                                channel="cos",
+                                need="read",
+                                owner_id=str(owner_id),
+                            )
+                        except HTTPException:
+                            return error_command(
+                                "thread not found or not owned by user", tool_call_id
+                            )
+                        return error_command("该工作区对你只读", tool_call_id)
+                    return error_command(
+                        "thread not found or not owned by user", tool_call_id
+                    )
+        # --- DALTON-HOOK(workspace-sharing-settings): end ---
+        return error_command(
+            "thread not found or not owned by user", tool_call_id
+        )
     except Exception as e:
         logger.error(f"Failed to verify thread ownership: {e}")
         return error_command("thread not found", tool_call_id)

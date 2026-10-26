@@ -335,14 +335,30 @@ HOME_NOT_ON_COMPUTER = "Home is not on a computer yet"
 HOME_NOT_ON_COMPUTER_REASON = "home_not_on_computer"
 
 
-async def owned_workspace_on_computer(workspace_id: str, user_id: str) -> dict[str, Any]:
+async def owned_workspace_on_computer(
+    workspace_id: str, user_id: str, *, need: str | None = None
+) -> dict[str, Any]:
     """The caller's workspace, for a route that reaches its files or sandbox.
 
     Refused as any owner check refuses, and with a 400 while it is Home not
     yet on a computer.
     """
     workspace = await db_get_workspace(workspace_id)
-    require_workspace_owner(workspace, user_id=user_id)
+    # --- DALTON-HOOK(workspace-sharing-settings): begin ---
+    if need in ("read", "write"):
+        from src.dalton.settings import is_dalton_supabase_auth_enabled
+
+        if is_dalton_supabase_auth_enabled():
+            from src.dalton.sharing import require_workspace_access
+
+            workspace = await require_workspace_access(
+                workspace, user_id, channel="web", need=need
+            )
+        else:
+            require_workspace_owner(workspace, user_id=user_id)
+    else:
+        require_workspace_owner(workspace, user_id=user_id)
+    # --- DALTON-HOOK(workspace-sharing-settings): end ---
     if is_unbound(workspace):
         raise HTTPException(status_code=400, detail=HOME_NOT_ON_COMPUTER)
     return workspace
@@ -526,6 +542,27 @@ def _is_serve_blocked_path(client_path: str) -> bool:
         or _is_hidden_path(client_path)
         or client_path.startswith(_SYSTEM_DIR_PREFIXES)
     )
+
+
+# --- DALTON-HOOK(workspace-sharing-settings): begin ---
+def _is_non_owner_blocked_path(client_path: str) -> bool:
+    """True when a relative workspace path is hidden, system, or virtual for a colleague."""
+    if not client_path:
+        return True
+    cleaned = client_path.strip("/")
+    if not cleaned:
+        return True
+    with_slash = f"{cleaned}/"
+    return (
+        _is_always_hidden_path(cleaned)
+        or _is_hidden_path(cleaned)
+        or with_slash.startswith(_HIDDEN_DIR_PREFIXES)
+        or _is_system_path(cleaned)
+        or with_slash.startswith(_SYSTEM_DIR_PREFIXES)
+        or _is_virtual_dir(cleaned)
+        or bool(_virtual_file(cleaned))
+    )
+# --- DALTON-HOOK(workspace-sharing-settings): end ---
 
 
 def layout_for(workspace: dict[str, Any], *, manager: Any = None) -> WorkspaceLayout:

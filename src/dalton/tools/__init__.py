@@ -40,6 +40,15 @@ def build_dalton_tools(
     tools: list[BaseTool] = []
 
     if role == "chief_of_staff":
+        if settings.knowledge.enabled:
+            try:
+                from src.dalton.tools.knowledge_tools import create_knowledge_tools
+
+                tools.extend(
+                    create_knowledge_tools(filesystem_backend=filesystem_backend)
+                )
+            except Exception as e:
+                logger.debug("[DALTON_TOOLS] knowledge_tools not loaded: %s", e)
         if settings.autonomy.enabled:
             tools.extend(build_director_tools(role=role, filesystem_backend=filesystem_backend))
             tools.extend(build_coverage_tools(role=role))

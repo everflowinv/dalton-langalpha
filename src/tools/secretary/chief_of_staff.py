@@ -32,6 +32,10 @@ from src.tools.secretary.tools import (
     threads_delete,
     threads_list,
     threads_stop,
+    # DALTON-HOOK(workspace-sharing-settings): CoS file access on colleague workspaces
+    workspace_file_read_cos,
+    workspace_file_write_cos,
+    workspace_files_list_cos,
     workspaces_create,
     workspaces_list,
 )
@@ -52,19 +56,27 @@ async def chief_of_staff_workspaces(
     name: str | None = None,
     description: str | None = None,
     workspace_id: str | None = None,
+    # DALTON-HOOK(workspace-sharing-settings): optional path/content for CoS file read/write
+    path: str | None = None,
+    content: str | None = None,
     tool_call_id: Annotated[str, InjectedToolCallId] = "",
 ) -> Command:
-    """List the user's workspaces, or create or delete one once the user confirms.
+    """List the user's and colleagues' shared workspaces, create or delete the user's own workspace, or list/read/write files in a workspace.
+
+    Use "list_files", "read_file", and "write_file" to inspect or update files in a colleague's
+    shared workspace (which does not share this computer's filesystem); use "write_file" only
+    when the workspace's access is "rw".
 
     Args:
-        action: "list", "create" or "delete".
+        action: "list", "create", "delete", "list_files", "read_file", or "write_file".
         name: Name for the new workspace; required for "create".
         description: What the new workspace is for; optional.
-        workspace_id: The workspace to delete; required for "delete". Home cannot be deleted.
+        workspace_id: Target workspace ID; required for "delete", "list_files", "read_file", and "write_file". Home cannot be deleted.
+        path: Relative directory or file path in workspace_id; optional prefix for "list_files", required for "read_file" and "write_file".
+        content: Full UTF-8 text to write; required for "write_file" (requires "rw" access).
 
     Returns:
-        One short row per workspace, with its id, and its folder (dir_name) when it is on
-        this computer; for "create", the new id.
+        Workspace rows (with colleague owner and access level) for "list", the new id for "create", or file paths/content for file actions.
     """
     user_id = config.get("configurable", {}).get("user_id")
     if not user_id:
@@ -78,8 +90,23 @@ async def chief_of_staff_workspaces(
         )
     if action == "delete":
         return await _workspaces_delete(user_id, workspace_id, tool_call_id)
+    # --- DALTON-HOOK(workspace-sharing-settings): begin ---
+    if action == "list_files":
+        return await workspace_files_list_cos(
+            user_id, workspace_id, path, tool_call_id
+        )
+    if action == "read_file":
+        return await workspace_file_read_cos(
+            user_id, workspace_id, path, tool_call_id
+        )
+    if action == "write_file":
+        return await workspace_file_write_cos(
+            user_id, workspace_id, path, content, tool_call_id
+        )
+    # --- DALTON-HOOK(workspace-sharing-settings): end ---
     return error_command(
-        f"Unknown action: {action}. Use list, create or delete.", tool_call_id
+        f"Unknown action: {action}. Use list, create, delete, list_files, read_file, or write_file.",
+        tool_call_id,
     )
 
 

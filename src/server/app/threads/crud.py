@@ -102,16 +102,18 @@ async def list_threads(
             from src.server.database.workspace import get_workspace as db_get_workspace
 
             workspace = await db_get_workspace(workspace_id)
-            # --- DALTON-HOOK(team-sharing): begin ---
+            # --- DALTON-HOOK(workspace-sharing-settings): begin ---
             from src.dalton.settings import is_dalton_supabase_auth_enabled
 
             if is_dalton_supabase_auth_enabled():
-                from src.dalton.sharing import require_workspace_reader
+                from src.dalton.sharing import require_workspace_access
 
-                await require_workspace_reader(workspace, x_user_id)
+                await require_workspace_access(
+                    workspace, x_user_id, channel="web", need="read"
+                )
             else:
                 require_workspace_owner(workspace, user_id=x_user_id)
-            # --- DALTON-HOOK(team-sharing): end ---
+            # --- DALTON-HOOK(workspace-sharing-settings): end ---
             threads, total = await get_workspace_threads(
                 workspace_id=workspace_id,
                 limit=limit,
@@ -175,16 +177,18 @@ async def list_threads(
 @router.get("/{thread_id}")
 async def get_thread(thread_id: str, x_user_id: CurrentUserId):
     """Get thread metadata. Used by frontend to resolve workspaceId from threadId."""
-    # --- DALTON-HOOK(team-sharing): begin ---
+    # --- DALTON-HOOK(workspace-sharing-settings): begin ---
     from src.dalton.settings import is_dalton_supabase_auth_enabled
 
     if is_dalton_supabase_auth_enabled():
-        from src.dalton.sharing import require_thread_reader
+        from src.dalton.sharing import require_thread_access
 
-        await require_thread_reader(thread_id, x_user_id)
+        await require_thread_access(
+            thread_id, x_user_id, channel="web", need="read"
+        )
     else:
         await auth_api.require_thread_owner(thread_id, x_user_id)
-    # --- DALTON-HOOK(team-sharing): end ---
+    # --- DALTON-HOOK(workspace-sharing-settings): end ---
     thread = await get_thread_by_id(thread_id)
     if not thread:
         raise HTTPException(status_code=404, detail="Thread not found")

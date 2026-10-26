@@ -8,6 +8,8 @@ import { isDaltonAuth } from '@/config/daltonAuth';
 import { queryKeys } from '@/lib/queryKeys';
 import { useUser } from '@/hooks/useUser';
 
+export type TeamAccessMode = 'owner' | 'rw' | 'ro';
+
 export interface TeamWorkspaceItem {
   workspace_id: string;
   user_id: string;
@@ -17,6 +19,9 @@ export interface TeamWorkspaceItem {
   description?: string | null;
   status?: string;
   is_home?: boolean;
+  web_access?: 'rw' | 'ro' | 'hidden';
+  cos_access?: 'rw' | 'ro' | 'hidden';
+  access?: 'rw' | 'ro' | 'hidden';
   updated_at?: string | null;
   last_activity_at?: string | null;
   created_at?: string | null;
@@ -53,13 +58,16 @@ export function useTeamWorkspaces(enabled = true) {
 }
 
 export interface TeamReadOnlyState {
+  access: TeamAccessMode;
+  isColleague: boolean;
   isReadOnly: boolean;
+  canWriteFiles: boolean;
   ownerName: string | null;
   ownerEmail: string | null;
 }
 
 /**
- * Resolve whether the active workspace/thread belongs to a teammate (read-only mode).
+ * Resolve the caller's 3-state access (`owner` | `rw` | `ro`) on the active workspace/thread.
  * Active only when `isDaltonAuth` is true.
  */
 export function useTeamReadOnly(
@@ -71,11 +79,19 @@ export function useTeamReadOnly(
   const { data: teamData } = useTeamWorkspaces(Boolean(workspaceId));
 
   if (!isDaltonAuth || !workspaceId) {
-    return { isReadOnly: false, ownerName: null, ownerEmail: null };
+    return {
+      access: 'owner',
+      isColleague: false,
+      isReadOnly: false,
+      canWriteFiles: true,
+      ownerName: null,
+      ownerEmail: null,
+    };
   }
 
   const navState = (location.state ?? null) as {
     isTeamReadOnly?: boolean;
+    teamAccess?: 'rw' | 'ro';
     teamOwnerName?: string;
     teamOwnerEmail?: string;
   } | null;
@@ -90,8 +106,13 @@ export function useTeamReadOnly(
         member.email ||
         matched.owner_email ||
         '同事';
+      const rawAccess = matched.web_access || matched.access || navState?.teamAccess || 'ro';
+      const mode: TeamAccessMode = rawAccess === 'rw' ? 'rw' : 'ro';
       return {
-        isReadOnly: true,
+        access: mode,
+        isColleague: true,
+        isReadOnly: mode === 'ro',
+        canWriteFiles: mode === 'rw',
         ownerName: display,
         ownerEmail: member.email || matched.owner_email || null,
       };
@@ -107,16 +128,24 @@ export function useTeamReadOnly(
       matchedMember?.email ||
       navState?.teamOwnerName ||
       wsOwnerId;
+    const mode: TeamAccessMode = navState?.teamAccess === 'rw' ? 'rw' : 'ro';
     return {
-      isReadOnly: true,
+      access: mode,
+      isColleague: true,
+      isReadOnly: mode === 'ro',
+      canWriteFiles: mode === 'rw',
       ownerName: display,
       ownerEmail: matchedMember?.email || navState?.teamOwnerEmail || null,
     };
   }
 
   if (navState?.isTeamReadOnly) {
+    const mode: TeamAccessMode = navState.teamAccess === 'rw' ? 'rw' : 'ro';
     return {
-      isReadOnly: true,
+      access: mode,
+      isColleague: true,
+      isReadOnly: mode === 'ro',
+      canWriteFiles: mode === 'rw',
       ownerName: navState.teamOwnerName || '同事',
       ownerEmail: navState.teamOwnerEmail || null,
     };
@@ -126,13 +155,23 @@ export function useTeamReadOnly(
   // user have loaded and confirmed ownership.
   if (!wsOwnerId || !currentUserId) {
     return {
+      access: 'ro',
+      isColleague: true,
       isReadOnly: true,
+      canWriteFiles: false,
       ownerName: navState?.teamOwnerName || '同事',
       ownerEmail: navState?.teamOwnerEmail || null,
     };
   }
 
-  return { isReadOnly: false, ownerName: null, ownerEmail: null };
+  return {
+    access: 'owner',
+    isColleague: false,
+    isReadOnly: false,
+    canWriteFiles: true,
+    ownerName: null,
+    ownerEmail: null,
+  };
 }
 
 function formatShortTime(iso: string | null | undefined): string {
@@ -249,6 +288,8 @@ export function TeamWorkspacesSection({
                       {member.workspaces.map((ws) => {
                         const active = currentWorkspaceId === ws.workspace_id;
                         const timeLabel = formatShortTime(ws.last_activity_at || ws.updated_at);
+                        const wsAccess = (ws.web_access || ws.access) === 'rw' ? 'rw' : 'ro';
+                        const accessBadge = wsAccess === 'rw' ? '可读写' : '只读';
                         return (
                           <button
                             key={ws.workspace_id}
@@ -260,6 +301,7 @@ export function TeamWorkspacesSection({
                                   workspaceName: ws.name,
                                   workspaceStatus: 'stopped',
                                   isTeamReadOnly: true,
+                                  teamAccess: wsAccess,
                                   teamOwnerName: displayLabel,
                                   teamOwnerEmail: member.email,
                                 },
@@ -277,14 +319,26 @@ export function TeamWorkspacesSection({
                               />
                               <span className="truncate">{ws.name}</span>
                             </span>
-                            {timeLabel && (
+                            <span className="flex items-center gap-1.5 shrink-0">
                               <span
-                                className="text-[11px] shrink-0"
-                                style={{ color: 'var(--color-text-tertiary)' }}
+                                data-testid={`team-workspace-access-${ws.workspace_id}`}
+                                className="text-[10px] px-1.5 py-0.5 rounded-full border"
+                                style={{
+                                  borderColor: 'var(--color-border-muted)',
+                                  color: 'var(--color-text-tertiary)',
+                                }}
                               >
-                                {timeLabel}
+                                {accessBadge}
                               </span>
-                            )}
+                              {timeLabel && (
+                                <span
+                                  className="text-[11px] shrink-0"
+                                  style={{ color: 'var(--color-text-tertiary)' }}
+                                >
+                                  {timeLabel}
+                                </span>
+                              )}
+                            </span>
                           </button>
                         );
                       })}
@@ -301,16 +355,19 @@ export function TeamWorkspacesSection({
 }
 
 /**
- * Top read-only banner shown when viewing a teammate's workspace or thread.
+ * Top banner shown when viewing a teammate's workspace or thread.
  */
 export function TeamReadOnlyBanner({
   ownerName,
+  access = 'ro',
   compact = false,
 }: {
   ownerName: string | null;
+  access?: TeamAccessMode;
   compact?: boolean;
 }): React.ReactElement {
-  const label = `只读 · 来自 ${ownerName || '同事'}`;
+  const modeLabel = access === 'rw' ? '可读写' : '只读';
+  const label = `${modeLabel} · 来自 ${ownerName || '同事'}`;
   return (
     <div
       data-testid="team-readonly-banner"
@@ -335,10 +392,16 @@ export function TeamReadOnlyBanner({
  */
 export function TeamReadOnlyComposer({
   ownerName,
+  access = 'ro',
 }: {
   ownerName: string | null;
+  access?: TeamAccessMode;
 }): React.ReactElement {
-  const label = `只读 · 来自 ${ownerName || '同事'}（无法发送消息或新建对话）`;
+  const label =
+    access === 'rw'
+      ? `可读写（文件） · 来自 ${ownerName || '同事'}（发送消息与派活：该功能下一期开放）`
+      : `只读 · 来自 ${ownerName || '同事'}（无法发送消息或新建对话）`;
+  const buttonTitle = access === 'rw' ? '该功能下一期开放' : '只读模式下不可发送';
   return (
     <div
       data-testid="team-readonly-composer"
@@ -362,7 +425,7 @@ export function TeamReadOnlyComposer({
         type="button"
         disabled
         aria-label="发送"
-        title="只读模式下不可发送"
+        title={buttonTitle}
         className="p-1.5 rounded-md cursor-not-allowed opacity-50"
         style={{ color: 'var(--color-text-tertiary)' }}
       >

@@ -90,6 +90,11 @@ class WorkspaceTrackingUpdateRequest(BaseModel):
     tier: str | None = None
 
 
+class WorkspaceSharingUpdateRequest(BaseModel):
+    cos_access: str | None = None
+    web_access: str | None = None
+
+
 class SystemJobToggleRequest(BaseModel):
     enabled: bool
 
@@ -348,6 +353,161 @@ async def list_team_workspaces_endpoint(
     return {"members": members}
 
 
+@router.get("/workspaces/{workspace_id}/sharing")
+@handle_api_exceptions("get workspace sharing settings", logger)
+async def get_workspace_sharing_endpoint(
+    workspace_id: str,
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    from src.server.database.home_workspace import is_home_row
+    from src.dalton.settings import is_dalton_supabase_auth_enabled
+    from src.dalton.sharing import (
+        can_edit_workspace_sharing,
+        get_workspace_sharing,
+        require_team_reader,
+        require_workspace_access,
+    )
+    from src.server.database import workspace as ws_db
+
+    uid = str(user_id or "").strip()
+    if not uid:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    is_pm = uid in get_dalton_settings().pm_user_ids
+    if is_dalton_supabase_auth_enabled() and not is_pm:
+        await require_team_reader(uid)
+
+    ws = await ws_db.get_workspace(workspace_id)
+    if ws is None or ws.get("status") == "deleted":
+        raise HTTPException(status_code=404, detail="Workspace not found")
+
+    is_home = is_home_row(ws) or bool(ws.get("is_home"))
+    owner_id = str(ws.get("user_id") or "").strip()
+    if is_home:
+        if owner_id != uid:
+            raise HTTPException(
+                status_code=403,
+                detail="Home workspace is not shared with team members",
+            )
+        return {
+            "workspace_id": str(ws["workspace_id"]),
+            "cos_access": "hidden",
+            "web_access": "hidden",
+            "is_home": True,
+            "can_edit": False,
+            "updated_by": None,
+            "updated_at": None,
+        }
+
+    can_edit = can_edit_workspace_sharing(ws, uid)
+    if not can_edit:
+        if is_dalton_supabase_auth_enabled():
+            await require_workspace_access(
+                ws,
+                uid,
+                channel="web",
+                need="read",
+                workspace=ws,
+            )
+        else:
+            raise HTTPException(
+                status_code=403,
+                detail="Not authorized to access this workspace",
+            )
+
+    sharing = await get_workspace_sharing(str(ws["workspace_id"]))
+    return {
+        **sharing,
+        "is_home": False,
+        "can_edit": can_edit,
+    }
+
+
+@router.put("/workspaces/{workspace_id}/sharing")
+@handle_api_exceptions("update workspace sharing settings", logger)
+async def update_workspace_sharing_endpoint(
+    workspace_id: str,
+    body: WorkspaceSharingUpdateRequest,
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    from src.server.database.home_workspace import is_home_row
+    from src.dalton.settings import is_dalton_supabase_auth_enabled
+    from src.dalton.sharing import (
+        VALID_ACCESS_LEVELS,
+        can_edit_workspace_sharing,
+        require_team_reader,
+        upsert_workspace_sharing,
+    )
+    from src.server.database import workspace as ws_db
+
+    uid = str(user_id or "").strip()
+    if not uid:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    is_pm = uid in get_dalton_settings().pm_user_ids
+    if is_dalton_supabase_auth_enabled() and not is_pm:
+        await require_team_reader(uid)
+
+    ws = await ws_db.get_workspace(workspace_id)
+    if ws is None or ws.get("status") == "deleted":
+        raise HTTPException(status_code=404, detail="Workspace not found")
+
+    is_home = is_home_row(ws) or bool(ws.get("is_home"))
+    owner_id = str(ws.get("user_id") or "").strip()
+    if is_home:
+        if owner_id != uid and not is_pm:
+            raise HTTPException(
+                status_code=403,
+                detail="Home workspace is not shared with team members",
+            )
+        raise HTTPException(
+            status_code=400,
+            detail="Home workspace cannot be shared",
+        )
+
+    if not can_edit_workspace_sharing(ws, uid):
+        raise HTTPException(
+            status_code=403,
+            detail="Only workspace owner or PM may modify sharing settings",
+        )
+
+    if body.cos_access is None and body.web_access is None:
+        raise HTTPException(
+            status_code=400,
+            detail="At least one of cos_access or web_access must be provided",
+        )
+
+    cos_val: str | None = None
+    if body.cos_access is not None:
+        cos_val = str(body.cos_access).strip().lower()
+        if cos_val not in VALID_ACCESS_LEVELS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid cos_access: {body.cos_access!r}",
+            )
+
+    web_val: str | None = None
+    if body.web_access is not None:
+        web_val = str(body.web_access).strip().lower()
+        if web_val not in VALID_ACCESS_LEVELS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid web_access: {body.web_access!r}",
+            )
+
+    saved = await upsert_workspace_sharing(
+        str(ws["workspace_id"]),
+        cos_access=cos_val,
+        web_access=web_val,
+        updated_by=uid,
+    )
+    return {
+        **saved,
+        "is_home": False,
+        "can_edit": True,
+    }
+
+
 @router.get("/credentials/status")
 @handle_api_exceptions("get team credentials status", logger)
 async def get_team_credentials_status_endpoint(
@@ -392,22 +552,16 @@ async def list_knowledge_versions_endpoint(
     from src.dalton.sharing import require_workspace_reader
 
     if is_dalton_supabase_auth_enabled():
-        workspace = await require_workspace_reader(workspace_id, user_id)
+        await require_workspace_reader(workspace_id, user_id)
     else:
-        workspace = await _verify_workspace_access(workspace_id, user_id)
-    owner_id = str((workspace or {}).get("user_id") or user_id)
+        await _verify_workspace_access(workspace_id, user_id)
     rows = await db_knowledge.list_versions(
         workspace_id=workspace_id,
         doc_key=doc,
         limit=limit,
         before=before,
     )
-    items = [
-        r
-        for r in rows
-        if not r.get("user_id") or str(r.get("user_id")) in {str(user_id), owner_id}
-    ]
-    return {"items": items}
+    return {"items": list(rows)}
 
 
 @router.get("/knowledge/{workspace_id}/{doc}/versions/{n}")
@@ -424,18 +578,15 @@ async def get_knowledge_version_endpoint(
     from src.dalton.sharing import require_workspace_reader
 
     if is_dalton_supabase_auth_enabled():
-        workspace = await require_workspace_reader(workspace_id, user_id)
+        await require_workspace_reader(workspace_id, user_id)
     else:
-        workspace = await _verify_workspace_access(workspace_id, user_id)
-    owner_id = str((workspace or {}).get("user_id") or user_id)
+        await _verify_workspace_access(workspace_id, user_id)
     row = await db_knowledge.get_version(
         workspace_id=workspace_id,
         doc_key=doc,
         version_no=n,
     )
-    if row is None or (
-        row.get("user_id") and str(row.get("user_id")) not in {str(user_id), owner_id}
-    ):
+    if row is None:
         raise HTTPException(status_code=404, detail="Knowledge version not found")
     return row
 

@@ -81,6 +81,8 @@ from ._shared import (
     _is_binary,
     HOME_NOT_ON_COMPUTER_REASON,
     _is_hidden_path,
+    # DALTON-HOOK(workspace-sharing-settings): colleague path filter helper
+    _is_non_owner_blocked_path,
     owned_workspace_on_computer,
     _is_system_path,
     _normalize_requested_path,
@@ -177,18 +179,20 @@ async def list_workspace_files(
     """List files in a workspace's sandbox, or from DB if stopped."""
 
     workspace = await db_get_workspace(workspace_id)
-    # --- DALTON-HOOK(team-sharing): begin ---
+    # --- DALTON-HOOK(workspace-sharing-settings): begin ---
     from src.dalton.settings import is_dalton_supabase_auth_enabled
 
     is_non_owner_reader = False
     if is_dalton_supabase_auth_enabled():
-        from src.dalton.sharing import require_workspace_reader
+        from src.dalton.sharing import require_workspace_access
 
-        workspace = await require_workspace_reader(workspace, x_user_id)
+        workspace = await require_workspace_access(
+            workspace, x_user_id, channel="web", need="read"
+        )
         is_non_owner_reader = workspace.get("user_id") != x_user_id
     else:
         require_workspace_owner(workspace, user_id=x_user_id)
-    # --- DALTON-HOOK(team-sharing): end ---
+    # --- DALTON-HOOK(workspace-sharing-settings): end ---
 
     if is_unbound(workspace):
         return {"files": [], "sandbox_ready": False, "reason": HOME_NOT_ON_COMPUTER_REASON}
@@ -202,8 +206,8 @@ async def list_workspace_files(
     if requested_dir is None:
         raise HTTPException(status_code=404, detail="Not found")
 
-    # DALTON-HOOK(team-sharing): non-owner team readers always read from DB mirror (never sandbox)
-    if is_non_owner_reader or (not auto_start and served_from_mirror(workspace.get("status"))):
+    # DALTON-HOOK(workspace-sharing-settings): stopped workspaces read DB mirror (never auto-start for colleagues); running workspaces read live sandbox
+    if served_from_mirror(workspace.get("status")) and (is_non_owner_reader or not auto_start):
         file_tree = await FilePersistenceService.get_file_tree(workspace_id)
         # Filter by path prefix if specified
         normalized_path = _normalize_requested_path(path, work_dir, previous_dirs)
@@ -229,6 +233,7 @@ async def list_workspace_files(
             # A row at a virtual path predates the backup skipping its folder;
             # a read answers from the DB, so only the splice may list one.
             and not _virtual_file(f["path"])
+            and not (is_non_owner_reader and _is_non_owner_blocked_path(f["path"]))
         ]
         # DALTON-HOOK(team-sharing): omit owner-private virtual files for non-owner readers
         if not is_non_owner_reader:
@@ -241,12 +246,20 @@ async def list_workspace_files(
             "source": "database",
         }
 
-    async with _acquire_sandbox_to_change(workspace_id, x_user_id) as (sandbox, workspace):
+    sandbox_owner_id = str(workspace.get("user_id") or x_user_id)
+    async with _acquire_sandbox_to_change(workspace_id, sandbox_owner_id) as (sandbox, workspace):
         # Fast path: return empty list if sandbox is still initializing and wait_for_sandbox=False
         # This allows CLI autocomplete to populate later without blocking startup
         if not wait_for_sandbox and not sandbox.is_ready():
             return {"files": [], "sandbox_ready": False}
-        files = await _live_listing(sandbox, workspace, path, pattern, include_system)
+        files = await _live_listing(
+            sandbox,
+            workspace,
+            path,
+            pattern,
+            include_system,
+            is_non_owner=is_non_owner_reader,
+        )
     return {
         "workspace_id": workspace_id,
         "path": path,
@@ -261,29 +274,43 @@ async def _live_listing(
     path: str,
     pattern: str,
     include_system: bool,
+    *,
+    # DALTON-HOOK(workspace-sharing-settings): filter hidden/system/virtual paths for non-owners
+    is_non_owner: bool = False,
 ) -> list[str]:
     work_dir = owner_work_dir(workspace)
     previous_dirs = previous_dir_names_of(workspace)
     requested_dir = contained_listing_path(path, work_dir, previous_dirs)
     if requested_dir is None:
         raise HTTPException(status_code=404, detail="Not found")
+    # DALTON-HOOK(workspace-sharing-settings): block hidden/system/virtual listing roots for non-owners
+    if is_non_owner and requested_dir and _is_non_owner_blocked_path(requested_dir):
+        return []
 
     # Allow explicit listing of hidden internal paths (e.g. _internal/...).
     # No pre-flight health probe: ``aglob_files`` raises on an unreachable
     # sandbox rather than returning [], so the glob already reports the truth
     # and an extra round trip on every listing would buy nothing.
-    allow_denied = _requested_hidden_ok(path, work_dir, previous_dirs)
+    # DALTON-HOOK(workspace-sharing-settings): never allow denied/hidden/system for non-owner
+    allow_denied = False if is_non_owner else _requested_hidden_ok(path, work_dir, previous_dirs)
     glob_root = f"{work_dir}/{requested_dir}" if requested_dir else work_dir
     # Canonicalise the root before walking it: a symlinked directory inside the
     # folder is how a contained request lists a sibling's files.
     glob_root = await contained_sandbox_path(sandbox, glob_root, work_dir=work_dir)
     if glob_root is None:
         raise HTTPException(status_code=404, detail="Not found")
+    # DALTON-HOOK(workspace-sharing-settings): re-check canonicalized glob_root for non-owners
+    if is_non_owner and glob_root != work_dir:
+        glob_root_client = _to_client_path(sandbox, glob_root, work_dir)
+        if _is_non_owner_blocked_path(glob_root_client):
+            return []
     absolute_paths: list[str] = await sandbox.aglob_files(
         pattern, path=glob_root, allow_denied=allow_denied
     )
 
-    allow_hidden = _requested_hidden_ok(path, work_dir, previous_dirs)
+    # DALTON-HOOK(workspace-sharing-settings): enforce non-owner hidden/system filtering
+    allow_hidden = False if is_non_owner else _requested_hidden_ok(path, work_dir, previous_dirs)
+    effective_include_system = False if is_non_owner else include_system
 
     files: list[str] = []
     for absolute_path in absolute_paths:
@@ -295,20 +322,28 @@ async def _live_listing(
         if _is_always_hidden_path(client_path):
             continue
 
+        # DALTON-HOOK(workspace-sharing-settings): hide blocked paths for non-owners
+        if is_non_owner and _is_non_owner_blocked_path(client_path):
+            continue
+
         # Hide internal SDK/package directories unless explicitly requested.
         if not allow_hidden and _is_hidden_path(client_path):
             continue
 
         # Hide system directories unless explicitly requested or include_system=True.
+        # DALTON-HOOK(workspace-sharing-settings): never allow system paths for non-owners
         if (
-            not include_system
+            not effective_include_system
             and _is_system_path(client_path)
-            and not _requested_system_ok(path, work_dir, previous_dirs)
+            and (is_non_owner or not _requested_system_ok(path, work_dir, previous_dirs))
         ):
             continue
 
         files.append(client_path)
 
+    # DALTON-HOOK(workspace-sharing-settings): omit owner virtual files for non-owners
+    if is_non_owner:
+        return files
     requested_norm = _normalize_requested_path(path, work_dir, previous_dirs)
     return await _with_virtual_files(files, requested_norm, workspace["user_id"])
 
@@ -357,18 +392,20 @@ async def resolve_workspace_file(
     never guesses from a listing that may predate the file.
     """
     workspace = await db_get_workspace(workspace_id)
-    # --- DALTON-HOOK(team-sharing): begin ---
+    # --- DALTON-HOOK(workspace-sharing-settings): begin ---
     from src.dalton.settings import is_dalton_supabase_auth_enabled
 
     is_non_owner_reader = False
     if is_dalton_supabase_auth_enabled():
-        from src.dalton.sharing import require_workspace_reader
+        from src.dalton.sharing import require_workspace_access
 
-        workspace = await require_workspace_reader(workspace, x_user_id)
+        workspace = await require_workspace_access(
+            workspace, x_user_id, channel="web", need="read"
+        )
         is_non_owner_reader = workspace.get("user_id") != x_user_id
     else:
         require_workspace_owner(workspace, user_id=x_user_id)
-    # --- DALTON-HOOK(team-sharing): end ---
+    # --- DALTON-HOOK(workspace-sharing-settings): end ---
 
     if is_unbound(workspace):
         return {"status": "unavailable", "reason": HOME_NOT_ON_COMPUTER_REASON, "matches": []}
@@ -392,26 +429,19 @@ async def resolve_workspace_file(
         }
 
     name = candidates[0].rsplit("/", 1)[-1]
-    if is_non_owner_reader or served_from_mirror(workspace.get("status")):
+    if served_from_mirror(workspace.get("status")):
         file_tree = await FilePersistenceService.get_file_tree(workspace_id)
         paths = [
             f["path"]
             for f in file_tree
             if f["path"].rsplit("/", 1)[-1] == name
             # DALTON-HOOK(team-sharing): hide system/hidden paths for non-owner mirror readers
-            and not (
-                is_non_owner_reader
-                and (
-                    _is_always_hidden_path(f["path"])
-                    or _is_hidden_path(f["path"])
-                    or _is_system_path(f["path"])
-                    or bool(_virtual_file(f["path"]))
-                )
-            )
+            and not (is_non_owner_reader and _is_non_owner_blocked_path(f["path"]))
         ]
         source = "database"
     else:
-        async with _acquire_sandbox_to_change(workspace_id, x_user_id) as (sandbox, workspace):
+        sandbox_owner_id = str(workspace.get("user_id") or x_user_id)
+        async with _acquire_sandbox_to_change(workspace_id, sandbox_owner_id) as (sandbox, workspace):
             if not sandbox.is_ready():
                 return {
                     "status": "unavailable",
@@ -431,10 +461,13 @@ async def resolve_workspace_file(
             absolute_paths: list[str] = await sandbox.aglob_files(
                 name_glob(name), path=glob_root
             )
+        # DALTON-HOOK(workspace-sharing-settings): filter blocked paths for non-owners in live resolve
         paths = [
-            _to_client_path(sandbox, p, work_dir)
+            cp
             for p in absolute_paths
             if is_within(work_dir, p)
+            for cp in [_to_client_path(sandbox, p, work_dir)]
+            if not (is_non_owner_reader and _is_non_owner_blocked_path(cp))
         ]
         source = "sandbox"
 
@@ -463,22 +496,25 @@ async def read_workspace_file(
 ) -> dict[str, Any]:
     """Read a file from the workspace's sandbox, or from DB if stopped."""
 
-    # --- DALTON-HOOK(team-sharing): begin ---
+    # --- DALTON-HOOK(workspace-sharing-settings): begin ---
     from src.dalton.settings import is_dalton_supabase_auth_enabled
 
     is_non_owner_reader = False
     if is_dalton_supabase_auth_enabled():
-        from src.dalton.sharing import require_workspace_reader
+        from src.dalton.sharing import require_workspace_access
 
-        workspace = await require_workspace_reader(
-            await db_get_workspace(workspace_id), x_user_id
+        workspace = await require_workspace_access(
+            await db_get_workspace(workspace_id),
+            x_user_id,
+            channel="web",
+            need="read",
         )
         if is_unbound(workspace):
             raise HTTPException(status_code=400, detail="Home is not on a computer yet")
         is_non_owner_reader = workspace.get("user_id") != x_user_id
     else:
         workspace = await owned_workspace_on_computer(workspace_id, x_user_id)
-    # --- DALTON-HOOK(team-sharing): end ---
+    # --- DALTON-HOOK(workspace-sharing-settings): end ---
 
     # Virtual DB-backed JSON files (user profile, automations) are served from
     # the DB, independent of sandbox state. Works whether the workspace is
@@ -486,6 +522,8 @@ async def read_workspace_file(
     work_dir = owner_work_dir(workspace)
     previous_dirs = previous_dir_names_of(workspace)
     normalized_for_virtual = _normalize_requested_path(path, work_dir, previous_dirs)
+    if is_non_owner_reader and normalized_for_virtual and _is_non_owner_blocked_path(normalized_for_virtual):
+        raise HTTPException(status_code=404, detail="File not found")
     virtual = _virtual_file(normalized_for_virtual)
     if virtual:
         if is_non_owner_reader:
@@ -511,17 +549,12 @@ async def read_workspace_file(
             "source": virtual.source,
         }
 
-    # DALTON-HOOK(team-sharing): DB fallback for stopped workspaces, or always for non-owner team readers
-    if is_non_owner_reader or served_from_mirror(workspace.get("status")):
+    # DALTON-HOOK(workspace-sharing-settings): DB fallback only when stopped; running workspaces read live sandbox
+    if served_from_mirror(workspace.get("status")):
         normalized_path = _normalize_requested_path(path, work_dir, previous_dirs)
         if not normalized_path:
             raise HTTPException(status_code=400, detail="File path is required")
-        if is_non_owner_reader and (
-            _is_always_hidden_path(normalized_path)
-            or _is_hidden_path(normalized_path)
-            or _is_system_path(normalized_path)
-            or bool(_virtual_file(normalized_path))
-        ):
+        if is_non_owner_reader and _is_non_owner_blocked_path(normalized_path):
             raise HTTPException(status_code=404, detail="File not found")
 
         # Parallel: fetch vault secrets + file content in one round-trip window
@@ -563,13 +596,22 @@ async def read_workspace_file(
             "source": "database",
         }
 
-    async with _acquire_sandbox_to_change(workspace_id, x_user_id) as (sandbox, workspace):
+    # DALTON-HOOK(workspace-sharing-settings): acquire owner sandbox for live read and re-check canonical path
+    sandbox_owner_id = str(workspace.get("user_id") or x_user_id)
+    async with _acquire_sandbox_to_change(workspace_id, sandbox_owner_id) as (sandbox, workspace):
         work_dir = owner_work_dir(workspace)
         previous_dirs = previous_dir_names_of(workspace)
 
         normalized, raw_bytes = await _read_contained_target(
             sandbox, path, work_dir, previous_dirs
         )
+
+    # DALTON-HOOK(workspace-sharing-settings): reject hidden/system/virtual canonical targets for non-owner
+    client_path = _to_client_path(sandbox, normalized, work_dir)
+    if _is_always_hidden_path(client_path) or (
+        is_non_owner_reader and _is_non_owner_blocked_path(client_path)
+    ):
+        raise HTTPException(status_code=404, detail="File not found")
 
     # Check for known binary extensions
     if _is_binary(normalized):
@@ -597,10 +639,6 @@ async def read_workspace_file(
         lines = text_content.splitlines()
         content = "\n".join(lines[offset : offset + limit])
         truncated = len(lines) > offset + limit
-
-    client_path = _to_client_path(sandbox, normalized, work_dir)
-    if _is_always_hidden_path(client_path):
-        raise HTTPException(status_code=404, detail="File not found")
 
     mime = resolve_content_type(client_path, default="text/plain")
 
@@ -633,7 +671,11 @@ async def write_workspace_file(
 ) -> dict[str, Any]:
     """Write text content to a file in the workspace's sandbox."""
 
-    workspace = await owned_workspace_on_computer(workspace_id, x_user_id)
+    # --- DALTON-HOOK(workspace-sharing-settings): begin ---
+    workspace = await owned_workspace_on_computer(workspace_id, x_user_id, need="write")
+    is_non_owner = workspace.get("user_id") != x_user_id
+    sandbox_owner_id = str(workspace.get("user_id") or x_user_id)
+    # --- DALTON-HOOK(workspace-sharing-settings): end ---
 
     if served_from_mirror(workspace.get("status")):
         raise HTTPException(
@@ -648,19 +690,32 @@ async def write_workspace_file(
     # generic write endpoint cannot enforce safely.
     work_dir = owner_work_dir(workspace)
     previous_dirs = previous_dir_names_of(workspace)
-    virtual = _virtual_file(_normalize_requested_path(path, work_dir, previous_dirs))
+    normalized_req_path = _normalize_requested_path(path, work_dir, previous_dirs)
+    virtual = _virtual_file(normalized_req_path)
     if virtual:
         raise HTTPException(status_code=400, detail=virtual.read_only)
+    # DALTON-HOOK(workspace-sharing-settings): block hidden/system/virtual paths for non-owners and use owner sandbox
+    if is_non_owner and _is_non_owner_blocked_path(normalized_req_path):
+        raise HTTPException(status_code=403, detail="Cannot write system or hidden files")
 
     content_bytes = body.content.encode("utf-8")
     if len(content_bytes) > MAX_WRITE_BYTES:
         raise HTTPException(status_code=413, detail="File content too large (max 10MB)")
 
-    async with _acquire_sandbox_to_change(workspace_id, x_user_id) as (sandbox, workspace):
+    async with _acquire_sandbox_to_change(workspace_id, sandbox_owner_id) as (sandbox, workspace):
         work_dir = owner_work_dir(workspace)
         previous_dirs = previous_dir_names_of(workspace)
 
         normalized = await _contained_target(sandbox, path, work_dir, previous_dirs)
+        # DALTON-HOOK(workspace-sharing-settings): re-check resolved canonical target after symlink resolution
+        resolved_client_path = _to_client_path(sandbox, normalized, work_dir)
+        if is_non_owner and _is_non_owner_blocked_path(resolved_client_path):
+            raise HTTPException(
+                status_code=403, detail="Cannot write system or hidden files"
+            )
+        virtual_resolved = _virtual_file(resolved_client_path)
+        if virtual_resolved:
+            raise HTTPException(status_code=400, detail=virtual_resolved.read_only)
 
         # ``awrite_file_text`` takes this path's write lock for the write itself.
         ok = await sandbox.awrite_file_text(normalized, body.content)
@@ -790,22 +845,25 @@ async def download_workspace_file(
     """Download raw bytes from the workspace's sandbox, or from DB if stopped."""
     disposition = "attachment" if attachment else "inline"
 
-    # --- DALTON-HOOK(team-sharing): begin ---
+    # --- DALTON-HOOK(workspace-sharing-settings): begin ---
     from src.dalton.settings import is_dalton_supabase_auth_enabled
 
     is_non_owner_reader = False
     if is_dalton_supabase_auth_enabled():
-        from src.dalton.sharing import require_workspace_reader
+        from src.dalton.sharing import require_workspace_access
 
-        workspace = await require_workspace_reader(
-            await db_get_workspace(workspace_id), x_user_id
+        workspace = await require_workspace_access(
+            await db_get_workspace(workspace_id),
+            x_user_id,
+            channel="web",
+            need="read",
         )
         if is_unbound(workspace):
             raise HTTPException(status_code=400, detail="Home is not on a computer yet")
         is_non_owner_reader = workspace.get("user_id") != x_user_id
     else:
         workspace = await owned_workspace_on_computer(workspace_id, x_user_id)
-    # --- DALTON-HOOK(team-sharing): end ---
+    # --- DALTON-HOOK(workspace-sharing-settings): end ---
 
     work_dir = owner_work_dir(workspace)
     previous_dirs = previous_dir_names_of(workspace)
@@ -813,6 +871,8 @@ async def download_workspace_file(
     # Virtual files come from the DB, as in /files/read: on the sandbox their
     # folder links out to the file mount, and the stored copy has no row for them.
     virtual_path = _normalize_requested_path(path, work_dir, previous_dirs)
+    if is_non_owner_reader and virtual_path and _is_non_owner_blocked_path(virtual_path):
+        raise HTTPException(status_code=404, detail="File not found")
     virtual = _virtual_file(virtual_path)
     if virtual:
         if is_non_owner_reader:
@@ -823,17 +883,12 @@ async def download_workspace_file(
             text.encode(), filename, "application/json", request, disposition
         )
 
-    # DALTON-HOOK(team-sharing): DB fallback for stopped workspaces, or always for non-owner team readers
-    if is_non_owner_reader or served_from_mirror(workspace.get("status")):
+    # DALTON-HOOK(workspace-sharing-settings): DB fallback only when stopped; running workspaces download from live sandbox
+    if served_from_mirror(workspace.get("status")):
         normalized_path = _normalize_requested_path(path, work_dir, previous_dirs)
         if not normalized_path:
             raise HTTPException(status_code=400, detail="File path is required")
-        if is_non_owner_reader and (
-            _is_always_hidden_path(normalized_path)
-            or _is_hidden_path(normalized_path)
-            or _is_system_path(normalized_path)
-            or bool(_virtual_file(normalized_path))
-        ):
+        if is_non_owner_reader and _is_non_owner_blocked_path(normalized_path):
             raise HTTPException(status_code=404, detail="File not found")
 
         # Parallel: fetch vault secrets + file content in one round-trip window
@@ -871,12 +926,14 @@ async def download_workspace_file(
 
         return _build_download_response(content, filename, mime, request, disposition)
 
+    # DALTON-HOOK(workspace-sharing-settings): acquire owner sandbox for live download and re-check canonical path
+    sandbox_owner_id = str(workspace.get("user_id") or x_user_id)
     async with AsyncExitStack() as folder:
         # A streamed file is read by path chunk after chunk, so its hold goes
         # with the response; a settle moving the folder between two chunks
         # would end the download.
         sandbox, workspace = await folder.enter_async_context(
-            _acquire_sandbox_to_change(workspace_id, x_user_id)
+            _acquire_sandbox_to_change(workspace_id, sandbox_owner_id)
         )
         work_dir = owner_work_dir(workspace)
         previous_dirs = previous_dir_names_of(workspace)
@@ -895,12 +952,26 @@ async def download_workspace_file(
             raise HTTPException(status_code=404, detail="File not found")
         normalized, content = resolved
 
+        # DALTON-HOOK(workspace-sharing-settings): reject hidden/system/virtual canonical targets and binary files for non-owner
         client_path = _to_client_path(sandbox, normalized, work_dir)
-        if _is_always_hidden_path(client_path):
+        if _is_always_hidden_path(client_path) or (
+            is_non_owner_reader and _is_non_owner_blocked_path(client_path)
+        ):
             raise HTTPException(status_code=404, detail="File not found")
 
         filename = client_path.split("/")[-1] if client_path else "download"
         mime = resolve_content_type(filename)
+
+        # DALTON-HOOK(workspace-sharing-settings): reject binary file download for non-owner readers in live branch
+        if is_non_owner_reader and (
+            _is_binary(client_path)
+            or too_large is not None
+            or not (_is_text_content_type(mime) or _is_utf8(content))
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail="Binary file download is not available in read-only mode",
+            )
 
         if too_large is not None:
             return await _stream_large_file(
@@ -989,14 +1060,17 @@ async def workspace_file_download_url(
     disk. The link skips secret redaction: it is the owner's own file, and
     redacting would mean carrying the bytes through this process.
     """
-    # --- DALTON-HOOK(team-sharing): begin ---
+    # --- DALTON-HOOK(workspace-sharing-settings): begin ---
     from src.dalton.settings import is_dalton_supabase_auth_enabled
 
     if is_dalton_supabase_auth_enabled():
-        from src.dalton.sharing import require_workspace_reader
+        from src.dalton.sharing import require_workspace_access
 
-        workspace = await require_workspace_reader(
-            await db_get_workspace(workspace_id), x_user_id
+        workspace = await require_workspace_access(
+            await db_get_workspace(workspace_id),
+            x_user_id,
+            channel="web",
+            need="read",
         )
         if is_unbound(workspace):
             raise HTTPException(status_code=400, detail="Home is not on a computer yet")
@@ -1004,7 +1078,7 @@ async def workspace_file_download_url(
             return {"url": None}
     else:
         workspace = await owned_workspace_on_computer(workspace_id, x_user_id)
-    # --- DALTON-HOOK(team-sharing): end ---
+    # --- DALTON-HOOK(workspace-sharing-settings): end ---
 
     layout = owner_layout(workspace)
     work_dir = layout.workspace
@@ -1058,7 +1132,11 @@ async def upload_workspace_file(
 ) -> dict[str, Any]:
     """Upload a file to the workspace's live sandbox."""
 
-    workspace = await owned_workspace_on_computer(workspace_id, x_user_id)
+    # --- DALTON-HOOK(workspace-sharing-settings): begin ---
+    workspace = await owned_workspace_on_computer(workspace_id, x_user_id, need="write")
+    is_non_owner = workspace.get("user_id") != x_user_id
+    sandbox_owner_id = str(workspace.get("user_id") or x_user_id)
+    # --- DALTON-HOOK(workspace-sharing-settings): end ---
 
     if served_from_mirror(workspace.get("status")):
         raise HTTPException(
@@ -1066,7 +1144,7 @@ async def upload_workspace_file(
             detail=f"Cannot upload files — workspace is {workspace.get('status')}. Wait for it to be running.",
         )
 
-    async with _acquire_sandbox_to_change(workspace_id, x_user_id) as (sandbox, workspace):
+    async with _acquire_sandbox_to_change(workspace_id, sandbox_owner_id) as (sandbox, workspace):
         work_dir = owner_work_dir(workspace)
         previous_dirs = previous_dir_names_of(workspace)
 
@@ -1075,11 +1153,23 @@ async def upload_workspace_file(
             raise HTTPException(status_code=400, detail="Destination path is required")
         # The same refusal as write: an upload would land a sandbox file the
         # virtual route shadows, so it would read as saved and change nothing.
-        virtual = _virtual_file(_normalize_requested_path(dest, work_dir, previous_dirs))
+        normalized_req_dest = _normalize_requested_path(dest, work_dir, previous_dirs)
+        virtual = _virtual_file(normalized_req_dest)
         if virtual:
             raise HTTPException(status_code=400, detail=virtual.read_only)
+        if is_non_owner and _is_non_owner_blocked_path(normalized_req_dest):
+            raise HTTPException(status_code=403, detail="Cannot upload to system or hidden paths")
 
         normalized = await _contained_target(sandbox, dest, work_dir, previous_dirs)
+        # DALTON-HOOK(workspace-sharing-settings): re-check resolved canonical target after symlink resolution
+        resolved_client_path = _to_client_path(sandbox, normalized, work_dir)
+        if is_non_owner and _is_non_owner_blocked_path(resolved_client_path):
+            raise HTTPException(
+                status_code=403, detail="Cannot upload to system or hidden paths"
+            )
+        virtual_resolved = _virtual_file(resolved_client_path)
+        if virtual_resolved:
+            raise HTTPException(status_code=400, detail=virtual_resolved.read_only)
 
         # Accept only what the next backup could actually store. This route
         # buffers the body, so its own ceiling applies too, and whichever is
@@ -1275,7 +1365,11 @@ async def delete_workspace_files(
 ) -> dict[str, Any]:
     """Delete one or more files from the workspace's live sandbox."""
 
-    workspace = await owned_workspace_on_computer(workspace_id, x_user_id)
+    # --- DALTON-HOOK(workspace-sharing-settings): begin ---
+    workspace = await owned_workspace_on_computer(workspace_id, x_user_id, need="write")
+    is_non_owner = workspace.get("user_id") != x_user_id
+    sandbox_owner_id = str(workspace.get("user_id") or x_user_id)
+    # --- DALTON-HOOK(workspace-sharing-settings): end ---
 
     if served_from_mirror(workspace.get("status")):
         raise HTTPException(
@@ -1283,7 +1377,7 @@ async def delete_workspace_files(
             detail=f"Cannot delete files — workspace is {workspace.get('status')}. Wait for it to be running.",
         )
 
-    async with _acquire_sandbox_to_change(workspace_id, x_user_id) as (sandbox, workspace):
+    async with _acquire_sandbox_to_change(workspace_id, sandbox_owner_id) as (sandbox, workspace):
         work_dir = owner_work_dir(workspace)
         previous_dirs = previous_dir_names_of(workspace)
 
@@ -1296,6 +1390,11 @@ async def delete_workspace_files(
         candidates: list[str] = []
         undeletable: dict[int, str] = {}
         for index, path in enumerate(body.paths):
+            req_norm = _normalize_requested_path(path, work_dir, previous_dirs)
+            if is_non_owner and _is_non_owner_blocked_path(req_norm):
+                raise HTTPException(
+                    status_code=403, detail="Cannot delete system or hidden files"
+                )
             candidate = contained_absolute_path(path, work_dir, previous_dirs)
             if candidate is None or not sandbox.validate_path(candidate):
                 continue
@@ -1322,7 +1421,16 @@ async def delete_workspace_files(
 
             addressed = candidates[slot]
             client_path = _to_client_path(sandbox, addressed, work_dir)
-            if _is_system_path(client_path):
+            resolved_client_path = _to_client_path(sandbox, normalized, work_dir)
+            # DALTON-HOOK(workspace-sharing-settings): re-check resolved canonical target for symlinks into hidden/system/virtual paths
+            if is_non_owner and (
+                _is_non_owner_blocked_path(client_path)
+                or _is_non_owner_blocked_path(resolved_client_path)
+            ):
+                raise HTTPException(
+                    status_code=403, detail="Cannot delete system or hidden files"
+                )
+            if _is_system_path(client_path) or _is_system_path(resolved_client_path):
                 errors.append({"path": path, "detail": "Cannot delete system files"})
                 continue
 

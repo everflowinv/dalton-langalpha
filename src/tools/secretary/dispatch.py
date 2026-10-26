@@ -111,7 +111,7 @@ def _unknown_dispatch_command(
 
 
 async def _owned_workspace(workspace_id: str, user_id: str) -> dict | None:
-    """The workspace row when ``user_id`` owns it, else None.
+    """The workspace row when ``user_id`` owns it (or has CoS access), else None.
 
     Ownership-scoped so the hand-off card can't surface another user's
     workspace name. A read that fails is None as well: a continuation only
@@ -124,7 +124,29 @@ async def _owned_workspace(workspace_id: str, user_id: str) -> dict | None:
     except Exception as e:
         logger.warning(f"Failed to read workspace {workspace_id}: {e}")
         return None
-    return ws if ws and str(ws.get("user_id")) == user_id else None
+    if not ws:
+        return None
+    if str(ws.get("user_id")) == user_id:
+        return ws
+    # --- DALTON-HOOK(workspace-sharing-settings): begin ---
+    from fastapi import HTTPException
+    from src.dalton.settings import is_dalton_supabase_auth_enabled
+
+    if is_dalton_supabase_auth_enabled():
+        from src.dalton.sharing import require_workspace_access
+
+        try:
+            checked = await require_workspace_access(
+                ws, user_id, channel="cos", need="read", workspace=ws
+            )
+            return {
+                **checked,
+                "_colleague_cos_access": checked.get("_caller_cos_access", "ro"),
+            }
+        except HTTPException:
+            return None
+    # --- DALTON-HOOK(workspace-sharing-settings): end ---
+    return None
 
 
 async def dispatch(
@@ -213,6 +235,19 @@ async def dispatch(
     # which the owner check above already proved.
     if workspace is None and not is_continuation:
         return error_command("workspace not found", tool_call_id)
+    # --- DALTON-HOOK(workspace-sharing-settings): begin ---
+    if workspace is not None and str(workspace.get("user_id")) != str(user_id):
+        colleague_access = workspace.get("_colleague_cos_access") or "ro"
+        if colleague_access != "rw":
+            return error_command(
+                "Workspace is read-only for colleagues (cos_access=ro); cannot delegate to analyst.",
+                tool_call_id,
+            )
+        return error_command(
+            "该功能下一期开放：向同事工作区派发任务将在下一期开放。",
+            tool_call_id,
+        )
+    # --- DALTON-HOOK(workspace-sharing-settings): end ---
 
     if not preapproved:
         approved, response = hitl_confirm(

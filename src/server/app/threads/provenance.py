@@ -36,16 +36,18 @@ async def get_provenance(thread_id: str, x_user_id: CurrentUserId):
     the structured input a post-hoc verification agent consumes.
     """
     try:
-        # --- DALTON-HOOK(team-sharing): begin ---
+        # --- DALTON-HOOK(workspace-sharing-settings): begin ---
         from src.dalton.settings import is_dalton_supabase_auth_enabled
 
         if is_dalton_supabase_auth_enabled():
-            from src.dalton.sharing import require_thread_reader
+            from src.dalton.sharing import require_thread_access
 
-            await require_thread_reader(thread_id, x_user_id)
+            await require_thread_access(
+                thread_id, x_user_id, channel="web", need="read"
+            )
         else:
             await auth_api.require_thread_owner(thread_id, x_user_id)
-        # --- DALTON-HOOK(team-sharing): end ---
+        # --- DALTON-HOOK(workspace-sharing-settings): end ---
         rows = await get_provenance_for_thread(thread_id)
 
         turns: dict[int, dict] = {}
@@ -135,16 +137,18 @@ async def get_provenance_bodies(
     one request from materializing tens of MB.
     """
     try:
-        # --- DALTON-HOOK(team-sharing): begin ---
+        # --- DALTON-HOOK(workspace-sharing-settings): begin ---
         from src.dalton.settings import is_dalton_supabase_auth_enabled
 
         if is_dalton_supabase_auth_enabled():
-            from src.dalton.sharing import require_thread_reader
+            from src.dalton.sharing import require_thread_access
 
-            await require_thread_reader(thread_id, x_user_id)
+            await require_thread_access(
+                thread_id, x_user_id, channel="web", need="read"
+            )
         else:
             await auth_api.require_thread_owner(thread_id, x_user_id)
-        # --- DALTON-HOOK(team-sharing): end ---
+        # --- DALTON-HOOK(workspace-sharing-settings): end ---
 
         from src.server.database.pool import get_db_connection
         from src.server.database.provenance_bodies import fetch_result_bodies
@@ -216,16 +220,18 @@ async def get_provenance_record_body(
     caller's thread.
     """
     try:
-        # --- DALTON-HOOK(team-sharing): begin ---
+        # --- DALTON-HOOK(workspace-sharing-settings): begin ---
         from src.dalton.settings import is_dalton_supabase_auth_enabled
 
         if is_dalton_supabase_auth_enabled():
-            from src.dalton.sharing import require_thread_reader
+            from src.dalton.sharing import require_thread_access
 
-            await require_thread_reader(thread_id, x_user_id)
+            await require_thread_access(
+                thread_id, x_user_id, channel="web", need="read"
+            )
         else:
             await auth_api.require_thread_owner(thread_id, x_user_id)
-        # --- DALTON-HOOK(team-sharing): end ---
+        # --- DALTON-HOOK(workspace-sharing-settings): end ---
         row = await get_provenance_record(thread_id, provenance_record_id)
         if row is None:
             raise HTTPException(status_code=404, detail="Provenance record not found")
