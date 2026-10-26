@@ -98,6 +98,7 @@ ALLOWED_HOOKS=(
   "multi-file-upload"
   "invite-signup"
   "wiki-ingest"
+  "handoff-keep-on-resumable"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

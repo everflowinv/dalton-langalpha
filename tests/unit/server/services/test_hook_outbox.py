@@ -975,3 +975,1521 @@ class TestExecutorRegistry:
             await drainer._execute(job)
         assert followup.await_count == (1 if followed_up else 0)
 
+
+# ---------------------------------------------------------------------------
+# DALTON-HOOK(handoff-keep-on-resumable): Resumable worker_lost interruptions
+# keep handoff state intact so the resumed run reports back normally.
+# ---------------------------------------------------------------------------
+
+
+def _awaitable_fn(fn):
+    """Wrap an async method as a plain non-coroutine function returning a
+    Future, matching redis.asyncio client methods that return awaitables
+    without satisfying inspect.iscoroutinefunction."""
+    import asyncio
+
+    def _wrapper(*args, **kwargs):
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        coro = fn(*args, **kwargs)
+        asyncio.ensure_future(coro).add_done_callback(
+            lambda task: (
+                fut.set_exception(task.exception())
+                if task.exception()
+                else fut.set_result(task.result())
+            )
+        )
+        return fut
+
+    return _wrapper
+
+
+# DALTON-HOOK(handoff-keep-on-resumable): test suite for resumable handoff retention
+class TestHandoffKeepOnResumable:
+    @staticmethod
+    def _seeded_cache(
+        *,
+        dispatcher_tid: str = "cos-home",
+        ptc_tid: str = "ptc-dash",
+        user_id: str = "u-1",
+        dispatch_gen: str = "gen-1",
+    ):
+        from src.server.services.report_back.handoff.keys import (
+            ORIGIN_KIND,
+            ORIGIN_THREAD_FIELD,
+            ptc_origin_key,
+            user_pending_key,
+            watch_key,
+        )
+        from tests.unit.server.handlers.chat.redis_fakes import FakeCache
+
+        cache = FakeCache()
+        origin = {
+            "origin": ORIGIN_KIND,
+            "report_back": True,
+            ORIGIN_THREAD_FIELD: dispatcher_tid,
+            "user_id": user_id,
+            "dispatch_gen": dispatch_gen,
+            "ptc_workspace_id": "ws-dash",
+        }
+        cache.kv[ptc_origin_key(ptc_tid)] = origin
+        cache.client.sets[watch_key(dispatcher_tid)] = {ptc_tid}
+        cache.client.sets[user_pending_key(user_id)] = {ptc_tid}
+        cache.client.sismember = _awaitable_fn(cache.client.sismember)
+        return cache
+
+    # DALTON-HOOK(handoff-keep-on-resumable): normal delivery path across worker_lost -> resume
+    @pytest.mark.asyncio
+    async def test_worker_lost_normal_delivery_resumed_completes_before_old_watch_clear_executes(
+        self,
+    ):
+        from contextlib import asynccontextmanager
+        from unittest.mock import create_autospec
+
+        from src.server.database.runs import lifecycle as tl_db
+        from src.server.database.runs import outbox as outbox_db
+        from src.server.services.report_back import notify_turn
+        from src.server.services.report_back.handoff import executor
+        from src.server.services.report_back.handoff.keys import (
+            ptc_origin_key,
+            watch_key,
+        )
+        from src.utils.cache import redis_cache
+
+        cache = self._seeded_cache()
+        runs_by_id = {
+            "ptc-run-0": {
+                "conversation_response_id": "ptc-run-0",
+                "status": "error",
+                "errors": [
+                    "worker_lost: no live executor holds this run's writer fence"
+                ],
+            },
+            "ptc-run-1": {
+                "conversation_response_id": "ptc-run-1",
+                "status": "completed",
+                "errors": [],
+            },
+        }
+        analyst_latest = dict(runs_by_id["ptc-run-0"])
+
+        async def _fake_get_run(run_id: str):
+            return dict(runs_by_id[run_id]) if run_id in runs_by_id else None
+
+        async def _fake_latest_attempt(thread_id: str):
+            if thread_id == "ptc-dash":
+                return dict(analyst_latest)
+            return {"conversation_response_id": "cos-idle", "status": "completed"}
+
+        # DALTON-HOOK(handoff-keep-on-resumable): autospec test doubles
+        get_cache_mock = create_autospec(
+            redis_cache.get_cache_client, return_value=cache
+        )
+        get_run_mock = create_autospec(tl_db.get_run, side_effect=_fake_get_run)
+        get_latest_mock = create_autospec(
+            tl_db.get_latest_attempt, side_effect=_fake_latest_attempt
+        )
+        post_calls: list[dict] = []
+
+        async def _fake_post_turn(**kwargs):
+            post_calls.append(kwargs)
+            idx = len(post_calls) - 1
+            return ("dispatched", f"rb-run-{idx}")
+
+        post_mock = create_autospec(
+            notify_turn.post_notification_turn, side_effect=_fake_post_turn
+        )
+        await_terminal_mock = create_autospec(
+            notify_turn.await_run_terminal, return_value="terminal"
+        )
+        extend_mock = create_autospec(
+            outbox_db.extend_job_lease, return_value=True
+        )
+        merge_mock = create_autospec(
+            outbox_db.merge_job_payload, return_value=True
+        )
+        has_live_mock = create_autospec(
+            outbox_db.has_live_hand_off, return_value=False
+        )
+        find_by_key_mock = create_autospec(
+            tl_db.find_run_by_request_key, return_value=None
+        )
+        ws_name_mock = create_autospec(
+            executor._workspace_name, return_value="DASH"
+        )
+
+        @asynccontextmanager
+        async def _owned_guard(job_id: str, attempts: int, *, lease_seconds: int = 60):
+            yield True
+
+        guard_mock = create_autospec(
+            outbox_db.fenced_job_guard, side_effect=_owned_guard
+        )
+
+        # DALTON-HOOK(handoff-keep-on-resumable): round 0 resumable failure report-back
+        with (
+            patch.object(outbox_db, "fenced_job_guard", guard_mock),
+            patch.object(redis_cache, "get_cache_client", get_cache_mock),
+            patch.object(tl_db, "get_run", get_run_mock),
+            patch.object(tl_db, "get_latest_attempt", get_latest_mock),
+            patch.object(tl_db, "find_run_by_request_key", find_by_key_mock),
+            patch.object(notify_turn, "post_notification_turn", post_mock),
+            patch.object(notify_turn, "await_run_terminal", await_terminal_mock),
+            patch.object(outbox_db, "extend_job_lease", extend_mock),
+            patch.object(outbox_db, "merge_job_payload", merge_mock),
+            patch.object(outbox_db, "has_live_hand_off", has_live_mock),
+            patch.object(executor, "_workspace_name", ws_name_mock),
+        ):
+            job_0 = {
+                "hook_outbox_id": "job-err-0",
+                "hook_type": "report_back",
+                "run_id": "ptc-run-0",
+                "attempts": 1,
+                "ordering_key": "cos-home",
+                "payload": {
+                    "ptc_thread_id": "ptc-dash",
+                    "dispatch_gen": "gen-1",
+                    "final_status": "error",
+                },
+            }
+            await core._exec_handoff_report_back(job_0)
+
+            assert len(post_calls) == 1
+            msg_0 = post_calls[0]["body"]["messages"][0]["content"]
+            assert "failed before it finished" in msg_0
+            assert "运行被中断，系统会续跑，完成后会再回报" in msg_0
+            origin_after_r0 = cache.kv[ptc_origin_key("ptc-dash")]
+            assert origin_after_r0["awaiting_resume"]["analyst_run_id"] == "ptc-run-0"
+            assert origin_after_r0["awaiting_resume"]["dispatch_gen"] == "gen-1"
+            assert isinstance(origin_after_r0["awaiting_resume"]["marked_at"], float)
+
+            # DALTON-HOOK(handoff-keep-on-resumable): resumed run completes BEFORE
+            # the unmarked watch_clear from round 0 executes.
+            analyst_latest.update(runs_by_id["ptc-run-1"])
+            latest_calls_before_clear = get_latest_mock.await_count
+
+            await core._exec_watch_clear(
+                {
+                    "hook_outbox_id": "job-clear-0",
+                    "hook_type": "watch_clear",
+                    "run_id": "rb-run-0",
+                    "attempts": 1,
+                    "ordering_key": "cos-home",
+                    "payload": {
+                        "ptc_thread_id": "ptc-dash",
+                        "user_id": "u-1",
+                        "error_wake": False,
+                        "dispatch_gen": "gen-1",
+                    },
+                }
+            )
+            assert get_latest_mock.await_count == latest_calls_before_clear
+            assert "ptc-dash" in cache.client.sets.get(watch_key("cos-home"), set())
+            assert ptc_origin_key("ptc-dash") in cache.kv
+
+            # Round 1: resumed analyst run's report_back revokes awaiting_resume and wakes Home.
+            job_1 = {
+                "hook_outbox_id": "job-ok-1",
+                "hook_type": "report_back",
+                "run_id": "ptc-run-1",
+                "attempts": 1,
+                "ordering_key": "cos-home",
+                "payload": {
+                    "ptc_thread_id": "ptc-dash",
+                    "dispatch_gen": "gen-1",
+                    "final_status": "completed",
+                },
+            }
+            await core._exec_handoff_report_back(job_1)
+
+            assert "awaiting_resume" not in cache.kv[ptc_origin_key("ptc-dash")]
+            assert len(post_calls) == 2
+            msg_1 = post_calls[1]["body"]["messages"][0]["content"]
+            assert "has completed." in msg_1
+            assert "运行被中断" not in msg_1
+            assert any(
+                '"run_id": "rb-run-1"' in payload_str
+                for _, payload_str in cache.client.published
+            )
+
+            # Final watch_clear after the completion summary turn clears the pair.
+            await core._exec_watch_clear(
+                {
+                    "hook_outbox_id": "job-clear-1",
+                    "hook_type": "watch_clear",
+                    "run_id": "rb-run-1",
+                    "attempts": 1,
+                    "ordering_key": "cos-home",
+                    "payload": {
+                        "ptc_thread_id": "ptc-dash",
+                        "user_id": "u-1",
+                        "error_wake": False,
+                        "dispatch_gen": "gen-1",
+                    },
+                }
+            )
+            assert "ptc-dash" not in cache.client.sets.get(
+                watch_key("cos-home"), set()
+            )
+            assert ptc_origin_key("ptc-dash") not in cache.kv
+
+    # DALTON-HOOK(handoff-keep-on-resumable): awaiting_resume is stamped on ptc_origin
+    # BEFORE POST, so finalize watch_clear in any order and post-POST retry preserve the pair
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("finalize_during_post", [True, False])
+    async def test_awaiting_resume_stamped_before_post_and_survives_post_retry(
+        self, finalize_during_post: bool
+    ):
+        from contextlib import asynccontextmanager
+        from unittest.mock import create_autospec
+
+        from src.server.database.runs import lifecycle as tl_db
+        from src.server.database.runs import outbox as outbox_db
+        from src.server.services.report_back import notify_turn
+        from src.server.services.report_back.handoff import executor, pointer
+        from src.server.services.report_back.handoff.keys import (
+            ptc_origin_key,
+            watch_key,
+        )
+        from src.utils.cache import redis_cache
+
+        cache = self._seeded_cache()
+        runs_by_id = {
+            "ptc-run-0": {
+                "conversation_response_id": "ptc-run-0",
+                "status": "error",
+                "errors": [
+                    "worker_lost: no live executor holds this run's writer fence"
+                ],
+            },
+            "ptc-run-1": {
+                "conversation_response_id": "ptc-run-1",
+                "status": "completed",
+                "errors": [],
+            },
+        }
+        call_order: list[str] = []
+        post_count = 0
+
+        async def _fake_post_turn(**kwargs):
+            nonlocal post_count
+            post_count += 1
+            # Verify awaiting_resume is ALREADY on ptc_origin at the moment POST runs.
+            origin_during_post = cache.kv[ptc_origin_key("ptc-dash")]
+            if post_count == 1:
+                assert (
+                    origin_during_post["awaiting_resume"]["analyst_run_id"]
+                    == "ptc-run-0"
+                )
+                call_order.append("post_with_awaiting_resume_already_set")
+                if finalize_during_post:
+                    # Summary finalize enqueues and even executes watch_clear before
+                    # report_back finishes its post-POST steps.
+                    await core._exec_watch_clear(
+                        {
+                            "hook_outbox_id": "job-clear-early",
+                            "hook_type": "watch_clear",
+                            "run_id": "rb-run-0",
+                            "attempts": 1,
+                            "ordering_key": "cos-home",
+                            "payload": {
+                                "ptc_thread_id": "ptc-dash",
+                                "user_id": "u-1",
+                                "error_wake": False,
+                                "dispatch_gen": "gen-1",
+                            },
+                        }
+                    )
+                return ("dispatched", "rb-run-0")
+            assert "awaiting_resume" not in origin_during_post
+            call_order.append("post_after_awaiting_resume_revoked")
+            return ("dispatched", "rb-run-1")
+
+        # DALTON-HOOK(handoff-keep-on-resumable): simulate transient failure on first
+        # await_run_terminal so job retries via dispatched_run_id
+        terminal_calls = 0
+
+        async def _flaky_await_terminal(*args, **kwargs):
+            nonlocal terminal_calls
+            terminal_calls += 1
+            if terminal_calls == 1:
+                raise RuntimeError("transient error after POST")
+            return "terminal"
+
+        get_cache_mock = create_autospec(
+            redis_cache.get_cache_client, return_value=cache
+        )
+        get_run_mock = create_autospec(
+            tl_db.get_run,
+            side_effect=lambda run_id: dict(runs_by_id[run_id]),
+        )
+        get_latest_mock = create_autospec(
+            tl_db.get_latest_attempt,
+            return_value=dict(runs_by_id["ptc-run-0"]),
+        )
+        find_by_key_mock = create_autospec(
+            tl_db.find_run_by_request_key, return_value=None
+        )
+        post_mock = create_autospec(
+            notify_turn.post_notification_turn, side_effect=_fake_post_turn
+        )
+        await_terminal_mock = create_autospec(
+            notify_turn.await_run_terminal, side_effect=_flaky_await_terminal
+        )
+        extend_mock = create_autospec(
+            outbox_db.extend_job_lease, return_value=True
+        )
+        merge_mock = create_autospec(
+            outbox_db.merge_job_payload, return_value=True
+        )
+        has_live_mock = create_autospec(
+            outbox_db.has_live_hand_off, return_value=False
+        )
+        ws_name_mock = create_autospec(
+            executor._workspace_name, return_value="DASH"
+        )
+        ack_mock = create_autospec(outbox_db.ack_outbox_job, return_value=True)
+        nack_mock = create_autospec(
+            outbox_db.nack_outbox_job, return_value="pending"
+        )
+
+        @asynccontextmanager
+        async def _owned_guard(job_id: str, attempts: int, *, lease_seconds: int = 60):
+            yield True
+
+        guard_mock = create_autospec(
+            outbox_db.fenced_job_guard, side_effect=_owned_guard
+        )
+
+        # DALTON-HOOK(handoff-keep-on-resumable): verify retry + watch_clear + resumed run
+        drainer = HookOutboxDrainer()
+        job_0 = {
+            "hook_outbox_id": "job-err-0",
+            "hook_type": "report_back",
+            "run_id": "ptc-run-0",
+            "attempts": 1,
+            "ordering_key": "cos-home",
+            "payload": {
+                "ptc_thread_id": "ptc-dash",
+                "dispatch_gen": "gen-1",
+                "final_status": "error",
+            },
+        }
+        with (
+            patch.object(outbox_db, "fenced_job_guard", guard_mock),
+            patch.object(redis_cache, "get_cache_client", get_cache_mock),
+            patch.object(tl_db, "get_run", get_run_mock),
+            patch.object(tl_db, "get_latest_attempt", get_latest_mock),
+            patch.object(tl_db, "find_run_by_request_key", find_by_key_mock),
+            patch.object(notify_turn, "post_notification_turn", post_mock),
+            patch.object(notify_turn, "await_run_terminal", await_terminal_mock),
+            patch.object(outbox_db, "extend_job_lease", extend_mock),
+            patch.object(outbox_db, "merge_job_payload", merge_mock),
+            patch.object(outbox_db, "has_live_hand_off", has_live_mock),
+            patch.object(executor, "_workspace_name", ws_name_mock),
+            patch.object(outbox_db, "ack_outbox_job", ack_mock),
+            patch.object(outbox_db, "nack_outbox_job", nack_mock),
+        ):
+            await drainer._execute(job_0)
+            nack_mock.assert_awaited_once()
+            job_0["attempts"] = 2
+            await drainer._execute(job_0)
+            ack_mock.assert_awaited_once()
+
+            if not finalize_during_post:
+                await core._exec_watch_clear(
+                    {
+                        "hook_outbox_id": "job-clear-late",
+                        "hook_type": "watch_clear",
+                        "run_id": "rb-run-0",
+                        "attempts": 1,
+                        "ordering_key": "cos-home",
+                        "payload": {
+                            "ptc_thread_id": "ptc-dash",
+                            "user_id": "u-1",
+                            "error_wake": False,
+                            "dispatch_gen": "gen-1",
+                        },
+                    }
+                )
+            assert "ptc-dash" in cache.client.sets.get(watch_key("cos-home"), set())
+            assert (
+                cache.kv[ptc_origin_key("ptc-dash")][pointer.AWAITING_RESUME_FIELD][
+                    "analyst_run_id"
+                ]
+                == "ptc-run-0"
+            )
+
+            # Resumed run completes -> revokes awaiting_resume -> final clear succeeds
+            await core._exec_handoff_report_back(
+                {
+                    "hook_outbox_id": "job-ok-1",
+                    "hook_type": "report_back",
+                    "run_id": "ptc-run-1",
+                    "attempts": 1,
+                    "ordering_key": "cos-home",
+                    "payload": {
+                        "ptc_thread_id": "ptc-dash",
+                        "dispatch_gen": "gen-1",
+                        "final_status": "completed",
+                    },
+                }
+            )
+            assert call_order == [
+                "post_with_awaiting_resume_already_set",
+                "post_after_awaiting_resume_revoked",
+            ]
+            await core._exec_watch_clear(
+                {
+                    "hook_outbox_id": "job-clear-1",
+                    "hook_type": "watch_clear",
+                    "run_id": "rb-run-1",
+                    "attempts": 1,
+                    "ordering_key": "cos-home",
+                    "payload": {
+                        "ptc_thread_id": "ptc-dash",
+                        "user_id": "u-1",
+                        "error_wake": False,
+                        "dispatch_gen": "gen-1",
+                    },
+                }
+            )
+            assert "ptc-dash" not in cache.client.sets.get(
+                watch_key("cos-home"), set()
+            )
+            assert ptc_origin_key("ptc-dash") not in cache.kv
+
+    # DALTON-HOOK(handoff-keep-on-resumable): Codex #1 — POST succeeds, finalize inserts
+    # unmarked {rb_run_id}:watch_clear, report_back exhausts retries to dead_clear, and
+    # old unmarked watch_clear executes later: both keep pair until resumed run finishes
+    @pytest.mark.asyncio
+    async def test_dead_report_back_and_late_unmarked_watch_clear_both_preserve_handoff(
+        self,
+    ):
+        from contextlib import asynccontextmanager
+        from unittest.mock import create_autospec
+
+        from src.server.database.runs import lifecycle as tl_db
+        from src.server.database.runs import outbox as outbox_db
+        from src.server.services.report_back import notify_turn
+        from src.server.services.report_back.handoff import executor
+        from src.server.services.report_back.handoff.keys import (
+            ptc_origin_key,
+            watch_key,
+        )
+        from src.utils.cache import redis_cache
+
+        cache = self._seeded_cache()
+        runs_by_id = {
+            "ptc-run-0": {
+                "conversation_response_id": "ptc-run-0",
+                "status": "error",
+                "errors": [
+                    "worker_lost: no live executor holds this run's writer fence"
+                ],
+            },
+            "ptc-run-1": {
+                "conversation_response_id": "ptc-run-1",
+                "status": "completed",
+                "errors": [],
+            },
+        }
+        get_cache_mock = create_autospec(
+            redis_cache.get_cache_client, return_value=cache
+        )
+        get_run_mock = create_autospec(
+            tl_db.get_run,
+            side_effect=lambda run_id: dict(runs_by_id[run_id]),
+        )
+        get_latest_mock = create_autospec(
+            tl_db.get_latest_attempt,
+            return_value=dict(runs_by_id["ptc-run-1"]),
+        )
+        find_by_key_mock = create_autospec(
+            tl_db.find_run_by_request_key, return_value=None
+        )
+        post_calls: list[dict] = []
+
+        async def _fake_post_turn(**kwargs):
+            post_calls.append(kwargs)
+            return ("dispatched", f"rb-run-{len(post_calls) - 1}")
+
+        post_mock = create_autospec(
+            notify_turn.post_notification_turn, side_effect=_fake_post_turn
+        )
+        # DALTON-HOOK(handoff-keep-on-resumable): round 0 fails after POST at attempt 5 -> dead
+        terminal_attempts = 0
+
+        async def _await_terminal(*args, **kwargs):
+            nonlocal terminal_attempts
+            terminal_attempts += 1
+            if terminal_attempts == 1:
+                raise RuntimeError("worker failed after POST at max attempts")
+            return "terminal"
+
+        await_terminal_mock = create_autospec(
+            notify_turn.await_run_terminal, side_effect=_await_terminal
+        )
+        extend_mock = create_autospec(
+            outbox_db.extend_job_lease, return_value=True
+        )
+        merge_mock = create_autospec(
+            outbox_db.merge_job_payload, return_value=True
+        )
+        has_live_mock = create_autospec(
+            outbox_db.has_live_hand_off, return_value=False
+        )
+        ws_name_mock = create_autospec(
+            executor._workspace_name, return_value="DASH"
+        )
+        ack_mock = create_autospec(outbox_db.ack_outbox_job, return_value=True)
+        nack_mock = create_autospec(
+            outbox_db.nack_outbox_job, return_value="dead"
+        )
+
+        @asynccontextmanager
+        async def _owned_guard(job_id: str, attempts: int, *, lease_seconds: int = 60):
+            yield True
+
+        guard_mock = create_autospec(
+            outbox_db.fenced_job_guard, side_effect=_owned_guard
+        )
+
+        drainer = HookOutboxDrainer()
+        job_dead = {
+            "hook_outbox_id": "job-err-dead",
+            "hook_type": "report_back",
+            "run_id": "ptc-run-0",
+            "attempts": 5,
+            "ordering_key": "cos-home",
+            "payload": {
+                "ptc_thread_id": "ptc-dash",
+                "dispatch_gen": "gen-1",
+                "final_status": "error",
+            },
+        }
+        # DALTON-HOOK(handoff-keep-on-resumable): execute dead_clear then unmarked watch_clear
+        with (
+            patch.object(outbox_db, "fenced_job_guard", guard_mock),
+            patch.object(redis_cache, "get_cache_client", get_cache_mock),
+            patch.object(tl_db, "get_run", get_run_mock),
+            patch.object(tl_db, "get_latest_attempt", get_latest_mock),
+            patch.object(tl_db, "find_run_by_request_key", find_by_key_mock),
+            patch.object(notify_turn, "post_notification_turn", post_mock),
+            patch.object(notify_turn, "await_run_terminal", await_terminal_mock),
+            patch.object(outbox_db, "extend_job_lease", extend_mock),
+            patch.object(outbox_db, "merge_job_payload", merge_mock),
+            patch.object(outbox_db, "has_live_hand_off", has_live_mock),
+            patch.object(executor, "_workspace_name", ws_name_mock),
+            patch.object(outbox_db, "ack_outbox_job", ack_mock),
+            patch.object(outbox_db, "nack_outbox_job", nack_mock),
+        ):
+            await drainer._execute(job_dead)
+            nack_mock.assert_awaited_once()
+            assert (
+                cache.kv[ptc_origin_key("ptc-dash")]["awaiting_resume"][
+                    "analyst_run_id"
+                ]
+                == "ptc-run-0"
+            )
+
+            # 1) {job_id}:dead_clear executes (unmarked payload from SQL CTE)
+            await core._exec_watch_clear(
+                {
+                    "hook_outbox_id": "job-err-dead:dead_clear",
+                    "hook_type": "watch_clear",
+                    "run_id": "ptc-run-0",
+                    "attempts": 1,
+                    "ordering_key": "cos-home",
+                    "payload": {
+                        "ptc_thread_id": "ptc-dash",
+                        "error_wake": True,
+                        "dispatch_gen": "gen-1",
+                        "refuse_if_pointer": True,
+                    },
+                }
+            )
+            assert "ptc-dash" in cache.client.sets.get(watch_key("cos-home"), set())
+            assert ptc_origin_key("ptc-dash") in cache.kv
+
+            # 2) Unmarked {rb_run_id}:watch_clear from summary finalize executes later
+            await core._exec_watch_clear(
+                {
+                    "hook_outbox_id": "rb-run-0:watch_clear",
+                    "hook_type": "watch_clear",
+                    "run_id": "rb-run-0",
+                    "attempts": 1,
+                    "ordering_key": "cos-home",
+                    "payload": {
+                        "ptc_thread_id": "ptc-dash",
+                        "user_id": "u-1",
+                        "error_wake": False,
+                        "dispatch_gen": "gen-1",
+                    },
+                }
+            )
+            assert "ptc-dash" in cache.client.sets.get(watch_key("cos-home"), set())
+            assert ptc_origin_key("ptc-dash") in cache.kv
+
+            # 3) Resumed run ptc-run-1 reports back, revokes awaiting_resume, and clears
+            await core._exec_handoff_report_back(
+                {
+                    "hook_outbox_id": "job-ok-1",
+                    "hook_type": "report_back",
+                    "run_id": "ptc-run-1",
+                    "attempts": 1,
+                    "ordering_key": "cos-home",
+                    "payload": {
+                        "ptc_thread_id": "ptc-dash",
+                        "dispatch_gen": "gen-1",
+                        "final_status": "completed",
+                    },
+                }
+            )
+            assert len(post_calls) == 2
+            await core._exec_watch_clear(
+                {
+                    "hook_outbox_id": "rb-run-1:watch_clear",
+                    "hook_type": "watch_clear",
+                    "run_id": "rb-run-1",
+                    "attempts": 1,
+                    "ordering_key": "cos-home",
+                    "payload": {
+                        "ptc_thread_id": "ptc-dash",
+                        "user_id": "u-1",
+                        "error_wake": False,
+                        "dispatch_gen": "gen-1",
+                    },
+                }
+            )
+            assert "ptc-dash" not in cache.client.sets.get(
+                watch_key("cos-home"), set()
+            )
+            assert ptc_origin_key("ptc-dash") not in cache.kv
+
+    # DALTON-HOOK(handoff-keep-on-resumable): Codex #2 — summary terminal-wait timeout
+    # (_await_run_terminal) and drop/cap skip clearing while awaiting_resume is active
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mode", ["timeout", "cap"])
+    async def test_summary_timeout_and_drop_cap_preserve_handoff_until_resumed_run(
+        self, mode: str
+    ):
+        from contextlib import asynccontextmanager
+        from unittest.mock import create_autospec
+
+        from src.server.database.runs import lifecycle as tl_db
+        from src.server.database.runs import outbox as outbox_db
+        from src.server.services.report_back import notify_turn
+        from src.server.services.report_back.handoff import executor
+        from src.server.services.report_back.handoff.keys import (
+            PTC_ORIGIN_TTL,
+            ptc_origin_key,
+            rb_done_key,
+            rb_run_key,
+            watch_key,
+        )
+        from src.utils.cache import redis_cache
+
+        cache = self._seeded_cache()
+        runs_by_id = {
+            "ptc-run-0": {
+                "conversation_response_id": "ptc-run-0",
+                "status": "error",
+                "errors": [
+                    "worker_lost: no live executor holds this run's writer fence"
+                ],
+            },
+            "ptc-run-1": {
+                "conversation_response_id": "ptc-run-1",
+                "status": "completed",
+                "errors": [],
+            },
+        }
+        get_cache_mock = create_autospec(
+            redis_cache.get_cache_client, return_value=cache
+        )
+        get_run_mock = create_autospec(
+            tl_db.get_run,
+            side_effect=lambda run_id: dict(runs_by_id[run_id]),
+        )
+        get_latest_mock = create_autospec(
+            tl_db.get_latest_attempt,
+            return_value=dict(runs_by_id["ptc-run-0"]),
+        )
+        find_by_key_mock = create_autospec(
+            tl_db.find_run_by_request_key, return_value=None
+        )
+        post_calls: list[dict] = []
+
+        async def _fake_post_turn(**kwargs):
+            post_calls.append(kwargs)
+            if len(post_calls) == 1 and mode == "cap":
+                return ("cap", None)
+            return ("dispatched", f"rb-run-{len(post_calls) - 1}")
+
+        post_mock = create_autospec(
+            notify_turn.post_notification_turn, side_effect=_fake_post_turn
+        )
+        # DALTON-HOOK(handoff-keep-on-resumable): first summary wait times out; second succeeds
+        terminal_outcomes = iter(["timeout", "terminal"])
+        await_terminal_mock = create_autospec(
+            notify_turn.await_run_terminal,
+            side_effect=lambda *args, **kwargs: next(terminal_outcomes),
+        )
+        extend_mock = create_autospec(
+            outbox_db.extend_job_lease, return_value=True
+        )
+        merge_mock = create_autospec(
+            outbox_db.merge_job_payload, return_value=True
+        )
+        has_live_mock = create_autospec(
+            outbox_db.has_live_hand_off, return_value=False
+        )
+        ws_name_mock = create_autospec(
+            executor._workspace_name, return_value="DASH"
+        )
+
+        @asynccontextmanager
+        async def _owned_guard(job_id: str, attempts: int, *, lease_seconds: int = 60):
+            yield True
+
+        guard_mock = create_autospec(
+            outbox_db.fenced_job_guard, side_effect=_owned_guard
+        )
+
+        with (
+            patch.object(outbox_db, "fenced_job_guard", guard_mock),
+            patch.object(redis_cache, "get_cache_client", get_cache_mock),
+            patch.object(tl_db, "get_run", get_run_mock),
+            patch.object(tl_db, "get_latest_attempt", get_latest_mock),
+            patch.object(tl_db, "find_run_by_request_key", find_by_key_mock),
+            patch.object(notify_turn, "post_notification_turn", post_mock),
+            patch.object(notify_turn, "await_run_terminal", await_terminal_mock),
+            patch.object(outbox_db, "extend_job_lease", extend_mock),
+            patch.object(outbox_db, "merge_job_payload", merge_mock),
+            patch.object(outbox_db, "has_live_hand_off", has_live_mock),
+            patch.object(executor, "_workspace_name", ws_name_mock),
+        ):
+            await core._exec_handoff_report_back(
+                {
+                    "hook_outbox_id": "job-err-timeout",
+                    "hook_type": "report_back",
+                    "run_id": "ptc-run-0",
+                    "attempts": 1,
+                    "ordering_key": "cos-home",
+                    "payload": {
+                        "ptc_thread_id": "ptc-dash",
+                        "dispatch_gen": "gen-1",
+                        "final_status": "error",
+                    },
+                }
+            )
+            # Neither _await_run_terminal timeout nor drop/cap cleared the pair!
+            assert "ptc-dash" in cache.client.sets.get(watch_key("cos-home"), set())
+            assert ptc_origin_key("ptc-dash") in cache.kv
+            assert cache.client.ttls[ptc_origin_key("ptc-dash")] == PTC_ORIGIN_TTL
+            if mode == "timeout":
+                # DALTON-HOOK(handoff-keep-on-resumable): timeout does NOT release
+                # the still-running summary turn's pointer or record it as drained;
+                # only the summary turn's own watch_clear releases it.
+                assert (
+                    cache.kv[rb_run_key("cos-home", "ptc-dash")]["run_id"]
+                    == "rb-run-0"
+                )
+                assert not cache.client.lists.get(rb_done_key("cos-home"))
+                await core._exec_watch_clear(
+                    {
+                        "hook_outbox_id": "rb-run-0:watch_clear",
+                        "hook_type": "watch_clear",
+                        "run_id": "rb-run-0",
+                        "attempts": 1,
+                        "ordering_key": "cos-home",
+                        "payload": {
+                            "ptc_thread_id": "ptc-dash",
+                            "user_id": "u-1",
+                            "error_wake": False,
+                            "dispatch_gen": "gen-1",
+                        },
+                    }
+                )
+                assert rb_run_key("cos-home", "ptc-dash") not in cache.kv
+                assert cache.client.lists.get(rb_done_key("cos-home")) == [
+                    "rb-run-0"
+                ]
+                assert "ptc-dash" in cache.client.sets.get(
+                    watch_key("cos-home"), set()
+                )
+                assert ptc_origin_key("ptc-dash") in cache.kv
+
+            # Resumed run completes -> revokes awaiting_resume -> final clear succeeds
+            await core._exec_handoff_report_back(
+                {
+                    "hook_outbox_id": "job-ok-after-timeout",
+                    "hook_type": "report_back",
+                    "run_id": "ptc-run-1",
+                    "attempts": 1,
+                    "ordering_key": "cos-home",
+                    "payload": {
+                        "ptc_thread_id": "ptc-dash",
+                        "dispatch_gen": "gen-1",
+                        "final_status": "completed",
+                    },
+                }
+            )
+            await core._exec_watch_clear(
+                {
+                    "hook_outbox_id": "job-clear-after-timeout",
+                    "hook_type": "watch_clear",
+                    "run_id": "rb-run-1",
+                    "attempts": 1,
+                    "ordering_key": "cos-home",
+                    "payload": {
+                        "ptc_thread_id": "ptc-dash",
+                        "user_id": "u-1",
+                        "error_wake": False,
+                        "dispatch_gen": "gen-1",
+                    },
+                }
+            )
+            assert "ptc-dash" not in cache.client.sets.get(
+                watch_key("cos-home"), set()
+            )
+            assert ptc_origin_key("ptc-dash") not in cache.kv
+
+    # DALTON-HOOK(handoff-keep-on-resumable): awaiting_resume expires after 24h (PTC_ORIGIN_TTL)
+    @pytest.mark.asyncio
+    async def test_expired_awaiting_resume_marker_clears_handoff_as_usual(self):
+        import time
+        from contextlib import asynccontextmanager
+        from unittest.mock import create_autospec
+
+        from src.server.database.runs import lifecycle as tl_db
+        from src.server.database.runs import outbox as outbox_db
+        from src.server.services.report_back.handoff import pointer
+        from src.server.services.report_back.handoff.keys import (
+            PTC_ORIGIN_TTL,
+            ptc_origin_key,
+            watch_key,
+        )
+        from src.utils.cache import redis_cache
+
+        cache = self._seeded_cache()
+        await pointer.mark_awaiting_resume(
+            cache,
+            "ptc-dash",
+            analyst_run_id="ptc-run-0",
+            expected_gen="gen-1",
+            marked_at=time.time() - PTC_ORIGIN_TTL - 10,
+        )
+        get_cache_mock = create_autospec(
+            redis_cache.get_cache_client, return_value=cache
+        )
+        get_run_mock = create_autospec(
+            tl_db.get_run,
+            return_value={
+                "conversation_response_id": "ptc-run-0",
+                "status": "error",
+                "errors": ["worker_lost"],
+            },
+        )
+
+        @asynccontextmanager
+        async def _owned_guard(job_id: str, attempts: int, *, lease_seconds: int = 60):
+            yield True
+
+        guard_mock = create_autospec(
+            outbox_db.fenced_job_guard, side_effect=_owned_guard
+        )
+        with (
+            patch.object(outbox_db, "fenced_job_guard", guard_mock),
+            patch.object(redis_cache, "get_cache_client", get_cache_mock),
+            patch.object(tl_db, "get_run", get_run_mock),
+        ):
+            await core._exec_watch_clear(
+                {
+                    "hook_outbox_id": "job-clear-expired",
+                    "hook_type": "watch_clear",
+                    "run_id": "rb-run-0",
+                    "attempts": 1,
+                    "ordering_key": "cos-home",
+                    "payload": {
+                        "ptc_thread_id": "ptc-dash",
+                        "user_id": "u-1",
+                        "error_wake": False,
+                        "dispatch_gen": "gen-1",
+                    },
+                }
+            )
+        get_run_mock.assert_not_awaited()
+        assert "ptc-dash" not in cache.client.sets.get(watch_key("cos-home"), set())
+        assert ptc_origin_key("ptc-dash") not in cache.kv
+
+    # DALTON-HOOK(handoff-keep-on-resumable): non-resumable failure + user retry
+    # delivered via real _exec_handoff_report_back writes no awaiting_resume and clears as usual
+    @pytest.mark.asyncio
+    async def test_non_resumable_failure_plus_user_retry_clears_handoff_as_usual(
+        self,
+    ):
+        from contextlib import asynccontextmanager
+        from unittest.mock import create_autospec
+
+        from src.server.database.runs import lifecycle as tl_db
+        from src.server.database.runs import outbox as outbox_db
+        from src.server.services.report_back import notify_turn
+        from src.server.services.report_back.handoff import executor
+        from src.server.services.report_back.handoff.keys import (
+            ptc_origin_key,
+            watch_key,
+        )
+        from src.utils.cache import redis_cache
+
+        cache = self._seeded_cache()
+        runs_by_id = {
+            "ptc-run-err": {
+                "conversation_response_id": "ptc-run-err",
+                "status": "error",
+                "errors": ["ValueError: invalid ticker symbol"],
+            },
+            "ptc-run-user-retry": {
+                "conversation_response_id": "ptc-run-user-retry",
+                "status": "in_progress",
+                "retry_of_run_id": "ptc-run-err",
+                "errors": [],
+            },
+        }
+        get_run_mock = create_autospec(
+            tl_db.get_run,
+            side_effect=lambda run_id: dict(runs_by_id[run_id]),
+        )
+        get_latest_mock = create_autospec(
+            tl_db.get_latest_attempt,
+            return_value=dict(runs_by_id["ptc-run-err"]),
+        )
+        find_by_key_mock = create_autospec(
+            tl_db.find_run_by_request_key, return_value=None
+        )
+        post_calls: list[dict] = []
+
+        async def _fake_post_turn(**kwargs):
+            post_calls.append(kwargs)
+            return ("dispatched", "rb-run-err")
+
+        post_mock = create_autospec(
+            notify_turn.post_notification_turn, side_effect=_fake_post_turn
+        )
+        await_terminal_mock = create_autospec(
+            notify_turn.await_run_terminal, return_value="terminal"
+        )
+        extend_mock = create_autospec(
+            outbox_db.extend_job_lease, return_value=True
+        )
+        merge_mock = create_autospec(
+            outbox_db.merge_job_payload, return_value=True
+        )
+        has_live_mock = create_autospec(
+            outbox_db.has_live_hand_off, return_value=False
+        )
+        ws_name_mock = create_autospec(
+            executor._workspace_name, return_value="DASH"
+        )
+        get_cache_mock = create_autospec(
+            redis_cache.get_cache_client, return_value=cache
+        )
+
+        @asynccontextmanager
+        async def _owned_guard(job_id: str, attempts: int, *, lease_seconds: int = 60):
+            yield True
+
+        guard_mock = create_autospec(
+            outbox_db.fenced_job_guard, side_effect=_owned_guard
+        )
+        # DALTON-HOOK(handoff-keep-on-resumable): deliver ordinary failure through
+        # _exec_handoff_report_back, assert awaiting_resume is not written, then clear
+        with (
+            patch.object(outbox_db, "fenced_job_guard", guard_mock),
+            patch.object(redis_cache, "get_cache_client", get_cache_mock),
+            patch.object(tl_db, "get_run", get_run_mock),
+            patch.object(tl_db, "get_latest_attempt", get_latest_mock),
+            patch.object(tl_db, "find_run_by_request_key", find_by_key_mock),
+            patch.object(notify_turn, "post_notification_turn", post_mock),
+            patch.object(notify_turn, "await_run_terminal", await_terminal_mock),
+            patch.object(outbox_db, "extend_job_lease", extend_mock),
+            patch.object(outbox_db, "merge_job_payload", merge_mock),
+            patch.object(outbox_db, "has_live_hand_off", has_live_mock),
+            patch.object(executor, "_workspace_name", ws_name_mock),
+        ):
+            job_err = {
+                "hook_outbox_id": "job-err-nonresumable",
+                "hook_type": "report_back",
+                "run_id": "ptc-run-err",
+                "attempts": 1,
+                "ordering_key": "cos-home",
+                "payload": {
+                    "ptc_thread_id": "ptc-dash",
+                    "dispatch_gen": "gen-1",
+                    "final_status": "error",
+                },
+            }
+            await core._exec_handoff_report_back(job_err)
+
+            assert len(post_calls) == 1
+            msg = post_calls[0]["body"]["messages"][0]["content"]
+            assert "failed before it finished" in msg
+            assert "运行被中断" not in msg
+            assert "awaiting_resume" not in cache.kv[ptc_origin_key("ptc-dash")]
+
+            await core._exec_watch_clear(
+                {
+                    "hook_outbox_id": "job-clear-err",
+                    "hook_type": "watch_clear",
+                    "run_id": "rb-run-err",
+                    "attempts": 1,
+                    "ordering_key": "cos-home",
+                    "payload": {
+                        "ptc_thread_id": "ptc-dash",
+                        "user_id": "u-1",
+                        "error_wake": False,
+                        "dispatch_gen": "gen-1",
+                    },
+                }
+            )
+        assert "ptc-dash" not in cache.client.sets.get(watch_key("cos-home"), set())
+        assert ptc_origin_key("ptc-dash") not in cache.kv
+
+    # DALTON-HOOK(handoff-keep-on-resumable): cancelled / user stop clears as usual
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "run_row",
+        [
+            {
+                "conversation_response_id": "ptc-run-cancel",
+                "status": "cancelled",
+                "errors": ["worker_lost"],
+            },
+            {
+                "conversation_response_id": "ptc-run-user-stop",
+                "status": "error",
+                "errors": ["worker_lost"],
+                "cancel_requested_at": "2026-10-26T00:00:00Z",
+            },
+            {
+                "conversation_response_id": "ptc-run-user-meta",
+                "status": "error",
+                "errors": ["worker_lost"],
+                "metadata": {"cancelled_by_user": True},
+            },
+        ],
+    )
+    async def test_cancelled_or_user_stopped_clears_handoff_as_usual(
+        self, run_row
+    ):
+        from contextlib import asynccontextmanager
+        from unittest.mock import create_autospec
+
+        from src.server.database.runs import lifecycle as tl_db
+        from src.server.database.runs import outbox as outbox_db
+        from src.server.services.report_back.handoff import executor
+        from src.server.services.report_back.handoff.keys import (
+            ptc_origin_key,
+            watch_key,
+        )
+        from src.utils.cache import redis_cache
+
+        cache = self._seeded_cache()
+        get_run_mock = create_autospec(tl_db.get_run, return_value=run_row)
+        get_cache_mock = create_autospec(
+            redis_cache.get_cache_client, return_value=cache
+        )
+
+        @asynccontextmanager
+        async def _owned_guard(job_id: str, attempts: int, *, lease_seconds: int = 60):
+            yield True
+
+        guard_mock = create_autospec(
+            outbox_db.fenced_job_guard, side_effect=_owned_guard
+        )
+        # DALTON-HOOK(handoff-keep-on-resumable): cancelled runs are never resumable
+        with (
+            patch.object(outbox_db, "fenced_job_guard", guard_mock),
+            patch.object(redis_cache, "get_cache_client", get_cache_mock),
+            patch.object(tl_db, "get_run", get_run_mock),
+        ):
+            assert (
+                await executor.is_resumable_analyst_failure(
+                    run_row["conversation_response_id"]
+                )
+                is False
+            )
+            await core._exec_watch_clear(
+                {
+                    "hook_outbox_id": "job-clear-cancel",
+                    "hook_type": "watch_clear",
+                    "run_id": "rb-run-cancel",
+                    "attempts": 1,
+                    "ordering_key": "cos-home",
+                    "payload": {
+                        "ptc_thread_id": "ptc-dash",
+                        "user_id": "u-1",
+                        "error_wake": True,
+                        "dispatch_gen": "gen-1",
+                    },
+                }
+            )
+        assert "ptc-dash" not in cache.client.sets.get(watch_key("cos-home"), set())
+        assert ptc_origin_key("ptc-dash") not in cache.kv
+
+    # DALTON-HOOK(handoff-keep-on-resumable): closed DB pool raises for drainer nack
+    @pytest.mark.asyncio
+    async def test_db_pool_not_open_raises_and_nacks_without_clearing(self):
+        from unittest.mock import create_autospec
+
+        from src.server.database.runs import lifecycle as tl_db
+        from src.server.database.runs import outbox as outbox_db
+        from src.server.services.report_back.handoff.keys import (
+            ptc_origin_key,
+            watch_key,
+        )
+        from src.utils.cache import redis_cache
+
+        cache = self._seeded_cache()
+        get_cache_mock = create_autospec(
+            redis_cache.get_cache_client, return_value=cache
+        )
+        get_latest_mock = create_autospec(
+            tl_db.get_latest_attempt,
+            return_value={"conversation_response_id": "cos-idle", "status": "completed"},
+        )
+        has_live_mock = create_autospec(
+            outbox_db.has_live_hand_off, return_value=False
+        )
+        get_run_mock = create_autospec(
+            tl_db.get_run,
+            side_effect=RuntimeError(
+                "Conversation database pool is not open. Ensure lifespan initializes it."
+            ),
+        )
+        ack_mock = create_autospec(outbox_db.ack_outbox_job, return_value=True)
+        nack_mock = create_autospec(
+            outbox_db.nack_outbox_job, return_value="pending"
+        )
+
+        drainer = HookOutboxDrainer()
+        # DALTON-HOOK(handoff-keep-on-resumable): pool-not-open nacks instead of acking
+        with (
+            patch.object(redis_cache, "get_cache_client", get_cache_mock),
+            patch.object(tl_db, "get_latest_attempt", get_latest_mock),
+            patch.object(outbox_db, "has_live_hand_off", has_live_mock),
+            patch.object(tl_db, "get_run", get_run_mock),
+            patch.object(outbox_db, "ack_outbox_job", ack_mock),
+            patch.object(outbox_db, "nack_outbox_job", nack_mock),
+        ):
+            await drainer._execute(
+                {
+                    "hook_outbox_id": "job-err-pool",
+                    "hook_type": "report_back",
+                    "run_id": "ptc-run-0",
+                    "attempts": 1,
+                    "ordering_key": "cos-home",
+                    "payload": {
+                        "ptc_thread_id": "ptc-dash",
+                        "dispatch_gen": "gen-1",
+                        "final_status": "error",
+                    },
+                }
+            )
+
+        nack_mock.assert_awaited_once()
+        ack_mock.assert_not_awaited()
+        assert "ptc-dash" in cache.client.sets.get(watch_key("cos-home"), set())
+        assert ptc_origin_key("ptc-dash") in cache.kv
+
+    # DALTON-HOOK(handoff-keep-on-resumable): NotOwed exit logs INFO with context
+    @pytest.mark.asyncio
+    async def test_not_owed_exit_logs_info(self, caplog):
+        from src.server.services.report_back.handoff import executor
+        from src.server.services.report_back.handoff.keys import watch_key
+
+        cache = self._seeded_cache()
+        cache.client.sets[watch_key("cos-home")].clear()
+
+        job = {
+            "hook_outbox_id": "job-cleared",
+            "hook_type": "report_back",
+            "ordering_key": "cos-home",
+            "payload": {
+                "ptc_thread_id": "ptc-dash",
+                "dispatch_gen": "gen-1",
+                "final_status": "completed",
+            },
+        }
+        with caplog.at_level(
+            "INFO", logger="src.server.handlers.chat_handler"
+        ):
+            verdict = await executor.analyst_report_verdict(cache, job)
+
+        assert isinstance(verdict, executor.NotOwed)
+        assert verdict.reason == "its pair was already cleared"
+        assert any(
+            "its pair was already cleared" in rec.message
+            and "cos-home" in rec.message
+            and "ptc-dash" in rec.message
+            and "gen-1" in rec.message
+            for rec in caplog.records
+        )
+
+    # DALTON-HOOK(handoff-keep-on-resumable): Round 5 #2 — marked g1 -> provisional
+    # reserve (g2) -> old clear for g1 -> rollback of g2 keeps both the pair and marker
+    @pytest.mark.asyncio
+    async def test_awaiting_resume_survives_provisional_reserve_old_clear_and_rollback(
+        self,
+    ):
+        from contextlib import asynccontextmanager
+        from unittest.mock import create_autospec
+
+        from src.server.database.runs import lifecycle as tl_db
+        from src.server.database.runs import outbox as outbox_db
+        from src.server.services.report_back.handoff import pointer, reserve
+        from src.server.services.report_back.handoff.keys import (
+            ptc_origin_key,
+            ptc_teardown_tombstone_key,
+            user_pending_key,
+            watch_key,
+        )
+        from src.utils.cache import redis_cache
+
+        cache = self._seeded_cache()
+        await pointer.mark_awaiting_resume(
+            cache,
+            "ptc-dash",
+            analyst_run_id="ptc-run-0",
+            expected_gen="gen-1",
+        )
+
+        get_cache_mock = create_autospec(
+            redis_cache.get_cache_client, return_value=cache
+        )
+        get_run_mock = create_autospec(
+            tl_db.get_run,
+            return_value={
+                "conversation_response_id": "ptc-run-0",
+                "status": "error",
+                "errors": ["worker_lost: no live executor holds this run's writer fence"],
+            },
+        )
+        has_gen_mock = create_autospec(
+            tl_db.thread_has_dispatch_gen, return_value=False
+        )
+        active_run_mock = create_autospec(
+            tl_db.get_active_run, return_value=None
+        )
+
+        @asynccontextmanager
+        async def _owned_guard(job_id: str, attempts: int, *, lease_seconds: int = 60):
+            yield True
+
+        guard_mock = create_autospec(
+            outbox_db.fenced_job_guard, side_effect=_owned_guard
+        )
+
+        # DALTON-HOOK(handoff-keep-on-resumable): exercise reserve -> fenced old clear -> rollback
+        with (
+            patch.object(redis_cache, "get_cache_client", get_cache_mock),
+            patch.object(tl_db, "get_run", get_run_mock),
+            patch.object(tl_db, "thread_has_dispatch_gen", has_gen_mock),
+            patch.object(tl_db, "get_active_run", active_run_mock),
+            patch.object(outbox_db, "fenced_job_guard", guard_mock),
+        ):
+            async with reserve.reserve(
+                "cos-home", "ptc-dash", "ws-dash", "fws-1", "u-1"
+            ) as slot:
+                assert slot.error is None
+                # RESERVE_LUA preserved awaiting_resume on the new generation's origin
+                origin_mid = cache.kv[ptc_origin_key("ptc-dash")]
+                assert origin_mid["dispatch_gen"] == slot.dispatch_gen
+                assert (
+                    origin_mid["awaiting_resume"]["analyst_run_id"]
+                    == "ptc-run-0"
+                )
+                assert origin_mid["awaiting_resume"]["dispatch_gen"] == "gen-1"
+
+                # Old watch_clear for gen-1 arrives while provisional gen-2 holds origin
+                await core._exec_watch_clear(
+                    {
+                        "hook_outbox_id": "job-clear-old-gen1",
+                        "hook_type": "watch_clear",
+                        "run_id": "rb-run-0",
+                        "attempts": 1,
+                        "ordering_key": "cos-home",
+                        "payload": {
+                            "ptc_thread_id": "ptc-dash",
+                            "user_id": "u-1",
+                            "error_wake": False,
+                            "dispatch_gen": "gen-1",
+                        },
+                    }
+                )
+                # Tombstone was recorded by the gen fence, and orphan resolve was suppressed
+                assert "gen-1" in cache.client.sets.get(
+                    ptc_teardown_tombstone_key("ptc-dash"), set()
+                )
+                assert "ptc-dash" in cache.client.sets.get(
+                    watch_key("cos-home"), set()
+                )
+                # Exit without slot.commit() -> triggers ROLLBACK_RESERVE_LUA
+
+        # After rollback: pair and awaiting_resume marker are both preserved!
+        assert "ptc-dash" in cache.client.sets.get(watch_key("cos-home"), set())
+        assert "ptc-dash" in cache.client.sets.get(user_pending_key("u-1"), set())
+        restored_origin = cache.kv.get(ptc_origin_key("ptc-dash"))
+        assert isinstance(restored_origin, dict)
+        assert restored_origin["dispatch_gen"] == "gen-1"
+        assert (
+            restored_origin["awaiting_resume"]["analyst_run_id"] == "ptc-run-0"
+        )
+        assert (
+            ptc_teardown_tombstone_key("ptc-dash") not in cache.client.sets
+        )
+
+    # DALTON-HOOK(handoff-keep-on-resumable): Round 5 #4a — strict GET raises -> no teardown
+    @pytest.mark.asyncio
+    async def test_clear_handoff_strict_get_failure_raises_without_teardown(self):
+        from unittest.mock import create_autospec
+
+        from src.server.services.report_back.handoff import pointer
+        from src.server.services.report_back.handoff.keys import (
+            ptc_origin_key,
+            user_pending_key,
+            watch_key,
+        )
+
+        cache = self._seeded_cache()
+        eval_spy = create_autospec(
+            cache.client.eval, side_effect=cache.client.eval
+        )
+        get_strict_mock = create_autospec(
+            cache.get_strict,
+            side_effect=ConnectionError("redis strict read timeout"),
+        )
+        with (
+            patch.object(cache, "get_strict", get_strict_mock),
+            patch.object(cache.client, "eval", eval_spy),
+        ):
+            with pytest.raises(ConnectionError, match="redis strict read timeout"):
+                await pointer.clear_handoff_report_back(
+                    cache,
+                    "ptc-dash",
+                    "cos-home",
+                    expected_gen="gen-1",
+                )
+
+        eval_spy.assert_not_awaited()
+        assert "ptc-dash" in cache.client.sets.get(watch_key("cos-home"), set())
+        assert "ptc-dash" in cache.client.sets.get(user_pending_key("u-1"), set())
+        assert ptc_origin_key("ptc-dash") in cache.kv
+
+    # DALTON-HOOK(handoff-keep-on-resumable): Round 5 #4b — another worker stamps
+    # awaiting_resume after Python pre-read and right before Lua eval -> script refuses
+    @pytest.mark.asyncio
+    async def test_interleaved_mark_before_teardown_and_orphan_lua_refuses_clear(
+        self,
+    ):
+        from unittest.mock import create_autospec
+
+        from src.server.database.runs import lifecycle as tl_db
+        from src.server.services.report_back.handoff import pointer, reserve
+        from src.server.services.report_back.handoff.keys import (
+            ptc_origin_key,
+            user_pending_key,
+            watch_key,
+        )
+
+        cache = self._seeded_cache()
+        real_get_strict = cache.get_strict
+
+        # 1) During clear_handoff_report_back, get_strict reads unmarked origin, and
+        # another worker stamps awaiting_resume right before GATED_TEARDOWN_LUA runs.
+        async def _get_strict_then_rival_marks(key: str):
+            val = await real_get_strict(key)
+            if key == ptc_origin_key("ptc-dash"):
+                assert "awaiting_resume" not in val
+                await pointer.mark_awaiting_resume(
+                    cache,
+                    "ptc-dash",
+                    analyst_run_id="ptc-run-0",
+                    expected_gen="gen-1",
+                )
+            return val
+
+        get_strict_mock = create_autospec(
+            cache.get_strict, side_effect=_get_strict_then_rival_marks
+        )
+        run_row = {
+            "conversation_response_id": "ptc-run-0",
+            "status": "error",
+            "errors": ["worker_lost: no live executor holds this run's writer fence"],
+        }
+        get_run_mock = create_autospec(
+            tl_db.get_run, side_effect=lambda _rid: dict(run_row)
+        )
+        has_gen_mock = create_autospec(
+            tl_db.thread_has_dispatch_gen, return_value=False
+        )
+        active_run_mock = create_autospec(
+            tl_db.get_active_run, return_value=None
+        )
+
+        # DALTON-HOOK(handoff-keep-on-resumable): Lua refuses both teardown and orphan resolve
+        with (
+            patch.object(cache, "get_strict", get_strict_mock),
+            patch.object(tl_db, "get_run", get_run_mock),
+            patch.object(tl_db, "thread_has_dispatch_gen", has_gen_mock),
+            patch.object(tl_db, "get_active_run", active_run_mock),
+        ):
+            outcome = await pointer.clear_handoff_report_back(
+                cache,
+                "ptc-dash",
+                "cos-home",
+                expected_gen="gen-1",
+            )
+            assert not outcome.cleared
+            assert outcome.awaiting_resume is True
+            assert "ptc-dash" in cache.client.sets.get(
+                watch_key("cos-home"), set()
+            )
+            assert "ptc-dash" in cache.client.sets.get(
+                user_pending_key("u-1"), set()
+            )
+
+            # 2) Same for resolve_orphaned_watch: ORPHAN_RESOLVE_LUA checks awaiting_resume in Lua
+            resolved, _ = await reserve.resolve_orphaned_watch(
+                cache,
+                "ptc-dash",
+                "cos-home",
+                "u-1",
+                fencer_gen="gen-1",
+                job_gen="gen-1",
+            )
+            assert resolved is False
+            assert "ptc-dash" in cache.client.sets.get(
+                watch_key("cos-home"), set()
+            )
+
+            # 3) Once Postgres reports the run is no longer resumable (cancelled),
+            # clear_handoff_report_back conditionally revokes awaiting_resume and tears down.
+            run_row["cancel_requested_at"] = "2026-10-26T00:00:00Z"
+
+        with patch.object(tl_db, "get_run", get_run_mock):
+            outcome_after_cancel = await pointer.clear_handoff_report_back(
+                cache,
+                "ptc-dash",
+                "cos-home",
+                expected_gen="gen-1",
+            )
+        assert outcome_after_cancel.cleared is True
+        assert ptc_origin_key("ptc-dash") not in cache.kv
+        assert "ptc-dash" not in cache.client.sets.get(
+            watch_key("cos-home"), set()
+        )
+
+
+

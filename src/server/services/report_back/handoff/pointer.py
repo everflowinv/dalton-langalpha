@@ -15,6 +15,7 @@ from typing import NamedTuple
 
 from src.server.services.report_back.handoff import leases
 from src.server.services.report_back.handoff.keys import (
+    PTC_ORIGIN_TTL,
     RB_DONE_MAX,
     RB_DONE_TTL,
     RB_RUN_TTL,
@@ -27,6 +28,10 @@ from src.server.services.report_back.handoff.keys import (
     user_pending_key,
     watch_key,
 )
+
+# DALTON-HOOK(handoff-keep-on-resumable): field name on ptc_origin holding the
+# awaiting-resume marker across a resumable analyst interruption.
+AWAITING_RESUME_FIELD = "awaiting_resume"
 
 # Same hard-coded logger name request_prep uses — existing log routing keys off it.
 logger = logging.getLogger("src.server.handlers.chat_handler")
@@ -154,6 +159,9 @@ return 1
 #         means a report-back admission is in flight or already consummated
 #         for this pair — refuse the whole teardown, {0, ''}, no tombstone;
 #         only that admission's own serialized lifecycle may drain it)
+#       5=honor_awaiting_resume ('1' = refuse teardown with {2, analyst_run_id}
+#         when ptc_origin carries a non-expired awaiting_resume marker; '0' =
+#         mass discard of a deleted dispatcher thread)
 GATED_TEARDOWN_LUA = """
 if ARGV[4] == '1' and KEYS[2] ~= '' and redis.call('exists', KEYS[2]) == 1 then
   return {0, ''}
@@ -161,13 +169,30 @@ end
 local v = redis.call('get', KEYS[1])
 if v then
   local ok, t = pcall(cjson.decode, v)
-  if ok and type(t) == 'table' and type(t['dispatch_gen']) == 'string' then
-    if ARGV[1] == '' or t['dispatch_gen'] ~= ARGV[1] then
-      local mark = ARGV[1]
-      if mark == '' then mark = '__legacy__' end
-      redis.call('sadd', KEYS[5], mark)
-      redis.call('expire', KEYS[5], ARGV[3])
-      return {0, t['dispatch_gen']}
+  if ok and type(t) == 'table' then
+    if type(t['dispatch_gen']) == 'string' then
+      if ARGV[1] == '' or t['dispatch_gen'] ~= ARGV[1] then
+        local mark = ARGV[1]
+        if mark == '' then mark = '__legacy__' end
+        redis.call('sadd', KEYS[5], mark)
+        redis.call('expire', KEYS[5], ARGV[3])
+        return {0, t['dispatch_gen']}
+      end
+    end
+    -- DALTON-HOOK(handoff-keep-on-resumable): check awaiting_resume atomically
+    -- inside the teardown script against Redis TIME (24h = 86400s).
+    local ar = t['awaiting_resume']
+    if ARGV[5] ~= '0' and type(ar) == 'table' and type(ar['marked_at']) == 'number' then
+      local mgen = ar['dispatch_gen']
+      if type(mgen) ~= 'string'
+         or mgen == t['dispatch_gen']
+         or mgen == t['prev_gen']
+         or mgen == t['owner_gen'] then
+        local now = tonumber(redis.call('time')[1])
+        if (now - ar['marked_at']) < 86400 then
+          return {2, ar['analyst_run_id'] or ''}
+        end
+      end
     end
   end
 end
@@ -189,9 +214,56 @@ class ClearOutcome(NamedTuple):
 
     cleared: bool
     fencer_gen: str | None = None
+    # DALTON-HOOK(handoff-keep-on-resumable): True when teardown was skipped
+    # because the handoff pair is awaiting resume of an interrupted analyst run.
+    awaiting_resume: bool = False
 
     def __bool__(self) -> bool:
         return self.cleared
+
+
+# DALTON-HOOK(handoff-keep-on-resumable): atomically stamp or clear
+# awaiting_resume on ptc_origin:{ptc_thread_id} gated on dispatch_gen.
+# KEYS: 1=ptc_origin
+# ARGV: 1=expected_gen ('' = legacy-only)
+#       2=mode ('set' or 'clear')
+#       3=analyst_run_id (for 'set', or conditional CAS filter for 'clear')
+#       4=marked_at (epoch seconds string, for 'set')
+#       5=ttl (PTC_ORIGIN_TTL, for 'set')
+AWAITING_RESUME_LUA = """
+local o = redis.call('get', KEYS[1])
+if not o then return 0 end
+local ok, origin = pcall(cjson.decode, o)
+if not (ok and type(origin) == 'table') then return 0 end
+if ARGV[2] == 'set' then
+  if type(origin['dispatch_gen']) == 'string' then
+    if ARGV[1] == '' or origin['dispatch_gen'] ~= ARGV[1] then
+      return 0
+    end
+  end
+  origin['awaiting_resume'] = {
+    analyst_run_id = ARGV[3],
+    marked_at = tonumber(ARGV[4]),
+    dispatch_gen = origin['dispatch_gen'],
+  }
+  redis.call('set', KEYS[1], cjson.encode(origin), 'EX', tonumber(ARGV[5]))
+  return 1
+end
+local ar = origin['awaiting_resume']
+if type(ar) ~= 'table' then return 0 end
+if type(origin['dispatch_gen']) == 'string' then
+  local mgen = ar['dispatch_gen']
+  if ARGV[1] == '' or (origin['dispatch_gen'] ~= ARGV[1] and mgen ~= ARGV[1]) then
+    return 0
+  end
+end
+if ARGV[3] ~= '' and ar['analyst_run_id'] ~= ARGV[3] then
+  return 0
+end
+origin['awaiting_resume'] = nil
+redis.call('set', KEYS[1], cjson.encode(origin), 'KEEPTTL')
+return 1
+"""
 
 # Compare-and-delete for the run pointer: a separate GET-compare-DEL races a
 # concurrent claim writing a NEW run id and would delete the newer claim.
@@ -531,6 +603,90 @@ async def claim(
             await release_report_back_run(cache, dispatcher_thread_id, ptc_thread_id, run_id)
 
 
+# DALTON-HOOK(handoff-keep-on-resumable): atomic write, revocation, and TTL/DB
+# verification of awaiting_resume on ptc_origin:{ptc_thread_id}.
+async def mark_awaiting_resume(
+    cache,
+    ptc_thread_id: str,
+    *,
+    analyst_run_id: str,
+    expected_gen: str | None = None,
+    marked_at: float | None = None,
+) -> bool:
+    """Atomically stamp ``awaiting_resume`` onto ``ptc_origin:{ptc_thread_id}``
+    when ``expected_gen`` matches the pair's current ``dispatch_gen``."""
+    if not (cache.enabled and cache.client):
+        raise RuntimeError(
+            f"Redis cache unavailable while marking awaiting_resume for {ptc_thread_id}"
+        )
+    now = time.time() if marked_at is None else float(marked_at)
+    res = await cache.client.eval(
+        AWAITING_RESUME_LUA,
+        1,
+        ptc_origin_key(ptc_thread_id),
+        expected_gen or "",
+        "set",
+        str(analyst_run_id),
+        str(now),
+        str(PTC_ORIGIN_TTL),
+    )
+    return bool(int(res))
+
+
+async def clear_awaiting_resume(
+    cache,
+    ptc_thread_id: str,
+    *,
+    expected_gen: str | None = None,
+    analyst_run_id: str | None = None,
+) -> bool:
+    """Atomically revoke ``awaiting_resume`` on ``ptc_origin:{ptc_thread_id}``
+    when ``expected_gen`` (and optional ``analyst_run_id``) matches."""
+    if not (cache.enabled and cache.client):
+        raise RuntimeError(
+            f"Redis cache unavailable while clearing awaiting_resume for {ptc_thread_id}"
+        )
+    res = await cache.client.eval(
+        AWAITING_RESUME_LUA,
+        1,
+        ptc_origin_key(ptc_thread_id),
+        expected_gen or "",
+        "clear",
+        str(analyst_run_id or ""),
+        "0",
+        str(PTC_ORIGIN_TTL),
+    )
+    return bool(int(res))
+
+
+# DALTON-HOOK(handoff-keep-on-resumable): verify the Lua-reported awaiting_resume
+# run in Postgres; conditionally revoke the marker if no longer resumable.
+async def still_resumable_or_revoke(
+    cache,
+    ptc_thread_id: str,
+    analyst_run_id: str | None,
+    *,
+    expected_gen: str | None = None,
+) -> bool:
+    """Return True if ``analyst_run_id`` is still a resumable analyst failure in
+    Postgres; otherwise conditionally revoke ``awaiting_resume`` on ``ptc_origin``
+    so the caller can re-run its teardown script."""
+    from src.server.services.report_back.handoff import executor
+
+    if analyst_run_id and await executor.is_resumable_analyst_failure(
+        str(analyst_run_id)
+    ):
+        return True
+    await clear_awaiting_resume(
+        cache,
+        ptc_thread_id,
+        expected_gen=expected_gen,
+        analyst_run_id=analyst_run_id,
+    )
+    return False
+
+
+# DALTON-HOOK(handoff-keep-on-resumable): ignore_awaiting_resume bypasses marker for 404 thread deletion
 async def clear_handoff_report_back(
     cache,
     ptc_thread_id: str,
@@ -540,6 +696,8 @@ async def clear_handoff_report_back(
     record_drained: bool = True,
     expected_gen: str | None = None,
     refuse_if_pointer: bool = False,
+    ignore_awaiting_resume: bool = False,
+    release_pointer_when_kept: bool = True,
 ) -> ClearOutcome:
     """Tear down all report-back state for one PTC thread.
 
@@ -562,24 +720,26 @@ async def clear_handoff_report_back(
     is recorded on the drained-run list (``rb_done_key``) so a client that
     missed the wake can still find the finished turn; ``record_drained=False``
     skips that (a deleted Chief of Staff thread, where nothing can render
-    those turns).
+    those turns). ``release_pointer_when_kept=False`` keeps the summary
+    turn's pointer on a pair kept for resume (a terminal-wait timeout, where
+    that turn has not finished).
     """
-    origin = await cache.get(ptc_origin_key(ptc_thread_id))
+    # DALTON-HOOK(handoff-keep-on-resumable): strict pre-reads fail loud so a
+    # Redis blip nacks the outbox job instead of degrading to None.
+    origin = await cache.get_strict(ptc_origin_key(ptc_thread_id))
     if user_id is None and isinstance(origin, dict):
         user_id = origin.get("user_id")
 
-    # Read the run pointer BEFORE the teardown deletes it; best-effort.
     drained_run_id = None
     if record_drained and dispatcher_thread_id:
-        try:
-            ptr = await cache.get(rb_run_key(dispatcher_thread_id, ptc_thread_id))
-            if isinstance(ptr, dict):
-                drained_run_id = ptr.get("run_id")
-        except Exception:
-            pass
+        ptr = await cache.get_strict(
+            rb_run_key(dispatcher_thread_id, ptc_thread_id)
+        )
+        if isinstance(ptr, dict):
+            drained_run_id = ptr.get("run_id")
 
     if cache.client:
-        res = await cache.client.eval(
+        teardown_args = (
             GATED_TEARDOWN_LUA,
             5,
             ptc_origin_key(ptc_thread_id),
@@ -593,7 +753,49 @@ async def clear_handoff_report_back(
             ptc_thread_id,
             TEARDOWN_TOMBSTONE_TTL,
             "1" if refuse_if_pointer else "0",
+            "0" if ignore_awaiting_resume else "1",
         )
+        res = await cache.client.eval(*teardown_args)
+        # DALTON-HOOK(handoff-keep-on-resumable): {2, analyst_run_id} means Lua
+        # refused teardown because ptc_origin carries a non-expired awaiting_resume
+        # marker. Verify in Postgres; only if no longer resumable, conditionally
+        # revoke the marker and re-run the teardown script.
+        if isinstance(res, (list, tuple)) and res and int(res[0]) == 2:
+            analyst_run_id = (
+                decode(res[1]) if len(res) > 1 and res[1] else None
+            )
+            if await still_resumable_or_revoke(
+                cache,
+                ptc_thread_id,
+                analyst_run_id,
+                expected_gen=expected_gen,
+            ):
+                # DALTON-HOOK(handoff-keep-on-resumable): a kept pair still
+                # releases the pointer of a summary turn that has ended
+                # (watch_clear); a terminal-wait timeout passes False, since
+                # that summary turn has not ended.
+                if (
+                    record_drained
+                    and release_pointer_when_kept
+                    and not refuse_if_pointer
+                    and drained_run_id
+                    and dispatcher_thread_id
+                ):
+                    await release_report_back_run(
+                        cache, dispatcher_thread_id, ptc_thread_id, drained_run_id
+                    )
+                    await record_drained_run(
+                        cache, dispatcher_thread_id, drained_run_id
+                    )
+                logger.info(
+                    f"[HANDOFF_REPORT_BACK] Skipping teardown for {ptc_thread_id} on "
+                    f"thread {dispatcher_thread_id}: awaiting resume of analyst run "
+                    f"{analyst_run_id}"
+                )
+                return ClearOutcome(False, None, awaiting_resume=True)
+            res = await cache.client.eval(*teardown_args)
+            if isinstance(res, (list, tuple)) and res and int(res[0]) == 2:
+                return ClearOutcome(False, None, awaiting_resume=True)
         # Gen fence returns {0, fencing_gen}; pointer refusal {0, ''};
         # success returns 1.
         if isinstance(res, (list, tuple)) and res and not int(res[0]):
