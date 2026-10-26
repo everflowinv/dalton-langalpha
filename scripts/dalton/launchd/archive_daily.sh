@@ -85,6 +85,16 @@ except Exception as exc:
 PY
 }
 
+# Everything this run prints, the archive's own stderr logging included, goes to the
+# stdout log under one "=== <time> run" header, so the settings page shows this run's
+# lines (the bridge slices the log from the last such header) and nothing from an older run.
+# Only a run that owns the archive (claimed the PID file) writes the header. Starts that
+# exit early (switched off, unreadable state, another run in progress) write a "--- " line
+# instead: a manual run may be in progress (it may run while the schedule is off), and a new
+# header would cut that run's section in two.
+exec 2>&1
+run_header() { echo "=== $(date '+%F %T %Z') run"; }
+
 # Check bridge-managed schedule state file unless forced by manual run_now
 if [[ "${DALTON_ARCHIVE_FORCE_RUN:-0}" != "1" ]] && [[ -e "${STATE_FILE}" || -L "${STATE_FILE}" ]]; then
     if ! IS_DISABLED="$("${PYTHON_BIN}" - "${STATE_FILE}" <<'PY'
@@ -114,7 +124,7 @@ PY
 )"; then
         NOW_ISO="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
         ERR_MSG="${NOW_ISO} [ERROR] conversation_archive: 读取状态文件失败或文件已损坏 (${STATE_FILE})，拒绝运行归档"
-        echo "${ERR_MSG}" >&2
+        echo "--- ${ERR_MSG}" >&2
         if [[ -n "${DALTON_ARCHIVE_LOG_FILE:-}" ]]; then
             mkdir -p "$(dirname "${DALTON_ARCHIVE_LOG_FILE}")" 2>/dev/null || true
             echo "${ERR_MSG}" >> "${DALTON_ARCHIVE_LOG_FILE}" 2>/dev/null || true
@@ -125,7 +135,7 @@ PY
     if [[ "${IS_DISABLED}" == "1" ]]; then
         NOW_ISO="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
         MSG="${NOW_ISO} [INFO] conversation_archive: 已关闭（状态文件 ${STATE_FILE} 为 disabled，跳过定时运行）"
-        echo "${MSG}"
+        echo "--- ${MSG}"
         if [[ -n "${DALTON_ARCHIVE_LOG_FILE:-}" ]]; then
             mkdir -p "$(dirname "${DALTON_ARCHIVE_LOG_FILE}")" 2>/dev/null || true
             echo "${MSG}" >> "${DALTON_ARCHIVE_LOG_FILE}" 2>/dev/null || true
@@ -189,10 +199,12 @@ PY
 if [[ "${CLAIM_RESULT}" == BUSY:* ]]; then
     EXISTING_PID="${CLAIM_RESULT#BUSY:}"
     NOW_ISO="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-    echo "${NOW_ISO} [INFO] conversation_archive: 已在运行 (pid=${EXISTING_PID})，跳过"
+    echo "--- ${NOW_ISO} [INFO] conversation_archive: 已在运行 (pid=${EXISTING_PID})，跳过"
     write_status_file "${NOW_ISO}" "${NOW_ISO}" "2" "已在运行，跳过" || true
     exit 0
 fi
+
+run_header
 
 cleanup_pid_file() {
     "${PYTHON_BIN}" - "${STATUS_FILE}" "${PID_FILE}" "$$" <<'PY' 2>/dev/null || true
@@ -234,9 +246,52 @@ if [[ -f "${BRIDGE_ENV}" ]]; then
     set +a
 fi
 
+export DALTON_BRIDGE_EMBED_URL=http://127.0.0.1:8960/embed
+export no_proxy="localhost,127.0.0.1,::1,host.docker.internal,${no_proxy:-}"
+
 STARTED_AT="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-"${PYTHON_BIN}" "${ARCHIVE_SCRIPT}" run "$@"
-EXIT_CODE=$?
+EXIT_CODE=1
+# rc 3 = incomplete segments, safe to re-run: one retry after the journal stale window,
+# unless the archive was switched off in the meantime.
+for attempt in 1 2; do
+    echo "--- $(date '+%F %T %Z') attempt ${attempt}"
+    "${PYTHON_BIN}" "${ARCHIVE_SCRIPT}" run "$@"
+    EXIT_CODE=$?
+    echo "--- attempt ${attempt} exit ${EXIT_CODE}"
+    if [[ "${EXIT_CODE}" -eq 3 && "${attempt}" -eq 1 ]]; then
+        sleep "${DALTON_ARCHIVE_RETRY_SLEEP_S:-960}"
+        # Same rule as the start-of-run check: retry only if the switch still reads as on
+        # (or there is no state file); off, unreadable or corrupt stops here.
+        if [[ "${DALTON_ARCHIVE_FORCE_RUN:-0}" != "1" ]] && [[ -e "${STATE_FILE}" || -L "${STATE_FILE}" ]]; then
+            "${PYTHON_BIN}" - "${STATE_FILE}" <<'PY'
+import json
+import sys
+
+try:
+    raw = open(sys.argv[1], encoding="utf-8").read().strip()
+    low = raw.lower()
+    if low in ("false", "0", "off", "disabled"):
+        sys.exit(0)
+    if low in ("true", "1", "on", "enabled"):
+        sys.exit(1)
+    data = json.loads(raw)
+    if not isinstance(data, dict) or not isinstance(data.get("enabled"), bool):
+        sys.exit(2)
+    sys.exit(1 if data["enabled"] else 0)
+except Exception:
+    sys.exit(2)
+PY
+            case $? in
+                1) ;;
+                0) echo "--- retry skipped: archive was switched off"; break ;;
+                *) echo "--- retry skipped: state file unreadable or corrupt (${STATE_FILE})"; break ;;
+            esac
+        fi
+        continue
+    fi
+    break
+done
+echo "=== exit ${EXIT_CODE}"
 FINISHED_AT="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 
 write_status_file "${STARTED_AT}" "${FINISHED_AT}" "${EXIT_CODE}" || true

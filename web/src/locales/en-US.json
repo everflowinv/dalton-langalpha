@@ -143,9 +143,10 @@
     "feishuScopes": {
       "title": "Feishu doc access",
       "subtitle": "Choose which wiki spaces external team members may read Feishu docs from. Admins and internal members always have read and write access.",
+      "refresh": "Refresh",
       "save": "Save",
       "saving": "Saving…",
-      "empty": "No wiki spaces visible to the bot. Configure Feishu credentials on the host first."
+      "empty": "The bot (eve) has not been added to any Feishu wiki space yet. In Feishu Wiki \"Space Settings → Members\", add the group containing the eve bot as a member (read permission is sufficient), then click Refresh."
     },
     "errors": {
       "invalidCredentials": "Incorrect email or password.",

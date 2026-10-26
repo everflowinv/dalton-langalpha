@@ -201,7 +201,12 @@ export function DaltonBudgetCard() {
               onChange={(e) => setTimezoneInput(e.target.value)}
               placeholder="Asia/Shanghai"
             />
-            <Button type="submit" size="sm" disabled={updateBudget.isPending}>
+            <Button
+              type="submit"
+              size="sm"
+              disabled={updateBudget.isPending}
+              className="shrink-0 whitespace-nowrap"
+            >
               {t('common.save', '保存')}
             </Button>
           </div>
@@ -263,7 +268,13 @@ export function DaltonBudgetCard() {
             placeholder="上限 USD"
             className="w-32 text-xs"
           />
-          <Button type="submit" size="sm" variant="outline" disabled={upsertTaskCap.isPending}>
+          <Button
+            type="submit"
+            size="sm"
+            variant="outline"
+            disabled={upsertTaskCap.isPending}
+            className="shrink-0 whitespace-nowrap"
+          >
             <Plus className="h-3.5 w-3.5 mr-1" />
             添加
           </Button>

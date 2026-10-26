@@ -522,7 +522,7 @@ export interface DaltonSystemJobItem {
   scope: DaltonSystemJobScope;
   title?: string;
   description?: string;
-  schedule?: string;
+  schedule?: string | null;
   timezone?: string;
   workspace_id?: string;
   ticker?: string;
