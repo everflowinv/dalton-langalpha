@@ -65,6 +65,16 @@ sed \
     -e "s|__HOME__|${HOME}|g" \
     "${PLIST_TEMPLATE}" > "${TMP_PLIST}"
 
+# launchd jobs do not inherit the login shell's environment. On a host whose outbound
+# traffic goes through a local proxy, the archive's model calls need it, so carry the
+# installing shell's proxy settings into the job.
+for proxy_var in http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY; do
+    proxy_val="${!proxy_var:-}"
+    if [[ -n "${proxy_val}" ]]; then
+        plutil -replace "EnvironmentVariables.${proxy_var}" -string "${proxy_val}" "${TMP_PLIST}"
+    fi
+done
+
 if [[ -f "${PLIST_DEST}" ]] && [[ "${FORCE}" != "1" ]]; then
     echo "[install_conversation_archive] Target plist already exists: ${PLIST_DEST}" >&2
     diff -u "${PLIST_DEST}" "${TMP_PLIST}" || true
