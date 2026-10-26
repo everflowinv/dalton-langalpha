@@ -1200,7 +1200,7 @@ class TestToolsListResearchDescription:
 
 
 class TestDaltonSkillRegistrySingleSource:
-    def test_all_22_dalton_skills_match_skill_md_frontmatter(self) -> None:
+    def test_all_23_dalton_skills_match_skill_md_frontmatter(self) -> None:
         import yaml
 
         from ptc_agent.agent.middleware.skills.dalton_registry import (
@@ -1210,8 +1210,8 @@ class TestDaltonSkillRegistrySingleSource:
         )
         from ptc_agent.agent.middleware.skills.registry import SKILL_REGISTRY
 
-        assert len(_DALTON_SKILL_SPECS) == 22
-        assert len(DALTON_SKILL_DEFINITIONS) == 22
+        assert len(_DALTON_SKILL_SPECS) == 23
+        assert len(DALTON_SKILL_DEFINITIONS) == 23
 
         for name, skill_def in DALTON_SKILL_DEFINITIONS.items():
             skill_md = DALTON_SKILLS_DIR / name / "SKILL.md"
@@ -1227,6 +1227,73 @@ class TestDaltonSkillRegistrySingleSource:
             assert SKILL_REGISTRY[name].description == expected_desc
             assert "触发词" not in expected_desc, f"{name} still has trigger keyword list"
             assert len(expected_desc) <= 120, f"{name} description exceeds 120 chars: {len(expected_desc)}"
+
+    def test_dalton_onboarding_skill_and_interview_entry(self) -> None:
+        from ptc_agent.agent.middleware.skills.content import (
+            SkillRequest,
+            build_skill_content,
+            load_skill_content,
+        )
+        from ptc_agent.agent.middleware.skills.registry import (
+            SKILL_REGISTRY,
+            get_command_to_skill_map,
+            list_skills,
+            skills_outside_sandbox,
+        )
+
+        skill = SKILL_REGISTRY["dalton-onboarding"]
+        assert skill.hidden is True
+        assert skill.command is None
+        assert skill.requires == ()
+        assert "dalton-onboarding" not in {s["name"] for s in list_skills()}
+        assert "dalton-onboarding" not in get_command_to_skill_map().values()
+        assert "dalton-onboarding" in skills_outside_sandbox()
+
+        body = load_skill_content("dalton-onboarding")
+        assert body is not None
+        assert ".agents/user/profile/README.md" in body
+        assert ".agents/user/profile/portfolio.json" in body
+        assert ".agents/user/profile/watchlist.json" in body
+        assert ".agents/user/profile/preference.json" in body
+        assert ".agents/user/profile/user.json" in body
+        assert '"onboarding_completed": true' in body
+        assert "get_brokerage_status" not in body
+
+        injected = build_skill_content(
+            [SkillRequest(name="dalton-onboarding", instruction="Start the Dalton onboarding interview")]
+        )
+        assert injected is not None
+        assert injected.loaded_skill_names == ["dalton-onboarding"]
+        assert '<loaded-skill name="dalton-onboarding">' in injected.content
+
+        interview_tsx = (
+            Path(__file__).resolve().parents[3]
+            / "web"
+            / "src"
+            / "pages"
+            / "Onboarding"
+            / "dalton"
+            / "interview.tsx"
+        ).read_text(encoding="utf-8")
+        assert "name: 'dalton-onboarding'" in interview_tsx
+        assert "name: 'onboarding'" not in interview_tsx
+
+    def test_composer_drafts_thread_send_result_chain(self) -> None:
+        repo_root = Path(__file__).resolve().parents[3]
+        chat_view = (repo_root / "web/src/pages/ChatAgent/components/ChatView.tsx").read_text(
+            encoding="utf-8"
+        )
+        use_chat_messages = (
+            repo_root / "web/src/pages/ChatAgent/hooks/useChatMessages.ts"
+        ).read_text(encoding="utf-8")
+        chat_drafts = (repo_root / "web/src/lib/dalton/chatDrafts.ts").read_text(
+            encoding="utf-8"
+        )
+
+        assert "return stableSendMessage(" in chat_view
+        assert "): Promise<boolean> => {" in use_chat_messages
+        assert "(resolved) => pending.finalizeSend(resolved === true)" in chat_drafts
+        assert "pending.finalizeSend(result === true);" in chat_drafts
 
     def test_missing_skill_md_raises_at_load(self, tmp_path: Path) -> None:
         from ptc_agent.agent.middleware.skills.dalton_registry import (

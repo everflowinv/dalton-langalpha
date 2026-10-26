@@ -602,7 +602,7 @@ describe('useChatMessages – a send from a view that missed a turn', () => {
       return { disconnected: false, aborted: false };
     });
 
-    let sent: Promise<void> = Promise.resolve();
+    let sent: Promise<unknown> = Promise.resolve(); // DALTON-HOOK(composer-drafts): handleSendMessage resolves to the send outcome
     act(() => {
       sent = result.current.handleSendMessage('question 4');
     });

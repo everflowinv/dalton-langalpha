@@ -268,6 +268,13 @@ export interface PendingSendHandle {
   finalizeSend: (succeeded: boolean) => void;
 }
 
+interface InFlightSendState {
+  draftKey?: string;
+  userId: string;
+  sentText: string;
+  settled: boolean;
+}
+
 export function settleSendResult(
   pending: PendingSendHandle,
   invoke: () => void | boolean | Promise<void | boolean>,
@@ -279,21 +286,17 @@ export function settleSendResult(
     pending.finalizeSend(false);
     return;
   }
-  if (result === false) {
-    pending.finalizeSend(false);
-    return;
-  }
   if (
     result &&
     typeof (result as Promise<void | boolean>).then === 'function'
   ) {
     (result as Promise<void | boolean>).then(
-      (resolved) => pending.finalizeSend(resolved !== false),
+      (resolved) => pending.finalizeSend(resolved === true),
       () => pending.finalizeSend(false),
     );
     return;
   }
-  pending.finalizeSend(true);
+  pending.finalizeSend(result === true);
 }
 
 export interface UseComposerDraftResult {
@@ -331,6 +334,7 @@ export function useComposerDraft({
   const dirtyRef = useRef<boolean>(false);
   const writtenSinceMountOrSendRef = useRef<boolean>(false);
   const hasSentOnKeyRef = useRef<boolean>(false);
+  const inFlightSendRef = useRef<InFlightSendState | null>(null);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const activeDraftKeyRef = useRef<string | undefined>(draftKey);
   const activeUserIdRef = useRef<string>(userId);
@@ -438,13 +442,18 @@ export function useComposerDraft({
       timerRef.current = null;
     }
     const sentText = latestMessageRef.current;
-    const sendDraftKey = activeDraftKeyRef.current;
-    const sendUserId = activeUserIdRef.current;
+    const inFlight: InFlightSendState = {
+      draftKey: activeDraftKeyRef.current,
+      userId: activeUserIdRef.current,
+      sentText,
+      settled: false,
+    };
+    inFlightSendRef.current = inFlight;
 
     // Ensure the draft is persisted in localStorage while awaiting send completion,
     // and clear the input box programmatically without deleting the stored draft.
-    if (dirtyRef.current && sendDraftKey && sentText.trim()) {
-      save(sendDraftKey, sentText, sendUserId);
+    if (inFlight.draftKey && sentText.trim()) {
+      save(inFlight.draftKey, sentText, inFlight.userId);
     }
     dirtyRef.current = false;
     writtenSinceMountOrSendRef.current = false;
@@ -452,11 +461,15 @@ export function useComposerDraft({
     latestMessageRef.current = '';
     setMessageState('');
 
-    let settled = false;
     return {
       finalizeSend(succeeded: boolean) {
-        if (settled) return;
-        settled = true;
+        if (inFlight.settled) return;
+        inFlight.settled = true;
+        if (inFlightSendRef.current === inFlight) {
+          inFlightSendRef.current = null;
+        }
+        const sendDraftKey = inFlight.draftKey;
+        const sendUserId = inFlight.userId;
         if (succeeded) {
           const isSameKey = activeDraftKeyRef.current === sendDraftKey;
           const hasFollowUp =
@@ -468,6 +481,9 @@ export function useComposerDraft({
           }
           return;
         }
+        if (!sendDraftKey) {
+          return;
+        }
         // Send failed: keep the draft in localStorage and put the original text back.
         if (activeDraftKeyRef.current === sendDraftKey) {
           hasSentOnKeyRef.current = false;
@@ -475,13 +491,21 @@ export function useComposerDraft({
             clearTimeout(timerRef.current);
             timerRef.current = null;
           }
+          const trimmedSent = sentText.trim();
           const currentTyped = latestMessageRef.current.trim();
+          const alreadyRestored =
+            Boolean(trimmedSent) &&
+            (currentTyped === trimmedSent ||
+              currentTyped.startsWith(`${trimmedSent}\n\n`) ||
+              currentTyped.endsWith(`\n\n${trimmedSent}`));
           const restoredText = sentText
-            ? currentTyped
-              ? `${sentText}\n\n${latestMessageRef.current}`
-              : sentText
+            ? alreadyRestored
+              ? latestMessageRef.current
+              : currentTyped
+                ? `${sentText}\n\n${latestMessageRef.current}`
+                : sentText
             : latestMessageRef.current;
-          if (sendDraftKey && restoredText.trim()) {
+          if (restoredText.trim()) {
             save(sendDraftKey, restoredText, sendUserId);
           }
           if (restoredText) {
@@ -490,7 +514,7 @@ export function useComposerDraft({
             writtenSinceMountOrSendRef.current = true;
             setMessageState(restoredText);
           }
-        } else if (sendDraftKey && sentText.trim()) {
+        } else if (sentText.trim()) {
           save(sendDraftKey, sentText, sendUserId);
         }
       },
@@ -531,6 +555,48 @@ export function useComposerDraft({
         isNewWorkspaceDraftKey(prev.draftKey) &&
         isThreadDraftKey(draftKey)
       ) {
+        const inFlight = inFlightSendRef.current;
+        const sendStillInFlight =
+          inFlight !== null &&
+          !inFlight.settled &&
+          inFlight.draftKey === prev.draftKey;
+        if (sendStillInFlight && inFlight) {
+          clearStorageEntry(prev.draftKey, prev.userId);
+          inFlight.draftKey = draftKey;
+          inFlight.userId = userId;
+          const followUpText = writtenSinceMountOrSendRef.current
+            ? latestMessageRef.current
+            : '';
+          hasSentOnKeyRef.current = false;
+          hadPrefillRef.current = Boolean(prefillMessageRef.current);
+          onDraftKeySwitchRef.current?.();
+          if (followUpText && followUpText.trim()) {
+            save(draftKey, followUpText, userId);
+            latestMessageRef.current = followUpText;
+            dirtyRef.current = false;
+            writtenSinceMountOrSendRef.current = true;
+            setMessageState(followUpText);
+          } else {
+            if (inFlight.sentText.trim()) {
+              save(draftKey, inFlight.sentText, userId);
+            }
+            latestMessageRef.current = '';
+            dirtyRef.current = false;
+            writtenSinceMountOrSendRef.current = false;
+            setMessageState('');
+          }
+          return () => {
+            if (timerRef.current !== null) {
+              clearTimeout(timerRef.current);
+              timerRef.current = null;
+            }
+            if (dirtyRef.current && draftKey) {
+              save(draftKey, latestMessageRef.current, userId);
+              dirtyRef.current = false;
+            }
+          };
+        }
+
         const continuationText = writtenSinceMountOrSendRef.current
           ? latestMessageRef.current || load(prev.draftKey, prev.userId)
           : load(prev.draftKey, prev.userId);

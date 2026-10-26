@@ -15,6 +15,7 @@ import {
   load,
   pruneExpired,
   save,
+  settleSendResult,
 } from '../chatDrafts';
 
 const mockGetHomeWorkspace = vi.fn().mockResolvedValue({ workspace_id: 'ws-home' });
@@ -53,7 +54,7 @@ function renderComposer(
   options: { userId?: string; queryClient?: QueryClient } = {},
 ) {
   const queryClient = options.queryClient ?? createQueryClient(options.userId);
-  const onSend = props.onSend ?? vi.fn<ChatInputProps['onSend']>();
+  const onSend = props.onSend ?? vi.fn<ChatInputProps['onSend']>().mockReturnValue(true);
 
   const utils = render(
     <QueryClientProvider client={queryClient}>
@@ -196,7 +197,7 @@ describe('chatDrafts storage module & ChatInput composer drafts', () => {
   });
 
   it('clears the stored draft on successful send, when emptied by user, and does not migrate sent text from ws:<id>:new to thread:<id>', () => {
-    const onSend = vi.fn<ChatInputProps['onSend']>();
+    const onSend = vi.fn<ChatInputProps['onSend']>().mockReturnValue(true);
     const view = renderComposer({ draftKey: 'ws:ws-1:new', onSend }, { userId: 'u-1' });
 
     fireEvent.change(view.getTextarea(), {
@@ -232,7 +233,7 @@ describe('chatDrafts storage module & ChatInput composer drafts', () => {
   });
 
   it('migrates post-send continuation text from ws:<id>:new to thread:<id> and deletes the old key', () => {
-    const onSend = vi.fn<ChatInputProps['onSend']>();
+    const onSend = vi.fn<ChatInputProps['onSend']>().mockReturnValue(true);
     const view = renderComposer({ draftKey: 'ws:ws-1:new', onSend }, { userId: 'u-1' });
 
     // Send initial message to start the new conversation
@@ -312,6 +313,109 @@ describe('chatDrafts storage module & ChatInput composer drafts', () => {
     });
     expect(load('market:main', 'u-1')).toBe('question that rejects on send');
     view3.unmount();
+
+    // 4. onSend returns undefined (missing return in wrapper) -> treated as failure, draft preserved
+    const onSendUndefined = vi.fn<ChatInputProps['onSend']>().mockReturnValue(undefined);
+    const view4 = renderComposer({ draftKey: 'thread:t-undef', onSend: onSendUndefined }, { userId: 'u-1' });
+    fireEvent.change(view4.getTextarea(), {
+      target: { value: 'draft when wrapper omits return', selectionStart: 31 },
+    });
+    fireEvent.click(screen.getByLabelText('Send message'));
+
+    expect(onSendUndefined).toHaveBeenCalledTimes(1);
+    expect(view4.getTextarea().value).toBe('draft when wrapper omits return');
+    expect(load('thread:t-undef', 'u-1')).toBe('draft when wrapper omits return');
+    view4.unmount();
+  });
+
+  it('preserves thread composer draft on budget rejection (402/429) or network failure, and clears it only on successful send', async () => {
+    // Simulate ChatView's handleSendWithAttachments -> stableSendMessage -> handleSendMessage chain
+    let nextOutcome: 'budget_402' | 'rate_429' | 'network_err' | 'ok' = 'budget_402';
+    const simulatedThreadSend = vi.fn(async (): Promise<boolean> => {
+      try {
+        if (nextOutcome === 'budget_402') {
+          throw Object.assign(new Error('Monthly token budget exceeded'), {
+            status: 402,
+            errorInfo: { code: 'budget_exceeded', message: 'Monthly token budget exceeded' },
+          });
+        }
+        if (nextOutcome === 'rate_429') {
+          throw Object.assign(new Error('Rate limit exceeded'), {
+            status: 429,
+            rateLimitInfo: { code: 'rate_limited' },
+          });
+        }
+        if (nextOutcome === 'network_err') {
+          throw new TypeError('Failed to fetch');
+        }
+        return true;
+      } catch {
+        // Mirrors useChatMessages.ts catch branch returning false on 402/429/network failure
+        return false;
+      }
+    });
+
+    const handleSendWithAttachments: ChatInputProps['onSend'] = () => simulatedThreadSend();
+    const view = renderComposer(
+      { draftKey: 'thread:t-budget', onSend: handleSendWithAttachments },
+      { userId: 'u-1' },
+    );
+
+    fireEvent.change(view.getTextarea(), {
+      target: { value: 'deep dive on NVDA Q4 gross margin drivers', selectionStart: 41 },
+    });
+
+    // 1. Budget admission rejection (HTTP 402) -> draft preserved in input and localStorage
+    fireEvent.click(screen.getByLabelText('Send message'));
+    await waitFor(() => {
+      expect(view.getTextarea().value).toBe('deep dive on NVDA Q4 gross margin drivers');
+    });
+    expect(load('thread:t-budget', 'u-1')).toBe('deep dive on NVDA Q4 gross margin drivers');
+
+    // 2. Rate-limit / quota rejection (HTTP 429) -> draft still preserved
+    nextOutcome = 'rate_429';
+    fireEvent.click(screen.getByLabelText('Send message'));
+    await waitFor(() => {
+      expect(view.getTextarea().value).toBe('deep dive on NVDA Q4 gross margin drivers');
+    });
+    expect(load('thread:t-budget', 'u-1')).toBe('deep dive on NVDA Q4 gross margin drivers');
+
+    // 3. Network failure -> draft still preserved
+    nextOutcome = 'network_err';
+    fireEvent.click(screen.getByLabelText('Send message'));
+    await waitFor(() => {
+      expect(view.getTextarea().value).toBe('deep dive on NVDA Q4 gross margin drivers');
+    });
+    expect(load('thread:t-budget', 'u-1')).toBe('deep dive on NVDA Q4 gross margin drivers');
+
+    // 4. Subsequent send succeeds -> input stays cleared and stored draft is removed
+    nextOutcome = 'ok';
+    fireEvent.click(screen.getByLabelText('Send message'));
+    await waitFor(() => {
+      expect(load('thread:t-budget', 'u-1')).toBe('');
+    });
+    expect(view.getTextarea().value).toBe('');
+    view.unmount();
+  });
+
+  it('settleSendResult only treats explicit true (sync or resolved) as success', async () => {
+    const outcomes: boolean[] = [];
+    const makePending = () => ({
+      finalizeSend: (ok: boolean) => outcomes.push(ok),
+    });
+
+    settleSendResult(makePending(), () => true);
+    settleSendResult(makePending(), () => false);
+    settleSendResult(makePending(), () => undefined);
+    settleSendResult(makePending(), () => Promise.resolve(true));
+    settleSendResult(makePending(), () => Promise.resolve(false));
+    settleSendResult(makePending(), () => Promise.resolve(undefined));
+    settleSendResult(makePending(), () => Promise.reject(new Error('boom')));
+
+    await waitFor(() => {
+      expect(outcomes).toHaveLength(7);
+    });
+    expect(outcomes).toEqual([true, false, false, true, false, false, false]);
   });
 
   it('preserves follow-up text typed while awaiting a send that later fails across unmount and remount', async () => {

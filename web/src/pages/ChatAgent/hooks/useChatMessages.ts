@@ -1962,13 +1962,14 @@ export function useChatMessages(
    * a send under the same request key once the view lets the ended turn go,
    * or back to the composer when the user stopped meanwhile.
    */
+  // DALTON-HOOK(composer-drafts): return explicit boolean send outcome so ChatInput preserves drafts on failure
   const handleSendSteering = async (
     message: string,
     additionalContext: Record<string, unknown>[] | null = null,
     attachmentMeta: Record<string, unknown>[] | null = null,
     modelOptions: ModelOptions = {},
     resendKey: string | null = null,
-  ) => {
+  ): Promise<boolean> => {
     const { widgetSnapshots, chartSelections } = modelOptions;
     // The refused-steer queue the steer belongs to, for a refusal to rejoin
     // it only if no thread switch has ended it since.
@@ -2035,12 +2036,14 @@ export function useChatMessages(
           errorInfo: { code: frame.code, message: text },
         });
       }
+      // DALTON-HOOK(composer-drafts): report steering send outcome to composer draft lifecycle
+      return true;
     } catch (err: unknown) {
-      if ((err as Error)?.name === 'AbortError') return;
+      if ((err as Error)?.name === 'AbortError') return true;
       const code = (err as { errorInfo?: { code?: unknown } })?.errorInfo?.code;
       if ((err as { status?: number })?.status === 409 && code === 'not_running') {
         settleNotRunningSteer(userMessage.id as string, gen, message, additionalContext, attachmentMeta, modelOptions, requestKey, seq);
-        return;
+        return true;
       }
       // A steer the user's stop overtook: the stop hands the turn's steers
       // back to the composer, and this one joins them.
@@ -2048,11 +2051,11 @@ export function useChatMessages(
         requestKeyRef.current.settle(requestKey);
         setMessages((prev) => prev.filter((m) => m.id !== userMessage.id));
         giveBackSteering(message);
-        return;
+        return true;
       }
-      if (wasStoppedRef.current) return;
+      if (wasStoppedRef.current) return true;
       console.error('Error sending steering:', err);
-      if (settleDuplicateSteer(err, userMessage.id as string, message, requestKey)) return;
+      if (settleDuplicateSteer(err, userMessage.id as string, message, requestKey)) return true;
       // The server sends a refusal (a 4xx) before it queues a steer. It holds
       // the status line of a steer it takes until the stream's first frame,
       // so a failure in between reads as a 5xx or as no answer, and a
@@ -2060,7 +2063,7 @@ export function useChatMessages(
       // delivery marks the steers it names, so one that marked a refused
       // steer was another with its text.
       const refused = isClientError(err);
-      if (!refused && liveMessages.get().some((m) => m.id === userMessage.id && (m as { steeringDelivered?: boolean }).steeringDelivered)) return;
+      if (!refused && liveMessages.get().some((m) => m.id === userMessage.id && (m as { steeringDelivered?: boolean }).steeringDelivered)) return true;
       // Shown as a refused send's is. A steer has no reply to fail in its
       // place, so one the server gave no words for still says it was not
       // sent. A load clears the banner as it starts, so the refusal is
@@ -2084,6 +2087,8 @@ export function useChatMessages(
         }))
       );
       setMessageError(banner);
+      // DALTON-HOOK(composer-drafts): steering rejected or failed on network — preserve composer draft
+      return false;
     } finally {
       steersInFlightRef.current.delete(seq);
       if (notRunningSendsRef.current.length > 0) setNotRunningTick((n) => n + 1);
@@ -2235,10 +2240,11 @@ export function useChatMessages(
     heldRetriesRef.current.set(bubbleId, { bubbleId, request: retryRequest(null, additionalContext), cut: null });
   };
 
-  const handleSendMessage = async (message: string, additionalContext: Record<string, unknown>[] | null = null, attachmentMeta: Record<string, unknown>[] | null = null, { model, reasoningEffort, fastMode, widgetSnapshots, chartSelections, subagentsAllowed, reasoningEffortOverride, fastModeOverride, hiddenOpener = false, threadTitle }: SendOptions = {}, resendKey: string | null = null) => {
+  // DALTON-HOOK(composer-drafts): return explicit boolean send outcome so ChatInput preserves drafts on failure
+  const handleSendMessage = async (message: string, additionalContext: Record<string, unknown>[] | null = null, attachmentMeta: Record<string, unknown>[] | null = null, { model, reasoningEffort, fastMode, widgetSnapshots, chartSelections, subagentsAllowed, reasoningEffortOverride, fastModeOverride, hiddenOpener = false, threadTitle }: SendOptions = {}, resendKey: string | null = null): Promise<boolean> => {
     const hasContent = message.trim() || (additionalContext && additionalContext.length > 0);
     if (!workspaceId || !hasContent) {
-      return;
+      return false;
     }
 
     // Chat activity bumps the thread to the top of the nav panel's list
@@ -2286,13 +2292,15 @@ export function useChatMessages(
         return appendMessage(base, queuedMessage);
       });
       setQueuedSend(message.trim() || '…');
-      return;
+      // DALTON-HOOK(composer-drafts): queued send during compaction succeeded
+      return true;
     }
 
     // The resend of a refused steer is the queue's own; anything else waits behind it.
     if (resendKey === null && notRunningSendsRef.current.length > 0) {
       queueBehindRefused(message, additionalContext, attachmentMeta, { model, reasoningEffort, fastMode, widgetSnapshots, chartSelections, subagentsAllowed, reasoningEffortOverride, fastModeOverride });
-      return;
+      // DALTON-HOOK(composer-drafts): queued behind refused steer succeeded
+      return true;
     }
 
     // If agent is already streaming, send as steering message
@@ -2406,7 +2414,8 @@ export function useChatMessages(
     });
     // Stopped during the pre-create round-trip: stopWorkflow already finalized
     // the UI — starting the run now would resurrect it.
-    if (created.aborted) return;
+    // DALTON-HOOK(composer-drafts): return explicit boolean send outcome across stream and error branches
+    if (created.aborted) return false;
     const effectiveThreadId = created.threadId;
 
     // One request_key per logical send, reused if this exact send is
@@ -2471,7 +2480,8 @@ export function useChatMessages(
           backgroundReconnectRef.current = false;
           attemptReconnectAfterDisconnect(currentMessageRef.current || assistantMessageId);
         }
-        return;
+        // DALTON-HOOK(composer-drafts): report accepted send outcome to composer draft lifecycle
+        return true;
       }
 
       // Checked before the disconnect: the server drops the connection right
@@ -2479,14 +2489,15 @@ export function useChatMessages(
       // is nothing to reconnect to. A scheduled resend owns finalization.
       if (refs.retryNotice && settleRetry(refs.retryNotice, currentMessageRef.current || assistantMessageId, 0, { model, reasoningEffort, fastMode }, sendRequest(message, additionalContext, subagentsAllowed), null, admission.unstarted())) {
         wasDisconnected = true;
-        return;
+        // DALTON-HOOK(composer-drafts): scheduled retry owns the send
+        return true;
       }
 
       if (result?.disconnected && !refs.retryNotice) {
         console.log('[Send] Stream disconnected, attempting reconnect');
         wasDisconnected = true;
         attemptReconnectAfterDisconnect(assistantMessageId);
-        return;
+        return true;
       }
 
       // Mark message as complete (use live ref in case steering_delivered switched it)
@@ -2497,19 +2508,25 @@ export function useChatMessages(
         );
         // A send the server never started left nothing to replay, so its
         // bubbles have to outlive a reload and take no turn.
-        if (admission.refused() || refs.retryNotice?.recovery === 'resend') admission.unadmit();
-        else markTranscriptPersisted();
+        // DALTON-HOOK(composer-drafts): unstarted refusal preserves draft; accepted turn clears draft
+        if (admission.refused() || refs.retryNotice?.recovery === 'resend') {
+          admission.unadmit();
+          return false;
+        }
+        markTranscriptPersisted();
+        return true;
       }
     } catch (err: unknown) {
           // An aborted stream (user hit stop) is intentional, not a failure.
           // streamFetch normally swallows AbortError and returns { aborted },
           // but guard here too so a stop never surfaces an error banner.
+          // DALTON-HOOK(composer-drafts): user stop / duplicate adoption counts as accepted send
           if ((err as Error)?.name === 'AbortError' || wasStoppedRef.current) {
-            return;
+            return true;
           }
           // A copy steered into another turn needs a turn running, which a
           // hidden opener's new chat has none of.
-          if (userMessage && settleSteeredSend(err, { userId: userMessage.id, assistantId: assistantMessageId, turnIndex, watermarkBefore, requestKey })) return;
+          if (userMessage && settleSteeredSend(err, { userId: userMessage.id, assistantId: assistantMessageId, turnIndex, watermarkBefore, requestKey })) return true;
           // 409 duplicate_request: an earlier copy of this send was already
           // accepted (its response was lost) — adopt that run instead of
           // erroring; the reconnect owns finalization from here.
@@ -2518,7 +2535,7 @@ export function useChatMessages(
             || adoptDuplicateRun(err, assistantMessageId, requestKey)
           ) {
             wasDisconnected = true;
-            return;
+            return true;
           }
           admission.unadmit();
           if ((err as Record<string, unknown>).status !== 429) console.error('Error sending message:', err);
@@ -2539,6 +2556,8 @@ export function useChatMessages(
                 failAssistantMessage(msg, { message: 'Failed to send message. Please try again.' }))
             );
           }
+          // DALTON-HOOK(composer-drafts): budget admission rejection (402/429) or network error preserves draft
+          return false;
         } finally {
           // Skip cleanup on a user stop — stopWorkflow owns the teardown and a
           // second cleanup here would re-toggle loading/subagent state. Also

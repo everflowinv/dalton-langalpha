@@ -27,6 +27,10 @@ _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*(?:\n|$)", re.DOTALL)
 # and a user disable of run-workflow alone cannot strand their RunWorkflow call.
 _RW = "run-workflow"
 
+# Hidden skills are activated programmatically via additional_context and stay
+# out of user-facing slash listings and sandbox skill manifests.
+_HIDDEN_DALTON_SKILLS: frozenset[str] = frozenset({"dalton-onboarding"})
+
 # (skill_name, command, requires)
 _DALTON_SKILL_SPECS: tuple[tuple[str, str | None, tuple[str, ...]], ...] = (
     ("dalton-conventions", None, ("research-conventions",)),
@@ -51,6 +55,7 @@ _DALTON_SKILL_SPECS: tuple[tuple[str, str | None, tuple[str, ...]], ...] = (
     ("dalton-topic-research", "topic-research", ("dalton-conventions", "research-conventions", _RW)),
     ("dalton-call", "dalton-call", ("dalton-conventions", "research-conventions")),
     ("dalton-pm-qa", "pm-qa", ("dalton-conventions", "research-conventions")),
+    ("dalton-onboarding", None, ()),
 )
 
 
@@ -84,6 +89,7 @@ def build_dalton_skill_definitions(
             skill_md_path=f"skills/{name}/SKILL.md",
             command=command,
             requires=requires,
+            hidden=name in _HIDDEN_DALTON_SKILLS,
         )
     return definitions
 

@@ -566,7 +566,8 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
       const additionalContext = contexts.length > 0 ? contexts : null;
       const attachmentMeta = metaItems.length > 0 ? metaItems : null;
 
-      handleSendMessage(outgoingMessage, additionalContext, attachmentMeta, {
+      // DALTON-HOOK(composer-drafts): forward send result so ChatInput preserves the draft when sending fails
+      const sent = handleSendMessage(outgoingMessage, additionalContext, attachmentMeta, {
         ...modelOptions,
         ...(selectionSnapshots.length > 0 ? { chartSelections: selectionSnapshots } : {}),
         subagentsAllowed: subagentsToSend,
@@ -574,6 +575,7 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
       });
       onClearChartImage();
       chartSelectionStore.clearAll();
+      return sent;
     },
     [symbol, interval, chartImage, chartImageDesc, handleSendMessage, onClearChartImage, subagentsToSend, tuningToSend],
   );

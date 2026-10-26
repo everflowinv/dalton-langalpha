@@ -703,7 +703,8 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     }
 
     const additionalContext = contexts.length > 0 ? contexts : null;
-    stableSendMessage(
+    // DALTON-HOOK(composer-drafts): forward send result so ChatInput preserves the draft when sending fails
+    return stableSendMessage(
       picked?.outgoingMessage ?? message,
       additionalContext,
       attachmentMeta,

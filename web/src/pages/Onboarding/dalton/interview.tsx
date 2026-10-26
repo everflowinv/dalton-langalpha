@@ -20,7 +20,7 @@ type Translate = ReturnType<typeof useTranslation>['t'];
 
 /**
  * The turn that opens the interview: what the user is shown as having said,
- * plus the instruction riding the `onboarding` skill. The message is the
+ * plus the instruction riding the `dalton-onboarding` skill. The message is the
  * user's and follows their language; the instruction is the agent's and
  * stays English, as every other skill instruction does.
  */
@@ -33,9 +33,9 @@ export function daltonInterviewKickoff(t: Translate): {
     additionalContext: [
       {
         type: 'skills',
-        name: 'onboarding',
+        name: 'dalton-onboarding',
         instruction:
-          'The user has no brokerage connected. Ask which stocks they own or follow, then continue onboarding.',
+          'Start the Dalton onboarding interview: ask which stocks or assets the user holds or watches and which markets they follow, then collect investment style, risk tolerance, and answer preferences before marking onboarding complete.',
       },
     ],
   };

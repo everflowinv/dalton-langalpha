@@ -536,6 +536,8 @@ function MarketViewInner() {
     }
     setChartImage(null);
     setChartImageDesc(null);
+    // DALTON-HOOK(composer-drafts): signal successful handoff so ChatInput clears the draft
+    return true;
   }, [navigate, toast, t, queryClient, chartImage, chartImageDesc, scope, selectedWorkspaceId, selectedStock, selectedInterval, subagents.toSend, tuning.toSend]);
 
   const handleSidebarSymbolClick = useCallback((symbol: string) => {

@@ -551,9 +551,10 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
       reasoningEffortOverride?: string;
       fastModeOverride?: boolean;
     } = {},
-  ) => {
+    // DALTON-HOOK(composer-drafts): return explicit boolean send outcome so ChatInput only clears draft on success
+  ): Promise<boolean> => {
     if ((!message.trim() && (!attachments || attachments.length === 0)) || isSendingMessage || !workspaceId) {
-      return;
+      return false;
     }
 
     setIsSendingMessage(true);
@@ -596,8 +597,11 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
           ...(fastModeOverride !== undefined ? { fastModeOverride } : {}),
         },
       });
+      // DALTON-HOOK(composer-drafts): signal successful navigation handoff to clear gallery draft
+      return true;
     } catch (error) {
       console.error('Error navigating to thread:', error);
+      return false;
     } finally {
       setIsSendingMessage(false);
     }

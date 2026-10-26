@@ -102,11 +102,11 @@ export function useChatInput({ composing = false }: { composing?: boolean } = {}
     // the dashboard handoff.
     _slashCommands: SlashCommand[] = [],
     { model, reasoningEffort, fastMode, widgetSnapshots, subagentsAllowed, reasoningEffortOverride, fastModeOverride }: SendOptions = {},
-    // DALTON-HOOK(composer-drafts): return false when workspace resolution or handoff fails
-  ): Promise<void | boolean> => {
+    // DALTON-HOOK(composer-drafts): return explicit boolean send outcome so ChatInput preserves draft on failure
+  ): Promise<boolean> => {
     const hasContent = message.trim() || (attachments && attachments.length > 0) || (widgetSnapshots && widgetSnapshots.length > 0);
     if (!hasContent || isLoading) {
-      return;
+      return false;
     }
 
     setIsLoading(true);
@@ -181,6 +181,8 @@ export function useChatInput({ composing = false }: { composing?: boolean } = {}
       if (widgetSnapshots && widgetSnapshots.length > 0) {
         ContextBus.clear();
       }
+      // DALTON-HOOK(composer-drafts): signal successful handoff so ChatInput clears the draft
+      return true;
     } catch (error) {
       console.error('Error with workspace:', error);
       toast({
