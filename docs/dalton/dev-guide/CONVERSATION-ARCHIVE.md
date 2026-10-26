@@ -6,7 +6,7 @@
 
 每日定时任务使用 `src/dalton/dalton.yaml` 下 `conversations` 段的默认配置：
 - `extract_concurrency: 1`（单并发，保持每日任务行为不变）
-- `hourly_token_budget: 500000`（10/26 起；此前 120000）
+- `hourly_token_budget: 5000000`（10/26 起；此前 120000）
 
 运行命令：
 
@@ -26,7 +26,7 @@
 ```
 
 - **建议参数**：`--concurrency 4 --hourly-token-budget 1500000`。
-- **每日任务不受影响**：`dalton.yaml` 中默认仍为 `extract_concurrency: 1` 和 `hourly_token_budget: 500000`，仅在回填命令行显式传入 `--concurrency 4 --hourly-token-budget 1500000` 时提速。
+- **每日任务不受影响**：`dalton.yaml` 中默认仍为 `extract_concurrency: 1` 和 `hourly_token_budget: 5000000`，仅在回填命令行显式传入 `--concurrency 4 --hourly-token-budget 1500000` 时提速。
 - **并发与限流保护**：
   - 使用 `asyncio.Semaphore` 控制并发抽取数；
   - `HourlyTokenBudgetLimiter` 在并发下先按估算 token 预占预算、完成后按实际消耗校正，避免多个协程同时看到剩余预算而超额；
