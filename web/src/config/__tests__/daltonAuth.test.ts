@@ -53,4 +53,15 @@ describe('daltonAuth config', () => {
     expect(isDaltonAuth).toBe(true);
     expect(APP_ENTRY_PATH).toBe('/');
   });
+
+  it('resolves bare username to username@VITE_DALTON_INVITE_EMAIL_DOMAIN and keeps full emails unchanged', async () => {
+    vi.stubEnv('VITE_DALTON_INVITE_EMAIL_DOMAIN', '');
+    const { resolveDaltonLoginEmail } = await loadDaltonAuth();
+    expect(resolveDaltonLoginEmail('alice_01')).toBe('alice_01@team.dalton.local');
+    expect(resolveDaltonLoginEmail('user@example.com')).toBe('user@example.com');
+
+    vi.stubEnv('VITE_DALTON_INVITE_EMAIL_DOMAIN', 'corp.dalton.ai');
+    const { resolveDaltonLoginEmail: resolveCustom } = await loadDaltonAuth();
+    expect(resolveCustom('bob.smith')).toBe('bob.smith@corp.dalton.ai');
+  });
 });

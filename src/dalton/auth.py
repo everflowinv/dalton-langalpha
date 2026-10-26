@@ -20,6 +20,7 @@ import jwt
 from fastapi import HTTPException, WebSocket, WebSocketException, status
 from fastapi.security import HTTPAuthorizationCredentials
 
+from src.dalton.invites import is_team_member
 from src.dalton.settings import (
     get_dalton_allowed_emails,
     get_supabase_publishable_key,
@@ -261,20 +262,19 @@ async def verify_dalton_token(token: str) -> AuthInfo:
 
     raw_email = claims.get("email")
     email = raw_email.strip().lower() if isinstance(raw_email, str) else ""
-    allowed_emails = get_dalton_allowed_emails()
 
-    if not allowed_emails:
-        logger.warning(
-            "Dalton Supabase auth rejected request (allowlist is empty, fail-closed): email=%s",
-            email or "<missing>",
-        )
-        raise HTTPException(status_code=403, detail="Email is not on the Dalton allowlist")
-
-    if not email or email not in allowed_emails:
-        logger.warning(
-            "Dalton Supabase auth rejected email not in allowlist: email=%s",
-            email or "<missing>",
-        )
+    if not email or not await is_team_member(email):
+        allowed_emails = get_dalton_allowed_emails()
+        if not allowed_emails:
+            logger.warning(
+                "Dalton Supabase auth rejected request (allowlist is empty, fail-closed): email=%s",
+                email or "<missing>",
+            )
+        else:
+            logger.warning(
+                "Dalton Supabase auth rejected email not in allowlist: email=%s",
+                email or "<missing>",
+            )
         raise HTTPException(status_code=403, detail="Email is not on the Dalton allowlist")
 
     object.__setattr__(auth_info, "email", email)

@@ -39,6 +39,8 @@ const SetupWizard = lazyWithMotion(() => import('./pages/Setup/SetupWizard'));
 const PrivacyPolicy = React.lazy(() => import('./pages/Legal/PrivacyPolicy'));
 const Legal = React.lazy(() => import('./pages/Legal/Legal'));
 const ResetPassword = React.lazy(() => import('./pages/Login/ResetPassword'));
+// DALTON-HOOK(invite-signup): public invite redemption page (/invite#<token>)
+const InviteRedeemPage = React.lazy(() => import('./lib/dalton/InviteRedeemPage'));
 
 /** How long a callback may sit holding neither a session nor a stated reason
  *  before it is called a failure. What it waits on is the `?code=` exchange the
@@ -374,6 +376,12 @@ function App() {
       <Route path="/reset-password/:shell" element={
         <Suspense fallback={<PageLoading />}>
           <ResetPassword />
+        </Suspense>
+      } />
+      {/* DALTON-HOOK(invite-signup): single-use invite signup route (/invite#<token>) */}
+      <Route path="/invite" element={
+        <Suspense fallback={<PageLoading />}>
+          <InviteRedeemPage />
         </Suspense>
       } />
       {/* Chats share under /s/, files and apps live under /a/. The codes are
