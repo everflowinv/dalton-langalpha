@@ -6,7 +6,7 @@ import { useTranslation, Trans } from 'react-i18next';
 import { BrandMark } from '@/components/brand/BrandMark'; // DALTON-HOOK(brand-name)
 import { BRAND_MARK, BRAND_NAME } from '@/config/brand'; // DALTON-HOOK(brand-name)
 import { useAuth } from '../../contexts/AuthContext';
-import { isDaltonAuth } from '../../config/daltonAuth'; // DALTON-HOOK(dalton-auth): restrict login page to email+password without signup
+import { isDaltonAuth, resolveDaltonLoginEmail } from '../../config/daltonAuth'; // DALTON-HOOK(dalton-auth) DALTON-HOOK(invite-signup): restrict login page and resolve username login
 import { authErrorMessage, type AuthErrorInfo } from '../../lib/authErrors';
 import PasswordInput from './PasswordInput';
 import PasswordStrength from './PasswordStrength';
@@ -166,7 +166,9 @@ function LoginPage() {
 
   const handleLogin = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
-    await runSubmit(() => loginWithEmail(loginEmail, loginPassword), 'Login failed');
+    // DALTON-HOOK(invite-signup): append invite email domain when input has no @ in Dalton mode
+    const emailToSubmit = isDaltonAuth ? resolveDaltonLoginEmail(loginEmail) : loginEmail;
+    await runSubmit(() => loginWithEmail(emailToSubmit, loginPassword), 'Login failed');
   };
 
   const handleSignup = async (e: React.FormEvent<HTMLFormElement>) => {
@@ -316,16 +318,19 @@ function LoginPage() {
             <div>
               <h2 className="login-page__view-title">{t('auth.loginTitle')}</h2>
             </div>
+            {/* DALTON-HOOK(invite-signup): accept email or username in Dalton mode */}
             <div className="login-page__field">
-              <label className="login-page__label">{t('common.email')}</label>
+              <label className="login-page__label">
+                {isDaltonAuth ? t('auth.emailOrUsername') : t('common.email')}
+              </label>
               <Input
-                type="email"
+                type={isDaltonAuth ? 'text' : 'email'}
                 value={loginEmail}
                 onChange={(e) => setLoginEmail(e.target.value)}
-                placeholder={t('auth.enterEmail')}
+                placeholder={isDaltonAuth ? t('auth.enterEmailOrUsername') : t('auth.enterEmail')}
                 className="login-page__input"
                 disabled={isSubmitting}
-                autoComplete="email"
+                autoComplete={isDaltonAuth ? 'username' : 'email'}
                 required
               />
             </div>

@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field
 
 from src.dalton.budget.service import (
@@ -360,6 +360,7 @@ async def get_team_credentials_status_endpoint(
         is_credential_admin,
         is_team_credential_sharing_enabled,
     )
+    from src.dalton.invites import is_invite_pm
     from src.dalton.settings import get_dalton_config
 
     cfg = get_dalton_config()
@@ -372,6 +373,7 @@ async def get_team_credentials_status_endpoint(
         "credential_user_id": credential_user_id(user_id),
         "is_pm": can_disconnect,
         "can_disconnect": can_disconnect,
+        "can_invite": is_invite_pm(user_id),
     }
 
 
@@ -1059,5 +1061,76 @@ async def put_user_earnings_calendar_mirror_endpoint(
         if "1 MB" in msg or "exceeds" in msg:
             raise HTTPException(status_code=413, detail=msg) from exc
         raise HTTPException(status_code=400, detail=msg) from exc
+
+
+class InviteCheckRequest(BaseModel):
+    token: str
+
+
+class InviteRedeemRequest(BaseModel):
+    token: str
+    username: str
+    password: str
+
+
+@router.post("/invites")
+@handle_api_exceptions("create dalton invite", logger)
+async def create_invite_endpoint(
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    from src.dalton.invites import create_invite_for_pm
+
+    return await create_invite_for_pm(user_id)
+
+
+@router.get("/invites")
+@handle_api_exceptions("list dalton invites", logger)
+async def list_invites_endpoint(
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    from src.dalton.invites import list_invites_for_pm
+
+    invites = await list_invites_for_pm(user_id)
+    return {"invites": invites}
+
+
+@router.delete("/invites/{invite_id}")
+@handle_api_exceptions("revoke dalton invite", logger)
+async def revoke_invite_endpoint(
+    invite_id: str,
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    from src.dalton.invites import revoke_invite_for_pm
+
+    return await revoke_invite_for_pm(user_id, invite_id)
+
+
+@router.post("/invites/check")
+@handle_api_exceptions("check dalton invite token", logger)
+async def check_invite_endpoint(
+    body: InviteCheckRequest,
+    request: Request = None,  # type: ignore[assignment]
+) -> dict[str, Any]:
+    from src.dalton.invites import check_invite_token, enforce_invite_rate_limit
+
+    await enforce_invite_rate_limit(request, action="check")
+    return await check_invite_token(body.token)
+
+
+@router.post("/invites/redeem")
+@handle_api_exceptions("redeem dalton invite token", logger)
+async def redeem_invite_endpoint(
+    body: InviteRedeemRequest,
+    request: Request = None,  # type: ignore[assignment]
+) -> dict[str, Any]:
+    from src.dalton.invites import enforce_invite_rate_limit, redeem_invite_token
+
+    await enforce_invite_rate_limit(request, action="redeem")
+    return await redeem_invite_token(
+        token=body.token,
+        username=body.username,
+        password=body.password,
+    )
+
 
 

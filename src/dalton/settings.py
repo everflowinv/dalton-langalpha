@@ -902,3 +902,42 @@ def get_dalton_audit_cache_hmac_key() -> bytes | None:
     return hmac.new(seed.encode("utf-8"), b"dalton-audit-cache-v1", hashlib.sha256).digest()
 
 
+DEFAULT_INVITE_EMAIL_DOMAIN = "team.dalton.local"
+
+
+def get_dalton_invite_email_domain() -> str:
+    """Return ``DALTON_INVITE_EMAIL_DOMAIN`` (lowercase, default ``team.dalton.local``)."""
+    raw = os.getenv("DALTON_INVITE_EMAIL_DOMAIN", "").strip().lower().lstrip("@")
+    return raw or DEFAULT_INVITE_EMAIL_DOMAIN
+
+
+def get_supabase_secret_key() -> str:
+    """Return ``SUPABASE_SECRET_KEY`` for Supabase Admin API calls (never logged)."""
+    return os.getenv("SUPABASE_SECRET_KEY", "").strip()
+
+
+def get_supabase_url() -> str:
+    """Return ``SUPABASE_URL`` without trailing slash."""
+    env_url = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
+    if env_url:
+        return env_url
+    from src.config import settings as app_settings
+
+    return (getattr(app_settings, "SUPABASE_URL", None) or "").strip().rstrip("/")
+
+
+DEFAULT_TRUSTED_PROXIES: tuple[str, ...] = ("127.0.0.1", "::1")
+
+
+def get_dalton_trusted_proxies() -> tuple[str, ...]:
+    """Return configured trusted reverse-proxy IPs/CIDRs from ``DALTON_TRUSTED_PROXIES`` (default ``127.0.0.1,::1``)."""
+    raw = os.getenv("DALTON_TRUSTED_PROXIES")
+    if raw is None or not raw.strip():
+        return DEFAULT_TRUSTED_PROXIES
+    parsed = tuple(item.strip() for item in raw.split(",") if item.strip())
+    return parsed if parsed else DEFAULT_TRUSTED_PROXIES
+
+
+
+
+

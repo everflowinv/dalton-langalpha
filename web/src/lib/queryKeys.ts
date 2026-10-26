@@ -292,6 +292,9 @@ export const queryKeys = {
       from ?? '',
       to ?? '',
     ],
+    // DALTON-HOOK(invite-signup): PM invite list & public invite check query keys
+    invites: () => [...queryKeys.dalton.all, 'invites'],
+    inviteCheck: (token: string) => [...queryKeys.dalton.all, 'invites', 'check', token],
   },
 };
 

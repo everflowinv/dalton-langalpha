@@ -14,8 +14,8 @@ from fastapi import HTTPException
 from psycopg.rows import dict_row
 
 from src.dalton.auth import _verified_token_identity
+from src.dalton.invites import get_team_member_emails, is_team_member
 from src.dalton.settings import (
-    get_dalton_allowed_emails,
     is_dalton_supabase_auth_enabled,
 )
 from src.server.database import conversation as conv_db
@@ -53,14 +53,10 @@ async def require_team_reader(user_id: str | None) -> str:
     if not is_dalton_supabase_auth_enabled():
         return uid
 
-    allowed_emails = get_dalton_allowed_emails()
-    if not allowed_emails:
-        raise HTTPException(status_code=403, detail="Forbidden")
-
     verified = _verified_token_identity.get()
     if verified is not None and verified[0] == uid:
         verified_email = (verified[1] or "").strip().lower()
-        if verified_email in allowed_emails:
+        if await is_team_member(verified_email):
             return uid
         raise HTTPException(status_code=403, detail="Forbidden")
 
@@ -78,7 +74,7 @@ async def require_team_reader(user_id: str | None) -> str:
         raise HTTPException(status_code=403, detail="Forbidden")
 
     email = str(user_row.get("email") or "").strip().lower()
-    if not email or email not in allowed_emails:
+    if not email or not await is_team_member(email):
         raise HTTPException(status_code=403, detail="Forbidden")
 
     return uid
@@ -199,9 +195,7 @@ async def list_team_workspaces(current_user_id: str) -> list[dict[str, Any]]:
         return []
 
     uid = await require_team_reader(current_user_id)
-    allowed_emails = sorted(get_dalton_allowed_emails())
-    if not allowed_emails:
-        return []
+    allowed_emails = sorted(await get_team_member_emails())
 
     async with get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
@@ -224,7 +218,13 @@ async def list_team_workspaces(current_user_id: str) -> list[dict[str, Any]]:
                 WHERE w.user_id <> %s
                   AND w.status <> 'deleted'
                   AND w.status <> 'unbound'
-                  AND LOWER(BTRIM(u.email)) = ANY(%s)
+                  AND (
+                      LOWER(BTRIM(u.email)) = ANY(%s)
+                      OR EXISTS (
+                          SELECT 1 FROM dalton_members dm
+                          WHERE dm.email = LOWER(BTRIM(u.email))
+                      )
+                  )
                 ORDER BY
                     COALESCE(NULLIF(BTRIM(u.name), ''), LOWER(BTRIM(u.email))) ASC,
                     COALESCE(w.last_activity_at, w.updated_at) DESC,
@@ -240,6 +240,8 @@ async def list_team_workspaces(current_user_id: str) -> list[dict[str, Any]]:
             continue
         owner_uid = str(row["user_id"])
         owner_email = str(row.get("owner_email") or "").strip()
+        if not await is_team_member(owner_email):
+            continue
         owner_display = _display_name(row.get("owner_name"), owner_email)
         member = grouped.get(owner_uid)
         if member is None:

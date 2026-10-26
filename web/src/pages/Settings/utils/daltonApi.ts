@@ -607,3 +607,76 @@ export async function runDaltonSystemJobNow(
   );
   return data;
 }
+
+export type DaltonInviteStatus = 'pending' | 'used' | 'expired' | 'revoked';
+
+export interface DaltonInviteItem {
+  invite_id: string;
+  status: DaltonInviteStatus;
+  status_label?: string;
+  created_at: string | null;
+  expires_at: string | null;
+  used_at?: string | null;
+  revoked_at?: string | null;
+  used_by_username?: string | null;
+  username?: string | null;
+}
+
+export interface DaltonInviteCreateResponse extends DaltonInviteItem {
+  token: string;
+  url: string;
+  invite_url?: string;
+}
+
+export interface DaltonInviteListResponse {
+  invites: DaltonInviteItem[];
+}
+
+export interface DaltonInviteCheckResponse {
+  valid: boolean;
+  reason: string | null;
+}
+
+export interface DaltonInviteRedeemResponse {
+  ok: boolean;
+  username: string;
+  email: string;
+}
+
+export async function fetchDaltonInvites(): Promise<DaltonInviteListResponse> {
+  const { data } = await api.get<DaltonInviteListResponse>('/api/v1/dalton/invites');
+  return data;
+}
+
+export async function createDaltonInvite(): Promise<DaltonInviteCreateResponse> {
+  const { data } = await api.post<DaltonInviteCreateResponse>('/api/v1/dalton/invites', {});
+  return data;
+}
+
+export async function revokeDaltonInvite(inviteId: string): Promise<DaltonInviteItem> {
+  const { data } = await api.delete<DaltonInviteItem>(
+    `/api/v1/dalton/invites/${encodeURIComponent(inviteId)}`,
+  );
+  return data;
+}
+
+export async function checkDaltonInviteToken(token: string): Promise<DaltonInviteCheckResponse> {
+  const { data } = await api.post<DaltonInviteCheckResponse>(
+    '/api/v1/dalton/invites/check',
+    { token },
+  );
+  return data;
+}
+
+export async function redeemDaltonInviteToken(payload: {
+  token: string;
+  username: string;
+  password: string;
+}): Promise<DaltonInviteRedeemResponse> {
+  const { data } = await api.post<DaltonInviteRedeemResponse>(
+    '/api/v1/dalton/invites/redeem',
+    payload,
+  );
+  return data;
+}
+

@@ -64,3 +64,23 @@
     1. **MCP 服务器、插件、Vault 密钥与出网授权（egress grants）**：在上游与交易授权级别（`trading_permissions`）、插件复合外键、egress grant 及各工作区 schema/配置版本号强绑定，共享会导致持有人交易权限越权扩散及跨用户目录/工作区状态冲突，因此保持按人隔离。
     2. **用户资料与审计**：用户资料、偏好（`user_preferences`）、工作区、线程、记忆、日预算、`dalton_provider_events` 日志与 `dalton_llm_journal.user_id` 均记实际调用者（共享开启时 `usage.credential_user_id` 记录所借用的持有人 ID）。
 - **断开、清空与关闭权限**：所有白名单成员均可连接模型 OAuth、新增或更新为非空 BYOK API Key（可同时附带该 provider 的 `base_url`）、开启 `byok_enabled=true`；**仅 PM 用户（`DALTON_PM_USER_IDS`）可断开模型 OAuth、删除/置空 API Key（含传 `""` 或借 `base_url` 写空）、单独修改/清空已有密钥的 `base_url`（未同时提供非空新密钥）或将 `byok_enabled` 设为 `false`**，非 PM 成员调用返回 `403`（`"团队共用凭据只能由管理员断开"`），前端通过 React Query（`queryKeys.dalton.credentialsStatus`）按当前登录用户获取权限并对非 PM 成员隐藏断开按钮。
+
+## 6. 邀请注册
+
+管理员（`DALTON_PM_USER_IDS`）可在**设置 → 邀请成员**区块生成一次性邀请链接（`{DALTON_FRONTEND_URL}/invite#{token}`，7 天有效，可随时撤销；token 放在 URL 片段中，永不发送至服务器访问日志，前端加载后立即清除 URL 片段并通过 JSON body 调用接口）。受邀人打开链接设置**用户名 + 密码**后，后端通过 Supabase Admin API 创建账户并写入 `dalton_members` 表，自动完成首次登录。
+
+### 环境变量
+
+| 环境变量 | 默认值 | 说明 |
+|---|---|---|
+| `SUPABASE_SECRET_KEY` | 无（必填以启用邀请） | Supabase 服务端管理员密钥（`service_role` / Secret Key），仅后端持有，用于调用 `POST {SUPABASE_URL}/auth/v1/admin/users` 创建已确认邮箱的账户。缺失时生成邀请与兑换接口返回 `503`（`"邀请注册未配置"`）。 |
+| `DALTON_INVITE_EMAIL_DOMAIN` | `team.dalton.local` | 邀请注册账户合成邮箱域名，受邀人设置的 `username` 映射为 `{username}@{DALTON_INVITE_EMAIL_DOMAIN}`。 |
+| `VITE_DALTON_INVITE_EMAIL_DOMAIN` | `team.dalton.local` | 前端登录页用户名补全域名（须与后端 `DALTON_INVITE_EMAIL_DOMAIN` 一致）。当登录框输入不含 `@` 时，前端自动补全为 `{username}@{VITE_DALTON_INVITE_EMAIL_DOMAIN}` 再调用 Supabase 密码登录。 |
+| `DALTON_TRUSTED_PROXIES` | `127.0.0.1,::1` | 可信反向代理 IP 或 CIDR 列表（逗号分隔，可加入 edge 容器所在 Docker 网段）。公开邀请接口限流默认取直连 `request.client.host`，仅当直连对端属于 `DALTON_TRUSTED_PROXIES` 时才从右往左取 `X-Forwarded-For` 中第一个非可信地址。 |
+
+### Supabase 侧设置要求
+
+- **保持关闭公开注册**：Supabase 控制台必须继续保持 `disable_signup=true`（关闭 Allow new users to sign up）、`mailer_autoconfirm=false`（开启 Confirm email）以及关闭匿名登录（`external.anonymous_users=false`）。
+- 邀请注册通过服务端 `SUPABASE_SECRET_KEY` 调用 Admin API（`email_confirm: true`）创建用户，无需开放公开注册，后端启动与鉴权时的 `/auth/v1/settings` fail-closed 安全检查保持不变。
+- 团队成员判定为 `DALTON_ALLOWED_EMAILS ∪ dalton_members`，原有环境变量白名单中的邮箱无需迁移即可继续使用。
+
