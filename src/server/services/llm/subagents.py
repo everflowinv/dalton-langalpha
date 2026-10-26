@@ -261,7 +261,12 @@ def subagent_roles(
     return roles
 
 
-def demote_clientless(config: Any) -> None:
+def demote_clientless(
+    config: Any,
+    *,
+    role: AgentRole = "analyst",
+    slot: str = "primary",
+) -> None:
     """After the clients are built, a pinned model that got no client is Inherit.
 
     That is a custom model whose last key was removed, or a provider with no
@@ -270,13 +275,18 @@ def demote_clientless(config: Any) -> None:
     ``resolve_clients`` stamped from its pinned model, since the subagent now
     runs the turn's.
     """
+    # DALTON-HOOK(subagent-model-pin): non-primary slots do not build subagent
+    # clients (roles=[]), and a role like chief_of_staff withholds analyst-only
+    # subagents, so only inspect resolved.for_role(role) on the primary slot.
+    if slot != "primary":
+        return
     resolved = config.subagents.resolved
     if resolved is None:
         return
     definitions = dict(resolved.definitions)
     changed = False
-    for name in resolved.enabled:
-        defn = definitions[name]
+    for defn in resolved.for_role(role):
+        name = defn.name
         key = f"subagent:{name}"
         if not defn.model or key in config.subsidiary_llm_clients:
             continue

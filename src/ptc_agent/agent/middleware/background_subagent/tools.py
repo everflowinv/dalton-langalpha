@@ -158,6 +158,18 @@ async def _settled_text(registry, task: BackgroundTask, *, listed: bool) -> str:
     # announcing its error text as finished work is the one thing that must not
     # happen.
     label = _settled_label(task)
+    # DALTON-HOOK(workflow-resume): resumable workflow failures must resume via RunWorkflow, never manual Task re-dispatch.
+    if task.terminal_status == "error" and (
+        "RESUMABLE" in body
+        or (task.subagent_type == "workflow" and "worker_lost" in body)
+    ):
+        body = (
+            f"{body}\n\n"
+            f"When continuing (or when the user asks to continue / '继续'), you MUST "
+            f"re-launch the workflow with RunWorkflow(workflow=<same workflow>, resume='{task.task_id}') "
+            f"to replay completed dispatches from its journal — do NOT manually re-dispatch "
+            f"Task subagents (such as data-prep or dalton-evidence)."
+        )
     if listed:
         return f"### {task.display_id} ({task.subagent_type}) - {label}\n{body}"
     return f"**{task.display_id}** ({task.subagent_type}) {label}:\n\n{body}"
@@ -262,7 +274,20 @@ async def _compose_missing_reply(registry, task_id: str, run: dict | None) -> st
         )
     detail = ""
     if isinstance(failure, dict) and failure.get("error"):
-        detail = f" Error: {str(failure['error'])[:300]}"
+        detail = f" Error: {str(failure['error'])[:450]}"
+    # DALTON-HOOK(workflow-resume): resumable workflow failures must resume via RunWorkflow, never manual Task re-dispatch.
+    if "RESUMABLE" in detail or (
+        isinstance(run, dict)
+        and run.get("subagent_type") == "workflow"
+        and "worker_lost" in detail
+    ):
+        return (
+            f"Task-{task_id} failed and produced no final result.{detail} "
+            f"When continuing (or when the user asks to continue / '继续'), you MUST "
+            f"re-launch the workflow with RunWorkflow(workflow=<same workflow>, resume='{task_id}') "
+            f"to replay completed dispatches from its journal — do NOT manually re-dispatch "
+            f"Task subagents (such as data-prep or dalton-evidence)."
+        )
     return (
         f"Task-{task_id} failed and produced no result.{detail} "
         f"Re-dispatch it if the work is still needed."

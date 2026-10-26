@@ -59,6 +59,14 @@ def _last_message_id(request: ModelRequest) -> str | None:
 
 def _summarize_error(exc: BaseException) -> str:
     text = str(exc) or type(exc).__name__
+    # DALTON-HOOK(fallback-reason-log): scrub credentials before logging or
+    # checkpointing fallback error text.
+    try:
+        from src.server.utils.error_sanitization import sanitize_error_text
+
+        text = sanitize_error_text(text)
+    except Exception:
+        pass
     return text[:_ERROR_SUMMARY_MAX_CHARS]
 
 
@@ -244,14 +252,31 @@ class ModelResilienceMiddleware(AgentMiddleware):
         # checkpointed ``ui`` channel, which replay projects per turn. The
         # turn's records keep no step, so the record names the message the
         # call followed, which replay places the notice after.
+        error_type = type(record.exc).__name__
+        error_summary = _summarize_error(record.exc)
         props = {
             "from_model": record.model,
             "to_model": to_model,
             "from_is_primary": from_is_primary,
-            "error": _summarize_error(record.exc),
+            "error": error_summary,
+            "error_type": error_type,
             "status_code": record.status_code,
             "attempts_on_from": record.attempts,
         }
+        # DALTON-HOOK(fallback-reason-log): emit a server WARNING log with
+        # from_model, to_model, status_code, error_type, and sanitized error
+        # snippet so mid-turn model switches are traceable in logs and durable
+        # model_fallback run/ui records.
+        logger.warning(
+            "[ModelResilience] Switching model on fallback",
+            from_model=record.model,
+            to_model=to_model,
+            from_is_primary=from_is_primary,
+            status_code=record.status_code,
+            error_type=error_type,
+            attempts_on_from=record.attempts,
+            error=error_summary,
+        )
         try:
             from langgraph.graph.ui import push_ui_message
 

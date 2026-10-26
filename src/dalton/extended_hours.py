@@ -129,8 +129,8 @@ def enrich_yfinance_snapshot_extended_hours(
         if price is None or price <= 0:
             return base_snap
 
-        reg_as_of = _epoch_sec_to_ms(base_snap.get("as_of"))
-        reg_trading_date = _regular_date_iso(reg_as_of, sym)
+        reg_as_of = _epoch_sec_to_ms(base_snap.get("regular_as_of") or base_snap.get("as_of"))
+        reg_trading_date = base_snap.get("regular_trading_date") or _regular_date_iso(reg_as_of, sym)
         reg_change = _finite(base_snap.get("regular_trading_change"))
         if reg_change is None:
             reg_change = _finite(base_snap.get("change"))
@@ -555,7 +555,12 @@ def format_quote_change_parts(
     main_price = reg_close if ext_part is not None else fallback_price
     out = []
     if pct is not None:
-        pct_str = f"{'+' if pct >= 0 else ''}{pct:.2f}% {basis}"
+        basis_label = (
+            f"{close_word} {reg_date.strftime('%m-%d')}"
+            if reg_date is not None and snap.get("market_status") == "closed"
+            else basis
+        )
+        pct_str = f"{'+' if pct >= 0 else ''}{pct:.2f}% {basis_label}"
         if anchor_prev is not None:
             pct_str += f" vs prev close {price_fn(anchor_prev, ref)}"
         out.append(pct_str)

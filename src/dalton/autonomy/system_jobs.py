@@ -439,8 +439,10 @@ async def _build_company_job_entry(
         )
         return None
 
-    ticker = str(tracking.get("ticker") or "").upper()
+    ticker = str(tracking.get("ticker") or "").strip().upper()
     raw_status = str(tracking.get("status") or "disabled")
+    if raw_status == "not_applicable" or not ticker:
+        return None
     mapped_status = _TRACKING_STATUS_TO_JOB_STATUS.get(raw_status, "partial")
 
     prefix = f"dalton-{ticker.lower()}-"
@@ -963,7 +965,9 @@ async def run_system_job_now(user_id: str, key: str) -> dict[str, Any]:
     # Company scope: trigger the company's watch automation (`dalton-<t>-watch`) if it exists
     ws_id = await _resolve_company_workspace_id(uid, target)
     tracking = await get_tracking_status(uid, ws_id)
-    ticker = str(tracking["ticker"])
+    ticker = str(tracking.get("ticker") or "").strip().upper()
+    if tracking.get("status") == "not_applicable" or not ticker:
+        raise ValueError(f"Unable to resolve company ticker for workspace '{ws_id}'")
     watch_name = f"dalton-{ticker.lower()}-watch"
     rows = await list_all_user_automations(uid, name_prefix=watch_name)
     row = next(

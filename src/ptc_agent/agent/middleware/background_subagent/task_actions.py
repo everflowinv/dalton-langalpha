@@ -441,12 +441,16 @@ async def _handle_resume(
     # resolving against it instead of the workflow's archived result. Refused
     # before admission for the same reason `never_started` is: the damage is
     # the row, not the spawn.
+    # DALTON-HOOK(workflow-resume): workflow runs resume via RunWorkflow(..., resume=...), not Task(action="resume").
     if task.subagent_type == WORKFLOW_SUBAGENT_TYPE:
         return ToolMessage(
             content=(
                 f"Error: Task-{target_task_id} is a workflow run and cannot be "
-                f'resumed. Use TaskOutput(task_id="{target_task_id}") for its '
-                f"result, or RunWorkflow to start a new run."
+                f"resumed via Task(action='resume'). Use "
+                f'TaskOutput(task_id="{target_task_id}") for its result, or '
+                f'RunWorkflow(workflow=<same workflow>, resume="{target_task_id}", params=...) '
+                f"to resume an interrupted workflow from its journal (do NOT manually "
+                f"re-dispatch individual Task subagents)."
             ),
             tool_call_id=tool_call_id,
             name="Task",

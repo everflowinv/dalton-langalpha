@@ -677,7 +677,8 @@ async def install_sandbox_packages(
     _session, sandbox = await _get_sandbox(workspace_id, x_user_id)
 
     quoted = " ".join(shlex.quote(p) for p in body.packages)
-    cmd = f"uv pip install {quoted}"
+    # DALTON-HOOK(sandbox-pip-system): pass --system to match Dockerfile.sandbox.
+    cmd = f"uv pip install --system {quoted}"
 
     try:
         result = await sandbox.execute_bash_command(cmd, timeout=120)

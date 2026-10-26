@@ -216,4 +216,8 @@ class TestSubagentPreloadedSkills:
     def test_a_custom_prompt_without_preloads_is_kept_as_written(self):
         defn = SubagentDefinition(name="ops", description="d", custom_prompt="You are ops.  ")
 
-        assert _compiler().compile(defn)["system_prompt"] == "You are ops.  "
+        # DALTON-HOOK(subagent-workspace-root): custom_prompt gets the workspace root suffix and no <preloaded_skills>
+        prompt = _compiler().compile(defn)["system_prompt"]
+        assert prompt.startswith("You are ops.")
+        assert "<preloaded_skills>" not in prompt
+        assert "Workspace root directory (absolute): `/home/workspace`" in prompt

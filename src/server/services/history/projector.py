@@ -537,6 +537,7 @@ MODEL_FALLBACK_FIELDS = (
     "from_model",
     "to_model",
     "from_is_primary",
+    "error_type",  # DALTON-HOOK(fallback-reason-log)
     "status_code",
     "attempts_on_from",
 )

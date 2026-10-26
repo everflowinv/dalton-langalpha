@@ -85,3 +85,7 @@ Dalton 继承 `.agents/skills/research-conventions/SKILL.md` 的通用投研纪�
 
 1. **推送稿落盘（路径由各 skill 给定，不要自己拼自动化名）**：把最后一条回复要发送的正文写入该 skill 收尾步骤指定的固定路径（`dalton-earnings-preview` 写 `research/push/{as_of}-earnings-preview-{quarter}.md`，`dalton-earnings-flash` 写 `research/push/{as_of}-earnings-flash-{quarter}.md`，`dalton-earnings-deep` 写 `research/push/{release_date}-earnings-deep-{quarter}.md`，`dalton-stock-move` 写 `research/push/{as_of}-stock-move.md`〔同日多次触发时直接重写该文件并重新审两轮〕，`dalton-weekly-review` 写 Home 下的 `research/push/{end}-director-weekly.md`，`dalton-earnings-calendar` 写 Home 下的 `research/push/{as_of}-earnings-calendar.md`）。内容按通知卡片支持的 `## 结论`、`## 要点`、`## 下一步验证`、`## 来源` 四节组织，**`## 结论` 段必须放在最前**（卡片空间受限时只取首段）。`price_move`（`dalton-stock-move`）只看最终五词 verdict：verdict 为 `NO_CHANGE` 时不推送，也不写推送稿、不跑语言审查。
 2. **两轮语言审查后原样回复**：对本轮写入的推送稿依次调用 `check_language(draft_path=..., round=1)`、按 `.language.md` 清单修改、再调用 `check_language(draft_path=..., round=2)`（若第 2 轮后仍有改动，再跑一次 `round=2` 使记录绑定终稿哈希）；**最后一条回复的正文必须与定稿后的推送稿文件内容逐字相同**。`dalton_check_done` 会检查推送稿是本轮写的、且审完两轮语言审查。
+
+## 9. Workflow 断点续跑硬性约定
+
+- **可续跑的 workflow 失败后，"继续"必须走 `RunWorkflow(..., resume=...)`**：当 `RunWorkflow` 因 `worker_lost`、子任务超时或中途审稿 `block` 等原因中断且标记为 `RESUMABLE`（或工作区 `.progress.json` 中存在未完成的 `run_id`）后，用户要求"继续"/"继续跑"/重试时，**必须**调用 `RunWorkflow(workflow=<同名>, params=<原参数>, resume=<失败的 task_id>)` 从日志断点续跑（自动复用已完成且哈希匹配的支线派发，并履行 `dalton_check_done` 完成契约），**严禁改为手工重派 `Task` 子代理（如 `data-prep`、`dalton-evidence`、`dalton-reviewer`）绕过日志重放与完成契约**。

@@ -719,7 +719,8 @@ async def get_workspace_tracking_endpoint(
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {**res, "can_edit": can_edit}
+    is_not_applicable = res.get("status") == "not_applicable"
+    return {**res, "can_edit": False if is_not_applicable else can_edit}
 
 
 @router.post("/tracking/{workspace_id}")

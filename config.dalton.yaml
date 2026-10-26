@@ -22,3 +22,13 @@ market_data:
       markets: [all]         # Free fallback — no API key, ahead of FMP
     - name: fmp
       markets: [all]         # FMP — global coverage, catch-all fallback
+
+# Ordered news provider chain — yfinance ahead of FMP so user-initiated news
+# queries prefer free sources before consuming FMP's daily quota (background
+# polling in NewsRefreshService excludes FMP altogether).
+news_data:
+  providers:
+    - name: ginlix-data
+    - name: yfinance
+    - name: fmp
+

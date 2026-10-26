@@ -507,6 +507,9 @@ def create_run_workflow_tool(
         # reaches here; the claimant identity lets a cross-worker replay of
         # the same call recognise its own claim.
         launch_tool_call_id = tool_call_id or f"wfrun-{uuid.uuid4().hex[:12]}"
+        progress_path = None
+        if isinstance(params, dict) and isinstance(params.get("progress_path"), str):
+            progress_path = params["progress_path"] or None
         journal_source = None
         if resume is not None:
             if not isinstance(resume, str) or not resume.strip():
@@ -531,10 +534,7 @@ def create_run_workflow_tool(
             from src.dalton.workflows.as_of import resolve_launch_as_of
 
             params = await resolve_launch_as_of(backend, meta.name, params, journal_source)
-        # DALTON-HOOK(workflow-resume): the progress marker the driver keeps
-        # current; the launching skill passes it in params so the runtime
-        # stays workflow-agnostic about where Dalton keeps its research dirs.
-        progress_path = None
+        # DALTON-HOOK(workflow-resume): refresh progress_path after params normalization.
         if isinstance(params, dict) and isinstance(params.get("progress_path"), str):
             progress_path = params["progress_path"] or None
 

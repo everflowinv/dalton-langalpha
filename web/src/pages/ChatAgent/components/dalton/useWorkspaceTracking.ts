@@ -15,7 +15,11 @@ export function useWorkspaceTracking(
     queryKey: queryKeys.dalton.tracking(id),
     queryFn: () => fetchWorkspaceTracking(id),
     enabled: Boolean(id) && enabled,
-    staleTime: 30_000,
+    staleTime: (query) =>
+      query.state.data?.status === 'not_applicable' ? Infinity : 30_000,
+    refetchOnWindowFocus: (query) =>
+      query.state.data?.status !== 'not_applicable',
+    refetchInterval: false,
     retry: false,
   });
 }
