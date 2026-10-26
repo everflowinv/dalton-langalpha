@@ -82,12 +82,20 @@ another endpoint while keeping its provider key. Config can only turn a channel
   worse than a 400). An id the host's rule cannot place fails closed onto the
   user-message fallback.
 
-The Anthropic wire form also carries placement rules the caller must honor: a
-mid-conversation system message has to follow a user message (or an assistant
-message ending in server-tool use) and must be either the last entry in
-``messages`` or be followed by an assistant turn. It cannot be ``messages[0]``,
-which is why an operator-tagged message at index 0 is left to the ordinary
-hoist.
+DALTON-HOOK(upstream-backport-596): this paragraph and the bridge's placement
+check are upstream 86ce2f02c, backported ahead of the next upstream sync.
+
+The Anthropic wire form also carries placement rules: a mid-conversation system
+message has to follow a user message (or an assistant message ending in
+server-tool use) and must be either the last entry in ``messages`` or be
+followed by an assistant turn. It cannot be ``messages[0]``, which is why an
+operator-tagged message at index 0 is left to the ordinary hoist. Everywhere
+else the bridge checks the rule on the formatted request, because only there is
+it known what reaches the wire: a turn stopped before the model answered leaves
+no assistant turn after its entry, and an assistant message with nothing left to
+send is dropped by the formatter. An entry the rule refuses goes out as a
+``<system-reminder>`` block in a user turn, the shape every model without the
+channel already reads.
 """
 
 from __future__ import annotations
@@ -447,8 +455,10 @@ def _splice_operator_entries(original: Callable[..., Any], messages: Any) -> Any
     if not cuts:
         return original(msgs)
 
+    # DALTON-HOOK(upstream-backport-596): upstream 86ce2f02c, placement rule for mid-turn system entries.
     system: Any = None
     formatted: list[dict[str, Any]] = []
+    spliced: list[int] = []
     start = 0
     for cut in [*cuts, len(msgs)]:
         run_system, run_formatted = original(msgs[start:cut])
@@ -461,9 +471,38 @@ def _splice_operator_entries(original: Callable[..., Any], messages: Any) -> Any
         if cut < len(msgs):
             entry = operator_system_entry(msgs[cut])
             if entry is not None:
+                spliced.append(len(formatted))
                 formatted.append(entry)
         start = cut + 1
+    # In order, so an entry moved into a user turn counts as the user turn
+    # in front of the next one.
+    for index in spliced:
+        if not _placeable(formatted, index):
+            formatted[index] = _as_reminder_turn(formatted[index])
     return system, formatted
+
+
+# DALTON-HOOK(upstream-backport-596): upstream 86ce2f02c.
+def _placeable(formatted: list[dict[str, Any]], index: int) -> bool:
+    """Whether Anthropic accepts the system entry at *index* where it stands."""
+    after_user = index > 0 and formatted[index - 1].get("role") == "user"
+    is_last = index == len(formatted) - 1
+    return after_user and (is_last or formatted[index + 1].get("role") == "assistant")
+
+
+def _as_reminder_turn(entry: dict[str, Any]) -> dict[str, Any]:
+    """*entry* as a user turn, each text block in ``<system-reminder>`` tags.
+
+    The API combines it with an adjacent user turn, so it reads as the
+    reminder block the carrier writes for a model without the channel.
+    """
+    return {
+        "role": "user",
+        "content": [
+            {**block, "text": f"<system-reminder>\n{block['text']}\n</system-reminder>"}
+            for block in entry["content"]
+        ],
+    }
 
 
 _bridge_installed = False

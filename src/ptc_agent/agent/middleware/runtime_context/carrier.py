@@ -9,11 +9,14 @@ per model:
   Consecutive parts (several rows, or rows followed by the envelope) are
   coalesced into one message with a text block each, because two adjacent
   operator entries have not been proven on the Anthropic wire form.
+DALTON-HOOK(upstream-backport-596): upstream 86ce2f02c wording below.
+
 - ``reminder``: a ``<system-reminder>`` block appended inside the message it
   belongs to, which is the shape Claude Code uses: one message, the user's own
-  text first, the harness blocks after it. The wrapper is added here and only
-  here; both writers hand over bare text, and an operator role carries the
-  same meaning without it.
+  text first, the harness blocks after it. The wrapper is added here, and
+  otherwise only by the Anthropic bridge to a system entry the wire cannot
+  place there (``src/llms/operator_channel.py``); both writers hand over bare
+  text, and an operator role carries the same meaning without it.
 
 A tool result is never merged into. Harness text inside a tool result would sit
 under the provenance label that says "untrusted", so after a tool batch the

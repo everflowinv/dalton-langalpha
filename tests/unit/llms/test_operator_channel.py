@@ -577,6 +577,44 @@ def test_multiple_carriers_each_get_their_own_entry():
     assert payload["messages"][4]["content"] == [{"type": "text", "text": "second envelope"}]
 
 
+# DALTON-HOOK(upstream-backport-596): upstream 86ce2f02c, placement rule for mid-turn system entries.
+
+
+def test_a_carrier_no_assistant_turn_follows_rides_as_a_reminder():
+    """Anthropic refuses a system entry with a user turn after it, which is
+    where a turn stopped before the model answered leaves its carrier."""
+    payload = _payload(
+        [
+            SystemMessage("base prompt"),
+            HumanMessage("first question"),
+            build_operator_message("stopped turn", "system"),
+            HumanMessage("second question"),
+            build_operator_message("this turn", "system"),
+        ]
+    )
+    assert [m["role"] for m in payload["messages"]] == ["user", "user", "user", "system"]
+    assert payload["messages"][1]["content"] == [
+        {"type": "text", "text": "<system-reminder>\nstopped turn\n</system-reminder>"}
+    ]
+    assert payload["messages"][3]["content"] == [{"type": "text", "text": "this turn"}]
+
+
+def test_an_assistant_turn_the_formatter_drops_does_not_count():
+    """An assistant message with nothing to send never reaches the wire, so it
+    is not the turn a system entry stands before."""
+    payload = _payload(
+        [
+            SystemMessage("base prompt"),
+            HumanMessage("first question"),
+            build_operator_message("row", "system"),
+            AIMessage(""),
+            HumanMessage("second question"),
+            build_operator_message("envelope", "system"),
+        ]
+    )
+    assert [m["role"] for m in payload["messages"]] == ["user", "user", "user", "system"]
+
+
 def test_bridge_is_installed_once_and_idle_outside_the_window():
     """The wrapped hoist is the one module global; outside the window it is
     the stock function's answer, so every other Anthropic call is untouched."""
