@@ -744,6 +744,8 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
               ) : (
                 <ChatInput
                   ref={chatInputRef}
+                  // DALTON-HOOK(composer-drafts): persist draft per workspace gallery or home gallery
+                  draftKey={isHome ? 'home:gallery' : (workspaceId ? `ws:${workspaceId}:gallery` : undefined)}
                   onSend={handleSendMessage as any} // TODO: type properly — ChatInput expects strict ReadyAttachment[]
                   disabled={isSendingMessage || !workspaceId}
                   files={ownFiles}

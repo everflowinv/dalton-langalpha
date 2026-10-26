@@ -38,10 +38,15 @@ function ChatInputCard() {
     [t],
   );
 
+  // DALTON-HOOK(composer-drafts): return handleSend result so ChatInput preserves draft on failure
   const handleMobileSend = (...args: Parameters<typeof handleSend>) => {
-    handleSend(...args);
+    const result = handleSend(...args);
     setChatExpanded(false);
+    return result;
   };
+
+  // DALTON-HOOK(composer-drafts): persist dashboard composer draft per selected workspace or fallback key
+  const draftKey = selectedWorkspaceId ? `ws:${selectedWorkspaceId}:new` : 'dashboard:new';
 
   if (isMobile) {
     return (
@@ -55,6 +60,8 @@ function ChatInputCard() {
         <div className="dashboard-floating-chat">
           <ChatInput
             ref={chatInputRef}
+            // DALTON-HOOK(composer-drafts): persist dashboard mobile composer draft
+            draftKey={draftKey}
             onSend={handleMobileSend}
             disabled={isLoading}
             scope={scope}
@@ -107,6 +114,8 @@ function ChatInputCard() {
         >
           <ChatInput
             ref={chatInputRef}
+            // DALTON-HOOK(composer-drafts): persist dashboard desktop composer draft
+            draftKey={draftKey}
             onSend={handleSend}
             disabled={isLoading}
             scope={scope}

@@ -100,7 +100,8 @@ export function useChatInput({ composing = false }: { composing?: boolean } = {}
     // the dashboard handoff.
     _slashCommands: SlashCommand[] = [],
     { model, reasoningEffort, widgetSnapshots, subagentsAllowed }: SendOptions = {},
-  ): Promise<void> => {
+    // DALTON-HOOK(composer-drafts): return false when workspace resolution or handoff fails
+  ): Promise<void | boolean> => {
     const hasContent = message.trim() || (attachments && attachments.length > 0) || (widgetSnapshots && widgetSnapshots.length > 0);
     if (!hasContent || isLoading) {
       return;
@@ -152,7 +153,8 @@ export function useChatInput({ composing = false }: { composing?: boolean } = {}
       const workspaceId = await resolveChatWorkspace(queryClient, scope, selectedWorkspaceId);
       if (!workspaceId) {
         toast({ variant: 'destructive', title: t('agents.workspaceRequired') });
-        return;
+        // DALTON-HOOK(composer-drafts): signal failed send so ChatInput restores the draft
+        return false;
       }
       navigate(`/chat/t/__default__`, {
         state: {
@@ -179,6 +181,8 @@ export function useChatInput({ composing = false }: { composing?: boolean } = {}
         title: 'Error',
         description: 'Failed to access workspace. Please try again.',
       });
+      // DALTON-HOOK(composer-drafts): signal failed send so ChatInput restores the draft
+      return false;
     } finally {
       setIsLoading(false);
     }

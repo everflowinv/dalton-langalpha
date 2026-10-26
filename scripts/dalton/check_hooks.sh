@@ -104,6 +104,7 @@ ALLOWED_HOOKS=(
   "subagent-workspace-root"
   "upstream-backport-596"
   "workspace-sharing-settings"
+  "composer-drafts"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)
