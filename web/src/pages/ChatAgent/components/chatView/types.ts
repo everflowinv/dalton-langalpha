@@ -172,6 +172,11 @@ export interface ModelOptions {
    *  creates the thread (`useThreadTuning`). */
   reasoningEffortOverride?: string;
   fastModeOverride?: boolean;
+  /**
+   * DALTON-HOOK(composer-drafts): the composer's acceptance callback, passed
+   * through into the send options — see SendOptions.onAccepted.
+   */
+  onAccepted?: () => void;
 }
 
 export interface ActionCommand {

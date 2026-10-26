@@ -1969,7 +1969,14 @@ export function useChatMessages(
     attachmentMeta: Record<string, unknown>[] | null = null,
     modelOptions: ModelOptions = {},
     resendKey: string | null = null,
+    onAccepted?: () => void,
   ): Promise<boolean> => {
+    let acceptedFired = false;
+    const notifyAccepted = () => {
+      if (acceptedFired) return;
+      acceptedFired = true;
+      onAccepted?.();
+    };
     const { widgetSnapshots, chartSelections } = modelOptions;
     // The refused-steer queue the steer belongs to, for a refusal to rejoin
     // it only if no thread switch has ended it since.
@@ -2006,7 +2013,9 @@ export function useChatMessages(
             // is the natural boundary in the Redis stream; fall back to the
             // local counter for tests/legacy flows without `_eventId`.
             steeringAtOrderRef.current = computeSteeringBoundary(event, contentOrderCounterRef.current);
-            // Update the user message to reflect steering status
+            // DALTON-HOOK(composer-drafts): the server took the steer — accepted
+            notifyAccepted();
+            // Update user message to reflect steering status
             setMessages((prev) =>
               updateMessage(prev,userMessage.id as string, (msg) => ({
                 ...msg,
@@ -2043,6 +2052,8 @@ export function useChatMessages(
       const code = (err as { errorInfo?: { code?: unknown } })?.errorInfo?.code;
       if ((err as { status?: number })?.status === 409 && code === 'not_running') {
         settleNotRunningSteer(userMessage.id as string, gen, message, additionalContext, attachmentMeta, modelOptions, requestKey, seq);
+        // DALTON-HOOK(composer-drafts): the steer joined the refused queue — a queued position counts as accepted
+        notifyAccepted();
         return true;
       }
       // A steer the user's stop overtook: the stop hands the turn's steers
@@ -2055,7 +2066,11 @@ export function useChatMessages(
       }
       if (wasStoppedRef.current) return true;
       console.error('Error sending steering:', err);
-      if (settleDuplicateSteer(err, userMessage.id as string, message, requestKey)) return true;
+      if (settleDuplicateSteer(err, userMessage.id as string, message, requestKey)) {
+        // DALTON-HOOK(composer-drafts): the duplicate steer was already accepted server-side
+        notifyAccepted();
+        return true;
+      }
       // The server sends a refusal (a 4xx) before it queues a steer. It holds
       // the status line of a steer it takes until the stream's first frame,
       // so a failure in between reads as a 5xx or as no answer, and a
@@ -2063,7 +2078,11 @@ export function useChatMessages(
       // delivery marks the steers it names, so one that marked a refused
       // steer was another with its text.
       const refused = isClientError(err);
-      if (!refused && liveMessages.get().some((m) => m.id === userMessage.id && (m as { steeringDelivered?: boolean }).steeringDelivered)) return true;
+      if (!refused && liveMessages.get().some((m) => m.id === userMessage.id && (m as { steeringDelivered?: boolean }).steeringDelivered)) {
+        // DALTON-HOOK(composer-drafts): the run delivered this steer after all — accepted
+        notifyAccepted();
+        return true;
+      }
       // Shown as a refused send's is. A steer has no reply to fail in its
       // place, so one the server gave no words for still says it was not
       // sent. A load clears the banner as it starts, so the refusal is
@@ -2241,11 +2260,22 @@ export function useChatMessages(
   };
 
   // DALTON-HOOK(composer-drafts): return explicit boolean send outcome so ChatInput preserves drafts on failure
-  const handleSendMessage = async (message: string, additionalContext: Record<string, unknown>[] | null = null, attachmentMeta: Record<string, unknown>[] | null = null, { model, reasoningEffort, fastMode, widgetSnapshots, chartSelections, subagentsAllowed, reasoningEffortOverride, fastModeOverride, hiddenOpener = false, threadTitle }: SendOptions = {}, resendKey: string | null = null): Promise<boolean> => {
+  const handleSendMessage = async (message: string, additionalContext: Record<string, unknown>[] | null = null, attachmentMeta: Record<string, unknown>[] | null = null, { model, reasoningEffort, fastMode, widgetSnapshots, chartSelections, subagentsAllowed, reasoningEffortOverride, fastModeOverride, hiddenOpener = false, threadTitle, onAccepted }: SendOptions = {}, resendKey: string | null = null): Promise<boolean> => {
     const hasContent = message.trim() || (additionalContext && additionalContext.length > 0);
     if (!workspaceId || !hasContent) {
       return false;
     }
+
+    // DALTON-HOOK(composer-drafts): acceptance fires once, at the first sign
+    // the server took this send — the composer clears its stored draft there,
+    // while the return value below stays the fallback for sends that never
+    // report either way.
+    let acceptedFired = false;
+    const notifyAccepted = () => {
+      if (acceptedFired) return;
+      acceptedFired = true;
+      onAccepted?.();
+    };
 
     // Chat activity bumps the thread to the top of the nav panel's list
     // (clicking around never reorders; new threads surface via the new-id rule).
@@ -2292,20 +2322,22 @@ export function useChatMessages(
         return appendMessage(base, queuedMessage);
       });
       setQueuedSend(message.trim() || '…');
-      // DALTON-HOOK(composer-drafts): queued send during compaction succeeded
+      // DALTON-HOOK(composer-drafts): a queued position counts as accepted; the draft settles sent
+      notifyAccepted();
       return true;
     }
 
     // The resend of a refused steer is the queue's own; anything else waits behind it.
     if (resendKey === null && notRunningSendsRef.current.length > 0) {
       queueBehindRefused(message, additionalContext, attachmentMeta, { model, reasoningEffort, fastMode, widgetSnapshots, chartSelections, subagentsAllowed, reasoningEffortOverride, fastModeOverride });
-      // DALTON-HOOK(composer-drafts): queued behind refused steer succeeded
+      // DALTON-HOOK(composer-drafts): a queued position counts as accepted; the draft settles sent
+      notifyAccepted();
       return true;
     }
 
     // If agent is already streaming, send as steering message
     if (isLoading) {
-      return handleSendSteering(message, additionalContext, attachmentMeta, { model, reasoningEffort, fastMode, widgetSnapshots, chartSelections, subagentsAllowed, reasoningEffortOverride, fastModeOverride }, resendKey);
+      return handleSendSteering(message, additionalContext, attachmentMeta, { model, reasoningEffort, fastMode, widgetSnapshots, chartSelections, subagentsAllowed, reasoningEffortOverride, fastModeOverride }, resendKey, notifyAccepted);
     }
 
     // Store model options so HITL resume can forward them
@@ -2415,7 +2447,14 @@ export function useChatMessages(
     // Stopped during the pre-create round-trip: stopWorkflow already finalized
     // the UI — starting the run now would resurrect it.
     // DALTON-HOOK(composer-drafts): return explicit boolean send outcome across stream and error branches
-    if (created.aborted) return false;
+    if (created.aborted) {
+      // The user's stop, not a refusal: their message is already in the
+      // transcript, so the draft settles sent — restoring the text would show
+      // it in the input and the record at once. The boolean stays false for
+      // callers that read it as "a turn ran".
+      notifyAccepted();
+      return false;
+    }
     const effectiveThreadId = created.threadId;
 
     // One request_key per logical send, reused if this exact send is
@@ -2462,6 +2501,8 @@ export function useChatMessages(
         onRunIdResolved: (runId, resolvedThreadId) => {
           requestKeyRef.current.settle(requestKey);
           currentRunIdRef.current = runId;
+          // DALTON-HOOK(composer-drafts): the run exists server-side — the send is accepted, the draft may settle sent before the stream ends
+          notifyAccepted();
           if (resolvedThreadId && resolvedThreadId !== '__default__') {
             threadIdRef.current = resolvedThreadId;
           }
@@ -2489,7 +2530,8 @@ export function useChatMessages(
       // is nothing to reconnect to. A scheduled resend owns finalization.
       if (refs.retryNotice && settleRetry(refs.retryNotice, currentMessageRef.current || assistantMessageId, 0, { model, reasoningEffort, fastMode }, sendRequest(message, additionalContext, subagentsAllowed), null, admission.unstarted())) {
         wasDisconnected = true;
-        // DALTON-HOOK(composer-drafts): scheduled retry owns the send
+        // DALTON-HOOK(composer-drafts): scheduled retry owns the send — the server took it, the draft settles sent
+        notifyAccepted();
         return true;
       }
 
@@ -2497,6 +2539,8 @@ export function useChatMessages(
         console.log('[Send] Stream disconnected, attempting reconnect');
         wasDisconnected = true;
         attemptReconnectAfterDisconnect(assistantMessageId);
+        // DALTON-HOOK(composer-drafts): the started stream's reconnect owns finalization — accepted already
+        notifyAccepted();
         return true;
       }
 
@@ -2526,7 +2570,11 @@ export function useChatMessages(
           }
           // A copy steered into another turn needs a turn running, which a
           // hidden opener's new chat has none of.
-          if (userMessage && settleSteeredSend(err, { userId: userMessage.id, assistantId: assistantMessageId, turnIndex, watermarkBefore, requestKey })) return true;
+          if (userMessage && settleSteeredSend(err, { userId: userMessage.id, assistantId: assistantMessageId, turnIndex, watermarkBefore, requestKey })) {
+            // DALTON-HOOK(composer-drafts): the steer merged into the running turn — accepted
+            notifyAccepted();
+            return true;
+          }
           // 409 duplicate_request: an earlier copy of this send was already
           // accepted (its response was lost) — adopt that run instead of
           // erroring; the reconnect owns finalization from here.
@@ -2535,6 +2583,8 @@ export function useChatMessages(
             || adoptDuplicateRun(err, assistantMessageId, requestKey)
           ) {
             wasDisconnected = true;
+            // DALTON-HOOK(composer-drafts): the adopted duplicate was already accepted server-side
+            notifyAccepted();
             return true;
           }
           admission.unadmit();

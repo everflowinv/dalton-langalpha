@@ -67,6 +67,15 @@ export interface ModelOptions {
    * see `widgetSnapshotsToContexts` in `pages/ChatAgent/utils/fileUpload.ts`.
    */
   widgetSnapshots?: WidgetContextSnapshot[];
+  /**
+   * DALTON-HOOK(composer-drafts): pass-through for the composer's draft
+   * lifecycle — the send path calls it once the server has taken the send
+   * (run started, steer accepted, queued, duplicate adopted), before the
+   * stream ends, so the stored draft settles sent without waiting for the
+   * stream. Send implementations that cannot report acceptance leave it
+   * uncalled and their return value settles the draft instead.
+   */
+  onAccepted?: () => void;
 }
 
 export interface ReadyAttachment {

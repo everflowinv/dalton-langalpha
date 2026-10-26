@@ -170,6 +170,16 @@ interface SendOptions extends ModelOptions {
   /** The title of the thread this send creates, in place of one generated
    *  from its message. A send on a live thread leaves the title alone. */
   threadTitle?: string;
+  /**
+   * DALTON-HOOK(composer-drafts): called once, as early as the server has
+   * taken this send — the first metadata carrying a run_id, a steer accepted
+   * or merged into the running turn, a queued position, an adopted duplicate,
+   * a reconnect to the already-started stream, or an auto-retry scheduled.
+   * The composer's draft settles as sent here, so a reload mid-stream never
+   * restores an already-sent message into the input. The send's returned
+   * boolean stays the fallback for a send that never reports either way.
+   */
+  onAccepted?: () => void;
 }
 
 /** Offload batch ref state. */

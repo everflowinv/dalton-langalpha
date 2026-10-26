@@ -18,7 +18,7 @@ First-conversation interview for a new Dalton user. You are running in **Home** 
 Before asking questions, read `.agents/user/profile/README.md` for the authoritative schema and vocabulary slugs, and check `.agents/user/profile/user.json`, `.agents/user/profile/portfolio.json`, `.agents/user/profile/watchlist.json`, and `.agents/user/profile/preference.json` to see if anything is already populated.
 
 - Do **not** set `onboarding_completed: true` yet.
-- Do **not** write `.agents/user/profile/preference.json` until **Step 5 (Finish)** — committing `risk_preference.risk_level` in `preference.json` automatically marks onboarding complete on the server.
+- **Write no profile file until Step 5.** Every committed save to any of the four profile files runs the server's fallback completion check (`profile_files.py` → `maybe_complete_onboarding`), and a user who already has risk-related free text or watchlist items would be marked complete the moment Step 2 wrote a portfolio row. Steps 2–4 only hold answers in the conversation; Step 5 writes everything at once.
 
 ### Step 2: Greeting + Holdings, Watchlist & Followed Markets
 
@@ -32,10 +32,7 @@ Then ask one combined question to get started:
 
 > What stocks, ETFs, bonds, or other assets do you currently hold or watch (and roughly how much or at what cost, if you'd like to share), and which markets do you primarily follow (e.g., US, HK, A-shares/CN, Japan, Europe)? If you don't have specific positions in mind yet, what sectors or themes are you most interested in exploring?
 
-Once the user answers:
-- Write any current positions to `.agents/user/profile/portfolio.json`.
-- Write any watched tickers or candidate ideas to `.agents/user/profile/watchlist.json`.
-- Hold any market/sector preferences in context to write into `.agents/user/profile/preference.json` in Step 5.
+Hold everything the user answers — positions, watched tickers, markets, sectors — in context for Step 5. **Do not write `portfolio.json` or `watchlist.json` yet** (see Step 1).
 
 ### Step 3: Investment Style & Risk
 
@@ -44,7 +41,7 @@ Next, ask about their investment approach and risk tolerance in a single turn (u
 1. **Investment style & horizon** — How do they approach investing (fundamental, macro, quantitative, technical, event-driven), what style fits best (growth, value, income, index), and what is their typical holding period (intraday, days, months, years)?
 2. **Risk tolerance** — How do they think about risk (conservative / capital preservation, moderate / balanced, growth, or aggressive), and do they have any drawdown or concentration rules?
 
-Hold their answers in context until Step 5 (do **not** write `preference.json` yet).
+Hold their answers in context for Step 5 (still no writes).
 
 ### Step 4: Answer Preferences
 
@@ -53,13 +50,17 @@ Ask one final question about how they want research and answers delivered (via `
 - **Research depth** — Quick takeaways (`light`), matched to the question (`adaptive`), or deep-dive with full citations and tables (`thorough`)?
 - **Deliverable & proactivity** — Prose-first (`text`) or charts and tables (`visual`), Markdown (`markdown`) or HTML (`html`), and whether you should proactively suggest follow-ups (`proactive`, `when_needed`, or `on_request`)?
 
+Hold their answers in context for Step 5 (still no writes).
+
 ### Step 5: Finish (Write Structured Profile & Complete Onboarding)
 
-Only after the interview questions in Steps 2–4 are answered (or if the user explicitly asks to skip the remaining questions):
+Only after the interview questions in Steps 2–4 are answered (or if the user explicitly asks to skip the remaining questions), write everything in this one step:
 
-1. **Write `.agents/user/profile/preference.json`** with `risk_preference`, `investment_preference`, and `agent_preference` following the structured schema below.
-2. **Write `.agents/user/profile/user.json`** with `name`, `timezone`, `locale`, and `"onboarding_completed": true` (preserving any existing `name`, `timezone`, or `locale` values).
-3. **Summarize & propose a first task**:
+1. **Write `.agents/user/profile/portfolio.json`** with the holdings collected in Step 2.
+2. **Write `.agents/user/profile/watchlist.json`** with the watched tickers and candidate ideas collected in Step 2.
+3. **Write `.agents/user/profile/preference.json`** with `risk_preference`, `investment_preference`, and `agent_preference` following the structured schema below — only the keys the user actually answered (see the schema notes on never inventing unasked fields).
+4. **Write `.agents/user/profile/user.json`** with `name`, `timezone`, `locale`, and `"onboarding_completed": true` (preserving any existing `name`, `timezone`, or `locale` values).
+5. **Summarize & propose a first task**:
    - Briefly confirm what you saved (2–3 sentences).
    - Propose 1–2 concrete, high-value first research tasks tailored to their holdings, watchlist, or sectors (for example: an earnings or valuation deep-dive on one of their core holdings in a dedicated workspace using `manage_workspaces(action="create")` and `delegate_to_analyst`, or a quick portfolio/watchlist briefing right here in Home).
 
@@ -139,6 +140,8 @@ Always follow `.agents/user/profile/README.md`. All four files under `.agents/us
 
 ### 4. `.agents/user/profile/preference.json`
 
+Only the keys the user actually answered. This interview asks about risk, holdings/markets/sectors, style/horizon, and answer preferences — the example below shows exactly those. Keys the interview does **not** ask (`investor_type`, `experience`, `help_with`, `familiar_instruments`, `tone`, …) are written **only if the user volunteered them in their own words**; an unasked key is never invented and never copied from an example.
+
 ```json
 {
   "risk_preference": {
@@ -146,10 +149,6 @@ Always follow `.agents/user/profile/README.md`. All four files under `.agents/us
     "risk_tolerance": "Max single-position weight 10%; uncomfortable with >15% drawdown"
   },
   "investment_preference": {
-    "investor_type": "professional",
-    "experience": "3_10y",
-    "help_with": ["research", "ideas", "portfolio"],
-    "familiar_instruments": ["stock", "etf", "bond"],
     "markets": ["us", "hk", "cn"],
     "approaches": ["fundamental", "macro"],
     "styles": ["growth", "value"],
@@ -161,19 +160,21 @@ Always follow `.agents/user/profile/README.md`. All four files under `.agents/us
     "research_depth": "thorough",
     "deliverable": "visual",
     "proactivity": "when_needed",
-    "output_format": "markdown",
-    "tone": "Direct, institutional-grade, data-first"
+    "output_format": "markdown"
   }
 }
 ```
 
-Allowed vocabulary values for structured keys (additional free-form keys like `risk_tolerance`, `analysis_focus`, `company_interest`, `tone` are preserved alongside them):
+- `risk_tolerance` and `analysis_focus` are free text: quote what the user said, condensed — do not compose opinions they did not state.
+- `tone` especially is free text the server injects into **every** turn's profile block: never write it unless the user explicitly described how they want answers worded.
+
+Allowed vocabulary values for structured keys (additional free-form keys like `risk_tolerance`, `analysis_focus`, `company_interest`, `tone` are preserved alongside them — when the user gave them):
 
 - **`risk_preference`**:
   - `risk_level`: `"conservative"` | `"moderate"` | `"growth"` | `"aggressive"`
 - **`investment_preference`**:
-  - `investor_type`: `"individual"` | `"professional"` | `"student"`
-  - `experience`: `"under_1y"` | `"1_3y"` | `"3_10y"` | `"over_10y"`
+  - `investor_type`: `"individual"` | `"professional"` | `"student"` — *only when the user said so; this interview does not ask.*
+  - `experience`: `"under_1y"` | `"1_3y"` | `"3_10y"` | `"over_10y"` — *only when the user said so; this interview does not ask.*
   - `help_with` (array): `"ideas"` | `"research"` | `"portfolio"` | `"news"` | `"learning"`
   - `familiar_instruments` / `asset_classes` (array): `"stock"` | `"etf"` | `"index"` | `"option"` | `"future"` | `"bond"` | `"fund"` | `"forex"` | `"crypto"` | `"commodity"`
   - `markets` (array): `"us"` | `"hk"` | `"cn"` | `"jp"` | `"eu"`
@@ -192,6 +193,6 @@ Allowed vocabulary values for structured keys (additional free-form keys like `r
 ## Guardrails
 
 - **No brokerage or live trading**: Never ask about brokerage accounts, linking a broker, or live trade execution. Do not set `brokerages` or `"trading"` in `preference.json`.
-- **Complete onboarding only at the end**: Never write `"onboarding_completed": true` in `user.json` or commit `preference.json` before the interview finishes in Step 5.
+- **Write no profile file before Step 5**: Not `preference.json`, and not `portfolio.json`/`watchlist.json` either — every committed save runs the server's fallback completion check, which an existing user's risk text or watchlist items can satisfy early. All four files are written together in Step 5, and `onboarding_completed: true` only there.
 - **Keep it conversational**: 2–4 short turns total. Do not dump a long questionnaire in a single wall of text.
-- **If the user jumps straight to a research task**: Help them with their request first (answering directly or delegating to a workspace analyst), save any profile facts they mentioned, and only mark `onboarding_completed: true` once they confirm they are done with setup or finish the remaining profile questions.
+- **If the user jumps straight to a research task**: Help them with their request first (answering directly or delegating to a workspace analyst) and write nothing. When they later confirm setup is done — or answer the remaining interview questions — run Step 5's writes in full (including `onboarding_completed: true`); facts they mentioned earlier ride along in that one write. Never write `preference.json`'s risk keys or `onboarding_completed` on the strength of a passing mention alone.

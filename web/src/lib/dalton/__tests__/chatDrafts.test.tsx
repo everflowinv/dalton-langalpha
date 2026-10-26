@@ -401,6 +401,7 @@ describe('chatDrafts storage module & ChatInput composer drafts', () => {
   it('settleSendResult only treats explicit true (sync or resolved) as success', async () => {
     const outcomes: boolean[] = [];
     const makePending = () => ({
+      acceptSend: () => {},
       finalizeSend: (ok: boolean) => outcomes.push(ok),
     });
 
@@ -416,6 +417,95 @@ describe('chatDrafts storage module & ChatInput composer drafts', () => {
       expect(outcomes).toHaveLength(7);
     });
     expect(outcomes).toEqual([true, false, false, true, false, false, false]);
+  });
+
+  it('a superseded send settles without touching the newer send\'s stored draft or input', async () => {
+    // A streams forever (its promise never settles by itself); B is a steer
+    // sent mid-stream on the same draft key. A completing afterwards — in
+    // success or failure — must not delete or restore over B.
+    const resolvers: Array<(v: boolean) => void> = [];
+    const onSend = vi.fn<ChatInputProps['onSend']>().mockImplementation(
+      () => new Promise<boolean>((resolve) => { resolvers.push(resolve); }),
+    );
+    const view = renderComposer({ draftKey: 'thread:supersede', onSend }, { userId: 'u-1' });
+
+    // Send A
+    fireEvent.change(view.getTextarea(), { target: { value: 'first message', selectionStart: 13 } });
+    fireEvent.click(screen.getByLabelText('Send message'));
+    expect(view.getTextarea().value).toBe('');
+    expect(load('thread:supersede', 'u-1')).toBe('first message');
+
+    // Send B while A is still streaming
+    fireEvent.change(view.getTextarea(), { target: { value: 'second steer', selectionStart: 11 } });
+    fireEvent.click(screen.getByLabelText('Send message'));
+    expect(load('thread:supersede', 'u-1')).toBe('second steer');
+
+    // A's turn completes — before the fix this deleted B's stored draft.
+    await act(async () => {
+      resolvers[0](true);
+    });
+    expect(load('thread:supersede', 'u-1')).toBe('second steer');
+
+    // B's turn completes — its own settle clears its own draft.
+    await act(async () => {
+      resolvers[1](true);
+    });
+    expect(load('thread:supersede', 'u-1')).toBe('');
+    expect(view.getTextarea().value).toBe('');
+    view.unmount();
+
+    // The failure twin: A' superseded and failed must not restore A's text
+    // into an input that B' owns, and must not overwrite B' in storage.
+    const resolvers2: Array<(v: boolean) => void> = [];
+    const onSend2 = vi.fn<ChatInputProps['onSend']>().mockImplementation(
+      () => new Promise<boolean>((resolve) => { resolvers2.push(resolve); }),
+    );
+    const view2 = renderComposer({ draftKey: 'thread:supersede2', onSend: onSend2 }, { userId: 'u-1' });
+    fireEvent.change(view2.getTextarea(), { target: { value: 'first again', selectionStart: 11 } });
+    fireEvent.click(screen.getByLabelText('Send message'));
+    fireEvent.change(view2.getTextarea(), { target: { value: 'steer again', selectionStart: 10 } });
+    fireEvent.click(screen.getByLabelText('Send message'));
+    await act(async () => {
+      resolvers2[0](false);
+    });
+    expect(view2.getTextarea().value).toBe('');
+    expect(load('thread:supersede2', 'u-1')).toBe('steer again');
+    view2.unmount();
+  });
+
+  it('acceptSend settles the draft as sent before the stream ends, and a later failure does not restore it', async () => {
+    // The wiring useChatMessages provides: onAccepted fires when the server
+    // takes the send (run_id metadata), long before the stream promise
+    // resolves. The draft must be gone by then, so a reload mid-stream never
+    // restores a sent message; the eventual return value is only a fallback.
+    let resolveStream!: (v: boolean) => void;
+    const seenAccepted: Array<boolean | undefined> = [];
+    const onSend = vi.fn<ChatInputProps['onSend']>().mockImplementation(
+      (_m, _a, _s, opts) => {
+        seenAccepted.push(typeof opts.onAccepted === 'function');
+        opts.onAccepted?.();
+        return new Promise<boolean>((resolve) => { resolveStream = resolve; });
+      },
+    );
+    const view = renderComposer({ draftKey: 'thread:accept', onSend }, { userId: 'u-1' });
+
+    fireEvent.change(view.getTextarea(), { target: { value: 'long running analysis', selectionStart: 21 } });
+    fireEvent.click(screen.getByLabelText('Send message'));
+
+    // The stream is still running (promise pending), but acceptance already
+    // settled the send: storage cleared, input cleared.
+    expect(seenAccepted).toEqual([true]);
+    expect(load('thread:accept', 'u-1')).toBe('');
+    expect(view.getTextarea().value).toBe('');
+
+    // The stream later reports failure (e.g. a post-acceptance transport
+    // error surfaced as false): acceptance already settled — nothing comes back.
+    await act(async () => {
+      resolveStream(false);
+    });
+    expect(load('thread:accept', 'u-1')).toBe('');
+    expect(view.getTextarea().value).toBe('');
+    view.unmount();
   });
 
   it('preserves follow-up text typed while awaiting a send that later fails across unmount and remount', async () => {

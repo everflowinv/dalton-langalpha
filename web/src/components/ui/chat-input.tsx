@@ -647,7 +647,7 @@ function ChatInput({
       finalMessage = finalMessage.trimEnd() + '\n' + blocks.join('\n');
     }
     // DALTON-HOOK(composer-drafts): clear input immediately, then remove stored draft only when onSend succeeds
-    submitWithDraft(() =>
+    submitWithDraft((onAccepted) =>
       onSend(finalMessage, readyAttachments, slashCommands, {
         model: pillModel,
         reasoningEffort: sentEffort,
@@ -656,6 +656,7 @@ function ChatInput({
         subagentsAllowed: draftSubagents,
         ...ownOverrides,
         widgetSnapshots: widgetSnapshots.length ? widgetSnapshots : undefined,
+        onAccepted,
       }),
     );
     attachedFiles.forEach(f => { if (f.preview) URL.revokeObjectURL(f.preview); });

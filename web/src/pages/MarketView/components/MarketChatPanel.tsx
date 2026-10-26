@@ -81,6 +81,7 @@ interface ModelOptionsLike {
   model?: string | null;
   reasoningEffort?: string | null;
   fastMode?: boolean | null;
+  onAccepted?: () => void; // DALTON-HOOK(composer-drafts): settles the composer draft on acceptance
 }
 
 interface AttachmentItem {
@@ -566,15 +567,24 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
       const additionalContext = contexts.length > 0 ? contexts : null;
       const attachmentMeta = metaItems.length > 0 ? metaItems : null;
 
-      // DALTON-HOOK(composer-drafts): forward send result so ChatInput preserves the draft when sending fails
+      // DALTON-HOOK(composer-drafts): forward send result so ChatInput preserves the draft when
+      // sending fails. The screenshot and confirmed selections ride this one send, so they are
+      // spent only once the server accepts it: a refused send (the budget gate, the network)
+      // leaves them on the chart to send again.
+      const spendChartContext = () => {
+        onClearChartImage();
+        chartSelectionStore.clearAll();
+      };
       const sent = handleSendMessage(outgoingMessage, additionalContext, attachmentMeta, {
         ...modelOptions,
         ...(selectionSnapshots.length > 0 ? { chartSelections: selectionSnapshots } : {}),
         subagentsAllowed: subagentsToSend,
         ...tuningToSend,
+        onAccepted: () => {
+          spendChartContext();
+          modelOptions?.onAccepted?.();
+        },
       });
-      onClearChartImage();
-      chartSelectionStore.clearAll();
       return sent;
     },
     [symbol, interval, chartImage, chartImageDesc, handleSendMessage, onClearChartImage, subagentsToSend, tuningToSend],

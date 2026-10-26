@@ -266,6 +266,15 @@ export interface UseComposerDraftOptions {
 
 export interface PendingSendHandle {
   finalizeSend: (succeeded: boolean) => void;
+  /**
+   * Settle this send as accepted before its promise resolves: the server has
+   * taken it (a run_id arrived, a steer was accepted, the send was queued, a
+   * duplicate was adopted, …), so its draft is safe to clear even though the
+   * stream may run on for a long time — a reload mid-stream must not restore
+   * an already-sent message into the composer. A later finalizeSend on the
+   * same handle is a no-op.
+   */
+  acceptSend: () => void;
 }
 
 interface InFlightSendState {
@@ -305,7 +314,7 @@ export interface UseComposerDraftResult {
   clearCurrentDraft: () => void;
   beginSend: () => PendingSendHandle;
   submitWithDraft: (
-    invoke: () => void | boolean | Promise<void | boolean>,
+    invoke: (onAccepted: () => void) => void | boolean | Promise<void | boolean>,
   ) => void;
 }
 
@@ -461,70 +470,97 @@ export function useComposerDraft({
     latestMessageRef.current = '';
     setMessageState('');
 
+    const settleSuccess = () => {
+      const sendDraftKey = inFlight.draftKey;
+      const sendUserId = inFlight.userId;
+      const isSameKey = activeDraftKeyRef.current === sendDraftKey;
+      const hasFollowUp =
+        isSameKey &&
+        (writtenSinceMountOrSendRef.current ||
+          Boolean(latestMessageRef.current.trim()));
+      if (!hasFollowUp && sendDraftKey) {
+        clearStorageEntry(sendDraftKey, sendUserId);
+      }
+    };
+
+    const settle = (succeeded: boolean) => {
+      if (inFlight.settled) return;
+      inFlight.settled = true;
+      // A newer send on this key may have superseded this one while it was in
+      // flight (a steer sent mid-stream, say): the key's stored draft and the
+      // input are that send's now — this settle touches neither, or the first
+      // send's completion would delete or restore the second send's draft.
+      if (inFlightSendRef.current !== inFlight) return;
+      inFlightSendRef.current = null;
+
+      if (succeeded) {
+        settleSuccess();
+        return;
+      }
+      const sendDraftKey = inFlight.draftKey;
+      const sendUserId = inFlight.userId;
+      if (!sendDraftKey) {
+        return;
+      }
+      // Send failed: keep the draft in localStorage and put the original text back.
+      if (activeDraftKeyRef.current === sendDraftKey) {
+        hasSentOnKeyRef.current = false;
+        if (timerRef.current !== null) {
+          clearTimeout(timerRef.current);
+          timerRef.current = null;
+        }
+        const trimmedSent = sentText.trim();
+        const currentTyped = latestMessageRef.current.trim();
+        const alreadyRestored =
+          Boolean(trimmedSent) &&
+          (currentTyped === trimmedSent ||
+            currentTyped.startsWith(`${trimmedSent}\n\n`) ||
+            currentTyped.endsWith(`\n\n${trimmedSent}`));
+        const restoredText = sentText
+          ? alreadyRestored
+            ? latestMessageRef.current
+            : currentTyped
+              ? `${sentText}\n\n${latestMessageRef.current}`
+              : sentText
+          : latestMessageRef.current;
+        if (restoredText.trim()) {
+          save(sendDraftKey, restoredText, sendUserId);
+        }
+        if (restoredText) {
+          latestMessageRef.current = restoredText;
+          dirtyRef.current = false;
+          writtenSinceMountOrSendRef.current = true;
+          setMessageState(restoredText);
+        }
+      } else if (sentText.trim()) {
+        save(sendDraftKey, sentText, sendUserId);
+      }
+    };
+
     return {
       finalizeSend(succeeded: boolean) {
-        if (inFlight.settled) return;
-        inFlight.settled = true;
-        if (inFlightSendRef.current === inFlight) {
-          inFlightSendRef.current = null;
-        }
-        const sendDraftKey = inFlight.draftKey;
-        const sendUserId = inFlight.userId;
-        if (succeeded) {
-          const isSameKey = activeDraftKeyRef.current === sendDraftKey;
-          const hasFollowUp =
-            isSameKey &&
-            (writtenSinceMountOrSendRef.current ||
-              Boolean(latestMessageRef.current.trim()));
-          if (!hasFollowUp && sendDraftKey) {
-            clearStorageEntry(sendDraftKey, sendUserId);
-          }
-          return;
-        }
-        if (!sendDraftKey) {
-          return;
-        }
-        // Send failed: keep the draft in localStorage and put the original text back.
-        if (activeDraftKeyRef.current === sendDraftKey) {
-          hasSentOnKeyRef.current = false;
-          if (timerRef.current !== null) {
-            clearTimeout(timerRef.current);
-            timerRef.current = null;
-          }
-          const trimmedSent = sentText.trim();
-          const currentTyped = latestMessageRef.current.trim();
-          const alreadyRestored =
-            Boolean(trimmedSent) &&
-            (currentTyped === trimmedSent ||
-              currentTyped.startsWith(`${trimmedSent}\n\n`) ||
-              currentTyped.endsWith(`\n\n${trimmedSent}`));
-          const restoredText = sentText
-            ? alreadyRestored
-              ? latestMessageRef.current
-              : currentTyped
-                ? `${sentText}\n\n${latestMessageRef.current}`
-                : sentText
-            : latestMessageRef.current;
-          if (restoredText.trim()) {
-            save(sendDraftKey, restoredText, sendUserId);
-          }
-          if (restoredText) {
-            latestMessageRef.current = restoredText;
-            dirtyRef.current = false;
-            writtenSinceMountOrSendRef.current = true;
-            setMessageState(restoredText);
-          }
-        } else if (sentText.trim()) {
-          save(sendDraftKey, sentText, sendUserId);
-        }
+        settle(succeeded);
+      },
+      acceptSend() {
+        settle(true);
       },
     };
   }, []);
 
   const submitWithDraft = useCallback(
-    (invoke: () => void | boolean | Promise<void | boolean>) => {
+    (invoke: (onAccepted: () => void) => void | boolean | Promise<void | boolean>) => {
       const pending = beginSend();
-      settleSendResult(pending, invoke);
+      // The send path reports acceptance early (a run started, a steer was
+      // taken, the send was queued) by calling onAccepted; the promise's
+      // resolved value is the fallback for a send that never reported either.
+      let result: void | boolean | Promise<void | boolean>;
+      try {
+        result = invoke(pending.acceptSend);
+      } catch {
+        pending.finalizeSend(false);
+        return;
+      }
+      settleSendResult(pending, () => result);
     },
     [beginSend],
   );
