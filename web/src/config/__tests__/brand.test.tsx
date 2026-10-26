@@ -204,7 +204,7 @@ describe('brand configuration (VITE_BRAND_NAME & VITE_BRAND_MARK)', () => {
     expect(screen.getAllByText('← Back to Everflow')).toHaveLength(1);
     expect(container.textContent).toContain('hosted LangAlpha service');
     expect(container.textContent).toContain('langalpha repository');
-    expect(container.textContent).toContain('ginlix.ai');
+    expect(container.innerHTML).toContain('github.com/ginlix/langalpha');
   });
 
   it('interpolates {{brand}} in en-US and zh-CN locale strings when unset and when VITE_BRAND_NAME=Everflow', async () => {

@@ -5554,7 +5554,7 @@
       "unchangedCount": "{{count}} 个模型无变化",
       "inUseWarning": "注意：被移除或隐藏的模型当前正被角色配置使用",
       "editDefaultModel": "修改主模型",
-      "editSubagentModels": "修改子智能体模型",
+      "editSubagentModels": "修改子代理模型",
       "added": "新增模型",
       "removed": "移除 / 隐藏模型",
       "changed": "参数或价格变更",
