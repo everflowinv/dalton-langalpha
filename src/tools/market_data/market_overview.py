@@ -143,6 +143,26 @@ def _get_index_name(symbol: str) -> str:
     return index_names.get(symbol, symbol)
 
 
+async def _yfinance_sector_snapshot() -> List[Dict[str, Any]]:
+    """Today's sector-ETF snapshot from yfinance; ``[]`` when Yahoo fails too.
+
+    DALTON-HOOK(market-data-fallback): last resort for a dateless sector
+    request whose provider chain raised — keeps the overview's sector half
+    alive. This only matters on a pure-FMP source chain (FMP primary, no
+    yfinance-first composite); Dalton's default chain already answers this
+    dateless call yfinance-first via src/dalton/market_data_fallback.py, so
+    there the fallback fires only when that composite itself raises. Dated
+    requests never come here: yfinance has no date-aware sector data.
+    """
+    try:
+        from src.data_client.yfinance.financial_source import YFinanceFinancialSource
+
+        return list(await YFinanceFinancialSource().get_sector_performance())
+    except Exception:
+        logger.warning("Sector performance yfinance fallback failed", exc_info=True)
+        return []
+
+
 async def fetch_sector_performance(
     date: Optional[str] = None,
 ) -> Tuple[str, Dict[str, Any]]:
@@ -209,6 +229,16 @@ async def fetch_sector_performance(
                     return content, _build_sector_artifact(results)
             except Exception:
                 logger.exception("Sector performance provider call failed")
+                # DALTON-HOOK(market-data-fallback): only a dateless request
+                # can be re-answered here — yfinance serves the latest ETF
+                # snapshot, not a target date, so dated calls stay FMP-only.
+                if date is None:
+                    results = await _yfinance_sector_snapshot()
+                    if results:
+                        return (
+                            header + _format_sectors_as_table(results),
+                            _build_sector_artifact(results),
+                        )
 
         logger.warning(
             "No sector performance data found - endpoint may not be available on this FMP plan"
