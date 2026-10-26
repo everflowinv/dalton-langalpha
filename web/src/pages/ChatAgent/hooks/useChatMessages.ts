@@ -2548,6 +2548,12 @@ export function useChatMessages(
         console.log('[Send] Stream disconnected, attempting reconnect');
         wasDisconnected = true;
         attemptReconnectAfterDisconnect(assistantMessageId);
+        // DALTON-HOOK(composer-drafts): this send resolves true (upstream's reconnect owns it), so
+        // settle the draft and the market panel's chart context together as sent. Accepted
+        // residual: a drop between the response headers and the first frame, followed by a
+        // pre-START refusal, loses this one draft — restoring it instead would risk a duplicate
+        // send whenever the run did start.
+        notifyAccepted();
         return true;
       }
 
