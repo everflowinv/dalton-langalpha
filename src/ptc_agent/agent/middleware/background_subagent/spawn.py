@@ -9,6 +9,7 @@ the cycle can hold the shared pipeline.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
@@ -17,6 +18,11 @@ import structlog
 from ptc_agent.agent.middleware.background_subagent import run_executor
 from ptc_agent.agent.middleware.background_subagent.registry import (
     BackgroundTask,
+)
+# DALTON-HOOK(subagent-caps): Redis slot lease + FIFO queue for background subagents.
+from src.dalton.subagent_slots import (
+    release_subagent_slot,
+    reserve_subagent_slot,
 )
 from src.observability.tracing import (
     create_task_with_context,
@@ -123,6 +129,9 @@ async def spawn_task_writer(
         )
         await mw.registry.write_task_meta(task, "running")
         await mw._append_run_opener(task, prompt)
+        # DALTON-HOOK(subagent-caps): acquire a Redis slot lease or enqueue in FIFO
+        # order before publishing the writer so the launch reply knows whether it queued.
+        await reserve_subagent_slot(task, mw.registry.thread_id)
         asyncio_task = await mw.registry.publish_writer(
             task,
             lambda: create_task_with_context(
@@ -138,16 +147,23 @@ async def spawn_task_writer(
                 name=name,
             ),
         )
+    except asyncio.CancelledError:
+        # DALTON-HOOK(subagent-caps): release slot if cancelled during setup/publish.
+        await release_subagent_slot(task)
+        raise
     except Exception as e:
         # An admitted run either spawns or terminates — never a stranded
         # in_progress row (for un-admitted children the settle still writes
         # terminal meta and releases the fence).
+        # DALTON-HOOK(subagent-caps): release slot if writer setup or publish aborted.
+        await release_subagent_slot(task)
         await mw._abort_admitted_run(task, e)
         on_setup_failure(task, e)
         raise SpawnSetupError(f"setup failed before spawn: {e}") from e
     if asyncio_task is None:
         # A stop stamped the (handle-less) task during a setup await — the
         # publish fence refused the writer.
+        await release_subagent_slot(task)
         await mw._finalize_cancelled_before_spawn(task)
         raise SpawnStoppedError(f"{task.display_id} was stopped before it started")
     asyncio_task.add_done_callback(

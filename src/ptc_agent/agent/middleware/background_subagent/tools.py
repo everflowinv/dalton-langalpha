@@ -197,6 +197,22 @@ async def _compose_missing_reply(registry, task_id: str, run: dict | None) -> st
     status = str(run["status"]) if run else None
 
     if status == "in_progress":
+        # DALTON-HOOK(subagent-caps): check Redis queue status when task is owned by another worker.
+        from src.dalton.subagent_slots import (
+            format_queued_notice_from_status,
+            query_queued_slot_status,
+        )
+
+        queued_status = await query_queued_slot_status(
+            getattr(registry, "thread_id", ""),
+            task_id,
+            str(run.get("task_run_id") or "") if isinstance(run, dict) else None,
+        )
+        if queued_status is not None:
+            return (
+                f"Task-{task_id} is [QUEUED] (排队中, owned by another turn or "
+                f"worker). {format_queued_notice_from_status(queued_status)}"
+            )
         return (
             f"Task-{task_id} is still running (owned by another turn or "
             "worker). You will be notified when it finishes."
@@ -385,7 +401,17 @@ async def _task_reply(registry, task: BackgroundTask, *, listed: bool) -> tuple[
         is_terminal, text = resolved
         pending, end = not is_terminal, "\n\n"
     elif not task.completed:
-        pending, text, end = True, _format_task_progress(task), "\n"
+        # DALTON-HOOK(subagent-caps): resolve Redis queue status when local lease is absent.
+        from src.dalton.subagent_slots import resolve_task_queued_status
+
+        queued_status = await resolve_task_queued_status(
+            task, getattr(registry, "thread_id", "")
+        )
+        pending, text, end = (
+            True,
+            _format_task_progress(task, queued_status=queued_status),
+            "\n",
+        )
     else:
         # Marked seen even when the reply is a stop notice: that notice IS
         # this task's delivery, and without it the orchestrator's
@@ -445,9 +471,23 @@ def create_task_output_tool(middleware: BackgroundSubagentMiddleware) -> Structu
         ]
         pending_count = sum(1 for pending, _ in entries if pending)
         completed_count = len(entries) - pending_count
+        # DALTON-HOOK(subagent-caps): surface queued count in TaskOutput overview (including cross-worker).
+        from src.dalton.subagent_slots import resolve_task_queued_status
+
+        queued_statuses = [
+            await resolve_task_queued_status(task, getattr(registry, "thread_id", ""))
+            for task in all_tasks
+            if not task.completed and task.terminal_status is None
+        ]
+        queued_count = sum(1 for qs in queued_statuses if qs is not None)
+        running_summary = (
+            f"{max(0, pending_count - queued_count)} running, {queued_count} queued (排队中)"
+            if queued_count > 0
+            else f"{pending_count} running"
+        )
         header = (
             f"**Background Tasks** ({len(all_tasks)} total: "
-            f"{completed_count} completed, {pending_count} running)\n\n"
+            f"{completed_count} completed, {running_summary})\n\n"
         )
         return pending_count > 0, header + "".join(entry for _, entry in entries)
 
@@ -521,11 +561,12 @@ def _fmt_ago(ts: float) -> str:
     return f"{int(delta / 3600)}h ago"
 
 
-def _format_task_progress(task: BackgroundTask) -> str:
+def _format_task_progress(task: BackgroundTask, queued_status: Any = None) -> str:
     """Format progress info for a single task.
 
     Args:
         task: The BackgroundTask to format
+        queued_status: Optional resolved ``QueuedSlotStatus`` (local or Redis)
 
     Returns:
         Formatted progress string
@@ -533,14 +574,27 @@ def _format_task_progress(task: BackgroundTask) -> str:
     elapsed = time.time() - task.created_at
 
     # Status indicator
-    status = {
-        None: "[RUNNING]",
-        "completed": "[DONE]",
-        "cancelled": "[STOPPED]",
-        "timeout": "[TIMED OUT]",
-        "error": "[ERROR]",
-        "never_started": "[NEVER STARTED]",
-    }[task.terminal_status]
+    # DALTON-HOOK(subagent-caps): show queued status and queue notice in TaskOutput.
+    from src.dalton.subagent_slots import (
+        format_queued_notice,
+        is_subagent_queued,
+    )
+
+    queued = task.terminal_status is None and (
+        queued_status is not None or is_subagent_queued(task)
+    )
+    status = (
+        "[QUEUED] (排队中)"
+        if queued
+        else {
+            None: "[RUNNING]",
+            "completed": "[DONE]",
+            "cancelled": "[STOPPED]",
+            "timeout": "[TIMED OUT]",
+            "error": "[ERROR]",
+            "never_started": "[NEVER STARTED]",
+        }[task.terminal_status]
+    )
 
     # Tool call summary (always show, even if 0)
     tool_summary = f" | {task.total_tool_calls} tool calls"
@@ -551,8 +605,11 @@ def _format_task_progress(task: BackgroundTask) -> str:
         tool_summary += f" ({tool_details})"
 
     # Current activity (only for running tasks)
+    # DALTON-HOOK(subagent-caps): include queue notice in progress block when queued.
     activity = ""
-    if not task.completed and task.current_tool:
+    if queued:
+        activity = f"\n  Queue: {format_queued_notice(task, queued_status=queued_status)}"
+    elif not task.completed and task.current_tool:
         activity = f"\n  Currently executing: `{task.current_tool}`"
 
     # Staleness summary: how long since anything meaningful changed (see

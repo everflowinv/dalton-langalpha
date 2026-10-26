@@ -17,14 +17,14 @@ services:
     # the backend and cancels every running turn. Code changes are applied by an explicit
     # `docker restart dalton-langalpha-backend-1` once no turn is in progress.
     command: ["uv", "run", "python", "server.py", "--host", "0.0.0.0", "--port", "8000"]
-    # 3g: scrapling's Chromium runs inside this container next to the server; at 2g a
-    # long DoorDash initial-coverage fetch run got the server process OOM-killed (10/25).
-    # The Colima VM has 8 GiB to leave room for postgres and the sandboxes.
-    mem_limit: 3g
+    # 4g: raised from 3g for concurrent background subagents (up to 8 per thread /
+    # 24 globally); the VM has 6 GB total and other containers use ~0.6 GB combined,
+    # plus scrapling's Chromium runs inside this container next to the server.
+    mem_limit: 4g
     # Chromium (scrapling's browser tier) crashes pages ("Page crashed", then a dead
     # driver pipe) with Docker's default 64 MB /dev/shm, which hung the whole backend.
     shm_size: "1gb"
-    memswap_limit: 3g
+    memswap_limit: 4g
     # Replace upstream 0.0.0.0:8000 port binding with loopback-only (requires Docker Compose v2.24.4+).
     ports: !override
       - "127.0.0.1:${BACKEND_PORT:-8000}:8000"

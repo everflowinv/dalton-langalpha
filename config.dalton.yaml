@@ -32,3 +32,8 @@ news_data:
     - name: yfinance
     - name: fmp
 
+# Background subagent concurrency caps (per thread and across all backend workers).
+subagent_limits:
+  max_running_per_thread: 8
+  max_running_global: 24
+
