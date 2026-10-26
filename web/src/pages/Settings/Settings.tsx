@@ -8,6 +8,7 @@ import { UserInfoTab } from './panels/UserInfoTab';
 import { PreferencesTab } from './panels/PreferencesTab';
 import { ModelTab } from './panels/ModelTab';
 import { ExperimentsTab } from './panels/ExperimentsTab';
+import { isDaltonAuth } from '@/config/daltonAuth'; // DALTON-HOOK(hide-experiments)
 import './Settings.css';
 
 function Settings() {
@@ -16,7 +17,10 @@ function Settings() {
   const { isLoading: isPrefsLoading } = usePreferences();
   const { t } = useTranslation();
 
-  const tabParam = searchParams.get('tab') || 'userInfo';
+  // DALTON-HOOK(hide-experiments): Dalton hides the Experiments tab; a link to it opens the default tab
+  const visibleTab = (tab: string | null) =>
+    !tab || (isDaltonAuth && tab === 'experiments') ? 'userInfo' : tab;
+  const tabParam = visibleTab(searchParams.get('tab'));
   const [activeTab, setActiveTab] = useState(tabParam);
   const pageRef = useRef<HTMLDivElement>(null);
   useScrollMemory(pageRef, 'page:settings');
@@ -30,7 +34,7 @@ function Settings() {
 
   // Sync from URL on mount / back-forward navigation
   useEffect(() => {
-    const urlTab = searchParams.get('tab');
+    const urlTab = searchParams.get('tab') && visibleTab(searchParams.get('tab')); // DALTON-HOOK(hide-experiments)
     if (urlTab && urlTab !== activeTab) {
       setActiveTab(urlTab);
     }
@@ -80,17 +84,20 @@ function Settings() {
             >
               {t('settings.model')}
             </button>
-            <button
-              type="button"
-              onClick={() => handleTabChange('experiments')}
-              className="px-4 py-2 text-sm font-medium whitespace-nowrap shrink-0"
-              style={{
-                color: activeTab === 'experiments' ? 'var(--color-text-primary)' : 'var(--color-text-tertiary)',
-                borderBottom: activeTab === 'experiments' ? '2px solid var(--color-accent-primary)' : '2px solid transparent',
-              }}
-            >
-              {t('settings.experiments', 'Experiments')}
-            </button>
+            {/* DALTON-HOOK(hide-experiments) */}
+            {!isDaltonAuth && (
+              <button
+                type="button"
+                onClick={() => handleTabChange('experiments')}
+                className="px-4 py-2 text-sm font-medium whitespace-nowrap shrink-0"
+                style={{
+                  color: activeTab === 'experiments' ? 'var(--color-text-primary)' : 'var(--color-text-tertiary)',
+                  borderBottom: activeTab === 'experiments' ? '2px solid var(--color-accent-primary)' : '2px solid transparent',
+                }}
+              >
+                {t('settings.experiments', 'Experiments')}
+              </button>
+            )}
           </div>
 
           <div className="settings-content">
@@ -108,7 +115,7 @@ function Settings() {
 
             {/* Text-heavy tab: cap the measure so descriptions stay readable
                 instead of spanning the full settings container. */}
-            {!isLoading && activeTab === 'experiments' && <ExperimentsTab />}
+            {!isLoading && !isDaltonAuth && activeTab === 'experiments' && <ExperimentsTab />} {/* DALTON-HOOK(hide-experiments) */}
           </div>
         </div>
       </div>

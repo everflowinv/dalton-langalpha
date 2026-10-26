@@ -224,7 +224,7 @@ export function TeamWorkspacesSection({
 
   return (
     <div
-      className="mt-2 pt-2 border-t"
+      className="sidebar-team-section shrink-0 mt-2 pt-2 pb-2 border-t"
       style={{ borderColor: 'var(--color-border-muted)' }}
       data-testid="team-workspaces-section"
     >
