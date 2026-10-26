@@ -26,6 +26,7 @@ web/src/pages/Settings/utils/daltonOAuthApi.ts
 web/src/pages/Setup/steps/connectStep/dalton/
 web/src/pages/ChatAgent/components/dalton/
 web/src/pages/Dashboard/components/dalton/
+web/src/pages/Onboarding/dalton/
 web/.env.dalton
 web/public/everflow/
 web/src/config/brand.ts

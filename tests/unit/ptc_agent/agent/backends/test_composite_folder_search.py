@@ -2048,5 +2048,3 @@ class TestGrepFilterMatchesRgOnDisk:
                 differences[path] = (sorted(found - expected), sorted(expected - found))
 
         assert differences == {}
-
-

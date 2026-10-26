@@ -245,6 +245,7 @@ function AuthenticatedShell() {
   // this is free when the gate is already settled. Mount-only: later
   // navigations mount their lazy component directly.
   useEffect(() => {
+    // DALTON-HOOK(hide-trading): Dalton redirects /welcome, so its chunk is never preloaded
     if (window.location.pathname === WELCOME_PATH && !isDaltonBuild) {
       void Welcome.preload().catch(() => {});
     } else {
