@@ -3,7 +3,7 @@ import {
   TrendingUp, Building2, BarChart3, PieChart, Search, Globe,
   FilePlus, FileText, FilePen, FolderSearch, SquareChevronRight, Wrench,
   Newspaper, Brain, User, FileBarChart, Clock, ClipboardList, Zap, Settings, Terminal,
-  Sparkles, BookText, BookMarked, BookPlus, PenLine, Eye, Plug, Send, Contact,
+  Sparkles, BookText, BookMarked, BookPlus, PenLine, Eye, Plug, Send, Contact, AlarmClock,
 } from 'lucide-react';
 import {
   classifyAgentPath, topicFromMemoryKey, type AgentPathInfo, type UserDataEntity,
@@ -12,6 +12,7 @@ import { directToolDisplayName, parseDirectToolName, summarizeDirectToolArgs } f
 import { INTERVAL_LABEL } from '@/lib/bars';
 import { LARGE_TOOL_RESULTS_PREFIX } from './filePanel/fileMeta';
 import { messagingAppName, platformOf } from './messaging/messageDelivery';
+import { quietArg, wakeupArgListed } from '../session/wakeupArgs';
 
 /** Translation function signature compatible with i18next's t() */
 type TFn = (key: string, opts?: Record<string, unknown>) => string;
@@ -68,6 +69,8 @@ export const TOOL_DISPLAY_CONFIG: Record<string, ToolDisplayEntry> = {
   screen_stocks:            { displayName: 'Stock Screener',       i18nKey: 'stockScreener',       icon: Search },
   // Market watch (live price injection) — one tool, action="watch"/"unwatch"
   watch_market:             { displayName: 'Watch Market',         i18nKey: 'watchMarket',         icon: Eye },
+  // The agent's own follow-ups: set, cancel or list them, or end a check quietly
+  schedule_wakeup:          { displayName: 'Wakeups',              i18nKey: 'scheduleWakeup',      icon: AlarmClock },
   // SEC
   get_sec_filing:           { displayName: 'SEC Filing',           i18nKey: 'secFiling',           icon: FileBarChart },
   // Web search / news
@@ -307,6 +310,13 @@ export function getInProgressText(rawToolName: string, toolCall: ToolCall | unde
       if (has('symbols')) return tr?.('watchingMarket') ?? 'starting market watch...';
       if (has('targets')) return tr?.('settingPriceTargets') ?? 'setting price targets...';
       return tr?.('checkingMarketWatch') ?? 'checking market watch...';
+    }
+    case 'schedule_wakeup': {
+      const tw = (key: string, fallback: string) => (t ? t(`chat.wakeups.${key}`) : fallback);
+      if (quietArg(args)) return tw('endingQuietly', 'ending the check...');
+      if (wakeupArgListed(args, 'triggers')) return tw('settingWakeups', 'setting wakeups...');
+      if (wakeupArgListed(args, 'cancel')) return tw('cancellingWakeups', 'cancelling wakeups...');
+      return tw('checkingWakeups', 'checking wakeups...');
     }
     case 'get_sec_filing':
       return args?.symbol

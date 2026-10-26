@@ -46,9 +46,13 @@ TASK_RB_INFLIGHT_QUOTA = 3
 # report-backs for everyone. A claim never asks for more jobs than the room
 # left under any quota, so a burst cannot overshoot one in a single batch.
 MARKET_TARGET_INFLIGHT_QUOTA = 3
+# A wakeup's notice rides out refusals the same way, and a market-wide move
+# fires every price wakeup on the venue together, so it gets the same share.
+WAKEUP_INFLIGHT_QUOTA = 3
 _INFLIGHT_QUOTAS = {
     "task_report_back": TASK_RB_INFLIGHT_QUOTA,
     "market_target": MARKET_TARGET_INFLIGHT_QUOTA,
+    "wakeup": WAKEUP_INFLIGHT_QUOTA,
 }
 # How long shutdown waits for the loop, and then for its in-flight jobs.
 STOP_GRACE = 10.0
@@ -57,8 +61,8 @@ STOP_GRACE = 10.0
 RETENTION_SECONDS = 7 * 24 * 3600.0
 PURGE_INTERVAL = 3600.0
 PURGE_BATCH = 5000
-# How often the drainer closes market-target alerts no turn will take in, and
-# how often it revives dead ones. Neither is urgent; a revive waits out a
+# How often the drainer closes alerts (a price target's or a wakeup's notice)
+# no turn will take in, and how often it revives dead ones. Neither is urgent; a revive waits out a
 # cool-down anyway (``outbox.revive_dead_alerts``), and reads terminal rows.
 ALERT_CLOSE_INTERVAL = 60.0
 ALERT_REVIVE_INTERVAL = 600.0
@@ -97,7 +101,7 @@ _EXECUTORS: Dict[str, Callable[[Dict[str, Any]], Awaitable[None]]] = {
 _CLOSE_FOLLOWUPS: Dict[str, Callable[[Dict[str, Any]], Awaitable[None]]] = {}
 # Best-effort followups for a row its type settles itself at the attempts
 # ceiling rather than parking it dead (a steer, ``outbox._exhaust_steers``;
-# a market-target alert, ``outbox._exhaust_alerts``).
+# an alert, ``outbox._exhaust_alerts``).
 _EXHAUST_FOLLOWUPS: Dict[str, Callable[[Dict[str, Any]], Awaitable[None]]] = {}
 
 
@@ -253,8 +257,8 @@ class HookOutboxDrainer:
             except Exception:
                 logger.error("[HookOutbox] revive sweep failed", exc_info=True)
 
-            # A market-target alert out of attempts waits for its thread's next
-            # turn instead of going dead. One an older build dead-lettered is
+            # An alert out of attempts waits for its thread's next turn
+            # instead of going dead. One an older build dead-lettered is
             # made due again, at most twice, while its notice is owed; one no
             # turn will take in (not owed, or its thread archived or its
             # workspace deleted) is closed rather than left pending for good.
@@ -263,7 +267,7 @@ class HookOutboxDrainer:
                 try:
                     for revived in await outbox_db.revive_dead_alerts():
                         logger.warning(
-                            f"[HookOutbox] revived dead market alert job="
+                            f"[HookOutbox] revived dead alert job="
                             f"{revived.get('hook_outbox_id')} "
                             f"key={revived.get('ordering_key')} for another "
                             f"wake"
@@ -272,7 +276,7 @@ class HookOutboxDrainer:
                     raise
                 except Exception:
                     logger.error(
-                        "[HookOutbox] market alert revive sweep failed",
+                        "[HookOutbox] alert revive sweep failed",
                         exc_info=True,
                     )
             if time.monotonic() >= self._next_alert_close:
@@ -280,7 +284,7 @@ class HookOutboxDrainer:
                 try:
                     for closed in await outbox_db.close_unowed_waiting_alerts():
                         logger.info(
-                            f"[HookOutbox] closed market alert job="
+                            f"[HookOutbox] closed alert job="
                             f"{closed.get('hook_outbox_id')} "
                             f"key={closed.get('ordering_key')}: no turn will "
                             f"take it in"
@@ -289,7 +293,7 @@ class HookOutboxDrainer:
                     raise
                 except Exception:
                     logger.error(
-                        "[HookOutbox] market alert close sweep failed",
+                        "[HookOutbox] alert close sweep failed",
                         exc_info=True,
                     )
 

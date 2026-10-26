@@ -18,6 +18,7 @@ from ptc_agent.core.paths import (
     grep_working_dir,
     lexical_path,
 )
+from ptc_agent.core.sandbox.glob_runtime import expand_braces
 from ptc_agent.core.sandbox.grep_render import GrepLine
 
 logger = structlog.get_logger(__name__)
@@ -331,16 +332,24 @@ class CompositeFilesystemBackend:
         return any(wanted.finds(f"{root}/{name}") for root in roots for name in names)
 
     def _glob_found(
-        self, routes: list[FilesystemRoute], listings: list[list[str]], wanted: DiskGlob
+        self,
+        routes: list[FilesystemRoute],
+        listings: list[list[str]],
+        wanted: Sequence[DiskGlob],
     ) -> list[str]:
-        """The listed files Glob finds at either spelling of their route."""
+        """The listed files one of the patterns finds, each at the spellings
+        of their route its own walk goes into."""
         found: list[str] = []
         for route, listing in zip(routes, listings):
-            roots = self._glob_roots(route, wanted)
+            walked = [(glob, self._glob_roots(route, glob)) for glob in wanted]
             for path in listing:
                 if path.startswith(route.root_prefix):
                     rel = path[len(route.root_prefix) :]
-                    if any(wanted.finds(f"{root}/{rel}") for root in roots):
+                    if any(
+                        glob.finds(f"{root}/{rel}")
+                        for glob, roots in walked
+                        for root in roots
+                    ):
                         found.append(path)
         return found
 
@@ -432,12 +441,14 @@ class CompositeFilesystemBackend:
         # Each route is listed whole and matched here, since a route knows
         # neither the base nor the names the agent gives its root. Its files
         # are files at both of their spellings, matched as the sandbox glob
-        # matches the disk.
-        wanted = DiskGlob(pattern, normalized)
-        if route is not None and not wanted.absolute and not wanted.climbs:
+        # matches the disk: each pattern the braces expand to on its own.
+        wanted = [DiskGlob(each, normalized) for each in expand_braces(pattern)]
+        if route is not None and not any(w.absolute or w.climbs for w in wanted):
             # Below a path inside a route are the route's files alone, so
             # the sandbox is not asked.
-            reached = [route] if self._glob_lists(route, wanted) else []
+            reached = (
+                [route] if any(self._glob_lists(route, w) for w in wanted) else []
+            )
             listings = await asyncio.gather(
                 *(r.aglob_paths("*", r.root_prefix) for r in reached)
             )
@@ -448,7 +459,9 @@ class CompositeFilesystemBackend:
         # hits come first, newest first, each route file at its route's
         # root, and a route adds the files they lack. With a `..`, which the
         # disk alone resolves, they are all there is.
-        reached = [r for r in self._routes if self._glob_lists(r, wanted)]
+        reached = [
+            r for r in self._routes if any(self._glob_lists(r, w) for w in wanted)
+        ]
         sandbox_paths, *listings = await asyncio.gather(
             self._sandbox.aglob_paths(pattern, normalized),
             *(r.aglob_paths("*", r.root_prefix) for r in reached),

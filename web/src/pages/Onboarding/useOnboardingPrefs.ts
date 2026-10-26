@@ -141,6 +141,15 @@ export function useOnboardingPrefs() {
     [writeOnboardingPrefs, fallbackOther, isLoading]
   );
 
+  /** Record that the user passed on the welcome flow, once. */
+  const markWelcomeSkipped = useCallback(() => {
+    if (isLoading) return;
+    writeOnboardingPrefs(
+      (cur) => (cur.welcomeSkippedAt !== null ? null : { ...cur, welcomeSkippedAt: Date.now() }),
+      { fallbackOther }
+    );
+  }, [writeOnboardingPrefs, fallbackOther, isLoading]);
+
   /** Clear all onboarding state ("reset onboarding"). Returns false if the
    * write was refused (cold cache), so the caller can skip an empty toast. */
   const resetAll = useCallback((): boolean => {
@@ -159,6 +168,7 @@ export function useOnboardingPrefs() {
     replayGuides,
     setLastSeenReleaseVersion,
     ensureFirstRun,
+    markWelcomeSkipped,
     resetAll,
   };
 }

@@ -711,6 +711,38 @@ class TestPreferenceStrictValidation:
         assert "other_preference" not in values  # still dropped from output
 
 
+class TestPreferenceStructuredKeys:
+    """The agent's writes run ``check_profile`` against the row the save read;
+    its rules are pinned in ``tests/unit/server/models/test_structured_preferences.py``."""
+
+    def test_values_come_back_as_the_check_spells_them(self):
+        current = {"investment_preference": {"horizon": "long_term"}}
+        values = {"risk_preference": {"risk_level": " Growth "}, "agent_preference": {"output_format": "HTML"}}
+        assert io.check_preferences({**values, **current}, current) == {
+            "risk_preference": {"risk_level": "growth"},
+            "investment_preference": {"horizon": "long_term"},
+            "agent_preference": {"output_format": "html"},
+        }
+
+    def test_every_problem_is_named_in_one_refusal(self):
+        values = {
+            "risk_preference": {"risk_level": "yolo"},
+            "investment_preference": {"investor_type": "trader", "horizon": 5},
+            "agent_preference": {"output_format": "pdf"},
+        }
+        with pytest.raises(UserDataValidationError) as exc:
+            io.check_preferences(values, None)
+        assert exc.value.error_type == "schema_error"
+        assert exc.value.field_path == "risk_preference.risk_level"
+        assert [path for path, _ in exc.value.problems] == [
+            "risk_preference.risk_level",
+            "investment_preference.investor_type",
+            "investment_preference.horizon",
+            "agent_preference.output_format",
+        ]
+        assert "individual, professional, student" in exc.value.message
+
+
 class TestContentHashVersion:
     """__version__ derives from agent-visible content, not updated_at.
 

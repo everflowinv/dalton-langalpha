@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from src.server.contracts.status import TERMINAL_STATUSES
+from src.server.contracts.turn_kinds import NOTIFICATION_QUERY_TYPES
 from src.server.database.provenance import provenance_row_to_event
 from src.server.services.history.replay import facts as replay_facts
 from src.server.services.history.replay import legacy
@@ -31,8 +32,9 @@ def _user_message_item(
         "metadata": query.get("metadata"),
     }
     # Turns nobody typed: a system notification, or the wake a market
-    # target's notice started. The client draws them apart from user bubbles.
-    if query.get("type") in ("system", "market_target"):
+    # target's notice or a wakeup started. The client draws them apart from
+    # user bubbles.
+    if query.get("type") in NOTIFICATION_QUERY_TYPES:
         payload["query_type"] = query["type"]
     if query.get("type") == "system":
         # A report-back's row is drawn from its query, and a live attach draws

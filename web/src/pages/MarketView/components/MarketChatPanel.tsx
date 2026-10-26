@@ -24,6 +24,7 @@ import { computerFolders } from '../../ChatAgent/utils/agentPaths';
 import { useChatMessages } from '../../ChatAgent/hooks/useChatMessages';
 import { useThreadModel } from '../../ChatAgent/hooks/useThreadModel';
 import { useThreadSubagents } from '../../ChatAgent/hooks/useThreadSubagents';
+import { useThreadTuning } from '../../ChatAgent/hooks/useThreadTuning';
 import { ThreadNotices } from '../../ChatAgent/components/chatView/ThreadNotices';
 import { DispatchStatusProvider } from '../../ChatAgent/hooks/usePTCDispatchStatus';
 import { useStreamFollow } from '../../ChatAgent/components/chatView/streamFollow';
@@ -386,6 +387,7 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
       : 'market_view';
   }, [symbol]);
 
+  const readComposerOptions = useCallback(() => chatInputRef.current?.getModelOptions?.(), []);
   const chat = useChatMessages(
     activeWorkspaceId,
     initialThreadId,
@@ -397,6 +399,7 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
     null,                       // clearSubagentCards
     null,                       // onWorkspaceCreated
     platformValue,
+    readComposerOptions,
   );
 
   const {
@@ -455,6 +458,8 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
   const threadModel = useThreadModel({ threadId, isLoading });
   const threadSubagents = useThreadSubagents({ threadId });
   const { toSend: subagentsToSend } = threadSubagents;
+  const threadTuning = useThreadTuning({ threadId });
+  const { toSend: tuningToSend } = threadTuning;
 
   // Subagent telemetry resolver — feeds ActivityBlock's live token counts.
   // MarketView has no floating cards layer, so we resolve through history only.
@@ -565,11 +570,12 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
         ...modelOptions,
         ...(selectionSnapshots.length > 0 ? { chartSelections: selectionSnapshots } : {}),
         subagentsAllowed: subagentsToSend,
+        ...tuningToSend,
       });
       onClearChartImage();
       chartSelectionStore.clearAll();
     },
-    [symbol, interval, chartImage, chartImageDesc, handleSendMessage, onClearChartImage, subagentsToSend],
+    [symbol, interval, chartImage, chartImageDesc, handleSendMessage, onClearChartImage, subagentsToSend, tuningToSend],
   );
 
   // Stop the running turn (the input's Stop button). Mirrors ChatView: the hook's
@@ -967,6 +973,9 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
         onPickModel={threadModel.pickModel}
         subagentsAllowed={threadSubagents.allowed}
         onToggleSubagents={threadSubagents.setAllowed}
+        tuning={threadTuning.tuning}
+        onPickReasoningEffort={threadTuning.setReasoningEffort}
+        onPickFastMode={threadTuning.setFastMode}
         emptyWorkspacesHint={emptyWorkspacesHint}
         workspaces={workspaces}
         selectedWorkspaceId={selectedWorkspaceId}

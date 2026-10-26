@@ -23,6 +23,7 @@ from ptc_agent.agent.backends.langgraph_store import (
     ReadOnlyStoreError,
     StoreBackend,
     StoreContentTooLargeError,
+    store_label,
 )
 from ptc_agent.agent.backends.results import EditTextResult
 from ptc_agent.agent.backends.sandbox import SandboxBackend
@@ -60,7 +61,7 @@ class MalformedWorkflowError(ValueError):
 
 def workflow_namespace(user_id: str) -> tuple[str, ...]:
     """Store namespace holding one user's saved workflow scripts."""
-    return (user_id, _WORKFLOW_TIER)
+    return (store_label(user_id), _WORKFLOW_TIER)
 
 
 def workflow_key(name: str) -> str:

@@ -2,18 +2,20 @@ import React from 'react';
 import { motion } from '@/lib/framer';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import { NotificationDivider } from './messageList/NotificationDivider';
-import { MarketAlertRow } from './messageList/MarketAlertRow';
+import { WakeupRow } from './messageList/WakeupRow';
+import { QuietChecksRow } from './messageList/QuietChecksRow';
 import { MessageBubble } from './messageList/MessageBubble';
 import { TurnFold } from './messageList/TurnFold';
 import { projectMessageContent, visibleProjection } from './messageList/contentProjection';
 import { useMessageActions } from './messageList/MessageActionsContext';
 import { isReportRow, opensTurn } from './messageList/messagePredicates';
 import { UserBubble } from './messageList/UserBubble';
-import { computeTurnTails, hasTurn, projectTurns } from './messageList/turnProjection';
+import {
+  computeTurnTails, hasTurn, hiddenOpenerTurns, liveTurns, messageTimeMs, projectTurns,
+} from './messageList/turnProjection';
+import { planQuietChecks } from './messageList/quietChecks';
 import { useLiveMessages, type LiveMessages } from '../session/stream/liveMessages';
-import type { ChatMessage, MessageProvenance } from '@/types/chat';
-import type { MarketTarget } from '../utils/api';
-import type { MarketAlert } from '../session/marketWatchEvents';
+import type { ChatMessage, MessageProvenance, WakeupArrival } from '@/types/chat';
 import { turnFilesByTurn } from '../utils/turnFiles';
 import { useWorkspaceFolders } from '../contexts/WorkspaceContext';
 import type { FeedbackResult, FoldState, MessageRecord } from './messageList/types';
@@ -28,20 +30,6 @@ interface TurnFoldInfo {
   isLive: boolean;
   /** Nothing stands for the turn once folded, so it settles to `process`. */
   noAnswer: boolean;
-}
-
-/**
- * A bubble's time arrives as a Date from the chat session and as an ISO string
- * from the market-chat reducer. Reading only the Date dropped the clock for the
- * market transcript, and a turn with no start gets no fold at all, so the whole
- * panel silently kept the pre-fold layout.
- */
-function epochMs(value: unknown): number | undefined {
-  const ms = value instanceof Date ? value.getTime()
-    : typeof value === 'number' ? value
-      : typeof value === 'string' ? Date.parse(value)
-        : NaN;
-  return Number.isFinite(ms) ? ms : undefined;
 }
 
 /** The activity accordion's fold spring, so the two levels move alike. */
@@ -60,11 +48,12 @@ interface MessageListProps {
    *  its turn, so a steering continuation shows the continued turn's rating. */
   feedbackByTurn?: Record<number, FeedbackResult>;
   dispatcherContext?: { threadId: string; workspaceId: string } | null;
-  /** The thread's market-watch targets, read by its price-alert rows. */
-  marketTargets?: readonly MarketTarget[] | null;
+  /** A first turn is about to land (the welcome flow's), so an empty list is
+   *  not an empty chat and draws no prompt to type. */
+  starting?: boolean;
 }
 
-function MessageList({ messages, isLoading, isLoadingHistory, isSubagentView, readOnly, allowFiles, feedbackByTurn, dispatcherContext, marketTargets }: MessageListProps): React.ReactElement | null {
+function MessageList({ messages, isLoading, isLoadingHistory, isSubagentView, readOnly, allowFiles, feedbackByTurn, dispatcherContext, starting }: MessageListProps): React.ReactElement | null {
   const isMobile = useIsMobile();
   const { onOpenFile } = useMessageActions();
   // The deck keeps the workspace's own notes file out on every surface; its
@@ -95,6 +84,8 @@ function MessageList({ messages, isLoading, isLoadingHistory, isSubagentView, re
   // The bubbles of the server's turns. A send it never stored is painted
   // like any other but has no turn to time, fold, rate or list files under.
   const turned = React.useMemo(() => projected.filter(hasTurn), [projected]);
+  // A turn that opened hidden has no message a regenerate could run again.
+  const hiddenTurns = React.useMemo(() => hiddenOpenerTurns(turned), [turned]);
   // Retry re-runs the thread's latest attempt and replaces everything from
   // its reply on, so only a reply nothing was sent after offers it.
   const latestReplyId = React.useMemo(() => {
@@ -124,6 +115,11 @@ function MessageList({ messages, isLoading, isLoadingHistory, isSubagentView, re
     }
     return newest;
   }, [turned]);
+
+  const live = React.useMemo(
+    () => liveTurns(turned, newestTurn, !!isLoading, (message) => projectMessageContent(message, isSubagentView).hasPinnedLive),
+    [turned, newestTurn, isLoading, isSubagentView],
+  );
 
   // Both display preferences fold finished turns; only live reasoning differs.
   const turnFolds = React.useMemo(() => {
@@ -159,7 +155,7 @@ function MessageList({ messages, isLoading, isLoadingHistory, isSubagentView, re
         if (!opensTurn(message)) continue;
         // Of two openers on one count the later is the turn's: the row and
         // the clock start over there.
-        const ts = epochMs(message.timestamp);
+        const ts = messageTimeMs(message.timestamp);
         if (ts !== undefined) startedAt.set(turnIndex, ts);
         else startedAt.delete(turnIndex);
         rowPos.delete(turnIndex);
@@ -170,7 +166,7 @@ function MessageList({ messages, isLoading, isLoadingHistory, isSubagentView, re
       if (role !== 'assistant') continue;
       if (!rowPos.has(turnIndex)) rowPos.set(turnIndex, i);
       if (!firstReplyAt.has(turnIndex)) {
-        const ts = epochMs(message.timestamp);
+        const ts = messageTimeMs(message.timestamp);
         if (ts !== undefined) firstReplyAt.set(turnIndex, ts);
       }
       const bubbles = assistantBubbles.get(turnIndex);
@@ -196,17 +192,13 @@ function MessageList({ messages, isLoading, isLoadingHistory, isSubagentView, re
       if (start === undefined || pos === undefined) continue;
       const contents = (assistantBubbles.get(turnIndex) ?? []).map((bubble) => projectMessageContent(bubble, isSubagentView));
       if (!contents.some((content) => content.hasProcess) && contents.reduce((sum, content) => sum + content.textCount, 0) < 2) continue;
-      // A background task outlives the stream that launched it, and the row
-      // it runs under is a process row: letting the turn settle here would
-      // collapse the only indicator that the work is still going.
-      const isLive = (!!isLoading && turnIndex === newestTurn) || !!message.isStreaming
-        || contents.some((content) => content.hasPinnedLive);
+      const isLive = live.has(turnIndex);
       // A pinned call outlives the stream that launched it, so the stream-close
       // stamp was taken before the turn's work was done and a fold reading it
       // counts backwards, from `Working for 2m` to `Worked for 5s`. The server's
       // own stamp still wins outright; this only sharpens the local fallback.
       const endStamp = endStamps.get(turnIndex) ?? message;
-      const observedEnd = epochMs(endStamp.completionObservedAt);
+      const observedEnd = messageTimeMs(endStamp.completionObservedAt);
       const localEnd = contents.reduce<number | undefined>(
         (end, content) => (content.pinnedSettledAt !== null && (end === undefined || content.pinnedSettledAt > end)
           ? content.pinnedSettledAt
@@ -218,16 +210,21 @@ function MessageList({ messages, isLoading, isLoadingHistory, isSubagentView, re
         noAnswer: !(contents.at(-1)?.lastTextKey || contents.some((content) => content.hasRetained) || hasFiles),
         rowPos: pos,
         startedAt: start,
-        completedAt: isLive ? undefined : epochMs(endStamp.completedAt) ?? localEnd,
+        completedAt: isLive ? undefined : messageTimeMs(endStamp.completedAt) ?? localEnd,
         isLive,
       });
     }
     return folds;
-  }, [visible, turned, turnTails, isLoading, newestTurn, isSubagentView, filesByTurn, onOpenFile, readOnly, allowFiles]);
+  }, [visible, turned, turnTails, live, isSubagentView, filesByTurn, onOpenFile, readOnly, allowFiles]);
+
+  const items = React.useMemo(
+    () => planQuietChecks(visible, turned, live, isSubagentView),
+    [visible, turned, live, isSubagentView],
+  );
 
   // Empty state - show when no messages exist (hidden in subagent view)
   if (messages.length === 0) {
-    if (isSubagentView) return null;
+    if (isSubagentView || starting) return null;
     if (isLoadingHistory) {
       return (
         <div className="space-y-6 py-4 animate-pulse">
@@ -273,11 +270,16 @@ function MessageList({ messages, isLoading, isLoadingHistory, isSubagentView, re
   // otherwise replace the gap below it.
   return (
     <div className={`font-content ${isMobile ? 'sibling-space-y-4' : 'sibling-space-y-6'}`}>
-      {visible.map(({ message, turnIndex }, i) => {
+      {items.map((item) => {
+        if (item.kind === 'quiet') {
+          return <QuietChecksRow key={`quiet-checks-${item.checks[0].turnIndex}`} checks={item.checks} />;
+        }
+        const i = item.index;
+        const { message, turnIndex } = visible[i];
         if ((message.role as string) === 'notification') {
-          const marketAlert = message.marketAlert as MarketAlert | undefined;
-          return marketAlert
-            ? <MarketAlertRow key={message.id as string} alert={marketAlert} targets={marketTargets} />
+          const wakeup = message.wakeup as WakeupArrival | undefined;
+          return wakeup
+            ? <WakeupRow key={message.id as string} wakeup={wakeup} />
             : <NotificationDivider key={message.id as string} message={message} />;
         }
         if (isReportRow(message)) {
@@ -311,6 +313,7 @@ function MessageList({ messages, isLoading, isLoadingHistory, isSubagentView, re
           contentProjection: projectMessageContent(message, isSubagentView),
           turnIndex,
           isTurnTail: turnTails[i],
+          canRegenerate: turnIndex === null || !hiddenTurns.has(turnIndex),
           isLatestReply: message.id === latestReplyId,
           // The fold already decided whether this turn is working, and that
           // decision now includes a background task outliving its stream.
@@ -320,7 +323,7 @@ function MessageList({ messages, isLoading, isLoadingHistory, isSubagentView, re
           // over results the running task can still change.
           isTurnLive: info
             ? info.isLive
-            : (!!isLoading && turnIndex === newestTurn) || !!message.isStreaming,
+            : (turnIndex !== null && live.has(turnIndex)) || !!message.isStreaming,
           turnFiles: turnTails[i] && turnIndex !== null ? filesByTurn.get(turnIndex) : undefined,
           feedback: turnIndex === null ? null : feedbackByTurn?.[turnIndex] ?? null,
           isLoading,

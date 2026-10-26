@@ -33,6 +33,7 @@ from ptc_agent.agent.transcript import (
     load_manifest,
 )
 from ptc_agent.agent.transcript import identity
+from ptc_agent.agent.transcript.render import split_runs
 from tests.unit.middleware.compaction.window_harness import NOTES_DIR, THREAD
 
 INDEX_LIMIT = identity._INDEX_LIMIT
@@ -57,6 +58,23 @@ def _run(n: int, *, calls: int = 1, write_to: str | None = None) -> list:
 
 def _thread(runs: int, first: int = 1) -> list:
     return [m for n in range(first, first + runs) for m in _run(n)]
+
+
+def _parallel(n: int, calls: int = 3) -> list:
+    """Run ``n``, answering ``calls`` tool calls made at once."""
+    ids = [f"c-{n}-{k}" for k in range(calls)]
+    return [
+        HumanMessage(f"Question {n}", id=f"h-{n}"),
+        AIMessage("", id=f"ai-{n}", tool_calls=[{"name": "Read", "id": i, "args": {}} for i in ids]),
+        *(ToolMessage(f"read {i}", tool_call_id=i, id=f"t-{i}") for i in ids),
+        AIMessage(f"Answer {n}", id=f"ai-{n}-end"),
+    ]
+
+
+def _answers_reversed(messages: list) -> list:
+    """``messages`` with each run's batch of answers in reverse, as a saver
+    that replays a step's writes in another order loads them."""
+    return [m for run in split_runs(messages) for m in [*run[:2], *run[-2:1:-1], run[-1]]]
 
 
 def _event(messages: list, anchor_id: str | None) -> dict:
@@ -154,6 +172,44 @@ def test_the_head_is_its_messages_in_order_whatever_their_ids() -> None:
     assert not head.holds([*messages[:-2], messages[-1], messages[-2]])
     edited = [*messages[:-1], AIMessage("Answer 2, edited", id="ai-2-end")]
     assert not head.holds(edited)
+
+
+def test_the_answers_to_calls_made_at_once_hold_in_any_order() -> None:
+    """Each answer is its own task's write, and the order a load replays a
+    step's writes in is the saver's: checkpoint-postgres 3.2 replays them as
+    they were applied, where 3.1 replayed them by task id."""
+    messages = [*_parallel(1), *_parallel(2)]
+    head = Window().extend(messages)
+    assert head.holds(_answers_reversed(messages))
+    call, answer = messages[1], messages[2]
+    assert not head.holds([messages[0], answer, call, *messages[3:]])
+    # Only within one batch: the same answers split across turns differ.
+    crossed = [*messages[:4], messages[10], *messages[5:10], messages[4], *messages[11:]]
+    assert not head.holds(crossed)
+
+
+def test_a_window_hashed_in_load_order_is_rehashed_at_its_next_trim() -> None:
+    """A window trimmed before the digest took answers in call order holds
+    only in the order it was hashed in, which slices cut again under a later
+    saver need not keep. Its next trim rehashes it from the slices, whichever
+    order they hold, and checks in full only the messages it adds."""
+    loaded = [*_parallel(1), *_parallel(2), *_parallel(3)]
+    stored = _answers_reversed(loaded)
+    first, second = len(_parallel(1)), 2 * len(_parallel(1))
+    old = Window(version=1).extend(stored[:first])
+    kept = {k: v for k, v in old.update()["_window"].items() if k != "version"}
+    assert Window.of({"_window": kept}) == old
+    assert old.holds(stored[:first]) and not old.holds(loaded[:first])
+
+    head = old.extend_held(loaded[first:second], stored[:second])
+    assert head == Window().extend(loaded[:second])
+    assert head.version == identity.DIGEST_VERSION and Window.of(head.update()) == head
+    assert old.extend_held(loaded[first:second], loaded[:second]) == head
+    # What it adds is checked in full where the window's count puts it, so
+    # an edit fails, and so do slices holding a message fewer before it.
+    edited = loaded[second - 1].model_copy(update={"content": "Answer 2, edited"})
+    assert old.extend_held([*loaded[first : second - 1], edited], loaded[:second]) is None
+    assert old.extend_held(loaded[first:second], loaded[1 : second + 1]) is None
 
 
 def test_the_earlier_index_keeps_only_what_a_summary_lists() -> None:
@@ -316,14 +372,15 @@ def _summarized(runs: int = 4) -> dict:
 def test_covered_runs_are_trimmed() -> None:
     asked = []
 
-    async def coverage(head):
-        asked.append(head)
-        return True
+    async def coverage(window, trimmed):
+        asked.append((window, trimmed))
+        return window.extend(trimmed)
 
     state = _summarized()
     update = asyncio.run(_middleware(coverage)._trim(state))
-    head = Window().extend(state["messages"][: _index(state["messages"], "h-3")])
-    assert asked == [head] and head.runs == 2
+    trimmed = state["messages"][: _index(state["messages"], "h-3")]
+    head = Window().extend(trimmed)
+    assert asked == [(Window(), trimmed)] and head.runs == 2
     assert update is not None and Window.of(update) == head
 
 
@@ -333,15 +390,18 @@ def test_a_refusal_is_kept_until_a_summary_moves_the_cut() -> None:
     answers = [False, True]
     asked = []
 
-    async def coverage(head):
+    async def coverage(window, trimmed):
+        head = window.extend(trimmed)
         asked.append(head.runs)
-        return answers.pop(0)
+        return head if answers.pop(0) else None
 
     middleware = _middleware(coverage)
     state = _summarized()
     refused = asyncio.run(middleware._trim(state))
     cut = _index(state["messages"], "h-3")
-    assert refused == {"_window_refused": {"anchor": "t-3-0", "cut": cut}}
+    assert refused == {
+        "_window_refused": {"anchor": "t-3-0", "cut": cut, "digest": identity.DIGEST_VERSION}
+    }
     state = {**state, **refused}
     assert asyncio.run(middleware._trim(state)) is None
     assert asked == [2]
@@ -353,9 +413,25 @@ def test_a_refusal_is_kept_until_a_summary_moves_the_cut() -> None:
     assert update is not None and Window.of(update).runs == 3
 
 
-@pytest.mark.parametrize("answer", [False, RuntimeError("db down"), "slow"])
+def test_a_refusal_under_an_older_digest_is_asked_again() -> None:
+    """A thread refused while answers were hashed in load order may hold under
+    call order, so its refusal does not wait for the next summary."""
+    asked = []
+
+    async def coverage(window, trimmed):
+        asked.append(window)
+        return window.extend(trimmed)
+
+    state = _summarized()
+    cut = _index(state["messages"], "h-3")
+    state = {**state, "_window_refused": {"anchor": "t-3-0", "cut": cut}}
+    update = asyncio.run(_middleware(coverage)._trim(state))
+    assert asked == [Window()] and update is not None and Window.of(update).runs == 2
+
+
+@pytest.mark.parametrize("answer", [None, RuntimeError("db down"), "slow"])
 def test_nothing_is_trimmed_the_server_does_not_confirm(answer) -> None:
-    async def coverage(runs):
+    async def coverage(window, trimmed):
         if answer == "slow":
             await asyncio.sleep(1)
         if isinstance(answer, Exception):
@@ -365,7 +441,7 @@ def test_nothing_is_trimmed_the_server_does_not_confirm(answer) -> None:
     with patch.object(middleware_module, "_COVERAGE_TIMEOUT_S", 0.01):
         update = asyncio.run(_middleware(coverage)._trim(_summarized()))
     # Only an answer is kept as a refusal; a failed or slow check asks again.
-    if answer is False:
+    if answer is None:
         assert set(update) == {"_window_refused"}
     else:
         assert update is None

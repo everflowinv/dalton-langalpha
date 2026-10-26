@@ -3,7 +3,6 @@
 import subprocess
 import sys
 from types import SimpleNamespace
-# DALTON-HOOK(glob-brace-expansion): use create_autospec for PTCSandbox test double
 from unittest.mock import create_autospec
 
 import pytest
@@ -27,7 +26,6 @@ def _sandbox() -> SimpleNamespace:
     async def _call(fn, *args, retry_policy=None, **kwargs):
         return await fn(*args, **kwargs)
 
-    # DALTON-HOOK(glob-brace-expansion): replace bare AsyncMock with create_autospec(PTCSandbox, instance=True)
     return SimpleNamespace(
         _wait_ready=create_autospec(PTCSandbox, instance=True)._wait_ready,
         config=SimpleNamespace(
@@ -139,7 +137,6 @@ async def test_a_link_reaching_the_mount_another_way_is_still_the_mount(
     assert found == [str(workspace / "data" / "a.csv")]
 
 
-# DALTON-HOOK(glob-brace-expansion): unit tests for brace expansion, nesting, commas, dedup, and mtime sort
 def test_expand_braces_nested_and_commas():
     from ptc_agent.core.sandbox.glob_runtime import expand_braces
 
@@ -224,7 +221,10 @@ async def test_glob_brace_expansion_deduplicates_and_preserves_mtime_sort(tmp_pa
     ],
 )
 async def test_glob_sandbox_and_diskglob_parity(tmp_path, pattern):
+    # Upstream expands braces at the caller (composite.py) and hands each
+    # expanded pattern its own DiskGlob; mirror that here.
     from ptc_agent.agent.backends.search_match import DiskGlob
+    from ptc_agent.core.sandbox.glob_runtime import expand_braces
 
     files = [
         tmp_path / "root.json",
@@ -244,8 +244,8 @@ async def test_glob_sandbox_and_diskglob_parity(tmp_path, pattern):
         f.write_text("{}")
 
     sandbox_found = set(await aglob_files(_sandbox(), pattern, str(tmp_path)))
-    dg = DiskGlob(pattern, str(tmp_path))
-    diskglob_found = {str(f) for f in files if dg.finds(str(f))}
+    wanted = [DiskGlob(each, str(tmp_path)) for each in expand_braces(pattern)]
+    diskglob_found = {str(f) for f in files if any(w.finds(str(f)) for w in wanted)}
 
     assert sandbox_found == diskglob_found
 

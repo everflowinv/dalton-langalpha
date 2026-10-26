@@ -2,9 +2,10 @@
 PriceMonitorService — Monitors prices via MarketDataFeed
 and triggers price-based automations when conditions are met.
 
-Also watches the price targets threads set on their market watch: a hit is
-claimed in the database, which is the only dedup a target has, and the claim
-enqueues the alert for the outbox to deliver.
+Also watches the price targets threads set on their market watch, and the
+price wakeups agents set: a hit is claimed in the database, which is the only
+dedup either has, and the claim enqueues the notice for the outbox to
+deliver. Both are held as target rows; a wakeup's is marked by its source.
 
 Supports stock and index markets. Uses Redis SET NX locks for
 multi-instance deduplication of automations. Falls back to REST snapshot
@@ -131,6 +132,42 @@ def _targets_by_listing(rows: List[Dict[str, Any]]) -> Dict[Listing, List[Dict[s
         row["_created_ms"] = int(row["created_at"].timestamp() * 1000)
         by_listing.setdefault(listing, []).append(row)
     return by_listing
+
+
+# A price wakeup in the monitor is a target row with its own claim, so every
+# path that reads targets (evaluation, drops, the scoped reload) reads it too.
+_WAKEUP_SOURCE = "wakeup"
+
+
+def _wakeup_as_target(row: Dict[str, Any]) -> Dict[str, Any]:
+    """An armed price wakeup in the shape the monitor holds a target in."""
+    return {
+        "target_id": row["wakeup_id"],
+        "_source": _WAKEUP_SOURCE,
+        "conversation_thread_id": row["conversation_thread_id"],
+        "symbol": row["symbol"],
+        "market": row.get("market") or MarketType.STOCK.value,
+        "kind": row.get("price_kind"),
+        "value": row.get("price_value"),
+        "pct_from": row.get("pct_from"),
+        "armed_price": row.get("armed_price"),
+        "expires_at": row["expires_at"],
+        "created_at": row["created_at"],
+    }
+
+
+async def _armed_rows(thread_ids: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    """Armed targets and price wakeups, of every thread or of *thread_ids*."""
+    from src.server.database import market_targets as targets_db
+    from src.server.database.wakeups import read as wakeups_read
+
+    if thread_ids is None:
+        targets = await targets_db.list_armed_targets()
+        wakeups = await wakeups_read.list_armed_price_wakeups()
+    else:
+        targets = await targets_db.list_armed_targets(thread_ids=thread_ids)
+        wakeups = await wakeups_read.list_armed_price_wakeups(thread_ids)
+    return [*targets, *(_wakeup_as_target(row) for row in wakeups)]
 
 
 def _thread_key(value: Any) -> Optional[str]:
@@ -330,6 +367,25 @@ def _pct_crossed(
     return pct_change <= -value if inclusive else pct_change < -value
 
 
+def target_hit(kind: Any, value: float, ref_price: float, price: float) -> bool:
+    """Whether a target of ``kind`` at ``value`` is hit at ``price``.
+
+    A target's kind is an automation condition under another name, but a
+    touch hits it where an automation needs a cross: the tool promises an
+    alert when the price reaches the level and refuses to set one the last
+    price already sits on, so a print exactly on it is the hit. ``ref_price``
+    is the base a % kind measures from; no base (0) never hits.
+    """
+    condition_type = _TARGET_CONDITIONS.get(kind)
+    if condition_type is None:
+        return False
+    if condition_type == PriceConditionType.PRICE_ABOVE:
+        return price >= value
+    if condition_type == PriceConditionType.PRICE_BELOW:
+        return price <= value
+    return _pct_crossed(condition_type, value, ref_price, price, inclusive=True)
+
+
 class ConditionEvaluator:
     """Evaluates price conditions against current prices."""
 
@@ -375,30 +431,18 @@ class ConditionEvaluator:
     def evaluate_target(
         self, target: Dict[str, Any], current_price: float, listing: Listing
     ) -> bool:
-        """Whether a market-watch target is hit at *current_price*.
-
-        A target's kind is an automation condition under another name, but a
-        touch hits it where an automation needs a cross: the tool promises an
-        alert when the price reaches the level and refuses to arm one the
-        last price already sits on, so a print exactly on it is the hit. A %
-        target set ``pct_from='armed'`` measures from the price the target
-        was set at, not from the previous close.
+        """Whether a market-watch target is hit at *current_price*, by
+        `target_hit`. A % target set ``pct_from='armed'`` measures from the
+        price the target was set at, not from the previous close.
         """
-        condition_type = _TARGET_CONDITIONS.get(target.get("kind"))
         value = _positive(target.get("value"))
-        if condition_type is None or value is None:
+        if value is None:
             return False
-        if condition_type == PriceConditionType.PRICE_ABOVE:
-            return current_price >= value
-        if condition_type == PriceConditionType.PRICE_BELOW:
-            return current_price <= value
         if target.get("pct_from") == "armed":
             ref_price = _positive(target.get("armed_price")) or 0.0
         else:
             ref_price = self._reference_prices.get(listing, {}).get("previous_close", 0.0)
-        return _pct_crossed(
-            condition_type, value, ref_price, current_price, inclusive=True
-        )
+        return target_hit(target.get("kind"), value, ref_price, current_price)
 
     async def refresh_references(self, listings: Collection[Listing]) -> None:
         """Fetch reference prices (previous_close, day_open) via REST snapshots."""
@@ -783,14 +827,12 @@ class PriceMonitorService:
     async def _fire_targets(
         self, targets: List[Dict[str, Any]], price: float, printed_at: Optional[float]
     ) -> None:
-        """Claim the hits one price made, in one transaction: the feed waits
-        on this, and a price crossing several targets would otherwise cost a
-        round trip each. Every worker's monitor sees the same tick, and the
-        guarded UPDATE in fire_targets is what lets exactly one of them win
-        each target; the winner's transaction also enqueues the alert."""
-        from src.server.database import market_targets as targets_db
-
-        target_ids = [target["target_id"] for target in targets]
+        """Claim the hits one price made, in one transaction per source: the
+        feed waits on this, and a price crossing several targets would
+        otherwise cost a round trip each. Every worker's monitor sees the
+        same tick, and the guarded UPDATE in each claim is what lets exactly
+        one of them win each target; the winner's transaction also enqueues
+        the notice."""
         # Off this worker's books whatever the claim returns: a lost race, or
         # a claim that failed, would otherwise query on every tick until a
         # load restores a target that is still armed.
@@ -802,6 +844,46 @@ class PriceMonitorService:
             datetime.fromtimestamp(printed_at / 1000, tz=timezone.utc)
             if printed_at is not None else None
         )
+        wakeups = [t for t in targets if t.get("_source") == _WAKEUP_SOURCE]
+        legacy = [t for t in targets if t.get("_source") != _WAKEUP_SOURCE]
+        if legacy:
+            await self._claim_targets(legacy, price, traded_at)
+        if wakeups:
+            await self._claim_wakeups(wakeups, price, traded_at)
+
+    async def _claim_wakeups(
+        self, targets: List[Dict[str, Any]], price: float, traded_at: Optional[datetime]
+    ) -> None:
+        from src.server.database.wakeups import fire as wakeups_fire
+
+        wakeup_ids = [target["target_id"] for target in targets]
+        try:
+            rows = await wakeups_fire.fire_price_wakeups(
+                wakeup_ids, price, printed_at=traded_at
+            )
+        except Exception:
+            logger.error(
+                "[PriceMonitor] Failed to claim hits for price wakeups %s",
+                ", ".join(wakeup_ids), exc_info=True,
+            )
+            for thread_id in {target["conversation_thread_id"] for target in targets}:
+                self.request_targets_reload(thread_id)
+            return
+        for row in rows:
+            logger.info(
+                "[PriceMonitor] Wakeup %s hit: %s %s %s price=%.4f thread=%s",
+                row.get("wakeup_id"), row.get("symbol"), row.get("price_kind"),
+                row.get("price_value"), price, row.get("conversation_thread_id"),
+            )
+        if rows:
+            _nudge_hook_drainer()
+
+    async def _claim_targets(
+        self, targets: List[Dict[str, Any]], price: float, traded_at: Optional[datetime]
+    ) -> None:
+        from src.server.database import market_targets as targets_db
+
+        target_ids = [target["target_id"] for target in targets]
         try:
             rows = await targets_db.fire_targets(target_ids, price, printed_at=traded_at)
         except Exception:
@@ -1010,18 +1092,17 @@ class PriceMonitorService:
             await self._resubscribe(set(new_symbol_map), self._target_listings)
 
     async def _load_targets(self, thread_ids: Optional[Collection[str]] = None) -> None:
-        """Load armed market-watch targets and update symbol subscriptions.
+        """Load armed market-watch targets and price wakeups and update
+        symbol subscriptions.
 
         With *thread_ids*, only those threads' targets are re-read and
         replaced, and every other thread's stay as this worker holds them: a
         change nudge names the thread it touched, and re-reading every armed
         target in every worker on each one is what that saves.
         """
-        from src.server.database import market_targets as targets_db
-
         async with self._load_lock:
             if thread_ids is None:
-                new_symbol_map = _targets_by_listing(await targets_db.list_armed_targets())
+                new_symbol_map = _targets_by_listing(await _armed_rows())
                 await self._resubscribe(self._automation_listings, set(new_symbol_map))
                 self._symbol_targets = new_symbol_map
                 self._target_listings = set(new_symbol_map)
@@ -1030,9 +1111,7 @@ class PriceMonitorService:
             scope = set(thread_ids)
             if not scope:
                 return
-            fresh = _targets_by_listing(
-                await targets_db.list_armed_targets(thread_ids=sorted(scope))
-            )
+            fresh = _targets_by_listing(await _armed_rows(sorted(scope)))
             listings = set(self._merge_thread_targets(scope, fresh))
             await self._resubscribe(self._automation_listings, listings)
             # Merged from the map as it stands now: a target a claim dropped

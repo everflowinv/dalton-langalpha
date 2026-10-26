@@ -88,6 +88,7 @@ from .request_prep import (
     turn_surface,
     user_skill_commands,
 )
+from src.server.contracts.turn_kinds import announced
 from src.server.services import automation_delivery
 from src.server.services.credit_gate_port import build_run_credit_gate
 from src.server.services.report_back.handoff import carry
@@ -649,6 +650,7 @@ async def astream_ptc_workflow(
             direct_tools_for_turn,
         )
         from src.server.services.trading_rule import with_trading_rule
+        from src.server.services.wakeups.cancel_notice import ThreadCancelNotices
 
         # Resolved once and used three times: the agent build mounts the
         # workspace's memory off it, the post-turn reconcile materialises that
@@ -705,6 +707,7 @@ async def astream_ptc_workflow(
             # worker, so the agent re-reads the row on every call.
             subagent_switch=partial(read_thread_subagents_allowed, thread_id),
             window_coverage=partial(runs_held, thread_id),
+            cancel_notices=ThreadCancelNotices(thread_id, turn_context.tool_timezone),
         )
 
         _mark_phase("graph_build")
@@ -876,9 +879,8 @@ async def astream_ptc_workflow(
             token_callback=token_callback,
             tool_tracker=tool_tracker,
             agent_config=config,
-            report_source=query_metadata.get("report_source"),
             turn_index=run_handle.turn_index,
-            market_target=query_metadata.get("market_target"),
+            announced=announced(query_metadata),
         )
 
         # =====================================================================

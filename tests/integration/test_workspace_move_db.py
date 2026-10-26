@@ -7,6 +7,7 @@ the database rather than string-matched mocks.
 """
 
 import asyncio
+import json
 import uuid
 from typing import Optional
 
@@ -600,6 +601,31 @@ async def test_home_binds_only_to_a_computer_still_primary(seed_user, test_db_po
         home, second, expected_computer_id=None, dir_name=HOME_FOLDER, primary_only=True
     )
     assert str(bound["computer_id"]) == second
+
+
+async def test_a_bind_to_another_computer_drops_the_folder_backoff(seed_user, test_db_pool):
+    """The backoff is for the full disk of the computer it was recorded on;
+    kept, it would hold the folder off its name on a computer with room."""
+    user_id = seed_user["user_id"]
+    primary, second = await _machines(user_id)
+    workspace_id = await _workspace(user_id, "Research", primary)
+    blocked = {"target": "Macro", "until": 9e9}
+    await _execute(
+        test_db_pool,
+        "UPDATE workspaces SET config = jsonb_set(COALESCE(config, '{}'::jsonb),"
+        " '{folder_move_blocked}', %s::jsonb) WHERE workspace_id = %s",
+        (json.dumps(blocked), workspace_id),
+    )
+
+    again = await workspaces.bind_workspace_to_computer(
+        workspace_id, primary, expected_computer_id=primary
+    )
+    assert again["config"]["folder_move_blocked"] == blocked
+
+    moved = await workspaces.bind_workspace_to_computer(
+        workspace_id, second, expected_computer_id=primary, dir_name="Research"
+    )
+    assert "folder_move_blocked" not in moved["config"]
 
 
 # ---------------------------------------------------------------------------

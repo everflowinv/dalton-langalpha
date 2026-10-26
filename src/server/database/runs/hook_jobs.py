@@ -8,7 +8,7 @@ makes it testable as data.
 """
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, NotRequired, Optional, TypedDict
+from typing import Any, Callable, Dict, List, Mapping, NotRequired, Optional, TypedDict
 
 from src.server.contracts.status import to_public
 from src.server.services.report_back.handoff.keys import ORIGIN_THREAD_META
@@ -69,6 +69,22 @@ class UserFeedPayload(TypedDict):
     run_seq: Optional[int]
     status: str  # PUBLIC vocabulary (to_public of the CAS-adopted status)
     interrupt_reason: Optional[str]
+    # Where the thread's seen pointer stands after this settle carried it,
+    # over a wakeup's check that ended quietly with nothing changed. Absent
+    # when the settle left it.
+    last_seen_run_seq: NotRequired[int]
+
+
+#: Run metadata key for how a wake turn ended quietly: {"changed"}.
+WAKEUP_QUIET_META = "wakeup_quiet"
+
+
+def is_unchanged_quiet(meta: Mapping[str, Any]) -> bool:
+    """Whether the run was a wakeup's check that ended quietly and set or
+    cancelled nothing: news to nobody, so it leaves the thread as seen as it
+    was. A check that changed the plan is shown like any turn."""
+    quiet = meta.get(WAKEUP_QUIET_META)
+    return isinstance(quiet, dict) and quiet.get("changed") is False
 
 
 def build_finalize_jobs(
@@ -86,6 +102,7 @@ def build_finalize_jobs(
     automation_execution_id: Optional[str] = None,
     automation_id: Optional[str] = None,
     superseded: bool = False,
+    last_seen_run_seq: Optional[int] = None,
 ) -> Callable[[str], List[HookJob]]:
     """The one decision table mapping a run's final status to its hook jobs.
 
@@ -115,23 +132,24 @@ def build_finalize_jobs(
             # report_back CTE in outbox.py): the event is latency, not truth
             # — the feed endpoint re-reads DB truth on a 30s cadence inside
             # every live connection, which outruns any outbox revival path.
+            feed = UserFeedPayload(
+                user_id=user_id,
+                thread_id=thread_id,
+                workspace_id=workspace_id,
+                run_id=run_id,
+                run_seq=run_seq,
+                status=to_public(final_status),
+                interrupt_reason=(
+                    interrupt_reason if final_status == "interrupted" else None
+                ),
+            )
+            if last_seen_run_seq is not None:
+                feed["last_seen_run_seq"] = last_seen_run_seq
             jobs.append(
                 HookJob(
                     hook_type="user_feed",
                     idempotency_key=f"{run_id}:user_feed",
-                    payload=UserFeedPayload(
-                        user_id=user_id,
-                        thread_id=thread_id,
-                        workspace_id=workspace_id,
-                        run_id=run_id,
-                        run_seq=run_seq,
-                        status=to_public(final_status),
-                        interrupt_reason=(
-                            interrupt_reason
-                            if final_status == "interrupted"
-                            else None
-                        ),
-                    ),
+                    payload=feed,
                 )
             )
 
@@ -216,10 +234,13 @@ def build_finalize_jobs(
 
 def build_finalize_jobs_from_run_row(
     run: Dict[str, Any],
+    *,
+    last_seen_run_seq: Optional[int] = None,
 ) -> Callable[[str], List[HookJob]]:
     """Factory from the durable row alone: everything the decision table
     needs was stamped into run metadata at START. This is finalize_run's
-    DEFAULT — no finalize path can skip required terminal effects (I5)."""
+    DEFAULT: no finalize path can skip required terminal effects (I5).
+    ``last_seen_run_seq`` is the seen pointer the finalize itself carried."""
     meta = run.get("metadata") or {}
     return build_finalize_jobs(
         run_id=str(run["conversation_response_id"]),
@@ -237,4 +258,5 @@ def build_finalize_jobs_from_run_row(
         automation_id=meta.get("automation_id"),
         # Stamped by the finalize itself, which the post-CAS row carries.
         superseded=bool(meta.get("superseded")),
+        last_seen_run_seq=last_seen_run_seq,
     )

@@ -27,9 +27,13 @@ from src.server.database.conversation import (
     lookup_thread_by_external_id,
     get_replay_thread_data,
 )
+from src.server.contracts.turn_kinds import ANNOUNCED_KEYS
 from src.server.database.pool import DATABASE_UNAVAILABLE
 from src.server.services.report_back.handoff.keys import ORIGIN_THREAD_META
-from src.server.dependencies.usage_limits import ChatRateLimited
+from src.server.dependencies.usage_limits import (
+    ChatRateLimited,
+    quota_service_unavailable,
+)
 
 from src.observability import (
     observe_background_chat_turn,
@@ -231,20 +235,19 @@ def _is_service_request(raw_request: Request | None) -> bool:
 
 
 # Fields only the server's own requests set. A user's copy would post a system
-# message, label their message as a report-back, forge a report-back watch's
-# cleanup, or settle a parked steer as its own turn; ``surface_rules`` is a
-# channel gateway's, whose text rides the operator role on providers with a
-# native channel.
+# message, label their message as a report-back or a wakeup (whose turn may end
+# without a reply), forge a report-back watch's cleanup, or settle a parked
+# steer as its own turn; ``surface_rules`` is a channel gateway's, whose text
+# rides the operator role on providers with a native channel.
 _SERVER_ONLY_FIELDS = (
     "query_type",
+    *ANNOUNCED_KEYS,
     "report_back_ptc_thread_id",
-    "report_source",
     ORIGIN_THREAD_META,
     "origin_dispatch_gen",
     "automation_delivery",
     "automation_earlier_runs",
     "disable_subagents",
-    "market_target",
     "surface_rules",
     "steer_job_id",
 )
@@ -407,8 +410,13 @@ async def _handle_send_message(
 
         # 403 guard: require BYOK, OAuth, or platform access (tier >= 0).
         # All flags are pre-checked by enforce_chat_limit — no DB calls here.
+        # A tier nobody could read is an outage, not a missing provider: telling
+        # a paying user to set one up sends them to the setup wizard for it.
         from src.config.settings import HOST_MODE
-        if HOST_MODE == "platform" and not auth.is_byok and not auth.has_oauth and auth.access_tier < 0:
+        needs_plan = HOST_MODE == "platform" and not auth.is_byok and not auth.has_oauth
+        if needs_plan and auth.access_tier is None:
+            raise quota_service_unavailable()
+        if needs_plan and auth.access_tier < 0:
             raise HTTPException(
                 status_code=403,
                 detail={
@@ -529,14 +537,25 @@ async def _handle_send_message(
             else None
         )
 
+        # Likewise a turn naming no effort or fast mode runs the thread's own,
+        # picked in its composer, and with none of those the user's Settings.
+        # A client sends what its composer shows, so the row decides only for
+        # a turn no composer started: a report-back, a resume after a reload.
+        reasoning_effort = getattr(request, "reasoning_effort", None) or (
+            thread_meta.get("reasoning_effort") if thread_meta else None
+        )
+        fast_mode = getattr(request, "fast_mode", None)
+        if fast_mode is None and thread_meta:
+            fast_mode = thread_meta.get("fast_mode")
+
         async def resolve(model: str | None):
             return await resolve_llm_config(
                 setup.agent_config,
                 user_id,
                 model,
                 is_byok,
-                reasoning_effort=getattr(request, "reasoning_effort", None),
-                fast_mode=getattr(request, "fast_mode", None),
+                reasoning_effort=reasoning_effort,
+                fast_mode=fast_mode,
                 thread_id=thread_id,
                 enabled_subagents=request.subagents_enabled,
                 workspace_id=workspace_id,
@@ -569,8 +588,9 @@ async def _handle_send_message(
         is_byok = config.credential_source in (CredentialSource.OAUTH, CredentialSource.BYOK)
 
         # Credit check: always ask, whoever's key this is. Which pools apply to
-        # an own-key turn is the quota service's call, not ours.
-        await enforce_credit_limit(user_id, byok=is_byok)
+        # an own-key turn is the quota service's call, not ours, and so is what
+        # the surface the turn came from means for it.
+        await enforce_credit_limit(user_id, byok=is_byok, surface=request.platform)
 
         # I6: Redis down at START = 503 before any durable row. Ordered after
         # the auth/authz/credit gates (their statuses are more meaningful and
@@ -1369,6 +1389,7 @@ async def retry_thread(
     from src.server.services.runs.pending_input import (
         input_rerun_request,
         read_pending_input,
+        retried_wake_fields,
     )
 
     scope = RunScope(user_id=auth.user_id, burst_slot_id=auth.burst_slot_id)
@@ -1457,6 +1478,7 @@ async def retry_thread(
                 llm_model=(body.llm_model if body else None),
                 reasoning_effort=(body.reasoning_effort if body else None),
                 fast_mode=(body.fast_mode if body else None),
+                **await retried_wake_fields(thread_id, latest["turn_index"]),
             )
     except BaseException:
         # ChatRateLimited acquired a burst slot at the dependency; every

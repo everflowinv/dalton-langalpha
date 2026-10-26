@@ -529,8 +529,11 @@ async def lifespan(app: FastAPI):
     from src.server.services.report_back import steer_executor, subagent
     from src.server.services.report_back.handoff import core as handoff_core
     from src.server.services import automation_settlement, thread_lifecycle_feed
+    from src.server.services.features import register_feature_off_hook
     from src.server.services.hook_outbox import HookOutboxDrainer
     from src.server.services.market_targets import delivery as market_target_delivery
+    from src.server.services.wakeups import cancel as wakeups_cancel
+    from src.server.services.wakeups import delivery as wakeup_delivery
 
     handoff_core.register_outbox_executors()
     subagent.register_outbox_executors()
@@ -538,6 +541,9 @@ async def lifespan(app: FastAPI):
     thread_lifecycle_feed.register_outbox_executors()
     automation_settlement.register_outbox_executors()
     market_target_delivery.register_outbox_executors()
+    wakeup_delivery.register_wakeup_executors()
+    # Turning wakeups off ends what the agent set, on every thread.
+    register_feature_off_hook("wakeups", wakeups_cancel.setting_off)
     try:
         HookOutboxDrainer.get_instance().start()
         logger.info("HookOutboxDrainer started")
@@ -612,6 +618,16 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Failed to start PriceMonitorService: {e}")
         logger.warning("Price-triggered automations will not run")
+
+    # Start WakeupSweeper (fires agents' timed wakeups). Every worker runs
+    # one: its fires are guarded claims, so none doubles another's.
+    try:
+        from src.server.services.wakeups.sweep import WakeupSweeper
+
+        await WakeupSweeper.get_instance().start()
+        logger.info("WakeupSweeper started")
+    except Exception as e:
+        logger.warning(f"Failed to start WakeupSweeper: {e}")
 
     # Start MarketInsightService (schedule-based market news gathering)
     try:
@@ -854,6 +870,13 @@ async def lifespan(app: FastAPI):
         await price_mon.stop()
     except Exception as e:
         logger.warning(f"Error shutting down PriceMonitorService: {e}")
+
+    try:
+        from src.server.services.wakeups.sweep import WakeupSweeper
+
+        await WakeupSweeper.get_instance().stop()
+    except Exception as e:
+        logger.warning(f"Error shutting down WakeupSweeper: {e}")
 
     # 1. Shutdown AutomationScheduler
     try:

@@ -11,12 +11,20 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import dataclass
+from unittest.mock import patch
 
 import pytest
-from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage
+from langchain_core.messages import (
+    AIMessage,
+    AnyMessage,
+    HumanMessage,
+    RemoveMessage,
+    ToolMessage,
+)
 from langgraph.checkpoint.memory import InMemorySaver
-from langgraph.graph import START, MessagesState, StateGraph
+from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
+from langgraph.types import Send
 from langsmith import tracing_context
 
 from ptc_agent.agent.state import DeltaAgentState
@@ -60,11 +68,15 @@ class Thread:
     def base(self) -> int:
         return self.run.held[-1][1]
 
+    def messages(self, runs: int) -> list[AnyMessage]:
+        """The messages of the thread's first ``runs`` runs."""
+        whole = h.whole_threads(self.run)[-1]
+        return [m for run in split_runs(whole)[:runs] for m in run]
+
     def head(self, runs: int) -> Window:
         """The thread's first ``runs`` runs, as a trim of them would leave
         its head."""
-        whole = h.whole_threads(self.run)[-1]
-        return Window().extend([m for run in split_runs(whole)[:runs] for m in run])
+        return Window().extend(self.messages(runs))
 
     async def trimmed(self) -> Window:
         """What the window left trimmed at the tip."""
@@ -159,16 +171,20 @@ async def test_coverage_holds_once_the_slices_are_stored(monkeypatch, threads) -
     _cache_probe(monkeypatch)
     store = SliceStore()
     _serve(monkeypatch, on, store)
-    assert await window_module.runs_held(h.THREAD, Window())
-    assert not await window_module.runs_held(h.THREAD, on.head(on.base))
+    assert await window_module.runs_held(h.THREAD, Window(), on.messages(on.base)) is None
     await _page(monkeypatch, on, store)
-    assert await window_module.runs_held(h.THREAD, on.head(on.base))
+    assert await window_module.runs_held(
+        h.THREAD, Window(), on.messages(on.base)
+    ) == on.head(on.base)
     whole = on.head(TURNS)
-    assert await window_module.runs_held(h.THREAD, whole)
-    beyond = Window(TURNS + 1, whole.messages + 1, whole.digest)
-    assert not await window_module.runs_held(h.THREAD, beyond)
-    other = Window().extend([HumanMessage("Question 1, edited", id="h-1")])
-    assert not await window_module.runs_held(h.THREAD, other)
+    assert await window_module.runs_held(h.THREAD, Window(), on.messages(TURNS)) == whole
+    # A window already trimmed asks for one more run.
+    second = on.messages(2)[len(on.messages(1)) :]
+    assert await window_module.runs_held(h.THREAD, on.head(1), second) == on.head(2)
+    beyond = [HumanMessage("One more question", id="h-beyond")]
+    assert await window_module.runs_held(h.THREAD, whole, beyond) is None
+    other = [HumanMessage("Question 1, edited", id="h-1")]
+    assert await window_module.runs_held(h.THREAD, Window(), other) is None
 
 
 async def test_a_slice_from_another_branch_does_not_count(monkeypatch, threads) -> None:
@@ -178,8 +194,8 @@ async def test_a_slice_from_another_branch_does_not_count(monkeypatch, threads) 
     await _page(monkeypatch, on, store)
     row = store.turns["resp-1"]
     row["tail_checkpoint_id"] = "another-branch"
-    assert await window_module.runs_held(h.THREAD, on.head(1))
-    assert not await window_module.runs_held(h.THREAD, on.head(2))
+    assert await window_module.runs_held(h.THREAD, Window(), on.messages(1)) == on.head(1)
+    assert await window_module.runs_held(h.THREAD, Window(), on.messages(2)) is None
 
 
 async def test_a_slice_replay_would_not_serve_does_not_count(
@@ -192,15 +208,15 @@ async def test_a_slice_replay_would_not_serve_does_not_count(
     _cache_probe(monkeypatch)
     store = SliceStore()
     await _page(monkeypatch, on, store)
-    head = on.head(on.base)
+    head, trimmed = on.head(on.base), on.messages(on.base)
     extracted = await window_module.earlier_runs(h.THREAD, on.tip, head)
     row = store.turns["resp-0"]
-    assert await window_module.runs_held(h.THREAD, head)
+    assert await window_module.runs_held(h.THREAD, Window(), trimmed) == head
 
     key, row["slice_key"] = row["slice_key"], "an-older-key"
-    assert not await window_module.runs_held(h.THREAD, head)
+    assert await window_module.runs_held(h.THREAD, Window(), trimmed) is None
     row["slice_key"], row["slice"] = key, b"undecodable"
-    assert not await window_module.runs_held(h.THREAD, head)
+    assert await window_module.runs_held(h.THREAD, Window(), trimmed) is None
     read_back = await window_module.earlier_runs(h.THREAD, on.tip, head)
     assert read_back is not None and _text(read_back) == _text(extracted)
 
@@ -336,11 +352,16 @@ async def _shaped(monkeypatch, requests: list[tuple[list, list | None]]):
             await graph.ainvoke({"messages": given}, config)
     state = await graph.aget_state({"configurable": {"thread_id": SHAPED}})
     tip = state.config["configurable"]["checkpoint_id"]
+    assert await _store_slices(monkeypatch, saver, SHAPED, tip) == len(requests)
+    return tip, list(state.values["messages"])
 
+
+async def _store_slices(monkeypatch, saver, thread_id: str, tip: str) -> int:
+    """Every turn's slice stored as replay stores it, read as ``saver``
+    loads it now, and the window's reads pointed at them. Returns how many."""
     reader = CheckpointHistoryReader(saver)
     monkeypatch.setattr(CheckpointHistoryReader, "get_instance", classmethod(lambda cls: reader))
-    anchors, _ = await reader.aget_turn_anchors(SHAPED, tip)
-    assert len(anchors) == len(requests)
+    anchors, _ = await reader.aget_turn_anchors(thread_id, tip)
     rows = [
         slices_db.StoredSlice(
             a.input_checkpoint_id,
@@ -348,7 +369,7 @@ async def _shaped(monkeypatch, requests: list[tuple[list, list | None]]):
             slices.SLICE_KEY,
             *slices.encode(reader.serde, turn),
         )
-        for a, turn in zip(anchors, await reader.aget_turn_slices(SHAPED, anchors))
+        for a, turn in zip(anchors, await reader.aget_turn_slices(thread_id, anchors))
     ]
 
     async def held(thread_id, key):
@@ -363,7 +384,7 @@ async def _shaped(monkeypatch, requests: list[tuple[list, list | None]]):
     monkeypatch.setattr(slices_db, "has_turn_slices", held)
     monkeypatch.setattr(slices_db, "get_slices_at", at)
     monkeypatch.setattr(window_module, "get_thread_checkpoint_id", pointer)
-    return tip, list(state.values["messages"])
+    return len(rows)
 
 
 async def test_turns_that_open_no_run_or_several(monkeypatch) -> None:
@@ -391,7 +412,7 @@ async def test_turns_that_open_no_run_or_several(monkeypatch) -> None:
         trimmed = [m for run in runs[:n] for m in run]
         head = Window().extend(trimmed)
         assert head.runs == n
-        assert await window_module.runs_held(SHAPED, head), n
+        assert await window_module.runs_held(SHAPED, Window(), trimmed) == head, n
         read_back = await window_module.earlier_runs(SHAPED, tip, head)
         assert [m.id for m in read_back or ()] == [m.id for m in trimmed], n
 
@@ -421,8 +442,87 @@ async def test_a_thread_the_old_summarizer_compacted_is_not_trimmed(monkeypatch)
     )
     assert [m.id for m in messages] == ["s-1", "a-2", "h-3", "a-3", "h-4", "a-4"]
     head = Window().extend(messages[:4])
-    assert not await window_module.runs_held(SHAPED, head)
+    assert await window_module.runs_held(SHAPED, Window(), messages[:4]) is None
     assert await window_module.earlier_runs(SHAPED, tip, head) is None
+
+
+FANNED = "fa0e0000-0000-4000-8000-0000000000fa"
+
+
+def _fanned_graph(saver):
+    """Each turn makes six tool calls at once, each answered by its own task:
+    the six orders of task ids one in 720 sorts as the calls."""
+
+    def model(state):
+        last, turn = state["messages"][-1], len(split_runs(state["messages"]))
+        if last.type != "human":
+            return {"messages": [AIMessage(f"Answer {turn}", id=f"ai-{turn}-end")]}
+        calls = [
+            {"name": "Read", "args": {"k": k}, "id": f"c-{turn}-{k}", "type": "tool_call"}
+            for k in range(6)
+        ]
+        return {"messages": [AIMessage("", id=f"ai-{turn}", tool_calls=calls)]}
+
+    def route(state):
+        calls = getattr(state["messages"][-1], "tool_calls", None)
+        return [Send("tool", call) for call in calls] if calls else END
+
+    def tool(call):
+        return {"messages": [ToolMessage(f"read {call['id']}", tool_call_id=call["id"])]}
+
+    return (
+        StateGraph(DeltaAgentState)
+        .add_node("model", model)
+        .add_node("tool", tool)
+        .add_edge(START, "model")
+        .add_conditional_edges("model", route, ["tool", END])
+        .add_edge("tool", "model")
+        .compile(checkpointer=saver)
+    )
+
+
+async def test_a_thread_trimmed_before_the_saver_reordered_its_answers(monkeypatch) -> None:
+    """checkpoint-postgres 3.1 (and the in-memory saver of its day) replayed
+    a step's writes by task id, 3.2 as they were applied. A thread trimmed
+    under the old saver keeps a window and slices in task id order and now
+    loads its newer turns in call order: its next trim holds whether the
+    slices are the ones cut then or cut again now, and the read back serves
+    it."""
+    import langgraph.checkpoint.memory as memory_saver
+
+    def by_task_id(task_path, task_id="", idx=0):
+        return (task_id, idx)
+
+    saver = InMemorySaver()
+    graph = _fanned_graph(saver)
+    config = {"configurable": {"thread_id": FANNED}}
+    with patch.object(memory_saver, "writes_sort_key", by_task_id), tracing_context(enabled=False):
+        for i in range(4):
+            meta = {"turn_index": i, "run_id": f"run-{i}"}
+            await graph.ainvoke(
+                {"messages": [HumanMessage(f"Q{i + 1}", id=f"h-{i + 1}")]},
+                {**config, "metadata": meta},
+            )
+        state = await graph.aget_state(config)
+        tip, stored = state.config["configurable"]["checkpoint_id"], state.values["messages"]
+        assert await _store_slices(monkeypatch, saver, FANNED, tip) == 4
+    loaded = (await graph.aget_state(config)).values["messages"]
+    runs = split_runs(loaded)
+    first, cut = len(runs[0]), sum(len(run) for run in runs[:3])
+    old = Window(version=1).extend(stored[:first])
+    assert [m.id for m in loaded[:cut]] != [m.id for m in stored[:cut]]
+    # What the check asked before the digest took answers in call order.
+    assert not old.extend(loaded[first:cut]).holds(stored[:cut])
+
+    head = await window_module.runs_held(FANNED, old, loaded[first:cut])
+    assert head == Window().extend(loaded[:cut])
+    read_back = await window_module.earlier_runs(FANNED, tip, head)
+    assert [m.id for m in read_back or ()] == [m.id for m in stored[:cut]]
+
+    assert await _store_slices(monkeypatch, saver, FANNED, tip) == 4
+    assert await window_module.runs_held(FANNED, old, loaded[first:cut]) == head
+    read_back = await window_module.earlier_runs(FANNED, tip, head)
+    assert [m.id for m in read_back or ()] == [m.id for m in loaded[:cut]]
 
 
 # ------------------------------------------------------------ manual writes

@@ -52,6 +52,9 @@ interface MessageBubbleProps {
    *  turn (steering splits one turn across several bubbles). Regenerate renders
    *  only on the tail. Computed positionally in MessageList. */
   isTurnTail: boolean;
+  /** False for a turn that opened hidden, whose words a regenerate's replay
+   *  would drop (see `hiddenOpenerTurns`). */
+  canRegenerate?: boolean;
   /** Whether this is the transcript's newest reply. Retry re-runs the
    *  thread's latest attempt, so an older failed reply offers none. */
   isLatestReply?: boolean;
@@ -80,7 +83,7 @@ interface MessageBubbleProps {
  * MessageActionsContext (one identity-stable object per host), so a streamed
  * chunk never re-renders settled bubbles through a handler identity.
  */
-export const MessageBubble = memo(function MessageBubble({ message, contentProjection, turnIndex, isTurnTail, isLatestReply = true, isTurnLive, turnFiles, feedback, isLoading, fold = 'unfolded', isSubagentView, readOnly, allowFiles, isMobile, dispatcherContext }: MessageBubbleProps): React.ReactElement | null {
+export const MessageBubble = memo(function MessageBubble({ message, contentProjection, turnIndex, isTurnTail, canRegenerate = true, isLatestReply = true, isTurnLive, turnFiles, feedback, isLoading, fold = 'unfolded', isSubagentView, readOnly, allowFiles, isMobile, dispatcherContext }: MessageBubbleProps): React.ReactElement | null {
   const { onOpenFile, onDownloadFile, onRevealFiles, onOpenSources, onEditMessage, editDrafts, onRegenerate, onRetry, onThumbUp, onThumbDown, onReportWithAgent } = useMessageActions();
   const { t } = useTranslation();
   const projection = contentProjection ?? projectMessageContent(message, isSubagentView);
@@ -353,8 +356,9 @@ export const MessageBubble = memo(function MessageBubble({ message, contentProje
     {/* One regenerate per backend turn, on the turn's last bubble —
         regenerating re-runs the whole turn from its input checkpoint
         (mid-run steering can't be replayed), so the affordance sits
-        at the end of the full response. */}
-    {isAssistant && (!hasError || unloaded) && onRegenerate && isTurnTail && (
+        at the end of the full response. A turn that opened hidden has
+        none: that checkpoint lacks the words its context carried. */}
+    {isAssistant && (!hasError || unloaded) && onRegenerate && isTurnTail && canRegenerate && (
       <button
         onClick={() => onRegenerate(messageId)}
         className="p-1 min-h-7 min-w-7 inline-flex items-center justify-center rounded transition-colors hover:bg-(--color-bg-elevated)"
@@ -483,6 +487,9 @@ export const MessageBubble = memo(function MessageBubble({ message, contentProje
             exit={{ height: 0, paddingTop: 0, opacity: 0, transition: EXIT_TWEEN }}
             aria-hidden={!quiet}
             data-testid="streaming-indicator"
+            // What the welcome flow's pending mark becomes in its hand-off
+            // (welcome/handoff.css), named only while that runs.
+            data-handoff="agent"
             data-quiet={quiet ? 'true' : 'false'}
           >
             <FigureEightLoading active={quiet} className={`${isMobile ? 'h-[20px]' : 'h-[24px]'} text-(--color-accent-primary)`} />

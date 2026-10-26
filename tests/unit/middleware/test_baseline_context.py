@@ -57,7 +57,7 @@ from ptc_agent.agent.middleware.runtime_context.epoch import OTHER_COMPUTERS, Wo
 from ptc_agent.agent.middleware.runtime_context.harness_blocks import (
     harness_update_kind,
 )
-from ptc_agent.agent.middleware.runtime_context.profile import ProfileSnapshot
+from ptc_agent.agent.middleware.runtime_context.profile import ProfileSnapshot, ProfileSwitches
 from ptc_agent.core.paths import (
     MEMORY_INDEX_FILENAME,
     MEMORY_USER_DIR,
@@ -793,6 +793,105 @@ class TestProfileFollowsTheGoldenRule:
         assert "Preference output_format: markdown (the frozen block says html)" in row.text
         assert "Preference tone: terse (not in the frozen block)" in row.text
         assert "Timezone" not in row.text
+
+    @pytest.mark.asyncio
+    async def test_a_list_preference_reads_as_a_list_in_words(self):
+        state = await self._turn(
+            {**self.PROFILE, "agent_preference": {"avoid": ["jargon"]}}, self.COUNTS
+        ).abefore_agent({}, None)
+        later = self._turn(
+            {**self.PROFILE, "agent_preference": {"avoid": ["jargon", "emoji"], "tone": ""}},
+            self.COUNTS,
+        )
+        row = runtime_update_from_message(_rows(await later.abefore_agent(state, None))[0])
+        assert "Preference avoid: jargon, emoji (the frozen block says jargon)" in row.text
+        # A key holding nothing has no line in the block, so no row either.
+        assert "Preference tone" not in row.text
+
+    @pytest.mark.asyncio
+    async def test_the_depth_guidance_is_worded_for_the_role(self):
+        """Home's research is often a hand-off, so its block says so."""
+        profile = {**self.PROFILE, "agent_preference": {"research_depth": "light"}}
+        texts = {}
+        for role in ("analyst", "chief_of_staff"):
+            mw = _middleware(
+                _session("# Notes"), user_profile=profile, user_data_counts=self.COUNTS, role=role
+            )
+            texts[role] = _text(await _render(mw, await mw.abefore_agent({}, None)))
+        assert "offer the full research rather than starting it unasked" in texts["analyst"]
+        assert "offer the hand-off to an analyst" in texts["chief_of_staff"]
+
+    def test_a_preference_field_is_its_line_in_the_block(self):
+        fields = ProfileSnapshot(
+            {"agent_preference": {"avoid": ["jargon", "emoji"], "flag": False, "none": [], "blank": ""}}
+        ).fields()
+        assert {k: v for k, v in fields.items() if k.startswith("Preference")} == {
+            "Preference avoid": "jargon, emoji",
+            "Preference flag": "False",
+        }
+
+    INVESTMENT = {
+        "investor_type": "individual",
+        "risk_level": "moderate",
+        "markets": ["us", "hk"],
+        "sectors": ["technology"],
+    }
+
+    @pytest.mark.asyncio
+    async def test_an_investment_profile_change_names_only_that_key(self):
+        state = await self._turn(
+            {**self.PROFILE, "investment_profile": self.INVESTMENT}, self.COUNTS
+        ).abefore_agent({}, None)
+        moved = {**self.INVESTMENT, "markets": ["us"], "horizon": "years"}
+        del moved["investor_type"]
+        later = self._turn({**self.PROFILE, "investment_profile": moved}, self.COUNTS)
+
+        rows = _rows(await later.abefore_agent(state, None))
+
+        assert len(rows) == 1
+        row = runtime_update_from_message(rows[0])
+        assert row.kind == "profile_changed"
+        changed = [
+            "Holding horizon: years (not in the frozen block)",
+            "Investor type: no longer set (the frozen block says individual)",
+            "Markets: us (the frozen block says us, hk)",
+        ]
+        assert [line for line in row.text.splitlines() if line in changed] == changed
+        for unchanged in ("Risk level", "Sectors", "Timezone", "Preference"):
+            assert unchanged not in row.text
+
+    @pytest.mark.asyncio
+    async def test_what_the_user_wants_help_with_leads_the_suggestions(self):
+        profile = {**self.PROFILE, "investment_profile": {"help_with": ["ideas", "portfolio"]}}
+        mw = self._turn(profile, self.COUNTS)
+        text = _text(await _render(mw, await mw.abefore_agent({}, None)))
+        block = text[text.index("## Investment Profile") : text.index("## Financial Context")]
+        assert "- **Wants help with**: ideas, portfolio" in block
+        assert "start from what they want help with, in the order listed." in block
+
+    @pytest.mark.parametrize(
+        "investment, guided",
+        [
+            ({"investor_type": "student"}, True),
+            ({"experience": "under_1y", "markets": ["us"]}, True),
+            ({"risk_level": "moderate", "approaches": ["technical"]}, False),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_who_the_user_is_sets_how_deep_to_go(self, investment, guided):
+        """The depth guidance follows the investor type or experience, and
+        only those: without either there is nothing to pitch the depth to."""
+        mw = self._turn({**self.PROFILE, "investment_profile": investment}, self.COUNTS)
+        text = _text(await _render(mw, await mw.abefore_agent({}, None)))
+        start = text.index("## Investment Profile")
+        block = text[start : text.index("## Financial Context")]
+        assert ("Match the depth to who they are." in block) is guided
+
+    @pytest.mark.asyncio
+    async def test_an_empty_investment_profile_renders_no_section(self):
+        mw = self._turn({**self.PROFILE, "investment_profile": {}}, self.COUNTS)
+        text = _text(await _render(mw, await mw.abefore_agent({}, None)))
+        assert "## Investment Profile" not in text
 
     @pytest.mark.asyncio
     async def test_compaction_catches_the_block_up(self):
@@ -1736,7 +1835,7 @@ class TestTheChannelsParagraph:
             _session("# Notes"),
             user_profile=self.PROFILE,
             user_data_counts={"portfolio_count": 2},
-            channels_enabled=channels,
+            switches=ProfileSwitches(channels=channels),
         )
 
     async def _block(self, mw, state: dict) -> tuple[dict, str]:

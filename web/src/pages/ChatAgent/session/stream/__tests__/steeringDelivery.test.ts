@@ -18,6 +18,11 @@ const NOTICE = {
 } as const;
 const alert: DeliveredMarketAlert = { content: '', market_alert: NOTICE, timestamp: 1_700_000_000 };
 const ALERT_ID = 'market-alert-tg-1:hit';
+// The notice as a price wakeup's, which its row is drawn from.
+const AS_WAKEUP = {
+  wakeup_id: 'tg-1', kind: 'price', notice: 'fire', seq: 1, total: 1, fired_at: '2030-01-01T15:05:00Z',
+  price: { symbol: 'ACME', kind: 'above', value: 205, pct_from: null, fired_price: 205.12 },
+};
 const steer = (content: string, extra: Partial<DeliveredSteer> = {}): DeliveredSteer => ({ content, ...extra });
 
 type Failed = UserMessage & { queueError?: unknown };
@@ -105,13 +110,13 @@ describe('deliveredEntryRow', () => {
 
   it("draws a price alert as its row, under its notice's id whatever the caller mints", () => {
     const row = deliveredEntryRow(alert, id, 2);
-    expect(row).toEqual({
+    expect(row).toMatchObject({
       id: ALERT_ID,
       role: 'notification',
       content: '',
       variant: 'info',
       timestamp: at,
-      marketAlert: { source: 'delivered', notices: [NOTICE] },
+      wakeup: { source: 'delivered', legacy: true, notices: [AS_WAKEUP] },
     });
     expect(deliveredEntryRow(alert, (kind) => `history-${kind}`, undefined)).toEqual(row);
   });

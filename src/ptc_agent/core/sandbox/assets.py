@@ -587,8 +587,13 @@ async def _cleanup_legacy_manifests(sandbox: "PTCSandbox") -> None:
         pass  # Best-effort cleanup
 
 
-async def _upload_mcp_server_files_impl(sandbox: "PTCSandbox") -> None:
-    """Upload MCP server .py files to sandbox (pure upload, no manifest check)."""
+async def _upload_mcp_server_files_impl(sandbox: "PTCSandbox") -> set[str]:
+    """Upload MCP server .py files to sandbox (pure upload, no manifest check).
+
+    Returns the filenames the directory should hold. Pruning the rest is left
+    to :func:`_prune_mcp_server_files`, once the config that stops launching
+    them is installed: the live config may still run a file this sync drops.
+    """
     work_dir = sandbox._work_dir
     mcp_servers_dir = f"{work_dir}/mcp_servers"
     config_dir = getattr(sandbox.config, "config_file_dir", None)
@@ -663,30 +668,6 @@ async def _upload_mcp_server_files_impl(sandbox: "PTCSandbox") -> None:
         retry_policy=RetryPolicy.SAFE,
     )
 
-    # Prune stale files — single rm command instead of N
-    existing_entries = await sandbox.als_directory(mcp_servers_dir)
-    if existing_entries:
-        files_to_remove = [
-            entry["path"]
-            for entry in existing_entries
-            if not entry.get("is_dir", False)
-            and entry.get("name") not in expected_files
-            and entry.get("name")
-            not in (".mcp_manifest.json", ".sandbox_manifest.json")
-        ]
-        if files_to_remove:
-            rm_cmd = "rm -f " + " ".join(shlex.quote(p) for p in files_to_remove)
-            await sandbox._runtime_call(
-                runtime.exec,
-                rm_cmd,
-                retry_policy=RetryPolicy.SAFE,
-            )
-            logger.info(
-                "Pruned MCP server files",
-                removed=len(files_to_remove),
-                sandbox_root=mcp_servers_dir,
-            )
-
     # Batch upload — single HTTP request via upload_files
     if files_to_upload:
         batch = [(local, remote) for _, local, remote in files_to_upload]
@@ -701,6 +682,37 @@ async def _upload_mcp_server_files_impl(sandbox: "PTCSandbox") -> None:
                 server=name,
                 local_path=local,
                 sandbox_path=remote,
+            )
+    return expected_files
+
+
+async def _prune_mcp_server_files(sandbox: "PTCSandbox", expected: set[str]) -> None:
+    """Remove server files the upload no longer ships."""
+    mcp_servers_dir = f"{sandbox._work_dir}/mcp_servers"
+    assert sandbox.runtime is not None
+
+    # Prune stale files — single rm command instead of N
+    existing_entries = await sandbox.als_directory(mcp_servers_dir)
+    if existing_entries:
+        files_to_remove = [
+            entry["path"]
+            for entry in existing_entries
+            if not entry.get("is_dir", False)
+            and entry.get("name") not in expected
+            and entry.get("name")
+            not in (".mcp_manifest.json", ".sandbox_manifest.json")
+        ]
+        if files_to_remove:
+            rm_cmd = "rm -f " + " ".join(shlex.quote(p) for p in files_to_remove)
+            await sandbox._runtime_call(
+                sandbox.runtime.exec,
+                rm_cmd,
+                retry_policy=RetryPolicy.SAFE,
+            )
+            logger.info(
+                "Pruned MCP server files",
+                removed=len(files_to_remove),
+                sandbox_root=mcp_servers_dir,
             )
 
 
@@ -959,9 +971,26 @@ async def sync_sandbox_assets(
                 on_progress("Syncing skills...")
             parallel_uploads.append(("skills", _do_skills_upload()))
 
+        mcp_expected: set[str] | None = None
+        skills_error: Exception | None = None
         if parallel_uploads:
-            await asyncio.gather(*[coro for _, coro in parallel_uploads])
-            refreshed.extend(name for name, _ in parallel_uploads)
+            results = await asyncio.gather(
+                *[coro for _, coro in parallel_uploads], return_exceptions=True
+            )
+            for (name, _), result in zip(parallel_uploads, results):
+                if not isinstance(result, BaseException):
+                    refreshed.append(name)
+                    if name == "mcp_servers":
+                        mcp_expected = result
+                elif name == "skills" and isinstance(result, Exception):
+                    # Skills are independent of the MCP config, so their
+                    # failure waits until the config below is installed to
+                    # match the server files just uploaded.
+                    skills_error = result
+                else:
+                    # The tool modules are built on the server files and
+                    # packages, so either failing stops the sync here.
+                    raise result
         _mark_sync("uploads")
 
         # Group 2: tool_modules AFTER mcp_servers (intent: derived from MCP definitions)
@@ -978,6 +1007,15 @@ async def sync_sandbox_assets(
             except Exception as e:
                 logger.warning("Failed to refresh MCP servers", error=str(e))
             _mark_sync("mcp_start")
+
+        # Only after the install: the config must never launch a file the
+        # sync already removed, so any failure above leaves the old ones.
+        if mcp_expected is not None:
+            await sandbox._prune_mcp_server_files(mcp_expected)
+
+        # Unwritten manifest, so the next acquire retries the skills.
+        if skills_error is not None:
+            raise skills_error
 
         # Cache skills metadata (only if not already set by _build_complete_skills_cache,
         # which includes user-installed skills from the lock file)

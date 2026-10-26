@@ -198,6 +198,99 @@ describe('history replay: the steers a dead stream left', () => {
   });
 });
 
+describe('history replay: a turn opened hidden', () => {
+  // The onboarding kickoff's query is stored empty: its words were the model's.
+  const hiddenOpener = (turn: number, runId?: string) => ({
+    event: 'user_message',
+    data: {
+      thread_id: 'thread-1', turn_index: turn, content: '',
+      metadata: { attachments: [{ name: 'positions.png', type: 'image/png', size: 1024 }] },
+      ...(runId ? { run_id: runId } : {}),
+    },
+  });
+  const liveReply = (over: Record<string, unknown> = {}) =>
+    ({ id: 'assistant-live', role: 'assistant', content: 'Welc', turnIndex: 0, isStreaming: false, hiddenOpener: true, contentSegments: [], ...over }) as unknown as ChatMessage;
+
+  it('draws no user row for it, attachments and all, so the reply opens the chat', async () => {
+    const { rt, read } = buildRuntime();
+    api.replayThreadHistory.mockImplementation(replayOf([
+      hiddenOpener(0, 'run-0'), chunk(0, 'Welcome. Three places to start.'),
+      opener(1, 'The first one', 'run-1'), chunk(1, 'On it.'),
+    ]));
+    await loadConversationHistory(rt, makeDeps());
+
+    expect(ids(read())).toEqual(['history-assistant-0', 'history-user-1', 'history-assistant-1']);
+    expect(read()[0].content).toBe('Welcome. Three places to start.');
+  });
+
+  it('gives its live copy way to the replay, as an opener with text would', async () => {
+    const { rt, read } = buildRuntime();
+    rt.setMessages(() => [liveReply()]);
+    api.replayThreadHistory.mockImplementation(replayOf([hiddenOpener(0, 'run-0'), chunk(0, 'Welcome.')]));
+    await loadConversationHistory(rt, makeDeps());
+
+    expect(ids(read())).toEqual(['history-assistant-0']);
+  });
+
+  it('flags its reply as the live one was, which a turn of attachments alone is not', async () => {
+    const { rt, read } = buildRuntime();
+    const kickoff = {
+      event: 'user_message',
+      data: {
+        thread_id: 'thread-1', turn_index: 0, content: '', run_id: 'run-0',
+        // What the server keeps of the kickoff: the skill's name, never its instruction.
+        metadata: { additional_context: [{ type: 'skills', name: 'onboarding' }, { type: 'directive', content: '<market-brief>' }] },
+      },
+    };
+    const attachmentsAlone = {
+      event: 'user_message',
+      data: {
+        thread_id: 'thread-1', turn_index: 1, content: '', run_id: 'run-1',
+        metadata: { attachments: [{ name: 'positions.png', type: 'image/png', size: 1024 }] },
+      },
+    };
+    api.replayThreadHistory.mockImplementation(replayOf([
+      kickoff, chunk(0, 'Welcome.'),
+      attachmentsAlone, chunk(1, 'Two positions.'),
+    ]));
+    await loadConversationHistory(rt, makeDeps());
+
+    expect(ids(read())).toEqual(['history-assistant-0', 'history-assistant-1']);
+    expect(read()[0]).toMatchObject({ hiddenOpener: true });
+    expect((read()[1] as { hiddenOpener?: boolean }).hiddenOpener).toBeUndefined();
+  });
+
+  it('leaves unflagged a turn of attachments alone sent with Watch on, whose skill the user sent', async () => {
+    const { rt, read } = buildRuntime();
+    // The Watch toggle adds the `market-watch` skill to every send, so a turn
+    // of files alone stores an empty query with a skill named beside them.
+    const watchedAttachments = {
+      event: 'user_message',
+      data: {
+        thread_id: 'thread-1', turn_index: 0, content: '', run_id: 'run-0',
+        metadata: {
+          attachments: [{ name: 'positions.png', type: 'image', size: 1024 }],
+          additional_context: [{ type: 'skills', name: 'market-watch' }],
+        },
+      },
+    };
+    api.replayThreadHistory.mockImplementation(replayOf([watchedAttachments, chunk(0, 'Two positions.')]));
+    await loadConversationHistory(rt, makeDeps());
+
+    expect(ids(read())).toEqual(['history-assistant-0']);
+    expect((read()[0] as { hiddenOpener?: boolean }).hiddenOpener).toBeUndefined();
+  });
+
+  it('keeps a reply the server refused, which holds no turn of the replay', async () => {
+    const { rt, read } = buildRuntime();
+    rt.setMessages(() => [liveReply({ unadmitted: true, error: true, content: '' })]);
+    api.replayThreadHistory.mockImplementation(replayOf([hiddenOpener(0, 'run-0'), chunk(0, 'Welcome.')]));
+    await loadConversationHistory(rt, makeDeps());
+
+    expect(ids(read())).toEqual(['history-assistant-0', 'assistant-live']);
+  });
+});
+
 describe('history replay: a steer refused in an earlier turn', () => {
   it('stays under the turn it was sent in, above the turns after it', async () => {
     const { rt, read } = buildRuntime();

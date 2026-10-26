@@ -281,7 +281,6 @@ class TestMarketWatchTargets:
 
     @pytest.mark.asyncio
     async def test_archiving_a_thread_cancels_its_targets(self, threads_client, no_targets):
-        no_targets["cancel"].return_value = [_row(status="cancelled")]
         updated = {
             "conversation_thread_id": THREAD_ID,
             "workspace_id": "ws-1",
@@ -298,13 +297,16 @@ class TestMarketWatchTargets:
             patch(f"{THREADS_MOD}.update_thread_fields", new=AsyncMock(return_value=updated)),
             patch(f"{THREADS_MOD}.publish_thread_archived", new=AsyncMock()),
             patch(f"{THREADS_MOD}.prune_thread_dirs_soon"),
+            patch(
+                "src.server.services.wakeups.cancel.cancel_on_archive", new=AsyncMock()
+            ) as cancel_on_archive,
         ):
             resp = await threads_client.patch(
                 f"/api/v1/threads/{THREAD_ID}", json={"archived": True}
             )
         assert resp.status_code == 200
-        no_targets["cancel"].assert_awaited_once_with(THREAD_ID)
-        no_targets["changed"].assert_awaited_once_with(THREAD_ID)
+        # One call ends both the thread's wakeups and its legacy targets.
+        cancel_on_archive.assert_awaited_once_with(THREAD_ID)
 
     @pytest.mark.asyncio
     async def test_cancel_by_a_non_owner_is_forbidden(self, threads_client, no_targets):

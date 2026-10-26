@@ -5,7 +5,8 @@ turn hears "busy" at once, while our own duplicate is still adopted. With
 ``refusal_fails_fast`` a caller that can hand its message to the thread's
 next turn hears "refused" at once on a refusal no wait outlives, while one
 that clears by itself is still waited out. Callers that ask for neither, the
-report-back executors, keep deferring through every refusal."""
+report-back executors, keep deferring through every refusal. ``on_unanswered``
+hears of each POST that may still be admitted, and of no other."""
 
 from __future__ import annotations
 
@@ -147,3 +148,32 @@ async def test_report_backs_keep_deferring_on_a_lasting_refusal(status, body):
 
     assert await _post(session) == ("dispatched", "r-1")
     assert session.posts == 2
+
+
+class _NoAnswer:
+    async def __aenter__(self):
+        raise TimeoutError("sock_read")
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+@pytest.mark.asyncio
+async def test_each_post_with_no_answer_is_reported():
+    unanswered = AsyncMock()
+    session = _Session([_NoAnswer(), _Resp(503, {}), _Resp(200, {"run_id": "r-1"})])
+
+    assert await _post(session, on_unanswered=unanswered) == ("dispatched", "r-1")
+    assert unanswered.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_a_definite_refusal_is_not_reported():
+    unanswered = AsyncMock()
+    session = _Session([_Resp(409, {"detail": {"code": "thread_busy"}})])
+
+    assert await _post(session, busy_fails_fast=True, on_unanswered=unanswered) == (
+        "busy",
+        None,
+    )
+    unanswered.assert_not_awaited()

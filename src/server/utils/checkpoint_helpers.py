@@ -13,7 +13,7 @@ from functools import wraps
 from typing import TYPE_CHECKING, Any, Callable, TypeVar
 
 from fastapi import HTTPException
-from langgraph.checkpoint.base import CheckpointTuple
+from langgraph.checkpoint.base import CheckpointTuple, writes_sort_key
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
@@ -236,6 +236,11 @@ def _answered_checkpoint_id(branch: list[Any], i: int) -> str | None:
     return nxt.config["configurable"]["checkpoint_id"]
 
 
+# Checkpoints that run no step: an update written beside a run, and the fork
+# a run opens its branch with. The SQL walk below spells the same pair.
+_NO_STEP_SOURCES = ("update", "fork")
+
+
 def _resumed_by_later_run(branch: list[Any], i: int) -> bool:
     """An interrupted checkpoint that a later run carried on from.
 
@@ -244,8 +249,9 @@ def _resumed_by_later_run(branch: list[Any], i: int) -> bool:
     it waited, the waiting calls are cancelled or run by tools that never ask
     (``agent_change``), so nothing writes the mark and the resume shows only
     as execution continuing under another run. Updates between the two (the
-    cancellation, a stop's flush) are skipped; an ``input`` checkpoint is a
-    new message, its own boundary, not a resume.
+    cancellation, a stop's flush) are skipped, as is the fork a run opens its
+    branch with when it is addressed at an update the thread has moved past;
+    an ``input`` checkpoint is a new message, its own boundary, not a resume.
     """
     cp = branch[i]
     if not any(
@@ -255,7 +261,7 @@ def _resumed_by_later_run(branch: list[Any], i: int) -> bool:
     run_id = (cp.metadata or {}).get("run_id")
     for later in branch[i + 1 :]:
         metadata = later.metadata or {}
-        if metadata.get("source") == "update":
+        if metadata.get("source") in _NO_STEP_SOURCES:
             continue
         later_run = metadata.get("run_id")
         return metadata.get("source") == "loop" and later_run not in (None, run_id)
@@ -278,9 +284,9 @@ _BRANCH_TIP_SQL = """
 # statement) may hash the thread's whole history once per step, which goes
 # quadratic on a long thread. The LIMIT keeps the planner from flattening the
 # probe back into that join. For the later-run test, ``moves_after`` counts the
-# non-update checkpoints after each one and ``move_no`` numbers them from the
-# tip, so the first non-update checkpoint after a row is the one whose
-# ``move_no`` equals that row's ``moves_after``. ``child_*`` is the row after
+# checkpoints after each one that ran a step (neither an update nor a fork) and
+# ``move_no`` numbers them from the tip, so the first such checkpoint after a
+# row is the one whose ``move_no`` equals that row's ``moves_after``. ``child_*`` is the row after
 # it, for _answered_checkpoint_id.
 _BRANCH_BOUNDARIES_SQL = """
     WITH RECURSIVE branch AS (
@@ -314,11 +320,15 @@ _BRANCH_BOUNDARIES_SQL = """
                coalesce(m.interrupted, false) AS interrupted,
                lag(b.checkpoint_id) OVER (ORDER BY b.checkpoint_id DESC) AS child_id,
                lag(b.source) OVER (ORDER BY b.checkpoint_id DESC) AS child_source,
-               count(*) FILTER (WHERE b.source IS DISTINCT FROM 'update') OVER (
+               count(*) FILTER (
+                   WHERE coalesce(b.source, '') NOT IN ('update', 'fork')
+               ) OVER (
                    ORDER BY b.checkpoint_id DESC
                    ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
                ) AS moves_after,
-               count(*) FILTER (WHERE b.source IS DISTINCT FROM 'update') OVER (
+               count(*) FILTER (
+                   WHERE coalesce(b.source, '') NOT IN ('update', 'fork')
+               ) OVER (
                    ORDER BY b.checkpoint_id DESC ROWS UNBOUNDED PRECEDING
                ) AS move_no
         FROM branch b LEFT JOIN marks m USING (checkpoint_id)
@@ -330,7 +340,7 @@ _BRANCH_BOUNDARIES_SQL = """
         FROM steps s
         LEFT JOIN steps nxt
           ON nxt.move_no = s.moves_after
-         AND nxt.source IS DISTINCT FROM 'update'
+         AND coalesce(nxt.source, '') NOT IN ('update', 'fork')
         WHERE s.source = 'input'
            OR s.resumed
            OR (s.interrupted
@@ -351,13 +361,14 @@ _BRANCH_BOUNDARIES_SQL = """
 """
 
 # The boundary rule needs only which channels were written, which the walk
-# reads in SQL; the one payload a consumer reads is the interrupts.
+# reads in SQL; the one payload a consumer reads is the interrupts. They are
+# sorted in Python by the saver's own key, so a boundary read here lists them
+# as one loaded through the saver does, whatever the database's collation.
 _BOUNDARY_INTERRUPTS_SQL = """
-    SELECT checkpoint_id, task_id, channel, type, blob
+    SELECT checkpoint_id, task_id, task_path, idx, channel, type, blob
     FROM checkpoint_writes
     WHERE thread_id = %(thread_id)s AND checkpoint_ns = %(ns)s
       AND checkpoint_id = ANY(%(ids)s) AND channel = '__interrupt__'
-    ORDER BY checkpoint_id, task_id, idx
 """
 
 
@@ -417,6 +428,7 @@ async def _walk_via_tables(
             write_rows = await cur.fetchall()
 
     writes_by_cp: dict[str, list[tuple[str, str, Any]]] = defaultdict(list)
+    write_rows.sort(key=lambda w: writes_sort_key(w["task_path"], w["task_id"], w["idx"]))
     for w in write_rows:
         value = checkpointer.serde.loads_typed((w["type"], bytes(w["blob"])))
         writes_by_cp[w["checkpoint_id"]].append((w["task_id"], w["channel"], value))

@@ -9,7 +9,7 @@ import asyncio
 import json
 import logging
 import time
-from typing import Any, AsyncGenerator, Dict, List, Optional, Set, Tuple, cast
+from typing import Any, AsyncGenerator, Dict, List, Mapping, Optional, Set, Tuple, cast
 
 import json_repair
 
@@ -34,6 +34,8 @@ from src.server.database.runs.lifecycle import ProducerRecord
 from src.server.services.runs.credit_usage import build_credit_usage_data
 from src.server.services.runs.reasoning_facts import ReasoningDurations
 from src.server.services.runs.stream_errors import error_event_data
+from src.tools.wakeups.models import WakeupArtifact
+from src.tools.wakeups.quiet import quiet_result
 from src.server.utils.text_phase import TextPhaseTracker
 from src.utils.concurrency import aclose_within
 from src.utils.stream_coalescing import (
@@ -196,10 +198,9 @@ class RunSSEProducer:
         tool_tracker: Optional[Any] = None,
         workflow_timeout: Optional[int] = None,
         agent_config: Optional[Any] = None,
-        report_source: Optional[Dict[str, Any]] = None,
         *,
         turn_index: Optional[int] = None,
-        market_target: Optional[Dict[str, Any]] = None,
+        announced: Optional[Mapping[str, Any]] = None,
     ):
         """Initialize the workflow stream handler.
 
@@ -213,12 +214,10 @@ class RunSSEProducer:
         ``run_id`` would silently strip that frame and leave the client
         racing on reconnect.
 
-        ``report_source`` rides the same frame on a report-back turn: a
-        client that attaches to the run live has no user message to label,
-        so it draws the report's row from this. ``market_target`` rides it
-        on a target's wake turn for the same reason: the notice the alert
-        row names is on the turn's query row, which a live attach never
-        reads.
+        ``announced`` rides the same frame on a notification turn (the
+        query row's ``turn_kinds.ANNOUNCED_KEYS``): a client that attaches to
+        the run live has no user message to label and never reads the query
+        row, so it draws the report's or the notices' row from this.
 
         ``turn_index`` is the turn admission gave the run, announced on the
         same frame: a view that missed turns added elsewhere cannot count its
@@ -226,8 +225,10 @@ class RunSSEProducer:
         """
         self.thread_id = thread_id
         self.run_id = run_id
-        self.report_source = report_source
-        self.market_target = market_target
+        self.announced = dict(announced or {})
+        # How a wake turn ended quietly, for the finalize to record; reset
+        # if the main agent speaks again after it.
+        self.quiet: Optional[WakeupArtifact] = None
         self.turn_index = turn_index
         self.token_callback = token_callback
         self.tool_tracker = tool_tracker
@@ -438,10 +439,7 @@ class RunSSEProducer:
             }
             if self.turn_index is not None:
                 metadata["turn_index"] = self.turn_index
-            if self.report_source:
-                metadata["report_source"] = self.report_source
-            if self.market_target:
-                metadata["market_target"] = self.market_target
+            metadata.update(self.announced)
             yield self._build_sse_event("metadata", metadata)
 
             for result in settled_results or ():
@@ -806,6 +804,8 @@ class RunSSEProducer:
                     and message_chunk.id
                 ):
                     self._reasoning.saw_root_chunk(str(node), message_chunk.id)
+                if not agent_from_stream and not is_compaction_chunk:
+                    self._note_quiet(message_chunk, node)
 
                 # Process the message chunk
                 async for event in self._process_message_chunk(
@@ -1059,6 +1059,19 @@ class RunSSEProducer:
         }
         prov_data["agent"] = agent
         return prov_data
+
+    def _note_quiet(self, message: BaseMessage, node: Any) -> None:
+        """Keep the main agent's quiet ending, as the finalize records it.
+
+        The quiet guard ends the run on that result, so it stands only while
+        nothing follows it: a model call after it (a background task's report
+        re-invoking the agent) means the turn spoke after all.
+        """
+        if isinstance(message, ToolMessage):
+            if (found := quiet_result(message)) is not None:
+                self.quiet = found
+        elif isinstance(message, (AIMessage, AIMessageChunk)) and node != "tools":
+            self.quiet = None
 
     def _extract_agent_name(self, namespace_tuple: tuple, message_metadata: dict) -> str:
         """Return the agent identifier for an event.

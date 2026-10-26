@@ -95,7 +95,6 @@ vi.mock('@/pages/ChatAgent/utils/api', () => ({
 // Settings renders the onboarding replay/reset buttons; no provider here.
 vi.mock('@/pages/Onboarding', () => ({
   useOnboarding: () => ({ replayGuides: vi.fn(), resetOnboarding: vi.fn() }),
-  useStartOnboarding: () => ({ start: vi.fn() }),
 }));
 
 // Import after mocks are registered.

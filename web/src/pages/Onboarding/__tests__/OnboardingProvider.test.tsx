@@ -1,6 +1,6 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, fireEvent, waitFor } from '@testing-library/react';
-import { MemoryRouter, useNavigate } from 'react-router';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { render, screen, fireEvent } from '@testing-library/react';
+import { MemoryRouter, useLocation, useNavigate } from 'react-router';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { emptyOnboardingPrefs } from '../onboardingPrefsSchema';
 import type { OnboardingPrefs } from '../types';
@@ -15,6 +15,7 @@ const dismissGettingStarted = vi.fn();
 const replayGuides = vi.fn(() => true);
 const setLastSeenReleaseVersion = vi.fn();
 const ensureFirstRun = vi.fn();
+const markWelcomeSkipped = vi.fn();
 const resetAll = vi.fn(() => true);
 vi.mock('../useOnboardingPrefs', () => ({
   useOnboardingPrefs: () => ({
@@ -26,17 +27,14 @@ vi.mock('../useOnboardingPrefs', () => ({
     replayGuides,
     setLastSeenReleaseVersion,
     ensureFirstRun,
+    markWelcomeSkipped,
     resetAll,
   }),
 }));
 
-let mockUser: Record<string, unknown> | null = { user_id: 'u1', personalization_completed: true };
+// A returning user with a saved investing profile, unless a test says otherwise.
+let mockUser: Record<string, unknown> | null = { user_id: 'u1', onboarding_completed: true };
 vi.mock('@/hooks/useUser', () => ({ useUser: () => ({ user: mockUser }) }));
-
-let mockPreferences: Record<string, unknown> | null = null;
-vi.mock('@/hooks/usePreferences', () => ({
-  usePreferences: () => ({ preferences: mockPreferences, isLoading: false }),
-}));
 
 let mockSnoozed = false;
 vi.mock('@/pages/Dashboard/hooks/useOnboarding', () => ({
@@ -50,15 +48,6 @@ vi.mock('@/hooks/useIsMobile', () => ({ useIsMobile: () => mockIsMobile }));
 // Deterministic regardless of the .env loaded by vitest: provider tests run in
 // OSS mode (platform-only tasks filtered out).
 vi.mock('@/config/hostMode', () => ({ HOST_MODE: 'oss', isPlatformMode: false }));
-
-const listWatchlists = vi.fn(async () => ({ watchlists: [] as Array<{ watchlist_id: string }> }));
-const listWatchlistItems = vi.fn(async () => ({ items: [] as unknown[] }));
-const listPortfolio = vi.fn(async () => ({ holdings: [] as unknown[] }));
-vi.mock('@/pages/Dashboard/utils/api', () => ({
-  listWatchlists: (...a: unknown[]) => listWatchlists(...(a as [])),
-  listWatchlistItems: (...a: unknown[]) => listWatchlistItems(...(a as [])),
-  listPortfolio: (...a: unknown[]) => listPortfolio(...(a as [])),
-}));
 
 let mockWorkspaces: unknown[] = [];
 const useWorkspacesSpy = vi.fn((opts: { enabled?: boolean } = {}) => ({
@@ -92,6 +81,7 @@ function Harness() {
       <button onClick={replay}>replay</button>
       <button onClick={resetOnboarding}>reset</button>
       <NavButtons />
+      <LocationProbe />
     </div>
   );
 }
@@ -105,8 +95,14 @@ function NavButtons() {
       </button>
       <button onClick={() => navigate('/chat')}>go-gallery</button>
       <button onClick={() => navigate('/chat/t/another-thread')}>go-thread</button>
+      <button onClick={() => navigate('/dashboard')}>go-dashboard</button>
     </>
   );
+}
+
+function LocationProbe() {
+  const { pathname, search } = useLocation();
+  return <span data-testid="location">{pathname + search}</span>;
 }
 
 function renderAt(route: string) {
@@ -125,21 +121,17 @@ function renderAt(route: string) {
 const phase = () => screen.getByTestId('phase').textContent;
 const intro = () => screen.getByTestId('intro').textContent;
 const card = () => screen.getByTestId('card').textContent;
+const location = () => screen.getByTestId('location').textContent;
 
 describe('OnboardingProvider', () => {
   beforeEach(() => {
     mockPrefs = emptyOnboardingPrefs();
     mockLoading = false;
-    mockUser = { user_id: 'u1', personalization_completed: true };
-    mockPreferences = null;
+    mockUser = { user_id: 'u1', onboarding_completed: true };
     mockWorkspaces = [];
     mockSnoozed = false;
     mockIsMobile = false;
     vi.clearAllMocks();
-    // drop any leftover mockResolvedValueOnce queues (clearAllMocks keeps them)
-    listWatchlists.mockReset();
-    listWatchlistItems.mockReset();
-    listPortfolio.mockReset();
     localStorage.clear();
   });
 
@@ -185,14 +177,29 @@ describe('OnboardingProvider', () => {
     expect(phase()).toBe('idle');
   });
 
-  it('suppresses intros on the dashboard while the personalization banner owns it', () => {
-    mockUser = { user_id: 'u1' }; // personalization not completed
+  it('suppresses intros on the dashboard while the welcome banner owns it', () => {
+    mockUser = { user_id: 'u1' }; // no investing profile yet
     renderAt('/dashboard');
     expect(phase()).toBe('idle');
   });
 
-  it('never pops an intro over the onboarding connect sheet', () => {
-    renderAt('/chat?onboarding=connect');
+  it('a key of their own does not stand in for a saved profile', () => {
+    // `personalization_completed` says the user has a key, so the banner (and
+    // the hold on the dashboard intro) stays until the profile is saved.
+    mockUser = { user_id: 'u1', personalization_completed: true };
+    renderAt('/dashboard');
+    expect(phase()).toBe('idle');
+  });
+
+  it("never pops an intro or What's New over the welcome flow", () => {
+    mockPrefs = { ...emptyOnboardingPrefs(), firstRunAt: 1, lastSeenReleaseVersion: '2026.1' };
+    renderAt('/welcome');
+    expect(phase()).toBe('idle');
+  });
+
+  it('sends the old connect-sheet link to the welcome flow, keeping the rest of its query', () => {
+    renderAt('/chat?onboarding=connect&mcp_oauth=done');
+    expect(location()).toBe('/welcome?mcp_oauth=done&step=brokerage');
     expect(phase()).toBe('idle');
   });
 
@@ -356,11 +363,12 @@ describe('OnboardingProvider', () => {
   });
 
   it('getting-started: visible for a fresh user, platform-only tasks filtered out in OSS', () => {
+    mockUser = { user_id: 'u1' };
     renderAt('/settings');
     expect(card()).toBe('visible');
     expect(screen.getByTestId('done').textContent).toBe('0');
     expect(screen.getByTestId('taskIds').textContent).toBe(
-      'dashboard,market,stocks,preferences,createWorkspace,firstChat,models'
+      'dashboard,market,profile,createWorkspace,firstChat,models'
     );
   });
 
@@ -370,40 +378,15 @@ describe('OnboardingProvider', () => {
     expect(screen.getByTestId('done').textContent).toBe('0');
   });
 
-  it('getting-started: preferences task derives live from filled preference fields', () => {
-    mockPreferences = { risk_preference: { risk_tolerance: 'aggressive' } };
+  it('getting-started: the profile task reads the user row live, so a reset un-checks it', () => {
     const { unmount } = renderAt('/settings');
     expect(screen.getByTestId('done').textContent).toBe('1');
+    expect(markTaskDone).not.toHaveBeenCalledWith('profile');
     unmount();
 
-    // A preferences reset empties the fields — the task un-checks.
-    mockPreferences = { risk_preference: { risk_tolerance: null } };
+    mockUser = { user_id: 'u1', onboarding_completed: false };
     renderAt('/settings');
     expect(screen.getByTestId('done').textContent).toBe('0');
-  });
-
-  it('getting-started: stocks task stamps once the watchlist has an item', async () => {
-    listWatchlists.mockResolvedValueOnce({ watchlists: [{ watchlist_id: 'wl1' }] });
-    listWatchlistItems.mockResolvedValueOnce({ items: [{ symbol: 'NVDA' }] });
-    renderAt('/settings');
-    await waitFor(() => expect(markTaskDone).toHaveBeenCalledWith('stocks'));
-  });
-
-  it('getting-started: stocks task stamps from a portfolio holding when watchlists are empty', async () => {
-    listPortfolio.mockResolvedValueOnce({ holdings: [{ symbol: 'AVGO' }] });
-    renderAt('/settings');
-    await waitFor(() => expect(markTaskDone).toHaveBeenCalledWith('stocks'));
-  });
-
-  it('getting-started: stocks lookup is skipped once stamped or dismissed', () => {
-    mockPrefs = { ...emptyOnboardingPrefs(), gettingStartedDoneAt: { stocks: 1 } };
-    const { unmount } = renderAt('/settings');
-    expect(listWatchlists).not.toHaveBeenCalled();
-    unmount();
-
-    mockPrefs = { ...emptyOnboardingPrefs(), gettingStartedDismissedAt: 1 };
-    renderAt('/settings');
-    expect(listWatchlists).not.toHaveBeenCalled();
   });
 
   it('getting-started: createWorkspace stamps when a workspace other than Home exists', () => {
@@ -439,11 +422,9 @@ describe('OnboardingProvider', () => {
     expect(card()).toBe('hidden');
     unmount();
 
-    mockPreferences = { agent_preference: { output_style: 'concise' } };
     mockPrefs = {
       ...emptyOnboardingPrefs(),
       gettingStartedDoneAt: {
-        stocks: 1,
         firstChat: 2,
         dashboard: 3,
         market: 4,
@@ -451,8 +432,104 @@ describe('OnboardingProvider', () => {
         createWorkspace: 6,
       },
     };
-    renderAt('/settings'); // preferences done via derived signal → all 7 complete
+    renderAt('/settings'); // profile done from the user row → all 6 complete
     expect(card()).toBe('hidden');
+  });
+
+  describe('welcome auto-open', () => {
+    const fresh = (userId = 'u1') => ({
+      user_id: userId,
+      onboarding_completed: false,
+      created_at: new Date(Date.now() - 60_000).toISOString(),
+    });
+
+    it("opens the flow over a new account's first dashboard visit, once", () => {
+      mockUser = fresh();
+      renderAt('/dashboard');
+      expect(location()).toBe('/welcome');
+      // Leaving the flow for the dashboard (Skip, before the stamp lands) does
+      // not reopen it this session.
+      fireEvent.click(screen.getByText('go-dashboard'));
+      expect(location()).toBe('/dashboard');
+    });
+
+    it('leaves a deep link where it landed', () => {
+      mockUser = fresh();
+      renderAt('/chat');
+      expect(location()).toBe('/chat');
+    });
+
+    it('leaves a returning visit, a skipped flow and an old account on the dashboard', () => {
+      mockUser = fresh();
+      mockPrefs = { ...emptyOnboardingPrefs(), firstRunAt: 1 };
+      const { unmount } = renderAt('/dashboard');
+      expect(location()).toBe('/dashboard');
+      unmount();
+
+      mockPrefs = { ...emptyOnboardingPrefs(), welcomeSkippedAt: 1 };
+      const second = renderAt('/dashboard');
+      expect(location()).toBe('/dashboard');
+      second.unmount();
+
+      mockPrefs = emptyOnboardingPrefs();
+      mockUser = { ...fresh(), created_at: '2025-01-01T00:00:00Z' };
+      renderAt('/dashboard');
+      expect(location()).toBe('/dashboard');
+    });
+
+    describe('after a switch to another account in place', () => {
+      // Signing in to another account without signing out clears the cache
+      // in place (AuthContext), so the provider outlives the first account.
+      afterEach(() => {
+        ensureFirstRun.mockReset();
+      });
+
+      it('opens the flow for a new account that follows a returning one', () => {
+        mockUser = fresh('a');
+        mockPrefs = { ...emptyOnboardingPrefs(), firstRunAt: 1 };
+        renderAt('/dashboard');
+        expect(location()).toBe('/dashboard');
+
+        mockUser = fresh('b');
+        mockPrefs = emptyOnboardingPrefs();
+        fireEvent.click(screen.getByText('go-dashboard'));
+        expect(location()).toBe('/welcome');
+      });
+
+      it('opens the flow for a new account after the last one visited it', () => {
+        mockUser = fresh('a');
+        renderAt('/welcome');
+
+        mockUser = fresh('b');
+        fireEvent.click(screen.getByText('go-dashboard'));
+        expect(location()).toBe('/welcome');
+      });
+
+      it('reads the first visit from the new account when its prefs land before its user row', () => {
+        // Sending the stamp moves the cached prefs at once, as the optimistic
+        // preferences write does.
+        ensureFirstRun.mockImplementation(() => {
+          mockPrefs = { ...mockPrefs, firstRunAt: Date.now() };
+          return true;
+        });
+        mockUser = fresh('a');
+        mockPrefs = { ...emptyOnboardingPrefs(), firstRunAt: 1 };
+        renderAt('/dashboard');
+
+        // The cleared cache: no user row yet, prefs loading.
+        mockUser = null;
+        mockLoading = true;
+        mockPrefs = emptyOnboardingPrefs();
+        fireEvent.click(screen.getByText('go-dashboard'));
+        // The sign-in sync seeds the new account's prefs before its user row loads.
+        mockLoading = false;
+        fireEvent.click(screen.getByText('go-dashboard'));
+
+        mockUser = fresh('b');
+        fireEvent.click(screen.getByText('go-dashboard'));
+        expect(location()).toBe('/welcome');
+      });
+    });
   });
 
   it('shows nothing while prefs are loading', () => {

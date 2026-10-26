@@ -740,11 +740,11 @@ async def get_thread_owner_id(thread_id: str, *, conn=None) -> Optional[str]:
 
 async def get_thread_auth_meta(thread_id: str, *, conn=None) -> Optional[Dict[str, Any]]:
     """Owner ``user_id`` + ``is_shared`` + ``msg_type`` + ``workspace_id`` +
-    ``llm_model`` in one query.
+    ``llm_model`` + ``reasoning_effort`` + ``fast_mode`` in one query.
 
     Lets ``/status`` authorize the caller and read share state from a single
     round-trip, and lets a send authorize, find its workspace and read the
-    thread's model from the same one. Returns ``None`` if the thread
+    thread's model and tuning from the same one. Returns ``None`` if the thread
     doesn't exist.
     """
     # Same UUID normalization as get_thread_owner_id: a non-UUID id can't match
@@ -758,7 +758,7 @@ async def get_thread_auth_meta(thread_id: str, *, conn=None) -> Optional[Dict[st
                 await cur.execute(
                     """
                     SELECT w.user_id, t.is_shared, t.msg_type, t.workspace_id,
-                           t.llm_model
+                           t.llm_model, t.reasoning_effort, t.fast_mode
                     FROM conversation_threads t
                     JOIN workspaces w ON w.workspace_id = t.workspace_id
                     WHERE t.conversation_thread_id = %s

@@ -541,7 +541,16 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
     message: string,
     attachments: Array<{ file: File; type: string; preview: string | null; dataUrl: string | null }> = [],
     slashCommands: Array<{ type: string; skillName?: string; name?: string }> = [],
-    { model, reasoningEffort, subagentsAllowed }: { model?: string; reasoningEffort?: string; subagentsAllowed?: boolean } = {},
+    {
+      model, reasoningEffort, fastMode, subagentsAllowed, reasoningEffortOverride, fastModeOverride,
+    }: {
+      model?: string | null;
+      reasoningEffort?: string | null;
+      fastMode?: boolean | null;
+      subagentsAllowed?: boolean;
+      reasoningEffortOverride?: string;
+      fastModeOverride?: boolean;
+    } = {},
   ) => {
     if ((!message.trim() && (!attachments || attachments.length === 0)) || isSendingMessage || !workspaceId) {
       return;
@@ -582,6 +591,9 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
           ...(attachmentMeta ? { attachmentMeta } : {}),
           ...(model ? { model } : {}),
           ...(reasoningEffort ? { reasoningEffort } : {}),
+          ...(typeof fastMode === 'boolean' ? { fastMode } : {}),
+          ...(reasoningEffortOverride !== undefined ? { reasoningEffortOverride } : {}),
+          ...(fastModeOverride !== undefined ? { fastModeOverride } : {}),
         },
       });
     } catch (error) {

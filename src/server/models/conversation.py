@@ -9,6 +9,8 @@ from typing import Optional, List, Dict, Any
 from datetime import datetime
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from src.llms.reasoning import ReasoningLevel
+
 
 # ==================== Workspace Thread Response Models ====================
 
@@ -57,6 +59,17 @@ class WorkspaceThreadListItem(BaseModel):
         "subagents already running keep going and their results stay "
         "collectable. NULL = follows the owner's subagents default "
         "(other_preference.subagents_default; on when unset).",
+    )
+    reasoning_effort: Optional[str] = Field(
+        None,
+        description="The thread's own reasoning effort, picked in its "
+        "composer. NULL = follows the user's Settings (the model's own "
+        "level, else the account default, else the model's).",
+    )
+    fast_mode: Optional[bool] = Field(
+        None,
+        description="The thread's own fast mode, picked in its composer. "
+        "NULL = follows the user's Settings.",
     )
     turn_count: Optional[int] = Field(
         None,
@@ -228,9 +241,17 @@ class ThreadCreateRequest(BaseModel):
         None, description="Target workspace; Home's id for the user's Home"
     )
     first_query: str = Field(
-        ..., min_length=1,
+        "",
         description="The user's first message; stamped as the initial title "
-        "and fed to title generation.",
+        "and fed to title generation. May be empty when `title` is given.",
+    )
+    title: Optional[str] = Field(
+        None,
+        min_length=1,
+        max_length=255,
+        description="The thread's title, stored as given, with no title "
+        "generated after it. For a first turn that opens with no message of "
+        "the user's to title it from.",
     )
 
     @field_validator("first_query")
@@ -261,13 +282,32 @@ class ThreadCreateRequest(BaseModel):
         "user's default (other_preference.subagents_default) is on, the thread "
         "follows that default until a PATCH switches it.",
     )
+    reasoning_effort: Optional[ReasoningLevel] = Field(
+        default=None,
+        description="The thread's own reasoning effort; omitted, the thread "
+        "follows the user's Settings until a PATCH sets one.",
+    )
+    fast_mode: Optional[bool] = Field(
+        default=None,
+        description="The thread's own fast mode; omitted, the thread follows "
+        "the user's Settings until a PATCH sets one.",
+    )
+
+    @model_validator(mode="after")
+    def _something_titles_the_thread(self) -> "ThreadCreateRequest":
+        # The row is born with a title: the one named, else the stamp of the
+        # first message. With neither there is nothing to stamp or generate.
+        if self.title is None and not self.first_query:
+            raise ValueError("first_query or title is required")
+        return self
 
 
 class ThreadCreateResponse(BaseModel):
     """201 body of POST /api/v1/threads — the created row.
 
-    ``title`` is the creation-time stamp (the raw first query). The generated
-    title arrives later on the lifecycle feed; it is never awaited here.
+    ``title`` is the creation-time stamp: the title the request named, else
+    the raw first query, whose generated title arrives later on the lifecycle
+    feed; it is never awaited here.
     """
     thread_id: str
     workspace_id: str
@@ -279,13 +319,19 @@ class ThreadCreateResponse(BaseModel):
         description="The switch the create stored; null follows the owner's "
         "subagents default.",
     )
+    reasoning_effort: Optional[str] = Field(
+        None, description="The effort the create stored; null follows Settings."
+    )
+    fast_mode: Optional[bool] = Field(
+        None, description="The fast mode the create stored; null follows Settings."
+    )
     created_at: datetime
     updated_at: datetime
 
 
 class ThreadUpdateRequest(BaseModel):
     """Request model for updating a thread (title, pin, archive, model,
-    subagent switch).
+    subagent switch, effort, fast mode).
 
     Only fields explicitly present in the request are applied — the endpoint
     reads ``model_fields_set``, so ``{"is_pinned": true}`` cannot clear the
@@ -313,6 +359,18 @@ class ThreadUpdateRequest(BaseModel):
         "user's default is on, or null, leaves the thread following the "
         "default, so it moves when the default does; the other side is the "
         "thread's own and stays whatever the default does.",
+    )
+    reasoning_effort: Optional[ReasoningLevel] = Field(
+        None,
+        description="The thread's reasoning effort from its next turn, any "
+        "level of the vocabulary: a turn clamps it to what the thread's model "
+        "offers, since the model can change under it. null returns the thread "
+        "to the user's Settings.",
+    )
+    fast_mode: Optional[bool] = Field(
+        None,
+        description="The thread's fast mode from its next turn. null returns "
+        "the thread to the user's Settings.",
     )
 
     model_config = ConfigDict(json_schema_extra={

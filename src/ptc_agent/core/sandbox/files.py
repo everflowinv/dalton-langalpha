@@ -32,7 +32,6 @@ from ptc_agent.core.paths import (
     logged_path,
 )
 from ptc_agent.core.sandbox import path_locks as _path_locks
-from ptc_agent.core.sandbox.glob_runtime import agent_glob_pattern
 from ptc_agent.core.sandbox.grep_render import render_grep_json
 from ptc_agent.core.sandbox.livefs_runtime.protocol import MOUNT
 from ptc_agent.core.sandbox.retry import RetryPolicy
@@ -827,8 +826,6 @@ async def aglob_files(
 
     try:
         search_path = sandbox._normalize_search_path(path)
-
-        pattern = agent_glob_pattern(pattern)
 
         # Drop dependency/build/cache dirs (node_modules, .git, caches, …) so a
         # recursive glob can't walk a huge dependency tree into the model context.

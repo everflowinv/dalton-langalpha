@@ -2,12 +2,18 @@
 deleted thread's (and an archived thread's scratchpad) that the bring-up runs."""
 
 import asyncio
+import base64
+import json
 import logging
 import shlex
+import textwrap
 import time
+import zlib
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ptc_agent.core.paths import THREAD_DIR_NAME, THREAD_DIRS_SET_ASIDE, WorkspaceLayout
+from ptc_agent.core.sandbox.livefs_runtime import tree_runtime
 
 if TYPE_CHECKING:
     from src.server.database.conversation import ThreadPrefixes
@@ -70,9 +76,9 @@ async def prune_dead_thread_dirs(
     by the time its dir could be judged; a caller passing ``listing`` ran
     ``listing_script`` before this call. A dead dir is judged again inside the
     read's fence and only moved aside there, so no run is admitted between the
-    judgment and the dir leaving its path, and admission waits on renames
-    rather than on a delete of any size. The caller holds the folder
-    throughout.
+    judgment and the dir leaving its path. Admission waits on renames, or on
+    deletes in place of dirs a rename cannot move up to the same deadline,
+    never on a delete of any size. The caller holds the folder throughout.
     """
     from src.server.database.conversation import (
         fenced_workspace_thread_prefixes,
@@ -158,20 +164,58 @@ def _dead(listing: ThreadDirListing, kept: "ThreadPrefixes", layout: WorkspaceLa
     ]
 
 
+# Runs after ``tree_runtime``. A dir a rename cannot move, one a Daytona
+# sandbox restored from its archive holds in a read-only overlay layer, is
+# deleted where it is, which is all setting it aside is for, and stops at the
+# same deadline as the moves. ``mv`` would copy it instead, for as long as that
+# takes, with admission waiting.
+_SET_ASIDE_PASS = textwrap.dedent("""
+    import json, os, secrets, sys, time
+    A = json.loads(sys.argv[1])
+    rc = 0
+    try:
+        if time.time() >= A["by"]:
+            sys.exit(1)
+        folder = A["folder"] + secrets.token_hex(4)
+        os.mkdir(folder, 0o700)
+        for i, path in enumerate(A["dead"]):
+            if time.time() >= A["by"]:
+                rc = 1
+                break
+            try:
+                try:
+                    os.rename(path, "%s/%d" % (folder, i))
+                except OSError as exc:
+                    if not (cannot_rename(exc) and remove_tree(path, A["by"])):
+                        raise
+            except OSError:
+                rc = 1
+    finally:
+        print(A["end"])
+    sys.exit(rc)
+""")
+_SET_ASIDE_SOURCE = Path(tree_runtime.__file__).read_text(encoding="utf-8") + _SET_ASIDE_PASS
+
+
 def _set_aside_script(layout: WorkspaceLayout, dead: list[str], *, move_by: float) -> str:
     """Rename every dead dir into a fresh folder beside them, one name each:
     the same thread's dirs under different bases share a name. A dir that
     fails to move fails the script and stays for the next prune, as does
-    every dir the script reaches past ``move_by`` (epoch seconds)."""
-    folder = f"{_set_aside(layout)}XXXXXX"
-    moves = "".join(
-        f'move {shlex.quote(path)} "$t/{i}" || rc=1\n' for i, path in enumerate(dead)
-    )
+    every dir the script reaches past ``move_by`` (epoch seconds). Isolated,
+    as it runs where the workspace's own modules could shadow the standard
+    library's."""
+    # Compressed, as for the folder script, which carries ``tree_runtime`` too.
+    code = base64.b64encode(zlib.compress(_SET_ASIDE_SOURCE.encode("utf-8"), 9)).decode("ascii")
+    args = {
+        "folder": layout.join(THREAD_DIRS_SET_ASIDE),
+        "dead": dead,
+        "by": move_by,
+        "end": _SET_ASIDE_END,
+    }
     return (
-        f"trap 'echo {_SET_ASIDE_END}' EXIT\n"
-        f'move() {{ [ "$(date +%s)" -lt {int(move_by)} ] && mv -- "$1" "$2"; }}\n'
-        f'[ "$(date +%s)" -lt {int(move_by)} ] || exit 1\n'
-        f"t=$(mktemp -d {folder}) || exit 1\nrc=0\n{moves}exit $rc\n"
+        "python3 -I -c \"import base64,zlib;"
+        f"exec(zlib.decompress(base64.b64decode('{code}')).decode())\" "
+        f"{shlex.quote(json.dumps(args))}"
     )
 
 

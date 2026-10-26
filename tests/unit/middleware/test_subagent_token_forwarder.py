@@ -11,6 +11,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 
 import pytest
+from langchain_core.messages import AIMessageChunk
 
 from ptc_agent.agent.middleware.background_subagent.registry import (
     BackgroundTaskRegistry,
@@ -22,7 +23,7 @@ from ptc_agent.agent.middleware.background_subagent.token_forwarder import (
 
 def _chunk(content, msg_id="msg-1", reasoning_kw=None):
     """Build a fake message chunk with content and optional reasoning kwarg."""
-    chunk = MagicMock()
+    chunk = MagicMock(spec=AIMessageChunk)
     chunk.content = content
     chunk.id = msg_id
     chunk.additional_kwargs = {}
@@ -880,3 +881,29 @@ async def test_whitespace_alone_does_not_open_reasoning():
         if e["event"] == "message_chunk"
     ]
     assert timeline == [("text", "done")]
+
+
+@pytest.mark.asyncio
+async def test_a_malformed_call_answer_is_not_subagent_prose():
+    """langchain answers a malformed tool call from the model node, so its
+    error ToolMessage and the RemoveMessage beside it stream as ``model``."""
+    from langchain_core.messages import RemoveMessage, ToolMessage
+    from langgraph.graph.message import REMOVE_ALL_MESSAGES
+
+    registry = BackgroundTaskRegistry()
+    task = await _register(registry)
+    fw = _SubagentTokenForwarder(registry, task.tool_call_id, "task:abc")
+
+    model = {"langgraph_node": "model"}
+    await fw.forward(RemoveMessage(id=REMOVE_ALL_MESSAGES), model)
+    await fw.forward(
+        ToolMessage(
+            "Tool call web_search with id call_bad could not be executed",
+            tool_call_id="call_bad",
+            status="error",
+        ),
+        model,
+    )
+    await fw.finalize()
+
+    assert not [r for r in task._test_records if r["event"] == "message_chunk"]

@@ -14,7 +14,7 @@ export type ConnectStart = Pick<ConnectRecord, 'server' | 'label' | 'retry' | 'd
  *
  * The callback lands on whatever page it returns to, and the one shell
  * controller reads it there once; the surface that acts on it may not be
- * mounted until that page or the onboarding sheet loads. Held outside React
+ * mounted until that page or the welcome flow loads. Held outside React
  * for that reason, and spent by the first surface that takes it, so a remount
  * never acts twice.
  */
@@ -37,11 +37,11 @@ export type ConnectLanding =
     }
   | {
       id: number;
-      /** The onboarding sheet, which reopens over the page it was left from. */
-      owner: 'sheet';
+      /** The welcome flow's brokerage step, which the connect returns to. */
+      owner: 'welcome';
       server: string;
-      /** `connected` only for a connect this tab started: the sheet goes on to
-       *  the chat on it, which a link must not be able to make it do. */
+      /** `connected` only for a connect this tab started: the flow moves on by
+       *  itself on it, which a link must not be able to make it do. */
       outcome: 'connected' | 'failed';
       /** For `failed`: the reason's sentence, or null for one backed out of. */
       reasonKey: string | null;
@@ -99,8 +99,8 @@ export function useConnectLanding(kinds: readonly ConnectRetry['kind'][]): PageL
   return landing?.owner === 'page' && kinds.includes(landing.draft.retry.kind) ? landing : null;
 }
 
-/** The landing waiting for the onboarding sheet, or null. */
-export function useSheetLanding(): Extract<ConnectLanding, { owner: 'sheet' }> | null {
+/** The landing waiting for the welcome flow, or null. */
+export function useWelcomeLanding(): Extract<ConnectLanding, { owner: 'welcome' }> | null {
   const landing = useSyncExternalStore(subscribe, getSnapshot);
-  return landing?.owner === 'sheet' ? landing : null;
+  return landing?.owner === 'welcome' ? landing : null;
 }

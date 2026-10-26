@@ -346,6 +346,11 @@ export function applyFeedEvent(evt: {
   run_seq?: number | null;
   status?: string | null;
   interrupt_reason?: string | null;
+  /**
+   * Where the seen cursor stands after a settle that carried it over its run
+   * (a wakeup's quiet check that changed nothing), so the dot never shows.
+   */
+  last_seen_run_seq?: number | null;
 }): void {
   if (evt.type !== 'run_started' && evt.type !== 'run_settled') return;
   if (!evt.thread_id || !evt.status) return;
@@ -355,6 +360,11 @@ export function applyFeedEvent(evt: {
     status: evt.status as PublicRunStatus,
     interruptReason: evt.interrupt_reason ?? null,
   });
+  const seen = evt.last_seen_run_seq;
+  if (typeof seen === 'number') {
+    const entry = ensure(evt.thread_id);
+    if (seen > entry.lastSeenSeq) entry.lastSeenSeq = seen;
+  }
   recompute();
 }
 

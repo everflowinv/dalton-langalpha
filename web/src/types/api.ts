@@ -410,6 +410,11 @@ export interface Thread {
   /** Whether the agent may hand work to subagents; null (or absent, from an older
    *  server) follows the user's subagents default. */
   subagents_allowed?: boolean | null;
+  /** The thread's own reasoning effort; null (or absent, from an older server)
+   *  follows Settings for the thread's model. */
+  reasoning_effort?: string | null;
+  /** The thread's own fast mode; null (or absent) follows Settings. */
+  fast_mode?: boolean | null;
   /** Turn count (list responses only). */
   turn_count?: number;
   created_at?: string;

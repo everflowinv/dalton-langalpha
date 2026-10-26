@@ -21,6 +21,7 @@ import type { Freshness } from '@/types/market';
 import { attachmentsToContexts } from '../ChatAgent/utils/fileUpload';
 import { useThreadModel } from '../ChatAgent/hooks/useThreadModel';
 import { useThreadSubagents } from '../ChatAgent/hooks/useThreadSubagents';
+import { useThreadTuning } from '../ChatAgent/hooks/useThreadTuning';
 import { ThreadNotices } from '../ChatAgent/components/chatView/ThreadNotices';
 import { motion, AnimatePresence } from '@/lib/framer';
 import CompanyOverviewPanel from './components/CompanyOverviewPanel';
@@ -232,6 +233,8 @@ function MarketViewInner() {
   // The Subagents pick lives here too, so a fold keeps it. The send carries
   // it into the thread it opens.
   const subagents = useThreadSubagents({ threadId: null });
+  // The thread's own effort and fast mode, held here for the same reason.
+  const tuning = useThreadTuning({ threadId: null });
 
   // Home's id, which All workspaces runs in. Retried, since
   // a failed first fetch would otherwise leave All workspaces annotations
@@ -430,7 +433,7 @@ function MarketViewInner() {
     setChartImageDesc(parts.join('\n'));
   }, [selectedStock, selectedInterval, stockInfo, selectedStockDisplay, overviewData, displayPrice, quote.currency]);
 
-  const handleSendMessage = useCallback(async (message: string, attachments: AttachmentItem[] = [], _slashCommands: string[] = [], { model, reasoningEffort }: { model?: string; reasoningEffort?: string } = {}) => {
+  const handleSendMessage = useCallback(async (message: string, attachments: AttachmentItem[] = [], _slashCommands: string[] = [], { model, reasoningEffort, fastMode }: { model?: string; reasoningEffort?: string | null; fastMode?: boolean | null } = {}) => {
     // Build additional_context from chart image + file attachments.
     // The drawing tools are always bound; the chart-annotation skill rides
     // every send for its drawing guide and to tell the agent which ticker +
@@ -516,6 +519,8 @@ function MarketViewInner() {
           ...(attachmentMeta ? { attachmentMeta } : {}),
           ...(model ? { model } : {}),
           ...(reasoningEffort ? { reasoningEffort } : {}),
+          ...(typeof fastMode === 'boolean' ? { fastMode } : {}),
+          ...tuning.toSend,
         },
       });
       chartSelectionStore.clearAll();
@@ -531,7 +536,7 @@ function MarketViewInner() {
     }
     setChartImage(null);
     setChartImageDesc(null);
-  }, [navigate, toast, t, queryClient, chartImage, chartImageDesc, scope, selectedWorkspaceId, selectedStock, selectedInterval, subagents.toSend]);
+  }, [navigate, toast, t, queryClient, chartImage, chartImageDesc, scope, selectedWorkspaceId, selectedStock, selectedInterval, subagents.toSend, tuning.toSend]);
 
   const handleSidebarSymbolClick = useCallback((symbol: string) => {
     setSelectedStock(displaySpelling(symbol));
@@ -661,6 +666,9 @@ function MarketViewInner() {
               onPickModel={threadModel.pickModel}
               subagentsAllowed={subagents.allowed}
               onToggleSubagents={subagents.setAllowed}
+              tuning={tuning.tuning}
+              onPickReasoningEffort={tuning.setReasoningEffort}
+              onPickFastMode={tuning.setFastMode}
               workspaces={selectableWorkspaces}
               selectedWorkspaceId={selectedWorkspaceId}
               onWorkspaceChange={selectWorkspace}

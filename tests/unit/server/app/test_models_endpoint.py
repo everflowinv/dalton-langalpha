@@ -125,6 +125,8 @@ class TestListModelsResponse:
         assert defaults["fetch_model"] == "claude-haiku-4-5"
         assert defaults["fallback_models"] == ["gpt-4o"]
         # Profile catalog exposed separately from system_defaults
+        baseline = body["task_cost_baseline"]
+        assert baseline is None or set(baseline) == {"model", "effort"}
         profiles = body["compaction_profiles"]
         assert set(profiles.keys()) == {"aggressive", "moderate", "extended", "relaxed"}
         for preset in profiles.values():

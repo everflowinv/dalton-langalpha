@@ -4,7 +4,7 @@ import time
 from typing import Any
 
 import structlog
-from langchain_core.messages import BaseMessage
+from langchain_core.messages import AIMessage, BaseMessage
 
 from ptc_agent.agent.middleware.background_subagent.registry import (
     BackgroundTaskRegistry,
@@ -121,16 +121,19 @@ class _SubagentTokenForwarder:
         # ``event_capture.py``). Forwarding the inner model's AI chunks would
         # leak the extraction prompt's CoT to the per-task channel.
         #
-        # No isinstance(AIMessageChunk) discriminant here: this forwarder's
-        # input universe is narrower than ``sse_producer``'s. The caller
-        # at ``_arun_subagent_streaming`` only invokes ``forward`` for chunks
-        # streamed via ``stream_mode=["messages"]`` from inside the
-        # subagent's own subgraph — which carries inner-LLM AI chunks but
-        # NOT the ToolMessage returns (those land on the separate
-        # event-capture path). So an unconditional drop on
+        # The caller at ``_arun_subagent_streaming`` only invokes ``forward``
+        # for chunks streamed via ``stream_mode=["messages"]`` from inside the
+        # subagent's own subgraph, whose ToolMessage returns land on the
+        # separate event-capture path. So an unconditional drop on
         # ``langgraph_node == "tools"`` is correct here, where in
         # ``sse_producer`` it would clobber ToolMessage content.
         if metadata is not None and metadata.get("langgraph_node") == "tools":
+            return
+        # Only the subagent's own model output is prose. langchain answers a
+        # malformed tool call from the model node itself, so that error
+        # ToolMessage, and the RemoveMessage rewriting the history around it,
+        # reach this stream tagged ``model``.
+        if not isinstance(message_chunk, AIMessage):
             return
 
         msg_id = message_chunk.id or f"sg-{self.tool_call_id}"

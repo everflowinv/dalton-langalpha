@@ -6,11 +6,10 @@
  */
 import type { ChatMessage, NotificationMessage, UserMessage } from '@/types/chat';
 import {
-  isDeliveredMarketAlert, isDeliveredReport, isDeliveredSteer,
+  isDeliveredNotice, isDeliveredReport, isDeliveredSteer,
   type DeliveredReport, type DeliveredSteer, type SteeringDeliveredEntry,
 } from '@/types/sse';
-import { createMarketAlertMessage } from '../../hooks/utils/messageHelpers';
-import { coerceNotices, marketAlertId } from '../marketWatchEvents';
+import { deliveredNoticeRow } from '../wakeupEvents';
 import { reportRow, senderProvenance } from '../provenance';
 
 /** A delivery's entries, typed once where the loose event shapes are read. */
@@ -22,16 +21,17 @@ export function steeringDeliveredEntries(event: { messages?: readonly unknown[] 
 export type DeliveredRowKind = 'report' | 'user';
 
 /** A row a delivery draws: a steer's words or a report's caption, or a price
- *  alert's row. */
+ *  alert's or a wakeup's row. */
 export type DeliveredRow = UserMessage | NotificationMessage;
 
 /**
- * The row an entry is drawn as: a report's caption, a price alert's row, or
- * the steer's words labelled with the agent that sent them or the chat app
- * they came from. Delivered steering, so it opens no turn and offers no edit.
- * Null for an entry with neither, which is what a share leaves of a report.
- * An alert's id is its notice's, not minted: the server delivers a notice
- * once, so the live stream and every replay draw it under one id.
+ * The row an entry is drawn as: a report's caption, a price alert's or a
+ * wakeup's row, or the steer's words labelled with the agent that sent them
+ * or the chat app they came from. Delivered steering, so it opens no turn and
+ * offers no edit. Null for an entry with neither, which is what a share
+ * leaves of a report. An alert's or a wakeup's id is its notice's, not
+ * minted: the server delivers a notice once, so the live stream and every
+ * replay draw it under one id.
  */
 export function deliveredEntryRow(
   entry: DeliveredSteer | DeliveredReport,
@@ -49,11 +49,7 @@ export function deliveredEntryRow(
   turnIndex: number | undefined,
 ): DeliveredRow | null {
   const timestamp = entry.timestamp ? new Date(entry.timestamp * 1000) : new Date();
-  if (isDeliveredMarketAlert(entry)) {
-    const notices = coerceNotices([entry.market_alert]);
-    if (notices.length === 0) return null;
-    return createMarketAlertMessage(marketAlertId(notices), { source: 'delivered', notices }, timestamp);
-  }
+  if (isDeliveredNotice(entry)) return deliveredNoticeRow(entry, timestamp);
   if (isDeliveredReport(entry)) {
     return reportRow(entry.report_source, {
       id: rowId('report'),
@@ -186,12 +182,12 @@ export interface SteeringDelivery {
  * Folds a live delivery into the transcript. A steer of this view's it names
  * gets no copy; the rest, which this view never held (sent elsewhere) or lost
  * on a reconnect, go after what it delivers, above any steer still waiting in
- * the turn, which the model has yet to read. Reports and price alerts go
+ * the turn, which the model has yet to read. Reports, alerts and wakeups go
  * ahead of the user's words, as the model reads them: before the first steer
  * this delivers, else before the first still waiting in the turn (sent after
  * the run took its queue, and replay draws the report above it too), else at
- * the end. An alert already on screen is not drawn again: its id is its
- * notice's, so a stream re-delivering what a replay drew finds it.
+ * the end. An alert or a wakeup already on screen is not drawn again: its id
+ * is its notice's, so a stream re-delivering what a replay drew finds it.
  */
 export function foldSteeringDelivery(
   prev: ChatMessage[],

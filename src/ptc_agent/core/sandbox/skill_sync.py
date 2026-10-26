@@ -16,8 +16,8 @@ Four operations:
 - :func:`report` — one exec: scan every skill dir and ledger entry, compute
   content tree hashes (with a git-index-style stat cache so unchanged trees
   cost one ``lstat`` per file), and return the full picture for the server's
-  decision matrix. Read-only except the stat cache and janitorial GC of
-  orphaned staging/trash dirs.
+  decision matrix. Read-only except the stat cache, janitorial GC of
+  orphaned staging/trash dirs, and finishing a delete in place cut short.
 - :func:`apply_actions` — one exec: the write phase. Ledger stamps are
   guarded by ``expectTreeHash`` (stamp-if-unchanged), directory deletes
   re-verify the tree hash first (content beats deletion), and push-down
@@ -102,7 +102,7 @@ def shared_link_target(base: str, user_base: str) -> str:
 # base64 JSON blob, and the whole script is itself base64-wrapped into the
 # exec command line, which sidesteps shell quoting entirely.
 _SCRIPT = textwrap.dedent(r'''
-import base64, fcntl, hashlib, json, os, re, shutil, stat, sys, time
+import base64, errno, fcntl, hashlib, json, os, re, shutil, stat, sys, time
 
 ARGS = json.loads(base64.b64decode("__ARGS_B64__").decode())
 BASE = ARGS["base"]
@@ -112,6 +112,7 @@ MANAGED_SOURCE_TYPE = ARGS["managedSourceType"]
 ORPHAN_TTL = ARGS["orphanTtl"]
 LOCK_PATH = os.path.join(BASE, "skills-lock.json")
 STAGING = os.path.join(BASE, ".staging")
+DELETING = ".deleting-"
 
 
 def fail(msg, code=None):
@@ -282,8 +283,77 @@ def remove_path(p):
     # file at a skill's name.
     if os.path.islink(p) or not os.path.isdir(p):
         os.unlink(p)
-    else:
-        shutil.rmtree(p, ignore_errors=True)
+        return
+    # A folder in it the agent made read-only refuses a delete inside until it
+    # is opened up again.
+    open_up(p)
+    for d, dirs, _ in os.walk(p):
+        for name in dirs:
+            open_up(os.path.join(d, name))
+    shutil.rmtree(p, ignore_errors=True)
+
+
+def open_up(p):
+    try:
+        st = os.lstat(p)
+        if stat.S_ISDIR(st.st_mode) and st.st_mode & 0o700 != 0o700:
+            os.chmod(p, stat.S_IMODE(st.st_mode) | 0o700)
+    except OSError:
+        pass
+
+
+def delete_in_place(p):
+    # SKILL.md first: a delete cut short leaves a dir that holds no skill, which
+    # the next sync installs again, not one that reads as an edit made here and
+    # goes up over the server's copy. The mark beside it outlasts the rest, so
+    # the next report finishes the delete: left as it was, the dir would read
+    # as one the agent made, which an install may not overwrite. With no mark
+    # it is not begun: the skill stays whole, and the caller finds it there.
+    mark = os.path.join(os.path.dirname(p), DELETING + os.path.basename(p))
+    if os.path.isdir(p) and not os.path.islink(p):
+        try:
+            open(mark, "w").close()
+        except OSError:
+            return
+        try:
+            os.unlink(os.path.join(p, "SKILL.md"))
+        except OSError:
+            pass
+    if os.path.lexists(p):
+        remove_path(p)
+    if not os.path.lexists(p) and os.path.lexists(mark):
+        os.unlink(mark)
+
+
+def replace_live(live, staged, trash):
+    """Rename ``staged`` in at ``live``; True if the old dir went to ``trash``.
+
+    A dir a Daytona sandbox restored from its archive sits in a read-only
+    overlay layer that refuses to rename it (EXDEV), so it is deleted where it
+    is instead, the name empty only under the flock a link pass reads it
+    under. The staged dir, made since, still renames; should that rename
+    fail, the name stays empty until the next sync installs the skill again.
+    """
+    displaced = os.path.lexists(live)
+    if displaced:
+        try:
+            os.rename(live, trash)
+        except OSError as e:
+            if e.errno != errno.EXDEV:
+                raise
+            delete_in_place(live)
+            if os.path.lexists(live):
+                raise OSError(e.errno, "could not delete %s where it is" % live)
+            displaced = False
+    try:
+        os.rename(staged, live)
+    except OSError:
+        # Never leave the name with nothing: put the live dir back before
+        # surfacing the failure.
+        if displaced:
+            os.rename(trash, live)
+        raise
+    return displaced
 
 
 def gc_orphans():
@@ -302,6 +372,28 @@ def gc_orphans():
             try:
                 if now - os.lstat(p).st_mtime > ORPHAN_TTL:
                     remove_path(p)
+            except OSError:
+                pass
+        elif entry.startswith(DELETING):
+            # A delete in place runs only under this flock, so one marked
+            # here was cut short. It is only ever of a skill's own name:
+            # anything else, as "" or "..", would reach past one. And it took
+            # SKILL.md first, so a dir that holds one is a skill made at the
+            # name since, or one cut short before anything went: it stays,
+            # and only the mark goes.
+            name = entry[len(DELETING):]
+            p = os.path.join(BASE, name)
+            try:
+                if (
+                    name
+                    and not name.startswith(".")
+                    and os.path.isdir(p)
+                    and not os.path.islink(p)
+                    and not os.path.lexists(os.path.join(p, "SKILL.md"))
+                ):
+                    delete_in_place(p)
+                else:
+                    os.unlink(os.path.join(BASE, entry))
             except OSError:
                 pass
 
@@ -458,17 +550,7 @@ def run_apply():
                 else:
                     live = os.path.join(BASE, name)
                     trash = os.path.join(BASE, ".trash-%s" % os.path.basename(staged))
-                    displaced = os.path.lexists(live)
-                    if displaced:
-                        os.rename(live, trash)
-                    try:
-                        os.rename(staged, live)
-                    except OSError:
-                        # Never leave the name with nothing: put the live dir
-                        # back before surfacing the failure.
-                        if displaced:
-                            os.rename(trash, live)
-                        raise
+                    replace_live(live, staged, trash)
                     entry = action["entry"]
                     th, new_cache, special = tree_state(live, {})
                     sync = entry.setdefault("sync", {})
@@ -574,9 +656,15 @@ def unpin_shared_copies(served, own):
             trash = os.path.join(BASE, ".trash-unpin-%s-%d" % (name, time.time_ns()))
             try:
                 os.rename(p, trash)
-            except OSError:
+            except OSError as e:
+                if e.errno != errno.EXDEV:
+                    continue
+                # Restored from an archive, it cannot move: deleted where it is.
+                delete_in_place(p)
+            else:
+                shutil.rmtree(trash, ignore_errors=True)
+            if os.path.lexists(p):
                 continue
-            shutil.rmtree(trash, ignore_errors=True)
         del entries[name]
         unpinned.append(name)
     if unpinned:
@@ -712,18 +800,8 @@ def run_install():
             continue
         live = os.path.join(BASE, name)
         trash = os.path.join(BASE, ".trash-%s-%s" % (tag, name))
-        displaced = os.path.lexists(live)
         try:
-            if displaced:
-                os.rename(live, trash)
-            try:
-                os.rename(staged, live)
-            except OSError:
-                # Never leave the name with nothing: put the live dir back
-                # before surfacing the failure.
-                if displaced:
-                    os.rename(trash, live)
-                raise
+            displaced = replace_live(live, staged, trash)
         except OSError as e:
             fail("install %s: %s" % (name, e))
         if displaced:

@@ -33,6 +33,11 @@ const NOTICE = {
   expires_at: null,
 };
 const ALERT = { content: '', timestamp: 1_700_000_000, market_alert: NOTICE };
+// The notice as a price wakeup's, which its row is drawn from.
+const AS_WAKEUP = {
+  wakeup_id: 'tg-1', kind: 'price', notice: 'fire', seq: 1, total: 1, fired_at: '2030-01-01T15:05:00Z',
+  price: { symbol: 'ACME', kind: 'above', value: 205, pct_from: null, fired_price: 205.12 },
+};
 
 const chunk = (turn: number, content: string) => ({
   event: 'message_chunk',
@@ -77,7 +82,7 @@ describe('history replay: market targets', () => {
     expect(messages[2]).toMatchObject({
       id: 'history-market-alert-wake-1',
       isHistory: true,
-      marketAlert: { source: 'wake', notices: [NOTICE] },
+      wakeup: { source: 'wake', legacy: true, notices: [AS_WAKEUP] },
     });
     expect(messages[3]).toMatchObject({ turnIndex: 1, content: 'ACME is through 205.' });
   });
@@ -102,7 +107,7 @@ describe('history replay: market targets', () => {
         lastEventIdRef: { current: null },
         threadIdRef: { current: 'thread-1' },
       } as unknown as Parameters<typeof createStreamEventProcessor>[0],
-      { clearModelStatus: () => {}, refreshMarketWatch: vi.fn(), refreshWorkspaceFolder: null } as unknown as Parameters<typeof createStreamEventProcessor>[1],
+      { clearModelStatus: () => {}, refreshMarketWatch: vi.fn(), refreshWakeups: vi.fn(), refreshWorkspaceFolder: null } as unknown as Parameters<typeof createStreamEventProcessor>[1],
       'a1',
       {
         contentOrderCounterRef: { current: 0 },
@@ -160,7 +165,7 @@ describe('history replay: market targets', () => {
     await loadConversationHistory(rt, makeDeps());
 
     const [row] = read() as unknown as Row[];
-    expect(row).toMatchObject({ role: 'notification', marketAlert: { source: 'wake', notices: [] } });
+    expect(row).toMatchObject({ role: 'notification', wakeup: { source: 'wake', legacy: true, notices: [] } });
   });
 
   it('splits a turn at a delivered alert, the rest of the turn in a continuation', async () => {
@@ -182,7 +187,7 @@ describe('history replay: market targets', () => {
       'history-assistant-steering-0-1',
     ]);
     expect(messages[1].content).toBe('Waiting.');
-    expect(messages[2]).toMatchObject({ role: 'notification', isHistory: true, marketAlert: { source: 'delivered', notices: [NOTICE] } });
+    expect(messages[2]).toMatchObject({ role: 'notification', isHistory: true, wakeup: { source: 'delivered', legacy: true, notices: [AS_WAKEUP] } });
     expect(messages[3]).toMatchObject({ content: 'It crossed.', isSteering: true, turnIndex: 0 });
   });
 
@@ -239,7 +244,7 @@ describe('history replay: market targets', () => {
         lastEventIdRef: { current: null },
         threadIdRef: { current: 'thread-1' },
       } as unknown as Parameters<typeof createStreamEventProcessor>[0],
-      { clearModelStatus: () => {}, refreshMarketWatch: vi.fn() } as unknown as Parameters<typeof createStreamEventProcessor>[1],
+      { clearModelStatus: () => {}, refreshMarketWatch: vi.fn(), refreshWakeups: vi.fn() } as unknown as Parameters<typeof createStreamEventProcessor>[1],
       'a1',
       {
         contentOrderCounterRef: { current: 0 },

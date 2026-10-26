@@ -60,6 +60,24 @@ class FeatureSpec:
 
 
 FEATURES: dict[str, FeatureSpec] = {
+    "wakeups": FeatureSpec(
+        key="wakeups",
+        label="Wakeups",
+        description=(
+            "Lets the agent pick a thread back up by itself to carry on a task: "
+            "at a time, every few minutes, when a price moves, or when an order "
+            "it placed fills. Pending wakeups show in the chat tray and the "
+            "Status panel, where you can cancel any of them."
+        ),
+        enabled=True,
+        gate=FeatureGate.OPT_OUT,
+        tradeoffs=(
+            "A wakeup that fires while the thread is idle starts a turn by "
+            "itself, which costs as much as any turn; checking every 5 minutes "
+            "can take up to 24 turns over two hours. Turning this off cancels "
+            "every pending wakeup."
+        ),
+    ),
     "market_watch": FeatureSpec(
         key="market_watch",
         label="Market watch",
@@ -67,9 +85,7 @@ FEATURES: dict[str, FeatureSpec] = {
             "Adds a Watch toggle to chat: keep a per-thread list of symbols "
             "whose live quotes stream into the conversation while you work, "
             "so the agent reasons from current intraday prices instead of "
-            "stale lookups. The agent can also set price targets on a thread, "
-            "a level or a % move. When one is hit, the agent sees the alert in "
-            "the turn it is running, or picks the thread back up if it is idle."
+            "stale lookups."
         ),
         enabled=True,
         gate=FeatureGate.OPT_IN,
@@ -77,9 +93,7 @@ FEATURES: dict[str, FeatureSpec] = {
             "Quotes are re-injected into the model's context as they update, "
             "which can occasionally distract the agent from its main task and "
             "invalidate the prompt cache — expect slightly slower, costlier "
-            "turns while a watch list is active. A target that hits, or is about "
-            "to lapse, while the thread is idle starts a new turn by itself, "
-            "which costs as much as any turn."
+            "turns while a watch list is active."
         ),
     ),
     "site_crawl": FeatureSpec(

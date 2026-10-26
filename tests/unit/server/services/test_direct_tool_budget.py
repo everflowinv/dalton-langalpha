@@ -69,6 +69,38 @@ def test_a_fat_schema_is_charged_by_size_not_by_count():
     assert len(admitted["a"]) < MAX_DIRECT_TOOLS
 
 
+def test_a_schema_is_charged_as_sent_after_folding():
+    # Folding copies the referenced order beside its definition, so each tool
+    # sends about twice what the vendor published.
+    fat = "x" * (MAX_DIRECT_SCHEMA_CHARS // 3)
+    order = {"properties": {"ticker": {"type": "string", "description": fat}}}
+    input_schema = {"$defs": {"order": order}, "allOf": [{"$ref": "#/$defs/order"}]}
+    by_server = {
+        "a": _entry(
+            *(
+                DirectTool(
+                    {"name": f"a_{i}", "description": "d", "input_schema": input_schema},
+                    Resolved("direct", "policy"),
+                )
+                for i in range(2)
+            )
+        )
+    }
+    admitted, dropped = admit_within_budget(by_server)
+    assert [t.name for t in admitted["a"]] == ["a_0"]
+    assert [t.name for _, t in dropped] == ["a_1"]
+
+
+def test_an_unreadable_schema_costs_only_its_own_tool():
+    broken = DirectTool(
+        {"name": "a_0", "description": "d", "input_schema": {"anyOf": [{"properties": ["x"]}]}},
+        Resolved("direct", "policy"),
+    )
+    admitted, dropped = admit_within_budget({"a": _entry(broken, _read("a_1"))})
+    assert [t.name for t in admitted["a"]] == ["a_1"]
+    assert [t.name for _, t in dropped] == ["a_0"]
+
+
 def test_a_server_with_no_schemas_is_not_an_error():
     by_server = {"a": _entry(), "b": _entry(*_reads("b", 2))}
     admitted, dropped = admit_within_budget(by_server)

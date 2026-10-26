@@ -31,12 +31,12 @@ _NOTICE = {"target_id": "tg-1", "notice": "hit", "symbol": "AAPL"}
 _ALERT = SteeredReport(
     job_id="job-alert",
     content="<market-alert>\nAAPL crossed 230.00\n</market-alert>",
-    market_alert=_NOTICE,
+    shown={"market_alert": _NOTICE},
 )
 _REPORT = SteeredReport(
     job_id="job-report",
     content="REPORT",
-    report_source={"kind": "task", "task_id": "a"},
+    shown={"report_source": {"kind": "task", "task_id": "a"}},
 )
 _STEER = SteeredReport(
     job_id="job-steer",
@@ -80,7 +80,7 @@ async def test_alert_rides_the_steering_message_ahead_of_the_users_words():
     # The user's messages only: a chat gateway retires this many.
     assert delivered["count"] == 1
     report, alert, user = delivered["messages"]
-    assert report["report_source"] == _REPORT.report_source
+    assert report["report_source"] == _REPORT.shown["report_source"]
     assert "market_alert" not in report
     assert alert["content"] == "" and alert["market_alert"] == _NOTICE
     assert "report_source" not in alert
@@ -96,14 +96,23 @@ async def test_alert_rides_the_steering_message_ahead_of_the_users_words():
     assert event["messages"][1]["market_alert"] == _NOTICE
 
 
+def _waiting(alert: bool) -> AsyncMock:
+    return AsyncMock(return_value={utils.MARKET_ALERT_SENDER} if alert else set())
+
+
+_MARKET = frozenset({utils.MARKET_ALERT_SENDER})
+
+
 async def _senders(*, steers: list[str], alert: bool, market_alerts: bool):
-    has_alert = AsyncMock(return_value=alert)
+    has_alert = _waiting(alert)
     with (
         patch(f"{_OUTBOX}.pending_steer_senders", new=AsyncMock(return_value=steers)),
-        patch(f"{_OUTBOX}.has_steerable_market_alert", new=has_alert),
+        patch(f"{_OUTBOX}.steerable_alert_senders", new=has_alert),
     ):
         checker = await utils.build_message_checker(
-            "t-1", own_run_id="run-A", market_alerts=market_alerts
+            "t-1",
+            own_run_id="run-A",
+            alert_senders=_MARKET if market_alerts else frozenset(),
         )
         return await checker(), has_alert
 
@@ -112,7 +121,9 @@ async def _senders(*, steers: list[str], alert: bool, market_alerts: bool):
 async def test_checker_names_the_alert_only_when_no_steer_waits():
     senders, has_alert = await _senders(steers=[], alert=True, market_alerts=True)
     assert senders == [utils.MARKET_ALERT_SENDER]
-    has_alert.assert_awaited_once_with("t-1")
+    has_alert.assert_awaited_once_with(
+        "t-1", {utils.MARKET_ALERT_SENDER: "market_target"}
+    )
 
     senders, has_alert = await _senders(
         steers=["user"], alert=True, market_alerts=True
@@ -134,11 +145,11 @@ async def test_a_failing_alert_check_counts_as_nothing_waiting():
     with (
         patch(f"{_OUTBOX}.pending_steer_senders", new=AsyncMock(return_value=[])),
         patch(
-            f"{_OUTBOX}.has_steerable_market_alert",
+            f"{_OUTBOX}.steerable_alert_senders",
             new=AsyncMock(side_effect=RuntimeError("db down")),
         ),
     ):
-        checker = await utils.build_message_checker("t-1", market_alerts=True)
+        checker = await utils.build_message_checker("t-1", alert_senders=_MARKET)
         assert await checker() == []
 
 
@@ -154,17 +165,14 @@ def _orchestrator(
     agent.aupdate_state = AsyncMock()
     agent.aget_state = AsyncMock(return_value=MagicMock(interrupts=()))
     return BackgroundSubagentOrchestrator(
-        agent, mw, market_alerts=market_alerts, **kwargs
+        agent, mw, alert_senders=_MARKET if market_alerts else frozenset(), **kwargs
     )
 
 
 async def _reinvoke(orch, *, steers: list[str], alert: bool) -> bool:
     with (
         patch(f"{_OUTBOX}.pending_steer_senders", new=AsyncMock(return_value=steers)),
-        patch(
-            f"{_OUTBOX}.has_steerable_market_alert",
-            new=AsyncMock(return_value=alert),
-        ),
+        patch(f"{_OUTBOX}.steerable_alert_senders", new=_waiting(alert)),
     ):
         return await orch._reinvoke_for_steering(_config(), iteration=1)
 
@@ -247,4 +255,6 @@ async def test_only_a_wait_a_rerun_can_follow_ends_on_an_alert(max_iterations, c
             pass
 
     orch.middleware.registry.wait_for_all.assert_awaited_once()
-    assert build.await_args_list[0].kwargs["market_alerts"] is counted
+    assert build.await_args_list[0].kwargs["alert_senders"] == (
+        _MARKET if counted else frozenset()
+    )

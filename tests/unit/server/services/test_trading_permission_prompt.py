@@ -13,8 +13,8 @@ from ptc_agent.agent.middleware.runtime_context import (
 from ptc_agent.agent.middleware.runtime_context.profile import (
     ProfileSnapshot,
     profile_diff_lines,
+    render_user_profile,
 )
-from ptc_agent.agent.prompts import get_loader
 from ptc_agent.config.core import MCPConfig, MCPServerConfig
 from src.server.services import trading_rule as trading_rule_module
 from src.server.services.brokerage_capabilities import vendor_for_url
@@ -104,12 +104,7 @@ def _profile(resolved) -> dict:
 
 
 def _section(profile: dict) -> str:
-    out = get_loader().render(
-        "components/user_profile.md.j2",
-        user_profile=profile,
-        user_data_counts=None,
-        main_agent_steering=False,
-    )
+    out = render_user_profile(profile, main_agent_steering=False)
     return out.split("## Trading Permission", 1)[1]
 
 

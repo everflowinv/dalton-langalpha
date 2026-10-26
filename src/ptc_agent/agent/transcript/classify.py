@@ -8,6 +8,8 @@ turn it only landed inside.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Literal
 
 from langchain_core.messages import AnyMessage, HumanMessage
@@ -63,8 +65,31 @@ STEERING_TRIGGER = "User sent additional instructions."
 #: The trigger when all that is waiting is a market target's notice, which
 #: nobody sent.
 MARKET_TARGET_TRIGGER = "A market alert arrived."
+#: The trigger when a wakeup's notice is waiting.
+WAKE_TRIGGER = "A wakeup arrived."
+#: The senders a message checker names for notices nobody sent: a market
+#: target's alert, and a wakeup's notice.
+MARKET_ALERT_SENDER = "market_alert"
+WAKEUP_SENDER = "wakeup"
+#: The trigger for each of those senders, the one that wins first when
+#: several wait: a wakeup's trigger covers a market alert taken in beside it.
+REENTRY_TRIGGERS: Mapping[str, str] = MappingProxyType(
+    {WAKEUP_SENDER: WAKE_TRIGGER, MARKET_ALERT_SENDER: MARKET_TARGET_TRIGGER}
+)
+_NOTICE_TRIGGERS = frozenset(REENTRY_TRIGGERS.values())
 _TRIGGER_TAIL = " sent additional instructions."
 _TRIGGER_NAMES = {"user": "User", "chief_of_staff": "Chief of Staff"}
+
+
+def reentry_trigger(senders: list[str]) -> str:
+    """The trigger that routes the graph back to the agent for what waits.
+
+    Notices nobody sent have no sender to name, so they take their own
+    trigger; any steer among them names its sender.
+    """
+    if senders and all(sender in REENTRY_TRIGGERS for sender in senders):
+        return next(t for s, t in REENTRY_TRIGGERS.items() if s in senders)
+    return steering_trigger(senders)
 
 
 def steering_trigger(senders: list[str]) -> str:
@@ -78,7 +103,7 @@ def steering_trigger(senders: list[str]) -> str:
 
 def is_steering_trigger(content: object) -> bool:
     return isinstance(content, str) and (
-        content.endswith(_TRIGGER_TAIL) or content == MARKET_TARGET_TRIGGER
+        content.endswith(_TRIGGER_TAIL) or content in _NOTICE_TRIGGERS
     )
 
 

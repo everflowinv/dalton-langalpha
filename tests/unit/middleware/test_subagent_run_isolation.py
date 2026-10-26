@@ -119,3 +119,67 @@ async def test_ambient_config_is_restored_when_the_subagent_fails():
         assert var_child_runnable_config.get() is ambient
     finally:
         var_child_runnable_config.reset(token)
+
+
+@pytest.mark.asyncio
+async def test_a_follow_up_launched_from_a_resumed_turn_reaches_the_subagent(
+    monkeypatch,
+):
+    """LangGraph marks every task of a turn that answered an interrupt as
+    resuming, and a resuming graph applies no input, so a task that already
+    has state would skip the follow-up's prompt if it inherited the flag."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from ptc_agent.agent.middleware.background_subagent import subagent as sa
+    from ptc_agent.agent.middleware.background_subagent.middleware import (
+        current_background_tool_call_id,
+    )
+
+    saver = InMemorySaver()
+
+    async def model(state: MessagesState):
+        return {"messages": [AIMessage(content=f"saw {len(state['messages'])}")]}
+
+    builder = StateGraph(MessagesState)
+    builder.add_node("model", model)
+    builder.add_edge(START, "model")
+    builder.add_edge("model", END)
+    graph = builder.compile(checkpointer=saver)
+    task_conf = {"thread_id": "t1", "__pregel_task_id": "launch"}
+    await graph.ainvoke(
+        {"messages": [HumanMessage("first")]},
+        {"configurable": {**task_conf, "checkpoint_ns": "task:task-1"}},
+    )
+
+    results: list[dict] = []
+
+    async def run(subagent, state, config, registry):
+        results.append(await subagent.ainvoke(state, config))
+        return results[-1]
+
+    monkeypatch.setattr(sa, "arun_subagent_streaming", run)
+    registry = MagicMock()
+    registry.get_by_tool_call_id.return_value = SimpleNamespace(
+        completed=False, task_id="task-1", subagent_type="research", task_run_id=None
+    )
+    tool = sa._create_task_tool(
+        subagent_graphs={"research": graph}, registry=registry, checkpointer=saver
+    )
+    runtime = MagicMock()
+    runtime.state = {"messages": []}
+    runtime.tool_call_id = "tc-1"
+
+    ambient = {"configurable": {**task_conf, "__pregel_resuming": True}}
+    token = current_background_tool_call_id.set("tc-bg")
+    config_token = var_child_runnable_config.set(ambient)
+    try:
+        await tool.coroutine(
+            description="d", prompt="follow-up", action="resume",
+            task_id="task-1", runtime=runtime,
+        )
+    finally:
+        var_child_runnable_config.reset(config_token)
+        current_background_tool_call_id.reset(token)
+
+    assert results[-1]["messages"][-1].content == "saw 3"

@@ -9,10 +9,10 @@ import type {
   UserMessage,
   NotificationMessage,
   NotificationVariant,
+  WakeupArrival,
 } from '@/types/chat';
 import type { WidgetContextSnapshot } from '@/pages/Dashboard/widgets/framework/contextSnapshot';
 import type { ChartSelectionSnapshot } from '@/pages/MarketView/stores/chartSelectionStore';
-import type { MarketAlert } from '../../session/marketWatchEvents';
 
 // Re-export types for consumers
 export type { ChatMessage, AssistantMessage, UserMessage, NotificationMessage, NotificationVariant };
@@ -133,12 +133,13 @@ export function createNotificationMessage(
 }
 
 /**
- * The row a price alert draws in the transcript. The id is the caller's, so
- * the same alert keeps one id across a live stream and every replay.
+ * The row a wakeup, or a price alert, draws in the transcript. The id is the
+ * caller's, so the same notice keeps one id across a live stream and every
+ * replay.
  */
-export function createMarketAlertMessage(
+export function createWakeupMessage(
   id: string,
-  marketAlert: MarketAlert,
+  wakeup: WakeupArrival,
   timestamp: Date,
 ): NotificationMessage {
   return {
@@ -147,6 +148,6 @@ export function createMarketAlertMessage(
     content: '',
     variant: 'info',
     timestamp,
-    marketAlert,
+    wakeup,
   };
 }

@@ -6,6 +6,7 @@ import { useAuth } from '../../contexts/AuthContext';
 import { isPlatformMode, APP_ENTRY_PATH } from '../../config/hostMode';
 import { isDaltonAuth } from '../../config/daltonAuth'; // DALTON-HOOK(dalton-auth): allow password reset route when Dalton auth is enabled
 import { authErrorMessage } from '../../lib/authErrors';
+import { landAfterSignIn } from '../../lib/hostedSignIn';
 import { useShellHandoff } from './useShellHandoff';
 import ShellHandoff from './ShellHandoff';
 import PasswordInput from './PasswordInput';
@@ -81,7 +82,7 @@ function ResetPassword() {
       const result = await updatePassword(password);
       if (!result) return;
       if (result.error) throw result.error;
-      navigate('/dashboard', { replace: true });
+      landAfterSignIn(navigate);
     } catch (err: unknown) {
       setError(authErrorMessage(err, t).message);
     } finally {

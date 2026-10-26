@@ -20,14 +20,6 @@ vi.mock('../OnboardingProvider', () => ({
   }),
 }));
 
-// DALTON-HOOK(hide-trading): preserve ONBOARDING_PARAM/ONBOARDING_CONNECT constants on mock
-const startOnboarding = vi.fn();
-vi.mock('../connect/useStartOnboarding', () => ({
-  ONBOARDING_PARAM: 'onboarding',
-  ONBOARDING_CONNECT: 'connect',
-  useStartOnboarding: () => ({ start: startOnboarding }),
-}));
-
 import { GettingStartedCard } from '../engine/GettingStartedCard';
 
 function LocationProbe() {
@@ -49,7 +41,6 @@ describe('GettingStartedCard', () => {
   beforeEach(() => {
     dismiss.mockClear();
     completeTask.mockClear();
-    startOnboarding.mockClear();
     mockVisible = true;
     mockTasks = GETTING_STARTED_TASKS.map((def, i) => ({ def, done: i === 0 }));
   });
@@ -76,7 +67,7 @@ describe('GettingStartedCard', () => {
     });
     expect(doneBtn).toBeDisabled();
     expect(screen.getByText('Explore the dashboard')).toHaveClass('line-through');
-    expect(screen.getByText(/tell the agent the tickers you watch/)).toBeInTheDocument();
+    expect(screen.getByText(/Risk, markets, style, and how the agent works with you/)).toBeInTheDocument();
   });
 
   it('clicking a pending task navigates to its target', () => {
@@ -85,27 +76,11 @@ describe('GettingStartedCard', () => {
     expect(screen.getByTestId('loc').textContent).toBe('/chat');
   });
 
-  it('an interview task explains the flow first, then confirm starts onboarding, not a bare route', () => {
-    mockTasks = GETTING_STARTED_TASKS.map((def) => ({ def, done: false }));
+  it('the profile task opens the welcome flow', () => {
     renderCard();
-    fireEvent.click(screen.getByRole('button', { name: /Share your investing preferences/ }));
-    // explainer dialog, nothing launched yet
-    expect(screen.getByText(/agent asks a few questions about your portfolio/)).toBeInTheDocument();
-    expect(startOnboarding).not.toHaveBeenCalled();
-
-    fireEvent.click(screen.getByRole('button', { name: 'Start the chat' }));
-    expect(startOnboarding).toHaveBeenCalledTimes(1);
-    // not a bare route: the connect sheet opens over the page the user is on
-    expect(screen.getByTestId('loc').textContent).toBe('/settings');
-  });
-
-  it('declining the interview dialog launches nothing', () => {
-    mockTasks = GETTING_STARTED_TASKS.map((def) => ({ def, done: false }));
-    renderCard();
-    fireEvent.click(screen.getByRole('button', { name: /Share your watchlist/ }));
-    fireEvent.click(screen.getByRole('button', { name: 'Not now' }));
-    expect(startOnboarding).not.toHaveBeenCalled();
-    expect(screen.queryByText(/agent asks a few questions/)).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: /Set up your investing profile/ }));
+    expect(screen.getByTestId('loc').textContent).toBe('/welcome');
+    expect(completeTask).not.toHaveBeenCalled();
   });
 
   it('clicking an external task stamps it done and opens a new tab, no in-app navigation', () => {
@@ -132,17 +107,5 @@ describe('GettingStartedCard', () => {
     renderCard();
     fireEvent.click(screen.getByRole('button', { name: 'Hide guide' }));
     expect(dismiss).toHaveBeenCalledTimes(1);
-  });
-
-  // DALTON-HOOK(hide-trading): OnboardingConnectHost never renders the brokerage connect sheet
-  it('OnboardingConnectHost skips the brokerage sheet and redirects ?onboarding=connect via start()', async () => {
-    const { OnboardingConnectHost } = await import('../connect/OnboardingConnectHost');
-    render(
-      <MemoryRouter initialEntries={['/dashboard?onboarding=connect']}>
-        <OnboardingConnectHost />
-      </MemoryRouter>
-    );
-    expect(startOnboarding).toHaveBeenCalledWith({ replace: true });
-    expect(screen.queryByText(/Connect your brokerage/i)).toBeNull();
   });
 });

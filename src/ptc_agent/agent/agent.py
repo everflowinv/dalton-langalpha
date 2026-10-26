@@ -55,6 +55,7 @@ from ptc_agent.agent.middleware.background_subagent import (
     SubagentEventCaptureMiddleware,
     SubagentToolResultCaptureMiddleware,
 )
+from ptc_agent.agent.transcript.classify import MARKET_ALERT_SENDER, WAKEUP_SENDER
 from ptc_agent.agent.middleware.compaction.notes import (
     NotesDueMiddleware,
     NotesOffMiddleware,
@@ -73,6 +74,12 @@ from ptc_agent.agent.middleware.subagent_switch import (
     SubagentSwitchMiddleware,
     SubagentSwitchReader,
     subagents_window_carry,
+)
+from ptc_agent.agent.middleware.wakeups import (
+    CancelNotices,
+    WakeupCancelNoticeMiddleware,
+    WakeupQuietGuardMiddleware,
+    wakeup_cancels_window_carry,
 )
 from ptc_agent.agent.context_stack import build_context_middleware
 from ptc_agent.agent.roles import AgentRole
@@ -94,6 +101,7 @@ from ptc_agent.agent.middleware.runtime_context import (
     TurnContextMiddleware,
 )
 from ptc_agent.agent.middleware.runtime_context.epoch import Workspace
+from ptc_agent.agent.middleware.runtime_context.profile import ProfileSwitches
 from ptc_agent.agent.middleware.background_subagent.registry import (
     BackgroundTaskRegistry,
 )
@@ -137,6 +145,7 @@ from src.tools.market_data.tool import (
 from src.tools.market_watch import watch_market
 from src.tools.chart_annotation import CHART_ANNOTATION_TOOLS
 from src.tools.messaging import build_messaging_tools, messaging_enabled
+from src.tools.wakeups.tool import build_schedule_wakeup_tool
 from ptc_agent.config import AgentConfig
 from ptc_agent.core.mcp_registry import MCPRegistry
 from ptc_agent.core.sandbox import PTCSandbox
@@ -260,6 +269,7 @@ class PTCAgent:
         harness_blocks: Mapping[str, str | None] | None = None,
         subagent_switch: SubagentSwitchReader | None = None,
         window_coverage: WindowCoverage | None = None,
+        cancel_notices: CancelNotices | None = None,
     ) -> Any:
         """Create a deepagent with PTC pattern capabilities.
 
@@ -300,6 +310,9 @@ class PTCAgent:
                 runs the main agent's window would trim from its checkpoint
                 (see ``compaction.window``). None for a build with no server
                 behind it, which never trims.
+            cancel_notices: The user's cancels of wakeups on this thread,
+                read before every call. None for a build with no thread row
+                to read, which tells the agent of none.
 
         Returns:
             Configured BackgroundSubagentOrchestrator wrapping the deepagent.
@@ -313,6 +326,8 @@ class PTCAgent:
 
         # Compute short thread ID for thread-scoped storage
         short_thread_id = thread_id[:8] if thread_id else ""
+        # A wakeup belongs to a thread, so a build outside one has none.
+        wakeups_on = bool(thread_id) and self.config.feature_enabled("wakeups")
 
         preview_owner = project.workspace_id if project else None
         backend = SandboxBackend(
@@ -604,7 +619,13 @@ class PTCAgent:
             )
         )
 
-        # Right after steering, so a steer and a flip sent together reach the
+        # The user's cancels of wakeups the agent set, after the steers that
+        # reached this call. Whether or not wakeups are on, so the row saying
+        # they were turned off arrives.
+        if cancel_notices is not None:
+            main_only_middleware.append(WakeupCancelNoticeMiddleware(cancel_notices))
+
+        # After steering, so a steer and a flip sent together reach the
         # model in that order, with the operator-role row last. Its tool hook
         # wraps BackgroundSubagentMiddleware (the one Task interceptor) and the
         # tool node (RunWorkflow), so a refused launch starts nothing; the
@@ -762,7 +783,12 @@ class PTCAgent:
         # trims too.
         if main_compaction and window_coverage and thread_id:
             main_compaction = main_compaction.with_window(
-                window_coverage, [notes_window_carry(thread_id), subagents_window_carry]
+                window_coverage,
+                [
+                    notes_window_carry(thread_id),
+                    subagents_window_carry,
+                    wakeup_cancels_window_carry,
+                ],
             )
 
         model_resilience = [build_model_resilience_middleware(self.config, turn)]
@@ -870,7 +896,7 @@ class PTCAgent:
             workspace=workspace,
             sources=baseline_store_sources,
             files_mounted=files_mounted,
-            channels_enabled=gates.channels,
+            switches=ProfileSwitches(channels=gates.channels, wakeups=wakeups_on),
             blocks={
                 "mcp_servers": lambda _state: tool_summary,
                 "skills": lambda state: skill_loader_middleware.build_manifest(state)
@@ -950,6 +976,12 @@ class PTCAgent:
         # subagent snapshot: a subagent reports to its parent, never to a person.
         tools.extend(build_messaging_tools(role))
 
+        # The agent's own follow-ups on this thread, main agent only and
+        # added after the subagent snapshot: a wakeup comes back to the
+        # thread, and a subagent has no thread of its own to come back to.
+        if wakeups_on:
+            tools.append(build_schedule_wakeup_tool())
+
         # Main agent middleware (includes SubAgentMiddleware + main_only)
         # Ordering matters for prompt caching:
         #   - AnthropicPromptCachingMiddleware (cache_control) and
@@ -996,6 +1028,10 @@ class PTCAgent:
                     backend=backend, eviction_dir=eviction_dir
                 ),
                 subagent_task_middleware,
+                # Ends a quiet wake turn before the credit gate, steering and
+                # the context rows run, so a call that never happens takes in
+                # nothing and writes nothing. Only with the tool that sets it.
+                WakeupQuietGuardMiddleware() if wakeups_on else None,
                 *shared_middleware,
                 skill_loader_middleware,
                 *main_only_middleware,
@@ -1057,5 +1093,12 @@ class PTCAgent:
             agent=agent,
             middleware=background_middleware,
             auto_wait=self.config.background_auto_wait,
-            market_alerts=self.config.feature_enabled("market_watch"),
+            alert_senders=frozenset(
+                sender
+                for sender, on in (
+                    (MARKET_ALERT_SENDER, self.config.feature_enabled("market_watch")),
+                    (WAKEUP_SENDER, wakeups_on),
+                )
+                if on
+            ),
         )

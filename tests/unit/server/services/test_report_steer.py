@@ -42,7 +42,7 @@ def _report(n: int) -> SteeredReport:
     return SteeredReport(
         job_id=f"job-{n}",
         content=f"report {n}",
-        report_source={"kind": "task", "task_id": str(n)},
+        shown={"report_source": {"kind": "task", "task_id": str(n)}},
     )
 
 
@@ -232,12 +232,14 @@ async def test_a_held_report_whose_thread_cannot_be_read_again_is_given_back():
 
 @pytest.mark.asyncio
 async def test_confirm_closes_the_runs_held_reports_and_never_raises():
+    # No alert among them: nothing to stamp ahead of the close.
+    no_alerts = patch(f"{_OUTBOX}.held_alert_jobs", new=AsyncMock(return_value=[]))
     confirm = AsyncMock(return_value=["job-1"])
-    with patch(f"{_OUTBOX}.confirm_jobs", new=confirm):
+    with no_alerts, patch(f"{_OUTBOX}.confirm_jobs", new=confirm):
         await steer.SteeredReportInbox().confirm("run-A", ["job-1"])
     confirm.assert_awaited_once_with(["job-1"], owner=("run", "run-A"))
 
-    with patch(
+    with no_alerts, patch(
         f"{_OUTBOX}.confirm_jobs",
         new=AsyncMock(side_effect=RuntimeError("db down")),
     ):
@@ -323,7 +325,7 @@ async def test_task_offer_steers_an_owed_report():
         "This notice is from the system, not the user. Keep writing to the user in the language of their request.\n"
         "</system>"
     )
-    assert offer.report_source["kind"] == "task"
+    assert offer.shown["report_source"]["kind"] == "task"
 
 
 def test_task_report_message_includes_language_notice_and_preserves_fields():
@@ -409,7 +411,7 @@ async def test_analyst_offer_steers_an_owed_report():
         "This notice is from the system, not the user. Keep writing to the user in the language of their request.\n"
         "</system>"
     )
-    assert offer.report_source == {"kind": "analyst", "thread_id": "ptc-1"}
+    assert offer.shown["report_source"] == {"kind": "analyst", "thread_id": "ptc-1"}
 
 
 @pytest.mark.asyncio

@@ -1,18 +1,28 @@
 /**
  * The tray's chips: the market watch as a control with a live label, a list
- * whose rows close it as they open their target, and an Analyst's thread
+ * whose rows close it as they open their target, the wakeups with a Cancel on each, and an Analyst's thread
  * opened behind the host's leave guard.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { act, cleanup, render, screen, fireEvent } from '@testing-library/react';
+import type { Mock } from 'vitest';
+import { act, cleanup, render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router';
 import { RouteLeaveGuardContext, type RouteLeaveGuard } from '../../../contexts/RouteLeaveGuardContext';
-import type { MarketTarget } from '../../../utils/api';
+import type { Wakeup } from '@/types/wakeups';
+
+vi.mock('../../../utils/api', async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  cancelWakeups: vi.fn().mockResolvedValue({ results: [], wakeups: [] }),
+}));
+
+import { cancelWakeups } from '../../../utils/api';
 import type { RosterTask } from '../delegatedWork';
 import { ComposerTray } from '../ComposerTray';
 import { trayWorking, type TrayContents } from '../useTrayContents';
 
-const EMPTY: TrayContents = { watch: null, tasks: null, analysts: null, reportBackLabel: null };
+const EMPTY: TrayContents = { watch: null, wakeups: null, tasks: null, analysts: null, reportBackLabel: null };
+const THREAD = '7d1c2a4e-0b3f-4c55-9a61-2f8e5d9b0c17';
 
 function Where() {
   const location = useLocation();
@@ -28,46 +38,43 @@ function renderTray(
   } = {},
 ) {
   return render(
-    <MemoryRouter initialEntries={['/chat/t/here']}>
-      <RouteLeaveGuardContext value={guard}>
-        <Routes>
-          <Route
-            path="*"
-            element={(
-              <>
-                <ComposerTray
-                  contents={{ ...EMPTY, ...contents }}
-                  phase="open"
-                  trayRef={{ current: null }}
-                  dockRef={{ current: null }}
-                  from={{ threadId: 'here', workspaceId: 'home' }}
-                  onOpenTask={onOpenTask}
-                  onOpenWatch={onOpenWatch}
-                />
-                <Where />
-              </>
-            )}
-          />
-        </Routes>
-      </RouteLeaveGuardContext>
-    </MemoryRouter>,
+    <QueryClientProvider client={new QueryClient()}>
+      <MemoryRouter initialEntries={['/chat/t/here']}>
+        <RouteLeaveGuardContext value={guard}>
+          <Routes>
+            <Route
+              path="*"
+              element={(
+                <>
+                  <ComposerTray
+                    contents={{ ...EMPTY, ...contents }}
+                    phase="open"
+                    trayRef={{ current: null }}
+                    dockRef={{ current: null }}
+                    from={{ threadId: 'here', workspaceId: 'home' }}
+                    onOpenTask={onOpenTask}
+                    onOpenWatch={onOpenWatch}
+                    threadId={THREAD}
+                  />
+                  <Where />
+                </>
+              )}
+            />
+          </Routes>
+        </RouteLeaveGuardContext>
+      </MemoryRouter>
+    </QueryClientProvider>,
   );
 }
 
 // Neutral placeholder tickers and made-up levels only.
-function target(over: Partial<MarketTarget>): MarketTarget {
+function wakeup(over: Partial<Wakeup>): Wakeup {
   return {
-    target_id: 'tg-1',
-    symbol: 'NVDA',
-    kind: 'above',
-    value: 205,
-    pct_from: null,
-    armed_price: null,
-    status: 'armed',
-    expires_at: '2030-01-02T00:00:00Z',
-    fired_at: null,
-    fired_price: null,
-    created_at: '2030-01-01T00:00:00Z',
+    wakeup_id: 'w-1', short_id: 'w_3f2a', label: null, kind: 'price', state: 'armed',
+    timezone: null, cron: null, at: null, until: null, next_fire_at: null,
+    fires_done: 0, fires_total: 1, ends_at: null, expires_at: '2099-01-02T00:00:00Z', fired_at: null,
+    price: { symbol: 'NVDA', kind: 'above', value: 205, pct_from: null, armed_price: null, fired_price: null },
+    order: null, cancellable: true, legacy: false, created_at: '2030-01-01T00:00:00Z',
     ...over,
   };
 }
@@ -98,23 +105,28 @@ describe('ComposerTray', () => {
     expect(label.closest('button')).not.toHaveAttribute('role');
   });
 
-  it('shows armed targets beside their symbol', () => {
-    renderTray({
-      watch: {
-        symbols: ['NVDA', 'AAPL'],
-        targets: [
-          target({ target_id: 'a' }),
-          target({ target_id: 'b', kind: 'below', value: 190.5 }),
-          target({ target_id: 'c', symbol: 'TSLA', kind: 'pct_down', value: 3, pct_from: 'previous_close' }),
-        ],
-      },
-    });
-    expect(screen.getByText('Watching NVDA · ≥ 205 / ≤ 190.5, AAPL, TSLA · -3%')).toBeInTheDocument();
+  it('counts pending wakeups with no next time when none is timed', () => {
+    renderTray({ wakeups: { items: [wakeup({}), wakeup({ wakeup_id: 'w-2' })], userTimezone: null } });
+    expect(screen.getByRole('button', { name: /2 wakeups/ })).toHaveTextContent('2 wakeups');
   });
 
-  it('names armed targets with no live-stamped symbol', () => {
-    renderTray({ watch: { symbols: [], targets: [target({ kind: 'pct_up', value: 2.5, pct_from: 'now' })] } });
-    expect(screen.getByText('Watching NVDA · +2.5%')).toBeInTheDocument();
+  it('names the next time when a pending wakeup is timed', () => {
+    renderTray({
+      wakeups: {
+        items: [wakeup({ kind: 'at', price: null, at: '2099-01-02T14:30:00Z', next_fire_at: '2099-01-02T14:30:00Z' })],
+        userTimezone: 'UTC',
+      },
+    });
+    expect(screen.getByRole('button', { name: /1 wakeup · / })).toBeInTheDocument();
+  });
+
+  it('cancels one wakeup from the chip, or all of them', async () => {
+    renderTray({ wakeups: { items: [wakeup({}), wakeup({ wakeup_id: 'w-2', label: 'Entry' })], userTimezone: null } });
+    fireEvent.click(screen.getByRole('button', { name: /2 wakeups/ }));
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel the wakeup Entry' }));
+    await waitFor(() => expect(cancelWakeups as Mock).toHaveBeenCalledWith(THREAD, ['w-2']));
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel all' }));
+    await waitFor(() => expect(cancelWakeups as Mock).toHaveBeenLastCalledWith(THREAD, 'all'));
   });
 
   it('names when the watch last updated', () => {

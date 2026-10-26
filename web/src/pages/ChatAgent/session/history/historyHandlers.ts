@@ -11,12 +11,12 @@ import { deriveTaskSegment, applyTaskSegment, applyLaunchReply } from '../subage
 import { reportRow, senderProvenance, type SenderMetadata } from '../provenance';
 import { deliveredEntryRow, steeringDeliveredEntries } from '../stream/steeringDelivery';
 import type { ReportSource } from '@/types/api';
-import { isDeliveredMarketAlert, isDeliveredSteer, type DeliveredSteer } from '@/types/sse';
+import { isDeliveredNotice, isDeliveredSteer, type DeliveredSteer } from '@/types/sse';
 import type { SubagentTaskRecord, TextSegment } from '@/types/chat';
 import type { MessageRecord, SetMessages, ToolCallRecord, ToolCallResultRecord, TodoPayload, HtmlWidgetData } from '../../hooks/utils/types';
 import type { PairState } from '../types';
 import type { StructuredError } from '@/utils/rateLimitError';
-import { wakeAlertRow } from '../marketWatchEvents';
+import { wakeTurnOpener } from '../wakeupEvents';
 
 
 /** Shape of an SSE history event. */
@@ -89,6 +89,34 @@ function dropLiveCopy(
       break;
     }
   }
+  return dropTurnFrom(prev, opener, pairIndex, insertIndex);
+}
+
+/**
+ * The same for a turn that opened with no message of its own (a hidden
+ * opener), whose replayed query is empty and draws no row: its copy starts at
+ * the reply its send flagged. A reply the server refused before admission is
+ * no copy, for the reason a refused send is none.
+ */
+function dropHiddenOpenerCopy(
+  prev: MessageRecord[],
+  pairIndex: number,
+  insertIndex: number,
+): { rest: MessageRecord[]; removedAbove: number } {
+  const opener = prev.findLastIndex((m) => (
+    m.role === 'assistant' && m.hiddenOpener === true && !m.isHistory && !m.unadmitted && m.turnIndex === pairIndex
+  ));
+  return dropTurnFrom(prev, opener, pairIndex, insertIndex);
+}
+
+/** Drops the live copy of turn `pairIndex` that opens at `opener` (-1 for
+ *  none): the opener, and the replies and delivered steers under it. */
+function dropTurnFrom(
+  prev: MessageRecord[],
+  opener: number,
+  pairIndex: number,
+  insertIndex: number,
+): { rest: MessageRecord[]; removedAbove: number } {
   if (opener === -1) return { rest: prev, removedAbove: 0 };
   const drop = new Set<number>([opener]);
   for (let i = opener + 1; i < prev.length; i++) {
@@ -111,8 +139,8 @@ function refusedBefore(m: MessageRecord, turn: number): boolean {
  * resume pairs. A system query, a report-back's invocation, is written for
  * the model: it shows only as the label naming what it reports, and stays
  * hidden when the row names nothing (an older row, or a share's replay). A
- * price alert that woke the agent is written for the model too, and heads
- * its turn as the alert's row, which still draws when it names nothing.
+ * price alert or a wakeup that woke the agent is written for the model too,
+ * and heads its turn as its row, which still draws when it names nothing.
  */
 function turnOpenerRow(event: HistoryEvent, pairIndex: number, text: string): MessageRecord | null {
   // Deterministic id keyed only on pairIndex (the server-side turn_index,
@@ -122,9 +150,10 @@ function turnOpenerRow(event: HistoryEvent, pairIndex: number, text: string): Me
   // second replay would silently double the visible history.
   const id = `history-user-${pairIndex}`;
   const timestamp = event.timestamp ? new Date(event.timestamp) : new Date();
-  if (event.query_type === 'market_target') {
-    return { ...wakeAlertRow(pairIndex, event.metadata, timestamp), isHistory: true };
-  }
+  const wake = event.query_type === 'market_target' || event.query_type === 'wakeup'
+    ? wakeTurnOpener(pairIndex, event.metadata, timestamp, event.query_type)
+    : null;
+  if (wake) return { ...wake, isHistory: true };
   if (event.query_type === 'system') {
     const source = event.metadata?.report_source;
     return source ? reportRow(source, {
@@ -188,6 +217,19 @@ export function handleHistoryUserMessage({
   });
 
   const messageContent = (event.content || '').trim();
+  // A user's turn with no words whose stored context names the `onboarding`
+  // skill opened hidden: the welcome flow's kickoff, the one send of that
+  // hidden skill. Its words were the skill's instruction, which no row keeps,
+  // so its reply carries the flag the live one did and the turn still offers
+  // no Regenerate. Other skills ride turns the user sent: attachments alone
+  // with Watch on name `market-watch`, and keep their Regenerate, since their
+  // input checkpoint holds the files.
+  const storedContext = event.metadata?.additional_context;
+  const opensHidden = !messageContent && !event.query_type && Array.isArray(storedContext)
+    && storedContext.some((ctx) => {
+      const entry = ctx as { type?: unknown; name?: unknown } | null;
+      return entry?.type === 'skills' && entry.name === 'onboarding';
+    });
 
   // Check if this message was recently sent (to avoid duplicates)
   const isDuplicate = messageContent && recentlySentTracker.isRecentlySent(messageContent);
@@ -278,6 +320,14 @@ export function handleHistoryUserMessage({
         newMessagesStartIndexRef.current = insertIndex + 1;
         return newMessages;
       });
+    } else if (!messageContent && event.query_type !== 'system' && !currentMessageRef.current) {
+      // No row, so nothing above took the turn's live copy away, and the
+      // placeholder below would draw the reply a second time beside it.
+      setMessages((prev: MessageRecord[]) => {
+        const { rest, removedAbove } = dropHiddenOpenerCopy(prev, pairIndex, newMessagesStartIndexRef.current);
+        newMessagesStartIndexRef.current -= removedAbove;
+        return rest;
+      });
     }
   }
 
@@ -310,6 +360,7 @@ export function handleHistoryUserMessage({
       contentSegments: [],
       reasoningProcesses: {},
       toolCallProcesses: {},
+      ...(opensHidden ? { hiddenOpener: true } : {}),
     };
 
     setMessages((prev: MessageRecord[]) => {
@@ -676,7 +727,7 @@ function lostSteerCopies(prev: MessageRecord[], entry: DeliveredSteer, pairIndex
 /**
  * Handles steering_delivered events in history replay. Creates user bubble(s)
  * for each steering message, a report's caption row for each report and a
- * price alert's row for each alert the turn took in, then a new assistant
+ * row for each price alert or wakeup the turn took in, then a new assistant
  * placeholder so subsequent events render in a fresh assistant bubble.
  */
 export function handleHistorySteeringDelivered({
@@ -713,10 +764,12 @@ export function handleHistorySteeringDelivered({
     const userMessage: MessageRecord = { ...row, isHistory: true };
     let delivered: string | null = null;
     setMessages((prev: MessageRecord[]) => {
-      // An alert's row has its notice's id live too, so a copy a stream left
-      // on screen gives way to this one, in its place in the turn.
+      // An alert's or a wakeup's row has its notice's id live too, so a copy
+      // a stream left on screen gives way to this one, in its place in the turn.
       const lost = isDeliveredSteer(entry) ? lostSteerCopies(prev, entry, pairIndex)
-        : isDeliveredMarketAlert(entry) ? prev.flatMap((m, i) => (m.id === row.id ? [i] : [])) : [];
+        : isDeliveredNotice(entry)
+          ? prev.flatMap((m, i) => (m.id === row.id ? [i] : []))
+          : [];
       if (lost.length > 0) delivered = (prev[lost[0]] as { requestKey?: string }).requestKey ?? null;
       const rest = lost.length === 0 ? prev : prev.filter((_, i) => !lost.includes(i));
       const idx = newMessagesStartIndexRef.current - lost.filter((i) => i < newMessagesStartIndexRef.current).length;

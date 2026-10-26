@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from decimal import Decimal
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -48,15 +48,26 @@ def cursor(request):
     async def _cursor(**_kwargs):
         yield cur
 
+    @asynccontextmanager
+    async def _transaction():
+        yield None
+
     class _Conn:
         cursor = staticmethod(_cursor)
+        transaction = staticmethod(_transaction)
 
     @asynccontextmanager
     async def _db():
         yield _Conn()
 
     module = getattr(request, "param", "order_reconciliation")
-    with patch(f"src.server.database.{module}.get_db_connection", new=_db):
+    with (
+        patch(f"src.server.database.{module}.get_db_connection", new=_db),
+        patch(
+            "src.server.database.order_reconciliation.fire_order_wakeups",
+            new=AsyncMock(return_value=[]),
+        ),
+    ):
         yield cur
 
 

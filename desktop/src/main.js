@@ -360,6 +360,33 @@ function watchLoads(win) {
   win.webContents.on('did-navigate', (_event, url, httpResponseCode) => {
     lastNav = { url, status: httpResponseCode }
   })
+  // A same-document navigation moves the URL and keeps the document, and the
+  // status is the document's. Both SPAs move their own URL as they boot: the
+  // app's first run goes / → /dashboard → /welcome by replaceState, and when
+  // that lands before the load event the URL read at `did-finish-load` is no
+  // longer the one `did-navigate` reported. Matched on the old URL alone, that
+  // load was credited with no status at all, and the first run that went
+  // straight into the welcome flow never recorded reaching the app. Main frame
+  // only: a subframe's in-page move is not this document changing its address.
+  win.webContents.on('did-navigate-in-page', (_event, url, isMainFrame) => {
+    if (isMainFrame === false || lastNav.url === null) return
+    lastNav = { url, status: lastNav.status }
+  })
+  // A load that fails still finishes: Chromium commits its own error document
+  // at the URL that failed and reports it with `did-fail-load`, never with
+  // `did-navigate`. A reload fails at the URL the window is already on, so the
+  // page it replaced was still paired with that URL, and the error document,
+  // which declares nothing, was credited with that page's 200 and revoked the
+  // flag on a server that was only unreachable. Forgotten here, the error
+  // document finishes with no status, and the next real load sets one again.
+  //
+  // ERR_ABORTED is left alone, as the outage screen leaves it. It commits no
+  // document, and it is how a load cut short by a newer one is reported. When
+  // the newer one is on another site, that report arrives after the newer
+  // one's `did-navigate`, so forgetting then would take that load's status.
+  win.webContents.on('did-fail-load', (_event, code, _description, _url, isMainFrame) => {
+    if (outage.shouldShow({ code, isMainFrame })) lastNav = { url: null, status: 0 }
+  })
 
   win.webContents.on('did-finish-load', async () => {
     const url = win.webContents.getURL()
@@ -421,10 +448,11 @@ function shellArgs({ chromeHidden }) {
     // editions install side by side, and an email link marked for the wrong one
     // opens the other build, or nothing.
     `--langalpha-shell-scheme=${config.scheme}`,
-    // Whether this build has a console to finish an integration login or
-    // install on. An edition with no platform origin drops those links, so it
-    // must not say it can.
-    `--langalpha-integration-returns=${origins.platformOrigin() ? '1' : ''}`,
+    // Whether this build has a console to finish a return from the browser on:
+    // an integration login or install, or a console page asked to be shown
+    // again. An edition with no platform origin drops those links, so it must
+    // not say it can.
+    `--langalpha-console-returns=${origins.platformOrigin() ? '1' : ''}`,
   ]
 }
 
@@ -658,12 +686,14 @@ function openDeepLink(win, raw, base) {
 }
 
 /**
- * An integration login or install handed back from the browser, already mapped
- * onto the console's callback page. It goes back to the page that started it:
- * the console window that sent the user to the browser, or else any window
- * showing the console. Either can be the one, and both can show it at once: an
- * account window opened before the console reserved the strip stays open after
- * the main window starts showing the console too.
+ * A return from the browser, already mapped onto a console page: an
+ * integration login or install landing on the console's callback page, or a
+ * console page asked to be shown again after a trip to a third party's page.
+ * It goes back to the page that started it: the console window that sent the
+ * user to the browser, or else any window showing the console. Either can be
+ * the one, and both can show it at once: an account window opened before the
+ * console reserved the strip stays open after the main window starts showing
+ * the console too.
  *
  * With no window showing the console, it goes wherever a navigation to the
  * console goes, decided here and before the load: `navigate` is loadURL and
@@ -672,10 +702,9 @@ function openDeepLink(win, raw, base) {
  * its own when the main one cannot show it.
  *
  * Restored as well as raised: the window may have been minimized while the
- * browser had the login or install, and show() does not bring a minimized
- * window back.
+ * browser had the user, and show() does not bring a minimized window back.
  */
-function openIntegrationReturn(url) {
+function openConsoleReturn(url) {
   const showsConsole = (w) => Boolean(w) && !w.isDestroyed()
     && (w === platformWindow || (w === mainWindow && origins.isPlatform(w.webContents.getURL())))
   let win = [lastSentOutWindow, mainWindow, platformWindow].find(showsConsole)
@@ -693,16 +722,26 @@ function openIntegrationReturn(url) {
   return win
 }
 
+// What the log says about a link addressed to the console that this build
+// refuses, by the kind `deeplink.toConsole` read it as. Never any of the link:
+// its values are the provider's or the third party's answer.
+const REFUSED_CONSOLE_LINK = {
+  integration: '[shell] ignoring an integration link this build cannot finish',
+  console: '[shell] ignoring a console link this build cannot open',
+}
+
 /** Where a link the OS handed us goes: every arrival path ends here. */
 function onDeepLink(raw) {
   // Settled before any window is picked, because the answer picks it, and never
   // left to fall through: the app's /callback would try to redeem the
-  // provider's answer as a sign-in. That includes an edition with no console,
-  // which has nowhere to finish one.
-  if (deeplink.isIntegrationReturn(raw)) {
-    const target = deeplink.toIntegrationUrl(raw)
-    if (target) openIntegrationReturn(target)
-    else console.warn('[shell] ignoring an integration link this build cannot finish')
+  // provider's answer as a sign-in. That covers an integration login or
+  // install and any link under the console host, so a console page this build
+  // does not know is dropped rather than redeemed, and it includes an edition
+  // with no console, which has nowhere to finish one.
+  const link = deeplink.toConsole(raw)
+  if (link) {
+    if (link.url) openConsoleReturn(link.url)
+    else console.warn(REFUSED_CONSOLE_LINK[link.kind])
     return
   }
 

@@ -14,7 +14,7 @@ from __future__ import annotations
 import logging
 
 from ptc_agent.agent.middleware.steering import SteeredReport
-from src.server.services.report_back.notify_turn import NotOwed
+from src.server.services.report_back.notify_turn import NotOwed, earlier_wake
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +39,6 @@ async def market_alert_offer(job: dict) -> SteeredReport | NotOwed | None:
     from src.server.services.features import user_feature_enabled
     from src.server.services.market_targets.delivery import (
         NOTICES,
-        earlier_wake,
         last_quote,
         owed,
         request_key,
@@ -65,7 +64,7 @@ async def market_alert_offer(job: dict) -> SteeredReport | NotOwed | None:
             f"its owner"
         )
     thread_id = str(target["conversation_thread_id"])
-    earlier = await earlier_wake(request_key(job_id), thread_id)
+    earlier = await earlier_wake(request_key(job_id), thread_id, log_prefix=_LOG)
     if earlier is not None:
         run_id = str(earlier["conversation_response_id"])
         if not await mt_db.mark_delivered(target_id, notice, run_id):
@@ -83,13 +82,13 @@ async def market_alert_offer(job: dict) -> SteeredReport | NotOwed | None:
     return SteeredReport(
         job_id=job_id,
         content=render_notice(target, notice, quote),
-        market_alert=notice_payload(target, notice),
+        shown={"market_alert": notice_payload(target, notice)},
     )
 
 
-async def stamp_held_alerts(job_ids: list[str], run_id: str) -> None:
-    """Stamp delivered to ``run_id`` each notice among ``job_ids`` it holds,
-    ahead of the confirm that closes their jobs.
+async def stamp_held_alerts(jobs: list[dict], run_id: str) -> None:
+    """Stamp delivered to ``run_id`` the notice of each held job in ``jobs``,
+    ahead of the confirm that closes them.
 
     A stamp that fails is logged and the job closed regardless: the notice
     is in the checkpointed message, and leaving the job open would show it
@@ -97,26 +96,18 @@ async def stamp_held_alerts(job_ids: list[str], run_id: str) -> None:
     """
     from src.server.database import market_targets as mt_db
 
-    try:
-        alerts = await mt_db.held_alerts(job_ids, run_id)
-    except Exception:
-        logger.warning(
-            f"{_LOG} Reading the notices run {run_id} holds failed", exc_info=True
-        )
-        return
-    for alert in alerts:
+    for job in jobs:
+        payload = job.get("payload") or {}
+        target_id, notice = payload.get("target_id"), payload.get("notice")
         try:
-            if not await mt_db.mark_delivered(
-                alert["target_id"], alert["notice"], run_id
-            ):
+            if not await mt_db.mark_delivered(target_id, notice, run_id):
                 logger.info(
-                    f"{_LOG} {alert['notice']} notice of target "
-                    f"{alert['target_id']} was already stamped when run {run_id} "
-                    f"took it in"
+                    f"{_LOG} {notice} notice of target {target_id} was already "
+                    f"stamped when run {run_id} took it in"
                 )
         except Exception:
             logger.warning(
-                f"{_LOG} Stamping the {alert['notice']} notice of target "
-                f"{alert['target_id']} to run {run_id} failed",
+                f"{_LOG} Stamping the {notice} notice of target {target_id} to "
+                f"run {run_id} failed",
                 exc_info=True,
             )

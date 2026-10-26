@@ -107,7 +107,10 @@ async def gate_capabilities(config, user_id: str, model_pref: dict) -> TierPermi
             # true tier is resolved here — lazily, Redis-cached, once per turn.
             from src.server.dependencies.usage_limits import _fetch_platform_tier
 
-            user_tier = await _fetch_platform_tier(user_id)
+            tier = await _fetch_platform_tier(user_id)
+            # Unknown (the platform down, nothing on record) gates as no plan:
+            # the turn loses a capability for the outage, not its answer.
+            user_tier = -1 if tier is None else tier
         return user_tier >= min_tier
 
     # The pair the search tool will run, so a depth the provider lacks reads

@@ -17,7 +17,6 @@ from langgraph.checkpoint.postgres import aio as postgres_aio
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.graph import START, StateGraph
 
-import src.server.utils.checkpointer  # noqa: F401  (installs the walk guard)
 from ptc_agent.agent.state import DeltaAgentState
 
 pytestmark = [pytest.mark.integration, pytest.mark.asyncio]

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import uuid
+from dataclasses import replace
 
 from src.server.database.workspace_folders import (
     TOMBSTONES_PER_PASS,
@@ -128,6 +129,16 @@ def test_a_staged_row_whose_target_is_held_goes_back_to_its_old_folder():
     rows = [row(A, "Macro", moving_path(A), previous=("Research",)), row(B, "Macro", "Macro")]
     plan = plan_folder_moves(rows, busy={B})
     assert moves(plan) == {A: ("Research", "Research")}
+
+
+def test_a_staged_row_with_no_room_to_copy_out_waits_while_its_backoff_lasts():
+    """Staged across an archive, it leaves staging only by a copy: moved on
+    every acquisition, it would copy until the disk filled, then delete, on
+    whichever target the last pass tried."""
+    staged = FolderRow(A, "Macro", moving_path(A), False, ("Research",), blocked="Macro")
+    assert not plan_folder_moves([staged])
+    assert not plan_folder_moves([replace(staged, blocked="Research")])
+    assert moves(plan_folder_moves([replace(staged, blocked=None)])) == {A: ("Research", "Macro")}
 
 
 def test_a_staged_row_falls_back_to_a_placeholder_when_its_old_folder_is_landed_on():

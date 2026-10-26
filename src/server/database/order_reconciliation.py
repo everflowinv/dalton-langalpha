@@ -27,6 +27,7 @@ from psycopg.rows import dict_row
 from src.server.database.order_attempts import row_as_json
 from src.server.database.pool import get_db_connection
 from src.server.database.session_lock import try_session_lock
+from src.server.database.wakeups.fire import fire_order_wakeups
 from src.server.services.brokerage_capabilities import OrderAction
 from src.server.services.brokerage_orders import OPEN_STATUSES, AttemptStatus
 from src.server.services.brokerage_orders.models import (
@@ -200,7 +201,7 @@ async def record_observation(
     )
     if not allowed:
         return None
-    async with get_db_connection() as conn:
+    async with get_db_connection() as conn, conn.transaction():
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 f"""
@@ -249,7 +250,27 @@ async def record_observation(
                     [str(s) for s in allowed],
                 ),
             )
-            return row_as_json(await cur.fetchone())
+            row = row_as_json(await cur.fetchone())
+        if row is not None:
+            await _fire_order_wakeups(conn, attempt_id)
+        return row
+
+
+async def _fire_order_wakeups(conn, attempt_id: str) -> None:
+    """Fire what this observation set off, committed with it.
+
+    In a savepoint, and a failure is only logged: the reading is the
+    ledger's fact and must land whatever happens to a wakeup on it, and the
+    wakeup sweep checks every armed order on its next pass, so a fire lost
+    here is late rather than missing.
+    """
+    try:
+        await fire_order_wakeups([attempt_id], conn=conn)
+    except Exception:
+        logger.warning(
+            "order wakeups not fired with the observation on attempt %s",
+            attempt_id, exc_info=True,
+        )
 
 
 @asynccontextmanager

@@ -554,6 +554,12 @@ export type AssistantMessage = {
   /** The reply to a send the server refused before admitting it (see
    *  UserMessage.unadmitted). */
   unadmitted?: boolean;
+  /** The reply to a send that drew no message of its own (a hidden opener),
+   *  so it opens its turn on screen. A replay of the turn has no opener row
+   *  to find this live copy by, and finds it by this instead. The replay
+   *  flags its own copy too, and a turn with it offers no Regenerate
+   *  (`hiddenOpenerTurns`). */
+  hiddenOpener?: boolean;
   /** Monotonic counter bumped by every landed reply text chunk or context
    *  notice (`nextArrivalSeq`). The streaming indicator reads it to tell
    *  arriving text from a pause. */
@@ -576,11 +582,23 @@ export type NotificationMessage = {
   /** Optional longer text (e.g. a compaction summary) surfaced via the
    *  notification's expand toggle. */
   detail?: string;
-  /** Set on a price alert's row, which is drawn from this instead of
-   *  `content`: a notification rides the turn it sits in, as the alert does. */
-  marketAlert?: import('@/pages/ChatAgent/session/marketWatchEvents').MarketAlert;
+  /** Set on a wakeup's row, a price alert's included, which is drawn from
+   *  this instead of `content`: a notification rides the turn it sits in, as
+   *  the wakeup does. */
+  wakeup?: WakeupArrival;
   isHistory?: boolean;
 };
+
+/**
+ * Wakeups reaching the thread, drawn as one row: `delivered` landed inside a
+ * running turn (one `steering_delivered` entry), `wake` started turn
+ * `turnIndex`, whose quiet fold finds it by that turn. `legacy` marks a price
+ * target's notice from before wakeups, whose row reads as a price alert even
+ * when the notice names nothing.
+ */
+export type WakeupArrival =
+  | { source: 'delivered'; notices: import('./wakeups').WakeNotice[]; legacy?: true }
+  | { source: 'wake'; notices: import('./wakeups').WakeNotice[]; turnIndex: number; legacy?: true };
 
 export type ChatMessage = UserMessage | AssistantMessage | NotificationMessage;
 

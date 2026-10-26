@@ -101,8 +101,8 @@ async def create_thread_endpoint(
 
     # Same credit gate the follow-up /messages call enforces — a quota-blocked
     # client must not mint durable rows + platform title calls through this
-    # door. byok is reported the same way the message path reports it, so both
-    # doors get the same verdict for the same user.
+    # door. byok and the surface are reported the same way the message path
+    # reports them, so both doors get the same verdict for the same user.
     if HOST_MODE != "oss":
         from src.server.database.api_keys import is_byok_active
         from src.server.database.oauth_tokens import has_any_oauth_token
@@ -111,7 +111,9 @@ async def create_thread_endpoint(
         is_byok, has_oauth = await asyncio.gather(
             is_byok_active(x_user_id), has_any_oauth_token(x_user_id)
         )
-        await enforce_credit_limit(x_user_id, byok=is_byok or has_oauth)
+        await enforce_credit_limit(
+            x_user_id, byok=is_byok or has_oauth, surface=request.platform
+        )
 
     # Decided where the message path decides it, so the thread is born in the
     # workspace its runs will actually use.
@@ -119,9 +121,12 @@ async def create_thread_endpoint(
     await route.bind(x_user_id, workspace)
     workspace_id = route.workspace_id
 
-    # Same stamp ensure_thread_exists would apply; also the CAS expectation
-    # the title generator swaps against.
-    stamped_title = request.first_query[:255]
+    # A title the caller named is the thread's own: nothing generates over it,
+    # since the first message may be no words of the user's at all. Else the
+    # same stamp ensure_thread_exists would apply, which is also the CAS
+    # expectation the title generator swaps against.
+    named_title = request.title
+    stamped_title = named_title if named_title is not None else request.first_query[:255]
 
     thread_id = str(uuid4())
     try:
@@ -133,12 +138,14 @@ async def create_thread_endpoint(
             title=stamped_title,
             platform=request.platform,
             subagents_allowed=request.subagents_allowed,
+            reasoning_effort=request.reasoning_effort,
+            fast_mode=request.fast_mode,
         )
     except Exception as e:
         logger.exception(f"Error pre-creating thread: {e}")
         raise HTTPException(status_code=500, detail="Failed to create thread")
 
-    title_task = schedule_title_generation(
+    title_task = None if named_title is not None else schedule_title_generation(
         thread_id=thread_id,
         user_id=x_user_id,
         first_query=request.first_query,
@@ -153,6 +160,8 @@ async def create_thread_endpoint(
         title=stamped_title,
         msg_type=row["msg_type"],
         subagents_allowed=row["subagents_allowed"],
+        reasoning_effort=row.get("reasoning_effort"),
+        fast_mode=row.get("fast_mode"),
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )

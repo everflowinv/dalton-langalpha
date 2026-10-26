@@ -487,12 +487,12 @@ class TestToolResultsPrecedeInjectedMedia:
             _media(),
             ToolMessage(content="file1", tool_call_id="toolu_B"),
         )
-        _, before = _format_messages(broken)
+        _, before = _format_messages(broken, model="claude-sonnet-4-6")
         assert [b["type"] for b in before[-1]["content"]] == [
             "tool_result", "text", "image", "tool_result"
         ], "precondition: the raw order interleaves a tool_result after content"
 
-        _, after = _format_messages(order_tool_results_first(broken))
+        _, after = _format_messages(order_tool_results_first(broken), model="claude-sonnet-4-6")
         kinds = [b["type"] for b in after[-1]["content"]]
         assert kinds.index("text") > max(
             i for i, k in enumerate(kinds) if k == "tool_result"
@@ -652,7 +652,7 @@ class TestPageStampStaysLocal:
         if one passed it through, it would be an unknown field in the payload."""
         from langchain_anthropic.chat_models import _format_messages
 
-        _, payload = _format_messages([_pdf_block(300)])
+        _, payload = _format_messages([_pdf_block(300)], model="claude-sonnet-4-6")
         document = [b for b in payload[0]["content"] if b["type"] == "document"][0]
         assert "pages" not in document
         assert "pages" not in document["source"]

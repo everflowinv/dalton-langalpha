@@ -82,7 +82,64 @@ async def test_the_profile_carries_no_model_preferences():
         ),
     ):
         profile = await get_user_profile_for_prompt("user-1")
-    assert set(profile) == {"name", "timezone", "locale", "agent_preference"}
+    assert set(profile) == {"name", "timezone", "locale", "agent_preference", "investment_profile"}
+
+
+@pytest.mark.asyncio
+async def test_the_profile_carries_the_structured_keys_alone_and_flat():
+    """Each becomes its own line of the prompt's profile and its own row when
+    it moves; the free-text keys stay in the profile file."""
+    cache = _FakeCache()
+    with (
+        _patch_cache(cache),
+        patch(
+            "src.server.database.user.get_user_with_preferences",
+            new_callable=AsyncMock,
+            return_value={
+                "user": {"name": "Ada"},
+                "preferences": {
+                    "risk_preference": {
+                        "risk_level": "growth",
+                        "risk_tolerance": "high-ish",
+                        "drawdown_reaction": "hold",
+                    },
+                    "investment_preference": {
+                        "investor_type": "student",
+                        "markets": ["us", "hk"],
+                        "approaches": ["technical"],
+                        "horizon": "long\nterm",
+                        "sectors": [],
+                        "brokerages": ["schwab", "other"],
+                        "holding_period": "years",
+                    },
+                    "agent_preference": {
+                        "research_depth": "light",
+                        "deliverable": "visual",
+                        "tone": "terse",
+                    },
+                },
+            },
+        ),
+    ):
+        profile = await get_user_profile_for_prompt("user-1")
+    # The agent keys are structured too, but reach the prompt whole: its
+    # Agent Preferences section turns them into guidance.
+    assert profile["agent_preference"] == {
+        "research_depth": "light",
+        "deliverable": "visual",
+        "tone": "terse",
+    }
+    # A value from before the key had a vocabulary is kept, folded onto one
+    # line; an empty list is no value; a key that lost its vocabulary
+    # (``drawdown_reaction``) is free text now and stays in the file.
+    assert profile["investment_profile"] == {
+        "risk_level": "growth",
+        "investor_type": "student",
+        "markets": ["us", "hk"],
+        "approaches": ["technical"],
+        "horizon": "long term",
+        "brokerages": ["schwab", "other"],
+    }
 
 
 @pytest.mark.asyncio

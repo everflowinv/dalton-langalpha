@@ -33,6 +33,7 @@ from ptc_agent.agent.middleware.background_subagent.spawn import (
     spawn_task_writer,
 )
 from ptc_agent.agent.middleware.background_subagent.subagent import (
+    PARENT_RUN_STATE_KEYS,
     arun_subagent_streaming,
     return_command_with_state_update,
 )
@@ -60,6 +61,8 @@ logger = structlog.get_logger(__name__)
 #   token of children after the first is silently dropped — and shifts the
 #   child's checkpoints out of the ``task:<id>`` namespace history readers
 #   expect.
+# - ``PARENT_RUN_STATE_KEYS`` — the launching run's resume and replay flags,
+#   dropped on the Task path too.
 #
 # The REMAINING ``__pregel_*`` internals (task_id, send/read, checkpointer,
 # runtime) are deliberately kept: they mark the child run as nested, which
@@ -67,14 +70,12 @@ logger = structlog.get_logger(__name__)
 # non-nested run gets its ns reset to "" and would write checkpoints into
 # the thread's ROOT namespace, which the writer guard refuses once the
 # launching turn's session ends.
-_DROPPED_CONFIGURABLE_KEYS = frozenset(
-    {
-        "checkpoint_ns",
-        "checkpoint_id",
-        "checkpoint_map",
-        "__pregel_scratchpad",
-    }
-)
+_DROPPED_CONFIGURABLE_KEYS = PARENT_RUN_STATE_KEYS | {
+    "checkpoint_ns",
+    "checkpoint_id",
+    "checkpoint_map",
+    "__pregel_scratchpad",
+}
 
 async def run_subagent_graph(
     subagent_graph: Any,

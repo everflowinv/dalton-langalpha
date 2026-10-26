@@ -31,6 +31,7 @@ from src.server.database import portfolio as portfolio_db
 from src.server.database import user as user_db
 from src.server.database import watchlist as watchlist_db
 from src.server.database.pool import get_db_connection
+from src.server.models.profile_vocabulary import check_profile
 from src.server.models.user import normalize_instrument_type, normalize_symbol
 from src.server.utils.db import UpdateQueryBuilder
 
@@ -1019,6 +1020,21 @@ def parse_preferences(content: str) -> dict[str, Any]:
             )
         result[key] = value
     return result
+
+
+def check_preferences(values: dict[str, Any], current: dict[str, Any] | None) -> dict[str, Any]:
+    """``parse_preferences``' values with each structured key checked and in
+    its stored spelling, against ``current`` as the save's transaction read
+    it: a value the row already holds passes, so a save that leaves one from
+    before the key had a vocabulary is not refused for it. Every problem is
+    named in one refusal, so one retry can fix them all."""
+    checked, problems = check_profile(values, current)
+    if problems:
+        path, hint = problems[0]
+        raise UserDataValidationError(
+            "schema_error", "preference.json", path, hint, problems=problems
+        )
+    return checked
 
 
 def preferences_equal(current: dict[str, Any] | None, values: dict[str, Any]) -> bool:

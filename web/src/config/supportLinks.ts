@@ -6,9 +6,16 @@
  */
 import { isPlatformMode } from './hostMode';
 
-export const PLAN_URL: string | null = isPlatformMode
-  ? `${import.meta.env.VITE_PLATFORM_URL || '/account'}/plans`
+/**
+ * The account portal's base, from `VITE_PLATFORM_URL`: a path on this origin or
+ * an absolute URL, with no trailing slash. Null outside platform mode, where the
+ * portal does not exist even if the variable is set.
+ */
+export const PLATFORM_URL: string | null = isPlatformMode
+  ? import.meta.env.VITE_PLATFORM_URL || '/account'
   : null;
+
+export const PLAN_URL: string | null = PLATFORM_URL ? `${PLATFORM_URL}/plans` : null;
 
 export const SUPPORT_EMAIL: string | null =
   (import.meta.env.VITE_CONTACT_EMAILS ?? '')

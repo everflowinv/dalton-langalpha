@@ -3,6 +3,7 @@
  */
 import { api } from '@/api/client';
 import type { Thread } from '@/types/api';
+import type { WakeupCancelResponse, WakeupsResponse } from '@/types/wakeups';
 
 export interface ThreadCreatedInfo {
   thread_id: string;
@@ -10,6 +11,9 @@ export interface ThreadCreatedInfo {
   thread_index: number;
   title: string;
   msg_type: string;
+  /** The tuning overrides the create stored, echoed back; null follows Settings. */
+  reasoning_effort?: string | null;
+  fast_mode?: boolean | null;
 }
 
 /**
@@ -18,27 +22,40 @@ export interface ThreadCreatedInfo {
  * Resolves with the created row so the caller can navigate and paint the
  * sidebar row immediately. The generated title is NOT awaited here: it lands
  * on the lifecycle feed's `thread_title` event (and on the next list refetch),
- * which is the single delivery path for it. Rejects on HTTP failure or
- * timeout — callers fall back to the legacy `__default__` send path.
+ * which is the single delivery path for it. A `title` the caller names is
+ * stored as given and none is generated. Rejects on HTTP failure or timeout —
+ * callers fall back to the legacy `__default__` send path.
  */
 export async function createThreadWithTitle(opts: {
   workspaceId?: string | null;
+  /** May be empty when `title` is given. */
   firstQuery: string;
+  /** The thread's title, in place of one generated from `firstQuery`. */
+  title?: string;
   platform?: string | null;
   /** Lets title generation resolve relative dates ("today") on the user's
    *  wall clock; the server reads UTC without it. */
   timezone?: string;
   /** Left out, the thread stores no value and follows the owner's default. */
   subagentsAllowed?: boolean;
+  /** The thread's own effort and fast mode, picked before it existed. Left
+   *  out, the thread follows Settings. */
+  reasoningEffort?: string;
+  fastMode?: boolean;
   timeoutMs?: number;
 }): Promise<ThreadCreatedInfo> {
-  const { workspaceId, firstQuery, platform, timezone, subagentsAllowed, timeoutMs = 8000 } = opts;
+  const {
+    workspaceId, firstQuery, title, platform, timezone, subagentsAllowed, reasoningEffort, fastMode, timeoutMs = 8000,
+  } = opts;
 
   const body: Record<string, unknown> = { first_query: firstQuery };
+  if (title) body.title = title;
   if (workspaceId) body.workspace_id = workspaceId;
   if (platform) body.platform = platform;
   if (timezone) body.timezone = timezone;
   if (subagentsAllowed !== undefined) body.subagents_allowed = subagentsAllowed;
+  if (reasoningEffort !== undefined) body.reasoning_effort = reasoningEffort;
+  if (fastMode !== undefined) body.fast_mode = fastMode;
 
   const { data } = await api.post<ThreadCreatedInfo>('/api/v1/threads', body, { timeout: timeoutMs });
   return data;
@@ -55,38 +72,16 @@ export async function getThread(threadId: string): Promise<Thread> {
   return data;
 }
 
-export type MarketTargetKind = 'above' | 'below' | 'pct_up' | 'pct_down';
-export type MarketTargetPctFrom = 'previous_close' | 'now';
-export type MarketTargetStatus = 'armed' | 'fired' | 'expired' | 'cancelled';
-
-/** A price level or % move the agent set on this thread. `value` is a price
- *  for `above`/`below` and a percent (3 = 3%) for the pct kinds. */
-export interface MarketTarget {
-  target_id: string;
-  symbol: string;
-  kind: MarketTargetKind;
-  value: number;
-  pct_from: MarketTargetPctFrom | null;
-  armed_price: number | null;
-  status: MarketTargetStatus;
-  expires_at: string;
-  fired_at: string | null;
-  fired_price: number | null;
-  created_at: string;
-}
-
 export interface MarketWatchResponse {
   thread_id: string;
   symbols: string[];
-  /** Armed targets plus those settled in the last day, newest first. */
-  targets?: MarketTarget[];
 }
 
 /**
  * Fetch the thread's current market-watch list (the tickers the agent is
- * live-stamping) and its price targets. Returns an empty `symbols` array when
- * watch is off. Used to seed the persistent watch chip on thread load and to
- * refetch after a turn.
+ * live-stamping). Returns an empty `symbols` array when watch is off. Used
+ * to seed the persistent watch chip on thread load and to refetch after a
+ * turn.
  */
 export async function fetchMarketWatch(threadId: string): Promise<MarketWatchResponse> {
   if (!threadId) throw new Error('Thread ID is required');
@@ -94,13 +89,24 @@ export async function fetchMarketWatch(threadId: string): Promise<MarketWatchRes
   return data;
 }
 
-/** Cancel one armed target. `cancelled` is false when it had already fired,
- *  expired or been cancelled, which a refetch then shows. */
-export async function cancelMarketTarget(threadId: string, targetId: string): Promise<{ cancelled: boolean }> {
+/** The thread's wakeups: pending ones, those that ended in the last day, and
+ *  price targets set before wakeups existed. */
+export async function fetchWakeups(threadId: string): Promise<WakeupsResponse> {
   if (!threadId) throw new Error('Thread ID is required');
-  const { data } = await api.delete<{ cancelled: boolean }>(
-    `/api/v1/threads/${threadId}/market-watch/targets/${encodeURIComponent(targetId)}`,
-  );
+  const { data } = await api.get<WakeupsResponse>(`/api/v1/threads/${threadId}/wakeups`);
+  return data;
+}
+
+/** Cancel the named wakeups, or every one with `'all'`. The answer carries each
+ *  outcome and the listing as it stands, so a `too_late` one shows where it is;
+ *  the listing is null when the server could not read it after the cancel. */
+export async function cancelWakeups(
+  threadId: string,
+  which: readonly string[] | 'all',
+): Promise<WakeupCancelResponse> {
+  if (!threadId) throw new Error('Thread ID is required');
+  const body = which === 'all' ? { all: true } : { wakeup_ids: which };
+  const { data } = await api.post<WakeupCancelResponse>(`/api/v1/threads/${threadId}/wakeups/cancel`, body);
   return data;
 }
 
@@ -160,10 +166,17 @@ export interface ThreadUpdates {
   /** Whether the agent may hand work to subagents on this thread. `null`
    *  returns it to following the user's default. */
   subagents_allowed?: boolean | null;
+  /** The thread's own reasoning effort, stored as sent. `null` returns it to
+   *  following Settings. */
+  reasoning_effort?: string | null;
+  /** The thread's own fast mode, stored as sent. `null` returns it to
+   *  following Settings. */
+  fast_mode?: boolean | null;
 }
 
 /**
- * Update user-editable thread fields (title, pin, archive, model, subagents) via PATCH.
+ * Update user-editable thread fields (title, pin, archive, model, subagents,
+ * effort, fast mode) via PATCH.
  * Only the keys present in `updates` are applied server-side.
  */
 export async function updateThread(threadId: string, updates: ThreadUpdates): Promise<Thread> {

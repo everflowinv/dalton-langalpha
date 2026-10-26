@@ -25,6 +25,11 @@ const NOTICE = {
   fired_at: '2030-01-01T15:05:00Z',
   expires_at: null,
 } as const;
+// The notice as a price wakeup's, which its row is drawn from.
+const AS_WAKEUP = {
+  wakeup_id: 'tg-1', kind: 'price', notice: 'fire', seq: 1, total: 1, fired_at: '2030-01-01T15:05:00Z',
+  price: { symbol: 'ACME', kind: 'above', value: 205, pct_from: null, fired_price: 205.12 },
+};
 
 function setup(extra: Array<Record<string, unknown>> = []) {
   let messages = [
@@ -47,7 +52,7 @@ function setup(extra: Array<Record<string, unknown>> = []) {
     lastEventIdRef: { current: null },
     threadIdRef: { current: 'thread-1' },
   };
-  const deps = { clearModelStatus: () => {}, refreshMarketWatch: vi.fn(), refreshWorkspaceFolder: null };
+  const deps = { clearModelStatus: () => {}, refreshMarketWatch: vi.fn(), refreshWakeups: vi.fn(), refreshWorkspaceFolder: null };
   const refs = {
     contentOrderCounterRef: { current: 0 },
     currentReasoningIdRef: { current: null },
@@ -76,16 +81,16 @@ describe('live: a wake turn attached to its run', () => {
     expect(read()[2]).toMatchObject({
       role: 'notification',
       content: '',
-      marketAlert: { source: 'wake', notices: [NOTICE] },
+      wakeup: { source: 'wake', legacy: true, notices: [AS_WAKEUP] },
     });
     expect(read()[2].isHistory).toBeUndefined();
     expect(read()[3]).toMatchObject({ turnIndex: 1 });
   });
 
-  it('re-reads the targets, since the wake spent one', () => {
+  it('re-reads the wakeups, since the wake spent one', () => {
     const { metadata, deps } = setup();
     metadata({ market_target: NOTICE });
-    expect(deps.refreshMarketWatch).toHaveBeenCalledTimes(1);
+    expect(deps.refreshWakeups).toHaveBeenCalledTimes(1);
   });
 
   it('keeps the row a replay drew for the turn, and draws one for a re-attach', () => {
@@ -102,6 +107,24 @@ describe('live: a wake turn attached to its run', () => {
     const { metadata, read, deps } = setup();
     metadata();
     expect(read().some((m) => m.role === 'notification')).toBe(false);
-    expect(deps.refreshMarketWatch).not.toHaveBeenCalled();
+    expect(deps.refreshWakeups).not.toHaveBeenCalled();
+  });
+});
+
+describe('live: a wakeup wake turn attached to its run', () => {
+  // Made-up label only.
+  const WAKE = {
+    wakeup_id: 'wk-1', short_id: 'w_ab12', label: 'morning check', kind: 'at', notice: 'fire',
+    seq: 1, total: 1, last: true, skipped: 0, fired_at: '2030-01-01T15:05:00Z',
+  };
+
+  it("draws the wakeup row from the run's first frame, keyed as replay keys it, and re-reads the wakeups", () => {
+    const { metadata, read, deps } = setup();
+    metadata({ wakeup: { v: 1, notices: [WAKE] } });
+    metadata({ wakeup: { v: 1, notices: [WAKE] } });
+
+    expect(read().map((m) => m.id)).toEqual(['u0', 'h0', 'history-wakeup-wake-1', 'a1']);
+    expect(read()[2]).toMatchObject({ role: 'notification', wakeup: { source: 'wake', turnIndex: 1, notices: [WAKE] } });
+    expect(deps.refreshWakeups).toHaveBeenCalled();
   });
 });

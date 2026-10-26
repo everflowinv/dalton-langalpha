@@ -53,6 +53,16 @@ def _target(
     }
 
 
+@pytest.fixture(autouse=True)
+def _no_price_wakeups():
+    """The monitor reads price wakeups beside targets; these tests hold none."""
+    with patch(
+        "src.server.database.wakeups.read.list_armed_price_wakeups",
+        AsyncMock(return_value=[]),
+    ):
+        yield
+
+
 def _now_ms():
     return int(time.time() * 1000)
 

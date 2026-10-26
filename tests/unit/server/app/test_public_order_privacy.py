@@ -346,3 +346,66 @@ async def test_replay_drops_every_interrupt(client, request_):
     assert request_["type"] not in body
     ids = [line[len("id: ") :] for line in body.splitlines() if line.startswith("id: ")]
     assert ids == ["1", "2", "3", "4"]
+
+
+async def test_replay_keeps_a_wakeup_on_an_order_to_its_label(client):
+    """A wakeup on an order names the order and its fill wherever it reaches a
+    turn: the wake turn's own prompt, the notice on its query row and on a
+    running turn's steering entry, and the agent's ``schedule_wakeup`` call
+    and answer. A viewer keeps what names the row: the label and the kind."""
+    order = {
+        "vendor_order_id": "900104",
+        "summary": "Buy 7 AAPL",
+        "outcome": "filled",
+        "filled_qty": 7,
+        "qty": 7,
+        "avg_fill_price": 187.25,
+        "currency": "USD",
+        "reason": None,
+    }
+    notice = {
+        "wakeup_id": "w-1",
+        "short_id": "w_ab12",
+        "label": "AAPL buy fill",
+        "kind": "order",
+        "notice": "fire",
+        "order": order,
+    }
+    steered = {
+        "event": "steering_delivered",
+        "data": {"messages": [{"content": "", "wakeup": notice, "timestamp": 1.0}]},
+    }
+    set_call = _call(
+        "schedule_wakeup",
+        {"triggers": [{"order": "900104", "label": "AAPL buy fill"}]},
+    )
+    set_answer = {
+        "event": "tool_call_result",
+        "data": {
+            "tool_call_id": "call_abc",
+            "content": "- w_ab12 (AAPL buy fill): order 900104, Buy 7 AAPL.",
+            "artifact": {"quiet": False, "changed": True},
+        },
+    }
+    body, events = await _replay(
+        client,
+        [steered, set_call, set_answer],
+        later_events=[],
+        later_metadata={"wakeup": {"v": 1, "notices": [notice]}},
+        later_query={
+            "type": "wakeup",
+            "content": "<wakeup>order 900104 filled 7 at 187.25</wakeup>",
+        },
+    )
+    for value in ("900104", "187.25", "Buy 7 AAPL"):
+        assert value not in body
+    wake = [e for e in events if e["event"] == "user_message"][1]
+    assert wake["data"]["content"] == ""
+    shown = {k: v for k, v in notice.items() if k != "order"}
+    assert wake["data"]["metadata"]["wakeup"] == {"v": 1, "notices": [shown]}
+    entry = next(e for e in events if e["event"] == "steering_delivered")
+    assert entry["data"]["messages"][0]["wakeup"] == shown
+    call = next(e for e in events if e["event"] == "tool_calls")
+    assert call["data"]["tool_calls"][0]["args"] == {
+        "triggers": [{"label": "AAPL buy fill"}]
+    }

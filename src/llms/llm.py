@@ -22,6 +22,7 @@ from .preferences import compaction_profile_for
 from .pricing_utils import get_price_tier
 from .reasoning import apply_reasoning_effort
 from .reasoning_lineage import ROUTE_ENDPOINT_SEP
+from .task_costs import task_cost
 
 load_dotenv()
 
@@ -237,6 +238,14 @@ class ModelConfig:
             price_tier = get_price_tier(model_info.get("model_id", model_name), provider)
             if price_tier is not None:
                 entry["price"] = price_tier
+            # What a typical benchmark task costs at each level the model
+            # offers, against a baseline model (see task_costs.py). Read by the
+            # manifest key alone: a variant on another route, such as an OAuth
+            # or regional key, is priced on its own terms, so it shows no figure
+            # rather than borrowing its parent's.
+            costs = task_cost(model_name, efforts)
+            if costs is not None:
+                entry["task_cost"] = costs
             # Mark variants that require their own API key (different env_key from parent).
             # e.g. z-ai-cn needs ZAI_CN_API_KEY, not ZAI_API_KEY.
             parent_provider = provider_info.get("parent_provider")

@@ -1,5 +1,5 @@
 /** The thread row fields a composer saves itself (`useThreadFieldSave`). */
-export type ThreadField = 'llm_model' | 'subagents_allowed';
+export type ThreadField = 'llm_model' | 'subagents_allowed' | 'reasoning_effort' | 'fast_mode';
 
 /**
  * The mutation identity of a save of one field on one thread, so a settle,

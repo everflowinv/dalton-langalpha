@@ -443,17 +443,19 @@ def operator_request(shape: str | None) -> Iterator[None]:
         _in_operator_request.reset(token)
 
 
-def _splice_operator_entries(original: Callable[..., Any], messages: Any) -> Any:
+def _splice_operator_entries(
+    original: Callable[..., Any], messages: Any, *args: Any, **kwargs: Any
+) -> Any:
     """Format the runs between tagged messages and put each entry back in place.
 
-    The untouched original formats each run, so a message the caller did not
-    tag takes the exact path it took before, and a second untagged system
-    message is still the refusal it always was.
+    The untouched original formats each run, with the caller's own arguments,
+    so a message the caller did not tag takes the exact path it took before,
+    and a second untagged system message is still the refusal it always was.
     """
     msgs = list(messages)
     cuts = [i for i, m in enumerate(msgs) if i > 0 and is_operator_system_message(m)]
     if not cuts:
-        return original(msgs)
+        return original(msgs, *args, **kwargs)
 
     # DALTON-HOOK(upstream-backport-596): upstream 86ce2f02c, placement rule for mid-turn system entries.
     system: Any = None
@@ -461,7 +463,7 @@ def _splice_operator_entries(original: Callable[..., Any], messages: Any) -> Any
     spliced: list[int] = []
     start = 0
     for cut in [*cuts, len(msgs)]:
-        run_system, run_formatted = original(msgs[start:cut])
+        run_system, run_formatted = original(msgs[start:cut], *args, **kwargs)
         if run_system is not None:
             if system is not None:
                 msg = "Received multiple non-consecutive system messages."
@@ -515,7 +517,9 @@ def _install_format_bridge() -> None:
     builder, with no client argument, so a subclass cannot reach it; the
     ContextVar is the only handle for telling a composed call from any other
     Anthropic call in the process. Outside the window the wrapper is one extra
-    call to the original.
+    call to the original. Every argument past the messages is passed through
+    untouched: langchain-anthropic 1.7 made ``model`` a required keyword, and
+    its private signature can grow again without notice.
     """
     global _bridge_installed
     try:
@@ -534,10 +538,10 @@ def _install_format_bridge() -> None:
     if getattr(original, "_operator_bridge", False):
         return
 
-    def _bridged(messages):
+    def _bridged(messages, *args, **kwargs):
         if not _in_operator_request.get():
-            return original(messages)
-        return _splice_operator_entries(original, messages)
+            return original(messages, *args, **kwargs)
+        return _splice_operator_entries(original, messages, *args, **kwargs)
 
     _bridged._operator_bridge = True
     chat_models._format_messages = _bridged

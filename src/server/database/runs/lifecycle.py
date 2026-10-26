@@ -38,6 +38,7 @@ from src.server.database.runs.outbox import (
 )
 from src.server.contracts.status import TERMINAL_STATUSES
 from src.server.database.provenance import MAIN_PROVENANCE_LANE
+from src.server.database.runs.hook_jobs import is_unchanged_quiet
 from src.server.utils.pg_sanitize import SafeJson, normalize_uuid
 
 logger = logging.getLogger(__name__)
@@ -610,6 +611,36 @@ class _AlreadyTerminal(Exception):
     """Internal control flow: guarded UPDATE matched zero rows."""
 
 
+async def _keep_seen_over_quiet(
+    conn, thread_id: str, run_seq: Optional[int]
+) -> Optional[int]:
+    """Carry the thread's seen pointer over a quiet check that changed nothing,
+    and return where it now stands, or None when it stayed.
+
+    Every settled run past the pointer marks the thread unseen, so without
+    this each quiet check of a series would badge it. Only a thread the user
+    had seen up to this run is carried: one with unseen turns stays unseen.
+    """
+    if run_seq is None:
+        return None
+    async with conn.cursor() as cur:
+        await cur.execute(
+            """
+            UPDATE conversation_threads
+            SET last_seen_run_seq = GREATEST(COALESCE(last_seen_run_seq, 0), %(seq)s)
+            WHERE conversation_thread_id = %(thread)s
+              AND COALESCE(last_seen_run_seq, 0) >= (
+                  SELECT COALESCE(MAX(run_seq), 0) FROM conversation_responses
+                  WHERE conversation_thread_id = %(thread)s AND run_seq < %(seq)s
+              )
+            RETURNING last_seen_run_seq
+            """,
+            {"seq": run_seq, "thread": thread_id},
+        )
+        row = await cur.fetchone()
+    return row[0] if row else None
+
+
 async def finalize_run(
     *,
     run_id: str,
@@ -658,6 +689,7 @@ async def finalize_run(
         replay_facts["error_frame"] = record.error_frame
     if outcome.images:
         replay_facts["images"] = outcome.images
+    run_metadata = dict(outcome.metadata or {})
     # A checkpoint the run did not write was there before START. For a fork
     # whose run died before its first step, that is the abandoned branch's
     # tip, under the rows START truncated to the fork, so the pointer stays
@@ -712,7 +744,7 @@ async def finalize_run(
                             status,
                             outcome.interrupt_reason,
                             status,
-                            SafeJson(outcome.metadata or {}),
+                            SafeJson(run_metadata),
                             outcome.warnings or [],
                             outcome.errors or [],
                             outcome.execution_time,
@@ -751,6 +783,12 @@ async def finalize_run(
                         f"thread projection update failed for thread={thread_id}"
                     )
 
+                seen_run_seq = None
+                if final_status == "completed" and is_unchanged_quiet(run_meta):
+                    seen_run_seq = await _keep_seen_over_quiet(
+                        conn, thread_id, run_row["run_seq"]
+                    )
+
                 await qr_db._sync_provenance_for_response(
                     conn,
                     conversation_response_id=run_id,
@@ -769,7 +807,9 @@ async def finalize_run(
                 # START-stamped metadata, selected on the CAS-ADOPTED status
                 # (durable cancel intent can flip error->cancelled). No caller
                 # can attach, override, or forget them.
-                jobs = build_finalize_jobs_from_run_row(run_row)(final_status)
+                jobs = build_finalize_jobs_from_run_row(
+                    run_row, last_seen_run_seq=seen_run_seq
+                )(final_status)
                 if jobs:
                     await enqueue_hooks(
                         conn, run_id=run_id, thread_id=thread_id, jobs=jobs

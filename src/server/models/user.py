@@ -8,6 +8,8 @@ from uuid import UUID
 from market_protocol import display_spelling
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, StrictBool, field_validator
 
+from src.server.models.profile_vocabulary import STRUCTURED_PREFERENCES
+
 
 # =============================================================================
 # Symbol Normalization
@@ -52,13 +54,24 @@ def normalize_instrument_type(v: Any) -> Any:
 # =============================================================================
 
 
+def _doc(column: str, key: str) -> str:
+    """A structured key's description, the one its vocabulary carries."""
+    return STRUCTURED_PREFERENCES[column][key].doc
+
+
 class RiskPreference(BaseModel):
     """Risk preference settings stored in JSONB."""
 
     model_config = ConfigDict(extra="allow")
 
+    # The structured keys are Any and checked in the endpoint instead
+    # (``check_profile`` in ``profile_vocabulary``). Every response model
+    # parses the stored row, so a type here would fail the read of a value
+    # saved before the key had one; and a vocabulary refusal and a type
+    # refusal then share one 422 shape.
+    risk_level: Optional[Any] = Field(None, description=_doc("risk_preference", "risk_level"))
     risk_tolerance: Optional[str] = Field(
-        None, description="Risk tolerance description"
+        None, description="Free-text risk tolerance, from before risk_level"
     )
 
 
@@ -67,11 +80,28 @@ class InvestmentPreference(BaseModel):
 
     model_config = ConfigDict(extra="allow")
 
+    investor_type: Optional[Any] = Field(
+        None, description=_doc("investment_preference", "investor_type")
+    )
+    experience: Optional[Any] = Field(None, description=_doc("investment_preference", "experience"))
+    help_with: Optional[Any] = Field(None, description=_doc("investment_preference", "help_with"))
+    familiar_instruments: Optional[Any] = Field(
+        None, description=_doc("investment_preference", "familiar_instruments")
+    )
+    markets: Optional[Any] = Field(None, description=_doc("investment_preference", "markets"))
+    asset_classes: Optional[Any] = Field(
+        None, description=_doc("investment_preference", "asset_classes")
+    )
+    approaches: Optional[Any] = Field(None, description=_doc("investment_preference", "approaches"))
+    styles: Optional[Any] = Field(None, description=_doc("investment_preference", "styles"))
+    horizon: Optional[Any] = Field(None, description=_doc("investment_preference", "horizon"))
+    sectors: Optional[Any] = Field(None, description=_doc("investment_preference", "sectors"))
+    brokerages: Optional[Any] = Field(None, description=_doc("investment_preference", "brokerages"))
     company_interest: Optional[str] = Field(
         None, description="Type of companies interested in"
     )
     holding_period: Optional[str] = Field(
-        None, description="Preferred holding period"
+        None, description="Free-text holding period, from before horizon"
     )
     analysis_focus: Optional[str] = Field(
         None, description="Primary analysis focus area"
@@ -83,13 +113,16 @@ class AgentPreference(BaseModel):
 
     model_config = ConfigDict(extra="allow")
 
+    # Any, and checked in the endpoint, for the reasons RiskPreference gives.
+    # A null survives the parse too, which the JSONB merge reads as deleting
+    # the key: Settings' switch sends one to go back to markdown.
+    research_depth: Optional[Any] = Field(None, description=_doc("agent_preference", "research_depth"))
+    deliverable: Optional[Any] = Field(None, description=_doc("agent_preference", "deliverable"))
+    proactivity: Optional[Any] = Field(None, description=_doc("agent_preference", "proactivity"))
     output_style: Optional[str] = Field(
         None, description="Preferred output style"
     )
-    output_format: Optional[str] = Field(
-        None,
-        description="Preferred output format: 'markdown' or 'html' (absent = default). Not a Literal so the endpoint validates and None-means-delete JSONB-merge semantics are preserved.",
-    )
+    output_format: Optional[Any] = Field(None, description=_doc("agent_preference", "output_format"))
 
 
 class OtherPreference(BaseModel):

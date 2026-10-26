@@ -8,12 +8,15 @@ Gate hierarchy:
                                            checks.  Can be absent even when
                                            HOST_MODE is "platform" (partial deploy).
 
-Fail-open: when the platform service is unreachable, requests are allowed.
+Fail-open: when the platform service is unreachable, requests are allowed,
+except by the credit gate and by a plan that is on record nowhere, which both
+answer 503 rather than guess.
 """
 
 import asyncio
 import logging
 import os
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Annotated, Optional
@@ -37,16 +40,21 @@ class QuotaServiceUnavailable(Exception):
     """
 
 
-# One retry covers the common outage: the quota service deploys in place, so it
-# is unreachable for seconds, not minutes. Deterministic 4xx answers (a rejected
-# service token, a malformed request) are not retried — they will not change.
+# The quota service deploys in place and refuses connections while it restarts,
+# for about five seconds. Strict callers retry on this schedule, 7.5 s of waiting
+# in all, so a check that lands in that gap waits it out; an outage that outlasts
+# it is real, and they fail closed. Deterministic 4xx answers (a rejected service
+# token, a malformed request) are not retried: they will not change.
 #
 # Only ``strict`` callers retry. For everyone else an unanswered check already
-# means "carry on", so a second attempt buys a slightly better answer at the
-# cost of a second per call — including inside the always-on reconciler, which
-# probes once per owner. The caller that pays for accuracy is the one that
-# blocks on it.
-_VALIDATE_RETRY_BACKOFF = 1.0  # seconds
+# means "carry on", so more attempts buy a slightly better answer at the cost of
+# seconds per call, including inside the always-on reconciler, which probes once
+# per owner. The caller that pays for accuracy is the one that blocks on it.
+_VALIDATE_RETRY_DELAYS = (0.5, 1.0, 2.0, 2.0, 2.0)  # seconds before each retry
+# The schedule assumes a refused connection, which fails at once. A service that
+# accepts and then hangs costs the client timeout per attempt, so no wait starts
+# that would end past this, and only the attempt already under way runs over.
+_VALIDATE_RETRY_WINDOW = 8.0  # seconds from the first attempt
 
 # Long enough that a retry lands after an in-place restart, short enough that a
 # client which honours it does not look hung.
@@ -130,13 +138,35 @@ def service_token_missing() -> bool:
     ).strip()
 
 
+def quota_service_unavailable() -> HTTPException:
+    """The 503 for a request the quota service gave no verdict on.
+
+    One shape for every gate that refuses rather than guess, so a client shows
+    an outage and retries instead of reading the status as a quota denial or a
+    missing plan.
+    """
+    return HTTPException(
+        status_code=503,
+        detail={
+            # Same wording the quota service uses for its own guard, so the
+            # user reads one sentence whichever side went dark.
+            "message": "Service temporarily unavailable. Please try again shortly.",
+            "type": "service_unavailable",
+            "retry_after": _SERVICE_UNAVAILABLE_RETRY_AFTER,
+        },
+        headers={"Retry-After": str(_SERVICE_UNAVAILABLE_RETRY_AFTER)},
+    )
+
+
 @dataclass
 class ChatAuthResult:
     """Auth + tier data collected by enforce_chat_limit for downstream gates."""
     user_id: str
     is_byok: bool = False
     has_oauth: bool = False
-    access_tier: int = -1  # -1 = no platform access, 0+ = tier level
+    # -1 = no platform access, 0+ = tier level, None = the platform could not
+    # be asked and no membership is on record for this user.
+    access_tier: Optional[int] = -1
     burst_slot_id: Optional[str] = None  # ZSET member held for this request
 
 
@@ -268,7 +298,7 @@ async def enforce_chat_limit(
 
     # Platform access tier — only when quota service is available and user
     # has no own-key path (BYOK or OAuth already grants access).
-    tier = -1
+    tier: Optional[int] = -1
     if HOST_MODE != "oss" and AUTH_SERVICE_URL and not is_byok and not has_oauth:
         tier = await _fetch_platform_tier(user_id)
 
@@ -281,12 +311,18 @@ async def enforce_chat_limit(
     )
 
 
-async def enforce_credit_limit(user_id: str, *, byok: bool = False) -> None:
+async def enforce_credit_limit(
+    user_id: str, *, byok: bool = False, surface: str | None = None
+) -> None:
     """Check credit quota via the auth/quota service. Raises 429 if denied.
 
     No-op in OSS mode. ``byok`` is forwarded, not branched on: which pools apply
     to a key the user pays for themselves is the platform's rule to state, and
-    this service only relays the verdict it gets back.
+    this service only relays the verdict it gets back. ``surface`` is the same:
+    where the turn came from (the request's ``platform``, e.g. ``web`` or
+    ``slack``), sent only when the turn names one. The auth service may apply
+    its own policy to it, and its refusal comes back as any other does, its
+    message and type relayed as sent.
 
     This is the one gate that fails **closed** (503). The others admit on an
     unanswered check because the worst case is bounded and self-correcting; here
@@ -302,21 +338,11 @@ async def enforce_credit_limit(user_id: str, *, byok: bool = False) -> None:
 
     try:
         result = await _call_validate_for_user(
-            user_id, check_quota="chat", byok=byok, strict=True
+            user_id, check_quota="chat", byok=byok, surface=surface, strict=True
         )
     except QuotaServiceUnavailable as e:
         logger.error("Credit gate closed — quota service gave no verdict (%s)", e)
-        raise HTTPException(
-            status_code=503,
-            detail={
-                # Same wording the quota service uses for its own guard, so the
-                # user reads one sentence whichever side went dark.
-                "message": "Service temporarily unavailable. Please try again shortly.",
-                "type": "service_unavailable",
-                "retry_after": _SERVICE_UNAVAILABLE_RETRY_AFTER,
-            },
-            headers={"Retry-After": str(_SERVICE_UNAVAILABLE_RETRY_AFTER)},
-        ) from e
+        raise quota_service_unavailable() from e
 
     if result is None:
         return  # OSS mode reached this only via a race on HOST_MODE; nothing to check.
@@ -350,14 +376,15 @@ async def _call_validate_for_user(
     check_quota: Optional[str] = None,
     byok: bool = False,
     strict: bool = False,
+    surface: str | None = None,
 ) -> Optional[dict]:
     """POST to the auth/quota service at /api/auth/validate.
 
     Returns None in OSS mode. When the service cannot be reached, ``strict``
-    callers get :class:`QuotaServiceUnavailable` (after one retry) and everyone
-    else gets None on the first failure, which each of them reads as "carry on"
-    — see the fail-open notes at those call sites for why that is safe there and
-    not at the credit gate.
+    callers get :class:`QuotaServiceUnavailable` once the retry schedule runs
+    out, and everyone else gets None on the first failure, which most of them
+    read as "carry on". See the fail-open notes at those call sites for why that
+    is safe there and not at the credit gate.
     """
     if not platform_gating_active():
         return None
@@ -370,13 +397,20 @@ async def _call_validate_for_user(
         body["check_quota"] = check_quota
     if byok:
         body["byok"] = True
+    if surface:
+        body["surface"] = surface
 
     url = f"{AUTH_SERVICE_URL.rstrip('/')}/api/auth/validate"
     reason = "unknown"
+    delays = _VALIDATE_RETRY_DELAYS if strict else ()
+    give_up_at = time.monotonic() + _VALIDATE_RETRY_WINDOW
 
-    for attempt in range(2 if strict else 1):
+    for attempt in range(len(delays) + 1):
         if attempt:
-            await asyncio.sleep(_VALIDATE_RETRY_BACKOFF)
+            delay = delays[attempt - 1]
+            if time.monotonic() + delay > give_up_at:
+                break
+            await asyncio.sleep(delay)
         try:
             resp = await client.post(url, json=body if body else None, headers=headers)
         except Exception as e:
@@ -460,18 +494,46 @@ async def enforce_computer_limit(
 
 _PLATFORM_MEMBERSHIP_CACHE_TTL = 300  # 5 minutes
 
+# The last membership the platform gave, kept to stand in while it cannot be
+# asked. Long, because it is read only during an outage and the credit gate
+# still asks about every turn: a plan that changed meanwhile is wrong for the
+# length of the outage at most, and spends nothing the gate did not allow.
+_PLATFORM_MEMBERSHIP_LAST_KNOWN_TTL = 30 * 24 * 3600  # 30 days
+
+# After a failed ask, requests for that user stop asking for this long and read
+# the last-known membership instead, so a down or hanging platform is not called
+# on every request. Matches the Retry-After an unknown membership answers with,
+# so a client that honours it asks again once the pause is over.
+_PLATFORM_MEMBERSHIP_PAUSE_TTL = _SERVICE_UNAVAILABLE_RETRY_AFTER
+
 
 def platform_membership_cache_key(user_id: str) -> str:
     return f"platform_membership:{user_id}"
 
 
-async def _fetch_platform_membership(user_id: str) -> dict:
-    """Fetch the user's platform membership (access tier + plan display name).
+def _membership_last_known_key(user_id: str) -> str:
+    return f"platform_membership:last_known:{user_id}"
 
-    Returns ``{"access_tier": int, "plan_display_name": Optional[str]}``.
-    ``access_tier`` is -1 when the user has no platform access;
-    ``plan_display_name`` is ``None`` when the user has no active subscription.
-    Cached in Redis for 5 minutes. No-op in OSS mode.
+
+def _membership_pause_key(user_id: str) -> str:
+    return f"platform_membership:unreachable:{user_id}"
+
+
+def _is_membership(value: object) -> bool:
+    return isinstance(value, dict) and "access_tier" in value
+
+
+async def _fetch_platform_membership(
+    user_id: str, *, refresh: bool = False
+) -> Optional[dict]:
+    """The user's platform membership: ``{"access_tier", "plan_display_name"}``.
+
+    ``access_tier`` -1 is the platform's own answer that the user has no access.
+    None means there is no answer: the platform could not be asked and has not
+    answered for this user within the last-known TTL. An outage is not a plan,
+    so no caller may read None as -1. While the platform is unreachable the last
+    membership it gave stands in. ``refresh`` asks now, past the 5-minute cache
+    and any pause. No-op in OSS mode.
     """
     if not platform_gating_active():
         return {"access_tier": -1, "plan_display_name": None}
@@ -479,10 +541,30 @@ async def _fetch_platform_membership(user_id: str) -> dict:
     from src.utils.cache.redis_cache import get_cache_client
 
     cache = get_cache_client()
-    cache_key = platform_membership_cache_key(user_id)
-    cached = await cache.get(cache_key)
-    if isinstance(cached, dict) and "access_tier" in cached:
-        return cached
+    cached, last_known, paused = await cache.mget([
+        platform_membership_cache_key(user_id),
+        _membership_last_known_key(user_id),
+        _membership_pause_key(user_id),
+    ])
+    if not _is_membership(last_known):
+        last_known = None
+    if refresh:
+        # Dropped, not only skipped: should this ask fail, later requests must
+        # not take the plan it was asked to replace back from the cache.
+        await cache.delete(platform_membership_cache_key(user_id))
+    else:
+        if _is_membership(cached):
+            # An entry an older worker wrote has no last-known record beside it.
+            # Not from a -1, which an older worker also caches for a failed ask.
+            if last_known is None and int(cached.get("access_tier", -1)) >= 0:
+                await cache.set(
+                    _membership_last_known_key(user_id),
+                    cached,
+                    ttl=_PLATFORM_MEMBERSHIP_LAST_KNOWN_TTL,
+                )
+            return cached
+        if paused:
+            return last_known
 
     result = await _call_validate_for_user(user_id)
     if result is not None:
@@ -490,18 +572,27 @@ async def _fetch_platform_membership(user_id: str) -> dict:
             "access_tier": int(result.get("access_tier", -1)),
             "plan_display_name": result.get("plan_display_name"),
         }
-        await cache.set(cache_key, membership, ttl=_PLATFORM_MEMBERSHIP_CACHE_TTL)
+        await cache.set_many([
+            (platform_membership_cache_key(user_id), membership,
+             _PLATFORM_MEMBERSHIP_CACHE_TTL),
+            (_membership_last_known_key(user_id), membership,
+             _PLATFORM_MEMBERSHIP_LAST_KNOWN_TTL),
+        ])
         return membership
 
-    # Brief negative cache prevents thundering herd against a down service.
-    fallback = {"access_tier": -1, "plan_display_name": None}
-    await cache.set(cache_key, fallback, ttl=15)
-    return fallback
+    # The failure is recorded beside the membership, never in its place: a
+    # cached -1 here is what used to send a paying user to the setup wizard.
+    await cache.set(
+        _membership_pause_key(user_id), True, ttl=_PLATFORM_MEMBERSHIP_PAUSE_TTL
+    )
+    return last_known
 
 
-async def _fetch_platform_tier(user_id: str) -> int:
-    """Fetch only the user's platform access tier. Shares cache with membership."""
+async def _fetch_platform_tier(user_id: str) -> Optional[int]:
+    """Only the access tier, from the same cache; None when it is unknown."""
     membership = await _fetch_platform_membership(user_id)
+    if membership is None:
+        return None
     return int(membership.get("access_tier", -1))
 
 
@@ -510,9 +601,11 @@ async def get_platform_access_tier(user_id: str) -> int | None:
 
     Normalizes the ``-1`` no-access sentinel to None so callers can fail closed
     on ``tier is None`` instead of leaking the sentinel into tier comparisons.
+    An unknown tier is None too: a plan gate stays shut on a plan it cannot
+    confirm, which costs a feature for the length of an outage, not a turn.
     """
     tier = await _fetch_platform_tier(user_id)
-    return tier if tier >= 0 else None
+    return tier if tier is not None and tier >= 0 else None
 
 
 # ---------------------------------------------------------------------------

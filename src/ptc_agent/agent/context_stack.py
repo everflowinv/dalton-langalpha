@@ -25,7 +25,10 @@ from ptc_agent.agent.middleware.runtime_context import (
     resolve_preferred_market,
 )
 from ptc_agent.agent.middleware.runtime_context.epoch import Workspace
-from ptc_agent.agent.middleware.runtime_context.profile import profile_read_answered
+from ptc_agent.agent.middleware.runtime_context.profile import (
+    ProfileSwitches,
+    profile_read_answered,
+)
 from ptc_agent.agent.roles import AgentRole
 
 
@@ -62,7 +65,7 @@ def build_context_middleware(
     user_data_counts: dict[str, Any] | None = None,
     files_mounted: bool | None = None,
     role: AgentRole = "analyst",
-    channels_enabled: bool | None = None,
+    switches: ProfileSwitches = ProfileSwitches(),
 ) -> ContextMiddleware:
     """Wire the turn row, the per-thread baseline and the tail envelope.
 
@@ -101,7 +104,7 @@ def build_context_middleware(
             model_name=model_name,
             files_mounted=files_mounted,
             role=role,
-            channels_enabled=channels_enabled,
+            switches=switches,
         ),
         tail=TailEnvelopeMiddleware(
             now=now,

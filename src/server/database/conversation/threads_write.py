@@ -87,6 +87,8 @@ async def create_thread(
     platform: Optional[str] = None,
     metadata: Optional[Dict[str, Any]] = None,
     subagents_allowed: Optional[bool] = None,
+    reasoning_effort: Optional[str] = None,
+    fast_mode: Optional[bool] = None,
     conn=None,
 ) -> Dict[str, Any]:
     """
@@ -109,6 +111,8 @@ async def create_thread(
     is unique-indexed for dedup. Web-originated threads have external_id NULL.
     `subagents_allowed` None, or the side the owner's default is on, stores
     NULL, which follows the default (see ``_sql.stored_subagents_allowed``).
+    `reasoning_effort` and `fast_mode` are the thread's own picks; None stores
+    NULL, which follows the user's Settings.
 
     A concurrent create that loses the `(platform, external_id)` dedup index
     raises ``errors.ExternalIdConflictError`` (routes map it to a 409 / an in-stream
@@ -138,6 +142,12 @@ async def create_thread(
     if metadata:
         columns.append("metadata")
         extra_params.append(Json(metadata))
+    if reasoning_effort is not None:
+        columns.append("reasoning_effort")
+        extra_params.append(reasoning_effort)
+    if fast_mode is not None:
+        columns.append("fast_mode")
+        extra_params.append(fast_mode)
 
     col_str = ", ".join(columns)
     placeholders = ", ".join(
@@ -626,12 +636,14 @@ async def update_thread_fields(
     archived: Any = _UNSET,
     llm_model: Any = _UNSET,
     subagents_allowed: Any = _UNSET,
+    reasoning_effort: Any = _UNSET,
+    fast_mode: Any = _UNSET,
 ) -> Optional[Dict[str, Any]]:
     """Dynamic update of user-editable thread fields (title, pin, archive,
-    model, subagent switch).
+    model, subagent switch, effort, fast mode).
 
-    Only title bumps ``updated_at``: pin, archive, model and the subagent
-    switch must not reorder the recency sort (same reasoning as
+    Only title bumps ``updated_at``: pin, archive, model, the subagent
+    switch and the thread's tuning must not reorder the recency sort (same reasoning as
     ``stamp_thread_seen``). Archiving also
     advances the seen cursor in the SAME statement (see ``_ARCHIVE_SEEN_STAMP``).
     Returns the updated row, or None when the thread doesn't exist / nothing
@@ -660,6 +672,12 @@ async def update_thread_fields(
         stored = _sql.stored_subagents_allowed("%s", "conversation_threads.workspace_id")
         sets.append(f"subagents_allowed = {stored}")
         params.append(subagents_allowed)
+    if reasoning_effort is not _UNSET:
+        sets.append("reasoning_effort = %s")
+        params.append(reasoning_effort)
+    if fast_mode is not _UNSET:
+        sets.append("fast_mode = %s")
+        params.append(fast_mode)
     if not sets:
         return None
 

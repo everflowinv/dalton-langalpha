@@ -1,7 +1,10 @@
+import { useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useStableArray } from '@/hooks/useStableArray';
 import type { ChatMessage } from '@/types/chat';
-import { armedTargets, type MarketWatchState } from '../../session/marketWatchEvents';
+import type { WakeupList } from '@/types/wakeups';
+import { useThreadWakeups } from '../../hooks/useWakeups';
+import type { MarketWatchState } from '../../session/marketWatchEvents';
 import type { ReportBackOwedThread } from '../../utils/api';
 import {
   analystCandidates,
@@ -11,9 +14,13 @@ import {
   type RosterTask,
 } from './delegatedWork';
 import { useAnalystRoster, type RosterAnalyst } from './useAnalystRoster';
+import { pendingWakeups } from '../wakeupLabels';
 
 interface TrayInputs {
   marketWatch: MarketWatchState | null;
+  /** The thread whose wakeups the tray counts, and whether its chat is in front. */
+  threadId: string | null;
+  isActive: boolean;
   /** Live task cards, keyed `subagent-<agentId>`. */
   cards: Parameters<typeof taskRoster>[0]['cards'];
   /** The tasks the page's history loaded, by agent id. */
@@ -37,8 +44,10 @@ export interface TrayTasks {
 
 /** What the tray holds: one chip per entry that is set. */
 export interface TrayContents {
-  /** The market watch, while the agent watches tickers or has a target armed. */
+  /** The market watch, while the agent watches tickers. */
   watch: MarketWatchState | null;
+  /** The wakeups still pending, while there are any. */
+  wakeups: WakeupList | null;
   /** The tasks this thread handed off, while one is listed or runs. */
   tasks: TrayTasks | null;
   /** The Analysts this thread handed work to (Home only). */
@@ -51,8 +60,8 @@ const NO_CANDIDATES: ReturnType<typeof analystCandidates> = [];
 /** How many chips the tray draws, which is how many shapes its liquid runs. */
 export function trayChipCount(contents: TrayContents | null): number {
   if (!contents) return 0;
-  const { watch, tasks, analysts, reportBackLabel } = contents;
-  return [watch, tasks, analysts, reportBackLabel].filter((entry) => entry !== null).length;
+  const { watch, wakeups, tasks, analysts, reportBackLabel } = contents;
+  return [watch, wakeups, tasks, analysts, reportBackLabel].filter((entry) => entry !== null).length;
 }
 
 /** Whether anything in the tray is still working, which the folded dock spins for. */
@@ -66,20 +75,22 @@ export function trayWorking({ tasks, analysts, reportBackLabel }: TrayContents):
 
 /**
  * What the thread is waiting on or handed off, which the tray shows as chips:
- * the market watch, the tasks and Analysts it delegated, and an owed report
+ * the market watch, its pending wakeups, the tasks and Analysts it delegated, and an owed report
  * neither names. Null when there is none. Read once by the host, since the
  * tray and its folded dock show the same thing.
  */
 export function useTrayContents({
-  marketWatch, cards, taskHistory, messages, isLoading, hasActiveSubagents, reportBackOwed, owedThreads, isHome,
+  marketWatch, threadId, isActive, cards, taskHistory, messages, isLoading, hasActiveSubagents, reportBackOwed, owedThreads, isHome,
 }: TrayInputs): TrayContents | null {
   const { t } = useTranslation();
 
-  // A target is watched server-side between turns, so it keeps the chip up
-  // with no live-stamped symbol.
-  const watch = marketWatch && (marketWatch.symbols.length || armedTargets(marketWatch.targets).length)
-    ? marketWatch
-    : null;
+  const watch = marketWatch && marketWatch.symbols.length ? marketWatch : null;
+  const wakeups = useThreadWakeups(threadId, isActive);
+  // A wakeup fires server-side between turns, so it keeps the chip up.
+  const pending = useMemo(() => {
+    const items = pendingWakeups(wakeups?.items);
+    return items.length ? { items, userTimezone: wakeups?.userTimezone ?? null } : null;
+  }, [wakeups]);
   const turnStarts = countedTurnStarts(messages);
   // A task's status can read live after its run ended unseen; one runs only
   // while this turn does or a task channel is open.
@@ -103,6 +114,6 @@ export function useTrayContents({
     ? t(isHome ? 'agents.reportBackPending' : 'chat.taskReportBackPending')
     : null;
 
-  if (!watch && !taskChip && !analystChip && !reportBackLabel) return null;
-  return { watch, tasks: taskChip, analysts: analystChip, reportBackLabel };
+  if (!watch && !pending && !taskChip && !analystChip && !reportBackLabel) return null;
+  return { watch, wakeups: pending, tasks: taskChip, analysts: analystChip, reportBackLabel };
 }

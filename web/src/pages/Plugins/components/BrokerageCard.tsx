@@ -31,6 +31,23 @@ import { partialReachText } from './pluginsPage/pluginReach';
 import { RowNote } from './RowNote';
 import type { ScopeWorkspace } from './ScopeControl';
 import { CellMenu, CellState, StatusDot } from './surface/Surface';
+import './BrokerageCard.css';
+
+/** What the Brokerages tab does with a row beyond connecting it: the ⋯ menu,
+ *  the broker's page, and where the row reaches. */
+export interface BrokerageCardManage {
+  workspaces: ScopeWorkspace[];
+  /** `workspaces` has not arrived yet; the reach waits for it. */
+  workspacesLoading?: boolean;
+  refreshing: boolean;
+  onDisconnect: () => void;
+  onRefreshSchemas: () => void;
+  onRequestRemove: () => void;
+  onOpenInMcpTab: () => void;
+  /** Open this broker's page. Offered on an offer too: what a broker can do
+   *  is the thing to read before deciding to add it. Workspaces live there. */
+  onOpen: () => void;
+}
 
 /**
  * One shipped brokerage as a card, in whichever of its two states the user is
@@ -52,43 +69,31 @@ import { CellMenu, CellState, StatusDot } from './surface/Surface';
  * same mutation the Connectors cell calls. What it does not offer is Edit: the
  * address is the one thing we pick rather than the user, so changing it means
  * going to the section where it is an ordinary server.
+ *
+ * Without `manage` (the welcome flow) the card is the offer alone: the same
+ * identity, groups and notes, with no menu and no page to open, and a row
+ * that is switched off is switched back on from its foot.
  */
 export function BrokerageCard({
   broker,
-  workspaces,
-  workspacesLoading = false,
   connecting,
-  refreshing,
-  toggling,
+  toggling = false,
   onConnect,
-  onDisconnect,
-  onRefreshSchemas,
   onToggle,
-  onRequestRemove,
-  onOpenInMcpTab,
-  onOpen,
+  manage,
 }: {
   /** Resolved by the list rather than here, so the section and this card
    *  cannot reach different answers about which broker the row is. */
   broker: ResolvedBroker;
-  workspaces: ScopeWorkspace[];
-  /** `workspaces` has not arrived yet; the reach waits for it. */
-  workspacesLoading?: boolean;
   connecting: boolean;
-  refreshing: boolean;
-  toggling: boolean;
+  toggling?: boolean;
   onConnect: () => void;
-  onDisconnect: () => void;
-  onRefreshSchemas: () => void;
   onToggle: (enabled: boolean) => void;
-  onRequestRemove: () => void;
-  onOpenInMcpTab: () => void;
-  /** Open this broker's page. Offered on an offer too: what a broker can do
-   *  is the thing to read before deciding to add it. Workspaces live there. */
-  onOpen: () => void;
+  manage?: BrokerageCardManage;
 }) {
   const { t } = useTranslation();
   const home = useHomeOption();
+  const refreshing = manage?.refreshing ?? false;
   const {
     b: brokerage,
     row,
@@ -125,8 +130,8 @@ export function BrokerageCard({
 
   // An offer says nothing here: its section already says it is not added.
   const reach =
-    row && enabled && !workspacesLoading
-      ? partialReachText(t, row, workspaces, home)
+    manage && row && enabled && !manage.workspacesLoading
+      ? partialReachText(t, row, manage.workspaces, home)
       : null;
 
   // The corner says where the broker stands, on every card, so the four read
@@ -150,6 +155,21 @@ export function BrokerageCard({
         onClick={onConnect}
       />
     );
+  } else if (off && !manage) {
+    // With no menu to hold the switch, it sits where Connect would. The
+    // tokens are intact, so this is no second consent.
+    action = (
+      <ConnectButton
+        status={status}
+        connecting={toggling}
+        vendor={vendor}
+        rowKey={rowKey}
+        size="md"
+        label={t('plugins.shell.brokerage.switchOn')}
+        testid={`brokerage-switch-on-${brokerage.name}`}
+        onClick={() => onToggle(true)}
+      />
+    );
   }
   if (!row) {
     state = <span className="broker-card-state is-quiet">{t('plugins.brokerages.notAdded')}</span>;
@@ -171,7 +191,8 @@ export function BrokerageCard({
   }
 
   const menu =
-    row && (
+    row &&
+    manage && (
       <CellMenu label={t('mcp.row.actionsAria', { name: title })}>
         {enabled ? (
           <DropdownMenuItem disabled={toggling} onSelect={() => onToggle(false)}>
@@ -196,19 +217,19 @@ export function BrokerageCard({
             </span>
           </DropdownMenuItem>
         )}
-        <DropdownMenuItem onSelect={onOpen}>
+        <DropdownMenuItem onSelect={manage.onOpen}>
           <Layers className="h-3.5 w-3.5 mr-2" />
           {t('plugins.shell.brokerage.workspaces')}
         </DropdownMenuItem>
         <OauthMenuItems
           status={status}
-          onRefreshSchemas={onRefreshSchemas}
-          onDisconnect={onDisconnect}
+          onRefreshSchemas={manage.onRefreshSchemas}
+          onDisconnect={manage.onDisconnect}
         />
         {/* The escape hatch, named for where it goes rather than for
             what it does there: the address and headers stay editable,
             just not from the section whose point is that we picked it. */}
-        <DropdownMenuItem onSelect={onOpenInMcpTab}>
+        <DropdownMenuItem onSelect={manage.onOpenInMcpTab}>
           <Server className="h-3.5 w-3.5 mr-2" />
           {t('plugins.brokerages.openInMcp')}
         </DropdownMenuItem>
@@ -218,7 +239,7 @@ export function BrokerageCard({
         {!isPluginOwned(row) && (
           <>
             <DropdownMenuSeparator />
-            <DropdownMenuItem onSelect={onRequestRemove} variant="destructive">
+            <DropdownMenuItem onSelect={manage.onRequestRemove} variant="destructive">
               <Trash2 className="h-3.5 w-3.5 mr-2" />
               {t('plugins.shell.brokerage.remove')}
             </DropdownMenuItem>
@@ -247,9 +268,13 @@ export function BrokerageCard({
         <div className="broker-card-id">
           {/* The name is the card's button and its hit area is the whole card;
               the controls and links sit above it. */}
-          <button type="button" className="broker-card-open" onClick={onOpen}>
-            {title}
-          </button>
+          {manage ? (
+            <button type="button" className="broker-card-open" onClick={manage.onOpen}>
+              {title}
+            </button>
+          ) : (
+            <span className="broker-card-name">{title}</span>
+          )}
           {(site || reach) && (
             <div className="broker-card-meta">
               {site && (

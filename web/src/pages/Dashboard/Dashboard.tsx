@@ -1,6 +1,6 @@
 import { useCallback, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { ListFilter, Sparkles, X } from 'lucide-react';
+import { ListFilter } from 'lucide-react';
 import { MobileBottomSheet } from '../../components/ui/mobile-bottom-sheet';
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '../../components/ui/dialog';
 import { Input } from '../../components/ui/input';
@@ -22,7 +22,7 @@ import { usePortfolioData, type PortfolioRow } from './hooks/usePortfolioData';
 import { useTickerNews } from './hooks/useTickerNews';
 import { useDashboardData } from './hooks/useDashboardData';
 import { useOnboarding, snoozePersonalization } from './hooks/useOnboarding';
-import { useStartOnboarding } from '../Onboarding/connect/useStartOnboarding';
+import { WelcomeBanner } from '../Onboarding/welcome/WelcomeBanner';
 import { useScrollMemory } from '@/lib/scrollMemory';
 import './Dashboard.css';
 
@@ -67,7 +67,6 @@ function Dashboard({ layoutToggle }: DashboardProps = {}) {
   } = useDashboardData();
 
   const { showPersonalizationBanner, setShowPersonalizationBanner } = useOnboarding();
-  const onboarding = useStartOnboarding();
 
   const watchlist = useWatchlistData();
   const portfolio = usePortfolioData();
@@ -139,45 +138,14 @@ function Dashboard({ layoutToggle }: DashboardProps = {}) {
             )}
           </div>
 
-          {/* Personalize your experience: dismissible banner */}
+          {/* The welcome flow, offered until an investing profile is saved */}
           {showPersonalizationBanner && (
-            <div
-              className="mb-6 rounded-lg border px-4 py-3 flex items-center gap-3"
-              style={{
-                backgroundColor: 'var(--color-bg-card)',
-                borderColor: 'var(--color-border-muted)',
+            <WelcomeBanner
+              onDismiss={() => {
+                snoozePersonalization();
+                setShowPersonalizationBanner(false);
               }}
-            >
-              <Sparkles size={18} className="shrink-0" style={{ color: 'var(--color-accent-primary)' }} />
-              <div className="flex-1 min-w-0">
-                <p className="text-sm font-medium" style={{ color: 'var(--color-text-primary)' }}>
-                  {t('dashboard.personalizeTitle')}
-                </p>
-                <p className="text-xs mt-0.5" style={{ color: 'var(--color-text-secondary)' }}>
-                  {t('dashboard.personalizeDesc')}
-                </p>
-              </div>
-              <button
-                type="button"
-                onClick={() => onboarding.start()}
-                className="shrink-0 px-3 py-1.5 rounded-md text-xs font-medium transition-colors hover:opacity-90"
-                style={{ backgroundColor: 'var(--color-btn-primary-bg)', color: 'var(--color-btn-primary-text)' }}
-              >
-                {t('dashboard.personalize')}
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  snoozePersonalization();
-                  setShowPersonalizationBanner(false);
-                }}
-                className="shrink-0 p-1 rounded transition-colors hover:bg-foreground/10"
-                style={{ color: 'var(--color-text-tertiary)' }}
-                aria-label={t('common.close')}
-              >
-                <X size={14} />
-              </button>
-            </div>
+            />
           )}
 
           {/* Index Movement — full width */}

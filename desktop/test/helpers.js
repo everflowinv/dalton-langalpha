@@ -20,6 +20,8 @@ const BUILD_CONFIG = path.join(CONFIG_DIR, 'build.json')
 // loader. It is also the file `scripts/write-build-config.mjs` leaves behind
 // after packaging a saas build locally, so it is stashed here and put back by
 // `cleanup` rather than lost to having run the tests.
+// Every test file writes this one build.json, so the suite runs one file at a
+// time (package.json's test script, which CI runs as `pnpm test`).
 const STASHED_BUILD_CONFIG = fs.existsSync(BUILD_CONFIG) ? fs.readFileSync(BUILD_CONFIG) : null
 
 const opened = []
@@ -222,6 +224,41 @@ function loadShell({ edition = 'oss', appOrigin, platformOrigin, serverUrl = nul
   return shell
 }
 
+/** A saas install that has signed in before, so a launch opens the app. */
+function signedIn({ consoleSharesMainWindow }) {
+  const shell = loadShell({ edition: 'saas' })
+  shell.store.set('reachedApp', true)
+  shell.store.set('appChrome', true)
+  shell.store.set('platformChrome', consoleSharesMainWindow)
+  return shell
+}
+
+/** What macOS does with a link to the registered scheme: `open-url`, for the shell to claim. */
+const openUrl = (url) => emitApp('open-url', { preventDefault() {} }, url)
+
+/** The console's window of its own, as against the main window. */
+const isAccount = (win) => win.options.title === 'Account'
+
+/** What Chromium hands `will-navigate` for a page-initiated main-frame load. */
+function navigateFrom(win, url) {
+  const event = { isMainFrame: true, defaultPrevented: false, preventDefault() { this.defaultPrevented = true } }
+  win.webContents.emit('will-navigate', event, url)
+  return event
+}
+
+/** Run `fn` with console.warn captured, and answer with every line it wrote. */
+function quietly(fn) {
+  const warned = []
+  const realWarn = console.warn
+  console.warn = (...a) => warned.push(a.join(' '))
+  try {
+    fn()
+  } finally {
+    console.warn = realWarn
+  }
+  return warned
+}
+
 /**
  * Load the packaged entry rather than main, with a config written to fail
  * validation. The entry's whole job is what happens when a require throws, so it
@@ -282,5 +319,5 @@ function cleanup() {
 
 module.exports = {
   loadShell, loadEntryWith, loadPreload, cleanup, opened, electronStub, setOnline, setSaveDialog, tempDir,
-  emitApp, windows, focusOrder,
+  emitApp, windows, focusOrder, signedIn, openUrl, isAccount, navigateFrom, quietly,
 }

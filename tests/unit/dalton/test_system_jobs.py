@@ -1999,8 +1999,6 @@ def test_sandbox_env_and_mcp_config_exclude_internal_service_token(
     config (url / command / args / headers), with the leaking server disabled.
     Each token is checked on its own: with only the internal token configured,
     its leaks are scrubbed while an unset admin token never disables anything."""
-    import logging
-
     import ptc_agent.config.plugins as plugins_mod
     from ptc_agent.core.sandbox.ptc_sandbox import PTCSandbox
     from ptc_agent.core.tool_generator import ToolFunctionGenerator

@@ -19,15 +19,10 @@ from ptc_agent.agent.middleware.background_subagent.middleware import (
 # utils.build_message_checker governs every caller.
 from ptc_agent.agent.middleware.background_subagent import utils
 from ptc_agent.agent.middleware.background_subagent.utils import (
-    MARKET_ALERT_SENDER,
     MessageChecker,
     config_own_run_id,
 )
-from ptc_agent.agent.transcript.classify import (
-    MARKET_TARGET_TRIGGER,
-    ORCHESTRATOR_SOURCE,
-    steering_trigger,
-)
+from ptc_agent.agent.transcript.classify import ORCHESTRATOR_SOURCE, reentry_trigger
 
 logger = structlog.get_logger(__name__)
 
@@ -69,7 +64,7 @@ class BackgroundSubagentOrchestrator:
         middleware: BackgroundSubagentMiddleware,
         max_iterations: int = 3,
         auto_wait: bool = False,
-        market_alerts: bool = False,
+        alert_senders: frozenset[str] = frozenset(),
     ) -> None:
         """Initialize the orchestrator.
 
@@ -79,15 +74,16 @@ class BackgroundSubagentOrchestrator:
             max_iterations: Maximum number of re-invocation iterations
             auto_wait: If True, wait for background tasks to complete before returning.
                       If False (default), return immediately and let CLI handle status.
-            market_alerts: Whether this run's owner has market watch on, so a
-                      target's alert waiting on the thread is one its steering
-                      takes in rather than closes unread.
+            alert_senders: The notices nobody sent (``REENTRY_TRIGGERS``)
+                      whose feature this run's owner has on, so one waiting
+                      on the thread is a notice its steering takes in rather
+                      than closes unread.
         """
         self.agent = agent
         self.middleware = middleware
         self.max_iterations = max_iterations
         self.auto_wait = auto_wait
-        self.market_alerts = market_alerts
+        self.alert_senders = alert_senders
 
     async def ainvoke(
         self,
@@ -431,26 +427,28 @@ class BackgroundSubagentOrchestrator:
     ) -> MessageChecker | None:
         """What ends a wait or re-invokes the agent.
 
-        A market target's alert counts only when this run's steering takes
-        it in: the owner has market watch on and the run has subagents, as
-        otherwise the re-run would hold nothing to read. Nor on the last
-        pass, which re-invokes nothing: an alert ending that wait would end
-        the turn with its tasks still running, and each result would come
-        back as a turn of its own. Nor while the run waits on the user's
-        answer: re-invoking supersedes the question for a notice nobody sent,
-        and the turn that resumes it takes the alert in. A steer keeps ending
-        it, as it always has.
+        A market target's alert or a wakeup's notice counts only when this
+        run's steering takes it in: the owner has the feature on and the run
+        has subagents, as otherwise the re-run would hold nothing to read.
+        Nor on the last pass, which re-invokes nothing: an alert ending that
+        wait would end the turn with its tasks still running, and each result
+        would come back as a turn of its own. Nor while the run waits on the
+        user's answer: re-invoking supersedes the question for a notice
+        nobody sent, and the turn that resumes it takes the alert in. A steer
+        keeps ending it, as it always has.
         """
         thread_id = (config.get("configurable") or {}).get("thread_id")
-        market_alerts = (
-            self.market_alerts and self.middleware.enabled and not last_pass
+        alert_senders = (
+            self.alert_senders
+            if self.middleware.enabled and not last_pass
+            else frozenset()
         )
-        if market_alerts and await self._awaits_answer(config):
-            market_alerts = False
+        if alert_senders and await self._awaits_answer(config):
+            alert_senders = frozenset()
         return await utils.build_message_checker(
             thread_id,
             own_run_id=config_own_run_id(config),
-            market_alerts=market_alerts,
+            alert_senders=alert_senders,
         )
 
     async def _awaits_answer(self, config: dict[str, Any]) -> bool:
@@ -459,7 +457,7 @@ class BackgroundSubagentOrchestrator:
         try:
             state = await self.agent.aget_state(config)
         except Exception as e:
-            logger.warning("Interrupt check failed, holding market alerts", error=str(e))
+            logger.warning("Interrupt check failed, holding alerts", error=str(e))
             return True
         return bool(state.interrupts)
 
@@ -497,13 +495,7 @@ class BackgroundSubagentOrchestrator:
 
         # Inject a minimal trigger so the graph routes to the agent node.
         # SteeringMiddleware.abefore_model() will consume the actual content.
-        # A market target's alert alone has no sender to name.
-        trigger = (
-            MARKET_TARGET_TRIGGER
-            if senders == [MARKET_ALERT_SENDER]
-            else steering_trigger(senders)
-        )
-        await self._inject(config, trigger)
+        await self._inject(config, reentry_trigger(senders))
         return True
 
     async def check_and_get_notification(self) -> str | None:
@@ -583,7 +575,7 @@ class BackgroundSubagentOrchestrator:
             middleware=self.middleware,
             max_iterations=self.max_iterations,
             auto_wait=self.auto_wait,
-            market_alerts=self.market_alerts,
+            alert_senders=self.alert_senders,
         )
 
     def __getattr__(self, name: str) -> Any:

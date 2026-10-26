@@ -63,7 +63,9 @@ def test_it_sits_after_steering_and_outside_the_task_interceptor(machine):
     names = _names(_build(subagent_switch=AsyncMock(), **machine))
 
     at = names.index("SubagentSwitchMiddleware")
-    assert names[at - 1] == "SteeringMiddleware"
+    # Only the wakeup cancel notice, which wraps no tool call, sits between.
+    between = names[names.index("SteeringMiddleware") + 1 : at]
+    assert between in ([], ["WakeupCancelNoticeMiddleware"])
     assert names[at + 1] == "BackgroundSubagentMiddleware"
     assert names.count("SubagentSwitchMiddleware") == 1
 
@@ -164,6 +166,7 @@ def test_the_window_trims_the_main_agent_only(machine):
     """A subagent's run is bounded, and its transcript reads its namespace's
     whole history, so only the main stack's compaction gets the window."""
     from ptc_agent.agent.middleware.subagent_switch import subagents_window_carry
+    from ptc_agent.agent.middleware.wakeups import wakeup_cancels_window_carry
 
     real = SubAgentMiddleware
     handed: list = []
@@ -177,7 +180,8 @@ def test_the_window_trims_the_main_agent_only(machine):
         built = _build(subagent_switch=AsyncMock(), window_coverage=coverage, **machine)
     (main,), (sub,) = _compactions(built, handed)
     assert main._coverage is coverage
-    assert subagents_window_carry in main._carries and len(main._carries) == 2
+    assert subagents_window_carry in main._carries and len(main._carries) == 3
+    assert wakeup_cancels_window_carry in main._carries
     assert sub._coverage is None
 
 
@@ -192,6 +196,6 @@ def test_the_window_needs_only_the_server(machine):
     ):
         ((main,),) = _compactions(_build(**kwargs, **machine))
         assert main._coverage is coverage, kwargs
-        assert len(main._carries) == 2, kwargs
+        assert len(main._carries) == 3, kwargs
     ((main,),) = _compactions(_build(subagent_switch=AsyncMock(), **machine))
     assert main._coverage is None

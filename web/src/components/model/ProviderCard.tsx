@@ -47,17 +47,17 @@ export const ProviderCard = memo(function ProviderCard({
         "rounded-lg p-4 min-w-[80px] min-h-[64px] transition-colors select-none",
         "focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background",
       )}
+      // Ink, as the onboarding choice cards are: amber annotates, it does not
+      // select (DESIGN.md, accent discipline).
       style={{
         border: selected
-          ? "2px solid var(--color-accent-primary)"
+          ? "1px solid var(--color-text-primary)"
           : "1px solid var(--color-border-default)",
         background: selected
-          ? "var(--color-accent-soft)"
+          ? "var(--color-bg-tag)"
           : hovered
             ? "var(--color-bg-surface)"
             : undefined,
-        // Compensate for border width change to prevent layout shift
-        padding: selected ? 15 : 16,
       }}
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => setHovered(false)}

@@ -9,6 +9,10 @@ into a sandbox counts as activity at its provider (Daytona's auto-stop, E2B's
 pause deadline) and would hold off that stop for good; its next turn's start
 writes the token before any of that turn's code runs. Every worker runs the
 sweep; claiming a computer in Postgres has one of them write each.
+
+A pass first sends again each revocation a stop could not deliver, the
+platform being unreachable then, until the platform confirms it or every
+token it covers has run out.
 """
 
 from __future__ import annotations
@@ -33,6 +37,12 @@ SWEEP_MAX_PAGES = 10
 # A computer taken up is not taken again for this long, by any worker, so one
 # whose sandbox keeps failing costs a try per interval, not one per worker.
 RETRY_AFTER = timedelta(seconds=SWEEP_INTERVAL_S)
+# A revocation sent is not sent again for this long by any worker. Shorter than
+# the interval, so the next pass on any worker after it sends it.
+REVOKE_RETRY_AFTER = timedelta(seconds=60)
+# How long a rewrite after a revocation waits out a sibling's write in progress.
+REWRITE_WAIT_S = 10.0
+_LOCK_POLL_S = 0.25
 STOP_GRACE = 30.0
 
 
@@ -118,6 +128,7 @@ class DataTokenSweeper:
         from src.server.database import computer_data_tokens as db
         from src.server.services import data_tokens
 
+        await self._settle_revocations()
         written = 0
         for _ in range(SWEEP_MAX_PAGES):
             rows = await db.claim_due(
@@ -140,6 +151,53 @@ class DataTokenSweeper:
             if len(rows) < SWEEP_BATCH_LIMIT:
                 break
         return written
+
+    async def _settle_revocations(self) -> None:
+        """Send again the revocations still owed. The first that finds the
+        platform unreachable ends this part of the pass: the rest would wait on
+        it too, and the next pass takes them first. One the platform refuses
+        stays owed, and the rest go on."""
+        from src.server.database import computer_data_tokens as db
+        from src.server.services import data_tokens
+
+        for _ in range(SWEEP_MAX_PAGES):
+            owed = await db.claim_revocations(
+                retry_after=REVOKE_RETRY_AFTER, limit=SWEEP_BATCH_LIMIT
+            )
+            for revocation in owed:
+                if self._stop_event.is_set():
+                    return
+                answer = await data_tokens.settle(revocation)
+                if answer == "unreachable":
+                    return
+                if answer != "revoked":
+                    continue
+                logger.info(
+                    "[DataTokenSweeper] revoked the market-data tokens of "
+                    "computer %s, owed since its stop",
+                    revocation.computer_id,
+                )
+            if len(owed) < SWEEP_BATCH_LIMIT:
+                return
+
+    async def rewrite(self, computer_id: str) -> bool:
+        """Write a fresh token into the computer's sandbox now, the platform
+        having confirmed a revocation that may have ended the one it holds.
+
+        Waits out a sibling's write in progress rather than leave the sandbox
+        to the next pass: that write read the row before the revocation was
+        recorded, so its token may be one the platform refuses, and its save
+        or hold misses the row. A computer still starting is in use, whatever
+        its last activity says.
+        """
+        from src.server.database import computer_data_tokens as db
+
+        row = await db.load_in_service(computer_id)
+        if row is None:
+            return False
+        if row.get("status") != "starting" and not await self._keeps_running(row):
+            return False
+        return await self._write_when_free(computer_id, row, wait_s=REWRITE_WAIT_S)
 
     @staticmethod
     async def _keeps_running(row: dict[str, Any]) -> bool:
@@ -171,17 +229,26 @@ class DataTokenSweeper:
         )
 
     async def _sweep_one(self, row: dict[str, Any]) -> bool:
-        from src.server.database.session_lock import try_session_lock
-
         if not await self._keeps_running(row):
             return False
-        computer_id = str(row["computer_id"])
-        # Session-level, so the server releases it if this worker dies
-        # mid-write.
-        async with try_session_lock(_lock_key(computer_id)) as held:
-            if not held:
+        return await self._write_when_free(str(row["computer_id"]), row)
+
+    async def _write_when_free(
+        self, computer_id: str, row: dict[str, Any], *, wait_s: float = 0.0
+    ) -> bool:
+        from src.server.database.session_lock import try_session_lock
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + wait_s
+        while True:
+            # Session-level, so the server releases it if this worker dies
+            # mid-write.
+            async with try_session_lock(_lock_key(computer_id)) as held:
+                if held:
+                    return await self._write_locked(computer_id, row)
+            if loop.time() >= deadline:
                 return False  # a sibling worker is writing this one
-            return await self._write_locked(computer_id, row)
+            await asyncio.sleep(_LOCK_POLL_S)
 
     async def _write_locked(self, computer_id: str, row: dict[str, Any]) -> bool:
         from ptc_agent.core.paths import SandboxLayout

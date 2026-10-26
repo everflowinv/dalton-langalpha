@@ -23,7 +23,7 @@ from ._shared import (
     workspace_relative_path,
 )
 
-_GLOB_SPECIAL_RE = re.compile(r"([*?\[])")
+_GLOB_SPECIAL_RE = re.compile(r"([*?\[{\\])")
 
 # A reference is a workspace path, and the longest a filesystem will hold is
 # well under this. The bound is on the item because the shared-thread route is

@@ -34,9 +34,9 @@ def with_run_tracer(config: dict[str, Any]) -> dict[str, Any]:
     Unchanged when tracing is off, or when the callbacks already carry a
     tracer or are a callback manager, which brings its parent's tracer. The
     tracer is built from the context langchain_core's ``_configure`` reads for
-    its own (enabled, project, client, tags and metadata), so it has to be
-    called where the run starts, and once per run, since its ``order_map``
-    lives as long as it does.
+    its own (enabled, project or agent address, client, tags and metadata), so
+    it has to be called where the run starts, and once per run, since its
+    ``order_map`` lives as long as it does.
     """
     callbacks = config.get("callbacks")
     if callbacks is not None and not isinstance(callbacks, list):
@@ -52,23 +52,18 @@ def with_run_tracer(config: dict[str, Any]) -> dict[str, Any]:
 def _ambient_equivalent() -> NonRetainingTracer | None:
     try:
         from langchain_core.tracers.context import (
-            _get_tracer_project,
+            _get_tracer_kwargs,
             _tracing_v2_is_enabled,
             tracing_v2_callback_var,
         )
-        from langsmith.run_helpers import get_tracing_context
 
         # A tracer set by ``tracing_v2_enabled`` is what _configure would add.
         if not _tracing_v2_is_enabled() or tracing_v2_callback_var.get() is not None:
             return None
-        context = get_tracing_context()
-        parent = context["parent"]
-        return NonRetainingTracer(
-            project_name=_get_tracer_project(),
-            client=parent.client if parent is not None else context["client"],
-            tags=context["tags"],
-            metadata=context["metadata"],
-        )
+        # The same kwargs _configure builds its own tracer from, so the
+        # destination (a parent's project and address, else the ambient one)
+        # resolves exactly as it would without us.
+        return NonRetainingTracer(**_get_tracer_kwargs())
     except Exception as e:
         # langchain_core then builds its own tracer, which still traces the
         # run; it only holds the tree again.

@@ -50,6 +50,15 @@ def _job(notice: str = "hit") -> dict:
     }
 
 
+def _held(job_id: str, target_id: str, notice: str) -> dict:
+    """A held alert job as the confirm reads it back."""
+    return {
+        "hook_outbox_id": job_id,
+        "hook_type": "market_target",
+        "payload": {"target_id": target_id, "notice": notice},
+    }
+
+
 async def _offer(
     job: dict,
     target: dict | None,
@@ -80,9 +89,9 @@ async def test_an_owed_hit_is_offered_with_its_alert_row():
     assert isinstance(offer, SteeredReport)
     assert offer.job_id == "job-1"
     assert offer.content.startswith("<market-alert>")
-    assert offer.market_alert["target_id"] == "tg-1"
-    assert offer.market_alert["notice"] == "hit"
-    assert not offer.report_source
+    assert offer.shown["market_alert"]["target_id"] == "tg-1"
+    assert offer.shown["market_alert"]["notice"] == "hit"
+    assert "report_source" not in offer.shown
     last_quote.assert_not_awaited()
 
 
@@ -93,7 +102,7 @@ async def test_an_expiring_notice_asks_for_the_price_briefly():
     offer, last_quote = await _offer(_job("expiring"), target)
 
     assert isinstance(offer, SteeredReport)
-    assert offer.market_alert["notice"] == "expiring"
+    assert offer.shown["market_alert"]["notice"] == "expiring"
     last_quote.assert_awaited_once()
     assert last_quote.call_args.kwargs["timeout"] < delivery._QUOTE_TIMEOUT
 
@@ -180,7 +189,9 @@ async def test_a_malformed_job_is_left_to_its_executor():
 
 @pytest.mark.asyncio
 async def test_take_routes_alert_jobs_to_the_market_offer():
-    report = SteeredReport(job_id="job-1", content="alert", market_alert={"n": 1})
+    report = SteeredReport(
+        job_id="job-1", content="alert", shown={"market_alert": {"n": 1}}
+    )
     market_offer = AsyncMock(return_value=report)
     task_offer = AsyncMock()
     with (
@@ -193,6 +204,7 @@ async def test_take_routes_alert_jobs_to_the_market_offer():
             new=AsyncMock(return_value=["job-1"]),
         ),
         patch(f"{_OUTBOX}.close_unowed_report_jobs", new=AsyncMock(return_value=[])),
+        patch(f"{_OUTBOX}.close_unowed_held_alerts", new=AsyncMock(return_value=[])),
         patch.object(inline, "market_alert_offer", new=market_offer),
         patch.object(steer, "_task_offer", new=task_offer),
         patch.object(steer, "_analyst_offer", new=task_offer),
@@ -214,12 +226,9 @@ async def test_confirm_stamps_held_alerts_before_closing_their_jobs():
     order: list[str] = []
     mark = AsyncMock(side_effect=lambda *a: order.append(f"stamp {a[0]}") or True)
     close = AsyncMock(side_effect=lambda *a, **k: order.append("close") or a[0])
-    held = [
-        {"target_id": "tg-1", "notice": "hit"},
-        {"target_id": "tg-2", "notice": "expiring"},
-    ]
+    held = [_held("job-1", "tg-1", "hit"), _held("job-2", "tg-2", "expiring")]
     with (
-        patch(f"{_MT_DB}.held_alerts", new=AsyncMock(return_value=held)) as read,
+        patch(f"{_OUTBOX}.held_alert_jobs", new=AsyncMock(return_value=held)) as read,
         patch(f"{_MT_DB}.mark_delivered", new=mark),
         patch(f"{_OUTBOX}.confirm_jobs", new=close),
     ):
@@ -235,14 +244,11 @@ async def test_confirm_stamps_held_alerts_before_closing_their_jobs():
 async def test_a_failed_stamp_still_closes_the_job():
     """The notice is in the checkpointed message; an open job would show it
     again as a wake."""
-    held = [
-        {"target_id": "tg-1", "notice": "hit"},
-        {"target_id": "tg-2", "notice": "hit"},
-    ]
+    held = [_held("job-1", "tg-1", "hit"), _held("job-2", "tg-2", "hit")]
     mark = AsyncMock(side_effect=[RuntimeError("db down"), True])
     close = AsyncMock(return_value=["job-1", "job-2"])
     with (
-        patch(f"{_MT_DB}.held_alerts", new=AsyncMock(return_value=held)),
+        patch(f"{_OUTBOX}.held_alert_jobs", new=AsyncMock(return_value=held)),
         patch(f"{_MT_DB}.mark_delivered", new=mark),
         patch(f"{_OUTBOX}.confirm_jobs", new=close),
     ):
@@ -253,7 +259,7 @@ async def test_a_failed_stamp_still_closes_the_job():
 
 
 async def _confirm_found(owner: tuple[str, str]):
-    held = [{"target_id": "tg-1", "notice": "hit"}]
+    held = [_held("job-1", "tg-1", "hit")]
     read = AsyncMock(return_value=held)
     mark = AsyncMock(return_value=True)
     close = AsyncMock(return_value=["job-1"])
@@ -262,7 +268,7 @@ async def _confirm_found(owner: tuple[str, str]):
             "ptc_agent.agent.middleware.steering.checkpointed_holds",
             return_value={"job-1"},
         ),
-        patch(f"{_MT_DB}.held_alerts", new=read),
+        patch(f"{_OUTBOX}.held_alert_jobs", new=read),
         patch(f"{_MT_DB}.mark_delivered", new=mark),
         patch(f"{_OUTBOX}.confirm_jobs", new=close),
     ):

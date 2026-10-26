@@ -100,6 +100,28 @@ async def test_resume_of_cancelled_calls_is_its_own_boundary(saver):
     assert boundaries[1] == interrupt_tip
 
 
+async def test_a_retry_at_an_update_the_thread_moved_past_keeps_its_turns(saver):
+    """langgraph 1.2.16 opens such a retry with a fork checkpoint, which the
+    later-run rule reads past as it does the update beneath it."""
+    thread = str(uuid.uuid4())
+    graph = _graph(saver)
+    interrupt_tip, interrupt_id = await _interrupted_turn(graph, thread)
+    await graph.aupdate_state(
+        _cfg(thread),
+        {"messages": [AIMessage(content="Not run", id="ai-cancelled")]},
+        as_node="ask",
+    )
+    update = (await graph.aget_state(_cfg(thread))).config["configurable"]["checkpoint_id"]
+    await graph.ainvoke(Command(resume={interrupt_id: "yes"}), _cfg(thread, run_id="run-1"))
+    assert (await _both_walks(saver, thread))[1] == interrupt_tip
+
+    await graph.ainvoke(None, _cfg(thread, run_id="run-2", checkpoint_id=update))
+
+    boundaries = await _both_walks(saver, thread)
+    assert len(boundaries) == 2
+    assert boundaries[1] == interrupt_tip
+
+
 async def test_resume_by_an_agent_that_does_not_ask_is_its_own_boundary(saver):
     thread = str(uuid.uuid4())
     interrupt_tip, interrupt_id = await _interrupted_turn(_graph(saver), thread)
@@ -151,6 +173,34 @@ async def test_answered_interrupt_and_an_interrupt_at_the_tip(saver):
     assert boundaries[1].interrupts == [
         {"id": interrupt_id, "value": {"action_requests": [{"description": "go?"}]}}
     ]
+
+
+async def test_asks_raised_in_one_step_list_in_the_savers_order(saver):
+    """checkpoint-postgres 3.2 loads a step's writes by task path, not task id,
+    so the SQL walk has to sort the same way or list parallel asks shuffled."""
+    names = ["alpha", "bravo", "charlie", "delta"]
+
+    def asker(name):
+        def node(state):
+            return {"messages": [AIMessage(content=interrupt(name), id=f"ai-{name}")]}
+
+        return node
+
+    builder = StateGraph(DeltaAgentState)
+    for name in names:
+        builder.add_node(name, asker(name)).add_edge(START, name)
+    graph = builder.compile(checkpointer=saver)
+    # Task ids are random per checkpoint, so several threads all but ensure
+    # one where task-id order is not task-path order.
+    for _ in range(4):
+        thread = str(uuid.uuid4())
+        await graph.ainvoke(
+            {"messages": [HumanMessage(content="q0", id="h-0")]}, _cfg(thread)
+        )
+        state = await graph.aget_state(_cfg(thread))
+        resume = {i.id: "ok" for i in state.interrupts}
+        await graph.ainvoke(Command(resume=resume), _cfg(thread))
+        await _both_walks(saver, thread)
 
 
 async def test_an_answered_turn_regenerates_with_its_answer(saver, monkeypatch):

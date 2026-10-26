@@ -169,6 +169,9 @@ class FolderRow:
     landings: tuple[str, ...] = ()
     # Home's folder is named for Home whatever its row is called.
     home: bool = False
+    # A target the last pass had no disk to copy this row's folder to, while
+    # its backoff lasts: each acquisition would copy and fail the same way.
+    blocked: Optional[str] = None
 
     @property
     def folder_label(self) -> Optional[str]:
@@ -215,6 +218,9 @@ class FolderPlan:
     # Deleted workspaces whose folders this pass leaves: an earlier pass may
     # have moved one aside unrecorded, and only its journal entry says so.
     deferred: tuple[str, ...] = ()
+    # Rows still to move, here or on a later pass: a copy one began where a
+    # rename could not move its folder is kept for the pass that finishes it.
+    copying: tuple[str, ...] = ()
 
     def __bool__(self) -> bool:
         return bool(self.moves or self.tombstones)
@@ -227,7 +233,10 @@ def plan_folder_moves(rows: Iterable[FolderRow], busy: set[str] = frozenset()) -
     row holds, repeated until nothing changes: a row that stays keeps holding
     its folder, which can strand the next one. A staged row always moves, back
     to its old folder or to a placeholder when its target is held, because a
-    folder under ``_internal`` is one the agent cannot use.
+    folder under ``_internal`` is one the agent cannot use. The exception is
+    one the last pass had no room to copy out, while that backoff lasts:
+    staged across an archive, it leaves staging only by a copy, and every
+    acquisition on the computer would copy until the disk filled, then delete.
     """
     rows = list(rows)
     live = [r for r in rows if not r.deleted]
@@ -238,10 +247,12 @@ def plan_folder_moves(rows: Iterable[FolderRow], busy: set[str] = frozenset()) -
     # a row whose target folds alike waits where it is.
     for row in sorted(live, key=lambda r: not r.staged):
         target = row.target()
-        if row.staged or (
-            target is not None
+        if (row.staged and not row.blocked) or (
+            not row.staged
+            and target is not None
             and target != row.dir_name
             and row.workspace_id not in busy
+            and target != row.blocked
             # Two rows folding alike only happens across an old build's write.
             and fold(target) not in seen_targets
         ):
@@ -315,7 +326,12 @@ def plan_folder_moves(rows: Iterable[FolderRow], busy: set[str] = frozenset()) -
         moves.append(
             FolderMove(row.workspace_id, row.source, destination, row.staged, row.landings)
         )
-    return FolderPlan(tuple(moves), tuple(tombstones), tuple(r.workspace_id for r in left))
+    copying = tuple(
+        r.workspace_id for r in live if r.staged or r.target() not in (None, r.dir_name)
+    )
+    return FolderPlan(
+        tuple(moves), tuple(tombstones), tuple(r.workspace_id for r in left), copying
+    )
 
 
 def _row(record: Mapping[str, Any]) -> FolderRow:
@@ -330,6 +346,7 @@ def _row(record: Mapping[str, Any]) -> FolderRow:
         # Staging writes a fresh list, so any other row's is nothing a pass planned.
         landings=recorded_landings(record.get("landings")) if staged else (),
         home=is_home_row(record),
+        blocked=record.get("move_blocked"),
     )
 
 
@@ -343,10 +360,20 @@ _HOLDS_FOLDER = """
          OR COALESCE(w.config, '{}'::jsonb) @> '{"folder_cleanup_pending": true}')
 """
 
+# Epoch seconds by the database clock, which wrote them. Nested, as a guard
+# beside the cast in one condition would not keep the cast from running.
+_MOVE_BLOCKED = """
+    CASE WHEN jsonb_typeof(w.config->'folder_move_blocked'->'until') = 'number'
+         THEN CASE WHEN (w.config->'folder_move_blocked'->>'until')::numeric
+                        > extract(epoch FROM now())
+                   THEN w.config->'folder_move_blocked'->>'target' END
+    END AS move_blocked
+"""
+
 _ROWS_SQL = f"""
     SELECT w.workspace_id, w.name, w.dir_name, w.status = 'deleted' AS deleted,
            w.previous_dir_names, w.config->'folder_landings' AS landings,
-           w.user_id, w.status
+           w.user_id, w.status, {_MOVE_BLOCKED}
     FROM workspaces w
     WHERE w.computer_id = %s AND {_HOLDS_FOLDER}
     ORDER BY w.created_at, w.workspace_id
@@ -379,7 +406,7 @@ async def read_folder_rows(computer_id: str) -> tuple[Optional[int], list[Folder
             SELECT c.layout_version, w.workspace_id, w.name, w.dir_name,
                    w.status = 'deleted' AS deleted, w.previous_dir_names,
                    w.config->'folder_landings' AS landings,
-                   w.user_id, w.status
+                   w.user_id, w.status, {_MOVE_BLOCKED}
             FROM computers c
             LEFT JOIN workspaces w
               ON w.computer_id = c.computer_id AND {_HOLDS_FOLDER}
@@ -765,7 +792,8 @@ async def record_folder_landings(
                         SET dir_name = %(folder)s::text,
                             previous_dir_names = array_remove(previous_dir_names, %(folder)s::text),
                             config = CASE WHEN %(landed)s
-                                THEN config #- '{folder_landings}' ELSE config END
+                                THEN config #- '{folder_landings}' #- '{folder_move_blocked}'
+                                ELSE config END
                         WHERE workspace_id = %(id)s AND computer_id = %(computer)s
                           AND dir_name = %(moving)s
                         """,
@@ -791,6 +819,42 @@ async def record_folder_landings(
                     f"before its move recorded"
                 )
     return landed
+
+
+FOLDER_MOVE_BACKOFF = "6 hours"
+
+
+async def record_folder_blocked(
+    conn, computer_id: str, *, blocked: Mapping[str, str]
+) -> None:
+    """Hold each row on its folder until the backoff ends or it is renamed again.
+
+    ``blocked`` maps a row to the target its folder had no room to be copied
+    to; only a target the pass planned for that row counts, since the report
+    comes from the sandbox.
+    """
+    async with conn.cursor() as cur:
+        for workspace_id, target in blocked.items():
+            await cur.execute(
+                """
+                UPDATE workspaces
+                SET config = jsonb_set(
+                    COALESCE(config, '{}'::jsonb), '{folder_move_blocked}',
+                    jsonb_build_object(
+                        'target', %(target)s::text,
+                        'until', extract(epoch FROM now() + %(backoff)s::interval)
+                    )
+                )
+                WHERE workspace_id = %(id)s AND computer_id = %(computer)s
+                  AND status <> 'deleted'
+                """,
+                {
+                    "target": target,
+                    "backoff": FOLDER_MOVE_BACKOFF,
+                    "id": workspace_id,
+                    "computer": computer_id,
+                },
+            )
 
 
 async def retarget_folder_cleanup(

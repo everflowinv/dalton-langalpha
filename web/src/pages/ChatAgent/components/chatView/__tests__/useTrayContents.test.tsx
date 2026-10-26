@@ -3,18 +3,31 @@
  * steps, or a row not loaded yet) even while it keeps settled rows, so the
  * tray still reads as working.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
+import type { Mock } from 'vitest';
 import type { ReactNode } from 'react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { renderHook } from '@testing-library/react';
-import type { MarketTarget } from '../../../utils/api';
+import { renderHook, waitFor } from '@testing-library/react';
+import type { Wakeup } from '@/types/wakeups';
+
+vi.mock('@/hooks/useFeatures', () => ({ useFeatureEnabled: () => true }));
+vi.mock('../../../utils/api', async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  fetchWakeups: vi.fn(),
+}));
+
+import { fetchWakeups } from '../../../utils/api';
 import { trayWorking, useTrayContents } from '../useTrayContents';
+
+const THREAD = '7d1c2a4e-0b3f-4c55-9a61-2f8e5d9b0c17';
 
 function readTray(hasActiveSubagents: boolean) {
   const client = new QueryClient();
   const wrapper = ({ children }: { children: ReactNode }) => <QueryClientProvider client={client}>{children}</QueryClientProvider>;
   const { result } = renderHook(() => useTrayContents({
     marketWatch: null,
+    threadId: null,
+    isActive: true,
     cards: {},
     taskHistory: { 'task:Qm3xLp': { description: 'Pull filings', status: 'completed', messages: [], lastActivityMs: 1_700_000_000_000 } },
     messages: [],
@@ -42,19 +55,25 @@ describe('useTrayContents: a running task no row names', () => {
 });
 
 // Neutral placeholder ticker and a made-up level only.
-function target(over: Partial<MarketTarget>): MarketTarget {
+function wakeup(over: Partial<Wakeup>): Wakeup {
   return {
-    target_id: 'tg-1', symbol: 'NVDA', kind: 'above', value: 205, pct_from: null, armed_price: null,
-    status: 'armed', expires_at: '2030-01-02T00:00:00Z', fired_at: null, fired_price: null,
-    created_at: '2030-01-01T00:00:00Z', ...over,
+    wakeup_id: 'w-1', short_id: 'w_3f2a', label: null, kind: 'price', state: 'armed',
+    timezone: null, cron: null, at: null, until: null, next_fire_at: null,
+    fires_done: 0, fires_total: 1, ends_at: null, expires_at: '2030-01-02T00:00:00Z', fired_at: null,
+    price: { symbol: 'NVDA', kind: 'above', value: 205, pct_from: null, armed_price: null, fired_price: null },
+    order: null, cancellable: true, legacy: false, created_at: '2030-01-01T00:00:00Z',
+    ...over,
   };
 }
 
-function readWatch(targets: MarketTarget[]) {
+async function readWakeups(items: Wakeup[]) {
+  (fetchWakeups as Mock).mockResolvedValue({ thread_id: THREAD, user_timezone: null, wakeups: items });
   const client = new QueryClient();
   const wrapper = ({ children }: { children: ReactNode }) => <QueryClientProvider client={client}>{children}</QueryClientProvider>;
   const { result } = renderHook(() => useTrayContents({
-    marketWatch: { symbols: [], targets },
+    marketWatch: null,
+    threadId: THREAD,
+    isActive: true,
     cards: {},
     taskHistory: {},
     messages: [],
@@ -64,15 +83,25 @@ function readWatch(targets: MarketTarget[]) {
     owedThreads: null,
     isHome: false,
   }), { wrapper });
+  await waitFor(() => expect(fetchWakeups).toHaveBeenCalledWith(THREAD));
+  // Settled once the answer has rendered: the read is the only thing in flight.
+  await waitFor(() => expect(client.isFetching()).toBe(0));
   return result.current;
 }
 
-describe('useTrayContents: a target with no live-stamped symbol', () => {
-  it('keeps the watch chip while the target is armed', () => {
-    expect(readWatch([target({})])?.watch).not.toBeNull();
+describe('useTrayContents: wakeups', () => {
+  it('keeps the wakeups chip while one is pending, with only the pending ones', async () => {
+    const pending = wakeup({});
+    const contents = await readWakeups([pending, wakeup({ wakeup_id: 'b', state: 'fired', cancellable: false })]);
+    expect(contents?.wakeups?.items).toEqual([pending]);
+    expect(contents?.watch).toBeNull();
   });
 
-  it('drops it once every target has settled', () => {
-    expect(readWatch([target({ status: 'fired' }), target({ target_id: 'b', status: 'expired' })])).toBeNull();
+  it('counts a fired wakeup the agent has not read yet as pending', async () => {
+    expect((await readWakeups([wakeup({ state: 'held' })]))?.wakeups).not.toBeNull();
+  });
+
+  it('drops it once every wakeup has ended', async () => {
+    expect(await readWakeups([wakeup({ state: 'fired' }), wakeup({ wakeup_id: 'b', state: 'cancelled' })])).toBeNull();
   });
 });

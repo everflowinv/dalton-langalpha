@@ -9,15 +9,18 @@ workspace to the target in one transaction. The target lays the folder again
 from the mirror the first time the workspace is opened there, as it does after
 a rebuild. The folder set aside stays on the old computer until the files are
 back in place and ``LEFTOVERS_KEEP_DAYS`` have passed, because the mirror
-leaves out dependency and version-control folders.
+leaves out dependency and version-control folders. A folder a rename cannot
+move (a Daytona sandbox restored from its archive) is copied aside instead, or,
+with no disk for the copy, deleted where it is, and the backup is all it keeps.
 """
 
 import asyncio
+import functools
 import logging
 import shlex
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Any, AsyncIterator, Awaitable, Dict, Literal, Mapping, Optional
+from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Literal, Mapping, Optional
 
 from psycopg.errors import DeadlockDetected, SerializationFailure
 
@@ -53,6 +56,7 @@ from src.server.database.workspace_move import (
 from src.server.models.computer import ComputerStatus
 from src.server.services.computer_errors import ComputerBusyError
 from src.server.services.computer_manager._folders import _run_folder_script
+from src.server.services.persistence.transfer import SYNC_MARKER_NAME
 from src.server.services.workspace_move import (
     MoveSourceUnavailable,
     move_error,
@@ -77,6 +81,10 @@ _PUT_BACK_GIVE_UP_S = 30 * 60
 # such as the backup that runs after every turn, before the move fails busy.
 _FOLDER_HOLD_WAIT_S = 30
 _FOLDER_HOLD_RETRY_S = 0.5
+# Script passes a copy or a delete in place may take to set the folder aside,
+# each resuming where the last stopped: a few minutes, for a large folder.
+_SET_ASIDE_PASSES = 8
+_NO_ROOM = object()
 
 
 @asynccontextmanager
@@ -106,6 +114,27 @@ async def _folder_held(computer_id: str, workspace_id: str) -> AsyncIterator[Any
 
 def _leftovers_folder(move_id: str) -> str:
     return f"{LEFTOVERS_DIR}/move-{move_id}"
+
+
+async def _clear_move_folder(
+    runtime: Any, root: str, tombstone: str, folder: str, stuck: str
+) -> Any:
+    """Where the script left the folder: its leftovers path, None once nothing
+    is left, or ``_NO_ROOM`` when it had to be copied and could not be."""
+    entry = {"id": tombstone, "dir": folder, "source": folder, "staged": False, "stuck": stuck}
+    for _ in range(_SET_ASIDE_PASSES):
+        report = await _run_folder_script(
+            runtime, root, moves=[], tombstones=[entry], prune=False
+        )
+        if tombstone in (report.get("pending") or ()):
+            continue
+        if tombstone in (report.get("blocked") or {}):
+            return _NO_ROOM
+        moved = report.get("tombstones") or {}
+        if not isinstance(moved, dict) or tombstone not in moved:
+            raise RuntimeError("; ".join(map(str, report.get("errors") or ["no report"])))
+        return moved[tombstone]
+    raise RuntimeError(f"setting the folder aside outlasted {_SET_ASIDE_PASSES} passes")
 
 
 def _running_ref(computer: Optional[Mapping[str, Any]]) -> Optional[str]:
@@ -233,23 +262,31 @@ class WorkspaceMoveMixin:
         provider_ref = _running_ref(computer)
         if provider_ref is None:
             raise MoveSourceUnavailable(f"computer {source} is not running")
-        backup = self.backup_project_files(
+        back_up = functools.partial(
+            self.backup_project_files,
             workspace_id,
             computer_id=source,
             strict=True,
             expected_sandbox_id=provider_ref,
             session=session,
         )
-        if not await self._unless_lost(backup, lost):
+        if not await self._unless_lost(back_up(), lost):
             return None
         return await self._set_folder_aside(
             move,
             session.sandbox.runtime,
             computer.get("root_dir") or DEFAULT_ROOT_DIR,
+            back_up,
+            lost,
         )
 
     async def _set_folder_aside(
-        self, move: Mapping[str, Any], runtime: Any, root: str
+        self,
+        move: Mapping[str, Any],
+        runtime: Any,
+        root: str,
+        back_up: Callable[..., Awaitable[bool]],
+        lost: asyncio.Event,
     ) -> Optional[Dict[str, Any]]:
         """Move the folder under ``_internal/leftovers`` on the source.
 
@@ -273,27 +310,39 @@ class WorkspaceMoveMixin:
             )
             if staged is None:
                 return None
-            report = await _run_folder_script(
-                runtime,
-                root,
-                moves=[],
-                tombstones=[
-                    {"id": tombstone, "dir": folder, "source": folder, "staged": False}
-                ],
-                prune=False,
-            )
-            moved = report.get("tombstones") or {}
-            if not isinstance(moved, dict) or tombstone not in moved:
-                raise RuntimeError(
-                    "; ".join(map(str, report.get("errors") or ["no report"]))
+            moved = await _clear_move_folder(runtime, root, tombstone, folder, "copy")
+            if moved is _NO_ROOM:
+                # The backup is all that is kept of it now, so it is taken
+                # again here: a file change that began before this hold may
+                # have landed after the first one read the folder, and the
+                # hold stops any more from the server. Not from a process
+                # still at work in the sandbox: what that writes after this
+                # backup goes with the folder, as on any disk the target lays
+                # the folder from the backup alone. A rollback from here
+                # restores from that backup, so its flag goes up next, and the
+                # folder's sync marker goes before the rest, so a delete cut
+                # short still leaves a folder the next attach restores rather
+                # than takes as whole.
+                logger.info(
+                    "Move %s: no room to keep %r on computer %s; deleting it after its backup",
+                    move_id, folder, move["source_computer_id"],
                 )
-            if moved[tombstone] is None:
-                # Never laid on this computer: nothing is left behind.
+                if not await self._unless_lost(back_up(held_folder=folder), lost):
+                    return None
+                await flag_rollback_restore(move_id, workspace_id)
+                marker = shlex.quote(f"{workspace_root(root, folder)}/{SYNC_MARKER_NAME}")
+                result = await runtime.exec(f"rm -f {marker}")
+                if result.exit_code != 0:
+                    raise RuntimeError(f"could not remove the sync marker: {result.stdout}")
+                moved = await _clear_move_folder(runtime, root, tombstone, folder, "delete")
+            if moved is None:
+                # Never laid on this computer, or deleted where it was:
+                # nothing is left behind.
                 return await advance_workspace_move(
                     move_id, runner, "staged", leftovers_path=None
                 )
-            if moved[tombstone] != away:
-                raise RuntimeError(f"folder script reported {moved[tombstone]!r}")
+            if moved != away:
+                raise RuntimeError(f"folder script reported {moved!r}")
         return staged
 
     async def _commit_move(self, staged: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
@@ -395,6 +444,12 @@ class WorkspaceMoveMixin:
                     conn, str(row["workspace_id"])
                 ):
                     return "later"
+                # A copy that took the folder aside may have had its delete
+                # of the folder cut short: what is left of it goes first, so
+                # the copy can come back whole rather than the backup.
+                await _clear_move_folder(
+                    runtime, root, f"move-{row['move_id']}", folder, "finish"
+                )
                 # Never over a folder something laid under the name since.
                 result = await runtime.exec(
                     f"if [ -e {src} ]; then if [ -e {dst} ]; then exit 3; fi; "

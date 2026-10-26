@@ -359,11 +359,9 @@ class WorkspaceManager(ComputerManager):
             self._forget_machine(computer_id)
         self._forget_project(workspace_id)
 
-        from src.server.services.market_targets.changes import (
-            cancel_on_workspace_delete,
-        )
+        from src.server.services.wakeups import cancel as wakeups_cancel
 
-        await cancel_on_workspace_delete(workspace_id)
+        await wakeups_cancel.cancel_on_workspace_delete(workspace_id)
 
         if not retired:
             # Its proxied previews stop now rather than at expiry; a retired

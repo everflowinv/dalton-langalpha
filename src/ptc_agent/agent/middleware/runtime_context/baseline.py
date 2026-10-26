@@ -25,7 +25,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from html import escape
 from typing import Any
@@ -64,11 +64,16 @@ from ptc_agent.agent.middleware.runtime_context.harness_blocks import (
 )
 from ptc_agent.agent.middleware.runtime_context.profile import (
     ProfileSnapshot,
+    ProfileSwitches,
     profile_read_answered,
+    render_user_profile,
 )
 from ptc_agent.agent.middleware.runtime_context.state import STATE_BASELINE, state_get
 from ptc_agent.agent.middleware.runtime_context.templates import render_template
-from ptc_agent.agent.middleware.runtime_context.turn import NON_CHANGE_ROW_KINDS
+from ptc_agent.agent.middleware.runtime_context.turn import (
+    NON_CHANGE_ROW_KINDS,
+    NOTICE_ROW_KINDS,
+)
 from ptc_agent.agent.roles import AgentRole
 from ptc_agent.agent.tools.context_file_policy import MAX_AGENT_MD_SIZE, MAX_MEMORY_BLOCK_SIZE
 from ptc_agent.core.paths import (
@@ -82,6 +87,7 @@ logger = logging.getLogger(__name__)
 AGENT_MD_PATH = "/agent.md"
 
 
+
 def _retained_change_rows(state: Any) -> tuple[str, ...]:
     """The kinds of the change rows the model can still read.
 
@@ -92,7 +98,7 @@ def _retained_change_rows(state: Any) -> tuple[str, ...]:
     """
     kinds: list[str] = []
     for update in rows_in_view(state):
-        if update.kind in NON_CHANGE_ROW_KINDS:
+        if update.kind in NON_CHANGE_ROW_KINDS or update.kind in NOTICE_ROW_KINDS:
             continue
         kinds.append(update.kind)
         if update.kind == "baseline_rebuilt":
@@ -204,9 +210,13 @@ class BaselineContextMiddleware(AgentMiddleware):
             a build whose prompt says nothing about the mount.
         role: The role the agent runs in, for the wording of the blocks that
             differ by role. Fixed per build, so the block stays deterministic.
-        channels_enabled: Whether the agent has the chat-app settings folder,
-            which a rebuild freezes for the block to state. None for a build
-            whose block says nothing about it.
+        switches: What the build has that the profile block points to. A
+            rebuild freezes ``channels`` (the chat-app settings folder) for
+            the block to state. ``wakeups`` (``schedule_wakeup``, which the
+            Automations paragraph names) is read from the build rather than
+            frozen: it changes only when the user flips the setting, and a
+            block that kept naming a tool the turn no longer has would
+            contradict the row that says it is gone.
         subagent: A subagent's baseline. It has no workspace block and a
             profile without the main agent's filesystem steering, reads memory
             without being told to write it, and its scratchpad has no notes.
@@ -232,7 +242,7 @@ class BaselineContextMiddleware(AgentMiddleware):
         read_timeout_s: float = _READ_TIMEOUT_S,
         files_mounted: bool | None = None,
         role: AgentRole = "analyst",
-        channels_enabled: bool | None = None,
+        switches: ProfileSwitches = ProfileSwitches(),
         subagent: bool = False,
     ) -> None:
         super().__init__()
@@ -240,7 +250,7 @@ class BaselineContextMiddleware(AgentMiddleware):
         self._session = session
         self._role = role
         self._files_mounted = files_mounted
-        self._channels_enabled = channels_enabled
+        self._switches = switches
         # None is a read that did not answer; an empty name is a workspace
         # with no name. Only the first is kept out of change detection.
         self._workspace_available = workspace is not None
@@ -403,7 +413,7 @@ class BaselineContextMiddleware(AgentMiddleware):
             workspace_available=self._workspace_available,
             workspace_configured=not self._subagent,
             files_mounted=self._files_mounted,
-            channels_enabled=self._channels_enabled,
+            channels_enabled=self._switches.channels,
             role=self._role,
         )
 
@@ -640,25 +650,29 @@ class BaselineContextMiddleware(AgentMiddleware):
         """The ``<user_profile>`` component: identity plus the steering it carries.
 
         Rendered from the epoch's frozen snapshot so the block never moves
-        inside an epoch. A preference or count that changes mid-thread reaches
-        the model as a `profile_changed` row on the next turn. An epoch frozen
-        before profiles were captured falls back to this turn's snapshot, and
-        one that froze no ``channels`` to this build's.
+        inside an epoch for what the profile says. A preference or count that
+        changes mid-thread reaches the model as a `profile_changed` row on the
+        next turn. The wakeups switch is the one exception: it comes from the
+        build, so a flip moves the block on purpose, with the tool. An epoch
+        frozen before profiles were captured falls back to this turn's
+        snapshot, and one that froze no ``channels`` to this build's.
         """
         snapshot = frozen if frozen is not None else self._profile_snapshot()
         if channels is None:
-            channels = self._channels_enabled
+            channels = self._switches.channels
         if not snapshot.user_profile and not snapshot.user_data_counts:
             return ""
         # A subagent's profile leaves out what only the main agent acts on:
         # the profile files, the delivery format and where settings live.
+        # The role words the research-depth guidance around the Chief of
+        # Staff's hand-offs.
         try:
-            content = render_template(
-                "components/user_profile.md.j2",
-                user_profile=snapshot.user_profile,
-                user_data_counts=snapshot.user_data_counts or None,
+            content = render_user_profile(
+                snapshot.user_profile,
+                snapshot.user_data_counts or None,
                 main_agent_steering=not self._subagent,
-                channels_enabled=bool(channels),
+                switches=replace(self._switches, channels=channels),
+                role=self._role,
             )
         except Exception:  # noqa: BLE001 - one component is not the whole block
             logger.warning("[Baseline] user_profile render failed", exc_info=True)

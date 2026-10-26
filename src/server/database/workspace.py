@@ -483,9 +483,12 @@ async def bind_workspace_to_computer(
                 UPDATE workspaces w
                 SET computer_id = comp.computer_id,
                     dir_name = COALESCE(%(dir_name)s, w.dir_name),
-                    -- A folder given here ends any move a settle staged.
-                    config = CASE WHEN %(dir_name)s::text IS NULL THEN w.config
-                        ELSE w.config #- '{{folder_landings}}' END,
+                    -- A folder given here ends any move a settle staged, and
+                    -- a backoff is for the full disk of the computer left.
+                    config = (CASE WHEN %(dir_name)s::text IS NULL THEN w.config
+                        ELSE w.config #- '{{folder_landings}}' END)
+                        #- (CASE WHEN w.computer_id IS DISTINCT FROM comp.computer_id
+                            THEN '{{folder_move_blocked}}' ELSE '{{}}' END)::text[],
                     status = comp.status,
                     sandbox_id = comp.provider_ref,
                     resource_tier = comp.resource_tier,
@@ -564,9 +567,9 @@ async def get_live_workspace_ids_for_computer(
 # What a row's sandbox was last verified under, for the next start to compare.
 SANDBOX_STAMP_KEYS = ("sandbox_config_hash", "sandbox_provider", "sandbox_working_dir")
 # Written by the server alone: a forged stamp would skip the migration a start
-# owes, and folder landings are the folder settle's record. A client's config
-# carries none of them in.
-SERVER_OWNED_CONFIG_KEYS = ("folder_landings", *SANDBOX_STAMP_KEYS)
+# owes, and folder landings and a move's backoff are the folder settle's
+# record. A client's config carries none of them in.
+SERVER_OWNED_CONFIG_KEYS = ("folder_landings", "folder_move_blocked", *SANDBOX_STAMP_KEYS)
 
 
 async def stamp_computer_sandbox_config(computer_id: str, stamp: Dict[str, Any]) -> None:
@@ -1108,16 +1111,28 @@ async def update_workspace(
             updates.append("description = %s")
             params.append(description)
 
+        config_sql, config_params = "config", []
         if config is not None:
             # A replaced config keeps the row's server-owned keys and never
             # takes the caller's.
-            updates.append(
-                "config = (%s::jsonb - %s::text[]) || COALESCE("
+            config_sql = (
+                "(%s::jsonb - %s::text[]) || COALESCE("
                 "(SELECT jsonb_object_agg(key, value) FROM jsonb_each(config)"
                 " WHERE key = ANY(%s::text[])), '{}'::jsonb)"
             )
             owned = list(SERVER_OWNED_CONFIG_KEYS)
-            params.extend((Json(config), owned, owned))
+            config_params = [Json(config), owned, owned]
+        if name is not None:
+            # A new name ends a backoff a settle left for want of room, as the
+            # folder is asked for again, even under the name it had no room for.
+            config_sql = (
+                f"({config_sql}) #- (CASE WHEN name IS DISTINCT FROM %s"
+                " THEN '{folder_move_blocked}' ELSE '{}' END)::text[]"
+            )
+            config_params.append(name)
+        if config_params:
+            updates.append(f"config = {config_sql}")
+            params.extend(config_params)
 
         if is_pinned is not None:
             updates.append("is_pinned = %s")

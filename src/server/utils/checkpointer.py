@@ -6,14 +6,12 @@ This module is standalone and does not depend on deep_research.
 """
 
 import asyncio
-import functools
 import logging
 import os
 from typing import Any, Optional
 
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
-from langgraph.checkpoint.postgres.base import BasePostgresSaver
 from langgraph.store.postgres import AsyncPostgresStore
 from psycopg_pool import AsyncConnectionPool
 
@@ -21,36 +19,6 @@ from src.config.env import DB_SSLMODE
 from src.config.settings import get_checkpointer_pool_max
 
 logger = logging.getLogger(__name__)
-
-
-def _walk_delta_history_from_loaded_target() -> None:
-    """Keep the Postgres saver from reading an older checkpoint's messages as empty.
-
-    The saver rebuilds a ``DeltaChannel`` by paging checkpoints newest-first
-    (1024 a page) and walking parents back from the target. Through 3.1.2, a
-    first page that does not hold the target records it as a root and the walk
-    never resumes, so on a thread past 1024 checkpoints its early turns replay
-    empty and an edit or regenerate from one runs with no history. The guard is
-    the one langchain-ai/langgraph#8556 adds upstream, so it is inert once the
-    release carrying it is installed and can go with that floor bump;
-    ``test_delta_walk_guard.py`` fails on the upgrade that brings it. Patched
-    on the base class, every saver the server builds is covered.
-    """
-    original = BasePostgresSaver._try_advance_walks
-    if getattr(original, "_waits_for_target", False):
-        return
-
-    @functools.wraps(original)
-    def _try_advance_walks(target_id, channels, parent_of, *args, **kwargs):
-        if target_id not in parent_of:
-            return None  # not loaded yet, which is not a root: a later page retries
-        return original(target_id, channels, parent_of, *args, **kwargs)
-
-    _try_advance_walks._waits_for_target = True
-    BasePostgresSaver._try_advance_walks = staticmethod(_try_advance_walks)
-
-
-_walk_delta_history_from_loaded_target()
 
 # Message ids under DeltaChannel are stamped upstream by langgraph's
 # ``ensure_message_ids`` (>=1.2.2) at ``put_writes`` time, before the checkpointer

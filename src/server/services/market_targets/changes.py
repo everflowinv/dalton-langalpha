@@ -22,22 +22,3 @@ async def targets_changed(thread_id: str) -> None:
     except Exception:
         logger.debug("[MarketTargets] in-process reload request failed", exc_info=True)
 
-
-async def cancel_on_workspace_delete(workspace_id: str) -> None:
-    """End a deleted workspace's armed targets, as archiving a thread ends
-    its own: no turn starts there again, so a hit would only be dropped.
-    Best effort after the delete committed; one that survives a failure here
-    is dropped at delivery, as its workspace reads deleted."""
-    from src.server.database.market_targets import cancel_workspace_targets
-
-    try:
-        rows = await cancel_workspace_targets(workspace_id)
-        for thread_id in {str(row["conversation_thread_id"]) for row in rows}:
-            await targets_changed(thread_id)
-    except Exception:
-        logger.warning(
-            "[MarketTargets] cancelling targets on workspace delete failed "
-            "workspace_id=%s",
-            workspace_id,
-            exc_info=True,
-        )

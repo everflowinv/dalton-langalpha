@@ -89,7 +89,10 @@ export function settleStoppedBubble(at: { assistantMessageId: string; refs: Stre
  * Settles a turn whose run failed. `failure` is the card the bubble shows,
  * none when the failure is shown in the banner. An `internal` failure on a
  * turn that streamed nothing settles it without `error`, so the orphan skip
- * hides it and the banner is the whole report.
+ * hides it and the banner is the whole report. A hidden opener's reply is the
+ * exception: it is all its turn shows, and hidden it would leave the banner
+ * with no Retry and no message to send again, so it fails with the card a
+ * reload of the failed turn draws.
  */
 export function settleFailedBubble({ failure, internal = false, ...at }: {
   assistantMessageId: string;
@@ -98,7 +101,9 @@ export function settleFailedBubble({ failure, internal = false, ...at }: {
   failure?: StructuredError;
   internal?: boolean;
 }): void {
-  settleTurnEnd(at, (msg) => (internal && !holdsContent(msg)
-    ? finalizeAssistantMessage(msg, 'disconnected')
-    : failAssistantMessage(msg, failure)));
+  settleTurnEnd(at, (msg) => {
+    if (!internal || holdsContent(msg)) return failAssistantMessage(msg, failure);
+    if (msg.hiddenOpener === true) return failAssistantMessage(msg, { message: '', kind: 'internal' });
+    return finalizeAssistantMessage(msg, 'disconnected');
+  });
 }

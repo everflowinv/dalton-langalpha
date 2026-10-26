@@ -68,6 +68,7 @@ from ptc_agent.agent.middleware.compaction.window import (
     window_cut,
 )
 from ptc_agent.agent.transcript import TranscriptTarget, Window
+from ptc_agent.agent.transcript.identity import DIGEST_VERSION
 from ptc_agent.agent.transcript.pointer import aexport_transcript, transcript_target
 
 if TYPE_CHECKING:
@@ -358,9 +359,10 @@ class CompactionMiddleware(AgentMiddleware):
         which case the update keeps the refusal.
 
         A refusal is kept in the checkpoint with the anchor and cut it was
-        for, and not asked again until a summary moves them: a thread whose
-        slices do not match pays for the check once per summary, not per
-        turn, and one backfilled since trims after its next summary.
+        for, and the digest it was checked under, and not asked again until
+        one of them moves: a thread whose slices do not match pays for the
+        check once per summary, not per turn, and one backfilled since trims
+        after its next summary.
         """
         if self._coverage is None:
             return None
@@ -369,22 +371,20 @@ class CompactionMiddleware(AgentMiddleware):
         cut = window_cut(messages, event)
         if cut <= 0:
             return None
-        asked = {"anchor": event["anchor_message_id"], "cut": cut}
+        asked = {"anchor": event["anchor_message_id"], "cut": cut, "digest": DIGEST_VERSION}
         if state.get("_window_refused") == asked:
             return None
-        # Hashing the head is CPU over every message it drops.
-        head = await asyncio.to_thread(Window.of(state).extend, messages[:cut])
         try:
             async with asyncio.timeout(_COVERAGE_TIMEOUT_S):
-                covered = await self._coverage(head)
+                head = await self._coverage(Window.of(state), messages[:cut])
         except Exception:  # noqa: BLE001 - an unanswered check only delays the trim
             logger.warning("[Compaction] window coverage unread", exc_info=True)
             return None
-        if not covered:
+        if head is None:
             logger.info(
                 "[Compaction] window waits for the next summary: slices do not "
-                "hold runs 1-%d",
-                head.runs,
+                "hold the %d messages before the cut",
+                cut,
             )
             return {"_window_refused": asked}
         logger.info(

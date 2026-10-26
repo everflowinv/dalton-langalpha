@@ -1,14 +1,13 @@
-import { useState, type ReactElement, type ReactNode } from 'react';
+import type { ReactElement, ReactNode } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useLocale } from '@/hooks/useLocale';
 import { useNow } from '@/hooks/useNow';
 import { mediumTime } from '@/lib/format';
-import { Button } from '@/components/ui/button';
 import PulseDot from '@/components/ui/pulse-dot';
-import type { MarketTarget } from '../utils/api';
-import { armedTargets } from '../session/marketWatchEvents';
 import type { MarketWatchState } from '../hooks/utils/streamEventHandlers';
-import { conditionLabel, targetConditionLabel, targetStatusLabel } from './marketTargetLabels';
+import { useThreadWakeups } from '../hooks/useWakeups';
+import { WakeupListRows } from './wakeups/WakeupList';
+import { isPending } from './wakeupLabels';
 
 const TERTIARY = { color: 'var(--color-text-tertiary)' as const };
 
@@ -70,97 +69,32 @@ function QuoteBlock({ content }: { content: string }): ReactElement {
   );
 }
 
-/** One target: its condition, where it stands, and a cancel while it is armed. */
-function TargetRow({
-  target,
-  now,
-  onCancel,
-}: {
-  target: MarketTarget;
-  now: number;
-  onCancel?: ((targetId: string) => Promise<void>) | null;
-}): ReactElement {
-  const { t } = useTranslation();
-  const locale = useLocale();
-  const [cancelling, setCancelling] = useState(false);
-  const [failed, setFailed] = useState(false);
-
-  const cancel = () => {
-    if (!onCancel) return;
-    setCancelling(true);
-    setFailed(false);
-    onCancel(target.target_id).then(
-      () => setCancelling(false),
-      () => {
-        setCancelling(false);
-        setFailed(true);
-      },
-    );
-  };
-
-  return (
-    <li className="flex items-start gap-3 py-2" data-target-status={target.status}>
-      <div className="min-w-0 flex-1">
-        <div className="flex flex-wrap items-baseline gap-x-2 text-sm">
-          <span className="font-medium" style={{ color: 'var(--color-text-primary)' }}>
-            {target.symbol}
-          </span>
-          <span className="tabular-nums" style={{ color: 'var(--color-text-secondary)' }}>
-            {targetConditionLabel(target, t, locale)}
-          </span>
-        </div>
-        <div className="mt-0.5 text-xs tabular-nums" style={TERTIARY}>
-          {targetStatusLabel(target, t, locale, now)}
-        </div>
-        {failed && (
-          <div className="mt-0.5 text-xs" style={{ color: 'var(--color-loss)' }} role="alert">
-            {t('chat.marketWatch.cancelTargetFailed')}
-          </div>
-        )}
-      </div>
-      {target.status === 'armed' && onCancel && (
-        <Button
-          variant="ghost"
-          size="sm"
-          className="h-7 shrink-0 px-2 text-xs"
-          style={{ color: 'var(--color-text-secondary)' }}
-          disabled={cancelling}
-          onClick={cancel}
-          aria-label={t('chat.marketWatch.cancelTargetLabel', {
-            symbol: target.symbol,
-            condition: conditionLabel(target.kind, target.value, locale),
-          })}
-        >
-          {cancelling ? t('chat.marketWatch.cancellingTarget') : t('chat.marketWatch.cancelTarget')}
-        </Button>
-      )}
-    </li>
-  );
-}
-
 export interface StatusPanelProps {
   marketWatch?: MarketWatchState | null;
-  /** Cancels an armed target; rejects when the request fails. Omitted, the
-   *  targets show without a cancel. */
-  onCancelTarget?: ((targetId: string) => Promise<void>) | null;
+  /** The thread whose wakeups the panel lists; absent, it lists none. */
+  threadId?: string | null;
+  /** False while the panel's chat is kept warm off screen, which holds the
+   *  list without reading it. */
+  active?: boolean;
 }
 
 /**
  * The file panel's Status tab body: the live market watch (symbols + the quote
- * block streamed by `market_watch_update` events), then the thread's price
- * targets: armed ones and those settled in the last day.
+ * block streamed by `market_watch_update` events), then the thread's wakeups:
+ * pending ones and those that ended in the last day.
  * Structured so later status surfaces can be appended as more sections.
  */
-export default function StatusPanel({ marketWatch, onCancelTarget }: StatusPanelProps): ReactElement {
+export default function StatusPanel({ marketWatch, threadId = null, active = true }: StatusPanelProps): ReactElement {
   const { t } = useTranslation();
   const locale = useLocale();
+  const wakeups = useThreadWakeups(threadId, active);
   const symbols = marketWatch?.symbols ?? [];
-  const targets = marketWatch?.targets ?? [];
+  const items = wakeups?.items ?? [];
   const content = marketWatch?.content;
   const timestamp = marketWatch?.timestamp;
-  const armedCount = armedTargets(targets).length;
-  // Only an armed target's time left moves.
-  const now = useNow(60_000, armedCount > 0);
+  const pendingCount = items.filter(isPending).length;
+  // Only a pending wakeup's time left moves.
+  const now = useNow(60_000, pendingCount > 0);
 
   const updatedCaption =
     timestamp != null
@@ -172,8 +106,8 @@ export default function StatusPanel({ marketWatch, onCancelTarget }: StatusPanel
 
   return (
     <div className="h-full overflow-y-auto px-4 py-4">
-      {/* With only targets, the empty watch list would read as nothing watched. */}
-      {(symbols.length > 0 || targets.length === 0) && (
+      {/* With only wakeups, the empty watch list would read as nothing watched. */}
+      {(symbols.length > 0 || !wakeups || items.length === 0) && (
         <StatusSection
           title={t('chat.marketWatch.panelTitle', { defaultValue: 'Market watch' })}
           caption={updatedCaption}
@@ -211,13 +145,15 @@ export default function StatusPanel({ marketWatch, onCancelTarget }: StatusPanel
           )}
         </StatusSection>
       )}
-      {targets.length > 0 && (
-        <StatusSection title={t('chat.marketWatch.targetsTitle')} live={armedCount > 0}>
-          <ul className="divide-y divide-(--color-border-muted)">
-            {targets.map((target) => (
-              <TargetRow key={target.target_id} target={target} now={now} onCancel={onCancelTarget} />
-            ))}
-          </ul>
+      {wakeups && (
+        <StatusSection title={t('chat.wakeups.panelTitle')} live={pendingCount > 0}>
+          {items.length === 0 ? (
+            <p className="text-sm" style={TERTIARY}>{t('chat.wakeups.panelEmpty')}</p>
+          ) : (
+            <ul className="-mx-2.5 divide-y divide-(--color-border-muted)">
+              <WakeupListRows threadId={threadId} wakeups={items} now={now} userTimezone={wakeups.userTimezone} />
+            </ul>
+          )}
         </StatusSection>
       )}
     </div>

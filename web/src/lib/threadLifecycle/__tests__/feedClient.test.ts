@@ -529,6 +529,65 @@ describe('threadLifecycleFeed — thread_subagents', () => {
   });
 });
 
+describe('threadLifecycleFeed — thread_tuning', () => {
+  it('rereads an open thread whose effort or fast mode moved, and skips one that already agrees', async () => {
+    const invalidate = vi.spyOn(queryClient, 'invalidateQueries');
+    startThreadLifecycleFeed(queryClient);
+    await flush();
+
+    queryClient.setQueryData(queryKeys.threads.detail('t1'), { thread_id: 't1', reasoning_effort: 'low', fast_mode: null });
+    queryClient.setQueryData(queryKeys.threads.detail('t2'), { thread_id: 't2', reasoning_effort: 'high', fast_mode: null });
+    // From a server that predates the fields: absent follows Settings, as null does.
+    queryClient.setQueryData(queryKeys.threads.detail('t3'), { thread_id: 't3' });
+
+    invalidate.mockClear();
+    for (const thread_id of ['t1', 't2', 't3']) {
+      conns[0].emit({
+        event: 'thread_lifecycle',
+        type: 'thread_tuning',
+        thread_id,
+        workspace_id: 'w1',
+        reasoning_effort: thread_id === 't3' ? null : 'high',
+        fast_mode: null,
+      });
+    }
+    await flush(400);
+
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.threads.detail('t1') });
+    expect(invalidate).not.toHaveBeenCalledWith({ queryKey: queryKeys.threads.detail('t2') });
+    expect(invalidate).not.toHaveBeenCalledWith({ queryKey: queryKeys.threads.detail('t3') });
+  });
+
+  it("only marks the row stale while this tab's own pick on it is saving", async () => {
+    const getThread = vi.fn().mockResolvedValue({ thread_id: 't1', reasoning_effort: 'low' });
+    const key = queryKeys.threads.detail('t1');
+    const observer = new QueryObserver(queryClient, { queryKey: key, queryFn: getThread, staleTime: Infinity });
+    const unsubscribe = observer.subscribe(() => {});
+    startThreadLifecycleFeed(queryClient);
+    await flush();
+    getThread.mockClear();
+
+    const pick = new MutationObserver(queryClient, {
+      mutationKey: threadFieldMutationKey('t1', 'reasoning_effort'),
+      mutationFn: () => new Promise(() => {}),
+    });
+    void pick.mutate();
+    conns[0].emit({
+      event: 'thread_lifecycle',
+      type: 'thread_tuning',
+      thread_id: 't1',
+      workspace_id: 'w1',
+      reasoning_effort: 'high',
+      fast_mode: true,
+    });
+    await flush(400);
+
+    expect(getThread).not.toHaveBeenCalled();
+    expect(queryClient.getQueryState(key)?.isInvalidated).toBe(true);
+    unsubscribe();
+  });
+});
+
 describe('threadLifecycleFeed — cache-only list refetch', () => {
   it('explicitly fetches an invalidated list whose only observers opt in', async () => {
     // The nav tree's page-0 queries observe with `enabled: false`, which

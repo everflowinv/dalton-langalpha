@@ -145,6 +145,32 @@ def validate_store_key(key: str) -> None:
             )
 
 
+def store_label(value: str) -> str:
+    """``value`` as a namespace label the store accepts.
+
+    The store joins labels with ``.`` and, since langgraph-checkpoint 4.3,
+    refuses a label holding one on reads as well as writes, so an id that
+    carries a dot (an email set as ``AUTH_USER_ID``) has it escaped. Only the
+    dot is: a write under a dotted label always failed, so no row moves, and
+    every other id keeps the label its rows were written under. An id spelling
+    ``%2E`` would share its dotted twin's label, and no deployment holds both:
+    ids are UUIDs or the one configured ``AUTH_USER_ID``.
+    """
+    return value.replace(".", "%2E")
+
+
+def user_memory_namespace(user_id: str) -> tuple[str, ...]:
+    return (store_label(user_id), "memory")
+
+
+def workspace_memory_namespace(user_id: str, workspace_id: str) -> tuple[str, ...]:
+    return (store_label(user_id), "workspaces", store_label(workspace_id), "memory")
+
+
+def memo_namespace(user_id: str) -> tuple[str, ...]:
+    return (store_label(user_id), "memos")
+
+
 def grep_texts(
     texts: list[tuple[str, str]],
     compiled: re.Pattern[str],

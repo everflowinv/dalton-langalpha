@@ -7,9 +7,11 @@ dependencies; until then the row stays staged and the sweep tries again.
 """
 
 import asyncio
+import json
 import subprocess
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -18,7 +20,9 @@ import pytest
 from src.server.services.computer_manager import ComputerManager
 from src.server.services.computer_errors import ComputerBusyError
 from src.server.services.computer_manager._move import _PUT_BACK_GIVE_UP_S, _folder_held
+from src.server.services.persistence.transfer import SYNC_MARKER_NAME
 from src.server.services.workspace_move import move_from_row
+from tests.unit.restored_overlay import archive, python3_on_path
 
 _MOVE = "src.server.services.computer_manager._move"
 MOVE_ID = "66666666-6666-4666-8666-666666666666"
@@ -137,12 +141,14 @@ def put_back():
 
     manager._detached_runtime = detached
     manager.wake_computer = AsyncMock()
+    clear = AsyncMock(return_value=None)
     with (
         patch(f"{_MOVE}.get_computer", AsyncMock(side_effect=lambda _: state.computers.pop(0))),
         patch(f"{_MOVE}.workspace_folders_lock", folders_lock),
         patch(f"{_MOVE}.hold_workspace_folder", AsyncMock(return_value=True)),
+        patch(f"{_MOVE}._clear_move_folder", clear),
     ):
-        yield SimpleNamespace(manager=manager, state=state, runtime=runtime)
+        yield SimpleNamespace(manager=manager, state=state, runtime=runtime, clear=clear)
 
 
 @pytest.mark.asyncio
@@ -152,6 +158,9 @@ async def test_a_stopped_source_is_started_to_take_its_folder_back(put_back):
     assert await put_back.manager._put_folder_back(_staged()) == "back"
 
     put_back.manager.wake_computer.assert_awaited_once_with(SOURCE, user_id="user-1")
+    put_back.clear.assert_awaited_once_with(
+        put_back.runtime, ROOT, f"move-{MOVE_ID}", "Research", "finish"
+    )
     (command,) = put_back.runtime.exec.await_args.args
     assert f"mv {ROOT}/{AWAY} {ROOT}/Research" in command
 
@@ -286,3 +295,107 @@ def test_an_incomplete_backup_keeps_its_own_sentence_and_files():
     }
 
     assert move_from_row(row).error.model_dump() == error
+
+
+class _LocalShell:
+    """Runs the commands the runner builds in a local shell."""
+
+    async def upload_file(self, content, dest_path):
+        Path(dest_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(dest_path).write_bytes(content)
+
+    async def exec(self, command, timeout=None):
+        done = subprocess.run(
+            ["/bin/sh", "-c", command], capture_output=True, text=True, timeout=timeout
+        )
+        return SimpleNamespace(exit_code=done.returncode, stdout=done.stdout, stderr=done.stderr)
+
+
+@pytest.mark.asyncio
+async def test_a_put_back_finishes_the_delete_a_copy_aside_left(tmp_path, monkeypatch):
+    """The folder was copied aside and its delete where it is cut short: both
+    paths exist. The copy is whole and the folder is not, so what is left of
+    the folder goes and the copy comes back, rather than the mirror, which
+    lacks .git and dependencies."""
+    root = tmp_path / "root"
+    (root / "Research").mkdir(parents=True)
+    (root / "Research" / "left.txt").write_text("not yet deleted")
+    copy = root / AWAY
+    (copy / ".git").mkdir(parents=True)
+    (copy / ".git" / "HEAD").write_text("ref")
+    (copy / "left.txt").write_text("not yet deleted")
+    journal = root / "_internal" / "moving" / "landed.json"
+    journal.parent.mkdir(parents=True)
+    journal.write_text(json.dumps(
+        {f"c:move-{MOVE_ID}": ["Research", copy.lstat().st_ino, AWAY]}
+    ))
+    python3_on_path(monkeypatch, tmp_path / "bin", archive(root))
+    manager = _manager()
+
+    @asynccontextmanager
+    async def detached(provider_ref, *, binding=None):
+        yield _LocalShell()
+
+    @asynccontextmanager
+    async def folders_lock(computer_id):
+        yield object()
+
+    manager._detached_runtime = detached
+    computer = {**_computer(), "root_dir": str(root)}
+    with (
+        patch(f"{_MOVE}.get_computer", AsyncMock(return_value=computer)),
+        patch(f"{_MOVE}.workspace_folders_lock", folders_lock),
+        patch(f"{_MOVE}.hold_workspace_folder", AsyncMock(return_value=True)),
+    ):
+        assert await manager._put_folder_back(_staged()) == "back"
+
+    assert (root / "Research" / ".git" / "HEAD").read_text() == "ref"
+    assert not copy.exists()
+    assert json.loads(journal.read_text()) == {}
+
+
+@pytest.mark.asyncio
+async def test_a_folder_with_no_room_for_its_copy_is_deleted_after_its_backup(
+    tmp_path, monkeypatch
+):
+    """Restored from its archive, the source refuses to rename the folder
+    aside, and its disk has no room for a copy. The backup is all that is
+    kept, so it is taken again under the hold, which a file change begun
+    before the move no longer has, and a rollback is flagged to restore from
+    it before anything goes. Nothing is left behind."""
+    root = tmp_path / "root"
+    folder = root / "Research"
+    (folder / "src").mkdir(parents=True)
+    (folder / "src" / "a.py").write_text("x")
+    (folder / SYNC_MARKER_NAME).write_text("synced")
+    python3_on_path(monkeypatch, tmp_path / "bin", archive(root), full=True)
+    seen = []
+
+    async def back_up(**kwargs):
+        seen.append(("backup", kwargs, folder.exists()))
+        return True
+
+    flag = AsyncMock(side_effect=lambda *_: seen.append(("flag", folder.exists())))
+    advance = AsyncMock(return_value={"phase": "staged", "leftovers_path": None})
+
+    @asynccontextmanager
+    async def held(computer_id, workspace_id):
+        yield object()
+
+    with (
+        patch(f"{_MOVE}._folder_held", held),
+        patch(f"{_MOVE}.get_workspace_dir_name", AsyncMock(return_value="Research")),
+        patch(f"{_MOVE}.stage_workspace_move", AsyncMock(return_value=_staged())),
+        patch(f"{_MOVE}.flag_rollback_restore", flag),
+        patch(f"{_MOVE}.advance_workspace_move", advance),
+    ):
+        staged = await _manager()._set_folder_aside(
+            _staged(), _LocalShell(), str(root), back_up, asyncio.Event()
+        )
+
+    assert staged == {"phase": "staged", "leftovers_path": None}
+    flag.assert_awaited_once_with(MOVE_ID, "ws-1")
+    assert seen == [("backup", {"held_folder": "Research"}, True), ("flag", True)]
+    advance.assert_awaited_once_with(MOVE_ID, "runner-1", "staged", leftovers_path=None)
+    assert not folder.exists()
+    assert not (root / AWAY).exists()

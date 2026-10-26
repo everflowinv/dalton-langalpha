@@ -5,7 +5,7 @@ import { ToastAction } from '@/components/ui/toast';
 import { toast } from '@/components/ui/use-toast';
 import { canBeginMcpOAuth } from '@/lib/desktop';
 import { pendingIntent } from '@/pages/ChatAgent/utils/api/mcpOauth';
-import { ONBOARDING_CONNECT, ONBOARDING_PARAM } from '@/pages/Onboarding/connect/useStartOnboarding';
+import { WELCOME_PATH, isLegacyOnboardingSearch, legacyOnboardingTarget } from '@/pages/Onboarding/welcome/paths';
 import { DesktopDownloadLink } from './components/DesktopDownloadLink';
 import { SignInFailure } from './components/SignInFailure';
 import { CALLBACK_PARAMS } from './connectOutcome';
@@ -61,12 +61,18 @@ function pluginsParams(at: Place = window.location): URLSearchParams {
  * callback lands there itself, except when the server could no longer tie it
  * to its flow (a sign-in slower than the flow's state lives), which leaves it
  * only the Plugins page to fall back on; the record still knows the way.
+ *
+ * A connect an older build's onboarding sheet sent out names the sheet's URL,
+ * which is the welcome flow's brokerage screen now. The shell moves a URL it
+ * is opened on there by itself, before this reads the landing; a recorded one
+ * is moved here.
  */
 function askedToLand(record: ConnectRecord | null): Place {
   if (record?.returnTo) {
     try {
       const url = new URL(record.returnTo, window.location.origin);
-      if (url.origin === window.location.origin) return url;
+      if (url.origin !== window.location.origin) return window.location;
+      return isLegacyOnboardingSearch(url.search) ? new URL(legacyOnboardingTarget(url.search), url.origin) : url;
     } catch {
       // Not a path any build wrote; where the callback landed will do.
     }
@@ -129,10 +135,15 @@ function toastAbandoned(record: ConnectRecord, t: TFunction, navigate: NavigateF
   });
 }
 
+/** The welcome flow, which a brokerage connect it sent out returns to. */
+function onWelcome(at: Pick<Place, 'pathname'>): boolean {
+  return at.pathname === WELCOME_PATH;
+}
+
 /**
  * Read what this landing says about the connects this tab sent out, once, and
- * hand it to whoever acts on it: the onboarding sheet when the page reopens
- * with it, the page otherwise.
+ * hand it to whoever acts on it: the welcome flow when it reopens with it, the
+ * page otherwise.
  *
  * Every surface's connect comes back through here: the callback returns to the
  * page it was given, and Back returns to the page the connect left from. The
@@ -142,12 +153,10 @@ function toastAbandoned(record: ConnectRecord, t: TFunction, navigate: NavigateF
 export function landConnectReturn({ t, navigate }: { t: TFunction; navigate: NavigateFunction }) {
   const landed = settleConnectReturn(window.location.search);
   if (!landed) return;
-  const onSheet = (search: string) =>
-    new URLSearchParams(search).get(ONBOARDING_PARAM) === ONBOARDING_CONNECT;
 
   if (landed.kind === 'abandoned') {
-    if (onSheet(window.location.search)) {
-      setConnectLanding({ owner: 'sheet', server: landed.record.server, outcome: 'failed', reasonKey: null });
+    if (onWelcome(window.location)) {
+      setConnectLanding({ owner: 'welcome', server: landed.record.server, outcome: 'failed', reasonKey: null });
     } else {
       toastAbandoned(landed.record, t, navigate);
     }
@@ -156,21 +165,20 @@ export function landConnectReturn({ t, navigate }: { t: TFunction; navigate: Nav
 
   const { outcome, record } = landed;
   const back = askedToLand(record);
-  const sheet = onSheet(back.search);
+  const welcome = onWelcome(back);
   const here = new URLSearchParams(back.search);
   for (const key of CALLBACK_PARAMS) here.delete(key);
   const rest = `${here}`;
-  const strip = () =>
-    navigate(`${back.pathname}${rest ? `?${rest}` : ''}${back.hash}`, { replace: true });
+  const strip = () => navigate(`${back.pathname}${rest ? `?${rest}` : ''}${back.hash}`, { replace: true });
   const server = outcome.server ?? record?.server ?? null;
 
-  if (sheet) {
-    // The sheet goes on to the chat on a connect, so only one this tab sent
+  if (welcome) {
+    // The flow moves on by itself on a connect, so only one this tab sent
     // counts: a link carrying the callback's params is not the user's answer.
     if (outcome.kind === 'failed' && server) {
-      setConnectLanding({ owner: 'sheet', server, outcome: 'failed', reasonKey: outcome.reasonKey });
+      setConnectLanding({ owner: 'welcome', server, outcome: 'failed', reasonKey: outcome.reasonKey });
     } else if (outcome.kind === 'connected' && record) {
-      setConnectLanding({ owner: 'sheet', server: record.server, outcome: 'connected', reasonKey: null });
+      setConnectLanding({ owner: 'welcome', server: record.server, outcome: 'connected', reasonKey: null });
     }
     strip();
     return;

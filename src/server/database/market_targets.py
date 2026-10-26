@@ -43,6 +43,28 @@ def ordering_key(thread_id: str) -> str:
     return f"{HOOK_TYPE}:{thread_id}"
 
 
+# Whether the notice of the job ``o`` is still owed, as ``owed()`` in
+# market_targets/delivery.py decides it: a hit until it is delivered, a
+# reminder while its target is armed, unexpired and not yet reminded. The
+# CASEs keep a malformed id from failing the statement; the executor drops
+# that job.
+MARKET_TARGET_OWED_SQL = """EXISTS (
+    SELECT 1 FROM market_watch_targets t
+    WHERE t.target_id = CASE
+            WHEN o.payload->>'target_id'
+                 ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+            THEN (o.payload->>'target_id')::uuid
+        END
+      AND CASE o.payload->>'notice'
+            WHEN 'hit' THEN t.hit_delivered_at IS NULL
+            WHEN 'expiring' THEN t.warn_delivered_at IS NULL
+                                 AND t.status = 'armed'
+                                 AND t.expires_at > NOW()
+            ELSE false
+        END
+)"""
+
+
 def idempotency_key(target_id: str, notice: Notice) -> str:
     return f"{HOOK_TYPE}:{target_id}:{notice}"
 
@@ -414,28 +436,6 @@ async def expire_due_targets() -> int:
 # ---------------------------------------------------------------------------
 # Delivery
 # ---------------------------------------------------------------------------
-
-
-async def held_alerts(job_ids: List[str], run_id: str) -> List[Dict[str, str]]:
-    """The notices among ``job_ids`` that ``run_id`` holds for its live turn,
-    each as its target and notice."""
-    if not job_ids:
-        return []
-    async with get_db_connection() as conn:
-        async with conn.cursor(row_factory=dict_row) as cur:
-            await cur.execute(
-                """
-                SELECT payload->>'target_id' AS target_id,
-                       payload->>'notice' AS notice
-                FROM hook_outbox
-                WHERE hook_outbox_id = ANY(%s::uuid[])
-                  AND hook_type = %s
-                  AND status = 'pending'
-                  AND payload->>'steered_run_id' = %s::text
-                """,
-                (job_ids, HOOK_TYPE, run_id),
-            )
-            return [dict(row) for row in await cur.fetchall()]
 
 
 async def mark_delivered(target_id: str, notice: Notice, run_id: Optional[str]) -> bool:

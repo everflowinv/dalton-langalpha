@@ -1939,6 +1939,34 @@ class TestSearchProviderPreference:
         tier_mock.assert_awaited_once_with("user-1")
 
     @pytest.mark.asyncio
+    async def test_platform_mode_unknown_tier_ignores_provider(self, base_config, monkeypatch):
+        """No tier could be read (platform down, nothing on record): the turn
+        runs on the default provider rather than failing on the comparison."""
+        from src.server.services.llm.config import resolve_llm_config
+
+        monkeypatch.setattr("src.config.settings.HOST_MODE", "platform")
+        monkeypatch.setattr("src.config.settings.SEARCH_PROVIDER_MIN_TIER", 1)
+        tier_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(
+            "src.server.dependencies.usage_limits._fetch_platform_tier", tier_mock
+        )
+
+        mock_mc = _mock_model_config()
+        with (
+            patch(
+                f"{USER_MODELS}.get_model_preference",
+                new_callable=AsyncMock,
+                return_value={"search_provider": "serper"},
+            ),
+            patch(f"{CLIENTS}.resolve_oauth_llm_client", new_callable=AsyncMock, return_value=None),
+            patch("src.llms.llm.LLM.get_model_config", return_value=mock_mc),
+        ):
+            config = await resolve_llm_config(base_config, "user-1", None, False)
+
+        assert config.search_api == "tavily"
+        tier_mock.assert_awaited_once_with("user-1")
+
+    @pytest.mark.asyncio
     async def test_unknown_provider_ignored_without_tier_check(self, base_config, monkeypatch):
         """An unknown engine string is rejected at the validity check, BEFORE the
         search tier gate — no tier fetch happens, and nothing raises."""

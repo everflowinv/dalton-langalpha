@@ -55,14 +55,16 @@ export function Brokerages() {
   const { workspaces, loading: workspacesLoading } = useWorkspaceOptions();
   // Back to this tab, not the MCP one: the vendor round trip should return the
   // user to the page they left.
-  const { oauth, requestConnect: connectBrokerage, toggle } = useBrokerageConnect({
+  const {
+    oauth,
+    requestConnect: connectBrokerage,
+    toggle,
+    togglingName,
+  } = useBrokerageConnect({
     returnTo: '/plugins?tab=brokerages',
   });
   const deleteMutation = useDeleteMcpCatalogServer();
 
-  // Held here rather than in the row so a click on one broker never greys out
-  // the other's controls.
-  const [togglingName, setTogglingName] = useState<string | null>(null);
   // Removing is this tab's own question; the connect question belongs to the
   // connect lifecycle and is held by the hook, so that every surface that can
   // start one has to answer it. Each entry point closes the other, so only one
@@ -72,12 +74,6 @@ export function Brokerages() {
 
   const shipped = brokerages ?? [];
   const resolved = resolveBrokerages(shipped, catalog?.servers ?? []);
-
-  async function handleToggle({ b, row }: ResolvedBroker, enabled: boolean) {
-    setTogglingName(b.name);
-    await toggle(b, row, enabled);
-    setTogglingName(null);
-  }
 
   /**
    * Hand the connect to the shared brokerage connect, closing this tab's own
@@ -189,23 +185,25 @@ export function Brokerages() {
                 <BrokerageCard
                   key={broker.b.name}
                   broker={broker}
-                  workspaces={workspaces}
-                  workspacesLoading={workspacesLoading}
                   connecting={oauth.connectingName === broker.b.name}
-                  refreshing={oauth.refreshingName === broker.b.name}
                   toggling={togglingName === broker.b.name}
                   onConnect={() => requestConnect(broker)}
-                  onDisconnect={() => oauth.disconnect(broker.b.name)}
-                  onRefreshSchemas={() => oauth.refreshSchemas(broker.b.name)}
-                  onToggle={(enabled) => handleToggle(broker, enabled)}
-                  onRequestRemove={() => {
-                    oauth.cancelPending();
-                    setRemovingName(broker.b.name);
+                  onToggle={(enabled) => void toggle(broker.b, broker.row, enabled)}
+                  manage={{
+                    workspaces,
+                    workspacesLoading,
+                    refreshing: oauth.refreshingName === broker.b.name,
+                    onDisconnect: () => oauth.disconnect(broker.b.name),
+                    onRefreshSchemas: () => oauth.refreshSchemas(broker.b.name),
+                    onRequestRemove: () => {
+                      oauth.cancelPending();
+                      setRemovingName(broker.b.name);
+                    },
+                    // The row's other home, where its address and headers are
+                    // editable. Pushed like any detail, so Back returns here.
+                    onOpenInMcpTab: () => openDetail({ kind: 'server', name: broker.b.name }),
+                    onOpen: () => detail.open(broker.b.name),
                   }}
-                  // The row's other home, where its address and headers are
-                  // editable. Pushed like any detail, so Back returns here.
-                  onOpenInMcpTab={() => openDetail({ kind: 'server', name: broker.b.name })}
-                  onOpen={() => detail.open(broker.b.name)}
                 />
               ))}
             </div>
@@ -222,7 +220,7 @@ export function Brokerages() {
           data={detailData}
           onClose={detail.close}
           toggling={togglingName === detailBroker.b.name}
-          onToggle={(enabled) => void handleToggle(detailBroker, enabled)}
+          onToggle={(enabled) => void toggle(detailBroker.b, detailBroker.row, enabled)}
           connecting={oauth.connectingName === detailBroker.b.name}
           // The same call the card makes, so the consent dialog and the
           // sign-in behind it are asked once and answered in one place,

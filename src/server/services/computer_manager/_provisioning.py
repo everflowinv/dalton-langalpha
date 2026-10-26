@@ -8,7 +8,7 @@ import json
 import logging
 import time
 from collections.abc import AsyncIterator, Callable
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from dataclasses import replace
 from datetime import datetime
 from typing import Any, Dict, Optional
@@ -682,6 +682,7 @@ class ProvisioningMixin:
         expected_sandbox_id: str | None = None,
         session: Session | None = None,
         layout: WorkspaceLayout | None = None,
+        held_folder: str | None = None,
     ) -> bool:
         """Always fence backups: sync_to_db overwrites the durable file copy.
 
@@ -692,7 +693,9 @@ class ProvisioningMixin:
         A superseded session would destroy the good copy and miss live files.
         strict=True must abort destructive callers on incomplete backup;
         expected_sandbox_id and layout's root avoid reads when the caller already
-        holds them. The folder is always read again, under the folder hold.
+        holds them. The folder is always read again, under the folder hold,
+        except ``held_folder``, which a caller holding it exclusively names: the
+        hold would wait on that caller, and from staging a move refuses it.
         The machine is resolved here for a caller that holds only the project
         (the post-turn mirror), because the session and the fence are the
         machine's: requiring it of every caller made that one fail on its
@@ -756,7 +759,12 @@ class ProvisioningMixin:
             # as missing, which counts as mirrored. A move a settle could not
             # finish raises: until the next one, the content may be in any of
             # three folders.
-            async with self._held_workspace_folder(workspace_id) as dir_name:
+            held = (
+                nullcontext(held_folder)
+                if held_folder is not None
+                else self._held_workspace_folder(workspace_id)
+            )
+            async with held as dir_name:
                 result = await FilePersistenceService.sync_to_db(
                     workspace_id,
                     session.sandbox,

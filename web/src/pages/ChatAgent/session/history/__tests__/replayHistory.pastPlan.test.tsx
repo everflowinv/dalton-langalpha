@@ -210,4 +210,19 @@ describe('history replay: a past plan', () => {
 
     expectSettledPlan(rt, container, 'Plan not reviewed');
   });
+
+  it('reads a call the runtime closed as not completed, error status and all, as not reviewed', async () => {
+    // Newer runtimes word the same patch differently and stamp it as an
+    // error, which must not read as a rejection.
+    const { rt, container } = await replay([
+      user(0, 'Analyse the filing'),
+      submitPlan(0),
+      review(0),
+      user(1, 'Never mind, just summarize it.'),
+      result(1, CALL_ID, `Tool call SubmitPlan with id ${CALL_ID} did not complete - no result was recorded. It may have been cancelled or interrupted.`, 'error'),
+      text(1, 'Here is the summary.'),
+    ]);
+
+    expectSettledPlan(rt, container, 'Plan not reviewed');
+  });
 });

@@ -3,7 +3,8 @@ deliverables stay Markdown and HTML is made only at formal publication."""
 
 import pytest
 
-from ptc_agent.agent.prompts import get_loader, reset_loader
+from ptc_agent.agent.middleware.runtime_context.profile import render_user_profile
+from ptc_agent.agent.prompts import reset_loader
 
 NARROWING = "This preference is narrowed for Dalton work"
 
@@ -13,12 +14,10 @@ def _render(agent_preference, main_agent_steering=True):
     profile = {"name": "Demo", "timezone": "UTC", "locale": "en-US"}
     if agent_preference is not None:
         profile["agent_preference"] = agent_preference
-    return get_loader().render(
-        "components/user_profile.md.j2",
-        user_profile=profile,
-        user_data_counts=None,
-        main_agent_steering=main_agent_steering,
-    )
+    # Render through the real shaper (agent_preference splits into printed
+    # lines and agent_steering upstream of the template), not by hand-rolling
+    # the template's variables.
+    return render_user_profile(profile, main_agent_steering=main_agent_steering)
 
 
 @pytest.fixture(autouse=True)

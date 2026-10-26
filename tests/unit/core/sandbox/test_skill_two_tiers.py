@@ -26,6 +26,7 @@ from ptc_agent.agent.middleware.skills.lock import (
 )
 from ptc_agent.core.paths import SandboxLayout
 from ptc_agent.core.sandbox import skill_sync
+from tests.unit.restored_overlay import archive, python3_on_path
 
 ROOT = "/home/workspace"
 
@@ -335,6 +336,22 @@ class TestStaleSharedCopies:
         assert result["unpinned"] == ["pdf"]
         assert result["linked"] == ["pdf"]
         assert (tiers.ws / "pdf" / "SKILL.md").read_text().endswith("current\n")
+        assert _ledgered(tiers.ws) == set()
+
+    def test_a_copy_a_restored_sandbox_cannot_rename_still_gives_way(
+        self, tiers, monkeypatch, tmp_path
+    ):
+        """Restored from its archive, the sandbox refuses to rename the copy
+        aside (EXDEV), so it is deleted where it is."""
+        _skill(tiers.user, "pdf", body="current")
+        (_skill(tiers.ws, "pdf", body="stale") / "scripts").mkdir()
+        _ledger(tiers.ws, {"pdf": _PLATFORM})
+        python3_on_path(monkeypatch, tmp_path / "bin", archive(tiers.ws))
+
+        result = _link(tiers)
+
+        assert result["unpinned"] == ["pdf"]
+        assert _entries(tiers.ws) == {"pdf": "link:../../../.agents/skills/pdf"}
         assert _ledgered(tiers.ws) == set()
 
     def test_a_delivered_user_skill_copy_gives_way_to_a_link(self, tiers):

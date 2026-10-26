@@ -107,7 +107,7 @@ async def test_a_row_that_leaves_staging_drops_its_planned_landings():
     moved = [(params["id"], params["landed"]) for sql, params in moves if "dir_name =" in sql]
     assert moved == [(A, True), (B, False)]
     assert all(
-        "THEN config #- '{folder_landings}' ELSE config" in sql
+        "THEN config #- '{folder_landings}' #- '{folder_move_blocked}' ELSE config" in sql
         for sql, params in moves
         if isinstance(params, dict) and "landed" in params
     )
@@ -147,8 +147,8 @@ async def test_a_new_folder_is_never_one_a_staged_row_may_have_landed_on():
 
 @pytest.mark.asyncio
 async def test_a_config_replace_keeps_the_rows_server_owned_keys():
-    """The client writes ``config`` whole; the settle's list and the sandbox
-    stamp are not its to set."""
+    """The client writes ``config`` whole; the settle's list, its block on a
+    rename and the sandbox stamp are not its to set."""
     from src.server.database.workspace import update_workspace
 
     cur = _Cursor()
@@ -159,7 +159,13 @@ async def test_a_config_replace_keeps_the_rows_server_owned_keys():
         " FROM jsonb_each(config) WHERE key = ANY(%s::text[])), '{}'::jsonb)"
     ) in sql
     assert params[0].obj == {"folder_landings": ["Sibling"], "theme": "dark"}
-    owned = ["folder_landings", "sandbox_config_hash", "sandbox_provider", "sandbox_working_dir"]
+    owned = [
+        "folder_landings",
+        "folder_move_blocked",
+        "sandbox_config_hash",
+        "sandbox_provider",
+        "sandbox_working_dir",
+    ]
     assert params[1] == params[2] == owned
 
 

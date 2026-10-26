@@ -1,6 +1,6 @@
 """What the window has trimmed from the head of a message list: how many runs,
-which messages, as one order-sensitive digest, and what a summary's index
-says of the newest of them.
+which messages, as one digest, and what a summary's index says of the newest
+of them.
 
 The window trims runs from the head of the main agent's messages (see
 ``compaction.window``) once the server's turn slices hold them, and from then
@@ -11,19 +11,22 @@ turns or runs, which a thread can have in more than one shape.
 
 A message is keyed by what it says and the tool calls it makes or answers,
 never by its id: one saved before ids were stable loads with a different id,
-or none, from one checkpoint to the next.
+or none, from one checkpoint to the next. Order counts, but not among the
+answers to one batch of parallel tool calls: each is its own task's write,
+and which order a load replays a step's writes in is the saver's to choose
+(checkpoint-postgres 3.2 changed it), so they are hashed in call-id order.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from collections.abc import Iterable, Iterator, Mapping, Sequence
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from langchain_core.messages import AnyMessage
-from typing_extensions import TypedDict
+from typing_extensions import NotRequired, TypedDict
 
 from ptc_agent.agent.transcript.render import split_runs, turn_map
 
@@ -36,14 +39,22 @@ _INDEX_LIMIT = 20
 _REQUEST_CHARS = 1_000
 _NO_REQUEST = "(no request)"
 
+#: How a digest is hashed: 2 takes a batch of tool answers in call-id order,
+#: 1 (a window trimmed before it) in the order they loaded in.
+DIGEST_VERSION = 2
+
+
+def _kind(message: AnyMessage) -> str:
+    # A streamed message can be stored as its chunk class.
+    return message.type.removesuffix("MessageChunk").lower()
+
 
 def _feed(step: Any, message: AnyMessage) -> None:
     content = message.content
     text = content if isinstance(content, str) else json.dumps(
         content, sort_keys=True, default=str
     )
-    # A streamed message can be stored as its chunk class.
-    kind = message.type.removesuffix("MessageChunk").lower()
+    kind = _kind(message)
     calls = [call.get("id") for call in getattr(message, "tool_calls", None) or ()]
     answers = getattr(message, "tool_call_id", None)
     data = text.encode("utf-8", "surrogatepass")
@@ -53,15 +64,37 @@ def _feed(step: Any, message: AnyMessage) -> None:
     step.update(data)
 
 
-def extend(digest: str, messages: Iterable[AnyMessage]) -> str:
-    """``digest`` carried on over ``messages``. A list's digest is its
-    head's carried on over the rest, so a trim adds to the digest the trims
-    before it left instead of needing what they dropped."""
+def _chain(digest: str, messages: Iterable[AnyMessage]) -> str:
     for message in messages:
         step = hashlib.blake2b(digest.encode(), digest_size=16)
         _feed(step, message)
         digest = step.hexdigest()
     return digest
+
+
+def _call_ordered(messages: Iterable[AnyMessage]) -> Iterator[AnyMessage]:
+    """``messages`` with each batch of tool answers in call-id order."""
+    batch: list[AnyMessage] = []
+    for message in messages:
+        if _kind(message) == "tool":
+            batch.append(message)
+            continue
+        yield from sorted(batch, key=_call_id)
+        batch.clear()
+        yield message
+    yield from sorted(batch, key=_call_id)
+
+
+def _call_id(message: AnyMessage) -> str:
+    return getattr(message, "tool_call_id", None) or ""
+
+
+def extend(digest: str, messages: Iterable[AnyMessage]) -> str:
+    """``digest`` carried on over ``messages``. A list's digest is its
+    head's carried on over the rest, so a trim adds to the digest the trims
+    before it left instead of needing what they dropped; a head ends where a
+    run starts, never inside a batch of tool answers."""
+    return _chain(digest, _call_ordered(messages))
 
 
 class WindowState(TypedDict):
@@ -73,6 +106,8 @@ class WindowState(TypedDict):
     messages: int
     digest: str
     requests: list[str]
+    #: ``DIGEST_VERSION`` the digest was hashed under; absent, 1.
+    version: NotRequired[int]
 
 
 @dataclass(frozen=True)
@@ -88,6 +123,8 @@ class Window:
     digest: str = ""
     #: The index text of the newest trimmed runs, by number.
     earlier: Mapping[int, str] = field(default_factory=dict)
+    #: ``DIGEST_VERSION`` the digest was hashed under.
+    version: int = DIGEST_VERSION
 
     @classmethod
     def of(cls, state: Mapping[str, Any]) -> Window:
@@ -101,6 +138,7 @@ class Window:
             kept["messages"],
             kept["digest"],
             {first + i: line for i, line in enumerate(requests)},
+            kept.get("version", 1),
         )
 
     def update(self) -> dict[str, WindowState]:
@@ -111,6 +149,7 @@ class Window:
                 messages=self.messages,
                 digest=self.digest,
                 requests=list(self.earlier.values()),
+                version=self.version,
             )
         }
 
@@ -128,13 +167,43 @@ class Window:
         return Window(
             runs,
             self.messages + len(messages),
-            extend(self.digest, messages),
+            self._extend(self.digest, messages),
             newest_lines(self.lines(requests), runs),
+            self.version,
         )
 
     def holds(self, messages: Sequence[AnyMessage]) -> bool:
         """Whether ``messages`` are exactly the ones trimmed."""
-        return len(messages) == self.messages and extend("", messages) == self.digest
+        return len(messages) == self.messages and self._extend("", messages) == self.digest
+
+    def extend_held(
+        self, messages: Sequence[AnyMessage], held: Sequence[AnyMessage]
+    ) -> Window | None:
+        """This window with ``messages`` trimmed after it, if ``held`` is
+        exactly its messages and then those, else None, hashed under
+        ``DIGEST_VERSION``.
+
+        A window hashed under an older digest is rehashed from ``held``
+        unchecked: that digest took answers in the order they loaded, which
+        a later load need not repeat, and what it trimmed lives only in the
+        slices already. ``messages`` are still checked in full, where its
+        count puts them.
+        """
+        earlier, later = held[: self.messages], held[self.messages :]
+        if len(earlier) != self.messages or len(later) != len(messages):
+            return None
+        base = self
+        if self.version != DIGEST_VERSION:
+            base = replace(self, digest=extend("", earlier), version=DIGEST_VERSION)
+        elif not self.holds(earlier):
+            return None
+        head = base.extend(messages)
+        return head if extend(base.digest, later) == head.digest else None
+
+    def _extend(self, digest: str, messages: Iterable[AnyMessage]) -> str:
+        if self.version == DIGEST_VERSION:
+            return extend(digest, messages)
+        return _chain(digest, messages)
 
 
 def newest_lines(lines: Mapping[int, str], last: int) -> dict[int, str]:

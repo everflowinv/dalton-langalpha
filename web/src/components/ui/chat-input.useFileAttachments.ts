@@ -1,14 +1,17 @@
 import { useCallback, useState } from 'react';
-import type { FileAttachment } from './chat-input.types';
+import type { FileAttachment, ReadyAttachment } from './chat-input.types';
 import { MAX_FILES, MAX_FILE_SIZE } from './chat-input.helpers';
 
 /** Attachment handling for the chat composer: validation (count and size),
- * dataUrl reading with previews, drag & drop, and paste capture. */
-export function useFileAttachments() {
+ * dataUrl reading with previews, drag & drop, and paste capture. A `disabled`
+ * composer takes no files, however they come: its drag handlers refuse
+ * instead of attach, and a pick or paste that still arrives is dropped. */
+export function useFileAttachments({ disabled = false }: { disabled?: boolean } = {}) {
   const [attachedFiles, setAttachedFiles] = useState<FileAttachment[]>([]);
   const [isDragging, setIsDragging] = useState(false);
 
   const handleFiles = useCallback((newFilesList: FileList | File[]) => {
+    if (disabled) return;
     const currentCount = attachedFiles.length;
     const fileArray = Array.from(newFilesList);
 
@@ -49,7 +52,22 @@ export function useFileAttachments() {
       };
       reader.readAsDataURL(f.file);
     });
-  }, [attachedFiles.length]);
+  }, [attachedFiles.length, disabled]);
+
+  // Files a send took that are coming back to the composer, already read.
+  // The send revoked their previews, so each gets a new one.
+  const restoreFiles = useCallback((files: ReadyAttachment[]) => {
+    if (files.length === 0) return;
+    const restored: FileAttachment[] = files.map((f) => ({
+      id: Math.random().toString(36).substr(2, 9),
+      file: f.file,
+      type: f.type,
+      preview: f.type.startsWith('image/') ? URL.createObjectURL(f.file) : null,
+      uploadStatus: 'complete' as const,
+      dataUrl: f.dataUrl,
+    }));
+    setAttachedFiles((prev) => [...prev, ...restored].slice(0, MAX_FILES));
+  }, []);
 
   const removeFile = useCallback((id: string) => {
     setAttachedFiles((prev) => {
@@ -59,11 +77,17 @@ export function useFileAttachments() {
     });
   }, []);
 
-  // Drag & Drop
+  // Drag & Drop. A disabled composer refuses a drag over it (shown as such,
+  // and kept from reaching the page, which would open the file in its place)
+  // and a drop on it is not attached to a message that cannot be sent.
   const onDragOver = useCallback((e: React.DragEvent) => {
     e.preventDefault();
+    if (disabled) {
+      e.dataTransfer.dropEffect = 'none';
+      return;
+    }
     setIsDragging(true);
-  }, []);
+  }, [disabled]);
   const onDragLeave = useCallback((e: React.DragEvent) => {
     e.preventDefault();
     setIsDragging(false);
@@ -90,5 +114,5 @@ export function useFileAttachments() {
     }
   }, [handleFiles]);
 
-  return { attachedFiles, setAttachedFiles, isDragging, handleFiles, removeFile, onDragOver, onDragLeave, onDrop, handlePaste };
+  return { attachedFiles, setAttachedFiles, isDragging, handleFiles, restoreFiles, removeFile, onDragOver, onDragLeave, onDrop, handlePaste };
 }

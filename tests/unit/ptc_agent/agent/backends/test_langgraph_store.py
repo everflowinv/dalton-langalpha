@@ -18,7 +18,12 @@ from ptc_agent.agent.backends.langgraph_store import (
     StoreContentInvalidError,
     StoreContentTooLargeError,
     StoreBackend,
+    memo_namespace,
+    store_label,
+    user_memory_namespace,
+    workspace_memory_namespace,
 )
+from ptc_agent.agent.backends.workflows import workflow_namespace
 
 USER_PREFIX = "/home/workspace/.agents/user/memory/"
 
@@ -529,3 +534,26 @@ class TestCacheInvalidation:
 
         refreshed = await cache.aget(store, ns, "memory.md")
         assert refreshed.value["content"] == "new body"
+
+
+class TestNamespaceLabels:
+    """The store refuses a dotted label on reads too (langgraph-checkpoint 4.3)."""
+
+    @pytest.mark.asyncio
+    async def test_dotted_user_id_reads_and_writes_every_tier(self):
+        store = InMemoryStore()
+        user = "alice@example.com"
+        for ns in (
+            user_memory_namespace(user),
+            workspace_memory_namespace(user, "ws-1"),
+            memo_namespace(user),
+            workflow_namespace(user),
+        ):
+            assert await store.asearch(ns) == []
+            await store.aput(ns, "k.md", {"content": "x"})
+            assert (await store.aget(ns, "k.md")).value == {"content": "x"}
+
+    def test_ids_without_a_dot_keep_the_label_they_were_written_under(self):
+        for user in ("local-dev-user", "5cd66c29-00cc-4f02-820e-b9bab633fbf1", "bob%42"):
+            assert user_memory_namespace(user) == (user, "memory")
+        assert store_label("alice@example.com") == "alice@example%2Ecom"

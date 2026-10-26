@@ -75,8 +75,9 @@ async def park_while_thread_busy(
     The re-read closes the race where that finalize landed between the
     status read and the park (its release pass saw no deferred row yet),
     releasing the job itself. ``parks_at_ceiling`` is for a type the defer
-    still parks at the attempts ceiling (a market-target alert, held for the
-    thread's next turn), so the re-read covers it there too; a steer settled
+    still parks at the attempts ceiling (an alert: a price target's or a
+    wakeup's notice, held for the thread's next turn), so the re-read covers
+    it there too; a steer settled
     there instead is not parked, and has nothing to release.
     """
     from src.server.database.runs import lifecycle as tl_db
@@ -145,6 +146,28 @@ async def release_if_a_turn_ended(thread_id: str, since: tuple[str, str] | None)
     return True
 
 
+async def earlier_wake(key: str, thread_id: str, *, log_prefix: str) -> dict | None:
+    """The run an earlier claim's POST started under ``key``, or None.
+
+    Request keys are unique across every thread, so a run holding the key on
+    another thread is not this notice's wake, and stamping the notice to it
+    would mark delivered a notice this thread never saw.
+    """
+    from src.server.database.runs import lifecycle as tl_db
+
+    earlier = await tl_db.find_run_by_request_key(key)
+    if earlier is None:
+        return None
+    if str(earlier.get("conversation_thread_id")) != thread_id:
+        logger.warning(
+            f"{log_prefix} Request key {key} names run "
+            f"{earlier.get('conversation_response_id')} on another thread "
+            f"than {thread_id}; not adopting it"
+        )
+        return None
+    return earlier
+
+
 async def post_notification_turn(
     *,
     thread_id: str,
@@ -157,6 +180,7 @@ async def post_notification_turn(
     still_due=None,
     busy_fails_fast: bool = False,
     refusal_fails_fast: bool = False,
+    on_unanswered=None,
 ) -> tuple[str, str | None]:
     """POST a synthetic turn to ``thread_id``, deferring through admission.
 
@@ -174,7 +198,8 @@ async def post_notification_turn(
     busy-wait can't outlive the caller's outbox lease. ``still_due`` (async
     -> bool) is asked before each POST until one gets no definite answer (a
     transport error or a 5xx): that POST may still be admitted, and only a
-    retry's request_key dedup can tell.
+    retry's request_key dedup can tell. ``on_unanswered`` (async) runs after
+    each such POST, for a caller that must record it outlasting this call.
     ``busy_fails_fast`` returns ``"busy"`` on the first 409 that is not our
     own duplicate, for a caller with a better move than waiting out the
     thread's run (handing its message to that run).
@@ -309,6 +334,8 @@ async def post_notification_turn(
                 logger.warning(
                     f"{log_prefix} HTTP error POSTing to thread {thread_id}: {e}"
                 )
+            if not answered and on_unanswered is not None:
+                await on_unanswered()
 
             if heartbeat is not None and not await heartbeat():
                 logger.warning(
@@ -335,9 +362,10 @@ async def _lasting_refusal(resp) -> bool:
     """A refusal no wait under one claim outlives: payment required, or a
     429 for the user's usage limit rather than this server's capacity.
 
-    A 403 is not one. No provider for the user is also the answer while the
-    access-tier lookup fails for a moment, and a wrong dispatch token is the
-    operator's to fix; both still reach the caller once the wait runs out.
+    A 403 is not one. A missing provider is the user's to set up and a wrong
+    dispatch token the operator's to fix, either of which can happen while this
+    waits; both still reach the caller once the wait runs out. An access tier
+    the platform cannot be asked for answers 503, which defers like any 5xx.
     """
     if resp.status == 402:
         return True

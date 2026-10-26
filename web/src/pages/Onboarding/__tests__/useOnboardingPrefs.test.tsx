@@ -43,6 +43,7 @@ describe('useOnboardingPrefs', () => {
       result.current.replayGuides();
       result.current.setLastSeenReleaseVersion('2026.6');
       result.current.ensureFirstRun('2026.6');
+      result.current.markWelcomeSkipped();
       result.current.resetAll();
     });
     expect(mockWrite).not.toHaveBeenCalled();
@@ -181,6 +182,15 @@ describe('useOnboardingPrefs', () => {
 
     // already stamped → abort
     expect(applyUpdater(0, { ...emptyOnboardingPrefs(), firstRunAt: 1 })).toBeNull();
+  });
+
+  it('markWelcomeSkipped stamps once and keeps the rest of the state', () => {
+    const { result } = renderHook(() => useOnboardingPrefs());
+    act(() => result.current.markWelcomeSkipped());
+    const next = applyUpdater(0, { ...emptyOnboardingPrefs(), firstRunAt: 3 });
+    expect(next).toEqual({ ...emptyOnboardingPrefs(), firstRunAt: 3, welcomeSkippedAt: expect.any(Number) });
+    // already skipped → abort, so the first skip's time stands
+    expect(applyUpdater(0, { ...emptyOnboardingPrefs(), welcomeSkippedAt: 1 })).toBeNull();
   });
 
   it('setLastSeenReleaseVersion overwrites onto the freshest state', () => {

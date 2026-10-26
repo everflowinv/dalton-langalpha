@@ -46,4 +46,14 @@ subagent_limits:
 features:
   market_watch:
     enabled: false
+  # Product decision 1 (roadmap §6): upstream's wakeups (schedule_wakeup,
+  # cron/price/order wakes that can start a turn of their own on an idle
+  # thread) stay off until the budget/governance review opens them. The kill
+  # switch unbinds the schedule_wakeup tool, hides the chat-tray chip and the
+  # Status-panel tab, and makes the wake delivery drop every notice, so no
+  # path starts a turn on an idle thread. Wake delivery, once enabled, rides
+  # the normal messaging admission (enforce_credit_limit), which the Dalton
+  # budget-admission hook gates. Flip to true when the decision opens it.
+  wakeups:
+    enabled: false
 

@@ -6,18 +6,21 @@ import { Popover, PopoverClose, PopoverContent, PopoverTrigger } from '@/compone
 import PulseDot from '@/components/ui/pulse-dot';
 import { useLocale } from '@/hooks/useLocale';
 import { mediumTime } from '@/lib/format';
+import { useNow } from '@/hooks/useNow';
 import { DURATION } from '@/lib/motion';
 import { cn } from '@/lib/utils';
 import { DispatchStatusGlyph, DispatchStatusIndicator, LiveSpinner } from '../dispatchStatusUi';
 import type { PTCDispatchStatus } from '../../hooks/usePTCDispatchStatus';
 import { useOpenDispatchedThread, type DispatcherContext } from '../../hooks/useOpenDispatchedThread';
-import { armedTargets, type MarketWatchState } from '../../session/marketWatchEvents';
+import type { WakeupList } from '@/types/wakeups';
+import type { MarketWatchState } from '../../session/marketWatchEvents';
 import { isTerminalStatus, sidebarAgentRowLabel, type SubagentTerminalStatus } from '../../session/subagents/subagentStatus';
-import { watchChipItems } from '../marketTargetLabels';
+import { chipLabel } from '../wakeupLabels';
 import type { RosterTask } from './delegatedWork';
 import type { RosterAnalyst } from './useAnalystRoster';
 import { SHAPE_RUN, SHAPE_STAGGER, liquidRunMs, type TrayFoldPhase } from './useTrayFold';
 import { trayChipCount, trayWorking, type TrayContents, type TrayTasks } from './useTrayContents';
+import { WakeupListRows } from '../wakeups/WakeupList';
 
 // Solid, not a translucent tint: the transcript scrolls under the tray. The
 // liquid and the dock are the chips' own fill, so a chip, its shape and the
@@ -43,6 +46,8 @@ interface ComposerTrayProps {
   onOpenTask: (agentId: string) => void;
   /** Opens the market watch's live prices. */
   onOpenWatch: () => void;
+  /** The thread the wakeups chip cancels in. */
+  threadId: string | null;
 }
 
 /**
@@ -57,7 +62,7 @@ interface ComposerTrayProps {
  * back out the same way.
  */
 export function ComposerTray({
-  contents, phase, trayRef, dockRef, from, onOpenTask, onOpenWatch,
+  contents, phase, trayRef, dockRef, from, onOpenTask, onOpenWatch, threadId,
 }: ComposerTrayProps) {
   const chipsRef = useRef<HTMLDivElement>(null);
   const [run, setRun] = useState<LiquidRun | null>(null);
@@ -72,7 +77,7 @@ export function ComposerTray({
   }, [liquid, phase, trayRef, dockRef]);
 
   if (phase === 'folded') return null;
-  const { watch, tasks, analysts, reportBackLabel } = contents;
+  const { watch, wakeups, tasks, analysts, reportBackLabel } = contents;
   // Unfolding, the chips are back in full as the last shape lands, when the
   // liquid under them goes.
   const unfoldFadeDelay = liquidRunMs(trayChipCount(contents)) / 1000 - DURATION.quick;
@@ -95,6 +100,7 @@ export function ComposerTray({
           : { duration: DURATION.exit }}
       >
         {watch && <WatchChip watch={watch} onOpen={onOpenWatch} />}
+        {wakeups && <WakeupsChip list={wakeups} threadId={threadId} />}
         {tasks && <TasksChip {...tasks} onOpen={onOpenTask} />}
         {analysts && <AnalystsChip threads={analysts} from={from} />}
         {reportBackLabel && <StatusChip label={reportBackLabel} />}
@@ -291,11 +297,30 @@ function WatchChip({ watch, onOpen }: { watch: MarketWatchState; onOpen: () => v
     <button type="button" className={CHIP_BUTTON} title={title} aria-label={t('chat.marketWatch.chipAction')} onClick={onOpen}>
       <PulseDot />
       <span role="status" aria-live="polite" className="tabular-nums">
-        {t('chat.marketWatch.watching', {
-          symbols: watchChipItems(watch.symbols, armedTargets(watch.targets), locale).join(', '),
-        })}
+        {t('chat.marketWatch.watching', { symbols: watch.symbols.join(', ') })}
       </span>
     </button>
+  );
+}
+
+/**
+ * The wakeups the agent set in this thread: how many are pending and when the
+ * next fires, opening a list where each can be cancelled. Not a status line,
+ * so no live region: it changes when the agent sets or a wakeup fires.
+ */
+function WakeupsChip({ list, threadId }: { list: WakeupList; threadId: string | null }) {
+  const { t } = useTranslation();
+  const locale = useLocale();
+  const now = useNow();
+  return (
+    <ListChip
+      label={chipLabel(list.items, t, locale, now, list.userTimezone)}
+      heading={t('chat.wakeups.panelTitle')}
+      title={t('chat.wakeups.chipTitle')}
+      working={false}
+    >
+      <WakeupListRows threadId={threadId} wakeups={list.items} now={now} userTimezone={list.userTimezone} />
+    </ListChip>
   );
 }
 
@@ -330,11 +355,11 @@ function StatusChip({ label }: { label: string }) {
  * goes with it: a list that shrinks to one while open does not spring back
  * open when a second arrives. It spins while any of them is working.
  */
-function ListChip({ label, heading, working, children }: { label: string; heading: string; working: boolean; children: ReactNode }) {
+function ListChip({ label, heading, title, working, children }: { label: string; heading: string; title?: string; working: boolean; children: ReactNode }) {
   return (
     <Popover>
       <PopoverTrigger asChild>
-        <button type="button" className={cn(CHIP_BUTTON, 'group')}>
+        <button type="button" className={cn(CHIP_BUTTON, 'group')} title={title}>
           {working && <LiveSpinner />}
           <span>{label}</span>
           <ChevronUp aria-hidden="true" className="h-3 w-3 shrink-0 transition-transform group-data-[state=open]:rotate-180" />

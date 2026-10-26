@@ -182,7 +182,7 @@ export function ChatInputModelMenu({
   moreModelsItems,
   hasStarredModels,
   reasoningEffort,
-  inheritedEffort,
+  defaultEffort,
   onReasoningEffortChange,
   fastMode,
   onFastModeChange,
@@ -201,13 +201,16 @@ export function ChatInputModelMenu({
   validModelNames: Set<string>;
   moreModelsItems: string[];
   hasStarredModels: boolean;
+  /** The level the composer shows and a send runs; null names none. */
   reasoningEffort: string | null;
-  /** What this model resolves to with no override — account-wide value, else
-   *  the manifest default. Carries the "Default" badge, and picking it clears
-   *  the override rather than pinning the same value. */
-  inheritedEffort: string | null;
+  /** What Settings gives this model: its profile, else the account default,
+   *  else the manifest default. Carries the "Default" badge, and picking it
+   *  names null, so the thread follows Settings rather than pinning the same
+   *  value. */
+  defaultEffort: string | null;
   onReasoningEffortChange: (effort: string | null) => void;
-  fastMode: boolean;
+  /** Null while the thread's own value is not known, which checks neither. */
+  fastMode: boolean | null;
   onFastModeChange: (fast: boolean) => void;
   isCodexModel: boolean;
   /** Exactly the levels this model honors, weakest first. Empty renders no
@@ -229,8 +232,7 @@ export function ChatInputModelMenu({
   const [showMoreModels, setShowMoreModels] = useState(false);
   const [expanded, setExpanded] = useState<'effort' | 'speed' | null>(null);
 
-  const effectiveEffort = reasoningEffort ?? inheritedEffort;
-  const effortLabel = effortLabelFor(t, effectiveEffort);
+  const effortLabel = effortLabelFor(t, reasoningEffort);
 
   // Show if there's anything to pick (quick-access list or current selection),
   // or if the user has stars to manage even when they all filter out (keeps
@@ -248,7 +250,7 @@ export function ChatInputModelMenu({
           type="button"
           title="Select model"
         >
-          <TriggerBody selectedModel={selectedModel} metadata={metadata} effortLabel={effortLabel} fastMode={fastMode} isCodexModel={isCodexModel} accent />
+          <TriggerBody selectedModel={selectedModel} metadata={metadata} effortLabel={effortLabel} fastMode={fastMode === true} isCodexModel={isCodexModel} accent />
         </button>
       </DropdownMenuTrigger>
       <DropdownMenuContent
@@ -281,11 +283,11 @@ export function ChatInputModelMenu({
                 <SettingOption
                   key={level}
                   label={t(EFFORT_LABELS[level])}
-                  badge={level === inheritedEffort ? t('chat.modelSelector.defaultBadge') : undefined}
-                  selected={level === effectiveEffort}
-                  // Picking the inherited level clears the override instead of
-                  // pinning today's default as a permanent choice.
-                  onPick={() => onReasoningEffortChange(level === inheritedEffort ? null : level)}
+                  badge={level === defaultEffort ? t('chat.modelSelector.defaultBadge') : undefined}
+                  selected={level === reasoningEffort}
+                  // Picking the level Settings gives clears the thread's own
+                  // instead of pinning today's default as a permanent choice.
+                  onPick={() => onReasoningEffortChange(level === defaultEffort ? null : level)}
                 />
               ) : null
             ))}
@@ -295,20 +297,20 @@ export function ChatInputModelMenu({
         {isCodexModel && (
           <SettingRow
             label={t('chat.modelSelector.speed')}
-            value={t(fastMode ? 'chat.modelSelector.speedFast' : 'chat.modelSelector.speedStandard')}
+            value={fastMode === null ? '' : t(fastMode ? 'chat.modelSelector.speedFast' : 'chat.modelSelector.speedStandard')}
             expanded={expanded === 'speed'}
             onToggle={() => setExpanded((v) => (v === 'speed' ? null : 'speed'))}
             isMobile={isMobile}
           >
             <SettingOption
               label={t('chat.modelSelector.speedStandard')}
-              selected={!fastMode}
+              selected={fastMode === false}
               onPick={() => onFastModeChange(false)}
             />
             <SettingOption
               label={t('chat.modelSelector.speedFast')}
               hint={t('chat.modelSelector.speedFastHint')}
-              selected={fastMode}
+              selected={fastMode === true}
               onPick={() => onFastModeChange(true)}
             />
           </SettingRow>

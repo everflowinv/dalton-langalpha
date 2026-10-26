@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastapi import HTTPException
 
+from ptc_agent.core.sandbox.glob_runtime import expand_braces
 from src.server.app.share_files import resolve_shared_file
 from src.server.app.workspace_files._containment import contained_relative_path
 from src.server.app.workspace_files._shared import (
@@ -75,6 +76,12 @@ class TestCleaning:
         pattern = glob.removeprefix("**/")
         assert fnmatchcase("C#1 [draft]*.md", pattern)
         assert not fnmatchcase("C#1 d*.md", pattern)
+
+    @pytest.mark.parametrize("name", ["v{1,2}.md", "a\\,b.md", "q\\{a,b\\}.md"])
+    def test_name_glob_keeps_braces_and_escapes_literal(self, name):
+        glob = name_glob(name)
+        assert expand_braces(glob) == [glob]
+        assert fnmatchcase(name, glob.removeprefix("**/"))
 
     def test_hidden_files_show_only_when_the_reference_points_there(self):
         paths = ["results/a.md", "_internal/a.md", "work/__pycache__/a.md"]

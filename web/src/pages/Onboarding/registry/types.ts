@@ -67,8 +67,6 @@ export interface GettingStartedTaskDef {
   descKey: string;
   /** Where clicking the task navigates (router path, or a full URL when external). */
   to: string;
-  /** Starts onboarding (`useStartOnboarding`) instead of a plain navigation. */
-  interview?: boolean;
   /** Cross-app destination: opens in a new tab and is stamped done on click. */
   external?: boolean;
   /** Only offered on the hosted platform (e.g. channel integrations). */
@@ -77,11 +75,10 @@ export interface GettingStartedTaskDef {
   visitRoute?: (pathname: string, search: string) => boolean;
   /**
    * Derived completion signal — live done state without a prefs stamp.
-   * `hasStocks`: watchlist or portfolio has at least one entry (stamped once
-   * true so the lookup stops re-running). `hasWorkspace`: at least one
-   * workspace other than Home exists (also stamped once true). `hasPreferences`:
-   * any risk / investment / agent preference field is filled (never stamped,
-   * so a preferences reset un-checks it).
+   * `hasWorkspace`: at least one workspace other than Home exists (stamped
+   * once true so the lookup stops re-running). `onboardingCompleted`: the
+   * user row says the investing profile is saved (never stamped, so a reset
+   * un-checks it).
    */
-  doneWhen?: 'hasStocks' | 'hasPreferences' | 'hasWorkspace';
+  doneWhen?: 'hasWorkspace' | 'onboardingCompleted';
 }

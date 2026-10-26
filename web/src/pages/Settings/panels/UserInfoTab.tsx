@@ -29,7 +29,8 @@ import { useToast } from '@/components/ui/use-toast';
 import ConfirmDialog from '@/pages/Dashboard/components/ConfirmDialog';
 import { useDebouncedSave } from '@/hooks/useDebouncedSave';
 import { useLocale } from '@/hooks/useLocale';
-import { isSupported, setLocaleCookie, switchLocale } from '@/lib/locale';
+import { applyLocale } from '@/hooks/useLocaleChoice';
+import { isSupported } from '@/lib/locale';
 import TimezonePicker from '@/components/TimezonePicker';
 import { deviceTimezone } from '@/lib/deviceTimezone';
 import type { Preferences } from './types';
@@ -135,10 +136,8 @@ export function UserInfoTab() {
 
   const handleLocaleChange = (newLocale: string) => {
     setAccountLocale(newLocale);
-    if (isSupported(newLocale)) {
-      void switchLocale(i18n, newLocale);
-      setLocaleCookie(newLocale);
-    }
+    // Switched here, saved with the rest of the form below.
+    if (isSupported(newLocale)) void applyLocale(i18n, newLocale);
     userInfoRef.current = { ...userInfoRef.current, locale: newLocale };
     flushUserInfoSave();
   };

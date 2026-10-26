@@ -1,8 +1,9 @@
-import { useState, useCallback, useMemo } from 'react';
+import { useState, useCallback, useId, useMemo } from 'react';
 import { useNavigate, useLocation } from 'react-router';
 import { Plus } from 'lucide-react';
-import { Button } from '@/components/ui/button';
 import { Loader } from '@/components/ui/loader';
+import { WizardStepHeader } from '@/components/ui/wizard';
+import { SetupFooter } from '../SetupFooter';
 import { ProviderCard } from '@/components/model/ProviderCard';
 import { useModels } from '@/hooks/useModels';
 import { usePreferences } from '@/hooks/usePreferences';
@@ -10,6 +11,7 @@ import { useConfiguredProviders } from '@/hooks/useConfiguredProviders';
 import type { AccessType, ProviderCatalogEntry } from '@/components/model/types';
 import { useTranslation } from 'react-i18next';
 import { modelPrefs } from '@/lib/modelPreferences';
+import { useProviderConnected } from './connectStep/shared';
 
 const CUSTOM_PROVIDER_KEY = '__custom__';
 
@@ -19,6 +21,7 @@ const CUSTOM_PROVIDER_KEY = '__custom__';
 
 export default function ProviderStep() {
   const navigate = useNavigate();
+  const connected = useProviderConnected();
   const location = useLocation();
 
   // Method passed from MethodStep via location state
@@ -29,6 +32,7 @@ export default function ProviderStep() {
   const { configuredSet } = useConfiguredProviders();
   const { t } = useTranslation();
   const [selected, setSelected] = useState<string | null>(null);
+  const headingId = useId();
 
   // Extract provider_catalog from models response
   const catalog = useMemo<ProviderCatalogEntry[]>(() => {
@@ -70,16 +74,15 @@ export default function ProviderStep() {
       return;
     }
 
-    // Existing custom provider — already has a key, go straight to model management
+    // Existing custom provider. Its definition is saved before its key, so a
+    // definition alone is not a connection. With a key it is connected: back
+    // to a page that sent the user here to connect one, or straight on to
+    // model management. Without one it goes on to model management without
+    // consuming the return, which then happens from the Done step.
     if (customProviderSet.has(selected)) {
-      navigate('/setup/models', {
-        state: {
-          method,
-          provider: selected,
-          displayName: selected,
-          brandKey: selected,
-        },
-      });
+      const customState = { method, provider: selected, displayName: selected, brandKey: selected };
+      if (configuredSet.has(selected)) connected(customState);
+      else navigate('/setup/models', { state: customState });
       return;
     }
 
@@ -97,44 +100,38 @@ export default function ProviderStep() {
       dynamicModels: provider?.dynamic_models ?? false,
     };
 
-    // Already connected? Skip key input, go straight to model management
+    // Already connected? Skip key input: back to the page that sent the user
+    // here, or straight on to model management.
     if (configuredSet.has(selected)) {
-      navigate('/setup/models', { state: providerState });
+      connected(providerState);
       return;
     }
 
     navigate('/setup/connect', { state: providerState });
-  }, [selected, method, filteredProviders, customProviderSet, configuredSet, navigate]);
+  }, [selected, method, filteredProviders, customProviderSet, configuredSet, navigate, connected]);
 
   if (isLoading) {
     return (
       <div className="flex items-center justify-center py-20">
-        <Loader size={20} className="text-(--color-text-tertiary)" />
+        <Loader size={20} className="text-(--color-text-tertiary)" label={t('common.loading')} />
       </div>
     );
   }
 
   return (
-    <div className="flex flex-col gap-4 sm:gap-6">
-      {/* Section heading */}
-      <div className="flex flex-col gap-1">
-        <h2
-          className="font-semibold"
-          style={{ fontSize: '1.125rem', color: 'var(--color-text-primary)' }}
-        >
-          {t('setup.providerTitle')}
-        </h2>
-        <p
-          className="text-sm"
-          style={{ color: 'var(--color-text-secondary)' }}
-        >
-          {method === 'oauth' && t('setup.providerSubtitleOAuth')}
-          {method === 'coding_plan' && t('setup.providerSubtitleCodingPlan')}
-          {method === 'api_key' && t('setup.providerSubtitleApiKey')}
-          {method === 'local' && t('setup.providerSubtitleLocal')}
-        </p>
-      </div>
-
+    <div>
+      <WizardStepHeader
+        titleId={headingId}
+        title={t('setup.providerTitle')}
+        helper={
+          method === 'oauth' ? t('setup.providerSubtitleOAuth')
+            : method === 'coding_plan' ? t('setup.providerSubtitleCodingPlan')
+            : method === 'api_key' ? t('setup.providerSubtitleApiKey')
+            : method === 'local' ? t('setup.providerSubtitleLocal')
+            : undefined
+        }
+      />
+      <div className="flex flex-col gap-4 sm:gap-6">
       {/* Provider grid */}
       {filteredProviders.length === 0 ? (
         <p
@@ -146,7 +143,7 @@ export default function ProviderStep() {
       ) : (
         <div
           role="radiogroup"
-          aria-label="Choose your AI provider"
+          aria-labelledby={headingId}
           className="grid grid-cols-2 sm:grid-cols-3 gap-3"
         >
           {filteredProviders.map((p) => (
@@ -184,19 +181,18 @@ export default function ProviderStep() {
           className="flex items-center gap-3 rounded-lg p-3 text-left transition-colors cursor-pointer w-full"
           style={{
             border: selected === CUSTOM_PROVIDER_KEY
-              ? '2px solid var(--color-accent-primary)'
+              ? '1px solid var(--color-text-primary)'
               : '1px dashed var(--color-border-default)',
-            background: selected === CUSTOM_PROVIDER_KEY ? 'var(--color-accent-soft)' : undefined,
-            padding: selected === CUSTOM_PROVIDER_KEY ? 11 : 12,
+            background: selected === CUSTOM_PROVIDER_KEY ? 'var(--color-bg-tag)' : undefined,
           }}
         >
           <div
             className="flex items-center justify-center w-8 h-8 rounded-full shrink-0"
             style={{
               background: selected === CUSTOM_PROVIDER_KEY
-                ? 'var(--color-accent-primary)'
+                ? 'var(--color-btn-primary-bg)'
                 : 'var(--color-bg-surface)',
-              color: selected === CUSTOM_PROVIDER_KEY ? '#fff' : 'var(--color-text-tertiary)',
+              color: selected === CUSTOM_PROVIDER_KEY ? 'var(--color-btn-primary-text)' : 'var(--color-text-tertiary)',
             }}
           >
             <Plus className="h-4 w-4" />
@@ -212,20 +208,12 @@ export default function ProviderStep() {
         </button>
       )}
 
-      {/* Navigation buttons */}
-      <div className="flex items-center justify-between pt-2">
-        <Button variant="outline" onClick={handleBack}>
-          {t('setup.back')}
-        </Button>
-        <Button
-          variant="default"
-          disabled={!selected}
-          onClick={handleNext}
-          className="min-w-[120px]"
-        >
-          {t('setup.next')}
-        </Button>
       </div>
+
+      <SetupFooter
+        back={{ label: t('setup.back'), onClick: handleBack }}
+        primary={{ label: t('setup.continue'), onClick: handleNext, disabled: !selected }}
+      />
     </div>
   );
 }

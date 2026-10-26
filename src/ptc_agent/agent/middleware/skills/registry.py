@@ -104,9 +104,15 @@ SUBAGENT_WITHHELD_SKILLS: frozenset[str] = frozenset({"chart-annotation"})
 SKILL_REGISTRY: dict[str, SkillDefinition] = {
     "onboarding": SkillDefinition(
         name="onboarding",
-        description="First-time setup. Import holdings and watchlists from a connected brokerage, learn the markets the user follows, and save it all to their profile files.",
+        # Keep in sync with the `description:` in
+        # plugins/langalpha_service/skills/onboarding/SKILL.md frontmatter.
+        description="First run after the user saves their investing profile: import holdings and watchlists from the brokerage they connected or the screenshots they attached, then propose three first tasks (one on their portfolio or watchlist, one from their profile, one on today's market) and do the one they pick.",
         # Guidance-only: the agent saves what it learns to the profile files
         # under .agents/user/profile/, so the skill binds no tools of its own.
+        # The web's kickoff names the action and may carry the day's market
+        # brief as a directive. This loads alone: when the user picks the
+        # health check, the body sends the agent to portfolio-diagnosis's
+        # SKILL.md.
         skill_md_path="skills/onboarding/SKILL.md",
         hidden=True,
     ),
@@ -296,6 +302,24 @@ SKILL_REGISTRY: dict[str, SkillDefinition] = {
         skill_md_path="skills/thesis-tracker/SKILL.md",
         command="thesis-tracker",
         requires=("research-conventions",),
+    ),
+    "portfolio-diagnosis": SkillDefinition(
+        name="portfolio-diagnosis",
+        # Keep in sync with the `description:` in
+        # plugins/langalpha_research/skills/portfolio-diagnosis/SKILL.md
+        # frontmatter (locked by a unit test).
+        description=(
+            "Health check of the user's own portfolio against their investing "
+            "profile: concentration, exposure by sector, region and asset "
+            "class, cash, currency mix, and risk fit (volatility, beta, "
+            "drawdown), ending in a few next steps. Triggers on diagnose my "
+            "portfolio, portfolio review, portfolio health check, am I too "
+            "concentrated, how risky is my portfolio."
+        ),
+        skill_md_path="skills/portfolio-diagnosis/SKILL.md",
+        # The figures come from one execute_code call. Onboarding reads it by
+        # path for the health check; the command reaches it any time after.
+        command="portfolio-diagnosis",
     ),
     "model-update": SkillDefinition(
         name="model-update",

@@ -30,9 +30,11 @@ interface SlashCommand {
 interface SendOptions {
   model?: string | null;
   reasoningEffort?: string | null;
-  fastMode?: boolean;
+  fastMode?: boolean | null;
   widgetSnapshots?: WidgetContextSnapshot[];
   subagentsAllowed?: boolean;
+  reasoningEffortOverride?: string;
+  fastModeOverride?: boolean;
 }
 
 const EMPTY_WORKSPACES: Workspace[] = [];
@@ -99,7 +101,7 @@ export function useChatInput({ composing = false }: { composing?: boolean } = {}
     // dropped here — they apply only inside an active chat session, not on
     // the dashboard handoff.
     _slashCommands: SlashCommand[] = [],
-    { model, reasoningEffort, widgetSnapshots, subagentsAllowed }: SendOptions = {},
+    { model, reasoningEffort, fastMode, widgetSnapshots, subagentsAllowed, reasoningEffortOverride, fastModeOverride }: SendOptions = {},
     // DALTON-HOOK(composer-drafts): return false when workspace resolution or handoff fails
   ): Promise<void | boolean> => {
     const hasContent = message.trim() || (attachments && attachments.length > 0) || (widgetSnapshots && widgetSnapshots.length > 0);
@@ -165,6 +167,11 @@ export function useChatInput({ composing = false }: { composing?: boolean } = {}
           ...(attachmentMeta ? { attachmentMeta } : {}),
           ...(model ? { model } : {}),
           ...(reasoningEffort ? { reasoningEffort } : {}),
+          ...(typeof fastMode === 'boolean' ? { fastMode } : {}),
+          // The composer's own effort and fast-mode picks, which the thread
+          // this send starts keeps as its own.
+          ...(reasoningEffortOverride !== undefined ? { reasoningEffortOverride } : {}),
+          ...(fastModeOverride !== undefined ? { fastModeOverride } : {}),
           ...(stateWidgetSnapshots ? { widgetSnapshots: stateWidgetSnapshots } : {}),
         },
       });

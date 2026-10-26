@@ -14,7 +14,7 @@ const composer = vi.hoisted(() => ({ giveBack: vi.fn() }));
 
 vi.mock('@/lib/framer', async () => (await import('./chatViewHarness')).framerMock());
 vi.mock('react-i18next', () => ({
-  useTranslation: () => ({ t: (key: string) => key }),
+  useTranslation: () => ({ t: (key: string) => key, i18n: { language: 'en-US', resolvedLanguage: 'en-US' } }),
 }));
 vi.mock('@/lib/supabase', () => ({ supabase: null }));
 vi.mock('@/hooks/useUser', () => ({ useUser: () => ({ user: null }) }));

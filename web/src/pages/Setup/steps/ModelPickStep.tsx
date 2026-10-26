@@ -1,9 +1,12 @@
-import { useState, useCallback, useMemo, useEffect } from 'react';
+import { useState, useCallback, useId, useMemo, useEffect } from 'react';
 import { useNavigate, useLocation } from 'react-router';
-import { Check, Plus, X, KeyRound, Info } from 'lucide-react';
+import { Plus, X, KeyRound, Info } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import { CheckboxChoice } from '@/components/ui/choice';
 import { Loader } from '@/components/ui/loader';
 import { Input } from '@/components/ui/input';
+import { WizardStepHeader } from '@/components/ui/wizard';
+import { SetupFooter } from '../SetupFooter';
 import { useAllModels } from '@/hooks/useAllModels';
 import { useConfiguredProviders } from '@/hooks/useConfiguredProviders';
 import { usePreferences } from '@/hooks/usePreferences';
@@ -11,6 +14,7 @@ import { useUpdatePreferences } from '@/hooks/useUpdatePreferences';
 import { useTranslation } from 'react-i18next';
 import { slugifyModelName } from './slugifyModelName';
 import { computeSlotCleanup } from './modelSlotCleanup';
+import { ModalityChips, useModalityState } from './connectStep/shared';
 import { modelPrefs, splitPreferenceWrite } from '@/lib/modelPreferences';
 import type { CustomModelEntry } from '@/components/model/types';
 
@@ -45,6 +49,9 @@ export default function ModelPickStep() {
   const updatePreferences = useUpdatePreferences();
   const { preferences } = usePreferences();
   const { t } = useTranslation();
+  const headingId = useId();
+  const customNameId = useId();
+  const customIdId = useId();
 
   const state = (location.state as LocationState | null) ?? {};
 
@@ -166,7 +173,12 @@ export default function ModelPickStep() {
   // built-in; the backend resolver picks the custom entry first.
   const [customName, setCustomName] = useState('');
   const [customId, setCustomId] = useState('');
-  const [customModalities, setCustomModalities] = useState<Set<string>>(new Set());
+  const {
+    manualModalities: customModalities,
+    toggleManualModality: toggleCustomModality,
+    clearManualModalities: clearCustomModalities,
+    buildModalitiesArray,
+  } = useModalityState();
   const [showCustomInput, setShowCustomInput] = useState(false);
   // Carries form-supplied metadata (model_id + modalities) for each
   // user-added name. handleNext reads this to construct rich
@@ -199,21 +211,12 @@ export default function ModelPickStep() {
     }
   }, [selected.size, allModels]);
 
-  const toggleCustomModality = useCallback((modality: string) => {
-    setCustomModalities((prev) => {
-      const next = new Set(prev);
-      if (next.has(modality)) next.delete(modality);
-      else next.add(modality);
-      return next;
-    });
-  }, []);
-
   const resetCustomForm = useCallback(() => {
     setCustomName('');
     setCustomId('');
-    setCustomModalities(new Set());
+    clearCustomModalities();
     setShowCustomInput(false);
-  }, []);
+  }, [clearCustomModalities]);
 
   const handleAddCustomModel = useCallback(() => {
     const name = slugifyModelName(customName);
@@ -222,9 +225,7 @@ export default function ModelPickStep() {
     // literal input. Only fall back to the slugified name when empty.
     const modelId = customId.trim() || name;
     // text is always on; store the full list when the user picked extras.
-    const modalities = customModalities.size > 0
-      ? ['text', ...Array.from(customModalities).filter((m) => m !== 'text')]
-      : [];
+    const modalities = buildModalitiesArray(customModalities) ?? [];
     setPendingCustomEntries((prev) => {
       const next = new Map(prev);
       next.set(name, { modelId, modalities });
@@ -232,7 +233,7 @@ export default function ModelPickStep() {
     });
     setSelected((prev) => new Set([...prev, name]));
     resetCustomForm();
-  }, [customName, customId, customModalities, resetCustomForm]);
+  }, [customName, customId, customModalities, buildModalitiesArray, resetCustomForm]);
 
   const handleRemoveCustomModel = useCallback((model: string) => {
     setSelected((prev) => {
@@ -355,50 +356,42 @@ export default function ModelPickStep() {
   if (modelsLoading) {
     return (
       <div className="flex items-center justify-center py-20">
-        <Loader size={20} className="text-(--color-text-tertiary)" />
+        <Loader size={20} className="text-(--color-text-tertiary)" label={t('common.loading')} />
       </div>
     );
   }
 
   return (
-    <div className="flex flex-col gap-4 sm:gap-6">
-      {/* Section heading */}
-      <div className="flex flex-col gap-1">
-        <div className="flex items-center justify-between">
-          <h2
-            className="font-semibold"
-            style={{ fontSize: '1.125rem', color: 'var(--color-text-primary)' }}
-          >
-            {provider ? t('setup.manageModels', { provider: displayName }) : t('setup.modelsTitle')}
-          </h2>
-          {provider && isConfigured && (
-            <button
-              type="button"
-              onClick={() => navigate('/setup/connect', { state })}
-              className="flex items-center gap-1 text-xs font-medium transition-colors hover:opacity-80"
-              style={{ color: 'var(--color-text-tertiary)' }}
-            >
-              <KeyRound className="h-3 w-3" />
-              {t('setup.updateApiKey')}
-            </button>
-          )}
-        </div>
-        <p
-          className="text-sm"
-          style={{ color: 'var(--color-text-secondary)' }}
-        >
-          {provider
+    <div>
+      <WizardStepHeader
+        titleId={headingId}
+        title={provider ? t('setup.manageModels', { provider: displayName }) : t('setup.modelsTitle')}
+        helper={
+          provider
             ? t('setup.chooseModels', { provider: displayName })
-            : t('setup.chooseModelsGeneric')}
-        </p>
-      </div>
+            : t('setup.chooseModelsGeneric')
+        }
+      />
+      <div className="flex flex-col gap-4 sm:gap-6">
+      {/* A side path back to the key, kept quiet above the list it affects */}
+      {provider && isConfigured && (
+        <button
+          type="button"
+          onClick={() => navigate('/setup/connect', { state })}
+          className="flex items-center gap-1 self-start text-xs font-medium transition-colors hover:opacity-80"
+          style={{ color: 'var(--color-text-tertiary)' }}
+        >
+          <KeyRound className="h-3 w-3" />
+          {t('setup.updateApiKey')}
+        </button>
+      )}
 
       {/* Model access reminder */}
       <div
         className="flex items-start gap-2.5 rounded-lg px-3.5 py-3"
         style={{
-          background: 'var(--color-accent-soft)',
-          border: '1px solid var(--color-accent-primary)',
+          background: 'var(--color-bg-tag)',
+          border: '1px solid var(--color-border-default)',
         }}
       >
         <Info
@@ -419,8 +412,7 @@ export default function ModelPickStep() {
           <button
             type="button"
             onClick={toggleAll}
-            className="text-xs font-medium"
-            style={{ color: 'var(--color-accent-primary)' }}
+            className="text-xs font-medium text-(--color-text-primary) underline underline-offset-2 hover:opacity-80"
           >
             {selected.size === displayModels.length ? t('setup.deselectAll') : t('setup.selectAll')}
           </button>
@@ -428,8 +420,7 @@ export default function ModelPickStep() {
             <button
               type="button"
               onClick={() => setShowCustomInput(true)}
-              className="flex items-center gap-1 text-xs font-medium"
-              style={{ color: 'var(--color-accent-primary)' }}
+              className="flex items-center gap-1 text-xs font-medium text-(--color-text-primary) underline underline-offset-2 hover:opacity-80"
             >
               <Plus className="h-3 w-3" />
               {t('setup.addModel')}
@@ -449,12 +440,14 @@ export default function ModelPickStep() {
         >
           <div className="flex flex-col gap-1">
             <label
+              htmlFor={customNameId}
               className="text-xs font-medium"
               style={{ color: 'var(--color-text-secondary)' }}
             >
               {t('setup.customModelNameLabel')}
             </label>
             <Input
+              id={customNameId}
               value={customName}
               onChange={(e) => setCustomName(e.target.value)}
               placeholder={t('setup.customModelNamePlaceholder')}
@@ -482,12 +475,14 @@ export default function ModelPickStep() {
           </div>
           <div className="flex flex-col gap-1">
             <label
+              htmlFor={customIdId}
               className="text-xs font-medium"
               style={{ color: 'var(--color-text-secondary)' }}
             >
               {t('setup.customModelIdLabel')}
             </label>
             <Input
+              id={customIdId}
               value={customId}
               onChange={(e) => setCustomId(e.target.value)}
               placeholder={t('setup.customModelIdPlaceholder')}
@@ -505,38 +500,7 @@ export default function ModelPickStep() {
               {t('setup.customModelIdHint')}
             </span>
           </div>
-          <div className="flex flex-wrap items-center gap-1.5">
-            <span
-              className="text-xs font-medium mr-1"
-              style={{ color: 'var(--color-text-secondary)' }}
-            >
-              {t('setup.capabilities', { defaultValue: 'Capabilities' })}:
-            </span>
-            <span
-              className="inline-flex items-center rounded-full px-2 py-0.5 text-[0.625rem] font-medium"
-              style={{ background: 'var(--color-accent-soft)', color: 'var(--color-accent-primary)', opacity: 0.6 }}
-            >
-              Text
-            </span>
-            {(['image', 'pdf'] as const).map((mod) => {
-              const active = customModalities.has(mod);
-              return (
-                <button
-                  key={mod}
-                  type="button"
-                  onClick={() => toggleCustomModality(mod)}
-                  className="inline-flex items-center rounded-full px-2 py-0.5 text-[0.625rem] font-medium transition-colors"
-                  style={{
-                    background: active ? 'var(--color-accent-soft)' : 'transparent',
-                    color: active ? 'var(--color-accent-primary)' : 'var(--color-text-tertiary)',
-                    border: `1px solid ${active ? 'var(--color-accent-primary)' : 'var(--color-border-default)'}`,
-                  }}
-                >
-                  {mod === 'image' ? 'Image' : 'PDF'}
-                </button>
-              );
-            })}
-          </div>
+          <ModalityChips active={customModalities} onToggle={toggleCustomModality} />
           <div className="flex items-center justify-end gap-2">
             <Button variant="outline" size="sm" onClick={resetCustomForm}>
               {t('common.cancel')}
@@ -574,7 +538,7 @@ export default function ModelPickStep() {
           )}
         </div>
       ) : (
-        <div className="flex flex-col gap-1 max-h-[40vh] sm:max-h-none overflow-y-auto">
+        <div role="group" aria-labelledby={headingId} className="flex flex-col gap-1 max-h-[40vh] sm:max-h-none overflow-y-auto">
           {displayModels.map((model) => {
             const isChecked = selected.has(model);
             const meta = modelMetadata[model] ?? {};
@@ -585,27 +549,15 @@ export default function ModelPickStep() {
                 key={model}
                 className="flex items-center gap-0"
               >
-                <button
-                  type="button"
-                  role="checkbox"
-                  aria-checked={isChecked}
-                  onClick={() => toggleModel(model)}
-                  className="flex-1 flex items-center gap-3 rounded-lg px-3 py-2.5 text-left transition-colors"
+                <CheckboxChoice
+                  size="md"
+                  checked={isChecked}
+                  onCheckedChange={() => toggleModel(model)}
+                  className="flex-1 items-center gap-3 rounded-lg px-3 py-2.5 transition-colors"
                   style={{
-                    background: isChecked ? 'var(--color-accent-soft)' : undefined,
+                    background: isChecked ? 'var(--color-bg-tag)' : undefined,
                   }}
                 >
-                  <div
-                    className="flex items-center justify-center w-5 h-5 rounded border shrink-0 transition-colors"
-                    style={{
-                      borderColor: isChecked
-                        ? 'var(--color-accent-primary)'
-                        : 'var(--color-border-default)',
-                      background: isChecked ? 'var(--color-accent-primary)' : undefined,
-                    }}
-                  >
-                    {isChecked && <Check className="h-3 w-3" style={{ color: '#fff' }} strokeWidth={3} />}
-                  </div>
                   <span
                     className="text-sm"
                     style={{ color: 'var(--color-text-primary)' }}
@@ -624,7 +576,7 @@ export default function ModelPickStep() {
                       {t('setup.customBadge')}
                     </span>
                   )}
-                </button>
+                </CheckboxChoice>
                 {isCustom && (
                   <button
                     type="button"
@@ -643,7 +595,7 @@ export default function ModelPickStep() {
       )}
 
       {error && (
-        <p className="text-sm" style={{ color: 'var(--color-loss)' }}>
+        <p role="alert" className="text-sm" style={{ color: 'var(--color-loss)' }}>
           {error}
         </p>
       )}
@@ -675,29 +627,16 @@ export default function ModelPickStep() {
         </Button>
       </div>
 
-      {/* Navigation buttons */}
-      <div className="flex items-center justify-between pt-2">
-        <Button variant="outline" onClick={handleBack}>
-          {t('setup.back')}
-        </Button>
-        <Button
-          variant="default"
-          disabled={saving}
-          onClick={handleNext}
-          className="min-w-[120px]"
-        >
-          {saving ? (
-            <>
-              <span aria-hidden="true" className="mr-1.5 shrink-0">
-                <Loader size={16} className="text-current" />
-              </span>
-              {t('setup.saving')}
-            </>
-          ) : (
-            t('setup.nextStep')
-          )}
-        </Button>
       </div>
+
+      <SetupFooter
+        back={{ label: t('setup.back'), onClick: handleBack }}
+        primary={{
+          label: saving ? t('setup.saving') : t('setup.continue'),
+          onClick: handleNext,
+          busy: saving,
+        }}
+      />
     </div>
   );
 }

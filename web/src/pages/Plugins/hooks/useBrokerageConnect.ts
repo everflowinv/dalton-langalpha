@@ -76,5 +76,9 @@ export function useBrokerageConnect({
     }
   }
 
-  return { oauth, requestConnect, toggle };
+  // The broker whose switch is on its way, by name, so a click on one broker
+  // never greys out another's controls.
+  const togglingName = toggleMutation.isPending ? toggleMutation.variables.name : null;
+
+  return { oauth, requestConnect, toggle, togglingName };
 }

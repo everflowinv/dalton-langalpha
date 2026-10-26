@@ -304,6 +304,15 @@ class TestInjectMultimodalContext:
         # Original text is last
         assert blocks[-1] == {"type": "text", "text": "describe this"}
 
+    def test_a_message_with_no_words_gets_no_empty_text_block(self):
+        """The onboarding kickoff opens with images and no text of the user's;
+        an empty text block is one some providers refuse."""
+        msgs = [{"role": "user", "content": ""}]
+        ctx = MultimodalContext(type="image", data="data:image/png;base64,abc", description="positions")
+        blocks = inject_multimodal_context(msgs, [ctx])[0]["content"]
+        assert any(b.get("type") == "image_url" for b in blocks)
+        assert all(b.get("text", "x").strip() for b in blocks if b.get("type") == "text")
+
     def test_pdf_merges_file_block(self):
         msgs = [{"role": "user", "content": "summarize"}]
         ctx = MultimodalContext(type="image", data="data:application/pdf;base64,abc", description="report")

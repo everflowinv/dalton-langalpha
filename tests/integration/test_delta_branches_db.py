@@ -4,8 +4,8 @@ A regenerate of a turn resumed from a question replays the checkpoint the
 answer was written on, whose pending writes hold the step's tool results; a
 retry replays a failed step's checkpoint; a compaction or offload of a failed
 turn writes a state update on it. Each reruns the step's tasks, so before
-``ptc_agent.agent.delta_branch`` the new branch's ``messages`` loads also
-replayed the results those tasks stored the first time: two results for one
+langgraph 1.2.13 snapshotted a new branch's delta channels, its ``messages``
+loads also replayed the results those tasks stored the first time: two results for one
 tool call, which providers refuse. Inputs are the id-less dicts the chat path
 sends. Each test writes its own thread.
 """
@@ -25,7 +25,6 @@ from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, Send, interrupt
 
-import src.server.utils.checkpointer  # noqa: F401  (installs the walk guard)
 from ptc_agent.agent.main_state import MainAgentState
 from ptc_agent.agent.state import DeltaAgentState
 

@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
@@ -232,7 +232,7 @@ def _script(turn: int, rounds: int, *, notes: bool = False, label: str = "") -> 
     return out
 
 
-Coverage = Callable[[Window], Any]
+Coverage = Callable[[Window, Sequence[AnyMessage]], Any]
 
 
 @dataclass
@@ -288,18 +288,19 @@ def build_graph(
     notes_rows = NotesDueMiddleware(scratchpad, compaction)
     if window:
 
-        async def coverage(head: Window) -> bool:
-            # Not checked against the head, so a test that breaks the window
-            # still sees it trim; the answer it should have had is kept.
+        async def coverage(
+            before: Window, trimmed: Sequence[AnyMessage]
+        ) -> Window | None:
+            # The answer is not checked against the thread, so a test that
+            # breaks the window still sees it trim; the one it should have
+            # had is kept.
             whole = whole_threads(run)[-1] if run.exports else []
+            head = before.extend(trimmed)
+            held = before.extend_held(trimmed, whole[: head.messages])
             run.asked.append(
-                (
-                    head.runs,
-                    head.holds(whole[: head.messages]),
-                    len(run.summary_model.requests),
-                )
+                (head.runs, held is not None, len(run.summary_model.requests))
             )
-            return covered
+            return head if covered else None
 
         compaction = compaction.with_window(
             coverage, [notes_window_carry(THREAD), subagents_window_carry]

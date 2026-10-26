@@ -26,6 +26,9 @@ pytestmark = [pytest.mark.integration, pytest.mark.asyncio(loop_scope="session")
 
 MAX = 5
 
+# A waiting run's checker asks for the market alert by this sender.
+_MARKET_ALERT = {"market_alert": "market_target"}
+
 
 def _app_rows(monkeypatch):
     """Hand the outbox tuple rows by default, as the app's pool does; the test
@@ -289,7 +292,7 @@ async def test_a_held_alert_blocks_no_later_wake_and_the_next_turn_takes_it_in(
     assert first.job not in claimed
 
     run_id = await _run(thread)
-    assert await outbox.has_steerable_market_alert(thread.id)
+    assert await outbox.steerable_alert_senders(thread.id, _MARKET_ALERT) == {"market_alert"}
     assert first.job in _ids(await outbox.list_steerable_report_jobs(thread.id))
     assert await outbox.hold_steered_report_jobs([first.job], run_id=run_id) == [first.job]
     assert await outbox.confirm_steered_report_jobs([first.job], run_id=run_id) == [first.job]
@@ -305,10 +308,10 @@ async def test_a_waiting_run_wakes_only_for_an_alert_the_drainer_cannot_claim(
     from src.server.database.runs import outbox
 
     hit = await _hit(thread, db_conn, "AAA")
-    assert not await outbox.has_steerable_market_alert(thread.id)
+    assert await outbox.steerable_alert_senders(thread.id, _MARKET_ALERT) == set()
 
     await _defer(db_conn, hit.job)
-    assert await outbox.has_steerable_market_alert(thread.id)
+    assert await outbox.steerable_alert_senders(thread.id, _MARKET_ALERT) == {"market_alert"}
 
 
 async def test_a_turn_ending_without_it_buys_one_more_look_not_a_loop(thread, db_conn):
@@ -418,7 +421,7 @@ async def test_a_held_alert_whose_wake_was_admitted_is_stamped_to_it_and_closed(
         request_key=request_key(hit.job),
         metadata={"msg_type": "ptc", "user_id": thread.user_id},
     )
-    assert await outbox.has_steerable_market_alert(thread.id)
+    assert await outbox.steerable_alert_senders(thread.id, _MARKET_ALERT) == {"market_alert"}
 
     cleared = AsyncMock()
     with (
@@ -438,7 +441,7 @@ async def test_a_held_alert_whose_wake_was_admitted_is_stamped_to_it_and_closed(
     target = await get_target(hit.target)
     assert target["hit_delivered_at"] is not None
     assert str(target["hit_delivered_run_id"]) == wake
-    assert not await outbox.has_steerable_market_alert(thread.id)
+    assert await outbox.steerable_alert_senders(thread.id, _MARKET_ALERT) == set()
     cleared.assert_awaited_once_with(thread.id)
 
 

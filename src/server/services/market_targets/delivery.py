@@ -51,6 +51,8 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+from src.server.services.wakeups.message import last_quote
+
 logger = logging.getLogger(__name__)
 
 _LOG = "[MarketTarget]"
@@ -85,28 +87,6 @@ def request_key(job_id: str) -> str:
     return str(uuid.uuid5(MARKET_TARGET_REQUEST_NS, job_id))
 
 
-async def earlier_wake(key: str, thread_id: str) -> Optional[dict[str, Any]]:
-    """The run an earlier claim's POST started under ``key``, or None.
-
-    Request keys are unique across every thread, so a run holding the key on
-    another thread is not this notice's wake, and stamping the notice to it
-    would mark delivered a notice this thread never saw.
-    """
-    from src.server.database.runs import lifecycle as tl_db
-
-    earlier = await tl_db.find_run_by_request_key(key)
-    if earlier is None:
-        return None
-    if str(earlier.get("conversation_thread_id")) != thread_id:
-        logger.warning(
-            f"{_LOG} Request key {key} names run "
-            f"{earlier.get('conversation_response_id')} on another thread "
-            f"than {thread_id}; not adopting it"
-        )
-        return None
-    return earlier
-
-
 def owed(target: Optional[dict[str, Any]], notice: str) -> bool:
     """Whether the notice still has to be shown.
 
@@ -123,28 +103,6 @@ def owed(target: Optional[dict[str, Any]], notice: str) -> bool:
     return not isinstance(expires_at, datetime) or expires_at > datetime.now(
         timezone.utc
     )
-
-
-async def last_quote(
-    target: dict[str, Any], user_id: str, *, timeout: float = _QUOTE_TIMEOUT
-) -> Optional[dict]:
-    """The latest quote for an ``expiring`` notice, if it comes quickly; the
-    notice is worth more on time than with a price."""
-    from src.server.services.cache.quote_cache_service import QuoteCacheService
-    from src.server.services.market_targets.message import listing_ref
-
-    ref = listing_ref(target)
-    if ref is None:
-        return None
-    try:
-        rows = await asyncio.wait_for(
-            QuoteCacheService.get_instance().get_quotes([ref], user_id),
-            timeout=timeout,
-        )
-    except Exception:
-        logger.debug(f"{_LOG} quote for {target.get('symbol')} unavailable", exc_info=True)
-        return None
-    return rows[0][1] if rows else None
 
 
 async def _settle_wake(target_id: str, notice: str, thread_id: str, run_id: str) -> None:
@@ -193,6 +151,7 @@ async def execute_market_target(job: dict) -> None:
         render_notice,
     )
     from src.server.services.report_back.notify_turn import (
+        earlier_wake,
         park_while_thread_busy,
         post_notification_turn,
         release_if_a_turn_ended,
@@ -223,7 +182,7 @@ async def execute_market_target(job: dict) -> None:
     key = request_key(job_id)
 
     async def _adopt_earlier_wake() -> bool:
-        earlier = await earlier_wake(key, thread_id)
+        earlier = await earlier_wake(key, thread_id, log_prefix=_LOG)
         if earlier is None:
             return False
         run_id = str(earlier["conversation_response_id"])
@@ -278,7 +237,11 @@ async def execute_market_target(job: dict) -> None:
             )
         return
 
-    quote = await last_quote(target, user_id) if notice == "expiring" else None
+    quote = (
+        await last_quote(target, user_id, timeout=_QUOTE_TIMEOUT)
+        if notice == "expiring"
+        else None
+    )
     text = render_notice(target, notice, quote)
     body = {
         "messages": [{"role": "user", "content": text}],

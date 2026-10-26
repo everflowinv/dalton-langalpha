@@ -8,15 +8,24 @@ watched under the caret spelling the live feed reads as the same index, so
 the feed, the stored row and the thread API all name one listing.
 """
 
-from typing import NamedTuple, Optional, Tuple
+from typing import Any, Mapping, NamedTuple, Optional, Tuple
 
-from market_protocol import AssetClass, to_legacy_api
+from market_protocol import AssetClass, InstrumentRef, to_legacy_api
 
 from src.data_client.ginlix_data.data_source import index_ticker
 from src.server.models.automation import MarketType, bare_alert_listing, is_pair_symbol
 from src.server.services.price_monitor import watched_listing, watched_market
+from src.tools.market_data.display import resolve_ref
+from src.tools.wakeups.wording import (
+    LISTING_PAIR,
+    LISTING_UNKNOWN_SUFFIX,
+    LISTING_UNREADABLE as UNREADABLE,
+)
 
-UNREADABLE = "the price monitor cannot read this symbol"
+# A % move from "now" is stored as from "armed", the moment it was set: the
+# tool's vocabulary to the stored one, and back for the thread API.
+PCT_FROM_STORED = {"previous_close": "previous_close", "now": "armed"}
+PCT_FROM_TOOL = {stored: tool for tool, stored in PCT_FROM_STORED.items()}
 
 
 class TargetListing(NamedTuple):
@@ -39,11 +48,32 @@ def watch_spelling(key: str, market: MarketType) -> str:
     return "^" + to_legacy_api(ref).removeprefix("^")
 
 
+def listing_ref(row: Mapping[str, Any]) -> Optional[InstrumentRef]:
+    """The listing a stored row (a target, a price wakeup) watches; its market
+    decides what a bare spelling names (``HSI`` on an index is the Hang Seng)."""
+    asset_class = (
+        AssetClass.INDEX if row.get("market") == "index" else AssetClass.EQUITY
+    )
+    return resolve_ref(row.get("symbol"), asset_class)
+
+
+def shown_symbol(row: Mapping[str, Any]) -> Optional[str]:
+    """A stored row's symbol as the tool, the thread API and the chip spell
+    it, so an index is ``^GSPC`` everywhere rather than its stored ``SPX``."""
+    symbol = row.get("symbol")
+    if not symbol:
+        return None
+    try:
+        return watch_spelling(symbol, MarketType(row.get("market") or "stock"))
+    except ValueError:
+        return symbol
+
+
 def target_listing(symbol: str) -> Tuple[Optional[TargetListing], Optional[str]]:
     """The listing a target on a display-spelled *symbol* is on, or why the
     price monitor cannot watch it."""
     if is_pair_symbol(symbol):
-        return None, "a crypto, currency or futures symbol; the price monitor cannot watch those"
+        return None, LISTING_PAIR
     if symbol.startswith("^"):
         key, market = index_ticker(symbol).removeprefix("I:"), MarketType.INDEX
     else:
@@ -62,5 +92,5 @@ def target_listing(symbol: str) -> Tuple[Optional[TargetListing], Optional[str]]
         ):
             return None, UNREADABLE
     if watched_market(key, market) == "other":
-        return None, "an exchange suffix the price monitor does not know, so it would never be checked"
+        return None, LISTING_UNKNOWN_SUFFIX
     return TargetListing(key, market, watch), None

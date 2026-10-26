@@ -30,6 +30,8 @@
     "back": "Back",
     "done": "Done",
     "failed": "Failed",
+    "language": "Language",
+    "languageCurrent": "Language: {{language}}",
     "optional": "(Optional)"
   },
   "auth": {
@@ -296,7 +298,7 @@
     "logoutConfirmMsg": "Are you sure you want to logout?",
     "timezone": "Timezone",
     "selectTimezone": "Select timezone...",
-    "preferencesDesc": "Preferences are managed through conversation with the agent. Use the button below to update them.",
+    "preferencesDesc": "You can also ask the agent to change these in any chat.",
     "noPreferencesYet": "No preferences set yet. Use the button below to set up your profile.",
     "riskTolerance": "Risk Tolerance",
     "investmentStyle": "Investment Style",
@@ -311,10 +313,8 @@
     "resetPreferences": "Reset Preferences",
     "resetConfirmMsg": "This will clear all your preferences: risk tolerance, investment style, agent settings, your default models and other model settings (custom models and providers, quick-access models, per-model settings), and your dashboard layout. Conversations keep the models they use. You can set everything up again anytime in Settings or via the agent. Are you sure?",
     "resetting": "Resetting...",
-    "modifyWithAgent": "Modify with Agent",
-    "completeProfile": "Complete your profile setup",
-    "completeProfileDesc": "Set up your stocks, risk tolerance, and preferences through a quick conversation.",
-    "startOnboarding": "Start Onboarding",
+    "completeProfile": "Set up your investing profile",
+    "completeProfileDesc": "A few questions so the agent's research fits how you invest.",
     "defaultModel": "Default Model",
     "defaultModelDesc": "Used for workspace conversations (code execution, sandbox).",
     "defaultModelChange": {
@@ -543,6 +543,7 @@
     "xaiConnectTitle": "Connect xAI Grok (SuperGrok)"
   },
   "dashboard": {
+    "failedOnboarding": "Failed to set up onboarding. Please try again.",
     "title": "{{brand}}",
     "searchPlaceholder": "Search by symbol or company name...",
     "searching": "Searching...",
@@ -552,12 +553,7 @@
     "prefIncompleteMsg": "Your preference information is not complete. Please complete your preferences to get the best experience with the agent.",
     "ignoreFor24h": "Ignore for 24 hours",
     "proceed": "Proceed",
-    "failedOnboarding": "Failed to set up onboarding. Please try again.",
-    "failedPrefUpdate": "Failed to start preference update. Please try again.",
     "watchlist": "Watchlist",
-    "personalizeTitle": "Personalize your experience",
-    "personalizeDesc": "Chat with our agent to customize watchlists, risk preferences, and alerts",
-    "personalize": "Personalize",
     "layoutToggle": {
       "groupAria": "Dashboard layout",
       "classic": "Classic",
@@ -1681,6 +1677,8 @@
       "subagentsOn": "Subagents on",
       "subagentsOff": "Subagents off",
       "subagentsFailed": "Couldn't change this thread's subagents setting",
+      "effortFailed": "Couldn't change this thread's reasoning effort",
+      "fastModeFailed": "Couldn't change this thread's speed",
       "watch": "Market watch",
       "watchOn": "Market watch on",
       "watchOff": "Market watch off",
@@ -1918,17 +1916,6 @@
       "panelUpdated": "Updated {{time}}",
       "panelWaiting": "Live prices appear here while the agent is working.",
       "panelEmpty": "No tickers are being watched.",
-      "targetsTitle": "Price targets",
-      "targetArmed": "Armed",
-      "targetExpires": "Armed · expires {{when}}",
-      "targetHit": "Hit",
-      "targetHitAt": "Hit · {{detail}}",
-      "targetExpired": "Expired",
-      "targetCancelled": "Cancelled",
-      "cancelTarget": "Cancel",
-      "cancellingTarget": "Cancelling…",
-      "cancelTargetLabel": "Cancel the {{symbol}} {{condition}} target",
-      "cancelTargetFailed": "Couldn't cancel this target. Try again.",
       "pctFromClose": "{{move}} from previous close",
       "pctFromPrice": "{{move}} from {{price}}",
       "pctFromSet": "{{move}} from when it was set"
@@ -1945,6 +1932,53 @@
       "woke": "Price alert woke the agent: {{alert}}",
       "wokeGeneric": "Price alert woke the agent",
       "generic": "Price alert"
+    },
+    "wakeups": {
+      "chip_one": "1 wakeup · {{time}}",
+      "chip_other": "{{count}} wakeups · next {{time}}",
+      "chipTitle": "Wakeups the agent set in this thread. Open to cancel any of them.",
+      "panelTitle": "Wakeups",
+      "panelEmpty": "No wakeups in this thread.",
+      "cancel": "Cancel",
+      "cancelAll": "Cancel all",
+      "cancelling": "Cancelling…",
+      "cancelLabel": "Cancel the wakeup {{label}}",
+      "cancelFailed": "Couldn't cancel this wakeup. Try again.",
+      "cancelTooLate": "Already with the agent. Use Stop to end its turn.",
+      "rowTitle": "{{label}}",
+      "labelAt": "At {{time}}",
+      "labelRepeat": "{{schedule}}",
+      "labelRepeatZone": "{{schedule}} · {{zone}} time",
+      "labelOrder": "Order fills or ends · {{order}}",
+      "stateNext": "Next {{time}}",
+      "stateProgress": "{{done}} of {{total}} · next {{time}}",
+      "stateLapses": "Pending · lapses {{when}}",
+      "stateHeld": "Fired · arrives when this turn ends",
+      "stateHeldUsage": "Fired · usage limit reached, arrives on your next message",
+      "stateFired": "Fired · {{time}}",
+      "stateFinished": "Finished",
+      "stateLapsed": "Lapsed",
+      "stateExpired": "Expired",
+      "stateCancelled": "Cancelled",
+      "woke": "Woke the agent: {{labels}}",
+      "wokeOrder": "Order update woke the agent: {{label}}",
+      "arrived": "Wakeup: {{label}}",
+      "check": "Check {{n}} of {{total}}",
+      "orderFilled": "{{order}} filled at {{price}}",
+      "orderPartial": "{{order}}: {{filled}} of {{qty}} filled",
+      "orderCancelled": "{{order}} cancelled",
+      "orderRejected": "{{order}} rejected",
+      "quiet_one": "1 check · nothing new · {{time}}",
+      "quiet_other": "{{count}} checks · nothing new · last {{time}}",
+      "quietEntry": "{{time}} · {{labels}} · {{status}}",
+      "chip_one_untimed": "1 wakeup",
+      "chip_other_untimed": "{{count}} wakeups",
+      "settingWakeups": "setting wakeups...",
+      "cancellingWakeups": "cancelling wakeups...",
+      "checkingWakeups": "checking wakeups...",
+      "endingQuietly": "ending the check...",
+      "orderPartialCancelled": "{{order}}: {{filled}} of {{qty}} filled, then cancelled",
+      "orderFailed": "{{order}} failed"
     },
     "missingWorkspaceOrThread": "Missing workspace or thread information",
     "accessDeniedTitle": "You don't have access to this conversation",
@@ -2995,7 +3029,8 @@
       "preference": "Preferences",
       "user": "Account",
       "sendMessage": "Send Message",
-      "messageTargets": "Message Targets"
+      "messageTargets": "Message Targets",
+      "scheduleWakeup": "Wakeups"
     },
     "completed": {
       "activatedSkill": "Activated skill",
@@ -3284,8 +3319,8 @@
     "securityNote": "Your API keys are encrypted and never shared",
     "methodTitle": "How would you like to connect?",
     "methodSubtitle": "Choose how you'll access AI models. You can add more providers later.",
-    "methodOAuth": "Use your Claude / GPT subscription",
-    "methodOAuthDesc": "Connect via OAuth. No API key needed.",
+    "methodOAuth": "Use your Claude or ChatGPT subscription",
+    "methodOAuthDesc": "Sign in with your account. No API key needed.",
     "methodCodingPlan": "I have a coding plan",
     "methodCodingPlanDesc": "ZhipuAI, MiniMax, DashScope, Moonshot, etc.",
     "methodApiKey": "I have an API key",
@@ -3304,7 +3339,7 @@
     "doneTitle": "You're all set!",
     "doneSummary": "Your AI research assistant is configured and ready to go.",
     "goToDashboard": "Go to Dashboard",
-    "personalizeLink": "Set up investment profile",
+    "personalizeLink": "Set up investing profile",
     "invitationCodeLink": "Have an invitation code?",
     "invitationCodePlaceholder": "Enter your invitation code",
     "testButton": "Test",
@@ -3320,10 +3355,24 @@
     "stepProvider": "Provider",
     "stepModels": "Models",
     "stepReady": "Ready",
+    "progressLabel": "Setup progress",
     "exitSetup": "Exit setup",
     "providersConnected": "{{count}} providers connected",
     "providersConnected_one": "{{count}} provider connected",
     "nextStep": "Next step",
+    "skipToModels": "Skip to models",
+    "showKey": "Show API key",
+    "hideKey": "Hide API key",
+    "keyAccepted": "Key accepted",
+    "modelsFound_one": "{{count}} model found",
+    "modelsFound_other": "{{count}} models found",
+    "testUnavailable": "Test not available for this provider",
+    "testFailed": "Test request failed",
+    "modalityText": "Text",
+    "modalityImage": "Image",
+    "modalityPdf": "PDF",
+    "errorAuthFailed": "Authorization failed. Please try again.",
+    "errorFetchModels": "Could not fetch models from provider",
     "oauthBadge": "OAuth",
     "apiKeyBadge": "API key",
     "codingPlanBadge": "Coding plan",
@@ -3732,13 +3781,9 @@
           "title": "Check live markets",
           "desc": "Real-time charts with streaming market data."
         },
-        "stocks": {
-          "title": "Share your watchlist & portfolio",
-          "desc": "A short chat — tell the agent the tickers you watch and hold."
-        },
-        "preferences": {
-          "title": "Share your investing preferences",
-          "desc": "Set your risk tolerance, investing style, and how you want answers framed."
+        "profile": {
+          "title": "Set up your investing profile",
+          "desc": "Risk, markets, style, and how the agent works with you."
         },
         "createWorkspace": {
           "title": "Create your first workspace"
@@ -3755,12 +3800,6 @@
           "title": "Use {{brand}} on other platforms",
           "desc": "Reach the agent from Slack, email, and more via platform integrations."
         }
-      },
-      "interview": {
-        "title": "A quick chat to personalize your experience",
-        "body": "We'll open a chat where the agent asks a few questions about your portfolio, watchlist, risk tolerance, and investment preferences — so its answers fit you. You can change any of it later in Settings, or simply ask the agent to update it.",
-        "cancel": "Not now",
-        "confirm": "Start the chat"
       }
     },
     "announce": {
@@ -3782,20 +3821,283 @@
       "reset": "Reset onboarding",
       "resetDone": "Onboarding reset — tips and the guide start fresh."
     },
-    "connect": {
-      "title": "Connect your brokerage",
-      "description": "Your Chief of Staff loads your holdings and watchlists from it, then asks a few questions about the markets you follow.",
-      "continue": "Continue",
-      "turnOn": "Turn on",
-      "skip": "Continue without a brokerage",
-      "footnote": "You choose what it can do with your account on the next screen.",
-      "waiting": "Loading {{brokerage}}…",
-      "failed": "Couldn't connect {{brokerage}}. Try again, or continue without it."
-    },
     "kickoff": {
-      "connected": "I connected {{brokerage}}. Let's set up my profile.",
+      "threadTitle": "Getting started",
       "noBrokerage": "Let's set up my profile.",
       "modifyPreferences": "I'd like to review and update my preferences."
+    },
+    "welcome": {
+      "progressLabel": "Progress",
+      "skip": "Skip",
+      "cancel": "Cancel",
+      "continue": "Continue",
+      "save": "Save",
+      "optional": "Optional",
+      "saveFailed": "Couldn't save your investing profile. Try again.",
+      "loadFailed": "Couldn't load your investing profile.",
+      "entry": "Set up investing profile",
+      "edit": "Edit investing profile",
+      "chat": {
+        "greeting": "Hi {{name}}.",
+        "greetingNoName": "Hi there.",
+        "intro": "I'm your LangAlpha Chief of Staff. I help you coordinate your AI analysts and manage your workspaces.",
+        "introNext": "First, a few questions about your portfolio and how you invest.",
+        "editIntro": "Here's your investing profile. Change any answer, then save.",
+        "lead": {
+          "brokerage": "Connect a brokerage account so I can work from your actual holdings, or continue without one for now.",
+          "elsewhere": "Which brokerages do you use? Then choose how you'd like to add your holdings.",
+          "experience": "Which best describes you? It helps me explain things at the right level.",
+          "risk": "How much risk are you comfortable with? It guides how I balance potential gains against losses.",
+          "markets": "Which markets do you invest in? I'll focus my research there.",
+          "style": "What do you base your decisions on? I'll lead with that kind of analysis.",
+          "agent": "Last, how should I answer your questions by default? Quickly, with research when a question needs it, or with full research every time?"
+        },
+        "composer": {
+          "waiting": "You can message me once we're set up",
+          "start": "Add a question or context to start with (optional)"
+        },
+        "edit": "Change answer",
+        "summary": {
+          "connected": "Connected {{brokerage}}",
+          "screenshots_one": "{{count}} screenshot",
+          "screenshots_other": "{{count}} screenshots",
+          "search": "I'll add them by search",
+          "skipped": "Skipped"
+        }
+      },
+      "banner": {
+        "title": "Set up your investing profile",
+        "desc": "Answer a few questions so the agent's research fits how you invest.",
+        "start": "Set up",
+        "resume": "Resume"
+      },
+      "brokerage": {
+        "none": "No brokerage can be connected here yet.",
+        "failed": "Couldn't connect {{brokerage}}. Try again, or continue without connecting.",
+        "desktopOnly": "{{brokerages}} can only be connected from the desktop app. <download>Download the desktop app</download>",
+        "desktopOutdated": "Update the desktop app to connect a brokerage. <download>Download the latest version</download>",
+        "permissionHelper": "How the agent handles orders at your connected brokerages. You can change this later in Settings.",
+        "elsewhereTitle": "Don't see your brokerage?",
+        "elsewhereBody": "You can still add your holdings from screenshots or by search.",
+        "elsewhereAction": "Continue without connecting"
+      },
+      "elsewhere": {
+        "brokerages": {
+          "fidelity": "Fidelity",
+          "schwab": "Charles Schwab",
+          "vanguard": "Vanguard",
+          "etrade": "E*TRADE",
+          "robinhood": "Robinhood",
+          "ibkr": "Interactive Brokers",
+          "webull": "Webull",
+          "moomoo": "moomoo",
+          "futu": "Futu",
+          "tiger": "Tiger Brokers",
+          "longbridge": "Longbridge",
+          "tastytrade": "tastytrade",
+          "other": "Other",
+          "none": "No account yet"
+        },
+        "otherLabel": "Your brokerage's name",
+        "otherPlaceholder": "Brokerage name",
+        "connectable": "You can connect {{brokerages}} so the agent can read your holdings directly. <connect>Connect instead</connect>",
+        "holdingsTitle": "Add your holdings",
+        "methods": {
+          "screenshot": {
+            "title": "Upload screenshots",
+            "desc": "Capture your positions and watchlist in your brokerage app. The agent checks with you before adding anything."
+          },
+          "search": {
+            "title": "Search and add",
+            "desc": "Find each holding by name or ticker."
+          }
+        }
+      },
+      "experience": {
+        "types": {
+          "individual": {
+            "title": "Individual investor",
+            "desc": "Investing or trading my own money."
+          },
+          "professional": {
+            "title": "Finance professional",
+            "desc": "Analyst, trader, portfolio manager or advisor."
+          },
+          "student": {
+            "title": "Student",
+            "desc": "Learning how markets work."
+          }
+        },
+        "yearsTitle": "How long have you been investing or trading?",
+        "years": {
+          "under_1y": "Under 1 year",
+          "1_3y": "1–3 years",
+          "3_10y": "3–10 years",
+          "over_10y": "Over 10 years"
+        },
+        "instrumentsTitle": "Which types of investments are you interested in?"
+      },
+      "risk": {
+        "levels": {
+          "conservative": {
+            "title": "Conservative",
+            "desc": "Protect capital first and aim for modest returns."
+          },
+          "moderate": {
+            "title": "Moderate",
+            "desc": "Accept some ups and downs in pursuit of long-term growth."
+          },
+          "growth": {
+            "title": "Growth",
+            "desc": "Accept larger swings in pursuit of higher returns."
+          },
+          "aggressive": {
+            "title": "Aggressive",
+            "desc": "Take concentrated positions and accept deep drawdowns."
+          }
+        },
+        "horizonTitle": "How long do you usually hold a position?",
+        "horizons": {
+          "intraday": "Intraday",
+          "days": "Days to weeks",
+          "months": "Months",
+          "years": "Years"
+        }
+      },
+      "instruments": {
+        "stock": "Stocks",
+        "etf": "ETFs",
+        "index": "Indices",
+        "option": "Options",
+        "future": "Futures",
+        "bond": "Bonds",
+        "fund": "Mutual funds",
+        "forex": "Forex",
+        "crypto": "Crypto",
+        "commodity": "Commodities"
+      },
+      "markets": {
+        "names": {
+          "us": "United States",
+          "hk": "Hong Kong",
+          "cn": "China A-shares",
+          "jp": "Japan",
+          "eu": "Europe"
+        },
+        "helpTitle": "What would you like help with?",
+        "help": {
+          "ideas": "Finding investment ideas",
+          "research": "Researching companies",
+          "portfolio": "Tracking my portfolio",
+          "news": "Keeping up with markets",
+          "trading": "Planning trades",
+          "learning": "Learning the basics"
+        }
+      },
+      "style": {
+        "approaches": {
+          "fundamental": "Fundamental analysis",
+          "macro": "Macro trends",
+          "quantitative": "Systematic and quant signals",
+          "technical": "Technical analysis",
+          "event_driven": "Earnings and events"
+        },
+        "stylesTitle": "Which investing styles fit you?",
+        "styles": {
+          "growth": "Growth",
+          "value": "Value",
+          "income": "Dividends and income",
+          "trading": "Active trading",
+          "index": "Passive and index"
+        },
+        "sectorsTitle": "Which sectors do you follow?",
+        "sectors": {
+          "technology": "Technology",
+          "semiconductors": "Semiconductors",
+          "healthcare": "Healthcare",
+          "financials": "Financials",
+          "energy": "Energy",
+          "consumer": "Consumer",
+          "industrials": "Industrials",
+          "real_estate": "Real estate",
+          "utilities": "Utilities",
+          "materials": "Materials"
+        }
+      },
+      "agent": {
+        "depth": {
+          "light": {
+            "title": "Quick answers",
+            "desc": "A short answer from a quick check. Deeper research only when you ask."
+          },
+          "adaptive": {
+            "title": "Depends on the question",
+            "desc": "Quick for simple questions, full research when a question needs it."
+          },
+          "thorough": {
+            "title": "Full research",
+            "desc": "Data and evidence checked before every answer. Takes longer and uses more credits."
+          }
+        },
+        "deliverableTitle": "What should an answer usually look like?",
+        "deliverable": {
+          "text": {
+            "title": "Text in the chat",
+            "desc": "A written answer, with tables where they help."
+          },
+          "visual": {
+            "title": "Charts and dashboards",
+            "desc": "Interactive charts and dashboards in the chat, to explore."
+          },
+          "report": {
+            "title": "Full reports",
+            "desc": "A styled HTML report to share or save as a PDF. Takes longer to prepare and uses more credits."
+          }
+        },
+        "proactivityTitle": "When should I reach out to you?",
+        "proactivity": {
+          "proactive": {
+            "title": "Regularly",
+            "desc": "Briefings, ideas and updates on what you hold, without waiting to be asked."
+          },
+          "when_needed": {
+            "title": "When it matters",
+            "desc": "Only when something needs your attention, like a big move in a holding."
+          },
+          "on_request": {
+            "title": "Only when asked",
+            "desc": "No briefings or alerts unless you ask for them."
+          }
+        }
+      },
+      "start": {
+        "submit": "Start",
+        "waiting": "Loading {{brokerage}}…",
+        "failed": "Couldn't open the chat. Try again."
+      },
+      "holdings": {
+        "ticker": "Ticker",
+        "quantity": "Quantity",
+        "remove": "Remove {{symbol}}",
+        "failed": "Couldn't add {{symbol}}.",
+        "search": "Search by name or ticker",
+        "noResults": "No matches for “{{query}}”",
+        "toHoldings": "Add to holdings",
+        "toWatchlist": "Add to watchlist",
+        "holdingsTitle": "Holdings",
+        "watchlistTitle": "Watchlist",
+        "watchlistRemove": "Remove {{symbol}} from the watchlist",
+        "watchlistFailed": "Couldn't add {{symbol}} to the watchlist."
+      },
+      "shots": {
+        "prompt": "Add screenshots of your positions or watchlist",
+        "hint": "Drop, paste or choose up to {{max}} images",
+        "add": "Add a screenshot",
+        "remove": "Remove {{name}}",
+        "tooMany": "Up to {{max}} screenshots; the rest were left out.",
+        "notImage": "{{name}} isn't a PNG, JPEG, WebP or GIF image.",
+        "unreadable": "{{name}} couldn't be read."
+      }
     }
   },
   "mcp": {
@@ -4396,7 +4698,7 @@
         "neverAvailable": "Never available",
         "neverAvailableNote": "Held back deliberately. Refused whatever you grant."
       },
-      "exclusiveNote": "Disconnects any other AI app linked to your {{broker}} account",
+      "exclusiveNote": "Disconnects other AI apps linked to this account",
       "exclusiveWarning": "This account allows one connected AI platform, so connecting here replaces whichever one is connected now.",
       "grantedNone": "Granted nothing",
       "intro": "Nothing reaches a broker until you connect it, and each connection asks first what the agent may do there.",

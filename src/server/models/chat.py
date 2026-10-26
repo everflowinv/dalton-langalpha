@@ -36,8 +36,8 @@ RequestKey = Annotated[str, AfterValidator(_uuid_text)]
 #   2. langgraph's ``ensure_message_ids`` must STAMP it at ``put_writes`` (role in
 #      langgraph's ``_MESSAGE_ROLES``). An accepted-but-unstamped role persists
 #      id-less; the hard-stop checkpoint flush / offload write the full list back
-#      via ``aupdate_state`` (which does NOT re-run ``ensure_message_ids``), and the
-#      non-minting reducer can't dedup an id-less message, so it DUPLICATES.
+#      via ``aupdate_state``, and the non-minting reducer can't dedup an id-less
+#      message against that copy, so it DUPLICATES.
 #
 # ``developer`` clears bar 1 (``convert_to_messages`` maps it to SystemMessage) but
 # FAILS bar 2 (not in langgraph's ``_MESSAGE_ROLES``), so it is excluded — clients
@@ -455,12 +455,16 @@ class ChatRequest(BaseModel):
     # into a 422 the caller cannot act on.
     reasoning_effort: Optional[ReasoningLevel] = Field(
         default=None,
-        description="Override reasoning effort for this request.",
+        description="Reasoning effort for this turn only. Omitted, the turn "
+        "runs the thread's own (PATCH /threads/{id}), else the user's "
+        "Settings. Never stored on the thread.",
     )
 
     fast_mode: Optional[bool] = Field(
         default=None,
-        description="When True, enables priority service tier for faster responses (Codex OAuth models only)",
+        description="When True, enables priority service tier for faster "
+        "responses (Codex OAuth models only), for this turn only. Omitted, the "
+        "turn runs the thread's own, else the user's Settings.",
     )
 
     # Internal: query type override (e.g., "system" for report-back invocations)
@@ -549,6 +553,14 @@ class ChatRequest(BaseModel):
         default=None,
         description="Market target notice this wake turn delivers. "
         "Internal use only.",
+    )
+
+    # Server-set: the notices a wakeup's wake turn delivers ({"v": 1, "notices":
+    # [...]}), kept on the turn's query metadata as ``market_target`` is, so
+    # history can name what fired without reading the model-facing block.
+    wakeup: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Wakeup notices this wake turn delivers. Server use only.",
     )
 
     # Server-stamped: the burst-guard ZSET member held by this request's

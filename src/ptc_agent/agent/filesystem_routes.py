@@ -22,8 +22,11 @@ from ptc_agent.agent.backends import (
     RequestScopedStoreCache,
     StoreBackend,
     WorkflowsBackend,
+    memo_namespace,
     prebuilt_workflow_backend,
+    user_memory_namespace,
     workflow_namespace,
+    workspace_memory_namespace,
 )
 from ptc_agent.agent.backends.automations import AutomationsBackend
 from ptc_agent.agent.backends.channels import ChannelsBackend
@@ -211,7 +214,7 @@ def build_filesystem_backend(
     if gates.user_memory:
 
         def _user_namespace() -> tuple[str, ...]:
-            return (user_id, "memory")
+            return user_memory_namespace(user_id)
 
         user_namespace_factory = _user_namespace
         routes.append(
@@ -227,7 +230,7 @@ def build_filesystem_backend(
     if gates.workspace_memory:
 
         def _workspace_namespace() -> tuple[str, ...]:
-            return (user_id, "workspaces", workspace_id, "memory")
+            return workspace_memory_namespace(user_id, workspace_id)
 
         workspace_namespace_factory = _workspace_namespace
         routes.append(
@@ -243,10 +246,7 @@ def build_filesystem_backend(
     if gates.memo:
 
         def _memo_namespace() -> tuple[str, ...]:
-            # Plural: avoid string-prefix collision with the
-            # ``(user_id, "memory")`` tier in AsyncPostgresStore,
-            # whose asearch is ``LIKE 'user_id.memo%'``.
-            return (user_id, "memos")
+            return memo_namespace(user_id)
 
         memo_namespace_factory = _memo_namespace
         routes.append(

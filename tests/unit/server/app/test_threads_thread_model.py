@@ -1,5 +1,8 @@
 """Which model a send runs, and what the thread keeps, in ``_handle_send_message``.
 
+Effort and fast mode follow the same order with no keeping: the send's own,
+else the thread's own, else Settings, which the resolver applies.
+
 One thread read authorizes the send and gives the model the thread holds; the
 named and held models go to ``thread_model.turn_model`` for one decision, and
 only a named model is handed to the run generator to keep on the thread. Retry
@@ -50,7 +53,9 @@ def _app():
 
 
 @contextmanager
-def _send_stubs(*, owner_id, stored_model=None, turn_model=None):
+def _send_stubs(
+    *, owner_id, stored_model=None, turn_model=None, stored_effort=None, stored_fast=None
+):
     """Everything past the route stubbed; yields the mocks a test asserts on.
 
     ``turn_model`` is what ``thread_model.turn_model`` answers.
@@ -66,6 +71,8 @@ def _send_stubs(*, owner_id, stored_model=None, turn_model=None):
             "msg_type": "ptc",
             "workspace_id": "ws-placeholder",
             "llm_model": stored_model,
+            "reasoning_effort": stored_effort,
+            "fast_mode": stored_fast,
         }
         if owner_id is not None
         else None
@@ -110,9 +117,11 @@ async def _send(
     llm_model=None,
     workspace_id="ws-placeholder",
     headers=None,
+    tuning=None,
 ):
     body = {
         "messages": [{"role": "user", "content": "test query"}],
+        **(tuning or {}),
     }
     if workspace_id is not None:
         body["workspace_id"] = workspace_id
@@ -138,6 +147,28 @@ async def test_a_turn_naming_no_model_runs_the_threads_own():
     assert _resolved_model(m["resolve"]) == "m-pin"
     # Nothing new was named, so there is nothing to keep.
     assert m["astream"].call_args.kwargs["named_model"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stored", "sent", "runs"),
+    [
+        ((None, None), {}, (None, None)),
+        (("xhigh", True), {}, ("xhigh", True)),
+        (("xhigh", True), {"reasoning_effort": "low", "fast_mode": False}, ("low", False)),
+    ],
+    ids=["settings", "threads-own", "sends-own"],
+)
+async def test_a_turn_runs_the_sends_tuning_else_the_threads_own(stored, sent, runs):
+    # None reaches the resolver, which applies Settings.
+    with _send_stubs(
+        owner_id=USER, stored_effort=stored[0], stored_fast=stored[1]
+    ) as m:
+        resp = await _send(tuning=sent)
+
+    assert resp.status_code == 200
+    kwargs = m["resolve"].await_args.kwargs
+    assert (kwargs["reasoning_effort"], kwargs["fast_mode"]) == runs
 
 
 @pytest.mark.asyncio

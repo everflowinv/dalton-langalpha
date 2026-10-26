@@ -36,6 +36,7 @@ from src.server.database.workspace_folders import (
     leftovers_path,
     moving_path,
     read_folder_rows,
+    record_folder_blocked,
     record_folder_landings,
     release_former_folder,
     stage_folder_moves,
@@ -613,6 +614,29 @@ async def test_a_config_replace_never_touches_the_settles_landings(seed_user, te
     assert (await _row(test_db_pool, c))["config"] == {"theme": "dark"}
 
 
+async def test_a_rename_ends_the_backoff_a_full_disk_left(seed_user, test_db_pool):
+    """Even one back to the name it had no room for, which is asked for again."""
+    user_id = seed_user["user_id"]
+    computer_id = await _computer(user_id, test_db_pool)
+    a = str((await workspaces.create_workspace_on_computer(user_id, "Research", computer_id))["workspace_id"])
+    await workspaces.update_workspace(a, name="Macro")
+    async with workspace_folders_lock(computer_id) as conn:
+        await record_folder_blocked(conn, computer_id, blocked={a: "Macro"})
+
+    async def planned():
+        async with workspace_folders_lock(computer_id) as conn:
+            plan = await stage_folder_moves(conn, computer_id, ignore_busy=True)
+        return [(m.source, m.target) for m in plan.moves]
+
+    await workspaces.update_workspace(a, name="Macro", description="notes")
+    assert await planned() == []
+
+    await workspaces.update_workspace(a, name="Notes", config={"theme": "dark"})
+    assert (await _row(test_db_pool, a))["config"] == {"theme": "dark"}
+    await workspaces.update_workspace(a, name="Macro")
+    assert await planned() == [("Research", "Macro")]
+
+
 async def test_a_row_given_a_folder_by_a_bind_is_no_longer_mid_move(seed_user, test_db_pool):
     user_id = seed_user["user_id"]
     computer_id = await _computer(user_id, test_db_pool)
@@ -702,7 +726,7 @@ async def test_a_strict_backup_refuses_a_folder_left_mid_move(seed_user, test_db
     sync.assert_not_awaited()
 
 
-async def _lands_every_move(_runtime, _root, *, moves, tombstones, prune, deferred=()):
+async def _lands_every_move(_runtime, _root, *, moves, tombstones, prune, deferred=(), copying=()):
     """The move script's report when every folder reaches its target."""
     return {"moves": {m["id"]: m["target"] for m in moves}, "tombstones": {}}
 

@@ -9,20 +9,19 @@ import {
   useSyncExternalStore,
   type ReactNode,
 } from 'react';
-import { useLocation } from 'react-router';
-import { useQuery } from '@tanstack/react-query';
+import { useLocation, useNavigate } from 'react-router';
 import { useUser } from '@/hooks/useUser';
-import { usePreferences } from '@/hooks/usePreferences';
 import { useWorkspaces } from '@/hooks/useWorkspaces';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import {
   isPersonalizationSnoozed,
   subscribePersonalizationSnooze,
 } from '@/pages/Dashboard/hooks/useOnboarding';
-import { listWatchlists, listWatchlistItems, listPortfolio } from '@/pages/Dashboard/utils/api';
 import { isPlatformMode } from '@/config/hostMode';
+import { isDaltonBuild } from '@/config/brand'; // DALTON-HOOK(hide-trading)
 import { useOnboardingPrefs } from './useOnboardingPrefs';
-import { ONBOARDING_CONNECT, ONBOARDING_PARAM } from './connect/useStartOnboarding';
+import { shouldAutoOpenWelcome } from './welcome/autoOpen';
+import { WELCOME_PATH, isLegacyOnboardingSearch, legacyOnboardingTarget } from './welcome/paths';
 import { readMirror, type OnboardingMirror } from './mirror';
 import { ANNOUNCEMENTS, PAGE_INTROS, GETTING_STARTED_TASKS } from './registry';
 import { unseenReleases, latestReleaseVersion } from './engine/whatsNew';
@@ -49,17 +48,6 @@ interface GettingStartedState {
 /** Tasks offered in this deployment — channel integrations are platform-hosted. */
 const DEPLOYED_TASKS = GETTING_STARTED_TASKS.filter((t) => !t.platformOnly || isPlatformMode);
 
-/** Any non-empty string value in a preference object (mirrors the backend's check). */
-function hasFilledField(section: unknown): boolean {
-  return (
-    typeof section === 'object' &&
-    section !== null &&
-    Object.values(section as Record<string, unknown>).some(
-      (v) => typeof v === 'string' && v.trim() !== ''
-    )
-  );
-}
-
 interface OnboardingContextValue {
   phase: OnboardingPhase;
   unseen: AnnouncementDef[];
@@ -74,6 +62,8 @@ interface OnboardingContextValue {
   // (cold cache), so Settings can skip a "done" toast it can't honor.
   replayGuides: () => boolean;
   resetOnboarding: () => boolean;
+  /** The user passed on the welcome flow: it never opens by itself again. */
+  skipWelcome: () => void;
 }
 
 const OnboardingContext = createContext<OnboardingContextValue | null>(null);
@@ -87,8 +77,8 @@ export function useOnboarding(): OnboardingContextValue {
 
 export function OnboardingProvider({ children }: { children: ReactNode }) {
   const { pathname, search } = useLocation();
+  const navigate = useNavigate();
   const { user } = useUser();
-  const { preferences } = usePreferences();
   const {
     prefs,
     isLoading,
@@ -98,6 +88,7 @@ export function OnboardingProvider({ children }: { children: ReactNode }) {
     replayGuides: replayGuidesPrefs,
     setLastSeenReleaseVersion,
     ensureFirstRun,
+    markWelcomeSkipped,
     resetAll,
   } = useOnboardingPrefs();
 
@@ -122,10 +113,13 @@ export function OnboardingProvider({ children }: { children: ReactNode }) {
   const unseen = useMemo(() => unseenReleases(prefs, ANNOUNCEMENTS), [prefs]);
 
   // Stamp first-run once prefs resolve, so brand-new users start "caught up"
-  // (page intros, not a What's-New backlog).
+  // (page intros, not a What's-New backlog). It waits for the account too.
+  // After an in-place account switch the next account's prefs can land before
+  // its user row does, since the sign-in sync seeds them, and a stamp sent in
+  // that gap would land before `firstRun` below could read the first visit.
   const firstRunStampedRef = useRef(false);
   useEffect(() => {
-    if (isLoading || firstRunStampedRef.current) return;
+    if (isLoading || !userId || firstRunStampedRef.current) return;
     if (prefs.firstRunAt === null) {
       firstRunStampedRef.current = true;
       // Re-arm on a refused or failed write so the stamp isn't lost for the
@@ -137,7 +131,63 @@ export function OnboardingProvider({ children }: { children: ReactNode }) {
       });
       if (!accepted) firstRunStampedRef.current = false;
     }
-  }, [isLoading, prefs.firstRunAt, ensureFirstRun]);
+  }, [isLoading, userId, prefs.firstRunAt, ensureFirstRun]);
+
+  // Whether the engine had never run for this account when its prefs first
+  // loaded this session, which is what makes this visit the account's first.
+  // Captured before the stamp above lands, and kept for the session. It is
+  // held with the account it was read for. Signing in to another account
+  // without signing out clears the cache in place (AuthContext) and leaves
+  // this provider mounted, so the last account's answer must not stand for
+  // the next one: that one is read again once its own prefs have loaded.
+  const [firstRunRead, setFirstRunRead] = useState<{ userId: string; firstRun: boolean } | null>(null);
+  if (userId && !isLoading && firstRunRead?.userId !== userId) {
+    setFirstRunRead({ userId, firstRun: prefs.firstRunAt === null });
+  }
+  const firstRun = firstRunRead?.userId === userId ? firstRunRead.firstRun : null;
+
+  // A new account's first visit opens the welcome flow over the dashboard,
+  // once. Any visit to the flow this session counts as that once, so leaving
+  // it for the dashboard before the user row catches up cannot reopen it.
+  // The guard holds the account it was set for, for the same in-place switch
+  // as `firstRun`: another account signing in gets a first visit of its own.
+  const welcomeOpenedForRef = useRef<string | null>(null);
+  useEffect(() => {
+    // Nothing is recorded without an account. The user is a dependency, so
+    // a visit made while it loads is recorded once it arrives.
+    if (!user) return;
+    if (pathname === WELCOME_PATH) {
+      welcomeOpenedForRef.current = user.user_id;
+      return;
+    }
+    if (welcomeOpenedForRef.current === user.user_id || firstRun === null) return;
+    // DALTON-HOOK(hide-trading): a Dalton build never auto-opens the welcome
+    // flow on a first visit (product decision 3) — the getting-started card
+    // is the entry, and its profile task lands on the Chief of Staff
+    // interview through App's /welcome redirect. Mark it opened either way so
+    // a later session on the same account cannot fire it.
+    if (isDaltonBuild) {
+      welcomeOpenedForRef.current = user.user_id;
+      return;
+    }
+    const open = shouldAutoOpenWelcome({
+      pathname,
+      firstRun,
+      onboardingCompleted: user.onboarding_completed === true,
+      welcomeSkippedAt: prefs.welcomeSkippedAt,
+      createdAt: user.created_at,
+      now: Date.now(),
+    });
+    if (!open) return;
+    welcomeOpenedForRef.current = user.user_id;
+    navigate(WELCOME_PATH, { replace: true });
+  }, [pathname, firstRun, user, prefs.welcomeSkippedAt, navigate]);
+
+  // The brokerage sheet this flow replaced opened on `?onboarding=connect`;
+  // a link or a sign-in from an older build still lands there.
+  useEffect(() => {
+    if (isLegacyOnboardingSearch(search)) navigate(legacyOnboardingTarget(search), { replace: true });
+  }, [search, navigate]);
 
   // First intro for the current route that nothing (server, mirror, session)
   // has recorded as seen. The mirror only suppresses — never triggers.
@@ -227,11 +277,11 @@ export function OnboardingProvider({ children }: { children: ReactNode }) {
     return true;
   }, [resetAll]);
 
-  // The interview thread starts as /chat/t/__default__ but is renamed to a
-  // real thread id on the first message — and that navigate drops the
-  // personalization route state. Remember WHICH thread the interview became
-  // and suppress intros only there: the thread intro can't pop mid-interview,
-  // but a different thread opened later the same session shows it normally.
+  // The thread the welcome flow opens starts as /chat/t/__default__ but is
+  // renamed to a real thread id on the first message — and that navigate drops
+  // the kickoff route state. Remember WHICH thread it became and suppress
+  // intros only there: the thread intro can't pop over the first answer, but a
+  // different thread opened later the same session shows it normally.
   const interviewThreadRef = useRef<string | null>(null);
   const wasInInterviewRef = useRef(false);
   const threadId = pathname.match(/^\/chat\/t\/([^/]+)/)?.[1] ?? null;
@@ -255,19 +305,16 @@ export function OnboardingProvider({ children }: { children: ReactNode }) {
     isPersonalizationSnoozed
   );
 
-  // Suppress while the personalization flow owns the screen: the dashboard
-  // banner (unless snoozed), and the personalization chat itself — clicking
-  // "Personalize" navigates to /chat/t/__default__ and no intro must pop over
-  // it (snooze is irrelevant mid-flow).
-  const personalizationCompleted =
-    user?.personalization_completed === true || user?.onboarding_completed === true;
+  // Suppress while onboarding owns the screen: the welcome flow, the chat it
+  // opens, and the dashboard while its banner offers the flow (unless
+  // snoozed). Read off `onboarding_completed` alone, as the banner is:
+  // `personalization_completed` means the user has a key of their own.
+  const onboardingCompleted = user?.onboarding_completed === true;
   const suppress =
     inInterview ||
-    // The connect sheet is the first step of the same flow, over any page.
-    new URLSearchParams(search).get(ONBOARDING_PARAM) === ONBOARDING_CONNECT ||
-    (!personalizationCompleted &&
-      ((pathname === '/dashboard' && !personalizationSnoozed) ||
-        pathname === '/chat/t/__default__'));
+    pathname === WELCOME_PATH ||
+    isLegacyOnboardingSearch(search) ||
+    (!onboardingCompleted && pathname === '/dashboard' && !personalizationSnoozed);
 
   // Getting-started: auto-complete route-visit tasks. markTaskDone owns the
   // once-per-task guard, so a refused write is not re-sent on the prefs
@@ -281,65 +328,10 @@ export function OnboardingProvider({ children }: { children: ReactNode }) {
     }
   }, [isLoading, pathname, search, prefs, markTaskDone]);
 
-  // "Tell us your preferences" — live from the prefs the interview writes, so
-  // a preferences reset un-checks it. Deliberately NOT the user-row completion
-  // flags: personalization_completed means "has BYOK key", and a reset clears
-  // onboarding_completed without clearing this data's siblings.
-  const hasPreferences = useMemo(
-    () =>
-      ['risk_preference', 'investment_preference', 'agent_preference'].some((k) =>
-        hasFilledField((preferences as Record<string, unknown> | null)?.[k])
-      ),
-    [preferences]
-  );
-
-  // "Tell us your watchlist & portfolio" — does any stock exist? Fetched only
-  // while the card still needs it (not dismissed, not yet stamped); once true
-  // it's stamped into prefs so later sessions skip the lookup entirely.
-  const stocksStamped = prefs.gettingStartedDoneAt['stocks'] != null;
-  const { data: hasStocks = false } = useQuery({
-    // User-scoped key: the result must never be served to another account
-    // within the same QueryClient lifetime.
-    queryKey: ['onboarding', 'hasStocks', userId],
-    queryFn: async () => {
-      // listPortfolio is independent of the watchlists result — start it in
-      // parallel so a user with no watchlists (the common new-user case)
-      // resolves in one round-trip instead of listWatchlists → listPortfolio in
-      // series. .catch keeps it a settled boolean so an early listWatchlists
-      // rejection can't leave it floating unhandled.
-      const portfolioProbe = listPortfolio()
-        .then((r) => ((r as { holdings?: unknown[] }).holdings?.length ?? 0) > 0)
-        .catch(() => false);
-      const { watchlists } = (await listWatchlists()) as {
-        watchlists?: Array<{ watchlist_id: string }>;
-      };
-      // Item probes fire the moment listWatchlists resolves, in parallel with
-      // the still-in-flight portfolio probe.
-      const itemProbes = (watchlists ?? []).map(async (wl) => {
-        const { items } = (await listWatchlistItems(wl.watchlist_id)) as { items?: unknown[] };
-        return (items?.length ?? 0) > 0;
-      });
-      // allSettled: one failed watchlist probe must not mask stocks another
-      // probe found — the result is one-way and gets stamped, so a transient
-      // error returning false would stick the task incomplete for the session.
-      const results = await Promise.allSettled([portfolioProbe, ...itemProbes]);
-      return results.some((r) => r.status === 'fulfilled' && r.value);
-    },
-    enabled: userId != null && !isLoading && prefs.gettingStartedDismissedAt === null && !stocksStamped,
-    staleTime: 60_000,
-    retry: false,
-    // The probe fans out one request per watchlist; don't re-run the burst on
-    // every tab refocus — the result is one-way (false → true → stamped).
-    refetchOnWindowFocus: false,
-  });
-  useEffect(() => {
-    if (hasStocks && !stocksStamped) markTaskDone('stocks');
-  }, [hasStocks, stocksStamped, markTaskDone]);
-
   // "Create your first workspace": any workspace other than Home exists. An
   // independent lightweight probe (limit:1 keys its own cache entry, distinct
   // from the gallery's limit:20); only fetched while the card needs it, and
-  // stamped once true like the stocks task.
+  // stamped once true so later sessions skip the lookup.
   const workspaceStamped = prefs.gettingStartedDoneAt['createWorkspace'] != null;
   const { data: workspacesData } = useWorkspaces({
     limit: 1,
@@ -355,10 +347,10 @@ export function OnboardingProvider({ children }: { children: ReactNode }) {
     const tasks = DEPLOYED_TASKS.map((def) => ({
       def,
       done:
-        def.doneWhen === 'hasPreferences'
-          ? hasPreferences
+        // Live from the user row, never stamped, so a profile reset un-checks it.
+        def.doneWhen === 'onboardingCompleted'
+          ? onboardingCompleted
           : prefs.gettingStartedDoneAt[def.id] != null ||
-            (def.doneWhen === 'hasStocks' && hasStocks) ||
             (def.doneWhen === 'hasWorkspace' && hasWorkspace),
     }));
     const doneCount = tasks.filter((t) => t.done).length;
@@ -370,7 +362,7 @@ export function OnboardingProvider({ children }: { children: ReactNode }) {
       dismiss: dismissGettingStarted,
       completeTask: markTaskDone,
     };
-  }, [prefs, hasPreferences, hasStocks, hasWorkspace, isLoading, dismissGettingStarted, markTaskDone]);
+  }, [prefs, onboardingCompleted, hasWorkspace, isLoading, dismissGettingStarted, markTaskDone]);
 
   useOnboardingOrchestrator({
     isLoading,
@@ -398,6 +390,7 @@ export function OnboardingProvider({ children }: { children: ReactNode }) {
       acknowledgeWhatsNew,
       replayGuides,
       resetOnboarding,
+      skipWelcome: markWelcomeSkipped,
     }),
     [
       phase,
@@ -408,6 +401,7 @@ export function OnboardingProvider({ children }: { children: ReactNode }) {
       acknowledgeWhatsNew,
       replayGuides,
       resetOnboarding,
+      markWelcomeSkipped,
     ]
   );
 

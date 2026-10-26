@@ -158,7 +158,10 @@ def inject_multimodal_context(
         if messages[i].get("role") == "user":
             content = messages[i]["content"]
             if isinstance(content, str):
-                messages[i]["content"] = blocks + [{"type": "text", "text": content}]
+                # A turn that opens with no words of the user's (the onboarding
+                # kickoff) gets no empty text block: some providers refuse one.
+                text = [{"type": "text", "text": content}] if content.strip() else []
+                messages[i]["content"] = blocks + text
             elif isinstance(content, list):
                 messages[i]["content"] = blocks + content
             break

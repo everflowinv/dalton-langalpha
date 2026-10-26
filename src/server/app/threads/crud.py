@@ -13,6 +13,7 @@ from src.server.services.features import user_feature_enabled
 from src.server.models.automation import MarketType
 from src.server.services.market_targets.changes import targets_changed
 from src.server.services.market_targets.listing import watch_spelling
+from src.server.services.wakeups import cancel as wakeups_cancel
 from src.server.services.llm.thread_model import require_selectable_model
 from src.server.services.thread_lifecycle import project_lifecycle
 from src.server.services.thread_lifecycle_feed import (
@@ -20,6 +21,7 @@ from src.server.services.thread_lifecycle_feed import (
     publish_thread_deleted,
     publish_thread_pinned,
     publish_thread_subagents,
+    publish_thread_tuning,
     publish_thread_title,
     publish_thread_unarchived,
 )
@@ -155,6 +157,8 @@ async def list_threads(
                 archived_at=thread.get("archived_at"),
                 llm_model=thread.get("llm_model"),
                 subagents_allowed=thread["subagents_allowed"],
+                reasoning_effort=thread.get("reasoning_effort"),
+                fast_mode=thread.get("fast_mode"),
                 turn_count=thread.get("turn_count"),
                 created_at=thread["created_at"],
                 updated_at=thread["updated_at"],
@@ -424,24 +428,11 @@ def _thread_list_item(row: dict) -> WorkspaceThreadListItem:
         archived_at=row.get("archived_at"),
         llm_model=row.get("llm_model"),
         subagents_allowed=row["subagents_allowed"],
+        reasoning_effort=row.get("reasoning_effort"),
+        fast_mode=row.get("fast_mode"),
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
-
-
-async def _cancel_targets_on_archive(thread_id: str) -> None:
-    """End an archived thread's armed targets: a hit there would start a turn
-    nobody sees. Best effort after the archive committed; one that survives
-    a failure here is dropped at delivery, as the thread reads archived."""
-    try:
-        if await cancel_targets(thread_id):
-            await targets_changed(thread_id)
-    except Exception:
-        logger.warning(
-            "[MarketWatch] cancelling targets on archive failed thread_id=%s",
-            thread_id,
-            exc_info=True,
-        )
 
 
 @router.patch("/{thread_id}", response_model=WorkspaceThreadListItem)
@@ -449,7 +440,7 @@ async def update_thread_endpoint(
     thread_id: str, request: ThreadUpdateRequest, x_user_id: CurrentUserId
 ):
     """Update user-editable thread fields: title, pin, archive, model,
-    subagent switch.
+    subagent switch, effort, fast mode.
 
     Applies only the fields explicitly present in the request body
     (``model_fields_set``) — a pin toggle can't clear the title.
@@ -480,6 +471,13 @@ async def update_thread_endpoint(
             # running turn on its next model call and at every subagent
             # launch, so a flip mid-turn takes effect without one.
             updates["subagents_allowed"] = request.subagents_allowed
+        # Stored as sent, null returning the field to the user's Settings.
+        # Read when the next turn resolves its model, so a running turn keeps
+        # the level it started on.
+        if "reasoning_effort" in provided:
+            updates["reasoning_effort"] = request.reasoning_effort
+        if "fast_mode" in provided:
+            updates["fast_mode"] = request.fast_mode
         if not updates:
             raise HTTPException(
                 status_code=400, detail="No updatable fields provided"
@@ -511,6 +509,14 @@ async def update_thread_endpoint(
                 workspace_id=str(updated_thread["workspace_id"]),
                 allowed=updated_thread["subagents_allowed"],
             )
+        if "reasoning_effort" in updates or "fast_mode" in updates:
+            await publish_thread_tuning(
+                user_id=x_user_id,
+                thread_id=thread_id,
+                workspace_id=str(updated_thread["workspace_id"]),
+                reasoning_effort=updated_thread["reasoning_effort"],
+                fast_mode=updated_thread["fast_mode"],
+            )
         if "archived" in updates:
             # Post-commit only: the archive statement already stamped the
             # latest terminal attempt seen, so the row's absence from the
@@ -528,7 +534,7 @@ async def update_thread_endpoint(
             if updates["archived"]:
                 # Archiving ends the thread's scratchpad.
                 prune_thread_dirs_soon(str(updated_thread["workspace_id"]))
-                await _cancel_targets_on_archive(thread_id)
+                await wakeups_cancel.cancel_on_archive(thread_id)
         return _thread_list_item(updated_thread)
 
     except HTTPException:

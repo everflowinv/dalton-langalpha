@@ -29,6 +29,11 @@ const NOTICE = {
   expires_at: null,
 } as const;
 const ALERT: SteeringDeliveredEntry = { content: '', timestamp: 1_700_000_000, market_alert: NOTICE };
+// The notice as a price wakeup's, which its row is drawn from.
+const AS_WAKEUP = {
+  wakeup_id: 'tg-1', kind: 'price', notice: 'fire', seq: 1, total: 1, fired_at: '2030-01-01T15:05:00Z',
+  price: { symbol: 'ACME', kind: 'above', value: 205, pct_from: null, fired_price: 205.12 },
+};
 
 function setup(extra: Array<Record<string, unknown>> = []) {
   let messages = [
@@ -58,7 +63,7 @@ function setup(extra: Array<Record<string, unknown>> = []) {
     threadIdRef: { current: 'thread-1' },
     pendingPTCBackfillRef: { current: new Map() },
   };
-  const deps = { clearModelStatus: () => {}, refreshMarketWatch: vi.fn() };
+  const deps = { clearModelStatus: () => {}, refreshMarketWatch: vi.fn(), refreshWakeups: vi.fn() };
   const refs = {
     contentOrderCounterRef: { current: 4 },
     currentReasoningIdRef: { current: null },
@@ -84,7 +89,7 @@ describe('live: a price alert the turn took in', () => {
     const { rt, deps, refs, deliver, read } = setup();
     deliver([ALERT]);
 
-    expect(deps.refreshMarketWatch).toHaveBeenCalledOnce();
+    expect(deps.refreshWakeups).toHaveBeenCalledOnce();
     const [user, settled, alert, next] = read();
     expect(read()).toHaveLength(4);
     expect(user.id).toBe('u0');
@@ -94,7 +99,7 @@ describe('live: a price alert the turn took in', () => {
       id: 'market-alert-tg-1:hit',
       role: 'notification',
       timestamp: new Date(1_700_000_000_000),
-      marketAlert: { source: 'delivered', notices: [NOTICE] },
+      wakeup: { source: 'delivered', legacy: true, notices: [AS_WAKEUP] },
     });
     expect(next).toMatchObject({ role: 'assistant', isSteering: true, isStreaming: true, turnIndex: 0 });
     expect(rt.currentMessageRef.current).toBe(next.id);
@@ -134,17 +139,17 @@ describe('live: a price alert the turn took in', () => {
     expect(read().filter((m) => m.role === 'notification')).toHaveLength(1);
   });
 
-  it('refreshes the targets but draws nothing for an alert naming no target', () => {
+  it('re-reads the wakeups but draws nothing for an alert naming no target', () => {
     const { deps, deliver, read } = setup();
     deliver([{ content: '', market_alert: { symbol: 'ACME' } } as unknown as SteeringDeliveredEntry]);
-    expect(deps.refreshMarketWatch).toHaveBeenCalledOnce();
+    expect(deps.refreshWakeups).toHaveBeenCalledOnce();
     expect(read().some((m) => m.role === 'notification')).toBe(false);
   });
 
-  it('leaves the targets alone for a delivery with no alert in it', () => {
+  it('leaves the wakeups alone for a delivery with no alert in it', () => {
     const { deps, deliver } = setup();
     deliver([{ content: 'and margins' }]);
-    expect(deps.refreshMarketWatch).not.toHaveBeenCalled();
+    expect(deps.refreshWakeups).not.toHaveBeenCalled();
   });
 });
 
@@ -174,5 +179,25 @@ describe("live: the agent's watch_market call", () => {
     process(call('tc-q', 'get_quote'));
     process(result('tc-q'));
     expect(deps.refreshMarketWatch).not.toHaveBeenCalled();
+  });
+});
+
+describe("live: the agent's schedule_wakeup call", () => {
+  const call = (id: string) => ({
+    event: 'tool_calls',
+    agent: 'main',
+    tool_calls: [{ id, name: 'schedule_wakeup', args: { triggers: [{ at: '2030-01-02T15:00' }] } }],
+  } as unknown as SSEEvent);
+  const result = (id: string) =>
+    ({ event: 'tool_call_result', agent: 'main', tool_call_id: id, content: 'Set 1 wakeup.' } as unknown as SSEEvent);
+
+  it('re-reads the wakeups once its result arrives', () => {
+    const { deps, process } = setup();
+    process(call('tc-s'));
+    expect(deps.refreshWakeups).not.toHaveBeenCalled();
+    process(result('tc-s'));
+    expect(deps.refreshWakeups).toHaveBeenCalledOnce();
+    process(result('tc-s'));
+    expect(deps.refreshWakeups).toHaveBeenCalledOnce();
   });
 });

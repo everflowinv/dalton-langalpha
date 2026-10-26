@@ -9,6 +9,7 @@ from ptc_agent.agent.middleware.runtime_context import TurnContext
 from ptc_agent.agent.middleware.runtime_context.epoch import Workspace
 from ptc_agent.agent.middleware.compaction.window import WindowCoverage
 from ptc_agent.agent.middleware.subagent_switch import SubagentSwitchReader
+from ptc_agent.agent.middleware.wakeups import CancelNotices
 from ptc_agent.config import AgentConfig
 from ptc_agent.core.project_context import ProjectContext
 from ptc_agent.core.session import Session
@@ -208,6 +209,7 @@ async def build_ptc_graph_with_session(
     role: AgentRole = "analyst",
     subagent_switch: SubagentSwitchReader | None = None,
     window_coverage: WindowCoverage | None = None,
+    cancel_notices: CancelNotices | None = None,
 ) -> Any:
     """Build a BackgroundSubagentOrchestrator from a pre-acquired session (WorkspaceManager path).
 
@@ -226,7 +228,8 @@ async def build_ptc_graph_with_session(
     ``subagent_switch`` reads the thread's subagent switch on every call; a
     build without one leaves subagents as built. ``window_coverage`` lets the
     main agent trim its checkpoint to its window (see ``compaction.window``);
-    a build without one never trims.
+    a build without one never trims. ``cancel_notices`` tells the agent of
+    the user's cancels of its wakeups; a build without one tells it of none.
     """
     mcp_registry = (
         tool_view.mcp_registry if tool_view is not None else session.mcp_registry
@@ -303,6 +306,7 @@ async def build_ptc_graph_with_session(
         harness_blocks=harness_blocks,
         subagent_switch=subagent_switch,
         window_coverage=window_coverage,
+        cancel_notices=cancel_notices,
     )
 
     logger.debug(

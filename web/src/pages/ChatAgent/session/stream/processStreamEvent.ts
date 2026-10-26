@@ -12,7 +12,7 @@ import { noteLiveRun } from '../latestRun';
 import type { StructuredError } from '@/utils/rateLimitError';
 import { applyAnnotationArtifact } from '@/pages/MarketView/stores/chartAnnotationStore';
 import type { AssistantMessage, ChatMessage } from '@/types/chat';
-import { CREDIT_STOP_ERROR_TYPE, isDeliveredMarketAlert, isDeliveredSteer } from '@/types/sse';
+import { CREDIT_STOP_ERROR_TYPE, isDeliveredNotice, isDeliveredSteer } from '@/types/sse';
 import { setStoredThreadId } from '../../hooks/utils/threadStorage';
 import { createAssistantMessage, updateMessage } from '../../hooks/utils/messageHelpers';
 import { turnOf } from '../../components/messageList/turnProjection';
@@ -42,9 +42,8 @@ import {
   type DeliveredInstruction,
 } from '../subagents/liveEventHandlers';
 import { getOrCreateTaskRefs, type UpdateSubagentCard } from '../streamRefs';
-import {
-  handleMarketWatchUpdate, wakeAlertRow, withLiveWakeRow, type MarketWatchState,
-} from '../marketWatchEvents';
+import { handleMarketWatchUpdate, type MarketWatchState } from '../marketWatchEvents';
+import { SCHEDULE_WAKEUP, wakeTurnOpener, withLiveWakeRow } from '../wakeupEvents';
 import type {
   SSEEvent, StreamProcessorRefs, ModelStatus,
 } from '../types';
@@ -52,6 +51,15 @@ import { dispatchResultFields, setCardFields, settleProposalFromResult } from '.
 import { projectLiveInterrupt } from '../interrupts/fromLiveEvent';
 import type { StreamRuntime } from '../runtime';
 import { preapprovedReportBack } from '../../utils/preapprovedCards';
+
+type RefreshOnResult = 'refreshMarketWatch' | 'refreshWakeups';
+
+/** The tools whose result is when the chip and the Status panel re-read what
+ *  the call changed, rather than at turn end. */
+const REFRESH_ON_RESULT = new Map<string, RefreshOnResult>([
+  ['watch_market', 'refreshMarketWatch'],
+  [SCHEDULE_WAKEUP, 'refreshWakeups'],
+]);
 
 export interface StreamRouterDeps {
   /** Fold a model-fallback event into the fallback banner state. */
@@ -62,9 +70,11 @@ export interface StreamRouterDeps {
   releaseStreamOwnership: () => void;
   attachSubagentMux: (tid: string, processEvent: (event: SSEEvent) => void, snapshotAtMs?: number) => void;
   setMarketWatch: React.Dispatch<React.SetStateAction<MarketWatchState | null>>;
-  /** Re-read the thread's watch and targets, after a target's state moved
-   * on the server. */
+  /** Re-read the thread's watched symbols, after the agent changed them. */
   refreshMarketWatch: () => void;
+  /** Re-read the thread's wakeups, after one fired or the agent set or
+   * cancelled some. */
+  refreshWakeups: () => void;
   /** Re-read the workspace row, whose folder a run's sandbox acquisition may
    * have moved; null with no workspace. */
   refreshWorkspaceFolder: (() => void) | null;
@@ -142,10 +152,8 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
   // This ensures the tool-call index is populated before tool_call_result.
   const pendingTaskToolCallIds: string[] = [];
 
-  // The agent's watch_market calls still to answer. A call may arm, replace or
-  // cancel a target, and a live stamp carries no targets, so its result is
-  // when the chip and the Status panel re-read them rather than at turn end.
-  const pendingWatchCallIds = new Set<string>();
+  // Those calls still to answer, by call id.
+  const pendingRefreshCalls = new Map<string, RefreshOnResult>();
 
   // Append a notification segment to a task card's latest assistant message
   // (transcript notice inside the subagent detail view). No-ops before the
@@ -213,16 +221,18 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
           const { run_id: runId, report_source: source, turn_index: turn } = event;
           const beforeId = rt.currentMessageRef.current;
           rt.setMessages((prev) => withLiveReportRow(prev, runId, source, beforeId, turn));
-        } else if (event.market_target && typeof event.turn_index === 'number') {
-          // A target's wake, attached live, draws its alert row from this
-          // frame, keyed on the turn as replay keys it, so a later load
-          // replaces it rather than drawing a second.
-          const row = wakeAlertRow(event.turn_index, { market_target: event.market_target }, new Date());
-          const beforeId = rt.currentMessageRef.current;
-          rt.setMessages((prev) => withLiveWakeRow(prev, row, beforeId));
-          // The wake spent its target, which the chip and the Status panel
-          // would otherwise show armed until the turn ends.
-          deps.refreshMarketWatch();
+        } else {
+          // A wake, attached live, draws its opener row from this frame,
+          // keyed on the turn as replay keys it, so a later load replaces it
+          // rather than drawing a second.
+          const row = typeof event.turn_index === 'number' ? wakeTurnOpener(event.turn_index, event, new Date()) : null;
+          if (row) {
+            const beforeId = rt.currentMessageRef.current;
+            rt.setMessages((prev) => withLiveWakeRow(prev, row, beforeId));
+            // The wake moved its wakeup on the server, which the chip and the
+            // Status panel would otherwise show armed.
+            deps.refreshWakeups();
+          }
         }
       }
       // The turn admission gave the run, which a view that missed turns added
@@ -298,12 +308,11 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
     }
 
     // (b) Live market-watch stamp — keep the persistent watch chip current
-    // mid-turn. Swallowed here so it never leaks into the message stream. The
-    // stamp carries no targets, so the last read's stay.
+    // mid-turn. Swallowed here so it never leaks into the message stream.
     if (eventType === 'market_watch_update') {
       handleMarketWatchUpdate({
         event,
-        setMarketWatch: (next) => deps.setMarketWatch((prev) => ({ ...next, targets: prev?.targets })),
+        setMarketWatch: deps.setMarketWatch,
       });
       return;
     }
@@ -332,8 +341,9 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
       // takes it. Read here, not in the rollback updater, which React may run
       // after the take has nulled both.
       const effectiveSteeringAtOrder = entries.some(isDeliveredSteer) ? takeSteeringBoundary() : null;
-      // An alert moved its target on the server, which the watch panel shows.
-      if (entries.some(isDeliveredMarketAlert)) deps.refreshMarketWatch();
+      // A delivered alert or wakeup moved its wakeup on the server, which the
+      // chip and the Status panel show.
+      if (entries.some(isDeliveredNotice)) deps.refreshWakeups();
 
       // 1. Roll back old assistant message to the snapshot taken at steering_accepted
       //    time, removing any content that leaked due to stream-mode multiplexing.
@@ -834,7 +844,8 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
         // may leave state. One that produced something shows as a failed turn
         // with it; an empty one (the reconnect cleanup's test: no segments, no
         // content) settles without `error`, which the render-time orphan skip
-        // hides, as it does the 429 path's.
+        // hides, as it does the 429 path's, unless it is a hidden opener's
+        // (settleFailedBubble).
         // The headline alone, as a reload shows it: the frame's text is the
         // server's raw exception and stays on the wire for other readers.
         rt.setMessageError({ message: '', kind: 'internal' });
@@ -1025,7 +1036,8 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
           if ((tc.name === 'task' || tc.name === 'Task') && tc.id && !tc.args?.task_id) {
             pendingTaskToolCallIds.push(tc.id);
           }
-          if (tc.name === 'watch_market' && tc.id) pendingWatchCallIds.add(tc.id);
+          const refresh = REFRESH_ON_RESULT.get(tc.name);
+          if (refresh && tc.id) pendingRefreshCalls.set(tc.id, refresh);
         }
       }
     } else if (eventType === 'tool_call_result') {
@@ -1072,7 +1084,11 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
 
       if (isWorkspaceChangingToolSuccess(event.content)) deps.refreshWorkspaces();
 
-      if (toolCallId && pendingWatchCallIds.delete(toolCallId)) deps.refreshMarketWatch();
+      const refresh = toolCallId ? pendingRefreshCalls.get(toolCallId) : undefined;
+      if (refresh) {
+        pendingRefreshCalls.delete(toolCallId);
+        deps[refresh]();
+      }
 
       // Detect navigate_to_workspace action from start_question tool result
       if (rt.onWorkspaceCreated && typeof event.content === 'string') {

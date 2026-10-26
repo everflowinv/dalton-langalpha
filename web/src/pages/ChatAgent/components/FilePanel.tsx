@@ -61,6 +61,7 @@ import { usePanelTarget } from './filePanel/usePanelTarget';
 import { ActiveTabBody } from './filePanel/ActiveTabBody';
 import { useWatchTab } from './filePanel/useWatchTab';
 import type { MarketWatchState } from '../session/marketWatchEvents';
+import { useThreadWakeups } from '../hooks/useWakeups';
 import { RouteLeaveGuardContext, type RouteLeaveGuard } from '../contexts/RouteLeaveGuardContext';
 import type { SubagentInfo } from './ToolCallDetailView';
 import type { TranscriptReader } from './filePanel/useTranscript';
@@ -70,7 +71,8 @@ const TREE_OVERLAY_WIDTH = 720;
 
 interface FilePanelProps {
   workspaceId: string;
-  /** Scopes the tab strip; absent for a chat that has not sent its first message, or a share. */
+  /** Scopes the tab strip and names the thread whose wakeups the Status tab
+   *  follows; absent for a chat that has not sent its first message, or a share. */
   threadId?: string | null;
   onClose: () => void;
   /** What the chat asked the panel to show. A `file` target's `dir` stays on
@@ -83,8 +85,6 @@ interface FilePanelProps {
   onTargetMemoHandled?: (seq?: number) => void;
   /** The live market watch, which the Status tab follows. */
   marketWatch?: MarketWatchState | null;
-  /** Cancels an armed price target from the Status tab; rejects on failure. */
-  onCancelMarketTarget?: ((targetId: string) => Promise<void>) | null;
   /** Leaves the panel for the full MarketView page on this symbol. */
   onOpenInMarketView?: ((spec: ChartTabSpec) => void) | null;
   /** Leaves for a subagent's own transcript, from a tool tab showing its task. */
@@ -148,7 +148,6 @@ function FilePanel({
   onTargetMemoryHandled,
   onTargetMemoHandled,
   marketWatch = null,
-  onCancelMarketTarget = null,
   onOpenInMarketView = null,
   onOpenSubagentTask = null,
   transcript = null,
@@ -418,7 +417,8 @@ function FilePanel({
   const [memoSyncing, setMemoSyncing] = useState(false);
   const [memoDiffOpen, setMemoDiffOpen] = useState(false);
 
-  useWatchTab(tabs, marketWatch);
+  const wakeups = useThreadWakeups(threadId, isActive);
+  useWatchTab(tabs, marketWatch, wakeups);
 
   // Stable: `retryOpen` is new with every file list and every change mark, and
   // the viewer this reaches should render only for its own file.
@@ -796,7 +796,8 @@ function FilePanel({
                 onTargetMemoryHandled={onTargetMemoryHandled}
                 onTargetMemoHandled={onTargetMemoHandled}
                 marketWatch={marketWatch}
-                onCancelMarketTarget={onCancelMarketTarget}
+                threadId={threadId}
+                isActive={isActive}
                 onOpenFile={onOpenFile}
                 onOpenSubagentTask={onOpenSubagentTask}
                 transcript={transcript}

@@ -1,5 +1,5 @@
-"""The outbox statements behind a market-target alert held for its thread's
-next turn: every way out of a claim at the ceiling holds it rather than
+"""The outbox statements behind an alert (a market target's or a wakeup's
+notice) held for its thread's next turn: every way out of a claim at the ceiling holds it rather than
 dead-lettering it, a held one blocks no later wake, and the sweeps that
 revive and close it are single guarded statements every worker may run.
 
@@ -41,10 +41,12 @@ async def test_a_claim_out_of_attempts_is_held_not_dead(
 
     statements = _statements(mock_cursor)
     hold = statements[-1]
-    assert hold.startswith("UPDATE hook_outbox o SET status = 'pending'")
+    assert hold.startswith("WITH held AS ( UPDATE hook_outbox o SET status = 'pending'")
     assert "next_retry_at = 'infinity'::timestamptz" in hold
     assert "jsonb_build_object('exhausted', true)" in hold
-    assert "o.hook_type = 'market_target'" in hold
+    assert "o.hook_type IN ('market_target', 'wakeup')" in hold
+    # A wakeup's riders are held with their head, keeping the head they rode.
+    assert "'exhausted', true, 'rode', r.payload->>'rides')" in hold
     assert _flat(outbox._AT_CEILING_SQL) in hold
     # No dead transition ran after the hold.
     assert not any("'dead'" in s for s in statements)
@@ -61,7 +63,7 @@ async def test_the_park_sweep_holds_alerts_and_dead_letters_the_rest(
     hold, dead = _statements(mock_cursor)[-2:]
     assert "jsonb_build_object('exhausted', true)" in hold
     assert "o.lease_expires_at <= NOW()" in hold
-    assert "hook_type NOT IN ('steer', 'market_target')" in dead
+    assert "hook_type NOT IN ('steer', 'market_target', 'wakeup')" in dead
 
 
 @pytest.mark.asyncio
@@ -84,7 +86,7 @@ def test_a_waiting_alert_blocks_no_later_job_in_either_claim_phase():
     import inspect
 
     source = _flat(inspect.getsource(outbox.claim_outbox_jobs))
-    blocker = '(p.status = \'pending\' AND NOT {_waiting_alert_sql("p")})'
+    blocker = '(p.status = \'pending\' AND NOT {waiting_alert_sql("p")})'
     assert source.count(blocker) == 2
 
 
@@ -108,7 +110,9 @@ async def test_the_revive_sweep_makes_an_owed_dead_alert_due_a_bounded_number_of
     # The fence token survives revival.
     assert "attempts" not in head
 
-    assert where.startswith("o.status = 'dead' AND o.hook_type = 'market_target'")
+    assert where.startswith(
+        "o.status = 'dead' AND o.hook_type IN ('market_target', 'wakeup')"
+    )
     assert f"{_flat(outbox._ALERT_REVIVALS_SQL)} < %(max)s" in where
     assert _flat(outbox._ALERT_OWED_SQL) in where
     assert mock_cursor.execute.call_args.args[1] == {
@@ -152,16 +156,22 @@ async def test_the_close_sweep_ends_unheld_alerts_no_turn_will_take(
     sql = _statements(mock_cursor)[-1]
     assert "SET status = 'done'" in sql
     assert (
-        "WHERE o.hook_type = 'market_target' AND o.status = 'pending'"
+        "WHERE o.hook_type IN ('market_target', 'wakeup') AND o.status = 'pending'"
         " AND NOT (o.payload ? 'steered_run_id')"
     ) in sql
     # Not owed: only a waiting one, which nothing else would close.
     assert (
-        f"({_flat(outbox._waiting_alert_sql('o'))} AND NOT {_flat(outbox._ALERT_OWED_SQL)})"
+        f"({_flat(outbox.waiting_alert_sql('o'))} AND NOT {_flat(outbox._ALERT_OWED_SQL)})"
     ) in sql
     # No turn will come: any pending one, held or merely parked.
     assert "LEFT JOIN workspaces w ON w.workspace_id = c.workspace_id" in sql
     assert "AND (c.archived_at IS NOT NULL OR w.status = 'deleted')" in sql
+    # Except a wakeup's notice still owed, which its executor must end first.
+    assert f"(o.hook_type <> 'wakeup' OR NOT {_flat(outbox._ALERT_OWED_SQL)})" in sql
+    due = _statements(mock_cursor)[-2]
+    assert "SET next_retry_at = NOW()" in due
+    assert f"AND {_flat(outbox._NO_TURN_SQL)} AND {_flat(outbox.WAKEUP_OWED_SQL)}" in due
+    assert "ORDER BY (o.payload ? 'rides'), o.hook_outbox_id FOR UPDATE SKIP LOCKED" in due
 
 
 def test_the_owed_predicate_reads_each_notice_as_delivery_does():

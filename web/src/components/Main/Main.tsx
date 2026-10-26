@@ -36,19 +36,34 @@ const Automations = lazyWithMotion(routeChunks.automations);
 const Plugins = lazyWithMotion(routeChunks.plugins);
 const Settings = lazyWithMotion(routeChunks.settings);
 
+// What a preload warms for each section: the page itself where it is loaded
+// with motion, so a page warmed ahead renders on its first mount rather than
+// behind the pane's spinner (see lib/lazyWithMotion).
+const routePreloads = {
+  ...routeChunks,
+  dashboard: Dashboard.preload,
+  chat: ChatAgent.preload,
+  market: MarketView.preload,
+  automations: Automations.preload,
+  orders: Orders.preload,
+  plugins: Plugins.preload,
+  settings: Settings.preload,
+  connectors: Plugins.preload,
+} satisfies Record<AppSection, () => Promise<unknown>>;
+
 /** Start downloading the chunk for `pathname` without rendering it, so the
  * shell can warm the target route while the /users/me gate is still
  * resolving instead of serializing the two network legs. Unknown segments
  * warm the dashboard chunk (the catch-all redirect's target). */
 export function preloadRouteChunk(pathname: string): void {
-  const chunkFor: Record<string, () => Promise<unknown>> = routeChunks;
+  const chunkFor: Record<string, () => Promise<unknown>> = routePreloads;
   const segment = pathname.split('/')[1] || 'dashboard';
   // Swallowed on purpose, but it must be caught: a deploy deletes the previous
   // build's chunks, so this rejects routinely for a stale tab, and an unhandled
   // rejection is noise that hides real ones. The failure still surfaces — Vite
   // fires vite:preloadError (index.html reports it), and React.lazy retries the
   // same import at mount, where StaleBuildBoundary catches it.
-  void (chunkFor[segment] ?? routeChunks.dashboard)().catch(() => {});
+  void (chunkFor[segment] ?? routePreloads.dashboard)().catch(() => {});
 }
 
 /** Permanent alias for the pre-rename Connectors page. Keeps search + hash:

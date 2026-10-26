@@ -13,7 +13,7 @@ import enum
 import functools
 import hashlib
 from collections import defaultdict
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Container
 from dataclasses import dataclass, field
 from typing import Any, Generic, TypeVar
 
@@ -26,13 +26,15 @@ from scripts._errors import where
 MESSAGES = "messages"
 
 # The releases whose storage format and load path these scripts were checked
-# against: the stage-1 walk stops at the first checkpoint whose
-# ``channel_values`` has a ``messages`` key, a direct load joins the blob by
-# channel version, and a flag without a blob seeds empty.
+# against: a direct load joins the blob by channel version; otherwise the
+# stage-1 walk, starting on the target's own page, stops at the first parent
+# with a non-empty blob at its version or an inline value (a flag without a
+# blob seeds the ``true`` marker), and the writes in between replay in
+# ``writes_sort_key`` order.
 SUPPORTED_RELEASES = {
-    "langgraph": "1.2.11",
-    "langgraph-checkpoint": "4.1.1",
-    "langgraph-checkpoint-postgres": "3.1.1",
+    "langgraph": "1.2.16",
+    "langgraph-checkpoint": "4.3.0",
+    "langgraph-checkpoint-postgres": "3.2.0",
 }
 
 
@@ -47,13 +49,6 @@ def unsupported_saver() -> str | None:
             return f"{dist} is not installed"
         if installed != wanted:
             return f"{dist} {installed} is not a verified release ({wanted})"
-    # Longer walks reach targets past the first stage-1 page, which only the
-    # server's walk guard rebuilds correctly on these releases.
-    import src.server.utils.checkpointer  # noqa: F401
-    from langgraph.checkpoint.postgres.base import BasePostgresSaver
-
-    if not getattr(BasePostgresSaver._try_advance_walks, "_waits_for_target", False):
-        return "the server's delta walk guard is not installed"
     return None
 
 
@@ -149,14 +144,17 @@ class Tree:
     def leaves(self) -> list[str]:
         return [cid for cid in self.order if not self.children.get(cid)]
 
-    def walk(self, checkpoint_id: str, flags: set[str]) -> tuple[str | None, list[str]]:
+    def walk(
+        self, checkpoint_id: str, stored: Container[str], flags: Container[str]
+    ) -> tuple[str | None, list[str]]:
         """The saver's walk for a checkpoint that loads no blob: parents from
-        its own up to and including the first flagged one, which seeds it."""
+        its own up to and including the first one that seeds it, by a blob
+        stored at its version or by its flag."""
         chain: list[str] = []
         cur = self.nodes[checkpoint_id].parent
         while cur is not None:
             chain.append(cur)
-            if cur in flags:
+            if self.nodes[cur].version in stored or cur in flags:
                 return cur, chain
             cur = self.nodes[cur].parent
         return None, chain
@@ -208,9 +206,7 @@ class Loader:
     """Reads ``messages`` through the server's reader graph on one connection."""
 
     def __init__(self, conn: psycopg.AsyncConnection) -> None:
-        # Importing the checkpointer module installs the server's walk guard on
-        # the saver base class; the reader is what the history endpoints use.
-        import src.server.utils.checkpointer  # noqa: F401
+        # The reader is what the history endpoints load through.
         from src.server.services.history.reader import CheckpointHistoryReader
 
         self.saver = _metered_saver_class()(conn)

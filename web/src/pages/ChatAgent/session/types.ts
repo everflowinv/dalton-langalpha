@@ -6,7 +6,7 @@
 
 import type React from 'react';
 import type { ChatMessage } from '@/types/chat';
-import type { ActionRequest, MetadataEvent, ToolCallData } from '@/types/sse';
+import type { ActionRequest, ToolCallData } from '@/types/sse';
 import type { ReportSource } from '@/types/api';
 import type { SubagentTokenUsage } from '../utils/tokenUsage';
 import type { DecisionTarget } from './interrupts/toolApprovalCard';
@@ -96,9 +96,6 @@ interface SSEEvent {
   /** On a report-back's `metadata` frame: what it reports, for the row a live
    *  attach draws, since no user message comes with it. */
   report_source?: ReportSource;
-  /** On a target's wake turn's `metadata` frame: the notice that woke it, for
-   *  the alert row a live attach draws, for the same reason. */
-  market_target?: MetadataEvent['market_target'];
   /** ISO instant the turn's run settled, on a terminal `user_message` only.
    *  Live turns carry none — their tail bubble is stamped when it finalizes. */
   run_completed_at?: string;
@@ -153,6 +150,26 @@ interface ModelOptions {
    * thread carries none: the row's PATCH is its only writer.
    */
   subagentsAllowed?: boolean;
+  /**
+   * The effort and fast mode the thread this send creates keeps as its own
+   * (`useThreadTuning`), apart from `reasoningEffort`/`fastMode`, which are
+   * this turn's. A send on a live thread carries none, for the same reason.
+   */
+  reasoningEffortOverride?: string;
+  fastModeOverride?: boolean;
+}
+
+/** What a fresh send takes beyond the model options an edit or regenerate does. */
+interface SendOptions extends ModelOptions {
+  /**
+   * The send opens its turn with no message of its own: the model reads only
+   * its additionalContext, and the reply is the first bubble the turn shows.
+   * A reload draws none for it either, since its stored query is empty.
+   */
+  hiddenOpener?: boolean;
+  /** The title of the thread this send creates, in place of one generated
+   *  from its message. A send on a live thread leaves the title alone. */
+  threadTitle?: string;
 }
 
 /** Offload batch ref state. */
@@ -293,7 +310,7 @@ interface PairState {
 
 export type {
   SetMessages, TokenUsage, PendingInterrupt,
-  SSEEvent, ModelOptions, OffloadBatch, ContextWindowCallbacks,
+  SSEEvent, ModelOptions, SendOptions, OffloadBatch, ContextWindowCallbacks,
   SubagentHistoryEntry, TaskRefs, HistoryInterruptInfo, SubagentHistoryData,
   StreamProcessorRefs, PairState,
 };

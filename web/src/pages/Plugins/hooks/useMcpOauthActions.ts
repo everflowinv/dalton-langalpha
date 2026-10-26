@@ -470,12 +470,13 @@ export function useMcpOauthActions({
       const answered = 'kind' in started ? started : null;
       const server = answered?.server ?? name;
       const plugin = answered?.kind === 'plugin' ? answered.plugin : null;
+      const label = request.label ?? vendor?.label ?? plugin ?? server;
       // Kept from the start, not from the page leaving: the desktop app never
       // leaves this page, and its callback still has to find what the user
       // was doing.
       rememberConnect({
         server,
-        label: request.label ?? vendor?.label ?? plugin ?? server,
+        label,
         retry: request.retry ?? retryFor(pending),
         desktopOnly: !!vendor?.native_callback_only,
         returnTo: landTo,
@@ -512,9 +513,7 @@ export function useMcpOauthActions({
         if (pending) {
           toast({
             title: t('plugins.oauth.continueInBrowserTitle'),
-            description: t('plugins.oauth.continueInBrowserDesc', {
-              server: plugin ?? server,
-            }),
+            description: t('plugins.oauth.continueInBrowserDesc', { server: label }),
           });
         }
         return;

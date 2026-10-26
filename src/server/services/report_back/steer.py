@@ -30,10 +30,13 @@ whose eligibility cannot be read right now. A task report nothing is owed for
 any more is closed without a word, as the executor would drop it.
 
 A market-watch target's notice (``market_target``) takes the same road, as
-an alert the reader is shown as its own row (``market_targets/inline.py``).
-Every close of one it was read for stamps the target delivered first. One
-whose own wake turn was admitted is not left to its executor: it is stamped
-to that turn and closed.
+an alert the reader is shown as its own row (``market_targets/inline.py``),
+and so does a wakeup's (``wakeup``, ``wakeups/inline.py``). Every close of
+one it was read for stamps the notice delivered first. One whose own wake
+turn was admitted is not left to its executor: it is stamped to that turn
+and closed. Each is read once more after the hold, so one that stopped
+being owed in between (delivered elsewhere, or a wakeup a cancel ended
+outright) is closed rather than shown.
 """
 
 from __future__ import annotations
@@ -43,9 +46,28 @@ import logging
 from collections.abc import Sequence
 
 from ptc_agent.agent.middleware.steering import ALL_KINDS, SteeredReport
+from src.server.services.market_targets import inline as market_inline
 from src.server.services.report_back.notify_turn import NotOwed
+from src.server.services.wakeups import inline as wakeup_inline
 
 logger = logging.getLogger(__name__)
+
+# Each alert type's two steps on this road, by hook type: what its job
+# offers a live turn, and the delivery stamp ahead of the confirm. Resolved
+# at call time, so a patched module attribute is the one called.
+_ALERT_OFFERS = {
+    "market_target": lambda job: market_inline.market_alert_offer(job),
+    "wakeup": lambda job: wakeup_inline.wakeup_offer(job),
+}
+_ALERT_STAMPS = {
+    "market_target": lambda jobs, run_id: market_inline.stamp_held_alerts(jobs, run_id),
+    "wakeup": lambda jobs, run_id: wakeup_inline.stamp_held_wakeups(jobs, run_id),
+}
+# The block each group of reports a turn takes in together reads as, by the
+# kind its offers carry.
+_GROUP_BLOCKS = {
+    "wakeup": lambda contents: wakeup_inline.inline_block(contents),
+}
 
 
 class SteeredReportInbox:
@@ -61,6 +83,10 @@ class SteeredReportInbox:
         reports = await self._take_reports(thread_id, run_id) if "report" in kinds else []
         steers = await _take_steers(thread_id, run_id) if "steer" in kinds else []
         return reports + steers
+
+    def render_group(self, kind: str, contents: list[str]) -> str:
+        """The one block the reports of ``kind`` one model call takes in read as."""
+        return _GROUP_BLOCKS[kind](contents)
 
     async def _take_reports(self, thread_id: str, run_id: str) -> list[SteeredReport]:
         from src.server.database.runs import outbox as outbox_db
@@ -101,6 +127,9 @@ class SteeredReportInbox:
         held -= await _overtaken_since_read(
             [job for job in jobs if str(job["hook_outbox_id"]) in held], run_id
         )
+        held -= await _alerts_settled_since_read(
+            [job for job in jobs if str(job["hook_outbox_id"]) in held], run_id
+        )
         closed: list[str] = []
         try:
             closed = await outbox_db.close_unowed_report_jobs(unowed)
@@ -131,11 +160,20 @@ class SteeredReportInbox:
         them has begun: the graph checkpoints each step before the next
         starts, so the message carrying them is durable. A failure here
         repeats a row when the turn ends (a steer as the next turn's input, a
-        report as its own turn), never loses it."""
+        report as its own turn), never loses it. So does a failed delivery
+        stamp: the rows stay held, for the turn's ending to stamp and confirm
+        against its checkpoint."""
         from src.server.database.runs import outbox as outbox_db
-        from src.server.services.market_targets.inline import stamp_held_alerts
 
-        await stamp_held_alerts(job_ids, run_id)
+        try:
+            await _stamp_held_notices(job_ids, run_id)
+        except Exception:
+            logger.warning(
+                f"[REPORT_STEER] Stamping the notices run {run_id} holds failed; "
+                f"leaving {job_ids} held",
+                exc_info=True,
+            )
+            return
         try:
             closed = await outbox_db.confirm_jobs(job_ids, owner=("run", run_id))
         except Exception:
@@ -369,18 +407,58 @@ async def _overtaken_since_read(held: list[dict], run_id: str) -> set[str]:
     return set(given_back)
 
 
+async def _alerts_settled_since_read(held: list[dict], run_id: str) -> set[str]:
+    """The held alerts closed because they stopped being owed between the
+    offer's read and the hold: a delivery elsewhere, a target that moved on,
+    or a cancel that ends a wakeup outright (an archive, a workspace
+    delete). A cancel the user makes is decided against the hold itself
+    (the notice is too late once held), so it never reaches here. A failed
+    read leaves them held, to be shown as read."""
+    from src.server.database.runs import outbox as outbox_db
+
+    alerts = [
+        str(job["hook_outbox_id"]) for job in held if job["hook_type"] in _ALERT_OFFERS
+    ]
+    if not alerts:
+        return set()
+    try:
+        closed = set(await outbox_db.close_unowed_held_alerts(alerts, run_id))
+    except Exception:
+        logger.warning(
+            f"[REPORT_STEER] Re-reading held alerts {alerts} failed",
+            exc_info=True,
+        )
+        return set()
+    if closed:
+        logger.info(
+            f"[REPORT_STEER] Run {run_id} closed {len(closed)} alert(s) "
+            f"settled since its read"
+        )
+    return closed
+
+
+async def _stamp_held_notices(job_ids: list[str], run_id: str) -> None:
+    """Stamp the alerts among ``job_ids`` delivered to ``run_id`` ahead of
+    the confirm that closes them, each by its own type. Raises when the read
+    fails, or a stamp its type will not close without."""
+    from src.server.database.runs import outbox as outbox_db
+
+    by_type: dict[str, list[dict]] = {}
+    for job in await outbox_db.held_alert_jobs(job_ids, run_id):
+        by_type.setdefault(job["hook_type"], []).append(job)
+    for hook_type, jobs in by_type.items():
+        await _ALERT_STAMPS[hook_type](jobs, run_id)
+
+
 async def _decide(job: dict, thread_id: str) -> SteeredReport | NotOwed | None:
     """The report to steer, ``NotOwed`` to close it, or None to leave it to
     its executor (as is any job whose read fails)."""
     try:
         if job["hook_type"] == "task_report_back":
             return await _task_offer(job)
-        if job["hook_type"] == "market_target":
-            from src.server.services.market_targets.inline import (
-                market_alert_offer,
-            )
-
-            return await market_alert_offer(job)
+        offer = _ALERT_OFFERS.get(job["hook_type"])
+        if offer is not None:
+            return await offer(job)
         return await _analyst_offer(job, thread_id)
     except Exception:
         logger.warning(
@@ -411,7 +489,7 @@ async def _task_offer(job: dict) -> SteeredReport | NotOwed | None:
     return SteeredReport(
         job_id=job_id,
         content=verdict.message(steered=True),
-        report_source=verdict.report.model_dump(exclude_none=True),
+        shown={"report_source": verdict.report.model_dump(exclude_none=True)},
     )
 
 
@@ -488,7 +566,7 @@ async def _analyst_offer(job: dict, thread_id: str) -> SteeredReport | None:
     return SteeredReport(
         job_id=job_id,
         content=content,
-        report_source=report_source.model_dump(exclude_none=True),
+        shown={"report_source": report_source.model_dump(exclude_none=True)},
     )
 
 
@@ -571,9 +649,7 @@ async def _confirm_found(held: list[str], state, owner: tuple[str, str]) -> list
     if not ids:
         return []
     if owner[0] == "run":
-        from src.server.services.market_targets.inline import stamp_held_alerts
-
-        await stamp_held_alerts(ids, owner[1])
+        await _stamp_held_notices(ids, owner[1])
     closed = await outbox_db.confirm_jobs(ids, owner=owner)
     if closed:
         logger.info(

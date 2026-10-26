@@ -1,5 +1,6 @@
 """What every worker knows of the market-data token each computer's sandbox
-holds: when it runs out and which sandbox took it, never the token itself."""
+holds: when it runs out and which sandbox took it, never the token itself;
+and of a revocation of its tokens the platform has yet to confirm."""
 
 from __future__ import annotations
 
@@ -15,10 +16,10 @@ from src.server.database.sql_fences import FENCE_BINDABLE
 
 @dataclass(frozen=True)
 class DataTokenRow:
-    #: When the token in the sandbox runs out; None with none, or revoked.
+    #: When the last token saved runs out; None with none, or after a stop.
     expires_at: datetime | None = None
     #: The sandbox that took it: None until a write lands, since one can fail
-    #: after its mint.
+    #: after its mint, and again once a revocation may have ended it.
     held_by: str | None = None
     #: What a save names to replace this row; 0 with no row.
     generation: int = 0
@@ -64,6 +65,10 @@ async def save(
     the sandbox one that read it before a rebuild or a tier move: its token
     would go to a sandbox the computer has left and stay good there until it
     runs out.
+
+    The row also keeps when the last token saved since the previous stop runs
+    out, what the next stop owes a revocation until: a shorter configured
+    lifetime puts the newest token's expiry before an older one's.
     """
     async with get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
@@ -78,13 +83,16 @@ async def save(
                 ),
                 saved AS (
                     INSERT INTO computer_data_tokens AS t
-                        (computer_id, user_id, expires_at, held_by, generation,
-                         updated_at)
-                    SELECT computer_id, user_id, %(expires_at)s, NULL,
-                           %(generation)s + 1, NOW()
+                        (computer_id, user_id, expires_at, tokens_until, held_by,
+                         generation, updated_at)
+                    SELECT computer_id, user_id, %(expires_at)s, %(expires_at)s,
+                           NULL, %(generation)s + 1, NOW()
                     FROM serving
                     ON CONFLICT (computer_id) DO UPDATE
                         SET expires_at = EXCLUDED.expires_at, held_by = NULL,
+                            tokens_until = GREATEST(
+                                t.tokens_until, t.expires_at, EXCLUDED.expires_at
+                            ),
                             user_id = EXCLUDED.user_id,
                             generation = t.generation + 1, updated_at = NOW()
                         WHERE t.generation = %(generation)s
@@ -117,35 +125,198 @@ async def mark_held(computer_id: str, generation: int, sandbox_id: str | None) -
         return cur.rowcount > 0
 
 
-async def revoke(computer_id: str) -> list[str]:
+@dataclass(frozen=True)
+class Revocation:
+    """A revocation to send to the platform, and the row it settles."""
+
+    computer_id: str
+    #: Whose tokens to revoke, as recorded with what is owed: the platform keys
+    #: a revocation by user and computer, and the computer may have changed
+    #: hands since a token was minted.
+    users: tuple[str, ...]
+    #: The row's generation when it was read, before the request is sent:
+    #: every tombstone up to it is covered by the platform's answer.
+    generation: int
+
+
+def _users(*user_ids: Any) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(str(u) for u in user_ids if u))
+
+
+async def revoke(computer_id: str) -> Revocation | None:
     """Leave the row with no token and a new generation, inserting it if the
-    computer has none, and answer whose tokens to revoke at the platform.
+    computer has none, record the revocation as owed until the last token it
+    covers runs out, and answer what to send the platform.
 
     Kept rather than deleted, so a mint in flight across the revoke finds the
     generation it read gone; nothing remains to revoke when the computer row
-    itself is gone, since the cascade took this one with it.
+    itself is gone, since the cascade took this one with it. The owed one runs
+    until the last token saved since the previous stop runs out, a bound it
+    clears for the next stop, so a stop recorded while an earlier one is still
+    owed keeps the later of the two, and the users of both.
     """
     async with get_db_connection() as conn:
-        cur = await conn.execute(
-            """
-            WITH tomb AS (
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
                 INSERT INTO computer_data_tokens AS t
                     (computer_id, user_id, expires_at, held_by, generation,
+                     revoke_generation, revoke_users, revoke_attempted_at,
                      updated_at)
-                SELECT computer_id, user_id, NULL, NULL, 1, NOW()
+                SELECT computer_id, user_id, NULL, NULL, 1, 1,
+                       ARRAY[user_id]::text[], NOW(), NOW()
                 FROM computers WHERE computer_id = %(computer_id)s
                 ON CONFLICT (computer_id) DO UPDATE
-                    SET expires_at = NULL, held_by = NULL,
-                        generation = t.generation + 1, updated_at = NOW()
-                RETURNING user_id
+                    SET expires_at = NULL, held_by = NULL, tokens_until = NULL,
+                        generation = t.generation + 1,
+                        revoke_until = GREATEST(
+                            t.revoke_until, t.tokens_until, t.expires_at
+                        ),
+                        revoke_generation = t.generation + 1,
+                        -- The row's user and the computer's, which differ
+                        -- until a save after the computer changes hands.
+                        revoke_users = ARRAY(
+                            SELECT DISTINCT u FROM unnest(
+                                CASE WHEN t.revoke_until > NOW()
+                                     THEN t.revoke_users END
+                                || ARRAY[t.user_id, EXCLUDED.user_id]::text[]
+                            ) AS u
+                        ),
+                        -- This revoke sends it next, so the sweep leaves
+                        -- it a retry interval before sending it again.
+                        revoke_attempted_at = NOW(),
+                        updated_at = NOW()
+                RETURNING generation, revoke_users
+                """,
+                {"computer_id": computer_id},
             )
-            SELECT user_id FROM tomb
-            UNION
-            SELECT user_id FROM computers WHERE computer_id = %(computer_id)s
-            """,
-            {"computer_id": computer_id},
+            row = await cur.fetchone()
+    if row is None:
+        return None
+    return Revocation(
+        computer_id, _users(*row["revoke_users"]), int(row["generation"])
+    )
+
+
+async def revoked(revocation: Revocation, users: tuple[str, ...]) -> bool:
+    """Record that the platform confirmed ``revocation`` for ``users``, and
+    answer whether the computer is in service, so its sandbox may have lost a
+    live token.
+
+    Only those users leave what is owed, which ends once none is left; what a
+    stop recorded while the request was in flight owes stays whole. The
+    platform refuses every token of theirs issued before it handled the
+    request, which can include the one the sandbox holds, minted after the
+    tombstone by a start that read it. So whatever the row records stops
+    counting as held, and the generation moves: a push that read the row
+    before this point minted a token that may be refused already, and its save
+    or hold now misses. A push that reads the row after this point mints after
+    the revocation, which spares its token. The expiries stay, the bound on
+    what a later stop owes. What the sandbox is owed comes first in the
+    sweep's next pass.
+    """
+    async with get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                WITH owed AS (
+                    SELECT computer_id,
+                           CASE WHEN COALESCE(revoke_generation, 0) <= %(generation)s
+                                THEN ARRAY(SELECT u FROM unnest(revoke_users) AS u
+                                           WHERE u <> ALL(%(users)s::text[]))
+                                ELSE revoke_users END AS users
+                    FROM computer_data_tokens
+                    WHERE computer_id = %(computer_id)s
+                    FOR UPDATE
+                ),
+                confirmed AS (
+                    UPDATE computer_data_tokens AS t
+                    SET revoke_users = NULLIF(owed.users, '{}'),
+                        revoke_until = CASE WHEN cardinality(owed.users) > 0
+                                            THEN t.revoke_until END,
+                        held_by = NULL, attempted_at = NULL,
+                        generation = t.generation + 1, updated_at = NOW()
+                    FROM owed
+                    WHERE t.computer_id = owed.computer_id
+                    RETURNING t.computer_id
+                )
+                SELECT EXISTS (
+                    SELECT 1 FROM confirmed JOIN computers c USING (computer_id)
+                    WHERE c.status IN ('starting', 'running')
+                      AND c.provider_ref IS NOT NULL
+                ) AS in_service
+                """,
+                {
+                    "computer_id": revocation.computer_id,
+                    "generation": revocation.generation,
+                    "users": list(users),
+                },
+            )
+            row = await cur.fetchone()
+    return bool(row and row["in_service"])
+
+
+async def claim_revocations(*, retry_after: timedelta, limit: int) -> list[Revocation]:
+    """Take up to ``limit`` revocations still owed, the longest unsent first,
+    marking each sent so that no worker takes it again for ``retry_after``.
+
+    One whose last token has run out is no longer owed: the platform refuses
+    every token it covers on expiry alone.
+    """
+    async with get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                WITH due AS (
+                    SELECT computer_id FROM computer_data_tokens
+                    WHERE revoke_until > NOW()
+                      AND (revoke_attempted_at IS NULL
+                           OR revoke_attempted_at < NOW() - %(retry_after)s)
+                    ORDER BY revoke_attempted_at ASC NULLS FIRST, computer_id
+                    LIMIT %(limit)s
+                )
+                UPDATE computer_data_tokens AS t
+                SET revoke_attempted_at = NOW()
+                FROM due
+                WHERE t.computer_id = due.computer_id
+                  -- Again on the locked row: a sibling's claim since the
+                  -- listing has already taken it.
+                  AND t.revoke_until > NOW()
+                  AND (t.revoke_attempted_at IS NULL
+                       OR t.revoke_attempted_at < NOW() - %(retry_after)s)
+                RETURNING t.computer_id, t.generation, t.revoke_users
+                """,
+                {"retry_after": retry_after, "limit": limit},
+            )
+            rows = await cur.fetchall()
+    return [
+        Revocation(
+            str(row["computer_id"]),
+            _users(*row["revoke_users"]),
+            int(row["generation"]),
         )
-        return [str(row[0]) for row in await cur.fetchall() if row[0]]
+        for row in rows
+    ]
+
+
+async def load_in_service(computer_id: str) -> dict[str, Any] | None:
+    """The computer as ``claim_due`` lists it, with its status, while it is
+    starting or running on a sandbox; None otherwise."""
+    async with get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT computer_id, user_id, provider_ref, kind, provider_config,
+                       root_dir, is_always_on, status,
+                       COALESCE(last_activity_at, updated_at) AS last_activity
+                FROM computers
+                WHERE computer_id = %s AND status IN ('starting', 'running')
+                  AND provider_ref IS NOT NULL
+                """,
+                (computer_id,),
+            )
+            row = await cur.fetchone()
+    return dict(row) if row else None
 
 
 async def claim_due(

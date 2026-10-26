@@ -27,16 +27,20 @@ export function RowNote({
   tone?: 'muted' | 'warning';
   children: React.ReactNode;
 }) {
+  // The glyph sits in a box one line tall, so a note that wraps in a narrow
+  // row keeps it beside its first line, the rest hanging under the text.
   return (
     <span
       id={id}
-      className="inline-flex items-center gap-1 text-[0.6875rem]"
+      className="inline-flex items-start gap-1 text-[0.6875rem] text-pretty"
       style={{
         color:
           tone === 'warning' ? 'var(--color-warning)' : 'var(--color-text-tertiary)',
       }}
     >
-      <Icon className="h-3 w-3 shrink-0" />
+      <span className="flex h-[1lh] shrink-0 items-center">
+        <Icon className="h-3 w-3" />
+      </span>
       {children}
     </span>
   );

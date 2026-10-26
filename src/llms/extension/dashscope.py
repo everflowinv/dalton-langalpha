@@ -44,8 +44,9 @@ _in_dashscope_stream: contextvars.ContextVar[bool] = contextvars.ContextVar(
 )
 
 # While a Codex stream is advanced, its function calls still owed their
-# arguments, by item id, each with the content index upstream gave it; None
-# outside one. One dict per stream, so no id is ever compared across streams.
+# arguments, by item id, each with the content and output indexes upstream gave
+# it; None outside one. One dict per stream, so no id is ever compared across
+# streams.
 _codex_pending_calls: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
     "codex_pending_calls", default=None
 )
@@ -315,30 +316,34 @@ def _install_responses_stream_bridge() -> None:
         carried when it was added, so a call that got either is never owed:
         replaying its ``.done`` would double them, in the tool call and in the
         item sent back next turn. An owed call's ``.done`` is replayed as the one
-        delta upstream reads, at the content index the call was given when
-        added, since upstream would otherwise number it by the latest call and
-        a ``.done`` arriving after a later call's ``added`` would land on that
-        one. The running indexes go back unchanged, as a real delta for that
-        call would leave them.
+        delta upstream reads, at the content and output indexes the call was
+        given when added, since upstream would otherwise number it by the latest
+        call and a ``.done`` arriving after a later call's ``added`` would land on
+        that one. The output index is the one upstream settled on for the
+        ``added``, not the ``.done``'s own: the API can report a later one on the
+        ``.done``, and langchain-openai 1.7 pins each item to its first. The
+        running indexes go back unchanged, as a real delta for that call would
+        leave them.
         """
         chunk_type = chunk.type
         if chunk_type == "response.output_item.added":
             result = original_fn(chunk, *args, **kwargs)
             item = chunk.item
             if getattr(item, "type", None) == "function_call" and not item.arguments:
-                pending[item.id] = result[0]
+                pending[item.id] = (result[0], result[1])
             return result
         if chunk_type == "response.function_call_arguments.delta":
             pending.pop(chunk.item_id, None)
         elif chunk_type == "response.function_call_arguments.done":
-            index = pending.pop(chunk.item_id, None)
-            if index is not None and chunk.arguments and len(args) >= 3:
+            owed = pending.pop(chunk.item_id, None)
+            if owed is not None and chunk.arguments and len(args) >= 3:
+                index, output_index = owed
                 try:
                     delta = ResponseFunctionCallArgumentsDeltaEvent(
                         type="response.function_call_arguments.delta",
                         delta=chunk.arguments,
                         item_id=chunk.item_id,
-                        output_index=chunk.output_index,
+                        output_index=output_index,
                         sequence_number=chunk.sequence_number,
                     )
                 except Exception as e:
@@ -352,7 +357,7 @@ def _install_responses_stream_bridge() -> None:
                 else:
                     current = args[:3]
                     *_, generation = original_fn(
-                        delta, index, chunk.output_index, *args[2:], **kwargs
+                        delta, index, output_index, *args[2:], **kwargs
                     )
                     return (*current, generation)
         return original_fn(chunk, *args, **kwargs)

@@ -49,8 +49,15 @@ def build_lifecycle_event(
     title: Optional[str] = None,
     pinned: Optional[bool] = None,
     updated_at: Optional[str] = None,
+    last_seen_run_seq: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """The one wire shape (plan v6 §2.2). ``status`` is PUBLIC vocabulary."""
+    """The one wire shape (plan v6 §2.2). ``status`` is PUBLIC vocabulary.
+
+    ``last_seen_run_seq`` is the seen pointer a settle carried over its run:
+    a wakeup's check that ended without a reply and changed nothing, on a
+    thread with nothing unseen before it. The client takes it as it takes
+    any seen pointer, so the settle leaves no unseen dot.
+    """
     event: Dict[str, Any] = {
         "v": EVENT_VERSION,
         "type": type,
@@ -67,6 +74,8 @@ def build_lifecycle_event(
         event["pinned"] = pinned
     if updated_at is not None:
         event["updated_at"] = updated_at
+    if last_seen_run_seq is not None:
+        event["last_seen_run_seq"] = last_seen_run_seq
     return event
 
 
@@ -189,6 +198,27 @@ async def publish_thread_subagents(
     await publish_user_event(user_id, event)
 
 
+async def publish_thread_tuning(
+    *,
+    user_id: Optional[str],
+    thread_id: str,
+    workspace_id: Optional[str],
+    reasoning_effort: Optional[str],
+    fast_mode: Optional[bool],
+) -> None:
+    """Tuning hint: a thread's effort and fast mode live only on its row, so a
+    tab with the thread open learns of a pick made in another one only from
+    this event or its next read of the thread. A stale tab would otherwise
+    send the level it still shows."""
+    event = build_lifecycle_event(
+        type="thread_tuning", thread_id=thread_id, workspace_id=workspace_id
+    )
+    # Always present: null is the thread following the user's Settings.
+    event["reasoning_effort"] = reasoning_effort
+    event["fast_mode"] = fast_mode
+    await publish_user_event(user_id, event)
+
+
 async def publish_thread_deleted(
     *,
     user_id: Optional[str],
@@ -303,6 +333,7 @@ async def _exec_user_feed(job: Dict[str, Any]) -> None:
             run_seq=payload.get("run_seq"),
             status=payload.get("status"),
             interrupt_reason=payload.get("interrupt_reason"),
+            last_seen_run_seq=payload.get("last_seen_run_seq"),
         ),
     )
 

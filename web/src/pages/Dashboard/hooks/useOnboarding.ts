@@ -41,26 +41,25 @@ export function subscribePersonalizationSnooze(callback: () => void): () => void
 }
 
 /**
- * Whether to show the optional "Personalize your experience" banner: the user
- * has not completed personalization and has not snoozed it in the last 24
- * hours. Starting it is `useStartOnboarding`'s.
+ * Whether to show the banner offering the welcome flow: the user has not saved
+ * an investing profile and has not snoozed the offer in the last 24 hours.
  */
 export function useOnboarding(): PersonalizationResult {
     const { user: authUser } = useUser() as {
         user: {
             onboarding_completed?: boolean;
-            personalization_completed?: boolean;
             [key: string]: unknown;
         } | null;
     };
 
     const [showPersonalizationBanner, setShowPersonalizationBanner] = useState(false);
 
-    // Check personalization / onboarding completion reactively from user data
+    // Check onboarding completion reactively from user data. Not
+    // `personalization_completed`, which says the user has a key of their own
+    // and nothing about a profile.
     useEffect(() => {
         if (!authUser) return;
-        // Treat either flag as "completed" for backward compatibility
-        if (authUser.personalization_completed === true || authUser.onboarding_completed === true) {
+        if (authUser.onboarding_completed === true) {
             setShowPersonalizationBanner(false);
             return;
         }

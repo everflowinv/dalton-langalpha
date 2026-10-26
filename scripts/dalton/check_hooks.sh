@@ -93,7 +93,6 @@ ALLOWED_HOOKS=(
   "bridge-admin-token"
   "hide-trading"
   "dalton-notify"
-  "glob-brace-expansion"
   "user-coverage"
   "multi-file-upload"
   "invite-signup"

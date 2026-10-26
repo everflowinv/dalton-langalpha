@@ -27,6 +27,11 @@ from src.config.settings import (
     get_locale_config,
 )
 from src.observability.langsmith_tracer import with_run_tracer
+from src.server.contracts.turn_kinds import (
+    ANNOUNCED_KEYS,
+    NOTIFICATION_QUERY_TYPES,
+    WAKE_QUERY_TYPE,
+)
 from src.server.database import conversation as qr_db
 from src.server.database.conversation.threads_write import remember_thread_llm_model
 from src.server.services.llm.thread_model import NamedModel
@@ -263,21 +268,21 @@ def provenance_metadata(request: ChatRequest) -> dict[str, Any]:
     raw surface string, the client deciding which values it labels, and the
     request's own rather than :func:`turn_surface`'s, which gives a
     report-back the thread's channel although nobody sent it from there; and
-    ``report_source`` names what a report-back turn announces, since that
-    turn's own message is model-facing and hidden, as ``market_target`` names
-    the notices a target's wake announces.
+    the ``ANNOUNCED_KEYS`` name what a notification turn announces, since its
+    own message is model-facing and hidden: ``report_source`` a report-back's
+    report, ``market_target`` and ``wakeup`` a wake's notices.
     """
     metadata: dict[str, Any] = {}
     if request.origin:
         metadata["origin"] = request.origin.model_dump(exclude_none=True)
     if request.platform:
         metadata["platform"] = request.platform
-    if request.report_source:
-        metadata["report_source"] = request.report_source.model_dump(
-            exclude_none=True
-        )
-    if request.market_target:
-        metadata["market_target"] = request.market_target
+    for key in ANNOUNCED_KEYS:
+        value = getattr(request, key)
+        if value and not isinstance(value, dict):
+            value = value.model_dump(exclude_none=True)
+        if value:
+            metadata[key] = value
     return metadata
 
 
@@ -557,15 +562,15 @@ def build_turn_context(
 
 def is_notification_turn(request: ChatRequest) -> bool:
     """Whether this server posted the turn itself, to report finished background
-    work or a market target's notice.
+    work, a market target's notice or a wakeup that fired.
 
     A report-back arrives as a system query with no surface of its own, and a
-    target's wake as a ``market_target`` query. Nobody sent either, so it
-    speaks where the thread's last turn did rather than naming a surface.
+    wake as a ``market_target`` or ``wakeup`` query. Nobody sent any of them,
+    so it speaks where the thread's last turn did rather than naming a surface.
     ``query_type`` is stripped from every request that is not the server's own
     (``threads/messaging.py``), so a client cannot claim one.
     """
-    return request.query_type in ("system", "market_target") and not request.platform
+    return request.query_type in NOTIFICATION_QUERY_TYPES and not request.platform
 
 
 def turn_surface(request: ChatRequest, prior: PriorThread) -> Optional[str]:
@@ -858,6 +863,9 @@ def build_graph_config(
         "timezone": timezone_str,
         "run_id": run_id,
         "platform": surface,
+        # Only a turn a wakeup started may end without a reply. The type is
+        # server-only, so no client can claim it.
+        "wake_turn": request.query_type == WAKE_QUERY_TYPE,
     }
     if extra_configurable:
         configurable.update(extra_configurable)

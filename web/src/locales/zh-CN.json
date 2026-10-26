@@ -30,6 +30,8 @@
     "back": "返回",
     "done": "完成",
     "failed": "失败",
+    "language": "语言",
+    "languageCurrent": "语言：{{language}}",
     "optional": "（可选）"
   },
   "auth": {
@@ -296,7 +298,7 @@
     "logoutConfirmMsg": "确定要退出登录吗？",
     "timezone": "时区",
     "selectTimezone": "选择时区...",
-    "preferencesDesc": "偏好设置通过与 Agent 对话来管理。点击下方按钮进行更新。",
+    "preferencesDesc": "也可以在任意对话中让 Agent 修改这些设置。",
     "noPreferencesYet": "暂无偏好设置。点击下方按钮进行设置。",
     "riskTolerance": "风险偏好",
     "investmentStyle": "投资风格",
@@ -311,10 +313,8 @@
     "resetPreferences": "重置偏好",
     "resetConfirmMsg": "这将清除您所有的偏好设置：风险偏好、投资风格、Agent 设置、默认模型及其他模型设置（自定义模型与服务商、快速切换模型、按模型设置），以及仪表盘布局。已有对话会继续使用各自的模型。您可以随时在设置中或通过 Agent 重新设置。确定吗？",
     "resetting": "重置中...",
-    "modifyWithAgent": "通过 Agent 修改",
-    "completeProfile": "完善个人资料",
-    "completeProfileDesc": "通过简短对话设置您的股票、风险偏好和其他偏好。",
-    "startOnboarding": "开始设置",
+    "completeProfile": "设置投资画像",
+    "completeProfileDesc": "回答几个问题，让 Agent 更了解你的投资习惯，提供更适合你的研究。",
     "defaultModel": "默认模型",
     "defaultModelDesc": "用于工作区对话（代码执行、沙箱）。",
     "defaultModelChange": {
@@ -541,6 +541,7 @@
     "xaiConnectTitle": "连接 xAI Grok（SuperGrok）"
   },
   "dashboard": {
+    "failedOnboarding": "设置失败，请重试。",
     "title": "{{brand}}",
     "searchPlaceholder": "搜索股票代码或公司名称...",
     "searching": "搜索中...",
@@ -550,12 +551,7 @@
     "prefIncompleteMsg": "您的偏好信息尚未完善。请完善偏好设置以获得最佳体验。",
     "ignoreFor24h": "24小时内忽略",
     "proceed": "继续",
-    "failedOnboarding": "设置失败，请重试。",
-    "failedPrefUpdate": "启动偏好更新失败，请重试。",
     "watchlist": "自选",
-    "personalizeTitle": "个性化您的体验",
-    "personalizeDesc": "与我们的 AI 助手交流，自定义您的关注列表、风险偏好和提醒",
-    "personalize": "个性化",
     "layoutToggle": {
       "groupAria": "仪表板布局",
       "classic": "经典",
@@ -1679,6 +1675,8 @@
       "subagentsOn": "子 Agent 已开启",
       "subagentsOff": "子 Agent 已关闭",
       "subagentsFailed": "无法更改此对话的子 Agent 设置",
+      "effortFailed": "无法更改此对话的推理强度",
+      "fastModeFailed": "无法更改此对话的速度",
       "watch": "盯盘",
       "watchOn": "盯盘已开启",
       "watchOff": "盯盘已关闭",
@@ -1914,17 +1912,6 @@
       "panelUpdated": "更新于 {{time}}",
       "panelWaiting": "Agent 工作时，实时价格将显示在这里。",
       "panelEmpty": "当前没有正在监控的股票。",
-      "targetsTitle": "价格目标",
-      "targetArmed": "监控中",
-      "targetExpires": "监控中 · {{when}}到期",
-      "targetHit": "已触发",
-      "targetHitAt": "已触发 · {{detail}}",
-      "targetExpired": "已过期",
-      "targetCancelled": "已取消",
-      "cancelTarget": "取消",
-      "cancellingTarget": "正在取消…",
-      "cancelTargetLabel": "取消 {{symbol}} {{condition}} 的价格目标",
-      "cancelTargetFailed": "无法取消此目标，请重试。",
       "pctFromClose": "较前收盘价 {{move}}",
       "pctFromPrice": "较 {{price}} {{move}}",
       "pctFromSet": "较设置时 {{move}}"
@@ -1941,6 +1928,53 @@
       "woke": "价格提醒唤醒了 Agent：{{alert}}",
       "wokeGeneric": "价格提醒唤醒了 Agent",
       "generic": "价格提醒"
+    },
+    "wakeups": {
+      "chip_one": "1 个唤醒 · {{time}}",
+      "chip_other": "{{count}} 个唤醒 · 下次 {{time}}",
+      "chipTitle": "Agent 在此对话中设置的唤醒，点开即可取消。",
+      "panelTitle": "唤醒",
+      "panelEmpty": "此对话暂无唤醒。",
+      "cancel": "取消",
+      "cancelAll": "全部取消",
+      "cancelling": "正在取消…",
+      "cancelLabel": "取消唤醒：{{label}}",
+      "cancelFailed": "无法取消此唤醒，请重试。",
+      "cancelTooLate": "已送达 Agent，可点击停止结束本轮。",
+      "rowTitle": "{{label}}",
+      "labelAt": "{{time}}",
+      "labelRepeat": "{{schedule}}",
+      "labelRepeatZone": "{{schedule}} · {{zone}}时间",
+      "labelOrder": "订单成交或结束 · {{order}}",
+      "stateNext": "下次 {{time}}",
+      "stateProgress": "已检查 {{done}}/{{total}} 次 · 下次 {{time}}",
+      "stateLapses": "等待中 · {{when}}失效",
+      "stateHeld": "已触发 · 本轮结束后送达",
+      "stateHeldUsage": "已触发 · 已达用量上限，将在你发送下一条消息时送达",
+      "stateFired": "已触发 · {{time}}",
+      "stateFinished": "已结束",
+      "stateLapsed": "已失效",
+      "stateExpired": "已过期",
+      "stateCancelled": "已取消",
+      "woke": "已唤醒 Agent：{{labels}}",
+      "wokeOrder": "订单更新唤醒了 Agent：{{label}}",
+      "arrived": "唤醒：{{label}}",
+      "check": "第 {{n}}/{{total}} 次检查",
+      "orderFilled": "{{order}} 已成交，均价 {{price}}",
+      "orderPartial": "{{order}} 部分成交 {{filled}}/{{qty}}",
+      "orderCancelled": "{{order}} 已取消",
+      "orderRejected": "{{order}} 被拒绝",
+      "quiet_one": "1 次检查 · 无新情况 · {{time}}",
+      "quiet_other": "{{count}} 次检查 · 无新情况 · 最近一次 {{time}}",
+      "quietEntry": "{{time}} · {{labels}} · {{status}}",
+      "chip_one_untimed": "1 个唤醒",
+      "chip_other_untimed": "{{count}} 个唤醒",
+      "settingWakeups": "设置唤醒中...",
+      "cancellingWakeups": "取消唤醒中...",
+      "checkingWakeups": "查看唤醒中...",
+      "endingQuietly": "结束检查中...",
+      "orderPartialCancelled": "{{order}} 部分成交 {{filled}}/{{qty}} 后取消",
+      "orderFailed": "{{order}} 失败"
     },
     "missingWorkspaceOrThread": "缺少工作区或对话信息",
     "accessDeniedTitle": "你没有权限查看此对话",
@@ -2969,7 +3003,8 @@
       "preference": "偏好",
       "user": "账号",
       "sendMessage": "发送消息",
-      "messageTargets": "发送目标"
+      "messageTargets": "发送目标",
+      "scheduleWakeup": "唤醒"
     },
     "completed": {
       "activatedSkill": "已激活技能",
@@ -3238,56 +3273,69 @@
   "setup": {
     "capabilities": "能力",
     "importParentModels": "同时添加这些模型",
-    "importParentModelsDesc": "来自父级目录的模型，通过您的端点和密钥路由。取消勾选不需要的模型。",
+    "importParentModelsDesc": "来自父级目录的模型，通过你的端点和密钥路由。取消勾选不需要的模型。",
     "selectNone": "全不选",
     "fetchingModels": "正在获取模型…",
-    "selectModelsDesc": "选择您服务器上可用的模型。",
+    "selectModelsDesc": "选择你服务器上可用的模型。",
     "availableModels": "可用模型",
-    "noModelsFound": "未找到模型。请确认您的服务器正在运行且已加载模型。",
-    "brandedHeader": "配置您的 LLM 提供商",
-    "securityNote": "您的 API 密钥已加密且不会被共享",
-    "methodTitle": "您想如何连接？",
-    "methodSubtitle": "选择访问 AI 模型的方式。您可以稍后添加更多提供商。",
-    "methodOAuth": "使用您的 Claude / GPT 订阅",
-    "methodOAuthDesc": "通过 OAuth 连接，无需 API 密钥。",
+    "noModelsFound": "未找到模型。请确认你的服务器正在运行且已加载模型。",
+    "brandedHeader": "配置你的 LLM 提供商",
+    "securityNote": "你的 API 密钥已加密且不会被共享",
+    "methodTitle": "你想如何连接？",
+    "methodSubtitle": "选择访问 AI 模型的方式。你可以稍后添加更多提供商。",
+    "methodOAuth": "使用你的 Claude 或 ChatGPT 订阅",
+    "methodOAuthDesc": "登录你的账户即可，无需 API 密钥。",
     "methodCodingPlan": "我有编程计划",
     "methodCodingPlanDesc": "智谱 AI、MiniMax、通义千问、Moonshot 等。",
     "methodApiKey": "我有 API 密钥",
     "methodApiKeyDesc": "按使用量付费。",
     "methodLocal": "我在本地运行模型",
     "methodLocalDesc": "Ollama、LM Studio、vLLM 或其他本地推理服务器。",
-    "providerTitle": "选择您的提供商",
+    "providerTitle": "选择你的提供商",
     "connectTitle": "连接 {{provider}}",
     "connectWith": "连接 {{provider}}",
     "modelsTitle": "选择快速访问模型",
     "addAnotherProvider": "添加另一个提供商？",
-    "addAnotherDescription": "您可以连接多个提供商以获取更多模型选择。",
+    "addAnotherDescription": "你可以连接多个提供商以获取更多模型选择。",
     "continueToDefaults": "继续设置默认值",
-    "defaultsTitle": "设置您的默认模型",
-    "defaultsSubtitle": "选择驱动您研究的模型",
+    "defaultsTitle": "设置你的默认模型",
+    "defaultsSubtitle": "选择驱动你研究的模型",
     "doneTitle": "准备就绪！",
-    "doneSummary": "您的 AI 研究助手已配置完成，随时可用。",
+    "doneSummary": "你的 AI 研究助手已配置完成，随时可用。",
     "goToDashboard": "前往控制台",
-    "personalizeLink": "设置投资偏好",
+    "personalizeLink": "设置投资画像",
     "invitationCodeLink": "有邀请码？",
-    "invitationCodePlaceholder": "输入您的邀请码",
+    "invitationCodePlaceholder": "输入你的邀请码",
     "testButton": "测试",
     "testing": "测试中...",
     "testSuccess": "密钥有效！",
     "next": "下一步",
-    "back": "返回",
+    "back": "上一步",
     "saving": "保存中...",
     "continue": "继续",
-    "pasteKeyPlaceholder": "在此粘贴您的 API 密钥",
+    "pasteKeyPlaceholder": "在此粘贴你的 API 密钥",
     "baseUrlPlaceholder": "Base URL（可选）",
     "stepMethod": "方式",
     "stepProvider": "提供商",
     "stepModels": "模型",
     "stepReady": "完成",
+    "progressLabel": "设置进度",
     "exitSetup": "退出设置",
     "providersConnected": "已连接 {{count}} 个提供商",
     "providersConnected_one": "已连接 {{count}} 个提供商",
     "nextStep": "下一步",
+    "skipToModels": "直接选择模型",
+    "showKey": "显示 API 密钥",
+    "hideKey": "隐藏 API 密钥",
+    "keyAccepted": "密钥有效",
+    "modelsFound_other": "找到 {{count}} 个模型",
+    "testUnavailable": "此提供商不支持测试",
+    "testFailed": "测试请求失败",
+    "modalityText": "文本",
+    "modalityImage": "图片",
+    "modalityPdf": "PDF",
+    "errorAuthFailed": "授权失败，请重试。",
+    "errorFetchModels": "无法从提供商获取模型",
     "oauthBadge": "OAuth",
     "apiKeyBadge": "API 密钥",
     "codingPlanBadge": "Coding 计划",
@@ -3296,7 +3344,7 @@
     "removeProvider": "移除",
     "addAnotherProviderHeading": "添加其他提供商",
     "addMoreProviders": "连接其他提供商以获取更多模型选择。",
-    "invitationRedeemed": "邀请码已兑换。您可以配置模型或添加提供商。",
+    "invitationRedeemed": "邀请码已兑换。你可以配置模型或添加提供商。",
     "invitationCodeLabel": "邀请码",
     "redeeming": "兑换中...",
     "redeem": "兑换",
@@ -3304,12 +3352,12 @@
     "invitationErrorEmpty": "请输入邀请码。",
     "invitationErrorInvalid": "邀请码无效。",
     "invitationErrorExpired": "此邀请码已过期或已被完全使用。",
-    "invitationErrorRedeemed": "您已兑换过此邀请码。",
+    "invitationErrorRedeemed": "你已兑换过此邀请码。",
     "invitationErrorGeneric": "出了点问题，请重试。",
     "providerSubtitleOAuth": "选择要连接的订阅。",
-    "providerSubtitleCodingPlan": "选择您的编程计划提供商。",
-    "providerSubtitleApiKey": "选择您拥有 API 密钥的提供商。",
-    "providerSubtitleLocal": "选择您的本地推理服务器。",
+    "providerSubtitleCodingPlan": "选择你的编程计划提供商。",
+    "providerSubtitleApiKey": "选择你拥有 API 密钥的提供商。",
+    "providerSubtitleLocal": "选择你的本地推理服务器。",
     "noProviders": "此方式暂无可用提供商。",
     "localModels": "本地模型",
     "customProvider": "自定义提供商",
@@ -3323,13 +3371,13 @@
     "apiFormatGeneric": "{{sdk}} API",
     "apiFormatDefault": "API",
     "securityPrivacy": "安全与隐私",
-    "tokensEncrypted": "您的令牌已加密存储。我们仅在代您调用 API 时使用它们。",
-    "usageCountsClaude": "使用量将计入您的 Anthropic 订阅。您可以随时断开连接。",
-    "usageCountsOpenai": "使用量将计入您的 OpenAI 订阅。您可以随时断开连接。",
+    "tokensEncrypted": "你的令牌已加密存储。我们仅在代你调用 API 时使用它们。",
+    "usageCountsClaude": "使用量将计入你的 Anthropic 订阅。你可以随时断开连接。",
+    "usageCountsOpenai": "使用量将计入你的 OpenAI 订阅。你可以随时断开连接。",
     "copied": "已复制",
     "copy": "复制",
     "addModelTo": "为 {{provider}} 添加模型",
-    "addModelToDesc": "为您现有的自定义提供商添加模型。",
+    "addModelToDesc": "为你现有的自定义提供商添加模型。",
     "modelLabel": "模型",
     "modelDisplayNamePlaceholder": "显示名称（如 Llama 3.3 70B）",
     "modelIdPlaceholder": "模型 ID（如 meta-llama/Llama-3.3-70B）",
@@ -3342,8 +3390,8 @@
     "baseUrlLabel": "Base URL",
     "apiKeyLabel": "API 密钥",
     "customBaseUrlPlaceholder": "https://your-endpoint.com/v1",
-    "oauthCodexDesc": "使用设备码授权您的 ChatGPT 账户。",
-    "oauthClaudeDesc": "通过 OAuth 连接您的 Claude 订阅。",
+    "oauthCodexDesc": "使用设备码授权你的 ChatGPT 账户。",
+    "oauthClaudeDesc": "通过 OAuth 连接你的 Claude 订阅。",
     "oauthAntigravityDesc": "连接你的 Google Antigravity 订阅（Google One AI / Antigravity 套餐），使用其中的 Gemini、Claude 和 GPT-OSS 模型。",
     "antigravityStep1Title": "打开 Google 登录页",
     "antigravityStep1Desc": "点击下方按钮，会在新标签页打开 accounts.google.com。",
@@ -3372,7 +3420,7 @@
     "codexStep1Title": "打开 OpenAI 验证页面",
     "codexStep1Desc": "将打开新标签页跳转到 OpenAI 的设备授权页面。",
     "codexStep2Title": "输入设备码",
-    "codexStep2Desc": "我们会为您生成一个代码。复制并粘贴到 OpenAI 页面上，然后批准访问。",
+    "codexStep2Desc": "我们会为你生成一个代码。复制并粘贴到 OpenAI 页面上，然后批准访问。",
     "codexStep3Title": "返回此处",
     "codexStep3Desc": "授权通过后，我们会自动检测并完成连接。",
     "claudeStep1Title": "在 claude.ai 上授权",
@@ -3390,14 +3438,14 @@
     "waitingApproval": "等待 OpenAI 授权中...",
     "openVerificationAgain": "重新打开验证页面",
     "pasteAuthCode": "粘贴来自 claude.ai 的授权码",
-    "pasteAuthCodeHint": "授权后，您将在 Claude 页面看到一串代码。复制并粘贴到下方。",
+    "pasteAuthCodeHint": "授权后，你将在 Claude 页面看到一串代码。复制并粘贴到下方。",
     "pasteCodePlaceholder": "在此粘贴代码（如 abc123#state456）",
     "submitting": "提交中...",
     "submit": "提交",
     "openClaudeAgain": "重新打开 claude.ai",
-    "localServerDesc": "配置您的本地服务器 URL。API 密钥为可选项。",
-    "codingPlanDesc": "输入您的编程计划订阅的 API 密钥。",
-    "apiKeyInputDesc": "输入您的 API 密钥。您可以在提供商的控制台中找到。",
+    "localServerDesc": "配置你的本地服务器 URL。API 密钥为可选项。",
+    "codingPlanDesc": "输入你的编程计划订阅的 API 密钥。",
+    "apiKeyInputDesc": "输入你的 API 密钥。你可以在提供商的控制台中找到。",
     "regionLabel": "区域",
     "regionChina": "中国",
     "regionSingapore": "新加坡",
@@ -3421,7 +3469,7 @@
     "updateApiKey": "更新 API 密钥",
     "chooseModels": "选择要加入 {{provider}} 已配置模型列表的模型。",
     "chooseModelsGeneric": "选择要加入已配置模型列表的模型。",
-    "modelAccessReminder": "请确保您的 API 密钥或计划可以访问您选择的模型。不支持的模型将在运行时失败。",
+    "modelAccessReminder": "请确保你的 API 密钥或计划可以访问你选择的模型。不支持的模型将在运行时失败。",
     "deselectAll": "取消全选",
     "selectAll": "全选",
     "addModel": "添加模型",
@@ -3441,7 +3489,7 @@
     "removeModel": "移除 {{model}}",
     "addAnother": "+ 添加",
     "errorSaveModels": "保存模型选择失败。",
-    "chooseYourModels": "选择您的模型",
+    "chooseYourModels": "选择你的模型",
     "errorSavePrefs": "保存模型偏好失败。",
     "providerLabel": "提供商",
     "notSet": "未设置",
@@ -3696,13 +3744,9 @@
           "title": "查看实时行情",
           "desc": "实时数据流驱动的行情图表。"
         },
-        "stocks": {
-          "title": "告诉 Agent 你的自选股与持仓",
-          "desc": "与 Agent 简单聊聊你关注和持有的股票。"
-        },
-        "preferences": {
-          "title": "设置投资偏好",
-          "desc": "设定风险承受度、投资风格与回答方式。"
+        "profile": {
+          "title": "设置投资画像",
+          "desc": "风险、市场、风格，以及 Agent 怎么配合你。"
         },
         "createWorkspace": {
           "title": "创建第一个工作区"
@@ -3719,12 +3763,6 @@
           "title": "在其他平台使用 {{brand}}",
           "desc": "通过平台集成，在 Slack、邮件等平台使用 {{brand}}。"
         }
-      },
-      "interview": {
-        "title": "聊几句，让 Agent 更懂你",
-        "body": "即将打开一段对话，Agent 会简单了解你的持仓、自选股、风险承受度与投资偏好，让之后的回答更贴合你的情况。这些信息可在设置中修改，也可以直接让它更新。",
-        "cancel": "暂不",
-        "confirm": "开始对话"
       }
     },
     "announce": {
@@ -3746,20 +3784,283 @@
       "reset": "重置新手引导",
       "resetDone": "新手引导已重置，提示与指南将重新开始。"
     },
-    "connect": {
-      "title": "连接你的券商账户",
-      "description": "Chief of Staff Agent 会从中读取你的持仓和自选股，再问你几个关于所关注市场的问题。",
-      "continue": "继续",
-      "turnOn": "开启",
-      "skip": "不连接券商，直接继续",
-      "footnote": "下一步由你决定它可以对你的账户做什么。",
-      "waiting": "正在加载 {{brokerage}}…",
-      "failed": "无法连接 {{brokerage}}。请重试，或不连接直接继续。"
-    },
     "kickoff": {
-      "connected": "我已连接 {{brokerage}}，帮我设置个人资料吧。",
-      "noBrokerage": "帮我设置个人资料吧。",
-      "modifyPreferences": "我想查看并更新我的偏好设置。"
+      "threadTitle": "开始使用",
+      "noBrokerage": "我们来设置我的投资画像。",
+      "modifyPreferences": "我想回顾并更新我的偏好设置。"
+    },
+    "welcome": {
+      "progressLabel": "进度",
+      "skip": "跳过",
+      "cancel": "取消",
+      "continue": "继续",
+      "save": "保存",
+      "optional": "可选",
+      "saveFailed": "投资画像保存失败，请重试。",
+      "loadFailed": "投资画像加载失败。",
+      "entry": "设置投资画像",
+      "edit": "编辑投资画像",
+      "chat": {
+        "greeting": "你好，{{name}}。",
+        "greetingNoName": "你好。",
+        "intro": "我是你在 LangAlpha 的 Chief of Staff Agent，帮你协调 AI 分析师、管理各个工作区。",
+        "introNext": "先问你几个问题，了解一下你的投资组合和投资习惯。",
+        "editIntro": "这是你的投资画像。修改任意一项后保存即可。",
+        "lead": {
+          "brokerage": "连接券商账户后，我就能结合你的实际持仓做研究。也可以先跳过，以后再连。",
+          "elsewhere": "你的账户开在哪些券商？选好后，再挑一种方式添加持仓。",
+          "experience": "下面哪一项最符合你的情况？这样我讲解时能把握好深浅。",
+          "risk": "你能接受多大的风险？我会按你的风险偏好，权衡潜在收益和亏损。",
+          "markets": "你主要投资哪些市场？研究时我会重点关注。",
+          "style": "你做投资决策时主要看什么？我会优先给你这类分析。",
+          "agent": "最后，你希望我通常怎么回答问题？是快速作答、看问题决定研究深度，还是每次都先充分研究？"
+        },
+        "composer": {
+          "waiting": "设置完成后，你就可以给我发消息了",
+          "start": "想先问什么，或有什么背景要补充，可以写在这里（选填）"
+        },
+        "edit": "修改回答",
+        "summary": {
+          "connected": "已连接 {{brokerage}}",
+          "screenshots_one": "{{count}} 张截图",
+          "screenshots_other": "{{count}} 张截图",
+          "search": "搜索添加持仓",
+          "skipped": "已跳过"
+        }
+      },
+      "banner": {
+        "title": "设置投资画像",
+        "desc": "回答几个问题，让 Agent 更了解你的投资习惯，提供更适合你的研究。",
+        "start": "去设置",
+        "resume": "继续设置"
+      },
+      "brokerage": {
+        "none": "暂时没有可连接的券商。",
+        "failed": "连接 {{brokerage}} 失败。请重试，或先跳过这一步。",
+        "desktopOnly": "{{brokerages}} 只能在桌面应用中连接。<download>下载桌面应用</download>",
+        "desktopOutdated": "更新桌面应用后才能连接券商。<download>下载最新版本</download>",
+        "permissionHelper": "选择 Agent 如何处理已连接的券商账户中的订单，之后也可以在设置中修改。",
+        "elsewhereTitle": "找不到你的券商？",
+        "elsewhereBody": "也可以用截图或搜索添加持仓。",
+        "elsewhereAction": "不连接，继续"
+      },
+      "elsewhere": {
+        "brokerages": {
+          "fidelity": "富达",
+          "schwab": "嘉信理财",
+          "vanguard": "先锋领航",
+          "etrade": "E*TRADE",
+          "robinhood": "Robinhood",
+          "ibkr": "盈透证券",
+          "webull": "微牛",
+          "moomoo": "moomoo",
+          "futu": "富途牛牛",
+          "tiger": "老虎证券",
+          "longbridge": "长桥证券",
+          "tastytrade": "tastytrade",
+          "other": "其他",
+          "none": "还没有账户"
+        },
+        "otherLabel": "券商名称",
+        "otherPlaceholder": "券商名称",
+        "connectable": "连接 {{brokerages}} 后，Agent 可以直接读取你的持仓。<connect>去连接</connect>",
+        "holdingsTitle": "添加持仓",
+        "methods": {
+          "screenshot": {
+            "title": "上传截图",
+            "desc": "截取券商 App 中的持仓和自选页面。Agent 会先和你确认要添加的内容。"
+          },
+          "search": {
+            "title": "搜索添加",
+            "desc": "按名称或代码逐个添加。"
+          }
+        }
+      },
+      "experience": {
+        "types": {
+          "individual": {
+            "title": "个人投资者",
+            "desc": "用自己的资金投资或交易。"
+          },
+          "professional": {
+            "title": "金融从业者",
+            "desc": "分析师、交易员、基金经理或投资顾问。"
+          },
+          "student": {
+            "title": "学生",
+            "desc": "正在学习市场知识。"
+          }
+        },
+        "yearsTitle": "你做投资或交易有多久了？",
+        "years": {
+          "under_1y": "不到 1 年",
+          "1_3y": "1–3 年",
+          "3_10y": "3–10 年",
+          "over_10y": "10 年以上"
+        },
+        "instrumentsTitle": "你对哪些投资品种感兴趣？"
+      },
+      "risk": {
+        "levels": {
+          "conservative": {
+            "title": "保守",
+            "desc": "优先保护本金，追求适度收益。"
+          },
+          "moderate": {
+            "title": "稳健",
+            "desc": "接受一定波动，追求资产长期增值。"
+          },
+          "growth": {
+            "title": "进取",
+            "desc": "承受较大波动，追求更高回报。"
+          },
+          "aggressive": {
+            "title": "激进",
+            "desc": "集中持仓，可接受大幅回撤。"
+          }
+        },
+        "horizonTitle": "你通常持仓多久？",
+        "horizons": {
+          "intraday": "日内",
+          "days": "几天到几周",
+          "months": "几个月",
+          "years": "数年"
+        }
+      },
+      "instruments": {
+        "stock": "股票",
+        "etf": "ETF",
+        "index": "指数",
+        "option": "期权",
+        "future": "期货",
+        "bond": "债券",
+        "fund": "基金",
+        "forex": "外汇",
+        "crypto": "加密货币",
+        "commodity": "大宗商品"
+      },
+      "markets": {
+        "names": {
+          "us": "美国",
+          "hk": "香港",
+          "cn": "A 股",
+          "jp": "日本",
+          "eu": "欧洲"
+        },
+        "helpTitle": "你希望我在哪些方面帮你？",
+        "help": {
+          "ideas": "发掘投资机会",
+          "research": "研究公司",
+          "portfolio": "跟踪我的持仓",
+          "news": "关注市场动态",
+          "trading": "制定交易计划",
+          "learning": "学习投资基础"
+        }
+      },
+      "style": {
+        "approaches": {
+          "fundamental": "基本面分析",
+          "macro": "宏观趋势",
+          "quantitative": "系统化策略与量化信号",
+          "technical": "技术分析",
+          "event_driven": "财报与事件"
+        },
+        "stylesTitle": "你偏向哪些投资风格？",
+        "styles": {
+          "growth": "成长",
+          "value": "价值",
+          "income": "股息收益",
+          "trading": "短线交易",
+          "index": "被动与指数投资"
+        },
+        "sectorsTitle": "你关注哪些行业？",
+        "sectors": {
+          "technology": "科技",
+          "semiconductors": "半导体",
+          "healthcare": "医疗健康",
+          "financials": "金融",
+          "energy": "能源",
+          "consumer": "消费",
+          "industrials": "工业",
+          "real_estate": "房地产",
+          "utilities": "公用事业",
+          "materials": "原材料"
+        }
+      },
+      "agent": {
+        "depth": {
+          "light": {
+            "title": "快速作答",
+            "desc": "快速查证后简要回答，只有在你要求时才深入研究。"
+          },
+          "adaptive": {
+            "title": "看问题而定",
+            "desc": "简单问题快速回答，需要深入时充分研究。"
+          },
+          "thorough": {
+            "title": "充分研究",
+            "desc": "每次回答前都核实数据和证据，耗时更长，消耗更多 credits。"
+          }
+        },
+        "deliverableTitle": "你通常希望回答以什么形式呈现？",
+        "deliverable": {
+          "text": {
+            "title": "文字回复",
+            "desc": "在对话中用文字回答，必要时配表格。"
+          },
+          "visual": {
+            "title": "图表和看板",
+            "desc": "在对话中通过交互式图表和看板探索数据。"
+          },
+          "report": {
+            "title": "完整报告",
+            "desc": "排版好的 HTML 报告，可分享或保存为 PDF，准备时间更长，消耗更多 credits。"
+          }
+        },
+        "proactivityTitle": "你希望我什么时候主动提供简报或提醒？",
+        "proactivity": {
+          "proactive": {
+            "title": "定期更新",
+            "desc": "不等你提问，主动提供简报、投资思路和持仓动态。"
+          },
+          "when_needed": {
+            "title": "重要变动时",
+            "desc": "只在需要你留意时提醒，比如持仓大幅波动。"
+          },
+          "on_request": {
+            "title": "仅在你要求时",
+            "desc": "不主动安排简报或提醒，你提出时再安排。"
+          }
+        }
+      },
+      "start": {
+        "submit": "开始",
+        "waiting": "正在加载 {{brokerage}}…",
+        "failed": "无法打开对话，请重试。"
+      },
+      "holdings": {
+        "ticker": "代码",
+        "quantity": "数量",
+        "remove": "移除 {{symbol}}",
+        "failed": "无法添加 {{symbol}}。",
+        "search": "按名称或代码搜索",
+        "noResults": "没有找到与“{{query}}”相关的结果",
+        "toHoldings": "加入持仓",
+        "toWatchlist": "加入自选",
+        "holdingsTitle": "持仓",
+        "watchlistTitle": "自选",
+        "watchlistRemove": "从自选中移除 {{symbol}}",
+        "watchlistFailed": "无法将 {{symbol}} 加入自选。"
+      },
+      "shots": {
+        "prompt": "添加持仓或自选列表的截图",
+        "hint": "拖入、粘贴或选择图片，最多 {{max}} 张",
+        "add": "添加截图",
+        "remove": "移除 {{name}}",
+        "tooMany": "最多只能添加 {{max}} 张截图，其余的已忽略。",
+        "notImage": "{{name}} 不是 PNG、JPEG、WebP 或 GIF 图片。",
+        "unreadable": "无法读取 {{name}}。"
+      }
     }
   },
   "mcp": {
@@ -4341,7 +4642,7 @@
         "neverAvailable": "始终不可用",
         "neverAvailableNote": "已刻意保留。无论授权什么都会被拒绝。"
       },
-      "exclusiveNote": "会断开你的 {{broker}} 账户已关联的其他 AI 应用",
+      "exclusiveNote": "会断开此账户已关联的其他 AI 应用",
       "exclusiveWarning": "该账户只允许连接一个 AI 平台，因此在此连接会取代当前已连接的那一个。",
       "grantedNone": "未授予任何操作",
       "intro": "连接之前不会向券商发送任何数据，每次连接前都会先询问 Agent 可以在其中做什么。",

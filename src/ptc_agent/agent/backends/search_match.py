@@ -22,8 +22,7 @@ from functools import lru_cache
 from pathlib import Path
 
 from ptc_agent.core.paths import AGENT_HISTORY_DIRS, ALWAYS_HIDDEN_DIR_NAMES
-# DALTON-HOOK(glob-brace-expansion): share brace expansion between sandbox find and DiskGlob
-from ptc_agent.core.sandbox.glob_runtime import agent_glob_pattern, expand_braces
+from ptc_agent.core.sandbox.glob_runtime import agent_glob_pattern
 
 # What ``aglob_files`` hands the disk glob for the agent's own Glob, which
 # always hides history.
@@ -940,34 +939,13 @@ class DiskGlob:
         search_path: str,
         excluded_dirs: Iterable[str] = GLOB_EXCLUDED_DIRS,
         history_children: dict[str, list[str]] = GLOB_HISTORY_CHILDREN,
-        *,
-        _apply_agent_pattern: bool = True,
     ) -> None:
-        # DALTON-HOOK(glob-brace-expansion): apply agent_glob_pattern once before expand_braces (matches sandbox order)
-        if _apply_agent_pattern:
-            pattern = agent_glob_pattern(pattern)
-        expanded = expand_braces(pattern)
-        self._subglobs: list[DiskGlob] | None = (
-            [DiskGlob(p, search_path, excluded_dirs, history_children, _apply_agent_pattern=False) for p in expanded]
-            if expanded != [pattern]
-            else None
-        )
-        self.absolute = (
-            any(g.absolute for g in self._subglobs)
-            if self._subglobs is not None
-            else pattern.startswith("/")
-        )
+        pattern = agent_glob_pattern(pattern)
+        self.absolute = pattern.startswith("/")
         # A `..` steps back out of whatever the name before it is on disk: a
         # folder, a link into the mount, a file or nothing. Only the sandbox's
         # glob can tell, so a pattern with one finds nothing here.
-        # DALTON-HOOK(glob-brace-expansion): delegate climbs check to subglobs when brace-expanded
-        self.climbs = (
-            any(g.climbs for g in self._subglobs)
-            if self._subglobs is not None
-            else ".." in pattern.split("/")
-        )
-        if self._subglobs is not None:
-            return
+        self.climbs = ".." in pattern.split("/")
         self._search_path = search_path
         self._excluded = frozenset(excluded_dirs)
         self._history = {
@@ -1035,9 +1013,6 @@ class DiskGlob:
     def finds(self, path: str) -> bool:
         """Whether the glob lists a file at ``path``, every name above it
         being a folder."""
-        # DALTON-HOOK(glob-brace-expansion): delegate brace-expanded patterns across subglobs
-        if self._subglobs is not None:
-            return any(g.finds(path) for g in self._subglobs)
         if self._exact is not None:
             walked = path == self._exact
         else:
@@ -1055,9 +1030,6 @@ class DiskGlob:
         ``link``: ``find`` follows one only where the pattern's literal
         prefix, or the search path, runs through it, and passes it by where a
         wildcard reaches it."""
-        # DALTON-HOOK(glob-brace-expansion)
-        if self._subglobs is not None:
-            return any(g.enters(link) for g in self._subglobs)
         link = link.rstrip("/") or "/"
         if self._exact is not None:
             return _under(self._exact, link)
@@ -1065,9 +1037,6 @@ class DiskGlob:
 
     def reaches(self, directory: str) -> bool:
         """Whether a file below ``directory`` could be listed."""
-        # DALTON-HOOK(glob-brace-expansion)
-        if self._subglobs is not None:
-            return any(g.reaches(directory) for g in self._subglobs)
         directory = directory.rstrip("/") or "/"
         if self._exact is not None:
             return _under(self._exact, directory)

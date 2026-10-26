@@ -1,7 +1,7 @@
-import { MessageSquareText, Plus } from 'lucide-react';
+import { Plus, SlidersHorizontal } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 
-import { useStartOnboarding } from '@/pages/Onboarding';
+import { useWelcomeOffer } from '@/pages/Onboarding/welcome/useWelcomeOffer';
 
 interface GalleryEmptyStateProps {
   /** A search that matched nothing says so; it does not re-pitch the product. */
@@ -11,7 +11,7 @@ interface GalleryEmptyStateProps {
 
 export function GalleryEmptyState({ isFiltered, onNewWorkspace }: GalleryEmptyStateProps) {
   const { t } = useTranslation();
-  const onboarding = useStartOnboarding();
+  const welcomeOffer = useWelcomeOffer();
 
   if (isFiltered) {
     return (
@@ -30,17 +30,19 @@ export function GalleryEmptyState({ isFiltered, onNewWorkspace }: GalleryEmptySt
         {t('workspace.welcomeDesc')}
       </p>
       <div className="flex flex-col sm:flex-row items-center gap-3">
-        <button
-          onClick={() => onboarding.start()}
-          className="flex items-center gap-2 px-6 py-3 rounded-lg transition-all hover:opacity-90 active:scale-[0.985]"
-          style={{
-            backgroundColor: 'var(--color-btn-primary-bg)',
-            color: 'var(--color-btn-primary-text)',
-          }}
-        >
-          <MessageSquareText className="h-5 w-5" />
-          <span className="font-medium">{t('settings.startOnboarding')}</span>
-        </button>
+        {welcomeOffer && (
+          <button
+            onClick={() => welcomeOffer.open()}
+            className="flex items-center gap-2 px-6 py-3 rounded-lg transition-all hover:opacity-90 active:scale-[0.985]"
+            style={{
+              backgroundColor: 'var(--color-btn-primary-bg)',
+              color: 'var(--color-btn-primary-text)',
+            }}
+          >
+            <SlidersHorizontal className="h-5 w-5" />
+            <span className="font-medium">{t('onboarding.welcome.entry')}</span>
+          </button>
+        )}
         <button
           onClick={onNewWorkspace}
           className="flex items-center gap-2 px-6 py-3 rounded-lg border transition-all hover:bg-foreground/5 hover:scale-[1.01] active:scale-[0.985]"

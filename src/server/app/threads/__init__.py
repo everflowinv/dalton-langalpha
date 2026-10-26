@@ -15,5 +15,6 @@ from . import tasks  # noqa: E402,F401
 from . import sharing  # noqa: E402,F401
 from . import feedback  # noqa: E402,F401
 from . import provenance  # noqa: E402,F401
+from . import wakeups  # noqa: E402,F401
 
 __all__ = ["router"]

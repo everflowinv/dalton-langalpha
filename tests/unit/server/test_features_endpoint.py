@@ -236,6 +236,10 @@ class TestPlanGate:
         assert no_access["gate"] == "plan"
         assert no_access["enabled"] is False
 
+        # Unknown (the platform down, no membership on record) fails closed too.
+        unknown = await _fetch(USER_ID, None)
+        assert unknown["enabled"] is False
+
         # Positive control: a tier meeting min_tier flows through the same
         # wiring and unlocks the feature.
         granted = await _fetch(USER_ID, 2)

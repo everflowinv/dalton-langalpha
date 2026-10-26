@@ -88,6 +88,16 @@ TIME_UP_ROW_KIND = "turn_time_up"
 #: a new clock, which ``update_row.md.j2`` hardcodes the same way.
 TIME_UP_WITHDRAWN_ROW_KIND = "turn_time_up_withdrawn"
 
+#: Row kind of the user's cancel of wakeups the agent set
+#: (``middleware/wakeups.py``), which ``update_row.md.j2`` hardcodes the same
+#: way.
+WAKEUP_CANCELLED_ROW_KIND = "wakeup_cancelled"
+
+#: Rows that speak for no block, so a rebuild neither folds them in nor
+#: retires them, but a summary carries them: nobody states them again, and
+#: the user's cancel of a wakeup holds whatever the blocks say.
+NOTICE_ROW_KINDS = frozenset({WAKEUP_CANCELLED_ROW_KIND})
+
 #: Rows that are no change under the baseline: their writers state them again
 #: once a compaction takes them from view (the notes reminder before the next
 #: summary, the check-in after the next run of tool calls, the time-up ask on

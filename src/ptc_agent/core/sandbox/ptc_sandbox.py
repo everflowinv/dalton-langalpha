@@ -513,7 +513,8 @@ class PTCSandbox:
         # Disjoint paths, so in parallel. These run here rather than in the
         # first sync so they overlap the registry connect; the manifest below
         # records them, and that sync skips whatever it finds recorded at the
-        # same version.
+        # same version. No prune either: a new sandbox has no stale server
+        # files.
         await asyncio.gather(
             self._upload_mcp_server_files_impl(),  # → mcp_servers/
             self._upload_internal_packages(),  # → _internal/src/
@@ -1401,8 +1402,11 @@ class PTCSandbox:
     async def _cleanup_legacy_manifests(self) -> None:
         return await _assets._cleanup_legacy_manifests(self)
 
-    async def _upload_mcp_server_files_impl(self) -> None:
+    async def _upload_mcp_server_files_impl(self) -> set[str]:
         return await _assets._upload_mcp_server_files_impl(self)
+
+    async def _prune_mcp_server_files(self, expected: set[str]) -> None:
+        return await _assets._prune_mcp_server_files(self, expected)
 
     async def sync_sandbox_assets(
         self,

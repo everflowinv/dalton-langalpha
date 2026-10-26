@@ -61,15 +61,20 @@ contextBridge.exposeInMainWorld('langalphaDesktop', {
    *   `<scheme>://integrations/install/<name>/callback`, so a browser that
    *   finished the install can hand its result back to the page that started
    *   it.
+   * - `console-return`: the shell will load a console page a link from the
+   *   browser names, on the console's origin, in the console's window. The
+   *   link is `<scheme>://console/<page>?…` and the page one of a fixed few, so
+   *   a browser that landed on a console page with no session can hand it back
+   *   to the app, which has one.
    *
-   *   Both present only in an edition that has a console to finish them on;
-   *   one with no platform origin drops those links, so it leaves both out.
+   *   All three present only in an edition that has a console to open them on;
+   *   one with no platform origin drops those links, so it leaves all three out.
    *
    * A list fixed when the window opens, and deliberately not a channel: nothing
    * on it hands the page a way to drive anything.
    */
   capabilities: Object.freeze(
-    flag('integration-returns') === '1' ? ['integration-login', 'integration-install'] : [],
+    flag('console-returns') === '1' ? ['integration-login', 'integration-install', 'console-return'] : [],
   ),
 
   /**

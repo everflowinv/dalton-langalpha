@@ -1,33 +1,17 @@
-import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router';
 import { Check, X } from 'lucide-react';
-import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-  DialogDescription,
-  DialogFooter,
-} from '@/components/ui/dialog';
 import { cn } from '@/lib/utils';
-import { useStartOnboarding } from '../connect/useStartOnboarding';
 import { useOnboarding } from '../OnboardingProvider';
 
 /**
  * Floating "Get started" checklist (bottom-left, desktop only). Tasks complete
- * via route visits or the personalization flag; clicking a pending task
- * navigates to it. Hidden once dismissed or when every task is done.
+ * via route visits or a derived signal (the saved investing profile, a
+ * workspace); clicking a pending task navigates to it. Hidden once dismissed or when every task is done.
  */
 export function GettingStartedCard() {
   const { gettingStarted } = useOnboarding();
   const navigate = useNavigate();
-  // The same start as the dashboard banner: the brokerage connect sheet, then
-  // the Chief of Staff's interview in Home.
-  const onboarding = useStartOnboarding();
-  // Interview tasks confirm first: the click opens a live agent conversation,
-  // which is a bigger jump than the navigation the other tasks do.
-  const [interviewPromptOpen, setInterviewPromptOpen] = useState(false);
   const { t } = useTranslation();
 
   if (!gettingStarted.visible) return null;
@@ -87,9 +71,7 @@ export function GettingStartedCard() {
               type="button"
               disabled={done}
               onClick={() => {
-                if (def.interview) {
-                  setInterviewPromptOpen(true);
-                } else if (def.external) {
+                if (def.external) {
                   // Cross-app page — no route of ours to observe, so a
                   // successful open is the completion signal. null = popup
                   // blocked; leave the task pending so the user can retry.
@@ -150,52 +132,6 @@ export function GettingStartedCard() {
           </li>
         ))}
       </ul>
-
-      <Dialog open={interviewPromptOpen} onOpenChange={setInterviewPromptOpen}>
-        <DialogContent variant="centered" className="sm:max-w-md">
-          <DialogHeader className="space-y-2 text-left">
-            <DialogTitle style={{ color: 'var(--color-text-primary)' }}>
-              {t('onboarding.gettingStarted.interview.title', 'A quick chat to personalize your experience')}
-            </DialogTitle>
-            <DialogDescription
-              className="text-sm leading-relaxed"
-              style={{ color: 'var(--color-text-secondary)' }}
-            >
-              {t(
-                'onboarding.gettingStarted.interview.body',
-                "We'll open a chat where the agent asks a few questions about your portfolio, watchlist, risk tolerance, and investment preferences — so its answers fit you. You can change any of it later in Settings, or simply ask the agent to update it."
-              )}
-            </DialogDescription>
-          </DialogHeader>
-          <DialogFooter className="gap-2 sm:gap-3">
-            <button
-              type="button"
-              onClick={() => setInterviewPromptOpen(false)}
-              className="rounded-lg border px-4 py-2 text-sm font-medium transition-colors hover:bg-(--color-bg-subtle) focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
-              style={{
-                borderColor: 'var(--color-border-default)',
-                color: 'var(--color-text-secondary)',
-              }}
-            >
-              {t('onboarding.gettingStarted.interview.cancel', 'Not now')}
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                setInterviewPromptOpen(false);
-                onboarding.start();
-              }}
-              className="rounded-lg px-4 py-2 text-sm font-semibold transition-opacity hover:opacity-90 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
-              style={{
-                background: 'var(--color-btn-primary-bg)',
-                color: 'var(--color-btn-primary-text)',
-              }}
-            >
-              {t('onboarding.gettingStarted.interview.confirm', 'Start the chat')}
-            </button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
     </aside>
   );
 }
