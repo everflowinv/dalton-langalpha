@@ -278,9 +278,11 @@ def _resolve_service(target: Any) -> Any:
     return getattr(target, "_service", None) or target
 
 
-def get_dalton_move_refs(target: Any) -> Dict[str, Dict[str, Any]]:
+def get_dalton_move_refs(target: Any) -> Dict[Tuple[str, Optional[MarketType]], Dict[str, Any]]:
     """Return the isolated Dalton validated reference store
-    ``service._dalton_move_refs`` (``symbol -> {previous_close, day_open, trading_date}``).
+    ``service._dalton_move_refs``, keyed by the ``(symbol, market)`` listing:
+    one bare symbol can be watched in two markets at once (HSI the US ticker
+    and the Hang Seng), and each listing's reference must stand alone.
     """
     service = _resolve_service(target)
     refs = getattr(service, "_dalton_move_refs", None)
@@ -290,22 +292,21 @@ def get_dalton_move_refs(target: Any) -> Dict[str, Dict[str, Any]]:
     return refs
 
 
-def symbol_has_dalton_move(target: Any, bare_symbol: str) -> bool:
-    """Return True iff ``bare_symbol`` currently has a Dalton price-move
-    automation in ``_symbol_automations``.
+def symbol_has_dalton_move(
+    target: Any, bare_symbol: str, watched_market: Optional[MarketType]
+) -> bool:
+    """Return True iff the ``(bare_symbol, watched_market)`` listing currently
+    has a Dalton price-move automation in ``_symbol_automations``.
 
-    Upstream keys the map by ``(symbol, market)`` listings, and the same
-    bare symbol can be watched in two markets at once, so this checks every
-    listing the symbol names.
+    Upstream keys the map by listings, so the market is part of the identity:
+    a Dalton automation on HSI/stock says nothing about HSI/index, and a
+    reference refresh on one listing must not steal or clear the other's.
     """
     service = _resolve_service(target)
-    sym = bare_symbol.upper()
-    for (listing_sym, _market), autos in getattr(
-        service, "_symbol_automations", {}
-    ).items():
-        if listing_sym == sym and any(is_dalton_price_move_automation(a) for a in autos):
-            return True
-    return False
+    autos = getattr(service, "_symbol_automations", {}).get(
+        (bare_symbol.upper(), watched_market), ()
+    )
+    return any(is_dalton_price_move_automation(a) for a in autos)
 
 
 def record_snapshot_reference(
@@ -317,14 +318,16 @@ def record_snapshot_reference(
 ) -> Optional[str]:
     """Write to the isolated ``_dalton_move_refs`` store ONLY when
     ``extract_today_regular_snapshot`` succeeds. Never reads or mutates
-    ``evaluator._reference_prices``.
+    ``evaluator._reference_prices``. Keyed by the listing, so a same-named
+    symbol in another market keeps its own reference.
     """
     sym = bare_symbol.upper()
+    listing = (sym, watched_market)
     refs = get_dalton_move_refs(target)
     validated = extract_today_regular_snapshot(sym, watched_market, snapshot, now)
     if validated is not None:
         today_iso, _, prev_close, day_open = validated
-        refs[sym] = {
+        refs[listing] = {
             "previous_close": prev_close,
             "day_open": day_open,
             "trading_date": today_iso,
@@ -332,11 +335,11 @@ def record_snapshot_reference(
         return today_iso
 
     today_iso = trading_session_date(sym, watched_market, now)
-    existing = refs.get(sym)
+    existing = refs.get(listing)
     if existing is not None and existing.get("trading_date") == today_iso and today_iso is not None:
         return today_iso
 
-    refs.pop(sym, None)
+    refs.pop(listing, None)
     return None
 
 
@@ -347,11 +350,12 @@ def refresh_dalton_reference_if_needed(
     watched_market: Optional[MarketType],
     now: datetime,
 ) -> Optional[str]:
-    """Update ``_dalton_move_refs`` only when ``bare_symbol`` currently has at
-    least one Dalton price-move automation in ``_symbol_automations``.
+    """Update ``_dalton_move_refs`` only when the ``(bare_symbol,
+    watched_market)`` listing currently has at least one Dalton price-move
+    automation in ``_symbol_automations``.
     """
-    if not symbol_has_dalton_move(target, bare_symbol):
-        get_dalton_move_refs(target).pop(bare_symbol.upper(), None)
+    if not symbol_has_dalton_move(target, bare_symbol, watched_market):
+        get_dalton_move_refs(target).pop((bare_symbol.upper(), watched_market), None)
         return None
     return record_snapshot_reference(
         target, bare_symbol, snapshot, watched_market, now
@@ -372,12 +376,12 @@ def can_evaluate_automation(
     if not is_dalton_price_move_automation(automation):
         return True
 
-    symbol = config.symbol.upper()
-    today_iso = trading_session_date(symbol, config.market, now)
+    listing = (config.symbol.upper(), config.market)
+    today_iso = trading_session_date(config.symbol.upper(), config.market, now)
     if today_iso is None:
         return False
 
-    ref_entry = get_dalton_move_refs(target).get(symbol)
+    ref_entry = get_dalton_move_refs(target).get(listing)
     if not isinstance(ref_entry, Mapping):
         return False
     if ref_entry.get("trading_date") != today_iso:
@@ -400,8 +404,8 @@ def evaluate_dalton_move_conditions(
     if not can_evaluate_automation(target, automation, config, now):
         return False
 
-    symbol = config.symbol.upper()
-    ref_entry = get_dalton_move_refs(target).get(symbol) or {}
+    listing = (config.symbol.upper(), config.market)
+    ref_entry = get_dalton_move_refs(target).get(listing) or {}
 
     for condition in config.conditions:
         if condition.type == PriceConditionType.PRICE_ABOVE:
@@ -471,7 +475,7 @@ async def process_polled_snapshot(
     automations = list(service._symbol_automations.get((bare_symbol, watched_market), []))
     dalton_autos = [a for a in automations if is_dalton_price_move_automation(a)]
     if not dalton_autos:
-        get_dalton_move_refs(service).pop(bare_symbol.upper(), None)
+        get_dalton_move_refs(service).pop((bare_symbol.upper(), watched_market), None)
         return automations
 
     normal_autos = [a for a in automations if not is_dalton_price_move_automation(a)]
@@ -502,7 +506,13 @@ def day_trigger_lock_key(
     direction: str,
     trading_date: str,
 ) -> str:
-    """Per-user Redis key for ``(user_id, symbol, direction, trading_date)``."""
+    """Per-user Redis key for ``(user_id, symbol, direction, trading_date)``.
+
+    Deliberately without the market: Dalton creates stock-move automations
+    only with ``market=stock``, so a same-named stock and index can never both
+    hold one, and the daily dedup (this key and the
+    ``dalton_price_move_firings`` unique constraint) stays symbol-scoped.
+    """
     return (
         f"dalton:price_trigger:{user_id}:{symbol.upper()}:"
         f"{direction.lower()}:{trading_date}"

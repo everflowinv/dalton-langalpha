@@ -37,3 +37,13 @@ subagent_limits:
   max_running_per_thread: 8
   max_running_global: 24
 
+# Product decision 1b (roadmap §6): keep Dalton's stock-move automations
+# (src/dalton/autonomy/price_trigger.py) and do not open upstream's
+# market-watch price targets. The kill switch unbinds the watch_market tool
+# from the agent, hides every watch/target surface (the base watch toggle
+# included), and drops delivery of any notice an existing armed target still
+# produces. Flip to true if/when the product decision opens the feature.
+features:
+  market_watch:
+    enabled: false
+

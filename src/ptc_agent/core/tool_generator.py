@@ -77,6 +77,27 @@ def _safe_func_name(name: str) -> str:
     return sanitize_tool_name(name) or "_invalid_tool"
 
 
+def _redact_managed_tokens(values: list[str]) -> list[str]:
+    """DALTON-HOOK(bridge-admin-token): replace each management token's value
+    (``DALTON_BRIDGE_ADMIN_TOKEN`` / ``INTERNAL_SERVICE_TOKEN``) with ``***``.
+
+    The plugins loader expands ``${...}`` refs into plaintext on the server
+    objects this module reads, so anything logged off them — before the
+    sandbox-bound output is sanitized — must be redacted here.
+    """
+    from src.dalton.settings import managed_secret_token_values
+
+    tokens = managed_secret_token_values()
+    if not tokens:
+        return values
+    out = []
+    for v in values:
+        for token in tokens:
+            v = v.replace(token, "***")
+        out.append(v)
+    return out
+
+
 @dataclass(frozen=True)
 class _ParamBinding:
     """One parameter's two names plus its resolved schema facts.
@@ -720,10 +741,14 @@ except ImportError:
         ):
             filename = Path(args[2]).name
             args = ["run", "python", f"{layout.mcp_servers}/{filename}"]
+            # DALTON-HOOK(bridge-admin-token): the plugins loader expands ${...}
+            # refs into plaintext, so raw server.args would put a management
+            # token in the debug log before the entry is ever sanitized.
+            logged_args = _redact_managed_tokens([str(a) for a in (server.args or ())])
             logger.debug(
                 "Transformed MCP server command for sandbox",
                 server=server.name,
-                original_args=server.args,
+                original_args=logged_args,
                 sandbox_args=args,
             )
         entry = {

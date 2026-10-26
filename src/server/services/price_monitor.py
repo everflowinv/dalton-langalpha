@@ -445,7 +445,7 @@ class PriceMonitorService:
 
         self._evaluator = ConditionEvaluator()
         self._evaluator._service = self  # DALTON-HOOK(stock-move-upgrade)
-        self._dalton_move_refs: Dict[str, Dict[str, Any]] = {}  # DALTON-HOOK(stock-move-upgrade)
+        self._dalton_move_refs: Dict[Tuple[str, MarketType], Dict[str, Any]] = {}  # DALTON-HOOK(stock-move-upgrade): keyed by listing
 
         # listing → [automation dicts]  (keyed by user-entered symbol)
         self._symbol_automations: Dict[Listing, List[Dict[str, Any]]] = {}
@@ -1173,9 +1173,10 @@ class PriceMonitorService:
         for listing, snapshot in await _fetch_snapshots(provider, stock_syms, index_syms):
             from src.dalton.autonomy.price_trigger import process_polled_snapshot  # DALTON-HOOK(stock-move-upgrade)
             bare, market = listing  # DALTON-HOOK(stock-move-upgrade)
+            # None = every automation on this listing is a Dalton price-move
+            # task, fully handled inside; only the normal-automation loop below
+            # is skipped — a market-watch target on the listing still evaluates.
             normal_automations = await process_polled_snapshot(self, bare, market, snapshot, now)  # DALTON-HOOK(stock-move-upgrade)
-            if normal_automations is None:  # DALTON-HOOK(stock-move-upgrade)
-                continue  # DALTON-HOOK(stock-move-upgrade)
             current_price = _positive(snapshot.get("price"))
             if current_price is None:
                 continue
@@ -1197,7 +1198,7 @@ class PriceMonitorService:
                     day_open=snapshot.get("open"),
                 )
 
-            for automation in normal_automations:  # DALTON-HOOK(stock-move-upgrade)
+            for automation in normal_automations or ():  # DALTON-HOOK(stock-move-upgrade)
                 try:
                     await self._evaluate_and_trigger(automation, current_price)
                 except Exception:
