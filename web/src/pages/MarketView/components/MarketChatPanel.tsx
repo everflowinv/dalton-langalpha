@@ -494,6 +494,12 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
     readTurnEndScroll(preferences),
   );
 
+  // DALTON-HOOK(composer-drafts): the screenshot as it is now, for a send settled later.
+  const chartImageRef = useRef(chartImage);
+  useEffect(() => {
+    chartImageRef.current = chartImage;
+  }, [chartImage]);
+
   // Send: shape attachments + chart screenshot like ChatAgent does.
   const handleSend = useCallback(
     (
@@ -571,9 +577,13 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
       // sending fails. The screenshot and confirmed selections ride this one send, so they are
       // spent only once the server accepts it: a refused send (the budget gate, the network)
       // leaves them on the chart to send again.
+      // Spend only what this send carried: a selection confirmed or a screenshot retaken while
+      // it waited for acceptance belongs to the next send.
+      const sentSelectionIds = chartSelectionStore.getConfirmedFor(sym, tf).map((sel) => sel.id);
+      const sentImage = chartImage;
       const spendChartContext = () => {
-        onClearChartImage();
-        chartSelectionStore.clearAll();
+        if (sentImage && chartImageRef.current === sentImage) onClearChartImage();
+        for (const id of sentSelectionIds) chartSelectionStore.remove(id);
       };
       const sent = handleSendMessage(outgoingMessage, additionalContext, attachmentMeta, {
         ...modelOptions,

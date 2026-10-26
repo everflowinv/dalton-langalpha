@@ -490,8 +490,17 @@ export function useComposerDraft({
       // flight (a steer sent mid-stream, say): the key's stored draft and the
       // input are that send's now — this settle touches neither, or the first
       // send's completion would delete or restore the second send's draft.
-      if (inFlightSendRef.current !== inFlight) return;
-      inFlightSendRef.current = null;
+      // Supersession is per key: a newer send on another key (the market panel's key moves
+      // from its workspace form to the new thread's once the thread exists) does not own
+      // this send's stored draft, so this send still settles its own key.
+      const current = inFlightSendRef.current;
+      if (
+        current
+        && current !== inFlight
+        && current.draftKey === inFlight.draftKey
+        && current.userId === inFlight.userId
+      ) return;
+      if (current === inFlight) inFlightSendRef.current = null;
 
       if (succeeded) {
         settleSuccess();

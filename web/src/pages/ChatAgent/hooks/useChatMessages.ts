@@ -2480,6 +2480,17 @@ export function useChatMessages(
       const processStreamFrame = createStreamEventProcessor(runtime, streamRouterDeps, assistantMessageId, refs, getTaskIdFromEvent, wasInterruptedRef);
       const processEvent = (event: SSEEvent) => {
         admission.observe(event);
+        // DALTON-HOOK(composer-drafts): the send is accepted once the server has started its
+        // run — the main agent's metadata frame (or a recoverable failure naming the run), the
+        // same signals `admission` counts as started. The Content-Location run_id is only a
+        // pre-minted id sent before admission runs, so it must not settle the draft.
+        if (
+          !isSubagentEvent(event)
+          && (event.event === 'metadata'
+            || ((event.event === 'error' || event.event === 'retry') && event.recovery && typeof event.run_id === 'string'))
+        ) {
+          notifyAccepted();
+        }
         processStreamFrame(event);
       };
 
@@ -2501,8 +2512,6 @@ export function useChatMessages(
         onRunIdResolved: (runId, resolvedThreadId) => {
           requestKeyRef.current.settle(requestKey);
           currentRunIdRef.current = runId;
-          // DALTON-HOOK(composer-drafts): the run exists server-side — the send is accepted, the draft may settle sent before the stream ends
-          notifyAccepted();
           if (resolvedThreadId && resolvedThreadId !== '__default__') {
             threadIdRef.current = resolvedThreadId;
           }

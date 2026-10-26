@@ -473,6 +473,30 @@ describe('chatDrafts storage module & ChatInput composer drafts', () => {
     view2.unmount();
   });
 
+  it('a send superseded only by a send on another key still clears its own key', async () => {
+    // The market panel's key moves from its workspace form to the new thread's
+    // once the thread exists; a send on the new key must not strand the first.
+    const resolvers: Array<(v: boolean) => void> = [];
+    const onSend = vi.fn<ChatInputProps['onSend']>().mockImplementation(
+      () => new Promise<boolean>((resolve) => { resolvers.push(resolve); }),
+    );
+    const view = renderComposer({ draftKey: 'market:panel:ws-1:NVDA', onSend }, { userId: 'u-1' });
+    fireEvent.change(view.getTextarea(), { target: { value: 'first on old key', selectionStart: 16 } });
+    fireEvent.click(screen.getByLabelText('Send message'));
+    expect(load('market:panel:ws-1:NVDA', 'u-1')).toBe('first on old key');
+
+    view.rerenderComposer({ draftKey: 'market:panel:th-9', onSend });
+    fireEvent.change(view.getTextarea(), { target: { value: 'second on new key', selectionStart: 17 } });
+    fireEvent.click(screen.getByLabelText('Send message'));
+
+    await act(async () => {
+      resolvers[0](true);
+    });
+    expect(load('market:panel:ws-1:NVDA', 'u-1')).toBe('');
+    expect(load('market:panel:th-9', 'u-1')).toBe('second on new key');
+    view.unmount();
+  });
+
   it('acceptSend settles the draft as sent before the stream ends, and a later failure does not restore it', async () => {
     // The wiring useChatMessages provides: onAccepted fires when the server
     // takes the send (run_id metadata), long before the stream promise

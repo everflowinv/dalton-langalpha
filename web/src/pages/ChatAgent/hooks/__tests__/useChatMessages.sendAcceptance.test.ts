@@ -60,6 +60,9 @@ describe('useChatMessages – send acceptance (DALTON composer drafts)', () => {
       async (_msg: string, _ws: string, _tid: string | null, opts: StreamOptions) => {
         opts.onEvent?.({ event: 'thread_id', thread_id: 'thread-accept-1' });
         opts.onRunIdResolved?.('run-accept-1', 'thread-accept-1');
+        // The header's run id is minted before admission: not acceptance yet.
+        await Promise.resolve();
+        opts.onEvent?.({ event: 'metadata', thread_id: 'thread-accept-1', run_id: 'run-accept-1' } as never);
         await new Promise(() => {});
         return { disconnected: false };
       },
@@ -90,6 +93,8 @@ describe('useChatMessages – send acceptance (DALTON composer drafts)', () => {
       async (_msg: string, _ws: string, _tid: string | null, opts: StreamOptions) => {
         opts.onEvent?.({ event: 'thread_id', thread_id: 'thread-accept-2' });
         opts.onRunIdResolved?.('run-accept-2', 'thread-accept-2');
+        opts.onEvent?.({ event: 'metadata', thread_id: 'thread-accept-2', run_id: 'run-accept-2' } as never);
+        opts.onEvent?.({ event: 'metadata', thread_id: 'thread-accept-2', run_id: 'run-accept-2' } as never);
         return { disconnected: false };
       },
     );
@@ -106,6 +111,29 @@ describe('useChatMessages – send acceptance (DALTON composer drafts)', () => {
 
     expect(accepted).toHaveBeenCalledTimes(1);
     expect(outcome).toBe(true);
+  });
+
+  it('does not settle on the header run id when admission then refuses the send', async () => {
+    // Content-Location carries a run id minted before admission; the server can
+    // still refuse (compaction, stop, capacity) before START. The draft must stay.
+    mockSendStream.mockImplementation(
+      async (_msg: string, _ws: string, _tid: string | null, opts: StreamOptions) => {
+        opts.onEvent?.({ event: 'thread_id', thread_id: 'thread-accept-3' });
+        opts.onRunIdResolved?.('run-accept-3', 'thread-accept-3');
+        opts.onEvent?.({ event: 'error', error: 'compacting', recovery: 'resend' } as never);
+        return { disconnected: false };
+      },
+    );
+
+    const accepted = vi.fn();
+    const { result } = renderHookWithProviders(() => useChatMessages('ws-test'));
+    await act(async () => {
+      await result.current.handleSendMessage('refused after headers', null, null, {
+        onAccepted: accepted,
+      });
+    });
+
+    expect(accepted).not.toHaveBeenCalled();
   });
 
   it('treats a send stopped while the thread is still being created as accepted — the message is already in the transcript', async () => {
