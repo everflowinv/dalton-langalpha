@@ -24,6 +24,7 @@ from ptc_agent.agent.middleware.runtime_context import (
     TurnContextMiddleware,
     resolve_preferred_market,
 )
+from ptc_agent.agent.middleware.runtime_context.epoch import Workspace
 from ptc_agent.agent.middleware.runtime_context.profile import profile_read_answered
 from ptc_agent.agent.roles import AgentRole
 
@@ -55,8 +56,7 @@ def build_context_middleware(
     turn_context: TurnContext | None = None,
     user_profile: dict | None = None,
     session: Any | None = None,
-    workspace_name: str | None = None,
-    workspace_description: str | None = None,
+    workspace: Workspace | None = None,
     sources: BaselineSources | None = None,
     blocks: dict[str, BlockReader] | None = None,
     user_data_counts: dict[str, Any] | None = None,
@@ -90,8 +90,7 @@ def build_context_middleware(
         ),
         baseline=BaselineContextMiddleware(
             session=session,
-            workspace_name=workspace_name,
-            workspace_description=workspace_description,
+            workspace=workspace,
             sources=sources,
             blocks=blocks,
             user_profile=user_profile,

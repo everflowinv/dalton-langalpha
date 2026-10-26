@@ -357,15 +357,19 @@ class _Harness:
         self, *automations: dict[str, Any]
     ) -> PriceMonitorService:
         svc = PriceMonitorService()
-        sym_map: dict[str, list[dict[str, Any]]] = {}
-        mkt_map: dict[str, MarketType] = {}
+        # Upstream keys _symbol_automations by (symbol, market) listings and
+        # the poll loop reads the merged _listings set _resubscribe maintains.
+        sym_map: dict[tuple[str, MarketType], list[dict[str, Any]]] = {}
         for auto in automations:
             self.register_automation(auto)
             sym = str(auto["trigger_config"]["symbol"]).upper()
-            sym_map.setdefault(sym, []).append(auto)
-            mkt_map[sym] = MarketType.STOCK
+            market = MarketType(
+                str(auto["trigger_config"].get("market", "stock")).lower()
+            )
+            sym_map.setdefault((sym, market), []).append(auto)
         svc._symbol_automations = sym_map
-        svc._symbol_markets = mkt_map
+        svc._automation_listings = set(sym_map)
+        svc._listings = set(sym_map)
         return svc
 
 
@@ -672,9 +676,7 @@ async def test_stale_reference_price_and_failed_snapshot_validation_do_not_mark_
     assert svc._dalton_move_refs.get("NVDA") is None
     assert harness.scheduler.dispatch.call_count == 0
 
-    await svc._evaluator.refresh_references(
-        ["NVDA"], symbol_markets={"NVDA": MarketType.STOCK}
-    )
+    await svc._evaluator.refresh_references([("NVDA", MarketType.STOCK)])
     assert svc._dalton_move_refs.get("NVDA") is None
 
     # Subsequent WS tick on Monday with -6% price cannot evaluate because _dalton_move_refs has no valid entry
@@ -753,7 +755,7 @@ async def test_isolated_dalton_refs_mixed_symbol_interleaved_ws_tick_and_deleted
         ]
     )
     await svc_mixed._poll_snapshots(poll_stock=True, poll_index=False)
-    assert svc_mixed._evaluator._reference_prices["NVDA"] == {
+    assert svc_mixed._evaluator._reference_prices[("NVDA", MarketType.STOCK)] == {
         "previous_close": 100.0,
         "day_open": 99.0,
     }
@@ -824,7 +826,7 @@ async def test_isolated_dalton_refs_mixed_symbol_interleaved_ws_tick_and_deleted
         ]
     )
     await svc_mixed._poll_snapshots(poll_stock=True, poll_index=False)
-    assert svc_mixed._evaluator._reference_prices["NVDA"]["previous_close"] == 100.0
+    assert svc_mixed._evaluator._reference_prices[("NVDA", MarketType.STOCK)]["previous_close"] == 100.0
     assert len(harness.scheduler.dispatch.call_args_list) == 4
     assert (
         harness.scheduler.dispatch.call_args_list[-1].args[0]["automation_id"]
@@ -856,7 +858,7 @@ async def test_isolated_dalton_refs_mixed_symbol_interleaved_ws_tick_and_deleted
         automation_id: str, server_id: str
     ) -> str | None:
         # At this exact point, evaluator._reference_prices["NVDA"]["previous_close"] is 100.0
-        assert svc_mixed._evaluator._reference_prices["NVDA"]["previous_close"] == 100.0
+        assert svc_mixed._evaluator._reference_prices[("NVDA", MarketType.STOCK)]["previous_close"] == 100.0
         await svc_mixed._on_message(
             '{"ev":"AM"}',
             {"symbol": "NVDA", "close": 94.0, "time": _ms(mon_open)},
@@ -874,9 +876,9 @@ async def test_isolated_dalton_refs_mixed_symbol_interleaved_ws_tick_and_deleted
     assert "auto-nvda-dalton" not in dispatched_ids
 
     # 3. After deleting the Dalton move task from _symbol_automations, the symbol is handed back to upstream as-is
-    svc_mixed._symbol_automations["NVDA"] = [normal_nvda]
+    svc_mixed._symbol_automations[("NVDA", MarketType.STOCK)] = [normal_nvda]
     remaining_normal = await process_polled_snapshot(
-        svc_mixed, "NVDA", unvalidated_monday_snap, mon_open
+        svc_mixed, "NVDA", MarketType.STOCK, unvalidated_monday_snap, mon_open
     )
     assert remaining_normal == [normal_nvda]
     assert "NVDA" not in svc_mixed._dalton_move_refs

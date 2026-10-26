@@ -34,6 +34,8 @@ from ptc_agent.core.sandbox.runtime import (
     SandboxProvider,
     SandboxRuntime,
     SandboxTransientError,
+    SessionCommandResult,
+    SessionState,
 )
 
 
@@ -96,7 +98,9 @@ class MemoryRuntime(SandboxRuntime):
 
     # -- Execution --
 
-    async def exec(self, command: str, timeout: int = 60) -> ExecResult:
+    async def exec(
+        self, command: str, timeout: int = 60, *, env: dict[str, str] | None = None
+    ) -> ExecResult:
         self._check_running()
         try:
             proc = await asyncio.create_subprocess_shell(
@@ -104,7 +108,7 @@ class MemoryRuntime(SandboxRuntime):
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=self._work_dir,
-                env={**os.environ, **self._env_vars},
+                env={**os.environ, **self._env_vars, **(env or {})},
             )
             stdout_bytes, stderr_bytes = await asyncio.wait_for(
                 proc.communicate(), timeout=timeout
@@ -216,11 +220,31 @@ class MemoryRuntime(SandboxRuntime):
             )
         return entries
 
+    # -- Sessions (not supported in-process) --
+
+    async def create_session(self, session_id: str) -> None:
+        raise NotImplementedError("MemoryRuntime has no sessions")
+
+    async def session_execute(self, session_id: str, command: str) -> str:
+        raise NotImplementedError("MemoryRuntime has no sessions")
+
+    async def session_command_logs(
+        self, session_id: str, command_id: str
+    ) -> SessionCommandResult:
+        raise NotImplementedError("MemoryRuntime has no sessions")
+
+    async def session_logs(self, session_id: str) -> SessionCommandResult | None:
+        raise NotImplementedError("MemoryRuntime has no sessions")
+
+    async def list_sessions(self) -> list[SessionState]:
+        raise NotImplementedError("MemoryRuntime has no sessions")
+
+    async def delete_session(self, session_id: str) -> None:
+        raise NotImplementedError("MemoryRuntime has no sessions")
+
     # -- Capabilities & metadata --
 
-    @property
-    def capabilities(self) -> set[str]:
-        return {"exec", "code_run", "file_io", "archive"}
+    archives = True
 
     async def archive(self) -> None:
         if self._deleted:

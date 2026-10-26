@@ -1,8 +1,8 @@
-import React, { useMemo, useState } from 'react';
+import React, { Suspense, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router';
 import { useTranslation } from 'react-i18next';
 import { useQueryClient } from '@tanstack/react-query';
-import { Pin, Pencil, Copy, Trash2 } from 'lucide-react';
+import { Pin, Pencil, Copy, FolderOutput, Trash2 } from 'lucide-react';
 import { DropdownMenuItem, DropdownMenuSeparator } from '@/components/ui/dropdown-menu';
 import { toast } from '@/components/ui/use-toast';
 import { queryKeys } from '@/lib/queryKeys';
@@ -13,11 +13,19 @@ import { invalidateNewWorkspace, invalidateWorkspaceMembership } from '../hooks/
 import { forgetStableNavOrder } from '../hooks/useNavigationData';
 import { forgetSharedWorkspaceThreads } from '@/lib/navThreadsStore';
 import { removeStoredThreadId } from '../hooks/utils/threadStorage';
+import { useComputers } from '../hooks/useComputers';
+import { liveComputers, takesWorkspaces } from '../utils/computerStatus';
 import { clearAllMarketThreadsForWorkspace } from '../../MarketView/utils/threadPersistence';
 import { forgetNavPanelExpansion } from './navExpansionStore';
+import { lazyWithMotion } from '@/lib/lazyWithMotion';
 import { scrollMemory } from '@/lib/scrollMemory';
 import DeleteConfirmModal from './DeleteConfirmModal';
 import DuplicateWorkspaceDialog from './DuplicateWorkspaceDialog';
+import { WorkspaceMoveOutcomes } from './WorkspaceMoveOutcomes';
+
+// Lazy: the sidebar mounts these actions on every page, and the dialog brings
+// framer, which stays off the first load.
+const MoveWorkspaceDialog = lazyWithMotion(() => import('./MoveWorkspaceDialog'));
 
 /** Minimal workspace shape the menu + actions need — both the gallery's richer
  *  record and the nav tree's loose entry satisfy it. */
@@ -26,6 +34,8 @@ export interface MenuWorkspace {
   name?: string;
   status?: string;
   is_pinned?: boolean;
+  is_home?: boolean;
+  computer_id?: string | null;
   [key: string]: unknown;
 }
 
@@ -34,6 +44,8 @@ interface WorkspaceMenuItemsProps<W extends MenuWorkspace> {
   onTogglePin?: (workspace: W) => void;
   onRename?: (workspace: W) => void;
   onDuplicate: (workspace: W) => void;
+  /** Absent where moving isn't offered; shown only when there is somewhere to move to. */
+  onMove?: (workspace: W) => void;
   onDelete: (workspace: W) => void;
 }
 
@@ -48,9 +60,20 @@ export function WorkspaceMenuItems<W extends MenuWorkspace>({
   onTogglePin,
   onRename,
   onDuplicate,
+  onMove,
   onDelete,
 }: WorkspaceMenuItemsProps<W>) {
   const { t } = useTranslation();
+  // Read from the list the fan-out already holds. The menu mounts only while
+  // open, so a page without that list fetches it on the first open alone.
+  const { data: computerData } = useComputers({ enabled: !!onMove });
+  // Home moves only with the primary, and a row with no computer has no
+  // folder to move. Two machines that take workspaces always leave one that
+  // is not this workspace's.
+  const canMove =
+    !workspace.is_home
+    && !!workspace.computer_id
+    && liveComputers(computerData?.computers).filter(takesWorkspaces).length >= 2;
 
   return (
     <>
@@ -71,6 +94,12 @@ export function WorkspaceMenuItems<W extends MenuWorkspace>({
         <Copy className="h-4 w-4" />
         {t('workspace.duplicate', 'Duplicate')}
       </DropdownMenuItem>
+      {onMove && canMove && (
+        <DropdownMenuItem onSelect={() => onMove(workspace)}>
+          <FolderOutput className="h-4 w-4" />
+          {t('workspace.move.menu', 'Move to computer…')}
+        </DropdownMenuItem>
+      )}
       <DropdownMenuSeparator />
       <DropdownMenuItem variant="destructive" onSelect={() => onDelete(workspace)}>
         <Trash2 className="h-4 w-4" />
@@ -82,6 +111,7 @@ export function WorkspaceMenuItems<W extends MenuWorkspace>({
 
 export interface WorkspaceActions {
   openDuplicate: (workspace: MenuWorkspace) => void;
+  openMove: (workspace: MenuWorkspace) => void;
   openDelete: (workspace: MenuWorkspace) => void;
   /** Render once at the host's root — the confirm/config dialogs. */
   dialogs: React.ReactNode;
@@ -99,7 +129,7 @@ export interface UseWorkspaceActionsOptions {
 }
 
 /**
- * Self-contained duplicate / delete actions with their dialogs. The canonical implementation for every host (gallery card,
+ * Self-contained duplicate / move / delete actions with their dialogs. The canonical implementation for every host (gallery card,
  * sidebar tree, mobile drawer): same mutations, entitlement mapping, toasts,
  * and delete cleanup; deleting the currently-open workspace navigates back to
  * the gallery. Host-specific presentation lands in the two callbacks.
@@ -115,6 +145,10 @@ export function useWorkspaceActions({
 
   const [duplicateTarget, setDuplicateTarget] = useState<MenuWorkspace | null>(null);
   const [duplicateBusy, setDuplicateBusy] = useState(false);
+  const [moveTarget, setMoveTarget] = useState<MenuWorkspace | null>(null);
+  // Latched once opened, so closing animates out rather than unmounting.
+  const [moveNeeded, setMoveNeeded] = useState(false);
+  if (moveTarget && !moveNeeded) setMoveNeeded(true);
   const [deleteTarget, setDeleteTarget] = useState<MenuWorkspace | null>(null);
   const [deleteBusy, setDeleteBusy] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
@@ -184,6 +218,14 @@ export function useWorkspaceActions({
         onConfirm={() => void handleDuplicateConfirm()}
         busy={duplicateBusy}
       />
+      {moveNeeded && (
+        <Suspense fallback={null}>
+          <MoveWorkspaceDialog target={moveTarget} onClose={() => setMoveTarget(null)} />
+        </Suspense>
+      )}
+      {/* Every host carries it, so an ending is told wherever the user is;
+          each one is handed out once however many are mounted. */}
+      <WorkspaceMoveOutcomes />
       <DeleteConfirmModal
         isOpen={!!deleteTarget}
         workspaceName={deleteTarget?.name || ''}
@@ -199,6 +241,7 @@ export function useWorkspaceActions({
   // one stable set.
   const actions = useMemo<Omit<WorkspaceActions, 'dialogs'>>(() => ({
     openDuplicate: setDuplicateTarget,
+    openMove: setMoveTarget,
     openDelete: (ws) => { setDeleteTarget(ws); setDeleteError(null); },
   }), []);
 

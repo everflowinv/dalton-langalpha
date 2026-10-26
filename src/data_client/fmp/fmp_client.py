@@ -21,6 +21,15 @@ _CACHE_MAX_SIZE = 512
 
 logger = logging.getLogger(__name__)
 
+# Stable's ``economic-indicators`` answers at most this many days ending at
+# ``to``, so an indicator is read back in windows of that span from today in
+# UTC. Another implementation of this tool surface should walk the same windows
+# with the same caps and batches, so both serve the same rows.
+_INDICATOR_WINDOW_DAYS = 91
+_INDICATOR_MAX_WINDOWS = 64
+_INDICATOR_MAX_EMPTY_RUN = 16
+_INDICATOR_MAX_BATCH = 8
+
 
 def _vendor_symbol_params(params: Dict[str, Any]) -> Dict[str, Any]:
     """Respell the symbol params in FMP's form.
@@ -1145,9 +1154,58 @@ class FMPClient:
     # =====================================================================
 
     async def get_economic_indicators(self, name: str, limit: int = 50) -> List[Dict]:
-        return await self._make_request(
-            "economic-indicators", params={"name": name, "limit": limit}
-        )
+        """The newest ``limit`` observations of an indicator, newest first.
+
+        Stable ignores ``limit`` and answers at most the 91 days ending at
+        ``to``, clamping a longer range without a word, so a quarterly series
+        such as GDP has nothing in its default window. The series is read back
+        a window at a time instead, the first alone and then a widening batch,
+        until ``limit`` rows are in hand. An answer that is not a list is FMP's
+        refusal and is returned as it came, as the single read returned it.
+        """
+        found: Dict[str, Dict] = {}
+        end = _today_utc()
+        batch, walked, empty_run = 1, 0, 0
+        while walked < _INDICATOR_MAX_WINDOWS:
+            spans = []
+            for _ in range(min(batch, _INDICATOR_MAX_WINDOWS - walked)):
+                start = end - timedelta(days=_INDICATOR_WINDOW_DAYS - 1)
+                spans.append((start.isoformat(), end.isoformat()))
+                end = start - timedelta(days=1)
+            walked += len(spans)
+            answers = await asyncio.gather(
+                *(
+                    self._make_request(
+                        "economic-indicators",
+                        params={"name": name, "from": lo, "to": hi},
+                    )
+                    for lo, hi in spans
+                ),
+                return_exceptions=True,
+            )
+            # Newest first, in window order rather than completion order: a
+            # window older than the rows already in hand, or past the empty run
+            # that ends the series, is not needed, and neither is its failure.
+            for (lo, hi), answer in zip(spans, answers):
+                if len(found) >= limit or empty_run >= _INDICATOR_MAX_EMPTY_RUN:
+                    break
+                if isinstance(answer, BaseException):
+                    raise answer
+                if not isinstance(answer, list):
+                    return answer
+                inside = [
+                    row
+                    for row in answer
+                    if isinstance(row, dict) and lo <= str(row.get("date"))[:10] <= hi
+                ]
+                for row in inside:
+                    found.setdefault(row["date"], row)
+                empty_run = 0 if inside else empty_run + 1
+            if len(found) >= limit or empty_run >= _INDICATOR_MAX_EMPTY_RUN:
+                break
+            batch = min(batch * 2, _INDICATOR_MAX_BATCH)
+        rows = sorted(found.values(), key=lambda row: row["date"], reverse=True)
+        return rows[: max(limit, 0)]
 
     async def get_economic_calendar(
         self, from_date: Optional[str] = None, to_date: Optional[str] = None

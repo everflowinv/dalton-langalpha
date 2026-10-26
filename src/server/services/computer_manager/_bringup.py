@@ -323,7 +323,7 @@ class BringUpMixin:
                 sandbox,
                 sandbox_id,
                 root or DEFAULT_ROOT_DIR,
-                lambda ws: self._projects_attached.discard((ws, sandbox_id)),
+                lambda ws: self._projects_attached.pop((ws, sandbox_id), None),
             )
 
             async def _run(job: BringUp) -> None:

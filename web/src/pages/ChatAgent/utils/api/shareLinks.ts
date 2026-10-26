@@ -50,12 +50,14 @@ export async function createFileGrant(workspaceId: string): Promise<FileGrant> {
 
 /**
  * The absolute link a user pastes somewhere: the app origin plus `/a/<code>`.
- * An app's `path` opens it at that page rather than the link's own entry,
- * which moves whenever the agent publishes another page on the same port.
+ * An app's `path` opens it at that page, the root as `/`, rather than the
+ * link's own entry, which moves whenever the agent publishes another page on
+ * the same port; only a link with no `path` follows the entry.
  */
 export function shareLinkHref(code: string, path?: string | null): string {
-  const page = path?.replace(/^\/+/, '');
-  return `${window.location.origin}/a/${code}${page ? `?${new URLSearchParams({ path: page })}` : ''}`;
+  const href = `${window.location.origin}/a/${code}`;
+  if (path == null) return href;
+  return `${href}?${new URLSearchParams({ path: path.replace(/^\/+/, '') || '/' })}`;
 }
 
 /**

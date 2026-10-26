@@ -5,6 +5,7 @@ import { Loader } from '@/components/ui/loader';
 import { toast } from '@/components/ui/use-toast';
 import { useCopyShareLink } from '@/hooks/useCopyShareLink';
 import { useShareLink } from '@/hooks/useShareLink';
+import { shareLinkHref } from '../../utils/api/shareLinks';
 import type { PreviewEntry } from './usePreviews';
 
 interface PreviewCrumbsProps {
@@ -12,8 +13,10 @@ interface PreviewCrumbsProps {
   onRefresh: () => void;
   // DALTON-HOOK(team-sharing): disable refresh button in colleague mirror mode
   refreshDisabled?: boolean;
-  /** The owner's workspace; null on a read-only panel, which offers no link. */
+  /** The workspace the app runs in, whose `/a/` link opens it in a tab. */
   workspaceId?: string | null;
+  /** A read-only panel opens the app's link but offers no copy of it. */
+  readOnly?: boolean;
 }
 
 /**
@@ -22,19 +25,19 @@ interface PreviewCrumbsProps {
  * carries no chrome of its own — the tab's X is its close, and this row is
  * where everything else lives, so the panel keeps one header shape.
  */
-export function PreviewCrumbs({ entry, onRefresh, refreshDisabled = false, workspaceId = null }: PreviewCrumbsProps): React.ReactElement {
+export function PreviewCrumbs({ entry, onRefresh, refreshDisabled = false, workspaceId = null, readOnly = false }: PreviewCrumbsProps): React.ReactElement {
   const { t } = useTranslation();
   const name = entry.title || t('filePanel.previewTab');
 
   // An app's link is private, so minting it on open costs nothing and
-  // lets the copy land inside the click.
+  // lets the copy, or the tab it opens, land inside the click.
   const { data: link } = useShareLink(workspaceId, { kind: 'app', port: entry.port });
   const { copy, copiedCode } = useCopyShareLink();
   const copied = !!link && copiedCode === link.code;
 
   // The check confirms the copy; the toast says who the link opens for.
   const copyLink = async () => {
-    if (link && await copy(link.code, entry.path)) toast({ description: t('shareLink.copiedPrivate') });
+    if (link && await copy(link.code, entry.path ?? '/')) toast({ description: t('shareLink.copiedPrivate') });
   };
 
   return (
@@ -50,7 +53,7 @@ export function PreviewCrumbs({ entry, onRefresh, refreshDisabled = false, works
           {entry.path}
         </span>
       )}
-      {workspaceId && (
+      {workspaceId && !readOnly && (
         <button
           type="button"
           onClick={() => void copyLink()}
@@ -75,13 +78,15 @@ export function PreviewCrumbs({ entry, onRefresh, refreshDisabled = false, works
       >
         {entry.loading ? <Loader size={14} className="text-current" /> : <RefreshCw className="h-3.5 w-3.5" />}
       </button>
+      {/* The link, never the frame's URL: that one is a short-lived key the
+          app opens for whoever holds it, and a tab on it dies when it lapses. */}
       <button
         type="button"
-        onClick={() => window.open(entry.url, '_blank', 'noopener,noreferrer')}
+        onClick={() => link && window.open(shareLinkHref(link.code, entry.path ?? '/'), '_blank', 'noopener,noreferrer')}
         className="file-panel-icon-btn shrink-0"
         title={t('filePanel.openInBrowser')}
         aria-label={t('filePanel.openInBrowser')}
-        disabled={!entry.url}
+        disabled={!link}
       >
         <ExternalLink className="h-3.5 w-3.5" />
       </button>

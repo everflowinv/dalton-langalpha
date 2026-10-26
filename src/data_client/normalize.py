@@ -5,8 +5,8 @@ Single source of truth for converting the canonical
 exchange-local timestamps.
 
 Also holds the legacy-path minor-unit scale helpers: providers that quote a
-venue in a currency's minor unit (XLON equities quote GBX/pence) multiply
-price-like fields by ``minor_unit_scale`` on the legacy bar/snapshot path so
+venue in a currency's minor unit (XLON equities quote GBX/pence) shift
+price-like fields by ``minor_unit_places`` on the legacy bar/snapshot path so
 the wire values are major units. The protocol path applies the same rule
 independently inside each provider's ``normalize_series`` — the two never
 chain, so conversion happens exactly once per path.
@@ -24,10 +24,11 @@ from market_protocol import (
     Series,
     market_home,
     to_canonical,
+    to_major_units,
 )
 from market_protocol import build_series as _build_series
 from market_protocol.enums import AssetClass, PriceTreatment, Tier
-from market_protocol.symbology import UNKNOWN_MIC
+from market_protocol.symbology import MINOR_UNIT_PLACES, UNKNOWN_MIC
 
 # Snapshot fields whose values carry a price and therefore scale with the
 # quote's minor-currency unit. change_percent (and pre/post percents) are
@@ -195,38 +196,38 @@ def build_series(
     )
 
 
-def minor_unit_scale(symbol: str) -> float:
-    """Legacy-path price scale for *symbol*: 0.01 when quoted in GBX (pence).
+def minor_unit_places(symbol: str) -> int:
+    """Legacy-path decimal places to *symbol*'s major unit: 2 when quoted in GBX (pence).
 
     Resolved once per fetch from the canonical instrument's ``display_unit``
-    (XLON equities quote in pence). Falls back to 1.0 for anything unresolvable.
+    (XLON equities quote in pence). Falls back to 0 for anything unresolvable.
     """
     try:
-        return 0.01 if to_canonical(symbol).display_unit == "GBX" else 1.0
+        return MINOR_UNIT_PLACES.get(to_canonical(symbol).display_unit or "", 0)
     except Exception:
-        return 1.0
+        return 0
 
 
-def scale_price(value: Any, scale: float) -> Any:
-    """Return ``value * scale`` for numerics; pass None/non-numeric through.
+def scale_price(value: Any, places: int) -> Any:
+    """*value* shifted *places* decimal places to major units; None/non-numeric pass through.
 
-    A ``scale`` of 1.0 returns the value untouched (identity, no float cast),
+    Zero places returns the value untouched (identity, no float cast),
     preserving exact legacy behavior for non-pence instruments.
     """
-    if scale == 1.0 or value is None:
+    if not places or value is None:
         return value
     try:
-        return float(value) * scale
+        return to_major_units(float(value), places)
     except (TypeError, ValueError):
         return value
 
 
-def scale_snapshot_prices(snap: dict, scale: float) -> dict:
-    """In-place ×scale of price-like snapshot fields; percents/volume untouched."""
-    if scale != 1.0:
+def scale_snapshot_prices(snap: dict, places: int) -> dict:
+    """In-place shift of price-like snapshot fields to major units; percents/volume untouched."""
+    if places:
         for field in _SNAPSHOT_PRICE_FIELDS:
             if snap.get(field) is not None:
-                snap[field] = scale_price(snap[field], scale)
+                snap[field] = scale_price(snap[field], places)
     return snap
 
 
@@ -255,6 +256,12 @@ def _as_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _field(bar: dict, name: str, short: str) -> Any:
+    """*name*, or its one-letter form when *name* is absent; a zero is a value, not a gap."""
+    value = bar.get(name)
+    return bar.get(short) if value is None else value
 
 
 def populated(data: Any) -> bool:
@@ -301,11 +308,11 @@ def normalize_bars(
             date_str = bar.get("date", "")
         normalized.append({
             "date": date_str,
-            "open": _as_float(bar.get("open") or bar.get("o")),
-            "high": _as_float(bar.get("high") or bar.get("h")),
-            "low": _as_float(bar.get("low") or bar.get("l")),
-            "close": _as_float(bar.get("close") or bar.get("c")),
-            "volume": _as_float(bar.get("volume") or bar.get("v")),
+            "open": _as_float(_field(bar, "open", "o")),
+            "high": _as_float(_field(bar, "high", "h")),
+            "low": _as_float(_field(bar, "low", "l")),
+            "close": _as_float(_field(bar, "close", "c")),
+            "volume": _as_float(_field(bar, "volume", "v")),
         })
     normalized.sort(key=lambda r: r["date"], reverse=True)
     return normalized

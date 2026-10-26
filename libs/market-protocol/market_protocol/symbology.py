@@ -16,6 +16,7 @@ from __future__ import annotations
 import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass
+from decimal import Decimal
 from functools import lru_cache
 from importlib.resources import files
 from types import MappingProxyType
@@ -269,9 +270,22 @@ _SEED_FIELDS = frozenset(
 )
 
 # Minor quote units, by the decimal places to their major unit. The series
-# builder divides by these, so any other display_unit would be served
+# builder shifts by these, so any other display_unit would be served
 # unscaled, and a seed may name only these.
 MINOR_UNIT_PLACES: Mapping[str, int] = MappingProxyType({"GBX": 2})
+
+
+def to_major_units(value: float, places: int) -> float:
+    """*value* in a minor unit, moved *places* decimal places to its major unit.
+
+    The shift is decimal, on the float's shortest repr: 120.65 pence is 1.2065
+    pounds, where binary ``* 0.01`` leaves 1.2065000000000001. Rounding would
+    instead cut genuine digits, such as a 120.7625p VWAP. Zero places returns
+    *value* itself, so a price quoted in its major unit passes bit-identical.
+    """
+    if not places:
+        return value
+    return float(Decimal(repr(float(value))).scaleb(-places))
 
 _CALENDAR_IDS = frozenset(
     {info.calendar_id for info in _MICS.values()} | {ALWAYS_24_7, WEEKDAYS_24_5}

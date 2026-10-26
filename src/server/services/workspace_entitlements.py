@@ -9,6 +9,7 @@ from contextlib import AsyncExitStack
 from dataclasses import replace
 from typing import Any, Dict
 
+from ptc_agent.core.sandbox.providers import provider_class
 from ptc_agent.core.session import Session
 
 from src.server.database.computer import (
@@ -61,9 +62,7 @@ class WorkspaceEntitlementsMixin:
         if not await spec_entitlement_lost(user_id, tier):
             return tier
         computer_id = binding.computer_id
-        settings = self._provider_settings(
-            binding.kind or self.config.sandbox.provider, binding.provider_config
-        )
+        settings = self._provider_settings(binding.kind, binding.provider_config)
         standard = settings.resource_tiers.get("standard")
         if standard is None:
             logger.warning("No standard tier for computer %s; keeping %s", computer_id, tier)
@@ -188,20 +187,17 @@ class WorkspaceEntitlementsMixin:
         Interval 0 (never auto-stop) when enabled, else the configured default.
         Reuses ``runtime`` when the caller already holds a connected one (the
         reconnect path) to avoid a throwaway provider and an extra round trip.
-        No-ops if the runtime lacks the ``autostop`` capability.
+        No-ops on a runtime that does not auto-stop.
         """
         settings = (
             self._provider_settings(binding.kind, binding.provider_config)
-            if binding is not None and binding.kind
-            else self.config.sandbox.daytona
+            if binding is not None
+            else self.config.sandbox.settings_for(self.config.sandbox.provider)
         )
-        interval = getattr(
-            settings, "auto_stop_interval", self.config.sandbox.daytona.auto_stop_interval
-        )
-        minutes = 0 if enabled else interval // 60
+        minutes = 0 if enabled else settings.auto_stop_interval // 60
 
         if runtime is not None:
-            if "autostop" in runtime.capabilities:
+            if runtime.autostops:
                 await runtime.set_autostop_interval(minutes)
             return
 
@@ -210,7 +206,7 @@ class WorkspaceEntitlementsMixin:
         # sandbox that may not live there, which is the whole reason a computer
         # carries provider_kind and provider_config.
         async with self._detached_runtime(sandbox_id, binding=binding) as detached:
-            if "autostop" in detached.capabilities:
+            if detached.autostops:
                 await detached.set_autostop_interval(minutes)
 
     async def set_workspace_always_on(
@@ -250,6 +246,11 @@ class WorkspaceEntitlementsMixin:
                 if not computer:
                     raise ValueError(f"Computer {computer_id} not found")
                 owner_id = str(computer["user_id"])
+                if enabled and not computer.get("is_always_on"):
+                    if not provider_class(computer["kind"]).holds_always_on:
+                        raise RuntimeError(
+                            "Always-on isn't available for this computer's provider"
+                        )
                 from src.server.dependencies.usage_limits import (
                     assert_always_on_allowed,
                     platform_gating_active,

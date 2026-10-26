@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional, Sequence
 from psycopg.rows import dict_row
 from psycopg.types.json import Json
 
+from src.server.database.home_workspace import get_home_workspace_id
 from src.server.database.pool import get_db_connection
 from src.server.database.sql_fences import (
     COMPUTER_COLS as _COMPUTER_COLS,
@@ -39,15 +40,6 @@ __all__ = [
 ]
 
 logger = logging.getLogger(__name__)
-
-# A user reads the name before anything else about the machine, so it says
-# where the machine runs: Daytona is the hosted default, Docker is theirs.
-COMPUTER_NAMES_BY_KIND = {"daytona": "Cloud computer", "docker": "Local computer"}
-
-
-def default_computer_name(kind: str) -> str:
-    return COMPUTER_NAMES_BY_KIND.get(kind, COMPUTER_NAMES_BY_KIND["daytona"])
-
 
 DEFAULT_ROOT_DIR = "/home/workspace"
 
@@ -106,6 +98,24 @@ async def computer_capacity_lock(user_id: str):
 def computer_advisory_key(computer_id: str) -> int:
     """Use the C(computer) domain to avoid collisions with bare 32-bit workspace hashtext locks."""
     return advisory_key("C", computer_id)
+
+
+async def get_live_computer_kinds(*, conn=None) -> Dict[str, int]:
+    """Count the computers not deleted, per provider kind.
+
+    A kind stays served for as long as computers of it exist, so a provider
+    switch keeps the old kind's Secrets current with no config to remember.
+    """
+    async with _computer_cursor(conn) as cur:
+        await cur.execute(
+            """
+            SELECT kind, count(*) AS computers
+            FROM computers
+            WHERE status <> 'deleted'
+            GROUP BY kind
+            """
+        )
+        return {str(r["kind"]): int(r["computers"]) for r in await cur.fetchall()}
 
 
 def bind_provider_ref_statement(
@@ -193,8 +203,10 @@ async def get_computer_for_workspace(
 
     The join already has the project's row, so ``dir_name`` rides along: the
     binding needs the folder as often as it needs the machine, and a second
-    query for it is a second answer that can disagree with this one. None is
-    normal for an unbound Home and backfill shared-sandbox tie-break losers.
+    query for it is a second answer that can disagree with this one, and so
+    does ``files_epoch``, which says which arrival of the files a worker's
+    record of the folder is for. None is normal for an unbound Home and
+    backfill shared-sandbox tie-break losers.
     """
     workspace_id = normalize_uuid(workspace_id)
     if workspace_id is None:
@@ -203,7 +215,7 @@ async def get_computer_for_workspace(
     async with _computer_cursor(conn) as cur:
         await cur.execute(
             f"""
-            SELECT {computer_cols("c")}, w.dir_name
+            SELECT {computer_cols("c")}, w.dir_name, w.files_epoch
             FROM computers c
             JOIN workspaces w ON w.computer_id = c.computer_id
             WHERE w.workspace_id = %s AND c.{FENCE_NOT_DELETED}
@@ -285,6 +297,29 @@ async def get_computers_for_user(
         return [dict(r) for r in await cur.fetchall()]
 
 
+async def get_computer_names_and_home(
+    user_id: str,
+    *,
+    conn=None,
+) -> List[Dict[str, Any]]:
+    """The user's live computers by id and name, each flagged when the user's
+    Home is on it: the names and the Home binding from one snapshot."""
+    async with _computer_cursor(conn) as cur:
+        await cur.execute(
+            f"""
+            SELECT c.computer_id, c.name,
+                   c.computer_id IS NOT DISTINCT FROM (
+                       SELECT h.computer_id FROM workspaces h
+                       WHERE h.workspace_id = %(home_id)s AND h.{FENCE_NOT_DELETED}
+                   ) AS is_home
+            FROM computers c
+            WHERE c.user_id = %(user_id)s AND c.{FENCE_NOT_DELETED}
+            """,
+            {"user_id": user_id, "home_id": get_home_workspace_id(user_id)},
+        )
+        return [dict(r) for r in await cur.fetchall()]
+
+
 async def get_primary_computer(
     user_id: str,
     *,
@@ -352,7 +387,11 @@ async def mark_computer_retirement_pending(
     *,
     conn=None,
 ) -> bool:
-    """Durably ask cleanup to finish retiring this machine once it is empty."""
+    """Durably ask cleanup to finish retiring this machine once it is empty.
+
+    True only when this call set the marker, so a request that takes back its
+    own marker can tell it from one another delete left owed.
+    """
     async with _computer_cursor(conn) as cur:
         await cur.execute(
             f"""
@@ -365,6 +404,34 @@ async def mark_computer_retirement_pending(
                 updated_at = NOW()
             WHERE computer_id = %s
               AND {FENCE_NOT_DELETED}
+              AND NOT COALESCE(config, '{{}}'::jsonb)
+                    @> '{{"retire_when_empty": true}}'::jsonb
+            """,
+            (computer_id,),
+        )
+        return cur.rowcount > 0
+
+
+async def defer_computer_retirement(
+    computer_id: str,
+    *,
+    conn=None,
+) -> bool:
+    """Move a pending retirement behind newer ones in the sweep's order.
+
+    Only while it is still pending: a marker taken off since the sweep read it
+    was settled by whoever took it off, and putting it back would retire a
+    computer its owner was told stays.
+    """
+    async with _computer_cursor(conn) as cur:
+        await cur.execute(
+            f"""
+            UPDATE computers
+            SET updated_at = NOW()
+            WHERE computer_id = %s
+              AND {FENCE_NOT_DELETED}
+              AND COALESCE(config, '{{}}'::jsonb)
+                    @> '{{"retire_when_empty": true}}'::jsonb
             """,
             (computer_id,),
         )
@@ -398,7 +465,7 @@ async def create_computer(
     user_id: str,
     *,
     kind: str = "daytona",
-    name: Optional[str] = None,
+    name: str,
     is_primary: bool = False,
     status: str = "creating",
     resource_tier: str = "standard",
@@ -418,8 +485,6 @@ async def create_computer(
     predates the computers table; a machine minted for a new project is born
     unprovisioned and gets its ref from try_bind_computer_provider_ref."""
     from psycopg.errors import UniqueViolation
-
-    name = name or default_computer_name(kind)
 
     async def _insert(want_primary: bool) -> Dict[str, Any]:
         async with _computer_cursor(conn) as cur:

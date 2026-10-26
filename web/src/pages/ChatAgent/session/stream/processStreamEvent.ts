@@ -12,7 +12,7 @@ import { noteLiveRun } from '../latestRun';
 import type { StructuredError } from '@/utils/rateLimitError';
 import { applyAnnotationArtifact } from '@/pages/MarketView/stores/chartAnnotationStore';
 import type { AssistantMessage, ChatMessage } from '@/types/chat';
-import { CREDIT_STOP_ERROR_TYPE, isDeliveredReport } from '@/types/sse';
+import { CREDIT_STOP_ERROR_TYPE, isDeliveredMarketAlert, isDeliveredSteer } from '@/types/sse';
 import { setStoredThreadId } from '../../hooks/utils/threadStorage';
 import { createAssistantMessage, updateMessage } from '../../hooks/utils/messageHelpers';
 import { turnOf } from '../../components/messageList/turnProjection';
@@ -42,7 +42,9 @@ import {
   type DeliveredInstruction,
 } from '../subagents/liveEventHandlers';
 import { getOrCreateTaskRefs, type UpdateSubagentCard } from '../streamRefs';
-import { handleMarketWatchUpdate, type MarketWatchState } from '../marketWatchEvents';
+import {
+  handleMarketWatchUpdate, wakeAlertRow, withLiveWakeRow, type MarketWatchState,
+} from '../marketWatchEvents';
 import type {
   SSEEvent, StreamProcessorRefs, ModelStatus,
 } from '../types';
@@ -60,6 +62,9 @@ export interface StreamRouterDeps {
   releaseStreamOwnership: () => void;
   attachSubagentMux: (tid: string, processEvent: (event: SSEEvent) => void, snapshotAtMs?: number) => void;
   setMarketWatch: React.Dispatch<React.SetStateAction<MarketWatchState | null>>;
+  /** Re-read the thread's watch and targets, after a target's state moved
+   * on the server. */
+  refreshMarketWatch: () => void;
   /** Re-read the workspace row, whose folder a run's sandbox acquisition may
    * have moved; null with no workspace. */
   refreshWorkspaceFolder: (() => void) | null;
@@ -137,6 +142,11 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
   // This ensures the tool-call index is populated before tool_call_result.
   const pendingTaskToolCallIds: string[] = [];
 
+  // The agent's watch_market calls still to answer. A call may arm, replace or
+  // cancel a target, and a live stamp carries no targets, so its result is
+  // when the chip and the Status panel re-read them rather than at turn end.
+  const pendingWatchCallIds = new Set<string>();
+
   // Append a notification segment to a task card's latest assistant message
   // (transcript notice inside the subagent detail view). No-ops before the
   // task has an assistant message — status still surfaces via chan_close.
@@ -203,6 +213,16 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
           const { run_id: runId, report_source: source, turn_index: turn } = event;
           const beforeId = rt.currentMessageRef.current;
           rt.setMessages((prev) => withLiveReportRow(prev, runId, source, beforeId, turn));
+        } else if (event.market_target && typeof event.turn_index === 'number') {
+          // A target's wake, attached live, draws its alert row from this
+          // frame, keyed on the turn as replay keys it, so a later load
+          // replaces it rather than drawing a second.
+          const row = wakeAlertRow(event.turn_index, { market_target: event.market_target }, new Date());
+          const beforeId = rt.currentMessageRef.current;
+          rt.setMessages((prev) => withLiveWakeRow(prev, row, beforeId));
+          // The wake spent its target, which the chip and the Status panel
+          // would otherwise show armed until the turn ends.
+          deps.refreshMarketWatch();
         }
       }
       // The turn admission gave the run, which a view that missed turns added
@@ -278,9 +298,13 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
     }
 
     // (b) Live market-watch stamp — keep the persistent watch chip current
-    // mid-turn. Swallowed here so it never leaks into the message stream.
+    // mid-turn. Swallowed here so it never leaks into the message stream. The
+    // stamp carries no targets, so the last read's stay.
     if (eventType === 'market_watch_update') {
-      handleMarketWatchUpdate({ event, setMarketWatch: deps.setMarketWatch });
+      handleMarketWatchUpdate({
+        event,
+        setMarketWatch: (next) => deps.setMarketWatch((prev) => ({ ...next, targets: prev?.targets })),
+      });
       return;
     }
 
@@ -303,11 +327,13 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
     if (eventType === 'steering_delivered' && !isSubagent) {
       const oldAssistantId = assistantMessageId;
       const entries = steeringDeliveredEntries(event);
-      // A delivery of reports alone leaves the user's own steer, and the
-      // boundary its acceptance set, for the delivery that takes it. Read
-      // here, not in the rollback updater, which React may run after the
-      // take has nulled both.
-      const effectiveSteeringAtOrder = entries.some((e) => !isDeliveredReport(e)) ? takeSteeringBoundary() : null;
+      // A delivery of reports or price alerts alone leaves the user's own
+      // steer, and the boundary its acceptance set, for the delivery that
+      // takes it. Read here, not in the rollback updater, which React may run
+      // after the take has nulled both.
+      const effectiveSteeringAtOrder = entries.some(isDeliveredSteer) ? takeSteeringBoundary() : null;
+      // An alert moved its target on the server, which the watch panel shows.
+      if (entries.some(isDeliveredMarketAlert)) deps.refreshMarketWatch();
 
       // 1. Roll back old assistant message to the snapshot taken at steering_accepted
       //    time, removing any content that leaked due to stream-mode multiplexing.
@@ -394,8 +420,8 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
       // The bubble being steered: every bubble this creates joins its turn,
       // read from the projection because a report-back's bubble has no stamp.
       const steeredId = assistantMessageId;
-      // 2. Mark delivered the steers it names and draw the rest, reports
-      //    ahead of the user's words.
+      // 2. Mark delivered the steers it names and draw the rest, reports and
+      //    price alerts ahead of the user's words.
       let clearedErrors: unknown[] = [];
       let settledKeys: string[] = [];
       rt.setMessages((prev) => {
@@ -999,6 +1025,7 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
           if ((tc.name === 'task' || tc.name === 'Task') && tc.id && !tc.args?.task_id) {
             pendingTaskToolCallIds.push(tc.id);
           }
+          if (tc.name === 'watch_market' && tc.id) pendingWatchCallIds.add(tc.id);
         }
       }
     } else if (eventType === 'tool_call_result') {
@@ -1044,6 +1071,8 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
       if (preapprovedReportBack(event.content)) deps.armReportBack();
 
       if (isWorkspaceChangingToolSuccess(event.content)) deps.refreshWorkspaces();
+
+      if (toolCallId && pendingWatchCallIds.delete(toolCallId)) deps.refreshMarketWatch();
 
       // Detect navigate_to_workspace action from start_question tool result
       if (rt.onWorkspaceCreated && typeof event.content === 'string') {

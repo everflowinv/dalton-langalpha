@@ -264,7 +264,8 @@ def provenance_metadata(request: ChatRequest) -> dict[str, Any]:
     request's own rather than :func:`turn_surface`'s, which gives a
     report-back the thread's channel although nobody sent it from there; and
     ``report_source`` names what a report-back turn announces, since that
-    turn's own message is model-facing and hidden.
+    turn's own message is model-facing and hidden, as ``market_target`` names
+    the notices a target's wake announces.
     """
     metadata: dict[str, Any] = {}
     if request.origin:
@@ -275,6 +276,8 @@ def provenance_metadata(request: ChatRequest) -> dict[str, Any]:
         metadata["report_source"] = request.report_source.model_dump(
             exclude_none=True
         )
+    if request.market_target:
+        metadata["market_target"] = request.market_target
     return metadata
 
 
@@ -553,14 +556,16 @@ def build_turn_context(
 
 
 def is_notification_turn(request: ChatRequest) -> bool:
-    """Whether this server posted the turn itself to report finished background work.
+    """Whether this server posted the turn itself, to report finished background
+    work or a market target's notice.
 
-    A report-back arrives as a system query with no surface of its own. Nobody
-    sent it, so it speaks where the thread's last turn did rather than naming a
-    surface. ``query_type`` is stripped from every request that is not the
-    server's own (``threads/messaging.py``), so a client cannot claim one.
+    A report-back arrives as a system query with no surface of its own, and a
+    target's wake as a ``market_target`` query. Nobody sent either, so it
+    speaks where the thread's last turn did rather than naming a surface.
+    ``query_type`` is stripped from every request that is not the server's own
+    (``threads/messaging.py``), so a client cannot claim one.
     """
-    return request.query_type == "system" and not request.platform
+    return request.query_type in ("system", "market_target") and not request.platform
 
 
 def turn_surface(request: ChatRequest, prior: PriorThread) -> Optional[str]:

@@ -1,5 +1,6 @@
 /**
- * The machine-level mutations: start and stop, rename, change spec, always-on.
+ * The machine-level mutations: create, start and stop, rename, change spec,
+ * make primary, turning always-on off, remove.
  *
  * These used to hang off a workspace's menu, but tier and always-on are the
  * computer's, and every workspace on it changes with them. They are addressed
@@ -12,9 +13,12 @@ import { useTranslation } from 'react-i18next';
 
 import { toast } from '@/components/ui/use-toast';
 import { queryKeys } from '@/lib/queryKeys';
-import type { ComputersResponse, ResourceTier } from '@/types/api';
+import type { ComputerCreate, ComputersResponse, ResourceTier } from '@/types/api';
 
 import {
+  createComputer,
+  deleteComputer,
+  makeComputerPrimary,
   renameComputer,
   setComputerAlwaysOn,
   setComputerSpec,
@@ -25,11 +29,14 @@ import { entitlementErrorMessage } from '../utils/entitlementErrors';
 import { tierLabel } from '../components/tierUi';
 import { closeComputerSpec } from './computerPanelStore';
 import {
+  addComputerRow,
   invalidateMachine,
   invalidateMachineStorage,
   patchComputerRow,
   patchComputerStatusInCaches,
+  removeComputerRow,
 } from './useComputers';
+import { seedWorkspaceMove, watchMove } from './useWorkspaceMove';
 
 export type PowerAction = 'start' | 'stop';
 
@@ -89,12 +96,31 @@ export function useComputerActions() {
     onError: () => invalidateMachine(queryClient),
   });
 
-  const alwaysOn = useMutation({
-    mutationFn: ({ computerId, enabled }: { computerId: string; enabled: boolean }) =>
-      setComputerAlwaysOn(computerId, enabled),
-    onMutate: ({ computerId, enabled }) => {
+  // A 200 flipped the primary now. A 202 moves Home first and flips when that
+  // move commits, so the move is seeded for the row to follow and watched, so
+  // its ending is told wherever the user is by then. The name rides in the
+  // variables for that toast.
+  const makePrimary = useMutation({
+    mutationFn: ({ computerId }: { computerId: string; name: string }) => makeComputerPrimary(computerId),
+    onSuccess: async (res, { name }) => {
+      if (!res.move) {
+        invalidateMachine(queryClient);
+        return;
+      }
+      await seedWorkspaceMove(queryClient, res.move);
+      watchMove(res.move, name);
+    },
+    // A refusal can mean the rows moved under the dialog (a spec change began,
+    // the machine was removed), so the list re-reads to show why.
+    onError: () => invalidateMachine(queryClient),
+  });
+
+  // Always-on is no longer offered, so turning it off is all that is left.
+  const turnOffAlwaysOn = useMutation({
+    mutationFn: ({ computerId }: { computerId: string }) => setComputerAlwaysOn(computerId, false),
+    onMutate: ({ computerId }) => {
       const snapshot = queryClient.getQueriesData<ComputersResponse | undefined>({ queryKey: queryKeys.computers.lists() });
-      patchComputerRow(queryClient, computerId, { is_always_on: enabled });
+      patchComputerRow(queryClient, computerId, { is_always_on: false });
       return { snapshot };
     },
     onError: (err, _vars, ctx) => {
@@ -108,10 +134,41 @@ export function useComputerActions() {
     onSettled: () => invalidateMachine(queryClient),
   });
 
+  // The new row goes on the list straight away so the dialog can scroll to it;
+  // the refetch then brings the server's count and status. A refusal can mean
+  // the plan or the offered providers moved under the form, so both re-read.
+  const create = useMutation({
+    mutationFn: (body: ComputerCreate) => createComputer(body),
+    onSuccess: (row) => {
+      addComputerRow(queryClient, row);
+      invalidateMachine(queryClient);
+    },
+    onError: () => {
+      invalidateMachine(queryClient);
+      void queryClient.invalidateQueries({ queryKey: queryKeys.computers.providers() });
+    },
+  });
+
+  // The row leaves every list at once, so nothing goes on offering a machine
+  // that is gone; the refetch then confirms it with the server's list. The
+  // name rides in the variables because the row is gone by the time it is read.
+  const remove = useMutation({
+    mutationFn: ({ computerId }: { computerId: string; name: string }) => deleteComputer(computerId),
+    onSuccess: (_res, { computerId, name }) => {
+      removeComputerRow(queryClient, computerId);
+      queryClient.removeQueries({ queryKey: queryKeys.computers.storage(computerId) });
+      invalidateMachine(queryClient);
+      toast({ title: t('computer.removed', '{{name}} removed', { name }) });
+    },
+    // A refusal can mean the row moved under the dialog (a workspace landed,
+    // a start began), so the list re-reads to show why.
+    onError: () => invalidateMachine(queryClient),
+  });
+
   const renameComputerTo = useCallback(
     (computerId: string, name: string) => rename.mutate({ computerId, name }),
     [rename],
   );
 
-  return { power, rename, renameComputerTo, spec, alwaysOn };
+  return { power, rename, renameComputerTo, spec, makePrimary, turnOffAlwaysOn, create, remove };
 }

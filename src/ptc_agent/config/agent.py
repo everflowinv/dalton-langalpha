@@ -17,6 +17,7 @@ from ptc_agent.config.plugins import bundled_skill_dirs
 from ptc_agent.config.core import (
     CoreConfig,
     DaytonaConfig,
+    E2BConfig,
     FilesystemConfig,
     LoggingConfig,
     MCPConfig,
@@ -25,7 +26,8 @@ from ptc_agent.config.core import (
     SecurityConfig,
     create_default_security_config,
     default_sandbox_skills_base,
-    validate_daytona_api_key,
+    detect_provider_kind,
+    validate_sandbox_api_keys,
 )
 
 if TYPE_CHECKING:
@@ -402,6 +404,10 @@ class AgentConfig(BaseModel):
             python_version: Python version in sandbox (default: "3.12")
             auto_stop_interval: Seconds before auto-stop (default: 3600)
 
+        Optional - E2B (used when no Daytona key is set):
+            E2B_API_KEY: Your E2B API key (https://e2b.dev/dashboard?tab=keys)
+            E2B_DOMAIN / E2B_API_URL / E2B_SANDBOX_URL: self-hosted E2B only
+
         Optional - MCP:
             mcp_servers: List[MCPServerConfig] for additional tools (default: [])
 
@@ -447,26 +453,24 @@ class AgentConfig(BaseModel):
         llm_config = LLMConfig(name="custom")
 
         # Resolve provider: explicit > env var > auto-detect from API key presence
-        resolved_provider = provider or os.getenv("SANDBOX_PROVIDER", "")
-        if not resolved_provider:
-            resolved_provider = (
-                "daytona"
-                if (daytona_api_key or os.getenv("DAYTONA_API_KEY"))
-                else "docker"
-            )
+        resolved_provider = (
+            provider
+            or os.getenv("SANDBOX_PROVIDER", "")
+            or detect_provider_kind(daytona_api_key or "")
+        )
 
         # Create Daytona config (required for daytona provider, defaults for others).
         # Defaults live on DaytonaConfig (src/ptc_agent/config/core.py) — the
         # single source of truth for Python-side values. agent_config.yaml is
         # the runtime SSoT and overrides these.
         if resolved_provider == "daytona":
-            api_key = daytona_api_key or os.getenv("DAYTONA_API_KEY", "")
+            _daytona_defaults = DaytonaConfig.from_section(None)
+            api_key = daytona_api_key or _daytona_defaults.api_key
             if not api_key:
                 raise ValueError("DAYTONA_API_KEY must be provided or set in environment")
-            _daytona_defaults = DaytonaConfig()
             daytona_config = DaytonaConfig(
                 api_key=api_key,
-                secret_namespace=os.getenv("DAYTONA_SECRET_NAMESPACE", ""),
+                secret_namespace=_daytona_defaults.secret_namespace,
                 base_url=daytona_base_url,
                 auto_stop_interval=kwargs.pop(
                     "auto_stop_interval", _daytona_defaults.auto_stop_interval
@@ -493,6 +497,10 @@ class AgentConfig(BaseModel):
         else:
             # Non-Daytona providers don't need Daytona config; use defaults
             daytona_config = DaytonaConfig()
+
+        e2b_config = E2BConfig.from_section(None)
+        if resolved_provider == "e2b":
+            e2b_config.require_api_key()
 
         # Create Security config with defaults
         security_defaults = create_default_security_config()
@@ -551,6 +559,7 @@ class AgentConfig(BaseModel):
         sandbox_config = SandboxConfig(
             provider=resolved_provider,
             daytona=daytona_config,
+            e2b=e2b_config,
         )
 
         # Create the config
@@ -577,7 +586,7 @@ class AgentConfig(BaseModel):
     def validate_api_keys(self) -> None:
         """Validate that required API keys are present.
 
-        For configs created via create(), only checks DAYTONA_API_KEY since
+        For configs created via create(), only checks the sandbox provider key since
         the LLM client is passed directly with its own API key.
 
         For configs created via load_from_files(), LLM API key validation
@@ -586,8 +595,7 @@ class AgentConfig(BaseModel):
         Raises:
             ValueError: If required API keys are missing
         """
-        if self.sandbox.provider == "daytona":
-            validate_daytona_api_key(self.sandbox.daytona)
+        validate_sandbox_api_keys(self.sandbox)
 
     def get_llm_client(self) -> "BaseChatModel":
         """Return the LLM client instance.

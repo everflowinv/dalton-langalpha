@@ -41,15 +41,12 @@ from src.server.app.share_access import (
     resolve_link,
 )
 from src.server.app.share_files import share_files_router
-from src.server.app.workspace_sandbox import (
-    owner_preview_url,
-    signed_url_expires_at,
-    with_preview_path,
-)
+from src.server.app.workspace_sandbox import owner_preview_url, with_preview_path
 from src.server.database.conversation.replay_rows import get_replay_thread_data
 from src.server.database.pool import DATABASE_UNAVAILABLE
 from src.server.database.share_links import KIND_APP
 from src.server.services.file_grants import grant_prefix, mint_file_grant, seconds_left
+from src.server.services.preview_links import signed_url_expires_at
 from src.server.utils.api import PageViewer, Viewer, database_unavailable
 from src.server.services.share_redaction import ShareRedaction
 

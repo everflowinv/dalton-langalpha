@@ -106,6 +106,11 @@ html {
   --color-border-elevated: #34363A;
   --color-border-subtle: #26282B;
   --color-border-input: #34363A;
+  /* The edge of a chosen option card. The borders above are hairlines that
+     vanish on bg-elevated, the dialog fill; this one has to read on every
+     fill, so it is a step up from all of them. Neutral: a selection never
+     takes the accent. */
+  --color-border-strong: rgba(230, 230, 228, 0.32);
 
   --color-text-primary: #E6E6E4;
   --color-text-secondary: #9B9FA6;
@@ -294,6 +299,7 @@ html {
   --color-border-elevated: #E3E3E1;
   --color-border-subtle: #EFEFEE;
   --color-border-input: #E3E3E1;
+  --color-border-strong: rgba(31, 31, 30, 0.3);
 
   --color-text-primary: #1F1F1E;
   --color-text-secondary: #73726E;

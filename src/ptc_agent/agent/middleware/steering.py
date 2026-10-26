@@ -2,9 +2,9 @@
 Steering Middleware.
 
 Before each LLM call, takes in what reached the thread while the agent works:
-messages steered into it (by the user or the Chief of Staff) and the
-reports owed to the thread by background work that finished meanwhile. All
-of it waits in the server's outbox, which hands it to the next model call
+messages steered into it (by the user or the Chief of Staff), the
+reports owed to the thread by background work that finished meanwhile, and
+the alerts its market-watch targets raised. All of it waits in the server's outbox, which hands it to the next model call
 rather than to a turn of its own. Messages sent to a background task whose
 run ended before reading them resume that task instead.
 """
@@ -55,12 +55,14 @@ ALL_KINDS: tuple[str, ...] = ("report", "steer")
 
 @dataclass(frozen=True)
 class SteeredReport:
-    """One outbox row a live turn takes in: a report owed to the thread, or
-    a steer (``kind="steer"``) sent into it."""
+    """One outbox row a live turn takes in: a report owed to the thread, a
+    market-watch target's alert (a report the reader is shown as its own
+    row), or a steer (``kind="steer"``) sent into it."""
 
     job_id: str
     content: str                    # what the model reads
     report_source: dict[str, Any] = field(default_factory=dict)  # reader's view
+    market_alert: dict[str, Any] | None = None  # ... when it is an alert
     kind: str = "report"
     sender: str | None = None
     platform: str | None = None
@@ -468,6 +470,17 @@ def _delivered_origin(origin: dict[str, Any] | None) -> dict[str, Any] | None:
     return shown or None
 
 
+def _report_entry(report: SteeredReport, now: float) -> dict[str, Any]:
+    """A taken report's ``steering_delivered`` entry: no text of its own, as
+    the reader is shown an alert's row or what a report reports on."""
+    shown = (
+        {"market_alert": report.market_alert}
+        if report.market_alert is not None
+        else {"report_source": report.report_source}
+    )
+    return {"content": "", **shown, "timestamp": now}
+
+
 def _steer_entry(steer: SteeredReport) -> dict[str, Any]:
     entry: dict[str, Any] = {
         "content": steer.content,
@@ -513,10 +526,7 @@ def _steering_message(
         # messages it queued, oldest first, and it never queued another
         # sender's.
         "count": sum((s.sender or "user") == "user" for s in steers),
-        "messages": [
-            {"content": "", "report_source": report.report_source, "timestamp": now}
-            for report in reports
-        ]
+        "messages": [_report_entry(report, now) for report in reports]
         + [_steer_entry(steer) for steer in steers],
         "timestamp": now,
     }

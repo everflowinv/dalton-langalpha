@@ -298,10 +298,16 @@ export function getInProgressText(rawToolName: string, toolCall: ToolCall | unde
       return tr?.('fetchingSectorData') ?? 'fetching sector data...';
     case 'screen_stocks':
       return tr?.('screeningStocks') ?? 'screening stocks...';
-    case 'watch_market':
-      return args?.action === 'unwatch'
-        ? (tr?.('unwatchingMarket') ?? 'stopping market watch...')
-        : (tr?.('watchingMarket') ?? 'starting market watch...');
+    case 'watch_market': {
+      if (args?.action === 'unwatch') return tr?.('unwatchingMarket') ?? 'stopping market watch...';
+      if (args?.action === 'cancel') return tr?.('cancellingPriceTargets') ?? 'cancelling price targets...';
+      // Targets stand apart from the watch, so a call that sets only targets
+      // starts no watch, and one with neither only reads the state.
+      const has = (key: string) => { const v = args?.[key]; return Array.isArray(v) && v.length > 0; };
+      if (has('symbols')) return tr?.('watchingMarket') ?? 'starting market watch...';
+      if (has('targets')) return tr?.('settingPriceTargets') ?? 'setting price targets...';
+      return tr?.('checkingMarketWatch') ?? 'checking market watch...';
+    }
     case 'get_sec_filing':
       return args?.symbol
         ? (tr?.('fetchingSymbolFiling', { symbol: args.symbol }) ?? `fetching ${args.symbol} filing...`)

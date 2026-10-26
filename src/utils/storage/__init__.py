@@ -70,7 +70,7 @@ if STORAGE_PROVIDER != "none" and not _configured_bucket(STORAGE_PROVIDER):
 #: handles metadata only. ``relay``: the server copies every byte through its
 #: own memory, the path a store without SHA-256-bound uploads (OSS, ``none``)
 #: or a sandbox without a route to the store still needs. ``auto`` picks
-#: ``direct`` for an S3-compatible store and a remote (Daytona) sandbox.
+#: ``direct`` for an S3-compatible store and a remote (Daytona or E2B) sandbox.
 BLOB_TRANSFER_MODE = _load_storage_setting("blob_transfer", "STORAGE_BLOB_TRANSFER", "auto")
 _BLOB_TRANSFER_MODES = ("auto", "direct", "relay")
 
@@ -89,7 +89,9 @@ def get_blob_transfer_mode(sandbox_provider: str | None) -> str:
         return "relay"
     if mode != "auto":
         return mode
-    return "direct" if sandbox_provider == "daytona" else "relay"
+    from ptc_agent.core.sandbox.providers import provider_runs_remote
+
+    return "direct" if provider_runs_remote(sandbox_provider) else "relay"
 
 
 def is_storage_enabled() -> bool:

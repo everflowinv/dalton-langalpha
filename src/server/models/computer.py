@@ -40,6 +40,9 @@ class ComputerStatus(StrEnum):
 CLAIMABLE_FOR_START = (ComputerStatus.STOPPED, ComputerStatus.CREATING)
 
 
+ComputerKind = Literal["daytona", "docker", "e2b"]
+
+
 class ComputerCreate(BaseModel):
     """Request model for creating a computer."""
 
@@ -52,6 +55,36 @@ class ComputerCreate(BaseModel):
     resource_tier: Literal["standard", "performance", "max"] = Field(
         "standard",
         description="Spec preset the computer is created at",
+    )
+    kind: Optional[ComputerKind] = Field(
+        None,
+        description=(
+            "Sandbox provider the computer runs on, for good; the deployment "
+            "default when absent. Must be one GET /computers/providers lists."
+        ),
+    )
+
+
+class ComputerProviderOption(BaseModel):
+    """One sandbox provider a new computer may be created on."""
+
+    kind: ComputerKind = Field(description="Sandbox provider")
+    is_default: bool = Field(
+        description="Whether a computer created without a kind runs here"
+    )
+    allowed: Optional[bool] = Field(
+        description=(
+            "Whether the caller may create a computer here; null when it is "
+            "not gated or the answer is unknown, and the create is then allowed"
+        )
+    )
+
+
+class ComputerProvidersResponse(BaseModel):
+    """The sandbox providers a new computer may be created on."""
+
+    providers: List[ComputerProviderOption] = Field(
+        default_factory=list, description="The default provider first"
     )
 
 
@@ -187,7 +220,7 @@ class ComputerResponse(BaseModel):
 
     computer_id: str = Field(description="Unique computer identifier")
     user_id: str = Field(description="Owner user ID")
-    kind: str = Field(description="Execution backend: daytona, docker")
+    kind: str = Field(description="Execution backend: daytona, docker, e2b")
     name: str = Field(description="User-facing computer name")
     status: str = Field(
         description=(

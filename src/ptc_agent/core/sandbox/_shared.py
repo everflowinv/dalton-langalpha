@@ -2,6 +2,10 @@
 
 import hashlib
 import importlib.util
+import json
+import secrets
+import shlex
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -24,6 +28,7 @@ _LOCK_VOLATILE_KEYS: frozenset[str] = frozenset({"installedAt", "updatedAt"})
 _MCP_SHARED_RUNTIME_FILES: tuple[str, ...] = (
     "_bootstrap.py",
     "_browser.py",
+    "_dates.py",
     "_envelope.py",
     "_extract.py",
     "_schemas.py",
@@ -113,6 +118,99 @@ class SyncResult:
     refreshed_modules: list[str]
     forced: bool
     layout_version: int | None = None
+
+
+# Same-directory rename(2): atomic, and it fails rather than copying across a
+# filesystem boundary the way ``mv`` would.
+REPLACE_SCRIPT = "import os,sys; os.replace(sys.argv[1], sys.argv[2])"
+
+# The token file is replaced only by a token minted no earlier: one written by
+# a push that stalled across a newer one must not put the older, possibly
+# revoked, token back. Ordered by the mint's ``iat_ms``, which the platform
+# dates after any revocation standing at mint time, not by expiry, which a
+# shorter configured lifetime would put out of order. A file without one (or
+# none at all) loses. A discard exits nonzero, so the caller does not record
+# as held a token the sandbox dropped.
+REPLACE_UNLESS_NEWER_SCRIPT = (
+    "import json,os,sys\n"
+    "src, dst, issued = sys.argv[1], sys.argv[2], int(sys.argv[3])\n"
+    "try:\n"
+    "    held = int(json.load(open(dst)).get('iat_ms') or 0)\n"
+    "except Exception:\n"
+    "    held = 0\n"
+    "if held > issued:\n"
+    "    os.remove(src)\n"
+    "    sys.exit('kept the newer token already held')\n"
+    "os.replace(src, dst)\n"
+)
+
+
+def _direct_call(func: Callable[..., Awaitable[Any]], *args: Any) -> Awaitable[Any]:
+    return func(*args)
+
+
+async def publish_private_file(
+    runtime: Any,
+    path: str,
+    payload: dict[str, Any],
+    *,
+    what: str,
+    script: str = REPLACE_SCRIPT,
+    args: tuple[str, ...] = (),
+    call: Callable[..., Awaitable[Any]] = _direct_call,
+) -> bool:
+    """Write a credential file the sandbox reads on every call, atomically
+    and owner-only.
+
+    The content goes to a per-write temp path, gets its 0600 mode, then
+    replaces the target, so a reader sees the whole old file or the whole new
+    one, and two workers writing at once each land whole. True only on a
+    confirmed write: ``exec`` reports a failed replace as a nonzero exit, not
+    an exception, so the exit code is checked, and a caller must not record a
+    write it did not make.
+    """
+    # 128-bit unique temp, so concurrent writers never share a staging file.
+    tmp_path = f"{path}.{secrets.token_hex(16)}.tmp"
+    published = False
+    try:
+        await call(runtime.upload_file, json.dumps(payload).encode("utf-8"), tmp_path)
+        # chmod before the rename, so the file is 0600 the instant it appears
+        # at the real path (uploads land 0644); argv keeps the paths out of
+        # the shell.
+        command = " ".join(
+            [
+                f"chmod 600 {shlex.quote(tmp_path)} && python3 -I -c",
+                shlex.quote(script),
+                shlex.quote(tmp_path),
+                shlex.quote(path),
+                *(shlex.quote(arg) for arg in args),
+            ]
+        )
+        result = await call(runtime.exec, command)
+        if getattr(result, "exit_code", -1) != 0:
+            # stdout carries both streams; stderr is set only when the
+            # command could not run at all.
+            output = getattr(result, "stderr", "") or getattr(result, "stdout", "")
+            raise RuntimeError(
+                f"publish exec exit={getattr(result, 'exit_code', '?')} "
+                f"output={output[:200]}"
+            )
+        logger.debug(f"Uploaded {what}", path=path)
+        published = True
+        return True
+    except Exception as e:
+        logger.warning(f"Failed to upload {what}", error=str(e))
+        return False
+    finally:
+        # A failed or cancelled write would otherwise orphan the staging
+        # file, a world-readable copy of the credential until something
+        # replaced it; a warm sandbox rewriting every few minutes must not
+        # accumulate them either.
+        if not published:
+            try:
+                await call(runtime.exec, f"rm -f {shlex.quote(tmp_path)}")
+            except Exception:
+                pass
 
 
 def _sha256_file(path: Path) -> str:

@@ -60,6 +60,9 @@ ORCHESTRATOR_SOURCE = "orchestrator"
 #: trigger's text before it named the sender. It only routes the graph back to
 #: the agent; the steering message that follows it carries the words.
 STEERING_TRIGGER = "User sent additional instructions."
+#: The trigger when all that is waiting is a market target's notice, which
+#: nobody sent.
+MARKET_TARGET_TRIGGER = "A market alert arrived."
 _TRIGGER_TAIL = " sent additional instructions."
 _TRIGGER_NAMES = {"user": "User", "chief_of_staff": "Chief of Staff"}
 
@@ -74,7 +77,9 @@ def steering_trigger(senders: list[str]) -> str:
 
 
 def is_steering_trigger(content: object) -> bool:
-    return isinstance(content, str) and content.endswith(_TRIGGER_TAIL)
+    return isinstance(content, str) and (
+        content.endswith(_TRIGGER_TAIL) or content == MARKET_TARGET_TRIGGER
+    )
 
 
 def human_kind(message: HumanMessage) -> HumanKind:

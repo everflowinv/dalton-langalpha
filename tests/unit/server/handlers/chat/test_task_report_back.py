@@ -192,7 +192,7 @@ def _arb_env(
             new=defer or AsyncMock(return_value="pending"),
         ),
         patch(
-            "src.server.database.runs.outbox.release_deferred_report_backs",
+            "src.server.database.runs.outbox.release_deferred_notifications",
             new=release or AsyncMock(return_value=1),
         ),
         patch(

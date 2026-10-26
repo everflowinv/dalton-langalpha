@@ -20,6 +20,7 @@ import pytest
 from psycopg.errors import UniqueViolation
 
 from src.server.database import workspace as W
+from src.server.database.sql_fences import FENCE_TAKES_WORKSPACES
 
 COMPUTER_ID = "11111111-1111-4111-8111-111111111111"
 WORKSPACE_ID = "22222222-2222-4222-8222-222222222222"
@@ -160,6 +161,25 @@ class TestTheStatement:
     async def test_a_tombstoned_computer_creates_nothing(self, db):
         await W.create_workspace_on_computer("user-1", "Research", COMPUTER_ID)
         assert "status <> 'deleted'" in _sql(db)
+
+    @pytest.mark.asyncio
+    async def test_a_computer_being_retired_creates_nothing(self, db):
+        """Its retirement read it empty, and a workspace landing after the
+        marker would go down with the tombstone. The fence sits in the share
+        locked read, which the marker's write waits on or is seen by."""
+        await W.create_workspace_on_computer("user-1", "Research", COMPUTER_ID)
+        sql = _sql(db)
+        assert FENCE_TAKES_WORKSPACES in sql
+        assert sql.index(FENCE_TAKES_WORKSPACES) < sql.index("FOR SHARE")
+
+    @pytest.mark.asyncio
+    async def test_a_bind_onto_a_computer_being_retired_binds_nothing(self, db):
+        await W.bind_workspace_to_computer(
+            WORKSPACE_ID, COMPUTER_ID, expected_computer_id=None
+        )
+        sql = _sql(db)
+        assert FENCE_TAKES_WORKSPACES in sql
+        assert sql.index(FENCE_TAKES_WORKSPACES) < sql.index("FOR SHARE")
 
     @pytest.mark.asyncio
     async def test_a_vanished_computer_returns_none_rather_than_raising(self, db):
@@ -379,6 +399,14 @@ class TestAdoptingTheMachinesSandbox:
         sql = _sql(db)
         assert "w.sandbox_id IS DISTINCT FROM comp.provider_ref" in sql
         assert "w.status <> comp.status" in sql
+
+    @pytest.mark.asyncio
+    async def test_a_repair_leaves_the_gallery_order_alone(self, db):
+        """The gallery orders by updated_at, and this reaches every sibling on
+        the machine; stamping them would give them all one moment."""
+        db.fetchall = AsyncMock(return_value=[])
+        await W.adopt_computer_sandbox_into_workspaces(COMPUTER_ID)
+        assert "updated_at" not in _sql(db)
 
     @pytest.mark.asyncio
     async def test_an_unbound_home_is_out_of_reach_of_the_repair(self, db):

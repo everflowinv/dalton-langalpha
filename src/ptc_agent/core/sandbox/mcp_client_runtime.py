@@ -10,16 +10,25 @@ modules import ``_call_mcp_tool`` from here.
 Runs on the sandbox's bare python3 - stdlib + httpx only, no host packages.
 """
 
+import atexit
 import collections
+import contextlib
 import dataclasses
 import datetime
+import email.utils
+import fcntl
 import hashlib
 import json
+import math
 import os
 import queue
+import random
 import re as _re
+import signal
+import struct
 import subprocess
 import sys
+import termios
 import threading
 from typing import Any
 import time
@@ -50,6 +59,13 @@ _MODERN_VERSIONS = ("2026-07-28",)
 # revision, so pre-2026 servers negotiate the newest era they support.
 _LEGACY_OFFER = "2025-11-25"
 _PROBE_TIMEOUT = 10.0
+# How long a freshly spawned server may take to start reading its first request.
+# A handshake reply clock (_PROBE_TIMEOUT) starts only once it has: an import on
+# a cold disk (a new E2B computer) or a uvx/npx fetch can keep a healthy server
+# from listening for tens of seconds, and that is slowness, not silence.
+_STARTUP_TIMEOUT = 60.0
+# How often a handshake read re-checks whether its request is still unread.
+_STARTUP_POLL_S = 0.5
 _CALL_TIMEOUT = 120.0
 
 # HTTP wall clocks, in seconds. An HTTP handshake is multi-phase, so each phase
@@ -88,7 +104,7 @@ _REFUSAL_MAX = 16
 #   {"working_dir": str,
 #    "servers": {name: {transport, untrusted, command?, args?, url?, env?,
 #                        env_keys?, headers?, discovery_uses_secrets?,
-#                        relay_bound?}},
+#                        relay_bound?, auth?}},
 #    "result_body_max_bytes": int, "result_body_trace_budget_bytes": int}
 # Each entry is normalized ONCE into a frozen _ServerCfg, so nothing downstream
 # re-derives trust or re-reads an untyped key. These names are seeded by the
@@ -166,19 +182,25 @@ class _ServerCfg:
     #: workspace's own vault. The root vault is the account's, where a secret
     #: of the same name can hold another value, so such an entry gets none.
     workspace_vault: bool
+    #: Authenticates with the computer's data token, and so also takes the
+    #: data-token failure policy (see ``_post``).
+    data_token: bool
     call_timeout_s: float = _HTTP_CALL_BUDGET  # DALTON-HOOK(mcp-call-timeout)
 
 
 def _normalize(name: str, entry: dict) -> _ServerCfg:
     # Named keys only: a sibling's ledger entry written by an older host can
     # carry keys this runtime no longer reads, and they must stay inert.
+    transport = entry.get("transport") or "stdio"
+    # The host computes trust; a missing flag fails CLOSED. Guessing
+    # untrusted costs a builtin its inherited env; guessing trusted hands a
+    # user server the sandbox's whole environment and host-var substitution.
+    untrusted = bool(entry.get("untrusted", True))
+    relay_bound = bool(entry.get("relay_bound"))
     return _ServerCfg(
         name=name,
-        transport=entry.get("transport") or "stdio",
-        # The host computes trust; a missing flag fails CLOSED. Guessing
-        # untrusted costs a builtin its inherited env; guessing trusted hands a
-        # user server the sandbox's whole environment and host-var substitution.
-        untrusted=bool(entry.get("untrusted", True)),
+        transport=transport,
+        untrusted=untrusted,
         command=entry.get("command") or "",
         args=tuple(entry.get("args") or ()),
         env=dict(entry.get("env") or {}),
@@ -186,9 +208,17 @@ def _normalize(name: str, entry: dict) -> _ServerCfg:
         url=entry.get("url") or "",
         headers=dict(entry.get("headers") or {}),
         discovery_uses_secrets=bool(entry.get("discovery_uses_secrets")),
-        relay_bound=bool(entry.get("relay_bound")),
+        relay_bound=relay_bound,
         credential_files=tuple(entry.get("credential_files") or ()),
         workspace_vault=bool(entry.get("vault_file")) or "@" in name,
+        # Fails closed like trust: the token spends the whole computer's data
+        # access, so only a trusted entry dialed directly may present it.
+        data_token=(
+            entry.get("auth") == "data_token"
+            and transport == "http"
+            and not untrusted
+            and not relay_bound
+        ),
         call_timeout_s=float(entry.get("call_timeout_s") or _HTTP_CALL_BUDGET),  # DALTON-HOOK(mcp-call-timeout)
     )
 
@@ -394,7 +424,8 @@ def _resolve_http(cfg, *, discovery=False):
     """Return (url, headers) for an http request.
 
     Relay-bound servers dial the relay instead. Builtin servers keep the legacy
-    ${VAR}-from-os.environ URL resolution and send no extra headers. Untrusted
+    ${VAR}-from-os.environ URL resolution and send no configured headers; a
+    data-token builtin sends the computer's data token as its bearer. Untrusted
     servers resolve ${vault:NAME} refs in BOTH the URL and headers vault-only
     (no host-env fallback) and send the resolved headers.
     """
@@ -406,7 +437,8 @@ def _resolve_http(cfg, *, discovery=False):
         def _env_sub(match):
             return os.environ.get(match.group(1), match.group(0))
 
-        return _re.sub(r"\$\{([^}]+)\}", _env_sub, cfg.url), {}
+        url = _re.sub(r"\$\{([^}]+)\}", _env_sub, cfg.url)
+        return url, (_bearer_headers() if cfg.data_token else {})
 
     names = list(cfg.headers)
     resolved = _resolve_all(
@@ -777,13 +809,46 @@ def _legacy_init_request() -> dict:
 _STDIO_OVERSIZE = object()
 
 
-def _kill_server(server_name: str, proc: subprocess.Popen) -> None:
+class _StartupTimeout(RuntimeError):
+    """The server never started reading, so a restart would only wait again."""
+
+
+def _signal_group(proc: subprocess.Popen, sig: int) -> None:
+    """Signal the server's whole process group. The direct child is often a
+    launcher (uv run, uvx, npx), and signalling only that orphans the real
+    server, which then holds its memory until the computer stops."""
     try:
-        proc.kill()
+        os.killpg(proc.pid, sig)
     except OSError:
+        try:
+            proc.send_signal(sig)
+        except OSError:
+            pass
+
+
+def _kill_server(server_name: str, proc: subprocess.Popen) -> None:
+    _signal_group(proc, signal.SIGKILL)
+    # EOF for anything that left the group: our write end is the only one left.
+    try:
+        proc.stdin.close()
+    except (OSError, ValueError):
         pass
     _server_processes.pop(server_name, None)
     _PROTO.pop(server_name, None)
+
+
+def _request_unread(proc: subprocess.Popen) -> bool:
+    """Whether bytes we wrote still sit in the server's stdin pipe.
+
+    A server reads its first request once its loop is up, so unread bytes mean
+    it is still starting, not hung. FIONREAD on a pipe's write end answers on
+    Linux, where sandboxes run; elsewhere it reports 0 and this is False.
+    """
+    try:
+        raw = fcntl.ioctl(proc.stdin.fileno(), termios.FIONREAD, b"\0\0\0\0")
+    except (OSError, ValueError):
+        return False
+    return struct.unpack("i", raw)[0] > 0
 
 
 def _send_message(server_name: str, proc: subprocess.Popen, message: dict) -> None:
@@ -798,7 +863,11 @@ def _send_message(server_name: str, proc: subprocess.Popen, message: dict) -> No
 
 
 def _read_reply(
-    server_name: str, proc: subprocess.Popen, want_id: int, timeout: float
+    server_name: str,
+    proc: subprocess.Popen,
+    want_id: int,
+    timeout: float,
+    startup: float = 0.0,
 ) -> dict:
     """Read the reply matching ``want_id``.
 
@@ -808,18 +877,40 @@ def _read_reply(
     / invalid framing so the next call restarts cleanly. Lines come from the pump
     thread's queue, never select() — a burst of messages lands in Python's
     stdio buffer where select() on the fd would block forever.
+
+    With ``startup`` (a handshake on a process that may still be starting),
+    ``timeout`` runs from when the server is first seen reading, and a request
+    still unread after ``startup`` seconds raises ``_StartupTimeout``.
     """
-    deadline = time.monotonic() + timeout
+    started = time.monotonic()
+    deadline = started + timeout
+    listening = not startup
     refusals = 0
     while True:
-        remaining = deadline - time.monotonic()
+        now = time.monotonic()
+        if not listening:
+            if not _request_unread(proc):
+                listening = True
+            elif now - started >= startup:
+                _kill_server(server_name, proc)
+                error_msg = (
+                    f"MCP server {server_name} did not start within "
+                    f"{startup:.0f}s [startup_timeout]"
+                )
+                print(f"ERROR: {error_msg}", file=sys.stderr)  # noqa: T201
+                raise _StartupTimeout(error_msg)
+            else:
+                deadline = now + timeout
+        remaining = deadline - now
         if remaining <= 0:
             _kill_server(server_name, proc)
             error_msg = f"MCP server {server_name} timed out after {timeout:.0f}s"
             print(f"ERROR: {error_msg}", file=sys.stderr)  # noqa: T201
             raise RuntimeError(error_msg)
         try:
-            line = proc.mcp_stdout_queue.get(timeout=remaining)
+            line = proc.mcp_stdout_queue.get(
+                timeout=remaining if listening else min(remaining, _STARTUP_POLL_S)
+            )
         except queue.Empty:
             continue
         if isinstance(line, str):
@@ -905,6 +996,10 @@ def _spawn_mcp_process(server_name: str, discovery: bool = False) -> subprocess.
         env=proc_env,
         text=True,
         bufsize=1,  # Line buffered
+        # Its own group, so a kill reaches a server started behind a launcher.
+        # Not its own session: whoever bounds this client (the command check)
+        # stops its session, and that has to take the servers with it.
+        process_group=0,
     )
 
     # Drain stderr in background to prevent pipe buffer deadlock.
@@ -1005,7 +1100,9 @@ def _legacy_initialize(server_name: str, proc: subprocess.Popen) -> dict:
     """Pre-2026 handshake; offer the newest legacy revision, adopt the reply's."""
     request = _legacy_init_request()
     _send_message(server_name, proc, request)
-    response = _read_reply(server_name, proc, request["id"], _PROBE_TIMEOUT)
+    response = _read_reply(
+        server_name, proc, request["id"], _PROBE_TIMEOUT, startup=_STARTUP_TIMEOUT
+    )
     if "error" in response:
         _kill_server(server_name, proc)
         msg = f"MCP initialization failed: {response['error']}"
@@ -1037,8 +1134,9 @@ def _negotiate_stdio(
     Discover ok but only legacy versions advertised => legacy initialize on a
     FRESH stream (the v2 server era-latched this connection on first request).
     Timeout / EOF / invalid framing => the probe may have crashed the server:
-    restart once, then legacy initialize. -32022 with a mutual version in its
-    data => retry discover once with that version.
+    restart once, then legacy initialize. Never started reading => slow, not
+    legacy: fail without a restart. -32022 with a mutual version in its data =>
+    retry discover once with that version.
     """
     version = _MODERN_VERSIONS[0]
     error = None
@@ -1046,7 +1144,15 @@ def _negotiate_stdio(
         request = _modern_request("server/discover", {}, version)
         _send_message(server_name, proc, request)
         try:
-            response = _read_reply(server_name, proc, request["id"], _PROBE_TIMEOUT)
+            response = _read_reply(
+                server_name,
+                proc,
+                request["id"],
+                _PROBE_TIMEOUT,
+                startup=_STARTUP_TIMEOUT,
+            )
+        except _StartupTimeout:
+            raise
         except RuntimeError:
             proc = _spawn_mcp_process(server_name, discovery=discovery)
             return proc, _legacy_initialize(server_name, proc)
@@ -1087,6 +1193,9 @@ def _ensure_stdio_server(server_name: str, discovery: bool = False) -> tuple:
         proto = _PROTO.get(server_name)
         if proc is not None and proc.poll() is None and proto is not None:
             return proc, proto
+        if proc is not None:
+            # A launcher that exited can leave its server running.
+            _kill_server(server_name, proc)
         proc = _spawn_mcp_process(server_name, discovery=discovery)
         proc, proto = _negotiate_stdio(server_name, proc, discovery=discovery)
         _server_processes[server_name] = proc
@@ -1235,6 +1344,18 @@ def _phase_deadline(
     return now + max(remaining, floor)
 
 
+class _ReplyError(RuntimeError):
+    """An http reply this client refused to read: too slow, too large or malformed.
+
+    The server answered, so the request is never resent: the deadline or size
+    cap that stopped this read would stop the next one too.
+    """
+
+    def __init__(self, message: str, reason: str) -> None:
+        super().__init__(f"{message} [{reason}]")
+        self.reason = reason
+
+
 def _parse_http_reply(
     response, want_id: int, server_name: str, deadline: float | None = None
 ) -> dict:
@@ -1255,30 +1376,25 @@ def _parse_http_reply(
         try:
             message = json.loads(body)
         except json.JSONDecodeError:
-            msg = (
-                f"Invalid JSON from MCP server {server_name}: "
-                f"{body[:200]!r} [invalid_reply]"
-            )
-            raise RuntimeError(msg)
+            msg = f"Invalid JSON from MCP server {server_name}: {body[:200]!r}"
+            raise _ReplyError(msg, "invalid_reply")
         if not isinstance(message, dict):
             msg = (
-                f"MCP server {server_name}: HTTP reply is not a JSON-RPC "
-                "message object [invalid_reply]"
+                f"MCP server {server_name}: HTTP reply is not a JSON-RPC message object"
             )
-            raise RuntimeError(msg)
+            raise _ReplyError(msg, "invalid_reply")
         if "method" in message and "id" in message:
             msg = (
                 f"MCP server {server_name}: server-initiated request "
-                f"{message['method']!r} is not supported by this client "
-                "[unsupported_server_request]"
+                f"{message['method']!r} is not supported by this client"
             )
-            raise RuntimeError(msg)
+            raise _ReplyError(msg, "unsupported_server_request")
         if "method" in message or message.get("id") != want_id:
             msg = (
                 f"MCP server {server_name}: HTTP reply did not answer "
-                f"request id {want_id} [mismatched_reply]"
+                f"request id {want_id}"
             )
-            raise RuntimeError(msg)
+            raise _ReplyError(msg, "mismatched_reply")
         return message
 
     def _frame_reply(payload):
@@ -1293,10 +1409,9 @@ def _parse_http_reply(
             # fail fast instead of scanning on until the stream times out.
             msg = (
                 f"MCP server {server_name}: server-initiated request "
-                f"{message['method']!r} is not supported by this client "
-                "[unsupported_server_request]"
+                f"{message['method']!r} is not supported by this client"
             )
-            raise RuntimeError(msg)
+            raise _ReplyError(msg, "unsupported_server_request")
         if message.get("id") == want_id and "method" not in message:
             return message
         return None
@@ -1326,16 +1441,17 @@ def _parse_http_reply(
     # the server does not control.
     for chunk in response.iter_text():
         if _deadline_exceeded(deadline):
-            raise RuntimeError(
+            raise _ReplyError(
                 f"MCP server {server_name}: SSE read exceeded the deadline "
-                "before a matching reply [stream_deadline]"
+                "before a matching reply",
+                "stream_deadline",
             )
         seen += len(chunk)
         if seen > _REPLY_MAX_BYTES:
-            raise RuntimeError(
+            raise _ReplyError(
                 f"MCP server {server_name}: SSE stream exceeded "
-                f"{_REPLY_MAX_BYTES} bytes without a matching reply "
-                "[reply_too_large]"
+                f"{_REPLY_MAX_BYTES} bytes without a matching reply",
+                "reply_too_large",
             )
         while chunk:
             newline = chunk.find("\n")
@@ -1356,7 +1472,7 @@ def _parse_http_reply(
         if reply is not None:
             return reply
     msg = f"MCP server {server_name}: SSE stream ended without a matching reply"
-    raise RuntimeError(msg)
+    raise _ReplyError(msg, "no_reply")
 
 
 def _read_body_capped(response, server_name: str, deadline: float | None) -> bytes:
@@ -1365,18 +1481,407 @@ def _read_body_capped(response, server_name: str, deadline: float | None) -> byt
     seen = 0
     for chunk in response.iter_bytes():
         if _deadline_exceeded(deadline):
-            raise RuntimeError(
-                f"MCP server {server_name}: HTTP read exceeded the deadline "
-                "[stream_deadline]"
+            raise _ReplyError(
+                f"MCP server {server_name}: HTTP read exceeded the deadline",
+                "stream_deadline",
             )
         seen += len(chunk)
         if seen > _REPLY_MAX_BYTES:
-            raise RuntimeError(
+            raise _ReplyError(
                 f"MCP server {server_name}: HTTP reply exceeded "
-                f"{_REPLY_MAX_BYTES} bytes [reply_too_large]"
+                f"{_REPLY_MAX_BYTES} bytes",
+                "reply_too_large",
             )
         chunks.append(chunk)
     return b"".join(chunks)
+
+
+# ---------------------------------------------------------------------------
+# Data-token servers: builtin http servers that authenticate with the
+# computer's own data token instead of a credential of their own.
+# ---------------------------------------------------------------------------
+
+# A pause the server asks for is waited out in place only while it is short,
+# so one call never stalls for longer than the agent would take to retry it.
+_DATA_TOKEN_MAX_WAIT_S = 10.0
+_DATA_TOKEN_RATE_RETRIES = 2
+_DATA_TOKEN_RATE_PAUSE_S = 1.0
+# The pauses before each resend after a failure that never reached a tool,
+# about 7.5 s in all: long enough that a rolling restart or a few seconds of
+# outage costs the call latency rather than the call. Each is jittered so the
+# computers that lost the service together do not all come back together.
+_DATA_TOKEN_TRANSIENT_BACKOFF_S = (0.5, 1.0, 2.0, 4.0)
+_DATA_TOKEN_JITTER = 0.2
+_DATA_TOKEN_TRANSIENT_STATUSES = frozenset({502, 503, 504})
+# What _post answers itself; any other reply is the caller's.
+_DATA_TOKEN_REFUSALS = frozenset({401, 403, 429}) | _DATA_TOKEN_TRANSIENT_STATUSES
+# Failures before any reply: nothing ran, or the connection died under it, so a
+# resend is safe and likely to land. A read timeout is absent on purpose: that
+# request is still running at the server, and a resend spends its vendor quota
+# and its budget a second time.
+_DATA_TOKEN_TRANSIENT_ERRORS = (
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.RemoteProtocolError,
+    httpx.ReadError,
+    httpx.WriteError,
+)
+# Short against the budgets, so a connect that timed out can still be retried.
+_DATA_TOKEN_CONNECT_TIMEOUT_S = 10.0
+# A refused reply's body is read before the connection is let go (see _drain).
+# Error bodies run to a few KiB; a larger one is left unread and its connection
+# closed, since reading it would cost more than the handshake it saves.
+_DATA_TOKEN_DRAIN_MAX_BYTES = 64 * 1024
+_DATA_TOKEN_DRAIN_S = 0.5
+
+# One pooled client per process for every data-token server, since they are all
+# the one data service: a client per call pays a TCP connect, and in production
+# a TLS handshake, on every call. Held with its pid, because a forked child
+# writing into the parent's sockets would corrupt both sides' streams.
+_data_client_lock = threading.Lock()
+_data_client_held: dict = {}
+
+
+def _data_client() -> httpx.Client:
+    pid = os.getpid()
+    held = _data_client_held
+    if held.get("pid") != pid:
+        with _data_client_lock:
+            if held.get("pid") != pid:
+                # Never closed here: an inherited client's sockets are the
+                # parent's, and closing them would end its connections.
+                held.clear()
+                held.update(pid=pid, client=httpx.Client(timeout=_HTTP_CALL_BUDGET))
+    return held["client"]
+
+
+def _forget_data_client_after_fork() -> None:
+    # A lock held by another thread at the fork stays held in the child forever.
+    global _data_client_lock
+    _data_client_lock = threading.Lock()
+    _data_client_held.clear()
+
+
+def _close_data_client() -> None:
+    held = _data_client_held
+    if held.get("pid") == os.getpid():
+        held.pop("client").close()
+
+
+os.register_at_fork(after_in_child=_forget_data_client_after_fork)
+atexit.register(_close_data_client)
+
+
+def _client_for(cfg, timeout: float):
+    """The client for one exchange: the pooled one for a data-token server.
+
+    Every other server gets a client of its own per exchange, as before. Their
+    origins are unrelated, and relay-bound ones share the relay's origin, so a
+    shared client would carry one server's cookies into another's requests.
+    """
+    if cfg.data_token:
+        return contextlib.nullcontext(_data_client())
+    return httpx.Client(timeout=timeout)
+
+
+# The daemon calls on threads, and the file is replaced (never edited) when the
+# token rotates, so a changed stamp is the one signal to read it again.
+_data_token_lock = threading.Lock()
+_data_token_cache: dict = {}
+
+
+class _DataTokenError(RuntimeError):
+    """A data-token server's failure, carrying the error envelope it returns."""
+
+    def __init__(self, code: str, detail: str, **context: Any) -> None:
+        super().__init__(f"[{code}] {detail}")
+        self.envelope = {"error": code, "detail": detail, **context}
+
+
+def _file_stamp(st: os.stat_result) -> tuple:
+    return (st.st_ino, st.st_mtime_ns, st.st_size)
+
+
+def _data_token() -> str:
+    try:
+        stamp = _file_stamp(os.stat(_MCP_TOKENS_FILE))
+    except OSError:
+        raise _DataTokenError(
+            "auth_failed", "this computer has no data token yet; retry shortly"
+        ) from None
+    with _data_token_lock:
+        if _data_token_cache.get("stamp") == stamp:
+            return _data_token_cache["token"]
+        try:
+            with open(_MCP_TOKENS_FILE, encoding="utf-8") as fh:
+                # Stamped from the open file, so the cache never pairs a token
+                # with the stamp of a replacement written in between.
+                stamp = _file_stamp(os.fstat(fh.fileno()))
+                payload = json.load(fh)
+        except (OSError, ValueError):
+            raise _DataTokenError(
+                "auth_failed", "this computer's data token could not be read"
+            ) from None
+        token = payload.get("access_token") if isinstance(payload, dict) else None
+        token = token.strip() if isinstance(token, str) else ""
+        if not token or not (token.isascii() and token.isprintable()):
+            raise _DataTokenError(
+                "auth_failed", "this computer's data token file holds no usable token"
+            )
+        _data_token_cache.clear()
+        _data_token_cache.update(stamp=stamp, token=token)
+        return token
+
+
+def _drop_data_token() -> None:
+    with _data_token_lock:
+        _data_token_cache.clear()
+
+
+def _bearer_headers() -> dict:
+    return {"Authorization": "Bearer " + _data_token()}
+
+
+def _retry_after_s(response) -> float | None:
+    """The pause the server asked for, in seconds, or None when it named none."""
+    value = (response.headers.get("retry-after") or "").strip()
+    if not value:
+        return None
+    try:
+        seconds = float(value)
+    except ValueError:
+        try:
+            when = email.utils.parsedate_to_datetime(value)
+        except (TypeError, ValueError):
+            return None
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=datetime.timezone.utc)
+        seconds = (when - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
+    return max(0.0, seconds) if math.isfinite(seconds) else None
+
+
+def _auth_challenge(response) -> dict:
+    match = _re.search(
+        r'error="?([A-Za-z_]+)', response.headers.get("www-authenticate") or ""
+    )
+    return {"reason": match.group(1)} if match else {}
+
+
+def _resend_pause(deadline: float, pause: float) -> float | None:
+    """``pause`` when a resend after it still fits the budget, else None.
+
+    A resend needs ``_HTTP_PHASE_FLOOR`` of the budget left for its reply, so
+    waiting closer to the deadline would only turn this failure into a timeout.
+    """
+    if time.monotonic() + pause + _HTTP_PHASE_FLOOR > deadline:
+        return None
+    return pause
+
+
+def _transient_pause(
+    attempt: int, deadline: float, asked: float | None = None
+) -> float | None:
+    """The wait before transient resend ``attempt + 1``, or None to give up."""
+    if attempt >= len(_DATA_TOKEN_TRANSIENT_BACKOFF_S):
+        return None
+    if asked is None:
+        pause = _DATA_TOKEN_TRANSIENT_BACKOFF_S[attempt] * random.uniform(
+            1 - _DATA_TOKEN_JITTER, 1 + _DATA_TOKEN_JITTER
+        )
+    elif asked > _DATA_TOKEN_MAX_WAIT_S:
+        return None
+    else:
+        pause = _stretched(asked)
+    return _resend_pause(deadline, pause)
+
+
+def _stretched(pause: float) -> float:
+    """``pause`` lengthened by up to ``_DATA_TOKEN_JITTER``, never shortened.
+
+    A pause the server named is a floor, but calls it refused together would
+    otherwise all resend in the same instant and meet the same refusal.
+    """
+    return pause * random.uniform(1, 1 + _DATA_TOKEN_JITTER)
+
+
+def _drain(response, deadline: float) -> None:
+    """Read a refused reply's small body, so its connection goes back to the pool.
+
+    httpx closes a connection whose reply was left unread, so every resend after
+    a 401, 429 or gateway error, and the call after one that ended in an
+    envelope, would open a new one: in production a TLS handshake through the
+    edge, just when the service is failing or limiting. Bounded so it never costs
+    the call: a body over ``_DATA_TOKEN_DRAIN_MAX_BYTES`` is left unread; each
+    read waits at most ``_DATA_TOKEN_DRAIN_S`` and the loop stops that long in,
+    so a trickling body costs at most twice that, and a drain starts only with
+    that much budget left. An abandoned drain closes the connection, as before.
+    """
+    if response.is_stream_consumed or response.is_closed:
+        return
+    declared = response.headers.get("content-length")
+    if declared is not None and not (
+        declared.isdigit() and int(declared) <= _DATA_TOKEN_DRAIN_MAX_BYTES
+    ):
+        return
+    start = time.monotonic()
+    if deadline - start < 2 * _DATA_TOKEN_DRAIN_S:
+        return
+    # httpcore takes the read timeout from the request when the body read
+    # begins, so lowering it now bounds this body's reads and nothing else.
+    timeouts = response.request.extensions.get("timeout")
+    if isinstance(timeouts, dict):
+        response.request.extensions["timeout"] = {
+            **timeouts,
+            "read": _DATA_TOKEN_DRAIN_S,
+        }
+    seen = 0
+    try:
+        for chunk in response.iter_raw():
+            seen += len(chunk)
+            if (
+                seen > _DATA_TOKEN_DRAIN_MAX_BYTES
+                or time.monotonic() - start > _DATA_TOKEN_DRAIN_S
+            ):
+                return
+    except httpx.HTTPError:
+        return
+
+
+@contextlib.contextmanager
+def _post(client, cfg, url: str, body: dict, headers: dict, *, deadline: float):
+    """POST one MCP message, under the data-token failure policy when it applies.
+
+    Only a data-token server is ever resent: it serves read-only data, so a
+    resend cannot repeat an effect. Any other server's request goes out exactly
+    once, because a tools/call that reached it may already have acted. A 401
+    gets one resend with the token read from the file again, the cache dropped
+    even when the file looks unchanged: the host may have replaced the token
+    while this request was in flight.
+
+    ``deadline`` is the exchange's whole budget, the caller's reply read
+    included, so every resend, pause and per-send timeout is cut to fit it.
+    """
+    if not cfg.data_token:
+        with client.stream("POST", url, json=body, headers=headers) as response:
+            yield response
+        return
+    auth_reread = False
+    rate_retries = 0
+    transient = 0
+    while True:
+        # Restamped per send: the file may have rotated since the caller
+        # resolved its headers, and the cached read costs one stat.
+        headers = {**headers, **_bearer_headers()}
+        remaining = max(deadline - time.monotonic(), 1.0)
+        timeout = httpx.Timeout(
+            remaining, connect=min(_DATA_TOKEN_CONNECT_TIMEOUT_S, remaining)
+        )
+        with contextlib.ExitStack() as stack:
+            try:
+                response = stack.enter_context(
+                    client.stream(
+                        "POST", url, json=body, headers=headers, timeout=timeout
+                    )
+                )
+            except _DATA_TOKEN_TRANSIENT_ERRORS as exc:
+                pause = _transient_pause(transient, deadline)
+                if pause is None:
+                    raise _DataTokenError(
+                        "upstream_error",
+                        f"the data service is unreachable ({type(exc).__name__})",
+                    ) from exc
+                transient += 1
+                response = None
+            if response is not None:
+                status = response.status_code
+                if status not in _DATA_TOKEN_REFUSALS:
+                    try:
+                        yield response
+                    finally:
+                        if not 200 <= status < 300:
+                            # The caller raises on it, so the call ends in an
+                            # envelope; drained for the next call's sake.
+                            _drain(response, deadline)
+                    return
+                # Before the verdict, so its budget checks count the drain.
+                _drain(response, deadline)
+                if status == 401:
+                    pause = 0.0
+                    if auth_reread or _resend_pause(deadline, pause) is None:
+                        raise _DataTokenError(
+                            "auth_failed",
+                            "the data service refused this computer's data token;"
+                            " a fresh token is delivered automatically, so retry"
+                            " later",
+                            **_auth_challenge(response),
+                        )
+                    auth_reread = True
+                    _drop_data_token()
+                elif status == 403:
+                    raise _DataTokenError(
+                        "auth_failed",
+                        "this computer's data token does not grant this data",
+                        **_auth_challenge(response),
+                    )
+                elif status == 429:
+                    asked = _retry_after_s(response)
+                    wait = _DATA_TOKEN_RATE_PAUSE_S if asked is None else asked
+                    pause = _stretched(wait)
+                    if (
+                        rate_retries >= _DATA_TOKEN_RATE_RETRIES
+                        or wait > _DATA_TOKEN_MAX_WAIT_S
+                        or _resend_pause(deadline, pause) is None
+                    ):
+                        context = {}
+                        if asked is not None:
+                            context["retry_after_seconds"] = math.ceil(asked)
+                        raise _DataTokenError(
+                            "rate_limited",
+                            # The service counts per user, so every computer
+                            # of the account shares this limit.
+                            "the data service is rate limiting this account",
+                            **context,
+                        )
+                    rate_retries += 1
+                else:
+                    pause = _transient_pause(
+                        transient, deadline, _retry_after_s(response)
+                    )
+                    if pause is None:
+                        raise _DataTokenError(
+                            "upstream_error",
+                            f"the data service is unavailable (HTTP {status})",
+                            status=status,
+                        )
+                    transient += 1
+        time.sleep(pause)
+
+
+def _failure_name(exc: Exception) -> str:
+    """What an envelope's detail names a transport or reply failure by."""
+    return exc.reason if isinstance(exc, _ReplyError) else type(exc).__name__
+
+
+def _envelope_reply(envelope: dict) -> dict:
+    """A tools/call reply whose value is ``envelope``.
+
+    Returned as a value, the shape the market-data tools give their own
+    failures, so agent code branches on ``error`` either way; ``isError`` keeps
+    it out of provenance.
+    """
+    return {
+        "jsonrpc": "2.0",
+        "id": None,
+        "result": {
+            "content": [{"type": "text", "text": json.dumps(envelope)}],
+            "structuredContent": envelope,
+            "isError": True,
+        },
+    }
+
+
+# A data-token server's last failed handshake, as (finished at, envelope).
+_handshake_failures: dict[str, tuple[float, dict]] = {}
 
 
 def _ensure_http_server(server_name: str, discovery: bool = False) -> dict:
@@ -1384,10 +1889,26 @@ def _ensure_http_server(server_name: str, discovery: bool = False) -> dict:
 
     Under the server's lock: the daemon runs calls on threads, and two first
     calls racing here would both initialize and one would overwrite the
-    other's negotiated session.
+    other's negotiated session. A data-token handshake retries for seconds while
+    the service is down, so a call that waited on the lock while one failed
+    takes that failure instead of running the whole cycle again; a call that
+    starts after it tries afresh.
     """
+    started = time.monotonic()
     with _get_server_lock(server_name):
-        return _negotiate_http_server(server_name, discovery)
+        failed = _handshake_failures.get(server_name)
+        if failed is not None and failed[0] > started:
+            context = dict(failed[1])
+            raise _DataTokenError(
+                context.pop("error"), context.pop("detail"), **context
+            )
+        try:
+            proto = _negotiate_http_server(server_name, discovery)
+        except _DataTokenError as exc:
+            _handshake_failures[server_name] = (time.monotonic(), exc.envelope)
+            raise
+        _handshake_failures.pop(server_name, None)
+        return proto
 
 
 def _negotiate_http_server(server_name: str, discovery: bool) -> dict:
@@ -1409,7 +1930,7 @@ def _negotiate_http_server(server_name: str, discovery: bool) -> dict:
     version = _MODERN_VERSIONS[0]
     probe_note = ""
     try:
-        with httpx.Client(timeout=_HTTP_EXCHANGE_BUDGET) as client:
+        with _client_for(cfg, _HTTP_EXCHANGE_BUDGET) as client:
             outer = time.monotonic() + _HTTP_EXCHANGE_BUDGET
             probe = _modern_request("server/discover", {}, version)
             probe_headers = _mcp_headers(
@@ -1420,8 +1941,8 @@ def _negotiate_http_server(server_name: str, discovery: bool) -> dict:
             )
             reply = None
             try:
-                with client.stream(
-                    "POST", url, json=probe, headers=probe_headers
+                with _post(
+                    client, cfg, url, probe, probe_headers, deadline=outer
                 ) as response:
                     if response.status_code < 400:
                         reply = _parse_http_reply(
@@ -1433,6 +1954,10 @@ def _negotiate_http_server(server_name: str, discovery: bool) -> dict:
                             # the whole handshake.
                             _phase_deadline(outer, cap=_PROBE_TIMEOUT),
                         )
+            except _DataTokenError:
+                # Already retried under its own policy; the legacy initialize
+                # would only meet the same refusal.
+                raise
             except (httpx.HTTPError, RuntimeError, ValueError) as probe_exc:
                 if "stream_deadline" in str(probe_exc):
                     # Name the phase that actually stalled, or the fallback
@@ -1466,8 +1991,8 @@ def _negotiate_http_server(server_name: str, discovery: bool) -> dict:
                 init_deadline = _phase_deadline(outer, floor=_HTTP_PHASE_FLOOR)
                 init_headers = {"Accept": "application/json, text/event-stream"}
                 init_headers.update(_headers)
-                with client.stream(
-                    "POST", url, json=init, headers=init_headers
+                with _post(
+                    client, cfg, url, init, init_headers, deadline=init_deadline
                 ) as response:
                     if (
                         response.headers.get("x-relay-error") == "relay_auth"
@@ -1508,17 +2033,26 @@ def _negotiate_http_server(server_name: str, discovery: bool) -> dict:
             )
             # Streamed and never read: the reply is discarded either way, and
             # buffering it would hand an unbounded body to the interpreter.
-            with client.stream(
-                "POST",
+            with _post(
+                client,
+                cfg,
                 url,
-                json={"jsonrpc": "2.0", "method": "notifications/initialized"},
-                headers=notif_headers,
+                {"jsonrpc": "2.0", "method": "notifications/initialized"},
+                notif_headers,
+                deadline=_phase_deadline(outer, floor=_HTTP_PHASE_FLOOR),
             ):
                 pass
         _PROTO[server_name] = proto
         return proto
 
+    except _DataTokenError:
+        raise
     except Exception as e:  # noqa: BLE001 - Re-raising as RuntimeError with context
+        if cfg.data_token and isinstance(e, (httpx.HTTPError, _ReplyError)):
+            raise _DataTokenError(
+                "upstream_error",
+                f"the data service failed the handshake ({_failure_name(e)})",
+            ) from e
         msg = f"Failed to initialize remote MCP server {server_name}: {e}{probe_note}"
         raise RuntimeError(msg) from e
 
@@ -1537,7 +2071,33 @@ def _call_mcp_tool_http(
 
 
 def _http_exchange(server_name: str, tool_name: str, arguments: dict[str, Any]) -> dict:
-    """One tools/call over streamable HTTP, with its two bounded recoveries."""
+    """One tools/call over streamable HTTP, with its bounded recoveries.
+
+    A data-token server's failure comes back as an error-envelope reply rather
+    than an exception: through the daemon an exception after the ack reads as
+    "the call may have run", which is noise for read-only data, and the agent's
+    code already branches on the envelope. A reply the server did give, a
+    JSON-RPC error included, is returned and settled as any server's is.
+    """
+    if not _server_cfg(server_name).data_token:
+        return _http_tools_call(server_name, tool_name, arguments)
+    try:
+        return _http_tools_call(server_name, tool_name, arguments)
+    except _DataTokenError as exc:
+        return _envelope_reply(exc.envelope)
+    except (httpx.HTTPError, _ReplyError) as exc:
+        envelope = {
+            "error": "upstream_error",
+            "detail": f"the data service call failed ({_failure_name(exc)})",
+        }
+        if isinstance(exc, httpx.HTTPStatusError):
+            envelope["status"] = exc.response.status_code
+        return _envelope_reply(envelope)
+
+
+def _http_tools_call(
+    server_name: str, tool_name: str, arguments: dict[str, Any]
+) -> dict:
     # Negotiate once per interpreter, then speak the agreed era
     proto = _ensure_http_server(server_name)
 
@@ -1566,12 +2126,14 @@ def _http_exchange(server_name: str, tool_name: str, arguments: dict[str, Any]) 
     # into a local timeout. The two recovery paths (relay credential
     # re-mint and legacy session expiry) each fire at most once, so the
     # loop is bounded to three sends.
-    with httpx.Client(timeout=cfg.call_timeout_s) as client:  # DALTON-HOOK(mcp-call-timeout)
+    with _client_for(cfg, cfg.call_timeout_s) as client:  # DALTON-HOOK(mcp-call-timeout)
         relay_auth_retried = False
         session_reinited = False
         while True:
             deadline = time.monotonic() + cfg.call_timeout_s  # DALTON-HOOK(mcp-call-timeout)
-            with client.stream("POST", url, json=request, headers=headers) as response:
+            with _post(
+                client, cfg, url, request, headers, deadline=deadline
+            ) as response:
                 relay_code = response.headers.get("x-relay-error")
                 if relay_code:
                     if relay_code == "relay_auth" and not relay_auth_retried:
@@ -1768,10 +2330,14 @@ def secret_fingerprint() -> list:
 
     A stdio server's credentials are baked into its environment at spawn, so a
     rotation reaches it only by respawning; the daemon watches this to know
-    when holding a process has become the wrong thing to do.
+    when holding a process has become the wrong thing to do. The market-data
+    token file is not watched on its own: its reader picks up a new token
+    itself, and the server writes one every half hour, which would respawn
+    every trusted server each time. A server whose config names it still
+    depends on it.
     """
     stamps = []
-    paths = {_VAULT_SECRETS_FILE, _MCP_TOKENS_FILE, _EGRESS_RELAY_FILE}
+    paths = {_VAULT_SECRETS_FILE, _EGRESS_RELAY_FILE}
     for name in _SERVER_CONFIGS:
         dependencies = server_secret_dependencies(name)
         if dependencies:
@@ -1788,6 +2354,10 @@ def secret_fingerprint() -> list:
 def server_secret_dependencies(server_name: str) -> list[str] | None:
     """Credential files a held server depends on, or None when unknowable."""
     cfg = _server_cfg(server_name)
+    if cfg.data_token:
+        # It re-reads the token file per request and holds no process or
+        # environment, so a rotation never calls for dropping it.
+        return []
     if cfg.credential_files:
         return sorted({str(path) for path in cfg.credential_files if path})
     if not cfg.untrusted:
@@ -2116,17 +2686,16 @@ def cleanup_mcp_servers():
     in-process fallback spawned.
     """
     for server_name, proc in list(_server_processes.items()):
+        _signal_group(proc, signal.SIGTERM)
         try:
-            proc.terminate()
             proc.wait(timeout=5)
         except (OSError, subprocess.SubprocessError) as e:
             # TimeoutExpired is a SubprocessError, not a TimeoutError; a server
             # that ignores SIGTERM must not leave the rest of the set running.
             print(f"Error cleaning up MCP server {server_name}: {e}", file=sys.stderr)  # noqa: T201
-            try:
-                proc.kill()
-            except OSError:
-                pass
+        # A launcher can exit on SIGTERM and leave what it started, so the
+        # group gets SIGKILL either way.
+        _signal_group(proc, signal.SIGKILL)
     _server_processes.clear()
     _PROTO.clear()
 
@@ -2197,15 +2766,16 @@ def _discover_stdio(server_name: str) -> list:
 def _discover_http(server_name: str) -> list:
     """Negotiate with the http server in discovery mode and list its tools."""
     proto = _ensure_http_server(server_name, discovery=True)
-    url, headers = _resolve_http(_server_cfg(server_name), discovery=True)
+    cfg = _server_cfg(server_name)
+    url, headers = _resolve_http(cfg, discovery=True)
     if proto["mode"] == "modern":
         req = _modern_request("tools/list", {}, proto["version"])
     else:
         req = _legacy_request("tools/list", {})
     hdrs = _mcp_headers("tools/list", "", proto, headers)
-    with httpx.Client(timeout=_HTTP_EXCHANGE_BUDGET) as client:
+    with _client_for(cfg, _HTTP_EXCHANGE_BUDGET) as client:
         deadline = time.monotonic() + _HTTP_EXCHANGE_BUDGET
-        with client.stream("POST", url, json=req, headers=hdrs) as response:
+        with _post(client, cfg, url, req, hdrs, deadline=deadline) as response:
             # A relay rejection here would otherwise surface as a bare 502
             # against the relay URL; decode it like the handshake path does.
             _msg = _relay_error(response, server_name)

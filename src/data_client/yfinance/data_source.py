@@ -15,8 +15,8 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from src.data_client.normalize import build_series, minor_unit_scale, scale_snapshot_prices
-from market_protocol import InstrumentRef, Series, to_canonical
+from src.data_client.normalize import build_series, minor_unit_places, scale_snapshot_prices
+from market_protocol import InstrumentRef, Series, to_canonical, to_major_units
 from market_protocol.calendars import get_calendar, session_bounds
 from market_protocol.enums import AssetClass
 from src.utils.market_hours import interval_seconds
@@ -89,10 +89,10 @@ def _finite(v: Any) -> float | None:
     return f if math.isfinite(f) else None
 
 
-def _normalize_bar(idx, row: Any, scale: float = 1.0) -> dict[str, Any]:
+def _normalize_bar(idx, row: Any, places: int = 0) -> dict[str, Any]:
     """Convert a yfinance history row to the standard OHLCV bar shape.
 
-    ``scale`` is the minor-unit factor (0.01 for GBX/pence venues, else 1.0);
+    ``places`` is the minor-unit shift (2 for GBX/pence venues, else 0);
     OHLC prices are scaled, volume (a share count) is not.
     """
     if hasattr(idx, "timestamp"):
@@ -101,10 +101,10 @@ def _normalize_bar(idx, row: Any, scale: float = 1.0) -> dict[str, Any]:
         t = 0
     return {
         "time": t,
-        "open": round(float(row["Open"]) * scale, 4),
-        "high": round(float(row["High"]) * scale, 4),
-        "low": round(float(row["Low"]) * scale, 4),
-        "close": round(float(row["Close"]) * scale, 4),
+        "open": round(to_major_units(float(row["Open"]), places), 4),
+        "high": round(to_major_units(float(row["High"]), places), 4),
+        "low": round(to_major_units(float(row["Low"]), places), 4),
+        "close": round(to_major_units(float(row["Close"]), places), 4),
         # NaN != NaN: index/sparse rows carry NaN volume and int(NaN) raises,
         # killing the whole fetch for one bad row.
         "volume": int(row["Volume"]) if row["Volume"] == row["Volume"] else 0,
@@ -116,7 +116,7 @@ def _fetch_history(
     interval: str,
     start: str | None,
     end: str | None,
-    scale: float = 1.0,
+    places: int = 0,
     extended_hours: bool = False,  # DALTON-HOOK(stock-move-upgrade)
 ) -> list[dict[str, Any]]:
     """Synchronous helper — called via ``asyncio.to_thread``."""
@@ -144,7 +144,7 @@ def _fetch_history(
     # A NaN-priced row (halted session, yfinance gap padding) would propagate
     # NaN into the cache and render as "nan" downstream — drop it here.
     df = df.copy().dropna(subset=["Open", "High", "Low", "Close"])
-    return [_normalize_bar(idx, row, scale) for idx, row in df.iterrows()]
+    return [_normalize_bar(idx, row, places) for idx, row in df.iterrows()]
 
 
 def _place_in_sessions(
@@ -385,15 +385,15 @@ class YFinanceDataSource:
                 f"Interval '{interval}' is not supported by yfinance"
             )
         api_symbol = self._api_symbol(symbol, is_index)
-        scale = minor_unit_scale(symbol)
+        places = minor_unit_places(symbol)
         bars = await asyncio.to_thread(
             _fetch_history,
             api_symbol,
             yf_interval,
             from_date,
             to_date,
-            scale,
-            extended_hours,
+            places,
+            extended_hours,  # DALTON-HOOK(stock-move-upgrade)
         )
         return _place_in_sessions(bars, symbol, is_index, interval)
 
@@ -406,9 +406,9 @@ class YFinanceDataSource:
         user_id: str | None = None,
     ) -> list[dict[str, Any]]:
         api_symbol = self._api_symbol(symbol, is_index)
-        scale = minor_unit_scale(symbol)
+        places = minor_unit_places(symbol)
         return await asyncio.to_thread(
-            _fetch_history, api_symbol, "1d", from_date, to_date, scale
+            _fetch_history, api_symbol, "1d", from_date, to_date, places
         )
 
     async def get_snapshots(
@@ -443,8 +443,8 @@ class YFinanceDataSource:
             if snap is None:
                 continue
             snap["symbol"] = original
-            # Scale price-like fields per the requested symbol (GBX → ×0.01).
-            scale_snapshot_prices(snap, minor_unit_scale(original))
+            # Scale price-like fields per the requested symbol (GBX → pounds).
+            scale_snapshot_prices(snap, minor_unit_places(original))
             out.append(snap)
         return out
 

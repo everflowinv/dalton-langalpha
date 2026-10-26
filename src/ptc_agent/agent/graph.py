@@ -6,6 +6,7 @@ from typing import Any, Protocol, runtime_checkable
 
 from ptc_agent.agent.agent import AgentRole, PTCAgent
 from ptc_agent.agent.middleware.runtime_context import TurnContext
+from ptc_agent.agent.middleware.runtime_context.epoch import Workspace
 from ptc_agent.agent.middleware.compaction.window import WindowCoverage
 from ptc_agent.agent.middleware.subagent_switch import SubagentSwitchReader
 from ptc_agent.config import AgentConfig
@@ -92,31 +93,38 @@ async def _read_harness_blocks(
 
 async def _read_workspace_naming(
     workspace_id: str, role: AgentRole = "analyst"
-) -> tuple[str | None, str | None]:
-    """The workspace's name and description for the prompt's `<workspace>` block.
+) -> Workspace | None:
+    """The workspace's name, description and computer for the `<workspace>` block.
 
     Read once here rather than inside the model call, so the values are bound
     when the turn's agent is built and the model never sees the name change
-    under it mid-answer. The baseline freezes the pair per epoch; a rename
+    under it mid-answer. The baseline freezes them per epoch; a rename
     reaches the model as a `workspace_changed` row on the next turn. A read
     that fails answers None, not an empty name: the baseline must not file a
     row saying the workspace lost its name. The Chief of Staff's Home is named
     for its folder, not for the row it is stored in.
     """
     if not workspace_id:
-        return None, None
+        return None
+    try:
+        from src.server.database.workspace import get_workspace_naming
+
+        row = await get_workspace_naming(workspace_id) or {}
+    except Exception as e:
+        logger.warning(f"Failed to read the name of workspace {workspace_id}: {e}")
+        return None
+    from src.tools.secretary.utils import computer_label
+
+    computer = computer_label(row.get("computer_name"), row.get("computers") or 0) or ""
     if role == "chief_of_staff":
         from src.server.database.workspace_names import HOME_FOLDER
 
-        return HOME_FOLDER, _HOME_DESCRIPTION
-    try:
-        from src.server.database.workspace import get_workspace_name_and_description
-
-        row = await get_workspace_name_and_description(workspace_id) or {}
-        return (row.get("name") or "").strip(), (row.get("description") or "").strip()
-    except Exception as e:
-        logger.warning(f"Failed to read the name of workspace {workspace_id}: {e}")
-        return None, None
+        return Workspace(name=HOME_FOLDER, description=_HOME_DESCRIPTION, computer=computer)
+    return Workspace(
+        name=(row.get("name") or "").strip(),
+        description=(row.get("description") or "").strip(),
+        computer=computer,
+    )
 
 
 async def build_ptc_graph(
@@ -145,7 +153,7 @@ async def build_ptc_graph(
             f"Failed to initialize session for conversation {conversation_id}"
         )
 
-    ptc_agent, user_data_counts, (workspace_name, workspace_description) = await asyncio.gather(
+    ptc_agent, user_data_counts, workspace = await asyncio.gather(
         asyncio.to_thread(PTCAgent, config),
         fetch_user_data_counts(user_id),
         _read_workspace_naming(conversation_id),
@@ -163,8 +171,7 @@ async def build_ptc_graph(
         background_registry=background_registry,
         # session gives workspace-tier memory a real namespace.
         session=session,
-        workspace_name=workspace_name,
-        workspace_description=workspace_description,
+        workspace=workspace,
         store=store,
         on_signed_url=on_signed_url,
         user_id=user_id,
@@ -243,7 +250,7 @@ async def build_ptc_graph_with_session(
     (
         user_data_counts,
         ptc_agent,
-        (workspace_name, workspace_description),
+        workspace,
         harness_blocks,
     ) = await asyncio.gather(
         fetch_user_data_counts(user_id),
@@ -277,8 +284,7 @@ async def build_ptc_graph_with_session(
         user_profile=user_profile,
         session=session,
         thread_id=thread_id,
-        workspace_name=workspace_name,
-        workspace_description=workspace_description,
+        workspace=workspace,
         on_agent_md_write=session.note_agent_md_write,
         store=store,
         on_signed_url=on_signed_url,

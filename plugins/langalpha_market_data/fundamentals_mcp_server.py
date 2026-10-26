@@ -78,6 +78,11 @@ _SOURCE_TUSHARE = "tushare"
 _CLIENT_UNAVAILABLE = "FMP client is unavailable"
 _UPSTREAM_FAILED = "FMP request failed"
 
+# The bar sizes the hosted technicals read accepts, in the order its refusal
+# lists them. FMP answers any other as a bare 400, so the refusal is made here,
+# in the hosted words, before FMP is asked.
+_BAR_SIZES = ("1min", "5min", "15min", "30min", "1hour", "4hour", "1day")
+
 _tushare_financial = None
 
 
@@ -713,6 +718,12 @@ async def get_technical_indicator(
         On error: {error: <code>, detail, symbol}.
     """
     disp = _canonical(symbol)
+    if timeframe not in _BAR_SIZES:
+        return make_error(
+            "invalid_argument",
+            f"timeframe must be one of {', '.join(_BAR_SIZES)}, not {timeframe!r}",
+            symbol=disp,
+        )
     api = _fmp_symbol(symbol)
     try:
         client = await get_fmp_client()

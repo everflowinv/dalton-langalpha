@@ -14,22 +14,27 @@ from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
-from ptc_agent.core.sandbox.runtime import SandboxTransientError
+from ptc_agent.core.sandbox.runtime import RuntimeState, SandboxTransientError
 from ptc_agent.core.session import Session
 
 from src.observability import safe_add, workspace_created
 from src.server.database.computer import (
     get_computer,
+    get_computer_for_workspace,
     get_computers_by_status,
     update_computer_status,
 )
 from src.server.database.home_workspace import is_home_row
 from src.server.database.workspace import (
+    MOVING_DELETE_REFUSAL,
     SERVER_OWNED_CONFIG_KEYS,
+    WorkspaceBusyError,
+    WorkspaceMovingError,
     complete_workspace_folder_cleanup,
     create_workspace_on_computer,
     delete_workspace as db_delete_workspace,
     get_pending_workspace_folder_cleanups,
+    workspace_is_moving,
 )
 from src.server.database.workspace_folders import (
     WorkspaceFolderMoving,
@@ -37,6 +42,11 @@ from src.server.database.workspace_folders import (
     workspace_folder_in_use,
 )
 from src.server.database.workspace_names import checked_workspace_name
+from src.server.models.computer import ComputerStatus
+from src.server.services.computer_errors import (
+    ComputerNotFoundError,
+    ComputerPreparingError,
+)
 from src.server.services.computer_manager import ComputerManager
 
 logger = logging.getLogger(__name__)
@@ -58,6 +68,7 @@ class WorkspaceManager(ComputerManager):
         description: Optional[str] = None,
         config: Optional[Dict[str, Any]] = None,
         resource_tier: Optional[str] = None,
+        computer_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Create a project on the user's computer and return it straight away.
 
@@ -74,15 +85,33 @@ class WorkspaceManager(ComputerManager):
             config: Optional configuration
             resource_tier: Tier for a user who has no computer yet; ignored
                 once they have one, since the tier belongs to the machine.
+            computer_id: One of the user's computers to create the project on
+                instead of their primary.
 
         Returns:
             Created workspace record, bound and ready to be started.
+
+        Raises:
+            ComputerNotFoundError: ``computer_id`` names no live computer of
+                the user's.
+            ComputerPreparingError: the computer is building its first sandbox.
         """
         # Before a first computer is minted for a name that cannot be stored.
         name = checked_workspace_name(name)
-        computer = await self.ensure_primary_computer(
-            user_id, name=name, resource_tier=resource_tier
-        )
+        chosen = computer_id is not None
+        if chosen:
+            computer = await self._chosen_computer(user_id, computer_id)
+        else:
+            computer = await self.ensure_primary_computer(
+                user_id, name=name, resource_tier=resource_tier
+            )
+        # Never had a sandbox and one is being built. A workspace placed on it
+        # now would make its first request wait out that build, so it waits here.
+        if computer.get("status") in (
+            ComputerStatus.CREATING,
+            ComputerStatus.STARTING,
+        ) and not computer.get("provider_ref"):
+            raise ComputerPreparingError("Computer is still being prepared")
         computer_id = str(computer["computer_id"])
 
         workspace = await create_workspace_on_computer(
@@ -97,6 +126,8 @@ class WorkspaceManager(ComputerManager):
             },
         )
         if workspace is None:
+            if chosen:
+                raise ComputerNotFoundError("Computer not found")
             raise RuntimeError(
                 f"Computer {computer_id} was gone before workspace {name!r} "
                 "could be created on it"
@@ -110,6 +141,22 @@ class WorkspaceManager(ComputerManager):
         )
         safe_add(workspace_created, 1)
         return workspace
+
+    @staticmethod
+    async def _chosen_computer(user_id: str, computer_id: str) -> Dict[str, Any]:
+        """The user's live computer by id, for a project they place on it.
+
+        A machine waiting to be retired once empty counts as gone: its teardown
+        would tombstone the new project with it.
+        """
+        computer = await get_computer(computer_id)
+        if (
+            computer is None
+            or str(computer.get("user_id")) != str(user_id)
+            or (computer.get("config") or {}).get("retire_when_empty")
+        ):
+            raise ComputerNotFoundError("Computer not found")
+        return computer
 
     async def get_session_for_workspace(
         self,
@@ -156,7 +203,12 @@ class WorkspaceManager(ComputerManager):
         Raises:
             ValueError: If workspace not found
             RuntimeError: If workspace is in error/deleted state
+            WorkspaceMovingError: The workspace is moving to another computer.
         """
+        # Before a start too: a stopped computer starts by restoring its
+        # starter's folder, which a move has set aside.
+        if await workspace_is_moving(workspace_id):
+            raise WorkspaceMovingError(workspace_id)
         session = await self._acquire_session(
             workspace_id,
             user_id=user_id,
@@ -167,6 +219,11 @@ class WorkspaceManager(ComputerManager):
         runtime = getattr(getattr(session, "sandbox", None), "runtime", None)
         if runtime is not None:
             binding = await self.resolve_binding(workspace_id)
+            # Every acquire, warm ones included: no sync runs on most of them,
+            # and an idle computer's token is left to run out, so this is
+            # what has one in place before the turn's code runs. A read of
+            # the row when the token has time left.
+            await self._keep_data_token(binding.computer_id, user_id, session.sandbox)
             await self._settle_folders(
                 binding.computer_id, runtime, root=binding.root_dir, own_run_id=run_id
             )
@@ -179,6 +236,10 @@ class WorkspaceManager(ComputerManager):
                 if binding.dir_name and not is_top_level(binding.dir_name):
                     # A move a settle could not finish; the agent cannot work in _internal.
                     raise WorkspaceFolderMoving(workspace_id)
+                # Again under the hold a move sets the folder aside under, for
+                # a move claimed while this acquired.
+                if await workspace_is_moving(workspace_id):
+                    raise WorkspaceMovingError(workspace_id)
                 # Per project, not per machine: the acquire above may have handed
                 # back the session a sibling started, which prepared only that
                 # sibling's folder and only that sibling's tool overlay.
@@ -188,6 +249,39 @@ class WorkspaceManager(ComputerManager):
                 "This workspace's folder is being moved. Try again in a moment."
             ) from e
         return session
+
+    async def get_session_if_running(
+        self, workspace_id: str, user_id: str | None = None
+    ) -> Session | None:
+        """The workspace's session, or None while its computer is not running.
+
+        For reads that must never start a computer: an open preview card polls
+        every two minutes, so a read that starts one undoes every stop within
+        two. Postgres says whether the computer was stopped. Without a session
+        on this worker the provider is asked too, because a sandbox can stop on
+        its own idle timer before the server notices, and attaching to a
+        paused E2B sandbox resumes it.
+        """
+        computer = await get_computer_for_workspace(workspace_id)
+        if (
+            computer is None
+            or computer.get("status") != "running"
+            or not computer.get("provider_ref")
+        ):
+            return None
+        provider_ref = str(computer["provider_ref"])
+        session = self.get_session_if_ready(
+            workspace_id, expected_sandbox_id=provider_ref
+        )
+        if session is not None:
+            return session
+        binding = self._binding_from_computer(workspace_id, computer)
+        async with self._detached_runtime(provider_ref, binding=binding) as runtime:
+            # Just looked up, so the state it holds is current.
+            state = await runtime.get_state()
+        if state is not RuntimeState.RUNNING:
+            return None
+        return await self.get_session_for_workspace(workspace_id, user_id=user_id)
 
     async def archive_workspace(self, workspace_id: str) -> Dict[str, Any]:
         """Archive a stopped machine (moves its sandbox to object storage)."""
@@ -225,6 +319,10 @@ class WorkspaceManager(ComputerManager):
                 # Here rather than only at the route: an agent's tool deletes
                 # through this method too.
                 raise ValueError("Cannot delete Home")
+            # Before the last backup holds the folder, which would fail the
+            # move instead; the delete's own transaction checks again.
+            if await workspace_is_moving(workspace_id):
+                raise WorkspaceBusyError(MOVING_DELETE_REFUSAL)
 
             logger.info(f"Deleting workspace {workspace_id}")
 
@@ -260,6 +358,20 @@ class WorkspaceManager(ComputerManager):
         if retired:
             self._forget_machine(computer_id)
         self._forget_project(workspace_id)
+
+        from src.server.services.market_targets.changes import (
+            cancel_on_workspace_delete,
+        )
+
+        await cancel_on_workspace_delete(workspace_id)
+
+        if not retired:
+            # Its proxied previews stop now rather than at expiry; a retired
+            # machine's teardown already ended them. Revocation is per sandbox,
+            # so a sibling's preview mints a fresh link on next open.
+            from src.server.services.preview_capabilities import revoke
+
+            await revoke(binding.provider_ref)
 
         return True
 
@@ -318,7 +430,13 @@ class WorkspaceManager(ComputerManager):
                 last_activity = last_activity.replace(tzinfo=timezone.utc)
 
             idle_seconds = (now - last_activity).total_seconds()
-            if idle_seconds <= self.idle_timeout:
+            try:
+                idle_timeout = self._idle_timeout_for(computer)
+            except ValueError as e:
+                # Settings the stop could not build a provider from either.
+                self._note_idle_reap_failure(computer_id, e)
+                continue
+            if idle_seconds <= idle_timeout:
                 continue
 
             # Skip machines that still have an active agent workflow. The gate
@@ -371,6 +489,21 @@ class WorkspaceManager(ComputerManager):
                 completed += 1
         return completed
 
+    def _idle_timeout_for(self, computer: Dict[str, Any]) -> int:
+        """Seconds idle before the sweep stops this computer.
+
+        Ten minutes ahead of its own provider's auto-stop, overrides included,
+        so the server cleans up before the provider stops the sandbox; never
+        under five minutes.
+
+        Raises:
+            ValueError: The computer's provider settings are unreadable.
+        """
+        settings = self._provider_settings(
+            computer["kind"], computer.get("provider_config") or None
+        )
+        return max(settings.auto_stop_interval - 600, 300)
+
     def _note_idle_reap_failure(self, computer_id: str, error: Exception) -> None:
         """Park a machine the sweep cannot stop, so one warning replaces a loop.
 
@@ -393,7 +526,7 @@ class WorkspaceManager(ComputerManager):
         machine.idle_reap_backoff_until = time.monotonic() + _IDLE_REAP_BACKOFF_SECONDS
 
     async def reap_stuck_starting_workspaces(self) -> int:
-        """Revert computers wedged in 'starting' back to 'stopped'.
+        """Revert computers wedged in 'starting' or 'creating' back to 'stopped'.
 
         Backstop for the cross-worker start mutex: if a claim winner's Phase 2
         dies without reverting (worker crash, event-loop teardown that beats the
@@ -412,7 +545,9 @@ class WorkspaceManager(ComputerManager):
         crashed/recycled worker, which carry no local membership.
 
         The revert enters through the computer, so every project on the machine
-        follows it back to 'stopped' in the same statement.
+        follows it back to 'stopped' in the same statement. A 'creating' row is
+        claimed by its own create request within moments, so one that has sat
+        past the threshold lost that request and would hold a running slot.
 
         Returns:
             Number of computers reverted.
@@ -420,13 +555,18 @@ class WorkspaceManager(ComputerManager):
         now = datetime.now(timezone.utc)
         reverted = 0
 
-        starting_computers = await get_computers_by_status("starting", limit=1000)
-        if len(starting_computers) == 1000:
-            logger.warning(
-                "reap_stuck_starting hit the 1000-row scan cap; more stuck "
-                "rows may remain and will be reaped on the next cycle"
-            )
+        starting_computers: list[Dict[str, Any]] = []
+        for stuck_status in ("starting", "creating"):
+            rows = await get_computers_by_status(stuck_status, limit=1000)
+            if len(rows) == 1000:
+                logger.warning(
+                    f"reap_stuck_starting hit the 1000-row scan cap on "
+                    f"{stuck_status!r}; more stuck rows may remain and will be "
+                    "reaped on the next cycle"
+                )
+            starting_computers.extend(rows)
         for computer in starting_computers:
+            stuck_status = computer["status"]
             updated_at = computer.get("updated_at")
             if not updated_at:
                 continue
@@ -445,7 +585,7 @@ class WorkspaceManager(ComputerManager):
                 # membership and fall through to the reap below.
                 continue
             logger.warning(
-                f"Reaping computer {computer_id} stuck in 'starting' for "
+                f"Reaping computer {computer_id} stuck in {stuck_status!r} for "
                 f"{(now - updated_at).total_seconds():.0f}s "
                 f"(threshold {self.reap_stuck_after:.0f}s); reverting to 'stopped'"
             )
@@ -458,12 +598,12 @@ class WorkspaceManager(ComputerManager):
                     if not locked:
                         continue
                     current = await get_computer(computer_id)
-                    if current is None or current.get("status") != "starting":
+                    if current is None or current.get("status") != stuck_status:
                         continue
                     changed = await update_computer_status(
                         computer_id,
                         "stopped",
-                        expected="starting",
+                        expected=stuck_status,
                         updated_before=now - timedelta(seconds=self.reap_stuck_after),
                     )
                 if changed is None:
@@ -479,7 +619,9 @@ class WorkspaceManager(ComputerManager):
                 )
 
         if reverted > 0:
-            logger.info(f"Reaped {reverted} computers stuck in 'starting'")
+            logger.info(
+                f"Reaped {reverted} computers stuck in 'starting' or 'creating'"
+            )
 
         return reverted
 
@@ -495,9 +637,11 @@ class WorkspaceManager(ComputerManager):
                 try:
                     await asyncio.sleep(self.cleanup_interval)
                     if not self._shutdown:
-                        # Remove tombstoned project folders before idle cleanup
-                        # can stop their computer and make the runtime unavailable.
+                        # Remove tombstoned project folders, and those moves
+                        # left, before idle cleanup can stop their computer and
+                        # make the runtime unavailable.
                         await self.reap_pending_workspace_folder_cleanups()
+                        await self.reap_workspace_moves()
                         await self.cleanup_idle_workspaces()
                         await self.reap_stuck_starting_workspaces()
                         await self.reap_retirement_pending_computers()

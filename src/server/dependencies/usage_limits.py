@@ -14,6 +14,7 @@ Fail-open: when the platform service is unreachable, requests are allowed.
 import asyncio
 import logging
 import os
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Annotated, Optional
 
@@ -761,6 +762,50 @@ async def assert_spec_allowed(
 async def assert_always_on_allowed(user_id: str) -> None:
     """Gate enabling always-on (scope 403 + count 429). No-op in OSS mode."""
     await _assert_hybrid_gate(user_id, ALWAYS_ON_SCOPE, ALWAYS_ON_QUOTA)
+
+
+def provider_scope(kind: str) -> str:
+    """The scope a new computer on a non-default sandbox provider needs."""
+    return f"workspace:provider:{kind}"
+
+
+async def assert_provider_allowed(
+    user_id: str, kind: str, *, default_kind: str
+) -> None:
+    """Gate creating a computer on ``kind`` (scope 403). The default kind is never gated.
+
+    Scope only, with no count quota: the computer cap already meters machines
+    whatever they run on. No-op in OSS mode, fail-open when the platform is
+    unreachable.
+    """
+    if kind == default_kind:
+        return
+    await require_workspace_scope(user_id, provider_scope(kind))
+
+
+async def get_provider_allowances(
+    user_id: str, kinds: Sequence[str], *, default_kind: str
+) -> dict[str, Optional[bool]]:
+    """Whether the user may create a computer on each kind, for display.
+
+    None is the gate's own fail-open reading (OSS mode, an unreachable
+    platform), so a picker built on this never disables a kind the gate would
+    take. Scopes are read once, from the same cache the gate uses.
+    """
+    scopes = (
+        await _get_user_scopes(user_id)
+        if platform_gating_active() and any(k != default_kind for k in kinds)
+        else None
+    )
+
+    def allowed(kind: str) -> Optional[bool]:
+        if kind == default_kind:
+            return True
+        if scopes is None:
+            return None
+        return provider_scope(kind) in scopes
+
+    return {kind: allowed(kind) for kind in kinds}
 
 
 async def spec_grantable(

@@ -30,8 +30,11 @@ def _user_message_item(
         "timestamp": query.get("created_at"),
         "metadata": query.get("metadata"),
     }
+    # Turns nobody typed: a system notification, or the wake a market
+    # target's notice started. The client draws them apart from user bubbles.
+    if query.get("type") in ("system", "market_target"):
+        payload["query_type"] = query["type"]
     if query.get("type") == "system":
-        payload["query_type"] = "system"
         # A report-back's row is drawn from its query, and a live attach draws
         # it again from the stream's first frame. Naming the run here, ended or
         # not, lets the client keep one. Not ``run_id``, which means rendered.

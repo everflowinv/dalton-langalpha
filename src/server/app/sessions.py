@@ -34,7 +34,6 @@ async def get_sessions(x_user_id: CurrentUserId):
     ]
     return {
         "active_sessions": len(sessions),
-        "idle_timeout": manager.idle_timeout,
         "cleanup_interval": manager.cleanup_interval,
         "workspaces": sessions,
     }

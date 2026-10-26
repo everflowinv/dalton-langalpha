@@ -2,6 +2,7 @@ import React from 'react';
 import { motion } from '@/lib/framer';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import { NotificationDivider } from './messageList/NotificationDivider';
+import { MarketAlertRow } from './messageList/MarketAlertRow';
 import { MessageBubble } from './messageList/MessageBubble';
 import { TurnFold } from './messageList/TurnFold';
 import { projectMessageContent, visibleProjection } from './messageList/contentProjection';
@@ -11,6 +12,8 @@ import { UserBubble } from './messageList/UserBubble';
 import { computeTurnTails, hasTurn, projectTurns } from './messageList/turnProjection';
 import { useLiveMessages, type LiveMessages } from '../session/stream/liveMessages';
 import type { ChatMessage, MessageProvenance } from '@/types/chat';
+import type { MarketTarget } from '../utils/api';
+import type { MarketAlert } from '../session/marketWatchEvents';
 import { turnFilesByTurn } from '../utils/turnFiles';
 import { useWorkspaceFolders } from '../contexts/WorkspaceContext';
 import type { FeedbackResult, FoldState, MessageRecord } from './messageList/types';
@@ -57,9 +60,11 @@ interface MessageListProps {
    *  its turn, so a steering continuation shows the continued turn's rating. */
   feedbackByTurn?: Record<number, FeedbackResult>;
   dispatcherContext?: { threadId: string; workspaceId: string } | null;
+  /** The thread's market-watch targets, read by its price-alert rows. */
+  marketTargets?: readonly MarketTarget[] | null;
 }
 
-function MessageList({ messages, isLoading, isLoadingHistory, isSubagentView, readOnly, allowFiles, feedbackByTurn, dispatcherContext }: MessageListProps): React.ReactElement | null {
+function MessageList({ messages, isLoading, isLoadingHistory, isSubagentView, readOnly, allowFiles, feedbackByTurn, dispatcherContext, marketTargets }: MessageListProps): React.ReactElement | null {
   const isMobile = useIsMobile();
   const { onOpenFile } = useMessageActions();
   // The deck keeps the workspace's own notes file out on every surface; its
@@ -270,7 +275,10 @@ function MessageList({ messages, isLoading, isLoadingHistory, isSubagentView, re
     <div className={`font-content ${isMobile ? 'sibling-space-y-4' : 'sibling-space-y-6'}`}>
       {visible.map(({ message, turnIndex }, i) => {
         if ((message.role as string) === 'notification') {
-          return <NotificationDivider key={message.id as string} message={message} />;
+          const marketAlert = message.marketAlert as MarketAlert | undefined;
+          return marketAlert
+            ? <MarketAlertRow key={message.id as string} alert={marketAlert} targets={marketTargets} />
+            : <NotificationDivider key={message.id as string} message={message} />;
         }
         if (isReportRow(message)) {
           return (

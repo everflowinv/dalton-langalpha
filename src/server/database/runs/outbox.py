@@ -127,6 +127,39 @@ _STEER_SAFETY_NET_SQL = """(
 )"""
 
 
+def _waiting_alert_sql(a: str) -> str:
+    """A market-target alert its executor gave up waking the thread for
+    (``_exhaust_alerts``), parked until the thread's next turn takes it in or
+    a turn's ending makes it due. ``a`` is the hook_outbox alias."""
+    return (
+        f"({a}.hook_type = 'market_target' AND {a}.status = 'pending'"
+        f" AND {a}.next_retry_at = 'infinity'::timestamptz"
+        f" AND {a}.payload ? 'exhausted')"
+    )
+
+
+# Whether the notice of the alert ``o`` is still owed, as ``owed()`` in
+# market_targets/delivery.py decides it: a hit until it is delivered, a
+# reminder while its target is armed, unexpired and not yet reminded. The CASE
+# keeps a malformed target id from failing the statement; the executor drops
+# that job.
+_ALERT_OWED_SQL = """EXISTS (
+    SELECT 1 FROM market_watch_targets t
+    WHERE t.target_id = CASE
+            WHEN o.payload->>'target_id'
+                 ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+            THEN (o.payload->>'target_id')::uuid
+        END
+      AND CASE o.payload->>'notice'
+            WHEN 'hit' THEN t.hit_delivered_at IS NULL
+            WHEN 'expiring' THEN t.warn_delivered_at IS NULL
+                                 AND t.status = 'armed'
+                                 AND t.expires_at > NOW()
+            ELSE false
+        END
+)"""
+
+
 async def claim_outbox_jobs(
     limit: int = 10,
     lease_seconds: int = 60,
@@ -175,6 +208,10 @@ async def claim_outbox_jobs(
     ``next_retry_at`` (``_STEER_DUE_SQL``). A parked one is also due once its
     owner is over and nothing will take it in (``_STEER_SAFETY_NET_SQL``), so
     its release does not hang on any one finalize path running to the end.
+
+    A waiting alert (``_waiting_alert_sql``) blocks nothing behind it: it is
+    not claimable, and a later notice's wake is the turn that would take it
+    in.
     """
     excluded = list(excluded_hook_types or [])
     async with pool.get_db_connection() as conn:
@@ -204,7 +241,8 @@ async def claim_outbox_jobs(
                             (p.status = 'claimed'
                              AND p.lease_expires_at > NOW())
                             OR (
-                              (p.status = 'pending'
+                              ((p.status = 'pending'
+                                AND NOT {_waiting_alert_sql("p")})
                                OR (p.status = 'claimed'
                                    AND p.lease_expires_at <= NOW()))
                               AND (p.created_at, p.hook_outbox_id)
@@ -259,7 +297,8 @@ async def claim_outbox_jobs(
                                     (p.status = 'claimed'
                                      AND p.lease_expires_at > NOW())
                                     OR (
-                                      (p.status = 'pending'
+                                      ((p.status = 'pending'
+                                        AND NOT {_waiting_alert_sql("p")})
                                        OR (p.status = 'claimed'
                                            AND p.lease_expires_at <= NOW()))
                                       AND (p.created_at, p.hook_outbox_id)
@@ -354,18 +393,24 @@ async def park_exhausted_jobs(*, max_attempts: int = 5) -> List[Dict[str, Any]]:
     normally parks dead) is reclaimable forever; the claim ceiling alone
     would instead leave it claimed-expired forever, wedging its ordering
     chain. Dead report_backs get their watch_clear compensation in the
-    same atomic statement. A steer is settled instead (``_exhaust_steers``),
-    in the same transaction. Returns the parked rows, a steer's with the
-    status it was settled to (done, or pending for the user's).
+    same atomic statement. A steer is settled instead (``_exhaust_steers``)
+    and a market-target alert held for its thread's next turn
+    (``_exhaust_alerts``), in the same transaction. Returns the parked rows,
+    a steer's or an alert's with the status it was settled to (done, or
+    pending).
     """
+    expired_at_ceiling = (
+        "o.status = 'claimed' AND o.lease_expires_at <= NOW()"
+        " AND o.attempts >= %(max)s"
+    )
     async with pool.get_db_connection() as conn:
         async with conn.transaction():
             async with conn.cursor(row_factory=dict_row) as cur:
                 steers = await _exhaust_steers(
-                    cur,
-                    "o.status = 'claimed' AND o.lease_expires_at <= NOW()"
-                    " AND o.attempts >= %(max)s",
-                    {"max": max_attempts},
+                    cur, expired_at_ceiling, {"max": max_attempts}
+                )
+                alerts = await _exhaust_alerts(
+                    cur, expired_at_ceiling, {"max": max_attempts}
                 )
                 await cur.execute(
                     f"""
@@ -374,7 +419,7 @@ async def park_exhausted_jobs(*, max_attempts: int = 5) -> List[Dict[str, Any]]:
                         SET status = 'dead', lease_expires_at = NULL,
                             completed_at = NOW()
                         WHERE status = 'claimed'
-                          AND hook_type <> 'steer'
+                          AND hook_type NOT IN ('steer', 'market_target')
                           AND lease_expires_at <= NOW()
                           AND attempts >= %s
                         RETURNING *
@@ -385,7 +430,7 @@ async def park_exhausted_jobs(*, max_attempts: int = 5) -> List[Dict[str, Any]]:
                     (max_attempts,),
                 )
                 rows = await cur.fetchall()
-                return [dict(r) for r in rows] + steers
+                return [dict(r) for r in rows] + steers + alerts
 
 
 async def revive_dead_cleanup_jobs(
@@ -427,6 +472,151 @@ async def revive_dead_cleanup_jobs(
             )
             rows = await cur.fetchall()
             return [dict(r) for r in rows]
+
+
+# Every column but next_retry_at, which psycopg cannot load as 'infinity'.
+_PARKED_RETURNING_SQL = """o.hook_outbox_id, o.run_id, o.conversation_thread_id,
+    o.hook_type, o.payload, o.ordering_key, o.idempotency_key, o.status,
+    o.attempts, o.created_at, o.completed_at"""
+
+
+async def _exhaust_alerts(
+    cur, where: str, params: Dict[str, Any]
+) -> List[Dict[str, Any]]:
+    """Hold the market-target alerts matching ``where`` for their thread's
+    next turn, in the caller's transaction, instead of letting them go dead.
+
+    Parked pending, so a live turn takes the notice in as a report owed to
+    the thread, and a turn's ending makes it due for its executor to look
+    again. ``exhausted`` stays for good: it keeps the parked row from
+    blocking its chain, lets the closing sweep close it once its notice is
+    no longer owed, and tells its executor that one more refusal holds it
+    again rather than starting a fresh round of retries, so each further
+    claim waits on another turn's ending. Leaves ``attempts`` alone, the
+    fence token: a pending row has no claim ceiling, and every way back from
+    claimed at the ceiling holds it here again. Needs a ``dict_row`` cursor;
+    returns the rows as held."""
+    await cur.execute(
+        f"""
+        UPDATE hook_outbox o
+        SET status = 'pending',
+            lease_expires_at = NULL,
+            next_retry_at = 'infinity'::timestamptz,
+            payload = (o.payload - 'steered_run_id' - 'due_at')
+                || jsonb_build_object('exhausted', true)
+        WHERE o.hook_type = 'market_target' AND {where}
+        RETURNING {_PARKED_RETURNING_SQL}
+        """,
+        params,
+    )
+    return [dict(r) for r in await cur.fetchall()]
+
+
+async def exhaust_alert(job_id: str, *, attempts: int) -> bool:
+    """Hold a claimed market-target alert whose wake was refused for its
+    thread's next turn (``_exhaust_alerts``), fenced to the caller's lease.
+    False when the fence was lost: another owner has the job."""
+    async with pool.get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            held = await _exhaust_alerts(
+                cur,
+                "o.hook_outbox_id = %(job_id)s::uuid AND o.status = 'claimed'"
+                " AND o.attempts = %(attempts)s",
+                {"job_id": job_id, "attempts": attempts},
+            )
+            return bool(held)
+
+
+# How many times ``revive_dead_alerts`` brought the alert ``o`` back. Read
+# only as a number, so a value of any other type cannot fail the statement.
+_ALERT_REVIVALS_SQL = """(CASE WHEN jsonb_typeof(o.payload->'revived') = 'number'
+    THEN (o.payload->>'revived')::int ELSE 0 END)"""
+
+
+async def revive_dead_alerts(
+    *, cooldown_seconds: int = 600, window_seconds: int = 86400, max_revivals: int = 2
+) -> List[Dict[str, Any]]:
+    """Make a dead market-target alert whose notice is still owed due again.
+
+    This build holds an alert rather than dead-lettering it, but a build
+    that predates the hold, or one that knows no ``market_target`` job, kills
+    it at the attempts ceiling: across a blue/green cutover the old color's
+    drainer nacks a job it cannot run until it dies, and this build never
+    tried its wake. Revived due, its executor here tries one, and a refusal
+    holds it as any other (at once when its attempts are past the ceiling).
+    Only a row dead for ``cooldown_seconds`` comes back, so an old color
+    still draining is less likely to kill it again, and ``revived`` counts
+    revivals up to ``max_revivals``, so one it keeps killing stays dead. Only
+    rows that died within ``window_seconds`` are read, which keeps the scan
+    on the terminal-age index. ``attempts`` is kept, the fence token. A
+    single guarded UPDATE, so every worker may run it at once: a second one
+    waiting on the row finds it no longer dead."""
+    async with pool.get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                f"""
+                UPDATE hook_outbox o
+                SET status = 'pending',
+                    lease_expires_at = NULL,
+                    completed_at = NULL,
+                    next_retry_at = NOW(),
+                    payload = (o.payload - 'steered_run_id' - 'due_at')
+                        || jsonb_build_object('revived', {_ALERT_REVIVALS_SQL} + 1)
+                WHERE o.status = 'dead'
+                  AND o.hook_type = 'market_target'
+                  AND COALESCE(o.completed_at, o.created_at)
+                      <= NOW() - make_interval(secs => %(cooldown)s::float)
+                  AND COALESCE(o.completed_at, o.created_at)
+                      > NOW() - make_interval(secs => %(window)s::float)
+                  AND {_ALERT_REVIVALS_SQL} < %(max)s
+                  AND {_ALERT_OWED_SQL}
+                RETURNING o.hook_outbox_id, o.conversation_thread_id,
+                          o.ordering_key, o.payload
+                """,
+                {
+                    "cooldown": cooldown_seconds,
+                    "window": window_seconds,
+                    "max": max_revivals,
+                },
+            )
+            return [dict(r) for r in await cur.fetchall()]
+
+
+async def close_unowed_waiting_alerts() -> List[Dict[str, Any]]:
+    """Close the market-target alerts no turn will take in: a waiting one
+    whose notice is no longer owed (a reminder whose target fired, expired
+    or was cancelled since), and any pending one on a thread that is
+    archived or whose workspace was deleted, held or merely parked.
+
+    Closed as their executor would drop them, without waiting on a turn the
+    thread may never get. One a turn holds is left to that turn's confirm
+    or ending. A deleted thread takes its rows with it, and an owner who
+    turned market watch off is read at the turn or the claim that would
+    show the notice. A single guarded UPDATE, so every worker may run it at
+    once; the row lock orders it against a turn's hold and a claim."""
+    async with pool.get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                f"""
+                UPDATE hook_outbox o
+                SET status = 'done', completed_at = NOW(), next_retry_at = NULL
+                WHERE o.hook_type = 'market_target'
+                  AND o.status = 'pending'
+                  AND NOT (o.payload ? 'steered_run_id')
+                  AND (
+                    ({_waiting_alert_sql("o")} AND NOT {_ALERT_OWED_SQL})
+                    OR EXISTS (
+                        SELECT 1 FROM conversation_threads c
+                        LEFT JOIN workspaces w ON w.workspace_id = c.workspace_id
+                        WHERE c.conversation_thread_id = o.conversation_thread_id
+                          AND (c.archived_at IS NOT NULL OR w.status = 'deleted')
+                    )
+                  )
+                RETURNING o.hook_outbox_id, o.conversation_thread_id,
+                          o.ordering_key, o.payload
+                """
+            )
+            return [dict(r) for r in await cur.fetchall()]
 
 
 async def purge_terminal_jobs(
@@ -504,14 +694,16 @@ async def nack_outbox_job(
     reclaiming owner's live lease (a fence-lost nack also never
     compensates a live job). A report_back going dead gets its watch_clear
     compensation in the same atomic statement; a steer at the ceiling is
-    settled instead (``_exhaust_steers``). Returns the new status
-    (``'exhausted'`` for that steer), or None if the fence was lost."""
+    settled instead (``_exhaust_steers``), and a market-target alert held
+    for its thread's next turn (``_exhaust_alerts``). Returns the new status
+    (``'exhausted'`` for either), or None if the fence was lost."""
     async with pool.get_db_connection() as conn:
         async with conn.transaction():
             async with conn.cursor(row_factory=dict_row) as cur:
-                if await _exhaust_steers(
-                    cur, _AT_CEILING_SQL, _fence_params(job_id, attempts, max_attempts)
-                ):
+                fence = _fence_params(job_id, attempts, max_attempts)
+                if await _exhaust_steers(cur, _AT_CEILING_SQL, fence):
+                    return "exhausted"
+                if await _exhaust_alerts(cur, _AT_CEILING_SQL, fence):
                     return "exhausted"
                 await cur.execute(
                     f"""
@@ -676,7 +868,7 @@ async def enqueue_compensation_job(
     """Insert a single follow-up job.
 
     ``defer=True`` inserts the row with ``next_retry_at='infinity'`` — durable
-    but never claimable until ``release_deferred_report_backs`` flips it due
+    but never claimable until ``release_deferred_notifications`` flips it due
     (interrupted-root task report-backs wait for the thread's next completed
     finalize). ON CONFLICT DO NOTHING: a retried caller never double-registers.
     ``conn`` joins the caller's transaction — how a job commits atomically
@@ -733,18 +925,21 @@ async def _insert_compensation_job(
     )
 
 
-async def release_deferred_report_backs(conn, thread_id: str) -> int:
-    """Flip the deferred (``next_retry_at='infinity'``) report-backs owed to a
-    thread due.
+async def release_deferred_notifications(conn, thread_id: str) -> int:
+    """Flip the deferred (``next_retry_at='infinity'``) report-backs and
+    market-target alerts owed to a thread due.
 
-    A task report-back is the thread's own row; an analyst's report-back
-    (``report_back``) belongs to the analyst's thread and is keyed on the
-    thread it reports to, so each is matched by its own column. Runs on the
+    A task report-back and an alert are the thread's own rows; an analyst's
+    report-back (``report_back``) belongs to the analyst's thread and is keyed
+    on the thread it reports to, so each is matched by its own column. Runs on the
     caller's connection so the release commits atomically with the finalize
     that makes posting safe again (a completed run means no pending HITL
     checkpoint to collide with). A turn's hold goes with the park, so the
     next live turn may take a released report in without waiting on its
-    executor.
+    executor. An alert waiting on the thread's next turn (``_exhaust_alerts``)
+    that the ending turn did not take in is released too and keeps
+    ``exhausted``: its executor wakes the thread if it now can, and holds it
+    again if not, so each further try waits on another turn's ending.
     """
     async with conn.cursor() as cur:
         await cur.execute(
@@ -755,7 +950,7 @@ async def release_deferred_report_backs(conn, thread_id: str) -> int:
             WHERE status = 'pending'
               AND next_retry_at = 'infinity'::timestamptz
               AND (
-                (hook_type = 'task_report_back'
+                (hook_type IN ('task_report_back', 'market_target')
                  AND conversation_thread_id = %s)
                 OR (hook_type = 'report_back' AND ordering_key = %s)
               )
@@ -778,7 +973,9 @@ async def defer_claimed_job(
     (a dead report_back with its watch_clear compensation), since a pending
     row below the ceiling blocks its ordering chain and an unclaimable-forever
     deferred row would wedge every later notification on the thread. A steer
-    at the ceiling is settled instead (``_exhaust_steers``). Returns the new
+    at the ceiling is settled instead (``_exhaust_steers``), and a
+    market-target alert held for its thread's next turn (``_exhaust_alerts``),
+    which blocks no chain. Returns the new
     status ('pending', 'dead' or 'exhausted'), or None if the fence was lost;
     the caller stops either way and its fenced ack no-ops. A turn's hold on
     the job is dropped: a job its executor holds was never confirmed, so the
@@ -787,9 +984,10 @@ async def defer_claimed_job(
     async with pool.get_db_connection() as conn:
         async with conn.transaction():
             async with conn.cursor(row_factory=dict_row) as cur:
-                if await _exhaust_steers(
-                    cur, _AT_CEILING_SQL, _fence_params(job_id, attempts, max_attempts)
-                ):
+                fence = _fence_params(job_id, attempts, max_attempts)
+                if await _exhaust_steers(cur, _AT_CEILING_SQL, fence):
+                    return "exhausted"
+                if await _exhaust_alerts(cur, _AT_CEILING_SQL, fence):
                     return "exhausted"
                 await cur.execute(
                     f"""
@@ -855,9 +1053,12 @@ async def list_open_notification_jobs(
             return [dict(row) for row in await cur.fetchall()]
 
 
-# The report-back types a live turn may take in. Every report statement names
-# them, so none can touch a steer row, which shares the hold's lifecycle keys.
-_REPORT_TYPES_SQL = "hook_type IN ('task_report_back', 'report_back')"
+# The report-back types a live turn may take in, a market target's alert among
+# them. Every report statement names them, so none can touch a steer row,
+# which shares the hold's lifecycle keys.
+_REPORT_TYPES_SQL = (
+    "hook_type IN ('task_report_back', 'report_back', 'market_target')"
+)
 
 # A report-back a live turn may take in: pending in any form (due, backing
 # off, parked), not dispatched (it has its turn) and not held (stamped
@@ -873,28 +1074,57 @@ _STEERABLE_REPORT_SQL = (
 async def list_steerable_report_jobs(
     thread_id: str, *, limit: int = 10
 ) -> List[Dict[str, Any]]:
-    """Report-backs owed to a thread that no executor or turn holds, oldest
-    first."""
+    """Report-backs and market-target alerts owed to a thread that no
+    executor or turn holds, oldest first."""
+    from src.server.database.market_targets import ordering_key as alert_key
+
     async with pool.get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 f"""
                 SELECT hook_outbox_id, hook_type, run_id, payload, created_at
                 FROM hook_outbox
-                WHERE ordering_key = %s
-                  AND hook_type IN ('task_report_back', 'report_back')
+                WHERE ((ordering_key = %s
+                        AND hook_type IN ('task_report_back', 'report_back'))
+                       OR (ordering_key = %s AND hook_type = 'market_target'))
                   AND {_STEERABLE_REPORT_SQL}
                 ORDER BY created_at, hook_outbox_id
                 LIMIT %s
                 """,
-                (str(thread_id), limit),
+                (str(thread_id), alert_key(str(thread_id)), limit),
             )
             return [dict(row) for row in await cur.fetchall()]
 
 
+async def has_steerable_market_alert(thread_id: str) -> bool:
+    """Whether a market-target alert waits for the thread's live turn to take
+    it in; a run waiting on its background tasks asks this between polls.
+
+    Only a parked one counts: nothing makes it claimable while the turn
+    lives, so the trigger this answer injects finds it at the next model
+    call. A due one may be claimed by the drainer before that call, leaving
+    the trigger with no alert; its executor parks it behind the live turn,
+    and a later poll counts it."""
+    from src.server.database.market_targets import ordering_key as alert_key
+
+    async with pool.get_db_connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                f"""
+                SELECT 1 FROM hook_outbox
+                WHERE ordering_key = %s AND hook_type = 'market_target'
+                  AND {_STEERABLE_REPORT_SQL}
+                  AND next_retry_at = 'infinity'::timestamptz
+                LIMIT 1
+                """,
+                (alert_key(str(thread_id)),),
+            )
+            return await cur.fetchone() is not None
+
+
 async def hold_steered_report_jobs(job_ids: List[str], *, run_id: str) -> List[str]:
-    """Park report-backs a live turn is taking in as a steer, stamped with
-    its run; returns the ids won.
+    """Park report-backs and alerts a live turn is taking in as a steer,
+    stamped with its run; returns the ids won.
 
     The same ``pending`` gate the drainer's claim takes, so a job is either
     steered or claimed, never both. Held, not closed: until the message
@@ -2234,8 +2464,10 @@ async def list_held_jobs(
     thread_id: str, *, owner: Tuple[str, str], task_id: Optional[str] = None
 ) -> List[str]:
     """Ids of the rows ``owner`` still holds on the thread: steers, and for a
-    run the report-backs it took in as steers. Its ending reads them against
-    its checkpoint (``report_back.steer.confirm_checkpointed_holds``)."""
+    run the report-backs and alerts it took in as steers. Its ending reads
+    them against its checkpoint (``report_back.steer.confirm_checkpointed_holds``)."""
+    from src.server.database.market_targets import ordering_key as alert_key
+
     kind, owner_id = owner
     if kind == "task":
         where = f"o.ordering_key = %(okey)s AND {_steer_sql(_LIVE_STEER_SQL)}"
@@ -2245,7 +2477,8 @@ async def list_held_jobs(
     else:
         where = (
             f"((o.ordering_key = %(okey)s AND {_steer_sql(_LIVE_STEER_SQL)})"
-            f" OR (o.ordering_key = %(thread)s AND o.{_REPORT_TYPES_SQL}))"
+            f" OR (o.ordering_key = %(thread)s AND o.{_REPORT_TYPES_SQL})"
+            " OR (o.ordering_key = %(alerts)s AND o.hook_type = 'market_target'))"
         )
         okey = steer_ordering_key(thread_id)
     async with pool.get_db_connection() as conn:
@@ -2258,7 +2491,12 @@ async def list_held_jobs(
                   AND o.payload->>'steered_run_id' = %(owner)s::text
                 ORDER BY o.created_at, o.hook_outbox_id
                 """,
-                {"okey": okey, "thread": str(thread_id), "owner": owner_id},
+                {
+                    "okey": okey,
+                    "thread": str(thread_id),
+                    "alerts": alert_key(str(thread_id)),
+                    "owner": owner_id,
+                },
             )
             return [str(r[0]) for r in await cur.fetchall()]
 

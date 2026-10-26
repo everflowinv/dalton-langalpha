@@ -1,38 +1,51 @@
 /**
- * The machines behind the workspace gallery, and the one place to manage them.
+ * The machines behind the workspace gallery, and the one place to add and
+ * manage them.
  *
  * Deliberately a dialog rather than a page: a computer is infrastructure a
- * user visits to manage, not a place they work. Tier, always-on, name and
- * storage all belong to the machine, so they live here rather than on any one
- * workspace's menu, where changing them would silently change its siblings.
+ * user visits to manage, not a place they work. Tier, name and storage all
+ * belong to the machine, so they live here rather than on any one workspace's
+ * menu, where changing them would silently change its siblings.
+ *
+ * The dialogs it opens (New computer, Change spec, Make primary, Remove) take
+ * its place rather than piling on top: while one is open this panel steps
+ * back, and the page stays dimmed exactly as much as with this panel alone.
  */
 import { useEffect, useId, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { AnimatePresence } from '@/lib/framer';
-import { ChevronDown, Cpu, Pencil, Play, Square, Star } from 'lucide-react';
+import { ChevronDown, Cpu, Pencil, Play, Plus, Square, Star, Trash2 } from 'lucide-react';
 
 import { Button } from '@/components/ui/button';
 import { Disclosure } from '@/components/ui/Disclosure';
 import { ModalShell } from '@/components/ui/ModalShell';
 import { Loader } from '@/components/ui/loader';
 import { ToggleSwitch } from '@/components/ui/switch';
+import { useHomeWorkspaceId } from '@/hooks/useHomeWorkspace';
 import { useLocale } from '@/hooks/useLocale';
 import { formatBytes } from '@/lib/format';
 import { cn } from '@/lib/utils';
-import type { Computer } from '@/types/api';
+import type { Computer, ComputerCreate } from '@/types/api';
 
-import { useComputerStorage, useComputers } from '../hooks/useComputers';
+import { useComputerProviders, useComputerStorage, useComputers } from '../hooks/useComputers';
 import { openComputerSpec } from '../hooks/computerPanelStore';
 import { useComputerActions, type PowerAction } from '../hooks/useComputerActions';
-import { ComputerStatusIndicator, isComputerStatusTransitional } from './computerStatusUi';
+import { usePrepareStage } from '../hooks/computerPreparation';
+import { isMoveActive, useWorkspaceMove } from '../hooks/useWorkspaceMove';
+import { ComputerStatusIndicator } from './computerStatusUi';
+import { isComputerPreparing, isComputerStatusTransitional, prepareStepLabel, takesWorkspaces } from '../utils/computerStatus';
 import { tierLabel } from './tierUi';
 import { DiskBar, diskLevelColor, diskUsageLabel } from './computerDiskUi';
 import { activeSpecChange, effectiveTier, specChangeLabel, SpecChangeProgress } from './specChangeUi';
-import AlwaysOnConfirmDialog from './AlwaysOnConfirmDialog';
+import CreateComputerDialog, { COMPUTER_NAME_MAX } from './CreateComputerDialog';
+import RemoveComputerDialog from './RemoveComputerDialog';
+import MakePrimaryDialog, { MakePrimaryButton } from './MakePrimaryDialog';
+import { providerLabel, rowsShowProvider } from './providerUi';
+import { apiErrorObject, apiErrorReason, apiErrorStatus } from '../utils/api';
 import { denialMessage } from '../utils/denialMessage';
+import { entitlementErrorMessage } from '../utils/entitlementErrors';
 
-/** The server's column width for a computer's name. */
-const COMPUTER_NAME_MAX = 255;
+type Translate = ReturnType<typeof useTranslation>['t'];
 
 interface ComputersDialogProps {
   open: boolean;
@@ -41,34 +54,95 @@ interface ComputersDialogProps {
   focusComputerId?: string | null;
   /** Open the focused row's storage breakdown. */
   expandStorage?: boolean;
+  /** A dialog the host opened over this one (Change spec) is showing. */
+  covered?: boolean;
 }
 
-function ComputersDialog({ open, onOpenChange, focusComputerId = null, expandStorage = false }: ComputersDialogProps) {
+function ComputersDialog({
+  open,
+  onOpenChange,
+  focusComputerId = null,
+  expandStorage = false,
+  covered = false,
+}: ComputersDialogProps) {
   const { t } = useTranslation();
   const titleId = useId();
-  const [alwaysOnTarget, setAlwaysOnTarget] = useState<Computer | null>(null);
+  const [createOpen, setCreateOpen] = useState(false);
+  // The machine this dialog just created, scrolled to and highlighted like
+  // a row the dialog was opened onto.
+  const [createdId, setCreatedId] = useState<string | null>(null);
+  const [removeTargetId, setRemoveTargetId] = useState<string | null>(null);
+  const [primaryTargetId, setPrimaryTargetId] = useState<string | null>(null);
 
   const { data, isLoading } = useComputers({ enabled: open });
   const computers = data?.computers ?? [];
-  const { power, renameComputerTo, alwaysOn } = useComputerActions();
+  // Read off the live list, so a row that leaves it (removed elsewhere, or by
+  // this dialog) closes its confirmation rather than leaving a stale copy.
+  const removeTarget = removeTargetId ? computers.find((c) => c.computer_id === removeTargetId) ?? null : null;
+  const primaryTarget = primaryTargetId ? computers.find((c) => c.computer_id === primaryTargetId) ?? null : null;
+  const { data: providerData } = useComputerProviders({ enabled: open });
+  const showProvider = rowsShowProvider(providerData?.providers, computers);
+  const { power, renameComputerTo, turnOffAlwaysOn, create, remove, makePrimary } = useComputerActions();
+  // Home moves with the primary, so a make-primary that has to move it runs
+  // as Home's move: read here so it shows on its row, after a reopen too.
+  const homeId = useHomeWorkspaceId() ?? makePrimary.data?.move?.workspace_id;
+  const { data: homeMove } = useWorkspaceMove(homeId, { enabled: open });
+  const homeMoving = isMoveActive(homeMove) ? homeMove : null;
   // A refused start relays the quota service's own sentence (denialMessage).
   const error = power.error ? denialMessage(power.error, t) : null;
+  const createError = create.error
+    ? entitlementErrorMessage(create.error, t, create.variables?.resource_tier)
+    : null;
+  const removeError = remove.error ? removeErrorMessage(remove.error, t) : null;
+  const focusId = createdId ?? focusComputerId;
 
   const closeAndReset = () => {
     power.reset();
+    create.reset();
+    remove.reset();
+    makePrimary.reset();
+    setCreateOpen(false);
+    setCreatedId(null);
+    setRemoveTargetId(null);
+    setPrimaryTargetId(null);
     onOpenChange(false);
   };
 
-  const toggleAlwaysOn = (computer: Computer) => {
-    if (alwaysOn.isPending) return;
-    if (computer.is_always_on) {
-      alwaysOn.mutate({ computerId: computer.computer_id, enabled: false });
-    } else {
-      setAlwaysOnTarget(computer);
-    }
+  const openCreate = () => {
+    create.reset();
+    setCreateOpen(true);
   };
 
-  // Additional-computer creation stays hidden until projects can select a machine.
+  const submitCreate = (body: ComputerCreate) => {
+    create.mutate(body, {
+      onSuccess: (row) => {
+        setCreateOpen(false);
+        setCreatedId(row.computer_id);
+      },
+    });
+  };
+
+  const openRemove = (computerId: string) => {
+    remove.reset();
+    setRemoveTargetId(computerId);
+  };
+
+  const confirmRemove = () => {
+    if (!removeTarget || remove.isPending) return;
+    remove.mutate(
+      { computerId: removeTarget.computer_id, name: removeTarget.name },
+      { onSuccess: () => setRemoveTargetId(null) },
+    );
+  };
+
+  const confirmMakePrimary = () => {
+    if (!primaryTarget || makePrimary.isPending) return;
+    makePrimary.mutate(
+      { computerId: primaryTarget.computer_id, name: primaryTarget.name },
+      { onSuccess: () => setPrimaryTargetId(null) },
+    );
+  };
+
   return (
     <>
       <AnimatePresence>
@@ -80,6 +154,13 @@ function ComputersDialog({ open, onOpenChange, focusComputerId = null, expandSto
             onClose={closeAndReset}
             width="standard"
             density="form"
+            covered={covered || createOpen || !!removeTarget || !!primaryTarget}
+            footer={
+              <Button variant="ghost" size="sm" className="gap-1.5" onClick={openCreate}>
+                <Plus className="h-3.5 w-3.5" />
+                {t('computer.newComputer', 'New computer')}
+              </Button>
+            }
           >
             {isLoading ? (
               <div className="flex items-center gap-2 py-6 justify-center" style={{ color: 'var(--color-text-tertiary)' }}>
@@ -99,14 +180,26 @@ function ComputersDialog({ open, onOpenChange, focusComputerId = null, expandSto
                     // remounts it expanded instead of re-syncing local state.
                     key={`${computer.computer_id}:${expandStorage && computer.computer_id === focusComputerId}`}
                     computer={computer}
-                    focused={computer.computer_id === focusComputerId}
+                    focused={computer.computer_id === focusId}
+                    showProvider={showProvider}
                     initiallyExpanded={expandStorage && computer.computer_id === focusComputerId}
                     busy={power.isPending && power.variables?.computerId === computer.computer_id}
-                    alwaysOnBusy={alwaysOn.isPending && alwaysOn.variables?.computerId === computer.computer_id}
+                    alwaysOnBusy={turnOffAlwaysOn.isPending && turnOffAlwaysOn.variables?.computerId === computer.computer_id}
                     onAction={(action) => power.mutate({ computerId: computer.computer_id, action })}
                     onRename={(name) => renameComputerTo(computer.computer_id, name)}
                     onChangeSpec={() => openComputerSpec(computer.computer_id)}
-                    onToggleAlwaysOn={() => toggleAlwaysOn(computer)}
+                    onTurnOffAlwaysOn={() => {
+                      if (!turnOffAlwaysOn.isPending) turnOffAlwaysOn.mutate({ computerId: computer.computer_id });
+                    }}
+                    onRemove={() => openRemove(computer.computer_id)}
+                    movingHome={homeMoving?.target_computer_id === computer.computer_id}
+                    // One move at a time per user, and Home's is the one this
+                    // button starts.
+                    makePrimaryHeld={!!homeMoving || makePrimary.isPending}
+                    onMakePrimary={() => {
+                      makePrimary.reset();
+                      setPrimaryTargetId(computer.computer_id);
+                    }}
                   />
                 ))}
               </div>
@@ -120,18 +213,39 @@ function ComputersDialog({ open, onOpenChange, focusComputerId = null, expandSto
           </ModalShell>
         )}
       </AnimatePresence>
-      <AlwaysOnConfirmDialog
-        target={alwaysOnTarget}
-        onClose={() => setAlwaysOnTarget(null)}
-        onConfirm={() => {
-          if (!alwaysOnTarget) return;
-          alwaysOn.mutate(
-            { computerId: alwaysOnTarget.computer_id, enabled: true },
-            { onSuccess: () => setAlwaysOnTarget(null) },
-          );
-        }}
-        busy={!!alwaysOnTarget && alwaysOn.isPending}
-      />
+      <AnimatePresence>
+        {open && createOpen && (
+          <CreateComputerDialog
+            onClose={() => { if (!create.isPending) setCreateOpen(false); }}
+            onSubmit={submitCreate}
+            busy={create.isPending}
+            error={createError}
+          />
+        )}
+      </AnimatePresence>
+      <AnimatePresence>
+        {open && removeTarget && (
+          <RemoveComputerDialog
+            name={removeTarget.name}
+            onClose={() => { if (!remove.isPending) setRemoveTargetId(null); }}
+            onConfirm={confirmRemove}
+            busy={remove.isPending}
+            error={removeError}
+          />
+        )}
+      </AnimatePresence>
+      <AnimatePresence>
+        {open && primaryTarget && (
+          <MakePrimaryDialog
+            computerId={primaryTarget.computer_id}
+            name={primaryTarget.name}
+            onClose={() => { if (!makePrimary.isPending) setPrimaryTargetId(null); }}
+            onConfirm={confirmMakePrimary}
+            busy={makePrimary.isPending}
+            error={makePrimary.error}
+          />
+        )}
+      </AnimatePresence>
     </>
   );
 }
@@ -139,36 +253,56 @@ function ComputersDialog({ open, onOpenChange, focusComputerId = null, expandSto
 interface ComputerRowProps {
   computer: Computer;
   focused: boolean;
+  /** Name the provider beside the tier, when there are providers to tell apart. */
+  showProvider: boolean;
   initiallyExpanded: boolean;
   busy: boolean;
   alwaysOnBusy: boolean;
   onAction: (action: PowerAction) => void;
   onRename: (name: string) => void;
   onChangeSpec: () => void;
-  onToggleAlwaysOn: () => void;
+  onTurnOffAlwaysOn: () => void;
+  onRemove: () => void;
+  /** Home is moving here because this computer is being made primary. */
+  movingHome: boolean;
+  makePrimaryHeld: boolean;
+  onMakePrimary: () => void;
 }
 
 function ComputerRow({
   computer,
   focused,
+  showProvider,
   initiallyExpanded,
   busy,
   alwaysOnBusy,
   onAction,
   onRename,
   onChangeSpec,
-  onToggleAlwaysOn,
+  onTurnOffAlwaysOn,
+  onRemove,
+  movingHome,
+  makePrimaryHeld,
+  onMakePrimary,
 }: ComputerRowProps) {
   const { t } = useTranslation();
   const locale = useLocale();
   const rowRef = useRef<HTMLDivElement>(null);
   const breakdownId = useId();
+  const prepareHintId = useId();
+  const removeHintId = useId();
   const [expanded, setExpanded] = useState(initiallyExpanded);
   const isRunning = computer.status === 'running';
   const isTransitional = isComputerStatusTransitional(computer.status);
+  const preparing = isComputerPreparing(computer);
+  const prepareStage = usePrepareStage(computer.computer_id);
   const tier = effectiveTier(computer);
   const disk = computer.disk ?? null;
   const specChange = activeSpecChange(computer);
+  // The primary is kept, so it offers no Remove at all. Every other computer
+  // offers it, held while the server would refuse, with the reason under it.
+  const removeHeld = computer.is_primary ? null : removeBlock(computer, busy);
+  const removeHint = removeHeld ? removeBlockHint(t, removeHeld, computer.workspace_count ?? 0) : null;
 
   useEffect(() => {
     if (focused) rowRef.current?.scrollIntoView?.({ block: 'nearest' });
@@ -196,8 +330,18 @@ function ComputerRow({
               </span>
             )}
           </div>
-          <div className="flex items-center gap-2 text-xs mt-1" style={{ color: 'var(--color-text-tertiary)' }}>
-            <ComputerStatusIndicator status={computer.status} />
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs mt-1" style={{ color: 'var(--color-text-tertiary)' }}>
+            <ComputerStatusIndicator
+              status={computer.status}
+              preparing={preparing}
+              detail={preparing ? prepareStepLabel(t, prepareStage) : null}
+            />
+            {showProvider && (
+              <>
+                <span aria-hidden="true">·</span>
+                <span>{providerLabel(computer.kind)}</span>
+              </>
+            )}
             <span aria-hidden="true">·</span>
             <span>{tierLabel(t, tier)}</span>
             {typeof computer.workspace_count === 'number' && (
@@ -207,6 +351,14 @@ function ComputerRow({
               </>
             )}
           </div>
+          {preparing && (
+            <p id={prepareHintId} className="text-xs mt-1" style={{ color: 'var(--color-text-tertiary)' }}>
+              {t(
+                'computer.prepare.hint',
+                "Setting up this computer can take a few minutes. You can create workspaces on it once it's ready.",
+              )}
+            </p>
+          )}
         </div>
         {isRunning ? (
           <Button variant="ghost" size="sm" className="gap-1.5" disabled={busy || !!specChange} onClick={() => onAction('stop')} data-computer-power>
@@ -250,37 +402,124 @@ function ComputerRow({
         </Disclosure>
       </div>
 
-      <div className="flex items-center justify-between gap-3">
-        <label className="flex items-center gap-2 text-sm" style={{ color: 'var(--color-text-secondary)' }}>
-          <ToggleSwitch
-            checked={computer.is_always_on}
-            onChange={onToggleAlwaysOn}
-            // Mid start or stop the switch would promise a state the machine
-            // is about to leave; it opens again once the machine settles.
-            disabled={alwaysOnBusy || isTransitional || computer.status === 'deleted'}
-            ariaLabel={t('computer.alwaysOn', 'Always-on')}
-          />
-          <span>{t('computer.alwaysOn', 'Always-on')}</span>
-        </label>
-        {specChange ? (
-          // Opens the same dialog, which shows the change's progress, not a picker.
-          <button
-            type="button"
-            className="rounded px-1 text-xs hover:opacity-80"
-            aria-label={specChangeLabel(t, specChange)}
-            onClick={onChangeSpec}
-          >
-            <SpecChangeProgress change={specChange} asLabel />
-          </button>
-        ) : (
-          <Button variant="ghost" size="sm" className="gap-1.5" onClick={onChangeSpec} disabled={isTransitional || computer.status === 'deleted'}>
-            <Cpu className="h-3.5 w-3.5" />
-            {t('workspace.changeSpec', 'Change spec')}
-          </Button>
+      <div className="flex flex-col gap-0.5">
+        <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1">
+          {/* Always-on is no longer offered, so the switch is only there to turn it off. */}
+          {computer.is_always_on && (
+            <label className="flex items-center gap-2 text-sm" style={{ color: 'var(--color-text-secondary)' }}>
+              <ToggleSwitch
+                checked
+                onChange={onTurnOffAlwaysOn}
+                // Mid start or stop the switch would promise a state the machine
+                // is about to leave; it opens again once the machine settles.
+                disabled={alwaysOnBusy || isTransitional || computer.status === 'deleted'}
+                ariaLabel={t('computer.alwaysOn', 'Always-on')}
+              />
+              <span>{t('computer.alwaysOn', 'Always-on')}</span>
+            </label>
+          )}
+          {/* Wraps under the switch on a phone, still at the row's end. */}
+          <div className="ml-auto flex flex-wrap items-center justify-end gap-1">
+            {specChange ? (
+              // Opens the same dialog, which shows the change's progress, not a picker.
+              <button
+                type="button"
+                className="rounded px-1 text-xs hover:opacity-80"
+                aria-label={specChangeLabel(t, specChange)}
+                onClick={onChangeSpec}
+              >
+                <SpecChangeProgress change={specChange} asLabel />
+              </button>
+            ) : (
+              <Button variant="ghost" size="sm" className="gap-1.5" onClick={onChangeSpec} disabled={isTransitional || computer.status === 'deleted'}>
+                <Cpu className="h-3.5 w-3.5" />
+                {t('workspace.changeSpec', 'Change spec')}
+              </Button>
+            )}
+            {!computer.is_primary && (
+              <MakePrimaryButton
+                movingHome={movingHome}
+                disabled={makePrimaryHeld || !!specChange || !takesWorkspaces(computer)}
+                onClick={onMakePrimary}
+              />
+            )}
+            {!computer.is_primary && (
+              <Button
+                variant="ghost"
+                size="sm"
+                className="gap-1.5"
+                onClick={onRemove}
+                disabled={!!removeHeld}
+                // A preparing row already says why, in its own hint above.
+                aria-describedby={removeHeld === 'preparing' ? prepareHintId : removeHint ? removeHintId : undefined}
+              >
+                <Trash2 className="h-3.5 w-3.5" />
+                {t('computer.remove', 'Remove')}
+              </Button>
+            )}
+          </div>
+        </div>
+        {removeHint && (
+          <p id={removeHintId} className="text-right text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
+            {removeHint}
+          </p>
         )}
       </div>
     </div>
   );
+}
+
+/**
+ * Why Remove is held, in the order the user meets them: workspaces first,
+ * since moving them is on the user and outlasts any start, stop or spec
+ * change. Null when the server would take the request.
+ */
+type RemoveBlock = 'workspaces' | 'preparing' | 'specChange' | 'starting' | 'stopping' | 'busy';
+
+function removeBlock(computer: Computer, busy: boolean): RemoveBlock | null {
+  if ((computer.workspace_count ?? 0) > 0) return 'workspaces';
+  if (isComputerPreparing(computer)) return 'preparing';
+  if (activeSpecChange(computer)) return 'specChange';
+  if (computer.status === 'creating' || computer.status === 'starting') return 'starting';
+  if (computer.status === 'stopping') return 'stopping';
+  // A power request in flight lands as 'starting' or 'stopping' a moment
+  // later, and a removed row is about to leave the list: neither needs words.
+  if (busy || computer.status === 'deleted') return 'busy';
+  return null;
+}
+
+/** The line under a held Remove. A preparing row has its own hint already. */
+function removeBlockHint(t: Translate, block: RemoveBlock, workspaceCount: number): string | null {
+  switch (block) {
+    case 'workspaces':
+      return t('computer.removeBlocked.workspaces', { count: workspaceCount });
+    case 'specChange':
+      return t('computer.removeBlocked.specChange', 'You can remove it once the spec change finishes.');
+    case 'starting':
+      return t('computer.removeBlocked.starting', 'You can remove it once it has started.');
+    case 'stopping':
+      return t('computer.removeBlocked.stopping', 'You can remove it once it has stopped.');
+    default:
+      return null;
+  }
+}
+
+/**
+ * A refused remove, in this app's words for the refusals the route names,
+ * else the server's own sentence, else a plain line.
+ */
+function removeErrorMessage(err: unknown, t: Translate): string {
+  if (apiErrorStatus(err) === 409) {
+    switch (apiErrorObject(err)?.code) {
+      case 'primary':
+        return t('computer.removeRefused.primary', "Your primary computer can't be removed.");
+      case 'has_workspaces':
+        return t('computer.removeRefused.hasWorkspaces', 'Delete the workspaces on this computer first.');
+      case 'busy':
+        return t('computer.removeRefused.busy', 'This computer is busy. Try again in a moment.');
+    }
+  }
+  return apiErrorReason(err) || t('computer.removeFailed', "Couldn't remove this computer. Try again.");
 }
 
 /** The name, editable in place. Enter or blur saves; Escape backs out. */

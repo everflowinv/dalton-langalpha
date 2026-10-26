@@ -193,8 +193,7 @@ class ComputerSpecMixin:
 
     def _resource_tiers(self, computer: Mapping[str, Any]) -> Mapping[str, Any]:
         return self._provider_settings(
-            computer.get("kind") or self.config.sandbox.provider,
-            computer.get("provider_config"),
+            computer["kind"], computer.get("provider_config")
         ).resource_tiers
 
     async def _refuse_if_turn_active(
@@ -694,12 +693,16 @@ class ComputerSpecMixin:
         locked_sandbox_id: str,
         *,
         tier: str,
-        claim_id: str,
+        claim_id: str | None,
         disk_guard: int | None,
         user_id: str | None,
         workspace_id: str | None,
     ) -> None:
-        """Swap a live machine's sandbox for one built at the persisted tier."""
+        """Swap a live machine's sandbox for one built at the persisted tier.
+
+        ``claim_id`` is the spec change's own claim; a replacement that is not a
+        spec change passes None and holds the machine's advisory key instead.
+        """
         computer_id = binding.computer_id
         # Resolved here and not with the machine binding: the other branches
         # need no project, and a folder read that fails must not stop a machine
@@ -745,7 +748,8 @@ class ComputerSpecMixin:
                 # leaves the live sandbox as it was.
                 await self._assert_machine_disk_fits(computer_id, disk_guard)
 
-            await self._assert_spec_claim_owned(computer_id, claim_id)
+            if claim_id is not None:
+                await self._assert_spec_claim_owned(computer_id, claim_id)
             # Teardown starts: the files are backed up and the old sandbox is
             # no longer something to hand back, so a failure from here leaves
             # the row stopped and the next start rebuilds (claim -> restart ->
@@ -767,6 +771,75 @@ class ComputerSpecMixin:
                 binding, user_id, self._core_config_for(binding)
             )
 
+    async def replace_sandbox_for_platform_secrets(
+        self, computer_id: str, sandbox_id: str
+    ) -> bool:
+        """Rebuild a running machine whose sandbox env holds a platform credential.
+
+        Its provider sets env only at create (E2B), so no restart clears it.
+        The sandbox goes the way a spec change takes it: a strict backup, then
+        a new one restored from it, created with markers in place of the value.
+        The caller holds the machine's advisory key, which keeps spec changes
+        and the stuck-start reaper off it. A machine with no workspace is
+        stopped without its sandbox instead. False when the machine has since
+        stopped or moved to another sandbox, and nothing was done.
+
+        Raises:
+            MachineBusyError: A turn is running on the machine.
+        """
+        async with self._observed_lock(computer_id, "computer.platform_secret"):
+            computer = await get_computer(computer_id)
+            if (
+                not computer
+                or computer.get("status") != ComputerStatus.RUNNING
+                or computer.get("provider_ref") != sandbox_id
+            ):
+                return False
+            if not await get_live_workspace_ids_for_computer(computer_id):
+                return await self._drop_empty_machine_sandbox(computer, sandbox_id)
+            await self._replace_running_sandbox(
+                self._binding_from_computer("", computer),
+                sandbox_id,
+                tier=computer.get("resource_tier") or "standard",
+                claim_id=None,
+                disk_guard=None,
+                user_id=str(computer["user_id"]),
+                workspace_id=None,
+            )
+            return True
+
+    async def _drop_empty_machine_sandbox(
+        self, computer: Dict[str, Any], sandbox_id: str
+    ) -> bool:
+        """Destroy an empty machine's sandbox, for its next start to build anew.
+
+        The rebuild is workspace-addressed, and a machine with no workspace has
+        nothing to back up or restore: the start path builds a new sandbox when
+        the one the row names is gone. Re-checked under the stop claim, since a
+        placement does not take the machine's advisory key. False when the
+        machine left 'running', gained a workspace or work, and nothing was done.
+        """
+        computer_id = str(computer["computer_id"])
+        if await self._claim_machine_for_stop(computer_id) is None:
+            return False
+        settled = ComputerStatus.RUNNING
+        try:
+            if await get_live_workspace_ids_for_computer(
+                computer_id
+            ) or await self._machine_has_active_tasks(computer_id):
+                return False
+            self._cancel_mcp_discovery(computer_id)
+            await self._clear_session(computer_id)
+            SessionManager.remove_session(computer_id)
+            await self._destroy_sandbox(
+                sandbox_id, binding=self._binding_from_computer("", computer)
+            )
+            await clear_computer_disk(computer_id, sandbox_id=sandbox_id)
+            settled = ComputerStatus.STOPPED
+            return True
+        finally:
+            await self._settle_machine_stop(computer_id, settled)
+
     async def _destroy_sandbox(
         self, sandbox_id: str, *, binding: Any = None, timeout: float = 60.0
     ) -> None:
@@ -781,6 +854,10 @@ class ComputerSpecMixin:
         replacement beside a sandbox still billed. A sandbox already gone
         returns normally. ``binding`` points it at the machine's own backend.
         """
+        from src.server.services.preview_capabilities import revoke
+
+        # First, so no proxied preview outlives the sandbox it opens.
+        await revoke(sandbox_id)
         provider = self._provider_for(binding)
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout

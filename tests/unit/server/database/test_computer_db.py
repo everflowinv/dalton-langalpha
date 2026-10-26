@@ -406,7 +406,7 @@ class TestReads:
 class TestCreate:
     @pytest.mark.asyncio
     async def test_a_second_primary_is_squashed_in_the_statement(self, db, cursor):
-        await C.create_computer(USER_ID, is_primary=True)
+        await C.create_computer(USER_ID, name="Cloud computer", is_primary=True)
         sql = _sql(cursor)
         assert "NOT EXISTS ( SELECT 1 FROM computers WHERE user_id = %s" in sql
         assert "is_primary AND status <> 'deleted'" in sql
@@ -420,7 +420,7 @@ class TestCreate:
         cursor.execute.side_effect = [UniqueViolation(), None]
         cursor.fetchone.return_value = _computer_row(is_primary=False)
 
-        row = await C.create_computer(USER_ID, is_primary=True)
+        row = await C.create_computer(USER_ID, name="Cloud computer", is_primary=True)
 
         assert row["is_primary"] is False
         assert cursor.execute.await_count == 2
@@ -434,7 +434,7 @@ class TestCreate:
 
         cursor.execute.side_effect = UniqueViolation()
         with pytest.raises(UniqueViolation):
-            await C.create_computer(USER_ID)
+            await C.create_computer(USER_ID, name="Cloud computer")
 
 
 class TestPublishFanOut:

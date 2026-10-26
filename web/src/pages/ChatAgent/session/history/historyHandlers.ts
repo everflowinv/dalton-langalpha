@@ -11,11 +11,12 @@ import { deriveTaskSegment, applyTaskSegment, applyLaunchReply } from '../subage
 import { reportRow, senderProvenance, type SenderMetadata } from '../provenance';
 import { deliveredEntryRow, steeringDeliveredEntries } from '../stream/steeringDelivery';
 import type { ReportSource } from '@/types/api';
-import { isDeliveredReport, type DeliveredSteer } from '@/types/sse';
+import { isDeliveredMarketAlert, isDeliveredSteer, type DeliveredSteer } from '@/types/sse';
 import type { SubagentTaskRecord, TextSegment } from '@/types/chat';
 import type { MessageRecord, SetMessages, ToolCallRecord, ToolCallResultRecord, TodoPayload, HtmlWidgetData } from '../../hooks/utils/types';
 import type { PairState } from '../types';
 import type { StructuredError } from '@/utils/rateLimitError';
+import { wakeAlertRow } from '../marketWatchEvents';
 
 
 /** Shape of an SSE history event. */
@@ -109,7 +110,9 @@ function refusedBefore(m: MessageRecord, turn: number): boolean {
  * The row a replayed turn opens with, or null for empty content and HITL
  * resume pairs. A system query, a report-back's invocation, is written for
  * the model: it shows only as the label naming what it reports, and stays
- * hidden when the row names nothing (an older row, or a share's replay).
+ * hidden when the row names nothing (an older row, or a share's replay). A
+ * price alert that woke the agent is written for the model too, and heads
+ * its turn as the alert's row, which still draws when it names nothing.
  */
 function turnOpenerRow(event: HistoryEvent, pairIndex: number, text: string): MessageRecord | null {
   // Deterministic id keyed only on pairIndex (the server-side turn_index,
@@ -119,6 +122,9 @@ function turnOpenerRow(event: HistoryEvent, pairIndex: number, text: string): Me
   // second replay would silently double the visible history.
   const id = `history-user-${pairIndex}`;
   const timestamp = event.timestamp ? new Date(event.timestamp) : new Date();
+  if (event.query_type === 'market_target') {
+    return { ...wakeAlertRow(pairIndex, event.metadata, timestamp), isHistory: true };
+  }
   if (event.query_type === 'system') {
     const source = event.metadata?.report_source;
     return source ? reportRow(source, {
@@ -248,15 +254,18 @@ export function handleHistoryUserMessage({
         userMessage.chartSelections = event.metadata!.chart_selections;
       }
 
-      // A live attach that drew this report's row before a reload keeps it
+      // A live attach that drew this turn's row before a reload keeps it
       // through the reload, which keeps live rows; this row, which knows its
-      // turn, replaces it. Live rows sit past the insert point, so it holds.
+      // turn, replaces it. A report's row is found by its run, and a wake's
+      // alert row by its id, which the live one shares. Live rows sit past the
+      // insert point, so it holds.
       const runId = userMessage.runId;
+      const rowId = userMessage.id;
       // A stream writing now may be writing this turn, with the tracker past
       // its window: its bubbles are not the replay's to take.
       const streaming = !!currentMessageRef.current;
       setMessages((prev: MessageRecord[]) => {
-        const kept = runId ? prev.filter((m) => m.isHistory || m.runId !== runId) : prev;
+        const kept = prev.filter((m) => m.isHistory || (m.id !== rowId && !(runId && m.runId === runId)));
         const { rest, removedAbove } = streaming
           ? { rest: kept, removedAbove: 0 }
           : dropLiveCopy(kept, messageContent, pairIndex, newMessagesStartIndexRef.current);
@@ -666,9 +675,9 @@ function lostSteerCopies(prev: MessageRecord[], entry: DeliveredSteer, pairIndex
 
 /**
  * Handles steering_delivered events in history replay. Creates user bubble(s)
- * for each steering message, and a report's caption row for each report the
- * turn took in, then a new assistant placeholder so subsequent events render
- * in a fresh assistant bubble.
+ * for each steering message, a report's caption row for each report and a
+ * price alert's row for each alert the turn took in, then a new assistant
+ * placeholder so subsequent events render in a fresh assistant bubble.
  */
 export function handleHistorySteeringDelivered({
   event,
@@ -704,7 +713,10 @@ export function handleHistorySteeringDelivered({
     const userMessage: MessageRecord = { ...row, isHistory: true };
     let delivered: string | null = null;
     setMessages((prev: MessageRecord[]) => {
-      const lost = isDeliveredReport(entry) ? [] : lostSteerCopies(prev, entry, pairIndex);
+      // An alert's row has its notice's id live too, so a copy a stream left
+      // on screen gives way to this one, in its place in the turn.
+      const lost = isDeliveredSteer(entry) ? lostSteerCopies(prev, entry, pairIndex)
+        : isDeliveredMarketAlert(entry) ? prev.flatMap((m, i) => (m.id === row.id ? [i] : [])) : [];
       if (lost.length > 0) delivered = (prev[lost[0]] as { requestKey?: string }).requestKey ?? null;
       const rest = lost.length === 0 ? prev : prev.filter((_, i) => !lost.includes(i));
       const idx = newMessagesStartIndexRef.current - lost.filter((i) => i < newMessagesStartIndexRef.current).length;
@@ -727,8 +739,9 @@ export function handleHistorySteeringDelivered({
     steeringBatches: batchId,
   });
 
-  // The reply after a steer starts when the run took it in (epoch seconds),
-  // not when this replay ran: the tray ages a hand-off made here by it.
+  // The reply after a steer or an alert starts when the run took it in
+  // (epoch seconds), not when this replay ran: the tray ages a hand-off made
+  // here by it.
   const deliveredAt = typeof event.timestamp === 'number'
     ? event.timestamp
     : entries.reduce<number | null>((at, m) => (typeof m.timestamp === 'number' ? m.timestamp : at), null);

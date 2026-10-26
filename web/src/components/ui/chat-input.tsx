@@ -32,7 +32,7 @@ import {
 import { ChatInputModelMenu, ModelTriggerMeasure } from './chat-input.modelMenu';
 import { useToolbarItems } from './chat-input.toolbar';
 import {
-  useToolbarFold, CONTAINER_BORDER, CONTAINER_PX, GROUP_GAP, ICON_BUTTON_W, TOKEN_RING_W, TOOLBAR_GAP,
+  useToolbarFold, CONTAINER_BORDER, CONTAINER_PX, GROUP_GAP, ICON_BUTTON_W, TOOLBAR_GAP,
 } from './chat-input.useToolbarFold';
 import { useMentions } from './chat-input.useMentions';
 import { useSlashCommands } from './chat-input.useSlashCommands';
@@ -682,7 +682,7 @@ function ChatInput({
     // Left of the first pill: container border + px-3, the attach button, and
     // the optional ring / chart-capture button (see the action bar below).
     fixedLeft: CONTAINER_BORDER + CONTAINER_PX + ICON_BUTTON_W
-      + (ringVisible ? TOOLBAR_GAP + TOKEN_RING_W : 0)
+      + (ringVisible ? TOOLBAR_GAP + ICON_BUTTON_W : 0)
       + (onCaptureChart ? TOOLBAR_GAP + ICON_BUTTON_W : 0),
     // Right group: the model pill (measured), the mic, and send/stop. Mic
     // reserve ignores isLoading on purpose — the fold set must not jump when a

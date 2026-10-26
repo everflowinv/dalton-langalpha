@@ -20,6 +20,11 @@ export interface StatusFrame {
   /** The machine. Null on the workspace channel when the row is unbound. */
   computer_id?: string;
   workspace_id?: string;
+  /** The build step of a new sandbox (`sandbox`, `tools`, `finishing`). A hint
+   *  the server never stores, so a stream joined late may not carry it. */
+  stage?: string;
+  /** Why a background start failed, on the `error` frame that ends it. */
+  error?: string;
 }
 
 function readString(value: unknown): string | undefined {
@@ -83,6 +88,8 @@ export async function streamStatusEvents(
                 sandbox_state: readString(parsed.sandbox_state),
                 computer_id: readString(parsed.computer_id),
                 workspace_id: readString(parsed.workspace_id),
+                stage: readString(parsed.stage),
+                error: readString(parsed.error),
               });
             }
           } catch { /* ignore malformed payload */ }

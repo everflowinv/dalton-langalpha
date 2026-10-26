@@ -85,21 +85,30 @@ async def _collect_mcp_trace(sandbox: "PTCSandbox", trace_path: str) -> list[dic
     # GBs) into memory. ~4x the body budget (RESULT_BODY_TRACE_BUDGET_BYTES)
     # leaves slack for snippets/args/metadata; the extractor clamps anyway.
     _MCP_TRACE_READ_MAX_BYTES = 16 * 1024 * 1024
+    # A trace this small comes back in the size probe's own output; a larger
+    # one is downloaded, since command output is not built for megabytes.
+    _MCP_TRACE_INLINE_MAX_BYTES = 256 * 1024
 
     records: list[dict] = []
     content: str | None = None
     try:
-        size_res = await sandbox._runtime_call(
+        # Size and, for a small trace, contents in one round trip: the size
+        # line comes first. The delete stays a separate call so a retried read
+        # still finds the file.
+        path = shlex.quote(trace_path)
+        read_res = await sandbox._runtime_call(
             sandbox.runtime.exec,
-            f"wc -c < {shlex.quote(trace_path)} 2>/dev/null",
+            f'[ -s {path} ] || exit 0; n=$(wc -c < {path}); echo "$n"; '
+            f'[ "$n" -le {_MCP_TRACE_INLINE_MAX_BYTES} ] && cat {path}',
             retry_policy=RetryPolicy.SAFE,
         )
-        trace_bytes = int((getattr(size_res, "stdout", "") or "").strip() or 0)
+        size_line, _, body = (getattr(read_res, "stdout", "") or "").partition("\n")
+        trace_bytes = int(size_line.strip() or 0)
         if trace_bytes == 0:
             # No trace written — the common case for a bash command that
             # imported no MCP wrappers (git/npm/ls/...). The file was never
-            # created, so skip BOTH the read and the rm below (nothing to
-            # delete): saves two sandbox round-trips on every non-MCP bash run.
+            # created, so skip the rm below (nothing to delete): one sandbox
+            # round trip on every non-MCP run.
             return records
         if trace_bytes > _MCP_TRACE_READ_MAX_BYTES:
             logger.warning(
@@ -108,6 +117,8 @@ async def _collect_mcp_trace(sandbox: "PTCSandbox", trace_path: str) -> list[dic
                 bytes=trace_bytes,
                 cap=_MCP_TRACE_READ_MAX_BYTES,
             )
+        elif trace_bytes <= _MCP_TRACE_INLINE_MAX_BYTES:
+            content = body
         else:
             content = await sandbox.aread_file_text(trace_path)
     except Exception as e:
@@ -203,6 +214,7 @@ async def execute(
     # crash path collected, which would otherwise orphan the JSONL.
     trace_collected = False
     carry_trace = list(_carry_mcp_trace or [])
+    save_code: asyncio.Task[None] | None = None
     try:
         # Write code to thread dir or fallback to code/
         if thread_id:
@@ -219,19 +231,25 @@ async def execute(
         else:
             code_path = f"{_SYSTEM_CODE}/{execution_id}.py"
             code_abs = _computer_path(sandbox, code_path)
-        try:
-            await sandbox._runtime_call(
-                sandbox.runtime.upload_file,
-                code.encode("utf-8"),
-                code_abs,
-                retry_policy=RetryPolicy.SAFE,
-            )
-        except Exception as upload_err:
-            logger.warning(
-                "Failed to save code file to sandbox (non-fatal)",
-                code_path=code_path,
-                error=str(upload_err),
-            )
+
+        async def _save_code() -> None:
+            try:
+                await sandbox._runtime_call(
+                    sandbox.runtime.upload_file,
+                    code.encode("utf-8"),
+                    code_abs,
+                    retry_policy=RetryPolicy.SAFE,
+                )
+            except Exception as upload_err:
+                logger.warning(
+                    "Failed to save code file to sandbox (non-fatal)",
+                    code_path=code_path,
+                    error=str(upload_err),
+                )
+
+        # The saved copy goes up beside the run, not ahead of it: nothing reads
+        # it before the result returns, and a round trip is most of a short run.
+        save_code = asyncio.create_task(_save_code())
 
         # Execute code
         # Set PYTHONPATH so code can import the tool wrappers and the runtime.
@@ -269,6 +287,7 @@ async def execute(
             retry_policy=RetryPolicy.UNSAFE,
             total_timeout=timeout_val + 30,
         )
+        await save_code
 
         stdout = result.stdout
         stderr = result.stderr
@@ -364,6 +383,9 @@ async def execute(
         return execution_result
 
     except Exception as e:
+        if save_code is not None:
+            # Best effort and never raises; awaited so it is not left detached.
+            await save_code
         duration = time.time() - start_time
         is_timeout, error_detail, stderr_msg = sandbox._classify_execution_error(
             e,
@@ -563,7 +585,6 @@ async def execute_bash_command(
                     sandbox.runtime.session_execute,
                     session_id,
                     bg_command,
-                    run_async=True,
                     retry_policy=RetryPolicy.UNSAFE,
                     total_timeout=30,
                 )

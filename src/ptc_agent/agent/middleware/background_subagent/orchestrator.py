@@ -18,10 +18,25 @@ from ptc_agent.agent.middleware.background_subagent.middleware import (
 # Module-attribute binding (not a direct symbol import) so a single patch of
 # utils.build_message_checker governs every caller.
 from ptc_agent.agent.middleware.background_subagent import utils
-from ptc_agent.agent.middleware.background_subagent.utils import config_own_run_id
-from ptc_agent.agent.transcript.classify import ORCHESTRATOR_SOURCE, steering_trigger
+from ptc_agent.agent.middleware.background_subagent.utils import (
+    MARKET_ALERT_SENDER,
+    MessageChecker,
+    config_own_run_id,
+)
+from ptc_agent.agent.transcript.classify import (
+    MARKET_TARGET_TRIGGER,
+    ORCHESTRATOR_SOURCE,
+    steering_trigger,
+)
 
 logger = structlog.get_logger(__name__)
+
+
+def _is_interrupt(event: Any) -> bool:
+    """Whether a streamed event carries an interrupt. The payload comes last
+    in every shape ``stream_mode`` and ``subgraphs`` give an event."""
+    payload = event[-1] if isinstance(event, tuple) and event else event
+    return isinstance(payload, dict) and "__interrupt__" in payload
 
 
 class BackgroundSubagentOrchestrator:
@@ -54,6 +69,7 @@ class BackgroundSubagentOrchestrator:
         middleware: BackgroundSubagentMiddleware,
         max_iterations: int = 3,
         auto_wait: bool = False,
+        market_alerts: bool = False,
     ) -> None:
         """Initialize the orchestrator.
 
@@ -63,11 +79,15 @@ class BackgroundSubagentOrchestrator:
             max_iterations: Maximum number of re-invocation iterations
             auto_wait: If True, wait for background tasks to complete before returning.
                       If False (default), return immediately and let CLI handle status.
+            market_alerts: Whether this run's owner has market watch on, so a
+                      target's alert waiting on the thread is one its steering
+                      takes in rather than closes unread.
         """
         self.agent = agent
         self.middleware = middleware
         self.max_iterations = max_iterations
         self.auto_wait = auto_wait
+        self.market_alerts = market_alerts
 
     async def ainvoke(
         self,
@@ -120,9 +140,8 @@ class BackgroundSubagentOrchestrator:
 
             # If there are still pending background tasks, wait for them.
             if self.middleware.registry.has_pending_tasks():
-                thread_id = (config.get("configurable") or {}).get("thread_id")
-                checker = await utils.build_message_checker(
-                    thread_id, own_run_id=config_own_run_id(config)
+                checker = await self._message_checker(
+                    config, last_pass=iteration >= self.max_iterations
                 )
                 logger.info(
                     "Waiting for pending background tasks",
@@ -195,6 +214,11 @@ class BackgroundSubagentOrchestrator:
         re-invocation so that notification messages create ``source=update``
         checkpoints instead of ``source=input``, avoiding phantom user turns.
 
+        That update drops any interrupt the pass ended on, so re-invoking
+        supersedes it. Interrupt events are therefore held to the end of each
+        pass and only the last pass's go out: the ones the checkpoint still
+        holds pending, which replay shows and a resume can answer.
+
         Args:
             input_state: Initial state for the agent (None to resume from checkpoint)
             config: Optional config dict for the agent
@@ -223,11 +247,15 @@ class BackgroundSubagentOrchestrator:
             # Closing this stream must close the agent's too, and in this task:
             # a bare ``async for`` leaves it to the garbage collector, so its
             # model calls and tools would outlive the close the caller awaits.
+            pauses: list[Any] = []
             async with aclosing(
                 self.agent.astream(current_state, config, **stream_kwargs)
             ) as events:
                 async for event in events:
-                    yield event
+                    if _is_interrupt(event):
+                        pauses.append(event)
+                    else:
+                        yield event
 
             # After first iteration, strip checkpoint_id so subsequent
             # aupdate_state/astream calls use the latest checkpoint.
@@ -252,7 +280,7 @@ class BackgroundSubagentOrchestrator:
                 if await self._reinvoke_for_steering(config, iteration):
                     current_state = None
                     continue
-                return
+                break
 
             # If auto_wait is False, return immediately without waiting
             # CLI will handle displaying task status and collecting results later
@@ -264,12 +292,11 @@ class BackgroundSubagentOrchestrator:
                     "Background tasks pending, returning immediately (auto_wait=False)",
                     pending_count=self.middleware.registry.pending_count,
                 )
-                return
+                break
 
             # Wait for all background tasks to complete
-            thread_id = (config.get("configurable") or {}).get("thread_id")
-            checker = await utils.build_message_checker(
-                thread_id, own_run_id=config_own_run_id(config)
+            checker = await self._message_checker(
+                config, last_pass=iteration >= self.max_iterations
             )
             logger.info(
                 "Waiting for pending background tasks after stream",
@@ -285,7 +312,7 @@ class BackgroundSubagentOrchestrator:
                 if await self._reinvoke_for_steering(config, iteration):
                     current_state = None
                     continue
-                return
+                break
 
             logger.info(
                 "Background tasks completed after stream, notifying agent",
@@ -297,6 +324,13 @@ class BackgroundSubagentOrchestrator:
 
             # NOTE: Do NOT clear registry here - agent needs to call TaskOutput()
             # to retrieve results in the next iteration.
+        else:
+            # Every pass ended by injecting, the last included, so none of
+            # their interrupts is still pending.
+            return
+
+        for event in pauses:
+            yield event
 
     async def _inject(self, config: dict[str, Any], content: str) -> None:
         """Append an orchestrator-authored human turn as if from ``__start__``."""
@@ -392,12 +426,46 @@ class BackgroundSubagentOrchestrator:
         """Check if there are any pending background tasks."""
         return self.middleware.registry.has_pending_tasks()
 
+    async def _message_checker(
+        self, config: dict[str, Any], *, last_pass: bool = False
+    ) -> MessageChecker | None:
+        """What ends a wait or re-invokes the agent.
+
+        A market target's alert counts only when this run's steering takes
+        it in: the owner has market watch on and the run has subagents, as
+        otherwise the re-run would hold nothing to read. Nor on the last
+        pass, which re-invokes nothing: an alert ending that wait would end
+        the turn with its tasks still running, and each result would come
+        back as a turn of its own. Nor while the run waits on the user's
+        answer: re-invoking supersedes the question for a notice nobody sent,
+        and the turn that resumes it takes the alert in. A steer keeps ending
+        it, as it always has.
+        """
+        thread_id = (config.get("configurable") or {}).get("thread_id")
+        market_alerts = (
+            self.market_alerts and self.middleware.enabled and not last_pass
+        )
+        if market_alerts and await self._awaits_answer(config):
+            market_alerts = False
+        return await utils.build_message_checker(
+            thread_id,
+            own_run_id=config_own_run_id(config),
+            market_alerts=market_alerts,
+        )
+
+    async def _awaits_answer(self, config: dict[str, Any]) -> bool:
+        """Whether the run stopped on an interrupt. A failed read counts as
+        stopped, which only leaves an alert parked for the next turn."""
+        try:
+            state = await self.agent.aget_state(config)
+        except Exception as e:
+            logger.warning("Interrupt check failed, holding market alerts", error=str(e))
+            return True
+        return bool(state.interrupts)
+
     async def _pending_steer_senders(self, config: dict[str, Any]) -> list[str]:
         """Who sent the steers waiting that this run would take in."""
-        thread_id = (config.get("configurable") or {}).get("thread_id")
-        checker = await utils.build_message_checker(
-            thread_id, own_run_id=config_own_run_id(config)
-        )
+        checker = await self._message_checker(config)
         if checker is None:
             return []
         try:
@@ -429,7 +497,13 @@ class BackgroundSubagentOrchestrator:
 
         # Inject a minimal trigger so the graph routes to the agent node.
         # SteeringMiddleware.abefore_model() will consume the actual content.
-        await self._inject(config, steering_trigger(senders))
+        # A market target's alert alone has no sender to name.
+        trigger = (
+            MARKET_TARGET_TRIGGER
+            if senders == [MARKET_ALERT_SENDER]
+            else steering_trigger(senders)
+        )
+        await self._inject(config, trigger)
         return True
 
     async def check_and_get_notification(self) -> str | None:
@@ -509,6 +583,7 @@ class BackgroundSubagentOrchestrator:
             middleware=self.middleware,
             max_iterations=self.max_iterations,
             auto_wait=self.auto_wait,
+            market_alerts=self.market_alerts,
         )
 
     def __getattr__(self, name: str) -> Any:

@@ -719,19 +719,47 @@
       "write": "extra_body.reasoning_effort"
     }
   },
+  "minimax-m3.1-flash": {
+    "model_id": "MiniMax-M3.1-Flash",
+    "provider": "minimax",
+    "visible": true,
+    "speed": 5,
+    "intelligence": 3,
+    "context": 1000000,
+    "parameters": {
+      "max_tokens": 128000
+    },
+    "input_modalities": [
+      "text",
+      "image",
+      "video"
+    ],
+    "reasoning": {
+      "efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "default": "high",
+      "write": "parameters.output_config.effort"
+    }
+  },
   "minimax-m3": {
     "model_id": "MiniMax-M3",
     "provider": "minimax",
     "visible": true,
     "speed": 4,
     "intelligence": 2,
-    "context": 512000,
+    "context": 1000000,
     "parameters": {
       "max_tokens": 128000
     },
     "input_modalities": [
       "text",
-      "image"
+      "image",
+      "video"
     ],
     "reasoning": {
       "efforts": [

@@ -12,6 +12,7 @@
  */
 export {
   apiErrorDetailMessage,
+  apiErrorObject,
   apiErrorReason,
   formatApiErrorDetail,
   apiErrorStatus,

@@ -327,6 +327,15 @@ class MarketWatchConfig(BaseModel):
         default=25, ge=5, description="Throttle between injections per thread"
     )
     max_symbols: int = Field(default=10, ge=1, le=50, description="Watch list cap")
+    max_targets: int = Field(
+        default=10, ge=1, le=50, description="Armed price targets per thread"
+    )
+    target_warning_minutes: int = Field(
+        default=60,
+        ge=1,
+        le=720,
+        description="Minutes before a target lapses that the thread is told",
+    )
 
 
 class WorkflowOrchestrationConfig(BaseModel):

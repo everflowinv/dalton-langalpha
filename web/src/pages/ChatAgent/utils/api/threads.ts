@@ -55,19 +55,52 @@ export async function getThread(threadId: string): Promise<Thread> {
   return data;
 }
 
+export type MarketTargetKind = 'above' | 'below' | 'pct_up' | 'pct_down';
+export type MarketTargetPctFrom = 'previous_close' | 'now';
+export type MarketTargetStatus = 'armed' | 'fired' | 'expired' | 'cancelled';
+
+/** A price level or % move the agent set on this thread. `value` is a price
+ *  for `above`/`below` and a percent (3 = 3%) for the pct kinds. */
+export interface MarketTarget {
+  target_id: string;
+  symbol: string;
+  kind: MarketTargetKind;
+  value: number;
+  pct_from: MarketTargetPctFrom | null;
+  armed_price: number | null;
+  status: MarketTargetStatus;
+  expires_at: string;
+  fired_at: string | null;
+  fired_price: number | null;
+  created_at: string;
+}
+
 export interface MarketWatchResponse {
   thread_id: string;
   symbols: string[];
+  /** Armed targets plus those settled in the last day, newest first. */
+  targets?: MarketTarget[];
 }
 
 /**
  * Fetch the thread's current market-watch list (the tickers the agent is
- * live-stamping). Returns an empty `symbols` array when watch is off. Used to
- * seed the persistent watch chip on thread load and to refetch after a turn.
+ * live-stamping) and its price targets. Returns an empty `symbols` array when
+ * watch is off. Used to seed the persistent watch chip on thread load and to
+ * refetch after a turn.
  */
 export async function fetchMarketWatch(threadId: string): Promise<MarketWatchResponse> {
   if (!threadId) throw new Error('Thread ID is required');
   const { data } = await api.get<MarketWatchResponse>(`/api/v1/threads/${threadId}/market-watch`);
+  return data;
+}
+
+/** Cancel one armed target. `cancelled` is false when it had already fired,
+ *  expired or been cancelled, which a refetch then shows. */
+export async function cancelMarketTarget(threadId: string, targetId: string): Promise<{ cancelled: boolean }> {
+  if (!threadId) throw new Error('Thread ID is required');
+  const { data } = await api.delete<{ cancelled: boolean }>(
+    `/api/v1/threads/${threadId}/market-watch/targets/${encodeURIComponent(targetId)}`,
+  );
   return data;
 }
 

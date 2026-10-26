@@ -542,6 +542,15 @@ class ChatRequest(BaseModel):
         description="The steer job this turn carries. Internal use only.",
     )
 
+    # Internal: the price-target notice a market_target wake turn delivers,
+    # kept on the turn's query metadata so a replay can tell which target
+    # the turn is about without reading the alert text.
+    market_target: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Market target notice this wake turn delivers. "
+        "Internal use only.",
+    )
+
     # Server-stamped: the burst-guard ZSET member held by this request's
     # admission. The route overwrites whatever a client sent (a forged value
     # could only orphan the caller's own slot until reap, but stamping keeps

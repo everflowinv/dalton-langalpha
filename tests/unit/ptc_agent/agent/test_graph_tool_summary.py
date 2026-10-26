@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from ptc_agent.agent.graph import build_ptc_graph_with_session
+from ptc_agent.agent.middleware.runtime_context.epoch import Workspace
 
 
 def _make_session(summary):
@@ -96,7 +97,7 @@ async def test_graph_redacts_the_owners_whole_vault_read_fresh():
     vault = {'KEY': 'synthetic-rotated-value', 'UNREFERENCED': 'synthetic-agent-code-value'}
     with (
         patch('ptc_agent.agent.graph.PTCAgent', return_value=agent),
-        patch('ptc_agent.agent.graph._read_workspace_naming', AsyncMock(return_value=('A', ''))),
+        patch('ptc_agent.agent.graph._read_workspace_naming', AsyncMock(return_value=Workspace('A'))),
         patch('ptc_agent.agent.graph.fetch_user_data_counts', AsyncMock(return_value=None)),
         patch(_VAULT_READ, AsyncMock(return_value=vault)) as secrets,
     ):
@@ -118,7 +119,7 @@ async def test_graph_does_not_continue_with_wrong_secrets_when_vault_read_fails(
     agent = MagicMock()
     with (
         patch('ptc_agent.agent.graph.PTCAgent', return_value=agent),
-        patch('ptc_agent.agent.graph._read_workspace_naming', AsyncMock(return_value=('A', ''))),
+        patch('ptc_agent.agent.graph._read_workspace_naming', AsyncMock(return_value=Workspace('A'))),
         patch('ptc_agent.agent.graph.fetch_user_data_counts', AsyncMock(return_value=None)),
         patch(_VAULT_READ, AsyncMock(side_effect=RuntimeError('vault unavailable'))),
         pytest.raises(RuntimeError, match='vault unavailable'),

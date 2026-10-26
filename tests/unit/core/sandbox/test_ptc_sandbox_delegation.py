@@ -397,17 +397,11 @@ class TestBackgroundBashTrace:
     async def test_launch_injects_trace_env_named_after_the_session(
         self, mock_create_provider, mock_provider, mock_runtime
     ):
-        from ptc_agent.core.sandbox.runtime import SessionCommandResult
-
         sandbox = self._sandbox(mock_create_provider, mock_provider, mock_runtime)
         mock_runtime.fetch_working_dir = AsyncMock(return_value="/home/workspace")
         mock_runtime.list_sessions = AsyncMock(return_value=[])
         mock_runtime.create_session = AsyncMock()
-        mock_runtime.session_execute = AsyncMock(
-            return_value=SessionCommandResult(
-                cmd_id="cmd-xyz", exit_code=None, stdout="", stderr=""
-            )
-        )
+        mock_runtime.session_execute = AsyncMock(return_value="cmd-xyz")
 
         result = await sandbox.execute_bash_command(
             "python long_job.py", background=True

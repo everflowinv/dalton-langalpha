@@ -116,6 +116,9 @@ class ReconcileStats:
     unlinked: int = 0
     #: The link step raised, so the folder may still lack its shared skills.
     link_failed: bool = False
+    #: The pass ran before this folder's restore finished, so it held back
+    #: whatever reads the tree; a pass after the restore still has work.
+    restore_incomplete: bool = False
 
     @property
     def changed(self) -> bool:
@@ -277,6 +280,7 @@ async def _run_pass(
         # report read is about to be replaced.
         restore_incomplete=await files_restore_incomplete(workspace_id),
     )
+    ctx.stats.restore_incomplete = ctx.restore_incomplete
 
     for name in sorted(set(report) | set(ws_rows)):
         try:

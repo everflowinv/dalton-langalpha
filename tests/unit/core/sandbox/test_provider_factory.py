@@ -11,6 +11,7 @@ from ptc_agent.config.core import (
     CoreConfig,
     DaytonaConfig,
     DockerConfig,
+    E2BConfig,
     FilesystemConfig,
     LoggingConfig,
     MCPConfig,
@@ -45,6 +46,14 @@ class TestBuildProvider:
         assert provider._config is config
         assert provider._working_dir == "/home/a"
 
+    def test_e2b_uses_the_config_it_is_given(self):
+        config = E2BConfig(api_key="test")
+        provider = build_provider("e2b", config, working_dir="/home/a")
+
+        assert type(provider).__name__ == "E2BProvider"
+        assert provider._config is config
+        assert provider._working_dir == "/home/a"
+
     def test_two_backends_coexist_in_one_process(self):
         first = build_provider(
             "daytona", DaytonaConfig(api_key="key-a"), working_dir="/home/a"
@@ -73,6 +82,12 @@ class TestCreateProvider:
 
         assert provider._config is sandbox.docker
         assert provider._working_dir == "/home/workspace"
+
+    def test_selects_the_e2b_sub_config(self):
+        sandbox = SandboxConfig(provider="e2b", e2b=E2BConfig(api_key="test"))
+        provider = create_provider(_core_config(sandbox, "/home/workspace"))
+
+        assert provider._config is sandbox.e2b
 
     def test_filesystem_working_directory_wins_over_the_provider_field(self):
         sandbox = SandboxConfig(

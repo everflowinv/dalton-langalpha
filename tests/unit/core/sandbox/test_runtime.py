@@ -3,7 +3,7 @@ Tests for ptc_agent.core.sandbox.runtime — ABCs and data classes.
 
 Covers:
 - ExecResult, CodeRunResult, Artifact, RuntimeState data classes
-- SandboxRuntime ABC contract (cannot instantiate, subclass works, capabilities, archive)
+- SandboxRuntime ABC contract (cannot instantiate, subclass works, optional abilities, archive)
 - SandboxProvider ABC contract (cannot instantiate, is_transient_error default)
 """
 
@@ -91,6 +91,28 @@ class TestRuntimeState:
 # ---------------------------------------------------------------------------
 
 
+class _NoSessions:
+    """The session methods every runtime must define, for stubs that never use them."""
+
+    async def create_session(self, session_id):
+        raise NotImplementedError
+
+    async def session_execute(self, session_id, command):
+        raise NotImplementedError
+
+    async def session_command_logs(self, session_id, command_id):
+        raise NotImplementedError
+
+    async def session_logs(self, session_id):
+        raise NotImplementedError
+
+    async def list_sessions(self):
+        raise NotImplementedError
+
+    async def delete_session(self, session_id):
+        raise NotImplementedError
+
+
 class TestSandboxRuntimeABC:
     def test_cannot_instantiate(self):
         with pytest.raises(TypeError):
@@ -99,7 +121,7 @@ class TestSandboxRuntimeABC:
     def test_concrete_subclass_works(self):
         """A minimal stub implementing all abstract methods should instantiate."""
 
-        class StubRuntime(SandboxRuntime):
+        class StubRuntime(_NoSessions, SandboxRuntime):
             @property
             def id(self) -> str:
                 return "stub-1"
@@ -143,9 +165,9 @@ class TestSandboxRuntimeABC:
         assert runtime.working_dir == "/work"
 
     def test_default_capabilities(self):
-        """capabilities property should return the default set."""
+        """A runtime claims no optional ability until it overrides one."""
 
-        class StubRuntime(SandboxRuntime):
+        class StubRuntime(_NoSessions, SandboxRuntime):
             @property
             def id(self):
                 return "s"
@@ -185,11 +207,13 @@ class TestSandboxRuntimeABC:
                 return []
 
         runtime = StubRuntime()
-        assert runtime.capabilities == {"exec", "code_run", "file_io"}
+        assert not runtime.updates_env
+        assert not runtime.archives
+        assert not runtime.autostops
 
     @pytest.mark.asyncio
     async def test_archive_raises_not_implemented(self):
-        class StubRuntime(SandboxRuntime):
+        class StubRuntime(_NoSessions, SandboxRuntime):
             @property
             def id(self):
                 return "s"
@@ -234,7 +258,7 @@ class TestSandboxRuntimeABC:
 
     @pytest.mark.asyncio
     async def test_get_metadata_defaults(self):
-        class StubRuntime(SandboxRuntime):
+        class StubRuntime(_NoSessions, SandboxRuntime):
             @property
             def id(self):
                 return "meta-1"

@@ -43,6 +43,7 @@ from starlette.middleware.gzip import GZipMiddleware
 from ptc_agent.core.sandbox.livefs_runtime.protocol import PREFIX as LIVEFS_PREFIX
 from ptc_agent.core.sandbox.platform_secrets import PlatformSecretError
 from ptc_agent.core.sandbox.runtime import SandboxGoneError, SandboxTransientError
+from src.server.preview_proxy import install_preview_proxy
 from src.config.logging_config import configure_logging
 from src.config.settings import (
     get_allowed_origins,
@@ -53,6 +54,10 @@ from src.observability.private_query import drop_span_query
 from src.server.services.runs.executor import LocalRunExecutor
 from src.server.services.background_registry_store import BackgroundRegistryStore
 from src.server.utils.api import find_malformed_route_ids  # TEMP (malformed-id-diag)
+from src.server.services.preview_base import (
+    PreviewProxyConfigurationError,
+    check_preview_proxy_config,
+)
 from src.server.utils.error_sanitization import (
     sandbox_unreachable_detail,
     single_line,
@@ -122,6 +127,9 @@ _REDIS_BACKGROUND_SINGLETONS: tuple[tuple[str, str], ...] = (
     # Refreshes expiring MCP OAuth connections ahead of the hot path; the
     # per-connection advisory try-lock dedups it across workers.
     ("McpOAuthRefreshSweeper", "src.server.services.mcp_oauth.sweep"),
+    # Keeps running sandboxes' market-data tokens fresh between turns; a
+    # claim on each computer's row in Postgres dedups it across workers.
+    ("DataTokenSweeper", "src.server.services.data_token_sweep"),
 )
 
 
@@ -323,6 +331,13 @@ async def lifespan(app: FastAPI):
         logger.info("Loading PTC Agent configuration...")
         agent_config = await load_from_files(context=ConfigContext.SDK)
 
+        from src.config.env import PUBLIC_APP_URL, SERVER_BASE_URL
+
+        check_preview_proxy_config(
+            requires_proxy=not agent_config.sandbox.e2b.public_traffic,
+            app_urls=(SERVER_BASE_URL, PUBLIC_APP_URL, *get_allowed_origins()),
+        )
+
         from src.server.services.plugins.bundled import component_owners
 
         bundle_owners = component_owners()
@@ -333,20 +348,6 @@ async def lifespan(app: FastAPI):
 
         await reconcile_platform_secrets_at_boot(agent_config)
         logger.info("PTC Agent configuration loaded successfully")
-
-        # Platform-secret migration sweep: converges running sandboxes left
-        # behind the fleet generation (always-on sandboxes never re-init, so
-        # only this sweep ever scrubs them). Inert without an active catalog.
-        try:
-            from src.server.services.platform_secret_sweep import (
-                PlatformSecretSweeper,
-            )
-
-            PlatformSecretSweeper.get_instance().start(
-                agent_config.to_core_config()
-            )
-        except Exception as e:
-            logger.warning(f"Failed to start PlatformSecretSweeper: {e}")
 
         # Connect once, freeze, install as the process-global registry so every
         # Session borrows the same tool snapshot instead of spawning its own
@@ -361,7 +362,7 @@ async def lifespan(app: FastAPI):
         try:
             core_config = agent_config.to_core_config()
             mcp_registry = MCPRegistry(core_config)
-            await mcp_registry.connect_all()
+            await mcp_registry.connect_all(retry_builtin_remote=True)
             await mcp_registry.freeze()
             set_global_registry(mcp_registry)
             logger.info(
@@ -394,21 +395,32 @@ async def lifespan(app: FastAPI):
         llm_service = LLMService(agent_config=agent_config, logger=logger)
         logger.info("LLMService initialized")
 
-        # Initialize workspace manager
-        # Derive idle timeout from Daytona auto-stop so the server cleans up
-        # *before* Daytona kills the sandbox (10-min buffer, 5-min floor).
-        daytona_auto_stop = agent_config.daytona.auto_stop_interval  # seconds
-        server_idle_timeout = max(daytona_auto_stop - 600, 300)
-
+        # Initialize workspace manager. Its idle sweep times each computer by
+        # that computer's own provider settings.
         from src.server.services.workspace_manager import WorkspaceManager
 
         workspace_manager = WorkspaceManager.get_instance(
             config=agent_config,
-            idle_timeout=server_idle_timeout,
             cleanup_interval=300,  # 5 minutes
         )
         await workspace_manager.start_cleanup_task()
         logger.info("Workspace Manager initialized")
+
+        # Platform-secret migration sweep: converges running sandboxes left
+        # behind the fleet generation (always-on sandboxes never re-init, so
+        # only this sweep ever scrubs them). Inert without an active catalog.
+        # Started after the Workspace Manager, which creates the
+        # ComputerManager its first pass needs.
+        try:
+            from src.server.services.platform_secret_sweep import (
+                PlatformSecretSweeper,
+            )
+
+            PlatformSecretSweeper.get_instance().start(
+                agent_config.to_core_config()
+            )
+        except Exception as e:
+            logger.warning(f"Failed to start PlatformSecretSweeper: {e}")
 
         # Initialize PTC Agent checkpointer for state persistence
         from src.server.utils.checkpointer import (
@@ -482,6 +494,10 @@ async def lifespan(app: FastAPI):
         # Required platform Secrets are a configuration gate. Hosted mode
         # must never continue into a plaintext fallback or partial startup.
         raise
+    except PreviewProxyConfigurationError:
+        # The same kind of gate: private computers with nowhere to serve
+        # their previews would hand out only dead links.
+        raise
     except Exception as e:
         logger.warning(f"Failed to initialize PTC Agent: {e}")
         logger.warning("PTC Agent endpoints may not work correctly")
@@ -514,12 +530,14 @@ async def lifespan(app: FastAPI):
     from src.server.services.report_back.handoff import core as handoff_core
     from src.server.services import automation_settlement, thread_lifecycle_feed
     from src.server.services.hook_outbox import HookOutboxDrainer
+    from src.server.services.market_targets import delivery as market_target_delivery
 
     handoff_core.register_outbox_executors()
     subagent.register_outbox_executors()
     steer_executor.register_outbox_executors()
     thread_lifecycle_feed.register_outbox_executors()
     automation_settlement.register_outbox_executors()
+    market_target_delivery.register_outbox_executors()
     try:
         HookOutboxDrainer.get_instance().start()
         logger.info("HookOutboxDrainer started")
@@ -697,6 +715,23 @@ async def lifespan(app: FastAPI):
             name="dalton-startup-data-source-health",
         )
 
+    # A built-in remote server still down after boot's retry budget is retried
+    # in the background, so this worker heals when it answers instead of
+    # serving without its tools until a restart. Last, so nothing above can
+    # fail startup with the task running.
+    from ptc_agent.core.mcp_registry import get_global_registry, reconnect_builtin_remote
+
+    mcp_reconnect: asyncio.Task[None] | None = None
+    booted_registry = get_global_registry()
+    if booted_registry is not None and booted_registry.failed_builtin_remote:
+        mcp_reconnect = asyncio.create_task(
+            reconnect_builtin_remote(), name="mcp-builtin-reconnect"
+        )
+        logger.info(
+            "Reconnecting built-in MCP servers in the background: %s",
+            ", ".join(sorted(booted_registry.failed_builtin_remote)),
+        )
+
     # Startup leaves ~700k import-time objects (pydantic schemas, routes,
     # module state) that never die, and every full collection re-walks them
     # while the loop is frozen. Freezing moves them out of the collector for
@@ -720,6 +755,11 @@ async def lifespan(app: FastAPI):
     if mark_warmup is not None:
         mark_warmup.cancel()
         await asyncio.gather(mark_warmup, return_exceptions=True)
+    # Before the registry is cleared below, which would end it anyway, so an
+    # attempt in flight closes its connection while the loop still runs.
+    if mcp_reconnect is not None:
+        mcp_reconnect.cancel()
+        await asyncio.gather(mcp_reconnect, return_exceptions=True)
     from src.server.services.brand_icons import stop_refreshes
 
     await stop_refreshes()
@@ -839,6 +879,15 @@ async def lifespan(app: FastAPI):
         await registry_store.cancel_all(force=True)
     except Exception as e:
         logger.warning(f"Error cancelling background subagent tasks: {e}")
+
+    # 2.5. Close the preview proxy's upstream pool; its keep-alive renewals
+    # reach the Workspace Manager, so they go before it does.
+    preview_proxy = getattr(app.state, "preview_proxy", None)
+    if preview_proxy is not None:
+        try:
+            await preview_proxy.aclose()
+        except Exception as e:
+            logger.warning(f"Error closing the preview proxy: {e}")
 
     # 3. Shutdown Workspace Manager (stop cleanup task, clear cache)
     if workspace_manager is not None:
@@ -1177,6 +1226,10 @@ app.add_middleware(
     ],  # Use the configured list of methods
     allow_headers=["*"],  # Now allow all headers, but can be restricted further
 )
+
+# Previews of private sandboxes, picked out by Host before any middleware
+# above sees the request. Installed last, around the stack the tracing wraps.
+install_preview_proxy(app)
 
 
 # ============================================================================

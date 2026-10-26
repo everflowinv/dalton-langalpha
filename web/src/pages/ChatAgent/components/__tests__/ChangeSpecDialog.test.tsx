@@ -53,14 +53,14 @@ describe('ChangeSpecDialog, seeding on a low-disk machine', () => {
       <ChangeSpecDialog target={LOW_DISK} onClose={() => {}} onSubmit={onSubmit} busy={false} quota={undefined} />,
     );
     // Before the quota lands the step up is the seed, as on a plan that allows it.
-    expect(radio('Performance')).toHaveAttribute('aria-checked', 'true');
+    expect(radio('Performance')).toBeChecked();
 
     rerender(
       <ChangeSpecDialog target={LOW_DISK} onClose={() => {}} onSubmit={onSubmit} busy={false} quota={NOT_ON_PLAN} />,
     );
     expect(radio('Performance')).toBeDisabled();
-    expect(radio('Performance')).toHaveAttribute('aria-checked', 'false');
-    expect(radio('Standard')).toHaveAttribute('aria-checked', 'true');
+    expect(radio('Performance')).not.toBeChecked();
+    expect(radio('Standard')).toBeChecked();
     expect(apply()).toBeDisabled();
     await userEvent.click(apply());
     expect(onSubmit).not.toHaveBeenCalled();
@@ -70,7 +70,7 @@ describe('ChangeSpecDialog, seeding on a low-disk machine', () => {
     renderWithProviders(
       <ChangeSpecDialog target={LOW_DISK} onClose={() => {}} onSubmit={() => {}} busy={false} quota={ON_PLAN} />,
     );
-    expect(radio('Performance')).toHaveAttribute('aria-checked', 'true');
+    expect(radio('Performance')).toBeChecked();
     expect(apply()).toBeEnabled();
   });
 
@@ -82,7 +82,7 @@ describe('ChangeSpecDialog, seeding on a low-disk machine', () => {
     rerender(
       <ChangeSpecDialog target={LOW_DISK} onClose={() => {}} onSubmit={() => {}} busy={false} quota={NOT_ON_PLAN} />,
     );
-    expect(radio('Max')).toHaveAttribute('aria-checked', 'true');
+    expect(radio('Max')).toBeChecked();
     expect(apply()).toBeEnabled();
   });
 });
@@ -106,9 +106,46 @@ describe('ChangeSpecDialog, after an interrupted change', () => {
     renderWithProviders(
       <ChangeSpecDialog target={INTERRUPTED} onClose={() => {}} onSubmit={() => {}} busy={false} quota={ON_PLAN} />,
     );
-    expect(radio('Standard')).toHaveAttribute('aria-checked', 'true');
+    expect(radio('Standard')).toBeChecked();
+    // Current is the tier it runs at, not the one the row still names.
+    expect(radio('Standard')).toHaveAccessibleDescription(/^Current/);
+    expect(radio('Performance')).not.toHaveAccessibleDescription(/Current/);
     expect(apply()).toBeDisabled();
     await userEvent.click(radio('Performance'));
     expect(apply()).toBeEnabled();
+  });
+});
+
+describe('ChangeSpecDialog, the current tier', () => {
+  const HEALTHY = { ...LOW_DISK, disk: null };
+
+  it('reads "Current", and holds Apply until another tier is picked', async () => {
+    renderWithProviders(
+      <ChangeSpecDialog target={HEALTHY} onClose={() => {}} onSubmit={() => {}} busy={false} quota={ON_PLAN} />,
+    );
+    expect(radio('Standard')).toBeChecked();
+    expect(radio('Standard')).toHaveAccessibleDescription(/^Current/);
+    expect(radio('Max')).not.toHaveAccessibleDescription(/Current/);
+    expect(apply()).toBeDisabled();
+
+    await userEvent.click(radio('Performance'));
+    expect(apply()).toBeEnabled();
+    await userEvent.click(radio('Standard'));
+    expect(apply()).toBeDisabled();
+  });
+
+  it("keeps Current over the plan's count, which the current tier doesn't draw on", () => {
+    const quota: WorkspaceQuota = { performance: { used: 1, limit: 2 }, max: null, always_on: null };
+    renderWithProviders(
+      <ChangeSpecDialog
+        target={{ ...HEALTHY, resource_tier: 'performance' }}
+        onClose={() => {}}
+        onSubmit={() => {}}
+        busy={false}
+        quota={quota}
+      />,
+    );
+    expect(radio('Performance')).toHaveAccessibleDescription(/^Current/);
+    expect(radio('Performance')).not.toHaveAccessibleDescription(/1 of 2 left/);
   });
 });

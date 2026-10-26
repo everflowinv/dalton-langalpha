@@ -186,6 +186,7 @@ class TestCleanupIdleWorkspacesGuard:
         return {
             "computer_id": computer_id,
             "user_id": "user-1",
+            "kind": "daytona",
             "is_always_on": False,
             "last_activity_at": datetime.now(timezone.utc) - timedelta(seconds=3600),
             "updated_at": datetime.now(timezone.utc) - timedelta(seconds=3600),
@@ -196,9 +197,10 @@ class TestCleanupIdleWorkspacesGuard:
         from ptc_agent.config import AgentConfig
 
         config = MagicMock(spec=AgentConfig)
+        config.to_core_config.return_value.sandbox = SandboxConfig()
         from src.server.services.workspace_manager import WorkspaceManager
 
-        mgr = WorkspaceManager(config=config, idle_timeout=1800)
+        mgr = WorkspaceManager(config=config)
 
         with (
             patch(
@@ -225,9 +227,10 @@ class TestCleanupIdleWorkspacesGuard:
         from ptc_agent.config import AgentConfig
 
         config = MagicMock(spec=AgentConfig)
+        config.to_core_config.return_value.sandbox = SandboxConfig()
         from src.server.services.workspace_manager import WorkspaceManager
 
-        mgr = WorkspaceManager(config=config, idle_timeout=1800)
+        mgr = WorkspaceManager(config=config)
         machine = self._idle_machine("comp-idle")
 
         with (

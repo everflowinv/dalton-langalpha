@@ -178,7 +178,7 @@ class TestUpdateWorkspace:
         )
 
         ws_id = str(seed_workspace["workspace_id"])
-        computer = await create_computer(seed_workspace["user_id"])
+        computer = await create_computer(seed_workspace["user_id"], name="Cloud computer")
         computer_id = str(computer["computer_id"])
         assert await bind_workspace_to_computer(
             ws_id, computer_id, expected_computer_id=None, dir_name="test-ws"

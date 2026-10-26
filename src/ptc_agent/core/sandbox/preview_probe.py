@@ -1,0 +1,37 @@
+"""Probing a preview port with the credential its URL needs."""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+
+import httpx
+
+_MAX_HOPS = 5
+
+
+async def head_preview(
+    client: httpx.AsyncClient, url: str, headers: Mapping[str, str]
+) -> httpx.Response:
+    """HEAD *url*, following redirects only while they stay on its origin.
+
+    The headers open the sandbox's ports, and httpx keeps custom headers
+    across a redirect to another host, so an app that sends its visitors to a
+    login page elsewhere would hand that host the credential. A redirect that
+    leaves the origin is the answer instead: the app is up and replying.
+    """
+    first = httpx.URL(url)
+    response = await client.head(first, headers=dict(headers), follow_redirects=False)
+    for _ in range(_MAX_HOPS):
+        if not response.is_redirect:
+            break
+        target = response.url.join(response.headers["location"])
+        if (target.scheme, target.host, target.port) != (
+            first.scheme,
+            first.host,
+            first.port,
+        ):
+            break
+        response = await client.head(
+            target, headers=dict(headers), follow_redirects=False
+        )
+    return response

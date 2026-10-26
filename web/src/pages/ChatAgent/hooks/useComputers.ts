@@ -15,6 +15,7 @@ import { queryKeys } from '@/lib/queryKeys';
 import type { Computer, ComputerStorage, ComputersResponse } from '@/types/api';
 
 import {
+  getComputerProviders,
   getComputerStorage,
   getComputers,
   streamComputerEvents,
@@ -25,11 +26,9 @@ import {
   patchComputerStatusInCaches,
   patchWorkspaceStatusInCaches,
 } from '../utils/warmWorkspace';
-import {
-  isComputerStatusTerminal,
-  isComputerStatusTransitional,
-} from '../components/computerStatusUi';
+import { isComputerStatusTerminal, isComputerStatusTransitional } from '../utils/computerStatus';
 import { activeSpecChange } from '../components/specChangeUi';
+import { recordPrepareFailure, recordPrepareStage } from './computerPreparation';
 
 /** How often the list is re-read while a spec change runs. */
 export const SPEC_CHANGE_POLL_MS = 3000;
@@ -82,6 +81,44 @@ export function useComputers(options: { enabled?: boolean } = {}) {
     refetchInterval: (query) =>
       query.state.data?.computers.some((c) => activeSpecChange(c)) ? SPEC_CHANGE_POLL_MS : false,
   });
+}
+
+/**
+ * The providers a new computer can go on. Read by the create form and by the
+ * rows, which name a machine's provider once there is more than one to tell
+ * apart. `enabled` is the caller's gate: fetch while a computer surface is open.
+ */
+export function useComputerProviders(options: { enabled: boolean }) {
+  return useQuery({
+    queryKey: queryKeys.computers.providers(),
+    queryFn: getComputerProviders,
+    enabled: options.enabled,
+    staleTime: 60_000,
+  });
+}
+
+/** Put a machine the server just created on every cached list, ahead of the refetch. */
+export function addComputerRow(queryClient: QueryClient, computer: Computer) {
+  queryClient.setQueriesData<ComputersResponse | undefined>(
+    { queryKey: queryKeys.computers.lists() },
+    (prev) => !prev?.computers || prev.computers.some((c) => c.computer_id === computer.computer_id) ? prev : {
+      ...prev,
+      computers: [...prev.computers, computer],
+      ...(typeof prev.total === 'number' ? { total: prev.total + 1 } : {}),
+    },
+  );
+}
+
+/** Take a machine the server just removed off every cached list, ahead of the refetch. */
+export function removeComputerRow(queryClient: QueryClient, computerId: string) {
+  queryClient.setQueriesData<ComputersResponse | undefined>(
+    { queryKey: queryKeys.computers.lists() },
+    (prev) => !prev?.computers?.some((c) => c.computer_id === computerId) ? prev : {
+      ...prev,
+      computers: prev.computers.filter((c) => c.computer_id !== computerId),
+      ...(typeof prev.total === 'number' ? { total: Math.max(0, prev.total - 1) } : {}),
+    },
+  );
 }
 
 /**
@@ -296,8 +333,13 @@ export function useComputerStatusFanout(): void {
           let lastStatus: string | undefined;
           await streamComputerEvents(
             computerId,
-            (status) => {
+            (frame) => {
+              const { status } = frame;
               lastStatus = status;
+              if (frame.stage) recordPrepareStage(computerId, frame.stage);
+              // Before the status lands, so whoever reads the failure off the
+              // list finds its reason waiting.
+              if (status === 'error' && frame.error) recordPrepareFailure(computerId, frame.error);
               patchComputerStatusInCaches(queryClient, computerId, status);
               // A breakdown read while the machine was down only says to start it.
               if (status === 'running') invalidateMachineStorage(queryClient, computerId);
@@ -347,6 +389,13 @@ export function useComputerStatusFanout(): void {
 const WORKSPACE_KEY_ROOT = queryKeys.workspaces.all[0];
 
 /**
+ * The workspace statuses that move on without anyone acting. Not the
+ * computer's transitional set: its 'creating' is a new machine's preparation,
+ * which a row with no machine never goes through.
+ */
+const WORKSPACE_MOVING = new Set(['starting', 'stopping']);
+
+/**
  * The in-flight workspaces no machine speaks for, as a sorted joined key.
  *
  * Read from the cache rather than taken as a prop so the fan-out mounts once,
@@ -369,7 +418,7 @@ function useUnboundTransitionalWorkspaceKey(): string {
   const getKey = useCallback(() => {
     const ids = new Set(
       cachedWorkspaceLists(queryClient)
-        .filter((ws) => !ws.computer_id && isComputerStatusTransitional(ws.status))
+        .filter((ws) => !ws.computer_id && !!ws.status && WORKSPACE_MOVING.has(ws.status))
         .map((ws) => ws.workspace_id),
     );
     return [...ids].sort().join(',');

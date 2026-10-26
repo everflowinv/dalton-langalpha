@@ -368,3 +368,35 @@ class TestGetTechnicalIndicator:
         assert result["indicator"] == "ema"
         assert result["period"] == 50
         assert result["timeframe"] == "1hour"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("timeframe", ["2day", "1d", "1h", "1HOUR", "1week", ""])
+    async def test_unknown_timeframe_is_refused_before_fmp(self, timeframe):
+        from plugins.langalpha_market_data.fundamentals_mcp_server import get_technical_indicator
+
+        client = _make_fmp_client()
+        with patch(f"{_MOD}.get_fmp_client", return_value=client):
+            result = await get_technical_indicator("AAPL", indicator="rsi", timeframe=timeframe)
+
+        # The hosted tool's envelope, word for word.
+        assert result == {
+            "error": "invalid_argument",
+            "detail": (
+                "timeframe must be one of 1min, 5min, 15min, 30min, 1hour, 4hour, 1day, "
+                f"not {timeframe!r}"
+            ),
+            "symbol": "AAPL",
+        }
+        client.get_technical_indicator.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("timeframe", ["1min", "5min", "15min", "30min", "1hour", "4hour", "1day"])
+    async def test_every_bar_size_reaches_fmp(self, timeframe):
+        from plugins.langalpha_market_data.fundamentals_mcp_server import get_technical_indicator
+
+        client = _make_fmp_client()
+        with patch(f"{_MOD}.get_fmp_client", return_value=client):
+            result = await get_technical_indicator("AAPL", indicator="rsi", timeframe=timeframe)
+
+        assert result["timeframe"] == timeframe
+        assert client.get_technical_indicator.await_args.kwargs["timeframe"] == timeframe

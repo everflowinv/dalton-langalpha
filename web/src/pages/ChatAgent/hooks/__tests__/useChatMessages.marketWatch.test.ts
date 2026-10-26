@@ -33,11 +33,12 @@ vi.mock('../utils/threadStorage', () => ({
 
 vi.mock('../../utils/api', async () => (await import('./chatHookHarness')).apiMockModule());
 
-import { fetchMarketWatch } from '../../utils/api';
+import { cancelMarketTarget, fetchMarketWatch, type MarketTarget } from '../../utils/api';
 import { useChatMessages } from '../useChatMessages';
 import { useMarketWatch } from '../useMarketWatch';
 
 const mockFetchMarketWatch = fetchMarketWatch as Mock;
+const mockCancelMarketTarget = cancelMarketTarget as Mock;
 
 describe('useChatMessages – market watch chip state', () => {
   beforeEach(() => {
@@ -167,5 +168,123 @@ describe('useMarketWatch – live stamp survives the turn-completion refetch (me
     await waitFor(() => {
       expect(result.current.marketWatch).toBeNull();
     });
+  });
+});
+
+// A target is watched server-side between turns, so it keeps the watch on with
+// no live-stamped symbols, and a cancel is the server's to settle.
+describe('useMarketWatch – price targets', () => {
+  // Neutral placeholder ticker and a made-up level only.
+  const ARMED: MarketTarget = {
+    target_id: 'tg-1',
+    symbol: 'NVDA',
+    kind: 'above',
+    value: 205,
+    pct_from: null,
+    armed_price: null,
+    status: 'armed',
+    expires_at: '2030-01-02T00:00:00Z',
+    fired_at: null,
+    fired_price: null,
+    created_at: '2030-01-01T00:00:00Z',
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('keeps the state on for targets alone', async () => {
+    mockFetchMarketWatch.mockResolvedValue({ thread_id: 'thread-a', symbols: [], targets: [ARMED] });
+    const threadIdRef = { current: 'thread-a' };
+    const { result } = renderHookWithProviders(() => useMarketWatch('thread-a', false, threadIdRef));
+    await waitFor(() => {
+      expect(result.current.marketWatch).toEqual({ symbols: [], targets: [ARMED] });
+    });
+  });
+
+  it('cancels through the API, shows it cancelled, and re-reads the targets', async () => {
+    mockFetchMarketWatch.mockResolvedValue({ thread_id: 'thread-a', symbols: [], targets: [ARMED] });
+    const threadIdRef = { current: 'thread-a' };
+    const { result } = renderHookWithProviders(() => useMarketWatch('thread-a', false, threadIdRef));
+    await waitFor(() => expect(result.current.marketWatch?.targets).toEqual([ARMED]));
+
+    let resolveRefetch: (v: unknown) => void = () => {};
+    mockFetchMarketWatch.mockImplementation(() => new Promise((r) => { resolveRefetch = r; }));
+    mockCancelMarketTarget.mockResolvedValue({ cancelled: true });
+    await act(async () => {
+      await result.current.cancelMarketTarget('tg-1');
+    });
+
+    expect(mockCancelMarketTarget).toHaveBeenCalledWith('thread-a', 'tg-1');
+    expect(result.current.marketWatch?.targets?.[0].status).toBe('cancelled');
+    expect(mockFetchMarketWatch).toHaveBeenCalledTimes(2);
+
+    // The re-read is the truth once it lands.
+    const settled = { ...ARMED, status: 'cancelled' as const };
+    await act(async () => {
+      resolveRefetch({ thread_id: 'thread-a', symbols: [], targets: [settled] });
+    });
+    expect(result.current.marketWatch).toEqual({ symbols: [], targets: [settled] });
+  });
+
+  // The server settles it on its next sweep, and nothing re-reads the targets
+  // between turns, so the view must not go on offering a Cancel for it.
+  it('reads an armed target expired once its expiry passes, with no re-read', async () => {
+    vi.useFakeTimers({ now: Date.parse('2030-01-01T23:59:00Z'), toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    try {
+      mockFetchMarketWatch.mockResolvedValue({ thread_id: 'thread-a', symbols: [], targets: [ARMED] });
+      const threadIdRef = { current: 'thread-a' };
+      const { result } = renderHookWithProviders(() => useMarketWatch('thread-a', false, threadIdRef));
+      await act(async () => {});
+      expect(result.current.marketWatch?.targets?.[0].status).toBe('armed');
+
+      await act(async () => {
+        vi.advanceTimersByTime(59_000);
+      });
+      expect(result.current.marketWatch?.targets?.[0].status).toBe('armed');
+
+      await act(async () => {
+        vi.advanceTimersByTime(1_000);
+      });
+      expect(result.current.marketWatch).toEqual({ symbols: [], targets: [{ ...ARMED, status: 'expired' }] });
+      expect(mockFetchMarketWatch).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('drops an older read that answers after a newer one', async () => {
+    mockFetchMarketWatch.mockResolvedValue({ thread_id: 'thread-a', symbols: [], targets: [ARMED] });
+    const threadIdRef = { current: 'thread-a' };
+    const { result } = renderHookWithProviders(() => useMarketWatch('thread-a', false, threadIdRef));
+    await waitFor(() => expect(result.current.marketWatch?.targets).toEqual([ARMED]));
+
+    const answers: Array<(v: unknown) => void> = [];
+    mockFetchMarketWatch.mockImplementation(() => new Promise((r) => { answers.push(r); }));
+    act(() => {
+      result.current.refreshMarketWatch();
+      result.current.refreshMarketWatch();
+    });
+    const fired = { ...ARMED, status: 'fired' as const };
+    await act(async () => {
+      answers[1]({ thread_id: 'thread-a', symbols: [], targets: [fired] });
+    });
+    await act(async () => {
+      answers[0]({ thread_id: 'thread-a', symbols: [], targets: [ARMED] });
+    });
+    expect(result.current.marketWatch).toEqual({ symbols: [], targets: [fired] });
+  });
+
+  it('rejects when the cancel request fails, leaving the target as it was', async () => {
+    mockFetchMarketWatch.mockResolvedValue({ thread_id: 'thread-a', symbols: [], targets: [ARMED] });
+    const threadIdRef = { current: 'thread-a' };
+    const { result } = renderHookWithProviders(() => useMarketWatch('thread-a', false, threadIdRef));
+    await waitFor(() => expect(result.current.marketWatch?.targets).toEqual([ARMED]));
+
+    mockCancelMarketTarget.mockRejectedValue(new Error('Network Error'));
+    await act(async () => {
+      await expect(result.current.cancelMarketTarget('tg-1')).rejects.toThrow('Network Error');
+    });
+    expect(result.current.marketWatch?.targets?.[0].status).toBe('armed');
   });
 });

@@ -90,6 +90,23 @@ class TestMetadataFrameFirst:
         assert data == {"thread_id": "t-1", "run_id": "r-abc", "report_source": source}
 
     @pytest.mark.asyncio
+    async def test_market_target_rides_the_metadata_frame(self):
+        """A target's wake names its notice up front: a client that attaches
+        live reads no query row to draw the alert's row from."""
+        notice = {"target_id": "tg-1", "notice": "hit", "symbol": "ACME", "kind": "above", "value": 205}
+        handler = RunSSEProducer(
+            thread_id="t-1", run_id="r-abc", turn_index=3, market_target=notice
+        )
+        event_name, data = _parse_sse((await _collect_stream(handler))[0])
+        assert event_name == "metadata"
+        assert data == {
+            "thread_id": "t-1",
+            "run_id": "r-abc",
+            "turn_index": 3,
+            "market_target": notice,
+        }
+
+    @pytest.mark.asyncio
     async def test_metadata_names_the_admitted_turn(self):
         """The client stamps a live turn's bubbles from this value: a view
         that missed turns added elsewhere would otherwise count to the wrong

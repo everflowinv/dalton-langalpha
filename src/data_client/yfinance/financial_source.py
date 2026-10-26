@@ -17,7 +17,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 import yfinance as yf
-from market_protocol import display_spelling
+from market_protocol import display_spelling, to_major_units
 
 # DALTON-HOOK(yfinance-prev-close)
 from .yahoo import regular_previous_close, yahoo_ticker
@@ -274,9 +274,12 @@ def _stamp_reported_currency(ticker: yf.Ticker, rows: list[dict[str, Any]]) -> l
 
 
 def _percent_to_fraction(val: Any) -> float | None:
-    """Yahoo reports debtToEquity and dividendYield as percents (154.0, 0.41)."""
+    """Yahoo reports debtToEquity and dividendYield as percents (154.0, 0.41).
+
+    A decimal shift, since 0.41 / 100 is 0.0040999999999999995.
+    """
     val = _clean_value(val)
-    return val / 100 if isinstance(val, (int, float)) else None
+    return to_major_units(val, 2) if isinstance(val, (int, float)) else None
 
 
 # These two stand in for FMP's stable key-metrics-ttm and ratios-ttm, so each

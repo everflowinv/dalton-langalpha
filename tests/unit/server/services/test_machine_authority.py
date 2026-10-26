@@ -66,6 +66,7 @@ def _workspace(workspace_id, *, computer_id=COMPUTER_ID, status="running"):
 def _computer(*, shadowed, status="running", provider_ref="sandbox-abc"):
     return {
         "computer_id": COMPUTER_ID,
+        "kind": "daytona",
         "status": status,
         "provider_ref": provider_ref,
         "shadowed_workspace_ids": shadowed,
@@ -709,7 +710,7 @@ class TestArchiveClaim(_Base):
         manager._machine_has_active_tasks = AsyncMock(return_value=False)
         row = _computer(shadowed=[], status="stopped")
         status = AsyncMock(return_value={**row, "status": "stopping"} if wins else None)
-        runtime = SimpleNamespace(capabilities={"archive"}, archive=AsyncMock())
+        runtime = SimpleNamespace(archives=True, archive=AsyncMock())
 
         @asynccontextmanager
         async def detached(*_args, **_kwargs):
@@ -742,7 +743,7 @@ class TestArchiveClaim(_Base):
         manager._reconcile_provider_stop = AsyncMock(side_effect=RuntimeError("unreachable"))
         manager._settle_machine_stop = AsyncMock()
         runtime = SimpleNamespace(
-            capabilities={"archive"}, archive=AsyncMock(side_effect=RuntimeError("archive failed"))
+            archives=True, archive=AsyncMock(side_effect=RuntimeError("archive failed"))
         )
 
         @asynccontextmanager

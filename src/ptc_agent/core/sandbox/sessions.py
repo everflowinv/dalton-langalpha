@@ -49,11 +49,15 @@ async def get_preview_url(sandbox: "PTCSandbox", port: int, expires_in: int = 36
     )
 
 
-async def get_preview_link(sandbox: "PTCSandbox", port: int) -> PreviewInfo:
+async def get_preview_link(
+    sandbox: "PTCSandbox", port: int, *, wake: bool = True
+) -> PreviewInfo:
     """Get a standard preview URL with header-based auth token.
 
         Results are cached per-port since the standard URL doesn't change
         while the sandbox is running. Cache is cleared on sandbox restart.
+        ``wake=False`` is for probes: one attempt and no reconnect, because
+        the reconnect that rescues a stopped sandbox would start it.
         """
     cached = sandbox._preview_link_cache.get(port)
     if cached is not None:
@@ -64,6 +68,8 @@ async def get_preview_link(sandbox: "PTCSandbox", port: int) -> PreviewInfo:
         sandbox.runtime.get_preview_link,
         port,
         retry_policy=RetryPolicy.SAFE,
+        allow_reconnect=wake,
+        retries=5 if wake else 1,
     )
     sandbox._preview_link_cache[port] = result
     return result
@@ -139,24 +145,23 @@ async def start_preview_server(
         else:
             raise
 
-    result = await sandbox._runtime_call(
+    cmd_id = await sandbox._runtime_call(
         sandbox.runtime.session_execute,
         session_id,
         command,
-        run_async=True,
         retry_policy=RetryPolicy.UNSAFE,
         total_timeout=30,
     )
-    sandbox._preview_sessions[port] = (session_id, result.cmd_id)
+    sandbox._preview_sessions[port] = (session_id, cmd_id)
     if owner is not None:
         sandbox._preview_owners[port] = owner
     logger.info(
         "Preview server started",
-        cmd_id=result.cmd_id,
+        cmd_id=cmd_id,
         session_id=session_id,
         port=port,
     )
-    return result.cmd_id
+    return cmd_id
 
 
 async def _is_preview_reachable(sandbox: "PTCSandbox", port: int, *, timeout: float = 3.0) -> bool:
@@ -169,14 +174,12 @@ async def _is_preview_reachable(sandbox: "PTCSandbox", port: int, *, timeout: fl
         """
     import httpx
 
+    from ptc_agent.core.sandbox.preview_probe import head_preview
+
     try:
         link = await sandbox.get_preview_link(port)
         async with httpx.AsyncClient(timeout=timeout) as client:
-            resp = await client.head(
-                link.url,
-                headers=link.auth_headers,
-                follow_redirects=True,
-            )
+            resp = await head_preview(client, link.url, link.auth_headers)
             # 4xx means the server IS running (path not found, etc.)
             # 5xx (especially 502) means the proxy can't reach the backend
             return 200 <= resp.status_code < 500 and resp.status_code != 502

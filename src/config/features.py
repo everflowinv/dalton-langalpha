@@ -67,7 +67,9 @@ FEATURES: dict[str, FeatureSpec] = {
             "Adds a Watch toggle to chat: keep a per-thread list of symbols "
             "whose live quotes stream into the conversation while you work, "
             "so the agent reasons from current intraday prices instead of "
-            "stale lookups."
+            "stale lookups. The agent can also set price targets on a thread, "
+            "a level or a % move. When one is hit, the agent sees the alert in "
+            "the turn it is running, or picks the thread back up if it is idle."
         ),
         enabled=True,
         gate=FeatureGate.OPT_IN,
@@ -75,7 +77,9 @@ FEATURES: dict[str, FeatureSpec] = {
             "Quotes are re-injected into the model's context as they update, "
             "which can occasionally distract the agent from its main task and "
             "invalidate the prompt cache — expect slightly slower, costlier "
-            "turns while a watch list is active."
+            "turns while a watch list is active. A target that hits, or is about "
+            "to lapse, while the thread is idle starts a new turn by itself, "
+            "which costs as much as any turn."
         ),
     ),
     "site_crawl": FeatureSpec(

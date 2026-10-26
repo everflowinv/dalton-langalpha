@@ -1361,6 +1361,121 @@ class TestRequireWorkspaceScope:
 
 
 # ===================================================================
+# Provider gate: a computer on a non-default sandbox provider needs
+# workspace:provider:<kind>; the deployment default is never gated.
+# ===================================================================
+
+
+def _platform_scopes(scopes):
+    """Patches for platform mode with the given cached scope answer."""
+    return (
+        patch(f"{MODULE}.HOST_MODE", "platform"),
+        patch(f"{MODULE}.AUTH_SERVICE_URL", "http://localhost:8003"),
+        patch(f"{MODULE}._get_user_scopes", new_callable=AsyncMock, return_value=scopes),
+    )
+
+
+class TestAssertProviderAllowed:
+    @pytest.mark.asyncio
+    async def test_the_default_kind_is_never_gated(self):
+        mode, url, scopes = _platform_scopes([])
+        with mode, url, scopes as mock_scopes:
+            from src.server.dependencies.usage_limits import assert_provider_allowed
+
+            await assert_provider_allowed("user-1", "daytona", default_kind="daytona")
+            mock_scopes.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_oss_mode_is_noop(self):
+        with (
+            patch(f"{MODULE}.HOST_MODE", "oss"),
+            patch(f"{MODULE}._get_user_scopes", new_callable=AsyncMock) as mock_scopes,
+        ):
+            from src.server.dependencies.usage_limits import assert_provider_allowed
+
+            await assert_provider_allowed("user-1", "e2b", default_kind="daytona")
+            mock_scopes.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_missing_scope_raises_403(self):
+        mode, url, scopes = _platform_scopes(["workspace:spec:max"])
+        with mode, url, scopes:
+            from src.server.dependencies.usage_limits import assert_provider_allowed
+
+            with pytest.raises(HTTPException) as exc:
+                await assert_provider_allowed("user-1", "e2b", default_kind="daytona")
+        assert exc.value.status_code == 403
+        assert exc.value.detail == "Requires scope: workspace:provider:e2b"
+
+    @pytest.mark.asyncio
+    async def test_scope_present_allows(self):
+        mode, url, scopes = _platform_scopes(["workspace:provider:e2b"])
+        with mode, url, scopes:
+            from src.server.dependencies.usage_limits import assert_provider_allowed
+
+            await assert_provider_allowed("user-1", "e2b", default_kind="daytona")
+
+    @pytest.mark.asyncio
+    async def test_unknown_scopes_fail_open(self):
+        mode, url, scopes = _platform_scopes(None)
+        with mode, url, scopes:
+            from src.server.dependencies.usage_limits import assert_provider_allowed
+
+            await assert_provider_allowed("user-1", "e2b", default_kind="daytona")
+
+
+class TestGetProviderAllowances:
+    @pytest.mark.asyncio
+    async def test_oss_mode_reads_the_default_as_allowed_and_others_as_ungated(self):
+        with (
+            patch(f"{MODULE}.HOST_MODE", "oss"),
+            patch(f"{MODULE}._get_user_scopes", new_callable=AsyncMock) as mock_scopes,
+        ):
+            from src.server.dependencies.usage_limits import get_provider_allowances
+
+            allowed = await get_provider_allowances(
+                "user-1", ("daytona", "e2b"), default_kind="daytona"
+            )
+        assert allowed == {"daytona": True, "e2b": None}
+        mock_scopes.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_reads_each_kind_from_the_scopes_once(self):
+        mode, url, scopes = _platform_scopes(["workspace:provider:docker"])
+        with mode, url, scopes as mock_scopes:
+            from src.server.dependencies.usage_limits import get_provider_allowances
+
+            allowed = await get_provider_allowances(
+                "user-1", ("daytona", "e2b", "docker"), default_kind="daytona"
+            )
+        assert allowed == {"daytona": True, "e2b": False, "docker": True}
+        mock_scopes.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_unknown_scopes_read_as_unknown(self):
+        mode, url, scopes = _platform_scopes(None)
+        with mode, url, scopes:
+            from src.server.dependencies.usage_limits import get_provider_allowances
+
+            allowed = await get_provider_allowances(
+                "user-1", ("daytona", "e2b"), default_kind="daytona"
+            )
+        assert allowed == {"daytona": True, "e2b": None}
+
+    @pytest.mark.asyncio
+    async def test_only_the_default_asks_the_platform_nothing(self):
+        mode, url, scopes = _platform_scopes([])
+        with mode, url, scopes as mock_scopes:
+            from src.server.dependencies.usage_limits import get_provider_allowances
+
+            allowed = await get_provider_allowances(
+                "user-1", ("daytona",), default_kind="daytona"
+            )
+        assert allowed == {"daytona": True}
+        mock_scopes.assert_not_awaited()
+
+
+# ===================================================================
 # _get_user_scopes — None (unreachable/omitted) vs a definitive list.
 # ===================================================================
 

@@ -34,9 +34,13 @@ FORK = ForkSpec(from_turn=2, checkpoint_id="ckpt-1", branch_tip="ckpt-tip")
 
 @pytest.fixture(autouse=True)
 def _no_steers_to_keep():
-    """The fork's steer lift reads the cursor; these tests script it for
-    the guards alone."""
+    """The fork's steer lift and the move fence read the cursor; these tests
+    script it for the guards alone."""
     with (
+        patch(
+            "src.server.database.workspace.workspace_is_moving",
+            new=AsyncMock(return_value=False),
+        ),
         patch(
             "src.server.database.runs.lifecycle.lift_fork_steers",
             new=AsyncMock(return_value=([], None)),
@@ -49,7 +53,7 @@ def _no_steers_to_keep():
 def _clean_thread(mock_cursor):
     """No duplicate request_key, a tip still where the fork read it, no live
     root run: the checks the fork path makes before the subagent guard."""
-    mock_cursor.fetchone.side_effect = [{"status": "running"}, None, None]
+    mock_cursor.fetchone.side_effect = [{"workspace_id": "ws-1", "status": "running"}, None, None]
     mock_cursor.rowcount = 1
 
 

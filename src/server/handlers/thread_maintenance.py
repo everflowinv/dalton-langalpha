@@ -9,6 +9,7 @@ reads live in services/cancel_dispatch.py and services/thread_status.py.
 import asyncio
 import logging
 from contextlib import AsyncExitStack, asynccontextmanager
+from functools import partial
 
 from fastapi import HTTPException
 
@@ -93,14 +94,14 @@ async def _resolve_graph_and_state(
         raise HTTPException(
             status_code=500, detail="Agent configuration not initialized"
         )
-    from src.server.app.workspace_sandbox import _set_cached_signed_url
+    from src.server.services.preview_links import cache_tool_preview
 
     graph = await build_ptc_graph_with_session(
         session=session,
         tool_view=workspace_manager.tool_view(session, workspace_id),
         config=effective_config,
         checkpointer=checkpointer,
-        on_signed_url=_set_cached_signed_url,
+        on_signed_url=partial(cache_tool_preview, workspace_id=workspace_id),
     )
 
     # State with timeout, read where the next turn would start, so the write

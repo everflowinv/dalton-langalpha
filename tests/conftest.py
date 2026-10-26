@@ -175,6 +175,7 @@ def mock_computer_manager():
     manager.archive_computer = AsyncMock()
     manager.set_computer_spec = AsyncMock()
     manager.set_computer_always_on = AsyncMock()
+    manager.remove_computer = AsyncMock()
     return manager
 
 

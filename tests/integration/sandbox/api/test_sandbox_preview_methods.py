@@ -82,10 +82,8 @@ class TestStartPreviewServer:
         async def fake_create_session(session_id):
             created_sessions.append(session_id)
 
-        async def fake_session_execute(session_id, command, *, run_async=False, timeout=None):
-            return SessionCommandResult(
-                cmd_id="cmd-001", exit_code=None, stdout="", stderr="",
-            )
+        async def fake_session_execute(session_id, command):
+            return "cmd-001"
 
         sandbox.runtime.create_session = fake_create_session
         sandbox.runtime.session_execute = fake_session_execute
@@ -112,15 +110,10 @@ class TestStartPreviewServer:
         async def fake_delete_session(session_id):
             deleted_sessions.append(session_id)
 
-        async def fake_session_execute(session_id, command, *, run_async=False, timeout=None):
+        async def fake_session_execute(session_id, command):
             nonlocal call_count
             call_count += 1
-            return SessionCommandResult(
-                cmd_id=f"cmd-{call_count:03d}",
-                exit_code=None,
-                stdout="",
-                stderr="",
-            )
+            return f"cmd-{call_count:03d}"
 
         sandbox.runtime.create_session = fake_create_session
         sandbox.runtime.delete_session = fake_delete_session
@@ -151,15 +144,10 @@ class TestStartPreviewServer:
         async def fake_create_session(session_id):
             created_sessions.append(session_id)
 
-        async def fake_session_execute(session_id, command, *, run_async=False, timeout=None):
+        async def fake_session_execute(session_id, command):
             nonlocal call_count
             call_count += 1
-            return SessionCommandResult(
-                cmd_id=f"cmd-{call_count:03d}",
-                exit_code=None,
-                stdout="",
-                stderr="",
-            )
+            return f"cmd-{call_count:03d}"
 
         sandbox.runtime.create_session = fake_create_session
         sandbox.runtime.session_execute = fake_session_execute
@@ -189,10 +177,8 @@ class TestStopPreviewServer:
         async def fake_delete_session(session_id):
             deleted_sessions.append(session_id)
 
-        async def fake_session_execute(session_id, command, *, run_async=False, timeout=None):
-            return SessionCommandResult(
-                cmd_id="cmd-001", exit_code=None, stdout="", stderr="",
-            )
+        async def fake_session_execute(session_id, command):
+            return "cmd-001"
 
         sandbox.runtime.create_session = fake_create_session
         sandbox.runtime.delete_session = fake_delete_session
@@ -222,10 +208,8 @@ class TestGetPreviewServerLogs:
         async def fake_create_session(session_id):
             pass
 
-        async def fake_session_execute(session_id, command, *, run_async=False, timeout=None):
-            return SessionCommandResult(
-                cmd_id="cmd-001", exit_code=None, stdout="", stderr="",
-            )
+        async def fake_session_execute(session_id, command):
+            return "cmd-001"
 
         async def fake_session_command_logs(session_id, cmd_id):
             return SessionCommandResult(
@@ -262,10 +246,8 @@ class TestGetPreviewServerLogs:
         async def fake_create_session(session_id):
             pass
 
-        async def fake_session_execute(session_id, command, *, run_async=False, timeout=None):
-            return SessionCommandResult(
-                cmd_id="cmd-001", exit_code=None, stdout="", stderr="",
-            )
+        async def fake_session_execute(session_id, command):
+            return "cmd-001"
 
         async def fake_session_command_logs(session_id, cmd_id):
             return SessionCommandResult(
@@ -302,9 +284,7 @@ async def _launch(sandbox, command: str = "sleep 999") -> str:
         created.append(session_id)
 
     sandbox.runtime.create_session = fake_create_session
-    sandbox.runtime.session_execute = AsyncMock(
-        return_value=SessionCommandResult(cmd_id="c1", exit_code=None, stdout="", stderr="")
-    )
+    sandbox.runtime.session_execute = AsyncMock(return_value="c1")
     sandbox.runtime.list_sessions = AsyncMock(return_value=[])
 
     result = await sandbox.execute_bash_command(command, background=True)

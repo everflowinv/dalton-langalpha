@@ -4,6 +4,9 @@ Tests build_code_wrapper() and extract_artifacts() from the _chart_capture modul
 which is shared by MemoryRuntime and DockerRuntime.
 """
 
+import subprocess
+import sys
+
 import pytest
 
 from ptc_agent.core.sandbox.providers._chart_capture import (
@@ -57,19 +60,51 @@ class TestBuildCodeWrapper:
         compile(wrapped, "<test>", "exec")
 
     def test_sets_agg_backend(self):
-        """Wrapper should set matplotlib to Agg (non-interactive) backend."""
+        """Wrapper should pick the Agg (non-interactive) backend."""
         wrapped = build_code_wrapper("pass")
-        assert "matplotlib.use('Agg')" in wrapped
+        assert "os.environ['MPLBACKEND'] = 'Agg'" in wrapped
 
     def test_replaces_plt_show(self):
         """Wrapper should replace plt.show with the capture function."""
         wrapped = build_code_wrapper("pass")
         assert "plt.show = _capture_show" in wrapped
 
-    def test_handles_import_error(self):
-        """Wrapper should gracefully handle missing matplotlib (try/except)."""
-        wrapped = build_code_wrapper("pass")
-        assert "except ImportError" in wrapped
+
+class TestWrapperRuns:
+    """The wrapper executed for real, since its import hook is the contract."""
+
+    @staticmethod
+    def _run(tmp_path, code):
+        script = tmp_path / "w.py"
+        script.write_text(build_code_wrapper(code))
+        done = subprocess.run(
+            [sys.executable, str(script)], capture_output=True, text=True, timeout=60
+        )
+        artifacts, stdout = extract_artifacts(done.stdout)
+        return done, artifacts, stdout
+
+    def test_code_that_draws_nothing_never_loads_matplotlib(self, tmp_path):
+        done, artifacts, stdout = self._run(
+            tmp_path, "import sys\nprint('matplotlib' in sys.modules)"
+        )
+        assert done.returncode == 0
+        assert stdout.strip() == "False"
+        assert artifacts == []
+
+    def test_show_after_a_late_pyplot_import_is_captured(self, tmp_path):
+        pytest.importorskip("matplotlib")
+        done, artifacts, stdout = self._run(
+            tmp_path,
+            "import matplotlib\n"
+            "from matplotlib.pyplot import plot, show\n"
+            "print(matplotlib.get_backend())\n"
+            "plot([1, 2]); show()\n"
+            "plot([3, 4]); show()",
+        )
+        assert done.returncode == 0, done.stderr
+        assert stdout.strip().lower() == "agg"
+        assert [a.name for a in artifacts] == ["chart_1.png", "chart_2.png"]
+        assert all(a.type == "image/png" and a.data for a in artifacts)
 
 
 # ---------------------------------------------------------------------------

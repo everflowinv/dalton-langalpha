@@ -11,6 +11,7 @@ from market_protocol import (
     served_display_decimals,
     served_display_unit,
     to_canonical,
+    to_major_units,
 )
 
 T0 = 1_750_000_000_000
@@ -59,6 +60,14 @@ class TestServedUnit:
         # Multiplying by 0.01 would serve 1.2345000000000002.
         bar = _series([_row(open=123.45, close=54.32)], ref=to_canonical("ABC.L")).records[0]
         assert (bar.open, bar.close) == (1.2345, 0.5432)
+
+    def test_pence_shift_in_decimal_and_major_units_pass_untouched(self):
+        # Binary math leaves noise: 120.65 * 0.01 is 1.2065000000000001, 122.1 / 100 is 1.2209999999999999.
+        assert to_major_units(120.65, 2) == 1.2065
+        bar = _series([_row(open=120.65, close=122.1)], ref=to_canonical("ABC.L")).records[0]
+        assert (bar.open, bar.close) == (1.2065, 1.221)
+        noisy = 0.1 + 0.2
+        assert to_major_units(noisy, 0) is noisy
 
     def test_pence_keep_their_decimals_in_pounds(self):
         # GBP shows 2 places; a pence series served in pounds needs 2 more, or 54.32p shows as 0.54.

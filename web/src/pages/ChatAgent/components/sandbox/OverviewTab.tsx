@@ -6,7 +6,7 @@ import { Loader } from '@/components/ui/loader';
 import { useLocale } from '@/hooks/useLocale';
 import { createDateFormatter } from '@/lib/format';
 import type { ComputerStatus } from '@/types/api';
-import { COMPUTER_STATUS_UI, computerStatusUi } from '../computerStatusUi';
+import { COMPUTER_STATUS_UI, PREPARING_UI, computerStatusUi } from '../../utils/computerStatus';
 import type { SandboxStats } from './sandboxTypes';
 
 // The fields Date#toLocaleDateString() prints by default.
@@ -73,17 +73,19 @@ interface OverviewTabProps {
   /** The machine this workspace lives on, when it names one. */
   computerName?: string | null;
   recoverableCreating?: boolean;
+  /** The machine is having its first sandbox built, which reads as one state. */
+  preparing?: boolean;
   /** The workspace's folder on that machine. */
   dirName?: string | null;
 }
 
-export function OverviewTab({ stats, isRunning, actionLoading, refreshing, onStartStop, canStop = true, onRefresh, computerName, dirName, recoverableCreating = false }: OverviewTabProps) {
+export function OverviewTab({ stats, isRunning, actionLoading, refreshing, onStartStop, canStop = true, onRefresh, computerName, dirName, recoverableCreating = false, preparing = false }: OverviewTabProps) {
   const { t } = useTranslation();
   const locale = useLocale();
   const isTransitioning =
     actionLoading || (!!stats.state && !TERMINAL_STATES.has(stats.state) &&
       !(stats.state === 'creating' && recoverableCreating));
-  const stateUi = stateLabelUi(stats.state || 'unknown');
+  const stateUi = preparing && isTransitioning ? PREPARING_UI : stateLabelUi(stats.state || 'unknown');
   const stateLabel = t(stateUi.labelKey, stateUi.fallback ?? '');
   const resourceCards = [
     { icon: Cpu, label: 'CPU', value: stats.resources.cpu != null ? `${stats.resources.cpu} vCPU` : '---' },

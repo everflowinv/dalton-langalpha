@@ -23,6 +23,9 @@ ENV VITE_SUPABASE_URL=${VITE_SUPABASE_URL}
 ENV VITE_SUPABASE_PUBLISHABLE_KEY=${VITE_SUPABASE_PUBLISHABLE_KEY}
 ENV VITE_PLATFORM_URL=${VITE_PLATFORM_URL}
 ENV VITE_CDN_BASE=${VITE_CDN_BASE}
+# Declared without a default or an ENV, so a build that passes nothing still
+# reads the value from web/.env, which an empty variable here would override.
+ARG VITE_PRIVACY_URL
 RUN pnpm run build
 
 FROM alpine:3.20

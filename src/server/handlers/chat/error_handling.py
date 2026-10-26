@@ -257,6 +257,7 @@ async def handle_workflow_error(
     again.
     """
     from src.server.database.runs.subagent_runs import TaskRunSlotBusyError
+    from src.server.database.workspace import WorkspaceMovingError
     from src.server.services.runs.coordinator import (
         AttemptConflictError,
         DuplicateRequestError,
@@ -476,6 +477,7 @@ async def handle_workflow_error(
     # like its siblings, never a workflow failure. StaleForkError is the
     # route's stale_fork refusal arriving late: the branch moved between the
     # route's check and START, which refused before truncating anything.
+    # WorkspaceMovingError is START meeting a move of the thread's workspace.
     if isinstance(
         e,
         (
@@ -484,11 +486,14 @@ async def handle_workflow_error(
             AttemptConflictError,
             StaleForkError,
             qr_db.QueryConflictError,
+            WorkspaceMovingError,
         ),
     ):
         await scope.release_slot()
         if isinstance(e, (RunSlotBusyError, TaskRunSlotBusyError)):
             detail = admission_conflict_detail("running")
+        elif isinstance(e, WorkspaceMovingError):
+            detail = admission_conflict_detail("workspace_moving")
         elif isinstance(e, StaleForkError):
             from src.server.handlers.checkpoint_handler import stale_fork_detail
 

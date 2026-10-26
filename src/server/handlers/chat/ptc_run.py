@@ -643,7 +643,7 @@ async def astream_ptc_workflow(
         # Build graph with the workspace's session
         # Note: agent.md is injected by the runtime-context baseline middleware
         # on every model call, ensuring it's always the latest content.
-        from src.server.app.workspace_sandbox import _set_cached_signed_url
+        from src.server.services.preview_links import cache_tool_preview
         from src.server.services.egress.direct_tools import (
             bind_direct_mcp_tools,
             direct_tools_for_turn,
@@ -655,15 +655,6 @@ async def astream_ptc_workflow(
         # folder's skills, and the run's own task binds it for the path layer.
         project = await _resolve_project(session, workspace_id)
 
-        async def cache_workspace_preview(
-            preview_sandbox_id: str, port: int, signed_url: str
-        ) -> None:
-            await _set_cached_signed_url(
-                preview_sandbox_id,
-                port,
-                signed_url,
-                owner_workspace_id=workspace_id,
-            )
         # Frozen for this project at acquire; the session's own MCP fields are
         # whichever sibling on the machine resolved last.
         tool_view = workspace_manager.tool_view(session, workspace_id)
@@ -703,7 +694,7 @@ async def astream_ptc_workflow(
             user_profile=user_profile,
             thread_id=thread_id,
             store=setup.store,
-            on_signed_url=cache_workspace_preview,
+            on_signed_url=partial(cache_tool_preview, workspace_id=workspace_id),
             direct_mcp=direct_mcp,
             order_ledger=order_ledger,
             turn_context=turn_context,
@@ -887,6 +878,7 @@ async def astream_ptc_workflow(
             agent_config=config,
             report_source=query_metadata.get("report_source"),
             turn_index=run_handle.turn_index,
+            market_target=query_metadata.get("market_target"),
         )
 
         # =====================================================================

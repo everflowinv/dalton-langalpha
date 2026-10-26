@@ -221,13 +221,15 @@ def _our_failure(e: BaseException) -> bool:
     """An outage of ours rather than the automation's failure.
 
     The credit gate's 503 is its fail-closed answer when the quota service
-    gives no verdict, a burst or unavailable 429 is our capacity, and an
-    unavailable writer guard is the checkpoint store. A usage limit is not
-    here either: it is ``_limit_message``'s, and never a strike.
+    gives no verdict, a burst or unavailable 429 is our capacity, an
+    unavailable writer guard is the checkpoint store, and a workspace moving
+    to another computer is its owner's doing, not the automation's. A usage
+    limit is not here either: it is ``_limit_message``'s, and never a strike.
     """
+    from src.server.database.workspace import WorkspaceMovingError
     from src.server.services.writer_guard import WriterGuardUnavailable
 
-    if isinstance(e, WriterGuardUnavailable):
+    if isinstance(e, (WriterGuardUnavailable, WorkspaceMovingError)):
         return True
     if not isinstance(e, HTTPException):
         return False

@@ -14,6 +14,7 @@ import { useIsMobile } from './hooks/useIsMobile';
 import { useLocale } from './hooks/useLocale';
 import { useSetupGate } from './hooks/useSetupGate';
 import { isPlatformMode, APP_ENTRY_PATH } from './config/hostMode';
+import { PRIVACY_URL } from './config/supportLinks';
 import { AUTH_BROADCAST_CHANNEL, type AuthBroadcastMessage } from './lib/oauthPopup';
 import { inAppPath } from './lib/inAppPath';
 import { OnboardingProvider, OnboardingHostGate, OnboardingConnectHost } from './pages/Onboarding';
@@ -36,7 +37,6 @@ const LoginPage = React.lazy(() => import('./pages/Login/LoginPage'));
 // — into the entry chunk that every visitor loads before login.
 const SharePage = lazyWithMotion(() => import('./pages/SharedChat/SharePage'));
 const SetupWizard = lazyWithMotion(() => import('./pages/Setup/SetupWizard'));
-const PrivacyPolicy = React.lazy(() => import('./pages/Legal/PrivacyPolicy'));
 const Legal = React.lazy(() => import('./pages/Legal/Legal'));
 const ResetPassword = React.lazy(() => import('./pages/Login/ResetPassword'));
 // DALTON-HOOK(invite-signup): public invite redemption page (/invite#<token>)
@@ -188,6 +188,12 @@ function RootRedirect() {
     return null;
   }
   return <Navigate to="/dashboard" replace />;
+}
+
+/** Leaves the app for an address outside it, without a history entry to come back to. */
+function ExternalRedirect({ to }: { to: string }) {
+  window.location.replace(to);
+  return null;
 }
 
 /** Legacy shared-host entry path — sends stale /app links to the root entry. */
@@ -400,11 +406,9 @@ function App() {
           <SharePage />
         </Suspense>
       } />
-      <Route path="/privacy" element={
-        <Suspense fallback={<PageLoading />}>
-          <PrivacyPolicy />
-        </Suspense>
-      } />
+      {/* The policy is published at its own address; links made to this path
+          still reach it. */}
+      {PRIVACY_URL && <Route path="/privacy" element={<ExternalRedirect to={PRIVACY_URL} />} />}
       <Route path="/legal" element={
         <Suspense fallback={<PageLoading />}>
           <Legal />

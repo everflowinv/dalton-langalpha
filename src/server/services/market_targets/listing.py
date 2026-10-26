@@ -1,0 +1,66 @@
+"""Which listing a market-watch target is on, and the names it goes by.
+
+A target is read by a price automation's rules, so it names what an alert
+on the same symbol would: a caret spelling or a known index family (SPX,
+GSPC) is the index, and any other bare spelling is the stock. It is stored
+under the key the price monitor reads prices by (``^GSPC`` is ``SPX``) and
+watched under the caret spelling the live feed reads as the same index, so
+the feed, the stored row and the thread API all name one listing.
+"""
+
+from typing import NamedTuple, Optional, Tuple
+
+from market_protocol import AssetClass, to_legacy_api
+
+from src.data_client.ginlix_data.data_source import index_ticker
+from src.server.models.automation import MarketType, bare_alert_listing, is_pair_symbol
+from src.server.services.price_monitor import watched_listing, watched_market
+
+UNREADABLE = "the price monitor cannot read this symbol"
+
+
+class TargetListing(NamedTuple):
+    key: str  # as stored and read by the price monitor
+    market: MarketType
+    watch: str  # the watch-list spelling of the same listing
+
+
+def watch_spelling(key: str, market: MarketType) -> str:
+    """The watch-list spelling of a stored target.
+
+    The live feed reads a bare spelling as the stock, so an index is
+    watched by its caret spelling.
+    """
+    if market is not MarketType.INDEX:
+        return key
+    ref = watched_listing(key, market)
+    if ref is None:
+        return key
+    return "^" + to_legacy_api(ref).removeprefix("^")
+
+
+def target_listing(symbol: str) -> Tuple[Optional[TargetListing], Optional[str]]:
+    """The listing a target on a display-spelled *symbol* is on, or why the
+    price monitor cannot watch it."""
+    if is_pair_symbol(symbol):
+        return None, "a crypto, currency or futures symbol; the price monitor cannot watch those"
+    if symbol.startswith("^"):
+        key, market = index_ticker(symbol).removeprefix("I:"), MarketType.INDEX
+    else:
+        key, market = bare_alert_listing(symbol)
+    ref = watched_listing(key, market)
+    if ref is None or ref.asset_class in (AssetClass.FX, AssetClass.CRYPTO):
+        return None, UNREADABLE
+    watch = watch_spelling(key, market)
+    if market is MarketType.INDEX:
+        # The feed must read the watch spelling as this very index, or the
+        # prices beside the target would be another listing's.
+        seen = watched_listing(watch, MarketType.STOCK)
+        if seen is None or (seen.index_family, seen.calendar_id) != (
+            ref.index_family,
+            ref.calendar_id,
+        ):
+            return None, UNREADABLE
+    if watched_market(key, market) == "other":
+        return None, "an exchange suffix the price monitor does not know, so it would never be checked"
+    return TargetListing(key, market, watch), None

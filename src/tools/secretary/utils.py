@@ -3,6 +3,8 @@
 import json
 import logging
 import re
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
 from datetime import datetime, timezone as dt_timezone
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -379,6 +381,56 @@ def user_zone(name: str) -> ZoneInfo:
         return ZoneInfo(name)
     except Exception:  # noqa: BLE001 - an unknown zone reads as UTC
         return ZoneInfo("UTC")
+
+
+def computer_label(name: str | None, computers: int) -> str | None:
+    """What an agent is told a computer is called, out of ``computers`` live ones.
+
+    Which computer a workspace is on tells an agent something only once the
+    user has another it could be on, so a user with one sees no computer named.
+    """
+    if name is None or computers < 2:
+        return None
+    return name.strip() or "Untitled"
+
+
+@dataclass(frozen=True, slots=True)
+class ComputerPlacement:
+    """Which computer each of the user's workspaces is on, as the Chief of Staff is told.
+
+    A folder is named only on Home's computer, the one whose folders the Chief
+    of Staff reads: a workspace on another computer keeps its folder there, so
+    naming it would send a read or a link to a path Home lacks.
+    """
+
+    home_computer_id: str | None = None
+    names: Mapping[str, str] = field(default_factory=dict)
+
+    @classmethod
+    def from_rows(cls, rows: Sequence[Mapping[str, Any]]) -> "ComputerPlacement":
+        names = {
+            str(row["computer_id"]): label
+            for row in rows
+            if (label := computer_label(row["name"], len(rows))) is not None
+        }
+        home = next((str(row["computer_id"]) for row in rows if row["is_home"]), None)
+        return cls(home_computer_id=home, names=names)
+
+    def folder(self, workspace: Mapping[str, Any]) -> str | None:
+        # With Home on no computer nothing matches, since str() is never None.
+        if str(workspace.get("computer_id")) != self.home_computer_id:
+            return None
+        return workspace.get("dir_name")
+
+    def computer(self, workspace: Mapping[str, Any]) -> str | None:
+        return self.names.get(str(workspace.get("computer_id")))
+
+
+async def read_computer_placement(user_id: str) -> ComputerPlacement:
+    # Local import: this module loads at agent import time.
+    from src.server.database.computer import get_computer_names_and_home
+
+    return ComputerPlacement.from_rows(await get_computer_names_and_home(user_id))
 
 
 def _run_block(run: dict[str, Any], text: str, zone: ZoneInfo) -> str:

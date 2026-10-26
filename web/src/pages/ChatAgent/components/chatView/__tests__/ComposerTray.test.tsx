@@ -7,6 +7,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { act, cleanup, render, screen, fireEvent } from '@testing-library/react';
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router';
 import { RouteLeaveGuardContext, type RouteLeaveGuard } from '../../../contexts/RouteLeaveGuardContext';
+import type { MarketTarget } from '../../../utils/api';
 import type { RosterTask } from '../delegatedWork';
 import { ComposerTray } from '../ComposerTray';
 import { trayWorking, type TrayContents } from '../useTrayContents';
@@ -53,6 +54,24 @@ function renderTray(
   );
 }
 
+// Neutral placeholder tickers and made-up levels only.
+function target(over: Partial<MarketTarget>): MarketTarget {
+  return {
+    target_id: 'tg-1',
+    symbol: 'NVDA',
+    kind: 'above',
+    value: 205,
+    pct_from: null,
+    armed_price: null,
+    status: 'armed',
+    expires_at: '2030-01-02T00:00:00Z',
+    fired_at: null,
+    fired_price: null,
+    created_at: '2030-01-01T00:00:00Z',
+    ...over,
+  };
+}
+
 function task(id: string, description: string, running = true): RosterTask {
   return { id, name: `Task-${id}`, description, isMainAgent: false, status: running ? 'active' : 'completed', running };
 }
@@ -77,6 +96,25 @@ describe('ComposerTray', () => {
     expect(label).toHaveAttribute('role', 'status');
     expect(label).toHaveAttribute('aria-live', 'polite');
     expect(label.closest('button')).not.toHaveAttribute('role');
+  });
+
+  it('shows armed targets beside their symbol', () => {
+    renderTray({
+      watch: {
+        symbols: ['NVDA', 'AAPL'],
+        targets: [
+          target({ target_id: 'a' }),
+          target({ target_id: 'b', kind: 'below', value: 190.5 }),
+          target({ target_id: 'c', symbol: 'TSLA', kind: 'pct_down', value: 3, pct_from: 'previous_close' }),
+        ],
+      },
+    });
+    expect(screen.getByText('Watching NVDA · ≥ 205 / ≤ 190.5, AAPL, TSLA · -3%')).toBeInTheDocument();
+  });
+
+  it('names armed targets with no live-stamped symbol', () => {
+    renderTray({ watch: { symbols: [], targets: [target({ kind: 'pct_up', value: 2.5, pct_from: 'now' })] } });
+    expect(screen.getByText('Watching NVDA · +2.5%')).toBeInTheDocument();
   });
 
   it('names when the watch last updated', () => {

@@ -12,12 +12,15 @@ Endpoints:
 - GET /api/v1/workspaces/{workspace_id} - Get workspace details
 - PUT /api/v1/workspaces/{workspace_id} - Update workspace
 - POST /api/v1/workspaces/{workspace_id}/start - Start stopped workspace
+- POST /api/v1/workspaces/{workspace_id}/move - Move to another computer
+- GET /api/v1/workspaces/{workspace_id}/move - Latest move and its outcome
+- POST /api/v1/workspaces/{workspace_id}/move/cancel - Cancel a move
 - DELETE /api/v1/workspaces/{workspace_id} - Delete workspace
 """
 
 import contextlib
 import logging
-from typing import Literal
+from typing import Literal, Optional
 
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import Response, StreamingResponse
@@ -41,6 +44,10 @@ from src.server.database.workspace_names import (
     WorkspaceNameTaken,
 )
 from src.server.database.home_workspace import is_home_row, is_unbound
+from src.server.database.workspace_move import (
+    cancel_workspace_move as db_cancel_workspace_move,
+    get_latest_workspace_move,
+)
 from src.server.database.workspace import (
     get_workspace as db_get_workspace,
     get_workspaces_for_user,
@@ -60,6 +67,13 @@ from src.server.models.workspace import (
     WorkspaceUpdate,
 )
 from src.server.models.computer import CLAIMABLE_FOR_START
+from src.server.models.workspace_move import WorkspaceMoveOut, WorkspaceMoveRequest
+from src.server.app.computers import accept_workspace_move
+from src.server.services.workspace_move import move_error_detail, move_from_row
+from src.server.services.computer_errors import (
+    ComputerNotFoundError,
+    ComputerPreparingError,
+)
 from ptc_agent.core.sandbox.runtime import SandboxGoneError, SandboxTransientError
 from src.server.utils.error_sanitization import sandbox_unreachable_detail
 from src.server.models.workspace_refresh import WorkspaceRefreshResponse
@@ -176,7 +190,9 @@ async def create_workspace(
     Returns as soon as the row is written: the workspace is bound to the
     user's computer and owns a folder on it, and the machine itself is brought
     up by the first turn (or an explicit start), so nothing here waits on a
-    sandbox. A user with no computer yet gets one.
+    sandbox. A user with no computer yet gets one. ``computer_id`` picks one
+    of the caller's computers instead of their primary; any other id answers
+    404, whoever owns it.
 
     Adding a folder is not capacity-checked. Allocating the first computer
     enforces the same machine limit as explicit computer creation.
@@ -195,6 +211,7 @@ async def create_workspace(
             name=request.name,
             description=request.description,
             config=request.config,
+            computer_id=str(request.computer_id) if request.computer_id else None,
         )
 
         logger.info(
@@ -206,6 +223,12 @@ async def create_workspace(
         raise
     except (WorkspaceNameTaken, WorkspaceNameInvalid) as e:
         raise _name_error(e) from None
+    except ComputerNotFoundError:
+        raise HTTPException(status_code=404, detail="Computer not found") from None
+    except ComputerPreparingError as e:
+        raise HTTPException(
+            status_code=409, detail={"code": "computer_preparing", "message": str(e)}
+        ) from None
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -337,13 +360,17 @@ async def workspace_status_events(workspace_id: str, x_user_id: CurrentUserId):
     )
 
     def _frame(
-        status: str, sandbox_state: str | None = None, error: str | None = None
+        status: str,
+        sandbox_state: str | None = None,
+        error: str | None = None,
+        stage: str | None = None,
     ) -> str:
         return sse_status_event(
             {"workspace_id": workspace_id, "computer_id": computer_id},
             status,
             sandbox_state,
             error,
+            stage,
         )
 
     async def _read_status() -> str | None:
@@ -778,6 +805,55 @@ async def duplicate_workspace(
             f"{new_workspace['workspace_id']} for user {x_user_id}"
         )
         return _workspace_to_response(new_workspace)
+
+
+@router.post(
+    "/{workspace_id}/move", response_model=WorkspaceMoveOut, status_code=202
+)
+async def move_workspace(
+    workspace_id: str,
+    request: WorkspaceMoveRequest,
+    x_user_id: CurrentUserId,
+):
+    """Accept a move to another of the owner's computers and run it after answering.
+
+    Copying a folder outlasts a request, so the refusals a client can act on
+    are answered here as a 409 ``{code, message}`` and the outcome is read
+    back from ``GET /{workspace_id}/move``. Home moves only by making its
+    computer primary.
+    """
+    workspace = await db_get_workspace(workspace_id)
+    require_workspace_owner(workspace, user_id=x_user_id)
+    return await accept_workspace_move(x_user_id, workspace_id, request.computer_id)
+
+
+@router.get("/{workspace_id}/move", response_model=Optional[WorkspaceMoveOut])
+async def get_workspace_move(workspace_id: str, x_user_id: CurrentUserId):
+    """The workspace's latest move, null when it has never moved."""
+    workspace = await db_get_workspace(workspace_id)
+    require_workspace_owner(workspace, user_id=x_user_id)
+    return move_from_row(await get_latest_workspace_move(workspace_id))
+
+
+@router.post("/{workspace_id}/move/cancel", response_model=WorkspaceMoveOut)
+async def cancel_workspace_move(workspace_id: str, x_user_id: CurrentUserId):
+    """Cancel a move before it sets the folder aside; an ended move answers as it ended.
+
+    Past that point the move finishes or puts the folder back on its own, so
+    a cancel then is a 409 ``not_cancellable``.
+    """
+    workspace = await db_get_workspace(workspace_id)
+    require_workspace_owner(workspace, user_id=x_user_id)
+    cancelled = await db_cancel_workspace_move(workspace_id, x_user_id)
+    if cancelled is not None:
+        logger.info(f"Cancelled move {cancelled['move_id']} of workspace {workspace_id}")
+        return move_from_row(cancelled)
+    latest = move_from_row(await get_latest_workspace_move(workspace_id))
+    if latest is None:
+        raise HTTPException(status_code=404, detail=move_error_detail("not_found"))
+    if latest.phase in ("done", "failed", "cancelled"):
+        return latest
+    raise HTTPException(status_code=409, detail=move_error_detail("not_cancellable"))
 
 
 @router.post("/{workspace_id}/refresh", response_model=WorkspaceRefreshResponse)

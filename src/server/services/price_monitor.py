@@ -2,10 +2,14 @@
 PriceMonitorService — Monitors prices via MarketDataFeed
 and triggers price-based automations when conditions are met.
 
+Also watches the price targets threads set on their market watch: a hit is
+claimed in the database, which is the only dedup a target has, and the claim
+enqueues the alert for the outbox to deliver.
+
 Supports stock and index markets. Uses Redis SET NX locks for
-multi-instance deduplication. Falls back to REST snapshot polling when WS is
-disconnected, and polls non-US symbols while their venue's session runs, since
-the live-data WebSocket carries US venues only.
+multi-instance deduplication of automations. Falls back to REST snapshot
+polling when WS is disconnected, and polls non-US symbols while their venue's
+session runs, since the live-data WebSocket carries US venues only.
 """
 
 import asyncio
@@ -13,9 +17,10 @@ import logging
 import math
 import numbers
 import time
+import uuid
 from datetime import datetime, timezone
 from functools import lru_cache
-from typing import Any, Dict, List, Optional
+from typing import Any, Collection, Dict, List, Optional, Tuple
 
 from market_protocol import (
     AssetClass,
@@ -43,6 +48,11 @@ _POLL_INTERVAL = 30  # seconds — REST fallback polling
 _REFERENCE_REFRESH_INTERVAL = 300  # seconds — refresh reference prices
 _ONE_SHOT_DEDUP_TTL = 300  # seconds — must exceed _REFRESH_INTERVAL to avoid re-trigger races
 _MIN_TRADING_DAY_TTL = 300  # 5 min floor for trading-day TTL
+_TARGET_SWEEP_INTERVAL = 30  # seconds: claim due warnings, close lapsed targets
+_TARGET_WARNING_BATCH = 100
+_TARGET_RELOAD_DEBOUNCE = 1.0  # seconds: coalesce a burst of change nudges
+_TARGET_SIGNAL_POLL = 5.0  # seconds: get_message window, bounds how fast stop is seen
+_TARGET_SIGNAL_RETRY = 5.0  # seconds: before resubscribing to the change channel
 
 # Service-account identity for background service-to-service data calls.
 # Matches the principal the live-data WS stream already sends so both
@@ -56,6 +66,15 @@ _SERVICE_USER_ID = "langalpha-service"
 _DISPLAY_TO_BARE: Dict[str, str] = {
     display: wire.removeprefix("I:") for display, wire in INDEX_TICKERS.items()
 }
+# The reverse, for a snapshot request: the data service answers an index by
+# its display spelling. Asked for bare ``COMP`` it returns no row at all, and
+# bare ``SPX`` only reaches a fallback vendor.
+_BARE_TO_DISPLAY: Dict[str, str] = {bare: display for display, bare in _DISPLAY_TO_BARE.items()}
+
+# A bare symbol and the market it is read in, which is what names a listing:
+# HSI is a US ticker as a stock and the Hang Seng as an index, so anything
+# keyed by the bare symbol alone lets one stand in for the other.
+Listing = Tuple[str, MarketType]
 
 
 def _to_ws_symbol(symbol: str, market: MarketType) -> str:
@@ -77,9 +96,71 @@ def _from_display_symbol(symbol: str) -> str:
     return _DISPLAY_TO_BARE.get(symbol, symbol)
 
 
+def _target_symbol(symbol: str, market: MarketType) -> str:
+    """The bare key a target is watched under: the spelling its ticks and
+    snapshot rows read back as.
+
+    A target keeps the watch list's spelling, where a caret marks an index
+    (``^GSPC``). The feed names that index ``I:SPX`` and a snapshot row
+    ``GSPC``, both of which read back as ``SPX``, so keyed as stored it would
+    never meet its own price.
+    """
+    spelled = display_spelling(symbol).upper()
+    if market == MarketType.INDEX:
+        return _from_display_symbol(spelled.lstrip("^"))
+    return spelled
+
+
+def _targets_by_listing(rows: List[Dict[str, Any]]) -> Dict[Listing, List[Dict[str, Any]]]:
+    """Armed target rows by the listing they are watched under, each marked
+    with that listing and the epoch ms it was set at."""
+    by_listing: Dict[Listing, List[Dict[str, Any]]] = {}
+    for row in rows:
+        try:
+            market = MarketType(row["market"])
+        except ValueError:
+            logger.warning(
+                "[PriceMonitor] Unknown market %r on target %s",
+                row.get("market"), row.get("target_id"),
+            )
+            continue
+        listing = (_target_symbol(str(row["symbol"]), market), market)
+        row["_listing"] = listing
+        # Whole epoch ms, as ticks and snapshot rows stamp their prints,
+        # so a print in the millisecond the target was set counts.
+        row["_created_ms"] = int(row["created_at"].timestamp() * 1000)
+        by_listing.setdefault(listing, []).append(row)
+    return by_listing
+
+
+def _thread_key(value: Any) -> Optional[str]:
+    """*value* spelled as a target row spells its thread id, or None when it
+    names no thread (no payload, or text that is not an id), which asks for
+    a re-read of every thread."""
+    if isinstance(value, (bytes, bytearray)):
+        value = value.decode("utf-8", "replace")
+    if value is None:
+        return None
+    try:
+        return str(uuid.UUID(str(value)))
+    except ValueError:
+        return None
+
+
 def _now_utc() -> datetime:
     """Return current UTC time. Extracted for testability."""
     return datetime.now(timezone.utc)
+
+
+def _nudge_hook_drainer() -> None:
+    """Post-commit hint that a notice was enqueued; the drainer's poll in
+    every worker is what delivers it, so a failed nudge is not an error."""
+    try:
+        from src.server.services.hook_outbox import HookOutboxDrainer
+
+        HookOutboxDrainer.get_instance().nudge()
+    except Exception:
+        logger.debug("[PriceMonitor] hook drainer nudge failed", exc_info=True)
 
 
 def _positive(value: Any) -> Optional[float]:
@@ -172,50 +253,96 @@ def _seconds_until_next_market_open(
 
 async def _fetch_snapshots(
     provider, stock_syms: List[str], index_syms: List[str],
-) -> List[tuple[str, dict]]:
-    """``(bare symbol, snapshot)`` for every row either market returned.
+    user_id: str = _SERVICE_USER_ID,
+) -> List[Tuple[Listing, dict]]:
+    """``((bare symbol, market), snapshot)`` for every row either market returned.
 
     The two calls are independent, so one failing costs only its own rows.
-    Index rows come back in display spelling (``GSPC``) and are mapped to the
-    bare symbol an automation is keyed on (``SPX``). A row keeps the spelling
-    of the provider that served it, so a fallback vendor's ``600519.SS`` is
-    respelled to the ``600519.SH`` an automation is keyed on.
+    A row's market is the call that returned it, since both answer HSI as
+    ``HSI``. Index rows come back in display spelling (``GSPC``) and are
+    mapped to the bare symbol an automation is keyed on (``SPX``). A row
+    keeps the spelling of the provider that served it, so a fallback vendor's
+    ``600519.SS`` is respelled to the ``600519.SH`` an automation is keyed on.
     """
     async def _fetch(symbols: List[str], asset_type: str) -> list[dict]:
         if not symbols:
             return []
         try:
             return await provider.get_snapshots(
-                symbols, asset_type=asset_type, user_id=_SERVICE_USER_ID
+                symbols, asset_type=asset_type, user_id=user_id
             )
         except Exception:
             logger.debug("[PriceMonitor] %s snapshot fetch failed", asset_type, exc_info=True)
             return []
 
     stocks, indices = await asyncio.gather(
-        _fetch(stock_syms, "stocks"), _fetch(index_syms, "indices")
+        _fetch(stock_syms, "stocks"),
+        _fetch([_BARE_TO_DISPLAY.get(s, s) for s in index_syms], "indices"),
     )
-    pairs = [(display_spelling(str(snap.get("symbol") or "")), snap) for snap in stocks]
+    def _spelled(snap: dict) -> str:
+        return display_spelling(str(snap.get("symbol") or ""))
+
+    pairs = [((_spelled(snap), MarketType.STOCK), snap) for snap in stocks]
     pairs += [
-        (_from_display_symbol(display_spelling(str(snap.get("symbol") or ""))), snap)
-        for snap in indices
+        ((_from_display_symbol(_spelled(snap)), MarketType.INDEX), snap) for snap in indices
     ]
-    return [(sym, snap) for sym, snap in pairs if sym]
+    return [(listing, snap) for listing, snap in pairs if listing[0]]
+
+
+async def listing_snapshots(
+    provider, listings: Collection[Listing], user_id: str = _SERVICE_USER_ID,
+) -> Dict[Listing, dict]:
+    """Snapshots by the listing the monitor reads prices by, fetched as it
+    fetches its reference prices.
+
+    Whatever previews a level for an alert must measure from the row the
+    monitor will: an index fetched as a stock comes from another vendor,
+    whose previous close can still be a session behind before the open.
+    """
+    stock_syms = sorted({key for key, market in listings if market is not MarketType.INDEX})
+    index_syms = sorted({key for key, market in listings if market is MarketType.INDEX})
+    return dict(await _fetch_snapshots(provider, stock_syms, index_syms, user_id=user_id))
+
+
+_TARGET_CONDITIONS: Dict[str, PriceConditionType] = {
+    "above": PriceConditionType.PRICE_ABOVE,
+    "below": PriceConditionType.PRICE_BELOW,
+    "pct_up": PriceConditionType.PCT_CHANGE_ABOVE,
+    "pct_down": PriceConditionType.PCT_CHANGE_BELOW,
+}
+
+
+def _pct_crossed(
+    condition_type: str,
+    value: float,
+    ref_price: float,
+    current_price: float,
+    *,
+    inclusive: bool = False,
+) -> bool:
+    """A % condition against *ref_price*; no reference (0) never crosses.
+    ``inclusive`` also counts a move that lands exactly on *value*."""
+    if ref_price <= 0:
+        return False
+    pct_change = ((current_price - ref_price) / ref_price) * 100
+    if condition_type == PriceConditionType.PCT_CHANGE_ABOVE:
+        return pct_change >= value if inclusive else pct_change > value
+    return pct_change <= -value if inclusive else pct_change < -value
 
 
 class ConditionEvaluator:
     """Evaluates price conditions against current prices."""
 
     def __init__(self):
-        # symbol → {previous_close, day_open}
-        self._reference_prices: Dict[str, Dict[str, float]] = {}
+        # listing → {previous_close, day_open}
+        self._reference_prices: Dict[Listing, Dict[str, float]] = {}
 
     def set_reference(
-        self, symbol: str, previous_close: Optional[float], day_open: Optional[float]
+        self, listing: Listing, previous_close: Optional[float], day_open: Optional[float]
     ) -> None:
         # A reference a row left null reads as missing (0), which evaluate
         # already treats as no reference, instead of failing every compare.
-        self._reference_prices[symbol] = {
+        self._reference_prices[listing] = {
             "previous_close": _positive(previous_close) or 0.0,
             "day_open": _positive(day_open) or 0.0,
         }
@@ -226,7 +353,7 @@ class ConditionEvaluator:
         value: float,
         reference: str,
         current_price: float,
-        symbol: str,
+        listing: Listing,
     ) -> bool:
         """Evaluate a single condition. Returns True if condition is met."""
         if condition_type == PriceConditionType.PRICE_ABOVE:
@@ -237,45 +364,60 @@ class ConditionEvaluator:
             PriceConditionType.PCT_CHANGE_ABOVE,
             PriceConditionType.PCT_CHANGE_BELOW,
         ):
-            ref_prices = self._reference_prices.get(symbol)
+            ref_prices = self._reference_prices.get(listing)
             if not ref_prices:
                 return False
-            ref_price = ref_prices.get(reference, 0)
-            if ref_price <= 0:
-                return False
-            pct_change = ((current_price - ref_price) / ref_price) * 100
-            if condition_type == PriceConditionType.PCT_CHANGE_ABOVE:
-                return pct_change > value
-            else:
-                return pct_change < -value
+            return _pct_crossed(
+                condition_type, value, ref_prices.get(reference, 0), current_price
+            )
         return False
 
-    async def refresh_references(
-        self,
-        symbols: List[str],
-        symbol_markets: Optional[Dict[str, MarketType]] = None,
-    ) -> None:
-        """Fetch reference prices (previous_close, day_open) via REST snapshots.
+    def evaluate_target(
+        self, target: Dict[str, Any], current_price: float, listing: Listing
+    ) -> bool:
+        """Whether a market-watch target is hit at *current_price*.
 
-        Splits symbols by market type for correct asset_type routing.
+        A target's kind is an automation condition under another name, but a
+        touch hits it where an automation needs a cross: the tool promises an
+        alert when the price reaches the level and refuses to arm one the
+        last price already sits on, so a print exactly on it is the hit. A %
+        target set ``pct_from='armed'`` measures from the price the target
+        was set at, not from the previous close.
         """
-        if not symbols:
+        condition_type = _TARGET_CONDITIONS.get(target.get("kind"))
+        value = _positive(target.get("value"))
+        if condition_type is None or value is None:
+            return False
+        if condition_type == PriceConditionType.PRICE_ABOVE:
+            return current_price >= value
+        if condition_type == PriceConditionType.PRICE_BELOW:
+            return current_price <= value
+        if target.get("pct_from") == "armed":
+            ref_price = _positive(target.get("armed_price")) or 0.0
+        else:
+            ref_price = self._reference_prices.get(listing, {}).get("previous_close", 0.0)
+        return _pct_crossed(
+            condition_type, value, ref_price, current_price, inclusive=True
+        )
+
+    async def refresh_references(self, listings: Collection[Listing]) -> None:
+        """Fetch reference prices (previous_close, day_open) via REST snapshots."""
+        if not listings:
             return
         try:
             from src.data_client import get_market_data_provider
 
             provider = await get_market_data_provider()
-            markets = symbol_markets or {}
-            index_syms = [s for s in symbols if markets.get(s) == MarketType.INDEX]
-            stock_syms = [s for s in symbols if markets.get(s) != MarketType.INDEX]
             from src.dalton.autonomy.price_trigger import refresh_dalton_reference_if_needed  # DALTON-HOOK(stock-move-upgrade)
-            for sym, snap in await _fetch_snapshots(provider, stock_syms, index_syms):
+
+            for listing, snap in (await listing_snapshots(provider, listings)).items():
                 self.set_reference(
-                    sym,
+                    listing,
                     previous_close=snap.get("previous_close"),
                     day_open=snap.get("open"),
                 )
-                refresh_dalton_reference_if_needed(self, sym, snap, markets.get(sym), _now_utc())  # DALTON-HOOK(stock-move-upgrade)
+                bare, market = listing
+                refresh_dalton_reference_if_needed(self, bare, snap, market, _now_utc())  # DALTON-HOOK(stock-move-upgrade)
         except Exception:
             logger.warning("Failed to refresh reference prices", exc_info=True)
 
@@ -305,10 +447,16 @@ class PriceMonitorService:
         self._evaluator._service = self  # DALTON-HOOK(stock-move-upgrade)
         self._dalton_move_refs: Dict[str, Dict[str, Any]] = {}  # DALTON-HOOK(stock-move-upgrade)
 
-        # bare symbol → [automation dicts]  (keyed by user-entered symbol)
-        self._symbol_automations: Dict[str, List[Dict[str, Any]]] = {}
-        # bare symbol → MarketType  (for routing REST calls)
-        self._symbol_markets: Dict[str, MarketType] = {}
+        # listing → [automation dicts]  (keyed by user-entered symbol)
+        self._symbol_automations: Dict[Listing, List[Dict[str, Any]]] = {}
+        # listing → [armed target rows]; a copy of the table as of the
+        # last load, which the database claim in fire_targets always overrules
+        self._symbol_targets: Dict[Listing, List[Dict[str, Any]]] = {}
+        # listings per source as of its last load, and merged (what the feeds
+        # and the REST poll read)
+        self._automation_listings: set[Listing] = set()
+        self._target_listings: set[Listing] = set()
+        self._listings: set[Listing] = set()
         # ws_symbol sets per market (for WS subscription diffing)
         self._stock_ws_symbols: set[str] = set()
         self._index_ws_symbols: set[str] = set()
@@ -322,12 +470,23 @@ class PriceMonitorService:
         self._refresh_task: Optional[asyncio.Task] = None
         self._poll_task: Optional[asyncio.Task] = None
         self._ref_refresh_task: Optional[asyncio.Task] = None
+        self._target_sweep_task: Optional[asyncio.Task] = None
+        self._target_signal_task: Optional[asyncio.Task] = None
+        self._target_reload_task: Optional[asyncio.Task] = None
         self._shutdown_event = asyncio.Event()
 
+        # Loads of either kind diff the same subscription sets, and two
+        # target loads must not land out of order, so loads take turns.
+        self._load_lock = asyncio.Lock()
+        self._targets_reload_requested = asyncio.Event()
+        # What the pending reload covers: the threads the nudges named, or
+        # every thread once one named none.
+        self._targets_reload_threads: set[str] = set()
+        self._targets_full_reload = False
+
     @property
-    def _monitored_symbols(self) -> set[str]:
-        """All bare monitored symbols (for backward compat and logging)."""
-        return set(self._symbol_automations.keys())
+    def _monitored_listings(self) -> set[Listing]:
+        return set(self._symbol_automations) | set(self._symbol_targets)
 
     async def start(self) -> None:
         """Start the price monitor."""
@@ -337,6 +496,11 @@ class PriceMonitorService:
 
         # Initial load of price automations
         await self._load_automations()
+        try:
+            await self._load_targets()
+        except Exception:
+            # Automations keep running; the refresh loop retries the targets.
+            logger.error("[PriceMonitor] Initial target load failed", exc_info=True)
 
         # Register as consumers on both WS instances
         self._stock_handle = self._stock_ws.register_consumer(
@@ -362,12 +526,23 @@ class PriceMonitorService:
         self._ref_refresh_task = asyncio.create_task(
             self._reference_refresh_loop(), name="price_monitor_ref_refresh"
         )
+        self._target_sweep_task = asyncio.create_task(
+            self._target_sweep_loop(), name="price_monitor_target_sweep"
+        )
+        self._target_signal_task = asyncio.create_task(
+            self._target_signal_loop(), name="price_monitor_target_signal"
+        )
+        self._target_reload_task = asyncio.create_task(
+            self._target_reload_loop(), name="price_monitor_target_reload"
+        )
 
         logger.info(
-            "[PriceMonitor] Started — monitoring %d symbols (%d stock, %d index) from %d automations",
-            len(self._monitored_symbols),
+            "[PriceMonitor] Started — monitoring %d listings (%d stock, %d index) "
+            "from %d automations and %d targets",
+            len(self._monitored_listings),
             len(self._stock_ws_symbols), len(self._index_ws_symbols),
             sum(len(v) for v in self._symbol_automations.values()),
+            sum(len(v) for v in self._symbol_targets.values()),
         )
 
     async def stop(self) -> None:
@@ -375,7 +550,11 @@ class PriceMonitorService:
         logger.info("[PriceMonitor] Stopping...")
         self._shutdown_event.set()
 
-        for task in (self._refresh_task, self._poll_task, self._ref_refresh_task):
+        for task in (
+            self._refresh_task, self._poll_task, self._ref_refresh_task,
+            self._target_sweep_task, self._target_signal_task,
+            self._target_reload_task,
+        ):
             if task and not task.done():
                 task.cancel()
                 try:
@@ -398,11 +577,13 @@ class PriceMonitorService:
         if not bar:
             return
 
-        # Normalize wire symbol to bare (e.g. I:SPX → SPX)
-        bare_symbol = _from_ws_symbol(bar["symbol"])
+        # Normalize wire symbol to bare (e.g. I:SPX → SPX). Only the index
+        # feed spells a symbol with the I: prefix.
+        market = MarketType.INDEX if bar["symbol"].startswith("I:") else MarketType.STOCK
+        listing = (_from_ws_symbol(bar["symbol"]), market)
         current_price = bar["close"]
 
-        automations = self._symbol_automations.get(bare_symbol, [])
+        automations = self._symbol_automations.get(listing, [])
         for automation in automations:
             try:
                 await self._evaluate_and_trigger(automation, current_price)
@@ -412,6 +593,9 @@ class PriceMonitorService:
                     automation.get("automation_id"),
                     exc_info=True,
                 )
+
+        if listing in self._symbol_targets:
+            await self._evaluate_targets(listing, current_price, _positive(bar.get("time")))
 
     async def _evaluate_and_trigger(
         self, automation: Dict[str, Any], current_price: float
@@ -425,17 +609,18 @@ class PriceMonitorService:
             except Exception:
                 return
 
-        symbol = config.symbol.upper()
         from src.dalton.autonomy.price_trigger import is_dalton_price_move_automation, evaluate_and_trigger_dalton_move  # DALTON-HOOK(stock-move-upgrade)
         if is_dalton_price_move_automation(automation):  # DALTON-HOOK(stock-move-upgrade)
             await evaluate_and_trigger_dalton_move(self, automation, config, current_price, _now_utc())  # DALTON-HOOK(stock-move-upgrade)
             return  # DALTON-HOOK(stock-move-upgrade)
 
+        listing = (config.symbol.upper(), config.market)
+
         # All conditions must be met (AND logic)
         for condition in config.conditions:
             if not self._evaluator.evaluate(
                 condition.type, condition.value, condition.reference,
-                current_price, symbol,
+                current_price, listing,
             ):
                 return  # At least one condition not met
 
@@ -553,10 +738,227 @@ class PriceMonitorService:
         if automation_id in self._local_locks:
             self._local_locks[automation_id] = time.monotonic() + _REFRESH_INTERVAL
 
+    # ─── Targets ─────────────────────────────────────────────────────
+
+    async def _evaluate_targets(
+        self,
+        listing: Listing,
+        current_price: Any,
+        printed_at: Optional[float],
+    ) -> None:
+        """Fire every target on *listing* the price hits.
+
+        *printed_at* is when the price traded, in epoch ms, None when its
+        source does not say. A target fires only on a price printed after it
+        was set: the index feed runs about 15 minutes behind, and a closed
+        venue's snapshot still carries the last session's move, neither of
+        which is news to a target set since.
+        """
+        targets = self._symbol_targets.get(listing)
+        price = _positive(current_price)
+        if not targets or price is None:
+            return
+        now = _now_utc()
+        hits: List[Dict[str, Any]] = []
+        for target in tuple(targets):
+            try:
+                if target["expires_at"] <= now:
+                    # Lapsed since the load; the sweep closes its row.
+                    self._drop_target(target)
+                    continue
+                if printed_at is not None and printed_at < target["_created_ms"]:
+                    continue
+                hit = self._evaluator.evaluate_target(target, price, listing)
+            except Exception:
+                logger.error(
+                    "[PriceMonitor] Error evaluating target %s",
+                    target.get("target_id"), exc_info=True,
+                )
+                continue
+            if hit:
+                hits.append(target)
+        if hits:
+            await self._fire_targets(hits, price, printed_at)
+
+    async def _fire_targets(
+        self, targets: List[Dict[str, Any]], price: float, printed_at: Optional[float]
+    ) -> None:
+        """Claim the hits one price made, in one transaction: the feed waits
+        on this, and a price crossing several targets would otherwise cost a
+        round trip each. Every worker's monitor sees the same tick, and the
+        guarded UPDATE in fire_targets is what lets exactly one of them win
+        each target; the winner's transaction also enqueues the alert."""
+        from src.server.database import market_targets as targets_db
+
+        target_ids = [target["target_id"] for target in targets]
+        # Off this worker's books whatever the claim returns: a lost race, or
+        # a claim that failed, would otherwise query on every tick until a
+        # load restores a target that is still armed.
+        for target in targets:
+            self._drop_target(target)
+        # The alert says when the price traded, which on a delayed feed is
+        # well before the claim.
+        traded_at = (
+            datetime.fromtimestamp(printed_at / 1000, tz=timezone.utc)
+            if printed_at is not None else None
+        )
+        try:
+            rows = await targets_db.fire_targets(target_ids, price, printed_at=traded_at)
+        except Exception:
+            logger.error(
+                "[PriceMonitor] Failed to claim hits for targets %s",
+                ", ".join(target_ids), exc_info=True,
+            )
+            # Nothing was claimed, so the batch's threads are re-read after
+            # the debounce rather than at the timed reload: their targets
+            # that are still armed come back to be hit by a later price.
+            for thread_id in {target["conversation_thread_id"] for target in targets}:
+                self.request_targets_reload(thread_id)
+            return
+        claimed = {row["target_id"] for row in rows}
+        for target_id in target_ids:
+            if target_id not in claimed:
+                logger.debug(
+                    "[PriceMonitor] Target %s no longer armed (claimed elsewhere or settled)",
+                    target_id,
+                )
+        for row in rows:
+            logger.info(
+                "[PriceMonitor] Target %s hit: %s %s %s price=%.4f thread=%s",
+                row.get("target_id"), row.get("symbol"), row.get("kind"),
+                row.get("value"), price, row.get("conversation_thread_id"),
+            )
+        if rows:
+            _nudge_hook_drainer()
+
+    def _drop_target(self, target: Dict[str, Any]) -> None:
+        listing = target["_listing"]
+        remaining = [
+            t for t in self._symbol_targets.get(listing, ())
+            if t["target_id"] != target["target_id"]
+        ]
+        if remaining:
+            self._symbol_targets[listing] = remaining
+        else:
+            self._symbol_targets.pop(listing, None)
+
+    def request_targets_reload(self, thread_id: Any = None) -> None:
+        """Ask for a prompt re-read of armed targets, debounced: of
+        *thread_id*'s alone when it names a thread, of every thread's when
+        it names none. A hint only: the timed reload is what any change is
+        guaranteed to reach."""
+        thread = _thread_key(thread_id)
+        if thread is None:
+            self._targets_full_reload = True
+        else:
+            self._targets_reload_threads.add(thread)
+        self._targets_reload_requested.set()
+
+    async def _target_reload_loop(self) -> None:
+        """Coalesce a burst of change nudges, several targets set in one turn,
+        into one re-read of the threads they name."""
+        while not self._shutdown_event.is_set():
+            await self._targets_reload_requested.wait()
+            await asyncio.sleep(_TARGET_RELOAD_DEBOUNCE)
+            self._targets_reload_requested.clear()
+            full, threads = self._targets_full_reload, self._targets_reload_threads
+            self._targets_full_reload, self._targets_reload_threads = False, set()
+            if self._shutdown_event.is_set():
+                return
+            try:
+                await self._load_targets(None if full else threads)
+            except Exception:
+                logger.error("[PriceMonitor] Target reload failed", exc_info=True)
+
+    async def _target_signal_loop(self) -> None:
+        """Turn change nudges from any worker into a prompt reload here.
+
+        Best effort by design: Redis off, a dropped subscription or a missed
+        message only delays a change until the timed reload re-reads the table.
+        """
+        from src.server.services.market_targets.signals import TARGETS_CHANGED_CHANNEL
+        from src.server.services.workspace_status_pubsub import get_shared_pubsub_client
+
+        while not self._shutdown_event.is_set():
+            pubsub = None
+            try:
+                client = await get_shared_pubsub_client()
+                if client is not None:
+                    pubsub = client.pubsub()
+                    await pubsub.subscribe(TARGETS_CHANGED_CHANNEL)
+                    # Whatever was published before the subscribe landed is
+                    # gone, so a fresh subscription starts with a re-read.
+                    self.request_targets_reload()
+                    while not self._shutdown_event.is_set():
+                        msg = await pubsub.get_message(
+                            ignore_subscribe_messages=True, timeout=_TARGET_SIGNAL_POLL
+                        )
+                        if msg and msg.get("type") == "message":
+                            self.request_targets_reload(msg.get("data"))
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "[PriceMonitor] Target change listener error, resubscribing: %s", exc
+                )
+            finally:
+                if pubsub is not None:
+                    try:
+                        await pubsub.aclose()
+                    except Exception:
+                        pass
+            # Also the retry while Redis is off or its pub/sub pool is in a
+            # rebuild cooldown: either can end, so the listener never retires.
+            try:
+                await asyncio.wait_for(
+                    self._shutdown_event.wait(), timeout=_TARGET_SIGNAL_RETRY
+                )
+                return
+            except asyncio.TimeoutError:
+                pass
+
+    async def _target_sweep_loop(self) -> None:
+        """Warnings and expiry come due by the clock, not by a tick. Every
+        worker sweeps; the claims are guarded, so none doubles another's."""
+        while not self._shutdown_event.is_set():
+            try:
+                await asyncio.wait_for(
+                    self._shutdown_event.wait(), timeout=_TARGET_SWEEP_INTERVAL
+                )
+                return
+            except asyncio.TimeoutError:
+                pass
+            await self._sweep_targets()
+
+    async def _sweep_targets(self) -> None:
+        from src.server.database import market_targets as targets_db
+
+        try:
+            warned = 0
+            while True:
+                claimed = await targets_db.claim_due_warnings(limit=_TARGET_WARNING_BATCH)
+                warned += len(claimed)
+                if len(claimed) < _TARGET_WARNING_BATCH:
+                    break
+            if warned:
+                logger.info("[PriceMonitor] Enqueued %d target expiry warnings", warned)
+                _nudge_hook_drainer()
+        except Exception:
+            logger.error("[PriceMonitor] Target warning sweep failed", exc_info=True)
+
+        try:
+            expired = await targets_db.expire_due_targets()
+            if expired:
+                logger.info("[PriceMonitor] Closed %d lapsed targets", expired)
+        except Exception:
+            logger.error("[PriceMonitor] Target expiry sweep failed", exc_info=True)
+
     # ─── Background Loops ────────────────────────────────────────────
 
     async def _refresh_loop(self) -> None:
-        """Periodically reload price automations from DB and update subscriptions."""
+        """Periodically reload price automations and armed targets from DB
+        and update subscriptions. The re-read is what a target change is
+        guaranteed to reach; the change nudge only makes it sooner."""
         while not self._shutdown_event.is_set():
             try:
                 await asyncio.wait_for(
@@ -570,41 +972,109 @@ class PriceMonitorService:
                 await self._load_automations()
             except Exception:
                 logger.error("[PriceMonitor] Refresh failed", exc_info=True)
+            try:
+                await self._load_targets()
+            except Exception:
+                logger.error("[PriceMonitor] Target refresh failed", exc_info=True)
 
     async def _load_automations(self) -> None:
         """Load active price automations and update symbol subscriptions."""
         from src.server.database import automation as auto_db
 
-        automations = await auto_db.get_active_price_automations()
+        async with self._load_lock:
+            automations = await auto_db.get_active_price_automations()
 
-        new_symbol_map: Dict[str, List[Dict[str, Any]]] = {}
-        new_symbol_markets: Dict[str, MarketType] = {}
+            new_symbol_map: Dict[Listing, List[Dict[str, Any]]] = {}
+
+            for auto in automations:
+                trigger_config = auto.get("trigger_config", {})
+                try:
+                    config = PriceTriggerConfig(**trigger_config)
+                except Exception:
+                    logger.warning(
+                        "[PriceMonitor] Invalid trigger_config for automation %s",
+                        auto.get("automation_id"),
+                    )
+                    continue
+
+                auto["_parsed_config"] = config
+                listing = (config.symbol.upper(), config.market)
+                new_symbol_map.setdefault(listing, []).append(auto)
+
+            # DALTON-HOOK(stock-move-upgrade): publish the new map before the
+            # resubscribe — its reference refresh consults the map (via
+            # refresh_dalton_reference_if_needed) to decide which symbols keep
+            # a Dalton reference price, so it must see this load's automations.
+            self._symbol_automations = new_symbol_map
+            self._automation_listings = set(new_symbol_map)
+            await self._resubscribe(set(new_symbol_map), self._target_listings)
+
+    async def _load_targets(self, thread_ids: Optional[Collection[str]] = None) -> None:
+        """Load armed market-watch targets and update symbol subscriptions.
+
+        With *thread_ids*, only those threads' targets are re-read and
+        replaced, and every other thread's stay as this worker holds them: a
+        change nudge names the thread it touched, and re-reading every armed
+        target in every worker on each one is what that saves.
+        """
+        from src.server.database import market_targets as targets_db
+
+        async with self._load_lock:
+            if thread_ids is None:
+                new_symbol_map = _targets_by_listing(await targets_db.list_armed_targets())
+                await self._resubscribe(self._automation_listings, set(new_symbol_map))
+                self._symbol_targets = new_symbol_map
+                self._target_listings = set(new_symbol_map)
+                return
+
+            scope = set(thread_ids)
+            if not scope:
+                return
+            fresh = _targets_by_listing(
+                await targets_db.list_armed_targets(thread_ids=sorted(scope))
+            )
+            listings = set(self._merge_thread_targets(scope, fresh))
+            await self._resubscribe(self._automation_listings, listings)
+            # Merged from the map as it stands now: a target a claim dropped
+            # during the resubscribe stays dropped, since no read returned it.
+            self._symbol_targets = self._merge_thread_targets(scope, fresh)
+            self._target_listings = listings
+
+    def _merge_thread_targets(
+        self, scope: set[str], fresh: Dict[Listing, List[Dict[str, Any]]]
+    ) -> Dict[Listing, List[Dict[str, Any]]]:
+        """This worker's targets with those of the threads in *scope*
+        replaced by *fresh*, their armed rows as just read."""
+        merged: Dict[Listing, List[Dict[str, Any]]] = {}
+        for listing, targets in self._symbol_targets.items():
+            kept = [t for t in targets if t["conversation_thread_id"] not in scope]
+            if kept:
+                merged[listing] = kept
+        for listing, targets in fresh.items():
+            merged.setdefault(listing, []).extend(targets)
+        return merged
+
+    async def _resubscribe(
+        self,
+        automation_listings: set[Listing],
+        target_listings: set[Listing],
+    ) -> None:
+        """Bring the feeds and reference prices in line with both sources.
+
+        Called under the load lock. Each listing is read in its own market: a
+        bare symbol watched in two, whether by automations, targets or one of
+        each, is subscribed and polled in both, since reading it in one would
+        leave the other's watchers with no price of their own.
+        """
+        new_listings = automation_listings | target_listings
         new_stock_ws: set[str] = set()
         new_index_ws: set[str] = set()
-
-        for auto in automations:
-            trigger_config = auto.get("trigger_config", {})
-            try:
-                config = PriceTriggerConfig(**trigger_config)
-            except Exception:
-                logger.warning(
-                    "[PriceMonitor] Invalid trigger_config for automation %s",
-                    auto.get("automation_id"),
-                )
-                continue
-
-            bare = config.symbol.upper()
-            market = config.market
-
-            new_symbol_markets[bare] = market
+        for bare, market in new_listings:
             # The feeds carry the US tape only, where 600519.SH or I:HSI names
             # nothing; the REST poll covers every other venue in its session.
             if _is_us_symbol(bare, market):
                 ws_symbols = new_index_ws if market == MarketType.INDEX else new_stock_ws
                 ws_symbols.add(_to_ws_symbol(bare, market))
-
-            auto["_parsed_config"] = config
-            new_symbol_map.setdefault(bare, []).append(auto)
 
         # Diff stock subscriptions
         stock_added = new_stock_ws - self._stock_ws_symbols
@@ -624,26 +1094,23 @@ class PriceMonitorService:
             if index_added:
                 await self._index_handle.subscribe(list(index_added))
 
-        # Refresh reference prices for newly added bare symbols
-        old_bare = set(self._symbol_automations.keys())
-        new_bare = set(new_symbol_map.keys())
-        added_bare = new_bare - old_bare
-        self._symbol_automations = new_symbol_map  # DALTON-HOOK(stock-move-upgrade)
-        self._symbol_markets = new_symbol_markets
+        # Refresh reference prices for newly added listings
+        added = new_listings - self._listings
+        if added:
+            await self._evaluator.refresh_references(added)
+
+        self._listings = new_listings
         self._stock_ws_symbols = new_stock_ws
         self._index_ws_symbols = new_index_ws
-        if added_bare:
-            await self._evaluator.refresh_references(
-                list(added_bare), symbol_markets=new_symbol_markets
-            )
 
         total_added = len(stock_added) + len(index_added)
         total_removed = len(stock_removed) + len(index_removed)
         if total_added or total_removed:
             logger.info(
-                "[PriceMonitor] Subscriptions updated: +%d -%d (total %d symbols, %d automations)",
-                total_added, total_removed, len(new_bare),
-                sum(len(v) for v in new_symbol_map.values()),
+                "[PriceMonitor] Subscriptions updated: +%d -%d (total %d listings, "
+                "%d automation listings, %d target listings)",
+                total_added, total_removed, len(new_listings),
+                len(automation_listings), len(target_listings),
             )
 
     async def _poll_fallback_loop(self) -> None:
@@ -658,7 +1125,7 @@ class PriceMonitorService:
             except asyncio.TimeoutError:
                 pass
 
-            if not self._monitored_symbols:
+            if not self._monitored_listings:
                 continue
 
             try:
@@ -680,21 +1147,22 @@ class PriceMonitorService:
         no upstream call.
         """
         now = _now_utc()
-        day_starts: Dict[str, int] = {}
+        day_starts: Dict[Listing, int] = {}
         stock_syms: List[str] = []
         index_syms: List[str] = []
-        for bare, market in self._symbol_markets.items():
+        for listing in sorted(self._listings):
+            bare, market = listing
             if _is_us_symbol(bare, market):
                 if not (poll_index if market == MarketType.INDEX else poll_stock):
                     continue
                 from src.dalton.autonomy.price_trigger import should_poll_us_symbol  # DALTON-HOOK(stock-move-upgrade)
-                if not should_poll_us_symbol(bare, market, self._symbol_automations.get(bare, ()), now):  # DALTON-HOOK(stock-move-upgrade)
+                if not should_poll_us_symbol(bare, market, self._symbol_automations.get((bare, market), ()), now):  # DALTON-HOOK(stock-move-upgrade)
                     continue  # DALTON-HOOK(stock-move-upgrade)
             else:
                 day_start = _session_day_start_ms(bare, market, now)
                 if day_start is None:
                     continue
-                day_starts[bare] = day_start
+                day_starts[listing] = day_start
             (index_syms if market == MarketType.INDEX else stock_syms).append(bare)
         if not stock_syms and not index_syms:
             return
@@ -702,9 +1170,10 @@ class PriceMonitorService:
         from src.data_client import get_market_data_provider
 
         provider = await get_market_data_provider()
-        for bare_symbol, snapshot in await _fetch_snapshots(provider, stock_syms, index_syms):
+        for listing, snapshot in await _fetch_snapshots(provider, stock_syms, index_syms):
             from src.dalton.autonomy.price_trigger import process_polled_snapshot  # DALTON-HOOK(stock-move-upgrade)
-            normal_automations = await process_polled_snapshot(self, bare_symbol, snapshot, now)  # DALTON-HOOK(stock-move-upgrade)
+            bare, market = listing  # DALTON-HOOK(stock-move-upgrade)
+            normal_automations = await process_polled_snapshot(self, bare, market, snapshot, now)  # DALTON-HOOK(stock-move-upgrade)
             if normal_automations is None:  # DALTON-HOOK(stock-move-upgrade)
                 continue  # DALTON-HOOK(stock-move-upgrade)
             current_price = _positive(snapshot.get("price"))
@@ -716,14 +1185,14 @@ class PriceMonitorService:
             # time cannot show it rolled, so it is skipped too. US rows have
             # no bound.
             as_of = _positive(snapshot.get("as_of"))
-            day_start = day_starts.get(bare_symbol)
+            day_start = day_starts.get(listing)
             if day_start is not None and (as_of is None or as_of < day_start):
                 continue
 
             # Update reference prices
             if _positive(snapshot.get("previous_close")) is not None:
                 self._evaluator.set_reference(
-                    bare_symbol,
+                    listing,
                     previous_close=snapshot.get("previous_close"),
                     day_open=snapshot.get("open"),
                 )
@@ -738,6 +1207,13 @@ class PriceMonitorService:
                         exc_info=True,
                     )
 
+            # The day bound above leaves US rows alone, as an automation
+            # wants. A target needs the print time instead, to tell a move
+            # made since it was set from the last session's, which a closed
+            # venue's row still carries; a row without one cannot show that.
+            if as_of is not None:
+                await self._evaluate_targets(listing, current_price, as_of)
+
     async def _reference_refresh_loop(self) -> None:
         """Periodically refresh reference prices for all monitored symbols."""
         while not self._shutdown_event.is_set():
@@ -749,11 +1225,8 @@ class PriceMonitorService:
             except asyncio.TimeoutError:
                 pass
 
-            if self._monitored_symbols:
+            if self._monitored_listings:
                 try:
-                    await self._evaluator.refresh_references(
-                        list(self._monitored_symbols),
-                        symbol_markets=self._symbol_markets,
-                    )
+                    await self._evaluator.refresh_references(self._monitored_listings)
                 except Exception:
                     logger.debug("[PriceMonitor] Reference refresh failed", exc_info=True)

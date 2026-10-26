@@ -8,6 +8,7 @@ import os
 import subprocess
 from contextlib import asynccontextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import create_autospec
 
@@ -1890,6 +1891,10 @@ def test_plugins_config_and_sandbox_env_exclude_bridge_admin_token(
     assert any(admin_secret in str(a) for a in by_name["leak_args_srv"].args)
 
     sandbox_stub = create_autospec(PTCSandbox, instance=True)
+    # Upstream's env-var build now consults self.config for platform-secret
+    # withholding; a Docker provider never withholds, which keeps this test on
+    # the plain Dalton (oss) path.
+    sandbox_stub.config = SimpleNamespace(sandbox=SimpleNamespace(provider="docker"))
     sandbox_stub._token_file_path = "/home/workspace/.ginlix_token"
     sandbox_stub._builtin_servers.return_value = loaded_servers
 
@@ -1936,6 +1941,53 @@ def test_plugins_config_and_sandbox_env_exclude_bridge_admin_token(
     assert env_when_unset.get("SAFE_VAR") == "safe-value"
     assert all(s.enabled is True for s in clean_loaded)
     assert "enabled" not in cfg_when_unset["servers"]["clean_mcp_srv"]
+
+
+def test_sandbox_env_vars_never_resolve_admin_token_placeholders(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Lock the merged env-var loop in ``PTCSandbox._build_sandbox_env_vars``:
+    an *unexpanded* ``${DALTON_BRIDGE_ADMIN_TOKEN}`` / ``${INTERNAL_SERVICE_TOKEN}``
+    reference under any config key must never resolve into the sandbox env,
+    while bridge URLs (``DALTON_RESEARCHDATA_URL`` etc.) still do — on both the
+    Dalton oss path and upstream's platform-secret withholding path."""
+    from ptc_agent.config.core import MCPServerConfig
+    from ptc_agent.core.sandbox.ptc_sandbox import PTCSandbox
+
+    admin_secret = "admin-placeholder-secret"
+    monkeypatch.setenv("DALTON_BRIDGE_ADMIN_TOKEN", admin_secret)
+    monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", "internal-platform-secret")
+    monkeypatch.setenv("DALTON_RESEARCHDATA_URL", "http://host.docker.internal:8960")
+    monkeypatch.setenv("DALTON_BRIDGE_TOKEN", "mcp-token-ok")
+
+    servers = [
+        MCPServerConfig(
+            name="stdio_srv",
+            transport="stdio",
+            command="python3",
+            env={
+                "DALTON_RESEARCHDATA_URL": "${DALTON_RESEARCHDATA_URL}",
+                "DALTON_BRIDGE_TOKEN": "${DALTON_BRIDGE_TOKEN}",
+                "RENAMED_ADMIN": "${DALTON_BRIDGE_ADMIN_TOKEN}",
+                "RENAMED_INTERNAL": "${INTERNAL_SERVICE_TOKEN}",
+                "PLAIN_VALUE": "plain-ok",
+            },
+        ),
+    ]
+    sandbox_stub = create_autospec(PTCSandbox, instance=True)
+    sandbox_stub.config = SimpleNamespace(sandbox=SimpleNamespace(provider="docker"))
+    sandbox_stub._token_file_path = "/home/workspace/.ginlix_token"
+    sandbox_stub._builtin_servers.return_value = servers
+
+    env_vars = PTCSandbox._build_sandbox_env_vars(sandbox_stub, {})
+
+    assert admin_secret not in json.dumps(env_vars)
+    assert "internal-platform-secret" not in json.dumps(env_vars)
+    assert "RENAMED_ADMIN" not in env_vars
+    assert "RENAMED_INTERNAL" not in env_vars
+    assert env_vars["DALTON_RESEARCHDATA_URL"] == "http://host.docker.internal:8960"
+    assert env_vars["DALTON_BRIDGE_TOKEN"] == "mcp-token-ok"
+    assert env_vars["PLAIN_VALUE"] == "plain-ok"
 
 
 @pytest.mark.asyncio

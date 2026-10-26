@@ -51,7 +51,7 @@ class SessionCacheMixin:
             workspace_id=workspace_id,
             computer_id=str(computer["computer_id"]),
             dir_name=computer.get("dir_name"),
-            kind=computer.get("kind"),
+            kind=computer["kind"],
             root_dir=computer.get("root_dir"),
             provider_ref=(
                 str(computer["provider_ref"]) if computer.get("provider_ref") else None
@@ -59,6 +59,9 @@ class SessionCacheMixin:
             resource_tier=computer.get("resource_tier"),
             is_always_on=bool(computer.get("is_always_on")),
             provider_config=computer.get("provider_config") or None,
+            files_epoch=(
+                str(computer["files_epoch"]) if computer.get("files_epoch") else None
+            ),
         )
 
     async def resolve_binding(

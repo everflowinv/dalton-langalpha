@@ -9,6 +9,8 @@ from datetime import datetime, timezone
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Dict, Mapping, Optional, Set, Tuple
 
+from ptc_agent.core.mcp_composite import builtin_registry_of
+from ptc_agent.core.mcp_registry import get_global_registry
 from ptc_agent.core.session import Session
 from src.server.services.livefs.tracker import MountTracker
 
@@ -67,20 +69,22 @@ class ComputerBinding:
     acquisition resolves the binding it hands out. None on a workspace binding
     means only that this read did not answer for the folder, so the layout
     resolves it from the row; a caller that builds a workspace binding out of a
-    machine row has to supply it."""
+    machine row has to supply it. files_epoch names the move that last brought
+    the project's files to this machine, None if none has."""
 
     workspace_id: str
     computer_id: str
+    kind: str
     dir_name: Optional[str] = None
-    kind: Optional[str] = None
     root_dir: Optional[str] = None
     provider_ref: Optional[str] = None
     resource_tier: Optional[str] = None
     is_always_on: bool = False
     provider_config: Optional[Dict[str, Any]] = None
+    files_epoch: Optional[str] = None
 
     @property
-    def provider_identity(self) -> Tuple[Optional[str], str]:
+    def provider_identity(self) -> Tuple[str, str]:
         """Row-level provider overrides distinguish backends of the same kind."""
         return (self.kind, json.dumps(self.provider_config or {}, sort_keys=True))
 
@@ -125,6 +129,15 @@ class WorkspaceToolView:
             ),
             trading_rule=getattr(session, "trading_rule", None),
         )
+
+    def builtins_superseded(self) -> bool:
+        """Whether a reconnected built-in server has replaced the snapshot this
+        view was built on, so its tools, its prompt summary and the wrappers
+        synced from it all still lack that server until the view is rebuilt."""
+        if self.mcp_registry is None or self.session._owns_mcp_registry:
+            return False
+        current = get_global_registry()
+        return current is not None and builtin_registry_of(self.mcp_registry) is not current
 
     @classmethod
     def builtin_only(cls, workspace_id: str, session: Session) -> "WorkspaceToolView":

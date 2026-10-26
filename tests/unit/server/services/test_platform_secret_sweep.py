@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from contextlib import asynccontextmanager
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -24,21 +25,42 @@ _MECHANICS = "ptc_agent.core.sandbox.platform_secrets"
 _LIVEFS = "src.server.services.livefs.mount"
 
 
-def _rollout_set(generation: int = 1) -> PlatformSecretRolloutSet:
+def _rollout_set(
+    generation: int = 1, *, provider: str = "daytona"
+) -> PlatformSecretRolloutSet:
     rollout = PlatformSecretRollout(
         secret_key="FMP_API_KEY",
-        provider="daytona",
+        provider=provider,
         secret_name="prod-platform-fmp-api-key",
         provider_secret_id="secret-id",
         placeholder_sha256=hashlib.sha256(PLACEHOLDER.encode()).hexdigest(),
         current_credential_sha256="current",
         generation=generation,
     )
-    return PlatformSecretRolloutSet(rollouts=(rollout,), generation=generation)
+    return PlatformSecretRolloutSet(
+        provider=provider, rollouts=(rollout,), generation=generation
+    )
+
+
+def _sweep_config(*, e2b_key: str = "e2b-key", catalog: bool = True) -> SimpleNamespace:
+    """What the sweep reads off the deployment config: the catalog and keys."""
+    sandbox = SimpleNamespace(
+        provider="daytona",
+        platform_secrets=("FMP_API_KEY",) if catalog else (),
+        daytona=SimpleNamespace(api_key="daytona-key"),
+        e2b=SimpleNamespace(api_key=e2b_key),
+        docker=SimpleNamespace(),
+    )
+    sandbox.settings_for = lambda kind: getattr(sandbox, kind)
+    return SimpleNamespace(sandbox=sandbox)
 
 
 def _row(
-    *, version: int = 0, always_on: bool = False, workspace_id: str | None = "ws"
+    *,
+    version: int = 0,
+    always_on: bool = False,
+    workspace_id: str | None = "ws",
+    kind: str = "daytona",
 ) -> dict:
     # One row per computer, as list_workspaces_behind_platform_secret selects;
     # the project is the machine's oldest live one, or None when it has none.
@@ -46,6 +68,7 @@ def _row(
         "computer_id": COMPUTER_ID,
         "workspace_id": workspace_id,
         "sandbox_id": "sb",
+        "kind": kind,
         "platform_secret_version": version,
         "is_always_on": always_on,
     }
@@ -53,7 +76,7 @@ def _row(
 
 def _runtime(*, autostop: bool = True) -> MagicMock:
     runtime = MagicMock()
-    runtime.capabilities = {"autostop"} if autostop else set()
+    runtime.autostops = autostop
     runtime.set_autostop_interval = AsyncMock()
     return runtime
 
@@ -264,47 +287,37 @@ async def test_lock_loser_skips_without_touching_the_machine():
 
 @pytest.mark.asyncio
 async def test_lock_winner_converges_and_releases():
+    from src.server.database.computer import computer_advisory_key
+
     sweeper = PlatformSecretSweeper()
     provider = MagicMock()
     locked = AsyncMock(return_value=True)
-    executed: list[str] = []
-
-    @asynccontextmanager
-    async def _conn_cm():
-        cur = MagicMock()
-        cur.fetchone = AsyncMock(return_value=(True,))
-
-        async def _execute(sql, params=None):
-            executed.append(sql)
-            return cur
-
-        conn = MagicMock()
-        conn.execute = AsyncMock(side_effect=_execute)
-        yield conn
+    keys: list[int] = []
+    unlocked: list[int] = []
 
     with (
-        patch("src.server.database.pool.get_db_connection", _conn_cm),
+        patch(
+            "src.server.database.pool.get_db_connection",
+            _lock_conn([True], keys, unlocked),
+        ),
         patch.object(sweeper, "_converge_locked", locked),
     ):
         converged = await sweeper._sweep_one(_row(), _rollout_set(), provider)
 
     assert converged is True
     locked.assert_awaited_once()
-    assert any("pg_try_advisory_lock" in sql for sql in executed)
-    assert any("pg_advisory_unlock" in sql for sql in executed)
+    assert keys == unlocked == [computer_advisory_key(COMPUTER_ID)]
 
 
 @pytest.mark.asyncio
 async def test_sweep_once_is_inert_without_a_registered_rollout():
     sweeper = PlatformSecretSweeper()
-    sweeper._config = MagicMock()
+    sweeper._config = _sweep_config()
     list_behind = AsyncMock()
 
     with (
-        patch(
-            f"{_ROLLOUT}.get_platform_secret_rollouts",
-            AsyncMock(side_effect=RuntimeError("not initialized")),
-        ),
+        patch(f"{_ROLLOUT}.get_all_platform_secret_rollouts", AsyncMock(return_value={})),
+        patch.object(sweeper, "_register_missing_kinds", AsyncMock(return_value=False)),
         patch(f"{_ROLLOUT}.list_workspaces_behind_platform_secret", list_behind),
     ):
         assert await sweeper.sweep_once() == 0
@@ -313,23 +326,21 @@ async def test_sweep_once_is_inert_without_a_registered_rollout():
 
 
 @pytest.mark.asyncio
-async def test_start_is_inert_when_platform_secrets_inactive():
+async def test_start_is_inert_without_a_catalog():
     sweeper = PlatformSecretSweeper()
-    with patch(
-        f"{_MECHANICS}.platform_secrets_active", return_value=False
-    ):
-        sweeper.start(MagicMock())
+    sweeper.start(_sweep_config(catalog=False))
     assert sweeper._loop_task is None
 
 
 @pytest.mark.asyncio
 async def test_start_and_stop_lifecycle():
+    """A catalog alone starts it: a deployment on a provider without platform
+    Secrets can still hold computers on one that has them."""
     sweeper = PlatformSecretSweeper(interval=0.01)
-    with (
-        patch(f"{_MECHANICS}.platform_secrets_active", return_value=True),
-        patch.object(sweeper, "sweep_once", AsyncMock(return_value=0)),
-    ):
-        sweeper.start(MagicMock())
+    config = _sweep_config()
+    config.sandbox.provider = "docker"
+    with patch.object(sweeper, "sweep_once", AsyncMock(return_value=0)):
+        sweeper.start(config)
         assert sweeper._loop_task is not None
         await sweeper.stop()
     assert sweeper._loop_task is None
@@ -443,6 +454,7 @@ async def test_sweep_uses_each_computers_provider_and_closes_clients():
     from src.server.services.computer_manager import ComputerManager
 
     sweeper = PlatformSecretSweeper()
+    sweeper._config = _sweep_config()
     rows = [{**_row(), "kind": "daytona", "provider_ref": "sb",
              "root_dir": "/custom", "provider_config": {"auto_stop_interval": value}}
             for value in (600, 1200)]
@@ -451,7 +463,11 @@ async def test_sweep_uses_each_computers_provider_and_closes_clients():
     providers = [MagicMock(close=AsyncMock()), MagicMock(close=AsyncMock())]
     manager._provider_for.side_effect = providers
     with (
-        patch(f"{_ROLLOUT}.get_platform_secret_rollouts", AsyncMock(return_value=_rollout_set())),
+        patch(
+            f"{_ROLLOUT}.get_all_platform_secret_rollouts",
+            AsyncMock(return_value={"daytona": _rollout_set()}),
+        ),
+        patch.object(sweeper, "_register_missing_kinds", AsyncMock(return_value=False)),
         patch(f"{_ROLLOUT}.list_workspaces_behind_platform_secret", AsyncMock(return_value=rows)),
         patch.object(ComputerManager, "get_instance", return_value=manager),
         patch.object(sweeper, "_sweep_one", AsyncMock(return_value=True)) as sweep,
@@ -463,3 +479,319 @@ async def test_sweep_uses_each_computers_provider_and_closes_clients():
     assert [call.args[2] for call in sweep.await_args_list] == providers
     for provider in providers:
         provider.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_never_certified_e2b_sandbox_is_verified_not_scrubbed():
+    # A restart cannot change a fixed env, so there is no scrub: a clean one
+    # is certified as it stands.
+    sweeper = PlatformSecretSweeper()
+    provider = MagicMock()
+    provider.get = AsyncMock(return_value=_runtime())
+    converge = AsyncMock()
+    verify = AsyncMock()
+    stamp = AsyncMock()
+
+    with (
+        patch(f"{_MECHANICS}.converge_sandbox_platform_secrets", converge),
+        patch(f"{_MECHANICS}.remount_platform_secret_bindings", AsyncMock()),
+        patch(f"{_MECHANICS}.verify_runtime_platform_secrets", verify),
+        patch(f"{_ROLLOUT}.stamp_platform_secret_version", stamp),
+    ):
+        converged = await sweeper._converge_locked(
+            COMPUTER_ID, "sb", _row(kind="e2b"), _rollout_set(), provider
+        )
+
+    assert converged is True
+    converge.assert_not_awaited()
+    verify.assert_awaited_once()
+    stamp.assert_awaited_once()
+
+
+def _needs_replacing():
+    from ptc_agent.core.sandbox.platform_secrets import (
+        PlatformSecretReplacementRequired,
+    )
+
+    return AsyncMock(side_effect=PlatformSecretReplacementRequired("FMP_API_KEY"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("version", [0, 1])
+async def test_an_e2b_sandbox_holding_plaintext_is_rebuilt(version):
+    from src.server.services.computer_manager import ComputerManager
+
+    sweeper = PlatformSecretSweeper()
+    provider = MagicMock()
+    provider.get = AsyncMock(return_value=_runtime())
+    manager = MagicMock()
+    manager.replace_sandbox_for_platform_secrets = AsyncMock(return_value=True)
+    stamp = AsyncMock()
+
+    with (
+        patch(f"{_MECHANICS}.remount_platform_secret_bindings", AsyncMock()),
+        patch(f"{_MECHANICS}.verify_runtime_platform_secrets", _needs_replacing()),
+        patch(f"{_ROLLOUT}.stamp_platform_secret_version", stamp),
+        patch.object(ComputerManager, "get_instance", return_value=manager),
+    ):
+        converged = await sweeper._converge_locked(
+            COMPUTER_ID, "sb", _row(kind="e2b", version=version),
+            _rollout_set(generation=2), provider,
+        )
+
+    assert converged is True
+    manager.replace_sandbox_for_platform_secrets.assert_awaited_once_with(
+        COMPUTER_ID, "sb"
+    )
+    # The old sandbox is never stamped; the new one is as it binds.
+    stamp.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_rebuild_waits_out_a_turn_and_backs_off_after_a_failure(monkeypatch):
+    from src.server.services import platform_secret_sweep
+    from src.server.services.computer_errors import MachineBusyError
+    from src.server.services.computer_manager import ComputerManager
+
+    sweeper = PlatformSecretSweeper()
+    provider = MagicMock()
+    provider.get = AsyncMock(return_value=_runtime())
+    replace = AsyncMock(side_effect=MachineBusyError("turn running"))
+    manager = MagicMock(replace_sandbox_for_platform_secrets=replace)
+    clock = [1000.0]
+    monkeypatch.setattr(platform_secret_sweep.time, "monotonic", lambda: clock[0])
+
+    async def converge() -> bool:
+        return await sweeper._converge_locked(
+            COMPUTER_ID, "sb", _row(kind="e2b", version=1),
+            _rollout_set(generation=2), provider,
+        )
+
+    with (
+        patch(f"{_MECHANICS}.remount_platform_secret_bindings", AsyncMock()),
+        patch(f"{_MECHANICS}.verify_runtime_platform_secrets", _needs_replacing()),
+        patch(f"{_ROLLOUT}.stamp_platform_secret_version", AsyncMock()),
+        patch.object(ComputerManager, "get_instance", return_value=manager),
+    ):
+        # Busy: deferred to the next pass, with no backoff.
+        assert await converge() is False
+        assert sweeper._busy_skips[COMPUTER_ID] == 1
+        replace.side_effect = RuntimeError("backup incomplete")
+        assert await converge() is False
+        assert replace.await_count == 2
+        # A failed rebuild is not retried every pass.
+        clock[0] += 60
+        assert await converge() is False
+        assert replace.await_count == 2
+        clock[0] += platform_secret_sweep.REBUILD_RETRY_S
+        replace.side_effect = None
+        replace.return_value = True
+        assert await converge() is True
+        assert replace.await_count == 3
+
+
+# ---------------------------------------------------------------------------
+# One rollout per provider kind
+# ---------------------------------------------------------------------------
+
+
+def _kind_row(computer_id: str, kind: str) -> dict:
+    return {**_row(kind=kind, version=1), "computer_id": computer_id,
+            "provider_ref": "sb", "root_dir": None, "provider_config": None}
+
+
+@pytest.mark.asyncio
+async def test_each_computer_converges_against_its_own_kinds_rollout():
+    from src.server.services.computer_manager import ComputerManager
+
+    sweeper = PlatformSecretSweeper()
+    sweeper._config = _sweep_config()
+    sets = {
+        "daytona": _rollout_set(3, provider="daytona"),
+        "e2b": _rollout_set(8, provider="e2b"),
+    }
+    rows = [_kind_row("c-1", "daytona"), _kind_row("c-2", "e2b")]
+    list_behind = AsyncMock(return_value=rows)
+    manager = MagicMock()
+    manager._provider_for.return_value = MagicMock(close=AsyncMock())
+
+    with (
+        patch(f"{_ROLLOUT}.get_all_platform_secret_rollouts", AsyncMock(return_value=sets)),
+        patch.object(sweeper, "_register_missing_kinds", AsyncMock(return_value=False)),
+        patch(f"{_ROLLOUT}.list_workspaces_behind_platform_secret", list_behind),
+        patch.object(ComputerManager, "get_instance", return_value=manager),
+        patch.object(sweeper, "_sweep_one", AsyncMock(return_value=True)) as sweep,
+    ):
+        assert await sweeper.sweep_once() == 2
+
+    assert list_behind.await_args.args[0] == sets
+    assert [
+        (call.args[0]["computer_id"], call.args[1].provider)
+        for call in sweep.await_args_list
+    ] == [("c-1", "daytona"), ("c-2", "e2b")]
+
+
+@pytest.mark.asyncio
+async def test_a_kind_without_credentials_is_not_listed():
+    """Nothing could reach its sandboxes, and its computers cannot start."""
+    sweeper = PlatformSecretSweeper()
+    sweeper._config = _sweep_config(e2b_key="")
+    sets = {"daytona": _rollout_set(provider="daytona"), "e2b": _rollout_set(provider="e2b")}
+    list_behind = AsyncMock(return_value=[])
+
+    with (
+        patch(f"{_ROLLOUT}.get_all_platform_secret_rollouts", AsyncMock(return_value=sets)),
+        patch.object(sweeper, "_register_missing_kinds", AsyncMock(return_value=False)),
+        patch(f"{_ROLLOUT}.list_workspaces_behind_platform_secret", list_behind),
+    ):
+        assert await sweeper.sweep_once() == 0
+
+    assert sorted(list_behind.await_args.args[0]) == ["daytona"]
+
+
+@pytest.mark.asyncio
+async def test_a_pass_that_registers_a_kind_converges_onto_it_at_once():
+    sweeper = PlatformSecretSweeper()
+    sweeper._config = _sweep_config()
+    after = {"daytona": _rollout_set(provider="daytona"), "e2b": _rollout_set(9, provider="e2b")}
+    get_all = AsyncMock(side_effect=[{"daytona": after["daytona"]}, after])
+    list_behind = AsyncMock(return_value=[])
+
+    with (
+        patch(f"{_ROLLOUT}.get_all_platform_secret_rollouts", get_all),
+        patch.object(sweeper, "_register_missing_kinds", AsyncMock(return_value=True)),
+        patch(f"{_ROLLOUT}.list_workspaces_behind_platform_secret", list_behind),
+    ):
+        await sweeper.sweep_once()
+
+    assert list_behind.await_args.args[0] == after
+
+
+@pytest.mark.asyncio
+async def test_registration_skips_kinds_registered_or_without_credentials():
+    sweeper = PlatformSecretSweeper()
+    sweeper._config = _sweep_config(e2b_key="")
+    register = AsyncMock(return_value=True)
+
+    with (
+        patch(
+            f"{_ROLLOUT}.served_platform_secret_kinds",
+            AsyncMock(return_value={"daytona": 1, "e2b": 2}),
+        ),
+        patch.object(sweeper, "_register_kind", register),
+    ):
+        assert await sweeper._register_missing_kinds(
+            {"daytona": _rollout_set()}
+        ) is False
+
+    register.assert_not_awaited()
+
+
+def _lock_conn(acquired: list[bool], keys: list[str], unlocked: list[str]):
+    @asynccontextmanager
+    async def _conn_cm():
+        async def _execute(sql, params=None):
+            cur = MagicMock()
+            if "pg_try_advisory_lock" in sql:
+                keys.append(params[0])
+                cur.fetchone = AsyncMock(return_value=(acquired.pop(0),))
+            return cur
+
+        async def _unlock(sql, params=None):
+            if "pg_advisory_unlock" in sql:
+                unlocked.append(params[0])
+
+        conn = MagicMock()
+        conn.execute = AsyncMock(side_effect=_execute)
+        conn.close = AsyncMock()
+        unlock_cur = MagicMock()
+        unlock_cur.execute = AsyncMock(side_effect=_unlock)
+        conn.cursor.return_value.__aenter__.return_value = unlock_cur
+        yield conn
+
+    return _conn_cm
+
+
+@pytest.mark.asyncio
+async def test_registration_retry_runs_under_the_kinds_lock_and_backs_off(
+    monkeypatch,
+):
+    from src.server.services import platform_secret_sweep
+    from src.server.services.platform_secret_rollout import (
+        PlatformSecretReadinessError,
+    )
+
+    sweeper = PlatformSecretSweeper()
+    sweeper._config = _sweep_config()
+    clock = [1000.0]
+    monkeypatch.setattr(platform_secret_sweep.time, "monotonic", lambda: clock[0])
+    acquired = [False, True, True]
+    keys: list[str] = []
+    unlocked: list[str] = []
+    reconcile = AsyncMock(side_effect=ConnectionError("e2b down"))
+
+    async def register() -> bool:
+        return await sweeper._register_missing_kinds({"daytona": _rollout_set()})
+
+    with (
+        patch(
+            "src.server.database.pool.get_db_connection",
+            _lock_conn(acquired, keys, unlocked),
+        ),
+        patch(
+            f"{_ROLLOUT}.served_platform_secret_kinds",
+            AsyncMock(return_value={"daytona": 1, "e2b": 1}),
+        ),
+        patch(
+            f"{_ROLLOUT}.get_platform_secret_rollouts",
+            AsyncMock(side_effect=PlatformSecretReadinessError("not initialized")),
+        ),
+        patch(f"{_ROLLOUT}.reconcile_and_register_kind", reconcile),
+    ):
+        # A sibling holds the kind's lock: this worker leaves it alone.
+        assert await register() is False
+        reconcile.assert_not_awaited()
+        # Its turn, and the provider is down: retried only after the backoff.
+        assert await register() is False
+        assert reconcile.await_count == 1
+        clock[0] += 60
+        assert await register() is False
+        assert reconcile.await_count == 1
+        clock[0] += platform_secret_sweep.REGISTER_RETRY_S
+        reconcile.side_effect = None
+        reconcile.return_value = _rollout_set(provider="e2b")
+        assert await register() is True
+
+    assert reconcile.await_count == 2
+    assert reconcile.await_args.args[1] == "e2b"
+    key = platform_secret_sweep.registration_lock_key("e2b")
+    assert keys == [key] * 3
+    # Released after the failed attempt and after the one that landed.
+    assert unlocked == [key, key]
+    assert "e2b" not in sweeper._register_retry_at
+
+
+@pytest.mark.asyncio
+async def test_registration_leaves_a_kind_a_sibling_just_registered():
+    from src.server.services.platform_secret_sweep import registration_lock_key
+
+    sweeper = PlatformSecretSweeper()
+    sweeper._config = _sweep_config()
+    reconcile = AsyncMock()
+    unlocked: list[str] = []
+
+    with (
+        patch(
+            "src.server.database.pool.get_db_connection",
+            _lock_conn([True], [], unlocked),
+        ),
+        patch(
+            f"{_ROLLOUT}.get_platform_secret_rollouts",
+            AsyncMock(return_value=_rollout_set(provider="e2b")),
+        ),
+        patch(f"{_ROLLOUT}.reconcile_and_register_kind", reconcile),
+    ):
+        assert await sweeper._register_kind("e2b") is False
+
+    reconcile.assert_not_awaited()
+    assert unlocked == [registration_lock_key("e2b")]

@@ -576,6 +576,9 @@ export type NotificationMessage = {
   /** Optional longer text (e.g. a compaction summary) surfaced via the
    *  notification's expand toggle. */
   detail?: string;
+  /** Set on a price alert's row, which is drawn from this instead of
+   *  `content`: a notification rides the turn it sits in, as the alert does. */
+  marketAlert?: import('@/pages/ChatAgent/session/marketWatchEvents').MarketAlert;
   isHistory?: boolean;
 };
 

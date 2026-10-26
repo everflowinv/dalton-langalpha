@@ -71,6 +71,10 @@ export default defineConfig({
         // the send with a route handler, so no request leaves the browser.
         VITE_SUPABASE_URL: 'https://example.supabase.co',
         VITE_SUPABASE_PUBLISHABLE_KEY: 'e2e-placeholder-key',
+        // Set, as a deployment that publishes a privacy policy sets it, so the
+        // sign-in sentence carries both of its links and the tab walk lands on
+        // each. Nothing follows it.
+        VITE_PRIVACY_URL: 'https://example.com/privacy',
         VITE_API_BASE_URL: `http://127.0.0.1:${E2E_MOCK_PORT}`,
       },
     },

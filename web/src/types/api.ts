@@ -120,6 +120,15 @@ export interface WorkspacesResponse {
   total?: number;
 }
 
+/** Request body for `POST /api/v1/workspaces`. */
+export interface WorkspaceCreate {
+  name: string;
+  description?: string;
+  config?: Record<string, unknown>;
+  /** The caller's live computer to put the folder on. Omitted means the primary. */
+  computer_id?: string;
+}
+
 /** Count-quota status for one elevated capability. `limit === -1` means unlimited. */
 export interface WorkspaceCapacity {
   used: number;
@@ -155,7 +164,8 @@ export type ComputerStatus =
 export interface Computer {
   computer_id: string;
   user_id: string;
-  /** Execution backend, e.g. `daytona` or `docker`. */
+  /** Execution backend. Kept plain like `status`: a kind this build does not
+   *  know is still a real machine, and `providerLabel()` shows it as is. */
   kind: string;
   name: string;
   /** Wire value, kept plain: an unrecognized state is real, and
@@ -271,10 +281,79 @@ export interface ComputerActionResponse {
   message?: string;
 }
 
+/** One entry of `GET /api/v1/computers/providers`. */
+export interface ComputerProviderOption {
+  /** A sandbox backend, plain like {@link Computer.kind}: a deployment can
+   *  offer one this build does not know. */
+  kind: string;
+  /** The deployment's default, which a create without `kind` lands on. */
+  is_default: boolean;
+  /** False when the user's plan lacks it; null when it is not gated or the
+   *  platform did not say, which is treated as allowed. */
+  allowed: boolean | null;
+}
+
+/** The providers a user can create a computer on, default first. */
+export interface ComputerProvidersResponse {
+  providers: ComputerProviderOption[];
+}
+
+// --- Workspace move ---
+
+/**
+ * Where a move to another computer is. The first four are a move still
+ * running (`preparing` and `backing_up` can still be cancelled); the last
+ * three are how it ended.
+ */
+export type WorkspaceMovePhase =
+  | 'preparing'
+  | 'backing_up'
+  | 'staged'
+  | 'committed'
+  | 'done'
+  | 'failed'
+  | 'cancelled';
+
+/**
+ * Why a move was refused up front (the 409's `detail`) or failed later (the
+ * move's `error`): one shape for both. `message` is the server's sentence,
+ * written to be shown as is.
+ */
+export interface WorkspaceMoveError {
+  code: string;
+  message: string;
+  /** For `backup_incomplete`: the files the backup could not save. */
+  files?: UnsavedFile[];
+}
+
+/** `GET /workspaces/{id}/move`: the workspace's latest move. */
+export interface WorkspaceMove {
+  move_id: string;
+  workspace_id: string;
+  source_computer_id: string;
+  target_computer_id: string;
+  /** Home moving because its target is being made primary; the flip lands when the move commits. */
+  make_primary: boolean;
+  phase: WorkspaceMovePhase;
+  error?: WorkspaceMoveError | null;
+  created_at: string;
+  committed_at?: string | null;
+  finished_at?: string | null;
+}
+
+/** `POST /computers/{id}/make-primary`: flipped now, or Home moves first and `move` runs it. */
+export interface MakePrimaryResponse {
+  computer_id: string;
+  is_primary: boolean;
+  move: WorkspaceMove | null;
+}
+
 /** Request body for `POST /api/v1/computers`. Tier is the machine's, not a workspace's. */
 export interface ComputerCreate {
   name?: string;
   resource_tier?: ResourceTier;
+  /** Omitted means the deployment's default provider. */
+  kind?: string;
 }
 
 export interface ReorderItem {

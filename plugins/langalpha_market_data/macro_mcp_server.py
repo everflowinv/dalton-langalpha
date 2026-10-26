@@ -29,6 +29,7 @@ from typing import Optional
 
 
 from data_client.fmp import get_fmp_client, fmp_lifespan
+from mcp_servers._dates import calendar_days
 from mcp_servers._envelope import error_from_exception, make_error, make_response
 from mcp_servers._schemas import (
     NULLABLE_STR,
@@ -45,6 +46,13 @@ mcp = MCPServer("MacroMCP", lifespan=fmp_lifespan)
 _SOURCE = "fmp"
 _CLIENT_UNAVAILABLE = "FMP client is unavailable"
 _UPSTREAM_FAILED = "FMP request failed"
+
+# The tool documents these two names, but FMP serves the series under others and
+# answers the documented ones with a non-JSON error. Every other name is FMP's own.
+_FMP_INDICATOR_NAMES = {
+    "federalFundsRate": "federalFunds",
+    "nonFarmPayrolls": "totalNonfarmPayroll",
+}
 
 
 _OUT_GET_ECONOMIC_INDICATOR = output_model(
@@ -86,7 +94,9 @@ async def get_economic_indicator(
         return make_error("client_unavailable", _CLIENT_UNAVAILABLE, indicator=name)
 
     try:
-        data = await client.get_economic_indicators(name, limit=limit)
+        data = await client.get_economic_indicators(
+            _FMP_INDICATOR_NAMES.get(name, name), limit=limit
+        )
 
         return make_response(
             data or [],
@@ -139,7 +149,8 @@ async def get_economic_calendar(
         return make_error("client_unavailable", _CLIENT_UNAVAILABLE)
 
     try:
-        data = await client.get_economic_calendar(from_date=from_date, to_date=to_date)
+        lo, hi = calendar_days(from_date, to_date)
+        data = await client.get_economic_calendar(from_date=lo, to_date=hi)
 
         return make_response(
             data or [],
@@ -194,7 +205,8 @@ async def get_treasury_rates(
         return make_error("client_unavailable", _CLIENT_UNAVAILABLE)
 
     try:
-        data = await client.get_treasury_rates(from_date=from_date, to_date=to_date)
+        lo, hi = calendar_days(from_date, to_date)
+        data = await client.get_treasury_rates(from_date=lo, to_date=hi)
 
         return make_response(
             data or [],
@@ -280,7 +292,8 @@ async def get_earnings_calendar(
         return make_error("client_unavailable", _CLIENT_UNAVAILABLE)
 
     try:
-        data = await client.get_earnings_calendar_by_date(from_date=from_date, to_date=to_date)
+        lo, hi = calendar_days(from_date, to_date)
+        data = await client.get_earnings_calendar_by_date(from_date=lo, to_date=hi)
 
         return make_response(
             data or [],

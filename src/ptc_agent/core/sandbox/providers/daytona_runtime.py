@@ -98,6 +98,10 @@ class DaytonaRuntime(SandboxRuntime):
         return urlparse(url).hostname
 
     @property
+    def image_prebuilt(self) -> bool:
+        return self.snapshot_name is not None
+
+    @property
     def working_dir(self) -> str:
         """Return cached working dir, or Daytona default if not yet fetched."""
         return self._working_dir or self._default_working_dir
@@ -150,6 +154,8 @@ class DaytonaRuntime(SandboxRuntime):
     async def delete(self) -> None:
         await self._sandbox.delete()
 
+    updates_env = True
+
     async def update_env(
         self, env: dict[str, str], *, unset: Sequence[str] = ()
     ) -> None:
@@ -169,18 +175,10 @@ class DaytonaRuntime(SandboxRuntime):
 
     # -- Execution --
 
-    async def exec(self, command: str, timeout: int = 60) -> ExecResult:
-        return await self._exec(command, timeout)
-
-    async def exec_as_root(
-        self, command: str, timeout: int = 60, env: dict[str, str] | None = None
+    async def exec(
+        self, command: str, timeout: int = 60, *, env: dict[str, str] | None = None
     ) -> ExecResult:
-        # Commands here already run as root.
-        return await self._exec(command, timeout, env)
-
-    async def _exec(
-        self, command: str, timeout: int, env: dict[str, str] | None = None
-    ) -> ExecResult:
+        # Commands here already run as root, so exec_as_root keeps the default.
         result = await self._sandbox.process.exec(command, env=env, timeout=timeout)
         # SDK exec returns an object with .result (combined stdout+stderr)
         # and .exit_code. There is no separate stderr field.
@@ -292,25 +290,11 @@ class DaytonaRuntime(SandboxRuntime):
     async def create_session(self, session_id: str) -> None:
         await self._sandbox.process.create_session(session_id)
 
-    async def session_execute(
-        self,
-        session_id: str,
-        command: str,
-        *,
-        run_async: bool = False,
-        timeout: int | None = None,
-    ) -> SessionCommandResult:
-        req = SessionExecuteRequest(command=command, run_async=run_async)
-        result = await self._sandbox.process.execute_session_command(
-            session_id, req, timeout=timeout
-        )
+    async def session_execute(self, session_id: str, command: str) -> str:
+        req = SessionExecuteRequest(command=command, run_async=True)
+        result = await self._sandbox.process.execute_session_command(session_id, req)
         self._remember_command(session_id, result.cmd_id)
-        return SessionCommandResult(
-            cmd_id=result.cmd_id,
-            exit_code=result.exit_code,
-            stdout=result.stdout or "",
-            stderr=result.stderr or "",
-        )
+        return result.cmd_id
 
     async def session_command_logs(
         self, session_id: str, command_id: str
@@ -417,21 +401,12 @@ class DaytonaRuntime(SandboxRuntime):
 
     # -- Capabilities & metadata --
 
-    @property
-    def capabilities(self) -> set[str]:
-        return {
-            "exec",
-            "code_run",
-            "file_io",
-            "archive",
-            "snapshot",
-            "preview_url",
-            "sessions",
-            "autostop",
-        }
+    archives = True
 
     async def archive(self) -> None:
         await self._sandbox.archive()
+
+    autostops = True
 
     async def set_autostop_interval(self, minutes: int) -> None:
         """Set the idle auto-stop interval in minutes (0 disables auto-stop)."""

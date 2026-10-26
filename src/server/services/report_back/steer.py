@@ -28,6 +28,12 @@ before the job recorded it), an analyst's report from an automation run (the
 turn carries that run's delivery stamp, which a steer cannot), and anything
 whose eligibility cannot be read right now. A task report nothing is owed for
 any more is closed without a word, as the executor would drop it.
+
+A market-watch target's notice (``market_target``) takes the same road, as
+an alert the reader is shown as its own row (``market_targets/inline.py``).
+Every close of one it was read for stamps the target delivered first. One
+whose own wake turn was admitted is not left to its executor: it is stamped
+to that turn and closed.
 """
 
 from __future__ import annotations
@@ -127,7 +133,9 @@ class SteeredReportInbox:
         repeats a row when the turn ends (a steer as the next turn's input, a
         report as its own turn), never loses it."""
         from src.server.database.runs import outbox as outbox_db
+        from src.server.services.market_targets.inline import stamp_held_alerts
 
+        await stamp_held_alerts(job_ids, run_id)
         try:
             closed = await outbox_db.confirm_jobs(job_ids, owner=("run", run_id))
         except Exception:
@@ -367,6 +375,12 @@ async def _decide(job: dict, thread_id: str) -> SteeredReport | NotOwed | None:
     try:
         if job["hook_type"] == "task_report_back":
             return await _task_offer(job)
+        if job["hook_type"] == "market_target":
+            from src.server.services.market_targets.inline import (
+                market_alert_offer,
+            )
+
+            return await market_alert_offer(job)
         return await _analyst_offer(job, thread_id)
     except Exception:
         logger.warning(
@@ -556,6 +570,10 @@ async def _confirm_found(held: list[str], state, owner: tuple[str, str]) -> list
     ids = [job_id for job_id in held if job_id in found]
     if not ids:
         return []
+    if owner[0] == "run":
+        from src.server.services.market_targets.inline import stamp_held_alerts
+
+        await stamp_held_alerts(ids, owner[1])
     closed = await outbox_db.confirm_jobs(ids, owner=owner)
     if closed:
         logger.info(

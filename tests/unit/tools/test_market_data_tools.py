@@ -712,6 +712,23 @@ class TestFetchCompanyOverview:
         assert "analystRatings" in artifact
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("key", ["epsDiluted", "epsdiluted"])
+    async def test_diluted_eps_reads_the_stable_and_legacy_spellings(self, full_profile, key):
+        """FMP's stable statements spell it epsDiluted; Tushare-mapped and
+        yfinance rows keep epsdiluted."""
+        financial = _make_fake_financial_source(
+            profile_data=full_profile,
+            income_stmt=[{"date": "2025-06-30", "revenue": 94_000_000_000, key: 1.57}],
+        )
+        provider = _make_fake_financial_provider(financial=financial)
+        with (
+            patch(f"{_COMPANY_MOD}.get_financial_data_provider", return_value=provider),
+            patch(f"{_COMPANY_MOD}._fmp_request", return_value=[]),
+        ):
+            _, artifact = await fetch_company_overview("AAPL")
+        assert artifact["quarterlyFundamentals"][0]["epsDiluted"] == 1.57
+
+    @pytest.mark.asyncio
     async def test_cn_profile_prefers_chinese_name(self):
         """A tushare profile's nameLocal wins over the English companyName."""
         financial = _make_fake_financial_source(profile_data=[{
@@ -734,12 +751,15 @@ class TestFetchCompanyOverview:
         assert artifact["name"] == "甲公司"
 
     @pytest.mark.asyncio
-    async def test_cn_metrics_render_through_the_cn_source(self):
+    @pytest.mark.parametrize("stable", [False, True], ids=["legacy", "stable"])
+    async def test_cn_metrics_render_through_the_cn_source(self, stable):
         """ginlix-data's CN snapshot rows carry no TTM suffix; the cn source
-        renames them to FMP's keys, so the table fills from the same reads."""
+        renames them to FMP's keys, so the table fills from the same reads,
+        whether the rows use FMP's legacy spellings or its stable ones."""
         from src.data_client.financial_data_provider import MarketRoute, RoutedFinancialSource
         from src.data_client.ginlix_data.cn_financial import GinlixDataCnFinancialSource
 
+        pe, de = ("priceToEarningsRatio", "debtToEquityRatio") if stable else ("peRatio", "debtToEquity")
         rows = {
             "profile": [{
                 "symbol": "600001.XSHG",
@@ -749,23 +769,21 @@ class TestFetchCompanyOverview:
                 "industry": None,
                 "marketCap": 1_000_000_000_000,
                 "price": 42.0,
-                "exchangeShortName": "SSE",
+                "exchange": "SSE",
+                **({} if stable else {"exchangeShortName": "SSE"}),
             }],
             "key_metrics": [{
                 "symbol": "600001.XSHG",
-                "peRatio": 20.0,
-                "priceToBookRatio": 4.0,
                 "returnOnEquity": 0.25,
                 "returnOnAssets": 0.12,
-                "debtToEquity": 0.30,
             }],
             "financial_ratios": [{
                 "symbol": "600001.XSHG",
-                "peRatio": 20.0,
+                pe: 20.0,
                 "priceToBookRatio": 4.0,
                 "netProfitMargin": 0.40,
                 "operatingProfitMargin": 0.50,
-                "debtToEquity": 0.30,
+                de: 0.30,
                 "currentRatio": 3.0,
                 "quickRatio": 2.5,
             }],
@@ -795,6 +813,7 @@ class TestFetchCompanyOverview:
         assert "| Debt/Equity Ratio | 0.30 |" in content
         assert "| Current Ratio | 3.00 |" in content
         assert "| Quick Ratio | 2.50 |" in content
+        assert "**Market:** SSE" in content
         # A key present with a None value must not print the literal "None".
         assert "Sector: N/A | Industry: N/A" in content
 

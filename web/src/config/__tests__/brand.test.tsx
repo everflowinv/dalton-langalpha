@@ -174,35 +174,34 @@ describe('brand configuration (VITE_BRAND_NAME & VITE_BRAND_MARK)', () => {
     expect(screen.queryByAltText('LangAlpha')).toBeNull();
   });
 
-  it('switches Legal and PrivacyPolicy home navigation links while keeping legal body text unchanged', async () => {
+  it('switches the Legal home navigation link while keeping legal body text unchanged', async () => {
+    // The in-app PrivacyPolicy page is gone (upstream moved the policy to an
+    // external VITE_PRIVACY_URL link rendered inside Legal), so only Legal's
+    // own back link is branded here.
     vi.stubEnv('VITE_BRAND_NAME', '');
     vi.resetModules();
 
     const { default: LegalDefault } = await import('@/pages/Legal/Legal');
-    const { default: PrivacyDefault } = await import('@/pages/Legal/PrivacyPolicy');
 
     const { unmount } = render(
       <MemoryRouter>
         <LegalDefault />
-        <PrivacyDefault />
       </MemoryRouter>,
     );
-    expect(screen.getAllByText('← Back to LangAlpha')).toHaveLength(3);
+    expect(screen.getAllByText('← Back to LangAlpha')).toHaveLength(1);
     unmount();
 
     vi.stubEnv('VITE_BRAND_NAME', 'Everflow');
     vi.resetModules();
 
     const { default: LegalEverflow } = await import('@/pages/Legal/Legal');
-    const { default: PrivacyEverflow } = await import('@/pages/Legal/PrivacyPolicy');
 
     const { container } = render(
       <MemoryRouter>
         <LegalEverflow />
-        <PrivacyEverflow />
       </MemoryRouter>,
     );
-    expect(screen.getAllByText('← Back to Everflow')).toHaveLength(3);
+    expect(screen.getAllByText('← Back to Everflow')).toHaveLength(1);
     expect(container.textContent).toContain('hosted LangAlpha service');
     expect(container.textContent).toContain('langalpha repository');
     expect(container.textContent).toContain('ginlix.ai');

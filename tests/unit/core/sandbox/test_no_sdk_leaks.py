@@ -83,3 +83,50 @@ def test_allowed_file_does_import_daytona() -> None:
         assert _file_imports_daytona(path), (
             f"Expected {allowed} to import daytona but it does not"
         )
+
+
+# The only files allowed to import the E2B SDK
+ALLOWED_E2B_IMPORTS = {
+    "src/ptc_agent/core/sandbox/providers/e2b.py",
+    "src/ptc_agent/core/sandbox/providers/e2b_runtime.py",
+    "src/ptc_agent/core/sandbox/providers/e2b_secrets.py",
+}
+
+
+def _file_imports_e2b(filepath: Path) -> bool:
+    """Return True if *filepath* contains any import of e2b (AST-based)."""
+    try:
+        source = filepath.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(filepath))
+    except (SyntaxError, UnicodeDecodeError):
+        return False
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "e2b" or alias.name.startswith("e2b."):
+                    return True
+        elif isinstance(node, ast.ImportFrom):
+            if node.module and (
+                node.module == "e2b" or node.module.startswith("e2b.")
+            ):
+                return True
+    return False
+
+
+def test_no_e2b_import_leaks() -> None:
+    """All E2B imports must be inside the allowed provider modules."""
+    assert SRC_ROOT.is_dir(), f"src root not found: {SRC_ROOT}"
+
+    violations: list[str] = []
+    for py_file in _collect_python_files(SRC_ROOT):
+        rel = py_file.relative_to(SRC_ROOT.parent)
+        if str(rel) in ALLOWED_E2B_IMPORTS:
+            continue
+        if _file_imports_e2b(py_file):
+            violations.append(str(rel))
+
+    assert violations == [], (
+        "e2b imported outside allowed modules:\n"
+        + "\n".join(f"  - {v}" for v in sorted(violations))
+    )

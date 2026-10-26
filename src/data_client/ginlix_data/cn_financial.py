@@ -56,7 +56,9 @@ _SCREEN_EXCHANGES = {
 }
 # The latest-snapshot kinds arrive in the period rows' spelling; every other
 # FinancialDataSource answers get_key_metrics / get_financial_ratios with FMP's
-# TTM keys, so these rows are renamed to match. Most keys just gain the suffix.
+# TTM keys, so these rows are renamed to match. Most keys just gain the suffix;
+# the irregular ones are the legacy spellings a ginlix-data that predates FMP's
+# stable names still sends.
 _TTM_VERBATIM = frozenset({"symbol", "marketCap", "beta", "forwardPERatio"})
 _TTM_IRREGULAR = {
     "peRatio": "priceToEarningsRatioTTM",

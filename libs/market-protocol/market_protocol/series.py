@@ -14,7 +14,7 @@ from typing import Any
 
 from .enums import PriceTreatment, Tier
 from .models import InstrumentRef, OhlcvBar, Series, SeriesHeader
-from .symbology import MINOR_UNIT_PLACES, display_decimals_for
+from .symbology import MINOR_UNIT_PLACES, display_decimals_for, to_major_units
 
 
 # The widest timestamp an int64 reader can hold.
@@ -67,17 +67,17 @@ def build_series(
 ) -> Series:
     """Canonical ``{time, open, high, low, close, volume[, vwap, trades, is_final]}`` rows to a Series.
 
-    Rows carry prices in the venue's quote unit (pence on XLON, divided by 100
-    here per ``ref.display_unit``, with ``display_decimals`` widened by the
+    Rows carry prices in the venue's quote unit (pence on XLON, shifted to
+    pounds here per ``ref.display_unit``, with ``display_decimals`` widened by the
     same two places) and ``ts_of`` returns the window open in Unix
     milliseconds. A row whose timestamp is missing, unreadable or out of
     range, or without a finite open, high, low and close, is dropped rather
     than charted as a zero or failing the batch; a repeated timestamp keeps
     its last row, the later revision of that window.
     """
-    # An exact power of ten rounds once, where an inexact 0.01 leaves noise
-    # (123.45 * 0.01 != 1.2345).
-    divisor = 10 ** MINOR_UNIT_PLACES.get(ref.display_unit or "", 0)
+    # A decimal shift, since binary division by 100 still leaves noise
+    # (122.1 / 100 is 1.2209999999999999).
+    places = MINOR_UNIT_PLACES.get(ref.display_unit or "", 0)
     by_ts: dict[int, OhlcvBar] = {}
     for row in rows:
         try:
@@ -97,12 +97,12 @@ def build_series(
         is_final = row.get("is_final")
         by_ts[ts] = OhlcvBar(
             ts_event=ts,
-            open=o / divisor,
-            high=h / divisor,
-            low=lo / divisor,
-            close=c / divisor,
+            open=to_major_units(o, places),
+            high=to_major_units(h, places),
+            low=to_major_units(lo, places),
+            close=to_major_units(c, places),
             volume=volume if volume is not None and volume >= 0 else None,
-            vwap=vwap / divisor if vwap is not None else None,
+            vwap=to_major_units(vwap, places) if vwap is not None else None,
             trades=_count(row.get("trades")),
             # Only a real bool says the window closed; anything else reads as forming.
             is_final=is_final if isinstance(is_final, bool) else False,

@@ -700,6 +700,10 @@ except ImportError:
             if untrusted:
                 entry["headers"] = dict(server.headers or {})
                 entry["discovery_uses_secrets"] = discovery_should_use_secrets(server)
+            elif server.auth:
+                # A built-in's headers are host credentials for discovery and
+                # never ship; the client brings the sandbox's own token instead.
+                entry["auth"] = server.auth
             if server.call_timeout_s:  # DALTON-HOOK(mcp-call-timeout)
                 entry["call_timeout_s"] = float(server.call_timeout_s)
             return entry
@@ -853,7 +857,8 @@ _EMISSION_PROBE_TOOL_2 = MCPToolInfo(
 )
 
 # Third probe axis: the config/epilogue emission. One server per config
-# branch: builtin uv-stdio (path rewrite + env_keys), untrusted user http
+# branch: builtin uv-stdio (path rewrite + env_keys), builtin http on the
+# sandbox's data token (auth kept, headers dropped), untrusted user http
 # (headers + secret-mode hint), OAuth relay-bound. Hash-relevant only; never
 # uploaded.
 _EMISSION_PROBE_SERVERS = [
@@ -863,6 +868,13 @@ _EMISSION_PROBE_SERVERS = [
         command="uv",
         args=["run", "python", "mcp_servers/probe_server.py"],
         env={"PROBE_API_KEY": "${PROBE_API_KEY}"},
+    ),
+    MCPServerConfig(
+        name="probe_data",
+        transport="http",
+        url="https://probe.example/data",
+        auth="data_token",
+        headers={"X-Probe-Discovery": "host-only"},
     ),
     MCPServerConfig(
         name="probe_user",

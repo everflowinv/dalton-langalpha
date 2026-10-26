@@ -55,7 +55,10 @@ dependencies = [
     "fastapi>=0.110.0",
     "anyio>=4.0.0",
     "uvicorn>=0.27.1",
-    "websockets>=12.0",
+    # The preview proxy subclasses the asyncio client to refuse redirects.
+    "websockets>=15.0",
+    # The public suffix list, for the preview base's separate-site check.
+    "tld>=0.13",
     "pandas>=2.2.3",
     "numpy>=1.24,<3.0",
     "json-repair>=0.7.0",
@@ -112,6 +115,7 @@ dependencies = [
     # Imported directly (empty Registry = the no-remote-refs discipline), not
     # just as jsonschema's transitive.
     "referencing>=0.30",
+    "e2b>=2.53.1,<3",
 ]
 
 [tool.uv.sources]
@@ -198,6 +202,7 @@ markers = [
     "yahoo: hits live Yahoo Finance, no secrets needed; run by yahoo-live.yml when yfinance code or its version changes, not by the general integration job",
     "provider_docker: tests requiring Docker daemon",
     "provider_daytona: tests requiring Daytona API key",
+    "provider_e2b: tests requiring E2B API key",
     "regression: locks live market-data API behavior against a running server + live providers — opt-in",
 ]
 addopts = "-m 'not integration and not slow and not regression'"

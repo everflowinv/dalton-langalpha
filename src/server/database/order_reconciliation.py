@@ -26,7 +26,7 @@ from psycopg.rows import dict_row
 
 from src.server.database.order_attempts import row_as_json
 from src.server.database.pool import get_db_connection
-from src.server.database.session_lock import release_session_lock
+from src.server.database.session_lock import try_session_lock
 from src.server.services.brokerage_capabilities import OrderAction
 from src.server.services.brokerage_orders import OPEN_STATUSES, AttemptStatus
 from src.server.services.brokerage_orders.models import (
@@ -253,39 +253,9 @@ async def record_observation(
 
 
 @asynccontextmanager
-async def _try_session_lock(key: str) -> AsyncIterator[bool]:
-    """Hold a session advisory lock, or yield False when someone else has it.
-
-    Session-scoped rather than transaction-scoped: a holder makes network calls
-    between its statements, and wrapping those in a transaction would pin a
-    connection inside an open snapshot for the length of a brokerage's latency.
-    """
-    async with get_db_connection() as conn:
-        try:
-            async with conn.cursor() as cur:
-                await cur.execute(
-                    "SELECT pg_try_advisory_lock(hashtextextended(%s, 0))",
-                    (key,),
-                )
-                row = await cur.fetchone()
-        except BaseException:
-            # The lock may already have been granted: a session lock survives a
-            # cancelled fetch, so release it rather than pool a locked session.
-            await release_session_lock(conn, key)
-            raise
-        if not (row and row[0]):
-            yield False
-            return
-        try:
-            yield True
-        finally:
-            await release_session_lock(conn, key)
-
-
-@asynccontextmanager
 async def reconcile_pass_lock() -> AsyncIterator[bool]:
     """Hold the single-runner lock for a pass head, or False when it is held."""
-    async with _try_session_lock(PASS_LOCK_KEY) as held:
+    async with try_session_lock(PASS_LOCK_KEY) as held:
         yield held
 
 
@@ -297,7 +267,7 @@ async def reconcile_group_lock(user_id: str, server: str) -> AsyncIterator[bool]
     the same way a pass is. Its rows keep their ``swept_at`` stamp, so the next
     pass finds them at the head of the queue rather than losing them.
     """
-    async with _try_session_lock(group_lock_key(user_id, server)) as held:
+    async with try_session_lock(group_lock_key(user_id, server)) as held:
         yield held
 
 

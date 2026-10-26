@@ -32,6 +32,7 @@ export function apiMockModule<T extends Record<string, unknown>>(overrides = {} 
     getThreadFeedback: vi.fn().mockResolvedValue([]),
     watchThread: vi.fn().mockImplementation(() => ({ abort: new AbortController() })),
     fetchMarketWatch: vi.fn().mockResolvedValue({ thread_id: 't', symbols: [] }),
+    cancelMarketTarget: vi.fn().mockResolvedValue({ cancelled: true }),
     ...overrides,
   };
 }

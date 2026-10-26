@@ -539,8 +539,9 @@ export function useChatMessages(
 
   // Market-watch chip lifecycle: seed on thread load/switch + refetch on turn
   // completion. Live mid-turn overwrites arrive via `market_watch_update` SSE
-  // events, which forward `setMarketWatch` (see processEvent below).
-  const { marketWatch, setMarketWatch } = useMarketWatch(threadId, isLoading, threadIdRef);
+  // events, which forward `setMarketWatch` (see processEvent below), and a
+  // delivered price alert refetches through `refreshMarketWatch`.
+  const { marketWatch, setMarketWatch, refreshMarketWatch, cancelMarketTarget } = useMarketWatch(threadId, isLoading, threadIdRef);
 
   // Track if this is a new conversation (for todo list card management)
   const isNewConversationRef = useRef(false);
@@ -3408,6 +3409,7 @@ export function useChatMessages(
     releaseStreamOwnership,
     attachSubagentMux,
     setMarketWatch,
+    refreshMarketWatch,
     refreshWorkspaceFolder,
     armReportBack: () => armReportBackWatch(threadIdRef.current, null, null),
     refreshWorkspaces: () => invalidateNewWorkspace(queryClient),
@@ -3448,6 +3450,7 @@ export function useChatMessages(
     threadModels,
     isLoading,
     marketWatch,
+    cancelMarketTarget,
     hasActiveSubagents,
     awaitingReportBack,
     reportBackOwed,

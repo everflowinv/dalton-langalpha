@@ -30,7 +30,7 @@ EVENTS_TERMINAL = {"running", "error", "deleted"}
 
 # None means the subject row is gone.
 ReadStatusFn = Callable[[], Awaitable[Optional[str]]]
-# Frame callback accepts status, sandbox_state=None, and error=None.
+# Frame callback accepts status, sandbox_state=None, error=None, and stage=None.
 FrameFn = Callable[..., str]
 SubscribeFn = Callable[[], AbstractAsyncContextManager[Any]]
 SubscriptionKeyFn = Callable[[], object]
@@ -41,6 +41,7 @@ def sse_status_event(
     status: str,
     sandbox_state: Optional[str] = None,
     error: Optional[str] = None,
+    stage: Optional[str] = None,
 ) -> str:
     """subject carries ids only, never status."""
     data: Dict[str, Optional[str]] = {**subject, "status": status}
@@ -48,6 +49,8 @@ def sse_status_event(
         data["sandbox_state"] = sandbox_state
     if error:
         data["error"] = error
+    if stage:
+        data["stage"] = stage
     return f"event: status\ndata: {json.dumps(data)}\n\n"
 
 
@@ -63,6 +66,7 @@ async def status_event_stream(
     started = time.monotonic()
     last_status = initial_status
     last_sandbox_state: str | None = None
+    last_stage: str | None = None
 
     async def reconcile() -> tuple[str | None, bool]:
         nonlocal last_status
@@ -123,6 +127,16 @@ async def status_event_stream(
                         # Only reconcile owns terminal transitions; guard the status actually emitted.
                         last_sandbox_state = sandbox_state
                         yield frame(event_status, sandbox_state=sandbox_state)
+                    # Build steps of a new sandbox, the same kind of unpersisted hint.
+                    stage = payload.get("stage")
+                    if (
+                        isinstance(stage, str)
+                        and stage
+                        and stage != last_stage
+                        and event_status not in EVENTS_TERMINAL
+                    ):
+                        last_stage = stage
+                        yield frame(event_status, stage=stage)
                     # A failed background start reverts to stopped, so DB confirmation hides failure.
                     # Only its error-bearing publish carries the reason and can end the wait.
                     failure = payload.get("error")

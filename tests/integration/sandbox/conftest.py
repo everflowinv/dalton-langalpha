@@ -7,6 +7,7 @@ Provider selection via env vars:
 Available providers:
     memory   (default) -- in-process MemoryProvider, no infra needed
     daytona  -- real Daytona sandbox (requires DAYTONA_API_KEY)
+    e2b      -- real E2B sandbox (requires E2B_API_KEY)
     docker   -- Docker containers (requires Docker daemon + langalpha-sandbox image)
 
 Usage:
@@ -39,6 +40,7 @@ from ptc_agent.config.core import (
     CoreConfig,
     DaytonaConfig,
     DockerConfig,
+    E2BConfig,
     FilesystemConfig,
     LoggingConfig,
     MCPConfig,
@@ -75,6 +77,8 @@ def _can_run_provider(name: str) -> bool:
         return True
     if name == "daytona":
         return bool(os.environ.get("DAYTONA_API_KEY"))
+    if name == "e2b":
+        return bool(os.environ.get("E2B_API_KEY"))
     if name == "docker":
         return shutil.which("docker") is not None
     return False
@@ -91,17 +95,19 @@ def _make_core_config(
     api_key: str = "test-key",
     base_url: str = "https://app.daytona.io/api",
     docker_config: DockerConfig | None = None,
+    e2b_config: E2BConfig | None = None,
 ) -> CoreConfig:
     """Build a CoreConfig suitable for testing."""
     return CoreConfig(
         sandbox=SandboxConfig(
-            provider=provider if provider in ("daytona", "docker") else "daytona",
+            provider=provider if provider in ("daytona", "docker", "e2b") else "daytona",
             daytona=DaytonaConfig(
                 api_key=api_key,
                 base_url=base_url,
                 snapshot_enabled=False,  # skip snapshot for tests
             ),
             docker=docker_config or DockerConfig(),
+            e2b=e2b_config or E2BConfig(),
         ),
         security=SecurityConfig(
             max_execution_time=60,
@@ -220,6 +226,16 @@ async def _make_provider(
         )
         yield provider
         await provider.close()
+    elif name == "e2b":
+        api_key = os.environ.get("E2B_API_KEY", "")
+        if not api_key:
+            pytest.skip("E2B_API_KEY not set")
+        from ptc_agent.core.sandbox.providers.e2b import E2BProvider
+
+        working_dir = os.environ.get("E2B_SANDBOX_WORK_DIR", "/home/workspace")
+        provider = E2BProvider(E2BConfig(api_key=api_key), working_dir=working_dir)
+        yield provider
+        await provider.close()
     elif name == "docker":
         from ptc_agent.core.sandbox.providers.docker import DockerProvider
 
@@ -319,6 +335,15 @@ def _build_core_config(provider_name: str, base_dir: str) -> CoreConfig:
                 dev_mode=os.environ.get("DOCKER_SANDBOX_DEV_MODE", "").lower() in ("1", "true"),
                 host_work_dir=os.environ.get("DOCKER_SANDBOX_HOST_DIR"),
             ),
+        )
+    elif provider_name == "e2b":
+        api_key = os.environ.get("E2B_API_KEY", "")
+        if not api_key:
+            pytest.skip("E2B_API_KEY not set")
+        return _make_core_config(
+            working_directory=os.environ.get("E2B_SANDBOX_WORK_DIR", "/home/workspace"),
+            provider="e2b",
+            e2b_config=E2BConfig(api_key=api_key),
         )
 
     # memory provider -- use temp dir as working directory

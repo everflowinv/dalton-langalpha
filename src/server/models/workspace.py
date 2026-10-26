@@ -57,6 +57,13 @@ class WorkspaceCreate(BaseModel):
         None,
         description="Optional configuration settings",
     )
+    computer_id: Optional[uuid.UUID] = Field(
+        None,
+        description=(
+            "One of the caller's computers to create the workspace on; their "
+            "primary computer when absent"
+        ),
+    )
 
 
 class WorkspaceUpdate(BaseModel):

@@ -31,6 +31,7 @@ from src.server.database.session_lock import (
     await_settled,
     shared_lock_session,
 )
+from src.server.database.sql_fences import MOVE_SET_ASIDE_PHASES, workspace_move_fences
 from src.server.database.workspace_names import (
     HOME_FOLDER,
     WorkspaceNameInvalid,
@@ -410,10 +411,22 @@ async def computer_run_in_progress(
 async def _busy(
     cur, computer_id: str, rows: Iterable[FolderRow], own_run_id: Optional[str]
 ) -> set[str]:
-    """Every row while any run on the computer is in progress, else none."""
-    if not await computer_run_in_progress(cur, computer_id, own_run_id=own_run_id):
+    """Every row while any run on the computer is in progress, else any being
+    moved off it, whose folder the move sets aside by the name it has now."""
+    rows = list(rows)
+    if await computer_run_in_progress(cur, computer_id, own_run_id=own_run_id):
+        return {r.workspace_id for r in rows}
+    if not rows:
         return set()
-    return {r.workspace_id for r in rows}
+    await cur.execute(
+        f"""
+        SELECT workspace_id FROM workspaces
+        WHERE workspace_id = ANY(%s::uuid[])
+          AND {workspace_move_fences("workspaces.workspace_id")}
+        """,
+        ([r.workspace_id for r in rows],),
+    )
+    return {str(row["workspace_id"]) for row in await cur.fetchall()}
 
 
 async def busy_workspace_ids(
@@ -551,9 +564,12 @@ async def workspace_folder_in_use(workspace_id: str):
     A settle moves only folders it can hold exclusively, so a change whose
     paths were read under this lands before the move or after it. Between the
     two, ``mkdir -p`` would recreate the folder the move left, and the file
-    would land where nothing reads it. Held on the process's shared lock
-    session rather than a pooled connection, so the work under it reads
-    through the pool freely, and a hold taken inside another stacks on it.
+    would land where nothing reads it. A move to another computer sets the
+    folder aside under this hold too, but the row names the folder it left
+    until the move ends, so from staging on the hold is refused. Held on the
+    process's shared lock session rather than a pooled connection, so the work
+    under it reads through the pool freely, and a hold taken inside another
+    stacks on it.
     """
     key = f"{_IN_USE_NS}:{workspace_id}"
     locks = shared_lock_session()
@@ -562,9 +578,21 @@ async def workspace_folder_in_use(workspace_id: str):
     except SharedLockBusy as e:
         raise WorkspaceFolderMoving(workspace_id) from e
     try:
+        if await _folder_set_aside(workspace_id):
+            raise WorkspaceFolderMoving(workspace_id)
         yield
     finally:
         await locks.release(conn, key)
+
+
+async def _folder_set_aside(workspace_id: str) -> bool:
+    async with get_db_connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            "SELECT EXISTS (SELECT 1 FROM workspace_moves"
+            " WHERE workspace_id = %s AND phase = ANY(%s)) AS set_aside",
+            (workspace_id, list(MOVE_SET_ASIDE_PHASES)),
+        )
+        return bool((await cur.fetchone())["set_aside"])
 
 
 async def hold_workspace_folder(conn, workspace_id: str) -> bool:

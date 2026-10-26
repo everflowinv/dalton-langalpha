@@ -1,12 +1,18 @@
 """Thread CRUD: list, get, update, delete, external-id stamp, market watch."""
 
-from typing import Optional
+from datetime import datetime, timezone
+from typing import Literal, Optional
+from uuid import UUID
 
 
 from fastapi import HTTPException, Query
 from pydantic import BaseModel, Field
 
+from src.server.database.market_targets import cancel_targets, list_thread_targets
 from src.server.services.features import user_feature_enabled
+from src.server.models.automation import MarketType
+from src.server.services.market_targets.changes import targets_changed
+from src.server.services.market_targets.listing import watch_spelling
 from src.server.services.llm.thread_model import require_selectable_model
 from src.server.services.thread_lifecycle import project_lifecycle
 from src.server.services.thread_lifecycle_feed import (
@@ -234,19 +240,92 @@ async def mark_thread_seen(
     return ThreadSeenResponse(**result)
 
 
+class MarketWatchTarget(BaseModel):
+    target_id: str
+    symbol: str
+    kind: Literal["above", "below", "pct_up", "pct_down"]
+    value: float
+    # The agent's vocabulary, not storage's: "now" is stored as "armed".
+    pct_from: Optional[Literal["previous_close", "now"]] = None
+    armed_price: Optional[float] = None
+    status: Literal["armed", "fired", "expired", "cancelled"]
+    expires_at: datetime
+    fired_at: Optional[datetime] = None
+    fired_price: Optional[float] = None
+    created_at: datetime
+
+
 class MarketWatchResponse(BaseModel):
     thread_id: str
     symbols: list[str]
+    targets: list[MarketWatchTarget] = Field(default_factory=list)
+
+
+class MarketWatchTargetCancelResponse(BaseModel):
+    cancelled: bool
+
+
+def _target_out(row: dict, now: datetime) -> MarketWatchTarget:
+    pct_from = row.get("pct_from")
+    status = row["status"]
+    if status == "armed" and row["expires_at"] <= now:
+        # Lapsed but not yet swept: the price monitor no longer checks it, so
+        # showing it armed would offer a cancel for a target already over.
+        status = "expired"
+    return MarketWatchTarget(
+        target_id=str(row["target_id"]),
+        # The watch list's spelling, so a target sits beside its symbol:
+        # an index stored as SPX is watched as ^GSPC.
+        symbol=watch_spelling(row["symbol"], MarketType(row.get("market") or "stock")),
+        kind=row["kind"],
+        value=row["value"],
+        pct_from="now" if pct_from == "armed" else pct_from,
+        armed_price=row.get("armed_price"),
+        status=status,
+        expires_at=row["expires_at"],
+        fired_at=row.get("fired_at"),
+        fired_price=row.get("fired_price"),
+        created_at=row["created_at"],
+    )
 
 
 @router.get("/{thread_id}/market-watch", response_model=MarketWatchResponse)
 async def get_market_watch(thread_id: str, x_user_id: CurrentUserId):
-    """Current market-watch symbols for a thread (empty list when none)."""
+    """Current market-watch symbols and price targets for a thread."""
     await auth_api.require_thread_owner(thread_id, x_user_id)
     if not await user_feature_enabled(x_user_id, "market_watch"):
         return MarketWatchResponse(thread_id=thread_id, symbols=[])
     symbols = await get_watchlist(thread_id)
-    return MarketWatchResponse(thread_id=thread_id, symbols=symbols)
+    try:
+        now = datetime.now(timezone.utc)
+        targets = [_target_out(r, now) for r in await list_thread_targets(thread_id)]
+    except Exception:
+        # The chip and the panel poll this; losing the targets for one read
+        # must not take the watch list down with them.
+        logger.warning(
+            "[MarketWatch] listing targets failed thread_id=%s", thread_id, exc_info=True
+        )
+        targets = []
+    return MarketWatchResponse(thread_id=thread_id, symbols=symbols, targets=targets)
+
+
+@router.delete(
+    "/{thread_id}/market-watch/targets/{target_id}",
+    response_model=MarketWatchTargetCancelResponse,
+)
+async def cancel_market_watch_target(
+    thread_id: str, target_id: UUID, x_user_id: CurrentUserId
+):
+    """Cancel one armed target; ``cancelled`` is False when it was not armed.
+
+    Not gated on the feature: turning market watch off must never leave an
+    owner unable to stop a target armed before.
+    """
+    await auth_api.require_thread_owner(thread_id, x_user_id)
+    rows = await cancel_targets(thread_id, target_id=str(target_id))
+    if rows:
+        await targets_changed(thread_id)
+    return MarketWatchTargetCancelResponse(cancelled=bool(rows))
 
 
 @router.delete("/{thread_id}", response_model=ThreadDeleteResponse)
@@ -350,6 +429,21 @@ def _thread_list_item(row: dict) -> WorkspaceThreadListItem:
     )
 
 
+async def _cancel_targets_on_archive(thread_id: str) -> None:
+    """End an archived thread's armed targets: a hit there would start a turn
+    nobody sees. Best effort after the archive committed; one that survives
+    a failure here is dropped at delivery, as the thread reads archived."""
+    try:
+        if await cancel_targets(thread_id):
+            await targets_changed(thread_id)
+    except Exception:
+        logger.warning(
+            "[MarketWatch] cancelling targets on archive failed thread_id=%s",
+            thread_id,
+            exc_info=True,
+        )
+
+
 @router.patch("/{thread_id}", response_model=WorkspaceThreadListItem)
 async def update_thread_endpoint(
     thread_id: str, request: ThreadUpdateRequest, x_user_id: CurrentUserId
@@ -434,6 +528,7 @@ async def update_thread_endpoint(
             if updates["archived"]:
                 # Archiving ends the thread's scratchpad.
                 prune_thread_dirs_soon(str(updated_thread["workspace_id"]))
+                await _cancel_targets_on_archive(thread_id)
         return _thread_list_item(updated_thread)
 
     except HTTPException:

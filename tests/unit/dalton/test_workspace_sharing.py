@@ -27,6 +27,7 @@ from src.server.app import workspaces as workspaces_app
 from src.server.app.threads import crud as threads_crud
 from src.server.app.workspace_files import _shared as ws_files_shared
 from src.server.app.workspace_files import crud as ws_files_crud
+from src.server.database import computer as computer_db
 from src.server.database import conversation as conv_db
 from src.server.database import home_workspace as home_ws_db
 from src.server.database import user as user_db
@@ -38,6 +39,7 @@ from src.server.utils import secret_redactor
 from src.tools.secretary import activity as sec_activity
 from src.tools.secretary import dispatch as sec_dispatch
 from src.tools.secretary import tools as sec_tools
+from src.tools.secretary.utils import ComputerPlacement as _ComputerPlacement
 from src.tools.secretary.chief_of_staff import CHIEF_OF_STAFF_TOOLS
 
 TEAM_EMAILS = (
@@ -1157,6 +1159,16 @@ class TestChiefOfStaffChannel:
                 return_value=colleague_ws,
             ),
         )
+        # Upstream's listing reads computer placement (names + home) instead of
+        # the old get_workspace/get_home_workspace_id pair Dalton's version used.
+        monkeypatch.setattr(
+            computer_db,
+            "get_computer_names_and_home",
+            create_autospec(
+                computer_db.get_computer_names_and_home,
+                return_value=[{"computer_id": "c-1", "name": "Cloud computer", "is_home": True}],
+            ),
+        )
 
         cmd = await sec_tools.workspaces_list("u-chao", "tc-1")
         res = _cmd_json(cmd)
@@ -1178,7 +1190,7 @@ class TestChiefOfStaffChannel:
             home_id="ws-home",
             zone=ZoneInfo("UTC"),
             today=now.date(),
-            home_computer_id="c-1",
+            placement=_ComputerPlacement(home_computer_id="c-1"),
             colleague_workspaces=colleague_ws,
         )
         assert "Colleague workspaces shared with your Chief of Staff" in rendered

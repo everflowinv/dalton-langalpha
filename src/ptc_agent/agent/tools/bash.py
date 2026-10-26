@@ -48,6 +48,24 @@ _FILE_TOOLS_ONLY_ERROR = (
 )
 
 
+_DEFAULT_TIMEOUT_S = 120
+_MAX_TIMEOUT_S = 600
+
+
+def _timeout_seconds(timeout: int | None) -> int:
+    """The command's deadline in whole seconds, between 1 and 600.
+
+    The argument is documented in milliseconds, but a model often passes
+    seconds. Truncating 30 to 0 meant no deadline at all to the provider, so a
+    foreground command could hold the turn until the sandbox paused. A value
+    under 1000 is read as seconds: no shell command is meant to get less.
+    """
+    if not timeout or timeout < 0:
+        return _DEFAULT_TIMEOUT_S
+    seconds = timeout if timeout < 1000 else timeout // 1000
+    return min(seconds, _MAX_TIMEOUT_S)
+
+
 def create_execute_bash_tool(
     backend: SandboxBackend,
     thread_id: str = "",
@@ -132,14 +150,11 @@ def create_execute_bash_tool(
                 thread_id=thread_id or None,
             )
 
-            # Convert timeout from milliseconds to seconds for sandbox (int required)
-            timeout_seconds = int(timeout / 1000) if timeout else 120
-
             # Execute bash command in sandbox
             result = await backend.aexecute_bash(
                 command,
                 working_dir=working_dir,
-                timeout=timeout_seconds,
+                timeout=_timeout_seconds(timeout),
                 background=bool(run_in_background),
                 thread_id=thread_id or None,
                 call_id=call_id,

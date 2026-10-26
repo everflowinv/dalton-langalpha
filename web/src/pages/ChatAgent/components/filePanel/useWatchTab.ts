@@ -1,5 +1,5 @@
 import { useEffect, useEffectEvent, useRef } from 'react';
-import type { MarketWatchState } from '../../session/marketWatchEvents';
+import { armedTargets, type MarketWatchState } from '../../session/marketWatchEvents';
 import type { FileTabsApi } from './useFileTabs';
 
 /**
@@ -14,7 +14,8 @@ import type { FileTabsApi } from './useFileTabs';
  * though it were new.
  */
 export function useWatchTab(tabs: FileTabsApi, marketWatch: MarketWatchState | null | undefined): void {
-  const watching = (marketWatch?.symbols.length ?? 0) > 0;
+  // An armed target is watched server-side between turns, so it counts too.
+  const watching = (marketWatch?.symbols.length ?? 0) > 0 || armedTargets(marketWatch?.targets).length > 0;
   const wasWatching = useRef(watching);
   const openStatusUnfocused = useEffectEvent(() => tabs.openStatus({ focus: false }));
   useEffect(() => {

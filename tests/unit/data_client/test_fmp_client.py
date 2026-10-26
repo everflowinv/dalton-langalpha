@@ -466,3 +466,94 @@ class TestQuotaBreaker:
 
         _, ttl = marker_redis.store["fmp:quota_exhausted"]
         assert ttl == 90 * 60
+
+
+class TestEconomicIndicatorWindowWalk:
+    """Stable ignores ``limit`` and answers at most 91 days ending at ``to``."""
+
+    @pytest.mark.asyncio
+    async def test_the_newest_limit_rows_come_from_windows_walked_back(self, monkeypatch):
+        from datetime import date, timedelta
+
+        import src.data_client.fmp.fmp_client as fmp_client
+
+        monkeypatch.setattr(fmp_client, "_today_utc", lambda: date(2026, 10, 19))
+        # Quarterly, dated at the quarter's start: nothing in the newest 91 days.
+        quarters = [date(y, m, 1) for y in range(2026, 2019, -1) for m in (10, 7, 4, 1)]
+        quarters = [q for q in quarters if q <= date(2026, 4, 1)]
+
+        async def fmp_get(url, params, headers):
+            hi = date.fromisoformat(params["to"])
+            lo = max(date.fromisoformat(params["from"]), hi - timedelta(days=90))
+            rows = [
+                {"name": "GDP", "date": q.isoformat(), "value": q.year + q.month / 100}
+                for q in quarters
+                if lo <= q <= hi
+            ]
+            return httpx.Response(200, request=httpx.Request("GET", url), json=rows)
+
+        get_mock = AsyncMock(side_effect=fmp_get)
+        client = _client_with_mocked_http(get_mock)
+        try:
+            rows = await client.get_economic_indicators("GDP", limit=3)
+        finally:
+            await client.close()
+
+        assert [r["date"] for r in rows] == ["2026-04-01", "2026-01-01", "2025-10-01"]
+        sent = [call.kwargs["params"] for call in get_mock.await_args_list]
+        assert all("limit" not in p for p in sent)
+        # The first window alone, then batches of two and four, newest first.
+        assert len(sent) == 7
+        windows = sorted(
+            ((p["from"], p["to"]) for p in sent), key=lambda w: w[1], reverse=True
+        )
+        assert windows[0] == ("2026-07-21", "2026-10-19")
+        for (lo, hi), (_, older_hi) in zip(windows, windows[1:]):
+            assert (date.fromisoformat(hi) - date.fromisoformat(lo)).days == 90
+            assert date.fromisoformat(older_hi) == date.fromisoformat(lo) - timedelta(days=1)
+
+    @pytest.mark.parametrize(
+        ("failing_to", "fails"),
+        [
+            # The two oldest windows of the last batch: three rows were in hand.
+            ("2025-07-21", False),
+            ("2025-04-21", False),
+            # A window the three rows still needed.
+            ("2026-01-19", True),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_only_a_needed_window_s_failure_fails_the_read(
+        self, monkeypatch, failing_to, fails
+    ):
+        from datetime import date, timedelta
+
+        import src.data_client.fmp.fmp_client as fmp_client
+
+        monkeypatch.setattr(fmp_client, "_today_utc", lambda: date(2026, 10, 19))
+        quarters = [date(y, m, 1) for y in range(2026, 2019, -1) for m in (10, 7, 4, 1)]
+        quarters = [q for q in quarters if q <= date(2026, 4, 1)]
+
+        async def fmp_get(url, params, headers):
+            request = httpx.Request("GET", url)
+            if params["to"] == failing_to:
+                return httpx.Response(429, request=request, json={})
+            hi = date.fromisoformat(params["to"])
+            lo = max(date.fromisoformat(params["from"]), hi - timedelta(days=90))
+            rows = [
+                {"name": "GDP", "date": q.isoformat(), "value": q.year + q.month / 100}
+                for q in quarters
+                if lo <= q <= hi
+            ]
+            return httpx.Response(200, request=request, json=rows)
+
+        client = _client_with_mocked_http(AsyncMock(side_effect=fmp_get))
+        try:
+            if fails:
+                with pytest.raises(fmp_client.FMPRequestError):
+                    await client.get_economic_indicators("GDP", limit=3)
+            else:
+                rows = await client.get_economic_indicators("GDP", limit=3)
+                assert [r["date"] for r in rows] == ["2026-04-01", "2026-01-01", "2025-10-01"]
+        finally:
+            await client.close()

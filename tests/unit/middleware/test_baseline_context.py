@@ -53,7 +53,7 @@ from ptc_agent.agent.middleware.runtime_context import (
 )
 from ptc_agent.agent.middleware.runtime_context.baseline import _workspace_block
 from ptc_agent.agent.middleware.runtime_context.changes import render_diff, sha256_text
-from ptc_agent.agent.middleware.runtime_context.epoch import Workspace
+from ptc_agent.agent.middleware.runtime_context.epoch import OTHER_COMPUTERS, Workspace
 from ptc_agent.agent.middleware.runtime_context.harness_blocks import (
     harness_update_kind,
 )
@@ -200,7 +200,7 @@ class TestTheBlockIsFrozenForTheTurn:
         )
         mw = _middleware(
             _session("# Notes"),
-            workspace_name="Q3 Semis",
+            workspace=Workspace(name="Q3 Semis"),
             sources=_sources(
                 store,
                 memory={
@@ -1116,12 +1116,12 @@ class TestRendering:
         the name, so a rename has to reach the model without a rebuild."""
         first = _middleware(
             _session("# Notes"),
-            workspace_name="Old Name", workspace_description="old desc",
+            workspace=Workspace(name="Old Name", description="old desc"),
         )
         state = await first.abefore_agent({}, None)
         later = _middleware(
             _session("# Notes"),
-            workspace_name="New Name", workspace_description="old desc",
+            workspace=Workspace(name="New Name", description="old desc"),
         )
         second = await later.abefore_agent(state, None)
 
@@ -1138,7 +1138,7 @@ class TestRendering:
         # Back to the frozen name: one row that supersedes the notice.
         back = await first.abefore_agent(merged, None)
         assert runtime_update_from_message(_rows(back)[0]).text.endswith(
-            "Name and description are back to what <workspace> says."
+            "The workspace is back to what <workspace> says."
         )
 
     @pytest.mark.asyncio
@@ -1146,7 +1146,7 @@ class TestRendering:
         """A DB blip is not a workspace that lost its name."""
         first = _middleware(
             _session("# Notes"),
-            workspace_name="Old Name", workspace_description="old desc",
+            workspace=Workspace(name="Old Name", description="old desc"),
         )
         state = await first.abefore_agent({}, None)
         blind = _middleware(_session("# Notes"))
@@ -1164,12 +1164,12 @@ class TestRendering:
     async def test_a_rebuild_blind_to_the_workspace_leaves_the_rename_row_in_force(self):
         first = _middleware(
             _session("# Notes"),
-            workspace_name="Old Name", workspace_description="old desc",
+            workspace=Workspace(name="Old Name", description="old desc"),
         )
         state = await first.abefore_agent({}, None)
         later = _middleware(
             _session("# Notes"),
-            workspace_name="New Name", workspace_description="old desc",
+            workspace=Workspace(name="New Name", description="old desc"),
         )
         second = await later.abefore_agent(state, None)
         assert len(_rows(second)) == 1
@@ -1187,12 +1187,12 @@ class TestRendering:
 
         renamed_back = _middleware(
             _session("# Notes"),
-            workspace_name="Old Name", workspace_description="old desc",
+            workspace=Workspace(name="Old Name", description="old desc"),
         )
         fifth = await renamed_back.abefore_agent({**merged, **third}, None)
         row = runtime_update_from_message(_rows(fifth)[0])
         assert row.kind == "workspace_changed"
-        assert row.text.endswith("Name and description are back to what <workspace> says.")
+        assert row.text.endswith("The workspace is back to what <workspace> says.")
 
     @pytest.mark.asyncio
     async def test_a_build_with_no_memo_source_drops_the_pointer_a_ptc_epoch_froze(self):
@@ -1224,6 +1224,63 @@ class TestRendering:
 
     def test_a_workspace_with_no_name_leaves_no_empty_tag(self):
         assert _workspace_block(Workspace(description="x")) == ""
+
+    def test_a_user_with_one_computer_freezes_what_they_froze_before(self):
+        """No computer stays out of the state and the hash, so an epoch frozen
+        before computers were named files no row on the next turn."""
+        before = Workspace(name="Semis", description="Chips")
+        assert before.to_state() == {"name": "Semis", "description": "Chips"}
+        assert Workspace.from_state(before.to_state()).sha() == before.sha()
+        assert "Computer" not in _workspace_block(before)
+
+    def test_the_computer_is_named_and_only_the_analyst_is_told_its_reach(self):
+        """The Chief of Staff's own prompt says what another computer means
+        for it, so its block names the computer and nothing more."""
+        workspace = Workspace(name="Semis", computer="Big <box>")
+        analyst = _workspace_block(workspace, "analyst").splitlines()
+        chief = _workspace_block(workspace, "chief_of_staff").splitlines()
+        assert "Computer: Big &lt;box&gt;" in analyst
+        assert chief == ["<workspace>", "Name: Semis", "Computer: Big &lt;box&gt;", "</workspace>"]
+        assert len(analyst) == len(chief) + 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("role", ["analyst", "chief_of_staff"])
+    async def test_a_second_computer_is_a_row_and_the_block_stays(self, role):
+        """A block frozen with one computer never said what another computer
+        means, so the analyst's row says it; the Chief of Staff's prompt does."""
+        first = _middleware(
+            _session("# Notes"), workspace=Workspace(name="Semis"), role=role
+        )
+        state = await first.abefore_agent({}, None)
+        later = _middleware(
+            _session("# Notes"),
+            workspace=Workspace(name="Semis", computer="Big box"),
+            role=role,
+        )
+        second = await later.abefore_agent(state, None)
+        rows = [runtime_update_from_message(m) for m in _rows(second)]
+        assert [r.kind for r in rows] == ["workspace_changed"]
+        expected = ["Computer: Big box (not in the frozen block)"]
+        if role == "analyst":
+            expected.append(OTHER_COMPUTERS)
+        assert rows[0].text.splitlines()[-len(expected):] == expected
+        assert second[STATE_BASELINE]["epoch"] == state[STATE_BASELINE]["epoch"]
+
+    @pytest.mark.asyncio
+    async def test_a_renamed_computer_is_a_row_without_the_reach_sentence(self):
+        first = _middleware(
+            _session("# Notes"), workspace=Workspace(name="Semis", computer="Big box")
+        )
+        state = await first.abefore_agent({}, None)
+        later = _middleware(
+            _session("# Notes"), workspace=Workspace(name="Semis", computer="Lab")
+        )
+        rows = [
+            runtime_update_from_message(m)
+            for m in _rows(await later.abefore_agent(state, None))
+        ]
+        assert rows[0].text.splitlines()[-1] == "Computer: Lab (the frozen block says Big box)"
+        assert OTHER_COMPUTERS not in rows[0].text
 
 
 # ---------------------------------------------------------------------------

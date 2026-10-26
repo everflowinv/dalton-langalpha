@@ -14,7 +14,7 @@ import asyncio
 import hashlib
 import uuid
 from datetime import datetime, timezone
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -44,6 +44,8 @@ def _stub_sibling_restore_flags():
 def _make_config():
     config = MagicMock()
     config.to_core_config.return_value = MagicMock()
+    core_sandbox = config.to_core_config.return_value.sandbox
+    core_sandbox.settings_for.side_effect = lambda kind: getattr(core_sandbox, kind)
     config.daytona = MagicMock(api_key="k", base_url="https://daytona.test")
     config.sandbox = MagicMock(provider="daytona")
     config.filesystem = MagicMock(working_directory="/home/workspace")
@@ -78,6 +80,7 @@ def _make_computer(
     return {
         "computer_id": computer_id,
         "user_id": "user-1",
+        "kind": "daytona",
         "status": status,
         "resource_tier": resource_tier,
         "provider_ref": provider_ref,
@@ -91,6 +94,7 @@ def _make_binding(workspace_id, computer_id, *, provider_ref="sb-1", **kw):
     ``provider_ref`` defaults to _make_workspace's sandbox_id, so the machine
     and the project shadow agree unless a test says otherwise.
     """
+    kw.setdefault("kind", "daytona")
     return ComputerBinding(
         workspace_id=workspace_id,
         computer_id=computer_id,
@@ -116,6 +120,10 @@ def _make_session(*, version=None, summary=None, config_owner="ws"):
     session.sandbox.config.mcp = MagicMock(servers=[])
     session.mcp_registry = MagicMock()
     session._builtin_mcp_registry = session.mcp_registry
+    # No reconnect has replaced the global snapshot, so it is the borrowed one.
+    session.refresh_builtin_registry = MagicMock(
+        side_effect=lambda: session._builtin_mcp_registry
+    )
     session.mcp_tool_summary = summary
     session.mcp_config_version = version
     # Whose composite the version belongs to. A MagicMock default would read as
@@ -147,12 +155,21 @@ def _patch_certify():
     )
 
 
-def _patch_computer_for_workspace(computer):
-    """Stub the machine lookup the proactive-apply path uses to find the cooldown."""
-    return patch(
-        "src.server.services.computer_manager._mcp.get_computer_for_workspace",
-        new=AsyncMock(return_value=computer),
-    )
+@contextmanager
+def _patch_computer_for_workspace(computer, *, moving=False):
+    """Stub the lookups the proactive-apply path makes: the machine, for the
+    cooldown, and whether a move holds the workspace."""
+    with (
+        patch(
+            "src.server.services.computer_manager._mcp.get_computer_for_workspace",
+            new=AsyncMock(return_value=computer),
+        ),
+        patch(
+            "src.server.services.computer_manager._mcp.workspace_is_moving",
+            new=AsyncMock(return_value=moving),
+        ),
+    ):
+        yield
 
 
 # ---------------------------------------------------------------------------
@@ -1156,6 +1173,16 @@ class TestAppliedVersionAndProactiveApply:
         wm._acquire_session.assert_awaited_once_with("ws", user_id="user-1")
 
     @pytest.mark.asyncio
+    async def test_proactive_apply_leaves_a_moving_workspace_alone(self):
+        """An acquire would lay again the folder a move has set aside; the
+        next message applies the change wherever the move ends."""
+        wm = WorkspaceManager.get_instance(config=_make_config())
+        wm._acquire_session = AsyncMock()
+        with _patch_computer_for_workspace(None, moving=True):
+            await wm.proactively_apply_mcp_config("ws-x", "user-1")
+        wm._acquire_session.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_proactive_apply_swallows_errors(self):
         """Best-effort: a failure never propagates — it just falls back to the
         next-message apply, so a mutation response is never affected."""
@@ -1227,7 +1254,7 @@ class TestDiscoveryKickSeesCachedSession:
     def _stub_provisioning(wm):
         """Everything the provision path reaches that is not the kick itself."""
         wm._workspace_folder = AsyncMock(return_value="ws")
-        wm._mint_sandbox_tokens = AsyncMock(return_value={})
+        wm._keep_data_token = AsyncMock()
         wm._apply_session_mcp = AsyncMock(
             return_value=_resolved(1, servers=[_srv("alpha")])
         )

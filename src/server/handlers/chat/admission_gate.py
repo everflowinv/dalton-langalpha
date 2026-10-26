@@ -50,6 +50,8 @@ ADMISSION_CONFLICT_CODES = {
     "not_retryable",
     # A START posted for a parked steer that a running turn read first.
     "steer_taken",
+    # START refused because the workspace is moving to another computer.
+    "workspace_moving",
 }
 
 
@@ -78,6 +80,14 @@ def admission_conflict_detail(state: str) -> dict:
         return {
             "code": "not_running",
             "message": "No turn is running to steer. Resubmit as a new message.",
+        }
+    if state == "workspace_moving":
+        return {
+            "code": "workspace_moving",
+            "message": (
+                "This workspace is moving to another computer. "
+                "Try again when the move finishes."
+            ),
         }
     return {
         "code": "running",

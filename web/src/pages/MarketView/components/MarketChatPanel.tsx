@@ -343,7 +343,9 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
   // Open the served-HTML preview. The SSE artifact carries only a port, so —
   // like ChatView — open immediately in a loading state, then resolve the
   // authenticated signed URL and swap it in (otherwise the viewer is blank).
-  const handlePreview = useCallback((preview: PreviewData) => {
+  const handlePreview = useCallback((data: PreviewData) => {
+    // Named on the entry so the dialog's open button reaches the app's link.
+    const preview = { ...data, workspaceId: data.workspaceId ?? activeWorkspaceId ?? undefined };
     previewPortRef.current = preview.port;
     setDialogPayload({ type: 'preview', preview: { ...preview, loading: true } });
 

@@ -86,11 +86,28 @@ export function InlinePreviewCard({ artifact, onClick }: InlinePreviewCardProps)
     }
   }, [workspaceId, port]);
 
-  // Health check on mount + every 2 minutes
+  // Checked on mount and every 2 minutes, but only while the page is visible:
+  // a live answer counts as use of the computer, so a tab left open in the
+  // background must not keep it from stopping when idle. Coming back checks
+  // at once if the last answer is older than one interval.
   useEffect(() => {
-    doHealthCheck();
-    const interval = setInterval(doHealthCheck, 2 * 60 * 1000);
-    return () => clearInterval(interval);
+    const intervalMs = 2 * 60 * 1000;
+    let lastCheck = 0;
+    const check = () => {
+      if (document.visibilityState !== 'visible') return;
+      lastCheck = Date.now();
+      doHealthCheck();
+    };
+    const onVisible = () => {
+      if (Date.now() - lastCheck >= intervalMs) check();
+    };
+    check();
+    const interval = setInterval(check, intervalMs);
+    document.addEventListener('visibilitychange', onVisible);
+    return () => {
+      clearInterval(interval);
+      document.removeEventListener('visibilitychange', onVisible);
+    };
   }, [doHealthCheck]);
 
   if (!artifact) return null;
@@ -124,7 +141,7 @@ export function InlinePreviewCard({ artifact, onClick }: InlinePreviewCardProps)
   // The menu closes on select, so the copy is confirmed by a toast rather
   // than by the item's own state.
   const copyLink = async () => {
-    if (link && await copy(link.code, path)) toast({ description: t('shareLink.copiedPrivate') });
+    if (link && await copy(link.code, path ?? '/')) toast({ description: t('shareLink.copiedPrivate') });
   };
 
   return (
@@ -160,7 +177,7 @@ export function InlinePreviewCard({ artifact, onClick }: InlinePreviewCardProps)
             </DropdownMenuItem>
             <DropdownMenuItem
               disabled={!link}
-              onSelect={() => link && window.open(shareLinkHref(link.code, path), '_blank', 'noopener,noreferrer')}
+              onSelect={() => link && window.open(shareLinkHref(link.code, path ?? '/'), '_blank', 'noopener,noreferrer')}
             >
               <ExternalLink className="h-3.5 w-3.5" />
               {t('filePanel.openInBrowser')}

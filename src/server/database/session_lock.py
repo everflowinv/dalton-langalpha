@@ -6,6 +6,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import weakref
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any
 
 import psycopg
@@ -35,16 +37,21 @@ async def await_settled(task: asyncio.Future) -> Any:
     return task.result()
 
 
-async def _unlock_or_close(conn, key: str, unlock: str) -> None:
+def _lock_arg(key: str | int) -> str:
+    """A string names a lock and is hashed to its key; an int already is one."""
+    return "%s" if isinstance(key, int) else "hashtextextended(%s, 0)"
+
+
+async def _unlock_or_close(conn, key: str | int, unlock: str) -> None:
     try:
         async with conn.cursor() as cur:
-            await cur.execute(f"SELECT {unlock}(hashtextextended(%s, 0))", (key,))
+            await cur.execute(f"SELECT {unlock}({_lock_arg(key)})", (key,))
     except BaseException:
         await conn.close()
         raise
 
 
-async def release_session_lock(conn, key: str, *, shared: bool = False) -> None:
+async def release_session_lock(conn, key: str | int, *, shared: bool = False) -> None:
     """Release the session lock, or close the session so the lock dies with it.
 
     The release runs as its own task and is awaited until it finishes no
@@ -56,6 +63,34 @@ async def release_session_lock(conn, key: str, *, shared: bool = False) -> None:
     """
     unlock = "pg_advisory_unlock_shared" if shared else "pg_advisory_unlock"
     await await_settled(asyncio.ensure_future(_unlock_or_close(conn, key, unlock)))
+
+
+@asynccontextmanager
+async def try_session_lock(key: str | int) -> AsyncIterator[bool]:
+    """Hold a session advisory lock, or yield False when someone else has it.
+
+    Session-scoped rather than transaction-scoped: a holder makes network calls
+    between its statements, and wrapping those in a transaction would pin a
+    connection inside an open snapshot for as long as they take.
+    """
+    async with pool.get_db_connection() as conn:
+        try:
+            cur = await conn.execute(
+                f"SELECT pg_try_advisory_lock({_lock_arg(key)})", (key,)
+            )
+            row = await cur.fetchone()
+        except BaseException:
+            # The lock may already have been granted: a session lock survives a
+            # cancelled fetch, so release it rather than pool a locked session.
+            await release_session_lock(conn, key)
+            raise
+        if not (row and row[0]):
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            await release_session_lock(conn, key)
 
 
 class SharedLockBusy(Exception):

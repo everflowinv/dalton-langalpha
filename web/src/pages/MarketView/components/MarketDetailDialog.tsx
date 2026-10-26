@@ -111,6 +111,8 @@ export default function MarketDetailDialog({ payload, onClose, getToolCallProces
               url={payload.preview.url}
               port={payload.preview.port}
               title={payload.preview.title}
+              path={payload.preview.path}
+              workspaceId={payload.preview.workspaceId}
               loading={payload.preview.loading}
               error={payload.preview.error}
               reloadToken={payload.preview.reloadToken}

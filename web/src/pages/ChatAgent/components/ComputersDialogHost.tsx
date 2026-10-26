@@ -5,31 +5,33 @@
  * the root.
  *
  * Being always mounted and reading the list, it is also where list-wide
- * bookkeeping lives: announcing spec-change outcomes and forgetting disk
- * warning dismissals once a disk recovers.
+ * bookkeeping lives: announcing spec-change and preparation outcomes and
+ * forgetting disk warning dismissals once a disk recovers.
  */
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useQueryClient } from '@tanstack/react-query';
 
 import { toast } from '@/components/ui/use-toast';
 import { useLocale } from '@/hooks/useLocale';
-import type { Computer, ResourceTier } from '@/types/api';
+import type { ResourceTier } from '@/types/api';
 
 import {
   closeComputerSpec,
   closeComputersPanel,
   useComputersPanel,
 } from '../hooks/computerPanelStore';
+import { computerOutcomeWatch, reduceComputerOutcomes } from '../hooks/computerOutcomes';
+import { takePrepareFailures } from '../hooks/computerPreparation';
 import { useComputerActions } from '../hooks/useComputerActions';
 import { invalidateMachine, invalidateMachineStorage, useComputers } from '../hooks/useComputers';
 import { useTierQuota } from '../hooks/useTierQuota';
 import ChangeSpecDialog from './ChangeSpecDialog';
 import ComputersDialog from './ComputersDialog';
 import { useForgetRecoveredDismissals } from './DiskWarning';
-import { activeSpecChange } from './specChangeUi';
 import { specErrorFiles, specErrorFrom, specErrorFromOutcome, type SpecError } from './specErrors';
 import { normalizeTier, tierLabel } from './tierUi';
+import { WorkspaceMoveOutcomes } from './WorkspaceMoveOutcomes';
 
 function ComputersDialogHost() {
   const { t } = useTranslation();
@@ -53,35 +55,20 @@ function ComputersDialogHost() {
     setSpecError(null);
   }, [specComputerId]);
 
-  // Changes this tab has seen in progress, by computer, with the change's
-  // start so a stale row that predates it is not read as its outcome.
-  const inProgressRef = useRef<Map<string, string>>(new Map());
-
-  // Any list read can be the one that sees a change settle (the poll, window
-  // focus, a status reconcile, an invalidation), so the outcome is read off
-  // every new list rather than off a poll of our own. Only changes seen in
-  // progress are announced; an outcome that settled before load stays quiet.
+  // Any list read can be the one that sees an outcome land, so outcomes are
+  // read off every new list rather than off a poll of our own. The watch is
+  // set before anything is announced, so a second run over the same list
+  // (StrictMode, a remount) finds these outcomes already handed out.
   useEffect(() => {
     if (!computers) return;
-    const watched = inProgressRef.current;
-    const next = new Map<string, string>();
-    const settled: Computer[] = [];
-    for (const c of computers) {
-      const running = activeSpecChange(c);
-      const startedAt = watched.get(c.computer_id);
-      if (running) {
-        next.set(c.computer_id, running.started_at);
-      } else if (startedAt !== undefined) {
-        if (c.spec_change && c.spec_change.started_at === startedAt) settled.push(c);
-        else next.set(c.computer_id, startedAt);
-      }
-    }
-    inProgressRef.current = next;
+    const outcomes = reduceComputerOutcomes(computerOutcomeWatch.get(), computers);
+    computerOutcomeWatch.set(outcomes.watch);
+    const failures = takePrepareFailures(outcomes.idle);
 
-    // The dialog may be closed long before the change settles, so the outcome
-    // is reported wherever the user is: inline when the dialog is still open
-    // on that computer, as a toast otherwise.
-    for (const computer of settled) {
+    // The dialog may be closed long before a spec change settles, so the
+    // outcome is reported wherever the user is: inline when the dialog is
+    // still open on that computer, as a toast otherwise.
+    for (const computer of outcomes.specChanges) {
       const change = computer.spec_change;
       if (!change) continue;
       // A new tier is a new disk, so the breakdown is re-read here and
@@ -112,8 +99,30 @@ function ComputersDialogHost() {
         description: files.length > 0 ? `${error.message} ${files.join(', ')}` : error.message,
       });
     }
-    // Re-running on a dialog or locale change is harmless: settled ids have
-    // already left the watch set.
+
+    // A new computer is prepared in the background and the user has usually
+    // closed the dialog by the time it lands, so its outcome is a toast.
+    if (outcomes.preparations.length === 0) return;
+    // The row has its sandbox now, or is back at stopped after a failure:
+    // either way the cached copy is out of date.
+    invalidateMachine(queryClient);
+    for (const { computer, ready } of outcomes.preparations) {
+      if (ready) {
+        toast({
+          title: t('computer.prepare.readyTitle', '{{name}} is ready', { name: computer.name }),
+          description: t('computer.prepare.readyDesc', 'You can create workspaces on it now.'),
+        });
+        continue;
+      }
+      const reason = failures.get(computer.computer_id);
+      const retry = t('computer.prepare.retryHint', 'Start it to try again.');
+      toast({
+        variant: 'destructive',
+        title: t('computer.prepare.failedTitle', "Couldn't prepare {{name}}", { name: computer.name }),
+        // The server's reason is its own sentence, so the hint gets a line of its own.
+        description: reason ? <>{reason}<br />{retry}</> : retry,
+      });
+    }
   }, [computers, specComputerId, queryClient, t, locale]);
 
   const submitSpec = (tier: ResourceTier) => {
@@ -132,6 +141,9 @@ function ComputersDialogHost() {
         onOpenChange={(open) => { if (!open) closeComputersPanel(); }}
         focusComputerId={panel?.computerId ?? null}
         expandStorage={panel?.expandStorage ?? false}
+        // One panel at a time: Change spec opened from a row takes the
+        // Computers panel's place until it closes.
+        covered={!!specTarget}
       />
       <ChangeSpecDialog
         target={specTarget}
@@ -140,7 +152,13 @@ function ComputersDialogHost() {
         busy={spec.isPending}
         quota={quota}
         error={specError}
+        // Opened from a disk warning there is no Computers panel to dim the page.
+        stacked={!!panel}
       />
+      {/* The workspace menu hosts tell how a move ended too; this one covers
+          a page with none of them mounted, such as a chat on a phone, which
+          is where make-primary's move of Home can end. */}
+      <WorkspaceMoveOutcomes />
     </>
   );
 }

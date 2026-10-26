@@ -406,6 +406,12 @@ def test_source_key_rejected():
         McpServerInput(**_stdio(source="workspace"))
 
 
+def test_auth_key_rejected():
+    # ``auth`` hands a server the sandbox's own data token: built-ins only.
+    with pytest.raises(ValidationError, match="'auth' is not allowed"):
+        McpServerInput(**_http(auth="data_token"))
+
+
 def test_unknown_extra_key_rejected():
     with pytest.raises(ValidationError):
         McpServerInput(**_stdio(unexpected="x"))

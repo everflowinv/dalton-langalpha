@@ -33,6 +33,7 @@ vi.mock('@/lib/authToken', () => ({
 import { api } from '@/api/client';
 import {
   createComputer,
+  deleteComputer,
   getComputers,
   startComputer,
   stopComputer,
@@ -41,6 +42,7 @@ import {
 
 const mockGet = api.get as unknown as Mock;
 const mockPost = api.post as unknown as Mock;
+const mockDelete = api.delete as unknown as Mock;
 
 // GET /api/v1/computers, captured verbatim for user wp13-final-1789525377.
 const LIVE_LIST = {
@@ -100,14 +102,14 @@ describe('getComputers', () => {
 
 describe('createComputer', () => {
   it('posts the tier, which is the machine\'s property and not a workspace\'s', async () => {
-    // The live 201 body for {"name":"WP16 probe","resource_tier":"performance"}.
+    // The 201 body for {"name":"WP16 probe","resource_tier":"performance"}.
     mockPost.mockResolvedValueOnce({
       data: {
         computer_id: 'ebbab1a6-16fe-46d6-8ae9-08080cd7e084',
         user_id: 'wp13-final-1789525377',
         kind: 'daytona',
         name: 'WP16 probe',
-        status: 'stopped',
+        status: 'starting',
         resource_tier: 'performance',
         is_always_on: false,
         is_primary: false,
@@ -122,8 +124,10 @@ describe('createComputer', () => {
       { name: 'WP16 probe', resource_tier: 'performance' },
       expect.objectContaining({ timeout: expect.any(Number) }),
     );
-    // A computer is born stopped, so nothing in the UI may wait on 'creating'.
-    expect(computer.status).toBe('stopped');
+    // Its sandbox is built in the background from here, so the row comes back
+    // starting with none yet: the shape the UI reads as being prepared.
+    expect(computer.status).toBe('starting');
+    expect(computer.provider_ref).toBeNull();
     expect(computer.resource_tier).toBe('performance');
   });
 
@@ -177,6 +181,19 @@ describe('start/stop', () => {
   });
 });
 
+describe('deleteComputer', () => {
+  it('deletes the computer route, which answers 204 with no body', async () => {
+    mockDelete.mockResolvedValueOnce({ data: '', status: 204, headers: {} });
+    await expect(deleteComputer('c1')).resolves.toBeUndefined();
+    expect(mockDelete.mock.calls[0][0]).toBe('/api/v1/computers/c1');
+  });
+
+  it('refuses an empty id rather than deleting a route with a hole in it', async () => {
+    await expect(deleteComputer('')).rejects.toThrow('Computer ID is required');
+    expect(mockDelete).not.toHaveBeenCalled();
+  });
+});
+
 describe('streamComputerEvents', () => {
   function mockSSEResponse(chunks: string[], ok = true) {
     const encoder = new TextEncoder();
@@ -204,9 +221,9 @@ describe('streamComputerEvents', () => {
     mockSSEResponse([
       'event: status\ndata: {"computer_id": "5319ad0e-7835-4ca6-9541-b7c2961a7bf6", "status": "running"}\n\n',
     ]);
-    const onStatus = vi.fn();
-    await streamComputerEvents('5319ad0e-7835-4ca6-9541-b7c2961a7bf6', onStatus, ctrl());
-    expect(onStatus).toHaveBeenCalledWith('running', undefined);
+    const onFrame = vi.fn();
+    await streamComputerEvents('5319ad0e-7835-4ca6-9541-b7c2961a7bf6', onFrame, ctrl());
+    expect(onFrame).toHaveBeenCalledWith(expect.objectContaining({ status: 'running' }));
   });
 
   it('hits the computer events route', async () => {
@@ -221,19 +238,30 @@ describe('streamComputerEvents', () => {
       'event: status\ndata: {"computer_id": "c1", "status": "stopped"}\n\n',
       ': ping\n\n',
     ]);
-    const onStatus = vi.fn();
-    await streamComputerEvents('c1', onStatus, ctrl());
-    expect(onStatus).toHaveBeenCalledTimes(1);
-    expect(onStatus).toHaveBeenCalledWith('stopped', undefined);
+    const onFrame = vi.fn();
+    await streamComputerEvents('c1', onFrame, ctrl());
+    expect(onFrame).toHaveBeenCalledTimes(1);
+    expect(onFrame).toHaveBeenCalledWith(expect.objectContaining({ status: 'stopped' }));
   });
 
   it('carries the sandbox_state refinement when the server sends one', async () => {
     mockSSEResponse([
       'event: status\ndata: {"computer_id": "c1", "status": "starting", "sandbox_state": "archived"}\n\n',
     ]);
-    const onStatus = vi.fn();
-    await streamComputerEvents('c1', onStatus, ctrl());
-    expect(onStatus).toHaveBeenCalledWith('starting', 'archived');
+    const onFrame = vi.fn();
+    await streamComputerEvents('c1', onFrame, ctrl());
+    expect(onFrame).toHaveBeenCalledWith(expect.objectContaining({ status: 'starting', sandbox_state: 'archived' }));
+  });
+
+  it("hands over a new sandbox's build stage and a failed start's reason", async () => {
+    mockSSEResponse([
+      'event: status\ndata: {"computer_id": "c1", "status": "starting", "stage": "tools"}\n\n',
+      'event: status\ndata: {"computer_id": "c1", "status": "error", "error": "Sandbox image build failed"}\n\n',
+    ]);
+    const onFrame = vi.fn();
+    await streamComputerEvents('c1', onFrame, ctrl());
+    expect(onFrame.mock.calls[0][0]).toMatchObject({ status: 'starting', stage: 'tools' });
+    expect(onFrame.mock.calls[1][0]).toMatchObject({ status: 'error', error: 'Sandbox image build failed' });
   });
 
   it('stops at the server timeout event', async () => {
@@ -242,9 +270,9 @@ describe('streamComputerEvents', () => {
       'event: timeout\ndata: {}\n\n',
       'event: status\ndata: {"computer_id": "c1", "status": "running"}\n\n',
     ]);
-    const onStatus = vi.fn();
-    await streamComputerEvents('c1', onStatus, ctrl());
-    expect(onStatus).toHaveBeenCalledTimes(1);
+    const onFrame = vi.fn();
+    await streamComputerEvents('c1', onFrame, ctrl());
+    expect(onFrame).toHaveBeenCalledTimes(1);
   });
 
   it('resolves without throwing when the connection fails', async () => {

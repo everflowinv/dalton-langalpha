@@ -95,14 +95,11 @@ class TestTarMode:
         state = await runtime.get_state()
         assert state == RuntimeState.RUNNING
 
-    async def test_capabilities(self, runtime: DockerRuntime):
-        """Docker runtime should have exec, code_run, file_io but not archive/snapshot."""
-        caps = runtime.capabilities
-        assert "exec" in caps
-        assert "code_run" in caps
-        assert "file_io" in caps
-        assert "archive" not in caps
-        assert "snapshot" not in caps
+    async def test_runtime_facts(self, runtime: DockerRuntime):
+        """A container cannot archive, update its env in place, or stop itself."""
+        assert not runtime.archives
+        assert not runtime.updates_env
+        assert not runtime.autostops
 
 
 # ---------------------------------------------------------------------------
@@ -288,10 +285,6 @@ class TestPreviewUrl:
         info = await runtime.get_preview_link(8080)
         assert info.url.startswith("http")
 
-    async def test_capabilities_include_preview(self, runtime: DockerRuntime):
-        """Docker runtime should report preview_url capability."""
-        assert "preview_url" in runtime.capabilities
-
 
 # ---------------------------------------------------------------------------
 # Session support
@@ -316,15 +309,19 @@ class TestSessions:
         await provider.close()
 
     async def test_session_lifecycle(self, runtime: DockerRuntime):
-        """Create a session, run a sync command, check logs, delete."""
+        """Create a session, run a command, read its logs, delete."""
+        import asyncio
+
         await runtime.create_session("test-session")
 
-        # Sync execute
-        result = await runtime.session_execute(
-            "test-session", "echo hello-from-session", run_async=False
-        )
-        assert result.exit_code == 0
-        assert "hello-from-session" in result.stdout
+        cmd_id = await runtime.session_execute("test-session", "echo hello-from-session")
+        for _ in range(50):
+            logs = await runtime.session_command_logs("test-session", cmd_id)
+            if logs.exit_code is not None:
+                break
+            await asyncio.sleep(0.1)
+        assert logs.exit_code == 0
+        assert "hello-from-session" in logs.stdout
 
         # Delete
         await runtime.delete_session("test-session")
@@ -335,25 +332,18 @@ class TestSessions:
 
         await runtime.create_session("async-test")
 
-        result = await runtime.session_execute(
-            "async-test",
-            "echo async-output && sleep 0.5 && echo done",
-            run_async=True,
+        cmd_id = await runtime.session_execute(
+            "async-test", "echo async-output && sleep 0.5 && echo done"
         )
-        assert result.exit_code is None  # async, no exit code yet
-        assert result.cmd_id  # should have a command ID
+        assert cmd_id  # should have a command ID
 
         # Wait for the command to finish
         await asyncio.sleep(2)
 
         # Check logs
-        logs = await runtime.session_command_logs("async-test", result.cmd_id)
+        logs = await runtime.session_command_logs("async-test", cmd_id)
         assert logs.exit_code == 0
         assert "async-output" in logs.stdout
         assert "done" in logs.stdout
 
         await runtime.delete_session("async-test")
-
-    async def test_capabilities_include_sessions(self, runtime: DockerRuntime):
-        """Docker runtime should report sessions capability."""
-        assert "sessions" in runtime.capabilities

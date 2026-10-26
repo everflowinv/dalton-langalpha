@@ -98,6 +98,14 @@ def _margin(stmt: Dict, ratio_key: str, numerator_key: str) -> Optional[float]:
     return None
 
 
+def _diluted_eps(stmt: Dict) -> Optional[float]:
+    # FMP's stable statements spell it ``epsDiluted``, as CN rows do; yfinance
+    # rows, and CN rows from a ginlix-data that predates the stable spellings,
+    # keep the v3 ``epsdiluted``.
+    value = stmt.get("epsDiluted")
+    return value if value is not None else stmt.get("epsdiluted")
+
+
 def _first(rows: Any) -> Optional[Dict[str, Any]]:
     return rows[0] if rows else None
 
@@ -387,7 +395,7 @@ def _company_artifact(inp: CompanyInputs) -> Dict[str, Any]:
                 "grossProfit": stmt.get("grossProfit"),
                 "operatingIncome": stmt.get("operatingIncome"),
                 "ebitda": stmt.get("ebitda"),
-                "epsDiluted": stmt.get("epsdiluted"),
+                "epsDiluted": _diluted_eps(stmt),
                 "grossMargin": _margin(stmt, "grossProfitRatio", "grossProfit"),
                 "operatingMargin": _margin(stmt, "operatingIncomeRatio", "operatingIncome"),
                 "netMargin": _margin(stmt, "netIncomeRatio", "netIncome"),

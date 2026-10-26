@@ -327,3 +327,23 @@ describe('Trans slots', () => {
     expect(offenders).toEqual([]);
   });
 });
+
+// ── zh-CN house rules ─────────────────────────────────────
+//
+// Two rules a translation pass keeps breaking, checked over the whole catalog
+// since a new key is where they slip in. A product name or a code term beside
+// Chinese takes a space on each side ("在 E2B 上"), and "Agent" and "Chief of
+// Staff" are product names, left in English rather than rendered as 智能体 or
+// 幕僚长.
+describe('zh-CN house rules', () => {
+  const values = leaves(zhCN).map((key) => [key, String(lookup(zhCN, key))] as const);
+
+  it('puts a space between CJK and Latin letters', () => {
+    const TOUCHING = /[一-鿿][A-Za-z]|[A-Za-z][一-鿿]/;
+    expect(values.filter(([, v]) => TOUCHING.test(v)).map(([k]) => k)).toEqual([]);
+  });
+
+  it('never translates Agent or Chief of Staff', () => {
+    expect(values.filter(([, v]) => /智能体|幕僚长/.test(v)).map(([k]) => k)).toEqual([]);
+  });
+});

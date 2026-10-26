@@ -371,6 +371,14 @@ def get_market_watch_max_symbols() -> int:
     return get_infrastructure_config().market_watch.max_symbols
 
 
+def get_market_watch_max_targets() -> int:
+    return get_infrastructure_config().market_watch.max_targets
+
+
+def get_market_watch_target_warning_minutes() -> int:
+    return get_infrastructure_config().market_watch.target_warning_minutes
+
+
 def get_redis_ttl_market_watch() -> int:
     return get_infrastructure_config().redis.ttl.market_watch
 

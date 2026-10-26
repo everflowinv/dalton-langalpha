@@ -392,7 +392,7 @@ export interface WorkspaceTreeRowProps {
   expandedThreadIds: Set<string>;
   agents?: SidebarAgentRow[];
   activeAgentId?: string | null;
-  /** The shared change-spec / always-on / duplicate / delete flows. */
+  /** The shared duplicate / move / delete flows. */
   wsActions: Omit<WorkspaceActions, 'dialogs'>;
   rename: {
     active: boolean;
@@ -553,6 +553,7 @@ function WorkspaceTreeRowImpl({
                             onTogglePin={onPinWorkspace ? () => onPinWorkspace(wsId, !isPinned) : undefined}
                             onRename={rename.enabled ? () => rename.onStart(wsId, ws.name || '') : undefined}
                             onDuplicate={wsActions.openDuplicate}
+                            onMove={wsActions.openMove}
                             onDelete={wsActions.openDelete}
                           />
                         </DropdownMenuContent>

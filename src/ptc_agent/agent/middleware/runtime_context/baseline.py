@@ -50,6 +50,7 @@ from ptc_agent.agent.middleware.runtime_context.durable import (
 from ptc_agent.agent.middleware.runtime_context.epoch import (
     MEMO_DISPLAY_CAP,
     MEMORY_TIERS,
+    OTHER_COMPUTERS,
     BaselineEpoch,
     Identity,
     Observations,
@@ -175,8 +176,8 @@ class BaselineContextMiddleware(AgentMiddleware):
     Args:
         session: Workspace session, the agent.md read path. None disables the
             agent.md tier entirely.
-        workspace_name: Workspace name as its row had it at agent build.
-        workspace_description: Workspace description, from the same read.
+        workspace: The workspace as its row had it at agent build, or None
+            when that read did not answer.
         sources: Store-backed tiers to read (memory, memo). None reads neither.
         blocks: Harness-authored text this build states, keyed by read kind
             (see :data:`BlockReader`). A kind with no reader is a block this
@@ -217,8 +218,7 @@ class BaselineContextMiddleware(AgentMiddleware):
         self,
         *,
         session: Any | None = None,
-        workspace_name: str | None = None,
-        workspace_description: str | None = None,
+        workspace: Workspace | None = None,
         sources: BaselineSources | None = None,
         blocks: dict[str, BlockReader] | None = None,
         user_profile: dict[str, Any] | None = None,
@@ -241,11 +241,10 @@ class BaselineContextMiddleware(AgentMiddleware):
         self._role = role
         self._files_mounted = files_mounted
         self._channels_enabled = channels_enabled
-        # None is a read that did not answer; an empty string is a workspace
+        # None is a read that did not answer; an empty name is a workspace
         # with no name. Only the first is kept out of change detection.
-        self._workspace_available = workspace_name is not None
-        self._workspace_name = (workspace_name or "").strip()
-        self._workspace_description = (workspace_description or "").strip()
+        self._workspace_available = workspace is not None
+        self._workspace = workspace or Workspace()
         resolved = sources or BaselineSources()
         self._store = resolved.store
         self._store_cache = resolved.store_cache
@@ -390,9 +389,7 @@ class BaselineContextMiddleware(AgentMiddleware):
         )
         return Observations(
             now=datetime.now(tz=UTC),
-            workspace=Workspace(
-                name=self._workspace_name, description=self._workspace_description
-            ),
+            workspace=self._workspace,
             identity=self._identity(),
             profile=self._profile_snapshot(),
             reads=tuple(reads),
@@ -407,6 +404,7 @@ class BaselineContextMiddleware(AgentMiddleware):
             workspace_configured=not self._subagent,
             files_mounted=self._files_mounted,
             channels_enabled=self._channels_enabled,
+            role=self._role,
         )
 
     async def _read_sources(self, state: Any) -> list[SourceRead]:
@@ -573,7 +571,7 @@ class BaselineContextMiddleware(AgentMiddleware):
         guidance = self._guidance()
         parts: list[str] = []
 
-        parts.append(_workspace_block(epoch.workspace))
+        parts.append(_workspace_block(epoch.workspace, self._role))
         parts.append(self._user_profile_block(epoch.profile, epoch.channels_enabled))
 
         identity = epoch.identity or self._identity()
@@ -724,8 +722,9 @@ class BaselineContextMiddleware(AgentMiddleware):
 # ---------------------------------------------------------------------------
 
 
-def _workspace_block(workspace: Workspace) -> str:
-    """What the workspace is called, as element text.
+
+def _workspace_block(workspace: Workspace, role: AgentRole = "analyst") -> str:
+    """What the workspace is called, and the computer it is on, as element text.
 
     Text rather than attributes: a name is free text the user typed, and as text
     an escape of ``<`` and ``&`` is the whole obligation, with no quoting rule to
@@ -738,6 +737,11 @@ def _workspace_block(workspace: Workspace) -> str:
     description = workspace.description.strip()
     if description:
         lines.append(f"Description: {escape(description, quote=False)}")
+    computer = workspace.computer.strip()
+    if computer:
+        lines.append(f"Computer: {escape(computer, quote=False)}")
+        if role != "chief_of_staff":
+            lines.append(OTHER_COMPUTERS)
     body = "\n".join(lines)
     return f"<workspace>\n{body}\n</workspace>"
 

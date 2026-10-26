@@ -170,14 +170,20 @@ _REPORT_SOURCE = TypeAdapter(ReportSource)
 def _stored_turn_fields(query: Mapping[str, Any]) -> dict[str, Any]:
     """The server-set fields a turn's query row keeps, for a request that runs
     the turn again: its type, so a system turn (a report-back) runs as one,
-    and the report it announces, which labels it in history and the live
-    stream."""
-    stored = ((query.get("metadata") or {}).get("report_source")) or None
+    and the report or market target's notice it announces, which labels it in
+    history and the live stream."""
+    metadata = query.get("metadata") or {}
+    stored = metadata.get("report_source") or None
     try:
         report_source = _REPORT_SOURCE.validate_python(stored) if stored else None
     except ValidationError:
         report_source = None
-    return {"query_type": query.get("type"), "report_source": report_source}
+    market_target = metadata.get("market_target")
+    return {
+        "query_type": query.get("type"),
+        "report_source": report_source,
+        "market_target": market_target if isinstance(market_target, dict) else None,
+    }
 
 
 async def unstarted_regenerate_request(

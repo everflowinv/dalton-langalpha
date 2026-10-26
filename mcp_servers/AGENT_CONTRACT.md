@@ -153,3 +153,22 @@ test with a diff against the locked text. Rules of engagement:
   The pin test itself is read-only by design (it can never self-heal); the
   script is the lock's only writer. Commit the regenerated lock together with
   the docstring change so the diff shows both sides.
+
+## Exported tool list
+
+`mcp_servers/contract/market_data.tools.json` holds the `tools/list` of the four
+market-data servers (`price_data`, `fundamentals`, `macro`, `options`): each
+server's name and every tool's name, description, input schema and output
+schema, exactly as the SDK sends them. A deployment that serves these servers
+over HTTP from another implementation publishes this file as its tool list, so
+skills, prompts and generated wrappers see the same surface on either path.
+That implementation still has to return the envelope and row fields described
+above.
+
+`tests/unit/mcp_servers/test_market_data_tool_export.py` fails when the file no
+longer matches the servers. After an intentional tool change, regenerate it and
+commit it with the change:
+
+```bash
+uv run python scripts/utils/export_market_data_tools.py
+```

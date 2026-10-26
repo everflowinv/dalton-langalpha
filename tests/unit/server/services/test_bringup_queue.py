@@ -40,7 +40,7 @@ def _layout(name: str):
 class _Manager(SessionCacheMixin, BringUpMixin):
     def __init__(self) -> None:
         self._machines = {}
-        self._projects_attached: set[tuple[str, str | None]] = set()
+        self._projects_attached: dict[tuple[str, str | None], str | None] = {}
 
 
 @pytest.fixture
@@ -300,7 +300,7 @@ async def test_a_dropped_session_takes_its_queued_work_with_it(
     """What was still queued loses its attach key, so the next acquisition on
     that sandbox queues it again."""
     machine = manager._machine("computer-1")
-    manager._projects_attached |= {("A", "sandbox-1"), ("B", "sandbox-1")}
+    manager._projects_attached |= dict.fromkeys([("A", "sandbox-1"), ("B", "sandbox-1")])
     for workspace_id in "AB":
         _schedule(manager, sandbox, workspace_id, urgent=False)
     job = machine.bring_up
@@ -375,13 +375,13 @@ async def test_each_restore_reads_the_folder_where_it_is_when_it_runs(
 async def test_a_workspace_mid_move_is_left_to_its_next_acquisition(
     steps, manager, sandbox
 ):
-    manager._projects_attached |= {("A", "sandbox-1"), ("B", "sandbox-1")}
+    manager._projects_attached |= dict.fromkeys([("A", "sandbox-1"), ("B", "sandbox-1")])
     steps.folders["A"] = None
     _schedule(manager, sandbox, "A", urgent=True)
     _schedule(manager, sandbox, "B", urgent=False)
     await _drain(manager)
     assert _steps(steps.order) == ["restore:B", "sync:B"]
-    assert manager._projects_attached == {("B", "sandbox-1")}
+    assert manager._projects_attached.keys() == {("B", "sandbox-1")}
 
 
 async def test_a_busy_restore_pauses_without_holding_up_the_others(
@@ -508,7 +508,7 @@ async def test_an_unfinished_restore_is_left_to_the_next_acquisition(
 ):
     """On a running machine no start comes to resume it, so the attach key
     goes once the sync ran; a finished one keeps its key."""
-    manager._projects_attached |= {("A", "sandbox-1"), ("B", "sandbox-1")}
+    manager._projects_attached |= dict.fromkeys([("A", "sandbox-1"), ("B", "sandbox-1")])
     if ending == "errors":
         steps.short.add("A")
     else:
@@ -517,7 +517,7 @@ async def test_an_unfinished_restore_is_left_to_the_next_acquisition(
     _schedule(manager, sandbox, "B", urgent=False)
     await _drain(manager)
     assert {"sync:A", "sync:B"} <= set(steps.order)
-    assert manager._projects_attached == {("B", "sandbox-1")}
+    assert manager._projects_attached.keys() == {("B", "sandbox-1")}
 
 
 async def test_an_acquisition_before_the_sync_does_not_keep_the_unfinished_key(
@@ -529,7 +529,7 @@ async def test_an_acquisition_before_the_sync_does_not_keep_the_unfinished_key(
     _schedule(manager, sandbox, "A", urgent=False)
     while "restore:A" not in steps.order:
         await asyncio.sleep(0)
-    manager._projects_attached.add(("A", "sandbox-1"))
+    manager._projects_attached[("A", "sandbox-1")] = None
     _schedule(manager, sandbox, "A", urgent=True)
     await _drain(manager)
     assert _steps(steps.order) == ["restore:A", "sync:A"]
@@ -542,13 +542,13 @@ async def test_a_sync_that_left_a_thread_behind_is_left_to_the_next_acquisition(
 ):
     """A thread nobody opens again has no turn end to export it, and on a
     running machine no start comes to sync it, so the attach key goes."""
-    manager._projects_attached |= {("A", "sandbox-1"), ("B", "sandbox-1")}
+    manager._projects_attached |= dict.fromkeys([("A", "sandbox-1"), ("B", "sandbox-1")])
     steps.unsynced["A"] = ending
     _schedule(manager, sandbox, "A", urgent=False)
     _schedule(manager, sandbox, "B", urgent=False)
     await _drain(manager)
     assert _steps(steps.order) == ["restore:A", "restore:B", "sync:A", "sync:B"]
-    assert manager._projects_attached == {("B", "sandbox-1")}
+    assert manager._projects_attached.keys() == {("B", "sandbox-1")}
 
 
 async def test_a_thread_delete_drops_the_stamp_even_on_a_stopped_machine(manager):

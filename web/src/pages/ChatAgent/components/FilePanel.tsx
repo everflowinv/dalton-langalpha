@@ -83,6 +83,8 @@ interface FilePanelProps {
   onTargetMemoHandled?: (seq?: number) => void;
   /** The live market watch, which the Status tab follows. */
   marketWatch?: MarketWatchState | null;
+  /** Cancels an armed price target from the Status tab; rejects on failure. */
+  onCancelMarketTarget?: ((targetId: string) => Promise<void>) | null;
   /** Leaves the panel for the full MarketView page on this symbol. */
   onOpenInMarketView?: ((spec: ChartTabSpec) => void) | null;
   /** Leaves for a subagent's own transcript, from a tool tab showing its task. */
@@ -146,6 +148,7 @@ function FilePanel({
   onTargetMemoryHandled,
   onTargetMemoHandled,
   marketWatch = null,
+  onCancelMarketTarget = null,
   onOpenInMarketView = null,
   onOpenSubagentTask = null,
   transcript = null,
@@ -654,10 +657,11 @@ function FilePanel({
       {activeTab.kind === 'preview' && (
         <PreviewCrumbs
           entry={previews.byPort.get(activeTab.port) ?? { port: activeTab.port, url: '', loading: true, error: false, reloadToken: 0 }}
+          onRefresh={() => previews.refresh(activeTab.port)}
           // DALTON-HOOK(team-sharing): disable preview refresh in colleague mirror mode
-          onRefresh={() => { if (!teamReadOnly) previews.refresh(activeTab.port); }}
           refreshDisabled={teamReadOnly}
-          workspaceId={readOnly ? null : workspaceId}
+          workspaceId={workspaceId}
+          readOnly={readOnly}
         />
       )}
 
@@ -792,6 +796,7 @@ function FilePanel({
                 onTargetMemoryHandled={onTargetMemoryHandled}
                 onTargetMemoHandled={onTargetMemoHandled}
                 marketWatch={marketWatch}
+                onCancelMarketTarget={onCancelMarketTarget}
                 onOpenFile={onOpenFile}
                 onOpenSubagentTask={onOpenSubagentTask}
                 transcript={transcript}

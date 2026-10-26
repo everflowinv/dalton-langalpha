@@ -35,7 +35,7 @@ from src.server.database.workspace import (
     get_workspace as db_get_workspace,
     get_workspace_dir_name as db_get_workspace_dir_name,
     get_workspace_identity as db_get_workspace_identity,
-    get_restore_owed_workspace_ids_for_computer,
+    get_restore_owed_workspaces_for_computer,
     SandboxIdentityLostError,
     stamp_computer_sandbox_config,
     update_workspace_activity,
@@ -70,6 +70,8 @@ logger = logging.getLogger(__name__)
 # Sibling folders one restore pass fills at once: a recreated sandbox is one
 # small machine, already busy with the turn that recreated it.
 _SIBLING_RESTORES_AT_ONCE = 3
+# An attach record this worker never made, which no files_epoch equals.
+_UNSEEN = object()
 
 
 class ProvisioningMixin:
@@ -78,11 +80,17 @@ class ProvisioningMixin:
 
         cleanup_session deletes its attached sandbox, so stale handles must be
         retired intact and only the durable machine reference may be destroyed."""
+        from src.server.services.preview_capabilities import revoke as revoke_previews
+
         # Only the computer ref authorizes deletion; a drifted workspace shadow
         # may name someone else's sandbox. NULL means nothing to destroy.
         computer_id = binding.computer_id
         durable_sandbox_id = binding.provider_ref
+        await self._revoke_data_token(computer_id)
         await self._revoke_livefs(computer_id)
+        # Its previews end with it rather than at expiry, on every path that
+        # retires a machine, the sweep's included.
+        await revoke_previews(durable_sandbox_id)
 
         session = self._cached_session(computer_id)
         attached_sandbox_id = self._session_sandbox_id(session)
@@ -125,7 +133,9 @@ class ProvisioningMixin:
         this drops this worker's copy now, which a link it has in flight does
         not bring back."""
         self._projects_attached = {
-            key for key in self._projects_attached if key[0] != workspace_id
+            key: epoch
+            for key, epoch in self._projects_attached.items()
+            if key[0] != workspace_id
         }
         self._session_computer.pop(workspace_id, None)
         for machine in self._machines.values():
@@ -195,16 +205,9 @@ class ProvisioningMixin:
             else None
         )
 
-        # Include tokens and user data in the manifest hash to skip unchanged uploads.
         _sync_t0 = time.time()
 
-        async def _mint_and_sync_assets() -> Any:
-            tokens = {}
-            if reusing_sandbox and user_id:
-                tokens = await self._mint_sandbox_tokens(
-                    user_id, workspace_id, binding.computer_id
-                )
-
+        async def _sync_assets() -> Any:
             user_skill_params = await sandbox_skill_sync_params(
                 user_id,
                 self.config.skills.sandbox_skills_base,
@@ -228,8 +231,6 @@ class ProvisioningMixin:
                         skill_dirs=skill_dirs,
                         reusing_sandbox=reusing_sandbox,
                         force_refresh=force_refresh,
-                        tokens=tokens or None,
-                        user_id=user_id,
                         project=ProjectContext(workspace_id, dir_name or ""),
                         root_owner_dir_name=await self._layout_root_owner_dir(
                             replace(binding, dir_name=dir_name)
@@ -252,15 +253,36 @@ class ProvisioningMixin:
             await self._stamp_mcp_config_version(binding.computer_id)
             return result
 
+        # The market-data token is the machine's, not this project's, and
+        # its write touches nothing the sync does, so it runs beside it. Only
+        # into a sandbox the computer is already bound to, which a token is
+        # recorded against; a fresh one gets its token once the acquire that
+        # built it has bound it.
+        token = (
+            asyncio.ensure_future(
+                self._keep_data_token(binding.computer_id, user_id, sandbox)
+            )
+            if reusing_sandbox
+            else None
+        )
         assets: Any = None
         try:
-            assets = await _mint_and_sync_assets()
-        except LayoutMigrationError:
+            try:
+                assets = await _sync_assets()
+            except LayoutMigrationError:
+                raise
+            except WorkspaceFolderMoving:
+                logger.info(
+                    f"Asset sync for {workspace_id} waits for its folder to land"
+                )
+            except Exception as e:
+                logger.warning(f"Asset sync failed for {workspace_id}: {e}")
+        except BaseException:
+            if token is not None:
+                token.cancel()
             raise
-        except WorkspaceFolderMoving:
-            logger.info(f"Asset sync for {workspace_id} waits for its folder to land")
-        except Exception as e:
-            logger.warning(f"Asset sync failed for {workspace_id}: {e}")
+        if token is not None:
+            await token
         total = (time.time() - _sync_t0) * 1000
         logger.info(f"[SYNC_DETAIL] workspace_id={workspace_id} total={total:.0f}ms")
         return assets
@@ -444,7 +466,7 @@ class ProvisioningMixin:
         ws_version: int | None,
         kick_discovery: bool,
         post_init: "Callable[[Session], Any]",
-        core_config: Any = None,
+        core_config: Any,
         expected_previous_sandbox_id: str | None = None,
         expected_host_unavailable_since: datetime | None = None,
     ) -> tuple[Session, Any]:
@@ -453,22 +475,17 @@ class ProvisioningMixin:
         Earlier publication looks stale and can trigger retirement mid-restore,
         removing the cleanup handle and orphaning a billed sandbox. Discovery also
         requires publication for its liveness gate. ws_version=None forces MCP
-        resolution; failures and cancellation must destroy the partial provision."""
-        if core_config is None:
-            core_config = self.config.to_core_config()
+        resolution; failures and cancellation must destroy the partial provision.
+        ``core_config`` has no default: the sandbox is built on the provider it
+        names, so the deployment's would put another kind's computer on the
+        wrong backend."""
         workspace_id = binding.workspace_id
         computer_id = binding.computer_id
         dir_name = binding.dir_name
 
-        sandbox_tokens = await self._mint_sandbox_tokens(
-            user_id or "", workspace_id, computer_id
-        )
         session = self._session_handle(binding, core_config)
         try:
             await session.initialize(
-                sandbox_tokens=sandbox_tokens,
-                user_id=user_id,
-                workspace_id=workspace_id,
                 tier=tier,
                 auto_stop_minutes=auto_stop_minutes,
                 dir_name=dir_name,
@@ -508,7 +525,7 @@ class ProvisioningMixin:
 
             # Certify before binding so no workspace can name an uncertified sandbox.
             secret_version = await certify_platform_secrets(
-                core_config, runtime=session.sandbox.runtime
+                core_config, runtime=session.sandbox.runtime, kind=binding.kind
             )
             workspace = await self._bind_machine_identity(
                 binding,
@@ -628,6 +645,10 @@ class ProvisioningMixin:
                 f"Recovered workspace {workspace_id} but could not stamp activity: {e}"
             )
         await self._stamp_sandbox_config(binding)
+        # A rebuild no turn follows (a spec change, a platform-secret
+        # rotation) would otherwise leave the new sandbox without a token
+        # until the sweep reached it.
+        await self._keep_data_token(binding.computer_id, user_id, session.sandbox)
         return session
 
     async def _stamp_sandbox_config(self, binding: ComputerBinding) -> None:
@@ -960,9 +981,7 @@ class ProvisioningMixin:
             return
         try:
             binding = await self.resolve_binding(workspace_id)
-            owed = await get_restore_owed_workspace_ids_for_computer(
-                binding.computer_id
-            )
+            owed = await get_restore_owed_workspaces_for_computer(binding.computer_id)
         except Exception as e:
             logger.warning(f"Could not list sibling restores for {workspace_id}: {e}")
             return
@@ -991,15 +1010,77 @@ class ProvisioningMixin:
                     )
 
         # Not recorded as attached: that would skip the sibling's own attach,
-        # which also reconciles its skills and tool overlay.
+        # which also reconciles its skills and tool overlay. One this worker
+        # attached before its files last arrived is owed them all the same.
         await asyncio.gather(
             *(
                 restore(sibling_id)
-                for sibling_id in owed
+                for sibling_id, epoch in owed.items()
                 if sibling_id != workspace_id
-                and (sibling_id, sandbox_id) not in self._projects_attached
+                and self._projects_attached.get((sibling_id, sandbox_id), _UNSEEN) != epoch
             )
         )
+
+    def _claim_attached(
+        self, binding: ComputerBinding, session: Any
+    ) -> tuple[str, str | None] | None:
+        """Record the project attached by a start that did the attach's work.
+
+        A start of this project that synced its assets and restored its folder
+        has done what ``_ensure_project_attached`` does on first sight, short
+        of the skill pass it runs next; recording it here spares the attach
+        that follows in the same acquisition a second pass over the same
+        state. Taken right after the restore returns, before any other await,
+        for the reason the attach gives. Returns the key to hand to
+        ``_reconcile_skills``, which withdraws it unless its pass completes;
+        None when it was already recorded and so is not this caller's.
+        """
+        key = (binding.workspace_id, self._session_sandbox_id(session))
+        if self._attached(binding, key):
+            return None
+        if len(self._projects_attached) >= _PROJECTS_ATTACHED_CAP:
+            self._projects_attached.clear()
+        self._projects_attached[key] = binding.files_epoch
+        return key
+
+    def _attached(self, binding: ComputerBinding, key: tuple[str, str | None]) -> bool:
+        """Whether this worker attached the project to this sandbox since its files last arrived."""
+        return self._projects_attached.get(key, _UNSEEN) == binding.files_epoch
+
+    async def _sync_restore_and_reconcile(
+        self,
+        binding: ComputerBinding,
+        user_id: str | None,
+        session: Any,
+        *,
+        source: str,
+        mark: Callable[[str], None] = lambda _phase: None,
+    ) -> None:
+        """A start's asset sync and folder restore, then the skill pass.
+
+        In that order so the pass sees the final disk, and a start that did
+        both records the attach it spared (``_claim_attached``)."""
+        synced = await self._sync_sandbox_assets(
+            binding, user_id, session.sandbox, reusing_sandbox=True
+        )
+        mark("asset_sync")
+        if not session.sandbox:
+            return
+        restored = await self._maybe_restore_files(binding, session.sandbox)
+        attach_key = (
+            self._claim_attached(binding, session)
+            if synced is not None and restored and user_id
+            else None
+        )
+        mark("file_restore")
+        await self._reconcile_skills(
+            binding.workspace_id,
+            user_id,
+            session.sandbox,
+            source=source,
+            attach_key=attach_key,
+        )
+        mark("skill_reconcile")
 
     async def _ensure_project_attached(
         self, binding: ComputerBinding, session: Any, *, user_id: str | None = None
@@ -1017,7 +1098,7 @@ class ProvisioningMixin:
         workspace_id = binding.workspace_id
         key = (workspace_id, self._session_sandbox_id(session))
         recorded = False
-        if key not in self._projects_attached:
+        if not self._attached(binding, key):
             # Restore files before rebuilding the generated tool configuration.
             await self._ensure_workspace_dirs(workspace_id, sandbox, binding.dir_name)
             # Unrestored, the next acquisition retries before trusting this
@@ -1025,10 +1106,7 @@ class ProvisioningMixin:
             # bring-up just queued may drop the workspace and discard its key,
             # which a later add would undo.
             if await self._maybe_restore_files(binding, sandbox):
-                if len(self._projects_attached) >= _PROJECTS_ATTACHED_CAP:
-                    self._projects_attached.clear()
-                self._projects_attached.add(key)
-                recorded = True
+                recorded = self._claim_attached(binding, session) is not None
         # Before the overlay can end the attach, which does not end the turn:
         # a restart the reconnect found is recorded and a serving mount handed.
         await self._load_livefs(binding.computer_id, user_id, sandbox)
@@ -1037,7 +1115,7 @@ class ProvisioningMixin:
         ):
             # Retry on the next acquire; MCP calls refuse an absent config.
             if recorded:
-                self._projects_attached.discard(key)
+                self._projects_attached.pop(key, None)
             return
         if recorded and not await self._reconcile_skills(
             workspace_id, user_id, sandbox, source="attach_project"
@@ -1048,7 +1126,7 @@ class ProvisioningMixin:
             # the pass has to link. A full pass, once per sandbox per process:
             # one that did not finish leaves the attachment unrecorded, so the
             # next acquisition retries it before trusting this project.
-            self._projects_attached.discard(key)
+            self._projects_attached.pop(key, None)
         if not self._livefs_owed(binding.computer_id, workspace_id, sandbox):
             return
         if not user_id:

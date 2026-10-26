@@ -54,11 +54,10 @@ export function TokenUsageRing({ tokenUsage }: TokenUsageRingProps) {
 
   return (
     <Popover>
+      {/* An icon button's slot, so the ring sits as far from its neighbours
+          as the toolbar's icons sit from each other. */}
       <PopoverTrigger asChild>
-        <div
-          className="inline-flex items-center justify-center"
-          style={{ width: SIZE, height: SIZE, cursor: 'pointer', marginLeft: 2 }}
-        >
+        <div className="inline-flex flex-none items-center justify-center h-8 w-8 cursor-pointer">
           <svg width={SIZE} height={SIZE} viewBox={`0 0 ${SIZE} ${SIZE}`}>
             <circle
               cx={SIZE / 2}

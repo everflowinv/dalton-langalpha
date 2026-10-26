@@ -7,6 +7,7 @@ import { describe, it, expect } from 'vitest';
 import type { ReactNode } from 'react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { renderHook } from '@testing-library/react';
+import type { MarketTarget } from '../../../utils/api';
 import { trayWorking, useTrayContents } from '../useTrayContents';
 
 function readTray(hasActiveSubagents: boolean) {
@@ -37,5 +38,41 @@ describe('useTrayContents: a running task no row names', () => {
     const contents = readTray(false);
     expect(contents?.tasks?.unnamedRunning).toBe(false);
     expect(trayWorking(contents!)).toBe(false);
+  });
+});
+
+// Neutral placeholder ticker and a made-up level only.
+function target(over: Partial<MarketTarget>): MarketTarget {
+  return {
+    target_id: 'tg-1', symbol: 'NVDA', kind: 'above', value: 205, pct_from: null, armed_price: null,
+    status: 'armed', expires_at: '2030-01-02T00:00:00Z', fired_at: null, fired_price: null,
+    created_at: '2030-01-01T00:00:00Z', ...over,
+  };
+}
+
+function readWatch(targets: MarketTarget[]) {
+  const client = new QueryClient();
+  const wrapper = ({ children }: { children: ReactNode }) => <QueryClientProvider client={client}>{children}</QueryClientProvider>;
+  const { result } = renderHook(() => useTrayContents({
+    marketWatch: { symbols: [], targets },
+    cards: {},
+    taskHistory: {},
+    messages: [],
+    isLoading: false,
+    hasActiveSubagents: false,
+    reportBackOwed: false,
+    owedThreads: null,
+    isHome: false,
+  }), { wrapper });
+  return result.current;
+}
+
+describe('useTrayContents: a target with no live-stamped symbol', () => {
+  it('keeps the watch chip while the target is armed', () => {
+    expect(readWatch([target({})])?.watch).not.toBeNull();
+  });
+
+  it('drops it once every target has settled', () => {
+    expect(readWatch([target({ status: 'fired' }), target({ target_id: 'b', status: 'expired' })])).toBeNull();
   });
 });

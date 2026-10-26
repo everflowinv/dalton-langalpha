@@ -52,6 +52,13 @@ export const queryKeys = {
     // DALTON-HOOK(team-sharing): team workspaces grouped by colleague
     team:   () => [...queryKeys.workspaces.all, 'team'],
   },
+  // A workspace's latest move to another computer, polled while it runs. Its
+  // own root, not under `workspaces`: the read that sees a move end refreshes
+  // every workspace query, which would cancel that read before it lands.
+  workspaceMoves: {
+    all:       ['workspaceMoves'],
+    workspace: (wsId: string) => [...queryKeys.workspaceMoves.all, wsId],
+  },
   // The signed prefix the owner's report iframes load under, one per workspace
   // because the grant covers the whole workspace and nothing narrower. Its own
   // root, not under `workspaces`: every workspace invalidation would re-mint
@@ -88,6 +95,8 @@ export const queryKeys = {
     // The per-folder breakdown is a separate, expensive reading (a `du` on
     // the machine), not a projection of the row, so it keys apart from it.
     storage: (computerId: string) => [...queryKeys.computers.all, 'storage', computerId],
+    // What a new machine can run on, per user: the plan decides `allowed`.
+    providers: () => [...queryKeys.computers.all, 'providers'],
   },
   threads: {
     all:         ['threads'],

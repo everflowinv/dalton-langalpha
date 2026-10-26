@@ -46,6 +46,18 @@ def _folder_hold_is_free():
 
 
 @pytest.fixture(autouse=True)
+def _no_workspace_moving():
+    """Acquiring a session and deleting a workspace both refuse one that is
+    moving, a row read these pool-less tests cannot make. A test of the
+    refusal patches it inside this one."""
+    with patch(
+        "src.server.services.workspace_manager.workspace_is_moving",
+        AsyncMock(return_value=False),
+    ) as moving:
+        yield moving
+
+
+@pytest.fixture(autouse=True)
 def _folder_allocation_is_free():
     """An adoption picks its folder under a transaction-scoped advisory lock
     these pool-less tests cannot take; the reads and the bind under it are patched."""

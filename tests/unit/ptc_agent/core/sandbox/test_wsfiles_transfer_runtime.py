@@ -256,6 +256,20 @@ def test_scan_prior_reuse_vs_rehash(tmp_path):
     assert out["reused"] == 0 and out["hashed"] == 1
 
 
+def test_an_mtime_of_zero_never_reuses_a_digest(tmp_path):
+    """A same-size rewrite at the epoch keeps (size, 0), so only the bytes can tell.
+
+    Docker uploads landed at 0 before they were stamped, and an archive can
+    unpack at 0; a row recorded then would otherwise be trusted for good."""
+    p = _write(tmp_path, "f.bin", b"new")
+    os.utime(p, ns=(0, 0))
+    stale = {"f.bin": [3, 0, _sha(b"old")]}
+    out = _scan(tmp_path, prior=stale)
+    assert out["reused"] == 0 and out["hashed"] == 1
+    assert out["entries"][0]["sha256"] == _sha(b"new")
+    one = rt.hash_one({"root": str(tmp_path), "path": "f.bin", "prior": stale["f.bin"]})
+    assert one["sha256"] == _sha(b"new")
+
 
 def test_scan_without_hashing_reads_no_file(tmp_path, monkeypatch):
     _write(tmp_path, "big.bin", b"abc")
@@ -620,6 +634,19 @@ def test_pull_ok_applies_mode_and_mtime(tmp_path, bucket):
     assert stat.S_IMODE(st.st_mode) == 0o600
     assert st.st_mtime_ns == 1_600_000_000_000_000_000
     assert not [p for p in os.listdir(final.parent) if p.startswith(".wsfiles-")]
+
+
+@pytest.mark.enable_socket
+@pytest.mark.parametrize("in_place", [False, True])
+def test_pull_keeps_its_own_time_for_a_recorded_mtime_of_zero(tmp_path, bucket, in_place):
+    # Stamping the 0 back, or leaving a file already at 0 where it holds the
+    # bytes, would leave it rehashed on every later scan.
+    if in_place:
+        os.utime(_write(tmp_path, "epoch.bin", b"restored"), ns=(0, 0))
+    item = _file_item(bucket, "epoch.bin", b"restored", mtime_ns=0)
+    out = rt.pull({"root": str(tmp_path), "timeout_s": 10, "items": [item]})
+    assert out["results"]["epoch.bin"]["status"] == "ok"
+    assert os.stat(tmp_path / "epoch.bin").st_mtime_ns // 1000 != 0
 
 
 @pytest.mark.enable_socket

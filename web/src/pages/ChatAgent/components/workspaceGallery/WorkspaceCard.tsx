@@ -11,6 +11,7 @@ import { shortMonthDay } from '@/lib/format';
 import type { Computer } from '@/types/api';
 
 import { ComputerStatusIndicator } from '../computerStatusUi';
+import { isComputerPreparing } from '../../utils/computerStatus';
 import { diskLevelColor } from '../computerDiskUi';
 import { normalizeTier, tierLabel } from '../tierUi';
 import { effectiveTier } from '../specChangeUi';
@@ -29,11 +30,12 @@ interface CardMenuProps {
   onTogglePin: (workspace: WorkspaceRecord) => void;
   onRename: (workspace: WorkspaceRecord) => void;
   onDuplicate: (workspace: WorkspaceRecord) => void;
+  onMove?: (workspace: WorkspaceRecord) => void;
   onDelete: (workspace: WorkspaceRecord) => void;
 }
 
-/** Card menu dropdown (Pin / Rename / Duplicate / Delete). */
-function CardMenu({ workspace, onTogglePin, onRename, onDuplicate, onDelete }: CardMenuProps) {
+/** Card menu dropdown (Pin / Rename / Duplicate / Move / Delete). */
+function CardMenu({ workspace, onTogglePin, onRename, onDuplicate, onMove, onDelete }: CardMenuProps) {
   return (
     <DropdownMenu modal={false}>
       <DropdownMenuTrigger asChild>
@@ -51,6 +53,7 @@ function CardMenu({ workspace, onTogglePin, onRename, onDuplicate, onDelete }: C
           onTogglePin={onTogglePin}
           onRename={onRename}
           onDuplicate={onDuplicate}
+          onMove={onMove}
           onDelete={onDelete}
         />
       </DropdownMenuContent>
@@ -68,13 +71,14 @@ interface WorkspaceCardProps {
   /** Open the Computers dialog on this card's machine. */
   onOpenComputer?: (computerId: string) => void;
   onDuplicate: (workspace: WorkspaceRecord) => void;
+  onMove?: (workspace: WorkspaceRecord) => void;
   onDelete: (workspace: WorkspaceRecord) => void;
   prefetchThreads?: (wsId: string) => void;
   index?: number;
 }
 
 /** Workspace card for the normal gallery grid (no DnD). */
-export function WorkspaceCard({ workspace, computer, onSelect, onTogglePin, onRenameStart, onOpenComputer, onDuplicate, onDelete, prefetchThreads, index }: WorkspaceCardProps) {
+export function WorkspaceCard({ workspace, computer, onSelect, onTogglePin, onRenameStart, onOpenComputer, onDuplicate, onMove, onDelete, prefetchThreads, index }: WorkspaceCardProps) {
   const { t } = useTranslation();
   const locale = useLocale();
   const isMobile = useIsMobile();
@@ -156,7 +160,12 @@ export function WorkspaceCard({ workspace, computer, onSelect, onTogglePin, onRe
               >
                 <Server className="h-3 w-3 shrink-0" aria-hidden="true" />
                 <span className="truncate">{machineName}</span>
-                <ComputerStatusIndicator status={machineStatus} glyphSize={10} className="shrink-0" />
+                <ComputerStatusIndicator
+                  status={machineStatus}
+                  preparing={isComputerPreparing(computer)}
+                  glyphSize={10}
+                  className="shrink-0"
+                />
                 {showDiskDot && (
                   <span
                     className="h-1.5 w-1.5 shrink-0 rounded-full"
@@ -213,6 +222,7 @@ export function WorkspaceCard({ workspace, computer, onSelect, onTogglePin, onRe
               onTogglePin={onTogglePin}
               onRename={onRenameStart}
               onDuplicate={onDuplicate}
+              onMove={onMove}
               onDelete={onDelete}
             />
           </div>

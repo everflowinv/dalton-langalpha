@@ -20,8 +20,10 @@ from src.server.services.computer_manager._lifecycle import SessionLifecycleMixi
 from src.server.services.computer_manager._livefs import LivefsMixin
 from src.server.services.computer_manager._machines import MachineLifecycleMixin
 from src.server.services.computer_manager._mcp import McpSecretsMixin
+from src.server.services.computer_manager._move import WorkspaceMoveMixin
 from src.server.services.computer_manager._providers import ProviderMixin
 from src.server.services.computer_manager._provisioning import ProvisioningMixin
+from src.server.services.computer_manager._retirement import RetirementMixin
 from src.server.services.computer_manager._sessions import SessionCacheMixin
 from src.server.services.computer_manager._spec import ComputerSpecMixin
 
@@ -39,7 +41,9 @@ class ComputerManager(
     McpSecretsMixin,
     SessionLifecycleMixin,
     MachineLifecycleMixin,
+    RetirementMixin,
     ComputerSpecMixin,
+    WorkspaceMoveMixin,
     WorkspaceEntitlementsMixin,
 ):
     _instance: Optional["ComputerManager"] = None
@@ -47,14 +51,12 @@ class ComputerManager(
     def __init__(
         self,
         config: AgentConfig,
-        idle_timeout: int = 1800,
         cleanup_interval: int = 300,
         start_wait_timeout: float = 300.0,
         start_wait_poll_interval: float = 0.5,
         reap_stuck_after: float | None = None,
     ):
         self.config = config
-        self.idle_timeout = idle_timeout
         self.cleanup_interval = cleanup_interval
         # 300s covers the worst-case archived-sandbox restore before a waiter gives up.
         self.start_wait_timeout = start_wait_timeout
@@ -80,8 +82,9 @@ class ComputerManager(
 
         # Startup materialises only its initiating project. Check siblings
         # separately, keyed by sandbox so a rebuilt machine cannot reuse an old
-        # check.
-        self._projects_attached: set[tuple[str, str | None]] = set()
+        # check, and holding the project's files epoch so one that moved away
+        # and back to the same sandbox is attached again.
+        self._projects_attached: dict[tuple[str, str | None], str | None] = {}
 
         # asyncio holds weak task refs; retain publishes until PUBLISH completes.
         self._status_publish_tasks: set[asyncio.Task] = set()
@@ -101,10 +104,7 @@ class ComputerManager(
 
         logger.info(
             "ComputerManager initialized",
-            extra={
-                "idle_timeout": idle_timeout,
-                "cleanup_interval": cleanup_interval,
-            },
+            extra={"cleanup_interval": cleanup_interval},
         )
 
     @classmethod
@@ -176,7 +176,6 @@ class ComputerManager(
         ]
         return {
             "cached_sessions": len(cached),
-            "idle_timeout": self.idle_timeout,
             "cleanup_interval": self.cleanup_interval,
             "cached_computer_ids": cached,
         }

@@ -2,7 +2,7 @@
 import { describe, expect, it } from 'vitest';
 import type { ReportSource } from '@/types/api';
 import type { ChatMessage, UserMessage } from '@/types/chat';
-import type { DeliveredReport, DeliveredSteer, SteeringDeliveredEntry } from '@/types/sse';
+import type { DeliveredMarketAlert, DeliveredReport, DeliveredSteer, SteeringDeliveredEntry } from '@/types/sse';
 import { createAssistantMessage } from '../../../hooks/utils/messageHelpers';
 import { deliveredEntryRow, foldSteeringDelivery, type DeliveredRowKind } from '../steeringDelivery';
 
@@ -11,6 +11,13 @@ const TASK_PROVENANCE = { kind: 'task_report', taskId: 'k3', displayId: 'Task-k3
 const BANNER = { message: 'Steer failed to send' };
 
 const report: DeliveredReport = { content: '', report_source: TASK, timestamp: 1_700_000_000 };
+// Neutral placeholder ticker and made-up prices only.
+const NOTICE = {
+  target_id: 'tg-1', notice: 'hit', symbol: 'ACME', kind: 'above', value: 205, pct_from: null,
+  fired_price: 205.12, fired_at: '2030-01-01T15:05:00Z', expires_at: null,
+} as const;
+const alert: DeliveredMarketAlert = { content: '', market_alert: NOTICE, timestamp: 1_700_000_000 };
+const ALERT_ID = 'market-alert-tg-1:hit';
 const steer = (content: string, extra: Partial<DeliveredSteer> = {}): DeliveredSteer => ({ content, ...extra });
 
 type Failed = UserMessage & { queueError?: unknown };
@@ -94,6 +101,24 @@ describe('deliveredEntryRow', () => {
 
   it('draws nothing for what a share leaves of a report', () => {
     expect(deliveredEntryRow(steer(''), id, 2)).toBeNull();
+  });
+
+  it("draws a price alert as its row, under its notice's id whatever the caller mints", () => {
+    const row = deliveredEntryRow(alert, id, 2);
+    expect(row).toEqual({
+      id: ALERT_ID,
+      role: 'notification',
+      content: '',
+      variant: 'info',
+      timestamp: at,
+      marketAlert: { source: 'delivered', notices: [NOTICE] },
+    });
+    expect(deliveredEntryRow(alert, (kind) => `history-${kind}`, undefined)).toEqual(row);
+  });
+
+  it('draws nothing for an alert naming no target', () => {
+    const named = { content: '', market_alert: { symbol: 'ACME' } } as unknown as DeliveredMarketAlert;
+    expect(deliveredEntryRow(named, id, 2)).toBeNull();
   });
 });
 
@@ -259,5 +284,41 @@ describe('foldSteeringDelivery: placing reports', () => {
     const { messages } = fold(prev, [report]);
     expect(byId(messages, 's1')).toBe(prev[2]);
     expect(byId(messages, 'report-0')).toMatchObject({ provenance: TASK_PROVENANCE, steeringDelivered: true, turnIndex: 0 });
+  });
+});
+
+describe('foldSteeringDelivery: placing price alerts', () => {
+  it.each<[string, ChatMessage[], SteeringDeliveredEntry[], string[]]>([
+    [
+      'above the steer it is delivered with',
+      [...transcript(), waiting('s1', 'margins')],
+      [alert, steer('margins')],
+      ['u0', 'a1', ALERT_ID, 's1'],
+    ],
+    [
+      'alone, above a steer still waiting in the turn',
+      [...transcript(), waiting('s1', 'margins')],
+      [alert],
+      ['u0', 'a1', ALERT_ID, 's1'],
+    ],
+    [
+      'with a report, in the order delivered, ahead of the user\'s rows',
+      transcript(),
+      [alert, report, steer('and margins')],
+      ['u0', 'a1', ALERT_ID, 'report-0', 'user-1'],
+    ],
+  ])('%s', (_, prev, entries, ids) => {
+    expect(fold(prev, entries).messages.map((m) => m.id)).toEqual(ids);
+  });
+
+  it('leaves the user\'s waiting steer waiting when only alerts arrive', () => {
+    const prev = [...transcript(), waiting('s1', 'margins')];
+    const { messages } = fold(prev, [alert]);
+    expect(byId(messages, 's1')).toBe(prev[2]);
+  });
+
+  it('draws an alert already on screen once', () => {
+    const prev = [...transcript(), ...fold(transcript(), [alert]).messages.slice(2)];
+    expect(fold(prev, [alert]).messages).toBe(prev);
   });
 });

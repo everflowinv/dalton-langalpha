@@ -38,6 +38,18 @@ MAX_CONCURRENT_JOBS = 10
 # share so a burst of tail completions can't starve hand-off report-backs and
 # cheap wakes. Excluded types stay unclaimed but still head their chains.
 TASK_RB_INFLIGHT_QUOTA = 3
+# market_target jobs ride out admission refusals holding their slot, and each
+# thread's notices are their own chain, so one market-wide move (or a session
+# close, which every target on the venue warns ahead of) makes a job due on
+# every watching thread at once. Cap their share too, or a burst of wakes
+# refused for credit or rate could pin every slot and stall steers and
+# report-backs for everyone. A claim never asks for more jobs than the room
+# left under any quota, so a burst cannot overshoot one in a single batch.
+MARKET_TARGET_INFLIGHT_QUOTA = 3
+_INFLIGHT_QUOTAS = {
+    "task_report_back": TASK_RB_INFLIGHT_QUOTA,
+    "market_target": MARKET_TARGET_INFLIGHT_QUOTA,
+}
 # How long shutdown waits for the loop, and then for its in-flight jobs.
 STOP_GRACE = 10.0
 # Terminal-row retention: far beyond every read-back window (done-recents
@@ -45,6 +57,11 @@ STOP_GRACE = 10.0
 RETENTION_SECONDS = 7 * 24 * 3600.0
 PURGE_INTERVAL = 3600.0
 PURGE_BATCH = 5000
+# How often the drainer closes market-target alerts no turn will take in, and
+# how often it revives dead ones. Neither is urgent; a revive waits out a
+# cool-down anyway (``outbox.revive_dead_alerts``), and reads terminal rows.
+ALERT_CLOSE_INTERVAL = 60.0
+ALERT_REVIVE_INTERVAL = 600.0
 
 
 # ---------------------------------------------------------------------------
@@ -79,7 +96,8 @@ _EXECUTORS: Dict[str, Callable[[Dict[str, Any]], Awaitable[None]]] = {
 # A failure never un-acks the job.
 _CLOSE_FOLLOWUPS: Dict[str, Callable[[Dict[str, Any]], Awaitable[None]]] = {}
 # Best-effort followups for a row its type settles itself at the attempts
-# ceiling rather than parking it dead (a steer, ``outbox._exhaust_steers``).
+# ceiling rather than parking it dead (a steer, ``outbox._exhaust_steers``;
+# a market-target alert, ``outbox._exhaust_alerts``).
 _EXHAUST_FOLLOWUPS: Dict[str, Callable[[Dict[str, Any]], Awaitable[None]]] = {}
 
 
@@ -144,6 +162,8 @@ class HookOutboxDrainer:
         # task -> hook_type, so per-type quotas can count in-flight work.
         self._inflight: Dict[asyncio.Task, str] = {}
         self._next_purge = 0.0
+        self._next_alert_revive = 0.0
+        self._next_alert_close = 0.0
 
     def start(self) -> None:
         if self._task is None or self._task.done():
@@ -233,6 +253,46 @@ class HookOutboxDrainer:
             except Exception:
                 logger.error("[HookOutbox] revive sweep failed", exc_info=True)
 
+            # A market-target alert out of attempts waits for its thread's next
+            # turn instead of going dead. One an older build dead-lettered is
+            # made due again, at most twice, while its notice is owed; one no
+            # turn will take in (not owed, or its thread archived or its
+            # workspace deleted) is closed rather than left pending for good.
+            if time.monotonic() >= self._next_alert_revive:
+                self._next_alert_revive = time.monotonic() + ALERT_REVIVE_INTERVAL
+                try:
+                    for revived in await outbox_db.revive_dead_alerts():
+                        logger.warning(
+                            f"[HookOutbox] revived dead market alert job="
+                            f"{revived.get('hook_outbox_id')} "
+                            f"key={revived.get('ordering_key')} for another "
+                            f"wake"
+                        )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.error(
+                        "[HookOutbox] market alert revive sweep failed",
+                        exc_info=True,
+                    )
+            if time.monotonic() >= self._next_alert_close:
+                self._next_alert_close = time.monotonic() + ALERT_CLOSE_INTERVAL
+                try:
+                    for closed in await outbox_db.close_unowed_waiting_alerts():
+                        logger.info(
+                            f"[HookOutbox] closed market alert job="
+                            f"{closed.get('hook_outbox_id')} "
+                            f"key={closed.get('ordering_key')}: no turn will "
+                            f"take it in"
+                        )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.error(
+                        "[HookOutbox] market alert close sweep failed",
+                        exc_info=True,
+                    )
+
             # Retention: purge terminal rows past every read-back window so
             # the table (and the sweeps above) stays flat on a long-lived
             # deployment.
@@ -265,17 +325,18 @@ class HookOutboxDrainer:
             free = MAX_CONCURRENT_JOBS - len(self._inflight)
             jobs = []
             if free > 0:
-                task_rb_inflight = sum(
-                    1 for ht in self._inflight.values() if ht == "task_report_back"
-                )
-                excluded = (
-                    ["task_report_back"]
-                    if task_rb_inflight >= TASK_RB_INFLIGHT_QUOTA
-                    else None
+                running = list(self._inflight.values())
+                room = {
+                    hook_type: quota - running.count(hook_type)
+                    for hook_type, quota in _INFLIGHT_QUOTAS.items()
+                }
+                excluded = [t for t, left in room.items() if left <= 0] or None
+                batch = min(
+                    CLAIM_BATCH, free, *(left for left in room.values() if left > 0)
                 )
                 try:
                     jobs = await outbox_db.claim_outbox_jobs(
-                        limit=min(CLAIM_BATCH, free),
+                        limit=batch,
                         lease_seconds=LEASE_SECONDS,
                         max_attempts=MAX_ATTEMPTS,
                         excluded_hook_types=excluded,
@@ -295,7 +356,7 @@ class HookOutboxDrainer:
                         lambda t: self._inflight.pop(t, None)
                     )
 
-                if len(jobs) >= free:
+                if len(jobs) >= batch:
                     continue  # claimed to capacity; more are likely due right now
 
             await self._wait_for_nudge()

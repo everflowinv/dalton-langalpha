@@ -2639,18 +2639,20 @@ describe('the window-chrome contract holds across the two processes', () => {
   // What the strip cannot subtract is prose: `no-drag` covers controls, so a
   // route that renders a document with no chrome of its own has its top line
   // inside a drag region, where a press-and-drag moves the window instead of
-  // selecting the text. Terms and privacy are the two such documents this app
-  // ships, and the answer is that neither opens in the shell at all -- an
+  // selecting the text. The legal page is the one such document this app
+  // ships, and the answer is that it never opens in the shell at all -- an
   // anchor with a target reaches setWindowOpenHandler in src/main.js, which
   // hands one of our own URLs to the system browser. A `<Link>` is a
   // client-side navigation that never reaches that handler, and a plain `<a>`
   // navigates this window; both put the document back under the titlebar, and
-  // both look correct in a browser.
+  // both look correct in a browser. The privacy policy is published at its own
+  // address, which leaves the app either way; `/privacy` stays in the pattern
+  // because that path forwards to it.
   test('a legal document is never opened inside the app window', () => {
     const src = path.join(__dirname, '..', '..', 'web/src')
-    // The documents themselves are exempt, and by the same rule rather than as
-    // a hole in it: they only ever render in a browser tab, so a link between
-    // them is an ordinary in-tab navigation. The rule is about app surface.
+    // The document itself is exempt, and by the same rule rather than as a
+    // hole in it: it only ever renders in a browser tab, so a link from it is
+    // an ordinary in-tab navigation. The rule is about app surface.
     const exempt = `pages${path.sep}Legal${path.sep}`
     const offenders = []
     for (const rel of fs.readdirSync(src, { recursive: true })) {

@@ -1,9 +1,10 @@
 """Tests that PTCSandbox.execute() surfaces the in-sandbox MCP trace.
 
 The generated client writes a per-execution JSONL trace; ``execute()`` reads it
-back (via ``aread_file_text``) on BOTH the success path and the crash ``except``
-path (durability — lines are flushed per call before a crash), parsing it into
-``ExecutionResult.mcp_trace``.
+back on BOTH the success path and the crash ``except`` path (durability: lines
+are flushed per call before a crash), parsing it into ``ExecutionResult.mcp_trace``.
+A small trace comes back in the size probe's own output; a larger one is
+downloaded with ``aread_file_text``.
 """
 
 from __future__ import annotations
@@ -84,20 +85,31 @@ def _make_sandbox(mock_runtime):
     # execute() depends on these collaborators; stub them so we exercise only
     # the trace-collection logic.
     sandbox._runtime_call = AsyncMock(side_effect=_passthrough_runtime_call)
-    sandbox.aread_file_text = AsyncMock(return_value=_trace_jsonl())
+    _serve_trace(mock_runtime, sandbox, _trace_jsonl())
     return sandbox
 
 
-def _exec_side_effect(command, *args, **kwargs):
-    """Default exec mock: ``wc -c`` sizes the trace before the read.
+def _serve_trace(runtime, sandbox, content: str | None) -> None:
+    """Put ``content`` in the trace file, as the probe and the download see it.
 
-    A populated trace reports a real non-zero byte count in production (an
-    absent/empty file reports 0, which short-circuits the read). Other exec
-    calls (rm, mkdir) return empty.
+    The probe prints the byte count, then the contents when they fit inline; an
+    absent or empty file prints nothing. Other exec calls (rm, mkdir) return empty.
     """
-    if str(command).lstrip().startswith("wc -c"):
-        return ExecResult("4096", "", 0)
-    return ExecResult("", "", 0)
+
+    def exec_side_effect(command, *args, **kwargs):
+        if not str(command).lstrip().startswith("[ -s"):
+            return ExecResult("", "", 0)
+        if not content:
+            return ExecResult("", "", 0)
+        size = len(content.encode())
+        body = content if size <= _INLINE_MAX else ""
+        return ExecResult(f"{size}\n{body}", "", 0)
+
+    runtime.exec = AsyncMock(side_effect=exec_side_effect)
+    sandbox.aread_file_text = AsyncMock(return_value=content)
+
+
+_INLINE_MAX = 256 * 1024
 
 
 @pytest.fixture
@@ -105,7 +117,6 @@ def mock_runtime():
     runtime = AsyncMock(spec=SandboxRuntime)
     runtime.working_dir = WORK_DIR
     runtime.fetch_working_dir = AsyncMock(return_value=WORK_DIR)
-    runtime.exec = AsyncMock(side_effect=_exec_side_effect)
     runtime.upload_file = AsyncMock()
     runtime.code_run = AsyncMock(return_value=CodeRunResult("out", "", 0, []))
     return runtime
@@ -160,7 +171,11 @@ async def test_mcp_trace_populated_on_crash(
         "get_company_overview",
     ]
     # The crash path still read the trace file back.
-    sandbox.aread_file_text.assert_awaited()
+    probes = [
+        c for c in mock_runtime.exec.await_args_list
+        if str(c.args[0]).startswith("[ -s")
+    ]
+    assert probes
 
 
 @patch("ptc_agent.core.sandbox.ptc_sandbox.create_provider")
@@ -170,13 +185,13 @@ async def test_malformed_trace_lines_skipped(
 ):
     mock_create_provider.return_value = mock_provider
     sandbox = _make_sandbox(mock_runtime)
-    sandbox.aread_file_text = AsyncMock(
-        return_value=(
-            json.dumps(_TRACE_LINES[0])
-            + "\n{ this is not json\n\n"  # malformed + blank lines
-            + json.dumps(_TRACE_LINES[1])
-            + "\n"
-        )
+    _serve_trace(
+        mock_runtime,
+        sandbox,
+        json.dumps(_TRACE_LINES[0])
+        + "\n{ this is not json\n\n"  # malformed + blank lines
+        + json.dumps(_TRACE_LINES[1])
+        + "\n",
     )
 
     result = await sandbox.execute("print('hi')", auto_install=False)
@@ -193,7 +208,7 @@ async def test_mcp_trace_empty_when_no_file(
 ):
     mock_create_provider.return_value = mock_provider
     sandbox = _make_sandbox(mock_runtime)
-    sandbox.aread_file_text = AsyncMock(return_value=None)
+    _serve_trace(mock_runtime, sandbox, None)
 
     result = await sandbox.execute("print('hi')", auto_install=False)
 
@@ -207,7 +222,7 @@ async def test_mcp_trace_skipped_when_file_over_read_cap(
     mock_create_provider, mock_provider, mock_runtime
 ):
     # MCP_TRACE_FILE is writable by agent-authored sandbox code, so the host
-    # sizes it (wc -c) before reading. A file past the 16 MiB read cap is skipped
+    # sizes it before reading. A file past the 16 MiB read cap is skipped
     # entirely — never pulled into host memory — and yields no trace.
     mock_create_provider.return_value = mock_provider
     sandbox = _make_sandbox(mock_runtime)
@@ -226,8 +241,8 @@ async def test_mcp_trace_skips_read_when_file_absent(
     mock_create_provider, mock_provider, mock_runtime
 ):
     # A bash/exec run that imported no MCP wrappers never creates the trace file,
-    # so `wc -c` reports 0 bytes and the read (and the rm) are skipped entirely —
-    # no wasted round-trip on the common non-MCP path.
+    # so the probe prints nothing and the download and the rm are skipped: one
+    # round trip on the common non-MCP path.
     mock_create_provider.return_value = mock_provider
     sandbox = _make_sandbox(mock_runtime)
     mock_runtime.exec = AsyncMock(return_value=ExecResult("", "", 0))
@@ -236,5 +251,29 @@ async def test_mcp_trace_skips_read_when_file_absent(
 
     assert trace == []
     sandbox.aread_file_text.assert_not_awaited()
-    # Only the `wc -c` sizing ran — no read, no rm (both skipped).
+    # Only the probe ran: no download, no rm.
     assert mock_runtime.exec.await_count == 1
+
+
+@patch("ptc_agent.core.sandbox.ptc_sandbox.create_provider")
+@pytest.mark.asyncio
+async def test_small_trace_rides_the_probe_and_a_large_one_is_downloaded(
+    mock_create_provider, mock_provider, mock_runtime
+):
+    mock_create_provider.return_value = mock_provider
+    sandbox = _make_sandbox(mock_runtime)
+    path = f"{WORK_DIR}/.system/trace/t.jsonl"
+
+    small = await sandbox._collect_mcp_trace(path)
+
+    assert [r["tool"] for r in small] == ["get_daily_prices", "get_company_overview"]
+    sandbox.aread_file_text.assert_not_awaited()
+
+    filler = {"tool": "filler", "result_snippet": "x" * 1024}
+    large = "".join(json.dumps(filler) + "\n" for _ in range(300)) + _trace_jsonl()
+    _serve_trace(mock_runtime, sandbox, large)
+
+    big = await sandbox._collect_mcp_trace(path)
+
+    assert len(big) == 302
+    sandbox.aread_file_text.assert_awaited_once_with(path)

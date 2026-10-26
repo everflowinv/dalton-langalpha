@@ -74,11 +74,7 @@ def mock_runtime():
     runtime.working_dir = "/workspace"
     runtime.create_session = AsyncMock()
     runtime.delete_session = AsyncMock()
-    runtime.session_execute = AsyncMock(
-        return_value=SessionCommandResult(
-            cmd_id="cmd-001", exit_code=None, stdout="", stderr=""
-        )
-    )
+    runtime.session_execute = AsyncMock(return_value="cmd-001")
     runtime.session_command_logs = AsyncMock(
         return_value=SessionCommandResult(
             cmd_id="cmd-001", exit_code=None, stdout="some output", stderr=""
@@ -244,9 +240,7 @@ class TestStartPreviewServer:
 
     @pytest.mark.asyncio
     async def test_happy_path_creates_per_port_session(self, sandbox, mock_runtime):
-        mock_runtime.session_execute.return_value = SessionCommandResult(
-            cmd_id="preview-cmd-1", exit_code=None, stdout="", stderr=""
-        )
+        mock_runtime.session_execute.return_value = "preview-cmd-1"
 
         cmd_id = await sandbox.start_preview_server("python -m http.server 8080", 8080)
 
@@ -263,9 +257,7 @@ class TestStartPreviewServer:
         # Pre-populate a stale session for port 8080
         sandbox._preview_sessions[8080] = ("preview-8080", "old-cmd")
 
-        mock_runtime.session_execute.return_value = SessionCommandResult(
-            cmd_id="new-cmd", exit_code=None, stdout="", stderr=""
-        )
+        mock_runtime.session_execute.return_value = "new-cmd"
 
         cmd_id = await sandbox.start_preview_server("python app.py", 8080)
 
@@ -284,9 +276,7 @@ class TestStartPreviewServer:
         # delete_session fails but we should continue
         mock_runtime.delete_session.side_effect = Exception("cleanup failed")
 
-        mock_runtime.session_execute.return_value = SessionCommandResult(
-            cmd_id="new-cmd", exit_code=None, stdout="", stderr=""
-        )
+        mock_runtime.session_execute.return_value = "new-cmd"
 
         cmd_id = await sandbox.start_preview_server("python app.py", 8080)
         assert cmd_id == "new-cmd"
@@ -296,9 +286,7 @@ class TestStartPreviewServer:
         mock_runtime.create_session.side_effect = Exception(
             "Session already exists for this sandbox"
         )
-        mock_runtime.session_execute.return_value = SessionCommandResult(
-            cmd_id="reused-cmd", exit_code=None, stdout="", stderr=""
-        )
+        mock_runtime.session_execute.return_value = "reused-cmd"
 
         cmd_id = await sandbox.start_preview_server("node server.js", 3000)
         assert cmd_id == "reused-cmd"
@@ -541,7 +529,7 @@ class TestWorkspaceScopedPreviewCommands:
         cache.set = AsyncMock(return_value=True)
         cache.delete = AsyncMock()
         with patch(
-            "src.server.app.workspace_sandbox.get_cache_client",
+            "src.server.services.preview_links.get_cache_client",
             return_value=cache,
         ):
             yield
@@ -550,13 +538,13 @@ class TestWorkspaceScopedPreviewCommands:
     async def test_stored_command_restarts_inside_the_workspace_folder(
         self, mock_sandbox_for_endpoint
     ):
-        from src.server.app.workspace_sandbox import _resolve_preview
+        from src.server.services.preview_links import resolve_preview
 
         with patch(
-            "src.server.app.workspace_sandbox._set_cached_signed_url",
+            "src.server.services.preview_links._set_cached_signed_url",
             AsyncMock(),
         ):
-            await _resolve_preview(
+            await resolve_preview(
                 mock_sandbox_for_endpoint,
                 "ws-test-001",
                 8080,
@@ -602,7 +590,7 @@ class TestWorkspaceScopedPreviewCommands:
         return (
             patch("src.server.app.workspace_sandbox._get_sandbox",
                   AsyncMock(return_value=(MagicMock(), sandbox))),
-            patch("src.server.app.workspace_sandbox._set_cached_signed_url", AsyncMock()),
+            patch("src.server.services.preview_links._set_cached_signed_url", AsyncMock()),
             patch("src.server.app.workspace_files._shared.workspace_folder_in_use", hold),
             # Every read of the row, the owner check's included, goes through
             # here, so one outside the hold shows as out of order rather than
@@ -645,6 +633,79 @@ class TestWorkspaceScopedPreviewCommands:
         assert events == ["hold", "read", "launch cd /home/workspace/project-a", "release"]
 
     @pytest.mark.asyncio
+    async def test_a_url_a_browser_cannot_open_is_cached_and_returned_as_published(
+        self, mock_sandbox_for_endpoint
+    ):
+        """Whatever reaches the panel or the cache is publish's answer, never
+        the raw sandbox host that needs a header."""
+        from src.server.services.preview_links import resolve_preview
+
+        private = PreviewInfo(
+            url="https://8080-sb-123.e2b.app",
+            token=None,
+            auth_headers={"e2b-traffic-access-token": "tok"},
+            browser_ready=False,
+        )
+        mock_sandbox_for_endpoint.get_preview_url = AsyncMock(return_value=private)
+        capability = "https://8080-cap.preview.example.com/"
+        with (
+            patch(
+                "src.server.services.preview_links.publish",
+                AsyncMock(return_value=capability),
+            ) as publish,
+            patch(
+                "src.server.services.preview_links._set_cached_signed_url", AsyncMock()
+            ) as cache_url,
+        ):
+            url = await resolve_preview(
+                mock_sandbox_for_endpoint,
+                "ws-test-001",
+                8080,
+                command=None,
+                work_dir="/home/workspace/project-a",
+            )
+
+        assert url == capability
+        publish.assert_awaited_once_with(
+            private,
+            sandbox_id="sb-123",
+            port=8080,
+            workspace_id="ws-test-001",
+            expires_in=3600,
+        )
+        assert cache_url.await_args.args[2] == capability
+
+    @pytest.mark.asyncio
+    async def test_a_computer_needing_the_proxy_where_there_is_none_is_501(
+        self, mock_sandbox_for_endpoint, monkeypatch
+    ):
+        from fastapi import HTTPException
+
+        from src.config import env
+        from src.server.app.workspace_sandbox import owner_preview_url
+
+        monkeypatch.setattr(env, "PREVIEW_PROXY_BASE_URL", "")
+        mock_sandbox_for_endpoint.get_preview_url = AsyncMock(
+            return_value=PreviewInfo(
+                url="https://8080-sb-123.e2b.app",
+                token=None,
+                auth_headers={"e2b-traffic-access-token": "tok"},
+                browser_ready=False,
+            )
+        )
+        events = []
+        with ExitStack() as stack:
+            for p in self._held_folder(mock_sandbox_for_endpoint, events):
+                stack.enter_context(p)
+            with pytest.raises(HTTPException) as raised:
+                await owner_preview_url(
+                    "ws-test-001", "test-user-123", 8080, command=None
+                )
+
+        assert raised.value.status_code == 501
+        assert "preview proxy" in raised.value.detail
+
+    @pytest.mark.asyncio
     async def test_no_launch_starts_in_a_folder_left_mid_move(self, mock_sandbox_for_endpoint):
         from fastapi import HTTPException
 
@@ -674,24 +735,24 @@ class TestWorkspaceScopedPreviewCommands:
     async def test_cache_miss_reuses_owned_preview_from_another_worker(
         self, mock_sandbox_for_endpoint
     ):
-        from src.server.app.workspace_sandbox import _resolve_preview
+        from src.server.services.preview_links import resolve_preview
 
         mock_sandbox_for_endpoint._is_preview_reachable = AsyncMock(return_value=True)
         with (
             patch(
-                "src.server.app.workspace_sandbox._get_preview_owner",
+                "src.server.services.preview_links.get_preview_owner",
                 AsyncMock(return_value="ws-test-001"),
             ),
             patch(
-                "src.server.app.workspace_sandbox._get_cached_signed_url",
+                "src.server.services.preview_links._get_cached_signed_url",
                 AsyncMock(return_value=None),
             ),
             patch(
-                "src.server.app.workspace_sandbox._set_cached_signed_url",
+                "src.server.services.preview_links._set_cached_signed_url",
                 AsyncMock(),
             ) as cache_url,
         ):
-            url = await _resolve_preview(
+            url = await resolve_preview(
                 mock_sandbox_for_endpoint,
                 "ws-test-001",
                 8080,
@@ -712,7 +773,7 @@ class TestWorkspaceScopedPreviewCommands:
 
     @pytest.mark.asyncio
     async def test_cross_worker_launch_reserves_owner_before_provider_work(self):
-        from src.server.app.workspace_sandbox import _resolve_preview
+        from src.server.services.preview_links import resolve_preview
 
         class Cache:
             def __init__(self):
@@ -758,15 +819,15 @@ class TestWorkspaceScopedPreviewCommands:
 
         with (
             patch(
-                "src.server.app.workspace_sandbox.get_cache_client",
+                "src.server.services.preview_links.get_cache_client",
                 return_value=cache,
             ),
             patch(
-                "src.server.app.workspace_sandbox._check_signed_url_healthy",
+                "src.server.services.preview_links._check_signed_url_healthy",
                 AsyncMock(return_value=True),
             ),
         ):
-            first_task = asyncio.create_task(_resolve_preview(
+            first_task = asyncio.create_task(resolve_preview(
                 first,
                 "workspace-a",
                 8080,
@@ -774,7 +835,7 @@ class TestWorkspaceScopedPreviewCommands:
                 work_dir="/home/workspace/a",
             ))
             await launch_entered.wait()
-            second_task = asyncio.create_task(_resolve_preview(
+            second_task = asyncio.create_task(resolve_preview(
                 second,
                 "workspace-b",
                 8080,
@@ -792,7 +853,7 @@ class TestWorkspaceScopedPreviewCommands:
     async def test_failed_launch_releases_owner_reservation(
         self, mock_sandbox_for_endpoint
     ):
-        from src.server.app.workspace_sandbox import _resolve_preview
+        from src.server.services.preview_links import resolve_preview
 
         cache = MagicMock()
         cache.acquire_lock = AsyncMock(return_value=True)
@@ -804,11 +865,11 @@ class TestWorkspaceScopedPreviewCommands:
         mock_sandbox_for_endpoint.start_and_get_preview_url.side_effect = RuntimeError("boom")
 
         with patch(
-            "src.server.app.workspace_sandbox.get_cache_client",
+            "src.server.services.preview_links.get_cache_client",
             return_value=cache,
         ):
             with pytest.raises(RuntimeError, match="boom"):
-                await _resolve_preview(
+                await resolve_preview(
                     mock_sandbox_for_endpoint,
                     "workspace-a",
                     8080,
@@ -823,21 +884,21 @@ class TestWorkspaceScopedPreviewCommands:
     async def test_commandless_redirect_rejects_a_sibling_preview(
         self, mock_sandbox_for_endpoint
     ):
-        from src.server.app.workspace_sandbox import _resolve_preview
+        from src.server.services.preview_links import resolve_preview
 
         mock_sandbox_for_endpoint._is_preview_reachable = AsyncMock(return_value=True)
         with (
             patch(
-                "src.server.app.workspace_sandbox._get_preview_owner",
+                "src.server.services.preview_links.get_preview_owner",
                 AsyncMock(return_value="workspace-b"),
             ),
             patch(
-                "src.server.app.workspace_sandbox._get_cached_signed_url",
+                "src.server.services.preview_links._get_cached_signed_url",
                 AsyncMock(return_value="https://preview.example.com/b"),
             ),
         ):
             with pytest.raises(RuntimeError, match="already in use"):
-                await _resolve_preview(
+                await resolve_preview(
                     mock_sandbox_for_endpoint,
                     "workspace-a",
                     8080,
@@ -851,16 +912,16 @@ class TestWorkspaceScopedPreviewCommands:
     async def test_launch_fails_closed_without_preview_coordination(
         self, mock_sandbox_for_endpoint
     ):
-        from src.server.app.workspace_sandbox import _resolve_preview
+        from src.server.services.preview_links import resolve_preview
 
         cache = MagicMock()
         cache.acquire_lock = AsyncMock(return_value=None)
         with patch(
-            "src.server.app.workspace_sandbox.get_cache_client",
+            "src.server.services.preview_links.get_cache_client",
             return_value=cache,
         ):
             with pytest.raises(RuntimeError, match="coordination is unavailable"):
-                await _resolve_preview(
+                await resolve_preview(
                     mock_sandbox_for_endpoint,
                     "workspace-a",
                     8080,
@@ -875,22 +936,22 @@ class TestWorkspaceScopedPreviewCommands:
 async def test_a_signed_urls_expiry_is_counted_from_its_mint_not_from_the_read():
     """The ``/a/`` page renews an app's URL off this, and a cached URL is older
     than the request that gets it back."""
-    from src.server.app import workspace_sandbox as ws
+    from src.server.services import preview_links as links
 
     store: dict = {}
     cache = MagicMock()
     cache.set = AsyncMock(side_effect=lambda key, value, ttl=None: store.__setitem__(key, value))
     cache.get = AsyncMock(side_effect=lambda key: store.get(key))
     with (
-        patch.object(ws, "get_cache_client", return_value=cache),
-        patch.object(ws.time, "time", return_value=1_000_000),
+        patch.object(links, "get_cache_client", return_value=cache),
+        patch.object(links.time, "time", return_value=1_000_000),
     ):
-        await ws._set_cached_signed_url("sb-1", 8080, "https://a", url_expires_at=1_003_600)
-        await ws._set_cached_signed_url("sb-1", 8081, "https://b")
-        assert await ws.signed_url_expires_at("https://a") == 1_003_600
-        assert await ws.signed_url_expires_at("https://b") == 1_000_000 + 3600
+        await links._set_cached_signed_url("sb-1", 8080, "https://a", url_expires_at=1_003_600)
+        await links._set_cached_signed_url("sb-1", 8081, "https://b")
+        assert await links.signed_url_expires_at("https://a") == 1_003_600
+        assert await links.signed_url_expires_at("https://b") == 1_000_000 + 3600
         # Cached by a worker that kept no record: the cache's own margin.
-        assert await ws.signed_url_expires_at("https://c") == 1_000_000 + 600
+        assert await links.signed_url_expires_at("https://c") == 1_000_000 + 600
 
 
 class TestPreviewRedirectEndpoint:

@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import logging
 import shlex
+import time
 from contextlib import AsyncExitStack
 from dataclasses import asdict
 from datetime import UTC, datetime
@@ -758,6 +759,8 @@ async def write_workspace_file(
 _STREAM_SLOT_WAIT_S = 30
 # How long the sandbox has to produce a stream's first chunk.
 _STREAM_OPEN_TIMEOUT_S = 60
+# How often a large download counts as use of its computer while it streams.
+_STREAM_KEEP_ALIVE_S = 60
 
 
 class _StreamedDownload(StreamingResponse):
@@ -787,6 +790,29 @@ class _StreamedDownload(StreamingResponse):
 
 class _FileChangedWhileSending(Exception):
     """The file grew or shrank after its size went out as Content-Length."""
+
+
+async def _kept_alive(
+    body: AsyncIterator[bytes], workspace_id: str, sandbox: Any
+) -> AsyncIterator[bytes]:
+    """Yield ``body``, counting it as use of the computer about once a minute.
+
+    A download is no turn and, once open, makes no provider call, so neither
+    the idle sweep nor E2B's deadline would see it, and a long one could be
+    stopped mid-transfer.
+    """
+    due = 0.0
+    async for chunk in body:
+        now = time.monotonic()
+        if now >= due:
+            due = now + _STREAM_KEEP_ALIVE_S
+            try:
+                await WorkspaceManager.get_instance().keep_sandbox_alive(
+                    workspace_id, sandbox.sandbox_id, runtime=sandbox.runtime
+                )
+            except Exception as e:
+                logger.debug("Download did not count as activity: %s", e)
+        yield chunk
 
 
 async def _exactly(body: AsyncIterator[bytes], size: int) -> AsyncIterator[bytes]:
@@ -975,7 +1001,7 @@ async def download_workspace_file(
 
         if too_large is not None:
             return await _stream_large_file(
-                sandbox, too_large, filename, mime, disposition, folder=folder
+                workspace_id, sandbox, too_large, filename, mime, disposition, folder=folder
             )
 
         if _is_text_content_type(mime) or _is_utf8(content):
@@ -988,6 +1014,7 @@ async def download_workspace_file(
 
 
 async def _stream_large_file(
+    workspace_id: str,
     sandbox: Any,
     too_large: FileTooLargeToServe,
     filename: str,
@@ -1034,7 +1061,7 @@ async def _stream_large_file(
         held.push_async_callback(stream.aclose)
         _record_fs_bytes("download", too_large.size)
         return _StreamedDownload(
-            _exactly(stream, too_large.size),
+            _kept_alive(_exactly(stream, too_large.size), workspace_id, sandbox),
             held=held.pop_all(),
             media_type=mime,
             headers={

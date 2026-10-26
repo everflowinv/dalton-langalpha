@@ -22,6 +22,10 @@ logger = logging.getLogger(__name__)
 # credit, and rate-limit gates clear on their own.
 DEFER_STATUSES = {402, 403, 429}
 
+# 429s that are this server's capacity rather than the user's usage limit, as
+# the automation executor splits them: only these clear within a wait here.
+_CAPACITY_429_TYPES = frozenset({"burst_limit", "service_unavailable"})
+
 _TERMINAL_POLL = 5.0
 
 # A thread whose latest attempt is one of these cannot take a notification
@@ -56,7 +60,13 @@ def is_resumable_failure(failure_error: object) -> bool:
 
 
 async def park_while_thread_busy(
-    job_id: str, attempts: int, thread_id: str, *, log_prefix: str, subject: str
+    job_id: str,
+    attempts: int,
+    thread_id: str,
+    *,
+    log_prefix: str,
+    subject: str,
+    parks_at_ceiling: bool = False,
 ) -> bool:
     """Park a claimed report-back while the thread it reports to is live or
     interrupted, until that thread's next dead-turn finalize releases it;
@@ -64,12 +74,14 @@ async def park_while_thread_busy(
 
     The re-read closes the race where that finalize landed between the
     status read and the park (its release pass saw no deferred row yet),
-    releasing the job itself.
+    releasing the job itself. ``parks_at_ceiling`` is for a type the defer
+    still parks at the attempts ceiling (a market-target alert, held for the
+    thread's next turn), so the re-read covers it there too; a steer settled
+    there instead is not parked, and has nothing to release.
     """
-    from src.server.database.pool import get_db_connection
     from src.server.database.runs import lifecycle as tl_db
     from src.server.database.runs import outbox as outbox_db
-    from src.server.services.hook_outbox import MAX_ATTEMPTS, HookOutboxDrainer
+    from src.server.services.hook_outbox import MAX_ATTEMPTS
 
     latest = await tl_db.get_latest_attempt(thread_id)
     if not latest or latest.get("status") not in _BUSY_STATUSES:
@@ -81,15 +93,55 @@ async def park_while_thread_busy(
         f"{log_prefix} Parked job {job_id} for {subject} while thread "
         f"{thread_id} is {latest.get('status')} (status={parked})"
     )
-    if parked == "pending":
+    if parked == "pending" or (parked == "exhausted" and parks_at_ceiling):
         latest = await tl_db.get_latest_attempt(thread_id)
         if not latest or latest.get("status") not in _BUSY_STATUSES:
-            async with get_db_connection() as conn:
-                await outbox_db.release_deferred_report_backs(conn, thread_id)
-            try:
-                HookOutboxDrainer.get_instance().nudge()
-            except Exception:
-                pass
+            await release_parked_notifications(thread_id)
+    return True
+
+
+async def release_parked_notifications(thread_id: str) -> None:
+    """Release the thread's parked notifications and wake the drainer, as the
+    finalize of a turn that ended would have, for a caller that held one
+    while that finalize ran and so was skipped by its release."""
+    from src.server.database.pool import get_db_connection
+    from src.server.database.runs import outbox as outbox_db
+    from src.server.services.hook_outbox import HookOutboxDrainer
+
+    async with get_db_connection() as conn:
+        await outbox_db.release_deferred_notifications(conn, thread_id)
+    try:
+        HookOutboxDrainer.get_instance().nudge()
+    except Exception:
+        pass
+
+
+def run_marker(latest: dict | None) -> tuple[str, str] | None:
+    """The thread's latest run as id and status, for a later read to tell
+    whether a run ended in between."""
+    if not latest:
+        return None
+    return str(latest.get("conversation_response_id")), str(latest.get("status"))
+
+
+async def release_if_a_turn_ended(thread_id: str, since: tuple[str, str] | None) -> bool:
+    """Release the thread's parked notifications when its latest run has
+    ended since ``since`` (``run_marker`` read when the caller's claim
+    began) and none is live or awaiting the user; True when it released.
+
+    That run's finalize found the caller's job claimed and released nothing
+    for it, so a job the caller then parked would miss the look the ending
+    buys. Released only on a change: a claim that met no new ending leaves
+    its job parked, so a refusal on every look cannot loop.
+    """
+    from src.server.database.runs import lifecycle as tl_db
+
+    latest = await tl_db.get_latest_attempt(thread_id)
+    if not latest or latest.get("status") in _BUSY_STATUSES:
+        return False
+    if run_marker(latest) == since:
+        return False
+    await release_parked_notifications(thread_id)
     return True
 
 
@@ -103,6 +155,8 @@ async def post_notification_turn(
     log_prefix: str,
     subject: str = "",
     still_due=None,
+    busy_fails_fast: bool = False,
+    refusal_fails_fast: bool = False,
 ) -> tuple[str, str | None]:
     """POST a synthetic turn to ``thread_id``, deferring through admission.
 
@@ -121,6 +175,12 @@ async def post_notification_turn(
     -> bool) is asked before each POST until one gets no definite answer (a
     transport error or a 5xx): that POST may still be admitted, and only a
     retry's request_key dedup can tell.
+    ``busy_fails_fast`` returns ``"busy"`` on the first 409 that is not our
+    own duplicate, for a caller with a better move than waiting out the
+    thread's run (handing its message to that run).
+    ``refusal_fails_fast`` returns ``"refused"`` on the first refusal no wait
+    here outlives (``_lasting_refusal``), for a caller that can hand its
+    message to the thread's next turn instead of retrying it.
     ``subject`` is a short label for log lines (e.g. the source PTC thread
     or task id).
     """
@@ -216,6 +276,16 @@ async def post_notification_turn(
                                 f"{thread_id} was taken in elsewhere; not posting"
                             )
                             return "taken", None
+                        if busy_fails_fast:
+                            return "busy", None
+                    if refusal_fails_fast and await _lasting_refusal(resp):
+                        logger.info(
+                            f"{log_prefix} Thread {thread_id} refused the "
+                            f"notification for {subject or 'background work'} "
+                            f"({resp.status}) on a limit that does not clear "
+                            f"by itself; not waiting"
+                        )
+                        return "refused", None
                     if (
                         resp.status == 409
                         or resp.status >= 500
@@ -259,6 +329,25 @@ async def post_notification_turn(
                     f"on thread {thread_id}"
                 )
                 return "cap", None
+
+
+async def _lasting_refusal(resp) -> bool:
+    """A refusal no wait under one claim outlives: payment required, or a
+    429 for the user's usage limit rather than this server's capacity.
+
+    A 403 is not one. No provider for the user is also the answer while the
+    access-tier lookup fails for a moment, and a wrong dispatch token is the
+    operator's to fix; both still reach the caller once the wait runs out.
+    """
+    if resp.status == 402:
+        return True
+    if resp.status != 429:
+        return False
+    try:
+        detail = (await resp.json()).get("detail")
+    except Exception:
+        return False
+    return isinstance(detail, dict) and detail.get("type") not in _CAPACITY_429_TYPES
 
 
 async def await_run_terminal(

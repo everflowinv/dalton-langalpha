@@ -93,3 +93,29 @@ class TestBashMcpTraceArtifact:
         assert msg.artifact == {"mcp_trace": []}
         assert "ERROR" in msg.content
         backend.aexecute_bash.assert_not_called()
+
+
+class TestBashTimeout:
+    """A timeout the model passes in seconds must not become no deadline."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("timeout", "seconds"),
+        [
+            (30, 30),  # seconds by mistake: read as seconds, not truncated to 0
+            (999, 600),
+            (1500, 1),
+            (45000, 45),
+            (600000, 600),
+            (3600000, 600),  # past the documented max
+            (None, 120),
+            (0, 120),
+        ],
+    )
+    async def test_sandbox_gets_a_bounded_deadline(self, timeout, seconds):
+        backend = _make_backend({"success": True, "stdout": "ok", "stderr": "", "exit_code": 0})
+        tool = create_execute_bash_tool(backend)
+        call = _tool_call("sleep 1")
+        call["args"]["timeout"] = timeout
+        await tool.ainvoke(call)
+        assert backend.aexecute_bash.await_args.kwargs["timeout"] == seconds

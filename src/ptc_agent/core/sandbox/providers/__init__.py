@@ -1,9 +1,49 @@
 """Sandbox provider factory."""
 
-from ptc_agent.config.core import CoreConfig, DaytonaConfig, DockerConfig
+from collections.abc import Sequence
+from importlib import import_module
+
+from ptc_agent.config.core import (
+    CoreConfig,
+    DaytonaConfig,
+    DockerConfig,
+    E2BConfig,
+    PlatformSecretDefinition,
+)
 from ptc_agent.core.sandbox.runtime import SandboxProvider
 
-ProviderConfig = DaytonaConfig | DockerConfig
+ProviderConfig = DaytonaConfig | DockerConfig | E2BConfig
+
+# Imported on first use: each provider module loads its vendor's SDK.
+_PROVIDERS: dict[str, str] = {
+    "daytona": "ptc_agent.core.sandbox.providers.daytona:DaytonaProvider",
+    "docker": "ptc_agent.core.sandbox.providers.docker:DockerProvider",
+    "e2b": "ptc_agent.core.sandbox.providers.e2b:E2BProvider",
+}
+
+PROVIDER_KINDS = tuple(_PROVIDERS)
+
+
+def provider_class(kind: str) -> type[SandboxProvider]:
+    """The provider class for ``kind``, for facts a caller reads without
+    building one (building a provider can set up its client).
+
+    Raises:
+        ValueError: If ``kind`` names no known provider.
+    """
+    target = _PROVIDERS.get(kind) if isinstance(kind, str) else None
+    if target is None:
+        raise ValueError(f"Unknown sandbox provider: {kind!r}")
+    module, _, name = target.partition(":")
+    return getattr(import_module(module), name)
+
+
+def provider_runs_remote(kind: str | None) -> bool:
+    """Whether sandboxes of ``kind`` run off this host; an unknown kind reads as local."""
+    try:
+        return provider_class(kind).runs_remote  # type: ignore[arg-type]
+    except ValueError:
+        return False
 
 
 def build_provider(
@@ -11,45 +51,36 @@ def build_provider(
     provider_config: ProviderConfig,
     *,
     working_dir: str | None = None,
+    platform_secrets: Sequence[PlatformSecretDefinition] = (),
 ) -> SandboxProvider:
     """Build a provider from one backend's own kind and settings.
 
     The whole identity of the returned provider arrives through these
     arguments, so two backends can be addressed from one process.
+    ``platform_secrets`` is the deployment's catalog.
 
     Raises:
         ValueError: If ``kind`` names no known provider.
     """
-    if kind == "daytona":
-        from ptc_agent.core.sandbox.providers.daytona import DaytonaProvider
-
-        return DaytonaProvider(provider_config, working_dir=working_dir)
-
-    if kind == "docker":
-        from ptc_agent.core.sandbox.providers.docker import DockerProvider
-
-        return DockerProvider(provider_config, working_dir=working_dir)
-
-    raise ValueError(f"Unknown sandbox provider: {kind!r}")
+    return provider_class(kind)(
+        provider_config,
+        working_dir=working_dir,
+        platform_secrets=platform_secrets,
+    )
 
 
 def create_provider(config: CoreConfig) -> SandboxProvider:
     """Build the provider one CoreConfig selects.
 
-    ``SandboxConfig`` holds each kind's settings under a field of that same
-    name, which is what lets the selection stay a single lookup.
-
     Raises:
         ValueError: If ``sandbox.provider`` names no known provider.
     """
     kind = config.sandbox.provider
-    provider_config = getattr(config.sandbox, kind, None)
-    if provider_config is None:
-        raise ValueError(f"Unknown sandbox provider: {kind!r}")
     return build_provider(
         kind,
-        provider_config,
+        config.sandbox.settings_for(kind),
         # filesystem.working_directory is the single source of truth for both
         # providers; the per-provider working_dir field is only a fallback.
         working_dir=config.filesystem.working_directory,
+        platform_secrets=config.sandbox.platform_secrets,
     )

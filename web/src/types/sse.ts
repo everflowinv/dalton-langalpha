@@ -8,6 +8,7 @@ import type {
   OrderSummary,
 } from './orders';
 import type { ReportSource, ThreadOrigin } from './api';
+import type { MarketTargetNotice } from '@/pages/ChatAgent/session/marketWatchEvents';
 
 /**
  * `error_type` on a task's terminal frame when the credit gate stopped it,
@@ -57,6 +58,10 @@ export interface MetadataEvent extends BaseSSEEvent {
   /** The turn admission gave the run, the value replay names it by. Absent
    *  from a backend that predates it, where the view counts the turn itself. */
   turn_index?: number;
+  /** On a target's wake turn: the notice it delivers, as the turn's query row
+   *  keeps it, for the alert row a live attach draws, since no query row comes
+   *  with the stream. Untrusted: read through `wakeNotices`. */
+  market_target?: MarketTargetNotice;
 }
 
 export interface ReasoningSignalEvent extends BaseSSEEvent {
@@ -260,6 +265,7 @@ export interface DeliveredSteer {
   /** The agent that sent it (the Chief of Staff, Flash); absent when the user did. */
   origin?: ThreadOrigin;
   report_source?: never;
+  market_alert?: never;
 }
 
 /** A finished task's or analyst's report the run took in, which carries no
@@ -270,14 +276,36 @@ export interface DeliveredReport {
   /** Epoch seconds. */
   timestamp?: number;
   report_source: ReportSource;
+  market_alert?: never;
 }
 
-/** One entry of a delivery. The server lists its reports ahead of the
- *  user's steers, the order the model reads them. */
-export type SteeringDeliveredEntry = DeliveredSteer | DeliveredReport;
+/** A price alert on one of the thread's targets that the run took in: one
+ *  notice, as a wake turn's metadata lists them, and no words of the user's. */
+export interface DeliveredMarketAlert {
+  content: '';
+  /** Epoch seconds. */
+  timestamp?: number;
+  market_alert: MarketTargetNotice;
+  report_source?: never;
+}
+
+/** One entry of a delivery. The server lists its reports and alerts ahead
+ *  of the user's steers, the order the model reads them. */
+export type SteeringDeliveredEntry = DeliveredSteer | DeliveredReport | DeliveredMarketAlert;
 
 export function isDeliveredReport(entry: SteeringDeliveredEntry): entry is DeliveredReport {
   return entry.report_source !== undefined;
+}
+
+export function isDeliveredMarketAlert(entry: SteeringDeliveredEntry): entry is DeliveredMarketAlert {
+  return entry.market_alert !== undefined;
+}
+
+/** A steer, the user's or an agent's, as against a report or a price alert:
+ *  the only entry that claims a steer this view queued, and the only one that
+ *  spends the boundary an acceptance set. */
+export function isDeliveredSteer(entry: SteeringDeliveredEntry): entry is DeliveredSteer {
+  return !isDeliveredReport(entry) && !isDeliveredMarketAlert(entry);
 }
 
 export interface SteeringDeliveredEvent extends BaseSSEEvent {

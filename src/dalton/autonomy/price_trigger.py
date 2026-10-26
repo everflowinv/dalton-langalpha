@@ -293,10 +293,19 @@ def get_dalton_move_refs(target: Any) -> Dict[str, Dict[str, Any]]:
 def symbol_has_dalton_move(target: Any, bare_symbol: str) -> bool:
     """Return True iff ``bare_symbol`` currently has a Dalton price-move
     automation in ``_symbol_automations``.
+
+    Upstream keys the map by ``(symbol, market)`` listings, and the same
+    bare symbol can be watched in two markets at once, so this checks every
+    listing the symbol names.
     """
     service = _resolve_service(target)
-    autos = getattr(service, "_symbol_automations", {}).get(bare_symbol.upper(), ())
-    return any(is_dalton_price_move_automation(a) for a in autos)
+    sym = bare_symbol.upper()
+    for (listing_sym, _market), autos in getattr(
+        service, "_symbol_automations", {}
+    ).items():
+        if listing_sym == sym and any(is_dalton_price_move_automation(a) for a in autos):
+            return True
+    return False
 
 
 def record_snapshot_reference(
@@ -442,11 +451,16 @@ async def evaluate_and_trigger_dalton_move(
 async def process_polled_snapshot(
     service: Any,
     bare_symbol: str,
+    watched_market: Optional[MarketType],
     snapshot: Mapping[str, Any],
     now: datetime,
 ) -> Optional[list[Dict[str, Any]]]:
     """Process only Dalton price-move automations on ``bare_symbol`` and return
     the remaining non-Dalton automations for the upstream loop to handle.
+
+    ``watched_market`` is the market of the listing the poll fetched the
+    snapshot under (upstream keys ``_symbol_automations`` by
+    ``(symbol, market)``).
 
     Returns ``list(automations)`` immediately when ``bare_symbol`` has no Dalton
     price-move automations. When ``bare_symbol`` has Dalton price-move
@@ -454,14 +468,14 @@ async def process_polled_snapshot(
     and returns ``normal_autos`` if any exist, or ``None`` when all automations
     on ``bare_symbol`` are Dalton price-move automations.
     """
-    automations = list(service._symbol_automations.get(bare_symbol, []))
+    automations = list(service._symbol_automations.get((bare_symbol, watched_market), []))
     dalton_autos = [a for a in automations if is_dalton_price_move_automation(a)]
     if not dalton_autos:
         get_dalton_move_refs(service).pop(bare_symbol.upper(), None)
         return automations
 
     normal_autos = [a for a in automations if not is_dalton_price_move_automation(a)]
-    market = service._symbol_markets.get(bare_symbol)
+    market = watched_market
 
     validated = extract_today_regular_snapshot(bare_symbol, market, snapshot, now)
     if validated is None:

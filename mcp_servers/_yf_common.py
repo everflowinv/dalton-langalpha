@@ -7,6 +7,7 @@ pandas, and market_protocol.
 from __future__ import annotations
 
 import math
+from datetime import tzinfo
 from typing import Optional
 
 import pandas as pd
@@ -84,7 +85,7 @@ def serialize_records(df: pd.DataFrame) -> list[dict]:
 
 
 def clean_value(obj):
-    """Recursively normalize datetimes and missing values (NaT/NaN/inf) for JSON."""
+    """Recursively normalize datetimes, time zones and missing values (NaT/NaN/inf) for JSON."""
     if isinstance(obj, dict):
         return {k: clean_value(v) for k, v in obj.items()}
     if isinstance(obj, list):
@@ -99,4 +100,7 @@ def clean_value(obj):
         return None
     if hasattr(obj, "isoformat"):
         return format_datetime(obj)
+    if isinstance(obj, tzinfo):
+        # Yahoo's market status carries one (``tz``); its name is what JSON can hold.
+        return str(obj)
     return obj

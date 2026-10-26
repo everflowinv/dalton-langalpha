@@ -2,7 +2,15 @@
  * Workspace management endpoints.
  */
 import { api } from '@/api/client';
-import type { Workspace, WorkspaceQuota, WorkspacesResponse } from '@/types/api';
+import type {
+  Workspace,
+  WorkspaceCreate,
+  WorkspaceMove,
+  WorkspaceMoveError,
+  WorkspaceQuota,
+  WorkspacesResponse,
+} from '@/types/api';
+import { apiErrorObject, apiErrorStatus } from './errors';
 import { streamStatusEvents } from './statusStream';
 
 // The shared API client sets no global timeout. Workspace-management ops
@@ -20,8 +28,15 @@ export async function getWorkspaces(limit: number = 20, offset: number = 0, sort
   return data;
 }
 
-export async function createWorkspace(name: string, description: string = '', config: Record<string, unknown> = {}): Promise<Workspace> {
-  const { data } = await api.post<Workspace>('/api/v1/workspaces', { name, description, config });
+/** `computerId` puts the folder on that computer; without it the server uses the primary. */
+export async function createWorkspace(
+  name: string,
+  description: string = '',
+  config: Record<string, unknown> = {},
+  computerId?: string | null,
+): Promise<Workspace> {
+  const body: WorkspaceCreate = { name, description, config, ...(computerId ? { computer_id: computerId } : {}) };
+  const { data } = await api.post<Workspace>('/api/v1/workspaces', body);
   return data;
 }
 
@@ -80,6 +95,59 @@ export async function duplicateWorkspace(workspaceId: string) {
     timeout: WORKSPACE_MUTATION_TIMEOUT_MS,
   });
   return data;
+}
+
+/**
+ * Move a workspace to another of the user's computers. The server answers 202
+ * once the move is accepted and runs it afterwards, so its progress and
+ * outcome are read back with `getWorkspaceMove`. A refusal is a 409 (a 404
+ * when the workspace is gone) carrying a `WorkspaceMoveError`; see
+ * `moveRefusal`. Home is refused here: it moves only with the primary.
+ */
+export async function moveWorkspace(workspaceId: string, computerId: string): Promise<WorkspaceMove> {
+  if (!workspaceId) throw new Error('Workspace ID is required');
+  const { data } = await api.post<WorkspaceMove>(
+    `/api/v1/workspaces/${workspaceId}/move`,
+    { computer_id: computerId },
+    { timeout: WORKSPACE_MUTATION_TIMEOUT_MS },
+  );
+  return data;
+}
+
+/** The workspace's latest move, running or ended; null when it has never moved. */
+export async function getWorkspaceMove(workspaceId: string): Promise<WorkspaceMove | null> {
+  if (!workspaceId) throw new Error('Workspace ID is required');
+  const { data } = await api.get<WorkspaceMove | null>(`/api/v1/workspaces/${workspaceId}/move`, {
+    timeout: WORKSPACE_QUERY_TIMEOUT_MS,
+  });
+  return data ?? null;
+}
+
+/**
+ * Cancel a move while it is still copying. Answers the move as `cancelled`, or
+ * as it ended if it already had. Past copying it is refused with a 409
+ * (`not_cancellable`): the move then finishes or puts the folder back on its own.
+ */
+export async function cancelWorkspaceMove(workspaceId: string): Promise<WorkspaceMove> {
+  if (!workspaceId) throw new Error('Workspace ID is required');
+  const { data } = await api.post<WorkspaceMove>(`/api/v1/workspaces/${workspaceId}/move/cancel`, null, {
+    timeout: WORKSPACE_MUTATION_TIMEOUT_MS,
+  });
+  return data;
+}
+
+/**
+ * The coded refusal a move request got (and make-primary, which answers in
+ * the same shape), or null for any other failure. Its `message` is the
+ * server's sentence for the user.
+ */
+export function moveRefusal(err: unknown): WorkspaceMoveError | null {
+  const status = apiErrorStatus(err);
+  if (status !== 409 && status !== 404) return null;
+  const detail = apiErrorObject(err);
+  return detail && typeof detail.code === 'string' && typeof detail.message === 'string' && detail.message
+    ? (detail as unknown as WorkspaceMoveError)
+    : null;
 }
 
 /**

@@ -20,6 +20,7 @@ from ptc_agent.config.core import (
     CoreConfig,
     DaytonaConfig,
     DockerConfig,
+    E2BConfig,
     FilesystemConfig,
     LoggingConfig,
     MCPConfig,
@@ -279,6 +280,64 @@ class TestSandboxProviderEnvOverride:
         assert cfg.provider == "docker"
 
 
+class TestE2BConfig:
+    @pytest.fixture(autouse=True)
+    def _clean_env(self, monkeypatch):
+        for var in ("SANDBOX_PROVIDER", "DAYTONA_API_KEY", "E2B_API_KEY"):
+            monkeypatch.delenv(var, raising=False)
+
+    def test_env_only_config_loads_the_key_without_a_yaml_block(self, monkeypatch):
+        monkeypatch.setenv("E2B_API_KEY", "e2b-key")
+        monkeypatch.setenv("E2B_DOMAIN", "e2b.example.com")
+        cfg = create_sandbox_config({"sandbox": {"provider": "e2b"}})
+        assert cfg.provider == "e2b"
+        assert cfg.e2b.api_key == "e2b-key"
+        assert cfg.e2b.domain == "e2b.example.com"
+
+    def test_daytona_key_loads_without_a_yaml_block(self, monkeypatch):
+        """A deployment moved to E2B still serves its Daytona computers, so
+        their credentials load even when the config names only E2B."""
+        monkeypatch.setenv("DAYTONA_API_KEY", "daytona-key")
+        monkeypatch.setenv("DAYTONA_SECRET_NAMESPACE", "staging")
+        cfg = create_sandbox_config({"sandbox": {"provider": "e2b"}})
+        assert cfg.provider == "e2b"
+        assert cfg.daytona.api_key == "daytona-key"
+        assert cfg.daytona.secret_namespace == "staging"
+
+    def test_yaml_block_overrides_tunables(self):
+        cfg = create_sandbox_config(
+            {"sandbox": {"provider": "e2b", "e2b": {"max_timeout": 86400}}}
+        )
+        assert cfg.e2b.max_timeout == 86400
+        assert cfg.e2b.auto_stop_interval == 3600
+
+    def test_autodetects_e2b_only_from_its_key(self, monkeypatch):
+        assert create_sandbox_config({"sandbox": {}}).provider == "docker"
+        monkeypatch.setenv("E2B_API_KEY", "e2b-key")
+        assert create_sandbox_config({"sandbox": {}}).provider == "e2b"
+
+    def test_daytona_key_keeps_precedence(self, monkeypatch):
+        monkeypatch.setenv("E2B_API_KEY", "e2b-key")
+        monkeypatch.setenv("DAYTONA_API_KEY", "daytona-key")
+        assert create_sandbox_config({"sandbox": {}}).provider == "daytona"
+
+    def test_sandbox_provider_env_wins(self, monkeypatch):
+        monkeypatch.setenv("SANDBOX_PROVIDER", "e2b")
+        cfg = create_sandbox_config({"sandbox": {"provider": "docker"}})
+        assert cfg.provider == "e2b"
+
+    def test_validate_api_keys_requires_key_for_e2b(self):
+        cfg = CoreConfig(
+            sandbox=SandboxConfig(provider="e2b", e2b=E2BConfig(api_key="")),
+            security=SecurityConfig(),
+            mcp=MCPConfig(),
+            logging=LoggingConfig(),
+            filesystem=FilesystemConfig(),
+        )
+        with pytest.raises(ValueError, match="E2B_API_KEY"):
+            cfg.validate_api_keys()
+
+
 class TestPlatformSecretCatalogValidation:
     """SandboxConfig rejects a catalog that would silently mis-bind."""
 
@@ -322,3 +381,122 @@ class TestPlatformSecretCatalogValidation:
             )
         )
         assert len(cfg.platform_secrets) == 2
+
+
+class TestOfferedProviders:
+    """The kinds a new computer may be created on besides the deployment's own."""
+
+    @pytest.fixture(autouse=True)
+    def _clean_env(self, monkeypatch):
+        for var in (
+            "SANDBOX_PROVIDER",
+            "DAYTONA_API_KEY",
+            "E2B_API_KEY",
+            "DOCKER_SANDBOX_IMAGE",
+        ):
+            monkeypatch.delenv(var, raising=False)
+
+    @staticmethod
+    def _core(sandbox: SandboxConfig) -> CoreConfig:
+        return CoreConfig(
+            sandbox=sandbox,
+            security=SecurityConfig(),
+            mcp=MCPConfig(),
+            logging=LoggingConfig(),
+            filesystem=FilesystemConfig(),
+        )
+
+    def test_nothing_is_offered_by_default(self):
+        cfg = create_sandbox_config({"sandbox": {"provider": "daytona"}})
+        assert cfg.offered_providers == ()
+        assert cfg.creatable_providers() == ("daytona",)
+
+    def test_credentials_alone_offer_nothing(self, monkeypatch):
+        """Development environments carry every provider's key, so a key is
+        not an offer."""
+        monkeypatch.setenv("DAYTONA_API_KEY", "daytona-key")
+        monkeypatch.setenv("E2B_API_KEY", "e2b-key")
+        cfg = create_sandbox_config({"sandbox": {"provider": "daytona"}})
+        assert cfg.creatable_providers() == ("daytona",)
+
+    def test_reads_the_offer_in_order_after_the_default(self):
+        cfg = create_sandbox_config(
+            {"sandbox": {"provider": "daytona", "offered_providers": ["e2b", "docker"]}}
+        )
+        assert cfg.offered_providers == ("e2b", "docker")
+        assert cfg.creatable_providers() == ("daytona", "e2b", "docker")
+
+    def test_an_env_override_onto_an_offered_kind_lists_it_once(self, monkeypatch):
+        monkeypatch.setenv("SANDBOX_PROVIDER", "e2b")
+        cfg = create_sandbox_config(
+            {"sandbox": {"provider": "daytona", "offered_providers": ["e2b", "daytona"]}}
+        )
+        assert cfg.creatable_providers() == ("e2b", "daytona")
+
+    def test_an_unknown_kind_is_rejected(self):
+        with pytest.raises(ValueError):
+            create_sandbox_config(
+                {"sandbox": {"provider": "daytona", "offered_providers": ["memory"]}}
+            )
+
+    def test_an_offered_docker_kind_takes_the_docker_env_overrides(self, monkeypatch):
+        monkeypatch.setenv("DOCKER_SANDBOX_IMAGE", "custom:latest")
+        cfg = create_sandbox_config(
+            {"sandbox": {"provider": "daytona", "offered_providers": ["docker"]}}
+        )
+        assert cfg.docker.image == "custom:latest"
+
+    def test_docker_env_overrides_apply_when_docker_is_not_offered(self, monkeypatch):
+        """Docker computers kept from before the offer was dropped are still
+        rebuilt from these settings, mounts and image included."""
+        monkeypatch.setenv("DOCKER_SANDBOX_IMAGE", "custom:latest")
+        monkeypatch.setenv("DOCKER_SANDBOX_HOST_DIR", "/srv/work")
+        cfg = create_sandbox_config({"sandbox": {"provider": "daytona"}})
+        assert cfg.docker.image == "custom:latest"
+        assert cfg.docker.host_work_dir == "/srv/work"
+
+    def test_an_offered_kind_needs_its_credentials(self):
+        cfg = self._core(
+            SandboxConfig(
+                provider="daytona",
+                offered_providers=("e2b",),
+                daytona=DaytonaConfig(api_key="daytona-key"),
+                e2b=E2BConfig(api_key=""),
+            )
+        )
+        with pytest.raises(ValueError, match="E2B_API_KEY"):
+            cfg.validate_api_keys()
+
+    def test_an_offered_kind_with_credentials_validates(self):
+        cfg = self._core(
+            SandboxConfig(
+                provider="docker",
+                offered_providers=("daytona", "e2b"),
+                daytona=DaytonaConfig(api_key="daytona-key"),
+                e2b=E2BConfig(api_key="e2b-key"),
+            )
+        )
+        cfg.validate_api_keys()
+
+    def test_an_offered_docker_kind_needs_no_credentials(self):
+        cfg = self._core(
+            SandboxConfig(
+                provider="daytona",
+                offered_providers=("docker",),
+                daytona=DaytonaConfig(api_key="daytona-key"),
+            )
+        )
+        cfg.validate_api_keys()
+
+    def test_the_agent_config_checks_the_offer_too(self):
+        from ptc_agent.config.agent import AgentConfig
+
+        config = AgentConfig.model_construct(
+            sandbox=SandboxConfig(
+                provider="daytona",
+                offered_providers=("e2b",),
+                daytona=DaytonaConfig(api_key="daytona-key"),
+            )
+        )
+        with pytest.raises(ValueError, match="E2B_API_KEY"):
+            config.validate_api_keys()

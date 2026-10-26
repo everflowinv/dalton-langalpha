@@ -199,6 +199,7 @@ class RunSSEProducer:
         report_source: Optional[Dict[str, Any]] = None,
         *,
         turn_index: Optional[int] = None,
+        market_target: Optional[Dict[str, Any]] = None,
     ):
         """Initialize the workflow stream handler.
 
@@ -214,7 +215,10 @@ class RunSSEProducer:
 
         ``report_source`` rides the same frame on a report-back turn: a
         client that attaches to the run live has no user message to label,
-        so it draws the report's row from this.
+        so it draws the report's row from this. ``market_target`` rides it
+        on a target's wake turn for the same reason: the notice the alert
+        row names is on the turn's query row, which a live attach never
+        reads.
 
         ``turn_index`` is the turn admission gave the run, announced on the
         same frame: a view that missed turns added elsewhere cannot count its
@@ -223,6 +227,7 @@ class RunSSEProducer:
         self.thread_id = thread_id
         self.run_id = run_id
         self.report_source = report_source
+        self.market_target = market_target
         self.turn_index = turn_index
         self.token_callback = token_callback
         self.tool_tracker = tool_tracker
@@ -435,6 +440,8 @@ class RunSSEProducer:
                 metadata["turn_index"] = self.turn_index
             if self.report_source:
                 metadata["report_source"] = self.report_source
+            if self.market_target:
+                metadata["market_target"] = self.market_target
             yield self._build_sse_event("metadata", metadata)
 
             for result in settled_results or ():

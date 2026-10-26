@@ -7,11 +7,13 @@ import structlog
 from langchain_core.tools import BaseTool, tool
 
 from ptc_agent.agent.backends.sandbox import SandboxBackend
+from ptc_agent.core.sandbox.runtime import PreviewInfo
 
 logger = structlog.get_logger(__name__)
 
-# Callback signature: (sandbox_id, port, signed_url) -> None
-OnSignedUrl = Callable[[str, int, str], Awaitable[None]]
+# (sandbox_id, port, preview) -> None. The whole preview rather than its URL,
+# because only the server can tell what a browser may be handed for it.
+OnSignedUrl = Callable[[str, int, PreviewInfo], Awaitable[None]]
 
 
 def create_preview_url_tool(
@@ -25,7 +27,8 @@ def create_preview_url_tool(
     Args:
         backend: SandboxBackend wrapping the sandbox
         workspace_id: Workspace ID for preview URL generation
-        on_signed_url: Optional async callback to cache signed URLs
+        on_signed_url: Optional async callback that records the started
+            preview, so the panel opens it without a second resolve
 
     Returns:
         Configured GetPreviewUrl tool function
@@ -69,10 +72,10 @@ def create_preview_url_tool(
             preview_info = await backend.astart_preview_url(command, port)
             display_title = app_display_title(port, title)
 
-            # Cache the fresh signed URL so frontend resolves it instantly
+            # Record the preview so the frontend resolves it instantly
             if on_signed_url and backend.sandbox_id:
                 try:
-                    await on_signed_url(backend.sandbox_id, port, preview_info.url)
+                    await on_signed_url(backend.sandbox_id, port, preview_info)
                 except Exception:
                     logger.debug("Failed to cache signed URL for port %s", port, exc_info=True)
 

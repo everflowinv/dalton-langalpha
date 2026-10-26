@@ -1,7 +1,7 @@
 import { useTranslation } from 'react-i18next';
 import { useStableArray } from '@/hooks/useStableArray';
 import type { ChatMessage } from '@/types/chat';
-import type { MarketWatchState } from '../../session/marketWatchEvents';
+import { armedTargets, type MarketWatchState } from '../../session/marketWatchEvents';
 import type { ReportBackOwedThread } from '../../utils/api';
 import {
   analystCandidates,
@@ -37,7 +37,7 @@ export interface TrayTasks {
 
 /** What the tray holds: one chip per entry that is set. */
 export interface TrayContents {
-  /** The market watch, while the agent watches tickers. */
+  /** The market watch, while the agent watches tickers or has a target armed. */
   watch: MarketWatchState | null;
   /** The tasks this thread handed off, while one is listed or runs. */
   tasks: TrayTasks | null;
@@ -75,7 +75,11 @@ export function useTrayContents({
 }: TrayInputs): TrayContents | null {
   const { t } = useTranslation();
 
-  const watch = marketWatch?.symbols.length ? marketWatch : null;
+  // A target is watched server-side between turns, so it keeps the chip up
+  // with no live-stamped symbol.
+  const watch = marketWatch && (marketWatch.symbols.length || armedTargets(marketWatch.targets).length)
+    ? marketWatch
+    : null;
   const turnStarts = countedTurnStarts(messages);
   // A task's status can read live after its run ended unseen; one runs only
   // while this turn does or a task channel is open.

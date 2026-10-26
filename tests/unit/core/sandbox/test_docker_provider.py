@@ -4,7 +4,7 @@ Covers:
 - DockerRuntime state mapping (_DOCKER_STATE_MAP)
 - DockerRuntime exec: mock container.exec(), verify ExecResult
 - DockerRuntime lifecycle: start/stop/delete delegate to container methods
-- DockerRuntime capabilities: no "archive", no "snapshot"
+- DockerRuntime abilities: no archive, env update or auto-stop
 - DockerRuntime archive: raises NotImplementedError
 - DockerRuntime tar upload/download: mock container.put_archive/get_archive
 - DockerRuntime bind upload/download: use tmp_path for real filesystem
@@ -24,6 +24,7 @@ import os
 import shlex
 import subprocess
 import tarfile
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -204,12 +205,9 @@ class TestDockerRuntimeProperties:
         assert result == "/home/workspace"
 
     def test_capabilities_no_archive(self, runtime):
-        caps = runtime.capabilities
-        assert "exec" in caps
-        assert "code_run" in caps
-        assert "file_io" in caps
-        assert "archive" not in caps
-        assert "snapshot" not in caps
+        assert not runtime.archives
+        assert not runtime.updates_env
+        assert not runtime.autostops
 
     @pytest.mark.asyncio
     async def test_archive_raises_not_implemented(self, runtime):
@@ -469,6 +467,24 @@ class TestDockerRuntimeTarUpload:
         # One lookup for the runtime's whole life, not one per upload.
         cmds = [" ".join(c.kwargs["cmd"]) for c in container.exec.call_args_list]
         assert sum("id -u" in c for c in cmds) == 1
+
+    @pytest.mark.asyncio
+    async def test_uploads_carry_the_upload_time(self, runtime, container):
+        """Extraction applies each entry's mtime, and ``TarInfo`` defaults it to 0.
+
+        At the epoch, a same-size rewrite keeps the (mtime, size) stamp the
+        sandbox detects changes by, so a rotated secret or a re-uploaded file
+        reads as unchanged. The PAX record keeps the sub-second part, which is
+        what separates two rewrites within one second."""
+        before = time.time()
+        await runtime.upload_file(b"x", "/home/workspace/a.txt")
+        await runtime.upload_files([(b"y", "/home/workspace/b.txt")])
+        after = time.time()
+        for call in container.put_archive.call_args_list:
+            with tarfile.open(fileobj=io.BytesIO(call[0][1]), mode="r") as tar:
+                for m in tar.getmembers():
+                    assert "mtime" in m.pax_headers
+                    assert before <= m.mtime <= after
 
     @pytest.mark.asyncio
     async def test_an_unreadable_uid_falls_back_to_root(self, runtime, container):
@@ -1163,29 +1179,18 @@ class TestDockerRuntimeSessions:
 
     @pytest.mark.asyncio
     async def test_session_execute_async(self, runtime):
-        """session_execute with run_async=True returns None exit_code."""
+        """session_execute starts the command in the background and returns its id."""
         runtime._container.exec = AsyncMock(
             return_value=_make_exec_mock(output="99999\n")
         )
-        result = await runtime.session_execute("preview-8080", "python -m http.server 8080", run_async=True)
-        assert result.exit_code is None
-        assert result.cmd_id  # non-empty
+        cmd_id = await runtime.session_execute("preview-8080", "python -m http.server 8080")
+        assert cmd_id  # non-empty
         # Verify base64 encoding is in the exec command
         call_args = runtime._container.exec.call_args
         cmd = call_args[1].get("cmd", call_args[0][0] if call_args[0] else None)
         cmd_str = cmd[-1] if isinstance(cmd, list) else str(cmd)
         assert "base64" in cmd_str
         assert "nohup setsid" in cmd_str
-
-    @pytest.mark.asyncio
-    async def test_session_execute_sync(self, runtime):
-        """session_execute with run_async=False returns actual exit code."""
-        runtime._container.exec = AsyncMock(
-            return_value=_make_exec_mock(output="hello\n", exit_code=0)
-        )
-        result = await runtime.session_execute("preview-8080", "echo hello", run_async=False)
-        assert result.exit_code == 0
-        assert result.stdout == "hello\n"
 
     @pytest.mark.asyncio
     async def test_session_command_logs_finished(self, runtime):
@@ -1285,7 +1290,7 @@ class TestDockerRuntimeSessions:
 
         runtime.exec = local_exec
         await runtime.create_session("bg-0123456789ab")
-        await runtime.session_execute("bg-0123456789ab", f"touch {ran}", run_async=True)
+        await runtime.session_execute("bg-0123456789ab", f"touch {ran}")
         for _ in range(100):
             if launched.exists():
                 break
@@ -1424,27 +1429,6 @@ class TestDockerSessionsAcrossRestartsAndPidReuse:
 
         await runtime.delete_session(self.SID)
         assert victim.wait(timeout=5) is not None
-
-
-# ---------------------------------------------------------------------------
-# DockerRuntime — updated capabilities
-# ---------------------------------------------------------------------------
-
-
-class TestDockerRuntimeUpdatedCapabilities:
-    def test_capabilities_include_preview_and_sessions(self):
-        container = _make_mock_container()
-        runtime = DockerRuntime(
-            container,
-            runtime_id="docker-test",
-            working_dir="/home/workspace",
-        )
-        caps = runtime.capabilities
-        assert "preview_url" in caps
-        assert "sessions" in caps
-        assert "exec" in caps
-        assert "code_run" in caps
-        assert "file_io" in caps
 
 
 # ---------------------------------------------------------------------------

@@ -33,6 +33,7 @@ from ptc_agent.agent.middleware.runtime_context.profile import (
     profile_diff_lines,
 )
 from ptc_agent.agent.middleware.runtime_context.state import as_dict
+from ptc_agent.agent.roles import AgentRole
 
 # Rendered in a fixed order so the block is byte-identical for equal inputs.
 MEMORY_TIERS: tuple[str, ...] = ("user", "workspace")
@@ -49,10 +50,15 @@ MEMO_DISPLAY_CAP = 500
 
 @dataclass(frozen=True, slots=True)
 class Workspace:
-    """What the workspace was called when the epoch froze."""
+    """What the workspace was called, and the computer it was on, when the epoch froze.
+
+    The computer is empty for a user with one, and then stays out of the
+    state and the hash, so an epoch frozen before it was named reads the same.
+    """
 
     name: str = ""
     description: str = ""
+    computer: str = ""
 
     @classmethod
     def from_state(cls, value: Any) -> Workspace:
@@ -60,13 +66,28 @@ class Workspace:
         return cls(
             name=str(data.get("name") or ""),
             description=str(data.get("description") or ""),
+            computer=str(data.get("computer") or ""),
         )
 
     def to_state(self) -> dict[str, Any]:
-        return {"name": self.name, "description": self.description}
+        state = {"name": self.name, "description": self.description}
+        if self.computer:
+            state["computer"] = self.computer
+        return state
 
     def sha(self) -> str:
-        return sha256_text(f"{self.name}\n{self.description}")
+        text = f"{self.name}\n{self.description}"
+        return sha256_text(f"{text}\n{self.computer}" if self.computer else text)
+
+
+# Only to the analyst: the Chief of Staff's own prompt says what a workspace
+# on another computer means for it. Leans on the static prompt's sibling-folder
+# sentence rather than restating it.
+OTHER_COMPUTERS = (
+    "A workspace the user names that has no sibling folder is on another "
+    "computer, out of reach of your files. Say so, and that they can use it "
+    "from that workspace or ask their Chief of Staff in All workspaces."
+)
 
 
 def workspace_diff_lines(frozen: Workspace, current: Workspace) -> list[str]:
@@ -74,6 +95,7 @@ def workspace_diff_lines(frozen: Workspace, current: Workspace) -> list[str]:
     for label, was, now in (
         ("Name", frozen.name, current.name),
         ("Description", frozen.description, current.description),
+        ("Computer", frozen.computer, current.computer),
     ):
         if was == now:
             continue
@@ -364,6 +386,9 @@ class Observations:
     # Whether this turn's agent has the chat-app settings folder. None for a
     # build whose block says nothing about it.
     channels_enabled: bool | None = None
+    # The role this turn's agent runs in, for the rows whose wording differs
+    # by role.
+    role: AgentRole = "analyst"
 
 
 # ---------------------------------------------------------------------------
@@ -758,7 +783,7 @@ def _memo_row(epoch: BaselineEpoch, obs: Observations) -> DurableUpdate | None:
 def _workspace_row(
     epoch: BaselineEpoch, obs: Observations, last: str | None
 ) -> DurableUpdate | None:
-    """A row when the workspace was renamed or redescribed since last seen.
+    """A row when the name, description or computer changed since last seen.
 
     The static prompt names <workspace> as the one authoritative place for the
     name, so a rename has to reach the model without the block, and the cache
@@ -769,9 +794,14 @@ def _workspace_row(
     if (last or frozen.sha()) == current_sha:
         return None
     if current_sha == frozen.sha():
-        text = "Name and description are back to what <workspace> says."
+        text = "The workspace is back to what <workspace> says."
     else:
-        text = "\n".join(workspace_diff_lines(frozen, obs.workspace))
+        lines = workspace_diff_lines(frozen, obs.workspace)
+        if obs.role != "chief_of_staff" and obs.workspace.computer and not frozen.computer:
+            # A block frozen with one computer never said what a workspace on
+            # another one means.
+            lines.append(OTHER_COMPUTERS)
+        text = "\n".join(lines)
     return DurableUpdate(
         kind="workspace_changed",
         schema_version=UPDATE_SCHEMA_VERSION,

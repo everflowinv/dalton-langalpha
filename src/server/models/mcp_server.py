@@ -143,7 +143,7 @@ DESCRIPTION_MAX = 512
 INSTRUCTION_MAX = 1024
 
 # Reject keys the user must never set on an MCP server payload.
-_FORBIDDEN_KEYS = ("vault_blueprints", "source")
+_FORBIDDEN_KEYS = ("vault_blueprints", "source", "auth")
 
 # A bare host-env placeholder like ``${VAR}`` or ``$VAR`` — never resolves for
 # user servers (only ``${vault:NAME}`` does), so fail fast at the API.

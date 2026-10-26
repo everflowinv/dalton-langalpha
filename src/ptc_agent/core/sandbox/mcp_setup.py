@@ -260,10 +260,11 @@ async def discover_user_mcp_schemas(
 
 
 # Runs the discovery CLI as the leader of a session of its own, so everything
-# the server's command spawned (npx's node, uvx's python) shares one process
-# group that is stopped as a whole once the listing is in or the budget is
-# spent. A server that keeps running after its stdin closes would otherwise
-# outlive the check. Its last line says how the client ended, which is all a
+# the server's command spawned (npx's node, uvx's python) stays in that session
+# and is stopped as a whole once the listing is in or the budget is spent. A
+# server that keeps running after its stdin closes would otherwise outlive the
+# check. The session, not the process group: the client gives each server a
+# group of its own. Its last line says how the client ended, which is all a
 # missing result file cannot.
 _CHECK_LEADER = """\
 import os, signal, subprocess, sys, time
@@ -276,12 +277,30 @@ try:
     rc = str(child.wait(timeout=budget))
 except subprocess.TimeoutExpired:
     rc = "timeout"
-for sig in (signal.SIGTERM, signal.SIGKILL):
+def members():
     try:
-        os.killpg(child.pid, sig)
+        pids = [int(p) for p in os.listdir("/proc") if p.isdigit()]
     except OSError:
-        break
-    time.sleep(0.5)
+        ps = subprocess.run(["ps", "-A", "-o", "pid="], capture_output=True, text=True)
+        pids = [int(p) for p in ps.stdout.split()]
+    found = []
+    for pid in pids:
+        try:
+            if pid != child.pid and os.getsid(pid) == child.pid:
+                found.append(pid)
+        except OSError:
+            pass
+    return found
+for sig in (signal.SIGTERM, signal.SIGKILL):
+    child.send_signal(sig)
+    found = members()
+    for pid in found:
+        try:
+            os.kill(pid, sig)
+        except OSError:
+            pass
+    if found or child.poll() is None:
+        time.sleep(0.5)
 child.wait()
 print("MCP_CHECK_RC=" + rc, flush=True)
 """

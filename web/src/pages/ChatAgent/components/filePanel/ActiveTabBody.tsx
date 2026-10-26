@@ -26,6 +26,7 @@ interface ActiveTabBodyProps {
   onTargetMemoryHandled?: (seq?: number) => void;
   onTargetMemoHandled?: (seq?: number) => void;
   marketWatch: MarketWatchState | null;
+  onCancelMarketTarget: ((targetId: string) => Promise<void>) | null;
   onOpenFile: OpenFileHandler | null;
   onOpenSubagentTask: ((info: SubagentInfo) => void) | null;
   transcript: TranscriptReader | null;
@@ -44,7 +45,7 @@ interface ActiveTabBodyProps {
 /** What fills the viewer slot for the active tab. Preview panes are rendered beside this, always mounted. */
 export function ActiveTabBody({
   activeTab, tabs, workspaceId, apiAdapter, target, onTargetMemoryHandled, onTargetMemoHandled, marketWatch,
-  onOpenFile, onOpenSubagentTask, transcript, onAddContext,
+  onCancelMarketTarget, onOpenFile, onOpenSubagentTask, transcript, onAddContext,
   onOpenInMarketView, file, onPageCount, canUpload, treeOpen, onShowTree, onOpenChart,
 }: ActiveTabBodyProps): React.ReactNode {
   switch (activeTab.kind) {
@@ -89,6 +90,7 @@ export function ActiveTabBody({
           marketWatch={marketWatch}
           // DALTON-HOOK(team-sharing): forward teamReadOnly to block personal MemoPanel in colleague mirror mode
           teamReadOnly={file.teamReadOnly}
+          onCancelMarketTarget={onCancelMarketTarget}
         />
       );
     case 'sources':

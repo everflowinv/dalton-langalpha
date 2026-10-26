@@ -11,8 +11,9 @@ import { cn } from '@/lib/utils';
 import { DispatchStatusGlyph, DispatchStatusIndicator, LiveSpinner } from '../dispatchStatusUi';
 import type { PTCDispatchStatus } from '../../hooks/usePTCDispatchStatus';
 import { useOpenDispatchedThread, type DispatcherContext } from '../../hooks/useOpenDispatchedThread';
-import type { MarketWatchState } from '../../session/marketWatchEvents';
+import { armedTargets, type MarketWatchState } from '../../session/marketWatchEvents';
 import { isTerminalStatus, sidebarAgentRowLabel, type SubagentTerminalStatus } from '../../session/subagents/subagentStatus';
+import { watchChipItems } from '../marketTargetLabels';
 import type { RosterTask } from './delegatedWork';
 import type { RosterAnalyst } from './useAnalystRoster';
 import { SHAPE_RUN, SHAPE_STAGGER, liquidRunMs, type TrayFoldPhase } from './useTrayFold';
@@ -289,8 +290,10 @@ function WatchChip({ watch, onOpen }: { watch: MarketWatchState; onOpen: () => v
   return (
     <button type="button" className={CHIP_BUTTON} title={title} aria-label={t('chat.marketWatch.chipAction')} onClick={onOpen}>
       <PulseDot />
-      <span role="status" aria-live="polite">
-        {t('chat.marketWatch.watching', { symbols: watch.symbols.join(', ') })}
+      <span role="status" aria-live="polite" className="tabular-nums">
+        {t('chat.marketWatch.watching', {
+          symbols: watchChipItems(watch.symbols, armedTargets(watch.targets), locale).join(', '),
+        })}
       </span>
     </button>
   );

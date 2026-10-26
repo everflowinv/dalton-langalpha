@@ -32,7 +32,7 @@ from src.server.database.runs.outbox import (
     land_fork_steers,
     lift_fork_steers,
     list_returned_steers,
-    release_deferred_report_backs,
+    release_deferred_notifications,
     settle_run_steers,
     steer_ordering_key,
 )
@@ -775,25 +775,25 @@ async def finalize_run(
                         conn, run_id=run_id, thread_id=thread_id, jobs=jobs
                     )
 
-                # Deferred report-backs (a task's, an analyst's) wait for
-                # exactly this event: a dead-turn finalize (completed, error,
-                # or cancelled) proves no pending HITL checkpoint can collide
-                # with their synthetic POST, and no live turn is left to take
-                # them in as a steer. Interrupted keeps them parked: the
-                # checkpoint is live and a POST would collide with it, and
-                # the turn that resumes it takes them in as a steer. An
-                # interrupted turn that later errors or cancels releases
-                # here, so a parked job can never be stranded. Same
-                # transaction as the terminal CAS, so release and successor
-                # hooks commit together.
+                # Deferred report-backs (a task's, an analyst's) and market
+                # target alerts wait for exactly this event: a dead-turn
+                # finalize (completed, error, or cancelled) proves no pending
+                # HITL checkpoint can collide with their synthetic POST, and
+                # no live turn is left to take them in as a steer.
+                # Interrupted keeps them parked: the checkpoint is live and a
+                # POST would collide with it, and the turn that resumes it
+                # takes them in as a steer. An interrupted turn that later
+                # errors or cancels releases here, so a parked job can never
+                # be stranded. Same transaction as the terminal CAS, so
+                # release and successor hooks commit together.
                 if final_status in ("completed", "error", "cancelled"):
-                    released = await release_deferred_report_backs(
+                    released = await release_deferred_notifications(
                         conn, thread_id
                     )
                     if released:
                         logger.info(
                             f"[turn_lifecycle] released {released} deferred "
-                            f"report-back job(s) for thread={thread_id}"
+                            f"notification job(s) for thread={thread_id}"
                         )
 
                 # The thread's steers settle with the run they were sent to,

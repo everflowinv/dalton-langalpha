@@ -70,7 +70,7 @@ async def test_an_empty_hold_or_close_touches_nothing(mock_db_connection, mock_c
 async def test_a_release_drops_the_hold_with_the_park(mock_db_connection, mock_cursor):
     """Held exactly when stamped: a released report is takeable by the next
     live turn at once, not after its executor's claim and defer."""
-    await outbox.release_deferred_report_backs(mock_db_connection, "t-1")
+    await outbox.release_deferred_notifications(mock_db_connection, "t-1")
 
     sql = _sql(mock_cursor)
     assert "SET next_retry_at = NOW(), payload = payload - 'steered_run_id'" in sql

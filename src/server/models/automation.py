@@ -95,6 +95,17 @@ _DISPLAY_ALIASES: dict[str, str] = {"GSPC": "SPX", "IXIC": "COMP"}
 _INDEX_SYMBOLS: set[str] = {"SPX", "DJI", "COMP", "NDX", "RUT", "VIX"}
 
 
+def bare_alert_listing(symbol: str) -> tuple[str, MarketType]:
+    """``(symbol, market)`` a price alert reads a bare, display-spelled symbol as.
+
+    The same folding ``PriceTriggerConfig`` applies, shared so a market-watch
+    target names what an automation would: GSPC is SPX, and a known index
+    family is the index, since as a stock it names a ticker with no prices.
+    """
+    bare = _DISPLAY_ALIASES.get(symbol, symbol)
+    return bare, MarketType.INDEX if bare in _INDEX_SYMBOLS else MarketType.STOCK
+
+
 class PriceTriggerConfig(BaseModel):
     """Configuration stored in trigger_config for price-triggered automations."""
     symbol: str = Field(..., min_length=1, max_length=10, description="Ticker symbol (bare, e.g. 'AAPL' or 'SPX')")
@@ -322,7 +333,7 @@ _PAIR_QUOTES = ("USD", "USDT", "USDC", "EUR", "GBP", "JPY")
 _CRYPTO_BASES = ("BTC", "ETH", "SOL", "XRP", "DOGE", "ADA", "LTC", "BNB", "AVAX", "DOT", "LINK", "SHIB")
 
 
-def _is_pair_symbol(symbol: str) -> bool:
+def is_pair_symbol(symbol: str) -> bool:
     s = symbol.upper()
     if s.startswith(("X:", "C:")) or s.endswith(("=X", "=F")):
         return True
@@ -406,7 +417,7 @@ class _ScheduleFields(BaseModel):
                 config = PriceTriggerConfig(**v)
             except ValidationError as e:
                 raise ValueError(f"Invalid price trigger config: {validation_error_text(e)}")
-            if _is_pair_symbol(config.symbol):
+            if is_pair_symbol(config.symbol):
                 raise ValueError(
                     f"Invalid price trigger config: '{config.symbol}' is a crypto, currency or futures "
                     "symbol; price alerts cannot watch those"

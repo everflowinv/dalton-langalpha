@@ -76,8 +76,8 @@ function WorkspaceGallery({ onWorkspaceSelect, prefetchThreads }: WorkspaceGalle
   // remain available via the Sort-by toggle.
   const [sortBy, setSortBy] = useState<'activity' | 'name' | 'custom'>('custom');
   const [isReorderMode, setIsReorderMode] = useState(false);
-  // Rename is the gallery's own dialog (the tree renames inline); duplicate
-  // and delete come from useWorkspaceActions below. Spec and always-on are the
+  // Rename is the gallery's own dialog (the tree renames inline); duplicate,
+  // move and delete come from useWorkspaceActions below. Spec and always-on are the
   // machine's and live in the Computers dialog.
   const [renameTarget, setRenameTarget] = useState<WorkspaceRecord | null>(null);
   const { workspaceId: currentWorkspaceId } = useParams();
@@ -213,7 +213,7 @@ function WorkspaceGallery({ onWorkspaceSelect, prefetchThreads }: WorkspaceGalle
     if (ok) setRenameTarget(null);
   };
 
-  // Duplicate / delete: one implementation, shared
+  // Duplicate / move / delete: one implementation, shared
   // with the nav tree. Only the paging reactions are gallery-specific: a
   // duplicate lands at the top, and a delete that empties the page steps back.
   const wsActions = useWorkspaceActions({
@@ -356,6 +356,7 @@ function WorkspaceGallery({ onWorkspaceSelect, prefetchThreads }: WorkspaceGalle
               onRenameStart={setRenameTarget}
               onOpenComputer={(computerId) => openComputersPanel({ computerId })}
               onDuplicate={wsActions.openDuplicate}
+              onMove={wsActions.openMove}
               onDelete={wsActions.openDelete}
               prefetchThreads={prefetchThreads}
             />

@@ -9,9 +9,11 @@ signal: a lock it could not read means it does not know what it is replacing.
 from __future__ import annotations
 
 import base64
+import io
 import json
 import os
 import re
+import tarfile
 import tempfile
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -293,6 +295,12 @@ class TestUploadOwnershipGuard:
             if c[0] and ("rm -rf" in c[0][0] or "mkdir -p" in c[0][0])
         ]
 
+    def _archived_files(self, mock_runtime) -> list[str]:
+        """The sandbox paths of the files in the one archive uploaded."""
+        (call,) = mock_runtime.upload_file.call_args_list
+        with tarfile.open(fileobj=io.BytesIO(call[0][0]), mode="r:gz") as tar:
+            return ["/" + m.name for m in tar.getmembers() if m.isfile()]
+
     @patch("ptc_agent.core.sandbox.ptc_sandbox.create_provider")
     @pytest.mark.asyncio
     async def test_lock_unavailable_and_the_name_is_taken(
@@ -315,6 +323,7 @@ class TestUploadOwnershipGuard:
 
         assert collisions == {"some-skill"}
         assert self._writes(mock_runtime) == []
+        mock_runtime.upload_file.assert_not_called()
         mock_runtime.upload_files.assert_not_called()
 
     @patch("ptc_agent.core.sandbox.ptc_sandbox.create_provider")
@@ -335,7 +344,11 @@ class TestUploadOwnershipGuard:
             _, collisions = await self._upload(sandbox, tmpdir, existing_lock=None)
 
         assert collisions == set()
-        assert any("some-skill" in w for w in self._writes(mock_runtime))
+        # The whole tier goes up as one archive, never a request per file.
+        mock_runtime.upload_files.assert_not_called()
+        assert [p.rsplit("/", 2)[-2:] for p in self._archived_files(mock_runtime)] == [
+            ["some-skill", "SKILL.md"]
+        ]
 
     def _script_args(self, mock_runtime) -> list[dict]:
         """The decoded ARGS of every skill-sync script exec, in call order."""
@@ -373,13 +386,12 @@ class TestUploadOwnershipGuard:
 
         assert collisions == set()
         assert not [w for w in self._writes(mock_runtime) if "rm -rf" in w]
-        (batch,) = [c[0][0] for c in mock_runtime.upload_files.call_args_list]
         (install,) = self._script_args(mock_runtime)
         assert install["mode"] == "install"
         assert install["base"] == SANDBOX_BASE
         assert install["names"] == ["some-skill"]
         assert install["staging"].startswith(f"{SANDBOX_BASE}/.staging/sync-")
-        assert [dest for _, dest in batch] == [
+        assert self._archived_files(mock_runtime) == [
             f"{install['staging']}/some-skill/SKILL.md"
         ]
 

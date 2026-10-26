@@ -5,7 +5,7 @@ its error classification (stream_errors.py).
 
 import asyncio
 import json
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -1662,6 +1662,108 @@ class TestInterruptBuffering:
         await self._collect(handler, events)
         assert handler.saw_interrupt is True
         assert len(handler._pending_interrupts) == 1
+
+
+def _asking_graph(asks_on: set[int]):
+    """A checkpointed graph whose one node asks the user a question on the
+    passes numbered in ``asks_on`` and answers on the others."""
+    from langchain_core.messages import AIMessage
+    from langgraph.checkpoint.memory import InMemorySaver
+    from langgraph.graph import START, MessagesState, StateGraph
+    from langgraph.types import interrupt
+
+    passes = 0
+
+    def agent(_state):
+        nonlocal passes
+        passes += 1
+        if passes in asks_on:
+            interrupt(
+                {
+                    "action_requests": [
+                        {
+                            "type": "ask_user_question",
+                            "question": f"Which filing, take {passes}?",
+                            "options": ["10-K", "10-Q"],
+                        }
+                    ]
+                }
+            )
+        return {"messages": [AIMessage(content="Done.")]}
+
+    builder = StateGraph(MessagesState)
+    builder.add_node("agent", agent)
+    builder.add_edge(START, "agent")
+    return builder.compile(checkpointer=InMemorySaver())
+
+
+def _payloads(frames, event_type):
+    return [
+        json.loads(frame.split("data: ", 1)[1])
+        for frame in frames
+        if f"event: {event_type}\n" in frame
+    ]
+
+
+class TestSupersededInterrupt:
+    """A steer waiting when the agent stops on a question re-invokes it, and
+    the re-invocation supersedes the question: the checkpoint no longer holds
+    it, so neither replay nor a resume can see it. The live stream carries the
+    pause the checkpoint holds and nothing else."""
+
+    async def _steered_past_a_question(self, asks_on):
+        from ptc_agent.agent.middleware.background_subagent.orchestrator import (
+            BackgroundSubagentOrchestrator,
+        )
+        from src.server.services.runs.sse_producer import RunSSEProducer
+
+        graph = _asking_graph(asks_on)
+        middleware = MagicMock()
+        middleware.registry.has_pending_tasks.return_value = False
+        middleware.registry._tasks = {}
+        steers = iter([["user"]])
+
+        async def _checker():
+            return next(steers, [])
+
+        handler = RunSSEProducer(thread_id="t-steer", run_id="r-steer")
+        config = {"configurable": {"thread_id": "t-steer"}}
+        with patch(
+            "ptc_agent.agent.middleware.background_subagent.utils.build_message_checker",
+            new=AsyncMock(return_value=_checker),
+        ):
+            frames = [
+                frame
+                async for frame in handler.stream_workflow(
+                    BackgroundSubagentOrchestrator(graph, middleware),
+                    {"messages": [("user", "Pull the filing.")]},
+                    config,
+                )
+            ]
+        pending = [intr.id for intr in (await graph.aget_state(config)).interrupts]
+        return handler, frames, pending
+
+    @pytest.mark.asyncio
+    async def test_only_the_question_asked_again_is_streamed(self):
+        _handler, frames, pending = await self._steered_past_a_question({1, 2})
+
+        assert len(pending) == 1
+        streamed = [p["interrupt_id"] for p in _payloads(frames, "interrupt")]
+        assert streamed == pending
+
+    @pytest.mark.asyncio
+    async def test_a_question_not_asked_again_ends_the_turn_completed(self):
+        from src.server.services.runs.finalization import classify_outcome
+
+        handler, frames, pending = await self._steered_past_a_question({1})
+
+        assert pending == []
+        assert _payloads(frames, "interrupt") == []
+        assert _payloads(frames, "error") == []
+        status, *_ = await classify_outcome(
+            "stream_end", handler=handler, graph=None, thread_id="t-steer", error=None
+        )
+        assert status == "completed"
 
 
 class TestReasoningWhitespaceDeltas:
