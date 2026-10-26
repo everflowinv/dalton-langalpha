@@ -344,6 +344,9 @@ export function useComposerDraft({
   const writtenSinceMountOrSendRef = useRef<boolean>(false);
   const hasSentOnKeyRef = useRef<boolean>(false);
   const inFlightSendRef = useRef<InFlightSendState | null>(null);
+  // The latest send per (user, key). Kept after that send settles, so an older send on
+  // the same key that completes later still knows it was superseded.
+  const latestSendByKeyRef = useRef(new Map<string, InFlightSendState>());
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const activeDraftKeyRef = useRef<string | undefined>(draftKey);
   const activeUserIdRef = useRef<string>(userId);
@@ -458,6 +461,9 @@ export function useComposerDraft({
       settled: false,
     };
     inFlightSendRef.current = inFlight;
+    if (inFlight.draftKey) {
+      latestSendByKeyRef.current.set(`${inFlight.userId ?? ''}|${inFlight.draftKey}`, inFlight);
+    }
 
     // Ensure the draft is persisted in localStorage while awaiting send completion,
     // and clear the input box programmatically without deleting the stored draft.
@@ -493,14 +499,11 @@ export function useComposerDraft({
       // Supersession is per key: a newer send on another key (the market panel's key moves
       // from its workspace form to the new thread's once the thread exists) does not own
       // this send's stored draft, so this send still settles its own key.
-      const current = inFlightSendRef.current;
-      if (
-        current
-        && current !== inFlight
-        && current.draftKey === inFlight.draftKey
-        && current.userId === inFlight.userId
-      ) return;
-      if (current === inFlight) inFlightSendRef.current = null;
+      const latestOnKey = inFlight.draftKey
+        ? latestSendByKeyRef.current.get(`${inFlight.userId ?? ''}|${inFlight.draftKey}`)
+        : undefined;
+      if (latestOnKey && latestOnKey !== inFlight) return;
+      if (inFlightSendRef.current === inFlight) inFlightSendRef.current = null;
 
       if (succeeded) {
         settleSuccess();
@@ -609,6 +612,8 @@ export function useComposerDraft({
           clearStorageEntry(prev.draftKey, prev.userId);
           inFlight.draftKey = draftKey;
           inFlight.userId = userId;
+          // The send now owns its new key's generation (it migrated with it).
+          latestSendByKeyRef.current.set(`${userId ?? ''}|${draftKey}`, inFlight);
           const followUpText = writtenSinceMountOrSendRef.current
             ? latestMessageRef.current
             : '';

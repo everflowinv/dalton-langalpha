@@ -2548,8 +2548,6 @@ export function useChatMessages(
         console.log('[Send] Stream disconnected, attempting reconnect');
         wasDisconnected = true;
         attemptReconnectAfterDisconnect(assistantMessageId);
-        // DALTON-HOOK(composer-drafts): the started stream's reconnect owns finalization — accepted already
-        notifyAccepted();
         return true;
       }
 

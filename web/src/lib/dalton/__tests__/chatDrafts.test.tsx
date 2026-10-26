@@ -473,6 +473,32 @@ describe('chatDrafts storage module & ChatInput composer drafts', () => {
     view2.unmount();
   });
 
+  it('an older send stays superseded after the newer send on its key has already settled', async () => {
+    const resolvers: Array<(v: boolean) => void> = [];
+    const onSend = vi.fn<ChatInputProps['onSend']>().mockImplementation(
+      () => new Promise<boolean>((resolve) => { resolvers.push(resolve); }),
+    );
+    const view = renderComposer({ draftKey: 'thread:gen', onSend }, { userId: 'u-1' });
+    fireEvent.change(view.getTextarea(), { target: { value: 'older A', selectionStart: 7 } });
+    fireEvent.click(screen.getByLabelText('Send message'));
+    fireEvent.change(view.getTextarea(), { target: { value: 'newer B', selectionStart: 7 } });
+    fireEvent.click(screen.getByLabelText('Send message'));
+
+    // B fails first: its draft comes back.
+    await act(async () => {
+      resolvers[1](false);
+    });
+    expect(load('thread:gen', 'u-1')).toBe('newer B');
+
+    // A then succeeds: it was superseded by B, so B's restored draft stays.
+    await act(async () => {
+      resolvers[0](true);
+    });
+    expect(load('thread:gen', 'u-1')).toBe('newer B');
+    expect(view.getTextarea().value).toBe('newer B');
+    view.unmount();
+  });
+
   it('a send superseded only by a send on another key still clears its own key', async () => {
     // The market panel's key moves from its workspace form to the new thread's
     // once the thread exists; a send on the new key must not strand the first.
