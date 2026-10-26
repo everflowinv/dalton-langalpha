@@ -55,7 +55,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 
 1. **先读现有知识层与基金 Wiki（只读）**：
    - 先读当前公司工作区的 `thesis.md`、`debate.md`、`drivers.md`、`management.md`、`lessons.md`；若涉及其他覆盖公司，跨目录读取 `../<TICKER>/thesis.md` 与 `drivers.md`。
-   - 用 `researchdata.research(route="company-wiki")`（或只读文件检索）查阅共享只读基金百科 `wiki/` 中已有的行业/技术/供应链条目（**只读不写回 `wiki/`**）。
+   - 用 `researchdata.research(route="company-wiki")`（或只读文件检索）查阅共享基金百科 `wiki/` 中已有的行业/技术/供应链条目（**wiki 默认只读，不自动写回 `wiki/`；只有用户明确要求入库〔"入库/存一下/加到 wiki"〕时，按入库流程用 `ingest_company_wiki`**）。
 2. **拆解 3–6 个信息集群（Clusters）并写入 `research/<D>-topic-<slug>/plan.md`**：
    - 参考 [references/clusters-investment.md](references/clusters-investment.md)。
    - 为每个集群生成 **5–8 条中英文检索词**（含精确机构名、产品代号、供应链术语、时间限定词）。
@@ -141,7 +141,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
    - 调用 `knowledge_append_verdict`（`trigger.kind="agenda"`）记录本次专题对 thesis 的结论，并通过 `agenda_ops` 关闭已完成的议程项、登记新发现的跟踪项。
 2. **跨公司更新走提案机制**：
    - 若专题结论涉及其他覆盖公司，**不直接跨目录修改其他公司的 `data/*.json`**，在 `knowledge-revision.json` 中列出跨公司修改提案，并通过 `agenda_ops` 写入 `pm_handoffs`（或由 Home 研究总监通过 `delegate_to_analyst` / `dalton_agenda_note` 分发给对应公司分析师）。
-3. **只读基金 Wiki**：`wiki/` 目录由基金统一维护，分析师只读不写。
+3. **基金 Wiki 默认只读，按需两步入库**：`wiki/` 目录默认只读，不自动写回；只有用户明确要求入库（"入库/存一下/加到 wiki"）时，按两步入库流程调用 `ingest_company_wiki`（先 `confirm=False` 预览并由用户确认，再 `confirm=True` 正式写入；卖方材料不进 wiki）。
 4. **汇报完成前必须过完成契约（`dalton_check_done`）**：
    - 调用 `dalton_check_done(workflow="topic-research", run_id=<`research/<D>-topic-<slug>/.progress.json` 里的 run_id>, params={"topic": "<专题名称>", "slug": "<kebab-case-slug>", "workspace_dir": "<当前工作区路径>", "as_of": "<D>"})`（与启动时的参数一致；未传 `as_of` 时用 `as_of="latest"`）；
    - 走手动降级路径（`workflow.enabled` 已关闭、没有 run）时不传 `run_id`，调用 `dalton_check_done(workflow="topic-research", params={"topic": "<专题名称>", "slug": "<kebab-case-slug>", "workspace_dir": "<当前工作区路径>", "as_of": "<D>", "manual": true})`，审稿结论按 `research/<D>-topic-<slug>/review.json` 核对；
