@@ -347,10 +347,13 @@ async def get_budget_today_endpoint(user_id: CurrentUserId) -> dict[str, Any]:
 async def list_team_workspaces_endpoint(
     user_id: CurrentUserId,
 ) -> dict[str, Any]:
+    from src.dalton.access_tiers import get_user_tier
     from src.dalton.sharing import list_team_workspaces
 
     members = await list_team_workspaces(user_id)
-    return {"members": members}
+    # The sidebar hides the whole "团队" section for external members.
+    caller_tier = await get_user_tier(user_id)
+    return {"members": members, "caller_tier": caller_tier}
 
 
 @router.get("/workspaces/{workspace_id}/sharing")
@@ -360,6 +363,7 @@ async def get_workspace_sharing_endpoint(
     user_id: CurrentUserId,
 ) -> dict[str, Any]:
     from src.server.database.home_workspace import is_home_row
+    from src.dalton.access_tiers import classify_owner_tier, get_user_tier
     from src.dalton.settings import is_dalton_supabase_auth_enabled
     from src.dalton.sharing import (
         can_edit_workspace_sharing,
@@ -383,6 +387,25 @@ async def get_workspace_sharing_endpoint(
 
     is_home = is_home_row(ws) or bool(ws.get("is_home"))
     owner_id = str(ws.get("user_id") or "").strip()
+
+    # Classify the owner exactly once per request, before the Home branch and
+    # any can_edit decision, so isolation and the owner_external flag can
+    # never disagree: external callers and non-admins on external-owned (or
+    # unresolvable) workspaces get 404; an external-owned Home is 404 even
+    # for admins (never shown to anyone but its owner).
+    owner_tier: str | None = None
+    if is_dalton_supabase_auth_enabled() and owner_id and owner_id != uid:
+        caller_tier = await get_user_tier(uid)
+        if caller_tier == "external":
+            raise HTTPException(status_code=404, detail="Workspace not found")
+        owner_tier = await classify_owner_tier(owner_id)
+        if owner_tier == "unknown" or (
+            owner_tier == "external" and caller_tier != "admin"
+        ):
+            raise HTTPException(status_code=404, detail="Workspace not found")
+        if owner_tier == "external" and is_home:
+            raise HTTPException(status_code=404, detail="Workspace not found")
+
     if is_home:
         if owner_id != uid:
             raise HTTPException(
@@ -415,11 +438,25 @@ async def get_workspace_sharing_endpoint(
                 detail="Not authorized to access this workspace",
             )
 
+    # External-owned workspaces have no effective sharing settings: visible to
+    # admins (read-only) and nobody else. Surface that to the settings UI and
+    # take the edit rights away even from the owner and the PM. The owner-self
+    # path skipped the isolation block, so classify once here.
+    effective_owner_tier = owner_tier
+    if (
+        effective_owner_tier is None
+        and is_dalton_supabase_auth_enabled()
+        and owner_id
+    ):
+        effective_owner_tier = await classify_owner_tier(owner_id)
+    owner_external = effective_owner_tier == "external"
+
     sharing = await get_workspace_sharing(str(ws["workspace_id"]))
     return {
         **sharing,
         "is_home": False,
-        "can_edit": can_edit,
+        "can_edit": can_edit and not owner_external,
+        "owner_external": owner_external,
     }
 
 
@@ -454,6 +491,26 @@ async def update_workspace_sharing_endpoint(
 
     is_home = is_home_row(ws) or bool(ws.get("is_home"))
     owner_id = str(ws.get("user_id") or "").strip()
+
+    # Classify the owner exactly once per request and reuse the result below:
+    # a non-owner external caller always gets 404 (Home included); internal
+    # callers get 404 for external-owned and unresolvable workspaces; an
+    # external-owned Home is 404 even for admins (never shown to anyone).
+    owner_tier: str | None = None
+    if is_dalton_supabase_auth_enabled() and owner_id and owner_id != uid:
+        from src.dalton.access_tiers import classify_owner_tier, get_user_tier
+
+        caller_tier = await get_user_tier(uid)
+        if caller_tier == "external":
+            raise HTTPException(status_code=404, detail="Workspace not found")
+        owner_tier = await classify_owner_tier(owner_id)
+        if owner_tier == "unknown" or (
+            owner_tier == "external" and caller_tier != "admin"
+        ):
+            raise HTTPException(status_code=404, detail="Workspace not found")
+        if owner_tier == "external" and is_home:
+            raise HTTPException(status_code=404, detail="Workspace not found")
+
     if is_home:
         if owner_id != uid and not is_pm:
             raise HTTPException(
@@ -469,6 +526,24 @@ async def update_workspace_sharing_endpoint(
         raise HTTPException(
             status_code=403,
             detail="Only workspace owner or PM may modify sharing settings",
+        )
+
+    # Sharing settings never take effect on an external-owned workspace, so
+    # refuse to modify them (for the external owner and the PM alike). The
+    # owner-self path skipped the isolation block, so classify once here.
+    effective_owner_tier = owner_tier
+    if (
+        effective_owner_tier is None
+        and is_dalton_supabase_auth_enabled()
+        and owner_id
+    ):
+        from src.dalton.access_tiers import classify_owner_tier
+
+        effective_owner_tier = await classify_owner_tier(owner_id)
+    if effective_owner_tier == "external":
+        raise HTTPException(
+            status_code=403,
+            detail="外部成员的工作区仅管理员可查看，不提供共享设置",
         )
 
     if body.cos_access is None and body.web_access is None:
@@ -816,15 +891,36 @@ async def _resolve_tracking_workspace_owner(
     """Verify workspace access for tracking and return ``(owner_user_id, can_edit)``."""
     _require_dalton_enabled()
     from src.dalton.settings import is_dalton_supabase_auth_enabled
-    from src.dalton.sharing import require_workspace_reader
+    from src.dalton.sharing import (
+        EXTERNAL_OWNED_ADMIN_WRITE_FORBIDDEN_DETAIL,
+        require_workspace_reader,
+    )
     from src.server.database import workspace as ws_db
 
     uid = str(user_id or "").strip()
     is_pm = bool(uid and uid in get_dalton_settings().pm_user_ids)
 
     if is_dalton_supabase_auth_enabled():
+        from src.dalton.access_tiers import classify_owner_tier
+
         workspace = await require_workspace_reader(workspace_id, uid)
         owner_id = str((workspace or {}).get("user_id") or uid).strip()
+        if owner_id != uid:
+            owner_tier = await classify_owner_tier(owner_id)
+            if owner_tier == "unknown":
+                raise HTTPException(
+                    status_code=404,
+                    detail="Workspace not found",
+                )
+            if owner_tier == "external":
+                # External-owned workspaces are read-only even for admins, so
+                # tracking stays under the owner's control.
+                if require_write:
+                    raise HTTPException(
+                        status_code=403,
+                        detail=EXTERNAL_OWNED_ADMIN_WRITE_FORBIDDEN_DETAIL,
+                    )
+                return owner_id, False
         can_edit = (owner_id == uid) or is_pm
         if require_write and not can_edit:
             raise HTTPException(

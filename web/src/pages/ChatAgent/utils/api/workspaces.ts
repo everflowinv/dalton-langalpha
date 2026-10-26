@@ -207,6 +207,9 @@ export interface WorkspaceSharingResponse {
   web_access: WorkspaceAccessLevel;
   is_home?: boolean;
   can_edit: boolean;
+  /** True when the workspace owner is an external member: sharing settings do
+   *  not apply (admin read-only), so the UI shows a notice instead of options. */
+  owner_external?: boolean;
   updated_by?: string | null;
   updated_at?: string | null;
 }

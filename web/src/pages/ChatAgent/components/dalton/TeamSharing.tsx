@@ -38,12 +38,14 @@ export interface TeamMemberGroup {
 
 export interface TeamWorkspacesResponse {
   members: TeamMemberGroup[];
+  caller_tier?: 'admin' | 'internal' | 'external';
 }
 
 export async function fetchTeamWorkspaces(): Promise<TeamWorkspacesResponse> {
   const { data } = await api.get<TeamWorkspacesResponse>('/api/v1/dalton/workspaces/team');
   return {
     members: Array.isArray(data?.members) ? data.members : [],
+    caller_tier: data?.caller_tier,
   };
 }
 
@@ -208,6 +210,13 @@ export function TeamWorkspacesSection({
   }, []);
 
   if (!isDaltonAuth) {
+    return null;
+  }
+
+  // Render only for confirmed internal/admin callers: external members are
+  // fully isolated, and while the tier is still loading (or the query failed)
+  // the section stays hidden rather than flashing a placeholder.
+  if (data?.caller_tier !== 'internal' && data?.caller_tier !== 'admin') {
     return null;
   }
 

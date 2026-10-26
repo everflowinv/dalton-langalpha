@@ -17,6 +17,7 @@ from fastapi import HTTPException
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool, tool
 
+from src.dalton.access_tiers import get_user_tier
 from src.dalton.auth import (
     resolve_caller_home_workspace_id,
     verify_workspace_access,
@@ -46,6 +47,11 @@ WIKI_INGEST_ALLOWED_EXTENSIONS: frozenset[str] = frozenset(
 _WIKI_REQUEST_ID_NAMESPACE = UUID("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
 _FORBIDDEN_PATH_CHARS_RE = re.compile(r"""[;$()`|&<>'"!*?\[\]{}~#\x00-\x1f\x7f\\]""")
 _ALLOWED_ARGV_BINARIES: frozenset[str] = frozenset({"stat", "realpath"})
+
+EXTERNAL_WIKI_INGEST_FORBIDDEN_MESSAGE = (
+    "外部成员不能写入公司 wiki（ingest_company_wiki 仅管理员与内部成员可用）；"
+    "请如实告知用户这一身份限制，不要尝试绕过。"
+)
 
 TargetTypeLiteral = Literal["company", "sector"]
 
@@ -460,6 +466,7 @@ def build_ingest_company_wiki_tool(
     ) -> str:
         """将公司或行业一手研究资料（会议纪要、专家访谈、买方交流、研究笔记等）入库到基金共享 company-wiki；卖方研报与 sales color 严禁入库（请走 sales notes）。
 
+        仅管理员与内部成员可入库：外部成员（按名单固定）调用会被直接拒绝（confirm=False 预览同样拒绝），此时如实告知用户，不要尝试绕过。
         必须分两步调用：先传 confirm=False 获取预览（解析后的 slug、类型、文件名、大小、是否疑似卖方或重复）并向用户展示确认；用户明确同意后再传 confirm=True 正式写入。
         Args:
             target_type: 归属维度，'company' 或 'sector'。
@@ -476,6 +483,19 @@ def build_ingest_company_wiki_tool(
         user_id, workspace_id, thread_id, _ = _extract_run_identity(config)
         if not user_id:
             return "ERROR: user_id and workspace_id are required in RunnableConfig."
+
+        # Company wiki is team-shared storage: refuse external members before
+        # any bridge call (preview included), regardless of confirm.
+        if await get_user_tier(user_id) == "external":
+            return json.dumps(
+                {
+                    "ok": False,
+                    "status": "forbidden",
+                    "error_code": "external_member_forbidden",
+                    "error": EXTERNAL_WIKI_INGEST_FORBIDDEN_MESSAGE,
+                },
+                ensure_ascii=False,
+            )
 
         if allow_home_workspace and (
             not workspace_id or workspace_id.strip().lower() == "home"

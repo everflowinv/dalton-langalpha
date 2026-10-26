@@ -5562,6 +5562,7 @@
       "levelRo": "仅可读",
       "levelHidden": "不可见",
       "homeNote": "Home 工作区始终不对他人开放",
+      "externalOwnerNote": "外部成员的工作区仅管理员可查看，不提供共享设置",
       "nextPhaseNotice": "该功能下一期开放"
     }
   }

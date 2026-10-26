@@ -277,6 +277,7 @@ vi.mock('@/pages/ChatAgent/hooks/useWorkspaceFiles', () => ({
 }));
 
 const SAMPLE_TEAM_RESPONSE: TeamWorkspacesResponse = {
+  caller_tier: 'internal',
   members: [
     {
       user_id: 'u-richard',
@@ -998,6 +999,7 @@ describe('Dalton Team Sharing', () => {
   it('supports 3-state useTeamReadOnly (owner / rw / ro) and renders access badges in TeamWorkspacesSection', () => {
     const queryClient = createTestQueryClient();
     const teamWithLevels: TeamWorkspacesResponse = {
+      caller_tier: 'internal',
       members: [
         {
           user_id: 'u-richard',
@@ -1202,5 +1204,81 @@ describe('Dalton Team Sharing', () => {
         { cos_access: 'rw', web_access: 'ro' },
       );
     });
+  });
+
+  it('does not render team section when caller_tier is external', () => {
+    const queryClient = createTestQueryClient();
+    queryClient.setQueryData(queryKeys.workspaces.team(), {
+      ...SAMPLE_TEAM_RESPONSE,
+      caller_tier: 'external',
+    });
+
+    renderWithProviders(<TeamWorkspacesSection currentWorkspaceId={null} />, {
+      queryClient,
+    });
+
+    expect(screen.queryByTestId('team-workspaces-section')).toBeNull();
+  });
+
+  it('does not render team section while the team query is still loading', () => {
+    // Never-resolving GET keeps useQuery in the loading state (no caller_tier yet).
+    mockApiGet.mockReturnValue(new Promise(() => {}));
+    const queryClient = createTestQueryClient();
+
+    renderWithProviders(<TeamWorkspacesSection currentWorkspaceId={null} />, {
+      queryClient,
+    });
+
+    expect(screen.queryByTestId('team-workspaces-section')).toBeNull();
+  });
+
+  it('does not render team section when the team query fails', async () => {
+    mockApiGet.mockRejectedValueOnce(new Error('network down'));
+    const queryClient = createTestQueryClient();
+
+    renderWithProviders(<TeamWorkspacesSection currentWorkspaceId={null} />, {
+      queryClient,
+    });
+
+    // Wait for React Query to actually settle into the error state
+    // (`useTeamWorkspaces` has retry: false) before asserting on rendering.
+    await waitFor(() => {
+      expect(queryClient.getQueryState(queryKeys.workspaces.team())?.status).toBe(
+        'error',
+      );
+    });
+    expect(screen.queryByTestId('team-workspaces-section')).toBeNull();
+  });
+
+  it('shows the admin-only notice instead of options for external-owned workspaces', async () => {
+    const { default: i18n } = await import('@/i18n');
+    await i18n.changeLanguage('zh-CN');
+    onTestFinished(async () => {
+      await i18n.changeLanguage('en-US');
+    });
+    const queryClient = createTestQueryClient();
+    queryClient.setQueryData(queryKeys.dalton.sharing('ws-ext-1'), {
+      workspace_id: 'ws-ext-1',
+      cos_access: 'ro',
+      web_access: 'ro',
+      is_home: false,
+      can_edit: false,
+      owner_external: true,
+      updated_by: 'u-ext',
+      updated_at: '2026-10-26T12:00:00Z',
+    });
+
+    renderWithProviders(<WorkspaceSharingModal workspaceId="ws-ext-1" />, {
+      queryClient,
+    });
+
+    fireEvent.click(screen.getByTestId('workspace-sharing-button'));
+
+    expect(screen.getByTestId('sharing-external-owner-note')).toHaveTextContent(
+      '外部成员的工作区仅管理员可查看',
+    );
+    expect(screen.queryByTestId('sharing-cos-fieldset')).toBeNull();
+    expect(screen.queryByTestId('sharing-web-fieldset')).toBeNull();
+    expect(screen.queryByTestId('sharing-save-btn')).toBeNull();
   });
 });

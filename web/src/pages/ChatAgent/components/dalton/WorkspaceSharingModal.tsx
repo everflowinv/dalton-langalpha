@@ -88,7 +88,10 @@ export function WorkspaceSharingModal({
 
   const cosAccess: WorkspaceAccessLevel = data?.cos_access ?? 'ro';
   const webAccess: WorkspaceAccessLevel = data?.web_access ?? 'hidden';
-  const canEdit = data?.can_edit ?? !readOnly;
+  // External-owned workspaces ignore sharing settings entirely (admins see them
+  // read-only), so the modal explains that instead of offering options.
+  const ownerExternal = data?.owner_external === true;
+  const canEdit = !ownerExternal && (data?.can_edit ?? !readOnly);
 
   const handleOpen = () => {
     setDraftCos(cosAccess);
@@ -161,19 +164,21 @@ export function WorkspaceSharingModal({
                 >
                   {t('common.cancel', '取消')}
                 </button>
-                <button
-                  type="button"
-                  disabled={!canEdit || mutation.isPending}
-                  onClick={handleSave}
-                  data-testid="sharing-save-btn"
-                  className="px-3 py-1.5 rounded-md text-xs font-medium transition-opacity hover:opacity-90 disabled:opacity-50 disabled:cursor-not-allowed"
-                  style={{
-                    backgroundColor: 'var(--color-btn-primary-bg)',
-                    color: 'var(--color-btn-primary-text)',
-                  }}
-                >
-                  {t('common.save', '保存')}
-                </button>
+                {!ownerExternal && (
+                  <button
+                    type="button"
+                    disabled={!canEdit || mutation.isPending}
+                    onClick={handleSave}
+                    data-testid="sharing-save-btn"
+                    className="px-3 py-1.5 rounded-md text-xs font-medium transition-opacity hover:opacity-90 disabled:opacity-50 disabled:cursor-not-allowed"
+                    style={{
+                      backgroundColor: 'var(--color-btn-primary-bg)',
+                      color: 'var(--color-btn-primary-text)',
+                    }}
+                  >
+                    {t('common.save', '保存')}
+                  </button>
+                )}
               </div>
             }
           >
@@ -182,73 +187,88 @@ export function WorkspaceSharingModal({
               className="flex flex-col gap-4"
               style={{ color: 'var(--color-text-primary)' }}
             >
-              <fieldset
-                className="flex flex-col gap-2"
-                disabled={!canEdit || mutation.isPending}
-                data-testid="sharing-cos-fieldset"
-              >
-                <legend
-                  className="text-xs font-medium mb-1"
+              {ownerExternal ? (
+                <p
+                  className="text-xs"
+                  data-testid="sharing-external-owner-note"
                   style={{ color: 'var(--color-text-secondary)' }}
                 >
-                  {t('dalton.sharing.cosLabel', '别人的 Chief of Staff')}
-                </legend>
-                <div className="flex items-center gap-4">
-                  {ACCESS_OPTIONS.map((opt) => (
-                    <label
-                      key={`cos-${opt.value}`}
-                      className={`inline-flex items-center gap-1.5 text-xs ${
-                        canEdit ? 'cursor-pointer' : 'cursor-not-allowed opacity-60'
-                      }`}
+                  {t(
+                    'dalton.sharing.externalOwnerNote',
+                    '外部成员的工作区仅管理员可查看，不提供共享设置',
+                  )}
+                </p>
+              ) : (
+                <>
+                  <fieldset
+                    className="flex flex-col gap-2"
+                    disabled={!canEdit || mutation.isPending}
+                    data-testid="sharing-cos-fieldset"
+                  >
+                    <legend
+                      className="text-xs font-medium mb-1"
+                      style={{ color: 'var(--color-text-secondary)' }}
                     >
-                      <input
-                        type="radio"
-                        name="cos_access"
-                        value={opt.value}
-                        checked={draftCos === opt.value}
-                        disabled={!canEdit || mutation.isPending}
-                        onChange={() => setDraftCos(opt.value)}
-                        data-testid={`sharing-cos-${opt.value}`}
-                      />
-                      <span>{t(opt.labelKey, opt.labelZh)}</span>
-                    </label>
-                  ))}
-                </div>
-              </fieldset>
+                      {t('dalton.sharing.cosLabel', '别人的 Chief of Staff')}
+                    </legend>
+                    <div className="flex items-center gap-4">
+                      {ACCESS_OPTIONS.map((opt) => (
+                        <label
+                          key={`cos-${opt.value}`}
+                          className={`inline-flex items-center gap-1.5 text-xs ${
+                            canEdit ? 'cursor-pointer' : 'cursor-not-allowed opacity-60'
+                          }`}
+                        >
+                          <input
+                            type="radio"
+                            name="cos_access"
+                            value={opt.value}
+                            checked={draftCos === opt.value}
+                            disabled={!canEdit || mutation.isPending}
+                            onChange={() => setDraftCos(opt.value)}
+                            data-testid={`sharing-cos-${opt.value}`}
+                          />
+                          <span>{t(opt.labelKey, opt.labelZh)}</span>
+                        </label>
+                      ))}
+                    </div>
+                  </fieldset>
 
-              <fieldset
-                className="flex flex-col gap-2"
-                disabled={!canEdit || mutation.isPending}
-                data-testid="sharing-web-fieldset"
-              >
-                <legend
-                  className="text-xs font-medium mb-1"
-                  style={{ color: 'var(--color-text-secondary)' }}
-                >
-                  {t('dalton.sharing.webLabel', '别人的网页界面')}
-                </legend>
-                <div className="flex items-center gap-4">
-                  {ACCESS_OPTIONS.map((opt) => (
-                    <label
-                      key={`web-${opt.value}`}
-                      className={`inline-flex items-center gap-1.5 text-xs ${
-                        canEdit ? 'cursor-pointer' : 'cursor-not-allowed opacity-60'
-                      }`}
+                  <fieldset
+                    className="flex flex-col gap-2"
+                    disabled={!canEdit || mutation.isPending}
+                    data-testid="sharing-web-fieldset"
+                  >
+                    <legend
+                      className="text-xs font-medium mb-1"
+                      style={{ color: 'var(--color-text-secondary)' }}
                     >
-                      <input
-                        type="radio"
-                        name="web_access"
-                        value={opt.value}
-                        checked={draftWeb === opt.value}
-                        disabled={!canEdit || mutation.isPending}
-                        onChange={() => setDraftWeb(opt.value)}
-                        data-testid={`sharing-web-${opt.value}`}
-                      />
-                      <span>{t(opt.labelKey, opt.labelZh)}</span>
-                    </label>
-                  ))}
-                </div>
-              </fieldset>
+                      {t('dalton.sharing.webLabel', '别人的网页界面')}
+                    </legend>
+                    <div className="flex items-center gap-4">
+                      {ACCESS_OPTIONS.map((opt) => (
+                        <label
+                          key={`web-${opt.value}`}
+                          className={`inline-flex items-center gap-1.5 text-xs ${
+                            canEdit ? 'cursor-pointer' : 'cursor-not-allowed opacity-60'
+                          }`}
+                        >
+                          <input
+                            type="radio"
+                            name="web_access"
+                            value={opt.value}
+                            checked={draftWeb === opt.value}
+                            disabled={!canEdit || mutation.isPending}
+                            onChange={() => setDraftWeb(opt.value)}
+                            data-testid={`sharing-web-${opt.value}`}
+                          />
+                          <span>{t(opt.labelKey, opt.labelZh)}</span>
+                        </label>
+                      ))}
+                    </div>
+                  </fieldset>
+                </>
+              )}
 
               <p
                 className="text-xs"

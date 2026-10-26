@@ -2,6 +2,11 @@
 
 Active only when ``is_dalton_supabase_auth_enabled()`` is True and the caller is
 an allowlisted team member (``DALTON_ALLOWED_EMAILS``).
+
+External members (``get_user_tier == 'external'``, roster-fixed) are fully
+isolated: they see no colleague workspace on either channel, whatever the owner
+shared, and their own workspaces are visible to admins (read-only) and nobody
+else — the owner's sharing settings never apply to an external-owned workspace.
 """
 
 from __future__ import annotations
@@ -13,9 +18,15 @@ from typing import Any
 from fastapi import HTTPException
 from psycopg.rows import dict_row
 
+from src.dalton.access_tiers import classify_owner_tier, get_user_tier
 from src.dalton.auth import _verified_token_identity
-from src.dalton.invites import get_team_member_emails, is_team_member
+from src.dalton.invites import (
+    get_team_member_emails,
+    is_invite_pm,
+    is_team_member,
+)
 from src.dalton.settings import (
+    get_dalton_allowed_emails,
     get_dalton_settings,
     is_dalton_supabase_auth_enabled,
 )
@@ -34,6 +45,33 @@ VALID_NEEDS: frozenset[str] = frozenset({"read", "write"})
 
 DEFAULT_COS_ACCESS: str = "ro"
 DEFAULT_WEB_ACCESS: str = "hidden"
+
+# Admins may look into an external member's workspace but never write it;
+# the sharing settings of an external-owned workspace never take effect.
+EXTERNAL_OWNED_ADMIN_WRITE_FORBIDDEN_DETAIL = "外部成员的工作区仅管理员可查看（只读）"
+
+
+def _classify_owner_row_tier(owner_id: str | None, owner_email: Any) -> str:
+    """Classify a workspace owner from the row's joined email, with exactly the
+    ``classify_owner_tier`` rules (PM -> admin, allowlisted email -> internal,
+    everything else -> external); a missing email or any failing roster read
+    is ``unknown`` so list loops skip the row instead of applying an isolation
+    rule to a guess."""
+    uid = str(owner_id or "").strip()
+    if not uid:
+        return "unknown"
+    try:
+        if is_invite_pm(uid):
+            return "admin"
+        email = str(owner_email or "").strip().lower()
+        if not email:
+            return "unknown"
+        if email in get_dalton_allowed_emails():
+            return "internal"
+        return "external"
+    except Exception:
+        # A single unclassifiable row must not fail the whole listing.
+        return "unknown"
 
 
 def _display_name(name: str | None, email: str | None) -> str:
@@ -295,6 +333,13 @@ async def require_workspace_access(
       - ``hidden`` on ``channel`` -> HTTP 404 (does not leak existence).
       - ``ro`` on ``channel`` -> allows ``need='read'``, rejects ``need='write'`` with HTTP 403.
       - ``rw`` on ``channel`` -> allows both ``need='read'`` and ``need='write'``.
+    - External-member isolation (roster-fixed tiers, checked before the
+      Home/status checks, the owner membership check, and any sharing row):
+      a non-owner external caller gets HTTP 404 on every colleague workspace;
+      an external-owned workspace is HTTP 404 for every non-owner except
+      admins, who get read-only access (HTTP 403 on ``need='write'``); an
+      unresolvable owner tier (``unknown``) is HTTP 404 for everyone.
+    Owners keep full access regardless of their own tier.
     """
     cleaned_channel = str(channel or "web").strip().lower()
     if cleaned_channel not in VALID_CHANNELS:
@@ -348,6 +393,36 @@ async def require_workspace_access(
         ws["_caller_cos_access"] = "owner"
         return ws
 
+    # External-member isolation, decided before anything else — the Home
+    # 403, the owner membership check, the sharing row — so no caller state
+    # or owner-tier failure can leak a colleague workspace's existence.
+    caller_tier = await get_user_tier(uid)
+    if caller_tier == "external":
+        raise HTTPException(status_code=404, detail="Workspace not found")
+
+    owner_tier = await classify_owner_tier(owner_id)
+    if owner_tier == "unknown":
+        raise HTTPException(status_code=404, detail="Workspace not found")
+    if owner_tier == "external":
+        if caller_tier != "admin":
+            raise HTTPException(status_code=404, detail="Workspace not found")
+        # Admins see external-owned workspaces read-only — except the
+        # never-shared states, which stay 404 for them too.
+        if (
+            is_home_row(ws)
+            or bool(ws.get("is_home"))
+            or ws.get("status") in ("unbound", "deleted")
+        ):
+            raise HTTPException(status_code=404, detail="Workspace not found")
+        if cleaned_need == "write":
+            raise HTTPException(
+                status_code=403,
+                detail=EXTERNAL_OWNED_ADMIN_WRITE_FORBIDDEN_DETAIL,
+            )
+        ws[f"_caller_{cleaned_channel}_access"] = "ro"
+        return ws
+
+    # Only internal/admin owners below: original sharing semantics.
     # Personal Home workspaces and deleted/unbound workspaces are never shared with colleagues.
     if (
         is_home_row(ws)
@@ -388,7 +463,8 @@ async def require_thread_access(
 ) -> str:
     """Verify caller has ``need`` ('read' | 'write') access to ``thread_id`` on ``channel`` ('web' | 'cos').
 
-    Returns the resolved owner ``user_id`` of the thread.
+    Returns the resolved owner ``user_id`` of the thread. Non-owner callers
+    inherit the external-member isolation from ``require_workspace_access``.
     """
     uid = (user_id or "").strip()
     if not uid:
@@ -466,6 +542,10 @@ async def list_team_workspaces(current_user_id: str) -> list[dict[str, Any]]:
         return []
 
     uid = await require_team_reader(current_user_id)
+    # Fully isolated environment: external members see no colleague workspace.
+    caller_tier = await get_user_tier(uid)
+    if caller_tier == "external":
+        return []
     allowed_emails = sorted(await get_team_member_emails())
 
     async with get_db_connection() as conn:
@@ -499,7 +579,6 @@ async def list_team_workspaces(current_user_id: str) -> list[dict[str, Any]]:
                           WHERE dm.email = LOWER(BTRIM(u.email))
                       )
                   )
-                  AND COALESCE(s.web_access, 'hidden') IN ('ro', 'rw')
                 ORDER BY
                     COALESCE(NULLIF(BTRIM(u.name), ''), LOWER(BTRIM(u.email))) ASC,
                     COALESCE(w.last_activity_at, w.updated_at) DESC,
@@ -510,20 +589,45 @@ async def list_team_workspaces(current_user_id: str) -> list[dict[str, Any]]:
             rows = [dict(r) for r in await cur.fetchall()]
 
     grouped: dict[str, dict[str, Any]] = {}
+    # Sharing settings never apply to an external-owned workspace: admins see
+    # it read-only (even when marked hidden), everyone else sees nothing. The
+    # owner tier is classified from the joined email (no per-owner lookup).
+    owner_tiers: dict[str, str] = {}
     for row in rows:
         if is_home_row(row) or bool(row.get("is_home")):
             continue
-        raw_web_access = row.get("web_access")
-        if raw_web_access == "hidden":
+        owner_uid = str(row["user_id"])
+        owner_tier = owner_tiers.get(owner_uid)
+        if owner_tier is None:
+            owner_tier = _classify_owner_row_tier(owner_uid, row.get("owner_email"))
+            owner_tiers[owner_uid] = owner_tier
+        if owner_tier == "unknown":
+            logger.warning(
+                "Skipping workspace row with unresolvable owner tier "
+                "(owner_user_id=%s, workspace_id=%s)",
+                owner_uid,
+                row.get("workspace_id"),
+            )
             continue
-        web_access = _normalize_access_level(raw_web_access, "ro")
+        external_owned = owner_tier == "external"
+        if external_owned and caller_tier != "admin":
+            continue
+        raw_web_access = row.get("web_access")
+        if not external_owned and raw_web_access == "hidden":
+            continue
+        web_access = (
+            "ro"
+            if external_owned
+            else _normalize_access_level(raw_web_access, "ro")
+        )
         if web_access == "hidden":
             continue
-        cos_access = _normalize_access_level(
-            row.get("cos_access"), DEFAULT_COS_ACCESS
+        cos_access = (
+            "ro"
+            if external_owned
+            else _normalize_access_level(row.get("cos_access"), DEFAULT_COS_ACCESS)
         )
 
-        owner_uid = str(row["user_id"])
         owner_email = str(row.get("owner_email") or "").strip()
         if not await is_team_member(owner_email):
             continue
@@ -589,6 +693,10 @@ async def list_colleague_cos_workspaces(
     except HTTPException:
         return []
 
+    # Fully isolated environment: external members see no colleague workspace.
+    caller_tier = await get_user_tier(uid)
+    if caller_tier == "external":
+        return []
     allowed_emails = sorted(await get_team_member_emails())
 
     async with get_db_connection() as conn:
@@ -621,7 +729,6 @@ async def list_colleague_cos_workspaces(
                           WHERE dm.email = LOWER(BTRIM(u.email))
                       )
                   )
-                  AND COALESCE(s.cos_access, 'ro') IN ('ro', 'rw')
                 ORDER BY
                     COALESCE(NULLIF(BTRIM(u.name), ''), LOWER(BTRIM(u.email))) ASC,
                     COALESCE(w.last_activity_at, w.updated_at) DESC,
@@ -632,18 +739,45 @@ async def list_colleague_cos_workspaces(
             rows = [dict(r) for r in await cur.fetchall()]
 
     items: list[dict[str, Any]] = []
+    # Sharing settings never apply to an external-owned workspace: admins see
+    # it read-only (even when marked hidden), everyone else sees nothing. The
+    # owner tier is classified from the joined email (no per-owner lookup).
+    owner_tiers: dict[str, str] = {}
     for row in rows:
         if is_home_row(row) or bool(row.get("is_home")):
             continue
-        cos_access = _normalize_access_level(
-            row.get("cos_access"), DEFAULT_COS_ACCESS
+        owner_uid = str(row["user_id"])
+        owner_tier = owner_tiers.get(owner_uid)
+        if owner_tier is None:
+            owner_tier = _classify_owner_row_tier(owner_uid, row.get("owner_email"))
+            owner_tiers[owner_uid] = owner_tier
+        if owner_tier == "unknown":
+            logger.warning(
+                "Skipping colleague CoS workspace row with unresolvable owner "
+                "tier (owner_user_id=%s, workspace_id=%s)",
+                owner_uid,
+                row.get("workspace_id"),
+            )
+            continue
+        external_owned = owner_tier == "external"
+        if external_owned and caller_tier != "admin":
+            continue
+        cos_access = (
+            "ro"
+            if external_owned
+            else _normalize_access_level(
+                row.get("cos_access"), DEFAULT_COS_ACCESS
+            )
         )
         if cos_access == "hidden":
             continue
-        web_access = _normalize_access_level(
-            row.get("web_access"), DEFAULT_WEB_ACCESS
+        web_access = (
+            "ro"
+            if external_owned
+            else _normalize_access_level(
+                row.get("web_access"), DEFAULT_WEB_ACCESS
+            )
         )
-        owner_uid = str(row["user_id"])
         owner_email = str(row.get("owner_email") or "").strip()
         owner_display = _display_name(row.get("owner_name"), owner_email)
         updated_at = row.get("updated_at")

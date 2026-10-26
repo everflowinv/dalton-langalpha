@@ -7,6 +7,7 @@ from typing import Annotated, Any, Literal
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool, tool
 
+from src.dalton.access_tiers import get_user_tier
 from src.dalton.auth import resolve_caller_home_workspace_id
 from src.dalton.database.publications import resolve_thread_author_model
 from src.dalton.publish.language import run_check_language
@@ -28,6 +29,11 @@ PublishKindLiteral = Literal[
     "topic",
     "conviction_call",
 ]
+
+EXTERNAL_PUBLISH_FORBIDDEN_MESSAGE = (
+    "外部成员不能发布正式报告（publish_report 仅管理员与内部成员可用）；"
+    "请如实告知用户这一身份限制，不要尝试绕过。"
+)
 
 
 def _build_check_language_tool(
@@ -126,12 +132,16 @@ def create_publish_tools(filesystem_backend: Any = None) -> list[BaseTool]:
     ) -> str:
         """Publish a finished draft as the fund's official research (.md and optional .xlsx model): audits every figure, gets an independent review, then asks the PM to approve.
 
+        Admins and internal members only: external members are refused outright (report the refusal honestly; drafting and check_draft stay available).
         Call only when the draft is final; while drafting use check_draft. Unmatched figures or a "revise" review come back as a list to fix — fix and call again.
         Returns: the published paths, or what blocks publishing and what to do next.
         """
         user_id, workspace_id, thread_id, _ = _extract_run_identity(config)
         if not user_id or not workspace_id or not thread_id:
             return "ERROR: user_id, workspace_id, and thread_id are required in RunnableConfig."
+
+        if await get_user_tier(user_id) == "external":
+            return f"ERROR: {EXTERNAL_PUBLISH_FORBIDDEN_MESSAGE}"
 
         cfg = (config or {}).get("configurable") or {}
         author_model = (

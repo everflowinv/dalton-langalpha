@@ -33,6 +33,16 @@ if str(BRIDGE_DIR) not in sys.path:
 import researchdata_bridge as rb  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _wiki_caller_is_internal(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every tool-level test here is an internal team member ingesting wiki docs."""
+    monkeypatch.setattr(
+        wiki_tools,
+        "get_user_tier",
+        create_autospec(wiki_tools.get_user_tier, return_value="internal"),
+    )
+
+
 def _make_test_bridge(tmp_path: Path) -> rb.ResearchDataBridge:
     """Create an isolated `ResearchDataBridge` rooted under `tmp_path` without touching `~/.openclaw`."""
     ocw_root = tmp_path / "openclaw_workspace"
