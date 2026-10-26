@@ -6,7 +6,7 @@
 
 每日定时任务使用 `src/dalton/dalton.yaml` 下 `conversations` 段的默认配置：
 - `extract_concurrency: 1`（单并发，保持每日任务行为不变）
-- `hourly_token_budget: 120000`
+- `hourly_token_budget: 500000`（10/26 起；此前 120000）
 
 运行命令：
 
@@ -26,13 +26,13 @@
 ```
 
 - **建议参数**：`--concurrency 4 --hourly-token-budget 1500000`。
-- **每日任务不受影响**：`dalton.yaml` 中默认仍为 `extract_concurrency: 1` 和 `hourly_token_budget: 120000`，仅在回填命令行显式传入 `--concurrency 4 --hourly-token-budget 1500000` 时提速。
+- **每日任务不受影响**：`dalton.yaml` 中默认仍为 `extract_concurrency: 1` 和 `hourly_token_budget: 500000`，仅在回填命令行显式传入 `--concurrency 4 --hourly-token-budget 1500000` 时提速。
 - **并发与限流保护**：
   - 使用 `asyncio.Semaphore` 控制并发抽取数；
   - `HourlyTokenBudgetLimiter` 在并发下先按估算 token 预占预算、完成后按实际消耗校正，避免多个协程同时看到剩余预算而超额；
   - 任一协程遇到瞬时 `429` 退避时，其余并发协程共享暂停窗口，暂停新发请求；遇到 `PermanentQuotaError` 时取消其余在途任务，将已完成连续前缀落盘后退出。
 - **逐段有序落盘与进度监控**：
-  - 并发抽取的结果按片段原始顺序缓冲，只落盘**已连续完成的前缀**（最多攒 `N = concurrency` 段一起调用 embedding 并在同一事务内写入 `dalton_conversation_cards` 与 `dalton_conversation_processed`），严格保证 `supersedes` 的时间顺序语义；
+  - 并发抽取的结果按片段原始顺序缓冲，只落盘**同一会话（agent, session_id）内已连续完成的前缀**（10/26 起按会话阻断：某会话的段失败只挡住该会话的后续段，其他会话照常落盘）（最多攒 `N = concurrency` 段一起调用 embedding 并在同一事务内写入 `dalton_conversation_cards` 与 `dalton_conversation_processed`），严格保证 `supersedes` 的时间顺序语义；
   - 每落盘一次即同步更新 `dalton_conversation_runs` 行中的 `segments_processed`、`cards_extracted`、`cards_inserted`、`total_tokens` 等进度列；
   - 每个片段完成时向 `stderr`（无缓冲）输出一行 `INFO` 日志（含 `Segment i/total`、token 数、耗时）。
 
