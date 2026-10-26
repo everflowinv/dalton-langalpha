@@ -749,7 +749,7 @@ except ImportError:
                 "Transformed MCP server command for sandbox",
                 server=server.name,
                 original_args=logged_args,
-                sandbox_args=args,
+                sandbox_args=_redact_managed_tokens(list(args)),
             )
         entry = {
             "transport": "stdio",

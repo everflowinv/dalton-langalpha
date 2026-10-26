@@ -616,6 +616,20 @@ def managed_secret_token_values() -> tuple[str, ...]:
     )
 
 
+def redact_managed_tokens(text: Any) -> Any:
+    """Replace each management token's value with ``***`` in a log field.
+
+    Host-side logs can carry plaintext expanded from ``${...}`` config refs
+    (a failing MCP server echoing its argv to stderr, an exception message)
+    before any sandbox-bound sanitizing runs. Non-strings pass through.
+    """
+    if not isinstance(text, str):
+        return text
+    for token in managed_secret_token_values():
+        text = text.replace(token, "***")
+    return text
+
+
 def sanitize_sandbox_env_vars(
     env_vars: dict[str, str],
     servers: Any = None,

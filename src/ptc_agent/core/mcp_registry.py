@@ -366,14 +366,19 @@ class MCPServerConnector:
                     diagnosis=self.failure_reason,
                 )
                 return
+            # DALTON-HOOK(bridge-admin-token): a server launched with an expanded
+            # ${...} management token can echo it in stderr, the error or the
+            # traceback; redact before the host log, ahead of any sanitizer.
+            from src.dalton.settings import redact_managed_tokens
+
             (logger.debug if self._quiet else logger.error)(
                 "Failed to connect to MCP server",
                 server=self.config.name,
-                error=str(e),
+                error=redact_managed_tokens(str(e)),
                 error_type=type(e).__name__,
-                diagnosis=self.failure_reason,
-                traceback=error_details,
-                stderr_tail=stderr_tail or None,
+                diagnosis=redact_managed_tokens(self.failure_reason),
+                traceback=redact_managed_tokens(error_details),
+                stderr_tail=redact_managed_tokens(stderr_tail) or None,
             )
         finally:
             if stderr_capture is not None:
