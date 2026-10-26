@@ -680,3 +680,44 @@ export async function redeemDaltonInviteToken(payload: {
   return data;
 }
 
+
+export interface DaltonFeishuReadScope {
+  space_id: string;
+  name: string;
+  added_by: string;
+  added_at: string | null;
+}
+
+export interface DaltonFeishuReadScopesResponse {
+  scopes: DaltonFeishuReadScope[];
+}
+
+export interface DaltonFeishuSpace {
+  space_id: string;
+  name: string;
+  description?: string;
+}
+
+export async function fetchDaltonFeishuReadScopes(): Promise<DaltonFeishuReadScopesResponse> {
+  const { data } = await api.get<DaltonFeishuReadScopesResponse>(
+    '/api/v1/dalton/feishu/read-scopes',
+  );
+  return data;
+}
+
+export async function updateDaltonFeishuReadScopes(
+  scopes: Array<{ space_id: string; name?: string }>,
+): Promise<DaltonFeishuReadScopesResponse> {
+  const { data } = await api.put<DaltonFeishuReadScopesResponse>(
+    '/api/v1/dalton/feishu/read-scopes',
+    { scopes },
+  );
+  return data;
+}
+
+export async function fetchDaltonFeishuSpaces(): Promise<{ spaces: DaltonFeishuSpace[] }> {
+  const { data } = await api.get<{ spaces: DaltonFeishuSpace[] }>(
+    '/api/v1/dalton/feishu/spaces',
+  );
+  return data;
+}

@@ -105,6 +105,7 @@ ALLOWED_HOOKS=(
   "upstream-backport-596"
   "workspace-sharing-settings"
   "composer-drafts"
+  "feishu-docs"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

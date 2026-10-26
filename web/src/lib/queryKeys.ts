@@ -297,6 +297,9 @@ export const queryKeys = {
     // DALTON-HOOK(invite-signup): PM invite list & public invite check query keys
     invites: () => [...queryKeys.dalton.all, 'invites'],
     inviteCheck: (token: string) => [...queryKeys.dalton.all, 'invites', 'check', token],
+    // DALTON-HOOK(feishu-docs): Feishu wiki read-scope whitelist and bot-visible spaces
+    feishuReadScopes: () => [...queryKeys.dalton.all, 'feishu', 'read-scopes'],
+    feishuSpaces: () => [...queryKeys.dalton.all, 'feishu', 'spaces'],
   },
 };
 

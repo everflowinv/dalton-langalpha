@@ -23,13 +23,14 @@ def build_dalton_tools(
     """Return role-appropriate Dalton tools to bind onto the main agent (`DALTON-HOOK(dalton-tools)`).
 
     - `chief_of_staff` (Home / Research Director):
-      `dalton_coverage_board`, `dalton_record_plan`, `dalton_agenda_note`, `dalton_watch_event`, `dalton_resolve_signals`, `dalton_schedule_automation`, `dalton_coverage_tracking`, `dalton_system_jobs`, `dalton_coverage`, `conversation_search`, `check_language`, `ingest_company_wiki`, `dalton_check_done` (weekly-coverage-review, dalton-earnings-calendar only)
+      `dalton_coverage_board`, `dalton_record_plan`, `dalton_agenda_note`, `dalton_watch_event`, `dalton_resolve_signals`, `dalton_schedule_automation`, `dalton_coverage_tracking`, `dalton_system_jobs`, `dalton_coverage`, `conversation_search`, `check_language`, `ingest_company_wiki`, `dalton_check_done` (weekly-coverage-review, dalton-earnings-calendar only), `feishu_read`, `feishu_list_wiki`, `feishu_create_doc`, `feishu_append`
     - `analyst` (Company workspace):
-      `knowledge_update`, `knowledge_append_verdict`, `dalton_check_done`, `check_draft`, `check_language`, `publish_report`, `ingest_company_wiki`, `dalton_schedule_automation`, `dalton_coverage_tracking`, `dalton_system_jobs`, `conversation_search`
+      `knowledge_update`, `knowledge_append_verdict`, `dalton_check_done`, `check_draft`, `check_language`, `publish_report`, `ingest_company_wiki`, `dalton_schedule_automation`, `dalton_coverage_tracking`, `dalton_system_jobs`, `conversation_search`, `feishu_read`, `feishu_list_wiki`, `feishu_create_doc`, `feishu_append`
     """
     settings = get_dalton_settings()
     is_enabled = enabled if enabled is not None else (
-        settings.knowledge.enabled
+        settings.enabled
+        or settings.knowledge.enabled
         or settings.publish.enabled
         or settings.autonomy.enabled
         or settings.conversations.enabled
@@ -38,6 +39,14 @@ def build_dalton_tools(
         return []
 
     tools: list[BaseTool] = []
+
+    if settings.enabled:
+        try:
+            from src.dalton.tools.feishu_tools import create_feishu_tools
+
+            tools.extend(create_feishu_tools())
+        except Exception as e:
+            logger.debug("[DALTON_TOOLS] feishu_tools not loaded: %s", e)
 
     if role == "chief_of_staff":
         if settings.knowledge.enabled:
