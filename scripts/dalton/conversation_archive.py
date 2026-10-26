@@ -3216,6 +3216,47 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
+async def _disconnect_workspace_manager_mcp(
+    wm: Any,
+    *,
+    timeout_s: float = POOL_CLOSE_TIMEOUT_S,
+) -> None:
+    """Concurrently disconnect owned builtin MCP registries across cached sessions without touching sandboxes."""
+    if wm is None:
+        return
+
+    async def _disconnect_one(sess: Any) -> None:
+        if getattr(sess, "_builtin_mcp_registry", None) and getattr(
+            sess, "_owns_mcp_registry", False
+        ):
+            try:
+                await sess._builtin_mcp_registry.disconnect_all()
+            except Exception as exc:
+                logger.warning(
+                    "Failed disconnecting builtin MCP registry during archive shutdown: %s",
+                    exc,
+                )
+
+    sessions = [
+        getattr(machine, "session", None)
+        for machine in list(getattr(wm, "_machines", {}).values())
+    ]
+    coros = [_disconnect_one(sess) for sess in sessions if sess is not None]
+    if not coros:
+        return
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(*coros),
+            timeout=timeout_s,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Timed out or failed disconnecting builtin MCP registries within %.1fs: %s",
+            timeout_s,
+            exc,
+        )
+
+
 async def _async_main(
     args: argparse.Namespace,
     *,
@@ -3264,9 +3305,16 @@ async def _async_main(
 
             wm = WorkspaceManager.current()
             if wm is not None:
+                await _disconnect_workspace_manager_mcp(
+                    wm,
+                    timeout_s=POOL_CLOSE_TIMEOUT_S,
+                )
                 await asyncio.wait_for(wm.shutdown(), timeout=POOL_CLOSE_TIMEOUT_S)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning(
+                "WorkspaceManager shutdown failed during archive exit: %s",
+                exc,
+            )
         if db_pool is not None:
             try:
                 await asyncio.wait_for(db_pool.close(), timeout=POOL_CLOSE_TIMEOUT_S)

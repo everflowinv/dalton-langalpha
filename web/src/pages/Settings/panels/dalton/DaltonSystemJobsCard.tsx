@@ -38,8 +38,17 @@ const SCOPE_LABELS: Record<DaltonSystemJobScope, { title: string; subtitle: stri
   },
   ops: {
     title: '运维任务（只读）',
-    subtitle: '宿主机 launchd 运维状态展示（数据库备份、日志轮转、后端看门狗）',
+    subtitle: '宿主机 launchd 运维状态展示（数据库备份、后端看门狗）',
   },
+};
+
+const DEFAULT_SCOPES: DaltonSystemJobScope[] = ['company', 'home', 'host', 'ops'];
+
+const SCOPE_SUMMARY_NAMES: Record<DaltonSystemJobScope, string> = {
+  company: '公司跟踪',
+  home: 'Home 全局',
+  host: '宿主机归档',
+  ops: '运维监控',
 };
 
 function formatTimeZh(iso: string | null | undefined): string {
@@ -53,6 +62,23 @@ function formatTimeZh(iso: string | null | undefined): string {
     minute: '2-digit',
     hour12: false,
   });
+}
+
+function formatDailyScheduleFromNextRun(iso: string | null | undefined): string | null {
+  if (!iso) return null;
+  const dt = new Date(iso);
+  if (Number.isNaN(dt.getTime())) return null;
+  const hh = String(dt.getHours()).padStart(2, '0');
+  const mm = String(dt.getMinutes()).padStart(2, '0');
+  return `每日 ${hh}:${mm}`;
+}
+
+function shouldShowJobLog(job: DaltonSystemJobItem): boolean {
+  if (!job.log_tail) return false;
+  if (job.exit_code != null) {
+    return job.exit_code !== 0 && job.exit_code !== 2;
+  }
+  return Boolean(job.last_result && job.last_result.includes('失败'));
 }
 
 function StatusBadge({ status }: { status: DaltonSystemJobStatus }) {
@@ -88,9 +114,14 @@ function StatusBadge({ status }: { status: DaltonSystemJobStatus }) {
   );
 }
 
-export function DaltonSystemJobsCard(): React.ReactElement {
+export function DaltonSystemJobsCard({
+  scopes = DEFAULT_SCOPES,
+}: {
+  scopes?: DaltonSystemJobScope[];
+} = {}): React.ReactElement {
   const [busyKey, setBusyKey] = useState<string | null>(null);
   const [banner, setBanner] = useState<{ type: 'info' | 'error'; text: string } | null>(null);
+  const [expandedLogKeys, setExpandedLogKeys] = useState<Record<string, boolean>>({});
 
   const { data, isLoading, isFetching, refetch, error: queryError } = useDaltonSystemJobs();
   const toggleMutation = useToggleDaltonSystemJob();
@@ -180,8 +211,6 @@ export function DaltonSystemJobsCard(): React.ReactElement {
         }
       : null);
 
-  const scopes: DaltonSystemJobScope[] = ['company', 'home', 'host', 'ops'];
-
   return (
     <div
       className="rounded-lg p-4"
@@ -197,7 +226,8 @@ export function DaltonSystemJobsCard(): React.ReactElement {
             自动任务
           </h4>
           <p className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
-            统一查看、开关与立即触发系统内所有自动运行任务（公司跟踪、Home 全局、宿主机归档、运维监控）
+            统一查看、开关与立即触发系统内所有自动运行任务（
+            {scopes.map((s) => SCOPE_SUMMARY_NAMES[s]).join('、')}）
           </p>
         </div>
         <button
@@ -254,6 +284,13 @@ export function DaltonSystemJobsCard(): React.ReactElement {
                     {groupJobs.map((job) => {
                       const isBusy = busyKey === job.key;
                       const isChecked = job.status === 'on';
+                      const displaySchedule =
+                        job.schedule ||
+                        (job.key === 'conversation-archive' || job.kind === 'conversation_archive'
+                          ? formatDailyScheduleFromNextRun(job.next_run_at)
+                          : null);
+                      const showLog = shouldShowJobLog(job);
+                      const isLogExpanded = Boolean(expandedLogKeys[job.key]);
                       return (
                         <div
                           key={job.key}
@@ -266,9 +303,9 @@ export function DaltonSystemJobsCard(): React.ReactElement {
                                 {job.title || job.key}
                               </span>
                               <StatusBadge status={job.status} />
-                              {job.schedule && (
+                              {displaySchedule && (
                                 <span className="text-[11px] text-muted-foreground">
-                                  ({job.schedule})
+                                  ({displaySchedule})
                                 </span>
                               )}
                             </div>
@@ -299,10 +336,30 @@ export function DaltonSystemJobsCard(): React.ReactElement {
                               </div>
                             )}
 
-                            {job.log_tail && (
-                              <pre className="mt-1 max-h-24 overflow-auto rounded bg-muted/60 p-1.5 font-mono text-[10px] text-muted-foreground">
-                                {job.log_tail}
-                              </pre>
+                            {showLog && (
+                              <div className="pt-0.5">
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    setExpandedLogKeys((prev) => ({
+                                      ...prev,
+                                      [job.key]: !prev[job.key],
+                                    }))
+                                  }
+                                  data-testid={`system-job-log-toggle-${job.key}`}
+                                  className="inline-flex items-center gap-1 rounded border border-border/50 bg-background px-1.5 py-0.5 text-[11px] text-muted-foreground hover:bg-muted/60 hover:text-foreground"
+                                >
+                                  {isLogExpanded ? '收起日志' : '查看日志'}
+                                </button>
+                                {isLogExpanded && (
+                                  <pre
+                                    data-testid={`system-job-log-${job.key}`}
+                                    className="mt-1 max-h-96 max-h-[24lh] overflow-auto rounded bg-muted/60 p-1.5 font-mono text-[10px] leading-4 text-muted-foreground"
+                                  >
+                                    {job.log_tail}
+                                  </pre>
+                                )}
+                              </div>
                             )}
                           </div>
 

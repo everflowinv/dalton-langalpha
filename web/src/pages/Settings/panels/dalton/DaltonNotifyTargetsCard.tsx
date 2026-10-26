@@ -183,7 +183,12 @@ export function DaltonNotifyTargetsCard(): React.ReactElement {
           }}
           placeholder="例如 feishu:user:ou_xxx 或 discord:user:123"
         />
-        <Button type="submit" size="sm" disabled={!prefsReady}>
+        <Button
+          type="submit"
+          size="sm"
+          disabled={!prefsReady}
+          className="shrink-0 whitespace-nowrap"
+        >
           <Plus className="mr-1 h-3.5 w-3.5" />
           添加
         </Button>

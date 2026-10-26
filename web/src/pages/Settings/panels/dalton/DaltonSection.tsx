@@ -6,7 +6,7 @@ import { DaltonSystemJobsCard } from './DaltonSystemJobsCard';
 import { FeishuReadScopesCard } from './FeishuReadScopesCard';
 import { ProviderStatusCard } from './ProviderStatusCard';
 
-export function DaltonSection() {
+export function DaltonSection({ advanced = false }: { advanced?: boolean } = {}) {
   return (
     <div className="flex flex-col gap-3">
       <DaltonInvitesCard />
@@ -14,7 +14,9 @@ export function DaltonSection() {
       <ProviderStatusCard />
       <DaltonBudgetCard />
       <DaltonNotifyTargetsCard />
-      <DaltonSystemJobsCard />
+      <DaltonSystemJobsCard
+        scopes={advanced ? ['company', 'home', 'host', 'ops'] : ['company', 'home']}
+      />
     </div>
   );
 }

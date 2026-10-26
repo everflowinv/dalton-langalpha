@@ -137,4 +137,32 @@ describe('FeishuReadScopesCard', () => {
       ]);
     });
   });
+
+  it('shows empty guidance when spaces list is empty and refetches on refresh click', async () => {
+    h.fetchDaltonFeishuReadScopes.mockResolvedValue({ scopes: [] });
+    h.fetchDaltonFeishuSpaces.mockResolvedValue({ spaces: [] });
+
+    renderWithQueryClient(<FeishuReadScopesCard />);
+
+    const refreshBtn = await screen.findByTestId('dalton-feishu-scopes-refresh-btn');
+    await waitFor(() => {
+      expect(h.fetchDaltonFeishuSpaces).toHaveBeenCalledTimes(1);
+    });
+
+    fireEvent.click(refreshBtn);
+    await waitFor(() => {
+      expect(h.fetchDaltonFeishuSpaces).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  it('shows API error when spaces request fails instead of empty guidance', async () => {
+    h.fetchDaltonFeishuReadScopes.mockResolvedValue({ scopes: [] });
+    h.fetchDaltonFeishuSpaces.mockRejectedValue({
+      response: { data: { detail: '桥接层不可达' } },
+    });
+
+    renderWithQueryClient(<FeishuReadScopesCard />);
+
+    expect(await screen.findByText('桥接层不可达')).toBeInTheDocument();
+  });
 });

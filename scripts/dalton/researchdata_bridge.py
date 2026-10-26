@@ -24,6 +24,7 @@ import hmac
 import json
 import logging
 import os
+import plistlib
 import re
 import shutil
 import signal
@@ -1047,10 +1048,40 @@ class BridgeConfig:
             )
         except ValueError:
             self.archive_run_timeout_s = 10800.0
-        self.ops_status_file: Path = Path(
+        self.launch_agents_dir: Path = Path(
             os.environ.get(
-                "DALTON_OPS_STATUS_FILE",
-                os.path.expanduser("~/.cache/dalton/ops-jobs-status.json"),
+                "DALTON_LAUNCH_AGENTS_DIR",
+                os.path.expanduser("~/Library/LaunchAgents"),
+            )
+        ).expanduser()
+        self.archive_plist_file: Path = Path(
+            os.environ.get(
+                "DALTON_ARCHIVE_PLIST_FILE",
+                str(self.launch_agents_dir / "com.dalton.conversation-archive.plist"),
+            )
+        ).expanduser()
+        self.pg_backup_plist_file: Path = Path(
+            os.environ.get(
+                "DALTON_PG_BACKUP_PLIST_FILE",
+                str(self.launch_agents_dir / "com.dalton.pg-backup.plist"),
+            )
+        ).expanduser()
+        self.pg_backup_log_file: Path = Path(
+            os.environ.get(
+                "DALTON_PG_BACKUP_LOG_FILE",
+                os.path.expanduser("~/Library/Logs/dalton-pg-backup.log"),
+            )
+        ).expanduser()
+        self.backend_watchdog_plist_file: Path = Path(
+            os.environ.get(
+                "DALTON_BACKEND_WATCHDOG_PLIST_FILE",
+                str(self.launch_agents_dir / "com.dalton.backend-watchdog.plist"),
+            )
+        ).expanduser()
+        self.watchdog_failures_file: Path = Path(
+            os.environ.get(
+                "DALTON_WATCHDOG_FAILURES_FILE",
+                os.path.expanduser("~/Backups/dalton/.watchdog_failures"),
             )
         ).expanduser()
         self.openclaw_gateway_url: str = (
@@ -7628,18 +7659,11 @@ class ResearchDataBridge:
         enabled: bool,
         now: datetime | None = None,
     ) -> str | None:
-        """Compute next daily 21:15 (`Asia/Shanghai`) run timestamp when enabled, else None."""
+        """Compute next run timestamp from the conversation-archive launchd plist when enabled, else None."""
         if not enabled:
             return None
-        try:
-            tz = ZoneInfo("Asia/Shanghai")
-        except Exception:
-            tz = timezone.utc
-        cur = (now or datetime.now(tz)).astimezone(tz)
-        candidate = cur.replace(hour=21, minute=15, second=0, microsecond=0)
-        if candidate <= cur:
-            candidate = candidate + timedelta(days=1)
-        return candidate.isoformat()
+        plist_data = self._load_plist_dict(self.cfg.archive_plist_file)
+        return self._compute_next_calendar_interval_iso(plist_data, now=now)
 
     def _archive_pid_files(self) -> list[Path]:
         """Return PID file path(s) in the same directory as the archive status/state files."""
@@ -7832,21 +7856,67 @@ class ResearchDataBridge:
                 return []
             return decoded.splitlines()[-max_lines:]
 
+    @staticmethod
+    def _slice_last_archive_run_lines(
+        lines: list[str],
+        *,
+        max_lines: int = 25,
+    ) -> list[str]:
+        """Slice ``lines`` from the last run header (``=== ...``, excluding ``=== exit...``) and keep its tail."""
+        start_idx = 0
+        for idx, line in enumerate(lines):
+            if line.startswith("=== ") and not line.startswith("=== exit"):
+                start_idx = idx
+        run_lines = lines[start_idx:]
+        if max_lines > 0 and len(run_lines) > max_lines:
+            return run_lines[-max_lines:]
+        return run_lines
+
     def _read_sanitized_archive_log_tail(self, *, max_len: int = 8192) -> str:
-        """Read complete tail lines of conversation-archive logs, sanitize secrets/paths first, then truncate to 8 KiB."""
+        """Return the sanitized tail (max 8 KiB) of the last conversation-archive run.
+
+        The launchd script and the bridge's manual run both write the whole run, stderr
+        included, to the stdout log under one ``=== <time>`` header, so the run is sliced
+        from there. The separate stderr log is read only when the stdout log is missing or
+        empty (an install that predates the merged log); a run header that scrolled out of
+        the scan window must not pull in another file's older lines.
+        """
         chunks: list[str] = []
-        mem_tail = self._archive_last_status.get("log_tail")
-        if isinstance(mem_tail, str) and mem_tail.strip():
-            chunks.append(mem_tail.strip())
-        for log_path in (self.cfg.archive_log_file, self.cfg.archive_err_log_file):
-            if not log_path.is_file():
-                continue
+        stdout_has_content = False
+        if self.cfg.archive_log_file.is_file():
             try:
-                lines = self._read_complete_tail_lines(log_path, max_lines=25)
-                if lines:
-                    chunks.append("\n".join(lines))
+                raw_stdout = self._read_complete_tail_lines(
+                    self.cfg.archive_log_file, max_lines=2000
+                )
+                stdout_has_content = any(line.strip() for line in raw_stdout)
+                stdout_lines = self._slice_last_archive_run_lines(
+                    raw_stdout, max_lines=25
+                )
+                if stdout_lines:
+                    chunks.append("\n".join(stdout_lines))
             except Exception:
-                continue
+                pass
+        if not stdout_has_content and self.cfg.archive_err_log_file.is_file():
+            try:
+                raw_stderr = self._read_complete_tail_lines(
+                    self.cfg.archive_err_log_file, max_lines=200
+                )
+                stderr_lines = self._slice_last_archive_run_lines(
+                    raw_stderr, max_lines=25
+                )
+                if stderr_lines:
+                    chunks.append("\n".join(stderr_lines))
+            except Exception:
+                pass
+        if not chunks:
+            mem_tail = self._archive_last_status.get("log_tail")
+            if isinstance(mem_tail, str) and mem_tail.strip():
+                mem_lines = self._slice_last_archive_run_lines(
+                    mem_tail.strip().splitlines(),
+                    max_lines=25,
+                )
+                if mem_lines:
+                    chunks.append("\n".join(mem_lines))
         combined = "\n".join(chunks).strip()
         if not combined:
             return ""
@@ -8009,6 +8079,8 @@ class ResearchDataBridge:
         if proc_exited:
             if log_fh is not None:
                 try:
+                    if isinstance(rc, int) and not isinstance(rc, bool):
+                        log_fh.write(f"=== exit {int(rc)}\n".encode("utf-8"))
                     log_fh.flush()
                 except Exception:
                     pass
@@ -8119,12 +8191,24 @@ class ResearchDataBridge:
             if repo_env.is_file():
                 for k, v in _read_env_file_dict(repo_env).items():
                     env_vars.setdefault(k, v)
+            env_vars["DALTON_BRIDGE_EMBED_URL"] = "http://127.0.0.1:8960/embed"
+            env_vars["no_proxy"] = (
+                f"localhost,127.0.0.1,::1,host.docker.internal,{env_vars.get('no_proxy', '')}"
+            )
 
             started_at = datetime.now(timezone.utc).isoformat()
             log_fh: Any = None
             try:
                 self.cfg.archive_log_file.parent.mkdir(parents=True, exist_ok=True)
                 log_fh = self.cfg.archive_log_file.open("ab")
+                ts_str = (
+                    datetime.now()
+                    .astimezone()
+                    .strftime("%Y-%m-%d %H:%M:%S %Z")
+                    .strip()
+                )
+                log_fh.write(f"=== {ts_str} attempt 1\n".encode("utf-8"))
+                log_fh.flush()
             except Exception as exc:
                 logger.warning("Failed opening archive log file: %s", type(exc).__name__)
                 log_fh = None
@@ -8172,6 +8256,14 @@ class ResearchDataBridge:
 
                 rc = getattr(proc, "returncode", None)
                 if rc == 2:
+                    if log_fh is not None:
+                        try:
+                            log_fh.write(b"=== exit 2\n")
+                            log_fh.flush()
+                            log_fh.close()
+                        except Exception:
+                            pass
+                        log_fh = None
                     self._write_archive_status_file(
                         {
                             "last_run_at": started_at,
@@ -8219,73 +8311,259 @@ class ResearchDataBridge:
                     if cleanup_cancelled is not None and startup_cancelled is None:
                         raise cleanup_cancelled
 
+    @staticmethod
+    def _probe_launchd_label_status(label: str) -> str:
+        """Return ``'on'`` if ``launchctl print gui/<uid>/<label>`` succeeds, ``'off'`` on non-zero exit, else ``'unknown'``."""
+        try:
+            uid = os.getuid()
+            res = subprocess.run(
+                ["launchctl", "print", f"gui/{uid}/{label}"],
+                capture_output=True,
+                text=True,
+                timeout=2.0,
+                check=False,
+            )
+            return "on" if res.returncode == 0 else "off"
+        except Exception:
+            return "unknown"
+
+    @staticmethod
+    def _load_plist_dict(path: Path) -> dict[str, Any] | None:
+        """Read a launchd plist file via ``plistlib`` and return its root dict, or ``None`` on error."""
+        try:
+            if not path.is_file():
+                return None
+            with path.open("rb") as fh:
+                data = plistlib.load(fh)
+            return data if isinstance(data, dict) else None
+        except Exception:
+            return None
+
+    @classmethod
+    def _resolve_host_tzinfo(
+        cls,
+        localtime_path: Path = Path("/etc/localtime"),
+        *,
+        fallback_now: datetime | None = None,
+    ) -> Any:
+        """Resolve host IANA timezone from ``/etc/localtime`` symlink via ``ZoneInfo``, falling back to ``datetime.now().astimezone().tzinfo``."""
+        for target_fn in (
+            lambda: os.readlink(localtime_path),
+            lambda: str(localtime_path.resolve()),
+        ):
+            try:
+                raw_target = target_fn()
+                marker = "zoneinfo/"
+                idx = raw_target.find(marker)
+                if idx != -1:
+                    iana_name = raw_target[idx + len(marker) :].strip("/")
+                    if iana_name:
+                        return ZoneInfo(iana_name)
+            except Exception:
+                continue
+        if fallback_now is not None and isinstance(fallback_now.tzinfo, ZoneInfo):
+            return fallback_now.tzinfo
+        return datetime.now().astimezone().tzinfo or timezone.utc
+
+    @classmethod
+    def _compute_next_calendar_interval_iso(
+        cls,
+        plist_data: dict[str, Any] | None,
+        *,
+        now: datetime | None = None,
+        localtime_path: Path = Path("/etc/localtime"),
+    ) -> str | None:
+        """Compute next run ISO 8601 timestamp in host local timezone from ``StartCalendarInterval``."""
+        if not isinstance(plist_data, dict):
+            return None
+        raw_interval = plist_data.get("StartCalendarInterval")
+        intervals: list[dict[str, Any]] = []
+        if isinstance(raw_interval, dict):
+            intervals.append(raw_interval)
+        elif isinstance(raw_interval, list):
+            intervals.extend(x for x in raw_interval if isinstance(x, dict))
+        if not intervals:
+            return None
+
+        for item in intervals:
+            if any(k in item for k in ("Weekday", "Day", "Month")):
+                return None
+
+        tz = cls._resolve_host_tzinfo(
+            localtime_path=localtime_path,
+            fallback_now=now,
+        )
+        now_local = (now or datetime.now(tz)).astimezone(tz)
+        candidates: list[datetime] = []
+        for item in intervals:
+            raw_hour = item.get("Hour")
+            raw_min = item.get("Minute", 0)
+            if not isinstance(raw_hour, int) or isinstance(raw_hour, bool):
+                continue
+            if not isinstance(raw_min, int) or isinstance(raw_min, bool):
+                continue
+            if not (0 <= raw_hour <= 23 and 0 <= raw_min <= 59):
+                continue
+            cand = datetime(
+                now_local.year,
+                now_local.month,
+                now_local.day,
+                raw_hour,
+                raw_min,
+                0,
+                tzinfo=tz,
+            )
+            if cand <= now_local:
+                next_day = now_local.date() + timedelta(days=1)
+                cand = datetime(
+                    next_day.year,
+                    next_day.month,
+                    next_day.day,
+                    raw_hour,
+                    raw_min,
+                    0,
+                    tzinfo=tz,
+                )
+            candidates.append(cand)
+        if not candidates:
+            return None
+        return min(candidates).isoformat()
+
+    def _inspect_pg_backup_job_sync(self) -> dict[str, Any]:
+        """Inspect ``com.dalton.pg-backup`` launchd status, log file, and schedule."""
+        job: dict[str, Any] = {
+            "key": "ops-db-backup",
+            "kind": "ops_db_backup",
+            "title": "数据库备份",
+            "status": "unknown",
+            "last_run_at": None,
+            "last_result": None,
+            "next_run_at": None,
+        }
+        try:
+            job["status"] = self._probe_launchd_label_status("com.dalton.pg-backup")
+        except Exception:
+            job["status"] = "unknown"
+
+        try:
+            log_path = self.cfg.pg_backup_log_file
+            if log_path.is_file():
+                lines = self._read_complete_tail_lines(log_path, max_lines=25)
+                non_empty = [ln.strip() for ln in lines if ln.strip()]
+                if non_empty:
+                    last_line = non_empty[-1]
+                    parts = last_line.split()
+                    if len(parts) >= 3:
+                        naive_dt = datetime.strptime(
+                            f"{parts[0]} {parts[1]}",
+                            "%Y-%m-%d %H:%M:%S",
+                        )
+                        job["last_run_at"] = naive_dt.astimezone().isoformat()
+                        status_tok = parts[2].lower()
+                        if status_tok == "ok":
+                            size_tok = (
+                                parts[3]
+                                if len(parts) >= 4
+                                and not parts[3].startswith(("/", "~"))
+                                else ""
+                            )
+                            res_text = f"成功（{size_tok}）" if size_tok else "成功"
+                        else:
+                            res_text = "失败"
+                        job["last_result"] = _scrub_local_paths(res_text)
+        except Exception:
+            pass
+
+        try:
+            plist_data = self._load_plist_dict(self.cfg.pg_backup_plist_file)
+            job["next_run_at"] = self._compute_next_calendar_interval_iso(plist_data)
+        except Exception:
+            pass
+
+        return job
+
+    def _inspect_backend_watchdog_job_sync(self) -> dict[str, Any]:
+        """Inspect ``com.dalton.backend-watchdog`` launchd status, failures file, and next interval."""
+        job: dict[str, Any] = {
+            "key": "ops-backend-watchdog",
+            "kind": "ops_backend_watchdog",
+            "title": "后端看门狗",
+            "status": "unknown",
+            "last_run_at": None,
+            "last_result": None,
+            "next_run_at": None,
+        }
+        try:
+            job["status"] = self._probe_launchd_label_status("com.dalton.backend-watchdog")
+        except Exception:
+            job["status"] = "unknown"
+
+        start_interval = 60
+        try:
+            plist_data = self._load_plist_dict(self.cfg.backend_watchdog_plist_file)
+            if isinstance(plist_data, dict):
+                raw_iv = plist_data.get("StartInterval")
+                if isinstance(raw_iv, int) and not isinstance(raw_iv, bool) and raw_iv > 0:
+                    start_interval = raw_iv
+        except Exception:
+            pass
+
+        try:
+            failures_path = self.cfg.watchdog_failures_file
+            if failures_path.is_file():
+                mtime = failures_path.stat().st_mtime
+                last_run_dt = datetime.fromtimestamp(mtime).astimezone()
+                job["last_run_at"] = last_run_dt.isoformat()
+                raw_text = failures_path.read_text(encoding="utf-8", errors="replace").strip()
+                if raw_text.isascii() and raw_text.isdigit():
+                    count = int(raw_text)
+                    job["last_result"] = "健康" if count == 0 else f"连续失败 {count} 次"
+                else:
+                    job["last_result"] = None
+                job["next_run_at"] = (
+                    last_run_dt + timedelta(seconds=start_interval)
+                ).isoformat()
+        except Exception:
+            pass
+
+        return job
+
+    def _collect_ops_jobs_sync(self) -> list[dict[str, Any]]:
+        """Synchronously inspect host launchd operational jobs (intended to run via ``asyncio.to_thread``)."""
+        return [
+            self._inspect_pg_backup_job_sync(),
+            self._inspect_backend_watchdog_job_sync(),
+        ]
+
     async def handle_get_ops_jobs(self) -> tuple[int, dict[str, Any]]:
         """Handle `GET /jobs/ops` for read-only host operational jobs."""
-        default_ops = [
-            {
-                "key": "ops-db-backup",
-                "kind": "ops_db_backup",
-                "title": "数据库备份",
-                "status": "unknown",
-                "last_run_at": None,
-                "last_result": None,
-                "next_run_at": None,
-            },
-            {
-                "key": "ops-log-rotate",
-                "kind": "ops_log_rotate",
-                "title": "日志轮转",
-                "status": "unknown",
-                "last_run_at": None,
-                "last_result": None,
-                "next_run_at": None,
-            },
-            {
-                "key": "ops-backend-watchdog",
-                "kind": "ops_backend_watchdog",
-                "title": "后端看门狗",
-                "status": "unknown",
-                "last_run_at": None,
-                "last_result": None,
-                "next_run_at": None,
-            },
-        ]
-        if not self.cfg.ops_status_file.is_file():
-            return 200, {"ok": True, "jobs": default_ops}
         try:
-            raw = json.loads(self.cfg.ops_status_file.read_text(encoding="utf-8"))
-            by_key = raw.get("jobs") if isinstance(raw, dict) else raw
-            mapped: dict[str, dict[str, Any]] = {}
-            if isinstance(by_key, dict):
-                for k, v in by_key.items():
-                    if isinstance(v, dict):
-                        mapped[str(k)] = v
-            elif isinstance(by_key, list):
-                for item in by_key:
-                    if isinstance(item, dict) and item.get("key"):
-                        mapped[str(item["key"])] = item
-            out: list[dict[str, Any]] = []
-            for item in default_ops:
-                override = mapped.get(item["key"]) or {}
-                raw_st = str(override.get("status") or "unknown").strip().lower()
-                st = raw_st if raw_st in ("on", "off", "partial", "unknown") else "unknown"
-                last_res = override.get("last_result")
-                out.append(
-                    {
-                        **item,
-                        "status": st,
-                        "last_run_at": override.get("last_run_at"),
-                        "last_result": (
-                            _scrub_local_paths(sanitize_stderr_text(str(last_res), max_len=200))
-                            if last_res is not None
-                            else None
-                        ),
-                        "next_run_at": override.get("next_run_at"),
-                    }
-                )
-            return 200, {"ok": True, "jobs": out}
+            jobs = await asyncio.to_thread(self._collect_ops_jobs_sync)
+            return 200, {"ok": True, "jobs": jobs}
         except Exception:
-            return 200, {"ok": True, "jobs": default_ops}
+            return 200, {
+                "ok": True,
+                "jobs": [
+                    {
+                        "key": "ops-db-backup",
+                        "kind": "ops_db_backup",
+                        "title": "数据库备份",
+                        "status": "unknown",
+                        "last_run_at": None,
+                        "last_result": None,
+                        "next_run_at": None,
+                    },
+                    {
+                        "key": "ops-backend-watchdog",
+                        "kind": "ops_backend_watchdog",
+                        "title": "后端看门狗",
+                        "status": "unknown",
+                        "last_run_at": None,
+                        "last_result": None,
+                        "next_run_at": None,
+                    },
+                ],
+            }
 
     def _invoke_openclaw_gateway(self, payload: dict[str, Any]) -> dict[str, Any]:
         """POST ``payload`` to OpenClaw ``/tools/invoke`` bypassing proxies and never logging tokens."""

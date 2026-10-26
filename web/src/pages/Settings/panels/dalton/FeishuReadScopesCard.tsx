@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Save } from 'lucide-react';
+import { RefreshCw, Save } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { Button } from '@/components/ui/button';
 import { useTeamCredentials } from '@/hooks/useTeamCredentials';
@@ -135,16 +135,29 @@ export function FeishuReadScopesCard(): React.ReactElement | null {
             {t('auth.feishuScopes.subtitle')}
           </p>
         </div>
-        <Button
-          type="button"
-          size="sm"
-          onClick={() => saveMutation.mutate()}
-          disabled={saveMutation.isPending || !dirty}
-          data-testid="dalton-feishu-scopes-save-btn"
-        >
-          <Save className="mr-1.5 h-3.5 w-3.5" />
-          {saveMutation.isPending ? t('auth.feishuScopes.saving') : t('auth.feishuScopes.save')}
-        </Button>
+        <div className="flex shrink-0 items-center gap-2">
+          <button
+            type="button"
+            onClick={() => void spacesQuery.refetch()}
+            disabled={spacesQuery.isFetching}
+            data-testid="dalton-feishu-scopes-refresh-btn"
+            className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md border border-border/60 bg-background px-2.5 py-1 text-xs font-medium hover:bg-muted/60 disabled:opacity-50"
+          >
+            <RefreshCw className={`h-3.5 w-3.5 ${spacesQuery.isFetching ? 'animate-spin' : ''}`} />
+            {t('auth.feishuScopes.refresh', '刷新')}
+          </button>
+          <Button
+            type="button"
+            size="sm"
+            onClick={() => saveMutation.mutate()}
+            disabled={saveMutation.isPending || !dirty}
+            data-testid="dalton-feishu-scopes-save-btn"
+            className="shrink-0 whitespace-nowrap"
+          >
+            <Save className="mr-1.5 h-3.5 w-3.5" />
+            {saveMutation.isPending ? t('auth.feishuScopes.saving') : t('auth.feishuScopes.save')}
+          </Button>
+        </div>
       </div>
 
       {error && (
@@ -158,9 +171,15 @@ export function FeishuReadScopesCard(): React.ReactElement | null {
           {t('common.loading')}
         </p>
       ) : spaces.length === 0 ? (
-        <p className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
-          {spacesError ?? t('auth.feishuScopes.empty')}
-        </p>
+        spacesError ? (
+          <p className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
+            {spacesError}
+          </p>
+        ) : (
+          <p className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
+            {t('auth.feishuScopes.empty')}
+          </p>
+        )
       ) : (
         <div className="flex flex-col gap-1.5" data-testid="dalton-feishu-scopes-list">
           {spaces.map((space) => {

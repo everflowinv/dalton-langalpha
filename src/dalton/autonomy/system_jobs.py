@@ -52,12 +52,6 @@ DEFAULT_OPS_JOBS: list[dict[str, Any]] = [
         "description": "宿主机 launchd 定时备份 PostgreSQL 数据库",
     },
     {
-        "key": "ops-log-rotate",
-        "kind": "ops_log_rotate",
-        "title": "日志轮转",
-        "description": "宿主机 launchd 定时清理与归档运行日志",
-    },
-    {
         "key": "ops-backend-watchdog",
         "kind": "ops_backend_watchdog",
         "title": "后端看门狗",
@@ -203,8 +197,8 @@ async def _fetch_host_conversation_archive_job() -> dict[str, Any]:
         "kind": "conversation_archive",
         "scope": "host",
         "title": "团队对话归档",
-        "description": "每日 21:15 在宿主机增量抽取 OpenClaw 团队对话并写入投研记忆库",
-        "schedule": "每日 21:15",
+        "description": "每日在宿主机增量抽取 OpenClaw 团队对话并写入投研记忆库",
+        "schedule": None,
         "status": "unknown",
         "last_run_at": None,
         "last_result": None,

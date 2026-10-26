@@ -30,7 +30,6 @@ from src.dalton.tools.director_tools import build_director_tools
 from src.server.utils.api import get_current_user_id
 
 
-
 @pytest.fixture(autouse=True)
 def _empty_coverage_roster(monkeypatch: pytest.MonkeyPatch) -> None:
     """Tier lookups read the per-user coverage roster; these tests' fake
@@ -647,7 +646,7 @@ async def test_ops_jobs_fallback_to_unknown_without_raising(
     manifest = await system_jobs_mod.list_system_jobs(USER_ID)
     assert manifest["ok"] is True
     ops_jobs = [j for j in manifest["jobs"] if j["scope"] == "ops"]
-    assert len(ops_jobs) == 3
+    assert [j["key"] for j in ops_jobs] == ["ops-db-backup", "ops-backend-watchdog"]
     for item in ops_jobs:
         assert item["status"] == "unknown"
         assert item["can_toggle"] is False
@@ -1348,7 +1347,8 @@ async def test_bridge_state_write_oserror_returns_500_and_ok_false_and_cookie_ov
         f"from pathlib import Path\nPath({str(marker_file)!r}).write_text('ran', encoding='utf-8')\n",
         encoding="utf-8",
     )
-    corrupt_res = subprocess.run(
+    corrupt_res = await asyncio.to_thread(
+        subprocess.run,
         ["/bin/bash", str(script_path)],
         env={
             **os.environ,
@@ -1384,7 +1384,8 @@ async def test_bridge_state_write_oserror_returns_500_and_ok_false_and_cookie_ov
     assert pid_file.read_text(encoding="utf-8").strip() == str(live_winner_pid)
 
     # Losing `archive_daily.sh` side sees live winner PID under flock, exits without overwriting or deleting winner PID
-    busy_res = subprocess.run(
+    busy_res = await asyncio.to_thread(
+        subprocess.run,
         ["/bin/bash", str(script_path)],
         env={
             **os.environ,
@@ -1598,6 +1599,7 @@ async def test_bridge_admin_token_separation_and_backend_callers(
     fails closed when admin token is unset, and backend callers (`embedder.py`, `system_jobs.py`) use `get_dalton_bridge_admin_token()`.
     """
     import httpx
+
     import src.dalton.conversations.embedder as embedder_mod
     import src.dalton.settings as settings_mod
 
@@ -1816,9 +1818,9 @@ def test_plugins_config_and_sandbox_env_exclude_bridge_admin_token(
     2) carrying admin token in URL (and headers);
     3) carrying admin token in startup args.
     """
-    import src.ptc_agent.config.plugins as plugins_mod
-    from src.ptc_agent.core.sandbox.ptc_sandbox import PTCSandbox
-    from src.ptc_agent.core.tool_generator import ToolFunctionGenerator
+    import ptc_agent.config.plugins as plugins_mod
+    from ptc_agent.core.sandbox.ptc_sandbox import PTCSandbox
+    from ptc_agent.core.tool_generator import ToolFunctionGenerator
 
     admin_secret = "super-secret-bridge-admin-token-do-not-leak"
     mcp_secret = "sandbox-mcp-token-allowed"
@@ -1934,6 +1936,377 @@ def test_plugins_config_and_sandbox_env_exclude_bridge_admin_token(
     assert env_when_unset.get("SAFE_VAR") == "safe-value"
     assert all(s.enabled is True for s in clean_loaded)
     assert "enabled" not in cfg_when_unset["servers"]["clean_mcp_srv"]
+
+
+@pytest.mark.asyncio
+async def test_realtime_ops_jobs_and_archive_last_run_log_slice(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify real-time ops jobs inspection (pg-backup + backend-watchdog, no ops-log-rotate),
+    archive log tail slicing from the last `=== ` run header, and host schedule metadata.
+    """
+    import plistlib
+    from datetime import datetime, timedelta
+
+    pg_log = tmp_path / "dalton-pg-backup.log"
+    pg_plist = tmp_path / "com.dalton.pg-backup.plist"
+    wd_plist = tmp_path / "com.dalton.backend-watchdog.plist"
+    wd_failures = tmp_path / ".watchdog_failures"
+    archive_log = tmp_path / "dalton-conversation-archive.log"
+
+    pg_log.write_text(
+        "2026-10-25 04:00:01 ok 750M /Users/alice/Backups/dalton-pg-20261025-040000.dump\n"
+        "2026-10-26 07:42:19 ok 784M /Users/alice/Backups/dalton-pg-20261026-074111.dump\n\n",
+        encoding="utf-8",
+    )
+    pg_plist.write_bytes(
+        plistlib.dumps(
+            {
+                "Label": "com.dalton.pg-backup",
+                "StartCalendarInterval": {"Hour": 4, "Minute": 30},
+            }
+        )
+    )
+    wd_plist.write_bytes(
+        plistlib.dumps(
+            {
+                "Label": "com.dalton.backend-watchdog",
+                "StartInterval": 60,
+            }
+        )
+    )
+    wd_failures.write_text("0\n", encoding="utf-8")
+
+    monkeypatch.setenv("DALTON_PG_BACKUP_LOG_FILE", str(pg_log))
+    monkeypatch.setenv("DALTON_PG_BACKUP_PLIST_FILE", str(pg_plist))
+    monkeypatch.setenv("DALTON_BACKEND_WATCHDOG_PLIST_FILE", str(wd_plist))
+    monkeypatch.setenv("DALTON_WATCHDOG_FAILURES_FILE", str(wd_failures))
+    monkeypatch.setenv("DALTON_ARCHIVE_LOG_FILE", str(archive_log))
+
+    cfg = bridge_mod.BridgeConfig()
+    bridge = bridge_mod.ResearchDataBridge(cfg)
+
+    real_subprocess_run = subprocess.run
+    expected_uid = os.getuid()
+    expected_cmds = {
+        ("launchctl", "print", f"gui/{expected_uid}/com.dalton.pg-backup"),
+        ("launchctl", "print", f"gui/{expected_uid}/com.dalton.backend-watchdog"),
+    }
+
+    def _fake_subprocess_run(
+        cmd: list[str],
+        *,
+        capture_output: bool = False,
+        text: bool = False,
+        timeout: float | None = None,
+        check: bool = False,
+    ) -> subprocess.CompletedProcess[str]:
+        assert tuple(cmd) in expected_cmds
+        assert timeout == 2.0
+        assert capture_output is True
+        assert text is True
+        assert check is False
+        target = cmd[2]
+        if target.endswith("/com.dalton.pg-backup"):
+            return subprocess.CompletedProcess(cmd, 0, stdout="state = waiting\n", stderr="")
+        return subprocess.CompletedProcess(cmd, 113, stdout="", stderr="Could not find service")
+
+    monkeypatch.setattr(
+        bridge_mod.subprocess,
+        "run",
+        create_autospec(real_subprocess_run, side_effect=_fake_subprocess_run),
+    )
+
+    code, payload = await bridge.handle_get_ops_jobs()
+    assert code == 200
+    assert payload["ok"] is True
+    jobs = payload["jobs"]
+    assert [j["key"] for j in jobs] == ["ops-db-backup", "ops-backend-watchdog"]
+
+    db_job = jobs[0]
+    assert db_job["status"] == "on"
+    assert db_job["last_result"] == "成功（784M）"
+    assert "/Users/alice" not in str(db_job["last_result"])
+    parsed_db_last = datetime.fromisoformat(db_job["last_run_at"])
+    assert parsed_db_last.tzinfo is not None
+    assert (parsed_db_last.year, parsed_db_last.month, parsed_db_last.day) == (2026, 10, 26)
+    assert (parsed_db_last.hour, parsed_db_last.minute, parsed_db_last.second) == (7, 42, 19)
+    parsed_db_next = datetime.fromisoformat(db_job["next_run_at"])
+    assert parsed_db_next.tzinfo is not None
+    assert (parsed_db_next.hour, parsed_db_next.minute) == (4, 30)
+
+    wd_job = jobs[1]
+    assert wd_job["status"] == "off"
+    assert wd_job["last_result"] == "健康"
+    parsed_wd_last = datetime.fromisoformat(wd_job["last_run_at"])
+    parsed_wd_next = datetime.fromisoformat(wd_job["next_run_at"])
+    assert parsed_wd_next - parsed_wd_last == timedelta(seconds=60)
+
+    # Check failure formatting for pg-backup and backend-watchdog, plus timeout -> unknown
+    pg_log.write_text(
+        "2026-10-26 08:00:00 fail 0B /Users/alice/Backups/dalton-pg-failed.dump\n",
+        encoding="utf-8",
+    )
+    wd_failures.write_text("3\n", encoding="utf-8")
+
+    def _timeout_subprocess_run(
+        cmd: list[str],
+        *,
+        capture_output: bool = False,
+        text: bool = False,
+        timeout: float | None = None,
+        check: bool = False,
+    ) -> subprocess.CompletedProcess[str]:
+        assert tuple(cmd) in expected_cmds
+        assert timeout == 2.0
+        assert capture_output is True
+        assert text is True
+        assert check is False
+        raise subprocess.TimeoutExpired(cmd=cmd, timeout=2.0)
+
+    monkeypatch.setattr(
+        bridge_mod.subprocess,
+        "run",
+        create_autospec(real_subprocess_run, side_effect=_timeout_subprocess_run),
+    )
+
+    _, payload_fail = await bridge.handle_get_ops_jobs()
+    db_fail, wd_fail = payload_fail["jobs"]
+    assert db_fail["status"] == "unknown"
+    assert db_fail["last_result"] == "失败"
+    assert wd_fail["status"] == "unknown"
+    assert wd_fail["last_result"] == "连续失败 3 次"
+
+    # Non-negative integer check on watchdog failures: negative or arbitrary text sets last_result=None
+    for invalid_content in ("-1\n", "corrupted /Users/alice/secret\n", ""):
+        wd_failures.write_text(invalid_content, encoding="utf-8")
+        _, payload_invalid = await bridge.handle_get_ops_jobs()
+        assert payload_invalid["jobs"][1]["last_result"] is None
+
+    # Verify _read_sanitized_archive_log_tail slices from the last `=== ` run header (not `=== exit`)
+    # and ignores stderr file when stdout has a `=== ` boundary
+    archive_err_log = tmp_path / "dalton-conversation-archive.err.log"
+    cfg.archive_err_log_file = archive_err_log
+    archive_err_log.write_text("STALE_STDERR_FROM_OTHER_RUN\n", encoding="utf-8")
+    archive_log.write_text(
+        "=== 2026-10-25 21:15:00 EDT attempt 1\n"
+        "OLD_RUN_ERROR_LINE_SHOULD_NOT_APPEAR\n"
+        "=== exit 1\n"
+        "=== 2026-10-26 21:15:00 EDT attempt 1\n"
+        "latest run line 1\n"
+        "=== exit 0\n",
+        encoding="utf-8",
+    )
+    tail = bridge._read_sanitized_archive_log_tail()
+    assert "OLD_RUN_ERROR_LINE_SHOULD_NOT_APPEAR" not in tail
+    assert "STALE_STDERR_FROM_OTHER_RUN" not in tail
+    assert "=== 2026-10-25 21:15:00 EDT attempt 1" not in tail
+    assert "=== 2026-10-26 21:15:00 EDT attempt 1" in tail
+    assert "latest run line 1" in tail
+    assert "=== exit 0" in tail
+
+    # When stdout has no `=== ` boundary (e.g. empty), stderr is used as fallback
+    archive_log.write_text("", encoding="utf-8")
+    fallback_tail = bridge._read_sanitized_archive_log_tail()
+    assert "STALE_STDERR_FROM_OTHER_RUN" in fallback_tail
+
+    # Verify _compute_next_calendar_interval_iso across DST boundary (2026-10-31 -> 2026-11-01 04:30 in America/New_York is -05:00)
+    from zoneinfo import ZoneInfo
+
+    ny_tz = ZoneInfo("America/New_York")
+    fake_localtime = tmp_path / "localtime"
+    fake_localtime.symlink_to("/var/db/timezone/zoneinfo/America/New_York")
+    now_before_dst_end = datetime(2026, 10, 31, 12, 0, 0, tzinfo=ny_tz)
+    next_iso_dst = bridge_mod.ResearchDataBridge._compute_next_calendar_interval_iso(
+        {"StartCalendarInterval": {"Hour": 4, "Minute": 30}},
+        now=now_before_dst_end,
+        localtime_path=fake_localtime,
+    )
+    assert next_iso_dst == "2026-11-01T04:30:00-05:00"
+
+    # Weekday / Day / Month in StartCalendarInterval returns None
+    for unsupported_key in ("Weekday", "Day", "Month"):
+        assert (
+            bridge_mod.ResearchDataBridge._compute_next_calendar_interval_iso(
+                {"StartCalendarInterval": {"Hour": 4, "Minute": 30, unsupported_key: 1}},
+                now=now_before_dst_end,
+                localtime_path=fake_localtime,
+            )
+            is None
+        )
+
+    # Verify _compute_next_archive_run_at reads archive plist (and returns None when disabled)
+    archive_plist = tmp_path / "com.dalton.conversation-archive.plist"
+    archive_plist.write_bytes(
+        plistlib.dumps(
+            {
+                "Label": "com.dalton.conversation-archive",
+                "StartCalendarInterval": {"Hour": 21, "Minute": 15},
+            }
+        )
+    )
+    cfg.archive_plist_file = archive_plist
+    assert bridge._compute_next_archive_run_at(enabled=False, now=now_before_dst_end) is None
+    archive_next_iso = bridge._compute_next_archive_run_at(enabled=True, now=now_before_dst_end)
+    assert archive_next_iso is not None
+    parsed_archive_next = datetime.fromisoformat(archive_next_iso)
+    assert (parsed_archive_next.hour, parsed_archive_next.minute) == (21, 15)
+
+    # Verify _fetch_host_conversation_archive_job has schedule=None and no hardcoded 21:15 in description
+    monkeypatch.setattr(
+        system_jobs_mod,
+        "_call_host_bridge",
+        create_autospec(
+            system_jobs_mod._call_host_bridge,
+            return_value=(
+                200,
+                {
+                    "ok": True,
+                    "enabled": True,
+                    "status": "on",
+                    "last_run_at": "2026-10-26T01:15:00+00:00",
+                    "exit_code": 0,
+                    "last_result": "成功 (exit_code=0)",
+                    "log_tail": tail,
+                    "next_run_at": "2026-10-27T01:15:00+00:00",
+                    "running": False,
+                },
+            ),
+        ),
+    )
+    host_item = await system_jobs_mod._fetch_host_conversation_archive_job()
+    assert host_item["schedule"] is None
+    assert "21:15" not in host_item["description"]
+
+
+@pytest.mark.asyncio
+async def test_archive_disconnects_only_owned_builtin_mcp_registry_and_archive_daily_retry(
+    tmp_path: Path,
+) -> None:
+    """Verify `_disconnect_workspace_manager_mcp` only disconnects owned `_builtin_mcp_registry`
+    (never borrowed `_builtin_mcp_registry` or composite `mcp_registry`), and `archive_daily.sh`
+    retries once on exit code 3 with `=== <time> attempt N` / `=== exit <rc>` boundaries.
+    """
+    from types import SimpleNamespace
+
+    import scripts.dalton.conversation_archive as archive_mod
+    from src.ptc_agent.core.mcp_registry import MCPRegistry
+    from src.ptc_agent.core.session import Session
+
+    sess_owned = create_autospec(Session, instance=True)
+    sess_owned._builtin_mcp_registry = create_autospec(MCPRegistry, instance=True)
+    sess_owned._owns_mcp_registry = True
+    sess_owned.mcp_registry = create_autospec(MCPRegistry, instance=True)
+
+    sess_borrowed = create_autospec(Session, instance=True)
+    sess_borrowed._builtin_mcp_registry = create_autospec(MCPRegistry, instance=True)
+    sess_borrowed._owns_mcp_registry = False
+    sess_borrowed.mcp_registry = create_autospec(MCPRegistry, instance=True)
+
+    wm_stub = SimpleNamespace(
+        _machines={
+            "ws-owned": SimpleNamespace(session=sess_owned),
+            "ws-borrowed": SimpleNamespace(session=sess_borrowed),
+        }
+    )
+
+    await archive_mod._disconnect_workspace_manager_mcp(wm_stub, timeout_s=5.0)
+
+    sess_owned._builtin_mcp_registry.disconnect_all.assert_awaited_once()
+    sess_borrowed._builtin_mcp_registry.disconnect_all.assert_not_called()
+    sess_owned.mcp_registry.disconnect_all.assert_not_called()
+    sess_borrowed.mcp_registry.disconnect_all.assert_not_called()
+    sess_owned.cleanup.assert_not_called()
+    sess_owned.stop.assert_not_called()
+    sess_borrowed.cleanup.assert_not_called()
+    sess_borrowed.stop.assert_not_called()
+
+    # Verify archive_daily.sh retries on rc=3 (attempt 1 -> rc 3, attempt 2 -> rc 0) and writes final status
+    script_path = (
+        Path(__file__).resolve().parents[3]
+        / "scripts"
+        / "dalton"
+        / "launchd"
+        / "archive_daily.sh"
+    )
+    state_file = tmp_path / "state.json"
+    status_file = tmp_path / "status.json"
+    pid_file = tmp_path / "archive.pid"
+    count_file = tmp_path / "attempts.txt"
+    fake_py_script = tmp_path / "fake_archive_retry.py"
+    state_file.write_text('{"enabled": true}\n', encoding="utf-8")
+    fake_py_script.write_text(
+        "import os, sys\n"
+        "from pathlib import Path\n"
+        f"p = Path({str(count_file)!r})\n"
+        "n = int(p.read_text()) + 1 if p.is_file() else 1\n"
+        "p.write_text(str(n))\n"
+        "print(f'embed={os.environ.get(\"DALTON_BRIDGE_EMBED_URL\")} no_proxy={os.environ.get(\"no_proxy\")}')\n"
+        "sys.exit(3 if n == 1 else 0)\n",
+        encoding="utf-8",
+    )
+    res = await asyncio.to_thread(
+        subprocess.run,
+        ["/bin/bash", str(script_path)],
+        env={
+            **os.environ,
+            "DALTON_ARCHIVE_STATE_FILE": str(state_file),
+            "DALTON_ARCHIVE_STATUS_FILE": str(status_file),
+            "DALTON_ARCHIVE_PID_FILE": str(pid_file),
+            "DALTON_CONVERSATION_ARCHIVE_PY": str(fake_py_script),
+            "DALTON_ARCHIVE_RETRY_SLEEP_S": "0",
+        },
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert res.returncode == 0
+    assert res.stdout.count("=== ") == 2  # one run header and one final exit line
+    assert "--- attempt 1 exit 3" in res.stdout
+    assert "--- attempt 2 exit 0" in res.stdout
+    assert res.stdout.rstrip().endswith("=== exit 0")
+    assert "embed=http://127.0.0.1:8960/embed" in res.stdout
+    assert "host.docker.internal" in res.stdout
+    saved_status = json.loads(status_file.read_text(encoding="utf-8"))
+    assert saved_status["exit_code"] == 0
+
+    # Switched off while waiting to retry: attempt 2 does not run, final rc stays 3.
+    count_file.unlink()
+    fake_py_script.write_text(
+        "import sys\n"
+        "from pathlib import Path\n"
+        f"p = Path({str(count_file)!r})\n"
+        "n = int(p.read_text()) + 1 if p.is_file() else 1\n"
+        "p.write_text(str(n))\n"
+        f"Path({str(state_file)!r}).write_text('{{\"enabled\": false}}')\n"
+        "sys.exit(3)\n",
+        encoding="utf-8",
+    )
+    state_file.write_text('{"enabled": true}\n', encoding="utf-8")
+    res_off = await asyncio.to_thread(
+        subprocess.run,
+        ["/bin/bash", str(script_path)],
+        env={
+            **os.environ,
+            "DALTON_ARCHIVE_STATE_FILE": str(state_file),
+            "DALTON_ARCHIVE_STATUS_FILE": str(status_file),
+            "DALTON_ARCHIVE_PID_FILE": str(pid_file),
+            "DALTON_CONVERSATION_ARCHIVE_PY": str(fake_py_script),
+            "DALTON_ARCHIVE_RETRY_SLEEP_S": "0",
+        },
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert res_off.returncode == 3
+    assert count_file.read_text() == "1"
+    assert "retry skipped: archive was switched off" in res_off.stdout
+    assert json.loads(status_file.read_text(encoding="utf-8"))["exit_code"] == 3
+
+
 
 
 

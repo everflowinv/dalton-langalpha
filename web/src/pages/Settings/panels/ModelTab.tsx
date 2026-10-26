@@ -730,7 +730,7 @@ export function ModelTab() {
         </div>
 
         {/* DALTON-HOOK(settings-section): OpenClaw model sync & Dalton daily USD budget */}
-        <DaltonSection />
+        <DaltonSection advanced={isAdvanced} />
 
         {saveStatus !== 'idle' && (
           <div className="flex items-center justify-end pt-2">
