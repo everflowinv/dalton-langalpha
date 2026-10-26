@@ -364,6 +364,12 @@ async def arun_subagent_streaming(
     # ends. Either configurable can reach the run: the explicit one when it
     # carries checkpoint coordinates (``ensure_config`` then discards the
     # ambient one), the ambient one when it does not, so each is stripped.
+    # DALTON-HOOK(subagent-caps): start the subagent's own deadline clock only
+    # after its concurrency slot is held, never while waiting in the queue.
+    if bg_task is not None:
+        from src.dalton.subagent_slots import wait_for_subagent_slot
+
+        await wait_for_subagent_slot(bg_task, registry=registry)
     config = _without_stream_tee(config)
     config = _with_own_deadline(config, time_limit)
     # Built here, under the launcher's run, so the subagent's trace nests

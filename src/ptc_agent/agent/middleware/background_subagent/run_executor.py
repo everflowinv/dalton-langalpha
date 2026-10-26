@@ -30,6 +30,12 @@ from ptc_agent.agent.middleware.background_subagent.registry import (
     BackgroundTask,
     BackgroundTaskRegistry,
 )
+# DALTON-HOOK(subagent-caps): wait for Redis slot before graph execution and release in finally.
+from src.dalton.subagent_slots import (
+    abort_queued_subagent_on_cancel,
+    release_subagent_slot,
+    wait_for_subagent_slot,
+)
 
 if TYPE_CHECKING:
     from src.tools.decorators import ToolUsageTracker
@@ -197,8 +203,12 @@ async def _run_background_task(
         set_tool_tracker(tool_tracker)
         try:
             async with _child_credit_lane(task, tracker, tool_tracker, label):
+                # DALTON-HOOK(subagent-caps): wait until a Redis slot lease is held
+                # before invoking the subagent handler, and release it in finally.
+                await wait_for_subagent_slot(task, registry=registry)
                 return await handler(request)
         finally:
+            await release_subagent_slot(task)
             # The astream loop sends a held delta only once it is due, so the
             # run's last one is still held here. It goes out before the
             # outcome is judged on the stream's health: a spill that fails
@@ -263,6 +273,9 @@ async def _run_background_task(
         )
         return {"success": True, "result": result}
     except asyncio.CancelledError:
+        # DALTON-HOOK(subagent-caps): cancel a still-queued handler immediately
+        # so cancellation while queued finishes without waiting for a slot.
+        abort_queued_subagent_on_cancel(task)
         logger.info(
             "%s cancellation requested; continuing",
             label,
@@ -351,6 +364,9 @@ async def _settle_terminal_run(
     successor (who can only acquire after the release) always writes
     "running" after this writer's terminal state — never under it.
     """
+    # DALTON-HOOK(subagent-caps): ensure slot/queue entry is released on every
+    # terminal settle path (including cancelled-before-spawn).
+    await release_subagent_slot(task)
     # Ledger CAS first (durable truth), still under N(task:id) so
     # finalize-vs-successor ordering matches the meta's guarantee. A
     # failed CAS is left to orphan recovery — the row stays

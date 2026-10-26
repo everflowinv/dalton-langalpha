@@ -674,6 +674,14 @@ class WorkflowDriver:
         """
         task = run.task
         try:
+            # DALTON-HOOK(subagent-caps): child_timeout starts when the slot is
+            # acquired, not while queued waiting for a slot.
+            from src.dalton.subagent_slots import (
+                wait_until_subagent_slot_acquired,
+            )
+
+            if await wait_until_subagent_slot_acquired(task):
+                run.started_at = time.time()
             result = await asyncio.wait_for(
                 asyncio.shield(task.asyncio_task),
                 timeout=self.spec.caps.child_timeout,

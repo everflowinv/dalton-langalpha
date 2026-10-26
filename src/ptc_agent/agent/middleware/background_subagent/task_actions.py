@@ -37,6 +37,8 @@ from ptc_agent.agent.middleware.background_subagent.spawn import (
     spawn_task_writer,
     stopped_launch_artifact,
 )
+# DALTON-HOOK(subagent-caps): surface queued status in Task tool results.
+from src.dalton.subagent_slots import format_task_launch_status
 
 if TYPE_CHECKING:
     from ptc_agent.agent.middleware.background_subagent.middleware import (
@@ -625,12 +627,16 @@ async def _handle_resume(
         # can retry.
         mw._resume_claims.discard(task.task_id)
 
+    # DALTON-HOOK(subagent-caps): report queued status when waiting for a slot.
+    status_line = format_task_launch_status(
+        task, default="Running (resumed with full previous context)"
+    )
     short_description = _truncate_description(description, max_sentences=2)
     pseudo_result = (
         f"Resumed **{task.display_id}** in background with new instructions.\n"
         f"- Type: {task.subagent_type}\n"
         f"- New task: {short_description}\n"
-        f"- Status: Running (resumed with full previous context)\n\n"
+        f"- Status: {status_line}\n\n"
         f"You will be notified when it finishes."
     )
 
@@ -757,12 +763,16 @@ async def _handle_init(
         return failure
 
     # Return immediate pseudo-result with Task-N format
+    # DALTON-HOOK(subagent-caps): report queued status when waiting for a slot.
+    status_line = format_task_launch_status(
+        task, default="Running in background"
+    )
     short_description = _truncate_description(description, max_sentences=2)
     pseudo_result = (
         f"Background subagent deployed: **{task.display_id}**\n"
         f"- Type: {subagent_type}\n"
         f"- Task: {short_description}\n"
-        f"- Status: Running in background\n\n"
+        f"- Status: {status_line}\n\n"
         f"You will be notified when it finishes."
     )
 
