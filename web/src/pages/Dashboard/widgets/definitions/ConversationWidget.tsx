@@ -155,6 +155,8 @@ function ConversationWidget({ instance }: WidgetRenderProps<ConversationConfig>)
           }}
         >
           <ChatInput
+            // DALTON-HOOK(composer-drafts): persist dashboard conversation widget draft per workspace or fallback key
+            draftKey={selectedWorkspaceId ? `ws:${selectedWorkspaceId}:new` : 'dashboard:new'}
             onSend={handleSend}
             disabled={isLoading}
             scope={scope}

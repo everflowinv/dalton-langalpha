@@ -1753,6 +1753,8 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                       />
                       <ChatInput
                         ref={chatInputRef}
+                        // DALTON-HOOK(composer-drafts): persist draft per thread or per workspace new chat
+                        draftKey={panelThreadId ? `thread:${panelThreadId}` : (workspaceId ? `ws:${workspaceId}:new` : undefined)}
                         onSend={handleSendWithAttachments}
                         hasExternalContext={chartSelectionChips.length > 0}
                         disabled={isLoadingHistory || !workspaceId || !!pendingInterrupt}

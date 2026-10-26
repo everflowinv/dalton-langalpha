@@ -499,7 +499,8 @@ function MarketViewInner() {
           title: t('marketView.chatHistory.noWorkspace'),
           description: t('agents.market.noWorkspaceToast'),
         });
-        return;
+        // DALTON-HOOK(composer-drafts): signal failed send so ChatInput restores the draft
+        return false;
       }
 
       navigate(`/chat/t/__default__`, {
@@ -525,6 +526,8 @@ function MarketViewInner() {
         title: t('common.error'),
         description: t('agents.market.setupFailed'),
       });
+      // DALTON-HOOK(composer-drafts): signal failed send so ChatInput restores the draft
+      return false;
     }
     setChartImage(null);
     setChartImageDesc(null);
@@ -645,7 +648,13 @@ function MarketViewInner() {
               </div>
             )}
             <ChatInput
-              onSend={(...args: any[]) => { (handleSendMessage as any)(...args); setChatExpanded(false); }}
+              // DALTON-HOOK(composer-drafts): persist draft for main market view mobile composer and forward send result
+              draftKey="market:main"
+              onSend={async (...args: any[]) => {
+                const sent = await (handleSendMessage as any)(...args);
+                if (sent !== false) setChatExpanded(false);
+                return sent;
+              }}
               scope={scope}
               onScopeChange={setScope}
               model={threadModel.model}

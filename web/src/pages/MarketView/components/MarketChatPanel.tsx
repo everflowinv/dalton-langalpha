@@ -48,6 +48,8 @@ import { chartSelectionStore, useChartSelections, isConfirmedFor } from '../stor
 import { buildChartSelectionSend } from '../utils/selectionSend';
 import { SelectionChips } from './SelectionChips';
 import { marketViewAnnotationContext } from '../constants/annotationPrompt';
+// DALTON-HOOK(composer-drafts): clear new-chat draft on explicit New Chat action
+import { clear as clearChatDraft } from '@/lib/dalton/chatDrafts';
 import './MarketPanel.css';
 
 /** Compact status banner shown above the input (interrupt, compaction, etc.). */
@@ -210,6 +212,10 @@ function MarketChatScope(props: MarketChatPanelProps): React.ReactElement {
 
   const handleStartNewChat = useCallback(() => {
     clearMarketThreadId(activeWorkspaceId, symbol);
+    // DALTON-HOOK(composer-drafts): clear new-chat draft and cancel pending save on explicit New Chat
+    if (activeWorkspaceId) {
+      clearChatDraft(`market:panel:${activeWorkspaceId}:${(symbol || 'default').toUpperCase()}`);
+    }
     // Force a remount even if we were already on __default__ — append a
     // monotonic suffix that's stripped before passing to useChatMessages.
     setActiveThreadInit(`__default__#${Date.now()}`);
@@ -946,6 +952,8 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
       {/* Input */}
       <ChatInput
         ref={chatInputRef}
+        // DALTON-HOOK(composer-drafts): persist draft per market panel thread or workspace+symbol
+        draftKey={threadId && threadId !== '__default__' ? `market:panel:${threadId}` : `market:panel:${activeWorkspaceId}:${(symbol || 'default').toUpperCase()}`}
         onSend={handleSend as never}
         disabled={isLoadingHistory || !!pendingInterrupt}
         onStop={handleStop}

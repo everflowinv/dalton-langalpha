@@ -41,6 +41,8 @@ import { useFileAttachments } from './chat-input.useFileAttachments';
 import { modelProfile } from '@/lib/modelPreferences';
 import { readSubagentsDefault } from '@/lib/subagentsDefault';
 import { formatContextBlock } from './chat-input.contextBlocks';
+// DALTON-HOOK(composer-drafts): persist unsent composer draft text across view/thread switches
+import { useComposerDraft } from '@/lib/dalton/chatDrafts';
 
 /** Autosize cap for the composer textarea; past this the box scrolls. */
 const MAX_TEXTAREA_HEIGHT = 200;
@@ -64,7 +66,13 @@ export interface ChatInputHandle {
 
 
 export interface ChatInputProps {
-  onSend: (message: string, attachments: ReadyAttachment[], slashCommands: SlashCommand[], modelOptions: ModelOptions) => void;
+  // DALTON-HOOK(composer-drafts): allow onSend to return false or a rejected promise to preserve draft on failure
+  onSend: (
+    message: string,
+    attachments: ReadyAttachment[],
+    slashCommands: SlashCommand[],
+    modelOptions: ModelOptions,
+  ) => void | boolean | Promise<void | boolean>;
   disabled?: boolean;
   isLoading?: boolean;
   /**
@@ -128,6 +136,8 @@ export interface ChatInputProps {
    * the overflow menu with it, so the model label gives up the room instead.
    */
   toolbarStatus?: React.ReactNode;
+  // DALTON-HOOK(composer-drafts): storage key suffix for persisting unsent composer draft text
+  draftKey?: string;
 }
 
 /* --- MAIN COMPONENT --- */
@@ -174,6 +184,8 @@ function ChatInput({
   // Minimum visible rows for the textarea (default 1 = compact; pass 2 for roomier non-ChatView callsites)
   minRows = 1,
   toolbarStatus = null,
+  // DALTON-HOOK(composer-drafts): storage key suffix for persisting unsent composer draft text
+  draftKey,
   ref,
 }: ChatInputProps & { ref?: React.Ref<ChatInputHandle> }) {
   const { t } = useTranslation();
@@ -182,7 +194,16 @@ function ChatInput({
   const marketWatchEnabled = useFeatureEnabled('market_watch');
   const { validModelNames, metadata: modelMetadata, isLoading: modelsLoading } = useAllModels();
   const otherPref = (preferences as Record<string, Record<string, unknown>> | null)?.other_preference;
-  const [message, setMessage] = useState('');
+  // DALTON-HOOK(composer-drafts): persist unsent composer text in localStorage when draftKey is set
+  const resetRichDraftRef = useRef<() => void>(() => {});
+  const handleDraftKeySwitch = useCallback(() => {
+    resetRichDraftRef.current();
+  }, []);
+  const { message, setMessage, clearCurrentDraft, submitWithDraft } = useComposerDraft({
+    draftKey,
+    prefillMessage,
+    onDraftKeySwitch: handleDraftKeySwitch,
+  });
   const { attachedFiles, setAttachedFiles, isDragging, handleFiles, removeFile, onDragOver, onDragLeave, onDrop, handlePaste } = useFileAttachments();
   const [watchMode, setWatchMode] = useState(false);
   // The toggle state survives the feature going off (the pill just hides), so
@@ -296,6 +317,14 @@ function ChatInput({
     close: closeSlash, reset: resetSlash, handleKeyDown: slashKeyDown,
   } = slash;
 
+  // DALTON-HOOK(composer-drafts): clear transient mention/slash pills when switching draftKey on a mounted input
+  useEffect(() => {
+    resetRichDraftRef.current = () => {
+      resetMentions();
+      resetSlash();
+    };
+  }, [resetMentions, resetSlash]);
+
   // Voice input (speech recognition) — see chat-input.useVoiceInput.
   const { isListening, toggleListening, stopListening } = useVoiceInput({ message, setMessage, isLoading });
 
@@ -355,7 +384,8 @@ function ChatInput({
       });
       setTimeout(() => textareaRef.current?.focus(), 0);
     },
-  }), [pillModel, resolvedEffort, resolvedFastMode, effectiveMarketWatch, setMentionedFiles]);
+    // DALTON-HOOK(composer-drafts): include setMessage from useComposerDraft
+  }), [pillModel, resolvedEffort, resolvedFastMode, effectiveMarketWatch, setMentionedFiles, setMessage]);
 
   // Subscribe to ContextBus so this input mirrors the global widget-context
   // deck. Multiple chat inputs can be visible simultaneously (hero card +
@@ -389,12 +419,13 @@ function ChatInput({
   }, []);
 
   // Prefill support
+  // DALTON-HOOK(composer-drafts): include setMessage from useComposerDraft
   useEffect(() => {
     if (prefillMessage) {
       setMessage(prefillMessage);
       onClearPrefill?.();
     }
-  }, [prefillMessage, onClearPrefill]);
+  }, [prefillMessage, onClearPrefill, setMessage]);
 
   // These picks used to be device-local, which meant server-started turns never
   // saw them. Lift what this device still holds into the account profile, then
@@ -499,7 +530,8 @@ function ChatInput({
     // A live /slash trigger wins: the two menus never show at once.
     if (detectSlash(val, cursorPos)) closeMentions();
     else detectMention(val, cursorPos);
-  }, [pruneSlash, pruneMentions, detectSlash, detectMention, closeMentions]);
+    // DALTON-HOOK(composer-drafts): include setMessage from useComposerDraft
+  }, [pruneSlash, pruneMentions, detectSlash, detectMention, closeMentions, setMessage]);
 
   // Close both autocompletes on blur
   const handleBlur = useCallback(() => {
@@ -523,7 +555,8 @@ function ChatInput({
       actionCommands.forEach((c) => onAction?.(c));
       // Fully reset the draft, same as a normal send — an action must not leave
       // staged attachments / mentions / widget context behind for the next turn.
-      setMessage('');
+      // DALTON-HOOK(composer-drafts): clear stored composer draft on successful send
+      clearCurrentDraft();
       resetSlash();
       attachedFiles.forEach((f) => { if (f.preview) URL.revokeObjectURL(f.preview); });
       setAttachedFiles([]);
@@ -553,15 +586,17 @@ function ChatInput({
       const blocks = snippetMentions.map((f) => formatContextBlock(f, t));
       finalMessage = finalMessage.trimEnd() + '\n' + blocks.join('\n');
     }
-    onSend(finalMessage, readyAttachments, slashCommands, {
-      model: pillModel,
-      reasoningEffort: resolvedEffort,
-      fastMode: resolvedFastMode,
-      marketWatch: effectiveMarketWatch,
-      subagentsAllowed: draftSubagents,
-      widgetSnapshots: widgetSnapshots.length ? widgetSnapshots : undefined,
-    });
-    setMessage('');
+    // DALTON-HOOK(composer-drafts): clear input immediately, then remove stored draft only when onSend succeeds
+    submitWithDraft(() =>
+      onSend(finalMessage, readyAttachments, slashCommands, {
+        model: pillModel,
+        reasoningEffort: resolvedEffort,
+        fastMode: resolvedFastMode,
+        marketWatch: effectiveMarketWatch,
+        subagentsAllowed: draftSubagents,
+        widgetSnapshots: widgetSnapshots.length ? widgetSnapshots : undefined,
+      }),
+    );
     attachedFiles.forEach(f => { if (f.preview) URL.revokeObjectURL(f.preview); });
     setAttachedFiles([]);
     resetMentions();
@@ -576,9 +611,10 @@ function ChatInput({
     if (textareaRef.current) {
       textareaRef.current.style.height = 'auto';
     }
+    // DALTON-HOOK(composer-drafts): include draft helpers in handleSend deps
   }, [hasContent, disabled, message, effectiveMarketWatch, draftSubagents, attachedFiles, setAttachedFiles, onSend, onAction,
     mentionedFiles, resetMentions, slashCommands, resetSlash,
-    pillModel, resolvedEffort, resolvedFastMode, widgetSnapshots, t]);
+    pillModel, resolvedEffort, resolvedFastMode, widgetSnapshots, t, clearCurrentDraft, submitWithDraft]);
 
   // --- Keyboard & Language Detection ---
   const handleKeyDown = useCallback((e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -614,7 +650,8 @@ function ChatInput({
         handleSend();
       }
     }
-  }, [slashKeyDown, mentionKeyDown, mentionsOpen, handleSend, isListening, stopListening, message]);
+    // DALTON-HOOK(composer-drafts): include setMessage from useComposerDraft
+  }, [slashKeyDown, mentionKeyDown, mentionsOpen, handleSend, isListening, stopListening, message, setMessage]);
 
   /* --- Progressive toolbar folding ---
    *
