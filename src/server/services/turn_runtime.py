@@ -79,6 +79,18 @@ async def requested_workspace(
     workspace = await get_workspace(workspace_id)
     if workspace is None and is_home_id(user_id, workspace_id):
         return None
+    # --- DALTON-HOOK(workspace-sharing-settings): begin ---
+    if workspace is not None and str(workspace.get("user_id")) != str(user_id):
+        from src.dalton.settings import is_dalton_supabase_auth_enabled
+
+        if is_dalton_supabase_auth_enabled():
+            from src.dalton.sharing import require_workspace_access
+
+            await require_workspace_access(
+                workspace, user_id, channel="web", need="read", workspace=workspace
+            )
+            raise HTTPException(status_code=403, detail="该功能下一期开放")
+    # --- DALTON-HOOK(workspace-sharing-settings): end ---
     # A fresh thread id must not run inside another user's workspace. The
     # report-back dispatch sets X-User-Id to the owner, so it passes.
     require_workspace_owner(workspace, user_id=user_id)

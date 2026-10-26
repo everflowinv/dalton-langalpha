@@ -44,8 +44,9 @@ export function useRightPanel({
   messages,
   subagentTranscripts = NO_TRANSCRIPTS,
   watching = false,
-  // DALTON-HOOK(team-sharing): prevent preview sandbox startup in read-only mode
+  // DALTON-HOOK(workspace-sharing-settings): prevent preview sandbox startup for colleague workspaces
   readOnly = false,
+  isColleague = readOnly,
 }: {
   isMobile: boolean;
   workspaceId: string;
@@ -64,8 +65,9 @@ export function useRightPanel({
   subagentTranscripts?: readonly (readonly TranscriptMessage[])[];
   /** A market watch is running, so a watch call's row opens its live Status tab. */
   watching?: boolean;
-  // DALTON-HOOK(team-sharing): prevent preview sandbox startup in read-only mode
+  // DALTON-HOOK(workspace-sharing-settings): prevent preview sandbox startup for colleague workspaces
   readOnly?: boolean;
+  isColleague?: boolean;
 }) {
   const location = useLocation();
   const navigate = useNavigate();
@@ -439,8 +441,8 @@ export function useRightPanel({
    * sibling (`data.workspaceId`) runs there and is asked for there.
    */
   const handleOpenPreview = useCallback((data: PreviewData) => {
-    // DALTON-HOOK(team-sharing): do not open preview or start sandbox in read-only mode
-    if (readOnly) return;
+    // DALTON-HOOK(workspace-sharing-settings): do not open preview or start sandbox for colleagues
+    if (isColleague) return;
     const appWorkspaceId = data.workspaceId ?? workspaceId;
     if (!isMobile) {
       const land = () => landInFilePanel(
@@ -476,8 +478,8 @@ export function useRightPanel({
     if (data.loading && !data.url && appWorkspaceId) {
       resolveAndSetPreview(appWorkspaceId, data.port, data.command, data.path);
     }
-  // DALTON-HOOK(team-sharing): read-only for a teammate's workspace
-  }, [readOnly, isMobile, landInFilePanel, filePanelWorkspaceId, leaveFiles, setFilePanelWorkspaceId, applyPanelWidth, pushPanelHistory, workspaceId, resolveAndSetPreview]);
+  // DALTON-HOOK(workspace-sharing-settings): colleague check for a teammate's workspace
+  }, [isColleague, isMobile, landInFilePanel, filePanelWorkspaceId, leaveFiles, setFilePanelWorkspaceId, applyPanelWidth, pushPanelHistory, workspaceId, resolveAndSetPreview]);
 
   /**
    * An `/a/` link in a reply, opened as the panel tab its item already has:
@@ -616,8 +618,8 @@ export function useRightPanel({
       return;
     }
     const artifact = toolCallProcess.toolCallResult?.artifact as Record<string, unknown> | undefined;
-    // DALTON-HOOK(team-sharing): in read-only mode, show tool detail instead of starting preview sandbox
-    if (!readOnly && artifact?.type === 'preview_url' && artifact.port && workspaceId) {
+    // DALTON-HOOK(workspace-sharing-settings): for colleagues, show tool detail instead of starting preview sandbox
+    if (!isColleague && artifact?.type === 'preview_url' && artifact.port && workspaceId) {
       const port = artifact.port as number;
       const title = artifact.title as string | undefined;
       const command = artifact.command as string | undefined;
@@ -653,8 +655,8 @@ export function useRightPanel({
     applyPanelWidth(detailPanelWidth(toolCallProcess));
     setRightPanelType('detail');
     pushPanelHistory();
-  // DALTON-HOOK(team-sharing): read-only for a teammate's workspace
-  }, [readOnly, isMobile, getToolCallProcess, landInFilePanel, applyPanelWidth, pushPanelHistory, workspaceId, handleOpenPreview, watching]);
+  // DALTON-HOOK(workspace-sharing-settings): colleague check for a teammate's workspace
+  }, [isColleague, isMobile, getToolCallProcess, landInFilePanel, applyPanelWidth, pushPanelHistory, workspaceId, handleOpenPreview, watching]);
 
   // Close the mobile detail sheet
   const handleCloseDetailPanel = useCallback(() => {

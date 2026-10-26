@@ -5641,6 +5641,16 @@
       "cashBadge": "Cash",
       "tosRiskBadge": "ToS Risk",
       "nativeModelsSectionTitle": "Native model sync (subscription catalog)"
+    },
+    "sharing": {
+      "title": "Sharing Settings",
+      "cosLabel": "Others' Chief of Staff",
+      "webLabel": "Others' Web UI",
+      "levelRw": "Read & Write",
+      "levelRo": "Read Only",
+      "levelHidden": "Hidden",
+      "homeNote": "Home workspace is never open to others",
+      "nextPhaseNotice": "Available in the next phase"
     }
   }
 }

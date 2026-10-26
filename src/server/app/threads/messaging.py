@@ -447,6 +447,22 @@ async def _handle_send_message(
         thread_meta = await get_thread_auth_meta(thread_id) if thread_id else None
         owner_id = thread_meta["user_id"] if thread_meta else None
         if owner_id is not None and owner_id != user_id:
+            # --- DALTON-HOOK(workspace-sharing-settings): begin ---
+            from src.dalton.settings import is_dalton_supabase_auth_enabled
+
+            if is_dalton_supabase_auth_enabled():
+                from src.dalton.sharing import require_thread_access
+
+                await require_thread_access(
+                    thread_id,
+                    user_id,
+                    channel="web",
+                    need="read",
+                    owner_id=str(owner_id),
+                    workspace_id=thread_meta.get("workspace_id"),
+                )
+                raise HTTPException(status_code=403, detail="该功能下一期开放")
+            # --- DALTON-HOOK(workspace-sharing-settings): end ---
             raise HTTPException(status_code=403, detail="Forbidden")
 
         # A fork deletes rows from the turn it replaces, and that turn is the
@@ -959,23 +975,25 @@ async def replay_thread_messages(
         # Preserve existing 404/403 semantics from require_thread_owner
         if rows is None:
             raise HTTPException(status_code=404, detail="Thread not found")
-        # --- DALTON-HOOK(team-sharing): begin ---
+        # --- DALTON-HOOK(workspace-sharing-settings): begin ---
         from src.dalton.settings import is_dalton_supabase_auth_enabled
 
         is_non_owner_reader = False
         if is_dalton_supabase_auth_enabled():
-            from src.dalton.sharing import require_thread_reader
+            from src.dalton.sharing import require_thread_access
 
-            await require_thread_reader(
+            await require_thread_access(
                 thread_id,
                 x_user_id,
+                channel="web",
+                need="read",
                 owner_id=rows.owner_id,
                 workspace_id=rows.thread.get("workspace_id"),
             )
             is_non_owner_reader = rows.owner_id != x_user_id
         elif rows.owner_id != x_user_id:
             raise HTTPException(status_code=403, detail="Forbidden")
-        # --- DALTON-HOOK(team-sharing): end ---
+        # --- DALTON-HOOK(workspace-sharing-settings): end ---
 
         from src.server.services.history.replay import (
             CheckpointReplayUnavailable,

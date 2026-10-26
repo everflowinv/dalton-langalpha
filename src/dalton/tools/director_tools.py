@@ -300,7 +300,7 @@ def build_director_tools(
         user_id = str(configurable.get("user_id") or "").strip()
         if not user_id:
             raise ValueError("user_id is required")
-        await verify_workspace_access(workspace_id, user_id)
+        await verify_workspace_access(workspace_id, user_id, need="write", channel="cos")
         try:
             from src.dalton.database.knowledge import latest_version
             from src.dalton.knowledge.service import apply_update
@@ -388,7 +388,7 @@ def build_director_tools(
         user_id = str(configurable.get("user_id") or "").strip()
         if not user_id:
             raise ValueError("user_id is required")
-        await verify_workspace_access(workspace_id, user_id)
+        await verify_workspace_access(workspace_id, user_id, need="write", channel="cos")
         try:
             from src.dalton.database import knowledge as db_knowledge
             from src.dalton.knowledge import service as knowledge_service

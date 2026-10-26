@@ -76,16 +76,24 @@ async def workspaces_list(user_id: str, tool_call_id: str) -> Command:
         workspaces = [
             {**ws, "dir_name": folder_on(ws, computer_id)} for ws in workspaces
         ]
-        content = json.dumps(
-            {
-                "success": True,
-                "workspaces": [
-                    {field: ws.get(field) for field in _LISTED_WORKSPACE_FIELDS}
-                    for ws in workspaces
-                ],
-            },
-            default=str,
-        )
+        payload: dict[str, object] = {
+            "success": True,
+            "workspaces": [
+                {field: ws.get(field) for field in _LISTED_WORKSPACE_FIELDS}
+                for ws in workspaces
+            ],
+        }
+        # --- DALTON-HOOK(workspace-sharing-settings): begin ---
+        from src.dalton.settings import is_dalton_supabase_auth_enabled
+
+        if is_dalton_supabase_auth_enabled():
+            from src.dalton.sharing import list_colleague_cos_workspaces
+
+            payload["colleague_workspaces"] = await list_colleague_cos_workspaces(
+                user_id
+            )
+        # --- DALTON-HOOK(workspace-sharing-settings): end ---
+        content = json.dumps(payload, default=str)
     except Exception as e:
         logger.error(f"Failed to list workspaces: {e}")
         content = json.dumps({"success": False, "error": "failed to list workspaces"})
@@ -335,7 +343,10 @@ async def threads_stop(
                 "returned, or leave it out.",
                 tool_call_id,
             )
-    if err := await verify_thread_owner(thread_id, user_id, tool_call_id):
+    # DALTON-HOOK(workspace-sharing-settings): stop/delete thread requires ownership
+    if err := await verify_thread_owner(
+        thread_id, user_id, tool_call_id, owner_only=True
+    ):
         return err
 
     from src.server.services.cancel_dispatch import cancel_workflow
@@ -371,7 +382,10 @@ async def threads_delete(
             "thread_id is required for delete action", tool_call_id
         )
 
-    if err := await verify_thread_owner(thread_id, user_id, tool_call_id):
+    # DALTON-HOOK(workspace-sharing-settings): stop/delete thread requires ownership
+    if err := await verify_thread_owner(
+        thread_id, user_id, tool_call_id, owner_only=True
+    ):
         return err
 
     approved, _ = hitl_confirm(
@@ -445,3 +459,269 @@ async def threads_delete(
     except Exception as e:
         logger.error(f"Failed to delete thread: {e}")
         return error_command("failed to delete thread", tool_call_id)
+
+
+# --- DALTON-HOOK(workspace-sharing-settings): begin ---
+async def workspace_files_list_cos(
+    user_id: str,
+    workspace_id: str | None,
+    path: str | None,
+    tool_call_id: str,
+) -> Command:
+    """List files in a workspace via Chief of Staff (`cos_access in ('ro', 'rw')`)."""
+    if not workspace_id:
+        return error_command("workspace_id is required for list_files", tool_call_id)
+    if err := await verify_workspace_owner(
+        workspace_id, user_id, tool_call_id, need="read"
+    ):
+        return err
+    try:
+        from src.server.app.workspace_files._shared import (
+            _acquire_sandbox_to_change,
+            _is_non_owner_blocked_path,
+            _normalize_requested_path,
+            owner_work_dir,
+            previous_dir_names_of,
+        )
+        from src.server.app.workspace_files.crud import _live_listing
+        from src.server.database.workspace import get_workspace
+        from src.server.models.workspace import served_from_mirror
+        from src.server.services.persistence.file import FilePersistenceService
+
+        ws = await get_workspace(workspace_id)
+        if not ws:
+            return error_command("workspace not found", tool_call_id)
+        work_dir = owner_work_dir(ws)
+        previous_dirs = previous_dir_names_of(ws)
+        normalized_path = _normalize_requested_path(
+            path or ".", work_dir, previous_dirs
+        )
+        if normalized_path and _is_non_owner_blocked_path(normalized_path):
+            return success_command(
+                {"success": True, "workspace_id": workspace_id, "files": []},
+                tool_call_id,
+            )
+
+        if served_from_mirror(ws.get("status")):
+            file_tree = await FilePersistenceService.get_file_tree(workspace_id)
+            if normalized_path:
+                file_tree = [
+                    f
+                    for f in file_tree
+                    if f["path"].startswith(normalized_path + "/")
+                    or f["path"] == normalized_path
+                ]
+            files = [
+                f["path"]
+                for f in file_tree
+                if not _is_non_owner_blocked_path(f["path"])
+            ]
+        else:
+            owner_id = str(ws.get("user_id") or user_id)
+            async with _acquire_sandbox_to_change(workspace_id, owner_id) as (
+                sandbox,
+                live_ws,
+            ):
+                files = await _live_listing(
+                    sandbox,
+                    live_ws,
+                    path or ".",
+                    "**/*",
+                    False,
+                    is_non_owner=True,
+                )
+        return success_command(
+            {"success": True, "workspace_id": workspace_id, "files": files},
+            tool_call_id,
+        )
+    except Exception as e:
+        logger.error(f"Failed to list workspace files for CoS: {e}")
+        return error_command("failed to list workspace files", tool_call_id)
+
+
+async def workspace_file_read_cos(
+    user_id: str,
+    workspace_id: str | None,
+    path: str | None,
+    tool_call_id: str,
+) -> Command:
+    """Read a file from a workspace via Chief of Staff (`cos_access in ('ro', 'rw')`)."""
+    if not workspace_id:
+        return error_command("workspace_id is required for read_file", tool_call_id)
+    if not path:
+        return error_command("path is required for read_file", tool_call_id)
+    if err := await verify_workspace_owner(
+        workspace_id, user_id, tool_call_id, need="read"
+    ):
+        return err
+    try:
+        from fastapi import HTTPException
+        from src.server.app.workspace_files._shared import (
+            _acquire_sandbox_to_change,
+            _decode_file_text,
+            _is_binary,
+            _is_non_owner_blocked_path,
+            _normalize_requested_path,
+            _to_client_path,
+            http_file_text,
+            owner_work_dir,
+            previous_dir_names_of,
+        )
+        from src.server.app.workspace_files.crud import _read_contained_target
+        from src.server.database.workspace import get_workspace
+        from src.server.models.workspace import served_from_mirror
+        from src.server.services.persistence.file import FilePersistenceService
+        from src.server.utils.secret_redactor import (
+            get_redactor,
+            get_vault_secrets_for_redaction,
+        )
+
+        ws = await get_workspace(workspace_id)
+        if not ws:
+            return error_command("workspace not found", tool_call_id)
+        work_dir = owner_work_dir(ws)
+        previous_dirs = previous_dir_names_of(ws)
+        normalized_path = _normalize_requested_path(path, work_dir, previous_dirs)
+        if not normalized_path or _is_non_owner_blocked_path(normalized_path):
+            return error_command("file not found", tool_call_id)
+
+        owner_id = str(ws.get("user_id") or user_id)
+        if served_from_mirror(ws.get("status")):
+            file_record = await FilePersistenceService.get_file_content(
+                workspace_id, normalized_path
+            )
+            if not file_record:
+                return error_command("file not found", tool_call_id)
+            if file_record.get("is_binary"):
+                return error_command("cannot read binary file as text", tool_call_id)
+
+            text_content = await http_file_text(file_record, user_id=owner_id)
+            out_path = normalized_path
+        else:
+            async with _acquire_sandbox_to_change(workspace_id, owner_id) as (
+                sandbox,
+                live_ws,
+            ):
+                work_dir = owner_work_dir(live_ws)
+                previous_dirs = previous_dir_names_of(live_ws)
+                try:
+                    normalized, raw_bytes = await _read_contained_target(
+                        sandbox, path, work_dir, previous_dirs
+                    )
+                except HTTPException:
+                    return error_command("file not found", tool_call_id)
+
+            client_path = _to_client_path(sandbox, normalized, work_dir)
+            if _is_non_owner_blocked_path(client_path):
+                return error_command("file not found", tool_call_id)
+            if _is_binary(normalized):
+                return error_command("cannot read binary file as text", tool_call_id)
+            decoded = _decode_file_text(raw_bytes)
+            if decoded is None:
+                return error_command("cannot read binary file as text", tool_call_id)
+            text_content = decoded
+            out_path = client_path
+
+        vault_secrets = await get_vault_secrets_for_redaction(owner_id)
+        text_content = get_redactor().redact(text_content, vault_secrets=vault_secrets)
+        return success_command(
+            {
+                "success": True,
+                "workspace_id": workspace_id,
+                "path": out_path,
+                "content": text_content,
+            },
+            tool_call_id,
+        )
+    except Exception as e:
+        logger.error(f"Failed to read workspace file for CoS: {e}")
+        return error_command("failed to read workspace file", tool_call_id)
+
+
+async def workspace_file_write_cos(
+    user_id: str,
+    workspace_id: str | None,
+    path: str | None,
+    content: str | None,
+    tool_call_id: str,
+) -> Command:
+    """Write a text file in a workspace via Chief of Staff (`cos_access == 'rw'`)."""
+    if not workspace_id:
+        return error_command("workspace_id is required for write_file", tool_call_id)
+    if not path:
+        return error_command("path is required for write_file", tool_call_id)
+    if content is None:
+        return error_command("content is required for write_file", tool_call_id)
+    if err := await verify_workspace_owner(
+        workspace_id, user_id, tool_call_id, need="write"
+    ):
+        return err
+    try:
+        from src.server.app.workspace_files._shared import (
+            _acquire_sandbox_to_change,
+            _is_non_owner_blocked_path,
+            _normalize_requested_path,
+            _to_client_path,
+            owner_work_dir,
+            previous_dir_names_of,
+        )
+        from src.server.app.workspace_files.crud import (
+            MAX_WRITE_BYTES,
+            _contained_target,
+        )
+        from src.server.database.workspace import get_workspace
+        from src.server.models.workspace import served_from_mirror
+
+        ws = await get_workspace(workspace_id)
+        if not ws:
+            return error_command("workspace not found", tool_call_id)
+        if served_from_mirror(ws.get("status")):
+            return error_command(
+                f"Cannot write files — workspace is {ws.get('status')}. Wait for it to be running.",
+                tool_call_id,
+            )
+        work_dir = owner_work_dir(ws)
+        previous_dirs = previous_dir_names_of(ws)
+        normalized_req_path = _normalize_requested_path(path, work_dir, previous_dirs)
+        if _is_non_owner_blocked_path(normalized_req_path):
+            return error_command(
+                "403 Forbidden: Cannot write system, hidden, or virtual files",
+                tool_call_id,
+            )
+
+        content_bytes = content.encode("utf-8")
+        if len(content_bytes) > MAX_WRITE_BYTES:
+            return error_command("File content too large (max 10MB)", tool_call_id)
+
+        owner_id = str(ws.get("user_id") or user_id)
+        async with _acquire_sandbox_to_change(workspace_id, owner_id) as (
+            sandbox,
+            live_ws,
+        ):
+            work_dir = owner_work_dir(live_ws)
+            previous_dirs = previous_dir_names_of(live_ws)
+            normalized = await _contained_target(
+                sandbox, path, work_dir, previous_dirs
+            )
+            client_path = _to_client_path(sandbox, normalized, work_dir)
+            if _is_non_owner_blocked_path(client_path):
+                return error_command(
+                    "403 Forbidden: Cannot write system, hidden, or virtual files",
+                    tool_call_id,
+                )
+            ok = await sandbox.awrite_file_text(normalized, content)
+        if not ok:
+            return error_command("Write failed", tool_call_id)
+        return success_command(
+            {
+                "success": True,
+                "workspace_id": workspace_id,
+                "path": client_path,
+                "size": len(content_bytes),
+            },
+            tool_call_id,
+        )
+    except Exception as e:
+        logger.error(f"Failed to write workspace file for CoS: {e}")
+        return error_command("failed to write workspace file", tool_call_id)
+# --- DALTON-HOOK(workspace-sharing-settings): end ---

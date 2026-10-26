@@ -11,6 +11,9 @@ from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool, tool
 
 from src.dalton.auth import verify_workspace_access
+from src.dalton.database import knowledge as db_knowledge
+from src.dalton.database import verdicts as db_verdicts
+from src.dalton.knowledge.paths import DOC_KEYS
 from src.dalton.knowledge.reconcile import apply_pending
 from src.dalton.knowledge.service import append_verdict, apply_update
 from src.server.database.pool import get_db_connection
@@ -160,15 +163,17 @@ async def resolve_verdict_signals(
 
 
 def create_knowledge_tools(filesystem_backend: Any = None) -> list[BaseTool]:
-    """Build ``[knowledge_update, knowledge_append_verdict]`` bound to ``filesystem_backend``."""
+    """Build ``[knowledge_update, knowledge_append_verdict, knowledge_read]`` bound to ``filesystem_backend``."""
     reconciled_workspaces: set[str] = set()
 
-    async def _maybe_reconcile(workspace_id: str, user_id: str) -> None:
-        if filesystem_backend is None or workspace_id in reconciled_workspaces:
+    async def _maybe_reconcile(
+        workspace_id: str, user_id: str, backend: Any
+    ) -> None:
+        if backend is None or workspace_id in reconciled_workspaces:
             return
         reconciled_workspaces.add(workspace_id)
         try:
-            await apply_pending(workspace_id, filesystem_backend, user_id=user_id)
+            await apply_pending(workspace_id, backend, user_id=user_id)
         except Exception as e:
             logger.debug("apply_pending skipped for %s: %s", workspace_id, e)
 
@@ -180,6 +185,7 @@ def create_knowledge_tools(filesystem_backend: Any = None) -> list[BaseTool]:
         base_version: int | None = None,
         evidence_refs: list[dict[str, Any]] | None = None,
         dry_run: bool = False,
+        workspace_id: str | None = None,
         *,
         config: RunnableConfig,
         tool_call_id: Annotated[str, InjectedToolCallId] = "",
@@ -193,23 +199,31 @@ def create_knowledge_tools(filesystem_backend: Any = None) -> list[BaseTool]:
         On validation failure, the returned message includes the expected schema structure (失败时返回的信息里带有期望结构，照着补齐再提交).
         Returns: the new version and the rendered file (or dry-run preview/diff), or the list of problems to fix.
         """
-        user_id, workspace_id, thread_id, run_id = _extract_run_identity(config)
-        if not user_id or not workspace_id:
+        user_id, cfg_workspace_id, thread_id, run_id = _extract_run_identity(config)
+        target_ws_id = (str(workspace_id).strip() if workspace_id else "") or (
+            cfg_workspace_id or ""
+        )
+        if not user_id or not target_ws_id or target_ws_id.lower() == "home":
             return "ERROR: user_id and workspace_id are required in RunnableConfig."
 
-        await verify_workspace_access(workspace_id, user_id)
+        await verify_workspace_access(
+            target_ws_id, user_id, need="write", channel="cos"
+        )
+        eff_backend = (
+            filesystem_backend if target_ws_id == cfg_workspace_id else None
+        )
         if not dry_run:
-            await _maybe_reconcile(workspace_id, user_id)
+            await _maybe_reconcile(target_ws_id, user_id, eff_backend)
         res = await apply_update(
             user_id=user_id,
-            workspace_id=workspace_id,
+            workspace_id=target_ws_id,
             doc_key=doc,
             ops=ops,
             reason=reason,
             base_version=base_version,
             evidence_refs=evidence_refs,
             source="tool",
-            backend=filesystem_backend,
+            backend=eff_backend,
             thread_id=thread_id,
             run_id=run_id,
             tool_call_id=tool_call_id or None,
@@ -238,6 +252,7 @@ def create_knowledge_tools(filesystem_backend: Any = None) -> list[BaseTool]:
     async def _knowledge_append_verdict(
         verdict: dict[str, Any],
         agenda_ops: list[dict[str, Any]] | None = None,
+        workspace_id: str | None = None,
         *,
         config: RunnableConfig,
         tool_call_id: Annotated[str, InjectedToolCallId] = "",
@@ -248,25 +263,33 @@ def create_knowledge_tools(filesystem_backend: Any = None) -> list[BaseTool]:
         On validation failure, the returned message includes the expected schema structure (失败时返回的信息里带有期望结构，照着补齐再提交).
         Returns: the verdict id and the agenda version it updated.
         """
-        user_id, workspace_id, thread_id, run_id = _extract_run_identity(config)
-        if not user_id or not workspace_id:
+        user_id, cfg_workspace_id, thread_id, run_id = _extract_run_identity(config)
+        target_ws_id = (str(workspace_id).strip() if workspace_id else "") or (
+            cfg_workspace_id or ""
+        )
+        if not user_id or not target_ws_id or target_ws_id.lower() == "home":
             return "ERROR: user_id and workspace_id are required in RunnableConfig."
 
-        await verify_workspace_access(workspace_id, user_id)
+        await verify_workspace_access(
+            target_ws_id, user_id, need="write", channel="cos"
+        )
         refs = extract_verdict_signal_refs(verdict)
         if refs:
             from src.dalton.database import watch as watch_db
 
-            await watch_db.verify_signal_refs_in_workspace(refs, workspace_id)
+            await watch_db.verify_signal_refs_in_workspace(refs, target_ws_id)
 
-        await _maybe_reconcile(workspace_id, user_id)
+        eff_backend = (
+            filesystem_backend if target_ws_id == cfg_workspace_id else None
+        )
+        await _maybe_reconcile(target_ws_id, user_id, eff_backend)
         origin_type, auto_exec_id = await _resolve_thread_origin(thread_id)
         res = await append_verdict(
             user_id=user_id,
-            workspace_id=workspace_id,
+            workspace_id=target_ws_id,
             verdict=verdict,
             agenda_ops=agenda_ops,
-            backend=filesystem_backend,
+            backend=eff_backend,
             thread_id=thread_id,
             run_id=run_id,
             tool_call_id=tool_call_id or None,
@@ -275,14 +298,89 @@ def create_knowledge_tools(filesystem_backend: Any = None) -> list[BaseTool]:
         )
         if res.get("ok"):
             await resolve_verdict_signals(
-                workspace_id=workspace_id,
+                workspace_id=target_ws_id,
                 verdict=verdict,
                 verdict_id=str(res.get("verdict_id") or "") or None,
                 execution_id=auto_exec_id,
             )
         return str(res["message"])
 
-    return [_knowledge_update, _knowledge_append_verdict]
+    @tool("knowledge_read")
+    async def _knowledge_read(
+        workspace_id: str | None = None,
+        doc: str = "all",
+        limit: int = 20,
+        *,
+        config: RunnableConfig,
+    ) -> str:
+        """Read company-knowledge documents or recent event verdicts for a workspace (own or colleague's visible workspace).
+
+        Args:
+            workspace_id: Target workspace UUID (defaults to current workspace in RunnableConfig).
+            doc: Document key ("company", "thesis", "debate", "drivers", "management", "lessons", "agenda", "models"), "verdicts", or "all" (default).
+            limit: Maximum number of verdicts to return when doc is "verdicts" or "all" (default 20).
+
+        Returns:
+            JSON string with the requested knowledge document(s) and/or verdicts.
+        """
+        user_id, cfg_workspace_id, _, _ = _extract_run_identity(config)
+        target_ws_id = (str(workspace_id).strip() if workspace_id else "") or (
+            cfg_workspace_id or ""
+        )
+        if not user_id or not target_ws_id or target_ws_id.lower() == "home":
+            return "ERROR: user_id and workspace_id are required."
+
+        await verify_workspace_access(
+            target_ws_id, user_id, need="read", channel="cos"
+        )
+        cleaned_doc = str(doc or "all").strip().lower()
+        safe_limit = max(1, min(100, int(limit or 20)))
+
+        if cleaned_doc == "verdicts":
+            items = await db_verdicts.list_verdicts(target_ws_id, limit=safe_limit)
+            return json.dumps(
+                {"ok": True, "workspace_id": target_ws_id, "verdicts": items},
+                ensure_ascii=False,
+                default=str,
+            )
+
+        if cleaned_doc in DOC_KEYS:
+            row = await db_knowledge.latest_valid_version(target_ws_id, cleaned_doc)
+            return json.dumps(
+                {
+                    "ok": True,
+                    "workspace_id": target_ws_id,
+                    "doc": cleaned_doc,
+                    "version": row.get("version_no") if row else None,
+                    "content": row.get("content") if row else None,
+                },
+                ensure_ascii=False,
+                default=str,
+            )
+
+        latest_map = await db_knowledge.list_all_latest_for_workspace(
+            target_ws_id, valid_only=True
+        )
+        docs_out = {
+            k: {
+                "version_no": v.get("version_no"),
+                "content": v.get("content"),
+            }
+            for k, v in latest_map.items()
+        }
+        verdicts_out = await db_verdicts.list_verdicts(target_ws_id, limit=safe_limit)
+        return json.dumps(
+            {
+                "ok": True,
+                "workspace_id": target_ws_id,
+                "documents": docs_out,
+                "verdicts": verdicts_out,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+
+    return [_knowledge_update, _knowledge_append_verdict, _knowledge_read]
 
 
 def knowledge_tools(filesystem_backend: Any = None) -> list[BaseTool]:
@@ -293,3 +391,4 @@ def knowledge_tools(filesystem_backend: Any = None) -> list[BaseTool]:
 _DEFAULT_TOOLS = create_knowledge_tools(None)
 knowledge_update = _DEFAULT_TOOLS[0]
 knowledge_append_verdict = _DEFAULT_TOOLS[1]
+knowledge_read = _DEFAULT_TOOLS[2]

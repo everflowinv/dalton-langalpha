@@ -198,4 +198,37 @@ export async function updateWorkspaceTracking(
   return data;
 }
 
+// DALTON-HOOK(workspace-sharing-settings): per-workspace sharing settings API contract
+export type WorkspaceAccessLevel = 'rw' | 'ro' | 'hidden';
+
+export interface WorkspaceSharingResponse {
+  workspace_id: string;
+  cos_access: WorkspaceAccessLevel;
+  web_access: WorkspaceAccessLevel;
+  is_home?: boolean;
+  can_edit: boolean;
+  updated_by?: string | null;
+  updated_at?: string | null;
+}
+
+export async function fetchWorkspaceSharing(
+  workspaceId: string,
+): Promise<WorkspaceSharingResponse> {
+  const { data } = await api.get<WorkspaceSharingResponse>(
+    `/api/v1/dalton/workspaces/${encodeURIComponent(workspaceId)}/sharing`,
+  );
+  return data;
+}
+
+export async function updateWorkspaceSharing(
+  workspaceId: string,
+  payload: { cos_access: WorkspaceAccessLevel; web_access: WorkspaceAccessLevel },
+): Promise<WorkspaceSharingResponse> {
+  const { data } = await api.put<WorkspaceSharingResponse>(
+    `/api/v1/dalton/workspaces/${encodeURIComponent(workspaceId)}/sharing`,
+    payload,
+  );
+  return data;
+}
+
 // --- Threads ---

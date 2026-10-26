@@ -424,11 +424,18 @@ def is_dalton_service_request(sent_token: str, configured_token: str) -> bool:
     return service_token_matches(sent_token, configured_token)
 
 
-async def verify_workspace_access(workspace_id: str, user_id: str) -> dict[str, Any]:
-    """Verify that ``workspace_id`` exists and belongs to ``user_id`` fail-closed via ``get_workspace``.
+async def verify_workspace_access(
+    workspace_id: str,
+    user_id: str,
+    need: str | None = None,
+    channel: str | None = None,
+) -> dict[str, Any]:
+    """Verify that ``workspace_id`` exists and ``user_id`` has access fail-closed via ``get_workspace``.
 
-    - Raises HTTP 404 when ``workspace_id`` is empty/``home`` or the workspace row does not exist.
-    - Raises HTTP 403 when ``user_id`` is empty or ``workspace.user_id != user_id``.
+    - Default (``need=None, channel=None``): strict owner check (raises 403 when ``workspace.user_id != user_id``).
+    - When ``need`` ('read' | 'write') or ``channel`` ('cos' | 'web') is passed and Dalton Supabase auth is enabled,
+      non-owner team members are checked against ``dalton_workspace_sharing`` via ``require_workspace_access``.
+    - Raises HTTP 404 when ``workspace_id`` is empty/``home`` or the workspace row does not exist (or is ``hidden``).
     - Raises HTTP 503 (fail-closed) when querying the workspace table raises an exception.
     """
     cleaned_ws = str(workspace_id or "").strip()
@@ -465,12 +472,23 @@ async def verify_workspace_access(workspace_id: str, user_id: str) -> dict[str, 
             detail=f"Workspace '{workspace_id}' not found",
         )
     owner = str(ws.get("user_id") or "").strip()
-    if not owner or owner != cleaned_user:
-        raise HTTPException(
-            status_code=403,
-            detail="Workspace does not belong to current user",
+    if owner and owner == cleaned_user:
+        return ws
+
+    if (need is not None or channel is not None) and is_dalton_supabase_auth_enabled():
+        from src.dalton.sharing import require_workspace_access
+
+        return await require_workspace_access(
+            ws,
+            cleaned_user,
+            channel=channel or "cos",
+            need=need or "read",
         )
-    return ws
+
+    raise HTTPException(
+        status_code=403,
+        detail="Workspace does not belong to current user",
+    )
 
 
 async def resolve_caller_home_workspace_id(user_id: str) -> str:

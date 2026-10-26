@@ -86,6 +86,22 @@ def _enable_dalton_auth(monkeypatch: pytest.MonkeyPatch) -> None:
     get_user_mock = create_autospec(user_db.get_user, side_effect=_fake_get_user)
     monkeypatch.setattr(user_db, "get_user", get_user_mock)
 
+    async def _fake_get_sharing(
+        workspace_id: str, *, conn: Any | None = None
+    ) -> dict[str, Any]:
+        return {
+            "workspace_id": workspace_id,
+            "cos_access": "ro",
+            "web_access": "ro",
+            "updated_by": None,
+            "updated_at": None,
+        }
+
+    get_sharing_mock = create_autospec(
+        dalton_sharing.get_workspace_sharing, side_effect=_fake_get_sharing
+    )
+    monkeypatch.setattr(dalton_sharing, "get_workspace_sharing", get_sharing_mock)
+
 
 def _disable_dalton_auth(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(app_settings, "HOST_MODE", "oss")
@@ -683,8 +699,8 @@ class TestReadEndpointsAllowColleagues:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         _enable_dalton_auth(monkeypatch)
-        # Workspace is 'running', yet colleague reads MUST come from DB mirror and never acquire sandbox
-        ws = _sample_workspace(user_id="u-richard", status="running")
+        # Workspace is 'stopped': colleague reads MUST come from DB mirror and never start/acquire sandbox even with auto_start=True
+        ws = _sample_workspace(user_id="u-richard", status="stopped")
         monkeypatch.setattr(
             ws_files_crud,
             "db_get_workspace",
@@ -1002,6 +1018,7 @@ class TestWriteEndpointsRejectColleagues:
                 user_id="u-chao", workspace_id=ws["workspace_id"]
             )
         assert exc_new_thread.value.status_code == 403
+        assert exc_new_thread.value.detail == "该功能下一期开放"
         get_ws_mock.assert_called_once_with(ws["workspace_id"])
 
         # Route-level send_new_thread_message also rejects creating a thread in colleague's workspace
@@ -1024,6 +1041,7 @@ class TestWriteEndpointsRejectColleagues:
                 raw_request=_make_request(),
             )
         assert exc_route_new.value.status_code == 403
+        assert exc_route_new.value.detail == "该功能下一期开放"
 
         # 2. Route-level send_thread_message to an existing colleague thread -> 403
         auth_meta_mock.return_value = {
@@ -1041,6 +1059,7 @@ class TestWriteEndpointsRejectColleagues:
                 raw_request=_make_request(),
             )
         assert exc_send.value.status_code == 403
+        assert exc_send.value.detail == "该功能下一期开放"
 
     @pytest.mark.asyncio
     async def test_file_write_delete_upload_backup_rejected_on_colleague_workspace(

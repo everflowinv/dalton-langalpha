@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, onTestFinished } from 'vitest';
 import { render, screen, fireEvent, act, waitFor } from '@testing-library/react';
 import { QueryClientProvider } from '@tanstack/react-query';
 import { MemoryRouter } from 'react-router';
@@ -51,12 +51,13 @@ vi.mock('@/config/daltonAuth', () => ({
 
 const mockApiGet = vi.hoisted(() => vi.fn());
 const mockApiPost = vi.hoisted(() => vi.fn());
+const mockApiPut = vi.hoisted(() => vi.fn());
 vi.mock('@/api/client', () => ({
   api: {
     defaults: { baseURL: 'http://localhost:8000' },
     get: (...args: unknown[]) => mockApiGet(...args),
     post: (...args: unknown[]) => mockApiPost(...args),
-    put: vi.fn(),
+    put: (...args: unknown[]) => mockApiPut(...args),
     patch: vi.fn(),
     delete: vi.fn(),
   },
@@ -204,6 +205,7 @@ import {
   useTeamReadOnly,
   type TeamWorkspacesResponse,
 } from '@/pages/ChatAgent/components/dalton/TeamSharing';
+import { WorkspaceSharingModal } from '@/pages/ChatAgent/components/dalton/WorkspaceSharingModal';
 import { usePanelFiles } from '@/pages/ChatAgent/components/chatView/usePanelFiles';
 import { usePanelTarget } from '@/pages/ChatAgent/components/filePanel/usePanelTarget';
 import { PreviewPanes } from '@/pages/ChatAgent/components/filePanel/PreviewPanes';
@@ -943,5 +945,186 @@ describe('Dalton Team Sharing', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('supports 3-state useTeamReadOnly (owner / rw / ro) and renders access badges in TeamWorkspacesSection', () => {
+    const queryClient = createTestQueryClient();
+    const teamWithLevels: TeamWorkspacesResponse = {
+      members: [
+        {
+          user_id: 'u-richard',
+          email: 'richard.lu@dalton.test',
+          display_name: 'Richard Lu',
+          workspaces: [
+            {
+              workspace_id: 'ws-ro-1',
+              user_id: 'u-richard',
+              owner_name: 'Richard Lu',
+              owner_email: 'richard.lu@dalton.test',
+              name: 'NVDA ReadOnly',
+              status: 'running',
+              access: 'ro',
+              web_access: 'ro',
+              cos_access: 'ro',
+            },
+            {
+              workspace_id: 'ws-rw-1',
+              user_id: 'u-richard',
+              owner_name: 'Richard Lu',
+              owner_email: 'richard.lu@dalton.test',
+              name: 'TSM ReadWrite',
+              status: 'running',
+              access: 'rw',
+              web_access: 'rw',
+              cos_access: 'rw',
+            },
+          ],
+        },
+      ],
+    };
+    queryClient.setQueryData(queryKeys.workspaces.team(), teamWithLevels);
+    queryClient.setQueryData(queryKeys.user.me(), {
+      user_id: 'u-chao',
+      email: 'chao.yu@dalton.test',
+      name: 'Chao Yu',
+    });
+    queryClient.setQueryData(workspaceDetailQuery('ws-own-1').queryKey, {
+      workspace_id: 'ws-own-1',
+      user_id: 'u-chao',
+      name: 'My Own Workspace',
+      status: 'running',
+      is_home: false,
+    });
+
+    // 1. Owner state
+    const { result: ownerRes } = renderHookWithProviders(
+      () =>
+        useTeamReadOnly('ws-own-1', {
+          user_id: 'u-chao',
+          name: 'My Own Workspace',
+        }),
+      { queryClient },
+    );
+    expect(ownerRes.current.access).toBe('owner');
+    expect(ownerRes.current.isColleague).toBe(false);
+    expect(ownerRes.current.isReadOnly).toBe(false);
+    expect(ownerRes.current.canWriteFiles).toBe(true);
+
+    // 2. Colleague RO state
+    const { result: roRes } = renderHookWithProviders(() => useTeamReadOnly('ws-ro-1'), {
+      queryClient,
+    });
+    expect(roRes.current.access).toBe('ro');
+    expect(roRes.current.isColleague).toBe(true);
+    expect(roRes.current.isReadOnly).toBe(true);
+    expect(roRes.current.canWriteFiles).toBe(false);
+
+    // 3. Colleague RW state (canWriteFiles=true, isReadOnly=false)
+    const { result: rwRes } = renderHookWithProviders(() => useTeamReadOnly('ws-rw-1'), {
+      queryClient,
+    });
+    expect(rwRes.current.access).toBe('rw');
+    expect(rwRes.current.isColleague).toBe(true);
+    expect(rwRes.current.isReadOnly).toBe(false);
+    expect(rwRes.current.canWriteFiles).toBe(true);
+
+    // 3b. usePanelFiles for rw colleague keeps teamReadOnly=true and canShare=false while readOnly=false
+    const { result: rwPanelRes } = renderHookWithProviders(
+      () =>
+        usePanelFiles({
+          isHome: false,
+          workspaceId: 'ws-rw-1',
+          workspaceName: 'TSM RW',
+          includeSystem: false,
+          readOnly: !rwRes.current.canWriteFiles,
+          isColleague: rwRes.current.isColleague,
+        }),
+      { queryClient },
+    );
+    expect(rwPanelRes.current.panelAccess.readOnly).toBe(false);
+    expect(rwPanelRes.current.panelAccess.teamReadOnly).toBe(true);
+    expect(rwPanelRes.current.panelAccess.canShare).toBe(false);
+
+    // 4. Sidebar badges for RO and RW (expand member group first)
+    renderWithProviders(<TeamWorkspacesSection currentWorkspaceId="ws-rw-1" />, {
+      queryClient,
+    });
+    fireEvent.click(screen.getByTestId('team-member-toggle-u-richard'));
+    expect(screen.getByTestId('team-workspace-access-ws-ro-1')).toHaveTextContent('只读');
+    expect(screen.getByTestId('team-workspace-access-ws-rw-1')).toHaveTextContent('可读写');
+  });
+
+  it('renders WorkspaceSharingModal with two 3-option radio groups and saves sharing settings', async () => {
+    const { default: i18n } = await import('@/i18n');
+    await i18n.changeLanguage('zh-CN');
+    onTestFinished(async () => {
+      await i18n.changeLanguage('en-US');
+    });
+    const queryClient = createTestQueryClient();
+    queryClient.setQueryData(queryKeys.dalton.sharing('ws-own-1'), {
+      workspace_id: 'ws-own-1',
+      cos_access: 'ro',
+      web_access: 'hidden',
+      is_home: false,
+      can_edit: true,
+      updated_by: 'u-chao',
+      updated_at: '2026-04-20T12:00:00Z',
+    });
+    mockApiPut.mockResolvedValueOnce({
+      data: {
+        workspace_id: 'ws-own-1',
+        cos_access: 'rw',
+        web_access: 'ro',
+        is_home: false,
+        can_edit: true,
+        updated_by: 'u-chao',
+        updated_at: '2026-04-20T12:05:00Z',
+      },
+    });
+
+    renderWithProviders(<WorkspaceSharingModal workspaceId="ws-own-1" />, {
+      queryClient,
+    });
+
+    const trigger = screen.getByTestId('workspace-sharing-button');
+    expect(trigger).toHaveTextContent('共享设置');
+    fireEvent.click(trigger);
+
+    const dialog = screen.getByTestId('workspace-sharing-modal');
+    expect(dialog).toBeInTheDocument();
+    expect(screen.getByText('别人的 Chief of Staff')).toBeInTheDocument();
+    expect(screen.getByText('别人的网页界面')).toBeInTheDocument();
+    expect(screen.getByTestId('sharing-home-note')).toHaveTextContent(
+      'Home 工作区始终不对他人开放',
+    );
+
+    // Verify all two 3-option radio groups exist and reflect initial state
+    const cosRw = screen.getByTestId('sharing-cos-rw') as HTMLInputElement;
+    const cosRo = screen.getByTestId('sharing-cos-ro') as HTMLInputElement;
+    const cosHidden = screen.getByTestId('sharing-cos-hidden') as HTMLInputElement;
+    const webRw = screen.getByTestId('sharing-web-rw') as HTMLInputElement;
+    const webRo = screen.getByTestId('sharing-web-ro') as HTMLInputElement;
+    const webHidden = screen.getByTestId('sharing-web-hidden') as HTMLInputElement;
+
+    expect(cosRo.checked).toBe(true);
+    expect(cosRw.checked).toBe(false);
+    expect(cosHidden.checked).toBe(false);
+    expect(webHidden.checked).toBe(true);
+    expect(webRw.checked).toBe(false);
+    expect(webRo.checked).toBe(false);
+
+    // Change cos_access to rw and web_access to ro, then save
+    fireEvent.click(cosRw);
+    fireEvent.click(webRo);
+    expect(cosRw.checked).toBe(true);
+    expect(webRo.checked).toBe(true);
+    fireEvent.click(screen.getByTestId('sharing-save-btn'));
+
+    await waitFor(() => {
+      expect(mockApiPut).toHaveBeenCalledWith(
+        '/api/v1/dalton/workspaces/ws-own-1/sharing',
+        { cos_access: 'rw', web_access: 'ro' },
+      );
+    });
   });
 });

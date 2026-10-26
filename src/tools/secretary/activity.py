@@ -87,6 +87,18 @@ async def read_activity(
             ),
             timeout=_READ_TIMEOUT_S,
         )
+        # --- DALTON-HOOK(workspace-sharing-settings): begin ---
+        colleague_workspaces: list[dict[str, Any]] | None = None
+        from src.dalton.settings import is_dalton_supabase_auth_enabled
+
+        if is_dalton_supabase_auth_enabled():
+            from src.dalton.sharing import list_colleague_cos_workspaces
+
+            try:
+                colleague_workspaces = await list_colleague_cos_workspaces(user_id)
+            except Exception:
+                colleague_workspaces = None
+        # --- DALTON-HOOK(workspace-sharing-settings): end ---
         return render_activity(
             workspaces=workspaces,
             workspace_total=total,
@@ -97,6 +109,7 @@ async def read_activity(
             home_computer_id=(home or {}).get("computer_id"),
             zone=zone,
             today=today,
+            colleague_workspaces=colleague_workspaces,
         )
     except Exception:  # noqa: BLE001 - context is never worth failing a turn for
         logger.warning("[activity] read or render failed", exc_info=True)
@@ -114,6 +127,8 @@ def render_activity(
     zone: ZoneInfo,
     today: date,
     home_computer_id: Any = None,
+    # DALTON-HOOK(workspace-sharing-settings): colleague workspaces visible to CoS
+    colleague_workspaces: list[dict[str, Any]] | None = None,
 ) -> str:
     """The block's text: byte-identical for equal rows, and empty for none.
 
@@ -135,6 +150,21 @@ def render_activity(
                 ]
             )
         )
+    # --- DALTON-HOOK(workspace-sharing-settings): begin ---
+    if colleague_workspaces:
+        sections.append(
+            "\n".join(
+                [
+                    "Colleague workspaces shared with your Chief of Staff "
+                    f"({len(colleague_workspaces)}):",
+                    *(
+                        _colleague_workspace_line(ws)
+                        for ws in colleague_workspaces
+                    ),
+                ]
+            )
+        )
+    # --- DALTON-HOOK(workspace-sharing-settings): end ---
     if threads:
         sections.append(
             "\n".join(
@@ -185,6 +215,26 @@ def _workspace_line(ws: dict[str, Any], home_computer_id: Any, zone: ZoneInfo) -
         facts.append(f"folder `{_one_line(folder, _TITLE_CHARS)}`")
     facts.append(f"workspace_id `{ws['workspace_id']}`")
     return f"- {name}{f': {described}' if described else ''} ({', '.join(facts)})"
+
+
+# --- DALTON-HOOK(workspace-sharing-settings): begin ---
+def _colleague_workspace_line(ws: dict[str, Any]) -> str:
+    name = _one_line(ws.get("name"), _TITLE_CHARS) or "Untitled"
+    described = _one_line(ws.get("description"), _EXCERPT_CHARS)
+    owner_label = (
+        _one_line(ws.get("owner_name"), _TITLE_CHARS)
+        or _one_line(ws.get("owner_email"), _TITLE_CHARS)
+        or "colleague"
+    )
+    cos_access = str(ws.get("cos_access") or "ro")
+    access_label = "read-only" if cos_access == "ro" else "read-write"
+    facts = [
+        f"owner: {owner_label}",
+        f"access: {cos_access} ({access_label})",
+        f"workspace_id `{ws['workspace_id']}`",
+    ]
+    return f"- {name}{f': {described}' if described else ''} ({', '.join(facts)})"
+# --- DALTON-HOOK(workspace-sharing-settings): end ---
 
 
 def _thread_line(thread: dict[str, Any], home_id: str, zone: ZoneInfo) -> str:

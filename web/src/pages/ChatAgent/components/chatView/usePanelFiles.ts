@@ -15,16 +15,18 @@ export function usePanelFiles({
   workspaceId,
   workspaceName = null,
   includeSystem,
-  // DALTON-HOOK(team-sharing): force read-only file panel for colleague workspaces
+  // DALTON-HOOK(workspace-sharing-settings): separate file write lock (readOnly) from colleague identity (isColleague)
   readOnly = false,
+  isColleague = readOnly,
 }: {
   isHome: boolean;
   workspaceId: string;
   /** The view's own workspace, which the way back from a sibling is labelled with; Home's says Home. */
   workspaceName?: string | null;
   includeSystem: boolean;
-  // DALTON-HOOK(team-sharing): force read-only file panel for colleague workspaces
+  // DALTON-HOOK(workspace-sharing-settings): separate file write lock (readOnly) from colleague identity (isColleague)
   readOnly?: boolean;
+  isColleague?: boolean;
 }) {
   const [override, setOverride] = useState<string | null>(null);
   const shownId = override ?? workspaceId;
@@ -48,13 +50,13 @@ export function usePanelFiles({
     /** FilePanel's access props, spread onto every mount. */
     panelAccess: showsSibling
       ? {
-          // DALTON-HOOK(team-sharing): keep teamReadOnly separate from sibling readOnly
-          readOnly: true, teamReadOnly: readOnly, singleFileMode: true, canShare: false, isHome: false,
+          // DALTON-HOOK(workspace-sharing-settings): teamReadOnly follows isColleague; readOnly is file write lock; canShare is owner-only
+          readOnly: true, teamReadOnly: isColleague, singleFileMode: true, canShare: false, isHome: false,
           onReturnHome: () => setOverride(null), returnLabel: isHome ? null : workspaceName,
         }
       : {
-          // DALTON-HOOK(team-sharing): enforce readOnly and disable sharing on team workspaces
-          readOnly, teamReadOnly: readOnly, singleFileMode: false, canShare: !readOnly, isHome,
+          // DALTON-HOOK(workspace-sharing-settings): teamReadOnly follows isColleague; readOnly is file write lock; canShare is owner-only
+          readOnly, teamReadOnly: isColleague, singleFileMode: false, canShare: !isColleague && !readOnly, isHome,
           onReturnHome: null, returnLabel: null,
         },
   };

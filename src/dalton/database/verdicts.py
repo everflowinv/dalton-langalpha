@@ -231,11 +231,16 @@ async def list_user_verdicts(
 ) -> list[dict[str, Any]]:
     """List verdicts for ``user_id`` with optional workspace and time filters."""
     capped = max(1, min(limit, 500))
-    clauses = ["user_id = %s"]
-    params: list[Any] = [user_id]
+    clauses: list[str] = []
+    params: list[Any] = []
     if workspace_id:
         clauses.append("workspace_id = %s")
         params.append(workspace_id)
+    else:
+        clauses.append(
+            "(user_id = %s OR workspace_id IN (SELECT workspace_id FROM workspaces WHERE user_id = %s AND status != 'deleted'))"
+        )
+        params.extend([user_id, user_id])
     if since:
         clauses.append("verdict_at >= %s")
         params.append(since)

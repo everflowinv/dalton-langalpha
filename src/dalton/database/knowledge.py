@@ -295,7 +295,7 @@ async def latest_by_user(user_id: str, doc_key: str) -> list[dict[str, Any]]:
                     kv.run_id, kv.tool_call_id, kv.files_written_at, kv.created_at
                 FROM dalton_knowledge_versions kv
                 JOIN workspaces w ON w.workspace_id = kv.workspace_id
-                WHERE kv.user_id = %s
+                WHERE w.user_id = %s
                   AND kv.doc_key = %s
                   AND kv.schema_valid = TRUE
                   AND w.status != 'deleted'

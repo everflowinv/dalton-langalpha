@@ -5534,6 +5534,16 @@
       "cashBadge": "现金",
       "tosRiskBadge": "条款风险",
       "nativeModelsSectionTitle": "原生模型同步（订阅模型目录）"
+    },
+    "sharing": {
+      "title": "共享设置",
+      "cosLabel": "别人的 Chief of Staff",
+      "webLabel": "别人的网页界面",
+      "levelRw": "可读写",
+      "levelRo": "仅可读",
+      "levelHidden": "不可见",
+      "homeNote": "Home 工作区始终不对他人开放",
+      "nextPhaseNotice": "该功能下一期开放"
     }
   }
 }
