@@ -142,9 +142,11 @@ class TestRelayBoundEmission:
         # Each tools/call send is budgeted above the relay's 55s wall.
         assert "_HTTP_CALL_BUDGET = 65.0" in code
         # DALTON-HOOK(mcp-call-timeout): the send budget is per-server config
-        # (call_timeout_s, defaulting to _HTTP_CALL_BUDGET), so the client is
-        # constructed from the config field, not the raw constant.
-        assert "httpx.Client(timeout=cfg.call_timeout_s)" in code
+        # (call_timeout_s, defaulting to _HTTP_CALL_BUDGET): the per-exchange
+        # client and the per-send deadline (which also bounds data-token
+        # resends on the pooled client) both come from the config field.
+        assert "_client_for(cfg, cfg.call_timeout_s)" in code
+        assert "deadline = time.monotonic() + cfg.call_timeout_s" in code
 
     def test_builtin_only_config_has_no_relay_binding(self):
         # The runtime module always ships the relay/vault helpers (static
