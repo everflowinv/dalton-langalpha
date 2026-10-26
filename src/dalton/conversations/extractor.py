@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import math
 import re
 import time
 from dataclasses import dataclass, field
@@ -1174,6 +1175,10 @@ def _resolve_alias_cache_entry_or_map(
     return None, _call_load_ticker_company_aliases(user_id)
 
 
+# Reject tokens exceeding 30 integer digits (e.g. hashes/IDs or 1e5000) to avoid non-metric noise and int() conversion limits.
+MAX_NUMBER_INTEGER_DIGITS: int = 30
+
+
 def normalize_number_token(raw_token: str) -> str | None:
     """Normalize a numeric token (stripping commas, signs, `%`, scientific notation) to a canonical decimal string
     (`1,200` -> `'1200'`, `35.0%` -> `'35'`, `1e6` -> `'1000000'`).
@@ -1181,13 +1186,25 @@ def normalize_number_token(raw_token: str) -> str | None:
     cleaned = str(raw_token or "").replace(",", "").replace("%", "").strip()
     if not cleaned:
         return None
-    try:
-        dec = abs(Decimal(cleaned))
-    except InvalidOperation:
+    sig_part = re.split(r"[eE]", cleaned.lstrip("+-"), maxsplit=1)[0]
+    int_part = sig_part.split(".", 1)[0]
+    if (
+        len(int_part) > MAX_NUMBER_INTEGER_DIGITS
+        or len(sig_part.replace(".", "")) > MAX_NUMBER_INTEGER_DIGITS * 2
+    ):
         return None
-    if dec == dec.to_integral():
-        return str(int(dec))
-    return format(dec.normalize(), "f")
+    try:
+        dec = Decimal(cleaned).copy_abs()
+        if not dec.is_finite():
+            return None
+        if dec != 0 and abs(dec.adjusted()) >= MAX_NUMBER_INTEGER_DIGITS:
+            return None
+        int_val = int(dec)
+        if dec == int_val:
+            return str(int_val)
+        return format(dec, "f").rstrip("0").rstrip(".")
+    except (InvalidOperation, ValueError, OverflowError):
+        return None
 
 
 # Ordered longest-to-shortest: 万亿 > 亿 > 千万/百万 > 万 > 千/百
@@ -1263,6 +1280,7 @@ def _parse_chinese_number(cn_text: str) -> Decimal | None:
     s = str(cn_text or "").strip()
     if not s:
         return None
+    max_val = 10**MAX_NUMBER_INTEGER_DIGITS
     total = 0
     section = 0
     digit = 0
@@ -1294,9 +1312,14 @@ def _parse_chinese_number(cn_text: str) -> Decimal | None:
             has_any = True
         else:
             return None
+        if total + section + digit >= max_val:
+            return None
     if not has_any:
         return None
-    return Decimal(total + section + digit)
+    try:
+        return Decimal(total + section + digit)
+    except (InvalidOperation, ValueError, OverflowError):
+        return None
 
 
 def _chinese_company_aliases_for_stripping(
@@ -1703,7 +1726,7 @@ def _build_number_forms(raw_num: str, unit_str: str | None = None) -> tuple[str 
             scaled = normalize_number_token(str(Decimal(canon) * mult))
             if scaled is not None:
                 forms.add(scaled)
-        except InvalidOperation:
+        except (InvalidOperation, ValueError, OverflowError):
             pass
     return canon, forms
 
@@ -1943,7 +1966,7 @@ def _extract_figure_value_mentions(value: Any, unit: str | None = None) -> list[
             scaled = normalize_number_token(str(Decimal(raw_canon) * unit_mult))
             if scaled is not None:
                 new_forms.add(scaled)
-        except InvalidOperation:
+        except (InvalidOperation, ValueError, OverflowError):
             pass
         enriched.append((raw_canon, new_forms))
     return enriched
@@ -3612,7 +3635,9 @@ def validate_candidate_card(
     raw_conf = card.get("confidence", 0.8)
     try:
         orig_conf = float(raw_conf if raw_conf is not None else 0.8)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        orig_conf = 0.8
+    if not math.isfinite(orig_conf):
         orig_conf = 0.8
     orig_conf = max(0.0, min(1.0, orig_conf))
 
@@ -3897,13 +3922,22 @@ def _normalize_figure_key(metric: Any, period: Any) -> tuple[str, str]:
 
 
 def _normalize_figure_value(val: Any) -> str:
-    if isinstance(val, (int, float)):
-        return f"{float(val):.6g}"
+    if isinstance(val, (int, float)) and not isinstance(val, bool):
+        try:
+            fval = float(val)
+            if math.isfinite(fval):
+                return f"{fval:.6g}"
+        except (ValueError, OverflowError):
+            pass
+        return str(val).strip().lower()
     s = str(val or "").strip()
     try:
-        return f"{float(s):.6g}"
-    except ValueError:
-        return s.lower()
+        fval = float(s)
+        if math.isfinite(fval):
+            return f"{fval:.6g}"
+    except (ValueError, OverflowError):
+        pass
+    return s.lower()
 
 
 def _parse_card_ts_epoch(card: dict[str, Any]) -> float:
@@ -4139,12 +4173,89 @@ def _extract_error_Inspection(
     return False, code, "str", "", "", err_str
 
 
+_DETERMINISTIC_ERROR_KINDS: frozenset[str] = frozenset(
+    {
+        "validationerror",
+        "jsondecodeerror",
+        "valueerror",
+        "typeerror",
+        "keyerror",
+        "attributeerror",
+        "indexerror",
+        "overflowerror",
+        "invalidoperation",
+        "zerodivisionerror",
+        "arithmeticerror",
+        "assertionerror",
+        "syntaxerror",
+        "nameerror",
+        "unboundlocalerror",
+        "importerror",
+        "modulenotfounderror",
+        "lookuperror",
+        "unicodeerror",
+        "unicodedecodeerror",
+        "unicodeencodeerror",
+        "unicodetranslateerror",
+        "notimplementederror",
+        "recursionerror",
+    }
+)
+
+_TRANSIENT_NETWORK_CLASS_KINDS: frozenset[str] = frozenset(
+    {
+        "remoteprotocolerror",
+        "readerror",
+        "connecterror",
+        "readtimeout",
+        "connecttimeout",
+        "writeerror",
+        "writetimeout",
+        "pooltimeout",
+        "protocolerror",
+        "timeouterror",
+        "connectionerror",
+        "connectionreseterror",
+        "operationalerror",
+        "interfaceerror",
+    }
+)
+
+
+def _is_deterministic_extraction_error(
+    res: AssistResult | SegmentExtractionOutcome | BaseException | str,
+) -> bool:
+    """Return True when `res` is a non-transient code, parse, or schema validation error."""
+    if isinstance(res, SegmentExtractionOutcome) and (
+        res.rate_limited or res.transient_error or res.in_flight or res.permanent_quota_error
+    ):
+        return False
+    is_ok, _status_code, cls_name, _status, ek, err = _extract_error_Inspection(res)
+    if is_ok:
+        return False
+    if ek in _DETERMINISTIC_ERROR_KINDS or cls_name in _DETERMINISTIC_ERROR_KINDS:
+        return True
+    if not ek:
+        m = re.match(r"^([a-z_][a-z0-9_]*)\s*:", err)
+        if m and m.group(1) in _DETERMINISTIC_ERROR_KINDS:
+            return True
+    return False
+
+
+
+
+def is_deterministic_extraction_error(res: Any) -> bool:
+    """Whether resending the same segment would fail the same way (code or parse error)."""
+    return _is_deterministic_extraction_error(res)
+
 def is_in_flight_error(
     res: AssistResult | SegmentExtractionOutcome | BaseException | str,
 ) -> bool:
     """Return True if an extraction result or exception indicates a journal `in_flight` collision."""
     if isinstance(res, SegmentExtractionOutcome) and res.in_flight:
         return True
+    if _is_deterministic_extraction_error(res):
+        return False
     is_ok, _status_code, cls_name, status, ek, err = _extract_error_Inspection(res)
     if is_ok:
         return False
@@ -4166,6 +4277,8 @@ def is_transient_network_error(
     """Return True for transient network/upstream errors (`RemoteProtocolError`, `ReadError`, `ConnectError`, `ReadTimeout`, HTTP 502/503/504)."""
     if isinstance(res, SegmentExtractionOutcome) and res.transient_error:
         return True
+    if _is_deterministic_extraction_error(res):
+        return False
     is_ok, status_code, cls_name, status, ek, err = _extract_error_Inspection(res)
     if (
         is_ok
@@ -4178,22 +4291,9 @@ def is_transient_network_error(
         return False
     if status_code in (502, 503, 504):
         return True
-    if ek in ("stream_cut", "timeout", "http_502", "http_503", "http_504"):
+    if ek in ("stream_cut", "timeout", "http_502", "http_503", "http_504") or ek in _TRANSIENT_NETWORK_CLASS_KINDS:
         return True
-    if cls_name in (
-        "remoteprotocolerror",
-        "readerror",
-        "connecterror",
-        "readtimeout",
-        "connecttimeout",
-        "writeerror",
-        "writetimeout",
-        "pooltimeout",
-        "protocolerror",
-        "timeouterror",
-        "connectionerror",
-        "connectionreseterror",
-    ):
+    if cls_name in _TRANSIENT_NETWORK_CLASS_KINDS:
         return True
     for marker in (
         "remoteprotocolerror",
@@ -4206,6 +4306,7 @@ def is_transient_network_error(
         "connecttimeout",
         "writetimeout",
         "pooltimeout",
+        "operationalerror",
         "timed out",
         "http_502",
         "http_503",
@@ -4222,6 +4323,8 @@ def is_transient_network_error(
 
 def is_permanent_quota_error(res: AssistResult | BaseException | str) -> bool:
     """Return True if an `AssistResult` or exception failed due to a permanent/hard quota or billing limit."""
+    if _is_deterministic_extraction_error(res):
+        return False
     is_ok, status_code, cls_name, status, ek, err = _extract_error_Inspection(res)
     if is_ok:
         return False
@@ -4253,6 +4356,8 @@ def is_permanent_quota_error(res: AssistResult | BaseException | str) -> bool:
 
 def is_rate_limit_or_quota_error(res: AssistResult | BaseException | str) -> bool:
     """Return True if an `AssistResult` or exception failed due to transient 429 / rate-limit exhaustion."""
+    if _is_deterministic_extraction_error(res):
+        return False
     is_ok, status_code, cls_name, _status, ek, err = _extract_error_Inspection(res)
     if is_ok or is_permanent_quota_error(res):
         return False
@@ -4285,6 +4390,8 @@ def is_fallback_eligible(outcome: SegmentExtractionOutcome) -> bool:
         return False
     if is_in_flight_error(outcome):
         return False
+    if _is_deterministic_extraction_error(outcome):
+        return True
     if (
         str(outcome.status or "").strip().lower() == "indeterminate"
         or str(outcome.error_kind or "").strip().lower() in ("indeterminate", "timeout")
@@ -4509,7 +4616,12 @@ async def extract_segment_cards(
                 )
 
         raw_conf = raw_c.get("confidence", 0.8)
-        conf = float(0.8 if raw_conf is None else raw_conf)
+        try:
+            conf = float(0.8 if raw_conf is None else raw_conf)
+        except (TypeError, ValueError, OverflowError):
+            conf = 0.8
+        if not math.isfinite(conf):
+            conf = 0.8
         conf = max(0.0, min(1.0, conf))
 
         ev_ts = str(matched_ev.get("ts") or first_ev.get("ts") or datetime.now(timezone.utc).isoformat())

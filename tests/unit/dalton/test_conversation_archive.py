@@ -4739,18 +4739,18 @@ async def test_deferred_in_flight_window_uses_monotonic_deadline_including_budge
     mock_clock = create_autospec(archive_cli.time.monotonic, side_effect=_monotonic)
     mock_sleep = create_autospec(asyncio.sleep, side_effect=_advancing_sleep)
 
-    # 3 segments in different sessions so they form 3 separate segments:
+    # 3 segments in the same session spaced 1h apart so they form 3 separate segments:
     # seg 0 (`ev-d0`): in_flight initially; on deferred pass 1, call takes 940s (pushing clock past deadline = +960s) and stays in_flight
     # seg 1 (`ev-d1`): in_flight initially; must NOT be retried in deferred pass 1 after seg 0 crosses deadline!
     # seg 2 (`ev-d2`): succeeds on initial pass (150 tokens), becomes `blocked` behind seg 0 & seg 1
     events = [
         {
             "agent": "main",
-            "session_id": f"sess-d{i}",
+            "session_id": "sess-d",
             "event_id": f"ev-d{i}",
-            "seq": 1,
+            "seq": i + 1,
             "generation": "gen-1",
-            "created_at_ms": 1760950000000 + i * 1000,
+            "created_at_ms": 1760950000000 + i * 3600 * 1000,
             "ts": "2026-10-20T10:00:00+00:00",
             "date_et": "2026-10-20",
             "text": f"NVDA monotonic deadline test segment {i}.",
@@ -5309,14 +5309,14 @@ async def test_non_transient_schema_validation_failure_marks_failed_and_blocked_
     assert inc_by_id["ev-sw1-1"]["segment_index"] == 1
     assert inc_by_id["ev-sw1-1"]["status"] == "failed"
     assert inc_by_id["ev-sw1-1"]["reason"] == "extraction_error:ValidationError"
-    assert inc_by_id["ev-sw1-1"]["total_tokens"] == 150
+    assert inc_by_id["ev-sw1-1"]["total_tokens"] == 300
     assert inc_by_id["ev-sw1-2"]["segment_index"] == 2
     assert inc_by_id["ev-sw1-2"]["status"] == "blocked"
     assert inc_by_id["ev-sw1-2"]["reason"] == "blocked_by_incomplete_prefix"
     assert inc_by_id["ev-sw1-2"]["total_tokens"] == 150
-    # All 3 segments in Week 1 (150 each = 450) + 1 segment in Week 2 (150) = 600 tokens counted in summary
-    assert summary["batches"][0]["total_tokens"] == 450
-    assert summary["total_tokens"] == 600
+    # Week 1: seg 0 (150) + seg 1 primary+fallback (300) + seg 2 (150) = 600; Week 2: seg 0 (150) -> 750 total
+    assert summary["batches"][0]["total_tokens"] == 600
+    assert summary["total_tokens"] == 750
 
 
 @pytest.mark.asyncio
@@ -8814,12 +8814,12 @@ async def test_segment_exceeding_segment_deadline_s_marked_incomplete_and_contin
         },
         {
             "agent": "main",
-            "session_id": "sess-fast-1",
+            "session_id": "sess-hang-0",
             "event_id": "ev-fast-1",
-            "seq": 1,
+            "seq": 2,
             "generation": "gen-1",
-            "created_at_ms": 1761300060000,
-            "ts": "2026-10-24T12:01:00+00:00",
+            "created_at_ms": 1761303600000,
+            "ts": "2026-10-24T13:00:00+00:00",
             "date_et": "2026-10-24",
             "text": "第二段正常快速完成。",
         },
@@ -9218,12 +9218,12 @@ async def test_round2_extraction_swallowing_cancelled_error_abandoned_after_5s_g
         },
         {
             "agent": "main",
-            "session_id": "sess-next",
+            "session_id": "sess-zombie",
             "event_id": "ev-next-1",
-            "seq": 1,
+            "seq": 2,
             "generation": "gen-1",
-            "created_at_ms": 1761300060000,
-            "ts": "2026-10-24T12:01:00+00:00",
+            "created_at_ms": 1761303600000,
+            "ts": "2026-10-24T13:00:00+00:00",
             "date_et": "2026-10-24",
             "text": "Segment 1 runs after Segment 0 is abandoned.",
         },
@@ -10799,3 +10799,630 @@ async def test_deferred_fallback_budget_wait_longer_than_window_ends_segment_now
     assert wait_calls == 3
     assert fake_mono == clock_at_third_wait[0]  # ended at once: no sleep after the third wait
     assert summary["incomplete_segments"]
+
+
+def test_normalize_number_token_extreme_values_and_non_finite_return_none() -> None:
+    """Verify `normalize_number_token` returns `None` without raising on huge exponents (`'1e5000'`),
+    overly long digit strings, `'Infinity'`, and `'NaN'`, while preserving normal number behavior.
+    """
+    assert extractor_mod.MAX_NUMBER_INTEGER_DIGITS == 30
+
+    # Extreme / non-finite / non-numeric inputs return None without raising
+    for bad_token in (
+        "1e5000",
+        "-1e5000",
+        "1e-5000",
+        "1e30",
+        "9" * 31,
+        "9" * 5000,
+        "0" * 31,
+        "1" + "0" * 5000 + ".25",
+        "Infinity",
+        "-Infinity",
+        "+Infinity",
+        "inf",
+        "-inf",
+        "NaN",
+        "nan",
+        "sNaN",
+        "",
+        "   ",
+        "not-a-number",
+    ):
+        assert extractor_mod.normalize_number_token(bad_token) is None
+
+    # Normal numbers behave as expected
+    assert extractor_mod.normalize_number_token("1,200") == "1200"
+    assert extractor_mod.normalize_number_token("35.0%") == "35"
+    assert extractor_mod.normalize_number_token("1e6") == "1000000"
+    assert extractor_mod.normalize_number_token("-0.25") == "0.25"
+    assert extractor_mod.normalize_number_token("0") == "0"
+    assert extractor_mod.normalize_number_token("1e29") == "1" + "0" * 29
+    assert extractor_mod.normalize_number_token("9" * 30) == "9" * 30
+
+    # End-to-end card validation & figure/Chinese numeral helpers do not raise on extreme tokens
+    quote_with_huge = "NVDA 压测日志出现异常值 1e5000 与 Infinity、NaN，四季度机柜出货 1.2 万柜。"
+    supported = extractor_mod.extract_quote_supported_numbers(quote_with_huge)
+    assert "1.2" in supported
+    assert "12000" in supported
+
+    val_res = extractor_mod.validate_candidate_card(
+        {
+            "claim": "NVDA 四季度机柜出货 1.2 万柜（日志含 1e5000）",
+            "topic_label": "NVDA 机柜出货",
+            "type": "fact",
+            "figures": [
+                {"metric": "rack_shipments", "value": "1.2", "unit": "万柜", "period": "2026Q4"},
+                {"metric": "overflow_noise", "value": "1e5000", "unit": "", "period": "2026Q4"},
+            ],
+            "tickers": ["NVDA"],
+            "quote": quote_with_huge,
+            "cited_sources": ["company_filing"],
+            "confidence": "NaN",
+        },
+        quote=quote_with_huge,
+    )
+    assert val_res.ok is True
+    assert val_res.confidence == 0.8
+    assert [f["metric"] for f in val_res.figures] == ["rack_shipments"]
+    assert extractor_mod._parse_chinese_number("亿" * 20) is None
+    assert extractor_mod._normalize_figure_value(10**400) == str(10**400)
+    assert extractor_mod._normalize_figure_value("Infinity") == "infinity"
+
+
+@pytest.mark.asyncio
+async def test_per_session_prefix_blocking_isolates_failed_session_and_flushes_other_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify:
+    1. When segments from Session A and Session B are mixed in one batch and Session A's 1st segment
+       fails with a non-transient error (`ValueError`) on both primary (`deepseek-flash`) and fallback
+       (`gemini-4-argon-medium-oauth`), Session A's 1st segment is marked `status='failed'` with
+       `reason='extraction_error:ValueError'` (no backoff sleep, not written to `processed`), and
+       Session A's 2nd segment is marked `status='blocked'` with `reason='blocked_by_incomplete_prefix'`.
+    2. When Session B's 1st segment (`ev-b-0`) fails with a non-transient parse/validation error on
+       primary (`deepseek-flash`) and succeeds on the fallback model (`gemini-4-argon-medium-oauth`),
+       Session B's segments complete (with `ev-b-0`'s card recording `extractor_model='gemini-4-argon-medium-oauth'`),
+       flush to `dalton_conversation_cards`, and write to `dalton_conversation_processed`.
+    3. On the next run, already-processed Session B segments are not re-extracted, while Session A's
+       unprocessed segments are retried and flush once fixed.
+    """
+    persisted_cards: list[str] = []
+    persisted_card_rows: dict[str, dict[str, Any]] = {}
+    processed_db: dict[tuple[str, str, str, int], dict[str, Any]] = {}
+    finish_calls: list[dict[str, Any]] = []
+
+    async def _fake_insert_batch(
+        cards: list[dict[str, Any]],
+        *,
+        embeddings: list[list[float] | None] | None = None,
+        conn: Any = None,
+    ) -> tuple[int, int, list[dict[str, Any]]]:
+        for c in cards:
+            cid = str(c["card_id"])
+            persisted_cards.append(cid)
+            persisted_card_rows[cid] = dict(c)
+        return len(cards), 0, list(cards)
+
+    async def _fake_record_processed(
+        rows: list[dict[str, Any]],
+        conn: Any = None,
+    ) -> int:
+        for r in rows:
+            key = (
+                str(r["agent"]),
+                str(r["session_id"]),
+                str(r["event_id"]),
+                int(r["chunk_idx"]),
+            )
+            processed_db[key] = dict(r)
+        return len(rows)
+
+    async def _capture_finish(run_id: str, **kwargs: Any) -> dict[str, Any]:
+        finish_calls.append({"run_id": run_id, **kwargs})
+        return {"run_id": run_id, **kwargs}
+
+    _patch_autospec_db_connection(monkeypatch)
+    monkeypatch.setattr(
+        db_conv,
+        "insert_run_start",
+        create_autospec(db_conv.insert_run_start, return_value={"status": "running"}),
+    )
+    monkeypatch.setattr(
+        db_conv,
+        "update_run_progress",
+        create_autospec(db_conv.update_run_progress, return_value=None),
+    )
+    monkeypatch.setattr(
+        db_conv,
+        "update_run_finish",
+        create_autospec(db_conv.update_run_finish, side_effect=_capture_finish),
+    )
+    monkeypatch.setattr(
+        db_conv,
+        "find_existing_content_hashes",
+        create_autospec(db_conv.find_existing_content_hashes, return_value=set()),
+    )
+    monkeypatch.setattr(
+        db_conv,
+        "insert_cards_batch",
+        create_autospec(db_conv.insert_cards_batch, side_effect=_fake_insert_batch),
+    )
+    monkeypatch.setattr(
+        db_conv,
+        "record_processed_event_chunks",
+        create_autospec(db_conv.record_processed_event_chunks, side_effect=_fake_record_processed),
+    )
+    monkeypatch.setattr(
+        db_conv,
+        "list_unrendered_dates",
+        create_autospec(db_conv.list_unrendered_dates, return_value=[]),
+    )
+    monkeypatch.setattr(
+        db_conv,
+        "list_cards_for_dates",
+        create_autospec(db_conv.list_cards_for_dates, return_value=[]),
+    )
+    monkeypatch.setattr(
+        db_conv,
+        "mark_dates_rendered",
+        create_autospec(db_conv.mark_dates_rendered, return_value=1),
+    )
+    monkeypatch.setattr(
+        archive_cli,
+        "render_and_write_conversation_digests",
+        create_autospec(
+            archive_cli.render_and_write_conversation_digests,
+            return_value={"rendered_dates": ["2026-10-24"], "card_locations": {}},
+        ),
+    )
+    mock_embed = create_autospec(
+        embedder_mod.embed_texts_via_bridge,
+        side_effect=lambda texts, *, task_type="RETRIEVAL_DOCUMENT": (
+            [[0.1, 0.2, 0.3] for _ in texts],
+            "gemini-embedding-001",
+        ),
+    )
+
+    base_ms = int(datetime(2026, 10, 24, 10, 0, tzinfo=timezone.utc).timestamp() * 1000)
+    raw_events = [
+        # seg 0: Session A segment 1 (t = +0m)
+        {
+            "agent": "main",
+            "session_id": "sess-A",
+            "event_id": "ev-a-0",
+            "seq": 1,
+            "generation": "gen-1",
+            "created_at_ms": base_ms,
+            "ts": "2026-10-24T10:00:00+00:00",
+            "date_et": "2026-10-24",
+            "text": "Session A segment 0 containing 1e5000 bad token.",
+        },
+        # seg 1: Session B segment 1 (t = +10m)
+        {
+            "agent": "main",
+            "session_id": "sess-B",
+            "event_id": "ev-b-0",
+            "seq": 1,
+            "generation": "gen-1",
+            "created_at_ms": base_ms + 600_000,
+            "ts": "2026-10-24T10:10:00+00:00",
+            "date_et": "2026-10-24",
+            "text": "TSMC CoWoS 2026 年产能规划跟踪第一段。",
+        },
+        # seg 2: Session A segment 2 (t = +60m, >30m gap in sess-A)
+        {
+            "agent": "main",
+            "session_id": "sess-A",
+            "event_id": "ev-a-1",
+            "seq": 2,
+            "generation": "gen-1",
+            "created_at_ms": base_ms + 3_600_000,
+            "ts": "2026-10-24T11:00:00+00:00",
+            "date_et": "2026-10-24",
+            "text": "Session A segment 1 NVDA Blackwell 后续跟踪。",
+        },
+        # seg 3: Session B segment 2 (t = +70m, >30m gap in sess-B)
+        {
+            "agent": "main",
+            "session_id": "sess-B",
+            "event_id": "ev-b-1",
+            "seq": 2,
+            "generation": "gen-1",
+            "created_at_ms": base_ms + 4_200_000,
+            "ts": "2026-10-24T11:10:00+00:00",
+            "date_et": "2026-10-24",
+            "text": "TSMC CoWoS 2026 年产能规划跟踪第二段。",
+        },
+    ]
+
+    run_number = 1
+    calls_by_ev: dict[str, list[str]] = {}
+
+    async def _extract_mixed(
+        segment: list[dict[str, Any]],
+        **kwargs: Any,
+    ) -> extractor_mod.SegmentExtractionOutcome:
+        ev_id = str(segment[0]["event_id"])
+        model_used = str(kwargs.get("extractor_model") or "deepseek-flash")
+        calls_by_ev.setdefault(ev_id, []).append(model_used)
+        if run_number == 1 and ev_id == "ev-a-0":
+            # Both primary and fallback fail with a deterministic ValueError
+            raise ValueError("Exceeds the limit (4300 digits) for integer string conversion")
+        if run_number == 1 and ev_id == "ev-b-0" and model_used == "deepseek-flash":
+            # Primary fails with a deterministic ValidationError, fallback succeeds
+            return extractor_mod.SegmentExtractionOutcome(
+                ok=False,
+                model_used=model_used,
+                status="error",
+                error_kind="ValidationError",
+                input_tokens=80,
+                output_tokens=20,
+                total_tokens=100,
+                error="ValidationError: primary returned malformed card schema",
+            )
+        return extractor_mod.SegmentExtractionOutcome(
+            ok=True,
+            category="research",
+            cards=[
+                {
+                    "card_id": f"cc_{ev_id}",
+                    "source_type": "conversation",
+                    "agent": "main",
+                    "session_id": str(segment[0]["session_id"]),
+                    "quote_event_id": ev_id,
+                    "generation": "gen-1",
+                    "ts": str(segment[0]["ts"]),
+                    "date_et": "2026-10-24",
+                    "tickers": ["TSM"] if "ev-b" in ev_id else ["NVDA"],
+                    "entities": [],
+                    "sectors": [],
+                    "topic_label": "Semis",
+                    "type": "estimate",
+                    "claim": f"Claim {ev_id}",
+                    "quote": str(segment[0]["text"]),
+                    "extractor_model": model_used,
+                    "content_hash": f"hash_{ev_id}",
+                    "search_text": f"Search {ev_id}",
+                    "status": "active",
+                }
+            ],
+            cards_raw_count=1,
+            model_used=model_used,
+            input_tokens=100,
+            output_tokens=50,
+            total_tokens=150,
+        )
+
+    mock_extract = create_autospec(
+        extractor_mod.extract_segment_cards,
+        side_effect=_extract_mixed,
+    )
+    mock_sleep = create_autospec(asyncio.sleep, return_value=None)
+
+    summary_run1 = await archive_cli.process_weekly_batch(
+        [dict(e) for e in raw_events],
+        mode="run",
+        window_start=date(2026, 10, 20),
+        window_end=date(2026, 10, 26),
+        limiter=archive_cli.HourlyTokenBudgetLimiter(1_500_000, sleep_fn=mock_sleep),
+        extractor_model="deepseek-flash",
+        extractor_fallback_model="gemini-4-argon-medium-oauth",
+        prompt_version="conv_card_v2_3",
+        concurrency=2,
+        extract_fn=mock_extract,
+        embed_fn=mock_embed,
+        sleep_fn=mock_sleep,
+    )
+
+    # Deterministic failure on primary triggers exactly one fallback attempt (no backoff sleeps):
+    # - `ev-a-0` failed on both primary and fallback -> marked `failed`
+    # - `ev-b-0` failed on primary and succeeded on fallback -> completed with fallback `extractor_model`
+    assert calls_by_ev["ev-a-0"] == ["deepseek-flash", "gemini-4-argon-medium-oauth"]
+    assert calls_by_ev["ev-b-0"] == ["deepseek-flash", "gemini-4-argon-medium-oauth"]
+    assert calls_by_ev["ev-b-1"] == ["deepseek-flash"]
+    assert mock_sleep.await_count == 0
+
+    # Session B's 2 segments flushed to DB and wrote processed; Session A's 2 segments did not
+    assert summary_run1["segments_processed"] == 2
+    assert summary_run1["cards_inserted"] == 2
+    assert persisted_cards == ["cc_ev-b-0", "cc_ev-b-1"]
+    assert persisted_card_rows["cc_ev-b-0"]["extractor_model"] == "gemini-4-argon-medium-oauth"
+    assert persisted_card_rows["cc_ev-b-1"]["extractor_model"] == "deepseek-flash"
+    assert set(processed_db) == {
+        ("main", "sess-B", "ev-b-0", 0),
+        ("main", "sess-B", "ev-b-1", 0),
+    }
+
+    # Session A seg 0 is failed with exception type in reason; Session A seg 1 is blocked
+    assert summary_run1["incomplete_segments_count"] == 2
+    inc_by_ev = {item["first_event_id"]: item for item in summary_run1["incomplete_segments"]}
+    assert inc_by_ev["ev-a-0"]["status"] == "failed"
+    assert inc_by_ev["ev-a-0"]["reason"] == "extraction_error:ValueError"
+    assert inc_by_ev["ev-a-1"]["status"] == "blocked"
+    assert inc_by_ev["ev-a-1"]["reason"] == "blocked_by_incomplete_prefix"
+    assert finish_calls[-1]["status"] == "failed"
+
+    # Run 2: Incremental filter skips already-processed Session B and retries only Session A
+    run_number = 2
+    calls_by_ev.clear()
+    unprocessed_for_run2 = [
+        dict(e) for e in raw_events if archive_cli._chunk_key(e) not in processed_db
+    ]
+    assert [e["event_id"] for e in unprocessed_for_run2] == ["ev-a-0", "ev-a-1"]
+
+    summary_run2 = await archive_cli.process_weekly_batch(
+        unprocessed_for_run2,
+        mode="run",
+        window_start=date(2026, 10, 20),
+        window_end=date(2026, 10, 26),
+        limiter=archive_cli.HourlyTokenBudgetLimiter(1_500_000, sleep_fn=mock_sleep),
+        extractor_model="deepseek-flash",
+        extractor_fallback_model="gemini-4-argon-medium-oauth",
+        prompt_version="conv_card_v2_3",
+        concurrency=2,
+        extract_fn=mock_extract,
+        embed_fn=mock_embed,
+        sleep_fn=mock_sleep,
+    )
+
+    assert set(calls_by_ev) == {"ev-a-0", "ev-a-1"}
+    assert summary_run2["incomplete_segments_count"] == 0
+    assert summary_run2["segments_processed"] == 2
+    assert persisted_cards == ["cc_ev-b-0", "cc_ev-b-1", "cc_ev-a-0", "cc_ev-a-1"]
+    assert set(processed_db) == {
+        ("main", "sess-B", "ev-b-0", 0),
+        ("main", "sess-B", "ev-b-1", 0),
+        ("main", "sess-A", "ev-a-0", 0),
+        ("main", "sess-A", "ev-a-1", 0),
+    }
+
+
+@pytest.mark.asyncio
+async def test_assist_result_wrapped_pool_timeout_takes_transient_path_not_marked_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify a `PoolTimeout` caught and wrapped by `assist_json` into
+    `AssistResult(ok=False, status='error', error_kind='PoolTimeout', ...)` is classified as
+    a transient error (NOT a deterministic failure), retries on the transient backoff path,
+    and succeeds without marking the segment `failed`.
+    """
+    from psycopg_pool import PoolTimeout
+
+    monkeypatch.setattr(
+        assist_mod,
+        "dalton_complete",
+        create_autospec(
+            complete_mod.dalton_complete,
+            side_effect=PoolTimeout("couldn't get a connection after 30.00 sec"),
+        ),
+    )
+    wrapped_res = await assist_mod.assist_json(
+        task="conversation.extract_cards",
+        instructions="Extract cards",
+        payload={"events": []},
+        schema={"type": "object"},
+        user_id="u-pool-test",
+        role="extract",
+        model="gemini-4-argon-medium-oauth",
+    )
+    assert wrapped_res.ok is False
+    assert wrapped_res.status == "error"
+    assert wrapped_res.error_kind == "PoolTimeout"
+    assert extractor_mod._is_deterministic_extraction_error(wrapped_res) is False
+    assert extractor_mod.is_transient_network_error(wrapped_res) is True
+
+    # Also verify when `error` text itself omits the class name prefix (only `error_kind="PoolTimeout"`):
+    bare_res = assist_mod.AssistResult(
+        ok=False,
+        status="error",
+        error_kind="PoolTimeout",
+        error="couldn't get a connection after 30.00 sec",
+        model="gemini-4-argon-medium-oauth",
+    )
+    assert extractor_mod._is_deterministic_extraction_error(bare_res) is False
+    assert extractor_mod.is_transient_network_error(bare_res) is True
+
+    # Exercise end-to-end through `extract_segment_cards` + `process_weekly_batch`:
+    # Attempt 1 returns `wrapped_res` (`AssistResult` wrapping `PoolTimeout` with `status="error"`),
+    # Attempt 2 succeeds after transient 2.0s backoff -> segment completes, NOT marked `failed`.
+    assist_calls = 0
+
+    async def _pool_timeout_then_ok(*args: Any, **kwargs: Any) -> assist_mod.AssistResult:
+        nonlocal assist_calls
+        assist_calls += 1
+        if assist_calls == 1:
+            return wrapped_res
+        return assist_mod.AssistResult(
+            ok=True,
+            status="ok",
+            model=str(kwargs.get("model") or "gemini-4-argon-medium-oauth"),
+            data={
+                "category": "research",
+                "topic_label": "NVDA",
+                "cards": [
+                    {
+                        "type": "fact",
+                        "topic_label": "NVDA",
+                        "claim": "NVDA 四季度机柜出货 1.2 万柜",
+                        "tickers": ["NVDA"],
+                        "entities": [],
+                        "sectors": ["Semiconductors"],
+                        "figures": [],
+                        "quote": "NVDA 四季度机柜出货 1.2 万柜。",
+                        "quote_event_id": "ev-pool-1",
+                        "cited_sources": [],
+                        "confidence": 0.9,
+                    }
+                ],
+            },
+            usage={"input_tokens": 100, "output_tokens": 40, "total_tokens": 140},
+        )
+
+    monkeypatch.setattr(
+        extractor_mod,
+        "assist_json",
+        create_autospec(extractor_mod.assist_json, side_effect=_pool_timeout_then_ok),
+    )
+    _patch_autospec_db_connection(monkeypatch)
+    monkeypatch.setattr(
+        db_conv,
+        "insert_run_start",
+        create_autospec(db_conv.insert_run_start, return_value={"status": "running"}),
+    )
+    monkeypatch.setattr(
+        db_conv,
+        "update_run_progress",
+        create_autospec(db_conv.update_run_progress, return_value=None),
+    )
+    monkeypatch.setattr(
+        db_conv,
+        "update_run_finish",
+        create_autospec(db_conv.update_run_finish, return_value={"status": "completed"}),
+    )
+    monkeypatch.setattr(
+        db_conv,
+        "find_existing_content_hashes",
+        create_autospec(db_conv.find_existing_content_hashes, return_value=set()),
+    )
+    monkeypatch.setattr(
+        db_conv,
+        "insert_cards_batch",
+        create_autospec(
+            db_conv.insert_cards_batch,
+            side_effect=lambda cards, *, embeddings=None, conn=None: (len(cards), 0, list(cards)),
+        ),
+    )
+    processed_rows: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        db_conv,
+        "record_processed_event_chunks",
+        create_autospec(
+            db_conv.record_processed_event_chunks,
+            side_effect=lambda rows, conn=None: (processed_rows.extend(rows) or len(rows)),
+        ),
+    )
+    monkeypatch.setattr(
+        db_conv,
+        "list_unrendered_dates",
+        create_autospec(db_conv.list_unrendered_dates, return_value=[]),
+    )
+    monkeypatch.setattr(
+        db_conv,
+        "list_cards_for_dates",
+        create_autospec(db_conv.list_cards_for_dates, return_value=[]),
+    )
+    monkeypatch.setattr(
+        db_conv,
+        "mark_dates_rendered",
+        create_autospec(db_conv.mark_dates_rendered, return_value=1),
+    )
+    monkeypatch.setattr(
+        archive_cli,
+        "render_and_write_conversation_digests",
+        create_autospec(
+            archive_cli.render_and_write_conversation_digests,
+            return_value={"rendered_dates": ["2026-10-24"], "card_locations": {}},
+        ),
+    )
+
+    slept_delays: list[float] = []
+    mock_sleep = create_autospec(
+        asyncio.sleep,
+        side_effect=lambda s: slept_delays.append(float(s)),
+    )
+    mock_embed = create_autospec(
+        embedder_mod.embed_texts_via_bridge,
+        return_value=([[0.1, 0.2, 0.3]], "gemini-embedding-001"),
+    )
+
+    summary = await archive_cli.process_weekly_batch(
+        [
+            {
+                "agent": "main",
+                "session_id": "sess-pool-1",
+                "event_id": "ev-pool-1",
+                "seq": 1,
+                "generation": "gen-1",
+                "created_at_ms": 1761300000000,
+                "ts": "2026-10-24T12:00:00+00:00",
+                "date_et": "2026-10-24",
+                "speaker": {"sender_id_hash": "h1", "name": "Owner", "is_owner": True, "role": "owner"},
+                "text": "NVDA 四季度机柜出货 1.2 万柜。",
+            }
+        ],
+        mode="run",
+        window_start=date(2026, 10, 20),
+        window_end=date(2026, 10, 26),
+        limiter=archive_cli.HourlyTokenBudgetLimiter(1_500_000, sleep_fn=mock_sleep),
+        extractor_model="gemini-4-argon-medium-oauth",
+        prompt_version="conv_card_v2_3",
+        embed_fn=mock_embed,
+        sleep_fn=mock_sleep,
+    )
+
+    assert assist_calls == 2
+    assert slept_delays == [2.0]
+    assert summary["status"] == "completed"
+    assert summary["incomplete_segments_count"] == 0
+    assert summary["segments_processed"] == 1
+    assert summary["cards_inserted"] == 1
+    assert [r["event_id"] for r in processed_rows] == ["ev-pool-1"]
+
+
+
+
+@pytest.mark.asyncio
+async def test_oauth_primary_validation_error_still_falls_back_once() -> None:
+    """An OAuth primary resends transient errors itself, but a deterministic failure
+    (here a schema validation error) goes to the fallback model once."""
+    async def _extract(segment: list[dict[str, Any]], **kwargs: Any) -> extractor_mod.SegmentExtractionOutcome:
+        model = str(kwargs.get("extractor_model") or "")
+        if model == "gemini-4-argon-medium-oauth":
+            return extractor_mod.SegmentExtractionOutcome(
+                ok=False,
+                model_used=model,
+                status="error",
+                error_kind="ValidationError",
+                error="ValidationError: cards[0].ticker: field required",
+            )
+        return extractor_mod.SegmentExtractionOutcome(
+            ok=True,
+            category="research",
+            cards=[],
+            cards_raw_count=0,
+            model_used=model,
+            input_tokens=100,
+            output_tokens=50,
+            total_tokens=150,
+        )
+
+    mock_extract = create_autospec(extractor_mod.extract_segment_cards, side_effect=_extract)
+    segment = [
+        {
+            "agent": "main",
+            "session_id": "sess-oauth-fb",
+            "event_id": "ev-oauth-fb-0",
+            "seq": 1,
+            "generation": "gen-1",
+            "created_at_ms": 1761300000000,
+            "ts": "2026-10-24T12:00:00+00:00",
+            "date_et": "2026-10-24",
+            "text": "OAuth primary returns cards that fail validation.",
+        }
+    ]
+    outcome, _ = await archive_cli.extract_segment_with_infinite_backoff(
+        segment,
+        extractor_model="gemini-4-argon-medium-oauth",
+        prompt_version="conv_card_v2_3",
+        extractor_fallback_model="deepseek-flash",
+        segment_deadline_s=600.0,
+        extract_fn=mock_extract,
+    )
+
+    assert [c.kwargs.get("extractor_model") for c in mock_extract.call_args_list] == [
+        "gemini-4-argon-medium-oauth",
+        "deepseek-flash",
+    ]
+    assert outcome.ok is True
+    assert outcome.model_used == "deepseek-flash"

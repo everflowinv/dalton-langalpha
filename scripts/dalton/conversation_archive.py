@@ -64,6 +64,7 @@ from src.dalton.conversations.extractor import (  # noqa: E402
     deduplicate_candidate_cards,
     expand_event_chunks,
     extract_segment_cards,
+    is_deterministic_extraction_error,
     is_fallback_eligible,
     is_in_flight_error,
     is_permanent_quota_error,
@@ -1286,10 +1287,17 @@ async def extract_segment_with_infinite_backoff(
                         limiter.clear_rate_limit_backoff(pause_until)
                 continue
 
+            # A platform-key model may not be resent after a timeout, so any
+            # fallback-eligible failure goes to the fallback; an OAuth primary
+            # keeps retrying transient errors itself and falls back only when
+            # the failure is deterministic (resending would fail the same way).
             if (
-                billing_type != "oauth"
-                and not reextract_delegated_fallback
+                not reextract_delegated_fallback
                 and is_fallback_eligible(outcome)
+                and (
+                    billing_type != "oauth"
+                    or is_deterministic_extraction_error(outcome)
+                )
             ):
                 if not eff_fallback_model or eff_fallback_model == extractor_model:
                     return _with_accumulated_usage(outcome), rl_attempt + transient_attempt
@@ -1652,6 +1660,20 @@ async def process_weekly_batch(
     # failure (rendering, run finish) does not add it again.
     incomplete_usage_rolled = False
     seg_deadline_by_idx: dict[int, float] = {}
+    seg_session_by_idx: dict[int, tuple[str, str]] = {}
+    session_seg_indices: dict[tuple[str, str], list[int]] = {}
+    for _idx, _seg in enumerate(segments):
+        _first_ev = _seg[0] if _seg and isinstance(_seg[0], dict) else {}
+        _skey = (
+            str(_first_ev.get("agent") or "main"),
+            str(_first_ev.get("session_id") or ""),
+        )
+        seg_session_by_idx[_idx] = _skey
+        session_seg_indices.setdefault(_skey, []).append(_idx)
+    session_flush_pos: dict[tuple[str, str], int] = {
+        _skey: 0 for _skey in session_seg_indices
+    }
+    flushed_seg_indices: set[int] = set()
     next_to_flush = 0
     flush_failed = False
     flush_lock = asyncio.Lock()
@@ -1719,17 +1741,23 @@ async def process_weekly_batch(
             if flush_failed:
                 return
             try:
-                while next_to_flush in completed_by_idx:
-                    if incomplete_by_idx and next_to_flush >= min(incomplete_by_idx):
-                        break
+                while completed_by_idx:
                     ready_batch: list[tuple[int, list[dict[str, Any]], SegmentExtractionOutcome, int]] = []
-                    peek_idx = next_to_flush
-                    while peek_idx in completed_by_idx and len(ready_batch) < eff_concurrency:
-                        if incomplete_by_idx and peek_idx >= min(incomplete_by_idx):
+                    temp_session_pos = dict(session_flush_pos)
+                    for cand_idx in sorted(completed_by_idx):
+                        if len(ready_batch) >= eff_concurrency:
                             break
-                        seg, outcome, rl_retries = completed_by_idx[peek_idx]
-                        ready_batch.append((peek_idx, seg, outcome, rl_retries))
-                        peek_idx += 1
+                        if cand_idx in incomplete_by_idx:
+                            continue
+                        sess_key = seg_session_by_idx.get(cand_idx)
+                        if sess_key is None:
+                            continue
+                        sess_indices = session_seg_indices.get(sess_key, [])
+                        pos = temp_session_pos.get(sess_key, 0)
+                        if pos < len(sess_indices) and sess_indices[pos] == cand_idx:
+                            seg, outcome, rl_retries = completed_by_idx[cand_idx]
+                            ready_batch.append((cand_idx, seg, outcome, rl_retries))
+                            temp_session_pos[sess_key] = pos + 1
 
                     if not ready_batch:
                         break
@@ -1816,13 +1844,18 @@ async def process_weekly_batch(
                         ]
                         for seg_idx, seg_list, seg_outcome, _ in ready_batch:
                             completed_by_idx.pop(seg_idx, None)
+                            flushed_seg_indices.add(seg_idx)
+                            sess_key = seg_session_by_idx.get(seg_idx)
+                            if sess_key is not None:
+                                session_flush_pos[sess_key] = session_flush_pos.get(sess_key, 0) + 1
                             seg_list.clear()
                             seg_outcome.cards.clear()
                             if 0 <= seg_idx < len(segments):
                                 segments[seg_idx].clear()
                                 segments[seg_idx] = []
                         ready_batch.clear()
-                        next_to_flush = peek_idx
+                        while next_to_flush < total_segments and next_to_flush in flushed_seg_indices:
+                            next_to_flush += 1
                         segments_flushed += batch_segments
                         rate_limit_retries += batch_rl_retries
                         input_tokens += batch_in_tokens
@@ -1984,13 +2017,18 @@ async def process_weekly_batch(
 
                     for seg_idx, seg_list, seg_outcome, _ in ready_batch:
                         completed_by_idx.pop(seg_idx, None)
+                        flushed_seg_indices.add(seg_idx)
+                        sess_key = seg_session_by_idx.get(seg_idx)
+                        if sess_key is not None:
+                            session_flush_pos[sess_key] = session_flush_pos.get(sess_key, 0) + 1
                         seg_list.clear()
                         seg_outcome.cards.clear()
                         if 0 <= seg_idx < len(segments):
                             segments[seg_idx].clear()
                             segments[seg_idx] = []
                     ready_batch.clear()
-                    next_to_flush = peek_idx
+                    while next_to_flush < total_segments and next_to_flush in flushed_seg_indices:
+                        next_to_flush += 1
                     embedding_model_used = batch_emb_model
                     segments_flushed += batch_segments
                     rate_limit_retries += batch_rl_retries
