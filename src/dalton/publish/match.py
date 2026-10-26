@@ -1676,12 +1676,37 @@ def _extract_hit_window(
             if source_cache is not None
             else extract_figures(body)
         )
+        # ExtractedFigure carries no character offsets, only its line, so a
+        # figure is found again as the n-th occurrence of its raw text on that
+        # line (counting the exempt figures before it). Line starts follow the
+        # extractor's own splitlines(), not just "\n".
+        line_starts: list[int] = []
+        offset = 0
+        for chunk in body.splitlines(keepends=True):
+            line_starts.append(offset)
+            offset += len(chunk)
+        seen_on_line: dict[tuple[Any, str], int] = {}
         for sf in sfs:
+            line_no = (sf.location or {}).get("line")
+            occurrence = seen_on_line.get((line_no, sf.raw), 0)
+            seen_on_line[(line_no, sf.raw)] = occurrence + 1
             if sf.exempt:
                 continue
             ok_v, _, _ = values_within_tolerance(fig, sf.value, sf.unit, sf.scale)
-            if ok_v:
-                hit_span = sf.span
+            if not ok_v or not sf.raw:
+                continue
+            pos = -1
+            if isinstance(line_no, int) and 1 <= line_no <= len(line_starts):
+                cursor = line_starts[line_no - 1]
+                for _ in range(occurrence + 1):
+                    pos = body.find(sf.raw, cursor)
+                    if pos < 0:
+                        break
+                    cursor = pos + len(sf.raw)
+            if pos < 0:
+                pos = body.find(sf.raw)
+            if pos >= 0:
+                hit_span = (pos, pos + len(sf.raw))
                 break
 
     if hit_span is None and fig.period:

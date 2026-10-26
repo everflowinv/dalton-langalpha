@@ -6187,3 +6187,68 @@ async def test_round8_tight_currency_binding_and_model_cell_per_share_currency_p
 
 
 
+
+
+def test_hit_window_falls_back_to_an_equal_value_written_differently() -> None:
+    """The draft writes 9.14 亿美元, the source writes $914 million: the window must
+    centre on the source figure (this path used to read a nonexistent `.span`)."""
+    from src.dalton.publish.match import _extract_hit_window
+    from src.dalton.publish.numbers import extract_figures
+
+    fig = extract_figures("Adjusted EBITDA 为 9.14 亿美元。\n")[0]
+    body = ("背景资料。" * 400) + " Adjusted EBITDA was $914 million in the quarter. " + ("其他内容。" * 400)
+    assert fig.raw not in body
+
+    window = _extract_hit_window(body, fig, window=200)
+
+    assert len(window) == 200
+    assert "$914 million" in window
+
+
+def test_hit_window_picks_the_matched_occurrence_not_the_first() -> None:
+    """The same raw appears first in an exempt quote and again much later: the
+    window must centre on the occurrence the matcher chose."""
+    from src.dalton.publish.match import _extract_hit_window
+    from src.dalton.publish.numbers import extract_figures
+
+    fig = extract_figures("Adjusted EBITDA 为 9.14 亿美元。\n")[0]
+    body = (
+        "> 管理层原话：we expect $914 million next year.\n"
+        + ("背景资料。" * 400)
+        + "\nSECOND-HIT Adjusted EBITDA was $914 million in the quarter.\n"
+        + ("其他内容。" * 400)
+    )
+
+    window = _extract_hit_window(body, fig, window=200)
+
+    assert "SECOND-HIT" in window
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r", " "])
+def test_hit_window_line_starts_follow_the_extractors_line_breaks(newline: str) -> None:
+    from src.dalton.publish.match import _extract_hit_window
+    from src.dalton.publish.numbers import extract_figures
+
+    fig = extract_figures("Adjusted EBITDA 为 9.14 亿美元。\n")[0]
+    body = (
+        "> 管理层原话：we expect $914 million next year." + newline
+        + ("背景资料。" * 400) + newline
+        + "SECOND-HIT Adjusted EBITDA was $914 million in the quarter." + newline
+        + ("其他内容。" * 400)
+    )
+
+    assert "SECOND-HIT" in _extract_hit_window(body, fig, window=200)
+
+
+def test_hit_window_skips_an_exempt_duplicate_earlier_on_the_same_line() -> None:
+    from src.dalton.publish.match import _extract_hit_window
+    from src.dalton.publish.numbers import extract_figures
+
+    fig = extract_figures("Adjusted EBITDA 为 9.14 亿美元。\n")[0]
+    table = (
+        "| 指标 | 假设值 | 实际 |\n|---|---|---|\n"
+        "| EBITDA | [假设] $914 million " + ("占位" * 300) + " | SECOND-HIT $914 million |\n"
+    )
+    body = ("背景资料。" * 300) + "\n" + table + ("其他内容。" * 300)
+
+    assert "SECOND-HIT" in _extract_hit_window(body, fig, window=200)
