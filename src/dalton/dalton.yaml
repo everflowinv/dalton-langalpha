@@ -103,9 +103,10 @@ conversations:
   embedding_model: "gemini-embedding-001"
   embedding_model_preferred: "gemini-embedding-2-preview"
   embedding_dimensions: 3072
-  # 10/26 user decision: 500k/h. A backlog of ~75 segments (about 20k tokens each)
-  # took 10+ hours at 120k/h; deepseek-flash costs about $0.016 per segment.
-  hourly_token_budget: 500000
+  # 10/26 user decision: 5M/h. At 120k/h a backlog of ~75 segments (about 20k tokens
+  # each) took 10+ hours; deepseek-flash costs about $0.016 per segment, so 5M/h is at
+  # most a few dollars an hour.
+  hourly_token_budget: 5000000
   extract_concurrency: 1
   default_backfill_days: 14
   max_segment_gap_minutes: 30
