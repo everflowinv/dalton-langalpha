@@ -7,6 +7,8 @@ Endpoints:
   - `POST /mcp` (Streamable HTTP JSON-RPC 2.0 endpoint; authenticated via
     `Authorization: Bearer <token>` or `X-Dalton-Bridge-Token` header; legacy
     `POST /mcp/<token>` path remains accepted during transition)
+  - `POST /notify`, `POST /feishu/*` (admin-token routes: notification fanout
+    and the host-side Feishu OpenAPI proxy)
 
 Pure Python 3.11+ standard library only.
 """
@@ -1104,6 +1106,23 @@ class BridgeConfig:
             )
         except ValueError:
             self.wiki_ingest_timeout_s = WIKI_INGEST_TIMEOUT_S
+        # Feishu doc read/write proxy (DALTON-HOOK(feishu-docs)): credentials live on
+        # the host only — env first, else a read-only lookup of the OpenClaw channel
+        # account. Never logged, never returned by any route.
+        env_feishu_app_id = os.environ.get("FEISHU_APP_ID", "").strip()
+        env_feishu_app_secret = os.environ.get("FEISHU_APP_SECRET", "").strip()
+        if env_feishu_app_id and env_feishu_app_secret:
+            self.feishu_app_id = env_feishu_app_id
+            self.feishu_app_secret = env_feishu_app_secret
+        else:
+            self.feishu_app_id, self.feishu_app_secret = _read_openclaw_feishu_credentials()
+        try:
+            self.feishu_http_timeout_s: float = max(
+                5.0,
+                float(os.environ.get("FEISHU_HTTP_TIMEOUT_S", "30") or 30.0),
+            )
+        except ValueError:
+            self.feishu_http_timeout_s = 30.0
         self.test_mode: bool = os.environ.get("DALTON_BRIDGE_TEST_MODE", "0").strip().lower() in (
             "1",
             "true",
@@ -9804,6 +9823,246 @@ class ResearchDataBridge:
                     pass
             self._release_wiki_claim_locks(claim_fds)
 
+    # ------------------------------------------------------------------
+    # Feishu doc read/write handlers (DALTON-HOOK(feishu-docs))
+    # ------------------------------------------------------------------
+
+    def _feishu_client(self) -> FeishuClient | None:
+        """Return the cached Feishu client, or None when no credentials are configured."""
+        cached = getattr(self, "_feishu_client_instance", None)
+        if cached is not None:
+            return cached
+        app_id = (getattr(self.cfg, "feishu_app_id", "") or "").strip()
+        app_secret = (getattr(self.cfg, "feishu_app_secret", "") or "").strip()
+        if not app_id or not app_secret:
+            return None
+        client = FeishuClient(
+            app_id, app_secret, timeout_s=getattr(self.cfg, "feishu_http_timeout_s", 30.0)
+        )
+        self._feishu_client_instance = client
+        return client
+
+    async def _run_feishu(self, fn, *args: Any, **kwargs: Any) -> Any:
+        """Run a blocking FeishuClient call off the event loop; map errors to (code, payload)."""
+        client = self._feishu_client()
+        if client is None:
+            return 503, {"ok": False, "error": "feishu_not_configured"}
+        try:
+            result = await asyncio.to_thread(fn, client, *args, **kwargs)
+        except FeishuApiError as exc:
+            logger.warning(
+                "feishu route call failed error=%s detail=%s",
+                exc.error_code,
+                str(exc)[:200],
+            )
+            return 502, {"ok": False, "error": exc.error_code, "detail": str(exc)[:200]}
+        return 200, result
+
+    async def handle_feishu_doc_read(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        """Handle ``POST /feishu/doc/read``: resolve a docx/wiki link or token and return title + plain text.
+
+        ``document_id`` may be supplied by a caller that already resolved the
+        token through ``/feishu/wiki/node`` (the external-member permission
+        check); it is then used as-is so the check and the read act on the
+        same resolution instead of resolving twice.
+        """
+        raw_token = body.get("token")
+        kind, token = parse_feishu_token(raw_token if isinstance(raw_token, str) else "")
+        pre_resolved = str(body.get("document_id") or "").strip()
+        if not token and not pre_resolved:
+            return 400, {"ok": False, "error": "invalid_token"}
+        try:
+            max_chars = int(body.get("max_chars") or FEISHU_DEFAULT_CONTENT_CHARS)
+        except (TypeError, ValueError):
+            max_chars = FEISHU_DEFAULT_CONTENT_CHARS
+        max_chars = max(1000, min(max_chars, FEISHU_MAX_CONTENT_CHARS))
+
+        def _read(client: FeishuClient) -> dict[str, Any]:
+            if pre_resolved:
+                document_id, node = pre_resolved, {}
+            else:
+                document_id, node = resolve_feishu_document(client, kind, token)
+            document = client.get_document(document_id)
+            content = client.raw_content(document_id)
+            truncated = len(content) > max_chars
+            payload: dict[str, Any] = {
+                "ok": True,
+                "document_id": document_id,
+                "title": str(document.get("title") or node.get("title") or ""),
+                "content": content[:max_chars] if truncated else content,
+                "total_chars": len(content),
+                "truncated": truncated,
+            }
+            if node:
+                payload["node_token"] = str(node.get("node_token") or "")
+                payload["space_id"] = str(node.get("space_id") or "")
+            return payload
+
+        code, result = await self._run_feishu(_read)
+        return code, result
+
+    async def handle_feishu_wiki_nodes(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        """Handle ``POST /feishu/wiki/nodes``: list spaces (no ``space_id``) or a space's nodes."""
+        space_id = str(body.get("space_id") or "").strip()
+        parent_node_token = str(body.get("parent_node_token") or "").strip()
+        if not space_id:
+
+            def _spaces(client: FeishuClient) -> dict[str, Any]:
+                return {
+                    "ok": True,
+                    "spaces": [
+                        {
+                            "space_id": str(s.get("space_id") or ""),
+                            "name": str(s.get("name") or ""),
+                            "description": str(s.get("description") or ""),
+                        }
+                        for s in client.list_spaces()
+                    ],
+                }
+
+            code, result = await self._run_feishu(_spaces)
+            return code, result
+
+        def _nodes(client: FeishuClient) -> dict[str, Any]:
+            return {
+                "ok": True,
+                "space_id": space_id,
+                "nodes": [_feishu_node_summary(n) for n in client.list_nodes(space_id, parent_node_token)],
+            }
+
+        code, result = await self._run_feishu(_nodes)
+        return code, result
+
+    async def handle_feishu_wiki_node(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        """Handle ``POST /feishu/wiki/node``: resolve a link/token to its wiki node (or ``node: None``).
+
+        Uses `resolve_feishu_node_for_check`: same resolution as the read path
+        (wiki link -> node, docx link -> reverse lookup, bare token -> wiki
+        first, then a docx reverse lookup), so the permission check and the
+        read act on one resolution and a bare docx token is not rejected as
+        `not_in_wiki` when its space is whitelist-checkable.
+        """
+        raw_token = body.get("token")
+        kind, token = parse_feishu_token(raw_token if isinstance(raw_token, str) else "")
+        if not token:
+            return 400, {"ok": False, "error": "invalid_token"}
+        obj_type = str(body.get("obj_type") or "").strip()
+
+        def _resolve(client: FeishuClient) -> dict[str, Any]:
+            if obj_type:
+                node = _soft_get_node(client, token, obj_type=obj_type)
+            else:
+                _, node = resolve_feishu_node_for_check(client, kind, token)
+            if not node:
+                return {"ok": True, "node": None, "reason": "not_in_wiki"}
+            return {"ok": True, "node": _feishu_node_summary(node)}
+
+        code, result = await self._run_feishu(_resolve)
+        return code, result
+
+    async def handle_feishu_doc_create(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        """Handle ``POST /feishu/doc/create``: create a docx (wiki node or drive) and insert markdown blocks."""
+        title = str(body.get("title") or "").strip()
+        markdown = str(body.get("markdown") or "").strip()
+        if not title:
+            return 400, {"ok": False, "error": "title_required"}
+        if not markdown:
+            return 400, {"ok": False, "error": "markdown_required"}
+        space_id = str(body.get("space_id") or "").strip()
+        parent_node_token = str(body.get("parent_node_token") or "").strip()
+        folder_token = str(body.get("folder_token") or "").strip()
+        grant_email = str(body.get("grant_email") or "").strip().lower()
+
+        def _create(client: FeishuClient) -> dict[str, Any]:
+            node_token = ""
+            document_id = ""
+            if space_id:
+                node = client.create_wiki_doc(space_id, title, parent_node_token)
+                document_id = str(node.get("obj_token") or "")
+                node_token = str(node.get("node_token") or "")
+            else:
+                document = client.create_document(title, folder_token)
+                document_id = str(document.get("document_id") or "")
+            if not document_id:
+                raise FeishuApiError("feishu_create_failed")
+
+            def _content_insert_failed(reason: str) -> dict[str, Any]:
+                url = feishu_doc_url(document_id, node_token)
+                return {
+                    "ok": False,
+                    "error": "content_insert_failed",
+                    "message": (
+                        f"document created but its body was NOT written ({reason}); "
+                        f"fix manually at {url}"
+                    ),
+                    "document_id": document_id,
+                    "url": url,
+                }
+
+            try:
+                block_ids, blocks = client.convert_markdown(markdown)
+                if not block_ids:
+                    return _content_insert_failed("markdown conversion produced no blocks")
+                client.insert_descendants(document_id, document_id, block_ids, blocks, 0)
+            except FeishuApiError as exc:
+                return _content_insert_failed(f"{exc.error_code}: {str(exc)[:200]}")
+            readback = client.get_document(document_id)
+
+            payload: dict[str, Any] = {
+                "ok": True,
+                "document_id": document_id,
+                "title": str(readback.get("title") or title),
+            }
+            if space_id:
+                payload["space_id"] = space_id
+            if node_token:
+                payload["node_token"] = node_token
+
+            if grant_email:
+                try:
+                    client.grant_full_access(document_id, grant_email)
+                except FeishuApiError as exc:
+                    payload["warning"] = (
+                        f"grant_failed: document created, but granting {grant_email} "
+                        f"full access failed ({exc.error_code}); share it manually."
+                    )
+            return payload
+
+        code, result = await self._run_feishu(_create)
+        if result.get("error") == "content_insert_failed":
+            # The document exists; failing loudly beats silently returning an
+            # empty doc, and 502 (not 200) makes the tool surface the message.
+            return 502, result
+        return code, result
+
+    async def handle_feishu_doc_append(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        """Handle ``POST /feishu/doc/append``: append markdown blocks at the end of an existing doc."""
+        raw_token = body.get("token")
+        kind, token = parse_feishu_token(raw_token if isinstance(raw_token, str) else "")
+        if not token:
+            return 400, {"ok": False, "error": "invalid_token"}
+        markdown = str(body.get("markdown") or "").strip()
+        if not markdown:
+            return 400, {"ok": False, "error": "markdown_required"}
+
+        def _append(client: FeishuClient) -> dict[str, Any]:
+            document_id, _node = resolve_feishu_document(client, kind, token)
+            block_ids, blocks = client.convert_markdown(markdown)
+            if not block_ids:
+                raise FeishuApiError("markdown_convert_empty")
+            index = client.root_children_count(document_id)
+            client.insert_descendants(document_id, document_id, block_ids, blocks, index)
+            return {
+                "ok": True,
+                "document_id": document_id,
+                "appended_blocks": len(block_ids),
+            }
+
+        code, result = await self._run_feishu(_append)
+        return code, result
+
+
+
 
 def _normalize_content_type_key(raw: str) -> str:
     return re.sub(r"[\s\-_]+", " ", raw.strip().lower())
@@ -10014,8 +10273,6 @@ def build_wiki_ingest_cmd(
     if source_url:
         cmd.extend(["--source-url", source_url])
     return cmd
-
-
 _FEISHU_TARGET_RE = re.compile(r"^feishu:(user:ou_[A-Za-z0-9_-]+)$")
 _DISCORD_TARGET_RE = re.compile(r"^discord:(user:[0-9]+)$")
 
@@ -10164,6 +10421,468 @@ def _post_openclaw_tools_invoke(
         raw_resp = resp.read().decode("utf-8", errors="replace")
         parsed = json.loads(raw_resp) if raw_resp.strip() else {"ok": True}
         return parsed if isinstance(parsed, dict) else {"ok": True, "result": parsed}
+
+
+# ---------------------------------------------------------------------------
+# Feishu OpenAPI proxy (DALTON-HOOK(feishu-docs))
+#
+# All Feishu calls run here on the host with app identity
+# (tenant_access_token). Credentials come from FEISHU_APP_ID/FEISHU_APP_SECRET
+# or a read-only lookup of ~/.openclaw/openclaw.json; they are never logged
+# and never appear in any route response.
+# ---------------------------------------------------------------------------
+
+FEISHU_API_BASE = "https://open.feishu.cn"
+FEISHU_TOKEN_REFRESH_MARGIN_S = 300.0
+FEISHU_MAX_CONTENT_CHARS = 50000
+FEISHU_DEFAULT_CONTENT_CHARS = 20000
+FEISHU_PAGE_SIZE = 50
+FEISHU_MAX_PAGES = 20
+
+# URL path segment -> doc kind (docs is the legacy docx path; both carry a docx token)
+_FEISHU_LINK_KINDS: dict[str, str] = {"wiki": "wiki", "docx": "docx", "docs": "docx"}
+
+
+class FeishuApiError(RuntimeError):
+    """Feishu OpenAPI call failure. Never carries credentials or tokens."""
+
+    def __init__(self, error_code: str, message: str = "") -> None:
+        super().__init__(message or error_code)
+        self.error_code = error_code
+
+
+def _read_openclaw_feishu_credentials() -> tuple[str, str]:
+    """Return ``(appId, appSecret)`` from ``~/.openclaw/openclaw.json`` (read-only, empty on any failure).
+
+    Reads ``channels.feishu.accounts.<defaultAccount or "default">``.
+    """
+    ocw_home = Path(
+        os.environ.get("DALTON_OCW_HOME", os.path.expanduser("~/.openclaw"))
+    ).expanduser()
+    config_path = ocw_home / "openclaw.json"
+    try:
+        raw = config_path.read_text(encoding="utf-8")
+        data = json.loads(raw)
+    except Exception as exc:
+        logger.info("Feishu credentials not available from %s (%s)", config_path, type(exc).__name__)
+        return "", ""
+    try:
+        feishu = ((data or {}).get("channels") or {}).get("feishu") or {}
+        accounts = feishu.get("accounts") or {}
+        account_key = str(feishu.get("defaultAccount") or "default")
+        account = accounts.get(account_key) or accounts.get("default") or {}
+        app_id = str(account.get("appId") or "").strip()
+        app_secret = str(account.get("appSecret") or "").strip()
+        return app_id, app_secret
+    except Exception as exc:
+        logger.info("Feishu account lookup failed in %s (%s)", config_path, type(exc).__name__)
+        return "", ""
+
+
+def parse_feishu_token(raw: str) -> tuple[str, str]:
+    """Split a docx/wiki URL or bare token into ``(kind, token)``.
+
+    ``kind`` is ``"wiki"`` for wiki node tokens (``/wiki/<token>`` links),
+    ``"docx"`` for document tokens (``/docx/<token>``, ``/docs/<token>``
+    links), and ``""`` for a bare token, whose kind is resolved later by
+    `resolve_feishu_document` (wiki node lookup first, then docx id).
+    Query strings and fragments are ignored.
+    """
+    cleaned = str(raw or "").strip()
+    if not cleaned:
+        return "", ""
+    if "://" in cleaned or cleaned.startswith("/"):
+        try:
+            parsed = urllib.parse.urlparse(cleaned if "://" in cleaned else f"https://x{cleaned}")
+            segments = [seg for seg in (parsed.path or "").split("/") if seg]
+        except ValueError:
+            return "", ""
+        for idx, seg in enumerate(segments):
+            if seg in _FEISHU_LINK_KINDS and idx + 1 < len(segments):
+                token = segments[idx + 1].strip()
+                if token:
+                    return _FEISHU_LINK_KINDS[seg], token
+        return "", ""
+    return "", cleaned
+
+
+# Read-only fields the convert endpoint returns but the descendant-insert
+# endpoint rejects (e.g. table-cell merge state). Dropped before inserting.
+_FEISHU_BLOCK_READONLY_KEYS = frozenset({"merge_info"})
+
+# Official docx block_type ids (see Feishu docx block docs / OpenClaw
+# extensions/feishu/src/docx-table-ops.ts cleanBlocksForDescendant).
+_FEISHU_BLOCK_TYPE_TABLE = 31
+_FEISHU_BLOCK_TYPE_TABLE_CELL = 32
+
+# Tenant link base for docs; derived from the API domain (the bridge never
+# learns the tenant slug, so links are best-effort `<base>/docx/<id>`).
+FEISHU_DOC_URL_BASE = FEISHU_API_BASE.replace("://open.", "://")
+
+
+def _sanitize_feishu_block(block: Any) -> Any:
+    """Make a convert-produced block submittable to the descendant-insert API.
+
+    Mirrors OpenClaw's ``cleanBlocksForDescendant``: drop ``parent_id`` on every
+    block; rebuild a table block's ``table.property`` keeping only the writable
+    layout fields (``row_size`` / ``column_size`` / ``column_width`` — this
+    drops read-only ``cells`` and ``merge_info``); normalize a table cell's
+    string ``children`` to a list. Other read-only keys are still dropped
+    recursively as belt-and-braces.
+    """
+    if isinstance(block, list):
+        return [_sanitize_feishu_block(item) for item in block]
+    if not isinstance(block, dict):
+        return block
+    clean = {k: v for k, v in block.items() if k != "parent_id"}
+    block_type = clean.get("block_type")
+    if block_type == _FEISHU_BLOCK_TYPE_TABLE_CELL and isinstance(clean.get("children"), str):
+        clean["children"] = [clean["children"]]
+    if block_type == _FEISHU_BLOCK_TYPE_TABLE and isinstance(clean.get("table"), dict):
+        prop = clean["table"].get("property") or {}
+        rebuilt = {
+            k: prop[k]
+            for k in ("row_size", "column_size", "column_width")
+            if k in prop
+        }
+        clean["table"] = {"property": rebuilt}
+    return {
+        k: _sanitize_feishu_block(v)
+        for k, v in clean.items()
+        if k not in _FEISHU_BLOCK_READONLY_KEYS
+    }
+
+
+def feishu_doc_url(document_id: str, node_token: str = "") -> str:
+    """Best-effort tenant link for a created document (wiki node links use the node token)."""
+    return f"{FEISHU_DOC_URL_BASE}/wiki/{node_token}" if node_token else (
+        f"{FEISHU_DOC_URL_BASE}/docx/{document_id}"
+    )
+
+
+def _soft_get_node(client: "FeishuClient", token: str, *, obj_type: str = "") -> dict[str, Any]:
+    """`get_node` that maps "node not found"-shaped upstream answers to ``{}``.
+
+    Transport failures still raise: only API-level rejections (error code or
+    4xx/5xx payload) mean "this token is not a wiki node".
+    """
+    try:
+        return client.get_node(token, obj_type=obj_type)
+    except FeishuApiError as exc:
+        if exc.error_code == "feishu_api_error" or exc.error_code.startswith("feishu_http_"):
+            return {}
+        raise
+
+
+def _feishu_node_summary(node: dict[str, Any]) -> dict[str, Any]:
+    """Normalize a wiki node for wire responses, keeping shortcut cross-space fields."""
+    return {
+        "node_token": str(node.get("node_token") or ""),
+        "obj_token": str(node.get("obj_token") or ""),
+        "obj_type": str(node.get("obj_type") or ""),
+        "title": str(node.get("title") or ""),
+        "space_id": str(node.get("space_id") or ""),
+        "node_type": str(node.get("node_type") or ""),
+        "origin_space_id": str(node.get("origin_space_id") or ""),
+        "parent_node_token": str(node.get("parent_node_token") or ""),
+        "has_child": bool(node.get("has_child")),
+    }
+
+
+def resolve_feishu_document(
+    client: "FeishuClient", kind: str, token: str
+) -> tuple[str, dict[str, Any]]:
+    """Resolve a parsed token to ``(document_id, node)`` exactly once.
+
+    ``/wiki/`` links resolve through ``get_node``; ``/docx/`` links reverse-look
+    up their wiki node with ``obj_type=docx`` (empty node when not in a wiki);
+    bare tokens try the wiki-node lookup first and fall back to treating the
+    token as a docx document id. Callers must reuse this one resolution for
+    both the permission check and the actual read/write.
+    """
+    if kind == "wiki":
+        node = client.get_node(token)
+        document_id = str(node.get("obj_token") or "")
+        if not document_id:
+            raise FeishuApiError("wiki_node_not_found")
+        return document_id, node
+    if kind == "docx":
+        node = _soft_get_node(client, token, obj_type="docx")
+        document_id = str(node.get("obj_token") or token)
+        return document_id, node
+    node = _soft_get_node(client, token)
+    document_id = str(node.get("obj_token") or "")
+    if document_id:
+        return document_id, node
+    return token, {}
+
+
+def resolve_feishu_node_for_check(
+    client: "FeishuClient", kind: str, token: str
+) -> tuple[str, dict[str, Any]]:
+    """Permission-check resolution: `resolve_feishu_document`, plus a docx reverse lookup.
+
+    Unlike `resolve_feishu_document`, this never raises ``wiki_node_not_found``
+    (an unresolvable token is simply "not in a wiki" — the caller denies), and
+    a bare token that is NOT a wiki node gets one ``obj_type=docx`` reverse
+    lookup so a bare docx token's wiki space can still be whitelist-checked
+    instead of being rejected as `not_in_wiki` outright.
+    """
+    if kind == "wiki":
+        node = _soft_get_node(client, token)
+        return str(node.get("obj_token") or ""), node
+    if kind == "docx":
+        node = _soft_get_node(client, token, obj_type="docx")
+        return str(node.get("obj_token") or token), node
+    node = _soft_get_node(client, token)
+    if node:
+        return str(node.get("obj_token") or ""), node
+    node = _soft_get_node(client, token, obj_type="docx")
+    if node:
+        return str(node.get("obj_token") or token), node
+    return token, {}
+
+
+class FeishuClient:
+    """Minimal blocking Feishu OpenAPI client (tenant token + docx/wiki/permissions).
+
+    Bridge handlers wrap every call in ``asyncio.to_thread``; the tenant token is
+    cached in memory and refreshed ``FEISHU_TOKEN_REFRESH_MARGIN_S`` before expiry.
+    """
+
+    def __init__(self, app_id: str, app_secret: str, timeout_s: float = 30.0) -> None:
+        self.app_id = app_id
+        self.app_secret = app_secret
+        self.timeout_s = timeout_s
+        self._tenant_token = ""
+        self._token_expires_at = 0.0
+
+    def _tenant_access_token(self) -> str:
+        now = time.time()
+        if self._tenant_token and now < self._token_expires_at:
+            return self._tenant_token
+        body = self._request(
+            "POST",
+            "/open-apis/auth/v3/tenant_access_token/internal",
+            json_body={"app_id": self.app_id, "app_secret": self.app_secret},
+            with_auth=False,
+            unwrap_data=False,
+        )
+        token = str(body.get("tenant_access_token") or "")
+        expire_s = body.get("expire")
+        if not token:
+            raise FeishuApiError("feishu_auth_failed")
+        try:
+            ttl = max(60.0, float(expire_s)) if expire_s is not None else 7200.0
+        except (TypeError, ValueError):
+            ttl = 7200.0
+        self._tenant_token = token
+        self._token_expires_at = now + ttl - FEISHU_TOKEN_REFRESH_MARGIN_S
+        return token
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        json_body: dict[str, Any] | None = None,
+        query: dict[str, Any] | None = None,
+        with_auth: bool = True,
+        unwrap_data: bool = True,
+    ) -> dict[str, Any]:
+        url = f"{FEISHU_API_BASE}{path}"
+        if query:
+            cleaned_query = {k: v for k, v in query.items() if v is not None and v != ""}
+            if cleaned_query:
+                url = f"{url}?{urllib.parse.urlencode(cleaned_query)}"
+        headers = {"Content-Type": "application/json"}
+        if with_auth:
+            headers["Authorization"] = f"Bearer {self._tenant_access_token()}"
+        data_bytes = (
+            json.dumps(json_body, ensure_ascii=False).encode("utf-8") if json_body is not None else None
+        )
+        req = urllib.request.Request(url, data=data_bytes, method=method, headers=headers)
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        try:
+            with opener.open(req, timeout=self.timeout_s) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+                status = resp.status
+        except urllib.error.HTTPError as exc:
+            try:
+                raw = exc.read().decode("utf-8", errors="replace")
+            except Exception:
+                raw = ""
+            status = exc.code
+        except Exception as exc:
+            raise FeishuApiError("feishu_network_error", type(exc).__name__) from exc
+        try:
+            payload = json.loads(raw) if raw.strip() else {}
+        except ValueError:
+            raise FeishuApiError("feishu_invalid_response", f"http_{status}") from None
+        if not isinstance(payload, dict):
+            raise FeishuApiError("feishu_invalid_response", f"http_{status}")
+        if status < 200 or status >= 300:
+            raise FeishuApiError(
+                f"feishu_http_{status}",
+                f"code={payload.get('code')} msg={str(payload.get('msg') or '')[:200]}",
+            )
+        code = payload.get("code")
+        if code not in (0, None):
+            raise FeishuApiError(
+                "feishu_api_error",
+                f"code={code} msg={str(payload.get('msg') or '')[:200]}",
+            )
+        if not unwrap_data:
+            # Some endpoints (tenant_access_token) carry their fields at the
+            # top level instead of under `data`.
+            return payload
+        return payload.get("data") if isinstance(payload.get("data"), dict) else {}
+
+    # -- docx --
+
+    def get_document(self, document_id: str) -> dict[str, Any]:
+        data = self._request("GET", f"/open-apis/docx/v1/documents/{document_id}")
+        return data.get("document") if isinstance(data.get("document"), dict) else {}
+
+    def raw_content(self, document_id: str) -> str:
+        data = self._request(
+            "GET", f"/open-apis/docx/v1/documents/{document_id}/raw_content"
+        )
+        return str(data.get("content") or "")
+
+    def create_document(self, title: str, folder_token: str = "") -> dict[str, Any]:
+        body: dict[str, Any] = {"title": title}
+        if folder_token:
+            body["folder_token"] = folder_token
+        data = self._request("POST", "/open-apis/docx/v1/documents", json_body=body)
+        return data.get("document") if isinstance(data.get("document"), dict) else {}
+
+    def convert_markdown(self, markdown: str) -> tuple[list[str], list[dict[str, Any]]]:
+        """Return ``(first_level_block_ids, blocks)`` from markdown conversion.
+
+        The descendant-insert API needs both: ``children_id`` (the top-level
+        ids) and ``descendants`` (the full block definitions) — submitting only
+        the ids inserts nothing.
+        """
+        data = self._request(
+            "POST",
+            "/open-apis/docx/v1/blocks/convert",
+            json_body={"content_type": "markdown", "content": markdown},
+        )
+        ids = data.get("first_level_block_ids")
+        blocks = data.get("blocks")
+        return (
+            [str(i) for i in ids] if isinstance(ids, list) else [],
+            [b for b in blocks if isinstance(b, dict)] if isinstance(blocks, list) else [],
+        )
+
+    def insert_descendants(
+        self,
+        document_id: str,
+        block_id: str,
+        children_ids: list[str],
+        descendants: list[dict[str, Any]],
+        index: int,
+    ) -> None:
+        self._request(
+            "POST",
+            f"/open-apis/docx/v1/documents/{document_id}/blocks/{block_id}/descendant",
+            json_body={
+                "children_id": children_ids,
+                "descendants": [_sanitize_feishu_block(b) for b in descendants],
+                "index": index,
+            },
+        )
+
+    def root_children_count(self, document_id: str) -> int:
+        """Count the document root block's direct children (insert index for appends)."""
+        total = 0
+        page_token: str | None = None
+        for _ in range(FEISHU_MAX_PAGES):
+            data = self._request(
+                "GET",
+                f"/open-apis/docx/v1/documents/{document_id}/blocks/{document_id}/children",
+                query={"page_size": FEISHU_PAGE_SIZE, "page_token": page_token},
+            )
+            items = data.get("items")
+            total += len(items) if isinstance(items, list) else 0
+            page_token = data.get("page_token") or None
+            if not data.get("has_more") or not page_token:
+                break
+        return total
+
+    # -- wiki --
+
+    def get_node(self, token: str, *, obj_type: str = "") -> dict[str, Any]:
+        data = self._request(
+            "GET",
+            "/open-apis/wiki/v2/spaces/get_node",
+            query={"token": token, "obj_type": obj_type},
+        )
+        return data.get("node") if isinstance(data.get("node"), dict) else {}
+
+    def list_spaces(self) -> list[dict[str, Any]]:
+        spaces: list[dict[str, Any]] = []
+        page_token: str | None = None
+        for _ in range(FEISHU_MAX_PAGES):
+            data = self._request(
+                "GET",
+                "/open-apis/wiki/v2/spaces",
+                query={"page_size": FEISHU_PAGE_SIZE, "page_token": page_token},
+            )
+            items = data.get("items")
+            if isinstance(items, list):
+                spaces.extend(i for i in items if isinstance(i, dict))
+            page_token = data.get("page_token") or None
+            if not data.get("has_more") or not page_token:
+                break
+        return spaces
+
+    def list_nodes(self, space_id: str, parent_node_token: str = "") -> list[dict[str, Any]]:
+        nodes: list[dict[str, Any]] = []
+        page_token: str | None = None
+        for _ in range(FEISHU_MAX_PAGES):
+            data = self._request(
+                "GET",
+                f"/open-apis/wiki/v2/spaces/{space_id}/nodes",
+                query={
+                    "page_size": FEISHU_PAGE_SIZE,
+                    "parent_node_token": parent_node_token,
+                    "page_token": page_token,
+                },
+            )
+            items = data.get("items")
+            if isinstance(items, list):
+                nodes.extend(i for i in items if isinstance(i, dict))
+            page_token = data.get("page_token") or None
+            if not data.get("has_more") or not page_token:
+                break
+        return nodes
+
+    def create_wiki_doc(
+        self, space_id: str, title: str, parent_node_token: str = ""
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"obj_type": "docx", "title": title}
+        if parent_node_token:
+            body["parent_node_token"] = parent_node_token
+        data = self._request(
+            "POST", f"/open-apis/wiki/v2/spaces/{space_id}/nodes", json_body=body
+        )
+        return data.get("node") if isinstance(data.get("node"), dict) else {}
+
+    # -- drive permissions --
+
+    def grant_full_access(self, token: str, email: str) -> None:
+        self._request(
+            "POST",
+            f"/open-apis/drive/v1/permissions/{token}/members",
+            query={"type": "docx"},
+            json_body={
+                "member_type": "email",
+                "member_id": email,
+                "perm": "full_access",
+            },
+        )
 
 
 async def _send_http(
@@ -10550,6 +11269,43 @@ async def _handle_client(
                 if code == 200
                 else ("Bad Request" if code == 400 else "Bad Gateway")
             )
+            await _send_http(writer, code, status_label, payload)
+            return
+
+        # Route 7: POST /feishu/* (behind the admin token gate above; the
+        # sandbox holds only the MCP token, so it can never reach Feishu).
+        # DALTON-HOOK(feishu-docs)
+        if path.startswith("/feishu/"):
+            if method != "POST":
+                await _send_http(
+                    writer, 405, "Method Not Allowed", {"error": "Method Not Allowed"}
+                )
+                return
+            try:
+                feishu_body = json.loads(body_bytes.decode("utf-8"))
+                if not isinstance(feishu_body, dict):
+                    raise ValueError("Expected JSON object")
+            except Exception:
+                await _send_http(writer, 400, "Bad Request", {"ok": False, "error": "Parse error"})
+                return
+            feishu_routes: dict[str, Any] = {
+                "/feishu/doc/read": bridge.handle_feishu_doc_read,
+                "/feishu/wiki/nodes": bridge.handle_feishu_wiki_nodes,
+                "/feishu/wiki/node": bridge.handle_feishu_wiki_node,
+                "/feishu/doc/create": bridge.handle_feishu_doc_create,
+                "/feishu/doc/append": bridge.handle_feishu_doc_append,
+            }
+            handler = feishu_routes.get(path)
+            if handler is None:
+                await _send_http(writer, 404, "Not Found", {"ok": False, "error": "Not Found"})
+                return
+            code, payload = await handler(feishu_body)
+            status_label = {
+                200: "OK",
+                400: "Bad Request",
+                502: "Bad Gateway",
+                503: "Service Unavailable",
+            }.get(code, "Bad Gateway")
             await _send_http(writer, code, status_label, payload)
             return
 

@@ -140,6 +140,13 @@
       "statusExpired": "Expired",
       "statusRevoked": "Revoked"
     },
+    "feishuScopes": {
+      "title": "Feishu doc access",
+      "subtitle": "Choose which wiki spaces external team members may read Feishu docs from. Admins and internal members always have read and write access.",
+      "save": "Save",
+      "saving": "Saving…",
+      "empty": "No wiki spaces visible to the bot. Configure Feishu credentials on the host first."
+    },
     "errors": {
       "invalidCredentials": "Incorrect email or password.",
       "emailNotConfirmed": "Please confirm your email before signing in.",

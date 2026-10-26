@@ -71,6 +71,7 @@ Dalton 继承 `.agents/skills/research-conventions/SKILL.md` 的通用投研纪�
 - **行情与历史估值（默认 `yfinance`）**：股价、复权收益率与相对表现默认使用 `yf_price`（配合 `.agents/skills/research-conventions/references/market-data-rules.md` 统一基准日）；历史估值倍数使用 `fundamentals.get_historical_valuation` 或 `yf_fundamentals`。
 - **卖方一致预期（`estimates`）**：调用 `researchdata.finance(route="estimates", ticker=T)`，一律标为 `street_estimate`（写明 `"Yahoo Finance via yfinance"`、`fetched_at`、期间键与分析师人数）。Yahoo 无历史 as-of，每次取数必须保存快照到工作区 `data/consensus/<YYYY-MM-DD_HHMM>.json`（附 `_meta{route, fetched_at, source}`）；其中的 `implied_model` 是模型推导（税率默认取最近一季），必须标为 `model-derived`。
 - **用户上传的 Excel 打不开**：`openpyxl` 加载报错（例如 definedNames 损坏）时，先运行 `python .agents/skills/dalton-conventions/scripts/xlsx_repair.py <文件.xlsx>`。它只删除导致 openpyxl 无法加载的名字，另存为 `<文件名>.repaired.xlsx`，原文件不动；之后改读修复后的文件。
+- **飞书文档读写（`feishu_*`）**：用户提到飞书/Lark 文档链接、要求读取或把交付物落到飞书时使用：`feishu_read` 读文档（docx/wiki 链接或 token，超长会截断并标注），`feishu_list_wiki` 找知识空间或节点，`feishu_create_doc` 用 markdown 新建文档，`feishu_append` 在文末追加。**身份限制**：管理员和内部成员可读可写；外部成员只能读，且仅限管理员在设置里开放的知识空间（工具会按调用者身份自动放行或拒绝——返回"外部成员只能读取飞书文档"或"知识空间未开放"时，向用户如实转述，不要尝试绕过）。新建文档只做新建与追加，不覆盖、不删除、不改权限。
 
 ## 7. 公司知识层读写约定
 

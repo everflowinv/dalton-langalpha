@@ -10,7 +10,7 @@ import logging
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Request
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from src.dalton.budget.service import (
     get_budget_settings,
@@ -1283,6 +1283,101 @@ async def redeem_invite_endpoint(
         username=body.username,
         password=body.password,
     )
+
+
+# ---------------------------------------------------------------------------
+# Feishu doc read scopes (DALTON-HOOK(feishu-docs)): admin-maintained whitelist
+# of wiki spaces external members may read via the feishu_* agent tools.
+# ---------------------------------------------------------------------------
+
+
+class FeishuScopeEntry(BaseModel):
+    """One whitelist entry; validation failures surface as HTTP 422 at the request boundary."""
+
+    space_id: str = Field(min_length=1, max_length=200)
+    name: str = Field(default="", max_length=200)
+
+    @field_validator("space_id")
+    @classmethod
+    def _validate_space_id(cls, value: str) -> str:
+        from src.dalton.database.feishu import normalize_space_id
+
+        try:
+            return normalize_space_id(value)
+        except ValueError as exc:
+            raise ValueError(
+                "space_id 只允许字母、数字、下划线和连字符（去除首尾空白后不能为空）"
+            ) from exc
+
+    @field_validator("name")
+    @classmethod
+    def _strip_name(cls, value: str) -> str:
+        return value.strip()
+
+
+class FeishuReadScopesUpdateRequest(BaseModel):
+    scopes: list[FeishuScopeEntry] = Field(max_length=200)
+
+
+def _require_feishu_admin(user_id: str | None) -> str:
+    """Require a PM user (`DALTON_PM_USER_IDS`) for read-scope and space-list management."""
+    _require_dalton_enabled()
+    from src.dalton.invites import is_invite_pm
+
+    uid = str(user_id or "").strip()
+    if not uid:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    if not is_invite_pm(uid):
+        raise HTTPException(status_code=403, detail="仅管理员可管理飞书读取范围")
+    return uid
+
+
+@router.get("/feishu/read-scopes")
+@handle_api_exceptions("list dalton feishu read scopes", logger)
+async def list_feishu_read_scopes_endpoint(
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    from src.dalton.database.feishu import list_read_scopes
+
+    _require_feishu_admin(user_id)
+    return {"scopes": await list_read_scopes()}
+
+
+@router.put("/feishu/read-scopes")
+@handle_api_exceptions("update dalton feishu read scopes", logger)
+async def update_feishu_read_scopes_endpoint(
+    body: FeishuReadScopesUpdateRequest,
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    from src.dalton.database.feishu import replace_read_scopes
+
+    uid = _require_feishu_admin(user_id)
+    try:
+        scopes = await replace_read_scopes(
+            [entry.model_dump() for entry in body.scopes],
+            added_by=uid,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"scopes": scopes}
+
+
+@router.get("/feishu/spaces")
+@handle_api_exceptions("list dalton feishu wiki spaces", logger)
+async def list_feishu_spaces_endpoint(
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    from src.dalton.feishu import FeishuBridgeError, post_bridge_feishu
+
+    _require_feishu_admin(user_id)
+    try:
+        res = await post_bridge_feishu("wiki/nodes", {"space_id": ""})
+    except FeishuBridgeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    if res.get("ok") is not True:
+        detail = str(res.get("error") or "feishu_error")
+        raise HTTPException(status_code=502, detail=detail)
+    return {"spaces": res.get("spaces") or []}
 
 
 

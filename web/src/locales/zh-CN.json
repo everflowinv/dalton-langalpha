@@ -140,6 +140,13 @@
       "statusExpired": "已过期",
       "statusRevoked": "已撤销"
     },
+    "feishuScopes": {
+      "title": "飞书文档权限",
+      "subtitle": "勾选对团队成员中的外部成员开放读取的知识空间。管理员和内部成员始终可读可写。",
+      "save": "保存",
+      "saving": "保存中…",
+      "empty": "机器人暂时看不到任何知识空间，请先在宿主机配置飞书应用凭据。"
+    },
     "errors": {
       "invalidCredentials": "邮箱或密码错误。",
       "emailNotConfirmed": "请先确认邮箱后再登录。",
