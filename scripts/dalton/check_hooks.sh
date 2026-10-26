@@ -97,6 +97,7 @@ ALLOWED_HOOKS=(
   "user-coverage"
   "multi-file-upload"
   "invite-signup"
+  "wiki-ingest"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

@@ -76,7 +76,7 @@ Dalton 继承 `.agents/skills/research-conventions/SKILL.md` 的通用投研纪�
 
 - **知识层位置与结构**：每个公司工作区（如 `META/`）维护结构化知识文档 `data/{company,thesis,debate,drivers,management,lessons,agenda}.json` 与事件判断表 `dalton_verdicts`，由服务端自动渲染出根目录同名 `.md` 文件及 `verdicts.md`（详见 PK.1 文件布局与 PK.2 Schema）。
 - **受控写入**：修改认知必须调用 `knowledge_update` 或 `knowledge_append_verdict`（PK.4），不得直接手改渲染出的 `.md`（直接改会被记录为 `direct_edit` 并提示合入）；`agent.md` 中的 `<!-- dalton:summary:start (由 knowledge_update 维护，勿手改) -->` 至 `<!-- dalton:summary:end -->` 托管块（PK.6）由工具自动重写，切勿手动编辑。
-- **基金 Wiki 只读**：`company-wiki` 仅作只读检索源，不回写；所有新增研究发现、论点演进与正式报告均写入本公司工作区知识层及 `published/` 目录。
+- **基金 Wiki 默认只读**：`company-wiki` 默认只读，日常研究发现、论点演进与正式报告均写入本公司工作区知识层及 `published/` 目录；只有用户明确要求入库（"入库/存一下/加到 wiki"）时，按 [references/wiki-ingest.md](references/wiki-ingest.md) 的入库流程用 `ingest_company_wiki`。
 - **覆盖名单位置**：覆盖名单由系统按用户维护，通过 Chief of Staff 修改，自动渲染到用户 Home 下的 `../Home/dalton/coverage.yaml`（Home 工作区内为 `dalton/coverage.yaml`）。
 
 ## 8. 自动化推送稿与两轮语言审查约定

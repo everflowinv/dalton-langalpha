@@ -14,12 +14,16 @@ Pure Python 3.11+ standard library only.
 from __future__ import annotations
 
 import asyncio
+import base64
 import csv
+import difflib
+import hashlib
 import hmac
 import json
 import logging
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -49,6 +53,35 @@ logger = logging.getLogger("researchdata_bridge")
 
 MAX_REQUEST_BYTES = 256 * 1024  # 256 KiB
 MAX_EMBED_REQUEST_BYTES = 128 * 1024  # 128 KiB dedicated limit for /embed
+MAX_WIKI_INGEST_REQUEST_BYTES = 30 * 1024 * 1024  # 30 MiB HTTP envelope limit for /wiki/ingest (20 MB file b64)
+WIKI_INGEST_MAX_TEXT_CHARS = 200_000
+WIKI_INGEST_MAX_FILE_BYTES = 20 * 1024 * 1024  # 20 MB
+WIKI_INGEST_TIMEOUT_S: float = 180.0
+WIKI_INGEST_SIMILARITY_THRESHOLD: float = 0.80
+COMPANY_SLUG_RE = re.compile(r"^[A-Z][A-Z0-9-]{0,29}$")
+SECTOR_SLUG_RE = re.compile(r"^[a-z][a-z0-9-]{0,39}$")
+WIKI_INGEST_ALLOWED_EXTENSIONS: frozenset[str] = frozenset(
+    {".md", ".txt", ".pdf", ".docx", ".png", ".jpg", ".webp"}
+)
+WIKI_INGEST_ALLOWED_CONTENT_TYPES: tuple[str, ...] = (
+    "管理层会议纪要",
+    "专家访谈",
+    "季度研究笔记",
+    "Earnings Update",
+    "NDR纪要",
+    "Fireside Chat",
+    "买方交流",
+    "研究笔记",
+    "新闻更新",
+    "News Update",
+    "行业趋势",
+    "Industry Trends",
+    "Flomo笔记",
+    "微信文章",
+    "IPO Prospectus",
+    "投资备忘",
+    "Investment Memo",
+)
 
 DEFAULT_ROUTE_TIMEOUT_S = 240
 LONG_READ_TIMEOUT_S = 600
@@ -1045,6 +1078,32 @@ class BridgeConfig:
             )
         except ValueError:
             self.feishu_send_card_timeout_s = FEISHU_SEND_CARD_TIMEOUT_S
+        self.wiki_run_sh: Path | None = (
+            Path(os.environ["DALTON_WIKI_RUN_SH"]).expanduser()
+            if os.environ.get("DALTON_WIKI_RUN_SH", "").strip()
+            else None
+        )
+        default_wiki_audit = _SCRIPT_DIR.parents[1] / "var" / "dalton" / "wiki_ingest_audit.jsonl"
+        self.wiki_ingest_audit_file: Path = Path(
+            os.environ.get("DALTON_WIKI_INGEST_AUDIT_FILE", str(default_wiki_audit))
+        ).expanduser()
+        default_wiki_tmp = _SCRIPT_DIR.parents[1] / "var" / "dalton" / "tmp" / "wiki_ingest"
+        self.wiki_ingest_temp_dir: Path = Path(
+            os.environ.get("DALTON_WIKI_INGEST_TEMP_DIR", str(default_wiki_tmp))
+        ).expanduser()
+        try:
+            self.wiki_ingest_timeout_s: float = max(
+                5.0,
+                float(
+                    os.environ.get(
+                        "DALTON_WIKI_INGEST_TIMEOUT_S",
+                        str(WIKI_INGEST_TIMEOUT_S),
+                    )
+                    or WIKI_INGEST_TIMEOUT_S
+                ),
+            )
+        except ValueError:
+            self.wiki_ingest_timeout_s = WIKI_INGEST_TIMEOUT_S
         self.test_mode: bool = os.environ.get("DALTON_BRIDGE_TEST_MODE", "0").strip().lower() in (
             "1",
             "true",
@@ -8398,6 +8457,1564 @@ class ResearchDataBridge:
         all_ok = bool(results) and all(bool(item.get("ok")) for item in results)
         return 200, {"ok": all_ok, "results": results}
 
+    def _resolve_wiki_run_sh(self) -> Path:
+        """Locate the OpenClaw company-wiki `run.sh` entrypoint without modifying it."""
+        explicit = getattr(self.cfg, "wiki_run_sh", None)
+        if isinstance(explicit, Path):
+            return explicit
+        return self.cfg.ocw_root / "skills" / "company-wiki" / "run.sh"
+
+    def _load_company_wiki_config(self) -> dict[str, Any]:
+        """Read `skills/company-wiki/config.json` in read-only mode."""
+        cfg_path = self.cfg.ocw_root / "skills" / "company-wiki" / "config.json"
+        if not cfg_path.is_file():
+            return {}
+        try:
+            parsed = json.loads(cfg_path.read_text(encoding="utf-8"))
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception as exc:
+            logger.warning("Failed reading company-wiki config.json: %s", type(exc).__name__)
+            return {}
+
+    def _resolve_wiki_base_dir(self, target_type: str, wiki_cfg: dict[str, Any]) -> Path:
+        """Resolve `wiki/companies` or `wiki/sectors` directory under OpenClaw workspace."""
+        raw_wiki_dir = str(wiki_cfg.get("wiki_dir") or "wiki").strip() or "wiki"
+        wiki_dir = Path(raw_wiki_dir)
+        if not wiki_dir.is_absolute():
+            wiki_dir = self.cfg.ocw_root / wiki_dir
+        subdir = "companies" if target_type == "company" else "sectors"
+        return wiki_dir / subdir
+
+    def _resolve_and_validate_wiki_slug(
+        self, target_type: str, raw_target: str, wiki_cfg: dict[str, Any]
+    ) -> tuple[str | None, bool, dict[str, Any] | None]:
+        """Resolve `raw_target` against aliases/existing directories or validate new slug regex.
+
+        Returns `(resolved_slug, is_existing, error_payload)`.
+        """
+        cleaned = raw_target.strip()
+        if not cleaned:
+            return None, False, {
+                "ok": False,
+                "status": "invalid_slug",
+                "error_code": "empty_target",
+                "error": "target 不能为空",
+            }
+        if cleaned.lower().startswith("temp"):
+            return None, False, {
+                "ok": False,
+                "status": "invalid_slug",
+                "error_code": "reserved_slug",
+                "target": cleaned,
+                "target_type": target_type,
+                "error": f"无效的 {target_type} 名称 '{cleaned}'：temp* 为保留目录名，禁止入库。",
+            }
+
+        # 1. Check aliases in config.json (read-only)
+        alias_map: dict[str, str] = {}
+        raw_aliases = wiki_cfg.get("aliases")
+        if isinstance(raw_aliases, dict):
+            nested = raw_aliases.get(target_type)
+            if isinstance(nested, dict):
+                for k, v in nested.items():
+                    if isinstance(k, str) and isinstance(v, str) and k.strip() and v.strip():
+                        alias_map[k.strip().lower()] = v.strip()
+            for k, v in raw_aliases.items():
+                if isinstance(k, str) and isinstance(v, str) and k.strip() and v.strip():
+                    alias_map.setdefault(k.strip().lower(), v.strip())
+
+        base_dir = self._resolve_wiki_base_dir(target_type, wiki_cfg)
+        existing_dirs: dict[str, str] = {}
+        if base_dir.is_dir():
+            try:
+                existing_dirs = {
+                    d.name.lower(): d.name for d in base_dir.iterdir() if d.is_dir()
+                }
+            except OSError:
+                existing_dirs = {}
+
+        lowered = cleaned.lower()
+        if lowered in alias_map:
+            resolved = alias_map[lowered]
+            if resolved.lower().startswith("temp"):
+                return None, False, {
+                    "ok": False,
+                    "status": "invalid_slug",
+                    "error_code": "reserved_slug",
+                    "target": cleaned,
+                    "target_type": target_type,
+                    "error": f"别名映射结果 '{resolved}' 命中保留前缀 temp*，禁止入库。",
+                }
+            is_existing = resolved.lower() in existing_dirs
+            if is_existing:
+                resolved = existing_dirs[resolved.lower()]
+            return resolved, is_existing, None
+
+        # 2. Check existing directory match (exact case-sensitive for new vs existing, or case-insensitive existing dir)
+        if lowered in existing_dirs:
+            resolved_existing = existing_dirs[lowered]
+            pattern = COMPANY_SLUG_RE if target_type == "company" else SECTOR_SLUG_RE
+            if cleaned == resolved_existing or pattern.fullmatch(cleaned):
+                return resolved_existing, True, None
+
+        # 3. Unmapped A-share / HK / Chinese names or numeric tickers -> do NOT auto-add alias
+        if _WIKI_NEEDS_ALIAS_RE.search(cleaned) or not cleaned.isascii():
+            return None, False, {
+                "ok": False,
+                "status": "needs_alias",
+                "error_code": "needs_alias",
+                "needs_alias": True,
+                "target": cleaned,
+                "target_type": target_type,
+                "error": (
+                    f"'{cleaned}' 未在 config.json 配置别名 (needs_alias)；"
+                    "A股/港股/中文名称不自动添加别名，请找管理员在 config.json aliases 中配置后再入库。"
+                ),
+                "hint": "请联系管理员在 OpenClaw company-wiki config.json 的 aliases 中添加映射。",
+            }
+
+        if cleaned.isdigit():
+            return None, False, {
+                "ok": False,
+                "status": "needs_alias",
+                "error_code": "numeric_ticker_rejected",
+                "needs_alias": True,
+                "target": cleaned,
+                "target_type": target_type,
+                "error": (
+                    f"纯数字 ticker '{cleaned}' 拒绝直接建目录 (needs_alias)；"
+                    "A股/港股数字代码请找管理员在 config.json aliases 中添加映射后再入库。"
+                ),
+                "hint": "纯数字 ticker 禁止直接作为目录名，请联系管理员添加别名映射。",
+            }
+
+        # 4. Validate new slug regex
+        pattern = COMPANY_SLUG_RE if target_type == "company" else SECTOR_SLUG_RE
+        if not pattern.fullmatch(cleaned):
+            expected_re = "^[A-Z][A-Z0-9-]{0,29}$" if target_type == "company" else "^[a-z][a-z0-9-]{0,39}$"
+            return None, False, {
+                "ok": False,
+                "status": "invalid_slug",
+                "error_code": "invalid_slug",
+                "target": cleaned,
+                "target_type": target_type,
+                "error": f"无效的 {target_type} slug '{cleaned}'（须已存在或匹配 {expected_re}）",
+            }
+
+        return cleaned, False, None
+
+    def _read_wiki_audit_entries(self) -> list[dict[str, Any]]:
+        """Read existing JSONL entries from `self.cfg.wiki_ingest_audit_file`."""
+        audit_path = self.cfg.wiki_ingest_audit_file
+        if not audit_path.is_file():
+            return []
+        entries: list[dict[str, Any]] = []
+        try:
+            for line in audit_path.read_text(encoding="utf-8", errors="replace").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    item = json.loads(line)
+                    if isinstance(item, dict):
+                        entries.append(item)
+                except Exception:
+                    continue
+        except Exception as exc:
+            logger.warning("Failed reading wiki ingest audit log: %s", type(exc).__name__)
+        return entries
+
+    def _append_wiki_audit_entry(self, record: dict[str, Any]) -> None:
+        """Append a single JSONL audit record to `self.cfg.wiki_ingest_audit_file` under `flock`."""
+        import fcntl
+
+        audit_path = self.cfg.wiki_ingest_audit_file
+        audit_path.parent.mkdir(parents=True, exist_ok=True)
+        line = json.dumps(record, ensure_ascii=False) + "\n"
+        with audit_path.open("a", encoding="utf-8") as fh:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            try:
+                fh.write(line)
+                fh.flush()
+            finally:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+    def _wiki_idempotency_file(self) -> Path:
+        """Return the path to the independent idempotency store file."""
+        custom = getattr(self.cfg, "wiki_ingest_idempotency_file", None)
+        if custom is not None:
+            return Path(custom)
+        return self.cfg.wiki_ingest_audit_file.with_name("wiki_ingest_idempotency.json")
+
+    def _parse_wiki_idempotency_file_strict(self) -> dict[str, dict[str, Any]]:
+        """Read and validate the idempotency store JSON; raises on I/O or format corruption."""
+        idemp_path = self._wiki_idempotency_file()
+        if not idemp_path.exists():
+            return {}
+        raw = json.loads(idemp_path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict) or any(not isinstance(v, dict) for v in raw.values()):
+            raise ValueError("Wiki idempotency store root must be a JSON object of records")
+        return {str(k): v for k, v in raw.items()}
+
+    def _read_wiki_idempotent_results(self) -> dict[str, dict[str, Any]]:
+        """Read persisted `request_id -> record` entries from the independent idempotency store."""
+        idemp_path = self._wiki_idempotency_file()
+        if not idemp_path.is_file():
+            return {}
+        try:
+            return self._parse_wiki_idempotency_file_strict()
+        except Exception as exc:
+            logger.error(
+                "Failed reading/parsing wiki idempotency store %s: %s",
+                idemp_path,
+                type(exc).__name__,
+            )
+            return {}
+
+    def _save_wiki_idempotent_result(self, key: str, record: dict[str, Any]) -> None:
+        """Atomically persist `key -> record` to the independent idempotency store (temp file + fsync + rename + dir fsync).
+
+        Refuses to overwrite the original file if an existing idempotency file is corrupted.
+        """
+        import fcntl
+
+        idemp_path = self._wiki_idempotency_file()
+        idemp_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = idemp_path.with_suffix(".lock")
+        with lock_path.open("a", encoding="utf-8") as lock_fh:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+            try:
+                if idemp_path.exists():
+                    try:
+                        current = self._parse_wiki_idempotency_file_strict()
+                    except Exception as exc:
+                        logger.error(
+                            "Refusing to overwrite corrupted wiki idempotency store %s: %s",
+                            idemp_path,
+                            type(exc).__name__,
+                        )
+                        return
+                else:
+                    current = {}
+
+                current[str(key)] = record
+                tmp_fd, tmp_name = tempfile.mkstemp(
+                    prefix=".wiki_idemp_",
+                    suffix=".tmp",
+                    dir=str(idemp_path.parent),
+                )
+                os.close(tmp_fd)
+                tmp_path = Path(tmp_name)
+                try:
+                    os.chmod(tmp_path, 0o600)
+                    with open(tmp_path, "w", encoding="utf-8") as f:
+                        json.dump(current, f, ensure_ascii=False, indent=2)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    os.replace(str(tmp_path), str(idemp_path))
+                    dir_fd = os.open(str(idemp_path.parent), os.O_RDONLY)
+                    try:
+                        os.fsync(dir_fd)
+                    finally:
+                        os.close(dir_fd)
+                except BaseException:
+                    try:
+                        tmp_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    raise
+            finally:
+                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+
+    def _find_wiki_audit_by_request_id(self, request_id: str | None) -> dict[str, Any] | None:
+        """Return a prior successful audit record for `request_id` if one exists."""
+        if not request_id:
+            return None
+        for entry in reversed(self._read_wiki_audit_entries()):
+            if str(entry.get("request_id") or "").strip() != request_id:
+                continue
+            st = str(entry.get("status") or entry.get("result") or "").strip().lower()
+            if st in ("ingested", "done", "ok", "added", "added_from_file"):
+                return entry
+        return None
+
+    def _find_wiki_idempotent_result(self, request_id: str | None) -> dict[str, Any] | None:
+        """Return a prior successful result for `request_id`, checking the idempotency store first."""
+        if not request_id:
+            return None
+        idemp_map = self._read_wiki_idempotent_results()
+        rec = idemp_map.get(request_id)
+        if isinstance(rec, dict):
+            st = str(rec.get("status") or rec.get("result") or "").strip().lower()
+            if st in ("ingested", "done", "ok", "added", "added_from_file"):
+                return rec
+        return self._find_wiki_audit_by_request_id(request_id)
+
+    def _try_acquire_wiki_claim_locks(
+        self,
+        *,
+        content_sha256: str,
+        slot_key: str,
+        request_id: str | None = None,
+    ) -> tuple[list[int] | None, str | None]:
+        """Acquire non-blocking `fcntl.flock` claim locks in fixed order: `request_id` -> `sha256` -> `slot`.
+
+        Lock files are stable and never unlinked; kernel automatically releases locks on process exit.
+        """
+        import fcntl
+
+        claims_dir = self.cfg.wiki_ingest_temp_dir / "claims"
+        claims_dir.mkdir(parents=True, exist_ok=True)
+        candidates: list[tuple[Path, str]] = []
+        if request_id:
+            req_hash = hashlib.sha256(request_id.encode("utf-8")).hexdigest()[:32]
+            candidates.append((claims_dir / f"req_{req_hash}.lock", "same_request_inflight"))
+        candidates.append((claims_dir / f"sha256_{content_sha256}.lock", "concurrent_inflight"))
+        candidates.append((claims_dir / f"slot_{slot_key}.lock", "concurrent_inflight"))
+
+        debug_payload = (
+            json.dumps(
+                {
+                    "pid": os.getpid(),
+                    "created_at": time.time(),
+                    "request_id": request_id or "",
+                }
+            )
+            + "\n"
+        ).encode("utf-8")
+
+        acquired_fds: list[int] = []
+        try:
+            for lock_path, fail_reason in candidates:
+                fd = os.open(
+                    str(lock_path),
+                    os.O_RDWR | os.O_CREAT,
+                    0o600,
+                )
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                    self._release_wiki_claim_locks(acquired_fds)
+                    acquired_fds.clear()
+                    return None, fail_reason
+                except BaseException:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                    raise
+                acquired_fds.append(fd)
+                os.ftruncate(fd, 0)
+                os.lseek(fd, 0, os.SEEK_SET)
+                os.write(fd, debug_payload)
+            return acquired_fds, None
+        except BaseException:
+            self._release_wiki_claim_locks(acquired_fds)
+            acquired_fds.clear()
+            raise
+
+    @staticmethod
+    def _release_wiki_claim_locks(claim_fds: list[int]) -> None:
+        """Release held `fcntl.flock` file descriptors in reverse order (`LOCK_UN` then `os.close`)."""
+        import fcntl
+
+        for fd in reversed(claim_fds):
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def _check_target_disk_file_sync(
+        self,
+        *,
+        target_file: Path,
+        content_sha256: str,
+        norm_text: str,
+    ) -> dict[str, Any] | None:
+        """Check only the single target markdown file on disk for sha256 or text similarity match."""
+        if not target_file.is_file():
+            return None
+        rel_disk_path = (
+            str(target_file.relative_to(self.cfg.ocw_root))
+            if target_file.is_relative_to(self.cfg.ocw_root)
+            else str(target_file)
+        )
+        try:
+            raw_bytes = target_file.read_bytes()
+        except OSError:
+            return None
+        if hashlib.sha256(raw_bytes).hexdigest() == content_sha256:
+            return {
+                "reason": "sha256_match",
+                "doc_id": None,
+                "filepath": rel_disk_path,
+                "similarity": 1.0,
+            }
+        existing_raw = raw_bytes.decode("utf-8", errors="replace")
+        existing_body = _strip_wiki_markdown_frontmatter(existing_raw)
+        existing_norm = _normalize_wiki_text_for_hash(existing_body)
+        if existing_norm:
+            existing_sha = hashlib.sha256(existing_norm.encode("utf-8")).hexdigest()
+            if existing_sha == content_sha256:
+                return {
+                    "reason": "sha256_match",
+                    "doc_id": None,
+                    "filepath": rel_disk_path,
+                    "similarity": 1.0,
+                }
+            if norm_text:
+                sim = _compute_wiki_text_similarity(norm_text, existing_norm)
+                if sim >= WIKI_INGEST_SIMILARITY_THRESHOLD:
+                    return {
+                        "reason": "similar_content",
+                        "doc_id": None,
+                        "filepath": rel_disk_path,
+                        "similarity": round(sim, 4),
+                    }
+        return None
+
+    async def _check_wiki_duplicate(
+        self,
+        *,
+        target_type: str,
+        resolved_slug: str,
+        canonical_content_type: str,
+        date_str: str,
+        content_sha256: str,
+        norm_text: str,
+        wiki_cfg: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Check whether `content_sha256` or a highly similar same-(slug, date, type) doc already exists."""
+        idemp_entries = list(self._read_wiki_idempotent_results().values())
+        audit_entries = self._read_wiki_audit_entries()
+        combined_entries = [*idemp_entries, *audit_entries]
+
+        # 1. Exact SHA256 match against idempotency store and audit log (text AND binary PDF/images)
+        for entry in combined_entries:
+            st = str(entry.get("status") or entry.get("result") or "").strip().lower()
+            if st not in ("ingested", "done", "ok", "added", "added_from_file"):
+                continue
+            if str(entry.get("sha256") or "").strip() == content_sha256:
+                return {
+                    "reason": "sha256_match",
+                    "doc_id": entry.get("doc_id"),
+                    "filepath": entry.get("filepath"),
+                    "similarity": 1.0,
+                }
+
+        # 2. Text similarity against idempotency store and audit entries with same slug + date + content_type
+        if norm_text:
+            for entry in combined_entries:
+                st = str(entry.get("status") or entry.get("result") or "").strip().lower()
+                if st not in ("ingested", "done", "ok", "added", "added_from_file"):
+                    continue
+                if (
+                    str(entry.get("target") or "").strip().lower() == resolved_slug.lower()
+                    and str(entry.get("date") or "").strip() == date_str
+                    and str(entry.get("content_type") or "").strip() == canonical_content_type
+                ):
+                    prev_excerpt = str(entry.get("_norm_excerpt") or "").strip()
+                    if prev_excerpt:
+                        sim = _compute_wiki_text_similarity(norm_text, prev_excerpt)
+                        if sim >= WIKI_INGEST_SIMILARITY_THRESHOLD:
+                            return {
+                                "reason": "similar_content",
+                                "doc_id": entry.get("doc_id"),
+                                "filepath": entry.get("filepath"),
+                                "similarity": round(sim, 4),
+                            }
+                    rel_fp = str(entry.get("filepath") or "").strip()
+                    if rel_fp:
+                        fp_candidate = Path(rel_fp)
+                        if not fp_candidate.is_absolute():
+                            fp_candidate = self.cfg.ocw_root / fp_candidate
+                        if fp_candidate.is_file():
+                            try:
+                                raw_text = await asyncio.to_thread(
+                                    fp_candidate.read_text,
+                                    encoding="utf-8",
+                                    errors="replace",
+                                )
+                                existing_body = _strip_wiki_markdown_frontmatter(raw_text)
+                                sim = _compute_wiki_text_similarity(norm_text, existing_body)
+                                if sim >= WIKI_INGEST_SIMILARITY_THRESHOLD:
+                                    return {
+                                        "reason": "similar_content",
+                                        "doc_id": entry.get("doc_id"),
+                                        "filepath": rel_fp,
+                                        "similarity": round(sim, 4),
+                                    }
+                            except OSError:
+                                pass
+
+        # 3. Check only the single target file on disk via `asyncio.to_thread` (never scan the directory)
+        base_dir = self._resolve_wiki_base_dir(target_type, wiki_cfg)
+        type_slug = canonical_content_type.replace(" ", "-")
+        target_file = base_dir / resolved_slug / f"{date_str}-{type_slug}.md"
+        return await asyncio.to_thread(
+            self._check_target_disk_file_sync,
+            target_file=target_file,
+            content_sha256=content_sha256,
+            norm_text=norm_text,
+        )
+
+    def _build_wiki_subprocess_env(self) -> dict[str, str]:
+        """Construct minimal environment for `company-wiki/run.sh` without leaking bridge tokens."""
+        env_file_vars = _read_env_file_dict(self.cfg.env_path)
+        gemini_api_key = (
+            env_file_vars.get("GEMINI_API_KEY", "").strip()
+            or os.environ.get("GEMINI_API_KEY", "").strip()
+        )
+        env: dict[str, str] = {
+            "PATH": os.environ.get("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"),
+            "HOME": os.environ.get("HOME", os.path.expanduser("~")),
+            "LANG": os.environ.get("LANG", "en_US.UTF-8"),
+            "LC_ALL": os.environ.get("LC_ALL", "en_US.UTF-8"),
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONIOENCODING": "utf-8",
+            "SKILL_WARNINGS": "ignore",
+        }
+        if gemini_api_key:
+            env["GEMINI_API_KEY"] = gemini_api_key
+        if self.cfg.subprocess_proxy:
+            env["HTTP_PROXY"] = self.cfg.subprocess_proxy
+            env["HTTPS_PROXY"] = self.cfg.subprocess_proxy
+        return env
+
+    async def _run_company_wiki_ingest_cli(
+        self,
+        cmd: list[str],
+        *,
+        env: dict[str, str],
+        timeout_s: float,
+    ) -> dict[str, Any]:
+        """Run `company-wiki/run.sh --json add|add-file` as an argv list without a shell."""
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            cwd=str(self.cfg.ocw_root),
+            env=env,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                proc.communicate(),
+                timeout=timeout_s,
+            )
+        except asyncio.CancelledError:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            await _reap_process(proc)
+            raise
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            await _reap_process(proc)
+            return {
+                "ok": False,
+                "status": "timeout",
+                "error": f"company-wiki CLI timed out after {timeout_s}s",
+            }
+        except Exception as exc:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            await _reap_process(proc)
+            return {
+                "ok": False,
+                "status": "error",
+                "error": type(exc).__name__,
+            }
+
+        stdout_text = (stdout_bytes or b"").decode("utf-8", errors="replace").strip()
+        stderr_tail = sanitize_stderr_text(stderr_bytes, max_len=300)
+        parsed: dict[str, Any] | None = None
+        if stdout_text:
+            try:
+                cand = json.loads(stdout_text)
+                if isinstance(cand, dict):
+                    parsed = cand
+            except Exception:
+                for line in reversed(stdout_text.splitlines()):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        cand = json.loads(line)
+                        if isinstance(cand, dict):
+                            parsed = cand
+                            break
+                    except Exception:
+                        continue
+
+        if proc.returncode != 0 or not isinstance(parsed, dict) or parsed.get("ok") is False:
+            err_msg = (
+                (parsed.get("error") if isinstance(parsed, dict) else None)
+                or stderr_tail
+                or f"company-wiki CLI exited with code {proc.returncode}"
+            )
+            return {
+                "ok": False,
+                "status": "cli_error",
+                "exit_code": proc.returncode,
+                "error": sanitize_stderr_text(str(err_msg), max_len=300),
+                "hint": parsed.get("hint") if isinstance(parsed, dict) else None,
+            }
+        return parsed
+
+    async def handle_wiki_ingest(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        """Handle `POST /wiki/ingest` (admin token only) to validate, preview, or ingest into company-wiki."""
+        target_type = str(body.get("target_type") or "").strip().lower()
+        if target_type not in ("company", "sector"):
+            return 400, {
+                "ok": False,
+                "status": "invalid_target_type",
+                "error_code": "invalid_target_type",
+                "error": "target_type 必须为 'company' 或 'sector'",
+            }
+
+        raw_target = body.get("target")
+        if not isinstance(raw_target, str) or not raw_target.strip():
+            return 400, {
+                "ok": False,
+                "status": "invalid_slug",
+                "error_code": "empty_target",
+                "error": "target 必须为非空字符串",
+            }
+
+        raw_content_type = body.get("content_type")
+        if not isinstance(raw_content_type, str) or not raw_content_type.strip():
+            return 400, {
+                "ok": False,
+                "status": "invalid_content_type",
+                "error_code": "empty_content_type",
+                "error": "content_type 必须为非空字符串",
+            }
+
+        # Check sell-side content_type first and prompt user to use sales notes
+        if _SELL_SIDE_TYPE_RE.search(raw_content_type.strip()):
+            return 400, {
+                "ok": False,
+                "status": "sell_side_rejected",
+                "error_code": "sell_side_rejected",
+                "suspected_sell_side": True,
+                "error": f"卖方内容类型 '{raw_content_type.strip()}' 不进 company-wiki，请走 sales notes。",
+                "hint": "卖方观点（券商研报、sales color、分析师电话会）请走 sales notes，不进 wiki。",
+            }
+
+        canonical_content_type = _ALLOWED_CONTENT_TYPE_MAP.get(
+            _normalize_content_type_key(raw_content_type)
+        )
+        if not canonical_content_type:
+            return 400, {
+                "ok": False,
+                "status": "invalid_content_type",
+                "error_code": "invalid_content_type",
+                "allowed_content_types": list(WIKI_INGEST_ALLOWED_CONTENT_TYPES),
+                "error": (
+                    f"content_type '{raw_content_type.strip()}' 不在允许列表中。"
+                    f"允许的类型: {', '.join(WIKI_INGEST_ALLOWED_CONTENT_TYPES)}"
+                ),
+            }
+
+        date_str = str(body.get("date") or "").strip()
+        if not _YMD_RE.fullmatch(date_str):
+            return 400, {
+                "ok": False,
+                "status": "invalid_date",
+                "error_code": "invalid_date",
+                "error": "date 必须为 YYYY-MM-DD 格式",
+            }
+        try:
+            datetime.strptime(date_str, "%Y-%m-%d")
+        except ValueError:
+            return 400, {
+                "ok": False,
+                "status": "invalid_date",
+                "error_code": "invalid_date",
+                "error": f"date '{date_str}' 不是有效日历日期",
+            }
+
+        raw_source = body.get("source")
+        source_clean: str | None = None
+        if raw_source is not None and str(raw_source).strip():
+            try:
+                source_clean = _validate_clean_text(
+                    str(raw_source), field_name="source", max_len=500
+                )
+            except ValueError as exc:
+                return 400, {
+                    "ok": False,
+                    "status": "bad_request",
+                    "error_code": "invalid_source",
+                    "error": str(exc),
+                }
+            if _SELL_SIDE_TYPE_RE.search(source_clean):
+                return 400, {
+                    "ok": False,
+                    "status": "sell_side_rejected",
+                    "error_code": "sell_side_rejected",
+                    "suspected_sell_side": True,
+                    "error": f"来源 '{source_clean}' 属于卖方渠道，请走 sales notes。",
+                    "hint": "卖方观点（券商研报、sales color、分析师电话会）请走 sales notes，不进 wiki。",
+                }
+
+        raw_source_url = body.get("source_url")
+        source_url_clean: str | None = None
+        if raw_source_url is not None and str(raw_source_url).strip():
+            url_cand = str(raw_source_url).strip()
+            if (
+                len(url_cand) > 1000
+                or any(ord(ch) < 32 or ch.isspace() for ch in url_cand)
+                or not url_cand.startswith(("http://", "https://"))
+            ):
+                return 400, {
+                    "ok": False,
+                    "status": "bad_request",
+                    "error_code": "invalid_source_url",
+                    "error": "source_url 必须为有效的 http/https URL（<=1000 字符）",
+                }
+            source_url_clean = url_cand
+
+        # Validate ingested_by & ingested_via
+        raw_by = body.get("ingested_by")
+        if isinstance(raw_by, dict):
+            by_user_id = str(raw_by.get("user_id") or "").strip()
+            by_email = str(raw_by.get("email") or "").strip()
+        elif isinstance(raw_by, str) and raw_by.strip():
+            by_user_id = raw_by.strip()
+            by_email = ""
+        else:
+            by_user_id = ""
+            by_email = ""
+        if not by_user_id:
+            return 400, {
+                "ok": False,
+                "status": "bad_request",
+                "error_code": "missing_ingested_by",
+                "error": "ingested_by.user_id 必填",
+            }
+        ingested_by_norm = {"user_id": by_user_id, "email": by_email}
+
+        raw_via = body.get("ingested_via")
+        if isinstance(raw_via, dict):
+            ingested_via_norm = {
+                "workspace_id": str(raw_via.get("workspace_id") or "").strip(),
+                "thread_id": str(raw_via.get("thread_id") or "").strip(),
+            }
+        else:
+            ingested_via_norm = {"workspace_id": "", "thread_id": ""}
+
+        raw_req_id = body.get("request_id")
+        request_id: str | None = (
+            str(raw_req_id).strip() if isinstance(raw_req_id, str) and raw_req_id.strip() else None
+        )
+
+        dry_run = bool(body.get("dry_run", False))
+
+        # Validate mutually exclusive content vs file
+        has_content = body.get("content") is not None
+        has_file = body.get("file") is not None
+        if has_content == has_file:
+            return 400, {
+                "ok": False,
+                "status": "bad_request",
+                "error_code": "content_or_file_required",
+                "error": "content 与 file 必须二选一传入",
+            }
+
+        wiki_cfg = self._load_company_wiki_config()
+        resolved_slug, is_existing_slug, slug_err = self._resolve_and_validate_wiki_slug(
+            target_type, raw_target, wiki_cfg
+        )
+        if slug_err is not None or resolved_slug is None:
+            return 400, slug_err or {"ok": False, "status": "invalid_slug", "error": "Invalid target"}
+
+        content_text: str | None = None
+        file_bytes: bytes | None = None
+        upload_filename: str | None = None
+        size_bytes: int = 0
+        char_count: int = 0
+        text_for_inspection: str = ""
+        full_byte_scan_text: str = ""
+        text_extracted: bool = True
+        scan_note: str | None = None
+
+        if has_content:
+            raw_content = body.get("content")
+            if not isinstance(raw_content, str) or not raw_content.strip():
+                return 400, {
+                    "ok": False,
+                    "status": "empty_content",
+                    "error_code": "empty_content",
+                    "error": "content 不能为空",
+                }
+            if len(raw_content) > WIKI_INGEST_MAX_TEXT_CHARS:
+                return 400, {
+                    "ok": False,
+                    "status": "payload_too_large",
+                    "error_code": "text_too_large",
+                    "max_chars": WIKI_INGEST_MAX_TEXT_CHARS,
+                    "char_count": len(raw_content),
+                    "error": f"文本长度 ({len(raw_content)}) 超过 {WIKI_INGEST_MAX_TEXT_CHARS} 字符上限",
+                }
+            content_text = raw_content
+            char_count = len(content_text)
+            size_bytes = len(content_text.encode("utf-8"))
+            text_for_inspection = content_text
+            full_byte_scan_text = content_text
+            norm_text = _normalize_wiki_text_for_hash(content_text)
+            content_sha256 = hashlib.sha256(norm_text.encode("utf-8")).hexdigest()
+        else:
+            raw_file = body.get("file")
+            if not isinstance(raw_file, dict):
+                return 400, {
+                    "ok": False,
+                    "status": "bad_request",
+                    "error_code": "invalid_file_payload",
+                    "error": "file 必须为包含 filename 与文件字节的对象",
+                }
+            raw_fname = str(raw_file.get("filename") or raw_file.get("name") or "").strip()
+            if (
+                not raw_fname
+                or "/" in raw_fname
+                or "\\" in raw_fname
+                or ".." in raw_fname
+                or raw_fname.startswith(".")
+            ):
+                return 400, {
+                    "ok": False,
+                    "status": "bad_request",
+                    "error_code": "invalid_filename",
+                    "error": "file.filename 非法或为空",
+                }
+            ext = Path(raw_fname).suffix.lower()
+            if ext not in WIKI_INGEST_ALLOWED_EXTENSIONS:
+                return 400, {
+                    "ok": False,
+                    "status": "invalid_extension",
+                    "error_code": "invalid_extension",
+                    "allowed_extensions": sorted(WIKI_INGEST_ALLOWED_EXTENSIONS),
+                    "error": (
+                        f"不支持的文件扩展名 '{ext}'；仅允许: "
+                        f"{', '.join(sorted(WIKI_INGEST_ALLOWED_EXTENSIONS))}"
+                    ),
+                }
+            upload_filename = Path(raw_fname).name
+            decoded_bytes, decode_err = _extract_file_bytes(raw_file)
+            if decode_err is not None or decoded_bytes is None:
+                return 400, {
+                    "ok": False,
+                    "status": "bad_request",
+                    "error_code": "invalid_file_bytes",
+                    "error": decode_err or "无法解析文件字节",
+                }
+            if len(decoded_bytes) == 0:
+                return 400, {
+                    "ok": False,
+                    "status": "empty_content",
+                    "error_code": "empty_file",
+                    "error": "文件内容不能为空",
+                }
+            if len(decoded_bytes) > WIKI_INGEST_MAX_FILE_BYTES:
+                return 400, {
+                    "ok": False,
+                    "status": "payload_too_large",
+                    "error_code": "file_too_large",
+                    "max_bytes": WIKI_INGEST_MAX_FILE_BYTES,
+                    "size_bytes": len(decoded_bytes),
+                    "error": f"文件大小 ({len(decoded_bytes)} bytes) 超过 20 MB 上限",
+                }
+            file_bytes = decoded_bytes
+            size_bytes = len(file_bytes)
+            if ext in (".md", ".txt"):
+                decoded_text = file_bytes.decode("utf-8", errors="replace")
+                if not decoded_text.strip():
+                    return 400, {
+                        "ok": False,
+                        "status": "empty_content",
+                        "error_code": "empty_file",
+                        "error": "文本文件内容不能为空",
+                    }
+                if len(decoded_text) > WIKI_INGEST_MAX_TEXT_CHARS:
+                    return 400, {
+                        "ok": False,
+                        "status": "payload_too_large",
+                        "error_code": "text_too_large",
+                        "max_chars": WIKI_INGEST_MAX_TEXT_CHARS,
+                        "char_count": len(decoded_text),
+                        "error": f"文本文件字符数 ({len(decoded_text)}) 超过 {WIKI_INGEST_MAX_TEXT_CHARS} 上限",
+                    }
+                char_count = len(decoded_text)
+                text_for_inspection = decoded_text
+                full_byte_scan_text = decoded_text
+                norm_text = _normalize_wiki_text_for_hash(decoded_text)
+                content_sha256 = hashlib.sha256(norm_text.encode("utf-8")).hexdigest()
+            else:
+                (
+                    full_byte_scan_text,
+                    extracted_text,
+                    text_extracted,
+                    scan_note,
+                ) = _inspect_binary_file_for_wiki(file_bytes, ext)
+                text_for_inspection = extracted_text if text_extracted else full_byte_scan_text
+                char_count = len(extracted_text) if text_extracted else 0
+                norm_text = _normalize_wiki_text_for_hash(extracted_text) if text_extracted and extracted_text else ""
+                content_sha256 = hashlib.sha256(file_bytes).hexdigest()
+
+        # Full-byte secret scan across all file bytes / extracted text / metadata (no truncation)
+        secret_kind = _detect_wiki_ingest_secret(
+            full_byte_scan_text,
+            text_for_inspection,
+            source_clean or "",
+            source_url_clean or "",
+        )
+        if secret_kind is not None:
+            return 400, {
+                "ok": False,
+                "status": "secret_detected",
+                "error_code": "secret_detected",
+                "secret_kind": secret_kind,
+                "error": "检测到疑似密钥或敏感凭证（API key / token / 私钥 PEM），拒绝入库。",
+                "hint": "请先移除正文或文件中的密钥、Token 或私钥内容后再入库。",
+            }
+
+        # Check suspected sell-side markers across the full text and filename
+        suspected_sell_side = bool(
+            _SELL_SIDE_BODY_RE.search(text_for_inspection)
+            or (upload_filename and _SELL_SIDE_TYPE_RE.search(upload_filename))
+        )
+        sell_side_warning = (
+            "正文或文件名疑似包含卖方研报/Sales Color/分析师电话会特征；卖方观点请走 sales notes，请确认该材料为公司或专家一手纪要。"
+            if suspected_sell_side
+            else None
+        )
+
+        # Compute expected preview filename & relative filepath
+        type_slug = canonical_content_type.replace(" ", "-")
+        subdir = "companies" if target_type == "company" else "sectors"
+        preview_filename = f"{date_str}-{type_slug}.md"
+        preview_filepath = f"wiki/{subdir}/{resolved_slug}/{preview_filename}"
+
+        def _build_replay_response(prior_entry: dict[str, Any]) -> dict[str, Any]:
+            prior_doc_id = prior_entry.get("doc_id")
+            prior_fp = str(prior_entry.get("filepath") or preview_filepath)
+            prior_fn = str(prior_entry.get("filename") or Path(prior_fp).name)
+            resp_obj: dict[str, Any] = {
+                "ok": True,
+                "status": "ingested",
+                "dry_run": False,
+                "idempotent_replay": True,
+                "request_id": request_id,
+                "doc_id": prior_doc_id,
+                "document_id": f"wiki:{prior_doc_id}" if prior_doc_id is not None else None,
+                "target_type": str(prior_entry.get("target_type") or target_type),
+                "target": str(prior_entry.get("target") or resolved_slug),
+                "content_type": str(prior_entry.get("content_type") or canonical_content_type),
+                "date": str(prior_entry.get("date") or date_str),
+                "filename": prior_fn,
+                "filepath": prior_fp,
+                "size_bytes": size_bytes,
+                "char_count": char_count,
+                "sha256": str(prior_entry.get("sha256") or content_sha256),
+                "text_extracted": text_extracted,
+                "scan_note": scan_note,
+                "suspected_sell_side": suspected_sell_side,
+                "sell_side_warning": sell_side_warning,
+                "duplicate": False,
+                "audit_path": "var/dalton/wiki_ingest_audit.jsonl",
+            }
+            return resp_obj
+
+        def _build_duplicate_response(dup_info: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+            return 400, {
+                "ok": False,
+                "status": "duplicate",
+                "error_code": "duplicate",
+                "duplicate": True,
+                "duplicate_reason": dup_info.get("reason"),
+                "existing_doc_id": dup_info.get("doc_id"),
+                "existing_filepath": dup_info.get("filepath"),
+                "similarity": dup_info.get("similarity"),
+                "target_type": target_type,
+                "target": resolved_slug,
+                "content_type": canonical_content_type,
+                "date": date_str,
+                "filename": preview_filename,
+                "filepath": preview_filepath,
+                "size_bytes": size_bytes,
+                "char_count": char_count,
+                "sha256": content_sha256,
+                "text_extracted": text_extracted,
+                "scan_note": scan_note,
+                "suspected_sell_side": suspected_sell_side,
+                "sell_side_warning": sell_side_warning,
+                "error": (
+                    f"检测到重复文档 (duplicate: {dup_info.get('reason')})，已存在记录 "
+                    f"{dup_info.get('filepath') or dup_info.get('doc_id') or ''}，拒绝重复入库。"
+                ).strip(),
+            }
+
+        def _replay_and_backfill_audit_if_needed(prior_entry: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+            if request_id is not None and self._find_wiki_audit_by_request_id(request_id) is None:
+                try:
+                    self._append_wiki_audit_entry(
+                        {
+                            "timestamp": str(
+                                prior_entry.get("timestamp")
+                                or datetime.now(timezone.utc).isoformat()
+                            ),
+                            "request_id": request_id,
+                            "ingested_by": prior_entry.get("ingested_by") or ingested_by_norm,
+                            "ingested_via": prior_entry.get("ingested_via") or ingested_via_norm,
+                            "target_type": str(prior_entry.get("target_type") or target_type),
+                            "target": str(prior_entry.get("target") or resolved_slug),
+                            "content_type": str(
+                                prior_entry.get("content_type") or canonical_content_type
+                            ),
+                            "date": str(prior_entry.get("date") or date_str),
+                            "sha256": str(prior_entry.get("sha256") or content_sha256),
+                            "doc_id": prior_entry.get("doc_id"),
+                            "filepath": prior_entry.get("filepath"),
+                            "filename": prior_entry.get("filename"),
+                            "result": "ok",
+                            "status": "ingested",
+                            "_norm_excerpt": str(prior_entry.get("_norm_excerpt") or ""),
+                        }
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Failed backfilling wiki ingest audit entry on replay: %s",
+                        type(exc).__name__,
+                    )
+            return 200, _build_replay_response(prior_entry)
+
+        # Idempotent replay check by request_id (reads independent idempotency store first)
+        if not dry_run and request_id is not None:
+            prior_entry = self._find_wiki_idempotent_result(request_id)
+            if prior_entry is not None:
+                return _replay_and_backfill_audit_if_needed(prior_entry)
+
+        if dry_run:
+            dup_info = await self._check_wiki_duplicate(
+                target_type=target_type,
+                resolved_slug=resolved_slug,
+                canonical_content_type=canonical_content_type,
+                date_str=date_str,
+                content_sha256=content_sha256,
+                norm_text=norm_text,
+                wiki_cfg=wiki_cfg,
+            )
+            if dup_info is not None:
+                return _build_duplicate_response(dup_info)
+            return 200, {
+                "ok": True,
+                "status": "dry_run",
+                "dry_run": True,
+                "target_type": target_type,
+                "target": resolved_slug,
+                "raw_target": raw_target.strip(),
+                "is_existing_slug": is_existing_slug,
+                "content_type": canonical_content_type,
+                "date": date_str,
+                "filename": preview_filename,
+                "upload_filename": upload_filename,
+                "filepath": preview_filepath,
+                "size_bytes": size_bytes,
+                "char_count": char_count,
+                "sha256": content_sha256,
+                "text_extracted": text_extracted,
+                "scan_note": scan_note,
+                "suspected_sell_side": suspected_sell_side,
+                "sell_side_warning": sell_side_warning,
+                "duplicate": False,
+            }
+
+        # Built before any lock is taken: these touch the filesystem and can
+        # raise, and only the try/finally below releases the claim locks.
+        run_sh = self._resolve_wiki_run_sh()
+        subproc_env = self._build_wiki_subprocess_env()
+
+        # Kernel file locks (`fcntl.flock`) across duplicate check + CLI write + idempotency/audit persistence
+        slot_key = hashlib.sha256(
+            f"{target_type}:{resolved_slug.lower()}:{date_str}:{canonical_content_type}".encode("utf-8")
+        ).hexdigest()
+        claim_fds, claim_err = self._try_acquire_wiki_claim_locks(
+            content_sha256=content_sha256,
+            slot_key=slot_key,
+            request_id=request_id,
+        )
+        if claim_err == "same_request_inflight":
+            return 409, {
+                "ok": False,
+                "status": "in_progress",
+                "error_code": "request_in_progress",
+                "request_id": request_id,
+                "error": "同一请求正在处理，稍后重试",
+            }
+        if claim_err is not None or claim_fds is None:
+            return _build_duplicate_response(
+                {
+                    "reason": claim_err or "concurrent_inflight",
+                    "doc_id": None,
+                    "filepath": preview_filepath,
+                    "similarity": 1.0,
+                }
+            )
+
+        req_tmp_dir: Path | None = None
+        tmp_file_path: Path | None = None
+        tmp_content_path: Path | None = None
+
+        try:
+            if request_id is not None:
+                prior_entry = self._find_wiki_idempotent_result(request_id)
+                if prior_entry is not None:
+                    return _replay_and_backfill_audit_if_needed(prior_entry)
+
+            dup_info = await self._check_wiki_duplicate(
+                target_type=target_type,
+                resolved_slug=resolved_slug,
+                canonical_content_type=canonical_content_type,
+                date_str=date_str,
+                content_sha256=content_sha256,
+                norm_text=norm_text,
+                wiki_cfg=wiki_cfg,
+            )
+            if dup_info is not None:
+                return _build_duplicate_response(dup_info)
+
+            self.cfg.wiki_ingest_temp_dir.mkdir(parents=True, exist_ok=True)
+            req_tmp_dir = Path(
+                tempfile.mkdtemp(
+                    prefix="wiki_ingest_",
+                    dir=str(self.cfg.wiki_ingest_temp_dir),
+                )
+            )
+            os.chmod(req_tmp_dir, 0o700)
+
+            if file_bytes is not None and upload_filename is not None:
+                tmp_file_path = req_tmp_dir / upload_filename
+                fd = os.open(
+                    str(tmp_file_path),
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                )
+                try:
+                    os.write(fd, file_bytes)
+                finally:
+                    os.close(fd)
+            elif content_text is not None:
+                tmp_content_path = req_tmp_dir / "content.txt"
+                fd = os.open(
+                    str(tmp_content_path),
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                )
+                try:
+                    os.write(fd, content_text.encode("utf-8"))
+                finally:
+                    os.close(fd)
+
+            cmd = build_wiki_ingest_cmd(
+                run_sh=run_sh,
+                target_type=target_type,
+                resolved_slug=resolved_slug,
+                content_type=canonical_content_type,
+                date_str=date_str,
+                content_file_path=tmp_content_path,
+                file_path=tmp_file_path,
+                source=source_clean,
+                source_url=source_url_clean,
+            )
+            try:
+                cli_res = await self._run_company_wiki_ingest_cli(
+                    cmd,
+                    env=subproc_env,
+                    timeout_s=self.cfg.wiki_ingest_timeout_s,
+                )
+            except asyncio.CancelledError:
+                audit_cancelled = {
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "request_id": request_id,
+                    "ingested_by": ingested_by_norm,
+                    "ingested_via": ingested_via_norm,
+                    "target_type": target_type,
+                    "target": resolved_slug,
+                    "content_type": canonical_content_type,
+                    "date": date_str,
+                    "sha256": content_sha256,
+                    "doc_id": None,
+                    "filepath": None,
+                    "result": "cancelled",
+                    "status": "cancelled",
+                    "error": "CancelledError",
+                }
+                try:
+                    self._append_wiki_audit_entry(audit_cancelled)
+                except Exception as exc:
+                    logger.warning(
+                        "Failed writing wiki cancelled audit entry: %s",
+                        type(exc).__name__,
+                    )
+                raise
+
+            if cli_res.get("ok") is not True:
+                err_status = str(cli_res.get("status") or "cli_error")
+                err_msg = str(cli_res.get("error") or "company-wiki CLI failed")
+                audit_fail = {
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "request_id": request_id,
+                    "ingested_by": ingested_by_norm,
+                    "ingested_via": ingested_via_norm,
+                    "target_type": target_type,
+                    "target": resolved_slug,
+                    "content_type": canonical_content_type,
+                    "date": date_str,
+                    "sha256": content_sha256,
+                    "doc_id": None,
+                    "filepath": None,
+                    "result": "error",
+                    "status": err_status,
+                    "error": err_msg,
+                }
+                try:
+                    self._append_wiki_audit_entry(audit_fail)
+                except Exception as exc:
+                    logger.warning("Failed writing wiki failure audit entry: %s", type(exc).__name__)
+                return 502, {
+                    "ok": False,
+                    "status": err_status,
+                    "request_id": request_id,
+                    "error": err_msg,
+                    "hint": cli_res.get("hint"),
+                }
+
+            doc_id = cli_res.get("doc_id")
+            filepath = str(cli_res.get("filepath") or preview_filepath)
+            filename = str(cli_res.get("filename") or Path(filepath).name)
+            now_iso = datetime.now(timezone.utc).isoformat()
+            idemp_record = {
+                "timestamp": now_iso,
+                "request_id": request_id,
+                "ingested_by": ingested_by_norm,
+                "ingested_via": ingested_via_norm,
+                "target_type": target_type,
+                "target": resolved_slug,
+                "content_type": canonical_content_type,
+                "date": date_str,
+                "sha256": content_sha256,
+                "doc_id": doc_id,
+                "filepath": filepath,
+                "filename": filename,
+                "result": "ok",
+                "status": "ingested",
+                "chunks": cli_res.get("chunks"),
+                "tags": cli_res.get("tags") or [],
+                "related_companies": cli_res.get("related_companies") or [],
+                "related_sectors": cli_res.get("related_sectors") or [],
+                "_norm_excerpt": norm_text[:8192] if norm_text else "",
+            }
+            idemp_key = request_id or f"sha256:{content_sha256}"
+            try:
+                self._save_wiki_idempotent_result(idemp_key, idemp_record)
+            except Exception as exc:
+                logger.warning(
+                    "Failed writing wiki idempotency result after CLI success: %s",
+                    type(exc).__name__,
+                )
+
+            audit_ok = {
+                "timestamp": now_iso,
+                "request_id": request_id,
+                "ingested_by": ingested_by_norm,
+                "ingested_via": ingested_via_norm,
+                "target_type": target_type,
+                "target": resolved_slug,
+                "content_type": canonical_content_type,
+                "date": date_str,
+                "sha256": content_sha256,
+                "doc_id": doc_id,
+                "filepath": filepath,
+                "filename": filename,
+                "result": "ok",
+                "status": "ingested",
+                "_norm_excerpt": norm_text[:8192] if norm_text else "",
+            }
+            try:
+                self._append_wiki_audit_entry(audit_ok)
+            except Exception as exc:
+                logger.warning(
+                    "Failed writing wiki ingest audit entry after CLI success: %s",
+                    type(exc).__name__,
+                )
+
+            return 200, {
+                "ok": True,
+                "status": "ingested",
+                "dry_run": False,
+                "request_id": request_id,
+                "doc_id": doc_id,
+                "document_id": f"wiki:{doc_id}" if doc_id is not None else None,
+                "target_type": target_type,
+                "target": resolved_slug,
+                "content_type": canonical_content_type,
+                "date": date_str,
+                "filename": filename,
+                "filepath": filepath,
+                "size_bytes": size_bytes,
+                "char_count": char_count,
+                "sha256": content_sha256,
+                "text_extracted": text_extracted,
+                "scan_note": scan_note,
+                "chunks": cli_res.get("chunks"),
+                "tags": cli_res.get("tags") or [],
+                "related_companies": cli_res.get("related_companies") or [],
+                "related_sectors": cli_res.get("related_sectors") or [],
+                "suspected_sell_side": suspected_sell_side,
+                "sell_side_warning": sell_side_warning,
+                "duplicate": False,
+                "audit_path": "var/dalton/wiki_ingest_audit.jsonl",
+            }
+        finally:
+            for p in (tmp_content_path, tmp_file_path):
+                if p is not None:
+                    try:
+                        p.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+            if req_tmp_dir is not None:
+                try:
+                    shutil.rmtree(req_tmp_dir, ignore_errors=True)
+                except OSError:
+                    pass
+            self._release_wiki_claim_locks(claim_fds)
+
+
+def _normalize_content_type_key(raw: str) -> str:
+    return re.sub(r"[\s\-_]+", " ", raw.strip().lower())
+
+
+_ALLOWED_CONTENT_TYPE_MAP: dict[str, str] = {}
+for _ct in WIKI_INGEST_ALLOWED_CONTENT_TYPES:
+    _ALLOWED_CONTENT_TYPE_MAP[_normalize_content_type_key(_ct)] = _ct
+    _ALLOWED_CONTENT_TYPE_MAP[_ct.lower().replace(" ", "")] = _ct
+
+_SELL_SIDE_TYPE_RE = re.compile(
+    r"(?i)(?:券商|卖方|sales|broker|sell[-_\s]?side|分析师电话会|研报|投行报告|机构研报)"
+)
+_SELL_SIDE_BODY_RE = re.compile(
+    r"(?i)(?:证券研究报告|执业证书编号|SAC\s*执业|分析师电话会|sales\s+color|卖方研报|券商研报)"
+)
+_WIKI_NEEDS_ALIAS_RE = re.compile(
+    r"(?i)(?:[\u4e00-\u9fff]|^(?:SH|SZ|BJ|HK)[.\-]?\d{4,6}$|^\d{4,6}\.(?:HK|SH|SZ|SS|BJ)$)"
+)
+_WIKI_SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "private_key_pem",
+        re.compile(
+            r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |ENCRYPTED |PGP )?PRIVATE KEY-----",
+            re.ASCII,
+        ),
+    ),
+    (
+        "api_key_prefix",
+        re.compile(
+            r"(?:sk-(?:proj-|ant-|live-|test-)?[A-Za-z0-9_\-]{16,}|AIza[0-9A-Za-z\-_]{30,}|"
+            r"AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{20,}|gho_[A-Za-z0-9]{20,}|"
+            r"github_pat_[A-Za-z0-9_]{20,}|xai-[A-Za-z0-9_\-]{16,}|tvly-[A-Za-z0-9_\-]{16,}|"
+            r"fc-[A-Za-z0-9_\-]{16,}|xox[baprs]-[A-Za-z0-9\-]{16,})",
+            re.ASCII,
+        ),
+    ),
+    (
+        "secret_assignment",
+        re.compile(
+            r"(?i)\b(?:api[_-]?key|apikey|secret[_-]?key|access[_-]?token|auth[_-]?token|"
+            r"bearer[_-]?token|private[_-]?key|client[_-]?secret|dalton_bridge_(?:admin_)?token|"
+            r"gemini_api_key|openai_api_key|anthropic_api_key)\b\s*[:=]\s*['\"]?[A-Za-z0-9._\-+/=]{12,}['\"]?",
+            re.ASCII,
+        ),
+    ),
+    (
+        "bearer_token",
+        re.compile(
+            r"(?i)\bAuthorization\s*:\s*Bearer\s+[A-Za-z0-9._\-+/=]{16,}",
+            re.ASCII,
+        ),
+    ),
+)
+
+
+def _detect_wiki_ingest_secret(*texts: str) -> str | None:
+    """Return the matched secret pattern name if any text contains a suspected key/token/PEM, else None."""
+    for text in texts:
+        if not text:
+            continue
+        for kind, pat in _WIKI_SECRET_PATTERNS:
+            if pat.search(text):
+                return kind
+    return None
+
+
+def _normalize_wiki_text_for_hash(text: str) -> str:
+    """Normalize line endings and collapse whitespace for content hashing and similarity checks."""
+    cleaned = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    return re.sub(r"\s+", " ", cleaned)
+
+
+def _strip_wiki_markdown_frontmatter(raw_md: str) -> str:
+    """Strip YAML frontmatter and auto-generated H1 header from an existing wiki markdown file."""
+    text = raw_md.replace("\r\n", "\n").strip()
+    if text.startswith("---\n"):
+        end_idx = text.find("\n---\n", 4)
+        if end_idx != -1:
+            text = text[end_idx + 5 :].lstrip()
+    if text.startswith("# "):
+        nl_idx = text.find("\n")
+        if nl_idx != -1:
+            text = text[nl_idx + 1 :].lstrip()
+    return text
+
+
+def _compute_wiki_text_similarity(text_a: str, text_b: str) -> float:
+    """Compute similarity in [0.0, 1.0] between two normalized texts using SequenceMatcher and 3-gram Jaccard."""
+    norm_a = _normalize_wiki_text_for_hash(text_a)
+    norm_b = _normalize_wiki_text_for_hash(text_b)
+    if not norm_a or not norm_b:
+        return 0.0
+    if norm_a == norm_b:
+        return 1.0
+    seq_ratio = difflib.SequenceMatcher(None, norm_a[:12000], norm_b[:12000]).ratio()
+    compact_a = re.sub(r"\s+", "", norm_a[:12000])
+    compact_b = re.sub(r"\s+", "", norm_b[:12000])
+    if len(compact_a) >= 3 and len(compact_b) >= 3:
+        grams_a = {compact_a[i : i + 3] for i in range(len(compact_a) - 2)}
+        grams_b = {compact_b[i : i + 3] for i in range(len(compact_b) - 2)}
+        union = len(grams_a | grams_b)
+        jaccard = (len(grams_a & grams_b) / union) if union else 0.0
+        return max(seq_ratio, jaccard)
+    return seq_ratio
+
+
+def _extract_file_bytes(file_obj: dict[str, Any]) -> tuple[bytes | None, str | None]:
+    """Decode raw bytes from `file` dict (`content_b64`, `bytes_b64`, `data_b64`, or `bytes`/`data`/`content`)."""
+    for b64_key in ("content_b64", "bytes_b64", "data_b64"):
+        val = file_obj.get(b64_key)
+        if isinstance(val, str):
+            try:
+                return base64.b64decode(val.encode("ascii"), validate=True), None
+            except Exception:
+                return None, f"{b64_key} 不是有效的 base64 编码"
+    for raw_key in ("bytes", "data", "content"):
+        val = file_obj.get(raw_key)
+        if isinstance(val, (bytes, bytearray)):
+            return bytes(val), None
+        if isinstance(val, str):
+            try:
+                return base64.b64decode(val.encode("ascii"), validate=True), None
+            except Exception:
+                return val.encode("utf-8"), None
+    return None, "file 对象缺少 content_b64 / bytes 字段"
+
+
+WIKI_BINARY_SCAN_ONLY_NOTE = "无法提取正文，仅做了字节扫描"
+
+
+def _inspect_binary_file_for_wiki(
+    file_bytes: bytes, ext: str
+) -> tuple[str, str, bool, str | None]:
+    """Return `(full_byte_scan_text, extracted_text, text_extracted, scan_note)` without truncating bytes."""
+    full_latin1 = file_bytes.decode("latin1")
+    full_utf8 = file_bytes.decode("utf-8", errors="ignore")
+    full_byte_scan_text = f"{full_latin1}\n{full_utf8}"
+
+    if ext == ".docx":
+        import io
+        import zipfile
+
+        try:
+            with zipfile.ZipFile(io.BytesIO(file_bytes)) as zf:
+                if "word/document.xml" in zf.namelist():
+                    xml_text = zf.read("word/document.xml").decode("utf-8", errors="ignore")
+                    extracted = re.sub(r"<[^>]+>", " ", xml_text).strip()
+                    if extracted:
+                        return full_byte_scan_text, extracted, True, None
+        except Exception:
+            pass
+
+    return full_byte_scan_text, "", False, WIKI_BINARY_SCAN_ONLY_NOTE
+
+
+def build_wiki_ingest_cmd(
+    *,
+    run_sh: Path | str,
+    target_type: str,
+    resolved_slug: str,
+    content_type: str,
+    date_str: str,
+    content_file_path: Path | str | None = None,
+    file_path: Path | str | None = None,
+    source: str | None = None,
+    source_url: str | None = None,
+) -> list[str]:
+    """Build the exact argv list for `company-wiki/run.sh --json add|add-file` (no shell).
+
+    Body text is never passed directly in `--content`; callers must write validated
+    text to a bridge-owned `0600` temp file and pass `content_file_path` so CLI
+    receives `--content @<temp_file>`.
+    """
+    target_flag = "--company" if target_type == "company" else "--sector"
+    if file_path is not None:
+        cmd = [
+            str(run_sh),
+            "--json",
+            "add-file",
+            target_flag,
+            resolved_slug,
+            "--type",
+            content_type,
+            "--date",
+            date_str,
+            "--file",
+            str(file_path),
+        ]
+    elif content_file_path is not None:
+        cmd = [
+            str(run_sh),
+            "--json",
+            "add",
+            target_flag,
+            resolved_slug,
+            "--type",
+            content_type,
+            "--date",
+            date_str,
+            "--content",
+            f"@{Path(content_file_path)}",
+        ]
+    else:
+        raise ValueError("Either file_path or content_file_path is required")
+    if source:
+        cmd.extend(["--source", source])
+    if source_url:
+        cmd.extend(["--source-url", source_url])
+    return cmd
+
 
 _FEISHU_TARGET_RE = re.compile(r"^feishu:(user:ou_[A-Za-z0-9_-]+)$")
 _DISCORD_TARGET_RE = re.compile(r"^discord:(user:[0-9]+)$")
@@ -8665,7 +10282,12 @@ async def _handle_client(
                 headers[hk.strip().lower()] = hv.strip()
 
         content_length = int(headers.get("content-length") or "0")
-        max_bytes = bridge.cfg.embed_max_bytes if path == "/embed" else MAX_REQUEST_BYTES
+        if path == "/embed":
+            max_bytes = bridge.cfg.embed_max_bytes
+        elif path == "/wiki/ingest":
+            max_bytes = MAX_WIKI_INGEST_REQUEST_BYTES
+        else:
+            max_bytes = MAX_REQUEST_BYTES
         if content_length > max_bytes:
             await _send_http(
                 writer,
@@ -8677,8 +10299,9 @@ async def _handle_client(
 
         body_bytes = b""
         if content_length > 0:
+            read_timeout = 60.0 if path == "/wiki/ingest" else 15.0
             body_bytes = await asyncio.wait_for(
-                reader.readexactly(content_length), timeout=15.0
+                reader.readexactly(content_length), timeout=read_timeout
             )
 
         # Route 1: GET /healthz
@@ -8903,6 +10526,30 @@ async def _handle_client(
                 return
             code, payload = await bridge.handle_notify(notify_body)
             status_label = "OK" if code == 200 else "Bad Request"
+            await _send_http(writer, code, status_label, payload)
+            return
+
+        # Route 6: POST /wiki/ingest (behind the admin token gate above; MCP token gets 403)
+        # DALTON-HOOK(wiki-ingest)
+        if path == "/wiki/ingest":
+            if method != "POST":
+                await _send_http(
+                    writer, 405, "Method Not Allowed", {"error": "Method Not Allowed"}
+                )
+                return
+            try:
+                ingest_body = json.loads(body_bytes.decode("utf-8"))
+                if not isinstance(ingest_body, dict):
+                    raise ValueError("Expected JSON object")
+            except Exception:
+                await _send_http(writer, 400, "Bad Request", {"ok": False, "error": "Parse error"})
+                return
+            code, payload = await bridge.handle_wiki_ingest(ingest_body)
+            status_label = (
+                "OK"
+                if code == 200
+                else ("Bad Request" if code == 400 else "Bad Gateway")
+            )
             await _send_http(writer, code, status_label, payload)
             return
 
