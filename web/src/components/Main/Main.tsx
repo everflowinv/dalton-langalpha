@@ -45,7 +45,7 @@ const routePreloads = {
   chat: ChatAgent.preload,
   market: MarketView.preload,
   automations: Automations.preload,
-  orders: Orders.preload,
+  // DALTON-HOOK(hide-trading): the Orders page is not mounted, so it has no preload
   plugins: Plugins.preload,
   settings: Settings.preload,
   connectors: Plugins.preload,

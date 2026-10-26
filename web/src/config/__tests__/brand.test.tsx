@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { render, screen, cleanup } from '@testing-library/react';
 import { MemoryRouter } from 'react-router';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import enUS from '@/locales/en-US.json';
 import zhCN from '@/locales/zh-CN.json';
 
@@ -107,11 +108,14 @@ describe('brand configuration (VITE_BRAND_NAME & VITE_BRAND_MARK)', () => {
 
     const { default: AppSidebar } = await import('@/components/Sidebar/AppSidebar');
     const { ShareTopBar } = await import('@/pages/SharedChat/ShareTopBar');
-    const { default: SetupWizard } = await import('@/pages/Setup/SetupWizard');
+    // The setup flow's wordmark now lives in the shared WizardTopBar (SetupWizard
+    // itself needs routes and a query client, which these brand checks don't).
+    const { WizardTopBar } = await import('@/components/ui/wizard');
     const { default: ShareUnavailable } = await import('@/pages/SharedChat/ShareUnavailable');
     const { default: LoginPage } = await import('@/pages/Login/LoginPage');
 
     const { container } = render(
+      <QueryClientProvider client={new QueryClient()}>
       <MemoryRouter>
         <AppSidebar
           collapsed={false}
@@ -120,10 +124,11 @@ describe('brand configuration (VITE_BRAND_NAME & VITE_BRAND_MARK)', () => {
           onWidthChange={() => {}}
         />
         <ShareTopBar name="report.html" />
-        <SetupWizard />
+        <WizardTopBar />
         <ShareUnavailable />
         <LoginPage />
-      </MemoryRouter>,
+      </MemoryRouter>
+      </QueryClientProvider>,
     );
 
     expect(container.querySelector('.sidebar-wordmark')?.textContent).toBe('LangAlpha');
@@ -133,10 +138,12 @@ describe('brand configuration (VITE_BRAND_NAME & VITE_BRAND_MARK)', () => {
     expect(sidebarImg).toBeTruthy();
     expect(sidebarImg?.getAttribute('alt')).toBe('');
 
+    // ShareUnavailable keeps its alt-text logo; the wizard top bar shows the
+    // wordmark as text beside a decorative (alt="") logo.
     const langAlphaImgs = screen.getAllByAltText('LangAlpha') as HTMLImageElement[];
-    expect(langAlphaImgs).toHaveLength(2);
-    expect(langAlphaImgs[0].classList.contains('h-7')).toBe(true);
-    expect(langAlphaImgs[1].classList.contains('h-8')).toBe(true);
+    expect(langAlphaImgs).toHaveLength(1);
+    expect(langAlphaImgs[0].classList.contains('h-8')).toBe(true);
+    expect(container.querySelector('.wizard-topbar')?.textContent).toContain('LangAlpha');
 
     const loginSvg = container.querySelector('svg.login-page__logo-icon');
     expect(loginSvg?.getAttribute('viewBox')).toBe('0 0 60 60');
@@ -150,10 +157,13 @@ describe('brand configuration (VITE_BRAND_NAME & VITE_BRAND_MARK)', () => {
 
     const { default: AppSidebar } = await import('@/components/Sidebar/AppSidebar');
     const { ShareTopBar } = await import('@/pages/SharedChat/ShareTopBar');
-    const { default: SetupWizard } = await import('@/pages/Setup/SetupWizard');
+    // The setup flow's wordmark now lives in the shared WizardTopBar (SetupWizard
+    // itself needs routes and a query client, which these brand checks don't).
+    const { WizardTopBar } = await import('@/components/ui/wizard');
     const { default: ShareUnavailable } = await import('@/pages/SharedChat/ShareUnavailable');
 
     const { container } = render(
+      <QueryClientProvider client={new QueryClient()}>
       <MemoryRouter>
         <AppSidebar
           collapsed={false}
@@ -162,14 +172,17 @@ describe('brand configuration (VITE_BRAND_NAME & VITE_BRAND_MARK)', () => {
           onWidthChange={() => {}}
         />
         <ShareTopBar name="report.html" />
-        <SetupWizard />
+        <WizardTopBar />
         <ShareUnavailable />
-      </MemoryRouter>,
+      </MemoryRouter>
+      </QueryClientProvider>,
     );
 
     expect(container.querySelector('.sidebar-wordmark')?.textContent).toBe('Everflow');
     expect(container.querySelector('.share-topbar-brand')?.textContent).toBe('Everflow');
-    expect(screen.getAllByText('Everflow')).toHaveLength(2);
+    // ShareUnavailable, and the wizard top bar's wordmark beside the sidebar/top-bar brands.
+    expect(screen.getAllByText('Everflow')).toHaveLength(3);
+    expect(container.querySelector('.wizard-topbar')?.textContent).toContain('Everflow');
     expect(container.querySelector('.sidebar-brand svg')?.getAttribute('viewBox')).toBe('0 0 56 56');
     expect(screen.queryByAltText('LangAlpha')).toBeNull();
   });

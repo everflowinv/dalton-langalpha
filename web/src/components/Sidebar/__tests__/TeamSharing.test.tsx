@@ -140,7 +140,6 @@ const STABLE_CHAT_HELPERS = vi.hoisted(() => ({
   resolveSubagentIdToAgentId: (id: string) => id,
   hydrateTaskTranscript: vi.fn(() => Promise.resolve(null)),
   sendSubagentInstruction: vi.fn(() => Promise.resolve()),
-  cancelMarketTarget: vi.fn(),
 }));
 const STABLE_EDIT_DRAFTS = createEditDraftStore(() => 'th-1');
 
@@ -208,7 +207,6 @@ vi.mock('@/pages/ChatAgent/hooks/useChatMessages', () => ({
     resolveSubagentIdToAgentId: STABLE_CHAT_HELPERS.resolveSubagentIdToAgentId,
     hydrateTaskTranscript: STABLE_CHAT_HELPERS.hydrateTaskTranscript,
     sendSubagentInstruction: STABLE_CHAT_HELPERS.sendSubagentInstruction,
-    cancelMarketTarget: STABLE_CHAT_HELPERS.cancelMarketTarget,
   }),
 }));
 

@@ -37,6 +37,12 @@ vi.mock('@/hooks/useConfiguredProviders', () => ({
   useConfiguredProviders: () => ({ configuredSet: new Set(h.configured) }),
 }));
 vi.mock('@/api/client', () => ({ api: { get: h.apiGet, defaults: { baseURL: '' } } }));
+// DALTON-HOOK(team-credentials): the connect steps read the team-credentials hint,
+// which needs the auth context these isolated step renders do not mount.
+vi.mock('@/hooks/useTeamCredentials', () => ({
+  TEAM_SHARED_CREDENTIALS_HINT: '',
+  useTeamCredentials: () => ({ isShared: false, canDisconnect: true, isPm: true, canInvite: false }),
+}));
 vi.mock('@/pages/Dashboard/utils/api', () => ({
   initiateCodexDevice: h.initiateCodexDevice,
   pollCodexDevice: h.pollCodexDevice,
