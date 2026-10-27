@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, create_autospec, patch  # DALTON-HOOK(provenance-full-archive)
 
 import pytest
 
@@ -47,7 +47,10 @@ async def _persist(events: list[dict], captured: dict[str, str]):
         patch.object(subagent_run_coordinator, "record_lane_images", record),
         patch(
             "src.server.services.runs.subagent_archive.replace_lane_provenance",
-            AsyncMock(return_value=True),
+            # DALTON-HOOK(provenance-full-archive): these lanes carry no
+            # provenance, so the real write returns 0 and the archive must
+            # still succeed — not the truthy True an AsyncMock would hide.
+            create_autospec(subagent_archive.replace_lane_provenance, return_value=0),
         ),
     ):
         ok = await persist_collected_events(
@@ -163,7 +166,9 @@ async def test_images_that_fail_to_land_keep_the_lanes_capture_stream(
     registries = MagicMock()
     registries.get_registry = AsyncMock(return_value=None)
     retire = AsyncMock()
-    provenance = AsyncMock(return_value=True)
+    # DALTON-HOOK(provenance-full-archive): no provenance for these lanes, so
+    # the real write returns 0 and the archive must still succeed on it.
+    provenance = create_autospec(subagent_archive.replace_lane_provenance, return_value=0)
     with (
         patch.object(subagent_collection, "iter_subagent_events_full", stream),
         patch.object(

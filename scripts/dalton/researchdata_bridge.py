@@ -10820,13 +10820,21 @@ class ResearchDataBridge:
                     dynamic_ids=(document_id, node_token, token),
                     limit=200,
                 )
+                outcome = (
+                    "unknown"
+                    if exc.error_code in _FEISHU_UNKNOWN_OUTCOME_CODES
+                    else "rejected"
+                )
+                lead = (
+                    "追加请求结果未知，可能已经写入；请先打开文档检查，不要直接重试"
+                    if outcome == "unknown"
+                    else "追加内容没有写入，原文档未改变"
+                )
                 return {
                     "ok": False,
                     "error": "content_insert_failed",
-                    "message": (
-                        f"追加内容没有写入，原文档未改变 ({reason}); "
-                        f"url={url}"
-                    ),
+                    "outcome": outcome,
+                    "message": f"{lead} ({reason}); url={url}",
                     "detail": reason,
                     "document_id": document_id,
                     "url": url,
@@ -11232,6 +11240,15 @@ class FeishuApiError(RuntimeError):
         self.error_code = error_code
 
 
+#: Codes where Feishu never returned a definite verdict: the connection died
+#: mid-response or the body was unparseable, so a write may have been committed
+#: anyway. Callers must not claim nothing was written for these.
+_FEISHU_UNKNOWN_OUTCOME_CODES: frozenset[str] = frozenset({
+    "feishu_network_error",
+    "feishu_invalid_response",
+})
+
+
 #: OpenClaw's Eve tracking group (internal team), the default share target for
 #: docs the bot creates; override with FEISHU_DEFAULT_GRANT_CHAT_ID.
 FEISHU_DEFAULT_GRANT_CHAT_ID = "oc_397207208fb52a0b09969794ef3cd421"
@@ -11478,6 +11495,36 @@ def _feishu_path_template(path: str) -> str:
     return "/" + "/".join(out)
 
 
+def _feishu_collect_dynamic_ids(node: Any, ids: list[str]) -> None:
+    """Collect dynamic Feishu ids from a nested request payload, at any depth.
+
+    An id-shaped key (`*_id`, `*_token`, plus `children`/`cells`, which carry
+    bare block ids) marks every string under it — its own value or each string
+    item of its list, e.g. `descendants[*].block_id` or a child block's
+    `children` — as an id; everything else is only recursed into.
+    """
+    if isinstance(node, dict):
+        for key, val in node.items():
+            k = str(key)
+            if k.endswith(("_id", "_token")) or k in ("children", "cells"):
+                if isinstance(val, str):
+                    if val.strip():
+                        ids.append(val.strip())
+                    continue
+                if isinstance(val, list):
+                    for item in val:
+                        if isinstance(item, str):
+                            if item.strip():
+                                ids.append(item.strip())
+                        else:
+                            _feishu_collect_dynamic_ids(item, ids)
+                    continue
+            _feishu_collect_dynamic_ids(val, ids)
+    elif isinstance(node, list):
+        for item in node:
+            _feishu_collect_dynamic_ids(item, ids)
+
+
 def _feishu_request_dynamic_ids(
     path: str,
     query: dict[str, Any] | None = None,
@@ -11487,16 +11534,11 @@ def _feishu_request_dynamic_ids(
     ids: list[str] = [
         seg for seg in clean.split("/") if seg and seg not in _FEISHU_STATIC_PATH_SEGMENTS
     ]
-    for mapping in (query, json_body):
-        if not isinstance(mapping, dict):
-            continue
-        for key, val in mapping.items():
+    if isinstance(query, dict):
+        for key, val in query.items():
             if key in _FEISHU_DYNAMIC_ID_KEYS and isinstance(val, str) and val.strip():
                 ids.append(val.strip())
-            elif key == "children_id" and isinstance(val, list):
-                for item in val:
-                    if isinstance(item, str) and item.strip():
-                        ids.append(item.strip())
+    _feishu_collect_dynamic_ids(json_body, ids)
     # Sort longest-first so a longer id is replaced before a shorter prefix.
     return tuple(sorted(set(ids), key=len, reverse=True))
 

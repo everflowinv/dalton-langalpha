@@ -566,11 +566,38 @@ async def test_append_insert_failure_reports_doc_url_and_detail(
     assert code == 502
     assert payload["ok"] is False
     assert payload["error"] == "content_insert_failed"
+    assert payload["outcome"] == "rejected"
     assert payload["document_id"] == "doccnWiki1"
     assert payload["url"] == "https://feishu.cn/wiki/wikinode1"
     assert "追加内容没有写入，原文档未改变" in payload["message"]
     assert "1770001" in payload["message"]
     assert "1770001" in payload["detail"]
+
+
+@pytest.mark.asyncio
+async def test_append_network_error_reports_unknown_outcome_not_unchanged(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A timeout after Feishu may have committed the append: never claim the doc
+    is unchanged, and tell the caller to check the doc instead of retrying."""
+    bridge = _make_bridge(monkeypatch, tmp_path)
+
+    def _insert_timeout(doc_id, block_id, children_ids, descendants, index):
+        raise rb.FeishuApiError("feishu_network_error", "timeout")
+
+    _stub_feishu_client(bridge, insert_descendants=_insert_timeout)
+    code, payload = await bridge.handle_feishu_doc_append(
+        {"token": "https://x.feishu.cn/wiki/wikinode1", "markdown": "# more"}
+    )
+    assert code == 502
+    assert payload["ok"] is False
+    assert payload["error"] == "content_insert_failed"
+    assert payload["outcome"] == "unknown"
+    assert payload["document_id"] == "doccnWiki1"
+    assert payload["url"] == "https://feishu.cn/wiki/wikinode1"
+    assert "追加请求结果未知，可能已经写入" in payload["message"]
+    assert "不要直接重试" in payload["message"]
+    assert "原文档未改变" not in payload["message"]
 
 
 def test_request_non_json_error_carries_status_content_type_path_template_without_tokens(
@@ -637,6 +664,64 @@ def test_request_non_json_error_carries_status_content_type_path_template_withou
         "access_token",
     ):
         assert forbidden not in msg
+
+
+def test_request_dynamic_ids_collected_recursively_from_nested_bodies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ids nested in the request body — `descendants[*].block_id` and a child
+    block's `children` list — are redacted from non-JSON error previews too."""
+    import email
+    import io
+    import urllib.error
+    import urllib.request
+
+    hdrs = email.message.Message()
+    hdrs["Content-Type"] = "text/html; charset=utf-8"
+    raw_body = "Bad Gateway: failed to insert blkChild987 under blkTop456 in doccnTarget123456"
+
+    opener = create_autospec(urllib.request.OpenerDirector, instance=True)
+
+    def _open(req: Any, timeout: Any = None) -> Any:
+        raise urllib.error.HTTPError(
+            req.full_url, 502, "Bad Gateway", hdrs, io.BytesIO(raw_body.encode("utf-8"))
+        )
+
+    opener.open.side_effect = _open
+    monkeypatch.setattr(
+        rb.urllib.request,
+        "build_opener",
+        create_autospec(urllib.request.build_opener, return_value=opener),
+    )
+
+    client = rb.FeishuClient("fake-app-id", "fake-app-secret", timeout_s=1.0)
+    client._tenant_token = "t-secretTokenValue999"
+    client._token_expires_at = time.time() + 3600.0
+
+    with pytest.raises(rb.FeishuApiError) as excinfo:
+        client._request(
+            "POST",
+            "/open-apis/docx/v1/documents/doccnTarget123456/blocks/doccnTarget123456/descendant",
+            json_body={
+                "children_id": ["blkTop456"],
+                "index": 0,
+                "descendants": [
+                    {
+                        "block_id": "blkTop456",
+                        "block_type": 2,
+                        "children": ["blkChild987"],
+                    },
+                    {"block_id": "blkChild987", "block_type": 2, "parent_id": "blkTop456"},
+                ],
+            },
+        )
+
+    msg = str(excinfo.value)
+    assert excinfo.value.error_code == "feishu_invalid_response"
+    # The child id only appears in the body's nested fields, not the path.
+    assert "blkChild987" not in msg
+    assert "blkTop456" not in msg
+    assert "<id>" in msg
 
 
 @pytest.mark.asyncio

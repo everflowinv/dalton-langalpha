@@ -498,6 +498,7 @@ async def test_append_doc_reports_unchanged_original_doc_and_preserves_detail(
             payload={
                 "ok": False,
                 "error": "content_insert_failed",
+                "outcome": "rejected",
                 "message": "追加内容没有写入，原文档未改变 (feishu_http_400: code=1770001); url=https://feishu.cn/wiki/wikinode1",
                 "detail": "feishu_http_400: code=1770001 msg=invalid block",
                 "document_id": "doccnWiki1",
@@ -522,6 +523,50 @@ async def test_append_doc_reports_unchanged_original_doc_and_preserves_detail(
     assert "文档已创建" not in payload["message"]
     assert "1770001" in payload["message"]
     assert payload["detail"] == "feishu_http_400: code=1770001 msg=invalid block"
+    assert payload["url"] == "https://feishu.cn/wiki/wikinode1"
+    assert payload["document_id"] == "doccnWiki1"
+
+
+@pytest.mark.asyncio
+async def test_append_unknown_outcome_warns_to_check_doc_not_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A network-blinded append may have landed: the tool must say the outcome
+    is unknown and point at the doc, never that the original is unchanged."""
+    from src.dalton.feishu import FeishuBridgeError
+
+    async def _append_unknown(route: str, body: dict[str, Any]) -> dict[str, Any]:
+        raise FeishuBridgeError(
+            "content_insert_failed",
+            "追加请求结果未知，可能已经写入",
+            payload={
+                "ok": False,
+                "error": "content_insert_failed",
+                "outcome": "unknown",
+                "message": "追加请求结果未知，可能已经写入 (feishu_network_error: timeout); url=https://feishu.cn/wiki/wikinode1",
+                "detail": "feishu_network_error: timeout",
+                "document_id": "doccnWiki1",
+                "url": "https://feishu.cn/wiki/wikinode1",
+            },
+        )
+
+    monkeypatch.setattr(
+        feishu_tools_mod,
+        "post_bridge_feishu",
+        create_autospec(post_bridge_feishu, side_effect=_append_unknown),
+    )
+    _set_tier(monkeypatch, "internal")
+    payload = _parse(
+        await create_feishu_tools()[3].ainvoke(
+            {"token": "https://feishu.cn/wiki/wikinode1", "markdown": "more"},
+            config=_config("u-internal"),
+        )
+    )
+    assert payload["ok"] is False and payload["error"] == "content_insert_failed"
+    assert "追加请求结果未知，可能已经写入" in payload["message"]
+    assert "不要直接重试" in payload["message"]
+    assert "原文档未改变" not in payload["message"]
+    assert "timeout" in payload["message"]
     assert payload["url"] == "https://feishu.cn/wiki/wikinode1"
     assert payload["document_id"] == "doccnWiki1"
 

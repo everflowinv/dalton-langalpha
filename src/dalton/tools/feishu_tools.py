@@ -57,8 +57,10 @@ async def _bridge(route: str, body: dict[str, Any]) -> dict[str, Any] | str:
 
     `content_insert_failed` keeps the bridge's structured fields (url,
     document_id, detail) and distinguishes `doc/create` (a new empty doc exists)
-    from `doc/append` (appended content was not written and the original doc is
-    unchanged); every other error maps to a generic payload as before.
+    from `doc/append`, whose wording follows the bridge's `outcome`: a rejected
+    append left the original doc unchanged, while an unknown one (network error,
+    unparseable response) may already be written and must be checked in the doc
+    before any retry; every other error maps to a generic payload as before.
     """
     try:
         return await post_bridge_feishu(route, body)
@@ -67,10 +69,15 @@ async def _bridge(route: str, body: dict[str, Any]) -> dict[str, Any] | str:
             url = str(exc.payload["url"])
             detail = str(exc.payload.get("detail") or "").strip()
             if route == "doc/append":
+                lead = (
+                    "追加请求结果未知，可能已经写入；请先打开文档检查，不要直接重试"
+                    if str(exc.payload.get("outcome") or "") == "unknown"
+                    else "追加内容没有写入，原文档未改变"
+                )
                 msg = (
-                    f"追加内容没有写入，原文档未改变（{detail}），文档地址：{url}"
+                    f"{lead}（{detail}），文档地址：{url}"
                     if detail
-                    else f"追加内容没有写入，原文档未改变，文档地址：{url}"
+                    else f"{lead}，文档地址：{url}"
                 )
             else:
                 msg = f"文档已创建但正文没写进去，请到 {url} 手动处理。"
