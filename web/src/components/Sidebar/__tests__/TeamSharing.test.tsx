@@ -152,6 +152,7 @@ vi.mock('@/pages/ChatAgent/hooks/useChatMessages', () => ({
     messages: mockMessages.current,
     liveMessages: STABLE_CHAT_HELPERS.liveMessages,
     isLoading: false,
+    turnHeld: null,
     hasActiveSubagents: false,
     isLoadingHistory: false,
     historyLoadFailed: false,

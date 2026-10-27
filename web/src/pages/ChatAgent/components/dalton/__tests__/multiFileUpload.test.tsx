@@ -79,6 +79,7 @@ describe('useFileUpload — multi-file upload', () => {
       maxConcurrent = Math.max(maxConcurrent, active);
       await Promise.resolve();
       active--;
+      return { path: 'uploaded' };
     });
     const onRefreshFiles = vi.fn();
     const { result } = renderHookWithProviders(() =>
@@ -109,6 +110,7 @@ describe('useFileUpload — multi-file upload', () => {
         // 413 without a detail — the front-of-server limit the page can't know.
         throw { response: { status: 413, data: {} }, message: 'Request failed with status code 413' };
       }
+      return { path: file.name };
     });
     const onRefreshFiles = vi.fn();
     const { result } = renderHookWithProviders(() =>
@@ -149,7 +151,7 @@ describe('useFileUpload — multi-file upload', () => {
   });
 
   it('uploads every file picked through the multi-select input', async () => {
-    mockUpload.mockResolvedValue(undefined);
+    mockUpload.mockResolvedValue({ path: 'uploaded' });
     const onRefreshFiles = vi.fn();
     const { result } = renderHookWithProviders(() =>
       useFileUpload({ workspaceId: 'ws-1', onRefreshFiles }));
@@ -167,8 +169,8 @@ describe('useFileUpload — multi-file upload', () => {
 
   it('exposes the batch position while uploading', async () => {
     let release: (() => void) | null = null;
-    mockUpload.mockImplementation(() => new Promise<void>((resolve) => {
-      release = resolve;
+    mockUpload.mockImplementation(() => new Promise<{ path: string }>((resolve) => {
+      release = () => resolve({ path: 'uploaded' });
     }));
     const { result } = renderHookWithProviders(() =>
       useFileUpload({ workspaceId: 'ws-1' }));
@@ -200,8 +202,8 @@ describe('useFileUpload — multi-file upload', () => {
 
   it('files dropped while a batch runs join the same queue: one loop, one refresh, growing total', async () => {
     let release: (() => void) | null = null;
-    mockUpload.mockImplementation(() => new Promise<void>((resolve) => {
-      release = resolve;
+    mockUpload.mockImplementation(() => new Promise<{ path: string }>((resolve) => {
+      release = () => resolve({ path: 'uploaded' });
     }));
     const onRefreshFiles = vi.fn();
     const { result } = renderHookWithProviders(() =>
@@ -268,8 +270,8 @@ describe('useFileUpload — workspace switch / unmount guard', () => {
     // One resolver per upload, in call order: a1.txt's must stay reachable
     // after b1.txt starts, so the test can land them independently.
     const releases: Array<() => void> = [];
-    mockUpload.mockImplementation(() => new Promise<void>((resolve) => {
-      releases.push(resolve);
+    mockUpload.mockImplementation(() => new Promise<{ path: string }>((resolve) => {
+      releases.push(() => resolve({ path: 'uploaded' }));
     }));
     const refreshA = vi.fn();
     const refreshB = vi.fn();
@@ -325,8 +327,8 @@ describe('useFileUpload — workspace switch / unmount guard', () => {
 
   it('unmounting mid-upload: queued files dropped, the landed file still refreshes its own list', async () => {
     let release: (() => void) | null = null;
-    mockUpload.mockImplementation(() => new Promise<void>((resolve) => {
-      release = resolve;
+    mockUpload.mockImplementation(() => new Promise<{ path: string }>((resolve) => {
+      release = () => resolve({ path: 'uploaded' });
     }));
     const onRefreshFiles = vi.fn();
     const { result, unmount } = renderUploadHook({ ws: 'ws-A', refresh: onRefreshFiles });

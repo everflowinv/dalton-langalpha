@@ -301,8 +301,11 @@ class TestAdopt:
         assert adopt([summary], _claude(), "anthropic")[0].content == [_BLOCK]
 
     def test_claude_block_written_on_another_route_of_the_lineage(self):
+        # DALTON-HOOK(native-compaction-lines): claude-oauth is a Dalton relay
+        # (decision 6), so a block it carried is never replayed, not even on
+        # the official route of its lineage.
         summary = _summary({"block": _BLOCK, "origin": "claude-oauth", "text": ""})
-        assert adopt([summary], _claude(), "anthropic")[0].content == [_BLOCK]
+        assert adopt([summary], _claude(), "anthropic") is None
 
     @pytest.mark.parametrize(
         "origin", ["openai", None, f"anthropic{ROUTE_ENDPOINT_SEP}https://proxy.example"]
