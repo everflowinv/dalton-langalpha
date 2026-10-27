@@ -255,6 +255,22 @@ describe('placeHandoffs', () => {
     });
   });
 
+  // DALTON-HOOK(handoff-keep-on-resumable): a later unrelated turn is not the resume
+  it('does not let a later turn on the thread answer a hand-off awaiting its resume', () => {
+    const rInterim = report('r-interim', 'th', 'run-1');
+    (rInterim.message.provenance as Loose).outcome = 'error';
+    (rInterim.message.provenance as Loose).resumable = true;
+    const rFresh = report('r-fresh', 'th', 'run-2');
+    (rFresh.message.provenance as Loose).outcome = 'completed';
+
+    const places = placesOf([
+      reply('m1', { thread_id: 'th', run_id: 'run-1', tool_call_id: 'tc-1' }),
+      rInterim,
+      rFresh,
+    ]);
+    expect(places.get('tc-1')).toEqual({ madeAt: AT.getTime() });
+  });
+
   // DALTON-HOOK(handoff-keep-on-resumable): when only an interim resumable report exists, the hand-off stays unclaimed
   it('leaves a hand-off unclaimed when only an interim resumable report has arrived', () => {
     const rPinned = report('r-pinned', 'th', 'run-1');

@@ -131,9 +131,13 @@ export function placeHandoffs(messages: readonly { message: MessageRecord }[]): 
       reportFollows: followsOn(messages, h.at, r.at),
     });
   };
-  // DALTON-HOOK(handoff-keep-on-resumable): interim resumable reports never claim a hand-off
-  const names = (r: Report, { pin }: Handoff) =>
-    !r.resumable && (pin.kind === 'steer' ? !!r.steerIds?.includes(pin.steerId) : pin.kind === 'run' && r.runIds.includes(pin.runId));
+  const named = (r: Report, { pin }: Handoff) =>
+    pin.kind === 'steer' ? !!r.steerIds?.includes(pin.steerId) : pin.kind === 'run' && r.runIds.includes(pin.runId);
+  // DALTON-HOOK(handoff-keep-on-resumable): interim resumable reports never
+  // claim a hand-off, and a hand-off one named waits for the report naming its
+  // run (its /retry's): a later turn on the thread is not its continuation.
+  const names = (r: Report, h: Handoff) => !r.resumable && named(r, h);
+  const resuming = new Set(handoffs.filter((h) => reports.some((r) => r.resumable && named(r, h) && r.at > h.at)));
   // Only a report whose steers are unknown can answer a steered hand-off
   // without naming it.
   const after = (r: Report, h: Handoff) =>
@@ -142,7 +146,7 @@ export function placeHandoffs(messages: readonly { message: MessageRecord }[]): 
   for (const h of handoffs) {
     const own = reports.find((r) => names(r, h) && r.at > h.at);
     if (own) answered(h, own);
-    else open.push(h);
+    else if (!resuming.has(h)) open.push(h);
   }
   const unanswered: Handoff[] = [];
   for (const h of open) {
