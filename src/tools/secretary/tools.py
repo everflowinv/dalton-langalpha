@@ -472,57 +472,87 @@ async def threads_delete(
 
 
 # --- DALTON-HOOK(workspace-sharing-settings): begin ---
-def _strip_own_dir_prefix(rel_path: str, dir_name: str) -> str:
-    """Drop a redundant leading ``<own folder>/`` from a workspace-relative path.
+def _is_home_workspace(workspace: dict) -> bool:
+    """Whether ``workspace`` is the user's Home workspace."""
+    if bool(workspace.get("is_home")):
+        return True
+    own_dir = str(workspace.get("dir_name") or "").strip()
+    own_name = str(workspace.get("name") or "").strip()
+    return own_dir == "Home" or (not own_dir and own_name == "Home")
 
-    A listing shows the workspace's folder name (``dir_name``), and a caller
-    quoting it back ("DASH/sources/x.md" into the DASH workspace) means the
-    file at ``sources/x.md`` — without this the write lands at
-    ``DASH/DASH/sources/x.md`` and the workspace's analyst cannot find it."""
-    if not dir_name:
-        return rel_path
-    stripped = rel_path
-    parts = stripped.split("/", 1)
-    while len(parts) == 2 and parts[1].strip() and (
-        parts[0].strip().casefold() == dir_name.casefold()
-    ):
-        stripped = parts[1].strip().lstrip("/")
-        parts = stripped.split("/", 1)
-    return stripped
+
+async def _has_subdirectory(
+    sandbox: object, work_dir: str, subdir_name: str, *, fail_open: bool
+) -> bool:
+    """True when ``<work_dir>/<subdir_name>`` already exists as a directory."""
+    try:
+        entries = await sandbox.als_directory(work_dir)
+    except Exception as e:
+        logger.warning(
+            f"Could not list directory {work_dir} when checking subdirectory {subdir_name!r}: {e}"
+        )
+        return fail_open
+    for entry in entries or ():
+        if (
+            isinstance(entry, dict)
+            and bool(entry.get("is_dir"))
+            and str(entry.get("name") or "") == subdir_name
+        ):
+            return True
+    return False
 
 
 async def _sibling_folder_named(
-    rel_path: str, workspace: dict
+    rel_path: str, workspace: dict, sandbox: object, work_dir: str
 ) -> str | None:
-    """The path's first segment when it names ANOTHER workspace's folder on
-    this computer — the shape of writing "DASH/..." into Home believing that
-    creates the DASH workspace's folder. None when it names no sibling."""
-    first = rel_path.split("/", 1)[0].strip()
-    if not first:
+    """The path's first segment when ``workspace`` is Home, the first segment
+    matches a LIVE (non-deleted) sibling workspace's folder on this computer,
+    and Home does not already contain a subdirectory of that name."""
+    if not _is_home_workspace(workspace):
         return None
+    parts = rel_path.split("/", 1)
+    if len(parts) < 2 or not parts[0].strip() or not parts[1].strip():
+        return None
+    first = parts[0].strip()
     computer_id = workspace.get("computer_id")
     if not computer_id:
+        logger.warning(
+            f"Could not check sibling workspace folders for Home ({workspace.get('workspace_id')}): computer_id is empty"
+        )
         return None
     try:
         from src.server.database.workspace import (
-            get_workspace_dir_names_for_computer,
+            get_live_workspace_folders_for_computer,
         )
 
-        held = await get_workspace_dir_names_for_computer(str(computer_id))
+        live_rows = await get_live_workspace_folders_for_computer(str(computer_id))
     except Exception as e:
         logger.warning(
-            f"Could not read workspace folders of computer {computer_id}: {e}"
+            f"Could not read live workspace folders of computer {computer_id}: {e}"
         )
         return None
-    own = str(workspace.get("dir_name") or "").strip().casefold()
-    for name in held or ():
+    own_id = str(workspace.get("workspace_id") or "").strip()
+    own_dir = str(workspace.get("dir_name") or "Home").strip()
+    matched_sibling: str | None = None
+    for row in live_rows or ():
+        if isinstance(row, dict):
+            if own_id and str(row.get("workspace_id") or "") == own_id:
+                continue
+            folder = str(row.get("dir_name") or row.get("name") or "").strip()
+        else:
+            folder = str(row or "").strip()
         if (
-            name
-            and name.casefold() == first.casefold()
-            and name.casefold() != own
+            folder
+            and folder.casefold() != own_dir.casefold()
+            and folder.casefold() == first.casefold()
         ):
-            return name
-    return None
+            matched_sibling = folder
+            break
+    if matched_sibling is None:
+        return None
+    if await _has_subdirectory(sandbox, work_dir, first, fail_open=True):
+        return None
+    return matched_sibling
 
 
 async def workspace_files_list_cos(
@@ -764,16 +794,31 @@ async def workspace_file_write_cos(
             work_dir = owner_work_dir(live_ws)
             previous_dirs = previous_dir_names_of(live_ws)
             # DALTON-HOOK(workspace-sharing-settings): keep CoS writes inside the named workspace
-            rel_path = _strip_own_dir_prefix(
-                _normalize_requested_path(path, work_dir, previous_dirs),
-                str(live_ws.get("dir_name") or ""),
-            )
+            rel_path = _normalize_requested_path(path, work_dir, previous_dirs)
             if _is_non_owner_blocked_path(rel_path):
                 return error_command(
                     "403 Forbidden: Cannot write system, hidden, or virtual files",
                     tool_call_id,
                 )
-            sibling = await _sibling_folder_named(rel_path, live_ws)
+            own_dir = str(live_ws.get("dir_name") or "").strip()
+            parts = rel_path.split("/", 1)
+            if (
+                own_dir
+                and len(parts) == 2
+                and parts[1].strip()
+                and parts[0].strip() == own_dir
+            ):
+                if not await _has_subdirectory(
+                    sandbox, work_dir, own_dir, fail_open=False
+                ):
+                    rest = parts[1].strip().lstrip("/")
+                    return error_command(
+                        f"路径应相对该工作区自己的文件夹，去掉开头的 `{own_dir}/`（如 '{rest}'）。",
+                        tool_call_id,
+                    )
+            sibling = await _sibling_folder_named(
+                rel_path, live_ws, sandbox, work_dir
+            )
             if sibling is not None:
                 # The incident's shape: "DASH/..." written into Home (or any
                 # workspace but DASH) as a way to "put it in the workspace".

@@ -43,6 +43,9 @@ DASH_ROW = {
 def _install(
     monkeypatch: pytest.MonkeyPatch,
     ws_row: dict[str, Any],
+    *,
+    live_folders: list[dict[str, Any]] | None = None,
+    existing_subdirs: list[str] | None = None,
 ) -> Any:
     """Patch the write path's seams; returns the spec'd sandbox.
 
@@ -59,17 +62,26 @@ def _install(
         "get_workspace",
         create_autospec(ws_db.get_workspace, return_value=ws_row),
     )
+    default_live = [
+        {"workspace_id": "ws-home", "name": "Home", "dir_name": "Home"},
+        {"workspace_id": "ws-dash", "name": "DASH", "dir_name": "DASH"},
+        {"workspace_id": "ws-meta", "name": "META", "dir_name": "META"},
+    ]
     monkeypatch.setattr(
         ws_db,
-        "get_workspace_dir_names_for_computer",
+        "get_live_workspace_folders_for_computer",
         create_autospec(
-            ws_db.get_workspace_dir_names_for_computer,
-            return_value=("Home", "DASH", "META"),
+            ws_db.get_live_workspace_folders_for_computer,
+            return_value=default_live if live_folders is None else live_folders,
         ),
     )
 
     sandbox = create_autospec(PTCSandbox, instance=True)
     sandbox.awrite_file_text.return_value = True
+    sandbox.als_directory.return_value = [
+        {"name": d, "path": f"/root/{ws_row.get('dir_name')}/{d}", "is_dir": True}
+        for d in (existing_subdirs or [])
+    ]
 
     import src.server.app.workspace_files._shared as shared_mod
     import src.server.app.workspace_files.crud as crud_mod
@@ -120,14 +132,13 @@ async def test_sibling_folder_prefix_is_refused_not_silently_mislanded(
 
 
 @pytest.mark.asyncio
-async def test_own_folder_prefix_is_stripped_to_analyst_relative_path(
+async def test_own_folder_prefix_without_subdir_returns_error_not_stripped(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """workspace_id names DASH and the caller quoted the folder name back
-    ("DASH/sources/brief.md"): the prefix is redundant and is stripped, so the
-    write lands at <root>/DASH/sources/brief.md and the returned path is the
-    analyst-relative sources/brief.md."""
-    sandbox = _install(monkeypatch, DASH_ROW)
+    """workspace_id names DASH and the caller prefixed the folder name
+    ("DASH/sources/brief.md") when DASH has no DASH/ subdirectory: instead of
+    silently stripping the prefix, return an explicit error and do not write."""
+    sandbox = _install(monkeypatch, DASH_ROW, existing_subdirs=[])
 
     command = await workspace_file_write_cos(
         user_id="u-1",
@@ -137,13 +148,136 @@ async def test_own_folder_prefix_is_stripped_to_analyst_relative_path(
         tool_call_id="tc-2",
     )
     payload = _payload(command)
-    assert payload["success"] is True
-    # The write went to this workspace's own sources/, not DASH/DASH/.
-    sandbox.awrite_file_text.assert_called_once_with(
-        "/root/DASH/sources/brief.md", "# 简报\n"
+    assert payload.get("success") is False
+    assert "路径应相对该工作区自己的文件夹" in payload.get("error", "")
+    assert "去掉开头的 `DASH/`" in payload.get("error", "")
+    sandbox.awrite_file_text.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_own_folder_prefix_with_existing_subdir_writes_normally(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When workspace DASH genuinely has a DASH/ subdirectory, writing
+    DASH/readme.md writes into that subdirectory without stripping or failing."""
+    sandbox = _install(monkeypatch, DASH_ROW, existing_subdirs=["DASH"])
+
+    command = await workspace_file_write_cos(
+        user_id="u-1",
+        workspace_id="ws-dash",
+        path="DASH/readme.md",
+        content="# 子目录说明\n",
+        tool_call_id="tc-2b",
     )
-    # What the model reads back is what the workspace's analyst reads.
-    assert payload["path"] == "sources/brief.md"
+    payload = _payload(command)
+    assert payload["success"] is True
+    sandbox.awrite_file_text.assert_called_once_with(
+        "/root/DASH/DASH/readme.md", "# 子目录说明\n"
+    )
+    assert payload["path"] == "DASH/readme.md"
+
+
+@pytest.mark.asyncio
+async def test_home_existing_subdir_matching_live_sibling_is_allowed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Home already has a legitimate NVDA/ subdirectory; even if NVDA is also a
+    live sibling workspace on the same computer, writing NVDA/notes.md into
+    Home is allowed."""
+    sandbox = _install(
+        monkeypatch,
+        HOME_ROW,
+        live_folders=[
+            {"workspace_id": "ws-home", "name": "Home", "dir_name": "Home"},
+            {"workspace_id": "ws-nvda", "name": "NVDA", "dir_name": "NVDA"},
+        ],
+        existing_subdirs=["NVDA"],
+    )
+
+    command = await workspace_file_write_cos(
+        user_id="u-1",
+        workspace_id="ws-home",
+        path="NVDA/notes.md",
+        content="# 笔记\n",
+        tool_call_id="tc-home-nvda",
+    )
+    payload = _payload(command)
+    assert payload["success"] is True
+    sandbox.awrite_file_text.assert_called_once_with(
+        "/root/Home/NVDA/notes.md", "# 笔记\n"
+    )
+
+
+@pytest.mark.asyncio
+async def test_deleted_tombstone_workspace_does_not_block_home_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A deleted (tombstone) workspace is excluded from live folders, so Home
+    can write NVDA/notes.md even without a pre-existing NVDA/ directory."""
+    sandbox = _install(
+        monkeypatch,
+        HOME_ROW,
+        live_folders=[
+            {"workspace_id": "ws-home", "name": "Home", "dir_name": "Home"},
+            {"workspace_id": "ws-dash", "name": "DASH", "dir_name": "DASH"},
+        ],
+        existing_subdirs=[],
+    )
+
+    command = await workspace_file_write_cos(
+        user_id="u-1",
+        workspace_id="ws-home",
+        path="NVDA/notes.md",
+        content="# 墓碑工作区不阻断\n",
+        tool_call_id="tc-tombstone",
+    )
+    payload = _payload(command)
+    assert payload["success"] is True
+    sandbox.awrite_file_text.assert_called_once_with(
+        "/root/Home/NVDA/notes.md", "# 墓碑工作区不阻断\n"
+    )
+
+
+@pytest.mark.asyncio
+async def test_missing_computer_id_logs_warning_and_allows_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When computer_id is empty, log a warning and allow the write."""
+    home_no_comp = {**HOME_ROW, "computer_id": None}
+    sandbox = _install(monkeypatch, home_no_comp)
+
+    cmd = await workspace_file_write_cos(
+        user_id="u-1",
+        workspace_id="ws-home",
+        path="DASH/notes.md",
+        content="# 放行\n",
+        tool_call_id="tc-nocomp",
+    )
+    assert _payload(cmd)["success"] is True
+    sandbox.awrite_file_text.assert_called_once_with(
+        "/root/Home/DASH/notes.md", "# 放行\n"
+    )
+
+
+@pytest.mark.asyncio
+async def test_folder_query_failure_logs_warning_and_allows_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When folder lookup fails, log a warning and allow the write rather than blocking."""
+    sandbox = _install(monkeypatch, HOME_ROW)
+    ws_db.get_live_workspace_folders_for_computer.side_effect = RuntimeError("db down")
+
+    cmd = await workspace_file_write_cos(
+        user_id="u-1",
+        workspace_id="ws-home",
+        path="DASH/notes.md",
+        content="# 放行2\n",
+        tool_call_id="tc-dberr",
+    )
+    assert _payload(cmd)["success"] is True
+    sandbox.awrite_file_text.assert_called_once_with(
+        "/root/Home/DASH/notes.md", "# 放行2\n"
+    )
 
 
 @pytest.mark.asyncio

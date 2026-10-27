@@ -280,6 +280,7 @@ def _verdict_row(
     trigger_kind: str = "manual",
     *,
     run_id: str | None = None,
+    conversation_thread_id: str | None = None,
 ) -> dict[str, Any]:
     """One row exactly as ``verdicts._serialize_row`` emits it (real columns)."""
     return {
@@ -293,7 +294,7 @@ def _verdict_row(
         "progress": None,
         "next_due": None,
         "payload": {},
-        "conversation_thread_id": None,
+        "conversation_thread_id": conversation_thread_id,
         "run_id": run_id,
         "automation_execution_id": None,
         "origin_type": None,
@@ -3256,8 +3257,11 @@ async def test_explicit_delta_note_param_wins_over_dated_template(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """params["delta_note"] (the path the agent says it wrote) replaces the
-    dated template, no variant search needed."""
-    _patch_knowledge(monkeypatch, ["thesis"])
+    dated template, no variant search needed, as long as its mtime is within
+    the current run's window."""
+    _patch_knowledge(
+        monkeypatch, ["thesis"], start_epochs={"resp-wake": _WAKE_EPOCH}
+    )
     _patch_verdicts(monkeypatch, [_verdict_row("THESIS_STRENGTHENED", "internal_material")])
 
     result = await run_check_done(
@@ -3272,5 +3276,169 @@ async def test_explicit_delta_note_param_wins_over_dated_template(
         ),
         workspace_id=WS,
         thread_id="short-1",
+        conversation_run_id="resp-wake",
     )
     assert result["done"], result["missing"]
+
+
+@pytest.mark.asyncio
+async def test_explicit_delta_note_param_stale_mtime_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicitly passed path_param (delta_note) whose mtime predates this
+    run's window must fail freshness check and explain the reason."""
+    _patch_knowledge(
+        monkeypatch, ["thesis"], start_epochs={"resp-wake": _WAKE_EPOCH}
+    )
+    _patch_verdicts(monkeypatch, [_verdict_row("THESIS_STRENGTHENED", "internal_material")])
+
+    result = await run_check_done(
+        workflow="dalton-thesis-delta",
+        params={
+            "ticker": "META",
+            "as_of": "2026-10-27",
+            "delta_note": "research/2026-10-20-delta.md",
+        },
+        backend=_make_backend(
+            _wake_delta_files(note="research/2026-10-20-delta.md"),
+            mtimes={"research/2026-10-20-delta.md": _WAKE_EPOCH - 3600},
+        ),
+        workspace_id=WS,
+        thread_id="short-1",
+        conversation_run_id="resp-wake",
+    )
+    assert result["done"] is False
+    assert any(
+        "research/2026-10-20-delta.md" in m
+        and "不是本轮写的" in m
+        and "显式路径" in m
+        for m in result["missing"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_variant_glob_rejects_old_or_undated_filename_even_when_mtime_in_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A re-saved old file (or an undated file) matching variant_glob whose
+    mtime falls inside this run's window must NOT be accepted when its
+    filename date is neither as_of nor the window start's Eastern business day."""
+    _patch_knowledge(
+        monkeypatch, ["thesis"], start_epochs={"resp-wake": _WAKE_EPOCH}
+    )
+    _patch_verdicts(monkeypatch, [_verdict_row("THESIS_STRENGTHENED", "internal_material")])
+
+    for bad_note in ("research/2026-10-20-delta.md", "research/undated-delta.md"):
+        result = await run_check_done(
+            workflow="dalton-thesis-delta",
+            params={"ticker": "META", "as_of": "2026-10-27"},
+            backend=_make_backend(
+                _wake_delta_files(note=bad_note),
+                mtimes={bad_note: _WAKE_EPOCH + 1800},
+            ),
+            workspace_id=WS,
+            thread_id="short-1",
+            conversation_run_id="resp-wake",
+        )
+        assert result["done"] is False
+        assert any(
+            "research/2026-10-27-delta.md" in m and "research/*-delta.md" in m
+            for m in result["missing"]
+        )
+
+
+@pytest.mark.asyncio
+async def test_resolved_variant_draft_flows_to_closing_sidecar_and_language_review(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When dalton-earnings-preview accepts drafts/2026-10-26-preview-FY26Q3.md
+    via variant_glob while as_of=2026-10-27, closing's check_draft and
+    language_review must inspect the resolved 2026-10-26 draft and its sidecars
+    rather than demanding nonexistent 2026-10-27 sidecars."""
+    _patch_knowledge(
+        monkeypatch, ["drivers", "debate"], start_epochs={"resp-wake": _WAKE_EPOCH}
+    )
+    _patch_verdicts(monkeypatch, [_verdict_row("NO_CHANGE", trigger_kind="earnings")])
+
+    draft_26 = "drafts/2026-10-26-preview-FY26Q3.md"
+    draft_text = "# 前瞻\n" + "判断" * 300
+    push_27 = "research/push/2026-10-27-earnings-preview-FY26Q3.md"
+    push_text = "## 结论\n维持。\n"
+    pred_27 = "research/2026-10-27-preview-FY26Q3/predictions.json"
+    files = {
+        draft_26: draft_text,
+        "drafts/2026-10-26-preview-FY26Q3.audit.md": _sidecar_for(draft_text),
+        f"{draft_26}.language.json": _language_json(draft_text),
+        push_27: push_text,
+        f"{push_27}.language.json": _language_json(push_text),
+        pred_27: json.dumps({"predictions": [{"id": "P1", "metric": "revenue"}] * 3}),
+    }
+    mtimes = {
+        draft_26: _WAKE_EPOCH + 600,
+        push_27: _WAKE_EPOCH + 600,
+    }
+    result = await run_check_done(
+        workflow="dalton-earnings-preview",
+        params={"ticker": "META", "quarter": "FY26Q3", "as_of": "2026-10-27"},
+        backend=_make_backend(files, mtimes=mtimes),
+        workspace_id=WS,
+        thread_id="short-1",
+        conversation_run_id="resp-wake",
+    )
+    assert result["done"] is True, result["missing"]
+
+
+@pytest.mark.asyncio
+async def test_verdict_from_sibling_thread_in_same_workspace_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A verdict written in the same workspace and time window by another
+    thread must not satisfy this thread's check; only this thread's own verdict
+    passes."""
+    _patch_knowledge(
+        monkeypatch, ["thesis"], start_epochs={"resp-wake": _WAKE_EPOCH}
+    )
+    _patch_verdicts(
+        monkeypatch,
+        [
+            _verdict_row(
+                "THESIS_STRENGTHENED",
+                "earnings",
+                conversation_thread_id="other-thread-99",
+            )
+        ],
+    )
+    rejected = await run_check_done(
+        workflow="dalton-thesis-delta",
+        params={"ticker": "META", "as_of": "2026-10-27"},
+        backend=_make_backend(
+            _wake_delta_files(), mtimes={"research/2026-10-26-delta.md": _WAKE_EPOCH + 1800}
+        ),
+        workspace_id=WS,
+        thread_id="short-1",
+        conversation_run_id="resp-wake",
+    )
+    assert rejected["done"] is False
+    assert any("没有符合条件的 verdict" in m for m in rejected["missing"])
+
+    _patch_verdicts(
+        monkeypatch,
+        [
+            _verdict_row(
+                "THESIS_STRENGTHENED",
+                "internal_material",
+                conversation_thread_id="short-1",
+            )
+        ],
+    )
+    accepted = await run_check_done(
+        workflow="dalton-thesis-delta",
+        params={"ticker": "META", "as_of": "2026-10-27"},
+        backend=_make_backend(
+            _wake_delta_files(), mtimes={"research/2026-10-26-delta.md": _WAKE_EPOCH + 1800}
+        ),
+        workspace_id=WS,
+        thread_id="short-1",
+        conversation_run_id="resp-wake",
+    )
+    assert accepted["done"] is True, accepted["missing"]

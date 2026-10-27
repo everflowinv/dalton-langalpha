@@ -730,61 +730,123 @@ def _broker_reply(answer: str, citations: list) -> dict:
     }
 
 
-def test_no_evidence_answer_is_marked_and_carries_no_quotes() -> None:
-    """No citations: the result is marked no_evidence, states the summary may
-    not be used as fact or quote, and no quoted span survives."""
-    answer = 'The CEO said "we will double capex" per traders. Sentiment bullish.'
+def test_no_evidence_answer_is_marked_and_unquotes_only_long_quotes() -> None:
+    """No citations: the result is marked no_evidence, unquotes >=20-char quoted
+    spans (keeping their text so it is not presented as a direct quote), and
+    leaves short quoted terms (<20 chars) like "AI", "priced in", "EPS" intact
+    across straight and Chinese quote styles."""
+    answer = (
+        'The CEO said "we will double capex next fiscal year" per traders on "AI" '
+        'and "EPS" being "priced in". '
+        '另有传闻称“管理层预计四季度云业务增速将超过市场预期五个百分点”，'
+        '以及「明年资本开支指引将进一步上调至百亿美元级别」与『下半年整体毛利率预计将稳定维持在百分之六十以上的高位区间』，'
+        '但「毛利率」本身仍是焦点。Sentiment bullish.'
+    )
     cleaned, artifact = map_x_search_response(
         _broker_reply(answer, []), query="NVDA"
     )
     assert cleaned == []
     assert artifact["no_evidence"] is True
     assert artifact["evidence_count"] == 0
-    # No quoted direct quote survives at any layer; the plain prose does.
-    assert "we will double capex" not in artifact["answer"]
-    assert "Sentiment bullish" in artifact["answer"]
+    ans = artifact["answer"]
+    # Long quotes (>= 20 chars) lose their surrounding quote marks but keep their text.
+    assert '"we will double capex next fiscal year"' not in ans
+    assert "we will double capex next fiscal year" in ans
+    assert "“管理层预计四季度云业务增速将超过市场预期五个百分点”" not in ans
+    assert "管理层预计四季度云业务增速将超过市场预期五个百分点" in ans
+    assert "「明年资本开支指引将进一步上调至百亿美元级别」" not in ans
+    assert "明年资本开支指引将进一步上调至百亿美元级别" in ans
+    assert "『下半年整体毛利率预计将稳定维持在百分之六十以上的高位区间』" not in ans
+    assert "下半年整体毛利率预计将稳定维持在百分之六十以上的高位区间" in ans
+    # Short quotes (< 20 chars) keep their quotes and text untouched.
+    assert '"AI"' in ans
+    assert '"EPS"' in ans
+    assert '"priced in"' in ans
+    assert "「毛利率」" in ans
+    assert "Sentiment bullish" in ans
 
 
-def test_control_token_truncates_summary_and_flags_it() -> None:
-    """A <|eos|>-style control marker cuts the summary at the marker and the
-    result carries the truncation note and issue flag."""
+def test_control_token_fullwidth_and_ascii_in_sourced_and_unsourced_summaries() -> None:
+    """Full-width <｜eos｜> and ASCII <|eos|> markers:
+    - Sourced summaries strip only the marker itself and keep trailing content.
+    - No-evidence summaries truncate at the marker."""
     from src.dalton.web_search.x_search import X_SUMMARY_TRUNCATED_NOTE
 
-    answer = "First solid paragraph of the summary.<|eos|>Garbage after the marker"
-    cleaned, artifact = map_x_search_response(
-        _broker_reply(
-            answer,
-            ["https://x.com/NickRokke/status/2112925226740683159"],
-        ),
-        query="NVDA",
-    )
-    assert artifact["summary_issues"] == ["control_marker"]
-    assert artifact["answer"].startswith("First solid paragraph of the summary.")
-    assert X_SUMMARY_TRUNCATED_NOTE in artifact["answer"]
-    assert "Garbage after the marker" not in artifact["answer"]
-    assert "<|eos|>" not in artifact["answer"]
-    # Evidence rows still come through unchanged.
-    assert cleaned and cleaned[0]["type"] == "x_post"
+    for marker in ("<｜eos｜>", "<|eos|>"):
+        sourced_answer = f"First solid paragraph.{marker}Second valid paragraph."
+        cleaned, artifact = map_x_search_response(
+            _broker_reply(
+                sourced_answer,
+                ["https://x.com/NickRokke/status/2112925226740683159"],
+            ),
+            query="NVDA",
+        )
+        assert artifact["summary_issues"] == ["control_marker"]
+        assert marker not in artifact["answer"]
+        assert "First solid paragraph." in artifact["answer"]
+        assert "Second valid paragraph." in artifact["answer"]
+        assert X_SUMMARY_TRUNCATED_NOTE in artifact["answer"]
+        assert cleaned and cleaned[0]["type"] == "x_post"
+
+        unsourced_answer = f"First solid paragraph.{marker}Garbage after the marker"
+        cleaned_no_ev, artifact_no_ev = map_x_search_response(
+            _broker_reply(unsourced_answer, []),
+            query="NVDA",
+        )
+        assert cleaned_no_ev == []
+        assert artifact_no_ev["summary_issues"] == ["control_marker"]
+        assert marker not in artifact_no_ev["answer"]
+        assert "First solid paragraph." in artifact_no_ev["answer"]
+        assert "Garbage after the marker" not in artifact_no_ev["answer"]
 
 
-def test_repeated_paragraph_truncates_summary_and_flags_it() -> None:
-    """A duplicated paragraph cuts the summary from the repeat on and the
-    result carries the truncation note and issue flag."""
+def test_repeated_paragraph_sourced_keeps_later_paragraphs_while_unsourced_truncates() -> None:
+    """For a sourced summary, only the duplicate paragraph is removed and
+    subsequent unique paragraphs are preserved; for a no-evidence summary, it
+    truncates from the repeat onward."""
     from src.dalton.web_search.x_search import X_SUMMARY_TRUNCATED_NOTE
 
     answer = (
         "Traders report demand is strong into quarter end.\n\n"
         "Traders report demand is strong into quarter end.\n\n"
-        "Second unique paragraph."
+        "Second unique paragraph with distinct takeaway."
     )
-    _cleaned, artifact = map_x_search_response(
+    _cleaned, sourced_artifact = map_x_search_response(
         _broker_reply(
             answer,
             ["https://x.com/NickRokke/status/2112925226740683159"],
         ),
         query="NVDA",
     )
-    assert artifact["summary_issues"] == ["repeated_block"]
-    assert artifact["answer"].count("Traders report demand is strong") == 1
-    assert "Second unique paragraph." not in artifact["answer"]
-    assert X_SUMMARY_TRUNCATED_NOTE in artifact["answer"]
+    assert sourced_artifact["summary_issues"] == ["repeated_block"]
+    assert sourced_artifact["answer"].count("Traders report demand is strong") == 1
+    assert "Second unique paragraph with distinct takeaway." in sourced_artifact["answer"]
+    assert X_SUMMARY_TRUNCATED_NOTE in sourced_artifact["answer"]
+
+    _cleaned_no_ev, unsourced_artifact = map_x_search_response(
+        _broker_reply(answer, []),
+        query="NVDA",
+    )
+    assert unsourced_artifact["summary_issues"] == ["repeated_block"]
+    assert unsourced_artifact["answer"].count("Traders report demand is strong") == 1
+    assert "Second unique paragraph with distinct takeaway." not in unsourced_artifact["answer"]
+
+
+def test_inline_source_url_at_end_extracted_before_summary_cleanup() -> None:
+    """When citations=[] and the post URL is at the end of answer_text after a
+    repeated block or <｜eos｜> marker, sources are extracted first so the
+    response is NOT misclassified as no_evidence."""
+    answer = (
+        "Traders report demand is strong into quarter end.\n\n"
+        "Traders report demand is strong into quarter end.<｜eos｜>\n\n"
+        "Source post: https://x.com/NickRokke/status/2112925226740683159"
+    )
+    cleaned, artifact = map_x_search_response(
+        _broker_reply(answer, []),
+        query="NVDA",
+    )
+    assert len(cleaned) == 1
+    assert cleaned[0]["url"] == "https://x.com/NickRokke/status/2112925226740683159"
+    assert artifact.get("no_evidence") is not True
+    assert artifact["evidence_count"] == 1
+    assert "https://x.com/NickRokke/status/2112925226740683159" in artifact["answer"]

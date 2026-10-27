@@ -398,6 +398,104 @@ def resolve_researchdata_transport() -> dict[str, Any]:
     return {"mode": "wrapper", "call": call_fn, "error": ""}
 
 
+def _extract_non_empty_error(obj: dict[str, Any]) -> str | None:
+    """提取字典中非空的 error 字段文本；空串、None、False 不算错误。"""
+    raw_err = obj.get("error")
+    if raw_err is None or raw_err is False:
+        return None
+    if isinstance(raw_err, str):
+        stripped = raw_err.strip()
+        return stripped or None
+    if isinstance(raw_err, (dict, list)):
+        return json.dumps(raw_err, ensure_ascii=False) if raw_err else None
+    text = str(raw_err).strip()
+    return text or None
+
+
+def _extract_mcp_content_error_text(obj: dict[str, Any]) -> str | None:
+    """当 MCP 原始包返回 content 文本块时提取其中的错误文本。"""
+    content = obj.get("content")
+    if not isinstance(content, list):
+        return None
+    for item in content:
+        if isinstance(item, dict):
+            text = str(item.get("text") or "").strip()
+            if text:
+                return text
+    return None
+
+
+def _normalize_dict_result(
+    value: dict[str, Any],
+    *,
+    outer_is_error: bool = False,
+    default_error: str = "wrapper_call_failed",
+) -> dict[str, Any]:
+    structured = (
+        value.get("structuredContent")
+        if isinstance(value.get("structuredContent"), dict)
+        else None
+    )
+    err_from_value = _extract_non_empty_error(value) or (
+        _extract_non_empty_error(structured) if structured else None
+    )
+    mcp_error = bool(
+        outer_is_error
+        or value.get("isError") is True
+        or value.get("is_error") is True
+        or (
+            structured
+            and (
+                structured.get("isError") is True
+                or structured.get("is_error") is True
+            )
+        )
+    )
+    payload_ok = (
+        value.get("ok")
+        if "ok" in value
+        else (structured.get("ok") if structured else None)
+    )
+    raw_status = value.get("status") or (
+        structured.get("status") if structured else None
+    )
+    status_str = str(raw_status or "").strip()
+    is_ok = (
+        not mcp_error
+        and err_from_value is None
+        and payload_ok is not False
+        and status_str not in ("error", "failed")
+    )
+    if is_ok:
+        err_msg = None
+        final_status = status_str or "ok"
+    else:
+        reason = value.get("reason") or (
+            structured.get("reason") if structured else None
+        )
+        message = value.get("message") or (
+            structured.get("message") if structured else None
+        )
+        content_err = _extract_mcp_content_error_text(value)
+        err_msg = str(
+            err_from_value
+            or reason
+            or message
+            or content_err
+            or (status_str if status_str and status_str != "ok" else "")
+            or default_error
+        )
+        final_status = (
+            status_str if status_str and status_str != "ok" else "error"
+        )
+    return {
+        "ok": is_ok,
+        "status": final_status,
+        "error": err_msg,
+        "data": value,
+    }
+
+
 def _call_wrapper(call_fn: Any, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     """经包装模块调用一个 researchdata 工具，返回与 HTTP 桥路径同构的结果。"""
     try:
@@ -405,36 +503,23 @@ def _call_wrapper(call_fn: Any, tool_name: str, arguments: dict[str, Any]) -> di
     except Exception as e:  # noqa: BLE001 - MCP 调用失败按来源失败记录，不让脚本崩溃
         return {"ok": False, "status": "exception", "error": str(e)[:300]}
     if isinstance(value, str):
+        raw_text = value.strip()
         try:
             value = json.loads(value)
         except json.JSONDecodeError:
             return {
                 "ok": False,
                 "status": "empty_bridge_content",
-                "error": "wrapper returned non-JSON text",
+                "error": raw_text[:300] if raw_text else "wrapper returned non-JSON text",
             }
     if isinstance(value, dict):
-        payload_ok = value.get("ok")
-        status_str = str(value.get("status") or "")
-        is_ok = payload_ok is not False and status_str not in ("error", "failed")
-        err_msg = (
-            None
-            if is_ok
-            else str(
-                value.get("error")
-                or value.get("reason")
-                or value.get("message")
-                or status_str
-                or "wrapper_call_failed"
-            )
-        )
-        return {
-            "ok": is_ok,
-            "status": status_str or ("ok" if is_ok else "error"),
-            "error": err_msg,
-            "data": value,
-        }
-    return {"ok": True, "status": "ok", "data": clean_val(value)}
+        return _normalize_dict_result(value, default_error="wrapper_call_failed")
+    return {
+        "ok": False,
+        "status": "invalid_format",
+        "error": f"wrapper returned non-dict result ({type(value).__name__}): {str(value)[:200]}",
+        "data": clean_val(value),
+    }
 
 
 def _call_bridge_http(
@@ -469,25 +554,27 @@ def _call_bridge_http(
         if content and isinstance(content[0], dict) and content[0].get("text"):
             data = json.loads(content[0]["text"])
             if isinstance(data, dict):
-                payload_ok = data.get("ok")
-                status_str = str(data.get("status") or "")
-                is_ok = (
-                    not bool(res.get("isError", False))
-                    and payload_ok is not False
-                    and status_str not in ("error", "failed")
+                return _normalize_dict_result(
+                    data,
+                    outer_is_error=bool(res.get("isError", False)),
+                    default_error="bridge_call_failed",
                 )
-                err_msg = (
-                    None
-                    if is_ok
-                    else str(data.get("error") or data.get("reason") or data.get("message") or status_str or "bridge_call_failed")
-                )
-                return {
-                    "ok": is_ok,
-                    "status": status_str or ("ok" if is_ok else "error"),
-                    "error": err_msg,
-                    "data": data,
-                }
-            return {"ok": not bool(res.get("isError", False)), "data": data}
+            return {
+                "ok": False,
+                "status": "invalid_format",
+                "error": f"bridge returned non-dict result ({type(data).__name__})",
+                "data": clean_val(data),
+            }
+        if isinstance(res, dict) and (
+            res.get("isError") is True
+            or isinstance(res.get("structuredContent"), dict)
+            or _extract_non_empty_error(res)
+        ):
+            return _normalize_dict_result(
+                res,
+                outer_is_error=bool(res.get("isError", False)),
+                default_error="bridge_call_failed",
+            )
         return {"ok": False, "status": "empty_bridge_content", "error": str(raw.get("error") or "empty_bridge_content")}
     except Exception as e:
         return {"ok": False, "status": "exception", "error": str(e)[:300]}

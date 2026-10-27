@@ -64,12 +64,14 @@ X_NO_EVIDENCE_NOTICE = "以下为未经来源支持的摘要，不得作为事�
 X_SUMMARY_TRUNCATED_NOTE = "摘要输出异常，已截断"
 MAX_X_HANDLES = 20
 
-# 生成摘要里的模型控制标记（<|eos|>、<|im_end|>、…）——命中即从该处截断。
-_CONTROL_TOKEN_RE = re.compile(r"<\|[A-Za-z0-9_]+\|>")
-# 成对引号（直双引号与中文双引号）：无来源时整段摘除，不返回"直接引语"。
-_QUOTED_SPAN_RES = (
-    re.compile(r'"[^"\n]{1,400}"'),
-    re.compile(r"“[^”\n]{1,400}”"),
+# 生成摘要里的模型控制标记（<|eos|>、<｜eos｜>、<|im_end|>、…）。
+_CONTROL_TOKEN_RE = re.compile(r"<[|｜][A-Za-z0-9_]+[|｜]>")
+# 成对引号（直双引号、弯双引号、中文直角双引号）：无来源时仅对长度 >= 20 的引语剥掉两侧引号，保留正文与短术语引号。
+_LONG_QUOTED_SPAN_RES = (
+    re.compile(r'"([^"\n]{20,})"'),
+    re.compile(r"“([^”\n]{20,})”"),
+    re.compile(r"「([^」\n]{20,})」"),
+    re.compile(r"『([^』\n]{20,})』"),
 )
 
 _X_SNOWFLAKE_EPOCH_MS = 1288834974657
@@ -150,21 +152,26 @@ def _raise_for_x_bridge_error_payload(
     )
 
 
-def _sanitize_generated_summary(answer: str) -> Tuple[str, List[str]]:
-    """Strip generation artifacts from a synthesized summary: cut at the first
-    control token (`<|eos|>` and kin) and at the first repeated paragraph, so
-    degenerate output cannot reach the agent as if it were content.
+def _sanitize_generated_summary(
+    answer: str, *, has_sources: bool = False
+) -> Tuple[str, List[str]]:
+    """Strip generation artifacts from a synthesized summary.
 
-    Returns `(sanitized, issues)`; `issues` names what was cut
-    (`control_marker` / `repeated_block`) so the result can carry the
-    truncation note and the artifact can flag it.
+    When ``has_sources`` is True, control tokens are removed in-place without
+    discarding trailing text, and repeated paragraphs drop only the duplicate
+    paragraph while keeping the first occurrence and subsequent unique
+    paragraphs. When ``has_sources`` is False, control tokens and repeated
+    paragraphs truncate the summary from the artifact onward.
     """
     issues: List[str] = []
     text = answer
 
     control = _CONTROL_TOKEN_RE.search(text)
     if control is not None:
-        text = text[: control.start()].rstrip()
+        if has_sources:
+            text = _CONTROL_TOKEN_RE.sub("", text).strip()
+        else:
+            text = text[: control.start()].rstrip()
         issues.append("control_marker")
 
     paragraphs = re.split(r"\n\s*\n", text)
@@ -175,7 +182,10 @@ def _sanitize_generated_summary(answer: str) -> Tuple[str, List[str]]:
         if not key:
             continue
         if key.casefold() in seen:
-            issues.append("repeated_block")
+            if "repeated_block" not in issues:
+                issues.append("repeated_block")
+            if has_sources:
+                continue
             break
         seen.add(key.casefold())
         kept.append(para)
@@ -186,11 +196,11 @@ def _sanitize_generated_summary(answer: str) -> Tuple[str, List[str]]:
 
 
 def _strip_quoted_spans(answer: str) -> str:
-    """Remove paired quoted spans, so a no-evidence summary carries no
-    direct-quote-shaped text (a quote with no source is a fabricated quote)."""
-    for pattern in _QUOTED_SPAN_RES:
-        answer = pattern.sub("", answer)
-    return " ".join(answer.split())
+    """Unquote paired quoted spans of length >= 20 in a no-evidence summary
+    while keeping their inner text and leaving short quoted terms intact."""
+    for pattern in _LONG_QUOTED_SPAN_RES:
+        answer = pattern.sub(r"\1", answer)
+    return answer
 
 
 def _x_answer_with_sources(
@@ -438,18 +448,14 @@ def map_x_search_response(
         payload.get("provider") or broker_response.get("provider") or "xai"
     )
     request_id = broker_response.get("providerRequestId") or payload.get("requestId")
-    answer_text = unwrap_untrusted_text(
+    raw_answer_text = unwrap_untrusted_text(
         payload.get("content") or payload.get("answer") or ""
     )
-    # Generation artifacts (control tokens, repeated blocks) are cut before the
-    # text becomes both the excerpt source and the answer the agent reads.
-    answer_text, summary_issues = _sanitize_generated_summary(answer_text)
-    if summary_issues:
-        answer_text = f"{answer_text}\n[{X_SUMMARY_TRUNCATED_NOTE}]"
 
     cleaned_results: List[Dict[str, Any]] = []
     cards: List[Dict[str, str]] = []
     seen_urls: set[str] = set()
+    raw_sources: List[Tuple[str, str, str, str, int]] = []
 
     raw_citations = payload.get("inlineCitations") or payload.get("citations")
     if isinstance(raw_citations, list) and raw_citations:
@@ -471,38 +477,12 @@ def map_x_search_response(
             if parsed_status is None or url in seen_urls:
                 continue
             seen_urls.add(url)
-
             author, status_id = parsed_status
-            post_date = decode_snowflake_date(status_id)
-            summary_excerpt = _extract_unique_summary_excerpt(
-                answer_text, url, status_id, idx
-            )
-            title = cit_title or (
-                f"{author} ({post_date})" if post_date else author
-            )
+            raw_sources.append((url, author, status_id, cit_title, idx))
 
-            row: Dict[str, Any] = {
-                "type": "x_post",
-                "author": author,
-                "date": post_date,
-                "summary_excerpt": summary_excerpt,
-                "url": url,
-                "title": title,
-            }
-            cleaned_results.append(row)
-            favicon = _favicon_url(url) if include_favicon else ""
-            cards.append(
-                result_card(
-                    title=title,
-                    url=url,
-                    favicon=favicon,
-                    snippet=(summary_excerpt or "")[:SNIPPET_MAX],
-                )
-            )
-
-    if not cleaned_results and answer_text:
+    if not raw_sources and raw_answer_text:
         for idx, match in enumerate(
-            _X_STATUS_URL_IN_TEXT_RE.finditer(answer_text), start=1
+            _X_STATUS_URL_IN_TEXT_RE.finditer(raw_answer_text), start=1
         ):
             url = match.group(0)
             if url in seen_urls:
@@ -510,30 +490,46 @@ def map_x_search_response(
             seen_urls.add(url)
             author = f"@{match.group(1)}"
             status_id = match.group(2)
-            post_date = decode_snowflake_date(status_id)
+            raw_sources.append((url, author, status_id, "", idx))
+
+    has_sources = bool(raw_sources)
+    answer_text, summary_issues = _sanitize_generated_summary(
+        raw_answer_text, has_sources=has_sources
+    )
+
+    for url, author, status_id, cit_title, idx in raw_sources:
+        post_date = decode_snowflake_date(status_id)
+        summary_excerpt = _extract_unique_summary_excerpt(
+            answer_text, url, status_id, idx
+        )
+        if summary_excerpt is None and answer_text != raw_answer_text:
             summary_excerpt = _extract_unique_summary_excerpt(
-                answer_text, url, status_id, idx
+                raw_answer_text, url, status_id, idx
             )
-            title = f"{author} ({post_date})" if post_date else author
-            cleaned_results.append(
-                {
-                    "type": "x_post",
-                    "author": author,
-                    "date": post_date,
-                    "summary_excerpt": summary_excerpt,
-                    "url": url,
-                    "title": title,
-                }
+        title = cit_title or (
+            f"{author} ({post_date})" if post_date else author
+        )
+        row: Dict[str, Any] = {
+            "type": "x_post",
+            "author": author,
+            "date": post_date,
+            "summary_excerpt": summary_excerpt,
+            "url": url,
+            "title": title,
+        }
+        cleaned_results.append(row)
+        favicon = _favicon_url(url) if include_favicon else ""
+        cards.append(
+            result_card(
+                title=title,
+                url=url,
+                favicon=favicon,
+                snippet=(summary_excerpt or "")[:SNIPPET_MAX],
             )
-            favicon = _favicon_url(url) if include_favicon else ""
-            cards.append(
-                result_card(
-                    title=title,
-                    url=url,
-                    favicon=favicon,
-                    snippet=(summary_excerpt or "")[:SNIPPET_MAX],
-                )
-            )
+        )
+
+    if summary_issues:
+        answer_text = f"{answer_text}\n[{X_SUMMARY_TRUNCATED_NOTE}]"
 
     if not cleaned_results and not answer_text:
         raise OpenClawSearchEmptyResultError(X_EMPTY_RESULTS_MESSAGE)

@@ -122,3 +122,60 @@ def test_env_var_still_overrides_with_http_bridge(monkeypatch: pytest.MonkeyPatc
 
     transport = collect_mod.resolve_researchdata_transport()
     assert transport == {"mode": "bridge", "call": "http://127.0.0.1:8961/rpc", "error": ""}
+
+
+def test_wrapper_rejects_mcp_error_envelope_and_non_empty_error_dict(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """上游返回 isError=True + structuredContent={"error": ...} 或解包后的 {"error": ...} 时，
+    一律判 ok=False 并保留原始错误文本。"""
+    collect_mod = _load_collect_module()
+    monkeypatch.delenv("DALTON_RESEARCHDATA_URL", raising=False)
+    _install_wrapper_modules(monkeypatch, tmp_path)
+    wrapper = sys.modules["tools.researchdata"]
+
+    # 1. MCP 原始错误包：isError=True, content=[], structuredContent={"error": ...}
+    wrapper._call_mcp_tool.side_effect = None
+    wrapper._call_mcp_tool.return_value = {
+        "isError": True,
+        "content": [],
+        "structuredContent": {"error": "upstream token expired"},
+    }
+    res_env = collect_mod.call_bridge_jsonrpc("research", {"route": "company-wiki"})
+    assert res_env["ok"] is False
+    assert res_env["status"] == "error"
+    assert res_env["error"] == "upstream token expired"
+
+    # 2. _unwrap_mcp_content 解包后的 {"error": ...}（无 ok/status 字段）
+    wrapper._call_mcp_tool.return_value = {"error": "rate limit exceeded: 429"}
+    res_unwrapped = collect_mod.call_bridge_jsonrpc("research", {"route": "company-wiki"})
+    assert res_unwrapped["ok"] is False
+    assert res_unwrapped["status"] == "error"
+    assert res_unwrapped["error"] == "rate limit exceeded: 429"
+
+    # 3. MCP 错误标志 isError=True + content 文本块
+    wrapper._call_mcp_tool.return_value = {
+        "isError": True,
+        "content": [{"type": "text", "text": "tool execution crashed"}],
+    }
+    res_content = collect_mod.call_bridge_jsonrpc("research", {"route": "company-wiki"})
+    assert res_content["ok"] is False
+    assert res_content["error"] == "tool execution crashed"
+
+
+def test_wrapper_rejects_non_dict_result_as_format_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """非字典结果不默认 ok=True，按格式异常判失败。"""
+    collect_mod = _load_collect_module()
+    monkeypatch.delenv("DALTON_RESEARCHDATA_URL", raising=False)
+    _install_wrapper_modules(monkeypatch, tmp_path)
+    wrapper = sys.modules["tools.researchdata"]
+    wrapper._call_mcp_tool.side_effect = None
+
+    for bad_value in (["unexpected", "list"], 42, None, True):
+        wrapper._call_mcp_tool.return_value = bad_value
+        res = collect_mod.call_bridge_jsonrpc("research", {"route": "company-wiki"})
+        assert res["ok"] is False
+        assert res["status"] == "invalid_format"
+        assert res["error"]
