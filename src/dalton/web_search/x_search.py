@@ -58,7 +58,19 @@ X_EMPTY_RESULTS_MESSAGE = "OpenClaw X 搜索返回空结果"
 X_ANSWER_ONLY_HEADING = "OpenClaw X 搜索综合摘要（无来源链接）"
 X_ANSWER_WITH_SOURCES_HEADING = "OpenClaw X 搜索综合摘要（来源见下）"
 X_UNTRUSTED_NOTICE = "以下为 X 平台外部内容，未经核实"
+# 无任何来源链接时：正文是模型生成的摘要，不是原帖，不得当事实或引语用。
+X_NO_EVIDENCE_TAG = "no_evidence"
+X_NO_EVIDENCE_NOTICE = "以下为未经来源支持的摘要，不得作为事实或引语使用"
+X_SUMMARY_TRUNCATED_NOTE = "摘要输出异常，已截断"
 MAX_X_HANDLES = 20
+
+# 生成摘要里的模型控制标记（<|eos|>、<|im_end|>、…）——命中即从该处截断。
+_CONTROL_TOKEN_RE = re.compile(r"<\|[A-Za-z0-9_]+\|>")
+# 成对引号（直双引号与中文双引号）：无来源时整段摘除，不返回"直接引语"。
+_QUOTED_SPAN_RES = (
+    re.compile(r'"[^"\n]{1,400}"'),
+    re.compile(r"“[^”\n]{1,400}”"),
+)
 
 _X_SNOWFLAKE_EPOCH_MS = 1288834974657
 _X_MIN_VALID_DT = datetime(2010, 11, 1, 0, 0, 0, tzinfo=timezone.utc)
@@ -138,18 +150,69 @@ def _raise_for_x_bridge_error_payload(
     )
 
 
+def _sanitize_generated_summary(answer: str) -> Tuple[str, List[str]]:
+    """Strip generation artifacts from a synthesized summary: cut at the first
+    control token (`<|eos|>` and kin) and at the first repeated paragraph, so
+    degenerate output cannot reach the agent as if it were content.
+
+    Returns `(sanitized, issues)`; `issues` names what was cut
+    (`control_marker` / `repeated_block`) so the result can carry the
+    truncation note and the artifact can flag it.
+    """
+    issues: List[str] = []
+    text = answer
+
+    control = _CONTROL_TOKEN_RE.search(text)
+    if control is not None:
+        text = text[: control.start()].rstrip()
+        issues.append("control_marker")
+
+    paragraphs = re.split(r"\n\s*\n", text)
+    seen: set[str] = set()
+    kept: List[str] = []
+    for para in paragraphs:
+        key = " ".join(para.split())
+        if not key:
+            continue
+        if key.casefold() in seen:
+            issues.append("repeated_block")
+            break
+        seen.add(key.casefold())
+        kept.append(para)
+    if "repeated_block" in issues:
+        text = "\n\n".join(kept).rstrip()
+
+    return text, issues
+
+
+def _strip_quoted_spans(answer: str) -> str:
+    """Remove paired quoted spans, so a no-evidence summary carries no
+    direct-quote-shaped text (a quote with no source is a fabricated quote)."""
+    for pattern in _QUOTED_SPAN_RES:
+        answer = pattern.sub("", answer)
+    return " ".join(answer.split())
+
+
 def _x_answer_with_sources(
     answer: str, results: List[Dict[str, Any]]
 ) -> Union[str, List[Dict[str, Any]]]:
-    """Place the xAI synthesized summary (with untrusted external content notice) as the leading `answer_box` item."""
-    prefixed_answer = f"{X_UNTRUSTED_NOTICE}\n{answer}" if answer else X_UNTRUSTED_NOTICE
+    """Place the xAI synthesized summary (with untrusted external content notice) as the leading `answer_box` item.
+
+    With no post evidence at all the summary is marked `no_evidence` and its
+    quoted spans are stripped: nothing in it may be cited as fact or quote."""
     if not results:
-        return f"{X_ANSWER_ONLY_HEADING}\n{prefixed_answer}"
+        dequoted = _strip_quoted_spans(answer)
+        return (
+            f"{X_ANSWER_ONLY_HEADING} [{X_NO_EVIDENCE_TAG}]\n"
+            f"{X_NO_EVIDENCE_NOTICE}\n{dequoted}"
+        )
+    prefixed_answer = f"{X_UNTRUSTED_NOTICE}\n{answer}" if answer else X_UNTRUSTED_NOTICE
     return [
         {
             "type": "answer_box",
             "title": X_ANSWER_WITH_SOURCES_HEADING,
             "content": prefixed_answer,
+            "evidence": "posts_below",
         },
         *results,
     ]
@@ -378,6 +441,11 @@ def map_x_search_response(
     answer_text = unwrap_untrusted_text(
         payload.get("content") or payload.get("answer") or ""
     )
+    # Generation artifacts (control tokens, repeated blocks) are cut before the
+    # text becomes both the excerpt source and the answer the agent reads.
+    answer_text, summary_issues = _sanitize_generated_summary(answer_text)
+    if summary_issues:
+        answer_text = f"{answer_text}\n[{X_SUMMARY_TRUNCATED_NOTE}]"
 
     cleaned_results: List[Dict[str, Any]] = []
     cards: List[Dict[str, str]] = []
@@ -477,8 +545,19 @@ def map_x_search_response(
         "provider": provider_name,
         "response_time": round(response_time, 2),
         "total_results": len(cleaned_results),
+        # Evidence vs generated summary, as separate fields: the posts are the
+        # citable evidence, the answer is a synthesis of them (or, with
+        # evidence_count 0, of nothing).
+        "evidence_count": len(cleaned_results),
         "results": cards,
     }
+    if not cleaned_results and answer_text:
+        # Nothing backs the summary: flag it and strip quote-shaped spans so
+        # no layer returns a fabricated "direct quote".
+        artifact["no_evidence"] = True
+        answer_text = _strip_quoted_spans(answer_text)
+    if summary_issues:
+        artifact["summary_issues"] = summary_issues
     if answer_text:
         artifact["answer"] = answer_text
     if isinstance(request_id, str) and request_id:
@@ -628,7 +707,7 @@ def build_x_search_tool(
             handles: Optional list of X handles (up to 20, with or without leading `@`) to restrict results to specific accounts.
 
         Returns:
-            Synthesized summary (`answer_box`, when available) followed by matching X status posts (`author`, `date` decoded from status ID, `url`, and `summary_excerpt` — the summary's description of that post when uniquely matched, not the original post's full text).
+            Synthesized summary (`answer_box`, when available) followed by matching X status posts (`author`, `date` decoded from status ID, `url`, and `summary_excerpt` — the summary's description of that post when uniquely matched, not the original post's full text); only the posts are citable evidence — a summary returned with no source posts is marked `no_evidence` and must not be used as fact or quote, and a degraded summary is truncated and marked 摘要输出异常.
         """
         try:
             if not isinstance(query, str) or not query.strip():
@@ -707,7 +786,10 @@ __all__ = [
     "X_BRIDGE_BUSY_MESSAGE",
     "X_BRIDGE_UNAVAILABLE_MESSAGE",
     "X_EMPTY_RESULTS_MESSAGE",
+    "X_NO_EVIDENCE_NOTICE",
+    "X_NO_EVIDENCE_TAG",
     "X_RATE_LIMITED_MESSAGE",
+    "X_SUMMARY_TRUNCATED_NOTE",
     "X_UNTRUSTED_NOTICE",
     "build_x_search_tool",
     "decode_snowflake_date",

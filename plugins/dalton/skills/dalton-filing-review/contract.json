@@ -13,7 +13,8 @@
       "artifacts": [
         {
           "path": "research/{as_of}-filing-{form}-{accession}.md",
-          "min_bytes": 200
+          "min_bytes": 200,
+          "variant_glob": "research/*-filing-{form}-{accession}.md"
         }
       ]
     }

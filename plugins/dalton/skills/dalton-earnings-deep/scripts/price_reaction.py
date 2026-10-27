@@ -19,7 +19,6 @@ Usage:
 """
 
 import argparse
-from datetime import date, datetime
 import json
 from pathlib import Path
 import sys

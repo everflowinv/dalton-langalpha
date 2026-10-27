@@ -13,7 +13,8 @@
       "artifacts": [
         {
           "path": "drafts/{as_of}-preview-{quarter}.md",
-          "min_bytes": 300
+          "min_bytes": 300,
+          "variant_glob": "drafts/*-preview-{quarter}.md"
         }
       ]
     },

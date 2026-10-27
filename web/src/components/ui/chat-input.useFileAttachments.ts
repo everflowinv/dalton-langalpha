@@ -60,6 +60,7 @@ export function useFileAttachments() {
       };
       reader.readAsDataURL(f.file);
     });
+    // DALTON-HOOK(attachment-native-cap): deps of the too-large toast above
   }, [attachedFiles.length, t, toast]);
 
   const removeFile = useCallback((id: string) => {

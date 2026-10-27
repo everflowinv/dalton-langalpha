@@ -338,12 +338,112 @@ def compute_consensus_deltas(
     return deltas, flags
 
 
-def call_bridge_jsonrpc(tool_name: str, arguments: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
-    """若环境配置了 DALTON_RESEARCHDATA_URL，直接经 HTTP 桥调用 researchdata 工具。"""
-    bridge_url = os.environ.get("DALTON_RESEARCHDATA_URL", "").strip()
-    if not bridge_url:
-        return {"ok": False, "status": "bridge_url_not_configured", "error": "bridge_url_not_configured"}
+RESEARCHDATA_SERVER = "researchdata"
+# researchdata 的两条调用路：HTTP 桥（DALTON_RESEARCHDATA_URL，显式覆盖）与沙箱内
+# PTC 生成的包装模块 tools.researchdata（ExecuteCode 调 researchdata 的同一模块；
+# Bash 工具在运行本脚本前会 export PYTHONPATH 与 PTC_WORKSPACE_CONFIG，所以这里
+# 的 import 与代码单元里一样成立）。两条都不可用是配置错误，collect 启动时应报
+# 一次 researchdata_transport_unconfigured，而不是让每个来源各失败一次。
+RESEARCHDATA_TRANSPORT_UNCONFIGURED = "researchdata_transport_unconfigured"
 
+
+def resolve_researchdata_transport() -> dict[str, Any]:
+    """选定 researchdata 调用路：DALTON_RESEARCHDATA_URL 桥优先（覆盖），否则包装模块。
+
+    Returns:
+        {"mode": "bridge"|"wrapper"|None, "call": url或callable, "error": 不可用原因}。
+    """
+    bridge_url = os.environ.get("DALTON_RESEARCHDATA_URL", "").strip()
+    if bridge_url:
+        return {"mode": "bridge", "call": bridge_url, "error": ""}
+
+    try:
+        from tools import researchdata as wrapper  # type: ignore
+    except Exception as e:  # noqa: BLE001 - import 失败的任何形态都是"包装模块不可用"
+        return {
+            "mode": None,
+            "call": None,
+            "error": f"无法导入沙箱包装模块 tools.{RESEARCHDATA_SERVER}（{str(e)[:200]}）",
+        }
+    try:
+        import mcp_client  # type: ignore # noqa: F401 - 包装模块经它调 MCP，缺它时包装模块只剩会抛错的桩
+    except Exception as e:  # noqa: BLE001
+        return {
+            "mode": None,
+            "call": None,
+            "error": f"沙箱缺少 mcp_client 运行时（{str(e)[:200]}），包装模块无法调用 MCP",
+        }
+    config_path = os.environ.get(
+        "PTC_WORKSPACE_CONFIG", ".agents/tools/mcp_client_config.json"
+    )
+    try:
+        with open(config_path, encoding="utf-8") as fh:
+            cfg = json.load(fh)
+        enabled = set((cfg.get("servers") or {}).keys())
+    except (OSError, ValueError):
+        enabled = None
+    if enabled is not None and RESEARCHDATA_SERVER not in enabled:
+        return {
+            "mode": None,
+            "call": None,
+            "error": f"工作区未启用 {RESEARCHDATA_SERVER} MCP 服务器（{config_path}）",
+        }
+    call_fn = getattr(wrapper, "_call_mcp_tool", None)
+    if not callable(call_fn):
+        return {
+            "mode": None,
+            "call": None,
+            "error": f"tools.{RESEARCHDATA_SERVER} 模块缺少 _call_mcp_tool",
+        }
+    return {"mode": "wrapper", "call": call_fn, "error": ""}
+
+
+def _call_wrapper(call_fn: Any, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    """经包装模块调用一个 researchdata 工具，返回与 HTTP 桥路径同构的结果。"""
+    try:
+        value = call_fn(RESEARCHDATA_SERVER, tool_name, arguments)
+    except Exception as e:  # noqa: BLE001 - MCP 调用失败按来源失败记录，不让脚本崩溃
+        return {"ok": False, "status": "exception", "error": str(e)[:300]}
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return {
+                "ok": False,
+                "status": "empty_bridge_content",
+                "error": "wrapper returned non-JSON text",
+            }
+    if isinstance(value, dict):
+        payload_ok = value.get("ok")
+        status_str = str(value.get("status") or "")
+        is_ok = payload_ok is not False and status_str not in ("error", "failed")
+        err_msg = (
+            None
+            if is_ok
+            else str(
+                value.get("error")
+                or value.get("reason")
+                or value.get("message")
+                or status_str
+                or "wrapper_call_failed"
+            )
+        )
+        return {
+            "ok": is_ok,
+            "status": status_str or ("ok" if is_ok else "error"),
+            "error": err_msg,
+            "data": value,
+        }
+    return {"ok": True, "status": "ok", "data": clean_val(value)}
+
+
+def _call_bridge_http(
+    bridge_url: str,
+    tool_name: str,
+    arguments: dict[str, Any],
+    timeout: int,
+) -> dict[str, Any]:
+    """经 DALTON_RESEARCHDATA_URL 指向的 HTTP 桥调用 researchdata 工具。"""
     payload = {
         "jsonrpc": "2.0",
         "id": 1,
@@ -391,6 +491,20 @@ def call_bridge_jsonrpc(tool_name: str, arguments: dict[str, Any], timeout: int 
         return {"ok": False, "status": "empty_bridge_content", "error": str(raw.get("error") or "empty_bridge_content")}
     except Exception as e:
         return {"ok": False, "status": "exception", "error": str(e)[:300]}
+
+
+def call_bridge_jsonrpc(tool_name: str, arguments: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
+    """调用一个 researchdata 工具：HTTP 桥覆盖优先，默认走沙箱包装模块（tools.researchdata）。"""
+    transport = resolve_researchdata_transport()
+    if transport["mode"] == "bridge":
+        return _call_bridge_http(transport["call"], tool_name, arguments, timeout)
+    if transport["mode"] == "wrapper":
+        return _call_wrapper(transport["call"], tool_name, arguments)
+    return {
+        "ok": False,
+        "status": RESEARCHDATA_TRANSPORT_UNCONFIGURED,
+        "error": transport["error"] or RESEARCHDATA_TRANSPORT_UNCONFIGURED,
+    }
 
 
 def build_guidepoint_query(meta: dict[str, Any]) -> str:
@@ -908,6 +1022,29 @@ def cmd_collect(args: argparse.Namespace) -> int:
     ws_dir = Path(args.workspace_dir).resolve()
     P = tracker_paths(ws_dir)
     ticker = args.ticker.upper().strip()
+
+    # 启动即核 researchdata 调用路；两条都不可用是配置错误，一次性返回，不逐来源失败。
+    transport = resolve_researchdata_transport()
+    if transport["mode"] is None:
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "status": RESEARCHDATA_TRANSPORT_UNCONFIGURED,
+                    "ticker": ticker,
+                    "error": transport["error"],
+                    "hint": (
+                        "沙箱内应经 PTC 包装模块（tools.researchdata）调用，或设 "
+                        "DALTON_RESEARCHDATA_URL 走 HTTP 桥；两者皆不可用，本轮未采集任何来源，"
+                        "按取数失败如实汇报，不要当成“本轮无新文档”"
+                    ),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 2
+
     thr = load_thresholds(ws_dir)
     meta = resolve_company_meta(ticker, ws_dir)
 

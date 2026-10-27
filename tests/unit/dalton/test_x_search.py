@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import http.client
 import io
+import json
 import urllib.error
 import urllib.request
 from email.message import Message
@@ -214,9 +215,19 @@ async def test_x_search_tool_uses_x_specific_error_messages() -> None:
     }
 
     tool_fn = build_x_search_tool(wrapper=mock_wrapper)
-    content, _ = await tool_fn.coroutine(query="NVDA")
+    content, art = await tool_fn.coroutine(query="NVDA")
     assert isinstance(content, str)
-    assert content.startswith(f"{X_ANSWER_ONLY_HEADING}\n{X_UNTRUSTED_NOTICE}\n")
+    # No source links: the summary is marked no_evidence and says so up front.
+    from src.dalton.web_search.x_search import (
+        X_NO_EVIDENCE_NOTICE,
+        X_NO_EVIDENCE_TAG,
+    )
+
+    assert content.startswith(
+        f"{X_ANSWER_ONLY_HEADING} [{X_NO_EVIDENCE_TAG}]\n{X_NO_EVIDENCE_NOTICE}\n"
+    )
+    assert art.get("no_evidence") is True
+    assert art.get("evidence_count") == 0
 
     # Parameter validation error (> 20 handles)
     bad_handles = [f"user{i}" for i in range(21)]
@@ -691,3 +702,89 @@ def test_summary_excerpt_second_bare_status_url_with_path_and_query_joins_the_it
     for suffix in ("/photo/1?s=20", "?s=20#details"):
         text = f"- 两位作者都认为需求增长。[[1]]({_U1})\n{_U2}{suffix}\n总体情绪转弱。"
         assert _extract_unique_summary_excerpt(text, _U1, "2112925226740683159", 1) is None, suffix
+
+
+# --- Generated summary vs post evidence (prod incident: answer-only output
+# read as normal results — fabricated "CEO quotes", <｜eos｜> markers, repeats)
+
+
+def _broker_reply(answer: str, citations: list) -> dict:
+    """A broker reply whose answer is wrapped the way the gateway sends it."""
+    return {
+        "ok": True,
+        "provider": "xai",
+        "result": {
+            "content": [
+                {
+                    "type": "text",
+                    "text": (
+                        '{"query":"T","provider":"xai",'
+                        '"content":"<<<EXTERNAL_UNTRUSTED_CONTENT id=\\"1\\">>>\\n'
+                        + answer.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+                        + '\\n<<<END_EXTERNAL_UNTRUSTED_CONTENT id=\\"1\\">>>",'
+                        + '"citations":' + json.dumps(citations) + "}"
+                    ),
+                }
+            ]
+        },
+    }
+
+
+def test_no_evidence_answer_is_marked_and_carries_no_quotes() -> None:
+    """No citations: the result is marked no_evidence, states the summary may
+    not be used as fact or quote, and no quoted span survives."""
+    answer = 'The CEO said "we will double capex" per traders. Sentiment bullish.'
+    cleaned, artifact = map_x_search_response(
+        _broker_reply(answer, []), query="NVDA"
+    )
+    assert cleaned == []
+    assert artifact["no_evidence"] is True
+    assert artifact["evidence_count"] == 0
+    # No quoted direct quote survives at any layer; the plain prose does.
+    assert "we will double capex" not in artifact["answer"]
+    assert "Sentiment bullish" in artifact["answer"]
+
+
+def test_control_token_truncates_summary_and_flags_it() -> None:
+    """A <|eos|>-style control marker cuts the summary at the marker and the
+    result carries the truncation note and issue flag."""
+    from src.dalton.web_search.x_search import X_SUMMARY_TRUNCATED_NOTE
+
+    answer = "First solid paragraph of the summary.<|eos|>Garbage after the marker"
+    cleaned, artifact = map_x_search_response(
+        _broker_reply(
+            answer,
+            ["https://x.com/NickRokke/status/2112925226740683159"],
+        ),
+        query="NVDA",
+    )
+    assert artifact["summary_issues"] == ["control_marker"]
+    assert artifact["answer"].startswith("First solid paragraph of the summary.")
+    assert X_SUMMARY_TRUNCATED_NOTE in artifact["answer"]
+    assert "Garbage after the marker" not in artifact["answer"]
+    assert "<|eos|>" not in artifact["answer"]
+    # Evidence rows still come through unchanged.
+    assert cleaned and cleaned[0]["type"] == "x_post"
+
+
+def test_repeated_paragraph_truncates_summary_and_flags_it() -> None:
+    """A duplicated paragraph cuts the summary from the repeat on and the
+    result carries the truncation note and issue flag."""
+    from src.dalton.web_search.x_search import X_SUMMARY_TRUNCATED_NOTE
+
+    answer = (
+        "Traders report demand is strong into quarter end.\n\n"
+        "Traders report demand is strong into quarter end.\n\n"
+        "Second unique paragraph."
+    )
+    _cleaned, artifact = map_x_search_response(
+        _broker_reply(
+            answer,
+            ["https://x.com/NickRokke/status/2112925226740683159"],
+        ),
+        query="NVDA",
+    )
+    assert artifact["summary_issues"] == ["repeated_block"]
+    assert artifact["answer"].count("Traders report demand is strong") == 1
+    assert "Second unique paragraph." not in artifact["answer"]
+    assert X_SUMMARY_TRUNCATED_NOTE in artifact["answer"]

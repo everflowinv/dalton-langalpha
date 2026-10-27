@@ -3133,3 +3133,144 @@ async def test_language_review_disjunct_ignores_neighbour_unfinished_runs(
     # the language check's); the language check itself adds no gap.
     assert any("未结束的 workflow run" in m for m in result["missing"])
     assert not any("语言审查" in m or "language.json" in m for m in result["missing"])
+
+
+# --- Wake-before-Eastern-midnight: the window binds to the turn's start ----
+
+
+def _wake_delta_files(*, material: str = "yes", note: str = "research/2026-10-26-delta.md") -> dict[str, str]:
+    """A healthy manual dalton-thesis-delta workspace: commit state on disk,
+    one verdict row, and the delta note named for the EASTERN business day
+    (2026-10-26 ET) while the agent's params will say 2026-10-27."""
+    note_text = "# 增量\n" + "变化" * 200
+    return {
+        "research/tracker/last_run.json": json.dumps(
+            {"ticker": "META", "run_id": "20261027-0310", "material": material, "until": "2026-10-26"}
+        ),
+        "research/tracker/updates.log": "2026-10-27 03:40 | 20261027-0310 | material=yes | 摘要\n",
+        note: note_text,
+    }
+
+
+# UTC 2026-10-27T03:10Z == 2026-10-26 23:10 Eastern: the wake fires the
+# evening BEFORE the Eastern business day the agent's as_of will name.
+_WAKE_EPOCH = int(datetime(2026, 10, 27, 3, 10, tzinfo=timezone.utc).timestamp())
+
+
+@pytest.mark.asyncio
+async def test_wake_before_eastern_midnight_binds_window_to_turn_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Manual path, woken 2026-10-26 23:10 ET, agent passes as_of=2026-10-27
+    and names the note for the Eastern day (2026-10-26): the window starts at
+    the turn's start, so the verdict/note written during the turn count and
+    the contract reports done."""
+    captured = _patch_knowledge_capture(monkeypatch, ["thesis"])
+    _patch_verdicts(monkeypatch, [_verdict_row("THESIS_STRENGTHENED", "internal_material")])
+    # This turn's start: the wake time, read from conversation_responses.
+    monkeypatch.setattr(
+        check_done_tools,
+        "_run_start_epoch",
+        create_autospec(
+            check_done_tools._run_start_epoch,
+            return_value=_WAKE_EPOCH,
+        ),
+    )
+
+    result = await run_check_done(
+        workflow="dalton-thesis-delta",
+        params={"ticker": "META", "as_of": "2026-10-27"},
+        backend=_make_backend(
+            _wake_delta_files(), mtimes={"research/2026-10-26-delta.md": _WAKE_EPOCH + 1800}
+        ),
+        workspace_id=WS,
+        thread_id="short-1",
+        conversation_run_id="resp-wake",
+    )
+    assert result["done"], result["missing"]
+
+    # The knowledge-version window is the TURN's start (03:10Z), not the
+    # as_of day's Eastern midnight (2026-10-27T04:00Z), which would sit after
+    # everything the turn wrote.
+    assert captured["args"][2] == datetime.fromtimestamp(_WAKE_EPOCH, tz=timezone.utc)
+
+
+@pytest.mark.asyncio
+async def test_delta_note_variant_accepts_the_eastern_day_file(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """as_of=2026-10-27 renders research/2026-10-27-delta.md, which does not
+    exist; the contract accepts the note the run actually wrote
+    (research/2026-10-26-delta.md) because its mtime is inside the run's
+    window."""
+    _patch_knowledge(
+        monkeypatch, ["thesis"], start_epochs={"resp-wake": _WAKE_EPOCH}
+    )
+    _patch_verdicts(monkeypatch, [_verdict_row("THESIS_STRENGTHENED", "internal_material")])
+
+    result = await run_check_done(
+        workflow="dalton-thesis-delta",
+        params={"ticker": "META", "as_of": "2026-10-27"},
+        backend=_make_backend(
+            _wake_delta_files(), mtimes={"research/2026-10-26-delta.md": _WAKE_EPOCH + 1800}
+        ),
+        workspace_id=WS,
+        thread_id="short-1",
+        conversation_run_id="resp-wake",
+    )
+    assert result["done"], result["missing"]
+    assert not any("不存在" in m for m in result["missing"])
+
+
+@pytest.mark.asyncio
+async def test_delta_note_variant_outside_window_is_still_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A same-glob note whose mtime predates the run's window does not stand
+    in for this run's deliverable: the missing entry names both the expected
+    path and the variant glob."""
+    _patch_knowledge(
+        monkeypatch, ["thesis"], start_epochs={"resp-wake": _WAKE_EPOCH}
+    )
+    _patch_verdicts(monkeypatch, [_verdict_row("THESIS_STRENGTHENED", "internal_material")])
+
+    result = await run_check_done(
+        workflow="dalton-thesis-delta",
+        params={"ticker": "META", "as_of": "2026-10-27"},
+        backend=_make_backend(
+            _wake_delta_files(), mtimes={"research/2026-10-26-delta.md": _WAKE_EPOCH - 86400}
+        ),
+        workspace_id=WS,
+        thread_id="short-1",
+        conversation_run_id="resp-wake",
+    )
+    assert not result["done"]
+    assert any(
+        "research/2026-10-27-delta.md" in m and "research/*-delta.md" in m
+        for m in result["missing"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_explicit_delta_note_param_wins_over_dated_template(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """params["delta_note"] (the path the agent says it wrote) replaces the
+    dated template, no variant search needed."""
+    _patch_knowledge(monkeypatch, ["thesis"])
+    _patch_verdicts(monkeypatch, [_verdict_row("THESIS_STRENGTHENED", "internal_material")])
+
+    result = await run_check_done(
+        workflow="dalton-thesis-delta",
+        params={
+            "ticker": "META",
+            "as_of": "2026-10-27",
+            "delta_note": "research/2026-10-26-delta.md",
+        },
+        backend=_make_backend(
+            _wake_delta_files(), mtimes={"research/2026-10-26-delta.md": _WAKE_EPOCH + 1800}
+        ),
+        workspace_id=WS,
+        thread_id="short-1",
+    )
+    assert result["done"], result["missing"]

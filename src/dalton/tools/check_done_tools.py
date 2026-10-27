@@ -265,10 +265,45 @@ async def _derived_artifact_paths(
     return paths, problems
 
 
+async def _run_written_variant(
+    backend: Any,
+    artifact: dict[str, Any],
+    params: dict[str, Any],
+    missing_path: str,
+    since_epoch: int | None,
+) -> tuple[str, _FileInfo] | None:
+    """The file this run actually wrote where the dated template found nothing.
+
+    A dated deliverable (``research/{as_of}-delta.md``) is conventionally named
+    for the business day, but a caller crossing a midnight boundary may spell a
+    different calendar day than the template rendered. ``variant_glob`` widens
+    the dated segment to ``*``; a match counts only when provably written this
+    run (mtime at/after the window start), newest wins. None when the contract
+    declares no variant, the glob cannot run, or nothing matches — an
+    unreadable mtime proves nothing and reads as no match."""
+    pattern = artifact.get("variant_glob")
+    if not pattern or since_epoch is None:
+        return None
+    matches = await _glob(backend, render_template(pattern, params))
+    if matches is None:
+        return None
+    best: tuple[str, _FileInfo] | None = None
+    for candidate in (m for m in matches if not m.endswith(SIDECAR_SUFFIXES)):
+        info = await _file_info(backend, candidate)
+        if not info.exists or info.mtime_epoch is None:
+            continue
+        if info.mtime_epoch < since_epoch:
+            continue
+        if best is None or info.mtime_epoch > best[1].mtime_epoch:
+            best = (candidate, info)
+    return best
+
+
 async def _check_artifact(
     backend: Any,
     artifact: dict[str, Any],
     params: dict[str, Any],
+    since_epoch: int | None = None,
 ) -> tuple[list[str], list[str]]:
     """(missing, warnings) for one declared artifact. Everything required
     that cannot be verified lands in missing; only SKILL-optional artifacts
@@ -333,7 +368,14 @@ async def _check_artifact(
         if concrete is None or not concrete:
             return missing, warnings
     else:
-        concrete = [render_template(artifact["path"], params)]
+        # An explicitly passed path (``path_param``) is what the agent says it
+        # actually wrote; the dated template is only the conventional spelling.
+        explicit_key = artifact.get("path_param")
+        explicit = str(params.get(explicit_key) or "").strip() if explicit_key else ""
+        if explicit:
+            concrete = [render_template(explicit, params)]
+        else:
+            concrete = [render_template(artifact["path"], params)]
 
     if artifact.get("glob"):
         matches = await _glob(backend, concrete[0])
@@ -388,8 +430,23 @@ async def _check_artifact(
     for path in targets:
         info = await _file_info(backend, path)
         if not info.exists:
-            _report(f"产物文件不存在：{path}。下一步：补齐该阶段交付物后重查。")
-            continue
+            variant = await _run_written_variant(
+                backend, artifact, params, path, since_epoch
+            )
+            if variant is not None:
+                # The dated template guessed a different day than the file the
+                # run wrote; judge the file that exists, by this run's window.
+                path, info = variant
+            else:
+                if artifact.get("variant_glob"):
+                    _report(
+                        f"产物文件不存在：{path}，也未找到本轮写入的 "
+                        f"{artifact['variant_glob']}（文件名用美东业务日）；"
+                        "下一步：写入该阶段交付物后重查。"
+                    )
+                else:
+                    _report(f"产物文件不存在：{path}。下一步：补齐该阶段交付物后重查。")
+                continue
         if artifact.get("min_bytes") and info.size < artifact["min_bytes"]:
             _report(
                 f"产物文件过小（{path}，{info.size} 字节 < {artifact['min_bytes']}），"
@@ -808,6 +865,7 @@ async def _check_stages(
     backend: Any,
     run_id: str | None,
     thread_id: str | None = None,
+    since_epoch: int | None = None,
 ) -> tuple[list[str], list[str], str | None]:
     missing: list[str] = []
     warnings: list[str] = []
@@ -824,7 +882,7 @@ async def _check_stages(
             continue
         stage_missing = False
         for artifact in stage.get("artifacts", []):
-            gap, warn = await _check_artifact(backend, artifact, params)
+            gap, warn = await _check_artifact(backend, artifact, params, since_epoch)
             missing.extend(gap)
             warnings.extend(warn)
             stage_missing = stage_missing or bool(gap)
@@ -943,15 +1001,17 @@ async def _closing_since(
     params: dict[str, Any],
     run_id: str | None,
     thread_id: str | None,
+    conversation_run_id: str | None = None,
 ) -> tuple[datetime, list[str]]:
     """The closing checks' freshness window and any gap from fixing it.
 
     Audit #20: the window starts at THIS run's first dispatch (the earliest
     journal ``recorded_at``), so versions written during the run always count,
     whatever timezone it crossed; the manual path (no run) falls back to the
-    ``as_of`` day's start in America/New_York. A journal that exists but
-    cannot be read is a gap (fail-closed), with the manual window as the
-    best-effort floor the remaining checks still run against.
+    current turn's start, else the ``as_of`` day's start in America/New_York.
+    A journal that exists but cannot be read is a gap (fail-closed), with the
+    manual window as the best-effort floor the remaining checks still run
+    against.
     """
     try:
         _files, run_start = await _collect_run_dispatch_files(
@@ -959,13 +1019,15 @@ async def _closing_since(
         )
     except _CannotVerify as error:
         since = datetime.fromtimestamp(
-            await _manual_since_epoch(params, thread_id), tz=timezone.utc
+            await _manual_since_epoch(params, thread_id, conversation_run_id),
+            tz=timezone.utc,
         )
         return since, [f"知识层时间窗口无法核对（{error}），请重试。"]
     if run_start is not None:
         return datetime.fromtimestamp(run_start, tz=timezone.utc), []
     since = datetime.fromtimestamp(
-        await _manual_since_epoch(params, thread_id), tz=timezone.utc
+        await _manual_since_epoch(params, thread_id, conversation_run_id),
+        tz=timezone.utc,
     )
     return since, []
 
@@ -980,14 +1042,17 @@ async def _check_closing(
     thread_id: str | None = None,
     *,
     conversation_run_id: str | None = None,
+    since: datetime | None = None,
+    since_gaps: list[str] | None = None,
 ) -> tuple[list[str], list[str], str]:
     missing: list[str] = []
     warnings: list[str] = []
     closing = contract.get("closing") or {}
-    since, since_gaps = await _closing_since(
-        backend, contract["name"], params, run_id, thread_id
-    )
-    missing.extend(since_gaps)
+    if since is None:
+        since, since_gaps = await _closing_since(
+            backend, contract["name"], params, run_id, thread_id, conversation_run_id
+        )
+    missing.extend(since_gaps or [])
     since_label = since.date().isoformat()
 
     docs_all = list(closing.get("knowledge_docs", []))
@@ -1099,6 +1164,7 @@ async def _check_closing(
             contract,
             run_id,
             thread_id,
+            conversation_run_id,
         )
         for gap in gaps:
             (missing if required else warnings).append(gap)
@@ -1260,13 +1326,21 @@ async def _push_draft_since_epoch(
 
 
 async def _manual_since_epoch(
-    params: dict[str, Any], thread_id: str | None
+    params: dict[str, Any],
+    thread_id: str | None,
+    conversation_run_id: str | None = None,
 ) -> int:
-    """The manual path's window start: the run's ``as_of`` day at midnight
-    America/New_York (release_date/end are the aliases the contracts render);
-    with ``as_of`` missing, ``latest``, or unparseable, the thread's start;
-    and only when even that is unreadable, the last 24 hours — a window ending
-    at today's midnight would drop notes written before a midnight crossing."""
+    """The manual path's window start: THIS turn's start (the run's
+    ``created_at``) first, because an auto-wake fired before an Eastern
+    midnight crossing would otherwise anchor the window after everything the
+    turn wrote; then the run's ``as_of`` day at midnight America/New_York
+    (release_date/end are the aliases the contracts render); then the thread's
+    start; and only when even that is unreadable, the last 24 hours — a window
+    ending at today's midnight would drop notes written before a midnight
+    crossing."""
+    run_start = await _run_start_epoch(conversation_run_id)
+    if run_start is not None:
+        return run_start
     day = str(
         params.get("as_of") or params.get("release_date") or params.get("end") or ""
     ).strip()
@@ -1525,6 +1599,7 @@ async def _check_language_review(
     contract: dict[str, Any],
     run_id: str | None,
     thread_id: str | None,
+    conversation_run_id: str | None = None,
 ) -> list[str]:
     """Every formal deliverable this run wrote owes two language-review rounds:
     the contract's declared draft and notes (mtime-free — a reused note passes
@@ -1585,7 +1660,7 @@ async def _check_language_review(
     since_epoch = (
         int(run_start)
         if run_start is not None
-        else await _manual_since_epoch(params, thread_id)
+        else await _manual_since_epoch(params, thread_id, conversation_run_id)
     )
     scanned = await _scan_reviewable_since(backend, since_epoch)
     if scanned is None:
@@ -1956,8 +2031,19 @@ async def run_check_done(
                 "warnings": [],
                 "checked": checked,
             }
+        # One window feeds both the stage artifact variants and the closing
+        # checks, so a variant accepted by mtime is the same run the verdict
+        # window counts.
+        since, since_gaps = await _closing_since(
+            backend, contract["name"], params, run_id, thread_id, conversation_run_id
+        )
         stage_missing, stage_warnings, _draft = await _check_stages(
-            contract, params, backend, run_id, thread_id
+            contract,
+            params,
+            backend,
+            run_id,
+            thread_id,
+            since_epoch=int(since.timestamp()),
         )
         missing.extend(stage_missing)
         warnings.extend(stage_warnings)
@@ -1970,6 +2056,8 @@ async def run_check_done(
             run_id,
             thread_id,
             conversation_run_id=conversation_run_id,
+            since=since,
+            since_gaps=since_gaps,
         )
         missing.extend(close_missing)
         warnings.extend(close_warnings)

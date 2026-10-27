@@ -170,6 +170,14 @@
             }
           },
           "description": "从本产物路径推导的侧车文件（draft stem + suffix），同样要求存在且达到 min_bytes。"
+        },
+        "path_param": {
+          "type": "string",
+          "description": "参数名：params 里带该参数时，用它的值（可含占位符）替代 path 模板作为产物路径——agent 显式给出本次实际写入的文件时优先于按日期猜。"
+        },
+        "variant_glob": {
+          "type": "string",
+          "description": "path 模板渲染结果不存在时的同目录通配（如 research/*-delta.md，可含 {key} 占位符）；只接受本轮窗口内（mtime ≥ 运行开始时间）的最新匹配，防止旧文件顶替本轮交付。"
         }
       }
     },

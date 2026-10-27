@@ -26,6 +26,8 @@
       "artifacts": [
         {
           "path": "research/{as_of}-delta.md",
+          "path_param": "delta_note",
+          "variant_glob": "research/*-delta.md",
           "min_bytes": 100,
           "requires_json": {
             "json": "research/tracker/last_run.json",

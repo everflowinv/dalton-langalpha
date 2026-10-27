@@ -260,10 +260,16 @@ def create_knowledge_tools(filesystem_backend: Any = None) -> list[BaseTool]:
     ) -> str:
         """Record an event verdict (NO_CHANGE/THESIS_STRENGTHENED/THESIS_WEAKENED/THESIS_BROKEN/NEW_THESIS) and its next validation; every research session that looked at new evidence ends with one.
 
+        verdict 的字段（additionalProperties=false，多余字段整条被拒；at/id 由服务端生成，不要传）：
+        - 必填：verdict（上述五词之一）；event（一句话事件，含期间与数字）；rationale（定量依据）；progress（"none"|"some"|"resolved"）；
+          trigger：{"kind": filing|earnings|price_move|consensus_change|indicator|due_validation|pm_question|internal_material|agenda|director|manual, "ref": 唤醒信号 id / accession / V- 编号, "automation_execution_id": 仅自动任务}；
+          next_validation：{"what": 下一项看什么, "due": "YYYY-MM-DD"（不能是 null）, "validation_id": 可选 V-xxx}——不是 text/when。
+        - 可选：affected（{pillars:[], debates:[], drivers:[]}）；evidence_ids（["E-…"]——不是 evidence/evidence_refs/basis/summary）；question_ids（["Q-…"]）；house_view_changed。
+        最小示例：{"verdict":"NO_CHANGE","event":"…","rationale":"…","progress":"none","trigger":{"kind":"internal_material","ref":"<信号id>"},"next_validation":{"what":"…","due":"2026-11-05"}}；被拒时返回只列未知字段与缺少的字段，照改后原样重试。
+
         Writing requires the caller to own the workspace or hold rw on it; external members are fully isolated — colleagues' workspaces are not visible to them at all (a 404 is an identity limit — report it, don't retry).
         验证完 agenda 里的某一项，要在 agenda_ops 里显式关掉它，或者把 trigger.ref 设成该 validation id；next_validation 写的是下一项要看什么，不会关闭任何项。
-        On validation failure, the returned message includes the expected schema structure (失败时返回的信息里带有期望结构，照着补齐再提交).
-        Returns: the verdict id and the agenda version it updated.
+        Returns: the verdict id and the agenda version it updated; agenda 更新失败时返回 verdict_saved/agenda_saved 与补救调用。
         """
         user_id, cfg_workspace_id, thread_id, run_id = _extract_run_identity(config)
         target_ws_id = (str(workspace_id).strip() if workspace_id else "") or (
@@ -305,6 +311,27 @@ def create_knowledge_tools(filesystem_backend: Any = None) -> list[BaseTool]:
                 verdict_id=str(res.get("verdict_id") or "") or None,
                 execution_id=auto_exec_id,
             )
+            if res.get("agenda_update") == "failed":
+                # Partial success the model must not read as done: the verdict
+                # row exists, the agenda does not. The recovery is one
+                # knowledge_update call, so say exactly that.
+                verdict_id = res.get("verdict_id")
+                recovery = (
+                    "verdict 已入库、agenda 未更新：按 detail 里的期望结构调用 "
+                    f'knowledge_update(doc="agenda", ops=[…], '
+                    f'reason="补写 verdict {verdict_id} 的 agenda 更新")，'
+                    "不要重复调用 knowledge_append_verdict（会写第二条 verdict）。"
+                )
+                return json.dumps(
+                    {
+                        "verdict_saved": True,
+                        "agenda_saved": False,
+                        "verdict_id": verdict_id,
+                        "recovery": recovery,
+                        "detail": str(res["message"]),
+                    },
+                    ensure_ascii=False,
+                )
         return str(res["message"])
 
     @tool("knowledge_read")

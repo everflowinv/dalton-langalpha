@@ -89,9 +89,19 @@ async def workspaces_list(user_id: str, tool_call_id: str) -> Command:
         if is_dalton_supabase_auth_enabled():
             from src.dalton.sharing import list_colleague_cos_workspaces
 
-            payload["colleague_workspaces"] = await list_colleague_cos_workspaces(
-                user_id
-            )
+            colleague_list = await list_colleague_cos_workspaces(user_id)
+            payload["colleague_workspaces"] = colleague_list
+            if colleague_list:
+                # Said here, where the model reads the list it is about to
+                # route by: promising a dispatch into one of these was the
+                # incident, and dispatch refuses them.
+                payload["colleague_workspaces_note"] = (
+                    "同事共享的工作区当前只能读取（list_files / read_file；rw 时可 "
+                    "write_file 写文件），delegate_to_analyst 不能向同事的工作区派发"
+                    "任务（会被拒绝）。要在同事工作区里做的事：用 manage_workspaces"
+                    '(action="create") 在用户自己名下新建工作区，再把任务派发给它的'
+                    "分析师。"
+                )
         # --- DALTON-HOOK(workspace-sharing-settings): end ---
         content = json.dumps(payload, default=str)
     except Exception as e:
@@ -462,6 +472,59 @@ async def threads_delete(
 
 
 # --- DALTON-HOOK(workspace-sharing-settings): begin ---
+def _strip_own_dir_prefix(rel_path: str, dir_name: str) -> str:
+    """Drop a redundant leading ``<own folder>/`` from a workspace-relative path.
+
+    A listing shows the workspace's folder name (``dir_name``), and a caller
+    quoting it back ("DASH/sources/x.md" into the DASH workspace) means the
+    file at ``sources/x.md`` — without this the write lands at
+    ``DASH/DASH/sources/x.md`` and the workspace's analyst cannot find it."""
+    if not dir_name:
+        return rel_path
+    stripped = rel_path
+    parts = stripped.split("/", 1)
+    while len(parts) == 2 and parts[1].strip() and (
+        parts[0].strip().casefold() == dir_name.casefold()
+    ):
+        stripped = parts[1].strip().lstrip("/")
+        parts = stripped.split("/", 1)
+    return stripped
+
+
+async def _sibling_folder_named(
+    rel_path: str, workspace: dict
+) -> str | None:
+    """The path's first segment when it names ANOTHER workspace's folder on
+    this computer — the shape of writing "DASH/..." into Home believing that
+    creates the DASH workspace's folder. None when it names no sibling."""
+    first = rel_path.split("/", 1)[0].strip()
+    if not first:
+        return None
+    computer_id = workspace.get("computer_id")
+    if not computer_id:
+        return None
+    try:
+        from src.server.database.workspace import (
+            get_workspace_dir_names_for_computer,
+        )
+
+        held = await get_workspace_dir_names_for_computer(str(computer_id))
+    except Exception as e:
+        logger.warning(
+            f"Could not read workspace folders of computer {computer_id}: {e}"
+        )
+        return None
+    own = str(workspace.get("dir_name") or "").strip().casefold()
+    for name in held or ():
+        if (
+            name
+            and name.casefold() == first.casefold()
+            and name.casefold() != own
+        ):
+            return name
+    return None
+
+
 async def workspace_files_list_cos(
     user_id: str,
     workspace_id: str | None,
@@ -700,8 +763,31 @@ async def workspace_file_write_cos(
         ):
             work_dir = owner_work_dir(live_ws)
             previous_dirs = previous_dir_names_of(live_ws)
+            # DALTON-HOOK(workspace-sharing-settings): keep CoS writes inside the named workspace
+            rel_path = _strip_own_dir_prefix(
+                _normalize_requested_path(path, work_dir, previous_dirs),
+                str(live_ws.get("dir_name") or ""),
+            )
+            if _is_non_owner_blocked_path(rel_path):
+                return error_command(
+                    "403 Forbidden: Cannot write system, hidden, or virtual files",
+                    tool_call_id,
+                )
+            sibling = await _sibling_folder_named(rel_path, live_ws)
+            if sibling is not None:
+                # The incident's shape: "DASH/..." written into Home (or any
+                # workspace but DASH) as a way to "put it in the workspace".
+                # Refuse it naming the workspace-relative path, or the write
+                # silently lands in the wrong workspace's folder.
+                return error_command(
+                    f"路径以 {sibling}/ 开头：那是同一电脑上另一个工作区的文件夹，"
+                    f"不是工作区 {ws.get('name') or workspace_id} 内的路径，写入不会"
+                    "落到目标工作区。请改用该工作区内的相对路径（如 'sources/x.md'），"
+                    "或把 workspace_id 换成那个工作区。",
+                    tool_call_id,
+                )
             normalized = await _contained_target(
-                sandbox, path, work_dir, previous_dirs
+                sandbox, rel_path, work_dir, previous_dirs
             )
             client_path = _to_client_path(sandbox, normalized, work_dir)
             if _is_non_owner_blocked_path(client_path):

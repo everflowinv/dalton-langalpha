@@ -402,6 +402,15 @@ def test_collect_source_failure_never_short_circuits_and_surfaces_status(
     )
     monkeypatch.setattr(collect_mod, "call_bridge_jsonrpc", mock_bridge)
     monkeypatch.setattr(collect_mod, "fetch_consensus_snapshot", mock_consensus)
+    # cmd_collect 启动即核 researchdata 调用路；本测试用桥替身，绕过探测
+    monkeypatch.setattr(
+        collect_mod,
+        "resolve_researchdata_transport",
+        create_autospec(
+            collect_mod.resolve_researchdata_transport,
+            return_value={"mode": "bridge", "call": "http://bridge.test/rpc", "error": ""},
+        ),
+    )
 
     rc = collect_mod.cmd_collect(
         argparse.Namespace(
