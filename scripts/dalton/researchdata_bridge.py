@@ -2451,6 +2451,32 @@ _NESTED_ALIAS_CONFLICT_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
 _DATE_PARAM_FIELDS: tuple[str, ...] = ("start", "end", "as_of", "vintage")
 
 
+def _bridge_today() -> str:
+    """Today as the upstream CLI checks it: this host's date or Beijing's, the later.
+
+    AlphaEngine and the internal library stamp Beijing dates, a day ahead of
+    this host's for part of every day.
+    """
+    import datetime as _dt
+    from zoneinfo import ZoneInfo
+
+    return max(_dt.date.today(), _dt.datetime.now(ZoneInfo("Asia/Shanghai")).date()).isoformat()
+
+
+def _invalid_date_error(field: str, value: Any, norm_view: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "_declared_sources": [],
+        "_sources": [],
+        "ok": False,
+        "status": "invalid_arguments",
+        "error_code": "invalid_date",
+        "error_category": "参数错误",
+        "error": f"[参数错误] {field}={value!r} 不是可识别的日期；请用 YYYY-MM-DD。",
+        "hint": f"把 {field} 改成 YYYY-MM-DD（例如 2026-09-01）后重试；月份、季度也可写成 2026-09、2026Q3。",
+        "normalized_params": norm_view,
+    }
+
+
 def _normalize_date_param(field: str, value: Any) -> str | None:
     """Coerce a caller's date to the YYYY-MM-DD the upstream CLI parses.
 
@@ -2624,26 +2650,43 @@ def _normalize_and_validate_call_args(
             coerced = _normalize_date_param(date_k, raw_date)
             if coerced is None:
                 norm_view = _build_normalized_params_view(normalized, is_community=is_comm)
-                err = {
-                    "_declared_sources": [],
-                    "_sources": [],
-                    "ok": False,
-                    "status": "invalid_arguments",
-                    "error_code": "invalid_date",
-                    "error_category": "参数错误",
-                    "error": f"[参数错误] {date_k}={raw_date!r} 不是可识别的日期；请用 YYYY-MM-DD。",
-                    "hint": f"把 {date_k} 改成 YYYY-MM-DD（例如 2026-09-01）后重试；月份、季度也可写成 2026-09、2026Q3。",
-                    "normalized_params": norm_view,
-                }
-                return normalized, norm_view, err
+                return normalized, norm_view, _invalid_date_error(date_k, raw_date, norm_view)
             normalized[date_k] = coerced
+        # The upstream CLI refuses a date after its today (_bridge_today). An
+        # end is "up to now", so it stops there; a start after it has nothing
+        # to find.
+        today = _bridge_today()
+        for date_k in ("end", "as_of", "vintage"):
+            if isinstance(normalized.get(date_k), str) and normalized[date_k] > today:
+                normalized[date_k] = today
+        params_obj = normalized.get("params")
+        if isinstance(params_obj, dict):
+            params_obj = dict(params_obj)
+            for nested_k in ("start", "date_from", "end", "date_to"):
+                if params_obj.get(nested_k) is None:
+                    continue
+                as_field = "start" if nested_k in ("start", "date_from") else "end"
+                coerced = _normalize_date_param(as_field, params_obj[nested_k])
+                if coerced is None:
+                    norm_view = _build_normalized_params_view(normalized, is_community=is_comm)
+                    return normalized, norm_view, _invalid_date_error(f"params.{nested_k}", params_obj[nested_k], norm_view)
+                params_obj[nested_k] = min(coerced, today) if as_field == "end" else coerced
+            normalized["params"] = params_obj
+        for start_k, start_v in (("start", normalized.get("start")),) + tuple(
+            (f"params.{k}", params_obj.get(k)) for k in ("start", "date_from") if isinstance(params_obj, dict)
+        ):
+            if isinstance(start_v, str) and start_v > today:
+                norm_view = _build_normalized_params_view(normalized, is_community=is_comm)
+                err = _invalid_date_error(start_k, start_v, norm_view)
+                err["error"] = f"[参数错误] {start_k}={start_v!r} 晚于今天（{today}），没有可查的数据。"
+                return normalized, norm_view, err
         # AlphaEngine takes a date window only as a pair; one end alone is
         # refused upstream, so close it: up to today, or a year back.
         if route == "alphaengine" and (normalized.get("start") is None) != (normalized.get("end") is None):
             import datetime as _dt
 
             if normalized.get("end") is None:
-                normalized["end"] = max(_dt.date.today().isoformat(), normalized["start"])
+                normalized["end"] = max(today, normalized["start"])
             else:
                 end_day = _dt.date.fromisoformat(normalized["end"])
                 normalized["start"] = (end_day - _dt.timedelta(days=365)).isoformat()

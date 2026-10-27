@@ -71,3 +71,45 @@ def test_upstream_argument_codes_are_parameter_errors():
         "alphaengine", "search_library", {"ok": False, "error": "E_BAD_DATE_RANGE: date_from 和 date_to 必须成对提供"}
     )
     assert category == "参数错误"
+
+
+def test_an_end_after_the_hosts_today_stops_at_today(monkeypatch):
+    # The agent's today (UTC / Asia/Shanghai) is a day ahead of this host's in
+    # the US evening; the CLI refuses any date after its own today.
+    monkeypatch.setattr(rb, "_bridge_today", lambda: "2026-10-26")
+    normalized, _, err = rb._normalize_and_validate_call_args(
+        "research", {"route": "transcript", "ticker": "NVDA", "start": "2026-10-01", "end": "2026-10-27"}
+    )
+    assert err is None
+    assert normalized["end"] == "2026-10-26"
+
+    normalized, _, err = rb._normalize_and_validate_call_args(
+        "research", {"route": "alphaengine", "query": "英伟达", "start": "2026-10-01"}
+    )
+    assert err is None
+    assert normalized["end"] == "2026-10-26"
+
+
+def test_a_start_after_today_is_a_parameter_error(monkeypatch):
+    monkeypatch.setattr(rb, "_bridge_today", lambda: "2026-10-26")
+    _, _, err = rb._normalize_and_validate_call_args(
+        "research", {"route": "transcript", "ticker": "NVDA", "start": "2026-10-27"}
+    )
+    assert err is not None and err["error"].startswith("[参数错误]")
+    assert "晚于今天" in err["error"]
+
+
+def test_nested_alphaengine_dates_are_normalized(monkeypatch):
+    monkeypatch.setattr(rb, "_bridge_today", lambda: "2026-10-26")
+    normalized, _, err = rb._normalize_and_validate_call_args(
+        "research",
+        {"route": "alphaengine", "query": "英伟达", "params": {"date_from": "2026-09", "date_to": "2026-10-27T08:00:00"}},
+    )
+    assert err is None
+    assert normalized["params"]["date_from"] == "2026-09-01"
+    assert normalized["params"]["date_to"] == "2026-10-26"
+
+    _, _, err = rb._normalize_and_validate_call_args(
+        "research", {"route": "alphaengine", "query": "英伟达", "params": {"date_from": "soon"}}
+    )
+    assert err is not None and err["error"].startswith("[参数错误]")
