@@ -436,10 +436,11 @@ def test_shipped_manifest_walks_separate_credential_providers_alone(provider):
     ("provider", "walk"),
     [
         ("z-ai", ["z-ai", "z-ai-cn", "z-ai-coding"]),
-        ("z-ai-coding", ["z-ai-coding", "z-ai", "z-ai-cn"]),
-        ("z-ai-cn-coding", ["z-ai-cn-coding", "z-ai-cn"]),
+        # DALTON-HOOK(team-credentials): coding_plan variants only accept their own slug key
+        ("z-ai-coding", ["z-ai-coding"]),
+        ("z-ai-cn-coding", ["z-ai-cn-coding"]),
         ("volcengine", ["volcengine", "doubao-coding"]),
-        ("doubao-coding", ["doubao-coding", "volcengine"]),
+        ("doubao-coding", ["doubao-coding"]),
         ("openrouter", ["openrouter", "deepinfra"]),
     ],
 )

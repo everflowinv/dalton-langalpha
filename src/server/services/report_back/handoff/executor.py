@@ -171,8 +171,14 @@ async def analyst_report_verdict(cache, job: dict) -> OwedAnalystReport | NotOwe
         )
     # Already terminal-cleared (duplicate completion event, or a reclaimed job
     # whose summary turn already finished and watch-cleared): nothing to do.
+    # DALTON-HOOK(handoff-keep-on-resumable): log NotOwed exits at INFO
     if not await cache.client.sismember(watch_key(dispatcher_thread_id), ptc_thread_id):
-        return NotOwed("its pair was already cleared", wake=False)
+        return _not_owed(
+            "its pair was already cleared",
+            dispatcher_thread_id=dispatcher_thread_id,
+            ptc_thread_id=ptc_thread_id,
+            dispatch_gen=effective_gen,
+        )
     run_id = job.get("run_id")
     return OwedAnalystReport(
         origin=origin,

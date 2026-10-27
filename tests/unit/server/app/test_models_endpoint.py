@@ -239,5 +239,7 @@ class TestListModelsResponse:
         assert kinds["claude-opus-5-5"] == "anthropic"
         assert kinds["gpt-6-astra"] == "openai"
         # The subscription twins serve it as their key routes do.
-        assert kinds["claude-opus-5-5-oauth"] == "anthropic"
+        # DALTON-HOOK(native-compaction-lines): claude-oauth keeps native compaction off (product decision 6)
+        assert metadata["claude-opus-5-5-oauth"]["provider"] == "claude-oauth"
+        assert kinds.get("claude-opus-5-5-oauth") is None
         assert kinds["gpt-6-luna-oauth"] == "openai"
