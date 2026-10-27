@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
-from unittest.mock import create_autospec
+from unittest.mock import create_autospec, patch
 
 import pytest
 
+from mcp_servers._browser import fetch_fast
 from src.tools.web.inhouse.backend import CrawlOutput
-from src.tools.web.inhouse.content_router import ContentRouter
+from src.tools.web.inhouse.content_router import ContentRouter, get_extractor_registry
 from src.tools.web.inhouse.extractors.pdf import PdfExtractor, _MAX_PDF_SIZE
-from src.tools.web.inhouse.scrapling_crawler import _binary_payload
+from src.tools.web.inhouse.scrapling_crawler import ScraplingCrawler, _binary_payload
+from src.tools.web.inhouse.safe_wrapper import SafeCrawlerWrapper
+from src.tools.web.breaker import CircuitBreaker
 
 
 class _FakePage:
@@ -35,17 +38,19 @@ def _pdf_extractor_double(markdown: str = "PDF text") -> PdfExtractor:
 
 
 def _router_with(fallback_output: CrawlOutput, pdf_extractor: PdfExtractor | None):
-    from unittest.mock import patch
-
     router = ContentRouter()
-    fallback = create_autospec(router._fallback, instance=True)
+    fallback = create_autospec(ScraplingCrawler, instance=True)
     fallback.crawl_with_metadata.return_value = fallback_output
     fallback.shutdown.return_value = None
     router._fallback = fallback
     registry = {"pdf": pdf_extractor} if pdf_extractor is not None else {}
-    return router, fallback, patch(
-        "src.tools.web.inhouse.content_router.get_extractor_registry",
-        return_value=registry,
+    return (
+        router,
+        fallback,
+        patch(
+            "src.tools.web.inhouse.content_router.get_extractor_registry",
+            new=create_autospec(get_extractor_registry, return_value=registry),
+        ),
     )
 
 
@@ -119,9 +124,7 @@ class TestRouterBinaryDispatch:
 
         assert "该链接是图片（image/jpeg）" in result.markdown
         assert "https://final.example.com/photo.jpg" in result.markdown
-        assert "\xff\xd8" not in result.markdown.encode("utf-8", errors="ignore").decode(
-            "latin-1", errors="ignore"
-        )
+        assert "\ufffd" not in result.markdown
 
     @pytest.mark.asyncio
     async def test_plain_html_page_costs_exactly_one_fallback_fetch(self):
@@ -138,6 +141,68 @@ class TestRouterBinaryDispatch:
         assert result.markdown == "Example content"
         fallback.crawl_with_metadata.assert_awaited_once()
         assert fallback.crawl_with_metadata.await_count == 1
+
+
+class TestTier1SniffsBeforeEscalation:
+    """Binary detection runs before any `_needs_browser` escalation logic."""
+
+    async def _crawl(self, monkeypatch: pytest.MonkeyPatch, page: _FakePage, status: int):
+        fetch_spec = create_autospec(
+            fetch_fast,
+            return_value=(page, "body-not-used-when-binary", status),
+        )
+        tier2_spec = create_autospec(ScraplingCrawler._tier2_fetch)
+        monkeypatch.setattr("src.tools.web.inhouse.scrapling_crawler.fetch_fast", fetch_spec)
+        monkeypatch.setattr(ScraplingCrawler, "_tier2_fetch", tier2_spec)
+        crawler = ScraplingCrawler()
+        return await crawler.crawl_with_metadata("https://example.com/redirect"), tier2_spec
+
+    @pytest.mark.asyncio
+    async def test_short_png_does_not_reach_the_browser(self, monkeypatch: pytest.MonkeyPatch):
+        """A <200-byte PNG would read as an empty page and escalate; the sniff returns first."""
+        body = b"\x89PNG\r\n\x1a\n" + b"x" * 20  # 30 bytes < 200
+        page = _FakePage(body, content_type="text/html")
+        result, tier2_spec = await self._crawl(monkeypatch, page, 200)
+
+        assert result.binary_mime == "image/png"
+        assert result.content_bytes == body
+        tier2_spec.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_4xx_pdf_bytes_do_not_reach_the_browser(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A PDF body behind a 4xx redirect routes to extraction, not to Tier 2/3."""
+        page = _FakePage(b"%PDF-1.4 fake bytes")
+        result, tier2_spec = await self._crawl(monkeypatch, page, 403)
+
+        assert result.binary_mime == "application/pdf"
+        assert result.status == 403
+        tier2_spec.assert_not_awaited()
+
+
+class TestSafeWrapperBinaryNotice:
+    @pytest.mark.asyncio
+    async def test_binary_payload_is_a_success_with_a_notice_not_a_breaker_failure(self):
+        """Backend without ContentRouter: explicit message, no empty_content, no failure counted."""
+        wrapper = SafeCrawlerWrapper()
+        host_breaker = create_autospec(CircuitBreaker, instance=True)
+        output = CrawlOutput(
+            title="",
+            html="",
+            markdown="",
+            status=200,
+            binary_mime="application/pdf",
+            content_bytes=b"%PDF-1.4",
+            final_url="https://final.example.com/doc.pdf",
+        )
+        result = await wrapper._classify_output(output, host_breaker, "final.example.com")
+
+        assert result.success is True
+        assert "该链接是 PDF（application/pdf）" in (result.markdown or "")
+        assert "当前抓取后端不提取二进制内容" in (result.markdown or "")
+        host_breaker.record_failure.assert_not_awaited()
+        host_breaker.record_success.assert_awaited_once()
 
 
 class TestPdfExtractBytesFailures:

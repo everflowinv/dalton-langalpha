@@ -77,9 +77,12 @@ _UNTRUSTED_WRAPPER_RE = re.compile(
     re.DOTALL,
 )
 
-# Broker wording for "the search model returned nothing" — the empty-generation
-# class keys off the message because the error code is a generic PROVIDER_ERROR.
-_EMPTY_GENERATION_RE = re.compile(r"no final answer|empty (?:model )?(?:answer|response)", re.IGNORECASE)
+# Broker wording observed in production for "the search model returned
+# nothing". Deliberately narrow: only this phrase and explicit empty-generation
+# error codes classify as empty generation — a broader "empty response" match
+# would misread a genuinely broken bridge as a soft model failure.
+_EMPTY_GENERATION_RE = re.compile(r"no final answer", re.IGNORECASE)
+_EMPTY_GENERATION_CODES = frozenset({"empty_generation", "no_final_answer"})
 
 
 class OpenClawSearchBridgeUnavailableError(RuntimeError):
@@ -222,7 +225,9 @@ def _raise_for_bridge_error_payload(
     # and broker did their jobs, so this must NOT fall into the
     # bridge-unavailable bucket below, which reads as "the search bridge is
     # down" and invites troubleshooting instead of one retry with a rephrase.
-    if raw_message and _EMPTY_GENERATION_RE.search(raw_message):
+    if code.lower() in _EMPTY_GENERATION_CODES or (
+        raw_message and _EMPTY_GENERATION_RE.search(raw_message)
+    ):
         raise OpenClawSearchEmptyGenerationError(EMPTY_GENERATION_MESSAGE)
 
     # A broker-side INVALID_JSON arrives as 5xx: that is the bridge failing, not a bad request.

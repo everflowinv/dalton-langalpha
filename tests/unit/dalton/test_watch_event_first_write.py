@@ -45,6 +45,15 @@ def _latest_row(version_no: int, events: list[dict]) -> dict:
     }
 
 
+_EXISTING_EVENT = {
+    "id": "W1",
+    "type": "earnings",
+    "date": "2026-11-18",
+    "date_status": "estimated",
+    "note": "FY27Q1 财报",
+}
+
+
 @pytest.fixture
 def access_allowed(monkeypatch: pytest.MonkeyPatch):
     spec = create_autospec(verify_workspace_access, return_value=None)
@@ -61,18 +70,20 @@ async def test_first_write_creates_schema_valid_agenda(
     """No agenda yet: one apply_update with a create op whose document passes the agenda schema."""
     captured: list[dict] = []
 
-    async def fake_apply_update(*, ops, base_version, **kwargs):
+    def _capture_and_ok(*, ops, base_version, **kwargs):
         captured.append({"ops": ops, "base_version": base_version})
-        # Run the real op pipeline so schema validity is proven, not assumed.
-        doc, _ = apply_ops("agenda", None, ops, reason="test")
-        val = validate_update("agenda", None, doc, source="tool", reason="test")
-        assert val.ok, val.format_problems()
         return {"ok": True, "doc": "agenda", "version_no": 1}
 
-    monkeypatch.setattr(db_knowledge, "latest_version", create_autospec(
-        db_knowledge.latest_version, return_value=None
-    ))
-    monkeypatch.setattr(knowledge_service, "apply_update", fake_apply_update)
+    monkeypatch.setattr(
+        db_knowledge,
+        "latest_version",
+        create_autospec(db_knowledge.latest_version, return_value=None),
+    )
+    monkeypatch.setattr(
+        knowledge_service,
+        "apply_update",
+        create_autospec(knowledge_service.apply_update, side_effect=_capture_and_ok),
+    )
 
     tool, coro = _invoke()
     res = json.loads(await coro)
@@ -85,6 +96,10 @@ async def test_first_write_creates_schema_valid_agenda(
     create_ops = [op for op in captured[0]["ops"] if op["op"] == "create"]
     assert len(create_ops) == 1
     assert create_ops[0]["value"]["watch"]["events"][0]["id"] == "W1"
+    # Schema validity proven on the real pipeline, not assumed.
+    doc, _ = apply_ops("agenda", None, captured[0]["ops"], reason="test")
+    val = validate_update("agenda", None, doc, source="tool", reason="test")
+    assert val.ok, val.format_problems()
 
 
 @pytest.mark.asyncio
@@ -92,47 +107,34 @@ async def test_concurrent_first_write_retries_once_as_upsert(
     monkeypatch: pytest.MonkeyPatch, access_allowed
 ):
     """A losing concurrent first write re-reads the new latest and retries as a plain upsert."""
-
-    async def fake_latest(workspace_id, doc_key):
-        if fake_latest.calls == 0:
-            fake_latest.calls += 1
-            return None
-        fake_latest.calls += 1
-        return _latest_row(
-            1,
-            [
-                {
-                    "id": "W1",
-                    "type": "earnings",
-                    "date": "2026-11-18",
-                    "date_status": "estimated",
-                    "note": "FY27Q1 财报",
-                }
-            ],
-        )
-
-    fake_latest.calls = 0
-
-    calls: list[dict] = []
-
-    async def fake_apply_update(*, ops, base_version, **kwargs):
-        calls.append({"ops": ops, "base_version": base_version})
-        if len(calls) == 1:
-            return {"ok": False, "error": "version_conflict", "latest_version": 1}
-        return {"ok": True, "doc": "agenda", "version_no": 2}
-
-    monkeypatch.setattr(db_knowledge, "latest_version", fake_latest)
-    monkeypatch.setattr(knowledge_service, "apply_update", fake_apply_update)
+    monkeypatch.setattr(
+        db_knowledge,
+        "latest_version",
+        create_autospec(
+            db_knowledge.latest_version,
+            side_effect=[None, _latest_row(1, [_EXISTING_EVENT])],
+        ),
+    )
+    apply_spec = create_autospec(
+        knowledge_service.apply_update,
+        side_effect=[
+            {"ok": False, "error": "version_conflict", "latest_version": 1},
+            {"ok": True, "doc": "agenda", "version_no": 2},
+        ],
+    )
+    monkeypatch.setattr(knowledge_service, "apply_update", apply_spec)
 
     tool, coro = _invoke()
     res = json.loads(await coro)
 
     assert res["ok"] is True
     assert res["action"] == "updated"
-    assert len(calls) == 2
-    assert calls[0]["ops"][0]["op"] == "create"
-    assert calls[1]["ops"][0]["op"] == "upsert_item"
-    assert calls[1]["base_version"] == 1
+    assert apply_spec.await_count == 2
+    first_ops = apply_spec.await_args_list[0].kwargs["ops"]
+    second_ops = apply_spec.await_args_list[1].kwargs["ops"]
+    assert first_ops[0]["op"] == "create"
+    assert second_ops[0]["op"] == "upsert_item"
+    assert apply_spec.await_args_list[1].kwargs["base_version"] == 1
 
 
 @pytest.mark.asyncio
@@ -140,18 +142,20 @@ async def test_persistent_conflict_is_returned_as_is(
     monkeypatch: pytest.MonkeyPatch, access_allowed
 ):
     """Both attempts conflict: the second conflict comes back untouched (no third try)."""
-
-    async def fake_latest(workspace_id, doc_key):
-        return _latest_row(
-            1,
-            [{"id": "W1", "type": "earnings", "date": None, "date_status": "unknown"}],
-        )
-
+    monkeypatch.setattr(
+        db_knowledge,
+        "latest_version",
+        create_autospec(
+            db_knowledge.latest_version,
+            return_value=_latest_row(
+                1, [{"id": "W1", "type": "earnings", "date": None, "date_status": "unknown"}]
+            ),
+        ),
+    )
     apply_spec = create_autospec(
         knowledge_service.apply_update,
         return_value={"ok": False, "error": "version_conflict", "latest_version": 2},
     )
-    monkeypatch.setattr(db_knowledge, "latest_version", fake_latest)
     monkeypatch.setattr(knowledge_service, "apply_update", apply_spec)
 
     tool, coro = _invoke(date="2026-12-02")
@@ -167,20 +171,9 @@ async def test_existing_agenda_keeps_upsert_shape(
     monkeypatch: pytest.MonkeyPatch, access_allowed
 ):
     """Agenda present: one plain upsert against the read version, decorated as before."""
-
-    existing = _latest_row(
-        4,
-        [
-            {
-                "id": "W1",
-                "type": "earnings",
-                "date": "2026-11-18",
-                "date_status": "estimated",
-                "note": "FY27Q1 财报",
-            }
-        ],
+    latest_spec = create_autospec(
+        db_knowledge.latest_version, return_value=_latest_row(4, [_EXISTING_EVENT])
     )
-    latest_spec = create_autospec(db_knowledge.latest_version, return_value=existing)
     apply_spec = create_autospec(
         knowledge_service.apply_update,
         return_value={"ok": True, "doc": "agenda", "version_no": 5},

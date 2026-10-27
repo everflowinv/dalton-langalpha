@@ -77,6 +77,25 @@ class TestEmptyGenerationClassification:
                 }
             )
 
+    def test_generic_empty_response_wording_is_not_empty_generation(self):
+        """Only the known "no final answer" wording (or an explicit code)
+        classifies; a broader "empty response" message stays a bridge error."""
+        with pytest.raises(OpenClawSearchBridgeUnavailableError):
+            _raise_for_bridge_error_payload(
+                {
+                    "error": {
+                        "code": "PROVIDER_ERROR",
+                        "message": "provider returned an empty response",
+                    }
+                }
+            )
+
+    def test_explicit_empty_generation_code_classifies(self):
+        with pytest.raises(OpenClawSearchEmptyGenerationError):
+            _raise_for_bridge_error_payload(
+                {"error": {"code": "no_final_answer", "message": ""}}
+            )
+
     @pytest.mark.asyncio
     async def test_tool_retries_once_then_succeeds(self):
         wrapper = create_autospec(OpenClawSearchWrapper, instance=True)
@@ -123,11 +142,16 @@ class TestGroundingRedirectResolution:
         assert not is_grounding_redirect("https://vertexaisearch.cloud.google.com/other")
 
     @pytest.mark.asyncio
-    async def test_resolved_url_replaces_redirect_link(self):
+    async def test_source_url_returned_without_requesting_the_source(self):
+        """The Location off the grounding host IS the answer: the source is
+        never fetched, so a source that would 403 cannot fail the resolution."""
+        source_requests = []
+
         def handler(request: httpx.Request) -> httpx.Response:
-            if request.url.host == GROUNDING_REDIRECT_HOST:
-                return httpx.Response(302, headers={"location": SOURCE_URL})
-            return httpx.Response(200)
+            if request.url.host != GROUNDING_REDIRECT_HOST:
+                source_requests.append(str(request.url))
+                return httpx.Response(403)
+            return httpx.Response(302, headers={"location": SOURCE_URL})
 
         rows = [{"type": "page", "title": "Reuters", "url": GROUNDING_URL, "content": ""}]
         cards = [{"title": "Reuters", "url": GROUNDING_URL, "favicon": "", "snippet": ""}]
@@ -138,6 +162,50 @@ class TestGroundingRedirectResolution:
         assert rows[0]["redirect_url"] == GROUNDING_URL
         assert "url_unresolved" not in rows[0]
         assert cards[0]["url"] == SOURCE_URL
+        assert source_requests == []
+
+    @pytest.mark.asyncio
+    async def test_chain_through_second_grounding_hop(self):
+        second_hop = f"https://{GROUNDING_REDIRECT_HOST}/grounding-api-redirect/stage2"
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("stage2"):
+                return httpx.Response(302, headers={"location": SOURCE_URL})
+            return httpx.Response(302, headers={"location": second_hop})
+
+        rows = [{"type": "page", "title": "Reuters", "url": GROUNDING_URL, "content": ""}]
+        await resolve_grounding_redirects(rows, [], transport=_mock_transport(handler))
+        assert rows[0]["url"] == SOURCE_URL
+        assert rows[0]["redirect_url"] == GROUNDING_URL
+
+    @pytest.mark.asyncio
+    async def test_one_never_ending_resolution_does_not_hold_the_batch(self):
+        """A resolution that never lands is dropped at the batch deadline; the
+        rest of the results still come back in time."""
+        never_lands = asyncio.Event()
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("2"):
+                return httpx.Response(302, headers={"location": SOURCE_URL})
+            await never_lands.wait()
+            return httpx.Response(302, headers={"location": SOURCE_URL})
+
+        rows = [
+            {"type": "page", "title": "A", "url": GROUNDING_URL, "content": ""},
+            {"type": "page", "title": "B", "url": GROUNDING_URL + "2", "content": ""},
+        ]
+        loop = asyncio.get_event_loop()
+        started = loop.time()
+        await resolve_grounding_redirects(
+            rows, [], timeout_s=0.3, transport=_mock_transport(handler)
+        )
+        elapsed = loop.time() - started
+        never_lands.set()
+
+        assert elapsed < 2.0
+        assert rows[0]["url_unresolved"] is True
+        assert rows[0]["url"] == GROUNDING_URL
+        assert rows[1]["url"] == SOURCE_URL
 
     @pytest.mark.asyncio
     async def test_timeout_keeps_original_link_and_marks_unresolved(self):

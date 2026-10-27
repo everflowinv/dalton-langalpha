@@ -215,6 +215,17 @@ class ScraplingCrawler:
         try:
             page, html_body, status = await self._tier1_fetch(url)
 
+            # DALTON-HOOK(fetch-binary-route): sniff the payload BEFORE any
+            # escalation logic — a short or error-status binary body (a
+            # <200-byte PNG, a PDF behind a 4xx redirect) would otherwise be
+            # read as "blocked/empty page" and re-requested through two
+            # browsers before coming back as mojibake.
+            binary = _binary_payload(page)
+            if binary is not None:
+                mime, raw = binary
+                logger.debug(f"Tier 1 binary payload ({mime}) for {url}")
+                return _binary_output(url, page, mime, raw, status)
+
             # Hard blocks — host permanently rejects scrapers. Skip Tier 2/3
             # entirely. Each blocked-host call burns one curl_cffi call instead
             # of spawning two browsers to confirm the same "no".
@@ -237,13 +248,6 @@ class ScraplingCrawler:
                     failure_kind="rate_limited",
                 )
             if not _needs_browser(html_body, status):
-                # DALTON-HOOK(fetch-binary-route): an extension-less redirect that
-                # lands on a PDF/image must not reach the model as decoded bytes.
-                binary = _binary_payload(page)
-                if binary is not None:
-                    mime, raw = binary
-                    logger.debug(f"Tier 1 binary payload ({mime}) for {url}")
-                    return _binary_output(url, page, mime, raw, status)
                 title = _extract_title(page)
                 markdown = await asyncio.to_thread(_html_to_markdown, html_body)
                 logger.debug(f"Tier 1 (fast) succeeded for {url}")

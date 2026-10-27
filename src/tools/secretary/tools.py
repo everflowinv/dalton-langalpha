@@ -136,40 +136,98 @@ async def _folder_ready_result(
 
     A new row owns a folder name but no folder until the machine's next
     acquisition builds it, which left the Chief of Staff copying hand-off
-    files into a directory that did not exist yet. When the machine is
-    already running, a warm acquire through the ordinary attach path creates
-    the folder now; otherwise the result says so and points the hand-off at
-    Home. Any failure along the way degrades to ``folder_ready: False`` —
-    the create itself already succeeded and must not fail with it.
+    files into a directory that did not exist yet.
+
+    ``folder_path`` is always answered, from the binding alone — the same
+    ``root_dir``/``dir_name`` the bring-up's ``_ensure_workspace_dirs`` builds
+    the folder from (``PTCSandbox._ensure_workspace_dirs`` →
+    ``WorkspaceLayout.setup_dirs[0]`` = ``workspace_root(root, dir_name)``),
+    so a folder created here is the folder the machine's own attach would
+    create. No sandbox and no acquire is involved in computing it.
+
+    The folder is created only when the new workspace lives on THIS turn's
+    Home computer and this worker holds the turn's session for it (process
+    memory is execution context; the CoS turn runs here, so its session is in
+    this cache and no acquire/lock/attach is triggered). Even then ``mkdir``
+    and a separate ``test -d`` must both succeed before ``folder_ready`` is
+    true — a swallowed mkdir failure never reports ready. Every other case
+    (different computer, machine not running, no session, failed mkdir or
+    verify) answers ``folder_ready: False`` with the hint; the create itself
+    already succeeded and must never fail with it.
     """
     workspace_id = str(workspace.get("workspace_id") or "")
     dir_name = str(workspace.get("dir_name") or "").strip()
     computer_id = str(workspace.get("computer_id") or "").strip()
-    try:
-        from src.server.database.computer import get_computer
 
-        computer = await get_computer(computer_id) if computer_id else None
-        running = bool(computer) and str((computer or {}).get("status") or "") == "running"
-    except Exception as e:
-        logger.warning(f"Could not read computer status for {workspace_id}: {e}")
-        running = False
-    if not running or not dir_name:
-        return {"folder_ready": False, "folder_hint": _FOLDER_NOT_READY_HINT}
+    folder_path: str | None = None
     try:
-        # Reuses the standing acquire path: its project attach creates the
-        # folder (ComputerManager._ensure_workspace_dirs), so no ad-hoc mkdir.
-        await manager.get_session_for_workspace(workspace_id, user_id=user_id)
-        binding = await manager.resolve_binding(workspace_id)
-        root = str(getattr(binding, "root_dir", None) or "").rstrip("/")
-        folder = str(getattr(binding, "dir_name", None) or dir_name)
-        if not root or not folder:
-            return {"folder_ready": False, "folder_hint": _FOLDER_NOT_READY_HINT}
-        return {"folder_ready": True, "folder_path": f"{root}/{folder}"}
+        root = str(getattr(await manager.resolve_binding(workspace_id), "root_dir", None) or "").rstrip("/")
+        if root and dir_name:
+            folder_path = f"{root}/{dir_name}"
     except Exception as e:
-        logger.warning(
-            f"Could not prepare the folder for workspace {workspace_id}: {e}"
+        logger.warning(f"Could not resolve the folder path for {workspace_id}: {e}")
+    if folder_path is None and dir_name:
+        # Same math the file routes fall back to when the row names no root.
+        try:
+            from src.server.app.workspace_files._shared import work_dir_for
+
+            folder_path = work_dir_for(workspace, manager=manager)
+        except Exception as e:
+            logger.warning(f"Could not compute the folder path for {workspace_id}: {e}")
+
+    result: dict = {"folder_ready": False, "folder_hint": _FOLDER_NOT_READY_HINT}
+    if folder_path:
+        result["folder_path"] = folder_path
+
+    if not (folder_path and dir_name and computer_id):
+        return result
+
+    try:
+        from src.server.database.home_workspace import get_home_workspace_id
+        from src.server.database.workspace import get_workspace as _get_workspace
+
+        home = await _get_workspace(get_home_workspace_id(user_id))
+        home_computer_id = str((home or {}).get("computer_id") or "")
+    except Exception as e:
+        logger.warning(f"Could not read Home's computer for user {user_id}: {e}")
+        return result
+    if home_computer_id != computer_id:
+        return result
+
+    # This worker's live session for the Home computer — a peek, never an
+    # acquire: a machine with no cached session here is not running this turn.
+    session = manager._cached_session(computer_id)
+    sandbox = getattr(session, "sandbox", None) if session is not None else None
+    if sandbox is None:
+        return result
+
+    import shlex
+
+    def _exit_code(res: Any) -> int:
+        try:
+            return int((res or {}).get("exit_code"))
+        except (TypeError, ValueError):
+            return 1
+
+    quoted = shlex.quote(folder_path)
+    try:
+        made = await sandbox.execute_bash_command(
+            command=f"mkdir -p {quoted}", timeout=30
         )
-        return {"folder_ready": False, "folder_hint": _FOLDER_NOT_READY_HINT}
+        verified = await sandbox.execute_bash_command(
+            command=f"test -d {quoted}", timeout=15
+        )
+        if _exit_code(made) == 0 and _exit_code(verified) == 0:
+            return {
+                "folder_ready": True,
+                "folder_path": folder_path,
+            }
+        logger.warning(
+            f"Folder for {workspace_id} was not confirmed at {folder_path}"
+        )
+    except Exception as e:
+        logger.warning(f"Could not create the folder for {workspace_id}: {e}")
+    return result
 # --- DALTON-HOOK(workspace-folder-ready): end ---
 
 

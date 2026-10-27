@@ -8,8 +8,11 @@ from unittest.mock import create_autospec
 
 import pytest
 
+from ptc_agent.core.sandbox.ptc_sandbox import PTCSandbox
+from ptc_agent.core.session import Session
+from src.server.database.home_workspace import get_home_workspace_id
+from src.server.database.workspace import get_workspace
 from src.server.services.workspace_manager import WorkspaceManager
-from src.server.database.computer import get_computer
 from src.tools.secretary.tools import _FOLDER_CHECK_NOTE, workspaces_create
 
 USER_ID = "user-1"
@@ -21,21 +24,51 @@ ROW = {
 }
 
 
-def _manager_double() -> WorkspaceManager:
+def _sandbox_double(mkdir_code: int = 0, test_code: int = 0) -> PTCSandbox:
+    sandbox = create_autospec(PTCSandbox, instance=True)
+    sandbox.execute_bash_command.side_effect = [
+        {"exit_code": mkdir_code, "stdout": "", "stderr": ""},
+        {"exit_code": test_code, "stdout": "", "stderr": ""},
+    ]
+    return sandbox
+
+
+def _manager_double(
+    sandbox: PTCSandbox | None, *, dir_name: str = "DASH", root: str = "/w"
+) -> WorkspaceManager:
     manager = create_autospec(WorkspaceManager, instance=True)
-    manager.create_workspace.return_value = dict(ROW)
-    manager.get_session_for_workspace.return_value = None
+    manager.create_workspace.return_value = {**ROW, "dir_name": dir_name}
     manager.resolve_binding.return_value = SimpleNamespace(
-        root_dir="/workspaces", dir_name="DASH"
+        root_dir=root, dir_name=dir_name
     )
+    session = None
+    if sandbox is not None:
+        session = create_autospec(Session, instance=True)
+        session.sandbox = sandbox
+    manager._cached_session.return_value = session
     return manager
 
 
-async def _create_result(monkeypatch: pytest.MonkeyPatch, manager: WorkspaceManager):
+async def _create_result(
+    monkeypatch: pytest.MonkeyPatch,
+    manager: WorkspaceManager,
+    *,
+    home_computer_id: str = "c-1",
+):
     monkeypatch.setattr(
         WorkspaceManager,
         "get_instance",
         create_autospec(WorkspaceManager.get_instance, return_value=manager),
+    )
+    monkeypatch.setattr(
+        "src.server.database.home_workspace.get_home_workspace_id",
+        create_autospec(get_home_workspace_id, return_value="home-ws"),
+    )
+    monkeypatch.setattr(
+        "src.server.database.workspace.get_workspace",
+        create_autospec(
+            get_workspace, return_value={"workspace_id": "home-ws", "computer_id": home_computer_id}
+        ),
     )
     command = await workspaces_create(
         USER_ID, "DASH", None, "call-1", preapproved=True
@@ -44,71 +77,64 @@ async def _create_result(monkeypatch: pytest.MonkeyPatch, manager: WorkspaceMana
 
 
 @pytest.mark.asyncio
-async def test_running_computer_creates_folder_now(monkeypatch: pytest.MonkeyPatch):
-    """Machine running: the standing acquire path creates the folder and says so."""
-    manager = _manager_double()
-    monkeypatch.setattr(
-        "src.server.database.computer.get_computer",
-        create_autospec(get_computer, return_value={"computer_id": "c-1", "status": "running"}),
-    )
+async def test_same_computer_mkdir_and_verify_ready(monkeypatch: pytest.MonkeyPatch):
+    """Home's machine, live turn session: mkdir + test -d both pass -> ready."""
+    sandbox = _sandbox_double(mkdir_code=0, test_code=0)
+    manager = _manager_double(sandbox)
     payload = await _create_result(monkeypatch, manager)
 
     assert payload["success"] is True
     assert payload["folder_ready"] is True
-    assert payload["folder_path"] == "/workspaces/DASH"
+    assert payload["folder_path"] == "/w/DASH"
     assert payload["folder_note"] == _FOLDER_CHECK_NOTE
-    manager.get_session_for_workspace.assert_awaited_once_with(
-        "ws-1", user_id=USER_ID
-    )
-
-
-@pytest.mark.asyncio
-async def test_stopped_computer_reports_folder_not_ready(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    """Machine not running: no acquire, folder_ready False, hand-off pointed at Home."""
-    manager = _manager_double()
-    monkeypatch.setattr(
-        "src.server.database.computer.get_computer",
-        create_autospec(get_computer, return_value={"computer_id": "c-1", "status": "stopped"}),
-    )
-    payload = await _create_result(monkeypatch, manager)
-
-    assert payload["success"] is True
-    assert payload["folder_ready"] is False
-    assert "计算机启动后才会创建该文件夹" in payload["folder_hint"]
-    assert "Home" in payload["folder_hint"]
+    commands = [
+        call.kwargs["command"] for call in sandbox.execute_bash_command.await_args_list
+    ]
+    assert commands == ["mkdir -p /w/DASH", "test -d /w/DASH"]
+    # The whole point: no acquire, no locks, no attach.
     manager.get_session_for_workspace.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_acquire_failure_degrades_to_not_ready(monkeypatch: pytest.MonkeyPatch):
-    """A failed folder setup never fails the create that already succeeded."""
-    manager = _manager_double()
-    manager.get_session_for_workspace.side_effect = RuntimeError("sandbox gone")
-    monkeypatch.setattr(
-        "src.server.database.computer.get_computer",
-        create_autospec(get_computer, return_value={"computer_id": "c-1", "status": "running"}),
-    )
+async def test_mkdir_ok_but_verify_fails_reports_not_ready(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """mkdir exit 0 with a failed `test -d` never reports ready."""
+    sandbox = _sandbox_double(mkdir_code=0, test_code=1)
+    manager = _manager_double(sandbox)
     payload = await _create_result(monkeypatch, manager)
 
-    assert payload["success"] is True
     assert payload["folder_ready"] is False
     assert payload["folder_hint"]
+    assert payload["folder_path"] == "/w/DASH"
+    manager.get_session_for_workspace.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_status_read_failure_degrades_to_not_ready(
+async def test_different_computer_reports_not_ready_with_path(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    manager = _manager_double()
+    """The new workspace lands on another machine: path stated, never created."""
+    sandbox = _sandbox_double()
+    manager = _manager_double(sandbox)
+    payload = await _create_result(monkeypatch, manager, home_computer_id="c-other")
 
-    async def broken_get_computer(computer_id):
-        raise RuntimeError("db down")
+    assert payload["folder_ready"] is False
+    assert payload["folder_hint"]
+    assert payload["folder_path"] == "/w/DASH"
+    sandbox.execute_bash_command.assert_not_awaited()
+    manager.get_session_for_workspace.assert_not_awaited()
 
-    monkeypatch.setattr("src.server.database.computer.get_computer", broken_get_computer)
+
+@pytest.mark.asyncio
+async def test_no_live_session_reports_not_ready_with_path(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Machine without this worker's turn session (stopped): path stated, not created."""
+    manager = _manager_double(sandbox=None)
     payload = await _create_result(monkeypatch, manager)
 
-    assert payload["success"] is True
     assert payload["folder_ready"] is False
+    assert payload["folder_hint"]
+    assert payload["folder_path"] == "/w/DASH"
     manager.get_session_for_workspace.assert_not_awaited()

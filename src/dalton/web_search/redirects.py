@@ -60,11 +60,15 @@ def _hop_blocked(url: str) -> bool:
 
 
 async def _follow_hops(client: httpx.AsyncClient, url: str) -> str | None:
-    """The URL the redirect chain ends at, or None when it never lands on a page.
+    """The source URL the redirect chain hands out, or None when it never does.
 
-    Only response headers are read; each stream is closed before the body is
-    downloaded. A hop that is itself a redirect keeps the chain going, a 2xx
-    ends it, and anything else (4xx/5xx, missing Location) gives up.
+    Only the redirector is ever requested, and only response headers are read
+    (each stream is closed before the body is downloaded). The first Location
+    that points off the grounding host IS the source URL — it is returned
+    without being requested, so a source that would 403/429 a plain client
+    (news sites, IR pages, SEC) cannot fail the resolution. Every hop target
+    passes the literal SSRF check first: a Location into a private or
+    otherwise invalid address is a failed resolution, not a result.
     """
     current = url
     for _ in range(_MAX_HOPS):
@@ -72,15 +76,20 @@ async def _follow_hops(client: httpx.AsyncClient, url: str) -> str | None:
             return None
         try:
             async with client.stream("GET", current) as response:
-                if response.status_code in (301, 302, 303, 307, 308):
-                    location = response.headers.get("location")
-                    if not location:
+                if response.status_code not in (301, 302, 303, 307, 308):
+                    # The redirector answered without redirecting: no source
+                    # URL to extract.
+                    return None
+                location = response.headers.get("location")
+                if not location:
+                    return None
+                target = urljoin(current, location)
+                host = (urlparse(target).hostname or "").lower()
+                if host != GROUNDING_REDIRECT_HOST:
+                    if _hop_blocked(target):
                         return None
-                    current = urljoin(current, location)
-                    continue
-                if 200 <= response.status_code < 400:
-                    return str(response.url or current)
-                return None
+                    return target
+                current = target
         except (httpx.HTTPError, BlockedAddressError, OSError):
             return None
     return None
@@ -94,6 +103,12 @@ async def _resolve_row_url(
         return await asyncio.wait_for(_follow_hops(client, url), timeout=timeout_s)
     except (asyncio.TimeoutError, TimeoutError):
         return None
+
+
+def _reap(task: "asyncio.Task[str | None]") -> None:
+    """Read a cancelled straggler's exception so asyncio never logs it as unretrieved."""
+    if not task.cancelled():
+        task.exception()
 
 
 async def resolve_grounding_redirects(
@@ -125,13 +140,30 @@ async def resolve_grounding_redirects(
         timeout=timeout,
         headers={"User-Agent": _USER_AGENT},
     ) as client:
-        resolved = await asyncio.gather(
-            *(_resolve_row_url(client, url, timeout_s) for _, url in targets),
-            return_exceptions=True,
-        )
+        # One budget for the whole batch: DNS resolution runs in threads that
+        # a per-task `wait_for` cannot cancel, so the slowest link must not
+        # hold the search result hostage. `asyncio.wait` returns at the
+        # deadline; the stragglers are cancelled and read, not awaited.
+        tasks = {
+            asyncio.ensure_future(_resolve_row_url(client, url, timeout_s)): idx
+            for idx, url in targets
+        }
+        done, pending = await asyncio.wait(tasks, timeout=timeout_s)
+        for task in pending:
+            task.cancel()
+            task.add_done_callback(_reap)
+        resolved_by_idx = {
+            tasks[task]: (
+                task.result()
+                if task in done and not task.cancelled() and task.exception() is None
+                else None
+            )
+            for task in tasks
+        }
     failed = 0
-    for (idx, original), source in zip(targets, resolved):
+    for idx, original in targets:
         row = results[idx]
+        source = resolved_by_idx.get(idx)
         if not isinstance(source, str) or not source.strip() or source == original:
             row["url_unresolved"] = True
             failed += 1
