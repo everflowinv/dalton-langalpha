@@ -36,7 +36,7 @@ except ModuleNotFoundError:  # imported as a package module (tests)
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Literal  # DALTON-HOOK(market-data-fallback)
 
 import httpx
@@ -395,59 +395,74 @@ _YF_COMPUTED_RATIOS: tuple[tuple[str, str], ...] = (
 )
 
 
-def _yf_month_of(raw: Any) -> int | None:
-    """Month (1-12) of a Yahoo date field; None for anything unusable."""
+def _yf_date_of(raw: Any) -> date | None:
+    """Date of a Yahoo date field; None for anything unusable."""
     if isinstance(raw, bool):
         return None
     if isinstance(raw, (int, float)):
         try:
-            return datetime.fromtimestamp(float(raw), tz=timezone.utc).month
+            return datetime.fromtimestamp(float(raw), tz=timezone.utc).date()
         except (OverflowError, OSError, ValueError):
             return None
     if isinstance(raw, datetime):
-        return raw.month
+        return raw.date()
     if isinstance(raw, str):
         try:
-            return datetime.strptime(raw.strip()[:10], "%Y-%m-%d").month
+            return datetime.strptime(raw.strip()[:10], "%Y-%m-%d").date()
         except ValueError:
             return None
     return None
 
 
-def _yf_fiscal_year_end_month(info: Any) -> int | None:
-    """The issuer's fiscal-year end month, from Yahoo quote metadata.
+def _yf_month_end(d: date) -> bool:
+    """Whether *d* is the last day of its calendar month."""
+    return (d + timedelta(days=1)).day == 1
+
+
+def _yf_fiscal_year_end(info: Any) -> date | None:
+    """The issuer's fiscal-year end date, from Yahoo quote metadata.
 
     ``lastFiscalYearEnd`` is an epoch-seconds timestamp (there is no string
-    month field in the live payload); its month is the fiscal year end month,
-    stable across years for an issuer. Unknown stays ``None`` rather than
+    month field in the live payload); its date is a fiscal year end of this
+    issuer, stable in month across years. Unknown stays ``None`` rather than
     guessed as December.
+
+    DALTON-HOOK(market-data-fallback): the full date, not just its month — a
+    52/53-week calendar announces itself here (an end like 2026-01-30 never
+    falls on a month-end), and month arithmetic would mislabel its quarters.
     """
     if not isinstance(info, dict):
         return None
     for key in ("lastFiscalYearEnd", "fiscalYearEnd"):
-        month = _yf_month_of(info.get(key))
-        if month:
-            return month
+        fye = _yf_date_of(info.get(key))
+        if fye is not None:
+            return fye
     return None
 
 
 def _yf_fiscal_period(
-    date_str: str, period: str, fy_end_month: int | None
+    date_str: str, period: str, fy_end_date: date | None
 ) -> tuple[str | None, str | None]:
     """(period label, fiscalYear) for a statement column, on the issuer's fiscal calendar.
 
     Quarters are counted from the month after the fiscal year end (June-end
     MSFT: Jul-Sep is Q1) and the fiscal year is named for the calendar year it
-    ends in (a 2025-09-30 column is FY2026). Without the fiscal year end month
+    ends in (a 2025-09-30 column is FY2026). Without the fiscal year end date
     both are ``None`` — a calendar-year-shaped guess would silently misjoin
-    against FMP rows, which carry true fiscal labels.
+    against FMP rows, which carry true fiscal labels. A 52/53-week fiscal
+    calendar is also ``None`` on both: its year end and quarter ends drift
+    against the calendar months (a 2026-05-01 quarter reads as Q2 by month
+    where the issuer calls it Q1), so the month arithmetic does not apply.
     """
-    if fy_end_month is None:
+    if fy_end_date is None:
         return None, None
     try:
-        end = datetime.strptime(date_str[:10], "%Y-%m-%d")
+        end = datetime.strptime(date_str[:10], "%Y-%m-%d").date()
     except ValueError:
         return None, None
+    if not _yf_month_end(fy_end_date) or not _yf_month_end(end):
+        return None, None
+    fy_end_month = fy_end_date.month
     if period != "quarter":
         return "FY", str(end.year)
     fiscal_year = end.year + 1 if end.month > fy_end_month else end.year
@@ -463,7 +478,7 @@ def _yf_serialize_statement(
     currency: str | None = None,
     period: str = "annual",
     limit: int | None = None,
-    fy_end_month: int | None = None,
+    fy_end_date: date | None = None,
 ) -> list[dict[str, Any]]:
     if df is None or df.empty:
         return []
@@ -481,7 +496,7 @@ def _yf_serialize_statement(
     records: list[dict[str, Any]] = []
     for date_str, col in col_pairs:
         year_str = date_str[:4] if len(date_str) >= 4 else ""
-        period_label, fiscal_year = _yf_fiscal_period(date_str, period, fy_end_month)
+        period_label, fiscal_year = _yf_fiscal_period(date_str, period, fy_end_date)
         rec: dict[str, Any] = {
             "date": date_str,
             "symbol": symbol,
@@ -534,15 +549,18 @@ def _yf_statements(
     statement_type: str,
     period: str,
     limit: int = 10,
-) -> list[dict[str, Any]] | dict[str, list[dict[str, Any]]] | None:
-    """Synchronous yfinance statements fetch; None when yfinance cannot serve.
+) -> tuple[list[dict[str, Any]] | dict[str, list[dict[str, Any]]] | None, bool]:
+    """Synchronous yfinance statements fetch; ``(None, False)`` when yfinance cannot serve.
 
     Raises nothing the caller cannot treat as a soft miss back to the 402
     error. Converts each statement DataFrame into FMP-compatible period records
-    (newest-first) and slices to ``limit``.
+    (newest-first) and slices to ``limit``. The second return says whether the
+    issuer is on a 52/53-week fiscal calendar (fiscal year end or any period
+    end off a calendar month-end), the reason its records carry no
+    period/fiscalYear labels.
     """
     if _yf is None:
-        return None
+        return None, False
     disp, yf_symbol, _listing_currency = _yf_boundary(symbol)
     ticker = _yf.Ticker(yf_symbol)
     quarterly = period == "quarter"
@@ -559,7 +577,11 @@ def _yf_statements(
     financial_currency = info.get("financialCurrency")
     if not isinstance(financial_currency, str) or not financial_currency:
         financial_currency = None
-    fy_end_month = _yf_fiscal_year_end_month(info)
+    fy_end_date = _yf_fiscal_year_end(info)
+    # A fiscal year end off a month-end is the 52/53-week signature: no column
+    # of such an issuer can be month-labeled, so the date reaches the serializer
+    # as unknown rather than half the columns guessing.
+    week_based = fy_end_date is not None and not _yf_month_end(fy_end_date)
 
     def _pick(stmt_kind: str, quarterly_df_attr: str, annual_df_attr: str) -> list[dict[str, Any]]:
         df = getattr(ticker, quarterly_df_attr) if quarterly else getattr(ticker, annual_df_attr)
@@ -570,7 +592,7 @@ def _yf_statements(
             currency=financial_currency,
             period=period,
             limit=limit,
-            fy_end_month=fy_end_month,
+            fy_end_date=None if week_based else fy_end_date,
         )
 
     try:
@@ -590,10 +612,15 @@ def _yf_statements(
             }
     except Exception:  # noqa: BLE001 — soft miss, the 402 error answers
         logger.warning("yfinance statements failed for %s", symbol, exc_info=True)
-        return None
+        return None, False
     if not populated(data):
-        return None
-    return data
+        return None, False
+    if fy_end_date is not None and _yf_any_period_off_month_end(data):
+        # Month-end year end but a period end off a month-end: still a
+        # week-based calendar, just one whose year end happened to land on a
+        # month-end this year.
+        week_based = True
+    return data, week_based
 
 
 _YF_STATEMENTS_NOTE = (
@@ -609,6 +636,15 @@ _YF_PERIODS_UNKNOWN_NOTE = (
     " period / fiscalYear 未知 (issuer fiscal-year end not available); "
     "calendarYear still carries the statement date's year."
 )
+# DALTON-HOOK(market-data-fallback): a 52/53-week fiscal calendar (year end or
+# period ends off calendar month-ends) has quarters that drift against the
+# months, so no month-derived label is published for its columns.
+_YF_WEEK_BASED_NOTE = (
+    " 财年为周制，period / fiscalYear 未知 (a 52/53-week fiscal calendar: the "
+    "fiscal year end and period ends do not fall on calendar month-ends, so "
+    "quarters cannot be counted by month); calendarYear still carries the "
+    "statement date's year."
+)
 
 
 def _yf_periods_unknown(data: Any) -> bool:
@@ -619,6 +655,24 @@ def _yf_periods_unknown(data: Any) -> bool:
             isinstance(r, dict) and r.get("period") is None for r in records
         ):
             return True
+    return False
+
+
+def _yf_any_period_off_month_end(data: Any) -> bool:
+    """Whether any served record's period end is off a calendar month-end."""
+    groups = data.values() if isinstance(data, dict) else [data]
+    for records in groups:
+        if not isinstance(records, list):
+            continue
+        for r in records:
+            if not isinstance(r, dict):
+                continue
+            try:
+                end = date.fromisoformat(str(r.get("date") or "")[:10])
+            except ValueError:
+                continue
+            if not _yf_month_end(end):
+                return True
     return False
 
 
@@ -753,13 +807,15 @@ async def get_financial_statements(
         # the request — no argument change fixes it, so yfinance answers
         # instead of returning an error the agent would retry blind.
         if err.get("error") == "plan_not_covered" or getattr(e, "status_code", None) == 402:
-            yf_data = await asyncio.to_thread(_yf_statements, disp, statement_type, period, limit)
+            yf_data, week_based = await asyncio.to_thread(
+                _yf_statements, disp, statement_type, period, limit
+            )
             if yf_data is not None:
                 note = _YF_STATEMENTS_NOTE
                 # DALTON-HOOK(market-data-fallback): say so in the note rather
                 # than guessing calendar-shaped period labels.
                 if _yf_periods_unknown(yf_data):
-                    note += _YF_PERIODS_UNKNOWN_NOTE
+                    note += _YF_WEEK_BASED_NOTE if week_based else _YF_PERIODS_UNKNOWN_NOTE
                 return make_response(
                     yf_data,
                     source="yfinance",

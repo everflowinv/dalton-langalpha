@@ -158,20 +158,21 @@ def test_alphaengine_fanout_closes_a_lone_start_on_bridge_today(monkeypatch):
     # UTC-derived end made start > end and the whole route='all' call came
     # back as "上游不可用".
     monkeypatch.setattr(rb, "_bridge_today", lambda: "2026-10-27")
-    ae_args = rb.ResearchDataBridge._build_alphaengine_fanout_args(
+    ae_args, ae_err = rb.ResearchDataBridge._build_alphaengine_fanout_args(
         _fanout_bridge(), {"query": "NVDA", "start": "2026-10-20"}
     )
+    assert ae_err is None
     assert ae_args["start"] == "2026-10-20"
     assert ae_args["end"] == "2026-10-27"
 
 
 def test_fanout_legs_truncate_an_end_after_bridge_today(monkeypatch):
     monkeypatch.setattr(rb, "_bridge_today", lambda: "2026-10-26")
-    ae_args = rb.ResearchDataBridge._build_alphaengine_fanout_args(
+    ae_args, _ = rb.ResearchDataBridge._build_alphaengine_fanout_args(
         _fanout_bridge(), {"query": "NVDA", "start": "2026-10-01", "end": "2026-10-30"}
     )
     assert (ae_args["start"], ae_args["end"]) == ("2026-10-01", "2026-10-26")
-    gp_args = rb.ResearchDataBridge._build_guidepoint_fanout_args(
+    gp_args, _ = rb.ResearchDataBridge._build_guidepoint_fanout_args(
         _fanout_bridge(), {"query": "NVDA", "start": "2026-10-01", "end": "2026-10-30"}
     )
     assert (gp_args["start"], gp_args["end"]) == ("2026-10-01", "2026-10-26")
@@ -179,7 +180,7 @@ def test_fanout_legs_truncate_an_end_after_bridge_today(monkeypatch):
 
 def test_guidepoint_fanout_keeps_a_lone_start_and_wraps_string_keywords(monkeypatch):
     monkeypatch.setattr(rb, "_bridge_today", lambda: "2026-10-26")
-    gp_args = rb.ResearchDataBridge._build_guidepoint_fanout_args(
+    gp_args, _ = rb.ResearchDataBridge._build_guidepoint_fanout_args(
         _fanout_bridge(),
         {"query": "Meta advertising", "start": "2026-10-01", "params": {"keywords": "reels"}},
     )
@@ -262,7 +263,7 @@ def test_guidepoint_fanout_carries_normalized_nested_start_and_end_dates(monkeyp
         },
     )
     assert err is None
-    gp_args = rb.ResearchDataBridge._build_guidepoint_fanout_args(
+    gp_args, _ = rb.ResearchDataBridge._build_guidepoint_fanout_args(
         _fanout_bridge(), normalized
     )
     assert gp_args["params"]["start_date"] == "2026-09-01"
@@ -282,7 +283,7 @@ def test_guidepoint_fanout_with_both_windows_sends_only_the_nested_one(monkeypat
         "end": "2026-10-26",
         "params": {"start_date": "2026-09-01", "end_date": "2026-10-15"},
     }
-    gp_args = rb.ResearchDataBridge._build_guidepoint_fanout_args(
+    gp_args, _ = rb.ResearchDataBridge._build_guidepoint_fanout_args(
         _fanout_bridge(), arguments
     )
     assert "start" not in gp_args
@@ -290,8 +291,112 @@ def test_guidepoint_fanout_with_both_windows_sends_only_the_nested_one(monkeypat
     assert gp_args["params"]["start_date"] == "2026-09-01"
     assert gp_args["params"]["end_date"] == "2026-10-15"
 
-    ae_args = rb.ResearchDataBridge._build_alphaengine_fanout_args(
+    ae_args, _ = rb.ResearchDataBridge._build_alphaengine_fanout_args(
         _fanout_bridge(), arguments
     )
     assert ae_args["start"] == "2026-10-01"
     assert ae_args["end"] == "2026-10-26"
+
+
+def test_route_all_with_split_leg_windows_passes_entry_validation(monkeypatch):
+    # AlphaEngine rides the top-level start, Guidepoint the nested end_date —
+    # both half windows, both legal. Splicing them into one window at the entry
+    # point read this as "start after end" and refused a call both legs serve.
+    monkeypatch.setattr(rb, "_bridge_today", lambda: "2026-10-26")
+    normalized, _, err = rb._normalize_and_validate_call_args(
+        "research",
+        {
+            "route": "all",
+            "query": "Meta advertising",
+            "start": "2026-10-01",
+            "params": {"end_date": "2026-09-30"},
+        },
+    )
+    assert err is None
+    ae_args, ae_err = rb.ResearchDataBridge._build_alphaengine_fanout_args(
+        _fanout_bridge(), normalized
+    )
+    assert ae_err is None
+    assert (ae_args["start"], ae_args["end"]) == ("2026-10-01", "2026-10-26")
+    gp_args, gp_err = rb.ResearchDataBridge._build_guidepoint_fanout_args(
+        _fanout_bridge(), normalized
+    )
+    assert gp_err is None
+    assert "start" not in gp_args and "end" not in gp_args
+    assert gp_args["params"]["end_date"] == "2026-09-30"
+
+
+def test_route_all_with_a_reversed_nested_window_names_the_guidepoint_leg(monkeypatch):
+    # The top-level window is fine; the Guidepoint leg's nested one is
+    # reversed. The entry point must refuse it and name the leg, not splice
+    # top-level start with top-level end and wave the nested pair through.
+    monkeypatch.setattr(rb, "_bridge_today", lambda: "2026-10-26")
+    _, _, err = rb._normalize_and_validate_call_args(
+        "research",
+        {
+            "route": "all",
+            "query": "Meta advertising",
+            "start": "2026-01-01",
+            "end": "2026-10-23",
+            "params": {"start_date": "2026-09-30", "end_date": "2026-09-01"},
+        },
+    )
+    assert err is not None and err["error"].startswith("[参数错误]")
+    assert "guidepoint" in err["error"]
+    assert "2026-09-30" in err["error"] and "2026-09-01" in err["error"]
+
+
+def test_route_all_with_a_reversed_top_level_window_names_the_alphaengine_leg(monkeypatch):
+    monkeypatch.setattr(rb, "_bridge_today", lambda: "2026-10-26")
+    _, _, err = rb._normalize_and_validate_call_args(
+        "research",
+        {
+            "route": "all",
+            "query": "Meta advertising",
+            "start": "2026-09-30",
+            "end": "2026-09-01",
+        },
+    )
+    assert err is not None and err["error"].startswith("[参数错误]")
+    assert "alphaengine" in err["error"]
+
+
+def test_route_all_nested_half_window_is_sent_as_guidepoint_half_window(monkeypatch):
+    # Only params.start_date: a Guidepoint-native half window. It is sent
+    # as-is (never closed like AlphaEngine's pair) and must not trip the
+    # no-metadata or window validation.
+    monkeypatch.setattr(rb, "_bridge_today", lambda: "2026-10-26")
+    normalized, _, err = rb._normalize_and_validate_call_args(
+        "research",
+        {
+            "route": "all",
+            "query": "Meta advertising",
+            "params": {"start_date": "2026-09-01"},
+        },
+    )
+    assert err is None
+    gp_args, gp_err = rb.ResearchDataBridge._build_guidepoint_fanout_args(
+        _fanout_bridge(), normalized
+    )
+    assert gp_err is None
+    assert gp_args["params"]["start_date"] == "2026-09-01"
+    assert "end_date" not in gp_args["params"]
+    assert "start" not in gp_args and "end" not in gp_args
+
+
+def test_a_fanout_leg_window_error_is_returned_not_dropped(monkeypatch):
+    # Defense in depth: the entry point already refuses a reversed window per
+    # leg, but should one still arise while building a leg, the builder hands
+    # it back instead of sending the bad window upstream.
+    monkeypatch.setattr(rb, "_bridge_today", lambda: "2026-10-26")
+    gp_args, gp_err = rb.ResearchDataBridge._build_guidepoint_fanout_args(
+        _fanout_bridge(),
+        {"route": "all", "query": "Meta advertising", "start": "2026-10-01", "end": "2026-09-01"},
+    )
+    assert gp_err is not None and gp_err["error"].startswith("[参数错误]")
+    assert "晚于结束日期" in gp_err["error"]
+    ae_args, ae_err = rb.ResearchDataBridge._build_alphaengine_fanout_args(
+        _fanout_bridge(),
+        {"route": "all", "query": "Meta advertising", "start": "2026-10-01", "end": "2026-09-01"},
+    )
+    assert ae_err is not None and ae_err["error"].startswith("[参数错误]")

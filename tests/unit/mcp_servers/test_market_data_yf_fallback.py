@@ -175,6 +175,59 @@ class TestGetStockDataOrder:
         client.get_intraday_chart.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_hk_hourly_lunch_bar_reanchors_before_the_window_filter(self):
+        # HKEX breaks 12:00–13:00; Yahoo's hourly grid puts a 12:30 bar inside
+        # it that carries the reopen's trades and re-anchors to 13:00. The
+        # re-anchor must run before the request window filter, or a request
+        # starting 13:00 drops that bar (12:30 < 13:00) and the session starts
+        # at 14:00.
+        import pandas as pd
+        import plugins.langalpha_market_data.price_data_mcp_server as mod
+
+        idx = pd.DatetimeIndex(
+            [
+                "2026-10-26 10:30:00+08:00",
+                "2026-10-26 11:30:00+08:00",
+                "2026-10-26 12:30:00+08:00",
+                "2026-10-26 14:00:00+08:00",
+                "2026-10-26 15:00:00+08:00",
+            ]
+        )
+        df = pd.DataFrame(
+            {
+                "Open": [400.0, 401.0, 402.0, 403.0, 404.0],
+                "High": [401.0, 402.0, 403.0, 404.0, 405.0],
+                "Low": [399.0, 400.0, 401.0, 402.0, 403.0],
+                "Close": [400.5, 401.5, 402.5, 403.5, 404.5],
+                "Volume": [100, 200, 300, 400, 500],
+            },
+            index=idx,
+        )
+        ticker_inst = create_autospec(mod._yf.Ticker, instance=True)
+        ticker_inst.history.return_value = df
+        ticker_cls = create_autospec(mod._yf.Ticker, return_value=ticker_inst)
+        client = _fmp_client()
+
+        with _ginlix_miss(mod), \
+             patch.object(mod, "_yf_fetch_history", new=_REAL_YF_FETCH), \
+             patch.object(mod._yf, "Ticker", new=ticker_cls), \
+             patch(f"{_PRICE_MOD}.get_fmp_client", return_value=client):
+            result = await mod.get_stock_data(
+                "0700.HK",
+                interval="1hour",
+                start_date="2026-10-26 13:00",
+                end_date="2026-10-26 15:00",
+            )
+
+        assert result["source"] == "yfinance"
+        assert [r["date"] for r in result["data"]] == [
+            "2026-10-26 13:00:00",
+            "2026-10-26 14:00:00",
+            "2026-10-26 15:00:00",
+        ]
+        client.get_intraday_chart.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_partial_yfinance_coverage_falls_through_to_fmp_when_fmp_succeeds(self):
         import plugins.langalpha_market_data.price_data_mcp_server as mod
 
@@ -283,7 +336,7 @@ class TestYfCoversStart:
         # 13:01 sits between 5-minute bars; the 13:05 bar is coverage, not a gap.
         rows = [{"date": "2026-10-26 13:05:00"}]
         assert mod._yf_covers_start(
-            rows, "2026-10-26 13:01", intraday=True, display="AAPL"
+            rows, "2026-10-26 13:01", intraday=True, display="AAPL", interval="5min"
         )
 
     def test_a_weekend_intraday_start_gets_the_next_session_open(self):
@@ -291,8 +344,21 @@ class TestYfCoversStart:
 
         rows = [{"date": "2026-10-26 09:30:00"}]
         assert mod._yf_covers_start(
-            rows, "2026-10-24 10:00", intraday=True, display="AAPL"
+            rows, "2026-10-24 10:00", intraday=True, display="AAPL", interval="5min"
         )
+
+    def test_an_afternoon_first_bar_does_not_cover_a_morning_start(self):
+        # Date-only comparison called a day whose first bar is 14:00 covered
+        # for a 09:30 request; the bar clock must matter inside the session.
+        import plugins.langalpha_market_data.price_data_mcp_server as mod
+
+        rows = [{"date": "2026-10-26 14:00:00"}]
+        assert not mod._yf_covers_start(
+            rows, "2026-10-26 09:30", intraday=True, display="AAPL", interval="5min"
+        )
+        # The uncovered verdict routes to FMP first, then the partial-yfinance
+        # answer with the actual covered range named — that path is exercised
+        # end-to-end in TestGetStockDataOrder above.
 
     def test_a_capped_one_minute_history_of_a_two_month_request_is_not_covered(self):
         import plugins.langalpha_market_data.price_data_mcp_server as mod
@@ -301,7 +367,7 @@ class TestYfCoversStart:
         # bars only from 2026-10-20 — a real gap.
         rows = [{"date": "2026-10-20 09:30:00"}]
         assert not mod._yf_covers_start(
-            rows, "2026-08-25 09:30", intraday=True, display="AAPL"
+            rows, "2026-08-25 09:30", intraday=True, display="AAPL", interval="1min"
         )
 
     def test_a_daily_gap_beyond_four_days_is_not_covered(self):
@@ -483,7 +549,7 @@ class TestStatementsPlanFallback:
         )
         with patch(f"{_FUND_MOD}.get_fmp_client", return_value=client), \
              patch.object(mod, "_yf_statements", new=create_autospec(
-                 mod._yf_statements, return_value=None
+                 mod._yf_statements, return_value=(None, False)
              )):
             result = await mod.get_financial_statements("3690.HK", statement_type="income")
 
@@ -497,7 +563,7 @@ class TestStatementsPlanFallback:
         client.get_income_statement.side_effect = FMPRequestError(
             "FMP API request failed (500)", status_code=500
         )
-        yf_spy = create_autospec(mod._yf_statements, return_value={"x": {}})
+        yf_spy = create_autospec(mod._yf_statements, return_value=({"x": {}}, False))
         with patch(f"{_FUND_MOD}.get_fmp_client", return_value=client), \
              patch.object(mod, "_yf_statements", new=yf_spy):
             result = await mod.get_financial_statements("AAPL", statement_type="income")
@@ -578,6 +644,52 @@ class TestStatementsFiscalShape:
         assert first["fiscalYear"] == "2026"
         assert first["calendarYear"] == "2025"
         assert "period / fiscalYear 未知" not in result["note"]
+
+    @pytest.mark.asyncio
+    async def test_a_week_based_fiscal_calendar_gets_no_period_labels(self):
+        # A 52/53-week retailer: the fiscal year ends 2026-01-30 and quarters
+        # end 2026-05-01 / 2026-07-31 — off the calendar month grid, so month
+        # arithmetic read Q1 as Q2 (and 05-01/07-31 as the same Q2). No label
+        # is published for any column, month-end or not, and the note names
+        # the calendar as the reason.
+        import pandas as pd
+        import plugins.langalpha_market_data.fundamentals_mcp_server as mod
+
+        client = _fmp_client()
+        client.get_income_statement.side_effect = FMPRequestError(
+            "FMP API request failed (402)", status_code=402
+        )
+        df = pd.DataFrame(
+            {
+                "2026-07-31": [500.0],
+                "2026-05-01": [400.0],
+                "2026-01-30": [300.0],
+            },
+            index=pd.Index(["Total Revenue"]),
+        )
+        ticker_inst = create_autospec(mod._yf.Ticker, instance=True)
+        ticker_inst.quarterly_income_stmt = df
+        ticker_inst.info = {
+            "financialCurrency": "USD",
+            "lastFiscalYearEnd": _epoch(2026, 1, 30),
+        }
+        ticker_cls = create_autospec(mod._yf.Ticker, return_value=ticker_inst)
+
+        with patch(f"{_FUND_MOD}.get_fmp_client", return_value=client), \
+             patch.object(mod._yf, "Ticker", new=ticker_cls):
+            result = await mod.get_financial_statements(
+                "WMT", statement_type="income", period="quarter", limit=3
+            )
+
+        assert result["source"] == "yfinance"
+        assert [r["date"] for r in result["data"]] == [
+            "2026-07-31", "2026-05-01", "2026-01-30",
+        ]
+        # Every column is unlabeled — even the 07-31 month-end one.
+        assert all(r["period"] is None and r["fiscalYear"] is None for r in result["data"])
+        assert all(r["calendarYear"] == r["date"][:4] for r in result["data"])
+        assert "周制" in result["note"]
+        assert "period / fiscalYear 未知" in result["note"]
 
     @pytest.mark.asyncio
     async def test_without_fiscal_metadata_both_labels_are_none_and_noted(self):

@@ -307,8 +307,52 @@ def _yf_expected_session_day(display: str, start_day: date) -> Optional[date]:
 # Only a real gap counts as uncovered (a capped 1m history serving the last
 # 7 days of a two-month request); the old timestamp comparison read every
 # off-hours start as a miss and burned FMP quota re-asking a served window.
+def _yf_start_deadline_ms(display: str, start_date: str, interval: str) -> Optional[int]:
+    """The latest first bar that still covers an intraday *start_date*.
+
+    The start itself anchors it when it sits inside trading hours; otherwise
+    the next session open does — the reopen when the start sits inside a
+    venue's midday break, that session's open when it is earlier, the next
+    session's open when it is past the close or on a non-trading day. One bar
+    interval of slack rides on top (the 13:05 bar covers a 13:01 5min start).
+    """
+    start_ms = _yf_parse_exchange_bound_ms(start_date, display, is_end=False)
+    if start_ms is None:
+        return None
+    try:
+        from market_protocol.calendars import get_calendar, session_bounds
+
+        ref = to_canonical(display)
+        cal = get_calendar(ref.calendar_id)
+    except Exception:  # noqa: BLE001 — no calendar: caller keeps day granularity
+        return None
+    day = datetime.fromtimestamp(start_ms / 1000, cal.tz).date()
+    for _ in range(15):  # enough to bridge the longest venue holiday closure
+        if cal.is_trading_day(day):
+            bounds = session_bounds(ref.calendar_id, day.isoformat())
+            if bounds and bounds[0] is not None:
+                open_ms, close_ms, brk_start, brk_end = bounds
+                if start_ms <= open_ms:
+                    anchor = open_ms
+                elif brk_start is not None and brk_end is not None and brk_start <= start_ms < brk_end:
+                    anchor = brk_end
+                elif start_ms < close_ms:
+                    anchor = start_ms
+                else:
+                    anchor = None  # past this session's close: the next session's open
+                if anchor is not None:
+                    return anchor + _INTRADAY_SPAN_SECONDS.get(interval, 0) * 1000
+        day = day + timedelta(days=1)
+    return None
+
+
 def _yf_covers_start(
-    rows: list[dict], start_date: Optional[str], *, intraday: bool, display: str = ""
+    rows: list[dict],
+    start_date: Optional[str],
+    *,
+    intraday: bool,
+    display: str = "",
+    interval: str = "",
 ) -> bool:
     if not start_date or not rows:
         return True
@@ -324,7 +368,18 @@ def _yf_covers_start(
     if intraday:
         expected = _yf_expected_session_day(display, start_day)
         if expected is not None:
-            return first_day <= expected
+            if first_day > expected:
+                return False
+            # DALTON-HOOK(market-data-fallback): within the start's own session
+            # the bar clock matters too: a first bar at 14:00 does not cover a
+            # 09:30 request even though the dates match. The deadline is the
+            # start (rolled to the next open when off-hours) plus one interval;
+            # without a venue calendar the day-granular verdict stands.
+            deadline_ms = _yf_start_deadline_ms(display, s, interval)
+            first_ms = _yf_parse_exchange_bound_ms(first_date, display, is_end=False)
+            if deadline_ms is not None and first_ms is not None:
+                return first_ms <= deadline_ms
+            return True
     return (first_day - start_day).days <= 4
 
 
@@ -403,17 +458,11 @@ def _yf_fetch_history(
     # A NaN-priced row (halted session, gap padding) must not propagate NaN
     # into the response — drop it here.
     df = df.copy().dropna(subset=["Open", "High", "Low", "Close"])
-    start_ms = _yf_parse_exchange_bound_ms(start_date, display, is_end=False)
-    end_ms = _yf_parse_exchange_bound_ms(end_date, display, is_end=True)
     rows: list[dict] = []
     for idx, row in df.iterrows():
         try:
             ts = int(idx.timestamp() * 1000)
         except (AttributeError, OSError, OverflowError, ValueError):
-            continue
-        if start_ms is not None and ts < start_ms:
-            continue
-        if end_ms is not None and ts > end_ms:
             continue
         volume = row["Volume"]
         rows.append(
@@ -429,10 +478,20 @@ def _yf_fetch_history(
         )
     # DALTON-HOOK(market-data-fallback): drop the break-time zero-volume bars
     # Yahoo pads CN/HK intraday with, the same placement rule the main
-    # yfinance chain applies, so both legs return the same sessions.
+    # yfinance chain applies, so both legs return the same sessions — and do
+    # it BEFORE the window filter below: a HK 12:30 hourly bar re-anchors to
+    # the 13:00 reopen, so filtering first would drop it for a request that
+    # starts at 13:00 and the session would begin at 14:00 instead.
     if canonical != "1day":
         rows = _drop_midday_break_bars(rows, display, canonical)
-    return rows
+    start_ms = _yf_parse_exchange_bound_ms(start_date, display, is_end=False)
+    end_ms = _yf_parse_exchange_bound_ms(end_date, display, is_end=True)
+    return [
+        r
+        for r in rows
+        if (start_ms is None or r["time"] >= start_ms)
+        and (end_ms is None or r["time"] <= end_ms)
+    ]
 
 
 async def _fetch_stock_series(
@@ -580,7 +639,13 @@ async def _fetch_stock_bars(
                 intraday=intraday,
             )
             if yf_data:
-                if _yf_covers_start(yf_data, start_date, intraday=intraday, display=display):
+                if _yf_covers_start(
+                    yf_data,
+                    start_date,
+                    intraday=intraday,
+                    display=display,
+                    interval=canonical,
+                ):
                     return {
                         "data": yf_data,
                         "source": "yfinance",

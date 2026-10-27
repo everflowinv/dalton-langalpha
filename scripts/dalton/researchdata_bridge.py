@@ -2608,6 +2608,36 @@ def _point_date_error(field: str, value: Any, norm_view: dict[str, Any]) -> dict
     }
 
 
+def _route_all_leg_windows(
+    normalized: dict[str, Any], nested: dict[str, Any]
+) -> list[tuple[str, str, str | None, str | None]]:
+    """The date window each `route='all'` fan-out leg actually carries.
+
+    AlphaEngine always rides the top-level start/end. Guidepoint carries its
+    nested params.start_date/end_date when either is present (the fan-out sends
+    no other window on that leg), else the top-level window. The two legs are
+    independent windows: judging them as one combined window both misses a
+    reversed nested one and reads a legit split (top-level start for
+    AlphaEngine, nested end_date for Guidepoint) as "start after end".
+    """
+    top_start, top_end = normalized.get("start"), normalized.get("end")
+    gp_start = nested.get("start_date")
+    gp_end = nested.get("end_date")
+    if _non_empty_str(gp_start) or _non_empty_str(gp_end):
+        return [
+            ("alphaengine", "顶层 start/end", top_start, top_end),
+            ("guidepoint", "params.start_date/end_date", gp_start, gp_end),
+        ]
+    return [
+        ("alphaengine", "顶层 start/end", top_start, top_end),
+        ("guidepoint", "顶层 start/end", top_start, top_end),
+    ]
+
+
+def _non_empty_str(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
 def _normalize_date_window(
     route: str,
     normalized: dict[str, Any],
@@ -2635,6 +2665,22 @@ def _normalize_date_window(
             err = _invalid_date_error(start_k, start_v, norm_view)
             err["error"] = f"[参数错误] {start_k}={start_v!r} 晚于今天（{today}），没有可查的数据。"
             return err
+
+    # route='all' fans out to legs that carry independent date windows (see
+    # _route_all_leg_windows), so each leg is judged on its own window — never
+    # on the two spliced together.
+    if route == "all":
+        for leg, which, leg_start, leg_end in _route_all_leg_windows(normalized, nested):
+            if _non_empty_str(leg_start) and _non_empty_str(leg_end) and leg_start > leg_end:
+                norm_view = _build_normalized_params_view(normalized)
+                err = _invalid_date_error("start", leg_start, norm_view)
+                err["error"] = (
+                    f"[参数错误] route='all' 的 {leg} 腿日期窗口无效：{which} 中 "
+                    f"开始日期 {leg_start} 晚于结束日期 {leg_end}。"
+                )
+                err["hint"] = f"把 {which} 改成开始不晚于结束的成对日期后重试。"
+                return err
+        return None
 
     win_start = normalized.get("start") or nested.get("start") or nested.get("date_from") or nested.get("start_date")
     win_end = normalized.get("end") or nested.get("end") or nested.get("date_to") or nested.get("end_date")
@@ -4754,8 +4800,12 @@ class ResearchDataBridge:
 
     def _build_alphaengine_fanout_args(
         self, arguments: dict[str, Any]
-    ) -> dict[str, Any]:
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
         """Map `research(route='all')` search arguments to `route='alphaengine'` parameters.
+
+        Returns `(leg_args, window_error_or_none)`; a window error fails the
+        whole route='all' call as a parameter error at the fan-out call site,
+        it is never silently dropped.
 
         Mapping basis:
         - `data_gateway.py` sets `accepted['alphaengine'] = {'query', 'start', 'end'}` and rejects
@@ -4788,12 +4838,14 @@ class ResearchDataBridge:
         if end:
             ae_args["end"] = end
         # The same normalization/truncation/ordering as a direct call. The
-        # route='all' entry point already validated the caller's dates, so the
-        # error return is unreachable here; what matters is that today is
+        # route='all' entry point already validated the caller's dates per leg,
+        # so the error return should be unreachable here — but it is returned,
+        # not dropped: a window this leg cannot serve legally fails the whole
+        # call as a parameter error. What matters day to day is that today is
         # `_bridge_today()` (max of this host's and Beijing's date), not the
         # UTC date: in the Beijing small hours UTC is a day behind and the
         # gateway refused the resulting start > end window.
-        _normalize_date_window("alphaengine", ae_args)
+        ae_win_err = _normalize_date_window("alphaengine", ae_args)
 
         limit = arguments.get("limit")
         if isinstance(limit, int) and not isinstance(limit, bool) and limit > 0:
@@ -4802,12 +4854,16 @@ class ResearchDataBridge:
         ae_args["timeout"] = self._compute_fanout_timeout(
             arguments, FANOUT_ALPHAENGINE_TIMEOUT_S
         )
-        return ae_args
+        return ae_args, ae_win_err
 
     def _build_guidepoint_fanout_args(
         self, arguments: dict[str, Any]
-    ) -> dict[str, Any]:
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
         """Map `research(route='all')` search arguments to `route='guidepoint'` parameters.
+
+        Returns `(leg_args, window_error_or_none)`; a window error fails the
+        whole route='all' call as a parameter error at the fan-out call site,
+        it is never silently dropped.
 
         Mapping basis:
         - `catalog()` (`config/data_sources.json`) registers `guidepoint` with
@@ -4845,6 +4901,7 @@ class ResearchDataBridge:
         has_nested_window = isinstance(raw_params, dict) and any(
             str(raw_params.get(k) or "").strip() for k in ("start_date", "end_date")
         )
+        gp_win_err: dict[str, Any] | None = None
         if not has_nested_window:
             if start:
                 gp_args["start"] = start
@@ -4852,8 +4909,9 @@ class ResearchDataBridge:
                 gp_args["end"] = end
             # Shared window rules (end truncated to `_bridge_today()`, ordering
             # checked); a lone end stays lone — Guidepoint, unlike AlphaEngine,
-            # accepts half a window. The entry point already validated the dates.
-            _normalize_date_window("guidepoint", gp_args)
+            # accepts half a window. The entry point already validated the
+            # dates; the error, should one still arise, is returned, not dropped.
+            gp_win_err = _normalize_date_window("guidepoint", gp_args)
 
         limit = arguments.get("limit")
         if isinstance(limit, int) and not isinstance(limit, bool) and limit > 0:
@@ -4881,13 +4939,15 @@ class ResearchDataBridge:
                         else (coerced_nd if coerced_nd is not None else str(raw_nd).strip())
                     )
             if gp_params:
-                _normalize_date_window("guidepoint", gp_args, gp_params)
+                nested_win_err = _normalize_date_window("guidepoint", gp_args, gp_params)
+                if nested_win_err is not None:
+                    gp_win_err = gp_win_err or nested_win_err
                 gp_args["params"] = gp_params
 
         gp_args["timeout"] = self._compute_fanout_timeout(
             arguments, FANOUT_GUIDEPOINT_TIMEOUT_S
         )
-        return gp_args
+        return gp_args, gp_win_err
 
     async def _run_alphaengine_fanout(
         self, req_id: Any, ae_args: dict[str, Any], ae_budget_s: float
@@ -7368,12 +7428,19 @@ class ResearchDataBridge:
             norm_params_view["route"] = route
 
         do_fanout = self._should_fanout_alphaengine(tool_name, arguments)
-        ae_args: dict[str, Any] | None = (
-            self._build_alphaengine_fanout_args(arguments) if do_fanout else None
-        )
-        gp_args: dict[str, Any] | None = (
-            self._build_guidepoint_fanout_args(arguments) if do_fanout else None
-        )
+        ae_args: dict[str, Any] | None = None
+        gp_args: dict[str, Any] | None = None
+        if do_fanout:
+            ae_args, ae_win_err = self._build_alphaengine_fanout_args(arguments)
+            gp_args, gp_win_err = self._build_guidepoint_fanout_args(arguments)
+            # A leg window the entry point's per-leg validation somehow let
+            # through fails the whole call as a parameter error — the old code
+            # dropped the error and sent the bad window upstream anyway.
+            fanout_win_err = ae_win_err or gp_win_err
+            if fanout_win_err is not None:
+                return self._make_tool_result_response(
+                    req_id, fanout_win_err, is_error=True
+                )
         ae_outcome: dict[str, Any] | None = None
         gp_outcome: dict[str, Any] | None = None
 
