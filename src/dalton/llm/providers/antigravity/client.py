@@ -250,7 +250,7 @@ def _messages_to_gemini(
             # The endpoint validates that functionCall parts carry their
             # thought_signature (it 400s without one). A mapped message
             # replays each call's own signature; Gemini gets the stand-in for
-            # a call nothing signed, and for every call of an unmapped one,
+            # any call not in the map, and for every call of an unmapped one,
             # whose list may hold a text part's signature first.
             extra = message.additional_kwargs or {}
             by_call = extra.get(_CALL_SIGNATURES_KEY)
@@ -686,7 +686,13 @@ class ChatAntigravity(BaseChatModel):
                 text_parts.append(part["text"])
             elif "functionCall" in part:
                 call = part["functionCall"]
-                call_id = call.get("id") or f"antigravity_call_{uuid.uuid4().hex[:8]}"
+                # Capture normalizes the id to a string: replay looks calls up
+                # by str(call_id), and a chunk with an int id fails validation.
+                call_id = (
+                    str(call["id"])
+                    if call.get("id")
+                    else f"antigravity_call_{uuid.uuid4().hex[:8]}"
+                )
                 if "thoughtSignature" in part:
                     sigs.by_call[call_id] = part["thoughtSignature"]
                 tool_chunks.append(

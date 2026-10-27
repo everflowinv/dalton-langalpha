@@ -1239,6 +1239,34 @@ def build_researchdata_plugin_instruction() -> str:
 INTERNAL_LIBRARY_ROUTES: frozenset[str] = frozenset(
     {"company-wiki", "sales-notes", "tmtb", "funda-ai", "all", "sales-mail"}
 )
+# Routes whose gateway (data_gateway.py) accepts query/start/end only (the
+# library ones add `document`) and refuses `--ticker`; the bridge folds a
+# ticker into the query instead of letting the call die upstream.
+TICKER_FOLDS_INTO_QUERY_ROUTES: frozenset[str] = frozenset(
+    {
+        "all",
+        "alphaengine",
+        "guidepoint",
+        "company-wiki",
+        "sales-notes",
+        "sales-mail",
+        "tmtb",
+        "funda-ai",
+    }
+)
+
+
+def _query_contains_ticker(query: str, ticker: str) -> bool:
+    """True when ``ticker`` already appears in ``query`` as a whole token (non-alphanumeric boundaries, case-insensitive)."""
+    if not ticker or not query:
+        return False
+    return bool(
+        re.search(
+            rf"(?<![A-Za-z0-9]){re.escape(ticker)}(?![A-Za-z0-9])",
+            query,
+            re.IGNORECASE,
+        )
+    )
 INTERNAL_LIBRARY_READ_OPERATIONS: frozenset[str] = frozenset({"read"})
 MAX_CHARS_FLOOR: int = 1
 MAX_CHARS_CEILING: int = 30000
@@ -1895,6 +1923,8 @@ ROUTE_CONTRACT_SPECS: dict[str, dict[str, Any]] = {
             "indexed_since",
             "keywords",
             "recency_bias",
+            "start_date",
+            "end_date",
         ],
         "required_params": {
             "search": ["query 或 ticker"],
@@ -1903,7 +1933,7 @@ ROUTE_CONTRACT_SPECS: dict[str, dict[str, Any]] = {
         },
         "optional_params": ["start", "end", "limit", "params"],
         "param_formats": {
-            "ticker": "股票代码（如 'META'、'0700.HK'、'300750.SZ'）",
+            "ticker": "股票代码（如 'META'、'0700.HK'、'300750.SZ'）；会并入 query 检索词（上游不支持单独的 ticker 参数）",
             "start": "YYYY-MM-DD",
             "end": "YYYY-MM-DD",
             "document": "带库前缀的文档 ID（如 'wiki:123'、'mail:456'、'tmtb:789'、'funda:10'）",
@@ -1954,6 +1984,7 @@ ROUTE_CONTRACT_SPECS: dict[str, dict[str, Any]] = {
         "optional_params": ["start", "end", "limit", "params"],
         "param_formats": {
             "query": "检索关键词（公司代码如 'META' 直接拼入 query）",
+            "ticker": "股票代码；会并入 query 检索词（上游不支持单独的 ticker 参数）",
             "start": "YYYY-MM-DD（传入 start 时需与 end 成对传入）",
             "end": "YYYY-MM-DD",
             "params.doc_id": "纯数字字符串文档 ID（如 '99001122'；顶层传 document 时自动映射为 params.doc_id 并移除顶层 document）",
@@ -1986,9 +2017,11 @@ ROUTE_CONTRACT_SPECS: dict[str, dict[str, Any]] = {
         "optional_params": ["operation", "start", "end", "limit", "params"],
         "param_formats": {
             "query": "专家访谈检索词（如 'Meta Reels advertising'）",
+            "ticker": "股票代码；会并入 query 检索词（上游不支持单独的 ticker 参数）",
             "start": "YYYY-MM-DD",
             "end": "YYYY-MM-DD",
             "limit": "整数 1-40",
+            "params.keywords": "关键词列表 list[str]（传单个字符串时桥接层自动包成单元素列表）",
         },
         "return_shape": "{\"ok\": true, \"status\": \"ok\", \"data\": {\"structuredContent\": {\"data\": [...]}}, \"_sources\": [...]}",
         "examples": [
@@ -2062,6 +2095,7 @@ ROUTE_CONTRACT_SPECS: dict[str, dict[str, Any]] = {
         "optional_params": ["start", "end", "limit", "params"],
         "param_formats": {
             "params.company": "股票代码（如 'META'、'0700.HK'、'300750.SZ'）",
+            "ticker": "股票代码；会并入 query 检索词（上游不支持单独的 ticker 参数）",
             "document": "'wiki:<id>'",
             "start": "YYYY-MM-DD",
             "end": "YYYY-MM-DD",
@@ -2107,6 +2141,7 @@ ROUTE_CONTRACT_SPECS: dict[str, dict[str, Any]] = {
         },
         "optional_params": ["start", "end", "limit", "params"],
         "param_formats": {
+            "ticker": "股票代码；会并入 query 检索词（上游不支持单独的 ticker 参数）",
             "document": "'mail:<id>' 或 'digest:<date>'",
             "start": "YYYY-MM-DD",
             "end": "YYYY-MM-DD",
@@ -2152,6 +2187,7 @@ ROUTE_CONTRACT_SPECS: dict[str, dict[str, Any]] = {
         },
         "optional_params": ["start", "end", "limit", "params"],
         "param_formats": {
+            "ticker": "股票代码；会并入 query 检索词（上游不支持单独的 ticker 参数）",
             "document": "'mail:<id>' 或 'digest:<date>'",
             "start": "YYYY-MM-DD",
             "end": "YYYY-MM-DD",
@@ -2196,6 +2232,7 @@ ROUTE_CONTRACT_SPECS: dict[str, dict[str, Any]] = {
         },
         "optional_params": ["start", "end", "limit", "params"],
         "param_formats": {
+            "ticker": "股票代码；会并入 query 检索词（上游不支持单独的 ticker 参数）",
             "document": "'tmtb:<id>'",
             "start": "YYYY-MM-DD",
             "end": "YYYY-MM-DD",
@@ -2241,6 +2278,7 @@ ROUTE_CONTRACT_SPECS: dict[str, dict[str, Any]] = {
         },
         "optional_params": ["start", "end", "limit", "params"],
         "param_formats": {
+            "ticker": "股票代码；会并入 query 检索词（上游不支持单独的 ticker 参数）",
             "document": "'funda:<id>'",
             "start": "YYYY-MM-DD",
             "end": "YYYY-MM-DD",
@@ -2524,6 +2562,147 @@ def _normalize_date_param(field: str, value: Any) -> str | None:
     return None
 
 
+def _normalize_point_date_param(value: Any) -> str | None:
+    """Coerce a point-in-time parameter (`as_of`, `vintage`) to YYYY-MM-DD.
+
+    A point has no span to widen: a month, quarter or year is refused (the
+    caller must name the day), while a full date with a time suffix keeps its
+    date part. None when the text is not a specific day.
+    """
+    import datetime as _dt
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    def _day(y: int, m: int, d: int) -> str | None:
+        try:
+            return _dt.date(y, m, d).isoformat()
+        except ValueError:
+            return None
+
+    for pat in (
+        r"(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})(?:[T ].*)?",
+        r"(\d{4})(\d{2})(\d{2})",
+    ):
+        m = re.fullmatch(pat, text)
+        if m:
+            return _day(int(m[1]), int(m[2]), int(m[3]))
+    return None
+
+
+def _point_date_error(field: str, value: Any, norm_view: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "_declared_sources": [],
+        "_sources": [],
+        "ok": False,
+        "status": "invalid_arguments",
+        "error_code": "invalid_date",
+        "error_category": "参数错误",
+        "error": (
+            f"[参数错误] {field}={value!r} 不是具体日期；as_of/vintage 是时点，"
+            "请用 YYYY-MM-DD（月 / 季 / 年写法不支持）。"
+        ),
+        "hint": f"把 {field} 改成具体日期 YYYY-MM-DD（例如 2026-09-30）后重试。",
+        "normalized_params": norm_view,
+    }
+
+
+def _route_all_leg_windows(
+    normalized: dict[str, Any], nested: dict[str, Any]
+) -> list[tuple[str, str, str | None, str | None]]:
+    """The date window each `route='all'` fan-out leg actually carries.
+
+    AlphaEngine always rides the top-level start/end. Guidepoint carries its
+    nested params.start_date/end_date when either is present (the fan-out sends
+    no other window on that leg), else the top-level window. The two legs are
+    independent windows: judging them as one combined window both misses a
+    reversed nested one and reads a legit split (top-level start for
+    AlphaEngine, nested end_date for Guidepoint) as "start after end".
+    """
+    top_start, top_end = normalized.get("start"), normalized.get("end")
+    gp_start = nested.get("start_date")
+    gp_end = nested.get("end_date")
+    if _non_empty_str(gp_start) or _non_empty_str(gp_end):
+        return [
+            ("alphaengine", "顶层 start/end", top_start, top_end),
+            ("guidepoint", "params.start_date/end_date", gp_start, gp_end),
+        ]
+    return [
+        ("alphaengine", "顶层 start/end", top_start, top_end),
+        ("guidepoint", "顶层 start/end", top_start, top_end),
+    ]
+
+
+def _non_empty_str(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _normalize_date_window(
+    route: str,
+    normalized: dict[str, Any],
+    nested: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Apply the shared date-window rules to a call in place; error payload or None.
+
+    One definition for the bridge entry point and the `route='all'` fan-out
+    legs, so both agree on today (`_bridge_today`, max of this host's date and
+    Beijing's — a UTC date is a day behind part of every day and the gateway
+    rejects `start > end`): an `end` after today stops at today, a `start`
+    after today has nothing to find, AlphaEngine gets its window closed to a
+    pair, and a reversed window is refused.
+    """
+    nested = nested or {}
+    today = _bridge_today()
+
+    if isinstance(normalized.get("end"), str) and normalized["end"] > today:
+        normalized["end"] = today
+    for start_k, start_v in (("start", normalized.get("start")),) + tuple(
+        (f"params.{k}", nested.get(k)) for k in ("start", "date_from", "start_date")
+    ):
+        if isinstance(start_v, str) and start_v > today:
+            norm_view = _build_normalized_params_view(normalized)
+            err = _invalid_date_error(start_k, start_v, norm_view)
+            err["error"] = f"[参数错误] {start_k}={start_v!r} 晚于今天（{today}），没有可查的数据。"
+            return err
+
+    # route='all' fans out to legs that carry independent date windows (see
+    # _route_all_leg_windows), so each leg is judged on its own window — never
+    # on the two spliced together.
+    if route == "all":
+        for leg, which, leg_start, leg_end in _route_all_leg_windows(normalized, nested):
+            if _non_empty_str(leg_start) and _non_empty_str(leg_end) and leg_start > leg_end:
+                norm_view = _build_normalized_params_view(normalized)
+                err = _invalid_date_error("start", leg_start, norm_view)
+                err["error"] = (
+                    f"[参数错误] route='all' 的 {leg} 腿日期窗口无效：{which} 中 "
+                    f"开始日期 {leg_start} 晚于结束日期 {leg_end}。"
+                )
+                err["hint"] = f"把 {which} 改成开始不晚于结束的成对日期后重试。"
+                return err
+        return None
+
+    win_start = normalized.get("start") or nested.get("start") or nested.get("date_from") or nested.get("start_date")
+    win_end = normalized.get("end") or nested.get("end") or nested.get("date_to") or nested.get("end_date")
+    # AlphaEngine takes a date window only as a pair; one end alone is refused
+    # upstream, so close it: up to today, or a year back.
+    if route == "alphaengine" and (win_start is None) != (win_end is None):
+        import datetime as _dt
+
+        if win_end is None:
+            win_end = normalized["end"] = max(today, win_start)
+        else:
+            end_day = _dt.date.fromisoformat(win_end)
+            win_start = normalized["start"] = (end_day - _dt.timedelta(days=365)).isoformat()
+    if win_start and win_end and win_start > win_end:
+        norm_view = _build_normalized_params_view(normalized)
+        err = _invalid_date_error("start", win_start, norm_view)
+        err["error"] = f"[参数错误] 开始日期 {win_start} 晚于结束日期 {win_end}。"
+        err["hint"] = "把 start 改成不晚于 end 的日期后重试。"
+        return err
+    return None
+
+
 def _normalize_and_validate_call_args(
     tool_name: str,
     raw_args: dict[str, Any],
@@ -2642,65 +2821,74 @@ def _normalize_and_validate_call_args(
     if isinstance(normalized.get("ticker"), str):
         normalized["ticker"] = _normalize_ticker_for_route(route, normalized["ticker"])
 
+    # The gateway accepts query/start/end only on these routes (the library
+    # ones add `document`) and refuses a separate `--ticker`, so fold it into
+    # the query the same way the route='all' fan-out legs do.
+    if route in TICKER_FOLDS_INTO_QUERY_ROUTES:
+        folded_ticker = str(normalized.pop("ticker", "") or "").strip()
+        if folded_ticker:
+            folded_query = str(normalized.get("query") or "").strip()
+            if not _query_contains_ticker(folded_query, folded_ticker):
+                normalized["query"] = (
+                    f"{folded_ticker} {folded_query}".strip() if folded_query else folded_ticker
+                )
+            else:
+                normalized["query"] = folded_query
+
     if not is_comm:
         for date_k in _DATE_PARAM_FIELDS:
             raw_date = normalized.get(date_k)
             if raw_date is None:
                 continue
-            coerced = _normalize_date_param(date_k, raw_date)
-            if coerced is None:
-                norm_view = _build_normalized_params_view(normalized, is_community=is_comm)
-                return normalized, norm_view, _invalid_date_error(date_k, raw_date, norm_view)
+            if date_k in ("as_of", "vintage"):
+                # A point in time is not a window end: upstream has no "up to
+                # now" for it, so a future date or a month/quarter/year is the
+                # caller's mistake, not something to truncate.
+                coerced = _normalize_point_date_param(raw_date)
+                if coerced is None:
+                    norm_view = _build_normalized_params_view(normalized, is_community=is_comm)
+                    return normalized, norm_view, _point_date_error(date_k, raw_date, norm_view)
+                if coerced > _bridge_today():
+                    norm_view = _build_normalized_params_view(normalized, is_community=is_comm)
+                    err = _point_date_error(date_k, raw_date, norm_view)
+                    err["error"] = (
+                        f"[参数错误] {date_k}={raw_date!r} 晚于今天（{_bridge_today()}），没有可查的数据。"
+                    )
+                    return normalized, norm_view, err
+            else:
+                coerced = _normalize_date_param(date_k, raw_date)
+                if coerced is None:
+                    norm_view = _build_normalized_params_view(normalized, is_community=is_comm)
+                    return normalized, norm_view, _invalid_date_error(date_k, raw_date, norm_view)
             normalized[date_k] = coerced
-        # The upstream CLI refuses a date after its today (_bridge_today). An
-        # end is "up to now", so it stops there; a start after it has nothing
-        # to find.
-        today = _bridge_today()
-        for date_k in ("end", "as_of", "vintage"):
-            if isinstance(normalized.get(date_k), str) and normalized[date_k] > today:
-                normalized[date_k] = today
         params_obj = normalized.get("params")
         if isinstance(params_obj, dict):
             params_obj = dict(params_obj)
-            for nested_k in ("start", "date_from", "end", "date_to"):
+            # Guidepoint spells its nested window start_date/end_date; the
+            # same coercion and end truncation as the top-level start/end.
+            for nested_k in ("start", "date_from", "start_date", "end", "date_to", "end_date"):
                 if params_obj.get(nested_k) is None:
                     continue
-                as_field = "start" if nested_k in ("start", "date_from") else "end"
+                as_field = "start" if nested_k in ("start", "date_from", "start_date") else "end"
                 coerced = _normalize_date_param(as_field, params_obj[nested_k])
                 if coerced is None:
                     norm_view = _build_normalized_params_view(normalized, is_community=is_comm)
                     return normalized, norm_view, _invalid_date_error(f"params.{nested_k}", params_obj[nested_k], norm_view)
-                params_obj[nested_k] = min(coerced, today) if as_field == "end" else coerced
+                params_obj[nested_k] = min(coerced, _bridge_today()) if as_field == "end" else coerced
+            if (
+                route == "guidepoint"
+                and isinstance(params_obj.get("keywords"), str)
+                and params_obj["keywords"].strip()
+            ):
+                # Guidepoint's native API takes a list of keywords; a bare
+                # string is a 400 upstream.
+                params_obj["keywords"] = [params_obj["keywords"].strip()]
             normalized["params"] = params_obj
-        for start_k, start_v in (("start", normalized.get("start")),) + tuple(
-            (f"params.{k}", params_obj.get(k)) for k in ("start", "date_from") if isinstance(params_obj, dict)
-        ):
-            if isinstance(start_v, str) and start_v > today:
-                norm_view = _build_normalized_params_view(normalized, is_community=is_comm)
-                err = _invalid_date_error(start_k, start_v, norm_view)
-                err["error"] = f"[参数错误] {start_k}={start_v!r} 晚于今天（{today}），没有可查的数据。"
-                return normalized, norm_view, err
-        # The window as upstream merges it: a top-level end and a nested
-        # date_from (or the reverse) already make a pair.
-        nested = params_obj if isinstance(params_obj, dict) else {}
-        win_start = normalized.get("start") or nested.get("start") or nested.get("date_from")
-        win_end = normalized.get("end") or nested.get("end") or nested.get("date_to")
-        # AlphaEngine takes a date window only as a pair; one end alone is
-        # refused upstream, so close it: up to today, or a year back.
-        if route == "alphaengine" and (win_start is None) != (win_end is None):
-            import datetime as _dt
-
-            if win_end is None:
-                win_end = normalized["end"] = max(today, win_start)
-            else:
-                end_day = _dt.date.fromisoformat(win_end)
-                win_start = normalized["start"] = (end_day - _dt.timedelta(days=365)).isoformat()
-        if win_start and win_end and win_start > win_end:
-            norm_view = _build_normalized_params_view(normalized, is_community=is_comm)
-            err = _invalid_date_error("start", win_start, norm_view)
-            err["error"] = f"[参数错误] 开始日期 {win_start} 晚于结束日期 {win_end}。"
-            err["hint"] = "把 start 改成不晚于 end 的日期后重试。"
-            return normalized, norm_view, err
+        window_err = _normalize_date_window(
+            route, normalized, params_obj if isinstance(params_obj, dict) else None
+        )
+        if window_err is not None:
+            return normalized, window_err["normalized_params"], window_err
 
     # Validate nested `params` conflicts, top-level vs nested document conflicts, and alphaengine doc_id mapping
     if isinstance(normalized.get("params"), dict):
@@ -3296,11 +3484,34 @@ def _hint_conflicts_with_category(category: str, hint: str) -> bool:
     no_match_markers = ("无匹配", "未找到", "no match", "补充公司名重试", "没有匹配")
     if category != "没有匹配" and any(m in h_lower for m in no_match_markers):
         return True
+    if category == "没有匹配" and any(m in h_lower for m in ("暂不可用", "执行超时")):
+        return True
     if category == "权限或额度" and any(m in h_lower for m in ("参数错误", "未知参数")):
         return True
     if category == "参数错误" and any(m in h_lower for m in ("暂不可用", "执行超时")):
         return True
     return False
+
+
+# Upstream "found nothing for that concept/attachment id" messages (SEC): a
+# completed search with nothing to show, not an outage.
+_UPSTREAM_NO_MATCH_MARKERS: tuple[str, ...] = (
+    "no concepts matching",
+    "no concepts found",
+    "requested attachment was not found",
+)
+
+
+def _upstream_no_match_marker(err_lower: str) -> str | None:
+    for marker in _UPSTREAM_NO_MATCH_MARKERS:
+        if marker in err_lower:
+            return marker
+    return None
+
+
+def _reason_is_upstream_argument_error(reason: str) -> bool:
+    """True when one failed source's own reason is upstream's `E_BAD_*` argument check."""
+    return "e_bad_" in str(reason or "").strip().lower()
 
 
 def _classify_error_category_and_hint(
@@ -3329,9 +3540,11 @@ def _classify_error_category_and_hint(
     accepted_params = spec.get("accepted_params") or []
     accepted_ops = spec.get("operations") or []
 
-    if existing_cat in ("参数错误", "上游不可用", "权限或额度", "没有匹配"):
-        category = existing_cat
-    elif (
+    # Upstream's own argument checks (E_BAD_ARGS, E_BAD_DATE_RANGE, ...) ride
+    # only on their own leg; split them from the other parameter-error signals
+    # so a merged multi-source failure is not labeled by one leg's E_BAD_*.
+    e_bad_signal = "e_bad_" in err_lower or err_code.startswith("e_bad_")
+    other_param_signal = (
         status in ("invalid_arguments",)
         or err_code
         in (
@@ -3343,9 +3556,6 @@ def _classify_error_category_and_hint(
             "missing_required_parameters",
         )
         or "参数" in err_text
-        # Upstream's own argument checks (E_BAD_ARGS, E_BAD_DATE_RANGE, ...).
-        or "e_bad_" in err_lower
-        or err_code.startswith("e_bad_")
         or "未知" in err_text
         or "alphaengine 文档" in err_lower
         or "unsupported" in err_lower
@@ -3357,8 +3567,40 @@ def _classify_error_category_and_hint(
         or "format is invalid" in err_lower
         or "does not support" in err_lower
         or ("not allowed" in err_lower and status != "paid_source_not_allowed")
-    ):
-        category = "参数错误"
+    )
+    no_match_marker = _upstream_no_match_marker(err_lower)
+
+    if existing_cat in ("参数错误", "上游不可用", "权限或额度", "没有匹配"):
+        category = existing_cat
+    elif no_match_marker is not None:
+        # An unknown concept or attachment id found nothing; the upstream
+        # answered, so neither "参数错误" nor "上游暂不可用，可重试" is the fix.
+        category = "没有匹配"
+    elif other_param_signal or e_bad_signal:
+        _succeeded, failed_legs = (
+            _collect_multi_source_health(payload) if route == "all" else ([], [])
+        )
+        if failed_legs:
+            # Classify each failed leg individually first: a mixed fan-out (one
+            # parameter-error leg and one timeout/outage leg, even when the
+            # parameter error says "E_BAD_ARGS: 参数...") is only a whole-call
+            # parameter error when every failed leg is a parameter error.
+            leg_cats = {
+                name: _classify_error_category_and_hint(
+                    tool_name,
+                    name if name in ROUTE_CONTRACT_SPECS else route,
+                    operation,
+                    {"error": reason},
+                )[0]
+                for name, reason in failed_legs
+            }
+            if all(cat == "参数错误" for cat in leg_cats.values()):
+                category = "参数错误"
+            else:
+                payload["leg_categories"] = leg_cats
+                category = "上游不可用"
+        else:
+            category = "参数错误"
     elif (
         status
         in (
@@ -3420,7 +3662,12 @@ def _classify_error_category_and_hint(
                 "若无替代源必须在报告中如实写明该数据源因权限/配额取数失败，禁止写成“没有相关信息”。"
             )
     elif category == "没有匹配":
-        if route == "transcript":
+        if no_match_marker is not None:
+            hint = (
+                "SEC 未找到匹配的概念或附件 ID；先调用 finance(route='sec', operation='list-filings' 或 'attachments', "
+                "ticker=...) 拿到可用的 filing/attachment ID 再读取，不要猜文件名或章节 ID。"
+            )
+        elif route == "transcript":
             hint = TRANSCRIPT_NO_MATCH_HINT
         elif tool_name == "community":
             hint = (
@@ -4553,8 +4800,12 @@ class ResearchDataBridge:
 
     def _build_alphaengine_fanout_args(
         self, arguments: dict[str, Any]
-    ) -> dict[str, Any]:
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
         """Map `research(route='all')` search arguments to `route='alphaengine'` parameters.
+
+        Returns `(leg_args, window_error_or_none)`; a window error fails the
+        whole route='all' call as a parameter error at the fan-out call site,
+        it is never silently dropped.
 
         Mapping basis:
         - `data_gateway.py` sets `accepted['alphaengine'] = {'query', 'start', 'end'}` and rejects
@@ -4564,15 +4815,15 @@ class ResearchDataBridge:
           `['search_library', 'get_document', 'auth_status', 'list_filters']`, so `operation` is
           mapped to `'search_library'`.
         - `alphaengine-mcp/server.mjs` (`requireDatePair`) requires `start` (`date_from`) and `end`
-          (`date_to`) as a pair; if `start` is given without `end`, default `end` to today's UTC
-          date, and omit a lone `end` without `start`.
+          (`date_to`) as a pair; a lone `start` is closed to `end=_bridge_today()` by the
+          shared window rules (same helper as a direct call).
         - Local-library `params` keys (`sources`, `layer`, `search_mode`, etc.) are omitted because
           `search_library` sets `additionalProperties: false`.
         - Timeout is capped at `FANOUT_ALPHAENGINE_TIMEOUT_S` (60s).
         """
         query = str(arguments.get("query") or "").strip()
         ticker = str(arguments.get("ticker") or "").strip()
-        if ticker and ticker.lower() not in query.lower():
+        if ticker and not _query_contains_ticker(query, ticker):
             query = f"{ticker} {query}".strip() if query else ticker
 
         ae_args: dict[str, Any] = {
@@ -4582,12 +4833,19 @@ class ResearchDataBridge:
         }
         start = str(arguments.get("start") or "").strip()
         end = str(arguments.get("end") or "").strip()
-        if start and end:
+        if start:
             ae_args["start"] = start
+        if end:
             ae_args["end"] = end
-        elif start and not end:
-            ae_args["start"] = start
-            ae_args["end"] = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        # The same normalization/truncation/ordering as a direct call. The
+        # route='all' entry point already validated the caller's dates per leg,
+        # so the error return should be unreachable here — but it is returned,
+        # not dropped: a window this leg cannot serve legally fails the whole
+        # call as a parameter error. What matters day to day is that today is
+        # `_bridge_today()` (max of this host's and Beijing's date), not the
+        # UTC date: in the Beijing small hours UTC is a day behind and the
+        # gateway refused the resulting start > end window.
+        ae_win_err = _normalize_date_window("alphaengine", ae_args)
 
         limit = arguments.get("limit")
         if isinstance(limit, int) and not isinstance(limit, bool) and limit > 0:
@@ -4596,12 +4854,16 @@ class ResearchDataBridge:
         ae_args["timeout"] = self._compute_fanout_timeout(
             arguments, FANOUT_ALPHAENGINE_TIMEOUT_S
         )
-        return ae_args
+        return ae_args, ae_win_err
 
     def _build_guidepoint_fanout_args(
         self, arguments: dict[str, Any]
-    ) -> dict[str, Any]:
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
         """Map `research(route='all')` search arguments to `route='guidepoint'` parameters.
+
+        Returns `(leg_args, window_error_or_none)`; a window error fails the
+        whole route='all' call as a parameter error at the fan-out call site,
+        it is never silently dropped.
 
         Mapping basis:
         - `catalog()` (`config/data_sources.json`) registers `guidepoint` with
@@ -4620,7 +4882,7 @@ class ResearchDataBridge:
         """
         query = str(arguments.get("query") or "").strip()
         ticker = str(arguments.get("ticker") or "").strip()
-        if ticker and ticker.lower() not in query.lower():
+        if ticker and not _query_contains_ticker(query, ticker):
             query = f"{ticker} {query}".strip() if query else ticker
 
         gp_args: dict[str, Any] = {
@@ -4630,34 +4892,62 @@ class ResearchDataBridge:
         }
         start = str(arguments.get("start") or "").strip()
         end = str(arguments.get("end") or "").strip()
-        if start and end and start <= end:
-            gp_args["start"] = start
-            gp_args["end"] = end
-        elif start and not end:
-            gp_args["start"] = start
-        elif end and not start:
-            gp_args["end"] = end
+        raw_params = arguments.get("params")
+        # A nested window (params.start_date/end_date) belongs to this leg
+        # alone; carrying the top-level start/end beside it makes the gateway
+        # reject the whole call with a date-parameter conflict when the two
+        # disagree, so when a nested window is present it is the only one sent.
+        # AlphaEngine's leg keeps the top-level window either way.
+        has_nested_window = isinstance(raw_params, dict) and any(
+            str(raw_params.get(k) or "").strip() for k in ("start_date", "end_date")
+        )
+        gp_win_err: dict[str, Any] | None = None
+        if not has_nested_window:
+            if start:
+                gp_args["start"] = start
+            if end:
+                gp_args["end"] = end
+            # Shared window rules (end truncated to `_bridge_today()`, ordering
+            # checked); a lone end stays lone — Guidepoint, unlike AlphaEngine,
+            # accepts half a window. The entry point already validated the
+            # dates; the error, should one still arise, is returned, not dropped.
+            gp_win_err = _normalize_date_window("guidepoint", gp_args)
 
         limit = arguments.get("limit")
         if isinstance(limit, int) and not isinstance(limit, bool) and limit > 0:
             gp_args["limit"] = min(limit, 40)
 
-        raw_params = arguments.get("params")
         if isinstance(raw_params, dict):
             gp_params: dict[str, Any] = {}
-            if isinstance(raw_params.get("keywords"), list):
-                kw = [str(k).strip() for k in raw_params["keywords"] if str(k).strip()]
+            raw_keywords = raw_params.get("keywords")
+            if isinstance(raw_keywords, list):
+                kw = [str(k).strip() for k in raw_keywords if str(k).strip()]
                 if kw:
                     gp_params["keywords"] = kw
+            elif isinstance(raw_keywords, str) and raw_keywords.strip():
+                # Guidepoint's native API takes a list; a bare string is a 400.
+                gp_params["keywords"] = [raw_keywords.strip()]
             if isinstance(raw_params.get("recency_bias"), str) and raw_params["recency_bias"].strip():
                 gp_params["recency_bias"] = raw_params["recency_bias"].strip()
+            for nested_date_k, as_field in (("start_date", "start"), ("end_date", "end")):
+                raw_nd = raw_params.get(nested_date_k)
+                if raw_nd is not None and str(raw_nd).strip():
+                    coerced_nd = _normalize_date_param(as_field, raw_nd)
+                    gp_params[nested_date_k] = (
+                        min(coerced_nd, _bridge_today())
+                        if coerced_nd is not None and as_field == "end"
+                        else (coerced_nd if coerced_nd is not None else str(raw_nd).strip())
+                    )
             if gp_params:
+                nested_win_err = _normalize_date_window("guidepoint", gp_args, gp_params)
+                if nested_win_err is not None:
+                    gp_win_err = gp_win_err or nested_win_err
                 gp_args["params"] = gp_params
 
         gp_args["timeout"] = self._compute_fanout_timeout(
             arguments, FANOUT_GUIDEPOINT_TIMEOUT_S
         )
-        return gp_args
+        return gp_args, gp_win_err
 
     async def _run_alphaengine_fanout(
         self, req_id: Any, ae_args: dict[str, Any], ae_budget_s: float
@@ -7138,12 +7428,19 @@ class ResearchDataBridge:
             norm_params_view["route"] = route
 
         do_fanout = self._should_fanout_alphaengine(tool_name, arguments)
-        ae_args: dict[str, Any] | None = (
-            self._build_alphaengine_fanout_args(arguments) if do_fanout else None
-        )
-        gp_args: dict[str, Any] | None = (
-            self._build_guidepoint_fanout_args(arguments) if do_fanout else None
-        )
+        ae_args: dict[str, Any] | None = None
+        gp_args: dict[str, Any] | None = None
+        if do_fanout:
+            ae_args, ae_win_err = self._build_alphaengine_fanout_args(arguments)
+            gp_args, gp_win_err = self._build_guidepoint_fanout_args(arguments)
+            # A leg window the entry point's per-leg validation somehow let
+            # through fails the whole call as a parameter error — the old code
+            # dropped the error and sent the bad window upstream anyway.
+            fanout_win_err = ae_win_err or gp_win_err
+            if fanout_win_err is not None:
+                return self._make_tool_result_response(
+                    req_id, fanout_win_err, is_error=True
+                )
         ae_outcome: dict[str, Any] | None = None
         gp_outcome: dict[str, Any] | None = None
 

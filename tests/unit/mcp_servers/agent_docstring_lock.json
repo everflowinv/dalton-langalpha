@@ -277,6 +277,8 @@
     "doc_lines": [
       "Fetch raw historical financial statements for trend analysis or model",
       "building. statement_type=\"all\" returns income, balance sheet, and cash flow.",
+      "US: prefer SEC data finance(route=\"sec\", operation=\"financials\") (primary,",
+      "free); HK/A-share: yfinance statement tools.",
       "",
       "Args:",
       "    symbol: Ticker, e.g. \"AAPL\", \"0700.HK\", \"600519.SH\".",

@@ -40,3 +40,5 @@ web/src/components/dalton/
 web/src/lib/dalton/
 tests/unit/tools/secretary/test_workspace_file_write_cos.py
 tests/unit/tools/secretary/test_workspace_list_sharing_note.py
+tests/unit/mcp_servers/test_market_data_yf_fallback.py
+tests/unit/server/handlers/chat/test_attachments_notes.py

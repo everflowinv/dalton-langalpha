@@ -55,7 +55,11 @@ def _fmp_client(**overrides) -> AsyncMock:
 
 
 def _force_fmp_path(mod):
-    """Make the ginlix (US) client report 'no data' so the FMP path runs."""
+    """Make the ginlix (US) client report 'no data' so the FMP path runs.
+
+    DALTON-HOOK(market-data-fallback): the yfinance leg ahead of FMP is
+    neutralized suite-wide by the autouse fixture in conftest.py.
+    """
     return patch.object(mod._ginlix, "fetch_stock_data", new=AsyncMock(return_value=None))
 
 
