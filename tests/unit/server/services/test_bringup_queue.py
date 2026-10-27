@@ -83,10 +83,6 @@ def steps():
         default = {"workspace_id": workspace_id, "computer_id": "computer-1"}
         return placements.get(workspace_id, default)
 
-    @asynccontextmanager
-    async def folder_in_use(workspace_id):
-        yield
-
     def kept_of(workspace_id):
         default = frozenset({f"live-{workspace_id}"})
         return live.get(workspace_id, ThreadPrefixes(all=default, open=default))
@@ -135,7 +131,6 @@ def steps():
         patch.object(_bringup, "_inventory", inventory_of),
         patch.object(_bringup, "_thread_prefixes", live_threads),
         patch.object(_bringup, "get_workspace_placement", placement_of),  # DALTON-HOOK(bringup-owner-check)
-        patch.object(_bringup, "workspace_folder_in_use", folder_in_use),
         patch.object(_bringup.cache, "client", lambda: None),
         patch.object(_bringup, "_BUSY_PAUSE_S", 0.0),
         patch.object(_bringup._thread_dirs, "prune_dead_thread_dirs", prune),

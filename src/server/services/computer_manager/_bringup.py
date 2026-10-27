@@ -13,17 +13,14 @@ from typing import TYPE_CHECKING, Any, Optional
 
 from ptc_agent.core.paths import WorkspaceLayout
 from src.server.database.computer import DEFAULT_ROOT_DIR, get_computer_for_workspace
-# DALTON-HOOK(bringup-owner-check): the placement row and folder hold the
-# per-step owner check reads, before any restore, prune or transcript sync.
+# DALTON-HOOK(bringup-owner-check): the placement row the per-step owner
+# check reads, before any restore, prune or transcript sync.
 from src.server.database.workspace import (
     get_live_workspace_ids_for_computer,
     get_workspace_placement,
 )
 from src.server.database.workspace_file import WorkspaceSyncBusy
-from src.server.database.workspace_folders import (
-    WorkspaceFolderMoving,
-    workspace_folder_in_use,
-)
+from src.server.database.workspace_folders import WorkspaceFolderMoving
 from src.server.services import transcripts
 from src.server.services.computer_manager import _thread_dirs
 from src.server.services.livefs import cache
@@ -209,11 +206,14 @@ class BringUp:
                     pass
                 continue
             workspace_id, step = min(ready, key=lambda item: item[1])
-            # DALTON-HOOK(bringup-owner-check): a queued step can outlive the
-            # binding it was queued for, so each one is re-checked against the
-            # database before any restore, prune or sync runs (see
-            # ``_still_ours``, which both dispatch branches pass through).
-            if not await self._still_ours(workspace_id):
+            # DALTON-HOOK(bringup-owner-check): fast path only — a restart's
+            # queue can outlive the binding its workspaces were queued under,
+            # and dropping one that already left here saves it the stamp and
+            # folder reads of a pass that would end in the gate below. The
+            # check that actually guards the writes runs inside the folder
+            # hold each step's work already needs (``_restore`` / ``_sync``);
+            # both posts are the same judgment, ``_placement_is_ours``.
+            if not await self._placement_is_ours(workspace_id):
                 self.pending.pop(workspace_id, None)
                 self._forget(workspace_id)
                 continue
@@ -232,24 +232,18 @@ class BringUp:
     # while the queue worked through the rest, and a move from a backup leaves
     # the folder behind under its name, so no folder-level signal names it.
     # The placement row (deleted filtered, current computer_id) is the
-    # commit's truth, and the folder hold it is read under is the move's own
-    # gate for the folder, so the answer cannot sit beside a half-done
-    # set-aside of this workspace's folder. Dropped is not failed: the
+    # commit's truth. Callers that write take the folder hold first and read
+    # it inside (a move's set-aside takes the same hold, so it cannot land
+    # between this check and the writes it gates); the run() fast path reads
+    # it without the hold only to drop work early. Dropped is not failed: the
     # workspace's next acquisition on whichever computer holds it now queues
     # the work where it belongs, and the dropped attach key lets it.
-    async def _still_ours(self, workspace_id: str) -> bool:
+    async def _placement_is_ours(self, workspace_id: str) -> bool:
         """Whether the workspace still lives on this job's computer, read
         fresh from the database; False also when the read itself fails, since
         the safe side of not knowing is to write nothing."""
         try:
-            async with workspace_folder_in_use(workspace_id):
-                placement = await get_workspace_placement(workspace_id)
-        except WorkspaceFolderMoving:
-            logger.info(
-                f"Bring-up of workspace {workspace_id} found no settled "
-                f"folder; its next acquisition queues it again"
-            )
-            return False
+            placement = await get_workspace_placement(workspace_id)
         except Exception as e:  # noqa: BLE001 - no answer means no writes here
             logger.warning(
                 f"Bring-up of workspace {workspace_id} on computer "
@@ -304,6 +298,14 @@ class BringUp:
             async with held_workspace_layout(workspace_id, self.root) as layout:
                 if layout is None:
                     raise WorkspaceFolderMoving(workspace_id)
+                # DALTON-HOOK(bringup-owner-check): the ownership check rides
+                # inside the hold that fences this pass's writes, so a move
+                # that commits while the step waited on the stamp, the threads
+                # or this very hold is caught here, before the first exec.
+                if not await self._placement_is_ours(workspace_id):
+                    self.pending.pop(workspace_id, None)
+                    self._forget(workspace_id)
+                    return
                 listing, inventory = await _inventory(self.sandbox.runtime, layout)
                 kept, pruned = await _thread_dirs.prune_dead_thread_dirs(
                     self.sandbox.runtime, layout, workspace_id, listing=listing
@@ -359,9 +361,26 @@ class BringUp:
 
     async def _sync(self, workspace_id: str) -> bool:
         """Whether no thread was left behind. Only its own turn end exports a
-        thread again, so one nobody reopens waits on the next sync."""
+        thread again, so one nobody reopens waits on the next sync.
+
+        The export itself is server-side, but the step is this machine's duty
+        under this binding, so the folder hold pins the workspace's folder —
+        the same hold a move's set-aside takes — across the ownership check
+        and the export: a workspace that left while its restore ran or this
+        step waited is dropped here (False), and the caller forgets its
+        attach key as any dropped step's does."""
         try:
-            outcome = await transcripts.sync_workspace(workspace_id)
+            async with held_workspace_layout(workspace_id, self.root):
+                # DALTON-HOOK(bringup-owner-check)
+                if not await self._placement_is_ours(workspace_id):
+                    return False
+                outcome = await transcripts.sync_workspace(workspace_id)
+        except WorkspaceFolderMoving:
+            logger.info(
+                f"Transcript sync for workspace {workspace_id} found no "
+                f"settled folder; its next acquisition queues it again"
+            )
+            return False
         except Exception as e:
             logger.warning(f"Transcript sync failed for workspace {workspace_id}: {e}")
             return False
