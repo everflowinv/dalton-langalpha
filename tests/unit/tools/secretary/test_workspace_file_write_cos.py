@@ -301,3 +301,82 @@ async def test_plain_relative_path_unchanged(
         "/root/DASH/sources/brief.md", "# 简报\n"
     )
     assert payload["path"] == "sources/brief.md"
+
+
+# --- Case sensitivity (the sandbox is Linux) and listing-failure behavior ---
+
+
+@pytest.mark.asyncio
+async def test_different_case_prefix_is_an_ordinary_subdirectory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Writing dash/... (different case) into the DASH workspace: exact-match
+    rules treat it as an ordinary subdirectory — no prefix error, no refusal."""
+    sandbox = _install(monkeypatch, DASH_ROW, existing_subdirs=[])
+
+    command = await workspace_file_write_cos(
+        user_id="u-1",
+        workspace_id="ws-dash",
+        path="dash/notes.md",
+        content="# 小写目录\n",
+        tool_call_id="tc-case-own",
+    )
+    payload = _payload(command)
+    assert payload["success"] is True, payload
+    sandbox.awrite_file_text.assert_called_once_with(
+        "/root/DASH/dash/notes.md", "# 小写目录\n"
+    )
+    assert payload["path"] == "dash/notes.md"
+
+
+@pytest.mark.asyncio
+async def test_different_case_sibling_prefix_in_home_is_an_ordinary_directory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Home has NVDA/ and a live NVDA sibling workspace: writing nvda/notes.md
+    (different case) is an ordinary new directory, not the sibling's folder."""
+    sandbox = _install(
+        monkeypatch,
+        HOME_ROW,
+        live_folders=[
+            {"workspace_id": "ws-home", "name": "Home", "dir_name": "Home"},
+            {"workspace_id": "ws-nvda", "name": "NVDA", "dir_name": "NVDA"},
+        ],
+        existing_subdirs=["NVDA"],
+    )
+
+    command = await workspace_file_write_cos(
+        user_id="u-1",
+        workspace_id="ws-home",
+        path="nvda/notes.md",
+        content="# 小写兄弟目录\n",
+        tool_call_id="tc-case-sibling",
+    )
+    payload = _payload(command)
+    assert payload["success"] is True, payload
+    sandbox.awrite_file_text.assert_called_once_with(
+        "/root/Home/nvda/notes.md", "# 小写兄弟目录\n"
+    )
+
+
+@pytest.mark.asyncio
+async def test_directory_listing_failure_writes_the_original_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the directory listing fails, the write proceeds on the ORIGINAL
+    path — no error, no prefix advice that could misplace the file."""
+    sandbox = _install(monkeypatch, DASH_ROW, existing_subdirs=[])
+    sandbox.als_directory.side_effect = RuntimeError("listing failed")
+
+    command = await workspace_file_write_cos(
+        user_id="u-1",
+        workspace_id="ws-dash",
+        path="DASH/readme.md",
+        content="# 原路径写入\n",
+        tool_call_id="tc-listfail",
+    )
+    payload = _payload(command)
+    assert payload["success"] is True, payload
+    sandbox.awrite_file_text.assert_called_once_with(
+        "/root/DASH/DASH/readme.md", "# 原路径写入\n"
+    )

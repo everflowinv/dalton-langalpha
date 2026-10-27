@@ -366,7 +366,7 @@ def resolve_researchdata_transport() -> dict[str, Any]:
             "error": f"无法导入沙箱包装模块 tools.{RESEARCHDATA_SERVER}（{str(e)[:200]}）",
         }
     try:
-        import mcp_client  # type: ignore # noqa: F401 - 包装模块经它调 MCP，缺它时包装模块只剩会抛错的桩
+        import mcp_client as mcp_client_module  # type: ignore # 包装模块经它调 MCP，缺它时包装模块只剩会抛错的桩
     except Exception as e:  # noqa: BLE001
         return {
             "mode": None,
@@ -376,18 +376,35 @@ def resolve_researchdata_transport() -> dict[str, Any]:
     config_path = os.environ.get(
         "PTC_WORKSPACE_CONFIG", ".agents/tools/mcp_client_config.json"
     )
+    # 配置读不到时不能认为包装模块可用：没有它，启用集合未知、每次调用都会
+    # 在运行时里失败——启动即报配置错误，而不是 7 个来源各失败一次。
     try:
         with open(config_path, encoding="utf-8") as fh:
             cfg = json.load(fh)
         enabled = set((cfg.get("servers") or {}).keys())
-    except (OSError, ValueError):
-        enabled = None
-    if enabled is not None and RESEARCHDATA_SERVER not in enabled:
+    except OSError as e:
+        return {
+            "mode": None,
+            "call": None,
+            "error": f"无法读取工作区 MCP 配置（{config_path}）：{str(e)[:160]}",
+        }
+    except ValueError as e:
+        return {
+            "mode": None,
+            "call": None,
+            "error": f"工作区 MCP 配置不可解析（{config_path}）：{str(e)[:160]}",
+        }
+    if RESEARCHDATA_SERVER not in enabled:
         return {
             "mode": None,
             "call": None,
             "error": f"工作区未启用 {RESEARCHDATA_SERVER} MCP 服务器（{config_path}）",
         }
+    # 优先用保留 MCP isError 标志的入口（运行时随本仓库发布）；旧运行时里没有
+    # 它时退回 _call_mcp_tool（值里看不到错误标志，只能靠 error 字段判错）。
+    flagged = getattr(mcp_client_module, "call_mcp_tool_with_error_flag", None)
+    if callable(flagged):
+        return {"mode": "wrapper", "call": flagged, "error": ""}
     call_fn = getattr(wrapper, "_call_mcp_tool", None)
     if not callable(call_fn):
         return {
@@ -497,11 +514,19 @@ def _normalize_dict_result(
 
 
 def _call_wrapper(call_fn: Any, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-    """经包装模块调用一个 researchdata 工具，返回与 HTTP 桥路径同构的结果。"""
+    """经包装模块调用一个 researchdata 工具，返回与 HTTP 桥路径同构的结果。
+
+    call_fn 是运行时的 call_mcp_tool_with_error_flag 时返回 (is_error, value)：
+    MCP isError=true 的应答解包后值里没有错误标志（如 {"message": "unauthorized"}），
+    is_error 是唯一判据，为真即失败并保留值里的错误文本。"""
     try:
-        value = call_fn(RESEARCHDATA_SERVER, tool_name, arguments)
+        result = call_fn(RESEARCHDATA_SERVER, tool_name, arguments)
     except Exception as e:  # noqa: BLE001 - MCP 调用失败按来源失败记录，不让脚本崩溃
         return {"ok": False, "status": "exception", "error": str(e)[:300]}
+    is_error = False
+    value = result
+    if isinstance(result, tuple) and len(result) == 2 and isinstance(result[0], bool):
+        is_error, value = result
     if isinstance(value, str):
         raw_text = value.strip()
         try:
@@ -513,7 +538,9 @@ def _call_wrapper(call_fn: Any, tool_name: str, arguments: dict[str, Any]) -> di
                 "error": raw_text[:300] if raw_text else "wrapper returned non-JSON text",
             }
     if isinstance(value, dict):
-        return _normalize_dict_result(value, default_error="wrapper_call_failed")
+        return _normalize_dict_result(
+            value, outer_is_error=is_error, default_error="wrapper_call_failed"
+        )
     return {
         "ok": False,
         "status": "invalid_format",

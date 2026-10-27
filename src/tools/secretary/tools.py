@@ -484,7 +484,12 @@ def _is_home_workspace(workspace: dict) -> bool:
 async def _has_subdirectory(
     sandbox: object, work_dir: str, subdir_name: str, *, fail_open: bool
 ) -> bool:
-    """True when ``<work_dir>/<subdir_name>`` already exists as a directory."""
+    """True when ``<work_dir>/<subdir_name>`` already exists as a directory.
+
+    A listing failure never refuses or rewrites the write: it logs a warning
+    and answers ``fail_open`` — every caller passes True so the write proceeds
+    on the ORIGINAL path rather than telling the model to strip a prefix the
+    caller may genuinely mean."""
     try:
         entries = await sandbox.als_directory(work_dir)
     except Exception as e:
@@ -541,11 +546,10 @@ async def _sibling_folder_named(
             folder = str(row.get("dir_name") or row.get("name") or "").strip()
         else:
             folder = str(row or "").strip()
-        if (
-            folder
-            and folder.casefold() != own_dir.casefold()
-            and folder.casefold() == first.casefold()
-        ):
+        # Exact match: the sandbox is Linux and filenames are case-sensitive,
+        # so "nvda/" in Home is an ordinary folder even beside an "NVDA"
+        # workspace — same rule as the own-prefix and subdirectory checks.
+        if folder and folder != own_dir and folder == first:
             matched_sibling = folder
             break
     if matched_sibling is None:
@@ -809,7 +813,7 @@ async def workspace_file_write_cos(
                 and parts[0].strip() == own_dir
             ):
                 if not await _has_subdirectory(
-                    sandbox, work_dir, own_dir, fail_open=False
+                    sandbox, work_dir, own_dir, fail_open=True
                 ):
                     rest = parts[1].strip().lstrip("/")
                     return error_command(

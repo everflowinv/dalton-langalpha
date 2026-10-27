@@ -1708,6 +1708,16 @@ MOVE_FILES = {"research/2026-10-23-stock-move.md": "归因" * 200}
 async def test_stock_move_no_change_needs_no_knowledge_update(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # Every call in this test names a conversation run; give it a readable
+    # start so the window anchors (a named run without one is its own case).
+    monkeypatch.setattr(
+        check_done_tools,
+        "_run_start_epoch",
+        create_autospec(
+            check_done_tools._run_start_epoch,
+            return_value=int(time.time()) - 3600,
+        ),
+    )
     _patch_knowledge(monkeypatch, [])
     _patch_verdicts(
         monkeypatch,
@@ -2111,13 +2121,14 @@ async def test_weekly_and_earnings_calendar_push_draft_and_unreadable_start_fail
     )
     assert cal_ok["done"] is True, cal_ok["missing"]
 
-    # 3. Run start time unreadable, thread start time readable -> uses thread start time.
-    # Also verify the 5s tolerance: mtime = start - 3s counts as current round,
-    # while mtime = start - 10s is rejected as earlier than current round.
+    # 3. Run start readable: the 5s tolerance holds — mtime = start - 3s
+    # counts as current round, while mtime = start - 10s is rejected.
+    # (A run id whose start is unreadable now reports the dedicated gap; its
+    # own test covers that.)
     _patch_knowledge(
         monkeypatch,
         [],
-        start_epochs={"conv-run-unknown": None, "short-1": DEFAULT_START_EPOCH},
+        start_epochs={"conv-run-unknown": DEFAULT_START_EPOCH, "short-1": DEFAULT_START_EPOCH},
     )
     within_tolerance = await run_check_done(
         workflow="dalton-earnings-calendar",
@@ -3311,7 +3322,7 @@ async def test_explicit_delta_note_param_stale_mtime_is_rejected(
     assert any(
         "research/2026-10-20-delta.md" in m
         and "不是本轮写的" in m
-        and "显式路径" in m
+        and "期望路径" in m
         for m in result["missing"]
     )
 
@@ -3442,3 +3453,180 @@ async def test_verdict_from_sibling_thread_in_same_workspace_is_rejected(
         conversation_run_id="resp-wake",
     )
     assert accepted["done"] is True, accepted["missing"]
+
+
+# --- Same-as_of reruns: every contract artifact must be THIS run's writing ---
+
+
+# A second delta run later the same as_of day: its window starts here.
+_SECOND_RUN_EPOCH = int(datetime(2026, 10, 27, 13, 0, tzinfo=timezone.utc).timestamp())
+
+
+def _second_run_files() -> dict[str, str]:
+    """A healthy thesis-delta workspace whose note keeps the template's own
+    dated spelling (no variant needed): as_of names the same day as the run."""
+    return {
+        "research/tracker/last_run.json": json.dumps(
+            {"ticker": "META", "run_id": "20261027-1300", "material": "yes", "until": "2026-10-27"}
+        ),
+        "research/tracker/updates.log": "2026-10-27 13:05 | 20261027-1300 | material=yes | s\n",
+        "research/2026-10-27-delta.md": "# 增量\n" + "变化" * 200,
+    }
+
+
+def _patch_second_run_start(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        check_done_tools,
+        "_run_start_epoch",
+        create_autospec(
+            check_done_tools._run_start_epoch,
+            return_value=_SECOND_RUN_EPOCH,
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_same_as_of_rerun_rejects_the_morning_runs_template_note(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Second run of the same as_of day: the note left by the morning run
+    (template path, exists, big enough) is NOT this run's writing — judged
+    missing with the expected path."""
+    _patch_second_run_start(monkeypatch)
+    _patch_knowledge(monkeypatch, ["thesis"])
+    _patch_verdicts(monkeypatch, [_verdict_row("THESIS_STRENGTHENED", "internal_material")])
+
+    result = await run_check_done(
+        workflow="dalton-thesis-delta",
+        params={"ticker": "META", "as_of": "2026-10-27"},
+        backend=_make_backend(
+            _second_run_files(),
+            mtimes={
+                "research/2026-10-27-delta.md": _SECOND_RUN_EPOCH - 3600,
+                "research/tracker/last_run.json": _SECOND_RUN_EPOCH + 60,
+                "research/tracker/updates.log": _SECOND_RUN_EPOCH + 60,
+            },
+        ),
+        workspace_id=WS,
+        thread_id="short-1",
+        conversation_run_id="resp-2nd",
+    )
+    assert result["done"] is False
+    assert any(
+        "不是本轮写的" in m
+        and "research/2026-10-27-delta.md" in m
+        and "期望路径" in m
+        for m in result["missing"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_same_as_of_rerun_passes_when_this_run_rewrites_the_note(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rewritten inside this run's window (even 2s behind the window start —
+    sandbox clock skew): the contract completes."""
+    _patch_second_run_start(monkeypatch)
+    _patch_knowledge(monkeypatch, ["thesis"])
+    _patch_verdicts(monkeypatch, [_verdict_row("THESIS_STRENGTHENED", "internal_material")])
+
+    result = await run_check_done(
+        workflow="dalton-thesis-delta",
+        params={"ticker": "META", "as_of": "2026-10-27"},
+        backend=_make_backend(
+            _second_run_files(),
+            mtimes={
+                # 2s behind the run start: inside the shared 5s tolerance.
+                "research/2026-10-27-delta.md": _SECOND_RUN_EPOCH - 2,
+                "research/tracker/last_run.json": _SECOND_RUN_EPOCH + 60,
+                "research/tracker/updates.log": _SECOND_RUN_EPOCH + 60,
+            },
+        ),
+        workspace_id=WS,
+        thread_id="short-1",
+        conversation_run_id="resp-2nd",
+    )
+    assert result["done"], result["missing"]
+
+
+@pytest.mark.asyncio
+async def test_same_as_of_rerun_rejects_a_stale_last_run_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """last_run.json is a contract artifact like the rest: a commit record
+    from the morning run does not close the afternoon run."""
+    _patch_second_run_start(monkeypatch)
+    _patch_knowledge(monkeypatch, ["thesis"])
+    _patch_verdicts(monkeypatch, [_verdict_row("THESIS_STRENGTHENED", "internal_material")])
+
+    result = await run_check_done(
+        workflow="dalton-thesis-delta",
+        params={"ticker": "META", "as_of": "2026-10-27"},
+        backend=_make_backend(
+            _second_run_files(),
+            mtimes={
+                "research/2026-10-27-delta.md": _SECOND_RUN_EPOCH + 60,
+                "research/tracker/last_run.json": _SECOND_RUN_EPOCH - 3600,
+                "research/tracker/updates.log": _SECOND_RUN_EPOCH + 60,
+            },
+        ),
+        workspace_id=WS,
+        thread_id="short-1",
+        conversation_run_id="resp-2nd",
+    )
+    assert result["done"] is False
+    assert any(
+        "不是本轮写的" in m and "research/tracker/last_run.json" in m
+        for m in result["missing"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_named_run_without_readable_start_reports_retryable_gap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """conversation_run_id provided but its start cannot be read: the check
+    reports the dedicated gap instead of silently widening the window; with
+    no run id at all, the legacy fallback windows still apply."""
+    # No start epoch for "resp-undated": the DB stub answers None for it.
+    _patch_knowledge(monkeypatch, ["thesis"], start_epochs={"short-1": _SECOND_RUN_EPOCH})
+    _patch_verdicts(monkeypatch, [_verdict_row("THESIS_STRENGTHENED", "internal_material")])
+
+    result = await run_check_done(
+        workflow="dalton-thesis-delta",
+        params={"ticker": "META", "as_of": "2026-10-27"},
+        backend=_make_backend(
+            _second_run_files(),
+            mtimes={
+                "research/2026-10-27-delta.md": _SECOND_RUN_EPOCH - 3600,
+                "research/tracker/last_run.json": _SECOND_RUN_EPOCH + 60,
+                "research/tracker/updates.log": _SECOND_RUN_EPOCH + 60,
+            },
+        ),
+        workspace_id=WS,
+        thread_id="short-1",
+        conversation_run_id="resp-undated",
+    )
+    assert result["done"] is False
+    assert any(
+        "无法核对本轮完成情况" in m and "读不到本轮开始时间" in m and "dalton_check_done" in m
+        for m in result["missing"]
+    )
+
+    # Without a run id, the same workspace falls back to the thread-start
+    # window (the morning note is in-window there, so no such gap appears).
+    no_id = await run_check_done(
+        workflow="dalton-thesis-delta",
+        params={"ticker": "META", "as_of": "2026-10-27"},
+        backend=_make_backend(
+            _second_run_files(),
+            mtimes={
+                "research/2026-10-27-delta.md": _SECOND_RUN_EPOCH - 3600,
+                "research/tracker/last_run.json": _SECOND_RUN_EPOCH + 60,
+                "research/tracker/updates.log": _SECOND_RUN_EPOCH + 60,
+            },
+        ),
+        workspace_id=WS,
+        thread_id="short-1",
+    )
+    assert not any("无法核对本轮完成情况" in m for m in no_id["missing"])

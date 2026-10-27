@@ -850,3 +850,29 @@ def test_inline_source_url_at_end_extracted_before_summary_cleanup() -> None:
     assert artifact.get("no_evidence") is not True
     assert artifact["evidence_count"] == 1
     assert "https://x.com/NickRokke/status/2112925226740683159" in artifact["answer"]
+
+
+def test_short_quoted_terms_pair_correctly_and_stay_quoted() -> None:
+    """Two short quoted terms on one line pair each with its OWN closing quote
+    (never spanning from one term's closing quote to the next term's opener),
+    and both stay quoted verbatim."""
+    from src.dalton.web_search.x_search import _strip_quoted_spans
+
+    answer = (
+        '"AI" demand continues to grow over the next several quarters "GPU"'
+    )
+    assert _strip_quoted_spans(answer) == answer
+
+    # A long quote between short terms: only the long one loses its marks.
+    mixed = 'Short "AI" note. "the datacenter buildout is far from finished per management" end.'
+    out = _strip_quoted_spans(mixed)
+    assert '"AI"' in out
+    assert '"the datacenter buildout' not in out
+    assert "the datacenter buildout is far from finished per management" in out
+
+    # Chinese pairs behave the same.
+    zh = "“AI”需求持续，“管理层在电话会上表示未来三个季度的资本开支将明显高于市场预期”结束。"
+    zh_out = _strip_quoted_spans(zh)
+    assert "“AI”" in zh_out
+    assert "“管理层在电话会上" not in zh_out
+    assert "管理层在电话会上表示未来三个季度的资本开支将明显高于市场预期" in zh_out

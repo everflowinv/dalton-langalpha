@@ -66,13 +66,16 @@ MAX_X_HANDLES = 20
 
 # 生成摘要里的模型控制标记（<|eos|>、<｜eos｜>、<|im_end|>、…）。
 _CONTROL_TOKEN_RE = re.compile(r"<[|｜][A-Za-z0-9_]+[|｜]>")
-# 成对引号（直双引号、弯双引号、中文直角双引号）：无来源时仅对长度 >= 20 的引语剥掉两侧引号，保留正文与短术语引号。
-_LONG_QUOTED_SPAN_RES = (
-    re.compile(r'"([^"\n]{20,})"'),
-    re.compile(r"“([^”\n]{20,})”"),
-    re.compile(r"「([^」\n]{20,})」"),
-    re.compile(r"『([^』\n]{20,})』"),
+# 引号对（直双引号、弯双引号、中文直角双引号）。无来源摘要按"逐对识别"处理：
+# 每个开引号只与自己最近的闭引号配对，不跨到下一对，避免两个短术语被串成一段
+# 长引语；配对成功且内部 ≥ 20 字符的才剥掉两侧引号（保留文字），短引号原样保留。
+_QUOTE_PAIRS: Tuple[Tuple[str, str], ...] = (
+    ('"', '"'),
+    ("“", "”"),
+    ("「", "」"),
+    ("『", "』"),
 )
+_LONG_QUOTE_MIN_CHARS = 20
 
 _X_SNOWFLAKE_EPOCH_MS = 1288834974657
 _X_MIN_VALID_DT = datetime(2010, 11, 1, 0, 0, 0, tzinfo=timezone.utc)
@@ -197,10 +200,35 @@ def _sanitize_generated_summary(
 
 def _strip_quoted_spans(answer: str) -> str:
     """Unquote paired quoted spans of length >= 20 in a no-evidence summary
-    while keeping their inner text and leaving short quoted terms intact."""
-    for pattern in _LONG_QUOTED_SPAN_RES:
-        answer = pattern.sub(r"\1", answer)
-    return answer
+    while keeping their inner text and leaving short quoted terms intact.
+
+    Quotes are PAIRED first — each opening quote closes at its own nearest
+    closing mark, never at the next pair's opener — so two short terms on one
+    line (``"AI" ... "GPU"``) are never read as one long span between them."""
+    out: List[str] = []
+    i = 0
+    n = len(answer)
+    while i < n:
+        ch = answer[i]
+        pair = next(((o, c) for o, c in _QUOTE_PAIRS if ch == o), None)
+        if pair is None:
+            out.append(ch)
+            i += 1
+            continue
+        _open, close_ch = pair
+        close = answer.find(close_ch, i + 1)
+        if close == -1:
+            # Unmatched opener: leave it as text rather than guessing a span.
+            out.append(ch)
+            i += 1
+            continue
+        inner = answer[i + 1 : close]
+        if len(inner) >= _LONG_QUOTE_MIN_CHARS and "\n" not in inner:
+            out.append(inner)
+        else:
+            out.append(answer[i : close + 1])
+        i = close + 1
+    return "".join(out)
 
 
 def _x_answer_with_sources(
@@ -208,13 +236,13 @@ def _x_answer_with_sources(
 ) -> Union[str, List[Dict[str, Any]]]:
     """Place the xAI synthesized summary (with untrusted external content notice) as the leading `answer_box` item.
 
-    With no post evidence at all the summary is marked `no_evidence` and its
-    quoted spans are stripped: nothing in it may be cited as fact or quote."""
+    With no post evidence at all the summary is marked `no_evidence`; its long
+    quoted spans were already unquoted in ``map_x_search_response`` (the one
+    layer that does it), so nothing here re-processes the text."""
     if not results:
-        dequoted = _strip_quoted_spans(answer)
         return (
             f"{X_ANSWER_ONLY_HEADING} [{X_NO_EVIDENCE_TAG}]\n"
-            f"{X_NO_EVIDENCE_NOTICE}\n{dequoted}"
+            f"{X_NO_EVIDENCE_NOTICE}\n{answer}"
         )
     prefixed_answer = f"{X_UNTRUSTED_NOTICE}\n{answer}" if answer else X_UNTRUSTED_NOTICE
     return [

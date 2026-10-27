@@ -59,6 +59,17 @@ _VALIDATOR_OUTPUT_CHARS = 300
 
 _RUN_STATUS_GLOB = ".agents/threads/*/workflows/*/status.json"
 
+# Freshness tolerance shared by every "written this run" judgment: absorbs
+# Postgres `::bigint` rounding, 1s `stat -c %Y` granularity, and minor
+# host/sandbox clock skew (a sandbox clock 2s behind must not fail its own
+# just-written file).
+MTIME_TOLERANCE_SECONDS = 5
+
+# The one gap a named-but-undatable turn reports: no silent fallback window.
+_RUN_START_UNAVAILABLE_MESSAGE = (
+    "无法核对本轮完成情况（读不到本轮开始时间），请稍后重试 dalton_check_done。"
+)
+
 
 def _thread_prefix(thread_id: str | None) -> str:
     """The journal/status glob prefix narrowed to ONE thread when its id is
@@ -70,6 +81,13 @@ def _thread_prefix(thread_id: str | None) -> str:
 
 class _CannotVerify(Exception):
     """A check could not run — surfaces as ``missing`` with 无法核对，请重试."""
+
+
+class _RunStartUnavailable(_CannotVerify):
+    """The current turn is named (``conversation_run_id``) but its start could
+    not be read: the check cannot be anchored to the run, and falling back to a
+    calendar-day window would silently admit whatever else the workspace
+    holds, so the caller reports a retryable gap instead."""
 
 
 @dataclass
@@ -457,12 +475,26 @@ async def _check_artifact(
     else:
         targets = concrete
 
-    day_floor: int | None = None
+    # Freshness: every declared stage artifact is THIS run's deliverable,
+    # whatever way its path resolved (template, explicit ``path_param``, or
+    # variant match) — it must be written inside this run's window, or a
+    # same-day rerun passes on the earlier round's files. ``modified_on:
+    # "today"`` keeps its execution-day anchor but is tightened to the run's
+    # window when one is known (whichever starts later decides, so a rerun can
+    # never pass on the earlier round's file); ``"as_of"`` keeps its calendar
+    # day. ``MTIME_TOLERANCE_SECONDS`` matches the push-draft check.
     modified_on = artifact.get("modified_on")
+    if modified_on not in (None, "today", "as_of"):
+        missing.append(f"契约字段 modified_on 非法（{name}：{modified_on!r}），请修契约。")
+        return missing, warnings, resolved
+    run_floor = (
+        since_epoch - MTIME_TOLERANCE_SECONDS if since_epoch is not None else None
+    )
+    floor_epoch, floor_label = run_floor, "本轮开始时间"
     if modified_on == "today":
-        # "today" is the EXECUTION day; a release_date among the params must
-        # not widen the freshness window backwards.
-        day_floor = int(_today_start_utc().timestamp())
+        today_utc = int(_today_start_utc().timestamp())
+        if today_utc > (floor_epoch if floor_epoch is not None else -1):
+            floor_epoch, floor_label = today_utc, "today 锚定日"
     elif modified_on == "as_of":
         anchor = params.get("as_of") or params.get("release_date") or params.get("end")
         day = str(anchor) if anchor else None
@@ -472,15 +504,13 @@ async def _check_artifact(
                 if day
                 else _today_start_utc()
             )
-            day_floor = int(base.timestamp())
+            as_of_floor = int(base.timestamp())
         except ValueError:
-            day_floor = int(_today_start_utc().timestamp())
-    elif modified_on is not None:
-        missing.append(f"契约字段 modified_on 非法（{name}：{modified_on!r}），请修契约。")
-        return missing, warnings, resolved
+            as_of_floor = int(_today_start_utc().timestamp())
+        if as_of_floor > (floor_epoch if floor_epoch is not None else -1):
+            floor_epoch, floor_label = as_of_floor, "as_of 锚定日"
 
     for path in targets:
-        via = "explicit" if explicit_used else "template"
         if explicit_used and template_path is not None:
             resolved[template_path] = path
         info = await _file_info(backend, path)
@@ -496,7 +526,6 @@ async def _check_artifact(
                 # The dated template guessed a different day than the file the
                 # run wrote; judge the file that exists, by this run's window.
                 path, info = variant
-                via = "variant"
             else:
                 if artifact.get("variant_glob") and not explicit_used:
                     _report(
@@ -517,24 +546,14 @@ async def _check_artifact(
                 f"产物文件过小（{path}，{info.size} 字节 < {artifact['min_bytes']}），"
                 "疑似占位。下一步：写满该交付物。"
             )
-        if via in ("explicit", "variant") and since_epoch is not None:
-            # An explicitly named or same-glob file must still be THIS run's
-            # writing — otherwise a stale note satisfies the contract by name.
+        if floor_epoch is not None:
             if info.mtime_epoch is None:
                 _report(f"无法读取文件时间（{path}），本轮写入未核对，请重试。")
-            elif info.mtime_epoch < since_epoch:
+            elif info.mtime_epoch < floor_epoch:
                 _report(
-                    f"产物文件不是本轮写的（{path}，mtime 早于本轮开始时间；"
-                    f"{'显式路径' if via == 'explicit' else '本轮同名文件'}"
-                    "也必须本轮写入）；下一步：本轮重写该文件后重查。"
-                )
-        if day_floor is not None:
-            if info.mtime_epoch is None:
-                _report(f"无法读取文件时间（{path}），本轮写入未核对，请重试。")
-            elif info.mtime_epoch < day_floor:
-                _report(
-                    f"产物文件不是本轮写的（{path}，mtime 早于 {modified_on} 锚定日）；"
-                    "下一步：重跑该步骤生成本轮文件。"
+                    f"产物文件不是本轮写的（{path}，mtime 早于{floor_label}）；"
+                    f"期望路径：{template_path or path}；"
+                    "下一步：本轮重写该文件后重查。"
                 )
         marker = artifact.get("end_marker")
         if marker:
@@ -1126,18 +1145,20 @@ async def _closing_since(
             backend, workflow, run_id, thread_id
         )
     except _CannotVerify as error:
-        since = datetime.fromtimestamp(
-            await _manual_since_epoch(params, thread_id, conversation_run_id),
-            tz=timezone.utc,
+        manual_epoch, gap = await _manual_window_or_gap(
+            params, thread_id, conversation_run_id
         )
+        if gap:
+            return datetime.fromtimestamp(manual_epoch, tz=timezone.utc), gap
+        since = datetime.fromtimestamp(manual_epoch, tz=timezone.utc)
         return since, [f"知识层时间窗口无法核对（{error}），请重试。"]
     if run_start is not None:
         return datetime.fromtimestamp(run_start, tz=timezone.utc), []
-    since = datetime.fromtimestamp(
-        await _manual_since_epoch(params, thread_id, conversation_run_id),
-        tz=timezone.utc,
+    manual_epoch, gap = await _manual_window_or_gap(
+        params, thread_id, conversation_run_id
     )
-    return since, []
+    since = datetime.fromtimestamp(manual_epoch, tz=timezone.utc)
+    return since, gap or []
 
 
 async def _check_closing(
@@ -1469,10 +1490,18 @@ async def _manual_since_epoch(
     (release_date/end are the aliases the contracts render); then the thread's
     start; and only when even that is unreadable, the last 24 hours — a window
     ending at today's midnight would drop notes written before a midnight
-    crossing."""
+    crossing.
+
+    A turn that is NAMED (``conversation_run_id``) but whose start cannot be
+    read raises ``_RunStartUnavailable`` instead of falling back: every
+    fallback window is a guess the workspace's older files could satisfy."""
     run_start = await _run_start_epoch(conversation_run_id)
     if run_start is not None:
         return run_start
+    if conversation_run_id:
+        raise _RunStartUnavailable(
+            f"本轮运行（{conversation_run_id}）的开始时间未能读取"
+        )
     day = str(
         params.get("as_of") or params.get("release_date") or params.get("end") or ""
     ).strip()
@@ -1484,6 +1513,20 @@ async def _manual_since_epoch(
     if thread_start is not None:
         return thread_start
     return int(time.time()) - 24 * 3600
+
+
+async def _manual_window_or_gap(
+    params: dict[str, Any],
+    thread_id: str | None,
+    conversation_run_id: str | None,
+) -> tuple[int, list[str] | None]:
+    """``(epoch, None)`` from the manual window, or ``(epoch, gap)`` when the
+    turn is named but its start is unreadable — the 24h floor keeps the
+    remaining checks running while the gap forces ``done=false``."""
+    try:
+        return await _manual_since_epoch(params, thread_id, conversation_run_id), None
+    except _RunStartUnavailable:
+        return int(time.time()) - 24 * 3600, [_RUN_START_UNAVAILABLE_MESSAGE]
 
 
 _SCAN_RC_RE = re.compile(r"^__DALTON_SCAN_RC__=(\d+)\s*$")
@@ -1749,12 +1792,12 @@ async def _check_language_review(
     resolved: dict[str, str] | None = None,
 ) -> list[str]:
     """Every formal deliverable this run wrote owes two language-review rounds:
-    the contract's declared draft and notes (mtime-free — a reused note passes
-    on its existing same-hash records), plus each reviewable file the run's
-    dispatches reported, plus what the mtime window scan of the workspace
-    finds. Fail-closed throughout. ``published/`` archives are nobody's
-    language target (see is_reviewable_deliverable): their review is the
-    draft's."""
+    the contract's declared draft and notes — but only files this run wrote (a
+    reused note riding an earlier round's same-hash records is that round's
+    deliverable) — plus each reviewable file the run's dispatches reported,
+    plus what the mtime window scan of the workspace finds. Fail-closed
+    throughout. ``published/`` archives are nobody's language target (see
+    is_reviewable_deliverable): their review is the draft's."""
     resolved_map = resolved or {}
     draft_template = render_template(rule["draft"], params)
     draft = resolved_map.get(draft_template, draft_template)
@@ -1781,25 +1824,42 @@ async def _check_language_review(
         seen.add(rel)
         targets.append(rel)
 
-    # 1. What the contract declares: unconditional, window-free. A declared
-    # path whose file is affirmatively absent is skipped — the artifact check
-    # reports the missing file itself, and a language record for nothing is
-    # noise.
-    for declared in await _contract_declared_paths(
-        backend, contract, params, resolved=resolved_map
-    ):
-        status, _ = await _read_text_diagnosed(backend, declared)
-        if status == "missing":
-            continue
-        _add(declared)
-
-    # 2. What the dispatches reported writing.
+    # 0. The run's window first — every target below must be this run's
+    # writing, a reused note's old records included.
     try:
         run_files, run_start = await _collect_run_dispatch_files(
             backend, contract["name"], run_id, thread_id
         )
     except _CannotVerify as error:
         return [f"本次运行写入的正式产物无法核对（{error}），请重试。"]
+    if run_start is not None:
+        since_epoch = int(run_start)
+    else:
+        since_epoch, gap = await _manual_window_or_gap(
+            params, thread_id, conversation_run_id
+        )
+        if gap:
+            return gap
+
+    # 1. What the contract declares — but only files this run wrote: a reused
+    # note riding on an earlier round's same-hash records is that round's
+    # deliverable, and the artifact check reports its staleness. A declared
+    # path whose file is affirmatively absent is skipped for the same reason.
+    for declared in await _contract_declared_paths(
+        backend, contract, params, resolved=resolved_map
+    ):
+        status, _ = await _read_text_diagnosed(backend, declared)
+        if status == "missing":
+            continue
+        info = await _file_info(backend, declared)
+        if (
+            info.mtime_epoch is not None
+            and info.mtime_epoch < since_epoch - MTIME_TOLERANCE_SECONDS
+        ):
+            continue
+        _add(declared)
+
+    # 2. What the dispatches reported writing.
     for path in run_files or []:
         _add(path)
 
@@ -1808,11 +1868,6 @@ async def _check_language_review(
     # itself is scanned for reviewable files written inside the run's window —
     # the run's start when there is one, else the manual window. A scan that
     # cannot run is a gap, never a pass.
-    since_epoch = (
-        int(run_start)
-        if run_start is not None
-        else await _manual_since_epoch(params, thread_id, conversation_run_id)
-    )
     scanned = await _scan_reviewable_since(backend, since_epoch)
     if scanned is None:
         return ["无法扫描工作区的正式产物（find/stat），无法核对，请重试。"]
@@ -1834,8 +1889,9 @@ async def _check_language_review(
     return gaps
 
 
-# 5s tolerance absorbs Postgres `::bigint` rounding, 1s `stat -c %Y` granularity, and minor host/sandbox clock skew.
-_PUSH_DRAFT_MTIME_TOLERANCE_SECONDS = 5
+# The push-draft freshness check shares the module's one tolerance (see
+# MTIME_TOLERANCE_SECONDS at the top); the alias keeps its call sites reading.
+_PUSH_DRAFT_MTIME_TOLERANCE_SECONDS = MTIME_TOLERANCE_SECONDS
 
 
 async def _is_current_run_no_change(conversation_run_id: str | None) -> bool:

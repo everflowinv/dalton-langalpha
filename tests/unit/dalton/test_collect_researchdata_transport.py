@@ -124,43 +124,144 @@ def test_env_var_still_overrides_with_http_bridge(monkeypatch: pytest.MonkeyPatc
     assert transport == {"mode": "bridge", "call": "http://127.0.0.1:8961/rpc", "error": ""}
 
 
-def test_wrapper_rejects_mcp_error_envelope_and_non_empty_error_dict(
+def test_wrapper_rejects_mcp_error_flag_through_the_real_settle_chain(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """上游返回 isError=True + structuredContent={"error": ...} 或解包后的 {"error": ...} 时，
-    一律判 ok=False 并保留原始错误文本。"""
+    """isError=true 的应答走运行时真实解包链（_settle_reply → _unwrap_mcp_content
+    → _is_error_result）：解包值里没有任何错误标志，is_error 是唯一判据，
+    collect 判失败并保留值里的错误文本。"""
+    from src.ptc_agent.core.sandbox import mcp_client_runtime
+
+    collect_mod = _load_collect_module()
+    monkeypatch.delenv("DALTON_RESEARCHDATA_URL", raising=False)
+    _install_wrapper_modules(monkeypatch, tmp_path)
+    mcp_client = sys.modules["mcp_client"]
+
+    # 1. 线上事故形态：isError=true, content=[], structuredContent={"message": ...}
+    envelope = {
+        "isError": True,
+        "content": [],
+        "structuredContent": {"message": "unauthorized"},
+    }
+    mcp_client.call_mcp_tool_with_error_flag = create_autospec(
+        mcp_client_runtime.call_mcp_tool_with_error_flag,
+        side_effect=lambda s, t, a: mcp_client_runtime._settle_reply(
+            {"result": envelope}, s, t, a, with_flag=True
+        ),
+    )
+    res = collect_mod.call_bridge_jsonrpc("research", {"route": "company-wiki"})
+    assert res["ok"] is False
+    assert res["error"] == "unauthorized"
+    assert res["data"] == {"message": "unauthorized"}
+
+    # 2. 成功形态同链路：content 文本块解包为 {"ok": true, ...}，flag 为 False
+    ok_envelope = {
+        "content": [
+            {
+                "type": "text",
+                "text": json.dumps(
+                    {"ok": True, "status": "ok", "results": [{"document_id": "wiki:x"}]}
+                ),
+            }
+        ]
+    }
+    mcp_client.call_mcp_tool_with_error_flag.side_effect = (
+        lambda s, t, a: mcp_client_runtime._settle_reply(
+            {"result": ok_envelope}, s, t, a, with_flag=True
+        )
+    )
+    res_ok = collect_mod.call_bridge_jsonrpc("research", {"route": "company-wiki"})
+    assert res_ok["ok"] is True
+    assert res_ok["data"]["results"][0]["document_id"] == "wiki:x"
+
+
+def test_transport_prefers_the_flag_preserving_entry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """运行时带 call_mcp_tool_with_error_flag 时，传输路选它而不是值通道。"""
+    from src.ptc_agent.core.sandbox import mcp_client_runtime
+
+    collect_mod = _load_collect_module()
+    monkeypatch.delenv("DALTON_RESEARCHDATA_URL", raising=False)
+    _install_wrapper_modules(monkeypatch, tmp_path)
+    mcp_client = sys.modules["mcp_client"]
+    mcp_client.call_mcp_tool_with_error_flag = create_autospec(
+        mcp_client_runtime.call_mcp_tool_with_error_flag,
+        return_value=(False, {"ok": True, "status": "ok", "results": []}),
+    )
+
+    transport = collect_mod.resolve_researchdata_transport()
+    assert transport["mode"] == "wrapper"
+    assert transport["call"] is mcp_client.call_mcp_tool_with_error_flag
+
+
+def test_wrapper_fallback_still_fails_on_value_level_error_fields(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """旧运行时（无带标志入口）退回 _call_mcp_tool 的值：值里的非空 error /
+    ok=False / error 状态仍判失败。"""
     collect_mod = _load_collect_module()
     monkeypatch.delenv("DALTON_RESEARCHDATA_URL", raising=False)
     _install_wrapper_modules(monkeypatch, tmp_path)
     wrapper = sys.modules["tools.researchdata"]
-
-    # 1. MCP 原始错误包：isError=True, content=[], structuredContent={"error": ...}
     wrapper._call_mcp_tool.side_effect = None
-    wrapper._call_mcp_tool.return_value = {
-        "isError": True,
-        "content": [],
-        "structuredContent": {"error": "upstream token expired"},
-    }
-    res_env = collect_mod.call_bridge_jsonrpc("research", {"route": "company-wiki"})
-    assert res_env["ok"] is False
-    assert res_env["status"] == "error"
-    assert res_env["error"] == "upstream token expired"
 
-    # 2. _unwrap_mcp_content 解包后的 {"error": ...}（无 ok/status 字段）
+    # 解包后的 {"error": ...}（无 ok/status 字段）
     wrapper._call_mcp_tool.return_value = {"error": "rate limit exceeded: 429"}
     res_unwrapped = collect_mod.call_bridge_jsonrpc("research", {"route": "company-wiki"})
     assert res_unwrapped["ok"] is False
     assert res_unwrapped["status"] == "error"
     assert res_unwrapped["error"] == "rate limit exceeded: 429"
 
-    # 3. MCP 错误标志 isError=True + content 文本块
-    wrapper._call_mcp_tool.return_value = {
-        "isError": True,
-        "content": [{"type": "text", "text": "tool execution crashed"}],
-    }
-    res_content = collect_mod.call_bridge_jsonrpc("research", {"route": "company-wiki"})
-    assert res_content["ok"] is False
-    assert res_content["error"] == "tool execution crashed"
+
+def test_missing_or_corrupt_workspace_config_fails_fast(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """PTC_WORKSPACE_CONFIG 指向的文件缺失或 JSON 损坏：启动探测即报
+    researchdata_transport_unconfigured（含原因），不再认为包装模块可用。"""
+    collect_mod = _load_collect_module()
+    monkeypatch.delenv("DALTON_RESEARCHDATA_URL", raising=False)
+    _install_wrapper_modules(monkeypatch, tmp_path)
+
+    # 1. 配置文件缺失
+    missing = tmp_path / "nope" / "mcp_client_config.json"
+    monkeypatch.setenv("PTC_WORKSPACE_CONFIG", str(missing))
+    transport = collect_mod.resolve_researchdata_transport()
+    assert transport["mode"] is None
+    assert "无法读取工作区 MCP 配置" in transport["error"]
+    assert str(missing) in transport["error"]
+    assert collect_mod.call_bridge_jsonrpc("research", {"route": "tmtb"})["status"] == (
+        "researchdata_transport_unconfigured"
+    )
+
+    # 2. JSON 损坏
+    corrupt = tmp_path / "corrupt_config.json"
+    corrupt.write_text("{not json", encoding="utf-8")
+    monkeypatch.setenv("PTC_WORKSPACE_CONFIG", str(corrupt))
+    transport_corrupt = collect_mod.resolve_researchdata_transport()
+    assert transport_corrupt["mode"] is None
+    assert "工作区 MCP 配置不可解析" in transport_corrupt["error"]
+
+    # 3. cmd_collect 启动一次性报配置错误，不进入逐来源采集
+    monkeypatch.setattr(
+        collect_mod, "collect_internal_and_ae", create_autospec(collect_mod.collect_internal_and_ae)
+    )
+    rc = collect_mod.cmd_collect(
+        argparse.Namespace(
+            ticker="META",
+            workspace_dir=str(tmp_path),
+            since="2026-10-21",
+            run_id="20261027-0310",
+            no_ae=False,
+            no_web=True,
+            json=True,
+        )
+    )
+    assert rc == 2
+    out = json.loads(capsys.readouterr().out)
+    assert out["status"] == "researchdata_transport_unconfigured"
+    assert "不可解析" in out["error"]
+    collect_mod.collect_internal_and_ae.assert_not_called()
 
 
 def test_wrapper_rejects_non_dict_result_as_format_error(
