@@ -6,6 +6,7 @@ import copy
 import hashlib
 import json
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Any
 
@@ -1051,6 +1052,49 @@ async def apply_update(
     }
 
 
+_REQUIRED_PROP_RE = re.compile(r"'([^']+)' is a required property")
+_ADDITIONAL_PROPS_RE = re.compile(r"Additional properties are not allowed \((.*)\)")
+
+_VERDICT_MINIMAL_EXAMPLE = (
+    '{"verdict":"NO_CHANGE","event":"<一句话事件>","rationale":"<定量依据>",'
+    '"progress":"none","trigger":{"kind":"internal_material","ref":"<唤醒信号id>"},'
+    '"next_validation":{"what":"<下一项看什么>","due":"2026-11-05"}}'
+)
+
+
+def _verdict_rejection_message(errors: list[dict[str, Any]]) -> str:
+    """The verdict rejection the model can act on in one retry: unknown fields
+    and missing fields by name, plus a minimal conforming example. The full
+    expected-structure dump serves `knowledge_update`'s bigger documents; for a
+    verdict it buried the two facts that fix the call."""
+    unknown: list[str] = []
+    missing: list[str] = []
+    other: list[str] = []
+    for err in errors:
+        msg = str(err.get("message") or "")
+        path = str(err.get("path") or "/")
+        prefix = "" if path == "/" else path
+        matched = _REQUIRED_PROP_RE.search(msg)
+        if matched:
+            missing.append(f"{prefix}/{matched.group(1)}")
+            continue
+        matched = _ADDITIONAL_PROPS_RE.search(msg)
+        if matched:
+            names = re.findall(r"'([^']+)'", matched.group(1))
+            unknown.extend(f"{prefix}/{name}" for name in names)
+            continue
+        other.append(f"- {path}: {err.get('code')} ({msg})")
+    lines: list[str] = []
+    if unknown:
+        lines.append("未知字段（schema 不认，删除后重试）：" + "、".join(unknown))
+    if missing:
+        lines.append("缺少必填字段（补上后重试）：" + "、".join(missing))
+    if other:
+        lines.append("其他问题：\n" + "\n".join(other))
+    lines.append(f"最小合规示例：{_VERDICT_MINIMAL_EXAMPLE}")
+    return "\n".join(lines)
+
+
 async def append_verdict(
     *,
     user_id: str,
@@ -1095,13 +1139,14 @@ async def append_verdict(
             }
         )
     if not val.ok:
-        schema_hint = _format_expected_structures("verdict", val.errors)
-        hint_suffix = f"\n\n{schema_hint}" if schema_hint else ""
         return {
             "ok": False,
             "error": "schema_error",
             "problems": val.errors,
-            "message": f"Invalid verdict payload (NOT SAVED):\n{val.format_problems()}{hint_suffix}",
+            "message": (
+                "Invalid verdict payload (NOT SAVED):\n"
+                f"{_verdict_rejection_message(val.errors)}"
+            ),
         }
 
     v_copy.pop("at", None)

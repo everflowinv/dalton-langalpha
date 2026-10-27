@@ -21,6 +21,13 @@ class CrawlOutput:
     markdown: str
     status: Optional[int] = None
     failure_kind: Optional[FailureKind] = None
+    # DALTON-HOOK(fetch-binary-route): set when the final response payload is a
+    # non-HTML binary (PDF/image reached via an extension-less redirect), so the
+    # router can dispatch it to the right consumer instead of handing the model
+    # binary bytes decoded into replacement-character soup.
+    binary_mime: Optional[str] = None
+    content_bytes: Optional[bytes] = None
+    final_url: Optional[str] = None
 
 
 class CrawlerBackend(Protocol):

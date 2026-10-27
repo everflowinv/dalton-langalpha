@@ -298,12 +298,21 @@ class TestExtractProvenance:
         assert by_id["b"]["source_timestamp"] is None  # bad value coerced, not raised
         assert by_id["c"]["source_timestamp"] is None
 
-    def test_caps_records_per_response(self):
+    # DALTON-HOOK(provenance-full-archive): 10000 hard cap with WARNING naming dropped count.
+    def test_caps_records_per_response(self, caplog):
+        import logging
         from src.server.database.provenance import _MAX_RECORDS_PER_RESPONSE
 
+        assert _MAX_RECORDS_PER_RESPONSE == 10000
         events = [
             _provenance_event(identifier=f"https://example.test/{i}", result_sha256=str(i))
             for i in range(_MAX_RECORDS_PER_RESPONSE + 50)
         ]
-        records = extract_provenance(events)
+        with caplog.at_level(logging.WARNING, logger="src.server.database.provenance"):
+            records = extract_provenance(events)
         assert len(records) == _MAX_RECORDS_PER_RESPONSE
+        assert any(
+            "10000" in rec.message and "dropped 50" in rec.message
+            for rec in caplog.records
+            if rec.levelno == logging.WARNING
+        )

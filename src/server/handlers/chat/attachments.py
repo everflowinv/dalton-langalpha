@@ -82,7 +82,6 @@ async def attach_request_files(
             multimodal_contexts, get_image_types(route)
         ),
     )
-
     # 3. Inject supported as native content blocks (merged into user message)
     if supported:
         supported_paths = [
@@ -103,17 +102,24 @@ async def attach_request_files(
 
     # Helper to build per-file path notes
     def _file_note(ctx, idx):
+        # DALTON-HOOK(attachment-native-cap): an attachment that failed to
+        # save gets an explicit note — never a bare filename the model would
+        # ignore.
         desc = ctx.description or "file"
         data = ctx.data
         mime = data.split(":")[1].split(";")[0] if ":" in data else "unknown"
         fpath = file_paths[idx] if file_paths and idx < len(file_paths) else None
-        if fpath:
+        if not fpath:
             return (
-                f"The user attached a file ({desc}, {mime}). "
-                f"It has been saved to {fpath}. "
-                f"Use Python to process it."
+                f"The user attached a file ({desc}, {mime}), but saving it "
+                "to the workspace failed, so it cannot be read here. Tell the "
+                "user to upload it again from the file panel."
             )
-        return f"The user attached a file ({desc}, {mime})."
+        return (
+            f"The user attached a file ({desc}, {mime}). "
+            f"It has been saved to {fpath}. "
+            f"Use Python to process it."
+        )
 
     # 4. Unsupported image/PDF: "cannot view" warning + file paths
     if unsupported:

@@ -21,7 +21,7 @@ import re
 import shlex
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Annotated, Any
 from zoneinfo import ZoneInfo
 
@@ -59,6 +59,17 @@ _VALIDATOR_OUTPUT_CHARS = 300
 
 _RUN_STATUS_GLOB = ".agents/threads/*/workflows/*/status.json"
 
+# Freshness tolerance shared by every "written this run" judgment: absorbs
+# Postgres `::bigint` rounding, 1s `stat -c %Y` granularity, and minor
+# host/sandbox clock skew (a sandbox clock 2s behind must not fail its own
+# just-written file).
+MTIME_TOLERANCE_SECONDS = 5
+
+# The one gap a named-but-undatable turn reports: no silent fallback window.
+_RUN_START_UNAVAILABLE_MESSAGE = (
+    "无法核对本轮完成情况（读不到本轮开始时间），请稍后重试 dalton_check_done。"
+)
+
 
 def _thread_prefix(thread_id: str | None) -> str:
     """The journal/status glob prefix narrowed to ONE thread when its id is
@@ -70,6 +81,13 @@ def _thread_prefix(thread_id: str | None) -> str:
 
 class _CannotVerify(Exception):
     """A check could not run — surfaces as ``missing`` with 无法核对，请重试."""
+
+
+class _RunStartUnavailable(_CannotVerify):
+    """The current turn is named (``conversation_run_id``) but its start could
+    not be read: the check cannot be anchored to the run, and falling back to a
+    calendar-day window would silently admit whatever else the workspace
+    holds, so the caller reports a retryable gap instead."""
 
 
 @dataclass
@@ -265,23 +283,106 @@ async def _derived_artifact_paths(
     return paths, problems
 
 
+_FILENAME_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def _parse_iso_day(text: str) -> str | None:
+    """Canonical ``YYYY-MM-DD`` when ``text`` is a real calendar date, else None."""
+    if not _FILENAME_DATE_RE.fullmatch(text):
+        return None
+    try:
+        return date.fromisoformat(text).isoformat()
+    except ValueError:
+        return None
+
+
+def _relevant_variant_days(
+    params: dict[str, Any], since_epoch: int | None
+) -> set[str] | None:
+    """The calendar days a variant's FILENAME may name: the run's ``as_of``
+    day and the Eastern business day of the window start (the same two a
+    caller legitimately spells). None when neither parses — then no variant
+    can pass the date test at all."""
+    days: set[str] = set()
+    anchor = str(
+        params.get("as_of") or params.get("release_date") or params.get("end") or ""
+    ).strip()
+    parsed_anchor = _parse_iso_day(anchor)
+    if parsed_anchor is not None:
+        days.add(parsed_anchor)
+    if since_epoch is not None:
+        days.add(
+            datetime.fromtimestamp(since_epoch, tz=_US_EASTERN).date().isoformat()
+        )
+    return days or None
+
+
+async def _run_written_variant(
+    backend: Any,
+    artifact: dict[str, Any],
+    params: dict[str, Any],
+    missing_path: str,
+    since_epoch: int | None,
+) -> tuple[str, _FileInfo] | None:
+    """The file this run actually wrote where the dated template found nothing.
+
+    A dated deliverable (``research/{as_of}-delta.md``) is conventionally named
+    for the business day, but a caller crossing a midnight boundary may spell a
+    different calendar day than the template rendered. ``variant_glob`` widens
+    the dated segment to ``*``; a match counts only when its FILENAME names a
+    day this run could legitimately spell (``as_of`` or the window start's
+    Eastern business day) AND it is provably written this run (mtime at/after
+    the window start) — a re-saved old note must not stand in for this run's
+    deliverable. Newest qualifying match wins. None when the contract declares
+    no variant, the glob cannot run, or nothing qualifies — an unreadable mtime
+    or an undated filename proves nothing and reads as no match."""
+    pattern = artifact.get("variant_glob")
+    if not pattern or since_epoch is None:
+        return None
+    days = _relevant_variant_days(params, since_epoch)
+    matches = await _glob(backend, render_template(pattern, params))
+    if matches is None:
+        return None
+    best: tuple[str, _FileInfo] | None = None
+    for candidate in (m for m in matches if not m.endswith(SIDECAR_SUFFIXES)):
+        name_day = _FILENAME_DATE_RE.search(posixpath.basename(candidate))
+        parsed_day = _parse_iso_day(name_day.group(0)) if name_day else None
+        if days is None or parsed_day is None or parsed_day not in days:
+            continue
+        info = await _file_info(backend, candidate)
+        if not info.exists or info.mtime_epoch is None:
+            continue
+        # The same tolerance as the artifact floor: a variant written 2s
+        # before the recorded window start (clock skew) is this run's.
+        if info.mtime_epoch < since_epoch - MTIME_TOLERANCE_SECONDS:
+            continue
+        if best is None or info.mtime_epoch > best[1].mtime_epoch:
+            best = (candidate, info)
+    return best
+
+
 async def _check_artifact(
     backend: Any,
     artifact: dict[str, Any],
     params: dict[str, Any],
-) -> tuple[list[str], list[str]]:
-    """(missing, warnings) for one declared artifact. Everything required
-    that cannot be verified lands in missing; only SKILL-optional artifacts
-    degrade their failures to warnings."""
+    since_epoch: int | None = None,
+) -> tuple[list[str], list[str], dict[str, str]]:
+    """(missing, warnings, resolved) for one declared artifact. Everything
+    required that cannot be verified lands in missing; only SKILL-optional
+    artifacts degrade their failures to warnings. ``resolved`` maps the
+    TEMPLATE-rendered path to the concrete file the check actually judged
+    (explicit ``path_param`` spellings and variant matches included), so the
+    closing checks can speak about the same file."""
     missing: list[str] = []
     warnings: list[str] = []
+    resolved: dict[str, str] = {}
     name = artifact["path"]
 
     def _report(message: str) -> None:
         (warnings if _optional(artifact) else missing).append(message)
 
     if artifact.get("requires_param") and not params.get(artifact["requires_param"]):
-        return missing, warnings
+        return missing, warnings, resolved
 
     condition = artifact.get("requires_json")
     if condition:
@@ -291,18 +392,18 @@ async def _check_artifact(
         status, state_text = await _read_text_diagnosed(backend, state_path)
         if status == "missing":
             _report(f"条件文件不存在（{state_path}），无法判定是否要求 {name}；下一步：重跑写它的步骤。")
-            return missing, warnings
+            return missing, warnings, resolved
         if status != "ok" or state_text is None:
             _report(f"条件文件读取出错（{state_path}），无法核对 {name}，请重试。")
-            return missing, warnings
+            return missing, warnings, resolved
         try:
             state = json.loads(state_text)
         except ValueError:
             _report(f"条件文件不可解析（{state_path}），无法核对 {name}，请重试。")
-            return missing, warnings
+            return missing, warnings, resolved
         if not isinstance(state, dict):
             _report(f"条件文件结构异常（{state_path}），无法核对 {name}，请重试。")
-            return missing, warnings
+            return missing, warnings, resolved
         # A missing or non-string field is 无法核对, never "condition not met":
         # {"run_id": ...} without material would otherwise skip the note and
         # still read as done.
@@ -313,33 +414,46 @@ async def _check_artifact(
                 f"条件文件缺少字符串字段 {field}（{state_path}），"
                 f"无法判定是否要求 {name}；下一步：重跑写它的步骤。"
             )
-            return missing, warnings
+            return missing, warnings, resolved
         allowed = condition.get("allowed_values")
         if allowed and value not in allowed:
             _report(
                 f"条件文件字段 {field}={value!r} 不在允许值 {'/'.join(allowed)}"
                 f"（{state_path}），无法判定是否要求 {name}；下一步：重跑写它的步骤。"
             )
-            return missing, warnings
+            return missing, warnings, resolved
         if value != condition["equals"]:
-            return missing, warnings
+            return missing, warnings, resolved
 
     concrete: list[str] | None
     problems: list[str] = []
+    # The template spelling the closing checks render themselves; the file
+    # judged here may be an explicit ``path_param`` path or a variant match.
+    template_path: str | None = None
+    explicit_used = False
     if artifact.get("derive"):
         concrete, problems = await _derived_artifact_paths(backend, artifact, params)
         for problem in problems:
             _report(problem)
         if concrete is None or not concrete:
-            return missing, warnings
+            return missing, warnings, resolved
     else:
-        concrete = [render_template(artifact["path"], params)]
+        template_path = render_template(artifact["path"], params)
+        # An explicitly passed path (``path_param``) is what the agent says it
+        # actually wrote; the dated template is only the conventional spelling.
+        explicit_key = artifact.get("path_param")
+        explicit = str(params.get(explicit_key) or "").strip() if explicit_key else ""
+        if explicit:
+            explicit_used = True
+            concrete = [render_template(explicit, params)]
+        else:
+            concrete = [template_path]
 
     if artifact.get("glob"):
         matches = await _glob(backend, concrete[0])
         if matches is None:
             _report(f"当前环境无法执行 glob（{name}），无法核对，请重试。")
-            return missing, warnings
+            return missing, warnings, resolved
         # Sidecars ride beside each target by the tools' stem convention, and
         # a ``cluster-*.md`` pattern matches ``cluster-a.md.language.md`` just
         # as well — they never count toward a deliverable's own minimum.
@@ -350,7 +464,7 @@ async def _check_artifact(
                 f"产物 {name} 需要 ≥{need} 个匹配，实际 {len(matches)} 个；"
                 "下一步：补齐缺失的支线/清单文件。"
             )
-            return missing, warnings
+            return missing, warnings, resolved
         targets = matches
         versions = [_version_of(path) for path in matches]
         if all(v is not None for v in versions):
@@ -359,16 +473,38 @@ async def _check_artifact(
             targets = [matches[versions.index(max(versions))]]
         elif artifact.get("modified_on"):
             _report(f"无法从匹配名解析版本号以确定最终文件（{name}），无法核对，请重试。")
-            return missing, warnings
+            return missing, warnings, resolved
     else:
         targets = concrete
 
-    day_floor: int | None = None
+    # Freshness, two regimes:
+    # - ``fresh_this_run`` artifacts (a wake skill's note / draft /
+    #   predictions.json / last_run.json — the run's own deliverables) must be
+    #   written inside this run's window however their path resolved, or a
+    #   same-day rerun passes on the earlier round's files. ``modified_on:
+    #   "today"`` on such an artifact IS the window start (UTC midnight only
+    #   when even the window is unknown); ``"as_of"`` keeps its calendar day
+    #   when it starts later.
+    # - Everything else keeps the pre-window rules (existence / min_bytes /
+    #   day anchors): a legitimately reused file — dalton-publish's approved
+    #   draft, a workflow-resume carry-over — is judged on its content, not on
+    #   which round last touched it.
     modified_on = artifact.get("modified_on")
-    if modified_on == "today":
-        # "today" is the EXECUTION day; a release_date among the params must
-        # not widen the freshness window backwards.
-        day_floor = int(_today_start_utc().timestamp())
+    if modified_on not in (None, "today", "as_of"):
+        missing.append(f"契约字段 modified_on 非法（{name}：{modified_on!r}），请修契约。")
+        return missing, warnings, resolved
+    fresh = bool(artifact.get("fresh_this_run"))
+    run_floor = (
+        since_epoch - MTIME_TOLERANCE_SECONDS
+        if (fresh and since_epoch is not None)
+        else None
+    )
+    floor_epoch, floor_label = run_floor, "本轮开始时间"
+    if modified_on == "today" and floor_epoch is None:
+        floor_epoch, floor_label = (
+            int(_today_start_utc().timestamp()),
+            "today 锚定日",
+        )
     elif modified_on == "as_of":
         anchor = params.get("as_of") or params.get("release_date") or params.get("end")
         day = str(anchor) if anchor else None
@@ -378,30 +514,64 @@ async def _check_artifact(
                 if day
                 else _today_start_utc()
             )
-            day_floor = int(base.timestamp())
+            as_of_floor = int(base.timestamp())
         except ValueError:
-            day_floor = int(_today_start_utc().timestamp())
-    elif modified_on is not None:
-        missing.append(f"契约字段 modified_on 非法（{name}：{modified_on!r}），请修契约。")
-        return missing, warnings
+            as_of_floor = int(_today_start_utc().timestamp())
+        if as_of_floor > (floor_epoch if floor_epoch is not None else -1):
+            floor_epoch, floor_label = as_of_floor, "as_of 锚定日"
 
     for path in targets:
+        if explicit_used and template_path is not None:
+            resolved[template_path] = path
         info = await _file_info(backend, path)
-        if not info.exists:
-            _report(f"产物文件不存在：{path}。下一步：补齐该阶段交付物后重查。")
-            continue
+        # A stale template file is not this run's writing either: the run may
+        # have written the variant spelling instead, so the variant search
+        # runs for an out-of-window template file exactly as for a missing one.
+        stale_template = bool(
+            fresh
+            and run_floor is not None
+            and artifact.get("variant_glob")
+            and info.exists
+            and (info.mtime_epoch is None or info.mtime_epoch < run_floor)
+        )
+        if (not info.exists or stale_template) and not explicit_used:
+            variant = await _run_written_variant(
+                backend, artifact, params, path, since_epoch
+            )
+            if variant is not None:
+                # The dated template guessed a different day than the file the
+                # run wrote; judge the file that exists, by this run's window.
+                path, info = variant
+            elif not info.exists:
+                if artifact.get("variant_glob"):
+                    _report(
+                        f"产物文件不存在：{path}，也未找到符合条件的 "
+                        f"{artifact['variant_glob']}（文件名日期须为本轮 as_of 或"
+                        "美东业务日、mtime 须在本轮窗口内）；"
+                        "下一步：写入该阶段交付物后重查。"
+                    )
+                else:
+                    _report(f"产物文件不存在：{path}。下一步：补齐该阶段交付物后重查。")
+                continue
+            # Stale template, no qualifying variant: the floor check below
+            # reports it with the expected path.
+        if template_path is not None:
+            # Later checks (check_draft, language review, sidecars) render the
+            # template again; point them at the file this run actually wrote.
+            resolved[template_path] = path
         if artifact.get("min_bytes") and info.size < artifact["min_bytes"]:
             _report(
                 f"产物文件过小（{path}，{info.size} 字节 < {artifact['min_bytes']}），"
                 "疑似占位。下一步：写满该交付物。"
             )
-        if day_floor is not None:
+        if floor_epoch is not None:
             if info.mtime_epoch is None:
                 _report(f"无法读取文件时间（{path}），本轮写入未核对，请重试。")
-            elif info.mtime_epoch < day_floor:
+            elif info.mtime_epoch < floor_epoch:
                 _report(
-                    f"产物文件不是本轮写的（{path}，mtime 早于 {modified_on} 锚定日）；"
-                    "下一步：重跑该步骤生成本轮文件。"
+                    f"产物文件不是本轮写的（{path}，mtime 早于{floor_label}）；"
+                    f"期望路径：{template_path or path}；"
+                    "下一步：本轮重写该文件后重查。"
                 )
         marker = artifact.get("end_marker")
         if marker:
@@ -422,7 +592,7 @@ async def _check_artifact(
                     f"产物文件过小（{sidecar_path}，{sidecar_info.size} 字节 "
                     f"< {sidecar['min_bytes']}），疑似占位。下一步：写满该交付物。"
                 )
-    return missing, warnings
+    return missing, warnings, resolved
 
 
 async def _check_knowledge_versions(
@@ -472,11 +642,34 @@ async def _check_verdicts(
     kinds: list[str] | None = None,
     triggers: list[str] | None = None,
     since: datetime,
+    thread_id: str | None = None,
 ) -> list[dict[str, Any]]:
-    from src.dalton.database.verdicts import list_verdicts
+    """This run's own verdicts, not the workspace's.
 
-    rows = await list_verdicts(workspace_id, limit=200, since=since)
-    return [row for row in rows if _verdict_row_matches(row, kinds, triggers)]
+    ``dalton_verdicts`` records ``conversation_thread_id``/``run_id`` on every
+    insert (see ``insert_verdict``), so when the matched rows carry ids only
+    THIS thread's verdict closes this check — a sibling task's same-window
+    verdict on the same workspace must not. Rows with no ids at all (legacy
+    writes) fall back to the contract's declared ``verdict_trigger`` kinds,
+    the only attribution that data supports; a contract declaring none keeps
+    the kinds-only match for them."""
+    from src.dalton.database import verdicts as verdicts_db
+
+    rows = await verdicts_db.list_verdicts(workspace_id, limit=200, since=since)
+    matched = [row for row in rows if _verdict_row_matches(row, kinds, triggers)]
+    if thread_id:
+        if any(row.get("conversation_thread_id") for row in matched):
+            own_thread = str(thread_id)
+            return [
+                row
+                for row in matched
+                if str(row.get("conversation_thread_id") or "") == own_thread
+            ]
+        if triggers:
+            return [
+                row for row in matched if row.get("trigger_kind") in set(triggers)
+            ]
+    return matched
 
 
 def _as_trigger_list(value: Any) -> list[str] | None:
@@ -808,9 +1001,14 @@ async def _check_stages(
     backend: Any,
     run_id: str | None,
     thread_id: str | None = None,
-) -> tuple[list[str], list[str], str | None]:
+    since_epoch: int | None = None,
+) -> tuple[list[str], list[str], str | None, dict[str, str]]:
+    """(missing, warnings, draft, resolved): ``resolved`` maps each artifact's
+    template-rendered path to the concrete file the stage check judged, for
+    the closing checks to speak about the same file."""
     missing: list[str] = []
     warnings: list[str] = []
+    resolved: dict[str, str] = {}
     draft_path: str | None = None
     rule = (contract.get("closing") or {}).get("check_draft")
     if rule or contract.get("draft"):
@@ -824,10 +1022,15 @@ async def _check_stages(
             continue
         stage_missing = False
         for artifact in stage.get("artifacts", []):
-            gap, warn = await _check_artifact(backend, artifact, params)
+            gap, warn, artifact_resolved = await _check_artifact(
+                backend, artifact, params, since_epoch
+            )
             missing.extend(gap)
             warnings.extend(warn)
+            resolved.update(artifact_resolved)
             stage_missing = stage_missing or bool(gap)
+        if draft_path is not None and draft_path in resolved:
+            draft_path = resolved[draft_path]
         for validator in stage.get("validators", []):
             try:
                 command = render_command(validator["command"], params)
@@ -874,7 +1077,7 @@ async def _check_stages(
                 missing.append(
                     f"阶段「{stage_name}」要求本次 run 的最终审稿结论为 pass，未通过：{reason}。"
                 )
-    return missing, warnings, draft_path
+    return missing, warnings, draft_path, resolved
 
 
 async def _conditional_knowledge_docs(
@@ -943,31 +1146,37 @@ async def _closing_since(
     params: dict[str, Any],
     run_id: str | None,
     thread_id: str | None,
+    conversation_run_id: str | None = None,
 ) -> tuple[datetime, list[str]]:
     """The closing checks' freshness window and any gap from fixing it.
 
     Audit #20: the window starts at THIS run's first dispatch (the earliest
     journal ``recorded_at``), so versions written during the run always count,
     whatever timezone it crossed; the manual path (no run) falls back to the
-    ``as_of`` day's start in America/New_York. A journal that exists but
-    cannot be read is a gap (fail-closed), with the manual window as the
-    best-effort floor the remaining checks still run against.
+    current turn's start, else the ``as_of`` day's start in America/New_York.
+    A journal that exists but cannot be read is a gap (fail-closed), with the
+    manual window as the best-effort floor the remaining checks still run
+    against.
     """
     try:
         _files, run_start = await _collect_run_dispatch_files(
             backend, workflow, run_id, thread_id
         )
     except _CannotVerify as error:
-        since = datetime.fromtimestamp(
-            await _manual_since_epoch(params, thread_id), tz=timezone.utc
+        manual_epoch, gap = await _manual_window_or_gap(
+            params, thread_id, conversation_run_id
         )
+        if gap:
+            return datetime.fromtimestamp(manual_epoch, tz=timezone.utc), gap
+        since = datetime.fromtimestamp(manual_epoch, tz=timezone.utc)
         return since, [f"知识层时间窗口无法核对（{error}），请重试。"]
     if run_start is not None:
         return datetime.fromtimestamp(run_start, tz=timezone.utc), []
-    since = datetime.fromtimestamp(
-        await _manual_since_epoch(params, thread_id), tz=timezone.utc
+    manual_epoch, gap = await _manual_window_or_gap(
+        params, thread_id, conversation_run_id
     )
-    return since, []
+    since = datetime.fromtimestamp(manual_epoch, tz=timezone.utc)
+    return since, gap or []
 
 
 async def _check_closing(
@@ -980,14 +1189,19 @@ async def _check_closing(
     thread_id: str | None = None,
     *,
     conversation_run_id: str | None = None,
+    since: datetime | None = None,
+    since_gaps: list[str] | None = None,
+    resolved: dict[str, str] | None = None,
 ) -> tuple[list[str], list[str], str]:
     missing: list[str] = []
     warnings: list[str] = []
+    resolved_map = resolved or {}
     closing = contract.get("closing") or {}
-    since, since_gaps = await _closing_since(
-        backend, contract["name"], params, run_id, thread_id
-    )
-    missing.extend(since_gaps)
+    if since is None:
+        since, since_gaps = await _closing_since(
+            backend, contract["name"], params, run_id, thread_id, conversation_run_id
+        )
+    missing.extend(since_gaps or [])
     since_label = since.date().isoformat()
 
     docs_all = list(closing.get("knowledge_docs", []))
@@ -1041,7 +1255,11 @@ async def _check_closing(
     elif kinds:
         try:
             verdict_rows = await _check_verdicts(
-                workspace_id, kinds=kinds, triggers=triggers, since=since
+                workspace_id,
+                kinds=kinds,
+                triggers=triggers,
+                since=since,
+                thread_id=thread_id,
             )
             if not verdict_rows:
                 trigger_note = (
@@ -1069,20 +1287,36 @@ async def _check_closing(
     gate = closing.get("gated_draft")
     if gate:
         missing.extend(
-            await _check_gated_draft(backend, gate, params, workspace_id, since)
+            await _check_gated_draft(
+                backend,
+                gate,
+                params,
+                workspace_id,
+                since,
+                thread_id=thread_id,
+                resolved=resolved_map,
+            )
         )
 
     publication = closing.get("published_or_awaiting_pm")
     if publication:
         missing.extend(
             await _check_published_or_awaiting(
-                backend, publication, params, workspace_id, user_id
+                backend,
+                publication,
+                params,
+                workspace_id,
+                user_id,
+                resolved=resolved_map,
             )
         )
 
     rule = closing.get("check_draft")
     if rule:
-        draft = render_template(rule.get("draft") or contract.get("draft", ""), params)
+        draft_template = render_template(
+            rule.get("draft") or contract.get("draft", ""), params
+        )
+        draft = resolved_map.get(draft_template, draft_template)
         required = rule.get("required", True)
         message = await _check_draft_sidecar(backend, draft)
         if message:
@@ -1099,6 +1333,8 @@ async def _check_closing(
             contract,
             run_id,
             thread_id,
+            conversation_run_id,
+            resolved=resolved_map,
         )
         for gap in gaps:
             (missing if required else warnings).append(gap)
@@ -1114,6 +1350,7 @@ async def _check_closing(
                 run_id,
                 thread_id,
                 conversation_run_id=conversation_run_id,
+                resolved=resolved_map,
             )
         )
     return missing, warnings, since_label
@@ -1260,13 +1497,29 @@ async def _push_draft_since_epoch(
 
 
 async def _manual_since_epoch(
-    params: dict[str, Any], thread_id: str | None
+    params: dict[str, Any],
+    thread_id: str | None,
+    conversation_run_id: str | None = None,
 ) -> int:
-    """The manual path's window start: the run's ``as_of`` day at midnight
-    America/New_York (release_date/end are the aliases the contracts render);
-    with ``as_of`` missing, ``latest``, or unparseable, the thread's start;
-    and only when even that is unreadable, the last 24 hours — a window ending
-    at today's midnight would drop notes written before a midnight crossing."""
+    """The manual path's window start: THIS turn's start (the run's
+    ``created_at``) first, because an auto-wake fired before an Eastern
+    midnight crossing would otherwise anchor the window after everything the
+    turn wrote; then the run's ``as_of`` day at midnight America/New_York
+    (release_date/end are the aliases the contracts render); then the thread's
+    start; and only when even that is unreadable, the last 24 hours — a window
+    ending at today's midnight would drop notes written before a midnight
+    crossing.
+
+    A turn that is NAMED (``conversation_run_id``) but whose start cannot be
+    read raises ``_RunStartUnavailable`` instead of falling back: every
+    fallback window is a guess the workspace's older files could satisfy."""
+    run_start = await _run_start_epoch(conversation_run_id)
+    if run_start is not None:
+        return run_start
+    if conversation_run_id:
+        raise _RunStartUnavailable(
+            f"本轮运行（{conversation_run_id}）的开始时间未能读取"
+        )
     day = str(
         params.get("as_of") or params.get("release_date") or params.get("end") or ""
     ).strip()
@@ -1278,6 +1531,20 @@ async def _manual_since_epoch(
     if thread_start is not None:
         return thread_start
     return int(time.time()) - 24 * 3600
+
+
+async def _manual_window_or_gap(
+    params: dict[str, Any],
+    thread_id: str | None,
+    conversation_run_id: str | None,
+) -> tuple[int, list[str] | None]:
+    """``(epoch, None)`` from the manual window, or ``(epoch, gap)`` when the
+    turn is named but its start is unreadable — the 24h floor keeps the
+    remaining checks running while the gap forces ``done=false``."""
+    try:
+        return await _manual_since_epoch(params, thread_id, conversation_run_id), None
+    except _RunStartUnavailable:
+        return int(time.time()) - 24 * 3600, [_RUN_START_UNAVAILABLE_MESSAGE]
 
 
 _SCAN_RC_RE = re.compile(r"^__DALTON_SCAN_RC__=(\d+)\s*$")
@@ -1450,17 +1717,23 @@ async def _check_language_record(
 
 
 async def _contract_declared_paths(
-    backend: Any, contract: dict[str, Any], params: dict[str, Any]
+    backend: Any,
+    contract: dict[str, Any],
+    params: dict[str, Any],
+    resolved: dict[str, str] | None = None,
 ) -> list[str]:
-    """Concrete paths the contract's stage artifacts declare, expanded the way
-    ``_check_artifact`` gates them (requires_param, requires_json, derive,
-    glob). Declared notes join the language-review targets regardless of
-    mtime — a reused note owes its records too (the same-hash two-round pass
-    satisfies it; no re-review is demanded)."""
+    """Concrete paths the contract's stage artifacts declare (each with its
+    ``fresh_this_run`` flag), expanded the way ``_check_artifact`` gates them
+    (requires_param, requires_json, derive, glob). A declared note joins the
+    language-review targets regardless of mtime unless it is fresh_this_run —
+    a reused note owes its records too (the same-hash two-round pass satisfies
+    it; no re-review is demanded), while a fresh one must be this run's
+    writing."""
+    resolved_map = resolved or {}
     workspace_dir = getattr(backend, "workspace_dir", None)
     if not isinstance(workspace_dir, str):
         workspace_dir = None
-    paths: list[str] = []
+    paths: list[tuple[str, bool]] = []
     for stage in contract.get("stages") or []:
         if stage.get("requires_param") and not params.get(stage["requires_param"]):
             continue
@@ -1500,20 +1773,44 @@ async def _contract_declared_paths(
                     value = item.get(derive["field"]) if isinstance(item, dict) else None
                     if value is not None:
                         paths.append(
-                            render_template(artifact["path"], {**params, derive["field"]: str(value)})
+                            (
+                                render_template(
+                                    artifact["path"],
+                                    {**params, derive["field"]: str(value)},
+                                ),
+                                False,
+                            )
                         )
                 continue
             template = render_template(artifact["path"], params)
+            explicit_key = artifact.get("path_param")
+            explicit = (
+                str(params.get(explicit_key) or "").strip() if explicit_key else ""
+            )
+            concrete_path = (
+                render_template(explicit, params)
+                if explicit
+                else resolved_map.get(template, template)
+            )
             if artifact.get("glob"):
-                matches = await _glob(backend, template)
+                matches = await _glob(backend, concrete_path)
                 paths.extend(
-                    m for m in (matches or []) if not m.endswith(SIDECAR_SUFFIXES)
+                    (m, False)
+                    for m in (matches or [])
+                    if not m.endswith(SIDECAR_SUFFIXES)
                 )
             else:
-                paths.append(template)
+                paths.append(
+                    (
+                        resolved_map.get(template, concrete_path),
+                        bool(artifact.get("fresh_this_run")),
+                    )
+                )
     return [
-        rel
-        for rel in (_workspace_relative(p, workspace_dir) for p in paths)
+        (rel, fresh)
+        for rel, fresh in (
+            (_workspace_relative(p, workspace_dir), fresh) for p, fresh in paths
+        )
         if is_reviewable_deliverable(rel, workspace_dir)
     ]
 
@@ -1525,15 +1822,21 @@ async def _check_language_review(
     contract: dict[str, Any],
     run_id: str | None,
     thread_id: str | None,
+    conversation_run_id: str | None = None,
+    *,
+    resolved: dict[str, str] | None = None,
 ) -> list[str]:
     """Every formal deliverable this run wrote owes two language-review rounds:
-    the contract's declared draft and notes (mtime-free — a reused note passes
-    on its existing same-hash records), plus each reviewable file the run's
-    dispatches reported, plus what the mtime window scan of the workspace
-    finds. Fail-closed throughout. ``published/`` archives are nobody's
-    language target (see is_reviewable_deliverable): their review is the
-    draft's."""
-    draft = render_template(rule["draft"], params)
+    the contract's declared draft and notes — ``fresh_this_run`` ones only
+    when this run wrote them (a reused draft, e.g. dalton-publish's approved
+    original, rides its existing same-hash records) — plus each reviewable
+    file the run's dispatches reported, plus what the mtime window scan of the
+    workspace finds. Fail-closed throughout. ``published/`` archives are
+    nobody's language target (see is_reviewable_deliverable): their review is
+    the draft's."""
+    resolved_map = resolved or {}
+    draft_template = render_template(rule["draft"], params)
+    draft = resolved_map.get(draft_template, draft_template)
     if (contract.get("closing") or {}).get("gated_draft"):
         # A gated contract (dalton-call) legitimately has no draft when the
         # gate failed; that branch is judged by gated_draft itself.
@@ -1557,23 +1860,44 @@ async def _check_language_review(
         seen.add(rel)
         targets.append(rel)
 
-    # 1. What the contract declares: unconditional, window-free. A declared
-    # path whose file is affirmatively absent is skipped — the artifact check
-    # reports the missing file itself, and a language record for nothing is
-    # noise.
-    for declared in await _contract_declared_paths(backend, contract, params):
-        status, _ = await _read_text_diagnosed(backend, declared)
-        if status == "missing":
-            continue
-        _add(declared)
-
-    # 2. What the dispatches reported writing.
+    # 0. The run's window first — every target below must be this run's
+    # writing, a reused note's old records included.
     try:
         run_files, run_start = await _collect_run_dispatch_files(
             backend, contract["name"], run_id, thread_id
         )
     except _CannotVerify as error:
         return [f"本次运行写入的正式产物无法核对（{error}），请重试。"]
+    if run_start is not None:
+        since_epoch = int(run_start)
+    else:
+        since_epoch, gap = await _manual_window_or_gap(
+            params, thread_id, conversation_run_id
+        )
+        if gap:
+            return gap
+
+    # 1. What the contract declares — only ``fresh_this_run`` files must be
+    # this run's writing; a reused draft (dalton-publish's approved original,
+    # a resume carry-over) stays a language target on its existing same-hash
+    # records. A declared path whose file is affirmatively absent is skipped —
+    # the artifact check reports the missing file itself.
+    for declared, fresh_path in await _contract_declared_paths(
+        backend, contract, params, resolved=resolved_map
+    ):
+        status, _ = await _read_text_diagnosed(backend, declared)
+        if status == "missing":
+            continue
+        if fresh_path:
+            info = await _file_info(backend, declared)
+            if (
+                info.mtime_epoch is not None
+                and info.mtime_epoch < since_epoch - MTIME_TOLERANCE_SECONDS
+            ):
+                continue
+        _add(declared)
+
+    # 2. What the dispatches reported writing.
     for path in run_files or []:
         _add(path)
 
@@ -1582,11 +1906,6 @@ async def _check_language_review(
     # itself is scanned for reviewable files written inside the run's window —
     # the run's start when there is one, else the manual window. A scan that
     # cannot run is a gap, never a pass.
-    since_epoch = (
-        int(run_start)
-        if run_start is not None
-        else await _manual_since_epoch(params, thread_id)
-    )
     scanned = await _scan_reviewable_since(backend, since_epoch)
     if scanned is None:
         return ["无法扫描工作区的正式产物（find/stat），无法核对，请重试。"]
@@ -1608,8 +1927,9 @@ async def _check_language_review(
     return gaps
 
 
-# 5s tolerance absorbs Postgres `::bigint` rounding, 1s `stat -c %Y` granularity, and minor host/sandbox clock skew.
-_PUSH_DRAFT_MTIME_TOLERANCE_SECONDS = 5
+# The push-draft freshness check shares the module's one tolerance (see
+# MTIME_TOLERANCE_SECONDS at the top); the alias keeps its call sites reading.
+_PUSH_DRAFT_MTIME_TOLERANCE_SECONDS = MTIME_TOLERANCE_SECONDS
 
 
 async def _is_current_run_no_change(conversation_run_id: str | None) -> bool:
@@ -1636,11 +1956,13 @@ async def _check_push_draft(
     thread_id: str | None,
     *,
     conversation_run_id: str | None = None,
+    resolved: dict[str, str] | None = None,
 ) -> list[str]:
     """Check ``closing.push_draft``: file existence, written in the current
     round (mtime >= run/thread start epoch - 5s tolerance, fail-closed when
     unreadable), and two-round language review matching current file sha256."""
-    path = render_template(rule["path"], params)
+    path_template = render_template(rule["path"], params)
+    path = (resolved or {}).get(path_template, path_template)
     skip_no_change = (
         await _is_current_run_no_change(conversation_run_id)
         if rule.get("skip_when_no_change")
@@ -1760,12 +2082,16 @@ async def _check_gated_draft(
     params: dict[str, Any],
     workspace_id: str | None,
     since: datetime,
+    *,
+    thread_id: str | None = None,
+    resolved: dict[str, str] | None = None,
 ) -> list[str]:
     """The two gate branches, each with its own signature: a formal draft
     (gate passed) owes size + a current check_draft sidecar; no draft (gate
     failed) owes this round's verdict word. Neither signature readable is
     无法判定, never a pass."""
-    draft = render_template(gate["draft"], params)
+    draft_template = render_template(gate["draft"], params)
+    draft = (resolved or {}).get(draft_template, draft_template)
     status, text = await _read_text_diagnosed(backend, draft)
     if status == "error" or (status == "ok" and text is None):
         return [f"正式草稿读取出错（{draft}），无法判定门禁结果，请重试。"]
@@ -1791,7 +2117,9 @@ async def _check_gated_draft(
             )
         ]
     try:
-        rows = await _check_verdicts(workspace_id, kinds=kinds, since=since)
+        rows = await _check_verdicts(
+            workspace_id, kinds=kinds, since=since, thread_id=thread_id
+        )
     except Exception as error:
         logger.warning("dalton_check_done gate verdict query failed", error=str(error))
         return [
@@ -1854,11 +2182,14 @@ async def _check_published_or_awaiting(
     params: dict[str, Any],
     workspace_id: str | None,
     user_id: str | None,
+    *,
+    resolved: dict[str, str] | None = None,
 ) -> list[str]:
     """One of the two publication states must exist: the immutable
     ``published/`` copy, or this workspace's ``awaiting_pm`` request for the
     draft. A query that cannot run is 无法核对, never a warning."""
-    draft = render_template(rule["draft"], params)
+    draft_template = render_template(rule["draft"], params)
+    draft = (resolved or {}).get(draft_template, draft_template)
     published = render_template(rule["published"], params)
     info = await _file_info(backend, published)
     if info.exists and info.size > 0:
@@ -1956,8 +2287,19 @@ async def run_check_done(
                 "warnings": [],
                 "checked": checked,
             }
-        stage_missing, stage_warnings, _draft = await _check_stages(
-            contract, params, backend, run_id, thread_id
+        # One window feeds both the stage artifact variants and the closing
+        # checks, so a variant accepted by mtime is the same run the verdict
+        # window counts.
+        since, since_gaps = await _closing_since(
+            backend, contract["name"], params, run_id, thread_id, conversation_run_id
+        )
+        stage_missing, stage_warnings, _draft, resolved = await _check_stages(
+            contract,
+            params,
+            backend,
+            run_id,
+            thread_id,
+            since_epoch=int(since.timestamp()),
         )
         missing.extend(stage_missing)
         warnings.extend(stage_warnings)
@@ -1970,6 +2312,9 @@ async def run_check_done(
             run_id,
             thread_id,
             conversation_run_id=conversation_run_id,
+            since=since,
+            since_gaps=since_gaps,
+            resolved=resolved,
         )
         missing.extend(close_missing)
         warnings.extend(close_warnings)

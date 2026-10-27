@@ -12,12 +12,14 @@
         {
           "path": "research/tracker/last_run.json",
           "min_bytes": 10,
-          "modified_on": "today"
+          "modified_on": "today",
+          "fresh_this_run": true
         },
         {
           "path": "research/tracker/updates.log",
           "min_bytes": 1,
-          "modified_on": "today"
+          "modified_on": "today",
+          "fresh_this_run": true
         }
       ]
     },
@@ -26,6 +28,8 @@
       "artifacts": [
         {
           "path": "research/{as_of}-delta.md",
+          "path_param": "delta_note",
+          "variant_glob": "research/*-delta.md",
           "min_bytes": 100,
           "requires_json": {
             "json": "research/tracker/last_run.json",
@@ -35,7 +39,8 @@
               "yes",
               "no"
             ]
-          }
+          },
+          "fresh_this_run": true
         }
       ]
     }

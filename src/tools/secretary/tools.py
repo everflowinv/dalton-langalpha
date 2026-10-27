@@ -7,6 +7,7 @@ The tools themselves are in ``chief_of_staff``; a hand-off runs through
 import asyncio
 import json
 import logging
+from typing import Any
 
 from langchain_core.messages import ToolMessage
 from langgraph.types import Command
@@ -88,9 +89,19 @@ async def workspaces_list(user_id: str, tool_call_id: str) -> Command:
         if is_dalton_supabase_auth_enabled():
             from src.dalton.sharing import list_colleague_cos_workspaces
 
-            payload["colleague_workspaces"] = await list_colleague_cos_workspaces(
-                user_id
-            )
+            colleague_list = await list_colleague_cos_workspaces(user_id)
+            payload["colleague_workspaces"] = colleague_list
+            if colleague_list:
+                # Said here, where the model reads the list it is about to
+                # route by: promising a dispatch into one of these was the
+                # incident, and dispatch refuses them.
+                payload["colleague_workspaces_note"] = (
+                    "同事共享的工作区当前只能读取（list_files / read_file；rw 时可 "
+                    "write_file 写文件），delegate_to_analyst 不能向同事的工作区派发"
+                    "任务（会被拒绝）。要在同事工作区里做的事：用 manage_workspaces"
+                    '(action="create") 在用户自己名下新建工作区，再把任务派发给它的'
+                    "分析师。"
+                )
         # --- DALTON-HOOK(workspace-sharing-settings): end ---
         content = json.dumps(payload, default=str)
     except Exception as e:
@@ -110,6 +121,138 @@ async def workspaces_list(user_id: str, tool_call_id: str) -> Command:
 # workspace the user already holds never rides the standing approval — the
 # middleware withholds it when the model proposes the call, and the duplicate
 # is named on the card, so the user can just reuse it.
+# --- DALTON-HOOK(workspace-folder-ready): begin ---
+_FOLDER_NOT_READY_HINT = (
+    "计算机启动后才会创建该文件夹；需要交接文件时，先放在 Home 下，并把路径写进派发说明"
+)
+_FOLDER_CHECK_NOTE = "复制或清理前先确认 folder_path 已存在且非空"
+
+
+async def _folder_ready_result(
+    manager: Any, user_id: str, workspace: dict
+) -> dict:
+    """``folder_ready``/``folder_path`` for a just-created workspace.
+
+    A new row owns a folder name but no folder until the machine's next
+    acquisition builds it, which left the Chief of Staff copying hand-off
+    files into a directory that did not exist yet.
+
+    The path a created folder must have is whatever the SANDBOX would use at
+    bring-up — ``session.sandbox.layout.for_workspace(dir_name).setup_dirs[0]``,
+    the exact expression ``PTCSandbox._ensure_workspace_dirs`` mkdirs — because
+    a reconnect can repoint the sandbox's working dir away from the computer
+    row's root, and a folder created at any other root is not the folder the
+    attach will find. So whenever the folder is actually created (the new
+    workspace is on THIS turn's Home computer and this worker holds the turn's
+    cached session for it — a peek, never an acquire), the layout of that
+    live sandbox is the one source for the path, for ``mkdir``, for ``test -d``
+    and for the returned ``folder_path`` alike.
+
+    Not creating (different computer, no cached session) answers the binding's
+    ``root_dir``/``dir_name`` as a best-effort ``folder_path`` — display only,
+    nothing was built there. A failed binding read never falls back to the
+    global default root to build anything; it answers a default-derived path
+    for display and ``folder_ready: False``. Even when creating, ``mkdir`` and
+    a separate ``test -d`` must both exit 0 before ``folder_ready`` is true —
+    a swallowed mkdir failure never reports ready. No case here may raise or
+    fail the create, which already succeeded.
+    """
+    workspace_id = str(workspace.get("workspace_id") or "")
+    dir_name = str(workspace.get("dir_name") or "").strip()
+    computer_id = str(workspace.get("computer_id") or "").strip()
+
+    result: dict = {"folder_ready": False, "folder_hint": _FOLDER_NOT_READY_HINT}
+
+    binding = None
+    try:
+        binding = await manager.resolve_binding(workspace_id)
+    except Exception as e:
+        logger.warning(f"Could not resolve the folder path for {workspace_id}: {e}")
+    if binding is None:
+        # Display-only path from the same default math the file routes use;
+        # never a root to build on.
+        if dir_name:
+            try:
+                from src.server.app.workspace_files._shared import work_dir_for
+
+                path = work_dir_for(workspace, manager=manager)
+                if path:
+                    result["folder_path"] = str(path)
+            except Exception as e:
+                logger.warning(
+                    f"Could not compute the folder path for {workspace_id}: {e}"
+                )
+        return result
+
+    root = str(getattr(binding, "root_dir", None) or "").rstrip("/")
+    if root and dir_name:
+        result["folder_path"] = f"{root}/{dir_name}"
+    if not (root and dir_name and computer_id):
+        return result
+
+    try:
+        from src.server.database.home_workspace import get_home_workspace_id
+        from src.server.database.workspace import get_workspace as _get_workspace
+
+        home = await _get_workspace(get_home_workspace_id(user_id))
+        home_computer_id = str((home or {}).get("computer_id") or "")
+    except Exception as e:
+        logger.warning(f"Could not read Home's computer for user {user_id}: {e}")
+        return result
+    if home_computer_id != computer_id:
+        return result
+
+    # This worker's live session for the Home computer — a peek, never an
+    # acquire: a machine with no cached session here is not running this turn.
+    session = manager._cached_session(computer_id)
+    sandbox = getattr(session, "sandbox", None) if session is not None else None
+    if sandbox is None:
+        return result
+
+    try:
+        # The one path bring-up would create: taken from the live sandbox's
+        # own layout, which may differ from the binding root after a
+        # reconnect repointed the sandbox's working dir.
+        folder_path = str(
+            sandbox.layout.for_workspace(dir_name).setup_dirs[0]
+        )
+    except Exception as e:
+        logger.warning(
+            f"Could not derive the sandbox folder path for {workspace_id}: {e}"
+        )
+        return result
+    result["folder_path"] = folder_path
+
+    import shlex
+
+    def _exit_code(res: Any) -> int:
+        try:
+            return int((res or {}).get("exit_code"))
+        except (TypeError, ValueError):
+            return 1
+
+    quoted = shlex.quote(folder_path)
+    try:
+        made = await sandbox.execute_bash_command(
+            command=f"mkdir -p {quoted}", timeout=30
+        )
+        verified = await sandbox.execute_bash_command(
+            command=f"test -d {quoted}", timeout=15
+        )
+        if _exit_code(made) == 0 and _exit_code(verified) == 0:
+            return {
+                "folder_ready": True,
+                "folder_path": folder_path,
+            }
+        logger.warning(
+            f"Folder for {workspace_id} was not confirmed at {folder_path}"
+        )
+    except Exception as e:
+        logger.warning(f"Could not create the folder for {workspace_id}: {e}")
+    return result
+# --- DALTON-HOOK(workspace-folder-ready): end ---
+
+
 async def workspaces_create(
     user_id: str,
     name: str | None,
@@ -175,6 +318,15 @@ async def workspaces_create(
             "workspace_id": str(workspace["workspace_id"]),
             "workspace_name": workspace["name"],
         }
+        # --- DALTON-HOOK(workspace-folder-ready): begin ---
+        # The folder is only built at the machine's next acquire, so say where
+        # it will be and whether it is there now — the incident's hand-off
+        # copied into a directory that did not exist yet.
+        result.update(
+            await _folder_ready_result(workspace_manager, user_id, workspace)
+        )
+        result["folder_note"] = _FOLDER_CHECK_NOTE
+        # --- DALTON-HOOK(workspace-folder-ready): end ---
         if preapproved:
             # The card for it is drawn from this result.
             result["preapproved"] = True
@@ -464,6 +616,93 @@ async def threads_delete(
 
 
 # --- DALTON-HOOK(workspace-sharing-settings): begin ---
+def _is_home_workspace(workspace: dict) -> bool:
+    """Whether ``workspace`` is the user's Home workspace."""
+    if bool(workspace.get("is_home")):
+        return True
+    own_dir = str(workspace.get("dir_name") or "").strip()
+    own_name = str(workspace.get("name") or "").strip()
+    return own_dir == "Home" or (not own_dir and own_name == "Home")
+
+
+async def _has_subdirectory(
+    sandbox: object, work_dir: str, subdir_name: str, *, fail_open: bool
+) -> bool:
+    """True when ``<work_dir>/<subdir_name>`` already exists as a directory.
+
+    A listing failure never refuses or rewrites the write: it logs a warning
+    and answers ``fail_open`` — every caller passes True so the write proceeds
+    on the ORIGINAL path rather than telling the model to strip a prefix the
+    caller may genuinely mean."""
+    try:
+        entries = await sandbox.als_directory(work_dir)
+    except Exception as e:
+        logger.warning(
+            f"Could not list directory {work_dir} when checking subdirectory {subdir_name!r}: {e}"
+        )
+        return fail_open
+    for entry in entries or ():
+        if (
+            isinstance(entry, dict)
+            and bool(entry.get("is_dir"))
+            and str(entry.get("name") or "") == subdir_name
+        ):
+            return True
+    return False
+
+
+async def _sibling_folder_named(
+    rel_path: str, workspace: dict, sandbox: object, work_dir: str
+) -> str | None:
+    """The path's first segment when ``workspace`` is Home, the first segment
+    matches a LIVE (non-deleted) sibling workspace's folder on this computer,
+    and Home does not already contain a subdirectory of that name."""
+    if not _is_home_workspace(workspace):
+        return None
+    parts = rel_path.split("/", 1)
+    if len(parts) < 2 or not parts[0].strip() or not parts[1].strip():
+        return None
+    first = parts[0].strip()
+    computer_id = workspace.get("computer_id")
+    if not computer_id:
+        logger.warning(
+            f"Could not check sibling workspace folders for Home ({workspace.get('workspace_id')}): computer_id is empty"
+        )
+        return None
+    try:
+        from src.server.database.workspace import (
+            get_live_workspace_folders_for_computer,
+        )
+
+        live_rows = await get_live_workspace_folders_for_computer(str(computer_id))
+    except Exception as e:
+        logger.warning(
+            f"Could not read live workspace folders of computer {computer_id}: {e}"
+        )
+        return None
+    own_id = str(workspace.get("workspace_id") or "").strip()
+    own_dir = str(workspace.get("dir_name") or "Home").strip()
+    matched_sibling: str | None = None
+    for row in live_rows or ():
+        if isinstance(row, dict):
+            if own_id and str(row.get("workspace_id") or "") == own_id:
+                continue
+            folder = str(row.get("dir_name") or row.get("name") or "").strip()
+        else:
+            folder = str(row or "").strip()
+        # Exact match: the sandbox is Linux and filenames are case-sensitive,
+        # so "nvda/" in Home is an ordinary folder even beside an "NVDA"
+        # workspace — same rule as the own-prefix and subdirectory checks.
+        if folder and folder != own_dir and folder == first:
+            matched_sibling = folder
+            break
+    if matched_sibling is None:
+        return None
+    if await _has_subdirectory(sandbox, work_dir, first, fail_open=True):
+        return None
+    return matched_sibling
+
+
 async def workspace_files_list_cos(
     user_id: str,
     workspace_id: str | None,
@@ -712,8 +951,46 @@ async def workspace_file_write_cos(
         ):
             work_dir = owner_work_dir(live_ws)
             previous_dirs = previous_dir_names_of(live_ws)
+            # DALTON-HOOK(workspace-sharing-settings): keep CoS writes inside the named workspace
+            rel_path = normalize_requested_path(path, work_dir, previous_dirs)
+            if _is_non_owner_blocked_path(rel_path):
+                return error_command(
+                    "403 Forbidden: Cannot write system, hidden, or virtual files",
+                    tool_call_id,
+                )
+            own_dir = str(live_ws.get("dir_name") or "").strip()
+            parts = rel_path.split("/", 1)
+            if (
+                own_dir
+                and len(parts) == 2
+                and parts[1].strip()
+                and parts[0].strip() == own_dir
+            ):
+                if not await _has_subdirectory(
+                    sandbox, work_dir, own_dir, fail_open=True
+                ):
+                    rest = parts[1].strip().lstrip("/")
+                    return error_command(
+                        f"路径应相对该工作区自己的文件夹，去掉开头的 `{own_dir}/`（如 '{rest}'）。",
+                        tool_call_id,
+                    )
+            sibling = await _sibling_folder_named(
+                rel_path, live_ws, sandbox, work_dir
+            )
+            if sibling is not None:
+                # The incident's shape: "DASH/..." written into Home (or any
+                # workspace but DASH) as a way to "put it in the workspace".
+                # Refuse it naming the workspace-relative path, or the write
+                # silently lands in the wrong workspace's folder.
+                return error_command(
+                    f"路径以 {sibling}/ 开头：那是同一电脑上另一个工作区的文件夹，"
+                    f"不是工作区 {ws.get('name') or workspace_id} 内的路径，写入不会"
+                    "落到目标工作区。请改用该工作区内的相对路径（如 'sources/x.md'），"
+                    "或把 workspace_id 换成那个工作区。",
+                    tool_call_id,
+                )
             normalized = await contained_target(
-                sandbox, path, work_dir, previous_dirs
+                sandbox, rel_path, work_dir, previous_dirs
             )
             client_path = _to_client_path(sandbox, normalized, work_dir)
             if _is_non_owner_blocked_path(client_path):

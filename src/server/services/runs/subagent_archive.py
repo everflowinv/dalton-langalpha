@@ -194,15 +194,30 @@ async def persist_collected_events(
             provenance = await saved_lane_provenance(
                 thread_id, events, log_tag="[SubagentCollector]"
             )
-            if not await replace_lane_provenance(response_id, provenance, lanes):
+            # DALTON-HOOK(provenance-full-archive): log actual written count
+            # after deduplication/cap, alongside deduped and dropped counts.
+            written = await replace_lane_provenance(response_id, provenance, lanes)
+            if written is None:
                 raise RuntimeError(f"no response row for {response_id}")
             for task_id, lane_images in images.items():
                 await record_lane_images(
                     thread_id, response_id, task_id, lane_images
                 )
+            from src.server.database.provenance import _extract_provenance_with_stats
+
+            _, deduped_count, dropped_count = _extract_provenance_with_stats(
+                provenance
+            )
+            extra_stats: list[str] = []
+            if deduped_count:
+                extra_stats.append(f"deduped={deduped_count}")
+            if dropped_count:
+                extra_stats.append(f"dropped={dropped_count}")
+            stats_suffix = f" ({', '.join(extra_stats)})" if extra_stats else ""
             logger.info(
-                f"[SubagentCollector] Recorded {len(provenance)} provenance "
-                f"entries for {len(lanes)} lanes, response_id={response_id}"
+                f"[SubagentCollector] Recorded {written} provenance "
+                f"entries{stats_suffix} for {len(lanes)} lanes, "
+                f"response_id={response_id}"
             )
             return True
         except Exception as e:

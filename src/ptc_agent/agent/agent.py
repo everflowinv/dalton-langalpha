@@ -22,6 +22,7 @@ from ptc_agent.agent.limits import UNBOUNDED_RECURSION_LIMIT
 from ptc_agent.agent.main_state import MainAgentState
 # DALTON-HOOK(dalton-patch-tool-calls): dangling calls are reported as possibly run, not cancelled.
 from src.dalton.middleware.patch_tool_calls import DaltonPatchToolCallsMiddleware
+# DALTON-HOOK(attachment-native-cap): cap cross-turn inline attachment payload per model request.
 from langchain_anthropic.middleware import AnthropicPromptCachingMiddleware
 
 from ptc_agent.agent.middleware import (
@@ -271,6 +272,9 @@ class PTCAgent:
         turn_context: TurnContext | None = None,
         project: ProjectContext | None = None,
         role: AgentRole = "analyst",
+        # DALTON-HOOK(dalton-tools): the caller's tier withholds internal-only
+        # Dalton tools at mount time.
+        user_tier: str | None = None,
         harness_blocks: Mapping[str, str | None] | None = None,
         subagent_switch: SubagentSwitchReader | None = None,
         window_coverage: WindowCoverage | None = None,
@@ -302,6 +306,11 @@ class PTCAgent:
             role: The Chief of Staff gets its role section and its
                 coordination tools, which subagents never see, and only the
                 subagents listed for its role (``SubagentDefinition.roles``).
+            user_tier: The caller's Dalton access tier ("admin" | "internal" |
+                "external"), resolved by the async builder; withholds
+                internal-only Dalton tools (conversation_search) from external
+                members at mount time. None mounts the full set.
+                (DALTON-HOOK(dalton-tools) plumbing.)
             harness_blocks: The baseline blocks this build's role adds, keyed
                 by kind (see ``HARNESS_BLOCKS``), each the text its read
                 returned before the build, or None when that read did not
@@ -1134,9 +1143,11 @@ class PTCAgent:
 
             tools = [*tools, *CHIEF_OF_STAFF_TOOLS]
         # DALTON-HOOK(dalton-tools): bind role-scoped Dalton knowledge/publish/director tools onto the main agent (PK.4, PK.11, PK.19).
+        # ``user_tier`` (resolved by the async builder) withholds internal-only
+        # tools from external members here, at mount time.
         from src.dalton.tools import build_dalton_tools
 
-        tools = [*tools, *build_dalton_tools(role, filesystem_backend)]
+        tools = [*tools, *build_dalton_tools(role, filesystem_backend, user_tier=user_tier)]
         if direct_tools:
             tools = [*tools, *direct_tools]
 

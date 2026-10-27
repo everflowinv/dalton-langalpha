@@ -94,6 +94,6 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 
 ### 收尾门禁：汇报完成前必须过完成契约（`dalton_check_done`）
 
-- 向 PM 汇报“完成”（或例行文件记 `NO_CHANGE` 收尾）前，必须调用 `dalton_check_done(workflow="dalton-filing-review", params={"ticker": ..., "as_of": "<笔记日期>", "form": "<表单，巨潮公告填 cninfo>", "accession": "<accession 短号；巨潮公告填 title 简称>"})`，参数与第 4 步笔记文件名一致。
+- 向 PM 汇报“完成”（或例行文件记 `NO_CHANGE` 收尾）前，必须调用 `dalton_check_done(workflow="dalton-filing-review", params={"ticker": ..., "as_of": "<笔记日期>", "form": "<表单，巨潮公告填 cninfo>", "accession": "<accession 短号；巨潮公告填 title 简称>"})`，参数与第 4 步笔记文件名一致（`as_of`/笔记日期统一用公告提交的美东业务日；新近度按本轮运行开始时间核对，跨美东零点的自动唤醒不会因此误判）。
 - 契约要求：第 4 步审阅笔记、本轮 `trigger.kind` 为 `filing` 或 `manual` 的 verdict；verdict 不是 `NO_CHANGE` 时，`thesis`/`debate`/`drivers`/`management` 至少一份须有本轮 `knowledge_update` 写入的新版本。
 - `done=false` 时按 `missing` 先补齐再查（审阅笔记缺失就补写、verdict 未写就 `knowledge_append_verdict`、非 `NO_CHANGE` 却没有知识更新就按第 5 步第 2 项 `knowledge_update`）；补不了的缺项只能汇报“未完成”并列出缺项与原因，不得汇报“完成”。

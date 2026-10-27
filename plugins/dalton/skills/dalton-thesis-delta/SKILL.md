@@ -43,6 +43,8 @@ python3 .agents/skills/dalton-thesis-delta/scripts/collect.py collect \
   --workspace-dir .
 ```
 
+   脚本默认经沙箱内 PTC 包装模块（`tools.researchdata`，与 `ExecuteCode` 调 researchdata 同一模块）取数；`DALTON_RESEARCHDATA_URL` 只作 HTTP 桥覆盖。若返回 `status=researchdata_transport_unconfigured`，是配置错误（两条调用路都不可用），本轮未采集任何来源：不要重试采集，按“所有来源取数失败”如实汇报并停下，严禁走短路分支或写成“本轮无新文档”。
+
 3. **快速短路分支（不读任何文档全文）**：
    - 检查 `collect.py` 返回的汇总 JSON 中的 `internal_status`、`failed_sources`、`all_sources_ok` 与 `short_circuit_eligible`：
    - **任何来源 `ok: false` 都不能当成“没有新文档”**：当某个来源 `ok: false`（`all_sources_ok == false` 或 `failed_sources` 非空）时，**严禁走“所有来源 0 新增 → 短路结束”的分支**；在本轮结论（`verdict` 与 `commit --summary`）和汇报里必须如实写明“`<来源> 本轮取数失败（原因）`”，**绝不能写成“本轮无新文档”或“无新增”**。
@@ -83,7 +85,7 @@ python3 .agents/skills/dalton-thesis-delta/scripts/collect.py collect \
 ### 第 3 步：分支处理（更新知识层 / 写增量笔记 / 决定是否推送）
 
 #### 分支 A：存在重要变化（`material=yes`）
-1. **撰写增量笔记**：按 `.agents/skills/dalton-thesis-delta/templates/delta.md` 写入 `research/<YYYY-MM-DD>-delta.md`（写清变化是什么、一手与卖方证据、影响哪个 thesis 支柱或 debate、事件五词结论、下一项验证）。
+1. **撰写增量笔记**：按 `.agents/skills/dalton-thesis-delta/templates/delta.md` 写入 `research/<YYYY-MM-DD>-delta.md`（日期统一用**美东业务日**——本轮运行开始时的美东日历日，与 `dalton_check_done` 口径一致；自动唤醒常在美东前一天晚间启动，此时不要用 UTC/北京日期命名）（写清变化是什么、一手与卖方证据、影响哪个 thesis 支柱或 debate、事件五词结论、下一项验证）。
 2. **更新知识层**：调用 `knowledge_update` 更新受影响的文档（`thesis` / `debate` / `drivers` / `management`）。
 3. **追加事件结论**：调用 `knowledge_append_verdict` 写入五词结论（`THESIS_STRENGTHENED` / `THESIS_WEAKENED` / `THESIS_BROKEN` / `NEW_THESIS` 或有实质新证据但维持原判的 `NO_CHANGE` + `progress="some"`（彻底解答问题时填 `"resolved"`）；`trigger.kind` 按第 1 步对照表与变化主要来源填 `consensus_change`、`internal_material`、`filing`、`earnings`、`indicator`、`price_move`、`due_validation`、`pm_question`、`agenda` 或 `manual`，`trigger.ref` 填 `<dalton_wake>` 信号 id）。
 4. **回复摘要**：最后一条回复写不超过 10 行的精炼中文摘要（delta 任务不发私信推送，PM 在对话里看到它；判断先行：五词结论 + 变化核心事实与带期间数字 + 受影响的支柱/Debate + 下一项验证）。
@@ -110,6 +112,6 @@ python3 .agents/skills/dalton-thesis-delta/scripts/collect.py commit \
 
 ### 收尾门禁：汇报完成前必须过完成契约（`dalton_check_done`）
 
-- 第 4 步 `commit` 成功后（无论 `material=yes` 还是 `no`，含第 1 步的快速短路分支），结束本轮前调用 `dalton_check_done(workflow="dalton-thesis-delta", params={"ticker": ..., "as_of": "<本轮日期 YYYY-MM-DD，与增量笔记文件名一致>"})`。
-- 契约按 `research/tracker/last_run.json` 判定：它须为本轮 `commit` 写入；`material=yes` 时还要求 `research/<本轮日期>-delta.md` 增量笔记，以及 `thesis`/`debate`/`drivers`/`management` 至少一份本轮 `knowledge_update` 新版本；`material=no` 时没有增量笔记是合法结果。两种情况都要求本轮 verdict 已写。
+- 第 4 步 `commit` 成功后（无论 `material=yes` 还是 `no`，含第 1 步的快速短路分支），结束本轮前调用 `dalton_check_done(workflow="dalton-thesis-delta", params={"ticker": ..., "as_of": "<本轮美东业务日 YYYY-MM-DD，与增量笔记文件名一致>"})`；若笔记文件名日期与 `as_of` 不同（如跨了美东零点），再加 `"delta_note": "<本轮实际写入的笔记路径>"` 显式指给契约。
+- 契约按 `research/tracker/last_run.json` 判定：它须为本轮 `commit` 写入；`material=yes` 时还要求 `research/<本轮日期>-delta.md` 增量笔记（按本轮运行开始时间核对新近度；也接受本轮实际写入的同目录 `*-delta.md` 或 params 里显式给的 `delta_note` 路径），以及 `thesis`/`debate`/`drivers`/`management` 至少一份本轮 `knowledge_update` 新版本；`material=no` 时没有增量笔记是合法结果。两种情况都要求本轮 verdict 已写。
 - `done=false` 时按 `missing` 先补齐再查（`commit` 未落盘就重跑 `commit`、增量笔记缺失就补写、verdict 未写就 `knowledge_append_verdict`、知识层缺本轮更新就 `knowledge_update`）；补不了的缺项只能汇报“未完成”并列出缺项与原因，不得汇报“完成”。

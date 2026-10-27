@@ -756,7 +756,7 @@ docstring 按 `src/tools/AGENTS.md` 和 `mcp_servers/AGENT_CONTRACT.md` 写：Re
 
 只在 researchdata 的 `read-item` 被证明不够用时才做。实现时先确认沙箱镜像里是否装了 edgartools【待验证 `Dockerfile.sandbox` 的依赖】。
 
-**错误信封：** 用 `make_error`，错误码取 `invalid_argument`、`not_found`、`rate_limited`、`upstream_error`。错误结果不入来源账（0.4 第 12 行），这符合预期。
+**错误信封：** 用 `make_error`，错误码取 `invalid_argument`、`not_found`、`plan_not_covered`、`rate_limited`、`upstream_error`。错误结果不入来源账（0.4 第 12 行），这符合预期。
 
 ### 验证方式（真实调用）
 

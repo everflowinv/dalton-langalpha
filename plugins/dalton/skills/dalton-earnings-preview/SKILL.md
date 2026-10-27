@@ -140,5 +140,5 @@ python3 .agents/skills/dalton-earnings-preview/scripts/predictions.py validate \
 
 ### 收尾门禁：汇报完成前必须过完成契约（`dalton_check_done`）
 
-- 第 5 项全部做完后、向 PM 汇报“完成”前，必须调用 `dalton_check_done(workflow="dalton-earnings-preview", params={"ticker": ..., "quarter": ..., "as_of": "<本稿 D>"})`。
+- 第 5 项全部做完后、向 PM 汇报“完成”前，必须调用 `dalton_check_done(workflow="dalton-earnings-preview", params={"ticker": ..., "quarter": ..., "as_of": "<本稿 D>"})`（`<D>` 统一用财报发布的美东业务日，与草稿文件名一致）。
 - `done=false` 时按 `missing` 先补齐再查（缺草稿或 `predictions.json` 就补写、校验未过就按输出修到 `predictions.py validate --strict` 通过、`drivers`/`debate` 缺本轮 source=tool 新版本就 `knowledge_update`、verdict 未写或 `trigger.kind` 不是 `earnings` 就 `knowledge_append_verdict`、check_draft 用了旧草稿就对最终稿重跑 `check_draft`、语言审查缺轮次或第 2 轮哈希对不上就补跑对应轮次的 `check_language`）；补不了的缺项只能汇报“未完成”并列出缺项与原因，不得汇报“完成”。

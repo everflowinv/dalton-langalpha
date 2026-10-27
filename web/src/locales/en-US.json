@@ -1982,6 +1982,8 @@
     "goToLangAlpha": "Go to {{brand}}"
   },
   "chat": {
+    "attachmentTooLarge": "{{name}} is over {{max}} MB and was not attached. Upload larger files from the file panel.",
+    "attachmentsTotalTooLarge": "{{name}} was not attached: this message's attachments would exceed {{max}} MB in total. Upload more files from the file panel.",
     "backToWorkflow": "Back to workflow",
     "backToMain": "Back to main",
     "reconnecting": "Reconnecting…",

@@ -659,14 +659,15 @@ def _unwrap_mcp_content(envelope: Any) -> Any:
     return envelope
 
 
-def _finalize_mcp_result(
+# DALTON-HOOK(dalton-tools): the flag-preserving settle core feeds collect.py's
+# batch entry; _finalize_mcp_result keeps its value-only behavior.
+def _settle_result_with_flag(
     server_name: str, tool_name: str, arguments: dict[str, Any], envelope: Any
-) -> Any:
-    """Unwrap an MCP result and trace it iff it carries real data.
-
-    Shared by both transports — the single place that sees the raw envelope (so
-    the ``isError`` flag survives) and decides whether the call is recordable.
-    """
+) -> tuple[bool, Any]:
+    """``(is_error, value)``: the settle decision with the MCP error verdict
+    kept alongside the unwrapped value — the single core every settle path
+    shares, so the flag-preserving entry and the value-only entry cannot
+    drift."""
     if isinstance(envelope, dict):
         result_type = envelope.get("resultType")
         if result_type not in (None, "complete"):
@@ -679,18 +680,42 @@ def _finalize_mcp_result(
             )
             raise RuntimeError(msg)
     value = _unwrap_mcp_content(envelope)
-    if not _is_error_result(envelope, value):
+    is_error = _is_error_result(envelope, value)
+    if not is_error:
         _trace_mcp_call(server_name, tool_name, arguments, value)
+    return is_error, value
+
+
+def _finalize_mcp_result(
+    server_name: str, tool_name: str, arguments: dict[str, Any], envelope: Any
+) -> Any:
+    """Unwrap an MCP result and trace it iff it carries real data.
+
+    Shared by both transports — the single place that sees the raw envelope (so
+    the ``isError`` flag survives) and decides whether the call is recordable.
+    """
+    _is_error, value = _settle_result_with_flag(
+        server_name, tool_name, arguments, envelope
+    )
     return value
 
 
+# DALTON-HOOK(dalton-tools): with_flag carries the settle core's error verdict
+# out to the flag-preserving entry; the default return stays value-only.
 def _settle_reply(
-    reply: dict, server_name: str, tool_name: str, arguments: dict[str, Any]
+    reply: dict,
+    server_name: str,
+    tool_name: str,
+    arguments: dict[str, Any],
+    *,
+    with_flag: bool = False,
 ) -> Any:
     """Turn a matched tools/call reply into the tool's value, or raise.
 
     Both transports end here, so a JSON-RPC error and a malformed reply read
-    the same to the agent whichever way the server was reached.
+    the same to the agent whichever way the server was reached. With
+    ``with_flag`` the return is ``(is_error, value)`` for the flag-preserving
+    entry point.
     """
     if "error" in reply:
         error_msg = f"MCP tool call failed: {reply['error']}"
@@ -703,7 +728,13 @@ def _settle_reply(
         print(f"ERROR: {error_msg}", file=sys.stderr)  # noqa: T201
         print(f"Reply: {reply}", file=sys.stderr)  # noqa: T201
         raise RuntimeError(error_msg)
-    return _finalize_mcp_result(server_name, tool_name, arguments, reply["result"])
+    # DALTON-HOOK(dalton-tools): the flag rides out here for the batch entry.
+    is_error, value = _settle_result_with_flag(
+        server_name, tool_name, arguments, reply["result"]
+    )
+    if with_flag:
+        return is_error, value
+    return value
 
 
 def _log_call_failure(
@@ -1245,13 +1276,21 @@ def _stdio_reply(
         lock.release()
 
 
+# DALTON-HOOK(dalton-tools): with_flag only threads the settle verdict through
+# for the flag-preserving entry; the default path is unchanged.
 def _call_mcp_tool_stdio(
-    server_name: str, tool_name: str, arguments: dict[str, Any]
+    server_name: str,
+    tool_name: str,
+    arguments: dict[str, Any],
+    *,
+    with_flag: bool = False,
 ) -> Any:
     """Call an MCP tool via stdio transport (subprocess)."""
     try:
         response = _stdio_reply(server_name, tool_name, arguments)
-        return _settle_reply(response, server_name, tool_name, arguments)
+        return _settle_reply(
+            response, server_name, tool_name, arguments, with_flag=with_flag
+        )
 
     except Exception as e:  # noqa: BLE001 - Top-level error handler for MCP tool call
         _log_call_failure("_call_mcp_tool_stdio", e, server_name, tool_name, arguments)
@@ -2057,13 +2096,21 @@ def _negotiate_http_server(server_name: str, discovery: bool) -> dict:
         raise RuntimeError(msg) from e
 
 
+# DALTON-HOOK(dalton-tools): with_flag only threads the settle verdict through
+# for the flag-preserving entry; the default path is unchanged.
 def _call_mcp_tool_http(
-    server_name: str, tool_name: str, arguments: dict[str, Any]
+    server_name: str,
+    tool_name: str,
+    arguments: dict[str, Any],
+    *,
+    with_flag: bool = False,
 ) -> Any:
     """Call an MCP tool via streamable HTTP transport."""
     try:
         result = _http_exchange(server_name, tool_name, arguments)
-        return _settle_reply(result, server_name, tool_name, arguments)
+        return _settle_reply(
+            result, server_name, tool_name, arguments, with_flag=with_flag
+        )
 
     except Exception as e:  # noqa: BLE001 - Top-level error handler for MCP tool call
         _log_call_failure("_call_mcp_tool_http", e, server_name, tool_name, arguments)
@@ -2654,6 +2701,21 @@ def _call_mcp_tool(server_name: str, tool_name: str, arguments: dict[str, Any]) 
     a latency property, and degrading to the old per-execution spawn is
     strictly better than losing every MCP call to a socket that failed to bind.
     """
+    return _call_mcp_tool_dispatch(server_name, tool_name, arguments)
+
+
+# DALTON-HOOK(dalton-tools): the dispatch split exists only to serve the
+# flag-preserving entry below; _call_mcp_tool's behavior is unchanged.
+def _call_mcp_tool_dispatch(
+    server_name: str,
+    tool_name: str,
+    arguments: dict[str, Any],
+    *,
+    with_flag: bool = False,
+) -> Any:
+    """``_call_mcp_tool``'s dispatch, parameterized only on how the reply is
+    settled (value-only, or ``(is_error, value)`` for the flag-preserving
+    entry). Behavior for the default is byte-for-byte the historical one."""
     transport = _server_cfg(server_name).transport
     _require_enabled(server_name)
 
@@ -2663,19 +2725,37 @@ def _call_mcp_tool(server_name: str, tool_name: str, arguments: dict[str, Any]) 
     reply = _supervisor_reply(server_name, tool_name, arguments)
     if reply is not None:
         try:
-            return _settle_reply(reply, server_name, tool_name, arguments)
+            return _settle_reply(
+                reply, server_name, tool_name, arguments, with_flag=with_flag
+            )
         except Exception as e:  # noqa: BLE001 - mirror the transports' dump
             _log_call_failure(
                 "_call_mcp_tool_supervisor", e, server_name, tool_name, arguments
             )
             raise
 
-    # Tracing happens in the transport via _finalize_mcp_result, where the raw
-    # envelope (incl. the MCP isError flag) is still visible — so failed calls
-    # and error payloads are returned to the agent but never recorded as sources.
+    # Tracing happens in the settle core, where the raw envelope (incl. the
+    # MCP isError flag) is still visible — so failed calls and error payloads
+    # are returned to the agent but never recorded as sources.
     if transport == "http":
-        return _call_mcp_tool_http(server_name, tool_name, arguments)
-    return _call_mcp_tool_stdio(server_name, tool_name, arguments)
+        return _call_mcp_tool_http(server_name, tool_name, arguments, with_flag=with_flag)
+    return _call_mcp_tool_stdio(server_name, tool_name, arguments, with_flag=with_flag)
+
+
+# DALTON-HOOK(dalton-tools): deterministic in-sandbox scripts (collect.py) batch
+# researchdata calls and must see the MCP error verdict; agent code keeps
+# _call_mcp_tool's value-only return unchanged.
+def call_mcp_tool_with_error_flag(
+    server_name: str, tool_name: str, arguments: dict[str, Any]
+) -> tuple[bool, Any]:
+    """``(is_error, value)`` for one tools/call — the same dispatch, tracing
+    and raise behavior as ``_call_mcp_tool``, with the error verdict kept.
+
+    An ``isError=true`` reply unwraps to the server's payload (e.g.
+    ``{"message": "unauthorized"}``) with no error marker left in it; a caller
+    that reads only the value scores that as an empty success. The flag is the
+    verdict — batch callers fail on it and keep the payload's error text."""
+    return _call_mcp_tool_dispatch(server_name, tool_name, arguments, with_flag=True)
 
 
 def cleanup_mcp_servers():

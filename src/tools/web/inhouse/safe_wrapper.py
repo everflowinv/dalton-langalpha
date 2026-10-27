@@ -455,6 +455,27 @@ class SafeCrawlerWrapper:
                 error_type=kind,
             )
 
+        # DALTON-HOOK(fetch-binary-route): a PDF/image payload (extension-less
+        # redirect) is a successful fetch this backend cannot extract — say so
+        # instead of falling into the empty-content failure below, which would
+        # charge the host breaker for a page that answered fine.
+        if getattr(output, "binary_mime", None):
+            kind = "PDF" if output.binary_mime == "application/pdf" else "图片"
+            if host_breaker is not None:
+                await host_breaker.record_success()
+            await self._infra_breaker.record_success()
+            if netloc and netloc in self._block_attempts:
+                async with self._lock:
+                    self._clear_block_attempts_locked(netloc)
+            return CrawlResult(
+                success=True,
+                markdown=(
+                    f"该链接是 {kind}（{output.binary_mime}），当前抓取后端"
+                    f"不提取二进制内容；最终地址：{output.final_url or ''}"
+                ),
+                title="",
+            )
+
         # No failure_kind set: legacy/successful path. Still guard against the
         # silent-empty case (empty markdown without any classification — rare,
         # but catches old extractors that don't set failure_kind).

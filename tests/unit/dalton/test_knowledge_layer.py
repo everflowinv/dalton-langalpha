@@ -1137,9 +1137,12 @@ async def test_validation_failure_includes_expected_schema_structure_and_enum(
     )
     assert res_v["ok"] is False
     v_msg = res_v["message"]
-    assert "Expected structure for / (" in v_msg
-    assert 'required=["at", "trigger", "event", "verdict", "rationale", "next_validation", "progress"]' in v_msg
-    assert 'enum=["NO_CHANGE", "THESIS_STRENGTHENED", "THESIS_WEAKENED", "THESIS_BROKEN", "NEW_THESIS"]' in v_msg
+    # The verdict rejection names the delta and a minimal example (schema
+    # spec rides the tool docstring now — the structure dump moved off).
+    assert "缺少必填字段（补上后重试）：/trigger、/rationale、/next_validation、/progress" in v_msg
+    assert "/verdict" in v_msg  # INVALID_VERDICT_ENUM surfaces as 其他问题
+    assert "最小合规示例：" in v_msg
+    assert '"verdict":"NO_CHANGE"' in v_msg
 
     # 3. Verify agenda next_validations[].due drills into oneOf/$ref and shows date|null instead of any
     agenda_struct = service._format_expected_structures(

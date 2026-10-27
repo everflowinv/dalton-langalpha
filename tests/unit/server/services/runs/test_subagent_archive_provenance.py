@@ -9,7 +9,7 @@ so does a lane whose checkpoint cannot be read.
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, create_autospec, patch  # DALTON-HOOK(provenance-full-archive)
 
 import pytest
 from langchain_core.messages import AIMessage, ToolMessage
@@ -48,21 +48,29 @@ def _saved(*tool_call_ids: str) -> list:
 
 
 async def _persist(events, task_messages, *, write=None):
+    from src.server.services.history.reader import CheckpointHistoryReader
+
     async def task_history(thread_id, task_id):
         if isinstance(task_messages[task_id], Exception):
             raise task_messages[task_id]
         return SimpleNamespace(messages=task_messages[task_id])
 
-    reader = MagicMock()
-    reader.aget_task_history = AsyncMock(side_effect=task_history)
-    write = write or AsyncMock(return_value=True)
+    # DALTON-HOOK(provenance-full-archive): autospec doubles; the write returns int | None.
+    reader = create_autospec(CheckpointHistoryReader, instance=True)
+    reader.aget_task_history.side_effect = task_history
+    if write is None:
+        write = create_autospec(subagent_archive.replace_lane_provenance, return_value=0)
     with (
         patch(
             "src.server.services.history.reader.CheckpointHistoryReader.get_instance",
             return_value=reader,
         ),
         patch.object(subagent_archive, "replace_lane_provenance", write),
-        patch.object(subagent_archive.asyncio, "sleep", AsyncMock()),
+        patch.object(
+            subagent_archive.asyncio,
+            "sleep",
+            create_autospec(subagent_archive.asyncio.sleep, return_value=None),
+        ),
     ):
         ok = await subagent_archive.persist_collected_events(
             events, "resp-1", "thread-1", "ws-1"
@@ -144,3 +152,55 @@ async def test_events_outside_a_task_lane_write_nothing():
 
     assert ok is True
     write.assert_not_awaited()
+
+
+# DALTON-HOOK(provenance-full-archive): cover positive int, 0, and None return values from replace_lane_provenance.
+@pytest.mark.asyncio
+async def test_persist_logs_actual_written_and_deduped_count_and_handles_zero_and_none(caplog):
+    import logging
+
+    dup1 = _source("task:k1", "tc-a", "https://a.test")
+    dup2 = _source("task:k1", "tc-a", "https://a.test")
+    unique = _source("task:k1", "tc-a", "https://b.test")
+    events = [dup1, dup2, unique, _chunk("task:k1")]
+
+    # Case 1: positive integer return value (2)
+    write_pos = create_autospec(subagent_archive.replace_lane_provenance, return_value=2)
+    with caplog.at_level(logging.INFO, logger="src.server.services.runs.subagent_archive"):
+        ok_pos, _, _ = await _persist(
+            events,
+            {"k1": _saved("tc-a")},
+            write=write_pos,
+        )
+    assert ok_pos is True
+    assert write_pos.await_count == 1
+    assert any(
+        "Recorded 2 provenance entries (deduped=1)" in rec.message
+        for rec in caplog.records
+    )
+
+    # Case 2: 0 return value is valid (row exists, 0 records written)
+    caplog.clear()
+    write_zero = create_autospec(subagent_archive.replace_lane_provenance, return_value=0)
+    with caplog.at_level(logging.INFO, logger="src.server.services.runs.subagent_archive"):
+        ok_zero, _, _ = await _persist(
+            [_chunk("task:k1")],
+            {},
+            write=write_zero,
+        )
+    assert ok_zero is True
+    assert write_zero.await_count == 1
+    assert any(
+        "Recorded 0 provenance entries for 1 lanes" in rec.message
+        for rec in caplog.records
+    )
+
+    # Case 3: None return value (response row missing) triggers retry and returns False
+    write_none = create_autospec(subagent_archive.replace_lane_provenance, return_value=None)
+    ok_none, _, _ = await _persist(
+        events,
+        {"k1": _saved("tc-a")},
+        write=write_none,
+    )
+    assert ok_none is False
+    assert write_none.await_count == 2

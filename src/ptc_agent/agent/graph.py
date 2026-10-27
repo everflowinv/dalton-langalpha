@@ -287,6 +287,17 @@ async def build_ptc_graph_with_session(
 
     await warm_turn_data_map(search_api=getattr(config, "search_api", None))
 
+    # DALTON-HOOK(dalton-tools): the caller's tier gates internal-only Dalton
+    # tools at mount time. Resolved fresh per build off the roster (never
+    # cached — multi-worker truth lives in Postgres) and it fails closed: a
+    # failed lookup reads "external", which withholds the tool rather than
+    # mounting something every call would refuse.
+    caller_tier: str | None = None
+    if user_id:
+        from src.dalton.access_tiers import get_user_tier
+
+        caller_tier = await get_user_tier(user_id)
+
     inner_agent = ptc_agent.create_agent(
         sandbox=session.sandbox,
         mcp_registry=mcp_registry,
@@ -314,6 +325,7 @@ async def build_ptc_graph_with_session(
         turn_context=turn_context,
         project=project,
         role=role,
+        user_tier=caller_tier,  # DALTON-HOOK(dalton-tools)
         harness_blocks=harness_blocks,
         subagent_switch=subagent_switch,
         window_coverage=window_coverage,

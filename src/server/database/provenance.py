@@ -44,14 +44,15 @@ MAIN_PROVENANCE_LANE = "main"
 _BIGINT_MIN = -(2**63)
 _BIGINT_MAX = 2**63 - 1
 
-# Cap rows materialized per response. The in-sandbox MCP trace is LLM-authored,
-# so a pathological/poisoned turn could emit thousands of entries; bound the
-# delete-then-insert (and the SSE/render fan-out downstream) defensively.
-_MAX_RECORDS_PER_RESPONSE = 1000
+# DALTON-HOOK(provenance-full-archive): batch INSERT at 1000 rows per statement
+# so responses with >1000 sources are archived in full within one transaction,
+# while keeping a 10000-row runaway ceiling.
+_INSERT_BATCH_SIZE = 1000
+_MAX_RECORDS_PER_RESPONSE = 10000
 
-# Columns of one provenance_records row, in INSERT bind order. 16 columns; with
-# the _MAX_RECORDS_PER_RESPONSE cap that's 16 * 1000 = 16_000 binds per INSERT,
-# well under Postgres's 65_535-parameter ceiling (would only break above ~4_095
+# Columns of one provenance_records row, in INSERT bind order. 17 columns; with
+# the _INSERT_BATCH_SIZE cap that's 17 * 1000 = 17_000 binds per INSERT,
+# well under Postgres's 65_535-parameter ceiling (would only break above ~3_855
 # rows). Keep in sync with _row_binds' tuple order.
 _INSERT_COLUMNS = (
     "conversation_response_id",
@@ -156,9 +157,11 @@ def _fingerprint_key(fingerprint: Any) -> str | None:
         return repr(fingerprint)
 
 
-def extract_provenance(
+# DALTON-HOOK(provenance-full-archive): track deduplicated and hard-cap-dropped
+# counts alongside extracted records so archive logs report actual written rows.
+def _extract_provenance_with_stats(
     events: list[dict[str, Any]] | None,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], int, int]:
     """Return normalized provenance rows from SSE events.
 
     Filters entries with top-level ``event == "provenance"`` and dedups within
@@ -174,10 +177,12 @@ def extract_provenance(
     (which runs inside the turn-persist transaction).
     """
     if not events:
-        return []
+        return [], 0, 0  # DALTON-HOOK(provenance-full-archive)
 
     records: list[dict[str, Any]] = []
     seen: set[tuple] = set()
+    deduped_count = 0
+    dropped_count = 0
     for entry in events:
         if not isinstance(entry, dict) or entry.get("event") != "provenance":
             continue
@@ -217,18 +222,29 @@ def extract_provenance(
             _fingerprint_key(record["args_fingerprint"]),
         )
         if dedup_key in seen:
+            deduped_count += 1  # DALTON-HOOK(provenance-full-archive)
             continue
         seen.add(dedup_key)
+
+        if len(records) >= _MAX_RECORDS_PER_RESPONSE:  # DALTON-HOOK(provenance-full-archive)
+            dropped_count += 1
+            continue
         records.append(record)
 
-        if len(records) >= _MAX_RECORDS_PER_RESPONSE:
-            logger.warning(
-                "[provenance] capped at %d records for one response; "
-                "remaining entries dropped",
-                _MAX_RECORDS_PER_RESPONSE,
-            )
-            break
+    return records, deduped_count, dropped_count  # DALTON-HOOK(provenance-full-archive)
 
+
+def extract_provenance(  # DALTON-HOOK(provenance-full-archive)
+    events: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    records, _deduped, dropped_count = _extract_provenance_with_stats(events)  # DALTON-HOOK(provenance-full-archive)
+    if dropped_count:
+        logger.warning(
+            "[provenance] capped at %d records for one response; "
+            "dropped %d excess records",
+            _MAX_RECORDS_PER_RESPONSE,
+            dropped_count,  # DALTON-HOOK(provenance-full-archive)
+        )
     return records
 
 
@@ -345,23 +361,29 @@ async def insert_provenance_records(
         if not records:
             return 0
 
+        # DALTON-HOOK(provenance-full-archive): insert in batches of
+        # _INSERT_BATCH_SIZE (1000) within the same transaction to stay well
+        # under Postgres's 65535-parameter limit without dropping records.
         row_placeholder = "(" + ", ".join(["%s"] * len(_INSERT_COLUMNS)) + ")"
-        values_clause = ", ".join([row_placeholder] * len(records))
-        params: list[Any] = []
-        for record in records:
-            params.extend(
-                _row_binds(
-                    record,
-                    conversation_response_id=conversation_response_id,
-                    conversation_thread_id=conversation_thread_id,
-                    turn_index=turn_index,
+        columns_sql = ", ".join(_INSERT_COLUMNS)
+        for offset in range(0, len(records), _INSERT_BATCH_SIZE):
+            batch = records[offset : offset + _INSERT_BATCH_SIZE]
+            values_clause = ", ".join([row_placeholder] * len(batch))
+            params: list[Any] = []
+            for record in batch:
+                params.extend(
+                    _row_binds(
+                        record,
+                        conversation_response_id=conversation_response_id,
+                        conversation_thread_id=conversation_thread_id,
+                        turn_index=turn_index,
+                    )
                 )
+            await cur.execute(  # DALTON-HOOK(provenance-full-archive)
+                f"INSERT INTO provenance_records ({columns_sql}) "
+                f"VALUES {values_clause}",
+                params,
             )
-        await cur.execute(
-            f"INSERT INTO provenance_records ({', '.join(_INSERT_COLUMNS)}) "
-            f"VALUES {values_clause}",
-            params,
-        )
 
     return len(records)
 

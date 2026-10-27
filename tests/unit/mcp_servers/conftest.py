@@ -15,6 +15,26 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _no_live_yfinance_price_leg(monkeypatch: pytest.MonkeyPatch):
+    """DALTON-HOOK(market-data-fallback): the price server answers from
+    yfinance ahead of FMP; without this stub the FMP-path tests would dial
+    Yahoo for real and flip on network reachability. A test that exercises
+    the leg patches ``_yf_fetch_history`` itself — the later patch wins.
+    """
+    from unittest.mock import create_autospec
+
+    import plugins.langalpha_market_data.price_data_mcp_server as price_mod
+
+    monkeypatch.setattr(
+        price_mod,
+        "_yf_fetch_history",
+        create_autospec(price_mod._yf_fetch_history, return_value=[]),
+    )
+
 
 def assert_ok_envelope(
     result: dict[str, Any],

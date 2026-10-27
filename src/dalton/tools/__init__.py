@@ -19,13 +19,19 @@ def build_dalton_tools(
     filesystem_backend: Any = None,
     *,
     enabled: bool | None = None,
+    user_tier: str | None = None,
 ) -> list[BaseTool]:
     """Return role-appropriate Dalton tools to bind onto the main agent (`DALTON-HOOK(dalton-tools)`).
 
     - `chief_of_staff` (Home / Research Director):
-      `dalton_coverage_board`, `dalton_record_plan`, `dalton_agenda_note`, `dalton_watch_event`, `dalton_resolve_signals`, `dalton_schedule_automation`, `dalton_coverage_tracking`, `dalton_system_jobs`, `dalton_coverage`, `conversation_search`, `check_language`, `ingest_company_wiki`, `dalton_check_done` (weekly-coverage-review, dalton-earnings-calendar only), `feishu_read`, `feishu_list_wiki`, `feishu_create_doc`, `feishu_append`
+      `dalton_coverage_board`, `dalton_record_plan`, `dalton_agenda_note`, `dalton_watch_event`, `dalton_resolve_signals`, `dalton_schedule_automation`, `dalton_coverage_tracking`, `dalton_system_jobs`, `dalton_coverage`, `conversation_search` (internal/admin only), `check_language`, `ingest_company_wiki`, `dalton_check_done` (weekly-coverage-review, dalton-earnings-calendar only), `feishu_read`, `feishu_list_wiki`, `feishu_create_doc`, `feishu_append`
     - `analyst` (Company workspace):
-      `knowledge_update`, `knowledge_append_verdict`, `dalton_check_done`, `check_draft`, `check_language`, `publish_report`, `ingest_company_wiki`, `dalton_schedule_automation`, `dalton_coverage_tracking`, `dalton_system_jobs`, `conversation_search`, `feishu_read`, `feishu_list_wiki`, `feishu_create_doc`, `feishu_append`
+      `knowledge_update`, `knowledge_append_verdict`, `dalton_check_done`, `check_draft`, `check_language`, `publish_report`, `ingest_company_wiki`, `dalton_schedule_automation`, `dalton_coverage_tracking`, `dalton_system_jobs`, `conversation_search` (internal/admin only), `feishu_read`, `feishu_list_wiki`, `feishu_create_doc`, `feishu_append`
+
+    ``user_tier`` ("admin" | "internal" | "external") withholds
+    ``conversation_search`` from external members, who would only reach its
+    per-call refusal. None leaves the tool mounted (the refusal stays the
+    second line of defense for builds without a resolved tier).
     """
     settings = get_dalton_settings()
     is_enabled = enabled if enabled is not None else (
@@ -39,6 +45,12 @@ def build_dalton_tools(
         return []
 
     tools: list[BaseTool] = []
+
+    # The team conversation archive is internal-only; an external member's
+    # every call would be refused at run time, so the tool is not mounted for
+    # them in the first place ("external" is also what a failed tier lookup
+    # resolves to — fail closed on mounting).
+    tier_mounts_conversation_search = user_tier is None or user_tier != "external"
 
     if settings.enabled:
         try:
@@ -61,7 +73,7 @@ def build_dalton_tools(
         if settings.autonomy.enabled:
             tools.extend(build_director_tools(role=role, filesystem_backend=filesystem_backend))
             tools.extend(build_coverage_tools(role=role))
-        if settings.conversations.enabled:
+        if settings.conversations.enabled and tier_mounts_conversation_search:
             try:
                 from src.dalton.tools.conversation_tools import create_conversation_tools
 
@@ -132,7 +144,7 @@ def build_dalton_tools(
     if settings.autonomy.enabled:
         tools.extend(build_director_tools(role=role, filesystem_backend=filesystem_backend))
 
-    if settings.conversations.enabled:
+    if settings.conversations.enabled and tier_mounts_conversation_search:
         try:
             from src.dalton.tools.conversation_tools import create_conversation_tools
 

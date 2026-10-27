@@ -260,10 +260,16 @@ def create_knowledge_tools(filesystem_backend: Any = None) -> list[BaseTool]:
     ) -> str:
         """Record an event verdict (NO_CHANGE/THESIS_STRENGTHENED/THESIS_WEAKENED/THESIS_BROKEN/NEW_THESIS) and its next validation; every research session that looked at new evidence ends with one.
 
+        verdict 的字段（additionalProperties=false，多余字段整条被拒；at/id 由服务端生成，不要传）：
+        - 必填：verdict（上述五词之一）；event（一句话事件，含期间与数字）；rationale（定量依据）；progress（"none"|"some"|"resolved"）；
+          trigger：{"kind": filing|earnings|price_move|consensus_change|indicator|due_validation|pm_question|internal_material|agenda|director|manual, "ref": 唤醒信号 id / accession / V- 编号, "automation_execution_id": 仅自动任务}；
+          next_validation：{"what": 下一项看什么, "due": "YYYY-MM-DD"（不能是 null）, "validation_id": 可选 V-xxx}——不是 text/when。
+        - 可选：affected（{pillars:[], debates:[], drivers:[]}）；evidence_ids（["E-…"]——不是 evidence/evidence_refs/basis/summary）；question_ids（["Q-…"]）；house_view_changed。
+        最小示例：{"verdict":"NO_CHANGE","event":"…","rationale":"…","progress":"none","trigger":{"kind":"internal_material","ref":"<信号id>"},"next_validation":{"what":"…","due":"2026-11-05"}}；被拒时返回只列未知字段与缺少的字段，照改后原样重试。
+
         Writing requires the caller to own the workspace or hold rw on it; external members are fully isolated — colleagues' workspaces are not visible to them at all (a 404 is an identity limit — report it, don't retry).
         验证完 agenda 里的某一项，要在 agenda_ops 里显式关掉它，或者把 trigger.ref 设成该 validation id；next_validation 写的是下一项要看什么，不会关闭任何项。
-        On validation failure, the returned message includes the expected schema structure (失败时返回的信息里带有期望结构，照着补齐再提交).
-        Returns: the verdict id and the agenda version it updated.
+        Returns: the verdict id and the agenda version it updated; agenda 更新失败时返回 verdict_saved/agenda_saved 与补救调用。
         """
         user_id, cfg_workspace_id, thread_id, run_id = _extract_run_identity(config)
         target_ws_id = (str(workspace_id).strip() if workspace_id else "") or (
@@ -305,6 +311,37 @@ def create_knowledge_tools(filesystem_backend: Any = None) -> list[BaseTool]:
                 verdict_id=str(res.get("verdict_id") or "") or None,
                 execution_id=auto_exec_id,
             )
+            if res.get("agenda_update") == "failed":
+                # Partial success the model must not read as done: the verdict
+                # row exists, the agenda does not. The recovery is a READ of
+                # the agenda's current version, then one versioned update — an
+                # unversioned retry on an existing agenda only hits
+                # version_conflict and fails again.
+                verdict_id = res.get("verdict_id")
+                ws_arg = f'workspace_id="{target_ws_id}", ' if workspace_id else ""
+                recovery = (
+                    "verdict 已入库、agenda 未更新，按以下两步补救"
+                    "（不要重复调用 knowledge_append_verdict，会写第二条 verdict）：\n"
+                    f'1. 读当前版本：knowledge_read({ws_arg}doc="agenda")，'
+                    "取返回 JSON 里的 latest_version_no（最新版本，含校验失败的行——"
+                    "不要用 version，那是最新有效版本，用它必然 version_conflict）；\n"
+                    f'2. 带 base_version 重试：knowledge_update({ws_arg}doc="agenda", '
+                    "ops=[…按 detail 里的期望结构…], "
+                    "base_version=<第 1 步读到的 latest_version_no>, "
+                    f'reason="补写 verdict {verdict_id} 的 agenda 更新")。'
+                    "\n返回的 latest_version_no 为 null（库里没有任何 agenda 行）时："
+                    'ops 用 [{"op":"create","value":{…}}]，base_version=null。'
+                )
+                return json.dumps(
+                    {
+                        "verdict_saved": True,
+                        "agenda_saved": False,
+                        "verdict_id": verdict_id,
+                        "recovery": recovery,
+                        "detail": str(res["message"]),
+                    },
+                    ensure_ascii=False,
+                )
         return str(res["message"])
 
     @tool("knowledge_read")
@@ -323,7 +360,7 @@ def create_knowledge_tools(filesystem_backend: Any = None) -> list[BaseTool]:
             limit: Maximum number of verdicts to return when doc is "verdicts" or "all" (default 20).
 
         Returns:
-            JSON string with the requested knowledge document(s) and/or verdicts.
+            JSON string with the requested knowledge document(s) and/or verdicts. 单文档时带 latest_version_no（最新版本号，含校验失败的行；无任何行为 null）——做 knowledge_update 时用它作 base_version（version 是最新有效版本号，最新行无效时用它会 version_conflict）。
         """
         user_id, cfg_workspace_id, _, _ = _extract_run_identity(config)
         target_ws_id = (str(workspace_id).strip() if workspace_id else "") or (
@@ -348,12 +385,21 @@ def create_knowledge_tools(filesystem_backend: Any = None) -> list[BaseTool]:
 
         if cleaned_doc in DOC_KEYS:
             row = await db_knowledge.latest_valid_version(target_ws_id, cleaned_doc)
+            # latest_version_no is the LATEST row's number, valid or not — the
+            # exact value apply_update validates base_version against. It is
+            # the number to retry knowledge_update with when the newest write
+            # was rejected (invalid), where `version` (latest VALID) would
+            # collide.
+            latest_row = await db_knowledge.latest_version(target_ws_id, cleaned_doc)
             return json.dumps(
                 {
                     "ok": True,
                     "workspace_id": target_ws_id,
                     "doc": cleaned_doc,
                     "version": row.get("version_no") if row else None,
+                    "latest_version_no": (
+                        latest_row.get("version_no") if latest_row else None
+                    ),
                     "content": row.get("content") if row else None,
                 },
                 ensure_ascii=False,

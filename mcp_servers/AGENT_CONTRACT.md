@@ -56,8 +56,9 @@ Rules:
 {"error": "<machine_code>", "detail": "<human-readable message>", ...context keys}
 ```
 
+<!-- DALTON-HOOK(market-data-fallback): 402 maps to plan_not_covered -->
 `error` is one of: `invalid_argument | unsupported_interval | not_found |
-auth_failed | rate_limited | upstream_error | client_unavailable`. Raw exception
+auth_failed | plan_not_covered | rate_limited | upstream_error | client_unavailable`. Raw exception
 text never lands in `error`; a sanitized summary may go in `detail`. Context keys
 (`symbol`, `supported`, `retry_after_seconds`, ...) are welcome.
 

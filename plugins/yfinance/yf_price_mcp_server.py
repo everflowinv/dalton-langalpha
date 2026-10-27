@@ -204,7 +204,7 @@ _OUT_GET_STOCK_HISTORY = output_model(
     envelope_schema(
         RECORDS,
         frame=("symbol", "interval", "currency", "timezone"),
-        echo={"period": STR},
+        echo={"period": STR, "price_treatment": STR},
     ),
 )
 
@@ -215,23 +215,25 @@ def get_stock_history(
     period: str = "1y",
     interval: str = "1d",
     extended_hours: bool = False,  # DALTON-HOOK(stock-move-upgrade)
+    adjusted: bool = True,
 ) -> _OUT_GET_STOCK_HISTORY:
-    """Historical OHLCV price bars for one stock — charts, returns, technicals.
+    """Historical OHLCV bars for one stock — charts, returns, technicals.
+    Adjusted prices cannot be divided by historical EPS for historical P/E;
+    use adjusted=False for historical P/E.
 
     Args:
-        ticker: US "AAPL", HK "0700.HK", CN "600519.SH", futures "NQ=F", index "^TNX".
-        period: 1d,5d,1mo,3mo,6mo,1y,2y,5y,10y,ytd,max. Intraday lookback is
-            capped by yfinance.
+        ticker: US "AAPL", HK "0700.HK", CN "600519.SH", "NQ=F", "^TNX".
+        period: 1d,5d,1mo,3mo,6mo,1y,2y,5y,10y,ytd,max.
         interval: 1min|5min|15min|30min|1hour|1day|1week|1month (2m|90m|5d|3mo
             accepted; 4hour unsupported).
-        extended_hours: Include pre/post-market intraday bars (default False).
+        extended_hours: Pre/post-market intraday bars (default False).
+        adjusted: Split/dividend-adjusted (default True); False for raw.
 
     Returns:
-        dict: {symbol, interval, period, currency, timezone, count, data,
-        source}. data: list of {date, open, high, low, close, volume,
-        dividends?, splits?} ascending (oldest first); exchange-local
-        "YYYY-MM-DD[ HH:MM:SS]", prices in `currency` major units (GBp/pence
-        auto-converted). On error: {error, detail} —
+        dict: {symbol, interval, period, price_treatment, currency, timezone,
+        count, data, source}. data: [{date, open, high, low, close, volume,
+        dividends?, splits?}] ascending, exchange-local, major units (GBp
+        converted). On error: {error, detail} —
         not_found|unsupported_interval|upstream_error.
     """
     symbol, yf_symbol, currency = boundary(ticker)
@@ -239,9 +241,14 @@ def get_stock_history(
     if err is not None:
         err["symbol"] = symbol
         return err
+    price_treatment = "split_dividend_adjusted" if adjusted else "raw"
     try:
         stock = yf.Ticker(yf_symbol)
-        hist_kwargs: dict[str, Any] = {"period": period, "interval": yf_interval}
+        hist_kwargs: dict[str, Any] = {
+            "period": period,
+            "interval": yf_interval,
+            "auto_adjust": adjusted,
+        }
         if extended_hours and yf_interval in _YF_INTRADAY_INTERVALS:  # DALTON-HOOK(stock-move-upgrade)
             hist_kwargs["prepost"] = True
         df = stock.history(**hist_kwargs)
@@ -262,6 +269,7 @@ def get_stock_history(
             currency=resp_currency,
             timezone=_index_tz(df.index),
             period=period,
+            price_treatment=price_treatment,
         )
     except Exception as e:  # noqa: BLE001
         return make_error(
@@ -274,7 +282,7 @@ _OUT_GET_MULTIPLE_STOCKS_HISTORY = output_model(
     envelope_schema(
         OBJECTS_BY_KEY,
         frame=("interval",),
-        echo={"period": STR, "errors": ERRORS},
+        echo={"period": STR, "price_treatment": STR, "errors": ERRORS},
     ),
 )
 
@@ -285,28 +293,32 @@ def get_multiple_stocks_history(
     period: str = "1y",
     interval: str = "1d",
     extended_hours: bool = False,  # DALTON-HOOK(stock-move-upgrade)
+    adjusted: bool = True,
 ) -> _OUT_GET_MULTIPLE_STOCKS_HISTORY:
     """Historical OHLCV bars for several stocks — compare price series.
+    Adjusted prices cannot be divided by historical EPS for historical P/E;
+    use adjusted=False for historical P/E.
 
     Args:
         tickers: Symbols, e.g. ["AAPL", "MSFT", "0700.HK", "NQ=F", "^TNX"].
         period: 1d,5d,1mo,3mo,6mo,1y,2y,5y,10y,ytd,max.
         interval: 1min|5min|15min|30min|1hour|1day|1week|1month (2m|90m|5d|3mo
             accepted; 4hour unsupported).
-        extended_hours: Include pre/post-market intraday bars (default False).
+        extended_hours: Pre/post-market intraday bars.
+        adjusted: Split/dividend-adjusted (True, default); False for raw.
 
     Returns:
-        dict: {interval, count, data, source, period, errors?}. data is keyed by
-        canonical symbol → {count, currency?, timezone?, data}; each inner data
-        is a list of {date, open, high, low, close, volume, dividends?, splits?}
-        ascending (oldest first), exchange-local "YYYY-MM-DD[ HH:MM:SS]", prices
-        in major units (GBp auto-converted). Failed symbols in errors as {error,
-        detail, symbol}; bad interval returns {error: unsupported_interval, detail, supported}.
+        dict: {interval, count, data, source, period, price_treatment, errors?}.
+        data: symbol → {count, price_treatment, currency?, timezone?, data} of
+        [{date, open, high, low, close, volume, dividends?, splits?}] ascending,
+        exchange-local, major units. Errors: {error, detail, symbol} or
+        unsupported_interval.
     """
     yf_interval, echo_interval, err = _resolve_interval(interval)
     if err is not None:
         return err
 
+    price_treatment = "split_dividend_adjusted" if adjusted else "raw"
     per_ticker: dict[str, Any] = {}
     errors: list[dict] = []
     total = 0
@@ -315,13 +327,20 @@ def get_multiple_stocks_history(
         symbol, yf_symbol, currency = boundary(t)
         try:
             stock = yf.Ticker(yf_symbol)
-            hist_kwargs: dict[str, Any] = {"period": period, "interval": yf_interval}
+            hist_kwargs: dict[str, Any] = {
+                "period": period,
+                "interval": yf_interval,
+                "auto_adjust": adjusted,
+            }
             if extended_hours and yf_interval in _YF_INTRADAY_INTERVALS:  # DALTON-HOOK(stock-move-upgrade)
                 hist_kwargs["prepost"] = True
             df = stock.history(**hist_kwargs)
             resp_currency, divisor = _price_scale(stock, currency)
             history = _serialize_history(df, divisor)
-            entry: dict[str, Any] = {"count": len(history)}
+            entry: dict[str, Any] = {
+                "count": len(history),
+                "price_treatment": price_treatment,
+            }
             if resp_currency:
                 entry["currency"] = resp_currency
             tz = _index_tz(df.index)
@@ -345,6 +364,7 @@ def get_multiple_stocks_history(
         interval=echo_interval,
         count=total,
         period=period,
+        price_treatment=price_treatment,  # DALTON-HOOK(stock-move-upgrade)
     )
     if errors:
         result["errors"] = errors

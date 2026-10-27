@@ -33,7 +33,7 @@ except ModuleNotFoundError:  # imported as a package module (tests)
 
 import asyncio
 import logging
-from datetime import datetime, timedelta, timezone as _tz
+from datetime import date, datetime, timedelta, timezone as _tz
 from typing import Any, Literal, Optional
 
 import httpx
@@ -46,7 +46,13 @@ from data_client.ginlix_data import (
     get_ginlix_mcp_client,
 )
 from data_client.market_data_provider import symbol_market
-from data_client.normalize import minor_unit_places, normalize_bars, populated, scale_price
+from data_client.normalize import (  # DALTON-HOOK(market-data-fallback)
+    minor_unit_places,
+    normalize_bars,
+    populated,
+    scale_price,
+    symbol_timezone,
+)
 from data_client.ginlix_data.cn_source import GinlixDataCnSource
 from data_client.ginlix_data.directory import NameDirectory
 from market_protocol import (  # DALTON-HOOK(stock-move-upgrade)
@@ -68,6 +74,7 @@ try:
         make_response,
         normalize_interval,
     )
+    from _yf_common import boundary as _yf_boundary  # DALTON-HOOK(market-data-fallback)
 except ModuleNotFoundError:  # imported as a package module (tests)
     from mcp_servers._envelope import (
         error_from_exception,
@@ -76,6 +83,7 @@ except ModuleNotFoundError:  # imported as a package module (tests)
         make_response,
         normalize_interval,
     )
+    from mcp_servers._yf_common import boundary as _yf_boundary  # DALTON-HOOK(market-data-fallback)
 
 from mcp_servers._dates import (
     NEW_YORK,
@@ -104,7 +112,10 @@ logger = logging.getLogger(__name__)
 _ginlix = get_ginlix_mcp_client()
 
 # Intervals served by each family. Stock/index route through the ginlix-data
-# (CN daily, US) + FMP (global) fetch clients, which cover intraday + daily only.
+# (CN daily, US) + yfinance + FMP (global) fetch clients, which cover intraday
+# + daily only.
+# DALTON-HOOK(market-data-fallback): yfinance sits ahead of FMP (Dalton's
+# market_data.providers order; see the _yf import block).
 _STOCK_INTRADAY = {"1min", "5min", "15min", "30min", "1hour", "4hour"}
 _STOCK_INTERVALS = _STOCK_INTRADAY | {"1day"}
 # FMP commodity/crypto/forex intraday coverage is narrower.
@@ -198,6 +209,340 @@ def _http_miss(exc: httpx.HTTPError) -> str:
     return type(exc).__name__
 
 
+# DALTON-HOOK(market-data-fallback): Dalton's provider order (config.dalton.yaml
+# market_data.providers) answers free yfinance ahead of FMP wherever both can
+# serve, so FMP's ~250 calls/day free quota survives for what only FMP has. The
+# sandbox ships MCP server processes neither config.yaml nor the config loader
+# (only data_client + market_protocol, see _SANDBOX_INTERNAL_PACKAGES), and
+# mcp.json passes no APP_ENV, so the order cannot be read from the deployed
+# overlay — it is pinned here to match it.
+try:
+    import yfinance as _yf
+except ImportError:  # an image without yfinance keeps the FMP chain
+    _yf = None  # type: ignore[assignment]
+
+_YF_INTERVALS: dict[str, str] = {
+    "1min": "1m",
+    "5min": "5m",
+    "15min": "15m",
+    "30min": "30m",
+    "1hour": "1h",
+    "1day": "1d",
+}
+#: Calendar days of history an undated request gets, keyed by yfinance
+#: interval — inside Yahoo's caps (1m: 8d, sub-hour: 60d, 1h: 730d) and as
+#: deep as the daily default the rest of the chain serves.
+_YF_LOOKBACK_DAYS: dict[str, int] = {"1m": 6, "5m": 57, "15m": 57, "30m": 57, "1h": 727, "1d": 730}
+
+
+def _yf_exclusive_end(end: str) -> str:
+    """Advance an inclusive end date to yfinance's exclusive ``end`` bound."""
+    try:
+        return ((datetime.strptime(end.strip()[:10], "%Y-%m-%d") + timedelta(days=1)).date()).isoformat()
+    except ValueError:
+        return end
+
+
+# DALTON-HOOK(market-data-fallback): interpret intraday start/end strings with
+# HH:MM[:SS] in the instrument's exchange timezone and filter returned bars to
+# the requested window.
+def _yf_parse_exchange_bound_ms(
+    bound: Optional[str], display: str, *, is_end: bool
+) -> Optional[int]:
+    if not bound:
+        return None
+    s = bound.strip().replace("T", " ")
+    if not s:
+        return None
+    tz = symbol_timezone(display)
+    dt: Optional[datetime] = None
+    if len(s) == 10:
+        try:
+            dt = datetime.strptime(s, "%Y-%m-%d")
+            if is_end:
+                dt = dt.replace(hour=23, minute=59, second=59, microsecond=999999)
+        except ValueError:
+            return None
+    else:
+        for fmt, pad_end_seconds in (("%Y-%m-%d %H:%M:%S", False), ("%Y-%m-%d %H:%M", True)):
+            try:
+                dt = datetime.strptime(s, fmt)
+                if is_end and pad_end_seconds:
+                    dt = dt.replace(second=59, microsecond=999999)
+                break
+            except ValueError:
+                continue
+    if dt is None:
+        return None
+    return int(dt.replace(tzinfo=tz).timestamp() * 1000)
+
+
+def _filter_display_rows_to_window(
+    rows: list[dict],
+    start_date: Optional[str],
+    end_date: Optional[str],
+    *,
+    intraday: bool,
+) -> list[dict]:
+    if not rows or (not start_date and not end_date):
+        return rows
+    start_bound: Optional[str] = None
+    end_bound: Optional[str] = None
+    if start_date:
+        s = start_date.strip().replace("T", " ")
+        if intraday:
+            start_bound = f"{s} 00:00:00" if len(s) == 10 else (f"{s}:00" if len(s) == 16 else s[:19])
+        else:
+            start_bound = s[:10]
+    if end_date:
+        e = end_date.strip().replace("T", " ")
+        if intraday:
+            end_bound = f"{e} 23:59:59" if len(e) == 10 else (f"{e}:59" if len(e) == 16 else e[:19])
+        else:
+            end_bound = e[:10]
+    return [
+        r
+        for r in rows
+        if (not start_bound or r["date"] >= start_bound)
+        and (not end_bound or r["date"] <= end_bound)
+    ]
+
+
+def _yf_expected_session_day(display: str, start_day: date) -> Optional[date]:
+    """The session an intraday start belongs to: its own day when that trades,
+    else the next session (a weekend/holiday start gets the next open)."""
+    try:
+        from market_protocol.calendars import get_calendar
+
+        cal = get_calendar(to_canonical(display).calendar_id)
+    except Exception:  # noqa: BLE001 — unknown venue, caller falls back to a grace span
+        return None
+    day = start_day
+    for _ in range(15):  # enough to bridge the longest venue holiday closure
+        if cal.is_trading_day(day):
+            return day
+        day = day + timedelta(days=1)
+    return None
+
+
+# DALTON-HOOK(market-data-fallback): the first bar need not carry the requested
+# start itself — a weekend start gets Monday's daily bar, a 13:01 intraday
+# start the 13:05 bar (or the next session's open when 13:01 sits in a break).
+# Only a real gap counts as uncovered (a capped 1m history serving the last
+# 7 days of a two-month request); the old timestamp comparison read every
+# off-hours start as a miss and burned FMP quota re-asking a served window.
+def _yf_start_deadline_ms(
+    display: str, start_date: str, interval: str, *, extended_hours: bool = False
+) -> Optional[int]:
+    """The latest first bar that still covers an intraday *start_date*.
+
+    The start itself anchors it when it sits inside trading hours; otherwise
+    the next session open does — the reopen when the start sits inside a
+    venue's midday break, that session's open when it is earlier, the next
+    session's open when it is past the close or on a non-trading day. One bar
+    interval of slack rides on top (the 13:05 bar covers a 13:01 5min start).
+    With *extended_hours* the session widens to the venue's pre-market open
+    and after-hours close where it has them, so a start inside those hours
+    anchors to itself — a 17:00 start on a 16:00-close venue is covered by a
+    17:05 after-hours bar, not handed to the next day's open.
+    """
+    start_ms = _yf_parse_exchange_bound_ms(start_date, display, is_end=False)
+    if start_ms is None:
+        return None
+    try:
+        from market_protocol.calendars import get_calendar, session_bounds
+
+        ref = to_canonical(display)
+        cal = get_calendar(ref.calendar_id)
+    except Exception:  # noqa: BLE001 — no calendar: caller keeps day granularity
+        return None
+    # Only XcalsCalendar carries extended bounds; hand-rolled regimes (and a
+    # False flag) keep the regular session, which for them is the whole day.
+    extended_bounds = (
+        getattr(cal, "extended_bounds_ms", None) if extended_hours else None
+    )
+    day = datetime.fromtimestamp(start_ms / 1000, cal.tz).date()
+    for _ in range(15):  # enough to bridge the longest venue holiday closure
+        if cal.is_trading_day(day):
+            bounds = session_bounds(ref.calendar_id, day.isoformat())
+            if bounds and bounds[0] is not None:
+                open_ms, close_ms, brk_start, brk_end = bounds
+                if extended_bounds is not None:
+                    # DALTON-HOOK(market-data-fallback): the fetch asked for
+                    # pre/post bars, so coverage runs on the extended data day;
+                    # judged against the regular close, a start in after-hours
+                    # would look answered by the next session's open even when
+                    # the symbol printed nothing until then. None means this
+                    # venue has no extended hours: outside the regular session
+                    # it is simply closed, regular bounds decide.
+                    ext = extended_bounds(day)
+                    if ext is not None:
+                        open_ms, close_ms = ext
+                if start_ms <= open_ms:
+                    anchor = open_ms
+                elif brk_start is not None and brk_end is not None and brk_start <= start_ms < brk_end:
+                    anchor = brk_end
+                elif start_ms < close_ms:
+                    anchor = start_ms
+                else:
+                    anchor = None  # past this session's close: the next session's open
+                if anchor is not None:
+                    return anchor + _INTRADAY_SPAN_SECONDS.get(interval, 0) * 1000
+        day = day + timedelta(days=1)
+    return None
+
+
+def _yf_covers_start(
+    rows: list[dict],
+    start_date: Optional[str],
+    *,
+    intraday: bool,
+    display: str = "",
+    interval: str = "",
+    extended_hours: bool = False,
+) -> bool:
+    if not start_date or not rows:
+        return True
+    s = start_date.strip().replace("T", " ")
+    first_date = str(rows[0].get("date") or "").strip()
+    if not first_date:
+        return True
+    try:
+        start_day = date.fromisoformat(s[:10])
+        first_day = date.fromisoformat(first_date[:10])
+    except ValueError:
+        return True
+    if intraday:
+        # DALTON-HOOK(market-data-fallback): within the start's own session
+        # the bar clock matters too: a first bar at 14:00 does not cover a
+        # 09:30 request even though the dates match. The deadline — the start
+        # anchored to the next open when it sits off-hours (past the close,
+        # a weekend, a holiday), plus one interval — subsumes the day check,
+        # so it decides first; the day-level check alone cannot see that an
+        # off-hours start belongs to the *next* session's first bar. Only
+        # when the deadline cannot be computed (no venue calendar,
+        # unparseable timestamps) does the day-granular verdict stand.
+        deadline_ms = _yf_start_deadline_ms(display, s, interval, extended_hours=extended_hours)
+        first_ms = _yf_parse_exchange_bound_ms(first_date, display, is_end=False)
+        if deadline_ms is not None and first_ms is not None:
+            return first_ms <= deadline_ms
+        expected = _yf_expected_session_day(display, start_day)
+        if expected is not None and first_day > expected:
+            return False
+    return (first_day - start_day).days <= 4
+
+
+_INTRADAY_SPAN_SECONDS: dict[str, int] = {
+    "1min": 60, "5min": 300, "15min": 900, "30min": 1800, "1hour": 3600,
+}
+
+
+def _drop_midday_break_bars(
+    rows: list[dict], display: str, canonical: str
+) -> list[dict]:
+    """Mirror the main chain's midday-break placement (yfinance
+    ``data_source._place_in_sessions``): a bar wholly inside a venue's break is
+    Yahoo's zero-volume padding and is dropped; one that starts inside the
+    break and ends past the reopen carries the reopen's trades and is
+    re-anchored there. Venues without a break have no midday window and keep
+    every bar. Built on ``market_protocol`` alone (the sandbox ships no ``src.``
+    packages), so both legs of the chain drop the same bars.
+    """
+    try:
+        from market_protocol.calendars import get_calendar, session_bounds
+
+        ref = to_canonical(display)
+        cal = get_calendar(ref.calendar_id)
+    except Exception:  # noqa: BLE001 — no calendar, no break to filter
+        return rows
+    span_ms = _INTRADAY_SPAN_SECONDS.get(canonical, 0) * 1000
+    breaks: dict[date, Optional[tuple[int, int]]] = {}
+    placed: list[dict] = []
+    for bar in rows:
+        day = datetime.fromtimestamp(bar["time"] / 1000, cal.tz).date()
+        if day not in breaks:
+            bounds = session_bounds(ref.calendar_id, day.isoformat())
+            breaks[day] = (bounds[2], bounds[3]) if bounds and bounds[2] is not None else None
+        brk = breaks[day]
+        if brk is None or not brk[0] <= bar["time"] < brk[1]:
+            placed.append(bar)
+        elif bar["time"] + span_ms > brk[1]:
+            placed.append({**bar, "time": brk[1]})
+    return placed
+
+
+def _yf_fetch_history(
+    display: str,
+    canonical: str,
+    start_date: Optional[str],
+    end_date: Optional[str],
+    *,
+    extended_hours: bool = False,
+) -> list[dict]:
+    """Synchronous yfinance history → epoch-ms OHLCV rows (`normalize_bars` shape).
+
+    Raises nothing the caller can't treat as a soft miss; an empty history
+    returns ``[]`` so the chain falls through to FMP.
+    """
+    yf_symbol = _yf_boundary(display)[1]
+    kwargs: dict[str, Any] = {
+        "interval": _YF_INTERVALS[canonical],
+        # Split-adjusted only, the whole chain's declared price treatment —
+        # conventions never blend across a provider failover.
+        "auto_adjust": False,
+    }
+    if extended_hours and canonical != "1day":
+        kwargs["prepost"] = True
+    if start_date:
+        kwargs["start"] = start_date.strip()[:10]
+    if end_date:
+        kwargs["end"] = _yf_exclusive_end(end_date)
+    if not start_date and not end_date:
+        lookback = timedelta(days=_YF_LOOKBACK_DAYS.get(_YF_INTERVALS[canonical], 730))
+        kwargs["start"] = (datetime.now(_tz.utc) - lookback).strftime("%Y-%m-%d")
+
+    df = _yf.Ticker(yf_symbol).history(**kwargs)
+    if df is None or df.empty:
+        return []
+    # A NaN-priced row (halted session, gap padding) must not propagate NaN
+    # into the response — drop it here.
+    df = df.copy().dropna(subset=["Open", "High", "Low", "Close"])
+    rows: list[dict] = []
+    for idx, row in df.iterrows():
+        try:
+            ts = int(idx.timestamp() * 1000)
+        except (AttributeError, OSError, OverflowError, ValueError):
+            continue
+        volume = row["Volume"]
+        rows.append(
+            {
+                "time": ts,
+                "open": float(row["Open"]),
+                "high": float(row["High"]),
+                "low": float(row["Low"]),
+                "close": float(row["Close"]),
+                # NaN != NaN: index/sparse rows carry NaN volume.
+                "volume": int(volume) if volume == volume else 0,
+            }
+        )
+    # DALTON-HOOK(market-data-fallback): drop the break-time zero-volume bars
+    # Yahoo pads CN/HK intraday with, the same placement rule the main
+    # yfinance chain applies, so both legs return the same sessions — and do
+    # it BEFORE the window filter below: a HK 12:30 hourly bar re-anchors to
+    # the 13:00 reopen, so filtering first would drop it for a request that
+    # starts at 13:00 and the session would begin at 14:00 instead.
+    if canonical != "1day":
+        rows = _drop_midday_break_bars(rows, display, canonical)
+    start_ms = _yf_parse_exchange_bound_ms(start_date, display, is_end=False)
+    end_ms = _yf_parse_exchange_bound_ms(end_date, display, is_end=True)
+    return [
+        r
+        for r in rows
+        if (start_ms is None or r["time"] >= start_ms)
+        and (end_ms is None or r["time"] <= end_ms)
+    ]
+
+
 async def _fetch_stock_series(
     symbol: str,
     interval: str,
@@ -205,7 +550,10 @@ async def _fetch_stock_series(
     end_date: Optional[str],
     extended_hours: bool = False,  # DALTON-HOOK(stock-move-upgrade)
 ) -> tuple[Optional[dict], Optional[dict]]:
-    """Fetch stock OHLCV: ginlix-data (CN daily, then US) → FMP fallback (global).
+    """Fetch stock OHLCV: ginlix-data (CN daily, then US) → yfinance → FMP fallback (global).
+
+    DALTON-HOOK(market-data-fallback): the yfinance-before-FMP order matches
+    Dalton's market_data.providers (see the _yf import block).
 
     Returns ``(make_response_kwargs, None)`` on success or ``(None, error)``.
     The success kwargs carry canonical ``symbol``/``interval``, ``currency``,
@@ -331,17 +679,84 @@ async def _fetch_stock_bars(
         # stands unless FMP returns rows.
         miss = tier, None
 
-    # FMP fallback (all markets; converts GBX/pence to pounds).
+    # DALTON-HOOK(market-data-fallback): free yfinance answers ahead of FMP
+    # (Dalton's market_data.providers order — see the _yf import block). Any
+    # miss — no library, unsupported interval, empty history, an error — falls
+    # through to FMP unchanged; partial coverage of start_date also tries FMP
+    # first and falls back to the partial yfinance bars with a coverage note.
+    places = minor_unit_places(legacy)
+    partial_yf: Optional[dict] = None
+    if _yf is not None and canonical in _YF_INTERVALS:
+        try:
+            yf_rows = await asyncio.to_thread(
+                _yf_fetch_history,
+                display,
+                canonical,
+                start_date,
+                end_date,
+                extended_hours=extended_hours,
+            )
+        except Exception:  # noqa: BLE001 - soft miss, chain continues
+            logger.warning("yfinance history failed for %s", display, exc_info=True)
+            yf_rows = []
+        if yf_rows:
+            yf_data = _filter_display_rows_to_window(
+                _display_rows(yf_rows, legacy, intraday=intraday, places=places),
+                start_date,
+                end_date,
+                intraday=intraday,
+            )
+            if yf_data:
+                if _yf_covers_start(
+                    yf_data,
+                    start_date,
+                    intraday=intraday,
+                    display=display,
+                    interval=canonical,
+                    extended_hours=extended_hours,
+                ):
+                    return {
+                        "data": yf_data,
+                        "source": "yfinance",
+                        "symbol": display,
+                        "interval": canonical,
+                        "currency": currency,
+                        "timezone": timezone,
+                    }, None
+                actual_start = yf_data[0]["date"]
+                actual_end = yf_data[-1]["date"]
+                # DALTON-HOOK(market-data-fallback): the FMP clause is stamped
+                # when this partial answer is actually returned — a 200 with no
+                # rows for the window is "FMP has no data there", not an
+                # unavailable fallback.
+                partial_yf = {
+                    "data": yf_data,
+                    "source": "yfinance",
+                    "symbol": display,
+                    "interval": canonical,
+                    "currency": currency,
+                    "timezone": timezone,
+                    "note": (
+                        f"yfinance partial coverage: actual covered range is "
+                        f"{actual_start} to {actual_end} (requested start_date={start_date}"
+                    ),
+                }
+
+    def _partial_with_outcome(outcome: str) -> tuple[dict, None]:
+        return {**partial_yf, "note": f"{partial_yf['note']}; {outcome})"}, None
+
+    # DALTON-HOOK(market-data-fallback): FMP fallback (all markets; converts GBX/pence to pounds).
     try:
         client = await get_fmp_client()
     except Exception:  # noqa: BLE001
+        if partial_yf is not None:  # DALTON-HOOK(market-data-fallback)
+            return _partial_with_outcome("FMP fallback unavailable")
         return miss or (None, make_error(
             "client_unavailable",
             "FMP client unavailable (FMP_API_KEY not configured).",
             symbol=display,
         ))
 
-    places = minor_unit_places(legacy)
     window = None
     try:
         # A bound FMP would drop or a reversed window is refused here, as the
@@ -358,11 +773,15 @@ async def _fetch_stock_bars(
                 **({"extended": True} if extended_hours else {}),  # DALTON-HOOK(stock-move-upgrade)
             )
     except Exception as e:  # noqa: BLE001
+        if partial_yf is not None:  # DALTON-HOOK(market-data-fallback)
+            return _partial_with_outcome("FMP fallback unavailable")
         return miss or (None, error_from_exception(
             e, "FMP fetch failed.", symbol=display, interval=canonical
         ))
     if not isinstance(rows or [], list):
         # FMP answers some failures with a 200 and an error object, not rows.
+        if partial_yf is not None:  # DALTON-HOOK(market-data-fallback)
+            return _partial_with_outcome("FMP fallback unavailable")
         return miss or (None, make_error(
             "upstream_error", "FMP fetch failed.", symbol=display, interval=canonical
         ))
@@ -370,6 +789,10 @@ async def _fetch_stock_bars(
         rows = window.rows(rows or [])
 
     data = _display_rows(rows or [], legacy, intraday=intraday, places=places)
+    if not data and partial_yf is not None:  # DALTON-HOOK(market-data-fallback)
+        # A 200 with no rows for the window: FMP has no data there, the
+        # fallback itself is fine.
+        return _partial_with_outcome("FMP 无该区间数据")
     if miss and not data:
         return miss
     return {

@@ -118,6 +118,68 @@ def _extract_title(page) -> str:
         return ""
 
 
+# DALTON-HOOK(fetch-binary-route): file signatures for payloads that reach the
+# crawler through links without a file extension (search-result redirects).
+# The signature wins over a wrong/missing Content-Type; a body whose first
+# bytes match none of these is treated as text, so a plain HTML page never
+# pays for this check beyond a slice.
+_BINARY_SIGNATURES: tuple[tuple[bytes, str], ...] = (
+    (b"%PDF-", "application/pdf"),
+    (b"\xff\xd8\xff", "image/jpeg"),
+    (b"\x89PNG", "image/png"),
+    (b"GIF8", "image/gif"),
+)
+
+_BINARY_CONTENT_TYPES = (
+    "application/pdf",
+    "image/",
+)
+
+
+def _binary_payload(page) -> tuple[str, bytes] | None:
+    """The ``(mime, raw_body)`` of a non-HTML binary final response, else None.
+
+    Reads only what the fetch already downloaded — headers and the raw body off
+    the scrapling Response — so detecting a binary never costs an extra request.
+    A text/html Content-Type with no binary signature (the ordinary page) stays
+    on the normal path.
+    """
+    try:
+        body = page.body
+    except Exception:
+        return None
+    if not isinstance(body, bytes) or not body:
+        return None
+    head = body[:16]
+    for sig, mime in _BINARY_SIGNATURES:
+        if head.startswith(sig):
+            return mime, body
+    try:
+        content_type = str(page.headers.get("content-type") or "").lower()
+    except Exception:
+        content_type = ""
+    if content_type and any(t in content_type for t in _BINARY_CONTENT_TYPES):
+        if "html" not in content_type and "xml" not in content_type:
+            return content_type.split(";")[0].strip(), body
+    return None
+
+
+def _binary_output(url: str, page, mime: str, raw: bytes, status: int) -> CrawlOutput:
+    try:
+        final_url = str(page.url) or url
+    except Exception:
+        final_url = url
+    return CrawlOutput(
+        title="",
+        html="",
+        markdown="",
+        status=status,
+        binary_mime=mime,
+        content_bytes=raw,
+        final_url=final_url,
+    )
+
+
 class ScraplingCrawler:
     """Async crawler using Scrapling with tiered fetching and stage-level concurrency."""
 
@@ -152,6 +214,17 @@ class ScraplingCrawler:
         # --- Tier 1: Fast HTTP fetch (requires curl_cffi) ---
         try:
             page, html_body, status = await self._tier1_fetch(url)
+
+            # DALTON-HOOK(fetch-binary-route): sniff the payload BEFORE any
+            # escalation logic — a short or error-status binary body (a
+            # <200-byte PNG, a PDF behind a 4xx redirect) would otherwise be
+            # read as "blocked/empty page" and re-requested through two
+            # browsers before coming back as mojibake.
+            binary = _binary_payload(page)
+            if binary is not None:
+                mime, raw = binary
+                logger.debug(f"Tier 1 binary payload ({mime}) for {url}")
+                return _binary_output(url, page, mime, raw, status)
 
             # Hard blocks — host permanently rejects scrapers. Skip Tier 2/3
             # entirely. Each blocked-host call burns one curl_cffi call instead
@@ -219,6 +292,13 @@ class ScraplingCrawler:
                 )
             stealth_reason = _needs_stealth(html_body, status)
             if stealth_reason is None:
+                # DALTON-HOOK(fetch-binary-route): browser tiers can land on the
+                # binary too (a JS-gated redirect to a PDF).
+                binary = _binary_payload(page)
+                if binary is not None:
+                    mime, raw = binary
+                    logger.debug(f"Tier 2 binary payload ({mime}) for {url}")
+                    return _binary_output(url, page, mime, raw, status)
                 title = _extract_title(page)
                 markdown = await asyncio.to_thread(_html_to_markdown, html_body)
                 logger.debug(f"Tier 2 (dynamic) succeeded for {url}")
@@ -242,6 +322,12 @@ class ScraplingCrawler:
             )
             tier3_reason = _needs_stealth(html_body, status)
             if tier3_reason is None:
+                # DALTON-HOOK(fetch-binary-route): same guard on the stealth tier.
+                binary = _binary_payload(page)
+                if binary is not None:
+                    mime, raw = binary
+                    logger.debug(f"Tier 3 binary payload ({mime}) for {url}")
+                    return _binary_output(url, page, mime, raw, status)
                 title = _extract_title(page)
                 markdown = await asyncio.to_thread(_html_to_markdown, html_body)
                 logger.debug(f"Tier 3 (stealth) completed for {url} (status={status})")

@@ -13,6 +13,32 @@ import math  # DALTON-HOOK(yfinance-prev-close)
 import yfinance as yf
 from market_protocol import vendor_spelling
 
+_FX_CURRENCIES = frozenset({  # DALTON-HOOK(market-data-fallback)
+    "AED", "ARS", "AUD", "BRL", "CAD", "CHF", "CLP", "CNH", "CNY", "COP",
+    "CZK", "DKK", "EGP", "EUR", "GBP", "HKD", "HUF", "IDR", "ILS", "INR",
+    "JPY", "KRW", "KWD", "MXN", "MYR", "NOK", "NZD", "PEN", "PHP", "PKR",
+    "PLN", "QAR", "RON", "RUB", "SAR", "SEK", "SGD", "THB", "TRY", "TWD",
+    "UAH", "USD", "VND", "XAG", "XAU", "ZAR",
+})
+
+
+def _yahoo_fx_symbol(symbol: str) -> str | None:  # DALTON-HOOK(market-data-fallback)
+    """Normalize a bare (``USDCNY``) or canonical hyphenated (``USD-CNY``) FX pair to Yahoo's ``=X`` spelling."""
+    if "." in symbol or "=" in symbol or symbol.startswith("^"):
+        return None
+    if "-" in symbol:
+        parts = symbol.split("-")
+        if len(parts) != 2:
+            return None
+        base, quote = parts
+    elif len(symbol) == 6 and symbol.isascii() and symbol.isalpha():
+        base, quote = symbol[:3], symbol[3:]
+    else:
+        return None
+    if base != quote and base in _FX_CURRENCIES and quote in _FX_CURRENCIES:
+        return f"{base}{quote}=X"
+    return None
+
 
 class _CookieCacheWithA3:
     """yfinance's cookie cache, less an entry without the ``A3`` cookie.
@@ -70,6 +96,8 @@ def yahoo_symbol(symbol: str, *, is_index: bool = False) -> str:
     takes a caret.
     """
     s = vendor_spelling(symbol)
+    if not is_index and (fx := _yahoo_fx_symbol(s)) is not None:  # DALTON-HOOK(market-data-fallback)
+        return fx
     if not is_index or s.startswith("^") or "." in s or "=" in s:  # DALTON-HOOK(stock-move-upgrade)
         return s
     return f"^{s}"

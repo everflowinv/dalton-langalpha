@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import { useToast } from './use-toast';
 import type { FileAttachment, ReadyAttachment } from './chat-input.types';
-import { MAX_FILES, MAX_FILE_SIZE } from './chat-input.helpers';
+import { MAX_FILES, MAX_FILE_SIZE, MAX_TOTAL_ATTACHMENTS_BYTES } from './chat-input.helpers'; // DALTON-HOOK(attachment-native-cap)
 
 /** Attachment handling for the chat composer: validation (count and size),
  * dataUrl reading with previews, drag & drop, and paste capture. A `disabled`
@@ -9,16 +11,41 @@ import { MAX_FILES, MAX_FILE_SIZE } from './chat-input.helpers';
 export function useFileAttachments({ disabled = false }: { disabled?: boolean } = {}) {
   const [attachedFiles, setAttachedFiles] = useState<FileAttachment[]>([]);
   const [isDragging, setIsDragging] = useState(false);
+  const { t } = useTranslation();
+  const { toast } = useToast();
 
   const handleFiles = useCallback((newFilesList: FileList | File[]) => {
     if (disabled) return;
     const currentCount = attachedFiles.length;
+    const currentBytes = attachedFiles.reduce((sum, f) => sum + f.file.size, 0);
     const fileArray = Array.from(newFilesList);
 
-    const validFiles = [];
+    const validFiles: File[] = [];
+    let acceptedBytes = currentBytes;
     for (const file of fileArray) {
       if (currentCount + validFiles.length >= MAX_FILES) break;
-      if (file.size > MAX_FILE_SIZE) continue;
+      if (file.size > MAX_FILE_SIZE) {
+        // DALTON-HOOK(attachment-native-cap): say so instead of dropping it silently
+        toast({
+          title: t('chat.attachmentTooLarge', { name: file.name, max: MAX_FILE_SIZE / (1024 * 1024) }),
+          variant: 'destructive',
+        });
+        continue;
+      }
+      // DALTON-HOOK(attachment-native-cap): the message's whole payload is
+      // capped too (see MAX_TOTAL_ATTACHMENTS_BYTES in the helpers); a file
+      // that fits alone but breaks the budget is not added.
+      if (acceptedBytes + file.size > MAX_TOTAL_ATTACHMENTS_BYTES) {
+        toast({
+          title: t('chat.attachmentsTotalTooLarge', {
+            name: file.name,
+            max: MAX_TOTAL_ATTACHMENTS_BYTES / (1024 * 1024),
+          }),
+          variant: 'destructive',
+        });
+        continue;
+      }
+      acceptedBytes += file.size;
       validFiles.push(file);
     }
 
@@ -52,7 +79,7 @@ export function useFileAttachments({ disabled = false }: { disabled?: boolean } 
       };
       reader.readAsDataURL(f.file);
     });
-  }, [attachedFiles.length, disabled]);
+  }, [attachedFiles.length, disabled, t, toast]); // DALTON-HOOK(attachment-native-cap)
 
   // Files a send took that are coming back to the composer, already read.
   // The send revoked their previews, so each gets a new one.

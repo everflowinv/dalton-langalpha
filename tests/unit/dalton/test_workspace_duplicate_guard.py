@@ -33,6 +33,7 @@ except ImportError:
     from langchain_core.tools import InjectedToolCallId
 
 from src.server.database.sql_fences import FENCE_LIVE_WORKSPACE
+from src.server.database.computer import get_computer as _REAL_GET_COMPUTER
 from src.server.database.user import get_user_preferences as _REAL_PREFS
 from src.server.database.workspace import (
     get_live_workspace_names as _REAL_LIVE_NAMES,
@@ -278,16 +279,27 @@ async def test_a_standing_approval_creates_without_reading_names():
     )
     names = create_autospec(_REAL_LIVE_NAMES, side_effect=AssertionError("must not read"))
     mgr = _manager()
-    with _patched(confirm, names, mgr):
+    with _patched(confirm, names, mgr), patch(
+        "src.server.database.computer.get_computer",
+        create_autospec(_REAL_GET_COMPUTER, side_effect=RuntimeError("no db")),
+    ):
         result = await workspaces_create(USER, "META", None, "call-1", preapproved=True)
 
     mgr.create_workspace.assert_awaited_once()
+    # folder_ready/folder_hint/folder_note ride every create result now
+    # (workspace-folder-ready); against this test's machine double the folder
+    # path is never ready, which is the degraded shape.
     assert _payload(result) == {
         "success": True,
         "workspace_id": "ws-new",
         "workspace_name": "New",
         "preapproved": True,
         "workspace_description": "",
+        "folder_ready": False,
+        "folder_hint": (
+            "计算机启动后才会创建该文件夹；需要交接文件时，先放在 Home 下，并把路径写进派发说明"
+        ),
+        "folder_note": "复制或清理前先确认 folder_path 已存在且非空",
     }
 
 
