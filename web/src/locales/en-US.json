@@ -1624,7 +1624,8 @@
     "removeRefused": {
       "primary": "Your primary computer can't be removed.",
       "hasWorkspaces": "A workspace not listed here is on it now. Check the list and try again.",
-      "busy": "This computer is busy. Try again in a moment."
+      "busy": "This computer is busy. Try again in a moment.",
+      "published_reports": "A workspace on this computer has published reports and can only be archived, not deleted."
     },
     "manageComputer": "Manage {{name}}",
     "alwaysOn": "Always-on",

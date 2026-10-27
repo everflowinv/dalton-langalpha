@@ -185,6 +185,10 @@ async def consume_approval(
             return _serialize_row(await cur.fetchone())
 
 
+class WorkspaceUnavailableForPublishError(RuntimeError):
+    """Raised when attempting to publish a report into a deleted or archiving workspace."""
+
+
 async def insert_publication(
     *,
     publish_request_id: str,
@@ -218,6 +222,24 @@ async def insert_publication(
 
     async with get_db_connection() as conn, conn.transaction():
         async with conn.cursor(row_factory=dict_row) as cur:
+            # Lock the workspace row so publication insertion is mutually exclusive
+            # with db_delete_workspace (which takes FOR UPDATE on the same row).
+            await cur.execute(
+                """
+                SELECT workspace_id, status
+                FROM workspaces
+                WHERE workspace_id = %s
+                FOR SHARE
+                """,
+                (workspace_id,),
+            )
+            ws_row = await cur.fetchone()
+            ws_status = str((ws_row or {}).get("status") or "").strip().lower()
+            if ws_row is None or ws_status in ("deleted", "archiving", "archived"):
+                raise WorkspaceUnavailableForPublishError(
+                    f"工作区 {workspace_id} 已删除或正在归档（status={ws_status or 'missing'}），禁止发布研报。"
+                )
+
             # Check idempotency if already inserted for this publish_request_id
             await cur.execute(
                 f"""
@@ -422,15 +444,20 @@ async def expire_stale_publications(
             return len(rows)
 
 
-async def has_published_reports(workspace_id: str | UUID) -> bool:
+async def has_published_reports(
+    workspace_id: str | UUID, *, cur: Any = None
+) -> bool:
     """Return True if ``workspace_id`` has any immutable rows in ``dalton_publications`` (G3.3)."""
+    sql = "SELECT EXISTS(SELECT 1 FROM dalton_publications WHERE workspace_id = %s) AS has_pub"
+    params = (str(workspace_id),)
+    if cur is not None:
+        await cur.execute(sql, params)
+        row = await cur.fetchone()
+        return bool(row and row.get("has_pub"))
     async with get_db_connection() as conn:
-        async with conn.cursor(row_factory=dict_row) as cur:
-            await cur.execute(
-                "SELECT EXISTS(SELECT 1 FROM dalton_publications WHERE workspace_id = %s) AS has_pub",
-                (str(workspace_id),),
-            )
-            row = await cur.fetchone()
+        async with conn.cursor(row_factory=dict_row) as db_cur:
+            await db_cur.execute(sql, params)
+            row = await db_cur.fetchone()
             return bool(row and row.get("has_pub"))
 
 

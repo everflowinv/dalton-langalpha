@@ -107,9 +107,12 @@ async function secondRemove(user: User = userEvent.setup()) {
 }
 
 /** A 409 as the API client rejects it, with the route's coded detail. */
+// DALTON-HOOK(workspace-delete-guard): ApiError copies object detail.message
+// onto err.message, so apiErrorReason returns null and removeErrorMessage must
+// select copy by code.
 function conflict(code: string, message: string, extra: Record<string, unknown> = {}) {
   const detail = { code, message, ...extra };
-  return Object.assign(new Error('Request failed with status code 409'), {
+  return Object.assign(new Error(message || 'Request failed with status code 409'), {
     status: 409,
     response: { status: 409, data: { detail }, headers: {} },
   });
@@ -818,6 +821,8 @@ describe('ComputersDialog: removing a computer', () => {
     ['busy', 'This computer is busy. Try again in a moment.'],
     ['has_workspaces', 'A workspace not listed here is on it now. Check the list and try again.'],
     ['primary', "Your primary computer can't be removed."],
+    // DALTON-HOOK(workspace-delete-guard)
+    ['published_reports', 'A workspace on this computer has published reports and can only be archived, not deleted.'],
   ])('keeps the confirm open and words a %s refusal itself', async (code, copy) => {
     const user = userEvent.setup();
     mockDelete.mockRejectedValue(conflict(code, 'Computer cannot be removed right now'));

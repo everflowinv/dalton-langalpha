@@ -29,8 +29,10 @@ from src.server.database.home_workspace import is_home_row
 from src.server.database.workspace import (
     ACTIVE_WORK_DELETE_REFUSAL,
     MOVING_DELETE_REFUSAL,
+    PUBLISHED_REPORTS_DELETE_REFUSAL,  # DALTON-HOOK(workspace-delete-guard)
     SERVER_OWNED_CONFIG_KEYS,
     WorkspaceBusyError,
+    WorkspaceHasPublishedReportsError,  # DALTON-HOOK(workspace-delete-guard)
     WorkspaceMovingError,
     complete_workspace_folder_cleanup,
     create_workspace_on_computer,
@@ -63,12 +65,6 @@ from src.server.services.computer_manager._types import (
 from src.server.services.persistence.file import FilePersistenceService
 
 logger = logging.getLogger(__name__)
-
-# DALTON-HOOK(workspace-delete-guard): the sentence the workspace route has
-# always answered a delete of a workspace with immutable published reports,
-# now raised from every delete path, not only that route.
-PUBLISHED_REPORTS_DELETE_REFUSAL = "该工作区含已发布研报，禁止删除；请归档。"
-
 
 async def _has_published_reports(workspace_id: str) -> bool:
     # DALTON-HOOK(workspace-delete-guard): imported lazily, as every other
@@ -420,7 +416,7 @@ class WorkspaceManager(ComputerManager):
             # the shared delete so every entry point — the agent's delete tool,
             # a computer's removal — is refused the same way.
             if await _has_published_reports(workspace_id):
-                raise WorkspaceBusyError(PUBLISHED_REPORTS_DELETE_REFUSAL)
+                raise WorkspaceHasPublishedReportsError()
             # Before the last backup holds the folder, which would fail the
             # move instead; the delete's own transaction checks again.
             if await workspace_is_moving(workspace_id):
@@ -551,7 +547,21 @@ class WorkspaceManager(ComputerManager):
                 await self.delete_workspace(
                     workspace_id, delete_files=delete_files, on_computer=computer_id
                 )
-            except WorkspaceBusyError:
+            # DALTON-HOOK(workspace-delete-guard): a report published after the
+            # pre-check above refuses this workspace's delete with
+            # ``published_reports`` rather than ``busy``. Workspaces already
+            # deleted earlier in the batch are not rolled back (each final
+            # backup can take minutes, so holding locks across the whole batch
+            # is prohibitively expensive); ``deleted`` reports what already went.
+            except WorkspaceHasPublishedReportsError:
+                raise ComputerRemovalRefused(
+                    Retirement.PUBLISHED_REPORTS, deleted=deleted
+                ) from None
+            except WorkspaceBusyError as e:
+                if str(e) == PUBLISHED_REPORTS_DELETE_REFUSAL:
+                    raise ComputerRemovalRefused(
+                        Retirement.PUBLISHED_REPORTS, deleted=deleted
+                    ) from None
                 # A move or a run that started since the check above.
                 raise ComputerRemovalRefused(Retirement.BUSY, deleted=deleted) from None
             except (WorkspaceNotFound, WorkspaceNotOnComputer):

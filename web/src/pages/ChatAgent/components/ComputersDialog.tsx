@@ -416,6 +416,12 @@ function removeErrorMessage(err: unknown, t: Translate): string {
         return t('computer.removeRefused.hasWorkspaces', 'A workspace not listed here is on it now. Check the list and try again.');
       case 'busy':
         return t('computer.removeRefused.busy', 'This computer is busy. Try again in a moment.');
+      // DALTON-HOOK(workspace-delete-guard): a workspace on it holds immutable published reports.
+      case 'published_reports':
+        return t(
+          'computer.removeRefused.published_reports',
+          'A workspace on this computer has published reports and can only be archived, not deleted.',
+        );
     }
   }
   return apiErrorReason(err) || t('computer.removeFailed', "Couldn't remove this computer. Try again.");

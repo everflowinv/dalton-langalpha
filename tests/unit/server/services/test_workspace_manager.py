@@ -2259,6 +2259,52 @@ class TestRemoveComputerWithWorkspaces:
         )
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("exc_factory", "expected_code"),
+        [
+            # DALTON-HOOK(workspace-delete-guard)
+            (
+                lambda: __import__(
+                    "src.server.database.workspace",
+                    fromlist=["WorkspaceHasPublishedReportsError"],
+                ).WorkspaceHasPublishedReportsError(),
+                "published_reports",
+            ),
+            (
+                lambda: __import__(
+                    "src.server.database.workspace",
+                    fromlist=["WorkspaceBusyError", "ACTIVE_WORK_DELETE_REFUSAL"],
+                ).WorkspaceBusyError("This workspace has active work."),
+                "busy",
+            ),
+        ],
+        ids=["published-mid-batch", "busy-mid-batch"],
+    )
+    async def test_a_mid_batch_delete_refusal_distinguishes_published_reports_from_busy(
+        self, exc_factory, expected_code
+    ):
+        """DALTON-HOOK(workspace-delete-guard): a report published or a run
+        started on a later workspace after the pre-check stops the batch, keeps
+        the earlier deletes, and answers ``published_reports`` vs ``busy``."""
+        from unittest.mock import create_autospec
+        from src.server.services.computer_errors import ComputerRemovalRefused
+
+        self.wm.delete_workspace = create_autospec(
+            WorkspaceManager(_make_config()).delete_workspace,
+            side_effect=[True, exc_factory()],
+        )
+
+        with pytest.raises(ComputerRemovalRefused) as refused:
+            await self._remove(["ws-a", "ws-b"])
+
+        assert (refused.value.code, refused.value.deleted) == (
+            expected_code,
+            ["ws-a"],
+        )
+        assert self.wm.delete_workspace.await_count == 2
+        self.wm.remove_computer.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_any_other_refusal_of_a_delete_stops_the_removal(self):
         self.wm.delete_workspace.side_effect = ValueError("Cannot delete Home")
 

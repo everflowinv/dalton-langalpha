@@ -1564,6 +1564,18 @@ MOVING_DELETE_REFUSAL = (
 ACTIVE_WORK_DELETE_REFUSAL = (
     "This workspace has active work. Stop it or wait for it to finish before deleting."
 )
+# DALTON-HOOK(workspace-delete-guard): the sentence the workspace route has
+# always answered a delete of a workspace with immutable published reports,
+# now raised from every delete path, not only that route.
+PUBLISHED_REPORTS_DELETE_REFUSAL = "该工作区含已发布研报，禁止删除；请归档。"
+
+
+class WorkspaceHasPublishedReportsError(WorkspaceBusyError):
+    """DALTON-HOOK(workspace-delete-guard): deletion is refused because the
+    workspace holds immutable published reports."""
+
+    def __init__(self, message: str = PUBLISHED_REPORTS_DELETE_REFUSAL) -> None:
+        super().__init__(message)
 
 
 class WorkspaceMovingError(SandboxTransientError):
@@ -1665,6 +1677,13 @@ async def delete_workspace(
                 # would have cleared a folder it found missing.
                 if await workspace_is_moving(workspace_id, conn=owned):
                     raise WorkspaceBusyError(MOVING_DELETE_REFUSAL)
+                # DALTON-HOOK(workspace-delete-guard): re-checked under the
+                # workspace row lock (FOR UPDATE) so a report published while
+                # the final backup was running cannot be tombstoned over.
+                from src.dalton.database.publications import has_published_reports
+
+                if await has_published_reports(workspace_id, cur=cur):
+                    raise WorkspaceHasPublishedReportsError()
                 # Exactly one of the two markers, whatever the row carried in.
                 await cur.execute(
                     """

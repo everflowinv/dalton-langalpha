@@ -1619,7 +1619,8 @@
     "removeRefused": {
       "primary": "默认计算机无法移除。",
       "hasWorkspaces": "它上面有一个未列出的工作区。请查看列表后重试。",
-      "busy": "这台计算机正忙，请稍后再试。"
+      "busy": "这台计算机正忙，请稍后再试。",
+      "published_reports": "这台计算机上有工作区含已发布研报，只能归档，不能删除。"
     },
     "manageComputer": "管理 {{name}}",
     "alwaysOn": "常驻",

@@ -1646,38 +1646,53 @@ async def run_publish(
             backend=backend,
         )
 
-        pub_row = await db_publications.insert_publication(
-            publish_request_id=req_id,
-            user_id=user_id,
-            workspace_id=workspace_id,
-            ticker=ticker,
-            kind=kind,
-            title=title,
-            published_date=pub_date_str,
-            files=files_meta,
-            file_blobs=file_blobs,
-            bundle_sha256=bundle_sha256,
-            sources=audit_info.get("matches") or [],
-            audit_summary={
-                "figures": audit_info.get("figures", 0),
-                "matched": audit_info.get("matched", 0),
-                "verified": audit_info.get("verified", audit_info.get("matched", 0)),
-                "contradicted": audit_info.get("contradicted", 0),
-                "unverified": audit_info.get("unverified", 0),
-                "uncertain": audit_info.get("uncertain", 0),
-                "exempt": audit_info.get("exempt", 0),
-            },
-            reviewer={
-                "model": review_info.get("model"),
-                "family": review_info.get("family"),
-                "verdict": review_info.get("verdict", "pass"),
-                "reasons": review_info.get("reasons") or [],
-                "reviewed_at": review_info.get("reviewed_at") or approved_at_iso,
-            },
-            approver_user_id=approver,
-            approved_at=now_dt,
-            thesis_version_no=thesis_version_no if updates_thesis else None,
-        )
+        try:
+            pub_row = await db_publications.insert_publication(
+                publish_request_id=req_id,
+                user_id=user_id,
+                workspace_id=workspace_id,
+                ticker=ticker,
+                kind=kind,
+                title=title,
+                published_date=pub_date_str,
+                files=files_meta,
+                file_blobs=file_blobs,
+                bundle_sha256=bundle_sha256,
+                sources=audit_info.get("matches") or [],
+                audit_summary={
+                    "figures": audit_info.get("figures", 0),
+                    "matched": audit_info.get("matched", 0),
+                    "verified": audit_info.get("verified", audit_info.get("matched", 0)),
+                    "contradicted": audit_info.get("contradicted", 0),
+                    "unverified": audit_info.get("unverified", 0),
+                    "uncertain": audit_info.get("uncertain", 0),
+                    "exempt": audit_info.get("exempt", 0),
+                },
+                reviewer={
+                    "model": review_info.get("model"),
+                    "family": review_info.get("family"),
+                    "verdict": review_info.get("verdict", "pass"),
+                    "reasons": review_info.get("reasons") or [],
+                    "reviewed_at": review_info.get("reviewed_at") or approved_at_iso,
+                },
+                approver_user_id=approver,
+                approved_at=now_dt,
+                thesis_version_no=thesis_version_no if updates_thesis else None,
+            )
+        except db_publications.WorkspaceUnavailableForPublishError as exc:
+            err_msg = str(exc)
+            await db_publications.transition(
+                req_id,
+                ("publishing",),
+                "rejected",
+                error=err_msg,
+            )
+            return {
+                "ok": False,
+                "status": "rejected",
+                "audit": row.get("audit"),
+                "message": _prefix_with_audit_summary(row, f"ERROR: {err_msg}"),
+            }
         pub_id = str(pub_row["publication_id"])
 
         # Step 9: Update thesis.official when updates_thesis=True (source='publish')

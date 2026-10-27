@@ -320,7 +320,7 @@ async def _read_workspace_file_safely(
             timeout=10,
         )
     except Exception as exc:
-        return None, None, f"Metadata stat check failed: {type(exc).__name__}"
+        return None, None, f"Metadata stat check failed: {type(exc).__name__}: {exc}"
 
     if stat_code != 0 or not stat_out.strip():
         return None, None, f"Metadata stat check failed for '{rel_path}' (exit={stat_code})."
@@ -351,7 +351,7 @@ async def _read_workspace_file_safely(
             timeout=10,
         )
     except Exception as exc:
-        return None, None, f"Metadata realpath check failed: {type(exc).__name__}"
+        return None, None, f"Metadata realpath check failed: {type(exc).__name__}: {exc}"
 
     if rp_code != 0 or not rp_out.strip():
         return None, None, f"Metadata realpath check failed for '{rel_path}' (exit={rp_code})."

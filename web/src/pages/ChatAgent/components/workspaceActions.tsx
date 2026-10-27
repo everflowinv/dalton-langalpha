@@ -8,6 +8,7 @@ import { toast } from '@/components/ui/use-toast';
 import { queryKeys } from '@/lib/queryKeys';
 import type { Computer } from '@/types/api';
 import { deleteWorkspace, duplicateWorkspace } from '../utils/api';
+import { apiErrorDetail } from '../utils/api/errors'; // DALTON-HOOK(workspace-delete-guard)
 import { entitlementErrorMessage } from '../utils/entitlementErrors';
 import { workspaceNameErrorMessage } from '../utils/workspaceName';
 import { forgetDeletedWorkspace, invalidateNewWorkspace, invalidateWorkspaceMembership } from '../hooks/workspaceRowActions';
@@ -210,7 +211,15 @@ export function useWorkspaceActions({
       setDeleteTarget(null);
     } catch (err) {
       console.error('Error deleting workspace:', err);
-      setDeleteError(err instanceof Error && err.message ? err.message : t('workspace.failedDeleteWorkspace'));
+      // DALTON-HOOK(workspace-delete-guard): the delete route answers a 409
+      // refusal (published reports, active work, a move) with a string detail,
+      // while ApiError leaves err.message as the generic status line.
+      const detail = apiErrorDetail(err);
+      setDeleteError(
+        typeof detail === 'string' && detail
+          ? detail
+          : t('workspace.failedDeleteWorkspace'),
+      );
     } finally {
       setDeleteBusy(false);
     }

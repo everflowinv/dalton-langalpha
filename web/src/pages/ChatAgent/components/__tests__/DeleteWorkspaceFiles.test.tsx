@@ -160,4 +160,27 @@ describe('deleting a workspace on the owner\'s machine', () => {
     expect(screen.queryByRole('checkbox')).toBeNull();
     expect(screen.getByText(/will be permanently deleted/)).toBeInTheDocument();
   });
+
+  // DALTON-HOOK(workspace-delete-guard): string detail on a 409 refusal wins
+  // over ApiError's generic status line; errors without one use the fallback copy.
+  it('shows the server string detail on a 409 refusal, else the generic failure copy', async () => {
+    const refusal = '该工作区含已发布研报，禁止删除；请归档。';
+    mockDelete.mockRejectedValueOnce(
+      Object.assign(new Error('Request failed with status code 409'), {
+        status: 409,
+        response: { status: 409, data: { detail: refusal }, headers: {} },
+      }),
+    );
+    renderWithProviders(<Harness workspace={onCloud} />);
+    fireEvent.click(screen.getByText('open'));
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Delete' }));
+    expect(await screen.findByText(refusal)).toBeInTheDocument();
+    expect(screen.queryByText(/status code 409/)).toBeNull();
+
+    mockDelete.mockRejectedValueOnce(new Error('Request failed with status code 500'));
+    fireEvent.click(screen.getByRole('button', { name: 'Delete' }));
+    expect(await screen.findByText('Failed to delete workspace. Please try again.')).toBeInTheDocument();
+    expect(screen.queryByText(/status code 500/)).toBeNull();
+  });
 });
