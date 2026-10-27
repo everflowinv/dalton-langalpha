@@ -372,6 +372,8 @@ def build_director_tools(
         Preserves the previous date in `note` when rescheduling (e.g. `原 10/27，改期`).
         On validation failure, the returned message includes the expected schema structure
         (失败时返回的信息里带有期望结构，照着补齐再提交).
+        Creates a minimal `agenda` document with the event when none exists yet (no separate
+        `knowledge_update` call needed for the first event).
         Does not wake the company's sandbox.
 
         Args:
@@ -394,146 +396,167 @@ def build_director_tools(
             from src.dalton.knowledge import service as knowledge_service
             from src.dalton.knowledge.ops import next_item_id
 
-            latest = await db_knowledge.latest_version(workspace_id, "agenda")
-            base_ver = int(latest["version_no"]) if latest else None
-            content = (latest.get("content") or {}) if isinstance(latest, dict) else {}
-            watch_block = content.get("watch") if isinstance(content.get("watch"), dict) else {}
-            existing_events = [
-                ev for ev in (watch_block.get("events") or []) if isinstance(ev, dict)
-            ]
+            async def _attempt() -> tuple[dict[str, Any], bool]:
+                """One read-match-write pass. Returns ``(apply_update result, was_first_write)``.
 
-            clean_event_id = str(event_id or "").strip()
-            matched_ev: dict[str, Any] | None = None
-            match_type = str(type).strip() if (type is not None and str(type).strip()) else "earnings"
-            if clean_event_id:
-                matched_ev = next(
-                    (ev for ev in existing_events if str(ev.get("id") or "") == clean_event_id),
-                    None,
-                )
-                if matched_ev is None:
-                    return json.dumps(
-                        {
+                On a workspace with no agenda yet the pass is a single ``create``
+                whose value carries the event inline — ``apply_ops`` accepts only a
+                lone create op against an empty base, and the schema's required
+                top-level fields (``schema_version``/``as_of``/…) are filled by
+                ``_ensure_nested_ids_and_defaults``, so the minimal create value is
+                just ``{"watch": {"events": [event]}}``.
+                """
+                latest = await db_knowledge.latest_version(workspace_id, "agenda")
+                base_ver = int(latest["version_no"]) if latest else None
+                content = (latest.get("content") or {}) if isinstance(latest, dict) else {}
+                watch_block = content.get("watch") if isinstance(content.get("watch"), dict) else {}
+                existing_events = [
+                    ev for ev in (watch_block.get("events") or []) if isinstance(ev, dict)
+                ]
+
+                clean_event_id = str(event_id or "").strip()
+                matched_ev: dict[str, Any] | None = None
+                match_type = str(type).strip() if (type is not None and str(type).strip()) else "earnings"
+                if clean_event_id:
+                    matched_ev = next(
+                        (ev for ev in existing_events if str(ev.get("id") or "") == clean_event_id),
+                        None,
+                    )
+                    if matched_ev is None:
+                        return {
                             "ok": False,
                             "error": "event_not_found",
                             "event_id": clean_event_id,
                             "message": f"agenda.watch.events 中不存在 event_id={clean_event_id!r} 的事件，无法按该 ID 更新。",
-                        },
-                        ensure_ascii=False,
-                    )
-                target_id = clean_event_id
-            else:
-                q_prefix = _extract_quarter_prefix(note)
-                if q_prefix:
-                    matched_ev = next(
-                        (
-                            ev
-                            for ev in existing_events
-                            if str(ev.get("type") or "") == match_type
-                            and _extract_quarter_prefix(ev.get("note")) == q_prefix
-                        ),
-                        None,
-                    )
-                if matched_ev is not None and matched_ev.get("id"):
-                    target_id = str(matched_ev["id"])
+                        }, False
+                    target_id = clean_event_id
                 else:
-                    target_id = next_item_id("events", existing_events)
+                    q_prefix = _extract_quarter_prefix(note)
+                    if q_prefix:
+                        matched_ev = next(
+                            (
+                                ev
+                                for ev in existing_events
+                                if str(ev.get("type") or "") == match_type
+                                and _extract_quarter_prefix(ev.get("note")) == q_prefix
+                            ),
+                            None,
+                        )
+                    if matched_ev is not None and matched_ev.get("id"):
+                        target_id = str(matched_ev["id"])
+                    else:
+                        target_id = next_item_id("events", existing_events)
 
-            date_status_provided = date_status is not None and str(date_status).strip() != ""
-            if matched_ev is None and not date_status_provided:
-                return json.dumps(
-                    {
+                date_status_provided = date_status is not None and str(date_status).strip() != ""
+                if matched_ev is None and not date_status_provided:
+                    return {
                         "ok": False,
                         "error": "missing_date_status",
                         "message": "新增监控事件时必须显式传入 date_status（'confirmed' | 'estimated' | 'unknown'）。",
-                    },
-                    ensure_ascii=False,
+                    }, latest is None
+
+                if date == _UNSET_DATE:
+                    clean_date = matched_ev.get("date") if matched_ev is not None else None
+                else:
+                    clean_date = str(date).strip() if (date is not None and str(date).strip()) else None
+
+                eff_type = (
+                    str(type).strip()
+                    if (type is not None and str(type).strip())
+                    else (str(matched_ev.get("type") or "earnings") if matched_ev is not None else "earnings")
+                )
+                eff_date_status = (
+                    str(date_status).strip()
+                    if date_status_provided
+                    else str(matched_ev.get("date_status") or "confirmed")
                 )
 
-            if date == _UNSET_DATE:
-                clean_date = matched_ev.get("date") if matched_ev is not None else None
-            else:
-                clean_date = str(date).strip() if (date is not None and str(date).strip()) else None
+                eff_note = note if note is not None else (matched_ev.get("note") if matched_ev else None)
+                if matched_ev is not None:
+                    old_date = str(matched_ev.get("date") or "").strip()
+                    if old_date and clean_date and old_date != clean_date:
+                        eff_note = _format_rescheduled_note(eff_note, old_date, clean_date)
 
-            eff_type = (
-                str(type).strip()
-                if (type is not None and str(type).strip())
-                else (str(matched_ev.get("type") or "earnings") if matched_ev is not None else "earnings")
-            )
-            eff_date_status = (
-                str(date_status).strip()
-                if date_status_provided
-                else str(matched_ev.get("date_status") or "confirmed")
-            )
-
-            eff_note = note if note is not None else (matched_ev.get("note") if matched_ev else None)
-            if matched_ev is not None:
-                old_date = str(matched_ev.get("date") or "").strip()
-                if old_date and clean_date and old_date != clean_date:
-                    eff_note = _format_rescheduled_note(eff_note, old_date, clean_date)
-
-            event_obj: dict[str, Any] = {
-                "id": target_id,
-                "type": eff_type,
-                "date": clean_date,
-                "date_status": eff_date_status,
-            }
-            if eff_note is not None or (matched_ev is not None and "note" in matched_ev):
-                event_obj["note"] = eff_note
-
-            if source is not None and str(source).strip():
-                event_obj["source"] = str(source).strip()
-            elif source is None and matched_ev is not None and matched_ev.get("source"):
-                event_obj["source"] = str(matched_ev["source"])
-
-            if plan is not None and str(plan).strip():
-                event_obj["plan"] = str(plan).strip()
-            elif (
-                plan is None
-                and matched_ev is not None
-                and matched_ev.get("plan")
-                and event_obj["date_status"] != "estimated"
-            ):
-                event_obj["plan"] = str(matched_ev["plan"])
-
-            ops: list[dict[str, Any]] = [
-                {
-                    "op": "upsert_item",
-                    "path": "/watch/events",
-                    "value": event_obj,
+                event_obj: dict[str, Any] = {
+                    "id": target_id,
+                    "type": eff_type,
+                    "date": clean_date,
+                    "date_status": eff_date_status,
                 }
-            ]
-            if matched_ev is not None and "plan" in matched_ev and "plan" not in event_obj:
-                ops.append({"op": "remove", "path": f"/watch/events/{target_id}/plan"})
+                if eff_note is not None or (matched_ev is not None and "note" in matched_ev):
+                    event_obj["note"] = eff_note
 
-            reason_str = (
-                f"更新议程监控事件 {target_id}"
-                if matched_ev is not None
-                else f"新增议程监控事件 {target_id}"
-            )
-            res = await knowledge_service.apply_update(
-                user_id=user_id,
-                workspace_id=workspace_id,
-                doc_key="agenda",
-                ops=ops,
-                reason=reason_str,
-                base_version=base_ver,
-                source="tool",
-                backend=None,
-                thread_id=str(configurable.get("thread_id")) if configurable.get("thread_id") else None,
-            )
-            if isinstance(res, dict):
-                if res.get("ok"):
-                    res["event_id"] = target_id
-                    res["action"] = "updated" if matched_ev is not None else "created"
-                    res["event"] = event_obj
+                if source is not None and str(source).strip():
+                    event_obj["source"] = str(source).strip()
+                elif source is None and matched_ev is not None and matched_ev.get("source"):
+                    event_obj["source"] = str(matched_ev["source"])
+
+                if plan is not None and str(plan).strip():
+                    event_obj["plan"] = str(plan).strip()
+                elif (
+                    plan is None
+                    and matched_ev is not None
+                    and matched_ev.get("plan")
+                    and event_obj["date_status"] != "estimated"
+                ):
+                    event_obj["plan"] = str(matched_ev["plan"])
+
+                first_write = latest is None
+                if first_write:
+                    ops: list[dict[str, Any]] = [
+                        {"op": "create", "value": {"watch": {"events": [event_obj]}}}
+                    ]
                 else:
-                    problems = res.get("problems") or [{"path": "/watch/events/0"}]
-                    expected = knowledge_service._format_expected_structures("agenda", problems)
-                    if expected:
-                        res.setdefault("expected_structure", expected)
-                        msg = str(res.get("message") or "")
-                        if "Expected structure" not in msg:
-                            res["message"] = f"{msg}\n\n{expected}".strip()
+                    ops = [
+                        {
+                            "op": "upsert_item",
+                            "path": "/watch/events",
+                            "value": event_obj,
+                        }
+                    ]
+                    if matched_ev is not None and "plan" in matched_ev and "plan" not in event_obj:
+                        ops.append({"op": "remove", "path": f"/watch/events/{target_id}/plan"})
+
+                reason_str = (
+                    f"更新议程监控事件 {target_id}"
+                    if matched_ev is not None
+                    else f"新增议程监控事件 {target_id}" + ("（首建 agenda）" if first_write else "")
+                )
+                res = await knowledge_service.apply_update(
+                    user_id=user_id,
+                    workspace_id=workspace_id,
+                    doc_key="agenda",
+                    ops=ops,
+                    reason=reason_str,
+                    base_version=base_ver,
+                    source="tool",
+                    backend=None,
+                    thread_id=str(configurable.get("thread_id")) if configurable.get("thread_id") else None,
+                )
+                if isinstance(res, dict):
+                    if res.get("ok"):
+                        res["event_id"] = target_id
+                        res["action"] = "updated" if matched_ev is not None else "created"
+                        res["event"] = event_obj
+                    elif res.get("error") not in ("event_not_found", "missing_date_status"):
+                        problems = res.get("problems") or [{"path": "/watch/events/0"}]
+                        expected = knowledge_service._format_expected_structures("agenda", problems)
+                        if expected:
+                            res.setdefault("expected_structure", expected)
+                            msg = str(res.get("message") or "")
+                            if "Expected structure" not in msg:
+                                res["message"] = f"{msg}\n\n{expected}".strip()
+                return res, first_write
+
+            res, first_write = await _attempt()
+            # 并发首写：两个调用同时建 agenda 时，输掉的一方在这里重读最新版本，
+            # 按普通 upsert 重试一次；再失败就把冲突原样交回。
+            if (
+                first_write
+                and isinstance(res, dict)
+                and res.get("error") == "version_conflict"
+            ):
+                res, _ = await _attempt()
             return json.dumps(res, ensure_ascii=False, default=str)
         except HTTPException:
             raise

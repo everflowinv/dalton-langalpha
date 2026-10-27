@@ -111,6 +111,8 @@ ALLOWED_HOOKS=(
   "hide-experiments"
   "provenance-full-archive"
   "loop-stall-stack"
+  "fetch-binary-route"
+  "workspace-folder-ready"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)
