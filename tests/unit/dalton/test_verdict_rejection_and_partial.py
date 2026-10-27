@@ -143,6 +143,82 @@ async def test_partial_success_returns_verdict_saved_and_recovery(
     assert payload["verdict_saved"] is True
     assert payload["agenda_saved"] is False
     assert payload["verdict_id"] == "VD-20261027-01"
-    assert 'knowledge_update(doc="agenda"' in payload["recovery"]
-    assert "不要重复调用 knowledge_append_verdict" in payload["recovery"]
+    recovery = payload["recovery"]
+    # The recovery is versioned: read the agenda's current version first, then
+    # retry WITH base_version — an unversioned retry on an existing agenda
+    # would only hit version_conflict and fail again.
+    assert 'knowledge_read(workspace_id="ws-1", doc="agenda")' in recovery
+    assert 'knowledge_update(workspace_id="ws-1", doc="agenda"' in recovery
+    assert "base_version=<第 1 步读到的 version>" in recovery
+    # No agenda yet: the create branch, with base_version=null.
+    assert '"op":"create"' in recovery and "base_version=null" in recovery
+    assert "不要重复调用 knowledge_append_verdict" in recovery
     assert "ops 校验失败" in payload["detail"]
+
+
+@pytest.mark.asyncio
+async def test_partial_success_recovery_omits_workspace_id_for_own_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Targeting the current workspace (no explicit workspace_id): the
+    recovery's read/update calls omit the parameter instead of freezing an
+    id the caller never named."""
+    monkeypatch.setattr(
+        kt_mod,
+        "verify_workspace_access",
+        create_autospec(kt_mod.verify_workspace_access, return_value={"workspace_id": "ws-1"}),
+    )
+    monkeypatch.setattr(
+        kt_mod,
+        "_resolve_thread_origin",
+        create_autospec(kt_mod._resolve_thread_origin, return_value=(None, None)),
+    )
+    monkeypatch.setattr(
+        kt_mod,
+        "resolve_verdict_signals",
+        create_autospec(kt_mod.resolve_verdict_signals, return_value=0),
+    )
+    monkeypatch.setattr(
+        kt_mod,
+        "append_verdict",
+        create_autospec(
+            kt_mod.append_verdict,
+            return_value={
+                "ok": True,
+                "verdict_id": "VD-20261027-02",
+                "word": "NO_CHANGE",
+                "agenda_version_no": None,
+                "warnings": [],
+                "agenda_update": "failed",
+                "agenda_error": "ops 校验失败",
+                "agenda_problems": [],
+                "message": "Recorded verdict …; agenda_update: failed …",
+            },
+        ),
+    )
+
+    tools = create_knowledge_tools(None)
+    verdict_tool = {t.name: t for t in tools}["knowledge_append_verdict"]
+    res = await verdict_tool.ainvoke(
+        {
+            "name": "knowledge_append_verdict",
+            "id": "tc-partial-2",
+            "type": "tool_call",
+            "args": {
+                "verdict": {
+                    "verdict": "NO_CHANGE",
+                    "event": "e",
+                    "rationale": "r",
+                    "progress": "none",
+                    "trigger": {"kind": "internal_material", "ref": "sig-1"},
+                    "next_validation": {"what": "w", "due": "2026-11-05"},
+                },
+            },
+        },
+        config={"configurable": {"user_id": "u-1", "workspace_id": "ws-1"}},
+    )
+    payload = json.loads(res.content if hasattr(res, "content") else str(res))
+    recovery = payload["recovery"]
+    assert 'knowledge_read(doc="agenda")' in recovery
+    assert 'knowledge_update(doc="agenda"' in recovery
+    assert "workspace_id=" not in recovery

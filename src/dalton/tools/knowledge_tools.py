@@ -313,14 +313,22 @@ def create_knowledge_tools(filesystem_backend: Any = None) -> list[BaseTool]:
             )
             if res.get("agenda_update") == "failed":
                 # Partial success the model must not read as done: the verdict
-                # row exists, the agenda does not. The recovery is one
-                # knowledge_update call, so say exactly that.
+                # row exists, the agenda does not. The recovery is a READ of
+                # the agenda's current version, then one versioned update — an
+                # unversioned retry on an existing agenda only hits
+                # version_conflict and fails again.
                 verdict_id = res.get("verdict_id")
+                ws_arg = f'workspace_id="{target_ws_id}", ' if workspace_id else ""
                 recovery = (
-                    "verdict 已入库、agenda 未更新：按 detail 里的期望结构调用 "
-                    f'knowledge_update(doc="agenda", ops=[…], '
-                    f'reason="补写 verdict {verdict_id} 的 agenda 更新")，'
-                    "不要重复调用 knowledge_append_verdict（会写第二条 verdict）。"
+                    "verdict 已入库、agenda 未更新，按以下两步补救"
+                    "（不要重复调用 knowledge_append_verdict，会写第二条 verdict）：\n"
+                    f'1. 读当前版本：knowledge_read({ws_arg}doc="agenda")，'
+                    "取返回 JSON 里的 version（如 3）；\n"
+                    f'2. 带 base_version 重试：knowledge_update({ws_arg}doc="agenda", '
+                    "ops=[…按 detail 里的期望结构…], base_version=<第 1 步读到的 version>, "
+                    f'reason="补写 verdict {verdict_id} 的 agenda 更新")。'
+                    "\n第 1 步返回没有 version（agenda 尚不存在）时："
+                    'ops 用 [{"op":"create","value":{…}}]，base_version=null。'
                 )
                 return json.dumps(
                     {
