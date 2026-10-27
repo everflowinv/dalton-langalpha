@@ -2448,6 +2448,56 @@ _NESTED_ALIAS_CONFLICT_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
 )
 
 
+_DATE_PARAM_FIELDS: tuple[str, ...] = ("start", "end", "as_of", "vintage")
+
+
+def _normalize_date_param(field: str, value: Any) -> str | None:
+    """Coerce a caller's date to the YYYY-MM-DD the upstream CLI parses.
+
+    The CLI exits on any other shape before printing, which surfaced as an
+    opaque "upstream unavailable"; a month, quarter or year widens to its first
+    day for `start` and its last day otherwise. None when it is not a date.
+    """
+    import calendar
+    import datetime as _dt
+
+    text = str(value).strip()
+    if not text:
+        return None
+    last = field != "start"
+
+    def _day(y: int, m: int, d: int) -> str | None:
+        try:
+            return _dt.date(y, m, d).isoformat()
+        except ValueError:
+            return None
+
+    def _span(y: int, m_first: int, m_last: int) -> str | None:
+        if not (1 <= m_first <= 12 and 1 <= m_last <= 12) or not (1900 <= y <= 2100):
+            return None
+        if last:
+            return _day(y, m_last, calendar.monthrange(y, m_last)[1])
+        return _day(y, m_first, 1)
+
+    m = re.fullmatch(r"(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})(?:[T ].*)?", text)
+    if m:
+        return _day(int(m[1]), int(m[2]), int(m[3]))
+    m = re.fullmatch(r"(\d{4})(\d{2})(\d{2})", text)
+    if m:
+        return _day(int(m[1]), int(m[2]), int(m[3]))
+    m = re.fullmatch(r"(\d{4})[-/.](\d{1,2})", text)
+    if m:
+        return _span(int(m[1]), int(m[2]), int(m[2]))
+    m = re.fullmatch(r"(\d{4})\s*-?\s*[Qq]([1-4])|[Qq]([1-4])\s*-?\s*(\d{4})", text)
+    if m:
+        y, q = (int(m[1]), int(m[2])) if m[1] else (int(m[4]), int(m[3]))
+        return _span(y, 3 * q - 2, 3 * q)
+    m = re.fullmatch(r"(\d{4})", text)
+    if m:
+        return _span(int(m[1]), 1, 12)
+    return None
+
+
 def _normalize_and_validate_call_args(
     tool_name: str,
     raw_args: dict[str, Any],
@@ -2565,6 +2615,28 @@ def _normalize_and_validate_call_args(
 
     if isinstance(normalized.get("ticker"), str):
         normalized["ticker"] = _normalize_ticker_for_route(route, normalized["ticker"])
+
+    if not is_comm:
+        for date_k in _DATE_PARAM_FIELDS:
+            raw_date = normalized.get(date_k)
+            if raw_date is None:
+                continue
+            coerced = _normalize_date_param(date_k, raw_date)
+            if coerced is None:
+                norm_view = _build_normalized_params_view(normalized, is_community=is_comm)
+                err = {
+                    "_declared_sources": [],
+                    "_sources": [],
+                    "ok": False,
+                    "status": "invalid_arguments",
+                    "error_code": "invalid_date",
+                    "error_category": "参数错误",
+                    "error": f"[参数错误] {date_k}={raw_date!r} 不是可识别的日期；请用 YYYY-MM-DD。",
+                    "hint": f"把 {date_k} 改成 YYYY-MM-DD（例如 2026-09-01）后重试；月份、季度也可写成 2026-09、2026Q3。",
+                    "normalized_params": norm_view,
+                }
+                return normalized, norm_view, err
+            normalized[date_k] = coerced
 
     # Validate nested `params` conflicts, top-level vs nested document conflicts, and alphaengine doc_id mapping
     if isinstance(normalized.get("params"), dict):
