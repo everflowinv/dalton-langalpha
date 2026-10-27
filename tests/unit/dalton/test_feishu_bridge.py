@@ -931,3 +931,53 @@ def test_grant_chat_full_access_request_shape() -> None:
         query={"type": "docx", "need_notification": "false"},
         json_body={"member_type": "openchat", "member_id": "oc_team", "perm": "full_access"},
     )
+
+
+@pytest.mark.parametrize(
+    ("error_code", "unknown"),
+    [
+        ("feishu_network_error", True),
+        ("feishu_invalid_response", True),
+        ("feishu_empty_error_response", True),
+        ("feishu_http_502", True),
+        ("feishu_http_503", True),
+        ("feishu_http_400", False),
+        ("feishu_api_error", False),
+    ],
+)
+def test_feishu_outcome_unknown_only_when_the_write_may_have_landed(
+    error_code: str, unknown: bool
+) -> None:
+    assert rb._feishu_outcome_unknown(error_code) is unknown
+
+
+def test_request_empty_error_body_is_an_unknown_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An empty 502 from a gateway after a committed write must not read as a refusal."""
+    import email
+    import io
+    import urllib.error
+    import urllib.request
+
+    opener = create_autospec(urllib.request.OpenerDirector, instance=True)
+
+    def _open(req: Any, timeout: Any = None) -> Any:
+        raise urllib.error.HTTPError(
+            req.full_url, 502, "Bad Gateway", email.message.Message(), io.BytesIO(b"")
+        )
+
+    opener.open.side_effect = _open
+    monkeypatch.setattr(
+        rb.urllib.request,
+        "build_opener",
+        create_autospec(urllib.request.build_opener, return_value=opener),
+    )
+    client = rb.FeishuClient("fake-app-id", "fake-app-secret", timeout_s=1.0)
+    client._tenant_token = "t-token"
+    client._token_expires_at = time.time() + 3600.0
+
+    with pytest.raises(rb.FeishuApiError) as excinfo:
+        client._request("POST", "/open-apis/docx/v1/documents/d/blocks/d/descendant", json_body={})
+    assert excinfo.value.error_code == "feishu_empty_error_response"
+    assert rb._feishu_outcome_unknown(excinfo.value.error_code)

@@ -10822,7 +10822,7 @@ class ResearchDataBridge:
                 )
                 outcome = (
                     "unknown"
-                    if exc.error_code in _FEISHU_UNKNOWN_OUTCOME_CODES
+                    if _feishu_outcome_unknown(exc.error_code)
                     else "rejected"
                 )
                 lead = (
@@ -11246,7 +11246,17 @@ class FeishuApiError(RuntimeError):
 _FEISHU_UNKNOWN_OUTCOME_CODES: frozenset[str] = frozenset({
     "feishu_network_error",
     "feishu_invalid_response",
+    "feishu_empty_error_response",
 })
+
+
+def _feishu_outcome_unknown(error_code: str) -> bool:
+    """Whether a Feishu failure leaves it unknown if the write landed: no
+    response, an unparseable or empty error body, or a 5xx (a gateway may
+    answer after the upstream committed). Only a 4xx with a body is a refusal."""
+    return error_code in _FEISHU_UNKNOWN_OUTCOME_CODES or error_code.startswith(
+        "feishu_http_5"
+    )
 
 
 #: OpenClaw's Eve tracking group (internal team), the default share target for
@@ -11675,6 +11685,11 @@ class FeishuClient:
                 )
         except Exception as exc:
             raise FeishuApiError("feishu_network_error", type(exc).__name__) from exc
+        if status >= 500 and not raw.strip():
+            # A server error with no body says nothing about whether the request
+            # took effect (an empty gateway 502 after a committed write). An
+            # empty 4xx is still a refusal and keeps its feishu_http_4xx code.
+            raise FeishuApiError("feishu_empty_error_response", f"http_{status}")
         try:
             payload = json.loads(raw) if raw.strip() else {}
         except ValueError:
