@@ -31,7 +31,7 @@ import researchdata_bridge as rb  # noqa: E402
 )
 def test_research_dates_are_coerced(args, start, end):
     normalized, _, err = rb._normalize_and_validate_call_args(
-        "research", {"route": "alphaengine", "query": "英伟达", **args}
+        "research", {"route": "transcript", "ticker": "NVDA", **args}
     )
     assert err is None
     assert normalized.get("start") == start
@@ -46,3 +46,28 @@ def test_an_unreadable_date_is_a_parameter_error(bad):
     assert err is not None
     assert err["status"] == "invalid_arguments"
     assert err["error"].startswith("[参数错误]")
+
+
+def test_alphaengine_gets_its_date_window_as_a_pair():
+    import datetime as dt
+
+    normalized, _, err = rb._normalize_and_validate_call_args(
+        "research", {"route": "alphaengine", "query": "英伟达", "start": "2026-09"}
+    )
+    assert err is None
+    assert normalized["start"] == "2026-09-01"
+    assert normalized["end"] == max(dt.date.today().isoformat(), "2026-09-01")
+
+    normalized, _, err = rb._normalize_and_validate_call_args(
+        "research", {"route": "alphaengine", "query": "英伟达", "end": "2026-10-26"}
+    )
+    assert err is None
+    assert normalized["start"] == "2025-10-26"
+
+
+def test_upstream_argument_codes_are_parameter_errors():
+    category, _ = rb._classify_error_category_and_hint(
+        "research",
+        "alphaengine", "search_library", {"ok": False, "error": "E_BAD_DATE_RANGE: date_from 和 date_to 必须成对提供"}
+    )
+    assert category == "参数错误"
