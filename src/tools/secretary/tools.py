@@ -138,48 +138,57 @@ async def _folder_ready_result(
     acquisition builds it, which left the Chief of Staff copying hand-off
     files into a directory that did not exist yet.
 
-    ``folder_path`` is always answered, from the binding alone — the same
-    ``root_dir``/``dir_name`` the bring-up's ``_ensure_workspace_dirs`` builds
-    the folder from (``PTCSandbox._ensure_workspace_dirs`` →
-    ``WorkspaceLayout.setup_dirs[0]`` = ``workspace_root(root, dir_name)``),
-    so a folder created here is the folder the machine's own attach would
-    create. No sandbox and no acquire is involved in computing it.
+    The path a created folder must have is whatever the SANDBOX would use at
+    bring-up — ``session.sandbox.layout.for_workspace(dir_name).setup_dirs[0]``,
+    the exact expression ``PTCSandbox._ensure_workspace_dirs`` mkdirs — because
+    a reconnect can repoint the sandbox's working dir away from the computer
+    row's root, and a folder created at any other root is not the folder the
+    attach will find. So whenever the folder is actually created (the new
+    workspace is on THIS turn's Home computer and this worker holds the turn's
+    cached session for it — a peek, never an acquire), the layout of that
+    live sandbox is the one source for the path, for ``mkdir``, for ``test -d``
+    and for the returned ``folder_path`` alike.
 
-    The folder is created only when the new workspace lives on THIS turn's
-    Home computer and this worker holds the turn's session for it (process
-    memory is execution context; the CoS turn runs here, so its session is in
-    this cache and no acquire/lock/attach is triggered). Even then ``mkdir``
-    and a separate ``test -d`` must both succeed before ``folder_ready`` is
-    true — a swallowed mkdir failure never reports ready. Every other case
-    (different computer, machine not running, no session, failed mkdir or
-    verify) answers ``folder_ready: False`` with the hint; the create itself
-    already succeeded and must never fail with it.
+    Not creating (different computer, no cached session) answers the binding's
+    ``root_dir``/``dir_name`` as a best-effort ``folder_path`` — display only,
+    nothing was built there. A failed binding read never falls back to the
+    global default root to build anything; it answers a default-derived path
+    for display and ``folder_ready: False``. Even when creating, ``mkdir`` and
+    a separate ``test -d`` must both exit 0 before ``folder_ready`` is true —
+    a swallowed mkdir failure never reports ready. No case here may raise or
+    fail the create, which already succeeded.
     """
     workspace_id = str(workspace.get("workspace_id") or "")
     dir_name = str(workspace.get("dir_name") or "").strip()
     computer_id = str(workspace.get("computer_id") or "").strip()
 
-    folder_path: str | None = None
+    result: dict = {"folder_ready": False, "folder_hint": _FOLDER_NOT_READY_HINT}
+
+    binding = None
     try:
-        root = str(getattr(await manager.resolve_binding(workspace_id), "root_dir", None) or "").rstrip("/")
-        if root and dir_name:
-            folder_path = f"{root}/{dir_name}"
+        binding = await manager.resolve_binding(workspace_id)
     except Exception as e:
         logger.warning(f"Could not resolve the folder path for {workspace_id}: {e}")
-    if folder_path is None and dir_name:
-        # Same math the file routes fall back to when the row names no root.
-        try:
-            from src.server.app.workspace_files._shared import work_dir_for
+    if binding is None:
+        # Display-only path from the same default math the file routes use;
+        # never a root to build on.
+        if dir_name:
+            try:
+                from src.server.app.workspace_files._shared import work_dir_for
 
-            folder_path = work_dir_for(workspace, manager=manager)
-        except Exception as e:
-            logger.warning(f"Could not compute the folder path for {workspace_id}: {e}")
+                path = work_dir_for(workspace, manager=manager)
+                if path:
+                    result["folder_path"] = str(path)
+            except Exception as e:
+                logger.warning(
+                    f"Could not compute the folder path for {workspace_id}: {e}"
+                )
+        return result
 
-    result: dict = {"folder_ready": False, "folder_hint": _FOLDER_NOT_READY_HINT}
-    if folder_path:
-        result["folder_path"] = folder_path
-
-    if not (folder_path and dir_name and computer_id):
+    root = str(getattr(binding, "root_dir", None) or "").rstrip("/")
+    if root and dir_name:
+        result["folder_path"] = f"{root}/{dir_name}"
+    if not (root and dir_name and computer_id):
         return result
 
     try:
@@ -200,6 +209,20 @@ async def _folder_ready_result(
     sandbox = getattr(session, "sandbox", None) if session is not None else None
     if sandbox is None:
         return result
+
+    try:
+        # The one path bring-up would create: taken from the live sandbox's
+        # own layout, which may differ from the binding root after a
+        # reconnect repointed the sandbox's working dir.
+        folder_path = str(
+            sandbox.layout.for_workspace(dir_name).setup_dirs[0]
+        )
+    except Exception as e:
+        logger.warning(
+            f"Could not derive the sandbox folder path for {workspace_id}: {e}"
+        )
+        return result
+    result["folder_path"] = folder_path
 
     import shlex
 

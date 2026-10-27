@@ -98,15 +98,20 @@ async def _follow_hops(client: httpx.AsyncClient, url: str) -> str | None:
 async def _resolve_row_url(
     client: httpx.AsyncClient, url: str, timeout_s: float
 ) -> str | None:
-    """Resolve one grounding link under its own deadline."""
+    """Resolve one grounding link under its own deadline.
+
+    Every non-cancellation failure is converted to None here so the task
+    itself never ends with an exception — the batch's bookkeeping can then
+    treat "not a usable string" as failed without reading exceptions.
+    """
     try:
         return await asyncio.wait_for(_follow_hops(client, url), timeout=timeout_s)
-    except (asyncio.TimeoutError, TimeoutError):
+    except Exception:
         return None
 
 
 def _reap(task: "asyncio.Task[str | None]") -> None:
-    """Read a cancelled straggler's exception so asyncio never logs it as unretrieved."""
+    """Read a finished task's exception so asyncio never logs it as unretrieved."""
     if not task.cancelled():
         task.exception()
 
@@ -142,16 +147,24 @@ async def resolve_grounding_redirects(
     ) as client:
         # One budget for the whole batch: DNS resolution runs in threads that
         # a per-task `wait_for` cannot cancel, so the slowest link must not
-        # hold the search result hostage. `asyncio.wait` returns at the
-        # deadline; the stragglers are cancelled and read, not awaited.
+        # hold the search result hostage. The reap callback rides every task
+        # from creation (an outer cancellation of the wait would otherwise
+        # skip any cleanup scheduled after it), and the finally cancels
+        # whatever has not finished — deadline or outer cancel alike — without
+        # waiting for the cancellations to land.
         tasks = {
             asyncio.ensure_future(_resolve_row_url(client, url, timeout_s)): idx
             for idx, url in targets
         }
-        done, pending = await asyncio.wait(tasks, timeout=timeout_s)
-        for task in pending:
-            task.cancel()
+        for task in tasks:
             task.add_done_callback(_reap)
+        done: set = set()
+        try:
+            done, _pending = await asyncio.wait(tasks, timeout=timeout_s)
+        finally:
+            for task in tasks:
+                if task not in done:
+                    task.cancel()
         resolved_by_idx = {
             tasks[task]: (
                 task.result()

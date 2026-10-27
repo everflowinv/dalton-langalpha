@@ -208,6 +208,44 @@ class TestGroundingRedirectResolution:
         assert rows[1]["url"] == SOURCE_URL
 
     @pytest.mark.asyncio
+    async def test_outer_cancellation_cancels_children_without_leaked_exceptions(self):
+        """Cancelling the turn mid-wait cancels every child task, and nothing is
+        left to surface as 'exception was never retrieved'."""
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            started.set()
+            await release.wait()
+            return httpx.Response(302, headers={"location": SOURCE_URL})
+
+        loop = asyncio.get_running_loop()
+        handler_calls: list[dict] = []
+        previous_handler = loop.get_exception_handler()
+        loop.set_exception_handler(lambda loop, ctx: handler_calls.append(ctx))
+        try:
+            rows = [
+                {"type": "page", "title": "A", "url": GROUNDING_URL, "content": ""}
+            ]
+            task = asyncio.ensure_future(
+                resolve_grounding_redirects(
+                    rows, [], timeout_s=5.0, transport=_mock_transport(handler)
+                )
+            )
+            await started.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            # Let cancelled children finish unwinding and the reap callbacks run.
+            release.set()
+            for _ in range(4):
+                await asyncio.sleep(0)
+        finally:
+            loop.set_exception_handler(previous_handler)
+
+        assert handler_calls == []
+
+    @pytest.mark.asyncio
     async def test_timeout_keeps_original_link_and_marks_unresolved(self):
         async def handler(request: httpx.Request) -> httpx.Response:
             await asyncio.sleep(0.5)
