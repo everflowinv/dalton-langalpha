@@ -4,6 +4,7 @@ import { Check, Copy, ExternalLink, FileDown, Link2, Lock, X } from 'lucide-reac
 import { cn } from '@/lib/utils';
 import { ease, useSceneTime } from './clock';
 import { Appear, Loader } from './kit';
+import { BRAND_NAME } from '@/config/brand'; // DALTON-HOOK(brand-name)
 
 /* The share controls, as the share scene draws them: the chat header's
    popover that shares a conversation (`ShareButton`), the dialog that shares
@@ -384,7 +385,7 @@ export function SharedFileBar({ name }: { name: string }) {
         className={cn('title-font shrink-0 font-semibold', sm)}
         style={{ color: 'var(--color-text-primary)' }}
       >
-        LangAlpha
+        {BRAND_NAME} {/* DALTON-HOOK(brand-name) */}
       </span>
       <span className={cn('shrink-0', sm)} style={{ color: 'var(--color-text-quaternary)' }}>
         /

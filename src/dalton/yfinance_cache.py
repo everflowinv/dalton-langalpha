@@ -144,6 +144,15 @@ def _point_at_process_dir() -> None:
     # yfinance creates the folder on first use, and if it cannot, runs
     # without the cache rather than failing the call.
     yf.set_tz_cache_location(str(_process_cache_dir()))
+    # The reset dropped the cookie cache, and with it the A3 guard yahoo.py
+    # wrapped around it at import; a forked child would otherwise build an
+    # unguarded cache and hit KeyError('A3') on the first cookie without one.
+    try:
+        from src.data_client.yfinance.yahoo import _guard_cookie_cache
+
+        _guard_cookie_cache()
+    except Exception:
+        logger.warning("yfinance_cache: could not re-guard the cookie cache", exc_info=True)
 
 
 def configure_process_cache() -> None:

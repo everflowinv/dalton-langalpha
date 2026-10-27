@@ -74,6 +74,32 @@ def test_fork_rebuilds_all_three_caches_onto_child_databases():
     assert yf_cache.get_tz_cache().lookup("SYM_child") is None
 
 
+def _child_cookie_guard(conn):
+    try:
+        conn.send(bool(getattr(yf_cache.get_cookie_cache(), "checks_a3", False)))
+    finally:
+        conn.close()
+
+
+def test_fork_keeps_the_a3_cookie_guard():
+    """The fork reset drops the cookie cache; the child must get the A3 guard back."""
+    import src.data_client.yfinance.yahoo  # noqa: F401  (installs the guard in the parent)
+
+    assert getattr(yf_cache.get_cookie_cache(), "checks_a3", False)
+    ctx = mp.get_context("fork")
+    recv_conn, send_conn = ctx.Pipe(duplex=False)
+    proc = ctx.Process(target=_child_cookie_guard, args=(send_conn,))
+    proc.start()
+    send_conn.close()
+    try:
+        guarded_in_child = recv_conn.recv()
+    finally:
+        recv_conn.close()
+        proc.join(timeout=10)
+    assert proc.exitcode == 0
+    assert guarded_in_child is True
+
+
 def test_cleanup_stale_cache_dirs_removes_only_exited_pid_dirs(tmp_path, monkeypatch):
     monkeypatch.setattr(
         yfinance_cache,
