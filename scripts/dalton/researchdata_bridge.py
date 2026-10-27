@@ -2637,6 +2637,16 @@ def _normalize_and_validate_call_args(
                 }
                 return normalized, norm_view, err
             normalized[date_k] = coerced
+        # AlphaEngine takes a date window only as a pair; one end alone is
+        # refused upstream, so close it: up to today, or a year back.
+        if route == "alphaengine" and (normalized.get("start") is None) != (normalized.get("end") is None):
+            import datetime as _dt
+
+            if normalized.get("end") is None:
+                normalized["end"] = max(_dt.date.today().isoformat(), normalized["start"])
+            else:
+                end_day = _dt.date.fromisoformat(normalized["end"])
+                normalized["start"] = (end_day - _dt.timedelta(days=365)).isoformat()
 
     # Validate nested `params` conflicts, top-level vs nested document conflicts, and alphaengine doc_id mapping
     if isinstance(normalized.get("params"), dict):
@@ -3279,6 +3289,9 @@ def _classify_error_category_and_hint(
             "missing_required_parameters",
         )
         or "参数" in err_text
+        # Upstream's own argument checks (E_BAD_ARGS, E_BAD_DATE_RANGE, ...).
+        or "e_bad_" in err_lower
+        or err_code.startswith("e_bad_")
         or "未知" in err_text
         or "alphaengine 文档" in err_lower
         or "unsupported" in err_lower
