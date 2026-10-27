@@ -42,6 +42,8 @@ export function reportRowProvenance(source?: ReportSource): MessageProvenance | 
         // Kept when empty: a report that lists none says it answers no
         // steered hand-off, which one whose steers are unknown cannot.
         ...(source.steer_ids ? { steerIds: source.steer_ids } : {}),
+        // DALTON-HOOK(handoff-keep-on-resumable): carry interim resumable flag
+        ...(source.resumable ? { resumable: true } : {}),
       };
     }
     case 'task':

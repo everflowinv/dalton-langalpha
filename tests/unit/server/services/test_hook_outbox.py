@@ -2511,6 +2511,145 @@ class TestHandoffKeepOnResumable:
             watch_key("cos-home"), set()
         )
 
+    # DALTON-HOOK(handoff-keep-on-resumable): verify AnalystReport.resumable on
+    # interim vs terminal reports and _reported_runs extension across resumable error runs
+    @pytest.mark.asyncio
+    async def test_report_source_resumable_flag_and_continued_run_chain(self):
+        from unittest.mock import create_autospec
+
+        from src.dalton.database import runs as dalton_runs_db
+        from src.server.database.runs import lifecycle as tl_db
+        from src.server.database.runs import outbox as outbox_db
+        from src.server.services.report_back.handoff import executor
+
+        runs_by_id = {
+            "ptc-run-init": {
+                "conversation_response_id": "ptc-run-init",
+                "status": "interrupted",
+                "errors": [],
+            },
+            "ptc-run-0": {
+                "conversation_response_id": "ptc-run-0",
+                "status": "error",
+                "errors": [
+                    "worker_lost: no live executor holds this run's writer fence"
+                ],
+            },
+            "ptc-run-ordinary-err": {
+                "conversation_response_id": "ptc-run-ordinary-err",
+                "status": "error",
+                "errors": ["Model rate limit exceeded"],
+            },
+            "ptc-run-1": {
+                "conversation_response_id": "ptc-run-1",
+                "status": "interrupted",
+                "errors": [],
+            },
+            "ptc-run-2": {
+                "conversation_response_id": "ptc-run-2",
+                "status": "completed",
+                "errors": [],
+            },
+        }
+        predecessor_map: dict[str, dict | None] = {
+            "ptc-run-2": runs_by_id["ptc-run-1"],
+            "ptc-run-1": runs_by_id["ptc-run-0"],
+            "ptc-run-0": runs_by_id["ptc-run-init"],
+            "ptc-run-init": None,
+            "ptc-run-ordinary-err": None,
+        }
+
+        async def _fake_get_run(run_id: str):
+            return dict(runs_by_id[run_id]) if run_id in runs_by_id else None
+
+        async def _fake_continued(thread_id: str, run_id: str):
+            if run_id == "ptc-run-2":
+                return ["ptc-run-1", "ptc-run-2"]
+            return [run_id]
+
+        async def _fake_prev(thread_id: str, run_id: str):
+            row = predecessor_map.get(run_id)
+            return dict(row) if row else None
+
+        # DALTON-HOOK(handoff-keep-on-resumable): autospec test doubles
+        get_run_mock = create_autospec(tl_db.get_run, side_effect=_fake_get_run)
+        continued_mock = create_autospec(
+            tl_db.get_continued_runs, side_effect=_fake_continued
+        )
+        prev_mock = create_autospec(
+            dalton_runs_db.get_previous_run_on_thread, side_effect=_fake_prev
+        )
+        taken_mock = create_autospec(
+            outbox_db.list_taken_hand_offs, return_value=[]
+        )
+        ws_name_mock = create_autospec(
+            executor._workspace_name, return_value="DASH"
+        )
+
+        def _make_owed(final_status: str, run_id: str) -> executor.OwedAnalystReport:
+            return executor.OwedAnalystReport(
+                origin={"ptc_workspace_id": "ws-dash"},
+                dispatcher_thread_id="cos-home",
+                ptc_thread_id="ptc-dash",
+                final_status=final_status,
+                run_id=run_id,
+            )
+
+        with (
+            patch.object(tl_db, "get_run", get_run_mock),
+            patch.object(tl_db, "get_continued_runs", continued_mock),
+            patch.object(
+                dalton_runs_db, "get_previous_run_on_thread", prev_mock
+            ),
+            patch.object(outbox_db, "list_taken_hand_offs", taken_mock),
+            patch.object(executor, "_workspace_name", ws_name_mock),
+        ):
+            # 1) Interim resumable failure: resumable is True
+            _, interim_src = await executor.report_message(
+                _make_owed("error", "ptc-run-0")
+            )
+            assert interim_src.resumable is True
+            assert interim_src.model_dump(exclude_none=True)["resumable"] is True
+            assert interim_src.run_ids == ["ptc-run-init", "ptc-run-0"]
+
+            # 2) Non-resumable error: resumable is None
+            _, ordinary_err_src = await executor.report_message(
+                _make_owed("error", "ptc-run-ordinary-err")
+            )
+            assert ordinary_err_src.resumable is None
+            assert "resumable" not in ordinary_err_src.model_dump(
+                exclude_none=True
+            )
+            assert ordinary_err_src.run_ids == ["ptc-run-ordinary-err"]
+
+            # 3) Final completed report after resumable error: resumable is None,
+            # and run_ids chains back through ptc-run-0 and ptc-run-init
+            _, final_src = await executor.report_message(
+                _make_owed("completed", "ptc-run-2")
+            )
+            assert final_src.resumable is None
+            assert "resumable" not in final_src.model_dump(exclude_none=True)
+            assert final_src.run_ids == [
+                "ptc-run-init",
+                "ptc-run-0",
+                "ptc-run-1",
+                "ptc-run-2",
+            ]
+
+            # 4) Preceding run is an ordinary (non-resumable) error: not chained
+            predecessor_map["ptc-run-1"] = runs_by_id["ptc-run-ordinary-err"]
+            _, after_ordinary_err_src = await executor.report_message(
+                _make_owed("completed", "ptc-run-2")
+            )
+            assert after_ordinary_err_src.run_ids == ["ptc-run-1", "ptc-run-2"]
+
+            # 5) DB failure when reading preceding run: falls back to upstream chain
+            prev_mock.side_effect = RuntimeError("db down")
+            _, fallback_src = await executor.report_message(
+                _make_owed("completed", "ptc-run-2")
+            )
+            assert fallback_src.run_ids == ["ptc-run-1", "ptc-run-2"]
+
 
 
 

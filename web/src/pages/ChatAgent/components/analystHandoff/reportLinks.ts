@@ -51,6 +51,8 @@ interface Report {
    *  read it for). */
   steerIds?: string[];
   outcome?: ReportOutcome;
+  // DALTON-HOOK(handoff-keep-on-resumable): interim resumable failure report
+  resumable?: boolean;
   at: number;
   claimed: boolean;
 }
@@ -102,8 +104,9 @@ export function placeHandoffs(messages: readonly { message: MessageRecord }[]): 
     if (message.role === 'user') {
       const provenance = message.provenance as MessageProvenance | undefined;
       if (provenance?.kind === 'analyst_report' && provenance.threadId) {
-        const { threadId, runIds = [], steerIds, outcome } = provenance;
-        reports.push({ id: String(message.id), threadId, runIds, steerIds, outcome, at, claimed: false });
+        // DALTON-HOOK(handoff-keep-on-resumable): carry resumable flag on Report
+        const { threadId, runIds = [], steerIds, outcome, resumable } = provenance;
+        reports.push({ id: String(message.id), threadId, runIds, steerIds, outcome, resumable, at, claimed: false });
       }
       return;
     }
@@ -128,12 +131,13 @@ export function placeHandoffs(messages: readonly { message: MessageRecord }[]): 
       reportFollows: followsOn(messages, h.at, r.at),
     });
   };
+  // DALTON-HOOK(handoff-keep-on-resumable): interim resumable reports never claim a hand-off
   const names = (r: Report, { pin }: Handoff) =>
-    pin.kind === 'steer' ? !!r.steerIds?.includes(pin.steerId) : pin.kind === 'run' && r.runIds.includes(pin.runId);
+    !r.resumable && (pin.kind === 'steer' ? !!r.steerIds?.includes(pin.steerId) : pin.kind === 'run' && r.runIds.includes(pin.runId));
   // Only a report whose steers are unknown can answer a steered hand-off
   // without naming it.
   const after = (r: Report, h: Handoff) =>
-    !r.claimed && r.threadId === h.threadId && r.at > h.at && !(h.pin.kind === 'steer' && r.steerIds);
+    !r.resumable && !r.claimed && r.threadId === h.threadId && r.at > h.at && !(h.pin.kind === 'steer' && r.steerIds);
   const open: Handoff[] = [];
   for (const h of handoffs) {
     const own = reports.find((r) => names(r, h) && r.at > h.at);

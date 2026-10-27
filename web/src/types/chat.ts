@@ -469,6 +469,8 @@ export type MessageProvenance =
        *  absent when unknown (a report from before the list, or one the
        *  server could not read it for), which cannot say. */
       steerIds?: string[];
+      // DALTON-HOOK(handoff-keep-on-resumable): interim resumable failure report
+      resumable?: boolean;
     }
   | {
       kind: 'task_report'; taskId: string; displayId: string; description: string | null; failed: boolean;

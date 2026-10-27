@@ -607,6 +607,9 @@ async def _reported_runs(ptc_thread_id: str, run_id) -> list[str]:
     than hold the report."""
     if not run_id:
         return []
+    # DALTON-HOOK(handoff-keep-on-resumable): extend continued-run chain across
+    # prior resumable worker-lost runs on the same analyst thread.
+    from src.dalton.database import runs as dalton_runs_db
     from src.server.database.runs import lifecycle as tl_db
 
     try:
@@ -617,7 +620,36 @@ async def _reported_runs(ptc_thread_id: str, run_id) -> list[str]:
             exc_info=True,
         )
         chain = []
-    return chain or [str(run_id)]
+    base_chain = list(chain) if chain else [str(run_id)]
+    limit = getattr(tl_db, "_CONTINUED_RUNS_LIMIT", 50)
+    try:
+        extended = list(base_chain)
+        while len(extended) < limit:
+            prev = await dalton_runs_db.get_previous_run_on_thread(
+                ptc_thread_id, extended[0]
+            )
+            if not isinstance(prev, dict):
+                break
+            prev_id = prev.get("conversation_response_id")
+            if not prev_id or str(prev_id) in extended:
+                break
+            prev_id = str(prev_id)
+            prev_status = prev.get("status")
+            if prev_status == "interrupted":
+                extended.insert(0, prev_id)
+            elif prev_status == "error" and await is_resumable_analyst_failure(
+                prev_id
+            ):
+                extended.insert(0, prev_id)
+            else:
+                break
+        return extended
+    except Exception:
+        logger.debug(
+            f"[HANDOFF_REPORT_BACK] Could not read resumable runs before {run_id}",
+            exc_info=True,
+        )
+        return base_chain
 
 
 async def _taken_hand_offs(
@@ -668,8 +700,9 @@ async def report_message(
     )
     # DALTON-HOOK(handoff-keep-on-resumable): tell Home when a failed analyst
     # run was a resumable interruption that will report back again on finish.
+    is_resumable = False
     if final_status == "error":
-        is_resumable = (
+        is_resumable = bool(
             await is_resumable_analyst_failure(owed.run_id)
             if resumable is None
             else resumable
@@ -703,6 +736,8 @@ async def report_message(
         # whose result named the steer. Empty when the runs took none in;
         # absent when that is unknown.
         steer_ids=await _taken_hand_offs(ptc_thread_id, run_ids),
+        # DALTON-HOOK(handoff-keep-on-resumable): mark interim resumable report
+        resumable=True if is_resumable else None,
     )
     return message, report_source
 

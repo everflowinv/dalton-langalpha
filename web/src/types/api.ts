@@ -565,6 +565,8 @@ export type ReportSource =
        *  absent when unknown (a report from before it was kept, or one the
        *  server could not read it for). */
       steer_ids?: string[];
+      // DALTON-HOOK(handoff-keep-on-resumable): interim resumable failure report
+      resumable?: boolean;
     }
   /** A background subagent task in this thread, finished or failed. */
   | {

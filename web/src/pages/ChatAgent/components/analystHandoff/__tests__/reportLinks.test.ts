@@ -232,4 +232,50 @@ describe('placeHandoffs', () => {
     expect(reportOf(places, 'tc-1')).toBeUndefined();
     expect(reportOf(places, 'tc-2')).toBeUndefined();
   });
+
+  // DALTON-HOOK(handoff-keep-on-resumable): interim resumable reports never claim a hand-off
+  it('skips an interim resumable report so the final report claims the hand-off and sets its outcome', () => {
+    const rInterim = report('r-interim', 'th', 'run-1');
+    (rInterim.message.provenance as Loose).outcome = 'error';
+    (rInterim.message.provenance as Loose).resumable = true;
+    const rFinal = report('r-final', 'th', 'run-1', 'run-2');
+    (rFinal.message.provenance as Loose).outcome = 'completed';
+
+    const places = placesOf([
+      reply('m1', { thread_id: 'th', run_id: 'run-1', tool_call_id: 'tc-1' }),
+      rInterim,
+      rFinal,
+    ]);
+    expect(places.get('tc-1')).toEqual({
+      madeAt: AT.getTime(),
+      reportId: 'r-final',
+      reportRunId: 'run-2',
+      outcome: 'completed',
+      reportFollows: true,
+    });
+  });
+
+  // DALTON-HOOK(handoff-keep-on-resumable): when only an interim resumable report exists, the hand-off stays unclaimed
+  it('leaves a hand-off unclaimed when only an interim resumable report has arrived', () => {
+    const rPinned = report('r-pinned', 'th', 'run-1');
+    (rPinned.message.provenance as Loose).outcome = 'error';
+    (rPinned.message.provenance as Loose).resumable = true;
+
+    const rNoRun = report('r-norun', 'th');
+    (rNoRun.message.provenance as Loose).outcome = 'error';
+    (rNoRun.message.provenance as Loose).resumable = true;
+
+    const rUnpinned = report('r-unpinned', 'th', 'run-2');
+    (rUnpinned.message.provenance as Loose).outcome = 'error';
+    (rUnpinned.message.provenance as Loose).resumable = true;
+
+    const places = placesOf([
+      reply('m1', { thread_id: 'th', run_id: 'run-1', tool_call_id: 'tc-1' }),
+      rPinned,
+      rNoRun,
+      rUnpinned,
+    ]);
+    expect(places.get('tc-1')).toEqual({ madeAt: AT.getTime() });
+    expect(reportOf(places, 'tc-1')).toBeUndefined();
+  });
 });

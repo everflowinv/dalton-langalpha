@@ -310,8 +310,9 @@ class AnalystReport(BaseModel):
     steers, oldest first, since one steered into a run that ended before
     reading it is reported on by the later run that did. A list, empty or
     not, is final; absent means unknown: a report stored before it was kept,
-    or one whose read of its steers failed. Rows stored before these were
-    kept have none of them.
+    or one whose read of its steers failed. ``resumable`` marks an interim
+    worker-lost report whose run will resume and report again. Rows stored
+    before these were kept have none of them.
     """
 
     kind: Literal["analyst"]
@@ -321,6 +322,8 @@ class AnalystReport(BaseModel):
     outcome: Optional[Literal["completed", "error", "cancelled"]] = None
     run_ids: Optional[List[str]] = None
     steer_ids: Optional[List[str]] = None
+    # DALTON-HOOK(handoff-keep-on-resumable): mark interim resumable-interruption reports
+    resumable: Optional[bool] = None
 
 
 class TaskReport(BaseModel):
